@@ -21,7 +21,7 @@ REPL + security-hardening release. The REPL foundation moved from rustyline to r
 
 - **Gemini API key no longer sent in the URL query string** (P0). The key now travels in the `x-goog-api-key` header and the request-controlled `model` is validated before being interpolated into the path, closing both a key-leak-into-logs vector and an SSRF/path-injection vector.
 - **Untrusted `.semac` can no longer crash the VM via `CallNative`** (P0). The native-table bounds check is now a real runtime check (was `debug_assert!`, compiled out in release).
-- **Provider `base-url` SSRF blocked under the sandbox** (P1). When running untrusted/sandboxed code, `llm/configure` / `llm/configure-embeddings` reject base URLs pointing at loopback/private/link-local hosts (e.g. `169.254.169.254`); trusted CLI/REPL/notebook sessions keep full access so local proxies and Ollama still work.
+- **Provider `base-url` SSRF blocked under the sandbox** (P1). When running untrusted/sandboxed code, `llm/configure` / `llm/configure-embeddings` reject base URLs pointing at loopback/private/link-local hosts (e.g. `169.254.169.254`); trusted CLI/REPL/notebook sessions keep full access so local proxies and Ollama still work. The check also decodes obfuscated `inet_aton` IP forms — decimal (`2130706433`), octal (`0177.0.0.1`), hex (`0x7f.0.0.1`), and short (`127.1`) — that resolve to internal addresses, so they can't slip past the gate.
 - **Registry package-name path traversal blocked** (P1). `sema pkg add` now validates registry names before joining them into `~/.sema/packages/`, so a name like `../../etc/cron.d` can no longer escape the packages dir.
 
 ### Fixed (correctness & reliability)

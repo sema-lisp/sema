@@ -106,6 +106,8 @@ Every handler receives a request map with the following fields:
 
 The `:json` field is automatically populated when the request has `Content-Type: application/json`.
 
+> **Request body limit.** Request bodies are capped at **16 MiB**. A larger body is rejected with `413 Payload Too Large` instead of being buffered into memory, so a client can't exhaust the server's memory with an oversized upload.
+
 ### Accessing Request Data
 
 ```sema

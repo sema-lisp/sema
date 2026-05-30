@@ -59,6 +59,8 @@ Any provider with an OpenAI-compatible API can be registered by passing `:api-ke
 
 This works for any service that implements the OpenAI chat completions API: Together, Fireworks, Perplexity, Azure OpenAI, Anyscale, vLLM, LiteLLM, text-generation-inference, and others.
 
+> **Sandbox note.** Local endpoints like `http://localhost:8000/v1` and Ollama on `localhost:11434` work normally in the REPL, CLI, and notebook. When running **untrusted code under `--sandbox`**, a `:base-url`/`:host` pointing at a loopback or private address (`localhost`, `127.0.0.1`, `10.x`, `169.254.169.254`, …) is rejected to prevent SSRF. Run unsandboxed to use a local endpoint.
+
 ## Lisp-Defined Providers
 
 For full control over request/response handling, you can define providers entirely in Sema using `llm/define-provider`. The provider's `:complete` function receives the request as a map and returns either a string or a response map.

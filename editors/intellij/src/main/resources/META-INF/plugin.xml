@@ -14,50 +14,50 @@
             <li>Brace matching and auto-pairing</li>
             <li>Line and block commenting</li>
         </ul>
-    ]]></description>
+        ]]></description>
 
     <depends>com.intellij.modules.platform</depends>
     <depends>com.redhat.devtools.lsp4ij</depends>
 
     <extensions defaultExtensionNs="com.intellij">
         <fileType
-            name="Sema"
-            language="Sema"
-            extensions="sema"
-            implementationClass="com.sema.intellij.SemaFileType"
-            fieldName="INSTANCE"/>
+                name="Sema"
+                language="Sema"
+                extensions="sema"
+                implementationClass="com.sema.intellij.SemaFileType"
+                fieldName="INSTANCE"/>
         <fileType
-            name="Semac"
-            extensions="semac"
-            implementationClass="com.sema.intellij.SemacFileType"
-            fieldName="INSTANCE"/>
+                name="Semac"
+                extensions="semac"
+                implementationClass="com.sema.intellij.SemacFileType"
+                fieldName="INSTANCE"/>
         <lang.syntaxHighlighterFactory
-            language="Sema"
-            implementationClass="com.sema.intellij.SemaSyntaxHighlighterFactory"/>
+                language="Sema"
+                implementationClass="com.sema.intellij.SemaSyntaxHighlighterFactory"/>
         <lang.braceMatcher
-            language="Sema"
-            implementationClass="com.sema.intellij.SemaBraceMatcher"/>
+                language="Sema"
+                implementationClass="com.sema.intellij.SemaBraceMatcher"/>
         <lang.commenter
-            language="Sema"
-            implementationClass="com.sema.intellij.SemaCommenter"/>
+                language="Sema"
+                implementationClass="com.sema.intellij.SemaCommenter"/>
         <lang.parserDefinition
-            language="Sema"
-            implementationClass="com.sema.intellij.SemaParserDefinition"/>
+                language="Sema"
+                implementationClass="com.sema.intellij.SemaParserDefinition"/>
         <colorSettingsPage implementation="com.sema.intellij.SemaColorSettingsPage"/>
         <configurationType implementation="com.sema.intellij.run.SemaRunConfigurationType"/>
         <runConfigurationProducer implementation="com.sema.intellij.run.SemaRunConfigurationProducer"/>
 
         <!-- LSP4IJ language-specific bindings (required for non-TEXT/textmate languages) -->
         <codeInsight.parameterInfo
-            language="Sema"
-            implementationClass="com.redhat.devtools.lsp4ij.features.signatureHelp.LSPParameterInfoHandler"/>
+                language="Sema"
+                implementationClass="com.redhat.devtools.lsp4ij.features.signatureHelp.LSPParameterInfoHandler"/>
         <lang.foldingBuilder
-            language="Sema"
-            implementationClass="com.redhat.devtools.lsp4ij.features.foldingRange.LSPFoldingRangeBuilder"
-            order="first"/>
+                language="Sema"
+                implementationClass="com.redhat.devtools.lsp4ij.features.foldingRange.LSPFoldingRangeBuilder"
+                order="first"/>
         <lang.psiStructureViewFactory
-            language="Sema"
-            implementationClass="com.redhat.devtools.lsp4ij.features.documentSymbol.LSPDocumentSymbolStructureViewFactory"/>
+                language="Sema"
+                implementationClass="com.redhat.devtools.lsp4ij.features.documentSymbol.LSPDocumentSymbolStructureViewFactory"/>
     </extensions>
 
     <extensions defaultExtensionNs="com.redhat.devtools.lsp4ij">
@@ -65,8 +65,9 @@
                 name="Sema Language Server"
                 factoryClass="com.sema.intellij.lsp.SemaLanguageServerFactory">
             <description><![CDATA[
-                <p>Language server for Sema, providing completions, hover, diagnostics, go-to-definition, and code lenses.</p>
-            ]]></description>
+                <p>Language server for Sema, providing completions, hover, diagnostics, go-to-definition, and code
+                    lenses.</p>
+                ]]></description>
         </server>
         <languageMapping language="Sema"
                          serverId="sema-lsp"

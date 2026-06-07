@@ -15,9 +15,9 @@ import com.intellij.openapi.vfs.VfsUtil
 import com.intellij.openapi.vfs.VirtualFile
 import com.intellij.openapi.vfs.VirtualFileManager
 import java.awt.Color
-import java.net.URI
 import java.awt.Graphics
 import java.awt.Rectangle
+import java.net.URI
 
 @Service(Service.Level.PROJECT)
 class EvalResultService(private val project: Project) : Disposable {

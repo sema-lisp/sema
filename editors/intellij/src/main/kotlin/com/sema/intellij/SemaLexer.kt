@@ -5,6 +5,7 @@ import com.intellij.psi.TokenType
 import com.intellij.psi.tree.IElementType
 
 class SemaLexer : LexerBase() {
+    @Suppress("SpellCheckingInspection")
     private val SPECIAL_FORMS = setOf(
         "and", "begin", "case", "cond", "define", "define-record-type",
         "defmacro", "defmethod", "defmulti", "defun", "defn", "def",
@@ -16,6 +17,7 @@ class SemaLexer : LexerBase() {
         "defagent", "deftool", "message", "prompt"
     )
 
+    @Suppress("SpellCheckingInspection")
     private val DEFINITION_FORMS = setOf(
         "define", "defun", "defn", "def", "defmacro", "defmethod",
         "defmulti", "defagent", "deftool", "define-record-type"
@@ -57,24 +59,62 @@ class SemaLexer : LexerBase() {
                 while (pos < endOffset && (buffer[pos].isWhitespace() || (buffer[pos] == ',' && (pos + 1 >= endOffset || buffer[pos + 1] != '@')))) pos++
                 TokenType.WHITE_SPACE
             }
+
             ch == ';' -> {
                 while (pos < endOffset && buffer[pos] != '\n') pos++
                 SemaTokenTypes.LINE_COMMENT
             }
+
             ch == '#' && peekNext() == '|' -> lexBlockComment()
             ch == '"' -> lexString()
-            ch == 'f' && peekNext() == '"' -> { pos++; lexString() }
-            ch == '#' && peekNext() == '"' -> { pos++; lexString() }
-            ch == '(' -> { pos++; SemaTokenTypes.LPAREN }
-            ch == ')' -> { pos++; SemaTokenTypes.RPAREN }
-            ch == '[' -> { pos++; SemaTokenTypes.LBRACKET }
-            ch == ']' -> { pos++; SemaTokenTypes.RBRACKET }
-            ch == '{' -> { pos++; SemaTokenTypes.LBRACE }
-            ch == '}' -> { pos++; SemaTokenTypes.RBRACE }
-            ch == '\'' -> { pos++; SemaTokenTypes.QUOTE }
-            ch == '`' -> { pos++; SemaTokenTypes.QUASIQUOTE }
-            ch == ',' && peekNext() == '@' -> { pos += 2; SemaTokenTypes.SPLICE }
-            ch == ',' -> { pos++; SemaTokenTypes.UNQUOTE }
+            ch == 'f' && peekNext() == '"' -> {
+                pos++; lexString()
+            }
+
+            ch == '#' && peekNext() == '"' -> {
+                pos++; lexString()
+            }
+
+            ch == '(' -> {
+                pos++; SemaTokenTypes.LPAREN
+            }
+
+            ch == ')' -> {
+                pos++; SemaTokenTypes.RPAREN
+            }
+
+            ch == '[' -> {
+                pos++; SemaTokenTypes.LBRACKET
+            }
+
+            ch == ']' -> {
+                pos++; SemaTokenTypes.RBRACKET
+            }
+
+            ch == '{' -> {
+                pos++; SemaTokenTypes.LBRACE
+            }
+
+            ch == '}' -> {
+                pos++; SemaTokenTypes.RBRACE
+            }
+
+            ch == '\'' -> {
+                pos++; SemaTokenTypes.QUOTE
+            }
+
+            ch == '`' -> {
+                pos++; SemaTokenTypes.QUASIQUOTE
+            }
+
+            ch == ',' && peekNext() == '@' -> {
+                pos += 2; SemaTokenTypes.SPLICE
+            }
+
+            ch == ',' -> {
+                pos++; SemaTokenTypes.UNQUOTE
+            }
+
             ch == '#' && peekNext() == '\\' -> lexCharacter()
             ch == '#' && (peekNext() == 't' || peekNext() == 'f') -> lexHashBoolean()
             ch == '#' && peekNext() == 'u' -> lexHashDispatch()
@@ -82,10 +122,13 @@ class SemaLexer : LexerBase() {
             ch == '.' && (pos + 1 >= endOffset || !isSymbolChar(buffer[pos + 1])) -> {
                 pos++; SemaTokenTypes.DOT
             }
+
             isDigit(ch) -> lexNumber()
             ch == '-' && pos + 1 < endOffset && isDigit(buffer[pos + 1]) -> lexNumber()
             isSymbolStart(ch) -> lexSymbol()
-            else -> { pos++; TokenType.BAD_CHARACTER }
+            else -> {
+                pos++; TokenType.BAD_CHARACTER
+            }
         }
         tokenEnd = pos
     }
@@ -111,8 +154,13 @@ class SemaLexer : LexerBase() {
         pos++ // skip opening "
         while (pos < endOffset) {
             when (buffer[pos]) {
-                '\\' -> { pos++; if (pos < endOffset) pos++ } // skip escape
-                '"' -> { pos++; return SemaTokenTypes.STRING }
+                '\\' -> {
+                    pos++; if (pos < endOffset) pos++
+                } // skip escape
+                '"' -> {
+                    pos++; return SemaTokenTypes.STRING
+                }
+
                 else -> pos++
             }
         }
@@ -125,7 +173,8 @@ class SemaLexer : LexerBase() {
             for (name in arrayOf("space", "newline", "tab", "return", "nul")) {
                 if (pos + name.length <= endOffset &&
                     buffer.subSequence(pos, pos + name.length).toString() == name &&
-                    (pos + name.length >= endOffset || !isSymbolChar(buffer[pos + name.length]))) {
+                    (pos + name.length >= endOffset || !isSymbolChar(buffer[pos + name.length]))
+                ) {
                     pos += name.length
                     return SemaTokenTypes.CHARACTER
                 }

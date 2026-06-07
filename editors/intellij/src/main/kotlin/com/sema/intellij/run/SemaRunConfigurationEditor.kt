@@ -12,19 +12,19 @@ class SemaRunConfigurationEditor(private val project: Project) : SettingsEditor<
 
     private val scriptPathField = TextFieldWithBrowseButton().apply {
         addBrowseFolderListener(
-            "Select Sema Script",
-            "Choose the .sema file to run",
             project,
             FileChooserDescriptorFactory.createSingleFileDescriptor("sema")
+                .withTitle("Select Sema Script")
+                .withDescription("Choose the .sema file to run")
         )
     }
     private val argumentsField = JTextField()
     private val workingDirectoryField = TextFieldWithBrowseButton().apply {
         addBrowseFolderListener(
-            "Select Working Directory",
-            "Choose working directory for the script",
             project,
             FileChooserDescriptorFactory.createSingleFolderDescriptor()
+                .withTitle("Select Working Directory")
+                .withDescription("Choose working directory for the script")
         )
     }
 

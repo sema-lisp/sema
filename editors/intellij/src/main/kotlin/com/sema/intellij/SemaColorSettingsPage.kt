@@ -10,6 +10,8 @@ import javax.swing.Icon
 class SemaColorSettingsPage : ColorSettingsPage {
     override fun getIcon(): Icon = SemaIcons.FILE
     override fun getHighlighter(): SyntaxHighlighter = SemaSyntaxHighlighter()
+
+    @Suppress("SpellCheckingInspection")
     override fun getDemoText(): String = """; Sema — a Lisp with LLM primitives
 (define pi 3.14159)
 (define name "hello world")

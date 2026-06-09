@@ -1,7 +1,7 @@
 # Sema Pico Hardware API Design
 
 **Date:** 2026-03-26
-**Status:** Future / Design
+**Status:** On Hold (2026-06-09) — PIO DSL shipped host-side (`crates/sema-stdlib/src/pio.rs`); native gpio/adc/pwm/i2c API deferred until the on-device Pico port exists. Interim hardware control works via the serial bridge (`serial/send` + MicroPython, see `examples/pico-blink.sema`).
 **Depends on:** [Raspberry Pi Pico Port](2026-03-25-raspberry-pi-pico-port.md) (Phase 1–4)
 
 ## Overview

@@ -1,7 +1,7 @@
 # Sema Lisp — Known Limitations & Gaps
 
 Assessed against standard Scheme (R7RS) and practical Lisp expectations.
-Status: as of v0.5.0 (record types, bytevectors, char comparison predicates).
+Status: originally written as of v0.5.0; verified and updated against v1.16.0 on 2026-06-09.
 
 ---
 
@@ -50,24 +50,24 @@ Proper Scheme `do` loop implemented. `begin` remains for sequencing.
     ((= i 10) sum))  ; => 45
 ```
 
-### ~~10. No `case` / Pattern Matching~~ → RESOLVED (Phase 7)
+### ~~10. No `case` / Pattern Matching~~ → RESOLVED
 
-`case` special form with R5RS semantics. Pattern matching still absent.
+`case` special form with R5RS semantics. Pattern matching also shipped since: `match` special form in both backends (map patterns `{:name n}`, vector/list patterns `[a b c]`, literals, `_` wildcard) plus destructuring (`crates/sema-eval/src/destructure.rs`).
 
-### ~~11. No Port-Based I/O~~ → PARTIALLY RESOLVED (Phase 7)
+### ~~11. No Port-Based I/O~~ → MOSTLY RESOLVED
 
 Full file namespace: `file/read`, `file/write`, `file/append`, `file/delete`, `file/rename`, `file/list`, `file/mkdir`, `file/info`, `file/exists?`, `file/is-directory?`, `file/is-file?`, `file/is-symlink?`.
 Path ops: `path/join`, `path/dirname`, `path/basename`, `path/extension`, `path/absolute`.
 HTTP: `http/get`, `http/post`, `http/put`, `http/delete`, `http/request`.
-Still no streaming/port-based I/O.
+Streaming shipped since: `stream/*` namespace (`crates/sema-stdlib/src/stream.rs` — read/write, byte ops, from-string/from-bytes, buffers, copy/flush/close, backed by the `SemaStream` trait) and incremental line streaming over files (`file/read-lines`, `file/for-each-line`, `file/fold-lines`). Remaining gap: no `file/open` returning a stream handle — streams are string/byte-buffer/server-backed, so port-style file handles are still absent.
 
 ### ~~12. No Struct/Record Types~~ → RESOLVED
 
 R7RS `define-record-type` with constructors, type predicates, and field accessors. `record?` predicate. `type` returns record type name as keyword.
 
-### ~~13. No Stack Traces~~ → RESOLVED
+### ~~13. No Stack Traces~~ → RESOLVED (tree-walker; VM partial)
 
-Full stack traces with call frames, file locations, and source spans. Traces are bounded for TCO'd recursion. Accessible via `:stack-trace` key in `catch` error maps.
+Full stack traces with call frames, file locations, and source spans. Traces are bounded for TCO'd recursion. Accessible via `:stack-trace` key in `catch` error maps — **on the tree-walker**. VM-caught error maps currently omit `:stack-trace`, and VM runtime errors print no `--> file:line:col` location (see ADR #57, partially implemented).
 
 ### ~~14. Missing Math Functions~~ → RESOLVED (Phase 8)
 
@@ -138,9 +138,9 @@ No destructuring bind for multiple values.
 
 No destructuring forms for multiple return values (related to #19).
 
-### 30. No Tail Calls Across Mutual Recursion in Stdlib
+### ~~30. No Tail Calls Across Mutual Recursion in Stdlib~~ → RESOLVED (folded into #24)
 
-The stdlib mini-eval (`call_function` in `list.rs`) doesn't support mutual tail calls, so `map`/`filter` callbacks can't mutually recurse with TCO.
+The mini-eval this entry referenced was deleted (callback architecture, ADR #61); HOF callbacks now run through the full evaluator and mutual tail recursion inside a callback TCOs fine (verified at depth 500k on both backends). The only remaining issue is #24's: a callback that *re-enters* a stdlib HOF recursively grows the Rust stack.
 
 ---
 
@@ -159,9 +159,9 @@ $ sema      -e '(let ((c 0)) (map (fn (x) (set! c (+ c x))) (list 1 2 3)) c)'
 0
 ```
 
-Root cause: the VM uses an **eager-close + dual-write upvalue model**. When a closure is created, captured locals are *copied* into upvalue cells; the parent's slot keeps its own copy. The resolution pass is already Lua-style (`ParentLocal` / `ParentUpvalue`), but the runtime never opens upvalues that point back at a live parent stack slot. When the closure is then handed to a stdlib HOF, that HOF runs the closure via `NativeFn::func` on a *fresh* VM (see Decision #50). The closure's local mutation lands in the fresh VM's upvalue copy, which is discarded when control returns to the caller.
+Root cause (updated 2026-06-09): the open-upvalue runtime **did ship** (ADR #55, commits `f691a55`/`346f46d` — `UpvalueState::{Open,Closed}` in `vm.rs`), and in-VM closure mutation now works correctly. But the shipped variant calls `close_open_upvalues` **before every non-VM call** (the `call_callback` sites in vm.rs). So when a closure is handed to a stdlib HOF — which runs it via `NativeFn::func` on a fresh VM (Decision #50) — its upvalue cells are closed snapshots, and `set!` mutations land in the snapshot and are discarded. The open-upvalue migration was necessary but not sufficient for this bug.
 
-Planned fix: move to an **open-upvalue runtime** (see MEMORY.md "Upvalue model: eager-close with dual-write … Runtime is what needs changing for open upvalues" and the ADR "Move VM upvalues to open-close-on-popframe model" in `docs/adr.md`). Note that `tail_call_vm_closure` must close upvalues before replacing the frame.
+Planned fix options: keep cells open across the cross-VM HOF bridge (the original ADR #55 point 5, dropped during implementation), or route HOF callbacks in-VM so the bridge is never taken. Full write-up: `docs/bugs/vm-set-lost-through-hof-callbacks.md`.
 
 Related symptoms surfaced by the same root cause:
 
@@ -173,11 +173,15 @@ Workaround: use tree-walker (`--tw`) for code that relies on `set!`-through-HOF,
 
 ### 32. Bytecode stack-balance validation gap (C11, HIGH)
 
-The VM's main dispatch loop uses `pop_unchecked` at 90+ call sites (`crates/sema-vm/src/vm.rs`). This is safe **only** because the in-process bytecode compiler is stack-balanced by construction (every emitted sequence pushes/pops by a known delta). The on-disk `.semac` format has no such guarantee: `validate_bytecode` (in `crates/sema-vm/src/serialize.rs`) currently checks magic, version, table bounds, and jump targets, but it does **not** abstract-interpret the instruction stream to verify stack balance.
+The VM's main dispatch loop uses `pop_unchecked` at ~67 call sites (`crates/sema-vm/src/vm.rs`). This is safe **only** because the in-process bytecode compiler is stack-balanced by construction (every emitted sequence pushes/pops by a known delta). The on-disk `.semac` format has no such guarantee: `validate_bytecode` (in `crates/sema-vm/src/serialize.rs`) currently checks magic, version, table bounds, and jump targets, but it does **not** abstract-interpret the instruction stream to verify stack balance.
 
 A hand-crafted (or corrupted) `.semac` file with a leading `Pop`, an unbalanced `Call`, or a missing push before a binary op causes undefined behavior in release builds: `pop_unchecked` reads `stack[len - 1]` after subtracting from an empty `Vec`, calls `set_len(usize::MAX)`, and subsequent pushes/pops corrupt arbitrary memory.
 
-**For now, `.semac` files should be treated as trusted-source-only.** Do not load `.semac` from network/untrusted sources without verification. The planned fix is a stack-depth verifier — see the ADR "Bytecode stack-depth verifier for .semac loading" in `docs/adr.md`.
+**For now, `.semac` files should be treated as trusted-source-only.** Do not load `.semac` from network/untrusted sources without verification. The planned fix is a stack-depth verifier — see the ADR "Bytecode stack-depth verifier for .semac loading" in `docs/adr.md` and the implementation plan `docs/plans/2026-05-15-adi-bytecode-verifier.md`.
+
+### 33. VM `eval` sees globals only — no lexical locals
+
+On the VM backend, `(eval expr)` runs via a tree-walker delegate (`__vm-eval`) against the **global environment only**. Lexical locals are not visible: `(define (f x) (eval 'x)) (f 42)` → `Unbound variable: x`. The "reify locals as a read-only view" design (archived `docs/decisions.md`, eval-reify section) was never implemented — the name→slot tables it required exist (`Function::local_names`) but are used only for DAP variable inspection. The tree-walker backend gives `eval` the caller's full environment, so this is also a backend divergence.
 
 ---
 
@@ -197,7 +201,7 @@ A hand-crafted (or corrupted) `.semac` file with a leading `Pop`, an unbalanced 
 | 26  | No `with-exception-handler`              | Low      | Medium    | `try`/`catch` is sufficient for most use cases                               |
 | 27  | No `define-values`                       | Low      | Low       | Rarely needed without multiple return values                                 |
 | 29  | No `let-values`/`receive`                | Low      | Low       | Blocked by #19                                                               |
-| 30  | No Tail Calls in Stdlib Mutual Recursion | Low      | High      | Architectural: stdlib can't depend on eval                                   |
+| 33  | VM `eval` sees globals only              | Medium   | High      | Reify design never built; backend divergence vs tree-walker                  |
 
 ---
 
@@ -222,6 +226,9 @@ A hand-crafted (or corrupted) `.semac` file with a leading `Pop`, an unbalanced 
 - **String operations** — split, trim, replace, contains?, format, str, index-of, chars, repeat, pad-left, pad-right
 - **Map operations** — hash-map, get, assoc, dissoc, keys, vals, merge, contains?, count, entries, map-vals, filter, select-keys, update
 - **List operations** — car/cdr + 12 compositions (caar through cdddr), cons, map (multi-list), filter, foldl, foldr, reduce, sort, range, take, drop, zip, flatten, partition, any, every, member, last, apply, index-of, unique, group-by, interleave, chunk, assoc/assq/assv (alist lookup)
+- **Async/concurrency (VM-only)** — `async`/`await`, channels, `async/sleep`, task scheduler with cooperative yield (ADR #53/#54); tree-walker errors clearly
+- **Pattern matching** — `match` special form (map/vector/literal patterns, `_` wildcard) + destructuring in both backends
+- **Streaming I/O** — `stream/*` namespace + `file/read-lines`/`file/for-each-line`/`file/fold-lines`
 - **Lazy evaluation** — `delay`/`force` with memoized promises, `promise?`, `promise-forced?`
 - **Iteration** — proper Scheme `do` loop with parallel assignment
 - **Math** — Full suite: abs, min, max, floor, ceil, round, sqrt, pow, log, sin, cos, tan, asin, acos, atan, atan2, exp, log10, log2, gcd, lcm, quotient, remainder, random, random-int, clamp, sign, pi, e

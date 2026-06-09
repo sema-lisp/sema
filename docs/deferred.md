@@ -2,6 +2,8 @@
 
 Things that came out of the May 2026 quality sweep (Wave 6 audit) but were intentionally not fixed because they're too risky, too design-dependent, or have a cheap workaround. Each entry says *why* it's deferred so a future pass can decide whether to revisit.
 
+Verified 2026-06-09: U6 ("did you mean" hints — shipped via `suggest_similar` in sema-core, attached in both backends) and U9 (REPL completeness check — replaced by the lexer-based `SemaValidator` in `crates/sema/src/repl/validator.rs`) were removed because they have since been fixed. Remaining entries re-verified as still open.
+
 ---
 
 ## D5 — Typed `try`/`catch` form
@@ -20,7 +22,7 @@ Things that came out of the May 2026 quality sweep (Wave 6 audit) but were inten
 
 ## N5 — `server.rs` response-helper `.unwrap()`s
 
-**Today:** `crates/sema-stdlib/src/server.rs` lines ~997, 1022, 1026, 1067, 1068 unwrap on `as_map_rc()` / `__stream_handler` / `__ws_handler` after a single-marker `is_*_response` check. A user who constructs a partially-formed response map (sets `__file_path` flag but forgets `__stream_handler`) panics the HTTP server thread.
+**Today:** `crates/sema-stdlib/src/server.rs` lines ~1028-1099 (as of 2026-06-09) unwrap on `as_map_rc()` / `__stream_handler` / `__ws_handler` after a single-marker `is_*_response` check. A user who constructs a partially-formed response map (sets `__file_path` flag but forgets `__stream_handler`) panics the HTTP server thread.
 
 **Proposed fix:** convert each unwrap to `.ok_or_else(|| SemaError::eval("..."))?` and propagate via `Result<ServerResponse, SemaError>` — sending a `ServerResponse::Error` over the oneshot instead of panicking.
 
@@ -39,39 +41,6 @@ Things that came out of the May 2026 quality sweep (Wave 6 audit) but were inten
 **Why deferred:** design call. Strictness is the safer choice for users but breaks anyone relying on the current behavior; defining a stable order is a long-term spec commitment. Wants an ADR.
 
 **Workaround today:** `(sort-by ...)` with an explicit comparator — works correctly across types because the user provides the comparator.
-
----
-
-## U6 — REPL "did you mean…?" for typos
-
-**Today:** `(mpa inc (list 1 2))` errors with `Unbound variable: inc` (which is itself confusing — the *first* unbound is `mpa`, not `inc`). No suggestion offered even though the env table is right there.
-
-**Proposed fix:** in interactive `print_error`, when the message starts with `Unbound variable: NAME`, run a Levenshtein-2 search over `interpreter.global_env` keys and append `\n  hint: did you mean '{best}'?`. The `strsim` crate is already pulled in for LSP — reuse it.
-
-**Why deferred:** medium-effort polish — needs `print_error` to take `&Interpreter` (currently takes only `&SemaError`), adjust signature at every call site. Not blocking anything; just nice-to-have.
-
-**Workaround today:** users notice the typo on the next iteration. The auto-completer at the REPL prompt (reedline) does suggest names on Tab, which catches some cases.
-
----
-
-## U9 — REPL `is_balanced` only counts brackets
-
-**Today:** the REPL's "is this expression complete?" check (`crates/sema/src/main.rs`'s `is_balanced` function, after Wave 6a around the multi-line read loop) only counts `( [ { ) ] }` and tracks string state with `\` escapes. It does NOT understand:
-- line comments (`; …` — a stray `(` inside a comment increments depth)
-- block comments (`#| … |#` if added later)
-- character literals (`#\(`)
-- regex literals (`#"…"`)
-- short-lambda `#(...)` (works incidentally because it's just an extra `(`)
-- datum comments `#;`
-- f-string interpolation `${…}`
-
-A user who pastes `(println "ok") ; close paren -> )` will trigger spurious continuation prompts (the `;` runs to EOL but `is_balanced` thinks `)` decrements depth).
-
-**Proposed fix:** add a tolerant-mode pub fn to `sema-reader` like `pub fn input_is_complete(src: &str) -> bool` that runs the lexer and returns `false` only on `UnexpectedEof`/unclosed-delimiter errors. Replace the hand-rolled bracket counter with this call.
-
-**Why deferred:** medium effort, requires a new pub API on `sema-reader` and careful handling of "almost-complete" inputs (the lexer needs to distinguish "syntax error" from "needs more input"). Real but only intermittent UX issue.
-
-**Workaround today:** users avoid pasting comment-heavy code into the REPL, or load via `(load "file.sema")` instead.
 
 ---
 
@@ -94,7 +63,7 @@ Pattern can mirror the diagnostic-waiting in `test_diagnostics.py`.
 
 ## VFS — clones on every read
 
-**Today:** `vfs_read` returns `Option<Vec<u8>>`, cloning file contents on each call (`crates/sema-notebook/src/vfs.rs`). For large assets or hot paths this is wasteful.
+**Today (updated 2026-06-09):** `vfs_read` returns `Option<Vec<u8>>`, cloning file contents on each call — the function now lives in `crates/sema-core/src/vfs.rs:15` (the embedded-binary VFS). The originally-cited `crates/sema-notebook/src/vfs.rs` has since become a different thing (disk-backed path-sandboxed shim) and is no longer relevant to this entry.
 
 **Proposed fix:** return `Cow<'_, [u8]>` so cached reads can be borrowed, or back the VFS with `Arc<HashMap>` so the file table can hand out cheap reference-counted handles.
 

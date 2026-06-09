@@ -17,6 +17,8 @@
 
 ### 3. Environment: `Rc<Env>` with parent chain, `RefCell<BTreeMap>`
 
+> **Superseded** (see #43/#44): bindings are now `Rc<RefCell<hashbrown::HashMap<Spur, Value>>>` — Spur-keyed after string interning, hashbrown for speed. The BTreeMap-for-ordering rationale no longer applies.
+
 - Single-threaded: `Rc` not `Arc`
 - `BTreeMap` over `HashMap` for deterministic ordering (matters for printing, testing)
 - `set_existing` walks the chain for `set!` semantics
@@ -34,6 +36,8 @@
 - Simple approach: inject the binding when applying the lambda
 
 ### 6. stdlib `call_function` duplication
+
+> **Superseded** (see #61): the mini-eval was deleted. `call_function` is now a thin dispatcher to `sema_core::call_callback`, which routes to the real evaluator registered at startup. The "complex expressions may not work" trade-off no longer exists.
 
 - `sema-stdlib/src/list.rs` has its own `call_function` and mini-eval for HOF support (`map`, `filter`, `foldl`)
 - This avoids a circular dependency (sema-stdlib can't depend on sema-eval)
@@ -268,6 +272,8 @@ crates/sema/src/
 
 ### 29. Duplicated `call_function` in map.rs
 
+> **Superseded** (see #61): the duplication was removed — `map.rs` now does `use crate::list::call_function;` and both route through `sema_core::call_callback`.
+
 - Map HOFs (`map/map-vals`, `map/filter`, `map/update`) need `call_function` like list.rs
 - Duplicated ~60 lines of `call_function` + `sema_eval_value` rather than refactoring to shared module
 - Same pattern as list.rs: handles NativeFn and Lambda, mini-eval for lambda bodies
@@ -381,7 +387,7 @@ crates/sema/src/
 ### 43. String interning for symbols and keywords (lasso)
 
 - `Value::Symbol` and `Value::Keyword` store `Spur` (u32) instead of `Rc<String>`
-- `Env::bindings` changed from `BTreeMap<String, Value>` to `BTreeMap<Spur, Value>` for direct Spur-keyed lookups
+- `Env::bindings` changed from `BTreeMap<String, Value>` to Spur-keyed lookups (today: `hashbrown::HashMap<Spur, Value>`, see #44)
 - Thread-local `Rodeo` interner, accessed via `intern()/resolve()/with_resolved()`
 - `Value::String` remains `Rc<String>` — arbitrary user strings are NOT interned
 - Eq comparison of symbols/keywords is now O(1) integer comparison
@@ -484,9 +490,9 @@ crates/sema/src/
 - The tree-walker returns a clear error: "async requires the VM backend (do not use --tw)"
 - This acknowledges the tree-walker's deprecation path and avoids maintaining two async implementations
 
-### 55. Move VM upvalues to open-close-on-popframe model (PROPOSED)
+### 55. Move VM upvalues to open-close-on-popframe model (IMPLEMENTED, modified design — C1 NOT resolved)
 
-Status: **proposed** — fixes audit bug C1 (see `docs/limitations.md` #31). Not yet implemented.
+Status: **implemented 2026-03-11** (commits `f691a55`, `3869228`, `346f46d`) — `UpvalueState::{Open,Closed}` in `crates/sema-vm/src/vm.rs`, `has_open_upvalues` flag removed, Load/StoreLocal stay branch-free. **Deviation from point 5 below:** the shipped variant calls `close_open_upvalues` *before every non-VM call* (vm.rs `call_callback` sites), instead of keeping cells open across the HOF bridge. Consequence: in-VM closure mutation works, but **audit bug C1 still reproduces** — `set!` inside a closure invoked via a stdlib HOF (`map`, `filter`, …) mutates a closed snapshot and is lost. See `docs/bugs/vm-set-lost-through-hof-callbacks.md` and `docs/limitations.md` #31. Fixing C1 requires either keeping cells open across the cross-VM bridge (original point 5) or routing HOF callbacks in-VM.
 
 Context: the current VM eagerly closes upvalues at `MakeClosure` time and dual-writes mutations to both the parent's local slot and the closure's upvalue cell. This breaks down when a closure is called *outside* the parent VM (stdlib HOFs like `map`, `filter`, `for-each`, `sort-by`, `retry` route through `NativeFn::func` on a fresh VM — Decision #50). The fresh VM has its own copy of the upvalue cell; mutations there never propagate back to the parent's slot, and `set!` is silently lost.
 
@@ -570,7 +576,9 @@ Once this lands, `.semac` files from untrusted sources can be loaded safely. Unt
 
 References: `crates/sema-vm/src/vm.rs::pop_unchecked` (the unsafe site), `crates/sema-vm/src/serialize.rs::validate_bytecode` (where the new pass plugs in), `crates/sema-vm/src/opcodes.rs` (canonical opcode list), `docs/limitations.md` #32.
 
-### 57. Propagate source spans through runtime errors (PROPOSED)
+### 57. Propagate source spans through runtime errors (PARTIALLY IMPLEMENTED — tree-walker done, VM pending)
+
+Status update 2026-06-09: the **tree-walker side is done** — runtime errors print `--> file:line:col`, a source snippet with caret, and spanned `at name (...)` frames (span plumbing in `crates/sema-eval/src/eval.rs`). The **VM side is not**: commit `1a83c2b` propagated spans into `ChunkDebugInfo`, but CallNative/CallGlobal/binary-op error sites still return bare messages with no location. The backends also emit different message text for arithmetic type errors (e.g. `(+ 1 "a")`). Remaining work is exactly the "VM side" section below.
 
 Tracks LIMITATIONS.md #H13. Today the **reader** has perfect span info (used in syntax-error diagnostics like `--> path:line:col`), but **eval/VM** runtime errors emit bare messages: `type error: + expected number, got string` with no location. For anything beyond a one-liner this makes debugging needlessly hard — the user sees the error but has to grep the file to find the offending call site.
 
@@ -597,7 +605,9 @@ Trade-offs:
 
 References: `crates/sema-eval/src/eval.rs` (eval_step, NativeFn dispatch), `crates/sema-vm/src/vm.rs` (CALL_NATIVE / CALL_GLOBAL, binary-op error sites), `crates/sema-vm/src/debug.rs::ChunkDebugInfo`, `crates/sema-core/src/error.rs` (SemaError + location plumbing), `crates/sema-reader/src/span.rs` (span formatter reused for `--> path:line:col`), `docs/limitations.md` #H13.
 
-### 58. Thread-local writer hook for stdout capture (replaces gag::BufferRedirect) (PROPOSED)
+### 58. Thread-local writer hook for stdout capture (replaces gag::BufferRedirect) (PARTIAL — hook shipped for DAP, notebook not migrated)
+
+Status update 2026-06-09: the hook landed in **`crates/sema-core/src/output_hook.rs`** (`set_stdout_hook`/`set_stderr_hook`/`write_stdout`/`write_stderr`) — note: in sema-core, not sema-stdlib as proposed below — and `sema-stdlib/src/io.rs` print fns route through it. Current consumer is the **DAP server** (`crates/sema-dap/src/server.rs`). The notebook still uses `gag::BufferRedirect` (`crates/sema-notebook/src/engine.rs`, `Cargo.toml`). Remaining work: `docs/plans/2026-06-09-notebook-output-hook-migration.md`.
 
 Tracks LIMITATIONS.md #H17. The notebook engine currently captures cell stdout with `gag::BufferRedirect::stdout()` — a process-wide file-descriptor swap. This works for the common case but composes poorly:
 
@@ -651,3 +661,49 @@ This pass closed several gaps where a canonical slash-namespaced form was missin
 - `read-line` / `read-many` / `read-stdin`: already aliased to `io/*` at the bottom of `crates/sema-stdlib/src/io.rs::register`. Leaving as-is — the aliases there already satisfy the slash-namespace convention.
 
 This decision is informed by the agent quality-sweep audit, which catalogued the alias gaps and motivated the canonical names chosen above. The audit's full list lives separately; this entry records only the policy outcome.
+
+## Rehomed from docs/decisions.md (archived 2026-06-09)
+
+The following entries were moved here from the legacy `docs/decisions.md` (now in `docs/archived/`), with factual corrections applied during the move.
+
+### 60. NaN-boxed Value representation
+
+Replaced the 24-byte `enum Value` with an 8-byte NaN-boxed `struct Value(u64)`. All values encoded in IEEE 754 quiet-NaN payload space.
+
+**Encoding scheme:**
+
+- **Floats:** stored directly as `f64` bits; canonical quiet NaN (`0x7FF8...`) used for NaN float values to avoid collision with boxed values.
+- **Boxed values:** sign=1, exponent=all 1s, quiet bit=1. Bits 50-45 = TAG (6 bits, up to 64 types), bits 44-0 = PAYLOAD (45 bits).
+- **Small integers:** 45-bit two's complement in the payload, range ±17.5 trillion. No heap allocation.
+- **Symbols/keywords:** `Spur` (interned string key, 32 bits) directly in the payload. **Chars:** Unicode codepoint in the payload. **Booleans/nil:** tag-only (`Value::NIL`, `Value::TRUE`, `Value::FALSE`).
+- **Heap types** (String, List, Vector, Map, Lambda, …): Rc pointer in the 45-bit payload (pointer >> 3, using 8-byte alignment). 23 heap-allocated tags.
+
+**API:** Value is no longer an enum — pattern matching uses `val.view()` → `ValueView`, or accessors (`as_int()`, `as_str()`, `as_list()`, `is_nil()`); constructors are lowercase fns (`Value::int(n)`, `Value::string(s)`).
+
+**Benchmark results at migration time (Apple M-series, release):** VM mode +8-12% (tak 9.09s→8.04s, deriv 1.99s→1.84s) from better cache locality; tree-walker −9-16% from `view()`/accessor overhead on the hot match path; RSS −5-10%. Kept despite the TW regression because the VM is the default/future path and the TW's role is shrinking (macro expansion, `--tw` compat).
+
+**Migration scope:** ~1,800 compile errors across 34 files in 8 crates, purely mechanical. **Safety fix found during migration:** `as_bytevector()`/`as_record()` had dangling-pointer UB via `borrow_rc()` returning a reference into a stack-local `ManuallyDrop<Rc<T>>`; fixed to `borrow_ref()`.
+
+### 61. Mini-eval removal — callback architecture
+
+The 620-line mini-evaluator (`sema_eval_value` + hand-rolled `call_function`) that lived in `sema-stdlib/src/list.rs` (see #6, #29) was **deleted** and replaced with thread-local `eval_callback`/`call_callback` in `sema-core`, registered by `sema-eval` at interpreter init. All stdlib HOFs now call through the real evaluator.
+
+- **Why:** the mini-eval diverged from the real evaluator (no `try/catch`, `do`, macros, modules) and blocked the bytecode-VM transition.
+- **Cost:** 1BRC regressed ~960ms → ~3050ms on 1M rows; fast-path work recovered ~14% (shared `with_stdlib_ctx` EvalContext, inline NativeFn dispatch, self-evaluating fast path, deferred cloning). The remaining gap is fundamental tree-walker overhead — closed by the bytecode VM, not by reviving the mini-eval.
+- Residue: a small `simple_eval` fallback survives in `sema-llm/src/builtins.rs` only.
+
+### 62. Runtime sandbox: capability bitset, not a process sandbox
+
+- `--sandbox` restricts dangerous natives at runtime via a `Caps` bitset (`sema-core/src/sandbox.rs`). **Nine** capability groups: `fs-read`, `fs-write`, `shell`, `network`, `env-read`, `env-write`, `process`, `llm`, `serial`.
+- Sandboxed functions stay registered (discoverable, tab-completable) but return `PermissionDenied` when invoked. `register_fn_gated()` wraps closures with a `Sandbox::check()` guard at registration; unrestricted default = zero overhead.
+- Presets: `--sandbox=strict` (deny shell, fs-write, network, env-write, process, llm, serial) and `--sandbox=all`. Path restriction via `--allowed-paths` / `Sandbox::with_allowed_paths`.
+- Embedders: `InterpreterBuilder::with_sandbox(Sandbox::deny(...))`.
+- The WASM playground uses compile-time `#[cfg]` shims instead — complementary.
+- **Not a process sandbox** — in-language permission checks only; no OS-level isolation.
+
+### 63. Package system: git + registry sources, lockfile
+
+- `sema pkg` CLI: `init`, `add`, `install`, `update`, `remove`, `list`, plus registry commands (`search`, `info`, `publish`, `yank`, `login`).
+- Two sources: **git repos** (`sema pkg add github.com/user/repo@ref` → `~/.sema/packages/`) and the **registry** (self-hostable single Rust binary in `pkg/` — SQLite/SeaORM, REST API, web UI; `DEFAULT_REGISTRY = pkg.sema-lang.com`, currently not serving — see `docs/plans/2026-06-09-pkg-registry-predeploy-hardening.md`).
+- Manifest: `sema.toml` (`[package]` + `[deps]`; short names = registry, URL paths = git). Default entrypoint `package.sema`, overridable via `entrypoint`.
+- **Lockfile is implemented** (`sema.lock`: exact commit SHAs + registry checksums, `--locked` enforcement in `crates/sema/src/pkg.rs`).

@@ -1,5 +1,9 @@
 # Architecture Decisions and Future Plans
 
+> **ARCHIVED 2026-06-09.** Legacy pre-`docs/adr.md` document — kept for history only; do not trust as current.
+> Unique content was rehomed to `docs/adr.md` #60-63 (NaN-boxing, mini-eval removal, sandbox, package system).
+> Known-wrong claims as of archival: the **Named-Let** section is false (named-let IS desugared to letrec+lambda; `compile_named_let`/`NamedLet` were removed — see adr.md #52); the **eval reify** section describes a design that was never built (VM `eval` sees globals only, no locals view — see `docs/limitations.md`); the LSP and "Future: lock file" sections long since shipped.
+
 This document records key architectural decisions in Sema and planned future work.
 
 ## Naming Conventions

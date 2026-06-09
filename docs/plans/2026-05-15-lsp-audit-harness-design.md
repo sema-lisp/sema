@@ -2,6 +2,7 @@
 
 **Status:** Approved design, awaiting implementation plan
 **Date:** 2026-05-15
+**Reviewed 2026-06-09:** Still unique work — NOT implemented by the Python suite (`crates/sema-lsp/tests/e2e/`, happy-path request/response tests) nor by `crates/sema-lsp/tests/lsp_e2e_test.rs` (capability smoke test). Before implementing, refresh: (a) extend the capability matrix with the five post-design capabilities (formatting, selectionRange, declaration, documentLink, callHierarchy); (b) account for `lsp_e2e_test.rs` as a third existing layer; (c) recheck the "code-lens round-trip is manual-only" claim against `test_code_lens.py`. Related: `2026-06-09-lsp-e2e-compliance-testing.md` covers the in-crate Rust protocol/lifecycle/spec-compliance suite; this design covers corpus/oracle-based correctness auditing — complementary, not duplicates.
 **Goal:** Prove the `sema-lsp` server actually works end-to-end across all advertised capabilities, against real Sema code, before any new LSP features are added.
 
 ## Motivation

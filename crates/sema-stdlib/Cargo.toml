@@ -22,7 +22,6 @@ csv.workspace = true
 md5.workspace = true
 hmac.workspace = true
 hex.workspace = true
-memchr.workspace = true
 lasso.workspace = true
 hashbrown.workspace = true
 unicode-normalization.workspace = true

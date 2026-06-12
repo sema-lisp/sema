@@ -1,0 +1,64 @@
+# EditorConfig — https://editorconfig.org
+# Top-level config for the sema-lisp workspace. Indent widths match the
+# existing files in each language (Rust/Kotlin/Python/shell/TOML = 4,
+# Sema/Lisp/web/YAML/Markdown = 2).
+root = true
+
+# Defaults for every file.
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+indent_style = space
+indent_size = 4
+
+# Rust.
+[*.rs]
+indent_size = 4
+
+# Sema source and other Lisp-family dialects (2-space Lisp convention).
+[*.{sema,scm,ss,lisp,lsp,clj,cljs,cljc,edn,el,fnl,janet,steel,l}]
+indent_size = 2
+
+# Web / frontend (notebook UI, playground, website).
+[*.{js,mjs,cjs,jsx,ts,tsx,vue,json,jsonc,css,scss,html}]
+indent_size = 2
+
+# YAML (CI, codecov, etc.).
+[*.{yml,yaml}]
+indent_size = 2
+
+# Kotlin / Gradle (IntelliJ plugin).
+[*.{kt,kts}]
+indent_size = 4
+
+# Python (benchmark + tooling scripts).
+[*.py]
+indent_size = 4
+
+# Shell.
+[*.sh]
+indent_size = 4
+
+# TOML (Cargo manifests + workspace config).
+[*.toml]
+indent_size = 4
+
+# Makefiles require real tabs.
+[{Makefile,*.mk}]
+indent_style = tab
+
+# Markdown — keep trailing spaces (two of them are a hard line break).
+[*.md]
+indent_size = 2
+trim_trailing_whitespace = false
+
+# Byte-sensitive test/fuzz corpora — never let an editor rewrite them.
+[**/test/corpus/**]
+trim_trailing_whitespace = false
+insert_final_newline = false
+
+[**/fuzz/corpus/**]
+trim_trailing_whitespace = false
+insert_final_newline = false

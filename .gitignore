@@ -46,12 +46,22 @@ reddit-scrutiny.json
 
 # Node
 node_modules/
+.nvmrc.local
+
+# Lockfiles (npm only — no bun, no yarn)
+bun.lock
+bun.lockb
+yarn.lock
+yarn-error.log
 
 # Build output
 **/dist/
+**/storybook-static/
 
 # Test artifacts
 test-results/
+/brand/ui/.vitest-attachments
+/brand/ui/tests/__screenshots__
 mutants.out/
 mutants.out.old/
 .vercel

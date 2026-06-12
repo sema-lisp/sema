@@ -3,6 +3,50 @@ import {ref} from 'vue'
 
 const copied = ref({})
 
+const activeOgVariation = ref(0)
+const ogVariations = [
+  {
+    category: 'Standard Library',
+    badge: 'Doc Reference',
+    path: 'stdlib / http-json',
+    desc: 'Documentation for HTTP client requests, JSON parsing, API integration primitives, and web server capabilities in the Sema standard library.',
+    metaLabel: 'Module',
+    metaValue: 'stdlib/http-json'
+  },
+  {
+    category: 'LLM Primitives',
+    badge: 'LLM Reference',
+    path: 'llm / conversations',
+    desc: 'Persistent conversation structures, message thread history tracking, prompt templates, and direct API client bindings for Anthropic, OpenAI, and Gemini.',
+    metaLabel: 'Feature',
+    metaValue: 'llm/conversations'
+  },
+  {
+    category: 'Tools & Integration',
+    badge: 'Tools Reference',
+    path: 'tools / dap-debugger',
+    desc: 'Reference for the Debug Adapter Protocol (DAP) server. Breakpoints, stepping, frame inspection, and variable watch expressions in Sema.',
+    metaLabel: 'Subsystem',
+    metaValue: 'sema-dap'
+  },
+  {
+    category: 'Tools & Integration',
+    badge: 'Tools Reference',
+    path: 'tools / lsp-server',
+    desc: 'Language Server Protocol server. Scope-aware completions, go-to-definition, reference scanning, syntax formatting, and semantic token coloring.',
+    metaLabel: 'Subsystem',
+    metaValue: 'sema-lsp'
+  },
+  {
+    category: 'Getting Started',
+    badge: 'Guide Reference',
+    path: 'guide / quickstart',
+    desc: 'Installation instructions, repl basics, editor config, compiling standalone binaries, and running your first agentic loop.',
+    metaLabel: 'Section',
+    metaValue: 'docs/quickstart'
+  }
+]
+
 const copyToClipboard = (text, key) => {
   if (navigator.clipboard) {
     navigator.clipboard.writeText(text).then(() => {
@@ -317,6 +361,28 @@ const copyIcon = (key) => {
                   <div class="specimen-info">Code Small · 400 Regular</div>
                   <div class="specimen-sample mono-font code-preview-small">
                     (map (lambda (x) (* x 2)) (range 1 10)) ; => (2 4 6 8 10 12 14 16 18)
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <!-- Inter Sans Specimen -->
+            <div class="font-specimen-block">
+              <h3 class="font-label">Inter — UI &amp; Body Prose</h3>
+              <div class="font-preview-large sans-font" style="font-family: 'Inter', system-ui, sans-serif;">
+                Aa Bb Cc Dd Ee Ff Gg Hh Ii Jj Kk Ll Mm Nn Oo Pp Qq Rr Ss Tt Uu Vv Ww Xx Yy Zz 1234567890
+              </div>
+              <div class="font-specimen-lines">
+                <div class="specimen-line">
+                  <div class="specimen-info">Body Prose · 400 Regular</div>
+                  <div class="specimen-sample sans-font body-preview" style="font-family: 'Inter', system-ui, sans-serif; font-size: 1rem; color: var(--text-secondary); line-height: 1.6; text-align: left;">
+                    Sema Lisp merges the speed of Rust with the power of modern LLMs. It is designed to be highly structured, conversationally persistent, and fully sandboxed.
+                  </div>
+                </div>
+                <div class="specimen-line">
+                  <div class="specimen-info">UI Label · 500 Medium</div>
+                  <div class="specimen-sample sans-font ui-preview" style="font-family: 'Inter', system-ui, sans-serif; font-size: 0.85rem; font-weight: 500; color: var(--text-primary); text-align: left;">
+                    Active Session: coder-agent (llm-run-active)
                   </div>
                 </div>
               </div>
@@ -1205,32 +1271,32 @@ resp = client.messages.create(
             <!-- Homepage OG Card -->
             <div class="og-card-wrapper">
               <h4 style="font-family: 'JetBrains Mono', monospace; font-size: 0.75rem; color: var(--gold); text-transform: uppercase; margin-bottom: 1rem;">A. Homepage Preview (1200×630)</h4>
-              <div class="og-card homepage-og" style="aspect-ratio: 1200 / 630; width: 100%; position: relative; background-color: #131110; border: 1px solid var(--border); border-radius: 12px; overflow: hidden; display: flex; flex-direction: column; justify-content: space-between; padding: 6.5cqw 8cqw; box-shadow: 0 20px 50px rgba(0,0,0,0.5);">
+              <div class="og-card homepage-og" style="aspect-ratio: 1200 / 630; width: 100%; position: relative; background-color: #131110; border: 1px solid var(--border); border-radius: 12px; overflow: hidden; display: flex; flex-direction: column; justify-content: space-between; padding: 4.5cqw 6.5cqw; box-shadow: 0 20px 50px rgba(0,0,0,0.5);">
                 <!-- Radial glow -->
                 <div style="position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); width: 90%; height: 90%; background: radial-gradient(circle, rgba(200, 168, 85, 0.08) 0%, transparent 70%); pointer-events: none; z-index: 1;"></div>
                 <!-- Dotted grid -->
                 <div style="position: absolute; inset: 0; background-image: radial-gradient(#2b2620 1px, transparent 1px); background-size: 2cqw 2cqw; opacity: 0.45; pointer-events: none; z-index: 1;"></div>
 
                 <!-- Card Header/Content -->
-                <div style="position: relative; z-index: 2; display: flex; flex-direction: column; gap: 2.5cqw;">
+                <div style="position: relative; z-index: 2; display: flex; flex-direction: column; gap: 2cqw;">
                   <div style="display: flex; align-items: center; gap: 1.5cqw;">
-                    <div style="width: 28cqw;" v-html="logoSvgCode"></div>
+                    <div style="width: 22cqw;" v-html="logoSvgCode"></div>
                   </div>
-                  <div style="display: flex; flex-direction: column; gap: 1cqw; margin-top: 1cqw;">
-                    <h1 style="font-family: 'Cormorant', Georgia, serif; font-size: 5cqw; font-weight: 300; color: #e9e3d6; line-height: 1.15; margin: 0; text-align: left;">Sema Lisp — <span style="color: var(--gold);">Agentic Primitives</span></h1>
-                    <p style="font-family: 'Cormorant', Georgia, serif; font-size: 2cqw; color: #968c79; font-style: italic; line-height: 1.4; max-width: 75%; margin: 0; text-align: left;">
+                  <div style="display: flex; flex-direction: column; gap: 0.8cqw; margin-top: 0.5cqw;">
+                    <h1 style="font-family: 'Cormorant', Georgia, serif; font-size: 4.2cqw; font-weight: 300; color: #e9e3d6; line-height: 1.15; margin: 0; text-align: left;">Sema Lisp — <span style="color: var(--gold);">Agentic Primitives</span></h1>
+                    <p style="font-family: 'Inter', system-ui, sans-serif; font-size: 1.8cqw; color: #968c79; line-height: 1.45; max-width: 75%; margin: 0; text-align: left;">
                       A Scheme-like Lisp where prompts are s-expressions, conversations are persistent data structures, and LLM calls are just another form of evaluation.
                     </p>
                   </div>
                 </div>
 
                 <!-- Card Footer -->
-                <div style="position: relative; z-index: 2; display: flex; justify-content: space-between; align-items: flex-end; border-top: 1px solid var(--border); padding-top: 2.5cqw; margin-top: 1cqw;">
-                  <div style="display: flex; flex-direction: column; gap: 0.5cqw; align-items: flex-start;">
-                    <span style="font-family: 'JetBrains Mono', monospace; font-size: 1.1cqw; text-transform: uppercase; letter-spacing: 0.15em; color: var(--gold);">Domain</span>
-                    <span style="font-family: 'JetBrains Mono', monospace; font-size: 1.6cqw; color: #e9e3d6; font-weight: 500;">sema-lang.com</span>
+                <div style="position: relative; z-index: 2; display: flex; justify-content: space-between; align-items: center; border-top: 1px solid var(--border); padding-top: 2cqw; margin-top: 0.5cqw;">
+                  <div style="display: flex; flex-direction: column; gap: 0.4cqw; align-items: flex-start;">
+                    <span style="font-family: 'JetBrains Mono', monospace; font-size: 1cqw; text-transform: uppercase; letter-spacing: 0.15em; color: var(--gold); line-height: 1;">Domain</span>
+                    <span style="font-family: 'JetBrains Mono', monospace; font-size: 1.5cqw; color: #e9e3d6; font-weight: 500; line-height: 1.2;">sema-lang.com</span>
                   </div>
-                  <div class="og-code-preview" style="background-color: #1c1916; border: 1px solid var(--border); border-radius: 6px; padding: 1.8cqw 2.5cqw; font-family: 'JetBrains Mono', monospace; font-size: 1.3cqw; line-height: 1.6; color: #e9e3d6; min-width: 45%; box-shadow: 0 10px 30px rgba(0,0,0,0.4); text-align: left;">
+                  <div class="og-code-preview" style="background-color: #1c1916; border: 1px solid var(--border); border-radius: 6px; padding: 1.2cqw 1.8cqw; font-family: 'JetBrains Mono', monospace; font-size: 1.15cqw; line-height: 1.55; color: #e9e3d6; min-width: 46%; box-shadow: 0 10px 30px rgba(0,0,0,0.4); text-align: left;">
                     <span style="color: #6b6354; font-style: italic;">;; Define an LLM agent with tools</span><br>
                     <span style="color: #6b6354;">(</span><span style="color: var(--gold);">defagent</span> weather-bot<br>
                     &nbsp;&nbsp;<span style="color: #6b6354;">{</span><span style="color: #7aacb8;">:system</span> <span style="color: #a8c47a;">"You answer weather questions."</span><br>
@@ -1243,37 +1309,60 @@ resp = client.messages.create(
 
             <!-- Docs/Reference OG Card -->
             <div class="og-card-wrapper">
-              <h4 style="font-family: 'JetBrains Mono', monospace; font-size: 0.75rem; color: var(--gold); text-transform: uppercase; margin-bottom: 1rem;">B. Documentation / Reference Page Preview (1200×630)</h4>
-              <div class="og-card docs-og" style="aspect-ratio: 1200 / 630; width: 100%; position: relative; background-color: #131110; border: 1px solid var(--border); border-radius: 12px; overflow: hidden; display: flex; flex-direction: column; justify-content: space-between; padding: 6.5cqw 8cqw; box-shadow: 0 20px 50px rgba(0,0,0,0.5);">
+              <h4 style="font-family: 'JetBrains Mono', monospace; font-size: 0.75rem; color: var(--gold); text-transform: uppercase; margin-bottom: 0.5rem;">B. Documentation / Reference Page Preview (1200×630)</h4>
+              
+              <!-- Tab selector -->
+              <div class="og-variation-tabs" style="display: flex; gap: 0.5rem; flex-wrap: wrap; margin-bottom: 1.25rem;">
+                <button 
+                  v-for="(v, index) in ogVariations" 
+                  :key="v.path" 
+                  @click="activeOgVariation = index"
+                  :style="{
+                    backgroundColor: activeOgVariation === index ? 'rgba(200, 168, 85, 0.08)' : 'transparent',
+                    borderColor: activeOgVariation === index ? 'var(--gold)' : 'var(--border)',
+                    color: activeOgVariation === index ? 'var(--gold)' : 'var(--text-secondary)'
+                  }"
+                  style="font-family: 'JetBrains Mono', monospace; font-size: 0.7rem; padding: 0.4rem 0.8rem; border: 1px solid; border-radius: 4px; cursor: pointer; transition: all 0.15s; outline: none;"
+                >
+                  {{ v.path.split(' / ')[1] }}
+                </button>
+              </div>
+
+              <div class="og-card docs-og" style="aspect-ratio: 1200 / 630; width: 100%; position: relative; background-color: #131110; border: 1px solid var(--border); border-radius: 12px; overflow: hidden; display: flex; flex-direction: column; justify-content: space-between; padding: 5.5cqw 7cqw; box-shadow: 0 20px 50px rgba(0,0,0,0.5);">
                 <!-- Radial glow -->
                 <div style="position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); width: 90%; height: 90%; background: radial-gradient(circle, rgba(200, 168, 85, 0.08) 0%, transparent 70%); pointer-events: none; z-index: 1;"></div>
                 <!-- Dotted grid -->
                 <div style="position: absolute; inset: 0; background-image: radial-gradient(#2b2620 1px, transparent 1px); background-size: 2cqw 2cqw; opacity: 0.45; pointer-events: none; z-index: 1;"></div>
 
                 <!-- Card Header/Content -->
-                <div style="position: relative; z-index: 2; display: flex; flex-direction: column; gap: 2.5cqw;">
+                <div style="position: relative; z-index: 2; display: flex; flex-direction: column; gap: 2.2cqw;">
                   <div style="display: flex; align-items: center; justify-content: space-between; width: 100%;">
-                    <div style="width: 20cqw;" v-html="logoSvgCode"></div>
-                    <span style="font-family: 'JetBrains Mono', monospace; font-size: 1.2cqw; text-transform: uppercase; letter-spacing: 0.15em; color: var(--gold); border: 1px solid rgba(200, 168, 85, 0.2); padding: 0.4cqw 1cqw; border-radius: 20px; background: rgba(200, 168, 85, 0.02);">Doc Reference</span>
+                    <span style="font-family: 'JetBrains Mono', monospace; font-size: 1.4cqw; text-transform: uppercase; letter-spacing: 0.15em; color: var(--gold);">{{ ogVariations[activeOgVariation].category }}</span>
+                    <span style="font-family: 'JetBrains Mono', monospace; font-size: 1.2cqw; text-transform: uppercase; letter-spacing: 0.12em; color: var(--text-tertiary); border: 1px solid var(--border); padding: 0.4cqw 1cqw; border-radius: 20px; background: rgba(0,0,0,0.15);">{{ ogVariations[activeOgVariation].badge }}</span>
                   </div>
-                  <div style="display: flex; flex-direction: column; gap: 1cqw; margin-top: 1cqw;">
-                    <h1 style="font-family: 'Cormorant', Georgia, serif; font-size: 4.8cqw; font-weight: 300; color: #e9e3d6; line-height: 1.15; margin: 0; text-align: left;">stdlib / <span style="color: var(--gold);">http-json</span></h1>
-                    <p style="font-family: 'Cormorant', Georgia, serif; font-size: 2cqw; color: #968c79; font-style: italic; line-height: 1.4; max-width: 75%; margin: 0; text-align: left;">
-                      Documentation for HTTP client requests, JSON parsing, API integration primitives, and web server capabilities in the Sema standard library.
+                  <div style="display: flex; flex-direction: column; gap: 1cqw; margin-top: 1.2cqw;">
+                    <h1 style="font-family: 'Cormorant', Georgia, serif; font-size: 6cqw; font-weight: 300; color: #e9e3d6; line-height: 1.15; margin: 0; text-align: left;">
+                      {{ ogVariations[activeOgVariation].path.split(' / ')[0] }} / <span style="color: var(--gold);">{{ ogVariations[activeOgVariation].path.split(' / ')[1] }}</span>
+                    </h1>
+                    <p style="font-family: 'Inter', system-ui, sans-serif; font-size: 2.5cqw; color: #968c79; line-height: 1.55; max-width: 90%; margin: 0; text-align: left;">
+                      {{ ogVariations[activeOgVariation].desc }}
                     </p>
                   </div>
                 </div>
 
                 <!-- Card Footer -->
-                <div style="position: relative; z-index: 2; display: flex; justify-content: space-between; align-items: flex-end; border-top: 1px solid var(--border); padding-top: 2.5cqw; margin-top: 1cqw;">
-                  <div style="display: flex; flex-direction: column; gap: 0.5cqw; align-items: flex-start;">
-                    <span style="font-family: 'JetBrains Mono', monospace; font-size: 1.1cqw; text-transform: uppercase; letter-spacing: 0.15em; color: var(--gold);">Module</span>
-                    <span style="font-family: 'JetBrains Mono', monospace; font-size: 1.6cqw; color: #e9e3d6; font-weight: 500;">stdlib/http-json</span>
+                <div style="position: relative; z-index: 2; display: flex; justify-content: space-between; align-items: flex-end; border-top: 1px solid var(--border); padding-top: 2.5cqw; margin-top: 1.2cqw;">
+                  <div style="display: flex; flex-direction: column; gap: 0.4cqw; align-items: flex-start; margin-bottom: 0.5cqw;">
+                    <span style="font-family: 'JetBrains Mono', monospace; font-size: 1.1cqw; text-transform: uppercase; letter-spacing: 0.15em; color: var(--gold); line-height: 1;">{{ ogVariations[activeOgVariation].metaLabel }}</span>
+                    <span style="font-family: 'JetBrains Mono', monospace; font-size: 1.6cqw; color: #e9e3d6; font-weight: 500; line-height: 1.2;">{{ ogVariations[activeOgVariation].metaValue }}</span>
                   </div>
-                  <div class="og-code-preview" style="background-color: #1c1916; border: 1px solid var(--border); border-radius: 6px; padding: 1.8cqw 2.5cqw; font-family: 'JetBrains Mono', monospace; font-size: 1.3cqw; line-height: 1.6; color: #e9e3d6; min-width: 45%; box-shadow: 0 10px 30px rgba(0,0,0,0.4); text-align: left;">
-                    <span style="color: #6b6354; font-style: italic;">;; HTTP client request & parse</span><br>
-                    <span style="color: #6b6354;">(</span><span style="color: var(--gold);">let</span> <span style="color: #6b6354;">[</span>resp <span style="color: #6b6354;">(</span><span style="color: #88a8b8;">http/get</span> <span style="color: #a8c47a;">"api.github.com/..."</span><span style="color: #6b6354;">)]</span><br>
-                    &nbsp;&nbsp;<span style="color: #6b6354;">(</span><span style="color: #88a8b8;">json/parse</span> <span style="color: #6b6354;">(</span><span style="color: #88a8b8;">http/body</span> resp<span style="color: #6b6354;">)))</span>
+                  <div style="height: 6.66cqw; width: auto; opacity: 0.8; display: flex; align-items: flex-end; justify-content: flex-end; margin-bottom: 0.5cqw;">
+                    <!-- Canonical (sema) SVG logo mark with height scaled -->
+                    <svg viewBox="0 0 366.00 132.00" style="height: 100%; width: auto;" fill="none">
+                      <path d="M48.5000 104.3000L48.5000 114Q34 110.7000 26.0500 100.5000Q18.1000 90.3000 18.1000 75L18.1000 57Q18.1000 41.7000 26.0500 31.5000Q34 21.3000 48.5000 18L48.5000 27.6000Q42.2000 29.1000 37.6000 33.1500Q33 37.2000 30.5000 43.3000Q28 49.4000 28 57L28 75Q28 82.6000 30.5000 88.6500Q33 94.7000 37.6000 98.7500Q42.2000 102.8000 48.5000 104.3000" fill="#c8a855" />
+                      <path d="M93.2000 102.8000L88.8000 102.8000Q79.4000 102.8000 74.2000 98.6000Q69 94.4000 69 86.8000L78.8000 86.8000Q78.8000 90.4000 81.4500 92.4500Q84.1000 94.5000 88.8000 94.5000L93.2000 94.5000Q98.1000 94.5000 100.7500 92.4000Q103.4000 90.3000 103.4000 86.5000Q103.4000 79.8000 96.8000 79L82 76.9000Q76.1000 76 72.9000 72.0500Q69.7000 68.1000 69.7000 61.8000Q69.7000 54.4000 74.7000 50.3000Q79.7000 46.2000 88.7000 46.2000L93.1000 46.2000Q101.5000 46.2000 106.7000 50.2000Q111.9000 54.2000 112.2000 60.8000L102.2000 60.8000Q102 58 99.6000 56.1500Q97.2000 54.3000 93.1000 54.3000L88.7000 54.3000Q84.2000 54.3000 81.7500 56.3000Q79.3000 58.3000 79.3000 61.7000Q79.3000 67.2000 84.8000 67.9000L98.7000 69.9000Q113 71.8000 113 86.5000Q113 94.3000 107.8500 98.5500Q102.7000 102.8000 93.2000 102.8000 M152 103Q142.1000 103 136.0500 97.1000Q130 91.2000 130 81L130 68Q130 57.8000 136.0500 51.9000Q142.1000 46 152 46Q158.6000 46 163.5500 48.6500Q168.5000 51.3000 171.2500 56.0500Q174 60.8000 174 67.1000L174 77L139.7000 77L139.7000 81.8000Q139.7000 87.8000 143 91.2000Q146.3000 94.6000 152 94.6000Q156.8000 94.6000 159.9000 92.8000Q163 91 163.6000 87.8000L173.5000 87.8000Q172.5000 94.8000 166.6000 98.9000Q160.7000 103 152 103M139.7000 67.1000L139.7000 69.7000L164.3000 69.7000L164.3000 67.1000Q164.3000 60.8000 161.1000 57.4000Q157.9000 54 152 54Q146.1000 54 142.9000 57.4000Q139.7000 60.8000 139.7000 67.1000 M197.7000 102L188.7000 102L188.7000 47L197.1000 47L197.1000 54.5000L197.4000 54.5000Q197.8000 50.7000 200.2500 48.3500Q202.7000 46 206.5000 46Q210.2000 46 212.7000 48.2000Q215.2000 50.4000 216.3000 54.1000Q216.9000 50.3000 219.4000 48.1500Q221.9000 46 225.7000 46Q230.9000 46 234.1000 49.9500Q237.3000 53.9000 237.3000 60.2000L237.3000 102L228.3000 102L228.3000 60.3000Q228.3000 57.2000 226.7500 55.3500Q225.2000 53.5000 222.6000 53.5000Q220 53.5000 218.5000 55.3000Q217 57.1000 217 60.3000L217 102L209 102L209 60.3000Q209 57.2000 207.5000 55.3500Q206 53.5000 203.4000 53.5000Q200.8000 53.5000 199.2500 55.3000Q197.7000 57.1000 197.7000 60.3000 M268.9000 103Q260.4000 103 255.4500 98.2500Q250.5000 93.5000 250.5000 85.8000Q250.5000 78.1000 255.6500 73.4000Q260.8000 68.7000 269.2000 68.7000L285.3000 68.7000L285.3000 64.5000Q285.3000 54.4000 274.1000 54.4000Q269.1000 54.4000 266.0500 56.2500Q263 58.1000 262.8000 61.4000L253 61.4000Q253.5000 54.7000 259.1000 50.3500Q264.7000 46 274.1000 46Q284.2000 46 289.7000 50.8000Q295.2000 55.6000 295.2000 64.3000L295.2000 102L285.5000 102L285.5000 91.9000L285.3000 91.9000Q284.6000 97 280.2500 100Q275.9000 103 268.9000 103M271.5000 94.7000Q277.8000 94.7000 281.5500 91.6500Q285.3000 88.6000 285.3000 83.3000L285.3000 76L270.1000 76Q265.8000 76 263.1500 78.5500Q260.5000 81.1000 260.5000 85.3000Q260.5000 89.6000 263.4000 92.1500Q266.3000 94.7000 271.5000 94.7000" fill="#ffffff" />
+                      <path d="M316.5000 114L316.5000 104.3000Q322.8000 102.8000 327.4000 98.7500Q332 94.7000 334.5500 88.6500Q337.1000 82.6000 337.1000 75L337.1000 57Q337.1000 49.4000 334.5500 43.3000Q332 37.2000 327.4000 33.1500Q322.8000 29.1000 316.5000 27.6000L316.5000 18Q331 21.3000 339 31.5000Q347 41.7000 347 57L347 75Q347 90.3000 339 100.5000Q331 110.7000 316.5000 114" fill="#c8a855" />
+                    </svg>
                   </div>
                 </div>
               </div>

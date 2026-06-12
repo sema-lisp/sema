@@ -60,8 +60,8 @@ yarn-error.log
 
 # Test artifacts
 test-results/
-/brand/ui/.vitest-attachments
-/brand/ui/tests/__screenshots__
+/ui/.vitest-attachments
+/ui/tests/__screenshots__
 mutants.out/
 mutants.out.old/
 .vercel

@@ -6,6 +6,7 @@
 - Single crate: `cargo test -p sema-reader` | Single test: `cargo test -p sema --test integration_test -- test_name`
 - Run file: `cargo run -- examples/hello.sema` | REPL: `cargo run` | Eval: `cargo run -- -e "(+ 1 2)"`
 - Integration tests: `crates/sema/tests/integration_test.rs`. Reader unit tests: `crates/sema-reader/src/reader.rs`.
+- IntelliJ plugin: `editors/intellij/`. Unit tests: `./gradlew test` (116 tests, JUnit 4). Full IDE integration: `./gradlew buildPlugin integrationTest`.
 
 ## Architecture (Cargo workspace, 11 crates)
 

@@ -12,6 +12,7 @@ members = [
     "crates/sema-lsp",
     "crates/sema-dap",
     "crates/sema-notebook",
+    "crates/sema-docs",
 ]
 exclude = ["pkg"]
 resolver = "2"
@@ -34,6 +35,7 @@ sema-fmt = { version = "=1.16.0", path = "crates/sema-fmt" }
 sema-lsp = { version = "=1.16.0", path = "crates/sema-lsp" }
 sema-dap = { version = "=1.16.0", path = "crates/sema-dap" }
 sema-notebook = { version = "=1.16.0", path = "crates/sema-notebook" }
+sema-docs = { version = "=1.16.0", path = "crates/sema-docs" }
 
 tower-lsp = "0.20"
 dashmap = "6"

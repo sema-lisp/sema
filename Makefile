@@ -1,4 +1,4 @@
-.PHONY: all build release install uninstall test test-lsp test-embedding-bench test-http test-llm check clippy fmt fmt-check clean run lint lint-links examples examples-vm smoke-bytecode test-providers fuzz fuzz-reader fuzz-eval setup bench-1m bench-10m bench-100m site-dev site-build site-preview site-deploy deploy coverage coverage-html bench bench-vm bench-tree bench-save bench-suite bench-closure bench-numeric bench-compare bench-baseline profile profile-vm profile-tree ts-setup ts-generate ts-test ts-playground js-lib-build js-lib-dev
+.PHONY: all build release install uninstall test test-lsp test-embedding-bench test-http test-llm check clippy fmt fmt-check clean run lint lint-links docs docs-check examples examples-vm smoke-bytecode test-providers fuzz fuzz-reader fuzz-eval setup bench-1m bench-10m bench-100m site-dev site-build site-preview site-deploy deploy coverage coverage-html bench bench-vm bench-tree bench-save bench-suite bench-closure bench-numeric bench-compare bench-baseline profile profile-vm profile-tree ts-setup ts-generate ts-test ts-playground js-lib-build js-lib-dev
 build:
 	cargo build
 
@@ -46,6 +46,18 @@ run:
 	cargo run
 
 lint: fmt-check clippy
+
+# Regenerate the builtin doc index (and, later, the API-reference site) from the canonical
+# structured source in crates/sema-docs/entries/stdlib + special-forms.
+docs:
+	cargo run -q -p sema-docs -- gen
+
+# CI gate: every entry must have a summary (--strict), the committed index must be up to date with
+# the source, and every registered builtin/special form must be documented (coverage test).
+docs-check:
+	cargo run -q -p sema-docs -- gen --strict
+	git diff --exit-code crates/sema-docs/builtin_docs.generated.json
+	cargo test -q -p sema-lsp builtin_doc_coverage
 
 lint-links:
 	lychee --config lychee.toml --no-progress '**/*.md'

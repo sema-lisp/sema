@@ -1,0 +1,16 @@
+[package]
+name = "sema-docs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Canonical structured documentation for Sema builtins/special forms; powers LSP hover/completion and REPL apropos"
+
+[dependencies]
+clap = { workspace = true, features = ["derive"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = "0.9"
+
+[[bin]]
+name = "sema-docs"
+path = "src/main.rs"

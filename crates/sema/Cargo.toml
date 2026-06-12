@@ -29,6 +29,7 @@ sema-fmt.workspace = true
 sema-lsp.workspace = true
 sema-dap.workspace = true
 sema-notebook.workspace = true
+sema-mcp.workspace = true
 tokio.workspace = true
 reedline = "0.47"
 nu-ansi-term = "0.50"

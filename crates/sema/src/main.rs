@@ -280,6 +280,18 @@ enum Commands {
     Lsp,
     /// Start the Debug Adapter Protocol server
     Dap,
+    /// Start the Model Context Protocol (MCP) server
+    Mcp {
+        /// Optional source files to run/load tools from
+        #[arg(value_name = "FILES")]
+        files: Vec<String>,
+        /// Comma-separated list of tool names to explicitly include
+        #[arg(long, value_name = "TOOLS")]
+        include: Option<String>,
+        /// Comma-separated list of tool names to explicitly exclude
+        #[arg(long, value_name = "TOOLS")]
+        exclude: Option<String>,
+    },
     /// Notebook interface — cell-based evaluation with browser UI
     Notebook {
         #[command(subcommand)]
@@ -605,6 +617,55 @@ fn main() {
                     .build()
                     .expect("Failed to create tokio runtime")
                     .block_on(sema_dap::run_server());
+            }
+            Commands::Mcp {
+                files,
+                include,
+                exclude,
+            } => {
+                let inc_tools = include.map(|s| {
+                    s.split(',')
+                        .map(|x| x.trim().to_string())
+                        .collect::<Vec<String>>()
+                });
+                let exc_tools = exclude.map(|s| {
+                    s.split(',')
+                        .map(|x| x.trim().to_string())
+                        .collect::<Vec<String>>()
+                });
+
+                let sandbox = sema_core::Sandbox::allow_all();
+                let interpreter = Interpreter::new_with_sandbox(&sandbox);
+
+                let _ = interpreter.eval_str("(llm/auto-configure)");
+
+                for file in files {
+                    match read_source_file(&file) {
+                        Ok(content) => {
+                            if let Err(e) = interpreter.eval_str_compiled(&content) {
+                                eprintln!("Error loading tool file {file}: {e}");
+                                std::process::exit(1);
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("Error reading tool file {file}: {e}");
+                            std::process::exit(1);
+                        }
+                    }
+                }
+
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("Failed to create tokio runtime")
+                    .block_on(async {
+                        if let Err(e) =
+                            sema_mcp::run_mcp_server(interpreter, inc_tools, exc_tools).await
+                        {
+                            eprintln!("MCP server error: {e}");
+                            std::process::exit(1);
+                        }
+                    });
             }
             Commands::Notebook { command } => {
                 run_notebook_command(command);
@@ -1306,11 +1367,63 @@ fn try_run_embedded() -> Option<i32> {
 
     let _ = interpreter.eval_str("(llm/auto-configure)");
 
-    match run_bytecode_bytes(&interpreter, &bytecode) {
-        Ok(_) => Some(0),
-        Err(e) => {
+    let args: Vec<String> = std::env::args().collect();
+    let is_mcp = args
+        .iter()
+        .any(|arg| arg == "--mcp" || arg.starts_with("--mcp="));
+
+    if is_mcp {
+        let mut include = None;
+        let mut exclude = None;
+        for window in args.windows(2) {
+            if window[0] == "--include" {
+                include = Some(window[1].clone());
+            } else if window[0] == "--exclude" {
+                exclude = Some(window[1].clone());
+            }
+        }
+        for arg in &args {
+            if let Some(rest) = arg.strip_prefix("--include=") {
+                include = Some(rest.to_string());
+            } else if let Some(rest) = arg.strip_prefix("--exclude=") {
+                exclude = Some(rest.to_string());
+            }
+        }
+
+        let inc_tools = include.map(|s| {
+            s.split(',')
+                .map(|x| x.trim().to_string())
+                .collect::<Vec<String>>()
+        });
+        let exc_tools = exclude.map(|s| {
+            s.split(',')
+                .map(|x| x.trim().to_string())
+                .collect::<Vec<String>>()
+        });
+
+        if let Err(e) = run_bytecode_bytes(&interpreter, &bytecode) {
             print_error(&e);
-            Some(1)
+            return Some(1);
+        }
+
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("Failed to create tokio runtime")
+            .block_on(async {
+                if let Err(e) = sema_mcp::run_mcp_server(interpreter, inc_tools, exc_tools).await {
+                    eprintln!("MCP server error: {e}");
+                    std::process::exit(1);
+                }
+            });
+        Some(0)
+    } else {
+        match run_bytecode_bytes(&interpreter, &bytecode) {
+            Ok(_) => Some(0),
+            Err(e) => {
+                print_error(&e);
+                Some(1)
+            }
         }
     }
 }

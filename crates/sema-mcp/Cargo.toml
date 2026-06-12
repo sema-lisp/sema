@@ -1,19 +1,22 @@
 [package]
-name = "sema-notebook"
+name = "sema-mcp"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
-description = "Notebook interface for Sema — cell-based evaluation with HTTP API and browser UI"
+description = "MCP (Model Context Protocol) server for Sema"
 
 [dependencies]
 sema-core.workspace = true
+sema-reader.workspace = true
 sema-eval.workspace = true
+sema-vm.workspace = true
+sema-fmt.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-axum.workspace = true
 tokio.workspace = true
-chrono = { workspace = true, features = ["serde"] }
-uuid.workspace = true
+sema-notebook.workspace = true
 gag.workspace = true
+uuid = { workspace = true, features = ["v4"] }
+crc32fast.workspace = true

@@ -12,6 +12,7 @@ members = [
     "crates/sema-lsp",
     "crates/sema-dap",
     "crates/sema-notebook",
+    "crates/sema-mcp",
 ]
 exclude = ["pkg"]
 resolver = "2"
@@ -34,6 +35,7 @@ sema-fmt = { version = "=1.16.0", path = "crates/sema-fmt" }
 sema-lsp = { version = "=1.16.0", path = "crates/sema-lsp" }
 sema-dap = { version = "=1.16.0", path = "crates/sema-dap" }
 sema-notebook = { version = "=1.16.0", path = "crates/sema-notebook" }
+sema-mcp = { version = "=1.16.0", path = "crates/sema-mcp" }
 
 tower-lsp = "0.20"
 dashmap = "6"
@@ -42,7 +44,7 @@ regex = "1"
 thiserror = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "net"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "net", "io-std", "io-util"] }
 reqwest = { version = "0.13", features = ["json", "stream", "blocking", "multipart"] }
 futures = "0.3"
 clap = { version = "4", features = ["derive"] }
@@ -73,6 +75,9 @@ rusqlite = { version = "0.31", features = ["bundled"] }
 semver = "1"
 tar = "0.4"
 flate2 = "1"
+gag = "1.0.0"
+crc32fast = "1"
+
 
 [profile.release]
 opt-level = 3

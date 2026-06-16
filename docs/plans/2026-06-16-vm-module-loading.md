@@ -1,6 +1,14 @@
 # VM-backed module loading (`load`/`import`) — design + why the naive approach failed
 
-**Status:** investigated, attempted, reverted. Not landed. Needs a VM architecture change before it can be done correctly. (2026-06-16)
+**Status (2026-06-16):**
+- A naive "route both `load` and `import` through the VM" attempt was made, found
+  broken by adversarial verification, and reverted (details below).
+- **Option B LANDED** (commit `14c2c9f`): `(load ...)` runs on the VM; `(import ...)`
+  stays tree-walked (correct isolation). Closes the async-in-`load`ed-files and
+  perf gaps. Cache-invalidation + flag-leak fixes included. Tests in
+  `crates/sema/tests/vm_module_test.rs`.
+- **Option A (VM-backed `import`) remains future work** — needs the per-module
+  globals VM change described below.
 
 ## Goal
 

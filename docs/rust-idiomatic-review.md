@@ -29,7 +29,7 @@ Almost all crate entry points (e.g. `lib.rs` in `sema-core`, `sema-eval`, `sema-
 
 The virtual machine (`sema-vm`) is a stack-based bytecode execution engine. It uses NaN-boxing for the representation of Lisp values (wrapping pointers and immediates into a single `u64`).
 
-> **Status (2026-06-16):** §2.1 and §2.2 remain **OPEN**. The 1.16.0 point-fixes for `DUP`-on-empty and the `CallNative` native-id bounds check did land and are correct, but the general `pop_unchecked` underflow and the missing stack-depth verifier are unchanged. This is now explicitly accounted for as a *trust-model constraint* (`.semac` is trusted-source-only) in `docs/limitations.md` #32 and `docs/adr.md` #56 (verifier PROPOSED, plan at `docs/plans/2026-05-15-adi-bytecode-verifier.md`). See §8.1 for the current stabilization call.
+> **Status (2026-06-16, RESOLVED):** §2.1 and §2.2 are now **FIXED**. A sound abstract stack-depth verifier (`Op::stack_effect` + worklist abstract interpretation in `validate_bytecode`, including validated exception-handler depths) rejects any unbalanced/underflowing `.semac` before execution, so `pop_unchecked` is sound for untrusted bytecode. The earlier `DUP`-on-empty and `CallNative` bounds-check point-fixes remain. Regression tests: `crates/sema-vm/tests/bytecode_validator_regression.rs`. See §8 (second follow-up) for details. The historical description below is retained for context.
 
 ### 2.1 Stack Underflow Vulnerability (`pop_unchecked`)
 In the core dispatch loop of [crates/sema-vm/src/vm.rs:555](file:///Users/helge/code/sema-lisp/crates/sema-vm/src/vm.rs#L555), the helper function `pop_unchecked` is implemented as:
@@ -237,7 +237,21 @@ After merging **PR #43** (built-in MCP server) and **PR #44** (DAP ergonomics) i
 > - **DAP-1/2/3 FIXED** — `DEBUG_REPLY_TIMEOUT` removed; the backend now drains `command_rx` after `execute_debug` (replying to late commands until the frontend drops its sender), inspection handlers are gated on `vm_suspended`, and `dbg_cmd_tx` is cleared on `Terminated`. Replies are now guaranteed, so the blocking reply wait can't hang and never returns fabricated empty data for a live VM. Regression test: `test_dap_inspection_after_termination_does_not_hang`.
 > - **DAP-4 FIXED** — locals display, `setVariable`, `set!` write-back, and `evaluate` reads all resolve a name through one `in_scope_locals` helper (pc-scoped, innermost-wins), so shadowed bindings are consistent. MCP-2 regression: `test_mcp_print_output_does_not_corrupt_protocol`.
 >
-> **Still deferred/open:** VM-1 (§2.1/§2.2 stack verifier — trust-model deferred), MCP-4 (NotebookCache eviction + symlinked-leaf key), MCP-5 (deftool arg validation), DAP-5..9 and §7.4 #4/#5 (lows). These are tracked below; none are release blockers.
+> **Still deferred/open (at the time of the first pass):** VM-1, MCP-4, MCP-5, DAP-5..9, §7.4 #4/#5.
+>
+> **Status (2026-06-16, second follow-up — all now FIXED):**
+> - **VM-1 FIXED** — §2.1/§2.2 resolved properly: a sound abstract stack-depth verifier (per-opcode `Op::stack_effect`, worklist abstract interpretation with strict-equality joins) now runs in `validate_bytecode` and rejects any unbalanced `.semac` before execution, making `pop_unchecked` sound for untrusted bytecode. The adversarial review caught an exception-handler soundness gap (handler `stack_depth` seeded from the file without validation); closed by requiring every reachable pc in a protected range to hold ≥ `stack_depth − n_locals` operands. Regression tests in `crates/sema-vm/tests/bytecode_validator_regression.rs`. **§2.1/§2.2 are no longer open** — update those sections' status accordingly.
+> - **DAP-6 FIXED** — `local_scopes` now serialized (bytecode format v3→**v4**, spec + serializer in lock-step), so `.semac`-loaded functions get correct pc-scoped locals.
+> - **DAP-7 FIXED** — `as_local_set` only short-circuits to write-back for the genuine builtin `set!` on an in-scope target; falls through to normal eval otherwise.
+> - **MCP-5 FIXED** — deftool arg mapping fully validates against the declared schema: missing-required → error (names field), strict type coercion (incl. `:number` preserving int/float kind, `:int` rejecting non-integral), rest/variadic collection, absent-vs-null distinction. Tests in `crates/sema-mcp/tests/`.
+> - **MCP-4 FIXED** — bounded LRU notebook cache (cap 16) + out-of-band mtime reload + full-path canonicalization (symlinked leaf collapses to one key).
+> - **MCP-6 FIXED** — server-loop response serialization no longer `unwrap()`s; falls back to a -32603 frame.
+> - **DAP-5 FIXED** — resume commands only sent while `vm_suspended`.
+> - **DAP-9 FIXED** — `decode_percent` decodes into bytes then UTF-8 (multi-byte `file://` paths correct).
+> - **§7.4 #4 FIXED (warning)** — load/import under a debug session emits a one-time warning that breakpoints in dynamically loaded files aren't hit (documented limitation; no risky module-loader rearchitecture).
+> - **§7.4 #5** — left single-thread by design (synchronous VM); documented.
+>
+> No open robustness/correctness items from this review remain. Low nits noted by verification (i64-boundary rounding in int coercion, rest-element type not enforced, mtime granularity) are acceptable and documented inline.
 
 The original triage follows.
 

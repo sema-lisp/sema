@@ -608,15 +608,18 @@ impl VM {
             }};
         }
 
-        // Unsafe unchecked pop — valid when compiler guarantees stack correctness.
+        // Unsafe unchecked pop — valid when the bytecode is stack-balanced.
         //
-        // FIXME(C11): this is safe for in-process compilation, but `.semac` files
-        // deserialized via `crate::serialize::deserialize_compile_result` are NOT
-        // verified for stack balance. A crafted .semac with a leading `Pop` or
-        // unbalanced sequence will reach this function with an empty stack and
-        // trigger UB in release builds (`set_len(usize::MAX)` after underflow).
-        // Treat .semac as trusted-source-only until a stack-depth verifier lands.
-        // See `docs/limitations.md` #32 and `docs/adr.md` ADR #56.
+        // SAFETY (C11 closed): every chunk reaching the VM is stack-balanced.
+        // In-process bytecode is balanced by construction (the compiler emits
+        // matched push/pop sequences). Deserialized `.semac` bytecode is proven
+        // balanced by the abstract stack-depth verifier in
+        // `crate::serialize::verify_stack_balance`, which runs inside
+        // `validate_bytecode` before `deserialize_from_bytes` returns and rejects
+        // any chunk where a reachable opcode could pop from an empty operand
+        // stack. That verifier is the safety guarantee for this `set_len` /
+        // `ptr::read`; the `debug_assert!` below catches verifier/dispatch drift
+        // in debug builds. See `docs/adr.md` ADR #56 and `docs/limitations.md` #32.
         #[inline(always)]
         unsafe fn pop_unchecked(stack: &mut Vec<Value>) -> Value {
             let len = stack.len();
@@ -2469,6 +2472,21 @@ impl VM {
     /// silently fail to persist. This mut variant detects that case and routes
     /// the assignment through the same write-back path as `setVariable`, keeping
     /// the two requests consistent.
+    ///
+    /// Precedence rules for the write-back short-circuit (all must hold; otherwise
+    /// the expression is handed to the normal evaluator unchanged):
+    ///
+    /// 1. The expression must be syntactically a builtin `set!` form — exactly
+    ///    `(set! <symbol> <value-expr>)`. Anything else (wrong arity, non-symbol
+    ///    target, head not the `set!` symbol) is evaluated normally.
+    /// 2. The head `set!` must NOT be shadowed by an in-scope local or upvalue in
+    ///    this frame. If the user rebound `set!` (e.g. `(let ((set! ...)) ...)`),
+    ///    the form is an ordinary call to that binding, not the assignment special
+    ///    form, so we must not hijack it.
+    /// 3. The assignment target must name an in-scope frame binding (local
+    ///    preferred over upvalue, matching the locals display). If it names a
+    ///    global or an unknown symbol, the normal evaluator handles it so global
+    ///    `set!` semantics are preserved.
     pub fn debug_evaluate_mut(
         &mut self,
         frame_id: usize,
@@ -2477,8 +2495,11 @@ impl VM {
         debug: &crate::debug::DebugState,
     ) -> Result<Value, SemaError> {
         if let Some((target, value_expr)) = Self::as_local_set(expr) {
+            // Rule 2: don't hijack a `set!` that the user has rebound in-frame.
+            let set_shadowed = self.frame_has_binding(frame_id, "set!");
             let name = sema_core::resolve(target);
-            if self.frame_has_binding(frame_id, &name) {
+            // Rule 3: only write back to an actual frame binding.
+            if !set_shadowed && self.frame_has_binding(frame_id, &name) {
                 let value = self.debug_evaluate(frame_id, &value_expr, ctx, debug)?;
                 self.debug_set_named(frame_id, &name, value.clone())?;
                 return Ok(value);
@@ -2487,8 +2508,12 @@ impl VM {
         self.debug_evaluate(frame_id, expr, ctx, debug)
     }
 
-    /// If `expr` is `(set! <symbol> <value-expr>)`, return the target symbol and
-    /// the value expression.
+    /// If `expr` is a builtin `set!` form `(set! <symbol> <value-expr>)`, return
+    /// the target symbol and the value expression. Returns `None` for anything
+    /// that is not syntactically that exact shape — including a head symbol other
+    /// than `set!`, the wrong number of arguments, or a non-symbol target. The
+    /// caller is responsible for confirming that the head `set!` is the builtin
+    /// special form and not a shadowing in-scope binding (see `debug_evaluate_mut`).
     fn as_local_set(expr: &Value) -> Option<(Spur, Value)> {
         let items = expr.as_list()?;
         if items.len() != 3 {
@@ -4872,5 +4897,38 @@ mod tests {
             let result = eval_str(&format!("g{i}"), &globals, &ctx).unwrap();
             assert_eq!(result, Value::int(i), "g{i} should be {i}");
         }
+    }
+
+    // ── as_local_set robustness (DAP-7) ─────────────────────────
+
+    fn parse_one(src: &str) -> Value {
+        sema_reader::read_many(src)
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap()
+    }
+
+    #[test]
+    fn test_as_local_set_matches_builtin_form() {
+        let expr = parse_one("(set! x 1)");
+        let (target, value) = VM::as_local_set(&expr).expect("should match a set! form");
+        assert_eq!(sema_core::resolve(target), "x");
+        assert_eq!(value, Value::int(1));
+    }
+
+    #[test]
+    fn test_as_local_set_rejects_non_set_forms() {
+        // Wrong head symbol — must not be treated as a write-back candidate.
+        assert!(VM::as_local_set(&parse_one("(define x 1)")).is_none());
+        assert!(VM::as_local_set(&parse_one("(+ x 1)")).is_none());
+        // Wrong arity.
+        assert!(VM::as_local_set(&parse_one("(set! x)")).is_none());
+        assert!(VM::as_local_set(&parse_one("(set! x 1 2)")).is_none());
+        // Non-symbol target (e.g. a place expression) — not a simple local set!.
+        assert!(VM::as_local_set(&parse_one("(set! (car xs) 1)")).is_none());
+        // Not a list at all.
+        assert!(VM::as_local_set(&parse_one("x")).is_none());
+        assert!(VM::as_local_set(&parse_one("42")).is_none());
     }
 }

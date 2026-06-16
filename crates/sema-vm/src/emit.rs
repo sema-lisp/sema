@@ -156,9 +156,9 @@ mod tests {
     #[test]
     fn test_const_dedup_floats() {
         let mut e = Emitter::new();
-        let idx1 = e.add_const(Value::float(3.14));
-        let idx2 = e.add_const(Value::float(3.14));
-        let idx3 = e.add_const(Value::float(2.72));
+        let idx1 = e.add_const(Value::float(1.25));
+        let idx2 = e.add_const(Value::float(1.25));
+        let idx3 = e.add_const(Value::float(2.5));
         assert_eq!(idx1, idx2, "same float should dedup");
         assert_ne!(idx1, idx3, "different floats should not dedup");
         assert_eq!(e.into_chunk().consts.len(), 2);

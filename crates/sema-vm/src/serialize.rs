@@ -568,6 +568,16 @@ pub fn serialize_function(
         buf.extend_from_slice(&idx.to_le_bytes());
     }
 
+    // local_scopes: Vec<(u16 slot, u32 start_pc, u32 end_pc)> — block-scope debug
+    // metadata used by the debugger to hide out-of-scope locals.
+    let n_local_scopes = checked_u16(func.local_scopes.len(), "local scope count")?;
+    buf.extend_from_slice(&n_local_scopes.to_le_bytes());
+    for &(slot, start_pc, end_pc) in &func.local_scopes {
+        buf.extend_from_slice(&slot.to_le_bytes());
+        buf.extend_from_slice(&start_pc.to_le_bytes());
+        buf.extend_from_slice(&end_pc.to_le_bytes());
+    }
+
     Ok(())
 }
 
@@ -658,6 +668,27 @@ pub fn deserialize_function(
         local_names.push((slot, remap[name_idx]));
     }
 
+    // local_scopes: Vec<(u16 slot, u32 start_pc, u32 end_pc)>
+    // Each entry is 10 bytes (u16 + u32 + u32); bounds-check the count against the
+    // remaining buffer so a crafted count cannot trigger an unbounded allocation.
+    let n_local_scopes = read_u16_le(buf, cursor)? as usize;
+    let scopes_remaining = buf.len().saturating_sub(*cursor);
+    if n_local_scopes
+        .checked_mul(10)
+        .is_none_or(|need| need > scopes_remaining)
+    {
+        return Err(SemaError::eval(format!(
+            "local scope count ({n_local_scopes}) exceeds remaining data ({scopes_remaining} bytes)"
+        )));
+    }
+    let mut local_scopes = Vec::with_capacity(n_local_scopes);
+    for _ in 0..n_local_scopes {
+        let slot = read_u16_le(buf, cursor)?;
+        let start_pc = read_u32_le(buf, cursor)?;
+        let end_pc = read_u32_le(buf, cursor)?;
+        local_scopes.push((slot, start_pc, end_pc));
+    }
+
     Ok(Function {
         name,
         chunk,
@@ -666,9 +697,7 @@ pub fn deserialize_function(
         arity,
         has_rest,
         local_names,
-        // Not serialized — bytecode carries no block-scope debug metadata, so
-        // the debugger falls back to showing all locals for loaded functions.
-        local_scopes: Vec::new(),
+        local_scopes,
         source_file: None,
         cache_offset: 0,
     })
@@ -796,7 +825,7 @@ pub fn remap_indices_to_spurs(code: &mut [u8], remap: &[Spur]) -> Result<(), Sem
 // ── File format constants ─────────────────────────────────────────
 
 const MAGIC: [u8; 4] = [0x00, b'S', b'E', b'M'];
-const FORMAT_VERSION: u16 = 3;
+const FORMAT_VERSION: u16 = 4;
 const SECTION_STRING_TABLE: u16 = 0x01;
 const SECTION_FUNCTION_TABLE: u16 = 0x02;
 const SECTION_MAIN_CHUNK: u16 = 0x03;
@@ -968,7 +997,179 @@ fn validate_chunk_bytecode(
         }
     }
 
+    // Third pass: abstract stack-depth verification. This is the precondition
+    // that makes `vm.rs::pop_unchecked` sound for deserialized bytecode — it
+    // proves no reachable opcode can pop from an empty operand stack.
+    verify_stack_balance(chunk, n_locals, label)?;
+
     Ok(())
+}
+
+/// Maximum operand-stack depth the verifier will tolerate. A well-formed chunk
+/// from the in-process compiler stays far below this; the bound exists purely to
+/// reject crafted bytecode that would otherwise grow the abstract depth without
+/// limit (e.g. a `Dup` loop) and to keep `max_stack` within `u16`.
+const MAX_STACK_DEPTH: i64 = 65535;
+
+/// Decode the variable-arity operand (argc / element count / pair count) that an
+/// opcode's stack effect depends on. Fixed-arity opcodes return 0. Operand bytes
+/// are already proven in-bounds by `advance_pc` during the first pass, but we
+/// re-check defensively so this function is sound in isolation.
+fn stack_effect_operand(code: &[u8], pc: usize, op: Op) -> Result<u16, SemaError> {
+    let read_u16_at = |off: usize| -> Result<u16, SemaError> {
+        if pc + off + 2 > code.len() {
+            return Err(SemaError::eval(format!(
+                "truncated operand for {op:?} at pc {pc}"
+            )));
+        }
+        Ok(u16::from_le_bytes([code[pc + off], code[pc + off + 1]]))
+    };
+    match op {
+        // u16 operand immediately after the opcode byte
+        Op::Call | Op::TailCall | Op::MakeList | Op::MakeVector | Op::MakeMap | Op::MakeHashMap => {
+            read_u16_at(1)
+        }
+        // u16 native_id + u16 argc → argc is the second u16
+        Op::CallNative => read_u16_at(3),
+        // u32 spur + u16 argc + u16 cache_slot → argc is the u16 after the spur
+        Op::CallGlobal => read_u16_at(5),
+        _ => Ok(0),
+    }
+}
+
+/// Sound, conservative abstract-interpretation pass over a chunk's bytecode that
+/// proves the operand stack never underflows and never exceeds `MAX_STACK_DEPTH`.
+///
+/// Uses a worklist over instruction boundaries, tracking the operand-stack depth
+/// on entry to each pc. Join points must agree exactly (strict equality, like the
+/// JVM/CLR verifiers) — a disagreement means the bytecode is malformed and is
+/// rejected. Exception handlers are seeded as additional roots with their known
+/// entry depth. The verifier never accepts an underflowing chunk; it may reject
+/// some exotic-but-safe bytecode that a real optimizing compiler could emit, but
+/// Sema's compiler only produces structured control flow that converges.
+fn verify_stack_balance(chunk: &Chunk, n_locals: usize, label: &str) -> Result<(), SemaError> {
+    let code = &chunk.code;
+    if code.is_empty() {
+        return Ok(());
+    }
+
+    // entry_depth[pc] = operand-stack depth on entry to the instruction at pc.
+    let mut entry_depth: std::collections::HashMap<usize, i64> = std::collections::HashMap::new();
+    let mut worklist: std::collections::VecDeque<usize> = std::collections::VecDeque::new();
+    let mut max_depth: i64 = 0;
+
+    // Root 0: normal entry with empty operand stack.
+    entry_depth.insert(0, 0);
+    worklist.push_back(0);
+
+    // Exception handlers are reachable from any pc in their protected range. The
+    // runtime truncates the operand stack to `stack_depth` and pushes the caught
+    // error value, then the handler's first op (StoreLocal catch_slot) pops it.
+    // So the handler's operand-stack entry depth is `stack_depth - n_locals + 1`.
+    let n_locals_i = n_locals as i64;
+    for entry in &chunk.exception_table {
+        let handler_pc = entry.handler_pc as usize;
+        if handler_pc >= code.len() {
+            return Err(SemaError::eval(format!(
+                "in {label}: exception handler_pc {handler_pc} out of range (code len {})",
+                code.len()
+            )));
+        }
+        let depth = entry.stack_depth as i64 - n_locals_i + 1;
+        if depth < 0 {
+            return Err(SemaError::eval(format!(
+                "in {label}: exception handler at pc {handler_pc} has negative operand depth {depth}",
+            )));
+        }
+        seed_or_join(&mut entry_depth, &mut worklist, handler_pc, depth, label)?;
+    }
+
+    while let Some(pc) = worklist.pop_front() {
+        let depth = entry_depth[&pc];
+        let (op, next) = advance_pc(code, pc)?;
+        let operand = stack_effect_operand(code, pc, op)?;
+        let effect = op.stack_effect(operand);
+
+        let pops = effect.pops as i64;
+        if depth < pops {
+            return Err(SemaError::eval(format!(
+                "in {label}: stack underflow at pc {pc}: {op:?} pops {pops} but operand stack depth is {depth}",
+            )));
+        }
+        let after = depth - pops + effect.pushes as i64;
+        // The peak the runtime touches at this op is the larger of the entry
+        // depth and the post-effect depth (pushes can grow it above entry).
+        max_depth = max_depth.max(depth).max(after);
+        if max_depth > MAX_STACK_DEPTH {
+            return Err(SemaError::eval(format!(
+                "in {label}: operand stack depth {max_depth} exceeds maximum ({MAX_STACK_DEPTH}) at pc {pc}",
+            )));
+        }
+
+        if effect.exits_frame {
+            // `Return`/`TailCall`/`Throw` each pop one value (already checked via
+            // `effect.pops` above, so `depth >= 1` holds here). The runtime's
+            // `Return` additionally tolerates extra leftover operands and an empty
+            // stack (substituting nil), so we do not require an exact depth — only
+            // that the pop the opcode performs cannot underflow, which the generic
+            // `depth < pops` check already guarantees. These ops have no
+            // intra-frame successors.
+            continue;
+        }
+
+        // Successors: fallthrough and/or branch target (at most two).
+        let mut successors: Vec<usize> = Vec::with_capacity(2);
+        match op {
+            Op::Jump => {
+                let offset =
+                    i32::from_le_bytes([code[pc + 1], code[pc + 2], code[pc + 3], code[pc + 4]]);
+                successors.push((next as i64 + offset as i64) as usize);
+            }
+            Op::JumpIfFalse | Op::JumpIfTrue => {
+                let offset =
+                    i32::from_le_bytes([code[pc + 1], code[pc + 2], code[pc + 3], code[pc + 4]]);
+                successors.push(next); // not-taken fallthrough
+                successors.push((next as i64 + offset as i64) as usize); // taken
+            }
+            _ => successors.push(next),
+        }
+
+        for succ in successors {
+            if succ >= code.len() {
+                // The only safe way to leave a frame is via a frame-exiting op
+                // (handled above). Falling off the end means missing Return.
+                return Err(SemaError::eval(format!(
+                    "in {label}: control falls off the end of the chunk at pc {pc}",
+                )));
+            }
+            seed_or_join(&mut entry_depth, &mut worklist, succ, after, label)?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Record the operand-stack depth on entry to `pc`. If `pc` was already visited
+/// with a different depth, the bytecode joins control flow at inconsistent stack
+/// heights — reject it (strict-equality lattice).
+fn seed_or_join(
+    entry_depth: &mut std::collections::HashMap<usize, i64>,
+    worklist: &mut std::collections::VecDeque<usize>,
+    pc: usize,
+    depth: i64,
+    label: &str,
+) -> Result<(), SemaError> {
+    match entry_depth.get(&pc) {
+        None => {
+            entry_depth.insert(pc, depth);
+            worklist.push_back(pc);
+            Ok(())
+        }
+        Some(&existing) if existing == depth => Ok(()),
+        Some(&existing) => Err(SemaError::eval(format!(
+            "in {label}: stack depth disagreement at pc {pc}: {existing} vs {depth}",
+        ))),
+    }
 }
 
 /// Deserialize a .semac file from bytes into a CompileResult.
@@ -1629,7 +1830,7 @@ mod tests {
             has_rest: true,
             local_names: vec![(0, intern("x")), (1, intern("y"))],
             source_file: None,
-            local_scopes: Vec::new(),
+            local_scopes: vec![(2, 0, 7), (3, 4, 9)],
             cache_offset: 0,
         };
 
@@ -1653,6 +1854,8 @@ mod tests {
         assert_eq!(sema_core::resolve(func2.upvalue_names[1]), "outer-y");
         assert_eq!(sema_core::resolve(func2.local_names[0].1), "x");
         assert_eq!(sema_core::resolve(func2.local_names[1].1), "y");
+        // local_scopes (block-scope debug metadata) must round-trip (DAP-6).
+        assert_eq!(func2.local_scopes, vec![(2, 0, 7), (3, 4, 9)]);
     }
 
     #[test]
@@ -1938,7 +2141,7 @@ mod tests {
         serialize_value(&Value::bool(true), &mut buf, &mut stb).unwrap();
         serialize_value(&Value::bool(false), &mut buf, &mut stb).unwrap();
         serialize_value(&Value::int(42), &mut buf, &mut stb).unwrap();
-        serialize_value(&Value::float(3.14), &mut buf, &mut stb).unwrap();
+        serialize_value(&Value::float(1.25), &mut buf, &mut stb).unwrap();
         serialize_value(&Value::string("hello"), &mut buf, &mut stb).unwrap();
         serialize_value(&Value::symbol("foo"), &mut buf, &mut stb).unwrap();
         serialize_value(&Value::keyword("bar"), &mut buf, &mut stb).unwrap();
@@ -1963,7 +2166,7 @@ mod tests {
             Value::int(42)
         );
         let f = deserialize_value(&buf, &mut cursor, &table, &remap).unwrap();
-        assert_eq!(f.as_float(), Some(3.14));
+        assert_eq!(f.as_float(), Some(1.25));
         let s = deserialize_value(&buf, &mut cursor, &table, &remap).unwrap();
         assert_eq!(s.as_str().unwrap(), "hello");
         let sym = deserialize_value(&buf, &mut cursor, &table, &remap).unwrap();
@@ -2248,6 +2451,98 @@ mod tests {
         assert!(
             deser.is_err(),
             "should reject out-of-bounds func_id in MakeClosure"
+        );
+    }
+
+    // ── Stack-depth verifier (VM-1 / ADR #56) ───────────────────
+
+    #[test]
+    fn test_stack_effect_variable_arity() {
+        // Call argc=3 pops callee+3 args = 4, pushes 1.
+        assert_eq!(
+            Op::Call.stack_effect(3),
+            crate::opcodes::StackEffect {
+                pops: 4,
+                pushes: 1,
+                exits_frame: false
+            }
+        );
+        // MakeMap with 2 pairs pops 4, pushes 1.
+        assert_eq!(
+            Op::MakeMap.stack_effect(2),
+            crate::opcodes::StackEffect {
+                pops: 4,
+                pushes: 1,
+                exits_frame: false
+            }
+        );
+        // TailCall exits the frame.
+        assert!(Op::TailCall.stack_effect(0).exits_frame);
+        // CallGlobal/CallNative pop only the args (callee resolved by id/spur).
+        assert_eq!(Op::CallGlobal.stack_effect(2).pops, 2);
+        assert_eq!(Op::CallNative.stack_effect(2).pops, 2);
+    }
+
+    #[test]
+    fn test_verifier_rejects_leading_pop() {
+        use crate::emit::Emitter;
+        let mut e = Emitter::new();
+        e.emit_op(Op::Pop);
+        e.emit_op(Op::Return);
+        let chunk = e.into_chunk();
+        let bytes = serialize_to_bytes(&CompileResult::new(chunk, vec![]), 0).unwrap();
+        let err = deserialize_from_bytes(&bytes).err().unwrap();
+        assert!(
+            err.to_string().contains("underflow"),
+            "expected underflow rejection, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_verifier_accepts_balanced_branch() {
+        // A balanced if/else: both arms leave exactly one value before Return.
+        use crate::emit::Emitter;
+        let mut e = Emitter::new();
+        e.emit_op(Op::True); // cond
+        let jf = e.emit_jump(Op::JumpIfFalse); // pop cond
+        e.emit_const(Value::int(1)); // then-branch value
+        let j = e.emit_jump(Op::Jump);
+        e.patch_jump(jf);
+        e.emit_const(Value::int(2)); // else-branch value
+        e.patch_jump(j);
+        e.emit_op(Op::Return);
+        let chunk = e.into_chunk();
+        let bytes = serialize_to_bytes(&CompileResult::new(chunk, vec![]), 0).unwrap();
+        assert!(
+            deserialize_from_bytes(&bytes).is_ok(),
+            "balanced branch should pass the verifier"
+        );
+    }
+
+    #[test]
+    fn test_verifier_rejects_dup_overflow() {
+        // An unconditional self-loop of Dup grows the abstract depth without
+        // bound; the verifier must reject it (via a stack-depth disagreement at
+        // the loop head when the second visit arrives at a higher depth) rather
+        // than spin forever.
+        //   pc 0: Const 1     (3 bytes) depth 0 -> 1
+        //   pc 3: Dup         (1 byte)  depth -> 2 on first pass
+        //   pc 4: Jump -6     (5 bytes) target = next(9) + (-6) = 3 (the Dup)
+        use crate::emit::Emitter;
+        let mut e = Emitter::new();
+        e.emit_const(Value::int(1));
+        // pc 3: Dup
+        e.emit_op(Op::Dup);
+        // pc 4: Jump back to pc 3
+        e.emit_op(Op::Jump);
+        e.emit_i32(-6); // next pc is 9, 9 + (-6) = 3
+        let chunk = e.into_chunk();
+        let bytes = serialize_to_bytes(&CompileResult::new(chunk, vec![]), 0).unwrap();
+        let err = deserialize_from_bytes(&bytes).err().unwrap();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("maximum") || msg.contains("disagreement"),
+            "expected overflow/disagreement rejection, got: {msg}"
         );
     }
 }

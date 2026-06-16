@@ -217,3 +217,45 @@ fn roundtrip_native_functions_use_call_global() {
     assert_roundtrip("(null? '())");
     assert_roundtrip("(begin (define xs '(1 2 3)) (map (fn (x) (* x 2)) xs))");
 }
+
+// ============================================================
+// 14. local_scopes block-scope debug metadata survives roundtrip (DAP-6)
+// ============================================================
+
+/// `Function::local_scopes` is compile-time debug metadata the debugger uses to
+/// hide out-of-scope block locals. It must survive serialization so `.semac`-
+/// loaded functions show correct in-scope locals (bytecode format version 4).
+#[test]
+fn roundtrip_preserves_local_scopes() {
+    let interp = Interpreter::new();
+    // A function with a `let`-introduced block local produces local_scopes.
+    let src = "(define (f a) (let ((b (+ a 1))) (+ a b)))";
+    let compiled = interp
+        .compile_to_bytecode(src)
+        .unwrap_or_else(|e| panic!("compile failed: {e}"));
+
+    // Find the function that has recorded block scopes.
+    let before: Vec<Vec<(u16, u32, u32)>> = compiled
+        .functions
+        .iter()
+        .map(|f| f.local_scopes.clone())
+        .collect();
+    assert!(
+        before.iter().any(|s| !s.is_empty()),
+        "expected at least one function with recorded local_scopes; got {before:?}"
+    );
+
+    let bytes = serialize_to_bytes(&compiled, 0).expect("serialize");
+    let deserialized = deserialize_from_bytes(&bytes).expect("deserialize");
+
+    let after: Vec<Vec<(u16, u32, u32)>> = deserialized
+        .functions
+        .iter()
+        .map(|f| f.local_scopes.clone())
+        .collect();
+
+    assert_eq!(
+        before, after,
+        "local_scopes must be identical after serialize/deserialize roundtrip"
+    );
+}

@@ -81,7 +81,7 @@ All multi-byte integers are **little-endian**. All strings are **UTF-8**.
 | Offset | Size | Field | Description |
 |--------|------|-------|-------------|
 | 0 | 4 | `magic` | `\x00SEM` (`0x00`, `0x53`, `0x45`, `0x4D`) |
-| 4 | 2 | `format_version` | Bytecode format version (currently `3`) |
+| 4 | 2 | `format_version` | Bytecode format version (currently `4`) |
 | 6 | 2 | `flags` | Bit flags (see below) |
 | 8 | 2 | `sema_major` | Sema version major that produced this file |
 | 10 | 2 | `sema_minor` | Sema version minor |
@@ -214,11 +214,30 @@ The main chunk contains the top-level bytecode and its constant pool.
 │    n_local_names: u16          │
 │    local_names: [(u16 slot,    │  Local variable debug info
 │                   u32 name)]   │  (name = string table index)
+│    n_local_scopes: u16         │
+│    local_scopes: [(u16 slot,   │  Block-scope ranges (debug metadata)
+│                    u32 start,  │  half-open [start_pc, end_pc) per
+│                    u32 end)]   │  block-introduced local
 ├────────────────────────────────┤
 │  Function Entry 1              │
 │    ...                         │
 └────────────────────────────────┘
 ```
+
+### Local Scopes (10 bytes each)
+
+`local_scopes` records the half-open bytecode PC range `[start_pc, end_pc)` over
+which each block-introduced local (from `let` / `let*` / `letrec` / `do`) is
+live. The debugger uses these ranges to hide locals that are not yet bound or
+already out of scope at the current PC. This is debug-only metadata — it is never
+read during execution. Functions whose `local_scopes` is empty (e.g. those with
+only parameters, or older `.semac` files) cause the debugger to show all locals.
+
+| Offset | Size | Field |
+|--------|------|-------|
+| 0 | 2 | `slot` — local variable slot |
+| 2 | 4 | `start_pc` — PC where the binding comes into scope |
+| 6 | 4 | `end_pc` — PC where the binding goes out of scope (exclusive) |
 
 ### Upvalue Descriptor (3 bytes each)
 
@@ -396,12 +415,21 @@ When loading a `.semac` file, the loader performs these checks:
 6. **Function table bounds** — all `func_id` references in `MakeClosure` must be valid
 7. **Constant pool types** — no runtime-only value types in the constant pool
 8. **Bytecode well-formedness** — opcodes must be valid, operand sizes must be correct, constant/local/upvalue indices must be in bounds, and jump targets must land on instruction boundaries
+9. **Stack-depth balance** — an abstract-interpretation pass over every chunk (main chunk and each function) proves the operand stack never underflows and never exceeds the maximum depth
 
 If validation fails, the loader returns a `SemaError` with a descriptive message.
 
-::: warning Structural checks only
-Validation does not verify stack discipline — a hand-crafted `.semac` with unbalanced stack operations can cause undefined behavior in the VM's unchecked hot path. Treat `.semac` files as trusted input. A stack-depth verifier is proposed (ADR #56).
-:::
+### Stack-Depth Verifier (ADR #56)
+
+The VM's hot dispatch loop uses an unchecked stack pop (`pop_unchecked`) for speed, which is sound only if the bytecode is stack-balanced. In-process bytecode is balanced by construction; deserialized `.semac` bytecode is proven balanced by a verifier that runs inside `validate_bytecode` before `deserialize_from_bytes` returns.
+
+The verifier abstract-interprets each chunk:
+
+- Each opcode has a static stack effect (`Op::stack_effect()` — the single source of truth shared with the VM dispatch arms). Variable-arity opcodes (`Call`, `TailCall`, `CallGlobal`, `CallNative`, `MakeList`, `MakeVector`, `MakeMap`, `MakeHashMap`) compute their effect from the decoded operand count.
+- A worklist tracks the operand-stack depth on entry to every reachable instruction, following fallthrough and jump edges. Exception handlers are seeded as additional roots at their known entry depth (`stack_depth - n_locals + 1`).
+- Join points must agree on depth exactly (strict-equality lattice, like the JVM/CLR verifiers). A disagreement, a reachable pop deeper than the current depth (underflow), a depth above the maximum (overflow), or control falling off the end of a chunk are all rejected with a descriptive `SemaError`.
+
+The verifier is **sound** — it never accepts an underflowing chunk. It is intentionally conservative: it may reject exotic-but-safe bytecode that a future optimizing compiler could emit, but accepts every program Sema's compiler produces. Once verification succeeds, `.semac` files from untrusted sources can be loaded without risking the unchecked-pop undefined behavior.
 
 ## Example
 
@@ -431,9 +459,9 @@ The compiled `.semac` would contain:
 
 ## Versioning Strategy
 
-- `format_version` started at `1` and increments on any breaking change to the binary format. Version `2` added `n_global_cache_slots` and the inline-cache operands; version `3` (current) added per-function upvalue names to the debug metadata.
+- `format_version` started at `1` and increments on any breaking change to the binary format. Version `2` added `n_global_cache_slots` and the inline-cache operands; version `3` added per-function upvalue names to the debug metadata; version `4` (current) added per-function `local_scopes` (block-scope PC ranges) to the debug metadata.
 - `sema_major`/`sema_minor`/`sema_patch` record the compiler version for diagnostics
-- The loader requires an exact `format_version` match and refuses anything else with a clear error: `"unsupported bytecode format version 1 (expected 3). Recompile from source."`
+- The loader requires an exact `format_version` match and refuses anything else with a clear error: `"unsupported bytecode format version 1 (expected 4). Recompile from source."`
 - Within the same `format_version`, new section types can be added without breaking older loaders (unknown sections are skipped)
 
 ## Comparison with Other Languages

@@ -155,34 +155,49 @@ pub fn json_args_to_sema(
     vec![sema_core::json_to_value(arguments)]
 }
 
-/// Evaluate a Lisp operation with stdout and stderr capture
+/// Evaluate a Lisp operation, capturing program stdout/stderr.
+///
+/// Capture goes through sema-core's thread-local output hooks rather than
+/// redirecting the process stdout file descriptor. The MCP transport writes
+/// JSON-RPC frames to the real stdout, so fd-level redirection risks
+/// interleaving user `print` output into the protocol stream (and silently
+/// corrupting it if the redirect fails to install). The hook keeps program
+/// output and the protocol stream completely separate.
 pub fn eval_with_capture<F, T>(f: F) -> (Result<T, String>, String)
 where
     F: FnOnce() -> Result<T, SemaError>,
 {
-    let mut captured = String::new();
-    let res = {
-        let redirect_out = gag::BufferRedirect::stdout();
-        let redirect_err = gag::BufferRedirect::stderr();
-        let r = f();
-        if let Ok(mut red) = redirect_out {
-            use std::io::Read;
-            let _ = red.read_to_string(&mut captured);
+    use std::sync::{Arc, Mutex};
+
+    let buf = Arc::new(Mutex::new(String::new()));
+    let out = buf.clone();
+    sema_core::set_stdout_hook(Some(Box::new(move |s: &str| {
+        if let Ok(mut b) = out.lock() {
+            b.push_str(s);
         }
-        if let Ok(mut red) = redirect_err {
-            use std::io::Read;
-            let mut captured_err = String::new();
-            if red.read_to_string(&mut captured_err).is_ok() && !captured_err.is_empty() {
-                if !captured.is_empty() {
-                    captured.push('\n');
-                }
-                captured.push_str("Stderr:\n");
-                captured.push_str(&captured_err);
-            }
+    })));
+    let err = buf.clone();
+    sema_core::set_stderr_hook(Some(Box::new(move |s: &str| {
+        if let Ok(mut b) = err.lock() {
+            b.push_str(s);
         }
-        r
-    };
-    (res.map_err(|e| format!("{e}")), captured)
+    })));
+
+    // Run the operation, clearing the hooks even if it panics — otherwise a
+    // leaked hook would capture into a dropped buffer and silence all later
+    // output. The panic is re-raised for the dispatch-level handler to convert
+    // into an error result.
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+
+    sema_core::set_stdout_hook(None);
+    sema_core::set_stderr_hook(None);
+
+    let captured = buf.lock().map(|b| b.clone()).unwrap_or_default();
+
+    match result {
+        Ok(r) => (r.map_err(|e| format!("{e}")), captured),
+        Err(panic) => std::panic::resume_unwind(panic),
+    }
 }
 
 /// Run compiled bytecode on the VM
@@ -435,7 +450,67 @@ fn is_tool_allowed(
 }
 
 /// Invokes standard dev tools, notebook tools, or user-defined deftools
+/// Restores the previous `sys/args` binding on the shared interpreter env when
+/// dropped, so a `run_file` call's argument override cannot leak into a later
+/// call — even if evaluation panics and unwinds.
+struct SysArgsGuard {
+    env: std::rc::Rc<sema_core::Env>,
+    prev: Option<Value>,
+}
+
+impl Drop for SysArgsGuard {
+    fn drop(&mut self) {
+        match self.prev.take() {
+            Some(prev) => self.env.set(sema_core::intern("sys/args"), prev),
+            None => {
+                self.env.take(sema_core::intern("sys/args"));
+            }
+        }
+    }
+}
+
+/// Extract a human-readable message from a caught panic payload.
+fn panic_message(panic: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = panic.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = panic.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "unknown panic".to_string()
+    }
+}
+
+/// Dispatch a tool call, converting any panic during evaluation into an
+/// `isError` result instead of letting it unwind out and terminate the
+/// (single-threaded) MCP server loop.
 pub fn call_mcp_tool(
+    name: &str,
+    arguments: &JsonValue,
+    interpreter: &Interpreter,
+    notebook_cache: &NotebookCache,
+    include_tools: Option<&[String]>,
+    exclude_tools: Option<&[String]>,
+) -> CallToolResult {
+    let dispatch = std::panic::AssertUnwindSafe(|| {
+        call_mcp_tool_inner(
+            name,
+            arguments,
+            interpreter,
+            notebook_cache,
+            include_tools,
+            exclude_tools,
+        )
+    });
+    match std::panic::catch_unwind(dispatch) {
+        Ok(result) => result,
+        Err(panic) => error_result(format!(
+            "Tool '{name}' panicked during evaluation: {}",
+            panic_message(panic.as_ref())
+        )),
+    }
+}
+
+fn call_mcp_tool_inner(
     name: &str,
     arguments: &JsonValue,
     interpreter: &Interpreter,
@@ -466,9 +541,11 @@ pub fn call_mcp_tool(
                 Err(e) => return error_result(format!("Failed to read {file_path}: {e}")),
             };
 
-            // Setup sys/args override if parameters provided
-            let prev_args = interpreter.global_env.get(sema_core::intern("sys/args"));
-            if let Some(arg_list) = args {
+            // Setup sys/args override if parameters provided. The guard restores
+            // the previous binding on scope exit — including a panic unwind — so
+            // one tool call can't leak its args into the next on the shared env.
+            let _args_guard = args.map(|arg_list| {
+                let prev = interpreter.global_env.get(sema_core::intern("sys/args"));
                 let lisp_args: Vec<Value> = arg_list
                     .iter()
                     .map(|v| Value::string(v.as_str().unwrap_or("")))
@@ -480,7 +557,11 @@ pub fn call_mcp_tool(
                         Ok(list_val.clone())
                     })),
                 );
-            }
+                SysArgsGuard {
+                    env: interpreter.global_env.clone(),
+                    prev,
+                }
+            });
 
             let (res, stdout) = eval_with_capture(|| {
                 if sema_vm::is_bytecode_file(&bytes) {
@@ -497,14 +578,7 @@ pub fn call_mcp_tool(
                 }
             });
 
-            // Restore sys/args
-            if let Some(prev) = prev_args {
-                interpreter
-                    .global_env
-                    .set(sema_core::intern("sys/args"), prev);
-            } else {
-                interpreter.global_env.take(sema_core::intern("sys/args"));
-            }
+            drop(_args_guard);
 
             match res {
                 Ok(val) => {
@@ -728,10 +802,10 @@ pub fn call_mcp_tool(
         }
         "info" => {
             let info_str = format!(
-                "Sema MCP Server v{}\nRust version: {}\nTarget Platform: {}\nEnvironment Context: standard",
+                "Sema MCP Server v{}\nTarget Platform: {}/{}\nSandbox: unrestricted — tools execute with full filesystem, network, and shell access in the host environment. Only connect trusted clients.",
                 env!("CARGO_PKG_VERSION"),
-                env!("CARGO_PKG_VERSION"), // standard workspace version
-                std::env::consts::OS
+                std::env::consts::OS,
+                std::env::consts::ARCH,
             );
             success_result(info_str)
         }

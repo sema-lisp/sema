@@ -2343,29 +2343,65 @@ impl VM {
             .collect()
     }
 
-    pub fn debug_locals(&mut self, frame_idx: usize) -> Vec<crate::debug::DapVariable> {
-        let Some(frame) = self.frames.get(frame_idx) else {
+    /// Locals in scope at the frame's current pc, as `(slot, name-spur)`, with
+    /// the innermost binding chosen when a name is shadowed by nested blocks.
+    ///
+    /// A slot with recorded block scopes (`let`/`do` bindings) is in scope only
+    /// while pc lies within one of them — hiding not-yet-bound and already-exited
+    /// block locals. Params and slots with no recorded scope (e.g. functions
+    /// loaded from bytecode, which carry no `local_scopes`) are always in scope.
+    /// This is the single source of truth used by the locals display and by the
+    /// `setVariable` / `set!` write-back and `evaluate` read paths, so all three
+    /// resolve a shadowed name to the same slot.
+    fn in_scope_locals(&self, frame_id: usize) -> Vec<(u16, Spur)> {
+        let Some(frame) = self.frames.get(frame_id) else {
             return Vec::new();
         };
-        let base = frame.base;
         let pc = frame.pc as u32;
-        let local_names = frame.closure.func.local_names.clone();
-        let local_scopes = frame.closure.func.local_scopes.clone();
-        let mut vars = Vec::new();
-        for (slot, spur) in local_names {
-            // If this slot has recorded block scopes (from a let/do binding),
-            // only show it while pc is within one of them — hiding not-yet-bound
-            // and already-exited block locals. Params and slots without scope
-            // info (e.g. functions loaded from bytecode) are always shown.
-            let mut slot_scopes = local_scopes
+        let func = &frame.closure.func;
+        // name -> (slot, spur, priority); higher priority = innermost block.
+        let mut chosen: hashbrown::HashMap<String, (u16, Spur, u32)> = hashbrown::HashMap::new();
+        for &(slot, spur) in &func.local_names {
+            let mut scopes = func
+                .local_scopes
                 .iter()
                 .filter(|(s, _, _)| *s == slot)
                 .peekable();
-            if slot_scopes.peek().is_some()
-                && !slot_scopes.any(|(_, start, end)| pc >= *start && pc < *end)
-            {
-                continue;
+            let priority = if scopes.peek().is_none() {
+                0 // param / no scope info: always in scope, lowest priority
+            } else {
+                match scopes
+                    .filter(|(_, start, end)| pc >= *start && pc < *end)
+                    .map(|(_, start, _)| *start)
+                    .max()
+                {
+                    Some(start) => start.saturating_add(1),
+                    None => continue, // out of scope at this pc
+                }
+            };
+            let name = sema_core::resolve(spur);
+            match chosen.get(&name) {
+                Some((_, _, p)) if *p >= priority => {}
+                _ => {
+                    chosen.insert(name, (slot, spur, priority));
+                }
             }
+        }
+        let mut result: Vec<(u16, Spur)> = chosen
+            .into_values()
+            .map(|(slot, spur, _)| (slot, spur))
+            .collect();
+        result.sort_by_key(|(slot, _)| *slot);
+        result
+    }
+
+    pub fn debug_locals(&mut self, frame_idx: usize) -> Vec<crate::debug::DapVariable> {
+        let Some(base) = self.frames.get(frame_idx).map(|f| f.base) else {
+            return Vec::new();
+        };
+        let in_scope = self.in_scope_locals(frame_idx);
+        let mut vars = Vec::new();
+        for (slot, spur) in in_scope {
             let idx = base + slot as usize;
             let val = self.stack.get(idx).cloned().unwrap_or(Value::nil());
             vars.push(self.debug_value_to_variable(&sema_core::resolve(spur), val));
@@ -2467,22 +2503,28 @@ impl VM {
     }
 
     /// True if `name` is a local or upvalue of the given frame.
+    /// The slot of the in-scope local named `name` at the frame's current pc, if
+    /// any (innermost when shadowed). Shared by the write/read paths so they
+    /// agree with the locals display on which binding a name refers to.
+    fn in_scope_local_slot(&self, frame_id: usize, name: &str) -> Option<u16> {
+        self.in_scope_locals(frame_id)
+            .into_iter()
+            .find(|(_, spur)| sema_core::resolve(*spur) == name)
+            .map(|(slot, _)| slot)
+    }
+
     fn frame_has_binding(&self, frame_id: usize, name: &str) -> bool {
-        let Some(frame) = self.frames.get(frame_id) else {
-            return false;
-        };
-        frame
-            .closure
-            .func
-            .local_names
-            .iter()
-            .any(|(_, spur)| sema_core::resolve(*spur) == name)
-            || frame
+        if self.in_scope_local_slot(frame_id, name).is_some() {
+            return true;
+        }
+        self.frames.get(frame_id).is_some_and(|frame| {
+            frame
                 .closure
                 .func
                 .upvalue_names
                 .iter()
                 .any(|spur| sema_core::resolve(*spur) == name)
+        })
     }
 
     /// Write `value` back to the local (preferred) or upvalue named `name`.
@@ -2492,20 +2534,8 @@ impl VM {
         name: &str,
         value: Value,
     ) -> Result<crate::debug::DapVariable, SemaError> {
-        let is_local = self
-            .frames
-            .get(frame_id)
-            .map(|frame| {
-                frame
-                    .closure
-                    .func
-                    .local_names
-                    .iter()
-                    .any(|(_, spur)| sema_core::resolve(*spur) == name)
-            })
-            .unwrap_or(false);
-        if is_local {
-            self.debug_set_local(frame_id, name, value)
+        if let Some(slot) = self.in_scope_local_slot(frame_id, name) {
+            self.debug_set_local_slot(frame_id, slot, name, value)
         } else {
             self.debug_set_upvalue(frame_id, name, value)
         }
@@ -2585,7 +2615,10 @@ impl VM {
             }
         }
 
-        for &(slot, spur) in &frame.closure.func.local_names {
+        // Inject only the locals in scope at the current pc (innermost binding
+        // for shadowed names), so an evaluated expression sees the same binding
+        // the locals display and setVariable resolve to.
+        for (slot, spur) in self.in_scope_locals(frame_id) {
             let idx = frame.base + slot as usize;
             if let Some(value) = self.stack.get(idx) {
                 env.set(spur, value.clone());
@@ -2612,24 +2645,31 @@ impl VM {
         name: &str,
         value: Value,
     ) -> Result<crate::debug::DapVariable, SemaError> {
-        let frame = self
-            .frames
-            .get(frame_id)
-            .ok_or_else(|| SemaError::eval(format!("setVariable: invalid frame id {frame_id}")))?;
-        let Some((slot, _)) = frame
-            .closure
-            .func
-            .local_names
-            .iter()
-            .find(|(_, spur)| sema_core::resolve(*spur) == name)
-            .copied()
-        else {
+        let Some(slot) = self.in_scope_local_slot(frame_id, name) else {
             return Err(SemaError::eval(format!(
                 "setVariable: local '{name}' not found"
             )));
         };
+        self.debug_set_local_slot(frame_id, slot, name, value)
+    }
 
-        let idx = frame.base + slot as usize;
+    /// Write `value` to a specific local `slot` of the frame, resolving the
+    /// stack index from the frame base. The caller has already mapped the name
+    /// to the pc-active slot (so shadowed locals write the binding actually in
+    /// scope, matching the locals display).
+    fn debug_set_local_slot(
+        &mut self,
+        frame_id: usize,
+        slot: u16,
+        name: &str,
+        value: Value,
+    ) -> Result<crate::debug::DapVariable, SemaError> {
+        let base = self
+            .frames
+            .get(frame_id)
+            .ok_or_else(|| SemaError::eval(format!("setVariable: invalid frame id {frame_id}")))?
+            .base;
+        let idx = base + slot as usize;
         let Some(slot_value) = self.stack.get_mut(idx) else {
             return Err(SemaError::eval(format!(
                 "setVariable: local '{name}' is out of range"

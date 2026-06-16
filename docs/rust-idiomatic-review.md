@@ -228,7 +228,18 @@ PR #44 closed most of the gaps originally listed here. Current status:
 
 ## 8. Stabilization Review — Post MCP/DAP Merge (2026-06-16)
 
-After merging **PR #43** (built-in MCP server) and **PR #44** (DAP ergonomics) into `main`, an adversarial post-merge review fixed 10 issues (commit `d2a5e6e`). A follow-up stabilization pass (this section) examined the two newly-shipped subsystems plus the VM safety items in §2 to identify what is still **fragile** before cutting the next release. Findings are grouped by priority. Each lists file pointers, the concrete trigger, and a hardening direction. Nothing in §8 is fixed yet — this is the triage list.
+After merging **PR #43** (built-in MCP server) and **PR #44** (DAP ergonomics) into `main`, an adversarial post-merge review fixed 10 issues (commit `d2a5e6e`). A follow-up stabilization pass (this section) examined the two newly-shipped subsystems plus the VM safety items in §2 to identify what is still **fragile** before cutting the next release. Findings are grouped by priority. Each lists file pointers, the concrete trigger, and a hardening direction.
+
+> **Status (2026-06-16, follow-up):** the release-blocker and shadowed-local items are now **FIXED** (no band-aids — the DAP timeout was removed in favour of a guaranteed-reply architecture):
+> - **MCP-1 FIXED** — tool dispatch is wrapped in `catch_unwind`; a panic becomes an `isError` result. `sys/args` override now restored via a `Drop` guard (also covers MCP-6).
+> - **MCP-2 FIXED** — `gag` fd-redirection removed entirely (dependency dropped); `eval_with_capture` and the notebook engine now capture via sema-core's thread-local output hook, so program output can never reach the protocol fd, and concurrent engine threads no longer contend on a global redirect.
+> - **MCP-3 RESOLVED (by decision)** — sandboxing stays **opt-in / allow-all by default**, consistent with the CLI/REPL/notebook (deliberate, not a default change). Only the misleading `info` string was corrected to state the unrestricted posture honestly.
+> - **DAP-1/2/3 FIXED** — `DEBUG_REPLY_TIMEOUT` removed; the backend now drains `command_rx` after `execute_debug` (replying to late commands until the frontend drops its sender), inspection handlers are gated on `vm_suspended`, and `dbg_cmd_tx` is cleared on `Terminated`. Replies are now guaranteed, so the blocking reply wait can't hang and never returns fabricated empty data for a live VM. Regression test: `test_dap_inspection_after_termination_does_not_hang`.
+> - **DAP-4 FIXED** — locals display, `setVariable`, `set!` write-back, and `evaluate` reads all resolve a name through one `in_scope_locals` helper (pc-scoped, innermost-wins), so shadowed bindings are consistent. MCP-2 regression: `test_mcp_print_output_does_not_corrupt_protocol`.
+>
+> **Still deferred/open:** VM-1 (§2.1/§2.2 stack verifier — trust-model deferred), MCP-4 (NotebookCache eviction + symlinked-leaf key), MCP-5 (deftool arg validation), DAP-5..9 and §7.4 #4/#5 (lows). These are tracked below; none are release blockers.
+
+The original triage follows.
 
 ### 8.1 Release blockers / High
 

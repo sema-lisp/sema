@@ -77,7 +77,6 @@ rusqlite = { version = "0.31", features = ["bundled"] }
 semver = "1"
 tar = "0.4"
 flate2 = "1"
-gag = "1.0.0"
 crc32fast = "1"
 
 

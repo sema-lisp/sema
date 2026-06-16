@@ -1,15 +1,5 @@
 use std::path::PathBuf;
 use std::sync::mpsc as std_mpsc;
-use std::time::Duration;
-
-/// Upper bound on how long a frontend request waits for the debug VM to reply
-/// over a `DebugCommand` channel. The VM polls the command channel frequently
-/// while running and services commands immediately while stopped, so a live VM
-/// replies near-instantly. The timeout exists so that if the VM has already
-/// returned from `execute_debug` (e.g. the program terminated) and can no
-/// longer service the command, the request degrades to an empty/error response
-/// instead of blocking the DAP session forever on a reply that never comes.
-const DEBUG_REPLY_TIMEOUT: Duration = Duration::from_secs(2);
 
 use tokio::io::BufReader;
 use tokio::sync::mpsc as tokio_mpsc;
@@ -110,6 +100,11 @@ pub async fn run() {
                     DebugEvent::Terminated => {
                         state.vm_active = false;
                         state.vm_suspended = false;
+                        // Drop the command sender so the backend's post-execution
+                        // drain loop sees the channel disconnect and exits, and so
+                        // any later request routes to the (pending) backend path
+                        // rather than a VM that is no longer polling.
+                        state.dbg_cmd_tx = None;
                         DapEvent::new(seq, "terminated", None)
                     }
                     DebugEvent::Output { category, output } => {
@@ -217,13 +212,9 @@ async fn handle_request(
                         lines: lines.clone(),
                         reply: reply_tx,
                     });
-                    tokio::task::spawn_blocking(move || {
-                        reply_rx
-                            .recv_timeout(DEBUG_REPLY_TIMEOUT)
-                            .unwrap_or_default()
-                    })
-                    .await
-                    .unwrap_or_default()
+                    tokio::task::spawn_blocking(move || reply_rx.recv().unwrap_or_default())
+                        .await
+                        .unwrap_or_default()
                 } else {
                     Vec::new()
                 }
@@ -254,7 +245,10 @@ async fn handle_request(
         }
         "configurationDone" => {
             let _ = backend_tx.send(BackendRequest::ConfigurationDone).await;
-            state.vm_active = true;
+            // Only mark the VM active if a launch actually produced a command
+            // channel and it hasn't already terminated (e.g. a launch/compile
+            // error sends Terminated, which clears dbg_cmd_tx).
+            state.vm_active = state.dbg_cmd_tx.is_some();
             state.vm_suspended = false;
             send_response(stdout, seq, msg.seq, "configurationDone", None).await;
         }
@@ -271,17 +265,16 @@ async fn handle_request(
             .await;
         }
         "stackTrace" => {
-            let frames = if state.vm_active {
+            // Only query the VM while it is stopped: it can only answer a stack
+            // trace meaningfully then, and gating on `vm_suspended` guarantees
+            // the VM is parked in its command loop so the reply wait can't hang.
+            let frames = if state.vm_active && state.vm_suspended {
                 if let Some(ref tx) = state.dbg_cmd_tx {
                     let (reply_tx, reply_rx) = std_mpsc::sync_channel(1);
                     let _ = tx.send(DebugCommand::GetStackTrace { reply: reply_tx });
-                    tokio::task::spawn_blocking(move || {
-                        reply_rx
-                            .recv_timeout(DEBUG_REPLY_TIMEOUT)
-                            .unwrap_or_default()
-                    })
-                    .await
-                    .unwrap_or_default()
+                    tokio::task::spawn_blocking(move || reply_rx.recv().unwrap_or_default())
+                        .await
+                        .unwrap_or_default()
                 } else {
                     Vec::new()
                 }
@@ -328,20 +321,16 @@ async fn handle_request(
                 .and_then(|a| a.get("frameId"))
                 .and_then(|f| f.as_u64())
                 .unwrap_or(0) as usize;
-            let scopes = if state.vm_active {
+            let scopes = if state.vm_active && state.vm_suspended {
                 if let Some(ref tx) = state.dbg_cmd_tx {
                     let (reply_tx, reply_rx) = std_mpsc::sync_channel(1);
                     let _ = tx.send(DebugCommand::GetScopes {
                         frame_id,
                         reply: reply_tx,
                     });
-                    tokio::task::spawn_blocking(move || {
-                        reply_rx
-                            .recv_timeout(DEBUG_REPLY_TIMEOUT)
-                            .unwrap_or_default()
-                    })
-                    .await
-                    .unwrap_or_default()
+                    tokio::task::spawn_blocking(move || reply_rx.recv().unwrap_or_default())
+                        .await
+                        .unwrap_or_default()
                 } else {
                     Vec::new()
                 }
@@ -374,20 +363,16 @@ async fn handle_request(
                 .and_then(|a| a.get("variablesReference"))
                 .and_then(|v| v.as_u64())
                 .unwrap_or(0);
-            let vars = if state.vm_active {
+            let vars = if state.vm_active && state.vm_suspended {
                 if let Some(ref tx) = state.dbg_cmd_tx {
                     let (reply_tx, reply_rx) = std_mpsc::sync_channel(1);
                     let _ = tx.send(DebugCommand::GetVariables {
                         reference,
                         reply: reply_tx,
                     });
-                    tokio::task::spawn_blocking(move || {
-                        reply_rx
-                            .recv_timeout(DEBUG_REPLY_TIMEOUT)
-                            .unwrap_or_default()
-                    })
-                    .await
-                    .unwrap_or_default()
+                    tokio::task::spawn_blocking(move || reply_rx.recv().unwrap_or_default())
+                        .await
+                        .unwrap_or_default()
                 } else {
                     Vec::new()
                 }
@@ -461,7 +446,7 @@ async fn handle_request(
             });
             let result = tokio::task::spawn_blocking(move || {
                 reply_rx
-                    .recv_timeout(DEBUG_REPLY_TIMEOUT)
+                    .recv()
                     .unwrap_or_else(|_| Err("debug VM did not reply".to_string()))
             })
             .await
@@ -542,7 +527,7 @@ async fn handle_request(
             });
             let result = tokio::task::spawn_blocking(move || {
                 reply_rx
-                    .recv_timeout(DEBUG_REPLY_TIMEOUT)
+                    .recv()
                     .unwrap_or_else(|_| Err("debug VM did not reply".to_string()))
             })
             .await
@@ -685,6 +670,38 @@ async fn send_error(
 }
 
 // --- Backend thread ---
+
+/// Reply to a debug command that arrived after the VM stopped polling, so the
+/// frontend's blocking reply wait resolves instead of hanging. Query commands
+/// get empty results; evaluate/setVariable get a clear error.
+fn reply_session_ended(cmd: DebugCommand) {
+    match cmd {
+        DebugCommand::SetBreakpoints { reply, .. } => {
+            let _ = reply.send(Vec::new());
+        }
+        DebugCommand::GetStackTrace { reply } => {
+            let _ = reply.send(Vec::new());
+        }
+        DebugCommand::GetScopes { reply, .. } => {
+            let _ = reply.send(Vec::new());
+        }
+        DebugCommand::GetVariables { reply, .. } => {
+            let _ = reply.send(Vec::new());
+        }
+        DebugCommand::Evaluate { reply, .. } => {
+            let _ = reply.send(Err("debug session has ended".to_string()));
+        }
+        DebugCommand::SetVariable { reply, .. } => {
+            let _ = reply.send(Err("debug session has ended".to_string()));
+        }
+        DebugCommand::Continue
+        | DebugCommand::StepInto
+        | DebugCommand::StepOver
+        | DebugCommand::StepOut
+        | DebugCommand::Pause
+        | DebugCommand::Disconnect => {}
+    }
+}
 
 fn backend_thread(
     mut rx: tokio_mpsc::Receiver<BackendRequest>,
@@ -878,6 +895,17 @@ fn backend_thread(
                         }
                     }
                     let _ = event_tx.blocking_send(DebugEvent::Terminated);
+
+                    // The VM is no longer polling its command channel. Drain any
+                    // commands the frontend sends in the race window before it
+                    // processes the Terminated event and replies to each, so a
+                    // blocking reply wait on the frontend can never hang on a
+                    // never-serviced command. This loop exits once the frontend
+                    // drops its command sender (on processing Terminated), which
+                    // disconnects the channel.
+                    while let Ok(cmd) = ds.command_rx.recv() {
+                        reply_session_ended(cmd);
+                    }
                 }
             }
 

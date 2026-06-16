@@ -616,3 +616,52 @@ async fn test_mcp_notebook_new_no_clobber_and_resets_env() {
         })
         .await;
 }
+
+/// Regression (MCP-2): program output from `print` must be captured and returned
+/// in the tool result, never interleaved into the JSON-RPC stdout stream. The
+/// response must remain a single well-formed JSON object and contain the output.
+#[tokio::test]
+async fn test_mcp_print_output_does_not_corrupt_protocol() {
+    let (client_read, mut server_write) = tokio::io::duplex(4096);
+    let (mut server_read, client_write) = tokio::io::duplex(4096);
+    let interpreter = Interpreter::new();
+
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async move {
+            let server_task = tokio::task::spawn_local(async move {
+                run_mcp_server_on(client_read, client_write, interpreter, None, None).await
+            });
+
+            // Evaluate code that prints to stdout and also returns a value.
+            call_tool(
+                &mut server_write,
+                1,
+                "eval",
+                json!({ "code": "(begin (print \"side-output-marker\") (+ 1 2))" }),
+            )
+            .await;
+
+            let mut reader = tokio::io::BufReader::new(&mut server_read);
+            let mut resp_line = String::new();
+            reader.read_line(&mut resp_line).await.unwrap();
+            // The line must parse cleanly as one JSON-RPC response — i.e. the
+            // printed text did not leak into the protocol stream.
+            let resp: serde_json::Value = serde_json::from_str(&resp_line)
+                .unwrap_or_else(|e| panic!("response not clean JSON ({e}): {resp_line:?}"));
+            assert_eq!(resp["id"], 1);
+            let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+            assert!(
+                text.contains("side-output-marker"),
+                "captured output should contain the printed text: {text}"
+            );
+            assert!(
+                text.contains("3"),
+                "result value 3 should be present: {text}"
+            );
+
+            drop(server_write);
+            server_task.await.unwrap().unwrap();
+        })
+        .await;
+}

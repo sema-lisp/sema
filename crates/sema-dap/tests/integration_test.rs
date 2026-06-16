@@ -1046,3 +1046,74 @@ fn test_dap_variables_expand_record_fields_by_name() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Regression (DAP-1/2/3): after the program terminates, inspection requests
+/// (stackTrace/scopes/variables) must return promptly with empty results rather
+/// than hanging the session waiting on a VM that is no longer polling. Runs a
+/// trivial program to completion (no breakpoints), then issues the requests and
+/// asserts each gets a timely, well-formed response.
+#[test]
+fn test_dap_inspection_after_termination_does_not_hang() {
+    let binary = sema_binary();
+    let dir = unique_temp_dir("post_term");
+    let program_path = dir.join("done.sema");
+    std::fs::write(&program_path, "(+ 1 2)\n").unwrap();
+
+    let mut child = Command::new(&binary)
+        .arg("dap")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap_or_else(|e| panic!("failed to spawn {binary}: {e}"));
+
+    let mut stdin = child.stdin.take().unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let mut reader = BufReader::new(stdout);
+
+    send_dap(&mut stdin, 1, "initialize", Some(serde_json::json!({})));
+    let _ = read_dap(&mut reader).unwrap();
+    let _ = read_dap(&mut reader).unwrap();
+
+    send_dap(
+        &mut stdin,
+        2,
+        "launch",
+        Some(serde_json::json!({ "program": program_path.to_string_lossy() })),
+    );
+    let resp = read_dap(&mut reader).unwrap();
+    assert_eq!(resp["command"], "launch");
+
+    send_dap(&mut stdin, 3, "configurationDone", None);
+    let resp = read_dap(&mut reader).unwrap();
+    assert_eq!(resp["command"], "configurationDone");
+
+    // Program runs to completion with no breakpoints.
+    assert!(
+        wait_for_event(&mut reader, "terminated", 50),
+        "should receive terminated event"
+    );
+
+    // Each inspection request must get a timely response (no hang) now that the
+    // VM has stopped polling its command channel.
+    for (seq, command, args) in [
+        (10, "stackTrace", serde_json::json!({})),
+        (11, "scopes", serde_json::json!({ "frameId": 0 })),
+        (
+            12,
+            "variables",
+            serde_json::json!({ "variablesReference": 1 }),
+        ),
+    ] {
+        send_dap(&mut stdin, seq, command, Some(args));
+        let resp = read_dap_timeout(&mut reader, Duration::from_secs(5))
+            .unwrap_or_else(|| panic!("{command} after termination hung (no response)"));
+        assert_eq!(resp["command"], command, "unexpected response: {resp}");
+        assert_eq!(resp["success"], true, "{command} should succeed: {resp}");
+    }
+
+    send_dap(&mut stdin, 13, "disconnect", None);
+    let _ = read_dap(&mut reader);
+    let _ = child.wait();
+    let _ = std::fs::remove_dir_all(&dir);
+}

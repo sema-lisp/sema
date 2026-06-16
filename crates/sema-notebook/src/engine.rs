@@ -5,7 +5,6 @@
 //! in earlier cells are visible to later ones.
 
 use std::collections::BTreeMap;
-use std::io::Read as _;
 use std::time::{Duration, Instant};
 
 use chrono::Utc;
@@ -182,17 +181,21 @@ impl Engine {
             self.interpreter.ctx.set_eval_deadline(None);
         }
 
-        // Capture stdout during evaluation
-        let mut captured = String::new();
-        let eval_result = if let Ok(mut redirect) = gag::BufferRedirect::stdout() {
-            let result = self.interpreter.eval_str_compiled(source);
-            let _ = redirect.read_to_string(&mut captured);
-            drop(redirect);
-            result
-        } else {
-            // Fallback: eval without capture (shouldn't happen)
-            self.interpreter.eval_str_compiled(source)
-        };
+        // Capture stdout during evaluation via the thread-local output hook
+        // rather than redirecting the process stdout fd. Hooks are per-thread,
+        // so concurrent cell evaluations on different engine threads don't
+        // contend for a single global fd redirect, and program output can never
+        // leak into a server's protocol stream on the real stdout.
+        let buf = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let sink = buf.clone();
+        sema_core::set_stdout_hook(Some(Box::new(move |s: &str| {
+            if let Ok(mut b) = sink.lock() {
+                b.push_str(s);
+            }
+        })));
+        let eval_result = self.interpreter.eval_str_compiled(source);
+        sema_core::set_stdout_hook(None);
+        let captured = buf.lock().map(|b| b.clone()).unwrap_or_default();
 
         // Always clear the deadline so subsequent cells (and unrelated
         // interpreter usage) are not poisoned by it.

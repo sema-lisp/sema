@@ -1,6 +1,5 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16">
-  <rect width="16" height="16" rx="3" fill="#1a1a1a"/>
-  <text x="8" y="12.5" text-anchor="middle" font-family="Georgia, 'Times New Roman', serif" font-weight="600" font-size="13" fill="#7a7a7a">S</text>
-  <rect x="9" y="9" width="6" height="6" rx="1" fill="#c8a855" opacity="0.8"/>
-  <text x="12" y="13.5" text-anchor="middle" font-family="monospace" font-weight="700" font-size="5" fill="#1a1a1a">c</text>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" width="16" height="16" fill="none">
+  <text x="7" y="11.5" text-anchor="middle" font-family="'JetBrains Mono', monospace" font-weight="700" font-size="8.5" fill="#968c79"><tspan fill="#6b6354" fill-opacity="0.65">(</tspan>s<tspan fill="#6b6354" fill-opacity="0.65">)</tspan></text>
+  <circle cx="13" cy="12.5" r="2.8" fill="#c8a855"/>
+  <text x="13" y="14.2" text-anchor="middle" font-family="'JetBrains Mono', monospace" font-weight="800" font-size="5" fill="#131110">c</text>
 </svg>

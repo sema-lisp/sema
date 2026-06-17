@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Fixed
+
+- **async/await and channels now work when running a compiled `.semac` file and under the DAP debugger.** Those execution paths previously ran the VM without initializing the async scheduler, so any async use failed with "no async scheduler registered"; the scheduler is now initialized consistently with running source.
+
 ### Added
 
 - **`(load ...)` runs on the bytecode VM** — when the VM is the active backend, a loaded file's body is now compiled and run on the VM instead of the tree-walker. This makes VM-only features (async/await, channels) work inside loaded files and runs loaded code at VM speed. `(import ...)` remains tree-walked (its module isolation needs lexical env capture the VM does not yet provide; tracked in `docs/plans/2026-06-16-vm-module-loading.md`). Under the DAP debugger, loaded files still run outside the attached debug session, so breakpoints inside them are not hit (a one-time warning notes this).

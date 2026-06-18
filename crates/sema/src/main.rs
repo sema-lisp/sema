@@ -152,8 +152,9 @@ struct Cli {
     #[arg(long, value_name = "DIRS")]
     allowed_paths: Option<String>,
 
-    /// Use tree-walker interpreter instead of bytecode VM (VM is the default)
-    #[arg(long)]
+    /// No-op: the tree-walker has been retired; the bytecode VM is the sole
+    /// evaluator. Accepted for backward compatibility, but ignored.
+    #[arg(long, hide = true)]
     tw: bool,
 
     /// No-op: use the bytecode VM (this is already the default). Accepted for compatibility.
@@ -840,27 +841,21 @@ fn main() {
 fn eval_with_mode(
     interpreter: &Interpreter,
     input: &str,
-    use_vm: bool,
+    _use_vm: bool,
 ) -> Result<sema_core::Value, sema_core::SemaError> {
-    if use_vm {
-        interpreter.eval_str_compiled(input)
-    } else {
-        interpreter.eval_str(input)
-    }
+    // The tree-walker is retired; the VM is the sole evaluator. `_use_vm` is
+    // ignored (the legacy `--tw` flag is a no-op).
+    interpreter.eval_str_compiled(input)
 }
 
-/// REPL eval. Tree-walker variant runs in the global env so top-level `define`s
-/// persist across REPL lines. VM variant already updates the global env.
+/// REPL eval. Runs in the global env so top-level `define`s persist across lines.
 pub(crate) fn eval_with_mode_repl(
     interpreter: &Interpreter,
     input: &str,
-    use_vm: bool,
+    _use_vm: bool,
 ) -> Result<sema_core::Value, sema_core::SemaError> {
-    if use_vm {
-        interpreter.eval_str_compiled(input)
-    } else {
-        interpreter.eval_str_in_global(input)
-    }
+    // The tree-walker is retired; the VM is the sole evaluator.
+    interpreter.eval_str_in_global(input)
 }
 
 /// Drain any pending async tasks scheduled by a top-level form.

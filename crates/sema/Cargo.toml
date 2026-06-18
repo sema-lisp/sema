@@ -32,14 +32,14 @@ sema-docs.workspace = true
 sema-notebook.workspace = true
 sema-mcp.workspace = true
 tokio.workspace = true
-reedline = "0.47"
+reedline = "0.48"
 nu-ansi-term = "0.50"
 crossterm = "0.29"
 glob.workspace = true
 clap.workspace = true
 clap_complete.workspace = true
 serde_json.workspace = true
-libsui = "0.13"
+libsui = "0.15"
 toml.workspace = true
 toml_edit.workspace = true
 serde.workspace = true
@@ -50,7 +50,7 @@ tar.workspace = true
 flate2.workspace = true
 crc32fast = "1"
 xz2 = "0.1"
-zip = { version = "2", default-features = false, features = ["deflate"] }
+zip = { version = "8", default-features = false, features = ["deflate"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

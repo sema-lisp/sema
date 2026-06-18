@@ -1,5 +1,7 @@
 # Whole-Codebase Bug Audit — 2026-05-29
 
+> **2026-06-18 re-triage:** every entry here (and the standalone bug docs) was re-verified against current HEAD; see **[2026-06-18-triage.md](./2026-06-18-triage.md)** for the authoritative status. Summary: 24 findings confirmed fixed, 28 still valid-as-written, 9 need re-planning, 1 stale. The adversarial re-check **re-opened 5** that had been marked fixed but were only masked/partial (notably VM-1 `CallNative` validation, the `time/parse` UTC bug, and the `eval.rs:773` UTF-8 slice).
+
 **Status:** **All P0 and P1 findings fixed for 1.16.0** (2026-05-30); P2/P3 tracked below. See Resolution.
 **Method:** 13 parallel reviewer agents, one per subsystem, hunting real bugs only
 (correctness, panics, memory/UB, security, reliability). Cosmetic/structural concerns excluded.

@@ -1,4 +1,4 @@
-.PHONY: all build release install uninstall test test-lsp test-embedding-bench test-http test-llm check clippy fmt fmt-check clean run lint lint-links docs docs-check update-pricing examples examples-vm smoke-bytecode test-providers fuzz fuzz-reader fuzz-eval setup bench-1m bench-10m bench-100m site-dev site-build site-preview site-deploy deploy coverage coverage-html bench bench-vm bench-tree bench-save bench-suite bench-closure bench-numeric bench-compare bench-baseline profile profile-vm profile-tree ts-setup ts-generate ts-test ts-playground js-lib-build js-lib-dev
+.PHONY: all build release install uninstall test test-lsp test-embedding-bench test-http test-llm check clippy fmt fmt-check clean run lint lint-links docs docs-check update-pricing examples examples-vm smoke-bytecode test-providers fuzz fuzz-reader fuzz-eval setup bench-1m bench-10m bench-100m site-dev site-build site-preview site-deploy deploy coverage coverage-html bench bench-vm bench-save bench-suite bench-closure bench-numeric bench-compare bench-baseline profile profile-vm ts-setup ts-generate ts-test ts-playground js-lib-build js-lib-dev
 build:
 	cargo build
 
@@ -197,22 +197,20 @@ BENCH_RUNS ?= 10
 BENCH_WARMUP ?= 3
 BENCH_SUITE ?= all
 
+# The bytecode VM is the sole evaluator; `bench` == `bench-vm`.
 bench: release
-	@./scripts/bench.sh --mode both --suite $(BENCH_SUITE) --runs $(BENCH_RUNS) --warmup $(BENCH_WARMUP)
+	@./scripts/bench.sh --mode vm --suite $(BENCH_SUITE) --runs $(BENCH_RUNS) --warmup $(BENCH_WARMUP)
 
 bench-vm: release
 	@./scripts/bench.sh --mode vm --suite $(BENCH_SUITE) --runs $(BENCH_RUNS) --warmup $(BENCH_WARMUP)
 
-bench-tree: release
-	@./scripts/bench.sh --mode tree --suite $(BENCH_SUITE) --runs $(BENCH_RUNS) --warmup $(BENCH_WARMUP)
-
 bench-save: release
 	@mkdir -p target/bench
-	@./scripts/bench.sh --mode both --suite $(BENCH_SUITE) --runs $(BENCH_RUNS) --warmup $(BENCH_WARMUP) \
+	@./scripts/bench.sh --mode vm --suite $(BENCH_SUITE) --runs $(BENCH_RUNS) --warmup $(BENCH_WARMUP) \
 		--export target/bench/bench-$$(git rev-parse --short HEAD 2>/dev/null || echo "nogit").json
 
 bench-suite: release
-	@./scripts/bench.sh --mode both --suite $(BENCH_SUITE) --runs $(BENCH_RUNS) --warmup $(BENCH_WARMUP)
+	@./scripts/bench.sh --mode vm --suite $(BENCH_SUITE) --runs $(BENCH_RUNS) --warmup $(BENCH_WARMUP)
 
 bench-closure: release
 	@./scripts/bench.sh --mode vm --suite closure --runs $(BENCH_RUNS) --warmup $(BENCH_WARMUP)
@@ -239,17 +237,13 @@ PROFILE_MODE ?= vm
 profile:
 	@mkdir -p $(PROFILE_DIR)
 	RUSTFLAGS="-C force-frame-pointers=yes" cargo build --profile release-with-debug -p sema-lang
-	@modeflag=""; if [ "$(PROFILE_MODE)" = "vm" ]; then modeflag="--vm"; fi; \
 	samply record --save-only --output $(PROFILE_DIR)/$(PROFILE_BENCH)-$(PROFILE_MODE).json -- \
-		./target/release-with-debug/sema --no-llm $$modeflag examples/benchmarks/$(PROFILE_BENCH).sema
+		./target/release-with-debug/sema --no-llm examples/benchmarks/$(PROFILE_BENCH).sema
 	@echo "Profile saved: $(PROFILE_DIR)/$(PROFILE_BENCH)-$(PROFILE_MODE).json"
 	@echo "Open with: samply load $(PROFILE_DIR)/$(PROFILE_BENCH)-$(PROFILE_MODE).json"
 
-profile-vm: 
+profile-vm:
 	@$(MAKE) profile PROFILE_MODE=vm PROFILE_BENCH=$(PROFILE_BENCH)
-
-profile-tree:
-	@$(MAKE) profile PROFILE_MODE=tree PROFILE_BENCH=$(PROFILE_BENCH)
 
 # Tree-sitter grammar
 TS_DIR := editors/tree-sitter-sema

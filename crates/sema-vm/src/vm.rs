@@ -872,6 +872,11 @@ impl VM {
         // closures so it never observes a cross-module callee's swapped table
         // (M4: import on the VM).
         let base_functions = self.functions.clone();
+        // Snapshot the VM's base globals — the env the top-level main closure
+        // (which carries no explicit home env) resolves against. `self.globals`
+        // is kept pointing at the running frame's home env (below); this
+        // immutable snapshot is the fallback for `None` closures (M1).
+        let base_globals = self.globals.clone();
 
         // Two-level dispatch: outer loop caches frame locals, inner loop dispatches opcodes.
         // We only break to the outer loop when frames change (Call/TailCall/Return/exceptions).
@@ -902,25 +907,35 @@ impl VM {
             let base = frame.base;
             let mut pc = frame.pc;
             let code_len = frame.closure.func.chunk.code.len();
-            // Home globals for this frame: the env the running closure was
-            // defined in. The top-level main closure carries `None` and falls
-            // back to the VM's own globals. Captured once per frame activation
-            // (cheap Rc clone) so the hot global opcodes below pay no
-            // per-instruction cost (M1: closure home-globals).
-            let frame_globals: Rc<Env> = match &frame.closure.globals {
-                Some(g) => g.clone(),
-                None => self.globals.clone(),
-            };
-            // Home function table for this frame: the compilation unit the
-            // running closure's func-ids index into. An imported closure carries
-            // its module's table; the top-level main closure carries `None` and
-            // uses the VM's base table. Restoring it here (rather than only
-            // swapping at call sites) means an importer frame regains its own
-            // table when a cross-module callee returns (M4: import on the VM).
-            self.functions = match &frame.closure.functions {
-                Some(f) => f.clone(),
-                None => base_functions.clone(),
-            };
+            // Point `self.globals` and `self.functions` at the running closure's
+            // home env / function table (a `None` closure — the top-level main
+            // closure — uses the VM's base snapshots). The hot global opcodes
+            // read `self.globals` directly, so this pays no per-instruction cost.
+            // Skip the Rc clone when already current (the common same-VM case):
+            // tak-style call-dense code keeps the same env/table across millions
+            // of frames, so the ptr-eq guard avoids needless refcount churn while
+            // an imported (cross-module) closure still gets its own env/table
+            // restored, and the caller regains theirs on return (M1 + M4).
+            match &frame.closure.globals {
+                Some(g) if !Rc::ptr_eq(g, &self.globals) => {
+                    let g = g.clone();
+                    self.globals = g;
+                }
+                None if !Rc::ptr_eq(&self.globals, &base_globals) => {
+                    self.globals = base_globals.clone();
+                }
+                _ => {}
+            }
+            match &frame.closure.functions {
+                Some(f) if !Rc::ptr_eq(f, &self.functions) => {
+                    let f = f.clone();
+                    self.functions = f;
+                }
+                None if !Rc::ptr_eq(&self.functions, &base_functions) => {
+                    self.functions = base_functions.clone();
+                }
+                _ => {}
+            }
 
             // Cache the next span boundary to avoid binary_search per instruction
             let (mut next_span_idx, mut next_span_pc) = if debug.is_some() {
@@ -1195,7 +1210,7 @@ impl VM {
                         let bits = read_u32!(code, pc);
                         let cache_slot = read_u16!(code, pc) as usize;
                         let cache_idx = self.frames[fi].cache_base + cache_slot;
-                        let version = frame_globals.version.get();
+                        let version = self.globals.version.get();
                         let entry = &self.inline_cache[cache_idx];
                         if entry.0 == bits && entry.1 == version {
                             self.stack.push(entry.2.clone());
@@ -1205,13 +1220,13 @@ impl VM {
                             // interned Spur for this global name; it is therefore guaranteed
                             // non-zero and layout-compatible with Spur.
                             let spur: Spur = unsafe { std::mem::transmute::<u32, Spur>(bits) };
-                            match frame_globals.get(spur) {
+                            match self.globals.get(spur) {
                                 Some(val) => {
                                     self.inline_cache[cache_idx] = (bits, version, val.clone());
                                     self.stack.push(val);
                                 }
                                 None => {
-                                    let err = unbound_global_error(spur, &frame_globals);
+                                    let err = unbound_global_error(spur, &self.globals);
                                     handle_err!(self, fi, pc, err, pc - op::SIZE_LOAD_GLOBAL, 'dispatch);
                                 }
                             }
@@ -1224,8 +1239,8 @@ impl VM {
                         // therefore non-zero and layout-compatible with Spur.
                         let spur: Spur = unsafe { std::mem::transmute::<u32, Spur>(bits) };
                         let val = unsafe { pop_unchecked(&mut self.stack) };
-                        if !frame_globals.set_existing(spur, val.clone()) {
-                            frame_globals.set(spur, val);
+                        if !self.globals.set_existing(spur, val.clone()) {
+                            self.globals.set(spur, val);
                         }
                     }
                     op::DEFINE_GLOBAL => {
@@ -1235,7 +1250,7 @@ impl VM {
                         // therefore non-zero and layout-compatible with Spur.
                         let spur: Spur = unsafe { std::mem::transmute::<u32, Spur>(bits) };
                         let val = unsafe { pop_unchecked(&mut self.stack) };
-                        frame_globals.set(spur, val);
+                        self.globals.set(spur, val);
                     }
 
                     // --- Control flow ---
@@ -1713,7 +1728,7 @@ impl VM {
 
                         // Look up the global (with inline cache)
                         let cache_idx = self.frames[fi].cache_base + cache_slot;
-                        let version = frame_globals.version.get();
+                        let version = self.globals.version.get();
                         let entry = &self.inline_cache[cache_idx];
                         let func_val = if entry.0 == bits && entry.1 == version {
                             entry.2.clone()
@@ -1722,13 +1737,13 @@ impl VM {
                             // emitted by the compiler from an interned Spur for the callee name
                             // and is therefore non-zero and layout-compatible with Spur.
                             let spur: Spur = unsafe { std::mem::transmute::<u32, Spur>(bits) };
-                            match frame_globals.get(spur) {
+                            match self.globals.get(spur) {
                                 Some(val) => {
                                     self.inline_cache[cache_idx] = (bits, version, val.clone());
                                     val
                                 }
                                 None => {
-                                    let err = unbound_global_error(spur, &frame_globals);
+                                    let err = unbound_global_error(spur, &self.globals);
                                     handle_err!(self, fi, pc, err, saved_pc, 'dispatch);
                                 }
                             }

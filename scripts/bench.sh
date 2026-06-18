@@ -160,21 +160,11 @@ for name in "${BENCHMARKS[@]}"; do
   HYPERFINE_ARGS=(--runs "$RUNS" --warmup "$WARMUP" --style full --ignore-failure)
   HYPERFINE_ARGS+=(--export-json "$TMPDIR_BENCH/${name}.json")
 
-  case "$MODE" in
-    tree)
-      hyperfine "${HYPERFINE_ARGS[@]}" \
-        -n "tree: $name" "$SEMA_BIN --no-llm $bench"
-      ;;
-    vm)
-      hyperfine "${HYPERFINE_ARGS[@]}" \
-        -n "vm: $name" "$SEMA_BIN --no-llm --vm $bench"
-      ;;
-    both)
-      hyperfine "${HYPERFINE_ARGS[@]}" \
-        -n "tree: $name" "$SEMA_BIN --no-llm $bench" \
-        -n "vm: $name" "$SEMA_BIN --no-llm --vm $bench"
-      ;;
-  esac
+  # The tree-walker is retired; the bytecode VM is the sole evaluator. The
+  # legacy --mode flag is accepted for backward compatibility but every mode
+  # now benchmarks the same VM binary.
+  hyperfine "${HYPERFINE_ARGS[@]}" \
+    -n "vm: $name" "$SEMA_BIN --no-llm $bench"
 
   echo
 done

@@ -61,7 +61,6 @@ This prevents **variable capture** — a common bug where macro-introduced bindi
 - Same `foo#` in one quasiquote → same generated symbol
 - Each quasiquote evaluation → fresh symbols (no cross-expansion collisions)
 - Outside quasiquote, `foo#` is a regular symbol (no magic)
-- Works in both the tree-walker and bytecode VM
 
 **Best practice:** Always use auto-gensym for bindings introduced by macros:
 

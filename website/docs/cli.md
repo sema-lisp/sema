@@ -23,7 +23,6 @@ sema [OPTIONS] [FILE] [-- SCRIPT_ARGS...]
 | `--chat-provider <NAME>`    | Set chat provider                     |
 | `--embedding-model <NAME>`  | Set embedding model                   |
 | `--embedding-provider <NAME>` | Set embedding provider              |
-| `--tw`               | Use tree-walker interpreter instead of bytecode VM (legacy; VM is the default) |
 | `--sandbox <MODE>`   | Restrict dangerous operations (see below)    |
 | `-V, --version`      | Print version                                |
 | `-h, --help`         | Print help                                   |
@@ -60,7 +59,6 @@ sema eval [OPTIONS]
 | `--sandbox <MODE>`    | Sandbox mode (`strict`, `all`, or comma-separated capabilities)  |
 | `--no-llm`            | Disable LLM features                                             |
 | `--timeout <MS>`      | Kill evaluation after N ms (default: 5000)                       |
-| `--tw`                | Use tree-walker interpreter instead of bytecode VM (legacy)      |
 
 **Examples:**
 
@@ -431,9 +429,6 @@ sema -p '(string/join (map str (range 10)) ",")'
 
 # Run without LLM features (faster startup)
 sema --no-llm script.sema
-
-# Use the tree-walker interpreter (legacy, slower)
-sema --tw script.sema
 
 # Compile to bytecode and run
 sema compile script.sema

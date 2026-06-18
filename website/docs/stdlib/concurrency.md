@@ -6,8 +6,6 @@ outline: [2, 3]
 
 Cooperative async concurrency with promises and channels. Tasks run on the VM's cooperative scheduler, interleaving at yield points (channel operations, `await`, `sleep`).
 
-Async features require the VM backend (default since v1.13). The tree-walker returns an error.
-
 ## Scheduling guarantees
 
 - **Spawn order is preserved.** When several tasks are simultaneously ready to run, the scheduler picks them in the order they were spawned. A pipeline of `(async (send-1)) (async (send-2)) (async (send-3))` followed by sequential receives yields `1 2 3`, not a reordered surface.

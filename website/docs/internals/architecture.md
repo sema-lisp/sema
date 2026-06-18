@@ -1,6 +1,6 @@
 # Architecture Overview
 
-Sema is a Lisp with first-class LLM primitives, implemented in Rust. The default execution path is a [bytecode VM](./bytecode-vm.md). A tree-walking interpreter — which walks the AST directly via a trampoline loop for tail-call optimization — is available via the `--tw` flag, and still serves as the macro expansion engine. The runtime is single-threaded (`Rc`, not `Arc`), with deterministic destruction via reference counting instead of a garbage collector.
+Sema is a Lisp with first-class LLM primitives, implemented in Rust. All code runs on a single evaluator: a [bytecode VM](./bytecode-vm.md). The runtime is single-threaded (`Rc`, not `Arc`), with deterministic destruction via reference counting instead of a garbage collector.
 
 The entire implementation is ~125k lines of Rust spread across 12 crates, each with a clear responsibility and strict dependency ordering.
 
@@ -26,8 +26,8 @@ The entire implementation is ~125k lines of Rust spread across 12 crates, each w
                           │      ┌────▼─────┐   │
                           │      │ sema-vm  │   │
                           │      │ bytecode │   │
-                          │      │VM        │   │
-                          │      │(default) │   │
+                          │      │ VM       │   │
+                          │      │(evaluator)│  │
                           │      └────┬─────┘   │
                           │           │         │
                      ┌────▼───────────▼──┐      │
@@ -57,7 +57,7 @@ This is discussed in detail in [The Circular Dependency Problem](#the-circular-d
 | --------------- | ------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
 | **sema-core**   | Shared types                    | `Value` (NaN-boxed 8-byte), `Env`, `SemaError`, string interner, `NativeFn`, `Lambda`, `Macro`, `Record`, LLM types                       |
 | **sema-reader** | Parsing                         | `Lexer` (24 token types) + recursive descent `Parser` → `Value` AST + `SpanMap`                                                           |
-| **sema-vm**     | Bytecode VM (default backend)   | `CoreExpr`, `ResolvedExpr`, `Op`, `Chunk`, `Emitter` — lowering, resolution, compilation, VM dispatch                                     |
+| **sema-vm**     | Bytecode VM (the evaluator)     | `CoreExpr`, `ResolvedExpr`, `Op`, `Chunk`, `Emitter` — lowering, resolution, compilation, VM dispatch                                     |
 | **sema-eval**   | Evaluation                      | Trampoline-based evaluator, special forms, module system, call stack + span table                                                         |
 | **sema-stdlib** | Standard library                | Native functions across a comprehensive standard library                                                                                  |
 | **sema-llm**    | LLM integration                 | `LlmProvider` trait, native providers (Anthropic, OpenAI, Gemini, Ollama), OpenAI-compatible shim, embedding providers, cost tracking     |

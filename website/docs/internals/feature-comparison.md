@@ -10,7 +10,7 @@ How does Sema stack up against other Lisps and Lisp-adjacent languages as a prac
 
 | Language | Implementation | Primary Use Case |
 | --- | --- | --- |
-| **Sema** | Rust (tree-walker + bytecode VM) | LLM-native scripting, AI tooling |
+| **Sema** | Rust (bytecode VM) | LLM-native scripting, AI tooling |
 | **Janet** | C (bytecode VM) | Embeddable scripting, system tools |
 | **Racket** | Chez Scheme backend | Teaching, DSLs, research |
 | **Clojure** | JVM | Production backend systems |

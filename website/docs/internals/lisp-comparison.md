@@ -21,9 +21,9 @@ How does Sema compare to other Lisp dialects on a real-world I/O-heavy workload?
 | **ECL**           | Native compiler          | 14,050    | 7.2x     | Compiled     |
 | **Guile**         | Bytecode VM              | 14,279    | 7.4x     | Interpreted  |
 | **Kawa**          | JVM (JIT)                | 16,521    | 8.5x     | JIT-compiled |
-| **Sema**          | Bytecode VM (default)    | 21,101    | 10.9x    | Interpreted  |
+| **Sema**          | Bytecode VM              | 21,101    | 10.9x    | Interpreted  |
 | **Gauche**        | Bytecode VM              | 21,786    | 11.2x    | Interpreted  |
-| **Sema**          | Tree-walking (`--tw`)    | 44,479    | 22.9x    | Interpreted  |
+| **Sema**          | Tree-walking (retired)   | 44,479    | 22.9x    | Interpreted  |
 
 Racket was excluded — we encountered crashes with both the CS (Chez Scheme) and BC (bytecode) backends in our Docker Desktop x86-64 emulation setup on Apple Silicon. This appears to be a [Docker/Rosetta emulation issue](https://racket.discourse.group/t/racket-docker-m1-rosetta/2947), not a Racket performance issue; Racket CS would likely land between Chez and Clojure.
 
@@ -32,7 +32,7 @@ Gambit, Chicken, and ECL are now benchmarked in compiled mode (compiling to nati
 :::
 
 ::: info Native performance
-Sema runs significantly faster natively on Apple Silicon: ~29.7s (tree-walker with `--tw`) and ~12.6s (VM, the default backend since v1.14.0) on 10M rows, compared to 44.5s / 21.1s under x86-64 emulation. NaN-boxing (introduced in v1.5.0) adds overhead that is amplified by x86-64 emulation. All dialects in this table were measured under the same Docker/emulation environment for a fair comparison.
+Sema runs significantly faster natively on Apple Silicon: ~12.6s (the bytecode VM) on 10M rows, compared to 21.1s under x86-64 emulation. The retired tree-walker measured ~29.7s natively (44.5s under emulation) and is kept in the tables below only for historical context. NaN-boxing (introduced in v1.5.0) adds overhead that is amplified by x86-64 emulation. All dialects in this table were measured under the same Docker/emulation environment for a fair comparison.
 :::
 
 ## Why SBCL Wins
@@ -98,7 +98,7 @@ Janet is the most architecturally comparable to Sema — both are:
 - Focused on practical scripting rather than language theory
 - No JIT, no native compilation
 
-Janet compiles to bytecode and runs on a register-based VM, which should be faster than tree-walking. Under the same Docker environment, Janet is ~3.4x faster than Sema's tree-walker (12.9s vs 44.5s). Sema's bytecode VM at 21.1s under emulation (~12.6s natively) is closing the gap — 1.6x behind Janet under emulation, and effectively tied natively.
+Janet compiles to bytecode and runs on a register-based VM. Under the same Docker environment, Janet was ~3.4x faster than Sema's old tree-walker (12.9s vs 44.5s). Sema's bytecode VM at 21.1s under emulation (~12.6s natively) closes the gap — 1.6x behind Janet under emulation, and effectively tied natively.
 
 Janet's implementation is straightforward: `file/read :line` in a loop, `string/find` + `string/slice` for parsing, mutable tables for accumulation. No special optimizations.
 
@@ -108,9 +108,9 @@ Guile (7.4x) and Gauche (11.2x) are both R7RS Scheme implementations with byteco
 
 ## Sema: The Interpreter Tax
 
-Sema's tree-walker (`--tw`) at 22.9x (44.5s under emulation, ~29.7s native) reflects the fundamental cost of tree-walking interpretation, amplified by NaN-boxing overhead under x86-64 emulation. Every operation — reading a line, splitting a string, parsing a number, updating a map — is a function call through the evaluator, with environment lookup, `Rc` reference counting, and trampoline dispatch.
+Sema's now-retired tree-walker measured 22.9x (44.5s under emulation, ~29.7s native), reflecting the fundamental cost of tree-walking interpretation, amplified by NaN-boxing overhead under x86-64 emulation. Every operation — reading a line, splitting a string, parsing a number, updating a map — was a function call through the evaluator, with environment lookup, `Rc` reference counting, and trampoline dispatch.
 
-The bytecode VM (the default backend since v1.14.0) cuts this to 10.9x (21.1s under emulation, ~12.6s native) — a **2.1× speedup** over the tree-walker under emulation and **2.4×** natively. Under emulation, Sema's VM has now overtaken Gauche (21.8s) and is closing in on Kawa. Natively, the VM at ~12.6s is essentially tied with Janet (12.9s Docker) and slightly ahead of Guile (14.3s Docker).
+The bytecode VM — now Sema's sole evaluator — cuts this to 10.9x (21.1s under emulation, ~12.6s native), a **2.1× speedup** over the old tree-walker under emulation and **2.4×** natively. Under emulation, Sema's VM has overtaken Gauche (21.8s) and is closing in on Kawa. Natively, the VM at ~12.6s is essentially tied with Janet (12.9s Docker) and slightly ahead of Guile (14.3s Docker).
 
 Key optimizations that remain in the runtime:
 
@@ -155,8 +155,8 @@ To measure raw language runtime speed — independent of implementation tricks �
 | **ECL**           | Native compiler          | 21,266    | 6.8x     | 1.5x slower  |
 | **Emacs Lisp**    | Bytecode VM              | 21,779    | 7.0x     | 1.8x slower  |
 | **Gauche**        | Bytecode VM              | 21,849    | 7.0x     | ~same        |
-| **Sema**          | Bytecode VM (default)    | 25,999    | 8.4x     | 1.2x slower  |
-| **Sema**          | Tree-walking (`--tw`)    | 49,770    | 16.0x    | 1.1x slower  |
+| **Sema**          | Bytecode VM              | 25,999    | 8.4x     | 1.2x slower  |
+| **Sema**          | Tree-walking (retired)   | 49,770    | 16.0x    | 1.1x slower  |
 
 The simple results are normalized to Fennel (the fastest simple implementation) rather than SBCL, since SBCL benefits the most from its optimizations.
 
@@ -188,7 +188,7 @@ Comparing simple vs optimized times shows where optimization effort pays off and
 - **Number parsing is the dominant optimization** — every dialect that benefits from optimization does so primarily by replacing the language's built-in number parser with a hand-rolled integer×10 parser. This avoids the overhead of handling the full numeric tower, scientific notation, and float precision.
 - **Fennel/LuaJIT is the fastest with zero optimization effort.** The simple and optimized versions are nearly identical — LuaJIT's tracing JIT does all the work. This makes Fennel the clear winner in "performance per line of code."
 - **Gauche's `string-ref` is O(k) on multibyte strings** — a hand-rolled char-by-char parser is actually _slower_ than `string->number` (C implementation) because Gauche stores strings in UTF-8, where `string-ref` must scan forward from the nearest index point.
-- **Sema's optimization gain is small** (21.1s vs 26.0s = 1.2x), because `file/fold-lines` and COW mutation work in both versions. The remaining difference is `string/to-float` + hashmap vs `string/to-number` + sorted map. The VM provides the same ~2× speedup over the tree-walker in both modes.
+- **Sema's optimization gain is small** (21.1s vs 26.0s = 1.2x), because `file/fold-lines` and COW mutation work in both versions. The remaining difference is `string/to-float` + hashmap vs `string/to-number` + sorted map. The VM provided the same ~2× speedup over the old tree-walker in both modes.
 
 ## What This Benchmark Doesn't Show
 
@@ -254,9 +254,8 @@ docker run ... sema-1brc-bench --simple /data/measurements.txt
 # Run both
 docker run ... sema-1brc-bench --all /data/measurements.txt
 
-# Run Sema natively for comparison (VM is default; --tw for tree-walker)
+# Run Sema natively for comparison
 cargo run --release -- --no-llm examples/benchmarks/1brc.sema -- benchmarks/data/bench-10m.txt
-cargo run --release -- --no-llm --tw examples/benchmarks/1brc.sema -- benchmarks/data/bench-10m.txt
 ```
 
 Source code for all implementations is in [`benchmarks/1brc/`](https://github.com/HelgeSverre/sema/tree/main/benchmarks/1brc) (optimized) and [`benchmarks/1brc/simple/`](https://github.com/HelgeSverre/sema/tree/main/benchmarks/1brc/simple) (simple/idiomatic).

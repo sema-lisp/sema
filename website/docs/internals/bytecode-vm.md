@@ -1,21 +1,21 @@
 # Bytecode VM
 
-::: tip Default Backend
-The bytecode VM is the default execution path as of v1.14.0. The tree-walking interpreter is still available via `--tw` for debugging and comparison. Both runtimes coexist and share the global environment.
+::: tip The Sole Evaluator
+The bytecode VM is the only evaluator. Every entry point — the CLI, the REPL, the embedding API, `eval`, `import`/`load`, macros, and async/await — compiles to bytecode and runs on the VM. Sema once also shipped a tree-walking interpreter (selectable via `--tw`); it has been retired, and the `--tw` flag is now a no-op accepted only for backward compatibility.
 :::
 
 ## Overview
 
-Sema's default backend is a bytecode VM. The VM compiles Sema source code into stack-based bytecode for faster execution, delivering **up to 17× speedup** over the tree-walker on compute-heavy workloads (e.g., TAK benchmark: 1.25s vs 21.4s).
+Sema's evaluator is a bytecode VM. The VM compiles Sema source code into stack-based bytecode for fast execution. On compute-heavy workloads it is dramatically faster than naive tree-walking interpretation — the TAK benchmark, for example, runs in ~1.25s (versus ~21.4s under the retired tree-walker).
 
-The tree-walking interpreter (`sema-eval`) is preserved as the macro expansion engine and `eval` fallback, and remains user-accessible via `--tw` — the two runtimes coexist, sharing the global environment and `EvalContext`.
+Macro expansion and dynamic `eval` are handled by `sema-eval`, which expands macros to a `Value` AST and then feeds them through the same compile-to-bytecode pipeline.
 
 ## Compilation Pipeline
 
 ```
 Source text
   → Reader       (tokenize + parse → Value AST)
-  → Macro expand  (tree-walker evaluates macros)
+  → Macro expand  (sema-eval expands macros)
   → Lower         (Value AST → CoreExpr IR)
   → Optimize      (constant folding + simplification on CoreExpr)
   → Resolve        (CoreExpr → ResolvedExpr with slot/upvalue/global analysis)
@@ -51,7 +51,7 @@ The resolver walks the CoreExpr tree and classifies every variable reference as 
 | `Upvalue { index }` | `LoadUpvalue` / `StoreUpvalue` | Captured from an enclosing function      |
 | `Global { spur }`   | `LoadGlobal` / `StoreGlobal`   | Module-level binding                     |
 
-This is the key optimization over the tree-walker: instead of hash-based environment chain lookup (O(scope depth) per access), variables are accessed by direct slot index (O(1)).
+This is a key optimization: instead of hash-based environment chain lookup (O(scope depth) per access), variables are accessed by direct slot index (O(1)).
 
 #### Upvalue Capture
 
@@ -121,7 +121,7 @@ CallFrame { closure: Rc<Closure>, pc: usize, base: usize, open_upvalues: Option<
 **Key design points:**
 
 - **Unsafe hot path**: The dispatch loop uses `unsafe` unchecked stack operations (`pop_unchecked`) and raw pointer bytecode reads via `read_u16!`/`read_i32!`/`read_u32!` macros for performance. Opcodes are dispatched by matching the raw byte against `u8` constants (the `op` module), avoiding decode overhead; `std::mem::transmute` is used only to reconstruct `Spur` handles from `u32` operands. Debug builds retain bounds checks via `debug_assert!`.
-- **Closure interop**: VM closures are wrapped as `Value::NativeFn` values so the tree-walker can call them. Each NativeFn carries an `Rc<dyn Any>` payload containing `VmClosurePayload` (closure + function table), and the VM uses `raw_tag()` + `downcast_ref` to avoid `Rc` refcount bumps on the hot path. When called from outside the VM (tree-walker, stdlib callbacks), the NativeFn wrapper creates a fresh VM instance to execute the closure's bytecode; in-VM calls unwrap the payload and run in the same VM.
+- **Closure interop**: VM closures are wrapped as `Value::NativeFn` values so code outside the VM can call them. Each NativeFn carries an `Rc<dyn Any>` payload containing `VmClosurePayload` (closure + function table), and the VM uses `raw_tag()` + `downcast_ref` to avoid `Rc` refcount bumps on the hot path. When called from outside the VM (e.g., stdlib higher-order-function callbacks), the NativeFn wrapper creates a fresh VM instance to execute the closure's bytecode; in-VM calls unwrap the payload and run in the same VM.
 - **Upvalue cells**: Lua-style open upvalues. `UpvalueCell` holds a `RefCell<UpvalueState>` — `Open { frame_base, slot }` points into the VM stack while the defining frame is alive; `Closed(Value)` owns the value after the frame exits. Locals are read and written directly on the stack (no cell indirection); cells are closed when a frame returns, tail-calls, unwinds — and before any non-VM call (see Current Limitations).
 - **Exception handling**: `Throw` opcode triggers handler search via the chunk's exception table. Stack is restored to saved depth, error value pushed, PC jumps to handler.
 
@@ -252,7 +252,7 @@ sema-core ← sema-reader ← sema-vm ← sema-eval
 
 ## Async Execution (VM-Only)
 
-Async/await and channels are implemented entirely in the VM — the tree-walker returns a clear error (`async requires the VM backend`) rather than maintaining a second implementation.
+Async/await and channels are implemented entirely in the VM, the runtime's sole evaluator.
 
 The model is **VM-per-task with cooperative scheduling**:
 
@@ -269,35 +269,21 @@ Yield-aware native functions must work on both closure paths (in-VM and the fres
 
 - The compiler emits inline opcodes for common builtins (`+`, `-`, `*`, `/`, `<`, `>`, `<=`, `>=`, `=`, `not`, `car`/`first`, `cdr`/`rest`, `cons`, `null?`, `pair?`, `list?`, `number?`, `string?`, `symbol?`, `length`, `append`, `get`, `contains?`, `nth`, `mod`/`modulo`) via intrinsic recognition. Redefining one of these names in the same program suppresses the intrinsic for that program, but a redefinition from a separate compilation unit (e.g., an earlier REPL entry) does not — the intrinsic still fires.
 - `CallNative` optimization requires passing `known_natives` at compile time (done automatically by `eval_str_compiled`); without it, all global calls use `CallGlobal`
-- `set!` to a captured local is silently lost when the closure is invoked through a stdlib higher-order function (`map`, `filter`, `for-each`, …) on the VM backend — upvalue cells are closed to snapshots before every non-VM call, so the callback mutates a detached copy. Globals and in-VM calls are unaffected. Use the tree-walker (`--tw`) or `foldl` with explicit accumulator threading as a workaround.
+- `set!` to a captured local is silently lost when the closure is invoked through a stdlib higher-order function (`map`, `filter`, `for-each`, …) — upvalue cells are closed to snapshots before every non-VM call, so the callback mutates a detached copy. Globals and in-VM calls are unaffected. Use `foldl` with explicit accumulator threading as a workaround.
 
 ## CLI Usage
 
-The bytecode VM is the default. Pass `--tw` to opt back into the tree-walker.
+The bytecode VM runs everything — no flag is required.
 
 ```bash
-# Run a file with the bytecode VM (default)
+# Run a file
 sema examples/hello.sema
 
-# Run with the tree-walker for debugging/comparison
-sema --tw examples/hello.sema
-
-# REPL also defaults to VM; use --tw to switch
+# Start the REPL
 sema
-sema --tw
 ```
 
-Both paths share the global `Env` and `EvalContext`.
-
 ## Design Decisions
-
-### Why Keep the Tree-Walker?
-
-The tree-walking interpreter remains for:
-
-1. **Macro expansion** — macros can call `eval` at expansion time, requiring a full evaluator before compilation
-2. **`eval` fallback** — dynamic `eval` needs to parse, expand, compile, and execute at runtime
-3. **Debugging** — tree-walking is easier to step through and inspect
 
 ### Why Not Delete CoreExpr After Resolution?
 

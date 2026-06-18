@@ -119,7 +119,7 @@ console.log(result.value); // {:status 200 :headers {...} :body "..."}
 
 ### `evalVM(code)` / `evalVMAsync(code)` — Bytecode VM
 
-These use the bytecode compiler and VM instead of the tree-walking evaluator. Same interface, potentially faster for compute-heavy code:
+Explicit aliases for evaluating via the bytecode VM. Sema runs all code on the VM, so these are equivalent to `eval`/`evalAsync`; they are kept as named entry points for clarity. Same interface:
 
 ```js
 const result = await interp.evalVMAsync('(http/get "https://httpbin.org/get")');
@@ -649,9 +649,9 @@ Compared to the [Rust embedding API](./embedding), the WASM/JavaScript embedding
 | `SemaInterpreter.createWithOptions(opts)` | Create with options: `{ stdlib, deny }`. Use `deny` to restrict capabilities. |
 | `interp.eval(code)` | Evaluate in a child env (definitions don't persist). Returns a JS object `{ value, output, error }`. |
 | `interp.evalGlobal(code)` | Evaluate in global env (definitions persist). Returns a JS object `{ value, output, error }`. |
-| `interp.evalAsync(code)` | Async eval with HTTP support (tree-walker). Returns a `Promise<object>`. |
-| `interp.evalVM(code)` | Evaluate via bytecode VM. Returns a JS object `{ value, output, error }`. |
-| `interp.evalVMAsync(code)` | Async VM eval with HTTP support. Returns a `Promise<object>`. |
+| `interp.evalAsync(code)` | Async eval with HTTP support. Returns a `Promise<object>`. |
+| `interp.evalVM(code)` | Evaluate via the bytecode VM (alias of `eval`). Returns a JS object `{ value, output, error }`. |
+| `interp.evalVMAsync(code)` | Async VM eval with HTTP support (alias of `evalAsync`). Returns a `Promise<object>`. |
 | `interp.registerFunction(name, fn)` | Register a JS function callable from Sema. Args passed as native JS values. |
 | `interp.preloadModule(name, source)` | Inject a virtual module for `(import "name")`. Returns `{ ok, error }`. |
 | `interp.readFile(path)` | Read a VFS file. Returns string or null. |

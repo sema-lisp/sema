@@ -618,10 +618,6 @@ Throw any value as an error.
 
 ## Async / Await
 
-::: info VM only
-`async` and `await` require the VM backend (default). The tree-walker interpreter returns an error.
-:::
-
 ### `async`
 
 Create an async task that evaluates `body` concurrently and returns a promise.

@@ -22,8 +22,7 @@ cargo test -p sema-reader                                # test single crate
 cargo test -p sema --test integration_test -- test_name  # single integration test
 cargo test -p sema --test dual_eval_test -- test_name    # single dual-eval test
 cargo test -p sema -- --ignored                          # run any ignored tests
-cargo run -- examples/hello.sema                         # run file (VM backend, default)
-cargo run -- --tw examples/hello.sema                    # run file with tree-walker backend
+cargo run -- examples/hello.sema                         # run file (bytecode VM — the sole evaluator)
 cargo run -- -e "(+ 1 2)"                                # eval expression
 ```
 
@@ -48,7 +47,7 @@ sema-core  ←  sema-reader  ←  sema-vm  ←  sema-eval  ←  sema (binary)
 - **sema-core** — NaN-boxed `Value(u64)` struct, `Env` (Rc + RefCell + hashbrown::HashMap), `SemaError`, `EvalContext`, thread-local VFS
 - **sema-reader** — Lexer + parser producing `Value` AST. Handles regex literals (`#"..."`), f-strings (`f"...${expr}..."`), short lambdas (`#(...)`)
 - **sema-vm** — Bytecode compiler (lowering → optimization → resolution → compilation), stack-based VM with intrinsic opcodes, debug hooks for DAP
-- **sema-eval** — Trampoline-based tree-walking evaluator, special forms, module system, destructuring/pattern matching, prelude macros
+- **sema-eval** — `Interpreter`, macro expansion (VM-native), module system (load/import drivers), prelude, eval/call callback wiring. (The legacy tree-walking evaluator has been retired — the VM is the sole evaluator; remaining `eval_value`/special-form code here is dead and slated for removal.)
 - **sema-stdlib** — Native functions across many modules registered into `Env`
 - **sema-llm** — LLM provider trait + Anthropic/OpenAI/Gemini/Ollama clients (tokio `block_on` for sync)
 - **sema-notebook** — Jupyter-inspired notebook interface: `.sema-nb` JSON format, evaluation engine with shared cell environment, HTTP server with REST API, embedded browser UI, Markdown export
@@ -101,23 +100,28 @@ Stdlib higher-order functions (map, filter, foldl, sort-by) call through `sema_c
 - Format: 24-byte header (magic `\x00SEM` + version + flags), then sections (string table, function table, main chunk, optional debug sections)
 - Spur remapping: global opcodes use string table indices in the file, remapped to process-local Spurs on load
 
-## Testing — Dual Eval (Tree-walker + VM)
+## Testing
 
-Sema has **two evaluators**: a tree-walking interpreter and a bytecode VM. The VM is the default backend. Most language features must produce identical results across both backends (tested via `dual_eval_test.rs`). **Async features (async/await, channels) are VM-only** — tests go in `vm_async_test.rs`.
+The bytecode VM is the **sole evaluator** (the tree-walker has been retired). All
+tests run on the VM. The `dual_eval_tests!` / `dual_eval_error_tests!` macros
+still exist (they currently emit `_tw` and `_vm` variants, both of which now run
+on the VM via the same entry points) and stay useful for pinning a literal
+expected value as the correctness oracle — the literal anchor matters more now
+that there's no second backend to differentially compare against.
 
-- **Dual-eval test file**: `crates/sema/tests/dual_eval_test.rs` — use `dual_eval_tests!` and `dual_eval_error_tests!` macros
-- **VM-only async tests**: `crates/sema/tests/vm_async_test.rs` — async/channel tests that only run on the VM backend
-- **Legacy files**: `integration_test.rs` (tree-walker only), `vm_integration_test.rs` (VM equivalence)
-- **New tests go in `dual_eval_test.rs`** — the macros generate `_tw` and `_vm` variants automatically
-- I/O, LLM, sandbox, CLI, module/import, server tests → tree-walker only (`integration_test.rs`)
+- **Dual-eval test file**: `crates/sema/tests/dual_eval_test.rs` — use `dual_eval_tests!` and `dual_eval_error_tests!` macros (literal `=> expected` value is the oracle)
+- **Async tests**: `crates/sema/tests/vm_async_test.rs` — async/channel tests
+- **VM equivalence / integration**: `vm_integration_test.rs`, `integration_test.rs`
+- I/O, LLM, sandbox, CLI, module/import, server tests → `integration_test.rs`
 - Notebook E2E tests: `crates/sema-notebook/tests/e2e/` (Playwright, run via `make test-notebook-e2e`)
+- A few `#[ignore]`d tests in `integration_test.rs` are a ready acceptance suite for the deferred VM stack-trace parity work (see `docs/deferred.md`).
 
 ## Adding New Functionality
 
 - **Builtin fn**: add to `crates/sema-stdlib/src/*.rs`, register in that module's `register()` fn, add dual-eval test.
-- **Special form**: add in `try_eval_special()` (tree-walker) AND `lower_list()` in `lower.rs` (VM), add dual-eval test.
-- **Prelude macro**: add to `crates/sema-eval/src/prelude.rs` (Sema code evaluated at startup).
-- **Async feature**: implement in stdlib (`async_ops.rs`) using yield signal mechanism, add VM-only test in `vm_async_test.rs`. Async features do NOT need tree-walker implementation.
+- **Special form**: add it to the VM lowering in `lower_list()` in `crates/sema-vm/src/lower.rs` (+ compiler if needed), add dual-eval test.
+- **Prelude macro**: add to `crates/sema-eval/src/prelude.rs` (Sema code evaluated at startup, expanded VM-natively).
+- **Async feature**: implement in stdlib (`async_ops.rs`) using the yield signal mechanism, add an async test in `vm_async_test.rs`.
 
 ## Release Procedure
 

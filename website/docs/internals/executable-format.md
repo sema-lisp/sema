@@ -308,5 +308,5 @@ Injection is format-aware rather than host-specific — `libsui` performs Mach-O
 
 - **Compression** — optional zstd/deflate compression for VFS entries
 - **Build options in `sema.toml`** — declare includes, metadata, and build options in the project manifest (`sema.toml` exists today for dependencies and formatter config, but `sema build` does not read it)
-- **Runtime-only binary** — strip tree-walker for smaller executables (requires architectural changes)
+- **Slimmer runtime** — trim unused runtime components for smaller executables (requires architectural changes)
 - **Code signing** — proper Apple notarization / Authenticode signing integration

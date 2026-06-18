@@ -42,6 +42,34 @@ fn round_trips_through_index_json() {
 }
 
 #[test]
+fn db_exec_batch_warns_about_sql_injection() {
+    // STD-10: db/exec-batch runs raw SQL with no parameterization. Its docs must
+    // warn it is for static SQL only and steer user input to parameterized db/exec.
+    let path =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("entries/stdlib/sqlite/db-exec-batch.md");
+    let src = std::fs::read_to_string(&path).unwrap();
+    let e = parse_entry(
+        &PathBuf::from("sqlite/db-exec-batch.md"),
+        &src,
+        "sqlite",
+        false,
+    )
+    .unwrap();
+    assert_eq!(e.name, "db/exec-batch");
+    let lower = e.body.to_lowercase();
+    assert!(
+        lower.contains("static sql only"),
+        "db/exec-batch docs must state it is static SQL only"
+    );
+    assert!(
+        lower.contains("db/exec"),
+        "db/exec-batch docs must steer user input to parameterized db/exec"
+    );
+    // The static-SQL warning is the headline, so it must surface in the summary too.
+    assert!(e.summary.to_lowercase().contains("static sql only"));
+}
+
+#[test]
 fn validate_and_dedupe() {
     // Cross-module: same name in different modules is kept.
     let a = parse_entry(&p(), "---\nname: \"length\"\n---\nLen.\n", "lists", false).unwrap();

@@ -132,6 +132,8 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
     });
 
     // (db/exec-batch handle sql) -> nil (execute multiple statements)
+    // STATIC SQL ONLY: no parameter binding — the string is run verbatim.
+    // Never interpolate user-controlled input; use parameterized db/exec for that.
     crate::register_fn_gated(
         env,
         sandbox,

@@ -98,6 +98,13 @@ impl Scheduler {
             SemaError::eval("async/spawn: argument must be a function (compiled VM closure)")
         })?;
 
+        // The closure will run on a dedicated task VM whose stack differs from
+        // the spawning VM's. Snapshot any still-open upvalue cells against the
+        // spawning VM now, while it is paused, so they don't dangle on the task
+        // VM stack (C1: keeping cells open across in-VM HOF calls means they may
+        // still be Open here).
+        vm::close_closure_upvalues_for_foreign_run(&closure);
+
         let id = self.next_id;
         self.next_id += 1;
 
@@ -293,6 +300,11 @@ pub(crate) fn run_closure_as_inline_task(
     functions: Rc<Vec<Rc<crate::chunk::Function>>>,
     args: &[Value],
 ) -> Result<Value, SemaError> {
+    // The closure runs on a dedicated task VM; snapshot any still-open upvalue
+    // cells against the owning (currently paused) VM before crossing onto the
+    // foreign task-VM stack (C1).
+    crate::vm::close_closure_upvalues_for_foreign_run(&closure);
+
     let mut sched = take_scheduler()?;
 
     let id = sched.next_id;

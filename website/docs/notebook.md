@@ -271,6 +271,12 @@ List response (`FileEntry[]`):
 VFS endpoints are sandboxed to the **parent directory of the notebook file**. When `sema notebook serve` is started **without** a `--notebook` path, the VFS root falls back to the current working directory (`$PWD`). The server prints a warning at startup in that case — prefer passing a notebook path if you don't want the whole `$PWD` to be reachable.
 :::
 
+## Security
+
+The notebook server is a **trusted-local** developer tool. Cells run arbitrary Sema code — including file and network access — with the full privileges of the user who started the server, and the server has **no authentication or authorization layer**.
+
+For this reason the server binds to the loopback interface (`127.0.0.1`) by default, so it is only reachable from the local machine. You can override the bind address with `--host`, but binding to a non-loopback address such as `0.0.0.0` exposes an unauthenticated remote code-execution endpoint to the network. If you need remote access, putting it behind a firewall, VPN, or an authenticating reverse proxy is **the operator's responsibility**.
+
 ## CLI Reference
 
 See [`sema notebook`](/docs/cli.html#sema-notebook) in the CLI reference for all flags and options.

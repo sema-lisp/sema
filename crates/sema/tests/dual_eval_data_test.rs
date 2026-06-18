@@ -35,7 +35,7 @@ dual_eval_tests! {
     regex_match_found: r#"(get (regex/match "\\d+" "abc123def") :match)"# => Value::string("123"),
     regex_match_no_match: r#"(regex/match "\\d+" "abc")"# => Value::nil(),
     regex_find_all: r#"(length (regex/find-all "\\d+" "a1b2c3"))"# => Value::int(3),
-    regex_find_all_empty: r#"(regex/find-all "\\d+" "abc")"# => common::eval_tw("'()"),
+    regex_find_all_empty: r#"(regex/find-all "\\d+" "abc")"# => Value::list(vec![]),
     regex_replace: r#"(regex/replace "\\d+" "X" "a1b2c3")"# => Value::string("aXb2c3"),
     regex_replace_all: r#"(regex/replace-all "\\s+" " " "a  b   c")"# => Value::string("a b c"),
     regex_split: r#"(length (regex/split "," "a,b,c"))"# => Value::int(3),

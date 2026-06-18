@@ -8,14 +8,14 @@ use sema_core::Value;
 // ============================================================
 
 dual_eval_tests! {
-    char_literal: r#"#\a"# => common::eval_tw(r#"#\a"#),
+    char_literal: r#"#\a"# => Value::char('a'),
     char_pred: r#"(char? #\a)"# => Value::bool(true),
     char_alpha: r#"(char-alphabetic? #\a)"# => Value::bool(true),
     char_numeric: r#"(char-numeric? #\5)"# => Value::bool(true),
     char_whitespace: r#"(char-whitespace? #\space)"# => Value::bool(true),
-    char_upper: r#"(char-upcase #\a)"# => common::eval_tw(r#"#\A"#),
+    char_upper: r#"(char-upcase #\a)"# => Value::char('A'),
     char_to_int: r#"(char->integer #\a)"# => Value::int(97),
-    int_to_char: r#"(integer->char 65)"# => common::eval_tw(r#"#\A"#),
+    int_to_char: r#"(integer->char 65)"# => Value::char('A'),
     char_cmp_lt: r#"(char<? #\a #\b)"# => Value::bool(true),
     char_cmp_eq: r#"(char=? #\a #\a)"# => Value::bool(true),
 }
@@ -31,7 +31,7 @@ dual_eval_tests! {
     bv_length: "(bytevector-length (bytevector 1 2 3))" => Value::int(3),
     bv_copy: "(bytevector-length (bytevector-copy (bytevector 1 2 3)))" => Value::int(3),
     bv_append: "(bytevector-length (bytevector-append (bytevector 1 2) (bytevector 3 4)))" => Value::int(4),
-    bv_list_roundtrip: "(bytevector->list (list->bytevector '(10 20 30)))" => common::eval_tw("'(10 20 30)"),
+    bv_list_roundtrip: "(bytevector->list (list->bytevector '(10 20 30)))" => Value::list(vec![Value::int(10), Value::int(20), Value::int(30)]),
     bv_utf8: r#"(utf8->string (string->utf8 "hello"))"# => Value::string("hello"),
     bv_display: "(bytevector? (bytevector 1 2 3))" => Value::bool(true),
 }
@@ -156,5 +156,5 @@ dual_eval_tests! {
     neg_zero_eq_identity: "(eq? -0.0 0.0)" => Value::bool(true),
 
     // -0.0 in collections — lookup must work since equal? says equal
-    neg_zero_in_list: "(member -0.0 '(1.0 0.0 2.0))" => common::eval_tw("'(0.0 2.0)"),
+    neg_zero_in_list: "(member -0.0 '(1.0 0.0 2.0))" => Value::list(vec![Value::float(0.0), Value::float(2.0)]),
 }

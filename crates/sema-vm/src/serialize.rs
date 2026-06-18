@@ -910,11 +910,30 @@ fn parse_sema_version() -> (u16, u16, u16) {
 
 /// Validate bytecode operand bounds after deserialization.
 fn validate_bytecode(result: &CompileResult) -> Result<(), SemaError> {
-    validate_chunk_bytecode(&result.chunk, result.functions.len(), 0, "main chunk")?;
+    // The native table is process-local and is NOT serialized in the .semac
+    // format, so a deserialized `CompileResult` carries an empty `native_table`
+    // (the VM resolves natives via the shared global env using CallGlobal). Any
+    // CallNative opcode in loaded bytecode therefore has no valid backing entry,
+    // and `native_id < n_natives` rejects it — matching the runtime invariant
+    // that loaded bytecode is run with an empty native table.
+    let n_natives = result.native_table.len();
+    validate_chunk_bytecode(
+        &result.chunk,
+        result.functions.len(),
+        0,
+        n_natives,
+        "main chunk",
+    )?;
     for (i, func) in result.functions.iter().enumerate() {
         let label = format!("function {i}");
         let n_upvalues = func.upvalue_descs.len();
-        validate_chunk_bytecode(&func.chunk, result.functions.len(), n_upvalues, &label)?;
+        validate_chunk_bytecode(
+            &func.chunk,
+            result.functions.len(),
+            n_upvalues,
+            n_natives,
+            &label,
+        )?;
     }
     Ok(())
 }
@@ -923,6 +942,7 @@ fn validate_chunk_bytecode(
     chunk: &Chunk,
     n_functions: usize,
     n_upvalues: usize,
+    n_natives: usize,
     label: &str,
 ) -> Result<(), SemaError> {
     let code = &chunk.code;
@@ -966,6 +986,18 @@ fn validate_chunk_bytecode(
                 if slot >= n_upvalues {
                     return Err(SemaError::eval(format!(
                         "in {label}: upvalue slot {slot} out of range (n_upvalues={n_upvalues}) at pc {pc}",
+                    )));
+                }
+            }
+            Op::CallNative => {
+                // CallNative = op + u16 native_id + u16 argc. The native_id
+                // indexes the VM's resolved native table at runtime; an
+                // out-of-range id would index past it (a release-build OOB
+                // guarded only by a debug_assert in vm.rs). Reject it here.
+                let native_id = u16::from_le_bytes([code[pc + 1], code[pc + 2]]) as usize;
+                if native_id >= n_natives {
+                    return Err(SemaError::eval(format!(
+                        "in {label}: CallNative native_id {native_id} out of range (table has {n_natives} entries) at pc {pc}",
                     )));
                 }
             }

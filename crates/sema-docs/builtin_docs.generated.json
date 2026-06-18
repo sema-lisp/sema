@@ -6860,11 +6860,11 @@
       "name": "db/exec-batch",
       "module": "sqlite",
       "section": "Executing SQL",
-      "summary": "Execute multiple SQL statements at once (no parameter binding). Useful for schema setup and migrations. Returns `nil`.",
+      "summary": "Execute multiple SQL statements at once. STATIC SQL ONLY — there is no parameter binding, so the entire string is run verbatim. Useful for schema setup and migrations. Returns `nil`.",
       "examples": [
         "(db/exec-batch \"mydb\" \"\n  CREATE TABLE posts (id INTEGER PRIMARY KEY, user_id INTEGER, title TEXT);\n  CREATE TABLE tags (id INTEGER PRIMARY KEY, name TEXT);\n  CREATE INDEX idx_posts_user ON posts(user_id);\n\")"
       ],
-      "body": "Execute multiple SQL statements at once (no parameter binding). Useful for schema setup and migrations. Returns `nil`.\n\n```sema\n(db/exec-batch \"mydb\" \"\n  CREATE TABLE posts (id INTEGER PRIMARY KEY, user_id INTEGER, title TEXT);\n  CREATE TABLE tags (id INTEGER PRIMARY KEY, name TEXT);\n  CREATE INDEX idx_posts_user ON posts(user_id);\n\")\n```"
+      "body": "Execute multiple SQL statements at once. STATIC SQL ONLY — there is no parameter binding, so the entire string is run verbatim. Useful for schema setup and migrations. Returns `nil`.\n\n**Security:** never interpolate user-controlled input into the SQL string passed to `db/exec-batch` — doing so is a SQL injection vulnerability. For any value that comes from outside the program, use the parameterized `db/exec` (with `?` placeholders) instead, one statement at a time.\n\n```sema\n(db/exec-batch \"mydb\" \"\n  CREATE TABLE posts (id INTEGER PRIMARY KEY, user_id INTEGER, title TEXT);\n  CREATE TABLE tags (id INTEGER PRIMARY KEY, name TEXT);\n  CREATE INDEX idx_posts_user ON posts(user_id);\n\")\n```"
     },
     {
       "name": "db/last-insert-id",

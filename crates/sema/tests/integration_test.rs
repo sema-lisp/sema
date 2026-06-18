@@ -20,6 +20,34 @@ fn assert_type_error(input: &str) {
     );
 }
 
+/// True if `err` (or any error it wraps via `WithTrace`/`UserException`) is a
+/// sandbox permission denial — either `PermissionDenied` (missing capability) or
+/// `PathDenied` (path outside allowed directories). Structured matching replaces
+/// fragile `.contains("Permission denied")` message checks.
+fn is_permission_error(err: &SemaError) -> bool {
+    matches!(
+        err.inner(),
+        SemaError::PermissionDenied { .. } | SemaError::PathDenied { .. }
+    )
+}
+
+/// Assert that `err` is a sandbox permission denial.
+fn assert_permission_denied(err: &SemaError) {
+    assert!(
+        is_permission_error(err),
+        "expected PermissionDenied/PathDenied, got: {err}"
+    );
+}
+
+/// Assert that `err` is specifically a `PathDenied` (path outside the allowed
+/// directories), not merely a missing-capability denial.
+fn assert_path_denied(err: &SemaError) {
+    assert!(
+        matches!(err.inner(), SemaError::PathDenied { .. }),
+        "expected PathDenied, got: {err}"
+    );
+}
+
 fn eval(input: &str) -> Value {
     let interp = Interpreter::new();
     interp
@@ -46,6 +74,28 @@ fn assert_float_eq(input: &str, expected: f64) {
         (f - expected).abs() < 1e-10,
         "{input} = {f}, expected ≈ {expected}"
     );
+}
+
+/// Build a path inside the OS temp directory, using forward slashes so it can be
+/// embedded directly in Sema source string literals on every platform (Windows
+/// `temp_dir()` would otherwise contain backslashes that act as escape chars).
+/// Replaces hardcoded `/tmp/...` paths in filesystem tests.
+fn temp_path(name: &str) -> String {
+    std::env::temp_dir()
+        .join(name)
+        .to_string_lossy()
+        .replace('\\', "/")
+}
+
+/// Evaluate an expression that yields a path string and normalize OS-specific
+/// directory separators to `/` so assertions are platform-agnostic (`path/join`
+/// emits `\` on Windows).
+fn eval_path(input: &str) -> String {
+    let v = eval(input);
+    let s = v
+        .as_str()
+        .unwrap_or_else(|| panic!("expected string path from `{input}`, got: {v}"));
+    s.replace('\\', "/")
 }
 
 #[test]
@@ -365,14 +415,17 @@ fn test_defagent() {
 #[test]
 fn test_load_special_form() {
     // Write a temp file and load it
-    eval(r#"(file/write "/tmp/sema-test-load.sema" "(define loaded-value 42)")"#);
-    let result = eval(
+    let path = temp_path("sema-test-load.sema");
+    eval(&format!(
+        r#"(file/write "{path}" "(define loaded-value 42)")"#
+    ));
+    let result = eval(&format!(
         r#"
         (begin
-          (load "/tmp/sema-test-load.sema")
+          (load "{path}")
           loaded-value)
-    "#,
-    );
+    "#
+    ));
     assert_eq!(result, Value::int(42));
 }
 
@@ -618,80 +671,85 @@ fn lisp_path(path: &std::path::Path) -> String {
 #[test]
 fn test_module_import() {
     // Write a module file
-    eval(
-        r#"(file/write "/tmp/sema-test-module.sema" "(module math (export add square) (define (add a b) (+ a b)) (define (square x) (* x x)) (define internal 42))")"#,
-    );
+    let path = temp_path("sema-test-module.sema");
+    eval(&format!(
+        r#"(file/write "{path}" "(module math (export add square) (define (add a b) (+ a b)) (define (square x) (* x x)) (define internal 42))")"#,
+    ));
     // Import and use
     assert_eq!(
-        eval(
+        eval(&format!(
             r#"
             (begin
-              (import "/tmp/sema-test-module.sema")
+              (import "{path}")
               (add 3 4))
         "#
-        ),
+        )),
         Value::int(7)
     );
     assert_eq!(
-        eval(
+        eval(&format!(
             r#"
             (begin
-              (import "/tmp/sema-test-module.sema")
+              (import "{path}")
               (square 5))
         "#
-        ),
+        )),
         Value::int(25)
     );
     // internal should NOT be exported
-    let err = eval_err(
+    let err = eval_err(&format!(
         r#"
         (begin
-          (import "/tmp/sema-test-module.sema")
+          (import "{path}")
           internal)
     "#,
-    );
+    ));
     assert!(matches!(err.inner(), SemaError::Unbound(_)));
 }
 
 #[test]
 fn test_selective_import() {
-    eval(
-        r#"(file/write "/tmp/sema-test-sel.sema" "(module m (export foo bar) (define (foo) 1) (define (bar) 2))")"#,
-    );
+    let path = temp_path("sema-test-sel.sema");
+    eval(&format!(
+        r#"(file/write "{path}" "(module m (export foo bar) (define (foo) 1) (define (bar) 2))")"#,
+    ));
     assert_eq!(
-        eval(
+        eval(&format!(
             r#"
             (begin
-              (import "/tmp/sema-test-sel.sema" foo)
+              (import "{path}" foo)
               (foo))
         "#
-        ),
+        )),
         Value::int(1)
     );
     // bar should not be imported
-    let err = eval_err(
+    let err = eval_err(&format!(
         r#"
         (begin
-          (import "/tmp/sema-test-sel.sema" foo)
+          (import "{path}" foo)
           (bar))
     "#,
-    );
+    ));
     assert!(matches!(err.inner(), SemaError::Unbound(_)));
 }
 
 #[test]
 fn test_module_cache() {
-    eval(r#"(file/write "/tmp/sema-test-cache.sema" "(module c (export val) (define val 99))")"#);
+    let path = temp_path("sema-test-cache.sema");
+    eval(&format!(
+        r#"(file/write "{path}" "(module c (export val) (define val 99))")"#
+    ));
     // Import twice — should work fine (cached)
     assert_eq!(
-        eval(
+        eval(&format!(
             r#"
             (begin
-              (import "/tmp/sema-test-cache.sema")
-              (import "/tmp/sema-test-cache.sema")
+              (import "{path}")
+              (import "{path}")
               val)
         "#
-        ),
+        )),
         Value::int(99)
     );
 }
@@ -921,7 +979,8 @@ fn test_macroexpand() {
 
 #[test]
 fn test_file_operations() {
-    let dir = "/tmp/sema-test-fileops";
+    let dir = temp_path("sema-test-fileops");
+    let dir = dir.as_str();
     // Clean up from previous runs
     let _ = std::fs::remove_dir_all(dir);
 
@@ -978,8 +1037,8 @@ fn test_file_operations() {
 #[test]
 fn test_path_operations() {
     assert_eq!(
-        eval(r#"(path/join "usr" "local" "bin")"#),
-        Value::string("usr/local/bin")
+        eval_path(r#"(path/join "usr" "local" "bin")"#),
+        "usr/local/bin"
     );
     assert_eq!(eval(r#"(path/dirname "/a/b/c")"#), Value::string("/a/b"));
     assert_eq!(
@@ -2303,7 +2362,8 @@ fn test_sys_env_all() {
 
 #[test]
 fn test_file_is_file() {
-    let dir = "/tmp/sema-test-isfile";
+    let dir = temp_path("sema-test-isfile");
+    let dir = dir.as_str();
     let _ = std::fs::remove_dir_all(dir);
     std::fs::create_dir_all(dir).unwrap();
     std::fs::write(format!("{dir}/a.txt"), "hello").unwrap();
@@ -2317,7 +2377,10 @@ fn test_file_is_file() {
         Value::bool(false)
     );
     assert_eq!(
-        eval(r#"(file/is-file? "/tmp/nonexistent-sema-xyz")"#),
+        eval(&format!(
+            r#"(file/is-file? "{}")"#,
+            temp_path("nonexistent-sema-xyz")
+        )),
         Value::bool(false)
     );
 
@@ -2327,7 +2390,8 @@ fn test_file_is_file() {
 #[test]
 fn test_file_is_symlink() {
     // Non-symlink file should return false
-    let dir = "/tmp/sema-test-symlink";
+    let dir = temp_path("sema-test-symlink");
+    let dir = dir.as_str();
     let _ = std::fs::remove_dir_all(dir);
     std::fs::create_dir_all(dir).unwrap();
     std::fs::write(format!("{dir}/a.txt"), "hello").unwrap();
@@ -2337,7 +2401,10 @@ fn test_file_is_symlink() {
         Value::bool(false)
     );
     assert_eq!(
-        eval(r#"(file/is-symlink? "/tmp/nonexistent-sema-xyz")"#),
+        eval(&format!(
+            r#"(file/is-symlink? "{}")"#,
+            temp_path("nonexistent-sema-xyz")
+        )),
         Value::bool(false)
     );
 
@@ -2729,7 +2796,8 @@ fn test_read_many() {
 
 #[test]
 fn test_file_append_standalone() {
-    let dir = "/tmp/sema-test-append";
+    let dir = temp_path("sema-test-append");
+    let dir = dir.as_str();
     let _ = std::fs::remove_dir_all(dir);
     eval(&format!(r#"(file/mkdir "{dir}")"#));
 
@@ -2753,7 +2821,8 @@ fn test_file_append_standalone() {
 
 #[test]
 fn test_file_delete_standalone() {
-    let dir = "/tmp/sema-test-delete";
+    let dir = temp_path("sema-test-delete");
+    let dir = dir.as_str();
     let _ = std::fs::remove_dir_all(dir);
     eval(&format!(r#"(file/mkdir "{dir}")"#));
 
@@ -2777,7 +2846,8 @@ fn test_file_delete_standalone() {
 
 #[test]
 fn test_file_rename_standalone() {
-    let dir = "/tmp/sema-test-rename";
+    let dir = temp_path("sema-test-rename");
+    let dir = dir.as_str();
     let _ = std::fs::remove_dir_all(dir);
     eval(&format!(r#"(file/mkdir "{dir}")"#));
 
@@ -2801,7 +2871,8 @@ fn test_file_rename_standalone() {
 
 #[test]
 fn test_file_list_standalone() {
-    let dir = "/tmp/sema-test-list";
+    let dir = temp_path("sema-test-list");
+    let dir = dir.as_str();
     let _ = std::fs::remove_dir_all(dir);
     eval(&format!(r#"(file/mkdir "{dir}")"#));
 
@@ -2824,7 +2895,8 @@ fn test_file_list_standalone() {
 
 #[test]
 fn test_file_mkdir_standalone() {
-    let dir = "/tmp/sema-test-mkdir";
+    let dir = temp_path("sema-test-mkdir");
+    let dir = dir.as_str();
     let _ = std::fs::remove_dir_all(dir);
 
     // Recursive mkdir
@@ -2847,7 +2919,8 @@ fn test_file_mkdir_standalone() {
 
 #[test]
 fn test_file_is_directory_standalone() {
-    let dir = "/tmp/sema-test-isdir";
+    let dir = temp_path("sema-test-isdir");
+    let dir = dir.as_str();
     let _ = std::fs::remove_dir_all(dir);
     eval(&format!(r#"(file/mkdir "{dir}")"#));
     eval(&format!(r#"(file/write "{dir}/f.txt" "file")"#));
@@ -2870,7 +2943,8 @@ fn test_file_is_directory_standalone() {
 
 #[test]
 fn test_file_info_standalone() {
-    let dir = "/tmp/sema-test-info";
+    let dir = temp_path("sema-test-info");
+    let dir = dir.as_str();
     let _ = std::fs::remove_dir_all(dir);
     eval(&format!(r#"(file/mkdir "{dir}")"#));
     eval(&format!(r#"(file/write "{dir}/test.txt" "hello")"#));
@@ -2902,7 +2976,8 @@ fn test_file_info_standalone() {
 
 #[test]
 fn test_file_read_lines() {
-    let dir = "/tmp/sema-test-readlines";
+    let dir = temp_path("sema-test-readlines");
+    let dir = dir.as_str();
     let _ = std::fs::remove_dir_all(dir);
     eval(&format!(r#"(file/mkdir "{dir}")"#));
 
@@ -2933,7 +3008,8 @@ fn test_file_read_lines() {
 
 #[test]
 fn test_file_write_lines() {
-    let dir = "/tmp/sema-test-writelines";
+    let dir = temp_path("sema-test-writelines");
+    let dir = dir.as_str();
     let _ = std::fs::remove_dir_all(dir);
     eval(&format!(r#"(file/mkdir "{dir}")"#));
 
@@ -3032,7 +3108,11 @@ fn test_file_for_each_line() {
 
     // Non-existent file → IO error
     assert!(matches!(
-        eval_err(r#"(file/for-each-line "/tmp/nonexistent-sema.txt" (fn (l) l))"#).inner(),
+        eval_err(&format!(
+            r#"(file/for-each-line "{}" (fn (l) l))"#,
+            temp_path("nonexistent-sema.txt")
+        ))
+        .inner(),
         SemaError::Io(_)
     ));
 
@@ -3111,7 +3191,11 @@ fn test_file_fold_lines() {
 
     // Non-existent file → IO error
     assert!(matches!(
-        eval_err(r#"(file/fold-lines "/tmp/nonexistent-sema.txt" (fn (a l) a) 0)"#).inner(),
+        eval_err(&format!(
+            r#"(file/fold-lines "{}" (fn (a l) a) 0)"#,
+            temp_path("nonexistent-sema.txt")
+        ))
+        .inner(),
         SemaError::Io(_)
     ));
 
@@ -3120,7 +3204,8 @@ fn test_file_fold_lines() {
 
 #[test]
 fn test_file_copy() {
-    let dir = "/tmp/sema-test-copy";
+    let dir = temp_path("sema-test-copy");
+    let dir = dir.as_str();
     let _ = std::fs::remove_dir_all(dir);
     eval(&format!(r#"(file/mkdir "{dir}")"#));
 
@@ -3160,13 +3245,35 @@ fn test_file_copy() {
 
 #[test]
 fn test_path_join_extended() {
-    assert_eq!(eval(r#"(path/join "a" "b" "c")"#), Value::string("a/b/c"));
+    assert_eq!(eval_path(r#"(path/join "a" "b" "c")"#), "a/b/c");
     assert_eq!(
-        eval(r#"(path/join "/usr" "local" "bin")"#),
-        Value::string("/usr/local/bin")
+        eval_path(r#"(path/join "/usr" "local" "bin")"#),
+        "/usr/local/bin"
     );
     // Single arg
-    assert_eq!(eval(r#"(path/join "only")"#), Value::string("only"));
+    assert_eq!(eval_path(r#"(path/join "only")"#), "only");
+}
+
+// Regression: test helpers must stay platform-agnostic. `temp_path` yields a
+// forward-slash path under the OS temp dir (no hardcoded `/tmp`), and `eval_path`
+// normalizes the `\` that `path/join` emits on Windows. See OPEN.md
+// platform-specific-windows.
+#[test]
+fn test_temp_path_helper_is_forward_slash_under_temp_dir() {
+    let p = temp_path("sema-helper-regression.txt");
+    assert!(!p.contains('\\'), "temp_path must use forward slashes: {p}");
+    let expected_root = std::env::temp_dir().to_string_lossy().replace('\\', "/");
+    assert!(
+        p.starts_with(&expected_root),
+        "temp_path must live under temp_dir: {p} (root {expected_root})"
+    );
+    assert!(p.ends_with("/sema-helper-regression.txt"));
+}
+
+#[test]
+fn test_eval_path_helper_normalizes_separators() {
+    // Regardless of the host separator, the joined components compare equal.
+    assert_eq!(eval_path(r#"(path/join "x" "y" "z")"#), "x/y/z");
 }
 
 #[test]
@@ -4282,11 +4389,12 @@ fn test_stack_trace_in_try_catch() {
 #[test]
 fn test_stack_trace_loaded_file() {
     // Write a file with a function that errors
-    eval(
-        r#"(file/write "/tmp/sema-test-trace.sema"
+    let path = temp_path("sema-test-trace.sema");
+    eval(&format!(
+        r#"(file/write "{path}"
              "(define (bad-fn x) (+ x \"oops\"))")"#,
-    );
-    let err = eval_err(r#"(load "/tmp/sema-test-trace.sema") (bad-fn 1)"#);
+    ));
+    let err = eval_err(&format!(r#"(load "{path}") (bad-fn 1)"#));
     let trace = err.stack_trace().expect("should have stack trace");
     let names: Vec<&str> = trace.0.iter().map(|f| f.name.as_str()).collect();
     assert_eq!(names[0], "+");
@@ -6596,11 +6704,7 @@ fn test_sandbox_shell_denied() {
     let interp = Interpreter::new_with_sandbox(&sandbox);
     let result = interp.eval_str(r#"(shell "echo hi")"#);
     assert!(result.is_err());
-    let err = result.unwrap_err();
-    assert!(
-        err.to_string().contains("Permission denied"),
-        "Expected permission denied, got: {err}"
-    );
+    assert_permission_denied(&result.unwrap_err());
 }
 
 #[test]
@@ -6620,10 +6724,7 @@ fn test_sandbox_fs_write_denied() {
     let interp = Interpreter::new_with_sandbox(&sandbox);
     let result = interp.eval_str(r#"(file/write "/tmp/sema-sandbox-test.txt" "hi")"#);
     assert!(result.is_err());
-    assert!(result
-        .unwrap_err()
-        .to_string()
-        .contains("Permission denied"));
+    assert_permission_denied(&result.unwrap_err());
 }
 
 #[test]
@@ -6632,10 +6733,7 @@ fn test_sandbox_fs_read_denied() {
     let interp = Interpreter::new_with_sandbox(&sandbox);
     let result = interp.eval_str(r#"(file/exists? "/tmp")"#);
     assert!(result.is_err());
-    assert!(result
-        .unwrap_err()
-        .to_string()
-        .contains("Permission denied"));
+    assert_permission_denied(&result.unwrap_err());
 }
 
 // EVAL-3: `import` must be gated behind FS_READ like other filesystem reads.
@@ -6659,10 +6757,7 @@ fn test_sandbox_env_read_denied() {
     let interp = Interpreter::new_with_sandbox(&sandbox);
     let result = interp.eval_str(r#"(env "HOME")"#);
     assert!(result.is_err());
-    assert!(result
-        .unwrap_err()
-        .to_string()
-        .contains("Permission denied"));
+    assert_permission_denied(&result.unwrap_err());
 }
 
 #[test]
@@ -6680,13 +6775,7 @@ fn test_sandbox_env_read_denies_implicit_env_readers() {
     ] {
         let result = interp.eval_str(expr);
         assert!(result.is_err(), "{expr} should be denied under ENV_READ");
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("Permission denied"),
-            "{expr} should report Permission denied"
-        );
+        assert_permission_denied(&result.unwrap_err());
     }
 }
 
@@ -6701,13 +6790,10 @@ fn test_sandbox_shell_denied_by_process_only() {
         result.is_err(),
         "shell should be denied when PROCESS is denied"
     );
-    let err = result.unwrap_err().to_string();
+    let err = result.unwrap_err();
+    assert_permission_denied(&err);
     assert!(
-        err.contains("Permission denied"),
-        "expected Permission denied, got: {err}"
-    );
-    assert!(
-        err.contains("shell"),
+        err.to_string().contains("shell"),
         "error should mention shell function: {err}"
     );
 }
@@ -6718,10 +6804,7 @@ fn test_sandbox_env_write_denied() {
     let interp = Interpreter::new_with_sandbox(&sandbox);
     let result = interp.eval_str(r#"(sys/set-env "SEMA_TEST_SANDBOX" "val")"#);
     assert!(result.is_err());
-    assert!(result
-        .unwrap_err()
-        .to_string()
-        .contains("Permission denied"));
+    assert_permission_denied(&result.unwrap_err());
 }
 
 #[test]
@@ -6730,10 +6813,7 @@ fn test_sandbox_process_denied() {
     let interp = Interpreter::new_with_sandbox(&sandbox);
     let result = interp.eval_str(r#"(sys/pid)"#);
     assert!(result.is_err());
-    assert!(result
-        .unwrap_err()
-        .to_string()
-        .contains("Permission denied"));
+    assert_permission_denied(&result.unwrap_err());
 }
 
 #[test]
@@ -6742,10 +6822,7 @@ fn test_sandbox_network_denied() {
     let interp = Interpreter::new_with_sandbox(&sandbox);
     let result = interp.eval_str(r#"(http/get "https://example.com")"#);
     assert!(result.is_err());
-    assert!(result
-        .unwrap_err()
-        .to_string()
-        .contains("Permission denied"));
+    assert_permission_denied(&result.unwrap_err());
 }
 
 #[test]
@@ -6773,10 +6850,7 @@ fn test_sandbox_strict_preset() {
     let interp = Interpreter::new_with_sandbox(&sandbox);
     let result = interp.eval_str(r#"(shell "echo hi")"#);
     assert!(result.is_err());
-    assert!(result
-        .unwrap_err()
-        .to_string()
-        .contains("Permission denied"));
+    assert_permission_denied(&result.unwrap_err());
 }
 
 #[test]
@@ -6790,10 +6864,11 @@ fn test_sandbox_parse_cli_multiple() {
 }
 
 #[test]
+#[cfg(unix)]
 fn test_sandbox_unrestricted_by_default() {
     let sandbox = sema_core::Sandbox::allow_all();
     let interp = Interpreter::new_with_sandbox(&sandbox);
-    // Everything should work
+    // Everything should work (runs a real `echo` and reads HOME — unix-specific)
     assert!(interp.eval_str(r#"(shell "echo hi")"#).is_ok());
     assert!(interp.eval_str(r#"(file/exists? "/tmp")"#).is_ok());
     assert!(interp.eval_str(r#"(env "HOME")"#).is_ok());
@@ -6824,13 +6899,7 @@ fn test_sandbox_fs_read_all_functions_denied() {
             result.is_err(),
             "Expected {expr} to be denied, but it succeeded"
         );
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("Permission denied"),
-            "Expected permission denied for {expr}"
-        );
+        assert_permission_denied(&result.unwrap_err());
     }
 }
 
@@ -6857,13 +6926,7 @@ fn test_sandbox_fs_write_all_functions_denied() {
             result.is_err(),
             "Expected {expr} to be denied, but it succeeded"
         );
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("Permission denied"),
-            "Expected permission denied for {expr}"
-        );
+        assert_permission_denied(&result.unwrap_err());
     }
 }
 
@@ -6896,13 +6959,7 @@ fn test_sandbox_process_all_functions_denied() {
             result.is_err(),
             "Expected {expr} to be denied, but it succeeded"
         );
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("Permission denied"),
-            "Expected permission denied for {expr}"
-        );
+        assert_permission_denied(&result.unwrap_err());
     }
 }
 
@@ -6962,13 +7019,7 @@ fn test_sandbox_network_all_functions_denied() {
             result.is_err(),
             "Expected {expr} to be denied, but it succeeded"
         );
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("Permission denied"),
-            "Expected permission denied for {expr}"
-        );
+        assert_permission_denied(&result.unwrap_err());
     }
 }
 
@@ -7062,8 +7113,13 @@ fn test_sandbox_all_denied_safe_functions_comprehensive() {
     assert!(interp.eval_str(r#"(read "(+ 1 2)")"#).is_ok());
     // path pure operations (no filesystem access)
     assert_eq!(
-        interp.eval_str(r#"(path/join "a" "b" "c")"#).unwrap(),
-        Value::string("a/b/c")
+        interp
+            .eval_str(r#"(path/join "a" "b" "c")"#)
+            .unwrap()
+            .as_str()
+            .unwrap()
+            .replace('\\', "/"),
+        "a/b/c"
     );
     assert_eq!(
         interp
@@ -7215,12 +7271,12 @@ fn test_path_filename() {
 #[test]
 fn test_path_join_multi() {
     assert_eq!(
-        eval(r#"(path/join "/tmp" "data.csv")"#),
-        Value::string("/tmp/data.csv")
+        eval_path(r#"(path/join "/tmp" "data.csv")"#),
+        "/tmp/data.csv"
     );
     assert_eq!(
-        eval(r#"(path/join "/home" "user" ".config")"#),
-        Value::string("/home/user/.config")
+        eval_path(r#"(path/join "/home" "user" ".config")"#),
+        "/home/user/.config"
     );
 }
 
@@ -7298,16 +7354,17 @@ fn test_base64_encode_bytes_empty() {
 #[test]
 fn test_file_read_bytes() {
     let interp = Interpreter::new();
+    let path = temp_path("sema-test-bytes.txt");
     let result = interp
-        .eval_str(
+        .eval_str(&format!(
             r#"(begin
-                (file/write "/tmp/sema-test-bytes.txt" "ABC")
-                (define bv (file/read-bytes "/tmp/sema-test-bytes.txt"))
+                (file/write "{path}" "ABC")
+                (define bv (file/read-bytes "{path}"))
                 (list (bytevector-length bv)
                       (bytevector-u8-ref bv 0)
                       (bytevector-u8-ref bv 1)
                       (bytevector-u8-ref bv 2)))"#,
-        )
+        ))
         .unwrap();
     assert_eq!(result.to_string(), "(3 65 66 67)");
 }
@@ -7315,19 +7372,21 @@ fn test_file_read_bytes() {
 #[test]
 fn test_file_read_bytes_not_found() {
     let interp = Interpreter::new();
-    let result = interp.eval_str(r#"(file/read-bytes "/tmp/sema-nonexistent-xyz.bin")"#);
+    let path = temp_path("sema-nonexistent-xyz.bin");
+    let result = interp.eval_str(&format!(r#"(file/read-bytes "{path}")"#));
     assert!(result.is_err());
 }
 
 #[test]
 fn test_file_write_bytes() {
     let interp = Interpreter::new();
+    let path = temp_path("sema-test-write-bytes.bin");
     let result = interp
-        .eval_str(
+        .eval_str(&format!(
             r#"(begin
-                (file/write-bytes "/tmp/sema-test-write-bytes.bin" (bytevector 72 101 108 108 111))
-                (file/read "/tmp/sema-test-write-bytes.bin"))"#,
-        )
+                (file/write-bytes "{path}" (bytevector 72 101 108 108 111))
+                (file/read "{path}"))"#,
+        ))
         .unwrap();
     assert_eq!(result, Value::string("Hello"));
 }
@@ -7335,7 +7394,10 @@ fn test_file_write_bytes() {
 #[test]
 fn test_file_write_bytes_type_error() {
     let interp = Interpreter::new();
-    let result = interp.eval_str(r#"(file/write-bytes "/tmp/foo.bin" "not a bytevector")"#);
+    let path = temp_path("sema-foo.bin");
+    let result = interp.eval_str(&format!(
+        r#"(file/write-bytes "{path}" "not a bytevector")"#
+    ));
     assert!(result.is_err());
 }
 
@@ -7345,13 +7407,7 @@ fn test_sandbox_load_denied_by_fs_read() {
     let interp = Interpreter::new_with_sandbox(&sandbox);
     let result = interp.eval_str(r#"(load "nonexistent.sema")"#);
     assert!(result.is_err());
-    assert!(
-        result
-            .unwrap_err()
-            .to_string()
-            .contains("Permission denied"),
-        "load should be denied by fs-read sandbox"
-    );
+    assert_permission_denied(&result.unwrap_err());
 }
 
 // === New Collection Functions (Laravel-inspired) ===
@@ -11126,6 +11182,33 @@ fn test_allowed_paths_read_inside() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+// Regression: sandbox denials must be matched structurally (by SemaError variant)
+// rather than by substring-matching the Display message. See OPEN.md
+// fragile-error-message-matching.
+#[test]
+fn test_permission_errors_match_structurally() {
+    // Missing capability → PermissionDenied (not PathDenied).
+    let sandbox = sema_core::Sandbox::deny(sema_core::Caps::FS_READ);
+    let interp = Interpreter::new_with_sandbox(&sandbox);
+    let err = interp
+        .eval_str(r#"(file/exists? "/anything")"#)
+        .unwrap_err();
+    assert!(matches!(err.inner(), SemaError::PermissionDenied { .. }));
+    assert_permission_denied(&err);
+
+    // Path outside allowed dirs → PathDenied, which is also a permission error.
+    let dir = std::env::temp_dir().join("sema-perm-structural");
+    std::fs::create_dir_all(&dir).unwrap();
+    let sandbox = sema_core::Sandbox::allow_all().with_allowed_paths(vec![dir.clone()]);
+    let interp = Interpreter::new_with_sandbox(&sandbox);
+    let err = interp
+        .eval_str(r#"(file/exists? "/etc/hosts")"#)
+        .unwrap_err();
+    assert!(matches!(err.inner(), SemaError::PathDenied { .. }));
+    assert_permission_denied(&err);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn test_allowed_paths_read_outside_denied() {
     let dir = std::env::temp_dir().join("sema-allowed-paths-outside");
@@ -11135,12 +11218,7 @@ fn test_allowed_paths_read_outside_denied() {
     let interp = Interpreter::new_with_sandbox(&sandbox);
     let result = interp.eval_str(r#"(file/exists? "/etc/hosts")"#);
     assert!(result.is_err(), "should deny access outside allowed path");
-    let err = result.unwrap_err();
-    assert!(err.to_string().contains("Permission denied"), "{err}");
-    assert!(
-        err.to_string().contains("outside allowed directories"),
-        "{err}"
-    );
+    assert_path_denied(&result.unwrap_err());
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -13953,10 +14031,7 @@ fn test_sandbox_http_file_denied_under_fs_read() {
     let interp = Interpreter::new_with_sandbox(&sandbox);
     let result = interp.eval_str(r#"(http/file "/tmp/anything")"#);
     assert!(result.is_err());
-    assert!(result
-        .unwrap_err()
-        .to_string()
-        .contains("Permission denied"));
+    assert_permission_denied(&result.unwrap_err());
 }
 
 // === Sandbox: db/exec and friends gated (C6) ===
@@ -13967,17 +14042,11 @@ fn test_sandbox_db_exec_denied_under_fs_write() {
     let interp = Interpreter::new_with_sandbox(&sandbox);
     let result = interp.eval_str(r#"(db/exec "nonexistent" "CREATE TABLE t (a INTEGER)")"#);
     assert!(result.is_err());
-    assert!(result
-        .unwrap_err()
-        .to_string()
-        .contains("Permission denied"));
+    assert_permission_denied(&result.unwrap_err());
 
     let result = interp.eval_str(r#"(db/exec-batch "nonexistent" "SELECT 1")"#);
     assert!(result.is_err());
-    assert!(result
-        .unwrap_err()
-        .to_string()
-        .contains("Permission denied"));
+    assert_permission_denied(&result.unwrap_err());
 }
 
 #[test]
@@ -13986,31 +14055,19 @@ fn test_sandbox_db_query_denied_under_fs_read() {
     let interp = Interpreter::new_with_sandbox(&sandbox);
     let result = interp.eval_str(r#"(db/query "nonexistent" "SELECT 1")"#);
     assert!(result.is_err());
-    assert!(result
-        .unwrap_err()
-        .to_string()
-        .contains("Permission denied"));
+    assert_permission_denied(&result.unwrap_err());
 
     let result = interp.eval_str(r#"(db/query-one "nonexistent" "SELECT 1")"#);
     assert!(result.is_err());
-    assert!(result
-        .unwrap_err()
-        .to_string()
-        .contains("Permission denied"));
+    assert_permission_denied(&result.unwrap_err());
 
     let result = interp.eval_str(r#"(db/tables "nonexistent")"#);
     assert!(result.is_err());
-    assert!(result
-        .unwrap_err()
-        .to_string()
-        .contains("Permission denied"));
+    assert_permission_denied(&result.unwrap_err());
 
     let result = interp.eval_str(r#"(db/last-insert-id "nonexistent")"#);
     assert!(result.is_err());
-    assert!(result
-        .unwrap_err()
-        .to_string()
-        .contains("Permission denied"));
+    assert_permission_denied(&result.unwrap_err());
 }
 
 // ── Regression: top-level (async ...) drains scheduler at exit (bug C2) ───────
@@ -14246,7 +14303,8 @@ fn test_t3_notebook_run_prints_stdout() {
 fn test_u1_file_not_found_wording() {
     // Compile / run / disasm / fmt / ast: each should produce a consistent
     // `file not found:` message rather than a raw OS error.
-    let missing = "/tmp/this-file-definitely-does-not-exist-sema-u1.sema";
+    let missing = temp_path("this-file-definitely-does-not-exist-sema-u1.sema");
+    let missing = missing.as_str();
 
     for subcmd in &["compile", "fmt", "disasm"] {
         let output = std::process::Command::new(env!("CARGO_BIN_EXE_sema"))

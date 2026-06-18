@@ -414,7 +414,7 @@ When loading a `.semac` file, the loader performs these checks:
 5. **String table bounds** — all string table indices in the file must be in range
 6. **Function table bounds** — all `func_id` references in `MakeClosure` must be valid
 7. **Constant pool types** — no runtime-only value types in the constant pool
-8. **Bytecode well-formedness** — opcodes must be valid, operand sizes must be correct, constant/local/upvalue indices must be in bounds, and jump targets must land on instruction boundaries
+8. **Bytecode well-formedness** — opcodes must be valid, operand sizes must be correct, constant/local/upvalue/`CallNative` native indices must be in bounds, and jump targets must land on instruction boundaries (the native table is process-local and unserialized, so its loaded length is `0` — any `CallNative` in a `.semac` is rejected)
 9. **Stack-depth balance** — an abstract-interpretation pass over every chunk (main chunk and each function) proves the operand stack never underflows and never exceeds the maximum depth
 
 If validation fails, the loader returns a `SemaError` with a descriptive message.

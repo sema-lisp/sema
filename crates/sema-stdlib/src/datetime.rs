@@ -38,6 +38,11 @@ pub fn register(env: &sema_core::Env) {
                 "time/parse uses chrono format specifiers like %Y-%m-%d %H:%M:%S (see https://docs.rs/chrono/latest/chrono/format/strftime/index.html)",
             )
         })?;
+        // Intentional: the parsed wall-clock time is interpreted as UTC, not
+        // local time, regardless of any offset in the string. Parsing via
+        // NaiveDateTime ignores timezone offsets, so callers needing another
+        // zone must convert to UTC themselves before parsing. Anchoring to UTC
+        // keeps time/parse deterministic and machine-independent.
         let dt: DateTime<Utc> = Utc.from_utc_datetime(&naive);
         Ok(Value::float(dt.timestamp() as f64))
     });

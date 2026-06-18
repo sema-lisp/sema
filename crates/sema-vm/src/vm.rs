@@ -120,6 +120,130 @@ pub struct VM {
     native_fns: Vec<Rc<NativeFn>>,
     debug_values: HashMap<u64, Value>,
     next_debug_value_ref: u64,
+    /// Frame-count floor at which the dispatch loop treats a RETURN as
+    /// "finished". Normally 0 (run until the call stack is empty). Raised
+    /// temporarily by `run_nested_closure` so a re-entrant in-VM HOF callback
+    /// returns to its native caller without unwinding the parent's frames.
+    frame_floor: usize,
+}
+
+thread_local! {
+    /// Stack of pointers to VMs that are currently executing a native call on
+    /// this thread. When a stdlib higher-order function invokes a VM closure
+    /// via `call_callback`, the closure's fallback consults this stack so it can
+    /// run *inside* the live VM (keeping open upvalue cells connected to the
+    /// parent stack) instead of spawning a fresh VM that loses `set!` mutations.
+    ///
+    /// SAFETY: each pointer is valid for as long as the corresponding native
+    /// call is on the Rust call stack. A `CurrentVmGuard` pushes the pointer
+    /// immediately before a synchronous native call and pops it immediately
+    /// after, so the pointer is only observed while the owning VM is paused at
+    /// that exact call site and is not otherwise touched.
+    static CURRENT_VM: RefCell<Vec<*mut VM>> = const { RefCell::new(Vec::new()) };
+}
+
+/// RAII guard that registers a VM as the current re-entrant target for the
+/// duration of a native call, then unregisters it on drop.
+struct CurrentVmGuard;
+
+impl CurrentVmGuard {
+    fn enter(vm: &mut VM) -> Self {
+        let ptr = vm as *mut VM;
+        CURRENT_VM.with(|stack| stack.borrow_mut().push(ptr));
+        CurrentVmGuard
+    }
+}
+
+impl Drop for CurrentVmGuard {
+    fn drop(&mut self) {
+        CURRENT_VM.with(|stack| {
+            stack.borrow_mut().pop();
+        });
+    }
+}
+
+/// Try to run `closure` on the live VM currently executing a native call on
+/// this thread. Returns `Some(result)` if a compatible VM was found and the
+/// closure was dispatched in-VM; `None` if no compatible VM is registered (the
+/// caller should fall back to a fresh VM).
+///
+/// "Compatible" means the running VM shares the same `functions` table and
+/// `globals` as the closure's compilation context — i.e. the closure belongs to
+/// that VM, so its open upvalue cells point into that VM's live stack.
+fn try_run_on_current_vm(
+    closure: &Rc<Closure>,
+    functions: &Rc<Vec<Rc<Function>>>,
+    globals: &Rc<Env>,
+    args: &[Value],
+    ctx: &EvalContext,
+) -> Option<Result<Value, SemaError>> {
+    // Snapshot the top compatible VM pointer, then release the borrow before
+    // re-entering the VM (the nested run may itself register a new current VM).
+    let vm_ptr = CURRENT_VM.with(|stack| {
+        let stack = stack.borrow();
+        stack.iter().rev().copied().find(|&ptr| {
+            // SAFETY: see CURRENT_VM docs — the pointer is valid while the
+            // native call that registered it is on the Rust stack, which is
+            // strictly the case here (we are inside that native call).
+            let vm = unsafe { &*ptr };
+            Rc::ptr_eq(&vm.functions, functions) && Rc::ptr_eq(&vm.globals, globals)
+        })
+    })?;
+    // SAFETY: the owning VM is paused at the native call site that registered
+    // this pointer and does not touch `self` until the call returns. Args have
+    // been copied into an owned slice by the native caller, so there is no
+    // outstanding borrow of the VM's stack. The reference does not escape this
+    // call.
+    let vm = unsafe { &mut *vm_ptr };
+    Some(vm.run_nested_closure(closure.clone(), args, ctx))
+}
+
+/// Close `closure`'s still-open upvalue cells against the VM(s) currently
+/// running a native call on this thread, snapshotting their values from the
+/// owning VM's live stack.
+///
+/// MUST be called before a VM closure is dispatched onto a *foreign* stack — a
+/// fresh fallback VM, or an async task VM created by `spawn` /
+/// `run_closure_as_inline_task`. An Open cell holds `{ frame_base, slot }`
+/// indices into the VM that created it; reading it on a different VM's stack is
+/// out-of-bounds. Snapshotting here (while the owning VM is paused at its native
+/// call) detaches the cells safely.
+///
+/// A no-op for cells that are already Closed or whose owning frame is no longer
+/// on any registered VM's stack.
+pub fn close_closure_upvalues_for_foreign_run(closure: &Closure) {
+    // Snapshot the registered VM pointers, then operate through them. The
+    // pointers are valid for the duration of this call (see CURRENT_VM docs).
+    let ptrs: Vec<*mut VM> = CURRENT_VM.with(|stack| stack.borrow().clone());
+    for cell in &closure.upvalues {
+        let (frame_base, slot) = {
+            let state = cell.state.borrow();
+            match &*state {
+                UpvalueState::Open { frame_base, slot } => (*frame_base, *slot),
+                UpvalueState::Closed(_) => continue,
+            }
+        };
+        // Find the registered VM that owns this cell (its frame is on that
+        // VM's stack). Walk most-recent first.
+        for &ptr in ptrs.iter().rev() {
+            // SAFETY: pointer registered by a live CurrentVmGuard on the Rust
+            // stack; the owning VM is paused and not otherwise borrowed.
+            let vm = unsafe { &mut *ptr };
+            if frame_base + slot < vm.stack.len() && vm.frames.iter().any(|f| f.base == frame_base)
+            {
+                let value = vm.stack[frame_base + slot].clone();
+                *cell.state.borrow_mut() = UpvalueState::Closed(value);
+                if let Some(frame) = vm.frames.iter_mut().find(|f| f.base == frame_base) {
+                    if let Some(open) = frame.open_upvalues.as_mut() {
+                        if let Some(entry) = open.get_mut(slot) {
+                            *entry = None;
+                        }
+                    }
+                }
+                break;
+            }
+        }
+    }
 }
 
 /// Close all open upvalues in the given open_upvalues vec, reading from the stack.
@@ -182,6 +306,7 @@ impl VM {
             native_fns,
             debug_values: HashMap::new(),
             next_debug_value_ref: DEBUG_VALUE_REF_BASE,
+            frame_floor: 0,
         })
     }
 
@@ -232,6 +357,7 @@ impl VM {
             native_fns: Vec::new(),
             debug_values: HashMap::new(),
             next_debug_value_ref: DEBUG_VALUE_REF_BASE,
+            frame_floor: 0,
         }
     }
 
@@ -255,6 +381,7 @@ impl VM {
             native_fns,
             debug_values: HashMap::new(),
             next_debug_value_ref: DEBUG_VALUE_REF_BASE,
+            frame_floor: 0,
         })
     }
 
@@ -461,6 +588,63 @@ impl VM {
             crate::debug::VmExecResult::AsyncYield(_) => Err(SemaError::eval(
                 "async yield outside of scheduler context".to_string(),
             )),
+        }
+    }
+
+    /// Run `closure` with `args` as a nested frame on this *live* VM and return
+    /// its result, leaving the parent frames and stack intact.
+    ///
+    /// This is the in-VM routing path for stdlib higher-order callbacks (C1).
+    /// Because the closure executes on the same VM, its open upvalue cells stay
+    /// connected to the parent frame's live stack slots, so `set!` inside the
+    /// callback propagates back to the caller — fixing the divergence where the
+    /// fresh-VM fallback mutated a detached closed snapshot.
+    ///
+    /// The dispatch loop is bounded by `frame_floor`: it returns as soon as the
+    /// frame it pushed (and any frames pushed beneath it) have returned, without
+    /// unwinding the caller's frames.
+    fn run_nested_closure(
+        &mut self,
+        closure: Rc<Closure>,
+        args: &[Value],
+        ctx: &EvalContext,
+    ) -> Result<Value, SemaError> {
+        // Floor = the parent's current frame depth. After setup_for_call pushes
+        // the callee frame, the loop must stop unwinding once it pops back to
+        // this depth (rather than emptying the whole call stack).
+        let floor = self.frames.len();
+        let stack_floor = self.stack.len();
+        self.setup_for_call(closure, args)?;
+        let saved_floor = self.frame_floor;
+        self.frame_floor = floor;
+        let result = self.run_inner(ctx, None);
+        self.frame_floor = saved_floor;
+        match result {
+            Ok(crate::debug::VmExecResult::Finished(v)) => Ok(v),
+            Ok(crate::debug::VmExecResult::Stopped(_))
+            | Ok(crate::debug::VmExecResult::Yielded) => {
+                unreachable!("Stopped/Yielded without debug state")
+            }
+            Ok(crate::debug::VmExecResult::AsyncYield(_)) => {
+                // Re-entrant HOF callbacks are synchronous; a yield here cannot
+                // be resumed. Roll back the partial nested frames/stack so the
+                // parent VM stays consistent, then surface the same error the
+                // fresh-VM fallback would have produced.
+                self.frames.truncate(floor);
+                self.stack.truncate(stack_floor);
+                Err(SemaError::eval(
+                    "async yield outside of scheduler context".to_string(),
+                ))
+            }
+            Err(e) => {
+                // The error propagated past every handler in the nested frames
+                // without being caught. run_inner leaves those frames in place
+                // on error, so unwind them back to the parent's depth before
+                // returning so the parent VM can handle/propagate cleanly.
+                self.frames.truncate(floor);
+                self.stack.truncate(stack_floor);
+                Err(e)
+            }
         }
     }
 
@@ -1091,7 +1275,10 @@ impl VM {
                         }
                         let frame = self.frames.pop().unwrap();
                         self.stack.truncate(frame.base);
-                        if self.frames.is_empty() {
+                        if self.frames.len() == self.frame_floor {
+                            // Either the top-level program finished (floor == 0)
+                            // or a re-entrant nested closure returned to its
+                            // native caller (floor raised by run_nested_closure).
                             return Ok(crate::debug::VmExecResult::Finished(result));
                         }
                         self.stack.push(result);
@@ -1124,18 +1311,23 @@ impl VM {
                             )));
                         }
 
-                        // Close open upvalues before non-VM call (native may invoke VM closures via callback)
-                        if let Some(ref mut open) = self.frames[fi].open_upvalues {
-                            close_open_upvalues(open, &self.stack, base);
-                        }
-
-                        // Borrow args directly from stack (no Vec allocation).
-                        // Rc::clone is cheap; it avoids holding &self.native_fns
-                        // and &self.stack simultaneously.
+                        // C1: keep open upvalues open across the call so a
+                        // re-entrant in-VM HOF callback (routed via
+                        // try_run_on_current_vm) can write `set!` back through
+                        // them. Closures that instead cross onto a foreign stack
+                        // (fresh fallback VM / async task VM) are snapshotted at
+                        // that crossing point (see close_closure_upvalues_for_foreign_run).
                         let native = self.native_fns[native_id].clone();
                         let args_start = self.stack.len() - argc;
-                        let result = (native.func)(ctx, &self.stack[args_start..]);
-                        self.stack.truncate(args_start);
+                        // Copy args into an owned Vec and drop them from the stack
+                        // before the call so no borrow of self.stack is held while
+                        // the native may re-enter this VM (run_nested_closure needs
+                        // &mut self via the CURRENT_VM pointer).
+                        let call_args: Vec<Value> = self.stack.split_off(args_start);
+                        let result = {
+                            let _vm_guard = CurrentVmGuard::enter(self);
+                            (native.func)(ctx, &call_args)
+                        };
                         match result {
                             Ok(val) => {
                                 // Check if the native function signaled an async yield
@@ -1815,16 +2007,18 @@ impl VM {
                 }
                 return self.call_vm_closure(closure, argc);
             }
-            // Close open upvalues before non-VM call (native may invoke VM closures via callback)
-            let caller_base = self.frames.last().unwrap().base;
-            if let Some(ref mut open) = self.frames.last_mut().unwrap().open_upvalues {
-                close_open_upvalues(open, &self.stack, caller_base);
-            }
-            // Regular native fn — borrow args directly from stack (no Vec allocation)
+            // C1: keep open upvalues open across the call so a re-entrant
+            // in-VM HOF callback can write back through them. Copy args into an
+            // owned Vec (releasing the stack borrow) so the native may re-enter
+            // this VM via run_nested_closure. Closures crossing onto a foreign
+            // stack are snapshotted at the crossing point.
             let func_rc = self.stack[func_idx].as_native_fn_rc().unwrap();
-            let args_start = func_idx + 1;
-            let result = (func_rc.func)(ctx, &self.stack[args_start..]);
-            self.stack.truncate(func_idx);
+            let call_args: Vec<Value> = self.stack.split_off(func_idx + 1);
+            self.stack.pop(); // pop the native fn value
+            let result = {
+                let _vm_guard = CurrentVmGuard::enter(self);
+                (func_rc.func)(ctx, &call_args)
+            };
             result.map(|val| self.stack.push(val))?;
             Ok(())
         } else if let Some(kw) = self.stack[func_idx].as_keyword_spur() {
@@ -1845,18 +2039,18 @@ impl VM {
             self.stack.push(result);
             Ok(())
         } else {
-            // Close open upvalues before non-VM call (callback may invoke VM closures)
-            let caller_base = self.frames.last().unwrap().base;
-            if let Some(ref mut open) = self.frames.last_mut().unwrap().open_upvalues {
-                close_open_upvalues(open, &self.stack, caller_base);
-            }
-            // Lambda or other callable — borrow args directly from stack.
-            // Safety: call_callback dispatches to the tree-walking evaluator,
-            // which has its own environment and does not mutate the VM's stack.
+            // C1: keep upvalues open across the callback. The callback may
+            // re-enter this VM (e.g. a multimethod whose handler is a VM
+            // closure). Copy args into an owned Vec so no stack borrow is held
+            // during the (possibly re-entrant) call. Closures crossing onto a
+            // foreign stack are snapshotted at the crossing point.
             let func_val = self.stack[func_idx].clone();
-            let args_start = func_idx + 1;
-            let result = sema_core::call_callback(ctx, &func_val, &self.stack[args_start..]);
-            self.stack.truncate(func_idx);
+            let call_args: Vec<Value> = self.stack.split_off(func_idx + 1);
+            self.stack.pop(); // pop the callable value
+            let result = {
+                let _vm_guard = CurrentVmGuard::enter(self);
+                sema_core::call_callback(ctx, &func_val, &call_args)
+            };
             let result = result?;
             self.stack.push(result);
             Ok(())
@@ -1903,15 +2097,16 @@ impl VM {
         ctx: &EvalContext,
     ) -> Result<(), SemaError> {
         if func_val.raw_tag() == Some(TAG_NATIVE_FN) {
-            // Close open upvalues before non-VM call (native may invoke VM closures via callback)
-            let caller_base = self.frames.last().unwrap().base;
-            if let Some(ref mut open) = self.frames.last_mut().unwrap().open_upvalues {
-                close_open_upvalues(open, &self.stack, caller_base);
-            }
+            // C1: keep upvalues open; copy args so the native may re-enter this
+            // VM via run_nested_closure without an outstanding stack borrow.
+            // Closures crossing onto a foreign stack are snapshotted there.
             let func_rc = func_val.as_native_fn_rc().unwrap();
             let args_start = self.stack.len() - argc;
-            let result = (func_rc.func)(ctx, &self.stack[args_start..]);
-            self.stack.truncate(args_start);
+            let call_args: Vec<Value> = self.stack.split_off(args_start);
+            let result = {
+                let _vm_guard = CurrentVmGuard::enter(self);
+                (func_rc.func)(ctx, &call_args)
+            };
             result.map(|val| self.stack.push(val))?;
             Ok(())
         } else if let Some(kw) = func_val.as_keyword_spur() {
@@ -1930,16 +2125,15 @@ impl VM {
             self.stack.push(result);
             Ok(())
         } else {
-            // Close open upvalues before non-VM call (callback may invoke VM closures)
-            let caller_base = self.frames.last().unwrap().base;
-            if let Some(ref mut open) = self.frames.last_mut().unwrap().open_upvalues {
-                close_open_upvalues(open, &self.stack, caller_base);
-            }
-            // Safety: call_callback dispatches to the tree-walking evaluator,
-            // which does not mutate the VM's stack.
+            // C1: keep upvalues open; copy args so a re-entrant callback can
+            // run in-VM without an outstanding stack borrow. Closures crossing
+            // onto a foreign stack are snapshotted at the crossing point.
             let args_start = self.stack.len() - argc;
-            let result = sema_core::call_callback(ctx, &func_val, &self.stack[args_start..]);
-            self.stack.truncate(args_start);
+            let call_args: Vec<Value> = self.stack.split_off(args_start);
+            let result = {
+                let _vm_guard = CurrentVmGuard::enter(self);
+                sema_core::call_callback(ctx, &func_val, &call_args)
+            };
             let result = result?;
             self.stack.push(result);
             Ok(())
@@ -2235,6 +2429,10 @@ impl VM {
                 // AsyncYield would surface as "async yield outside of
                 // scheduler context" and crash the calling HOF.
                 if sema_core::in_async_context() {
+                    // In async context the VM call sites close this closure's
+                    // open upvalues before invoking the HOF (see call_value /
+                    // CALL_NATIVE), so the cells are already snapshotted and safe
+                    // to run on the fresh task VM stack.
                     return crate::scheduler::run_closure_as_inline_task(
                         ctx,
                         closure_for_fallback.clone(),
@@ -2243,6 +2441,22 @@ impl VM {
                     );
                 }
 
+                // C1: if this closure belongs to a VM currently running a native
+                // call on this thread (e.g. a stdlib HOF like map/filter/foldl
+                // invoked us), run it as a nested frame on that *live* VM. This
+                // keeps the closure's open upvalue cells connected to the
+                // parent's stack slots so `set!` mutations flow back to the
+                // caller. Falls back to a fresh VM only when no compatible VM is
+                // on the stack (e.g. called directly from the tree-walker).
+                if let Some(result) =
+                    try_run_on_current_vm(&closure_for_fallback, &functions, &globals, args, ctx)
+                {
+                    return result;
+                }
+
+                // Foreign fresh VM: snapshot open upvalues against the owning
+                // VM (if any) before running on a different stack.
+                close_closure_upvalues_for_foreign_run(&closure_for_fallback);
                 let mut vm = VM::new_with_rc_functions(globals.clone(), functions.clone());
                 vm.setup_for_call(closure_for_fallback.clone(), args)?;
                 vm.run(ctx)
@@ -2263,8 +2477,12 @@ impl VM {
         failing_pc: usize,
     ) -> Result<ExceptionAction, SemaError> {
         let mut pc_for_lookup = failing_pc as u32;
-        // Walk frames from top looking for a handler
-        while let Some(frame) = self.frames.last() {
+        // Walk frames from top looking for a handler. Stop at `frame_floor`:
+        // during a re-entrant nested run (run_nested_closure) the frames below
+        // the floor belong to the parent VM execution, which must handle or
+        // propagate the error itself once control returns to it.
+        while self.frames.len() > self.frame_floor {
+            let frame = self.frames.last().unwrap();
             let chunk = &frame.closure.func.chunk;
 
             // Check exception table for this frame

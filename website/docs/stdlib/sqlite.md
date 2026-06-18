@@ -60,7 +60,11 @@ Execute a SQL statement that modifies data (INSERT, UPDATE, DELETE, CREATE TABLE
 
 ### `db/exec-batch`
 
-Execute multiple SQL statements at once (no parameter binding). Useful for schema setup and migrations. Returns `nil`.
+Execute multiple SQL statements at once. **Static SQL only** — there is no parameter binding, so the entire string is run verbatim. Useful for schema setup and migrations. Returns `nil`.
+
+::: danger SQL injection
+Never interpolate user-controlled input into the SQL string passed to `db/exec-batch` — doing so is a SQL injection vulnerability. For any value that comes from outside the program, use the parameterized [`db/exec`](#db-exec) (with `?` placeholders) instead, one statement at a time.
+:::
 
 ```sema
 (db/exec-batch "mydb" "

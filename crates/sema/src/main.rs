@@ -427,8 +427,10 @@ enum NotebookCommands {
         /// Path to .sema-nb file (created if absent)
         file: Option<String>,
 
-        /// Host address to bind to
-        #[arg(long, default_value = "127.0.0.1")]
+        /// Host address to bind to. Defaults to loopback (127.0.0.1); the
+        /// notebook server has no auth layer, so binding to a non-loopback
+        /// address exposes unauthenticated code execution to the network.
+        #[arg(long, default_value = sema_notebook::server::DEFAULT_HOST)]
         host: String,
 
         /// Port to listen on

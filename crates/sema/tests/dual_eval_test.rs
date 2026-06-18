@@ -461,13 +461,13 @@ dual_eval_error_tests! {
 // ============================================================
 
 dual_eval_tests! {
-    alias_mapcar: "(mapcar (fn (x) (* x 2)) '(1 2 3))" => common::eval_tw("'(2 4 6)"),
+    alias_mapcar: "(mapcar (fn (x) (* x 2)) '(1 2 3))" => Value::list(vec![Value::int(2), Value::int(4), Value::int(6)]),
     alias_fold: "(fold + 0 '(1 2 3))" => Value::int(6),
     alias_every_q: "(every? odd? '(1 3 5))" => Value::bool(true),
     alias_any_q: "(any? even? '(1 2 3))" => Value::bool(true),
     alias_some_q: "(some? even? '(1 2 3))" => Value::bool(true),
     alias_string_join: r#"(string-join '("a" "b" "c") ",")"# => Value::string("a,b,c"),
-    alias_string_split: r#"(string-split "a,b,c" ",")"# => common::eval_tw(r#"'("a" "b" "c")"#),
+    alias_string_split: r#"(string-split "a,b,c" ",")"# => Value::list(vec![Value::string("a"), Value::string("b"), Value::string("c")]),
     alias_string_trim: r#"(string-trim "  hello  ")"# => Value::string("hello"),
     alias_hash_map_q: "(hash-map? (hash-map :a 1))" => Value::bool(true),
     alias_hash_ref: "(hash-ref {:a 1 :b 2} :b)" => Value::int(2),
@@ -537,7 +537,7 @@ dual_eval_tests! {
           (defmacro vec-bind (val)
             `(let ((v# ,val)) [v# v#]))
           (vec-bind 5))
-    "# => common::eval_tw("[5 5]"),
+    "# => Value::vector(vec![Value::int(5), Value::int(5)]),
 
     // x## (double hash) is NOT auto-gensym — only single trailing # triggers it
     auto_gensym_double_hash_is_regular: r#"
@@ -1228,37 +1228,35 @@ fn alias_time_now_ms_vm() {
 //
 // See docs/limitations.md #31 (C1) and docs/adr.md ADR #55.
 
-/// C1: `set!` on a let-bound variable from a closure called via a stdlib HOF
-/// (here `map`) is silently lost on the VM backend due to the eager-close
-/// upvalue model. The tree-walker handles this correctly.
+/// C1 (FIXED 2026-06-18): `set!` on a let-bound variable from a closure called
+/// via a stdlib HOF (here `map`) used to be silently lost on the VM backend due
+/// to the eager-close upvalue model + fresh-VM fallback. HOF callbacks are now
+/// routed back into the running VM so the open upvalue cells stay connected.
+/// See docs/plans/2026-06-18-c1-vm-hof-in-vm.md.
 ///
 /// Reproduction (from the audit):
 ///   sema --tw -e '(let ((c 0)) (map (fn (x) (set! c (+ c x))) (list 1 2 3)) c)'  -> 6
-///   sema      -e '(let ((c 0)) (map (fn (x) (set! c (+ c x))) (list 1 2 3)) c)'  -> 0
+///   sema      -e '(let ((c 0)) (map (fn (x) (set! c (+ c x))) (list 1 2 3)) c)'  -> 6
 #[test]
-#[ignore = "C1: VM upvalue model — see docs/limitations.md #31"]
 fn vm_set_through_map_hof_propagates() {
     let src = "(let ((c 0)) (map (fn (x) (set! c (+ c x))) (list 1 2 3)) c)";
-    // TW must already produce 6 (sanity check):
     assert_eq!(common::eval_tw(src), Value::int(6), "TW oracle");
-    // VM is currently broken (returns 0). When the fix lands, this asserts 6:
     assert_eq!(
         common::eval_vm(src),
         Value::int(6),
-        "VM after open-upvalue fix"
+        "VM after in-VM HOF routing fix (C1)"
     );
 }
 
-/// C1 related: same issue surfaces with `for-each`.
+/// C1 (FIXED): same issue surfaced with `for-each`.
 #[test]
-#[ignore = "C1: VM upvalue model — see docs/limitations.md #31"]
 fn vm_set_through_for_each_hof_propagates() {
     let src = "(let ((c 0)) (for-each (fn (x) (set! c (+ c x))) (list 1 2 3)) c)";
     assert_eq!(common::eval_tw(src), Value::int(6), "TW oracle");
     assert_eq!(
         common::eval_vm(src),
         Value::int(6),
-        "VM after open-upvalue fix"
+        "VM after in-VM HOF routing fix (C1)"
     );
 }
 
@@ -1355,4 +1353,57 @@ dual_eval_tests! {
     wide_int_sub_runtime: "((fn (a b) (- a b)) 100000000000000 1)" => Value::int(99999999999999),
     wide_int_add_runtime: "((fn (a b) (+ a b)) 100000000000000 1)" => Value::int(100000000000001),
     wide_int_mul_runtime: "((fn (a b) (* a b)) 100000000000000 2)" => Value::int(200000000000000),
+}
+
+// ============================================================
+// C1: `set!` through stdlib HOF callbacks must flow back to the
+// captured local on BOTH backends. The VM previously closed open
+// upvalues before every non-VM call and ran the callback on a fresh
+// VM, so mutations were lost (returned 0 instead of 6). HOF callbacks
+// are now routed back into the running VM.
+// See docs/bugs/vm-set-lost-through-hof-callbacks.md and
+// docs/plans/2026-06-18-c1-vm-hof-in-vm.md.
+// ============================================================
+dual_eval_tests! {
+    // The canonical repro from the bug report.
+    hof_set_through_map: "(let ((c 0)) (map (fn (x) (set! c (+ c x))) (list 1 2 3)) c)" => Value::int(6),
+    // filter callback mutating a captured accumulator.
+    hof_set_through_filter:
+        "(let ((c 0)) (filter (fn (x) (set! c (+ c x)) (even? x)) (list 1 2 3 4)) c)" => Value::int(10),
+    // for-each callback mutating a captured accumulator.
+    hof_set_through_for_each:
+        "(let ((c 0)) (for-each (fn (x) (set! c (+ c x))) (list 10 20)) c)" => Value::int(30),
+    // foldl callback with a `set!` side effect on a captured local.
+    hof_set_through_foldl:
+        "(let ((c 0)) (foldl (fn (acc x) (set! c (+ c x)) acc) 0 (list 1 2 3)) c)" => Value::int(6),
+    // sort-by comparator that increments a captured counter once per key.
+    hof_set_through_sort_by:
+        "(let ((c 0)) (sort-by (fn (x) (set! c (+ c 1)) x) (list 3 1 2)) c)" => Value::int(3),
+    // Nested HOFs: the inner map's callback mutates the outermost local.
+    hof_set_through_nested_map:
+        "(let ((c 0)) (map (fn (xs) (map (fn (y) (set! c (+ c y))) xs)) (list (list 1 2) (list 3 4))) c)"
+        => Value::int(10),
+    // Two distinct closures over the same captured local: one mutates via a
+    // HOF, the other observes the mutation afterwards.
+    hof_set_shared_local_observed_after:
+        "(let ((c 0)) (define inc (fn () (set! c (+ c 1)))) (define get (fn () c)) (map (fn (x) (inc)) (list 1 2 3)) (get))"
+        => Value::int(3),
+    // The HOF still returns correct results while the callback mutates state.
+    hof_map_result_unaffected_by_set:
+        "(map (fn (x) (* x x)) (list 1 2 3))"
+        => Value::list(vec![Value::int(1), Value::int(4), Value::int(9)]),
+}
+
+dual_eval_error_tests! {
+    // An error raised inside a HOF callback must propagate cleanly out of the
+    // running VM (regression: the in-VM routing must unwind only the nested
+    // frames, not corrupt the parent frame stack).
+    hof_callback_error_propagates: r#"(map (fn (x) (error "boom")) (list 1 2 3))"#,
+}
+
+dual_eval_tests! {
+    // try/catch wrapping a HOF whose callback throws: both backends catch it.
+    hof_callback_error_caught:
+        r#"(try (map (fn (x) (error "boom")) (list 1)) (catch e :caught))"#
+        => Value::keyword("caught"),
 }

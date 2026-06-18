@@ -22,12 +22,12 @@ dual_eval_tests! {
 // ============================================================
 
 dual_eval_tests! {
-    short_lambda_basic: "(map #(+ % 1) '(1 2 3))" => common::eval_tw("'(2 3 4)"),
-    short_lambda_square: "(map #(* % %) '(1 2 3 4))" => common::eval_tw("'(1 4 9 16)"),
-    short_lambda_filter: "(filter #(> % 3) '(1 2 3 4 5))" => common::eval_tw("'(4 5)"),
+    short_lambda_basic: "(map #(+ % 1) '(1 2 3))" => Value::list(vec![Value::int(2), Value::int(3), Value::int(4)]),
+    short_lambda_square: "(map #(* % %) '(1 2 3 4))" => Value::list(vec![Value::int(1), Value::int(4), Value::int(9), Value::int(16)]),
+    short_lambda_filter: "(filter #(> % 3) '(1 2 3 4 5))" => Value::list(vec![Value::int(4), Value::int(5)]),
     short_lambda_two_args: "(#(+ %1 %2) 3 4)" => Value::int(7),
     short_lambda_no_args: "(#(+ 1 2))" => Value::int(3),
-    short_lambda_nested_call: r#"(map #(string-length %) '("hi" "hello" "hey"))"# => common::eval_tw("'(2 5 3)"),
+    short_lambda_nested_call: r#"(map #(string-length %) '("hi" "hello" "hey"))"# => Value::list(vec![Value::int(2), Value::int(5), Value::int(3)]),
 }
 
 // ============================================================
@@ -37,7 +37,7 @@ dual_eval_tests! {
 dual_eval_tests! {
     thread_first: "(-> 5 (+ 3) (* 2))" => Value::int(16),
     thread_first_bare_fn: r#"(-> "hello" string-length)"# => Value::int(5),
-    thread_last: "(->> (range 1 6) (filter odd?))" => common::eval_tw("'(1 3 5)"),
+    thread_last: "(->> (range 1 6) (filter odd?))" => Value::list(vec![Value::int(1), Value::int(3), Value::int(5)]),
     thread_last_pipeline: "(->> (range 1 6) (map (fn (x) (* x x))) (foldl + 0))" => Value::int(55),
     thread_as: "(as-> 5 x (+ x 3) (* x x) (- x 1))" => Value::int(63),
     some_thread_non_nil: r#"(some-> {:a {:b 42}} (get :a) (get :b))"# => Value::int(42),

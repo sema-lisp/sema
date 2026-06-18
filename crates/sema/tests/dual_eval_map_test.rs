@@ -1,6 +1,7 @@
 mod common;
 
 use sema_core::Value;
+use std::collections::BTreeMap;
 
 // ============================================================
 // hash-map constructor
@@ -44,7 +45,7 @@ dual_eval_tests! {
     assoc_map_multi: "(count (assoc {:a 1} :b 2 :c 3))" => Value::int(3),
     assoc_hashmap_add: "(get (assoc (hash-map :a 1) :b 2) :b)" => Value::int(2),
     assoc_hashmap_overwrite: "(get (assoc (hash-map :a 1) :a 99) :a)" => Value::int(99),
-    assoc_alist_found: "(assoc :a '((:a 1) (:b 2)))" => common::eval_tw("'(:a 1)"),
+    assoc_alist_found: "(assoc :a '((:a 1) (:b 2)))" => Value::list(vec![Value::keyword("a"), Value::int(1)]),
     assoc_alist_missing: "(assoc :z '((:a 1) (:b 2)))" => Value::bool(false),
 }
 
@@ -74,9 +75,9 @@ dual_eval_error_tests! {
 // ============================================================
 
 dual_eval_tests! {
-    keys_map: "(sort (keys {:b 2 :a 1}))" => common::eval_tw("'(:a :b)"),
+    keys_map: "(sort (keys {:b 2 :a 1}))" => Value::list(vec![Value::keyword("a"), Value::keyword("b")]),
     keys_hashmap: "(length (keys (hash-map :a 1 :b 2)))" => Value::int(2),
-    vals_map: "(sort (vals {:a 1 :b 2}))" => common::eval_tw("'(1 2)"),
+    vals_map: "(sort (vals {:a 1 :b 2}))" => Value::list(vec![Value::int(1), Value::int(2)]),
     vals_hashmap: "(length (vals (hash-map :a 1 :b 2)))" => Value::int(2),
 }
 
@@ -142,7 +143,7 @@ dual_eval_error_tests! {
 
 dual_eval_tests! {
     entries_map: "(length (map/entries {:a 1 :b 2}))" => Value::int(2),
-    entries_empty: "(map/entries {})" => common::eval_tw("'()"),
+    entries_empty: "(map/entries {})" => Value::list(vec![]),
     entries_hashmap: "(length (map/entries (hash-map :a 1 :b 2)))" => Value::int(2),
 }
 
@@ -308,7 +309,7 @@ dual_eval_tests! {
     get_in_missing_nil: r#"(get-in {:a {:b 1}} [:a :c])"# => Value::nil(),
     get_in_missing_default: r#"(get-in {:a {:b 1}} [:a :c] "default")"# => Value::string("default"),
     get_in_nil_intermediate: r#"(get-in {:a nil} [:a :b :c])"# => Value::nil(),
-    get_in_empty_path: r#"(get-in {:a 1} [])"# => common::eval_tw(r#"{:a 1}"#),
+    get_in_empty_path: r#"(get-in {:a 1} [])"# => Value::map(BTreeMap::from([(Value::keyword("a"), Value::int(1))])),
     get_in_non_map_intermediate: r#"(get-in {:a 42} [:a :b] "default")"# => Value::string("default"),
 }
 

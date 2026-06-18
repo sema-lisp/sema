@@ -196,6 +196,10 @@ dual_eval_tests! {
     // time/parse — basic parsing
     time_parse_basic: r#"(time/parse "2024-01-01 00:00:00" "%Y-%m-%d %H:%M:%S")"# => Value::float(1704067200.0),
     time_parse_epoch: r#"(time/parse "1970-01-01 00:00:00" "%Y-%m-%d %H:%M:%S")"# => Value::float(0.0),
+    // Naive (offset-less) strings are interpreted as UTC. 2025-01-15 12:10:00 UTC
+    // == unix 1736943000. This pins the documented UTC interpretation so it can't
+    // silently regress to local time.
+    time_parse_naive_is_utc: r#"(time/parse "2025-01-15 12:10:00" "%Y-%m-%d %H:%M:%S")"# => Value::float(1736943000.0),
 
     // time/format — basic formatting
     time_format_date: r#"(time/format 1704067200.0 "%Y-%m-%d")"# => Value::string("2024-01-01"),

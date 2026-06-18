@@ -4,7 +4,9 @@ module: "sqlite"
 section: "Executing SQL"
 ---
 
-Execute multiple SQL statements at once (no parameter binding). Useful for schema setup and migrations. Returns `nil`.
+Execute multiple SQL statements at once. STATIC SQL ONLY — there is no parameter binding, so the entire string is run verbatim. Useful for schema setup and migrations. Returns `nil`.
+
+**Security:** never interpolate user-controlled input into the SQL string passed to `db/exec-batch` — doing so is a SQL injection vulnerability. For any value that comes from outside the program, use the parameterized `db/exec` (with `?` placeholders) instead, one statement at a time.
 
 ```sema
 (db/exec-batch "mydb" "

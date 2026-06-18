@@ -57,12 +57,14 @@ dual_eval_tests! {
 // ============================================================
 
 dual_eval_tests! {
+    // Foundational ops: hand-constructed expected values so the oracle does not
+    // depend on the tree-walker (see docs/bugs/eval-tw-oracle-circularity.md).
     list_car: "(car '(1 2 3))" => Value::int(1),
-    list_cdr: "(cdr '(1 2 3))" => common::eval_tw("'(2 3)"),
-    list_cons: "(cons 1 '(2 3))" => common::eval_tw("'(1 2 3)"),
+    list_cdr: "(cdr '(1 2 3))" => Value::list(vec![Value::int(2), Value::int(3)]),
+    list_cons: "(cons 1 '(2 3))" => Value::list(vec![Value::int(1), Value::int(2), Value::int(3)]),
     list_length: "(length '(1 2 3))" => Value::int(3),
-    list_append: "(append '(1 2) '(3 4))" => common::eval_tw("'(1 2 3 4)"),
-    list_reverse: "(reverse '(1 2 3))" => common::eval_tw("'(3 2 1)"),
+    list_append: "(append '(1 2) '(3 4))" => Value::list(vec![Value::int(1), Value::int(2), Value::int(3), Value::int(4)]),
+    list_reverse: "(reverse '(1 2 3))" => Value::list(vec![Value::int(3), Value::int(2), Value::int(1)]),
     list_map: "(map (fn (x) (* x 2)) '(1 2 3))" => common::eval_tw("'(2 4 6)"),
     list_filter: "(filter odd? '(1 2 3 4 5))" => common::eval_tw("'(1 3 5)"),
     list_foldl: "(foldl + 0 '(1 2 3))" => Value::int(6),
@@ -105,7 +107,7 @@ dual_eval_tests! {
 dual_eval_tests! {
     vec_nth: "(nth [10 20 30] 1)" => Value::int(20),
     vec_length: "(length [1 2 3])" => Value::int(3),
-    vec_to_list: "(vector->list [1 2 3])" => common::eval_tw("'(1 2 3)"),
+    vec_to_list: "(vector->list [1 2 3])" => Value::list(vec![Value::int(1), Value::int(2), Value::int(3)]),
     list_to_vec: "(vector? (list->vector '(1 2 3)))" => Value::bool(true),
 }
 
@@ -495,11 +497,11 @@ dual_eval_tests! {
 // ============================================================
 
 dual_eval_tests! {
-    rest_list: "(rest '(1 2 3))" => common::eval_tw("'(2 3)"),
-    rest_single: "(rest '(1))" => common::eval_tw("'()"),
+    rest_list: "(rest '(1 2 3))" => Value::list(vec![Value::int(2), Value::int(3)]),
+    rest_single: "(rest '(1))" => Value::list(vec![]),
     rest_vector: "(vector? (rest [1 2 3]))" => Value::bool(true),
     rest_vector_values: "(length (rest [1 2 3]))" => Value::int(2),
-    cdr_list: "(cdr '(1 2 3))" => common::eval_tw("'(2 3)"),
+    cdr_list: "(cdr '(1 2 3))" => Value::list(vec![Value::int(2), Value::int(3)]),
 }
 
 // ============================================================
@@ -520,8 +522,8 @@ dual_eval_tests! {
 dual_eval_tests! {
     caar_basic: "(caar '((1 2) (3 4)))" => Value::int(1),
     cadr_basic: "(cadr '(1 2 3))" => Value::int(2),
-    cdar_basic: "(cdar '((1 2 3) (4 5)))" => common::eval_tw("'(2 3)"),
-    cddr_basic: "(cddr '(1 2 3 4))" => common::eval_tw("'(3 4)"),
+    cdar_basic: "(cdar '((1 2 3) (4 5)))" => Value::list(vec![Value::int(2), Value::int(3)]),
+    cddr_basic: "(cddr '(1 2 3 4))" => Value::list(vec![Value::int(3), Value::int(4)]),
 }
 
 // ============================================================
@@ -533,10 +535,10 @@ dual_eval_tests! {
     caadr_basic: "(caadr '(1 (2 3) 4))" => Value::int(2),
     cadar_basic: "(cadar '((1 2 3) 4))" => Value::int(2),
     caddr_basic: "(caddr '(1 2 3 4))" => Value::int(3),
-    cdaar_basic: "(cdaar '(((1 2 3)) 4))" => common::eval_tw("'(2 3)"),
-    cdadr_basic: "(cdadr '(1 (2 3 4)))" => common::eval_tw("'(3 4)"),
-    cddar_basic: "(cddar '((1 2 3 4) 5))" => common::eval_tw("'(3 4)"),
-    cdddr_basic: "(cdddr '(1 2 3 4 5))" => common::eval_tw("'(4 5)"),
+    cdaar_basic: "(cdaar '(((1 2 3)) 4))" => Value::list(vec![Value::int(2), Value::int(3)]),
+    cdadr_basic: "(cdadr '(1 (2 3 4)))" => Value::list(vec![Value::int(3), Value::int(4)]),
+    cddar_basic: "(cddar '((1 2 3 4) 5))" => Value::list(vec![Value::int(3), Value::int(4)]),
+    cdddr_basic: "(cdddr '(1 2 3 4 5))" => Value::list(vec![Value::int(4), Value::int(5)]),
 }
 
 // ============================================================
@@ -544,11 +546,11 @@ dual_eval_tests! {
 // ============================================================
 
 dual_eval_tests! {
-    assq_found: "(assq 2 '((1 10) (2 20) (3 30)))" => common::eval_tw("'(2 20)"),
+    assq_found: "(assq 2 '((1 10) (2 20) (3 30)))" => Value::list(vec![Value::int(2), Value::int(20)]),
     assq_missing: "(assq 5 '((1 10) (2 20)))" => Value::bool(false),
     assq_empty: "(assq 1 '())" => Value::bool(false),
     assq_first_match: "(car (cdr (assq 1 '((1 10) (1 99)))))" => Value::int(10),
-    assv_found: "(assv 2 '((1 10) (2 20) (3 30)))" => common::eval_tw("'(2 20)"),
+    assv_found: "(assv 2 '((1 10) (2 20) (3 30)))" => Value::list(vec![Value::int(2), Value::int(20)]),
     assv_missing: "(assv 5 '((1 10) (2 20)))" => Value::bool(false),
 }
 

@@ -1,6 +1,7 @@
 mod common;
 
 use sema_core::Value;
+use std::collections::BTreeMap;
 
 // ============================================================
 // Arithmetic & Math
@@ -179,12 +180,14 @@ dual_eval_tests! {
 // ============================================================
 
 dual_eval_tests! {
-    quote_list: "(car '(a b c))" => common::eval_tw("'a"),
+    // Foundational ops: hand-constructed expected values so the oracle does not
+    // depend on the tree-walker (see docs/bugs/eval-tw-oracle-circularity.md).
+    quote_list: "(car '(a b c))" => Value::symbol("a"),
     quasiquote_basic: "(begin (define x 42) (car (cdr `(a ,x b))))" => Value::int(42),
-    unquote_splicing: "(begin (define xs '(2 3)) `(1 ,@xs 4))" => common::eval_tw("'(1 2 3 4)"),
+    unquote_splicing: "(begin (define xs '(2 3)) `(1 ,@xs 4))" => Value::list(vec![Value::int(1), Value::int(2), Value::int(3), Value::int(4)]),
     eval_basic: "(eval '(+ 1 2))" => Value::int(3),
     read_parse: r#"(eval (read "(+ 10 20)"))"# => Value::int(30),
-    macroexpand_basic: "(begin (defmacro my-if (c t e) (list 'if c t e)) (macroexpand '(my-if #t 1 2)))" => common::eval_tw("'(if #t 1 2)"),
+    macroexpand_basic: "(begin (defmacro my-if (c t e) (list 'if c t e)) (macroexpand '(my-if #t 1 2)))" => Value::list(vec![Value::symbol("if"), Value::bool(true), Value::int(1), Value::int(2)]),
     defmacro_basic: "(begin (defmacro my-if (c t e) (list 'if c t e)) (my-if #t 1 2))" => Value::int(1),
     gensym_symbol: "(symbol? (gensym))" => Value::bool(true),
 }
@@ -216,7 +219,7 @@ dual_eval_tests! {
 // ============================================================
 
 dual_eval_tests! {
-    cons_basic: "(cons 1 '(2 3))" => common::eval_tw("'(1 2 3)"),
+    cons_basic: "(cons 1 '(2 3))" => Value::list(vec![Value::int(1), Value::int(2), Value::int(3)]),
     car_cdr: "(car (cdr '(1 2 3)))" => Value::int(2),
     cadr: "(cadr '(1 2 3))" => Value::int(2),
     eq_identity: "(eq? 42 42)" => Value::bool(true),
@@ -250,7 +253,7 @@ dual_eval_tests! {
 // ============================================================
 
 dual_eval_tests! {
-    try_throw_map_catch_value: "(try (throw {:a 1}) (catch e (get e :value)))" => common::eval_tw("(hash-map :a 1)"),
+    try_throw_map_catch_value: "(try (throw {:a 1}) (catch e (get e :value)))" => Value::map(BTreeMap::from([(Value::keyword("a"), Value::int(1))])),
     try_side_effect_before_throw: "(begin (define x 0) (try (set! x 1) (throw \"boom\") (catch e x)))" => Value::int(1),
     try_nested_rethrow: "(try (try (throw 42) (catch e (throw (+ 1 (get e :value))))) (catch e2 (get e2 :value)))" => Value::int(43),
     try_catch_multi_body: r#"(try (throw "err") (catch e (define y 10) (+ y 5)))"# => Value::int(15),
@@ -264,9 +267,9 @@ dual_eval_tests! {
 dual_eval_tests! {
     do_immediate_term_with_result: "(do ((i 0 (+ i 1))) ((= i 0) i))" => Value::int(0),
     do_immediate_term_no_result: "(do ((i 0 (+ i 1))) ((= i 0)))" => Value::nil(),
-    do_parallel_step: "(do ((a 1 b) (b 2 a) (n 0 (+ n 1))) ((= n 1) (list a b)))" => common::eval_tw("'(2 1)"),
+    do_parallel_step: "(do ((a 1 b) (b 2 a) (n 0 (+ n 1))) ((= n 1) (list a b)))" => Value::list(vec![Value::int(2), Value::int(1)]),
     do_step_side_effects: "(begin (define t 0) (do ((i 0 (begin (set! t (+ t 1)) (+ i 1)))) ((= i 3) t)))" => Value::int(3),
-    do_body_side_effects: "(begin (define acc '()) (do ((i 0 (+ i 1))) ((= i 3) (reverse acc)) (set! acc (cons i acc))))" => common::eval_tw("'(0 1 2)"),
+    do_body_side_effects: "(begin (define acc '()) (do ((i 0 (+ i 1))) ((= i 3) (reverse acc)) (set! acc (cons i acc))))" => Value::list(vec![Value::int(0), Value::int(1), Value::int(2)]),
 }
 
 // ============================================================

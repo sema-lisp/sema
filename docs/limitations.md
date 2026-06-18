@@ -146,30 +146,28 @@ The mini-eval this entry referenced was deleted (callback architecture, ADR #61)
 
 ## Known Backend Bugs (Audit Findings)
 
-### 31. VM `set!` through stdlib HOF callbacks loses the mutation (C1, HIGH)
+### 31. VM `set!` through stdlib HOF callbacks loses the mutation (C1, HIGH) — FIXED 2026-06-18
 
-When a closure captures a let-bound variable and that closure is invoked via a stdlib higher-order function (`map`, `filter`, `for-each`, `sort-by`, `retry`, etc.), `set!` performed inside the closure is **silently dropped on the VM backend**. The tree-walker behaves correctly.
-
-Reproduction:
+**Resolved.** When a closure captures a let-bound variable and that closure is invoked via a stdlib higher-order function (`map`, `filter`, `for-each`, `sort-by`, `foldl`, `retry`, etc.), `set!` performed inside the closure now propagates back on **both** backends.
 
 ```
 $ sema --tw -e '(let ((c 0)) (map (fn (x) (set! c (+ c x))) (list 1 2 3)) c)'
 6
 $ sema      -e '(let ((c 0)) (map (fn (x) (set! c (+ c x))) (list 1 2 3)) c)'
-0
+6
 ```
 
-Root cause (updated 2026-06-09): the open-upvalue runtime **did ship** (ADR #55, commits `f691a55`/`346f46d` — `UpvalueState::{Open,Closed}` in `vm.rs`), and in-VM closure mutation now works correctly. But the shipped variant calls `close_open_upvalues` **before every non-VM call** (the `call_callback` sites in vm.rs). So when a closure is handed to a stdlib HOF — which runs it via `NativeFn::func` on a fresh VM (Decision #50) — its upvalue cells are closed snapshots, and `set!` mutations land in the snapshot and are discarded. The open-upvalue migration was necessary but not sufficient for this bug.
+Root cause (was): the open-upvalue runtime (ADR #55, `UpvalueState::{Open,Closed}` in `vm.rs`) closed open upvalue cells **before every non-VM call**, then ran the HOF callback via `NativeFn::func` on a *fresh* VM (Decision #50). The closed cells were detached snapshots, so the callback's `set!` never reached the parent's live stack slot.
 
-Planned fix options: keep cells open across the cross-VM HOF bridge (the original ADR #55 point 5, dropped during implementation), or route HOF callbacks in-VM so the bridge is never taken. Full write-up: `docs/bugs/vm-set-lost-through-hof-callbacks.md`.
+Fix (route HOF callbacks in-VM): the VM no longer closes upvalues before native calls. Instead it registers itself on a thread-local `CURRENT_VM` stack for the duration of each native call (`CurrentVmGuard`). When a VM closure's `NativeFn` fallback fires synchronously, it consults that stack and — if a compatible VM is running — executes the closure as a **nested frame on that live VM** (`run_nested_closure`, bounded by `frame_floor`). The closure's open upvalue cells therefore stay connected to the parent's stack and `set!` flows back. Closures that genuinely cross onto a *foreign* stack (the fresh-VM fallback when called from the tree-walker, or async task VMs created by `spawn` / inline HOF tasks) are snapshotted at the crossing point via `close_closure_upvalues_for_foreign_run`. Full write-up: `docs/bugs/vm-set-lost-through-hof-callbacks.md`; plan: `docs/plans/2026-06-18-c1-vm-hof-in-vm.md`. Regression tests: `crates/sema/tests/dual_eval_test.rs` (`hof_set_through_*`, `vm_set_through_*`).
 
-Related symptoms surfaced by the same root cause:
+Still-open related symptoms from the same dual-path design (NOT addressed here):
 
-- `(type (fn (x) x))` returns `:lambda` in TW but `:native-fn` in VM (because VM closures wrap as `NativeFn` for stdlib HOF interop).
+- `(type (fn (x) x))` returns `:lambda` in TW but `:native-fn` in VM (VM closures wrap as `NativeFn` for stdlib HOF interop).
 - Caught error maps in the VM are missing `:stack-trace` (TW includes it).
 - Type-error message text for `+` / `-` differs between backends.
 
-Workaround: use tree-walker (`--tw`) for code that relies on `set!`-through-HOF, or refactor to use `foldl` with explicit accumulator threading (no captured mutation).
+Note: `set!`-through-HOF inside an *async task* still follows the pre-existing fresh-task-VM semantics (it is snapshotted on spawn), since async tasks run on dedicated VM stacks.
 
 ### 32. Bytecode stack-balance validation gap (C11, HIGH)
 

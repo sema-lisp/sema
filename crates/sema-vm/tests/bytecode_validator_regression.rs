@@ -156,6 +156,50 @@ fn semac_exception_handler_inflated_stack_depth_rejected() {
     );
 }
 
+/// A crafted `.semac` with a `CallNative` whose `native_id` is out of range
+/// must be rejected at load time (audit finding VM-1). The native table is
+/// process-local and is NOT serialized, so a deserialized chunk always has an
+/// empty native table — any `CallNative` therefore references a missing entry.
+/// Without the verifier arm, only a `debug_assert!` in `vm.rs` guarded this, so
+/// a release build would index past the resolved native table (OOB / panic).
+///
+/// The opcode is otherwise stack-balanced (argc=0 pops 0, pushes 1), so only the
+/// `native_id < n_natives` bounds check can reject it — not the stack verifier.
+#[test]
+fn semac_call_native_out_of_range_id_rejected() {
+    let mut e = Emitter::new();
+    e.emit_op(Op::CallNative);
+    e.emit_u16(99); // native_id far past the (empty, unserialized) native table
+    e.emit_u16(0); // argc — stack-balanced so this isolates the id check
+    e.emit_op(Op::Return);
+    let chunk = e.into_chunk();
+
+    let err = expect_rejected(chunk, "out-of-range CallNative native_id");
+    assert!(
+        err.contains("CallNative") && err.contains("out of range"),
+        "expected CallNative out-of-range rejection, got: {err}"
+    );
+}
+
+/// Even `native_id` 0 must be rejected, because the deserialized native table is
+/// empty (`0` entries). This pins the boundary: the check is `< n_natives`, not a
+/// looser sentinel comparison.
+#[test]
+fn semac_call_native_zero_id_rejected_when_table_empty() {
+    let mut e = Emitter::new();
+    e.emit_op(Op::CallNative);
+    e.emit_u16(0); // native_id 0 — still out of range against a 0-entry table
+    e.emit_u16(0); // argc
+    e.emit_op(Op::Return);
+    let chunk = e.into_chunk();
+
+    let err = expect_rejected(chunk, "CallNative native_id 0 against empty table");
+    assert!(
+        err.contains("CallNative") && err.contains("out of range"),
+        "expected CallNative out-of-range rejection, got: {err}"
+    );
+}
+
 /// A pure LINEAR stack-growth sequence (no back-edge) must be rejected by the
 /// `MAX_STACK_DEPTH` overflow bound specifically. The existing dup-overflow test
 /// uses a self-loop, which trips the join-depth-disagreement check instead, so it

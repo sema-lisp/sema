@@ -294,16 +294,18 @@ fn channel_zero_capacity_error() {
     );
 }
 
-// === Tree-walker rejects async ===
+// === Async is accepted on the (sole) VM backend ===
 
 #[test]
-fn tree_walker_rejects_async() {
+fn default_backend_accepts_async() {
+    // The tree-walker is retired; every eval entry point runs on the VM, so
+    // async/await is accepted via the default `eval_str` path (it used to error
+    // with "requires the VM backend" on the tree-walker).
     let interp = sema_eval::Interpreter::new();
-    let err = interp.eval_str("(async (+ 1 2))").unwrap_err().to_string();
-    assert!(
-        err.contains("VM backend"),
-        "expected VM backend error, got: {err}"
-    );
+    let result = interp
+        .eval_str("(await (async (+ 1 2)))")
+        .expect("async must work on the VM backend");
+    assert_eq!(result, sema_core::Value::int(3));
 }
 
 // ── Nested async ──────────────────────────────────────────────────

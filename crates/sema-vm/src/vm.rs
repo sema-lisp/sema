@@ -217,6 +217,24 @@ fn try_run_on_current_vm(
     Some(vm.run_nested_closure(closure.clone(), args, ctx))
 }
 
+/// The home globals env of the VM currently executing a native call on this
+/// thread (the innermost `CURRENT_VM`), if any. A native invoked from a running
+/// VM uses this to act on the *current* environment — e.g. a nested `import`/
+/// `load` copies bindings into the executing module's env rather than a fixed
+/// global env (M4 nested-module isolation).
+///
+/// SAFETY: the top `CURRENT_VM` pointer is valid while the native call that
+/// registered it is on the Rust stack, which is exactly the case when this is
+/// called from inside that native. The VM is paused at the call site.
+pub fn current_vm_globals() -> Option<Rc<Env>> {
+    CURRENT_VM.with(|stack| {
+        stack
+            .borrow()
+            .last()
+            .map(|&ptr| unsafe { &*ptr }.globals.clone())
+    })
+}
+
 /// Close `closure`'s still-open upvalue cells against the VM(s) currently
 /// running a native call on this thread, snapshotting their values from the
 /// owning VM's live stack.
@@ -2197,6 +2215,9 @@ impl VM {
         if self.frames.len() >= MAX_FRAMES {
             return Err(SemaError::eval(
                 "stack overflow: maximum call depth exceeded",
+            )
+            .with_hint(
+                "this usually means unbounded recursion; ensure recursive calls are in tail position for TCO, or use 'do' for iteration",
             ));
         }
         self.ensure_cache_space(&closure.func);
@@ -2258,6 +2279,9 @@ impl VM {
         if self.frames.len() >= MAX_FRAMES {
             return Err(SemaError::eval(
                 "stack overflow: maximum call depth exceeded",
+            )
+            .with_hint(
+                "this usually means unbounded recursion; ensure recursive calls are in tail position for TCO, or use 'do' for iteration",
             ));
         }
         self.ensure_cache_space(&closure.func);

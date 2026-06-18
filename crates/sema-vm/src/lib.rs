@@ -31,7 +31,7 @@ pub use resolve::resolve_with_locals;
 pub use scheduler::init_scheduler;
 pub use serialize::{deserialize_from_bytes, is_bytecode_file, serialize_to_bytes};
 pub use vm::{
-    compile_program, compile_program_with_spans, extract_vm_closure, snap_breakpoint_line,
-    valid_breakpoint_lines, valid_breakpoint_lines_by_file, Closure, CompiledProgram, UpvalueCell,
-    UpvalueState, VM,
+    compile_program, compile_program_with_spans, current_vm_globals, extract_vm_closure,
+    snap_breakpoint_line, valid_breakpoint_lines, valid_breakpoint_lines_by_file, Closure,
+    CompiledProgram, UpvalueCell, UpvalueState, VM,
 };

@@ -107,7 +107,7 @@ fn vm_macro_defined_and_used_within_loaded_file() {
 #[test]
 fn vm_async_in_loaded_module_works() {
     // The motivating capability: async (a VM-only feature) inside a loaded file
-    // now works because the body runs on the VM. On the tree-walker it errors.
+    // works because the body runs on the VM.
     let dir = temp_dir("load-async");
     let m = write(
         &dir,
@@ -116,10 +116,6 @@ fn vm_async_in_loaded_module_works() {
     );
     let src = format!(r#"(begin (load "{m}") (compute))"#);
     assert_eq!(vm(&src).unwrap(), Value::int(42));
-    assert!(
-        tw(&src).is_err(),
-        "async in a loaded file should fail on the tree-walker"
-    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -199,26 +195,9 @@ fn vm_backend_import_keeps_tree_walker_isolation() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-#[test]
-fn vm_backend_flag_resets_for_single_expr_eval() {
-    // Regression for the sticky-flag leak: after a VM eval on an interpreter, a
-    // subsequent single-expr tree-walker eval must NOT run a loaded body on the
-    // VM. We verify by loading an async-using file via eval_in_global (TW) — if
-    // the flag leaked, the loaded body would run on the VM and succeed; with the
-    // reset, it tree-walks and async fails.
-    let dir = temp_dir("flag-leak");
-    let m = write(&dir, "amod.sema", "(define (go) (await (async 1)))");
-    let interp = Interpreter::new();
-    interp.eval_str_compiled("(+ 1 2)").unwrap(); // sets vm_backend = true
-    let expr = sema_reader::read(&format!(r#"(begin (load "{m}") (go))"#)).unwrap();
-    let res = interp.eval_in_global(&expr);
-    assert!(
-        res.is_err(),
-        "single-expr tree-walker eval must reset the backend flag so async in a \
-         loaded file fails (the loaded body must not run on the VM), got {res:?}"
-    );
-    let _ = std::fs::remove_dir_all(&dir);
-}
+// (Removed `vm_backend_flag_resets_for_single_expr_eval`: it asserted the
+// tree-walker backend-flag reset — now obsolete, as every eval entry point runs
+// on the VM, so async in a loaded file always works regardless of entry point.)
 
 // === M4: VM-native import (module body runs on the VM) ===
 

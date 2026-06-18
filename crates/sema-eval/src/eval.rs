@@ -114,55 +114,66 @@ impl Interpreter {
         Interpreter { global_env, ctx }
     }
 
+    /// Evaluate a single expression on the VM. M6: the VM is the sole evaluator.
+    ///
+    /// NOTE (deliberate behavior change vs. the retired tree-walker): all eval
+    /// entry points now run in the global env, so top-level `define`s persist
+    /// across calls. The old `eval`/`eval_str` child-env isolation is gone —
+    /// maintaining two env semantics was the dual-evaluator complexity being
+    /// removed. Use a fresh `Interpreter` for an isolated evaluation.
     pub fn eval(&self, expr: &Value) -> EvalResult {
-        // Tree-walker entry: ensure a stale vm_backend flag from a prior VM call
-        // doesn't make a `(load ...)` here run its body on the VM.
-        self.ctx.set_vm_backend(false);
-        eval_value(&self.ctx, expr, &Env::with_parent(self.global_env.clone()))
+        self.eval_in_global(expr)
     }
 
+    /// Parse and evaluate on the VM (global env; `define`s persist — see `eval`).
     pub fn eval_str(&self, input: &str) -> EvalResult {
-        eval_string(&self.ctx, input, &Env::with_parent(self.global_env.clone()))
+        self.eval_str_in_global(input)
     }
 
     /// Evaluate in the global environment so that `define` persists across calls.
     pub fn eval_in_global(&self, expr: &Value) -> EvalResult {
-        self.ctx.set_vm_backend(false);
-        eval_value(&self.ctx, expr, &self.global_env)
+        self.ctx.set_vm_backend(true);
+        self.run_exprs_on_vm(std::slice::from_ref(expr), &self.global_env)
     }
 
     /// Parse and evaluate in the global environment so that `define` persists across calls.
     pub fn eval_str_in_global(&self, input: &str) -> EvalResult {
-        eval_string(&self.ctx, input, &self.global_env)
-    }
-
-    /// Parse, compile to bytecode, and execute via the VM.
-    pub fn eval_str_compiled(&self, input: &str) -> EvalResult {
-        // VM is the active backend: `(load ...)` compiles + runs loaded bodies on
-        // the VM (async/channels work in loaded files; code runs at VM speed).
         self.ctx.set_vm_backend(true);
         let (exprs, spans) = sema_reader::read_many_with_spans(input)?;
         self.ctx.merge_span_table(spans);
         if exprs.is_empty() {
             return Ok(Value::nil());
         }
+        self.run_exprs_on_vm(&exprs, &self.global_env)
+    }
 
-        let mut expanded = Vec::new();
-        for expr in &exprs {
-            let exp = self.expand_for_vm(expr)?;
-            expanded.push(exp);
+    /// Parse, compile to bytecode, and execute via the VM (global env, persists).
+    pub fn eval_str_compiled(&self, input: &str) -> EvalResult {
+        self.ctx.set_vm_backend(true);
+        let (exprs, spans) = sema_reader::read_many_with_spans(input)?;
+        self.ctx.merge_span_table(spans);
+        if exprs.is_empty() {
+            return Ok(Value::nil());
         }
+        self.run_exprs_on_vm(&exprs, &self.global_env)
+    }
 
-        let known_natives = collect_native_names(&self.global_env);
+    /// Macro-expand, compile, and run a sequence of top-level forms on the VM,
+    /// rooted at `globals`. Shared by every eval entry point (M6: single
+    /// evaluator). `define`s land in `globals`.
+    fn run_exprs_on_vm(&self, exprs: &[Value], globals: &Rc<Env>) -> EvalResult {
+        let mut expanded = Vec::with_capacity(exprs.len());
+        for expr in exprs {
+            expanded.push(expand_for_vm_in(&self.ctx, globals, expr)?);
+        }
+        let known_natives = collect_native_names(globals);
         let prog = sema_vm::compile_program(&expanded, Some(known_natives))?;
         let mut vm = sema_vm::VM::new(
-            self.global_env.clone(),
+            globals.clone(),
             prog.functions,
             &prog.native_table,
             prog.main_cache_slots,
         )?;
-        // Initialize the async scheduler with shared globals and native spurs.
-        // The function table is extracted from each thunk at spawn time.
         sema_vm::init_scheduler(self.global_env.clone(), prog.native_table.clone());
         vm.execute(prog.closure, &self.ctx)
     }
@@ -1087,7 +1098,11 @@ fn register_vm_delegates(env: &Rc<Env>) {
             if args.len() != 1 {
                 return Err(SemaError::arity("load", "1", args.len()));
             }
-            match special_forms::eval_load(std::slice::from_ref(&args[0]), &load_env, ctx)? {
+            // Target the *currently executing* VM's env (the module being run),
+            // falling back to the global env at top level, so a nested `load`
+            // adds definitions to the right module env — not always the globals.
+            let target = sema_vm::current_vm_globals().unwrap_or_else(|| load_env.clone());
+            match special_forms::eval_load(std::slice::from_ref(&args[0]), &target, ctx)? {
                 Trampoline::Value(v) => Ok(v),
                 Trampoline::Eval(..) => Ok(Value::nil()),
             }
@@ -1110,7 +1125,12 @@ fn register_vm_delegates(env: &Rc<Env>) {
             if let Some(items) = args[1].as_list() {
                 imp_args.extend(items.iter().cloned());
             }
-            match special_forms::eval_import(&imp_args, &import_env, ctx)? {
+            // Copy exports into the *currently executing* VM's env (the module
+            // being run), falling back to the global env at top level. This keeps
+            // a nested module's imports private to that module instead of leaking
+            // into the global env (M4 nested-module isolation).
+            let target = sema_vm::current_vm_globals().unwrap_or_else(|| import_env.clone());
+            match special_forms::eval_import(&imp_args, &target, ctx)? {
                 Trampoline::Value(v) => Ok(v),
                 Trampoline::Eval(..) => Ok(Value::nil()),
             }

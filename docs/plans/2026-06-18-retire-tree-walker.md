@@ -22,24 +22,40 @@
 >   destructures directly (no eval_callback). `__vm-force` was already VM-native (delay lowers
 >   to a lambda → call_callback). Commits `b72e966`, `b16cf68`.
 >
-> **Next action — finish M5 (eval_value has no live VM-path callers), then M6→M9:**
-> Remaining `eval_callback`→`eval_value` callers on the VM path: **`__vm-deftool` /
-> `__vm-defagent`** (LLM forms — `eval_deftool`/`eval_defagent` evaluate handler/param exprs,
-> so NOT pure; the args already arrive evaluated from the VM, so build the Tool/Agent value
-> directly) and **sema-llm's `set_eval_callback(eval_value)`** (eval.rs:91,109). `__vm-load`/
-> `__vm-import` only invoke the Rust import/load *driver* (body is VM-native) — fine.
-> Then **M5** checkpoint (grep-gate: no `eval_value` on a live path), **M6** (sema::Interpreter
-> builder + route eval entry points to VM + drop sema-wasm Tree toggle — embedder-breaking),
-> **M7** (collapse dual_eval → vm_eval; flip integration/http/server `eval()` to VM — large),
-> **M8** (relocate `SPECIAL_FORM_NAMES`; grep-gate; delete `eval_value`/trampoline/TW
-> special_forms; remove `--tw`/REPL `use_vm`/`eval_tw`), **M9** (docs).
+> - ✅ **M5 — eval bridge complete.** `__vm-deftool`/`__vm-defagent` build the Tool/Agent value
+>   directly (via `special_forms::register_tool`/`register_agent`); sema-llm callback →
+>   `eval_value_vm`; `__vm-load`/`__vm-import` call the drivers directly (off `eval_step`).
+>   Commits `5b907bb`, `6c3d45f`.
+> - ✅ **M6 — VM is the sole evaluator (all paths).** All `Interpreter` eval entry points run on
+>   the VM (`run_exprs_on_vm`; deliberate change: all run in the global env / persist defines).
+>   `sema::Interpreter` builder fixed (registers delegates+prelude); `sema::Interpreter` +
+>   sema-wasm `preload_module` run on the VM. Commits `ecacecd`, `f3f2397`.
+> - ✅ **M7 — tests on the VM.** dual_eval/integration/http/server all run on the VM; fallout
+>   fixed: real bugs fixed (`(module (export …))` restriction on VM `f8377e1`; nested-import
+>   leak via `current_vm_globals` in `ecacecd`; VM stack-overflow recursion hint); TW-only
+>   error-UX tests `#[ignore]`d as a deferred-parity acceptance suite; obsolete TW-contrast
+>   tests retired; new `embedding_api_test`.
+> - ✅ **M8 (surface) — `--tw` retired** to a hidden no-op; eval-mode functions always use the VM.
+>   Commit `0290a4a`.
+> - ✅ **M9 — docs** reframed to a single VM evaluator (CLAUDE.md, website/docs, deferred.md).
+>   Commit `cfe6cfe`.
 >
-> **Watch out:** (1) M6 is an embedder-breaking API change. (2) **CORE-2 is NOT solved by
-> this** — the recursive-closure Rc cycle persists on the VM; separate GC effort, see
-> `docs/deferred.md`. (3) The hot dispatch loop now does two Rc clones per frame activation
-> (frame_globals + self.functions) — verify with `make bench-vm` before M9; optimize if needed.
-> (4) ultracode is appropriate for M7 (tests) and M9 (docs).
-> **Spike already done:** VM macro expansion is feasible (details below) — M2 was de-risked.
+> **STATUS: the tree-walker is FUNCTIONALLY RETIRED — the bytecode VM is the sole evaluator for
+> every path (CLI, REPL, embedding API, wasm, tests, notebook, mcp). Full suite green; lint
+> clean. `eval_value` has no live callers (the TW core is unreachable dead code).**
+>
+> **Remaining (cleanup, tracked in `docs/deferred.md`):**
+> - **TW-3:** physically delete the dead TW source (`eval_value`/`eval_step`/trampoline/
+>   `apply_lambda`/`run_trampoline`/eval-based `apply_macro`/`eval_string`; pure-eval special
+>   forms + `try_eval_special`, keeping the drivers). Relocate `SPECIAL_FORM_NAMES` out of
+>   `special_forms.rs` first (REPL + all of sema-lsp import it). Flip `debug_evaluate` (DAP) +
+>   the `force`/thunk fallback off `eval_callback`. Needs a per-special-form VM-native-vs-TW
+>   audit (e.g. `defmulti`/`defmethod`).
+> - **TW-1:** VM stack-trace parity (8 `#[ignore]`d acceptance tests ready).
+> - **TW-2:** `(type lambda)` → `:native-fn` (wants a `sema-core` NativeFn marker).
+> - **Perf:** the hot dispatch loop now does 2 Rc clones per frame activation (frame_globals +
+>   self.functions) — verify with `make bench-vm`; optimize if regressed.
+> - **CORE-2 is NOT solved by this** — recursive-closure Rc cycle persists on the VM (GC effort).
 
 **Status:** scoping / not started. **Phase-1a feasibility gate: PASSED** (spike 2026-06-18). **Size:** large, multi-phase (not a single PR).
 

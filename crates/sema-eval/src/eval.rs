@@ -1113,19 +1113,23 @@ fn register_vm_delegates(env: &Rc<Env>) {
         })),
     );
 
-    // __vm-defmacro-form: delegate complete defmacro form to the tree-walker
+    // __vm-defmacro-form: register a complete `(defmacro ...)` form directly
+    // (pure destructure) — no tree-walker round-trip. Used for defmacro that
+    // reaches compilation (e.g. non-top-level) rather than expand-time
+    // registration.
     let dmf_env = env.clone();
     env.set(
         intern("__vm-defmacro-form"),
-        Value::native_fn(NativeFn::with_ctx(
-            "__vm-defmacro-form",
-            move |ctx, args| {
-                if args.len() != 1 {
-                    return Err(SemaError::arity("defmacro-form", "1", args.len()));
-                }
-                sema_core::eval_callback(ctx, &args[0], &dmf_env)
-            },
-        )),
+        Value::native_fn(NativeFn::simple("__vm-defmacro-form", move |args| {
+            if args.len() != 1 {
+                return Err(SemaError::arity("defmacro-form", "1", args.len()));
+            }
+            let items = args[0]
+                .as_list()
+                .ok_or_else(|| SemaError::type_error("list", args[0].type_name()))?;
+            register_defmacro(items, &dmf_env)?;
+            Ok(Value::nil())
+        })),
     );
 
     // __vm-define-record-type: delegate to the tree-walker

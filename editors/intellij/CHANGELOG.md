@@ -19,6 +19,7 @@
   uses the same binary as the rest of the integration (previously it could fall back to `sema` on
   `PATH`).
 - Debug launch parameters now include the adapter `type`, matching the run-configuration template.
+- Updated the LSP4IJ dependency to 0.20.1.
 
 ## [1.0.0]
 

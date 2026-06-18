@@ -30,7 +30,7 @@ dependencies {
         if (lsp4ijLocalPath.isPresent) {
             localPlugin(lsp4ijLocalPath)
         } else {
-            plugin("com.redhat.devtools.lsp4ij:0.19.4")
+            plugin("com.redhat.devtools.lsp4ij:0.20.1")
         }
 
         testFramework(TestFrameworkType.Platform)

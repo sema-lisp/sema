@@ -1,0 +1,32 @@
+;; Demo tool collection for the Sema MCP server.
+;;
+;; Run standalone:   sema mcp examples/mcp-demo-tools.sema
+;; Connect to Claude: claude --mcp-config sema-mcp.json   (see README at bottom)
+
+(deftool add
+  "Add two numbers together"
+  {:a {:type :number :description "First number"}
+   :b {:type :number :description "Second number"}}
+  (lambda (a b) (+ a b)))
+
+(deftool fib
+  "Compute the nth Fibonacci number (0-based)"
+  {:n {:type :number :description "Which Fibonacci number to compute"}}
+  (lambda (n)
+    (let loop ((i 0) (a 0) (b 1))
+      (if (= i n) a (loop (+ i 1) b (+ a b))))))
+
+(deftool reverse-text
+  "Reverse the characters in a string"
+  {:text {:type :string :description "The text to reverse"}}
+  (lambda (text) (string/reverse text)))
+
+(deftool word-count
+  "Count the number of whitespace-separated words in a string"
+  {:text {:type :string :description "The text to count words in"}}
+  (lambda (text) (length (string/split (string/trim text) " "))))
+
+(deftool shout
+  "Uppercase a string and add an exclamation mark"
+  {:text {:type :string :description "The text to shout"}}
+  (lambda (text) (string-append (string/upper text) "!")))

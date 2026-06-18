@@ -52,7 +52,7 @@ Proper Scheme `do` loop implemented. `begin` remains for sequencing.
 
 ### ~~10. No `case` / Pattern Matching~~ → RESOLVED
 
-`case` special form with R5RS semantics. Pattern matching also shipped since: `match` special form in both backends (map patterns `{:name n}`, vector/list patterns `[a b c]`, literals, `_` wildcard) plus destructuring (`crates/sema-eval/src/destructure.rs`).
+`case` special form with R5RS semantics. Pattern matching also shipped since: `match` special form (map patterns `{:name n}`, vector/list patterns `[a b c]`, literals, `_` wildcard) plus destructuring (`crates/sema-eval/src/destructure.rs`).
 
 ### ~~11. No Port-Based I/O~~ → MOSTLY RESOLVED
 
@@ -65,9 +65,9 @@ Streaming shipped since: `stream/*` namespace (`crates/sema-stdlib/src/stream.rs
 
 R7RS `define-record-type` with constructors, type predicates, and field accessors. `record?` predicate. `type` returns record type name as keyword.
 
-### ~~13. No Stack Traces~~ → RESOLVED (tree-walker; VM partial)
+### ~~13. No Stack Traces~~ → PARTIAL (VM)
 
-Full stack traces with call frames, file locations, and source spans. Traces are bounded for TCO'd recursion. Accessible via `:stack-trace` key in `catch` error maps — **on the tree-walker**. VM-caught error maps currently omit `:stack-trace`, and VM runtime errors print no `--> file:line:col` location (see ADR #57, partially implemented).
+The stack-trace machinery — call frames, file locations, and source spans, bounded for TCO'd recursion — exists, but the VM (the sole evaluator) does **not** yet surface it: VM-caught error maps omit the `:stack-trace` key, and VM runtime errors print no `--> file:line:col` location (see ADR #57, partially implemented, and TW-1 in `docs/deferred.md`).
 
 ### ~~14. Missing Math Functions~~ → RESOLVED (Phase 8)
 
@@ -140,7 +140,7 @@ No destructuring forms for multiple return values (related to #19).
 
 ### ~~30. No Tail Calls Across Mutual Recursion in Stdlib~~ → RESOLVED (folded into #24)
 
-The mini-eval this entry referenced was deleted (callback architecture, ADR #61); HOF callbacks now run through the full evaluator and mutual tail recursion inside a callback TCOs fine (verified at depth 500k on both backends). The only remaining issue is #24's: a callback that *re-enters* a stdlib HOF recursively grows the Rust stack.
+The mini-eval this entry referenced was deleted (callback architecture, ADR #61); HOF callbacks now run through the full evaluator and mutual tail recursion inside a callback TCOs fine (verified at depth 500k on the VM). The only remaining issue is #24's: a callback that *re-enters* a stdlib HOF recursively grows the Rust stack.
 
 ---
 
@@ -148,24 +148,21 @@ The mini-eval this entry referenced was deleted (callback architecture, ADR #61)
 
 ### 31. VM `set!` through stdlib HOF callbacks loses the mutation (C1, HIGH) — FIXED 2026-06-18
 
-**Resolved.** When a closure captures a let-bound variable and that closure is invoked via a stdlib higher-order function (`map`, `filter`, `for-each`, `sort-by`, `foldl`, `retry`, etc.), `set!` performed inside the closure now propagates back on **both** backends.
+**Resolved.** When a closure captures a let-bound variable and that closure is invoked via a stdlib higher-order function (`map`, `filter`, `for-each`, `sort-by`, `foldl`, `retry`, etc.), `set!` performed inside the closure now propagates back correctly on the VM.
 
 ```
-$ sema --tw -e '(let ((c 0)) (map (fn (x) (set! c (+ c x))) (list 1 2 3)) c)'
-6
-$ sema      -e '(let ((c 0)) (map (fn (x) (set! c (+ c x))) (list 1 2 3)) c)'
+$ sema -e '(let ((c 0)) (map (fn (x) (set! c (+ c x))) (list 1 2 3)) c)'
 6
 ```
 
 Root cause (was): the open-upvalue runtime (ADR #55, `UpvalueState::{Open,Closed}` in `vm.rs`) closed open upvalue cells **before every non-VM call**, then ran the HOF callback via `NativeFn::func` on a *fresh* VM (Decision #50). The closed cells were detached snapshots, so the callback's `set!` never reached the parent's live stack slot.
 
-Fix (route HOF callbacks in-VM): the VM no longer closes upvalues before native calls. Instead it registers itself on a thread-local `CURRENT_VM` stack for the duration of each native call (`CurrentVmGuard`). When a VM closure's `NativeFn` fallback fires synchronously, it consults that stack and — if a compatible VM is running — executes the closure as a **nested frame on that live VM** (`run_nested_closure`, bounded by `frame_floor`). The closure's open upvalue cells therefore stay connected to the parent's stack and `set!` flows back. Closures that genuinely cross onto a *foreign* stack (the fresh-VM fallback when called from the tree-walker, or async task VMs created by `spawn` / inline HOF tasks) are snapshotted at the crossing point via `close_closure_upvalues_for_foreign_run`. Full write-up: `docs/bugs/vm-set-lost-through-hof-callbacks.md`; plan: `docs/plans/2026-06-18-c1-vm-hof-in-vm.md`. Regression tests: `crates/sema/tests/dual_eval_test.rs` (`hof_set_through_*`, `vm_set_through_*`).
+Fix (route HOF callbacks in-VM): the VM no longer closes upvalues before native calls. Instead it registers itself on a thread-local `CURRENT_VM` stack for the duration of each native call (`CurrentVmGuard`). When a VM closure's `NativeFn` fallback fires synchronously, it consults that stack and — if a compatible VM is running — executes the closure as a **nested frame on that live VM** (`run_nested_closure`, bounded by `frame_floor`). The closure's open upvalue cells therefore stay connected to the parent's stack and `set!` flows back. Closures that genuinely cross onto a *foreign* stack (async task VMs created by `spawn` / inline HOF tasks) are snapshotted at the crossing point via `close_closure_upvalues_for_foreign_run`. Full write-up: `docs/bugs/vm-set-lost-through-hof-callbacks.md`; plan: `docs/plans/2026-06-18-c1-vm-hof-in-vm.md`. Regression tests: `crates/sema/tests/dual_eval_test.rs` (`hof_set_through_*`, `vm_set_through_*`).
 
 Still-open related symptoms from the same dual-path design (NOT addressed here):
 
-- `(type (fn (x) x))` returns `:lambda` in TW but `:native-fn` in VM (VM closures wrap as `NativeFn` for stdlib HOF interop).
-- Caught error maps in the VM are missing `:stack-trace` (TW includes it).
-- Type-error message text for `+` / `-` differs between backends.
+- `(type (fn (x) x))` returns `:native-fn` on the VM, since VM closures wrap as `NativeFn` for stdlib HOF interop (deferred — TW-2 in `docs/deferred.md`).
+- Caught error maps on the VM are missing `:stack-trace` (deferred — TW-1 in `docs/deferred.md`; see #13).
 
 Note: `set!`-through-HOF inside an *async task* still follows the pre-existing fresh-task-VM semantics (it is snapshotted on spawn), since async tasks run on dedicated VM stacks.
 
@@ -179,7 +176,18 @@ A hand-crafted (or corrupted) `.semac` file with a leading `Pop`, an unbalanced 
 
 ### 33. VM `eval` sees globals only — no lexical locals
 
-On the VM backend, `(eval expr)` runs via a tree-walker delegate (`__vm-eval`) against the **global environment only**. Lexical locals are not visible: `(define (f x) (eval 'x)) (f 42)` → `Unbound variable: x`. The "reify locals as a read-only view" design (archived `docs/decisions.md`, eval-reify section) was never implemented — the name→slot tables it required exist (`Function::local_names`) but are used only for DAP variable inspection. The tree-walker backend gives `eval` the caller's full environment, so this is also a backend divergence.
+On the VM, `(eval expr)` (the `__vm-eval` native) macro-expands, compiles, and runs the form against the **global environment only**. Lexical locals are not visible: `(define (f x) (eval 'x)) (f 42)` → `Unbound variable: x`. The "reify locals as a read-only view" design (archived `docs/decisions.md`, eval-reify section) was never implemented — the name→slot tables it required exist (`Function::local_names`) but are used only for DAP variable inspection.
+
+### 34. `import`/`load` that shadows a builtin isn't seen by same-program compiled calls
+
+A program compiled as one unit bakes calls to *known builtins* into `CallNative` opcodes (the `known_natives` optimization, resolved at compile time). A top-level `(define (truncate ...) ...)` is handled correctly (the compiler sees the define and skips `CallNative`), but a redefinition that happens at **runtime** via `(import ...)` / `(load ...)` is invisible to the compiler, so later calls in the same program still dispatch to the original builtin:
+
+```
+;; module exports a 2-arg `truncate`; the call still hits the 1-arg math builtin
+(import "string-utils") (truncate "hello" 3)  ; => Arity error: truncate expects 1 args, got 2
+```
+
+This worked on the retired tree-walker (late name resolution). On the VM, avoid shadowing a builtin name from an imported/loaded module (rename it, e.g. `truncate-str`), or `define` the override at top level in the same program. A general fix (conservatively disabling `CallNative` for programs containing `import`/`load`) was rejected for the per-call perf cost.
 
 ---
 
@@ -199,7 +207,7 @@ On the VM backend, `(eval expr)` runs via a tree-walker delegate (`__vm-eval`) a
 | 26  | No `with-exception-handler`              | Low      | Medium    | `try`/`catch` is sufficient for most use cases                               |
 | 27  | No `define-values`                       | Low      | Low       | Rarely needed without multiple return values                                 |
 | 29  | No `let-values`/`receive`                | Low      | Low       | Blocked by #19                                                               |
-| 33  | VM `eval` sees globals only              | Medium   | High      | Reify design never built; backend divergence vs tree-walker                  |
+| 33  | VM `eval` sees globals only              | Medium   | High      | Reify design never built; lexical locals not reified for `eval`              |
 
 ---
 
@@ -224,8 +232,8 @@ On the VM backend, `(eval expr)` runs via a tree-walker delegate (`__vm-eval`) a
 - **String operations** — split, trim, replace, contains?, format, str, index-of, chars, repeat, pad-left, pad-right
 - **Map operations** — hash-map, get, assoc, dissoc, keys, vals, merge, contains?, count, entries, map-vals, filter, select-keys, update
 - **List operations** — car/cdr + 12 compositions (caar through cdddr), cons, map (multi-list), filter, foldl, foldr, reduce, sort, range, take, drop, zip, flatten, partition, any, every, member, last, apply, index-of, unique, group-by, interleave, chunk, assoc/assq/assv (alist lookup)
-- **Async/concurrency (VM-only)** — `async`/`await`, channels, `async/sleep`, task scheduler with cooperative yield (ADR #53/#54); tree-walker errors clearly
-- **Pattern matching** — `match` special form (map/vector/literal patterns, `_` wildcard) + destructuring in both backends
+- **Async/concurrency** — `async`/`await`, channels, `async/sleep`, task scheduler with cooperative yield (ADR #53/#54)
+- **Pattern matching** — `match` special form (map/vector/literal patterns, `_` wildcard) + destructuring
 - **Streaming I/O** — `stream/*` namespace + `file/read-lines`/`file/for-each-line`/`file/fold-lines`
 - **Lazy evaluation** — `delay`/`force` with memoized promises, `promise?`, `promise-forced?`
 - **Iteration** — proper Scheme `do` loop with parallel assignment

@@ -35,14 +35,14 @@
 
 ;; String utilities module
 (file/write "/tmp/sema-mod-string.sema"
-  "(module string-utils (export slugify truncate word-wrap repeat-str)
+  "(module string-utils (export slugify truncate-str word-wrap repeat-str)
      (define (slugify s)
        (string/lower
          (string/join
            (regex/find-all \"[a-zA-Z0-9]+\" s)
            \"-\")))
 
-     (define (truncate s max-len)
+     (define (truncate-str s max-len)
        (if (<= (string/length s) max-len)
          s
          (string/append (string/slice s 0 (- max-len 3)) \"...\")))
@@ -82,7 +82,7 @@
 (println (format "slugify: ~a" (slugify "Hello World! This is Sema Lisp.")))
 (println
   (format "truncate: ~a"
-    (truncate "The quick brown fox jumps over the lazy dog" 25)))
+    (truncate-str "The quick brown fox jumps over the lazy dog" 25)))
 
 (define long-text
   "The quick brown fox jumps over the lazy dog and continues running through the forest")

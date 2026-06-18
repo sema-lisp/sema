@@ -482,13 +482,12 @@ crates/sema/src/
 - On yield, the VM leaves a nil placeholder on the stack and advances PC past the call. On resume, the scheduler replaces the placeholder with the wake value via `replace_stack_top()`
 - Replaces the replay model from PR #29 which re-executed entire task bodies, corrupting side effects
 
-### 54. Async is VM-only, VM is default backend
+### 54. Async is VM-only, VM is the sole backend
 
-- The bytecode VM is the default execution backend (CLI, REPL, notebook, playground)
-- The tree-walker is available via `--tw` flag for backwards compatibility
-- Async features (async/await, channels, task scheduler) require the VM backend
-- The tree-walker returns a clear error: "async requires the VM backend (do not use --tw)"
-- This acknowledges the tree-walker's deprecation path and avoids maintaining two async implementations
+- The bytecode VM is the sole execution backend (CLI, REPL, notebook, playground)
+- Async features (async/await, channels, task scheduler) run on the VM
+- Historical note: when this decision was made the tree-walker still existed and was selectable via `--tw`; async returned a clear error on it ("async requires the VM backend (do not use --tw)"). The tree-walker was eventually retired (2026-06-18) and the VM became the sole evaluator — the `--tw` flag is now a hidden no-op accepted only for backward compatibility. See `docs/plans/2026-06-18-retire-tree-walker.md`.
+- This acknowledged the tree-walker's deprecation path and avoided maintaining two async implementations
 
 ### 55. Move VM upvalues to open-close-on-popframe model (IMPLEMENTED, modified design — C1 NOT resolved)
 
@@ -576,9 +575,11 @@ Once this lands, `.semac` files from untrusted sources can be loaded safely. Unt
 
 References: `crates/sema-vm/src/vm.rs::pop_unchecked` (the unsafe site), `crates/sema-vm/src/serialize.rs::validate_bytecode` (where the new pass plugs in), `crates/sema-vm/src/opcodes.rs` (canonical opcode list), `docs/limitations.md` #32.
 
-### 57. Propagate source spans through runtime errors (PARTIALLY IMPLEMENTED — tree-walker done, VM pending)
+### 57. Propagate source spans through runtime errors (PARTIALLY IMPLEMENTED — evaluator side done, VM pending)
 
-Status update 2026-06-09: the **tree-walker side is done** — runtime errors print `--> file:line:col`, a source snippet with caret, and spanned `at name (...)` frames (span plumbing in `crates/sema-eval/src/eval.rs`). The **VM side is not**: commit `1a83c2b` propagated spans into `ChunkDebugInfo`, but CallNative/CallGlobal/binary-op error sites still return bare messages with no location. The backends also emit different message text for arithmetic type errors (e.g. `(+ 1 "a")`). Remaining work is exactly the "VM side" section below.
+Status update 2026-06-09: the **tree-walker side is done** — runtime errors print `--> file:line:col`, a source snippet with caret, and spanned `at name (...)` frames (span plumbing was in `crates/sema-eval/src/eval.rs`). The **VM side is not**: commit `1a83c2b` propagated spans into `ChunkDebugInfo`, but CallNative/CallGlobal/binary-op error sites still return bare messages with no location. The backends also emitted different message text for arithmetic type errors (e.g. `(+ 1 "a")`). Remaining work is exactly the "VM side" section below.
+
+Status update 2026-06-18: the tree-walker was retired and its source deleted; the VM is now the sole evaluator. The VM still does not produce stack traces / location-annotated runtime errors — this remains the open work, tracked as TW-1 in `docs/deferred.md`. The "tree-walker side" notes below are historical (that code no longer exists).
 
 Tracks LIMITATIONS.md #H13. Today the **reader** has perfect span info (used in syntax-error diagnostics like `--> path:line:col`), but **eval/VM** runtime errors emit bare messages: `type error: + expected number, got string` with no location. For anything beyond a one-liner this makes debugging needlessly hard — the user sees the error but has to grep the file to find the offending call site.
 
@@ -680,7 +681,7 @@ Replaced the 24-byte `enum Value` with an 8-byte NaN-boxed `struct Value(u64)`. 
 
 **API:** Value is no longer an enum — pattern matching uses `val.view()` → `ValueView`, or accessors (`as_int()`, `as_str()`, `as_list()`, `is_nil()`); constructors are lowercase fns (`Value::int(n)`, `Value::string(s)`).
 
-**Benchmark results at migration time (Apple M-series, release):** VM mode +8-12% (tak 9.09s→8.04s, deriv 1.99s→1.84s) from better cache locality; tree-walker −9-16% from `view()`/accessor overhead on the hot match path; RSS −5-10%. Kept despite the TW regression because the VM is the default/future path and the TW's role is shrinking (macro expansion, `--tw` compat).
+**Benchmark results at migration time (Apple M-series, release):** VM mode +8-12% (tak 9.09s→8.04s, deriv 1.99s→1.84s) from better cache locality; tree-walker −9-16% from `view()`/accessor overhead on the hot match path; RSS −5-10%. Kept despite the TW regression because the VM was the default/future path and the TW's role was shrinking (macro expansion, `--tw` compat). (Historical: the tree-walker was eventually retired 2026-06-18 — the VM is now the sole evaluator, so the TW regression is moot. See `docs/plans/2026-06-18-retire-tree-walker.md`.)
 
 **Migration scope:** ~1,800 compile errors across 34 files in 8 crates, purely mechanical. **Safety fix found during migration:** `as_bytevector()`/`as_record()` had dangling-pointer UB via `borrow_rc()` returning a reference into a stack-local `ManuallyDrop<Rc<T>>`; fixed to `borrow_ref()`.
 

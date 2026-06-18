@@ -4,7 +4,10 @@ Where Sema's time goes and what can be done about it. Based on analysis of the 1
 
 ## Current State
 
-- **Tree-walker:** ~28.4s on 10M rows (native), 22.4× behind SBCL
+The bytecode VM is the sole evaluator. (The tree-walker was eventually retired — historical numbers for it are no longer relevant.)
+
+Numbers below are historical (recorded ~Feb 2026, before the tree-walker retirement) and may be stale — re-measure before relying on them. For the current cross-Lisp comparison, see `website/docs/internals/lisp-comparison.md`.
+
 - **Bytecode VM:** ~15.9s on 10M rows (native), 11.2× behind SBCL, ~1.7× behind Janet
 - **Compute benchmarks (VM):** TAK 1,234ms, upvalue-counter 440ms, deriv 879ms
 

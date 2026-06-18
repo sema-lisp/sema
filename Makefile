@@ -68,51 +68,16 @@ docs-check:
 lint-links:
 	lychee --config lychee.toml --no-progress '**/*.md'
 
-examples: build
-	@echo "=== Running examples ==="
-	@for f in examples/*.sema; do \
-		case "$$(basename $$f)" in \
-			web-server.sema|eliza-web.sema) echo "  SKIP $$f (server)"; continue;; \
-			eliza.sema) echo "  SKIP $$f (interactive)"; continue;; \
-		esac; \
-		echo "--- $$f ---"; \
-		timeout 30 cargo run --quiet -- --no-llm "$$f" || true; \
-	done
-	@echo "=== Running stdlib examples ==="
-	@for f in examples/stdlib/*.sema; do \
-		echo "--- $$f ---"; \
-		timeout 30 cargo run --quiet -- --no-llm "$$f" || true; \
-	done
+# Run every runnable example headless and report pass/skip/fail. Interactive,
+# server, and hardware examples are skipped (see scripts/run-examples.sh for the
+# blacklist + rationale). Uses the release binary and a per-example timeout so it
+# never hangs; exits non-zero if any runnable example fails.
+examples: release
+	@EXAMPLE_TIMEOUT=30 ./scripts/run-examples.sh
 
-examples-vm: build
-	@echo "=== Running examples (--vm) ==="
-	@failed=""; \
-	for f in examples/*.sema; do \
-		case "$$(basename $$f)" in \
-			web-server.sema|eliza-web.sema) echo "  SKIP $$f (server)"; continue;; \
-			eliza.sema) echo "  SKIP $$f (interactive)"; continue;; \
-		esac; \
-		echo "--- $$f ---"; \
-		if ! timeout 30 cargo run --quiet -- --vm --no-llm "$$f"; then \
-			failed="$$failed $$f"; \
-		fi; \
-	done; \
-	echo "=== Running stdlib examples (--vm) ==="; \
-	for f in examples/stdlib/*.sema; do \
-		echo "--- $$f ---"; \
-		if ! timeout 30 cargo run --quiet -- --vm --no-llm "$$f"; then \
-			failed="$$failed $$f"; \
-		fi; \
-	done; \
-	if [ -n "$$failed" ]; then \
-		echo ""; \
-		echo "=== FAILED (--vm) ==="; \
-		for f in $$failed; do echo "  $$f"; done; \
-		echo ""; \
-	else \
-		echo ""; \
-		echo "=== ALL PASSED (--vm) ==="; \
-	fi
+# Back-compat alias: the tree-walker is retired, so `--tw`/`--vm` are no-ops and
+# there is only one evaluator to run examples on.
+examples-vm: examples
 
 example-notebook: build
 	@echo "=== Running example notebook ==="

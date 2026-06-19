@@ -33,7 +33,7 @@ Every `Value::clone()` is an `Rc::clone()` for heap types (strings, lists, maps)
 
 **Impact:** Measured 1.28× on deriv, 1.10× on closure-storm
 **Effort:** Medium (days)
-**Status:** First batch done (Feb 2026). Second batch (map/string ops) pending.
+**Status:** ✅ Arithmetic/comparison, list/predicate, and map/collection ops (Feb 2026) + string ops (`StringLength`/`StringRef`/`StringAppend`, Jun 2026, shipped v1.19.2). Only `apply`/`display` remain (control-flow/IO — deferred).
 
 The biggest single win. Instead of `CallGlobal("car")` → hash lookup → NativeFn → call, emit dedicated opcodes like `OpCar` that operate directly on the stack in the dispatch loop.
 
@@ -180,17 +180,17 @@ Building with `RUSTFLAGS="-C target-cpu=native"` lets LLVM use the full instruct
 
 ### 12. `#[inline(always)]` audit on hot Value accessors
 
-**Impact:** 5–10% on dispatch-heavy benchmarks
+**Impact:** No measurable suite impact — the hot path was already inlined.
 **Effort:** Small (hours)
-**Status:** Not started
+**Status:** ✅ Done (Jun 2026, shipped v1.19.2). Most hot accessors were already `#[inline(always)]`; added it to `type_name` + `as_str`. (`try_as_small_int`/`is_immediate` don't exist — small-int decode lives inline in `as_int`/`as_float`/`view`, which is deliberately NOT force-inlined as it's a large refcount-bumping match.)
 
-Ensure the hottest `Value` methods are `#[inline(always)]`: `try_as_small_int()`, `as_int()`, `as_float()`, `is_truthy()`, `view()`, `raw_tag()`, `is_immediate()`, `type_name()`. Without this annotation, LLVM may choose not to inline across crate boundaries even with LTO, especially for methods called from tight loops in `sema-vm`. Verify with `cargo-asm` or `samply` that these are actually inlined in the dispatch loop.
+Ensure the hottest `Value` methods are `#[inline(always)]`: `as_int()`, `as_float()`, `is_truthy()`, `view()`, `raw_tag()`, `type_name()`. Without this annotation, LLVM may choose not to inline across crate boundaries even with LTO, especially for methods called from tight loops in `sema-vm`. Verify with `cargo-asm` or `samply` that these are actually inlined in the dispatch loop.
 
 ### 13. Profile-Guided Optimization (PGO)
 
 **Impact:** Measured **−11% to −40%** (1BRC −25%/−27% best, higher-order-fold −40%, tak −32%, mandelbrot −29%, deriv/hashmap/bench-features ≈ −21–22%). The single biggest free win — it reorders the `match op` dispatch hot blocks by real opcode frequency.
 **Effort:** Medium (set up PGO pipeline)
-**Status:** ⏳ Measured locally (Jun 2026), NOT yet wired into release. Pipeline: `cargo build` with `-C profile-generate` → run the **full** bench suite + 1BRC as training → `llvm-profdata merge` (binary lives in the rustlib bin dir, not PATH) → rebuild with `-C profile-use`. **Train on a representative corpus**: a partial corpus regressed `bench-features` +29%; full-suite training fixed it (→ −21%, no regressions). Next step is integrating this into cargo-dist/CI release builds with a committed training corpus.
+**Status:** ✅ Shipped in v1.19.2 (Jun 2026) — wired into cargo-dist release CI via dist's `github-build-setup` (`.github/pgo-setup.yml`), and runnable locally with `make build-pgo` (`scripts/pgo-build.sh`). Pipeline: `cargo build` with `-C profile-generate` → run the **full** bench suite + 1BRC as training → `llvm-profdata merge` (binary lives in the rustlib bin dir, not PATH) → rebuild with `-C profile-use`. PGO runs on native release targets only; cross-compiled `aarch64-linux` and Windows fall back to fat LTO (POSIX-path/MSVC quirk), and the step is fail-safe (any failure ships LTO, never breaks the release). **Train on a representative corpus**: a partial corpus regressed `bench-features` +29%; full-suite training fixed it (→ −21%, no regressions). Validated green across all 5 targets via a CI smoke test (`pr-run-mode=upload` on a throwaway branch, no publish) — which caught two real bugs (libudev dep ordering on Linux; Windows path) before they shipped. `cargo install` builds get fat LTO but not PGO (PGO needs the training step).
 
 Use Rust's PGO support (`-C profile-generate` / `-C profile-use`) with representative Sema benchmarks (tak, 1BRC, deriv) as the training workload. This lets LLVM:
 - Lay out the dispatch function's basic blocks optimally for actual opcode frequency

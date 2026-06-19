@@ -171,6 +171,12 @@ Key optimizations that remain in the runtime:
 - **COW map mutation:** `assoc` mutates in-place when the `Rc` refcount is 1 (which `file/fold-lines` ensures by moving, not cloning, the accumulator)
 - **`hashmap/new`:** Amortized O(1) lookup via `hashbrown` instead of O(log n) `BTreeMap`
 - **Bytecode VM:** The VM compiles to bytecode before execution, eliminating tree-walking overhead. Recent VM work (per-instruction inline cache, open upvalues, forward-reference resolution in inner defines) has tightened the inner loop further since v1.9.0.
+- **Inline string opcodes (v1.19.2):** `string-length`, `string-ref`, and `string-append` compile to dedicated VM opcodes, bypassing the generic `CallGlobal` → hash-lookup → native-fn path.
+- **Fat LTO + PGO (v1.19.2):** Release binaries are built with fat link-time optimization (measured 3–9%) and **profile-guided optimization** — PGO trains the compiler on the benchmark suite + a 1BRC sample, then rebuilds with the profile, reordering the VM's dispatch hot blocks by real opcode frequency.
+
+::: warning Benchmark tables are pre-PGO
+The Sema rows in the tables above were measured **before** v1.19.2's profile-guided optimization. On the same hardware this session, PGO measured **~25–29% faster on this 1BRC workload** (and −11% to −40% across compute benchmarks). The shipped v1.19.2 release binaries (cargo-dist / Homebrew) are materially faster than the numbers above; the published tables are not yet re-run because the other dialects' numbers come from the same original measurement environment and a fair comparison requires re-running the whole matrix together. (`cargo install` builds get fat LTO but not PGO.)
+:::
 
 See the [Performance Internals](./performance.md) page for the optimization journey.
 

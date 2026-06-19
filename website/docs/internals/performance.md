@@ -336,6 +336,13 @@ Each `LoadGlobal`/`CallGlobal` instruction gets a dedicated cache slot at compil
 
 Slots 0–3 have dedicated zero-operand opcodes (`LoadLocal0`..`LoadLocal3`, `StoreLocal0`..`StoreLocal3`), saving 2 bytes per access to the most common local variable slots.
 
+## Build Tuning: Fat LTO + PGO (v1.19.2)
+
+Beyond the VM itself, the **distributed binaries** are optimized at build time:
+
+- **Fat LTO** (`lto = "fat"` on the `release`/`dist` profiles): lets LLVM inline across crate boundaries — the dispatch loop in `sema-vm` calls `sema-core` value accessors (`view`, `as_int`, `type_name`, …) millions of times per benchmark, and thin LTO can't always inline those. Measured 3–9% across the suite, at the cost of ~2× longer release builds.
+- **Profile-Guided Optimization (PGO):** the cargo-dist GitHub-release binaries and Homebrew bottle are built with PGO. The build instruments the binary, trains it on the full benchmark suite + a 1BRC sample, merges the profile with `llvm-profdata`, then rebuilds — letting LLVM lay out the `match op` dispatch hot blocks by _measured_ opcode frequency. Measured **~25–29% faster on 1BRC** and **−11% to −40% on compute benchmarks** (higher-order-fold −40%, tak −32%, deriv/hashmap −22%). It runs on native release targets via cargo-dist's `github-build-setup`; cross-compiled and Windows targets fall back to fat LTO, and the step is fail-safe (a PGO failure ships LTO, never breaks the release). Run it locally with `make build-pgo`. (`cargo install` builds get fat LTO but not PGO — PGO needs the training step.)
+
 ## Rejected Optimizations
 
 Not everything we tried worked:
@@ -346,6 +353,7 @@ Not everything we tried worked:
 | **im-rc / rpds (persistent collections)** | Slower       | Structural sharing fights the COW optimization — the whole point is to _avoid_ sharing and mutate in place when refcount is 1.                                                      |
 | **bumpalo / typed-arena**                 | Incompatible | Values need to escape the arena (returned from functions, stored in environments). Arena allocation only works for temporaries.                                                     |
 | **compact_str / smol_str**                | Redundant    | Once symbols/keywords are interned as `Spur`, small-string optimization for them is pointless. String _values_ are still `Rc<String>` but they're not in the hot path for dispatch. |
+| **`target-cpu=native`**                   | No-op (this workload) | Tested Jun 2026: the VM dispatch loop is branch-bound, not SIMD-bound, and the generic `aarch64` target already uses NEON on Apple Silicon. Zero measurable gain — and it breaks portable/distributable binaries, so it is not used.                                 |
 
 > **Note:** "Full evaluator callback" was previously listed here as rejected (4x slower than mini-eval). It became the **tree-walker's architecture** — the ~2.7× overhead vs the mini-eval was accepted as the cost of architectural correctness. The bytecode VM, now Sema's sole evaluator, bypasses this overhead by compiling directly to bytecode.
 

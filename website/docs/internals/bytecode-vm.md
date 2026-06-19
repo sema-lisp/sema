@@ -6,7 +6,7 @@ Sema compiles to bytecode and runs on the VM. Every entry point — the CLI, the
 
 ## Overview
 
-Sema's evaluator is a bytecode VM. The VM compiles Sema source code into stack-based bytecode for fast execution. On compute-heavy workloads it is fast — 500 iterations of the TAK benchmark `(tak 18 12 6)` run in roughly 1.9 s (≈3.7 ms/iteration) in a release build on a modern laptop.
+Sema's evaluator is a bytecode VM. The VM compiles Sema source code into stack-based bytecode for fast execution. On compute-heavy workloads it is fast — 500 iterations of the TAK benchmark `(tak 18 12 6)` run in roughly 1.9 s (≈3.7 ms/iteration) in a plain release build on a modern laptop. The PGO-optimized release binaries shipped via cargo-dist / Homebrew (v1.19.2+) run this benchmark ~30% faster again; see [Performance Internals](./performance.md).
 
 Macro expansion and dynamic `eval` are handled by `sema-eval`, which expands macros to a `Value` AST and then feeds them through the same compile-to-bytecode pipeline.
 

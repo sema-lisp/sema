@@ -74,6 +74,8 @@ All 10 original VM bugs from the early bring-up are fixed:
 
 ## Performance
 
+> **Note (Jun 2026):** the numbers below are **pre-PGO** and from older runs. v1.19.2 shipped fat LTO (3–9%) and PGO (~25–29% on 1BRC, −11% to −40% on compute) in the release binaries — see [Performance Roadmap](performance-roadmap.md) §10/§13. Re-measure before relying on these.
+
 - **1BRC (10M rows, VM):** ~15.9s — dominated by Rc/drop (~35%), VM dispatch (16.5%), HashMap::clone (5.8%)
 - **Compute benchmarks (VM):** TAK 8.04s, deriv 1.84s (post-NaN-boxing)
 - **VM vs (retired) tree-walker:** the VM was ~1.7–2× faster on compute-heavy workloads, which motivated retiring the tree-walker

@@ -51,9 +51,11 @@ struct Task {
     cancelled: bool,
     /// Value to pass to the VM on resume (set by `wake_blocked_tasks`).
     resume_value: Option<Value>,
-    /// Deadline for sleep-blocked tasks (None if not sleeping).
-    #[cfg(not(target_arch = "wasm32"))]
-    sleep_deadline: Option<std::time::Instant>,
+    /// Logical wake time (in scheduler virtual-clock milliseconds) for a
+    /// sleep-blocked task; `None` when the task is not sleeping. The task
+    /// resumes once `Scheduler::virtual_now >= wake_at`. See the module-level
+    /// note on the virtual clock.
+    wake_at: Option<u64>,
 }
 
 // ── Scheduler ──────────────────────────────────────────────────────
@@ -66,6 +68,15 @@ pub struct Scheduler {
     globals: Rc<Env>,
     /// Native function spurs for resolving the native dispatch table in child VMs.
     native_spurs: Vec<Spur>,
+    /// Virtual clock in milliseconds (see the module-level note). `async/sleep`
+    /// and `async/timeout` are measured against this logical clock, not the
+    /// wall clock. It only advances when no task can make progress (every task
+    /// is blocked), at which point it jumps to the nearest pending deadline —
+    /// so ordering by duration is exact and deterministic on every platform.
+    /// On native targets the scheduler also waits the corresponding real time
+    /// when it advances, preserving wall-clock pacing for CLI scripts; in WASM
+    /// (where blocking the UI thread is forbidden) it advances instantly.
+    virtual_now: u64,
 }
 
 impl Scheduler {
@@ -76,6 +87,7 @@ impl Scheduler {
             next_id: 1,
             globals,
             native_spurs,
+            virtual_now: 0,
         }
     }
 
@@ -126,8 +138,7 @@ impl Scheduler {
             started: false,
             cancelled: false,
             resume_value: None,
-            #[cfg(not(target_arch = "wasm32"))]
-            sleep_deadline: None,
+            wake_at: None,
         });
 
         Ok(promise)
@@ -146,6 +157,7 @@ impl Scheduler {
             Fail(String),
         }
 
+        let now = self.virtual_now;
         for task in &mut self.tasks {
             if task.cancelled {
                 if !matches!(task.state, TaskState::Done | TaskState::Failed) {
@@ -192,29 +204,18 @@ impl Scheduler {
                             }
                         }
                     }
-                    YieldReason::Sleep(_ms) => {
-                        #[cfg(not(target_arch = "wasm32"))]
-                        {
-                            // Set deadline on first check if not already set
-                            if task.sleep_deadline.is_none() {
-                                task.sleep_deadline = Some(
-                                    std::time::Instant::now()
-                                        + std::time::Duration::from_millis(*_ms),
-                                );
-                            }
-                            if task
-                                .sleep_deadline
-                                .is_none_or(|d| std::time::Instant::now() >= d)
-                            {
-                                task.sleep_deadline = None;
-                                WakeAction::Resume(Value::nil())
-                            } else {
-                                WakeAction::Pending
-                            }
-                        }
-                        #[cfg(target_arch = "wasm32")]
-                        {
+                    YieldReason::Sleep(ms) => {
+                        // Arm the logical wake time on first sight, then resume
+                        // once the virtual clock has reached it. Time only
+                        // advances when every task is blocked (see
+                        // `run_until_reentrant`), so a shorter sleep always
+                        // wakes before a longer one regardless of spawn order.
+                        let wake_at = *task.wake_at.get_or_insert(now.saturating_add(*ms));
+                        if now >= wake_at {
+                            task.wake_at = None;
                             WakeAction::Resume(Value::nil())
+                        } else {
+                            WakeAction::Pending
                         }
                     }
                 };
@@ -337,8 +338,7 @@ pub(crate) fn run_closure_as_inline_task(
         state: TaskState::Ready,
         cancelled: false,
         resume_value: None,
-        #[cfg(not(target_arch = "wasm32"))]
-        sleep_deadline: None,
+        wake_at: None,
     });
 
     // Re-enter the scheduler with this promise as the wait target. The
@@ -377,26 +377,24 @@ fn run_scheduler_callback(
 
 struct RunGoal<'a> {
     target: &'a SchedulerTarget,
-    #[cfg(not(target_arch = "wasm32"))]
-    deadline: Option<std::time::Instant>,
+    /// Logical deadline (scheduler virtual-clock ms) for a `Timeout` target;
+    /// `None` for non-timeout goals. Measured against `Scheduler::virtual_now`.
+    deadline: Option<u64>,
 }
 
 impl<'a> RunGoal<'a> {
-    fn new(target: &'a SchedulerTarget) -> Self {
-        #[cfg(not(target_arch = "wasm32"))]
+    /// `start` is the scheduler's virtual clock when the goal begins, so a
+    /// `Timeout(_, ms)` deadline is `start + ms` in logical time.
+    fn new(target: &'a SchedulerTarget, start: u64) -> Self {
         let deadline = match target {
-            SchedulerTarget::Timeout(_, ms) => {
-                Some(std::time::Instant::now() + std::time::Duration::from_millis(*ms))
-            }
+            SchedulerTarget::Timeout(_, ms) => Some(start.saturating_add(*ms)),
             _ => None,
         };
-        RunGoal {
-            target,
-            #[cfg(not(target_arch = "wasm32"))]
-            deadline,
-        }
+        RunGoal { target, deadline }
     }
 
+    /// Goal status: `Some(Complete)` once the target promise(s) settle. Timing
+    /// out is handled separately in the run loop (see `status`'s `Timeout` arm).
     fn status(&self) -> Option<SchedulerRunResult> {
         match self.target {
             SchedulerTarget::All => None,
@@ -418,38 +416,20 @@ impl<'a> RunGoal<'a> {
                 .any(|p| !matches!(&*p.state.borrow(), PromiseState::Pending))
                 .then_some(SchedulerRunResult::Complete),
             SchedulerTarget::Timeout(promise, _) => {
-                if !matches!(&*promise.state.borrow(), PromiseState::Pending) {
-                    return Some(SchedulerRunResult::Complete);
-                }
-                #[cfg(not(target_arch = "wasm32"))]
-                if self
-                    .deadline
-                    .is_some_and(|deadline| std::time::Instant::now() >= deadline)
-                {
-                    return Some(SchedulerRunResult::TimedOut);
-                }
-                None
+                // Only the *resolved* case is decided here. Timing out is decided
+                // in the run loop's all-blocked branch (after ready tasks have had
+                // a turn and the virtual clock has actually advanced to the
+                // deadline), so a 0 ms / very short timeout still lets work that is
+                // synchronously ready complete instead of tripping pre-emptively.
+                (!matches!(&*promise.state.borrow(), PromiseState::Pending))
+                    .then_some(SchedulerRunResult::Complete)
             }
         }
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
-    fn sleep_limit(&self) -> Option<std::time::Instant> {
+    /// Logical deadline to clamp virtual-time advancement against, if any.
+    fn sleep_limit(&self) -> Option<u64> {
         self.deadline
-    }
-
-    #[cfg(not(target_arch = "wasm32"))]
-    fn has_timeout(&self) -> bool {
-        self.deadline.is_some()
-    }
-
-    #[cfg(target_arch = "wasm32")]
-    fn pending_timeout_target(&self) -> bool {
-        matches!(
-            self.target,
-            SchedulerTarget::Timeout(promise, _)
-                if matches!(&*promise.state.borrow(), PromiseState::Pending)
-        )
     }
 }
 
@@ -520,7 +500,7 @@ fn run_until_reentrant(
     target: &SchedulerTarget,
 ) -> Result<SchedulerRunResult, SemaError> {
     const MAX_TICKS: u64 = 1_000_000;
-    let goal = RunGoal::new(target);
+    let goal = RunGoal::new(target, sched.virtual_now);
 
     for _ in 0..MAX_TICKS {
         if let Some(result) = goal.status() {
@@ -544,51 +524,54 @@ fn run_until_reentrant(
                 .iter()
                 .any(|t| matches!(t.state, TaskState::Blocked(_)));
             if has_blocked {
-                // Check if any blocked task is sleeping — if so, wait for
-                // its deadline. A sleeping task may unblock channel/promise
-                // waiters when it resumes, so we must not declare deadlock.
-                let any_sleeping = sched
+                // Nothing can make progress right now, so advance the virtual
+                // clock to the nearest pending deadline: the earliest sleeper's
+                // wake time, clamped by any `async/timeout` deadline. Jumping to
+                // that instant (rather than polling) is what makes sleep
+                // ordering exact and deterministic. A sleeping task may unblock
+                // channel/promise waiters when it resumes, so advancing time is
+                // not a deadlock.
+                let next_sleep = sched
                     .tasks
                     .iter()
-                    .any(|t| matches!(t.state, TaskState::Blocked(YieldReason::Sleep(_))));
-                #[cfg(target_arch = "wasm32")]
-                if goal.pending_timeout_target() {
-                    return Ok(SchedulerRunResult::TimedOut);
-                }
-                if any_sleeping {
+                    .filter(|t| matches!(t.state, TaskState::Blocked(YieldReason::Sleep(_))))
+                    .filter_map(|t| t.wake_at)
+                    .min();
+                let next = match (next_sleep, goal.sleep_limit()) {
+                    (Some(a), Some(b)) => Some(a.min(b)),
+                    (Some(a), None) | (None, Some(a)) => Some(a),
+                    (None, None) => None,
+                };
+                if let Some(target_time) = next {
+                    // On native, pass real wall-clock time so CLI scripts that
+                    // sleep for pacing/rate-limiting still wait. In WASM the UI
+                    // thread must not block, so the clock advances instantly.
+                    // `async/sleep`/`async/timeout` durations are capped (see
+                    // async_ops.rs), so `delta` here is bounded (≤ ~1 day) and
+                    // can't wedge the thread on a single multi-year sleep.
                     #[cfg(not(target_arch = "wasm32"))]
                     {
-                        // Find the nearest sleep deadline and wait
-                        let mut nearest = sched.tasks.iter().filter_map(|t| t.sleep_deadline).min();
-                        if let Some(timeout) = goal.sleep_limit() {
-                            nearest = Some(nearest.map_or(timeout, |sleep| sleep.min(timeout)));
-                        }
-                        if let Some(deadline) = nearest {
-                            let now = std::time::Instant::now();
-                            if deadline > now {
-                                std::thread::sleep(deadline - now);
-                            }
+                        let delta = target_time.saturating_sub(sched.virtual_now);
+                        if delta > 0 {
+                            std::thread::sleep(std::time::Duration::from_millis(delta));
                         }
                     }
-                    continue; // Re-check after sleeping
-                }
-                #[cfg(not(target_arch = "wasm32"))]
-                if goal.has_timeout() {
-                    if let Some(deadline) = goal.sleep_limit() {
-                        let now = std::time::Instant::now();
-                        if deadline > now {
-                            std::thread::sleep(deadline - now);
-                        }
+                    sched.virtual_now = target_time;
+
+                    // If we've reached the timeout deadline with the target still
+                    // pending, the operation has timed out. Decided here (not in
+                    // `status`) so a 0 ms timeout still lets synchronously-ready
+                    // work finish before this point is ever reached.
+                    if goal.sleep_limit().is_some_and(|dl| sched.virtual_now >= dl) {
+                        return Ok(SchedulerRunResult::TimedOut);
                     }
-                    continue;
+                    continue; // Re-check: wake sleepers / make progress.
                 }
+                // No sleepers and no timeout — genuinely stuck (e.g. awaiting a
+                // promise that can never resolve).
                 return Err(SemaError::eval(
                     "async scheduler: all tasks blocked (deadlock detected)",
                 ));
-            }
-            #[cfg(target_arch = "wasm32")]
-            if goal.pending_timeout_target() {
-                return Ok(SchedulerRunResult::TimedOut);
             }
             return Ok(SchedulerRunResult::Complete);
         };

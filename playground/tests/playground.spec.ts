@@ -117,6 +117,22 @@ test('runs code with the bytecode VM', async ({ page }) => {
   expect(timing).toContain('bytecode VM');
 });
 
+test('async/sleep ordering works in WASM (virtual clock)', async ({ page }) => {
+  // Regression guard for the virtual clock: in WASM async/sleep has no real
+  // delay, but shorter sleeps must still wake before longer ones. Tasks are
+  // spawned c/a/b but sleep 30/10/20 — output must be a, b, c.
+  const code = `(async/all
+  (list (async (async/sleep 30) (println "c"))
+        (async (async/sleep 10) (println "a"))
+        (async (async/sleep 20) (println "b"))))`;
+  await setEditorCode(page, code);
+  await clickRunAndWait(page);
+  const lines = await page.$$eval('#output .output-line', els =>
+    els.map(el => el.textContent)
+  );
+  expect(lines).toEqual(['a', 'b', 'c']);
+});
+
 test('evaluates a recursive fib correctly', async ({ page }) => {
   const code = `(define (fib n)
   (define (go a b i)

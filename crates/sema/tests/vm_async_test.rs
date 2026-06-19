@@ -247,6 +247,52 @@ fn async_sleep_returns_nil() {
     );
 }
 
+#[test]
+fn sleep_duration_determines_wake_order_not_spawn_order() {
+    // Three tasks spawned in the order c, a, b but sleeping 30/10/20ms. The
+    // virtual clock must wake them in *duration* order (a, b, c) regardless of
+    // spawn order — the drained channel proves it. This is deterministic on
+    // every platform (and instant in WASM, where the virtual clock advances
+    // without real waits).
+    let out = eval_vm(
+        r#"
+        (let ((out (channel/new 8)))
+          (async/all
+            (list (async (async/sleep 30) (channel/send out :c))
+                  (async (async/sleep 10) (channel/send out :a))
+                  (async (async/sleep 20) (channel/send out :b))))
+          (list (channel/recv out) (channel/recv out) (channel/recv out)))
+    "#,
+    );
+    assert_eq!(
+        out,
+        Value::list(vec![
+            Value::keyword("a"),
+            Value::keyword("b"),
+            Value::keyword("c"),
+        ])
+    );
+}
+
+#[test]
+fn equal_sleeps_wake_in_spawn_order() {
+    // Equal durations fall back to deterministic spawn (FIFO) order.
+    let out = eval_vm(
+        r#"
+        (let ((out (channel/new 8)))
+          (async/all
+            (list (async (async/sleep 5) (channel/send out 1))
+                  (async (async/sleep 5) (channel/send out 2))
+                  (async (async/sleep 5) (channel/send out 3))))
+          (list (channel/recv out) (channel/recv out) (channel/recv out)))
+    "#,
+    );
+    assert_eq!(
+        out,
+        Value::list(vec![Value::int(1), Value::int(2), Value::int(3)])
+    );
+}
+
 // === Error cases ===
 
 #[test]
@@ -437,6 +483,38 @@ fn timeout_beats_sleeping_task() {
     assert!(
         err.contains("timed out"),
         "expected timeout before sleep completion, got: {err}"
+    );
+}
+
+#[test]
+fn timeout_zero_lets_ready_work_complete() {
+    // A 0 ms timeout must still let synchronously-ready work finish — it only
+    // trips once the virtual clock actually reaches the deadline with the task
+    // still pending. (Regression guard: the deadline used to be checked before
+    // the ready task ran, so this timed out instead of returning the value.)
+    assert_eq!(eval_vm("(async/timeout 0 (async 42))"), Value::int(42));
+    assert_eq!(
+        eval_vm("(async/timeout 1 (async (+ 20 22)))"),
+        Value::int(42)
+    );
+}
+
+#[test]
+fn timeout_zero_still_expires_on_blocking_work() {
+    // ...but a 0 ms timeout on work that genuinely blocks still expires.
+    let err = eval_vm_err("(async/timeout 0 (async (channel/recv (channel/new 1))))");
+    assert!(err.contains("timed out"), "expected timeout, got: {err}");
+}
+
+#[test]
+fn sleep_duration_is_capped() {
+    // An out-of-range sleep is rejected up front; otherwise the native virtual
+    // clock would wait the whole delta in one multi-year thread::sleep (and the
+    // logical clock could overflow).
+    let err = eval_vm_err("(await (async (async/sleep 9223372036854775807) 1))");
+    assert!(
+        err.contains("exceeds maximum"),
+        "expected sleep cap error, got: {err}"
     );
 }
 

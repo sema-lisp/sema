@@ -398,6 +398,18 @@ fn register_promise_ops(env: &Env) {
                 "async/sleep: duration must be non-negative",
             ));
         }
+        // Cap the duration (mirrors async/timeout). The scheduler's virtual
+        // clock jumps straight to a sleeper's wake time and, on native, waits
+        // that whole delta in one `thread::sleep`; without a bound an
+        // out-of-range duration would wedge the thread for years and could
+        // overflow the virtual clock.
+        const MAX_SLEEP_MS: i64 = 86_400_000; // 1 day
+        if ms > MAX_SLEEP_MS {
+            return Err(SemaError::eval(format!(
+                "async/sleep: duration {ms} ms exceeds maximum {MAX_SLEEP_MS} ms (1 day)"
+            ))
+            .with_hint("use a shorter sleep, or loop with smaller sleeps"));
+        }
         if in_async_context() {
             if let Some(cached) = take_resume_value() {
                 return Ok(cached);

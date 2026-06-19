@@ -54,10 +54,17 @@ jobs:
             fi
           }
 
+          # Dependency order: a crate's path-deps must already be on crates.io.
           publish sema-core
           publish sema-reader
           publish sema-vm
           publish sema-llm
           publish sema-stdlib
           publish sema-eval
+          publish sema-docs
+          publish sema-fmt
+          publish sema-dap
+          publish sema-notebook
+          publish sema-lsp
+          publish sema-mcp
           publish sema-lang

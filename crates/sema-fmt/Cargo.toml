@@ -3,6 +3,8 @@ name = "sema-fmt"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+description = "Code formatter for Sema source files"
 
 [dependencies]
 sema-core.workspace = true

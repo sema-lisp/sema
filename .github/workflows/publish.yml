@@ -18,6 +18,7 @@ on:
   push:
     tags:
       - 'v*'
+  workflow_dispatch: # allow re-running a partially-failed publish against main
 
 jobs:
   publish:
@@ -27,19 +28,29 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
+      # sema-stdlib pulls in serialport -> libudev-sys, whose `cargo publish`
+      # verify-build needs libudev. Without this the last three crates fail to
+      # publish (and the old loop masked it as "already published").
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y libudev-dev pkg-config
+
       - name: Publish crates
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: |
           set -e
 
+          # Idempotent: skip crates already on crates.io, but FAIL LOUDLY on any
+          # other error (a real publish failure must not look like success).
           publish() {
             echo "Publishing $1..."
-            if cargo publish -p "$1" 2>&1; then
-              echo "Waiting for $1 to propagate..."
-              sleep 30
-            else
+            out=$(cargo publish -p "$1" 2>&1) && { echo "$out"; echo "Waiting for $1 to propagate..."; sleep 30; return 0; }
+            if echo "$out" | grep -qiE "already (uploaded|exists)"; then
               echo "$1 already published, skipping"
+            else
+              echo "$out"
+              echo "::error::Publishing $1 failed"
+              exit 1
             fi
           }
 

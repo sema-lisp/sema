@@ -48,6 +48,10 @@ SKIP_FILES=(
                                   # smoke run). Same rationale as
                                   # build-examples.sh. HTTP is covered by the
                                   # ignored integration suite (make test-http).
+  "examples/glados-downloads.sema" # LLM demo: calls llm/extract + llm/auto-
+                                  # configure, which hit a provider (e.g. Ollama
+                                  # at localhost:11434). Passes only where a
+                                  # provider is reachable; must not gate CI.
 )
 
 is_skipped() {

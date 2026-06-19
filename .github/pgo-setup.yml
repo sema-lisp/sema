@@ -24,6 +24,13 @@
       echo "PGO: target '$PGO_TARGETS' != host '$HOST' — skipping (cross-compile or non-build job); plain LTO build."
       exit 0
     fi
+    # PGO only on Linux/macOS. Windows git-bash yields POSIX paths (/d/a/...) that
+    # the native MSVC rustc rejects in -Cprofile-use, and that failure lands in
+    # dist build (not fail-safe). Windows ships a plain LTO build.
+    case "$(uname -s)" in
+      Linux|Darwin) ;;
+      *) echo "PGO: $(uname -s) unsupported for PGO here — skipping; plain LTO build."; exit 0 ;;
+    esac
     # This step runs BEFORE dist's own "Install dependencies" step, so the build
     # deps it declares (apt: libudev-dev) aren't present yet — install them here
     # or the instrumented build fails on libudev-sys.

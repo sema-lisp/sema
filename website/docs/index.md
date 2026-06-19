@@ -22,7 +22,7 @@ Install pre-built binaries (no Rust required):
 curl -fsSL https://sema-lang.com/install.sh | sh
 
 # Windows (PowerShell)
-powershell -ExecutionPolicy ByPass -c "irm https://github.com/HelgeSverre/sema/releases/latest/download/sema-lang-installer.ps1 | iex"
+powershell -ExecutionPolicy ByPass -c "irm https://sema-lang.com/install.ps1 | iex"
 
 # Homebrew (macOS / Linux)
 brew install helgesverre/tap/sema-lang

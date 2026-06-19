@@ -1,4 +1,11 @@
 <script setup>
+import { ref } from 'vue'
+
+// Mobile nav menu (hamburger) state.
+const menuOpen = ref(false)
+const toggleMenu = () => { menuOpen.value = !menuOpen.value }
+const closeMenu = () => { menuOpen.value = false }
+
 // TODO: extract into util function and re-use everywhere thisis needed
 const copyText = (id, event) => {
   const el = document.getElementById(id);
@@ -33,7 +40,16 @@ const copyText = (id, event) => {
               fill="#c8a855" />
           </svg>
         </a>
-        <div class="nav-links">
+        <button
+          class="nav-toggle"
+          :class="{ open: menuOpen }"
+          :aria-expanded="menuOpen"
+          aria-label="Toggle navigation menu"
+          @click="toggleMenu"
+        >
+          <span></span><span></span><span></span>
+        </button>
+        <div class="nav-links" :class="{ open: menuOpen }" @click="closeMenu">
           <a href="/docs/">Guide</a>
           <a href="/docs/stdlib/">Stdlib</a>
           <a href="/docs/llm/">LLM</a>
@@ -72,8 +88,10 @@ const copyText = (id, event) => {
         </div>
         <div class="hero-actions">
         <span class="install">
-          <span class="dollar">$</span>
-          <span id="i1">curl -fsSL https://sema-lang.com/install.sh | sh</span>
+          <span class="cmd-text">
+            <span class="dollar">$</span>
+            <span id="i1">curl -fsSL https://sema-lang.com/install.sh | sh</span>
+          </span>
           <button class="copy" @click="copyText('i1', $event)">copy</button>
         </span>
         </div>
@@ -456,6 +474,11 @@ messages = [{<span class="c-str">"role"</span>: <span class="c-str">"user"</span
   --muted: #968c79;
   --dim: #6b6354;
 
+  /* On-brand thin scrollbars for any scroll region on the page (install
+     snippets, code blocks). scrollbar-* are inherited, matching the playground. */
+  scrollbar-width: thin;
+  scrollbar-color: var(--border) transparent;
+
   --font-display: "Cormorant", Georgia, serif;
   --font-body: "Inter", system-ui, sans-serif;
   --font-mono: "JetBrains Mono", ui-monospace, monospace;
@@ -582,6 +605,35 @@ nav {
   width: 18px;
   height: 18px;
 }
+
+/* Hamburger toggle — hidden on desktop, shown on narrow screens. */
+.nav-toggle {
+  display: none;
+  margin-left: auto;
+  flex-direction: column;
+  justify-content: center;
+  gap: 4px;
+  width: 36px;
+  height: 34px;
+  padding: 0;
+  background: none;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+.nav-toggle span {
+  display: block;
+  width: 17px;
+  height: 1.5px;
+  margin: 0 auto;
+  background: var(--text);
+  transition: transform .2s var(--ease), opacity .2s var(--ease);
+}
+
+.nav-toggle.open span:nth-child(1) { transform: translateY(5.5px) rotate(45deg); }
+.nav-toggle.open span:nth-child(2) { opacity: 0; }
+.nav-toggle.open span:nth-child(3) { transform: translateY(-5.5px) rotate(-45deg); }
 
 .wrap {
   max-width: var(--w);
@@ -716,6 +768,7 @@ nav {
   border-radius: 8px;
   padding: 11px 16px;
   color: var(--text);
+  max-width: 100%; /* never exceed the viewport — command text scrolls within */
 }
 
 .install .dollar {
@@ -737,6 +790,7 @@ nav {
   padding: 3px 9px;
   cursor: pointer;
   transition: all .15s;
+  flex-shrink: 0; /* stay visible while the command text scrolls */
 }
 
 .copy:hover {
@@ -1200,6 +1254,28 @@ section {
   gap: 14px;
   text-align: left;
   white-space: nowrap;
+  /* Long install commands scroll horizontally inside the box instead of
+     widening the page (min-width:0 lets this flex child actually shrink). */
+  overflow-x: auto;
+  min-width: 0;
+  flex: 1 1 auto;
+  scrollbar-width: thin;
+}
+
+/* WebKit/Safari scrollbar for the install snippets (scrollbar-color above
+   covers Firefox + Chromium). */
+.custom-home .cmd-text::-webkit-scrollbar {
+  height: 8px;
+}
+.custom-home .cmd-text::-webkit-scrollbar-track {
+  background: transparent;
+}
+.custom-home .cmd-text::-webkit-scrollbar-thumb {
+  background: var(--border);
+  border-radius: 8px;
+}
+.custom-home .cmd-text::-webkit-scrollbar-thumb:hover {
+  background: var(--gold-line);
 }
 
 footer {
@@ -1221,8 +1297,53 @@ footer {
 }
 
 @media (max-width: 880px) {
+  /* Navbar collapses to a hamburger dropdown (was overflowing horizontally). */
+  .nav-toggle {
+    display: flex;
+  }
+
+  .nav-links {
+    position: absolute;
+    top: 100%;
+    left: 0;
+    right: 0;
+    margin-left: 0;
+    flex-direction: column;
+    align-items: stretch;
+    gap: 0;
+    padding: 6px 0;
+    background: rgba(19, 17, 16, 0.97);
+    backdrop-filter: blur(10px);
+    border-bottom: 1px solid var(--border-lo);
+    display: none;
+  }
+
+  .nav-links.open {
+    display: flex;
+  }
+
+  .custom-home .nav-links a {
+    padding: 11px 22px;
+  }
+
+  .custom-home .nav-gh {
+    padding: 11px 22px;
+  }
+
   .compare, .objections, .ship-grid, .agent-grid {
     grid-template-columns: 1fr;
+  }
+
+  /* Stack the install label above its snippet so the command gets full width. */
+  .install-row {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 7px;
+  }
+
+  .install-row .badge {
+    width: auto;
+    text-align: left;
   }
 
   .forms {

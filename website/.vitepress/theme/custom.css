@@ -21,6 +21,36 @@
   --vp-code-bg: #181512;
 }
 
+/* On-brand thin scrollbars across the whole site (docs sidebar, code blocks,
+   content panes). Set on `html` so it inherits everywhere; the custom homepage
+   (.custom-home) sets its own matching values. Matches the playground's themed
+   scrollbar approach. */
+html {
+  scrollbar-width: thin;
+  scrollbar-color: #3a342b transparent;
+}
+
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #3a342b;
+  border-radius: 8px;
+  border: 2px solid transparent;
+  background-clip: padding-box;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: var(--vp-c-brand-1);
+  background-clip: padding-box;
+}
+
 /* Remove max-width constraint on page layout so homepage goes full-width */
 .VPPage {
   padding: 0 !important;

@@ -1,6 +1,9 @@
 import { defineConfig } from 'vitepress'
 // Canonical source: editors/vscode/sema/syntaxes/sema.tmLanguage.json
 import semaLang from './sema.tmLanguage.json'
+// Brand syntax theme — matches the hand-coded snippets + playground palette
+// (gold keywords, green strings, orange numbers, cyan :keywords, dim parens).
+import semaCodeTheme from './sema-code-theme.json'
 import { SITE, OG_WIDTH, OG_HEIGHT, OG_EXT, ogSlug } from './og.shared.mjs'
 
 export default defineConfig({
@@ -287,5 +290,6 @@ export default defineConfig({
 
   markdown: {
     languages: [semaLang as any],
+    theme: { light: semaCodeTheme as any, dark: semaCodeTheme as any },
   },
 })

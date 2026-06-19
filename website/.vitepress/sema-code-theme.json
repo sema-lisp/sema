@@ -1,0 +1,40 @@
+{
+  "name": "sema-dark",
+  "type": "dark",
+  "colors": {
+    "editor.background": "#181512",
+    "editor.foreground": "#e9e3d6"
+  },
+  "tokenColors": [
+    {
+      "scope": ["comment"],
+      "settings": { "foreground": "#6b6354", "fontStyle": "italic" }
+    },
+    {
+      "scope": ["string", "constant.character"],
+      "settings": { "foreground": "#a8c47a" }
+    },
+    {
+      "scope": ["constant.numeric", "constant.language.boolean", "constant.language.nil"],
+      "settings": { "foreground": "#d19a66" }
+    },
+    {
+      "scope": ["constant.other.keyword"],
+      "settings": { "foreground": "#7aacb8" }
+    },
+    {
+      "scope": ["keyword.control", "keyword.control.definition", "keyword.operator.threading"],
+      "settings": { "foreground": "#c8a855" }
+    },
+    {
+      "scope": [
+        "punctuation",
+        "keyword.operator.quote",
+        "keyword.operator.quasiquote",
+        "keyword.operator.unquote",
+        "keyword.operator.unquote-splicing"
+      ],
+      "settings": { "foreground": "#6a6258" }
+    }
+  ]
+}

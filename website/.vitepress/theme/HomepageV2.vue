@@ -54,7 +54,6 @@ const copyText = (id, event) => {
           <a href="/docs/stdlib/">Stdlib</a>
           <a href="/docs/llm/">LLM</a>
           <a href="/docs/internals/architecture">Internals</a>
-          <a href="/brand">Brand</a>
           <a href="https://sema.run" target="_blank" rel="noopener" class="vp-external-link-icon ">
             Playground
           </a>
@@ -448,7 +447,8 @@ messages = [{<span class="c-str">"role"</span>: <span class="c-str">"user"</span
         <a href="/docs/">Docs</a> ·
         <a href="/docs/internals/lisp-comparison.html">Benchmarks</a> ·
         <a href="https://github.com/HelgeSverre/sema/blob/main/CHANGELOG.md">Changelog</a> ·
-        <a href="https://github.com/HelgeSverre/sema">GitHub</a>
+        <a href="https://github.com/HelgeSverre/sema">GitHub</a> ·
+        <a href="/brand">Brand</a>
       </span>
       </div>
     </footer>

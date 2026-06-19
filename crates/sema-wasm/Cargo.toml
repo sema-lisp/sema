@@ -32,6 +32,7 @@ web-sys = { workspace = true, features = [
     "Response",
     "AbortController",
     "AbortSignal",
+    "XmlHttpRequest",
 ] }
 
 [package.metadata.cargo-machete]

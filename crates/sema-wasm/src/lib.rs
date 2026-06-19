@@ -314,6 +314,15 @@ fn wasm_http_request(
 
     let key = http_cache_key(method, url, body_str.as_deref(), &headers);
 
+    // In a Web Worker there is no `window`. Do a real *synchronous* XHR: it
+    // blocks the worker thread and returns the response directly, so http works
+    // without the main-thread replay-the-whole-program hack — and it composes
+    // correctly with real `Atomics.wait` sleeps (no re-runs). Cross-origin
+    // targets still need CORS/CORP (a same-origin proxy covers the rest).
+    if web_sys::window().is_none() {
+        return perform_fetch_sync(method, url, body_str.as_deref(), &headers);
+    }
+
     let cached = HTTP_CACHE.with(|c| c.borrow().get(&key).cloned());
     if let Some(val) = cached {
         return Ok(val);
@@ -326,6 +335,61 @@ fn wasm_http_request(
         &headers,
         timeout_ms,
     ))
+}
+
+/// Synchronous HTTP via `XMLHttpRequest` (worker-only — sync XHR is illegal on
+/// the main thread). Blocks the calling (worker) thread until the response,
+/// returning the same `{:status :headers :body}` map shape as `perform_fetch`.
+/// (Per-request timeout is not applied on this path; the worker can be cancelled
+/// via the M6 control buffer instead.)
+fn perform_fetch_sync(
+    method: &str,
+    url: &str,
+    body: Option<&str>,
+    headers: &[(String, String)],
+) -> Result<Value, SemaError> {
+    let xhr = web_sys::XmlHttpRequest::new()
+        .map_err(|_| SemaError::Io("failed to create XMLHttpRequest".to_string()))?;
+    // async = false → synchronous (blocks this worker thread).
+    xhr.open_with_async(method, url, false)
+        .map_err(|e| SemaError::Io(format!("http: open failed: {}", js_err(&e))))?;
+    for (k, v) in headers {
+        let _ = xhr.set_request_header(k, v);
+    }
+    let send = match body {
+        Some(b) => xhr.send_with_opt_str(Some(b)),
+        None => xhr.send(),
+    };
+    send.map_err(|e| SemaError::Io(format!("http: request failed: {}", js_err(&e))))?;
+
+    let status = xhr.status().unwrap_or(0) as i64;
+    let body_text = xhr.response_text().ok().flatten().unwrap_or_default();
+
+    let mut resp_headers = BTreeMap::new();
+    if let Ok(raw) = xhr.get_all_response_headers() {
+        for line in raw.split("\r\n").filter(|l| !l.is_empty()) {
+            if let Some((k, v)) = line.split_once(':') {
+                resp_headers.insert(Value::keyword(k.trim()), Value::string(v.trim()));
+            }
+        }
+    }
+
+    let mut result = BTreeMap::new();
+    result.insert(Value::keyword("status"), Value::int(status));
+    result.insert(Value::keyword("headers"), Value::map(resp_headers));
+    result.insert(Value::keyword("body"), Value::string(&body_text));
+    Ok(Value::map(result))
+}
+
+/// Best-effort string for a JS error value.
+fn js_err(e: &JsValue) -> String {
+    e.as_string()
+        .or_else(|| {
+            js_sys::Reflect::get(e, &JsValue::from_str("message"))
+                .ok()
+                .and_then(|m| m.as_string())
+        })
+        .unwrap_or_else(|| "error".to_string())
 }
 
 /// Perform an HTTP fetch via the browser's `fetch()` API.

@@ -200,6 +200,24 @@ test('worker path: a file written during eval shows up in the file tree (VFS mir
   expect(files.some((f) => f.includes('from-worker.txt'))).toBe(true);
 });
 
+test('worker path: http/get works via synchronous XHR (no replay)', async ({ page }) => {
+  // On the worker, http uses a blocking synchronous XHR instead of the
+  // main-thread replay-the-whole-program hack. Hit a same-origin file so the
+  // test is reliable (no network, no cross-origin CORP/COEP concerns).
+  await page.goto('/?worker');
+  await page.waitForSelector('[data-testid="status"].status-ready', { timeout: 20000 });
+
+  const origin = await page.evaluate(() => location.origin);
+  await setEditorCode(page, `(:status (http/get "${origin}/index.html"))`);
+  await page.getByTestId('run-btn').click();
+  await page.waitForSelector('#output .output-timing', { timeout: 20000 });
+
+  const errors = await page.$$eval('#output .output-error', (els) => els.map((e) => e.textContent || ''));
+  expect(errors.join('\n')).not.toContain('window');
+  const value = await page.$eval('#output .output-value', (el) => el.textContent || '');
+  expect(value).toContain('200');
+});
+
 test('evaluates a recursive fib correctly', async ({ page }) => {
   const code = `(define (fib n)
   (define (go a b i)

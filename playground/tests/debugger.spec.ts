@@ -119,26 +119,36 @@ test.describe('Debugger', () => {
   test('breakpoint: stops at correct line', async ({ page }) => {
     const code = '(define x 10)\n(define y 20)\n(+ x y)';
     await setEditorCode(page, code);
-    
+
     // Set breakpoint on line 3
     await toggleBreakpoint(page, 3);
-    
-    // Click Debug
+
+    // Click Debug. When breakpoints are set, the debugger runs straight to the
+    // first breakpoint (it only stops on entry when no breakpoints exist).
     await page.getByTestId('debug-btn').click();
     await waitForPaused(page);
-    
-    // Should stop on entry (line 1) first since we use StepInto
-    const entryLine = await getCurrentDebugLine(page);
-    console.log(`Entry stop at line: ${entryLine}`);
-    
-    // Continue to breakpoint
-    await page.click('#dbg-continue');
-    await waitForPaused(page);
-    
+
     const bpLine = await getCurrentDebugLine(page);
     console.log(`Breakpoint stop at line: ${bpLine}`);
     expect(bpLine).toBe(3);
-    
+
+    // Continue to end
+    await page.click('#dbg-continue');
+    await waitForIdle(page);
+  });
+
+  test('no breakpoints: stops on entry', async ({ page }) => {
+    const code = '(define x 10)\n(define y 20)\n(+ x y)';
+    await setEditorCode(page, code);
+
+    // No breakpoints set — Debug should pause on entry (the first line).
+    await page.getByTestId('debug-btn').click();
+    await waitForPaused(page);
+
+    const entryLine = await getCurrentDebugLine(page);
+    console.log(`Entry stop at line: ${entryLine}`);
+    expect(entryLine).toBe(1);
+
     // Continue to end
     await page.click('#dbg-continue');
     await waitForIdle(page);
@@ -226,14 +236,11 @@ test.describe('Debugger', () => {
     
     // Set breakpoint on line 2
     await toggleBreakpoint(page, 2);
-    
+
+    // With a breakpoint set, Debug runs straight to it (line 2).
     await page.getByTestId('debug-btn').click();
     await waitForPaused(page);
-    
-    // We're at entry (line 1), continue to breakpoint
-    await page.click('#dbg-continue');
-    await waitForPaused(page);
-    
+
     const firstStop = await getCurrentDebugLine(page);
     console.log(`First breakpoint stop: line ${firstStop}`);
     expect(firstStop).toBe(2);
@@ -253,21 +260,18 @@ test.describe('Debugger', () => {
     
     // Set breakpoint on line 3 (body of do loop)
     await toggleBreakpoint(page, 3);
-    
+
+    // Debug runs straight to the first breakpoint hit (loop iteration 1).
     await page.getByTestId('debug-btn').click();
     await waitForPaused(page);
-    
-    // Continue to first breakpoint hit
-    await page.click('#dbg-continue');
-    await waitForPaused(page);
-    
+
     const firstHit = await getCurrentDebugLine(page);
     console.log(`First loop hit: line ${firstHit}`);
-    
-    // Continue - should hit breakpoint again on next iteration
+
+    // Continue - should hit the same breakpoint again on the next iteration
     await page.click('#dbg-continue');
     await waitForPaused(page);
-    
+
     const secondHit = await getCurrentDebugLine(page);
     console.log(`Second loop hit: line ${secondHit}`);
     expect(secondHit).toBe(firstHit);

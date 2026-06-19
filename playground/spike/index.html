@@ -1,0 +1,53 @@
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>COI + Atomics.wait spike (M1)</title></head>
+<body>
+<h1>Worker real-sleep feasibility spike (M1)</h1>
+<pre id="out" data-testid="out">running…</pre>
+<script>
+  const out = document.getElementById('out');
+  const log = (k, v) => { out.textContent += `\n${k}: ${v}`; };
+
+  const coi = self.crossOriginIsolated;
+  const hasSAB = typeof SharedArrayBuffer !== 'undefined';
+  log('crossOriginIsolated', coi);
+  log('SharedArrayBuffer available', hasSAB);
+
+  // Prove the MAIN thread stays responsive while the worker blocks: a timer
+  // increments a counter every 50ms. If the main thread were blocked (today's
+  // behavior), this would not advance during the worker's 1000ms block.
+  let ticks = 0;
+  const timer = setInterval(() => { ticks++; }, 50);
+
+  async function run() {
+    if (!hasSAB) {
+      window.__spike = { coi, hasSAB, error: 'SharedArrayBuffer unavailable (not cross-origin isolated)' };
+      out.dataset.done = '1';
+      return;
+    }
+    const sab = new SharedArrayBuffer(4);
+    const worker = new Worker('worker.js');
+    const done = new Promise((res) => { worker.onmessage = (e) => res(e.data); });
+    const t0 = performance.now();
+    worker.postMessage({ sab });
+    const w = await done;
+    const mainElapsed = performance.now() - t0;
+    clearInterval(timer);
+    worker.terminate();
+
+    window.__spike = {
+      coi, hasSAB,
+      workerBlockedMs: Math.round(w.elapsed),  // ~1000
+      waitResult: w.res,                        // "timed-out"
+      mainElapsedMs: Math.round(mainElapsed),
+      mainTicksDuringBlock: ticks,              // >0 => main thread stayed live
+    };
+    log('worker blocked (ms)', window.__spike.workerBlockedMs);
+    log('Atomics.wait result', window.__spike.waitResult);
+    log('main-thread ticks during block', window.__spike.mainTicksDuringBlock);
+    out.dataset.done = '1';
+  }
+  run();
+</script>
+</body>
+</html>

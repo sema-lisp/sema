@@ -44,6 +44,27 @@ async def test_hover_user_defined(client: LanguageClient):
 
 
 @pytest.mark.asyncio
+async def test_hover_user_redefinition_shadows_builtin(client: LanguageClient):
+    """Redefining a builtin name should hover the user's definition, not the builtin doc.
+
+    Regression test for L1: hover checked builtin docs before user definitions,
+    so a redefined `map` showed the builtin's doc instead of the local one.
+    """
+    uri = await open_doc(client, "(defun map (f xs) xs)\n(map inc (list 1 2 3))")
+    result = await client.text_document_hover_async(
+        HoverParams(
+            text_document=TextDocumentIdentifier(uri=uri),
+            position=Position(line=1, character=1),  # on the redefined 'map'
+        )
+    )
+    assert result is not None
+    content = result.contents.value if hasattr(result.contents, "value") else str(result.contents)
+    # The user's signature `(map f xs)`, flagged user-defined — not the builtin map doc.
+    assert "User-defined" in content
+    assert "f xs" in content
+
+
+@pytest.mark.asyncio
 async def test_hover_special_form(client: LanguageClient):
     """Hovering over a special form like 'if' should identify it."""
     uri = await open_doc(client, "(if #t 1 0)")

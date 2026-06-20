@@ -156,6 +156,6 @@ that there's no second backend to differentially compare against.
 - `docs/limitations.md` — known gaps and limitations
 - `docs/deferred.md` — items parked with rationale (won't-fix or revisit-later)
 - `docs/plans/` — individual implementation plans, named `YYYY-MM-DD-<slug>.md`
-- `docs/vm-status.md`, `docs/vm-improvements.md`, `docs/performance-roadmap.md` — VM internals reference
+- `docs/vm-status.md`, `docs/performance-roadmap.md` — VM internals reference
 - `docs/IDEAS.md` — feature tracker (consolidated from issues)
 - `docs/bugs/` — short write-ups of specific known test/code issues

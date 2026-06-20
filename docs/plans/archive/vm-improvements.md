@@ -1,5 +1,11 @@
 # VM Improvement Opportunities
 
+> ✅ **ARCHIVED (2026-06-20) — audit concluded.** 9 of 10 items shipped (see the
+> summary matrix), #6 is a documented won't-fix, and the only open item — #10
+> cycle collector / tracing GC — is tracked as **CORE-2** in `docs/deferred.md`.
+> Nothing actionable remains here; kept for historical context. Current VM state
+> lives in `docs/vm-status.md`.
+
 Identified 2026-03-10 during a test coverage audit. Each item rated by effort,
 impact, and risk. Effort is wall-clock time for a single developer who knows the
 codebase.

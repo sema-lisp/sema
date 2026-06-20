@@ -1,5 +1,14 @@
 # Sema Lisp — Style, Security, and Architectural Review
 
+> ✅ **ARCHIVED (2026-06-20) — one-time audit, findings actioned or tracked.** The
+> deep findings shipped (§2.1/§2.2 stack-balance verifier — ADR #56; the §8
+> stabilization items — see the RESOLVED banners with commit refs). The §3 SSRF
+> notes are explicitly out of scope. The §4 "tree-walker vs VM" divergences are
+> moot since the tree-walker was retired in 1.18.0, except the two real residuals
+> tracked in `docs/deferred.md`: VM stack traces (**VM-1**) and the `(type (fn))`
+> → `:native-fn` reflection nit (**C1 follow-up**). Kept for historical context;
+> not a live checklist.
+
 This document presents a deep-dive technical assessment of the **Sema Lisp** monorepo codebase. It evaluates the project's architecture, memory model, compiler/VM safety, language server protocol (LSP) implementation, and sandbox security constraints against the state-of-the-art in Rust system engineering.
 
 Recommendations and findings are backed by citations of standard Rust guidelines (e.g., [mre/idiomatic-rust](https://github.com/mre/idiomatic-rust), the [Rust API Guidelines](https://rust-lang.github.io/api-guidelines/)) and security auditing practices.

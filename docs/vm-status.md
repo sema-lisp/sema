@@ -4,7 +4,7 @@
 
 ## Current State
 
-The bytecode VM (`sema-vm` crate) is the **sole** execution backend. The tree-walking interpreter was retired and its source deleted; the VM is now the only evaluator. The `--tw` CLI flag is a hidden no-op accepted only for backward compatibility — it no longer selects a different evaluator. Async/concurrency features are VM-only by design.
+The bytecode VM (`sema-vm` crate) is the **sole** execution backend. The tree-walking interpreter was retired and its source deleted; the VM is now the only evaluator. The `--tw` and `--vm` CLI flags were removed in 1.18.0 (there is only one evaluator). Async/concurrency features are VM-only by design.
 
 - **sema-vm unit tests:** 524 passing
 - **Evaluator tests:** 840+ test cases across 11 test files (formerly dual-eval; now VM-only)

@@ -1,10 +1,18 @@
 # Performance Optimizations — Implementation Spike Plan
 
+> 📦 **ARCHIVED (2026-06-20) — never started; superseded by a simpler perf pass.**
+> This spike (allocation reduction, unique-Rc fast paths, typed-array kernels,
+> escape analysis, frame-local arenas) was never begun. The perf work that
+> actually shipped in 1.19.x was a separate, simpler initiative — PGO, fat LTO,
+> and inline string opcodes (see CHANGELOG 1.19.2) — none of which this plan
+> proposed. The 25-file `references/` OxCaml documentation mirror was **deleted**
+> on archival (reconstructable from oxcaml.org); only these 3 original Sema docs
+> are kept. Revisit if allocation-bound workloads become a real bottleneck.
+
 > **Status:** Research / filed for a future spike. Not yet started.
 > **Date filed:** 2026-06-07
 > **Inputs:** [`TECHNIQUES.md`](./TECHNIQUES.md) (OxCaml techniques),
-> [`sema-specific-adoptions.md`](./sema-specific-adoptions.md) (per-technique fit for Sema),
-> [`references/`](./references/) (mirrored OxCaml docs).
+> [`sema-specific-adoptions.md`](./sema-specific-adoptions.md) (per-technique fit for Sema).
 > **Relationship to prior work:** complements the existing
 > [VM perf roadmap](../2026-02-17-vm-performance-roadmap.md) (dispatch/arithmetic/call-frames).
 > This plan adds the **allocation-reduction + unboxing + static-analysis** angle.

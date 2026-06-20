@@ -1,5 +1,11 @@
 # Sema LSP Documentation Strategy — Research & Options
 
+> ✅ **ARCHIVED (2026-06-20) — superseded by the `sema-docs` crate.** The fragility
+> this research targeted (the LSP re-parsing website markdown via regex) was
+> solved by making `crates/sema-docs` the structured source of truth for
+> builtin/stdlib docs. The companion plan (`2026-06-09-lsp-followups-and-docs-research.md`)
+> is already archived as superseded. Kept for historical context.
+
 **Date:** 2026-06-09 · **Status:** research only (no implementation) · **Scope:** how to maintain and
 deliver builtin/stdlib documentation to the Sema LSP more robustly than the current "import the
 website markdown" approach, ideally as a single source of truth shared by the website **and** the

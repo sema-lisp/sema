@@ -1,5 +1,10 @@
 # 1BRC VM Profile: Data-Heavy Workload Analysis
 
+> 📎 **Historical snapshot (kept as a baseline).** Captured 2026-02-19, *before*
+> the 1.19.x perf pass (PGO, fat LTO, inline string opcodes — see CHANGELOG
+> 1.19.2, ~25–29% faster on 1BRC). Useful as a pre-optimization reference; the
+> hotspot percentages below predate those changes.
+
 > **Date:** 2026-02-19
 > **Git SHA:** `50f17d2`
 > **Machine:** Apple M2 Max, 32 GB, macOS 15.6 (arm64)

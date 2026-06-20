@@ -1,5 +1,11 @@
 # Comprehensive Loop DSL — Design Research for Sema
 
+> 📦 **ARCHIVED (2026-06-20) — design not adopted.** The full CL-style `loop`
+> grammar (~50 keywords: FOR/COLLECT/ACROSS/UNTIL/…) explored here was never
+> implemented. Sema shipped the simpler counted-iteration macros `dotimes` and
+> `for-range` (in `crates/sema-eval/src/prelude.rs`) instead. Kept for historical
+> context; revisit only if a comprehensive loop DSL is genuinely wanted.
+
 > Deep investigation of CL-style `loop` iteration DSL: architecture, grammar, internals, and how to implement it in Sema.
 > Status: **Research / Pre-Implementation Spec**
 

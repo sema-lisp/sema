@@ -1,10 +1,16 @@
 # Changelog
 
-## Unreleased
+## 1.20.1
+
+Bugfix release. Fixes a VM crash on valid code, found by a new in-language grammar fuzzer.
 
 ### Fixed
 
-- **VM crash: a throwing `try`/`catch` as a non-first binding in a parallel `let` corrupted the operand stack.** `(let ((a 1) (b (try (throw 1) (catch e 2)))) b)` aborted the process instead of returning `2`. `compile_let` pushed all binding inits onto the operand stack without updating `stack_height`, so an exception handler inside a later init restored the stack *below* the earlier already-pushed inits, and subsequent local-slot access went out of bounds. Fixed by tracking `stack_height` across the init pushes/stores (the way call-argument compilation already does). `let*`, `letrec`, and calls were unaffected. Found by the in-language grammar fuzzer.
+- **VM crash: a throwing `try`/`catch` as a non-first binding in a parallel `let` corrupted the operand stack.** `(let ((a 1) (b (try (throw 1) (catch e 2)))) b)` aborted the process instead of returning `2`. `compile_let` pushed all binding inits onto the operand stack without updating `stack_height`, so an exception handler inside a later init restored the stack *below* the earlier already-pushed inits, and subsequent local-slot access went out of bounds. Fixed by tracking `stack_height` across the init pushes/stores (the way call-argument compilation already does). `let*`, `letrec`, and calls were unaffected.
+
+### Added
+
+- **Grammar-based fuzzer written in Sema** (`fuzz/grammar-fuzz.sema`, `make fuzz-grammar`). Generates well-typed, closed programs over int/bool/float/string/list/vector/map and checks two oracles — printer⇄reader round-trip and a differential compiler/VM value oracle (expected computed bottom-up while generating) — plus crash detection, all reproducible from a single integer seed. This is what found the `try`/`let` crash above; the VM then ran 715k generated programs (depths 4–9) clean. Documented at `docs/internals/fuzzing`.
 
 ## 1.20.0
 

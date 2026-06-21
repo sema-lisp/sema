@@ -1243,12 +1243,12 @@ resp = client.messages.create(
                 <td>Lexer and S-Expression reader. Handles f-strings, short lambdas, and regex literals.</td>
               </tr>
               <tr>
-                <td class="inv-name">sema-eval</td>
-                <td>Trampoline-based TCO evaluator, module load system, pattern/destructure engine, macros.</td>
+                <td class="inv-name">sema-vm</td>
+                <td>Bytecode compiler and stack VM — the sole evaluator. Lowerer, optimizers, stack resolution, inline cache.</td>
               </tr>
               <tr>
-                <td class="inv-name">sema-vm</td>
-                <td>Bytecode compiler and stack VM. Optimizers, lowerer, stack resolution, inline cache.</td>
+                <td class="inv-name">sema-eval</td>
+                <td>Interpreter driver: VM-native macro expansion, module load/import system, prelude, eval/call callback wiring.</td>
               </tr>
               <tr>
                 <td class="inv-name">sema-stdlib</td>
@@ -1256,7 +1256,7 @@ resp = client.messages.create(
               </tr>
               <tr>
                 <td class="inv-name">sema-llm</td>
-                <td>Model traits, Anthropic/OpenAI/Gemini clients, pricing database, local cash fallback.</td>
+                <td>Model traits, Anthropic/OpenAI/Gemini/Ollama clients, pricing database, local fallback.</td>
               </tr>
               <tr>
                 <td class="inv-name">sema-lsp</td>
@@ -1269,6 +1269,18 @@ resp = client.messages.create(
               <tr>
                 <td class="inv-name">sema-fmt</td>
                 <td>Custom code formatter and formatter CLI.</td>
+              </tr>
+              <tr>
+                <td class="inv-name">sema-notebook</td>
+                <td>Jupyter-inspired notebook: <code>.sema-nb</code> format, shared-env evaluation engine, HTTP server, embedded UI.</td>
+              </tr>
+              <tr>
+                <td class="inv-name">sema-docs</td>
+                <td>Canonical structured docs for builtins/special forms; generates the JSON index used by the LSP and REPL.</td>
+              </tr>
+              <tr>
+                <td class="inv-name">sema-mcp</td>
+                <td>Model Context Protocol server exposing Sema evaluation and tooling to agents.</td>
               </tr>
               <tr>
                 <td class="inv-name">sema-wasm</td>

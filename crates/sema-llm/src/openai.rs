@@ -1,3 +1,6 @@
+use std::cell::RefCell;
+use std::collections::HashSet;
+
 use serde::{Deserialize, Serialize};
 
 use crate::provider::LlmProvider;
@@ -5,6 +8,33 @@ use crate::types::{
     ChatRequest, ChatResponse, ContentBlock, EmbedRequest, EmbedResponse, LlmError, MessageContent,
     ToolCall, Usage,
 };
+
+thread_local! {
+    /// Models the official OpenAI endpoint has rejected `temperature` on
+    /// (gpt-5.0 / o-series reasoning models). Learned at runtime from the 400
+    /// response, then omitted on subsequent requests so portable Sema code that
+    /// sets `:temperature` keeps working without any change. See Phase 4 compat.
+    static DROP_TEMPERATURE: RefCell<HashSet<String>> = RefCell::new(HashSet::new());
+}
+
+/// The official OpenAI API and Azure OpenAI require the gpt-5/o-series parameter
+/// conventions (`max_completion_tokens`, temperature restrictions); compatibility
+/// endpoints (Ollama/OpenRouter/vLLM/…) use the legacy ones.
+fn is_official_openai_url(base_url: &str) -> bool {
+    base_url.contains("api.openai.com")
+        || base_url.contains("openai.azure.com")
+        || base_url.contains("cognitiveservices.azure.com")
+}
+
+/// Detect an OpenAI 400 that rejects a custom `temperature` (covers both
+/// "'temperature' is not supported" and "does not support … Only the default").
+fn mentions_unsupported_temperature(body: &str) -> bool {
+    let lower = body.to_lowercase();
+    lower.contains("temperature")
+        && (lower.contains("not supported")
+            || lower.contains("does not support")
+            || lower.contains("unsupported"))
+}
 
 pub struct OpenAiProvider {
     name: String,
@@ -141,11 +171,17 @@ impl OpenAiProvider {
         // The official OpenAI API requires `max_completion_tokens` (gpt-5 /
         // o-series reject `max_tokens`); compatibility endpoints still expect the
         // legacy `max_tokens`. Pick by endpoint.
-        let is_official_openai = self.base_url.contains("api.openai.com");
+        let is_official_openai = is_official_openai_url(&self.base_url);
         let (max_tokens, max_completion_tokens) = if is_official_openai {
             (None, request.max_tokens)
         } else {
             (request.max_tokens, None)
+        };
+        // Omit temperature for models we've learned reject it (see DROP_TEMPERATURE).
+        let temperature = if DROP_TEMPERATURE.with(|s| s.borrow().contains(&model)) {
+            None
+        } else {
+            request.temperature
         };
 
         OpenAiRequest {
@@ -153,7 +189,7 @@ impl OpenAiProvider {
             messages,
             max_tokens,
             max_completion_tokens,
-            temperature: request.temperature,
+            temperature,
             tools,
             stop: request.stop_sequences.clone(),
             stream: None,
@@ -508,7 +544,24 @@ impl LlmProvider for OpenAiProvider {
     }
 
     fn complete(&self, request: ChatRequest) -> Result<ChatResponse, LlmError> {
-        self.runtime.block_on(self.complete_async(request))
+        let result = self.runtime.block_on(self.complete_async(request.clone()));
+        // Compat backstop: gpt-5.0 / o-series reject a custom `temperature` with a
+        // 400. Learn it per-model, drop temperature, and retry once — so portable
+        // Sema code that sets :temperature still works on those models.
+        if request.temperature.is_some() && is_official_openai_url(&self.base_url) {
+            if let Err(LlmError::Api {
+                status: 400,
+                message,
+            }) = &result
+            {
+                if mentions_unsupported_temperature(message) {
+                    let model = self.resolve_model(&request.model);
+                    DROP_TEMPERATURE.with(|s| s.borrow_mut().insert(model));
+                    return self.runtime.block_on(self.complete_async(request));
+                }
+            }
+        }
+        result
     }
 
     fn stream_complete(
@@ -571,6 +624,45 @@ mod tests {
         let mut r = ChatRequest::new("gpt-5.4-mini".into(), vec![ChatMessage::new("user", "hi")]);
         r.max_tokens = Some(100);
         r
+    }
+
+    #[test]
+    fn official_endpoint_detection_covers_azure() {
+        assert!(is_official_openai_url("https://api.openai.com/v1"));
+        assert!(is_official_openai_url(
+            "https://my-resource.openai.azure.com"
+        ));
+        assert!(is_official_openai_url(
+            "https://my-resource.cognitiveservices.azure.com"
+        ));
+        assert!(!is_official_openai_url("http://localhost:11434/v1")); // Ollama
+        assert!(!is_official_openai_url("https://openrouter.ai/api/v1"));
+    }
+
+    #[test]
+    fn detects_unsupported_temperature_400() {
+        assert!(mentions_unsupported_temperature(
+            "Unsupported parameter: 'temperature' is not supported with this model."
+        ));
+        assert!(mentions_unsupported_temperature(
+            "Unsupported value: 'temperature' does not support 0 with this model. Only the default (1) value is supported."
+        ));
+        assert!(!mentions_unsupported_temperature(
+            "Unsupported parameter: 'max_tokens' is not supported with this model."
+        ));
+    }
+
+    #[test]
+    fn memoized_model_drops_temperature() {
+        let p = OpenAiProvider::new("k".into(), None, None).unwrap();
+        let mut r = ChatRequest::new("gpt-5.0".into(), vec![ChatMessage::new("user", "hi")]);
+        r.temperature = Some(0.2);
+        // Before learning: temperature is sent.
+        assert_eq!(p.build_request_body(&r).temperature, Some(0.2));
+        // After learning the model rejects it: omitted.
+        DROP_TEMPERATURE.with(|s| s.borrow_mut().insert("gpt-5.0".to_string()));
+        assert_eq!(p.build_request_body(&r).temperature, None);
+        DROP_TEMPERATURE.with(|s| s.borrow_mut().clear());
     }
 
     #[test]

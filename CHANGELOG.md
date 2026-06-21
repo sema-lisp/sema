@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- **VM crash: a throwing `try`/`catch` as a non-first binding in a parallel `let` corrupted the operand stack.** `(let ((a 1) (b (try (throw 1) (catch e 2)))) b)` aborted the process instead of returning `2`. `compile_let` pushed all binding inits onto the operand stack without updating `stack_height`, so an exception handler inside a later init restored the stack *below* the earlier already-pushed inits, and subsequent local-slot access went out of bounds. Fixed by tracking `stack_height` across the init pushes/stores (the way call-argument compilation already does). `let*`, `letrec`, and calls were unaffected. Found by the in-language grammar fuzzer.
+
 ## 1.20.0
 
 Tooling and ergonomics release. `match` is now exhaustive-by-default (raises on no-match, with a new lenient `match*`), the LSP gains range formatting, the debugger gains conditional and exception breakpoints, lowering is faster, and the numeric domain policy is now documented. One behavior change to be aware of — see **Changed**.

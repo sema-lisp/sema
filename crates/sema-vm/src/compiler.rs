@@ -749,13 +749,21 @@ impl Compiler {
         bindings: &[(VarRef, ResolvedExpr)],
         body: &[ResolvedExpr],
     ) -> Result<(), SemaError> {
-        // Compile all init expressions first
+        // Compile all init expressions first. Each leaves its value on the
+        // operand stack, so track stack_height: if a later init throws (e.g. a
+        // `try` binding), the exception handler restores the stack to
+        // `n_locals + stack_height` and must not discard the earlier inits
+        // already pushed here. (Call-argument compilation tracks this the same
+        // way; omitting it here corrupted the stack — see the dual-eval
+        // `let_binding_throwing_try_*` regression tests.)
         for (_, init) in bindings {
             self.compile_expr(init)?;
+            self.stack_height += 1;
         }
         // Store into local slots (in reverse to match stack order)
         for (vr, _) in bindings.iter().rev() {
             self.compile_var_store(vr);
+            self.stack_height -= 1;
         }
         // Compile body; the bindings are in scope for its full pc range.
         let body_start = self.emit.current_pc();

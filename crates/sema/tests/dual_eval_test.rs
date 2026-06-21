@@ -1416,6 +1416,20 @@ dual_eval_tests! {
     hof_callback_error_caught:
         r#"(try (map (fn (x) (error "boom")) (list 1)) (catch e :caught))"#
         => Value::keyword("caught"),
+
+    // Regression: a throwing try/catch as a NON-FIRST binding in a parallel
+    // `let` used to corrupt the operand stack — compile_let pushed earlier inits
+    // without tracking stack_height, so the exception unwind truncated below
+    // them and later local-slot access went out of bounds (crash on valid code,
+    // found by the grammar fuzzer). See compiler.rs::compile_let.
+    let_binding_throwing_try_nonfirst:
+        r#"(let ((a 1) (b (try (throw 1) (catch e 2)))) b)"# => Value::int(2),
+    let_binding_throwing_try_three:
+        r#"(let ((a 0) (b (try (throw 1) (catch e 2))) (c 9)) (+ a b c))"# => Value::int(11),
+    let_binding_throwing_try_uses_prior:
+        r#"(let ((a 1) (b (try (throw a) (catch e 7)))) (+ a b))"# => Value::int(8),
+    let_binding_nonthrowing_try_unaffected:
+        r#"(let ((a 1) (b (try 5 (catch e 2)))) (+ a b))"# => Value::int(6),
 }
 
 // ============================================================

@@ -154,6 +154,11 @@ pub struct ChatRequest {
     pub stop_sequences: Vec<String>,
     /// When true, providers that support it will request JSON output mode.
     pub json_mode: bool,
+    /// Canonical reasoning effort: `minimal` | `low` | `medium` | `high` | `none`
+    /// | `xhigh` (stored raw for forward-compat). Each provider maps it to its
+    /// native control (OpenAI `reasoning_effort`, Anthropic extended thinking,
+    /// Gemini `thinkingConfig`); providers/models that don't support it ignore it.
+    pub reasoning_effort: Option<String>,
 }
 
 impl ChatRequest {
@@ -167,6 +172,7 @@ impl ChatRequest {
             tools: Vec::new(),
             stop_sequences: Vec::new(),
             json_mode: false,
+            reasoning_effort: None,
         }
     }
 }

@@ -93,15 +93,36 @@ impl AnthropicProvider {
             })
             .collect();
 
+        // Canonical reasoning_effort → Anthropic extended thinking. When enabled,
+        // Anthropic requires max_tokens > budget_tokens and temperature unset
+        // (defaults to 1), so we keep the caller's max_tokens as output room on top
+        // of the thinking budget and drop temperature.
+        let output_room = request.max_tokens.unwrap_or(4096);
+        let mut max_tokens = output_room;
+        let mut temperature = request.temperature;
+        let thinking = request
+            .reasoning_effort
+            .as_deref()
+            .and_then(anthropic_thinking_budget)
+            .map(|budget| {
+                max_tokens = budget + output_room;
+                temperature = None;
+                ThinkingConfig {
+                    kind: "enabled",
+                    budget_tokens: budget,
+                }
+            });
+
         AnthropicRequest {
             model,
             messages,
-            max_tokens: request.max_tokens.unwrap_or(4096),
-            temperature: request.temperature,
+            max_tokens,
+            temperature,
             system,
             tools,
             stop_sequences: request.stop_sequences.clone(),
             stream: false,
+            thinking,
         }
     }
 
@@ -161,6 +182,8 @@ impl AnthropicProvider {
                         arguments: input.clone(),
                     });
                 }
+                // Thinking / redacted_thinking / unknown blocks: ignore.
+                ContentBlock::Other => {}
             }
         }
 
@@ -290,6 +313,27 @@ struct AnthropicRequest {
     stop_sequences: Vec<String>,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     stream: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thinking: Option<ThinkingConfig>,
+}
+
+#[derive(Serialize)]
+struct ThinkingConfig {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    budget_tokens: u32,
+}
+
+/// Map canonical reasoning effort → Anthropic extended-thinking budget (tokens).
+/// `minimal`/`none`/unrecognized disable thinking (None).
+fn anthropic_thinking_budget(effort: &str) -> Option<u32> {
+    match effort.to_lowercase().as_str() {
+        "low" => Some(1024),
+        "medium" => Some(4096),
+        "high" => Some(12000),
+        "xhigh" | "max" => Some(24000),
+        _ => None,
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -325,6 +369,10 @@ enum ContentBlock {
         name: String,
         input: serde_json::Value,
     },
+    /// `thinking` / `redacted_thinking` (extended thinking) and any future block
+    /// types — tolerated and ignored so the response still decodes.
+    #[serde(other)]
+    Other,
 }
 
 #[derive(Deserialize)]
@@ -401,5 +449,47 @@ fn serialize_anthropic_content(content: &MessageContent) -> serde_json::Value {
                 .collect();
             serde_json::Value::Array(arr)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::{ChatMessage, ChatRequest};
+
+    #[test]
+    fn budget_mapping() {
+        assert_eq!(anthropic_thinking_budget("low"), Some(1024));
+        assert_eq!(anthropic_thinking_budget("medium"), Some(4096));
+        assert_eq!(anthropic_thinking_budget("high"), Some(12000));
+        assert_eq!(anthropic_thinking_budget("none"), None);
+        assert_eq!(anthropic_thinking_budget("minimal"), None);
+    }
+
+    #[test]
+    fn high_effort_enables_thinking_and_relaxes_constraints() {
+        let p = AnthropicProvider::new("k".into(), Some("claude-x".into())).unwrap();
+        let mut r = ChatRequest::new("claude-x".into(), vec![ChatMessage::new("user", "hi")]);
+        r.max_tokens = Some(1000);
+        r.temperature = Some(0.5);
+        r.reasoning_effort = Some("high".into());
+        let body = p.build_request_body(&r);
+        let t = body.thinking.expect("thinking enabled for high");
+        assert_eq!(t.budget_tokens, 12000);
+        assert!(
+            body.max_tokens > t.budget_tokens,
+            "max_tokens ({}) must exceed thinking budget ({})",
+            body.max_tokens,
+            t.budget_tokens
+        );
+        assert_eq!(body.temperature, None, "temperature dropped with thinking");
+    }
+
+    #[test]
+    fn none_effort_disables_thinking() {
+        let p = AnthropicProvider::new("k".into(), Some("claude-x".into())).unwrap();
+        let mut r = ChatRequest::new("claude-x".into(), vec![ChatMessage::new("user", "hi")]);
+        r.reasoning_effort = Some("none".into());
+        assert!(p.build_request_body(&r).thinking.is_none());
     }
 }

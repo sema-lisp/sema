@@ -354,6 +354,13 @@ fn get_opt_string(opts: &BTreeMap<Value, Value>, key: &str) -> Option<String> {
         .and_then(|v| v.as_str().map(|s| s.to_string()))
 }
 
+/// Read an option that may be given as a keyword (`:high`) or a string
+/// (`"high"`) — used for `:reasoning-effort`.
+fn get_opt_effort(opts: &BTreeMap<Value, Value>, key: &str) -> Option<String> {
+    opts.get(&Value::keyword(key))
+        .and_then(|v| v.as_keyword().or_else(|| v.as_str().map(|s| s.to_string())))
+}
+
 /// Parse one `llm/with-fallback` chain element into a [`FallbackEntry`].
 ///
 /// Accepted shapes:
@@ -1375,6 +1382,7 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
         let mut max_tokens = None;
         let mut temperature = None;
         let mut system = None;
+        let mut reasoning_effort = None;
 
         if let Some(opts_val) = args.get(1) {
             if let Some(opts) = opts_val.as_map_rc() {
@@ -1382,6 +1390,7 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
                 max_tokens = get_opt_u32(&opts, "max-tokens");
                 temperature = get_opt_f64(&opts, "temperature");
                 system = get_opt_string(&opts, "system");
+                reasoning_effort = get_opt_effort(&opts, "reasoning-effort");
             }
         }
 
@@ -1391,6 +1400,7 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
         request.max_tokens = max_tokens.or(Some(4096));
         request.temperature = temperature;
         request.system = system;
+        request.reasoning_effort = reasoning_effort;
 
         let response = do_complete(request)?;
         track_usage(&response.usage)?;
@@ -1414,6 +1424,7 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
             let mut max_tokens = None;
             let mut temperature = None;
             let mut system = None;
+            let mut reasoning_effort = None;
             let mut tools: Vec<Value> = Vec::new();
             let mut tool_mode = "auto".to_string();
             let mut max_tool_rounds = 10usize;
@@ -1424,6 +1435,7 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
                     max_tokens = get_opt_u32(&opts, "max-tokens");
                     temperature = get_opt_f64(&opts, "temperature");
                     system = get_opt_string(&opts, "system");
+                    reasoning_effort = get_opt_effort(&opts, "reasoning-effort");
                     if let Some(t) = opts.get(&Value::keyword("tools")).and_then(|v| v.as_seq()) {
                         tools = t.to_vec();
                     }
@@ -1446,6 +1458,7 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
                 request.max_tokens = max_tokens.or(Some(4096));
                 request.temperature = temperature;
                 request.system = system;
+                request.reasoning_effort = reasoning_effort;
                 let response = do_complete(request)?;
                 track_usage(&response.usage)?;
                 Ok(Value::string(&response.content))
@@ -1459,6 +1472,7 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
                     max_tokens,
                     temperature,
                     system,
+                    reasoning_effort,
                     &tools,
                     &tool_schemas,
                     max_tool_rounds,
@@ -2127,6 +2141,11 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
             .as_ref()
             .and_then(|o| o.get(&Value::keyword("on-tool-call")).cloned());
 
+        // Optional per-run reasoning effort, e.g. (agent/run a msg {:reasoning-effort :high}).
+        let reasoning_effort = opts
+            .as_ref()
+            .and_then(|o| get_opt_effort(o, "reasoning-effort"));
+
         // Build messages: prior history + new user message
         let mut messages = if let Some(ref o) = opts {
             if let Some(history) = o.get(&Value::keyword("messages")) {
@@ -2153,6 +2172,7 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
             Some(4096),
             None,
             system,
+            reasoning_effort,
             &agent.tools,
             &tool_schemas,
             agent.max_turns,
@@ -4494,6 +4514,7 @@ fn run_tool_loop(
     max_tokens: Option<u32>,
     temperature: Option<f64>,
     system: Option<String>,
+    reasoning_effort: Option<String>,
     tools: &[Value],
     tool_schemas: &[ToolSchema],
     max_rounds: usize,
@@ -4512,6 +4533,7 @@ fn run_tool_loop(
         request.max_tokens = max_tokens.or(Some(4096));
         request.temperature = temperature;
         request.system = system.clone();
+        request.reasoning_effort = reasoning_effort.clone();
         request.tools = tool_schemas.to_vec();
 
         let response = do_complete(request)?;

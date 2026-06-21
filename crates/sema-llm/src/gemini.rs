@@ -1,6 +1,18 @@
 use crate::provider::LlmProvider;
 use crate::types::{ChatRequest, ChatResponse, LlmError, ToolCall, Usage};
 
+/// Map canonical reasoning effort → Gemini `thinkingBudget` (tokens). `none`/
+/// `minimal` disable thinking (0); others scale within the 2.5-flash 0..=24576
+/// range. Unrecognized values default to disabled.
+fn gemini_thinking_budget(effort: &str) -> u32 {
+    match effort.to_lowercase().as_str() {
+        "low" => 1024,
+        "medium" => 8192,
+        "high" | "xhigh" | "max" => 24576,
+        _ => 0, // none / minimal / unrecognized
+    }
+}
+
 /// Build the Gemini endpoint URL without embedding the API key (the key is sent
 /// via the `x-goog-api-key` header instead — see the call sites). Validates the
 /// request-controlled `model` so it cannot inject extra path segments or break
@@ -274,6 +286,15 @@ impl GeminiProvider {
                 serde_json::json!(request.stop_sequences),
             );
         }
+        // Canonical reasoning_effort → Gemini thinkingConfig.thinkingBudget.
+        // minimal/none → 0 (disable thinking); others scale the budget.
+        if let Some(effort) = request.reasoning_effort.as_deref() {
+            let budget = gemini_thinking_budget(effort);
+            gen_config.insert(
+                "thinkingConfig".to_string(),
+                serde_json::json!({ "thinkingBudget": budget }),
+            );
+        }
         if !gen_config.is_empty() {
             body["generationConfig"] = serde_json::Value::Object(gen_config);
         }
@@ -436,6 +457,15 @@ fn serialize_gemini_parts(content: &crate::types::MessageContent) -> serde_json:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn thinking_budget_mapping() {
+        assert_eq!(gemini_thinking_budget("low"), 1024);
+        assert_eq!(gemini_thinking_budget("medium"), 8192);
+        assert_eq!(gemini_thinking_budget("high"), 24576);
+        assert_eq!(gemini_thinking_budget("none"), 0);
+        assert_eq!(gemini_thinking_budget("minimal"), 0);
+    }
 
     #[test]
     fn build_url_omits_api_key() {

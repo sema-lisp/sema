@@ -189,6 +189,7 @@ impl OpenAiProvider {
             messages,
             max_tokens,
             max_completion_tokens,
+            reasoning_effort: request.reasoning_effort.clone(),
             temperature,
             tools,
             stop: request.stop_sequences.clone(),
@@ -451,6 +452,9 @@ struct OpenAiRequest {
     /// `max_tokens`. Sent only when targeting the official OpenAI endpoint.
     #[serde(skip_serializing_if = "Option::is_none")]
     max_completion_tokens: Option<u32>,
+    /// gpt-5 / o-series reasoning control (minimal|low|medium|high|none|xhigh).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_effort: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     temperature: Option<f64>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -663,6 +667,17 @@ mod tests {
         DROP_TEMPERATURE.with(|s| s.borrow_mut().insert("gpt-5.0".to_string()));
         assert_eq!(p.build_request_body(&r).temperature, None);
         DROP_TEMPERATURE.with(|s| s.borrow_mut().clear());
+    }
+
+    #[test]
+    fn forwards_reasoning_effort() {
+        let p = OpenAiProvider::new("k".into(), None, None).unwrap();
+        let mut r = ChatRequest::new("gpt-5.4-mini".into(), vec![ChatMessage::new("user", "hi")]);
+        r.reasoning_effort = Some("high".into());
+        assert_eq!(
+            p.build_request_body(&r).reasoning_effort.as_deref(),
+            Some("high")
+        );
     }
 
     #[test]

@@ -111,11 +111,12 @@ sema> (:name person)
 ### Persistent Conversations
 
 ```sema
+;; Each conversation/say makes a real LLM call, threading prior turns as history.
 (define conv (conversation/new {:model "claude-haiku-4-5-20251001"}))
 (define conv (conversation/say conv "Remember: the secret number is 7"))
 (define conv (conversation/say conv "What is the secret number?"))
 (conversation/last-reply conv)
-; => "The secret number is 7."
+; => the model's reply, e.g. "The secret number is 7." — it recalls the earlier turn
 ```
 
 ## What's Next?

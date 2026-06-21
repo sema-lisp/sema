@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.21.2
+
+Bugfix + release-process hardening.
+
+### Fixed
+
+- **Special-form names are bindable again.** A change in 1.20.4 reserved special-form names (`if`, `fn`, `let`, `and`, `message`, …) and rejected binding *any* of them — but that also rejected correct value-position use, like a function parameter named `message` or a variable named `fn`, because the scope-free lowerer can't distinguish value use from operator use. It broke real code (5 bundled examples) and slipped a CI regression past four releases. The reservation is removed: special-form names shadow correctly in value position again. In operator/head position the special form still wins (a documented, accepted footgun — `docs/limitations.md` #36); the proper fix (full lexical shadowing) is future work.
+
+### CI / release process
+
+- **Publishing now requires the test suite to pass.** The crates.io and npm publish workflows triggered on a version tag with no dependency on CI, so a red test suite never blocked a release — which is how the reserved-name regression shipped. They now gate on a reusable `verify` workflow that runs the full CI-equivalent suite (fmt, clippy, doc check, `cargo test`, example + bytecode smoke tests) before any publish. The local release runbook was updated to run the example/bytecode smoke tests too (plain `cargo test` skips them).
+
 ## 1.21.1
 
 Bugfix. Found by a live stress test of the resilience features (Ollama-down →

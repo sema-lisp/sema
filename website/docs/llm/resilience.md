@@ -39,6 +39,29 @@ To target a different model per provider within a single chain, give chain entri
   (lambda () (llm/complete "Hello")))
 ```
 
+## Automatic Retry on Transient Errors
+
+LLM calls (`llm/complete`, `llm/chat`, `agent/run`, and the fallback-chain path)
+**automatically retry transient failures** — no configuration needed:
+
+- Retried: HTTP 429 (rate limited), 5xx server errors, and network/timeout errors.
+- Not retried: 4xx client errors other than 429 (e.g. 400 bad request), and parse
+  errors — these won't succeed on a retry, so they fail fast.
+- Backoff: capped **exponential backoff with full jitter** (base 500ms, doubling
+  per attempt, capped at 30s), up to 3 retries. A 429 honors the provider's
+  `retry-after` hint when present.
+
+This is distinct from [`llm/with-fallback`](#fallback-provider-chains) (which
+switches *providers* on failure) and the generic [`retry`](#generic-retry) (which
+wraps *any* thunk). They compose: each provider in a fallback chain does its own
+transient-error retry before the chain moves on.
+
+::: tip Streaming bypass
+Streaming calls (`llm/stream`) currently bypass the automatic retry, response
+cache, budget enforcement, and fallback chain — they hit the provider directly.
+Use the non-streaming forms when you need those guarantees.
+:::
+
 ## Rate Limiting
 
 ### `llm/with-rate-limit`

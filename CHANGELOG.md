@@ -1,5 +1,31 @@
 # Changelog
 
+## 1.21.0
+
+LLM/agentic bulletproofing. A multi-agent audit (see `docs/llm-agentic-audit.md`)
+found the headline agent loop broken on OpenAI-family providers and several
+robustness gaps; this release fixes them, hardens resilience, and adds
+cross-provider reasoning control — all verified live against OpenAI, Anthropic,
+and Gemini plus a new keyless deterministic test harness.
+
+### Fixed
+
+- **Agent tool loop was broken on OpenAI-family providers.** Tool results were sent as plain `[Tool result for X]: ...` user text with no `tool_call_id`, and the assistant's `tool_calls` were never echoed — so OpenAI/Ollama models re-called the tool until max-turns and returned an empty response (Anthropic happened to tolerate it). The loop now echoes the assistant `tool_calls` turn and sends correlated tool-result messages, translated to each provider's native shape (OpenAI/Ollama `tool_call_id`, Anthropic `tool_use`/`tool_result`, Gemini `functionCall`/`functionResponse`). Live-verified end-to-end on all three families.
+- **gpt-5 / o-series models were entirely uncallable.** They reject the legacy `max_tokens` parameter; the OpenAI serializer now sends `max_completion_tokens` on the official OpenAI/Azure endpoints (compatibility endpoints keep `max_tokens`).
+- **Anthropic extended thinking failed to decode.** `thinking` / `redacted_thinking` response blocks caused a hard "error decoding response body"; they're now tolerated.
+- **Documentation accuracy:** homepage no longer claims a runtime tree-walker (retired; the VM is the sole evaluator) and the `llm/classify` example matches the real signature; README describes pricing as a bundled models.dev snapshot rather than live "dynamic pricing".
+
+### Added
+
+- **Cross-provider `:reasoning-effort`.** One portable option (`:minimal` `:low` `:medium` `:high` `:none` `:xhigh`) on `llm/complete`, `llm/chat`, and `agent/run`, mapped to each provider's native control: OpenAI `reasoning_effort`, Anthropic extended thinking (budget tokens, with the required `max_tokens`/`temperature` adjustments), Gemini `thinkingConfig`. Unsupported providers/models ignore it. See `docs/llm/completion.md`.
+- **Recoverable tool errors + argument validation in the agent loop.** A tool that throws, isn't found, or is called with schema-invalid arguments no longer aborts `agent/run` — the error is fed back so the model self-corrects (bounded by `:max-turns` and a 5-consecutive-error cap). Model-supplied args are validated against the `deftool` parameter schema before the handler runs.
+- **Keyless deterministic LLM test harness** (`FakeProvider`) so the LLM/agent paths — including the tool-result protocol, retries, and reasoning mappings — are covered in CI without API keys.
+
+### Improved
+
+- **Resilience now matches the docs.** Network retry covers transient 5xx and network/timeout errors (not just 429) with capped exponential backoff + jitter; 429 honors the server `retry-after`. Non-retryable 4xx fail fast.
+- **OpenAI compatibility hardening.** Azure OpenAI endpoints are detected for the gpt-5 parameter conventions, and a self-healing backstop learns per-model when a custom `temperature` is rejected (gpt-5.0 / o-series) and retries without it — so portable code keeps working. Streaming's bypass of cache/budget/fallback is now documented honestly (`docs/llm/resilience.md`).
+
 ## 1.20.4
 
 Diagnostics release. Closes a special-form shadowing footgun and adds actionable hints for the most common cross-dialect mistakes.

@@ -89,6 +89,20 @@ Run an agent with a user message. The agent will loop, calling tools as needed, 
 (agent/run weather-bot "What's the weather in Tokyo?")
 ```
 
+An optional third argument takes per-run options:
+
+```sema
+(agent/run weather-bot "What's the weather in Tokyo?"
+  {:reasoning-effort :high          ; reasoning effort for this run (see Completion)
+   :on-tool-call (fn (event) ...)   ; observe each tool call (:start / :end events)
+   :messages prior-history})         ; seed the loop with prior conversation
+```
+
+**Error recovery.** A tool that throws, isn't found, or is called with arguments
+that don't match its declared schema does **not** abort the run — the error is
+fed back to the model as the tool result so it can correct itself and continue.
+The loop is bounded by `:max-turns` and aborts after 5 consecutive tool errors.
+
 ### Inspecting Agents
 
 ### `agent/name`

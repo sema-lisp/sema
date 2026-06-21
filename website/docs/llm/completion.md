@@ -94,8 +94,30 @@ All completion and chat functions accept an options map with these keys:
 
 | Key            | Description                                                   |
 | -------------- | ------------------------------------------------------------- |
-| `:model`       | Model name (e.g. `"claude-haiku-4-5-20251001"`)               |
-| `:max-tokens`  | Maximum tokens in response                                    |
-| `:temperature` | Sampling temperature (0.0–1.0)                                |
-| `:system`      | System prompt (for `llm/complete`)                            |
-| `:tools`       | List of tool values (see [Tools & Agents](./tools-agents.md)) |
+| `:model`            | Model name (e.g. `"claude-haiku-4-5-20251001"`)               |
+| `:max-tokens`       | Maximum tokens in response                                    |
+| `:temperature`      | Sampling temperature (0.0–1.0)                                |
+| `:system`           | System prompt (for `llm/complete`)                            |
+| `:reasoning-effort` | Reasoning effort for thinking models — see below              |
+| `:tools`            | List of tool values (see [Tools & Agents](./tools-agents.md)) |
+
+### Reasoning effort
+
+`:reasoning-effort` controls how much a reasoning/thinking model deliberates
+before answering. It takes a keyword or string: `:minimal`, `:low`, `:medium`,
+`:high`, `:none`, or `:xhigh`. It is a single **portable** option — Sema maps it
+to each provider's native control, so the same code works everywhere:
+
+```sema
+(llm/complete "Prove that sqrt(2) is irrational."
+  {:model "gpt-5.4-mini" :reasoning-effort :high :max-tokens 4000})
+```
+
+| Provider  | Mapped to                                                                              |
+| --------- | ------------------------------------------------------------------------------------- |
+| OpenAI    | native `reasoning_effort` (gpt-5 / o-series)                                           |
+| Anthropic | extended **thinking** — effort sets the thinking `budget_tokens` (and raises `max_tokens` above it; `temperature` is forced to default while thinking) |
+| Gemini    | `thinkingConfig.thinkingBudget` (`:none`/`:minimal` disable thinking)                  |
+
+Models and providers that don't support reasoning effort ignore the option (no-op).
+It is also accepted by `llm/chat` and per-run on `agent/run` (`{:reasoning-effort :high}`).

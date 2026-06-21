@@ -1562,7 +1562,12 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
 
         // Streaming bypasses do_complete/track_usage, so it gets its own CLIENT span.
         let span = sema_otel::llm_span("chat");
-        span.set_request(request.temperature, request.max_tokens, &request.stop_sequences, None);
+        span.set_request(
+            request.temperature,
+            request.max_tokens,
+            &request.stop_sequences,
+            None,
+        );
 
         let response = with_provider(|p| {
             if request.model.is_empty() {
@@ -4189,6 +4194,15 @@ fn response_facts(provider: &str, resp: &ChatResponse) -> sema_otel::ResponseFac
     }
 }
 
+/// Flatten chat messages into a `role: content` text blob for opt-in content capture.
+fn messages_text(messages: &[ChatMessage]) -> String {
+    messages
+        .iter()
+        .map(|m| format!("{}: {}", m.role, m.content.to_text()))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// Classify an `LlmError` for the `error.type` span attribute.
 fn llm_error_kind(e: &crate::types::LlmError) -> &'static str {
     use crate::types::LlmError::*;
@@ -4438,6 +4452,11 @@ fn do_complete_with_provider(
         // consumes the serving-provider stamp.
         span.set_dispatch(&entry.provider, &request.model);
         span.set_response(&response_facts(&entry.provider, &resp));
+        span.set_messages(
+            &messages_text(&request.messages),
+            &resp.content,
+            request.system.as_deref(),
+        );
         Ok(resp)
     })
 }
@@ -4459,6 +4478,11 @@ fn do_complete_uncached(
         // Capture provider/model/response before track_usage consumes the stamp.
         span.set_dispatch(p.name(), &request.model);
         span.set_response(&response_facts(p.name(), &resp));
+        span.set_messages(
+            &messages_text(&request.messages),
+            &resp.content,
+            request.system.as_deref(),
+        );
         Ok(resp)
     })
 }

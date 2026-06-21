@@ -20,6 +20,11 @@ eval_tests! {
 
     // Regression: get-in must distinguish a key present with a nil value from a
     // missing key, and an empty path returns the root (found by ultracode hunt).
+    // (otel/span ...) is a no-op when telemetry is disabled (no provider installed,
+    // the default in tests) but still runs its thunk and returns its value.
+    otel_span_disabled_returns_value: r#"(otel/span "x" (fn () (+ 40 2)))"# => Value::int(42),
+    otel_event_disabled_is_noop: r#"(otel/event "tick" {:n 1})"# => Value::nil(),
+
     get_in_present_nil: r#"(get-in {:a nil} [:a] "default")"# => Value::nil(),
     get_in_nil_empty_path: r#"(get-in nil [] "default")"# => Value::nil(),
     get_in_missing_key: r#"(get-in {:a 1} [:b] "default")"# => Value::string("default"),

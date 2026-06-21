@@ -19,6 +19,7 @@ mod list;
 mod map;
 mod math;
 mod meta;
+mod otel;
 #[cfg(not(target_arch = "wasm32"))]
 mod pdf;
 mod pio;
@@ -63,6 +64,7 @@ pub fn register_stdlib(env: &Env, sandbox: &Sandbox) {
     json::register(env);
     toml_ops::register(env);
     meta::register(env);
+    otel::register(env);
     regex_ops::register(env);
     #[cfg(not(target_arch = "wasm32"))]
     http::register(env, sandbox);

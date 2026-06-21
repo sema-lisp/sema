@@ -3235,6 +3235,7 @@ dependencies = [
  "reqwest",
  "rusqlite",
  "sema-core",
+ "sema-otel",
  "sema-reader",
  "serde_json",
  "serialport",

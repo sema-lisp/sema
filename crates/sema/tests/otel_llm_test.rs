@@ -75,4 +75,31 @@ fn llm_completion_emits_genai_chat_span() {
         hit["attributes"].get("gen_ai.provider.name").is_none(),
         "cache hit has no serving provider"
     );
+
+    // M3: both GenAI metric histograms were recorded.
+    let metrics = cap.metric_names();
+    assert!(
+        metrics.iter().any(|m| m == "gen_ai.client.token.usage"),
+        "token.usage histogram missing: {metrics:?}"
+    );
+    assert!(
+        metrics
+            .iter()
+            .any(|m| m == "gen_ai.client.operation.duration"),
+        "operation.duration histogram missing: {metrics:?}"
+    );
+
+    // M3 privacy: content capture is OFF by default — no message attributes.
+    assert!(
+        ping["attributes"].get("gen_ai.input.messages").is_none(),
+        "message content must not be captured without the opt-in flag"
+    );
+
+    // M3 Sema surface: (otel/span ...) returns the thunk value and emits one span.
+    let v = interp
+        .eval_str_compiled(r#"(otel/span "my-span" (fn () (+ 40 2)))"#)
+        .expect("otel/span should run");
+    assert_eq!(v.as_int(), Some(42));
+    let my = cap.span_named("my-span").expect("otel/span emits a span");
+    assert_eq!(my["kind"], "internal");
 }

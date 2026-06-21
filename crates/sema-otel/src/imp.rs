@@ -6,8 +6,10 @@ use std::sync::Once;
 use std::time::Duration;
 
 use opentelemetry::global;
+use opentelemetry::metrics::Histogram;
 use opentelemetry::trace::{SpanKind, Status, TraceContextExt, Tracer};
 use opentelemetry::{Array, Context, InstrumentationScope, KeyValue, StringValue, Value};
+use opentelemetry_sdk::metrics::{PeriodicReader, SdkMeterProvider};
 use opentelemetry_sdk::trace::SdkTracerProvider;
 use opentelemetry_sdk::Resource;
 
@@ -15,10 +17,62 @@ use crate::file_exporter::JsonlFileExporter;
 use crate::provider_map::gen_ai_provider_name;
 use crate::ResponseFacts;
 
-/// Set true once a provider is installed (by `init_from_env` or `use_host_global`).
-/// When false, every span constructor returns a no-op without touching `global`.
+/// Set true once a tracer provider is installed (by `init_from_env` or
+/// `use_host_global`). When false, every span constructor returns a no-op without
+/// touching `global`.
 static ENABLED: AtomicBool = AtomicBool::new(false);
+/// Set true once a meter provider is installed (OTLP-only — the JSONL file sink is
+/// trace-only). When false, metric recording is skipped.
+static METRICS_ENABLED: AtomicBool = AtomicBool::new(false);
 static INIT_ONCE: Once = Once::new();
+
+// GenAI metric histogram bucket boundaries (spec §2).
+const TOKEN_BUCKETS: &[f64] = &[
+    1.0, 4.0, 16.0, 64.0, 256.0, 1024.0, 4096.0, 16384.0, 65536.0, 262144.0, 1048576.0, 4194304.0,
+    16777216.0, 67108864.0,
+];
+const DURATION_BUCKETS: &[f64] = &[
+    0.01, 0.02, 0.04, 0.08, 0.16, 0.32, 0.64, 1.28, 2.56, 5.12, 10.24, 20.48, 40.96, 81.92,
+];
+
+struct Metrics {
+    token_usage: Histogram<u64>,
+    op_duration: Histogram<f64>,
+}
+
+static METRICS: std::sync::OnceLock<Option<Metrics>> = std::sync::OnceLock::new();
+
+/// Lazily build (and cache) the two GenAI histograms against the installed global
+/// meter provider. `None` when metrics aren't enabled.
+fn metrics() -> Option<&'static Metrics> {
+    if !METRICS_ENABLED.load(Ordering::Relaxed) {
+        return None;
+    }
+    METRICS
+        .get_or_init(|| {
+            let meter = global::meter("sema");
+            Some(Metrics {
+                token_usage: meter
+                    .u64_histogram("gen_ai.client.token.usage")
+                    .with_unit("{token}")
+                    .with_boundaries(TOKEN_BUCKETS.to_vec())
+                    .build(),
+                op_duration: meter
+                    .f64_histogram("gen_ai.client.operation.duration")
+                    .with_unit("s")
+                    .with_boundaries(DURATION_BUCKETS.to_vec())
+                    .build(),
+            })
+        })
+        .as_ref()
+}
+
+/// Enable metric recording against the current global meter provider (used by the
+/// testing helper after it installs an in-memory meter provider).
+#[cfg_attr(not(feature = "testing"), allow(dead_code))]
+pub(crate) fn enable_metrics() {
+    METRICS_ENABLED.store(true, Ordering::Relaxed);
+}
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -45,13 +99,20 @@ fn service_name() -> String {
 /// flush + shutdown so short-lived `sema run file.sema` processes never lose the
 /// last spans and never hang on a dead collector.
 pub struct OtelGuard {
-    provider: SdkTracerProvider,
+    provider: Option<SdkTracerProvider>,
+    meter: Option<SdkMeterProvider>,
 }
 
 impl Drop for OtelGuard {
     fn drop(&mut self) {
-        let _ = self.provider.force_flush();
-        let _ = self.provider.shutdown_with_timeout(Duration::from_secs(3));
+        if let Some(p) = &self.provider {
+            let _ = p.force_flush();
+            let _ = p.shutdown_with_timeout(Duration::from_secs(3));
+        }
+        if let Some(m) = &self.meter {
+            let _ = m.force_flush();
+            let _ = m.shutdown();
+        }
     }
 }
 
@@ -62,11 +123,21 @@ impl Drop for OtelGuard {
 pub fn init_from_env() -> Option<OtelGuard> {
     let mut guard = None;
     INIT_ONCE.call_once(|| {
-        if let Some(provider) = build_provider() {
-            global::set_tracer_provider(provider.clone());
-            ENABLED.store(true, Ordering::Relaxed);
-            guard = Some(OtelGuard { provider });
+        let provider = build_provider();
+        let meter = build_meter_provider();
+        if provider.is_none() && meter.is_none() {
+            return; // nothing configured — zero-cost no-op
         }
+        if let Some(p) = &provider {
+            global::set_tracer_provider(p.clone());
+            ENABLED.store(true, Ordering::Relaxed);
+        }
+        if let Some(m) = &meter {
+            global::set_meter_provider(m.clone());
+            ENABLED.store(true, Ordering::Relaxed);
+            METRICS_ENABLED.store(true, Ordering::Relaxed);
+        }
+        guard = Some(OtelGuard { provider, meter });
     });
     guard
 }
@@ -135,6 +206,51 @@ fn build_otlp_exporter() -> Option<opentelemetry_otlp::SpanExporter> {
             .with_protocol(Protocol::HttpJson)
             .build(),
         _ => SpanExporter::builder()
+            .with_http()
+            .with_protocol(Protocol::HttpBinary)
+            .build(),
+    };
+    result.ok()
+}
+
+/// Build a meter provider (OTLP only — the JSONL sink is trace-only). `None` when no
+/// OTLP endpoint is configured or the exporter fails to build.
+fn build_meter_provider() -> Option<SdkMeterProvider> {
+    let otlp = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
+        .ok()
+        .or_else(|| std::env::var("OTEL_EXPORTER_OTLP_METRICS_ENDPOINT").ok())
+        .filter(|s| !s.is_empty());
+    otlp.as_ref()?;
+    let exporter = build_otlp_metric_exporter()?;
+    let reader = PeriodicReader::builder(exporter).build();
+    let resource = Resource::builder()
+        .with_service_name(service_name())
+        .build();
+    Some(
+        SdkMeterProvider::builder()
+            .with_reader(reader)
+            .with_resource(resource)
+            .build(),
+    )
+}
+
+fn build_otlp_metric_exporter() -> Option<opentelemetry_otlp::MetricExporter> {
+    use opentelemetry_otlp::{MetricExporter, Protocol, WithExportConfig};
+    let proto =
+        std::env::var("OTEL_EXPORTER_OTLP_PROTOCOL").unwrap_or_else(|_| "http/protobuf".into());
+    let result = match proto.as_str() {
+        "grpc" => match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(rt) => rt.block_on(async { MetricExporter::builder().with_tonic().build() }),
+            Err(_) => return None,
+        },
+        "http/json" => MetricExporter::builder()
+            .with_http()
+            .with_protocol(Protocol::HttpJson)
+            .build(),
+        _ => MetricExporter::builder()
             .with_http()
             .with_protocol(Protocol::HttpBinary)
             .build(),
@@ -243,6 +359,10 @@ fn scrub(s: &str) -> String {
 pub struct LlmSpan {
     inner: Option<SpanCore>,
     op: &'static str,
+    start: std::time::Instant,
+    /// Mapped `gen_ai.provider.name` + request model, captured in `set_dispatch` for
+    /// the metric dimensions (recorded in `set_response`).
+    dims: RefCell<(String, String)>,
 }
 
 /// Start an LLM-call span (CLIENT). Provider/model are unknown at entry and set later
@@ -253,7 +373,12 @@ pub fn llm_span(op: &'static str) -> LlmSpan {
         SpanKind::Client,
         vec![KeyValue::new("gen_ai.operation.name", op)],
     );
-    LlmSpan { inner, op }
+    LlmSpan {
+        inner,
+        op,
+        start: std::time::Instant::now(),
+        dims: RefCell::new((String::new(), String::new())),
+    }
 }
 
 impl LlmSpan {
@@ -283,20 +408,52 @@ impl LlmSpan {
     /// Called AFTER the provider is resolved. Sets provider + request model and
     /// renames the span to the spec form `{op} {model}`.
     pub fn set_dispatch(&self, sema_provider: &str, request_model: &str) {
+        // Capture metric dimensions even if the span itself is a no-op (metrics may be
+        // enabled independently). Empty provider on a cache hit is kept as "".
+        let mapped = if sema_provider.is_empty() {
+            String::new()
+        } else {
+            gen_ai_provider_name(sema_provider).to_string()
+        };
+        *self.dims.borrow_mut() = (mapped.clone(), request_model.to_string());
         if let Some(c) = &self.inner {
             // A cache hit has no serving provider — skip the attribute rather than
             // emit an empty/mis-mapped value.
-            if !sema_provider.is_empty() {
-                c.set_str(
-                    "gen_ai.provider.name",
-                    gen_ai_provider_name(sema_provider).to_string(),
-                );
+            if !mapped.is_empty() {
+                c.set_str("gen_ai.provider.name", mapped);
             }
             if !request_model.is_empty() {
                 c.set_str("gen_ai.request.model", request_model.to_string());
                 c.update_name(format!("{} {}", self.op, request_model));
             }
         }
+    }
+
+    /// Record the two GenAI metric histograms (no-op when metrics are disabled).
+    fn record_metrics(&self, facts: &ResponseFacts) {
+        let Some(m) = metrics() else { return };
+        let (provider, req_model) = self.dims.borrow().clone();
+        let base = [
+            KeyValue::new("gen_ai.operation.name", self.op),
+            KeyValue::new("gen_ai.provider.name", provider.clone()),
+            KeyValue::new("gen_ai.request.model", req_model.clone()),
+            KeyValue::new("gen_ai.response.model", facts.response_model.clone()),
+        ];
+        let mut input_dims = base.to_vec();
+        input_dims.push(KeyValue::new("gen_ai.token.type", "input"));
+        m.token_usage.record(facts.input_tokens as u64, &input_dims);
+        let mut output_dims = base.to_vec();
+        output_dims.push(KeyValue::new("gen_ai.token.type", "output"));
+        m.token_usage
+            .record(facts.output_tokens as u64, &output_dims);
+
+        let duration_dims = [
+            KeyValue::new("gen_ai.operation.name", self.op),
+            KeyValue::new("gen_ai.provider.name", provider),
+            KeyValue::new("gen_ai.request.model", req_model),
+        ];
+        m.op_duration
+            .record(self.start.elapsed().as_secs_f64(), &duration_dims);
     }
 
     pub fn set_response(&self, facts: &ResponseFacts) {
@@ -328,6 +485,7 @@ impl LlmSpan {
                 c.set_bool("gen_ai.cache.hit", true);
             }
         }
+        self.record_metrics(facts);
     }
 
     pub fn set_conversation_id(&self, id: &str) {

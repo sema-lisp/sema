@@ -1489,6 +1489,7 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
                     &tool_schemas,
                     max_tool_rounds,
                     None,
+                    None,
                 )?;
                 Ok(Value::string(&result))
             }
@@ -1559,6 +1560,10 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
         request.temperature = temperature;
         request.system = system;
 
+        // Streaming bypasses do_complete/track_usage, so it gets its own CLIENT span.
+        let span = sema_otel::llm_span("chat");
+        span.set_request(request.temperature, request.max_tokens, &request.stop_sequences, None);
+
         let response = with_provider(|p| {
             if request.model.is_empty() {
                 let mut req = request.clone();
@@ -1574,8 +1579,13 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
                     }
                     Ok(())
                 };
-                p.stream_complete(req, &mut chunk_cb)
-                    .map_err(|e| SemaError::Llm(e.to_string()))
+                let req_model = req.model.clone();
+                let resp = p
+                    .stream_complete(req, &mut chunk_cb)
+                    .map_err(|e| SemaError::Llm(e.to_string()))?;
+                span.set_dispatch(p.name(), &req_model);
+                span.set_response(&response_facts(p.name(), &resp));
+                Ok(resp)
             } else {
                 let mut chunk_cb = |chunk: &str| -> Result<(), crate::types::LlmError> {
                     if let Some(ref cb) = callback {
@@ -1588,8 +1598,12 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
                     }
                     Ok(())
                 };
-                p.stream_complete(request.clone(), &mut chunk_cb)
-                    .map_err(|e| SemaError::Llm(e.to_string()))
+                let resp = p
+                    .stream_complete(request.clone(), &mut chunk_cb)
+                    .map_err(|e| SemaError::Llm(e.to_string()))?;
+                span.set_dispatch(p.name(), &request.model);
+                span.set_response(&response_facts(p.name(), &resp));
+                Ok(resp)
             }
         })?;
 
@@ -2205,6 +2219,7 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
             &tool_schemas,
             agent.max_turns,
             on_tool_call.as_ref(),
+            Some(&agent.name),
         )?;
 
         // 3-arg form with opts: return {:response "..." :messages [...]}
@@ -4622,7 +4637,11 @@ fn run_tool_loop(
     tool_schemas: &[ToolSchema],
     max_rounds: usize,
     on_tool_call: Option<&Value>,
+    agent_name: Option<&str>,
 ) -> Result<(String, Vec<ChatMessage>), SemaError> {
+    // INTERNAL agent span over the whole loop; the per-round `chat` spans (from
+    // do_complete) and per-tool spans nest under it via the thread-local stack.
+    let _agent_span = sema_otel::agent_span(agent_name);
     let mut messages = initial_messages;
     let mut last_content = String::new();
     // Bound runaway error loops: if the model keeps issuing failing tool calls
@@ -4675,6 +4694,13 @@ fn run_tool_loop(
             }
 
             let start_time = std::time::Instant::now();
+            // INTERNAL tool span (self-times over execute_tool_call, the one real
+            // latency source). v1.41 requires the tool name in the span name.
+            let tool_desc = tools.iter().find_map(|t| {
+                let td = t.as_tool_def_rc()?;
+                (td.name == tc.name).then(|| td.description.clone())
+            });
+            let tspan = sema_otel::tool_span(&tc.name, &tc.id, tool_desc.as_deref());
             // A failing or invalid tool call must NOT abort the whole agent run.
             // Capture the error as the tool result and feed it back so the model
             // can self-correct (bounded by MAX_CONSECUTIVE_TOOL_ERRORS / max_rounds).
@@ -4688,6 +4714,10 @@ fn run_tool_loop(
                     (format!("Error: {e}"), true)
                 }
             };
+            if is_error {
+                tspan.record_error("tool_error", &result);
+            }
+            drop(tspan);
             let duration_ms = start_time.elapsed().as_millis() as i64;
 
             // Fire "end" event

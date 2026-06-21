@@ -137,7 +137,13 @@ impl Engine {
         });
 
         let source = cell.source.clone();
-        let result = self.eval_source(&source);
+        // INTERNAL span per evaluated cell. Nests under the `notebook.run_all` root
+        // when invoked from eval_all; otherwise it's a standalone one-cell trace.
+        // LLM/tool spans emitted during the cell nest beneath it via the TL stack.
+        let result = {
+            let _cell_span = sema_otel::vm_span(&format!("notebook.cell {cell_id}"));
+            self.eval_source(&source)
+        };
 
         // Mark downstream cells as stale
         self.notebook.mark_downstream_stale(idx);
@@ -246,6 +252,8 @@ impl Engine {
             .map(|c| c.id.clone())
             .collect();
 
+        // One root trace per "Run All"; each cell becomes a child span.
+        let _root = sema_otel::vm_span("notebook.run_all");
         cell_ids
             .into_iter()
             .map(|id| {

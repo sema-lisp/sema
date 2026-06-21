@@ -3184,6 +3184,7 @@ dependencies = [
  "chrono",
  "sema-core",
  "sema-eval",
+ "sema-otel",
  "serde",
  "serde_json",
  "tokio",

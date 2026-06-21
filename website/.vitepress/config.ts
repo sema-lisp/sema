@@ -161,7 +161,8 @@ export default defineConfig({
             { text: 'Caching', link: '/docs/llm/caching' },
             { text: 'Resilience & Retry', link: '/docs/llm/resilience' },
             { text: 'Providers', link: '/docs/llm/providers' },
-            { text: 'Cost & Budgets', link: '/docs/llm/cost' }
+            { text: 'Cost & Budgets', link: '/docs/llm/cost' },
+            { text: 'Observability (OpenTelemetry)', link: '/docs/llm/observability' }
           ]
         }
       ],

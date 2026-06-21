@@ -2517,8 +2517,22 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
         };
 
         let request = EmbedRequest { texts, model };
+        // CLIENT embeddings span (bypasses do_complete). Input tokens only.
+        let span = sema_otel::llm_span("embeddings");
+        let req_model = request.model.clone().unwrap_or_default();
         let response = with_embedding_provider(|p| {
-            p.embed(request).map_err(|e| SemaError::Llm(e.to_string()))
+            let resp = p
+                .embed(request)
+                .map_err(|e| SemaError::Llm(e.to_string()))?;
+            span.set_dispatch(p.name(), &req_model);
+            span.set_response(&sema_otel::ResponseFacts {
+                input_tokens: resp.usage.prompt_tokens,
+                output_tokens: 0,
+                response_model: resp.model.clone(),
+                cost_usd: pricing::calculate_cost_for(p.name(), &resp.usage),
+                ..Default::default()
+            });
+            Ok(resp)
         })?;
 
         track_usage(&response.usage)?;

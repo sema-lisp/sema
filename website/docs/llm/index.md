@@ -65,3 +65,9 @@ Auto-configuration, runtime provider switching, custom providers, and OpenAI-com
 ### [Cost Tracking & Budgets](./cost.md)
 
 Usage tracking, budget enforcement, and batch/parallel operations.
+
+### [Observability (OpenTelemetry)](./observability.md)
+
+Standards-compliant OpenTelemetry traces + metrics (GenAI semantic conventions) for
+every LLM/agent run — export to Jaeger, Langfuse, Datadog, Grafana, or a JSONL file.
+Off by default, zero-cost when off.

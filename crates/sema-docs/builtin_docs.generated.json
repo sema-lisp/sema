@@ -5049,6 +5049,26 @@
       "body": "Build a multimodal message with text plus an attached image. Role is `:system`, `:user`, `:assistant`, or `:tool`; the image is a bytevector that is base64-encoded. The media type is auto-detected unless overridden via opts `:media-type`.\n\n```sema\n(message/with-image :user \"Describe this picture\" png-bytes {:media-type \"image/png\"})\n```"
     },
     {
+      "name": "otel/event",
+      "module": "otel",
+      "section": "Observability",
+      "summary": "Add an event (with optional attributes) to the current OpenTelemetry span. Attribute values are stringified. Returns nil. A no-op when telemetry is disabled or when there is no active span.",
+      "examples": [
+        "(otel/span \"request\"\n  (fn ()\n    (otel/event \"cache-miss\" {:key \"user:42\"})\n    (fetch-user 42)))"
+      ],
+      "body": "Add an event (with optional attributes) to the current OpenTelemetry span. Attribute values are stringified. Returns nil. A no-op when telemetry is disabled or when there is no active span.\n\n**Signature:** `(otel/event name) → nil` · `(otel/event name attrs-map) → nil`\n\n```sema\n(otel/span \"request\"\n  (fn ()\n    (otel/event \"cache-miss\" {:key \"user:42\"})\n    (fetch-user 42)))\n```\n\nTelemetry is opt-in: events are only exported when an OTLP endpoint or `SEMA_OTEL_FILE` is configured. See the [Observability guide](/docs/llm/observability)."
+    },
+    {
+      "name": "otel/span",
+      "module": "otel",
+      "section": "Observability",
+      "summary": "Run a thunk inside a named OpenTelemetry INTERNAL span and return the thunk's value. The span ends (recording its duration) when the thunk returns. Any LLM/tool spans created during the thunk nest beneath it. A no-op when telemetry is disabled.",
+      "examples": [
+        "(otel/span \"ingest-batch\"\n  (fn ()\n    (otel/event \"started\" {:batch-size 100})\n    (+ 40 2)))\n; => 42  (and emits one INTERNAL span named \"ingest-batch\")"
+      ],
+      "body": "Run a thunk inside a named OpenTelemetry INTERNAL span and return the thunk's value. The span ends (recording its duration) when the thunk returns. Any LLM/tool spans created during the thunk nest beneath it. A no-op when telemetry is disabled.\n\n**Signature:** `(otel/span name thunk) → any`\n\n```sema\n(otel/span \"ingest-batch\"\n  (fn ()\n    (otel/event \"started\" {:batch-size 100})\n    (+ 40 2)))\n; => 42  (and emits one INTERNAL span named \"ingest-batch\")\n```\n\nTelemetry is opt-in: spans are only exported when an OTLP endpoint or `SEMA_OTEL_FILE` is configured. See the [Observability guide](/docs/llm/observability)."
+    },
+    {
       "name": "pdf/extract-text",
       "module": "pdf",
       "section": "Text Extraction",

@@ -4,6 +4,27 @@
 
 ### Added
 
+- **OpenTelemetry observability (opt-in, GenAI semantic conventions).** A new
+  `sema-otel` crate emits standards-compliant traces + metrics for every LLM/agent
+  run, exportable to any OTLP backend (Jaeger/Langfuse/Datadog/Grafana/Honeycomb/
+  Phoenix) or a JSONL file — consumed natively by `gen_ai.*`-aware tools. **Off by
+  default and zero-cost when off**; a down/slow collector can never block, add latency,
+  or crash a script (thread-based batch processor, bounded queue, drop-on-full, bounded
+  flush+shutdown). Coverage: one `chat {model}` CLIENT span per non-streaming
+  completion (provider, request/response model, input/output + cache tokens, finish
+  reason, `gen_ai.usage.cost_usd`, `gen_ai.cache.hit` on cache hits); `embeddings`
+  spans; the full `invoke_agent → (chat, execute_tool {name}, chat)` agent tree;
+  per-HTTP-retry child spans; a streaming-call span; and a notebook "Run All" trace
+  (one root, one child per cell). Two GenAI metric histograms
+  (`gen_ai.client.token.usage`, `gen_ai.client.operation.duration`). Prompt/response
+  **content capture is OFF by default** (opt in via
+  `OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT=true`). New Sema builtins
+  `(otel/span name thunk)` and `(otel/event name attrs-map)`. Enabled via standard
+  `OTEL_*` env vars or `SEMA_OTEL_FILE`; both OTLP transports (HTTP + gRPC) compiled
+  in. Embedded hosts keep ownership: Sema never installs a global provider on its own
+  and nests under the host's current span. wasm builds compile the facade out to a
+  no-op. Docs: `website/docs/llm/observability.md`.
+
 - **Prompt-cache token reporting across providers.** `llm/last-usage` and `llm/session-usage` now expose `:cache-read-tokens` and `:cache-creation-tokens`, surfacing how many input tokens were served from (or written to) the provider's prompt cache. Wired through every first-party provider for both non-streaming and streaming responses: OpenAI/OpenAI-compatible (`prompt_tokens_details.cached_tokens` — implicit cache), Gemini (`cachedContentTokenCount` — implicit cache on 2.5+), and Anthropic (`cache_read_input_tokens` / `cache_creation_input_tokens`, reported separately from input tokens). Session counters accumulate cache tokens; custom Sema-defined providers can report them via `:cache-read-tokens` / `:cache-creation-tokens` in their usage map. Verified live (OpenAI and Gemini implicit cache reads observed on repeated long prefixes) and with a deterministic FakeProvider regression test. Cached reads are reported for visibility but not yet discounted in `:cost-usd`.
 
 ## 1.21.2

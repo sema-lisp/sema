@@ -176,7 +176,7 @@
 
 ;; The set of value types the program generator understands (LLM/IO/time/random
 ;; are deliberately excluded — no deterministic oracle).
-(define *types* (list 'int 'int 'int 'bool 'list 'float 'string 'vec 'map))
+(define *types* (list 'int 'int 'bool 'list 'float 'string 'vec 'map 'law 'law 'law))
 
 ;; Dispatch generation by type.
 (define (gen-of t env depth)
@@ -186,6 +186,7 @@
         ((= t 'float)  (gen-flt env depth))
         ((= t 'string) (gen-str    env depth))
         ((= t 'vec)    (gen-vec    env depth))
+        ((= t 'law)    (gen-law    env depth))
         (else          (gen-map-v  env depth))))
 
 ;; Nonzero divisor literals for mod (avoids division-by-zero, which raises).
@@ -325,7 +326,7 @@
 (define (gen-bool env depth)
   (if (<= depth 0)
       (gen-bool-leaf env)
-      (let ((choice (rng-int! 16)))
+      (let ((choice (rng-int! 17)))
         (cond
           ((< choice 2)  (gen-bool-leaf env))
           ((= choice 2)  (gen-bool-cmp '= env depth =))
@@ -341,6 +342,7 @@
           ((= choice 12) (gen-bool-mapcontains env depth))
           ((= choice 13) (gen-bool-typepred env depth))
           ((= choice 14) (gen-bool-strcontains env depth))
+          ((= choice 15) (gen-law env depth))
           (else          (gen-bool-let env depth))))))
 
 (define (gen-bool-leaf env)
@@ -679,6 +681,103 @@
           (mk (list 'async/all (cons 'list (reverse tasks))) (reverse vals))
           (let ((t (gen-int env (- depth 1))))
             (loop (+ i 1) (cons (list 'async (gf t)) tasks) (cons (gv t) vals)))))))
+
+;; ── metamorphic / differential laws (independent oracle for native ops) ──────
+;; The plain value oracle computes `expected` by calling the SAME builtin the
+;; form uses, so a bug in a native op (reverse/sort/map/filter/…) masks itself —
+;; both sides agree on the wrong answer. Each law here is instead a *theorem*
+;; whose expected value is the literal #t, cross-checking an op against an
+;; independent computation. A broken op makes the two sides disagree → the law
+;; evaluates to #f ≠ #t → caught.
+(define (law form) (mk form #t))     ; a law: must evaluate to #t on a correct VM
+
+(define (gen-law env depth)
+  (let ((c (rng-int! 15)))
+    (cond
+      ;; reverse == fold-cons
+      ((= c 0)
+       (let ((l (gen-ilist env (- depth 1))))
+         (law (list '= (list 'reverse (gf l))
+                    (list 'foldl (list 'lambda (list 'a 'x) (list 'cons 'x 'a))
+                          (list 'list) (gf l))))))
+      ;; last L == first (reverse L)   [nonempty]
+      ((= c 1)
+       (let* ((l (gen-ilist env (- depth 1))) (lv (gv l)))
+         (if (> (length lv) 0)
+             (law (list '= (list 'last (gf l)) (list 'first (list 'reverse (gf l)))))
+             (law #t))))
+      ;; append (take n L) (drop n L) == L
+      ((= c 2)
+       (let* ((l (gen-ilist env (- depth 1))) (n (rng-int! (+ 1 (length (gv l))))))
+         (law (list '= (list 'append (list 'take n (gf l)) (list 'drop n (gf l))) (gf l)))))
+      ;; length (append A B) == length A + length B
+      ((= c 3)
+       (let ((a (gen-ilist env (- depth 1))) (b (gen-ilist env (- depth 1))))
+         (law (list '= (list 'length (list 'append (gf a) (gf b)))
+                    (list '+ (list 'length (gf a)) (list 'length (gf b)))))))
+      ;; sort L == sort (reverse L)   (sort is order-independent)
+      ((= c 4)
+       (let ((l (gen-ilist env (- depth 1))))
+         (law (list '= (list 'sort (gf l)) (list 'sort (list 'reverse (gf l)))))))
+      ;; sum (sort L) == sum L        (sort preserves the multiset)
+      ((= c 5)
+       (let ((l (gen-ilist env (- depth 1))))
+         (law (list '= (list 'foldl '+ 0 (list 'sort (gf l))) (list 'foldl '+ 0 (gf l))))))
+      ;; length L == #even + #odd
+      ((= c 6)
+       (let ((l (gen-ilist env (- depth 1))))
+         (law (list '= (list 'length (gf l))
+                    (list '+ (list 'length (list 'filter 'even? (gf l)))
+                          (list 'length (list 'filter 'odd? (gf l))))))))
+      ;; map (+ k) L == reverse (fold-cons (+ k) L)
+      ((= c 7)
+       (let ((l (gen-ilist env (- depth 1))) (k (rng-range! -5 5)))
+         (law (list '= (list 'map (list 'lambda (list 'x) (list '+ 'x k)) (gf l))
+                    (list 'reverse
+                          (list 'foldl (list 'lambda (list 'a 'x) (list 'cons (list '+ 'x k) 'a))
+                                (list 'list) (gf l)))))))
+      ;; (first (cons X L)) == X  &  length grows by 1
+      ((= c 8)
+       (let ((x (gen-int env (- depth 1))) (l (gen-ilist env (- depth 1))))
+         (law (list 'and
+                    (list '= (list 'first (list 'cons (gf x) (gf l))) (gf x))
+                    (list '= (list 'length (list 'cons (gf x) (gf l)))
+                          (list '+ 1 (list 'length (gf l))))))))
+      ;; string-length (string-append A B) == lenA + lenB
+      ((= c 9)
+       (let ((a (gen-str env (- depth 1))) (b (gen-str env (- depth 1))))
+         (law (list '= (list 'string-length (list 'string-append (gf a) (gf b)))
+                    (list '+ (list 'string-length (gf a)) (list 'string-length (gf b)))))))
+      ;; string/reverse involution + length
+      ((= c 10)
+       (let ((s (gen-str env (- depth 1))))
+         (law (list 'and
+                    (list '= (list 'string/reverse (list 'string/reverse (gf s))) (gf s))
+                    (list '= (list 'string-length (list 'string/reverse (gf s)))
+                          (list 'string-length (gf s)))))))
+      ;; get (assoc M K V) K == V
+      ((= c 11)
+       (let ((m (gen-map-v env (- depth 1))) (k (rng-pick! *map-keys*))
+             (v (gen-int env (- depth 1))))
+         (law (list '= (list 'get (list 'assoc (gf m) k (gf v)) k) (gf v)))))
+      ;; count (assoc M K V) law
+      ((= c 12)
+       (let ((m (gen-map-v env (- depth 1))) (k (rng-pick! *map-keys*))
+             (v (gen-int env (- depth 1))))
+         (law (list '= (list 'count (list 'assoc (gf m) k (gf v)))
+                    (list 'if (list 'contains? (gf m) k)
+                          (list 'count (gf m))
+                          (list '+ 1 (list 'count (gf m))))))))
+      ;; distributivity: a*(b+c) == a*b + a*c
+      ((= c 13)
+       (let ((a (gen-int env (- depth 1))) (b (gen-int env (- depth 1)))
+             (cc (gen-int env (- depth 1))))
+         (law (list '= (list '* (gf a) (list '+ (gf b) (gf cc)))
+                    (list '+ (list '* (gf a) (gf b)) (list '* (gf a) (gf cc)))))))
+      ;; vector->list preserves count
+      (else
+       (let ((v (gen-vec env (- depth 1))))
+         (law (list '= (list 'count (list 'vector->list (gf v))) (list 'count (gf v)))))))))
 
 ;; ── float ──────────────────────────────────────────────────────────────────
 ;; Magnitudes kept small so +/-/* never overflow to inf and never produce NaN;

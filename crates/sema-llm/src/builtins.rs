@@ -135,6 +135,8 @@ pub fn reset_runtime_state() {
     RATE_LIMIT_RPS.with(|r| r.set(None));
     RATE_LIMIT_LAST.with(|r| r.set(0));
     LAST_SERVING_PROVIDER.with(|p| *p.borrow_mut() = None);
+    RETRY_BASE_MS.with(|c| c.set(500));
+    NETWORK_MAX_RETRIES.with(|c| c.set(3));
     pricing::clear_custom_pricing();
 }
 
@@ -4202,6 +4204,86 @@ fn do_complete_inner(request: ChatRequest) -> Result<ChatResponse, SemaError> {
     }
 }
 
+thread_local! {
+    /// Base delay for exponential backoff between network retries. Tests set this
+    /// to 0 via [`set_retry_base_ms`] so retry behavior is asserted on attempt
+    /// count without real sleeps.
+    static RETRY_BASE_MS: std::cell::Cell<u64> = const { std::cell::Cell::new(500) };
+    /// Max same-provider retries on transient errors (429 / 5xx / network).
+    static NETWORK_MAX_RETRIES: std::cell::Cell<u32> = const { std::cell::Cell::new(3) };
+}
+
+/// Test hook: set the retry backoff base (ms). 0 disables sleeping.
+pub fn set_retry_base_ms(ms: u64) {
+    RETRY_BASE_MS.with(|c| c.set(ms));
+}
+
+/// Test/config hook: set the max number of same-provider network retries.
+pub fn set_network_max_retries(n: u32) {
+    NETWORK_MAX_RETRIES.with(|c| c.set(n));
+}
+
+/// Whether an `LlmError` is worth retrying on the same provider, and the
+/// server-suggested wait in ms. `Some(ms)`: retryable — `ms > 0` honors that wait
+/// (429 `retry-after`), `ms == 0` means use computed backoff. `None`: not
+/// retryable (4xx non-429, parse/config errors).
+fn retryable_wait(err: &crate::types::LlmError) -> Option<u64> {
+    use crate::types::LlmError::*;
+    match err {
+        RateLimited { retry_after_ms } => Some(*retry_after_ms),
+        // 5xx are transient server faults; network failures and timeouts surface
+        // as Http(_). Both are safe to retry.
+        Api { status, .. } if *status >= 500 => Some(0),
+        Http(_) => Some(0),
+        _ => None,
+    }
+}
+
+/// Capped exponential backoff with full jitter. A positive server hint wins.
+fn retry_backoff_ms(attempt: u32, server_hint: u64) -> u64 {
+    const CAP_MS: u64 = 30_000;
+    if server_hint > 0 {
+        return server_hint.min(CAP_MS);
+    }
+    let base = RETRY_BASE_MS.with(|c| c.get());
+    if base == 0 {
+        return 0;
+    }
+    let ceil = base.saturating_mul(1u64 << attempt.min(6)).min(CAP_MS);
+    // Full jitter: a uniform-ish value in [0, ceil]. Sub-nanosecond entropy is
+    // plenty here — jitter only affects sleep duration, never control flow.
+    let entropy = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos() as u64)
+        .unwrap_or(0);
+    entropy % (ceil + 1)
+}
+
+/// Run `provider.complete` with retry on transient errors (429 / 5xx / network),
+/// using capped exponential backoff with jitter (429 honors `retry-after`).
+fn complete_with_retry(
+    provider: &dyn LlmProvider,
+    request: &ChatRequest,
+    max_retries: u32,
+) -> Result<ChatResponse, crate::types::LlmError> {
+    let mut attempt = 0u32;
+    loop {
+        match provider.complete(request.clone()) {
+            Ok(resp) => return Ok(resp),
+            Err(e) => match retryable_wait(&e) {
+                Some(hint) if attempt < max_retries => {
+                    let wait = retry_backoff_ms(attempt, hint);
+                    if wait > 0 {
+                        std::thread::sleep(std::time::Duration::from_millis(wait));
+                    }
+                    attempt += 1;
+                }
+                _ => return Err(e),
+            },
+        }
+    }
+}
+
 fn do_complete_with_provider(
     entry: &FallbackEntry,
     mut request: ChatRequest,
@@ -4220,56 +4302,26 @@ fn do_complete_with_provider(
         } else if request.model.is_empty() {
             request.model = provider.default_model().to_string();
         }
-        let mut retries = 0;
-        loop {
-            match provider.complete(request.clone()) {
-                Ok(resp) => {
-                    set_serving_provider(&entry.provider);
-                    return Ok(resp);
-                }
-                Err(crate::types::LlmError::RateLimited { retry_after_ms }) => {
-                    retries += 1;
-                    if retries > 3 {
-                        return Err(SemaError::Llm(format!(
-                            "provider '{}' rate limited after 3 retries",
-                            entry.provider
-                        )));
-                    }
-                    let wait = std::cmp::min(retry_after_ms, 30000);
-                    std::thread::sleep(std::time::Duration::from_millis(wait));
-                }
-                Err(e) => return Err(SemaError::Llm(e.to_string())),
-            }
-        }
+        let max_retries = NETWORK_MAX_RETRIES.with(|c| c.get());
+        let resp = complete_with_retry(provider, &request, max_retries)
+            .map_err(|e| SemaError::Llm(e.to_string()))?;
+        set_serving_provider(&entry.provider);
+        Ok(resp)
     })
 }
 
 /// Original do_complete logic (provider dispatch + rate-limit retry).
 fn do_complete_uncached(mut request: ChatRequest) -> Result<ChatResponse, SemaError> {
     enforce_rate_limit();
+    let max_retries = NETWORK_MAX_RETRIES.with(|c| c.get());
     with_provider(|p| {
         if request.model.is_empty() {
             request.model = p.default_model().to_string();
         }
-        let mut retries = 0;
-        let max_retries = 3;
-        loop {
-            match p.complete(request.clone()) {
-                Ok(resp) => {
-                    set_serving_provider(p.name());
-                    return Ok(resp);
-                }
-                Err(crate::types::LlmError::RateLimited { retry_after_ms }) => {
-                    retries += 1;
-                    if retries > max_retries {
-                        return Err(SemaError::Llm("rate limited after 3 retries".to_string()));
-                    }
-                    let wait = std::cmp::min(retry_after_ms, 30000);
-                    std::thread::sleep(std::time::Duration::from_millis(wait));
-                }
-                Err(e) => return Err(SemaError::Llm(e.to_string())),
-            }
-        }
+        let resp = complete_with_retry(p, &request, max_retries)
+            .map_err(|e| SemaError::Llm(e.to_string()))?;
+        set_serving_provider(p.name());
+        Ok(resp)
     })
 }
 

@@ -201,3 +201,68 @@ fn consecutive_tool_errors_abort() {
         "expected a consecutive-tool-errors abort, got: {err}"
     );
 }
+
+// ── Phase 4: network resilience (retry/backoff) ─────────────────────────────
+
+use sema_llm::builtins::set_retry_base_ms;
+use sema_llm::types::LlmError;
+
+/// A transient 5xx is retried (broadened beyond 429) and the next attempt
+/// succeeds. Backoff base is zeroed so the test asserts on attempt count, no sleep.
+#[test]
+fn transient_5xx_is_retried() {
+    let fake = FakeProvider::builder("fake")
+        .error(LlmError::Api {
+            status: 503,
+            message: "service unavailable".into(),
+        })
+        .reply("after-retry")
+        .build();
+    let recorder = fake.recorder();
+    let interp = Interpreter::new();
+    reset_runtime_state();
+    set_retry_base_ms(0); // no real sleeping
+    register_test_provider(Box::new(fake));
+    let val = interp
+        .eval_str_compiled(r#"(llm/complete "hi")"#)
+        .expect("should succeed after retrying the 5xx");
+    assert_eq!(val.as_str(), Some("after-retry"));
+    assert_eq!(recorder.call_count(), 2, "expected one retry after the 5xx");
+}
+
+/// A rate-limit (429) is retried too.
+#[test]
+fn rate_limit_is_retried() {
+    let fake = FakeProvider::builder("fake")
+        .error(LlmError::RateLimited { retry_after_ms: 1 })
+        .reply("ok")
+        .build();
+    let recorder = fake.recorder();
+    let interp = Interpreter::new();
+    reset_runtime_state();
+    set_retry_base_ms(0);
+    register_test_provider(Box::new(fake));
+    let val = interp.eval_str_compiled(r#"(llm/complete "hi")"#).unwrap();
+    assert_eq!(val.as_str(), Some("ok"));
+    assert_eq!(recorder.call_count(), 2);
+}
+
+/// A non-retryable 4xx (e.g. 400) is NOT retried — it fails immediately.
+#[test]
+fn client_4xx_is_not_retried() {
+    let fake = FakeProvider::builder("fake")
+        .error(LlmError::Api {
+            status: 400,
+            message: "bad request".into(),
+        })
+        .reply("never-reached")
+        .build();
+    let recorder = fake.recorder();
+    let interp = Interpreter::new();
+    reset_runtime_state();
+    set_retry_base_ms(0);
+    register_test_provider(Box::new(fake));
+    let result = interp.eval_str_compiled(r#"(llm/complete "hi")"#);
+    assert!(result.is_err(), "a 400 must not be retried");
+    assert_eq!(recorder.call_count(), 1, "no retry on a 4xx");
+}

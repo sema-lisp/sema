@@ -54,6 +54,10 @@ In-memory vector store for semantic search, plus vector math utilities (cosine s
 
 In-memory LLM response caching for iterative development and deduplication.
 
+### [Cassettes (Record & Replay)](./cassettes.md)
+
+Record real LLM/agent responses to a file once, then replay them deterministically — keyless, offline tests and reproducible demos.
+
 ### [Resilience & Retry](./resilience.md)
 
 Fallback provider chains, rate limiting, generic retry with exponential backoff, and convenience functions (`llm/summarize`, `llm/compare`).

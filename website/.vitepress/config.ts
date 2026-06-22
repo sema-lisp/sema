@@ -165,6 +165,7 @@ export default defineConfig({
             { text: 'Embeddings', link: '/docs/llm/embeddings' },
             { text: 'Vector Store & Math', link: '/docs/llm/vector-store' },
             { text: 'Caching', link: '/docs/llm/caching' },
+            { text: 'Cassettes (Record & Replay)', link: '/docs/llm/cassettes' },
             { text: 'Resilience & Retry', link: '/docs/llm/resilience' },
             { text: 'Providers', link: '/docs/llm/providers' },
             { text: 'Cost & Budgets', link: '/docs/llm/cost' }

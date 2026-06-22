@@ -1,5 +1,45 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- **LLM cassettes — record/replay for deterministic, keyless testing & demos.** A new
+  `sema-llm::cassette` layer records real LLM responses to an NDJSON tape once, then
+  replays them deterministically forever — no API key, no network. `llm/complete`,
+  `llm/chat`, `llm/extract`, and **agent loops** (`agent/run`, each turn keyed
+  independently) are covered; streaming and embeddings are not yet. Modes
+  `:auto` / `:replay` / `:record`; a `:replay` miss is a hard error that surfaces
+  prompt drift. Surface: `(llm/with-cassette path opts thunk)`,
+  `llm/cassette-load`/`-save`/`-eject`, and `SEMA_LLM_CASSETTE` /
+  `SEMA_LLM_CASSETTE_MODE` for CI. Folds with the rest of the runtime: it sits below
+  the OpenTelemetry span + response cache + cost accounting and above the provider, so
+  a replay still emits its `chat` span and reports its **recorded** usage (distinct
+  from a cache hit's zero usage), and `with-cassette` disables the response cache for
+  its scope. The tape stores only the response keyed by a request hash — no prompt
+  text, key, or header touches disk (redaction by construction). Docs:
+  `website/docs/llm/cassettes.md`.
+
+### Changed
+
+- **`sema-llm` no longer carries a redundant second evaluator callback.** Tool
+  handlers, Lisp-provider `:complete` functions, and streaming/agent callbacks now run
+  through `sema_core::call_callback` → the canonical `sema_eval::call_value` (the VM's
+  nested-closure path), like `sema-stdlib`. Removes the bespoke `EVAL_FN` /
+  `call_value_fn` / `simple_eval`, so `set!`, captured upvalues, and async/yield inside
+  a tool handler now share the same VM semantics as standard-library HOFs. No
+  user-facing API change.
+
+### CI
+
+- **Publish-list guard.** `scripts/check-publish-list.sh` (run in the release
+  `verify` gate + `make check-publish-list`) fails if a publishable workspace crate is
+  missing from `publish.yml`'s order — preventing the half-published release that hit
+  1.22.0 when the new `sema-otel` crate wasn't in the list.
+- The two publishes now share a single `verify` gate (was one full suite per
+  registry), CI uses `Swatinem/rust-cache`, and the per-crate publish sleeps are
+  trimmed (cargo already waits for index propagation).
+
 ## 1.22.0
 
 ### Added

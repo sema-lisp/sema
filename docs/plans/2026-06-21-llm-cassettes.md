@@ -1,8 +1,20 @@
 # LLM Cassettes — record/replay for deterministic LLM testing & demos
 
-**Status:** Scoping / design sketch (2026-06-21). Not started. Companion to the
-LLM bulletproofing plan; this is the foundational testability primitive that
-unblocks CI verification of every LLM/agentic feature **without API keys**.
+**Status:** M1 + Sema surface SHIPPED (2026-06-22). `complete`/`chat`/`extract` and
+**agent loops** record/replay deterministically and keylessly; folds with otel + cache
++ cost accounting (see `crates/sema-llm/src/cassette.rs`, tests `llm_cassette_test` /
+`otel_cassette_test`, docs `website/docs/llm/cassettes.md`). **Remaining:** M2
+(streaming chunk-array + embeddings + batch), M4 (record tapes for the playground
+`llm-tools` examples + wire `SEMA_LLM_CASSETTE_MODE=replay` into `make test`).
+
+Implementation note vs. the sketch below: rather than a registry-swapped decorator
+provider (which fights Rust's "can't move out of `Box<dyn Trait>`" on scope exit), the
+shipped design is a thread-local interceptor in `do_complete` — below the otel span +
+response cache, above the real provider. Same seam, cleaner ownership. The tape stores
+only the response keyed by a request hash (no request body) so redaction is free.
+
+Companion to the LLM bulletproofing plan; this is the foundational testability
+primitive that unblocks CI verification of every LLM/agentic feature **without API keys**.
 
 ## Why this is the highest-leverage thing
 

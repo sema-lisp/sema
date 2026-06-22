@@ -1,6 +1,11 @@
 # Unify the sema-llm eval callback onto the core callback
 
-**Status:** proposed · **Date:** 2026-06-22 · **Owner:** unassigned
+**Status:** ✅ shipped · **Date:** 2026-06-22 · **Owner:** unassigned
+
+> **Done.** The bespoke `EVAL_FN` / `set_eval_callback` / `full_eval` → `simple_eval`
+> fallback has been removed from `sema-llm`; all user-code evaluation now goes through the
+> canonical `sema_core::call_callback` (→ `sema_eval::call_value` → VM `run_nested_closure`),
+> the same path `sema-stdlib` uses. Archived for reference.
 
 ## Problem
 

@@ -1,8 +1,13 @@
 # OTel GenAI: Competitive Gap Analysis & Best-in-Class Roadmap
 
-**Status:** Research synthesis + roadmap. Tier-1 items already shipped (2026-06-22);
-the rest is a prioritized backlog, not yet implemented.
-**Date:** 2026-06-22
+**Status:** ✅ **P0 + P1 shipped & tested; P2 deferred — archived 2026-06-23.**
+The compat layer (`SEMA_OTEL_COMPAT=openinference,traceloop,langsmith,langfuse,braintrust`)
+landed in `crates/sema-otel/src/compat.rs`, wired through `imp.rs`, with the end-to-end
+regression suite `crates/sema/tests/otel_compat_test.rs` (+ `otel_compat_off_test.rs`,
+`otel_tags_test.rs`). The two P2 spans that *were* auto-derivable (retriever / reranker)
+also shipped; the remaining P2 items need new Sema language concepts and are deferred —
+tracked in IDEAS.md and the Sema-native tracing scoping doc.
+**Date:** 2026-06-22 (research) · 2026-06-23 (closed out)
 **Sources:** two parallel research passes — (A) OpenInference (Arize/Phoenix) +
 OpenLLMetry (Traceloop); (B) Langfuse, LangSmith, Braintrust, Pydantic Logfire — each
 grounded against the live platform docs and Sema's emitter (`crates/sema-otel/src/imp.rs`).
@@ -50,6 +55,15 @@ populate; sessions/users group; gRPC + HTTP both deliver.
 ## 2. Roadmap (prioritized, all auto-emit / no manual instrumentation)
 
 ### P0 — Cheap, high-signal, "push one more KeyValue from data in scope"
+
+**SHIPPED 2026-06-22/23** — all five items implemented in `compat.rs` and wired in `imp.rs`:
+span-kind tags at every constructor (`compat::span_kind`, LLM/Tool/Agent/Retriever/Reranker/Chain),
+generic span I/O (`compat::io` on the LLM span — `input.value`/`output.value` + mime),
+tool args/result (`compat::tool_io` ← `set_tool_io` in the tool loop), advertised tool
+schemas (`compat::tools` ← `set_tools` from the request's `ToolView`s), and the
+`langfuse.trace.input/output` rollup on the agent root (standalone chats are backfilled by
+Langfuse from the root observation's `langfuse.observation.input/output`). All asserted
+end-to-end in `crates/sema/tests/otel_compat_test.rs`.
 
 | Item | Keys | Where | Notes |
 |---|---|---|---|

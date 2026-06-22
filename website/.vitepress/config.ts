@@ -153,7 +153,7 @@ export default defineConfig({
           ]
         },
         {
-          text: 'Advanced LLM Operations',
+          text: 'Going Further',
           collapsed: false,
           items: [
             { text: 'Embeddings', link: '/docs/llm/embeddings' },
@@ -161,8 +161,14 @@ export default defineConfig({
             { text: 'Caching', link: '/docs/llm/caching' },
             { text: 'Resilience & Retry', link: '/docs/llm/resilience' },
             { text: 'Providers', link: '/docs/llm/providers' },
-            { text: 'Cost & Budgets', link: '/docs/llm/cost' },
-            { text: 'Observability (OpenTelemetry)', link: '/docs/llm/observability' },
+            { text: 'Cost & Budgets', link: '/docs/llm/cost' }
+          ]
+        },
+        {
+          text: 'Observability',
+          collapsed: false,
+          items: [
+            { text: 'Tracing & Metrics', link: '/docs/llm/observability' },
             { text: 'Backend Compatibility', link: '/docs/llm/otel-compat' }
           ]
         }

@@ -66,8 +66,15 @@ Auto-configuration, runtime provider switching, custom providers, and OpenAI-com
 
 Usage tracking, budget enforcement, and batch/parallel operations.
 
-### [Observability (OpenTelemetry)](./observability.md)
+### Observability (OpenTelemetry)
 
-Standards-compliant OpenTelemetry traces + metrics (GenAI semantic conventions) for
-every LLM/agent run — export to Jaeger, Langfuse, Datadog, Grafana, or a JSONL file.
-Off by default, zero-cost when off.
+Built-in, standards-compliant OpenTelemetry tracing + metrics for **every** LLM and
+agent run — no manual instrumentation. Each completion and tool call is auto-traced
+(`invoke_agent → chat → execute_tool`) with tokens, cost, and latency, exportable to
+any OTLP backend or a JSONL file. Off by default, zero-cost when off.
+
+- **[Tracing & Metrics](./observability.md)** — the GenAI spans/metrics, sessions,
+  privacy controls, and embedding Sema in your own app.
+- **[Backend Compatibility](./otel-compat.md)** — render first-class in Arize Phoenix,
+  Langfuse, Traceloop, and LangSmith via `SEMA_OTEL_COMPAT` (most other tools work with
+  zero config).

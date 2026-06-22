@@ -2,7 +2,7 @@
 outline: [2, 3]
 ---
 
-# Backend Compatibility (`SEMA_OTEL_COMPAT`)
+# Backend Compatibility
 
 Sema emits the **canonical OpenTelemetry GenAI semantic conventions** (`gen_ai.*`) by
 default. That makes its traces render first-class — with **zero configuration** — in any

@@ -2,12 +2,15 @@
 outline: [2, 3]
 ---
 
-# Observability (OpenTelemetry)
+# Tracing & Metrics
 
 Sema emits standards-compliant [OpenTelemetry](https://opentelemetry.io/) traces and
 metrics for every LLM and agent run, following the
 [GenAI semantic conventions](https://github.com/open-telemetry/semantic-conventions/tree/main/docs/gen-ai)
-that Datadog, Langfuse, Grafana, Honeycomb, Jaeger, and Phoenix consume natively.
+that Grafana, Datadog, Honeycomb, Jaeger, SigNoz, Logfire, and Braintrust consume
+natively — no configuration. (For tools that use their own namespace — Arize Phoenix,
+Traceloop, LangSmith — one env var makes them render first-class too; see
+[Backend Compatibility](./otel-compat).)
 
 Each non-streaming completion becomes one `chat` CLIENT span carrying the provider,
 model, token counts, finish reason, and computed cost. Agent runs nest a full
@@ -178,7 +181,7 @@ let interp = InterpreterBuilder::new()
 | `Off` (default) | No telemetry; never touches any global state (pure no-op). |
 | `UseHostGlobal` | Emit against the host's ambient global provider (silent no-op if none). |
 | `OwnProvider(p)` | Emit against a provider you hand Sema; installs **no** global. |
-| `FromEnv` | Self-install from `OTEL_*`/`SEMA_OTEL_FILE` — but **declines** if the host already installed a real provider (defers to it). Use `build_with_telemetry()` to keep the returned guard alive. |
+| `FromEnv` | Self-install from `OTEL_*` / `SEMA_OTEL_FILE`. The installed provider is owned by the built `Interpreter` and flushes on drop. If your app already runs OpenTelemetry, prefer `UseHostGlobal` or `OwnProvider` (which install nothing). |
 
 Sema's spans automatically **nest under your current span** (seeded from
 `opentelemetry::Context::current()`), so a host HTTP-request span becomes the parent

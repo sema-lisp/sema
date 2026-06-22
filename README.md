@@ -338,6 +338,7 @@ The [`examples/`](https://github.com/helgesverre/sema/tree/main/examples) direct
 - **Multi-provider** — swap between Anthropic, OpenAI, Gemini, Ollama, any OpenAI-compatible endpoint, or define your own provider in Sema
 - **Pipeline-ready** — response caching, fallback chains, rate limiting, retry with backoff, text chunking, prompt templates, vector store, and a persistent KV store
 - **Cost-aware** — built-in budget tracking with a bundled pricing snapshot ([models.dev](https://models.dev)), updated per release
+- **Observable** — every LLM/agent run is auto-traced with OpenTelemetry (GenAI semantic conventions): tokens, cost, latency, and the full `invoke_agent → chat → execute_tool` tree, exportable to Jaeger, Grafana, Datadog, Langfuse, Arize Phoenix, and more — zero manual instrumentation, off by default
 - **Practical Lisp** — closures, TCO, macros, modules, error handling, HTTP, file I/O, regex, JSON, and a comprehensive stdlib
 - **Standalone executables** — `sema build` compiles programs into self-contained binaries with auto-traced imports and bundled assets
 - **Embeddable** — [available on crates.io](https://crates.io/crates/sema-lang), clean Rust crate structure with a builder API

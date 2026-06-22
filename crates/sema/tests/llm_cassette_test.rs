@@ -160,6 +160,105 @@ fn replay_miss_is_a_hard_error() {
 }
 
 #[test]
+fn records_then_replays_a_streamed_completion() {
+    let path = tape_path("stream");
+    let _ = std::fs::remove_file(&path);
+
+    // Record a streamed call, accumulating the chunks the callback receives.
+    let rec = FakeProvider::builder("fake")
+        .model("m")
+        .reply("streamed answer")
+        .build();
+    let recorded = run(
+        &format!(
+            r#"(define out "")
+               (llm/with-cassette "{}" {{:mode :record}}
+                 (lambda ()
+                   (llm/stream "p" (lambda (c) (set! out (string-append out c))) {{:model "m"}})))
+               out"#,
+            path.display()
+        ),
+        rec,
+    )
+    .expect("record stream")
+    .as_str()
+    .map(String::from)
+    .expect("string");
+    assert_eq!(recorded, "streamed answer");
+
+    // Replay with a fake that errors if called — the recorded chunks must come back.
+    let replay_fake = FakeProvider::builder("fake")
+        .model("m")
+        .error(sema_llm::types::LlmError::Api {
+            status: 500,
+            message: "must not stream".into(),
+        })
+        .build();
+    let replayed = run(
+        &format!(
+            r#"(define out "")
+               (llm/with-cassette "{}" {{:mode :replay}}
+                 (lambda ()
+                   (llm/stream "p" (lambda (c) (set! out (string-append out c))) {{:model "m"}})))
+               out"#,
+            path.display()
+        ),
+        replay_fake,
+    )
+    .expect("replay stream without touching the provider")
+    .as_str()
+    .map(String::from)
+    .expect("string");
+    assert_eq!(
+        replayed, recorded,
+        "replayed chunks must match what was recorded"
+    );
+
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn records_then_replays_an_embedding() {
+    let path = tape_path("embed");
+    let _ = std::fs::remove_file(&path);
+
+    // Record an embedding (FakeProvider scripts the vectors).
+    let rec = FakeProvider::builder("fake")
+        .model("m")
+        .embed(vec![vec![0.1, 0.2, 0.3]])
+        .build();
+    run(
+        &format!(
+            r#"(llm/with-cassette "{}" {{:mode :record}}
+                 (lambda () (llm/embed "some text" {{:model "m"}})))"#,
+            path.display()
+        ),
+        rec,
+    )
+    .expect("record embed");
+
+    // Replay with a fake that has no embeddings scripted — it would error if called.
+    // Getting a bytevector back proves the tape served it.
+    let replay_fake = FakeProvider::builder("fake").model("m").build();
+    let replayed = run(
+        &format!(
+            r#"(llm/with-cassette "{}" {{:mode :replay}}
+                 (lambda () (llm/embed "some text" {{:model "m"}})))"#,
+            path.display()
+        ),
+        replay_fake,
+    )
+    .expect("replay embed without touching the provider");
+    assert_eq!(
+        replayed.type_name(),
+        "bytevector",
+        "replay returns the recorded embedding"
+    );
+
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
 fn tape_never_stores_the_prompt_text() {
     let path = tape_path("redaction");
     let _ = std::fs::remove_file(&path);

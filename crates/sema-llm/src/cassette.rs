@@ -72,6 +72,13 @@ pub struct TapeEntry {
     pub cache_read_input_tokens: u32,
     #[serde(default)]
     pub cache_creation_input_tokens: u32,
+    /// For `kind:"stream"` — the recorded text chunks in order. Replay feeds these
+    /// to the caller's `on_chunk` to reproduce the same boundaries.
+    #[serde(default)]
+    pub chunks: Vec<String>,
+    /// For `kind:"embed"` — the recorded embedding vectors (one per input text).
+    #[serde(default)]
+    pub embeddings: Vec<Vec<f64>>,
 }
 
 fn default_role() -> String {
@@ -94,6 +101,41 @@ impl TapeEntry {
             completion_tokens: resp.usage.completion_tokens,
             cache_read_input_tokens: resp.usage.cache_read_input_tokens,
             cache_creation_input_tokens: resp.usage.cache_creation_input_tokens,
+            chunks: Vec::new(),
+            embeddings: Vec::new(),
+        }
+    }
+
+    /// Tape entry for a streamed completion: the chunk sequence plus the final response.
+    pub fn from_stream(key: &str, chunks: &[String], resp: &ChatResponse) -> TapeEntry {
+        let mut entry = TapeEntry::from_response(key, resp);
+        entry.kind = "stream".to_string();
+        entry.chunks = chunks.to_vec();
+        entry
+    }
+
+    /// Tape entry for an embeddings call: the vectors plus the model and input tokens.
+    pub fn from_embed(
+        key: &str,
+        model: &str,
+        embeddings: &[Vec<f64>],
+        prompt_tokens: u32,
+    ) -> TapeEntry {
+        TapeEntry {
+            v: 1,
+            kind: "embed".to_string(),
+            key: key.to_string(),
+            content: String::new(),
+            role: default_role(),
+            model: model.to_string(),
+            tool_calls: Vec::new(),
+            stop_reason: None,
+            prompt_tokens,
+            completion_tokens: 0,
+            cache_read_input_tokens: 0,
+            cache_creation_input_tokens: 0,
+            chunks: Vec::new(),
+            embeddings: embeddings.to_vec(),
         }
     }
 
@@ -191,10 +233,12 @@ pub struct Cassette {
 }
 
 /// What a call should do, decided up front so the tape borrow is never held across
-/// the (possibly re-entrant) real provider call.
+/// the (possibly re-entrant) real provider call. The kind-specific payload (response,
+/// stream chunks, or embeddings) is read off the returned [`TapeEntry`] by the caller.
 pub enum Decision {
-    /// Serve this recorded response (replay / auto-hit).
-    Replay(ChatResponse),
+    /// Serve this recorded entry (replay / auto-hit). Boxed — a `TapeEntry` is large
+    /// relative to the other variants.
+    Replay(Box<TapeEntry>),
     /// `:replay` mode with no matching entry — a hard error (surfaces prompt drift).
     Miss(String),
     /// Call the real provider, then record the result.
@@ -212,24 +256,25 @@ impl Cassette {
         }
     }
 
-    /// Decide how to handle a call for `key` based on mode + tape contents.
+    /// Decide how to handle a call for `key` based on mode + tape contents. Used by
+    /// the complete, stream, and embed seams alike.
     pub fn decide(&self, key: &str) -> Decision {
         match self.mode {
             CassetteMode::Replay => match self.tape.lookup(key) {
-                Some(e) => Decision::Replay(e.to_response()),
+                Some(e) => Decision::Replay(Box::new(e.clone())),
                 None => Decision::Miss(key.to_string()),
             },
             CassetteMode::Auto => match self.tape.lookup(key) {
-                Some(e) => Decision::Replay(e.to_response()),
+                Some(e) => Decision::Replay(Box::new(e.clone())),
                 None => Decision::Record,
             },
             CassetteMode::Record => Decision::Record,
         }
     }
 
-    /// Append a freshly-obtained response to the tape.
-    pub fn record(&mut self, key: &str, resp: &ChatResponse) {
-        self.tape.record(TapeEntry::from_response(key, resp));
+    /// Append a recorded interaction (complete / stream / embed) to the tape.
+    pub fn record_entry(&mut self, entry: TapeEntry) {
+        self.tape.record(entry);
         self.dirty = true;
     }
 
@@ -291,9 +336,10 @@ mod tests {
             dirty: false,
         };
         assert!(matches!(cass.decide("k"), Decision::Record));
-        cass.record("k", &resp("recorded", 5, 6));
+        cass.record_entry(TapeEntry::from_response("k", &resp("recorded", 5, 6)));
         match cass.decide("k") {
-            Decision::Replay(r) => {
+            Decision::Replay(e) => {
+                let r = e.to_response();
                 assert_eq!(r.content, "recorded");
                 assert_eq!(r.usage.completion_tokens, 6);
             }

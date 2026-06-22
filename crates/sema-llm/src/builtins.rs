@@ -18,8 +18,8 @@ use crate::openai::OpenAiProvider;
 use crate::pricing;
 use crate::provider::{LlmProvider, ProviderRegistry};
 use crate::types::{
-    ChatMessage, ChatRequest, ChatResponse, ContentBlock, EmbedRequest, LlmError, ToolCall,
-    ToolSchema, Usage,
+    ChatMessage, ChatRequest, ChatResponse, ContentBlock, EmbedRequest, EmbedResponse, LlmError,
+    ToolCall, ToolSchema, Usage,
 };
 use crate::vector_store::{VectorDocument, VectorStore};
 
@@ -1603,17 +1603,7 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
                     }
                     Ok(())
                 };
-                let req_model = req.model.clone();
-                let resp = match p.stream_complete(req, &mut chunk_cb) {
-                    Ok(r) => r,
-                    Err(e) => {
-                        span.record_error(llm_error_kind(&e), &e.to_string());
-                        return Err(SemaError::Llm(e.to_string()));
-                    }
-                };
-                span.set_dispatch(p.name(), &req_model);
-                span.set_response(&response_facts(p.name(), &resp));
-                Ok(resp)
+                stream_with_cassette(p, req, &mut chunk_cb, &span)
             } else {
                 let mut chunk_cb = |chunk: &str| -> Result<(), crate::types::LlmError> {
                     if let Some(ref cb) = callback {
@@ -1626,16 +1616,7 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
                     }
                     Ok(())
                 };
-                let resp = match p.stream_complete(request.clone(), &mut chunk_cb) {
-                    Ok(r) => r,
-                    Err(e) => {
-                        span.record_error(llm_error_kind(&e), &e.to_string());
-                        return Err(SemaError::Llm(e.to_string()));
-                    }
-                };
-                span.set_dispatch(p.name(), &request.model);
-                span.set_response(&response_facts(p.name(), &resp));
-                Ok(resp)
+                stream_with_cassette(p, request.clone(), &mut chunk_cb, &span)
             }
         })?;
 
@@ -2548,24 +2529,66 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
         // CLIENT embeddings span (bypasses do_complete). Input tokens only.
         let span = sema_otel::llm_span("embeddings");
         let req_model = request.model.clone().unwrap_or_default();
-        let response = with_embedding_provider(|p| {
-            let resp = match p.embed(request) {
-                Ok(r) => r,
-                Err(e) => {
-                    span.record_error(llm_error_kind(&e), &e.to_string());
-                    return Err(SemaError::Llm(e.to_string()));
+        // Cassette interception (mirrors run_completion, for the embeddings seam).
+        let cassette_key = compute_embed_key(&request);
+        let decision =
+            CASSETTE.with(|c| c.borrow().as_ref().map(|cass| cass.decide(&cassette_key)));
+        let response = match decision {
+            Some(crate::cassette::Decision::Replay(entry)) => {
+                let resp = EmbedResponse {
+                    embeddings: entry.embeddings,
+                    model: entry.model.clone(),
+                    usage: Usage {
+                        prompt_tokens: entry.prompt_tokens,
+                        model: entry.model,
+                        ..Default::default()
+                    },
+                };
+                span.set_dispatch("cassette", &req_model);
+                span.set_response(&sema_otel::ResponseFacts {
+                    input_tokens: resp.usage.prompt_tokens,
+                    output_tokens: 0,
+                    response_model: resp.model.clone(),
+                    ..Default::default()
+                });
+                resp
+            }
+            Some(crate::cassette::Decision::Miss(k)) => return Err(cassette_miss_error(&k)),
+            other => {
+                let recording = matches!(other, Some(crate::cassette::Decision::Record));
+                let resp = with_embedding_provider(|p| {
+                    let resp = match p.embed(request) {
+                        Ok(r) => r,
+                        Err(e) => {
+                            span.record_error(llm_error_kind(&e), &e.to_string());
+                            return Err(SemaError::Llm(e.to_string()));
+                        }
+                    };
+                    span.set_dispatch(p.name(), &req_model);
+                    span.set_response(&sema_otel::ResponseFacts {
+                        input_tokens: resp.usage.prompt_tokens,
+                        output_tokens: 0,
+                        response_model: resp.model.clone(),
+                        cost_usd: pricing::calculate_cost_for(p.name(), &resp.usage),
+                        ..Default::default()
+                    });
+                    Ok(resp)
+                })?;
+                if recording {
+                    CASSETTE.with(|c| {
+                        if let Some(cass) = c.borrow_mut().as_mut() {
+                            cass.record_entry(crate::cassette::TapeEntry::from_embed(
+                                &cassette_key,
+                                &resp.model,
+                                &resp.embeddings,
+                                resp.usage.prompt_tokens,
+                            ));
+                        }
+                    });
                 }
-            };
-            span.set_dispatch(p.name(), &req_model);
-            span.set_response(&sema_otel::ResponseFacts {
-                input_tokens: resp.usage.prompt_tokens,
-                output_tokens: 0,
-                response_model: resp.model.clone(),
-                cost_usd: pricing::calculate_cost_for(p.name(), &resp.usage),
-                ..Default::default()
-            });
-            Ok(resp)
-        })?;
+                resp
+            }
+        };
 
         track_usage(&response.usage)?;
 
@@ -4528,28 +4551,109 @@ fn run_completion(
     let key = compute_cache_key(&request);
     let decision = CASSETTE.with(|c| c.borrow().as_ref().unwrap().decide(&key));
     match decision {
-        crate::cassette::Decision::Replay(resp) => {
+        crate::cassette::Decision::Replay(entry) => {
             // A replayed call is a stand-in for a real one: emit the span with the
             // recorded facts and let the caller's usage/cost accounting run on the
             // recorded tokens (distinct from a cache hit, which reports zero usage).
+            let resp = entry.to_response();
             span.set_dispatch("cassette", &resp.model);
             span.set_response(&response_facts("cassette", &resp));
             Ok(resp)
         }
-        crate::cassette::Decision::Miss(k) => Err(SemaError::Llm(format!(
-            "cassette miss in :replay mode (key {k}) — no recorded response for this \
-             request; re-record the tape or use :auto mode"
-        ))),
+        crate::cassette::Decision::Miss(k) => Err(cassette_miss_error(&k)),
         crate::cassette::Decision::Record => {
             let resp = do_complete_inner(request, span)?;
             CASSETTE.with(|c| {
                 if let Some(cass) = c.borrow_mut().as_mut() {
-                    cass.record(&key, &resp);
+                    cass.record_entry(crate::cassette::TapeEntry::from_response(&key, &resp));
                 }
             });
             Ok(resp)
         }
     }
+}
+
+/// The hard error raised on a `:replay`-mode cassette miss (no recorded interaction
+/// for this request). Shared by the complete, stream, and embed seams.
+fn cassette_miss_error(key: &str) -> SemaError {
+    SemaError::Llm(format!(
+        "cassette miss in :replay mode (key {key}) — no recorded interaction for this \
+         request; re-record the tape or use :auto mode"
+    ))
+}
+
+/// Streaming counterpart to `run_completion`: replays the recorded chunk sequence
+/// (feeding the caller's `on_chunk` so boundaries match) and final response, or
+/// records a fresh stream by capturing chunks as they arrive. Transparent
+/// passthrough with no active cassette. Sits below the otel span, above the provider.
+fn stream_with_cassette(
+    p: &dyn LlmProvider,
+    request: ChatRequest,
+    chunk_cb: &mut dyn FnMut(&str) -> Result<(), crate::types::LlmError>,
+    span: &sema_otel::LlmSpan,
+) -> Result<ChatResponse, SemaError> {
+    let stream_real = |req: ChatRequest,
+                       cb: &mut dyn FnMut(&str) -> Result<(), crate::types::LlmError>|
+     -> Result<ChatResponse, SemaError> {
+        p.stream_complete(req, cb).map_err(|e| {
+            span.record_error(llm_error_kind(&e), &e.to_string());
+            SemaError::Llm(e.to_string())
+        })
+    };
+
+    if CASSETTE.with(|c| c.borrow().is_none()) {
+        let resp = stream_real(request.clone(), chunk_cb)?;
+        span.set_dispatch(p.name(), &request.model);
+        span.set_response(&response_facts(p.name(), &resp));
+        return Ok(resp);
+    }
+
+    let key = compute_cache_key(&request);
+    let decision = CASSETTE.with(|c| c.borrow().as_ref().unwrap().decide(&key));
+    match decision {
+        crate::cassette::Decision::Replay(entry) => {
+            for ch in &entry.chunks {
+                chunk_cb(ch).map_err(|e| SemaError::Llm(e.to_string()))?;
+            }
+            let resp = entry.to_response();
+            span.set_dispatch("cassette", &resp.model);
+            span.set_response(&response_facts("cassette", &resp));
+            Ok(resp)
+        }
+        crate::cassette::Decision::Miss(k) => Err(cassette_miss_error(&k)),
+        crate::cassette::Decision::Record => {
+            let mut collected: Vec<String> = Vec::new();
+            let mut wrap = |chunk: &str| -> Result<(), crate::types::LlmError> {
+                collected.push(chunk.to_string());
+                chunk_cb(chunk)
+            };
+            let resp = stream_real(request.clone(), &mut wrap)?;
+            CASSETTE.with(|c| {
+                if let Some(cass) = c.borrow_mut().as_mut() {
+                    cass.record_entry(crate::cassette::TapeEntry::from_stream(
+                        &key, &collected, &resp,
+                    ));
+                }
+            });
+            span.set_dispatch(p.name(), &request.model);
+            span.set_response(&response_facts(p.name(), &resp));
+            Ok(resp)
+        }
+    }
+}
+
+/// Cassette key for an embeddings request (model + the input texts).
+fn compute_embed_key(request: &EmbedRequest) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"embed");
+    if let Some(ref m) = request.model {
+        hasher.update(m.as_bytes());
+    }
+    for t in &request.texts {
+        hasher.update(t.as_bytes());
+        hasher.update(b"\0");
+    }
+    format!("{:x}", hasher.finalize())
 }
 
 /// Resolve the model id used for the cache key when the caller pinned none. With an

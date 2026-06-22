@@ -3238,6 +3238,46 @@
       "body": "Return cache statistics as a map with `:hits`, `:misses`, and `:size` (the number of entries currently in the in-memory cache).\n\n```sema\n(llm/cache-stats)   ; => {:hits 3 :misses 1 :size 4}\n```"
     },
     {
+      "name": "llm/cassette-eject",
+      "module": "llm",
+      "summary": "Flush the active cassette's tape to disk and remove it, so subsequent LLM calls hit the real provider again. Returns `#t` if a cassette was active, `#f` otherwise.",
+      "returns": "boolean",
+      "examples": [
+        "(llm/cassette-eject)"
+      ],
+      "body": "Flush the active cassette's tape to disk and remove it, so subsequent LLM calls hit the real provider again. Returns `#t` if a cassette was active, `#f` otherwise.\n\n```sema\n(llm/cassette-eject)\n```"
+    },
+    {
+      "name": "llm/cassette-load",
+      "module": "llm",
+      "summary": "Install a cassette globally (record/replay of LLM calls) from a tape file. The opts map is optional and accepts `:mode` (`:auto` default, `:record`, or `:replay`). Use `llm/cassette-save` to flush and `llm/cassette-eject` to remove it. For scoped use prefer `llm/with-cassette`.",
+      "params": [
+        {
+          "name": "path",
+          "type": "string"
+        },
+        {
+          "name": "opts",
+          "type": "map"
+        }
+      ],
+      "returns": "nil",
+      "examples": [
+        "(llm/cassette-load \"tapes/suite.jsonl\" {:mode :replay})"
+      ],
+      "body": "Install a cassette globally (record/replay of LLM calls) from a tape file. The opts map is optional and accepts `:mode` (`:auto` default, `:record`, or `:replay`). Use `llm/cassette-save` to flush and `llm/cassette-eject` to remove it. For scoped use prefer `llm/with-cassette`.\n\n```sema\n(llm/cassette-load \"tapes/suite.jsonl\" {:mode :replay})\n```"
+    },
+    {
+      "name": "llm/cassette-save",
+      "module": "llm",
+      "summary": "Flush the active cassette's tape to disk. Returns `#t` if a cassette is active, `#f` otherwise. (The tape is also flushed automatically when an `llm/with-cassette` scope exits.)",
+      "returns": "boolean",
+      "examples": [
+        "(llm/cassette-save)"
+      ],
+      "body": "Flush the active cassette's tape to disk. Returns `#t` if a cassette is active, `#f` otherwise. (The tape is also flushed automatically when an `llm/with-cassette` scope exits.)\n\n```sema\n(llm/cassette-save)\n```"
+    },
+    {
       "name": "llm/chat",
       "module": "llm",
       "summary": "Run a multi-message chat against the default provider and return the assistant's text reply. The first argument is a sequence of messages. The optional opts map accepts `:model`, `:max-tokens`, `:temperature`, `:system`, `:tools`, `:tool-mode` (`:auto` or `:none`), and `:max-tool-rounds` (default 10). When tools are supplied and tool-mode is not `:none`, it runs a tool-execution loop.",
@@ -3761,6 +3801,29 @@
         "(llm/with-cache {:ttl 600}\n  (fn [] (llm/complete \"what is 2+2?\")))"
       ],
       "body": "Run a zero-argument function with LLM response caching enabled for its duration. With two arguments, the first is an opts map accepting `:ttl` (cache time-to-live in seconds, default 3600); with one argument it is just the thunk. The previous cache settings are restored after the call. Returns the thunk's result.\n\n```sema\n(llm/with-cache {:ttl 600}\n  (fn [] (llm/complete \"what is 2+2?\")))\n```"
+    },
+    {
+      "name": "llm/with-cassette",
+      "module": "llm",
+      "summary": "Record or replay LLM calls against a tape file for the duration of a zero-argument function — for deterministic, keyless tests and reproducible demos. `:mode` is `:auto` (default — replay if recorded, else record), `:record`, or `:replay` (a miss is a hard error). The opts map is optional. The response cache is disabled for the scope, and the tape is flushed on exit. Covers `llm/complete`, `llm/chat`, `llm/embed`, `llm/stream`, and agent loops. Returns the thunk's result.",
+      "params": [
+        {
+          "name": "path",
+          "type": "string"
+        },
+        {
+          "name": "opts",
+          "type": "map"
+        },
+        {
+          "name": "thunk"
+        }
+      ],
+      "returns": "any",
+      "examples": [
+        "(llm/with-cassette \"tapes/greeting.jsonl\" {:mode :auto}\n  (fn () (llm/complete \"Say hello in one word.\" {:model \"gpt-5-mini\"})))"
+      ],
+      "body": "Record or replay LLM calls against a tape file for the duration of a zero-argument function — for deterministic, keyless tests and reproducible demos. `:mode` is `:auto` (default — replay if recorded, else record), `:record`, or `:replay` (a miss is a hard error). The opts map is optional. The response cache is disabled for the scope, and the tape is flushed on exit. Covers `llm/complete`, `llm/chat`, `llm/embed`, `llm/stream`, and agent loops. Returns the thunk's result.\n\n```sema\n(llm/with-cassette \"tapes/greeting.jsonl\" {:mode :auto}\n  (fn () (llm/complete \"Say hello in one word.\" {:model \"gpt-5-mini\"})))\n```"
     },
     {
       "name": "llm/with-fallback",

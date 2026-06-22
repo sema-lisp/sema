@@ -28,9 +28,7 @@ fn compat_off_emits_no_aliases() {
         .eval_str_compiled(r#"(llm/complete "q" {:max-tokens 8})"#)
         .expect("completion");
 
-    let chat = cap
-        .span_named("chat fake-model")
-        .expect("a chat span");
+    let chat = cap.span_named("chat fake-model").expect("a chat span");
     let attrs = &chat["attributes"];
 
     // None of the compat alias keys may appear.

@@ -54,9 +54,15 @@ fn compat_all_emits_backend_aliases() {
     assert_eq!(attr("chat", "langsmith.span.kind"), "llm");
     assert_eq!(attr("chat", "gen_ai.system"), "fake");
     assert_eq!(attr("chat", "langfuse.observation.type"), "generation");
-    assert_eq!(attr("chat", "langfuse.observation.model.name"), "fake-model");
+    assert_eq!(
+        attr("chat", "langfuse.observation.model.name"),
+        "fake-model"
+    );
     // content I/O aliases (capture on)
-    assert!(attr("chat", "input.value").is_string(), "openinference input.value");
+    assert!(
+        attr("chat", "input.value").is_string(),
+        "openinference input.value"
+    );
     assert_eq!(attr("chat", "input.mime_type"), "application/json");
     assert!(attr("chat", "traceloop.entity.input").is_string());
     // usage_details JSON parses

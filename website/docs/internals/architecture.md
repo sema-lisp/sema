@@ -47,7 +47,7 @@ The entire implementation is ~116k lines of Rust across 15 crates, each with a c
 The critical constraint: **sema-stdlib and sema-llm depend on sema-core, not on sema-eval.** This avoids circular dependencies but creates a problem — both crates sometimes need to evaluate user code. They solve it via dependency inversion:
 
 - **sema-stdlib** invokes the real evaluator via callbacks (`call_callback`/`eval_callback`) registered by `sema-eval` at startup — stored on the `EvalContext` and a shared thread-local stdlib context
-- **sema-llm** uses its own eval callback for legacy reasons, plus the core callbacks
+- **sema-llm** mostly uses the same core callbacks, but still carries a redundant second eval callback of its own (tech debt — see [Solution 2](#solution-2-eval-callback-sema-llm-redundant-slated-for-removal))
 
 This is discussed in detail in [The Circular Dependency Problem](#the-circular-dependency-problem).
 
@@ -415,7 +415,7 @@ When Sema is embedded as a library it **never installs a global tracer provider 
 
 ## The Circular Dependency Problem
 
-The most architecturally significant constraint in Sema is the dependency direction between the evaluator and the library crates.
+One layering constraint shapes how the library crates reach the evaluator. It's a textbook case of **dependency inversion**, called out here mainly because the same pattern recurs in `sema-stdlib` and `sema-llm`.
 
 ### The Problem
 
@@ -424,13 +424,15 @@ Both `sema-stdlib` and `sema-llm` sometimes need to evaluate user code:
 - **sema-stdlib:** `file/fold-lines` invokes a user-provided lambda on each line. `map`, `filter`, `fold`, `for-each`, `sort` all take lambda arguments.
 - **sema-llm:** Tool handlers defined via `deftool` are Sema expressions that must be evaluated when an LLM invokes the tool.
 
-But `sema-stdlib` and `sema-llm` depend on `sema-core`, not `sema-eval`. They can't call `eval_value()` because that function lives in `sema-eval`, which is upstream.
+But the dependency already runs the *other* way: `sema-eval` depends on `sema-stdlib` and `sema-llm` so it can register their builtins at startup. If either of them depended on `sema-eval` to reach `eval_value()`, that would close a cycle — which Cargo forbids.
 
 ```
-sema-eval ──depends-on──► sema-core
-sema-stdlib ──depends-on──► sema-core
-sema-stdlib ──CANNOT depend on──► sema-eval  (would create a cycle)
+sema-eval   ──depends-on──► sema-stdlib / sema-llm   (to register their builtins)
+sema-stdlib ──CANNOT depend on──► sema-eval          (would close the cycle)
+            └── so it reaches the evaluator through a callback instead
 ```
+
+The cycle is a hard Cargo rule, but its *existence* is a deliberate trade: keeping the standard library and LLM layers as separate crates (for wasm gating, compile times, and isolated testing) while letting `sema-eval` assemble a batteries-included interpreter. Merging them into one crate would remove the cycle and the callback — at the cost of that modularity. The inversion below is the cheaper trade.
 
 ### Solution 1: Callback Architecture (sema-core + sema-stdlib)
 
@@ -469,9 +471,9 @@ The `with_stdlib_ctx` function provides a shared `EvalContext` for stdlib callba
 
 This is a clean dependency inversion — `sema-stdlib` depends only on the callback signature defined in `sema-core`, not on `sema-eval`. The runtime cost is one `Cell::get()` + function pointer dispatch per call, which is negligible. Unlike the previous mini-evaluator approach, this architecture uses the _same_ evaluator everywhere — all special forms, builtins, and features are available inside higher-order functions like `map` and `file/fold-lines`.
 
-### Solution 2: Eval Callback (sema-llm)
+### Solution 2: Eval Callback (sema-llm) — redundant, slated for removal
 
-`sema-llm` predates the core callback architecture and maintains its own eval callback in a thread-local. It stores a function pointer that bridges the dependency gap:
+`sema-llm` predates Solution 1 and still carries its *own* parallel callback — a `Box<dyn Fn>` in a thread-local (`EVAL_FN`), plus a hand-rolled function-application routine (`call_value_fn`) and a degraded mini-evaluator fallback (`simple_eval`). It bridges the same gap, redundantly:
 
 ```rust
 pub type EvalCallback = Box<dyn Fn(&EvalContext, &Value, &Env) -> Result<Value, SemaError>>;
@@ -507,7 +509,7 @@ fn full_eval(ctx: &EvalContext, expr: &Value, env: &Env) -> Result<Value, SemaEr
 }
 ```
 
-This is the classic dependency inversion pattern — `sema-llm` depends on an _interface_ (the callback signature) rather than the concrete implementation. The runtime cost is one `RefCell::borrow()` + dynamic dispatch per eval call, which is negligible for LLM tool invocations (the LLM API call dominates by orders of magnitude).
+This is the same dependency-inversion idea as Solution 1, but it should not be a *second* mechanism. `sema-llm` already uses the core `sema_core::call_callback` in a few places; the bespoke path duplicates it at ~15 call sites and, worse, `call_value_fn` re-implements function application by binding params into a plain `Env` and evaluating directly — bypassing the VM closure machinery (`run_nested_closure`) that the canonical `call_value` routes through. That means `set!`, captured upvalues, and async/yield *inside* a tool handler or streaming callback can behave differently than the same code inside a stdlib HOF. Consolidating `sema-llm` onto the core callback (and deleting `EVAL_FN`/`call_value_fn`/`simple_eval`) is tracked tech debt — see `docs/plans/2026-06-22-unify-sema-llm-eval-callback.md`.
 
 ### Why Not a Trait?
 

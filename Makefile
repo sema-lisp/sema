@@ -63,6 +63,12 @@ run:
 
 lint: fmt-check clippy
 
+# Fail if a publishable workspace crate is missing from publish.yml's order
+# (guards against a half-published release on a newly-added crate).
+.PHONY: check-publish-list
+check-publish-list:
+	@./scripts/check-publish-list.sh
+
 # Regenerate the builtin doc index (and, later, the API-reference site) from the canonical
 # structured source in crates/sema-docs/entries/stdlib + special-forms.
 docs:

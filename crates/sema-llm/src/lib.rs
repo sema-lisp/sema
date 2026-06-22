@@ -1,6 +1,7 @@
 #![allow(clippy::mutable_key_type)]
 pub mod anthropic;
 pub mod builtins;
+pub mod cassette;
 pub mod embeddings;
 pub mod fake;
 pub mod gemini;

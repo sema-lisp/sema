@@ -73,6 +73,9 @@ thread_local! {
     static CACHE_TTL_SECS: Cell<i64> = const { Cell::new(3600) };
     static CACHE_HITS: Cell<u64> = const { Cell::new(0) };
     static CACHE_MISSES: Cell<u64> = const { Cell::new(0) };
+    // Active LLM cassette (record/replay). Sits below the otel span + response
+    // cache, above the real provider — see crate::cassette.
+    static CASSETTE: RefCell<Option<crate::cassette::Cassette>> = const { RefCell::new(None) };
     static FALLBACK_CHAIN: RefCell<Option<Vec<FallbackEntry>>> = const { RefCell::new(None) };
     static VECTOR_STORES: RefCell<std::collections::HashMap<String, VectorStore>> =
         RefCell::new(std::collections::HashMap::new());
@@ -120,6 +123,7 @@ pub fn reset_runtime_state() {
     VECTOR_STORES.with(|s| s.borrow_mut().clear());
     RATE_LIMIT_RPS.with(|r| r.set(None));
     RATE_LIMIT_LAST.with(|r| r.set(0));
+    CASSETTE.with(|c| *c.borrow_mut() = None);
     LAST_SERVING_PROVIDER.with(|p| *p.borrow_mut() = None);
     RETRY_BASE_MS.with(|c| c.set(500));
     NETWORK_MAX_RETRIES.with(|c| c.set(3));
@@ -824,6 +828,23 @@ fn guard_provider_url(unrestricted: bool, opts: &BTreeMap<Value, Value>) -> Resu
 
 pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
     let unrestricted = sandbox.is_unrestricted();
+
+    // CI/global cassette: SEMA_LLM_CASSETTE=path [+ SEMA_LLM_CASSETTE_MODE=replay|
+    // record|auto] installs a cassette for the whole process, so a suite can be
+    // forced into deterministic replay without touching test source. Only honored
+    // outside the sandbox (it reads/writes a file path from the environment).
+    if unrestricted {
+        if let Ok(path) = std::env::var("SEMA_LLM_CASSETTE") {
+            if !path.is_empty() {
+                let mode = std::env::var("SEMA_LLM_CASSETTE_MODE")
+                    .map(|s| crate::cassette::CassetteMode::parse(&s))
+                    .unwrap_or(crate::cassette::CassetteMode::Auto);
+                let cassette =
+                    crate::cassette::Cassette::load(std::path::PathBuf::from(path), mode);
+                CASSETTE.with(|c| *c.borrow_mut() = Some(cassette));
+            }
+        }
+    }
     // (llm/configure :anthropic {:api-key "..." :default-model "..."})
     // (llm/configure :openai {:api-key "..." :base-url "..." :default-model "..."})
     register_fn(env, "llm/configure", move |args| {
@@ -3463,6 +3484,89 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
         result
     });
 
+    // --- Cassette (record/replay) builtins ---
+
+    register_fn_ctx(env, "llm/with-cassette", |ctx, args| {
+        // (llm/with-cassette "path.jsonl" [{:mode :auto}] thunk)
+        if args.len() < 2 || args.len() > 3 {
+            return Err(SemaError::arity("llm/with-cassette", "2 or 3", args.len()));
+        }
+        let path = args[0]
+            .as_str()
+            .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
+        let (mode, body_fn) = if args.len() == 3 {
+            let opts = args[1]
+                .as_map_ref()
+                .ok_or_else(|| SemaError::type_error("map", args[1].type_name()))?;
+            let mode = get_opt_effort(opts, "mode")
+                .map(|s| crate::cassette::CassetteMode::parse(&s))
+                .unwrap_or(crate::cassette::CassetteMode::Auto);
+            (mode, &args[2])
+        } else {
+            (crate::cassette::CassetteMode::Auto, &args[1])
+        };
+        if body_fn.as_lambda_rc().is_none() && body_fn.as_native_fn_rc().is_none() {
+            return Err(SemaError::type_error("function", body_fn.type_name()));
+        }
+        let cassette = crate::cassette::Cassette::load(std::path::PathBuf::from(path), mode);
+        // Swap in the cassette and disable the response cache for the dynamic extent
+        // (a cache hit would short-circuit before the tape — see crate::cassette).
+        let prev_cassette = CASSETTE.with(|c| c.borrow_mut().replace(cassette));
+        let prev_cache = CACHE_ENABLED.with(|c| c.replace(false));
+        let result = sema_core::call_callback(ctx, body_fn, &[]);
+        // Flush the tape, then restore the prior cassette + cache state.
+        CASSETTE.with(|c| {
+            if let Some(cass) = c.borrow().as_ref() {
+                let _ = cass.save();
+            }
+        });
+        CASSETTE.with(|c| *c.borrow_mut() = prev_cassette);
+        CACHE_ENABLED.with(|c| c.set(prev_cache));
+        result
+    });
+
+    register_fn(env, "llm/cassette-load", |args| {
+        // (llm/cassette-load "path" [{:mode :replay}]) — install globally.
+        if args.is_empty() || args.len() > 2 {
+            return Err(SemaError::arity("llm/cassette-load", "1 or 2", args.len()));
+        }
+        let path = args[0]
+            .as_str()
+            .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
+        let mode = if args.len() == 2 {
+            let opts = args[1]
+                .as_map_ref()
+                .ok_or_else(|| SemaError::type_error("map", args[1].type_name()))?;
+            get_opt_effort(opts, "mode")
+                .map(|s| crate::cassette::CassetteMode::parse(&s))
+                .unwrap_or(crate::cassette::CassetteMode::Auto)
+        } else {
+            crate::cassette::CassetteMode::Auto
+        };
+        let cassette = crate::cassette::Cassette::load(std::path::PathBuf::from(path), mode);
+        CASSETTE.with(|c| *c.borrow_mut() = Some(cassette));
+        Ok(Value::nil())
+    });
+
+    register_fn(env, "llm/cassette-save", |_args| {
+        let saved = CASSETTE.with(|c| c.borrow().as_ref().map(|cass| cass.save()));
+        match saved {
+            Some(Ok(())) => Ok(Value::bool(true)),
+            Some(Err(e)) => Err(SemaError::eval(format!("cassette save failed: {e}"))),
+            None => Ok(Value::bool(false)),
+        }
+    });
+
+    register_fn(env, "llm/cassette-eject", |_args| {
+        let cass = CASSETTE.with(|c| c.borrow_mut().take());
+        if let Some(cass) = cass {
+            let _ = cass.save();
+            Ok(Value::bool(true))
+        } else {
+            Ok(Value::bool(false))
+        }
+    });
+
     // --- Fallback provider builtins ---
 
     register_fn_ctx(env, "llm/with-fallback", |ctx, args| {
@@ -4356,7 +4460,7 @@ fn do_complete(request: ChatRequest) -> Result<ChatResponse, SemaError> {
     LAST_SERVING_PROVIDER.with(|p| *p.borrow_mut() = None);
     let cache_enabled = CACHE_ENABLED.with(|c| c.get());
     if !cache_enabled {
-        return do_complete_inner(request, &span);
+        return run_completion(request, &span);
     }
     // Compute the cache key from the model the request will *logically* use, but
     // without mutating the request that flows into the fallback loop. Pre-filling
@@ -4401,9 +4505,51 @@ fn do_complete(request: ChatRequest) -> Result<ChatResponse, SemaError> {
         }
     }
     CACHE_MISSES.with(|c| c.set(c.get() + 1));
-    let response = do_complete_inner(request, &span)?;
+    let response = run_completion(request, &span)?;
     store_cached(&cache_key, &response);
     Ok(response)
+}
+
+/// Cassette interception seam: below the otel span + response cache (set up in
+/// `do_complete`), above the real provider chain (`do_complete_inner`). When a
+/// cassette is active it replays a recorded response (still emitting the chat
+/// span, populated from the recorded model/usage) or records a fresh one; with no
+/// cassette it's a transparent passthrough. See `crate::cassette`.
+fn run_completion(
+    request: ChatRequest,
+    span: &sema_otel::LlmSpan,
+) -> Result<ChatResponse, SemaError> {
+    if CASSETTE.with(|c| c.borrow().is_none()) {
+        return do_complete_inner(request, span);
+    }
+    // Key by the request as-is (no default-model resolution) so record and replay
+    // produce the same key for an identical call, even with no provider configured
+    // (keyless replay). Shares the hashing with the response cache.
+    let key = compute_cache_key(&request);
+    let decision = CASSETTE.with(|c| c.borrow().as_ref().unwrap().decide(&key));
+    match decision {
+        crate::cassette::Decision::Replay(resp) => {
+            // A replayed call is a stand-in for a real one: emit the span with the
+            // recorded facts and let the caller's usage/cost accounting run on the
+            // recorded tokens (distinct from a cache hit, which reports zero usage).
+            span.set_dispatch("cassette", &resp.model);
+            span.set_response(&response_facts("cassette", &resp));
+            Ok(resp)
+        }
+        crate::cassette::Decision::Miss(k) => Err(SemaError::Llm(format!(
+            "cassette miss in :replay mode (key {k}) — no recorded response for this \
+             request; re-record the tape or use :auto mode"
+        ))),
+        crate::cassette::Decision::Record => {
+            let resp = do_complete_inner(request, span)?;
+            CASSETTE.with(|c| {
+                if let Some(cass) = c.borrow_mut().as_mut() {
+                    cass.record(&key, &resp);
+                }
+            });
+            Ok(resp)
+        }
+    }
 }
 
 /// Resolve the model id used for the cache key when the caller pinned none. With an

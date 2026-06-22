@@ -28,6 +28,12 @@ jobs:
       - name: Cache cargo + target
         uses: Swatinem/rust-cache@v2
 
+      # Gate the publish on a complete crate list: every publishable workspace
+      # crate must be in publish.yml's order, so a release can't half-publish on a
+      # newly-added crate (as happened with sema-otel in 1.22.0).
+      - name: Check publish list is complete
+        run: ./scripts/check-publish-list.sh
+
       - name: Check formatting
         run: cargo fmt -- --check
 

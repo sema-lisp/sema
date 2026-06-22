@@ -477,3 +477,134 @@ fn spike_mid_stream_failure_behaviour() {
         "no auto-retry on a mid-stream failure (a retry would re-emit the partial)"
     );
 }
+
+#[test]
+fn stream_budget_pre_gate_blocks_at_open() {
+    // :on-stream :pre-gate makes llm/stream refuse to open once the budget is spent.
+    let fake = FakeProvider::builder("fake")
+        .model("costly")
+        .reply_with_usage("spent", 1000, 1000) // first complete spends $2
+        .stream(&["must ", "not ", "run"])
+        .build();
+    let src = r#"
+        (llm/set-pricing "costly" 1000.0 1000.0)   ; $2 at 1000 in + 1000 out
+        (define out "")
+        (llm/with-budget {:max-cost-usd 0.5 :on-stream :pre-gate}
+          (fn ()
+            (try (llm/complete "spend" {:model "costly"}) (catch e nil))
+            (try (llm/stream "p" (lambda (c) (set! out (string-append out c))) {:model "costly"})
+                 (catch e (set! out "BLOCKED")))))
+        out
+    "#;
+    let (result, recorder) = eval_with_fake(src, fake);
+    assert_eq!(result.expect("eval ok").as_str(), Some("BLOCKED"));
+    assert_eq!(
+        recorder.requests().len(),
+        1,
+        "blocked stream must not reach the provider"
+    );
+}
+
+#[test]
+fn stream_default_does_not_pre_gate_budget() {
+    // Without :on-stream :pre-gate, an over-budget stream still OPENS and emits chunks
+    // (the callback fires); only the post-call usage check enforces the cap afterward.
+    // Pre-gate's difference is that the callback never fires (blocked at open).
+    let fake = FakeProvider::builder("fake")
+        .model("costly")
+        .reply_with_usage("spent", 1000, 1000)
+        .stream(&["ran"])
+        .build();
+    let src = r#"
+        (llm/set-pricing "costly" 1000.0 1000.0)
+        (define got-chunk #f)
+        (llm/with-budget {:max-cost-usd 0.5}
+          (fn ()
+            (try (llm/complete "spend" {:model "costly"}) (catch e nil))
+            (try (llm/stream "p" (lambda (c) (set! got-chunk #t)) {:model "costly"})
+                 (catch e nil))))
+        got-chunk
+    "#;
+    let (result, _r) = eval_with_fake(src, fake);
+    assert_eq!(
+        result.expect("eval ok"),
+        Value::bool(true),
+        "default: stream opens and the callback fires even when over budget (no pre-gate)"
+    );
+}
+
+fn eval_with_two(
+    src: &str,
+    p1: FakeProvider,
+    p2: FakeProvider,
+) -> Result<Value, sema_core::SemaError> {
+    let interp = Interpreter::new();
+    reset_runtime_state();
+    register_test_provider(Box::new(p1));
+    register_test_provider(Box::new(p2));
+    interp.eval_str_compiled(src)
+}
+
+#[test]
+fn stream_fails_over_at_open() {
+    // p1 errors before any chunk → fall over to p2, which streams.
+    use sema_llm::types::LlmError;
+    let p1 = FakeProvider::builder("p1")
+        .model("m")
+        .error(LlmError::Http("p1 is down".to_string()))
+        .build();
+    let p2 = FakeProvider::builder("p2")
+        .model("m")
+        .stream(&["hello ", "world"])
+        .build();
+    let src = r#"
+        (define out "")
+        (llm/with-fallback [:p1 :p2]
+          (fn () (llm/stream "p" (lambda (c) (set! out (string-append out c))))))
+        out
+    "#;
+    let val = eval_with_two(src, p1, p2).expect("fallback stream should succeed");
+    assert_eq!(
+        val.as_str(),
+        Some("hello world"),
+        "must fail over to p2 at open"
+    );
+}
+
+#[test]
+fn stream_does_not_fail_over_mid_stream() {
+    // p1 emits a partial chunk THEN errors → surface, do NOT fall over (would duplicate).
+    use sema_llm::types::LlmError;
+    let p1 = FakeProvider::builder("p1")
+        .model("m")
+        .stream_then_error(
+            &["partial"],
+            LlmError::Http("dropped mid-stream".to_string()),
+        )
+        .build();
+    let p2 = FakeProvider::builder("p2")
+        .model("m")
+        .stream(&["FULL"])
+        .build();
+    let src = r#"
+        (define out "")
+        (define errored #f)
+        (llm/with-fallback [:p1 :p2]
+          (fn ()
+            (try (llm/stream "p" (lambda (c) (set! out (string-append out c))))
+                 (catch e (set! errored #t)))))
+        (list out errored)
+    "#;
+    let val = eval_with_two(src, p1, p2).expect("eval ok");
+    let items = val.as_seq().unwrap();
+    assert_eq!(
+        items[0].as_str(),
+        Some("partial"),
+        "partial kept; p2's FULL must NOT appear"
+    );
+    assert_eq!(
+        items[1],
+        Value::bool(true),
+        "mid-stream error surfaces (no silent failover)"
+    );
+}

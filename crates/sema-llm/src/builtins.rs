@@ -32,6 +32,10 @@ thread_local! {
     static BUDGET_SPENT: RefCell<f64> = const { RefCell::new(0.0) };
     static BUDGET_TOKEN_LIMIT: RefCell<Option<u64>> = const { RefCell::new(None) };
     static BUDGET_TOKENS_SPENT: RefCell<u64> = const { RefCell::new(0) };
+    /// When set (via `llm/with-budget {:on-stream :pre-gate}`), `llm/stream` checks the
+    /// budget BEFORE opening a stream (usage is unknown until a stream ends, so this is
+    /// the only honest place to gate). Default off — streams don't enforce the budget.
+    static STREAM_BUDGET_PREGATE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static BUDGET_STACK: RefCell<Vec<BudgetFrame>> = const { RefCell::new(Vec::new()) };
 }
 
@@ -1710,37 +1714,21 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
             }
         }
 
-        let response = with_provider(|p| {
-            if request.model.is_empty() {
-                let mut req = request.clone();
-                req.model = p.default_model().to_string();
-                let mut chunk_cb = |chunk: &str| -> Result<(), crate::types::LlmError> {
-                    if let Some(ref cb) = callback {
-                        sema_core::call_callback(ctx, cb, &[Value::string(chunk)])
-                            .map_err(|e| crate::types::LlmError::Config(e.to_string()))?;
-                    } else {
-                        print!("{}", chunk);
-                        use std::io::Write;
-                        std::io::stdout().flush().ok();
-                    }
-                    Ok(())
-                };
-                stream_with_cassette(p, req, &mut chunk_cb, &span)
+        // Deliver each chunk to the user callback (or stdout). One callback for both the
+        // model-pinned and default-model paths; the dispatch helper resolves the model.
+        let mut chunk_cb = |chunk: &str| -> Result<(), crate::types::LlmError> {
+            if let Some(ref cb) = callback {
+                sema_core::call_callback(ctx, cb, &[Value::string(chunk)])
+                    .map_err(|e| crate::types::LlmError::Config(e.to_string()))?;
             } else {
-                let mut chunk_cb = |chunk: &str| -> Result<(), crate::types::LlmError> {
-                    if let Some(ref cb) = callback {
-                        sema_core::call_callback(ctx, cb, &[Value::string(chunk)])
-                            .map_err(|e| crate::types::LlmError::Config(e.to_string()))?;
-                    } else {
-                        print!("{}", chunk);
-                        use std::io::Write;
-                        std::io::stdout().flush().ok();
-                    }
-                    Ok(())
-                };
-                stream_with_cassette(p, request.clone(), &mut chunk_cb, &span)
+                print!("{}", chunk);
+                use std::io::Write;
+                std::io::stdout().flush().ok();
             }
-        })?;
+            Ok(())
+        };
+        // Stream-open dispatch: budget pre-gate + rate-limit + fallback-at-open.
+        let response = stream_with_dispatch(request, &mut chunk_cb, &span)?;
 
         // Print newline after streaming if using default display
         if callback.is_none() {
@@ -3619,8 +3607,18 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
             ));
         }
 
+        // `:on-stream :pre-gate` opts streaming calls into budget enforcement (checked
+        // before opening the stream). Default `:off` keeps streams unenforced.
+        let pregate = opts
+            .get(&Value::keyword("on-stream"))
+            .and_then(|v| v.as_keyword())
+            .map(|s| s == "pre-gate")
+            .unwrap_or(false);
+
         push_budget_scope(max_cost, max_tokens);
+        let prev_pregate = STREAM_BUDGET_PREGATE.with(|c| c.replace(pregate));
         let result = sema_core::call_callback(ctx, body_fn, &[]);
+        STREAM_BUDGET_PREGATE.with(|c| c.set(prev_pregate));
         pop_budget_scope();
         result
     });
@@ -5138,6 +5136,114 @@ fn do_complete_with_provider(
         );
         Ok(resp)
     })
+}
+
+/// Stream-open budget pre-gate. When `:on-stream :pre-gate` is active, refuse to OPEN a
+/// stream if the scope's spend is already at/over the cost or token limit. (A stream's own
+/// cost is unknown until it ends, so this is the only honest gate — a single in-flight
+/// stream can still push past the cap, but the next call is blocked.)
+fn stream_budget_pregate() -> Result<(), SemaError> {
+    if !STREAM_BUDGET_PREGATE.with(|c| c.get()) {
+        return Ok(());
+    }
+    if let Some(limit) = BUDGET_LIMIT.with(|l| *l.borrow()) {
+        let spent = BUDGET_SPENT.with(|s| *s.borrow());
+        if spent >= limit {
+            return Err(SemaError::Llm(format!(
+                "budget exceeded: ${spent:.4} of ${limit:.4} limit already spent — \
+                 streaming call blocked at open"
+            )));
+        }
+    }
+    if let Some(limit) = BUDGET_TOKEN_LIMIT.with(|l| *l.borrow()) {
+        let spent = BUDGET_TOKENS_SPENT.with(|s| *s.borrow());
+        if spent >= limit {
+            return Err(SemaError::Llm(format!(
+                "token budget exceeded: {spent} of {limit} tokens already used — \
+                 streaming call blocked at open"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Open a stream against one fallback-chain provider (resolving its per-entry model).
+fn stream_one_provider(
+    entry: &FallbackEntry,
+    mut request: ChatRequest,
+    chunk_cb: &mut dyn FnMut(&str) -> Result<(), crate::types::LlmError>,
+    span: &sema_otel::LlmSpan,
+) -> Result<ChatResponse, SemaError> {
+    PROVIDER_REGISTRY.with(|reg| {
+        let reg = reg.borrow();
+        let provider = reg.get(&entry.provider).ok_or_else(|| {
+            SemaError::Llm(format!("fallback provider '{}' not found", entry.provider))
+        })?;
+        if let Some(model) = &entry.model {
+            request.model = model.clone();
+        } else if request.model.is_empty() {
+            request.model = provider.default_model().to_string();
+        }
+        let resp = stream_with_cassette(provider, request, chunk_cb, span)?;
+        set_serving_provider(&entry.provider);
+        Ok(resp)
+    })
+}
+
+/// Stream-open dispatch for `llm/stream`: budget pre-gate + rate-limit, then open the
+/// stream through the fallback chain. Fails over to the next provider ONLY if a provider
+/// errors *before emitting any chunk*; once a chunk is delivered a mid-stream error
+/// surfaces (failing over would re-emit the already-delivered partial — see the spike test
+/// `spike_mid_stream_failure_behaviour`).
+fn stream_with_dispatch(
+    request: ChatRequest,
+    chunk_cb: &mut dyn FnMut(&str) -> Result<(), crate::types::LlmError>,
+    span: &sema_otel::LlmSpan,
+) -> Result<ChatResponse, SemaError> {
+    stream_budget_pregate()?;
+    enforce_rate_limit();
+
+    let chain = FALLBACK_CHAIN.with(|c| c.borrow().clone());
+    match chain {
+        Some(chain) if !chain.is_empty() => {
+            let mut last_error = None;
+            for entry in &chain {
+                let mut emitted = false;
+                let result = {
+                    let mut wrapped = |c: &str| -> Result<(), crate::types::LlmError> {
+                        emitted = true;
+                        chunk_cb(c)
+                    };
+                    stream_one_provider(entry, request.clone(), &mut wrapped, span)
+                };
+                match result {
+                    Ok(resp) => return Ok(resp),
+                    Err(e) if emitted => {
+                        // Mid-stream failure: surface; do NOT fail over (would duplicate).
+                        span.record_error("provider_error", &e.to_string());
+                        return Err(e);
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "Provider '{}' failed to open stream: {e}, trying next...",
+                            entry.provider
+                        );
+                        last_error = Some(e);
+                    }
+                }
+            }
+            let err = last_error.unwrap_or_else(|| SemaError::Llm("all providers failed".into()));
+            span.record_error("provider_error", &err.to_string());
+            Err(err)
+        }
+        _ => with_provider(|p| {
+            let mut req = request;
+            if req.model.is_empty() {
+                req.model = p.default_model().to_string();
+            }
+            stream_with_cassette(p, req, chunk_cb, span)
+        }),
+    }
 }
 
 /// Original do_complete logic (provider dispatch + rate-limit retry).

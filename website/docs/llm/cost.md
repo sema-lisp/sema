@@ -111,6 +111,17 @@ Scoped budget — sets spending limits for the duration of a thunk, then restore
 
 When a token budget is active, `llm/budget-remaining` includes `:token-limit`, `:tokens-spent`, and `:tokens-remaining` in addition to the cost fields.
 
+#### Streaming and the budget
+
+By default, budgets enforce on **non-streaming** calls (the spend is known after each call completes). A stream's cost isn't known until it ends, so streams aren't budget-gated unless you opt in with `:on-stream :pre-gate` — which refuses to **open** a stream once the scope's spend is already at the cap:
+
+```sema
+(llm/with-budget {:max-cost-usd 0.50 :on-stream :pre-gate} (lambda ()
+  (llm/stream "..." on-token)))   ; blocked at open once $0.50 is spent
+```
+
+A single in-flight stream can still push *past* the cap (you only learn its cost when it finishes), but the next call is blocked. Usage is tracked either way.
+
 ### `llm/clear-budget`
 
 Remove the spending limit.

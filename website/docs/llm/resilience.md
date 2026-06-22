@@ -56,11 +56,15 @@ switches *providers* on failure) and the generic [`retry`](#generic-retry) (whic
 wraps *any* thunk). They compose: each provider in a fallback chain does its own
 transient-error retry before the chain moves on.
 
-::: tip Streaming bypass
-Streaming calls (`llm/stream`) currently bypass the automatic retry, response
-cache, budget enforcement, and fallback chain — they hit the provider directly.
-Use the non-streaming forms when you need those guarantees.
-:::
+### Streaming and resilience
+
+`llm/stream` applies these guarantees **at stream-open** — before the first token:
+
+- **Fallback** — if a provider fails to *open* the stream, the chain fails over to the next, just like non-streaming. Once the first token has been delivered, a **mid-stream** failure is **not** failed over (switching providers mid-answer would re-emit the partial you already received); the error surfaces and the partial text is kept.
+- **Rate-limiting** — `llm/with-rate-limit` gates the stream-open call the same as a non-streaming one.
+- **Budget** — opt in with `llm/with-budget {... :on-stream :pre-gate}`: the stream is refused at open if the scope's spend is already at the cap. By default streams are **not** budget-gated (a stream's cost is unknown until it ends), though usage is still tracked afterward.
+
+Two things still **don't** apply to streams: the **response cache** (a live stream isn't cached — for deterministic replay use [cassettes](/docs/llm/cassettes)) and **mid-stream retry** (a retry would duplicate already-emitted output — see above).
 
 ## Rate Limiting
 

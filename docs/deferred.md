@@ -214,13 +214,11 @@ Remaining work:
 (`docs/plans/archive/2026-06-21-llm-bulletproofing.md`) shipped Phases 0–3, 4.1, 4.2, 4.4,
 5, and 6.3. What's left:
 
-- **4.3 — streaming through the dispatch layer (PENDING DECISION).** `llm/stream` still
-  bypasses budget/cache/rate-limit/fallback (the bypass is documented in
-  `docs/llm/resilience.md`). Framework research (Vercel AI SDK / LangChain / LiteLLM /
-  LlamaIndex / Mastra) shows the consensus is to act at *stream-open*: budget pre-gate on
-  *accumulated* spend, rate-limit + fallback before the first chunk, cache via
-  buffer-then-replay; mid-stream failure after partial emission has no clean recovery
-  anywhere. Awaiting an owner decision on which concerns to bind to stream-open vs. leave bypassed.
+- ~~**4.3 — streaming through the dispatch layer**~~ ✅ **DONE 2026-06-23.** `llm/stream`
+  now applies rate-limit + fallback at stream-open and an opt-in budget pre-gate
+  (`:on-stream :pre-gate`); mid-stream failure surfaces + keeps the partial (no failover —
+  the spike proved a retry would duplicate). Cache stays off for streams (cassettes cover
+  deterministic replay). Verified live.
 - **6.1 — `llm/generate-object`**: schema-validated structured output with a bounded repair
   loop (today only `llm/extract` does schema+reask). Reuse `validate_extraction` +
   `format_reask_prompt`.

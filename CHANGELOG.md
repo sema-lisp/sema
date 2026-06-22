@@ -4,6 +4,14 @@
 
 ### Added
 
+- **`llm/stream` now applies resilience at stream-open.** Streaming was bypassing the whole
+  dispatch layer; it now runs through **rate-limiting** and **provider fallback** before the
+  first token (a primary that fails to *open* the stream fails over to the next; once a token
+  is delivered, a mid-stream failure surfaces and keeps the partial — failing over would
+  re-emit it). Budgets can gate streams with `llm/with-budget {... :on-stream :pre-gate}`
+  (off by default). The cache and mid-stream retry still don't apply to streams (use
+  [cassettes](https://sema-lang.com/docs/llm/cassettes) for deterministic stream replay).
+  Verified live (OpenAI bad-model → fail over to Anthropic mid-`llm/stream`).
 - **Per-call `:timeout` (ms)** on `llm/complete` / `llm/chat` / `llm/send`. The option
   now reaches the HTTP layer as a per-request reqwest timeout for the network providers
   (Anthropic / OpenAI / Gemini) — previously parsed but ignored. (Local Ollama is excluded;

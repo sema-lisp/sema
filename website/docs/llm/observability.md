@@ -90,7 +90,7 @@ for how to set them). The `OTEL_*` names come from OpenTelemetry itself; the
 | --- | --- |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | The address of your tracing backend, e.g. `http://localhost:4318`. **Setting this turns tracing on.** |
 | `OTEL_EXPORTER_OTLP_PROTOCOL` | How to talk to it: `http/protobuf` (default) · `http/json` · `grpc`. Keep the default unless your backend only accepts gRPC. |
-| `OTEL_EXPORTER_OTLP_HEADERS` | Extra HTTP headers, usually authentication — e.g. `Authorization=Bearer <token>`. Comma-separated `key=value` pairs. |
+| `OTEL_EXPORTER_OTLP_HEADERS` | Extra HTTP headers, usually authentication — e.g. `Authorization=Bearer <token>`. Comma-separated `name=value` pairs; see [Authentication headers](#authentication-headers). |
 | `OTEL_EXPORTER_OTLP_TIMEOUT` | Per-export timeout in milliseconds. Keep it short (e.g. `3000`) so a dead backend never holds things up. |
 | `OTEL_SERVICE_NAME` | The name your runs appear under in the backend (default `sema`). |
 | `SEMA_OTEL_FILE` | Write traces to this file path, one JSON object per line, instead of sending them over the network. Also turns tracing on. |
@@ -115,11 +115,50 @@ cat /tmp/sema-trace.jsonl | jq .
 
 The file is written synchronously, so even a one-line script captures its spans.
 
-### Sending to hosted Langfuse
+## Authentication headers
 
-A hosted backend usually needs an endpoint plus an auth header. For
-[Langfuse](https://langfuse.com/), the header is HTTP Basic auth built from your project
-keys:
+Almost every **hosted** backend needs an API key, and you pass it as an HTTP header through
+`OTEL_EXPORTER_OTLP_HEADERS`. (This is separate from `SEMA_OTEL_COMPAT`, which only relabels
+attribute names — see [Backend Compatibility](./otel-compat).) The header **name** and the
+key are dictated by the backend, not by Sema; always check the tool's own OTLP page for the
+exact names.
+
+### The format
+
+`OTEL_EXPORTER_OTLP_HEADERS` is a comma-separated list of `name=value` pairs — the
+[W3C Baggage](https://www.w3.org/TR/baggage/) format the OpenTelemetry spec mandates:
+
+```bash
+# one header
+OTEL_EXPORTER_OTLP_HEADERS="Authorization=Bearer sk-abc123"
+
+# two headers — separate with a comma
+OTEL_EXPORTER_OTLP_HEADERS="Authorization=Bearer sk-abc123,x-project=my-app"
+```
+
+Rules worth knowing:
+
+- **Separate multiple headers with commas**, not semicolons — semicolons are not supported.
+- **The first `=` splits the name from the value**, so the value itself may contain `=`.
+  base64 strings with `=` padding (common in Basic auth) work fine.
+- **Avoid literal commas or spaces inside a value** — a comma starts a new header. If a token
+  genuinely needs one, percent-encode it (`,` → `%2C`). Bearer tokens and base64 never
+  contain commas, so this rarely comes up.
+- **Quote the whole value in your shell** so `$(...)` substitutions and special characters
+  survive.
+
+### Common patterns
+
+| Auth style | `OTEL_EXPORTER_OTLP_HEADERS` value | Example tools |
+| --- | --- | --- |
+| Bearer token | `Authorization=Bearer <api-key>` | Braintrust, Lunary, LangSmith |
+| Basic auth | `Authorization=Basic <base64 of id:secret>` | Langfuse, W&B Weave |
+| Vendor key header | `x-portkey-api-key=<key>` · `dd-api-key=<key>` | Portkey, Datadog |
+
+### Building a Basic-auth header
+
+Basic auth wants base64 of `id:secret`. Build it with `base64` and read the keys from
+environment variables rather than hard-coding them. For [Langfuse](https://langfuse.com/):
 
 ```bash
 export OTEL_EXPORTER_OTLP_ENDPOINT="https://cloud.langfuse.com/api/public/otel"
@@ -127,8 +166,20 @@ export OTEL_EXPORTER_OTLP_HEADERS="Authorization=Basic $(echo -n "$LANGFUSE_PUBL
 sema myagent.sema
 ```
 
-Langfuse (and several other LLM-focused tools) can show even richer detail with one more
-setting — see [Backend Compatibility](./otel-compat).
+### Tools that need more than one header
+
+Some backends need a second (or third) header to route the trace to the right project or
+workspace — the auth key alone isn't enough. The exact names come from each tool's OTLP docs:
+
+| Tool | `OTEL_EXPORTER_OTLP_HEADERS` value |
+| --- | --- |
+| HoneyHive | `Authorization=Bearer <key>,x-honeyhive=project:<name>` |
+| W&B Weave | `Authorization=Basic <base64 of api:KEY>,project_id=<entity>/<project>` |
+| Maxim | `x-maxim-api-key=<key>,x-maxim-repo-id=<repo-id>` |
+| Opik | `Authorization=<key>,projectName=<project>,Comet-Workspace=<workspace>` |
+
+Several LLM-focused backends can also show **richer** detail with one extra compatibility
+setting on top of the auth header — see [Backend Compatibility](./otel-compat).
 
 ## What gets traced
 

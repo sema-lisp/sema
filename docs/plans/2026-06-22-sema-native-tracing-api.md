@@ -1,7 +1,19 @@
 # Scoping: Sema-Native Tracing API (emit spans/traces from Sema code)
 
-**Status:** Scoping / design exploration. **NOT for implementation yet.**
-**Date:** 2026-06-22
+**Status:** Scoping / design exploration. **Parked — decided 2026-06-23 to keep as a
+scoping doc, not implement yet.**
+**Date:** 2026-06-22 · **Reviewed:** 2026-06-23
+**Resume-readiness (verified 2026-06-23):** the case is now *stronger* — the
+`SEMA_OTEL_COMPAT` layer shipped (`crates/sema-otel/src/compat.rs`), so the typed helpers
+(§2.3) would render user-built pipelines natively in Phoenix/Traceloop/Langfuse, not just
+vanilla OTel. The facade primitives this needs all already exist and are public:
+`SpanCore::set_str`/`set_attrs` (`imp.rs:1253`), `record_error` (status), and
+`set_conversation_scope` (`imp.rs:170`) — so S-tier is plumbing + a prelude macro, no new
+infra. Today's Sema surface is still only `otel/span` + `otel/event`. **Recommended slice
+when resumed:** S (`otel/set-attribute(s)`/`otel/set-status`/attrs-on-`otel/span`/`with-span`)
++ M (typed `otel/llm-span`/`otel/tool-span`/`otel/retrieval-span` + `otel/with-session`,
+each also emitting the compat span-kind); **defer L** (`otel/score`/evals — needs the
+export-path decision, overlaps the IDEAS.md evals item).
 **Context:** The OTel feature (crates/sema-otel) auto-instruments all `llm/*` + `agent/*`
 paths with zero user effort. This doc scopes whether/how to also let **Sema programs
 emit their own spans/attributes/events** so user-built abstractions (custom HTTP LLM

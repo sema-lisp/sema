@@ -162,13 +162,13 @@ export default defineConfig({
           text: 'Going Further',
           collapsed: false,
           items: [
+            { text: 'Providers', link: '/docs/llm/providers' },
+            { text: 'Cost & Budgets', link: '/docs/llm/cost' },
+            { text: 'Caching', link: '/docs/llm/caching' },
+            { text: 'Resilience & Retry', link: '/docs/llm/resilience' },
             { text: 'Embeddings', link: '/docs/llm/embeddings' },
             { text: 'Vector Store & Math', link: '/docs/llm/vector-store' },
-            { text: 'Caching', link: '/docs/llm/caching' },
-            { text: 'Cassettes', link: '/docs/llm/cassettes' },
-            { text: 'Resilience & Retry', link: '/docs/llm/resilience' },
-            { text: 'Providers', link: '/docs/llm/providers' },
-            { text: 'Cost & Budgets', link: '/docs/llm/cost' }
+            { text: 'Cassettes', link: '/docs/llm/cassettes' }
           ]
         },
         {

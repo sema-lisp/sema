@@ -229,21 +229,80 @@ histograms:
 
 ## Adding your own spans
 
-Two builtins let your Sema code record its own spans and events. Both do nothing when
-tracing is off, so they are safe to leave in.
+The `llm/*` and `agent/*` calls are traced for you. When you build your *own* abstraction —
+a custom RAG loop, a batch job, a provider Sema doesn't ship — these builtins let it emit
+first-class spans too. Every one is a **no-op when tracing is off**, so they are safe to
+leave in, and they never change your program's return value.
+
+### Generic spans
 
 ```sema
-;; Wrap any work in a named span; returns the thunk's value.
-(otel/span "ingest-batch"
-  (fn ()
-    (otel/event "started" {:batch-size 100})
-    (process-batch)))
+;; with-span runs the body inside a named span carrying an attribute map, ends it on exit
+;; (Error status if the body throws), and returns the body's value. Use {} for no attrs.
+(with-span "ingest-batch" {:batch.size 100}
+  (otel/event "started" {})
+  (process-batch))
 ```
 
-- `(otel/span name thunk)` — runs `thunk` inside a span called `name` and returns its
-  value; the span records how long the thunk took. Any LLM or tool spans created inside
-  nest beneath it.
-- `(otel/event name attrs-map)` — attaches a point-in-time event to the current span.
+The underlying builtin is `(otel/span name thunk attrs)`; `with-span` is the ergonomic
+macro over it. Any LLM/tool spans created inside nest beneath it.
+
+### Annotate the current span
+
+```sema
+(otel/set-attribute :http.status 200)         ; one attribute on the innermost span
+(otel/set-attributes {:rows 42 :cache.hit true})
+(otel/set-status :ok)                          ; or (otel/set-status :error "upstream timeout")
+(otel/event "cache-miss" {:key "user:42"})     ; a point-in-time event
+```
+
+Attribute values keep their type — integers, floats, and booleans render as numbers/bools
+in the backend, not strings.
+
+### Typed spans (render like the built-ins)
+
+For work that *is* an LLM call, tool, or retrieval — but that you implement yourself — use
+the typed helpers. They set `gen_ai.operation.name` and, when `SEMA_OTEL_COMPAT` is set,
+the backend-native span-kind, so a custom pipeline classifies in Phoenix/Traceloop/Langfuse
+exactly like the built-in `llm/*` spans.
+
+```sema
+;; A custom LLM/generation call (a provider Sema doesn't natively support):
+(otel/llm-span {:model "custom-model" :provider "myco" :operation "chat"}
+  (lambda ()
+    (let ((resp (my-http-llm-call prompt)))
+      ;; Account tokens + cost on the span — same gen_ai.usage.* keys as the built-ins.
+      (otel/llm-usage {:input-tokens 120 :output-tokens 30 :cost-usd 0.001})
+      resp)))
+
+;; A user-built retrieval step (first-class RETRIEVER span):
+(otel/retrieval-span "vector-search" (lambda () (search index query)) {:top-k 5})
+
+;; A user tool:
+(otel/tool-span "lookup-weather" (lambda () (weather city)))
+```
+
+### Grouping into sessions
+
+`with-session` groups every span started in its body under a session id (and optional
+user), filling Langfuse **Sessions/Users** for non-agent code:
+
+```sema
+(with-session "chat-42" {:user "alice"}
+  (llm/complete "...")        ; inherits session chat-42, user alice
+  (my-custom-pipeline))
+```
+
+| Form | What it does |
+| --- | --- |
+| `(with-span name attrs body…)` / `(otel/span name thunk attrs)` | Generic span around a block. |
+| `(otel/set-attribute key value)` / `(otel/set-attributes map)` | Set attribute(s) on the innermost active span. |
+| `(otel/set-status :ok)` / `(otel/set-status :error msg)` | Set the innermost span's status. |
+| `(otel/event name attrs-map)` | Point-in-time event on the current span. |
+| `(otel/llm-span config thunk)` + `(otel/llm-usage usage-map)` | Typed LLM/generation span + token/cost accounting. |
+| `(otel/tool-span name thunk [attrs])` | Typed TOOL span. |
+| `(otel/retrieval-span name thunk [attrs])` | Typed RETRIEVER span. |
+| `(with-session id config body…)` / `(otel/with-session id [config] thunk)` | Group spans into a session/user. |
 
 ## Privacy
 

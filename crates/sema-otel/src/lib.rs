@@ -29,6 +29,33 @@ pub struct ToolView {
     pub json_schema: String,
 }
 
+/// A scalar attribute value settable on a span from Sema code (`otel/set-attribute`,
+/// `otel/span` attrs). Keeps `sema-otel`'s public surface free of `opentelemetry` types.
+#[derive(Debug, Clone)]
+pub enum AttrValue {
+    Str(String),
+    Int(i64),
+    Float(f64),
+    Bool(bool),
+}
+
+/// Flavor of a user-emitted span (`otel/span`, `otel/llm-span`, `otel/tool-span`,
+/// `otel/retrieval-span`). Maps to the right OTel `SpanKind`, `gen_ai.operation.name`,
+/// and `SEMA_OTEL_COMPAT` span-kind so user spans render exactly like the built-in ones.
+#[derive(Debug, Clone, Copy)]
+pub enum SemaSpanKind {
+    /// Generic work block (INTERNAL / compat CHAIN).
+    Internal,
+    /// A user-built LLM/generation call (CLIENT / compat LLM).
+    Llm,
+    /// A user tool invocation (compat TOOL).
+    Tool,
+    /// A user retrieval / vector-search step (compat RETRIEVER).
+    Retrieval,
+    /// A user embedding call (compat EMBEDDING).
+    Embedding,
+}
+
 /// Plain `Send` snapshot of an LLM response, so `sema-otel` need not depend on
 /// `sema-llm` types. `sema-llm` maps `ChatResponse`/`Usage` into this.
 #[derive(Debug, Clone, Default)]

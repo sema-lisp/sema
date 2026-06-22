@@ -96,4 +96,15 @@ pub const PRELUDE: &str = r#"
     `(do ((,var ,start (+ ,var ,step)))
        ((>= ,var ,end))
        ,@body)))
+
+;; with-span: run body inside a named tracing span carrying an attributes map.
+;; Ends the span on exit (Error status if the body throws); returns the body's value.
+;; (with-span "ingest" {:batch.size 100} (process)) — use {} for no attributes.
+(defmacro with-span (name attrs . body)
+  `(otel/span ,name (lambda () ,@body) ,attrs))
+
+;; with-session: group every span started in body into a session (Langfuse Sessions/Users).
+;; (with-session "chat-42" {:user "alice"} (llm/complete "...")) — use {} for no user.
+(defmacro with-session (id config . body)
+  `(otel/with-session ,id ,config (lambda () ,@body)))
 "#;

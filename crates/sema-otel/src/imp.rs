@@ -1279,6 +1279,176 @@ fn is_polluting_key(k: &str) -> bool {
     matches!(k, "__proto__" | "constructor" | "prototype")
 }
 
+// ---------------------------------------------------------------------------
+// Sema-native tracing surface (the `otel/*` builtins): annotate the current span,
+// and open user-typed spans that render like the built-in ones.
+// ---------------------------------------------------------------------------
+
+/// Build a `KeyValue` from a dynamic (user-supplied) key + scalar value.
+fn attr_kv(key: String, val: crate::AttrValue) -> KeyValue {
+    match val {
+        crate::AttrValue::Str(s) => KeyValue::new(key, s),
+        crate::AttrValue::Int(i) => KeyValue::new(key, i),
+        crate::AttrValue::Float(f) => KeyValue::new(key, f),
+        crate::AttrValue::Bool(b) => KeyValue::new(key, b),
+    }
+}
+
+/// Set one attribute on the innermost active span (TL-stack top). No-op when disabled,
+/// when there is no active span, or for a prototype-polluting key.
+pub fn set_current_attr(key: &str, val: crate::AttrValue) {
+    if !ENABLED.load(Ordering::Relaxed) || is_polluting_key(key) {
+        return;
+    }
+    STACK.with(|s| {
+        if let Some(ctx) = s.borrow().last() {
+            ctx.span().set_attribute(attr_kv(key.to_string(), val));
+        }
+    });
+}
+
+/// Set many attributes on the innermost active span.
+pub fn set_current_attrs(attrs: Vec<(String, crate::AttrValue)>) {
+    if !ENABLED.load(Ordering::Relaxed) {
+        return;
+    }
+    STACK.with(|s| {
+        if let Some(ctx) = s.borrow().last() {
+            let span = ctx.span();
+            for (k, v) in attrs {
+                if !is_polluting_key(&k) {
+                    span.set_attribute(attr_kv(k, v));
+                }
+            }
+        }
+    });
+}
+
+/// Set the status of the innermost active span: `Some(msg)` = error (also records
+/// `error.type`), `None` = ok.
+pub fn set_current_status(error: Option<&str>) {
+    if !ENABLED.load(Ordering::Relaxed) {
+        return;
+    }
+    STACK.with(|s| {
+        if let Some(ctx) = s.borrow().last() {
+            let span = ctx.span();
+            match error {
+                Some(msg) => {
+                    span.set_attribute(KeyValue::new("error.type", "error"));
+                    span.set_status(Status::error(msg.to_string()));
+                }
+                None => span.set_status(Status::Ok),
+            }
+        }
+    });
+}
+
+/// Record LLM token usage + cost on the innermost active span (for a user-built
+/// `otel/llm-span`). Emits the same `gen_ai.usage.*` keys as the built-in LLM span plus
+/// the active backend's compat aliases, so a custom call accounts identically.
+pub fn set_current_llm_usage(input: u32, output: u32, cost: Option<f64>) {
+    if !ENABLED.load(Ordering::Relaxed) {
+        return;
+    }
+    let total = input + output;
+    STACK.with(|s| {
+        if let Some(ctx) = s.borrow().last() {
+            let span = ctx.span();
+            span.set_attribute(KeyValue::new("gen_ai.usage.input_tokens", input as i64));
+            span.set_attribute(KeyValue::new("gen_ai.usage.output_tokens", output as i64));
+            span.set_attribute(KeyValue::new("gen_ai.usage.total_tokens", total as i64));
+            if let Some(c) = cost {
+                span.set_attribute(KeyValue::new("gen_ai.usage.cost_usd", c));
+                span.set_attribute(KeyValue::new("gen_ai.usage.cost", c));
+            }
+            for kv in compat::llm_usage(input, output, total, 0, 0, cost, None, None) {
+                span.set_attribute(kv);
+            }
+        }
+    });
+}
+
+/// Map a user span flavor to (OTel `SpanKind`, compat `Kind`, optional operation name).
+fn user_kind_map(kind: crate::SemaSpanKind) -> (SpanKind, compat::Kind, Option<&'static str>) {
+    match kind {
+        crate::SemaSpanKind::Internal => (SpanKind::Internal, compat::Kind::Chain, None),
+        crate::SemaSpanKind::Llm => (SpanKind::Client, compat::Kind::Llm, Some("chat")),
+        crate::SemaSpanKind::Tool => (SpanKind::Internal, compat::Kind::Tool, Some("execute_tool")),
+        crate::SemaSpanKind::Retrieval => (SpanKind::Internal, compat::Kind::Retriever, None),
+        crate::SemaSpanKind::Embedding => (
+            SpanKind::Internal,
+            compat::Kind::Embedding,
+            Some("embeddings"),
+        ),
+    }
+}
+
+/// Open a user-emitted span of the given flavor with extra attributes. Returns a `VmSpan`
+/// (RAII; ends on drop). Typed flavors also set `gen_ai.operation.name` + the compat
+/// span-kind so they classify like the built-ins in every backend.
+pub fn user_span(
+    name: &str,
+    kind: crate::SemaSpanKind,
+    attrs: Vec<(String, crate::AttrValue)>,
+) -> VmSpan {
+    let (span_kind, compat_kind, op) = user_kind_map(kind);
+    let mut kvs = Vec::new();
+    if let Some(op) = op {
+        kvs.push(KeyValue::new("gen_ai.operation.name", op));
+    }
+    if matches!(kind, crate::SemaSpanKind::Tool) {
+        kvs.push(KeyValue::new("gen_ai.tool.name", name.to_string()));
+    }
+    for (k, v) in attrs {
+        if !is_polluting_key(&k) {
+            kvs.push(attr_kv(k, v));
+        }
+    }
+    let inner = start(name.to_string(), span_kind, kvs);
+    if let Some(c) = &inner {
+        c.set_attrs(compat::span_kind(compat_kind));
+    }
+    VmSpan { inner }
+}
+
+/// Open a user-built LLM/generation span (CLIENT). Sets `gen_ai.*` request attributes +
+/// the compat dispatch aliases from the in-scope provider/model, so a custom provider call
+/// renders as a first-class generation. Usage is added later via `set_current_llm_usage`.
+pub fn user_llm_span(
+    model: &str,
+    provider: &str,
+    operation: &str,
+    attrs: Vec<(String, crate::AttrValue)>,
+) -> VmSpan {
+    let op = if operation.is_empty() {
+        "chat"
+    } else {
+        operation
+    };
+    let mut kvs = vec![KeyValue::new("gen_ai.operation.name", op.to_string())];
+    if !provider.is_empty() {
+        kvs.push(KeyValue::new(
+            "gen_ai.provider.name",
+            crate::gen_ai_provider_name(provider).to_string(),
+        ));
+    }
+    if !model.is_empty() {
+        kvs.push(KeyValue::new("gen_ai.request.model", model.to_string()));
+    }
+    for (k, v) in attrs {
+        if !is_polluting_key(&k) {
+            kvs.push(attr_kv(k, v));
+        }
+    }
+    let inner = start(op.to_string(), SpanKind::Client, kvs);
+    if let Some(c) = &inner {
+        c.set_attrs(compat::span_kind(compat::Kind::Llm));
+        c.set_attrs(compat::llm_dispatch(op, provider, model));
+    }
+    VmSpan { inner }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

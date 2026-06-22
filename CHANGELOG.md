@@ -1,5 +1,21 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- **Sema-native tracing API.** New `otel/*` builtins + `with-span` / `with-session` macros
+  let your *own* Sema code emit first-class spans — not just the auto-instrumented `llm/*` /
+  `agent/*` paths. `with-span` / `otel/span` wrap a block in a generic span;
+  `otel/set-attribute(s)`, `otel/set-status`, and `otel/event` annotate the innermost active
+  span; the typed helpers `otel/llm-span` + `otel/llm-usage`, `otel/tool-span`, and
+  `otel/retrieval-span` render a user-built LLM/tool/retrieval step as an LLM/TOOL/RETRIEVER
+  span in Phoenix/Traceloop/Langfuse (via the `SEMA_OTEL_COMPAT` layer) with `gen_ai.usage.*`
+  accounting identical to the built-ins; `with-session` / `otel/with-session` groups
+  non-agent code into Langfuse Sessions/Users. Every form is a no-op when tracing is off and
+  never changes a program's return value. Docs: [Tracing & Metrics → Adding your own
+  spans](https://sema-lang.com/docs/llm/observability). Test: `crates/sema/tests/otel_native_test.rs`.
+
 ## 1.25.0
 
 ### Added

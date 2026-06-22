@@ -159,3 +159,26 @@ impl VmSpan {
 }
 
 pub fn add_event(_name: &str, _attrs: Vec<(String, String)>) {}
+
+// Sema-native tracing surface — inert on wasm.
+pub fn set_current_attr(_key: &str, _val: crate::AttrValue) {}
+pub fn set_current_attrs(_attrs: Vec<(String, crate::AttrValue)>) {}
+pub fn set_current_status(_error: Option<&str>) {}
+pub fn set_current_llm_usage(_input: u32, _output: u32, _cost: Option<f64>) {}
+
+pub fn user_span(
+    _name: &str,
+    _kind: crate::SemaSpanKind,
+    _attrs: Vec<(String, crate::AttrValue)>,
+) -> VmSpan {
+    VmSpan
+}
+
+pub fn user_llm_span(
+    _model: &str,
+    _provider: &str,
+    _operation: &str,
+    _attrs: Vec<(String, crate::AttrValue)>,
+) -> VmSpan {
+    VmSpan
+}

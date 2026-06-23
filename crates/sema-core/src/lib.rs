@@ -14,11 +14,12 @@ pub mod vfs;
 pub use async_signal::{
     blocking_sleep_ms, call_cancel_callback, call_run_scheduler, call_run_scheduler_all_of,
     call_run_scheduler_any_of, call_run_scheduler_timeout, call_spawn_callback, check_interrupt,
-    clear_blocking_sleep_callback, clear_interrupt_callback, in_async_context, set_async_context,
-    set_blocking_sleep_callback, set_cancel_callback, set_interrupt_callback, set_resume_value,
-    set_run_scheduler_callback, set_spawn_callback, set_yield_signal, take_resume_value,
-    take_yield_signal, BlockingSleepFn, CancelCallbackFn, InterruptCallbackFn,
-    RunSchedulerCallbackFn, SchedulerRunResult, SchedulerTarget, SpawnCallbackFn, YieldReason,
+    clear_blocking_sleep_callback, clear_interrupt_callback, in_async_context, io_park,
+    notify_io_complete, set_async_context, set_blocking_sleep_callback, set_cancel_callback,
+    set_interrupt_callback, set_resume_value, set_run_scheduler_callback, set_spawn_callback,
+    set_yield_signal, take_resume_value, take_yield_signal, BlockingSleepFn, CancelCallbackFn,
+    InterruptCallbackFn, IoHandle, IoPoll, RunSchedulerCallbackFn, SchedulerRunResult,
+    SchedulerTarget, SpawnCallbackFn, YieldReason,
 };
 pub use context::{
     call_callback, eval_callback, set_call_callback, set_eval_callback, with_stdlib_ctx,

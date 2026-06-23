@@ -218,6 +218,14 @@ impl Scheduler {
                             WakeAction::Pending
                         }
                     }
+                    YieldReason::AwaitIo(h) => match h.poll() {
+                        // Poll the offloaded future without blocking. The VM
+                        // thread only ever parks in the all-blocked branch of
+                        // `run_until_reentrant` (on `io_park`), never here.
+                        sema_core::IoPoll::Pending => WakeAction::Pending,
+                        sema_core::IoPoll::Ready(Ok(v)) => WakeAction::Resume(v),
+                        sema_core::IoPoll::Ready(Err(msg)) => WakeAction::Fail(msg),
+                    },
                 };
 
                 match action {
@@ -534,6 +542,30 @@ fn run_until_reentrant(
                 .iter()
                 .any(|t| matches!(t.state, TaskState::Blocked(_)));
             if has_blocked {
+                // Park-on-IO short-circuit (checked BEFORE the virtual-clock
+                // advance below): if at least one task is parked on an offloaded
+                // `AwaitIo` future and no task is Ready, the VM thread should
+                // wait for the real I/O to land — NOT jump the virtual clock
+                // (which would force-fail the in-flight task via an
+                // `async/timeout` deadline, B3). We re-check Ready each pass
+                // (the `ready_idx` guard above already established none are
+                // Ready here), so any runnable VM/tool work always pre-empts the
+                // park on the next iteration.
+                let has_await_io = sched
+                    .tasks
+                    .iter()
+                    .any(|t| matches!(t.state, TaskState::Blocked(YieldReason::AwaitIo(_))));
+                if has_await_io {
+                    // Park on the process-global IO-completion signal for a
+                    // small bound. `io_park` returns early on a completion
+                    // notify; the bound keeps the `check_interrupt` cadence at
+                    // the top of the loop live (so Ctrl-C still works) and
+                    // bounds any missed notify. Then loop back to re-run
+                    // `wake_blocked_tasks`, which polls the IO handles.
+                    sema_core::io_park(50);
+                    continue;
+                }
+
                 // Nothing can make progress right now, so advance the virtual
                 // clock to the nearest pending deadline: the earliest sleeper's
                 // wake time, clamped by any `async/timeout` deadline. Jumping to

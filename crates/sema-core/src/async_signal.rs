@@ -10,9 +10,58 @@
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
+use std::sync::{Condvar, Mutex};
 
 use crate::value::{AsyncPromise, Channel, Value};
 use crate::{EvalContext, SemaError};
+
+/// Result of polling an offloaded I/O future from the VM thread.
+///
+/// The poller closure (created in `sema-llm`, never in `sema-core`) owns the
+/// channel/receiver to the background runtime and translates the wire result
+/// into a Sema `Value` on the VM thread, so no non-`Send` value ever crosses
+/// the thread boundary.
+pub enum IoPoll {
+    /// The offloaded future has not completed yet — keep the task parked.
+    Pending,
+    /// The future completed. `Ok` resumes the task with the value; `Err`
+    /// rejects the task's promise with the message.
+    Ready(Result<Value, String>),
+}
+
+/// A non-blocking handle to an offloaded I/O future, polled by the scheduler.
+///
+/// Holds a boxed `FnMut` poller (built in `sema-llm`) so `sema-core` stays free
+/// of both tokio and `sema-llm` types. Wrapped in `Rc` inside
+/// [`YieldReason::AwaitIo`]; it never crosses a thread boundary (the scheduler
+/// lives in a `thread_local`).
+pub struct IoHandle {
+    poll: RefCell<Box<dyn FnMut() -> IoPoll>>,
+}
+
+impl IoHandle {
+    /// Create a handle from a poller closure. The closure is called each time
+    /// the scheduler checks whether the offloaded future has completed.
+    pub fn new(f: impl FnMut() -> IoPoll + 'static) -> Self {
+        Self {
+            poll: RefCell::new(Box::new(f)),
+        }
+    }
+
+    /// Poll the offloaded future without blocking.
+    pub fn poll(&self) -> IoPoll {
+        (self.poll.borrow_mut())()
+    }
+}
+
+// `IoHandle` holds a `Box<dyn FnMut>`, which is neither `Debug` nor `Clone`.
+// A manual `Debug` impl keeps the `#[derive(Debug, Clone)]` on `YieldReason`
+// compiling once the handle is wrapped in `Rc` (which restores `Clone`).
+impl std::fmt::Debug for IoHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("IoHandle")
+    }
+}
 
 /// Reason a task is yielding control back to the scheduler.
 #[derive(Debug, Clone)]
@@ -25,6 +74,10 @@ pub enum YieldReason {
     ChannelSend(Rc<Channel>, Value),
     /// Sleeping for a duration in milliseconds.
     Sleep(u64),
+    /// Waiting for an offloaded I/O future (e.g. an HTTP round-trip running on a
+    /// background runtime) to complete. The scheduler polls the handle and parks
+    /// the VM thread on the process-global IO-completion signal while in flight.
+    AwaitIo(Rc<IoHandle>),
 }
 
 /// What condition the scheduler should run until.
@@ -241,6 +294,42 @@ pub fn blocking_sleep_ms(ms: u64) {
     std::thread::sleep(std::time::Duration::from_millis(ms));
     #[cfg(target_arch = "wasm32")]
     let _ = ms; // no-op: advancing virtual time (caller) is enough for ordering
+}
+
+// ── IO-completion signal ────────────────────────────────────────
+
+/// Process-global IO-completion signal: a generation counter bumped each time
+/// an offloaded future finishes, plus a condvar so a parked VM thread wakes
+/// promptly. A missed notification is bounded by the park timeout — callers
+/// (the scheduler) loop and re-poll their `IoHandle`s, so correctness never
+/// depends on catching every notify.
+///
+/// This lives in `sema-core` (not tokio-land) so the park primitive is reachable
+/// from `sema-vm`'s scheduler without a tokio dependency. The bumping side is
+/// called by the offloaded future in `sema-llm`.
+static IO_SIGNAL: (Mutex<u64>, Condvar) = (Mutex::new(0), Condvar::new());
+
+/// Notify any thread parked in [`io_park`] that an offloaded future has
+/// completed. Bumps the generation counter and wakes all waiters. Safe to call
+/// from a background runtime thread.
+pub fn notify_io_complete() {
+    let (lock, cvar) = &IO_SIGNAL;
+    if let Ok(mut gen) = lock.lock() {
+        *gen = gen.wrapping_add(1);
+        cvar.notify_all();
+    }
+}
+
+/// Park the current (VM) thread on the IO-completion signal for up to
+/// `timeout_ms` milliseconds, returning early if a [`notify_io_complete`]
+/// arrives. The caller must re-poll its in-flight handles after this returns
+/// (whether woken by a notify or by the timeout) — a missed notify is bounded
+/// by `timeout_ms`, so the caller's poll loop stays live.
+pub fn io_park(timeout_ms: u64) {
+    let (lock, cvar) = &IO_SIGNAL;
+    if let Ok(gen) = lock.lock() {
+        let _ = cvar.wait_timeout(gen, std::time::Duration::from_millis(timeout_ms));
+    }
 }
 
 /// Run the scheduler, optionally waiting for a specific promise.

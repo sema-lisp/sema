@@ -347,6 +347,20 @@ This is the payoff of doing the work at the scheduler/yield level rather than in
 
 ---
 
+## 8.5 Concurrent `llm/embed` + per-task OTel — implementation design (2026-06-23, reviewed)
+
+Design-first pass (opus, code-grounded; full version in the design-agent transcript). Chosen approach for "do it properly — full OTel from day one":
+
+**(A) Per-task OTel TLS context-switch.** `sema-otel`: `OtelTaskCtx { stack: Vec<Context>, conversation/session/user ids }` + `take_task_otel()`/`install_task_otel()` (std::mem::swap the four thread-locals — `imp.rs:82-87`). Dependency-safe seam in `sema-core/async_signal.rs`: type-erased `Box<dyn Any>` fn-pointer callbacks (`set_otel_task_callbacks`), mirroring `set_blocking_sleep_callback`; registered once via `sema_otel::register_task_callbacks()` from a crate naming both types. Store the ctx in the `Task` struct (`scheduler.rs:42`) as `Box<dyn Any>`; install-on-enter / take-on-leave around the task step (`scheduler.rs:697-711`), **folded into `ReinstallGuard`** (`:454`) for panic safety. Seed `task.otel` at both spawn sites from `current_conversation_scope()` (ids only, empty stack) so conversation grouping survives isolation.
+
+**(B) Span across the yield — option (b), recommended.** Two natives sequenced in Sema: `embed-dispatch` → `embed-account`. Option (a) (one native finalizing on resume) is **unexpressible** — the native is NOT re-entered (`scheduler.rs:701` resumes the bytecode after the CALL). Key move: build the embeddings span **detached from `STACK`** (`llm_span_detached` — skip the push at `imp.rs:616` / pop in `Drop` `:526`; it's a leaf, needs no nesting) and **carry the `LlmSpan` into the `Rc<IoHandle>` poller closure**. The poller (VM thread) finalizes (`set_response`/`record_error`), drops the span, and decodes `EmbedResponse`→`Value`. `track_usage` runs in `embed-account` on the VM thread. This sidesteps the cross-thread `STACK` timing (`wake_blocked_tasks` runs before the per-task install).
+
+**(B1) Send boundary.** `ProviderRegistry.providers` → `HashMap<String, Arc<dyn LlmProvider>>` (`provider.rs:46`, ~6 `register` sites). `shared_rt().spawn_blocking(move || provider.embed(req))`: only the Send `EmbedRequest` + `Arc<provider>` cross; cassette-check (pre-spawn), `Value` decode, span finalize, `track_usage` all stay on the VM thread (`EmbedResponse`/`Usage` are Send — no `Rc`/`Value`).
+
+**Gate.** New `crates/sema/tests/embed_async_otel_test.rs` + a delayed fake embedding provider (`fake.rs`): (1) two concurrent `llm/embed` overlap (wall ≈ max, not sum) AND each produce a **distinct, correctly-parented** `embeddings` span (in-memory exporter — distinct trace_id/span_id, own input tokens/text) = the B2 isolation proof; (2) sync-path-unchanged; (3) `#[ignore]` live (OpenAI key, `text-embedding-3-small`).
+
+**Caveats:** don't assert span *duration* (real wall-clock across the yield); cassette replay/record stays VM-thread (replay pre-spawn returns inline, no yield); preserve embed's no-`set_serving_provider` pricing path; `(otel/span "x" (fn () (llm/embed…)))` wrapping async embed hits the existing `run_nested_closure` yield-in-HOF error (call async-embed at task frame); **`classify`/`extract`/`complete` reuse (A) but need a multi-yield span-carry for the tool loop — deferred to a separate plan.**
+
 ## 8. Verification addendum (review 2026-06-23)
 
 A multi-agent verification pass checked every cited `file:symbol` and adversarially stress-tested the load-bearing claims against the actual tree. **Verdict: the foundational thesis is correct and the scheduler-half plumbing (Steps 1, 3, 4, 8) is accurate and drops in — but the plan is *not implementable as written*. Five blocker-class issues must be resolved, and the bulk of the real risk is in Phase 2 (`llm/chat-once`), not Phase 3.**

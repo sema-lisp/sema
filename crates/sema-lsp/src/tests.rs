@@ -31,6 +31,10 @@ fn builtin_doc_coverage() {
         .into_iter()
         // Exclude internal VM helper forms (`__vm-*`, `__*`) — not user-facing.
         .filter(|n| !n.starts_with("__"))
+        // `llm/io-sleep-once` is a throwaway AwaitIo spike leaf (proves async
+        // I/O overlap; see docs/plans/2026-06-23-async-agent-parallelization.md
+        // §5). It is not a user-facing builtin and is intentionally undocumented.
+        .filter(|n| n != "llm/io-sleep-once")
         .filter(|n| !docs.contains(n))
         .collect();
     missing.sort();

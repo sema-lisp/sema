@@ -132,13 +132,23 @@ pub fn install_task_otel(ctx: OtelTaskCtx) -> OtelTaskCtx {
     }
 }
 
-/// Capture the current conversation/session/user identity into a fresh task
-/// context with an EMPTY span stack. Seeded onto a newly-spawned task so its
-/// spans group under the same conversation as the spawning code, without
-/// inheriting (and later mis-popping) the spawner's in-flight span stack.
+/// Capture the spawning context to seed onto a newly-spawned task: its
+/// conversation/session/user identity, plus the spawner's CURRENT active span (only
+/// the top-of-stack `Context`, if any) as the child's parent. So spans opened in the
+/// child task nest under the spawner and share its trace — proper distributed-trace
+/// propagation across `async/spawn` (a `(with-span … (async/map …))` becomes one
+/// connected tree, not N disconnected single-span traces).
+///
+/// We copy ONLY the top context — one parent marker — never the whole stack: the
+/// child pushes/pops its OWN spans above this seed and never pops the seed itself, so
+/// the spawner's in-flight stack is never mis-popped (the hazard the empty-stack seed
+/// originally guarded against). A top-level spawn (empty stack) seeds nothing → the
+/// child's spans are trace roots, exactly as before — so sibling top-level tasks stay
+/// in distinct traces (per-task isolation preserved).
 pub fn current_conversation_scope() -> OtelTaskCtx {
+    let parent = STACK.with(|s| s.borrow().last().cloned());
     OtelTaskCtx {
-        stack: Vec::new(),
+        stack: parent.into_iter().collect(),
         conversation_id: CONVERSATION_ID.with(|c| c.borrow().clone()),
         session_id: SESSION_ID.with(|c| c.borrow().clone()),
         user_id: USER_ID.with(|c| c.borrow().clone()),

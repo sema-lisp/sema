@@ -2644,13 +2644,33 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
         })
     });
 
-    // The SYNCHRONOUS embed path. Registered under an internal name; the
-    // user-facing `llm/embed` is a prelude router macro that calls this directly
-    // outside an async context (byte-identical) and the concurrent
-    // __embed-dispatch/__embed-account sequence inside one (overlap + full otel).
-    // (llm/embed "text" {:model "..."})
-    // (llm/embed ["text1" "text2"] {:model "..."})
-    register_fn(env, "__embed-sync", |args| {
+    // `llm/embed` — a SINGLE first-class native function that branches internally
+    // on `sema_core::in_async_context()`:
+    //
+    //   (llm/embed "text" {:model "..."})        ; → bytevector
+    //   (llm/embed ["text1" "text2"] {:model …}) ; → list of bytevectors
+    //
+    // Outside an async scheduler task it runs the SYNCHRONOUS embed path inline
+    // (open span, cassette, provider.embed, set_response, track_usage, decode).
+    // Inside a task it offloads `provider.embed` onto the shared runtime and
+    // yields `AwaitIo` so sibling tasks overlap; the IoHandle poller (which runs
+    // on the VM thread inside the scheduler) finalizes the DETACHED span, records
+    // the cassette, runs `track_usage`, and decodes the embeddings into the SAME
+    // Value the sync path returns — so the concurrent and sync paths are
+    // byte-identical. Folding `track_usage` into the poller is what lets a single
+    // native (which is NOT re-invoked on resume — the scheduler resumes the
+    // bytecode after the CALL via `replace_stack_top`) account correctly without
+    // a separate Sema-sequenced accounting step.
+    //
+    // Keeping it a native (not a macro) means `(procedure? llm/embed)` is #t and
+    // it is usable as a value: `(map llm/embed …)`, `(async/pool-map llm/embed …)`.
+    register_fn(env, "llm/embed", |args| {
+        // On resume from the async yield the scheduler re-runs the bytecode AFTER
+        // this CALL via `replace_stack_top`, so this native is not re-invoked.
+        // Drain any stray resume value defensively (mirrors io-sleep-once).
+        if let Some(v) = sema_core::take_resume_value() {
+            return Ok(v);
+        }
         if args.is_empty() || args.len() > 2 {
             return Err(SemaError::arity("llm/embed", "1-2", args.len()));
         }
@@ -2682,13 +2702,146 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
         };
 
         let request = EmbedRequest { texts, model };
+        let req_model = request.model.clone().unwrap_or_default();
+        let cassette_key = compute_embed_key(&request);
+
+        // ── ASYNC path: offload + yield (native targets only) ──────────────
+        //
+        // The concurrent embed path is native-only (no shared tokio runtime on
+        // wasm), so wasm always falls through to the synchronous path below.
+        #[cfg(not(target_arch = "wasm32"))]
+        if sema_core::in_async_context() {
+            // DETACHED embeddings span: parent captured now, finalized in the
+            // poller after the yield (where the active-span stack may hold a
+            // sibling task's span, so the span must not pop the stack on drop).
+            let span = sema_otel::llm_span_detached("embeddings");
+            span.set_embedding_input(&request.texts);
+
+            // Cassette decision — SYNCHRONOUSLY, pre-spawn, on the VM thread.
+            let decision =
+                CASSETTE.with(|c| c.borrow().as_ref().map(|cass| cass.decide(&cassette_key)));
+            match decision {
+                Some(crate::cassette::Decision::Replay(entry)) => {
+                    // Replay made no provider call → finalize the span inline,
+                    // account, and return WITHOUT yielding (nothing to overlap).
+                    let resp = EmbedResponse {
+                        embeddings: entry.embeddings,
+                        model: entry.model.clone(),
+                        usage: Usage {
+                            prompt_tokens: entry.prompt_tokens,
+                            model: entry.model,
+                            ..Default::default()
+                        },
+                    };
+                    span.set_dispatch("cassette", &req_model);
+                    span.set_response(&sema_otel::ResponseFacts {
+                        input_tokens: resp.usage.prompt_tokens,
+                        output_tokens: 0,
+                        response_model: resp.model.clone(),
+                        ..Default::default()
+                    });
+                    drop(span);
+                    track_usage(&resp.usage)?;
+                    return Ok(embed_value_from_response(&resp, single));
+                }
+                Some(crate::cassette::Decision::Miss(k)) => return Err(cassette_miss_error(&k)),
+                _ => {}
+            }
+            let recording = matches!(decision, Some(crate::cassette::Decision::Record));
+
+            // Clone an Arc<provider> off the thread-local registry on THIS thread,
+            // release the borrow, and move it into the offloaded future.
+            let provider = PROVIDER_REGISTRY.with(|reg| {
+                let reg = reg.borrow();
+                reg.embedding_provider().or_else(|| reg.default_provider())
+            });
+            let Some(provider) = provider else {
+                return Err(SemaError::Llm(
+                    "no embedding provider configured. Use (llm/configure-embeddings ...) first"
+                        .to_string(),
+                ));
+            };
+
+            // The provider name + canonical price are needed on the VM thread in
+            // the poller; capture them before the Arc is moved into the worker.
+            let provider_name = provider.name().to_string();
+            let (tx, mut rx) = tokio::sync::oneshot::channel::<Result<EmbedResponse, LlmError>>();
+            let req2 = request.clone();
+            crate::http::shared_rt().spawn_blocking(move || {
+                let r = provider.embed(req2);
+                let _ = tx.send(r);
+                sema_core::notify_io_complete();
+            });
+
+            // Move the LlmSpan + cassette context INTO the poller closure so the
+            // span is finalized (and the cassette recorded + usage accounted) on
+            // the VM thread when the future lands — never as a native-frame local
+            // (those drop at the yield).
+            let key = cassette_key;
+            let mut span_slot = Some(span);
+            let handle = Rc::new(sema_core::IoHandle::new(move || {
+                use tokio::sync::oneshot::error::TryRecvError;
+                match rx.try_recv() {
+                    Err(TryRecvError::Empty) => sema_core::IoPoll::Pending,
+                    Ok(Ok(resp)) => {
+                        if let Some(span) = span_slot.take() {
+                            span.set_dispatch(&provider_name, &req_model);
+                            span.set_response(&sema_otel::ResponseFacts {
+                                input_tokens: resp.usage.prompt_tokens,
+                                output_tokens: 0,
+                                response_model: resp.model.clone(),
+                                cost_usd: pricing::calculate_cost_for(&provider_name, &resp.usage),
+                                ..Default::default()
+                            });
+                            // span drops here → ends the span.
+                        }
+                        if recording {
+                            CASSETTE.with(|c| {
+                                if let Some(cass) = c.borrow_mut().as_mut() {
+                                    cass.record_entry(crate::cassette::TapeEntry::from_embed(
+                                        &key,
+                                        &resp.model,
+                                        &resp.embeddings,
+                                        resp.usage.prompt_tokens,
+                                    ));
+                                }
+                            });
+                        }
+                        // Decode the embedding (byte-identical to the sync path)
+                        // and account on the VM thread. `track_usage` only mutates
+                        // session-usage / budget thread-locals and reads static
+                        // pricing — it never spawns, yields, or touches the
+                        // scheduler — so it is safe to call here inside
+                        // `wake_blocked_tasks`'s `&mut self.tasks` borrow. A budget
+                        // overrun fails the task, exactly as the sync path's `?`.
+                        let value = embed_value_from_response(&resp, single);
+                        match track_usage(&resp.usage) {
+                            Ok(()) => sema_core::IoPoll::Ready(Ok(value)),
+                            Err(e) => sema_core::IoPoll::Ready(Err(e.to_string())),
+                        }
+                    }
+                    Ok(Err(e)) => {
+                        if let Some(span) = span_slot.take() {
+                            span.record_error(llm_error_kind(&e), &e.to_string());
+                        }
+                        sema_core::IoPoll::Ready(Err(e.to_string()))
+                    }
+                    Err(TryRecvError::Closed) => {
+                        span_slot.take();
+                        sema_core::IoPoll::Ready(Err("embed: io worker dropped".to_string()))
+                    }
+                }
+            }));
+            sema_core::set_yield_signal(sema_core::YieldReason::AwaitIo(handle));
+            return Ok(Value::nil());
+        }
+
+        // ── SYNC path: inline provider call (byte-identical to before) ─────
         // CLIENT embeddings span (bypasses do_complete). Input tokens only.
         let span = sema_otel::llm_span("embeddings");
-        let req_model = request.model.clone().unwrap_or_default();
         // Advertise the input texts (content-gated; OpenInference embedding.* keys).
         span.set_embedding_input(&request.texts);
         // Cassette interception (mirrors run_completion, for the embeddings seam).
-        let cassette_key = compute_embed_key(&request);
         let decision =
             CASSETTE.with(|c| c.borrow().as_ref().map(|cass| cass.decide(&cassette_key)));
         let response = match decision {
@@ -2749,251 +2902,7 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
         };
 
         track_usage(&response.usage)?;
-
-        if single {
-            let embedding = response.embeddings.into_iter().next().unwrap_or_default();
-            let bytes: Vec<u8> = embedding.iter().flat_map(|f| f.to_le_bytes()).collect();
-            Ok(Value::bytevector(bytes))
-        } else {
-            Ok(Value::list(
-                response
-                    .embeddings
-                    .into_iter()
-                    .map(|emb| {
-                        let bytes: Vec<u8> = emb.iter().flat_map(|f| f.to_le_bytes()).collect();
-                        Value::bytevector(bytes)
-                    })
-                    .collect(),
-            ))
-        }
-    });
-
-    // ── Concurrent single-shot embed: embed-dispatch + embed-account ─────
-    //
-    // The async counterpart of `llm/embed` (above). It splits the call into two
-    // natives sequenced in Sema (prelude `embed-async`) because a native that
-    // yields is NOT re-entered on resume (the scheduler resumes the bytecode
-    // after the CALL via `replace_stack_top`), so a single native cannot both
-    // yield across the provider call AND finalize accounting on resume.
-    //
-    //   embed-dispatch  — parse args identically to `llm/embed`, open a DETACHED
-    //     embeddings span, do the cassette decision SYNCHRONOUSLY pre-spawn
-    //     (Replay finalizes the span inline and returns WITHOUT yielding; Miss
-    //     errors), then on the offload arm clone an Arc<provider> off the
-    //     thread-local registry, `spawn_blocking(move || provider.embed(req))` on
-    //     the shared runtime, and yield `AwaitIo`. The poller (VM thread) finalizes
-    //     the span, records the cassette, decodes the embeddings to the SAME Value
-    //     the sync path returns, and packages it with the usage for accounting.
-    //   embed-account   — no yield: `track_usage` on the VM thread, returns the
-    //     embedding value. Splitting accounting out keeps it on the VM thread
-    //     after resume (thread-local budget/usage stay correct).
-    //
-    // Only the Send `EmbedRequest` + `Arc<provider>` cross the thread boundary;
-    // the EmbedResponse/Usage are Send (no Rc/Value), and all Value construction,
-    // span finalize, cassette record, and accounting stay on the VM thread.
-    #[cfg(not(target_arch = "wasm32"))]
-    register_fn_ctx(env, "__embed-dispatch", |_ctx, args| {
-        // Vestigial under CALL_NATIVE (kept for symmetry with io-sleep-once):
-        // the response arrives via the scheduler's replace_stack_top.
-        if let Some(v) = sema_core::take_resume_value() {
-            return Ok(v);
-        }
-        if args.is_empty() || args.len() > 2 {
-            return Err(SemaError::arity("llm/embed", "1-2", args.len()));
-        }
-
-        // Parse args identically to the synchronous `llm/embed`.
-        let (texts, single) = if let Some(s) = args[0].as_str() {
-            (vec![s.to_string()], true)
-        } else if let Some(l) = args[0].as_seq() {
-            let texts: Vec<String> = l
-                .iter()
-                .map(|v| {
-                    v.as_str()
-                        .map(|s| s.to_string())
-                        .unwrap_or_else(|| v.to_string())
-                })
-                .collect();
-            (texts, false)
-        } else {
-            return Err(SemaError::type_error("string or list", args[0].type_name()));
-        };
-        let model = if let Some(opts_val) = args.get(1) {
-            if let Some(opts) = opts_val.as_map_rc() {
-                get_opt_string(&opts, "model")
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-
-        let request = EmbedRequest { texts, model };
-        let req_model = request.model.clone().unwrap_or_default();
-
-        // DETACHED embeddings span: parent captured now, finalized in the poller
-        // after the yield (where the active-span stack may hold a sibling task's
-        // span, so the span must not pop the stack on drop).
-        let span = sema_otel::llm_span_detached("embeddings");
-        span.set_embedding_input(&request.texts);
-
-        // Cassette decision — SYNCHRONOUSLY, pre-spawn, on the VM thread.
-        let cassette_key = compute_embed_key(&request);
-        let decision =
-            CASSETTE.with(|c| c.borrow().as_ref().map(|cass| cass.decide(&cassette_key)));
-        match decision {
-            Some(crate::cassette::Decision::Replay(entry)) => {
-                // Replay finalizes the span inline and returns WITHOUT yielding —
-                // a replay made no provider call, so there is nothing to overlap.
-                let resp = EmbedResponse {
-                    embeddings: entry.embeddings,
-                    model: entry.model.clone(),
-                    usage: Usage {
-                        prompt_tokens: entry.prompt_tokens,
-                        model: entry.model,
-                        ..Default::default()
-                    },
-                };
-                span.set_dispatch("cassette", &req_model);
-                span.set_response(&sema_otel::ResponseFacts {
-                    input_tokens: resp.usage.prompt_tokens,
-                    output_tokens: 0,
-                    response_model: resp.model.clone(),
-                    ..Default::default()
-                });
-                drop(span);
-                return Ok(embed_account_carrier(&resp, single, false, &cassette_key));
-            }
-            Some(crate::cassette::Decision::Miss(k)) => return Err(cassette_miss_error(&k)),
-            _ => {}
-        }
-        let recording = matches!(decision, Some(crate::cassette::Decision::Record));
-
-        // Clone an Arc<provider> off the thread-local registry on THIS thread,
-        // release the borrow, and move it into the offloaded future.
-        let provider = PROVIDER_REGISTRY.with(|reg| {
-            let reg = reg.borrow();
-            reg.embedding_provider().or_else(|| reg.default_provider())
-        });
-        let Some(provider) = provider else {
-            return Err(SemaError::Llm(
-                "no embedding provider configured. Use (llm/configure-embeddings ...) first"
-                    .to_string(),
-            ));
-        };
-
-        // The provider name + canonical price are needed on the VM thread in the
-        // poller; capture them before the Arc is moved into the worker.
-        let provider_name = provider.name().to_string();
-        let (tx, mut rx) = tokio::sync::oneshot::channel::<Result<EmbedResponse, LlmError>>();
-        let req2 = request.clone();
-        crate::http::shared_rt().spawn_blocking(move || {
-            let r = provider.embed(req2);
-            let _ = tx.send(r);
-            sema_core::notify_io_complete();
-        });
-
-        // Move the LlmSpan + cassette context INTO the poller closure so the
-        // span is finalized (and the cassette recorded) on the VM thread when the
-        // future lands — never as a native-frame local (those drop at the yield).
-        let key = cassette_key;
-        let mut span_slot = Some(span);
-        let handle = Rc::new(sema_core::IoHandle::new(move || {
-            use tokio::sync::oneshot::error::TryRecvError;
-            match rx.try_recv() {
-                Err(TryRecvError::Empty) => sema_core::IoPoll::Pending,
-                Ok(Ok(resp)) => {
-                    if let Some(span) = span_slot.take() {
-                        span.set_dispatch(&provider_name, &req_model);
-                        span.set_response(&sema_otel::ResponseFacts {
-                            input_tokens: resp.usage.prompt_tokens,
-                            output_tokens: 0,
-                            response_model: resp.model.clone(),
-                            cost_usd: pricing::calculate_cost_for(&provider_name, &resp.usage),
-                            ..Default::default()
-                        });
-                        // span drops here → ends the span.
-                    }
-                    if recording {
-                        CASSETTE.with(|c| {
-                            if let Some(cass) = c.borrow_mut().as_mut() {
-                                cass.record_entry(crate::cassette::TapeEntry::from_embed(
-                                    &key,
-                                    &resp.model,
-                                    &resp.embeddings,
-                                    resp.usage.prompt_tokens,
-                                ));
-                            }
-                        });
-                    }
-                    sema_core::IoPoll::Ready(Ok(embed_account_carrier(&resp, single, false, &key)))
-                }
-                Ok(Err(e)) => {
-                    if let Some(span) = span_slot.take() {
-                        span.record_error(llm_error_kind(&e), &e.to_string());
-                    }
-                    sema_core::IoPoll::Ready(Err(e.to_string()))
-                }
-                Err(TryRecvError::Closed) => {
-                    span_slot.take();
-                    sema_core::IoPoll::Ready(Err("embed: io worker dropped".to_string()))
-                }
-            }
-        }));
-        sema_core::set_yield_signal(sema_core::YieldReason::AwaitIo(handle));
-        Ok(Value::nil())
-    });
-
-    // (embed-account <carrier>) — runs track_usage on the VM thread (after the
-    // embed-dispatch yield resolves) and returns the embedding value, byte-
-    // identical to the synchronous `llm/embed`. No yield.
-    #[cfg(not(target_arch = "wasm32"))]
-    register_fn(env, "__embed-account", |args| {
-        if args.len() != 1 {
-            return Err(SemaError::arity("embed-account", "1", args.len()));
-        }
-        let carrier = args[0]
-            .as_map_rc()
-            .ok_or_else(|| SemaError::type_error("embed carrier map", args[0].type_name()))?;
-        let prompt_tokens = carrier
-            .get(&Value::keyword("prompt-tokens"))
-            .and_then(|v| v.as_int())
-            .unwrap_or(0) as u32;
-        let model = carrier
-            .get(&Value::keyword("model"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        let embedding = carrier
-            .get(&Value::keyword("embedding"))
-            .cloned()
-            .unwrap_or_else(Value::nil);
-        // Embeddings report input tokens only. PRESERVE embed's no-set_serving_provider
-        // pricing path (track_usage prices via the canonical first-party rate).
-        let usage = Usage {
-            prompt_tokens,
-            completion_tokens: 0,
-            model,
-            ..Default::default()
-        };
-        track_usage(&usage)?;
-        Ok(embedding)
-    });
-
-    // Internal predicate for the `llm/embed` router macro: true when evaluating
-    // inside an async scheduler task (so embeds can overlap via __embed-dispatch).
-    // `__`-prefixed: not a user-facing builtin.
-    register_fn(env, "__in-async-context?", |args| {
-        if !args.is_empty() {
-            return Err(SemaError::arity("__in-async-context?", "0", args.len()));
-        }
-        // The concurrent embed path is native-only (no shared tokio runtime on
-        // wasm), so wasm always reports false → `llm/embed` stays synchronous.
-        #[cfg(not(target_arch = "wasm32"))]
-        let async_ctx = sema_core::in_async_context();
-        #[cfg(target_arch = "wasm32")]
-        let async_ctx = false;
-        Ok(Value::bool(async_ctx))
+        Ok(embed_value_from_response(&response, single))
     });
 
     // (llm/rerank query documents {:top-k 5 :model "..." :provider :cohere})
@@ -5280,9 +5189,7 @@ fn compute_embed_key(request: &EmbedRequest) -> String {
 
 /// Encode an `EmbedResponse`'s vectors into the SAME `Value` the synchronous
 /// `llm/embed` returns (single → bytevector; multi → list of bytevectors), so the
-/// concurrent and sync paths are byte-identical. `_key` is reserved for callers
-/// that want to thread the cassette key; currently unused by the carrier.
-#[cfg(not(target_arch = "wasm32"))]
+/// concurrent (async) and sync paths are byte-identical: both decode through here.
 fn embed_value_from_response(resp: &EmbedResponse, single: bool) -> Value {
     if single {
         let embedding = resp.embeddings.first().cloned().unwrap_or_default();
@@ -5299,28 +5206,6 @@ fn embed_value_from_response(resp: &EmbedResponse, single: bool) -> Value {
                 .collect(),
         )
     }
-}
-
-/// Build the carrier map handed from `embed-dispatch` (via the resume value) to
-/// `embed-account`: the byte-identical embedding value plus the prompt-token count
-/// and model `embed-account` needs to run `track_usage` on the VM thread. Built on
-/// the VM thread (the poller runs there), so `Value` construction is safe.
-#[cfg(not(target_arch = "wasm32"))]
-fn embed_account_carrier(
-    resp: &EmbedResponse,
-    single: bool,
-    _cache_hit: bool,
-    _key: &str,
-) -> Value {
-    let embedding = embed_value_from_response(resp, single);
-    let mut m = BTreeMap::new();
-    m.insert(Value::keyword("embedding"), embedding);
-    m.insert(
-        Value::keyword("prompt-tokens"),
-        Value::int(resp.usage.prompt_tokens as i64),
-    );
-    m.insert(Value::keyword("model"), Value::string(&resp.usage.model));
-    Value::map(m)
 }
 
 /// Resolve the model id used for the cache key when the caller pinned none. With an

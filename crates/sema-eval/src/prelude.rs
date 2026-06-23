@@ -108,18 +108,11 @@ pub const PRELUDE: &str = r#"
 (defmacro with-session (id config . body)
   `(otel/with-session ,id ,config (lambda () ,@body)))
 
-;; llm/embed: compute embeddings. Outside an async scheduler task it calls the
-;; synchronous embed path (__embed-sync) BYTE-IDENTICALLY; inside one it routes
-;; to the concurrent overlap path (__embed-dispatch yields on the offloaded
-;; provider call so siblings run; __embed-account runs track_usage on resume),
-;; so `(async/all (map (fn (t) (async/spawn (fn () (llm/embed t)))) texts))`
-;; overlaps. Both paths return the same value (bytevector, or list of them).
-;; A router macro (not a function) so the sync native stays untouched and
-;; `llm/embed` keeps its arity/type errors.
-(defmacro llm/embed (text . opts)
-  `(if (__in-async-context?)
-     (__embed-account (__embed-dispatch ,text ,@opts))
-     (__embed-sync ,text ,@opts)))
+;; llm/embed is a SINGLE first-class native function (crates/sema-llm/src/
+;; builtins.rs) that branches internally on `in_async_context()`: synchronous
+;; inline outside a scheduler task, offloaded+overlapping inside one. Keeping it a
+;; native (not a router macro) is what makes `(procedure? llm/embed)` true and lets
+;; it be used as a value — `(map llm/embed …)`, `(async/pool-map llm/embed …)`.
 
 ;; async/pool-map: bounded-concurrency fan-out. Applies `f` to each item with at
 ;; most `n` tasks running concurrently, returning results in INPUT order.

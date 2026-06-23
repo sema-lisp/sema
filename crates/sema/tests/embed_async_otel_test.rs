@@ -130,6 +130,76 @@ fn two_concurrent_embeds_overlap_with_isolated_spans() {
     }
 }
 
+/// `llm/embed` must be a FIRST-CLASS native function, not a macro: `(procedure?
+/// llm/embed)` is `#t`, it is `map`-pable at top level (sync), and — the headline
+/// RAG pattern — usable as the function argument to `async/pool-map`, where it runs
+/// concurrently under bounded fan-out and returns results in input order.
+#[test]
+#[serial]
+fn embed_is_first_class_and_pool_mappable() {
+    let _cap = sema_otel::testing::install();
+
+    let fake = FakeProvider::builder("fake")
+        .model("fake-embed")
+        // Six scripted embeds: two for the sync `(map llm/embed …)` call, four for
+        // the `async/pool-map` over four chunks. Each is a distinct 3-dim vector.
+        .embed_delay(300)
+        .embed_with_tokens(vec![vec![0.1, 0.2, 0.3]], 3)
+        .embed_with_tokens(vec![vec![0.4, 0.5, 0.6]], 3)
+        .embed_with_tokens(vec![vec![0.7, 0.8, 0.9]], 3)
+        .embed_with_tokens(vec![vec![1.0, 1.1, 1.2]], 3)
+        .embed_with_tokens(vec![vec![1.3, 1.4, 1.5]], 3)
+        .embed_with_tokens(vec![vec![1.6, 1.7, 1.8]], 3)
+        .build();
+
+    let interp = Interpreter::new();
+    reset_runtime_state();
+    register_test_provider(Box::new(fake));
+
+    // (a) `llm/embed` is a procedure (was #f when it was a router macro).
+    let is_proc = interp
+        .eval_str_compiled("(procedure? llm/embed)")
+        .expect("procedure? llm/embed evaluated");
+    assert_eq!(
+        is_proc.as_bool(),
+        Some(true),
+        "llm/embed must be a first-class procedure"
+    );
+
+    // (b) `(map llm/embed ...)` works at top level (sync path), in order.
+    let mapped = interp
+        .eval_str_compiled(r#"(map embedding/length (map llm/embed (list "a" "b")))"#)
+        .expect("map llm/embed evaluated");
+    let dims = mapped.as_list().expect("list of lengths");
+    assert_eq!(dims.len(), 2);
+    assert_eq!(dims[0].as_int(), Some(3));
+    assert_eq!(dims[1].as_int(), Some(3));
+
+    // (c) `(async/pool-map llm/embed chunks N)` — the headline RAG pattern — runs
+    // concurrently (overlap wall ≈ ceil(4/2)*300 = 600 ms, not 4*300 = 1200 ms
+    // serial) and returns results in INPUT order.
+    let program = r#"
+        (let ((t0 (sys/elapsed)))
+          (let ((res (async/pool-map llm/embed (list "w" "x" "y" "z") 2)))
+            (list (map embedding/length res)
+                  (floor (/ (- (sys/elapsed) t0) 1000000)))))
+    "#;
+    let result = interp
+        .eval_str_compiled(program)
+        .expect("async/pool-map llm/embed evaluated");
+    let outer = result.as_list().expect("(dims wall-ms)");
+    let dims = outer[0].as_list().expect("dims list");
+    assert_eq!(dims.len(), 4, "four embeddings in input order");
+    for d in dims {
+        assert_eq!(d.as_int(), Some(3));
+    }
+    let wall_ms = outer[1].as_int().expect("wall ms");
+    assert!(
+        wall_ms < 1000,
+        "expected overlapped wall < 1000 ms (serial floor ~1200 ms), got {wall_ms} ms"
+    );
+}
+
 /// Sync path unchanged: a single `(llm/embed "x")` OUTSIDE any async context emits
 /// exactly one correct `embeddings` span via the synchronous path.
 #[test]

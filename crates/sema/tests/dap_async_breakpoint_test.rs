@@ -195,19 +195,31 @@ fn async_task_breakpoint_inspects_task_frame_locals() {
     // GetStackTrace must report the task's frame (the inner `fn`), not the main
     // top-level frame — the top frame's line is the breakpoint line (3).
     let (tx, rx) = mpsc::sync_channel(1);
-    run.cmd_tx.send(DebugCommand::GetStackTrace { reply: tx }).unwrap();
-    let frames = rx.recv_timeout(Duration::from_secs(5)).expect("stack trace reply");
+    run.cmd_tx
+        .send(DebugCommand::GetStackTrace { reply: tx })
+        .unwrap();
+    let frames = rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("stack trace reply");
     assert!(!frames.is_empty(), "expected at least one task frame");
     let top = &frames[0];
-    assert_eq!(top.line, 3, "top frame should be at the breakpoint line: {frames:?}");
+    assert_eq!(
+        top.line, 3,
+        "top frame should be at the breakpoint line: {frames:?}"
+    );
     let frame_id = top.id as usize;
 
     // GetScopes → the Locals scope reference for that frame.
     let (tx, rx) = mpsc::sync_channel(1);
     run.cmd_tx
-        .send(DebugCommand::GetScopes { frame_id, reply: tx })
+        .send(DebugCommand::GetScopes {
+            frame_id,
+            reply: tx,
+        })
         .unwrap();
-    let scopes = rx.recv_timeout(Duration::from_secs(5)).expect("scopes reply");
+    let scopes = rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("scopes reply");
     let locals_ref = scopes
         .iter()
         .find(|s| s.name.eq_ignore_ascii_case("locals"))
@@ -217,9 +229,14 @@ fn async_task_breakpoint_inspects_task_frame_locals() {
     // GetVariables on the Locals scope must surface the task-local `n = 42`.
     let (tx, rx) = mpsc::sync_channel(1);
     run.cmd_tx
-        .send(DebugCommand::GetVariables { reference: locals_ref, reply: tx })
+        .send(DebugCommand::GetVariables {
+            reference: locals_ref,
+            reply: tx,
+        })
         .unwrap();
-    let vars = rx.recv_timeout(Duration::from_secs(5)).expect("variables reply");
+    let vars = rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("variables reply");
     assert!(
         vars.iter().any(|v| v.name == "n" && v.value == "42"),
         "task-local `n = 42` should be visible at the async stop, got {vars:?}"

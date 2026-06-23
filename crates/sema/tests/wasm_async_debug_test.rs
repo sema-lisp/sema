@@ -266,7 +266,10 @@ fn coop_async_stop_inspects_paused_task_locals() {
     let n_value = sema_vm::with_coop_paused_task_vm(|tvm| {
         let frames = tvm.debug_stack_trace();
         assert!(!frames.is_empty(), "paused task should have a frame");
-        assert_eq!(frames[0].line, 3, "task top frame at breakpoint line: {frames:?}");
+        assert_eq!(
+            frames[0].line, 3,
+            "task top frame at breakpoint line: {frames:?}"
+        );
         let fid = frames[0].id as usize;
         tvm.debug_variables(sema_vm::scope_locals_ref(fid))
             .into_iter()

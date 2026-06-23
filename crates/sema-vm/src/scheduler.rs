@@ -253,6 +253,25 @@ impl Scheduler {
         }
     }
 
+    /// Drop every task the scheduler is still holding.
+    ///
+    /// Called at the OUTERMOST scheduler exit (control returning to non-async
+    /// Sema code), where any leftover task is genuinely abandoned: there is no
+    /// surviving awaiter and the next top-level eval starts a fresh run. Dropping
+    /// them HERE — on the VM thread, while the OTel thread-locals are still alive —
+    /// is what prevents a span-owning `IoHandle` (e.g. an `llm/embed` abandoned by
+    /// `async/timeout`) from surviving to thread/process teardown, where its
+    /// detached `LlmSpan` would call `span.end()` against a destructed thread-local
+    /// and abort the process (adversarial #7).
+    ///
+    /// Tasks of a still-active NESTED run are never touched: this only runs when
+    /// the caller is returning to a non-async context (see `run_scheduler_callback`).
+    /// After a normal `(async/all …)` the scheduler holds no tasks, so this is a
+    /// no-op there.
+    fn reap_leftover_tasks(&mut self) {
+        self.tasks.clear();
+    }
+
     /// Mark a task as cancelled and transition its promise into `Cancelled`.
     /// Returns true if this call actually transitioned the task into the
     /// cancelled state, false if the task was already terminal (Done /
@@ -276,6 +295,15 @@ impl Scheduler {
 
 thread_local! {
     static SCHEDULER: RefCell<Option<Scheduler>> = const { RefCell::new(None) };
+}
+
+/// Test/observability hook: the number of tasks the thread-local scheduler is
+/// currently holding (Ready / Blocked / terminal-not-yet-reaped). 0 when no
+/// scheduler is initialized. Used by the abandoned-task-reaping gate to prove a
+/// stranded `AwaitIo` task (e.g. an embed abandoned by `async/timeout`) was reaped
+/// during the run rather than surviving to thread/process teardown.
+pub fn scheduler_task_count() -> usize {
+    SCHEDULER.with(|s| s.borrow().as_ref().map_or(0, |sched| sched.tasks.len()))
 }
 
 /// Take the scheduler out of the thread-local temporarily.
@@ -390,6 +418,22 @@ fn run_scheduler_callback(
 ) -> Result<SchedulerRunResult, SemaError> {
     let mut sched = take_scheduler()?;
     let result = run_until_reentrant(&mut sched, ctx, &target);
+
+    // This callback is the registered top-level entry for `async/await`,
+    // `async/all`, `async/any`, `async/run` and `async/timeout` — all of which
+    // only call it when NOT already in an async context (otherwise they
+    // `set_yield_signal` and let the running scheduler resume them). So reaching
+    // here means we are the OUTERMOST run returning to non-async Sema code: any
+    // task the scheduler still holds is abandoned (a timed-out / un-awaited
+    // sibling parked on `AwaitIo` etc.). Reap them now, on the VM thread, while
+    // the OTel thread-locals are still alive — never leaving a span-owning
+    // `IoHandle` to drop at teardown (adversarial #7). The nested HOF-callback
+    // run (`run_closure_as_inline_task`) goes through a different path and is
+    // gated by `in_async_context()` being true, so it is never reaped here.
+    if !sema_core::in_async_context() {
+        sched.reap_leftover_tasks();
+    }
+
     put_scheduler(sched);
     result
 }

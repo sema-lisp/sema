@@ -4,6 +4,61 @@
 Code-grounded. Every claim cites a `file:symbol` I actually read at the stated commit state.
 Audience: the repo owner, building from this for a full day.
 
+---
+
+> ## ⚑ STATUS UPDATE 2026-06-23 (later same day) — the Spike-0 concurrency BLOCKER is RESOLVED on `main`
+>
+> This addendum was written against a tree where **every LLM call was `runtime.block_on`** and
+> `set_yield_signal` appeared **zero times** in `sema-llm`, so the gate's central verdict was
+> "in-process async cannot interleave the actual LLM workload; concurrent LLM I/O degrades to
+> sequential; subprocess fan-out has zero existing primitive." **That premise is now false.** The
+> concurrent-I/O work landed (branch `feat/async-awaitio`, commit range `f233943..d254685`,
+> **CHANGELOG 1.27.0**). Verified in-repo (file:line):
+>
+> - **A cooperative `AwaitIo` yield now lets blocking leaves interleave.** New `YieldReason::AwaitIo(Rc<IoHandle>)`
+>   (`sema-core/src/async_signal.rs:119`), scheduler wake-arm + poll (`sema-vm/src/scheduler.rs:176,236`).
+>   `set_yield_signal(AwaitIo(..))` now appears — gated on `sema_core::in_async_context()` — in
+>   `sema-stdlib/src/http.rs:126,240` (`http/*`), `sema-stdlib/src/system.rs:199,241` (`shell`), and
+>   `sema-llm/src/builtins.rs:2842,5346` (`llm/embed`, and `llm/complete`/`classify`/`extract` via
+>   `do_complete`). **Top-level (non-async) calls are byte-identically synchronous** — the yield only
+>   fires inside a scheduler task. Verified live (CHANGELOG): 4× `llm/complete` ~3.4× faster than serial,
+>   4× `llm/embed` ~13.6×, 5× `shell` 514 ms vs 2571 ms.
+> - **`async/pool-map` ships as a prelude macro** (`sema-eval/src/prelude.rs:134`): bounded-concurrency
+>   fan-out, `≤n` in flight, results in **input order** — built from exactly the semaphore-channel +
+>   `async/all` recipe Spike 0 Track A / Spike 3 specified (token released on BOTH success and error
+>   paths, no deadlock). **This IS the `workflow/foreach`/`parallel` substrate. It is built and shipped,
+>   not a spike to run.**
+> - **True cancellation ships** (`docs/plans/2026-06-23-concurrent-complete-and-true-cancel.md`,
+>   Slice B): `async/cancel`/`async/timeout` abort real work — `cancel_await_tree`
+>   (`scheduler.rs:323`, transitive across `async/await`), `IoHandle` abort seam
+>   (`async_signal.rs:39` `with_abort`), `http` connection torn down, `shell` subprocess **SIGKILLed as
+>   a process group** (`system.rs:104-151` `kill_on_drop`+`process_group(0)`). LLM tier is honest
+>   best-effort (the `spawn_blocking` worker can't be interrupted mid-call; the result is discarded).
+> - **Per-task OTel isolation ships** (concurrent LLM spans no longer cross-contaminate).
+>
+> **What this means for the spikes below.** Spike 0's GATE is effectively **passed by shipped code**:
+> the in-process async substrate runs ordered, bounded, cancellable fan-out AND now overlaps blocking
+> leaves (http/shell/single-shot LLM) — no new value type was needed (`Value::AsyncPromise` is the
+> handle). The four obsolete verdicts (R1 row, the "do NOT route concurrent LLM I/O through async/spawn"
+> recommendation, and the three §3.2 Plan-correction bullets) are marked **SUPERSEDED** inline below;
+> the history is kept for the reasoning trail.
+>
+> **What is STILL true and STILL needs building** (orthogonal to concurrency — do not treat as solved):
+> Spike 1 (sequential runtime + frozen JSONL journal), Spike 2 (cassette-backed demo + the
+> `compute_cache_key` anti-collision proof), Spike 4 (canonical `Value→bytes` encoder for resume).
+> Two known caveats survive: **(a)** in-process **multi-round `agent/run`** overlap is the deferred
+> "major rewrite" — the monolithic `run_tool_loop` native frame cannot yield mid-loop
+> (`async-agent-parallelization.md` §2; the round-loop holds `Rc` otel guards across `do_complete`
+> inside a Rust `for`). Single-shot `llm/complete`/`classify`/`extract`/`embed` DO overlap; a full
+> tool-using agent run does not yet. **(b) ASYNC-1** (`docs/deferred.md`): `llm/with-cache`/`with-budget`
+> are dynamically-scoped thread-locals that an async task reads *when it executes*, which the scheduler
+> can defer past the thunk's return — so budgets/cache flags may **not** reliably apply to deferred
+> concurrent tasks. Relevant the moment a workflow attaches a budget to a concurrent fan-out.
+>
+> The "Remaining blockers to start implementation" section at the very bottom is the actionable summary.
+
+---
+
 ## TL;DR — what grounding the plan in real code changed
 
 Grounding flipped four things the scoping doc treated as cheap or solved.
@@ -18,7 +73,7 @@ Grounding flipped four things the scoping doc treated as cheap or solved.
 
 | Risk area | Verdict | Decisive actual-code fact | Remaining unknown |
 |---|---|---|---|
-| **R1 — Parallel scheduling on single-thread `Rc`** | Feasible for *structure*; **blocked** for the actual LLM workload | `async/spawn`/channels/`async/all`/`async/cancel` all ship (`async_ops.rs:106,213,239,431`); but `agent/run`→`provider.complete`=`runtime.block_on` (`anthropic.rs:429`) and `set_yield_signal` count in `sema-llm` = 0 → an LLM leaf stalls the single OS thread and never interleaves | Whether real concurrent LLM I/O lands via per-item-indexed `batch_complete` (`anthropic.rs:441` `join_all`) or a new `YieldReason::ProcessWait` — Spike 0 as scoped tests *neither* |
+| **R1 — Parallel scheduling on single-thread `Rc`** | ~~Feasible for *structure*; **blocked** for the actual LLM workload~~ **SUPERSEDED 2026-06-23 → RESOLVED** | ~~`set_yield_signal` count in `sema-llm` = 0~~ — **now non-zero**: `YieldReason::AwaitIo` (`async_signal.rs:119`) makes `http/*`/`shell`/`llm/embed`/`llm/complete`/`classify`/`extract` yield while their work runs on a background runtime (`http.rs:240`, `system.rs:199`, `builtins.rs:2842,5346`), gated on `in_async_context()`. `async/pool-map` (`prelude.rs:134`) ships the ordered bounded substrate. Concurrent LLM I/O verified ~3.4× (CHANGELOG 1.27.0). | The one remaining gap is **multi-round `agent/run`** overlap (the `run_tool_loop` native frame can't yield mid-loop — deferred "major rewrite", `async-agent-parallelization.md` §2). Single-shot LLM leaves DO overlap. |
 | **R1b — Subprocess pool** | Feasible but **net-new Rust** | Only process builtin is blocking `shell` = `Command::output()` (`system.rs:53`); grep finds no `Stdio`/`.spawn()`/`Child`/`kill` in stdlib | Unix process-group/`setsid` reaping + Windows `TerminateProcess`; the `--json` envelope `value` is a STRING (`main.rs` `print_eval_json`) needing a parse round-trip |
 | **R2 — Resume needs canonical serialization** | Feasible; **must build a new encoder** | `Value::Hash` swallows `Map`/`HashMap`/closures via `_ => {}` (`value.rs:1854`); `serialize_value` writes string-table *indices* (`serialize.rs:108`) → process-unstable; `value_to_json` collapses string/keyword/symbol keys and errors on NaN (`json.rs`) | Float/JSON low-bit drift in *downstream* inputs (normalization spec); whether `Record`/typed-array inputs are common enough to matter (they ARE Hash-handled, so encoder must too) |
 | **R3 — Determinism softer than pitch** | Confirmed; honest framing required | Cassette keys on LLM request text only (`compute_cache_key`, `builtins.rs:4475`), not Sema step inputs; orchestrator determinism is *assumed*, never enforced | No test enforces "record twice ⇒ byte-identical tape"; unsorted dir walks in `inventory` would silently drift keys |
@@ -36,7 +91,20 @@ Grounding flipped four things the scoping doc treated as cheap or solved.
 **Goal.** Decide and *prove* the concurrency substrate. The plan (§3.2) offers two candidates and calls reuse of the async scheduler "mostly wiring." Grounding says: the structural primitive is free and needs **no new value type** (`Value::AsyncPromise` is the handle — `task_id` + `async/cancel`/`async/cancelled?`/`async/all`, `async_ops.rs:213,231,239`), but the workload the feature targets (`agent/run` fan-out) **cannot interleave** on it. The gate must produce a *decision*, not a build.
 
 **Explicit recommendation — in-process-async vs subprocess.**
-Ship `workflow/foreach`/`parallel` on the **in-process async substrate** for *sequencing, input-ordering, bounded structure, and cancellation* — these are real and free. **Do not** route real concurrent LLM I/O through `async/spawn`. The reason, code-grounded: `agent/run` → `run_tool_loop` → `provider.complete` = `self.runtime.block_on(self.complete_async(req))` (`anthropic.rs:429`; identical at `openai.rs`/`gemini.rs`/`ollama.rs`), and `set_yield_signal` never appears in `sema-llm` — so the first LLM leaf blocks the single OS thread for the whole HTTP round-trip and starves every sibling task. The scheduler interleaves *only* at the four `YieldReason` points (`async_signal.rs:18` `AwaitPromise`/`ChannelRecv`/`ChannelSend`/`Sleep`), and `async/sleep` advances a **virtual clock** (`scheduler.rs:79` `virtual_now`, `:58` `wake_at`) — so it does not even model real wall-clock overlap. Real concurrent LLM I/O is a **separate follow-on**: cheapest is extending `batch_complete`'s `join_all` (`anthropic.rs:441`) with per-item indices so order survives; the general (arbitrary-step) path needs a new `YieldReason::ProcessWait` + scheduler poll of child exit, and is blocked structurally by the thread-local `PROVIDER_REGISTRY` (`builtins.rs:26`) + `Rc`-non-`Send` `Value`/`Env`. **Subprocess fan-out is the right model for genuinely heavy/isolated leaves, but it is net-new Rust** (no `spawn`/`Stdio`/`kill` exists today — `system.rs:53` is blocking `Command::output()`), so it is out of the gate's build scope; the gate's job is to *choose it or defer it*.
+
+> **SUPERSEDED 2026-06-23 (see STATUS UPDATE banner).** The core "do NOT route real concurrent LLM I/O
+> through `async/spawn`" recommendation below is **obsolete**: the `AwaitIo` yield (`async_signal.rs:119`)
+> now makes `http/*`/`shell`/`llm/embed`/single-shot `llm/complete`/`classify`/`extract` interleave on
+> `async/spawn`, and `set_yield_signal` *does* now appear in `sema-llm` (`builtins.rs:2842,5346`). The
+> scheduler now advances `virtual_now` by **real elapsed** while an `AwaitIo` is in flight (bounded by
+> the nearest sleeper/timeout deadline) — it models real wall-clock overlap. Subprocess fan-out is also
+> **no longer net-new Rust**: `shell` yields and is SIGKILL-cancellable today (`system.rs:104-199`).
+> The *narrow* part of the original recommendation that survives: **multi-round `agent/run`** (the
+> `run_tool_loop` native frame, not single-shot LLM leaves) still cannot interleave — keep that out of
+> the parallel feature's v1 (use single-shot `llm/complete` composition or subprocess `.sema` workers
+> instead). The original text is preserved below for the reasoning trail.
+
+~~Ship `workflow/foreach`/`parallel` on the **in-process async substrate** for *sequencing, input-ordering, bounded structure, and cancellation* — these are real and free. **Do not** route real concurrent LLM I/O through `async/spawn`. The reason, code-grounded: `agent/run` → `run_tool_loop` → `provider.complete` = `self.runtime.block_on(self.complete_async(req))` (`anthropic.rs:429`; identical at `openai.rs`/`gemini.rs`/`ollama.rs`), and `set_yield_signal` never appears in `sema-llm` — so the first LLM leaf blocks the single OS thread for the whole HTTP round-trip and starves every sibling task. The scheduler interleaves *only* at the four `YieldReason` points (`async_signal.rs:18` `AwaitPromise`/`ChannelRecv`/`ChannelSend`/`Sleep`), and `async/sleep` advances a **virtual clock** (`scheduler.rs:79` `virtual_now`, `:58` `wake_at`) — so it does not even model real wall-clock overlap. Real concurrent LLM I/O is a **separate follow-on**: cheapest is extending `batch_complete`'s `join_all` (`anthropic.rs:441`) with per-item indices so order survives; the general (arbitrary-step) path needs a new `YieldReason::ProcessWait` + scheduler poll of child exit, and is blocked structurally by the thread-local `PROVIDER_REGISTRY` (`builtins.rs:26`) + `Rc`-non-`Send` `Value`/`Env`. **Subprocess fan-out is the right model for genuinely heavy/isolated leaves, but it is net-new Rust** (no `spawn`/`Stdio`/`kill` exists today — `system.rs:53` is blocking `Command::output()`), so it is out of the gate's build scope; the gate's job is to *choose it or defer it*.~~
 
 **Concrete steps.**
 
@@ -244,9 +312,12 @@ fn go(v: &Value, out: &mut Vec<u8>, depth: usize) -> Result<(), SemaError> {
 
 ## Plan corrections (deduped)
 
-- **§3.2 option (2) — "reuse the async scheduler for in-process concurrent LLM calls is mostly wiring" is WRONG.** `sema-llm` has zero `set_yield_signal`; every call is `runtime.block_on` (`anthropic.rs:429`). In-process LLM "concurrency" degrades to **sequential**; making it concurrent needs a new yield-aware bridge, not wiring.
-- **§3.2 — "`llm/pmap`/`llm/batch` … generalizing that to arbitrary steps is mostly wiring" is FALSE.** `llm/pmap` maps the Sema fn **sequentially** ("since Rc", `builtins.rs:~2394`); concurrency is only `provider.batch_complete`'s `join_all` over `Vec<ChatRequest>` (`anthropic.rs:441`) — plain `Send` structs, never arbitrary `Rc`-VM steps.
-- **§3.2 — "subprocess fan-out" has ZERO existing primitive.** Only `shell` = blocking `Command::output()` (`system.rs:53`); no `Stdio`/`spawn`/`Child`/`kill`. It is net-new Rust, and it does not compose with the async scheduler (a child wait stalls the one thread) without a new `YieldReason::ProcessWait`.
+- **§3.2 option (2) — ~~"reuse the async scheduler for in-process concurrent LLM calls is mostly wiring" is WRONG~~ SUPERSEDED 2026-06-23 → the scoping doc was directionally RIGHT.** The "yield-aware bridge" the original correction said was missing has now been *built* (the `AwaitIo` yield, `async_signal.rs:119`), and the wiring is done: `set_yield_signal(AwaitIo)` now fires for `llm/complete`/`classify`/`extract`/`embed` (`builtins.rs:2842,5346`), so in-process single-shot LLM calls *do* run concurrently on `async/spawn`/`async/pool-map`. The original correction was true *at the time* (it was a net-new bridge, not "mostly wiring") but the bridge has since shipped. The one residual: **multi-round** `agent/run` still can't yield mid-`run_tool_loop` (deferred). Original text struck through:
+  ~~`sema-llm` has zero `set_yield_signal`; every call is `runtime.block_on` (`anthropic.rs:429`). In-process LLM "concurrency" degrades to **sequential**; making it concurrent needs a new yield-aware bridge, not wiring.~~
+- **§3.2 — ~~"`llm/pmap`/`llm/batch` … generalizing that to arbitrary steps is mostly wiring" is FALSE~~ SUPERSEDED 2026-06-23.** Concurrent single-shot LLM fan-out now generalizes to arbitrary Sema items via `(async/pool-map llm/complete items n)` (`prelude.rs:134`) — each `llm/complete` is a first-class native (`builtins.rs:1521`) that yields `AwaitIo`, so this is no longer limited to the `Send`-struct `batch_complete` path. (Multi-round agent steps remain the exception — see the deferred agent-loop rewrite.) Original text struck through:
+  ~~`llm/pmap` maps the Sema fn **sequentially** ("since Rc", `builtins.rs:~2394`); concurrency is only `provider.batch_complete`'s `join_all` over `Vec<ChatRequest>` (`anthropic.rs:441`) — plain `Send` structs, never arbitrary `Rc`-VM steps.~~
+- **§3.2 — ~~"subprocess fan-out" has ZERO existing primitive~~ SUPERSEDED 2026-06-23.** `shell` now yields `AwaitIo` in async context and runs on a shared background runtime (`system.rs:199,241`), so subprocess leaves DO compose with the scheduler (a child wait no longer stalls the one thread), and a cancelled child is **SIGKILLed as a process group** (`system.rs:104-151`) — the `YieldReason::ProcessWait` the original correction asked for is subsumed by `AwaitIo`. Original text struck through:
+  ~~Only `shell` = blocking `Command::output()` (`system.rs:53`); no `Stdio`/`spawn`/`Child`/`kill`. It is net-new Rust, and it does not compose with the async scheduler (a child wait stalls the one thread) without a new `YieldReason::ProcessWait`.~~
 - **§3.3 / §4-R2 — canonical serialization is bigger than "stable key ordering."** `Value::Hash` silently drops `Map`/`HashMap`/closures (`value.rs:1854`), `Value::Eq` treats hashmap≠btreemap, `serialize_value` is process-unstable (`serialize.rs:108`), `value_to_json` collapses key types and errors on NaN. A dedicated encoder is required. (But note Hash *does* handle Record/F64Array/I64Array — the encoder must too.)
 - **§3.3 — "this is exactly how `llm/with-cache` already works, generalized to steps."** `compute_cache_key` (`builtins.rs:4475`) hashes only model+temp+system+message-text on a Rust `ChatRequest`, no separators, ignores tools/tool_calls/json_mode; it is not a reusable canonical-Value hasher.
 - **§3.3 — canonical serialization is NOT a cassette prerequisite.** The cassette keys on the LLM request (Rust-side SHA-256), not Sema step inputs. Spike 2 is unblocked by it; only Spike 4 needs it.
@@ -257,7 +328,7 @@ fn go(v: &Value, out: &mut Vec<u8>, depth: usize) -> Result<(), SemaError> {
 - **§3.5 — events.jsonl determinism is not free.** `serde_json` has no `preserve_order` (`Cargo.toml:50`) → map-encoded events sort keys alphabetically. Use a fixed `#[derive(Serialize)] enum`, and add a clock/run-id test seam — neither exists.
 - **§3.5 / R4 — `agent.result` can only carry a string today** (`agent/run` returns String 2-arg, `{:response :messages}` 3-arg). Freeze the event with `output`/`output_digest` only; add typed fields later.
 - **§3.5 run-dir — project-local vs user-global is unstated.** `home.rs:5` `sema_home()` is `~/.sema`; the plan implies `./.sema/runs`. Decide project-local and freeze it.
-- **R1 framing is overstated.** The cooperative scheduler + channels + `async/all` + `async/cancel` already give bounded, ordered, cancellable fan-out for *yielding* work with **no new value type** — `Value::AsyncPromise` is the handle. The genuine unknown is narrower: concurrent **in-process LLM I/O**, blocked by `block_on`, not by a missing scheduling primitive.
+- **R1 framing is overstated.** The cooperative scheduler + channels + `async/all` + `async/cancel` already give bounded, ordered, cancellable fan-out for *yielding* work with **no new value type** — `Value::AsyncPromise` is the handle. ~~The genuine unknown is narrower: concurrent **in-process LLM I/O**, blocked by `block_on`, not by a missing scheduling primitive.~~ **UPDATE 2026-06-23: that "genuine unknown" is now RESOLVED** — single-shot in-process LLM I/O interleaves via `AwaitIo` (`builtins.rs:5346`). The remaining unknown narrows once more, to **multi-round `agent/run`** only.
 - **R1 — "no `Task`/`Future`/`AgentHandle`" omits that `AsyncPromise` is effectively the handle** (`task_id` + `async/cancel`/`async/await`/`async/all`/`async/cancelled?`/`async/pending?`). State explicitly: no new type needed for structure; maybe a small one for subprocess-PID reaping.
 
 ## Open risks the skeptic surfaced (honest, unresolved)
@@ -279,3 +350,49 @@ fn go(v: &Value, out: &mut Vec<u8>, depth: usize) -> Result<(), SemaError> {
 **Build Spike 0 Track A only, and only far enough to settle the GATE — starting with the one missing primitive.** Concretely: add a minimal `atom`/`reset!`/`deref` (or decide BOUND can be proven structurally and skip it), write `workflow/foreach` in `fuzz/spike0-foreach.sema` relying on `async/all`'s verified input-ordering (`async_ops.rs:266`), and prove **ORDER + BOUND(≤N) + CANCEL** plus the **async-vs-`shell` wall-clock contrast** (Track B).
 
 **Gate it must pass:** `./target/release/sema fuzz/spike0-foreach.sema` returns `(0 1 2 3 4 5 6 7)` in input order with the semaphore never exceeding N concurrent past-`recv` tasks, `async/cancel` makes outstanding promises `async/cancelled?`, and the `async/sleep` leaf runs ≪ the `shell` leaf (≈ sum of sleeps). If that holds, the structural substrate is proven with **no new value type** and the verdict is recorded; if BOUND/interleaving fails, the feature scopes to sequential-only or commits to a subprocess/`YieldReason::ProcessWait` build **before** anything else is written. This is the smallest thing that either unblocks Spike 3 or kills the parallel pitch — and it costs ~1 day, not the ~1 day the plan claimed *plus* the missing primitives it didn't account for.
+
+> **POST-1.27.0 NOTE (2026-06-23).** The "Recommended first move" above (build Spike 0 Track A to settle
+> the GATE) is now **largely moot** — `async/pool-map` (`prelude.rs:134`) *is* the proven substrate,
+> shipped with the exact semaphore + `async/all`-input-order recipe Track A specified, and the
+> async-vs-`shell` overlap contrast was verified live (CHANGELOG 1.27.0). The GATE is passed. The first
+> move is now **Spike 1** (sequential runtime + frozen journal) — see the section below.
+
+---
+
+## Remaining blockers to start implementation (2026-06-23, post-1.27.0)
+
+**Verdict: implementation can start NOW.** The Spike-0 concurrency GATE is settled by shipped code, so
+the critical-path is the orthogonal-but-still-unbuilt work. There is **one HARD blocker** to the
+*parallel* feature (a missing mutable-cell primitive, and only for one narrow use), and a short list of
+caveats to design around. Nothing blocks **Spike 1** at all.
+
+### (a) HARD blockers — must build/decide before the dependent spike
+
+| # | Blocks | Blocker (code-grounded) | Cheapest path |
+|---|---|---|---|
+| **H1** | Spike 4 (resume) | **Canonical, cross-process-stable `Value→bytes` encoder does not exist.** `serialize_value` writes process-unstable string-table *indices* (`serialize.rs:108`); `Value::Hash` silently drops `Map`/`HashMap`/closures (`value.rs:1854`); `value_to_json` collapses string/keyword/symbol keys and errors on NaN. Resume short-circuiting is unsound without it. | Build `crates/sema-core/src/canonical.rs` + `hash/value` builtin exactly as Spike 4 specifies (inline-interned strings, sorted-by-key-bytes maps, NaN/Inf reject, Record/typed-array *encoded*). ~2d. **Only blocks Spike 4** — Spikes 1/2/3 do not need it. |
+| **H2** | Spike 2 multi-round replay | **`compute_cache_key` (`builtins.rs:4475`) ignores `tools`/`tool_calls`/`tool_call_id`/`json_mode` and has no field separators** — a re-asked agent emitting identical visible text can collide tape entries. | Land the contained fix (hash those fields, length-prefixed), bump `TapeEntry.v` (`cassette.rs:53`), re-record. ~1d. Gate it with the dedicated identical-added-content unit test before building the runtime on top. |
+| **H3** | The BOUND *counter* assertion only (NOT the substrate) | **No `atom`/`box`/`make-vector`/`vector-set!`/`swap!` mutable cell in the stdlib** (re-verified absent 2026-06-23). | **Largely avoidable:** `async/pool-map` already enforces BOUND *structurally* (capacity-N channel), and `async/all` gives ORDER for free — neither needs a cell. Add a minimal `atom`/`reset!`/`deref` (~0.5d) **only if** a workflow needs run-scoped shared mutable state (Mastra-style `state` bag) or a peak-counter assertion. Decide when designing `checkpoint`'s state-bag, not before. |
+
+### (b) Caveats to design around — not blockers, but must be honored
+
+| # | Caveat | Why it's not a blocker | Cheapest path to design around |
+|---|---|---|---|
+| **C1** | **ASYNC-1: dynamic-scope flags vs deferred async tasks** (`docs/deferred.md`). `llm/with-cache`/`with-budget`/`:tags` are thread-locals read *when the task executes*, which the scheduler can defer past the thunk's return → a budget attached to a concurrent fan-out may not gate it, and cache-miss accounting under-reports. | Caching *correctness* still works in-extent (same-prompt repeat is a hit); the gap is accounting/visibility and **budget-gating of concurrent tasks**. Sequential workflows (Spike 1) are unaffected. | For v1, **attach budgets at the sequential boundary**, not inside a `pool-map` worker — i.e. enforce the run-level budget *before/after* a fan-out, not per-concurrent-call. The real fix (snapshot dynamic scope onto each task at `async/spawn`, reinstall on run — like the shipped per-task OTel swap) is its own task; defer it. **Document the gap in the workflow `:budget` contract.** |
+| **C2** | **Multi-round `agent/run` does not overlap.** The monolithic `run_tool_loop` native frame holds `messages`/round-counter/`Rc` otel guards across `do_complete` inside a Rust `for`, so it can't yield mid-loop (`async-agent-parallelization.md` §2 — deferred "major rewrite"). | Single-shot `llm/complete`/`classify`/`extract`/`embed` **do** overlap; subprocess `.sema` workers overlap. Only an in-process *tool-using multi-round agent* fanned out N-at-a-time serializes. | Scope the parallel feature's leaves to **single-shot LLM composition** (`async/pool-map llm/complete …`) or **subprocess workers** for v1; keep in-process multi-round `agent/run` fan-out out of scope and document it. (This is the surviving slice of the old Spike-0 recommendation.) |
+| **C3** | **`agent/run` structured output is still string-only** (2-arg returns `Value::string`; 3-arg `{:response :messages}` — `builtins.rs:~2354`), and `validate_extraction` is **shallow** (top-level keys only, `builtins.rs:4384`). | Doesn't block the journal or the parallel substrate; only constrains the *typed-findings* shape Spike 3's `verify` phase can express. | Freeze `agent.result.output` as opaque string/digest in the journal (Spike 1 already specifies this), use **flat schemas** in the verify phase, and expose `validate_extraction` as `llm/validate`. Grow the validator only if a nested-finding schema becomes load-bearing. |
+| **C4** | **No `loop`/`recur`** (only `dotimes`/`for-range` — `prelude.rs:81,91`). | Cosmetic — affects only the Spike 3 `typed-step` sketch as written. | Use a recursive helper fn or `for-range` over attempts (Spike 3 sketch already rewritten this way). |
+| **C5** | **Determinism is assumed, not enforced** — an unsorted `inventory` dir walk leaks into prompt content and drifts cassette keys (O16). | Doesn't block building; it's a correctness gate to add. | Sort dir listings in `inventory`; add a "record twice ⇒ byte-identical tape" gate to Spike 2. |
+
+### Can implementation start now, and on what?
+
+**Yes — start with Spike 1 (sequential runtime + frozen JSONL journal).** It has **zero hard blockers**:
+no concurrency (the journal is sequential), no canonical serialization (checkpoint digests can be lossy),
+no cassette. It is the foundation Spikes 2/3/4 all depend on, and it freezes the ~8-event vocabulary the
+dashboard scope (`2026-06-23-workflow-dashboard-scope.md`) waits on.
+
+**Order:** Spike 1 → Spike 2 (build H2's `compute_cache_key` fix as its first step) → Spike 3 (now a
+*thin* layer: wrap the shipped `async/pool-map` + `:schema` validation; honor C1/C2/C3) → Spike 4 (build
+H1's canonical encoder first). The parallel substrate Spike 3 used to gate on is **already shipped**, so
+Spike 3 collapses from "build bounded fan-out" to "compose the shipped `async/pool-map` with structured
+step output and document the C2/C3 leaf-shape boundary."

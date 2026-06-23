@@ -1,6 +1,35 @@
 # Plan — Breakpoints & stepping inside async tasks
 
-**Status:** Slice 1 (native DAP STOP+CONTINUE) SHIPPED 2026-06-23. Bug write-up: `docs/bugs/async-breakpoints.md`.
+**Status:** Slice 1 (native DAP STOP+CONTINUE) + Slice 2 (WASM playground cooperative STOP+CONTINUE) SHIPPED 2026-06-23. Bug write-up: `docs/bugs/async-breakpoints.md`.
+
+## Slice 2 — shipped (WASM playground cooperative stop+continue)
+
+The playground debugger is **cooperative** (`start_cooperative`/`run_cooperative`
+return to JS between stops; `DebugState::new_headless()` has a disconnected command
+channel) — so the blocking native `handle_debug_stop` can't be used. Design
+*debug-pause-as-cooperative-yield*, reusing the existing `AsyncYield`→JS→`debug_poll`
+resume plumbing:
+- `DebugState` gained `headless`/`is_headless()`; `start_cooperative`/`run_cooperative`
+  register the session via `ActiveDebugGuard` (so the scheduler's `step_task_debug`
+  engages), the guard dropping when control returns to JS.
+- On a task `Stopped` under a headless session, `step_task_debug` records the location
+  (`vm::set_coop_task_stop`), leaves the task **Ready/paused (frames intact, not
+  reaped)**, and `run_until_reentrant` returns `SchedulerRunResult::DebugPaused`. The
+  scheduler-driving natives (`async/await`/`all`/`timeout`/`race`/`run`) yield the
+  main VM and record a `DebugCoopResume`; `start_cooperative`/`run_cooperative`
+  surface a `VmExecResult::Stopped(info)` (info.line = the task's breakpoint line) to JS.
+- On the next `run_cooperative` (Continue): re-drive the scheduler (resume the paused
+  task; a nested breakpoint surfaces as another `Stopped`), reconstruct the native's
+  value from `DebugCoopResume`, resume the main VM.
+- Gates: `crates/sema/tests/wasm_async_debug_test.rs` (cooperative STOP+CONTINUE,
+  single/two-task/first-task) + `playground/tests/async-debugger.spec.ts` (e2e,
+  injected program, verified headed). Non-debug async hot path byte-identical (gated
+  on `is_debug_session_active()`/`is_headless()`).
+
+Deferred (both slices): stepping across the scheduler into sibling tasks; full
+stack/variable inspection targeting the paused task's VM (cooperative async stop
+targets the main VM frame). One maintenance note: a new async combinator must add a
+`DebugCoopResume` arm or its debug-resume value would be wrong.
 
 ## Slice 1 — shipped (native DAP stop+continue)
 

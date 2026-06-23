@@ -4294,9 +4294,8 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
             tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
             // Clamp at 0: a stray decrement from an abandoned future (timeout/pool
             // error-path) must not push a later test's live count negative.
-            let _ = IO_INFLIGHT.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| {
-                Some((v - 1).max(0))
-            });
+            let _ = IO_INFLIGHT
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| Some((v - 1).max(0)));
             let _ = tx.send(id);
             // Wake the parked VM thread so it re-polls promptly.
             sema_core::notify_io_complete();

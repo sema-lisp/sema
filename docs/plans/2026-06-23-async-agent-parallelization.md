@@ -10,7 +10,8 @@
 > - **✅ #2 `shell`/subprocess** — SHIPPED & verified (`894ecf6`). Single shared stdlib runtime (`async_rt.rs`) now serves http+shell. Observed: 5×0.5s concurrent → **514 ms** vs **2571 ms** serial; non-zero exit + spawn-error + sync path identical; 85 ok / 0 failed. Unblocks subprocess workflow workers.
 > - **#3 B2 — per-task otel span-stack snapshot/restore** (scheduler swaps the otel TLS on task-switch so concurrent LLM spans don't cross-contaminate — prerequisite for any concurrent LLM).
 > - **#4 single-shot LLM** (`llm/embed` first → `classify`/`extract`/`complete` — B1 via `spawn_blocking`, B2 from #3, thread-local capture; no B4, no loop lift). Unblocks RAG indexing, batch classify/extract.
-> - **#5 bounded fan-out** (`async/pool-map` semaphore combinator) + **true cancel** (AbortHandle). B3 real-clock timeout already shipped in #0.
+> - **✅ bounded fan-out** (`async/pool-map`) — SHIPPED & verified (`1f3a15c` + hardening `+ this`). Prelude macro; semaphore = capacity-N channel, token released on success AND error (no deadlock). Observed: 6 items @ n=2 → **607 ms** (peak in-flight **2**, cap held) vs n=6 → 203 ms; input order preserved under reversed completion; error path drains. **Independent full-workspace verification caught a flaky regression** the agent missed: the `IO_INFLIGHT` spike counter underflowed (`usize`→MAX) when an abandoned future decremented it during a later test → `+1` overflow panic; fixed (signed `AtomicI64` + clamp-at-0).
+> - **#5 true cancel** (AbortHandle for real socket/process abort; current best-effort cancel doesn't hang but lets the future run to completion).
 >
 > **Major rewrite, OUT of this track:** concurrent in-process multi-round `agent/run` (B1+B4 + Sema-loop lift). For B1, prefer `spawn_blocking(|| provider.complete(req))` — reuses the sync path (retry, DROP_TEMPERATURE, serving-provider) and dissolves three majors.
 **Date:** 2026-06-23

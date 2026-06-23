@@ -399,6 +399,30 @@ fn put_scheduler(sched: Scheduler) {
     SCHEDULER.with(|s| *s.borrow_mut() = Some(sched));
 }
 
+/// Run `f` against the per-task VM of the task currently paused at a cooperative
+/// breakpoint, if any. Returns `None` when no task is paused (or it can no longer
+/// be found — e.g. it already resumed/completed), in which case the caller should
+/// fall back to the main VM.
+///
+/// This is how the cooperative (WASM) debugger inspects an async stop: between JS
+/// calls the paused task sits Ready (frames intact) in `sched.tasks`, while the
+/// main VM is parked at the `await`. We relocate the task by id (recorded in
+/// `vm::set_coop_task_stop`) and hand its VM to `f` so GetStackTrace/GetScopes/
+/// GetVariables/Evaluate read the TASK's frames, not the main VM's. No raw
+/// pointers cross the JS boundary: the task is found fresh each call, so a Vec
+/// realloc between calls cannot dangle it.
+pub fn with_coop_paused_task_vm<R>(f: impl FnOnce(&mut VM) -> R) -> Option<R> {
+    let id = vm::coop_paused_task_id()?;
+    let mut sched = take_scheduler().ok()?;
+    let result = sched
+        .tasks
+        .iter_mut()
+        .find(|t| t.id == id)
+        .map(|t| f(&mut t.vm));
+    put_scheduler(sched);
+    result
+}
+
 /// Spawn callback registered via `sema_core::set_spawn_callback`.
 ///
 /// Called by the `async/spawn` stdlib function. Takes the scheduler
@@ -715,7 +739,7 @@ fn step_task_debug(task: &mut Task, ctx: &EvalContext) -> Result<VmExecResult, S
                 let is_headless =
                     vm::with_active_debug(|debug| debug.is_headless()).unwrap_or(false);
                 if is_headless {
-                    vm::set_coop_task_stop(info);
+                    vm::set_coop_task_stop(task.id, info);
                     return Ok(VmExecResult::Stopped(crate::debug::StopInfo {
                         reason: crate::debug::StopReason::Breakpoint,
                         file: None,

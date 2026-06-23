@@ -2232,8 +2232,18 @@ impl WasmInterpreter {
             let Some(ref mut sess) = *session else {
                 return JsValue::NULL;
             };
-            let frame_idx = sess.vm.frame_count().saturating_sub(1);
-            let locals = sess.vm.debug_locals(frame_idx);
+            // When paused at a breakpoint INSIDE an async task, inspect that
+            // task's per-task VM (its frames hold the task-locals); the main VM
+            // is parked at the `await`. Falls back to the main VM for ordinary
+            // synchronous stops.
+            let locals = sema_vm::with_coop_paused_task_vm(|tvm| {
+                let frame_idx = tvm.frame_count().saturating_sub(1);
+                tvm.debug_locals(frame_idx)
+            })
+            .unwrap_or_else(|| {
+                let frame_idx = sess.vm.frame_count().saturating_sub(1);
+                sess.vm.debug_locals(frame_idx)
+            });
             let arr = js_sys::Array::new();
             for var in &locals {
                 let obj = js_sys::Object::new();
@@ -2254,7 +2264,10 @@ impl WasmInterpreter {
             let Some(ref sess) = *session else {
                 return js_sys::Array::new().into();
             };
-            let frames = sess.vm.debug_stack_trace();
+            // Mirror debug_get_locals: at an async stop, show the PAUSED TASK's
+            // call stack, not the main VM's (which is parked at the `await`).
+            let frames = sema_vm::with_coop_paused_task_vm(|tvm| tvm.debug_stack_trace())
+                .unwrap_or_else(|| sess.vm.debug_stack_trace());
             let arr = js_sys::Array::new();
             for frame in &frames {
                 let obj = js_sys::Object::new();

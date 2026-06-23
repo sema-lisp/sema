@@ -273,18 +273,38 @@ thread_local! {
     /// stop to JS. Consumed by `start_cooperative`/`run_cooperative`, which
     /// translate it into `VmExecResult::Stopped(info)`. Cleared on resume.
     static COOP_TASK_STOP: RefCell<Option<crate::debug::StopInfo>> = const { RefCell::new(None) };
+
+    /// Id of the async task currently paused at a cooperative breakpoint. Set
+    /// alongside `COOP_TASK_STOP` so inspection requests between JS calls
+    /// (`with_coop_paused_task_vm`) can relocate the paused task in the scheduler
+    /// and read ITS frames/locals — the task's own per-task VM, not the main VM
+    /// which is parked at the `await`. Cleared on resume.
+    static COOP_PAUSED_TASK_ID: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
 }
 
 /// Record the location a task stopped at for a cooperative (headless) debug
-/// session. Called by the scheduler.
-pub fn set_coop_task_stop(info: crate::debug::StopInfo) {
+/// session, plus the id of the paused task so its VM can be inspected while the
+/// cooperative session is suspended in JS. Called by the scheduler.
+pub fn set_coop_task_stop(task_id: u64, info: crate::debug::StopInfo) {
     COOP_TASK_STOP.with(|s| *s.borrow_mut() = Some(info));
+    COOP_PAUSED_TASK_ID.with(|c| c.set(Some(task_id)));
 }
 
 /// Take the pending cooperative task-stop location, if any. Called by
 /// `run_cooperative`/`start_cooperative` to surface the stop to JS.
 pub fn take_coop_task_stop() -> Option<crate::debug::StopInfo> {
     COOP_TASK_STOP.with(|s| s.borrow_mut().take())
+}
+
+/// Id of the async task paused at a cooperative breakpoint, if any.
+pub fn coop_paused_task_id() -> Option<u64> {
+    COOP_PAUSED_TASK_ID.with(|c| c.get())
+}
+
+/// Clear the paused-task id once the cooperative session resumes (the task is
+/// about to be re-driven, so inspecting it as "paused" is no longer meaningful).
+pub fn clear_coop_paused_task_id() {
+    COOP_PAUSED_TASK_ID.with(|c| c.set(None));
 }
 
 /// Surface a cooperative async-task stop to JS as `VmExecResult::Stopped`,
@@ -870,6 +890,9 @@ impl VM {
         // new stop, otherwise reconstruct the native's value and resume the main
         // VM via the stack-top placeholder it left (`set_resume_value` semantics).
         if let Some((target, how)) = sema_core::take_debug_coop_resume() {
+            // The paused task is about to be re-driven; inspecting it as "paused"
+            // is no longer meaningful (a later stop re-records a fresh id).
+            clear_coop_paused_task_id();
             // The scheduler runs in debug mode for this re-drive too, so a later
             // breakpoint in the same or a sibling task stops as well.
             let _active = ActiveDebugGuard::enter(debug);

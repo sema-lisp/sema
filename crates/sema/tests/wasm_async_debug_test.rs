@@ -182,3 +182,55 @@ fn coop_async_breakpoint_in_first_task() {
     assert_stopped_at(&first, 2);
     coop.continue_to_finish();
 }
+
+/// Slice-1 follow-up #2 (cooperative half): at an async stop, INSPECTION must
+/// read the PAUSED TASK's per-task VM — not the main VM, which is parked at
+/// `(await p)` and has no task-local in scope. `with_coop_paused_task_vm`
+/// relocates the paused task by id so GetStackTrace/GetScopes/GetVariables target
+/// its frames.
+#[test]
+fn coop_async_stop_inspects_paused_task_locals() {
+    // 1  (define p (async/spawn (fn ()
+    // 2    (let ((n 42))
+    // 3      (+ n 1)))))      <- breakpoint here, inside the task, n bound to 42
+    // 4  (await p)
+    let source = "(define p (async/spawn (fn ()\n  (let ((n 42))\n    (+ n 1)))))\n(await p)\n";
+    let (mut coop, first) = Coop::start(source, 3);
+    assert_stopped_at(&first, 3);
+
+    // The paused task's VM sees its frame at the breakpoint line and the local n.
+    let n_value = sema_vm::with_coop_paused_task_vm(|tvm| {
+        let frames = tvm.debug_stack_trace();
+        assert!(!frames.is_empty(), "paused task should have a frame");
+        assert_eq!(frames[0].line, 3, "task top frame at breakpoint line: {frames:?}");
+        let fid = frames[0].id as usize;
+        tvm.debug_variables(sema_vm::scope_locals_ref(fid))
+            .into_iter()
+            .find(|v| v.name == "n")
+            .map(|v| v.value)
+    })
+    .expect("a task is paused at the cooperative stop")
+    .expect("task-local `n` is in scope at line 3");
+    assert_eq!(n_value, "42", "task-local n should be 42 at the async stop");
+
+    // CONTRAST: the MAIN VM (what naive inspection would read) is parked at the
+    // await and has no `n` — proving the routing to the task VM was necessary.
+    let main_has_n = coop
+        .vm
+        .debug_stack_trace()
+        .first()
+        .map(|f| f.id as usize)
+        .map(|fid| {
+            coop.vm
+                .debug_variables(sema_vm::scope_locals_ref(fid))
+                .iter()
+                .any(|v| v.name == "n")
+        })
+        .unwrap_or(false);
+    assert!(
+        !main_has_n,
+        "main VM must NOT expose the task-local `n` (it would mean inspection hit the wrong VM)"
+    );
+
+    coop.continue_to_finish();
+}

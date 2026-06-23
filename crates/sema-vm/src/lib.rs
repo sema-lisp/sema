@@ -29,7 +29,7 @@ pub use lower::lower;
 pub use opcodes::Op;
 pub use optimize::optimize as optimize_expr;
 pub use resolve::resolve_with_locals;
-pub use scheduler::{init_scheduler, scheduler_task_count};
+pub use scheduler::{init_scheduler, scheduler_task_count, with_coop_paused_task_vm};
 pub use serialize::{deserialize_from_bytes, is_bytecode_file, serialize_to_bytes};
 pub use vm::{
     compile_program, compile_program_with_spans, current_vm_globals, extract_vm_closure,

@@ -40,6 +40,27 @@ impl Drop for BlockingRuntime {
     }
 }
 
+/// Process-wide multi-thread Tokio runtime that drives offloaded I/O futures
+/// concurrently. A single shared runtime (rather than one per provider) lets N
+/// in-flight requests overlap so an `async/spawn`'d agent parks on `AwaitIo`
+/// while the VM thread runs its siblings, each launching its own request.
+///
+/// Distinct from [`create_runtime`]/[`BlockingRuntime`], which stay the
+/// per-provider runtime for the synchronous top-level `complete()` path.
+#[cfg(not(target_arch = "wasm32"))]
+static SHARED_RT: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
+
+/// Get (initializing on first use) the process-wide shared runtime.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn shared_rt() -> &'static tokio::runtime::Runtime {
+    SHARED_RT.get_or_init(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("SHARED_RT")
+    })
+}
+
 /// Create a new Tokio runtime for synchronous LLM calls.
 pub fn create_runtime() -> Result<BlockingRuntime, LlmError> {
     let runtime = tokio::runtime::Runtime::new()

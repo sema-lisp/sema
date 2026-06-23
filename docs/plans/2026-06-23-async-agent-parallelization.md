@@ -7,6 +7,7 @@
 > **Incremental roadmap (the "no major rewrite" track, decided 2026-06-23).** Build the generic `AwaitIo` yield ONCE (done), then convert blocking leaves one at a time by cost:
 > - **✅ #0 `AwaitIo` mechanism** — SHIPPED & verified (see Status above).
 > - **✅ #1 `http/*`** — SHIPPED & verified (`3cc9e9d`). Gated on `in_async_context()`; sync path byte-identical. Observed: 5×300 ms deterministic local server → **692 ms** (floor ~1500); **live** 4×1 s → **1006 ms concurrent vs 4015 ms serial**. `cargo test --workspace` 84 ok / 0 failed.
+> - **✅ #2 `shell`/subprocess** — SHIPPED & verified (`894ecf6`). Single shared stdlib runtime (`async_rt.rs`) now serves http+shell. Observed: 5×0.5s concurrent → **514 ms** vs **2571 ms** serial; non-zero exit + spawn-error + sync path identical; 85 ok / 0 failed. Unblocks subprocess workflow workers.
 > - **#2 `shell`/subprocess** (also unblocks *subprocess workflow workers*, dodging the agent-loop rewrite) → **#3 bounded fan-out + real-clock timeout + true cancel** → **#4 single-shot LLM** (`llm/embed`/`classify`/`extract`/`complete` — needs B5 cache-stage extraction + B2 per-task otel snapshot; no B4, no loop lift).
 >
 > **Major rewrite, OUT of this track:** concurrent in-process multi-round `agent/run` (B1+B4 + Sema-loop lift). For B1, prefer `spawn_blocking(|| provider.complete(req))` — reuses the sync path (retry, DROP_TEMPERATURE, serving-provider) and dissolves three majors.

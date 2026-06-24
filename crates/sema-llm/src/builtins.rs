@@ -51,6 +51,15 @@ pub struct LastUsage {
     pub cost_usd: Option<f64>,
 }
 
+/// Clear the per-thread last-usage slot. The workflow runtime calls this at the START
+/// of each agent leaf so that [`last_usage_snapshot`] read afterwards reflects ONLY a
+/// completion this leaf made — a leaf whose call fails (or makes none) reports `None`
+/// instead of re-reading the previous leaf's usage (which would mis-attribute a budget
+/// event and double-charge the cap).
+pub fn clear_last_usage() {
+    LAST_USAGE.with(|u| *u.borrow_mut() = None);
+}
+
 /// Snapshot the most recent LLM completion's usage on this thread (tokens + model
 /// + computed cost). Used by the workflow runtime to emit per-agent budget events.
 pub fn last_usage_snapshot() -> Option<LastUsage> {

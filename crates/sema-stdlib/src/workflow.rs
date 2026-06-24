@@ -259,20 +259,13 @@ pub fn register(env: &sema_core::Env) {
             // Outside a run: transparent — just call the thunk.
             return crate::list::call_function(thunk, &[]);
         };
-        // Budget latch: once a cap is tripped, refuse to launch further leaves. No
-        // events are emitted for a skipped agent — the journal shows only the leaves
-        // that actually ran (the run is forced to :failed by workflow/run). Checking
-        // at ENTRY (not via Err) is what makes the cap hold through `__fanout-tagged`,
-        // which would otherwise swallow a leaf Err into nil.
-        if ctx.over_budget() {
-            return Ok(Value::nil());
-        }
-        // Resume short-circuit: compute this leaf's content-key from its inputs (the
-        // `agent` macro injects :__prompt and :__schema-repr). On a resumed run, if the
-        // key has a memo, return the recorded value WITHOUT running the model or
-        // emitting events (silent replay — keeps the accounting invariant: a replay
-        // makes no provider call, so emits no budget event). The key is computed on
-        // EVERY run (its occurrence ordinal must advance in body order either way).
+        // Resume short-circuit FIRST (before the budget latch): compute this leaf's
+        // content-key from its inputs (the `agent` macro injects :__prompt and
+        // :__schema-repr). On a resumed run a memoized leaf replays for FREE — return it
+        // WITHOUT running the model or emitting events. This MUST precede the budget
+        // check: a replay makes no provider call, so a tripped cap must not refuse it
+        // (refusing would return nil for a value that's on disk). The key is computed on
+        // EVERY leaf so its occurrence ordinal advances in body order either way.
         let content_key = ctx.agent_content_key(
             &opt_str(&args[0], "__prompt"),
             &opt_str(&args[0], "__schema-repr"),
@@ -283,6 +276,14 @@ pub fn register(env: &sema_core::Env) {
             if let Some(v) = ctx.memo_lookup(&content_key) {
                 return Ok(v);
             }
+        }
+        // Budget latch: once a cap is tripped, refuse to LAUNCH further (non-replayed)
+        // leaves. No events are emitted for a skipped agent — the journal shows only the
+        // leaves that actually ran (the run is forced to :failed by workflow/run).
+        // Checking at ENTRY (not via Err) is what makes the cap hold through
+        // `__fanout-tagged`, which would otherwise swallow a leaf Err into nil.
+        if ctx.over_budget() {
+            return Ok(Value::nil());
         }
         // Unique per-invocation id (the dashboard correlates started→result→budget
         // by it); the label is the agent_name (role).
@@ -295,6 +296,11 @@ pub fn register(env: &sema_core::Env) {
             model: String::new(), // unknown until the call completes (filled below)
         });
         let start = Instant::now();
+        // Clear the per-thread usage slot BEFORE the thunk so the snapshot afterwards
+        // reflects ONLY a completion this leaf made. Without this, a leaf whose call
+        // fails (or makes none) would re-read the PREVIOUS leaf's sticky usage — a
+        // phantom budget event + a double-charge against the cap.
+        sema_llm::builtins::clear_last_usage();
         // Mark this as the current agent so `workflow/tool-call` inside the thunk
         // attributes to it; clear afterwards.
         ctx.set_cur_agent(Some(agent_id.clone()));

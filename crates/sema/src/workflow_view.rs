@@ -172,8 +172,7 @@ fn list_runs(run_dir: &Path) -> String {
 /// SQLite error so the endpoint never 500s the viewer.
 fn index_runs_json(run_dir: &Path) -> Vec<u8> {
     let try_build = || -> rusqlite::Result<Vec<u8>> {
-        let conn = rusqlite::Connection::open(run_dir.join(sema_workflow::INDEX_DB))?;
-        ingest::init_schema(&conn)?;
+        let conn = ingest::open(&run_dir.join(sema_workflow::INDEX_DB))?;
         ingest::backfill_all(&conn, run_dir);
         let rows = ingest::runs_summary(&conn)?;
         Ok(serde_json::to_vec(&serde_json::Value::Array(rows)).unwrap_or_else(|_| b"[]".to_vec()))

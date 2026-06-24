@@ -923,12 +923,8 @@ fn run_workflow_command(command: WorkflowCommands, sandbox: &sema_core::Sandbox)
         }
         WorkflowCommands::Index { run_dir } => {
             let root = PathBuf::from(&run_dir);
-            match rusqlite::Connection::open(root.join(sema_workflow::INDEX_DB)) {
+            match workflow_view::ingest::open(&root.join(sema_workflow::INDEX_DB)) {
                 Ok(conn) => {
-                    if let Err(e) = workflow_view::ingest::init_schema(&conn) {
-                        eprintln!("error: index schema: {e}");
-                        std::process::exit(1);
-                    }
                     workflow_view::ingest::backfill_all(&conn, &root);
                     match workflow_view::ingest::runs_summary(&conn) {
                         Ok(rows) => println!(

@@ -17,6 +17,7 @@ use std::sync::{Mutex, MutexGuard};
 use sema_eval::Interpreter;
 use sema_llm::builtins::{register_test_provider, reset_runtime_state};
 use sema_llm::fake::FakeProvider;
+use sema_llm::types::LlmError;
 
 static SERIAL: Mutex<()> = Mutex::new(());
 
@@ -109,6 +110,48 @@ fn budget_stops_sequential_run_after_the_tipping_leaf() {
     let budget = events_of(&events, "budget");
     assert_eq!(budget.len(), 1);
     assert_eq!(budget[0]["budget_limit"], 5);
+}
+
+#[test]
+fn failed_leaf_does_not_emit_a_phantom_budget_from_stale_usage() {
+    // Regression (verification bug #1): a leaf whose LLM call FAILS made no completion,
+    // so it must report ZERO usage — NOT re-read the previous leaf's sticky LAST_USAGE.
+    // Agent "one" succeeds (15 tokens); agent "two" errors. There must be exactly ONE
+    // budget event (for "one"); "two" must not emit a phantom budget carrying one's
+    // tokens (which would also double-charge the cap).
+    let fake = FakeProvider::builder("fake")
+        .model("fake-model")
+        .reply_with_usage("first answer", 10, 5)
+        .error(LlmError::Api {
+            status: 500,
+            message: "boom".into(),
+        })
+        .build();
+
+    let src = r#"
+        (defworkflow budget-failed-leaf
+          "second agent's call fails"
+          {:phases ["A"] :budget {:tokens 1000}}
+          (phase "A")
+          (def x (agent "first" {:name "one"}))
+          (def y (agent "second" {:name "two"}))
+          {:status :success})
+    "#;
+
+    let (events, _result) = run_workflow(src, fake, "wf_budget_failed");
+
+    let budget = events_of(&events, "budget");
+    assert_eq!(
+        budget.len(),
+        1,
+        "the failed leaf must not emit a budget event"
+    );
+    assert_eq!(budget[0]["agent_id"], "one_1");
+
+    // The failed leaf is still recorded as a failed agent result.
+    let results = events_of(&events, "agent.result");
+    let two = results.iter().find(|e| e["agent_id"] == "two_1").unwrap();
+    assert_eq!(two["status"], "failed");
 }
 
 #[test]

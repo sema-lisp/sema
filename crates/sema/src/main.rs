@@ -904,6 +904,11 @@ fn run_workflow_command(command: WorkflowCommands, sandbox: &sema_core::Sandbox)
 
     let interpreter = Interpreter::new_with_sandbox(sandbox);
 
+    // Auto-configure an LLM provider from the environment (mirrors the default run
+    // path), so a workflow whose leaves call `llm/*` works without self-configuring.
+    // Best-effort: a workflow with no LLM leaves needs no provider, so ignore errors.
+    let _ = interpreter.eval_str("(llm/auto-configure)");
+
     // Bind the parsed --args JSON object to the global `*workflow-args*` so the
     // workflow body can read its inputs.
     let args_value = match serde_json::from_str::<serde_json::Value>(&args) {

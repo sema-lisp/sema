@@ -1,6 +1,23 @@
 # Workflow Dashboard + SQLite Projection — Scoping
 
-**Status:** scoping / not started · **Date:** 2026-06-23 · **Design direction LOCKED 2026-06-23.**
+> ## ⚑ OPTION-A SPIKE SHIPPED 2026-06-24 (branch `feat/dynamic-workflows-spike1`)
+> The visible viewer is built: `sema workflow view --run-dir <dir> [--host --port]`.
+> - `crates/sema/src/workflow_view.rs` — a minimal loopback tokio HTTP/1.1 static server
+>   (NO new axum dep; 4 read-only routes: `/`, `/alpine.min.js`, `/api/runs`,
+>   `/api/run/<id>/events.jsonl`). Loopback + no-auth, documented (same model as the notebook).
+>   Path-traversal in the run id is rejected. Unit-tested routing/safety.
+> - `crates/sema/src/workflow_view/index.html` — the AlpineJS tree viewer (vendored alpine, same
+>   as the notebook), on the Sema brand palette: run header + status pill + rollup, phase groups,
+>   agent rows merging started→result with status glyph + duration, tool twigs, checkpoint/budget
+>   lines, expand-to-see output, follow-live polling while a run is `running`. Honors §1.2
+>   anti-dashboard-isms. Smoke-verified against the live content-pipeline journal
+>   (`crates/sema/tests/fixtures/workflow/content-live.events.jsonl`).
+> - This is **Option A** (§2.2 — static client-side parse of `events.jsonl`). **Option B** (the
+>   SQLite projection + idempotent replay-to-rows ingester + server-side `seq > N` live-tail cursor,
+>   §3–§5) is the documented upgrade for many/large/long runs — **still to build**. Browser-visual
+>   fidelity vs `variant-5b` is pending a human look.
+
+**Status:** scoping · Option A spike shipped 2026-06-24 · Option B (SQLite) pending · **Design direction LOCKED 2026-06-23.**
 **Depends on:** Spike 1 (sequential runtime + *frozen* JSONL journal) — see
 `docs/plans/2026-06-23-dynamic-workflows-derisk-spikes.md` §"Spike 1". This work
 **must not start until the ~8-event vocabulary is frozen** (scoping

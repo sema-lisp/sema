@@ -2,9 +2,23 @@
 
 **Date:** 2026-06-24
 **Branch:** `feat/dynamic-workflows-spike1`
-**Status:** APPROVED 2026-06-24 — **Variant C (hybrid)** chosen. Defaults locked: typed
-`agent` reuses the `llm/extract` validator; `checkpoint` kept but demoted to optional;
-combinators get bare names (`parallel`/`pipeline`). Implementation track #1 in progress.
+**Status:** Track #1 **SHIPPED** 2026-06-24 — **Variant C (hybrid)** chosen and
+implemented. Defaults locked: typed `agent` reuses the `llm/extract` validator;
+`checkpoint` kept but demoted to optional; combinators get bare names
+(`parallel`/`pipeline`). Tracks #2–#4 (resume/tools/budgets → SQLite → polish) remain.
+
+**Track #1 acceptance gate — all green (evidence):**
+- Both examples live-verified with real `gpt-5.4-mini`: content-pipeline (4 typed
+  `agent`s, published 4/4) and sema-docs-pipeline (13 agents, 12 tool calls, 6 phases in
+  order, published 4/4 + index).
+- `agent` `:schema` returns typed data consumed downstream without parsing
+  (content-pipeline Verify/Publish read `(:title)`/`(:body)`; the docs pipeline threads
+  typed `{:topic :draft :notes :body}` maps through a 3-stage `pipeline`).
+- `parallel` + `pipeline` share one `__fanout-tagged` engine; `workflow/foreach` removed
+  (no remaining refs outside history docs).
+- `hello-wf` golden **byte-identical** (marker phases emit the same ordering); Playwright
+  9/9; full `cargo test --workspace` green (96 binaries, 0 failures); `make lint` clean;
+  doc-coverage green.
 
 This is the recalibration doc. We built a lot reactively (runtime + journal + a full
 dashboard + two examples) and it works, but the surface sprawled and drifted from the

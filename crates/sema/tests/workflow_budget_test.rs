@@ -1,69 +1,17 @@
-//! Deterministic budget-enforcement tests (track #2, slice S1).
+//! Deterministic budget-enforcement tests (slice S1).
 //!
-//! Enforcement is a sticky `over_budget` latch on `WorkflowCtx`, set by `charge` once
-//! a `:budget {:tokens N}` cap is exceeded and checked at agent ENTRY — NOT `Err`
-//! propagation, which the `__fanout-tagged` engine would swallow into `nil`. These
-//! tests drive a workflow in-process against a scripted `FakeProvider` (no network,
-//! no keys), so token usage is deterministic and a `:tokens` cap trips predictably
-//! (a `:usd` cap would couple the test to the pricing table — see the design doc).
-//!
-//! Env isolation: this is its own test binary (its own process), so the
-//! `SEMA_WORKFLOW_*` env vars it sets do not leak into other binaries. A process-wide
-//! `SERIAL` mutex serializes the tests within THIS binary (they share the env + the
-//! thread-local provider registry).
+//! Enforcement is a sticky `over_budget` latch on `WorkflowCtx`, set by `charge` once a
+//! `:budget {:tokens N}` cap is exceeded and checked at agent ENTRY — NOT `Err`
+//! propagation, which the `__fanout-tagged` engine swallows into `nil`. Driven in-process
+//! against a scripted `FakeProvider` (no network/keys), so a `:tokens` cap trips
+//! deterministically (a `:usd` cap would couple the test to the pricing table). The
+//! shared harness lives in `workflow_common`.
 
-use std::sync::{Mutex, MutexGuard};
+mod workflow_common;
+use workflow_common as wc;
 
-use sema_eval::Interpreter;
-use sema_llm::builtins::{register_test_provider, reset_runtime_state};
 use sema_llm::fake::FakeProvider;
 use sema_llm::types::LlmError;
-
-static SERIAL: Mutex<()> = Mutex::new(());
-
-/// Run `src` as a workflow under the fixed-ts/run-id seam into a fresh temp run dir,
-/// against `fake` as the default provider. Returns the parsed events of the run.
-fn run_workflow(
-    src: &str,
-    fake: FakeProvider,
-    run_id: &str,
-) -> (Vec<serde_json::Value>, serde_json::Value) {
-    let _guard: MutexGuard<()> = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-
-    let mut dir = std::env::temp_dir();
-    dir.push(format!("sema-wf-budget-{}-{}", std::process::id(), run_id));
-    let _ = std::fs::remove_dir_all(&dir);
-
-    std::env::set_var("SEMA_WORKFLOW_FIXED_TS", "0");
-    std::env::set_var("SEMA_WORKFLOW_RUN_ID", run_id);
-    std::env::set_var("SEMA_WORKFLOW_RUN_DIR", &dir);
-
-    let interp = Interpreter::new();
-    reset_runtime_state();
-    register_test_provider(Box::new(fake));
-    let _ = interp.eval_str_compiled(src);
-
-    std::env::remove_var("SEMA_WORKFLOW_FIXED_TS");
-    std::env::remove_var("SEMA_WORKFLOW_RUN_ID");
-    std::env::remove_var("SEMA_WORKFLOW_RUN_DIR");
-
-    let run = dir.join(run_id);
-    let events = std::fs::read_to_string(run.join("events.jsonl")).expect("events.jsonl written");
-    let parsed: Vec<serde_json::Value> = events
-        .lines()
-        .map(|l| serde_json::from_str(l).expect("valid event json"))
-        .collect();
-    let result: serde_json::Value = serde_json::from_str(
-        &std::fs::read_to_string(run.join("result.json")).expect("result.json"),
-    )
-    .expect("valid result json");
-    let _ = std::fs::remove_dir_all(&dir);
-    (parsed, result)
-}
-
-fn events_of<'a>(events: &'a [serde_json::Value], name: &str) -> Vec<&'a serde_json::Value> {
-    events.iter().filter(|e| e["event"] == name).collect()
-}
 
 #[test]
 fn budget_stops_sequential_run_after_the_tipping_leaf() {
@@ -86,19 +34,19 @@ fn budget_stops_sequential_run_after_the_tipping_leaf() {
           {:status :success :x x :y y})
     "#;
 
-    let (events, result) = run_workflow(src, fake, "wf_budget_seq");
+    let out = wc::run_once(src, fake, "wf_budget_seq");
 
     // The run is forced to :failed with the budget reason, regardless of the body's
     // own (successful) last value.
-    let ended = events_of(&events, "run.ended");
+    let ended = wc::events_of(&out.events, "run.ended");
     assert_eq!(ended.len(), 1);
     assert_eq!(ended[0]["status"], "failed");
     assert_eq!(ended[0]["reason"], "budget exceeded");
-    assert_eq!(result["status"], "failed");
-    assert_eq!(result["reason"], "budget exceeded");
+    assert_eq!(out.result["status"], "failed");
+    assert_eq!(out.result["reason"], "budget exceeded");
 
     // Exactly ONE agent launched — the second was refused at entry (no events).
-    let started = events_of(&events, "agent.started");
+    let started = wc::events_of(&out.events, "agent.started");
     assert_eq!(
         started.len(),
         1,
@@ -107,7 +55,7 @@ fn budget_stops_sequential_run_after_the_tipping_leaf() {
     assert_eq!(started[0]["agent_name"], "one");
 
     // The tipping leaf's Budget event carries the populated token cap.
-    let budget = events_of(&events, "budget");
+    let budget = wc::events_of(&out.events, "budget");
     assert_eq!(budget.len(), 1);
     assert_eq!(budget[0]["budget_limit"], 5);
 }
@@ -138,9 +86,9 @@ fn failed_leaf_does_not_emit_a_phantom_budget_from_stale_usage() {
           {:status :success})
     "#;
 
-    let (events, _result) = run_workflow(src, fake, "wf_budget_failed");
+    let out = wc::run_once(src, fake, "wf_budget_failed");
 
-    let budget = events_of(&events, "budget");
+    let budget = wc::events_of(&out.events, "budget");
     assert_eq!(
         budget.len(),
         1,
@@ -149,17 +97,49 @@ fn failed_leaf_does_not_emit_a_phantom_budget_from_stale_usage() {
     assert_eq!(budget[0]["agent_id"], "one_1");
 
     // The failed leaf is still recorded as a failed agent result.
-    let results = events_of(&events, "agent.result");
+    let results = wc::events_of(&out.events, "agent.result");
     let two = results.iter().find(|e| e["agent_id"] == "two_1").unwrap();
     assert_eq!(two["status"], "failed");
 }
 
 #[test]
+fn usd_budget_enforced_end_to_end_via_pinned_pricing() {
+    // The :usd path (cost_usd → charge → latch → forced :failed) was only covered by
+    // direct charge() unit tests. Pin the fake model's price (via the Sema builtin, so
+    // it survives the harness's reset_runtime_state) so one reply blows a tiny :usd cap.
+    let fake = FakeProvider::builder("fake")
+        .model("fake-model")
+        .reply_with_usage("first", 10, 5)
+        .reply_with_usage("second", 10, 5)
+        .build();
+
+    let src = r#"
+        (llm/set-pricing "fake-model" 1000.0 1000.0)   ; $/1M tokens
+        (defworkflow budget-usd
+          "tiny usd cap"
+          {:phases ["A"] :budget {:usd 0.001}}
+          (phase "A")
+          (def x (agent "first" {:name "one"}))
+          (def y (agent "second" {:name "two"}))
+          {:status :success})
+    "#;
+    let out = wc::run_once(src, fake, "wf_budget_usd");
+
+    // 15 tokens × $1000/1M = $0.015 ≫ $0.001 cap → run fails, second agent refused,
+    // and the tipping budget event carries a real cost.
+    assert_eq!(out.result["status"], "failed");
+    assert_eq!(out.result["reason"], "budget exceeded");
+    let started = wc::events_of(&out.events, "agent.started");
+    assert_eq!(started.len(), 1, "second agent refused after the usd cap");
+    let budget = wc::events_of(&out.events, "budget");
+    assert!(budget[0]["cost_usd"].as_f64().unwrap() > 0.0);
+}
+
+#[test]
 fn budget_latch_fails_run_and_refuses_further_leaves_under_fanout() {
-    // A pipeline fan-out over 20 items with a tiny budget. The latch can't stop
-    // siblings already in flight (LAST_USAGE accounting is best-effort under fan-out),
-    // but once it trips, queued leaves are refused at entry — so strictly fewer than
-    // 20 agents run, and the run is forced :failed.
+    // A pipeline fan-out over 20 items with a tiny budget. The latch can't stop siblings
+    // already in flight (LAST_USAGE accounting is best-effort under fan-out), but once it
+    // trips, queued leaves are refused at entry — so strictly fewer than 20 agents run.
     let mut b = FakeProvider::builder("fake").model("fake-model");
     for _ in 0..20 {
         b = b.reply_with_usage("x", 10, 5);
@@ -175,14 +155,14 @@ fn budget_latch_fails_run_and_refuses_further_leaves_under_fanout() {
           {:status :success :n (count rs)})
     "#;
 
-    let (events, result) = run_workflow(src, fake, "wf_budget_fanout");
+    let out = wc::run_once(src, fake, "wf_budget_fanout");
 
-    let ended = events_of(&events, "run.ended");
+    let ended = wc::events_of(&out.events, "run.ended");
     assert_eq!(ended[0]["status"], "failed");
     assert_eq!(ended[0]["reason"], "budget exceeded");
-    assert_eq!(result["status"], "failed");
+    assert_eq!(out.result["status"], "failed");
 
-    let started = events_of(&events, "agent.started");
+    let started = wc::events_of(&out.events, "agent.started");
     assert!(
         !started.is_empty() && started.len() < 20,
         "latch must refuse further leaves under fan-out: ran {} of 20",

@@ -115,6 +115,8 @@ pub const PRELUDE: &str = r#"
 ;; to launch further `agent` leaves; the run ends {:status :failed :reason "budget
 ;; exceeded"}. Under a concurrent fan-out the cap still trips, but per-agent token
 ;; accounting is best-effort (the LAST_USAGE thread-local is not swapped per task).
+;; The cap is PER-INVOCATION: a `--resume` run starts spend at 0 (memoized leaves
+;; replay for free and don't recharge), so it does not carry the prior run's spend.
 ;; expands to a (workflow/run name doc meta thunk) call. `name` is a bare symbol that
 ;; becomes a string; `meta` is the metadata map literal, spliced verbatim (like the
 ;; with-span attrs map at :103); the body forms become the run thunk. workflow/run opens

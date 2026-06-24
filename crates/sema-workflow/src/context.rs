@@ -693,6 +693,17 @@ mod tests {
         let kw_map = Value::map(m);
         ctx.memo_store("ck_map", &kw_map);
         assert_eq!(ctx.memo_lookup("ck_map"), Some(kw_map));
+        // A map with a NON-string/keyword key does NOT survive JSON round-trip (the int
+        // key becomes a string), so the guard leaves it un-memoized → it re-runs on
+        // resume rather than resuming a different value. This exercises the FALSE branch.
+        let mut bad = BTreeMap::new();
+        bad.insert(Value::int(1), Value::int(2));
+        ctx.memo_store("ck_bad", &Value::map(bad));
+        assert_eq!(
+            ctx.memo_lookup("ck_bad"),
+            None,
+            "a non-round-trippable value must be left un-memoized"
+        );
     }
 
     #[test]

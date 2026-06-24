@@ -305,7 +305,12 @@ pub fn register(env: &sema_core::Env) {
         // phantom budget event + a double-charge against the cap.
         sema_llm::builtins::clear_last_usage();
         // Mark this as the current agent so `workflow/tool-call` inside the thunk
-        // attributes to it; clear afterwards.
+        // attributes to it; clear afterwards. NOTE: `cur_agent` is a single shared slot,
+        // so under a CONCURRENT `:tools` fan-out (tool loops yield between rounds) two
+        // in-flight tool-agents can clobber each other's attribution — tool-call
+        // attribution is best-effort under fan-out, the same single-slot-thread-local
+        // root as the per-agent budget caveat. The real fix is per-task scoping in the
+        // scheduler (out of scope); a sequential body is exact.
         ctx.set_cur_agent(Some(agent_id.clone()));
         let result = crate::list::call_function(thunk, &[]);
         ctx.set_cur_agent(None);

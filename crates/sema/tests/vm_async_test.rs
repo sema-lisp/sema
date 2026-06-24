@@ -1215,3 +1215,18 @@ fn parallel_runs_thunks_nil_on_failure() {
         common::eval(r#"(list 1 nil 3)"#)
     );
 }
+
+// Degenerate inputs must not deadlock/panic the semaphore/await plumbing: an empty list
+// yields an empty list; pipeline with ZERO stages is identity passthrough.
+#[test]
+fn parallel_and_pipeline_handle_empty_and_zero_stages() {
+    assert_eq!(eval(r#"(parallel (list))"#), common::eval(r#"'()"#));
+    assert_eq!(
+        eval(r#"(pipeline (list) (fn (x) x))"#),
+        common::eval(r#"'()"#)
+    );
+    assert_eq!(
+        eval(r#"(pipeline (list 1 2 3))"#),
+        common::eval(r#"'(1 2 3)"#)
+    );
+}

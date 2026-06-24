@@ -1,0 +1,25 @@
+{"event":"run.started","seq":0,"ts":"2026-06-24T13:32:07Z","workflow":"content-pipeline","run_id":"content-live4"}
+{"event":"phase.started","seq":1,"ts":"2026-06-24T13:32:07Z","phase":"Topics"}
+{"event":"checkpoint","seq":2,"ts":"2026-06-24T13:32:07Z","key":"topics","value_digest":"5bcf1a46d5602810b15c2dec53c82d6b"}
+{"event":"phase.ended","seq":3,"ts":"2026-06-24T13:32:07Z","phase":"Topics","status":"success","dur_ms":0}
+{"event":"phase.started","seq":4,"ts":"2026-06-24T13:32:07Z","phase":"Write"}
+{"event":"agent.started","seq":5,"ts":"2026-06-24T13:32:07Z","agent":"tail-call optimization"}
+{"event":"agent.started","seq":6,"ts":"2026-06-24T13:32:07Z","agent":"NaN-boxed values"}
+{"event":"agent.started","seq":7,"ts":"2026-06-24T13:32:07Z","agent":"the cooperative async scheduler"}
+{"event":"agent.started","seq":8,"ts":"2026-06-24T13:32:07Z","agent":"f-strings"}
+{"event":"agent.result","seq":9,"ts":"2026-06-24T13:32:10Z","agent":"f-strings","output":"a0e6f0d89c0b90280f0992fa365a98e5","dur_ms":2603}
+{"event":"agent.result","seq":10,"ts":"2026-06-24T13:32:10Z","agent":"the cooperative async scheduler","output":"f39c0f8f3b9e1b54289a5100466e0646","dur_ms":2604}
+{"event":"agent.result","seq":11,"ts":"2026-06-24T13:32:10Z","agent":"NaN-boxed values","output":"a642e262d6d3611753c52fcb87dd6493","dur_ms":2604}
+{"event":"agent.result","seq":12,"ts":"2026-06-24T13:32:10Z","agent":"tail-call optimization","output":"b0d5aaf8c613e3f261a78183f548d485","dur_ms":2604}
+{"event":"agent.started","seq":13,"ts":"2026-06-24T13:32:10Z","agent":"async/pool-map bounded fan-out"}
+{"event":"agent.started","seq":14,"ts":"2026-06-24T13:32:10Z","agent":"pattern matching with match"}
+{"event":"agent.result","seq":15,"ts":"2026-06-24T13:32:12Z","agent":"pattern matching with match","output":"577ef175a6d0dc80856ac7d4f9be4f82","dur_ms":2202}
+{"event":"agent.result","seq":16,"ts":"2026-06-24T13:32:12Z","agent":"async/pool-map bounded fan-out","output":"c2c35383dd4f4b74f1743f6efdd9b2b2","dur_ms":2202}
+{"event":"checkpoint","seq":17,"ts":"2026-06-24T13:32:12Z","key":"articles","value_digest":"c3d9223bb05e0df9d8fffb354f175d4c"}
+{"event":"phase.ended","seq":18,"ts":"2026-06-24T13:32:12Z","phase":"Write","status":"success","dur_ms":4808}
+{"event":"phase.started","seq":19,"ts":"2026-06-24T13:32:12Z","phase":"Verify"}
+{"event":"checkpoint","seq":20,"ts":"2026-06-24T13:32:12Z","key":"verified","value_digest":"7e4b56f1954f3b82a254a4d77061ee0c"}
+{"event":"phase.ended","seq":21,"ts":"2026-06-24T13:32:12Z","phase":"Verify","status":"success","dur_ms":4809}
+{"event":"phase.started","seq":22,"ts":"2026-06-24T13:32:12Z","phase":"Publish"}
+{"event":"phase.ended","seq":23,"ts":"2026-06-24T13:32:12Z","phase":"Publish","status":"success","dur_ms":4809}
+{"event":"run.ended","seq":24,"ts":"2026-06-24T13:32:12Z","status":"success","dur_ms":4809}

@@ -63,6 +63,7 @@ mod cross_compile;
 mod import_tracer;
 mod pkg;
 mod repl;
+mod workflow_view;
 
 /// Read a source file with consistent, friendly error messages.
 ///
@@ -428,6 +429,22 @@ enum WorkflowCommands {
         /// Defaults to the project-local `.sema/runs`.
         #[arg(long, default_value = ".sema/runs")]
         run_dir: String,
+    },
+    /// Open the read-only web viewer over a run directory's journals (loopback,
+    /// no auth — a local developer tool).
+    View {
+        /// Base directory holding `<run-id>/events.jsonl` run journals.
+        #[arg(long, default_value = ".sema/runs")]
+        run_dir: String,
+
+        /// Host to bind. Defaults to loopback; binding elsewhere exposes the run
+        /// directory to the network (the viewer has no auth).
+        #[arg(long, default_value = "127.0.0.1")]
+        host: String,
+
+        /// Port to listen on.
+        #[arg(short, long, default_value = "8899")]
+        port: u16,
     },
 }
 
@@ -861,11 +878,25 @@ fn main() {
 /// `defworkflow`s and runs it) with the run-directory + args seams wired, then
 /// exit non-zero if the run's `{:status …}` envelope reports failure.
 fn run_workflow_command(command: WorkflowCommands, sandbox: &sema_core::Sandbox) {
-    let WorkflowCommands::Run {
-        file,
-        args,
-        run_dir,
-    } = command;
+    let (file, args, run_dir) = match command {
+        WorkflowCommands::Run {
+            file,
+            args,
+            run_dir,
+        } => (file, args, run_dir),
+        WorkflowCommands::View {
+            run_dir,
+            host,
+            port,
+        } => {
+            tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .expect("Failed to create tokio runtime")
+                .block_on(workflow_view::serve(PathBuf::from(run_dir), &host, port));
+            return;
+        }
+    };
 
     // The workflow runtime (sema-workflow) reads this seam to choose the run-dir
     // base; the run lands in `<run-dir>/<run-id>/`.

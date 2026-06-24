@@ -1,0 +1,228 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Sema · Workflow Run</title>
+<script defer src="/alpine.min.js"></script>
+<style>
+  :root{
+    --gold:#c8a855; --gold-dim:rgba(200,168,85,.5); --gold-soft:rgba(200,168,85,.14);
+    --bg:#131110; --bg-elevated:#181512; --bg-output:#0f0d0c;
+    --text-primary:#e9e3d6; --text-secondary:#968c79; --text-tertiary:#6b6354;
+    --border:#2b2620; --success:#6a9955; --error:#c85555;
+    --mono:'JetBrains Mono',ui-monospace,'SF Mono',Menlo,Consolas,monospace;
+    --fs-micro:10px; --fs-meta:11px; --fs-small:11.5px; --fs-body:13px; --fs-lead:14px;
+  }
+  *{box-sizing:border-box}
+  html,body{height:100%}
+  body{margin:0;background:var(--bg);color:var(--text-primary);
+    font-family:var(--mono);font-size:var(--fs-body);line-height:1.45;-webkit-font-smoothing:antialiased;}
+  .tnum{font-variant-numeric:tabular-nums;}
+  a{color:var(--gold);}
+
+  .header{position:sticky;top:0;z-index:30;background:var(--bg-elevated);border-bottom:1px solid var(--border);}
+  .header-bar{display:grid;grid-template-columns:1fr auto 1fr;align-items:center;gap:10px 14px;padding:12px 20px 11px;}
+  .brand{justify-self:start;display:flex;align-items:baseline;gap:8px;overflow:hidden;}
+  .logo{font-size:16px;font-weight:600;letter-spacing:.3px;}
+  .logo .paren{color:var(--gold);}
+  .lead,.dot-sep{color:var(--text-tertiary);}
+  .wf-name{font-size:var(--fs-lead);font-weight:600;letter-spacing:.3px;}
+  .run-status{justify-self:center;display:flex;align-items:center;gap:10px;}
+  .pill{font-size:var(--fs-micro);padding:2px 8px;border:1px solid;letter-spacing:.7px;text-transform:uppercase;font-weight:600;line-height:1.5;}
+  .pill.running{color:var(--gold);border-color:var(--gold-dim);}
+  .pill.success{color:var(--success);border-color:#33402a;}
+  .pill.failed{color:var(--error);border-color:#4a2828;}
+  .elapsed{color:var(--text-secondary);}
+  .rollup{justify-self:end;color:var(--text-secondary);display:flex;gap:8px;align-items:baseline;font-size:var(--fs-small);white-space:nowrap;}
+  .rollup .num{color:var(--text-primary);}
+  .meta-strip{display:flex;gap:0;border-top:1px solid var(--border);font-size:var(--fs-meta);color:var(--text-tertiary);}
+  .meta-cell{padding:7px 20px;border-right:1px solid var(--border);}
+  .meta-cell b{color:var(--text-secondary);font-weight:500;}
+
+  .runs-bar{display:flex;gap:6px;flex-wrap:wrap;padding:8px 20px;border-bottom:1px solid var(--border);background:var(--bg-output);}
+  .run-chip{font-size:var(--fs-meta);padding:3px 9px;border:1px solid var(--border);color:var(--text-secondary);cursor:pointer;}
+  .run-chip.active{border-color:var(--gold-dim);color:var(--text-primary);}
+
+  .tree{padding:14px 20px 60px;}
+  .phase{margin-bottom:2px;}
+  .phase-head{display:flex;align-items:center;gap:8px;padding:5px 0;cursor:pointer;}
+  .phase-head:hover{background:var(--gold-soft);}
+  .phase-name{font-weight:600;letter-spacing:.2px;}
+  .phase-dur{margin-left:auto;color:var(--text-tertiary);font-size:var(--fs-meta);}
+  .glyph{width:1.1em;text-align:center;flex:0 0 auto;}
+  .g-run{color:var(--gold);} .g-ok{color:var(--success);} .g-fail{color:var(--error);}
+  .rows{padding-left:18px;border-left:1px solid var(--border);margin-left:5px;}
+  .row{display:flex;align-items:baseline;gap:8px;padding:3px 0;}
+  .row .conn{color:var(--text-tertiary);flex:0 0 auto;}
+  .row.agent{cursor:pointer;}
+  .row.agent:hover{background:var(--gold-soft);}
+  .agent-name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+  .agent-meta{margin-left:auto;color:var(--text-tertiary);font-size:var(--fs-meta);white-space:nowrap;}
+  .twig{color:var(--text-tertiary);font-size:var(--fs-meta);padding-left:18px;}
+  .line-cp{color:var(--text-secondary);font-size:var(--fs-meta);}
+  .line-budget{color:var(--text-secondary);font-size:var(--fs-meta);}
+  .kw{color:var(--gold);}
+  .disclosure{margin:2px 0 6px 26px;padding:8px 10px;background:var(--bg-output);border:1px solid var(--border);
+    font-size:var(--fs-meta);color:var(--text-secondary);white-space:pre-wrap;word-break:break-word;}
+  .empty{color:var(--text-tertiary);padding:30px 20px;}
+  .spin{display:inline-block;animation:spin 1s linear infinite;}
+  @keyframes spin{to{transform:rotate(360deg)}}
+</style>
+</head>
+<body>
+<div x-data="wfview()" x-init="init()">
+  <div class="header">
+    <div class="header-bar">
+      <div class="brand">
+        <span class="logo"><span class="paren">(</span>sema<span class="paren">)</span></span>
+        <span class="lead">Workflow</span><span class="dot-sep">—</span>
+        <span class="wf-name" x-text="run.workflow || '…'"></span>
+      </div>
+      <div class="run-status">
+        <span class="pill" :class="run.status" x-text="run.status || 'running'"></span>
+        <span class="elapsed tnum" x-text="durText"></span>
+      </div>
+      <div class="rollup tnum">
+        <span><span class="num" x-text="run.phaseCount"></span> phases</span><span class="dot-sep">·</span>
+        <span><span class="num" x-text="run.agentCount"></span> agents</span><span class="dot-sep">·</span>
+        <span><span class="num" x-text="run.checkpointCount"></span> checkpoints</span>
+      </div>
+    </div>
+    <div class="meta-strip">
+      <div class="meta-cell"><b>run</b> <span x-text="run.runId || '—'"></span></div>
+      <div class="meta-cell"><b>started</b> <span x-text="run.startedTs || '—'"></span></div>
+      <div class="meta-cell" x-show="run.codeVersion"><b>version</b> <span x-text="run.codeVersion"></span></div>
+    </div>
+  </div>
+
+  <div class="runs-bar" x-show="runs.length > 1">
+    <template x-for="r in runs" :key="r">
+      <span class="run-chip" :class="r === selected && 'active'" @click="select(r)" x-text="r"></span>
+    </template>
+  </div>
+
+  <div class="tree">
+    <div class="empty" x-show="!run.phases || run.phases.length === 0" x-text="loading ? 'Loading…' : 'No events yet.'"></div>
+    <template x-for="(ph, pi) in run.phases" :key="pi">
+      <div class="phase">
+        <div class="phase-head" @click="ph.open = !ph.open">
+          <span class="glyph" :class="glyphClass(ph.status)" x-html="glyph(ph.status)"></span>
+          <span class="phase-name" x-text="ph.name"></span>
+          <span class="phase-dur" x-show="ph.status !== 'running'" x-text="ms(ph.durMs)"></span>
+        </div>
+        <div class="rows" x-show="ph.open">
+          <template x-for="(row, ri) in ph.rows" :key="ri">
+            <div>
+              <!-- agent row (mutates in place started -> result) -->
+              <template x-if="row.kind === 'agent'">
+                <div>
+                  <div class="row agent" @click="row.open = !row.open">
+                    <span class="conn">├─</span>
+                    <span class="glyph" :class="glyphClass(row.status)" x-html="glyph(row.status)"></span>
+                    <span class="agent-name" x-text="row.name"></span>
+                    <span class="agent-meta" x-text="row.status === 'running' ? 'running…' : ms(row.durMs)"></span>
+                  </div>
+                  <template x-for="(tc, ti) in row.tools" :key="ti">
+                    <div class="twig">│  ├─ tool: <span x-text="tc.tool"></span> <span x-text="tc.argsDigest"></span></div>
+                  </template>
+                  <div class="disclosure" x-show="row.open" x-text="row.output || '(no output yet)'"></div>
+                </div>
+              </template>
+              <!-- checkpoint line -->
+              <template x-if="row.kind === 'checkpoint'">
+                <div class="row line-cp"><span class="conn">├─</span> saved <span class="kw" x-text="':' + row.key"></span>
+                  <span class="agent-meta" x-text="row.digest"></span></div>
+              </template>
+              <!-- budget line -->
+              <template x-if="row.kind === 'budget'">
+                <div class="row line-budget"><span class="conn">├─</span> budget <span x-text="row.text"></span></div>
+              </template>
+            </div>
+          </template>
+        </div>
+      </div>
+    </template>
+  </div>
+</div>
+
+<script>
+function wfview(){
+  return {
+    runs: [], selected: null, loading: true, run: {phases: []}, _timer: null,
+    get durText(){ return this.run.durMs != null ? this.ms(this.run.durMs) : '··:··'; },
+    ms(m){ if(m==null) return ''; if(m<1000) return m+'ms'; return (m/1000).toFixed(1)+'s'; },
+    glyph(s){ return s==='running' ? '<span class="spin">◐</span>' : s==='failed' ? '✗' : '✓'; },
+    glyphClass(s){ return s==='running' ? 'g-run' : s==='failed' ? 'g-fail' : 'g-ok'; },
+    async init(){
+      const url = new URL(location.href);
+      try{
+        const r = await fetch('/api/runs'); this.runs = await r.json();
+      }catch(e){ this.runs = []; }
+      const want = url.searchParams.get('run');
+      this.selected = (want && this.runs.includes(want)) ? want : this.runs[0] || null;
+      if(this.selected) this.load();
+      else this.loading = false;
+    },
+    select(r){ this.selected = r; this.load(); },
+    async load(){
+      this.loading = true;
+      try{
+        const res = await fetch('/api/run/' + encodeURIComponent(this.selected) + '/events.jsonl');
+        const text = await res.text();
+        const events = text.split('\n').filter(l => l.trim()).map(l => { try{return JSON.parse(l)}catch(e){return null} }).filter(Boolean);
+        this.run = this.build(events);
+      }catch(e){ this.run = {phases: []}; }
+      this.loading = false;
+      // follow-live: poll until the run ends
+      clearTimeout(this._timer);
+      if(this.run.status === 'running') this._timer = setTimeout(() => this.load(), 1000);
+    },
+    build(events){
+      const run = {workflow:'', runId:'', codeVersion:'', startedTs:'', status:'running',
+                   durMs:null, phaseCount:0, agentCount:0, checkpointCount:0, phases:[]};
+      let phase = null;
+      const agentsByName = {};
+      for(const e of events){
+        switch(e.event){
+          case 'run.started':
+            run.workflow=e.workflow; run.runId=e.run_id; run.codeVersion=e.code_version||''; run.startedTs=e.ts; break;
+          case 'run.ended':
+            run.status = e.status; run.durMs = e.dur_ms; break;
+          case 'phase.started':
+            phase = {name:e.phase, status:'running', durMs:null, open:true, rows:[]};
+            run.phases.push(phase); run.phaseCount++; break;
+          case 'phase.ended':
+            if(phase){ phase.status = e.status; phase.durMs = e.dur_ms; } break;
+          case 'agent.started': {
+            const row = {kind:'agent', name:e.agent, status:'running', durMs:null, output:'', open:false, tools:[]};
+            if(phase) phase.rows.push(row);
+            agentsByName[e.agent] = row; run.agentCount++; break;
+          }
+          case 'agent.result': {
+            const row = agentsByName[e.agent];
+            if(row){ row.durMs=e.dur_ms; row.output=e.output||'';
+              row.status = (row.output && row.output.startsWith('error:')) ? 'failed' : 'ok'; }
+            break;
+          }
+          case 'agent.tool_call': {
+            const row = agentsByName[e.agent];
+            if(row) row.tools.push({tool:e.tool, argsDigest:e.args_digest||''}); break;
+          }
+          case 'checkpoint':
+            if(phase) phase.rows.push({kind:'checkpoint', key:e.key, digest:(e.value_digest||'').slice(0,8)});
+            run.checkpointCount++; break;
+          case 'budget': {
+            const used = (e.tokens_used||0), cap = e.max_tokens;
+            const txt = cap ? `${used}/${cap} tok` : `${used} tok`;
+            if(phase) phase.rows.push({kind:'budget', text:txt}); break;
+          }
+        }
+      }
+      return run;
+    },
+  };
+}
+</script>
+</body>
+</html>

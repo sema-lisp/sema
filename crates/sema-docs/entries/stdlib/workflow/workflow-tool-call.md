@@ -14,4 +14,4 @@ Journal a tool call made by the agent currently executing. `(workflow/tool-call 
     (assemble-index (checkpoint :drafts))))
 ```
 
-See also: `workflow/agent`, `workflow/foreach`.
+See also: `workflow/agent`, `agent`, `pipeline`.

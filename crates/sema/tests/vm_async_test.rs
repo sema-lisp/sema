@@ -1211,9 +1211,7 @@ fn pipeline_stages_and_nil_on_failure() {
 #[test]
 fn parallel_runs_thunks_nil_on_failure() {
     assert_eq!(
-        eval(
-            r#"(parallel (list (fn () 1) (fn () (throw "boom")) (fn () 3)))"#
-        ),
+        eval(r#"(parallel (list (fn () 1) (fn () (throw "boom")) (fn () 3)))"#),
         common::eval(r#"(list 1 nil 3)"#)
     );
 }

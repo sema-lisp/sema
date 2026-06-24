@@ -219,7 +219,7 @@ directly extractable as training examples.
 
 Contains macro definitions for: `->`, `->>`, `as->`, `some->`, `when-let`, `if-let`,
 `with-stream`, `dotimes`, `for-range`, `with-span`, `with-session`, `defworkflow`, `phase`,
-`async/pool-map`, `workflow/foreach`, `async/spawn-all`, `async/map`.
+`agent`, `parallel`, `pipeline`, `async/pool-map`, `async/spawn-all`, `async/map`.
 
 ★★★★★ — Pure Sema source code (embedded as a string literal in Rust). Teaches macro
 definition patterns and idiomatic Sema.

@@ -570,8 +570,8 @@ function renderDrill(a){
   // captured panel for the agent's output — honestly opaque
   const capCls = ["captured", capturedOpen?"open":"", hasOutput?"":"empty"].join(" ");
   const capBody = hasOutput
-    ? `opaque output digest — full value (if journaled) lives in checkpoints/ on disk, not in SQLite`
-    : `nothing captured — agent.result.output is opaque and may be a digest only`;
+    ? `the agent's output as captured in the journal (length-capped — a very long output is truncated)`
+    : `nothing captured — the agent produced no output`;
 
   return (
     `<div class="drill" data-testid="drill">`+
@@ -595,8 +595,8 @@ function renderDrill(a){
 
       // OUTPUT DIGEST — opaque, verbatim, empty-able
       `<div class="drill-sec">`+
-        `<div class="sec-label">${st==="failed"?"Output (failed)":"Output digest"} `+
-          `<span class="gate">opaque string</span>`+
+        `<div class="sec-label">${st==="failed"?"Output (failed)":"Output"} `+
+          `<span class="gate">captured</span>`+
           `<span class="expand" id="cap-toggle">${capturedOpen?"collapse":"explain"}</span></div>`+
         `<div class="${digestCls}">${digestHtml}</div>`+
         `<div class="${capCls}" id="cap-body">${capBody}</div>`+

@@ -206,10 +206,20 @@ pub fn register(env: &sema_core::Env) {
         // made one) gives the model + tokens + cost to attribute to this agent.
         let usage = sema_llm::builtins::last_usage_snapshot();
         let model = usage.as_ref().map(|u| u.model.clone()).unwrap_or_default();
-        // Opaque output (digest on success, error text on failure) — the frozen
-        // agent.result.output is a string/digest only.
+        // The agent's actual output, captured in the journal so the dashboard can
+        // show it. Length-capped (char-boundary safe) to bound the journal line; a
+        // huge output is truncated with a tail note rather than hashed away.
+        const MAX_OUTPUT: usize = 4000;
         let output = match &result {
-            Ok(v) => ctx.value_digest(v),
+            Ok(v) => {
+                let s = sema_core::pretty_print(v, 100);
+                if s.chars().count() > MAX_OUTPUT {
+                    let head: String = s.chars().take(MAX_OUTPUT).collect();
+                    format!("{head}\n… (truncated, {} chars total)", s.chars().count())
+                } else {
+                    s
+                }
+            }
             Err(e) => format!("error: {e}"),
         };
         let status = if result.is_ok() { "ok" } else { "failed" };

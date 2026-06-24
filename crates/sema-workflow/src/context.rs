@@ -313,14 +313,23 @@ mod tests {
         assert!(current().is_none());
         let outer = WorkflowCtx::new("outer".into(), Journal::null(), BTreeMap::new());
         let g_outer = install_scope(outer.clone());
-        assert_eq!(current().map(|c| c.run_id.clone()).as_deref(), Some("outer"));
+        assert_eq!(
+            current().map(|c| c.run_id.clone()).as_deref(),
+            Some("outer")
+        );
         {
             let inner = WorkflowCtx::new("inner".into(), Journal::null(), BTreeMap::new());
             let _g_inner = install_scope(inner);
-            assert_eq!(current().map(|c| c.run_id.clone()).as_deref(), Some("inner"));
+            assert_eq!(
+                current().map(|c| c.run_id.clone()).as_deref(),
+                Some("inner")
+            );
         }
         // inner guard dropped → outer reinstated
-        assert_eq!(current().map(|c| c.run_id.clone()).as_deref(), Some("outer"));
+        assert_eq!(
+            current().map(|c| c.run_id.clone()).as_deref(),
+            Some("outer")
+        );
         drop(g_outer);
         assert!(current().is_none());
     }

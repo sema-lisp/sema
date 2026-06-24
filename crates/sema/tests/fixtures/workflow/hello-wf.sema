@@ -1,0 +1,38 @@
+;; hello-wf.sema — Spike 1 sequential-runtime fixture (no LLM, no parallel).
+;;
+;; Run with:
+;;   SEMA_WORKFLOW_FIXED_TS=0 SEMA_WORKFLOW_RUN_ID=wf_test_0001 \
+;;     sema workflow run crates/sema/tests/fixtures/workflow/hello-wf.sema \
+;;       --args '{"name":"x"}' --run-dir /tmp/wfspike
+;;
+;; The CLI binds the parsed --args map to the global `*workflow-args*` before
+;; evaluating this file, and exposes the per-run --run-dir via the
+;; SEMA_WORKFLOW_RUN_DIR seam that the workflow runtime reads. This file only
+;; *defines* a workflow and *runs* it; all journaling is done by the runtime.
+;;
+;; Phase 1 "Inventory": records a checkpoint :files (a fixed, deterministic list
+;;   so the golden journal is stable — no filesystem walk, which would drift).
+;; Phase 2 "Audit": READS (checkpoint :files) back (proving the checkpoint
+;;   round-trips the Inventory value) and records a checkpoint :findings derived
+;;   from it.
+;; The workflow returns the discriminated-union {:status :success ...} envelope.
+
+(defworkflow hello-wf
+  "Two-phase sequential demo workflow (Inventory -> Audit)."
+  {:args {:name :string}}
+
+  (phase "Inventory"
+    ;; Deterministic, sorted list — NOT a dir walk (O16: unsorted iteration drifts).
+    (checkpoint :files (list "a.php" "b.php" "c.php")))
+
+  (phase "Audit"
+    ;; Read the value recorded in Inventory; (checkpoint :files) with one arg READS.
+    (let ((files (checkpoint :files)))
+      (checkpoint :findings (count files))))
+
+  ;; Final discriminated-union envelope. `workflow/run` (which `defworkflow`
+  ;; expands to) returns this {:status …} map verbatim and emits run.ended; the
+  ;; `defworkflow` form IS the run, so no separate invocation is needed.
+  {:status :success
+   :files (checkpoint :files)
+   :findings (checkpoint :findings)})

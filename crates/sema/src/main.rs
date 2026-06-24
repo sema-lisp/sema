@@ -289,6 +289,11 @@ enum Commands {
         #[command(subcommand)]
         command: NotebookCommands,
     },
+    /// Dynamic workflows — run a sequential, journaled workflow (Spike 1)
+    Workflow {
+        #[command(subcommand)]
+        command: WorkflowCommands,
+    },
     /// Evaluate code and return results (designed for machine consumption by editors/LSP)
     Eval {
         /// Read program from stdin instead of --expr
@@ -404,6 +409,25 @@ enum PkgCommands {
         /// Registry URL override
         #[arg(long)]
         registry: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum WorkflowCommands {
+    /// Run a workflow file (a `.sema` program that `defworkflow`s and runs it),
+    /// journaling a frozen run-directory and writing `result.json`.
+    Run {
+        /// Path to the `.sema` workflow file.
+        file: String,
+
+        /// JSON object bound to the global `*workflow-args*` for the run.
+        #[arg(long, default_value = "{}")]
+        args: String,
+
+        /// Base directory for run journals; the run lands in `<run-dir>/<run-id>/`.
+        /// Defaults to the project-local `.sema/runs`.
+        #[arg(long, default_value = ".sema/runs")]
+        run_dir: String,
     },
 }
 
@@ -660,6 +684,9 @@ fn main() {
             Commands::Notebook { command } => {
                 run_notebook_command(command);
             }
+            Commands::Workflow { command } => {
+                run_workflow_command(command, &sandbox);
+            }
             Commands::Eval {
                 stdin,
                 expr,
@@ -828,6 +855,66 @@ fn main() {
 
     // REPL mode
     repl::run(interpreter, cli.quiet, cli.sandbox.as_deref());
+}
+
+/// `sema workflow run <file>` — evaluate a workflow `.sema` file (which
+/// `defworkflow`s and runs it) with the run-directory + args seams wired, then
+/// exit non-zero if the run's `{:status …}` envelope reports failure.
+fn run_workflow_command(command: WorkflowCommands, sandbox: &sema_core::Sandbox) {
+    let WorkflowCommands::Run {
+        file,
+        args,
+        run_dir,
+    } = command;
+
+    // The workflow runtime (sema-workflow) reads this seam to choose the run-dir
+    // base; the run lands in `<run-dir>/<run-id>/`.
+    std::env::set_var("SEMA_WORKFLOW_RUN_DIR", &run_dir);
+
+    let interpreter = Interpreter::new_with_sandbox(sandbox);
+
+    // Bind the parsed --args JSON object to the global `*workflow-args*` so the
+    // workflow body can read its inputs.
+    let args_value = match serde_json::from_str::<serde_json::Value>(&args) {
+        Ok(json) => sema_core::json::json_to_value(&json),
+        Err(e) => {
+            eprintln!("error: --args is not valid JSON: {e}");
+            std::process::exit(1);
+        }
+    };
+    interpreter
+        .global_env
+        .set(sema_core::intern("*workflow-args*"), args_value);
+
+    let content = match read_source_file(&file) {
+        Ok(c) => c,
+        Err(msg) => {
+            eprintln!("error: {msg}");
+            std::process::exit(1);
+        }
+    };
+
+    // The file's last form is the `defworkflow` (which expands to `workflow/run`),
+    // so eval returns the `{:status …}` envelope; journaling is its side effect.
+    match interpreter.eval_str_compiled(&content) {
+        Ok(envelope) => {
+            drain_async_scheduler(&interpreter);
+            let failed = envelope
+                .as_map_rc()
+                .and_then(|m| m.get(&Value::keyword("status")).cloned())
+                .and_then(|s| s.as_keyword())
+                .is_some_and(|s| s == "failed");
+            if failed {
+                eprintln!("workflow failed: {}", pretty_print(&envelope, 80));
+                std::process::exit(1);
+            }
+        }
+        Err(e) => {
+            eprint!("Error running workflow {file}: ");
+            print_error(&e);
+            std::process::exit(1);
+        }
+    }
 }
 
 /// Drain any pending async tasks scheduled by a top-level form.

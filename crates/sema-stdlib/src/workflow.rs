@@ -33,7 +33,9 @@ fn as_name(v: &Value) -> Option<String> {
 /// `{:status :success :value <v>}`.
 fn success_envelope(value: Value) -> Value {
     if let Some(m) = value.as_map_rc() {
-        if m.keys().any(|k| k.as_keyword().as_deref() == Some("status")) {
+        if m.keys()
+            .any(|k| k.as_keyword().as_deref() == Some("status"))
+        {
             return value;
         }
     }

@@ -44,11 +44,7 @@ pub enum WorkflowEvent {
     /// A `phase` opened. Paired with exactly one [`Self::PhaseEnded`] (emitted even on
     /// the error path).
     #[serde(rename = "phase.started")]
-    PhaseStarted {
-        seq: u64,
-        ts: String,
-        phase: String,
-    },
+    PhaseStarted { seq: u64, ts: String, phase: String },
 
     /// A `phase` closed. `status` is `"success"` or `"failed"`. `dur_ms` is `0` under
     /// the fixed-timestamp test seam.
@@ -63,11 +59,7 @@ pub enum WorkflowEvent {
 
     /// An agent leaf began executing.
     #[serde(rename = "agent.started")]
-    AgentStarted {
-        seq: u64,
-        ts: String,
-        agent: String,
-    },
+    AgentStarted { seq: u64, ts: String, agent: String },
 
     /// An agent leaf produced a result. `output` is an OPAQUE string/digest only
     /// (`agent/run` returns a String today); typed fields can be added later without

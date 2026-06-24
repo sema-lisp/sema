@@ -12,7 +12,7 @@
 //! the append-only [`Journal`], and a Mastra-style checkpoint/state bag.
 
 use std::cell::{Cell, RefCell};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io;
 use std::rc::Rc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -89,6 +89,17 @@ pub struct WorkflowCtx {
     /// The `agent_id` of the agent currently executing (set by `workflow/agent`), so
     /// `workflow/tool-call` can attribute a tool call to it. `None` outside an agent.
     cur_agent_id: RefCell<Option<String>>,
+    /// Resume state. `resuming` ⇒ this run was launched with `--resume`, so leaves whose
+    /// content-key is in `resume_memos` short-circuit (return the recorded value, skip
+    /// the model + events). `resume_memos` is loaded from the prior run's `memo/` dir at
+    /// scope open. `code_version` is folded into every content-key, so a changed workflow
+    /// (different version) simply produces different keys ⇒ no memo hits ⇒ full re-run
+    /// (automatic invalidation, no guard file). `key_seen` mints a per-base occurrence
+    /// ordinal so identical-prompt repeats in source order line up across runs.
+    resuming: Cell<bool>,
+    code_version: RefCell<String>,
+    resume_memos: RefCell<HashMap<String, Value>>,
+    key_seen: RefCell<HashMap<String, u32>>,
     /// The run's `--args` JSON string (for the run.started event). Empty if none.
     args_json: String,
     /// Cached fixed-ts override (read once at construction). `Some` ⇒ deterministic
@@ -141,6 +152,10 @@ impl WorkflowCtx {
             cur_phase_label: RefCell::new(None),
             agent_n: RefCell::new(BTreeMap::new()),
             cur_agent_id: RefCell::new(None),
+            resuming: Cell::new(false),
+            code_version: RefCell::new(String::new()),
+            resume_memos: RefCell::new(HashMap::new()),
+            key_seen: RefCell::new(HashMap::new()),
             args_json,
             fixed_ts,
         })
@@ -325,6 +340,85 @@ impl WorkflowCtx {
         self.over_budget.get()
     }
 
+    // ── Resume / content-key memoization ──────────────────────────────────────
+
+    /// Set the workflow's code version (folded into every content-key). A changed
+    /// workflow ⇒ different version ⇒ different keys ⇒ no memo hits ⇒ full re-run.
+    pub fn set_code_version(&self, v: String) {
+        *self.code_version.borrow_mut() = v;
+    }
+
+    /// Enter resume mode with the prior run's memos (content-key → value).
+    pub fn enter_resume(&self, memos: HashMap<String, Value>) {
+        self.resuming.set(true);
+        *self.resume_memos.borrow_mut() = memos;
+    }
+
+    /// True when this run is a `--resume` continuation.
+    pub fn resuming(&self) -> bool {
+        self.resuming.get()
+    }
+
+    /// The label of the currently-open phase (empty outside any phase). Part of a
+    /// content-key so the same leaf in different phases keys distinctly.
+    pub fn cur_phase_label(&self) -> String {
+        self.cur_phase_label.borrow().clone().unwrap_or_default()
+    }
+
+    /// Next 0-based occurrence ordinal for a content-key base, so identical-input leaves
+    /// repeated in body order get distinct keys that line up across runs (deterministic
+    /// for a sequential body; best-effort under a concurrent fan-out).
+    fn next_occurrence(&self, base: &str) -> u32 {
+        let mut m = self.key_seen.borrow_mut();
+        let n = m.entry(base.to_string()).or_insert(0);
+        let cur = *n;
+        *n += 1;
+        cur
+    }
+
+    /// Content-key for an agent leaf: a stable hash over (kind, code-version, phase,
+    /// name, prompt, schema-repr) plus an occurrence ordinal. Length-prefixed so
+    /// `("a","bc")` and `("ab","c")` never collide.
+    pub fn agent_content_key(
+        &self,
+        prompt: &str,
+        schema_repr: &str,
+        name: &str,
+        phase: &str,
+    ) -> String {
+        let cv = self.code_version.borrow().clone();
+        let base = hash_fields(&["agent", &cv, phase, name, prompt, schema_repr]);
+        format!("{base}_{}", self.next_occurrence(&base))
+    }
+
+    /// Content-key for a checkpoint write: hash over (kind, code-version, phase, key)
+    /// plus an occurrence ordinal.
+    pub fn checkpoint_content_key(&self, key: &str, phase: &str) -> String {
+        let cv = self.code_version.borrow().clone();
+        let base = hash_fields(&["checkpoint", &cv, phase, key]);
+        format!("{base}_{}", self.next_occurrence(&base))
+    }
+
+    /// Look up a memoized value by content-key (only meaningful while `resuming`).
+    pub fn memo_lookup(&self, content_key: &str) -> Option<Value> {
+        self.resume_memos.borrow().get(content_key).cloned()
+    }
+
+    /// Persist a leaf's value as a memo sidecar AND into the in-run map — but ONLY if it
+    /// round-trips through JSON identically (`value_to_json_lossy`→`json_to_value` is
+    /// lossy for keyword/string keys, records, typed arrays). A value that doesn't
+    /// survive is left un-memoized, so it re-runs on resume rather than resuming wrong.
+    /// Must be called OUTSIDE any held journal borrow.
+    pub fn memo_store(&self, content_key: &str, v: &Value) {
+        let json = sema_core::json::value_to_json_lossy(v);
+        if sema_core::json::json_to_value(&json) == *v {
+            let _ = self.journal.borrow().write_memo(content_key, &json);
+            self.resume_memos
+                .borrow_mut()
+                .insert(content_key.to_string(), v.clone());
+        }
+    }
+
     /// Best-effort flush of the journal writer (e.g. at `run.ended`).
     pub fn flush(&self) {
         self.journal.borrow_mut().flush();
@@ -363,21 +457,38 @@ pub fn install_scope(ctx: Rc<WorkflowCtx>) -> WorkflowGuard {
 pub fn set_workflow_scope(name: &str, doc: &str, meta: &Value) -> io::Result<WorkflowGuard> {
     let run_id = resolve_run_id();
     let runs_root = resolve_runs_root();
-    let journal = Journal::open(&runs_root, &run_id)?;
+    let code_version = std::env::var(CODE_VERSION_ENV).unwrap_or_default();
+    // Resume mode: reuse the run dir, write a fresh sibling events.resume-<n>.jsonl
+    // segment (keeps the frozen first-line/seq invariants), and preload prior memos.
+    let resuming = std::env::var(RESUME_ENV).map(|v| v == "1").unwrap_or(false);
+    let journal = if resuming {
+        let seg = crate::journal::next_resume_segment(&runs_root, &run_id);
+        Journal::open_named(&runs_root, &run_id, &seg)?
+    } else {
+        Journal::open(&runs_root, &run_id)?
+    };
     // metadata.json — self-describing run header. Best-effort; not part of the
     // byte-identical events.jsonl oracle.
     let metadata = serde_json::json!({
         "workflow": name,
         "doc": doc,
         "run_id": run_id,
-        "code_version": "",
+        "code_version": code_version,
         "meta": sema_core::json::value_to_json_lossy(meta),
     });
     let _ = journal.write_metadata(&metadata);
     // The `:budget` submap of meta becomes the run's enforced spend caps.
     // The CLI sets SEMA_WORKFLOW_ARGS_JSON to the verbatim `--args` string.
     let args_json = std::env::var("SEMA_WORKFLOW_ARGS_JSON").unwrap_or_default();
-    let ctx = WorkflowCtx::new_with_args(run_id, journal, parse_budget(meta), args_json);
+    let ctx = WorkflowCtx::new_with_args(run_id.clone(), journal, parse_budget(meta), args_json);
+    ctx.set_code_version(code_version);
+    if resuming {
+        let memos: HashMap<String, Value> = crate::journal::load_memos(&runs_root, &run_id)
+            .into_iter()
+            .map(|(ck, json)| (ck, sema_core::json::json_to_value(&json)))
+            .collect();
+        ctx.enter_resume(memos);
+    }
     Ok(install_scope(ctx))
 }
 
@@ -409,6 +520,24 @@ pub fn resolve_runs_root() -> String {
 pub fn current() -> Option<Rc<WorkflowCtx>> {
     WORKFLOW.with(|c| c.borrow().clone())
 }
+
+/// Length-prefixed md5 over a field list → short hex. Length-prefixing each field
+/// (`u64` LE length then bytes) means concatenation ambiguities like `("a","bc")` vs
+/// `("ab","c")` produce different digests — the separator-collision fix.
+fn hash_fields(fields: &[&str]) -> String {
+    let mut buf = Vec::new();
+    for f in fields {
+        buf.extend_from_slice(&(f.len() as u64).to_le_bytes());
+        buf.extend_from_slice(f.as_bytes());
+    }
+    let h = format!("{:x}", md5::compute(&buf));
+    h[..16].to_string()
+}
+
+/// Env seam: set to "1" by the CLI `--resume` path to enter resume mode.
+const RESUME_ENV: &str = "SEMA_WORKFLOW_RESUME";
+/// Env seam: a stable hash of the workflow source, folded into every content-key.
+const CODE_VERSION_ENV: &str = "SEMA_WORKFLOW_CODE_VERSION";
 
 /// Resolve the run id for a new run: `SEMA_WORKFLOW_RUN_ID` if set, else a generated
 /// id of the form `wf_<unix_secs>_<pid>` — deterministic-enough to be unique per
@@ -529,6 +658,57 @@ mod tests {
         assert_eq!(parsed.get("tokens").and_then(|v| v.as_int()), Some(1000));
         // No :budget at all → empty (unenforced).
         assert!(parse_budget(&Value::map(BTreeMap::new())).is_empty());
+    }
+
+    #[test]
+    fn content_keys_are_stable_distinct_and_length_prefixed() {
+        let ctx = WorkflowCtx::new("wf_t".into(), Journal::null(), BTreeMap::new());
+        ctx.set_code_version("v1".into());
+        // First occurrence of each distinct input is stable; differing inputs differ.
+        let k_a = ctx.agent_content_key("audit a.php", "[:list :string]", "auditor", "Audit");
+        let k_b = ctx.agent_content_key("audit b.php", "[:list :string]", "auditor", "Audit");
+        assert_ne!(k_a, k_b, "different prompts ⇒ different keys");
+        // Length-prefixing: ('a','bc') must not collide with ('ab','c').
+        let k1 = ctx.agent_content_key("a", "bc", "n", "p");
+        let k2 = ctx.agent_content_key("ab", "c", "n", "p");
+        assert_ne!(
+            k1, k2,
+            "length-prefixed fields can't collide via concatenation"
+        );
+        // Occurrence ordinal: a repeated identical leaf gets a distinct key.
+        let r1 = ctx.checkpoint_content_key("files", "Inventory");
+        let r2 = ctx.checkpoint_content_key("files", "Inventory");
+        assert_ne!(
+            r1, r2,
+            "repeated identical checkpoint ⇒ distinct occurrence key"
+        );
+    }
+
+    #[test]
+    fn code_version_changes_invalidate_keys() {
+        let ctx1 = WorkflowCtx::new("a".into(), Journal::null(), BTreeMap::new());
+        ctx1.set_code_version("v1".into());
+        let ctx2 = WorkflowCtx::new("b".into(), Journal::null(), BTreeMap::new());
+        ctx2.set_code_version("v2".into());
+        assert_ne!(
+            ctx1.agent_content_key("p", "s", "n", "ph"),
+            ctx2.agent_content_key("p", "s", "n", "ph"),
+            "a changed code-version produces different content-keys (auto-invalidation)"
+        );
+    }
+
+    #[test]
+    fn memo_store_round_trip_guard_skips_unsurvivable_values() {
+        let ctx = WorkflowCtx::new("wf_t".into(), Journal::null(), BTreeMap::new());
+        // A plain string round-trips → memoized and looked up.
+        ctx.memo_store("ck_text", &Value::string("hello"));
+        assert_eq!(ctx.memo_lookup("ck_text"), Some(Value::string("hello")));
+        // A keyword-keyed map round-trips (json_to_value rebuilds keyword keys).
+        let mut m = BTreeMap::new();
+        m.insert(Value::keyword("body"), Value::string("x"));
+        let kw_map = Value::map(m);
+        ctx.memo_store("ck_map", &kw_map);
+        assert_eq!(ctx.memo_lookup("ck_map"), Some(kw_map));
     }
 
     #[test]

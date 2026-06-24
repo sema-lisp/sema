@@ -15,10 +15,12 @@
 //! Run-dir layout (FROZEN public contract — mirror of `.semac`):
 //! ```text
 //! .sema/runs/<run-id>/
-//!   events.jsonl     # append-only, the system of record
-//!   args.json        # the --args input, verbatim
-//!   metadata.json    # workflow name, code version, budget, perms
-//!   result.json      # the final {:status …} envelope
+//!   events.jsonl              # append-only, the system of record
+//!   events.resume-<n>.jsonl   # one per --resume continuation (each keeps the invariants)
+//!   memo/<content-key>.json   # per-leaf memoized values (the resume source of truth)
+//!   args.json                 # the --args input, verbatim
+//!   metadata.json             # workflow name, code version, budget, perms
+//!   result.json               # the final {:status …} envelope
 //! ```
 
 use std::fs;
@@ -45,14 +47,40 @@ impl Journal {
     /// `runs_root` is normally [`crate::RUNS_ROOT`] (project-local `.sema/runs`),
     /// resolved cwd-relative — NOT `~/.sema`.
     pub fn open(runs_root: impl AsRef<Path>, run_id: &str) -> io::Result<Self> {
+        Self::open_named(runs_root, run_id, "events.jsonl")
+    }
+
+    /// As [`Self::open`] but writes to a named events file under the run dir. Resume
+    /// writes a sibling `events.resume-<n>.jsonl` segment so each file keeps the frozen
+    /// invariants (first line is `run.started`, `seq` monotonic from 0) intact — the
+    /// reader merges segments. See [`next_resume_segment`].
+    pub fn open_named(
+        runs_root: impl AsRef<Path>,
+        run_id: &str,
+        filename: &str,
+    ) -> io::Result<Self> {
         let dir = runs_root.as_ref().join(run_id);
         fs::create_dir_all(&dir)?;
-        let path = dir.join("events.jsonl");
+        let path = dir.join(filename);
         let file = OpenOptions::new().append(true).create(true).open(&path)?;
         Ok(Self {
             dir,
             writer: BufWriter::new(file),
         })
+    }
+
+    /// Write a per-leaf memo value to `memo/<content_key>.json`. The file's EXISTENCE
+    /// is the resume source of truth: present ⇒ that leaf completed with this value, so
+    /// a resumed run short-circuits it. Keeps the frozen `events.jsonl` untouched (the
+    /// memo dir is a NEW best-effort sidecar, like `result.json`). Best-effort by
+    /// design; a failed memo write just means that leaf re-runs on resume.
+    pub fn write_memo(&self, content_key: &str, value: &serde_json::Value) -> io::Result<()> {
+        let memo_dir = self.dir.join("memo");
+        fs::create_dir_all(&memo_dir)?;
+        let path = memo_dir.join(format!("{content_key}.json"));
+        let mut s = serde_json::to_string(value).unwrap_or_else(|_| "null".to_string());
+        s.push('\n');
+        fs::write(path, s)
     }
 
     /// A throwaway journal that writes into a temp directory — for unit tests that
@@ -136,6 +164,44 @@ impl Journal {
         s.push('\n');
         fs::write(path, s)
     }
+}
+
+/// Load all memo sidecars for a prior run into `(content_key, json)` pairs. Returns an
+/// empty vec when there is no `memo/` dir (a fresh or never-memoized run). Best-effort:
+/// an unreadable/corrupt memo file is skipped (that leaf re-runs), never fatal.
+pub fn load_memos(runs_root: impl AsRef<Path>, run_id: &str) -> Vec<(String, serde_json::Value)> {
+    let memo_dir = runs_root.as_ref().join(run_id).join("memo");
+    let mut out = Vec::new();
+    let Ok(entries) = fs::read_dir(&memo_dir) else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        if let Ok(text) = fs::read_to_string(&path) {
+            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) {
+                out.push((stem.to_string(), json));
+            }
+        }
+    }
+    out
+}
+
+/// Pick the next free `events.resume-<n>.jsonl` segment filename under a run dir (1-based;
+/// the first resume of a run writes `events.resume-1.jsonl`). A free-filename probe so
+/// each resumed run gets its own clean segment (each keeps the frozen invariants).
+pub fn next_resume_segment(runs_root: impl AsRef<Path>, run_id: &str) -> String {
+    let dir = runs_root.as_ref().join(run_id);
+    let mut n = 1;
+    while dir.join(format!("events.resume-{n}.jsonl")).exists() {
+        n += 1;
+    }
+    format!("events.resume-{n}.jsonl")
 }
 
 #[cfg(test)]

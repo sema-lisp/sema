@@ -151,7 +151,12 @@ pub const PRELUDE: &str = r#"
   (let ((opts-form (if (null? rest) {} (car rest))))
     `(let ((ag-opts# ,opts-form)
            (ag-prompt# ,prompt))
-       (workflow/agent ag-opts#
+       ;; Inject the resolved prompt + a stable schema repr so workflow/agent can
+       ;; compute this leaf's resume content-key (these `:__`-prefixed keys are
+       ;; internal — read by the runtime, ignored by the dashboard).
+       (workflow/agent (assoc ag-opts#
+                         :__prompt (str ag-prompt#)
+                         :__schema-repr (str (get ag-opts# :schema)))
          (fn ()
            (let ((ag-schema# (get ag-opts# :schema))
                  (ag-tools# (get ag-opts# :tools)))

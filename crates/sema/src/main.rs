@@ -438,6 +438,13 @@ enum WorkflowCommands {
         /// Port for the `--view` viewer.
         #[arg(short, long, default_value = "8899")]
         port: u16,
+
+        /// Resume a prior run by its run-id: reuse `<run-dir>/<run-id>/`, skip leaves
+        /// already recorded in its `memo/` dir (no re-call of the model), and write a
+        /// fresh `events.resume-N.jsonl` segment. A workflow edit changes the code
+        /// version and re-runs everything.
+        #[arg(long)]
+        resume: Option<String>,
     },
     /// Open the web viewer for a run directory's workflow journals
     View {
@@ -886,14 +893,15 @@ fn main() {
 /// `defworkflow`s and runs it) with the run-directory + args seams wired, then
 /// exit non-zero if the run's `{:status …}` envelope reports failure.
 fn run_workflow_command(command: WorkflowCommands, sandbox: &sema_core::Sandbox) {
-    let (file, args, run_dir, view, view_port) = match command {
+    let (file, args, run_dir, view, view_port, resume) = match command {
         WorkflowCommands::Run {
             file,
             args,
             run_dir,
             view,
             port,
-        } => (file, args, run_dir, view, port),
+            resume,
+        } => (file, args, run_dir, view, port, resume),
         WorkflowCommands::View {
             run_dir,
             host,
@@ -911,6 +919,27 @@ fn run_workflow_command(command: WorkflowCommands, sandbox: &sema_core::Sandbox)
     // The workflow runtime (sema-workflow) reads this seam to choose the run-dir
     // base; the run lands in `<run-dir>/<run-id>/`.
     std::env::set_var("SEMA_WORKFLOW_RUN_DIR", &run_dir);
+
+    // `--resume <run-id>`: reuse that run's dir + memo cache. Sanitize the operator-
+    // supplied id against path traversal (it joins into a filesystem path), require the
+    // prior run's events.jsonl to exist, then set the seams the runtime reads.
+    if let Some(run_id) = &resume {
+        if run_id.is_empty()
+            || run_id.contains('/')
+            || run_id.contains('\\')
+            || run_id.contains("..")
+        {
+            eprintln!("error: --resume run-id must be a bare directory name (no path separators)");
+            std::process::exit(1);
+        }
+        let prior = PathBuf::from(&run_dir).join(run_id).join("events.jsonl");
+        if !prior.exists() {
+            eprintln!("error: no prior run to resume at {}", prior.display());
+            std::process::exit(1);
+        }
+        std::env::set_var("SEMA_WORKFLOW_RUN_ID", run_id);
+        std::env::set_var("SEMA_WORKFLOW_RESUME", "1");
+    }
     // Recorded verbatim on the run.started event (shown in the viewer's stream/meta).
     std::env::set_var("SEMA_WORKFLOW_ARGS_JSON", &args);
 
@@ -972,6 +1001,17 @@ fn run_workflow_command(command: WorkflowCommands, sandbox: &sema_core::Sandbox)
             std::process::exit(1);
         }
     };
+
+    // Code version: a deterministic hash of the source, folded into every resume
+    // content-key. Editing the workflow changes this ⇒ memos no longer match ⇒ a
+    // resumed run re-executes from scratch (correct invalidation). DefaultHasher uses
+    // fixed keys, so the value is stable across separate invocations of this binary.
+    {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        content.hash(&mut h);
+        std::env::set_var("SEMA_WORKFLOW_CODE_VERSION", format!("{:016x}", h.finish()));
+    }
 
     // The file's last form is the `defworkflow` (which expands to `workflow/run`),
     // so eval returns the `{:status …}` envelope; journaling is its side effect.

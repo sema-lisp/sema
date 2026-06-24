@@ -27,6 +27,18 @@ fn as_name(v: &Value) -> Option<String> {
     v.as_keyword().or_else(|| v.as_str().map(|s| s.to_string()))
 }
 
+/// Read a string-valued option from an opts map (empty string if absent/not a map).
+/// Used for the hidden `:__prompt` / `:__schema-repr` content-key inputs the `agent`
+/// macro injects.
+fn opt_str(v: &Value, key: &str) -> String {
+    v.as_map_rc()
+        .and_then(|m| {
+            m.get(&Value::keyword(key))
+                .and_then(|x| x.as_str().map(String::from))
+        })
+        .unwrap_or_default()
+}
+
 /// Resolve an agent's role label from the `workflow/agent` first argument: the `:name`
 /// of an opts map, or a bare keyword/string label, falling back to "agent".
 fn agent_role(v: &Value) -> String {
@@ -239,6 +251,23 @@ pub fn register(env: &sema_core::Env) {
         if ctx.over_budget() {
             return Ok(Value::nil());
         }
+        // Resume short-circuit: compute this leaf's content-key from its inputs (the
+        // `agent` macro injects :__prompt and :__schema-repr). On a resumed run, if the
+        // key has a memo, return the recorded value WITHOUT running the model or
+        // emitting events (silent replay — keeps the accounting invariant: a replay
+        // makes no provider call, so emits no budget event). The key is computed on
+        // EVERY run (its occurrence ordinal must advance in body order either way).
+        let content_key = ctx.agent_content_key(
+            &opt_str(&args[0], "__prompt"),
+            &opt_str(&args[0], "__schema-repr"),
+            &label,
+            &ctx.cur_phase_label(),
+        );
+        if ctx.resuming() {
+            if let Some(v) = ctx.memo_lookup(&content_key) {
+                return Ok(v);
+            }
+        }
         // Unique per-invocation id (the dashboard correlates started→result→budget
         // by it); the label is the agent_name (role).
         let agent_id = ctx.next_agent_id(&label);
@@ -297,6 +326,11 @@ pub fn register(env: &sema_core::Env) {
             // is itself fully recorded; the sticky latch then refuses the NEXT leaf.
             ctx.charge(u.cost_usd, u.input_tokens + u.output_tokens);
         }
+        // Memoize the leaf's value for a future --resume (round-trip-guarded inside
+        // memo_store; called outside any held journal borrow).
+        if let Ok(ref v) = result {
+            ctx.memo_store(&content_key, v);
+        }
         result
     });
 
@@ -348,6 +382,17 @@ pub fn register(env: &sema_core::Env) {
         if args.len() == 2 {
             // Write: store, journal, return the value (so it threads through `let`).
             let value = args[1].clone();
+            // Resume short-circuit: a memoized checkpoint returns the recorded value,
+            // seeds the state bag (so later `(checkpoint :k)` reads see it), and skips
+            // re-emitting the checkpoint event. The key advances its occurrence ordinal
+            // on every run (computed before the resume check) to stay in body order.
+            let resume_key = ctx.checkpoint_content_key(&key, &ctx.cur_phase_label());
+            if ctx.resuming() {
+                if let Some(v) = ctx.memo_lookup(&resume_key) {
+                    ctx.store_checkpoint(&key, v.clone());
+                    return Ok(v);
+                }
+            }
             ctx.store_checkpoint(&key, value.clone());
             let digest = ctx.value_digest(&value);
             let content_key = ctx.content_key(&key, &digest);
@@ -360,6 +405,8 @@ pub fn register(env: &sema_core::Env) {
                 value_digest: digest,
                 value: capped_render(&value), // the real checkpointed value, for the dashboard
             });
+            // Memoize for a future --resume (round-trip-guarded; outside journal borrow).
+            ctx.memo_store(&resume_key, &value);
             Ok(value)
         } else {
             // Read: return the stored value or nil.

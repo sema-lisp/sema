@@ -2,6 +2,8 @@
 name: "floor"
 module: "math"
 section: "Numeric Utilities"
+params: [{ name: n, type: number }]
+returns: "int"
 ---
 
 Round down to nearest integer.

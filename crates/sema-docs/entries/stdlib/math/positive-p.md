@@ -2,6 +2,8 @@
 name: "positive?"
 module: "math"
 section: "Numeric Predicates"
+params: [{ name: n, type: number }]
+returns: "bool"
 ---
 
 Test if a number is positive.

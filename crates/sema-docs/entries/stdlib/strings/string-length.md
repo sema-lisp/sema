@@ -3,6 +3,8 @@ name: "string/length"
 module: "strings"
 section: "Scheme Compatibility Aliases"
 aliases: ["string-length"]
+params: [{ name: s, type: string }]
+returns: "int"
 ---
 
 Return the number of characters in a string.

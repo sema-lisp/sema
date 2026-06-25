@@ -2,6 +2,8 @@
 name: "bytevector"
 module: "bytevectors"
 section: "Construction"
+syntax: "(bytevector byte ...)"
+returns: "bytevector"
 ---
 
 Create a bytevector from byte values.

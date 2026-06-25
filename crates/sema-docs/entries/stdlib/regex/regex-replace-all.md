@@ -2,6 +2,8 @@
 name: "regex/replace-all"
 module: "regex"
 section: "Replacement"
+params: [{ name: pattern, type: string }, { name: replacement, type: string }, { name: text, type: string }]
+returns: "string"
 ---
 
 Replace **all** matches of a pattern.

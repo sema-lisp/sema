@@ -2,6 +2,8 @@
 name: "log"
 module: "math"
 section: "Numeric Utilities"
+params: [{ name: x, type: number }]
+returns: "float"
 ---
 
 Natural logarithm.

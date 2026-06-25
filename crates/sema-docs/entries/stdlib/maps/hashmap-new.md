@@ -2,6 +2,8 @@
 name: "hashmap/new"
 module: "maps"
 section: "HashMaps"
+syntax: "(hashmap/new key val ...)"
+returns: "map"
 ---
 
 Create a new hashmap from key-value pairs.

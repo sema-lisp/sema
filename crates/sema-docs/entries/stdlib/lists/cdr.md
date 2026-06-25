@@ -2,6 +2,8 @@
 name: "cdr"
 module: "lists"
 section: "Construction & Access"
+params: [{ name: lst, type: list }]
+returns: "list"
 ---
 
 Return the rest of a list (everything after the first element).

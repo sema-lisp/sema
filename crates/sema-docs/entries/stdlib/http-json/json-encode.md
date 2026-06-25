@@ -2,6 +2,8 @@
 name: "json/encode"
 module: "http-json"
 section: "JSON"
+params: [{ name: value, type: any, doc: "any JSON-encodable Sema value" }]
+returns: "string"
 ---
 
 ```

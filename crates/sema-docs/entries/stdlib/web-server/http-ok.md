@@ -2,6 +2,8 @@
 name: "http/ok"
 module: "web-server"
 section: "Response Helpers"
+params: [{ name: body, type: any, doc: "value JSON-encoded into the response body" }]
+returns: "map"
 ---
 
 Return 200 with a JSON-encoded body.

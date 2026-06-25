@@ -2,6 +2,8 @@
 name: "cons"
 module: "lists"
 section: "Construction & Access"
+params: [{ name: x, type: any }, { name: lst, type: list }]
+returns: "list"
 ---
 
 Prepend an element to a list.

@@ -2,6 +2,8 @@
 name: "frequencies"
 module: "lists"
 section: "Grouping"
+params: [{ name: list, type: list }]
+returns: "map"
 ---
 
 Count occurrences of each element, returning a map.

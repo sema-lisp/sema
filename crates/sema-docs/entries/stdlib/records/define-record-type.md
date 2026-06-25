@@ -2,6 +2,7 @@
 name: "define-record-type"
 module: "records"
 section: "Defining Record Types"
+syntax: "(define-record-type type (constructor field ...) predicate (field accessor) ...)"
 ---
 
 Define a new record type, generating a constructor, predicate, and one accessor per field.

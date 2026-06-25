@@ -3,6 +3,8 @@ name: "string/append"
 module: "strings"
 section: "Scheme Compatibility Aliases"
 aliases: ["string-append"]
+syntax: "(string/append str ...)"
+returns: "string"
 ---
 
 Concatenate strings together.

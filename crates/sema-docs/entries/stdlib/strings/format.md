@@ -2,6 +2,8 @@
 name: "format"
 module: "strings"
 section: "Scheme Compatibility Aliases"
+syntax: "(format fmt arg ...)"
+returns: "string"
 ---
 
 Format a string with `~a` placeholders.

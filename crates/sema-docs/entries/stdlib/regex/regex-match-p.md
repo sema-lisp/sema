@@ -2,6 +2,8 @@
 name: "regex/match?"
 module: "regex"
 section: "Matching"
+params: [{ name: pattern, type: string }, { name: text, type: string }]
+returns: "bool"
 ---
 
 Test if a pattern matches anywhere in a string. Returns `#t` or `#f`.

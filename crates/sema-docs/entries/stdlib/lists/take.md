@@ -2,6 +2,8 @@
 name: "take"
 module: "lists"
 section: "Sublists"
+params: [{ name: n, type: int }, { name: lst, type: list }]
+returns: "list"
 ---
 
 Take the first N elements.

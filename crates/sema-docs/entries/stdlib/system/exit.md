@@ -2,6 +2,7 @@
 name: "exit"
 module: "system"
 section: "Shell & Process Control"
+syntax: "(exit [code])"
 ---
 
 Exit the process with a given status code.

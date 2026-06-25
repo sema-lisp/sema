@@ -2,6 +2,8 @@
 name: "abs"
 module: "math"
 section: "Numeric Utilities"
+params: [{ name: n, type: number }]
+returns: "number"
 ---
 
 Absolute value.

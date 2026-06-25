@@ -2,6 +2,8 @@
 name: "bytevector/ref"
 module: "bytevectors"
 section: "Access & Mutation"
+params: [{ name: bv, type: bytevector }, { name: index, type: int }]
+returns: "int"
 ---
 
 Return the byte at a given index.

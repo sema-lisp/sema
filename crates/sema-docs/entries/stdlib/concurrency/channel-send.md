@@ -2,6 +2,8 @@
 name: "channel/send"
 module: "concurrency"
 section: "Channels"
+params: [{ name: ch, type: channel }, { name: value, type: any }]
+returns: "nil"
 ---
 
 ```sema

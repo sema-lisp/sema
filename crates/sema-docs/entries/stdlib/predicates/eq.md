@@ -2,6 +2,8 @@
 name: "="
 module: "predicates"
 section: "Equality"
+syntax: "(= a b ...)"
+returns: "bool"
 ---
 
 Equality. For numbers this is numeric equality (so `(= 1 1.0)` is `#t`); for

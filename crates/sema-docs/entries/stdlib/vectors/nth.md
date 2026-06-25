@@ -2,6 +2,8 @@
 name: "nth"
 module: "vectors"
 section: "Indexed Access"
+params: [{ name: coll, type: any, doc: "list or vector" }, { name: n, type: int, doc: "zero-based index" }]
+returns: "any"
 ---
 
 Return the element at index `n` (zero-based). Works on both lists and vectors.

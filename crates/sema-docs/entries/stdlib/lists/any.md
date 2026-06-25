@@ -2,6 +2,8 @@
 name: "any"
 module: "lists"
 section: "Searching"
+params: [{ name: pred, type: function }, { name: lst, type: list }]
+returns: "bool"
 ---
 
 Test if any element satisfies a predicate.

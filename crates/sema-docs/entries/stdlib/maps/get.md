@@ -2,6 +2,8 @@
 name: "get"
 module: "maps"
 section: "Maps"
+params: [{ name: m, type: map }, { name: key, type: any }, { name: default, type: any, doc: "optional value returned when key is absent (defaults to nil)" }]
+returns: "any"
 ---
 
 Look up a value by key. Works on both maps and hashmaps.

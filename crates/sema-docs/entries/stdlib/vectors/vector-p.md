@@ -2,6 +2,8 @@
 name: "vector?"
 module: "vectors"
 section: "Predicates & Introspection"
+params: [{ name: x, type: any }]
+returns: "bool"
 ---
 
 Test whether a value is a vector.

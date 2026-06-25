@@ -2,6 +2,8 @@
 name: "iota"
 module: "lists"
 section: "Construction"
+syntax: "(iota count [start [step]])"
+returns: "list"
 ---
 
 Generate a list of numbers. `(iota count)`, `(iota count start)`, or `(iota count start step)`.

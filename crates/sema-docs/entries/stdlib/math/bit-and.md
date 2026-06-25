@@ -2,6 +2,8 @@
 name: "bit/and"
 module: "math"
 section: "Bitwise Operations"
+params: [{ name: a, type: int }, { name: b, type: int }]
+returns: "int"
 ---
 
 Bitwise AND.

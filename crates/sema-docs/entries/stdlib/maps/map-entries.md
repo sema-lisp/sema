@@ -2,6 +2,8 @@
 name: "map/entries"
 module: "maps"
 section: "Maps"
+params: [{ name: m, type: map }]
+returns: "list"
 ---
 
 Return the entries as a list of key-value pairs.

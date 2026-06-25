@@ -2,6 +2,8 @@
 name: "http/get"
 module: "http-json"
 section: "HTTP"
+params: [{ name: url, type: string }, { name: opts, type: map, doc: "optional :headers/:timeout" }]
+returns: "map"
 ---
 
 ```

@@ -2,6 +2,8 @@
 name: "map/new"
 module: "maps"
 section: "Maps"
+syntax: "(map/new key val ...)"
+returns: "map"
 ---
 
 Create a map from key-value pairs.

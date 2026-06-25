@@ -2,6 +2,8 @@
 name: "math/sign"
 module: "math"
 section: "Interpolation & Clamping"
+params: [{ name: n, type: number }]
+returns: "number"
 ---
 
 Return the sign of a number: -1, 0, or 1.

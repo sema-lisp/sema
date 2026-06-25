@@ -2,6 +2,8 @@
 name: "sort"
 module: "lists"
 section: "Higher-Order Functions"
+params: [{ name: lst, type: list }, { name: cmp, type: function, doc: "optional comparator" }]
+returns: "list"
 ---
 
 Sort a list in ascending order.

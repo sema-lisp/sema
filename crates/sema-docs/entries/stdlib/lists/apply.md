@@ -2,6 +2,8 @@
 name: "apply"
 module: "lists"
 section: "Higher-Order Functions"
+syntax: "(apply f arg ... lst)"
+returns: "any"
 ---
 
 Apply a function to a list of arguments.

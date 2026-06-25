@@ -2,6 +2,8 @@
 name: "rest"
 module: "vectors"
 section: "Indexed Access"
+params: [{ name: vec, type: vector }]
+returns: "vector"
 ---
 
 Return everything after the first element. **Preserves type** — vector in, vector out.

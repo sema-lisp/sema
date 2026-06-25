@@ -2,6 +2,8 @@
 name: "regex/find-all"
 module: "regex"
 section: "Matching"
+params: [{ name: pattern, type: string }, { name: text, type: string }]
+returns: "list"
 ---
 
 Find all non-overlapping matches of a pattern.

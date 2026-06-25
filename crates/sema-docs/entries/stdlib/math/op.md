@@ -2,6 +2,8 @@
 name: "-"
 module: "math"
 section: "Basic Arithmetic"
+syntax: "(- num ...)"
+returns: "number"
 ---
 
 Subtract numbers. With one argument, negates. With multiple, subtracts left to right.

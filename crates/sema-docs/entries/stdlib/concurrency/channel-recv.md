@@ -2,6 +2,8 @@
 name: "channel/recv"
 module: "concurrency"
 section: "Channels"
+params: [{ name: ch, type: channel }]
+returns: "any"
 ---
 
 ```sema

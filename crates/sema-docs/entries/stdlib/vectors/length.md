@@ -3,6 +3,8 @@ name: "length"
 module: "vectors"
 section: "Predicates & Introspection"
 aliases: ["count", "empty?"]
+params: [{ name: vec, type: vector }]
+returns: "int"
 ---
 
 Vectors participate in Sema's generic collection functions:

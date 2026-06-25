@@ -2,6 +2,8 @@
 name: "list"
 module: "lists"
 section: "Construction & Access"
+syntax: "(list item ...)"
+returns: "list"
 ---
 
 Create a new list.

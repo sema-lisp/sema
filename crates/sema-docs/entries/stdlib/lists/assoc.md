@@ -2,6 +2,8 @@
 name: "assoc"
 module: "lists"
 section: "Association Lists"
+params: [{ name: key, type: any }, { name: alist, type: list }]
+returns: "any"
 ---
 
 Look up a key in an association list (list of pairs). Uses `equal?` comparison.

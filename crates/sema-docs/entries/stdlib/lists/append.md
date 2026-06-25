@@ -2,6 +2,8 @@
 name: "append"
 module: "lists"
 section: "Basic Operations"
+syntax: "(append list ...)"
+returns: "list"
 ---
 
 Concatenate lists.

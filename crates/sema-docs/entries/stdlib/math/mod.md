@@ -2,6 +2,8 @@
 name: "mod"
 module: "math"
 section: "Basic Arithmetic"
+params: [{ name: a, type: number }, { name: b, type: number }]
+returns: "number"
 ---
 
 Modulo (remainder after division).

@@ -2,6 +2,8 @@
 name: "reverse"
 module: "lists"
 section: "Basic Operations"
+params: [{ name: lst, type: list }]
+returns: "list"
 ---
 
 Reverse a list.

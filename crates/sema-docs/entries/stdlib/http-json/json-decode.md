@@ -2,6 +2,8 @@
 name: "json/decode"
 module: "http-json"
 section: "JSON"
+params: [{ name: json-string, type: string }]
+returns: "any"
 ---
 
 ```

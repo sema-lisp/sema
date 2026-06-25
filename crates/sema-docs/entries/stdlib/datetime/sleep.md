@@ -2,6 +2,8 @@
 name: "sleep"
 module: "datetime"
 section: "Delay"
+params: [{ name: milliseconds, type: int }]
+returns: "nil"
 ---
 
 Pause execution for a given number of milliseconds. Returns `nil`.

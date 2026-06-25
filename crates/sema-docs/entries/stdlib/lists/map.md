@@ -2,6 +2,8 @@
 name: "map"
 module: "lists"
 section: "Higher-Order Functions"
+syntax: "(map f lst ...)"
+returns: "list"
 ---
 
 Apply a function to each element of one or more lists.

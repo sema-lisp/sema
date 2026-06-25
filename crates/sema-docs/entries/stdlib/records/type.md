@@ -2,6 +2,8 @@
 name: "type"
 module: "records"
 section: "Introspection"
+params: [{ name: v, type: any }]
+returns: "keyword"
 ---
 
 Return the type of a value as a keyword. For records, returns the record's type name:

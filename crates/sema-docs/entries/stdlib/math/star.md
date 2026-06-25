@@ -2,6 +2,8 @@
 name: "*"
 module: "math"
 section: "Basic Arithmetic"
+syntax: "(* num ...)"
+returns: "number"
 ---
 
 Multiply numbers together.

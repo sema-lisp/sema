@@ -2,6 +2,8 @@
 name: "merge"
 module: "maps"
 section: "Maps"
+syntax: "(merge map ...)"
+returns: "map"
 ---
 
 Merge multiple maps together. Later maps override earlier ones. Works on both maps and hashmaps — the result type matches the first argument.

@@ -110,10 +110,12 @@
       "module": "bytevectors",
       "section": "Construction",
       "summary": "Create a bytevector from byte values.",
+      "returns": "bytevector",
       "examples": [
         "(bytevector 1 2 3)       ; => #u8(1 2 3)\n(bytevector)             ; => #u8()"
       ],
-      "body": "Create a bytevector from byte values.\n\n```sema\n(bytevector 1 2 3)       ; => #u8(1 2 3)\n(bytevector)             ; => #u8()\n```"
+      "body": "Create a bytevector from byte values.\n\n```sema\n(bytevector 1 2 3)       ; => #u8(1 2 3)\n(bytevector)             ; => #u8()\n```",
+      "syntax": "(bytevector byte ...)"
     },
     {
       "name": "bytevector->list",
@@ -272,6 +274,13 @@
       "module": "bytevectors",
       "section": "Access & Mutation",
       "summary": "Return the length of a bytevector.",
+      "params": [
+        {
+          "name": "bv",
+          "type": "bytevector"
+        }
+      ],
+      "returns": "int",
       "examples": [
         "(bytevector/length #u8(1 2 3))   ; => 3\n(bytevector/length #u8())        ; => 0"
       ],
@@ -312,6 +321,17 @@
       "module": "bytevectors",
       "section": "Access & Mutation",
       "summary": "Return the byte at a given index.",
+      "params": [
+        {
+          "name": "bv",
+          "type": "bytevector"
+        },
+        {
+          "name": "index",
+          "type": "int"
+        }
+      ],
+      "returns": "int",
       "examples": [
         "(bytevector/ref #u8(10 20 30) 1)   ; => 20\n(bytevector/ref #u8(10 20 30) 0)   ; => 10"
       ],
@@ -647,6 +667,12 @@
       "module": "concurrency",
       "section": "Promises",
       "summary": "Inside an async task, yield for `ms` milliseconds on the scheduler's virtual clock. The clock only advances when every task is blocked, jumping to the nearest deadline, so a shorter sleep always wakes before a longer one, deterministically. The scheduler then waits the real time when it advances: on native via `thread::sleep`, and in the browser playground by running eval on a Web Worker that blocks on `Atomics.wait` (so a sleep really pauses while the page stays responsive). Browsers without cross-origin isolation fall back to advancing the clock instantly (ordering preserved). Outside async, calls `thread::sleep` on native. Durations are capped at `86_400_000` ms (1 day).",
+      "params": [
+        {
+          "name": "ms",
+          "type": "number"
+        }
+      ],
       "examples": [
         "(async/sleep ms)"
       ],
@@ -769,6 +795,14 @@
       "module": "concurrency",
       "section": "Channels",
       "summary": "Create a bounded channel. Default capacity is 1. Capacity must be at least 1.",
+      "params": [
+        {
+          "name": "capacity",
+          "type": "int",
+          "doc": "optional bound, defaults to 1; must be at least 1"
+        }
+      ],
+      "returns": "channel",
       "examples": [
         "(channel/new)         → channel  ; capacity 1\n(channel/new capacity) → channel"
       ],
@@ -779,6 +813,13 @@
       "module": "concurrency",
       "section": "Channels",
       "summary": "Receive a value from the channel. If the channel is empty and inside an async task, yields until data is available. Outside async context, raises an error if empty. Returns `nil` if the channel is closed and empty.",
+      "params": [
+        {
+          "name": "ch",
+          "type": "channel"
+        }
+      ],
+      "returns": "any",
       "examples": [
         "(channel/recv ch) → value"
       ],
@@ -789,6 +830,17 @@
       "module": "concurrency",
       "section": "Channels",
       "summary": "Send a value to the channel. If the channel is full and inside an async task, yields until space is available. Outside async context, raises an error if full. Raises an error if the channel is closed.",
+      "params": [
+        {
+          "name": "ch",
+          "type": "channel"
+        },
+        {
+          "name": "value",
+          "type": "any"
+        }
+      ],
+      "returns": "nil",
       "examples": [
         "(channel/send ch value)"
       ],
@@ -1372,6 +1424,13 @@
       "module": "datetime",
       "section": "Delay",
       "summary": "Pause execution for a given number of milliseconds. Returns `nil`.",
+      "params": [
+        {
+          "name": "milliseconds",
+          "type": "int"
+        }
+      ],
+      "returns": "nil",
       "examples": [
         "(sleep milliseconds) ; => nil",
         "(sleep 1000)  ; sleep for 1 second\n(sleep 500)   ; sleep for 500ms\n(sleep 0)     ; yield (no-op pause)"
@@ -1386,10 +1445,12 @@
       "module": "datetime",
       "section": "Current Time",
       "summary": "Return the current time as Unix milliseconds (integer). Defined in the system module but useful alongside datetime operations.",
+      "returns": "int",
       "examples": [
         "(time-ms)   ; => 1707955200123"
       ],
-      "body": "Return the current time as Unix milliseconds (integer). Defined in the system module but useful alongside datetime operations.\n\n```sema\n(time-ms)   ; => 1707955200123\n```"
+      "body": "Return the current time as Unix milliseconds (integer). Defined in the system module but useful alongside datetime operations.\n\n```sema\n(time-ms)   ; => 1707955200123\n```",
+      "syntax": "(time-ms)"
     },
     {
       "name": "time/add",
@@ -1429,6 +1490,19 @@
       "module": "datetime",
       "section": "Formatting",
       "summary": "Format a UTC Unix timestamp using a [strftime](#strftime-format-directives)-style format string.",
+      "params": [
+        {
+          "name": "timestamp",
+          "type": "number",
+          "doc": "UTC Unix timestamp"
+        },
+        {
+          "name": "format-string",
+          "type": "string",
+          "doc": "strftime-style format"
+        }
+      ],
+      "returns": "string",
       "examples": [
         "(time/format timestamp format-string) ; => string",
         "(define ts 1736943000.0)  ; 2025-01-15 12:10:00 UTC\n\n(time/format ts \"%Y-%m-%d\")            ; => \"2025-01-15\"\n(time/format ts \"%H:%M:%S\")            ; => \"12:10:00\"\n(time/format ts \"%Y-%m-%d %H:%M:%S\")   ; => \"2025-01-15 12:10:00\"\n(time/format ts \"%A, %B %d, %Y\")       ; => \"Wednesday, January 15, 2025\"\n(time/format ts \"%F\")                  ; => \"2025-01-15\"  (shorthand for %Y-%m-%d)\n(time/format ts \"%T\")                  ; => \"12:10:00\"    (shorthand for %H:%M:%S)"
@@ -1530,10 +1604,12 @@
       "module": "file-io",
       "section": "Console I/O",
       "summary": "Print a value without a trailing newline.",
+      "returns": "nil",
       "examples": [
         "(display \"no newline\")\n(display 42)"
       ],
-      "body": "Print a value without a trailing newline.\n\n```sema\n(display \"no newline\")\n(display 42)\n```"
+      "body": "Print a value without a trailing newline.\n\n```sema\n(display \"no newline\")\n(display 42)\n```",
+      "syntax": "(display value ...)"
     },
     {
       "name": "file/append",
@@ -1570,6 +1646,13 @@
       "module": "file-io",
       "section": "File Predicates",
       "summary": "Test if a file or directory exists.",
+      "params": [
+        {
+          "name": "path",
+          "type": "string"
+        }
+      ],
+      "returns": "bool",
       "examples": [
         "(file/exists? \"data.txt\")   ; => #t or #f"
       ],
@@ -1660,6 +1743,12 @@
       "module": "file-io",
       "section": "Directory Operations",
       "summary": "Create a directory.",
+      "params": [
+        {
+          "name": "path",
+          "type": "string"
+        }
+      ],
       "examples": [
         "(file/mkdir \"new-dir\")"
       ],
@@ -1670,6 +1759,13 @@
       "module": "file-io",
       "section": "File Operations",
       "summary": "Read the entire contents of a file as a string.",
+      "params": [
+        {
+          "name": "path",
+          "type": "string"
+        }
+      ],
+      "returns": "string",
       "examples": [
         "(file/read \"data.txt\")   ; => \"file contents...\""
       ],
@@ -1710,6 +1806,17 @@
       "module": "file-io",
       "section": "File Operations",
       "summary": "Write a string to a file, overwriting any existing content.",
+      "params": [
+        {
+          "name": "path",
+          "type": "string"
+        },
+        {
+          "name": "content",
+          "type": "string"
+        }
+      ],
+      "returns": "nil",
       "examples": [
         "(file/write \"out.txt\" \"content\")"
       ],
@@ -1773,7 +1880,8 @@
       "examples": [
         "(io/println-error \"error: file not found\")"
       ],
-      "body": "Print to stderr with a trailing newline.\n\n```sema\n(io/println-error \"error: file not found\")\n```"
+      "body": "Print to stderr with a trailing newline.\n\n```sema\n(io/println-error \"error: file not found\")\n```",
+      "syntax": "(io/println-error arg ...)"
     },
     {
       "name": "io/read-line",
@@ -1887,10 +1995,12 @@
       "module": "file-io",
       "section": "Path Manipulation",
       "summary": "Join path components.",
+      "returns": "string",
       "examples": [
         "(path/join \"src\" \"main.rs\")   ; => \"src/main.rs\"\n(path/join \"a\" \"b\" \"c.txt\")  ; => \"a/b/c.txt\""
       ],
-      "body": "Join path components.\n\n```sema\n(path/join \"src\" \"main.rs\")   ; => \"src/main.rs\"\n(path/join \"a\" \"b\" \"c.txt\")  ; => \"a/b/c.txt\"\n```"
+      "body": "Join path components.\n\n```sema\n(path/join \"src\" \"main.rs\")   ; => \"src/main.rs\"\n(path/join \"a\" \"b\" \"c.txt\")  ; => \"a/b/c.txt\"\n```",
+      "syntax": "(path/join part ...)"
     },
     {
       "name": "path/stem",
@@ -1924,10 +2034,12 @@
       "module": "file-io",
       "section": "Console I/O",
       "summary": "Write values in read-syntax form (strings are quoted) like Scheme's `write`. No trailing newline. Use `display` for human-readable output without quotes.",
+      "returns": "nil",
       "examples": [
         "(print \"hello\")   ;; outputs: \"hello\"\n(display \"hello\") ;; outputs: hello"
       ],
-      "body": "Write values in read-syntax form (strings are quoted) like Scheme's `write`. No trailing newline. Use `display` for human-readable output without quotes.\n\n```sema\n(print \"hello\")   ;; outputs: \"hello\"\n(display \"hello\") ;; outputs: hello\n```"
+      "body": "Write values in read-syntax form (strings are quoted) like Scheme's `write`. No trailing newline. Use `display` for human-readable output without quotes.\n\n```sema\n(print \"hello\")   ;; outputs: \"hello\"\n(display \"hello\") ;; outputs: hello\n```",
+      "syntax": "(print value ...)"
     },
     {
       "name": "print-error",
@@ -1945,10 +2057,12 @@
       "module": "file-io",
       "section": "Console I/O",
       "summary": "Print a value followed by a newline.",
+      "returns": "nil",
       "examples": [
         "(println \"with newline\")\n(println 42)"
       ],
-      "body": "Print a value followed by a newline.\n\n```sema\n(println \"with newline\")\n(println 42)\n```"
+      "body": "Print a value followed by a newline.\n\n```sema\n(println \"with newline\")\n(println 42)\n```",
+      "syntax": "(println value ...)"
     },
     {
       "name": "println-error",
@@ -2031,6 +2145,18 @@
       "module": "http-json",
       "section": "HTTP",
       "summary": "Make an HTTP GET request.",
+      "params": [
+        {
+          "name": "url",
+          "type": "string"
+        },
+        {
+          "name": "opts",
+          "type": "map",
+          "doc": "optional :headers/:timeout"
+        }
+      ],
+      "returns": "map",
       "examples": [
         ";; Simple GET\n(http/get \"https://httpbin.org/get\")\n\n;; GET with custom headers\n(http/get \"https://api.example.com/users\"\n  {:headers {:authorization \"Bearer my-token\"}})"
       ],
@@ -2071,6 +2197,13 @@
       "module": "http-json",
       "section": "JSON",
       "summary": "Decode a JSON string into a Sema value. JSON objects become maps with keyword keys, arrays become lists. See the [type mapping table](#decoding-json-sema) for full details.",
+      "params": [
+        {
+          "name": "json-string",
+          "type": "string"
+        }
+      ],
+      "returns": "any",
       "examples": [
         "(json/decode \"42\")                          ; => 42\n(json/decode \"3.14\")                        ; => 3.14\n(json/decode \"\\\"hello\\\"\")                   ; => \"hello\"\n(json/decode \"true\")                        ; => #t\n(json/decode \"null\")                        ; => nil\n(json/decode \"[1, 2, 3]\")                   ; => (1 2 3)\n(json/decode \"{\\\"name\\\": \\\"Ada\\\"}\")         ; => {:name \"Ada\"}",
         ";; Invalid JSON throws an error\n(json/decode \"not json\")    ; Error: json/decode: expected value at line 1 column 1\n\n;; Argument must be a string\n(json/decode 42)            ; Error: type error: expected string, got int"
@@ -2082,6 +2215,14 @@
       "module": "http-json",
       "section": "JSON",
       "summary": "Encode a Sema value as a compact JSON string. Uses **strict** conversion — errors on values that cannot be represented in JSON (functions, records, NaN, Infinity).",
+      "params": [
+        {
+          "name": "value",
+          "type": "any",
+          "doc": "any JSON-encodable Sema value"
+        }
+      ],
+      "returns": "string",
       "examples": [
         "(json/encode 42)                    ; => \"42\"\n(json/encode \"hello\")               ; => \"\\\"hello\\\"\"\n(json/encode #t)                    ; => \"true\"\n(json/encode nil)                   ; => \"null\"\n(json/encode '(1 2 3))             ; => \"[1,2,3]\"\n(json/encode [1 2 3])              ; => \"[1,2,3]\"\n(json/encode {:name \"Ada\" :age 36}) ; => \"{\\\"age\\\":36,\\\"name\\\":\\\"Ada\\\"}\"",
         ";; NaN and Infinity cannot be represented in JSON\n(json/encode (/ 0.0 0.0))   ; Error: cannot encode NaN/Infinity as JSON\n\n;; Functions cannot be encoded\n(json/encode println)        ; Error: cannot encode native-fn as JSON"
@@ -2123,6 +2264,17 @@
       "module": "kv-store",
       "section": "Functions",
       "summary": "Get a value by key. Returns `nil` if the key doesn't exist.",
+      "params": [
+        {
+          "name": "ns",
+          "type": "string"
+        },
+        {
+          "name": "key",
+          "type": "string"
+        }
+      ],
+      "returns": "any",
       "examples": [
         "(kv/get \"config\" \"api-key\")  ; => \"sk-...\" or nil"
       ],
@@ -2163,6 +2315,17 @@
       "module": "lists",
       "section": "Searching",
       "summary": "Test if any element satisfies a predicate.",
+      "params": [
+        {
+          "name": "pred",
+          "type": "function"
+        },
+        {
+          "name": "lst",
+          "type": "list"
+        }
+      ],
+      "returns": "bool",
       "examples": [
         "(any even? '(1 3 5 6))   ; => #t\n(any even? '(1 3 5))     ; => #f"
       ],
@@ -2194,26 +2357,41 @@
       "module": "lists",
       "section": "Basic Operations",
       "summary": "Concatenate lists.",
+      "returns": "list",
       "examples": [
         "(append '(1 2) '(3 4))     ; => (1 2 3 4)\n(append '(1) '(2) '(3))    ; => (1 2 3)"
       ],
-      "body": "Concatenate lists.\n\n```sema\n(append '(1 2) '(3 4))     ; => (1 2 3 4)\n(append '(1) '(2) '(3))    ; => (1 2 3)\n```"
+      "body": "Concatenate lists.\n\n```sema\n(append '(1 2) '(3 4))     ; => (1 2 3 4)\n(append '(1) '(2) '(3))    ; => (1 2 3)\n```",
+      "syntax": "(append list ...)"
     },
     {
       "name": "apply",
       "module": "lists",
       "section": "Higher-Order Functions",
       "summary": "Apply a function to a list of arguments.",
+      "returns": "any",
       "examples": [
         "(apply + '(1 2 3))   ; => 6\n(apply max '(3 1 4)) ; => 4"
       ],
-      "body": "Apply a function to a list of arguments.\n\n```sema\n(apply + '(1 2 3))   ; => 6\n(apply max '(3 1 4)) ; => 4\n```"
+      "body": "Apply a function to a list of arguments.\n\n```sema\n(apply + '(1 2 3))   ; => 6\n(apply max '(3 1 4)) ; => 4\n```",
+      "syntax": "(apply f arg ... lst)"
     },
     {
       "name": "assoc",
       "module": "lists",
       "section": "Association Lists",
       "summary": "Look up a key in an association list (list of pairs). Uses `equal?` comparison.",
+      "params": [
+        {
+          "name": "key",
+          "type": "any"
+        },
+        {
+          "name": "alist",
+          "type": "list"
+        }
+      ],
+      "returns": "any",
       "examples": [
         "(define alist '((\"a\" 1) (\"b\" 2) (\"c\" 3)))\n(assoc \"b\" alist)   ; => (\"b\" 2)\n(assoc \"z\" alist)   ; => #f"
       ],
@@ -2311,6 +2489,13 @@
       "module": "lists",
       "section": "Construction & Access",
       "summary": "Compositions of `car` and `cdr`. Available: `caar`, `cadr`, `cdar`, `cddr`, `caaar`, `caadr`, `cadar`, `caddr`, `cdaar`, `cdadr`, `cddar`, `cdddr`.",
+      "params": [
+        {
+          "name": "lst",
+          "type": "list"
+        }
+      ],
+      "returns": "any",
       "examples": [
         "(cadr '(1 2 3))    ; => 2\n(caddr '(1 2 3))   ; => 3"
       ],
@@ -2321,6 +2506,13 @@
       "module": "lists",
       "section": "Construction & Access",
       "summary": "Return the first element of a list.",
+      "params": [
+        {
+          "name": "lst",
+          "type": "list"
+        }
+      ],
+      "returns": "any",
       "examples": [
         "(car '(1 2 3))     ; => 1"
       ],
@@ -2427,6 +2619,13 @@
       "module": "lists",
       "section": "Construction & Access",
       "summary": "Return the rest of a list (everything after the first element).",
+      "params": [
+        {
+          "name": "lst",
+          "type": "list"
+        }
+      ],
+      "returns": "list",
       "examples": [
         "(cdr '(1 2 3))     ; => (2 3)\n(cdr '(1))         ; => ()"
       ],
@@ -2437,6 +2636,17 @@
       "module": "lists",
       "section": "Construction & Access",
       "summary": "Prepend an element to a list.",
+      "params": [
+        {
+          "name": "x",
+          "type": "any"
+        },
+        {
+          "name": "lst",
+          "type": "list"
+        }
+      ],
+      "returns": "list",
       "examples": [
         "(cons 0 '(1 2 3))  ; => (0 1 2 3)\n(cons 1 '())       ; => (1)"
       ],
@@ -2447,6 +2657,17 @@
       "module": "lists",
       "section": "Sublists",
       "summary": "Drop the first N elements.",
+      "params": [
+        {
+          "name": "n",
+          "type": "int"
+        },
+        {
+          "name": "lst",
+          "type": "list"
+        }
+      ],
+      "returns": "list",
       "examples": [
         "(drop 2 '(1 2 3 4 5))   ; => (3 4 5)"
       ],
@@ -2478,6 +2699,17 @@
       "module": "lists",
       "section": "Searching",
       "summary": "Test if all elements satisfy a predicate.",
+      "params": [
+        {
+          "name": "pred",
+          "type": "function"
+        },
+        {
+          "name": "lst",
+          "type": "list"
+        }
+      ],
+      "returns": "bool",
       "examples": [
         "(every even? '(2 4 6))     ; => #t\n(every even? '(2 3 6))     ; => #f"
       ],
@@ -2509,6 +2741,17 @@
       "module": "lists",
       "section": "Higher-Order Functions",
       "summary": "Return elements that satisfy a predicate.",
+      "params": [
+        {
+          "name": "pred",
+          "type": "function"
+        },
+        {
+          "name": "seq",
+          "type": "list"
+        }
+      ],
+      "returns": "list",
       "examples": [
         "(filter even? '(1 2 3 4 5))   ; => (2 4)\n(filter string? '(1 \"a\" 2))   ; => (\"a\")"
       ],
@@ -2519,6 +2762,14 @@
       "module": "lists",
       "section": "Construction & Access",
       "summary": "Alias for `car`. Return the first element.",
+      "params": [
+        {
+          "name": "lst",
+          "type": "list",
+          "doc": "list or vector; nil if empty"
+        }
+      ],
+      "returns": "any",
       "examples": [
         "(first '(1 2 3))   ; => 1"
       ],
@@ -2583,6 +2834,22 @@
       "module": "lists",
       "section": "Higher-Order Functions",
       "summary": "Left fold. `(foldl f init list)` accumulates from left to right, calling `(f acc elem)` for each element.",
+      "params": [
+        {
+          "name": "f",
+          "type": "function",
+          "doc": "called as (f acc elem)"
+        },
+        {
+          "name": "init",
+          "type": "any"
+        },
+        {
+          "name": "list",
+          "type": "list"
+        }
+      ],
+      "returns": "any",
       "examples": [
         "(foldl + 0 '(1 2 3 4 5))                      ; => 15\n(foldl (fn (acc x) (cons x acc)) '() '(1 2 3)) ; => (3 2 1)"
       ],
@@ -2593,6 +2860,22 @@
       "module": "lists",
       "section": "Higher-Order Functions",
       "summary": "Right fold. `(foldr f init list)` — accumulates from right to left.",
+      "params": [
+        {
+          "name": "f",
+          "type": "function",
+          "doc": "called as (f elem acc)"
+        },
+        {
+          "name": "init",
+          "type": "any"
+        },
+        {
+          "name": "list",
+          "type": "list"
+        }
+      ],
+      "returns": "any",
       "examples": [
         "(foldr cons '() '(1 2 3))   ; => (1 2 3)"
       ],
@@ -2603,6 +2886,17 @@
       "module": "lists",
       "section": "Higher-Order Functions",
       "summary": "Apply a function to each element for side effects.",
+      "params": [
+        {
+          "name": "f",
+          "type": "function"
+        },
+        {
+          "name": "list",
+          "type": "list"
+        }
+      ],
+      "returns": "nil",
       "examples": [
         "(for-each println '(\"a\" \"b\" \"c\"))\n;; prints: a, b, c (each on a new line)"
       ],
@@ -2613,6 +2907,13 @@
       "module": "lists",
       "section": "Grouping",
       "summary": "Count occurrences of each element, returning a map.",
+      "params": [
+        {
+          "name": "list",
+          "type": "list"
+        }
+      ],
+      "returns": "map",
       "examples": [
         "(frequencies '(a b a c b a))   ; => {a 3 b 2 c 1}"
       ],
@@ -2623,6 +2924,17 @@
       "module": "lists",
       "section": "Grouping",
       "summary": "Insert a separator between elements.",
+      "params": [
+        {
+          "name": "sep",
+          "type": "any"
+        },
+        {
+          "name": "list",
+          "type": "list"
+        }
+      ],
+      "returns": "list",
       "examples": [
         "(interpose \", \" '(\"a\" \"b\" \"c\"))   ; => (\"a\" \", \" \"b\" \", \" \"c\")"
       ],
@@ -2633,16 +2945,25 @@
       "module": "lists",
       "section": "Construction",
       "summary": "Generate a list of numbers. `(iota count)`, `(iota count start)`, or `(iota count start step)`.",
+      "returns": "list",
       "examples": [
         "(iota 5)         ; => (0 1 2 3 4)\n(iota 3 10)      ; => (10 11 12)\n(iota 4 0 2)     ; => (0 2 4 6)"
       ],
-      "body": "Generate a list of numbers. `(iota count)`, `(iota count start)`, or `(iota count start step)`.\n\n```sema\n(iota 5)         ; => (0 1 2 3 4)\n(iota 3 10)      ; => (10 11 12)\n(iota 4 0 2)     ; => (0 2 4 6)\n```"
+      "body": "Generate a list of numbers. `(iota count)`, `(iota count start)`, or `(iota count start step)`.\n\n```sema\n(iota 5)         ; => (0 1 2 3 4)\n(iota 3 10)      ; => (10 11 12)\n(iota 4 0 2)     ; => (0 2 4 6)\n```",
+      "syntax": "(iota count [start [step]])"
     },
     {
       "name": "last",
       "module": "lists",
       "section": "Construction & Access",
       "summary": "Return the last element of a list.",
+      "params": [
+        {
+          "name": "list",
+          "type": "list"
+        }
+      ],
+      "returns": "any",
       "examples": [
         "(last '(1 2 3))    ; => 3"
       ],
@@ -2653,6 +2974,13 @@
       "module": "lists",
       "section": "Basic Operations",
       "summary": "Return the number of elements in a list.",
+      "params": [
+        {
+          "name": "list",
+          "type": "list"
+        }
+      ],
+      "returns": "int",
       "examples": [
         "(length '(1 2 3))  ; => 3\n(length '())       ; => 0"
       ],
@@ -2663,10 +2991,12 @@
       "module": "lists",
       "section": "Construction & Access",
       "summary": "Create a new list.",
+      "returns": "list",
       "examples": [
         "(list 1 2 3)       ; => (1 2 3)\n(list)             ; => ()\n(list \"a\" \"b\")     ; => (\"a\" \"b\")"
       ],
-      "body": "Create a new list.\n\n```sema\n(list 1 2 3)       ; => (1 2 3)\n(list)             ; => ()\n(list \"a\" \"b\")     ; => (\"a\" \"b\")\n```"
+      "body": "Create a new list.\n\n```sema\n(list 1 2 3)       ; => (1 2 3)\n(list)             ; => ()\n(list \"a\" \"b\")     ; => (\"a\" \"b\")\n```",
+      "syntax": "(list item ...)"
     },
     {
       "name": "list/avg",
@@ -3043,10 +3373,12 @@
       "module": "lists",
       "section": "Higher-Order Functions",
       "summary": "Apply a function to each element of one or more lists.",
+      "returns": "list",
       "examples": [
         "(map (fn (x) (* x x)) '(1 2 3))      ; => (1 4 9)\n(map + '(1 2 3) '(10 20 30))          ; => (11 22 33)"
       ],
-      "body": "Apply a function to each element of one or more lists.\n\n```sema\n(map (fn (x) (* x x)) '(1 2 3))      ; => (1 4 9)\n(map + '(1 2 3) '(10 20 30))          ; => (11 22 33)\n```"
+      "body": "Apply a function to each element of one or more lists.\n\n```sema\n(map (fn (x) (* x x)) '(1 2 3))      ; => (1 4 9)\n(map + '(1 2 3) '(10 20 30))          ; => (11 22 33)\n```",
+      "syntax": "(map f lst ...)"
     },
     {
       "name": "mapcar",
@@ -3084,6 +3416,19 @@
       "module": "lists",
       "section": "Construction & Access",
       "summary": "Return the element at index N (zero-based).",
+      "params": [
+        {
+          "name": "lst",
+          "type": "any",
+          "doc": "list or vector"
+        },
+        {
+          "name": "n",
+          "type": "int",
+          "doc": "zero-based index"
+        }
+      ],
+      "returns": "any",
       "examples": [
         "(nth '(10 20 30) 1)   ; => 20\n(nth '(10 20 30) 0)   ; => 10"
       ],
@@ -3104,10 +3449,12 @@
       "module": "lists",
       "section": "Basic Operations",
       "summary": "Generate a list of integers. With one argument, generates 0 to N-1. With two, generates from start to end-1.",
+      "returns": "list",
       "examples": [
         "(range 5)       ; => (0 1 2 3 4)\n(range 1 5)     ; => (1 2 3 4)"
       ],
-      "body": "Generate a list of integers. With one argument, generates 0 to N-1. With two, generates from start to end-1.\n\n```sema\n(range 5)       ; => (0 1 2 3 4)\n(range 1 5)     ; => (1 2 3 4)\n```"
+      "body": "Generate a list of integers. With one argument, generates 0 to N-1. With two, generates from start to end-1.\n\n```sema\n(range 5)       ; => (0 1 2 3 4)\n(range 1 5)     ; => (1 2 3 4)\n```",
+      "syntax": "(range end) | (range start end) | (range start end step)"
     },
     {
       "name": "reduce",
@@ -3124,6 +3471,13 @@
       "module": "lists",
       "section": "Construction & Access",
       "summary": "Alias for `cdr`. Return the rest of the list.",
+      "params": [
+        {
+          "name": "lst",
+          "type": "list"
+        }
+      ],
+      "returns": "list",
       "examples": [
         "(rest '(1 2 3))    ; => (2 3)"
       ],
@@ -3134,6 +3488,13 @@
       "module": "lists",
       "section": "Basic Operations",
       "summary": "Reverse a list.",
+      "params": [
+        {
+          "name": "lst",
+          "type": "list"
+        }
+      ],
+      "returns": "list",
       "examples": [
         "(reverse '(1 2 3))   ; => (3 2 1)"
       ],
@@ -3165,6 +3526,18 @@
       "module": "lists",
       "section": "Higher-Order Functions",
       "summary": "Sort a list in ascending order.",
+      "params": [
+        {
+          "name": "lst",
+          "type": "list"
+        },
+        {
+          "name": "cmp",
+          "type": "function",
+          "doc": "optional comparator"
+        }
+      ],
+      "returns": "list",
       "examples": [
         "(sort '(3 1 4 1 5))   ; => (1 1 3 4 5)"
       ],
@@ -3185,6 +3558,17 @@
       "module": "lists",
       "section": "Sublists",
       "summary": "Take the first N elements.",
+      "params": [
+        {
+          "name": "n",
+          "type": "int"
+        },
+        {
+          "name": "lst",
+          "type": "list"
+        }
+      ],
+      "returns": "list",
       "examples": [
         "(take 3 '(1 2 3 4 5))   ; => (1 2 3)\n(take 10 '(1 2))         ; => (1 2)"
       ],
@@ -4024,10 +4408,12 @@
       "module": "maps",
       "section": "Maps",
       "summary": "Add or update a key-value pair, returning a new map.",
+      "returns": "map",
       "examples": [
         "(assoc {:a 1} :b 2)     ; => {:a 1 :b 2}\n(assoc {:a 1} :a 99)    ; => {:a 99}"
       ],
-      "body": "Add or update a key-value pair, returning a new map.\n\n```sema\n(assoc {:a 1} :b 2)     ; => {:a 1 :b 2}\n(assoc {:a 1} :a 99)    ; => {:a 99}\n```"
+      "body": "Add or update a key-value pair, returning a new map.\n\n```sema\n(assoc {:a 1} :b 2)     ; => {:a 1 :b 2}\n(assoc {:a 1} :a 99)    ; => {:a 99}\n```",
+      "syntax": "(assoc map key val ...)"
     },
     {
       "name": "assoc-in",
@@ -4069,6 +4455,14 @@
       "module": "maps",
       "section": "Maps",
       "summary": "Return the number of key-value pairs.",
+      "params": [
+        {
+          "name": "coll",
+          "type": "any",
+          "doc": "list, vector, map, or string"
+        }
+      ],
+      "returns": "int",
       "examples": [
         "(count {:a 1 :b 2})   ; => 2"
       ],
@@ -4100,6 +4494,22 @@
       "module": "maps",
       "section": "Maps",
       "summary": "Look up a value by key. Works on both maps and hashmaps.",
+      "params": [
+        {
+          "name": "m",
+          "type": "map"
+        },
+        {
+          "name": "key",
+          "type": "any"
+        },
+        {
+          "name": "default",
+          "type": "any",
+          "doc": "optional value returned when key is absent (defaults to nil)"
+        }
+      ],
+      "returns": "any",
       "examples": [
         "(get {:a 1 :b 2} :a)   ; => 1\n(get {:a 1 :b 2} :z)   ; => nil"
       ],
@@ -4226,10 +4636,12 @@
       "module": "maps",
       "section": "HashMaps",
       "summary": "Create a new hashmap from key-value pairs.",
+      "returns": "map",
       "examples": [
         "(hashmap/new :a 1 :b 2 :c 3)   ; create a hashmap\n(hashmap/new)                    ; empty hashmap"
       ],
-      "body": "Create a new hashmap from key-value pairs.\n\n```sema\n(hashmap/new :a 1 :b 2 :c 3)   ; create a hashmap\n(hashmap/new)                    ; empty hashmap\n```"
+      "body": "Create a new hashmap from key-value pairs.\n\n```sema\n(hashmap/new :a 1 :b 2 :c 3)   ; create a hashmap\n(hashmap/new)                    ; empty hashmap\n```",
+      "syntax": "(hashmap/new key val ...)"
     },
     {
       "name": "hashmap/to-map",
@@ -4246,6 +4658,13 @@
       "module": "maps",
       "section": "Maps",
       "summary": "Return the keys of a map as a list.",
+      "params": [
+        {
+          "name": "m",
+          "type": "map"
+        }
+      ],
+      "returns": "list",
       "examples": [
         "(keys {:a 1 :b 2})   ; => (:a :b)"
       ],
@@ -4276,6 +4695,13 @@
       "module": "maps",
       "section": "Maps",
       "summary": "Return the entries as a list of key-value pairs.",
+      "params": [
+        {
+          "name": "m",
+          "type": "map"
+        }
+      ],
+      "returns": "list",
       "examples": [
         "(map/entries {:a 1 :b 2})   ; => ((:a 1) (:b 2))"
       ],
@@ -4346,10 +4772,12 @@
       "module": "maps",
       "section": "Maps",
       "summary": "Create a map from key-value pairs.",
+      "returns": "map",
       "examples": [
         "(map/new :a 1 :b 2)   ; => {:a 1 :b 2}"
       ],
-      "body": "Create a map from key-value pairs.\n\n```sema\n(map/new :a 1 :b 2)   ; => {:a 1 :b 2}\n```"
+      "body": "Create a map from key-value pairs.\n\n```sema\n(map/new :a 1 :b 2)   ; => {:a 1 :b 2}\n```",
+      "syntax": "(map/new key val ...)"
     },
     {
       "name": "map/select-keys",
@@ -4406,10 +4834,12 @@
       "module": "maps",
       "section": "Maps",
       "summary": "Merge multiple maps together. Later maps override earlier ones. Works on both maps and hashmaps — the result type matches the first argument.",
+      "returns": "map",
       "examples": [
         "(merge {:a 1} {:b 2} {:c 3})   ; => {:a 1 :b 2 :c 3}\n(merge {:a 1} {:a 99})         ; => {:a 99}\n(merge (hashmap/new :a 1) {:b 2})  ; hashmap with :a and :b"
       ],
-      "body": "Merge multiple maps together. Later maps override earlier ones. Works on both maps and hashmaps — the result type matches the first argument.\n\n```sema\n(merge {:a 1} {:b 2} {:c 3})   ; => {:a 1 :b 2 :c 3}\n(merge {:a 1} {:a 99})         ; => {:a 99}\n(merge (hashmap/new :a 1) {:b 2})  ; hashmap with :a and :b\n```"
+      "body": "Merge multiple maps together. Later maps override earlier ones. Works on both maps and hashmaps — the result type matches the first argument.\n\n```sema\n(merge {:a 1} {:b 2} {:c 3})   ; => {:a 1 :b 2 :c 3}\n(merge {:a 1} {:a 99})         ; => {:a 99}\n(merge (hashmap/new :a 1) {:b 2})  ; hashmap with :a and :b\n```",
+      "syntax": "(merge map ...)"
     },
     {
       "name": "update-in",
@@ -4451,96 +4881,121 @@
       "module": "math",
       "section": "Basic Arithmetic",
       "summary": "Multiply numbers together.",
+      "returns": "number",
       "examples": [
         "(* 4 5)       ; => 20\n(* 2 3 4)     ; => 24\n(*)           ; => 1"
       ],
-      "body": "Multiply numbers together.\n\n```sema\n(* 4 5)       ; => 20\n(* 2 3 4)     ; => 24\n(*)           ; => 1\n```"
+      "body": "Multiply numbers together.\n\n```sema\n(* 4 5)       ; => 20\n(* 2 3 4)     ; => 24\n(*)           ; => 1\n```",
+      "syntax": "(* num ...)"
     },
     {
       "name": "+",
       "module": "math",
       "section": "Basic Arithmetic",
       "summary": "Add numbers together. Accepts any number of arguments.",
+      "returns": "number",
       "examples": [
         "(+ 1 2 3)     ; => 6\n(+ 10)        ; => 10\n(+)           ; => 0"
       ],
-      "body": "Add numbers together. Accepts any number of arguments.\n\n```sema\n(+ 1 2 3)     ; => 6\n(+ 10)        ; => 10\n(+)           ; => 0\n```"
+      "body": "Add numbers together. Accepts any number of arguments.\n\n```sema\n(+ 1 2 3)     ; => 6\n(+ 10)        ; => 10\n(+)           ; => 0\n```",
+      "syntax": "(+ num ...)"
     },
     {
       "name": "-",
       "module": "math",
       "section": "Basic Arithmetic",
       "summary": "Subtract numbers. With one argument, negates. With multiple, subtracts left to right.",
+      "returns": "number",
       "examples": [
         "(- 10 3)      ; => 7\n(- 10 3 2)    ; => 5\n(- 5)         ; => -5"
       ],
-      "body": "Subtract numbers. With one argument, negates. With multiple, subtracts left to right.\n\n```sema\n(- 10 3)      ; => 7\n(- 10 3 2)    ; => 5\n(- 5)         ; => -5\n```"
+      "body": "Subtract numbers. With one argument, negates. With multiple, subtracts left to right.\n\n```sema\n(- 10 3)      ; => 7\n(- 10 3 2)    ; => 5\n(- 5)         ; => -5\n```",
+      "syntax": "(- num ...)"
     },
     {
       "name": "/",
       "module": "math",
       "section": "Basic Arithmetic",
       "summary": "Divide numbers. Returns a float when the division is not exact (so `(/ 10 3)` is `3.3333...`, not `3`). For truncated integer division use [`math/quotient`](#math-quotient).",
+      "returns": "number",
       "examples": [
         "(/ 10 2)      ;; => 5\n(/ 10 3)      ;; => 3.3333333333333335\n(/ 10.0 3)    ;; => 3.3333333333333335"
       ],
-      "body": "Divide numbers. Returns a float when the division is not exact (so `(/ 10 3)` is `3.3333...`, not `3`). For truncated integer division use [`math/quotient`](#math-quotient).\n\n```sema\n(/ 10 2)      ;; => 5\n(/ 10 3)      ;; => 3.3333333333333335\n(/ 10.0 3)    ;; => 3.3333333333333335\n```"
+      "body": "Divide numbers. Returns a float when the division is not exact (so `(/ 10 3)` is `3.3333...`, not `3`). For truncated integer division use [`math/quotient`](#math-quotient).\n\n```sema\n(/ 10 2)      ;; => 5\n(/ 10 3)      ;; => 3.3333333333333335\n(/ 10.0 3)    ;; => 3.3333333333333335\n```",
+      "syntax": "(/ num num ...)"
     },
     {
       "name": "<",
       "module": "math",
       "section": "Comparison",
       "summary": "Less than. Supports chaining.",
+      "returns": "bool",
       "examples": [
         "(< 1 2)       ; => #t\n(< 1 2 3)     ; => #t\n(< 3 2)       ; => #f"
       ],
-      "body": "Less than. Supports chaining.\n\n```sema\n(< 1 2)       ; => #t\n(< 1 2 3)     ; => #t\n(< 3 2)       ; => #f\n```"
+      "body": "Less than. Supports chaining.\n\n```sema\n(< 1 2)       ; => #t\n(< 1 2 3)     ; => #t\n(< 3 2)       ; => #f\n```",
+      "syntax": "(< num ...)"
     },
     {
       "name": "<=",
       "module": "math",
       "section": "Comparison",
       "summary": "Less than or equal.",
+      "returns": "bool",
       "examples": [
         "(<= 1 2)      ; => #t\n(<= 2 2)      ; => #t"
       ],
-      "body": "Less than or equal.\n\n```sema\n(<= 1 2)      ; => #t\n(<= 2 2)      ; => #t\n```"
+      "body": "Less than or equal.\n\n```sema\n(<= 1 2)      ; => #t\n(<= 2 2)      ; => #t\n```",
+      "syntax": "(<= num ...)"
     },
     {
       "name": "=",
       "module": "math",
       "section": "Comparison",
       "summary": "Equality. For numbers this is numeric equality (so `(= 1 1.0)` is `#t`); for non-numbers it falls back to structural equality. Unlike `<` / `>`, comparing non-numbers does not error.",
+      "returns": "bool",
       "examples": [
         "(= 1 1)           ; => #t\n(= 1 1.0)         ; => #t\n(= 1 2)           ; => #f\n(= \"abc\" \"abc\")   ; => #t   (structural, not an error)"
       ],
-      "body": "Equality. For numbers this is numeric equality (so `(= 1 1.0)` is `#t`); for\nnon-numbers it falls back to structural equality. Unlike `<` / `>`, comparing\nnon-numbers does not error.\n\n```sema\n(= 1 1)           ; => #t\n(= 1 1.0)         ; => #t\n(= 1 2)           ; => #f\n(= \"abc\" \"abc\")   ; => #t   (structural, not an error)\n```"
+      "body": "Equality. For numbers this is numeric equality (so `(= 1 1.0)` is `#t`); for\nnon-numbers it falls back to structural equality. Unlike `<` / `>`, comparing\nnon-numbers does not error.\n\n```sema\n(= 1 1)           ; => #t\n(= 1 1.0)         ; => #t\n(= 1 2)           ; => #f\n(= \"abc\" \"abc\")   ; => #t   (structural, not an error)\n```",
+      "syntax": "(= a b ...)"
     },
     {
       "name": ">",
       "module": "math",
       "section": "Comparison",
       "summary": "Greater than.",
+      "returns": "bool",
       "examples": [
         "(> 3 2)       ; => #t\n(> 1 2)       ; => #f"
       ],
-      "body": "Greater than.\n\n```sema\n(> 3 2)       ; => #t\n(> 1 2)       ; => #f\n```"
+      "body": "Greater than.\n\n```sema\n(> 3 2)       ; => #t\n(> 1 2)       ; => #f\n```",
+      "syntax": "(> num ...)"
     },
     {
       "name": ">=",
       "module": "math",
       "section": "Comparison",
       "summary": "Greater than or equal.",
+      "returns": "bool",
       "examples": [
         "(>= 3 2)      ; => #t\n(>= 2 2)      ; => #t"
       ],
-      "body": "Greater than or equal.\n\n```sema\n(>= 3 2)      ; => #t\n(>= 2 2)      ; => #t\n```"
+      "body": "Greater than or equal.\n\n```sema\n(>= 3 2)      ; => #t\n(>= 2 2)      ; => #t\n```",
+      "syntax": "(>= num ...)"
     },
     {
       "name": "abs",
       "module": "math",
       "section": "Numeric Utilities",
       "summary": "Absolute value.",
+      "params": [
+        {
+          "name": "n",
+          "type": "number"
+        }
+      ],
+      "returns": "number",
       "examples": [
         "(abs -5)      ; => 5\n(abs 3)       ; => 3\n(abs -3.14)   ; => 3.14"
       ],
@@ -4551,6 +5006,17 @@
       "module": "math",
       "section": "Bitwise Operations",
       "summary": "Bitwise AND.",
+      "params": [
+        {
+          "name": "a",
+          "type": "int"
+        },
+        {
+          "name": "b",
+          "type": "int"
+        }
+      ],
+      "returns": "int",
       "examples": [
         "(bit/and 5 3)      ; => 1\n(bit/and 15 9)     ; => 9"
       ],
@@ -4571,6 +5037,17 @@
       "module": "math",
       "section": "Bitwise Operations",
       "summary": "Bitwise OR.",
+      "params": [
+        {
+          "name": "a",
+          "type": "int"
+        },
+        {
+          "name": "b",
+          "type": "int"
+        }
+      ],
+      "returns": "int",
       "examples": [
         "(bit/or 5 3)       ; => 7\n(bit/or 8 4)       ; => 12"
       ],
@@ -4581,6 +5058,18 @@
       "module": "math",
       "section": "Bitwise Operations",
       "summary": "Left bit shift.",
+      "params": [
+        {
+          "name": "n",
+          "type": "int"
+        },
+        {
+          "name": "count",
+          "type": "int",
+          "doc": "shift amount, 0..64"
+        }
+      ],
+      "returns": "int",
       "examples": [
         "(bit/shift-left 1 4)   ; => 16\n(bit/shift-left 3 2)   ; => 12"
       ],
@@ -4591,6 +5080,17 @@
       "module": "math",
       "section": "Bitwise Operations",
       "summary": "Right bit shift.",
+      "params": [
+        {
+          "name": "n",
+          "type": "int"
+        },
+        {
+          "name": "count",
+          "type": "int"
+        }
+      ],
+      "returns": "int",
       "examples": [
         "(bit/shift-right 16 2) ; => 4\n(bit/shift-right 8 1)  ; => 4"
       ],
@@ -4651,6 +5151,13 @@
       "module": "math",
       "section": "Numeric Predicates",
       "summary": "Test if an integer is even.",
+      "params": [
+        {
+          "name": "n",
+          "type": "int"
+        }
+      ],
+      "returns": "bool",
       "examples": [
         "(even? 4)      ; => #t\n(even? 3)      ; => #f"
       ],
@@ -4661,6 +5168,17 @@
       "module": "math",
       "section": "Scheme Aliases",
       "summary": "Alias for `pow` (Scheme name for exponentiation).",
+      "params": [
+        {
+          "name": "base",
+          "type": "number"
+        },
+        {
+          "name": "exp",
+          "type": "number"
+        }
+      ],
+      "returns": "number",
       "examples": [
         "(expt 2 10)   ; => 1024"
       ],
@@ -4687,6 +5205,13 @@
       "module": "math",
       "section": "Numeric Utilities",
       "summary": "Round down to nearest integer.",
+      "params": [
+        {
+          "name": "n",
+          "type": "number"
+        }
+      ],
+      "returns": "int",
       "examples": [
         "(floor 3.7)   ; => 3\n(floor -2.3)  ; => -3"
       ],
@@ -4713,6 +5238,13 @@
       "module": "math",
       "section": "Numeric Utilities",
       "summary": "Natural logarithm.",
+      "params": [
+        {
+          "name": "x",
+          "type": "number"
+        }
+      ],
+      "returns": "float",
       "examples": [
         "(log 1)       ; => 0.0\n(log 100)     ; => 4.605..."
       ],
@@ -4763,6 +5295,21 @@
       "module": "math",
       "section": "Interpolation & Clamping",
       "summary": "Clamp a value to a range.",
+      "params": [
+        {
+          "name": "x",
+          "type": "number"
+        },
+        {
+          "name": "lo",
+          "type": "number"
+        },
+        {
+          "name": "hi",
+          "type": "number"
+        }
+      ],
+      "returns": "number",
       "examples": [
         "(math/clamp 15 0 10)   ; => 10\n(math/clamp -5 0 10)   ; => 0\n(math/clamp 5 0 10)    ; => 5"
       ],
@@ -4963,6 +5510,19 @@
       "module": "math",
       "section": "Random Numbers",
       "summary": "Return a random integer in a range (inclusive on both ends).",
+      "params": [
+        {
+          "name": "lo",
+          "type": "int",
+          "doc": "inclusive lower bound"
+        },
+        {
+          "name": "hi",
+          "type": "int",
+          "doc": "inclusive upper bound"
+        }
+      ],
+      "returns": "int",
       "examples": [
         "(math/random-int 1 100)  ; => 42 (varies)\n(math/random-int 0 9)    ; => 7 (varies)"
       ],
@@ -4973,6 +5533,17 @@
       "module": "math",
       "section": "Integer Math",
       "summary": "Remainder after truncated division.",
+      "params": [
+        {
+          "name": "a",
+          "type": "int"
+        },
+        {
+          "name": "b",
+          "type": "int"
+        }
+      ],
+      "returns": "int",
       "examples": [
         "(math/remainder 10 3) ; => 1\n(math/remainder 7 2)  ; => 1"
       ],
@@ -4993,6 +5564,13 @@
       "module": "math",
       "section": "Interpolation & Clamping",
       "summary": "Return the sign of a number: -1, 0, or 1.",
+      "params": [
+        {
+          "name": "n",
+          "type": "number"
+        }
+      ],
+      "returns": "number",
       "examples": [
         "(math/sign -5)     ; => -1\n(math/sign 0)      ; => 0\n(math/sign 42)     ; => 1"
       ],
@@ -5033,26 +5611,41 @@
       "module": "math",
       "section": "Numeric Utilities",
       "summary": "Return the largest of 1 or more numbers (the no-arg case errors).",
+      "returns": "number",
       "examples": [
         "(max 1 2 3)   ;; => 3\n(max 5)       ;; => 5\n(max)         ;; error: Arity error: max expects 1+ args, got 0"
       ],
-      "body": "Return the largest of 1 or more numbers (the no-arg case errors).\n\n```sema\n(max 1 2 3)   ;; => 3\n(max 5)       ;; => 5\n(max)         ;; error: Arity error: max expects 1+ args, got 0\n```"
+      "body": "Return the largest of 1 or more numbers (the no-arg case errors).\n\n```sema\n(max 1 2 3)   ;; => 3\n(max 5)       ;; => 5\n(max)         ;; error: Arity error: max expects 1+ args, got 0\n```",
+      "syntax": "(max num ...)"
     },
     {
       "name": "min",
       "module": "math",
       "section": "Numeric Utilities",
       "summary": "Return the smallest of 1 or more numbers (the no-arg case errors).",
+      "returns": "number",
       "examples": [
         "(min 1 2 3)   ;; => 1\n(min 5)       ;; => 5\n(min)         ;; error: Arity error: min expects 1+ args, got 0"
       ],
-      "body": "Return the smallest of 1 or more numbers (the no-arg case errors).\n\n```sema\n(min 1 2 3)   ;; => 1\n(min 5)       ;; => 5\n(min)         ;; error: Arity error: min expects 1+ args, got 0\n```"
+      "body": "Return the smallest of 1 or more numbers (the no-arg case errors).\n\n```sema\n(min 1 2 3)   ;; => 1\n(min 5)       ;; => 5\n(min)         ;; error: Arity error: min expects 1+ args, got 0\n```",
+      "syntax": "(min num ...)"
     },
     {
       "name": "mod",
       "module": "math",
       "section": "Basic Arithmetic",
       "summary": "Modulo (remainder after division).",
+      "params": [
+        {
+          "name": "a",
+          "type": "number"
+        },
+        {
+          "name": "b",
+          "type": "number"
+        }
+      ],
+      "returns": "number",
       "examples": [
         "(mod 10 3)    ; => 1\n(mod 7 2)     ; => 1"
       ],
@@ -5063,6 +5656,17 @@
       "module": "math",
       "section": "Scheme Aliases",
       "summary": "Alias for `mod`.",
+      "params": [
+        {
+          "name": "a",
+          "type": "number"
+        },
+        {
+          "name": "b",
+          "type": "number"
+        }
+      ],
+      "returns": "number",
       "examples": [
         "(modulo 10 3)  ; => 1"
       ],
@@ -5083,6 +5687,13 @@
       "module": "math",
       "section": "Numeric Predicates",
       "summary": "Test if an integer is odd.",
+      "params": [
+        {
+          "name": "n",
+          "type": "int"
+        }
+      ],
+      "returns": "bool",
       "examples": [
         "(odd? 3)       ; => #t\n(odd? 4)       ; => #f"
       ],
@@ -5103,6 +5714,13 @@
       "module": "math",
       "section": "Numeric Predicates",
       "summary": "Test if a number is positive.",
+      "params": [
+        {
+          "name": "n",
+          "type": "number"
+        }
+      ],
+      "returns": "bool",
       "examples": [
         "(positive? 1)  ; => #t\n(positive? -1) ; => #f\n(positive? 0)  ; => #f"
       ],
@@ -5123,6 +5741,13 @@
       "module": "math",
       "section": "Numeric Utilities",
       "summary": "Round to nearest integer.",
+      "params": [
+        {
+          "name": "n",
+          "type": "number"
+        }
+      ],
+      "returns": "int",
       "examples": [
         "(round 3.5)   ; => 4\n(round 3.4)   ; => 3"
       ],
@@ -5143,6 +5768,13 @@
       "module": "math",
       "section": "Numeric Utilities",
       "summary": "Square root.",
+      "params": [
+        {
+          "name": "n",
+          "type": "number"
+        }
+      ],
+      "returns": "float",
       "examples": [
         "(sqrt 16)     ; => 4.0\n(sqrt 2)      ; => 1.4142..."
       ],
@@ -5163,6 +5795,13 @@
       "module": "math",
       "section": "Numeric Predicates",
       "summary": "Test if a number is zero.",
+      "params": [
+        {
+          "name": "n",
+          "type": "number"
+        }
+      ],
+      "returns": "bool",
       "examples": [
         "(zero? 0)      ; => #t\n(zero? 1)      ; => #f"
       ],
@@ -5684,10 +6323,12 @@
       "module": "predicates",
       "section": "Equality",
       "summary": "Equality. For numbers this is numeric equality (so `(= 1 1.0)` is `#t`); for non-numbers it falls back to structural equality. Unlike `<` / `>`, comparing non-numbers does not error — it reports whether the values are equal.",
+      "returns": "bool",
       "examples": [
         "(= 1 1)           ; => #t\n(= 1 1.0)         ; => #t\n(= 1 2)           ; => #f\n(= \"abc\" \"abc\")   ; => #t   (structural, not an error)\n(= 1 \"a\")         ; => #f"
       ],
-      "body": "Equality. For numbers this is numeric equality (so `(= 1 1.0)` is `#t`); for\nnon-numbers it falls back to structural equality. Unlike `<` / `>`, comparing\nnon-numbers does not error — it reports whether the values are equal.\n\n```sema\n(= 1 1)           ; => #t\n(= 1 1.0)         ; => #t\n(= 1 2)           ; => #f\n(= \"abc\" \"abc\")   ; => #t   (structural, not an error)\n(= 1 \"a\")         ; => #f\n```"
+      "body": "Equality. For numbers this is numeric equality (so `(= 1 1.0)` is `#t`); for\nnon-numbers it falls back to structural equality. Unlike `<` / `>`, comparing\nnon-numbers does not error — it reports whether the values are equal.\n\n```sema\n(= 1 1)           ; => #t\n(= 1 1.0)         ; => #t\n(= 1 2)           ; => #f\n(= \"abc\" \"abc\")   ; => #t   (structural, not an error)\n(= 1 \"a\")         ; => #f\n```",
+      "syntax": "(= a b ...)"
     },
     {
       "name": "agent?",
@@ -5771,6 +6412,17 @@
       "module": "predicates",
       "section": "Equality",
       "summary": "Test structural equality. `equal?` is an alias.",
+      "params": [
+        {
+          "name": "a",
+          "type": "any"
+        },
+        {
+          "name": "b",
+          "type": "any"
+        }
+      ],
+      "returns": "bool",
       "examples": [
         "(eq? 'a 'a)           ; => #t\n(eq? '(1 2) '(1 2))   ; => #t\n(eq? 1 2)             ; => #f"
       ],
@@ -5802,6 +6454,13 @@
       "module": "predicates",
       "section": "Numeric Predicates",
       "summary": "Test if an integer is even.",
+      "params": [
+        {
+          "name": "n",
+          "type": "int"
+        }
+      ],
+      "returns": "bool",
       "examples": [
         "(even? 4)   ; => #t\n(even? 3)   ; => #f"
       ],
@@ -5842,6 +6501,13 @@
       "module": "predicates",
       "section": "Type Predicates",
       "summary": "Test if a value is a keyword.",
+      "params": [
+        {
+          "name": "v",
+          "type": "any"
+        }
+      ],
+      "returns": "bool",
       "examples": [
         "(keyword? :k)    ; => #t\n(keyword? \"k\")   ; => #f"
       ],
@@ -5852,6 +6518,13 @@
       "module": "predicates",
       "section": "Collection Predicates",
       "summary": "Test if a value is a list.",
+      "params": [
+        {
+          "name": "x",
+          "type": "any"
+        }
+      ],
+      "returns": "bool",
       "examples": [
         "(list? '(1))    ; => #t\n(list? 42)      ; => #f"
       ],
@@ -5862,6 +6535,13 @@
       "module": "predicates",
       "section": "Collection Predicates",
       "summary": "Test if a value is a map.",
+      "params": [
+        {
+          "name": "value",
+          "type": "any"
+        }
+      ],
+      "returns": "bool",
       "examples": [
         "(map? {:a 1})   ; => #t\n(map? '())      ; => #f"
       ],
@@ -5892,6 +6572,13 @@
       "module": "predicates",
       "section": "Emptiness Predicates",
       "summary": "Test if a value is `nil` specifically (not the empty list).",
+      "params": [
+        {
+          "name": "value",
+          "type": "any"
+        }
+      ],
+      "returns": "bool",
       "examples": [
         "(nil? nil)     ;; => #t\n(nil? '())     ;; => #f\n(nil? 0)       ;; => #f"
       ],
@@ -5919,6 +6606,13 @@
       "module": "predicates",
       "section": "Emptiness Predicates",
       "summary": "Test if a value is the empty list or `nil`.",
+      "params": [
+        {
+          "name": "x",
+          "type": "any"
+        }
+      ],
+      "returns": "bool",
       "examples": [
         "(null? '())    ;; => #t\n(null? nil)    ;; => #t\n(null? '(1))   ;; => #f"
       ],
@@ -5929,6 +6623,13 @@
       "module": "predicates",
       "section": "Numeric Predicates",
       "summary": "Test if a value is a number (integer or float).",
+      "params": [
+        {
+          "name": "v",
+          "type": "any"
+        }
+      ],
+      "returns": "bool",
       "examples": [
         "(number? 42)     ; => #t\n(number? 3.14)   ; => #t\n(number? \"42\")   ; => #f"
       ],
@@ -5939,6 +6640,13 @@
       "module": "predicates",
       "section": "Numeric Predicates",
       "summary": "Test if an integer is odd.",
+      "params": [
+        {
+          "name": "n",
+          "type": "int"
+        }
+      ],
+      "returns": "bool",
       "examples": [
         "(odd? 3)   ; => #t\n(odd? 4)   ; => #f"
       ],
@@ -5949,6 +6657,13 @@
       "module": "predicates",
       "section": "Collection Predicates",
       "summary": "Test if a value is a non-empty list (Scheme compatibility).",
+      "params": [
+        {
+          "name": "x",
+          "type": "any"
+        }
+      ],
+      "returns": "bool",
       "examples": [
         "(pair? '(1 2))   ; => #t\n(pair? '())      ; => #f"
       ],
@@ -5959,6 +6674,13 @@
       "module": "predicates",
       "section": "Numeric Predicates",
       "summary": "Test if a number is positive.",
+      "params": [
+        {
+          "name": "n",
+          "type": "number"
+        }
+      ],
+      "returns": "bool",
       "examples": [
         "(positive? 1)    ; => #t\n(positive? -1)   ; => #f"
       ],
@@ -5996,6 +6718,13 @@
       "module": "predicates",
       "section": "Promise Predicates",
       "summary": "Test if a value is a promise (created with `delay`).",
+      "params": [
+        {
+          "name": "v",
+          "type": "any"
+        }
+      ],
+      "returns": "bool",
       "examples": [
         "(promise? (delay 1))   ; => #t\n(promise? 42)          ; => #f"
       ],
@@ -6026,6 +6755,13 @@
       "module": "predicates",
       "section": "Type Predicates",
       "summary": "Test if a value is a string.",
+      "params": [
+        {
+          "name": "x",
+          "type": "any"
+        }
+      ],
+      "returns": "bool",
       "examples": [
         "(string? \"hi\")   ; => #t\n(string? 42)     ; => #f"
       ],
@@ -6036,6 +6772,13 @@
       "module": "predicates",
       "section": "Type Predicates",
       "summary": "Test if a value is a symbol.",
+      "params": [
+        {
+          "name": "x",
+          "type": "any"
+        }
+      ],
+      "returns": "bool",
       "examples": [
         "(symbol? 'x)     ; => #t\n(symbol? \"x\")    ; => #f"
       ],
@@ -6073,6 +6816,13 @@
       "module": "predicates",
       "section": "Collection Predicates",
       "summary": "Test if a value is a vector.",
+      "params": [
+        {
+          "name": "x",
+          "type": "any"
+        }
+      ],
+      "returns": "bool",
       "examples": [
         "(vector? [1])   ; => #t\n(vector? '(1))  ; => #f"
       ],
@@ -6083,6 +6833,13 @@
       "module": "predicates",
       "section": "Numeric Predicates",
       "summary": "Test if a number is zero.",
+      "params": [
+        {
+          "name": "n",
+          "type": "number"
+        }
+      ],
+      "returns": "bool",
       "examples": [
         "(zero? 0)   ; => #t\n(zero? 1)   ; => #f"
       ],
@@ -6201,7 +6958,8 @@
         "(define-record-type point\n  (make-point x y)       ; constructor (positional args)\n  point?                  ; predicate\n  (x point-x)            ; (field-name accessor-name)\n  (y point-y))",
         "(define-record-type <type-name>\n  (<constructor> <field-name> ...)\n  <predicate>\n  (<field-name> <accessor>) ...)"
       ],
-      "body": "Define a new record type, generating a constructor, predicate, and one accessor per field.\n\n```sema\n(define-record-type point\n  (make-point x y)       ; constructor (positional args)\n  point?                  ; predicate\n  (x point-x)            ; (field-name accessor-name)\n  (y point-y))\n```\n\nGeneral syntax:\n\n```sema\n(define-record-type <type-name>\n  (<constructor> <field-name> ...)\n  <predicate>\n  (<field-name> <accessor>) ...)\n```"
+      "body": "Define a new record type, generating a constructor, predicate, and one accessor per field.\n\n```sema\n(define-record-type point\n  (make-point x y)       ; constructor (positional args)\n  point?                  ; predicate\n  (x point-x)            ; (field-name accessor-name)\n  (y point-y))\n```\n\nGeneral syntax:\n\n```sema\n(define-record-type <type-name>\n  (<constructor> <field-name> ...)\n  <predicate>\n  (<field-name> <accessor>) ...)\n```",
+      "syntax": "(define-record-type type (constructor field ...) predicate (field accessor) ...)"
     },
     {
       "name": "record?",
@@ -6218,6 +6976,13 @@
       "module": "records",
       "section": "Introspection",
       "summary": "Return the type of a value as a keyword. For records, returns the record's type name:",
+      "params": [
+        {
+          "name": "v",
+          "type": "any"
+        }
+      ],
+      "returns": "keyword",
       "examples": [
         "(type (make-point 3 4))   ; => :point\n(type [1 2 3])            ; => :vector\n(type {:a 1})             ; => :map"
       ],
@@ -6238,6 +7003,17 @@
       "module": "regex",
       "section": "Matching",
       "summary": "Find all non-overlapping matches of a pattern.",
+      "params": [
+        {
+          "name": "pattern",
+          "type": "string"
+        },
+        {
+          "name": "text",
+          "type": "string"
+        }
+      ],
+      "returns": "list",
       "examples": [
         "(regex/find-all #\"\\d+\" \"a1b2c3\")          ; => (\"1\" \"2\" \"3\")\n(regex/find-all #\"[A-Z]\" \"Hello World\")   ; => (\"H\" \"W\")"
       ],
@@ -6259,6 +7035,17 @@
       "module": "regex",
       "section": "Matching",
       "summary": "Test if a pattern matches anywhere in a string. Returns `#t` or `#f`.",
+      "params": [
+        {
+          "name": "pattern",
+          "type": "string"
+        },
+        {
+          "name": "text",
+          "type": "string"
+        }
+      ],
+      "returns": "bool",
       "examples": [
         "(regex/match? #\"\\d+\" \"abc123\")       ; => #t\n(regex/match? #\"\\d+\" \"no digits\")    ; => #f\n(regex/match? #\"^\\d+$\" \"abc123\")     ; => #f  (anchored — must match entire string)\n(regex/match? #\"^\\d+$\" \"123\")        ; => #t"
       ],
@@ -6281,6 +7068,21 @@
       "module": "regex",
       "section": "Replacement",
       "summary": "Replace **all** matches of a pattern.",
+      "params": [
+        {
+          "name": "pattern",
+          "type": "string"
+        },
+        {
+          "name": "replacement",
+          "type": "string"
+        },
+        {
+          "name": "text",
+          "type": "string"
+        }
+      ],
+      "returns": "string",
       "examples": [
         "(regex/replace-all #\"\\d\" \"X\" \"a1b2\")        ; => \"aXbX\"\n(regex/replace-all #\"\\s+\" \" \" \"a  b  c\")    ; => \"a b c\""
       ],
@@ -7643,6 +8445,13 @@
       "module": "strings",
       "section": "Characters",
       "summary": "Convert a character to its Unicode code point.",
+      "params": [
+        {
+          "name": "c",
+          "type": "char"
+        }
+      ],
+      "returns": "int",
       "examples": [
         "(char/to-integer #\\A)   ; => 65\n(char/to-integer #\\a)   ; => 97"
       ],
@@ -7656,6 +8465,13 @@
       "module": "strings",
       "section": "Characters",
       "summary": "Convert a character to a single-character string.",
+      "params": [
+        {
+          "name": "c",
+          "type": "char"
+        }
+      ],
+      "returns": "string",
       "examples": [
         "(char/to-string #\\a)   ; => \"a\""
       ],
@@ -7725,6 +8541,17 @@
       "module": "strings",
       "section": "Character Comparison (R7RS)",
       "summary": "Character equality.",
+      "params": [
+        {
+          "name": "a",
+          "type": "char"
+        },
+        {
+          "name": "b",
+          "type": "char"
+        }
+      ],
+      "returns": "bool",
       "examples": [
         "(char=? #\\a #\\a)   ; => #t\n(char=? #\\a #\\b)   ; => #f"
       ],
@@ -7755,10 +8582,12 @@
       "module": "strings",
       "section": "Scheme Compatibility Aliases",
       "summary": "Format a string with `~a` placeholders.",
+      "returns": "string",
       "examples": [
         "(format \"~a is ~a\" \"Sema\" \"great\")   ; => \"Sema is great\"\n(format \"~a + ~a = ~a\" 1 2 3)        ; => \"1 + 2 = 3\""
       ],
-      "body": "Format a string with `~a` placeholders.\n\n```sema\n(format \"~a is ~a\" \"Sema\" \"great\")   ; => \"Sema is great\"\n(format \"~a + ~a = ~a\" 1 2 3)        ; => \"1 + 2 = 3\"\n```"
+      "body": "Format a string with `~a` placeholders.\n\n```sema\n(format \"~a is ~a\" \"Sema\" \"great\")   ; => \"Sema is great\"\n(format \"~a + ~a = ~a\" 1 2 3)        ; => \"1 + 2 = 3\"\n```",
+      "syntax": "(format fmt arg ...)"
     },
     {
       "name": "integer/to-char",
@@ -7781,6 +8610,13 @@
       "module": "strings",
       "section": "Type Conversions",
       "summary": "Convert a keyword to a string.",
+      "params": [
+        {
+          "name": "k",
+          "type": "keyword"
+        }
+      ],
+      "returns": "string",
       "examples": [
         "(keyword/to-string :name)   ; => \"name\""
       ],
@@ -7825,6 +8661,13 @@
       "module": "strings",
       "section": "Type Conversions",
       "summary": "Convert a number to a string.",
+      "params": [
+        {
+          "name": "n",
+          "type": "number"
+        }
+      ],
+      "returns": "string",
       "examples": [
         "(number/to-string 42)      ; => \"42\"\n(number/to-string 3.14)   ; => \"3.14\""
       ],
@@ -7835,10 +8678,12 @@
       "module": "strings",
       "section": "Scheme Compatibility Aliases",
       "summary": "Convert any value to its string representation.",
+      "returns": "string",
       "examples": [
         "(str 42)           ; => \"42\"\n(str #t)           ; => \"#t\"\n(str '(1 2 3))    ; => \"(1 2 3)\""
       ],
-      "body": "Convert any value to its string representation.\n\n```sema\n(str 42)           ; => \"42\"\n(str #t)           ; => \"#t\"\n(str '(1 2 3))    ; => \"(1 2 3)\"\n```"
+      "body": "Convert any value to its string representation.\n\n```sema\n(str 42)           ; => \"42\"\n(str #t)           ; => \"#t\"\n(str '(1 2 3))    ; => \"(1 2 3)\"\n```",
+      "syntax": "(str value ...)"
     },
     {
       "name": "string->float",
@@ -7898,10 +8743,12 @@
       "module": "strings",
       "section": "Scheme Compatibility Aliases",
       "summary": "Concatenate strings together.",
+      "returns": "string",
       "examples": [
         "(string/append \"hello\" \" \" \"world\")   ; => \"hello world\"\n(string/append \"a\" \"b\" \"c\")           ; => \"abc\""
       ],
-      "body": "Concatenate strings together.\n\n```sema\n(string/append \"hello\" \" \" \"world\")   ; => \"hello world\"\n(string/append \"a\" \"b\" \"c\")           ; => \"abc\"\n```"
+      "body": "Concatenate strings together.\n\n```sema\n(string/append \"hello\" \" \" \"world\")   ; => \"hello world\"\n(string/append \"a\" \"b\" \"c\")           ; => \"abc\"\n```",
+      "syntax": "(string/append str ...)"
     },
     {
       "name": "string/before",
@@ -7969,6 +8816,13 @@
       "module": "strings",
       "section": "Core String Operations",
       "summary": "Convert a string to a list of characters.",
+      "params": [
+        {
+          "name": "s",
+          "type": "string"
+        }
+      ],
+      "returns": "list",
       "examples": [
         "(string/chars \"abc\")   ; => (#\\a #\\b #\\c)"
       ],
@@ -7999,6 +8853,13 @@
       "module": "strings",
       "section": "Unicode & Encoding",
       "summary": "Return a list of Unicode codepoint integers for each character in a string. This reveals the internal structure of composed characters and emoji sequences.",
+      "params": [
+        {
+          "name": "s",
+          "type": "string"
+        }
+      ],
+      "returns": "list",
       "examples": [
         "(string/codepoints \"ABC\")      ; => (65 66 67)\n(string/codepoints \"é\")        ; => (233)\n(string/codepoints \"😀\")       ; => (128512)",
         ";; 👨‍👩‍👦 is actually 👨 + ZWJ + 👩 + ZWJ + 👦\n(string/codepoints \"👨‍👩‍👦\")   ; => (128104 8205 128105 8205 128102)\n\n;; 👋🏽 is 👋 + skin tone modifier\n(string/codepoints \"👋🏽\")      ; => (128075 127997)"
@@ -8010,6 +8871,17 @@
       "module": "strings",
       "section": "Core String Operations",
       "summary": "Test if a string contains a substring.",
+      "params": [
+        {
+          "name": "s",
+          "type": "string"
+        },
+        {
+          "name": "sub",
+          "type": "string"
+        }
+      ],
+      "returns": "bool",
       "examples": [
         "(string/contains? \"hello\" \"ell\")   ; => #t\n(string/contains? \"hello\" \"xyz\")   ; => #f"
       ],
@@ -8070,6 +8942,14 @@
       "module": "strings",
       "section": "Unicode & Encoding",
       "summary": "Construct a string from a list of Unicode codepoint integers. This is the inverse of `string/codepoints` and enables building emoji programmatically by combining codepoints.",
+      "params": [
+        {
+          "name": "codepoints",
+          "type": "list",
+          "doc": "list or vector of integer codepoints"
+        }
+      ],
+      "returns": "string",
       "examples": [
         "(string/from-codepoints (list 65 66 67))   ; => \"ABC\"\n(string/from-codepoints (list 233))        ; => \"é\"",
         ";; Build a family: 👨 + ZWJ + 👩 + ZWJ + 👧\n(string/from-codepoints (list 128104 8205 128105 8205 128103))\n;; => 👨‍👩‍👧\n\n;; Build a profession: 👩 + ZWJ + 💻\n(string/from-codepoints (list 128105 8205 128187))\n;; => 👩‍💻\n\n;; Add skin tone: 👋 + modifier\n(string/from-codepoints (list 128075 127997))\n;; => 👋🏽\n\n;; Build flags from Regional Indicators (A=127462):\n(string/from-codepoints (list 127475 127476))\n;; => 🇳🇴 (NO = Norway)",
@@ -8122,6 +9002,17 @@
       "module": "strings",
       "section": "Core String Operations",
       "summary": "Join a list of strings with a separator.",
+      "params": [
+        {
+          "name": "lst",
+          "type": "list"
+        },
+        {
+          "name": "sep",
+          "type": "string"
+        }
+      ],
+      "returns": "string",
       "examples": [
         "(string/join '(\"a\" \"b\" \"c\") \", \")  ; => \"a, b, c\"\n(string/join '(\"x\" \"y\") \"-\")      ; => \"x-y\""
       ],
@@ -8155,6 +9046,13 @@
       "module": "strings",
       "section": "Scheme Compatibility Aliases",
       "summary": "Return the number of characters in a string.",
+      "params": [
+        {
+          "name": "s",
+          "type": "string"
+        }
+      ],
+      "returns": "int",
       "examples": [
         "(string/length \"hello\")   ; => 5\n(string/length \"\")        ; => 0\n(string/length \"héllo\")   ; => 5\n(string/length \"日本語\")   ; => 3"
       ],
@@ -8218,20 +9116,24 @@
       "module": "strings",
       "section": "Core String Operations",
       "summary": "Pad a string on the left to a given width.",
+      "returns": "string",
       "examples": [
         "(string/pad-left \"42\" 5 \"0\")   ; => \"00042\"\n(string/pad-left \"hi\" 5)       ; => \"   hi\""
       ],
-      "body": "Pad a string on the left to a given width.\n\n```sema\n(string/pad-left \"42\" 5 \"0\")   ; => \"00042\"\n(string/pad-left \"hi\" 5)       ; => \"   hi\"\n```"
+      "body": "Pad a string on the left to a given width.\n\n```sema\n(string/pad-left \"42\" 5 \"0\")   ; => \"00042\"\n(string/pad-left \"hi\" 5)       ; => \"   hi\"\n```",
+      "syntax": "(string/pad-left s width [pad-char])"
     },
     {
       "name": "string/pad-right",
       "module": "strings",
       "section": "Core String Operations",
       "summary": "Pad a string on the right to a given width.",
+      "returns": "string",
       "examples": [
         "(string/pad-right \"hi\" 5)       ; => \"hi   \"\n(string/pad-right \"42\" 5 \"0\")   ; => \"42000\""
       ],
-      "body": "Pad a string on the right to a given width.\n\n```sema\n(string/pad-right \"hi\" 5)       ; => \"hi   \"\n(string/pad-right \"42\" 5 \"0\")   ; => \"42000\"\n```"
+      "body": "Pad a string on the right to a given width.\n\n```sema\n(string/pad-right \"hi\" 5)       ; => \"hi   \"\n(string/pad-right \"42\" 5 \"0\")   ; => \"42000\"\n```",
+      "syntax": "(string/pad-right s width [pad])"
     },
     {
       "name": "string/pascal-case",
@@ -8251,6 +9153,17 @@
       "module": "strings",
       "section": "Scheme Compatibility Aliases",
       "summary": "Return the character at a given index.",
+      "params": [
+        {
+          "name": "s",
+          "type": "string"
+        },
+        {
+          "name": "index",
+          "type": "int"
+        }
+      ],
+      "returns": "char",
       "examples": [
         "(string/ref \"hello\" 0)    ; => #\\h\n(string/ref \"hello\" 4)    ; => #\\o"
       ],
@@ -8271,6 +9184,18 @@
       "module": "strings",
       "section": "Core String Operations",
       "summary": "Repeat a string N times.",
+      "params": [
+        {
+          "name": "s",
+          "type": "string"
+        },
+        {
+          "name": "n",
+          "type": "int",
+          "doc": "number of repetitions"
+        }
+      ],
+      "returns": "string",
       "examples": [
         "(string/repeat \"ab\" 3)   ; => \"ababab\"\n(string/repeat \"-\" 5)    ; => \"-----\""
       ],
@@ -8324,6 +9249,22 @@
       "module": "strings",
       "section": "Scheme Compatibility Aliases",
       "summary": "Extract a substring by start and end character index.",
+      "params": [
+        {
+          "name": "s",
+          "type": "string"
+        },
+        {
+          "name": "start",
+          "type": "int"
+        },
+        {
+          "name": "end",
+          "type": "int",
+          "doc": "optional, defaults to string length"
+        }
+      ],
+      "returns": "string",
       "examples": [
         "(string/slice \"hello\" 1 3)   ; => \"el\"\n(string/slice \"hello\" 0 5)   ; => \"hello\"\n(string/slice \"héllo\" 1 2)   ; => \"é\""
       ],
@@ -8347,6 +9288,17 @@
       "module": "strings",
       "section": "Core String Operations",
       "summary": "Split a string by a delimiter.",
+      "params": [
+        {
+          "name": "s",
+          "type": "string"
+        },
+        {
+          "name": "sep",
+          "type": "string"
+        }
+      ],
+      "returns": "list",
       "examples": [
         "(string/split \"a,b,c\" \",\")        ; => (\"a\" \"b\" \"c\")\n(string/split \"hello world\" \" \")  ; => (\"hello\" \"world\")"
       ],
@@ -8403,6 +9355,13 @@
       "module": "strings",
       "section": "Type Conversions",
       "summary": "Convert a string to a keyword.",
+      "params": [
+        {
+          "name": "s",
+          "type": "string"
+        }
+      ],
+      "returns": "keyword",
       "examples": [
         "(string/to-keyword \"name\")   ; => :name"
       ],
@@ -8429,6 +9388,13 @@
       "module": "strings",
       "section": "Type Conversions",
       "summary": "Parse a string as a number.",
+      "params": [
+        {
+          "name": "s",
+          "type": "string"
+        }
+      ],
+      "returns": "number",
       "examples": [
         "(string/to-number \"42\")     ; => 42\n(string/to-number \"3.14\")  ; => 3.14"
       ],
@@ -8455,6 +9421,13 @@
       "module": "strings",
       "section": "Core String Operations",
       "summary": "Remove whitespace from both ends.",
+      "params": [
+        {
+          "name": "s",
+          "type": "string"
+        }
+      ],
+      "returns": "string",
       "examples": [
         "(string/trim \"  hello  \")   ; => \"hello\"\n(string/trim \"\\thello\\n\")   ; => \"hello\""
       ],
@@ -8581,6 +9554,14 @@
       "module": "system",
       "section": "Environment Variables",
       "summary": "Get the value of an environment variable. Returns `nil` if not set.",
+      "params": [
+        {
+          "name": "name",
+          "type": "string",
+          "doc": "environment variable name"
+        }
+      ],
+      "returns": "string",
       "examples": [
         "(env \"HOME\")       ; => \"/Users/ada\"\n(env \"PATH\")       ; => \"/usr/bin:/bin:...\"\n(env \"MISSING\")    ; => nil"
       ],
@@ -8610,7 +9591,8 @@
       "examples": [
         "(exit 0)   ; exit successfully\n(exit 1)   ; exit with error"
       ],
-      "body": "Exit the process with a given status code.\n\n```sema\n(exit 0)   ; exit successfully\n(exit 1)   ; exit with error\n```"
+      "body": "Exit the process with a given status code.\n\n```sema\n(exit 0)   ; exit successfully\n(exit 1)   ; exit with error\n```",
+      "syntax": "(exit [code])"
     },
     {
       "name": "gensym",
@@ -8654,10 +9636,12 @@
       "module": "system",
       "section": "Shell & Process Control",
       "summary": "Run a shell command. Returns a map with `:stdout`, `:stderr`, and `:exit-code`.",
+      "returns": "map",
       "examples": [
         "(shell \"echo hello\")\n; => {:exit-code 0 :stderr \"\" :stdout \"hello\\n\"}\n\n(:stdout (shell \"echo hello\"))   ; => \"hello\\n\""
       ],
-      "body": "Run a shell command. Returns a map with `:stdout`, `:stderr`, and `:exit-code`.\n\n```sema\n(shell \"echo hello\")\n; => {:exit-code 0 :stderr \"\" :stdout \"hello\\n\"}\n\n(:stdout (shell \"echo hello\"))   ; => \"hello\\n\"\n```"
+      "body": "Run a shell command. Returns a map with `:stdout`, `:stderr`, and `:exit-code`.\n\n```sema\n(shell \"echo hello\")\n; => {:exit-code 0 :stderr \"\" :stdout \"hello\\n\"}\n\n(:stdout (shell \"echo hello\"))   ; => \"hello\\n\"\n```",
+      "syntax": "(shell cmd arg ...)"
     },
     {
       "name": "spy",
@@ -9015,6 +9999,13 @@
       "module": "terminal",
       "section": "Modifiers",
       "summary": "Render text with decreased intensity.",
+      "params": [
+        {
+          "name": "text",
+          "type": "string"
+        }
+      ],
+      "returns": "string",
       "examples": [
         "(term/dim \"less important\")"
       ],
@@ -9176,12 +10167,14 @@
       "module": "terminal",
       "section": "Combined Styles",
       "summary": "Apply multiple styles at once using keywords. The first argument is the text, followed by one or more style keywords.",
+      "returns": "string",
       "examples": [
         "(term/style \"danger\" :bold :red)\n(term/style \"notice\" :italic :yellow :underline)\n(term/style \"subtle\" :dim :gray)",
         "(term/style \"plain text\")   ; => \"plain text\" (no ANSI codes)",
         "(term/style \"text\" :blink)  ; Error: unknown style keyword :blink"
       ],
-      "body": "Apply multiple styles at once using keywords. The first argument is the text, followed by one or more style keywords.\n\n```sema\n(term/style \"danger\" :bold :red)\n(term/style \"notice\" :italic :yellow :underline)\n(term/style \"subtle\" :dim :gray)\n```\n\nInternally, `term/style` combines ANSI codes with `;` separators into a single escape sequence (e.g., `ESC[1;31m` for bold red), which is more efficient than nesting individual style functions.\n\nIf called with no style keywords, the text is returned unstyled.\n\n```sema\n(term/style \"plain text\")   ; => \"plain text\" (no ANSI codes)\n```\n\nAn unknown keyword produces an error:\n\n```sema\n(term/style \"text\" :blink)  ; Error: unknown style keyword :blink\n```\n\n#### Style keyword reference\n\n| Keyword          | Effect         | ANSI Code |\n|------------------|----------------|-----------|\n| `:bold`          | Bold           | 1         |\n| `:dim`           | Dim            | 2         |\n| `:italic`        | Italic         | 3         |\n| `:underline`     | Underline      | 4         |\n| `:inverse`       | Inverse        | 7         |\n| `:strikethrough` | Strikethrough  | 9         |\n| `:black`         | Black text     | 30        |\n| `:red`           | Red text       | 31        |\n| `:green`         | Green text     | 32        |\n| `:yellow`        | Yellow text    | 33        |\n| `:blue`          | Blue text      | 34        |\n| `:magenta`       | Magenta text   | 35        |\n| `:cyan`          | Cyan text      | 36        |\n| `:white`         | White text     | 37        |\n| `:gray`          | Gray text      | 90        |"
+      "body": "Apply multiple styles at once using keywords. The first argument is the text, followed by one or more style keywords.\n\n```sema\n(term/style \"danger\" :bold :red)\n(term/style \"notice\" :italic :yellow :underline)\n(term/style \"subtle\" :dim :gray)\n```\n\nInternally, `term/style` combines ANSI codes with `;` separators into a single escape sequence (e.g., `ESC[1;31m` for bold red), which is more efficient than nesting individual style functions.\n\nIf called with no style keywords, the text is returned unstyled.\n\n```sema\n(term/style \"plain text\")   ; => \"plain text\" (no ANSI codes)\n```\n\nAn unknown keyword produces an error:\n\n```sema\n(term/style \"text\" :blink)  ; Error: unknown style keyword :blink\n```\n\n#### Style keyword reference\n\n| Keyword          | Effect         | ANSI Code |\n|------------------|----------------|-----------|\n| `:bold`          | Bold           | 1         |\n| `:dim`           | Dim            | 2         |\n| `:italic`        | Italic         | 3         |\n| `:underline`     | Underline      | 4         |\n| `:inverse`       | Inverse        | 7         |\n| `:strikethrough` | Strikethrough  | 9         |\n| `:black`         | Black text     | 30        |\n| `:red`           | Red text       | 31        |\n| `:green`         | Green text     | 32        |\n| `:yellow`        | Yellow text    | 33        |\n| `:blue`          | Blue text      | 34        |\n| `:magenta`       | Magenta text   | 35        |\n| `:cyan`          | Cyan text      | 36        |\n| `:white`         | White text     | 37        |\n| `:gray`          | Gray text      | 90        |",
+      "syntax": "(term/style text style ...)"
     },
     {
       "name": "term/underline",
@@ -9822,6 +10815,14 @@
       "module": "vectors",
       "section": "Indexed Access",
       "summary": "Return the first element of a vector (or list). Returns `nil` for empty vectors.",
+      "params": [
+        {
+          "name": "vec",
+          "type": "vector",
+          "doc": "vector or list; nil if empty"
+        }
+      ],
+      "returns": "any",
       "examples": [
         "(first [1 2 3])   ; => 1\n(first [])        ; => nil"
       ],
@@ -9836,6 +10837,13 @@
       "module": "vectors",
       "section": "Predicates & Introspection",
       "summary": "Vectors participate in Sema's generic collection functions:",
+      "params": [
+        {
+          "name": "vec",
+          "type": "vector"
+        }
+      ],
+      "returns": "int",
       "examples": [
         "(length [10 20 30])   ; => 3\n(count [10 20 30])    ; => 3\n(empty? [])           ; => #t\n(empty? [1])          ; => #f"
       ],
@@ -9856,6 +10864,19 @@
       "module": "vectors",
       "section": "Indexed Access",
       "summary": "Return the element at index `n` (zero-based). Works on both lists and vectors.",
+      "params": [
+        {
+          "name": "coll",
+          "type": "any",
+          "doc": "list or vector"
+        },
+        {
+          "name": "n",
+          "type": "int",
+          "doc": "zero-based index"
+        }
+      ],
+      "returns": "any",
       "examples": [
         "(nth [10 20 30] 0)    ; => 10\n(nth [10 20 30] 2)    ; => 30",
         "(nth [10 20 30] 3)\n; => error: index 3 out of bounds (length 3)"
@@ -9867,6 +10888,13 @@
       "module": "vectors",
       "section": "Indexed Access",
       "summary": "Return everything after the first element. **Preserves type** — vector in, vector out.",
+      "params": [
+        {
+          "name": "vec",
+          "type": "vector"
+        }
+      ],
+      "returns": "vector",
       "examples": [
         "(rest [1 2 3])    ; => [2 3]\n(rest [])         ; => []\n(rest [1])        ; => []"
       ],
@@ -9877,10 +10905,12 @@
       "module": "vectors",
       "section": "Construction",
       "summary": "Create a vector from its arguments.",
+      "returns": "vector",
       "examples": [
         "(vector 1 2 3)       ; => [1 2 3]\n(vector)             ; => []\n(vector \"a\" \"b\")     ; => [\"a\" \"b\"]"
       ],
-      "body": "Create a vector from its arguments.\n\n```sema\n(vector 1 2 3)       ; => [1 2 3]\n(vector)             ; => []\n(vector \"a\" \"b\")     ; => [\"a\" \"b\"]\n```"
+      "body": "Create a vector from its arguments.\n\n```sema\n(vector 1 2 3)       ; => [1 2 3]\n(vector)             ; => []\n(vector \"a\" \"b\")     ; => [\"a\" \"b\"]\n```",
+      "syntax": "(vector x ...)"
     },
     {
       "name": "vector->list",
@@ -9973,6 +11003,13 @@
       "module": "vectors",
       "section": "Predicates & Introspection",
       "summary": "Test whether a value is a vector.",
+      "params": [
+        {
+          "name": "x",
+          "type": "any"
+        }
+      ],
+      "returns": "bool",
       "examples": [
         "(vector? [1 2 3])          ; => #t\n(vector? '(1 2 3))         ; => #f\n(vector? 42)               ; => #f"
       ],
@@ -10054,6 +11091,14 @@
       "module": "web-server",
       "section": "Response Helpers",
       "summary": "Return 200 with a JSON-encoded body.",
+      "params": [
+        {
+          "name": "body",
+          "type": "any",
+          "doc": "value JSON-encoded into the response body"
+        }
+      ],
+      "returns": "map",
       "examples": [
         "(pprint (http/ok {:message \"success\"}))\n; => {:body \"{\"message\":\"success\"}\"\n;     :headers {\"content-type\" \"application/json\"}\n;     :status 200}\n\n(pprint (http/ok [1 2 3]))\n; => {:body \"[1,2,3]\" :headers {\"content-type\" \"application/json\"} :status 200}"
       ],

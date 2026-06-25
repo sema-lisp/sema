@@ -2,6 +2,8 @@
 name: "nil?"
 module: "predicates"
 section: "Emptiness Predicates"
+params: [{ name: value, type: any }]
+returns: "bool"
 ---
 
 Test if a value is `nil` specifically (not the empty list).

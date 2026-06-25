@@ -2,6 +2,8 @@
 name: "filter"
 module: "lists"
 section: "Higher-Order Functions"
+params: [{ name: pred, type: function }, { name: seq, type: list }]
+returns: "list"
 ---
 
 Return elements that satisfy a predicate.

@@ -2,6 +2,8 @@
 name: "<="
 module: "math"
 section: "Comparison"
+syntax: "(<= num ...)"
+returns: "bool"
 ---
 
 Less than or equal.

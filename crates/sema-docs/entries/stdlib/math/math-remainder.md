@@ -2,6 +2,8 @@
 name: "math/remainder"
 module: "math"
 section: "Integer Math"
+params: [{ name: a, type: int }, { name: b, type: int }]
+returns: "int"
 ---
 
 Remainder after truncated division.

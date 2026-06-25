@@ -2,6 +2,8 @@
 name: "eq?"
 module: "predicates"
 section: "Equality"
+params: [{ name: a, type: any }, { name: b, type: any }]
+returns: "bool"
 ---
 
 Test structural equality. `equal?` is an alias.

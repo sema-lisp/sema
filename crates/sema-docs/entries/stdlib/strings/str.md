@@ -2,6 +2,8 @@
 name: "str"
 module: "strings"
 section: "Scheme Compatibility Aliases"
+syntax: "(str value ...)"
+returns: "string"
 ---
 
 Convert any value to its string representation.

@@ -2,6 +2,8 @@
 name: "vector"
 module: "vectors"
 section: "Construction"
+syntax: "(vector x ...)"
+returns: "vector"
 ---
 
 Create a vector from its arguments.

@@ -180,7 +180,11 @@ pub fn parse_entry(
 /// blocks like ```sema\n(f x) → y\n``` are common at the top of an entry) and headings.
 fn first_paragraph(body: &str) -> String {
     let mut lines = body.lines().peekable();
-    // Skip leading blank lines and leading fenced code blocks.
+    // The first non-empty line of a leading signature block, used as a fallback summary
+    // for entries whose body is ONLY a signature (e.g. `(f x) → y`) with no prose — so
+    // such an entry still gets a non-empty summary rather than failing the strict gate.
+    let mut signature_fallback = String::new();
+    // Skip leading blank lines, leading fenced code blocks, and leading headings.
     loop {
         while matches!(lines.peek(), Some(l) if l.trim().is_empty()) {
             lines.next();
@@ -192,7 +196,13 @@ fn first_paragraph(body: &str) -> String {
                     if l.trim_start().starts_with("```") {
                         break;
                     }
+                    if signature_fallback.is_empty() && !l.trim().is_empty() {
+                        signature_fallback = l.trim().to_string();
+                    }
                 }
+            }
+            Some(l) if l.trim_start().starts_with('#') => {
+                lines.next(); // leading heading — skip to the prose that follows
             }
             _ => break,
         }
@@ -214,7 +224,11 @@ fn first_paragraph(body: &str) -> String {
         }
         out.push_str(l);
     }
-    out
+    if out.is_empty() {
+        signature_fallback
+    } else {
+        out
+    }
 }
 
 /// Extract the contents of ```sema fenced blocks from a markdown body.
@@ -343,12 +357,19 @@ pub fn dedupe(entries: &mut Vec<DocEntry>) -> Vec<String> {
     let mut warnings = Vec::new();
     entries.retain(|e| {
         let names: Vec<&String> = std::iter::once(&e.name).chain(e.aliases.iter()).collect();
-        if names
+        // Report the SPECIFIC name/alias that collided. A canonical-name-vs-other-entry's
+        // ALIAS clash would otherwise be reported only by `e.name`, hiding the real cause.
+        if let Some(clash) = names
             .iter()
-            .any(|n| seen.contains(&(e.module.clone(), n.to_string())))
+            .find(|n| seen.contains(&(e.module.clone(), n.to_string())))
         {
+            let via = if **clash == e.name {
+                String::new()
+            } else {
+                format!(" (via alias `{clash}`)")
+            };
             warnings.push(format!(
-                "dropped duplicate `{}` in module `{}`",
+                "dropped duplicate `{}`{via} in module `{}`",
                 e.name, e.module
             ));
             false

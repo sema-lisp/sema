@@ -101,3 +101,19 @@ fn validate_and_dedupe() {
         .is_empty()); // warn
     assert!(validate(&[bare], true).is_err()); // strict error
 }
+
+#[test]
+fn signature_only_body_derives_summary_from_the_signature() {
+    // A body that is ONLY a signature block (no prose) must still get a non-empty
+    // summary (else it would fail the strict gate despite being documented).
+    let src = "---\nname: \"x/y\"\n---\n```sema\n(x/y a b) → result\n```\n";
+    let e = parse_entry(&PathBuf::from("x/y.md"), src, "m", false).unwrap();
+    assert_eq!(e.summary, "(x/y a b) → result");
+}
+
+#[test]
+fn leading_heading_is_skipped_for_summary() {
+    let src = "---\nname: \"z\"\n---\n## Overview\n\nDoes the thing.\n";
+    let e = parse_entry(&PathBuf::from("z.md"), src, "m", false).unwrap();
+    assert_eq!(e.summary, "Does the thing.");
+}

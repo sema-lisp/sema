@@ -1,4 +1,4 @@
-.PHONY: all build release build-pgo pgo-profile install install-pgo uninstall test test-lsp test-embedding-bench test-http test-llm check clippy fmt fmt-check clean run lint lint-links docs docs-check update-pricing examples smoke-bytecode rag-demo test-providers fuzz fuzz-reader fuzz-eval fuzz-grammar fuzz-grammar-emit setup bench-1m bench-10m bench-100m site-dev site-build site-preview site-deploy deploy coverage coverage-html bench bench-vm bench-save bench-suite bench-closure bench-numeric bench-compare bench-baseline profile profile-vm ts-setup ts-generate ts-test ts-playground js-lib-build js-lib-dev
+.PHONY: all build release build-pgo pgo-profile install install-pgo uninstall test test-lsp test-embedding-bench test-http test-llm check clippy fmt fmt-check clean run lint lint-links docs docs-check update-pricing examples smoke-bytecode rag-demo test-providers fuzz fuzz-reader fuzz-eval fuzz-grammar fuzz-grammar-emit setup docs-search-gate bench-1m bench-10m bench-100m site-dev site-build site-preview site-deploy deploy coverage coverage-html bench bench-vm bench-save bench-suite bench-closure bench-numeric bench-compare bench-baseline profile profile-vm ts-setup ts-generate ts-test ts-playground js-lib-build js-lib-dev
 build:
 	cargo build
 
@@ -129,6 +129,11 @@ example-notebook-serve: build
 
 smoke-bytecode: build
 	@./scripts/smoke-bytecode.sh ./target/debug/sema
+
+# Hermetic gate: docs_search must work from the binary alone in a FROM-scratch
+# container (no source, no uncompiled docs, --network none). Requires docker + jq.
+docs-search-gate:
+	@./scripts/docs-search-gate.sh
 
 test-providers: build
 	@echo "=== Testing all LLM providers ==="

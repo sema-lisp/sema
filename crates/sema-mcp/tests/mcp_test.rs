@@ -90,6 +90,7 @@ async fn test_mcp_initialize_and_tools_list() {
             assert!(tool_names.contains(&"disasm"));
             assert!(tool_names.contains(&"build"));
             assert!(tool_names.contains(&"info"));
+            assert!(tool_names.contains(&"docs_search"));
             assert!(tool_names.contains(&"notebook/new"));
 
             // 3. Send tools/call for eval
@@ -775,6 +776,97 @@ async fn test_mcp_deftool_arg_validation() {
                 "error should distinguish explicit null: {}",
                 result_text(&r)
             );
+
+            drop(server_write);
+            server_task.await.unwrap().unwrap();
+        })
+        .await;
+}
+
+/// docs_search returns a JSON array of relevant hits for a natural-language query,
+/// with no LLM/network involved. The same code path runs in the FROM-scratch Docker
+/// gate; the assertions here mirror it (non-empty text, relevant symbol, anti-stub).
+#[tokio::test]
+async fn test_mcp_docs_search() {
+    let (client_read, mut server_write) = tokio::io::duplex(8192);
+    let (mut server_read, client_write) = tokio::io::duplex(8192);
+    let interpreter = Interpreter::new();
+
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async move {
+            let server_task = tokio::task::spawn_local(async move {
+                run_mcp_server_on(client_read, client_write, interpreter, None, None).await
+            });
+            let mut reader = tokio::io::BufReader::new(&mut server_read);
+            let mut line = String::new();
+
+            // (a) Descriptive query → ranked hits as a JSON array; `map` is relevant.
+            call_tool(
+                &mut server_write,
+                1,
+                "docs_search",
+                json!({ "query": "apply a function to every element of a list" }),
+            )
+            .await;
+            let r = read_resp(&mut reader, &mut line).await;
+            assert!(!is_error(&r), "docs_search must not error: {r}");
+            assert_eq!(
+                r["result"]["content"][0]["type"], "text",
+                "content must be a text block: {r}"
+            );
+            let text = result_text(&r);
+            assert!(!text.trim().is_empty(), "result text must be non-empty");
+            let hits: serde_json::Value =
+                serde_json::from_str(&text).expect("docs_search result must be valid JSON");
+            let arr = hits.as_array().expect("result must be a JSON array");
+            assert!(!arr.is_empty(), "expected at least one hit");
+            assert!(
+                arr.iter().any(|h| h["name"] == "map"),
+                "expected `map` among hits, got: {text}"
+            );
+
+            // (b) Relevance + anti-stub: a real symbol surfaces, not an echo of the query.
+            call_tool(
+                &mut server_write,
+                2,
+                "docs_search",
+                json!({ "query": "decode a json string into a value" }),
+            )
+            .await;
+            let r = read_resp(&mut reader, &mut line).await;
+            assert!(!is_error(&r), "docs_search (json) must not error: {r}");
+            let text = result_text(&r);
+            let arr: serde_json::Value = serde_json::from_str(&text).unwrap();
+            assert!(
+                arr.as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|h| h["name"].as_str().unwrap_or("").starts_with("json/")),
+                "expected a json/* entry, got: {text}"
+            );
+
+            // (c) `limit` is honored.
+            call_tool(
+                &mut server_write,
+                3,
+                "docs_search",
+                json!({ "query": "operate on a list", "limit": 2 }),
+            )
+            .await;
+            let r = read_resp(&mut reader, &mut line).await;
+            assert!(!is_error(&r), "docs_search (limit) must not error: {r}");
+            let arr: serde_json::Value = serde_json::from_str(&result_text(&r)).unwrap();
+            assert!(
+                arr.as_array().unwrap().len() <= 2,
+                "limit=2 must be honored, got {}",
+                arr.as_array().unwrap().len()
+            );
+
+            // (d) Missing required `query` → error.
+            call_tool(&mut server_write, 4, "docs_search", json!({})).await;
+            let r = read_resp(&mut reader, &mut line).await;
+            assert!(is_error(&r), "missing query must error: {r}");
 
             drop(server_write);
             server_task.await.unwrap().unwrap();

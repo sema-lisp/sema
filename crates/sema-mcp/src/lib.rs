@@ -1,4 +1,5 @@
 pub mod builtin_docs;
+pub mod docs_search;
 pub mod notebook;
 pub mod protocol;
 pub mod server;

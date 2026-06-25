@@ -1,0 +1,19 @@
+# Hermetic acceptance gate for the `docs_search` MCP tool.
+#
+# Proves docs_search works from the compiled binary ALONE: the runtime stage is
+# `FROM scratch` and copies ONLY the static `sema` binary — no repo source, no
+# uncompiled docs (crates/sema-docs/entries, website/docs), no examples, no certs.
+# If docs_search depended on anything outside the binary, it would fail here.
+# Driven by scripts/docs-search-gate.sh under `docker run --network none`.
+
+# Stage 1: build a fully static musl binary.
+FROM rust:alpine AS builder
+RUN apk add --no-cache musl-dev
+WORKDIR /build
+COPY . .
+RUN cargo build --release --locked -p sema-lang && strip target/release/sema
+
+# Stage 2: nothing but the binary.
+FROM scratch
+COPY --from=builder /build/target/release/sema /usr/local/bin/sema
+ENTRYPOINT ["sema"]

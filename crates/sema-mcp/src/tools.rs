@@ -619,6 +619,14 @@ pub fn list_mcp_tools(
             "type": "object",
             "properties": {}
         })),
+        ("docs_search", "Search Sema documentation by natural-language query (e.g. 'reverse a list', 'read file lines'). Returns the most relevant builtins/special forms ranked by relevance, as a JSON array of {name, module, summary, score}. Use this to discover the right function or syntax when you don't already know its name; use `docs` for the full docs of a known symbol.", json!({
+            "type": "object",
+            "properties": {
+                "query": { "type": "string", "description": "What you're looking for, in plain words (e.g. 'parse json string', 'spawn an async task')." },
+                "limit": { "type": "integer", "description": "Maximum number of results to return (default 5, max 25)." }
+            },
+            "required": ["query"]
+        })),
     ];
 
     for (name, desc, schema) in default_tool_list {
@@ -1003,6 +1011,25 @@ fn call_mcp_tool_inner(
             match get_builtin_doc(symbol) {
                 Some(doc) => success_result(doc.clone()),
                 None => error_result(format!("No documentation found for symbol: {symbol}")),
+            }
+        }
+        "docs_search" => {
+            let query = match arguments.get("query").and_then(|v| v.as_str()) {
+                Some(q) => q,
+                None => return error_result("Missing required parameter: query"),
+            };
+            let limit = arguments
+                .get("limit")
+                .and_then(|v| v.as_u64())
+                .map(|n| n as usize)
+                .unwrap_or(crate::docs_search::DEFAULT_LIMIT);
+            let hits = crate::docs_search::search(query, limit);
+            if hits.is_empty() {
+                return success_result(format!("No documentation matched query: {query}"));
+            }
+            match serde_json::to_string_pretty(&hits) {
+                Ok(json) => success_result(json),
+                Err(e) => error_result(format!("Failed to serialize search results: {e}")),
             }
         }
         "fmt" => {

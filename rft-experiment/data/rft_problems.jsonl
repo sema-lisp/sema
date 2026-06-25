@@ -1,0 +1,1037 @@
+{"prompt": "Evaluate this Sema expression:\n(string/to-float \"3.14\")", "expected": "3.14", "category": "string"}
+{"prompt": "Evaluate this Sema expression:\n(length (prompt/messages (prompt/concat (prompt (user \"a\")) (prompt (assistant \"b\")))))", "expected": "2", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(flatten '(1 (2 3) (4 5)))", "expected": "(1 2 3 4 5)", "category": "other"}
+{"prompt": "Evaluate this Sema expression:\n(count (map/filter (fn (k v) (> v 1)) (hash-map :a 1 :b 2 :c 3)))", "expected": "2", "category": "map"}
+{"prompt": "Evaluate this Sema expression:\n(drop-while even? '())", "expected": "()", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(begin (define (factorial n) (if (<= n 1) 1 (* n (factorial (- n 1))))) (factorial 10))", "expected": "3628800", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n\n        (let ((t (toml/decode \"debug = true\")))\n          (:debug t))\n    ", "expected": "#t", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(time/format (time/parse \"1969-12-31 23:59:59\" \"%Y-%m-%d %H:%M:%S\") \"%Y-%m-%d\")", "expected": "\"1969-12-31\"", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(let ((< >)) (< 1 2))", "expected": "#f", "category": "binding"}
+{"prompt": "Evaluate this Sema expression:\n(eq? -0.0 0.0)", "expected": "#t", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(any? odd? (list 1 2 3))", "expected": "#t", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(try 42 (catch e 0))", "expected": "42", "category": "error-handling"}
+{"prompt": "Evaluate this Sema expression:\n(list? '(1 2))", "expected": "#t", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(+ 1 2.0)", "expected": "3.0", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(get (pio/delay 7 (pio/nop)) :delay)", "expected": "7", "category": "map"}
+{"prompt": "Evaluate this Sema expression:\n(abs -5)", "expected": "5", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(string/to-number \"42\")", "expected": "42", "category": "string"}
+{"prompt": "Evaluate this Sema expression:\n(i64-array/fold (fn (acc x) (* acc x)) 1 (i64-array 2 3 4))", "expected": "24", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(length (keys (hash-map :a 1 :b 2)))", "expected": "2", "category": "map"}
+{"prompt": "Evaluate this Sema expression:\n(otel/span \"x\" (fn () (+ 40 2)))", "expected": "42", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(json/encode nil)", "expected": "\"null\"", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(time/parse \"2024-01-01 00:00:00\" \"%Y-%m-%d %H:%M:%S\")", "expected": "1704067200.0", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(length (json/decode \"[1,2,3]\"))", "expected": "3", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(list/duplicates '())", "expected": "()", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(list/min '(-3 -1 -2))", "expected": "-3", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(length (rest [1 2 3]))", "expected": "2", "category": "other"}
+{"prompt": "Evaluate this Sema expression:\n(list/avg '(10))", "expected": "10.0", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(char? #\\a)", "expected": "#t", "category": "other"}
+{"prompt": "Evaluate this Sema expression:\n(list/max '(5))", "expected": "5", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(i64-array/length (i64-array/map (fn (x) (* x x)) (i64-array)))", "expected": "0", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(procedure? (fn (x) x))", "expected": "#t", "category": "binding"}
+{"prompt": "Evaluate this Sema expression:\n(list/split-at '(1 2 3) 3)", "expected": "((1 2 3) ())", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(list/cross-join '() '(1 2))", "expected": "()", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(let (([a b & rest] '(1 2))) rest)", "expected": "()", "category": "binding"}
+{"prompt": "Evaluate this Sema expression:\n(string->number \"3.14\")", "expected": "3.14", "category": "string"}
+{"prompt": "Evaluate this Sema expression:\n(stream/available? (stream/from-string \"x\"))", "expected": "#t", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(with-stream (s (stream/from-string \"hello\")) (utf8->string (stream/read-all s)))", "expected": "\"hello\"", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(string-join '(\"a\" \"b\" \"c\") \",\")", "expected": "\"a,b,c\"", "category": "string"}
+{"prompt": "Evaluate this Sema expression:\n(assv 5 '((1 10) (2 20)))", "expected": "#f", "category": "other"}
+{"prompt": "Evaluate this Sema expression:\n(filter #(> % 3) '(1 2 3 4 5))", "expected": "(4 5)", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(reverse '())", "expected": "()", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(term/rgb \"hi\" 255 100 0)", "expected": "\"\u001b[38;2;255;100;0mhi\u001b[0m\"", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(list/diff '(1 2 3) '(1 2 3))", "expected": "()", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n\n        (begin\n          (defmulti op (fn (x) (get x :kind)))\n          (defmethod op :add (fn (x) (+ (get x :a) (get x :b))))\n          (let ((r1 (op {:kind :add :a 1 :b 2})))\n            (defmethod op :mul (fn (x) (* (get x :a) (get x :b))))\n            (+ r1 (op {:kind :mul :a 3 :b 4}))))\n    ", "expected": "15", "category": "map"}
+{"prompt": "Evaluate this Sema expression:\n(eval (read \"(+ 10 20)\"))", "expected": "30", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(get (pio/nop) :dest)", "expected": ":y", "category": "map"}
+{"prompt": "Evaluate this Sema expression:\n(begin (define x 0) (case 1 ((1) (set! x 7) x) (else 0)))", "expected": "7", "category": "binding"}
+{"prompt": "Evaluate this Sema expression:\n\n        (begin\n          (define c 0)\n          (define (tick) (set! c (+ c 1)) #t)\n          (match '(1 2)\n            ([a b d] when (tick) :bad)\n            (_ c)))\n    ", "expected": "0", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(prompt? 42)", "expected": "#f", "category": "other"}
+{"prompt": "Evaluate this Sema expression:\n(= 42 42)", "expected": "#t", "category": "other"}
+{"prompt": "Evaluate this Sema expression:\n(count (hashmap/to-map (hashmap/new :a 1 :b 2)))", "expected": "2", "category": "map"}
+{"prompt": "Evaluate this Sema expression:\n(+ 100 200)", "expected": "300", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(term/red \"error\")", "expected": "\"\u001b[31merror\u001b[0m\"", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(or #f #f 3)", "expected": "3", "category": "other"}
+{"prompt": "Evaluate this Sema expression:\n(json/encode {:a [1 2]})", "expected": "\"{\\\"a\\\":[1,2]}\"", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(count (map/select-keys {:a 1 :b 2 :c 3} '(:a :c)))", "expected": "2", "category": "map"}
+{"prompt": "Evaluate this Sema expression:\n\n        (begin\n          (defmacro my-bind (val body)\n            `(let ((tmp# ,val)) (+ tmp# tmp#)))\n          (my-bind 21 nil))\n    ", "expected": "42", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(length (prompt/messages (prompt/append (prompt (user \"a\")) (prompt (assistant \"b\")))))", "expected": "2", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(term/strip (term/bold \"hello\"))", "expected": "\"hello\"", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(get (pio/mov :x :!y) :source)", "expected": ":!y", "category": "map"}
+{"prompt": "Evaluate this Sema expression:\n(string-length \"h\u00e9llo\")", "expected": "5", "category": "string"}
+{"prompt": "Evaluate this Sema expression:\n\n        (begin\n          (define x# 42)\n          x#)\n    ", "expected": "42", "category": "binding"}
+{"prompt": "Evaluate this Sema expression:\n(f64-array/sum (f64-array/range 1 4))", "expected": "6.0", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(char-alphabetic? #\\a)", "expected": "#t", "category": "string"}
+{"prompt": "Evaluate this Sema expression:\n(begin (define [a b c] '(1 2 3)) (+ a b c))", "expected": "6", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(list/dedupe '(5 5 5))", "expected": "(5)", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n\n        (begin\n          (define c 0)\n          (match '(1)\n            ([x] when (begin (set! c (+ c 1)) #f) :no)\n            ([x] c)))\n    ", "expected": "1", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(symbol? 'foo)", "expected": "#t", "category": "other"}
+{"prompt": "Evaluate this Sema expression:\n(list/split-at '(1 2 3) 0)", "expected": "(() (1 2 3))", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(text/truncate \"hello\" 10)", "expected": "\"hello\"", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(get (time/date-parts 1704067200.0) :minute)", "expected": "0", "category": "map"}
+{"prompt": "Evaluate this Sema expression:\n(if #f :truthy :falsy)", "expected": ":falsy", "category": "control-flow"}
+{"prompt": "Evaluate this Sema expression:\n(list/sliding '(1 2 3 4 5) 3)", "expected": "((1 2 3) (2 3 4) (3 4 5))", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(string->number \"3.14\")", "expected": "3.14", "category": "string"}
+{"prompt": "Evaluate this Sema expression:\n(length (list/drop-last 9 (list 1 2)))", "expected": "0", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(i64-array/fold + 42 (i64-array))", "expected": "42", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(conversation/system (conversation/add-message (conversation/new) :system \"be helpful\"))", "expected": "\"be helpful\"", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(list/chunk 2 '(1 2 3 4))", "expected": "((1 2) (3 4))", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(begin\n        (define (outer n)\n          (define (even? x) (if (= x 0) #t (odd? (- x 1))))\n          (define (odd? x) (if (= x 0) #f (even? (- x 1))))\n          (even? n))\n        (outer 10))", "expected": "#t", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(as-> 5 x (+ x 3) (* x x) (- x 1))", "expected": "63", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(length [1 2 3])", "expected": "3", "category": "other"}
+{"prompt": "Evaluate this Sema expression:\n(regex/replace-all \"\\\\s+\" \" \" \"a  b   c\")", "expected": "\"a b c\"", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(let (([a & rest] '(1 2 3))) rest)", "expected": "(2 3)", "category": "binding"}
+{"prompt": "Evaluate this Sema expression:\n(f64-array? 42)", "expected": "#f", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(length (embedding/->list (embedding/list->embedding '(1.0 2.0 3.0))))", "expected": "3", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(list/min '(3 1.5 2))", "expected": "1.5", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(type {:a 1})", "expected": ":map", "category": "other"}
+{"prompt": "Evaluate this Sema expression:\n(list/avg '(2 4 6))", "expected": "4.0", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(get (time/date-parts (time/parse \"2024-03-10 12:00:00\" \"%Y-%m-%d %H:%M:%S\")) :hour)", "expected": "12", "category": "map"}
+{"prompt": "Evaluate this Sema expression:\n(match #t (#t \"yes\") (#f \"no\"))", "expected": "\"yes\"", "category": "control-flow"}
+{"prompt": "Evaluate this Sema expression:\n(let ((>= <=)) (>= 5 3))", "expected": "#f", "category": "binding"}
+{"prompt": "Evaluate this Sema expression:\n(begin (define (make-adder n) (lambda (x) (+ n x))) ((make-adder 5) 3))", "expected": "8", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(assq 1 '())", "expected": "#f", "category": "other"}
+{"prompt": "Evaluate this Sema expression:\n(do ((i 0 (+ i 1))) ((= i 0) i))", "expected": "0", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(retry (lambda () 42) {:max-attempts 3})", "expected": "42", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(length (conversation/messages (conversation/filter (conversation/new) (fn (m) #t))))", "expected": "0", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(begin\n        (define (outer x)\n          (define scale 10)\n          (define (helper y) (* y scale))\n          (helper x))\n        (outer 5))", "expected": "50", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(get (hash-map :x 1 :y 2) :x)", "expected": "1", "category": "map"}
+{"prompt": "Evaluate this Sema expression:\n(let* (([a b] '(1 2)) (c (+ a b))) c)", "expected": "3", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(begin (context/set :x \"outer\") (context/with {:x \"inner\"} (lambda () (context/get :x))))", "expected": "\"inner\"", "category": "map"}
+{"prompt": "Evaluate this Sema expression:\n(match '(1 2 3 4) ([a & rest] rest))", "expected": "(2 3 4)", "category": "control-flow"}
+{"prompt": "Evaluate this Sema expression:\n(bytevector/ref (bytevector 10 20 30) 1)", "expected": "20", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(list/dedupe '(1 2 3))", "expected": "(1 2 3)", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(<= 2 2)", "expected": "#t", "category": "other"}
+{"prompt": "Evaluate this Sema expression:\n\n        (match {:a {:b 42}}\n          ({:a {:b v}} v)\n          (_ nil))\n    ", "expected": "42", "category": "control-flow"}
+{"prompt": "Evaluate this Sema expression:\n(mod 10 3)", "expected": "1", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(substring \"hello\" 1 3)", "expected": "\"el\"", "category": "other"}
+{"prompt": "Evaluate this Sema expression:\n(get (merge {:a 1} (hash-map :b 2)) :b)", "expected": "2", "category": "map"}
+{"prompt": "Evaluate this Sema expression:\n(cons 1 '(2 3))", "expected": "(1 2 3)", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(get (dissoc (hash-map :a 1 :b 2) :a) :b)", "expected": "2", "category": "map"}
+{"prompt": "Evaluate this Sema expression:\n(regex/match? #\"[a-z]+\" \"hello\")", "expected": "#t", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(string/lower \"HELLO\")", "expected": "\"hello\"", "category": "string"}
+{"prompt": "Evaluate this Sema expression:\n(time/format (time/add (time/parse \"2024-01-02 00:00:00\" \"%Y-%m-%d %H:%M:%S\") -86400) \"%Y-%m-%d %H:%M:%S\")", "expected": "\"2024-01-01 00:00:00\"", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(f64-array/ref (f64-array/set! (f64-array 1.0 2.0 3.0) 1 9.5) 0)", "expected": "1.0", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(let ((s (stream/byte-buffer))) (eq? s s))", "expected": "#t", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(type nil)", "expected": ":nil", "category": "other"}
+{"prompt": "Evaluate this Sema expression:\n(base64/decode (base64/encode \"Sema Lisp\"))", "expected": "\"Sema Lisp\"", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(text/normalize-newlines \"a\\r\\nb\\rc\")", "expected": "\"a\\nb\\nc\"", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(hashmap/contains? (hashmap/new :a 1) :b)", "expected": "#f", "category": "map"}
+{"prompt": "Evaluate this Sema expression:\n(begin (context/push :trail \"a\") (context/push :trail \"b\") (length (context/stack :trail)))", "expected": "2", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(get (time/date-parts 1704067200.0) :month)", "expected": "1", "category": "map"}
+{"prompt": "Evaluate this Sema expression:\n(conversation/token-count (conversation/new))", "expected": "0", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(take-while even? '())", "expected": "()", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(+ 9223372036854775807 1)", "expected": "-9223372036854775808", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(map (fn (x) (* x x)) (list 1 2 3))", "expected": "(1 4 9)", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(json/encode \"hello\")", "expected": "\"\\\"hello\\\"\"", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(type 3.14)", "expected": ":float", "category": "other"}
+{"prompt": "Evaluate this Sema expression:\n(vector? (vector))", "expected": "#t", "category": "other"}
+{"prompt": "Evaluate this Sema expression:\n(json/encode #t)", "expected": "\"true\"", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(let (([a {:keys [b]}] (list 1 {:b 2}))) (+ a b))", "expected": "3", "category": "map"}
+{"prompt": "Evaluate this Sema expression:\n(if #t 1 2)", "expected": "1", "category": "control-flow"}
+{"prompt": "Evaluate this Sema expression:\n(get-in (update-in {:a {:b 10}} [:a :b] (fn (x) (+ x 1))) [:a :b])", "expected": "11", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(regex/replace \"\\\\d+\" \"X\" \"a1b2c3\")", "expected": "\"aXb2c3\"", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(force (delay 42))", "expected": "42", "category": "other"}
+{"prompt": "Evaluate this Sema expression:\n(positive? 5)", "expected": "#t", "category": "other"}
+{"prompt": "Evaluate this Sema expression:\n(get (hashmap/assoc (hashmap/new :a 1) :b 2) :b)", "expected": "2", "category": "map"}
+{"prompt": "Evaluate this Sema expression:\n(+ 3 (let ((+ *)) (+ 2 5)) )", "expected": "13", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(let ((= (lambda (a b) (string-append (number->string a) (number->string b))))) (= 1 2))", "expected": "\"12\"", "category": "string"}
+{"prompt": "Evaluate this Sema expression:\n(i64-array/sum (i64-array/range 0 10 2))", "expected": "20", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(char/downcase #\\A)", "expected": "#\\a", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(begin (define x 42) (car (cdr `(a ,x b))))", "expected": "42", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(begin (defun square (x) (* x x)) (square 5))", "expected": "25", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n\n        (let ((t (toml/decode \"tags = [\\\"a\\\", \\\"b\\\"]\")))\n          (length (:tags t)))\n    ", "expected": "2", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(member 2 '(1 2 3))", "expected": "(2 3)", "category": "other"}
+{"prompt": "Evaluate this Sema expression:\n(json/encode 3.14)", "expected": "\"3.14\"", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(floor 3.7)", "expected": "3", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(hashmap/get (hash-map :a 1) :b 99)", "expected": "99", "category": "map"}
+{"prompt": "Evaluate this Sema expression:\n\n        (define (find-user id) (if (= id 1) \"Alice\" #f))\n        (match {:method :GET :path \"/users\"}\n          ({:method :GET :path \"/users\" :id id} when (find-user id)\n            (find-user id))\n          ({:method :GET :path \"/users\" :id id}\n            \"not-found\")\n          ({:method :GET :path \"/users\"}\n            \"all\")\n          (_ \"404\"))\n    ", "expected": "\"all\"", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(list/page '() 1 10)", "expected": "()", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(get (pio/assemble (list (pio/mov :x :y))) :instructions)", "expected": "#u8(34 160)", "category": "map"}
+{"prompt": "Evaluate this Sema expression:\n(text/word-count \"hello world foo bar\")", "expected": "4", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(begin (deftool greet \"Greet\" {:name {:type :string}} (lambda (name) name)) (defagent greeter {:system \"You greet.\" :tools [greet]}) (agent/system greeter))", "expected": "\"You greet.\"", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(count (hashmap/assoc (hashmap/new :a 1) :b 2 :c 3))", "expected": "3", "category": "map"}
+{"prompt": "Evaluate this Sema expression:\n(time/parse \"1970-01-01 00:00:00\" \"%Y-%m-%d %H:%M:%S\")", "expected": "0.0", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(count (map/select-keys {:a 1 :b 2} [:a]))", "expected": "1", "category": "map"}
+{"prompt": "Evaluate this Sema expression:\n(hashmap/get (hash-map :a 1) :a)", "expected": "1", "category": "map"}
+{"prompt": "Evaluate this Sema expression:\n(list/cross-join '(1 2) '(3 4))", "expected": "((1 3) (1 4) (2 3) (2 4))", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(list/intersect '() '(1 2))", "expected": "()", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(symbol/to-string 'foo)", "expected": "\"foo\"", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(i64-array/sum (i64-array/range 0 5))", "expected": "10", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(i64-array? \"hello\")", "expected": "#f", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(utf8->string (string->utf8 \"hello\"))", "expected": "\"hello\"", "category": "string"}
+{"prompt": "Evaluate this Sema expression:\n(string/lower \"HELLO\")", "expected": "\"hello\"", "category": "string"}
+{"prompt": "Evaluate this Sema expression:\n(procedure? 1)", "expected": "#f", "category": "other"}
+{"prompt": "Evaluate this Sema expression:\n(term/style \"text\" :bold :red)", "expected": "\"\u001b[1;31mtext\u001b[0m\"", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(filter odd? '(1 3 5))", "expected": "(1 3 5)", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(string/upper \"hello\")", "expected": "\"HELLO\"", "category": "string"}
+{"prompt": "Evaluate this Sema expression:\n(integer/to-char 97)", "expected": "#\\a", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(> e 2.71)", "expected": "#t", "category": "other"}
+{"prompt": "Evaluate this Sema expression:\n(term/cyan \"info\")", "expected": "\"\u001b[36minfo\u001b[0m\"", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(empty? '())", "expected": "#t", "category": "other"}
+{"prompt": "Evaluate this Sema expression:\n(llm/similarity (embedding/list->embedding '(1.0 0.0)) (embedding/list->embedding '(0.0 1.0)))", "expected": "0.0", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(begin (define (outer) (define (a) (b)) (define (b) 42) (a)) (outer))", "expected": "42", "category": "binding"}
+{"prompt": "Evaluate this Sema expression:\n(begin\n    (define (test)\n      (define n 42)\n      (map (lambda (x) n) (list 1 2 3)))\n    (test))", "expected": "(42 42 42)", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(fold + 0 '(1 2 3))", "expected": "6", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(char-upcase #\\a)", "expected": "#\\A", "category": "string"}
+{"prompt": "Evaluate this Sema expression:\n(get (pio/nop) :op)", "expected": ":mov", "category": "map"}
+{"prompt": "Evaluate this Sema expression:\n\n        (begin\n          (defmacro add-one (expr)\n            `(let ((tmp# ,expr)) (+ tmp# 1)))\n          (add-one 41))\n    ", "expected": "42", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(match 99 (1 \"one\") (2 \"two\") (_ \"other\"))", "expected": "\"other\"", "category": "control-flow"}
+{"prompt": "Evaluate this Sema expression:\n(type-of 42)", "expected": ":int", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(length (prompt/messages (prompt (system \"be helpful\") (user \"hello\") (assistant \"hi\"))))", "expected": "3", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(if 0 :truthy :falsy)", "expected": ":truthy", "category": "control-flow"}
+{"prompt": "Evaluate this Sema expression:\n(let ((outer nil)) (with-stream (s (stream/from-string \"x\")) (set! outer s)) (stream? outer))", "expected": "#t", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(begin\n    (define captured #f)\n    (define (setup)\n      (define x 10)\n      (set! captured (lambda () x))\n      (set! x 20)\n      :done)\n    (setup)\n    (captured))", "expected": "20", "category": "binding"}
+{"prompt": "Evaluate this Sema expression:\n(string/ends-with? \"hello\" \"llo\")", "expected": "#t", "category": "string"}
+{"prompt": "Evaluate this Sema expression:\n(term/dim \"text\")", "expected": "\"\u001b[2mtext\u001b[0m\"", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(first (string/lines \"x\\ny\"))", "expected": "\"x\"", "category": "string"}
+{"prompt": "Evaluate this Sema expression:\n(cadar '((1 2 3) 4))", "expected": "2", "category": "other"}
+{"prompt": "Evaluate this Sema expression:\n(spy \"test\" 42)", "expected": "42", "category": "other"}
+{"prompt": "Evaluate this Sema expression:\n(begin\n        (define (outer)\n          (letrec ((f (lambda (n) (if (= n 0) (g) (f (- n 1))))))\n            (define (g) 99)\n            (f 3)))\n        (outer))", "expected": "99", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(string? (hash/md5 \"test\"))", "expected": "#t", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(let ((c 0)) (sort-by (fn (x) (set! c (+ c 1)) x) (list 3 1 2)) c)", "expected": "3", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(begin (define [{:keys [a]} b] (list {:a 10} 20)) (+ a b))", "expected": "30", "category": "map"}
+{"prompt": "Evaluate this Sema expression:\n(match :ok (:ok \"success\") (:err \"failure\"))", "expected": "\"success\"", "category": "control-flow"}
+{"prompt": "Evaluate this Sema expression:\n(length (string/lines \"a\\nb\\r\\nc\\n\"))", "expected": "3", "category": "string"}
+{"prompt": "Evaluate this Sema expression:\n\n        (match {:x 5}\n          ({:x n} when (> n 10) :big)\n          ({:x n} when (> n 0) :pos)\n          (_ :no))\n    ", "expected": ":pos", "category": "control-flow"}
+{"prompt": "Evaluate this Sema expression:\n(begin (deftool greet \"Greet\" {:name {:type :string}} (lambda (name) name)) (defagent greeter {:system \"You greet.\" :tools [greet]}) (agent? greeter))", "expected": "#t", "category": "binding"}
+{"prompt": "Evaluate this Sema expression:\n(math/clamp 15 0 10)", "expected": "10", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(list/sliding '() 2)", "expected": "()", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(begin (define x 1) (set! x 2) x)", "expected": "2", "category": "binding"}
+{"prompt": "Evaluate this Sema expression:\n(string-append \"a\" \"b\" \"c\" \"d\")", "expected": "\"abcd\"", "category": "string"}
+{"prompt": "Evaluate this Sema expression:\n(utf8/to-string (string/to-utf8 \"hello\"))", "expected": "\"hello\"", "category": "string"}
+{"prompt": "Evaluate this Sema expression:\n(begin (define {:keys [name age]} {:name \"Alice\" :age 30}) age)", "expected": "30", "category": "map"}
+{"prompt": "Evaluate this Sema expression:\n(list/interleave '(1 3 5) '(2 4 6))", "expected": "(1 2 3 4 5 6)", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(try (try (throw 42) (catch e (throw (+ 1 (get e :value))))) (catch e2 (get e2 :value)))", "expected": "43", "category": "map"}
+{"prompt": "Evaluate this Sema expression:\n(bytevector? (bytevector 1 2 3))", "expected": "#t", "category": "other"}
+{"prompt": "Evaluate this Sema expression:\n(drop-while even? '(2 4 5 6))", "expected": "(5 6)", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(assert= 42 42)", "expected": "#t", "category": "other"}
+{"prompt": "Evaluate this Sema expression:\n(time/format 1704067200.0 \"%H:%M:%S\")", "expected": "\"00:00:00\"", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(integer? 42)", "expected": "#t", "category": "other"}
+{"prompt": "Evaluate this Sema expression:\n(any odd? '(2 4 5 6))", "expected": "#t", "category": "other"}
+{"prompt": "Evaluate this Sema expression:\n\n        (begin\n          (defmacro my-inc (expr)\n            `(let ((v# ,expr)) (+ v# 1)))\n          (my-inc (my-inc 10)))\n    ", "expected": "12", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(list/split-at '(1 2 3 4 5) 3)", "expected": "((1 2 3) (4 5))", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(list/sum '(-1 -2 3))", "expected": "0", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n((lambda (x) (define y 2) (* x y)) 5)", "expected": "10", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(every? odd? '(1 3 5))", "expected": "#t", "category": "other"}
+{"prompt": "Evaluate this Sema expression:\n(drop-while even? '(1 2 4))", "expected": "(1 2 4)", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(vector? (vector 1 2 3))", "expected": "#t", "category": "other"}
+{"prompt": "Evaluate this Sema expression:\n(char-numeric? #\\5)", "expected": "#t", "category": "string"}
+{"prompt": "Evaluate this Sema expression:\n(count (merge))", "expected": "0", "category": "other"}
+{"prompt": "Evaluate this Sema expression:\n(max 3 1 2)", "expected": "3", "category": "other"}
+{"prompt": "Evaluate this Sema expression:\n(list/dedupe '(42))", "expected": "(42)", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(list/join '(1) \", \")", "expected": "\"1\"", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(list/chunk 2 '(1 2 3 4 5))", "expected": "((1 2) (3 4) (5))", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(get-in (deep-merge {:a {:b 1 :c 2}} {:a {:b 99}}) [:a :b])", "expected": "99", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(regex/match? #\"^hello$\" \"hello\")", "expected": "#t", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(prompt/render \"{{x}} and {{x}}\" {:x \"hi\"})", "expected": "\"hi and hi\"", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(char/whitespace? #\\space)", "expected": "#t", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(match 'hello ('hello :yes) (_ :no))", "expected": ":yes", "category": "control-flow"}
+{"prompt": "Evaluate this Sema expression:\n(* 4 5)", "expected": "20", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(list/duplicates '(1 1 1))", "expected": "(1)", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(list/take-while even? '())", "expected": "()", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(list/take-while even? '(2 4 5 6))", "expected": "(2 4)", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(or #f #f #f)", "expected": "#f", "category": "other"}
+{"prompt": "Evaluate this Sema expression:\n(count '(1 2 3))", "expected": "3", "category": "other"}
+{"prompt": "Evaluate this Sema expression:\n(length (json/decode (json/encode [1 2 3])))", "expected": "3", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(< 1 2 3 4)", "expected": "#t", "category": "other"}
+{"prompt": "Evaluate this Sema expression:\n(prompt/render \"Hello {{name}}, {{x}}.\" {:name \"Bob\"})", "expected": "\"Hello Bob, {{x}}.\"", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(do ((n 5 (- n 1)) (acc 1 (* acc n))) ((= n 0) acc))", "expected": "120", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(get (pio/set :x 31) :dest)", "expected": ":x", "category": "map"}
+{"prompt": "Evaluate this Sema expression:\n(get (time/date-parts 1704067200.0) :second)", "expected": "0", "category": "map"}
+{"prompt": "Evaluate this Sema expression:\n(abs -5)", "expected": "5", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(map #(* % %) '(1 2 3 4))", "expected": "(1 4 9 16)", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(defn add (a b) (+ a b)) (add 3 4)", "expected": "7", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(list/repeat 2 \"hi\")", "expected": "(\"hi\" \"hi\")", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(begin\n    (define (make-shared)\n      (define n 0)\n      (define inc (lambda () (set! n (+ n 1))))\n      (define get (lambda () n))\n      (list inc get))\n    (define p (make-shared))\n    ((first p))\n    ((first p))\n    ((car (cdr p))))", "expected": "2", "category": "map"}
+{"prompt": "Evaluate this Sema expression:\n(keyword->string :foo)", "expected": "\"foo\"", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n\n        (match #f\n          (#f :false)\n          (#t :true)\n          (_ :other))\n    ", "expected": ":false", "category": "control-flow"}
+{"prompt": "Evaluate this Sema expression:\n(list/page '(1 2 3 4 5) 10 2)", "expected": "()", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(let ((s (stream/from-string \"a\\nb\"))) (stream/read-line s) (stream/read-line s))", "expected": "\"b\"", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(contains? (map/map-keys (fn (k) :z) {:a 1}) :z)", "expected": "#t", "category": "map"}
+{"prompt": "Evaluate this Sema expression:\n(i64-array/length (i64-array/map (fn (x) (* x x)) (i64-array 1 2 3 4)))", "expected": "4", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(term/bold \"hello\")", "expected": "\"\u001b[1mhello\u001b[0m\"", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(stream/type (stream/byte-buffer))", "expected": "\"byte-buffer\"", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(< 1 2 2 3)", "expected": "#f", "category": "other"}
+{"prompt": "Evaluate this Sema expression:\n(get (time/date-parts (time/parse \"2024-06-15 23:59:59\" \"%Y-%m-%d %H:%M:%S\")) :second)", "expected": "59", "category": "map"}
+{"prompt": "Evaluate this Sema expression:\n(list/sum '(1 2 3))", "expected": "6", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(list/contains? (list 1 2 3) 9)", "expected": "#f", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(string/to-char \"a\")", "expected": "#\\a", "category": "string"}
+{"prompt": "Evaluate this Sema expression:\n\n        (begin\n          (defmulti area (fn (shape) (get shape :type)))\n          (defmethod area :circle (fn (s) (* 3 (get s :radius) (get s :radius))))\n          (defmethod area :rect (fn (s) (* (get s :width) (get s :height))))\n          (area {:type :circle :radius 5}))\n    ", "expected": "75", "category": "map"}
+{"prompt": "Evaluate this Sema expression:\n(cadr '(1 2 3))", "expected": "2", "category": "other"}
+{"prompt": "Evaluate this Sema expression:\n(get (car (csv/parse-maps \"a,b\\n1,2\")) :a)", "expected": "\"1\"", "category": "map"}
+{"prompt": "Evaluate this Sema expression:\n(match 5 (x when (> x 100) \"big\") (_ \"other\"))", "expected": "\"other\"", "category": "control-flow"}
+{"prompt": "Evaluate this Sema expression:\n(keyword->string :foo)", "expected": "\"foo\"", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(hashmap/get {:a 1} :a)", "expected": "1", "category": "map"}
+{"prompt": "Evaluate this Sema expression:\n(match '(1 2 3) ([a b c] (+ a b c)))", "expected": "6", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(unless #f 42)", "expected": "42", "category": "control-flow"}
+{"prompt": "Evaluate this Sema expression:\n(begin (context/set :x 1) (context/clear) (count (context/all)))", "expected": "0", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(apply + 1 2 '(3 4))", "expected": "10", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(get {:a 1} :b 99)", "expected": "99", "category": "map"}
+{"prompt": "Evaluate this Sema expression:\n(- -9223372036854775808 1)", "expected": "9223372036854775807", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(math/round-to 3.14159 2)", "expected": "3.14", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(drop-while even? '(2 4 6))", "expected": "()", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(get (json/decode \"{\\\"a\\\":1}\") :a)", "expected": "1", "category": "map"}
+{"prompt": "Evaluate this Sema expression:\n(begin (define t 0) (do ((i 0 (begin (set! t (+ t 1)) (+ i 1)))) ((= i 3) t)))", "expected": "3", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(string/slice \"hello\" 1 3)", "expected": "\"el\"", "category": "string"}
+{"prompt": "Evaluate this Sema expression:\n(list/reject even? '(1 2 3 4 5))", "expected": "(1 3 5)", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(begin\n        (define (solve n)\n          (define (try-it x) (if (ok? x) x 0))\n          (define (ok? x) (> x 0))\n          (try-it n))\n        (solve 5))", "expected": "5", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(let ((- +)) (- 3 4))", "expected": "7", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(< 1 2)", "expected": "#t", "category": "other"}
+{"prompt": "Evaluate this Sema expression:\n(number/to-string 42)", "expected": "\"42\"", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(match 42 (42 \"found\") (_ \"nope\"))", "expected": "\"found\"", "category": "control-flow"}
+{"prompt": "Evaluate this Sema expression:\n(type 'foo)", "expected": ":symbol", "category": "other"}
+{"prompt": "Evaluate this Sema expression:\n(match {:items [1 2 3]} ({:items [a & rest]} rest) (_ nil))", "expected": "(2 3)", "category": "control-flow"}
+{"prompt": "Evaluate this Sema expression:\n(try (try (error \"inner\") (catch e (error \"outer\"))) (catch e2 :recovered))", "expected": ":recovered", "category": "error-handling"}
+{"prompt": "Evaluate this Sema expression:\n(list/min '(5))", "expected": "5", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(count (map/filter (fn (k v) (> v 1)) {:a 1 :b 2 :c 3}))", "expected": "2", "category": "map"}
+{"prompt": "Evaluate this Sema expression:\n(begin\n        (define (outer)\n          (define (a) (b))\n          (define (b) (c))\n          (define (c) 99)\n          (a))\n        (outer))", "expected": "99", "category": "binding"}
+{"prompt": "Evaluate this Sema expression:\n\n        (let ((t (toml/decode \"port = 8080\")))\n          (:port t))\n    ", "expected": "8080", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(stream/read-byte (stream/from-string \"A\"))", "expected": "65", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(progn (define x 10) (define y 20) (+ x y))", "expected": "30", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(message/content (car (prompt/messages (prompt (user \"test input\")))))", "expected": "\"test input\"", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(get (merge (hash-map :a 1) {:b 2}) :b)", "expected": "2", "category": "map"}
+{"prompt": "Evaluate this Sema expression:\n(count '(1 2 3))", "expected": "3", "category": "other"}
+{"prompt": "Evaluate this Sema expression:\n(string/ref \"hello\" 0)", "expected": "#\\h", "category": "string"}
+{"prompt": "Evaluate this Sema expression:\n(get (time/date-parts 1704067200.0) :day)", "expected": "1", "category": "map"}
+{"prompt": "Evaluate this Sema expression:\n(message/content (car (prompt/messages (prompt/fill (prompt (user \"Hello {{name}}\")) {:name \"Alice\"}))))", "expected": "\"Hello Alice\"", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(let ((x (+ 3 4))) (let ((+ *)) (+ x 2)))", "expected": "14", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(list/times 5 (fn (i) (* i i)))", "expected": "(0 1 4 9 16)", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(every? odd? (list 1 2 3))", "expected": "#f", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(hashmap/get (frequencies '(1 1 2 3 3 3)) 2)", "expected": "1", "category": "map"}
+{"prompt": "Evaluate this Sema expression:\n(i64-array/ref (i64-array/set! (i64-array 10 20 30) 1 99) 0)", "expected": "10", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(caddr '(1 2 3 4))", "expected": "3", "category": "other"}
+{"prompt": "Evaluate this Sema expression:\n(begin (context/set :x 1) (context/has? :x))", "expected": "#t", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n((fn (fn) (+ fn 1)) 10)", "expected": "11", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(begin (define (foo x) (define y 10) (+ x y)) (foo 5))", "expected": "15", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(list/repeat 0 1)", "expected": "()", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(get-in (deep-merge {:a {:b 1 :c 2}} {:a {:b 99}}) [:a :c])", "expected": "2", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(even? 4)", "expected": "#t", "category": "other"}
+{"prompt": "Evaluate this Sema expression:\n(time/format (time/add (time/parse \"2024-01-01 00:00:00\" \"%Y-%m-%d %H:%M:%S\") 1) \"%Y-%m-%d %H:%M:%S\")", "expected": "\"2024-01-01 00:00:01\"", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(list/chunk 1 '(1 2 3))", "expected": "((1) (2) (3))", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\nf\"just a string\"", "expected": "\"just a string\"", "category": "f-string"}
+{"prompt": "Evaluate this Sema expression:\n(get-in (assoc-in {} [:a :b :c] 99) [:a :b :c])", "expected": "99", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(count (map/sort-keys (hash-map :b 2 :a 1)))", "expected": "2", "category": "map"}
+{"prompt": "Evaluate this Sema expression:\n(string? (hash/sha256 \"test\"))", "expected": "#t", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(stream? (stream/byte-buffer))", "expected": "#t", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(list/avg '(1 2.0 3))", "expected": "2.0", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(sort (vals {:a 1 :b 2}))", "expected": "(1 2)", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(prompt/render \"Count: {{n}}\" {:n 42})", "expected": "\"Count: 42\"", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(get (hash-map :x 1 :y 2) :y)", "expected": "2", "category": "map"}
+{"prompt": "Evaluate this Sema expression:\n(filter even? '(1 3 5))", "expected": "()", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(string/empty? \"hi\")", "expected": "#f", "category": "string"}
+{"prompt": "Evaluate this Sema expression:\n(get (document/metadata (document/create \"hello\" {:source \"x\"})) :source)", "expected": "\"x\"", "category": "map"}
+{"prompt": "Evaluate this Sema expression:\n(begin (define r1 (let ((+ *)) (+ 3 4))) (define r2 (+ 3 4)) (list r1 r2))", "expected": "(12 7)", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(def x 42) x", "expected": "42", "category": "other"}
+{"prompt": "Evaluate this Sema expression:\n(every even? '())", "expected": "#t", "category": "other"}
+{"prompt": "Evaluate this Sema expression:\n(every even? '(2 4 6))", "expected": "#t", "category": "other"}
+{"prompt": "Evaluate this Sema expression:\n(length (map/entries (hash-map :a 1 :b 2)))", "expected": "2", "category": "map"}
+{"prompt": "Evaluate this Sema expression:\n(get (pio/wait 1 :gpio 5) :polarity)", "expected": "1", "category": "map"}
+{"prompt": "Evaluate this Sema expression:\n(get (pio/assemble (list (pio/nop))) :wrap-target)", "expected": "0", "category": "map"}
+{"prompt": "Evaluate this Sema expression:\n(length (regex/split \"\\\\s+\" \"a b c\"))", "expected": "3", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(empty? \"a\")", "expected": "#f", "category": "other"}
+{"prompt": "Evaluate this Sema expression:\n(conversation? 42)", "expected": "#f", "category": "other"}
+{"prompt": "Evaluate this Sema expression:\n(assq 5 '((1 10) (2 20)))", "expected": "#f", "category": "other"}
+{"prompt": "Evaluate this Sema expression:\nf\"result: ${(+ 1 2)}\"", "expected": "\"result: 3\"", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(text/word-count \"\")", "expected": "0", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(count (map/zip '(:a :b :c) '(1 2)))", "expected": "2", "category": "map"}
+{"prompt": "Evaluate this Sema expression:\n\n        (match {:x 1}\n          ({:x v :y w} when #t \"both\")\n          (_ \"fallback\"))\n    ", "expected": "\"fallback\"", "category": "control-flow"}
+{"prompt": "Evaluate this Sema expression:\n(let ((message \"hi\")) message)", "expected": "\"hi\"", "category": "binding"}
+{"prompt": "Evaluate this Sema expression:\n(i64-array/ref (i64-array/range 0 5) 0)", "expected": "0", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(reduce + '(1 2 3 4))", "expected": "10", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(f64-array? (i64-array/make 1))", "expected": "#f", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(get-in {:a 42} [:a :b] \"default\")", "expected": "\"default\"", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(list/split-at '(1 2 3) 10)", "expected": "((1 2 3) ())", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(keyword? :foo)", "expected": "#t", "category": "other"}
+{"prompt": "Evaluate this Sema expression:\n(round 3.2)", "expected": "3", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n\n        (begin\n          (defmacro nested-bind (a b)\n            `(let ((outer# ,a))\n               (let ((inner# ,b))\n                 (+ outer# inner#))))\n          (nested-bind 10 20))\n    ", "expected": "30", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(list/sole (fn (x) (> x 10)) '(1 5 20))", "expected": "20", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(length (car (partition even? '(1 2 3 4 5))))", "expected": "2", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(interpose \", \" '(\"a\" \"b\" \"c\"))", "expected": "(\"a\" \", \" \"b\" \", \" \"c\")", "category": "other"}
+{"prompt": "Evaluate this Sema expression:\n(begin\n    (define (outer)\n      (define x 1)\n      (define (middle)\n        (lambda () x))\n      (set! x 99)\n      (middle))\n    ((outer)))", "expected": "99", "category": "binding"}
+{"prompt": "Evaluate this Sema expression:\n(list/page '(1 2 3 4 5) 2 2)", "expected": "(3 4)", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(foldl (fn (acc x) (- acc x)) 0 '(1 2 3))", "expected": "-6", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(let ((x 1)) (+ 100 200))", "expected": "300", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(or 42)", "expected": "42", "category": "other"}
+{"prompt": "Evaluate this Sema expression:\n(caar '((1 2) (3 4)))", "expected": "1", "category": "other"}
+{"prompt": "Evaluate this Sema expression:\n(list/pluck :age (list {:name \"a\"}))", "expected": "(nil)", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(list/sliding '(1 2 3) 1)", "expected": "((1) (2) (3))", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(context/has? :nope)", "expected": "#f", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(get (pio/assemble (list (pio/out :x 32))) :instructions)", "expected": "#u8(32 96)", "category": "map"}
+{"prompt": "Evaluate this Sema expression:\n(format \"~a\" 42)", "expected": "\"42\"", "category": "other"}
+{"prompt": "Evaluate this Sema expression:\n(car (conversation/map (conversation/add-message (conversation/new) :user \"hello\") message/content))", "expected": "\"hello\"", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(string/trim-left \"  hi  \")", "expected": "\"hi  \"", "category": "string"}
+{"prompt": "Evaluate this Sema expression:\n\n        (define (ok? v) (> v 10))\n        (match {:id 5}\n          ({:id n} when (ok? n) \"big\")\n          ({:id n :name s} \"has-name\")\n          ({:id n} (+ n 100))\n          (_ 0))\n    ", "expected": "105", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n\n        (begin\n          (defmacro double-bind (a b)\n            (let ((first `(let ((x# ,a)) x#))\n                  (second `(let ((x# ,b)) x#)))\n              `(+ ,first ,second)))\n          (double-bind 10 20))\n    ", "expected": "30", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(text/strip-html \"<p>Hello <b>world</b></p>\")", "expected": "\"Hello world\"", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(retry (lambda () 42))", "expected": "42", "category": "binding"}
+{"prompt": "Evaluate this Sema expression:\n(get (time/date-parts (time/parse \"2000-02-29 00:00:00\" \"%Y-%m-%d %H:%M:%S\")) :day)", "expected": "29", "category": "map"}
+{"prompt": "Evaluate this Sema expression:\n(get (pio/push) :block)", "expected": "#t", "category": "map"}
+{"prompt": "Evaluate this Sema expression:\n(flatten-deep '(1 (2 3) (4 (5))))", "expected": "(1 2 3 4 5)", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(get (pio/assemble (list (pio/jmp 'end) (pio/nop) 'end (pio/nop))) :instructions)", "expected": "#u8(2 0 66 160 66 160)", "category": "map"}
+{"prompt": "Evaluate this Sema expression:\n(i64-array/ref (i64-array/set! (i64-array 10 20 30) 2 7) 2)", "expected": "7", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(list/join '() \", \")", "expected": "\"\"", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n((fn ([{:keys [x]}]) x) (list {:x 42}))", "expected": "42", "category": "map"}
+{"prompt": "Evaluate this Sema expression:\n(assoc-in {:a 1} [] 42)", "expected": "42", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(count (dissoc {:a 1 :b 2 :c 3} :a :c))", "expected": "1", "category": "other"}
+{"prompt": "Evaluate this Sema expression:\n(> 3 2)", "expected": "#t", "category": "other"}
+{"prompt": "Evaluate this Sema expression:\n\n        (let ((t (toml/decode \"[package]\\nname = \\\"x\\\"\\n\\n[deps]\\nfoo = \\\"bar\\\"\")))\n          (list (:name (:package t)) (:foo (:deps t))))\n    ", "expected": "(\"x\" \"bar\")", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(time/format 1704067200.0 \"%Y-%m-%d %H:%M:%S\")", "expected": "\"2024-01-01 00:00:00\"", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(list/pluck :name (list {:name \"a\"} {:name \"b\"}))", "expected": "(\"a\" \"b\")", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(list/pad '(1 2 3) 3 0)", "expected": "(1 2 3)", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(get (map/from-entries '((:a 1) (:b 2))) :a)", "expected": "1", "category": "map"}
+{"prompt": "Evaluate this Sema expression:\n(let ((a 1) (b (try 5 (catch e 2)))) (+ a b))", "expected": "6", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(let ((s (stream/byte-buffer))) (stream/write s (string->utf8 \"hi\")) (bytevector-length (stream/to-bytes s)))", "expected": "2", "category": "string"}
+{"prompt": "Evaluate this Sema expression:\n(get (pio/out :x 32) :bits)", "expected": "32", "category": "map"}
+{"prompt": "Evaluate this Sema expression:\nf\"costs \\$5\"", "expected": "\"costs $5\"", "category": "f-string"}
+{"prompt": "Evaluate this Sema expression:\n(any odd? '())", "expected": "#f", "category": "other"}
+{"prompt": "Evaluate this Sema expression:\n(list/dedupe '())", "expected": "()", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(string/join (list \"a\" \"b\" \"c\") \",\")", "expected": "\"a,b,c\"", "category": "string"}
+{"prompt": "Evaluate this Sema expression:\n(bytevector/length (string/to-utf8 \"hi\"))", "expected": "2", "category": "string"}
+{"prompt": "Evaluate this Sema expression:\n(string-ref \"abc\" 2)", "expected": "#\\c", "category": "string"}
+{"prompt": "Evaluate this Sema expression:\n(i64-array/ref (i64-array/map (fn (x) (* x x)) (i64-array 1 2 3 4)) 0)", "expected": "1", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(begin (define n 0) (define (k) (set! n (+ n 1)) n) (case (k) ((1) n) (else 0)))", "expected": "1", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(string? (uuid/v4))", "expected": "#t", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(string/index-of \"hello \ud83c\udf0d world\" \"world\")", "expected": "8", "category": "string"}
+{"prompt": "Evaluate this Sema expression:\n(sort '(3 1 2))", "expected": "(1 2 3)", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(i64-array/length (i64-array/range 0 5 -1))", "expected": "0", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(stream? (stream/from-string \"hello\"))", "expected": "#t", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(:a (map/update {:a 1} :a (fn (x) (+ x 10))))", "expected": "11", "category": "map"}
+{"prompt": "Evaluate this Sema expression:\n(procedure? nil)", "expected": "#f", "category": "other"}
+{"prompt": "Evaluate this Sema expression:\n(#(+ %1 %2) 3 4)", "expected": "7", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(list/split-at '() 0)", "expected": "(() ())", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(base64/encode \"\")", "expected": "\"\"", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\nf\"costs $5\"", "expected": "\"costs $5\"", "category": "f-string"}
+{"prompt": "Evaluate this Sema expression:\n(begin 1 2 3)", "expected": "3", "category": "other"}
+{"prompt": "Evaluate this Sema expression:\n(- 5)", "expected": "-5", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(assoc :a '((:a 1) (:b 2)))", "expected": "(:a 1)", "category": "map"}
+{"prompt": "Evaluate this Sema expression:\n(sort (list/unique '(1 2 2 3 3 3)))", "expected": "(1 2 3)", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(list/sum '(1 2.0 3))", "expected": "6.0", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(list/reject even? '())", "expected": "()", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(> (time/now) 0)", "expected": "#t", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(match '(1 (2 3)) ([a [b c]] (+ a b c)))", "expected": "6", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(let ((map 7)) (+ map 1))", "expected": "8", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(list/join '(1 2 3) \", \" \" and \")", "expected": "\"1, 2 and 3\"", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(nil? (conversation/system (conversation/new)))", "expected": "#t", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(stream/readable? (stream/byte-buffer))", "expected": "#t", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(:b (map/update {:a 1} :b (fn (x) (if (nil? x) 99 x))))", "expected": "99", "category": "map"}
+{"prompt": "Evaluate this Sema expression:\n(reverse '(1 2 3))", "expected": "(3 2 1)", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(list/cross-join '(1) '(2))", "expected": "((1 2))", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(let ((/ -)) (/ 10 3))", "expected": "7", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(filter even? '(1 2 3 4 5 6))", "expected": "(2 4 6)", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(sort (keys {:b 2 :a 1}))", "expected": "(:a :b)", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(length (text/split-sentences \"Hello world. How are you? Fine.\"))", "expected": "3", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(conversation/model (conversation/new {:model \"gpt-4\"}))", "expected": "\"gpt-4\"", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(case 99 ((1) :one) (else :other))", "expected": ":other", "category": "control-flow"}
+{"prompt": "Evaluate this Sema expression:\n(string/reverse \"hello\")", "expected": "\"olleh\"", "category": "string"}
+{"prompt": "Evaluate this Sema expression:\n(try (error \"boom\") (catch e 99))", "expected": "99", "category": "error-handling"}
+{"prompt": "Evaluate this Sema expression:\n(> pi 3.14)", "expected": "#t", "category": "other"}
+{"prompt": "Evaluate this Sema expression:\n(count (map/sort-keys {:b 2 :a 1}))", "expected": "2", "category": "map"}
+{"prompt": "Evaluate this Sema expression:\n(base64/decode \"aGVsbG8=\")", "expected": "\"hello\"", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(bytevector/to-list (bytevector 1 2 3))", "expected": "(1 2 3)", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(eq? (string/intern \"a\") (string/intern \"b\"))", "expected": "#f", "category": "string"}
+{"prompt": "Evaluate this Sema expression:\n(let ((s (stream/byte-buffer))) (stream/write s (bytevector 1 2 3)))", "expected": "3", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(string/pad-left \"42\" 5 \"0\")", "expected": "\"00042\"", "category": "string"}
+{"prompt": "Evaluate this Sema expression:\n(count (deep-merge))", "expected": "0", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(list/sliding '(1 2) 5)", "expected": "()", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(get (pio/assemble (list (pio/in :pins 8))) :instructions)", "expected": "#u8(8 64)", "category": "map"}
+{"prompt": "Evaluate this Sema expression:\n(list/diff '(1 2 2 3) '(2))", "expected": "(1 3)", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(let ((> <)) (> 5 3))", "expected": "#f", "category": "binding"}
+{"prompt": "Evaluate this Sema expression:\n(json/encode {:a 1})", "expected": "\"{\\\"a\\\":1}\"", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(let ((+ *))\n      (do ((i 1 (+ i 2)))\n          ((> i 10) i)))", "expected": "16", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(list/page '(1 2 3 4 5) 3 2)", "expected": "(5)", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n\n        (match '(1)\n          ([a b] (+ a b))\n          ([x] x))\n    ", "expected": "1", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(conversation/system (conversation/set-system (conversation/add-message (conversation/new) :system \"old\") \"new\"))", "expected": "\"new\"", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n\n        (begin\n          (defmulti greet (fn (x) (get x :lang)))\n          (defmethod greet :en (fn (x) \"hello\"))\n          (defmethod greet :default (fn (x) \"hi\"))\n          (greet {:lang :fr}))\n    ", "expected": "\"hi\"", "category": "map"}
+{"prompt": "Evaluate this Sema expression:\n(let ((y 99)) (+ 3 4))", "expected": "7", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(let (([a b] [10 20])) (+ a b))", "expected": "30", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(let ((x 42)) f\"the answer is ${x}\")", "expected": "\"the answer is 42\"", "category": "binding"}
+{"prompt": "Evaluate this Sema expression:\n(prompt/render \"Hello {{name}}\" {:name \"Alice\"})", "expected": "\"Hello Alice\"", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n\n        (begin\n          (define s1 (gensym \"x\"))\n          (defmacro my-m (v) `(let ((x# ,v)) x#))\n          (my-m 42))\n    ", "expected": "42", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(type #t)", "expected": ":bool", "category": "other"}
+{"prompt": "Evaluate this Sema expression:\n(begin (define (square x) (* x x)) (square 5))", "expected": "25", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(string/repeat \"ab\" 3)", "expected": "\"ababab\"", "category": "string"}
+{"prompt": "Evaluate this Sema expression:\n(bit/xor 12 10)", "expected": "6", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(length (context/stack :empty))", "expected": "0", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(match {:x 10 :y 20} ({:keys [x y]} (+ x y)))", "expected": "30", "category": "map"}
+{"prompt": "Evaluate this Sema expression:\n(string-ref \"h\u00e9llo\" 1)", "expected": "#\\\u00e9", "category": "string"}
+{"prompt": "Evaluate this Sema expression:\n(bit/and 12 10)", "expected": "8", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(stream? nil)", "expected": "#f", "category": "other"}
+{"prompt": "Evaluate this Sema expression:\n(int 1.5e3)", "expected": "1500", "category": "other"}
+{"prompt": "Evaluate this Sema expression:\n(f64-array/ref (f64-array/set! (f64-array 1.0 2.0 3.0) 1 9.5) 1)", "expected": "9.5", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(if nil :truthy :falsy)", "expected": ":falsy", "category": "control-flow"}
+{"prompt": "Evaluate this Sema expression:\n(cddr '(1 2 3 4))", "expected": "(3 4)", "category": "other"}
+{"prompt": "Evaluate this Sema expression:\n(:a (deep-merge {:a {:b 1}} {:a 42}))", "expected": "42", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(match {:type :ok :val 42} ({:type :ok :val v} v) (_ nil))", "expected": "42", "category": "control-flow"}
+{"prompt": "Evaluate this Sema expression:\n(do ((i 0 (+ i 1)) (sum 0 (+ sum i))) ((= i 5) sum))", "expected": "10", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n\n        (begin\n          (defmacro wrap (expr)\n            `(let ((v# ,expr)) (+ v# 0)))\n          (wrap (wrap (wrap (wrap (wrap (wrap (wrap (wrap (wrap (wrap (wrap (wrap (wrap (wrap (wrap (wrap (wrap (wrap (wrap (wrap 7)))))))))))))))))))))\n    ", "expected": "7", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(format \"~a+~a=~a\" 1 2 3)", "expected": "\"1+2=3\"", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(count (map/except {:a 1 :b 2} '(:x)))", "expected": "2", "category": "map"}
+{"prompt": "Evaluate this Sema expression:\n(begin (define x 42) x)", "expected": "42", "category": "binding"}
+{"prompt": "Evaluate this Sema expression:\n(begin (define-record-type point (make-point x y) point? (x point-x) (y point-y)) (equal? (make-point 1 2) (make-point 1 2)))", "expected": "#t", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(begin\n    (define (make-getter)\n      (define n 42)\n      (lambda () n))\n    ((make-getter)))", "expected": "42", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(char<? #\\a #\\b)", "expected": "#t", "category": "other"}
+{"prompt": "Evaluate this Sema expression:\n(list/interleave '(1 2 3) '())", "expected": "()", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(let ((< >)) (cond ((< 1 2) :wrong) (#t :right)))", "expected": ":right", "category": "binding"}
+{"prompt": "Evaluate this Sema expression:\n(let ((a \"foo\") (b \"bar\")) f\"${a} and ${b}\")", "expected": "\"foo and bar\"", "category": "binding"}
+{"prompt": "Evaluate this Sema expression:\n(get (pio/side 1 (pio/delay 3 (pio/nop))) :side-set)", "expected": "1", "category": "map"}
+{"prompt": "Evaluate this Sema expression:\n(string-split \"a,b,c\" \",\")", "expected": "(\"a\" \"b\" \"c\")", "category": "string"}
+{"prompt": "Evaluate this Sema expression:\n(map/get-in {:a {:b 42}} '(:a :b))", "expected": "42", "category": "map"}
+{"prompt": "Evaluate this Sema expression:\n(list/max '(3 1.5 2))", "expected": "3", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(assq 2 '((1 10) (2 20) (3 30)))", "expected": "(2 20)", "category": "other"}
+{"prompt": "Evaluate this Sema expression:\n(get (map/map-vals (fn (v) (* v 2)) (hash-map :x 5)) :x)", "expected": "10", "category": "map"}
+{"prompt": "Evaluate this Sema expression:\n(begin (define-record-type point (make-point x y) point? (x point-x) (y point-y)) (point? 42))", "expected": "#f", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(negative? -3)", "expected": "#t", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(begin (define (count-down n) (if (= n 0) :done (count-down (- n 1)))) (count-down 100000))", "expected": ":done", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(length (conversation/map (-> (conversation/new) (conversation/add-message :user \"hello\") (conversation/add-message :assistant \"hi\")) message/content))", "expected": "2", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(message/content (message :user \"hello world\"))", "expected": "\"hello world\"", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(char=? #\\a #\\a)", "expected": "#t", "category": "other"}
+{"prompt": "Evaluate this Sema expression:\n(list/join '(\"a\" \"b\" \"c\") \"-\")", "expected": "\"\\\"a\\\"-\\\"b\\\"-\\\"c\\\"\"", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(let ((not (lambda (x) 42))) (not #f))", "expected": "42", "category": "binding"}
+{"prompt": "Evaluate this Sema expression:\n(bytevector-length (bytevector-copy (bytevector 1 2 3)))", "expected": "3", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(text/truncate \"hello world\" 5)", "expected": "\"he...\"", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(json/decode \"\\\"hello\\\"\")", "expected": "\"hello\"", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(list/min '(3 1 2))", "expected": "1", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(begin (define acc '()) (do ((i 0 (+ i 1))) ((= i 3) (reverse acc)) (set! acc (cons i acc))))", "expected": "(0 1 2)", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(member -0.0 '(1.0 0.0 2.0))", "expected": "(0.0 2.0)", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(list/times 3 (fn (i) i))", "expected": "(0 1 2)", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(equal? -0.0 0.0)", "expected": "#t", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(string/capitalize \"hello world\")", "expected": "\"Hello world\"", "category": "string"}
+{"prompt": "Evaluate this Sema expression:\n(and 42)", "expected": "42", "category": "other"}
+{"prompt": "Evaluate this Sema expression:\n(get (pio/assemble (list (pio/push))) :instructions)", "expected": "#u8(32 128)", "category": "map"}
+{"prompt": "Evaluate this Sema expression:\n(empty? nil)", "expected": "#t", "category": "other"}
+{"prompt": "Evaluate this Sema expression:\n(eq? (string/intern \"abc\") (string/intern \"abc\"))", "expected": "#t", "category": "string"}
+{"prompt": "Evaluate this Sema expression:\n(math/sign 42)", "expected": "1", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(try (let ((s (stream/byte-buffer))) (stream/close s) (stream/flush s)) (catch e :error))", "expected": ":error", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(get (merge (hash-map :a 1) (hash-map :b 2)) :b)", "expected": "2", "category": "map"}
+{"prompt": "Evaluate this Sema expression:\n(get (assoc (hash-map :a 1) :a 99) :a)", "expected": "99", "category": "map"}
+{"prompt": "Evaluate this Sema expression:\n(length (list/take-last 9 (list 1 2)))", "expected": "2", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(bytevector/length (bytevector/append (bytevector 1) (bytevector 2)))", "expected": "2", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(conversation/system (conversation/set-system (conversation/new) \"be nice\"))", "expected": "\"be nice\"", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(let (([[a b] c] '((1 2) 3))) (+ a b c))", "expected": "6", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(float? (time/now))", "expected": "#t", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(list/max '(3 1 2))", "expected": "3", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(f64-array? (f64-array/make 1))", "expected": "#t", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(caaar '(((1 2) 3) 4))", "expected": "1", "category": "other"}
+{"prompt": "Evaluate this Sema expression:\n((lambda (+ -) (+ 10 3)) * /)", "expected": "30", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(type +)", "expected": ":native-fn", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(zero? 0)", "expected": "#t", "category": "other"}
+{"prompt": "Evaluate this Sema expression:\n(get (time/date-parts (time/parse \"2024-02-29 00:00:00\" \"%Y-%m-%d %H:%M:%S\")) :weekday)", "expected": "\"Thursday\"", "category": "map"}
+{"prompt": "Evaluate this Sema expression:\n(get (map/new :a 1 :b 2) :b)", "expected": "2", "category": "map"}
+{"prompt": "Evaluate this Sema expression:\n(sqrt 16)", "expected": "4.0", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(type 42)", "expected": ":int", "category": "other"}
+{"prompt": "Evaluate this Sema expression:\n(begin (deftool greet \"Greet\" {:name {:type :string}} (lambda (name) name)) (defagent greeter {:system \"You greet.\" :tools [greet]}) (agent/name greeter))", "expected": "\"greeter\"", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n((lambda (x y) (+ x y)) 3 4)", "expected": "7", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n((lambda ({:keys [x y]}) (+ x y)) {:x 3 :y 4})", "expected": "7", "category": "map"}
+{"prompt": "Evaluate this Sema expression:\n(begin (define (make-counter) (let ((n 0)) (lambda () (set! n (+ n 1)) n))) (define c (make-counter)) (c) (c) (c))", "expected": "3", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(get-in {:a {:b 1}} [:a :c] \"default\")", "expected": "\"default\"", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(with-stream (s (stream/byte-buffer)) (stream/write s (bytevector 1 2 3)) 42)", "expected": "42", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n\n        (match 5\n          (x when (> x 10) :big)\n          (x when (> x 3) :medium)\n          (x :small))\n    ", "expected": ":medium", "category": "control-flow"}
+{"prompt": "Evaluate this Sema expression:\n(when #t 42)", "expected": "42", "category": "control-flow"}
+{"prompt": "Evaluate this Sema expression:\n(begin (define a 0) (define b 0) (while (< a 3) (set! a (+ a 1)) (set! b (+ b 10))) b)", "expected": "30", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(get (assoc (hash-map :a 1) :b 2) :b)", "expected": "2", "category": "map"}
+{"prompt": "Evaluate this Sema expression:\n(cond ((= 1 2) 10) ((= 1 1) 20) (else 30))", "expected": "20", "category": "control-flow"}
+{"prompt": "Evaluate this Sema expression:\n(count nil)", "expected": "0", "category": "other"}
+{"prompt": "Evaluate this Sema expression:\n(get (map/update (hash-map :a 5) :a (fn (x) (* x 2))) :a)", "expected": "10", "category": "map"}
+{"prompt": "Evaluate this Sema expression:\n(string->number \"42\")", "expected": "42", "category": "string"}
+{"prompt": "Evaluate this Sema expression:\n(length (string/to-list \"abc\"))", "expected": "3", "category": "string"}
+{"prompt": "Evaluate this Sema expression:\n(let () 42)", "expected": "42", "category": "binding"}
+{"prompt": "Evaluate this Sema expression:\n(get (pio/assemble (list (pio/out :pins 1))) :instructions)", "expected": "#u8(1 96)", "category": "map"}
+{"prompt": "Evaluate this Sema expression:\n(char/to-string #\\a)", "expected": "\"a\"", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(match '(1 2) ([a b c] :three) ([a b] :two) (_ :other))", "expected": ":two", "category": "control-flow"}
+{"prompt": "Evaluate this Sema expression:\n(document/text (document/create \"hello\" {:source \"x\"}))", "expected": "\"hello\"", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(vector? [1 2])", "expected": "#t", "category": "other"}
+{"prompt": "Evaluate this Sema expression:\n(conversation? (conversation/new))", "expected": "#t", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(bit/or 12 10)", "expected": "14", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(list/index-of '(1 2 2 3) 2)", "expected": "1", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(time/format (time/add (time/parse \"2024-01-01 00:00:00\" \"%Y-%m-%d %H:%M:%S\") 86400) \"%Y-%m-%d %H:%M:%S\")", "expected": "\"2024-01-02 00:00:00\"", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n\n        (begin\n          (defmulti describe (fn (x) (type x)))\n          (defmethod describe :int (fn (x) \"integer\"))\n          (defmethod describe :string (fn (x) \"text\"))\n          (list (describe 42) (describe \"hi\")))\n    ", "expected": "(\"integer\" \"text\")", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(equal? '(1 2) '(1 2))", "expected": "#t", "category": "other"}
+{"prompt": "Evaluate this Sema expression:\n(i64-array? (i64-array/make 1))", "expected": "#t", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(length (prompt/messages (prompt/fill (prompt (system \"You are {{role}}\") (user \"{{query}}\")) {:role \"helpful\" :query \"hi\"})))", "expected": "2", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(let ((- (lambda (x) (* x 2)))) (- 5))", "expected": "10", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(string/last-index-of \"caf\u00e9 caf\u00e9\" \"caf\u00e9\")", "expected": "5", "category": "string"}
+{"prompt": "Evaluate this Sema expression:\n(empty? '(1))", "expected": "#f", "category": "other"}
+{"prompt": "Evaluate this Sema expression:\n(get (map/zip [:a :b] [1 2]) :b)", "expected": "2", "category": "map"}
+{"prompt": "Evaluate this Sema expression:\n(i64-array/ref (i64-array/range 0 5) 4)", "expected": "4", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(try 1 2 3 (catch e 0))", "expected": "3", "category": "error-handling"}
+{"prompt": "Evaluate this Sema expression:\n(any odd? '(2 4 6))", "expected": "#f", "category": "other"}
+{"prompt": "Evaluate this Sema expression:\n(char/lower-case? #\\a)", "expected": "#t", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(try (throw {:a 1}) (catch e (get e :value)))", "expected": "{:a 1}", "category": "map"}
+{"prompt": "Evaluate this Sema expression:\n(begin (defmacro my-if (c t e) (list 'if c t e)) (my-if #t 1 2))", "expected": "1", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(string/trim-right \"  hi  \")", "expected": "\"  hi\"", "category": "string"}
+{"prompt": "Evaluate this Sema expression:\n(min 3 7)", "expected": "3", "category": "other"}
+{"prompt": "Evaluate this Sema expression:\n(let ((a 1) (b (try (throw a) (catch e 7)))) (+ a b))", "expected": "8", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(begin (deftool add-numbers \"Add two\" {:a {:type :number}} (lambda (a) a)) (tool/description add-numbers))", "expected": "\"Add two\"", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(empty? '())", "expected": "#t", "category": "other"}
+{"prompt": "Evaluate this Sema expression:\n(let (({:keys [x]} (hashmap/new :x 99))) x)", "expected": "99", "category": "map"}
+{"prompt": "Evaluate this Sema expression:\n(when #t 1 2 3)", "expected": "3", "category": "control-flow"}
+{"prompt": "Evaluate this Sema expression:\n\n        (begin\n          (define __v {:name \"Alice\" :age 30})\n          (some-> __v (:name)))\n    ", "expected": "\"Alice\"", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(list/sole even? '(1 2 3))", "expected": "2", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(llm/token-count \"\")", "expected": "0", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(begin (define i 0) (while (< i 5) (set! i (+ i 1))) i)", "expected": "5", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(string/index-of \"caf\u00e9 world\" \"world\")", "expected": "5", "category": "string"}
+{"prompt": "Evaluate this Sema expression:\n(type (stream/byte-buffer))", "expected": ":stream", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(nil? nil)", "expected": "#t", "category": "other"}
+{"prompt": "Evaluate this Sema expression:\n(char-whitespace? #\\space)", "expected": "#t", "category": "string"}
+{"prompt": "Evaluate this Sema expression:\n(string? (text/excerpt \"the quick brown fox jumps over\" \"fox\" 5))", "expected": "#t", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(get-in {:a 1} [:b] \"default\")", "expected": "\"default\"", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(vector? (rest [1 2 3]))", "expected": "#t", "category": "other"}
+{"prompt": "Evaluate this Sema expression:\n(get (pio/assemble (list (pio/nop) (pio/nop) (pio/nop))) :length)", "expected": "3", "category": "map"}
+{"prompt": "Evaluate this Sema expression:\n(list/mode '(42))", "expected": "42", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(let ((+ *)) (define a 3) (define b 4) (+ a b))", "expected": "12", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(embedding/length (embedding/list->embedding '(1.0 2.0 3.0)))", "expected": "3", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(let ((s (stream/byte-buffer))) (stream/write s (string->utf8 \"ok\")) (stream/to-string s))", "expected": "\"ok\"", "category": "string"}
+{"prompt": "Evaluate this Sema expression:\n(or 1 2 3)", "expected": "1", "category": "other"}
+{"prompt": "Evaluate this Sema expression:\n(begin (define-record-type point (make-point x y) point? (x point-x) (y point-y)) (point? (make-point 1 2)))", "expected": "#t", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(prompt? (prompt (user \"hello\")))", "expected": "#t", "category": "other"}
+{"prompt": "Evaluate this Sema expression:\n(get-in (update-in {} [:a :b] (fn (x) (if (nil? x) 1 (+ x 1)))) [:a :b])", "expected": "1", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(begin (context/set :temp \"val\") (context/pull :temp))", "expected": "\"val\"", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n\n        (match {:a [1 2]}\n          ({:a [x y]} when (= (+ x y) 3) :ok)\n          (_ :bad))\n    ", "expected": ":ok", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(type [1 2])", "expected": ":vector", "category": "other"}
+{"prompt": "Evaluate this Sema expression:\n(keyword? (string/to-keyword \"foo\"))", "expected": "#t", "category": "string"}
+{"prompt": "Evaluate this Sema expression:\n(stream/read-line (stream/from-string \"abc\"))", "expected": "\"abc\"", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(get (map/zip '(:a :b) '(1 2)) :a)", "expected": "1", "category": "map"}
+{"prompt": "Evaluate this Sema expression:\n(let ((c 0)) (filter (fn (x) (set! c (+ c x)) (even? x)) (list 1 2 3 4)) c)", "expected": "10", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(sqrt 9)", "expected": "3.0", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(string/trim \"  hi  \")", "expected": "\"hi\"", "category": "string"}
+{"prompt": "Evaluate this Sema expression:\n(last (list/drop-last 2 (list 1 2 3 4)))", "expected": "2", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(string-append \"hello\" \" \" \"world\")", "expected": "\"hello world\"", "category": "string"}
+{"prompt": "Evaluate this Sema expression:\n(procedure? '(1 2 3))", "expected": "#f", "category": "other"}
+{"prompt": "Evaluate this Sema expression:\n\n        (let ((k (string/intern \"key\")))\n          (get {k 42} k))\n    ", "expected": "42", "category": "string"}
+{"prompt": "Evaluate this Sema expression:\n(length (bytevector/to-list (bytevector 1 2 3)))", "expected": "3", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(count {:a 1 :b 2 :c 3})", "expected": "3", "category": "other"}
+{"prompt": "Evaluate this Sema expression:\n(hashmap/get (frequencies '(1 1 2 3 3 3)) 3)", "expected": "3", "category": "map"}
+{"prompt": "Evaluate this Sema expression:\n(number? \"hi\")", "expected": "#f", "category": "other"}
+{"prompt": "Evaluate this Sema expression:\n(list/chunk 10 '(1 2 3))", "expected": "((1 2 3))", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(length (prompt/slots (prompt (user \"no slots here\"))))", "expected": "0", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(promise? (delay 42))", "expected": "#t", "category": "other"}
+{"prompt": "Evaluate this Sema expression:\n(string-ref \"abc\" 0)", "expected": "#\\a", "category": "string"}
+{"prompt": "Evaluate this Sema expression:\n(time/format 1704067200.0 \"%Y-%m-%d\")", "expected": "\"2024-01-01\"", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(rest '(1))", "expected": "()", "category": "other"}
+{"prompt": "Evaluate this Sema expression:\n(list/join '(1 2 3) \", \")", "expected": "\"1, 2, 3\"", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(fn? 42)", "expected": "#f", "category": "other"}
+{"prompt": "Evaluate this Sema expression:\n(bytevector/length (bytevector 1 2 3 4))", "expected": "4", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(let ((a 9000000000000)) (+ a a))", "expected": "18000000000000", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(zip '(1 2 3) '(4 5 6))", "expected": "((1 4) (2 5) (3 6))", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(if #f 1 2)", "expected": "2", "category": "control-flow"}
+{"prompt": "Evaluate this Sema expression:\n(bytevector/u8-ref (bytevector/u8-set! (bytevector 0 0 0) 1 9) 1)", "expected": "9", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(vector->list [1 2 3])", "expected": "(1 2 3)", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(-> 5 (+ 3) (* 2))", "expected": "16", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(substring \"hello\" 1 3)", "expected": "\"el\"", "category": "other"}
+{"prompt": "Evaluate this Sema expression:\n(let fib ((n 10)) (cond ((= n 0) 0) ((= n 1) 1) (else (+ (fib (- n 1)) (fib (- n 2))))))", "expected": "55", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(empty? {})", "expected": "#t", "category": "other"}
+{"prompt": "Evaluate this Sema expression:\n(rest '(1 2 3))", "expected": "(2 3)", "category": "other"}
+{"prompt": "Evaluate this Sema expression:\n(length (prompt/messages (prompt (user \"hello\") (assistant \"hi\"))))", "expected": "2", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(any? odd? (list 2 4 6))", "expected": "#f", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(assoc :z '((:a 1) (:b 2)))", "expected": "#f", "category": "map"}
+{"prompt": "Evaluate this Sema expression:\n(base64/encode \"hello\")", "expected": "\"aGVsbG8=\"", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(case 2 ((1) :one) ((2) :two) (else :other))", "expected": ":two", "category": "control-flow"}
+{"prompt": "Evaluate this Sema expression:\n(let ((c 0)) (map (fn (x) (set! c (+ c x))) (list 1 2 3)) c)", "expected": "6", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(string/contains? \"hello world\" \"world\")", "expected": "#t", "category": "string"}
+{"prompt": "Evaluate this Sema expression:\n(length (prompt/messages (prompt/append (prompt (user \"a\")) (prompt (user \"b\")) (prompt (user \"c\")))))", "expected": "3", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n\n        (begin\n          (defmacro wrap (expr)\n            `(let ((v# ,expr)) (+ v# 0)))\n          (wrap (wrap (wrap (wrap (wrap 100))))))\n    ", "expected": "100", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(cdddr '(1 2 3 4 5))", "expected": "(4 5)", "category": "other"}
+{"prompt": "Evaluate this Sema expression:\n(map/entries {})", "expected": "()", "category": "map"}
+{"prompt": "Evaluate this Sema expression:\n(list/diff '() '(1 2))", "expected": "()", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(count (merge {:a 1} {:b 2} {:c 3}))", "expected": "3", "category": "other"}
+{"prompt": "Evaluate this Sema expression:\n(math/sign 0)", "expected": "0", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(stream/read-line (stream/from-string \"hello\\nworld\"))", "expected": "\"hello\"", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(map (fn (x) (* x 2)) '(1 2 3))", "expected": "(2 4 6)", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(string/last-index-of \"abcabc\" \"bc\")", "expected": "4", "category": "string"}
+{"prompt": "Evaluate this Sema expression:\n(string-length (hash/md5 \"test\"))", "expected": "32", "category": "string"}
+{"prompt": "Evaluate this Sema expression:\n(list/reject even? '(1 3 5))", "expected": "(1 3 5)", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(empty? {:a 1})", "expected": "#f", "category": "other"}
+{"prompt": "Evaluate this Sema expression:\n(i64-array/ref (i64-array/map (fn (x) (* x x)) (i64-array 1 2 3 4)) 3)", "expected": "16", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(time/format (time/parse \"2024-06-15 14:30:00\" \"%Y-%m-%d %H:%M:%S\") \"%Y-%m-%d %H:%M:%S\")", "expected": "\"2024-06-15 14:30:00\"", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(count \"hello\")", "expected": "5", "category": "other"}
+{"prompt": "Evaluate this Sema expression:\n(letrec ((even? (lambda (n) (if (= n 0) #t (odd? (- n 1))))) (odd? (lambda (n) (if (= n 0) #f (even? (- n 1)))))) (even? 10))", "expected": "#t", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(list/median '(7))", "expected": "7.0", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(string/replace \"hello world\" \"world\" \"rust\")", "expected": "\"hello rust\"", "category": "string"}
+{"prompt": "Evaluate this Sema expression:\n(list/drop-while even? '())", "expected": "()", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(cons 1 '(2 3))", "expected": "(1 2 3)", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(length (prompt/slots (prompt (user \"Hello {{name}}, age {{age}}\"))))", "expected": "2", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(/ 10 2)", "expected": "5", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(begin (define (even? n) (if (= n 0) #t (odd? (- n 1)))) (define (odd? n) (if (= n 0) #f (even? (- n 1)))) (even? 1000))", "expected": "#t", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(take-while even? '(1 2 4))", "expected": "()", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(get (assoc {:a 1} :a 99) :a)", "expected": "99", "category": "map"}
+{"prompt": "Evaluate this Sema expression:\n(:v (hashmap/get (list/key-by (fn (m) (:id m)) (list {:id 1 :v \"x\"} {:id 1 :v \"y\"})) 1))", "expected": "\"y\"", "category": "map"}
+{"prompt": "Evaluate this Sema expression:\n(begin (context/push :trail \"a\") (context/push :trail \"b\") (context/pop :trail))", "expected": "\"b\"", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(list/index-of '(10 20 30) 30)", "expected": "2", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(bytevector-length (stream/read (stream/from-string \"hi\") 10))", "expected": "2", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(message? (message :user \"hi\"))", "expected": "#t", "category": "other"}
+{"prompt": "Evaluate this Sema expression:\n(length (text/chunk \"short text\"))", "expected": "1", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(match \"hello\" (\"hello\" 1) (\"world\" 2) (_ 0))", "expected": "1", "category": "control-flow"}
+{"prompt": "Evaluate this Sema expression:\n(list/nth-or (list 10 20 30) 9 -1)", "expected": "-1", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(get (hash-map :x 10) :x)", "expected": "10", "category": "map"}
+{"prompt": "Evaluate this Sema expression:\n(begin\n        (define (outer)\n          (let ((x 1))\n            (define (a) (+ x (b)))\n            (define (b) 42)\n            (a)))\n        (outer))", "expected": "43", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(string/starts-with? \"hello\" \"hel\")", "expected": "#t", "category": "string"}
+{"prompt": "Evaluate this Sema expression:\n(list/pluck :x '())", "expected": "()", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(pow 2 10)", "expected": "1024", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(list/diff '(1 2 3) '())", "expected": "(1 2 3)", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(assert 42)", "expected": "#t", "category": "other"}
+{"prompt": "Evaluate this Sema expression:\n(count (hash-map))", "expected": "0", "category": "map"}
+{"prompt": "Evaluate this Sema expression:\n(list/contains? (list 1 2 3) 2)", "expected": "#t", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(get (hashmap/new :a 1 :b 2) :a)", "expected": "1", "category": "map"}
+{"prompt": "Evaluate this Sema expression:\n(stream/read-byte (stream/from-bytes (bytevector 42)))", "expected": "42", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(update-in 5 [] (fn (x) (+ x 1)))", "expected": "6", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n6.022e+23", "expected": "602200000000000027262976.0", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(type '(1 2))", "expected": ":list", "category": "other"}
+{"prompt": "Evaluate this Sema expression:\n(get (pio/delay 3 (pio/side 1 (pio/nop))) :delay)", "expected": "3", "category": "map"}
+{"prompt": "Evaluate this Sema expression:\n(list? (text/chunk \"\u03bb\u03bb\u03bb \u03bb\u03bb\u03bb \u03bb\u03bb\u03bb \u03bb\u03bb\u03bb \u03bb\u03bb\u03bb \u03bb\u03bb\u03bb\" {:size 12 :overlap 3}))", "expected": "#t", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(* 2 3.5)", "expected": "7.0", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(and 1 #f 3)", "expected": "#f", "category": "other"}
+{"prompt": "Evaluate this Sema expression:\n(stream/read-line (stream/from-string \"hello\\r\\nworld\"))", "expected": "\"hello\"", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(get (pio/mov :x :y :reverse) :mov-op)", "expected": ":reverse", "category": "map"}
+{"prompt": "Evaluate this Sema expression:\n(begin\n    (define (make-late)\n      (define n 0)\n      (define f (lambda () n))\n      (set! n 42)\n      f)\n    ((make-late)))", "expected": "42", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(match nil (nil \"null\") (_ \"other\"))", "expected": "\"null\"", "category": "control-flow"}
+{"prompt": "Evaluate this Sema expression:\n(let ((x 10) (y 20)) (+ x y))", "expected": "30", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(hash-map? (hash-map :a 1))", "expected": "#t", "category": "map"}
+{"prompt": "Evaluate this Sema expression:\n(begin (define p (delay (+ 1 2))) (force p) (force p))", "expected": "3", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(i64-array/ref (i64-array/set! (i64-array 10 20 30) 1 99) 1)", "expected": "99", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(get (assoc {:a 1} :b 2) :b)", "expected": "2", "category": "map"}
+{"prompt": "Evaluate this Sema expression:\n(length (prompt/slots (prompt (user \"{{x}} and {{x}}\"))))", "expected": "1", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(and 1 #f 3)", "expected": "#f", "category": "other"}
+{"prompt": "Evaluate this Sema expression:\n(length (list/take-last 2 (list 1 2 3 4)))", "expected": "2", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(bytevector-length (stream/read (stream/from-string \"hi\") 0))", "expected": "0", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(* 2 3e2)", "expected": "600.0", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(and)", "expected": "#t", "category": "other"}
+{"prompt": "Evaluate this Sema expression:\n(utf8->string (stream/read (stream/from-string \"hello\") 5))", "expected": "\"hello\"", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(get (map/deep-merge {:a 1} {:b 2}) :b)", "expected": "2", "category": "map"}
+{"prompt": "Evaluate this Sema expression:\n(string-length \"\")", "expected": "0", "category": "string"}
+{"prompt": "Evaluate this Sema expression:\n(get (time/date-parts 1704067200.0) :year)", "expected": "2024", "category": "map"}
+{"prompt": "Evaluate this Sema expression:\n(list/sum '())", "expected": "0", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(abs 5)", "expected": "5", "category": "other"}
+{"prompt": "Evaluate this Sema expression:\n(flat-map (fn (x) (list x x)) '(1 2 3))", "expected": "(1 1 2 2 3 3)", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(get (merge {:a 1} {:a 99}) :a)", "expected": "99", "category": "map"}
+{"prompt": "Evaluate this Sema expression:\n(any? even? '(1 2 3))", "expected": "#t", "category": "other"}
+{"prompt": "Evaluate this Sema expression:\n(list/sliding '(1 2 3 4 5) 2 2)", "expected": "((1 2) (3 4))", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(round 3.6)", "expected": "4", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(list/page '(1 2 3 4 5) 1 2)", "expected": "(1 2)", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(text/strip-html \"a &amp; b &lt; c\")", "expected": "\"a & b < c\"", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(round 3.5)", "expected": "4", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(length (conversation/messages (conversation/add-message (conversation/new) :user \"hello\")))", "expected": "1", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(> (sin 0.0) -0.001)", "expected": "#t", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n((fn (a b) (* a b)) 100000000000000 2)", "expected": "200000000000000", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(match {:type :err} ({:type :ok :val v} v) (_ \"fallback\"))", "expected": "\"fallback\"", "category": "control-flow"}
+{"prompt": "Evaluate this Sema expression:\n(string? \"hi\")", "expected": "#t", "category": "other"}
+{"prompt": "Evaluate this Sema expression:\n(count (frequencies '()))", "expected": "0", "category": "other"}
+{"prompt": "Evaluate this Sema expression:\n(keyword/to-string :foo)", "expected": "\"foo\"", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(last '(1 2 3))", "expected": "3", "category": "other"}
+{"prompt": "Evaluate this Sema expression:\n(length (keys (list/group-by even? '(1 2 3 4 5))))", "expected": "2", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(number? 42)", "expected": "#t", "category": "other"}
+{"prompt": "Evaluate this Sema expression:\n(match 5 (x when (> x 10) \"big\") (x when (> x 0) \"small\") (_ \"zero\"))", "expected": "\"small\"", "category": "control-flow"}
+{"prompt": "Evaluate this Sema expression:\n(sort-by (fn (x) (- 0 x)) '(3 1 2))", "expected": "(3 2 1)", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(char/to-integer #\\a)", "expected": "97", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(list/pad '() 2 \"x\")", "expected": "(\"x\" \"x\")", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(get-in {:a 1} [])", "expected": "{:a 1}", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(length (regex/find-all \"\\\\d+\" \"a1b2c3\"))", "expected": "3", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(message? 42)", "expected": "#f", "category": "other"}
+{"prompt": "Evaluate this Sema expression:\n(begin (define acc '()) (for-each (fn (x) (set! acc (cons x acc))) '(1 2 3)) (reverse acc))", "expected": "(1 2 3)", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(symbol? (gensym))", "expected": "#t", "category": "other"}
+{"prompt": "Evaluate this Sema expression:\n(length (vector 1 2 3))", "expected": "3", "category": "other"}
+{"prompt": "Evaluate this Sema expression:\n(nth '(10 20 30) 1)", "expected": "20", "category": "other"}
+{"prompt": "Evaluate this Sema expression:\n(pair? '(1 2))", "expected": "#t", "category": "other"}
+{"prompt": "Evaluate this Sema expression:\n(map? (map/new :a 1))", "expected": "#t", "category": "map"}
+{"prompt": "Evaluate this Sema expression:\n(i64-array/ref (i64-array/range 0 10 2) 4)", "expected": "8", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(list/reject even? '(2 4 6))", "expected": "()", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(let (({:x val} {:x 42})) val)", "expected": "42", "category": "binding"}
+{"prompt": "Evaluate this Sema expression:\n(first (list/take-last 2 (list 1 2 3 4)))", "expected": "3", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(let ((a 32768) (b 320462586) (c 352969177)) (- (* a (+ b c)) (+ (* a b) (* a c))))", "expected": "0", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n\n        (define (find-user id) (if (= id 1) \"Alice\" #f))\n        (match {:method :GET :path \"/users\" :id 99}\n          ({:method :GET :path \"/users\" :id id} when (find-user id)\n            (find-user id))\n          ({:method :GET :path \"/users\" :id id}\n            \"not-found\")\n          ({:method :GET :path \"/users\"}\n            \"all\")\n          (_ \"404\"))\n    ", "expected": "\"not-found\"", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(pair? '(1 2))", "expected": "#t", "category": "other"}
+{"prompt": "Evaluate this Sema expression:\n(time/format (time/add (time/parse \"2024-01-01 00:00:00\" \"%Y-%m-%d %H:%M:%S\") 3600) \"%Y-%m-%d %H:%M:%S\")", "expected": "\"2024-01-01 01:00:00\"", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(number? (list/pick '(1 2 3)))", "expected": "#t", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n\n        (string/contains? (toml/encode {:name \"test\"}) \"name = \\\"test\\\"\")\n    ", "expected": "#t", "category": "string"}
+{"prompt": "Evaluate this Sema expression:\n(match {:x 1} ({} :any-map) (_ :no))", "expected": ":any-map", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(i64-array/ref (i64-array/make 4) 0)", "expected": "0", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n((lambda (-) (- 5)) (lambda (x) (* x 10)))", "expected": "50", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(length (string/split \"a,b,c\" \",\"))", "expected": "3", "category": "string"}
+{"prompt": "Evaluate this Sema expression:\n(length (text/chunk \"\"))", "expected": "0", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(make-list 3 #t)", "expected": "(#t #t #t)", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(list/pad '(1 2) 5 0)", "expected": "(1 2 0 0 0)", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(try (let ((s (stream/from-string \"x\"))) (stream/close s) (stream/read-all s)) (catch e :error))", "expected": ":error", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(- 10 3)", "expected": "7", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(cdadr '(1 (2 3 4)))", "expected": "(3 4)", "category": "other"}
+{"prompt": "Evaluate this Sema expression:\n(get (pio/nop) :source)", "expected": ":y", "category": "map"}
+{"prompt": "Evaluate this Sema expression:\n(list/drop-while even? '(2 4 5 6))", "expected": "(5 6)", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(procedure? \"abc\")", "expected": "#f", "category": "other"}
+{"prompt": "Evaluate this Sema expression:\n(f64-array/ref (f64-array/set! (f64-array 1.0 2.0 3.0) 0 42) 0)", "expected": "42.0", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(char/numeric? #\\5)", "expected": "#t", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(range 1 5)", "expected": "(1 2 3 4)", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(length (text/split-sentences \"\"))", "expected": "0", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(string-trim \"  hello  \")", "expected": "\"hello\"", "category": "string"}
+{"prompt": "Evaluate this Sema expression:\n\n        (begin\n          (defmacro my-bind2 (a b)\n            `(let ((x# ,a) (y# ,b)) (+ x# y#)))\n          (my-bind2 10 20))\n    ", "expected": "30", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(i64-array/ref (i64-array/range 5 0 -1) 0)", "expected": "5", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n((fn ([a & rest]) rest) '(1 2 3))", "expected": "(2 3)", "category": "binding"}
+{"prompt": "Evaluate this Sema expression:\n(some? even? '(1 2 3))", "expected": "#t", "category": "other"}
+{"prompt": "Evaluate this Sema expression:\n(list/sliding '(1 2 3) 3)", "expected": "((1 2 3))", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(bytevector/length (bytevector/make 4 7))", "expected": "4", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(get (map/from-entries [[:a 1] [:b 2]]) :b)", "expected": "2", "category": "map"}
+{"prompt": "Evaluate this Sema expression:\n(list/sliding '(1 2 3 4 5 6) 2 3)", "expected": "((1 2) (4 5))", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(= (list \"q\\\"b\\\\s\") (read (str (list \"q\\\"b\\\\s\"))))", "expected": "#t", "category": "string"}
+{"prompt": "Evaluate this Sema expression:\n(number->string 42)", "expected": "\"42\"", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(contains? (dissoc (hash-map :a 1 :b 2) :a) :a)", "expected": "#f", "category": "map"}
+{"prompt": "Evaluate this Sema expression:\n(list/dedupe '(\"a\" \"a\" \"b\" \"b\" \"a\"))", "expected": "(\"a\" \"b\" \"a\")", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(bytevector/length (bytevector/from-list (list 1 2 3 4 5)))", "expected": "5", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(cdr '(1 2 3))", "expected": "(2 3)", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(foldr cons '() '(1 2 3))", "expected": "(1 2 3)", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(count (map/except {:a 1 :b 2} [:a]))", "expected": "1", "category": "map"}
+{"prompt": "Evaluate this Sema expression:\n(begin (deftool add-numbers \"Add\" {:a {:type :number}} (lambda (a) a)) (tool/name add-numbers))", "expected": "\"add-numbers\"", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(fn? +)", "expected": "#t", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(not #f)", "expected": "#t", "category": "other"}
+{"prompt": "Evaluate this Sema expression:\n(get (pio/assemble (list (pio/nop) :wrap-target (pio/nop) (pio/nop) :wrap)) :wrap)", "expected": "2", "category": "map"}
+{"prompt": "Evaluate this Sema expression:\n(> (conversation/token-count (conversation/add-message (conversation/new {:model \"test\"}) :user \"hello world this is a test\")) 0)", "expected": "#t", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(+ -3 -7)", "expected": "-10", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(empty? (hash-map))", "expected": "#t", "category": "map"}
+{"prompt": "Evaluate this Sema expression:\n(message/content (car (prompt/messages (prompt/fill (prompt (user \"Hi {{x}}\")) {:y \"z\"}))))", "expected": "\"Hi {{x}}\"", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(string/join '(\"a\" \"b\" \"c\") \"-\")", "expected": "\"a-b-c\"", "category": "string"}
+{"prompt": "Evaluate this Sema expression:\n(time/format (time/add (time/parse \"2024-01-01 00:00:00\" \"%Y-%m-%d %H:%M:%S\") 31622400) \"%Y-%m-%d %H:%M:%S\")", "expected": "\"2025-01-01 00:00:00\"", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(reverse '(1 2 3))", "expected": "(3 2 1)", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(time (fn () (+ 1 2)))", "expected": "3", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(mapcar (fn (x) (* x 2)) '(1 2 3))", "expected": "(2 4 6)", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(member 5 '(1 2 3))", "expected": "#f", "category": "other"}
+{"prompt": "Evaluate this Sema expression:\n(list/sum '(42))", "expected": "42", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(bytevector-u8-ref (bytevector 10 20 30) 1)", "expected": "20", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(let (([a b] '(1 2))) (+ a b))", "expected": "3", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(assert= \"hello\" \"hello\")", "expected": "#t", "category": "other"}
+{"prompt": "Evaluate this Sema expression:\n(term/green \"ok\")", "expected": "\"\u001b[32mok\u001b[0m\"", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(message/role (message :user \"hi\"))", "expected": ":user", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(unless #f 1 2 3)", "expected": "3", "category": "control-flow"}
+{"prompt": "Evaluate this Sema expression:\n(bytevector/u8-ref (bytevector 10 20 30) 1)", "expected": "20", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(list/median '(3 1 2))", "expected": "2.0", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(count (hashmap/new))", "expected": "0", "category": "map"}
+{"prompt": "Evaluate this Sema expression:\n(let (({} {:x 1})) 42)", "expected": "42", "category": "binding"}
+{"prompt": "Evaluate this Sema expression:\n(begin\n        (define (outer)\n          (define (f) factor)\n          (define factor 7)\n          (f))\n        (outer))", "expected": "7", "category": "binding"}
+{"prompt": "Evaluate this Sema expression:\n(time/diff (time/parse \"2024-01-01 00:00:00\" \"%Y-%m-%d %H:%M:%S\") (time/parse \"2024-01-01 00:00:00\" \"%Y-%m-%d %H:%M:%S\"))", "expected": "0.0", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(get (pio/assemble (list (pio/irq :set 0))) :instructions)", "expected": "#u8(0 192)", "category": "map"}
+{"prompt": "Evaluate this Sema expression:\n(llm/similarity '(1.0 0.0) '(0.0 1.0))", "expected": "0.0", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(cdaar '(((1 2 3)) 4))", "expected": "(2 3)", "category": "other"}
+{"prompt": "Evaluate this Sema expression:\n(empty? [])", "expected": "#t", "category": "other"}
+{"prompt": "Evaluate this Sema expression:\n(string-length (uuid/v4))", "expected": "36", "category": "string"}
+{"prompt": "Evaluate this Sema expression:\n(i64-array/ref (i64-array/range 0 10 2) 0)", "expected": "0", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(type \"hi\")", "expected": ":string", "category": "other"}
+{"prompt": "Evaluate this Sema expression:\n(string/empty? \"\")", "expected": "#t", "category": "string"}
+{"prompt": "Evaluate this Sema expression:\n(iota 5)", "expected": "(0 1 2 3 4)", "category": "other"}
+{"prompt": "Evaluate this Sema expression:\n(length (keys (list/group-by even? '())))", "expected": "0", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(list/intersect '(1 2 3) '(2 3 4))", "expected": "(2 3)", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(bytevector-length (base64/decode-bytes \"SGVsbG8=\"))", "expected": "5", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(equal? (string/intern \"hello\") (string/intern \"hello\"))", "expected": "#t", "category": "string"}
+{"prompt": "Evaluate this Sema expression:\n(list/sum '(1.5 2.5))", "expected": "4.0", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(match '(1 2 3) ([a b] \"two\") (_ \"other\"))", "expected": "\"other\"", "category": "control-flow"}
+{"prompt": "Evaluate this Sema expression:\n(list/chunk 2 '())", "expected": "()", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(begin (define-record-type point (make-point x y) point? (x point-x) (y point-y)) (point-x (make-point 3 4)))", "expected": "3", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(get (pio/assemble (list (pio/nop) (pio/nop))) :wrap)", "expected": "1", "category": "map"}
+{"prompt": "Evaluate this Sema expression:\n(vector? (list->vector '(1 2 3)))", "expected": "#t", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n\n        (begin\n          (defmacro vec-bind (val)\n            `(let ((v# ,val)) [v# v#]))\n          (vec-bind 5))\n    ", "expected": "[5 5]", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(begin (define (compose f g) (lambda (x) (f (g x)))) ((compose (lambda (x) (* x 2)) (lambda (x) (+ x 1))) 5))", "expected": "12", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(get (pio/assemble (list (pio/pull))) :instructions)", "expected": "#u8(160 128)", "category": "map"}
+{"prompt": "Evaluate this Sema expression:\n(list/duplicates '(1 2 3))", "expected": "()", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(hashmap/contains? (hashmap/new :a 1) :a)", "expected": "#t", "category": "map"}
+{"prompt": "Evaluate this Sema expression:\n(take-while even? '(2 4 5 6))", "expected": "(2 4)", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(hash-ref {:a 42} :a)", "expected": "42", "category": "map"}
+{"prompt": "Evaluate this Sema expression:\n(stream/writable? (stream/from-string \"x\"))", "expected": "#f", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(string/intern \"hello\")", "expected": "\"hello\"", "category": "string"}
+{"prompt": "Evaluate this Sema expression:\n(string/contains? \"hello\" \"xyz\")", "expected": "#f", "category": "string"}
+{"prompt": "Evaluate this Sema expression:\n(llm/similarity '(1.0 0.0 0.0) '(1.0 0.0 0.0))", "expected": "1.0", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(embedding/ref (embedding/list->embedding '(42)) 0)", "expected": "42.0", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(symbol->string 'foo)", "expected": "\"foo\"", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(type #\\a)", "expected": ":char", "category": "other"}
+{"prompt": "Evaluate this Sema expression:\n(let ((* +)) (* 3 4))", "expected": "7", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(length (hashmap/get (list/group-by even? '(1 2 3 4 5)) #f))", "expected": "3", "category": "map"}
+{"prompt": "Evaluate this Sema expression:\n(string->number \"42\")", "expected": "42", "category": "string"}
+{"prompt": "Evaluate this Sema expression:\n\n        (match #\\a\n          (#\\a :yes)\n          (_ :no))\n    ", "expected": ":yes", "category": "control-flow"}
+{"prompt": "Evaluate this Sema expression:\n(let ((c 0)) (define inc (fn () (set! c (+ c 1)))) (define get (fn () c)) (map (fn (x) (inc)) (list 1 2 3)) (get))", "expected": "3", "category": "map"}
+{"prompt": "Evaluate this Sema expression:\n(length (csv/parse \"a,b\\n1,2\\n3,4\"))", "expected": "3", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(contains? (dissoc {:a 1 :b 2} :a) :a)", "expected": "#f", "category": "other"}
+{"prompt": "Evaluate this Sema expression:\n(foldl (fn (acc x) (cons x acc)) '() '(1 2 3))", "expected": "(3 2 1)", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(text/clean-whitespace \"  hello   world  \")", "expected": "\"hello world\"", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(list/index-of '(10 20 30) 10)", "expected": "0", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(json/encode '(1 2 3))", "expected": "\"[1,2,3]\"", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(get (pio/in :pins 8) :source)", "expected": ":pins", "category": "map"}
+{"prompt": "Evaluate this Sema expression:\n(every? odd? (list 1 3 5))", "expected": "#t", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(get (hash-map :x 10) :y 42)", "expected": "42", "category": "map"}
+{"prompt": "Evaluate this Sema expression:\n(char/alphabetic? #\\a)", "expected": "#t", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(letrec ((+ (lambda (a b) (* a b)))) (+ 3 4))", "expected": "12", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(symbol? (string->symbol \"foo\"))", "expected": "#t", "category": "string"}
+{"prompt": "Evaluate this Sema expression:\n(list/intersect '(1 2) '())", "expected": "()", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(bit/shift-right 16 4)", "expected": "1", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(zero? -0.0)", "expected": "#t", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(length (list/shuffle '(1 2 3)))", "expected": "3", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(list/join '(1 2) \", \" \" and \")", "expected": "\"1 and 2\"", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(count (map/except (hash-map :a 1 :b 2 :c 3) '(:b)))", "expected": "2", "category": "map"}
+{"prompt": "Evaluate this Sema expression:\n(float? 3.14)", "expected": "#t", "category": "other"}
+{"prompt": "Evaluate this Sema expression:\n(cond ((= 1 1) 10 20 30))", "expected": "30", "category": "control-flow"}
+{"prompt": "Evaluate this Sema expression:\n(count (hash-map :a 1 :b 2))", "expected": "2", "category": "map"}
+{"prompt": "Evaluate this Sema expression:\n(length (prompt/messages (prompt/concat (prompt (system \"s\")) (prompt (user \"u\")) (prompt (assistant \"a\")))))", "expected": "3", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(get-in (assoc-in {:a {:b 1}} [:a :b] 42) [:a :b])", "expected": "42", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(begin (define (f x) (lambda (y) (lambda (z) (+ x y z)))) (((f 1) 2) 3))", "expected": "6", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(let ((x 9000000000000) (y -9000000000000)) (- x y))", "expected": "18000000000000", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n((fn (x) (* x x)) 4)", "expected": "16", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(map/get-in (map/assoc-in {} '(:a :b) 1) '(:a :b))", "expected": "1", "category": "map"}
+{"prompt": "Evaluate this Sema expression:\n(:a (map/map-vals (fn (v) (+ v 10)) {:a 1 :b 2}))", "expected": "11", "category": "map"}
+{"prompt": "Evaluate this Sema expression:\n(begin\n        (define (outer)\n          (let* ((x 1) (y 2))\n            (define (a) (+ x y (b)))\n            (define (b) 10)\n            (a)))\n        (outer))", "expected": "13", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(get (pio/jmp :!x 'bar) :cond)", "expected": ":!x", "category": "map"}
+{"prompt": "Evaluate this Sema expression:\n(let ((<= >=)) (<= 1 2))", "expected": "#f", "category": "binding"}
+{"prompt": "Evaluate this Sema expression:\n(empty? '(1))", "expected": "#f", "category": "other"}
+{"prompt": "Evaluate this Sema expression:\n(bit/shift-left 1 4)", "expected": "16", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(bytevector/length (bytevector 1 2 3))", "expected": "3", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(get (pio/assemble (list (pio/mov :x :!y))) :instructions)", "expected": "#u8(42 160)", "category": "map"}
+{"prompt": "Evaluate this Sema expression:\n(get (time/date-parts (time/parse \"1969-07-20 20:17:00\" \"%Y-%m-%d %H:%M:%S\")) :year)", "expected": "1969", "category": "map"}
+{"prompt": "Evaluate this Sema expression:\n(term/gray \"muted\")", "expected": "\"\u001b[90mmuted\u001b[0m\"", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n\n        (let* ((original {:name \"sema\" :version \"1.0\"})\n               (encoded (toml/encode original))\n               (decoded (toml/decode encoded)))\n          (list (:name decoded) (:version decoded)))\n    ", "expected": "(\"sema\" \"1.0\")", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(let (({:keys [x y]} {:x 10 :y 20})) (+ x y))", "expected": "30", "category": "map"}
+{"prompt": "Evaluate this Sema expression:\n(get (time/date-parts 1704067200.0) :hour)", "expected": "0", "category": "map"}
+{"prompt": "Evaluate this Sema expression:\n(foldl + 0 '(1 2 3))", "expected": "6", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(list/diff '(1 2 3 4) '(2 4))", "expected": "(1 3)", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(if-let (x 42) (+ x 1) 0)", "expected": "43", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(get (dissoc {:a 1 :b 2} :a) :b)", "expected": "2", "category": "map"}
+{"prompt": "Evaluate this Sema expression:\n(when-let (x 42) (+ x 1))", "expected": "43", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(> (time/now) 1704067200)", "expected": "#t", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(count (assoc {:a 1} :b 2 :c 3))", "expected": "3", "category": "map"}
+{"prompt": "Evaluate this Sema expression:\n(length (conversation/messages (conversation/filter (-> (conversation/new) (conversation/add-message :user \"hello\") (conversation/add-message :assistant \"hi\") (conversation/add-message :user \"bye\")) (fn (m) (= (message/role m) :user)))))", "expected": "2", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(case 2 ((1 2 3) :found) (else :miss))", "expected": ":found", "category": "control-flow"}
+{"prompt": "Evaluate this Sema expression:\n\n        (begin\n          (defmulti area (fn (shape) (get shape :type)))\n          (defmethod area :circle (fn (s) (* 3 (get s :radius) (get s :radius))))\n          (defmethod area :rect (fn (s) (* (get s :width) (get s :height))))\n          (area {:type :rect :width 4 :height 6}))\n    ", "expected": "24", "category": "map"}
+{"prompt": "Evaluate this Sema expression:\n(float 42)", "expected": "42.0", "category": "other"}
+{"prompt": "Evaluate this Sema expression:\n(or nil nil 3)", "expected": "3", "category": "other"}
+{"prompt": "Evaluate this Sema expression:\n(empty? \"\")", "expected": "#t", "category": "other"}
+{"prompt": "Evaluate this Sema expression:\n(let ((s (stream/byte-buffer))) (stream/write-byte s 65) (stream/write-byte s 66) (utf8->string (stream/to-bytes s)))", "expected": "\"AB\"", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(char->integer #\\a)", "expected": "97", "category": "string"}
+{"prompt": "Evaluate this Sema expression:\n(string/append \"a\" \"b\")", "expected": "\"ab\"", "category": "string"}
+{"prompt": "Evaluate this Sema expression:\n(try (throw \"err\") (catch e (define y 10) (+ y 5)))", "expected": "15", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(append '(1 2) '(3 4))", "expected": "(1 2 3 4)", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(count (map/select-keys {:a 1} '(:x :y)))", "expected": "0", "category": "map"}
+{"prompt": "Evaluate this Sema expression:\n(stream/type (stream/from-string \"x\"))", "expected": "\"string\"", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(f64-array/ref (f64-array/make 3) 1)", "expected": "0.0", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(hash-ref {:a 1 :b 2} :b)", "expected": "2", "category": "map"}
+{"prompt": "Evaluate this Sema expression:\n(string/upper \"hello\")", "expected": "\"HELLO\"", "category": "string"}
+{"prompt": "Evaluate this Sema expression:\n(conversation/model (conversation/new))", "expected": "\"\"", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(math/format-fixed 1.2 3)", "expected": "\"1.200\"", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(length (keys (frequencies '())))", "expected": "0", "category": "other"}
+{"prompt": "Evaluate this Sema expression:\n(begin (define (sum . args) (foldl + 0 args)) (sum 1 2 3 4 5))", "expected": "15", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(match \"hello\" (\"hello\" :hi) (_ :no))", "expected": ":hi", "category": "control-flow"}
+{"prompt": "Evaluate this Sema expression:\n(let ((list (fn (x) (* x 2)))) (list 5))", "expected": "10", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(list/median '(3 1 2 4))", "expected": "2.5", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(list/diff '(1 2 3) '(4 5))", "expected": "(1 2 3)", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(get (frequencies '(:a :b :a)) :a)", "expected": "2", "category": "map"}
+{"prompt": "Evaluate this Sema expression:\n\n        (match {:xs '(1 2 3)}\n          ({:xs [a & rest]} rest)\n          (_ nil))\n    ", "expected": "(2 3)", "category": "control-flow"}
+{"prompt": "Evaluate this Sema expression:\n(hashmap/get (frequencies '(5 5 5)) 5)", "expected": "3", "category": "map"}
+{"prompt": "Evaluate this Sema expression:\n(string/replace \"hello world\" \"world\" \"sema\")", "expected": "\"hello sema\"", "category": "string"}
+{"prompt": "Evaluate this Sema expression:\n(begin (define total 0) (define i 0) (while (< i 3) (define j 0) (while (< j 3) (set! total (+ total 1)) (set! j (+ j 1))) (set! i (+ i 1))) total)", "expected": "9", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(and 1 2 3)", "expected": "3", "category": "other"}
+{"prompt": "Evaluate this Sema expression:\n(get-in {:a {:b {:c 42}}} [:a :b :c])", "expected": "42", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(min 3 1 2)", "expected": "1", "category": "other"}
+{"prompt": "Evaluate this Sema expression:\n(try (throw \"oops\") (catch e (:value e)))", "expected": "\"oops\"", "category": "error-handling"}
+{"prompt": "Evaluate this Sema expression:\n(list/intersect '(1 2 2 3) '(2 4))", "expected": "(2 2)", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(let ((and (fn (a b) (* a b)))) (and 3 4))", "expected": "4", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(boolean? #t)", "expected": "#t", "category": "other"}
+{"prompt": "Evaluate this Sema expression:\n(stream/available? (stream/from-string \"\"))", "expected": "#f", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(if (> 3 2) :yes :no)", "expected": ":yes", "category": "control-flow"}
+{"prompt": "Evaluate this Sema expression:\n(json/decode \"true\")", "expected": "#t", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(count [1 2 3])", "expected": "3", "category": "other"}
+{"prompt": "Evaluate this Sema expression:\n(length (prompt/messages (prompt/set-system (prompt (system \"old\") (user \"hello\")) \"new\")))", "expected": "2", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(get (pio/assemble (list 'x (pio/jmp :!x 'x))) :instructions)", "expected": "#u8(32 0)", "category": "map"}
+{"prompt": "Evaluate this Sema expression:\n(begin\n    (define escaped #f)\n    (try\n      (begin\n        (define x 0)\n        (set! escaped (lambda () x))\n        (set! x 99)\n        (throw \"boom\"))\n      (catch e (escaped))))", "expected": "99", "category": "binding"}
+{"prompt": "Evaluate this Sema expression:\n(every even? '(2 3 6))", "expected": "#f", "category": "other"}
+{"prompt": "Evaluate this Sema expression:\n(apply + '(1 2 3))", "expected": "6", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(:a {:a 1 :b 2})", "expected": "1", "category": "other"}
+{"prompt": "Evaluate this Sema expression:\n(embedding/ref (embedding/list->embedding '(10.5 20.5 30.5)) 1)", "expected": "20.5", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(integer->char 65)", "expected": "#\\A", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(length (hashmap/keys (hashmap/new :a 1 :b 2)))", "expected": "2", "category": "map"}
+{"prompt": "Evaluate this Sema expression:\n(get (pio/set :pins 1) :value)", "expected": "1", "category": "map"}
+{"prompt": "Evaluate this Sema expression:\n(json/encode [1 2 3])", "expected": "\"[1,2,3]\"", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(hashmap/get (list/key-by (fn (m) (:id m)) (list {:id 1 :name \"a\"} {:id 2 :name \"b\"})) 1)", "expected": "{:id 1 :name \"a\"}", "category": "map"}
+{"prompt": "Evaluate this Sema expression:\n(odd? 3)", "expected": "#t", "category": "other"}
+{"prompt": "Evaluate this Sema expression:\n(get (pio/assemble (list (pio/wait 1 :gpio 15))) :instructions)", "expected": "#u8(143 32)", "category": "map"}
+{"prompt": "Evaluate this Sema expression:\n(string-length \"hello\")", "expected": "5", "category": "string"}
+{"prompt": "Evaluate this Sema expression:\n(contains? (map/map-keys (fn (k) :z) (hash-map :a 1)) :z)", "expected": "#t", "category": "map"}
+{"prompt": "Evaluate this Sema expression:\n(list/nth-or (list 10 20 30) 1 -1)", "expected": "20", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(string-append \"foo\" \"bar\")", "expected": "\"foobar\"", "category": "string"}
+{"prompt": "Evaluate this Sema expression:\n(match 42 (x (+ x 8)))", "expected": "50", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(contains? {:a 1} :a)", "expected": "#t", "category": "other"}
+{"prompt": "Evaluate this Sema expression:\n(spy \"tag\" \"hello\")", "expected": "\"hello\"", "category": "other"}
+{"prompt": "Evaluate this Sema expression:\n(fn? +)", "expected": "#t", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n\n        (match {:type :ok :val 42}\n          ({:type :ok :keys [val]} val)\n          (_ nil))\n    ", "expected": "42", "category": "map"}
+{"prompt": "Evaluate this Sema expression:\n(bytevector-length (make-bytevector 5 0))", "expected": "5", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(nth (vector 10 20 30) 1)", "expected": "20", "category": "other"}
+{"prompt": "Evaluate this Sema expression:\n(assert #t \"ok\")", "expected": "#t", "category": "other"}
+{"prompt": "Evaluate this Sema expression:\n(= (/ -1.0 0.0) (read \"-inf\"))", "expected": "#t", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(get (pio/mov :x :y) :dest)", "expected": ":x", "category": "map"}
+{"prompt": "Evaluate this Sema expression:\n(count (map/from-entries '()))", "expected": "0", "category": "map"}
+{"prompt": "Evaluate this Sema expression:\n(get (pio/assemble (list (pio/set :x 31))) :instructions)", "expected": "#u8(63 224)", "category": "map"}
+{"prompt": "Evaluate this Sema expression:\n(range 0 10 3)", "expected": "(0 3 6 9)", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(list/interleave '() '(1 2 3))", "expected": "()", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n((lambda (a [b c]) (+ a b c)) 10 '(20 30))", "expected": "60", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(math/round-to 2.7 0)", "expected": "3.0", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(bytevector? (make-bytevector 3 0))", "expected": "#t", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(get (pio/side 1 (pio/nop)) :side-set)", "expected": "1", "category": "map"}
+{"prompt": "Evaluate this Sema expression:\n(get (pio/assemble (list\n        'start\n        (pio/pull)\n        (pio/out :pins 1)\n        (pio/jmp 'start))) :instructions)", "expected": "#u8(160 128 1 96 0 0)", "category": "map"}
+{"prompt": "Evaluate this Sema expression:\n\n        (begin\n          (define x## 99)\n          x##)\n    ", "expected": "99", "category": "binding"}
+{"prompt": "Evaluate this Sema expression:\n(do ((a 1 b) (b 2 a) (n 0 (+ n 1))) ((= n 1) (list a b)))", "expected": "(2 1)", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(string/index-of \"hello\" \"ll\")", "expected": "2", "category": "string"}
+{"prompt": "Evaluate this Sema expression:\n(get (merge {:a 1} {:b 2}) :b)", "expected": "2", "category": "map"}
+{"prompt": "Evaluate this Sema expression:\n(cadr '(1 2 3))", "expected": "2", "category": "other"}
+{"prompt": "Evaluate this Sema expression:\n(if \"\" :truthy :falsy)", "expected": ":truthy", "category": "control-flow"}
+{"prompt": "Evaluate this Sema expression:\n(list/mode '(5 5 5))", "expected": "5", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(length (keys (list/key-by car '())))", "expected": "0", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(begin\n        (define (outer)\n          (define (mid)\n            (define (a) (b))\n            (define (b) 42)\n            (a))\n          (mid))\n        (outer))", "expected": "42", "category": "binding"}
+{"prompt": "Evaluate this Sema expression:\n(let ((c 0)) (foldl (fn (acc x) (set! c (+ c x)) acc) 0 (list 1 2 3)) c)", "expected": "6", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(caadr '(1 (2 3) 4))", "expected": "2", "category": "other"}
+{"prompt": "Evaluate this Sema expression:\n(stream/read-line (stream/from-string \"\\n\"))", "expected": "\"\"", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(list/pad '() 3 0)", "expected": "(0 0 0)", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(bit/not 0)", "expected": "-1", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(term/style \"plain\")", "expected": "\"plain\"", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(bytevector->list (list->bytevector '(10 20 30)))", "expected": "(10 20 30)", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(get (regex/match \"\\\\d+\" \"abc123def\") :match)", "expected": "\"123\"", "category": "map"}
+{"prompt": "Evaluate this Sema expression:\n(get (pio/jmp 'foo) :target)", "expected": "foo", "category": "map"}
+{"prompt": "Evaluate this Sema expression:\n(eval '(+ 1 2))", "expected": "3", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(list/dedupe '(1 1 2 1 1))", "expected": "(1 2 1)", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(max 3 7)", "expected": "7", "category": "other"}
+{"prompt": "Evaluate this Sema expression:\n(string->number \"42\")", "expected": "42", "category": "string"}
+{"prompt": "Evaluate this Sema expression:\n(i64-array/ref (i64-array/range 5 0 -1) 4)", "expected": "1", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(bytevector/length (bytevector/new 3))", "expected": "3", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(take 2 '(1 2 3 4))", "expected": "(1 2)", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(json/decode \"42\")", "expected": "42", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(begin\n    (define (test)\n      (define n 0)\n      (define inc (lambda (x) (set! n (+ n 1)) n))\n      (map inc (list 1 2 3)))\n    (test))", "expected": "(1 2 3)", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(list/intersect '(1 2) '(3 4))", "expected": "()", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n\n        (begin\n          (defmacro multi (a b c d)\n            `(let ((w# ,a) (x# ,b) (y# ,c) (z# ,d))\n               (+ w# x# y# z#)))\n          (multi 1 2 3 4))\n    ", "expected": "10", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n\n        (begin\n          (defmacro capture-test (body)\n            `(let ((result# 999)) ,body))\n          (let ((result# 1))\n            (capture-test result#)))\n    ", "expected": "1", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(begin (context/set-hidden :secret \"s3cret\") (context/get-hidden :secret))", "expected": "\"s3cret\"", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(keyword? (string->keyword \"foo\"))", "expected": "#t", "category": "string"}
+{"prompt": "Evaluate this Sema expression:\n(int 3.7)", "expected": "3", "category": "other"}
+{"prompt": "Evaluate this Sema expression:\n(:a (deep-merge {:a 1}))", "expected": "1", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(assert #t)", "expected": "#t", "category": "other"}
+{"prompt": "Evaluate this Sema expression:\n(begin (deftool add-numbers \"Add\" {:a {:type :number}} (lambda (a) a)) (tool? add-numbers))", "expected": "#t", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(let* ((+ *) (x (+ 3 4))) x)", "expected": "12", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(length (list/shuffle '()))", "expected": "0", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n\n        (let ((t (toml/decode \"[package]\\nname = \\\"test\\\"\\nversion = \\\"1.0\\\"\")))\n          (:name (:package t)))\n    ", "expected": "\"test\"", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n\n        (begin\n          (defmulti combine (fn (a b) (list (type a) (type b))))\n          (defmethod combine '(:int :int) (fn (a b) (+ a b)))\n          (defmethod combine '(:string :string) (fn (a b) (string-append a b)))\n          (list (combine 1 2) (combine \"a\" \"b\")))\n    ", "expected": "(3 \"ab\")", "category": "string"}
+{"prompt": "Evaluate this Sema expression:\n(count (map/except {:a 1 :b 2 :c 3} '(:a :c)))", "expected": "1", "category": "map"}
+{"prompt": "Evaluate this Sema expression:\n(nth [10 20 30] 1)", "expected": "20", "category": "other"}
+{"prompt": "Evaluate this Sema expression:\n(get (json/decode (json/encode {:a 1})) :a)", "expected": "1", "category": "map"}
+{"prompt": "Evaluate this Sema expression:\n(get (pio/assemble (list (pio/delay 31 (pio/nop)))) :instructions)", "expected": "#u8(66 191)", "category": "map"}
+{"prompt": "Evaluate this Sema expression:\n\n        (match {:x 1}\n          ({:keys [x y]} (list x y))\n          (_ :no))\n    ", "expected": "(1 nil)", "category": "map"}
+{"prompt": "Evaluate this Sema expression:\n(get (pio/assemble (list (pio/delay 3 (pio/set :pins 1)))) :instructions)", "expected": "#u8(1 227)", "category": "map"}
+{"prompt": "Evaluate this Sema expression:\n((fn (a b) (+ a b)) 100000000000000 1)", "expected": "100000000000001", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(length (conversation/messages (conversation/set-system (conversation/add-message (conversation/add-message (conversation/new) :system \"old\") :user \"hi\") \"new\")))", "expected": "2", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(time/format 0.0 \"%Y-%m-%d\")", "expected": "\"1970-01-01\"", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(json/encode #f)", "expected": "\"false\"", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(get {:a 1 :b 2} :a)", "expected": "1", "category": "map"}
+{"prompt": "Evaluate this Sema expression:\n(math/sign -3)", "expected": "-1", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(count (map/select-keys (hash-map :a 1 :b 2 :c 3) '(:a :c)))", "expected": "2", "category": "map"}
+{"prompt": "Evaluate this Sema expression:\n(bytevector-length (bytevector 1 2 3))", "expected": "3", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n((lambda ([a b]) (+ a b)) '(1 2))", "expected": "3", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(get-in (deep-merge {:a 1} {:b 2} {:c 3}) [:c])", "expected": "3", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(list/median '(1 2 3 4 5))", "expected": "3.0", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(let ((x 10500918018048) (y 11566093991936)) (+ x y))", "expected": "22067012009984", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(string-ref \"abc\" 1)", "expected": "#\\b", "category": "string"}
+{"prompt": "Evaluate this Sema expression:\n(length (text/chunk-by-separator \"a\\nb\\nc\" \"\\n\"))", "expected": "3", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(map? {:a 1})", "expected": "#t", "category": "other"}
+{"prompt": "Evaluate this Sema expression:\n(let ((m {:name \"Ada\"})) f\"name: ${(:name m)}\")", "expected": "\"name: Ada\"", "category": "binding"}
+{"prompt": "Evaluate this Sema expression:\n(take-while even? '(2 4 6))", "expected": "(2 4 6)", "category": "list"}
+{"prompt": "Evaluate this Sema expression:\n(get (pio/jmp 'foo) :cond)", "expected": ":always", "category": "map"}
+{"prompt": "Evaluate this Sema expression:\n(ceil 3.2)", "expected": "4", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(length (regex/split \",\" \"a,b,c\"))", "expected": "3", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(length (string/chars \"hello\"))", "expected": "5", "category": "string"}
+{"prompt": "Evaluate this Sema expression:\n(get-in {:a {:b 2}} [:a :b] 0)", "expected": "2", "category": "arithmetic"}
+{"prompt": "Evaluate this Sema expression:\n(contains? (hash-map :x 1) :x)", "expected": "#t", "category": "map"}

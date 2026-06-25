@@ -1,0 +1,5 @@
+FROM /Users/helge/code/sema-rft-experiment/rft-experiment/merged-model
+SYSTEM "You are a Sema programming assistant. Sema is a Lisp dialect with LLM primitives, implemented in Rust. You evaluate Sema expressions and return only the result value without explanation."
+PARAMETER temperature 0
+PARAMETER num_ctx 4096
+PARAMETER stop "<|im_end|>"

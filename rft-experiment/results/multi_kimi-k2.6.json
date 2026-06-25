@@ -1,0 +1,602 @@
+[
+  {
+    "task_id": "L1-001",
+    "level": 1,
+    "category": "arithmetic",
+    "score": 0.3,
+    "detail": "wrong: expected '3', got '(+ 1 2)'",
+    "tool_calls": 1,
+    "latency_s": 1.8038358688354492,
+    "completion": "The expression `(+ 1 2)` evaluates to **3**."
+  },
+  {
+    "task_id": "L1-002",
+    "level": 1,
+    "category": "arithmetic",
+    "score": 0.3,
+    "detail": "wrong: expected '42', got '(* 6 7)'",
+    "tool_calls": 1,
+    "latency_s": 1.9433648586273193,
+    "completion": "The expression `(* 6 7)` evaluates to **42**."
+  },
+  {
+    "task_id": "L1-003",
+    "level": 1,
+    "category": "list",
+    "score": 0.3,
+    "detail": "wrong: expected '(2 4 6)', got 'was multiplied by'",
+    "tool_calls": 1,
+    "latency_s": 2.054731845855713,
+    "completion": "The result is:\n\n```sema\n(2 4 6)\n```\n\nEach element in the list `(1 2 3)` was multiplied by `2`."
+  },
+  {
+    "task_id": "L1-004",
+    "level": 1,
+    "category": "list",
+    "score": 0.3,
+    "detail": "wrong: expected '(1 3 5)', got 'returns true, giving the list of odd numbers'",
+    "tool_calls": 1,
+    "latency_s": 2.786400079727173,
+    "completion": "The result is:\n\n```sema\n(1 3 5)\n```\n\n`filter` keeps only the elements of the list `(1 2 3 4 5)` for which `odd?` returns true, giving the list of odd numbers `(1 3 5)`."
+  },
+  {
+    "task_id": "L1-005",
+    "level": 1,
+    "category": "map",
+    "score": 0.3,
+    "detail": "wrong: expected '1', got 'sema\\n1'",
+    "tool_calls": 1,
+    "latency_s": 2.7382960319519043,
+    "completion": "The result is:\n\n```sema\n1\n```"
+  },
+  {
+    "task_id": "L1-006",
+    "level": 1,
+    "category": "string",
+    "score": 1.0,
+    "detail": "correct",
+    "tool_calls": 1,
+    "latency_s": 2.562459945678711,
+    "completion": "The result is:\n\n```\n\"HELLO\"\n```"
+  },
+  {
+    "task_id": "L1-007",
+    "level": 1,
+    "category": "string",
+    "score": 0.3,
+    "detail": "wrong: expected 'hi', got ''",
+    "tool_calls": 1,
+    "latency_s": 2.6703031063079834,
+    "completion": "The result is:\n\n```sema\n\"hi\"\n```\n\n`string/trim` removes leading and trailing whitespace from the string."
+  },
+  {
+    "task_id": "L1-008",
+    "level": 1,
+    "category": "let",
+    "score": 0.3,
+    "detail": "wrong: expected '30', got 'sema\\n(let ((x 10) (y 20)) (+ x y))\\n; => 30'",
+    "tool_calls": 1,
+    "latency_s": 2.8588600158691406,
+    "completion": "The expression evaluates to **30**.\n\n```sema\n(let ((x 10) (y 20)) (+ x y))\n; => 30\n```"
+  },
+  {
+    "task_id": "L1-009",
+    "level": 1,
+    "category": "cond",
+    "score": 0.3,
+    "detail": "wrong: expected 'b', got 'is returned.\\n- The'",
+    "tool_calls": 1,
+    "latency_s": 3.3770129680633545,
+    "completion": "The result is:\n\n```sema\nb\n```\n\n**Explanation:** `cond` evaluates each test in order. \n- `(= 1 2)` is false, so `'a` is skipped.\n- `(= 1 1)` is true, so `'b` is returned.\n- The `else` clause is never reached because a matching condition was found first."
+  },
+  {
+    "task_id": "L1-010",
+    "level": 1,
+    "category": "list",
+    "score": 0.3,
+    "detail": "wrong: expected '15', got '**15**'",
+    "tool_calls": 1,
+    "latency_s": 4.046518087387085,
+    "completion": "The result is **15**.\n\n```sema\n(foldl + 0 '(1 2 3 4 5))\n; => 15\n```\n\n`foldl` reduces the list from left to right, accumulating the sum starting from the initial value `0`:\n\n- `0 + 1 = 1`\n- `1 + 2 = 3`\n- `3 + 3 = 6`\n- `6 + 4 = 10`\n- `10 + 5 = 15`"
+  },
+  {
+    "task_id": "L1-011",
+    "level": 1,
+    "category": "predicate",
+    "score": 0.3,
+    "detail": "wrong: expected 'true', got '**'",
+    "tool_calls": 1,
+    "latency_s": 2.608062982559204,
+    "completion": "The result is **`#t`** (true).\n\nIn Sema, `nil?` checks whether a value is `nil`, so `(nil? nil)` returns true."
+  },
+  {
+    "task_id": "L1-012",
+    "level": 1,
+    "category": "keyword",
+    "score": 0.3,
+    "detail": "wrong: expected '42', got '**42**'",
+    "tool_calls": 1,
+    "latency_s": 3.239560127258301,
+    "completion": "The result is **42**.\n\nIn Sema, keywords can be used as functions to look up themselves in a map. So `(:a {:a 42 :b 99})` retrieves the value associated with the key `:a`."
+  },
+  {
+    "task_id": "L1-013",
+    "level": 1,
+    "category": "short-lambda",
+    "score": 0.3,
+    "detail": "wrong: expected '(1 4 9)', got 'applies it to every item, yielding'",
+    "tool_calls": 1,
+    "latency_s": 3.026421070098877,
+    "completion": "The result is:\n\n```sema\n(1 4 9)\n```\n\nThe short-lambda `#(* % %)` squares each element of the list `(1 2 3)`, and `map` applies it to every item, yielding `(1 4 9)`."
+  },
+  {
+    "task_id": "L1-014",
+    "level": 1,
+    "category": "f-string",
+    "score": 0.3,
+    "detail": "wrong: expected 'Hello World', got \"function converts its argument to a string. Since it's already a string, it simply returns\"",
+    "tool_calls": 1,
+    "latency_s": 5.101842164993286,
+    "completion": "The expression evaluates to:\n\n```\n\"Hello World\"\n```\n\nHere's what happens step by step:\n\n1. `f\"Hello ${\"World\"}\"` \u2014 The f-string interpolates the inner string literal `\"World\"`, producing the string `\"Hello World\"`.\n2. `(str \"Hello World\")` \u2014 The `str` function converts its argument to a string. Since it's already a string, it simply returns `\"Hello World\"`."
+  },
+  {
+    "task_id": "L1-015",
+    "level": 1,
+    "category": "map",
+    "score": 0.3,
+    "detail": "wrong: expected '{:a 11}', got ', yielding'",
+    "tool_calls": 1,
+    "latency_s": 2.487467050552368,
+    "completion": "The expression evaluates to:\n\n```sema\n{:a 11}\n```\n\n`map/update` takes a map, a key, and a function. It applies the function to the current value at that key (or `nil` if absent) and updates the map with the result. Here, `:a` starts at `1`, and `#(+ % 10)` adds `10`, yielding `11`."
+  },
+  {
+    "task_id": "L2-001",
+    "level": 2,
+    "category": "function",
+    "score": 1.0,
+    "detail": "correct",
+    "tool_calls": 1,
+    "latency_s": 2.0385921001434326,
+    "completion": "Here is the `square` function and its evaluation:\n\n```sema\n(define (square x)\n  (* x x))\n\n(square 5)\n```\n\n**Result:** `25`"
+  },
+  {
+    "task_id": "L2-002",
+    "level": 2,
+    "category": "function",
+    "score": 1.0,
+    "detail": "correct",
+    "tool_calls": 1,
+    "latency_s": 3.9070217609405518,
+    "completion": "Here is the function and its evaluation:\n\n```sema\n(defun even-or-odd (n)\n  (if (even? n)\n      :even\n      :odd))\n\n(even-or-odd 7)\n; => :odd\n```\n\nThe function uses the built-in predicate `even?` to test the number, returning the keyword `:even` if true and `:odd` otherwise. Evaluating `(even-or-odd 7)` returns `:odd`."
+  },
+  {
+    "task_id": "L2-003",
+    "level": 2,
+    "category": "list",
+    "score": 1.0,
+    "detail": "correct",
+    "tool_calls": 2,
+    "latency_s": 26.255642890930176,
+    "completion": "Here is a tail-recursive-style definition using `foldl` (which avoids relying on the built-in `length`):\n\n```sema\n(define (my-length lst)\n  (foldl (fn (acc _) (+ acc 1)) 0 lst))\n```\n\nEvaluating `(my-length '(1 2 3 4))` returns:\n\n```sema\n4\n```"
+  },
+  {
+    "task_id": "L2-004",
+    "level": 2,
+    "category": "list",
+    "score": 1.0,
+    "detail": "correct",
+    "tool_calls": 2,
+    "latency_s": 28.908729076385498,
+    "completion": "```sema\n(define (my-reverse lst)\n  (foldl (fn (acc x) (cons x acc)) '() lst))\n\n(my-reverse '(1 2 3))\n```\n\n**Result:** `(3 2 1)`\n\n`foldl` threads the accumulator as the first argument to the folding function, so each element is `cons`ed onto the front of the accumulated list, producing a reversed list."
+  },
+  {
+    "task_id": "L2-005",
+    "level": 2,
+    "category": "string",
+    "score": 0.3,
+    "detail": "wrong: expected 'true', got '#t'",
+    "tool_calls": 2,
+    "latency_s": 10.871355772018433,
+    "completion": "Here is the Sema function and its evaluation:\n\n```sema\n(define (palindrome? s)\n  (= s (string/reverse s)))\n```\n\nEvaluating `(palindrome? \"racecar\")` returns:\n\n```sema\n#t\n```"
+  },
+  {
+    "task_id": "L2-006",
+    "level": 2,
+    "category": "math",
+    "score": 1.0,
+    "detail": "correct",
+    "tool_calls": 1,
+    "latency_s": 3.7952771186828613,
+    "completion": "Here is the tail-recursive `factorial` using a named `let`:\n\n```sema\n(define (factorial n)\n  (let loop ((i n) (acc 1))\n    (if (= i 0)\n        acc\n        (loop (- i 1) (* acc i)))))\n```\n\nEvaluating `(factorial 5)` yields:\n\n```sema\n120\n```"
+  },
+  {
+    "task_id": "L2-007",
+    "level": 2,
+    "category": "fibonacci",
+    "score": 1.0,
+    "detail": "correct",
+    "tool_calls": 1,
+    "latency_s": 5.736469984054565,
+    "completion": "Here is the TCO Fibonacci function using a named `let`, and the evaluation of `(fib 10)`:\n\n```lisp\n(define (fib n)\n  (let loop ((i n) (a 0) (b 1))\n    (if (= i 0)\n        a\n        (loop (- i 1) b (+ a b)))))\n```\n\n**Result:**\n```lisp\n(fib 10)\n;; => 55\n```\n\nThe named `let` binds `loop` as a local function. On each iteration it decrements `i`, shifts `b` into `a`, and sets `b` to the sum of the previous two values, making the recursion tail-recursive."
+  },
+  {
+    "task_id": "L2-008",
+    "level": 2,
+    "category": "map",
+    "score": 0.3,
+    "detail": "wrong: expected '{:bird 1 :cat 1 :dog 1 :the 3}', got '{\"bird\" 1 \"cat\" 1 \"dog\" 1 \"the\" 3}'",
+    "tool_calls": 1,
+    "latency_s": 14.440286874771118,
+    "completion": "Here's the `count-words` function and its evaluation:\n\n```sema\n(defn count-words (s)\n  (let ((words (string/split s \" \")))\n    (foldl (fn (acc word)\n             (assoc acc word (+ (get acc word 0) 1)))\n           {}\n           words)))\n\n(count-words \"the cat the dog the bird\")\n```\n\n**Result:**\n```sema\n{\"bird\" 1, \"cat\" 1, \"dog\" 1, \"the\" 3}\n```\n\nThe function splits the string on spaces, then folds over the resulting list, using `assoc` to build a map where each word maps to its frequency. `get` p"
+  },
+  {
+    "task_id": "L2-009",
+    "level": 2,
+    "category": "list",
+    "score": 1.0,
+    "detail": "correct",
+    "tool_calls": 1,
+    "latency_s": 11.161495208740234,
+    "completion": "Here is the function using `foldl`, along with the evaluation:\n\n```sema\n(define (max-of-list nums)\n  (if (nil? nums)\n      nil\n      (foldl (fn (a b) (if (> a b) a b))\n             (car nums)\n             (cdr nums))))\n```\n\n**Evaluation:**\n```sema\n(max-of-list '(3 7 2 9 4))\n; => 9\n```\n\nThe `foldl` walks through the list carrying the largest value seen so far (`a`), comparing it against each element (`b`) and keeping the greater of the two. The first element is used as the initial accumulator."
+  },
+  {
+    "task_id": "L2-010",
+    "level": 2,
+    "category": "string",
+    "score": 0.0,
+    "detail": "error: Type error: expected string, got list",
+    "tool_calls": 2,
+    "latency_s": 13.278857946395874,
+    "completion": "Here is a custom `title-case` implementation that splits on spaces, capitalizes each word, and rejoins them:\n\n```sema\n(defn title-case (s)\n  (->> (string/split s \" \")\n       (map string/capitalize)\n       (string/join \" \")))\n```\n\nEvaluating your example:\n\n```sema\n(title-case \"hello world foo\")\n; => \"Hello World Foo\"\n```\n\n*(Note: Sema also provides a built-in `string/title-case` that handles this, but the function above shows how to build it from core string operations.)*"
+  },
+  {
+    "task_id": "L2-011",
+    "level": 2,
+    "category": "predicate",
+    "score": 0.3,
+    "detail": "wrong: expected 'true', got '#t'",
+    "tool_calls": 1,
+    "latency_s": 4.6387779712677,
+    "completion": "Here is a simple trial-division primality test in Sema:\n\n```sema\n(define (prime? n)\n  (if (< n 2)\n      #f\n      (let loop ((i 2))\n        (if (> (* i i) n)\n            #t\n            (if (= (mod n i) 0)\n                #f\n                (loop (+ i 1)))))))\n```\n\nEvaluating `(prime? 17)` returns:\n\n```sema\n#t\n```\n\nSo **17 is prime**."
+  },
+  {
+    "task_id": "L2-012",
+    "level": 2,
+    "category": "map",
+    "score": 1.0,
+    "detail": "correct",
+    "tool_calls": 1,
+    "latency_s": 5.119884014129639,
+    "completion": "Here is the function and its evaluation:\n\n```sema\n(define (map-keys-only m)\n  (keys m))\n\n(map-keys-only {:a 1 :b 2 :c 3})\n```\n\n**Result:** `(:a :b :c)`\n\nThe built-in `keys` function extracts all keys from a map and returns them as a list, so `map-keys-only` simply delegates to it."
+  },
+  {
+    "task_id": "L2-013",
+    "level": 2,
+    "category": "threading",
+    "score": 0.3,
+    "detail": "wrong: expected '165', got 'sema\\n(->> (range 1 11)\\n     (filter odd?)\\n     (map (fn (x) (* x x)))\\n     (reduce +))'",
+    "tool_calls": 2,
+    "latency_s": 12.113440752029419,
+    "completion": "```sema\n(->> (range 1 11)\n     (filter odd?)\n     (map (fn (x) (* x x)))\n     (reduce +))\n```"
+  },
+  {
+    "task_id": "L2-014",
+    "level": 2,
+    "category": "match",
+    "score": 1.0,
+    "detail": "correct",
+    "tool_calls": 2,
+    "latency_s": 10.41554307937622,
+    "completion": "Here is the `classify` function using `match`, and the evaluation of `(classify -5)`:\n\n```sema\n(define (classify n)\n  (match n\n    (_ when (> n 0) :positive)\n    (_ when (< n 0) :negative)\n    (_ :zero)))\n\n(classify -5)  ; => :negative\n```\n\n**Result:** `:negative`"
+  },
+  {
+    "task_id": "L2-015",
+    "level": 2,
+    "category": "destructure",
+    "score": 1.0,
+    "detail": "correct",
+    "tool_calls": 2,
+    "latency_s": 11.974486827850342,
+    "completion": "```sema\n(defun swap-pair (pair)\n  (match pair\n    ([a b] [b a])))\n\n(swap-pair '(1 2))\n```\n\n**Result:** `[2 1]`"
+  },
+  {
+    "task_id": "L3-001",
+    "level": 3,
+    "category": "data-transform",
+    "score": 1.0,
+    "detail": "correct",
+    "tool_calls": 1,
+    "latency_s": 9.013323068618774,
+    "completion": "Here is the function and its evaluation:\n\n```sema\n(define (group-by-parity nums)\n  {:evens (filter even? nums)\n   :odds  (filter odd? nums)})\n\n(group-by-parity '(1 2 3 4 5 6))\n```\n\n**Result:**\n```sema\n{:evens (2 4 6) :odds (1 3 5)}\n```"
+  },
+  {
+    "task_id": "L3-002",
+    "level": 3,
+    "category": "string",
+    "score": 0.3,
+    "detail": "wrong: expected '{:cat 1 :the 3}', got '{\"cat\" 1 \"the\" 3}'",
+    "tool_calls": 2,
+    "latency_s": 43.01296520233154,
+    "completion": "Here is the corrected `word-freq` function. The key fix is using **`regex/split`** (not `string/split`) with a regex to split on whitespace:\n\n```sema\n(define (word-freq s)\n  (->> s\n       (string/lower)\n       (regex/split #\"\\s+\")\n       (foldl (fn (acc word)\n                (map/update acc word #(if (nil? %) 1 (+ % 1))))\n              {})))\n\n(word-freq \"the The THE cat\")\n```\n\n**Result:**\n```sema\n{\"the\" 3 \"cat\" 1}\n```\n\n**Explanation:**\n1. `string/lower` lowercases the entire string.\n2. `regex/sp"
+  },
+  {
+    "task_id": "L3-003",
+    "level": 3,
+    "category": "record",
+    "score": 0.3,
+    "detail": "wrong: expected '5', got '5.0'",
+    "tool_calls": 2,
+    "latency_s": 13.100701808929443,
+    "completion": "Here is the complete solution:\n\n```sema\n(define-record-type Point\n  (make-point x y)\n  point?\n  (x point-x)\n  (y point-y))\n\n(define (distance p1 p2)\n  (let ((dx (- (point-x p2) (point-x p1)))\n        (dy (- (point-y p2) (point-y p1))))\n    (sqrt (+ (* dx dx) (* dy dy)))))\n\n(distance (make-point 0 0) (make-point 3 4))\n```\n\n**Result:** `5.0`"
+  },
+  {
+    "task_id": "L3-004",
+    "level": 3,
+    "category": "macro",
+    "score": 1.0,
+    "detail": "correct",
+    "tool_calls": 2,
+    "latency_s": 8.017390966415405,
+    "completion": "Here is the `unless` macro and its evaluation:\n\n```lisp\n(defmacro unless (condition . body)\n  `(if (not ,condition)\n     (begin ,@body)\n     nil))\n\n(unless false 42)\n```\n\n**Result:** `42`\n\nThe macro expands `(unless false 42)` into `(if (not false) (begin 42) nil)`, so the body runs because the condition is false."
+  },
+  {
+    "task_id": "L3-005",
+    "level": 3,
+    "category": "json",
+    "score": 0.5,
+    "detail": "runs ok",
+    "tool_calls": 1,
+    "latency_s": 3.3748159408569336,
+    "completion": "Here is the Sema expression:\n\n```sema\n(json/encode {:id 1 :name \"Alice\" :roles [:admin :user]})\n```\n\nResult:\n```json\n\"{\\\"id\\\":1,\\\"name\\\":\\\"Alice\\\",\\\"roles\\\":[\\\"admin\\\",\\\"user\\\"]}\"\n```"
+  },
+  {
+    "task_id": "L3-006",
+    "level": 3,
+    "category": "multimethod",
+    "score": 1.0,
+    "detail": "correct",
+    "tool_calls": 2,
+    "latency_s": 7.834419012069702,
+    "completion": "```sema\n(defmulti area #(get % :type))\n\n(defmethod area :circle\n  (fn (shape)\n    (let ((r (get shape :radius)))\n      (* 3.14159 (* r r)))))\n\n(defmethod area :rectangle\n  (fn (shape)\n    (let ((w (get shape :width))\n          (h (get shape :height)))\n      (* w h))))\n\n(area {:type :circle :radius 5})\n;; => 78.53975\n```"
+  },
+  {
+    "task_id": "L3-007",
+    "level": 3,
+    "category": "match",
+    "score": 1.0,
+    "detail": "correct",
+    "tool_calls": 2,
+    "latency_s": 19.801215171813965,
+    "completion": "```sema\n(define (handle-request req)\n  (match req\n    ({:method :GET :path \"/health\"} {:status 200 :body \"ok\"})\n    ({:method :POST :path \"/users\"} {:status 201 :body \"created\"})\n    (_ {:status 404 :body \"not found\"})))\n\n(handle-request {:method :GET :path \"/health\"})\n```\n\n**Explanation:**\n- `(define (handle-request req) ...)` defines a function that takes an HTTP request map.\n- `match` checks the map against literal map patterns. Each clause is a list `(pattern result)`.\n- The first clause `({"
+  },
+  {
+    "task_id": "L3-008",
+    "level": 3,
+    "category": "error-handling",
+    "score": 1.0,
+    "detail": "correct",
+    "tool_calls": 2,
+    "latency_s": 11.46331000328064,
+    "completion": "Here is the `safe-divide` function using `try/catch`, along with the evaluation:\n\n```sema\n(define (safe-divide num den)\n  (try\n    (/ num den)\n    (catch e\n      {:error (:message e)})))\n\n(safe-divide 10 2)\n```\n\n**Result:** `5`\n\nIf you call `(safe-divide 10 0)`, it will catch the division-by-zero exception and return `{:error \"division by zero\"}`."
+  },
+  {
+    "task_id": "L3-009",
+    "level": 3,
+    "category": "threading",
+    "score": 0.3,
+    "detail": "wrong: expected 'HELLO, WORLD, FOO, BAR', got 'inserted'",
+    "tool_calls": 2,
+    "latency_s": 29.26271891593933,
+    "completion": "So `string/split` takes the string first, then the delimiter. That means with `->>` (thread-last), I cannot simply write `(string/split \" \")` because that would put the threaded value last, making it `(string/split \" \" \"Hello World Foo Bar\")`, which is wrong.\n\nWait, but the error from the first eval was about `string/join` getting a list. Let me re-read the error: \"expected string, got list\". \n\nActually, if `string/split` takes string first, delimiter second, then `(->> \"Hello World Foo Bar\" (st"
+  },
+  {
+    "task_id": "L3-010",
+    "level": 3,
+    "category": "recursion",
+    "score": 1.0,
+    "detail": "correct",
+    "tool_calls": 1,
+    "latency_s": 11.724432229995728,
+    "completion": "Here's the recursive `tree-sum` function and its evaluation:\n\n```sema\n(define (tree-sum tree)\n  (cond\n    ((number? tree) tree)\n    ((list? tree) (foldl + 0 (map tree-sum tree)))\n    (else 0)))\n\n(tree-sum '(1 (2 3) (4 (5 6))))\n```\n\n**Result:** `21`\n\n**How it works:**\n- If the element is a `number?`, return it directly\n- If it's a `list?`, recursively apply `tree-sum` to each element via `map`, then `foldl` with `+` starting from `0` to sum the results\n- Any other type falls through to `else` and"
+  },
+  {
+    "task_id": "L3-011",
+    "level": 3,
+    "category": "map",
+    "score": 1.0,
+    "detail": "correct",
+    "tool_calls": 2,
+    "latency_s": 10.315053701400757,
+    "completion": "Here is the function and its result:\n\n```sema\n(defun deep-merge-user (user1 user2)\n  (merge user1 user2))\n\n(deep-merge-user {:name \"Alice\" :age 30} {:age 31 :role :admin})\n;; => {:age 31 :name \"Alice\" :role :admin}\n```\n\nThe stdlib `merge` combines the two maps, with keys from the second map (`user2`) overriding those in the first (`user1`). In this case, `:age` is updated from `30` to `31`, and the new `:role` key is added, while `:name` is preserved from the original map."
+  },
+  {
+    "task_id": "L3-012",
+    "level": 3,
+    "category": "pattern",
+    "score": 1.0,
+    "detail": "correct",
+    "tool_calls": 1,
+    "latency_s": 11.267460823059082,
+    "completion": "Here's the `fizzbuzz` function and its evaluation:\n\n```sema\n(define (fizzbuzz n)\n  (map (fn (i)\n         (cond\n           ((and (= (mod i 3) 0) (= (mod i 5) 0)) \"FizzBuzz\")\n           ((= (mod i 3) 0) \"Fizz\")\n           ((= (mod i 5) 0) \"Buzz\")\n           (else (str i))))\n       (range 1 (+ n 1))))\n```\n\nEvaluating `(fizzbuzz 5)` returns:\n\n```sema\n(\"1\" \"2\" \"Fizz\" \"4\" \"Buzz\")\n```"
+  },
+  {
+    "task_id": "L3-013",
+    "level": 3,
+    "category": "higher-order",
+    "score": 1.0,
+    "detail": "correct",
+    "tool_calls": 1,
+    "latency_s": 5.784130096435547,
+    "completion": "Here's the solution:\n\n```sema\n(define (compose f g)\n  (fn (x) (f (g x))))\n\n(define (square x) (* x x))\n(define (add1 x) (+ x 1))\n\n(define composed (compose square add1))\n\n(composed 4)\n; => 25\n```\n\n**Explanation:**\n\n- `compose` takes two functions `f` and `g` and returns an anonymous function `(fn (x) (f (g x)))`.\n- When called with `x`, it first applies `g` to `x`, then applies `f` to the result.\n- `(compose square add1)` creates a function that computes **square(add1(x))**.\n- With input `4`: `a"
+  },
+  {
+    "task_id": "L3-014",
+    "level": 3,
+    "category": "string",
+    "score": 0.0,
+    "detail": "error: Type error: expected string, got list",
+    "tool_calls": 2,
+    "latency_s": 27.075065851211548,
+    "completion": "The user wants me to provide the final answer now without calling more tools. Let me think about what I know.\n\nI found that `str` converts values to strings. But `string/join` gave an error when I passed a list. Let me think about the syntax.\n\nIn many Lisps, `string/join` might take the separator and the list as separate arguments, but maybe in Sema it expects a vector or the arguments are different. Actually, looking at the error: \"expected string, got list\" - this might mean `string/join` expe"
+  },
+  {
+    "task_id": "L3-015",
+    "level": 3,
+    "category": "let*",
+    "score": 0.3,
+    "detail": "wrong: expected '(3 2)', got '[3.0 2.0]'",
+    "tool_calls": 1,
+    "latency_s": 10.856441736221313,
+    "completion": "Here is the `quadratic-roots` function using `let*` to bind the discriminant, its square root, and the denominator:\n\n```sema\n(define (quadratic-roots a b c)\n  (let* ((discriminant (- (* b b) (* 4 a c)))\n         (sqrt-disc (sqrt discriminant))\n         (denom (* 2 a))\n         (root1 (/ (+ (- b) sqrt-disc) denom))\n         (root2 (/ (- (- b) sqrt-disc) denom)))\n    [root1 root2]))\n```\n\nEvaluating `(quadratic-roots 1 -5 6)` returns:\n\n```sema\n[3.0 2.0]\n```\n\n*(The results are floating-point because"
+  },
+  {
+    "task_id": "L4-001",
+    "level": 4,
+    "category": "data-pipeline",
+    "score": 1.0,
+    "detail": "correct",
+    "tool_calls": 2,
+    "latency_s": 25.738257884979248,
+    "completion": "```sema\n(define users\n  [{:name \"Alice\" :age 30}\n   {:name \"Bob\" :age 17}\n   {:name \"Carol\" :age 25}\n   {:name \"Dave\" :age 40}])\n\n(->> users\n     (filter (fn (u) (>= (get u :age) 18)))\n     (sort-by (fn (u) (get u :age)))\n     reverse\n     (map (fn (u) (get u :name))))\n```\n\n**Explanation:**\n1. **`filter`** keeps only users where `:age` is 18 or older (Bob is removed).\n2. **`sort-by`** orders the remaining users by `:age` in ascending order.\n3. **`reverse`** flips the list to descending order by "
+  },
+  {
+    "task_id": "L4-002",
+    "level": 4,
+    "category": "interpreter",
+    "score": 1.0,
+    "detail": "correct",
+    "tool_calls": 1,
+    "latency_s": 18.50598978996277,
+    "completion": "Here is a concise `eval-expr` that recursively evaluates the expression tree:\n\n```sema\n(define (eval-expr expr)\n  (cond\n    ((number? expr) expr)\n    ((list? expr)\n     (let ((op (car expr))\n           (left (cadr expr))\n           (right (caddr expr)))\n       (cond\n         ((eq? op '+) (+ (eval-expr left) (eval-expr right)))\n         ((eq? op '-) (- (eval-expr left) (eval-expr right)))\n         ((eq? op '*) (* (eval-expr left) (eval-expr right)))\n         ((eq? op '/) (/ (eval-expr left) (eval"
+  },
+  {
+    "task_id": "L4-003",
+    "level": 4,
+    "category": "state-machine",
+    "score": 0.3,
+    "detail": "wrong: expected '(:red :green :yellow :red :green)', got '(:red :green :yellow :red :green :yellow)'",
+    "tool_calls": 2,
+    "latency_s": 25.79676866531372,
+    "completion": "Here is the complete solution:\n\n```sema\n(define (next-state state)\n  (match state\n    (:red :green)\n    (:green :yellow)\n    (:yellow :red)))\n\n(define (run-states n)\n  (let loop ((i 0) (current :red) (acc (list :red)))\n    (if (= i n)\n      (reverse acc)\n      (let ((next (next-state current)))\n        (loop (+ i 1) next (cons next acc))))))\n\n(run-states 5)\n```\n\n**Result:** `(:red :green :yellow :red :green :yellow)`\n\nExplanation:\n- `next-state` uses `match` to transition `:red \u2192 :green`, `:gree"
+  },
+  {
+    "task_id": "L4-004",
+    "level": 4,
+    "category": "web-server",
+    "score": 0.3,
+    "detail": "wrong: expected '{:body \"ok\" :status 200}', got 'None'",
+    "tool_calls": 2,
+    "latency_s": 22.231404781341553,
+    "completion": "```sema\n(define router\n  (let ((routes [{:method \"GET\" :path \"/health\" :handler (fn (req) {:status 200 :body \"ok\"})}\n                 {:method \"GET\" :path \"/status\" :handler (fn (req) {:status 200 :body \"running\"})}]))\n    (fn (request)\n      (let ((matched (first (filter (fn (r) (and (= (get r :method) (get request :method))\n                                                  (= (get r :path) (get request :path))))\n                                    routes))))\n        (if (nil? matched)\n        "
+  },
+  {
+    "task_id": "L4-005",
+    "level": 4,
+    "category": "macro",
+    "score": 1.0,
+    "detail": "correct",
+    "tool_calls": 2,
+    "latency_s": 9.927261352539062,
+    "completion": "Here is the macro and its evaluation:\n\n```sema\n(defmacro my-when-let (binding . body)\n  `(let (,binding) (when ,(car binding) ,@body)))\n\n(my-when-let (x (get {:a 42} :a)) (* x 2))\n```\n\n**Result:** `84`\n\n**How it works:** The macro takes a binding pair `(var expr)` and a body. It expands to a `let` that binds the variable, wrapped in a `when` that tests the bound variable. If the value is non-nil, the body executes with the binding in scope; otherwise the whole form evaluates to nil."
+  },
+  {
+    "task_id": "L4-006",
+    "level": 4,
+    "category": "reduce",
+    "score": 1.0,
+    "detail": "correct",
+    "tool_calls": 1,
+    "latency_s": 4.666703939437866,
+    "completion": "Here is the `pipe` function using `foldl`, along with the evaluated result:\n\n```sema\n(define (pipe val fns)\n  (foldl (fn (acc f) (f acc)) val fns))\n\n(pipe 5 (list (fn (x) (+ x 1)) (fn (x) (* x 2)) (fn (x) (- x 3))))\n```\n\n**Result:** `9`\n\nThe computation flows left-to-right:\n1. `5 + 1 = 6`\n2. `6 * 2 = 12`\n3. `12 - 3 = 9`"
+  },
+  {
+    "task_id": "L4-007",
+    "level": 4,
+    "category": "matrix",
+    "score": 1.0,
+    "detail": "correct",
+    "tool_calls": 2,
+    "latency_s": 15.299669027328491,
+    "completion": "Here is the Sema function and its evaluation:\n\n```sema\n(define (matrix-transpose m)\n  (if (nil? m)\n      '()\n      (apply map list m)))\n\n(matrix-transpose '((1 2 3) (4 5 6)))\n```\n\n**Result:** `((1 4) (2 5) (3 6))`\n\nThe implementation uses `apply` to pass each row of the matrix as an argument to `map`, which then zips together the elements column-wise into the transposed rows. The `nil?` guard safely returns an empty list for an empty matrix."
+  },
+  {
+    "task_id": "L4-008",
+    "level": 4,
+    "category": "parser",
+    "score": 0.0,
+    "detail": "error: Command '['/Users/helge/code/sema-rft-experiment/target/debug/sema', 'eval', '--expr', '(begin (define (parse-csv-line line)\\n  (define (loop chars in",
+    "tool_calls": 2,
+    "latency_s": 46.030405044555664,
+    "completion": "The user wants me to provide the final answer. I should write a Sema function `parse-csv-line` that parses a single CSV line.\n\nLet me think through the implementation carefully.\n\nI'll implement it using a recursive helper that processes the string character by character. I'll convert the string to a list of characters using `string/to-list` and then recurse through it.\n\nStates:\n- `in-quote?` (boolean): whether we're inside quotes\n- `current` (list of chars): characters accumulated for the curren"
+  },
+  {
+    "task_id": "L4-009",
+    "level": 4,
+    "category": "json-transform",
+    "score": 0.3,
+    "detail": "wrong: expected '{:Alice 30 :Bob 25}', got '{\"Alice\" 30 \"Bob\" 25}'",
+    "tool_calls": 1,
+    "latency_s": 12.7536301612854,
+    "completion": "Here's the function and its evaluation:\n\n```sema\n(define (transform-users users)\n  (foldl (fn (acc user)\n           (assoc acc (:name user) (:age user)))\n         {}\n         users))\n\n(transform-users [{:name \"Alice\" :age 30} {:name \"Bob\" :age 25}])\n```\n\n**Result:** `{\"Alice\" 30 \"Bob\" 25}`\n\nThe `foldl` iterates over each user map, and `assoc` builds up the accumulator map by using the `:name` value as the key and the `:age` value as the value. The initial accumulator is an empty map `{}`."
+  },
+  {
+    "task_id": "L4-010",
+    "level": 4,
+    "category": "memoize",
+    "score": 0.0,
+    "detail": "error: Type error: expected list or vector, got symbol",
+    "tool_calls": 2,
+    "latency_s": 34.10943794250488,
+    "completion": "The user wants me to provide the final answer now without calling more tools. I need to write a Sema `memoize` function and test it.\n\nBased on the docs, I know:\n- `set!` can mutate an existing variable binding\n- There are hashmaps with `hashmap/new` and `hashmap/assoc`\n- There are also regular maps with `assoc`, `get`, etc.\n\nI should write a memoize function using a closure. Since Sema seems to have immutable maps by default (with `assoc` returning a new map), I can use `set!` to rebind the cach"
+  },
+  {
+    "task_id": "L5-001",
+    "level": 5,
+    "category": "macro",
+    "score": 1.0,
+    "detail": "correct",
+    "tool_calls": 2,
+    "latency_s": 19.480077028274536,
+    "completion": "Here is the `for-list` macro and its evaluation:\n\n```sema\n(defmacro for-list (bindings body)\n  (let ((var (nth bindings 0))\n        (coll (nth bindings 1))\n        (rest (drop 2 bindings)))\n    (if (and (= (length rest) 2) (= (nth rest 0) :when))\n        (let ((pred (nth rest 1)))\n          `(map (fn (,var) ,body) (filter (fn (,var) ,pred) ,coll)))\n        `(map (fn (,var) ,body) ,coll))))\n\n(for-list [x (range 10) :when (odd? x)] (* x x))\n```\n\n**Result:** `(1 9 25 49 81)`\n\nThe macro expands the "
+  },
+  {
+    "task_id": "L5-002",
+    "level": 5,
+    "category": "macro",
+    "score": 1.0,
+    "detail": "correct",
+    "tool_calls": 2,
+    "latency_s": 17.368489980697632,
+    "completion": "Here is the `defn-with-logging` macro and a test that defines `add` and calls it:\n\n```sema\n(defmacro defn-with-logging (name args . body)\n  `(define ,name\n     (fn ,args\n       (println \"Calling\" ',name \"with args:\" (list ,@args))\n       (let ((result (begin ,@body)))\n         (println \"Returning from\" ',name \"with value:\" result)\n         result))))\n\n(defn-with-logging add (a b)\n  (+ a b))\n\n(add 2 3)\n```\n\n**What it does:**\n\n- The macro captures the function `name`, the `args` list, and the `bod"
+  },
+  {
+    "task_id": "L5-003",
+    "level": 5,
+    "category": "async",
+    "score": 1.0,
+    "detail": "correct",
+    "tool_calls": 2,
+    "latency_s": 13.84849214553833,
+    "completion": "```sema\n(let ((ch (channel/new)))\n  (let ((p (async (channel/send ch 42))))\n    (await p)\n    (channel/recv ch)))\n```"
+  },
+  {
+    "task_id": "L5-004",
+    "level": 5,
+    "category": "lazy",
+    "score": 0.0,
+    "detail": "error: Type error: expected thunk, got list",
+    "tool_calls": 2,
+    "latency_s": 13.078427076339722,
+    "completion": "Here is the Sema implementation:\n\n```sema\n(define (integers-from n)\n  (cons n (delay (integers-from (+ n 1)))))\n\n(define (stream-take s n)\n  (if (= n 0)\n      '()\n      (cons (car s)\n            (stream-take (force (cdr s)) (- n 1)))))\n\n(stream-take (integers-from 1) 5)\n```\n\n**Explanation:**\n\n- **`integers-from`** builds a lazy stream as a `cons` pair where the `car` is the current integer `n` and the `cdr` is a **delayed** promise of the rest of the stream starting from `(+ n 1)`.\n- **`stream-t"
+  },
+  {
+    "task_id": "L5-005",
+    "level": 5,
+    "category": "quasiquote",
+    "score": 0.3,
+    "detail": "wrong: expected '10', got 'None'",
+    "tool_calls": 2,
+    "latency_s": 23.86875820159912,
+    "completion": "The user wants the final answer. I should provide the macro code and the test result. The test shows that (swap! x 20) returns 10 and x becomes 20. Wait, in my second test I got 10 for the whole begin because I appended x at the end? No, wait:\n\n(begin (define x 10) (swap! x 20) x) should return 20 if x is 20. But it returned 10. That's strange. Let me think...\n\nOh! The issue is that `define` inside `begin` at the REPL level might be behaving differently, or the macro expansion has a problem. Wai"
+  }
+]

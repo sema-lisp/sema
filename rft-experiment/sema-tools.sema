@@ -1,0 +1,43 @@
+;; ─────────────────────────────────────────────────────────────────────────────
+;; Sema MCP tools for RAG-powered docs search + code evaluation
+;; ─────────────────────────────────────────────────────────────────────────────
+;;
+;; Usage (from the sema-lisp worktree root):
+;;   sema mcp rft-experiment/sema-tools.sema
+;;
+;; Pre-built vector store at /tmp/sema-docs-rag.vec (run index first)
+
+(vector-store/open "docs" "/tmp/sema-docs-rag.vec")
+
+;; ── Tool: docs_search ────────────────────────────────────────────────────────
+(deftool docs_search
+  "Search Sema documentation semantically. Returns relevant doc entries with function names, descriptions, and code examples. Use this to find the right function or syntax for a task."
+  {:query {:type :string :description "What you're looking for, e.g. 'reverse a list' or 'read file lines'"}}
+  (lambda (query)
+    (let* ((query-vec (llm/embed query))
+           (candidates (vector-store/search "docs" query-vec 10))
+           (candidate-texts (map (lambda (c) (:text (:metadata c))) candidates))
+           (reranked (llm/rerank query candidate-texts {:top-k 5})))
+      (string/join
+       (map (lambda (r)
+              (let* ((idx (:index r))
+                     (c (nth candidates idx))
+                     (name (:name (:metadata c)))
+                     (score (math/round-to (:score r) 3))
+                     (text (:text (:metadata c))))
+                (string-append "### " (str name) " (relevance: " (str score) ")\n" (str text))))
+            reranked)
+       "\n\n---\n\n"))))
+
+;; ── Tool: eval_code ──────────────────────────────────────────────────────────
+(deftool eval_code
+  "Evaluate Sema code and return the result. Use this to test your code before returning it. Returns the evaluated value as a string, or an error message."
+  {:code {:type :string :description "The Sema code to evaluate"}}
+  (lambda (code)
+    (try
+      (let ((result (eval (read-many code))))
+        (if (nil? result)
+            "nil"
+            (str result)))
+      (catch e
+        (string-append "ERROR: " (:message e))))))

@@ -1,0 +1,166 @@
+{"test_name": "destructure_err_too_few", "input": "(let (([a b c] '(1 2))) a)", "expected_error": "destructure: expected 3", "file": "crates/sema/tests/eval_test.rs"}
+{"test_name": "destructure_err_too_many", "input": "(let (([a b] '(1 2 3))) a)", "expected_error": "destructure: expected 2", "file": "crates/sema/tests/eval_test.rs"}
+{"test_name": "destructure_err_non_list", "input": "(let (([a b] 42)) a)", "expected_error": "expected list or vector", "file": "crates/sema/tests/eval_test.rs"}
+{"test_name": "destructure_err_non_map", "input": "(let (({:keys [x]} '(1 2))) x)", "expected_error": "expected map", "file": "crates/sema/tests/eval_test.rs"}
+{"test_name": "sci_int_overflow", "input": "(int 1.0e19)", "expected_error": "int", "file": "crates/sema/tests/eval_test.rs"}
+{"test_name": "assert_false", "input": "(assert #f)", "expected_error": "assertion failed", "file": "crates/sema/tests/eval_test.rs"}
+{"test_name": "assert_nil", "input": "(assert nil)", "expected_error": "assertion failed", "file": "crates/sema/tests/eval_test.rs"}
+{"test_name": "assert_with_message", "input": "(assert #f \"custom error\")", "expected_error": "custom error", "file": "crates/sema/tests/eval_test.rs"}
+{"test_name": "assert_eq_mismatch", "input": "(assert= 1 2)", "expected_error": "assertion failed", "file": "crates/sema/tests/eval_test.rs"}
+{"test_name": "match_no_clause_raises", "input": "(match 42 (1 \"one\") (2 \"two\"))", "expected_error": "no clause matched", "file": "crates/sema/tests/eval_test.rs"}
+{"test_name": "match_all_clauses_fail_raises", "input": "(match {:x [1]} ({:x [1 2]} :bad) ({:x [a b c]} :bad2))", "expected_error": "no clause matched", "file": "crates/sema/tests/eval_test.rs"}
+{"test_name": "match_guards_all_fail_raises", "input": "(match 5 (x when (> x 100) \"big\") (x when (< x 0) \"neg\"))", "expected_error": "no clause matched", "file": "crates/sema/tests/eval_test.rs"}
+{"test_name": "string_intern_wrong_type", "input": "(string/intern 42)", "expected_error": "expected string", "file": "crates/sema/tests/eval_test.rs"}
+{"test_name": "string_intern_no_args", "input": "(string/intern)", "expected_error": "string/intern expects 1", "file": "crates/sema/tests/eval_test.rs"}
+{"test_name": "toml_decode_invalid_input", "input": "(toml/decode \"[invalid\")", "expected_error": "toml/decode", "file": "crates/sema/tests/eval_test.rs"}
+{"test_name": "toml_encode_non_map", "input": "(toml/encode \"not a map\")", "expected_error": "top-level value must be a map", "file": "crates/sema/tests/eval_test.rs"}
+{"test_name": "toml_decode_wrong_type", "input": "(toml/decode 42)", "expected_error": "expected string", "file": "crates/sema/tests/eval_test.rs"}
+{"test_name": "toml_encode_nil_value", "input": "(toml/encode {:key nil})", "expected_error": "cannot encode nil", "file": "crates/sema/tests/eval_test.rs"}
+{"test_name": "multi_no_method", "input": "\n        (begin\n          (defmulti f (fn (x) x))\n          (defmethod f :a (fn (x) 1))\n          (f :b))\n    ", "expected_error": "no method", "file": "crates/sema/tests/eval_test.rs"}
+{"test_name": "multi_defmethod_not_multi", "input": "\n        (begin\n          (define x 42)\n          (defmethod x :a (fn (x) 1)))\n    ", "expected_error": "not a multimethod", "file": "crates/sema/tests/eval_test.rs"}
+{"test_name": "multi_defmulti_no_args", "input": "(defmulti)", "expected_error": "defmulti expects 2", "file": "crates/sema/tests/eval_test.rs"}
+{"test_name": "multi_defmethod_no_args", "input": "(defmethod)", "expected_error": "defmethod expects 3", "file": "crates/sema/tests/eval_test.rs"}
+{"test_name": "destructure_err_amp_no_rest", "input": "(let (([a &] '(1 2))) a)", "expected_error": "`&` must be followed by a rest pattern", "file": "crates/sema/tests/eval_test.rs"}
+{"test_name": "destructure_err_amp_multiple", "input": "(let (([a & b c] '(1 2 3))) a)", "expected_error": "only one pattern allowed after `&`", "file": "crates/sema/tests/eval_test.rs"}
+{"test_name": "destructure_err_non_map_int", "input": "(let (({:keys [x]} 42)) x)", "expected_error": "expected map", "file": "crates/sema/tests/eval_test.rs"}
+{"test_name": "destructure_err_nested_nil", "input": "(let (({:a [x y]} {})) x)", "expected_error": "expected list or vector", "file": "crates/sema/tests/eval_test.rs"}
+{"test_name": "stream_read_wrong_type", "input": "(stream/read 42 5)", "expected_error": "expected stream", "file": "crates/sema/tests/eval_test.rs"}
+{"test_name": "stream_write_wrong_type", "input": "(stream/write 42 (bytevector 1))", "expected_error": "expected stream", "file": "crates/sema/tests/eval_test.rs"}
+{"test_name": "stream_write_to_readonly", "input": "(stream/write (stream/from-string \"x\") (bytevector 1))", "expected_error": "read-only", "file": "crates/sema/tests/eval_test.rs"}
+{"test_name": "stream_read_closed", "input": "(let ((s (stream/from-string \"hi\"))) (stream/close s) (stream/read s 1))", "expected_error": "stream is closed", "file": "crates/sema/tests/eval_test.rs"}
+{"test_name": "stream_write_closed", "input": "(let ((s (stream/byte-buffer))) (stream/close s) (stream/write s (bytevector 1)))", "expected_error": "stream is closed", "file": "crates/sema/tests/eval_test.rs"}
+{"test_name": "stream_read_byte_wrong_type", "input": "(stream/read-byte 42)", "expected_error": "expected stream", "file": "crates/sema/tests/eval_test.rs"}
+{"test_name": "stream_write_byte_range", "input": "(let ((s (stream/byte-buffer))) (stream/write-byte s 256))", "expected_error": "out of range", "file": "crates/sema/tests/eval_test.rs"}
+{"test_name": "stream_write_byte_negative", "input": "(let ((s (stream/byte-buffer))) (stream/write-byte s -1))", "expected_error": "out of range", "file": "crates/sema/tests/eval_test.rs"}
+{"test_name": "stream_to_bytes_wrong_stream", "input": "(stream/to-bytes (stream/from-string \"x\"))", "expected_error": "expected byte-buffer stream", "file": "crates/sema/tests/eval_test.rs"}
+{"test_name": "stream_to_string_wrong_stream", "input": "(stream/to-string (stream/from-string \"x\"))", "expected_error": "expected byte-buffer stream", "file": "crates/sema/tests/eval_test.rs"}
+{"test_name": "stream_read_negative_count", "input": "(stream/read (stream/from-string \"x\") -1)", "expected_error": "non-negative", "file": "crates/sema/tests/eval_test.rs"}
+{"test_name": "stream_from_string_wrong_type", "input": "(stream/from-string 42)", "expected_error": "expected string", "file": "crates/sema/tests/eval_test.rs"}
+{"test_name": "stream_from_bytes_wrong_type", "input": "(stream/from-bytes 42)", "expected_error": "expected bytevector", "file": "crates/sema/tests/eval_test.rs"}
+{"test_name": "pio_err_undefined_label", "input": "(pio/assemble (list (pio/jmp 'nowhere)))", "expected_error": "undefined label", "file": "crates/sema/tests/eval_test.rs"}
+{"test_name": "pio_err_duplicate_label", "input": "(pio/assemble (list 'x (pio/nop) 'x (pio/nop)))", "expected_error": "duplicate label", "file": "crates/sema/tests/eval_test.rs"}
+{"test_name": "pio_err_set_value_too_large", "input": "(pio/set :pins 32)", "expected_error": "out of range", "file": "crates/sema/tests/eval_test.rs"}
+{"test_name": "pio_err_set_invalid_dest", "input": "(pio/set :foo 1)", "expected_error": "unknown destination", "file": "crates/sema/tests/eval_test.rs"}
+{"test_name": "pio_err_jmp_target_not_symbol", "input": "(pio/jmp 42)", "expected_error": "expected symbol", "file": "crates/sema/tests/eval_test.rs"}
+{"test_name": "pio_err_delay_too_large", "input": "(pio/delay 32 (pio/nop))", "expected_error": "out of range", "file": "crates/sema/tests/eval_test.rs"}
+{"test_name": "pio_err_invalid_jmp_cond", "input": "(pio/jmp :bogus 'x)", "expected_error": "unknown condition", "file": "crates/sema/tests/eval_test.rs"}
+{"test_name": "pio_err_bit_count_zero", "input": "(pio/in :pins 0)", "expected_error": "bit count", "file": "crates/sema/tests/eval_test.rs"}
+{"test_name": "pio_err_bit_count_33", "input": "(pio/out :pins 33)", "expected_error": "bit count", "file": "crates/sema/tests/eval_test.rs"}
+{"test_name": "pio_err_invalid_in_source", "input": "(pio/in :foo 8)", "expected_error": "unknown source", "file": "crates/sema/tests/eval_test.rs"}
+{"test_name": "pio_err_invalid_out_dest", "input": "(pio/out :foo 8)", "expected_error": "unknown destination", "file": "crates/sema/tests/eval_test.rs"}
+{"test_name": "pio_err_invalid_mov_dest", "input": "(pio/mov :foo :y)", "expected_error": "unknown destination", "file": "crates/sema/tests/eval_test.rs"}
+{"test_name": "pio_err_invalid_mov_source", "input": "(pio/mov :x :foo)", "expected_error": "unknown source", "file": "crates/sema/tests/eval_test.rs"}
+{"test_name": "pio_err_irq_index_too_large", "input": "(pio/irq :set 8)", "expected_error": "out of range", "file": "crates/sema/tests/eval_test.rs"}
+{"test_name": "pio_err_wait_polarity", "input": "(pio/wait 2 :gpio 0)", "expected_error": "polarity must be 0 or 1", "file": "crates/sema/tests/eval_test.rs"}
+{"test_name": "pio_err_set_negative", "input": "(pio/set :pins -1)", "expected_error": "out of range", "file": "crates/sema/tests/eval_test.rs"}
+{"test_name": "pio_err_pull_bad_option", "input": "(pio/pull :bogus)", "expected_error": "unexpected option", "file": "crates/sema/tests/eval_test.rs"}
+{"test_name": "pio_err_push_bad_option", "input": "(pio/push :bogus)", "expected_error": "unexpected option", "file": "crates/sema/tests/eval_test.rs"}
+{"test_name": "pio_err_mov_bad_operation", "input": "(pio/mov :x :y :bogus)", "expected_error": "unknown operation", "file": "crates/sema/tests/eval_test.rs"}
+{"test_name": "pio_err_irq_bad_mode", "input": "(pio/irq :bogus 0)", "expected_error": "unknown mode", "file": "crates/sema/tests/eval_test.rs"}
+{"test_name": "pio_err_wait_bad_source", "input": "(pio/wait 1 :bogus 0)", "expected_error": "unknown source", "file": "crates/sema/tests/eval_test.rs"}
+{"test_name": "i64_array_fold_arity_too_many", "input": "(i64-array/fold + 0 (i64-array 1 2) 99)", "expected_error": null, "file": "crates/sema/tests/eval_test.rs"}
+{"test_name": "i64_array_set_out_of_bounds", "input": "(i64-array/set! (i64-array 1 2 3) 5 99)", "expected_error": null, "file": "crates/sema/tests/eval_test.rs"}
+{"test_name": "i64_array_set_wrong_type", "input": "(i64-array/set! (i64-array 1 2 3) 0 \"oops\")", "expected_error": null, "file": "crates/sema/tests/eval_test.rs"}
+{"test_name": "f64_array_set_out_of_bounds", "input": "(f64-array/set! (f64-array 1.0 2.0 3.0) 5 9.5)", "expected_error": null, "file": "crates/sema/tests/eval_test.rs"}
+{"test_name": "f64_array_set_wrong_type", "input": "(f64-array/set! (f64-array 1.0 2.0 3.0) 0 \"oops\")", "expected_error": null, "file": "crates/sema/tests/eval_test.rs"}
+{"test_name": "string_repeat_negative_errors", "input": "(string/repeat \"ab\" -1)", "expected_error": "non-negative", "file": "crates/sema/tests/eval_test.rs"}
+{"test_name": "abs_i64_min_errors", "input": "(abs -9223372036854775808)", "expected_error": "overflows i64", "file": "crates/sema/tests/eval_test.rs"}
+{"test_name": "nth_negative_errors", "input": "(nth (list 1 2 3) -1)", "expected_error": null, "file": "crates/sema/tests/eval_test.rs"}
+{"test_name": "take_negative_errors", "input": "(take -1 (list 1 2 3))", "expected_error": "non-negative", "file": "crates/sema/tests/eval_test.rs"}
+{"test_name": "drop_negative_errors", "input": "(drop -1 (list 1 2 3))", "expected_error": "non-negative", "file": "crates/sema/tests/eval_test.rs"}
+{"test_name": "force_non_promise_errors", "input": "(force 42)", "expected_error": "thunk", "file": "crates/sema/tests/eval_test.rs"}
+{"test_name": "bit_shift_left_overflow", "input": "(bit/shift-left 1 64)", "expected_error": "shift", "file": "crates/sema/tests/eval_test.rs"}
+{"test_name": "bit_shift_left_negative", "input": "(bit/shift-left 1 -1)", "expected_error": "shift", "file": "crates/sema/tests/eval_test.rs"}
+{"test_name": "bit_shift_right_overflow", "input": "(bit/shift-right 1 64)", "expected_error": "shift", "file": "crates/sema/tests/eval_test.rs"}
+{"test_name": "bit_shift_right_negative", "input": "(bit/shift-right 1 -1)", "expected_error": "shift", "file": "crates/sema/tests/eval_test.rs"}
+{"test_name": "random_int_reversed_bounds", "input": "(math/random-int 10 5)", "expected_error": "math/random-int", "file": "crates/sema/tests/eval_test.rs"}
+{"test_name": "string_pad_left_negative", "input": "(string/pad-left \"x\" -1)", "expected_error": "non-negative", "file": "crates/sema/tests/eval_test.rs"}
+{"test_name": "string_pad_right_negative", "input": "(string/pad-right \"x\" -1)", "expected_error": "non-negative", "file": "crates/sema/tests/eval_test.rs"}
+{"test_name": "list_chunk_negative", "input": "(list/chunk -1 (list 1 2 3))", "expected_error": "non-negative", "file": "crates/sema/tests/eval_test.rs"}
+{"test_name": "list_split_at_negative", "input": "(list/split-at (list 1 2 3) -1)", "expected_error": "non-negative", "file": "crates/sema/tests/eval_test.rs"}
+{"test_name": "list_sliding_negative", "input": "(list/sliding (list 1 2 3) -1)", "expected_error": "non-negative", "file": "crates/sema/tests/eval_test.rs"}
+{"test_name": "list_times_negative", "input": "(list/times -1 (lambda (i) i))", "expected_error": "non-negative", "file": "crates/sema/tests/eval_test.rs"}
+{"test_name": "list_repeat_negative", "input": "(list/repeat -1 0)", "expected_error": "non-negative", "file": "crates/sema/tests/eval_test.rs"}
+{"test_name": "list_page_negative_per_page", "input": "(list/page (list 1 2 3) 1 -1)", "expected_error": "non-negative", "file": "crates/sema/tests/eval_test.rs"}
+{"test_name": "list_pad_negative_len", "input": "(list/pad (list 1) -1 0)", "expected_error": "non-negative", "file": "crates/sema/tests/eval_test.rs"}
+{"test_name": "nth_negative_index", "input": "(nth (list 1 2 3) -1)", "expected_error": "non-negative", "file": "crates/sema/tests/eval_test.rs"}
+{"test_name": "quasiquote_map_value_splice_errors", "input": "(let ((items (list 1 2 3))) `{:a 1 :items ,@items})", "expected_error": "unquote-splicing is not allowed", "file": "crates/sema/tests/eval_test.rs"}
+{"test_name": "quasiquote_map_key_splice_errors", "input": "(let ((ks (list :a))) `{,@ks 1})", "expected_error": "unquote-splicing is not allowed", "file": "crates/sema/tests/eval_test.rs"}
+{"test_name": "optimizer_rest_param_shadows_builtin", "input": "((lambda (x . +) (+ 1 2)) 9 5)", "expected_error": null, "file": "crates/sema/tests/eval_test.rs"}
+{"test_name": "hof_callback_error_propagates", "input": "(map (fn (x) (error \"boom\")) (list 1 2 3))", "expected_error": null, "file": "crates/sema/tests/eval_test.rs"}
+{"test_name": "string_length_wrong_type", "input": "(string-length 42)", "expected_error": "expected string", "file": "crates/sema/tests/eval_test.rs"}
+{"test_name": "string_ref_out_of_bounds", "input": "(string-ref \"abc\" 5)", "expected_error": "out of bounds", "file": "crates/sema/tests/eval_test.rs"}
+{"test_name": "string_ref_negative", "input": "(string-ref \"abc\" -1)", "expected_error": "must be non-negative", "file": "crates/sema/tests/eval_test.rs"}
+{"test_name": "string_ref_non_string", "input": "(string-ref 42 0)", "expected_error": "expected string", "file": "crates/sema/tests/eval_test.rs"}
+{"test_name": "string_ref_non_int", "input": "(string-ref \"abc\" \"x\")", "expected_error": "expected int", "file": "crates/sema/tests/eval_test.rs"}
+{"test_name": "err_division_by_zero", "input": "(/ 1 0)", "expected_error": null, "file": "crates/sema/tests/eval_core_test.rs"}
+{"test_name": "err_unbound_var", "input": "undefined-variable", "expected_error": null, "file": "crates/sema/tests/eval_core_test.rs"}
+{"test_name": "while_bad_arity", "input": "(while #t)", "expected_error": null, "file": "crates/sema/tests/eval_core_test.rs"}
+{"test_name": "chunk_zero", "input": "(list/chunk 0 '(1 2 3))", "expected_error": null, "file": "crates/sema/tests/eval_collections_test.rs"}
+{"test_name": "min_empty", "input": "(list/min '())", "expected_error": null, "file": "crates/sema/tests/eval_collections_test.rs"}
+{"test_name": "max_empty", "input": "(list/max '())", "expected_error": null, "file": "crates/sema/tests/eval_collections_test.rs"}
+{"test_name": "avg_empty", "input": "(list/avg '())", "expected_error": null, "file": "crates/sema/tests/eval_collections_test.rs"}
+{"test_name": "median_empty", "input": "(list/median '())", "expected_error": null, "file": "crates/sema/tests/eval_collections_test.rs"}
+{"test_name": "mode_empty", "input": "(list/mode '())", "expected_error": null, "file": "crates/sema/tests/eval_collections_test.rs"}
+{"test_name": "sliding_zero_size", "input": "(list/sliding '(1 2 3) 0)", "expected_error": null, "file": "crates/sema/tests/eval_collections_test.rs"}
+{"test_name": "sliding_zero_step", "input": "(list/sliding '(1 2 3) 2 0)", "expected_error": null, "file": "crates/sema/tests/eval_collections_test.rs"}
+{"test_name": "page_zero", "input": "(list/page '(1 2 3) 0 2)", "expected_error": null, "file": "crates/sema/tests/eval_collections_test.rs"}
+{"test_name": "sole_none", "input": "(list/sole even? '(1 3 5))", "expected_error": null, "file": "crates/sema/tests/eval_collections_test.rs"}
+{"test_name": "sole_multiple", "input": "(list/sole even? '(2 4 6))", "expected_error": null, "file": "crates/sema/tests/eval_collections_test.rs"}
+{"test_name": "str_ref_negative", "input": "(string-ref \"hello\" -1)", "expected_error": null, "file": "crates/sema/tests/eval_collections_test.rs"}
+{"test_name": "str_ref_oob", "input": "(string-ref \"hello\" 10)", "expected_error": null, "file": "crates/sema/tests/eval_collections_test.rs"}
+{"test_name": "substring_negative_start", "input": "(substring \"hello\" -1 3)", "expected_error": null, "file": "crates/sema/tests/eval_collections_test.rs"}
+{"test_name": "substring_negative_end", "input": "(substring \"hello\" 0 -1)", "expected_error": null, "file": "crates/sema/tests/eval_collections_test.rs"}
+{"test_name": "substring_start_gt_end", "input": "(substring \"hello\" 3 1)", "expected_error": null, "file": "crates/sema/tests/eval_collections_test.rs"}
+{"test_name": "substring_oob", "input": "(substring \"hello\" 0 10)", "expected_error": null, "file": "crates/sema/tests/eval_collections_test.rs"}
+{"test_name": "time_parse_invalid_format", "input": "(time/parse \"not-a-date\" \"%Y-%m-%d\")", "expected_error": null, "file": "crates/sema/tests/eval_stdlib_test.rs"}
+{"test_name": "time_parse_wrong_type", "input": "(time/parse 42 \"%Y-%m-%d\")", "expected_error": null, "file": "crates/sema/tests/eval_stdlib_test.rs"}
+{"test_name": "time_format_wrong_type", "input": "(time/format \"not-a-number\" \"%Y-%m-%d\")", "expected_error": null, "file": "crates/sema/tests/eval_stdlib_test.rs"}
+{"test_name": "time_non_leap_feb29", "input": "(time/parse \"2023-02-29 00:00:00\" \"%Y-%m-%d %H:%M:%S\")", "expected_error": null, "file": "crates/sema/tests/eval_stdlib_test.rs"}
+{"test_name": "http_ok_no_args", "input": "(http/ok)", "expected_error": null, "file": "crates/sema/tests/eval_stdlib_test.rs"}
+{"test_name": "http_ok_too_many", "input": "(http/ok \"a\" \"b\")", "expected_error": null, "file": "crates/sema/tests/eval_stdlib_test.rs"}
+{"test_name": "http_created_no_args", "input": "(http/created)", "expected_error": null, "file": "crates/sema/tests/eval_stdlib_test.rs"}
+{"test_name": "http_not_found_no_args", "input": "(http/not-found)", "expected_error": null, "file": "crates/sema/tests/eval_stdlib_test.rs"}
+{"test_name": "http_redirect_no_args", "input": "(http/redirect)", "expected_error": null, "file": "crates/sema/tests/eval_stdlib_test.rs"}
+{"test_name": "http_redirect_non_string", "input": "(http/redirect 123)", "expected_error": null, "file": "crates/sema/tests/eval_stdlib_test.rs"}
+{"test_name": "http_error_one_arg", "input": "(http/error 422)", "expected_error": null, "file": "crates/sema/tests/eval_stdlib_test.rs"}
+{"test_name": "http_error_non_int_status", "input": "(http/error \"nope\" \"body\")", "expected_error": null, "file": "crates/sema/tests/eval_stdlib_test.rs"}
+{"test_name": "http_html_non_string", "input": "(http/html 123)", "expected_error": null, "file": "crates/sema/tests/eval_stdlib_test.rs"}
+{"test_name": "http_text_non_string", "input": "(http/text 123)", "expected_error": null, "file": "crates/sema/tests/eval_stdlib_test.rs"}
+{"test_name": "http_no_content_extra", "input": "(http/no-content \"extra\")", "expected_error": null, "file": "crates/sema/tests/eval_stdlib_test.rs"}
+{"test_name": "hash_map_odd_args", "input": "(hash-map :a 1 :b)", "expected_error": null, "file": "crates/sema/tests/eval_map_test.rs"}
+{"test_name": "get_bad_type", "input": "(get 42 :a)", "expected_error": null, "file": "crates/sema/tests/eval_map_test.rs"}
+{"test_name": "assoc_bad_arity", "input": "(assoc {:a 1} :b)", "expected_error": null, "file": "crates/sema/tests/eval_map_test.rs"}
+{"test_name": "assoc_bad_type", "input": "(assoc 42 :a 1)", "expected_error": null, "file": "crates/sema/tests/eval_map_test.rs"}
+{"test_name": "dissoc_bad_type", "input": "(dissoc 42 :a)", "expected_error": null, "file": "crates/sema/tests/eval_map_test.rs"}
+{"test_name": "keys_bad_type", "input": "(keys 42)", "expected_error": null, "file": "crates/sema/tests/eval_map_test.rs"}
+{"test_name": "vals_bad_type", "input": "(vals 42)", "expected_error": null, "file": "crates/sema/tests/eval_map_test.rs"}
+{"test_name": "merge_bad_type", "input": "(merge 42)", "expected_error": null, "file": "crates/sema/tests/eval_map_test.rs"}
+{"test_name": "merge_bad_second", "input": "(merge {:a 1} 42)", "expected_error": null, "file": "crates/sema/tests/eval_map_test.rs"}
+{"test_name": "contains_bad_type", "input": "(contains? 42 :a)", "expected_error": null, "file": "crates/sema/tests/eval_map_test.rs"}
+{"test_name": "count_bad_type", "input": "(count (fn (x) x))", "expected_error": null, "file": "crates/sema/tests/eval_map_test.rs"}
+{"test_name": "empty_bad_type", "input": "(empty? 42)", "expected_error": null, "file": "crates/sema/tests/eval_map_test.rs"}
+{"test_name": "entries_bad_type", "input": "(map/entries 42)", "expected_error": null, "file": "crates/sema/tests/eval_map_test.rs"}
+{"test_name": "select_keys_bad_map", "input": "(map/select-keys 42 '(:a))", "expected_error": null, "file": "crates/sema/tests/eval_map_test.rs"}
+{"test_name": "select_keys_bad_keys", "input": "(map/select-keys {:a 1} 42)", "expected_error": null, "file": "crates/sema/tests/eval_map_test.rs"}
+{"test_name": "map_vals_bad_type", "input": "(map/map-vals (fn (v) v) 42)", "expected_error": null, "file": "crates/sema/tests/eval_map_test.rs"}
+{"test_name": "map_keys_bad_type", "input": "(map/map-keys (fn (k) k) 42)", "expected_error": null, "file": "crates/sema/tests/eval_map_test.rs"}
+{"test_name": "map_filter_bad_type", "input": "(map/filter (fn (k v) #t) 42)", "expected_error": null, "file": "crates/sema/tests/eval_map_test.rs"}
+{"test_name": "from_entries_bad_type", "input": "(map/from-entries 42)", "expected_error": null, "file": "crates/sema/tests/eval_map_test.rs"}
+{"test_name": "from_entries_bad_entry", "input": "(map/from-entries '((:a 1 2)))", "expected_error": null, "file": "crates/sema/tests/eval_map_test.rs"}
+{"test_name": "from_entries_non_pair", "input": "(map/from-entries '(42))", "expected_error": null, "file": "crates/sema/tests/eval_map_test.rs"}
+{"test_name": "map_update_bad_type", "input": "(map/update 42 :a (fn (x) x))", "expected_error": null, "file": "crates/sema/tests/eval_map_test.rs"}
+{"test_name": "map_zip_bad_keys", "input": "(map/zip 42 '(1))", "expected_error": null, "file": "crates/sema/tests/eval_map_test.rs"}
+{"test_name": "map_zip_bad_vals", "input": "(map/zip '(:a) 42)", "expected_error": null, "file": "crates/sema/tests/eval_map_test.rs"}
+{"test_name": "map_except_bad_map", "input": "(map/except 42 '(:a))", "expected_error": null, "file": "crates/sema/tests/eval_map_test.rs"}
+{"test_name": "map_except_bad_keys", "input": "(map/except {:a 1} 42)", "expected_error": null, "file": "crates/sema/tests/eval_map_test.rs"}
+{"test_name": "sort_keys_bad_type", "input": "(map/sort-keys 42)", "expected_error": null, "file": "crates/sema/tests/eval_map_test.rs"}
+{"test_name": "hashmap_new_odd", "input": "(hashmap/new :a)", "expected_error": null, "file": "crates/sema/tests/eval_map_test.rs"}
+{"test_name": "hashmap_get_bad_type", "input": "(hashmap/get 42 :a)", "expected_error": null, "file": "crates/sema/tests/eval_map_test.rs"}
+{"test_name": "hashmap_assoc_bad_arity", "input": "(hashmap/assoc (hash-map :a 1) :b)", "expected_error": null, "file": "crates/sema/tests/eval_map_test.rs"}
+{"test_name": "hashmap_assoc_bad_type", "input": "(hashmap/assoc 42 :a 1)", "expected_error": null, "file": "crates/sema/tests/eval_map_test.rs"}
+{"test_name": "hashmap_to_map_bad_type", "input": "(hashmap/to-map 42)", "expected_error": null, "file": "crates/sema/tests/eval_map_test.rs"}
+{"test_name": "hashmap_keys_bad_type", "input": "(hashmap/keys 42)", "expected_error": null, "file": "crates/sema/tests/eval_map_test.rs"}
+{"test_name": "hashmap_contains_bad_type", "input": "(hashmap/contains? 42 :a)", "expected_error": null, "file": "crates/sema/tests/eval_map_test.rs"}
+{"test_name": "get_in_bad_path", "input": "(get-in {:a 1} 42)", "expected_error": null, "file": "crates/sema/tests/eval_map_test.rs"}
+{"test_name": "err_emb_oob", "input": "(embedding/ref (embedding/list->embedding '(1.0 2.0)) 5)", "expected_error": null, "file": "crates/sema/tests/eval_types_test.rs"}

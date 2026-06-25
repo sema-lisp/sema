@@ -1,0 +1,1696 @@
+{
+  "glm-5.2-serverless": {
+    "scores": [
+      {
+        "task_id": "L1-001",
+        "level": 1,
+        "category": "arithmetic",
+        "score": 0.3,
+        "detail": "wrong: expected '3', got '(+ 1 2)'",
+        "latency_s": 8.563815832138062,
+        "tokens_in": 1280,
+        "tokens_out": 52
+      },
+      {
+        "task_id": "L1-002",
+        "level": 1,
+        "category": "arithmetic",
+        "score": 1.0,
+        "detail": "correct",
+        "latency_s": 1.5555589199066162,
+        "tokens_in": 1280,
+        "tokens_out": 44
+      },
+      {
+        "task_id": "L1-003",
+        "level": 1,
+        "category": "list",
+        "score": 0.3,
+        "detail": "wrong: expected '(2 4 6)', got \"(map (fn (x) (* x 2)) '(1 2 3))\"",
+        "latency_s": 5.057075262069702,
+        "tokens_in": 1289,
+        "tokens_out": 197
+      },
+      {
+        "task_id": "L1-004",
+        "level": 1,
+        "category": "list",
+        "score": 1.0,
+        "detail": "correct",
+        "latency_s": 2.171748161315918,
+        "tokens_in": 1285,
+        "tokens_out": 109
+      },
+      {
+        "task_id": "L1-005",
+        "level": 1,
+        "category": "map",
+        "score": 1.0,
+        "detail": "correct",
+        "latency_s": 2.5195698738098145,
+        "tokens_in": 1284,
+        "tokens_out": 81
+      },
+      {
+        "task_id": "L1-006",
+        "level": 1,
+        "category": "string",
+        "score": 1.0,
+        "detail": "correct",
+        "latency_s": 2.6529581546783447,
+        "tokens_in": 1277,
+        "tokens_out": 45
+      },
+      {
+        "task_id": "L1-007",
+        "level": 1,
+        "category": "string",
+        "score": 1.0,
+        "detail": "correct",
+        "latency_s": 1.5661430358886719,
+        "tokens_in": 1279,
+        "tokens_out": 50
+      },
+      {
+        "task_id": "L1-008",
+        "level": 1,
+        "category": "let",
+        "score": 0.3,
+        "detail": "wrong: expected '30', got '(let ((x 10) (y 20)) (+ x y))'",
+        "latency_s": 4.681801080703735,
+        "tokens_in": 1286,
+        "tokens_out": 158
+      },
+      {
+        "task_id": "L1-009",
+        "level": 1,
+        "category": "cond",
+        "score": 0.3,
+        "detail": "wrong: expected 'b', got \"(cond ((= 1 2) 'a) ((= 1 1) 'b) (else 'c))\"",
+        "latency_s": 6.166275978088379,
+        "tokens_in": 1297,
+        "tokens_out": 230
+      },
+      {
+        "task_id": "L1-010",
+        "level": 1,
+        "category": "list",
+        "score": 1.0,
+        "detail": "correct",
+        "latency_s": 6.952891111373901,
+        "tokens_in": 1287,
+        "tokens_out": 222
+      },
+      {
+        "task_id": "L1-011",
+        "level": 1,
+        "category": "predicate",
+        "score": 0.3,
+        "detail": "wrong: expected 'true', got '#t'",
+        "latency_s": 2.6377861499786377,
+        "tokens_in": 1275,
+        "tokens_out": 69
+      },
+      {
+        "task_id": "L1-012",
+        "level": 1,
+        "category": "keyword",
+        "score": 0.3,
+        "detail": "wrong: expected '42', got ':a'",
+        "latency_s": 8.46808409690857,
+        "tokens_in": 1281,
+        "tokens_out": 157
+      },
+      {
+        "task_id": "L1-013",
+        "level": 1,
+        "category": "short-lambda",
+        "score": 0.3,
+        "detail": "wrong: expected '(1 4 9)', got \"(map #(* % %) '(1 2 3))\"",
+        "latency_s": 4.824061870574951,
+        "tokens_in": 1284,
+        "tokens_out": 217
+      },
+      {
+        "task_id": "L1-014",
+        "level": 1,
+        "category": "f-string",
+        "score": 0.3,
+        "detail": "wrong: expected 'Hello World', got 'f\"Hello ${\"World\"}\"'",
+        "latency_s": 4.945294141769409,
+        "tokens_in": 1280,
+        "tokens_out": 201
+      },
+      {
+        "task_id": "L1-015",
+        "level": 1,
+        "category": "map",
+        "score": 0.3,
+        "detail": "wrong: expected '{:a 11}', got '(map/update {:a 1} :a #(+ % 10))'",
+        "latency_s": 6.4862000942230225,
+        "tokens_in": 1286,
+        "tokens_out": 289
+      },
+      {
+        "task_id": "L2-001",
+        "level": 2,
+        "category": "function",
+        "score": 1.0,
+        "detail": "correct",
+        "latency_s": 1.8598477840423584,
+        "tokens_in": 1292,
+        "tokens_out": 50
+      },
+      {
+        "task_id": "L2-002",
+        "level": 2,
+        "category": "function",
+        "score": 1.0,
+        "detail": "correct",
+        "latency_s": 3.633235216140747,
+        "tokens_in": 1302,
+        "tokens_out": 168
+      },
+      {
+        "task_id": "L2-003",
+        "level": 2,
+        "category": "list",
+        "score": 0.0,
+        "detail": "error: Command '['/Users/helge/code/sema-rft-experiment/target/debug/sema', 'eval', '--expr', \"(begin (define (my-length lst)\\n  (let loop ((lst lst) (count 0))\\n    (if (nil? lst)\\n        count\\n        (l",
+        "latency_s": 12.911780834197998,
+        "tokens_in": 1307,
+        "tokens_out": 626
+      },
+      {
+        "task_id": "L2-004",
+        "level": 2,
+        "category": "list",
+        "score": 1.0,
+        "detail": "correct",
+        "latency_s": 10.538571834564209,
+        "tokens_in": 1299,
+        "tokens_out": 458
+      },
+      {
+        "task_id": "L2-005",
+        "level": 2,
+        "category": "string",
+        "score": 0.3,
+        "detail": "wrong output: expected 'true', got '#t'",
+        "latency_s": 7.647759199142456,
+        "tokens_in": 1295,
+        "tokens_out": 717
+      },
+      {
+        "task_id": "L2-006",
+        "level": 2,
+        "category": "math",
+        "score": 1.0,
+        "detail": "correct",
+        "latency_s": 6.271968841552734,
+        "tokens_in": 1294,
+        "tokens_out": 498
+      },
+      {
+        "task_id": "L2-007",
+        "level": 2,
+        "category": "fibonacci",
+        "score": 1.0,
+        "detail": "correct",
+        "latency_s": 17.08136010169983,
+        "tokens_in": 1295,
+        "tokens_out": 315
+      },
+      {
+        "task_id": "L2-008",
+        "level": 2,
+        "category": "map",
+        "score": 0.3,
+        "detail": "wrong output: expected '{:bird 1 :cat 1 :dog 1 :the 3}', got '{\"bird\" 1 \"cat\" 1 \"dog\" 1 \"the\" 3}'",
+        "latency_s": 12.798825025558472,
+        "tokens_in": 1309,
+        "tokens_out": 776
+      },
+      {
+        "task_id": "L2-009",
+        "level": 2,
+        "category": "list",
+        "score": 1.0,
+        "detail": "correct",
+        "latency_s": 37.91871500015259,
+        "tokens_in": 1308,
+        "tokens_out": 628
+      },
+      {
+        "task_id": "L2-010",
+        "level": 2,
+        "category": "string",
+        "score": 0.0,
+        "detail": "error: Unbound variable: string/substring",
+        "latency_s": 22.108536958694458,
+        "tokens_in": 1299,
+        "tokens_out": 1574
+      },
+      {
+        "task_id": "L2-011",
+        "level": 2,
+        "category": "predicate",
+        "score": 0.3,
+        "detail": "wrong output: expected 'true', got '#t'",
+        "latency_s": 8.481626033782959,
+        "tokens_in": 1291,
+        "tokens_out": 519
+      },
+      {
+        "task_id": "L2-012",
+        "level": 2,
+        "category": "map",
+        "score": 1.0,
+        "detail": "correct",
+        "latency_s": 4.210905075073242,
+        "tokens_in": 1308,
+        "tokens_out": 226
+      },
+      {
+        "task_id": "L2-013",
+        "level": 2,
+        "category": "threading",
+        "score": 0.3,
+        "detail": "wrong: expected '165', got '(->> (range 1 11)\\n     (filter odd?)\\n     (map #(* % %))\\n     (reduce + 0))'",
+        "latency_s": 7.790884017944336,
+        "tokens_in": 1303,
+        "tokens_out": 445
+      },
+      {
+        "task_id": "L2-014",
+        "level": 2,
+        "category": "match",
+        "score": 1.0,
+        "detail": "correct",
+        "latency_s": 7.1977698802948,
+        "tokens_in": 1300,
+        "tokens_out": 625
+      },
+      {
+        "task_id": "L2-015",
+        "level": 2,
+        "category": "destructure",
+        "score": 0.0,
+        "detail": "error: Eval error: match: no clause matched value: (1 2)",
+        "latency_s": 34.28618097305298,
+        "tokens_in": 1308,
+        "tokens_out": 1323
+      },
+      {
+        "task_id": "L3-001",
+        "level": 3,
+        "category": "data-transform",
+        "score": 1.0,
+        "detail": "correct",
+        "latency_s": 10.755083084106445,
+        "tokens_in": 1323,
+        "tokens_out": 689
+      },
+      {
+        "task_id": "L3-002",
+        "level": 3,
+        "category": "string",
+        "score": 0.0,
+        "detail": "error: Eval error: let: expected a list",
+        "latency_s": 18.41245198249817,
+        "tokens_in": 1314,
+        "tokens_out": 1416
+      },
+      {
+        "task_id": "L3-003",
+        "level": 3,
+        "category": "record",
+        "score": 0.3,
+        "detail": "wrong output: expected '5', got '5.0'",
+        "latency_s": 5.838714838027954,
+        "tokens_in": 1319,
+        "tokens_out": 492
+      },
+      {
+        "task_id": "L3-004",
+        "level": 3,
+        "category": "macro",
+        "score": 1.0,
+        "detail": "correct",
+        "latency_s": 7.320558071136475,
+        "tokens_in": 1302,
+        "tokens_out": 444
+      },
+      {
+        "task_id": "L3-005",
+        "level": 3,
+        "category": "json",
+        "score": 0.5,
+        "detail": "runs without error",
+        "latency_s": 6.0189759731292725,
+        "tokens_in": 1312,
+        "tokens_out": 220
+      },
+      {
+        "task_id": "L3-006",
+        "level": 3,
+        "category": "multimethod",
+        "score": 1.0,
+        "detail": "correct",
+        "latency_s": 12.881749868392944,
+        "tokens_in": 1327,
+        "tokens_out": 986
+      },
+      {
+        "task_id": "L3-007",
+        "level": 3,
+        "category": "match",
+        "score": 0.0,
+        "detail": "error: Eval error: match: each clause must be a list or vector",
+        "latency_s": 12.972500801086426,
+        "tokens_in": 1362,
+        "tokens_out": 638
+      },
+      {
+        "task_id": "L3-008",
+        "level": 3,
+        "category": "error-handling",
+        "score": 1.0,
+        "detail": "correct",
+        "latency_s": 5.0685999393463135,
+        "tokens_in": 1313,
+        "tokens_out": 319
+      },
+      {
+        "task_id": "L3-009",
+        "level": 3,
+        "category": "threading",
+        "score": 0.3,
+        "detail": "wrong: expected 'HELLO, WORLD, FOO, BAR', got '(->> \"Hello World Foo Bar\"\\n     (string/split \" \")\\n     (map string/upper)\\n     (string/join \", \"))'",
+        "latency_s": 13.877182960510254,
+        "tokens_in": 1311,
+        "tokens_out": 778
+      },
+      {
+        "task_id": "L3-010",
+        "level": 3,
+        "category": "recursion",
+        "score": 1.0,
+        "detail": "correct",
+        "latency_s": 15.600234031677246,
+        "tokens_in": 1313,
+        "tokens_out": 1198
+      },
+      {
+        "task_id": "L3-011",
+        "level": 3,
+        "category": "map",
+        "score": 1.0,
+        "detail": "correct",
+        "latency_s": 18.55889105796814,
+        "tokens_in": 1327,
+        "tokens_out": 592
+      },
+      {
+        "task_id": "L3-012",
+        "level": 3,
+        "category": "pattern",
+        "score": 1.0,
+        "detail": "correct",
+        "latency_s": 6.916754961013794,
+        "tokens_in": 1337,
+        "tokens_out": 722
+      },
+      {
+        "task_id": "L3-013",
+        "level": 3,
+        "category": "higher-order",
+        "score": 1.0,
+        "detail": "correct",
+        "latency_s": 5.849941968917847,
+        "tokens_in": 1313,
+        "tokens_out": 418
+      },
+      {
+        "task_id": "L3-014",
+        "level": 3,
+        "category": "string",
+        "score": 0.3,
+        "detail": "wrong output: expected 'Alice,30,admin', got '\"Alice,30,admin\"'",
+        "latency_s": 3.974261999130249,
+        "tokens_in": 1308,
+        "tokens_out": 284
+      },
+      {
+        "task_id": "L3-015",
+        "level": 3,
+        "category": "let*",
+        "score": 0.3,
+        "detail": "wrong output: expected '(3 2)', got '[3.0 2.0]'",
+        "latency_s": 17.3883318901062,
+        "tokens_in": 1332,
+        "tokens_out": 1600
+      },
+      {
+        "task_id": "L4-001",
+        "level": 4,
+        "category": "data-pipeline",
+        "score": 0.0,
+        "detail": "error: Type error: expected list or vector, got native-fn in sort",
+        "latency_s": 9.944704055786133,
+        "tokens_in": 1370,
+        "tokens_out": 591
+      },
+      {
+        "task_id": "L4-002",
+        "level": 4,
+        "category": "interpreter",
+        "score": 0.0,
+        "detail": "error: Eval error: match: no clause matched value: (+ (* 2 3) (- 10 4))",
+        "latency_s": 20.902594089508057,
+        "tokens_in": 1333,
+        "tokens_out": 2048
+      },
+      {
+        "task_id": "L4-003",
+        "level": 4,
+        "category": "state-machine",
+        "score": 0.0,
+        "detail": "error: Eval error: match: each clause must be a list or vector",
+        "latency_s": 13.571871995925903,
+        "tokens_in": 1356,
+        "tokens_out": 1172
+      },
+      {
+        "task_id": "L4-004",
+        "level": 4,
+        "category": "web-server",
+        "score": 0.0,
+        "detail": "error: Eval error: let: expected a list",
+        "latency_s": 23.386554718017578,
+        "tokens_in": 1335,
+        "tokens_out": 2048
+      },
+      {
+        "task_id": "L4-005",
+        "level": 4,
+        "category": "macro",
+        "score": 0.0,
+        "detail": "error: Reader error at 6:11: unexpected character: '@'",
+        "latency_s": 18.107985973358154,
+        "tokens_in": 1340,
+        "tokens_out": 1652
+      },
+      {
+        "task_id": "L4-006",
+        "level": 4,
+        "category": "reduce",
+        "score": 1.0,
+        "detail": "correct",
+        "latency_s": 5.6711390018463135,
+        "tokens_in": 1368,
+        "tokens_out": 496
+      },
+      {
+        "task_id": "L4-007",
+        "level": 4,
+        "category": "matrix",
+        "score": 0.0,
+        "detail": "error: Unbound variable: matrix-transpose",
+        "latency_s": 26.219053983688354,
+        "tokens_in": 1327,
+        "tokens_out": 2048
+      },
+      {
+        "task_id": "L4-008",
+        "level": 4,
+        "category": "parser",
+        "score": 0.0,
+        "detail": "error: Unbound variable: ...",
+        "latency_s": 28.4581081867218,
+        "tokens_in": 1339,
+        "tokens_out": 2048
+      },
+      {
+        "task_id": "L4-009",
+        "level": 4,
+        "category": "json-transform",
+        "score": 0.3,
+        "detail": "wrong output: expected '{:Alice 30 :Bob 25}', got '{\"Alice\" 30 \"Bob\" 25}'",
+        "latency_s": 6.4970338344573975,
+        "tokens_in": 1337,
+        "tokens_out": 495
+      },
+      {
+        "task_id": "L4-010",
+        "level": 4,
+        "category": "memoize",
+        "score": 0.0,
+        "detail": "error: Eval error: let: expected a list",
+        "latency_s": 28.829959869384766,
+        "tokens_in": 1351,
+        "tokens_out": 2048
+      },
+      {
+        "task_id": "L5-001",
+        "level": 5,
+        "category": "macro",
+        "score": 0.0,
+        "detail": "error: Unbound variable: second",
+        "latency_s": 30.83549475669861,
+        "tokens_in": 1340,
+        "tokens_out": 2048
+      },
+      {
+        "task_id": "L5-002",
+        "level": 5,
+        "category": "macro",
+        "score": 0.3,
+        "detail": "wrong output: expected '5', got 'None'",
+        "latency_s": 22.4202561378479,
+        "tokens_in": 1350,
+        "tokens_out": 2048
+      },
+      {
+        "task_id": "L5-003",
+        "level": 5,
+        "category": "async",
+        "score": 0.0,
+        "detail": "error: Eval error: let: expected a list",
+        "latency_s": 9.798316240310669,
+        "tokens_in": 1322,
+        "tokens_out": 701
+      },
+      {
+        "task_id": "L5-004",
+        "level": 5,
+        "category": "lazy",
+        "score": 0.0,
+        "detail": "error: Type error: expected thunk, got list",
+        "latency_s": 26.508506059646606,
+        "tokens_in": 1354,
+        "tokens_out": 2019
+      },
+      {
+        "task_id": "L5-005",
+        "level": 5,
+        "category": "quasiquote",
+        "score": 0.3,
+        "detail": "wrong output: expected '10', got 'None'",
+        "latency_s": 32.21219205856323,
+        "tokens_in": 1368,
+        "tokens_out": 2048
+      }
+    ],
+    "details": [],
+    "completions": [
+      {
+        "task_id": "L1-001",
+        "completion": "`(+ 1 2)` evaluates to **3**."
+      },
+      {
+        "task_id": "L1-002",
+        "completion": "```sema\n42\n```"
+      },
+      {
+        "task_id": "L1-003",
+        "completion": "```scheme\n(map (fn (x) (* x 2)) '(1 2 3))\n```\n\n**Result:** `(2 4 6)`\n\nThe `map` function applies the lambda `(fn (x) (* x 2))` to each element of the list `(1 2 3)`, doubling each value:\n\n- `1 \u2192 2`\n- `2 \u2192 4`\n- `3 \u2192 6`"
+      },
+      {
+        "task_id": "L1-004",
+        "completion": "```lisp\n(1 3 5)\n```"
+      },
+      {
+        "task_id": "L1-005",
+        "completion": "```scheme\n1\n```"
+      },
+      {
+        "task_id": "L1-006",
+        "completion": "\"HELLO\""
+      },
+      {
+        "task_id": "L1-007",
+        "completion": "\"hi\""
+      },
+      {
+        "task_id": "L1-008",
+        "completion": "```scheme\n(let ((x 10) (y 20)) (+ x y))\n```\n\n**Result: `30`**\n\nThe `let` binds `x` to `10` and `y` to `20` in parallel, then evaluates the body `(+ x y)` \u2192 `10 + 20` = **`30`**."
+      },
+      {
+        "task_id": "L1-009",
+        "completion": "## Evaluation\n\n```scheme\n(cond ((= 1 2) 'a) ((= 1 1) 'b) (else 'c))\n```\n\nTracing through each clause:\n\n1. **`(= 1 2)`** \u2192 `#f` \u2014 skip this clause\n2. **`(= 1 1)`** \u2192 `#t` \u2014 this clause matches, evaluate the body `'b`\n3. `else` \u2014 never reached\n\n**Result: `b`**"
+      },
+      {
+        "task_id": "L1-010",
+        "completion": "```sema\n15\n```\n\n`foldl` applies `+` left-to-right with an initial accumulator of `0`:\n\n```\n(+ 0 1) \u2192 1\n(+ 1 2) \u2192 3\n(+ 3 3) \u2192 6\n(+ 6 4) \u2192 10\n(+ 10 5) \u2192 15\n```"
+      },
+      {
+        "task_id": "L1-011",
+        "completion": "```sema\n#t\n```"
+      },
+      {
+        "task_id": "L1-012",
+        "completion": "In Sema, keywords are callable and act as map lookup functions. So `:a` applied to the map `{:a 42 :b 99}` looks up the value associated with `:a`.\n\n**Result: `42`**"
+      },
+      {
+        "task_id": "L1-013",
+        "completion": "```scheme\n(map #(* % %) '(1 2 3))\n```\n\nThe short lambda `#(* % %)` is equivalent to `(fn (%) (* % %))` \u2014 it squares its argument.\n\nApplying it to each element:\n\n- `1 \u2192 1*1 = 1`\n- `2 \u2192 2*2 = 4`\n- `3 \u2192 3*3 = 9`\n\n**Result:** `(1 4 9)`"
+      },
+      {
+        "task_id": "L1-014",
+        "completion": "The f-string `f\"Hello ${\"World\"}\"` interpolates the string literal `\"World\"` into the template, producing `\"Hello World\"`. Then `str` is called on that already-string value, which returns it unchanged.\n\n**Result:** `\"Hello World\"`"
+      },
+      {
+        "task_id": "L1-015",
+        "completion": "## Evaluation\n\n```sema\n(map/update {:a 1} :a #(+ % 10))\n```\n\n**Step-by-step:**\n\n1. `map/update` takes a map, a key, and an update function.\n2. It looks up the current value at key `:a` \u2192 `1`\n3. It applies the short lambda `#(+ % 10)` to that value \u2192 `(+ 1 10)` \u2192 `11`\n4. It associates the key `:a` with the new value `11`.\n\n**Result:**\n\n```sema\n{:a 11}\n```"
+      },
+      {
+        "task_id": "L2-001",
+        "completion": "```sema\n(define (square n) (* n n))\n\n(square 5)\n;; => 25\n```"
+      },
+      {
+        "task_id": "L2-002",
+        "completion": "```sema\n(define (even-or-odd n)\n  (if (even? n) :even :odd))\n\n(even-or-odd 7)\n```\n\nThis evaluates to `:odd`, since 7 is not evenly divisible by 2."
+      },
+      {
+        "task_id": "L2-003",
+        "completion": "```sema\n(define (my-length lst)\n  (let loop ((lst lst) (count 0))\n    (if (nil? lst)\n        count\n        (loop (cdr lst) (+ count 1)))))\n```\n\n**Evaluation:**\n\n```sema\n(my-length '(1 2 3 4))\n```\n\n**Result:**\n\n```\n4\n```\n\n**How it works:**\n\nThe function uses a named `let` loop (tail-recursive) to iterate through the list:\n\n| Iteration | `lst`        | `count` |\n|-----------|-------------|---------|\n| 1         | `(1 2 3 4)` | 0       |\n| 2         | `(2 3 4)`   | 1       |\n| 3         | `(3 4)`     | 2       |\n| 4         | `(4)`       | 3       |\n| 5         | `()`        | 4       |\n\nWhen `lst` is `nil`, the loop returns `count`, which is **4**."
+      },
+      {
+        "task_id": "L2-004",
+        "completion": "```sema\n(define (my-reverse lst)\n  (foldl (fn (acc x) (cons x acc)) '() lst))\n\n(my-reverse '(1 2 3))\n```\n\n**How it works:**\n\n`foldl` walks the list left-to-right, calling the lambda with the current accumulator and each element. By `cons`ing each element onto the front of the accumulator, the order is flipped:\n\n| Step | Element | Accumulator |\n|------|---------|-------------|\n| init | \u2014       | `()`        |\n| 1    | `1`     | `(1)`       |\n| 2    | `2`     | `(2 1)`     |\n| 3    | `3`     | `(3 2 1)`   |\n\n**Result:**\n\n```\n(3 2 1)\n```"
+      },
+      {
+        "task_id": "L2-005",
+        "completion": "```sema\n(define (palindrome? s)\n  (= s (list->string (reverse (string->list s)))))\n\n(palindrome? \"racecar\")\n```\n\n**How it works:**\n\n1. `string->list` converts the string into a list of characters: `(#\\r #\\a #\\c #\\e #\\c #\\a #\\r)`\n2. `reverse` flips the list: `(#\\r #\\a #\\c #\\e #\\c #\\a #\\r)`\n3. `list->string` joins it back into a string: `\"racecar\"`\n4. `=` compares the original with the reversed string\n\n**Result:**\n\n```\n#t\n```\n\n`\"racecar\"` reads the same forwards and backwards, so `palindrome?` returns `#t`."
+      },
+      {
+        "task_id": "L2-006",
+        "completion": "Here is the Sema function for computing factorial using a named `let` for tail recursion, along with the evaluation of `(factorial 5)`:\n\n```lisp\n(define (factorial n)\n  (let loop ((i n) (acc 1))\n    (if (= i 0)\n        acc\n        (loop (- i 1) (* acc i)))))\n\n(factorial 5)\n```\n\n### Evaluation\nWhen you evaluate `(factorial 5)`, it executes with the following tail-recursive steps:\n1. `loop` with `i = 5`, `acc = 1`\n2. `loop` with `i = 4`, `acc = 5`\n3. `loop` with `i = 3`, `acc = 20`\n4. `loop` with `i = 2`, `acc = 60`\n5. `loop` with `i = 1`, `acc = 120`\n6. `loop` with `i = 0`, `acc = 120` -> returns `acc`\n\n**Result:** `120`"
+      },
+      {
+        "task_id": "L2-007",
+        "completion": "```sema\n(define (fib n)\n  (let loop ((i n) (a 0) (b 1))\n    (if (= i 0)\n        a\n        (loop (- i 1) b (+ a b)))))\n\n(fib 10)\n;; => 55\n```\n\n**How it works:**\n\n- **`let loop`** creates a named loop with three accumulators:\n  - `i` \u2014 counts down from `n` to `0`\n  - `a` \u2014 holds `F(i)` (the current Fibonacci number)\n  - `b` \u2014 holds `F(i+1)` (the next Fibonacci number)\n- Each iteration shifts: `a` becomes the old `b`, and `b` becomes `a + b`.\n- When `i` reaches `0`, `a` holds `F(n)`.\n\nThis is **tail-recursive** \u2014 the recursive call to `loop` is in tail position, so Sema optimizes it into a constant-stack loop (TCO). No stack overflow even for large `n`.\n\n| Call        | Result |\n|-------------|--------|\n| `(fib 0)`   | `0`    |\n| `(fib 1)`   | `1`    |\n| `(fib 10)`  | `55`   |\n| `(fib 20)`  | `6765` |"
+      },
+      {
+        "task_id": "L2-008",
+        "completion": "```sema\n(define (count-words s)\n  (let ((words (string/split s \" \")))\n    (foldl (fn (acc word)\n             (assoc acc word (+ 1 (get acc word 0))))\n           {}\n           words)))\n\n(count-words \"the cat the dog the bird\")\n```\n\n**Evaluation:**\n\n1. `string/split` breaks `\"the cat the dog the bird\"` into the list `(\"the\" \"cat\" \"the\" \"dog\" \"the\" \"bird\")`.\n2. `foldl` walks the list, starting with `{}`. For each word it looks up the current count (defaulting to `0`) and increments it via `assoc`.\n3. The final map is:\n\n```sema\n{\"the\" 3 \"cat\" 1 \"dog\" 1 \"bird\" 1}\n```\n\n**Key points:**\n\n- `get` accepts a default value as its third argument, so `(get acc word 0)` returns `0` for unseen words \u2014 no explicit `nil?` check needed.\n- `assoc` returns a new map with the updated key, making the fold purely functional.\n- `foldl` (left fold) is the natural choice here since we're reducing a list into a single accumulator."
+      },
+      {
+        "task_id": "L2-009",
+        "completion": "```sema\n(define (max-of-list lst)\n  (foldl (fn (acc x) (if (> x acc) x acc))\n         (first lst)\n         lst))\n\n(max-of-list '(3 7 2 9 4))\n;; => 9\n```\n\n**How it works:**\n\n- `foldl` walks the list left-to-right, threading an accumulator through each step.\n- The initial accumulator is `(first lst)` \u2014 the first element \u2014 so we start with a real value from the list.\n- At each step, the lambda compares the current element `x` against the running max `acc` and keeps the larger one.\n\nYou can also write it more concisely with a short lambda, where `%1` is the accumulator and `%2` is the current element:\n\n```sema\n(define (max-of-list lst)\n  (foldl #(if (> %2 %1) %2 %1) (first lst) lst))\n```\n\nBoth evaluate `(max-of-list '(3 7 2 9 4))` to **`9`**."
+      },
+      {
+        "task_id": "L2-010",
+        "completion": "```lisp\n(define (title-case s)\n  (string/join \" \"\n    (map (fn (w)\n           (if (= (string/length w) 0)\n               w\n               (str (string/upper (string/substring w 0 1))\n                    (string/substring w 1))))\n         (string/split s \" \"))))\n\n(title-case \"hello world foo\")\n```\n\n**How it works:**\n\n1. **`string/split`** breaks the input on spaces \u2192 `(\"hello\" \"world\" \"foo\")`\n2. **`map`** applies a capitalization lambda to each word:\n   - `string/substring w 0 1` extracts the first character\n   - `string/upper` capitalizes it\n   - `string/substring w 1` gets the remainder of the word\n   - `str` concatenates the two parts\n3. **`string/join`** reassembles the words with spaces\n\n**Result:**\n\n```\n\"Hello World Foo\"\n```"
+      },
+      {
+        "task_id": "L2-011",
+        "completion": "```sema\n(define (prime? n)\n  (cond\n    ((< n 2) #f)\n    ((= n 2) #t)\n    ((even? n) #f)\n    (else\n     (let loop ((i 3))\n       (cond\n         ((> (* i i) n) #t)\n         ((= (mod n i) 0) #f)\n         (else (loop (+ i 2))))))))\n\n(prime? 17)\n```\n\n**Result:** `#t`\n\n### How it works\n\n| Step | Logic |\n|------|-------|\n| `(< n 2)` | Numbers below 2 are not prime |\n| `(= n 2)` | 2 is the only even prime |\n| `(even? n)` | Eliminate all other even numbers |\n| `loop` from `i = 3` | Test odd divisors only, incrementing by 2 |\n| `(> (* i i) n)` | Stop when `i\u00b2 > n` \u2014 no divisor can exist beyond \u221an |\n| `(= (mod n i) 0)` | Found a divisor \u2192 not prime |\n\nThe function uses **tail-recursive** named `let` for efficient iteration (TCO), so it won't blow the stack even for large inputs. For `n = 17`, it checks divisors 3 and 5 (since 5\u00b2 = 25 > 17), finds no divisor, and returns `#t`."
+      },
+      {
+        "task_id": "L2-012",
+        "completion": "```sema\n(define (map-keys-only m)\n  (keys m))\n\n(map-keys-only {:a 1 :b 2 :c 3})\n```\n\n**Result:** `(:a :b :c)`\n\nThe function simply delegates to the built-in `keys` function, which returns a list of all keys in the map. The evaluation of `(map-keys-only {:a 1 :b 2 :c 3})` produces the list `(:a :b :c)`."
+      },
+      {
+        "task_id": "L2-013",
+        "completion": "```sema\n(->> (range 1 11)\n     (filter odd?)\n     (map #(* % %))\n     (reduce + 0))\n```\n\nThis evaluates to **165**.\n\nHow it threads:\n1. `(range 1 11)` \u2192 `(1 2 3 4 5 6 7 8 9 10)`\n2. `(filter odd? ...)` \u2192 `(1 3 5 7 9)`\n3. `(map #(* % %) ...)` \u2192 `(1 9 25 49 81)`\n4. `(reduce + 0 ...)` \u2192 `165`"
+      },
+      {
+        "task_id": "L2-014",
+        "completion": "```sema\n(define (classify n)\n  (match n\n    (x when (> x 0) :positive)\n    (x when (< x 0) :negative)\n    (0 :zero)))\n```\n\n**How it works:**\n\n- The first clause binds `x` to `n` and tests the guard `(> x 0)`. If true, it returns `:positive`.\n- The second clause binds `x` to `n` and tests the guard `(< x 0)`. If true, it returns `:negative`.\n- The final clause matches the literal `0` and returns `:zero`.\n\n**Evaluating `(classify -5)`:**\n\n1. `n` is `-5`.\n2. First clause: guard `(> -5 0)` \u2192 `#f`, no match.\n3. Second clause: guard `(< -5 0)` \u2192 `#t`, match! Returns `:negative`.\n\n```\n=> :negative\n```"
+      },
+      {
+        "task_id": "L2-015",
+        "completion": "## Solution\n\n```sema\n(define (swap-pair lst)\n  (match lst\n    ((a b) [b a])))\n\n(swap-pair '(1 2))\n```\n\n## Evaluation\n\n```sema\n;; => [2 1]\n```\n\n## How it works\n\n| Part | Purpose |\n|---|---|\n| `match` | Pattern-matches/destructures the input list |\n| `(a b)` | Pattern binds the first element to `a`, second to `b` |\n| `[b a]` | Returns a **vector** with the elements swapped |\n\nThe pattern `(a b)` matches a 2-element list, binding `a \u2192 1` and `b \u2192 2`, then the body constructs the vector `[2 1]`."
+      },
+      {
+        "task_id": "L3-001",
+        "completion": "```sema\n(define (group-by-parity nums)\n  {:evens (filter even? nums)\n   :odds  (filter odd? nums)})\n\n(group-by-parity '(1 2 3 4 5 6))\n```\n\n**Result:**\n\n```sema\n{:evens (2 4 6) :odds (1 3 5)}\n```\n\n### How it works\n\n- **`filter even?`** selects all even numbers from the input list.\n- **`filter odd?`** selects all odd numbers.\n- The two filtered lists are placed into a map literal under the `:evens` and `:odds` keys.\n\nThis is a clean, declarative approach that traverses the list twice. If you prefer a single-pass version (useful for very large lists), you can use `foldl`:\n\n```sema\n(define (group-by-parity nums)\n  (foldl (fn (acc n)\n           (let [key (if (even? n) :evens :odds)]\n             (assoc acc key (append (get acc key '()) (list n)))))\n         {} nums))\n```\n\nBoth produce the same result for `(group-by-parity '(1 2 3 4 5 6))` \u2192 `{:evens (2 4 6) :odds (1 3 5)}`."
+      },
+      {
+        "task_id": "L3-002",
+        "completion": "```sema\n(define (word-freq s)\n  (let [words (string/split (string/lower s) #\"\\s+\")]\n    (foldl (fn (acc word)\n             (map/update acc (string/to-keyword word)\n                         #(if (nil? %) 1 (+ % 1))))\n           {}\n           words)))\n\n(word-freq \"the The THE cat\")\n```\n\n**Evaluation:**\n\n1. `string/lower` converts `\"the The THE cat\"` \u2192 `\"the the the cat\"`\n2. `string/split` on `#\"\\s+\"` produces `[\"the\" \"the\" \"the\" \"cat\"]`\n3. `foldl` accumulates with `map/update`, counting each word as a keyword key\n\n**Result:**\n\n```sema\n{:the 3 :cat 1}\n```"
+      },
+      {
+        "task_id": "L3-003",
+        "completion": "```scheme\n;; Define the Point record type with fields x and y\n(define-record-type Point\n  (make-point x y)\n  point?\n  (x point-x)\n  (y point-y))\n\n;; Euclidean distance between two Points\n(define (distance p1 p2)\n  (sqrt (+ (pow (- (point-x p2) (point-x p1)) 2)\n           (pow (- (point-y p2) (point-y p1)) 2))))\n\n;; Evaluate\n(distance (make-point 0 0) (make-point 3 4))\n```\n\nThis defines:\n\n- **`make-point`** \u2014 constructor taking `x` and `y`\n- **`point?`** \u2014 type predicate\n- **`point-x` / `point-y`** \u2014 field accessors\n\nThe `distance` function computes \u221a((x\u2082\u2212x\u2081)\u00b2 + (y\u2082\u2212y\u2081)\u00b2).\n\n**Result:** `5.0`"
+      },
+      {
+        "task_id": "L3-004",
+        "completion": "## `unless` Macro\n\n```sema\n(defmacro unless (condition . body)\n  `(if ,condition nil (begin ,@body)))\n```\n\n### How it works\n\n- **Parameters**: `condition` is the test expression; `body` is a rest parameter capturing all remaining forms.\n- **Expansion**: Uses quasiquote to build an `if` that returns `nil` when the condition is true and wraps the body in `begin` when it's false.\n\n### Evaluating `(unless false 42)`\n\n```sema\n(unless false 42)\n```\n\n**Macro expansion:**\n\n```sema\n(if false nil (begin 42))\n```\n\n**Evaluation:**\n\n1. `false` evaluates to `#f`\n2. The `if` takes the else-branch \u2192 `(begin 42)`\n3. `begin` returns the value of its last expression \u2192 **`42`**\n\n### Result\n\n```\n42\n```\n\n### Bonus \u2014 a few more uses\n\n```sema\n(unless true 42)       ; => nil   (condition true, body skipped)\n(unless false 1 2 3)   ; => 3     (multiple body forms, last value returned)\n(unless (= 1 2)\n  (println \"not equal\")\n  :ok)\n; prints \"not equal\", => :ok\n```"
+      },
+      {
+        "task_id": "L3-005",
+        "completion": "```sema\n(json/encode {:id 1 :name \"Alice\" :roles [:admin :user]})\n```\n\nThis creates a map literal with keyword keys (`:id`, `:name`, `:roles`), where `:roles` holds a vector of keywords (`[:admin :user]`), then passes it to `json/encode` which serializes it into a JSON string."
+      },
+      {
+        "task_id": "L3-006",
+        "completion": "```sema\n;; Define pi\n(define pi 3.14159)\n\n;; Define the multimethod, dispatching on the :type key of the shape map\n(defmulti area #(get % :type))\n\n;; Circle: \u03c0 * r\u00b2\n(defmethod area :circle\n  (fn [shape]\n    (* pi (pow (get shape :radius) 2))))\n\n;; Rectangle: w * h\n(defmethod area :rectangle\n  (fn [shape]\n    (* (get shape :width) (get shape :height))))\n\n;; Evaluate\n(area {:type :circle :radius 5})\n```\n\n**Result:** `78.53975`\n\n### How it works\n\n| Part | Purpose |\n|---|---|\n| `(defmulti area #(get % :type))` | Registers `area` as a multimethod. The dispatch function extracts `:type` from the argument map to select which method to invoke. |\n| `(defmethod area :circle ...)` | Handles shapes where `:type` is `:circle`. Computes `\u03c0 \u00d7 r\u00b2` using `pow` for the square. |\n| `(defmethod area :rectangle ...)` | Handles shapes where `:type` is `:rectangle`. Computes `width \u00d7 height`. |\n| `(area {:type :circle :radius 5})` | Dispatches to the `:circle` method \u2192 `3.14159 \u00d7 5\u00b2 = 3.14159 \u00d7 25 = 78.53975` |\n\nThe same multimethod also handles rectangles:\n\n```sema\n(area {:type :rectangle :width 4 :height 6})  ; => 24\n```"
+      },
+      {
+        "task_id": "L3-007",
+        "completion": "```sema\n(define (handle-request req)\n  (match req\n    {:method :GET  :path \"/health\"} {:status 200 :body \"ok\"}\n    {:method :POST :path \"/users\"}  {:status 201 :body \"created\"}\n    _                              {:status 404 :body \"not found\"}))\n\n(handle-request {:method :GET :path \"/health\"})\n```\n\n**How it works:**\n\n1. **`match`** destructures the request map against each pattern in order.\n2. The first pattern `{:method :GET :path \"/health\"}` matches maps where `:method` is `:GET` and `:path` is `\"/health\"` \u2014 returns `{:status 200 :body \"ok\"}`.\n3. The second pattern `{:method :POST :path \"/users\"}` matches the user-creation route \u2014 returns `{:status 201 :body \"created\"}`.\n4. The wildcard `_` catches everything else \u2014 returns `{:status 404 :body \"not found\"}`.\n\n**Evaluation result:**\n\n```\n{:status 200 :body \"ok\"}\n```"
+      },
+      {
+        "task_id": "L3-008",
+        "completion": "```sema\n(define (safe-divide a b)\n  (try (/ a b)\n       (catch e {:error \"division by zero\"})))\n\n(safe-divide 10 2)\n```\n\n**How it works:**\n\n- `try` attempts to evaluate `(/ a b)`.\n- If `b` is `0`, the division raises an exception which is caught by `catch`, binding the exception to `e` and returning the map `{:error \"division by zero\"}`.\n- If `b` is non-zero, the result of the division is returned normally.\n\n**Evaluation of `(safe-divide 10 2)`:**\n\n```\n5\n```\n\nThe denominator is `2` (non-zero), so no exception is raised and `10 / 2` evaluates to `5`."
+      },
+      {
+        "task_id": "L3-009",
+        "completion": "```sema\n(->> \"Hello World Foo Bar\"\n     (string/split \" \")\n     (map string/upper)\n     (string/join \", \"))\n```\n\nThis threads the string through each form as the **last** argument:\n\n1. `(string/split \" \" \"Hello World Foo Bar\")` \u2192 `(\"Hello\" \"World\" \"Foo\" \"Bar\")`\n2. `(map string/upper '(\"Hello\" \"World\" \"Foo\" \"Bar\"))` \u2192 `(\"HELLO\" \"WORLD\" \"FOO\" \"BAR\")`\n3. `(string/join \", \" '(\"HELLO\" \"WORLD\" \"FOO\" \"BAR\"))` \u2192 `\"HELLO, WORLD, FOO, BAR\"`"
+      },
+      {
+        "task_id": "L3-010",
+        "completion": "```sema\n(define (tree-sum tree)\n  (cond\n    ((number? tree) tree)\n    ((list? tree) (foldl + 0 (map tree-sum tree)))\n    (else 0)))\n```\n\n**How it works:**\n\n1. **Base case \u2014 number:** If the element is a number, return it directly.\n2. **Recursive case \u2014 list:** If the element is a list, map `tree-sum` over every element (recursing into sub-lists) and fold the results together with `+`.\n3. **Fallback:** Any non-number, non-list value (e.g., `nil`) contributes `0`.\n\n**Evaluation of `(tree-sum '(1 (2 3) (4 (5 6))))`:**\n\n```\ntree-sum '(1 (2 3) (4 (5 6)))\n= foldl + 0 (map tree-sum '(1 (2 3) (4 (5 6))))\n= foldl + 0 (list (tree-sum 1)\n                  (tree-sum '(2 3))\n                  (tree-sum '(4 (5 6))))\n\n  (tree-sum 1)        = 1\n  (tree-sum '(2 3))   = foldl + 0 (map tree-sum '(2 3))\n                      = foldl + 0 '(2 3)\n                      = 5\n  (tree-sum '(4 (5 6))) = foldl + 0 (map tree-sum '(4 (5 6)))\n                        = foldl + 0 (list 4 (tree-sum '(5 6)))\n                        = foldl + 0 (list 4 11)\n                        = 15\n\n= foldl + 0 '(1 5 15)\n= 21\n```\n\n**Result: `21`**"
+      },
+      {
+        "task_id": "L3-011",
+        "completion": "## Solution\n\n```sema\n(define (deep-merge-user user1 user2)\n  (merge user1 user2))\n\n(deep-merge-user {:name \"Alice\" :age 30} {:age 31 :role :admin})\n```\n\n## How it works\n\n- **`merge`** takes multiple maps and combines them into one. When the same key appears in more than one map, the **rightmost** (last) value wins.\n- So `:age` from `user2` (31) overrides `:age` from `user1` (30), while `:name` is preserved from `user1` and `:role` is added from `user2`.\n\n## Evaluation result\n\n```\n{:name \"Alice\" :age 31 :role :admin}\n```\n\n| Key    | Source   | Value    |\n|--------|----------|----------|\n| `:name` | `user1`  | `\"Alice\"` |\n| `:age`  | `user2`  | `31`      |\n| `:role` | `user2`  | `:admin`  |"
+      },
+      {
+        "task_id": "L3-012",
+        "completion": "```sema\n(define (fizzbuzz n)\n  (map (fn (i)\n         (cond\n           ((and (= (mod i 3) 0) (= (mod i 5) 0)) \"FizzBuzz\")\n           ((= (mod i 3) 0) \"Fizz\")\n           ((= (mod i 5) 0) \"Buzz\")\n           (else (str i))))\n       (range 1 (+ n 1))))\n\n(fizzbuzz 5)\n```\n\n**Evaluation of `(fizzbuzz 5)`:**\n\n| i | mod 3 | mod 5 | Result |\n|---|-------|-------|--------|\n| 1 | 1 | 1 | \"1\" |\n| 2 | 2 | 2 | \"2\" |\n| 3 | 0 | 3 | \"Fizz\" |\n| 4 | 1 | 4 | \"4\" |\n| 5 | 2 | 0 | \"Buzz\" |\n\n**Result:**\n\n```sema\n(\"1\" \"2\" \"Fizz\" \"4\" \"Buzz\")\n```\n\n**How it works:**\n\n1. **`range`** generates the list `(1 2 3 4 5)` \u2014 `range` is end-exclusive, so we pass `(+ n 1)`.\n2. **`map`** applies the lambda to each number.\n3. **`cond`** checks divisibility using `mod`:\n   - The **both** case (`FizzBuzz`) is tested **first** \u2014 order matters since 15 is divisible by both 3 and 5.\n   - `str` converts the number to its string representation for the fallback case."
+      },
+      {
+        "task_id": "L3-013",
+        "completion": "```sema\n; compose takes two functions f and g, returns a function computing f(g(x))\n(define (compose f g)\n  (fn (x) (f (g x))))\n\n(define (square x) (* x x))\n(define (add1 x) (+ x 1))\n\n; compose square and add1: square(add1(x))\n(define square-after-add1 (compose square add1))\n\n; evaluate with input 4 -> add1(4)=5 -> square(5)=25\n(println (square-after-add1 4))\n```\n\nThis prints `25`.\n\nA few notes on the design:\n- `compose` returns a closure via `fn` that captures `f` and `g` from the enclosing scope.\n- `(compose square add1)` produces `square \u2218 add1`, i.e. `square(add1(x))`, so `4 \u2192 5 \u2192 25`.\n- If you wanted the opposite order (`add1(square(x))`), you'd write `(compose add1 square)`, giving `4 \u2192 16 \u2192 17`."
+      },
+      {
+        "task_id": "L3-014",
+        "completion": "```sema\n(define (csv-row values)\n  (string/join (map str values) \",\"))\n\n(csv-row '(\"Alice\" 30 \"admin\"))\n```\n\n**Result:** `\"Alice,30,admin\"`\n\n### How it works\n\n1. **`map str values`** \u2014 applies `str` to every element, converting each value (`\"Alice\"`, `30`, `\"admin\"`) into its string representation.\n2. **`string/join ... \",\"`** \u2014 concatenates the resulting list of strings, inserting a comma between each pair."
+      },
+      {
+        "task_id": "L3-015",
+        "completion": "```sema\n(define (quadratic-roots a b c)\n  (let* ((discriminant (- (* b b) (* 4 a c)))\n         (sqrt-d       (sqrt discriminant))\n         (denom        (* 2 a))\n         (neg-b        (- b))\n         (root1        (/ (+ neg-b sqrt-d) denom))\n         (root2        (/ (- neg-b sqrt-d) denom)))\n    [root1 root2]))\n\n(quadratic-roots 1 -5 6)\n;; => [3 2]\n```\n\n**How it works:**\n\nUsing `let*` (sequential binding), each intermediate value is computed in order and available to subsequent bindings:\n\n1. **`discriminant`** \u2014 `b\u00b2 \u2212 4ac`, determines the nature of the roots\n2. **`sqrt-d`** \u2014 `\u221adiscriminant`, the square root of the discriminant\n3. **`denom`** \u2014 `2a`, the denominator\n4. **`neg-b`** \u2014 `\u2212b`, the negated middle coefficient\n5. **`root1`** \u2014 `(\u2212b + \u221a\u0394) / 2a` (the \"plus\" root)\n6. **`root2`** \u2014 `(\u2212b \u2212 \u221a\u0394) / 2a` (the \"minus\" root)\n\nFor `(quadratic-roots 1 -5 6)`:\n\n| Binding | Calculation | Value |\n|---|---|---|\n| `discriminant` | `(\u22125)\u00b2 \u2212 4(1)(6)` | 1 |\n| `sqrt-d` | `\u221a1` | 1 |\n| `denom` | `2(1)` | 2 |\n| `neg-b` | `\u2212(\u22125)` | 5 |\n| `root1` | `(5 + 1) / 2` | **3** |\n| `root2` | `(5 \u2212 1) / 2` | **2** |\n\nThe function returns the vector `[3 2]`."
+      },
+      {
+        "task_id": "L4-001",
+        "completion": "```sema\n;; Define the processing pipeline\n(define (process-users users)\n  (->> users\n       (filter (fn (u) (>= (get u :age) 18)))\n       (sort (fn (a b) (> (get a :age) (get b :age))))\n       (map (fn (u) (get u :name)))))\n\n;; Test data\n(define test-users\n  [{:name \"Alice\" :age 30}\n   {:name \"Bob\"   :age 17}\n   {:name \"Carol\" :age 25}\n   {:name \"Dave\"  :age 40}])\n\n;; Run and print\n(println (process-users test-users))\n```\n\n**Output:**\n```\n(\"Dave\" \"Alice\" \"Carol\")\n```\n\n### How it works\n\n1. **`filter`** \u2014 keeps only users where `:age >= 18`, removing Bob (age 17).\n2. **`sort`** \u2014 uses a comparator `(> age-a age-b)` so higher ages come first (descending).\n3. **`map`** \u2014 extracts the `:name` value from each remaining user map.\n4. **`->>`** \u2014 threads the list through all three steps left-to-right, making the pipeline read top-to-bottom."
+      },
+      {
+        "task_id": "L4-002",
+        "completion": "The user wants a Sema function `eval-expr` that evaluates a simple arithmetic expression tree. The tree is either:\n- a number (leaf)\n- a list `(op left right)` where op is one of `+ - * /`\n\nAnd they want to evaluate `(eval-expr '(+ (* 2 3) (- 10 4)))` which should give 12.\n\nLet me write this function. I'll use pattern matching with `match` to handle the cases.\n\nIn Sema, `match` is available. Let me think about how to match:\n- A number: I can check with `number?` or match on the structure\n- A list `(op left right)`: I can destructure\n\nLet me write it:\n\n```sema\n(define (eval-expr expr)\n  (match expr\n    (n when (number? n) n)\n    ((op left right)\n     (let ((l (eval-expr left))\n           (r (eval-expr right)))\n       (match op\n         ('+ (+ l r))\n         ('- (- l r))\n         ('* (* l r))\n         ('/ (/ l r))\n         (else (throw (string/format \"Unknown operator: ${op}\"))))))))\n```\n\nWait, in Sema, symbols are slash-namespaced strings. When we quote `'+`, what do we get? In Lisp, `'+` evaluates to the symbol `+`. In Sema, symbols are slash-namespaced. Let me think about how matching on symbols works.\n\nActually, in the expression `'(+ (* 2 3) (- 10 4))`, the `+`, `*`, `-` are symbols. When we match, we need to match against these symbols.\n\nIn Sema, I think matching against a quoted symbol like `'+` should work. Let me also consider using `cond` instead:\n\n```sema\n(define (eval-expr expr)\n  (cond\n    ((number? expr) expr)\n    ((list? expr)\n     (let ((op (first expr))\n           (left (eval-expr (second expr)))\n           (right (eval-expr (third expr))))\n       (cond\n         ((= op '+) (+ left right))\n         ((= op '-) (- left right))\n         ((= op '*) (* left right))\n         ((= op '/) (/ left right))\n         (else (throw (str \"Unknown operator: \" op))))))\n    (else (throw (str \"Invalid expression: \" expr)))))\n```\n\nHmm, but I need to be careful. In Sema, `first`, `second`, `third` might be available. Let me use `list` functions. Actually, looking at the stdlib, I see `take`, `drop`, etc. Common list access functions... In Scheme, `car` and `cdr` are standard. Let me check - the stdlib mentions `map`, `filter`, `foldl`, etc. but doesn't explicitly mention `first`/`second`/`third` or `car`/`cdr`.\n\nLet me use pattern matching with `match` which should handle destructuring nicely:\n\n```sema\n(define (eval-expr expr)\n  (match expr\n    (n when (number? n) n)\n    (['+ left right] (+ (eval-expr left) (eval-expr right)))\n    (['- left right] (- (eval-expr left) (eval-expr right)))\n    (['* left right] (* (eval-expr left) (eval-expr right)))\n    (['/ left right] (/ (eval-expr left) (eval-expr right)))\n    (else (throw (str \"Invalid expression: \" expr)))))\n```\n\nHmm, but I'm not sure if `match` in Sema supports matching on quoted symbols inside vectors/lists like that. Let me think about this more carefully.\n\nThe `match` form in Sema supports `:keys` destructuring and when guards. Let me look at the syntax again:\n\n```\nmatch / match* \u2014 pattern matching with :keys destructuring and when guards\n  (match expr (pattern body...) (pattern when guard body...) ...)\n```\n\nI think the safest approach is to use `cond` with explicit checks. Let me also consider that in Sema, we might need to use `list?` and then destructure manually.\n\nActually, let me try a cleaner approach using `match` with list patterns. In many Lisp match implementations, you can match list structures. Let me try:\n\n```sema\n(define (eval-expr expr)\n  (match expr\n    (n when (number? n) n)\n    ((op left right)\n     (let ((l (eval-expr left))\n           (r (eval-expr right)))\n       (cond\n         ((= op '+) (+ l r))\n         ((= op '-) (- l r))\n         ((= op '*) (* l r))\n         ((= op '/) (/ l r))\n         (else (throw (str \"Unknown operator: \" op))))))\n    (else (throw (str \"Invalid expression: \" expr)))))\n```\n\nThis should work. The `(op left right)` pattern destructures the list into three elements. Then we check what `op` is using `=` against quoted symbols.\n\nActually, I need to be careful about how symbols are compared in Sema. Symbols are \"slash-namespaced\" - so `+` might be represented as something like `core/+` or just `+`. When we quote `'+`, we get the symbol. When we compare with `=`, it should work if both are the same symbol.\n\nLet me also think about whether `=` works for symbol comparison. In most Lisps, `=` or `eq?` works for symbols. In Sema, `=` should work for symbols.\n\nLet me also consider using `case` if available, but the spec doesn't mention `case`. Let me stick with `cond` or `match`.\n\nActually, let me reconsider. The `match` form might support matching literal symbols. Let me try a version that matches on the operator directly:\n\n```sema\n(define (eval-expr expr)\n  (match expr\n    (n when (number? n) n)\n    ((+ left right) ...)  ; This might not work because + would be treated as a binding pattern\n    ...))\n```\n\nNo, that won't work because `+` in a pattern position would be treated as a variable to bind, not a literal to match. So I need to either:\n1. Use a guard to check the operator\n2. Use `cond` with explicit checks\n3. Match on the whole structure with quoted symbols\n\nLet me go with the `cond` approach which is clearest:\n\n```sema\n(define (eval-expr expr)\n  (cond\n    ((number? expr) expr)\n    ((list? expr)\n     (let ((op (car expr))\n           (args (cdr expr)))\n       (let ((left (eval-expr (car args)))\n             (right (eval-expr (car (cdr args)))))\n         (cond\n           ((= op '+) (+ left right))\n           ((= op '-) (- left right))\n           ((= op '*) (* left right))\n           ((= op '/) (/ left right))\n           (else (throw (str \"Unknown operator: \" op)))))))\n    (else (throw (str \"Invalid expression: \" expr)))))\n```\n\nHmm, but I'm not sure `car` and `cdr` are available in Sema. The stdlib doesn't mention them explicitly. Let me use `first` and `second` or maybe `list/get` or `nth`.\n\nActually, looking at the stdlib more carefully, I see `map/get` for maps. For lists, there might be `list/get` or `nth`. Let me think...\n\nIn the stdlib naming conventions, it says \"Slash-namespaced: string/trim, map/get, list/filter, ...\". So there might be `list/get` or `list/nth`.\n\nBut actually, in many Lisp implementations, `first`, `second`, `third` are available. Or I could use `(list-ref expr 0)`.\n\nLet me try a different approach - use `match` for destructuring:\n\n```sema\n(define (eval-expr expr)\n  (match expr\n    (n when (number? n) n)\n    ((op left right)\n     (let ((l (eval-expr left))\n           (r (eval-expr right)))\n       (cond\n         ((= op '+) (+ l r))\n         ((= op '-) (- l r))\n         ((= op '*) (* l r))\n         ((= op '/) (/ l r))\n         (else (throw (str \"Unknown operator: \" op))))))\n    (else (throw (str \"Invalid expression: \" expr)))))\n```\n\nI think this is the cleanest. The `match` form should support list destructuring with `(op left right)` pattern. This binds `op`, `left`, and `right` from the list elements.\n\nLet me also think about whether I should use `keyword?` comparison or symbol comparison. In the quoted expression `'(+ (* 2 3) (- 10 4))`, the operators are symbols. So comparing with `'+`, `'-`, etc. should work.\n\nActually, wait. In Sema, symbols are \"slash-namespaced (string/trim, map/get, list/filter)\". This means symbols have a namespace prefix. So `+` might actually be something like `core/+` when evaluated. But when quoted, `'+` should just be the symbol `+` without namespace resolution.\n\nHmm, but when we write `'(+ (* 2 3) (- 10 4))`, the"
+      },
+      {
+        "task_id": "L4-003",
+        "completion": "# Traffic Light State Machine in Sema\n\nHere's the implementation:\n\n```sema\n;; Transition function using match\n(define (next-state state)\n  (match state\n    :red   :green\n    :green :yellow\n    :yellow :red))\n\n;; Run n transitions starting from :red, returning all visited states\n(define (run-states n)\n  (let loop ((i 0) (state :red) (acc '(:red)))\n    (if (= i n)\n        (reverse acc)\n        (let ((next (next-state state)))\n          (loop (+ i 1) next (cons next acc))))))\n\n;; Evaluate\n(run-states 5)\n```\n\n## How It Works\n\n**`next-state`** \u2014 Uses `match` to pattern-match on the current state keyword and return the next one in the cycle.\n\n**`run-states`** \u2014 Uses a named `let` loop (tail-recursive) with three accumulators:\n- `i` \u2014 transition counter\n- `state` \u2014 current state\n- `acc` \u2014 list of visited states (built in reverse, then flipped at the end)\n\n## Evaluation of `(run-states 5)`\n\n| Step | State | Accumulator (reversed) |\n|------|-------|------------------------|\n| 0 | `:red` | `(:red)` |\n| 1 | `:green` | `(:green :red)` |\n| 2 | `:yellow` | `(:yellow :green :red)` |\n| 3 | `:red` | `(:red :yellow :green :red)` |\n| 4 | `:green` | `(:green :red :yellow :green :red)` |\n| 5 | `:yellow` | `(:yellow :green :red :yellow :green :red)` |\n\n**Result:**\n\n```sema\n(:red :green :yellow :red :green :yellow)\n```\n\nThe list contains **6 states** \u2014 the initial `:red` plus one state for each of the 5 transitions, cycling through the traffic light sequence `red \u2192 green \u2192 yellow \u2192 red \u2192 ...`."
+      },
+      {
+        "task_id": "L4-004",
+        "completion": "The user wants a Sema expression that defines an HTTP router. Let me break down the requirements:\n\n1. Two routes: GET /health \u2192 {:status 200 :body \"ok\"}, GET /status \u2192 {:status 200 :body \"running\"}\n2. Use a vector of route definitions\n3. The router should be a function that takes a request map and matches :method and :path\n\nLet me write this in Sema syntax.\n\nI'll define a vector of route definitions, each containing :method, :path, and a response. Then define a function that takes a request map, finds the matching route, and returns the response (or a 404 if no match).\n\n```sema\n(define routes\n  [{:method \"GET\" :path \"/health\" :response {:status 200 :body \"ok\"}}\n   {:method \"GET\" :path \"/status\" :response {:status 200 :body \"running\"}}])\n\n(define (router req)\n  (let ([match (list/find (fn (r)\n                            (and (= (get r :method) (get req :method))\n                                 (= (get r :path) (get req :path))))\n                          routes)])\n    (if match\n        (get match :response)\n        {:status 404 :body \"not found\"})))\n```\n\nWait, I need to check what functions are available. The stdlib mentions `filter` for lists. Let me think about whether `list/find` exists. The prompt doesn't explicitly list `find` but it's a common function. Let me use `filter` and `first` instead, or I could use `find` if it exists.\n\nActually, looking at the stdlib functions listed: `map, filter, foldl, foldr, reduce, apply, take, drop, range, zip, reverse, append, sort, sort-by, frequencies, flat-map, partition, interleave, chunk, sliding`. No `find` listed. But `filter` and `first` (or `take 1`) could work. Actually `first` isn't listed either but it's very common. Let me use `filter` and then check if the result is non-empty.\n\nHmm, let me think about this differently. I could use `filter` to get matching routes and then take the first one. Or I could use `foldl` to find the match.\n\nActually, let me just use a simple approach with `filter` and check if the result is empty:\n\n```sema\n(define routes\n  [{:method \"GET\" :path \"/health\" :response {:status 200 :body \"ok\"}}\n   {:method \"GET\" :path \"/status\" :response {:status 200 :body \"running\"}}])\n\n(define (router req)\n  (let ([matches (filter (fn (r)\n                           (and (= (get r :method) (get req :method))\n                                (= (get r :path) (get req :path))))\n                         routes)])\n    (if (nil? (first matches))\n        {:status 404 :body \"not found\"}\n        (get (first matches) :response))))\n```\n\nHmm, but `first` isn't listed. Let me use `take` instead: `(take 1 matches)` returns a list, then I can check if it's empty. But how to check if a list is empty? `nil?` might work if empty lists are nil, or I could use `list?` and length.\n\nActually, in many Lisp dialects, `first` is a standard function. And `empty?` is common too. Let me just use a reasonable approach. Since the prompt says \"Legacy Scheme names also work\", `car` and `cdr` might work too.\n\nLet me try a cleaner approach using `find` or just use `filter` with `first`. I think `first` is reasonable to assume exists even if not explicitly listed.\n\nActually, let me re-read the prompt. It says these are \"Key Stdlib Functions\" - not an exhaustive list. So `find`, `first`, `empty?` etc. likely exist.\n\nLet me write a clean version:\n\n```sema\n(define routes\n  [{:method \"GET\" :path \"/health\" :response {:status 200 :body \"ok\"}}\n   {:method \"GET\" :path \"/status\" :response {:status 200 :body \"running\"}}])\n\n(define (router req)\n  (let ([route (find (fn (r)\n                       (and (= (get r :method) (get req :method))\n                            (= (get r :path) (get req :path))))\n                     routes)])\n    (if route\n        (get route :response)\n        {:status 404 :body \"not found\"})))\n```\n\nThis is clean. `find` returns the first matching element or nil. If `find` doesn't exist, I could use `filter` + `first`.\n\nActually, let me be safe and use `filter` with a check. Or I could use `some` which is common. Let me just go with `find` as it's the most natural and likely exists.\n\nAlternatively, I could use a more functional approach with `cond` and direct matching:\n\n```sema\n(define routes\n  [{:method \"GET\" :path \"/health\" :response {:status 200 :body \"ok\"}}\n   {:method \"GET\" :path \"/status\" :response {:status 200 :body \"running\"}}])\n\n(define (router req)\n  (or (find (fn (r)\n              (and (= (get r :method) (get req :method))\n                   (= (get r :path) (get req :path))))\n            routes)\n      {:status 404 :body \"not found\"}))\n```\n\nWait, but `find` returns the route, not the response. I need to get the :response from it. Let me use `some` with a mapping:\n\nActually, let me keep it simple and clear:\n\n```sema\n(define routes\n  [{:method \"GET\" :path \"/health\" :response {:status 200 :body \"ok\"}}\n   {:method \"GET\" :path \"/status\" :response {:status 200 :body \"running\"}}])\n\n(define (router req)\n  (let ([match (find (fn (r)\n                       (and (= (get r :method) (get req :method))\n                            (= (get r :path) (get req :path))))\n                     routes)])\n    (if match\n        (get match :response)\n        {:status 404 :body \"not found\"})))\n```\n\nThis looks good. Let me also consider using the threading macro for readability:\n\n```sema\n(define routes\n  [{:method \"GET\" :path \"/health\" :response {:status 200 :body \"ok\"}}\n   {:method \"GET\" :path \"/status\" :response {:status 200 :body \"running\"}}])\n\n(define (router req)\n  (let ([match (find (fn (r)\n                       (and (= (get r :method) (get req :method))\n                            (= (get r :path) (get req :path))))\n                     routes)])\n    (if-let ([resp (get match :response)])\n        resp\n        {:status 404 :body \"not found\"})))\n```\n\nHmm, `if-let` with `get match :response` - if match is nil, `get` on nil might return nil, which would work. But it's a bit indirect. Let me keep the simpler version.\n\nActually, I realize I should double-check: does `find` exist in Sema? The prompt doesn't list it. Let me use `filter` and `first` which are more likely to exist, or use `foldl`.\n\nLet me use a safe approach with `filter`:\n\n```sema\n(define routes\n  [{:method \"GET\" :path \"/health\" :response {:status 200 :body \"ok\"}}\n   {:method \"GET\" :path \"/status\" :response {:status 200 :body \"running\"}}])\n\n(define (router req)\n  (let ([matches (filter (fn (r)\n                           (and (= (get r :method) (get req :method))\n                                (= (get r :path) (get req :path))))\n                         routes)])\n    (if (empty? matches)\n        {:status 404 :body \"not found\"}\n        (get (first matches) :response))))\n```\n\nBut `empty?` and `first` aren't listed either. Hmm.\n\nOK, let me think about what IS listed: `take`, `filter`, `foldl`, `foldr`, `reduce`. \n\nI could use `take 1` to get the first match, then check if the result is nil or empty. Or I could use `foldl` to find the match.\n\nLet me use `foldl`:\n\n```sema\n(define routes\n  [{:method \"GET\" :path \"/health\" :response {:status 200 :body \"ok\"}}\n   {:method \"GET\" :path \"/status\" :response {:status 200 :body \"running\"}}])\n\n(define (router req)\n  (foldl (fn (acc r)\n           (if (and (nil? acc)\n                    (= (get r :method) (get req :method))\n                    (= (get r :path) (get req :path)))\n               (get r :response)\n               acc))\n         nil\n         routes))\n```\n\nBut this doesn't handle the 404 case. Let me add that:\n\n```sema\n(define routes\n  [{:method \"GET\" :path \"/health\" :response {:status 200 :body \"ok\"}}\n   {:method \"GET\" :path \"/status\" :response {:status 200 :body \"running\"}}])\n\n(define (router req"
+      },
+      {
+        "task_id": "L4-005",
+        "completion": "# `my-when-let` Macro in Sema\n\n## Definition\n\n```sema\n(defmacro my-when-let (binding . body)\n  (let ((var  (first binding))\n        (expr (second binding)))\n    `(let ((~var ~expr))\n       (when (not (nil? ~var))\n         ~@body))))\n```\n\n## How It Works\n\nThe macro takes a **binding form** `(var expr)` and a **body** of expressions, then expands into:\n\n```sema\n(let ((var expr))\n  (when (not (nil? var))\n    body...))\n```\n\n- **`binding`** \u2014 captured as the first argument (e.g., `(x (get {:a 42} :a))`)\n- **`body`** \u2014 captured as a rest parameter (the remaining expressions)\n- **`~var` / `~expr`** \u2014 unquoted into the `let` binding\n- **`~@body`** \u2014 unquote-spliced into the `when` body\n\n## Evaluation\n\n```sema\n(my-when-let (x (get {:a 42} :a)) (* x 2))\n```\n\n**Expands to:**\n\n```sema\n(let ((x (get {:a 42} :a)))\n  (when (not (nil? x))\n    (* x 2)))\n```\n\n**Step-by-step:**\n\n1. `(get {:a 42} :a)` \u2192 `42`\n2. `x` is bound to `42`\n3. `(not (nil? 42))` \u2192 `#t`\n4. `(* 42 2)` \u2192 **`84`**\n\n## Verification\n\n```sema\n(println (my-when-let (x (get {:a 42} :a)) (* x 2)))\n; => 84\n\n(println (my-when-let (x (get {:a 42} :b)) (* x 2)))\n; => nil   (x is nil, when body skipped)\n```"
+      },
+      {
+        "task_id": "L4-006",
+        "completion": "## Solution\n\n```sema\n(define (pipe value funcs)\n  (foldl (fn (acc f) (f acc)) value funcs))\n```\n\n`foldl` walks the list left-to-right, threading the accumulated result through each function. Starting with `value` as the initial accumulator, each step calls `(f acc)` \u2014 applying the current function to the running result.\n\n## Evaluation\n\n```sema\n(pipe 5 (list (fn (x) (+ x 1)) (fn (x) (* x 2)) (fn (x) (- x 3))))\n```\n\nStep-by-step:\n\n| Step | Function | Accumulator |\n|------|----------|-------------|\n| init | \u2014 | `5` |\n| 1 | `(+ x 1)` | `5 + 1 = 6` |\n| 2 | `(* x 2)` | `6 * 2 = 12` |\n| 3 | `(- x 3)` | `12 - 3 = 9` |\n\n**Result: `9`**"
+      },
+      {
+        "task_id": "L4-007",
+        "completion": "The user wants a Sema function to transpose a matrix represented as a list of lists. Let me write this.\n\nTransposing a matrix: given ((1 2 3) (4 5 6)), we want ((1 4) (2 5) (3 6)).\n\nA classic way to transpose in Lisp is:\n```scheme\n(define (transpose m)\n  (if (nil? (car m)) '()\n      (cons (map car m) (transpose (map cdr m)))))\n```\n\nThis takes the first column (map car m) and conses it with the transpose of the remaining (map cdr m).\n\nLet me verify:\n- m = ((1 2 3) (4 5 6))\n- (car m) = (1 2 3), not nil\n- (map car m) = (1 4)\n- (map cdr m) = ((2 3) (5 6))\n- recurse: m = ((2 3) (5 6))\n  - (car m) = (2 3), not nil\n  - (map car m) = (2 5)\n  - (map cdr m) = ((3) (6))\n  - recurse: m = ((3) (6))\n    - (car m) = (3), not nil\n    - (map car m) = (3 6)\n    - (map cdr m) = (() ())\n    - recurse: m = (() ())\n      - (car m) = (), nil? In Sema, empty list... is it nil? In many Lisps '() is nil. Let me think about Sema. The user says Nil: nil. Empty list might be nil or might be distinct. In Scheme, '() is not nil but is the empty list which is falsy in some contexts. \n\nActually, let me be careful. In Sema, is an empty list nil? The prompt says \"Nil: nil\". It's ambiguous whether '() equals nil. To be safe, I could use `(empty? m)` or check `(nil? (car m))` but if empty list is nil then `(nil? (car m))` works. If empty list is not nil, I need a different check.\n\nLet me use a safer approach. I could check if the first row is empty using `empty?` or check length. Actually, let me think about what functions are available. The prompt mentions `nil?` predicate. It doesn't explicitly mention `empty?`. \n\nIn many Lisp dialects including Scheme, '() and nil are the same. Let me assume '() is nil in Sema (which is common). Actually, the prompt lists \"Nil: nil\" separately from lists, suggesting they might be distinct. But in practice for a Lisp dialect, empty list is often nil.\n\nTo be safe, I'll use a check that works either way. I could use:\n```scheme\n(if (or (nil? m) (empty? (car m))) '() ...)\n```\n\nBut I'm not sure `empty?` exists. Let me use a different approach that's robust. I could check if any row is empty, or use the length.\n\nActually, a cleaner approach using apply and map:\n```scheme\n(define (transpose m) (apply map list m))\n```\n\nWait, that's the classic Haskell-style trick. `(apply map list m)` means `(map list row1 row2 ...)` which gives `((list 1 4) (list 2 5) (list 3 6))` = `((1 4) (2 5) (3 6))`. \n\nLet me verify: `(apply map list '((1 2 3) (4 5 6)))` = `(map list '(1 2 3) '(4 5 6))`. map with multiple lists calls list on corresponding elements: (list 1 4) (list 2 5) (list 3 6) = ((1 4) (2 5) (3 6)). \n\nThis is elegant and handles the empty case naturally (if m is empty, apply map list '() ... well, (apply map list '()) = (map list) which might error or return '()). Actually if m is '(), (apply map list '()) = (map list) with no lists. That might return '() or error. For the given test it works fine.\n\nBut does Sema's map support multiple list arguments? The prompt says \"Lists: map, filter, foldl...\". It doesn't specify multi-arg map. Common Lisp and Scheme both support multi-list map. Let me assume Sema does too, but to be safe I could write the recursive version.\n\nLet me go with the recursive version which is more explicit and definitely works:\n\n```scheme\n(define (matrix-transpose m)\n  (if (nil? (car m))\n      '()\n      (cons (map car m) (matrix-transpose (map cdr m)))))\n```\n\nBut the concern is whether `(nil? (car m))` correctly detects empty list. If '() is nil in Sema, this works. If not, I need `(empty? (car m))` or `(= (car m) '())` or `(zero? (length (car m)))`.\n\nHmm, let me think. The prompt says booleans are #t/#f and nil is nil. In R7RS Scheme, '() is not the same as #f, and there's no nil. But Sema has nil. The question is whether '() is nil.\n\nGiven the prompt mentions \"Nil: nil\" as a distinct literal, and lists are separate, I think in Sema '() might be nil (the empty list IS nil, like in Clojure where '() is not nil actually... in Clojure '() is not nil). \n\nHmm, this is genuinely ambiguous. Let me use a check that's robust. I'll use `(or (nil? m) (nil? (car m)))` and hope empty list is nil. Actually, let me use a length-based check to be safe, or use the apply-map trick.\n\nActually, you know what, let me just provide both approaches and use the one that's most likely correct. The `apply map list` trick is the most elegant and commonly works. But if map doesn't support multiple lists, it fails.\n\nLet me go with the recursive approach but use a safe empty check. I'll check if the matrix is empty OR the first row is empty. For the empty check, I'll try `(nil? ...)` since in most Lisp dialects empty list is nil. If Sema treats '() as nil, this works perfectly.\n\nActually, I just realized - let me re-read the prompt. It says \"Nil: nil\". In many modern Lisps (Clojure), nil and '() are different - '() is an empty list, nil is null. But in Scheme, '() is the empty list and is distinct from #f. \n\nGiven Sema has both `nil` and lists, and the example uses `'((1 2 3) (4 5 6))` with quote for lists, I think empty list '() might be nil or might be its own thing.\n\nTo be maximally safe, let me write it to handle both cases. I can check:\n```scheme\n(define (matrix-transpose m)\n  (cond\n    ((nil? m) '())\n    ((nil? (car m)) '())\n    (else (cons (map car m) (matrix-transpose (map cdr m))))))\n```\n\nIf '() is nil, then when we get to m = (() ()), (car m) = () which is nil, so we return '(). \n\nIf '() is NOT nil, then (nil? (car m)) would be false when (car m) is '(), and we'd try (map car (() ())) = (car '()) which might error or return nil.\n\nHmm. Let me just go with this and note it. Actually, for the specific test case `((1 2 3) (4 5 6))`, the recursion goes:\n1. m = ((1 2 3) (4 5 6)), (car m) = (1 2 3) not nil \u2192 cons (1 4) with transpose of ((2 3) (5 6))\n2. m = ((2 3) (5 6)), (car m) = (2 3) not nil \u2192 cons (2 5) with transpose of ((3) (6))\n3. m = ((3) (6)), (car m) = (3) not nil \u2192 cons (3 6) with transpose of (() ())\n4. m = (() ()), (car m) = () \u2192 if () is nil, return '()\n\nSo the result is (cons (1 4) (cons (2 5) (cons (3 6) '()))) = ((1 4) (2 5) (3 6)). \n\nI'll go with this approach. Let me also mention the `apply map list` alternative.\n\nLet me write the final answer. I'll provide the recursive definition and show the evaluation.\n\nActually, let me also consider: does Sema have `car` and `cdr`? The prompt doesn't explicitly list them but they're fundamental Lisp operations. The prompt mentions `first` isn't listed either... but `take`, `drop` are. Hmm. Let me check - the stdlib section mentions \"Lists: map, filter, foldl, foldr, reduce, apply, take, drop, range, zip, reverse, append, sort, sort-by, frequencies, flat"
+      },
+      {
+        "task_id": "L4-008",
+        "completion": "The user wants a Sema function `parse-csv-line` that parses a single CSV line with optional double-quoted fields. Let me write this carefully.\n\nCSV parsing rules:\n- Fields are separated by commas\n- Fields may be wrapped in double quotes\n- Quoted fields can contain commas\n- Inside quoted fields, double quotes are escaped by doubling them (`\"\"` represents a literal `\"`)\n\nLet me write a character-by-character parser.\n\nI'll implement it as a state machine:\n- State: in-field (unquoted), in-quoted-field\n- Accumulate characters into current field buffer\n- On comma (when not in quotes), finish field and start new one\n- On double-quote at start of field, enter quoted mode\n- In quoted mode, `\"\"` becomes a literal `\"`\n- Closing quote followed by comma ends the field\n\nLet me write this in Sema.\n\n```sema\n(define (parse-csv-line line)\n  (let ((chars (string->list line))\n        (fields '())\n        (current '())\n        (in-quotes #f)\n        (i 0)\n        (n (string/length line)))\n    ...))\n```\n\nHmm, Sema has `string->list`? Let me think about what's available. The stdlib mentions string functions. Let me use a character-based approach.\n\nActually, let me think about what string functions are available:\n- string/trim, string/split, string/replace, string/upper, string/lower, string/join, string/length, string/contains?, string/starts-with?, string/format\n- string->symbol, keyword->string, list->string\n\nThere's `string->list` mentioned in conventions (arrows for conversions). Let me assume it exists. Also `string/ref` or `char/at` for getting a character at index.\n\nActually, I'm not 100% sure about all available functions. Let me write it in a way that's robust. I'll use a recursive approach processing the string character by character.\n\nLet me think about the algorithm more carefully:\n\n```\nparse-csv-line(line):\n  result = []\n  i = 0\n  n = length(line)\n  while i < n:\n    field = \"\"\n    # skip leading spaces? Actually CSV doesn't typically skip spaces unless quoted\n    if line[i] == '\"':\n      # quoted field\n      i++  # skip opening quote\n      while i < n:\n        if line[i] == '\"':\n          if i+1 < n and line[i+1] == '\"':\n            field += '\"'\n            i += 2\n          else:\n            i++  # skip closing quote\n            break\n        else:\n          field += line[i]\n          i++\n      # skip until comma or end\n      while i < n and line[i] != ',':\n        i++\n    else:\n      # unquoted field\n      while i < n and line[i] != ',':\n        field += line[i]\n        i++\n    result.append(field)\n    if i < n and line[i] == ',':\n      i++\n    # if at end, done\n  return result\n```\n\nWait, there's an edge case: if the line ends with a comma, we should have an empty field at the end. Let me handle that.\n\nActually, let me reconsider. After appending a field, if we see a comma, we increment i and continue the loop. If we're at the end, we stop. But if the last character was a comma, we need to add an empty field. Let me restructure:\n\n```\nparse-csv-line(line):\n  result = []\n  i = 0\n  n = length(line)\n  loop:\n    field = parse one field starting at i\n    result.append(field)\n    if i >= n:\n      break\n    # line[i] should be ','\n    i++  # skip comma\n    # continue loop\n  return result\n```\n\nThis handles trailing commas because after the comma we'll loop again and parse an empty field.\n\nLet me write this in Sema. I need to be careful about string operations. Let me use a character list approach.\n\nActually, let me use `string->list` to convert to a list of characters, then process recursively. That's more functional/Lisp-like.\n\n```sema\n(define (parse-csv-line line)\n  (let ((chars (string->list line)))\n    (parse-fields chars '() '() #f)))\n```\n\nWhere:\n- chars: remaining characters\n- current: current field characters (reversed)\n- fields: completed fields (reversed)\n- in-quotes: whether we're inside quotes\n\nHmm, this is getting complex with the state machine. Let me think about it differently.\n\nActually, let me use a mutable approach with indices since Sema has `while` loops and `set!`.\n\n```sema\n(define (parse-csv-line line)\n  (let ((n (string/length line))\n        (i 0)\n        (fields '())\n        (current \"\")\n        (in-quotes #f))\n    (while (< i n)\n      (let ((c (string/ref line i)))\n        (cond\n          (in-quotes\n           (if (char=? c #\\\")\n               (if (and (< (+ i 1) n) (char=? (string/ref line (+ i 1)) #\\\"))\n                   (begin (set! current (string-append current \"\\\"\"))\n                          (set! i (+ i 2)))\n                   (begin (set! in-quotes #f)\n                          (set! i (+ i 1))))\n               (begin (set! current (string-append current (string c)))\n                      (set! i (+ i 1)))))\n          ((char=? c #\\\")\n           (set! in-quotes #t)\n           (set! i (+ i 1)))\n          ((char=? c #\\,)\n           (set! fields (append fields (list current)))\n           (set! current \"\")\n           (set! i (+ i 1)))\n          (else\n           (set! current (string-append current (string c)))\n           (set! i (+ i 1))))))\n    (set! fields (append fields (list current)))\n    fields))\n```\n\nWait, but I'm not sure about all these functions. Let me think about what's available:\n- `string/length` - yes\n- `string/ref` - maybe? Or `string-char-at`? Let me use a safer approach.\n- `char=?` - maybe? Or `eq?` for chars?\n- `string` - to convert a char to string? Or `string->char`?\n- `string-append` - yes (mentioned in legacy Scheme names)\n\nHmm, I'm uncertain about character operations. Let me try a different approach using `string/split` and manual handling, or use substring operations.\n\nActually, let me try a recursive functional approach that processes the string character by character using `string->list` and `list->string`.\n\nLet me assume:\n- `string->list` converts a string to a list of characters\n- `list->string` converts a list of characters to a string\n- Characters can be compared with `char=?` or `eq?`\n- `#\\` is the character literal syntax (e.g., `#\\a`, `#\\,`, `#\\\"`)\n\nLet me write a clean recursive parser:\n\n```sema\n(define (parse-csv-line line)\n  (define (parse chars current fields in-quotes)\n    (cond\n      ;; End of input\n      ((null? chars)\n       (reverse (cons (list->string (reverse current)) fields)))\n      ;; Inside quotes\n      (in-quotes\n       (let ((c (car chars)))\n         (cond\n           ;; Double quote - check if escaped\n           ((char=? c #\\\")\n            (if (and (not (null? (cdr chars)))\n                     (char=? (cadr chars) #\\\"))\n                ;; Escaped quote\n                (parse (cddr chars) (cons #\\\" current) fields #t)\n                ;; Closing quote\n                (parse (cdr chars) current fields #f)))\n           ;; Regular char in quotes\n           (else\n            (parse (cdr chars) (cons c current) fields #t)))))\n      ;; Outside quotes\n      (else\n       (let ((c (car chars)))\n         (cond\n           ;; Opening quote (only at start of field)\n           ((and (char=? c #\\\") (null? current))\n            (parse (cdr chars) current fields #t))\n           ;; Comma - field separator\n           ((char=? c #\\,)\n            (parse (cdr chars) '() (cons (list->string (reverse current)) fields) #f))\n           ;; Regular char\n           (else\n            (parse (cdr chars) (cons c current) fields #f)))))))\n  (parse (string->list line) '() '() #f))\n```\n\nWait, there's an issue with the opening quote check. What if a quote appears in the middle of an unquoted field? In standard CSV, quotes are only special at the start of a field. If a quote appears mid-field, it should be treated as a literal character. My check `(null? current)` handles this - a quote is only treated as opening if we haven't accumulated any characters yet.\n\nBut wait, what about after a closing quote? If we have `\"Hello\",World`, after the closing quote we're in `#f` state with `current` containing the characters of \"Hello\". Then we see `,` which ends the field. Good.\n\nBut what about `\"Hello\"World`? After closing quote, current = \"Hello\", then we see 'W'. In the else branch, we'd add 'W"
+      },
+      {
+        "task_id": "L4-009",
+        "completion": "```sema\n(define (transform-users users)\n  (foldl (fn (acc user)\n           (assoc acc (get user :name) (get user :age)))\n         {}\n         users))\n\n(transform-users [{:name \"Alice\" :age 30} {:name \"Bob\" :age 25}])\n```\n\n**How it works:**\n\n1. **`foldl`** walks through the `users` list left-to-right, threading an accumulator (`acc`) starting from `{}`.\n2. For each `user` map, we extract `:name` and `:age` with `get`, then **`assoc`** the name\u2192age pair into the accumulator.\n3. The final accumulator is returned.\n\n**Evaluation:**\n\n| Step | `acc` | `user` |\n|------|-------|--------|\n| start | `{}` | \u2014 |\n| 1 | `{\"Alice\" 30}` | `{:name \"Alice\" :age 30}` |\n| 2 | `{\"Alice\" 30 \"Bob\" 25}` | `{:name \"Bob\" :age 25}` |\n\n**Result:**\n\n```sema\n{\"Alice\" 30 \"Bob\" 25}\n```"
+      },
+      {
+        "task_id": "L4-010",
+        "completion": "The user wants me to write a memoize function in Sema. Let me think about how to do this.\n\nIn Sema, I need to:\n1. Create a function `memoize` that takes a function `f`\n2. Inside, create a mutable cache (using an atom or some mutable mechanism)\n3. Return a new function that checks the cache first, and if not found, calls `f` and stores the result\n\nSema has atoms? The prompt mentions \"atom or let with a map variable\". Let me think about what Sema supports. The prompt mentions `set!` for mutating existing bindings. It also mentions atoms in the prompt (\"atom or let with a map variable\").\n\nLet me think about how atoms work in Sema. In Clojure-style Lisps, atoms are mutable references. You'd use `atom` to create one, `deref` or `@` to read, and `swap!` to update.\n\nBut I'm not 100% sure about Sema's atom API. Let me think about alternatives.\n\nActually, the prompt says \"Use a closure with a mutable map (atom or let with a map variable).\" So Sema supports atoms. Let me use an atom-based approach.\n\nIn typical Lisp/Scheme, an atom might work like:\n- `(atom initial-value)` or `(atom initial-value)` to create\n- `(deref atom)` or `@atom` to read\n- `(swap! atom function)` to update\n\nBut I'm not sure of the exact API. Let me think about what's most likely in Sema.\n\nActually, looking at the Sema conventions, it seems Clojure-influenced (atoms, swap!, deref). Let me use that style.\n\nAlternatively, I could use `set!` with a `let` binding. The prompt says \"let with a map variable\" as an option. So:\n\n```lisp\n(define (memoize f)\n  (let (cache {})\n    (fn (x)\n      (let (result (get cache x))\n        (if (nil? result)\n            (let (computed (f x))\n              (set! cache (assoc cache x computed))\n              computed)\n            result)))))\n```\n\nWait, but `set!` mutates an existing binding. Can I `set!` a `let`-bound variable? In Scheme, `set!` can mutate let-bound variables. Let me assume Sema supports this.\n\nBut there's a subtlety: if the function returns `nil` for some input, the cache would incorrectly recompute. But for the test case `(* x x)`, this won't be an issue since `(* 7 7) = 49` which is not nil.\n\nActually, there's another issue: `get` returns `nil` if the key is not found. But what if the cached value IS `nil`? Then we'd recompute. For robustness, I could use a sentinel or check if the key exists. But for simplicity and the given test, the basic approach works.\n\nLet me also think about the atom approach:\n\n```lisp\n(define (memoize f)\n  (let (cache (atom {}))\n    (fn (x)\n      (let (result (get (deref cache) x))\n        (if (nil? result)\n            (let (computed (f x))\n              (swap! cache #(assoc % x computed))\n              computed)\n            result)))))\n```\n\nHmm, but I'm not sure about `deref` and `swap!` in Sema. Let me go with the `set!` approach since it's more universally supported in Lisp dialects.\n\nActually, wait. Let me reconsider. The prompt says \"atom or let with a map variable\". This suggests both are valid approaches. Let me go with the `set!` approach using `let` since it's simpler and I'm more confident it works.\n\nBut actually, there's a question: does `set!` work on `let`-bound variables in Sema? In most Lisp dialects, yes. Let me go with that.\n\nLet me also think about whether I need to handle multiple arguments. The test only uses a single argument `(fn (x) (* x x))` called with `7`. So single-arg is fine.\n\nHere's my approach:\n\n```lisp\n(define (memoize f)\n  (let (cache {})\n    (fn (x)\n      (if (contains? cache x)  ; or use get with nil check\n          (get cache x)\n          (let (result (f x))\n            (set! cache (assoc cache x result))\n            result)))))\n```\n\nWait, does Sema have `contains?`? Let me check the stdlib functions listed... I see `map/get` but not `contains?`. Let me use `get` and check for nil.\n\nActually, looking more carefully at the stdlib, I see `get` listed under Maps. And for checking if a key exists, I could use `(get cache x ::not-found)` with a sentinel, but I'm not sure if Sema's `get` supports a default value argument.\n\nLet me just use the nil check approach, which works for the test case:\n\n```lisp\n(define (memoize f)\n  (let (cache {})\n    (fn (x)\n      (let (cached (get cache x))\n        (if (nil? cached)\n            (let (result (f x))\n              (set! cache (assoc cache x result))\n              result)\n            cached)))))\n```\n\nThis should work for the test case. Let me also add a demonstration with a \"slow\" function to show the caching behavior.\n\nLet me write the full solution:\n\n```lisp\n(define (memoize f)\n  (let (cache {})\n    (fn (x)\n      (let (cached (get cache x))\n        (if (nil? cached)\n            (let (result (f x))\n              (set! cache (assoc cache x result))\n              result)\n            cached)))))\n\n;; Test with a slow function\n(define slow-square\n  (memoize\n    (fn (x)\n      (println (string/format \"Computing %d...\" x))\n      (* x x))))\n\n(println (slow-square 7))   ; First call: prints \"Computing 7...\" and returns 49\n(println (slow-square 7))   ; Second call: returns 49 from cache, no print\n\n;; Direct evaluation\n(println ((memoize (fn (x) (* x x))) 7))  ; => 49\n```\n\nActually, I want to make the memoize function more robust. Let me think about using a sentinel value for the \"not found\" case. In Sema, I could use a unique keyword or gensym.\n\n```lisp\n(define (memoize f)\n  (let (cache {})\n    (fn (x)\n      (let (cached (get cache x ::not-found))\n        (if (= cached ::not-found)\n            (let (result (f x))\n              (set! cache (assoc cache x result))\n              result)\n            cached)))))\n```\n\nHmm, but I'm not sure if `get` in Sema supports a default value as a third argument. In Clojure, `(get map key default)` works. Let me assume Sema follows this convention since it seems Clojure-influenced.\n\nActually, let me keep it simple with the nil check for the main solution, and mention the sentinel approach as an improvement. The test case works fine with nil check since `(* 7 7) = 49 \u2260 nil`.\n\nLet me also think about whether `set!` on a `let` variable works in Sema. The prompt says `set!` is for \"mutate an existing binding\", and `let` creates bindings, so it should work.\n\nLet me finalize my answer. I'll provide:\n1. The memoize function\n2. A test with a slow function showing caching\n3. The direct evaluation `((memoize (fn (x) (* x x))) 7)`\n\nLet me also consider: should I use `let` or `let*`? Since there's only one binding (`cache`), `let` is fine.\n\nOne more thought: the prompt mentions \"atom\" as an option. Let me also show an atom-based version in case that's preferred. But since I'm not 100% sure of the atom API, I'll focus on the `set!` version.\n\nActually, let me reconsider. Looking at the prompt again: \"Use a closure with a mutable map (atom or let with a map variable).\" This suggests the user wants to see either approach. Let me go with the `let` + `set!` approach as the primary, and maybe mention the atom approach.\n\nLet me write the final answer:\n\n```lisp\n;; memoize: returns a cached version of f\n;; Uses a let-bound mutable map closed over by the returned function\n(define (memoize f)\n  (let (cache {})\n    (fn (x)\n      (let (cached (get cache x))\n        (if (nil? cached)\n            (let (result (f x))\n              (set! cache (assoc cache x result))\n              result)\n            cached)))))\n\n;; --- Test 1: slow function called twice ---\n(define slow-square\n  (memoize\n    (fn (x)\n      (println (string/format \"  [computing %d * %d]\" x x))\n      (* x x))))\n\n(println \"First call:\")\n(println (slow-square 7))\n(println \"Second call:\")\n(println (slow-square 7))\n\n;; --- Test 2: direct evaluation ---\n(println \"Direct: ((memoize (fn (x) (* x x))) 7)\")\n(println ((memoize (fn"
+      },
+      {
+        "task_id": "L5-001",
+        "completion": "The user wants a Sema macro `for-list` implementing list comprehension with syntax:\n`(for-list [x (range 5) :when (odd? x)] (* x x))`\n\nIt should expand to a combination of map and filter. Let me think about how to write this macro.\n\nThe syntax is:\n- `[x (range 5) :when (odd? x)]` \u2014 binding `x` to each element of `(range 5)`, with an optional `:when` guard\n- `(* x x)` \u2014 the body expression that produces the output\n\nThe expansion should be something like:\n`(map (fn (x) (* x x)) (filter (fn (x) (odd? x)) (range 5)))`\n\nSo the general pattern is:\n- Parse the binding part: `x (range 5)` \u2014 variable and collection\n- Parse optional `:when` guard\n- Generate: `(map (fn (x) body) (filter (fn (x) guard) collection))`\n\nIf there's no `:when`, just `(map (fn (x) body) collection)`.\n\nLet me write the macro using quasiquote. The macro receives:\n- `bindings` \u2014 the vector `[x (range 5) :when (odd? x)]`\n- `body` \u2014 `(* x x)`\n\nI need to destructure the bindings vector. In Sema, vectors are `[...]`. Let me think about how to destructure in a macro.\n\nActually, in a macro, the arguments are just data structures. So `bindings` would be a vector containing `x`, `(range 5)`, `:when`, `(odd? x)`.\n\nLet me think about how to extract these. I can use functions like `first`, `second`, etc. on the vector. Or I might need to convert it to a list first, or vectors might support sequence operations directly.\n\nLet me write the macro:\n\n```sema\n(defmacro for-list (bindings body)\n  (let ((var (first bindings))\n        (coll (second bindings))\n        (rest (drop 2 bindings)))\n    (if (nil? rest)\n      `(map (fn (var) body) coll)\n      ;; has :when\n      (let ((guard (second rest)))\n        `(map (fn (var) body) (filter (fn (var) guard) coll))))))\n```\n\nWait, but in quasiquote, I need to unquote `var`, `body`, `coll`, and `guard`. Let me be careful:\n\n```sema\n(defmacro for-list (bindings body)\n  (let ((var (first bindings))\n        (coll (second bindings))\n        (rest (drop 2 bindings)))\n    (if (nil? rest)\n      `(map (fn (~var) ~body) ~coll)\n      (let ((guard (second rest)))\n        `(map (fn (~var) ~body) (filter (fn (~var) ~guard) ~coll))))))\n```\n\nHmm, but `(fn (~var) ...)` \u2014 `var` is a symbol like `x`, so `~var` would unquote it to produce `x` in the expansion. That should work.\n\nWait, but there's a subtlety. In the quasiquote, `(fn (~var) ~body)` \u2014 the `~var` inside the list `(fn (~var) ...)` should produce `(fn x ...)` which is correct.\n\nLet me also consider: what if `rest` is not nil but starts with `:when`? I should check that the first element is `:when`. But for simplicity, let's assume the syntax is correct.\n\nActually, let me reconsider. The `rest` would be `[:when (odd? x)]` (a vector with two elements). So `(first rest)` is `:when` and `(second rest)` is `(odd? x)`.\n\nLet me also think about whether `drop` works on vectors in Sema. It should, since vectors are sequences. But to be safe, maybe I should convert to a list first, or use indexing.\n\nActually, let me think about this more carefully. In Sema, `first`, `second`, `drop` should work on vectors since they're sequence operations. But I'm not 100% sure. Let me use a safer approach.\n\nActually, looking at the Sema stdlib, `first`, `second`, `drop` are listed under Lists. They might not work on vectors. Let me convert the vector to a list first, or use `vector/get` or similar.\n\nHmm, but in many Lisp dialects, sequence functions work on both lists and vectors. Let me assume they do, or I can convert with `vector->list` or just use `seq`.\n\nActually, let me look at the available functions. The stdlib mentions `vector?` as a predicate. There might be `vector->list` or similar. But I don't see it explicitly listed.\n\nLet me try a different approach. Since the bindings is a vector, I can try to use `first`, `second` etc. on it. Many Lisp implementations support this. If not, I could use indexing.\n\nActually, let me just write it assuming sequence functions work on vectors. If the user is asking me to write this, they probably expect it to work.\n\nLet me also think about multiple bindings. The syntax `(for-list [x (range 5) :when (odd? x)] (* x x))` has a single binding. But list comprehensions can have multiple bindings like `[x (range 3) y (range 3)]`. However, the user only asked for the simple case with `:when`. Let me keep it simple.\n\nActually, let me re-read the request: \"Write a Sema defmacro (for-list) that implements a list comprehension. Syntax: (for-list [x (range 5) :when (odd? x)] (* x x)). It should expand to a combination of map and filter.\"\n\nSo the syntax is specifically with `:when`. Let me handle both cases (with and without `:when`).\n\nLet me also think about whether I need to handle `:let` or other clauses. The user only mentioned `:when`, so I'll keep it simple.\n\nHere's my macro:\n\n```sema\n(defmacro for-list (bindings body)\n  (let ((var (first bindings))\n        (coll (second bindings))\n        (rest (drop 2 bindings)))\n    (if (nil? rest)\n      `(map (fn (~var) ~body) ~coll)\n      (let ((guard (second rest)))\n        `(map (fn (~var) ~body) (filter (fn (~var) ~guard) ~coll))))))\n```\n\nWait, I need to be more careful. `drop 2 bindings` \u2014 if `bindings` is `[x (range 5) :when (odd? x)]`, then `drop 2` gives `[:when (odd? x)]`. If `bindings` is `[x (range 5)]`, then `drop 2` gives `[]` (empty). Is an empty vector nil? Probably not. Let me use `(empty? rest)` or check if the length is 0.\n\nHmm, but `nil?` on an empty vector would be false. Let me use a different check. Maybe `(= (count rest) 0)` or `(empty? rest)`.\n\nActually, I don't see `empty?` or `count` explicitly in the stdlib. Let me look... I see `string/length` for strings. For lists, there's no explicit `length` or `count` mentioned, but it's common. Let me use `(nil? (first rest))` \u2014 if rest is empty, first would return nil.\n\nActually, a cleaner approach: check if the third element (index 2) exists. If `bindings` has more than 2 elements, there's a `:when` clause.\n\nLet me try:\n\n```sema\n(defmacro for-list (bindings body)\n  (let ((var (first bindings))\n        (coll (second bindings))\n        (has-when (> (count bindings) 2)))\n    (if has-when\n      (let ((guard (nth bindings 3)))\n        `(map (fn (~var) ~body) (filter (fn (~var) ~guard) ~coll)))\n      `(map (fn (~var) ~body) ~coll))))\n```\n\nHmm, but I'm not sure about `count` and `nth` for vectors. Let me think about what functions are available.\n\nActually, looking at the stdlib list: `take`, `drop` are listed. `first` and `second` aren't explicitly listed but are standard. Let me look more carefully...\n\nThe stdlib says: \"Lists: map, filter, foldl, foldr, reduce, apply, take, drop, range, zip, reverse, append, sort, sort-by, frequencies, flat-map, partition, interleave, chunk, sliding\"\n\nI don't see `first`, `second`, `count`, `nth` explicitly. But these are so fundamental that they must exist. In Scheme, `car` and `cdr` are standard. In Clojure, `first`, `second`, `count`, `nth` are standard.\n\nSince Sema is a Lisp dialect, I'll assume `first`, `second` exist. For checking if there are more elements, I can use `(drop 2 bindings)` and check if it's empty.\n\nActually, let me try a different approach. Let me use pattern matching with `match`:\n\n```sema\n(defmacro for-list (bindings body)\n  (match bindings\n    [var coll :when guard] `(map (fn (~var) ~body) (filter (fn"
+      },
+      {
+        "task_id": "L5-002",
+        "completion": "# `defn-with-logging` Macro in Sema\n\n## Macro Definition\n\n```sema\n(defmacro defn-with-logging (name-and-args . body)\n  (let ((fname (car name-and-args))\n        (params (cdr name-and-args)))\n    `(define ,name-and-args\n       (println \"Calling\" ',fname \"with args:\" ,@params)\n       (let ((result (begin ,@body)))\n         (println ',fname \"returned:\" result)\n         result))))\n```\n\n## How It Works\n\nThe macro destructures the call form `(defn-with-logging (name args...) body...)`:\n\n1. **`name-and-args`** \u2014 captures the list `(name args...)` (e.g., `(add a b)`)\n2. **`fname`** \u2014 extracted function name symbol (e.g., `add`)\n3. **`params`** \u2014 extracted parameter list (e.g., `(a b)`)\n\nThe quasiquote produces a `define` with:\n- A **pre-execution** `println` that prints the function name (as a quoted symbol) and all argument values\n- A `let` binding the result of the body (wrapped in `begin` to support multi-expression bodies)\n- A **post-execution** `println` that prints the return value\n- The final `result` expression so the function returns properly\n\n## Expansion Example\n\n```sema\n(defn-with-logging (add a b) (+ a b))\n```\n\nExpands to:\n\n```sema\n(define (add a b)\n  (println \"Calling\" 'add \"with args:\" a b)\n  (let ((result (begin (+ a b))))\n    (println 'add \"returned:\" result)\n    result))\n```\n\n## Test\n\n```sema\n; Define the macro\n(defmacro defn-with-logging (name-and-args . body)\n  (let ((fname (car name-and-args))\n        (params (cdr name-and-args)))\n    `(define ,name-and-args\n       (println \"Calling\" ',fname \"with args:\" ,@params)\n       (let ((result (begin ,@body)))\n         (println ',fname \"returned:\" result)\n         result))))\n\n; Use the macro to define add\n(defn-with-logging (add a b) (+ a b))\n\n; Call it\n(add 2 3)\n```\n\n**Output:**\n```\nCalling add with args: 2 3\nadd returned: 5\n```\n\n**Returns:** `5`\n\n## Key Details\n\n| Technique | Purpose |\n|---|---|\n| ``,name-and-args`` | Splices the entire `(name args...)` list into `define` |\n| `',fname` | Quotes the symbol so it prints as `add` not its value |\n| `,@params` | Sp"
+      },
+      {
+        "task_id": "L5-003",
+        "completion": "```sema\n(let (ch (channel/new))\n  (async (channel/send ch 42))\n  (await (channel/recv ch)))\n```\n\nThis expression:\n\n1. **Creates a channel** bound to `ch` via `channel/new`.\n2. **Spawns an async task** with `async` that sends `42` into the channel using `channel/send`.\n3. **Awaits the receive** with `await` on `channel/recv`, which blocks until the value is available and returns `42`."
+      },
+      {
+        "task_id": "L5-004",
+        "completion": "```lisp\n;; Lazy infinite streams using delay/force\n;; A stream is a pair: (value . delayed-rest-of-stream)\n\n(define (integers-from n)\n  (cons n (delay (integers-from (+ n 1)))))\n\n(define (stream-take s n)\n  (if (= n 0)\n      '()\n      (cons (car s)\n            (stream-take (force (cdr s)) (- n 1)))))\n\n;; Evaluate \u2014 should give (1 2 3 4 5)\n(stream-take (integers-from 1) 5)\n```\n\n**How it works:**\n\n1. **`integers-from`** returns a pair where:\n   - `car` is the current integer `n`\n   - `cdr` is a **promise** (created by `delay`) that will compute `(integers-from (+ n 1))` only when forced. This is what makes the stream infinite but lazy \u2014 the rest of the stream is never computed until needed.\n\n2. **`stream-take`** recursively extracts `n` elements:\n   - Base case: when `n` reaches 0, return the empty list `'()`\n   - Recursive case: `cons` the current value (`car s`) onto the result of taking `n-1` elements from the **forced** tail (`force (cdr s)`). Calling `force` on the delayed computation runs it (and memoizes the result), producing the next stream pair.\n\n3. **Evaluation of `(stream-take (integers-from 1) 5)`** unfolds like this:\n   ```\n   (cons 1 (stream-take (force (cdr s1)) 4))   ; s1 = (1 . <delay>)\n   (cons 1 (cons 2 (stream-take (force (cdr s2)) 3)))  ; s2 = (2 . <delay>)\n   (cons 1 (cons 2 (cons 3 (stream-take (force (cdr s3)) 2))))\n   (cons 1 (cons 2 (cons 3 (cons 4 (stream-take (force (cdr s4)) 1)))))\n   (cons 1 (cons 2 (cons 3 (cons 4 (cons 5 '())))))\n   ;; => (1 2 3 4 5)\n   ```\n\nOnly 5 calls to `integers-from` ever happen \u2014 the infinite stream is never fully realized, demonstrating the power of lazy evaluation."
+      },
+      {
+        "task_id": "L5-005",
+        "completion": "The user wants me to write a Sema `defmacro` called `swap!` that takes a symbol and a value, and expands to a specific form using quasiquote and unquote.\n\nLet me analyze the target expansion:\n- Input: `(swap! x 20)`\n- Should expand to: `(set! x (let ((tmp x)) (set! x 20) tmp))`\n\nWait, let me re-read the expansion. The user says it expands to:\n`(set! sym (let ((tmp sym)) (set! sym val) tmp))`\n\nHmm, that's a bit odd. Let me think about what this does:\n1. `(let ((tmp sym)) ...)` - binds tmp to the current value of sym\n2. `(set! sym val)` - sets sym to the new value\n3. `tmp` - returns the old value\n4. The outer `(set! sym ...)` then sets sym to... the old value?\n\nWait, that doesn't seem right. If we do `(set! x (let ((tmp x)) (set! x 20) tmp))`:\n1. First, the let is evaluated: tmp = 10 (current value of x)\n2. Inside let: `(set! x 20)` - x becomes 20\n3. tmp is still 10 (let binding)\n4. The let returns 10\n5. Then `(set! x 10)` - x becomes 10 again\n\nSo x would end up as 10, not 20. That doesn't match the expected behavior where \"x should be 20\".\n\nHmm, let me re-read the problem. The user says:\n\"expands to (set! sym (let ((tmp sym)) (set! sym val) tmp))\"\n\nAnd \"Test: (define x 10) then (swap! x 20) should return 10 and leave x as 20.\"\n\nBut the expansion they gave would NOT leave x as 20. Let me think again...\n\nActually wait, maybe I'm misunderstanding. Let me re-read:\n\n`(set! sym (let ((tmp sym)) (set! sym val) tmp))`\n\nHmm, actually maybe the user made an error in the expansion, or maybe I need to think about this differently.\n\nActually, let me reconsider. Maybe the intended expansion is different. The user says \"swap the value and return the old value.\" A typical swap! would:\n1. Save old value\n2. Set new value\n3. Return old value\n\nSo the expansion should be something like:\n`(let ((tmp sym)) (set! sym val) tmp)`\n\nThis would:\n1. tmp = 10\n2. set! x 20\n3. return 10\n\nAnd x would be 20. That matches the expected behavior!\n\nBut the user specifically wrote the expansion as `(set! sym (let ((tmp sym)) (set! sym val) tmp))`. Maybe they made a mistake, or maybe there's a reason for the outer set!.\n\nActually, wait. Let me re-read more carefully. Maybe the user wants exactly that expansion, and the test is just to see if the macro expands correctly. But the test says \"should return 10 and leave x as 20\" which contradicts the given expansion.\n\nI think the user might have made an error in the expansion specification. Let me think about what would actually work:\n\nOption 1: `(let ((tmp sym)) (set! sym val) tmp)` - This returns old value and sets new value. \u2713\n\nOption 2: `(set! sym (let ((tmp sym)) (set! sym val) tmp))` - This sets sym to old value (undoing the inner set!). \u2717\n\nI think the user probably meant the expansion should be:\n`(let ((tmp sym)) (set! sym val) tmp)`\n\nOr maybe they meant something like:\n`(let ((tmp sym)) (set! sym val) tmp)`\n\nBut they wrote it with an outer set!. Let me just follow what the user asked for literally, since they explicitly said \"expands to (set! sym (let ((tmp sym)) (set! sym val) tmp))\".\n\nActually, wait. Let me re-read one more time...\n\n\"Write a Sema defmacro (swap!) that takes a symbol and a value, and expands to (set! sym (let ((tmp sym)) (set! sym val) tmp)) using quasiquote and unquote.\"\n\nHmm, but then: \"The macro should swap the value and return the old value. Test: (define x 10) then (swap! x 20) should return 10 and leave x as 20.\"\n\nThese two requirements are contradictory. The expansion `(set! sym (let ((tmp sym)) (set! sym val) tmp))` would return 10 but leave x as 10 (not 20).\n\nI think the user made an error. Let me provide the macro that actually achieves the stated goal (return old value, leave x as 20), and note the discrepancy.\n\nActually, let me think about this differently. Maybe the user's expansion is correct and I'm wrong about the semantics. Let me trace through again very carefully:\n\n`(set! x (let ((tmp x)) (set! x 20) tmp))`\n\nStep 1: Evaluate the value expression `(let ((tmp x)) (set! x 20) tmp)`\n  - At this point, x = 10\n  - `tmp` is bound to the value of `x`, which is 10\n  - `(set! x 20)` sets x to 20\n  - `tmp` evaluates to 10\n  - The let form returns 10\n\nStep 2: `(set! x 10)` - sets x to 10\n\nSo after this, x = 10 and the expression returned 10. That's NOT what the user wants.\n\nI think the correct expansion should be:\n`(let ((tmp sym)) (set! sym val) tmp)`\n\nLet me just write the macro that produces the correct behavior. I'll use the expansion that actually works:\n\n```sema\n(defmacro swap! (sym val)\n  `(let ((tmp ~sym)) (set! ~sym ~val) tmp))\n```\n\nWait, but `tmp` needs to be a gensym to avoid variable capture. But the user specifically asked for the expansion with `tmp`. Let me use gensym for safety, or just use `tmp` as the user specified.\n\nActually, the user said \"expands to (set! sym (let ((tmp sym)) (set! sym val) tmp))\". Let me just follow their specification exactly, even if the semantics seem off. Maybe in Sema, `set!` works differently, or maybe the evaluation order is different.\n\nActually, you know what, let me just follow the user's specification literally. They said the expansion should be `(set! sym (let ((tmp sym)) (set! sym val) tmp))`. Let me write that macro:\n\n```sema\n(defmacro swap! (sym val)\n  `(set! ~sym (let ((tmp ~sym)) (set! ~sym ~val) tmp)))\n```\n\nBut then the test would fail because x would be 10, not 20.\n\nHmm, let me think about this more carefully. Maybe the user actually wants:\n\nThe macro should:\n1. Return the old value\n2. Set the variable to the new value\n\nAnd the expansion they gave is just wrong. Let me provide the correct macro and explain.\n\nActually, I'll provide both - the macro as specified, and then note that for the test to pass, the expansion should be different. Or I'll just provide the working version.\n\nLet me re-read the user's request one more time:\n\n\"Write a Sema defmacro (swap!) that takes a symbol and a value, and expands to (set! sym (let ((tmp sym)) (set! sym val) tmp)) using quasiquote and unquote. The macro should swap the value and return the old value. Test: (define x 10) then (swap! x 20) should return 10 and leave x as 20. Evaluate (begin (define x 10) (swap! x 20)).\"\n\nOK so the user wants:\n1. The macro to expand to `(set! sym (let ((tmp sym)) (set! sym val) tmp))`\n2. The result should be 10 and x should be 20\n\nThese are contradictory. But maybe the user just wants me to write the macro as specified and then evaluate it. The evaluation result might not match their expectation, but that's what they asked for.\n\nActually, I think the most helpful thing is to write the macro as they specified, show the expansion, and then evaluate it. If the result doesn't match their expectation, I can note that.\n\nBut actually, let me reconsider. Maybe I should just write the correct macro that achieves the stated goal. The user might have just made a typo in the expansion. The correct expansion for \"return old value, set new value\" is:\n\n`(let ((tmp sym)) (set! sym val) tmp)`\n\nLet me write both versions and explain.\n\nActually, I'll just go with what the user literally asked for. They said \"expands to (set! sym (let ((tmp sym)) (set! sym val) tmp))\". I'll write that macro, show the expansion, and evaluate it. The result will be 10, and x will be 10 (not 20). I'll note the discrepancy.\n\nWait, actually, let me reconsider one more time. Maybe the user's expansion is intentional and correct, and I'm wrong about the semantics. In some languages, `set!` might not evaluate its value argument before setting. But in Lisp/Sema, `set"
+      }
+    ]
+  },
+  "qwen3-8b-rft": {
+    "scores": [
+      {
+        "task_id": "L1-001",
+        "level": 1,
+        "category": "arithmetic",
+        "score": 0.3,
+        "detail": "wrong: expected '3', got '(+ 1 2)'",
+        "latency_s": 0.3020946979522705,
+        "tokens_in": 1286,
+        "tokens_out": 24
+      },
+      {
+        "task_id": "L1-002",
+        "level": 1,
+        "category": "arithmetic",
+        "score": 0.3,
+        "detail": "wrong: expected '42', got '(* 6 7)'",
+        "latency_s": 0.2679331302642822,
+        "tokens_in": 1286,
+        "tokens_out": 25
+      },
+      {
+        "task_id": "L1-003",
+        "level": 1,
+        "category": "list",
+        "score": 1.0,
+        "detail": "correct",
+        "latency_s": 0.2626230716705322,
+        "tokens_in": 1295,
+        "tokens_out": 12
+      },
+      {
+        "task_id": "L1-004",
+        "level": 1,
+        "category": "list",
+        "score": 0.3,
+        "detail": "wrong: expected '(1 3 5)', got \"'(1 3 5)\"",
+        "latency_s": 0.7803559303283691,
+        "tokens_in": 1291,
+        "tokens_out": 108
+      },
+      {
+        "task_id": "L1-005",
+        "level": 1,
+        "category": "map",
+        "score": 0.3,
+        "detail": "wrong: expected '1', got '(get {:a 1 :b 2} :a)'",
+        "latency_s": 0.8644261360168457,
+        "tokens_in": 1290,
+        "tokens_out": 112
+      },
+      {
+        "task_id": "L1-006",
+        "level": 1,
+        "category": "string",
+        "score": 1.0,
+        "detail": "correct",
+        "latency_s": 0.22159814834594727,
+        "tokens_in": 1283,
+        "tokens_out": 9
+      },
+      {
+        "task_id": "L1-007",
+        "level": 1,
+        "category": "string",
+        "score": 1.0,
+        "detail": "correct",
+        "latency_s": 0.19560670852661133,
+        "tokens_in": 1285,
+        "tokens_out": 8
+      },
+      {
+        "task_id": "L1-008",
+        "level": 1,
+        "category": "let",
+        "score": 0.3,
+        "detail": "wrong: expected '30', got 'let'",
+        "latency_s": 0.5485479831695557,
+        "tokens_in": 1294,
+        "tokens_out": 78
+      },
+      {
+        "task_id": "L1-009",
+        "level": 1,
+        "category": "cond",
+        "score": 0.3,
+        "detail": "wrong: expected 'b', got \"(cond ((= 1 2) 'a) ((= 1 1) 'b) (else 'c))\"",
+        "latency_s": 0.8392987251281738,
+        "tokens_in": 1303,
+        "tokens_out": 117
+      },
+      {
+        "task_id": "L1-010",
+        "level": 1,
+        "category": "list",
+        "score": 0.3,
+        "detail": "wrong: expected '15', got \"(foldl + 0 '(1 2 3 4 5))\"",
+        "latency_s": 0.9339771270751953,
+        "tokens_in": 1293,
+        "tokens_out": 134
+      },
+      {
+        "task_id": "L1-011",
+        "level": 1,
+        "category": "predicate",
+        "score": 0.3,
+        "detail": "wrong: expected 'true', got '#t'",
+        "latency_s": 0.19254183769226074,
+        "tokens_in": 1281,
+        "tokens_out": 7
+      },
+      {
+        "task_id": "L1-012",
+        "level": 1,
+        "category": "keyword",
+        "score": 1.0,
+        "detail": "correct",
+        "latency_s": 0.7559430599212646,
+        "tokens_in": 1289,
+        "tokens_out": 96
+      },
+      {
+        "task_id": "L1-013",
+        "level": 1,
+        "category": "short-lambda",
+        "score": 1.0,
+        "detail": "correct",
+        "latency_s": 0.2716948986053467,
+        "tokens_in": 1290,
+        "tokens_out": 12
+      },
+      {
+        "task_id": "L1-014",
+        "level": 1,
+        "category": "f-string",
+        "score": 1.0,
+        "detail": "correct",
+        "latency_s": 0.4098818302154541,
+        "tokens_in": 1286,
+        "tokens_out": 9
+      },
+      {
+        "task_id": "L1-015",
+        "level": 1,
+        "category": "map",
+        "score": 0.3,
+        "detail": "wrong: expected '{:a 11}', got '(map/update {:a 1} :a #(+ % 10))'",
+        "latency_s": 1.0799221992492676,
+        "tokens_in": 1293,
+        "tokens_out": 160
+      },
+      {
+        "task_id": "L2-001",
+        "level": 2,
+        "category": "function",
+        "score": 1.0,
+        "detail": "correct",
+        "latency_s": 0.31539392471313477,
+        "tokens_in": 1298,
+        "tokens_out": 19
+      },
+      {
+        "task_id": "L2-002",
+        "level": 2,
+        "category": "function",
+        "score": 1.0,
+        "detail": "correct",
+        "latency_s": 0.4068779945373535,
+        "tokens_in": 1308,
+        "tokens_out": 41
+      },
+      {
+        "task_id": "L2-003",
+        "level": 2,
+        "category": "list",
+        "score": 0.0,
+        "detail": "error: Eval error: stack overflow: maximum call depth exceeded",
+        "latency_s": 0.5096769332885742,
+        "tokens_in": 1313,
+        "tokens_out": 50
+      },
+      {
+        "task_id": "L2-004",
+        "level": 2,
+        "category": "list",
+        "score": 1.0,
+        "detail": "correct",
+        "latency_s": 0.4717130661010742,
+        "tokens_in": 1305,
+        "tokens_out": 51
+      },
+      {
+        "task_id": "L2-005",
+        "level": 2,
+        "category": "string",
+        "score": 0.0,
+        "detail": "error: Unbound variable: string/equals?",
+        "latency_s": 0.4338569641113281,
+        "tokens_in": 1301,
+        "tokens_out": 37
+      },
+      {
+        "task_id": "L2-006",
+        "level": 2,
+        "category": "math",
+        "score": 1.0,
+        "detail": "correct",
+        "latency_s": 0.755702018737793,
+        "tokens_in": 1300,
+        "tokens_out": 61
+      },
+      {
+        "task_id": "L2-007",
+        "level": 2,
+        "category": "fibonacci",
+        "score": 1.0,
+        "detail": "correct",
+        "latency_s": 0.6009318828582764,
+        "tokens_in": 1302,
+        "tokens_out": 61
+      },
+      {
+        "task_id": "L2-008",
+        "level": 2,
+        "category": "map",
+        "score": 0.0,
+        "detail": "error: Unbound variable: count-words",
+        "latency_s": 0.6915161609649658,
+        "tokens_in": 1315,
+        "tokens_out": 83
+      },
+      {
+        "task_id": "L2-009",
+        "level": 2,
+        "category": "list",
+        "score": 0.0,
+        "detail": "error: Unbound variable: -inf.0",
+        "latency_s": 0.6146306991577148,
+        "tokens_in": 1314,
+        "tokens_out": 55
+      },
+      {
+        "task_id": "L2-010",
+        "level": 2,
+        "category": "string",
+        "score": 0.0,
+        "detail": "error: Unbound variable: title-case",
+        "latency_s": 0.7120718955993652,
+        "tokens_in": 1305,
+        "tokens_out": 62
+      },
+      {
+        "task_id": "L2-011",
+        "level": 2,
+        "category": "predicate",
+        "score": 0.3,
+        "detail": "wrong output: expected 'true', got '#t'",
+        "latency_s": 0.8793132305145264,
+        "tokens_in": 1298,
+        "tokens_out": 124
+      },
+      {
+        "task_id": "L2-012",
+        "level": 2,
+        "category": "map",
+        "score": 0.0,
+        "detail": "error: Unbound variable: map-keys-only",
+        "latency_s": 0.482450008392334,
+        "tokens_in": 1314,
+        "tokens_out": 42
+      },
+      {
+        "task_id": "L2-013",
+        "level": 2,
+        "category": "threading",
+        "score": 0.3,
+        "detail": "wrong: expected '165', got '(->> (range 10)'",
+        "latency_s": 0.3659188747406006,
+        "tokens_in": 1310,
+        "tokens_out": 36
+      },
+      {
+        "task_id": "L2-014",
+        "level": 2,
+        "category": "match",
+        "score": 0.0,
+        "detail": "error: Eval error: match: no clause matched value: -5",
+        "latency_s": 0.4953489303588867,
+        "tokens_in": 1306,
+        "tokens_out": 42
+      },
+      {
+        "task_id": "L2-015",
+        "level": 2,
+        "category": "destructure",
+        "score": 0.0,
+        "detail": "error: Eval error: define: expected a symbol",
+        "latency_s": 0.5933001041412354,
+        "tokens_in": 1314,
+        "tokens_out": 35
+      },
+      {
+        "task_id": "L3-001",
+        "level": 3,
+        "category": "data-transform",
+        "score": 0.0,
+        "detail": "error: Unbound variable: group-by-parity",
+        "latency_s": 0.8831050395965576,
+        "tokens_in": 1330,
+        "tokens_out": 115
+      },
+      {
+        "task_id": "L3-002",
+        "level": 3,
+        "category": "string",
+        "score": 0.0,
+        "detail": "error: Unbound variable: word-freq",
+        "latency_s": 0.794802188873291,
+        "tokens_in": 1320,
+        "tokens_out": 92
+      },
+      {
+        "task_id": "L3-003",
+        "level": 3,
+        "category": "record",
+        "score": 0.0,
+        "detail": "error: Eval error: define-record-type: requires at least type name, constructor, and predicate",
+        "latency_s": 0.7663569450378418,
+        "tokens_in": 1325,
+        "tokens_out": 92
+      },
+      {
+        "task_id": "L3-004",
+        "level": 3,
+        "category": "macro",
+        "score": 0.0,
+        "detail": "error: Arity error: unless expects 3 args, got 2",
+        "latency_s": 0.532681941986084,
+        "tokens_in": 1309,
+        "tokens_out": 49
+      },
+      {
+        "task_id": "L3-005",
+        "level": 3,
+        "category": "json",
+        "score": 0.5,
+        "detail": "runs without error",
+        "latency_s": 0.39391207695007324,
+        "tokens_in": 1318,
+        "tokens_out": 25
+      },
+      {
+        "task_id": "L3-006",
+        "level": 3,
+        "category": "multimethod",
+        "score": 0.0,
+        "detail": "error: Arity error: defmethod expects 3 args, got 4",
+        "latency_s": 0.7166869640350342,
+        "tokens_in": 1336,
+        "tokens_out": 65
+      },
+      {
+        "task_id": "L3-007",
+        "level": 3,
+        "category": "match",
+        "score": 0.3,
+        "detail": "wrong output: expected '{:body \"ok\" :status 200}', got '{:body \"not found\" :status 404}'",
+        "latency_s": 0.8377852439880371,
+        "tokens_in": 1373,
+        "tokens_out": 86
+      },
+      {
+        "task_id": "L3-008",
+        "level": 3,
+        "category": "error-handling",
+        "score": 1.0,
+        "detail": "correct",
+        "latency_s": 0.4964320659637451,
+        "tokens_in": 1320,
+        "tokens_out": 46
+      },
+      {
+        "task_id": "L3-009",
+        "level": 3,
+        "category": "threading",
+        "score": 0.3,
+        "detail": "wrong: expected 'HELLO, WORLD, FOO, BAR', got '(->> \"Hello World Foo Bar\"'",
+        "latency_s": 0.5519917011260986,
+        "tokens_in": 1317,
+        "tokens_out": 33
+      },
+      {
+        "task_id": "L3-010",
+        "level": 3,
+        "category": "recursion",
+        "score": 0.0,
+        "detail": "error: Arity error: reduce expects 2 args, got 3",
+        "latency_s": 0.7121589183807373,
+        "tokens_in": 1319,
+        "tokens_out": 78
+      },
+      {
+        "task_id": "L3-011",
+        "level": 3,
+        "category": "map",
+        "score": 0.0,
+        "detail": "error: Unbound variable: map/merge",
+        "latency_s": 0.799774169921875,
+        "tokens_in": 1335,
+        "tokens_out": 52
+      },
+      {
+        "task_id": "L3-012",
+        "level": 3,
+        "category": "pattern",
+        "score": 0.0,
+        "detail": "error: Unbound variable: add1",
+        "latency_s": 0.8348019123077393,
+        "tokens_in": 1343,
+        "tokens_out": 94
+      },
+      {
+        "task_id": "L3-013",
+        "level": 3,
+        "category": "higher-order",
+        "score": 1.0,
+        "detail": "correct",
+        "latency_s": 0.5698521137237549,
+        "tokens_in": 1319,
+        "tokens_out": 62
+      },
+      {
+        "task_id": "L3-014",
+        "level": 3,
+        "category": "string",
+        "score": 0.0,
+        "detail": "error: Unbound variable: csv-row",
+        "latency_s": 0.5975639820098877,
+        "tokens_in": 1315,
+        "tokens_out": 62
+      },
+      {
+        "task_id": "L3-015",
+        "level": 3,
+        "category": "let*",
+        "score": 0.3,
+        "detail": "wrong output: expected '(3 2)', got '[-1.0 6.0]'",
+        "latency_s": 0.7756600379943848,
+        "tokens_in": 1338,
+        "tokens_out": 108
+      },
+      {
+        "task_id": "L4-001",
+        "level": 4,
+        "category": "data-pipeline",
+        "score": 0.0,
+        "detail": "error: Arity error: name expects 1 args, got 0",
+        "latency_s": 1.6038029193878174,
+        "tokens_in": 1381,
+        "tokens_out": 246
+      },
+      {
+        "task_id": "L4-002",
+        "level": 4,
+        "category": "interpreter",
+        "score": 0.0,
+        "detail": "error: Unbound variable: second",
+        "latency_s": 1.4124188423156738,
+        "tokens_in": 1341,
+        "tokens_out": 176
+      },
+      {
+        "task_id": "L4-003",
+        "level": 4,
+        "category": "state-machine",
+        "score": 0.0,
+        "detail": "error: Unbound variable: run-states",
+        "latency_s": 0.7699282169342041,
+        "tokens_in": 1362,
+        "tokens_out": 102
+      },
+      {
+        "task_id": "L4-004",
+        "level": 4,
+        "category": "web-server",
+        "score": 0.3,
+        "detail": "wrong output: expected '{:body \"ok\" :status 200}', got '<native-fn http/router/dispatch>'",
+        "latency_s": 0.7024929523468018,
+        "tokens_in": 1345,
+        "tokens_out": 55
+      },
+      {
+        "task_id": "L4-005",
+        "level": 4,
+        "category": "macro",
+        "score": 0.0,
+        "detail": "error: Arity error: my-when-let expects 3 args, got 2",
+        "latency_s": 0.7897660732269287,
+        "tokens_in": 1348,
+        "tokens_out": 69
+      },
+      {
+        "task_id": "L4-006",
+        "level": 4,
+        "category": "reduce",
+        "score": 1.0,
+        "detail": "correct",
+        "latency_s": 1.0516936779022217,
+        "tokens_in": 1375,
+        "tokens_out": 139
+      },
+      {
+        "task_id": "L4-007",
+        "level": 4,
+        "category": "matrix",
+        "score": 1.0,
+        "detail": "correct",
+        "latency_s": 0.48567891120910645,
+        "tokens_in": 1333,
+        "tokens_out": 37
+      },
+      {
+        "task_id": "L4-008",
+        "level": 4,
+        "category": "parser",
+        "score": 0.0,
+        "detail": "error: Reader error at 26:43: unknown character name: backslash",
+        "latency_s": 12.573862075805664,
+        "tokens_in": 1347,
+        "tokens_out": 2048
+      },
+      {
+        "task_id": "L4-009",
+        "level": 4,
+        "category": "json-transform",
+        "score": 0.3,
+        "detail": "wrong output: expected '{:Alice 30 :Bob 25}', got '{\"Alice\" 30 \"Bob\" 25}'",
+        "latency_s": 0.7333059310913086,
+        "tokens_in": 1345,
+        "tokens_out": 63
+      },
+      {
+        "task_id": "L4-010",
+        "level": 4,
+        "category": "memoize",
+        "score": 0.0,
+        "detail": "error: Unbound variable: map/empty",
+        "latency_s": 1.7334649562835693,
+        "tokens_in": 1357,
+        "tokens_out": 273
+      },
+      {
+        "task_id": "L5-001",
+        "level": 5,
+        "category": "macro",
+        "score": 0.0,
+        "detail": "error: Arity error: for-list expects 1 args, got 2",
+        "latency_s": 2.8463728427886963,
+        "tokens_in": 1347,
+        "tokens_out": 411
+      },
+      {
+        "task_id": "L5-002",
+        "level": 5,
+        "category": "macro",
+        "score": 0.0,
+        "detail": "error: Arity error: defn-with-logging expects 4 args, got 3",
+        "latency_s": 0.8112199306488037,
+        "tokens_in": 1356,
+        "tokens_out": 96
+      },
+      {
+        "task_id": "L5-003",
+        "level": 5,
+        "category": "async",
+        "score": 0.3,
+        "detail": "wrong output: expected '42', got '<async-promise rejected: Unbound variable: ch>'",
+        "latency_s": 0.6018381118774414,
+        "tokens_in": 1330,
+        "tokens_out": 23
+      },
+      {
+        "task_id": "L5-004",
+        "level": 5,
+        "category": "lazy",
+        "score": 0.0,
+        "detail": "error: Type error: expected thunk, got list",
+        "latency_s": 0.8274729251861572,
+        "tokens_in": 1360,
+        "tokens_out": 98
+      },
+      {
+        "task_id": "L5-005",
+        "level": 5,
+        "category": "quasiquote",
+        "score": 1.0,
+        "detail": "correct",
+        "latency_s": 1.3131818771362305,
+        "tokens_in": 1380,
+        "tokens_out": 159
+      }
+    ],
+    "details": [],
+    "completions": [
+      {
+        "task_id": "L1-001",
+        "completion": "The result of evaluating the Sema expression `(+ 1 2)` is `3`."
+      },
+      {
+        "task_id": "L1-002",
+        "completion": "The result of evaluating the Sema expression `(* 6 7)` is `42`."
+      },
+      {
+        "task_id": "L1-003",
+        "completion": "(2 4 6)"
+      },
+      {
+        "task_id": "L1-004",
+        "completion": "The result of evaluating `(filter odd? '(1 2 3 4 5))` is:\n\n```lisp\n'(1 3 5)\n```\n\nExplanation:\n- The `filter` function is used to filter elements from a list based on a predicate.\n- The predicate `odd?` checks if a number is odd.\n- The list `(1 2 3 4 5)` is filtered to include only the odd numbers, resulting in `(1 3 5)`."
+      },
+      {
+        "task_id": "L1-005",
+        "completion": "The expression `(get {:a 1 :b 2} :a)` evaluates to `1`. \n\nHere's the breakdown:\n- `{:a 1 :b 2}` is a map with keys `:a` and `:b` and corresponding values `1` and `2`.\n- `:a` is the key we are looking up in the map.\n- The `get` function retrieves the value associated with the key `:a` from the map.\n\nSo, the result is `1`."
+      },
+      {
+        "task_id": "L1-006",
+        "completion": "\"HELLO\""
+      },
+      {
+        "task_id": "L1-007",
+        "completion": "\"hi\""
+      },
+      {
+        "task_id": "L1-008",
+        "completion": "The expression evaluates to 30. Here's the breakdown:\n\n1. The `let` form binds the variables `x` and `y` to the values 10 and 20, respectively.\n2. The `+` operator adds the values of `x` and `y`.\n\nSo, the result of the expression is `30`."
+      },
+      {
+        "task_id": "L1-009",
+        "completion": "The expression `(cond ((= 1 2) 'a) ((= 1 1) 'b) (else 'c))` evaluates to `'b`.\n\n### Explanation:\n- The `cond` special form evaluates each condition in order.\n- The first condition ` (= 1 2)` is false, so it moves to the next condition.\n- The second condition ` (= 1 1)` is true, so it returns the corresponding value `'b`.\n- The `else` clause is not reached because the previous condition was true."
+      },
+      {
+        "task_id": "L1-010",
+        "completion": "The expression `(foldl + 0 '(1 2 3 4 5))` evaluates to `15`.\n\n### Explanation:\n- `foldl` is a higher-order function that applies a binary function (in this case, `+`) to an initial value (0) and a list of elements (1, 2, 3, 4, 5).\n- It processes the list from left to right, accumulating the result.\n- The operation is: `0 + 1 + 2 + 3 + 4 + 5 = 15`.\n\nSo, the result is `15`."
+      },
+      {
+        "task_id": "L1-011",
+        "completion": "#t"
+      },
+      {
+        "task_id": "L1-012",
+        "completion": "The expression `(:a {:a 42 :b 99})` retrieves the value associated with the key `:a` from the map `{:a 42 :b 99}`.\n\n### Evaluation:\n- The key `:a` is present in the map with the value `42`.\n- Therefore, the result of the expression is `42`.\n\n### Final Answer:\n```lisp\n42\n```"
+      },
+      {
+        "task_id": "L1-013",
+        "completion": "(1 4 9)"
+      },
+      {
+        "task_id": "L1-014",
+        "completion": "\"Hello World\""
+      },
+      {
+        "task_id": "L1-015",
+        "completion": "The expression `(map/update {:a 1} :a #(+ % 10))` evaluates to `{:a 11}`.\n\n### Explanation:\n- `map/update` is a function that updates the value of a key in a map.\n- The first argument is the map `{:a 1}`.\n- The second argument is the key `:a`.\n- The third argument is a function `#(+ % 10)` which takes the current value of the key and adds 10 to it.\n- The value of the key `:a` is `1`, so applying the function `#(+ % 10)` results in `11`.\n- Therefore, the updated map is `{:a 11}`."
+      },
+      {
+        "task_id": "L2-001",
+        "completion": "(define (square x)\n  (* x x))\n\n(square 5)"
+      },
+      {
+        "task_id": "L2-002",
+        "completion": "(define (even-or-odd n)\n  (if (even? n)\n      :even\n      :odd))\n\n(even-or-odd 7) ; Returns :odd"
+      },
+      {
+        "task_id": "L2-003",
+        "completion": "(define (my-length lst)\n  (if (nil? lst)\n      0\n      (+ 1 (my-length (rest lst)))))\n\n(my-length '(1 2 3 4)) ; Returns 4"
+      },
+      {
+        "task_id": "L2-004",
+        "completion": "(define (my-reverse lst)\n  (foldl (fn (acc item) (cons item acc)) nil lst))\n\n(my-reverse '(1 2 3)) ; Evaluates to '(3 2 1)"
+      },
+      {
+        "task_id": "L2-005",
+        "completion": "(define (palindrome? s)\n  (string/equals? s (string/reverse s)))\n\n(palindrome? \"racecar\") ; => #t"
+      },
+      {
+        "task_id": "L2-006",
+        "completion": "(define (factorial n)\n  (let loop ((n n) (result 1))\n    (if (= n 0)\n        result\n        (loop (- n 1) (* result n)))))\n\n(factorial 5) ; Evaluates to 120"
+      },
+      {
+        "task_id": "L2-007",
+        "completion": "(define (fib n)\n  (let loop ((i n) (a 0) (b 1))\n    (if (= i 0) a (loop (- i 1) b (+ a b)))))\n\n(fib 10) ; Returns 55"
+      },
+      {
+        "task_id": "L2-008",
+        "completion": "(count-words \"the cat the dog the bird\")\n\n(define (count-words s)\n  (let loop ((words (string/split s \" \"))\n             (counts {}))\n    (if (nil? words)\n        counts\n        (loop (rest words)\n              (map/update counts (first words) #(if (nil? %) 1 (+ % 1)))))))"
+      },
+      {
+        "task_id": "L2-009",
+        "completion": "(define (max-of-list lst)\n  (foldl (fn (acc x) (if (> x acc) x acc)) -inf.0 lst))\n\n(max-of-list '(3 7 2 9 4)) ; Returns 9"
+      },
+      {
+        "task_id": "L2-010",
+        "completion": "(title-case \"hello world foo\") ; => \"Hello World Foo\"\n\n(define (title-case s)\n  (string/replace s #\"\\b\" (fn (match) (string/upper (string/substr match 0 1)) (string/substr match 1))))"
+      },
+      {
+        "task_id": "L2-011",
+        "completion": "(define (prime? n)\n  (if (<= n 1)\n      #f\n      (if (<= n 3)\n          #t\n          (if (even? n)\n              #f\n              (let loop ((i 3))\n                (if (> i (sqrt n))\n                    #t\n                    (if (divides? i n)\n                        #f\n                        (loop (+ i 2)))))))))\n\n(define (divides? a b)\n  (= (mod b a) 0))\n\n(prime? 17) ; => #t"
+      },
+      {
+        "task_id": "L2-012",
+        "completion": "(map-keys-only (fn (m) (keys m)))\n\n(map-keys-only {:a 1 :b 2 :c 3}) ; => (:a :b :c)"
+      },
+      {
+        "task_id": "L2-013",
+        "completion": "(->> (range 10)\n     (filter odd?)\n     (map (fn (x) (* x x)))\n     (reduce +))"
+      },
+      {
+        "task_id": "L2-014",
+        "completion": "(define (classify n)\n  (match n\n    ((? positive?) :positive)\n    ((? negative?) :negative)\n    (0 :zero)))\n\n(classify -5)"
+      },
+      {
+        "task_id": "L2-015",
+        "completion": "(define (swap-pair [a b])\n  [b a])\n\n(swap-pair '(1 2)) ; Returns '(2 1)"
+      },
+      {
+        "task_id": "L3-001",
+        "completion": "(group-by-parity '(1 2 3 4 5 6))\n\n(define (group-by-parity nums)\n  (let ((evens '())\n        (odds '()))\n    (for-range (i 0 (length nums))\n      (let ((num (nth nums i)))\n        (if (even? num)\n            (set! evens (append evens (list num)))\n            (set! odds (append odds (list num))))))\n    (map {:evens evens :odds odds})))"
+      },
+      {
+        "task_id": "L3-002",
+        "completion": "(word-freq \"the The THE cat\")\n\n; Result: {:the 3, :cat 1}\n\n; Function definition\n(define (word-freq s)\n  (foldl (fn (acc word)\n           (map/update acc (string/to-keyword word) \n                       (fn (count) \n                         (if (nil? count) 1 (+ count 1)))))\n         {}\n         (string/split s)))"
+      },
+      {
+        "task_id": "L3-003",
+        "completion": "(define-record-type Point\n  (fields x y))\n\n(define (distance p1 p2)\n  (let ((dx (- (Point-x p1) (Point-x p2)))\n        (dy (- (Point-y p1) (Point-y p2))))\n    (sqrt (+ (pow dx 2) (pow dy 2)))))\n\n(distance (make-point 0 0) (make-point 3 4))"
+      },
+      {
+        "task_id": "L3-004",
+        "completion": "(defmacro unless (condition &body body)\n  `(if (not ,condition)\n       (progn ,@body)))\n\n;; Test the macro\n(unless false 42) ; This should return 42"
+      },
+      {
+        "task_id": "L3-005",
+        "completion": "(json/encode {:id 1 :name \"Alice\" :roles [:admin :user]})"
+      },
+      {
+        "task_id": "L3-006",
+        "completion": "(defmulti area :type)\n\n(defmethod area :circle [{:keys [radius]}]\n  (* 3.14159 (* radius radius)))\n\n(defmethod area :rectangle [{:keys [width height]}]\n  (* width height))\n\n(area {:type :circle :radius 5})"
+      },
+      {
+        "task_id": "L3-007",
+        "completion": "(define (handle-request request)\n  (match request\n    ((:method :GET :path \"/health\") {:status 200 :body \"ok\"})\n    ((:method :POST :path \"/users\") {:status 201 :body \"created\"})\n    (_ {:status 404 :body \"not found\"})))\n\n(handle-request {:method :GET :path \"/health\"})"
+      },
+      {
+        "task_id": "L3-008",
+        "completion": "(define (safe-divide a b)\n  (try\n    (/ a b)\n    (catch e\n      {:error \"division by zero\"})))\n\n(safe-divide 10 2)"
+      },
+      {
+        "task_id": "L3-009",
+        "completion": "(->> \"Hello World Foo Bar\"\n     string/split\n     (map string/upper)\n     (string/join \", \"))"
+      },
+      {
+        "task_id": "L3-010",
+        "completion": "(define (tree-sum tree)\n  (cond\n    ((nil? tree) 0)\n    ((number? tree) tree)\n    ((list? tree) (reduce + 0 (map tree-sum tree)))\n    (else 0)))\n\n(tree-sum '(1 (2 3) (4 (5 6)))) ; Evaluates to 21"
+      },
+      {
+        "task_id": "L3-011",
+        "completion": "(define (deep-merge-user user1 user2)\n  (map/merge user1 user2))\n\n(deep-merge-user {:name \"Alice\" :age 30} {:age 31 :role :admin})"
+      },
+      {
+        "task_id": "L3-012",
+        "completion": "(define (fizzbuzz n)\n  (map (fn (i)\n         (cond\n           ((and (divisible? i 3) (divisible? i 5)) \"FizzBuzz\")\n           ((divisible? i 3) \"Fizz\")\n           ((divisible? i 5) \"Buzz\")\n           (else (string i))))\n       (range 1 (add1 n))))\n\n(fizzbuzz 5)"
+      },
+      {
+        "task_id": "L3-013",
+        "completion": "(define (compose f g)\n  (fn (x) (f (g x))))\n\n(define square (fn (x) (* x x)))\n(define add1 (fn (x) (+ x 1)))\n\n((compose square add1) 4) ; Result: 25"
+      },
+      {
+        "task_id": "L3-014",
+        "completion": "(csv-row '(\"Alice\" 30 \"admin\"))\n\n; Define the csv-row function\n(define (csv-row values)\n  (string/join \",\" (map string values)))\n\n; Evaluate the function with the given list\n(csv-row '(\"Alice\" 30 \"admin\"))"
+      },
+      {
+        "task_id": "L3-015",
+        "completion": "(define (quadratic-roots a b c)\n  (let* ((discriminant (+ (* b b) (* 4 a c)))\n         (sqrt-discriminant (sqrt discriminant))\n         (root1 (/ (- (- b) sqrt-discriminant) (* 2 a)))\n         (root2 (/ (+ (- b) sqrt-discriminant) (* 2 a))))\n    [root1 root2]))\n\n(quadratic-roots 1 -5 6) ; => [3 2]"
+      },
+      {
+        "task_id": "L4-001",
+        "completion": "```lisp\n; Process a list of user maps\n(define (process-users users)\n  (->> users\n       (filter (fn (user) (> (:age user) 17))) ; Filter out users under 18\n       (sort (fn (a b) (> (:age a) (:age b)))) ; Sort by age descending\n       (map (:name)))) ; Extract names\n\n; Test with the given list of users\n(process-users\n [{:name \"Alice\" :age 30}\n  {:name \"Bob\" :age 17}\n  {:name \"Carol\" :age 25}\n  {:name \"Dave\" :age 40}])\n```\n\nThis program defines a function `process-users` that:\n1. Filters out users under 18 using the `filter` function\n2. Sorts the remaining users by age in descending order using the `sort` function\n3. Extracts the names of the filtered and sorted users using the `map` function\n\nWhen tested with the provided list of users, it should return the list of names: (\"Dave\" \"Alice\" \"Carol\") as expected."
+      },
+      {
+        "task_id": "L4-002",
+        "completion": "(define (eval-expr expr)\n  (cond\n    ((number? expr) expr)\n    ((list? expr)\n     (let ((op (first expr))\n           (left (second expr))\n           (right (third expr)))\n       (case op\n         ((+) (+ (eval-expr left) (eval-expr right)))\n         ((-) (- (eval-expr left) (eval-expr right)))\n         ((*) (* (eval-expr left) (eval-expr right)))\n         ((/) (/ (eval-expr left) (eval-expr right)))\n         (else (error \"Unknown operation\" op))))) \n    (else (error \"Invalid expression\" expr)))) \n\n;; Test the function\n(eval-expr '(+ (* 2 3) (- 10 4))) ; Should return 12"
+      },
+      {
+        "task_id": "L4-003",
+        "completion": "(define (traffic-light)\n  (define (next-state state)\n    (match state\n      (:red :green)\n      (:green :yellow)\n      (:yellow :red)))\n  \n  (define (run-states n)\n    (let loop ((count n) (states '()))\n      (if (<= count 0)\n          states\n          (loop (- count 1)\n                (cons (next-state (last states)) states)))))\n  \n  (run-states 5))"
+      },
+      {
+        "task_id": "L4-004",
+        "completion": "(http/router\n  [[:get \"/health\" (fn (req) {:status 200 :body \"ok\"})]\n   [:get \"/status\" (fn (req) {:status 200 :body \"running\"})]])"
+      },
+      {
+        "task_id": "L4-005",
+        "completion": "(defmacro my-when-let (binding &rest body)\n  `(let ,binding\n     (when ,binding\n       ,@body)))\n\n;; Test the macro\n(my-when-let (x (get {:a 42} :a)) (* x 2)) ; Should return 84"
+      },
+      {
+        "task_id": "L4-006",
+        "completion": "(pipe 5 (list (fn (x) (+ x 1)) (fn (x) (* x 2)) (fn (x) (- x 3)))) evaluates to 12.\n\nHere is the implementation of the `pipe` function using `foldl`:\n\n```lisp\n(define (pipe value functions)\n  (foldl (fn (acc func) (func acc)) value functions))\n```\n\nThis function takes a value and a list of functions, and applies each function in sequence, passing the result of each function as the input to the next. The `foldl` function is used to accumulate the result of each function application."
+      },
+      {
+        "task_id": "L4-007",
+        "completion": "(define (matrix-transpose matrix)\n  (apply map list matrix)) \n\n(matrix-transpose '((1 2 3) (4 5 6)))"
+      },
+      {
+        "task_id": "L4-008",
+        "completion": "(define (parse-csv-line line)\n  (let loop ((tokens '())\n             (current-field \"\")\n             (in-quoted? #f)\n             (current-char #\\space))\n    (if (nil? line)\n        (if (or (and in-quoted? (not (nil? current-field)))\n                (and (not in-quoted?) (not (nil? current-field))))\n            (append tokens (list current-field))\n            tokens)\n        (let ((char (car line)))\n          (cond\n            ((and in-quoted? (char=? char #\\\")) ; End of quoted field\n             (loop (append tokens (list current-field))\n                   \"\" #f (cdr line)))\n            ((and in-quoted? (char=? char #\\,)) ; Comma inside quoted field\n             (loop tokens (append current-field (list char)) in-quoted? (cdr line)))\n            ((and in-quoted? (char=? char #\\newline)) ; Newline inside quoted field\n             (loop tokens (append current-field (list char)) in-quoted? (cdr line)))\n            ((and in-quoted? (char=? char #\\return)) ; Carriage return inside quoted field\n             (loop tokens (append current-field (list char)) in-quoted? (cdr line)))\n            ((and in-quoted? (char=? char #\\tab)) ; Tab inside quoted field\n             (loop tokens (append current-field (list char)) in-quoted? (cdr line)))\n            ((and in-quoted? (char=? char #\\space)) ; Space inside quoted field\n             (loop tokens (append current-field (list char)) in-quoted? (cdr line)))\n            ((and in-quoted? (char=? char #\\backslash)) ; Backslash inside quoted field\n             (loop tokens (append current-field (list char)) in-quoted? (cdr line)))\n            ((and in-quoted? (char=? char #\\quote)) ; Escaped quote inside quoted field\n             (loop tokens (append current-field (list char)) in-quoted? (cdr line)))\n            ((and in-quoted? (char=? char #\\newline)) ; Newline inside quoted field\n             (loop tokens (append current-field (list char)) in-quoted? (cdr line)))\n            ((and in-quoted? (char=? char #\\return)) ; Carriage return inside quoted field\n             (loop tokens (append current-field (list char)) in-quoted? (cdr line)))\n            ((and in-quoted? (char=? char #\\tab)) ; Tab inside quoted field\n             (loop tokens (append current-field (list char)) in-quoted? (cdr line)))\n            ((and in-quoted? (char=? char #\\space)) ; Space inside quoted field\n             (loop tokens (append current-field (list char)) in-quoted? (cdr line)))\n            ((and in-quoted? (char=? char #\\backslash)) ; Backslash inside quoted field\n             (loop tokens (append current-field (list char)) in-quoted? (cdr line)))\n            ((and in-quoted? (char=? char #\\quote)) ; Escaped quote inside quoted field\n             (loop tokens (append current-field (list char)) in-quoted? (cdr line)))\n            ((and in-quoted? (char=? char #\\newline)) ; Newline inside quoted field\n             (loop tokens (append current-field (list char)) in-quoted? (cdr line)))\n            ((and in-quoted? (char=? char #\\return)) ; Carriage return inside quoted field\n             (loop tokens (append current-field (list char)) in-quoted? (cdr line)))\n            ((and in-quoted? (char=? char #\\tab)) ; Tab inside quoted field\n             (loop tokens (append current-field (list char)) in-quoted? (cdr line)))\n            ((and in-quoted? (char=? char #\\space)) ; Space inside quoted field\n             (loop tokens (append current-field (list char)) in-quoted? (cdr line)))\n            ((and in-quoted? (char=? char #\\backslash)) ; Backslash inside quoted field\n             (loop tokens (append current-field (list char)) in-quoted? (cdr line)))\n            ((and in-quoted? (char=? char #\\quote)) ; Escaped quote inside quoted field\n             (loop tokens (append current-field (list char)) in-quoted? (cdr line)))\n            ((and in-quoted? (char=? char #\\newline)) ; Newline inside quoted field\n             (loop tokens (append current-field (list char)) in-quoted? (cdr line)))\n            ((and in-quoted? (char=? char #\\return)) ; Carriage return inside quoted field\n             (loop tokens (append current-field (list char)) in-quoted? (cdr line)))\n            ((and in-quoted? (char=? char #\\tab)) ; Tab inside quoted field\n             (loop tokens (append current-field (list char)) in-quoted? (cdr line)))\n            ((and in-quoted? (char=? char #\\space)) ; Space inside quoted field\n             (loop tokens (append current-field (list char)) in-quoted? (cdr line)))\n            ((and in-quoted? (char=? char #\\backslash)) ; Backslash inside quoted field\n             (loop tokens (append current-field (list char)) in-quoted? (cdr line)))\n            ((and in-quoted? (char=? char #\\quote)) ; Escaped quote inside quoted field\n             (loop tokens (append current-field (list char)) in-quoted? (cdr line)))\n            ((and in-quoted? (char=? char #\\newline)) ; Newline inside quoted field\n             (loop tokens (append current-field (list char)) in-quoted? (cdr line)))\n            ((and in-quoted? (char=? char #\\return)) ; Carriage return inside quoted field\n             (loop tokens (append current-field (list char)) in-quoted? (cdr line)))\n            ((and in-quoted? (char=? char #\\tab)) ; Tab inside quoted field\n             (loop tokens (append current-field (list char)) in-quoted? (cdr line)))\n            ((and in-quoted? (char=? char #\\space)) ; Space inside quoted field\n             (loop tokens (append current-field (list char)) in-quoted? (cdr line)))\n            ((and in-quoted? (char=? char #\\backslash)) ; Backslash inside quoted field\n             (loop tokens (append current-field (list char)) in-quoted? (cdr line)))\n            ((and in-quoted? (char=? char #\\quote)) ; Escaped quote inside quoted field\n             (loop tokens (append current-field (list char)) in-quoted? (cdr line)))\n            ((and in-quoted? (char=? char #\\newline)) ; Newline inside quoted field\n             (loop tokens (append current-field (list char)) in-quoted? (cdr line)))\n            ((and in-quoted? (char=? char #\\return)) ; Carriage return inside quoted field\n             (loop tokens (append current-field (list char)) in-quoted? (cdr line)))\n            ((and in-quoted? (char=? char #\\tab)) ; Tab inside quoted field\n             (loop tokens (append current-field (list char)) in-quoted? (cdr line)))\n            ((and in-quoted? (char=? char #\\space)) ; Space inside quoted field\n             (loop tokens (append current-field (list char)) in-quoted? (cdr line)))\n            ((and in-quoted? (char=? char #\\backslash)) ; Backslash inside quoted field\n             (loop tokens (append current-field (list char)) in-quoted? (cdr line)))\n            ((and in-quoted? (char=? char #\\quote)) ; Escaped quote inside quoted field\n             (loop tokens (append current-field (list char)) in-quoted? (cdr line)))\n            ((and in-quoted? (char=? char #\\newline)) ; Newline inside quoted field\n             (loop tokens (append current-field (list char)) in-quoted? (cdr line)))\n            ((and in-quoted? (char=? char #\\return)) ; Carriage return inside quoted field\n             (loop tokens (append current-field (list char)) in-quoted? (cdr line)))\n            ((and in-quoted? (char=? char #\\tab)) ; Tab inside quoted field\n             (loop tokens (append current-field (list char)) in-quoted? (cdr line)))\n            ((and in-quoted? (char=? char #\\space)) ; Space inside quoted field\n             (loop tokens (append current-field (list char)) in-quoted? (cdr line)))\n            ((and in-quoted? (char=? char #\\backslash)) ; Backslash inside quoted field\n             (loop tokens (append current-field (list char)) in-quoted? (cdr line)))\n            ((and in-quoted? (char=? char #\\quote)) ; Escaped quote inside quoted field\n             (loop tokens (append current-field (list char)) in-quoted? (cdr line)))\n            ((and in-quoted? (char=? char #\\newline)) ; Newline inside quoted field\n             (loop tokens (append current-field (list char)) in-quoted? (cdr line)))\n            ((and in-quoted? (char=? char #\\return)) ; Carriage return inside quoted field\n             (loop tokens (append current-field (list char)) in-quoted? (cdr line)))"
+      },
+      {
+        "task_id": "L4-009",
+        "completion": "(define (transform-users users)\n  (foldl (fn (acc user)\n           (assoc acc (:name user) (:age user)))\n         {} users))\n\n(transform-users [{:name \"Alice\" :age 30} {:name \"Bob\" :age 25}])"
+      },
+      {
+        "task_id": "L4-010",
+        "completion": "```lisp\n(define (memoize f)\n  (let ((cache (map/empty)))\n    (fn (x)\n      (if (map/contains? cache x)\n          (map/get cache x)\n          (let ((result (f x)))\n            (map/assoc cache x result)\n            result)))))\n\n;; Test the memoize function\n(define slow-square (fn (x) (* x x)))\n(define memoized-square (memoize slow-square))\n\n;; First call: computes the result\n(println ((memoized-square 7))) ; Output: 49\n\n;; Second call: returns the cached result\n(println ((memoized-square 7))) ; Output: 49\n```\n\nThis implementation of `memoize` creates a closure that wraps the input function `f`. The closure maintains a mutable map `cache` to store previously computed results. When the memoized function is called with an argument `x`, it checks if the result for `x` is already in the cache. If it is, the cached result is returned. If not, the function `f` is called with `x`, the result is stored in the cache, and then returned. This ensures that subsequent calls with the same argument will return the cached result, improving performance for repeated calls with the same input."
+      },
+      {
+        "task_id": "L5-001",
+        "completion": "```lisp\n(defmacro for-list (expr)\n  (let ((bindings (first expr))\n        (body (second expr)))\n    (let ((var (first bindings))\n          (seq (second bindings))\n          (when-clause (third bindings)))\n      (if (and (keyword? (third bindings)) (= (third bindings) :when))\n          (let ((condition (fourth bindings)))\n            (if (and (list? body) (= (first body) '*))\n                (list 'map\n                      (list 'fn (list var) (list '* var var))\n                      (list 'filter\n                            (list 'fn (list var) condition)\n                            seq))\n                (list 'map\n                      (list 'fn (list var) body)\n                      (list 'filter\n                            (list 'fn (list var) condition)\n                            seq)))\n            (list 'map\n                  (list 'fn (list var) body)\n                  seq))))))\n```\n\n```lisp\n;; Evaluate (for-list [x (range 10) :when (odd? x)] (* x x))\n(for-list [x (range 10) :when (odd? x)] (* x x))\n```\n\nThis macro expands to a combination of `map` and `filter` to implement a list comprehension. The `for-list` macro takes an expression with the following syntax:\n\n- `[x (range 10) :when (odd? x)]` defines the variable `x` and the sequence to iterate over, with an optional `:when` clause to filter the results.\n- `(* x x)` is the body of the comprehension, which is the expression to evaluate for each element in the sequence.\n\nThe macro expands to a `map` operation that applies the body to each element of the sequence, with a `filter` operation to apply the `:when` condition. The result is a list of the evaluated expressions for each element that satisfies the condition."
+      },
+      {
+        "task_id": "L5-002",
+        "completion": "(defmacro defn-with-logging (name args &body body)\n  `(define ,name\n     (fn ,args\n       (println \"Calling function\" ',name \"with arguments:\" ,args)\n       (let (result (progn ,@body))\n         (println \"Function\" ',name \"returned:\" result)\n         result))))\n\n(defn-with-logging add (x y)\n  (+ x y))\n\n(add 2 3)"
+      },
+      {
+        "task_id": "L5-003",
+        "completion": "(async (fn () (channel/send ch 42)) (channel/recv ch))"
+      },
+      {
+        "task_id": "L5-004",
+        "completion": "(define (integers-from n)\n  (cons n (delay (integers-from (+ n 1)))))\n\n(define (stream-take s n)\n  (if (<= n 0)\n      '()\n      (cons (car s) (stream-take (force (cdr s)) (- n 1)))))\n\n(stream-take (integers-from 1) 5) ; Should return (1 2 3 4 5)"
+      },
+      {
+        "task_id": "L5-005",
+        "completion": "```lisp\n(defmacro swap! (sym val)\n  `(set! ,sym (let ((tmp ,sym))\n                (set! ,sym ,val)\n                tmp)))\n\n;; Test\n(begin\n  (define x 10)\n  (swap! x 20)\n  x)\n```\n\nThis `swap!` macro takes a symbol and a value, and expands to a form that sets the symbol to the new value and returns the old value. The macro uses quasiquote and unquote to insert the symbol and value into the generated code. The test case defines `x` as 10, swaps it with 20 using `swap!`, and then returns the value of `x`, which should be 20."
+      }
+    ]
+  }
+}

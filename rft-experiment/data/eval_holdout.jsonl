@@ -1,0 +1,116 @@
+{"test_name": "let_binding_throwing_try_three", "input": "(let ((a 0) (b (try (throw 1) (catch e 2))) (c 9)) (+ a b c))", "file": "crates/sema/tests/eval_test.rs", "expected": "11", "stdout": "", "category": "arithmetic"}
+{"test_name": "math_floor_basic", "input": "(floor 3.7)", "file": "crates/sema/tests/eval_stdlib_test.rs", "expected": "3", "stdout": "", "category": "arithmetic"}
+{"test_name": "interleave_three", "input": "(list/interleave '(1 4) '(2 5) '(3 6))", "file": "crates/sema/tests/eval_collections_test.rs", "expected": "(1 2 3 4 5 6)", "stdout": "", "category": "list"}
+{"test_name": "if_let_nil", "input": "(if-let (x nil) (+ x 1) 0)", "file": "crates/sema/tests/eval_ergonomic_test.rs", "expected": "0", "stdout": "", "category": "arithmetic"}
+{"test_name": "neg_zero_negate", "input": "(= (- 0.0) 0.0)", "file": "crates/sema/tests/eval_types_test.rs", "expected": "#t", "stdout": "", "category": "arithmetic"}
+{"test_name": "base64_encode_bytes", "input": "(base64/encode-bytes (bytevector 72 101 108 108 111))", "file": "crates/sema/tests/eval_types_test.rs", "expected": "\"SGVsbG8=\"", "stdout": "", "category": "arithmetic"}
+{"test_name": "pio_asm_set_pins_1", "input": "(get (pio/assemble (list (pio/set :pins 1))) :instructions)", "file": "crates/sema/tests/eval_test.rs", "expected": "#u8(1 224)", "stdout": "", "category": "map"}
+{"test_name": "sci_float_literal", "input": "1.0e19", "file": "crates/sema/tests/eval_test.rs", "expected": "10000000000000000000.0", "stdout": "", "category": "other"}
+{"test_name": "str_trim", "input": "(string/trim \"  hi  \")", "file": "crates/sema/tests/eval_collections_test.rs", "expected": "\"hi\"", "stdout": "", "category": "string"}
+{"test_name": "map_filter_none", "input": "(count (map/filter (fn (k v) #f) {:a 1 :b 2}))", "file": "crates/sema/tests/eval_map_test.rs", "expected": "0", "stdout": "", "category": "map"}
+{"test_name": "ctx_remove", "input": "(begin (context/set :x 1) (context/remove :x) (context/has? :x))", "file": "crates/sema/tests/eval_stdlib_test.rs", "expected": "#f", "stdout": "", "category": "arithmetic"}
+{"test_name": "ctx_merge", "input": "(begin (context/merge {:a 1 :b 2}) (context/get :b))", "file": "crates/sema/tests/eval_stdlib_test.rs", "expected": "2", "stdout": "", "category": "map"}
+{"test_name": "auto_gensym_recursive_macro", "input": "\n        (begin\n          (defmacro count-down (n)\n            (if (= n 0)\n              0\n              `(let ((v# ,n)) (+ v# (count-down ,(- n 1))))))\n          (count-down 10))\n    ", "file": "crates/sema/tests/eval_test.rs", "expected": "55", "stdout": "", "category": "arithmetic"}
+{"test_name": "short_lambda_nested_call", "input": "(map #(string-length %) '(\"hi\" \"hello\" \"hey\"))", "file": "crates/sema/tests/eval_ergonomic_test.rs", "expected": "(2 5 3)", "stdout": "", "category": "string"}
+{"test_name": "string_length_empty", "input": "(string-length \"\")", "file": "crates/sema/tests/eval_test.rs", "expected": "0", "stdout": "", "category": "string"}
+{"test_name": "wide_int_sub_runtime", "input": "((fn (a b) (- a b)) 100000000000000 1)", "file": "crates/sema/tests/eval_test.rs", "expected": "99999999999999", "stdout": "", "category": "arithmetic"}
+{"test_name": "pio_pull_ifempty", "input": "(get (pio/pull :ifempty) :ifempty)", "file": "crates/sema/tests/eval_test.rs", "expected": "#t", "stdout": "", "category": "map"}
+{"test_name": "shadow_if_value_position", "input": "(let ((if 5)) (+ if 1))", "file": "crates/sema/tests/eval_test.rs", "expected": "6", "stdout": "", "category": "arithmetic"}
+{"test_name": "stream_byte_buffer_roundtrip", "input": "(let ((s (stream/byte-buffer))) (stream/write s (string->utf8 \"hello\")) (utf8->string (stream/to-bytes s)))", "file": "crates/sema/tests/eval_test.rs", "expected": "\"hello\"", "stdout": "", "category": "string"}
+{"test_name": "json_encode_int", "input": "(json/encode 42)", "file": "crates/sema/tests/eval_data_test.rs", "expected": "\"42\"", "stdout": "", "category": "arithmetic"}
+{"test_name": "type_keyword", "input": "(type :foo)", "file": "crates/sema/tests/eval_data_test.rs", "expected": ":keyword", "stdout": "", "category": "other"}
+{"test_name": "f64_array_not_i64", "input": "(i64-array? (f64-array/make 1))", "file": "crates/sema/tests/eval_test.rs", "expected": "#f", "stdout": "", "category": "arithmetic"}
+{"test_name": "bv_append", "input": "(bytevector-length (bytevector-append (bytevector 1 2) (bytevector 3 4)))", "file": "crates/sema/tests/eval_types_test.rs", "expected": "4", "stdout": "", "category": "list"}
+{"test_name": "assv_found", "input": "(assv 2 '((1 10) (2 20) (3 30)))", "file": "crates/sema/tests/eval_collections_test.rs", "expected": "(2 20)", "stdout": "", "category": "other"}
+{"test_name": "conv_empty_msgs", "input": "(length (conversation/messages (conversation/new)))", "file": "crates/sema/tests/eval_stdlib_test.rs", "expected": "0", "stdout": "", "category": "arithmetic"}
+{"test_name": "string_length_basic", "input": "(string-length \"hello\")", "file": "crates/sema/tests/eval_stdlib_test.rs", "expected": "5", "stdout": "", "category": "string"}
+{"test_name": "str_pad_right", "input": "(string/pad-right \"42\" 5 \"0\")", "file": "crates/sema/tests/eval_collections_test.rs", "expected": "\"42000\"", "stdout": "", "category": "string"}
+{"test_name": "shadow_deep", "input": "(let ((+ *)) (let ((y 2)) (let ((z 3)) (+ y z))))", "file": "crates/sema/tests/eval_core_test.rs", "expected": "6", "stdout": "", "category": "arithmetic"}
+{"test_name": "thread_last_pipeline", "input": "(->> (range 1 6) (map (fn (x) (* x x))) (foldl + 0))", "file": "crates/sema/tests/eval_ergonomic_test.rs", "expected": "55", "stdout": "", "category": "list"}
+{"test_name": "number_to_str", "input": "(number->string 42)", "file": "crates/sema/tests/eval_collections_test.rs", "expected": "\"42\"", "stdout": "", "category": "arithmetic"}
+{"test_name": "fn_pred_lambda", "input": "(fn? (fn (x) x))", "file": "crates/sema/tests/eval_test.rs", "expected": "#t", "stdout": "", "category": "binding"}
+{"test_name": "empty_hashmap_not", "input": "(empty? (hash-map :a 1))", "file": "crates/sema/tests/eval_map_test.rs", "expected": "#f", "stdout": "", "category": "map"}
+{"test_name": "prompt_slots_multi_msg", "input": "(length (prompt/slots (prompt (system \"{{role}}\") (user \"{{query}}\"))))", "file": "crates/sema/tests/eval_stdlib_test.rs", "expected": "2", "stdout": "", "category": "arithmetic"}
+{"test_name": "regex_find_all_empty", "input": "(regex/find-all \"\\\\d+\" \"abc\")", "file": "crates/sema/tests/eval_data_test.rs", "expected": "()", "stdout": "", "category": "arithmetic"}
+{"test_name": "macroexpand_basic", "input": "(begin (defmacro my-if (c t e) (list 'if c t e)) (macroexpand '(my-if #t 1 2)))", "file": "crates/sema/tests/eval_core_test.rs", "expected": "(if #t 1 2)", "stdout": "", "category": "list"}
+{"test_name": "max_negative", "input": "(list/max '(-3 -1 -2))", "file": "crates/sema/tests/eval_collections_test.rs", "expected": "-1", "stdout": "", "category": "list"}
+{"test_name": "unquote_splicing", "input": "(begin (define xs '(2 3)) `(1 ,@xs 4))", "file": "crates/sema/tests/eval_core_test.rs", "expected": "(1 2 3 4)", "stdout": "", "category": "binding"}
+{"test_name": "destructure_map_missing_keys", "input": "(let (({:keys [x y z]} {:x 1})) (list x y z))", "file": "crates/sema/tests/eval_test.rs", "expected": "(1 nil nil)", "stdout": "", "category": "map"}
+{"test_name": "list_length", "input": "(length '(1 2 3))", "file": "crates/sema/tests/eval_collections_test.rs", "expected": "3", "stdout": "", "category": "other"}
+{"test_name": "conv_fork", "input": "(conversation? (conversation/fork (conversation/new)))", "file": "crates/sema/tests/eval_stdlib_test.rs", "expected": "#t", "stdout": "", "category": "arithmetic"}
+{"test_name": "repeat_basic", "input": "(list/repeat 3 0)", "file": "crates/sema/tests/eval_collections_test.rs", "expected": "(0 0 0)", "stdout": "", "category": "list"}
+{"test_name": "short_lambda_no_args", "input": "(#(+ 1 2))", "file": "crates/sema/tests/eval_ergonomic_test.rs", "expected": "3", "stdout": "", "category": "arithmetic"}
+{"test_name": "and_single_false", "input": "(and #f)", "file": "crates/sema/tests/eval_core_test.rs", "expected": "#f", "stdout": "", "category": "other"}
+{"test_name": "alias_def_function", "input": "(def (add a b) (+ a b)) (add 3 4)", "file": "crates/sema/tests/eval_test.rs", "expected": "7", "stdout": "", "category": "arithmetic"}
+{"test_name": "mode_single_mode", "input": "(list/mode '(1 2 2 3))", "file": "crates/sema/tests/eval_collections_test.rs", "expected": "2", "stdout": "", "category": "list"}
+{"test_name": "eq_identity", "input": "(eq? 42 42)", "file": "crates/sema/tests/eval_core_test.rs", "expected": "#t", "stdout": "", "category": "other"}
+{"test_name": "list_filter", "input": "(filter odd? '(1 2 3 4 5))", "file": "crates/sema/tests/eval_collections_test.rs", "expected": "(1 3 5)", "stdout": "", "category": "list"}
+{"test_name": "term_strip_rgb", "input": "(term/strip (term/rgb \"hi\" 255 100 0))", "file": "crates/sema/tests/eval_stdlib_test.rs", "expected": "\"hi\"", "stdout": "", "category": "arithmetic"}
+{"test_name": "entries_map", "input": "(length (map/entries {:a 1 :b 2}))", "file": "crates/sema/tests/eval_map_test.rs", "expected": "2", "stdout": "", "category": "map"}
+{"test_name": "string_append_coerce_num", "input": "(string-append \"n=\" 42)", "file": "crates/sema/tests/eval_test.rs", "expected": "\"n=42\"", "stdout": "", "category": "string"}
+{"test_name": "some_thread_non_nil", "input": "(some-> {:a {:b 42}} (get :a) (get :b))", "file": "crates/sema/tests/eval_ergonomic_test.rs", "expected": "42", "stdout": "", "category": "map"}
+{"test_name": "arith_add", "input": "(+ 1 2)", "file": "crates/sema/tests/eval_core_test.rs", "expected": "3", "stdout": "", "category": "arithmetic"}
+{"test_name": "string_to_symbol_alias", "input": "(string/to-symbol \"foo\")", "file": "crates/sema/tests/eval_test.rs", "expected": "foo", "stdout": "", "category": "string"}
+{"test_name": "list_cdr", "input": "(cdr '(1 2 3))", "file": "crates/sema/tests/eval_collections_test.rs", "expected": "(2 3)", "stdout": "", "category": "list"}
+{"test_name": "named_let_sum", "input": "(let loop ((n 10) (acc 0)) (if (= n 0) acc (loop (- n 1) (+ acc n))))", "file": "crates/sema/tests/eval_core_test.rs", "expected": "55", "stdout": "", "category": "arithmetic"}
+{"test_name": "cdar_basic", "input": "(cdar '((1 2 3) (4 5)))", "file": "crates/sema/tests/eval_collections_test.rs", "expected": "(2 3)", "stdout": "", "category": "other"}
+{"test_name": "text_truncate_custom", "input": "(text/truncate \"hello world\" 8 \"\u2026\")", "file": "crates/sema/tests/eval_stdlib_test.rs", "expected": "\"hello w\u2026\"", "stdout": "", "category": "arithmetic"}
+{"test_name": "string_append_empty", "input": "(string-append \"\" \"x\")", "file": "crates/sema/tests/eval_test.rs", "expected": "\"x\"", "stdout": "", "category": "string"}
+{"test_name": "freq_count_keys", "input": "(length (keys (frequencies '(1 2 2 3 3 3))))", "file": "crates/sema/tests/eval_collections_test.rs", "expected": "3", "stdout": "", "category": "other"}
+{"test_name": "contains_map_no", "input": "(contains? {:a 1} :b)", "file": "crates/sema/tests/eval_map_test.rs", "expected": "#f", "stdout": "", "category": "other"}
+{"test_name": "neg_zero_arithmetic", "input": "(= (* -1.0 0.0) 0.0)", "file": "crates/sema/tests/eval_types_test.rs", "expected": "#t", "stdout": "", "category": "arithmetic"}
+{"test_name": "string_to_kw", "input": "(keyword? (string->keyword \"foo\"))", "file": "crates/sema/tests/eval_types_test.rs", "expected": "#t", "stdout": "", "category": "string"}
+{"test_name": "with_stream_read_after_close", "input": "(let ((outer nil))\n        (with-stream (s (stream/from-string \"x\")) (set! outer s))\n        (try (stream/read outer 1) (catch e :closed)))", "file": "crates/sema/tests/eval_test.rs", "expected": ":closed", "stdout": "", "category": "arithmetic"}
+{"test_name": "short_lambda_basic", "input": "(map #(+ % 1) '(1 2 3))", "file": "crates/sema/tests/eval_ergonomic_test.rs", "expected": "(2 3 4)", "stdout": "", "category": "list"}
+{"test_name": "char_upcase_alias", "input": "(char/upcase #\\a)", "file": "crates/sema/tests/eval_test.rs", "expected": "#\\A", "stdout": "", "category": "arithmetic"}
+{"test_name": "index_of_found", "input": "(list/index-of '(10 20 30) 20)", "file": "crates/sema/tests/eval_collections_test.rs", "expected": "1", "stdout": "", "category": "list"}
+{"test_name": "cond_else_multi_body", "input": "(cond (#f 1) (else 10 20))", "file": "crates/sema/tests/eval_core_test.rs", "expected": "20", "stdout": "", "category": "control-flow"}
+{"test_name": "toml_decode_empty_table", "input": "\n        (let ((t (toml/decode \"\")))\n          (map? t))\n    ", "file": "crates/sema/tests/eval_test.rs", "expected": "#t", "stdout": "", "category": "arithmetic"}
+{"test_name": "string_length_alias", "input": "(string/length \"hello\")", "file": "crates/sema/tests/eval_test.rs", "expected": "5", "stdout": "", "category": "string"}
+{"test_name": "let_star", "input": "(let* ((x 10) (y (* x 2))) (+ x y))", "file": "crates/sema/tests/eval_core_test.rs", "expected": "30", "stdout": "", "category": "arithmetic"}
+{"test_name": "assq_first_match", "input": "(car (cdr (assq 1 '((1 10) (1 99)))))", "file": "crates/sema/tests/eval_collections_test.rs", "expected": "10", "stdout": "", "category": "list"}
+{"test_name": "interleave_truncate", "input": "(list/interleave '(1 3 5) '(2 4))", "file": "crates/sema/tests/eval_collections_test.rs", "expected": "(1 2 3 4)", "stdout": "", "category": "list"}
+{"test_name": "char_upper_case_alias", "input": "(char/upper-case? #\\A)", "file": "crates/sema/tests/eval_test.rs", "expected": "#t", "stdout": "", "category": "arithmetic"}
+{"test_name": "term_strip_compound", "input": "(term/strip (term/style \"text\" :bold :red))", "file": "crates/sema/tests/eval_stdlib_test.rs", "expected": "\"text\"", "stdout": "", "category": "arithmetic"}
+{"test_name": "f64_array_length_from_list", "input": "(f64-array/length (f64-array/from-list '(10 20 30)))", "file": "crates/sema/tests/eval_test.rs", "expected": "3", "stdout": "", "category": "list"}
+{"test_name": "bit_xor_self", "input": "(bit/xor 42 42)", "file": "crates/sema/tests/eval_types_test.rs", "expected": "0", "stdout": "", "category": "arithmetic"}
+{"test_name": "empty_list", "input": "(empty? '())", "file": "crates/sema/tests/eval_map_test.rs", "expected": "#t", "stdout": "", "category": "other"}
+{"test_name": "toml_decode_deps", "input": "\n        (let ((t (toml/decode \"[deps]\\nhttp = \\\"github.com/user/http\\\"\")))\n          (:http (:deps t)))\n    ", "file": "crates/sema/tests/eval_test.rs", "expected": "\"github.com/user/http\"", "stdout": "", "category": "arithmetic"}
+{"test_name": "str_to_symbol", "input": "(symbol? (string->symbol \"foo\"))", "file": "crates/sema/tests/eval_collections_test.rs", "expected": "#t", "stdout": "", "category": "string"}
+{"test_name": "pad_already_long", "input": "(list/pad '(1 2 3) 2 0)", "file": "crates/sema/tests/eval_collections_test.rs", "expected": "(1 2 3)", "stdout": "", "category": "list"}
+{"test_name": "cddar_basic", "input": "(cddar '((1 2 3 4) 5))", "file": "crates/sema/tests/eval_collections_test.rs", "expected": "(3 4)", "stdout": "", "category": "other"}
+{"test_name": "stream_sequential_reads", "input": "(let ((s (stream/from-string \"abc\"))) (stream/read-byte s) (stream/read-byte s))", "file": "crates/sema/tests/eval_test.rs", "expected": "98", "stdout": "", "category": "arithmetic"}
+{"test_name": "ctx_set_get", "input": "(begin (context/set :name \"alice\") (context/get :name))", "file": "crates/sema/tests/eval_stdlib_test.rs", "expected": "\"alice\"", "stdout": "", "category": "map"}
+{"test_name": "stream_readable_true", "input": "(stream/readable? (stream/from-string \"x\"))", "file": "crates/sema/tests/eval_test.rs", "expected": "#t", "stdout": "", "category": "arithmetic"}
+{"test_name": "thread_last", "input": "(->> (range 1 6) (filter odd?))", "file": "crates/sema/tests/eval_ergonomic_test.rs", "expected": "(1 3 5)", "stdout": "", "category": "list"}
+{"test_name": "times_zero", "input": "(list/times 0 (fn (i) i))", "file": "crates/sema/tests/eval_collections_test.rs", "expected": "()", "stdout": "", "category": "list"}
+{"test_name": "try_catch_division", "input": "(try (/ 1 0) (catch e :caught))", "file": "crates/sema/tests/eval_core_test.rs", "expected": ":caught", "stdout": "", "category": "arithmetic"}
+{"test_name": "hof_set_through_for_each", "input": "(let ((c 0)) (for-each (fn (x) (set! c (+ c x))) (list 10 20)) c)", "file": "crates/sema/tests/eval_test.rs", "expected": "30", "stdout": "", "category": "list"}
+{"test_name": "fstring_basic", "input": "(let ((name \"world\")) f\"hello ${name}\")", "file": "crates/sema/tests/eval_ergonomic_test.rs", "expected": "\"hello world\"", "stdout": "", "category": "binding"}
+{"test_name": "cross_join_empty_second", "input": "(list/cross-join '(1 2) '())", "file": "crates/sema/tests/eval_collections_test.rs", "expected": "()", "stdout": "", "category": "list"}
+{"test_name": "time_diff_negative", "input": "(time/diff (time/parse \"2024-01-01 00:00:00\" \"%Y-%m-%d %H:%M:%S\") (time/parse \"2024-01-02 00:00:00\" \"%Y-%m-%d %H:%M:%S\"))", "file": "crates/sema/tests/eval_stdlib_test.rs", "expected": "-86400.0", "stdout": "", "category": "arithmetic"}
+{"test_name": "string_length_basic", "input": "(string-length \"hello\")", "file": "crates/sema/tests/eval_test.rs", "expected": "5", "stdout": "", "category": "string"}
+{"test_name": "destructure_let_wildcard", "input": "(let (([_ b] '(1 2))) b)", "file": "crates/sema/tests/eval_test.rs", "expected": "2", "stdout": "", "category": "binding"}
+{"test_name": "list_find", "input": "(list/find odd? '(2 4 5 6))", "file": "crates/sema/tests/eval_collections_test.rs", "expected": "5", "stdout": "", "category": "list"}
+{"test_name": "vals_hashmap", "input": "(length (vals (hash-map :a 1 :b 2)))", "file": "crates/sema/tests/eval_map_test.rs", "expected": "2", "stdout": "", "category": "map"}
+{"test_name": "scheme_null", "input": "(null? '())", "file": "crates/sema/tests/eval_core_test.rs", "expected": "#t", "stdout": "", "category": "other"}
+{"test_name": "time_parts_weekday", "input": "(get (time/date-parts 1704067200.0) :weekday)", "file": "crates/sema/tests/eval_stdlib_test.rs", "expected": "\"Monday\"", "stdout": "", "category": "map"}
+{"test_name": "thread_first_bare_fn", "input": "(-> \"hello\" string-length)", "file": "crates/sema/tests/eval_ergonomic_test.rs", "expected": "5", "stdout": "", "category": "string"}
+{"test_name": "inner_define_with_closure_capture", "input": "(begin\n        (define (outer n)\n          (define (inc x) (+ x step))\n          (define step 3)\n          (inc n))\n        (outer 10))", "file": "crates/sema/tests/eval_core_test.rs", "expected": "13", "stdout": "", "category": "arithmetic"}
+{"test_name": "match_quoted_symbol_mismatch", "input": "(match 'world ('hello :yes) (_ :no))", "file": "crates/sema/tests/eval_test.rs", "expected": ":no", "stdout": "", "category": "control-flow"}
+{"test_name": "hash_sha256_deterministic", "input": "(equal? (hash/sha256 \"test\") (hash/sha256 \"test\"))", "file": "crates/sema/tests/eval_data_test.rs", "expected": "#t", "stdout": "", "category": "arithmetic"}
+{"test_name": "while_no_iterations", "input": "(begin (define i 10) (while (< i 0) (set! i (+ i 1))) i)", "file": "crates/sema/tests/eval_core_test.rs", "expected": "10", "stdout": "", "category": "arithmetic"}
+{"test_name": "car_cdr", "input": "(car (cdr '(1 2 3)))", "file": "crates/sema/tests/eval_core_test.rs", "expected": "2", "stdout": "", "category": "list"}
+{"test_name": "stream_writable_true", "input": "(stream/writable? (stream/byte-buffer))", "file": "crates/sema/tests/eval_test.rs", "expected": "#t", "stdout": "", "category": "arithmetic"}
+{"test_name": "match_float_literal", "input": "(match 3.14 (3.14 :pi) (_ :no))", "file": "crates/sema/tests/eval_test.rs", "expected": ":pi", "stdout": "", "category": "control-flow"}
+{"test_name": "regex_literal_basic", "input": "(regex/match? #\"\\d+\" \"abc123\")", "file": "crates/sema/tests/eval_test.rs", "expected": "#t", "stdout": "", "category": "arithmetic"}
+{"test_name": "time_diff_basic", "input": "(time/diff (time/parse \"2024-01-02 00:00:00\" \"%Y-%m-%d %H:%M:%S\") (time/parse \"2024-01-01 00:00:00\" \"%Y-%m-%d %H:%M:%S\"))", "file": "crates/sema/tests/eval_stdlib_test.rs", "expected": "86400.0", "stdout": "", "category": "arithmetic"}
+{"test_name": "stream_int_is_not_stream", "input": "(stream? 42)", "file": "crates/sema/tests/eval_test.rs", "expected": "#f", "stdout": "", "category": "other"}
+{"test_name": "sym_to_string", "input": "(symbol->string 'foo)", "file": "crates/sema/tests/eval_types_test.rs", "expected": "\"foo\"", "stdout": "", "category": "arithmetic"}
+{"test_name": "stream_write_empty", "input": "(stream/write (stream/byte-buffer) (bytevector))", "file": "crates/sema/tests/eval_test.rs", "expected": "0", "stdout": "", "category": "arithmetic"}
+{"test_name": "procedure_pred_native_fn", "input": "(procedure? +)", "file": "crates/sema/tests/eval_test.rs", "expected": "#t", "stdout": "", "category": "arithmetic"}
+{"test_name": "try_side_effect_before_throw", "input": "(begin (define x 0) (try (set! x 1) (throw \"boom\") (catch e x)))", "file": "crates/sema/tests/eval_core_test.rs", "expected": "1", "stdout": "", "category": "binding"}
+{"test_name": "shadow_define", "input": "(begin (define + *) (+ 3 4))", "file": "crates/sema/tests/eval_core_test.rs", "expected": "12", "stdout": "", "category": "arithmetic"}
+{"test_name": "list_drop", "input": "(drop 2 '(1 2 3 4))", "file": "crates/sema/tests/eval_collections_test.rs", "expected": "(3 4)", "stdout": "", "category": "list"}
+{"test_name": "match_empty_vector", "input": "(match '() ([] :empty) (_ :no))", "file": "crates/sema/tests/eval_test.rs", "expected": ":empty", "stdout": "", "category": "control-flow"}
+{"test_name": "pio_irq_mode", "input": "(get (pio/irq :wait 3) :mode)", "file": "crates/sema/tests/eval_test.rs", "expected": ":wait", "stdout": "", "category": "map"}

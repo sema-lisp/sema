@@ -13,4 +13,4 @@ Macro: run the body inside a named OpenTelemetry span carrying an attributes map
 ;; emits one INTERNAL span "ingest-batch"; nested llm/tool spans sit beneath it
 ```
 
-See the Observability guide.
+See the [Observability guide](https://sema-lang.com/docs/llm/observability).

@@ -15,4 +15,4 @@ Record LLM token usage and cost on the innermost active span (typically inside a
     "done"))
 ```
 
-See the Observability guide.
+See the [Observability guide](https://sema-lang.com/docs/llm/observability).

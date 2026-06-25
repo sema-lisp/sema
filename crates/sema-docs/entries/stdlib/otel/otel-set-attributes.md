@@ -13,4 +13,4 @@ Set many attributes on the innermost active span from a map. Keys are keywords o
   (otel/set-attributes {:rows 42 :cache.hit true :table "users"}))
 ```
 
-See the Observability guide.
+See the [Observability guide](https://sema-lang.com/docs/llm/observability).

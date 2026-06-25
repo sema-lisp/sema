@@ -15,4 +15,4 @@ Set the status of the innermost active span. `:ok` marks success; `:error` marks
       (otel/set-status :error "upstream timeout")))
 ```
 
-See the Observability guide.
+See the [Observability guide](https://sema-lang.com/docs/llm/observability).

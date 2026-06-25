@@ -14,4 +14,4 @@ Run a thunk inside a typed **RETRIEVER** span for a retrieval / vector-search st
   {:top-k 5})
 ```
 
-See the Observability guide.
+See the [Observability guide](https://sema-lang.com/docs/llm/observability).

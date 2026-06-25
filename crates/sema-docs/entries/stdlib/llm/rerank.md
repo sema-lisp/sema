@@ -18,4 +18,4 @@ The opts map accepts `:top-k` (keep only the K best), `:model` (override the pro
 ;; => ({:index 1 :score 0.91 :document "use file/read to read a file"} ...)
 ```
 
-See the RAG guide for an end-to-end retrieve → rerank → answer pipeline.
+See the [RAG guide](https://sema-lang.com/docs/llm/rag) for an end-to-end retrieve → rerank → answer pipeline.

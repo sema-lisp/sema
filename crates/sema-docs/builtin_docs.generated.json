@@ -3708,7 +3708,7 @@
       "examples": [
         "(llm/rerank \"how do I read a file?\"\n            (list \"vectors are cool\" \"use file/read to read a file\" \"unrelated trivia\")\n            {:top-k 2})\n;; => ({:index 1 :score 0.91 :document \"use file/read to read a file\"} ...)"
       ],
-      "body": "Reorder `documents` (a list of strings) by their cross-encoder relevance to `query`, using a hosted reranking provider (Cohere, Jina, or Voyage — the same **API key** you use for embeddings, e.g. `COHERE_API_KEY` / `JINA_API_KEY` / `VOYAGE_API_KEY`). Unlike cosine similarity over embeddings, a reranker reads the query and each document *together*, so it is far more precise — the standard RAG move is to retrieve many candidates by vector search, then rerank to the best few.\n\nReturns a list of maps `{:index :score :document}`, highest relevance first. `:index` is the position in the original `documents` list, `:score` the relevance (higher is better; scores are query-dependent, use them for ordering, not as calibrated probabilities).\n\nThe opts map accepts `:top-k` (keep only the K best), `:model` (override the provider's default reranker), and `:provider` (`:cohere` / `:jina` / `:voyage` — defaults to the configured rerank provider).\n\n```sema\n(llm/rerank \"how do I read a file?\"\n            (list \"vectors are cool\" \"use file/read to read a file\" \"unrelated trivia\")\n            {:top-k 2})\n;; => ({:index 1 :score 0.91 :document \"use file/read to read a file\"} ...)\n```\n\nSee the RAG guide for an end-to-end retrieve → rerank → answer pipeline."
+      "body": "Reorder `documents` (a list of strings) by their cross-encoder relevance to `query`, using a hosted reranking provider (Cohere, Jina, or Voyage — the same **API key** you use for embeddings, e.g. `COHERE_API_KEY` / `JINA_API_KEY` / `VOYAGE_API_KEY`). Unlike cosine similarity over embeddings, a reranker reads the query and each document *together*, so it is far more precise — the standard RAG move is to retrieve many candidates by vector search, then rerank to the best few.\n\nReturns a list of maps `{:index :score :document}`, highest relevance first. `:index` is the position in the original `documents` list, `:score` the relevance (higher is better; scores are query-dependent, use them for ordering, not as calibrated probabilities).\n\nThe opts map accepts `:top-k` (keep only the K best), `:model` (override the provider's default reranker), and `:provider` (`:cohere` / `:jina` / `:voyage` — defaults to the configured rerank provider).\n\n```sema\n(llm/rerank \"how do I read a file?\"\n            (list \"vectors are cool\" \"use file/read to read a file\" \"unrelated trivia\")\n            {:top-k 2})\n;; => ({:index 1 :score 0.91 :document \"use file/read to read a file\"} ...)\n```\n\nSee the [RAG guide](https://sema-lang.com/docs/llm/rag) for an end-to-end retrieve → rerank → answer pipeline."
     },
     {
       "name": "llm/reset-usage",
@@ -5271,7 +5271,7 @@
       "examples": [
         "(otel/span \"request\"\n  (fn ()\n    (otel/event \"cache-miss\" {:key \"user:42\"})\n    (fetch-user 42)))"
       ],
-      "body": "Add an event (with optional attributes) to the current OpenTelemetry span. Attribute values are stringified. Returns nil. A no-op when telemetry is disabled or when there is no active span.\n\n**Signature:** `(otel/event name) → nil` · `(otel/event name attrs-map) → nil`\n\n```sema\n(otel/span \"request\"\n  (fn ()\n    (otel/event \"cache-miss\" {:key \"user:42\"})\n    (fetch-user 42)))\n```\n\nTelemetry is opt-in: events are only exported when an OTLP endpoint or `SEMA_OTEL_FILE` is configured. See the Observability guide."
+      "body": "Add an event (with optional attributes) to the current OpenTelemetry span. Attribute values are stringified. Returns nil. A no-op when telemetry is disabled or when there is no active span.\n\n**Signature:** `(otel/event name) → nil` · `(otel/event name attrs-map) → nil`\n\n```sema\n(otel/span \"request\"\n  (fn ()\n    (otel/event \"cache-miss\" {:key \"user:42\"})\n    (fetch-user 42)))\n```\n\nTelemetry is opt-in: events are only exported when an OTLP endpoint or `SEMA_OTEL_FILE` is configured. See the [Observability guide](https://sema-lang.com/docs/llm/observability)."
     },
     {
       "name": "otel/llm-span",
@@ -5281,7 +5281,7 @@
       "examples": [
         "(otel/llm-span {:model \"custom-model\" :provider \"myco\" :operation \"chat\"}\n  (fn ()\n    (let ((resp (my-http-llm-call prompt)))\n      (otel/llm-usage {:input-tokens 120 :output-tokens 30 :cost-usd 0.001})\n      resp)))"
       ],
-      "body": "Run a thunk inside a typed **LLM/generation** span for an LLM call you make yourself (a provider Sema doesn't natively support). The config map supplies `:model`, `:provider`, and `:operation` (default `\"chat\"`); any other keys become span attributes. Sets the `gen_ai.*` request attributes and, when `SEMA_OTEL_COMPAT` is set, the backend-native span-kind — so the call renders as a first-class generation in Phoenix/Traceloop/Langfuse. Account tokens with `otel/llm-usage` inside the thunk. A no-op when telemetry is disabled.\n\n**Signature:** `(otel/llm-span config-map thunk) → any`\n\n```sema\n(otel/llm-span {:model \"custom-model\" :provider \"myco\" :operation \"chat\"}\n  (fn ()\n    (let ((resp (my-http-llm-call prompt)))\n      (otel/llm-usage {:input-tokens 120 :output-tokens 30 :cost-usd 0.001})\n      resp)))\n```\n\nSee the Observability guide."
+      "body": "Run a thunk inside a typed **LLM/generation** span for an LLM call you make yourself (a provider Sema doesn't natively support). The config map supplies `:model`, `:provider`, and `:operation` (default `\"chat\"`); any other keys become span attributes. Sets the `gen_ai.*` request attributes and, when `SEMA_OTEL_COMPAT` is set, the backend-native span-kind — so the call renders as a first-class generation in Phoenix/Traceloop/Langfuse. Account tokens with `otel/llm-usage` inside the thunk. A no-op when telemetry is disabled.\n\n**Signature:** `(otel/llm-span config-map thunk) → any`\n\n```sema\n(otel/llm-span {:model \"custom-model\" :provider \"myco\" :operation \"chat\"}\n  (fn ()\n    (let ((resp (my-http-llm-call prompt)))\n      (otel/llm-usage {:input-tokens 120 :output-tokens 30 :cost-usd 0.001})\n      resp)))\n```\n\nSee the [Observability guide](https://sema-lang.com/docs/llm/observability)."
     },
     {
       "name": "otel/llm-usage",
@@ -5291,7 +5291,7 @@
       "examples": [
         "(otel/llm-span {:model \"custom-model\" :provider \"myco\"}\n  (fn ()\n    (otel/llm-usage {:input-tokens 120 :output-tokens 30 :cost-usd 0.001})\n    \"done\"))"
       ],
-      "body": "Record LLM token usage and cost on the innermost active span (typically inside an `otel/llm-span`). Emits the same `gen_ai.usage.*` keys as the built-in `llm/*` path plus the active backend's compat aliases, so a custom-provider call accounts identically. Map keys: `:input-tokens`, `:output-tokens`, `:cost-usd`. A no-op when telemetry is disabled or there is no active span.\n\n**Signature:** `(otel/llm-usage usage-map) → nil`\n\n```sema\n(otel/llm-span {:model \"custom-model\" :provider \"myco\"}\n  (fn ()\n    (otel/llm-usage {:input-tokens 120 :output-tokens 30 :cost-usd 0.001})\n    \"done\"))\n```\n\nSee the Observability guide."
+      "body": "Record LLM token usage and cost on the innermost active span (typically inside an `otel/llm-span`). Emits the same `gen_ai.usage.*` keys as the built-in `llm/*` path plus the active backend's compat aliases, so a custom-provider call accounts identically. Map keys: `:input-tokens`, `:output-tokens`, `:cost-usd`. A no-op when telemetry is disabled or there is no active span.\n\n**Signature:** `(otel/llm-usage usage-map) → nil`\n\n```sema\n(otel/llm-span {:model \"custom-model\" :provider \"myco\"}\n  (fn ()\n    (otel/llm-usage {:input-tokens 120 :output-tokens 30 :cost-usd 0.001})\n    \"done\"))\n```\n\nSee the [Observability guide](https://sema-lang.com/docs/llm/observability)."
     },
     {
       "name": "otel/retrieval-span",
@@ -5301,7 +5301,7 @@
       "examples": [
         "(otel/retrieval-span \"vector-search\"\n  (fn () (search index query))\n  {:top-k 5})"
       ],
-      "body": "Run a thunk inside a typed **RETRIEVER** span for a retrieval / vector-search step you build yourself. When `SEMA_OTEL_COMPAT` is set it emits the backend-native RETRIEVER span-kind, so a custom RAG step renders like the built-in `vector-store/search` span in Phoenix/Langfuse. Optional third arg is an attributes map. A no-op when telemetry is disabled.\n\n**Signature:** `(otel/retrieval-span name thunk) → any` · `(otel/retrieval-span name thunk attrs) → any`\n\n```sema\n(otel/retrieval-span \"vector-search\"\n  (fn () (search index query))\n  {:top-k 5})\n```\n\nSee the Observability guide."
+      "body": "Run a thunk inside a typed **RETRIEVER** span for a retrieval / vector-search step you build yourself. When `SEMA_OTEL_COMPAT` is set it emits the backend-native RETRIEVER span-kind, so a custom RAG step renders like the built-in `vector-store/search` span in Phoenix/Langfuse. Optional third arg is an attributes map. A no-op when telemetry is disabled.\n\n**Signature:** `(otel/retrieval-span name thunk) → any` · `(otel/retrieval-span name thunk attrs) → any`\n\n```sema\n(otel/retrieval-span \"vector-search\"\n  (fn () (search index query))\n  {:top-k 5})\n```\n\nSee the [Observability guide](https://sema-lang.com/docs/llm/observability)."
     },
     {
       "name": "otel/set-attribute",
@@ -5311,7 +5311,7 @@
       "examples": [
         "(with-span \"fetch\" {}\n  (otel/set-attribute :http.status 200)\n  (otel/set-attribute :cache.hit true))"
       ],
-      "body": "Set one attribute on the innermost active span (the current `otel/span`, `agent/run`, or `llm/*` span). The key is a keyword or string; the value keeps its type — integers, floats, and booleans render as numbers/bools in the backend, not strings. A no-op when telemetry is disabled or there is no active span.\n\n**Signature:** `(otel/set-attribute key value) → nil`\n\n```sema\n(with-span \"fetch\" {}\n  (otel/set-attribute :http.status 200)\n  (otel/set-attribute :cache.hit true))\n```\n\nSee the Observability guide."
+      "body": "Set one attribute on the innermost active span (the current `otel/span`, `agent/run`, or `llm/*` span). The key is a keyword or string; the value keeps its type — integers, floats, and booleans render as numbers/bools in the backend, not strings. A no-op when telemetry is disabled or there is no active span.\n\n**Signature:** `(otel/set-attribute key value) → nil`\n\n```sema\n(with-span \"fetch\" {}\n  (otel/set-attribute :http.status 200)\n  (otel/set-attribute :cache.hit true))\n```\n\nSee the [Observability guide](https://sema-lang.com/docs/llm/observability)."
     },
     {
       "name": "otel/set-attributes",
@@ -5321,7 +5321,7 @@
       "examples": [
         "(with-span \"query\" {}\n  (otel/set-attributes {:rows 42 :cache.hit true :table \"users\"}))"
       ],
-      "body": "Set many attributes on the innermost active span from a map. Keys are keywords or strings; values keep their type (number/bool/string). Equivalent to calling `otel/set-attribute` for each entry. A no-op when telemetry is disabled or there is no active span.\n\n**Signature:** `(otel/set-attributes attrs-map) → nil`\n\n```sema\n(with-span \"query\" {}\n  (otel/set-attributes {:rows 42 :cache.hit true :table \"users\"}))\n```\n\nSee the Observability guide."
+      "body": "Set many attributes on the innermost active span from a map. Keys are keywords or strings; values keep their type (number/bool/string). Equivalent to calling `otel/set-attribute` for each entry. A no-op when telemetry is disabled or there is no active span.\n\n**Signature:** `(otel/set-attributes attrs-map) → nil`\n\n```sema\n(with-span \"query\" {}\n  (otel/set-attributes {:rows 42 :cache.hit true :table \"users\"}))\n```\n\nSee the [Observability guide](https://sema-lang.com/docs/llm/observability)."
     },
     {
       "name": "otel/set-status",
@@ -5331,7 +5331,7 @@
       "examples": [
         "(with-span \"upstream\" {}\n  (if (ok? (call-api))\n      (otel/set-status :ok)\n      (otel/set-status :error \"upstream timeout\")))"
       ],
-      "body": "Set the status of the innermost active span. `:ok` marks success; `:error` marks failure and records an `error.type` attribute plus the optional message. A no-op when telemetry is disabled or there is no active span. (Span-wrapping forms like `otel/span` already set Error status automatically when their body throws — use this for finer control.)\n\n**Signature:** `(otel/set-status :ok) → nil` · `(otel/set-status :error msg) → nil`\n\n```sema\n(with-span \"upstream\" {}\n  (if (ok? (call-api))\n      (otel/set-status :ok)\n      (otel/set-status :error \"upstream timeout\")))\n```\n\nSee the Observability guide."
+      "body": "Set the status of the innermost active span. `:ok` marks success; `:error` marks failure and records an `error.type` attribute plus the optional message. A no-op when telemetry is disabled or there is no active span. (Span-wrapping forms like `otel/span` already set Error status automatically when their body throws — use this for finer control.)\n\n**Signature:** `(otel/set-status :ok) → nil` · `(otel/set-status :error msg) → nil`\n\n```sema\n(with-span \"upstream\" {}\n  (if (ok? (call-api))\n      (otel/set-status :ok)\n      (otel/set-status :error \"upstream timeout\")))\n```\n\nSee the [Observability guide](https://sema-lang.com/docs/llm/observability)."
     },
     {
       "name": "otel/span",
@@ -5341,7 +5341,7 @@
       "examples": [
         "(otel/span \"ingest-batch\"\n  (fn ()\n    (otel/event \"started\" {:batch-size 100})\n    (+ 40 2))\n  {:batch.size 100})\n; => 42  (and emits one INTERNAL span named \"ingest-batch\")"
       ],
-      "body": "Run a thunk inside a named OpenTelemetry INTERNAL span and return the thunk's value. The span ends (recording its duration) when the thunk returns, and is marked with Error status if the thunk throws. An optional attributes map is attached to the span. Any LLM/tool spans created during the thunk nest beneath it. A no-op when telemetry is disabled. The `with-span` macro is the ergonomic form: `(with-span name attrs body…)`.\n\n**Signature:** `(otel/span name thunk) → any` · `(otel/span name thunk attrs) → any`\n\n```sema\n(otel/span \"ingest-batch\"\n  (fn ()\n    (otel/event \"started\" {:batch-size 100})\n    (+ 40 2))\n  {:batch.size 100})\n; => 42  (and emits one INTERNAL span named \"ingest-batch\")\n```\n\nTelemetry is opt-in: spans are only exported when an OTLP endpoint or `SEMA_OTEL_FILE` is configured. See the Observability guide."
+      "body": "Run a thunk inside a named OpenTelemetry INTERNAL span and return the thunk's value. The span ends (recording its duration) when the thunk returns, and is marked with Error status if the thunk throws. An optional attributes map is attached to the span. Any LLM/tool spans created during the thunk nest beneath it. A no-op when telemetry is disabled. The `with-span` macro is the ergonomic form: `(with-span name attrs body…)`.\n\n**Signature:** `(otel/span name thunk) → any` · `(otel/span name thunk attrs) → any`\n\n```sema\n(otel/span \"ingest-batch\"\n  (fn ()\n    (otel/event \"started\" {:batch-size 100})\n    (+ 40 2))\n  {:batch.size 100})\n; => 42  (and emits one INTERNAL span named \"ingest-batch\")\n```\n\nTelemetry is opt-in: spans are only exported when an OTLP endpoint or `SEMA_OTEL_FILE` is configured. See the [Observability guide](https://sema-lang.com/docs/llm/observability)."
     },
     {
       "name": "otel/tool-span",
@@ -5351,7 +5351,7 @@
       "examples": [
         "(otel/tool-span \"lookup-weather\"\n  (fn () (weather \"Oslo\"))\n  {:call-id \"c-1\"})"
       ],
-      "body": "Run a thunk inside a typed **TOOL** span for a tool you invoke yourself. Sets `gen_ai.operation.name` = `execute_tool`, `gen_ai.tool.name` = `name`, and (when `SEMA_OTEL_COMPAT` is set) the backend-native TOOL span-kind, so it classifies like the built-in tool spans. Optional third arg is an attributes map. A no-op when telemetry is disabled.\n\n**Signature:** `(otel/tool-span name thunk) → any` · `(otel/tool-span name thunk attrs) → any`\n\n```sema\n(otel/tool-span \"lookup-weather\"\n  (fn () (weather \"Oslo\"))\n  {:call-id \"c-1\"})\n```\n\nSee the Observability guide."
+      "body": "Run a thunk inside a typed **TOOL** span for a tool you invoke yourself. Sets `gen_ai.operation.name` = `execute_tool`, `gen_ai.tool.name` = `name`, and (when `SEMA_OTEL_COMPAT` is set) the backend-native TOOL span-kind, so it classifies like the built-in tool spans. Optional third arg is an attributes map. A no-op when telemetry is disabled.\n\n**Signature:** `(otel/tool-span name thunk) → any` · `(otel/tool-span name thunk attrs) → any`\n\n```sema\n(otel/tool-span \"lookup-weather\"\n  (fn () (weather \"Oslo\"))\n  {:call-id \"c-1\"})\n```\n\nSee the [Observability guide](https://sema-lang.com/docs/llm/observability)."
     },
     {
       "name": "otel/with-session",
@@ -5361,7 +5361,7 @@
       "examples": [
         "(otel/with-session \"chat-42\" {:user \"alice\"}\n  (fn ()\n    (llm/complete \"...\")          ; grouped under session chat-42, user alice\n    (my-custom-pipeline)))"
       ],
-      "body": "Run a thunk with a session scope: every span started inside (including `llm/*` and `agent/*` calls) is tagged with the session id, grouping the run in session-aware backends (Langfuse Sessions/Users). The optional config map carries `:user`. The previous scope is restored when the thunk returns. A no-op when telemetry is disabled. The `with-session` macro is the ergonomic form.\n\n**Signature:** `(otel/with-session id thunk) → any` · `(otel/with-session id config thunk) → any`\n\n```sema\n(otel/with-session \"chat-42\" {:user \"alice\"}\n  (fn ()\n    (llm/complete \"...\")          ; grouped under session chat-42, user alice\n    (my-custom-pipeline)))\n```\n\nSee the Observability guide."
+      "body": "Run a thunk with a session scope: every span started inside (including `llm/*` and `agent/*` calls) is tagged with the session id, grouping the run in session-aware backends (Langfuse Sessions/Users). The optional config map carries `:user`. The previous scope is restored when the thunk returns. A no-op when telemetry is disabled. The `with-session` macro is the ergonomic form.\n\n**Signature:** `(otel/with-session id thunk) → any` · `(otel/with-session id config thunk) → any`\n\n```sema\n(otel/with-session \"chat-42\" {:user \"alice\"}\n  (fn ()\n    (llm/complete \"...\")          ; grouped under session chat-42, user alice\n    (my-custom-pipeline)))\n```\n\nSee the [Observability guide](https://sema-lang.com/docs/llm/observability)."
     },
     {
       "name": "with-session",
@@ -5371,7 +5371,7 @@
       "examples": [
         "(with-session \"chat-42\" {:user \"alice\"}\n  (llm/complete \"...\")          ; grouped under session chat-42, user alice\n  (my-custom-pipeline))"
       ],
-      "body": "Macro: run the body with a session scope so every span started inside (including `llm/*` and `agent/*` calls) is grouped under the session id in session-aware backends (Langfuse Sessions/Users). The config map carries an optional `:user`; use `{}` for none. The ergonomic form of `(otel/with-session id config thunk)`. A no-op when telemetry is disabled.\n\n```sema\n(with-session \"chat-42\" {:user \"alice\"}\n  (llm/complete \"...\")          ; grouped under session chat-42, user alice\n  (my-custom-pipeline))\n```\n\nSee the Observability guide."
+      "body": "Macro: run the body with a session scope so every span started inside (including `llm/*` and `agent/*` calls) is grouped under the session id in session-aware backends (Langfuse Sessions/Users). The config map carries an optional `:user`; use `{}` for none. The ergonomic form of `(otel/with-session id config thunk)`. A no-op when telemetry is disabled.\n\n```sema\n(with-session \"chat-42\" {:user \"alice\"}\n  (llm/complete \"...\")          ; grouped under session chat-42, user alice\n  (my-custom-pipeline))\n```\n\nSee the [Observability guide](https://sema-lang.com/docs/llm/observability)."
     },
     {
       "name": "with-span",
@@ -5381,7 +5381,7 @@
       "examples": [
         "(with-span \"ingest-batch\" {:batch.size 100}\n  (otel/set-attribute :rows 42)\n  (process-batch))\n;; emits one INTERNAL span \"ingest-batch\"; nested llm/tool spans sit beneath it"
       ],
-      "body": "Macro: run the body inside a named OpenTelemetry span carrying an attributes map, and return the body's value. The span ends on exit (with Error status if the body throws). The ergonomic form of `(otel/span name thunk attrs)`. Use `{}` for no attributes. A no-op when telemetry is disabled.\n\n```sema\n(with-span \"ingest-batch\" {:batch.size 100}\n  (otel/set-attribute :rows 42)\n  (process-batch))\n;; emits one INTERNAL span \"ingest-batch\"; nested llm/tool spans sit beneath it\n```\n\nSee the Observability guide."
+      "body": "Macro: run the body inside a named OpenTelemetry span carrying an attributes map, and return the body's value. The span ends on exit (with Error status if the body throws). The ergonomic form of `(otel/span name thunk attrs)`. Use `{}` for no attributes. A no-op when telemetry is disabled.\n\n```sema\n(with-span \"ingest-batch\" {:batch.size 100}\n  (otel/set-attribute :rows 42)\n  (process-batch))\n;; emits one INTERNAL span \"ingest-batch\"; nested llm/tool spans sit beneath it\n```\n\nSee the [Observability guide](https://sema-lang.com/docs/llm/observability)."
     },
     {
       "name": "pdf/extract-text",

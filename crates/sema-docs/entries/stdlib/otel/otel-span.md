@@ -17,4 +17,4 @@ Run a thunk inside a named OpenTelemetry INTERNAL span and return the thunk's va
 ; => 42  (and emits one INTERNAL span named "ingest-batch")
 ```
 
-Telemetry is opt-in: spans are only exported when an OTLP endpoint or `SEMA_OTEL_FILE` is configured. See the Observability guide.
+Telemetry is opt-in: spans are only exported when an OTLP endpoint or `SEMA_OTEL_FILE` is configured. See the [Observability guide](https://sema-lang.com/docs/llm/observability).

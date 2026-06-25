@@ -15,4 +15,4 @@ Run a thunk with a session scope: every span started inside (including `llm/*` a
     (my-custom-pipeline)))
 ```
 
-See the Observability guide.
+See the [Observability guide](https://sema-lang.com/docs/llm/observability).

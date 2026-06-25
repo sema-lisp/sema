@@ -12,4 +12,4 @@ Macro: run the body with a session scope so every span started inside (including
   (my-custom-pipeline))
 ```
 
-See the Observability guide.
+See the [Observability guide](https://sema-lang.com/docs/llm/observability).

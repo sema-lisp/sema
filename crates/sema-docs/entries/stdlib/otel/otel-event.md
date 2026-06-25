@@ -15,4 +15,4 @@ Add an event (with optional attributes) to the current OpenTelemetry span. Attri
     (fetch-user 42)))
 ```
 
-Telemetry is opt-in: events are only exported when an OTLP endpoint or `SEMA_OTEL_FILE` is configured. See the Observability guide.
+Telemetry is opt-in: events are only exported when an OTLP endpoint or `SEMA_OTEL_FILE` is configured. See the [Observability guide](https://sema-lang.com/docs/llm/observability).

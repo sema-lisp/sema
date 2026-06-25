@@ -14,9 +14,9 @@ impl BackendState {
             None => return vec![],
         };
 
-        // Get the line at cursor
+        // Get the line at cursor (addresses the trailing empty line at EOF).
         let line_idx = position.line as usize;
-        let line = match text.lines().nth(line_idx) {
+        let line = match line_at(text, line_idx) {
             Some(l) => l,
             None => return vec![],
         };

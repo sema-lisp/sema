@@ -235,6 +235,8 @@ fn range_formatting_in_blank_gap_overlaps_nothing() {
 fn parsed_state(uri: &str, source: &str) -> (BackendState, Url) {
     let mut state = BackendState::new_without_builtins(HashMap::new(), "sema".to_string());
     let (ast, span_map, symbol_spans) = sema_reader::read_many_with_symbol_spans(source).unwrap();
+    // Mirror the production build path (server.rs / state.rs): drop quoted symbols.
+    let symbol_spans = crate::helpers::filter_quoted_symbol_spans(&ast, &span_map, symbol_spans);
     let scope_tree = scope::ScopeTree::build(&ast, &span_map, &symbol_spans);
     state.cached_parses.insert(
         uri.to_string(),
@@ -1720,5 +1722,100 @@ fn named_let_binds_loop_name_and_vars() {
     assert!(
         visible.iter().any(|(n, _)| n == "i"),
         "loop var should be bound: {visible:?}"
+    );
+}
+
+// ── Navigation handler correctness (references / rename / robustness) ─────────
+
+#[test]
+fn rename_and_references_ignore_quoted_symbols() {
+    // `foo` appears as code (define + use) and as DATA inside a quoted list. Rename and
+    // references must touch ONLY the code occurrences, never the quoted ones (rewriting
+    // quoted data silently changes the program's meaning).
+    let src = "(define foo 1)\n'(foo bar foo)\n(+ foo 1)";
+    let (state, uri) = parsed_state("file:///q.sema", src);
+    let pos = Position {
+        line: 2,
+        character: 3,
+    }; // the code `foo` in (+ foo 1)
+
+    let refs = state.handle_references(&uri, &pos);
+    assert!(!refs.is_empty(), "should find the code references");
+    assert!(
+        refs.iter().all(|l| l.range.start.line != 1),
+        "quoted foo (line 1) must not be a reference: {refs:?}"
+    );
+
+    let edit = state
+        .handle_rename(&uri, &pos, "baz")
+        .expect("rename a user symbol");
+    let edits = &edit.changes.expect("edits")[&uri];
+    assert!(
+        edits.iter().all(|e| e.range.start.line != 1),
+        "rename must not rewrite the quoted foo on line 1: {edits:?}"
+    );
+    assert!(edits.iter().all(|e| e.new_text == "baz"));
+}
+
+#[test]
+fn references_top_level_skips_shadowing_param() {
+    // A param named `total` shadows the top-level `total` inside `f`. References on the
+    // top-level binding must NOT include the shadowing param/use on line 1.
+    let src = "(define total 1)\n(defun f (total) total)\n(+ total 1)";
+    let (state, uri) = parsed_state("file:///shadow.sema", src);
+    let refs = state.handle_references(
+        &uri,
+        &Position {
+            line: 2,
+            character: 3,
+        },
+    );
+    assert!(
+        refs.iter().all(|l| l.range.start.line != 1),
+        "shadowed param scope (line 1) must be excluded: {refs:?}"
+    );
+}
+
+#[test]
+fn navigation_handlers_tolerate_past_eof_and_unopened_uri() {
+    // Graceful degradation: a position past EOF and a never-opened URI must not panic.
+    let (mut state, uri) = parsed_state("file:///e.sema", "(define x 1)");
+    let past = Position {
+        line: 999,
+        character: 0,
+    };
+    assert!(state.handle_hover(&uri, &past).is_none());
+    assert!(state.handle_document_highlight(&uri, &past).is_none());
+    assert!(state.handle_references(&uri, &past).is_empty());
+    let ghost = Url::parse("file:///never-opened.sema").unwrap();
+    assert!(state
+        .handle_references(
+            &ghost,
+            &Position {
+                line: 0,
+                character: 0
+            }
+        )
+        .is_empty());
+}
+
+#[test]
+fn completion_works_on_trailing_empty_line_after_newline() {
+    // Cursor on the empty line after a trailing `\n` (where you type a new top-level
+    // form) — `str::lines()` drops that line; completion must still fire.
+    let (mut state, uri) = parsed_state("file:///t.sema", "(define x 1)\n");
+    state
+        .documents
+        .insert(uri.as_str().to_string(), "(define x 1)\n".to_string());
+    let items = state.handle_complete(
+        &uri,
+        &Position {
+            line: 1,
+            character: 0,
+        },
+    );
+    assert!(
+        !items.is_empty(),
+        "completion should offer items on the trailing empty line"
     );
 }

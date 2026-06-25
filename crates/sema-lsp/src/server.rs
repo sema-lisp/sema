@@ -820,6 +820,9 @@ pub async fn run_server() {
                         state.cached_user_defs.insert(uri_str.clone(), defs);
                     }
 
+                    // Drop quoted (data) symbol occurrences so rename/references/highlight
+                    // never rewrite quoted literals (a silent program-meaning change).
+                    let symbol_spans = filter_quoted_symbol_spans(&ast, &span_map, symbol_spans);
                     let scope_tree = scope::ScopeTree::build(&ast, &span_map, &symbol_spans);
                     state.cached_parses.insert(
                         uri_str.clone(),

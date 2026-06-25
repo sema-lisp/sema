@@ -386,6 +386,8 @@ impl BackendState {
         // Read and parse the file
         let text = std::fs::read_to_string(path).ok()?;
         let (ast, span_map, symbol_spans) = sema_reader::read_many_with_symbol_spans(&text).ok()?;
+        // Drop quoted (data) symbol occurrences (see filter_quoted_symbol_spans).
+        let symbol_spans = filter_quoted_symbol_spans(&ast, &span_map, symbol_spans);
         let scope_tree = scope::ScopeTree::build(&ast, &span_map, &symbol_spans);
 
         self.import_cache.insert(

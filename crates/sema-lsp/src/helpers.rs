@@ -79,6 +79,15 @@ pub(crate) fn expr_span<'a>(expr: &sema_core::Value, span_map: &'a SpanMap) -> O
     span_map.get(&ptr)
 }
 
+/// The text of line `idx` (0-based) for an LSP position. Unlike `str::lines()`, this
+/// addresses the trailing empty line produced by a final `\n` (where the cursor sits
+/// when typing a new top-level form) and strips a trailing `\r`.
+pub(crate) fn line_at(text: &str, idx: usize) -> Option<&str> {
+    text.split('\n')
+        .nth(idx)
+        .map(|l| l.strip_suffix('\r').unwrap_or(l))
+}
+
 /// Check if `inner` span is fully contained within `outer` span.
 pub(crate) fn span_contains(outer: &Span, inner: &Span) -> bool {
     let inner_start = (inner.line, inner.col);
@@ -86,6 +95,113 @@ pub(crate) fn span_contains(outer: &Span, inner: &Span) -> bool {
     let outer_start = (outer.line, outer.col);
     let outer_end = (outer.end_line, outer.end_col);
     inner_start >= outer_start && inner_end <= outer_end
+}
+
+/// Drop symbol occurrences that sit inside quoted (data) regions — a `(quote …)` form,
+/// or the non-unquoted parts of a `(quasiquote …)`. Quoted symbols are DATA, not code
+/// references: including them makes rename/references/highlight rewrite quoted literals
+/// (`(rename foo bar)` would silently rewrite `'(foo)` and change the program's meaning).
+pub(crate) fn filter_quoted_symbol_spans(
+    ast: &[sema_core::Value],
+    span_map: &SpanMap,
+    symbol_spans: Vec<(String, Span)>,
+) -> Vec<(String, Span)> {
+    let mut excl: Vec<Span> = Vec::new(); // quoted regions (data)
+    let mut reincl: Vec<Span> = Vec::new(); // `,x` / `,@x` holes inside quasiquote (code)
+    for e in ast {
+        collect_quote_regions(e, span_map, &symbol_spans, false, &mut excl, &mut reincl);
+    }
+    if excl.is_empty() {
+        return symbol_spans;
+    }
+    symbol_spans
+        .into_iter()
+        .filter(|(_, s)| {
+            let quoted = excl.iter().any(|q| span_contains(q, s))
+                && !reincl.iter().any(|u| span_contains(u, s));
+            !quoted
+        })
+        .collect()
+}
+
+/// The span covering a quoted/unquoted ARGUMENT. The `'`/`,` head span only covers the
+/// glyph, so the data is the argument's own extent: a list's `expr_span`, or a bare
+/// symbol's token — which begins exactly where the head glyph ends.
+fn quoted_arg_span(
+    arg: &sema_core::Value,
+    span_map: &SpanMap,
+    symbol_spans: &[(String, Span)],
+    head_span: &Span,
+) -> Option<Span> {
+    if let Some(s) = expr_span(arg, span_map) {
+        return Some(*s);
+    }
+    if arg.as_symbol().is_some() {
+        return symbol_spans
+            .iter()
+            .find(|(_, sp)| sp.line == head_span.end_line && sp.col == head_span.end_col)
+            .map(|(_, sp)| *sp);
+    }
+    None
+}
+
+/// Recursively mark quoted regions (and the unquoted holes inside quasiquote) for
+/// [`filter_quoted_symbol_spans`]. A plain `(quote …)` is wholly data; `(quasiquote …)`
+/// is data except inside `(unquote …)` / `(unquote-splicing …)`, which is code again.
+fn collect_quote_regions(
+    expr: &sema_core::Value,
+    span_map: &SpanMap,
+    symbol_spans: &[(String, Span)],
+    in_quote: bool,
+    excl: &mut Vec<Span>,
+    reincl: &mut Vec<Span>,
+) {
+    let Some(items) = expr.as_list() else {
+        return;
+    };
+    let head = items.first().and_then(|v| v.as_symbol());
+    let form_span = expr_span(expr, span_map).copied();
+    match head.as_deref() {
+        Some("quote") if !in_quote => {
+            if let Some(fs) = form_span {
+                for arg in items.iter().skip(1) {
+                    if let Some(s) = quoted_arg_span(arg, span_map, symbol_spans, &fs) {
+                        excl.push(s);
+                    }
+                }
+            }
+            // plain quote has no unquote semantics — the argument is wholly data.
+        }
+        Some("quasiquote") if !in_quote => {
+            if let Some(fs) = form_span {
+                for arg in items.iter().skip(1) {
+                    if let Some(s) = quoted_arg_span(arg, span_map, symbol_spans, &fs) {
+                        excl.push(s);
+                    }
+                }
+            }
+            for item in items.iter() {
+                collect_quote_regions(item, span_map, symbol_spans, true, excl, reincl);
+            }
+        }
+        Some("unquote") | Some("unquote-splicing") if in_quote => {
+            if let Some(fs) = form_span {
+                for arg in items.iter().skip(1) {
+                    if let Some(s) = quoted_arg_span(arg, span_map, symbol_spans, &fs) {
+                        reincl.push(s);
+                    }
+                }
+            }
+            for item in items.iter().skip(1) {
+                collect_quote_regions(item, span_map, symbol_spans, false, excl, reincl);
+            }
+        }
+        _ => {
+            for item in items.iter() {
+                collect_quote_regions(item, span_map, symbol_spans, in_quote, excl, reincl);
+            }
+        }
+    }
 }
 
 /// Find the precise span of a symbol `name` within a form's span.

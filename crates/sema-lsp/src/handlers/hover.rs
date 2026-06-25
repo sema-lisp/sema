@@ -13,7 +13,7 @@ impl BackendState {
         let uri_str = uri.as_str();
         let text = self.documents.get(uri_str)?;
         let line_idx = position.line as usize;
-        let line = text.lines().nth(line_idx)?;
+        let line = line_at(text, line_idx)?;
         let byte_offset = utf16_to_byte_offset(line, position.character);
         let symbol = extract_symbol_at(line, byte_offset).to_string();
         if symbol.is_empty() {

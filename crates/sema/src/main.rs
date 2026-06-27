@@ -1132,32 +1132,56 @@ fn run_notebook_command(command: NotebookCommands) {
                 }
             };
 
-            let results = if let Some(cell_spec) = cells {
+            // Collect the code cell IDs to evaluate, either specific indices
+            // (--cells 1,3,5) or all code cells.
+            let cell_ids: Vec<String> = if let Some(cell_spec) = &cells {
                 let indices: Vec<usize> = cell_spec
                     .split(',')
                     .filter_map(|s| s.trim().parse().ok())
                     .collect();
-                engine.eval_cells(&indices)
+                engine
+                    .notebook
+                    .cells
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, c)| {
+                        if indices.contains(&(i + 1))
+                            && c.cell_type == sema_notebook::format::CellType::Code
+                        {
+                            Some(c.id.clone())
+                        } else {
+                            None
+                        }
+                    })
+                    .collect()
             } else {
-                engine.eval_all()
+                engine
+                    .notebook
+                    .cells
+                    .iter()
+                    .filter(|c| c.cell_type == sema_notebook::format::CellType::Code)
+                    .map(|c| c.id.clone())
+                    .collect()
             };
 
+            let total = cell_ids.len();
             let mut had_error = false;
-            for (id, result) in &results {
-                match result {
+
+            for (i, id) in cell_ids.into_iter().enumerate() {
+                match engine.eval_cell(&id) {
                     Ok(r) => {
                         if !r.stdout.is_empty() {
-                            print!("[{id}] (stdout) {}", r.stdout);
+                            print!("[{}/{}] (stdout) {}", i + 1, total, r.stdout);
                         }
                         if !r.output.display.is_empty() {
-                            println!("[{id}] {}", r.output.display);
+                            println!("[{}/{}] {}", i + 1, total, r.output.display);
                         }
                         if r.output.output_type == sema_notebook::format::OutputType::Error {
                             had_error = true;
                         }
                     }
                     Err(e) => {
-                        eprintln!("[{id}] Error: {e}");
+                        eprintln!("[{}/{}] Error: {e}", i + 1, total);
                         had_error = true;
                     }
                 }

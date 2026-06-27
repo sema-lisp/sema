@@ -38,6 +38,7 @@ import httpx
 SCRIPT_DIR = Path(__file__).parent
 SEMA_BINARY = str(SCRIPT_DIR.parent / "target" / "debug" / "sema")
 MAX_TOOL_ROUNDS = 5
+DEFAULT_MAX_TOKENS = 4096
 
 TOOL_DEFS = [
     {"type": "function", "function": {
@@ -55,7 +56,7 @@ TOOL_DEFS = [
 
 # ─── API Call ─────────────────────────────────────────────────────────────────
 
-def call_model(base_url, api_key, model, messages, tools=None, max_tokens=2048,
+def call_model(base_url, api_key, model, messages, tools=None, max_tokens=DEFAULT_MAX_TOKENS,
                temperature=0.0, top_p=1.0, force_tool=False):
     """Call an OpenAI-compatible chat completions endpoint."""
     url = f"{base_url.rstrip('/')}/chat/completions"
@@ -290,8 +291,6 @@ def run_task(base_url, api_key, model, system_prompt, task, sema_path,
         choice = resp.get("choices", [{}])[0]
         msg = choice.get("message", {})
         content = msg.get("content", "") or ""
-        # Strip reasoning content if present
-        reasoning = getattr(msg, "reasoning_content", None)
         score, detail = grade_task(task, content, sema_path)
         return score, detail, 0, content[:500], 1
 

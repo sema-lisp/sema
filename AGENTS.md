@@ -21,6 +21,7 @@
 - **sema-notebook** → `.sema-nb` JSON notebook format, eval engine, HTTP server + REST API, embedded browser UI, Markdown export
 - **sema-mcp** → Model Context Protocol server exposing Sema eval/build/notebook tools to AI agents
 - **sema-otel** → OpenTelemetry facade (spans/metrics); native-only, no-op on wasm32
+- **sema-workflow** → Dynamic-workflow runtime: journals a frozen JSONL run-directory, bounded concurrency for leaves, `--resume` via memo sidecar. Leaf crate — depends only on sema-core + sema-otel.
 - **sema-fmt** → Code formatter for Sema source files
 - **sema-wasm** → WASM bindings for browser playground
 - **sema** → Binary (clap CLI + reedline REPL) + `sema build` (standalone executables) + `sema compile`/`sema disasm` + `sema lsp` + `sema dap` + `sema fmt` + integration tests

@@ -185,6 +185,30 @@ fn resume_does_not_evaluate_memoized_checkpoint_write_expression() {
 }
 
 #[test]
+fn checkpoint_event_content_key_points_to_memo_file() {
+    let base = temp_run_dir("resume-content-key");
+    let run_id = "wf_resume_content_key";
+    let r = run_workflow(WF, fresh_fake(), RunOpts::fresh(run_id, &base));
+    assert_eq!(r.result["status"], "success");
+
+    let checkpoints = workflow_common::events_of(&r.events, "checkpoint");
+    let content_key = checkpoints[0]["content_key"]
+        .as_str()
+        .expect("checkpoint event carries content_key");
+    let memo_path = base
+        .join(run_id)
+        .join("memo")
+        .join(format!("{content_key}.json"));
+    assert!(
+        memo_path.is_file(),
+        "checkpoint content_key must point to its memo sidecar: {}",
+        memo_path.display()
+    );
+
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
 fn editing_the_workflow_invalidates_memos_and_reruns() {
     let base = temp_run_dir("resume-inval");
     let r1 = run_workflow(WF, fresh_fake(), RunOpts::fresh("wf_resume_inval", &base));

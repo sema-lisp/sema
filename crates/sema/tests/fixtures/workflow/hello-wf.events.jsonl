@@ -1,8 +1,8 @@
 {"event":"run.started","seq":0,"ts":"0","workflow":"hello-wf","run_id":"wf_test_0001","args_json":"{\"name\":\"x\"}"}
 {"event":"phase.started","seq":1,"ts":"0","phase":"Inventory"}
-{"event":"checkpoint","seq":2,"ts":"0","phase_seq":1,"key":"files","content_key":"ck_bebde8b2","value_digest":"dc071858552dae9a60200b0a36a13dd3","value":"(\"a.php\" \"b.php\" \"c.php\")"}
+{"event":"checkpoint","seq":2,"ts":"0","phase_seq":1,"key":"files","content_key":"cb7c694369dc0fbf_0","value_digest":"dc071858552dae9a60200b0a36a13dd3","value":"(\"a.php\" \"b.php\" \"c.php\")"}
 {"event":"phase.ended","seq":3,"ts":"0","phase":"Inventory","status":"success","dur_ms":0}
 {"event":"phase.started","seq":4,"ts":"0","phase":"Audit"}
-{"event":"checkpoint","seq":5,"ts":"0","phase_seq":4,"key":"findings","content_key":"ck_269c187b","value_digest":"eccbc87e4b5ce2fe28308fd9f2a7baf3","value":"3"}
+{"event":"checkpoint","seq":5,"ts":"0","phase_seq":4,"key":"findings","content_key":"b21c32efb9bbbd18_0","value_digest":"eccbc87e4b5ce2fe28308fd9f2a7baf3","value":"3"}
 {"event":"phase.ended","seq":6,"ts":"0","phase":"Audit","status":"success","dur_ms":0}
 {"event":"run.ended","seq":7,"ts":"0","status":"success","dur_ms":0}

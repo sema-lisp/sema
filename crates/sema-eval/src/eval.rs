@@ -1,5 +1,5 @@
 use std::cell::RefCell;
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::rc::Rc;
 
 use sema_core::{
@@ -262,7 +262,41 @@ fn expand_macros_in(ctx: &EvalContext, env: &Env, expr: &Value) -> EvalResult {
             return Ok(Value::list(expanded));
         }
     }
-    Ok(expr.clone())
+
+    match expr.view() {
+        ValueView::Vector(items) => {
+            let expanded: Vec<Value> = items
+                .iter()
+                .map(|v| expand_macros_in(ctx, env, v))
+                .collect::<Result<_, _>>()?;
+            let changed = expanded
+                .iter()
+                .zip(items.iter())
+                .any(|(a, b)| a.raw_bits() != b.raw_bits());
+            if changed {
+                Ok(Value::vector(expanded))
+            } else {
+                Ok(expr.clone())
+            }
+        }
+        ValueView::Map(map) => {
+            let mut changed = false;
+            let mut expanded = BTreeMap::new();
+            for (key, value) in map.iter() {
+                let expanded_key = expand_macros_in(ctx, env, key)?;
+                let expanded_value = expand_macros_in(ctx, env, value)?;
+                changed |= expanded_key.raw_bits() != key.raw_bits()
+                    || expanded_value.raw_bits() != value.raw_bits();
+                expanded.insert(expanded_key, expanded_value);
+            }
+            if changed {
+                Ok(Value::map(expanded))
+            } else {
+                Ok(expr.clone())
+            }
+        }
+        _ => Ok(expr.clone()),
+    }
 }
 
 /// Compile and run a `load`ed module body on the VM, one top-level form at a

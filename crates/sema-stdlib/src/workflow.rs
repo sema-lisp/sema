@@ -453,13 +453,12 @@ pub fn register(env: &sema_core::Env) {
             let value = crate::list::call_function(&args[1], &[])?;
             ctx.store_checkpoint(&key, value.clone());
             let digest = ctx.value_digest(&value);
-            let content_key = ctx.content_key(&key, &digest);
             ctx.emit(WorkflowEvent::Checkpoint {
                 seq: ctx.next_seq(),
                 ts: ctx.ts(),
                 phase_seq: ctx.phase_seq(),
                 key: key.clone(),
-                content_key,
+                content_key: resume_key.clone(),
                 value_digest: digest,
                 value: capped_render(&value), // the real checkpointed value, for the dashboard
             });

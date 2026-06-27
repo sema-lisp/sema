@@ -189,6 +189,8 @@ eval_tests! {
     read_parse: r#"(eval (read "(+ 10 20)"))"# => Value::int(30),
     macroexpand_basic: "(begin (defmacro my-if (c t e) (list 'if c t e)) (macroexpand '(my-if #t 1 2)))" => Value::list(vec![Value::symbol("if"), Value::bool(true), Value::int(1), Value::int(2)]),
     defmacro_basic: "(begin (defmacro my-if (c t e) (list 'if c t e)) (my-if #t 1 2))" => Value::int(1),
+    defmacro_inside_map_literal: "(begin (defmacro one () 1) (:x {:x (one)}))" => Value::int(1),
+    defmacro_inside_vector_literal: "(begin (defmacro one () 1) (nth [(one)] 0))" => Value::int(1),
     gensym_symbol: "(symbol? (gensym))" => Value::bool(true),
 }
 

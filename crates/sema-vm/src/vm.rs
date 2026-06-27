@@ -10,8 +10,8 @@ use sema_core::{
 };
 
 use crate::chunk::Function;
-use crate::opcodes::Op;
 use crate::opcodes::op;
+use crate::opcodes::Op;
 
 const DEBUG_VALUE_REF_BASE: u64 = crate::debug::DEBUG_VALUE_REF_BASE;
 
@@ -3506,8 +3506,8 @@ impl VM {
         let pc32 = pc as u32;
         let spans = &frame.closure.func.chunk.spans;
         match spans.binary_search_by_key(&pc32, |(p, _)| *p) {
-            Ok(idx) => Some(spans[idx].1.clone()),
-            Err(idx) if idx > 0 => Some(spans[idx - 1].1.clone()),
+            Ok(idx) => Some(spans[idx].1),
+            Err(idx) if idx > 0 => Some(spans[idx - 1].1),
             _ => None,
         }
     }

@@ -957,11 +957,7 @@ fn run_workflow_command(command: WorkflowCommands, sandbox: &sema_core::Sandbox)
             }
             return;
         }
-        WorkflowCommands::Check {
-            file,
-            strict,
-            json,
-        } => {
+        WorkflowCommands::Check { file, strict, json } => {
             let src = match read_source_file(&file) {
                 Ok(s) => s,
                 Err(msg) => {

@@ -8,7 +8,8 @@ Run a sequential, journaled workflow and return its discriminated-union `{:statu
 
 ```sema
 (defworkflow hello "demo" {:args {:name :string}}
-  (phase "Inventory" (checkpoint :files (list "a" "b")))
+  (phase "Inventory")                       ; marker — body forms follow as siblings
+  (checkpoint :files (list "a" "b"))
   {:status :success :files (checkpoint :files)})
 ```
 

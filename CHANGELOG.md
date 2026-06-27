@@ -4,6 +4,17 @@
 
 ### Added
 
+- **Dynamic workflows.** `defworkflow` / `phase` / `agent` / `checkpoint` /
+  `parallel` / `pipeline` — a journaled, resumable agent-pipeline runtime.
+  Define multi-phase LLM workflows as ordinary Sema code; the runtime journals
+  every event to a frozen JSONL run directory (`.sema/runs/<run-id>/`), enforces
+  budget caps (`:tokens` / `:usd`), and supports `--resume` via content-keyed
+  memo sidecars. `sema workflow run` / `view` / `index` / `check` CLI commands.
+  A web viewer (`sema workflow view`) renders live runs with a SQLite cross-run
+  index. `sema workflow check` statically validates workflow files without
+  evaluating them — catches arity traps and layout issues before a run.
+  Doc entries for all workflow builtins are available in LSP hover/completion.
+  Feature page at [/feature/workflows](https://sema-lang.com/feature/workflows).
 - **`:stack-trace` on caught error maps.** The VM now captures the call stack
   at error time and serializes it as a `:stack-trace` field on caught error
   maps — a list of `{:name :file :line :col}` frame maps, innermost first.

@@ -4,15 +4,21 @@ use crate::types::{
     RerankResponse, RerankResult, Usage,
 };
 
-/// The two hosted-rerank wire dialects behind the OpenAI-compatible embedding providers.
+/// The hosted-rerank wire dialects behind the OpenAI-compatible embedding providers.
 /// They share `POST {base}/rerank` + `{model, query, documents}` but differ in the
-/// top-K parameter name and the results array key.
+/// top-K parameter name, the results array key, or the default model.
 #[derive(Clone, Copy)]
 pub enum RerankDialect {
     /// Jina: `top_n` parameter, `results` array. Default model `jina-reranker-v2-base-multilingual`.
     Jina,
     /// Voyage: `top_k` parameter, `data` array. Default model `rerank-2.5`.
     Voyage,
+    /// Nomic: `top_n` parameter, `results` array. Default model `nomic-rerank-v1.5`.
+    Nomic,
+    /// Together AI: `top_n` parameter, `results` array. Default model `BAAI/bge-reranker-v2-m3`.
+    Together,
+    /// Fireworks AI: `top_n` parameter, `results` array. Default model `nvidia/nv-rerankqa-mistral4b-v3`.
+    Fireworks,
 }
 
 impl RerankDialect {
@@ -20,18 +26,27 @@ impl RerankDialect {
         match self {
             RerankDialect::Jina => "jina-reranker-v2-base-multilingual",
             RerankDialect::Voyage => "rerank-2.5",
+            RerankDialect::Nomic => "nomic-rerank-v1.5",
+            RerankDialect::Together => "BAAI/bge-reranker-v2-m3",
+            RerankDialect::Fireworks => "nvidia/nv-rerankqa-mistral4b-v3",
         }
     }
     fn top_k_param(self) -> &'static str {
         match self {
             RerankDialect::Jina => "top_n",
             RerankDialect::Voyage => "top_k",
+            RerankDialect::Nomic => "top_n",
+            RerankDialect::Together => "top_n",
+            RerankDialect::Fireworks => "top_n",
         }
     }
     fn results_key(self) -> &'static str {
         match self {
             RerankDialect::Jina => "results",
             RerankDialect::Voyage => "data",
+            RerankDialect::Nomic => "results",
+            RerankDialect::Together => "results",
+            RerankDialect::Fireworks => "results",
         }
     }
 }

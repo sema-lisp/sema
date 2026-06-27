@@ -242,7 +242,11 @@ fn resolve_expr_inner(expr: &CoreExpr, r: &mut Resolver) -> Result<ResolvedExpr,
             // reference each other (letrec* semantics / R5RS internal defines).
             if !(r.current().is_top_level && r.current().blocks.len() == 1) {
                 for expr in exprs {
-                    if let CoreExpr::Define(spur, _) = expr {
+                    let inner = match expr {
+                        CoreExpr::Spanned(_, inner) => inner.as_ref(),
+                        other => other,
+                    };
+                    if let CoreExpr::Define(spur, _) = inner {
                         if r.current().find_local(*spur).is_none() {
                             r.define_local(*spur);
                         }
@@ -434,7 +438,11 @@ fn resolve_exprs(exprs: &[CoreExpr], r: &mut Resolver) -> Result<Vec<ResolvedExp
 fn resolve_body(exprs: &[CoreExpr], r: &mut Resolver) -> Result<Vec<ResolvedExpr>, SemaError> {
     if !(r.current().is_top_level && r.current().blocks.len() == 1) {
         for expr in exprs {
-            if let CoreExpr::Define(spur, _) = expr {
+            let inner = match expr {
+                CoreExpr::Spanned(_, inner) => inner.as_ref(),
+                other => other,
+            };
+            if let CoreExpr::Define(spur, _) = inner {
                 if r.current().find_local(*spur).is_none() {
                     r.define_local(*spur);
                 }
@@ -562,7 +570,11 @@ fn resolve_letrec(
     // Also pre-register body defines so letrec inits can reference them
     // (R5RS: internal defines in letrec body are visible to init expressions)
     for expr in body {
-        if let CoreExpr::Define(spur, _) = expr {
+        let inner = match expr {
+            CoreExpr::Spanned(_, inner) => inner.as_ref(),
+            other => other,
+        };
+        if let CoreExpr::Define(spur, _) = inner {
             if r.current().find_local(*spur).is_none() {
                 r.define_local(*spur);
             }

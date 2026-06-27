@@ -1127,6 +1127,139 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
                     reg.register(Box::new(provider));
                     reg.set_default("moonshot");
                 }
+                "deepseek" => {
+                    let api_key = api_key
+                        .clone()
+                        .ok_or_else(|| SemaError::Llm("missing :api-key".to_string()))?;
+                    let model = get_opt_string(&opts, "default-model")
+                        .unwrap_or_else(|| "deepseek-v4-flash".to_string());
+                    let base_url = get_opt_string(&opts, "base-url")
+                        .unwrap_or_else(|| "https://api.deepseek.com".to_string());
+                    let provider = OpenAiProvider::named(
+                        "deepseek".to_string(),
+                        api_key,
+                        base_url,
+                        model,
+                        false,
+                    )
+                    .map_err(|e| SemaError::Llm(e.to_string()))?;
+                    reg.register(Box::new(provider));
+                    reg.set_default("deepseek");
+                }
+                "openrouter" => {
+                    let api_key = api_key
+                        .clone()
+                        .ok_or_else(|| SemaError::Llm("missing :api-key".to_string()))?;
+                    let model = get_opt_string(&opts, "default-model")
+                        .unwrap_or_else(|| "openai/gpt-5.2".to_string());
+                    let base_url = get_opt_string(&opts, "base-url")
+                        .unwrap_or_else(|| "https://openrouter.ai/api/v1".to_string());
+                    let provider = OpenAiProvider::named(
+                        "openrouter".to_string(),
+                        api_key,
+                        base_url,
+                        model,
+                        true,
+                    )
+                    .map_err(|e| SemaError::Llm(e.to_string()))?;
+                    reg.register(Box::new(provider));
+                    reg.set_default("openrouter");
+                }
+                "together" => {
+                    let api_key = api_key
+                        .clone()
+                        .ok_or_else(|| SemaError::Llm("missing :api-key".to_string()))?;
+                    let model = get_opt_string(&opts, "default-model")
+                        .unwrap_or_else(|| "meta-llama/Llama-4-Scout-17B-16E-Instruct".to_string());
+                    let base_url = get_opt_string(&opts, "base-url")
+                        .unwrap_or_else(|| "https://api.together.ai/v1".to_string());
+                    let provider = OpenAiProvider::named(
+                        "together".to_string(),
+                        api_key,
+                        base_url,
+                        model,
+                        false,
+                    )
+                    .map_err(|e| SemaError::Llm(e.to_string()))?;
+                    reg.register(Box::new(provider));
+                    reg.set_default("together");
+                }
+                "fireworks" => {
+                    let api_key = api_key
+                        .clone()
+                        .ok_or_else(|| SemaError::Llm("missing :api-key".to_string()))?;
+                    let model = get_opt_string(&opts, "default-model")
+                        .unwrap_or_else(|| "accounts/fireworks/models/gpt-oss-120b".to_string());
+                    let base_url = get_opt_string(&opts, "base-url")
+                        .unwrap_or_else(|| "https://api.fireworks.ai/inference/v1".to_string());
+                    let provider = OpenAiProvider::named(
+                        "fireworks".to_string(),
+                        api_key,
+                        base_url,
+                        model,
+                        false,
+                    )
+                    .map_err(|e| SemaError::Llm(e.to_string()))?;
+                    reg.register(Box::new(provider));
+                    reg.set_default("fireworks");
+                }
+                "cerebras" => {
+                    let api_key = api_key
+                        .clone()
+                        .ok_or_else(|| SemaError::Llm("missing :api-key".to_string()))?;
+                    let model = get_opt_string(&opts, "default-model")
+                        .unwrap_or_else(|| "gpt-oss-120b".to_string());
+                    let base_url = get_opt_string(&opts, "base-url")
+                        .unwrap_or_else(|| "https://api.cerebras.ai/v1".to_string());
+                    let provider = OpenAiProvider::named(
+                        "cerebras".to_string(),
+                        api_key,
+                        base_url,
+                        model,
+                        false,
+                    )
+                    .map_err(|e| SemaError::Llm(e.to_string()))?;
+                    reg.register(Box::new(provider));
+                    reg.set_default("cerebras");
+                }
+                "sambanova" => {
+                    let api_key = api_key
+                        .clone()
+                        .ok_or_else(|| SemaError::Llm("missing :api-key".to_string()))?;
+                    let model = get_opt_string(&opts, "default-model")
+                        .unwrap_or_else(|| "Meta-Llama-3.3-70B-Instruct".to_string());
+                    let base_url = get_opt_string(&opts, "base-url")
+                        .unwrap_or_else(|| "https://api.sambanova.ai/v1".to_string());
+                    let provider = OpenAiProvider::named(
+                        "sambanova".to_string(),
+                        api_key,
+                        base_url,
+                        model,
+                        false,
+                    )
+                    .map_err(|e| SemaError::Llm(e.to_string()))?;
+                    reg.register(Box::new(provider));
+                    reg.set_default("sambanova");
+                }
+                "perplexity" => {
+                    let api_key = api_key
+                        .clone()
+                        .ok_or_else(|| SemaError::Llm("missing :api-key".to_string()))?;
+                    let model = get_opt_string(&opts, "default-model")
+                        .unwrap_or_else(|| "sonar-pro".to_string());
+                    let base_url = get_opt_string(&opts, "base-url")
+                        .unwrap_or_else(|| "https://api.perplexity.ai".to_string());
+                    let provider = OpenAiProvider::named(
+                        "perplexity".to_string(),
+                        api_key,
+                        base_url,
+                        model,
+                        false,
+                    )
+                    .map_err(|e| SemaError::Llm(e.to_string()))?;
+                    reg.register(Box::new(provider));
+                    reg.set_default("perplexity");
+                }
                 "ollama" => {
                     let host =
                         get_opt_string(&opts, "host").or_else(|| get_opt_string(&opts, "base-url"));
@@ -1183,6 +1316,24 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
                     reg.register(Box::new(provider));
                     reg.set_embedding_provider("cohere");
                     reg.set_rerank_provider("cohere");
+                }
+                "nomic" => {
+                    let api_key = api_key
+                        .clone()
+                        .ok_or_else(|| SemaError::Llm("missing :api-key".to_string()))?;
+                    let model = get_opt_string(&opts, "default-model")
+                        .unwrap_or_else(|| "nomic-embed-text-v1.5".to_string());
+                    let provider = OpenAiCompatEmbeddingProvider::new(
+                        "nomic".to_string(),
+                        api_key,
+                        "https://api.nomic.ai/v1".to_string(),
+                        model,
+                    )
+                    .map_err(|e| SemaError::Llm(e.to_string()))?
+                    .with_rerank(crate::embeddings::RerankDialect::Nomic);
+                    reg.register(Box::new(provider));
+                    reg.set_embedding_provider("nomic");
+                    reg.set_rerank_provider("nomic");
                 }
                 other => {
                     // Treat unknown providers as OpenAI-compatible if base-url and api-key are provided
@@ -1403,6 +1554,146 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
                     }
                 }
             }
+            // Try DeepSeek
+            if let Ok(key) = std::env::var("DEEPSEEK_API_KEY") {
+                if !key.is_empty() {
+                    let model =
+                        model_for!("deepseek").unwrap_or_else(|| "deepseek-v4-flash".to_string());
+                    let provider = OpenAiProvider::named(
+                        "deepseek".to_string(),
+                        key,
+                        "https://api.deepseek.com".to_string(),
+                        model,
+                        false,
+                    )
+                    .map_err(|e| SemaError::Llm(e.to_string()))?;
+                    reg.register(Box::new(provider));
+                    if first_configured.is_none() {
+                        reg.set_default("deepseek");
+                        first_configured = Some("deepseek".to_string());
+                    }
+                }
+            }
+            // Try OpenRouter
+            if let Ok(key) = std::env::var("OPENROUTER_API_KEY") {
+                if !key.is_empty() {
+                    let model =
+                        model_for!("openrouter").unwrap_or_else(|| "openai/gpt-5.2".to_string());
+                    let provider = OpenAiProvider::named(
+                        "openrouter".to_string(),
+                        key,
+                        "https://openrouter.ai/api/v1".to_string(),
+                        model,
+                        true,
+                    )
+                    .map_err(|e| SemaError::Llm(e.to_string()))?;
+                    reg.register(Box::new(provider));
+                    if first_configured.is_none() {
+                        reg.set_default("openrouter");
+                        first_configured = Some("openrouter".to_string());
+                    }
+                }
+            }
+            // Try Together
+            if let Ok(key) = std::env::var("TOGETHER_API_KEY") {
+                if !key.is_empty() {
+                    let model = model_for!("together")
+                        .unwrap_or_else(|| "meta-llama/Llama-4-Scout-17B-16E-Instruct".to_string());
+                    let provider = OpenAiProvider::named(
+                        "together".to_string(),
+                        key,
+                        "https://api.together.ai/v1".to_string(),
+                        model,
+                        false,
+                    )
+                    .map_err(|e| SemaError::Llm(e.to_string()))?;
+                    reg.register(Box::new(provider));
+                    if first_configured.is_none() {
+                        reg.set_default("together");
+                        first_configured = Some("together".to_string());
+                    }
+                }
+            }
+            // Try Fireworks
+            if let Ok(key) = std::env::var("FIREWORKS_API_KEY") {
+                if !key.is_empty() {
+                    let model = model_for!("fireworks")
+                        .unwrap_or_else(|| "accounts/fireworks/models/gpt-oss-120b".to_string());
+                    let provider = OpenAiProvider::named(
+                        "fireworks".to_string(),
+                        key,
+                        "https://api.fireworks.ai/inference/v1".to_string(),
+                        model,
+                        false,
+                    )
+                    .map_err(|e| SemaError::Llm(e.to_string()))?;
+                    reg.register(Box::new(provider));
+                    if first_configured.is_none() {
+                        reg.set_default("fireworks");
+                        first_configured = Some("fireworks".to_string());
+                    }
+                }
+            }
+            // Try Cerebras
+            if let Ok(key) = std::env::var("CEREBRAS_API_KEY") {
+                if !key.is_empty() {
+                    let model =
+                        model_for!("cerebras").unwrap_or_else(|| "gpt-oss-120b".to_string());
+                    let provider = OpenAiProvider::named(
+                        "cerebras".to_string(),
+                        key,
+                        "https://api.cerebras.ai/v1".to_string(),
+                        model,
+                        false,
+                    )
+                    .map_err(|e| SemaError::Llm(e.to_string()))?;
+                    reg.register(Box::new(provider));
+                    if first_configured.is_none() {
+                        reg.set_default("cerebras");
+                        first_configured = Some("cerebras".to_string());
+                    }
+                }
+            }
+            // Try SambaNova
+            if let Ok(key) = std::env::var("SAMBANOVA_API_KEY") {
+                if !key.is_empty() {
+                    let model = model_for!("sambanova")
+                        .unwrap_or_else(|| "Meta-Llama-3.3-70B-Instruct".to_string());
+                    let provider = OpenAiProvider::named(
+                        "sambanova".to_string(),
+                        key,
+                        "https://api.sambanova.ai/v1".to_string(),
+                        model,
+                        false,
+                    )
+                    .map_err(|e| SemaError::Llm(e.to_string()))?;
+                    reg.register(Box::new(provider));
+                    if first_configured.is_none() {
+                        reg.set_default("sambanova");
+                        first_configured = Some("sambanova".to_string());
+                    }
+                }
+            }
+            // Try Perplexity
+            if let Ok(key) = std::env::var("PERPLEXITY_API_KEY") {
+                if !key.is_empty() {
+                    let model =
+                        model_for!("perplexity").unwrap_or_else(|| "sonar-pro".to_string());
+                    let provider = OpenAiProvider::named(
+                        "perplexity".to_string(),
+                        key,
+                        "https://api.perplexity.ai".to_string(),
+                        model,
+                        false,
+                    )
+                    .map_err(|e| SemaError::Llm(e.to_string()))?;
+                    reg.register(Box::new(provider));
+                    if first_configured.is_none() {
+                        reg.set_default("perplexity");
+                        first_configured = Some("perplexity".to_string());
+                    }
+                }
+            }
             // Try Google Gemini
             if let Ok(key) = std::env::var("GOOGLE_API_KEY") {
                 if !key.is_empty() {
@@ -1497,6 +1788,73 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
                     }
                     if reg.rerank_provider().is_none() {
                         reg.set_rerank_provider("cohere");
+                    }
+                }
+            }
+            if let Ok(key) = std::env::var("NOMIC_API_KEY") {
+                if !key.is_empty() {
+                    let model = embed_model_for!("nomic", "nomic-embed-text-v1.5");
+                    let provider = OpenAiCompatEmbeddingProvider::new(
+                        "nomic".to_string(),
+                        key,
+                        "https://api.nomic.ai/v1".to_string(),
+                        model,
+                    )
+                    .map_err(|e| SemaError::Llm(e.to_string()))?
+                    .with_rerank(crate::embeddings::RerankDialect::Nomic);
+                    reg.register(Box::new(provider));
+                    if reg.embedding_provider().is_none() {
+                        reg.set_embedding_provider("nomic");
+                    }
+                    if reg.rerank_provider().is_none() {
+                        reg.set_rerank_provider("nomic");
+                    }
+                }
+            }
+            if embedding_provider.is_none() {
+                if let Ok(key) = std::env::var("TOGETHER_API_KEY") {
+                    if !key.is_empty() {
+                        let model = embed_model_for!("together-embeddings", "BAAI/bge-base-en-v1.5");
+                        let provider = OpenAiCompatEmbeddingProvider::new(
+                            "together-embeddings".to_string(),
+                            key,
+                            "https://api.together.ai/v1".to_string(),
+                            model,
+                        )
+                        .map_err(|e| SemaError::Llm(e.to_string()))?
+                        .with_rerank(crate::embeddings::RerankDialect::Together);
+                        reg.register(Box::new(provider));
+                        if reg.embedding_provider().is_none() {
+                            reg.set_embedding_provider("together-embeddings");
+                        }
+                        if reg.rerank_provider().is_none() {
+                            reg.set_rerank_provider("together-embeddings");
+                        }
+                    }
+                }
+            }
+            if embedding_provider.is_none() {
+                if let Ok(key) = std::env::var("FIREWORKS_API_KEY") {
+                    if !key.is_empty() {
+                        let model = embed_model_for!(
+                            "fireworks-embeddings",
+                            "nomic-ai/nomic-embed-text-v1.5"
+                        );
+                        let provider = OpenAiCompatEmbeddingProvider::new(
+                            "fireworks-embeddings".to_string(),
+                            key,
+                            "https://api.fireworks.ai/inference/v1".to_string(),
+                            model,
+                        )
+                        .map_err(|e| SemaError::Llm(e.to_string()))?
+                        .with_rerank(crate::embeddings::RerankDialect::Fireworks);
+                        reg.register(Box::new(provider));
+                        if reg.embedding_provider().is_none() {
+                            reg.set_embedding_provider("fireworks-embeddings");
+                        }
+                        if reg.rerank_provider().is_none() {
+                            reg.set_rerank_provider("fireworks-embeddings");
+                        }
                     }
                 }
             }
@@ -1827,7 +2185,7 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
     });
 
     // (llm/extract schema text {:model "..." :validate true :retries 2 :reask? true})
-    register_fn(env, "llm/extract", |args| {
+    register_fn_gated(env, sandbox, sema_core::Caps::LLM, "llm/extract", |args| {
         if args.len() < 2 || args.len() > 3 {
             return Err(SemaError::arity("llm/extract", "2-3", args.len()));
         }
@@ -1996,7 +2354,7 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
     );
 
     // (llm/classify categories text {:model "..."})
-    register_fn(env, "llm/classify", |args| {
+    register_fn_gated(env, sandbox, sema_core::Caps::LLM, "llm/classify", |args| {
         if args.len() < 2 || args.len() > 3 {
             return Err(SemaError::arity("llm/classify", "2-3", args.len()));
         }
@@ -2603,6 +2961,9 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
     // (llm/configure-embeddings :jina {:api-key "..."})
     // (llm/configure-embeddings :voyage {:api-key "..."})
     // (llm/configure-embeddings :cohere {:api-key "..."})
+    // (llm/configure-embeddings :nomic {:api-key "..."})
+    // (llm/configure-embeddings :together {:api-key "..."})
+    // (llm/configure-embeddings :fireworks {:api-key "..."})
     register_fn(env, "llm/configure-embeddings", move |args| {
         if args.len() != 2 {
             return Err(SemaError::arity(
@@ -2638,9 +2999,11 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
                         "https://api.jina.ai/v1".to_string(),
                         model,
                     )
-                    .map_err(|e| SemaError::Llm(e.to_string()))?;
+                    .map_err(|e| SemaError::Llm(e.to_string()))?
+                    .with_rerank(crate::embeddings::RerankDialect::Jina);
                     reg.register(Box::new(provider));
                     reg.set_embedding_provider("jina");
+                    reg.set_rerank_provider("jina");
                 }
                 "voyage" => {
                     let api_key = api_key
@@ -2654,9 +3017,11 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
                         "https://api.voyageai.com/v1".to_string(),
                         model,
                     )
-                    .map_err(|e| SemaError::Llm(e.to_string()))?;
+                    .map_err(|e| SemaError::Llm(e.to_string()))?
+                    .with_rerank(crate::embeddings::RerankDialect::Voyage);
                     reg.register(Box::new(provider));
                     reg.set_embedding_provider("voyage");
+                    reg.set_rerank_provider("voyage");
                 }
                 "cohere" => {
                     let api_key = api_key
@@ -2667,6 +3032,61 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
                         .map_err(|e| SemaError::Llm(e.to_string()))?;
                     reg.register(Box::new(provider));
                     reg.set_embedding_provider("cohere");
+                    reg.set_rerank_provider("cohere");
+                }
+                "nomic" => {
+                    let api_key = api_key
+                        .clone()
+                        .ok_or_else(|| SemaError::Llm("missing :api-key".to_string()))?;
+                    let model = get_opt_string(&opts, "default-model")
+                        .unwrap_or_else(|| "nomic-embed-text-v1.5".to_string());
+                    let provider = OpenAiCompatEmbeddingProvider::new(
+                        "nomic".to_string(),
+                        api_key,
+                        "https://api.nomic.ai/v1".to_string(),
+                        model,
+                    )
+                    .map_err(|e| SemaError::Llm(e.to_string()))?
+                    .with_rerank(crate::embeddings::RerankDialect::Nomic);
+                    reg.register(Box::new(provider));
+                    reg.set_embedding_provider("nomic");
+                    reg.set_rerank_provider("nomic");
+                }
+                "together" => {
+                    let api_key = api_key
+                        .clone()
+                        .ok_or_else(|| SemaError::Llm("missing :api-key".to_string()))?;
+                    let model = get_opt_string(&opts, "default-model")
+                        .unwrap_or_else(|| "BAAI/bge-base-en-v1.5".to_string());
+                    let provider = OpenAiCompatEmbeddingProvider::new(
+                        "together-embeddings".to_string(),
+                        api_key,
+                        "https://api.together.ai/v1".to_string(),
+                        model,
+                    )
+                    .map_err(|e| SemaError::Llm(e.to_string()))?
+                    .with_rerank(crate::embeddings::RerankDialect::Together);
+                    reg.register(Box::new(provider));
+                    reg.set_embedding_provider("together-embeddings");
+                    reg.set_rerank_provider("together-embeddings");
+                }
+                "fireworks" => {
+                    let api_key = api_key
+                        .clone()
+                        .ok_or_else(|| SemaError::Llm("missing :api-key".to_string()))?;
+                    let model = get_opt_string(&opts, "default-model")
+                        .unwrap_or_else(|| "nomic-ai/nomic-embed-text-v1.5".to_string());
+                    let provider = OpenAiCompatEmbeddingProvider::new(
+                        "fireworks-embeddings".to_string(),
+                        api_key,
+                        "https://api.fireworks.ai/inference/v1".to_string(),
+                        model,
+                    )
+                    .map_err(|e| SemaError::Llm(e.to_string()))?
+                    .with_rerank(crate::embeddings::RerankDialect::Fireworks);
+                    reg.register(Box::new(provider));
+                    reg.set_embedding_provider("fireworks-embeddings");
+                    reg.set_rerank_provider("fireworks-embeddings");
                 }
                 _ => {
                     // Default: OpenAI-compatible
@@ -4644,6 +5064,22 @@ fn format_schema(val: &Value) -> String {
                 } else {
                     "any".to_string()
                 }
+            } else if let Some(seq) = v.as_seq() {
+                // [:string] → "array of string"
+                if seq.len() == 1 {
+                    let inner = &seq[0];
+                    let inner_str = inner
+                        .as_keyword()
+                        .or_else(|| inner.as_str().map(|s| s.to_string()))
+                        .unwrap_or_else(|| inner.to_string());
+                    format!("array of {inner_str}")
+                } else {
+                    "array".to_string()
+                }
+            } else if v.as_keyword().is_some() {
+                // Bare keyword like :string — sent as a type hint
+                v.as_keyword()
+                    .unwrap_or_else(|| "any".to_string())
             } else {
                 "any".to_string()
             };
@@ -4703,6 +5139,11 @@ fn validate_extraction(result: &Value, schema: &Value) -> Result<(), String> {
                         let ok = match type_name.as_str() {
                             "string" => val.as_str().is_some(),
                             "number" => val.as_float().is_some(),
+                            "int" => val.as_int().is_some() || {
+                                val.as_float()
+                                    .map(|f| f.fract() == 0.0)
+                                    .unwrap_or(false)
+                            },
                             "boolean" | "bool" => val.as_bool().is_some(),
                             "list" | "array" => val.as_seq().is_some(),
                             _ => true,
@@ -4734,6 +5175,41 @@ fn validate_extraction(result: &Value, schema: &Value) -> Result<(), String> {
                             }
                             Err(e) => {
                                 errors.push(format!("key {key_name}: validation error: {e}"));
+                            }
+                        }
+                    }
+                } else if let Some(seq) = field_spec.as_seq() {
+                    // [:string] → list of string: validate that value is a sequence
+                    // and each element matches the inner type.
+                    if val.as_seq().is_none() {
+                        errors.push(format!(
+                            "key {key_name}: expected list, got {}",
+                            val.type_name()
+                        ));
+                        continue;
+                    }
+                    if seq.len() == 1 {
+                        let inner_type = seq[0]
+                            .as_keyword()
+                            .or_else(|| seq[0].as_str().map(|s| s.to_string()))
+                            .unwrap_or_else(|| seq[0].to_string());
+                        for (i, elem) in val.as_seq().unwrap().iter().enumerate() {
+                            let elem_ok = match inner_type.as_str() {
+                                "string" => elem.as_str().is_some(),
+                                "number" => elem.as_float().is_some(),
+                                "int" => elem.as_int().is_some() || {
+                                    elem.as_float()
+                                        .map(|f| f.fract() == 0.0)
+                                        .unwrap_or(false)
+                                },
+                                "boolean" | "bool" => elem.as_bool().is_some(),
+                                _ => true,
+                            };
+                            if !elem_ok {
+                                errors.push(format!(
+                                    "key {key_name}[{i}]: expected {inner_type}, got {}",
+                                    elem.type_name()
+                                ));
                             }
                         }
                     }

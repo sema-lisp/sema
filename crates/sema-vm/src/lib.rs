@@ -35,8 +35,7 @@ pub use scheduler::{
 pub use serialize::{deserialize_from_bytes, is_bytecode_file, serialize_to_bytes};
 pub use vm::{
     compile_program, compile_program_with_spans, compile_program_with_spans_and_natives,
-    current_vm_globals, extract_vm_closure,
-    is_debug_session_active, snap_breakpoint_line, valid_breakpoint_lines,
-    valid_breakpoint_lines_by_file, with_active_debug, Closure, CompiledProgram, DebugStopResume,
-    UpvalueCell, UpvalueState, VM,
+    current_vm_globals, extract_vm_closure, is_debug_session_active, snap_breakpoint_line,
+    valid_breakpoint_lines, valid_breakpoint_lines_by_file, with_active_debug, Closure,
+    CompiledProgram, DebugStopResume, UpvalueCell, UpvalueState, VM,
 };

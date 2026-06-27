@@ -494,7 +494,7 @@ import CustomPageLayout from './CustomPageLayout.vue'
     <!-- ============ CTA ============ -->
     <section class="cta">
       <div class="wrap">
-        <h2>Quote your first agent.</h2>
+        <h2>Run your first workflow.</h2>
         <p class="sub">The workflow DSL is homoiconic — the plan, the program, and the trace are all s-expressions. No YAML, no daemon, no separate runtime.</p>
         <div class="install-stack">
           <div class="install-row">

@@ -68,7 +68,7 @@ const copyText = (id, event) => {
           <span></span><span></span><span></span>
         </button>
         <div class="nav-links" :class="{ open: menuOpen }" @click="closeMenu">
-          <a href="/what-is-sema" :class="{ 'nav-active': activeNav === 'what-is-sema' }">What is Sema</a>
+          <a href="/what-is-sema" :class="{ 'nav-active': activeNav === 'what-is-sema' }">What is Sema?</a>
 
           <div class="nav-dropdown" :class="{ 'dd-active': docsActive }">
             <a href="/docs/" class="dd-label">Docs <span class="dd-caret">&#x25be;</span></a>

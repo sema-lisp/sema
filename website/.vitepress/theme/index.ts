@@ -7,6 +7,7 @@ import FeatureNotebook from './FeatureNotebook.vue'
 import FeatureAgents from './FeatureAgents.vue'
 import FeatureCassettes from './FeatureCassettes.vue'
 import FeatureObservability from './FeatureObservability.vue'
+import FeatureBuild from './FeatureBuild.vue'
 import FeatureWhatIsSema from './FeatureWhatIsSema.vue'
 import HomeSearch from './HomeSearch.vue'
 import './custom.css'
@@ -22,6 +23,7 @@ export default {
     app.component('FeatureAgents', FeatureAgents)
     app.component('FeatureCassettes', FeatureCassettes)
     app.component('FeatureObservability', FeatureObservability)
+    app.component('FeatureBuild', FeatureBuild)
     app.component('FeatureWhatIsSema', FeatureWhatIsSema)
     app.component('HomeSearch', HomeSearch)
   },

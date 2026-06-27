@@ -159,7 +159,7 @@ import CustomPageLayout from './CustomPageLayout.vue'
             <p class="kicker">defagent</p>
             <h2>An agent is a config, not a class.</h2>
             <p class="sub">
-              System prompt, tools, model, and a turn limit. <code>agent/run</code>
+              System prompt, tools, model, and a turn limit (optional, defaults to 10). <code>agent/run</code>
               handles the loop — calling tools, feeding results back, stopping at
               the limit or when the model has a final answer.
             </p>

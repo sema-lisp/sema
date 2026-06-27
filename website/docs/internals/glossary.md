@@ -90,7 +90,7 @@ This page defines the technical vocabulary used across Sema's documentation — 
 
 **Truthiness** — the rule determining which values count as true in conditionals. `and` returns the last truthy value or `#f`; `or` returns the first truthy value; `while`/`when` loop/run on truthy conditions. Only `#f` (and `nil`) are non-truthy.
 
-**Try / catch / throw** — error-handling forms: `try` evaluates a body, `catch` binds any raised error (a structured map with `:type` and `:message`; user-thrown values also include `:value`) for handling, and `throw` raises any value. `catch` catches ALL error types (including internal `:unbound`, `:arity`, `:permission-denied`), so re-throw what you don't handle.
+**Try / catch / throw** — error-handling forms: `try` evaluates a body, `catch` binds any raised error (a structured map with `:type`, `:message`, and `:value` for user-thrown values; plus `:stack-trace` — a list of frame maps) for handling, and `throw` raises any value. `catch` catches ALL error types (including internal `:unbound`, `:arity`, `:permission-denied`), so re-throw what you don't handle.
 
 **Unquote / unquote-splicing** — inside a quasiquote, unquote (`,expr`) evaluates `expr` and inserts its value; unquote-splicing (`,@expr`) evaluates a list and splices each element into the template. E.g. `` `(a ,@(list 1 2 3) b) `` yields `(a 1 2 3 b)`.
 
@@ -104,7 +104,7 @@ This page defines the technical vocabulary used across Sema's documentation — 
 
 **Bytecode VM** — Sema's stack-based bytecode virtual machine, the sole evaluator and default backend (since v1.13). Source compiles to bytecode through four passes (Lower → Optimize → Resolve → Compile) and runs on the VM; `.semac` files store the compiled bytecode.
 
-**Call frame** — (1) *VM CallFrame*: the per-call VM record holding the active closure, program counter, stack-base offset, open-upvalue cells, and cache base; pushed on call, reused on tail call, popped on return. (2) *EvalContext CallFrame*: a separate record used to build error stack traces. The DAP debugger renders VM frames with names, line numbers, and source paths.
+**Call frame** — (1) *VM CallFrame*: the per-call VM record holding the active closure, program counter, stack-base offset, open-upvalue cells, and cache base; pushed on call, reused on tail call, popped on return. (2) *sema_core::CallFrame*: a record used in `StackTrace`s attached to errors — carries `name`, `file`, and `span`. The VM's `capture_vm_stack_trace` walks VM frames and produces these for error maps. The DAP debugger renders VM frames with names, line numbers, and source paths.
 
 **Callback architecture** — Sema's dependency-inversion design where `sema-stdlib`/`sema-llm` (which depend on `sema-core`, not `sema-eval`) invoke the real evaluator through function-pointer callbacks (`call_callback`/`eval_callback`) registered by `sema-eval` at startup. Solves the circular-dependency problem so higher-order functions and LLM tool handlers run the single canonical evaluator. Replaced the removed *mini-eval*.
 
@@ -192,7 +192,7 @@ This page defines the technical vocabulary used across Sema's documentation — 
 
 **Runtime-delegated form** — a special form the compiler cannot lower to pure bytecode (`eval`, `import`, `load`, `defmacro`, `define-record-type`, `delay`/`force`, `prompt`/`message`/`deftool`/`defagent`, `macroexpand`), so it is compiled as a call to a corresponding `__vm-*` global function registered by `sema-eval`.
 
-**SemaError** — Sema's `thiserror`-derived error enum (variants incl. Reader, Eval, Type, Arity, Unbound, Llm, UserException, plus `WithTrace`/`WithContext` wrappers), constructed via helper methods (`eval`, `type_error`, `arity`), never raw variants. Surfaced to Sema code as a structured error map with `:type` and `:message` (and `:value` for user exceptions); VM stack-trace parity in caught errors is deferred (see `VM-1` in `docs/deferred.md`).
+**SemaError** — Sema's `thiserror`-derived error enum (variants incl. Reader, Eval, Type, Arity, Unbound, Llm, UserException, plus `WithTrace`/`WithContext` wrappers), constructed via helper methods (`eval`, `type_error`, `arity`), never raw variants. Surfaced to Sema code as a structured error map with `:type`, `:message`, and `:value` (for user exceptions). Caught errors also include `:stack-trace` — a list of `{:name :file :line :col}` frame maps, innermost first.
 
 **Short lambda** — a terse anonymous-function literal `#(...)` whose body is scanned for positional placeholders `%`, `%1`, `%2`…; bare `%` rewrites to `%1`, producing `(lambda (%1 … %N) body)`. Clojure-style; read/desugared by the reader. E.g. `#(* % %)` squares its argument.
 

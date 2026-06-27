@@ -84,7 +84,7 @@ import CustomPageLayout from './CustomPageLayout.vue'
             </div>
             <div class="feature-bite">
               <span class="bite-label">Error handling</span>
-              <p><code>try</code>/<code>catch</code>/<code>throw</code> — caught errors are structured maps with <code>:type</code>, <code>:message</code>, and <code>:value</code>.</p>
+              <p><code>try</code>/<code>catch</code>/<code>throw</code> — caught errors are structured maps with <code>:type</code>, <code>:message</code>, <code>:value</code>, and <code>:stack-trace</code>.</p>
             </div>
             <div class="feature-bite">
               <span class="bite-label">Async</span>

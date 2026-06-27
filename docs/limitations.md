@@ -67,7 +67,7 @@ R7RS `define-record-type` with constructors, type predicates, and field accessor
 
 ### ~~13. No Stack Traces~~ → PARTIAL (VM)
 
-The stack-trace machinery — call frames, file locations, and source spans, bounded for TCO'd recursion — exists, but the VM (the sole evaluator) does **not** yet surface it: VM-caught error maps omit the `:stack-trace` key, and VM runtime errors print no `--> file:line:col` location (see ADR #57, partially implemented, and TW-1 in `docs/deferred.md`).
+The stack-trace machinery — call frames, file locations, and source spans, bounded for TCO'd recursion — is now **implemented** on the VM. Caught error maps include a `:stack-trace` field (list of `{:name :file :line :col}` frame maps), and inline opcodes (`+`, `-`, `car`, etc.) produce synthetic intrinsic frames. Source spans are threaded through the main eval path via `compile_program_with_spans_and_natives`.
 
 ### ~~14. Missing Math Functions~~ → RESOLVED (Phase 8)
 
@@ -162,7 +162,7 @@ Fix (route HOF callbacks in-VM): the VM no longer closes upvalues before native 
 Still-open related symptoms from the same dual-path design (NOT addressed here):
 
 - `(type (fn (x) x))` returns `:native-fn` on the VM, since VM closures wrap as `NativeFn` for stdlib HOF interop (deferred — TW-2 in `docs/deferred.md`).
-- Caught error maps on the VM are missing `:stack-trace` (deferred — TW-1 in `docs/deferred.md`; see #13).
+- ~~Caught error maps on the VM are missing `:stack-trace` (deferred — TW-1 in `docs/deferred.md`; see #13).~~ **Fixed** — caught errors now include `:stack-trace`.
 
 Note: `set!`-through-HOF inside an *async task* still follows the pre-existing fresh-task-VM semantics (it is snapshotted on spawn), since async tasks run on dedicated VM stacks.
 

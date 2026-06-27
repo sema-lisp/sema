@@ -594,7 +594,7 @@ Catch errors with structured error maps.
 
 #### Error map fields
 
-Every caught error is a map with at least `:type` and `:message`. User-thrown values appear under `:value`, and some error types include additional fields:
+Every caught error is a map with at least `:type`, `:message`, and `:stack-trace`. User-thrown values appear under `:value`, and some error types include additional fields:
 
 | `:type` | Description | Extra fields |
 |---|---|---|

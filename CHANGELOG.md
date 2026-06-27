@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+### Added
+
+- **`:stack-trace` on caught error maps.** The VM now captures the call stack
+  at error time and serializes it as a `:stack-trace` field on caught error
+  maps — a list of `{:name :file :line :col}` frame maps, innermost first.
+  For inline opcodes (`+`, `-`, `car`, etc.), a synthetic intrinsic frame is
+  synthesized by decoding the opcode at the failing PC. TCO-bounded: tail
+  calls reuse frames, so the trace stays small even for deep recursion.
+  Source spans are now threaded through the main eval path
+  (`run_exprs_on_vm`) via `compile_program_with_spans_and_natives`, so
+  function frames carry `:line` and `:col` from the original source.
+
 ### Fixed
 
 - **`pretty_print` no longer double-serializes values.** `pretty_print` called

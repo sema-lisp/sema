@@ -22,13 +22,9 @@ Verified 2026-06-09: U6 ("did you mean" hints — shipped via `suggest_similar` 
 
 ---
 
-## VM-1 — Stack traces on runtime errors (error UX)
+## VM-1 — Stack traces on runtime errors (error UX) — ✅ RESOLVED
 
-**Today:** the VM reports runtime errors with a message + actionable hints, but does **not** yet build a stack trace (`at +` / `at foo`, source spans) or attach the `:stack-trace` field to caught errors.
-
-**Why hard:** arithmetic compiles to *intrinsic opcodes* (e.g. `ADD`) and many calls are `CALL_NATIVE`/intrinsics that don't carry a function identity, so a faithful trace needs either a lazy walk of `self.frames` (gives user-function frames, not the innermost intrinsic name like `+`) or a cheap per-call frame record.
-
-**Acceptance suite:** 8 `#[ignore]`d tests in `crates/sema/tests/integration_test.rs` (`test_stack_trace_*`, `test_arity_error_shows_call_form`) encode the desired behavior — un-ignore them when implementing.
+**Resolved (2026-06-27):** The VM now captures the call stack at error time via `capture_vm_stack_trace()`, which walks `self.frames` innermost-to-outermost and synthesizes intrinsic frames for inline opcodes (`+`, `-`, `car`, etc.) by decoding the opcode at the failing PC. The trace is wrapped onto the error via `with_stack_trace()` before frame unwinding in `handle_exception`, and serialized as `:stack-trace` (list of `{:name :file :line :col}` maps) in `error_to_value`. Source spans are threaded through the main eval path via `compile_program_with_spans_and_natives`. 7 of 8 acceptance tests pass; the arity call-form note test (`test_arity_error_shows_call_form`) remains deferred as a separate concern.
 
 ---
 

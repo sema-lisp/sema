@@ -22,6 +22,7 @@
 - **sema-mcp** → Model Context Protocol server exposing Sema eval/build/notebook tools to AI agents
 - **sema-otel** → OpenTelemetry facade (spans/metrics); native-only, no-op on wasm32
 - **sema-workflow** → Dynamic-workflow runtime: journals a frozen JSONL run-directory, bounded concurrency for leaves, `--resume` via memo sidecar. Leaf crate — depends only on sema-core + sema-otel.
+- **sema-docs** → Builtin docs index generator. Each builtin is a markdown file in `crates/sema-docs/entries/`; `sema-docs gen` produces a JSON index consumed by LSP hover/completion and REPL apropos.
 - **sema-fmt** → Code formatter for Sema source files
 - **sema-wasm** → WASM bindings for browser playground
 - **sema** → Binary (clap CLI + reedline REPL) + `sema build` (standalone executables) + `sema compile`/`sema disasm` + `sema lsp` + `sema dap` + `sema fmt` + integration tests

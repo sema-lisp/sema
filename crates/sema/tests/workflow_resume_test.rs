@@ -17,7 +17,7 @@ const WF: &str = r#"
       {:phases ["A"]}
       (phase "A")
       (def files (checkpoint :files (list "a" "b" "c")))
-      (def summary (agent "summarize the files" {:name "writer"}))
+      (def summary (step "summarize the files" {:name "writer"}))
       {:status :success :files files :summary summary})
 "#;
 

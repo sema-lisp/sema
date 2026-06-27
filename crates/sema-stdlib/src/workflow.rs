@@ -10,8 +10,8 @@
 //!   tripped).
 //! - `(workflow/phase label)` — a MARKER: closes the previously-open phase and opens
 //!   `label` (the checkpoints/agents that follow attribute to it).
-//! - `(workflow/agent opts thunk)` — runs a leaf as a journaled agent (started/result
-//!   + per-agent budget), with the resume short-circuit and budget latch at its entry.
+//! - `(workflow/step opts thunk)` — runs a leaf as a journaled step (agent.started/
+//!   result + per-step budget), with the resume short-circuit and budget latch at its entry.
 //! - `(workflow/tool-call name [args])` — journals a tool call by the current agent.
 //! - `(checkpoint :k v)` records+returns `v` (emitting a `checkpoint` event);
 //!   `(checkpoint :k)` reads it back.
@@ -57,29 +57,34 @@ fn declared_phases(meta: &Value) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// Resolve an agent's role label from the `workflow/agent` first argument: the `:name`
-/// of an opts map, or a bare keyword/string label, falling back to "agent".
+/// Resolve a step's role label from the `workflow/step` first argument: the `:name`
+/// of an opts map, or a bare keyword/string label, falling back to "step".
 fn agent_role(v: &Value) -> String {
     if let Some(m) = v.as_map_rc() {
         if let Some(name) = m.get(&Value::keyword("name")).and_then(as_name) {
             return name;
         }
-        return "agent".to_string();
+        return "step".to_string();
     }
-    as_name(v).unwrap_or_else(|| "agent".to_string())
+    as_name(v).unwrap_or_else(|| "step".to_string())
 }
 
-/// Render a value for the journal so the dashboard can show the real data, capped
-/// (char-boundary safe) so one huge value can't bloat a journal line.
-fn capped_render(v: &Value) -> String {
+/// Length-cap a string for the journal (char-boundary safe) so one huge value can't
+/// bloat a journal line. The total char count is appended when truncation happens.
+fn cap_text(s: &str) -> String {
     const MAX: usize = 4000;
-    let s = sema_core::pretty_print(v, 100);
     if s.chars().count() > MAX {
         let head: String = s.chars().take(MAX).collect();
         format!("{head}\n… (truncated, {} chars total)", s.chars().count())
     } else {
-        s
+        s.to_string()
     }
+}
+
+/// Render a value for the journal so the dashboard can show the real data, capped via
+/// [`cap_text`].
+fn capped_render(v: &Value) -> String {
+    cap_text(&sema_core::pretty_print(v, 100))
 }
 
 /// Build the success envelope returned by `workflow/run`. PASS-THROUGH: if the
@@ -190,7 +195,7 @@ pub fn register(env: &sema_core::Env) {
 
         if let Some(ctx) = context::current() {
             // A tripped budget cap fails the run regardless of the body's own outcome
-            // (the latch, not an Err, is the source of truth — see workflow/agent).
+            // (the latch, not an Err, is the source of truth — see workflow/step).
             if ctx.over_budget() {
                 status = "failed";
                 envelope = budget_failed_envelope();
@@ -245,14 +250,16 @@ pub fn register(env: &sema_core::Env) {
         Ok(Value::nil())
     });
 
-    // (workflow/agent label thunk) — run a leaf (typically an LLM/tool call) as a
-    // journaled "agent": emits agent.started before and agent.result after, so the
-    // dashboard renders it as an agent row under the current phase. Returns the
-    // thunk's value (or propagates its error, after journaling a result). A no-op
-    // wrapper (just runs the thunk) when called outside a workflow run.
-    crate::register_fn(env, "workflow/agent", |args| {
+    // (workflow/step label thunk) — run a leaf (typically an LLM/tool call) as a
+    // journaled "step": emits agent.started before and agent.result after (the
+    // event vocabulary is the frozen internal contract — `agent.*` names predate
+    // the step rename and stay), so the dashboard renders it as a row under the
+    // current phase. Returns the thunk's value (or propagates its error, after
+    // journaling a result). A no-op wrapper (just runs the thunk) when called
+    // outside a workflow run.
+    crate::register_fn(env, "workflow/step", |args| {
         if args.len() != 2 {
-            return Err(SemaError::arity("workflow/agent", "2", args.len()));
+            return Err(SemaError::arity("workflow/step", "2", args.len()));
         }
         // First arg is the agent role: an opts map `{:name "scout" …}` (the `agent`
         // macro form), or a bare keyword/string label. Default role is "agent".
@@ -263,14 +270,26 @@ pub fn register(env: &sema_core::Env) {
             return crate::list::call_function(thunk, &[]);
         };
         // Resume short-circuit FIRST (before the budget latch): compute this leaf's
-        // content-key from its inputs (the `agent` macro injects :__prompt and
+        // content-key from its inputs (the `step` macro injects :__prompt and
         // :__schema-repr). On a resumed run a memoized leaf replays for FREE — return it
         // WITHOUT running the model or emitting events. This MUST precede the budget
         // check: a replay makes no provider call, so a tripped cap must not refuse it
         // (refusing would return nil for a value that's on disk). The key is computed on
         // EVERY leaf so its occurrence ordinal advances in body order either way.
+        // The resolved user prompt, used both for the resume content-key and, capped,
+        // captured on the agent.started event so the viewer can show it. The `step` macro
+        // injects `:__prompt`; a hand-wrapped `workflow/step` can opt in by passing an
+        // explicit `:prompt` in its opts map. Prefer the macro key, fall back to `:prompt`.
+        let prompt = {
+            let injected = opt_str(&args[0], "__prompt");
+            if injected.is_empty() {
+                opt_str(&args[0], "prompt")
+            } else {
+                injected
+            }
+        };
         let content_key = ctx.agent_content_key(
-            &opt_str(&args[0], "__prompt"),
+            &prompt,
             &opt_str(&args[0], "__schema-repr"),
             &label,
             &ctx.cur_phase_label(),
@@ -297,13 +316,15 @@ pub fn register(env: &sema_core::Env) {
             agent_id: agent_id.clone(),
             agent_name: label.clone(),
             model: String::new(), // unknown until the call completes (filled below)
+            prompt: cap_text(&prompt), // empty for a hand-wrapped agent ⇒ skipped on the wire
         });
         let start = Instant::now();
-        // Clear the per-thread usage slot BEFORE the thunk so the snapshot afterwards
-        // reflects ONLY a completion this leaf made. Without this, a leaf whose call
-        // fails (or makes none) would re-read the PREVIOUS leaf's sticky usage — a
-        // phantom budget event + a double-charge against the cap.
-        sema_llm::builtins::clear_last_usage();
+        // Open a per-leaf usage accumulator for the duration of this thunk. Each
+        // completion the leaf makes folds into THIS scope's frame (summing multi-round
+        // tool loops); the async path captures the frame's Rc into its poller so a
+        // sibling leaf under parallel/pipeline fan-out can't clobber the tally. The
+        // RAII guard pops the frame on drop at the end of this fn.
+        let usage_scope = sema_llm::builtins::open_usage_scope();
         // Mark this as the current agent so `workflow/tool-call` inside the thunk
         // attributes to it; clear afterwards. NOTE: `cur_agent` is a single shared slot,
         // so under a CONCURRENT `:tools` fan-out (tool loops yield between rounds) two
@@ -319,10 +340,11 @@ pub fn register(env: &sema_core::Env) {
         } else {
             start.elapsed().as_millis() as u64
         };
-        // Per-agent usage: the most recent LLM completion on this thread (if the leaf
-        // made one) gives the model + tokens + cost to attribute to this agent.
-        let usage = sema_llm::builtins::last_usage_snapshot();
-        let model = usage.as_ref().map(|u| u.model.clone()).unwrap_or_default();
+        // Per-agent usage: the tokens + cost summed across every completion this leaf
+        // made (all rounds of a tool loop), accumulated into the leaf's own scope frame.
+        // `calls == 0` means the leaf made no (non-cache-hit) provider call.
+        let usage = usage_scope.usage();
+        let model = usage.model.clone();
         // The agent's actual output, captured in the journal so the dashboard can
         // show it (not a hash). Length-capped to bound the journal line.
         let output = match &result {
@@ -340,21 +362,22 @@ pub fn register(env: &sema_core::Env) {
             model,
         });
         // Attribute token usage + cost to this agent via a budget event (only when a
-        // completion actually ran — otherwise per-agent tokens stay honestly absent).
-        if let Some(u) = usage {
+        // completion actually ran — `calls > 0`. A leaf that made no call, or only a
+        // cache hit, stays honestly absent: no phantom zero Budget event, no charge).
+        if usage.calls > 0 {
             ctx.emit(WorkflowEvent::Budget {
                 seq: ctx.next_seq(),
                 ts: ctx.ts(),
                 agent_id: Some(agent_id),
                 phase_seq: ctx.phase_seq(),
-                input_tokens: u.input_tokens,
-                output_tokens: u.output_tokens,
-                cost_usd: u.cost_usd,
+                input_tokens: usage.input_tokens,
+                output_tokens: usage.output_tokens,
+                cost_usd: usage.cost_usd,
                 budget_limit: ctx.budget_limit_for_event(),
             });
             // Charge AFTER the Budget event is journaled, so the leaf that tips the cap
             // is itself fully recorded; the sticky latch then refuses the NEXT leaf.
-            ctx.charge(u.cost_usd, u.input_tokens + u.output_tokens);
+            ctx.charge(usage.cost_usd, usage.input_tokens + usage.output_tokens);
         }
         // Memoize the leaf's value for a future --resume (round-trip-guarded inside
         // memo_store; called outside any held journal borrow).
@@ -366,7 +389,7 @@ pub fn register(env: &sema_core::Env) {
 
     // (workflow/tool-call tool-name [args]) — journal a tool call by the current
     // agent (the dashboard renders these as tool twigs in the agent's drill-in).
-    // No-op (returns nil) outside a workflow/agent. `args` is an opaque/gated
+    // No-op (returns nil) outside a workflow/step. `args` is an opaque/gated
     // descriptor; pass a string or omit for the "gated" sentinel.
     crate::register_fn(env, "workflow/tool-call", |args| {
         if args.is_empty() || args.len() > 2 {
@@ -442,5 +465,59 @@ pub fn register(env: &sema_core::Env) {
             // Read: return the stored value or nil.
             Ok(ctx.read_checkpoint(&key).unwrap_or_else(Value::nil))
         }
+    });
+
+    // (workflow/check src) — static-check a workflow source string (or any value,
+    // which is pretty-printed to source) and return diagnostics as a Sema list of
+    // maps. An empty list means the source is clean. Each map has:
+    //   {:severity <:error|:warning> :code "E-PHASE-ARITY" :message "..." :line N :col N :hint "..."}
+    // :line and :col are nil when no span is available. Calls the pure checker in
+    // workflow_check — no eval, no LLM, no I/O.
+    crate::register_fn(env, "workflow/check", |args| {
+        if args.len() != 1 {
+            return Err(SemaError::arity("workflow/check", "1", args.len()));
+        }
+        let src: String = if let Some(s) = args[0].as_str() {
+            s.to_string()
+        } else {
+            sema_core::pretty_print(&args[0], 100)
+        };
+        let diags = crate::workflow_check::check_source(&src);
+        let items: Vec<Value> = diags
+            .iter()
+            .map(|d| {
+                let mut m = BTreeMap::new();
+                m.insert(
+                    Value::keyword("severity"),
+                    match d.severity {
+                        crate::workflow_check::Severity::Error => Value::keyword("error"),
+                        crate::workflow_check::Severity::Warning => Value::keyword("warning"),
+                    },
+                );
+                m.insert(Value::keyword("code"), Value::string(d.code));
+                m.insert(Value::keyword("message"), Value::string(&d.message));
+                m.insert(
+                    Value::keyword("line"),
+                    d.span
+                        .map(|s| Value::int(s.line as i64))
+                        .unwrap_or_else(Value::nil),
+                );
+                m.insert(
+                    Value::keyword("col"),
+                    d.span
+                        .map(|s| Value::int(s.col as i64))
+                        .unwrap_or_else(Value::nil),
+                );
+                m.insert(
+                    Value::keyword("hint"),
+                    d.hint
+                        .as_deref()
+                        .map(Value::string)
+                        .unwrap_or_else(Value::nil),
+                );
+                Value::map(m)
+            })
+            .collect();
+        Ok(Value::list(items))
     });
 }

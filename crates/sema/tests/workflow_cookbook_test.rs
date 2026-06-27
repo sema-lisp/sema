@@ -28,7 +28,7 @@ const COOKBOOK_SRC: &str = include_str!("../../../examples/workflows/cookbook.se
 //      call 1: actor step → "The answer is 42."
 //      call 2: critic step → "OK"
 //    Result: the first attempt is returned unchanged; only 1 agent.result
-//    for the actor (agent name "actor") and 1 for the critic (name "critic").
+//    for the actor (step name "actor") and 1 for the critic (name "critic").
 // ---------------------------------------------------------------------------
 #[test]
 fn reflexion_short_circuits_on_ok_critique() {

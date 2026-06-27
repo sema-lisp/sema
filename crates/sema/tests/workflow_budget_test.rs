@@ -28,9 +28,9 @@ fn budget_stops_sequential_run_after_the_tipping_leaf() {
           "two sequential agents, tiny token budget"
           {:phases ["A" "B"] :budget {:tokens 5}}
           (phase "A")
-          (def x (agent "first" {:name "one"}))
+          (def x (step "first" {:name "one"}))
           (phase "B")
-          (def y (agent "second" {:name "two"}))
+          (def y (step "second" {:name "two"}))
           {:status :success :x x :y y})
     "#;
 
@@ -81,8 +81,8 @@ fn failed_leaf_does_not_emit_a_phantom_budget_from_stale_usage() {
           "second agent's call fails"
           {:phases ["A"] :budget {:tokens 1000}}
           (phase "A")
-          (def x (agent "first" {:name "one"}))
-          (def y (agent "second" {:name "two"}))
+          (def x (step "first" {:name "one"}))
+          (def y (step "second" {:name "two"}))
           {:status :success})
     "#;
 
@@ -119,8 +119,8 @@ fn usd_budget_enforced_end_to_end_via_pinned_pricing() {
           "tiny usd cap"
           {:phases ["A"] :budget {:usd 0.001}}
           (phase "A")
-          (def x (agent "first" {:name "one"}))
-          (def y (agent "second" {:name "two"}))
+          (def x (step "first" {:name "one"}))
+          (def y (step "second" {:name "two"}))
           {:status :success})
     "#;
     let out = wc::run_once(src, fake, "wf_budget_usd");
@@ -151,7 +151,7 @@ fn budget_latch_fails_run_and_refuses_further_leaves_under_fanout() {
           "fan-out with a tiny token budget"
           {:phases ["Work"] :budget {:tokens 5}}
           (phase "Work")
-          (def rs (pipeline (range 20) (fn (i) (agent (str "item " i) {:name "w"}))))
+          (def rs (pipeline (range 20) (fn (i) (step (str "item " i) {:name "w"}))))
           {:status :success :n (count rs)})
     "#;
 

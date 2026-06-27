@@ -1,6 +1,6 @@
 //! Deterministic real-tool-agent tests (slice S2).
 //!
-//! `(agent prompt {:tools [...]})` routes the leaf through the REAL `run_tool_loop` (via
+//! `(step prompt {:tools [...]})` routes the leaf through the REAL `run_tool_loop` (via
 //! `llm/chat`, which owns the tool dispatch) and journals each genuine tool call as an
 //! `agent.tool_call` event through the `:on-tool-call` callback. Driven against a
 //! scripted `FakeProvider` so the tool call is deterministic. Shared harness in
@@ -39,7 +39,7 @@ fn tools_agent_journals_one_real_tool_call() {
           "one tool-using agent"
           {{:phases ["Go"]}}
           (phase "Go")
-          (def r (agent "What is the weather in Oslo?" {{:tools [get-weather] :name "scout"}}))
+          (def r (step "What is the weather in Oslo?" {{:tools [get-weather] :name "scout"}}))
           {{:status :success :r r}})
     "#
     );
@@ -93,7 +93,7 @@ fn tools_with_schema_returns_text_and_ignores_schema_v1() {
           "tools + schema → text-only (v1)"
           {{:phases ["Go"]}}
           (phase "Go")
-          (def r (agent "weather?" {{:tools [get-weather] :schema {{:temp :int}} :name "scout"}}))
+          (def r (step "weather?" {{:tools [get-weather] :schema {{:temp :int}} :name "scout"}}))
           {{:status :success :r r}})
     "#
     );

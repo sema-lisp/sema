@@ -64,7 +64,7 @@
   ;; Fan out: one typed agent per topic, at most 4 model calls in flight, in order.
   (def articles
     (pipeline chosen
-      (fn (t) (agent (article-prompt t) {:name "writer" :schema article}))))
+      (fn (t) (step (article-prompt t) {:name "writer" :schema article}))))
 
   (phase "Verify")
   ;; Per-item gate: keep only the well-formed articles (also drops failed nil slots).

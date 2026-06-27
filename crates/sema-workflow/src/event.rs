@@ -78,6 +78,14 @@ pub enum WorkflowEvent {
         agent_name: String,
         #[serde(default, skip_serializing_if = "String::is_empty")]
         model: String,
+        /// The user prompt sent to the model, captured + length-capped, so the viewer can
+        /// show what the agent was asked (the input counterpart to `agent.result.output`).
+        /// Present for `agent`-macro leaves (which inject the resolved prompt); a
+        /// hand-wrapped `workflow/step` given a bare label has no prompt to capture, so
+        /// the field is empty. Declared LAST (append-only) and skipped when empty, so
+        /// pre-existing goldens stay byte-identical.
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        prompt: String,
     },
 
     /// An agent leaf produced a result. `status` is `"ok"`/`"failed"`. `output` is an
@@ -161,6 +169,35 @@ pub enum WorkflowEvent {
         reason: Option<String>,
         dur_ms: u64,
     },
+
+    /// A memory thread was touched (append, remember, or recall). The value itself is
+    /// NOT stored in the stream — only an opaque `value_digest`. Declared LAST so
+    /// pre-existing goldens are byte-identical (this variant is never emitted in old
+    /// runs). All optional fields use `skip_serializing_if` so absent fields vanish.
+    #[serde(rename = "memory")]
+    Memory {
+        seq: u64,
+        ts: String,
+        /// `start_seq` of the enclosing phase, when inside one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        phase_seq: Option<u64>,
+        /// `agent_id` of the agent that triggered the memory op, when inside one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent_id: Option<String>,
+        /// The memory thread's `:id` opt.
+        memory_id: String,
+        /// The memory thread's `:namespace` opt.
+        namespace: String,
+        /// One of `"append"`, `"remember"`, `"recall"`.
+        op: String,
+        /// Fact key for `:remember`/`:recall`; empty for `:append`.
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        key: String,
+        /// Opaque md5 digest of the appended/remembered/recalled value.
+        value_digest: String,
+        /// Number of messages appended or facts set (1 per operation).
+        count: u64,
+    },
 }
 
 #[cfg(test)]
@@ -195,6 +232,7 @@ mod tests {
             agent_id: "auditor_1".into(),
             agent_name: "auditor".into(),
             model: String::new(),
+            prompt: String::new(), // empty ⇒ skipped, so the wire shape is unchanged
         };
         assert_eq!(
             serde_json::to_string(&started).unwrap(),
@@ -247,6 +285,49 @@ mod tests {
         assert_eq!(
             line,
             r#"{"event":"checkpoint","seq":2,"ts":"0","phase_seq":1,"key":"files","content_key":"ck_4d2f8a1c","value_digest":"abc123"}"#
+        );
+    }
+
+    #[test]
+    fn memory_event_wire_shape() {
+        let ev = WorkflowEvent::Memory {
+            seq: 10,
+            ts: "0".into(),
+            phase_seq: Some(3),
+            agent_id: Some("researcher_1".into()),
+            memory_id: "user-42".into(),
+            namespace: "support".into(),
+            op: "append".into(),
+            key: String::new(),
+            value_digest: "abc123".into(),
+            count: 1,
+        };
+        let line = serde_json::to_string(&ev).unwrap();
+        assert_eq!(
+            line,
+            r#"{"event":"memory","seq":10,"ts":"0","phase_seq":3,"agent_id":"researcher_1","memory_id":"user-42","namespace":"support","op":"append","value_digest":"abc123","count":1}"#
+        );
+    }
+
+    #[test]
+    fn memory_event_skips_empty_optional_fields() {
+        let ev = WorkflowEvent::Memory {
+            seq: 5,
+            ts: "0".into(),
+            phase_seq: None,
+            agent_id: None,
+            memory_id: "x".into(),
+            namespace: "default".into(),
+            op: "remember".into(),
+            key: "theme".into(),
+            value_digest: "def456".into(),
+            count: 1,
+        };
+        let line = serde_json::to_string(&ev).unwrap();
+        // phase_seq and agent_id are None → skipped; key is non-empty → present.
+        assert_eq!(
+            line,
+            r#"{"event":"memory","seq":5,"ts":"0","memory_id":"x","namespace":"default","op":"remember","key":"theme","value_digest":"def456","count":1}"#
         );
     }
 }

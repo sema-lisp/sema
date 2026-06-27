@@ -4,8 +4,8 @@ outline: [2, 3]
 
 # Workflows
 
-Sema's workflow runtime lets you define multi-phase agent pipelines as ordinary
-Sema code. Every phase, agent call, checkpoint, and budget charge is journaled
+Sema's workflow runtime lets you define multi-phase agentic workflows as ordinary
+Sema code. Every phase, step call, checkpoint, and budget charge is journaled
 to a frozen JSONL run directory. Crash, edit, and resume — the runtime skips
 leaves that already completed and only re-runs what changed.
 
@@ -49,14 +49,14 @@ The `meta-map` supports:
 | `:args` | map | Argument schema (informational; the actual args come from `--args`) |
 
 The body is ordinary Sema code. `phase` markers interleave with `def`,
-`agent`, `checkpoint`, `parallel`, `pipeline`, and any other Sema forms. The
+`step`, `checkpoint`, `parallel`, `pipeline`, and any other Sema forms. The
 last value is the return envelope — if it's already a `{:status …}` map it
 passes through; otherwise the runtime wraps it as `{:status :success :value …}`.
 
 ### `phase`
 
 A **marker**, not a wrapper. `(phase "Audit")` closes the previously-open
-phase and opens "Audit". Every `agent`, `checkpoint`, and `budget` event that
+phase and opens "Audit". Every `step`, `checkpoint`, and `budget` event that
 follows attributes to it until the next `(phase …)` or the run end (which
 closes the last open phase). Returns `nil`.
 
@@ -67,7 +67,7 @@ closes the last open phase). Returns `nil`.
 
 (phase "Audit")
 ;; forms here belong to "Audit"
-(define findings (agent "Audit each file" {:name "auditor"}))
+(define findings (step "Audit each file" {:name "auditor"}))
 ```
 
 ::: tip
@@ -76,40 +76,45 @@ closes the last open phase). Returns `nil`.
 correct form is `(phase "Audit")` followed by the body forms.
 :::
 
-### `agent`
+### `step`
 
-A journaled LLM leaf. The `agent` macro wraps `workflow/agent` and handles
-prompt resolution, schema validation, and tool dispatch.
+A journaled LLM leaf — the workflow's atomic orchestration unit. The `step` macro
+wraps `workflow/step` and handles prompt resolution, schema validation, tool
+dispatch, and `:agent` routing.
 
 ```sema
 ;; Without schema — returns the completion text
-(agent "Summarize the changelog.")
+(step "Summarize the changelog.")
 
 ;; With schema — returns typed data (validated via llm/extract)
-(agent "List auth-relevant files."
-       {:name "scout"
-        :schema [:list :string]})
+(step "List auth-relevant files."
+      {:name "scout"
+       :schema [:list :string]})
 
 ;; With tools — runs the real tool loop (llm/chat)
-(agent "Find TODOs in src/"
-       {:name "coder"
-        :tools [read-file run-command]})
+(step "Find TODOs in src/"
+      {:name "coder"
+       :tools [read-file run-command]})
+
+;; With :agent — runs a configured defagent as this step
+(step "Review this file" {:agent code-reviewer :schema verdict})
 ```
 
 The opts map supports:
 
 | Key | Type | Description |
 |-----|------|-------------|
-| `:name` | `:string` | Role label shown in the dashboard (default `"agent"`) |
-| `:schema` | schema spec | Typed extraction — the agent returns a validated map, not text |
-| `:tools` | `[tool …]` | Tool-calling loop — the agent runs `llm/chat` with tool dispatch |
+| `:name` | `:string` | Role label shown in the dashboard (default `"step"`) |
+| `:schema` | schema spec | Typed extraction — the step returns a validated map, not text |
+| `:tools` | `[tool …]` | Tool-calling loop — the step runs `llm/chat` with tool dispatch |
+| `:agent` | `defagent` | Run a configured `defagent` as this step via `agent/run` |
 
-When `:schema` and `:tools` are both present, `:tools` takes precedence (the
-agent runs the tool loop and returns text; `:schema` does not compose with
-`:tools` yet).
+When `:agent` is present, the defagent owns its own tools and model — inline
+`:tools`/`:model` are ignored (the static checker warns if both are given).
 
 The runtime emits `agent.started` before the leaf and `agent.result` after,
-plus a per-agent `budget` event with token/cost attribution.
+plus a per-step `budget` event with token/cost attribution. (The `agent.*`
+event names are the frozen journal contract — they predate the `step` rename.)
 
 ### `checkpoint`
 
@@ -157,8 +162,8 @@ Results align to `items` (nils for dropped).
 ```sema
 ;; Each file → audit → verify
 (pipeline files
-  (fn (f) (agent (str "Audit " f) {:name "auditor"}))
-  (fn (x) (agent (str "Verify " (:claim x)) {:name "verifier"})))
+  (fn (f) (step (str "Audit " f) {:name "auditor"}))
+  (fn (x) (step (str "Verify " (:claim x)) {:name "verifier"})))
 ```
 
 ## The run directory
@@ -236,8 +241,8 @@ against the cap.
 ## Budget enforcement
 
 Declare `:budget {:tokens N :usd M}` in the `defworkflow` metadata. The
-runtime charges each agent leaf and latches a sticky `over_budget` flag when
-a cap is exceeded — further agent leaves are **refused** and the run ends
+runtime charges each step leaf and latches a sticky `over_budget` flag when
+a cap is exceeded — further step leaves are **refused** and the run ends
 `{:status :failed :reason "budget exceeded"}`.
 
 ```sema
@@ -247,11 +252,11 @@ a cap is exceeded — further agent leaves are **refused** and the run ends
    :budget {:tokens 5000}}
 
   (phase "Scan")
-  (def a (agent "Find files." {}))
+  (def a (step "Find files." {}))
   ;; a burns 5200 tokens → cap trips after its Budget event
 
   (phase "Report")
-  (def b (agent "Summarize." {}))
+  (def b (step "Summarize." {}))
   ;; b refused: over_budget latch is sticky
 
   {:status :success :a a :b b})
@@ -264,7 +269,7 @@ a cap is exceeded — further agent leaves are **refused** and the run ends
 - **Per-leaf attribution.** Each `budget` event records the `agent_id`, token
   counts, and cost — the dashboard shows per-leaf spend.
 - **Sticky latch.** Once tripped, the latch stays set for the rest of the run.
-  No agent leaf launches after it, even under concurrent `parallel` fan-out.
+  No step leaf launches after it, even under concurrent `parallel` fan-out.
 
 ## `sema workflow check`
 
@@ -309,7 +314,7 @@ non-loopback host exposes the run directory to the network.
 ## Macro cookbook
 
 The workflow DSL is homoiconic — agent patterns from the literature are
-macros that expand into `parallel`, `pipeline`, and `agent` forms. These are
+macros that expand into `parallel`, `pipeline`, and `step` forms. These are
 from `examples/workflows/cookbook.sema` — load and use them inside any
 `defworkflow` body.
 
@@ -320,7 +325,7 @@ Reason → act (tool) → observe, bounded rounds.
 ```sema
 (defmacro react (question tools max-rounds)
   `(let loop ((round 1) (scratch ""))
-     (let ((answer (agent (str "Question: " ,question "\n\n"
+     (let ((answer (step (str "Question: " ,question "\n\n"
                                "Reason step-by-step, call a tool when you "
                                "need a fact, then give the final answer.\n"
                                (if (= scratch "") ""
@@ -339,7 +344,7 @@ Attempt → self-critique → retry with critique, bounded.
 ```sema
 (defmacro reflexion (task max-tries)
   `(let loop ((try 1) (note ""))
-     (let ((attempt (agent (str ,task
+     (let ((attempt (step (str ,task
                                 (if (= note "") ""
                                   (str "\n\nPrevious critique:\n" note)))
                        {:name "actor"})))
@@ -382,15 +387,15 @@ Two personas argue R rounds, a judge decides.
 ```sema
 (defmacro debate (topic persona-a persona-b rounds)
   `(let loop ((r 1) (transcript (str "TOPIC: " ,topic)))
-     (let* ((arg-a (agent (str "You are " ,persona-a ". Argue your side.\n\n"
+     (let* ((arg-a (step (str "You are " ,persona-a ". Argue your side.\n\n"
                                transcript)
                           {:name ,persona-a}))
             (t1 (str transcript "\n\n" ,persona-a ": " arg-a))
-            (arg-b (agent (str "You are " ,persona-b ". Rebut.\n\n" t1)
+            (arg-b (step (str "You are " ,persona-b ". Rebut.\n\n" t1)
                           {:name ,persona-b}))
             (t2 (str t1 "\n\n" ,persona-b ": " arg-b)))
        (if (>= r ,rounds)
-         (agent (str "You are the judge. Read the debate and declare a "
+         (step (str "You are the judge. Read the debate and declare a "
                      "winner with one sentence of reasoning.\n\n" t2)
                 {:name "judge"})
          (loop (+ r 1) t2)))))
@@ -402,7 +407,7 @@ Two complete workflow examples are in `examples/workflows/`:
 
 - **`content-pipeline.sema`** — a four-phase pipeline (Topics → Write →
   Verify → Publish) that generates short explainer articles. Uses `pipeline`
-  fan-out with typed `agent` leaves and a per-item verification gate.
+  fan-out with typed `step` leaves and a per-item verification gate.
 
 - **`sema-docs-pipeline.sema`** — a six-phase pipeline (Topics → Draft →
   Review → Revise → Assemble → Publish) with journaled tool calls and a
@@ -438,7 +443,7 @@ sema workflow view [--run-dir <dir>] [--host <addr>] [--port <n>]
 ## Internal API
 
 The builtins that back the DSL are registered in `sema-stdlib/src/workflow.rs`.
-The macros (`defworkflow`, `phase`, `agent`) are in `sema-eval/src/prelude.rs`.
+The macros (`defworkflow`, `phase`, `step`) are in `sema-eval/src/prelude.rs`.
 The runtime crate (`sema-workflow`) is a leaf — it depends only on
 `sema-core` + `sema-otel` + serde, never on `sema-eval`.
 
@@ -446,6 +451,6 @@ The runtime crate (`sema-workflow`) is a leaf — it depends only on
 |---------|-------------|
 | `workflow/run` | Open a run scope, journal start/end, return `{:status …}` |
 | `workflow/phase` | Marker — close the prior phase, open a new one |
-| `workflow/agent` | Run a leaf as a journaled agent (started/result + budget) |
+| `workflow/step` | Run a leaf as a journaled step (started/result + budget) |
 | `workflow/tool-call` | Journal a tool call by the current agent |
 | `checkpoint` | Record or read a keyed step value |

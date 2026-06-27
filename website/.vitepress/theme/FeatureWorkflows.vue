@@ -13,7 +13,7 @@ import CustomPageLayout from './CustomPageLayout.vue'
         <p class="eyebrow">Feature<span class="sep">·</span>Workflows<span class="sep">·</span>Journaled<span class="sep">·</span>Resumable</p>
         <h1>Agent orchestration, <em>built in.</em></h1>
         <p class="lede">
-          Define multi-phase agent workflows as ordinary Sema code.
+          Define multi-phase agentic workflows as ordinary Sema code.
           <strong>Phases</strong> are markers, <strong>agents</strong> are LLM
           leaves, and every step is <strong>journalled</strong> to a frozen
           JSONL run directory — resume, replay, or fork without losing state.
@@ -64,12 +64,12 @@ import CustomPageLayout from './CustomPageLayout.vue'
   (<span class="c-kw">def</span> chosen topics)
 
   (<span class="c-kw">phase</span> <span class="c-str">"Write"</span>)
-  <span class="c-com">;; Fan out: one typed agent per topic,</span>
+  <span class="c-com">;; Fan out: one typed step per topic,</span>
   <span class="c-com">;; at most 4 model calls in flight.</span>
   (<span class="c-kw">def</span> articles
     (<span class="c-kw">pipeline</span> chosen
       (<span class="c-kw">fn</span> (t)
-        (<span class="c-kw">agent</span> (article-prompt t)
+        (<span class="c-kw">step</span> (article-prompt t)
                {<span class="c-kwd">:name</span> <span class="c-str">"writer"</span>
                 <span class="c-kwd">:schema</span> article}))))
 
@@ -88,7 +88,7 @@ import CustomPageLayout from './CustomPageLayout.vue'
             <ul class="feature-list">
               <li><strong>defworkflow</strong> — a macro that expands to <code>workflow/run</code>. The body is a thunk; the form <em>is</em> the run.</li>
               <li><strong>phase</strong> — a marker, not a wrapper. <code>(phase "Write")</code> opens a phase; forms after it belong to that phase until the next marker or run end.</li>
-              <li><strong>agent</strong> — an LLM leaf. With <code>:schema</code> it returns typed data (validated via <code>llm/extract</code>); without, it returns the completion text. With <code>:tools</code> it runs the real tool loop.</li>
+              <li><strong>step</strong> — a journaled LLM leaf. With <code>:schema</code> it returns typed data (validated via <code>llm/extract</code>); without, it returns the completion text. With <code>:tools</code> it runs the real tool loop. With <code>:agent</code> it runs a configured <code>defagent</code>.</li>
               <li><strong>checkpoint</strong> — <code>(checkpoint :k v)</code> records and returns <code>v</code>; <code>(checkpoint :k)</code> reads it back. Threads state between phases.</li>
               <li><strong>parallel / pipeline</strong> — bounded-concurrency fan-out. <code>parallel</code> runs thunks concurrently (barrier); <code>pipeline</code> flows each item through stages independently (no barrier between stages).</li>
               <li><strong>{:status …}</strong> — the return envelope. <code>:success</code> or <code>:failed</code>; the runtime forces <code>:failed</code> if a budget cap trips.</li>
@@ -331,11 +331,11 @@ import CustomPageLayout from './CustomPageLayout.vue'
    <span class="c-kwd">:budget</span> {<span class="c-kwd">:tokens</span> 5000}}
 
   (<span class="c-kw">phase</span> <span class="c-str">"Scan"</span>)
-  (<span class="c-kw">def</span> a (agent <span class="c-str">"Find files."</span> {}))
+  (<span class="c-kw">def</span> a (step <span class="c-str">"Find files."</span> {}))
   <span class="c-com">;; a burns 5200 tokens → cap trips</span>
 
   (<span class="c-kw">phase</span> <span class="c-str">"Report"</span>)
-  (<span class="c-kw">def</span> b (agent <span class="c-str">"Summarize."</span> {}))
+  (<span class="c-kw">def</span> b (step <span class="c-str">"Summarize."</span> {}))
   <span class="c-com">;; b refused: over_budget latch</span>
 
   {<span class="c-kwd">:status</span> <span class="c-kwd">:success</span>
@@ -349,14 +349,14 @@ import CustomPageLayout from './CustomPageLayout.vue'
             <h2>Spend caps that actually trip.</h2>
             <p class="sub">
               Declare <code>:budget {:tokens N :usd M}</code> in the workflow
-              metadata. The runtime charges each agent leaf and latches a
+              metadata. The runtime charges each step leaf and latches a
               sticky <code>over_budget</code> flag when a cap is exceeded —
-              further agent leaves are refused and the run ends
+              further step leaves are refused and the run ends
               <code>{:status :failed :reason "budget exceeded"}</code>.
             </p>
             <ul class="feature-list">
               <li><strong>Per-leaf attribution.</strong> Each <code>budget</code> event records the <code>agent_id</code>, token counts, and cost — so the dashboard shows per-leaf spend, not just a total.</li>
-              <li><strong>Sticky latch.</strong> Once a cap trips, the latch stays set. No agent leaf launches after it — even under concurrent <code>parallel</code> fan-out.</li>
+              <li><strong>Sticky latch.</strong> Once a cap trips, the latch stays set. No step leaf launches after it — even under concurrent <code>parallel</code> fan-out.</li>
               <li><strong>Resume doesn't double-charge.</strong> A <code>--resume</code> run starts spend at zero. Memoized leaves replay for free.</li>
               <li><strong>USD is best-effort.</strong> Token caps are deterministic; USD caps depend on the pricing table being available.</li>
             </ul>
@@ -373,7 +373,7 @@ import CustomPageLayout from './CustomPageLayout.vue'
         <p class="sub">
           The workflow DSL is homoiconic — agent patterns from the literature
           are macros that expand into <code>parallel</code>, <code>pipeline</code>,
-          and <code>agent</code> forms. No framework, no runtime tax. These are
+          and <code>step</code> forms. No framework, no runtime tax. These are
           from <code>examples/workflows/cookbook.sema</code> — load and use them.
         </p>
 
@@ -381,10 +381,10 @@ import CustomPageLayout from './CustomPageLayout.vue'
           <div class="cook-card">
             <h3>ReAct</h3>
             <p class="cook-tag">think → act → observe → repeat</p>
-            <p>The agent reasons about each tool result before deciding the next step. The loop is a <code>let loop</code> over an accumulator — bounded by <code>max-rounds</code>.</p>
+            <p>The step reasons about each tool result before deciding the next step. The loop is a <code>let loop</code> over an accumulator — bounded by <code>max-rounds</code>.</p>
             <pre>(<span class="c-kw">defmacro</span> <span class="c-fn">react</span> (question tools max-rounds)
   `(let loop ((round 1) (scratch ""))
-     (let ((answer (agent (str "Q: " ,question "\n"
+     (let ((answer (step (str "Q: " ,question "\n"
                               scratch)
                         {:name "react"
                          :tools ,tools})))
@@ -398,10 +398,10 @@ import CustomPageLayout from './CustomPageLayout.vue'
           <div class="cook-card">
             <h3>Reflexion</h3>
             <p class="cook-tag">try → self-critique → retry</p>
-            <p>The agent critiques its own output and retries with the feedback. A critic reply starting with "OK" short-circuits. Bounded by <code>max-tries</code>.</p>
+            <p>The step critiques its own output and retries with the feedback. A critic reply starting with "OK" short-circuits. Bounded by <code>max-tries</code>.</p>
             <pre>(<span class="c-kw">defmacro</span> <span class="c-fn">reflexion</span> (task max-tries)
   `(let loop ((try 1) (note ""))
-     (let ((attempt (agent ,task {:name "actor"})))
+     (let ((attempt (step ,task {:name "actor"})))
        (if (>= try ,max-tries) attempt
          (let ((critique (step
            (str "Critique. Reply OK if good.\n\n"
@@ -435,14 +435,14 @@ import CustomPageLayout from './CustomPageLayout.vue'
             <p>Two personas argue R rounds; a judge reads the transcript and decides. Each round is two <code>step</code> leaves; the judge is a third.</p>
             <pre>(<span class="c-kw">defmacro</span> <span class="c-fn">debate</span> (topic a b rounds)
   `(let loop ((r 1) (transcript topic))
-     (let* ((arg-a (agent (str "You are " ,a ".\n"
+     (let* ((arg-a (step (str "You are " ,a ".\n"
                               transcript) {:name ,a}))
             (t1 (str transcript "\n\n" ,a ": " arg-a))
-            (arg-b (agent (str "You are " ,b ".\n"
+            (arg-b (step (str "You are " ,b ".\n"
                               t1) {:name ,b}))
             (t2 (str t1 "\n\n" ,b ": " arg-b)))
        (if (>= r ,rounds)
-         (agent (str "Judge the debate:\n" t2)
+         (step (str "Judge the debate:\n" t2)
            {:name "judge"})
          (loop (+ r 1) t2)))))</pre>
           </div>

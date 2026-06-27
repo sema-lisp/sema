@@ -4,8 +4,8 @@ use std::collections::BTreeMap;
 use std::rc::Rc;
 
 use sema_core::{
-    resolve, Conversation, Env, EvalContext, ImageAttachment, Message, NativeFn, Prompt, Role,
-    SemaError, Value, ValueView,
+    resolve, Agent, Conversation, Env, EvalContext, ImageAttachment, Message, NativeFn, Prompt,
+    Role, SemaError, Value, ValueView,
 };
 
 use sha2::{Digest, Sha256};
@@ -27,6 +27,21 @@ thread_local! {
     static PROVIDER_REGISTRY: RefCell<ProviderRegistry> = RefCell::new(ProviderRegistry::new());
     static SESSION_USAGE: RefCell<Usage> = RefCell::new(Usage::default());
     static LAST_USAGE: RefCell<Option<Usage>> = const { RefCell::new(None) };
+    /// The per-leaf usage accumulator active for the CURRENT TASK. The workflow
+    /// runtime opens a fresh frame (via [`open_usage_scope`]) around each agent leaf;
+    /// `track_usage` folds the completion it records into this frame. Unlike the single
+    /// `LAST_USAGE` slot, this survives concurrent parallel/pipeline fan-out: it is a
+    /// per-TASK slot (captured at task spawn, swapped in/out at each task step via the
+    /// `sema_core` usage-scope seam — mirroring the otel context), so a sibling leaf
+    /// running concurrently can't clobber an in-flight leaf's tally. A multi-round tool
+    /// loop SUMS every round's usage instead of seeing only the last. The async
+    /// completion path additionally captures this frame's `Rc` into its poller closure
+    /// so the fold lands even though the poller runs outside the task-step boundary.
+    static ACTIVE_LEAF_SCOPE: RefCell<Option<Rc<RefCell<LeafUsage>>>> = const { RefCell::new(None) };
+    /// Set while an async completion's poller folds usage into a CAPTURED frame Rc.
+    /// Suppresses `track_usage`'s own active-frame fold so the async path counts each
+    /// completion exactly once.
+    static USAGE_ACCUM_SUPPRESS: Cell<bool> = const { Cell::new(false) };
     static SESSION_COST: RefCell<f64> = const { RefCell::new(0.0) };
     static BUDGET_LIMIT: RefCell<Option<f64>> = const { RefCell::new(None) };
     static BUDGET_SPENT: RefCell<f64> = const { RefCell::new(0.0) };
@@ -37,6 +52,33 @@ thread_local! {
     /// the only honest place to gate). Default off — streams don't enforce the budget.
     static STREAM_BUDGET_PREGATE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static BUDGET_STACK: RefCell<Vec<BudgetFrame>> = const { RefCell::new(Vec::new()) };
+    /// Pluggable memory callbacks, set by `sema-stdlib` when it registers the memory
+    /// module. Allows `agent/run` to seed from and append to a memory handle without
+    /// depending on `sema-stdlib` (which would be circular).
+    static MEMORY_CALLBACKS: RefCell<Option<MemoryCbs>> = const { RefCell::new(None) };
+}
+
+/// Function-pointer table injected by `sema-stdlib/memory.rs` via
+/// [`register_memory_callbacks`]. Both slots are plain `fn` pointers (not closures)
+/// so they satisfy the `'static` bound required by `thread_local!`.
+struct MemoryCbs {
+    get_working: fn(&Value) -> Result<Vec<crate::types::ChatMessage>, sema_core::SemaError>,
+    append_back: fn(&Value, &[crate::types::ChatMessage]) -> Result<(), sema_core::SemaError>,
+}
+
+/// Register the memory integration callbacks. Called once by `sema-stdlib/memory.rs`
+/// during its `register(env)` call. Uses plain `fn` pointers so the callbacks are
+/// `'static` and thread-safe within the single-threaded runtime model.
+pub fn register_memory_callbacks(
+    get_working: fn(&Value) -> Result<Vec<crate::types::ChatMessage>, sema_core::SemaError>,
+    append_back: fn(&Value, &[crate::types::ChatMessage]) -> Result<(), sema_core::SemaError>,
+) {
+    MEMORY_CALLBACKS.with(|c| {
+        *c.borrow_mut() = Some(MemoryCbs {
+            get_working,
+            append_back,
+        });
+    });
 }
 
 /// A small snapshot of the most recent completion's usage, for callers (e.g. the
@@ -71,6 +113,120 @@ pub fn last_usage_snapshot() -> Option<LastUsage> {
             cost_usd: pricing::calculate_cost(usage),
         })
     })
+}
+
+/// One per-leaf usage tally, summed across every completion a single agent leaf makes
+/// (e.g. every round of a multi-round tool loop). `calls == 0` means the leaf made no
+/// (non-cache-hit) provider call — the workflow runtime then emits NO budget event,
+/// honoring the cache-hit-zero-usage invariant (no phantom zero Budget event).
+#[derive(Debug, Clone, Default)]
+pub struct LeafUsage {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    /// Summed cost; `None` while no priced call has landed, `Some` once one has (a
+    /// later unpriced call leaves the running sum unchanged).
+    pub cost_usd: Option<f64>,
+    /// The model of the most recent priced/recorded call in this scope.
+    pub model: String,
+    pub calls: u32,
+}
+
+/// Fold one completion's usage into a `LeafUsage` tally. A cache hit (all-zero usage)
+/// does NOT increment `calls`, so a purely-cached leaf stays filtered downstream.
+fn accumulate_into(slot: &Rc<RefCell<LeafUsage>>, usage: &Usage, cost: Option<f64>) {
+    let input = usage.prompt_tokens as u64;
+    let output = usage.completion_tokens as u64;
+    // Cache-hit-zero-usage invariant: an all-zero, unpriced completion is a cache hit;
+    // don't count it as a call (no phantom zero Budget event for a cached leaf).
+    if input == 0 && output == 0 && cost.is_none() {
+        return;
+    }
+    let mut acc = slot.borrow_mut();
+    acc.input_tokens += input;
+    acc.output_tokens += output;
+    if let Some(c) = cost {
+        acc.cost_usd = Some(acc.cost_usd.unwrap_or(0.0) + c);
+    }
+    if !usage.model.is_empty() {
+        acc.model = usage.model.clone();
+    }
+    acc.calls += 1;
+}
+
+/// RAII handle for a per-leaf usage accumulator. Installs a fresh frame as the active
+/// (per-task) scope on construction and restores the previously-active one on drop, so
+/// sequential/nested leaves nest correctly. The workflow runtime reads
+/// [`UsageScope::usage`] before drop to attribute tokens/cost to the leaf.
+pub struct UsageScope {
+    slot: Rc<RefCell<LeafUsage>>,
+    /// The scope that was active before this one, restored on drop.
+    prev: Option<Rc<RefCell<LeafUsage>>>,
+}
+
+impl UsageScope {
+    /// Read the accumulated tally for this scope's leaf.
+    pub fn usage(&self) -> LeafUsage {
+        self.slot.borrow().clone()
+    }
+}
+
+impl Drop for UsageScope {
+    fn drop(&mut self) {
+        ACTIVE_LEAF_SCOPE.with(|s| *s.borrow_mut() = self.prev.take());
+    }
+}
+
+/// Open a per-leaf usage accumulation scope. `track_usage` folds each completion made
+/// while the returned guard is alive into this scope's frame; the async completion path
+/// captures the frame's `Rc` into its poller so an in-flight leaf is tallied even after
+/// a sibling task runs. The guard restores the prior active scope on drop.
+pub fn open_usage_scope() -> UsageScope {
+    let slot = Rc::new(RefCell::new(LeafUsage::default()));
+    let prev = ACTIVE_LEAF_SCOPE.with(|s| s.borrow_mut().replace(Rc::clone(&slot)));
+    UsageScope { slot, prev }
+}
+
+/// Clone the active (per-task) usage-accumulator frame's `Rc`, if any. The async
+/// completion path captures this at yield time so the poller folds usage into the
+/// LEAF'S OWN frame — correct even across a concurrent sibling task.
+fn current_usage_accum() -> Option<Rc<RefCell<LeafUsage>>> {
+    ACTIVE_LEAF_SCOPE.with(|s| s.borrow().clone())
+}
+
+// ── Per-task active-leaf-scope seam (registered into sema-core) ─────
+//
+// The scheduler captures the active leaf scope at task spawn and swaps it in/out at
+// each task step (just like the otel context), so an inline agent thunk inherits the
+// scope its `workflow/step` opened and concurrent sibling tasks stay isolated. These
+// fns are the type-erased bridge sema-core calls; the `Rc` is carried in a `Box<dyn
+// Any>` holding `Option<Rc<RefCell<LeafUsage>>>`.
+
+/// Capture (clone) the active leaf scope to seed onto a freshly-spawned task.
+fn capture_usage_scope() -> Box<dyn std::any::Any> {
+    Box::new(ACTIVE_LEAF_SCOPE.with(|s| s.borrow().clone()))
+}
+
+/// Take the active leaf scope out of the thread-local (leaving none).
+fn take_usage_scope() -> Box<dyn std::any::Any> {
+    Box::new(ACTIVE_LEAF_SCOPE.with(|s| s.borrow_mut().take()))
+}
+
+/// Install a leaf scope into the thread-local, returning the one displaced.
+fn install_usage_scope(ctx: Box<dyn std::any::Any>) -> Box<dyn std::any::Any> {
+    let incoming: Option<Rc<RefCell<LeafUsage>>> = ctx
+        .downcast::<Option<Rc<RefCell<LeafUsage>>>>()
+        .map(|b| *b)
+        .unwrap_or(None);
+    Box::new(ACTIVE_LEAF_SCOPE.with(|s| std::mem::replace(&mut *s.borrow_mut(), incoming)))
+}
+
+/// Register the per-task usage-scope callbacks with sema-core. Called once at startup.
+pub fn register_usage_scope_task_callbacks() {
+    sema_core::set_usage_scope_task_callbacks(
+        capture_usage_scope,
+        take_usage_scope,
+        install_usage_scope,
+    );
 }
 
 #[derive(Clone)]
@@ -175,6 +331,11 @@ pub fn reset_runtime_state() {
     PROVIDER_REGISTRY.with(|r| *r.borrow_mut() = ProviderRegistry::new());
     SESSION_USAGE.with(|u| *u.borrow_mut() = Usage::default());
     LAST_USAGE.with(|u| *u.borrow_mut() = None);
+    ACTIVE_LEAF_SCOPE.with(|s| *s.borrow_mut() = None);
+    USAGE_ACCUM_SUPPRESS.with(|s| s.set(false));
+    // Idempotently register the per-task usage-scope seam (fn-pointer thread-locals)
+    // so the scheduler can swap the active leaf scope in/out per task step.
+    register_usage_scope_task_callbacks();
     SESSION_COST.with(|c| *c.borrow_mut() = 0.0);
     BUDGET_LIMIT.with(|l| *l.borrow_mut() = None);
     BUDGET_SPENT.with(|s| *s.borrow_mut() = 0.0);
@@ -312,6 +473,15 @@ fn track_usage(usage: &Usage) -> Result<(), SemaError> {
     let total_tokens = (usage.prompt_tokens + usage.completion_tokens) as u64;
 
     LAST_USAGE.with(|u| *u.borrow_mut() = Some(usage.clone()));
+    // Fold into the active per-task leaf accumulator for the workflow runtime. SUMS
+    // every round of a multi-round tool loop; cache hits (all-zero) don't bump `calls`.
+    // The async poller captures the leaf's own frame Rc and folds there instead, so it
+    // sets USAGE_ACCUM_SUPPRESS to keep this fold from double-counting.
+    if !USAGE_ACCUM_SUPPRESS.with(|s| s.get()) {
+        if let Some(slot) = current_usage_accum() {
+            accumulate_into(&slot, usage, cost);
+        }
+    }
     SESSION_USAGE.with(|u| {
         let mut session = u.borrow_mut();
         session.prompt_tokens += usage.prompt_tokens;
@@ -1127,139 +1297,6 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
                     reg.register(Box::new(provider));
                     reg.set_default("moonshot");
                 }
-                "deepseek" => {
-                    let api_key = api_key
-                        .clone()
-                        .ok_or_else(|| SemaError::Llm("missing :api-key".to_string()))?;
-                    let model = get_opt_string(&opts, "default-model")
-                        .unwrap_or_else(|| "deepseek-v4-flash".to_string());
-                    let base_url = get_opt_string(&opts, "base-url")
-                        .unwrap_or_else(|| "https://api.deepseek.com".to_string());
-                    let provider = OpenAiProvider::named(
-                        "deepseek".to_string(),
-                        api_key,
-                        base_url,
-                        model,
-                        false,
-                    )
-                    .map_err(|e| SemaError::Llm(e.to_string()))?;
-                    reg.register(Box::new(provider));
-                    reg.set_default("deepseek");
-                }
-                "openrouter" => {
-                    let api_key = api_key
-                        .clone()
-                        .ok_or_else(|| SemaError::Llm("missing :api-key".to_string()))?;
-                    let model = get_opt_string(&opts, "default-model")
-                        .unwrap_or_else(|| "openai/gpt-5.2".to_string());
-                    let base_url = get_opt_string(&opts, "base-url")
-                        .unwrap_or_else(|| "https://openrouter.ai/api/v1".to_string());
-                    let provider = OpenAiProvider::named(
-                        "openrouter".to_string(),
-                        api_key,
-                        base_url,
-                        model,
-                        true,
-                    )
-                    .map_err(|e| SemaError::Llm(e.to_string()))?;
-                    reg.register(Box::new(provider));
-                    reg.set_default("openrouter");
-                }
-                "together" => {
-                    let api_key = api_key
-                        .clone()
-                        .ok_or_else(|| SemaError::Llm("missing :api-key".to_string()))?;
-                    let model = get_opt_string(&opts, "default-model")
-                        .unwrap_or_else(|| "meta-llama/Llama-4-Scout-17B-16E-Instruct".to_string());
-                    let base_url = get_opt_string(&opts, "base-url")
-                        .unwrap_or_else(|| "https://api.together.ai/v1".to_string());
-                    let provider = OpenAiProvider::named(
-                        "together".to_string(),
-                        api_key,
-                        base_url,
-                        model,
-                        false,
-                    )
-                    .map_err(|e| SemaError::Llm(e.to_string()))?;
-                    reg.register(Box::new(provider));
-                    reg.set_default("together");
-                }
-                "fireworks" => {
-                    let api_key = api_key
-                        .clone()
-                        .ok_or_else(|| SemaError::Llm("missing :api-key".to_string()))?;
-                    let model = get_opt_string(&opts, "default-model")
-                        .unwrap_or_else(|| "accounts/fireworks/models/gpt-oss-120b".to_string());
-                    let base_url = get_opt_string(&opts, "base-url")
-                        .unwrap_or_else(|| "https://api.fireworks.ai/inference/v1".to_string());
-                    let provider = OpenAiProvider::named(
-                        "fireworks".to_string(),
-                        api_key,
-                        base_url,
-                        model,
-                        false,
-                    )
-                    .map_err(|e| SemaError::Llm(e.to_string()))?;
-                    reg.register(Box::new(provider));
-                    reg.set_default("fireworks");
-                }
-                "cerebras" => {
-                    let api_key = api_key
-                        .clone()
-                        .ok_or_else(|| SemaError::Llm("missing :api-key".to_string()))?;
-                    let model = get_opt_string(&opts, "default-model")
-                        .unwrap_or_else(|| "gpt-oss-120b".to_string());
-                    let base_url = get_opt_string(&opts, "base-url")
-                        .unwrap_or_else(|| "https://api.cerebras.ai/v1".to_string());
-                    let provider = OpenAiProvider::named(
-                        "cerebras".to_string(),
-                        api_key,
-                        base_url,
-                        model,
-                        false,
-                    )
-                    .map_err(|e| SemaError::Llm(e.to_string()))?;
-                    reg.register(Box::new(provider));
-                    reg.set_default("cerebras");
-                }
-                "sambanova" => {
-                    let api_key = api_key
-                        .clone()
-                        .ok_or_else(|| SemaError::Llm("missing :api-key".to_string()))?;
-                    let model = get_opt_string(&opts, "default-model")
-                        .unwrap_or_else(|| "Meta-Llama-3.3-70B-Instruct".to_string());
-                    let base_url = get_opt_string(&opts, "base-url")
-                        .unwrap_or_else(|| "https://api.sambanova.ai/v1".to_string());
-                    let provider = OpenAiProvider::named(
-                        "sambanova".to_string(),
-                        api_key,
-                        base_url,
-                        model,
-                        false,
-                    )
-                    .map_err(|e| SemaError::Llm(e.to_string()))?;
-                    reg.register(Box::new(provider));
-                    reg.set_default("sambanova");
-                }
-                "perplexity" => {
-                    let api_key = api_key
-                        .clone()
-                        .ok_or_else(|| SemaError::Llm("missing :api-key".to_string()))?;
-                    let model = get_opt_string(&opts, "default-model")
-                        .unwrap_or_else(|| "sonar-pro".to_string());
-                    let base_url = get_opt_string(&opts, "base-url")
-                        .unwrap_or_else(|| "https://api.perplexity.ai".to_string());
-                    let provider = OpenAiProvider::named(
-                        "perplexity".to_string(),
-                        api_key,
-                        base_url,
-                        model,
-                        false,
-                    )
-                    .map_err(|e| SemaError::Llm(e.to_string()))?;
-                    reg.register(Box::new(provider));
-                    reg.set_default("perplexity");
-                }
                 "ollama" => {
                     let host =
                         get_opt_string(&opts, "host").or_else(|| get_opt_string(&opts, "base-url"));
@@ -1316,24 +1353,6 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
                     reg.register(Box::new(provider));
                     reg.set_embedding_provider("cohere");
                     reg.set_rerank_provider("cohere");
-                }
-                "nomic" => {
-                    let api_key = api_key
-                        .clone()
-                        .ok_or_else(|| SemaError::Llm("missing :api-key".to_string()))?;
-                    let model = get_opt_string(&opts, "default-model")
-                        .unwrap_or_else(|| "nomic-embed-text-v1.5".to_string());
-                    let provider = OpenAiCompatEmbeddingProvider::new(
-                        "nomic".to_string(),
-                        api_key,
-                        "https://api.nomic.ai/v1".to_string(),
-                        model,
-                    )
-                    .map_err(|e| SemaError::Llm(e.to_string()))?
-                    .with_rerank(crate::embeddings::RerankDialect::Nomic);
-                    reg.register(Box::new(provider));
-                    reg.set_embedding_provider("nomic");
-                    reg.set_rerank_provider("nomic");
                 }
                 other => {
                     // Treat unknown providers as OpenAI-compatible if base-url and api-key are provided
@@ -1554,145 +1573,6 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
                     }
                 }
             }
-            // Try DeepSeek
-            if let Ok(key) = std::env::var("DEEPSEEK_API_KEY") {
-                if !key.is_empty() {
-                    let model =
-                        model_for!("deepseek").unwrap_or_else(|| "deepseek-v4-flash".to_string());
-                    let provider = OpenAiProvider::named(
-                        "deepseek".to_string(),
-                        key,
-                        "https://api.deepseek.com".to_string(),
-                        model,
-                        false,
-                    )
-                    .map_err(|e| SemaError::Llm(e.to_string()))?;
-                    reg.register(Box::new(provider));
-                    if first_configured.is_none() {
-                        reg.set_default("deepseek");
-                        first_configured = Some("deepseek".to_string());
-                    }
-                }
-            }
-            // Try OpenRouter
-            if let Ok(key) = std::env::var("OPENROUTER_API_KEY") {
-                if !key.is_empty() {
-                    let model =
-                        model_for!("openrouter").unwrap_or_else(|| "openai/gpt-5.2".to_string());
-                    let provider = OpenAiProvider::named(
-                        "openrouter".to_string(),
-                        key,
-                        "https://openrouter.ai/api/v1".to_string(),
-                        model,
-                        true,
-                    )
-                    .map_err(|e| SemaError::Llm(e.to_string()))?;
-                    reg.register(Box::new(provider));
-                    if first_configured.is_none() {
-                        reg.set_default("openrouter");
-                        first_configured = Some("openrouter".to_string());
-                    }
-                }
-            }
-            // Try Together
-            if let Ok(key) = std::env::var("TOGETHER_API_KEY") {
-                if !key.is_empty() {
-                    let model = model_for!("together")
-                        .unwrap_or_else(|| "meta-llama/Llama-4-Scout-17B-16E-Instruct".to_string());
-                    let provider = OpenAiProvider::named(
-                        "together".to_string(),
-                        key,
-                        "https://api.together.ai/v1".to_string(),
-                        model,
-                        false,
-                    )
-                    .map_err(|e| SemaError::Llm(e.to_string()))?;
-                    reg.register(Box::new(provider));
-                    if first_configured.is_none() {
-                        reg.set_default("together");
-                        first_configured = Some("together".to_string());
-                    }
-                }
-            }
-            // Try Fireworks
-            if let Ok(key) = std::env::var("FIREWORKS_API_KEY") {
-                if !key.is_empty() {
-                    let model = model_for!("fireworks")
-                        .unwrap_or_else(|| "accounts/fireworks/models/gpt-oss-120b".to_string());
-                    let provider = OpenAiProvider::named(
-                        "fireworks".to_string(),
-                        key,
-                        "https://api.fireworks.ai/inference/v1".to_string(),
-                        model,
-                        false,
-                    )
-                    .map_err(|e| SemaError::Llm(e.to_string()))?;
-                    reg.register(Box::new(provider));
-                    if first_configured.is_none() {
-                        reg.set_default("fireworks");
-                        first_configured = Some("fireworks".to_string());
-                    }
-                }
-            }
-            // Try Cerebras
-            if let Ok(key) = std::env::var("CEREBRAS_API_KEY") {
-                if !key.is_empty() {
-                    let model =
-                        model_for!("cerebras").unwrap_or_else(|| "gpt-oss-120b".to_string());
-                    let provider = OpenAiProvider::named(
-                        "cerebras".to_string(),
-                        key,
-                        "https://api.cerebras.ai/v1".to_string(),
-                        model,
-                        false,
-                    )
-                    .map_err(|e| SemaError::Llm(e.to_string()))?;
-                    reg.register(Box::new(provider));
-                    if first_configured.is_none() {
-                        reg.set_default("cerebras");
-                        first_configured = Some("cerebras".to_string());
-                    }
-                }
-            }
-            // Try SambaNova
-            if let Ok(key) = std::env::var("SAMBANOVA_API_KEY") {
-                if !key.is_empty() {
-                    let model = model_for!("sambanova")
-                        .unwrap_or_else(|| "Meta-Llama-3.3-70B-Instruct".to_string());
-                    let provider = OpenAiProvider::named(
-                        "sambanova".to_string(),
-                        key,
-                        "https://api.sambanova.ai/v1".to_string(),
-                        model,
-                        false,
-                    )
-                    .map_err(|e| SemaError::Llm(e.to_string()))?;
-                    reg.register(Box::new(provider));
-                    if first_configured.is_none() {
-                        reg.set_default("sambanova");
-                        first_configured = Some("sambanova".to_string());
-                    }
-                }
-            }
-            // Try Perplexity
-            if let Ok(key) = std::env::var("PERPLEXITY_API_KEY") {
-                if !key.is_empty() {
-                    let model = model_for!("perplexity").unwrap_or_else(|| "sonar-pro".to_string());
-                    let provider = OpenAiProvider::named(
-                        "perplexity".to_string(),
-                        key,
-                        "https://api.perplexity.ai".to_string(),
-                        model,
-                        false,
-                    )
-                    .map_err(|e| SemaError::Llm(e.to_string()))?;
-                    reg.register(Box::new(provider));
-                    if first_configured.is_none() {
-                        reg.set_default("perplexity");
-                        first_configured = Some("perplexity".to_string());
-                    }
-                }
-            }
             // Try Google Gemini
             if let Ok(key) = std::env::var("GOOGLE_API_KEY") {
                 if !key.is_empty() {
@@ -1787,74 +1667,6 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
                     }
                     if reg.rerank_provider().is_none() {
                         reg.set_rerank_provider("cohere");
-                    }
-                }
-            }
-            if let Ok(key) = std::env::var("NOMIC_API_KEY") {
-                if !key.is_empty() {
-                    let model = embed_model_for!("nomic", "nomic-embed-text-v1.5");
-                    let provider = OpenAiCompatEmbeddingProvider::new(
-                        "nomic".to_string(),
-                        key,
-                        "https://api.nomic.ai/v1".to_string(),
-                        model,
-                    )
-                    .map_err(|e| SemaError::Llm(e.to_string()))?
-                    .with_rerank(crate::embeddings::RerankDialect::Nomic);
-                    reg.register(Box::new(provider));
-                    if reg.embedding_provider().is_none() {
-                        reg.set_embedding_provider("nomic");
-                    }
-                    if reg.rerank_provider().is_none() {
-                        reg.set_rerank_provider("nomic");
-                    }
-                }
-            }
-            if embedding_provider.is_none() {
-                if let Ok(key) = std::env::var("TOGETHER_API_KEY") {
-                    if !key.is_empty() {
-                        let model =
-                            embed_model_for!("together-embeddings", "BAAI/bge-base-en-v1.5");
-                        let provider = OpenAiCompatEmbeddingProvider::new(
-                            "together-embeddings".to_string(),
-                            key,
-                            "https://api.together.ai/v1".to_string(),
-                            model,
-                        )
-                        .map_err(|e| SemaError::Llm(e.to_string()))?
-                        .with_rerank(crate::embeddings::RerankDialect::Together);
-                        reg.register(Box::new(provider));
-                        if reg.embedding_provider().is_none() {
-                            reg.set_embedding_provider("together-embeddings");
-                        }
-                        if reg.rerank_provider().is_none() {
-                            reg.set_rerank_provider("together-embeddings");
-                        }
-                    }
-                }
-            }
-            if embedding_provider.is_none() {
-                if let Ok(key) = std::env::var("FIREWORKS_API_KEY") {
-                    if !key.is_empty() {
-                        let model = embed_model_for!(
-                            "fireworks-embeddings",
-                            "fireworks/qwen3-embedding-8b"
-                        );
-                        let provider = OpenAiCompatEmbeddingProvider::new(
-                            "fireworks-embeddings".to_string(),
-                            key,
-                            "https://api.fireworks.ai/inference/v1".to_string(),
-                            model,
-                        )
-                        .map_err(|e| SemaError::Llm(e.to_string()))?
-                        .with_rerank(crate::embeddings::RerankDialect::Fireworks);
-                        reg.register(Box::new(provider));
-                        if reg.embedding_provider().is_none() {
-                            reg.set_embedding_provider("fireworks-embeddings");
-                        }
-                        if reg.rerank_provider().is_none() {
-                            reg.set_rerank_provider("fireworks-embeddings");
-                        }
                     }
                 }
             }
@@ -2185,7 +1997,7 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
     });
 
     // (llm/extract schema text {:model "..." :validate true :retries 2 :reask? true})
-    register_fn_gated(env, sandbox, sema_core::Caps::LLM, "llm/extract", |args| {
+    register_fn(env, "llm/extract", |args| {
         if args.len() < 2 || args.len() > 3 {
             return Err(SemaError::arity("llm/extract", "2-3", args.len()));
         }
@@ -2354,7 +2166,7 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
     );
 
     // (llm/classify categories text {:model "..."})
-    register_fn_gated(env, sandbox, sema_core::Caps::LLM, "llm/classify", |args| {
+    register_fn(env, "llm/classify", |args| {
         if args.len() < 2 || args.len() > 3 {
             return Err(SemaError::arity("llm/classify", "2-3", args.len()));
         }
@@ -2748,16 +2560,88 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
             .as_ref()
             .and_then(|o| get_opt_effort(o, "reasoning-effort"));
 
-        // Build messages: prior history + new user message
-        let mut messages = if let Some(ref o) = opts {
-            if let Some(history) = o.get(&Value::keyword("messages")) {
-                sema_list_to_chat_messages(history)?
+        // ── Phase 1: :session input — seed history from a prior Conversation ──
+        // When :session is a Conversation value, extract its messages as the initial
+        // history (so turn 2 sees turn 1's full history). Also extract its
+        // conversation-id so telemetry threads across turns.
+        let (session_messages, session_conv_id): (Vec<ChatMessage>, Option<String>) =
+            if let Some(ref o) = opts {
+                if let Some(sess_val) = o.get(&Value::keyword("session")) {
+                    if let Some(conv_rc) = sess_val.as_conversation_rc() {
+                        let msgs: Vec<ChatMessage> = conv_rc
+                            .messages
+                            .iter()
+                            .map(|m| ChatMessage::new(m.role.to_string(), m.content.clone()))
+                            .collect();
+                        let cid = conv_rc.metadata.get("conversation-id").cloned();
+                        (msgs, cid)
+                    } else {
+                        (Vec::new(), None)
+                    }
+                } else {
+                    (Vec::new(), None)
+                }
             } else {
-                Vec::new()
-            }
+                (Vec::new(), None)
+            };
+
+        // ── :memory opt — seed from memory working set ────────────────────────
+        // If :memory is given and memory callbacks are registered, extract the working
+        // messages and prepend them before any :session messages. After the run, the
+        // new turns are appended back into the memory.
+        let memory_handle: Option<Value> = opts
+            .as_ref()
+            .and_then(|o| o.get(&Value::keyword("memory")).cloned());
+
+        let memory_seed: Vec<ChatMessage> = if let Some(ref h) = memory_handle {
+            MEMORY_CALLBACKS.with(|c| {
+                if let Some(ref cbs) = *c.borrow() {
+                    (cbs.get_working)(h).unwrap_or_default()
+                } else {
+                    Vec::new()
+                }
+            })
         } else {
             Vec::new()
         };
+        let memory_seed_len = memory_seed.len();
+
+        // Generate (or reuse) the conversation-id BEFORE run_tool_loop so we can
+        // attach it to the :session output conversation. Explicit :conversation-id opt
+        // wins; then the :session's stored id; otherwise generate a fresh one.
+        let output_conv_id: String = session_conv_id
+            .clone()
+            .or_else(|| {
+                opts.as_ref()
+                    .and_then(|o| o.get(&Value::keyword("conversation-id")))
+                    .and_then(|v| v.as_str().map(|s| s.to_string()))
+            })
+            .unwrap_or_else(sema_otel::new_conversation_id);
+
+        let conv_scope = ConvScope {
+            conversation: Some(output_conv_id.clone()),
+            session: opts
+                .as_ref()
+                .and_then(|o| o.get(&Value::keyword("session-id")))
+                .and_then(|v| v.as_str().map(|s| s.to_string())),
+            user: opts
+                .as_ref()
+                .and_then(|o| o.get(&Value::keyword("user-id")))
+                .and_then(|v| v.as_str().map(|s| s.to_string())),
+        };
+
+        // Build messages: memory working set + session history + :messages history + new user.
+        // Track the pre-user-push count so we can slice new turns for memory append.
+        let mut messages: Vec<ChatMessage> = memory_seed;
+        messages.extend(session_messages);
+        if let Some(ref o) = opts {
+            if let Some(history) = o.get(&Value::keyword("messages")) {
+                let extra = sema_list_to_chat_messages(history)?;
+                messages.extend(extra);
+            }
+        }
+        // Capture the index of the first NEW turn (user+assistant) before the user push.
+        let pre_user_count = messages.len();
         messages.push(ChatMessage::new("user", user_msg));
 
         let tool_schemas = build_tool_schemas(&agent.tools)?;
@@ -2784,17 +2668,54 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
             agent.max_turns,
             on_tool_call.as_ref(),
             Some(&agent.name),
-            ConvScope::from_opts(opts.as_ref()),
+            conv_scope,
         )?;
 
-        // 3-arg form with opts: return {:response "..." :messages [...]}
+        // ── :memory post-run: append new turns back into the memory thread ────
+        // Append turns from pre_user_count onward (user turn + new assistant turns).
+        // This excludes the memory seed (already in memory) but includes session/extra
+        // history only if it was new (which is correct — those are the new turns).
+        // We want to persist user + assistant: slice from pre_user_count.
+        if let Some(ref h) = memory_handle {
+            let new_turns = if final_messages.len() > pre_user_count {
+                &final_messages[pre_user_count..]
+            } else {
+                &[]
+            };
+            let _ = memory_seed_len; // consumed above, silence warning
+            MEMORY_CALLBACKS.with(|c| {
+                if let Some(ref cbs) = *c.borrow() {
+                    let _ = (cbs.append_back)(h, new_turns);
+                }
+            });
+        }
+
+        // 3-arg form with opts: return {:response "..." :messages [...] :session <conv>}
         if opts.is_some() {
+            let mut meta = std::collections::BTreeMap::new();
+            meta.insert("conversation-id".to_string(), output_conv_id);
+            let session_conv = Conversation {
+                messages: final_messages
+                    .iter()
+                    .map(|m| Message {
+                        role: match m.role.as_str() {
+                            "assistant" => Role::Assistant,
+                            _ => Role::User,
+                        },
+                        content: m.content.to_text(),
+                        images: Vec::new(),
+                    })
+                    .collect(),
+                model: agent.model.clone(),
+                metadata: meta,
+            };
             let mut map = BTreeMap::new();
             map.insert(Value::keyword("response"), Value::string(&result));
             map.insert(
                 Value::keyword("messages"),
                 chat_messages_to_sema_list(&final_messages),
             );
+            map.insert(Value::keyword("session"), Value::conversation(session_conv));
             Ok(Value::map(map))
         } else {
             // 2-arg form: return string (backward compat)
@@ -2961,9 +2882,6 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
     // (llm/configure-embeddings :jina {:api-key "..."})
     // (llm/configure-embeddings :voyage {:api-key "..."})
     // (llm/configure-embeddings :cohere {:api-key "..."})
-    // (llm/configure-embeddings :nomic {:api-key "..."})
-    // (llm/configure-embeddings :together {:api-key "..."})
-    // (llm/configure-embeddings :fireworks {:api-key "..."})
     register_fn(env, "llm/configure-embeddings", move |args| {
         if args.len() != 2 {
             return Err(SemaError::arity(
@@ -2999,11 +2917,9 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
                         "https://api.jina.ai/v1".to_string(),
                         model,
                     )
-                    .map_err(|e| SemaError::Llm(e.to_string()))?
-                    .with_rerank(crate::embeddings::RerankDialect::Jina);
+                    .map_err(|e| SemaError::Llm(e.to_string()))?;
                     reg.register(Box::new(provider));
                     reg.set_embedding_provider("jina");
-                    reg.set_rerank_provider("jina");
                 }
                 "voyage" => {
                     let api_key = api_key
@@ -3017,11 +2933,9 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
                         "https://api.voyageai.com/v1".to_string(),
                         model,
                     )
-                    .map_err(|e| SemaError::Llm(e.to_string()))?
-                    .with_rerank(crate::embeddings::RerankDialect::Voyage);
+                    .map_err(|e| SemaError::Llm(e.to_string()))?;
                     reg.register(Box::new(provider));
                     reg.set_embedding_provider("voyage");
-                    reg.set_rerank_provider("voyage");
                 }
                 "cohere" => {
                     let api_key = api_key
@@ -3032,61 +2946,6 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
                         .map_err(|e| SemaError::Llm(e.to_string()))?;
                     reg.register(Box::new(provider));
                     reg.set_embedding_provider("cohere");
-                    reg.set_rerank_provider("cohere");
-                }
-                "nomic" => {
-                    let api_key = api_key
-                        .clone()
-                        .ok_or_else(|| SemaError::Llm("missing :api-key".to_string()))?;
-                    let model = get_opt_string(&opts, "default-model")
-                        .unwrap_or_else(|| "nomic-embed-text-v1.5".to_string());
-                    let provider = OpenAiCompatEmbeddingProvider::new(
-                        "nomic".to_string(),
-                        api_key,
-                        "https://api.nomic.ai/v1".to_string(),
-                        model,
-                    )
-                    .map_err(|e| SemaError::Llm(e.to_string()))?
-                    .with_rerank(crate::embeddings::RerankDialect::Nomic);
-                    reg.register(Box::new(provider));
-                    reg.set_embedding_provider("nomic");
-                    reg.set_rerank_provider("nomic");
-                }
-                "together" => {
-                    let api_key = api_key
-                        .clone()
-                        .ok_or_else(|| SemaError::Llm("missing :api-key".to_string()))?;
-                    let model = get_opt_string(&opts, "default-model")
-                        .unwrap_or_else(|| "BAAI/bge-base-en-v1.5".to_string());
-                    let provider = OpenAiCompatEmbeddingProvider::new(
-                        "together-embeddings".to_string(),
-                        api_key,
-                        "https://api.together.ai/v1".to_string(),
-                        model,
-                    )
-                    .map_err(|e| SemaError::Llm(e.to_string()))?
-                    .with_rerank(crate::embeddings::RerankDialect::Together);
-                    reg.register(Box::new(provider));
-                    reg.set_embedding_provider("together-embeddings");
-                    reg.set_rerank_provider("together-embeddings");
-                }
-                "fireworks" => {
-                    let api_key = api_key
-                        .clone()
-                        .ok_or_else(|| SemaError::Llm("missing :api-key".to_string()))?;
-                    let model = get_opt_string(&opts, "default-model")
-                        .unwrap_or_else(|| "fireworks/qwen3-embedding-8b".to_string());
-                    let provider = OpenAiCompatEmbeddingProvider::new(
-                        "fireworks-embeddings".to_string(),
-                        api_key,
-                        "https://api.fireworks.ai/inference/v1".to_string(),
-                        model,
-                    )
-                    .map_err(|e| SemaError::Llm(e.to_string()))?
-                    .with_rerank(crate::embeddings::RerankDialect::Fireworks);
-                    reg.register(Box::new(provider));
-                    reg.set_embedding_provider("fireworks-embeddings");
-                    reg.set_rerank_provider("fireworks-embeddings");
                 }
                 _ => {
                     // Default: OpenAI-compatible
@@ -3739,6 +3598,57 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
             .as_tool_def_rc()
             .ok_or_else(|| SemaError::type_error("tool", args[0].type_name()))?;
         Ok(t.parameters.clone())
+    });
+
+    // (agent {:system "…" :tools […] :model "…" :max-turns N}) — build an anonymous,
+    // reusable actor value (system prompt + tools + model + max-turns) without binding
+    // it. The named form is `defagent`; this is the plain constructor used inline (e.g.
+    // `(define bot (agent {:tools [t]}))` or passed to a `step` via `:agent`). All opts
+    // are optional; the name is empty for an anonymous agent (a `:agent` step falls back
+    // to the role label "step" when the name is empty). Mirrors `register_agent`'s opts
+    // extraction in sema-eval, the path `defagent` uses.
+    register_fn(env, "agent", |args| {
+        if args.len() != 1 {
+            return Err(SemaError::arity("agent", "1", args.len()));
+        }
+        let opts = args[0]
+            .as_map_rc()
+            .ok_or_else(|| SemaError::type_error("map", args[0].type_name()))?;
+        let system = opts
+            .get(&Value::keyword("system"))
+            .and_then(|v| v.as_str().map(|s| s.to_string()))
+            .unwrap_or_default();
+        let tools = opts
+            .get(&Value::keyword("tools"))
+            .map(|v| {
+                if let Some(l) = v.as_list() {
+                    l.to_vec()
+                } else if let Some(v) = v.as_vector() {
+                    v.to_vec()
+                } else {
+                    vec![]
+                }
+            })
+            .unwrap_or_default();
+        let max_turns = opts
+            .get(&Value::keyword("max-turns"))
+            .and_then(|v| v.as_int())
+            .unwrap_or(10) as usize;
+        let model = opts
+            .get(&Value::keyword("model"))
+            .and_then(|v| v.as_str().map(|s| s.to_string()))
+            .unwrap_or_default();
+        let name = opts
+            .get(&Value::keyword("name"))
+            .and_then(|v| v.as_str().map(|s| s.to_string()))
+            .unwrap_or_default();
+        Ok(Value::agent(Agent {
+            name,
+            system,
+            tools,
+            max_turns,
+            model,
+        }))
     });
 
     // Agent accessor functions
@@ -5064,21 +4974,6 @@ fn format_schema(val: &Value) -> String {
                 } else {
                     "any".to_string()
                 }
-            } else if let Some(seq) = v.as_seq() {
-                // [:string] → "array of string"
-                if seq.len() == 1 {
-                    let inner = &seq[0];
-                    let inner_str = inner
-                        .as_keyword()
-                        .or_else(|| inner.as_str().map(|s| s.to_string()))
-                        .unwrap_or_else(|| inner.to_string());
-                    format!("array of {inner_str}")
-                } else {
-                    "array".to_string()
-                }
-            } else if v.as_keyword().is_some() {
-                // Bare keyword like :string — sent as a type hint
-                v.as_keyword().unwrap_or_else(|| "any".to_string())
             } else {
                 "any".to_string()
             };
@@ -5138,11 +5033,6 @@ fn validate_extraction(result: &Value, schema: &Value) -> Result<(), String> {
                         let ok = match type_name.as_str() {
                             "string" => val.as_str().is_some(),
                             "number" => val.as_float().is_some(),
-                            "int" => {
-                                val.as_int().is_some() || {
-                                    val.as_float().map(|f| f.fract() == 0.0).unwrap_or(false)
-                                }
-                            }
                             "boolean" | "bool" => val.as_bool().is_some(),
                             "list" | "array" => val.as_seq().is_some(),
                             _ => true,
@@ -5174,41 +5064,6 @@ fn validate_extraction(result: &Value, schema: &Value) -> Result<(), String> {
                             }
                             Err(e) => {
                                 errors.push(format!("key {key_name}: validation error: {e}"));
-                            }
-                        }
-                    }
-                } else if let Some(seq) = field_spec.as_seq() {
-                    // [:string] → list of string: validate that value is a sequence
-                    // and each element matches the inner type.
-                    if val.as_seq().is_none() {
-                        errors.push(format!(
-                            "key {key_name}: expected list, got {}",
-                            val.type_name()
-                        ));
-                        continue;
-                    }
-                    if seq.len() == 1 {
-                        let inner_type = seq[0]
-                            .as_keyword()
-                            .or_else(|| seq[0].as_str().map(|s| s.to_string()))
-                            .unwrap_or_else(|| seq[0].to_string());
-                        for (i, elem) in val.as_seq().unwrap().iter().enumerate() {
-                            let elem_ok = match inner_type.as_str() {
-                                "string" => elem.as_str().is_some(),
-                                "number" => elem.as_float().is_some(),
-                                "int" => {
-                                    elem.as_int().is_some() || {
-                                        elem.as_float().map(|f| f.fract() == 0.0).unwrap_or(false)
-                                    }
-                                }
-                                "boolean" | "bool" => elem.as_bool().is_some(),
-                                _ => true,
-                            };
-                            if !elem_ok {
-                                errors.push(format!(
-                                    "key {key_name}[{i}]: expected {inner_type}, got {}",
-                                    elem.type_name()
-                                ));
                             }
                         }
                     }
@@ -5787,6 +5642,12 @@ fn do_complete_async_yield(
     // post-call work runs on the VM thread when the future lands.
     let mut span_slot = Some(span);
     let mut finalize_slot = Some(finalize);
+    // Capture THIS leaf's per-leaf usage accumulator frame (if a workflow scope is
+    // open) the same way the otel span crosses the yield via `span_slot`. Folding into
+    // this captured Rc — not whatever frame is on top when the future lands — is what
+    // makes async fan-out correct: a sibling leaf opening its own scope can't clobber
+    // this in-flight leaf's tally.
+    let usage_accum_slot = current_usage_accum();
     let request_for_messages = request;
     let handle = Rc::new(sema_core::IoHandle::new(move || {
         use tokio::sync::oneshot::error::TryRecvError;
@@ -5833,9 +5694,26 @@ fn do_complete_async_yield(
                         }
                     });
                 }
+                // Fold this completion into the LEAF'S OWN captured accumulator frame —
+                // the `Rc` snapshotted at yield time, not whatever scope is active when
+                // the future lands (the poller runs outside the per-task install
+                // boundary, so the thread-local may now hold a sibling's scope). Price
+                // it the same way `track_usage` does — by the serving provider — then
+                // suppress `track_usage`'s own active-frame fold so this completion is
+                // counted exactly once.
+                if let Some(slot) = &usage_accum_slot {
+                    let cost = pricing::calculate_cost_for(&serving_provider, &resp.usage);
+                    accumulate_into(slot, &resp.usage, cost);
+                }
                 // Account on the VM thread, then shape the value. A budget overrun
                 // fails the task, exactly as the sync path's `?`.
-                if let Err(e) = track_usage(&resp.usage) {
+                let track_result = USAGE_ACCUM_SUPPRESS.with(|s| {
+                    s.set(true);
+                    let r = track_usage(&resp.usage);
+                    s.set(false);
+                    r
+                });
+                if let Err(e) = track_result {
                     return sema_core::IoPoll::Ready(Err(e.to_string()));
                 }
                 let finalize = finalize_slot.take().expect("finalize used once");
@@ -6995,6 +6873,94 @@ mod tests {
     use super::*;
     use sema_core::{intern, Lambda};
     use serde_json::json;
+
+    fn usage(prompt: u32, completion: u32) -> Usage {
+        Usage {
+            prompt_tokens: prompt,
+            completion_tokens: completion,
+            model: "fake-model".into(),
+            ..Usage::default()
+        }
+    }
+
+    #[test]
+    fn accumulate_into_sums_tokens_cost_and_calls() {
+        let slot = Rc::new(RefCell::new(LeafUsage::default()));
+        accumulate_into(&slot, &usage(10, 5), Some(0.001));
+        accumulate_into(&slot, &usage(100, 50), Some(0.002));
+        let u = slot.borrow();
+        assert_eq!(u.input_tokens, 110, "tokens sum across calls");
+        assert_eq!(u.output_tokens, 55);
+        assert!((u.cost_usd.unwrap() - 0.003).abs() < 1e-9, "cost sums");
+        assert_eq!(u.calls, 2);
+        assert_eq!(u.model, "fake-model");
+    }
+
+    #[test]
+    fn accumulate_into_skips_cache_hit_zero_usage() {
+        // A cache hit is all-zero + unpriced — it must NOT count as a call (no phantom
+        // zero Budget event downstream), per the cache-hit-zero-usage invariant.
+        let slot = Rc::new(RefCell::new(LeafUsage::default()));
+        accumulate_into(&slot, &Usage::default(), None);
+        let u = slot.borrow();
+        assert_eq!(u.calls, 0, "cache hit doesn't bump calls");
+        assert_eq!(u.input_tokens, 0);
+        assert!(u.cost_usd.is_none());
+    }
+
+    #[test]
+    fn accumulate_into_unpriced_call_counts_but_leaves_cost_none() {
+        // An unpriced (no pricing-table entry) but token-bearing call IS a call; cost stays
+        // genuinely absent rather than $0, then a later priced call seeds the running sum.
+        let slot = Rc::new(RefCell::new(LeafUsage::default()));
+        accumulate_into(&slot, &usage(7, 3), None);
+        assert_eq!(slot.borrow().calls, 1);
+        assert!(
+            slot.borrow().cost_usd.is_none(),
+            "unpriced ⇒ cost still None"
+        );
+        accumulate_into(&slot, &usage(1, 1), Some(0.005));
+        assert!((slot.borrow().cost_usd.unwrap() - 0.005).abs() < 1e-9);
+        assert_eq!(slot.borrow().calls, 2);
+    }
+
+    #[test]
+    fn usage_scope_nests_and_restores_the_active_frame() {
+        let outer = open_usage_scope();
+        let outer_slot = current_usage_accum().expect("outer scope active");
+        {
+            let _inner = open_usage_scope();
+            let inner_slot = current_usage_accum().expect("inner scope active");
+            assert!(
+                !Rc::ptr_eq(&inner_slot, &outer_slot),
+                "a nested scope installs a distinct frame"
+            );
+        }
+        // inner dropped → the outer frame is the active one again
+        assert!(
+            Rc::ptr_eq(&current_usage_accum().expect("outer restored"), &outer_slot),
+            "dropping the inner scope restores the outer frame"
+        );
+        drop(outer);
+    }
+
+    #[test]
+    fn open_usage_scope_collects_completions_made_while_alive() {
+        let scope = open_usage_scope();
+        // Simulate two completions folding into the active frame (as track_usage does).
+        let slot = current_usage_accum().expect("scope active");
+        accumulate_into(&slot, &usage(20, 10), Some(0.01));
+        accumulate_into(&slot, &usage(4, 2), None);
+        let u = scope.usage();
+        assert_eq!(u.input_tokens, 24);
+        assert_eq!(u.output_tokens, 12);
+        assert_eq!(u.calls, 2);
+        drop(scope);
+        assert!(
+            current_usage_accum().is_none(),
+            "dropping the only scope leaves no active frame"
+        );
+    }
 
     #[test]
     fn enforce_rate_limit_survives_backward_clock() {

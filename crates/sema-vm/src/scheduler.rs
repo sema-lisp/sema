@@ -65,6 +65,12 @@ struct Task {
     /// Seeded at spawn from `current_conversation_scope()` (ids only, empty
     /// stack) so conversation grouping survives the per-task isolation.
     otel: Box<dyn Any>,
+    /// This task's saved per-leaf usage-accumulator scope, type-erased (the
+    /// `Option<Rc<RefCell<LeafUsage>>>` lives in `sema-llm`). Captured at spawn from
+    /// the spawner's active scope so an inline agent thunk inherits the scope its
+    /// `workflow/step` opened; swapped into the thread-local on task entry and back
+    /// out on leave so concurrent sibling tasks don't clobber each other's tally.
+    usage_scope: Box<dyn Any>,
 }
 
 // ── Scheduler ──────────────────────────────────────────────────────
@@ -149,6 +155,7 @@ impl Scheduler {
             resume_value: None,
             wake_at: None,
             otel: sema_core::current_conversation_scope_boxed(),
+            usage_scope: sema_core::current_usage_scope_boxed(),
         });
 
         Ok(promise)
@@ -505,6 +512,7 @@ pub(crate) fn run_closure_as_inline_task(
         resume_value: None,
         wake_at: None,
         otel: sema_core::current_conversation_scope_boxed(),
+        usage_scope: sema_core::current_usage_scope_boxed(),
     });
 
     // A cooperative (headless) debug session can pause this nested inline task at
@@ -676,6 +684,10 @@ struct ReinstallGuard<'a> {
     /// panic unwind) so a sibling/parent's otel stack + ids are never corrupted
     /// by a task that parked mid-span. `None` once consumed.
     prev_otel: Option<Box<dyn Any>>,
+    /// The leaf-usage scope displaced when this task's scope was installed on
+    /// task entry. Restored on leave alongside `prev_otel` so concurrent tasks'
+    /// per-leaf usage tallies stay isolated. `None` once consumed.
+    prev_usage_scope: Option<Box<dyn Any>>,
 }
 
 impl ReinstallGuard<'_> {
@@ -684,6 +696,17 @@ impl ReinstallGuard<'_> {
     /// the otel context that was active before this task ran. Idempotent: a
     /// second call (Drop after the explicit reinstall) is a no-op.
     fn restore_otel(&mut self) {
+        // Restore the leaf-usage scope in lockstep with otel (both are per-task
+        // thread-local contexts installed on entry). Take this task's (possibly
+        // mid-completion) scope back out onto the task so it resumes with the same
+        // tally next step, then restore the scope active before this task ran.
+        if let Some(prev_usage) = self.prev_usage_scope.take() {
+            let task_usage = sema_core::take_task_usage_scope();
+            if let Some(task) = self.task.as_mut() {
+                task.usage_scope = task_usage;
+            }
+            let _ = sema_core::install_task_usage_scope(prev_usage);
+        }
         let Some(prev) = self.prev_otel.take() else {
             return;
         };
@@ -1036,11 +1059,18 @@ fn run_until_reentrant(
         // and never corrupts a sibling's.
         let task_otel = std::mem::replace(&mut task.otel, Box::new(()));
         let prev_otel = sema_core::install_task_otel(task_otel);
+        // Install this task's per-leaf usage scope alongside its otel context, so a
+        // completion made during the step folds into the correct leaf's tally even
+        // when sibling tasks interleave (an inline agent thunk inherits the scope its
+        // `workflow/step` opened via the spawn-time capture).
+        let task_usage = std::mem::replace(&mut task.usage_scope, Box::new(()));
+        let prev_usage_scope = sema_core::install_task_usage_scope(task_usage);
         let mut guard = ReinstallGuard {
             sched,
             task: Some(task),
             armed: true,
             prev_otel: Some(prev_otel),
+            prev_usage_scope: Some(prev_usage_scope),
         };
         let task = guard.task.as_mut().expect("in-flight task present");
 
@@ -1165,6 +1195,7 @@ mod tests {
                 task: None,
                 armed: true,
                 prev_otel: None,
+                prev_usage_scope: None,
             };
             // Simulate a panic mid-step (e.g. an `unreachable!()` in the VM).
             panic!("simulated task panic");

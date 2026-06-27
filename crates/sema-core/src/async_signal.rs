@@ -414,6 +414,67 @@ pub fn install_task_otel(ctx: Box<dyn Any>) -> Box<dyn Any> {
     }
 }
 
+// ── Per-task "active leaf usage scope" seam ─────────────────────────
+//
+// The workflow runtime attributes per-leaf LLM usage by reading the accumulator
+// frame active for the CURRENT TASK. Like the otel context above, this must be
+// captured at task spawn (an inline agent thunk inherits the scope its
+// `workflow/step` opened) and swapped in/out at each task step so concurrently
+// running sibling tasks don't clobber each other's active frame. The actual
+// `Rc<RefCell<LeafUsage>>` slot lives in `sema-llm`; `sema-core` reaches it
+// through these type-erased fn-pointer callbacks (mirroring the otel seam), so it
+// need not depend on `sema-llm`. No-ops returning an empty box when unregistered.
+
+/// Capture the current thread's active leaf-usage scope (cloning its `Rc`) to
+/// seed onto a freshly-spawned task. `Box::new(())` when unregistered/none active.
+pub type UsageScopeCaptureFn = fn() -> Box<dyn Any>;
+/// Take (mem::take) the current thread's active leaf-usage scope, leaving none.
+pub type UsageScopeTakeFn = fn() -> Box<dyn Any>;
+/// Install a leaf-usage scope into the thread-local, returning the one displaced.
+pub type UsageScopeInstallFn = fn(Box<dyn Any>) -> Box<dyn Any>;
+
+thread_local! {
+    static USAGE_SCOPE_CAPTURE_CALLBACK: Cell<Option<UsageScopeCaptureFn>> = const { Cell::new(None) };
+    static USAGE_SCOPE_TAKE_CALLBACK: Cell<Option<UsageScopeTakeFn>> = const { Cell::new(None) };
+    static USAGE_SCOPE_INSTALL_CALLBACK: Cell<Option<UsageScopeInstallFn>> = const { Cell::new(None) };
+}
+
+/// Register the per-task leaf-usage-scope callbacks. Called once at startup by
+/// `sema-llm` (the crate that owns the `LeafUsage` accumulator).
+pub fn set_usage_scope_task_callbacks(
+    capture: UsageScopeCaptureFn,
+    take: UsageScopeTakeFn,
+    install: UsageScopeInstallFn,
+) {
+    USAGE_SCOPE_CAPTURE_CALLBACK.with(|cb| cb.set(Some(capture)));
+    USAGE_SCOPE_TAKE_CALLBACK.with(|cb| cb.set(Some(take)));
+    USAGE_SCOPE_INSTALL_CALLBACK.with(|cb| cb.set(Some(install)));
+}
+
+/// Capture the active leaf-usage scope to seed a spawned task.
+pub fn current_usage_scope_boxed() -> Box<dyn Any> {
+    match USAGE_SCOPE_CAPTURE_CALLBACK.with(|cb| cb.get()) {
+        Some(f) => f(),
+        None => Box::new(()),
+    }
+}
+
+/// Take the active leaf-usage scope out of the thread-local (leaving none).
+pub fn take_task_usage_scope() -> Box<dyn Any> {
+    match USAGE_SCOPE_TAKE_CALLBACK.with(|cb| cb.get()) {
+        Some(f) => f(),
+        None => Box::new(()),
+    }
+}
+
+/// Install a leaf-usage scope into the thread-local, returning the one displaced.
+pub fn install_task_usage_scope(ctx: Box<dyn Any>) -> Box<dyn Any> {
+    match USAGE_SCOPE_INSTALL_CALLBACK.with(|cb| cb.get()) {
+        Some(f) => f(ctx),
+        None => Box::new(()),
+    }
+}
+
 // ── Interrupt (cancellation) callback ───────────────────────────
 
 /// Callback that returns true when the running evaluation should be cancelled.

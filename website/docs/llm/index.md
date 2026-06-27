@@ -70,6 +70,12 @@ Auto-configuration, runtime provider switching, custom providers, and OpenAI-com
 
 Usage tracking, budget enforcement, and batch/parallel operations.
 
+### [Workflows](./workflows.md)
+
+Define multi-phase agent pipelines as ordinary Sema code. Every step is
+journaled to a frozen JSONL run directory — resume, replay, or fork without
+losing state. Budget caps, parallel/pipeline fan-out, and a live web viewer.
+
 ### Observability (OpenTelemetry)
 
 Built-in, standards-compliant OpenTelemetry tracing + metrics for **every** LLM and

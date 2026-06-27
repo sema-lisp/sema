@@ -27,6 +27,7 @@ const featureItems = [
   { label: 'Structured Extraction', link: '/feature/extraction', key: 'extraction' },
   { label: 'Embedding', link: '/feature/embed', key: 'embed' },
   { label: 'RAG', link: '/feature/rag', key: 'rag' },
+  { label: 'Workflows', link: '/feature/workflows', key: 'workflows' },
 ]
 
 const docsActive = computed(() => docsItems.some(i => i.key === props.activeNav))

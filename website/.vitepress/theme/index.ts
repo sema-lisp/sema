@@ -12,6 +12,7 @@ import FeatureExtraction from './FeatureExtraction.vue'
 import FeatureEmbed from './FeatureEmbed.vue'
 import FeatureRag from './FeatureRag.vue'
 import FeatureWhatIsSema from './FeatureWhatIsSema.vue'
+import FeatureWorkflows from './FeatureWorkflows.vue'
 import HomeSearch from './HomeSearch.vue'
 import './custom.css'
 
@@ -31,6 +32,7 @@ export default {
     app.component('FeatureEmbed', FeatureEmbed)
     app.component('FeatureRag', FeatureRag)
     app.component('FeatureWhatIsSema', FeatureWhatIsSema)
+    app.component('FeatureWorkflows', FeatureWorkflows)
     app.component('HomeSearch', HomeSearch)
   },
 }

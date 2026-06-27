@@ -44,6 +44,8 @@ mod toml_ops;
 mod typed_array;
 #[cfg(not(target_arch = "wasm32"))]
 mod workflow;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod workflow_check;
 
 #[cfg(not(target_arch = "wasm32"))]
 use sema_core::Caps;

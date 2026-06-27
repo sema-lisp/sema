@@ -63,6 +63,7 @@ mod cross_compile;
 mod import_tracer;
 mod pkg;
 mod repl;
+mod workflow_check;
 mod workflow_view;
 
 /// Read a source file with consistent, friendly error messages.
@@ -467,6 +468,20 @@ enum WorkflowCommands {
         /// Port to listen on.
         #[arg(short, long, default_value = "8899")]
         port: u16,
+    },
+    /// Statically validate a workflow `.sema` file WITHOUT evaluating it or calling any LLM
+    /// — catches arity traps, bad step opts, and layout issues before a run.
+    Check {
+        /// Path to the `.sema` workflow file.
+        file: String,
+
+        /// Treat warnings as errors (exit non-zero if any warning fires).
+        #[arg(long)]
+        strict: bool,
+
+        /// Emit machine-readable JSON diagnostics instead of human-readable text.
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -941,6 +956,21 @@ fn run_workflow_command(command: WorkflowCommands, sandbox: &sema_core::Sandbox)
                 }
             }
             return;
+        }
+        WorkflowCommands::Check {
+            file,
+            strict,
+            json,
+        } => {
+            let src = match read_source_file(&file) {
+                Ok(s) => s,
+                Err(msg) => {
+                    eprintln!("error: {msg}");
+                    std::process::exit(2);
+                }
+            };
+            let diags = workflow_check::check_source(&src);
+            std::process::exit(workflow_check::report(&file, &diags, strict, json));
         }
     };
 

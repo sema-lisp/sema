@@ -206,6 +206,7 @@ export default defineConfig({
           text: 'Cookbook',
           collapsed: false,
           items: [
+            { text: 'Workflows', link: '/docs/llm/workflows' },
             { text: 'RAG: Retrieve & Rerank', link: '/docs/llm/rag' }
           ]
         }

@@ -13,7 +13,7 @@ pub fn build_builtin_docs() -> HashMap<String, String> {
 
     // Stdlib + special-form entries from the canonical sema-docs index.
     // Use the full markdown body (what LSP hover renders); fall back to summary.
-    for e in sema_docs::builtin_index().entries {
+    for e in &sema_docs::builtin_index().entries {
         let text = if e.body.trim().is_empty() {
             e.summary.clone()
         } else {

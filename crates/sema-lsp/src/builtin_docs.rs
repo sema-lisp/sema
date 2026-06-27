@@ -8,10 +8,12 @@
 use crate::helpers::extract_params_from_doc;
 use sema_docs::DocEntry;
 use std::collections::HashMap;
+use std::rc::Rc;
 
 /// Name → documentation lookup (canonical names and aliases both resolve to the same entry).
+/// Entries are shared via `Rc` so an entry with N aliases is stored once, not cloned N times.
 pub struct BuiltinDocs {
-    by_name: HashMap<String, DocEntry>,
+    by_name: HashMap<String, Rc<DocEntry>>,
 }
 
 impl BuiltinDocs {
@@ -19,11 +21,14 @@ impl BuiltinDocs {
     pub fn load() -> Self {
         let index = sema_docs::builtin_index();
         let mut by_name = HashMap::with_capacity(index.entries.len() * 2);
-        for e in index.entries {
+        for e in &index.entries {
+            let rc = Rc::new(e.clone());
             for alias in &e.aliases {
-                by_name.entry(alias.clone()).or_insert_with(|| e.clone());
+                by_name
+                    .entry(alias.clone())
+                    .or_insert_with(|| Rc::clone(&rc));
             }
-            by_name.insert(e.name.clone(), e);
+            by_name.insert(e.name.clone(), rc);
         }
         BuiltinDocs { by_name }
     }
@@ -35,7 +40,7 @@ impl BuiltinDocs {
         }
     }
 
-    pub fn get(&self, name: &str) -> Option<&DocEntry> {
+    pub fn get(&self, name: &str) -> Option<&Rc<DocEntry>> {
         self.by_name.get(name)
     }
 
@@ -173,5 +178,31 @@ mod tests {
         };
         assert_eq!(signature(&e), "(f a b)");
         assert!(render_markdown(&e).contains("(f a b) → int"));
+    }
+
+    #[test]
+    fn aliases_share_same_rc_entry() {
+        let docs = BuiltinDocs::load();
+        // Find an entry that has at least one alias.
+        let mut found = false;
+        let by_name: Vec<(&String, &Rc<DocEntry>)> = docs.by_name.iter().collect();
+        for (name, entry) in &by_name {
+            if !entry.aliases.is_empty() {
+                // The canonical name and its first alias must point to the same Rc.
+                let alias = &entry.aliases[0];
+                let canonical = docs.get(name).expect("canonical name");
+                let alias_entry = docs.get(alias).expect("alias name");
+                assert!(
+                    Rc::ptr_eq(canonical, alias_entry),
+                    "alias `{alias}` and canonical `{name}` should share the same Rc<DocEntry>"
+                );
+                found = true;
+                break;
+            }
+        }
+        assert!(
+            found,
+            "expected at least one entry with an alias in the doc index"
+        );
     }
 }

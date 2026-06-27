@@ -33,11 +33,11 @@ pub fn run(env: &Env, pattern: &str) {
     // name → one-line summary, from the canonical sema-docs index (aliases included).
     let docs: std::collections::HashMap<String, String> = {
         let mut m = std::collections::HashMap::new();
-        for e in sema_docs::builtin_index().entries {
+        for e in &sema_docs::builtin_index().entries {
             for a in &e.aliases {
                 m.insert(a.clone(), e.summary.clone());
             }
-            m.insert(e.name, e.summary);
+            m.insert(e.name.clone(), e.summary.clone());
         }
         m
     };

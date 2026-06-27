@@ -132,8 +132,10 @@ pub async fn run() {
                     }
                 };
                 seq += 1;
-                let json = serde_json::to_string(&dap_event).unwrap();
-                let _ = transport::write_message(&mut stdout, &json).await;
+                match serde_json::to_string(&dap_event) {
+                    Ok(json) => { let _ = transport::write_message(&mut stdout, &json).await; }
+                    Err(e) => eprintln!("DAP: failed to serialize event: {e}"),
+                }
             }
         }
     }
@@ -172,8 +174,12 @@ async fn handle_request(
             // Send initialized event
             let event = DapEvent::new(*seq, "initialized", None);
             *seq += 1;
-            let json = serde_json::to_string(&event).unwrap();
-            let _ = transport::write_message(stdout, &json).await;
+            match serde_json::to_string(&event) {
+                Ok(json) => {
+                    let _ = transport::write_message(stdout, &json).await;
+                }
+                Err(e) => eprintln!("DAP: failed to serialize initialized event: {e}"),
+            }
         }
         "launch" => {
             let program = msg
@@ -235,16 +241,12 @@ async fn handle_request(
 
             let resolved_breakpoints = if state.vm_active {
                 if let Some(ref tx) = state.dbg_cmd_tx {
-                    // VM is running or stopped — send via DebugCommand
-                    let (reply_tx, reply_rx) = std_mpsc::sync_channel(1);
-                    let _ = tx.send(DebugCommand::SetBreakpoints {
+                    send_cmd_and_recv(tx, |reply| DebugCommand::SetBreakpoints {
                         file,
                         breakpoints: breakpoints_req,
-                        reply: reply_tx,
-                    });
-                    tokio::task::spawn_blocking(move || reply_rx.recv().unwrap_or_default())
-                        .await
-                        .unwrap_or_default()
+                        reply,
+                    })
+                    .await
                 } else {
                     Vec::new()
                 }
@@ -340,11 +342,7 @@ async fn handle_request(
             // the VM is parked in its command loop so the reply wait can't hang.
             let frames = if state.vm_active && state.vm_suspended {
                 if let Some(ref tx) = state.dbg_cmd_tx {
-                    let (reply_tx, reply_rx) = std_mpsc::sync_channel(1);
-                    let _ = tx.send(DebugCommand::GetStackTrace { reply: reply_tx });
-                    tokio::task::spawn_blocking(move || reply_rx.recv().unwrap_or_default())
-                        .await
-                        .unwrap_or_default()
+                    send_cmd_and_recv(tx, |reply| DebugCommand::GetStackTrace { reply }).await
                 } else {
                     Vec::new()
                 }
@@ -393,14 +391,7 @@ async fn handle_request(
                 .unwrap_or(0) as usize;
             let scopes = if state.vm_active && state.vm_suspended {
                 if let Some(ref tx) = state.dbg_cmd_tx {
-                    let (reply_tx, reply_rx) = std_mpsc::sync_channel(1);
-                    let _ = tx.send(DebugCommand::GetScopes {
-                        frame_id,
-                        reply: reply_tx,
-                    });
-                    tokio::task::spawn_blocking(move || reply_rx.recv().unwrap_or_default())
-                        .await
-                        .unwrap_or_default()
+                    send_cmd_and_recv(tx, |reply| DebugCommand::GetScopes { frame_id, reply }).await
                 } else {
                     Vec::new()
                 }
@@ -435,14 +426,8 @@ async fn handle_request(
                 .unwrap_or(0);
             let vars = if state.vm_active && state.vm_suspended {
                 if let Some(ref tx) = state.dbg_cmd_tx {
-                    let (reply_tx, reply_rx) = std_mpsc::sync_channel(1);
-                    let _ = tx.send(DebugCommand::GetVariables {
-                        reference,
-                        reply: reply_tx,
-                    });
-                    tokio::task::spawn_blocking(move || reply_rx.recv().unwrap_or_default())
+                    send_cmd_and_recv(tx, |reply| DebugCommand::GetVariables { reference, reply })
                         .await
-                        .unwrap_or_default()
                 } else {
                     Vec::new()
                 }
@@ -508,19 +493,14 @@ async fn handle_request(
                 return true;
             };
 
-            let (reply_tx, reply_rx) = std_mpsc::sync_channel(1);
-            let _ = tx.send(DebugCommand::Evaluate {
-                frame_id,
-                expression,
-                reply: reply_tx,
-            });
-            let result = tokio::task::spawn_blocking(move || {
-                reply_rx
-                    .recv()
-                    .unwrap_or_else(|_| Err("debug VM did not reply".to_string()))
+            let result = send_cmd_and_recv_result(tx, "debug VM did not reply", |reply| {
+                DebugCommand::Evaluate {
+                    frame_id,
+                    expression,
+                    reply,
+                }
             })
-            .await
-            .unwrap_or_else(|e| Err(format!("evaluate task failed: {e}")));
+            .await;
 
             match result {
                 Ok(var) => {
@@ -588,20 +568,15 @@ async fn handle_request(
                 return true;
             };
 
-            let (reply_tx, reply_rx) = std_mpsc::sync_channel(1);
-            let _ = tx.send(DebugCommand::SetVariable {
-                variables_reference,
-                name,
-                value_expression,
-                reply: reply_tx,
-            });
-            let result = tokio::task::spawn_blocking(move || {
-                reply_rx
-                    .recv()
-                    .unwrap_or_else(|_| Err("debug VM did not reply".to_string()))
+            let result = send_cmd_and_recv_result(tx, "debug VM did not reply", |reply| {
+                DebugCommand::SetVariable {
+                    variables_reference,
+                    name,
+                    value_expression,
+                    reply,
+                }
             })
-            .await
-            .unwrap_or_else(|e| Err(format!("setVariable task failed: {e}")));
+            .await;
 
             match result {
                 Ok(var) => {
@@ -707,6 +682,34 @@ async fn handle_request(
     true
 }
 
+/// Send a DebugCommand that expects a reply and wait for the response.
+/// Encapsulates the sync_channel + spawn_blocking pattern used by all
+/// query commands (stackTrace, scopes, variables, setBreakpoints).
+async fn send_cmd_and_recv<T: Default + Send + 'static>(
+    tx: &std_mpsc::Sender<DebugCommand>,
+    make_cmd: impl FnOnce(std_mpsc::SyncSender<T>) -> DebugCommand,
+) -> T {
+    let (reply_tx, reply_rx) = std_mpsc::sync_channel(1);
+    let _ = tx.send(make_cmd(reply_tx));
+    tokio::task::spawn_blocking(move || reply_rx.recv().unwrap_or_default())
+        .await
+        .unwrap_or_default()
+}
+
+/// Send a DebugCommand that expects a Result reply (evaluate, setVariable).
+async fn send_cmd_and_recv_result<T: Send + 'static>(
+    tx: &std_mpsc::Sender<DebugCommand>,
+    err_msg: &str,
+    make_cmd: impl FnOnce(std_mpsc::SyncSender<Result<T, String>>) -> DebugCommand,
+) -> Result<T, String> {
+    let (reply_tx, reply_rx) = std_mpsc::sync_channel(1);
+    let _ = tx.send(make_cmd(reply_tx));
+    let err_msg = err_msg.to_string();
+    tokio::task::spawn_blocking(move || reply_rx.recv().unwrap_or_else(|_| Err(err_msg)))
+        .await
+        .unwrap_or_else(|e| Err(format!("task failed: {e}")))
+}
+
 async fn send_response(
     stdout: &mut tokio::io::Stdout,
     seq: &mut u64,
@@ -716,8 +719,12 @@ async fn send_response(
 ) {
     let resp = DapResponse::success(*seq, request_seq, command, body);
     *seq += 1;
-    let json = serde_json::to_string(&resp).unwrap();
-    let _ = transport::write_message(stdout, &json).await;
+    match serde_json::to_string(&resp) {
+        Ok(json) => {
+            let _ = transport::write_message(stdout, &json).await;
+        }
+        Err(e) => eprintln!("DAP: failed to serialize response: {e}"),
+    }
 }
 
 fn breakpoint_to_json(bp: &DapBreakpoint) -> serde_json::Value {
@@ -744,8 +751,12 @@ async fn send_error(
 ) {
     let resp = DapResponse::error(*seq, request_seq, command, message);
     *seq += 1;
-    let json = serde_json::to_string(&resp).unwrap();
-    let _ = transport::write_message(stdout, &json).await;
+    match serde_json::to_string(&resp) {
+        Ok(json) => {
+            let _ = transport::write_message(stdout, &json).await;
+        }
+        Err(e) => eprintln!("DAP: failed to serialize error response: {e}"),
+    }
 }
 
 // --- Backend thread ---
@@ -1066,7 +1077,7 @@ fn decode_percent(s: &str) -> String {
     let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len() {
+        if bytes[i] == b'%' && i + 3 <= bytes.len() {
             if let Some(byte) = hex_to_byte(bytes[i + 1] as char, bytes[i + 2] as char) {
                 out.push(byte);
                 i += 3;
@@ -1113,6 +1124,14 @@ mod tests {
         assert_eq!(decode_percent("abc%"), "abc%");
         // Trailing percent with a single byte.
         assert_eq!(decode_percent("abc%C"), "abc%C");
+    }
+
+    #[test]
+    fn decode_percent_trailing_escape() {
+        // Percent-encoded sequence at end of string must still decode.
+        assert_eq!(decode_percent("file%20"), "file ");
+        assert_eq!(decode_percent("path%2F"), "path/");
+        assert_eq!(decode_percent("caf%C3%A9"), "café");
     }
 
     #[test]

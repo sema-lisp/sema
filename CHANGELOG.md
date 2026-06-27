@@ -1,5 +1,83 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- **`pretty_print` no longer double-serializes values.** `pretty_print` called
+  `format!("{value}")` to check if the compact form fit, then `pp_value` repeated
+  the same `format!` at `indent=0` when it didn't — walking and stringifying the
+  entire tree twice. The redundant check is removed; `pp_value` handles it
+  directly. Affects every REPL result, DAP variable inspection, and WASM
+  playground output.
+- **Runtime `/` now matches the constant folder for large integers.** The
+  optimizer used exact `i64` division while the runtime converted to `f64`
+  first, causing `(/ 9007199254740993 1)` to return different results depending
+  on whether the operands were compile-time constants. A two-integer fast path
+  in the runtime `/` uses exact `i64` division when `a % b == 0`, falling back
+  to `f64` for non-whole results. `+`, `-`, `*` were unaffected (both paths
+  already used `i64`).
+- **`ValueViewRef` — zero-refcount trait impls.** `PartialEq`, `Hash`, `Ord`,
+  `Display`, and `pp_value` previously used `view()` which calls
+  `Rc::increment_strong_count` + `Rc::from_raw` (and a matching decrement on
+  drop) for every heap-typed `Value` comparison. A new `ValueViewRef<'a>` enum
+  and `view_ref()` method use `borrow_ref` (raw pointer deref) instead,
+  eliminating refcount mutations on every `==`, `cmp()`, `hash()`, and
+  `format!()`. Micro-benchmarked **40–60% faster** on `eq`/`cmp` for strings,
+  lists, and maps; **39.9% faster** total across the benchmark suite.
+- **VM arithmetic and comparison functions use `view_ref()`.** `vm_add`,
+  `vm_sub`, `vm_mul`, `vm_div`, `vm_eq`, `vm_lt` (the handlers for every
+  `ADD`/`SUB`/`MUL`/`DIV`/`EQ`/`LT`/`GT`/`LE`/`GE` opcode) and the stdlib
+  `comparison.rs`, `arithmetic.rs`, `predicates.rs`, `math.rs`, `map.rs`, and
+  `list.rs` modules were migrated from `view()` to `view_ref()`, eliminating
+  refcount churn on numeric and collection operations.
+- **`filter` no longer double-clones passing items.** Each item that passed the
+  predicate was cloned twice (once for the predicate call, once for the result
+  vector). Now cloned once and reused for both.
+- **Optimizer `extend_shadowed` avoids allocation when nothing is shadowed.**
+  The function previously called `current.to_vec()` on every `let`/`let*`/
+  `letrec`/`lambda`/`do`/`try` form, even when none of the new names were
+  foldable builtins (the common case). Now returns `Cow::Borrowed` when no
+  foldable names are added, avoiding the allocation entirely.
+- **DAP `serde_json::to_string().unwrap()` replaced with error handling.** Four
+  sites in the DAP server (event send, initialized event, `send_response`,
+  `send_error`) now log serialization errors to stderr instead of panicking.
+  A malformed debug value would have crashed the entire debug session.
+- **DAP `decode_percent` off-by-one fixed.** The check `i + 2 < bytes.len()`
+  required at least one byte after the two hex digits, so a percent-encoded
+  sequence at the very end of a file URI (e.g. `file%20` for a trailing space)
+  was not decoded. Fixed to `i + 3 <= bytes.len()`.
+- **DAP debug query boilerplate extracted into helpers.** The
+  `sync_channel(1)` + `send` + `spawn_blocking` + `recv` pattern duplicated
+  6× across `setBreakpoints`, `stackTrace`, `scopes`, `variables`, `evaluate`,
+  and `setVariable` is now `send_cmd_and_recv` / `send_cmd_and_recv_result`.
+- **Formatter `token_text` returns `Cow<str>` and `token_width` avoids
+  allocation.** `token_text` was `-> String`, allocating on every call including
+  in `measure_width` where only `.len()` was needed. Now `-> Cow<'_, str>`
+  (symbols — the most common token — return `Cow::Borrowed`), with a separate
+  `token_width` function that computes the width without allocating.
+- **Formatter `format_top_level` O(n²) → single-pass.** When alignment failed
+  for a group of N consecutive defines, the code formatted only the first and
+  re-scanned the remaining N-1 on the next iteration. Now formats the entire
+  group in one pass and advances past it.
+- **`Span::contains` and `Span::contains_pos` consolidated.** Three
+  near-identical span containment functions duplicated across
+  `sema-lsp/helpers.rs` and `sema-lsp/scope.rs` are now methods on `Span` in
+  `sema-core`, available to all crates.
+
+### Performance
+
+- **`builtin_index()` cached with `OnceLock`.** The ~11K-line JSON doc index
+  was deserialized from scratch on every `,apropos` REPL command. Now parsed
+  once and cached; subsequent calls return a `&'static DocIndex` reference.
+- **`BuiltinDocs::load()` shares entries via `Rc<DocEntry>`.** Each `DocEntry`
+  (with full markdown body, params, examples) was cloned once per alias. Now
+  all names for the same entry share a single `Rc<DocEntry>`, eliminating
+  hundreds of string clones at LSP startup.
+- **`expand_query` O(n²) → O(n) dedup.** The synonym expansion in MCP
+  `docs_search` used a linear scan per token for de-duplication. Now uses a
+  `HashSet`.
+
 ## 1.27.1
 
 ### Added

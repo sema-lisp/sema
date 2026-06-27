@@ -15,6 +15,8 @@
 //! Two invariants the tests enforce: formatting is **idempotent**
 //! (`fmt(fmt(x)) == fmt(x)`) and **comment-preserving**.
 
+use std::borrow::Cow;
+
 use sema_core::SemaError;
 use sema_reader::lexer::{tokenize, FStringPart, SpannedToken, Token};
 
@@ -354,7 +356,7 @@ const TOO_WIDE: usize = 10_000;
 fn measure_width(node: &Node, budget: usize) -> Option<usize> {
     match node {
         Node::Atom(tok) => {
-            let w = token_text(tok).len();
+            let w = token_width(tok);
             if w <= budget {
                 Some(w)
             } else {
@@ -434,34 +436,60 @@ fn flat_width(node: &Node) -> usize {
 // Token → source text
 // ---------------------------------------------------------------------------
 
-fn token_text(tok: &Token) -> String {
+/// Compute the flat width of a token without allocating a String.
+fn token_width(tok: &Token) -> usize {
     match tok {
-        Token::Symbol(s) => s.clone(),
-        Token::Keyword(s) => format!(":{s}"),
-        Token::String(s) => format!("\"{}\"", escape_string(s)),
-        Token::FString(parts) => format_fstring(parts),
-        Token::Regex(s) => format!("#\"{}\"", escape_regex(s)),
-        Token::Int(n) => n.to_string(),
-        Token::Float(f) => format_float(*f),
-        Token::Bool(true) => "#t".to_string(),
-        Token::Bool(false) => "#f".to_string(),
-        Token::Char(c) => format_char(*c),
-        Token::Dot => ".".to_string(),
-        // These shouldn't normally appear as atoms but handle them:
-        Token::LParen => "(".to_string(),
-        Token::RParen => ")".to_string(),
-        Token::LBracket => "[".to_string(),
-        Token::RBracket => "]".to_string(),
-        Token::LBrace => "{".to_string(),
-        Token::RBrace => "}".to_string(),
-        Token::Quote => "'".to_string(),
-        Token::Quasiquote => "`".to_string(),
-        Token::Unquote => ",".to_string(),
-        Token::UnquoteSplice => ",@".to_string(),
-        Token::ShortLambdaStart => "#(".to_string(),
-        Token::BytevectorStart => "#u8(".to_string(),
-        Token::Comment(text) => text.clone(),
-        Token::Newline => "\n".to_string(),
+        Token::Symbol(s) => s.len(),
+        Token::Keyword(s) => s.len() + 1, // ":" prefix
+        Token::String(s) => escape_string(s).len() + 2, // quotes
+        Token::Int(n) => n.to_string().len(),
+        Token::Float(f) => format_float(*f).len(),
+        Token::Bool(true) => 2,
+        Token::Bool(false) => 2,
+        Token::Char(c) => format_char(*c).len(),
+        Token::Dot => 1,
+        Token::LParen | Token::RParen => 1,
+        Token::LBracket | Token::RBracket => 1,
+        Token::LBrace | Token::RBrace => 1,
+        Token::Quote | Token::Quasiquote | Token::Unquote => 1,
+        Token::UnquoteSplice => 2,
+        Token::ShortLambdaStart => 2,
+        Token::BytevectorStart => 4,
+        Token::Comment(text) => text.len(),
+        Token::Newline => 1,
+        // FString and Regex have variable-length formatted output — fall back
+        // to token_text for correctness (these are rare in width measurement).
+        Token::FString(_) | Token::Regex(_) => token_text(tok).len(),
+    }
+}
+
+fn token_text(tok: &Token) -> Cow<'_, str> {
+    match tok {
+        Token::Symbol(s) => Cow::Borrowed(s.as_str()),
+        Token::Keyword(s) => Cow::Owned(format!(":{s}")),
+        Token::String(s) => Cow::Owned(format!("\"{}\"", escape_string(s))),
+        Token::FString(parts) => Cow::Owned(format_fstring(parts)),
+        Token::Regex(s) => Cow::Owned(format!("#\"{}\"", escape_regex(s))),
+        Token::Int(n) => Cow::Owned(n.to_string()),
+        Token::Float(f) => Cow::Owned(format_float(*f)),
+        Token::Bool(true) => Cow::Borrowed("#t"),
+        Token::Bool(false) => Cow::Borrowed("#f"),
+        Token::Char(c) => Cow::Owned(format_char(*c)),
+        Token::Dot => Cow::Borrowed("."),
+        Token::LParen => Cow::Borrowed("("),
+        Token::RParen => Cow::Borrowed(")"),
+        Token::LBracket => Cow::Borrowed("["),
+        Token::RBracket => Cow::Borrowed("]"),
+        Token::LBrace => Cow::Borrowed("{"),
+        Token::RBrace => Cow::Borrowed("}"),
+        Token::Quote => Cow::Borrowed("'"),
+        Token::Quasiquote => Cow::Borrowed("`"),
+        Token::Unquote => Cow::Borrowed(","),
+        Token::UnquoteSplice => Cow::Borrowed(",@"),
+        Token::ShortLambdaStart => Cow::Borrowed("#("),
+        Token::BytevectorStart => Cow::Borrowed("#u8("),
+        Token::Comment(text) => Cow::Borrowed(text.as_str()),
+        Token::Newline => Cow::Borrowed("\n"),
     }
 }
 
@@ -666,6 +694,46 @@ impl Formatter {
                             }
                             i = group_end;
                             first_content = false;
+                            continue;
+                        }
+                        // Alignment failed or group too small — format each
+                        // define in the group individually to avoid re-scanning.
+                        // Only use the batch path when we actually had a group
+                        // of 2+ (otherwise fall through to normal formatting).
+                        if group.len() >= 2 {
+                            for node in &nodes[group_start..group_end] {
+                                match node {
+                                    Node::Newline => {
+                                        pending_blank_lines += 1;
+                                    }
+                                    Node::Comment(text) => {
+                                        if pending_blank_lines > 1 {
+                                            self.output.push('\n');
+                                        }
+                                        if !self.output.ends_with('\n') {
+                                            self.output.push('\n');
+                                        }
+                                        self.output.push_str(text);
+                                        self.output.push('\n');
+                                        pending_blank_lines = 0;
+                                        first_content = false;
+                                    }
+                                    _ => {
+                                        if !first_content {
+                                            if pending_blank_lines > 1 {
+                                                self.output.push('\n');
+                                            }
+                                            if !self.output.ends_with('\n') {
+                                                self.output.push('\n');
+                                            }
+                                        }
+                                        pending_blank_lines = 0;
+                                        self.format_node(node, 0);
+                                        first_content = false;
+                                    }
+                                }
+                            }
+                            i = group_end;
                             continue;
                         }
                     }
@@ -1641,7 +1709,7 @@ impl Formatter {
 /// Render a single node as a flat (single-line) string.
 fn node_to_flat_string(node: &Node) -> String {
     match node {
-        Node::Atom(tok) => token_text(tok),
+        Node::Atom(tok) => token_text(tok).into_owned(),
         Node::StringAtom(raw) => raw.clone(),
         Node::Comment(text) => text.clone(),
         Node::Newline => String::new(),

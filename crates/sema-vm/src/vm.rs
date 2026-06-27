@@ -5,7 +5,7 @@ use std::rc::Rc;
 use sema_core::{
     bits_to_spur,
     error::{suggest_similar, veteran_hint},
-    resolve as resolve_spur, Env, EvalContext, NativeFn, SemaError, Spur, Value, ValueView,
+    resolve as resolve_spur, Env, EvalContext, NativeFn, SemaError, Spur, Value, ValueViewRef,
     NAN_INT_SMALL_PATTERN, NAN_PAYLOAD_BITS, NAN_PAYLOAD_MASK, NAN_TAG_MASK, TAG_NATIVE_FN,
 };
 
@@ -3613,30 +3613,30 @@ impl VM {
 
     fn is_debug_expandable(value: &Value) -> bool {
         matches!(
-            value.view(),
-            ValueView::List(_)
-                | ValueView::Vector(_)
-                | ValueView::Map(_)
-                | ValueView::HashMap(_)
-                | ValueView::Record(_)
-                | ValueView::Bytevector(_)
+            value.view_ref(),
+            ValueViewRef::List(_)
+                | ValueViewRef::Vector(_)
+                | ValueViewRef::Map(_)
+                | ValueViewRef::HashMap(_)
+                | ValueViewRef::Record(_)
+                | ValueViewRef::Bytevector(_)
         )
     }
 
     fn debug_children(&mut self, value: Value) -> Vec<crate::debug::DapVariable> {
-        match value.view() {
-            ValueView::List(items) | ValueView::Vector(items) => items
+        match value.view_ref() {
+            ValueViewRef::List(items) | ValueViewRef::Vector(items) => items
                 .iter()
                 .enumerate()
                 .map(|(i, child)| self.debug_value_to_variable(&format!("[{i}]"), child.clone()))
                 .collect(),
-            ValueView::Map(map) => map
+            ValueViewRef::Map(map) => map
                 .iter()
                 .map(|(key, child)| {
                     self.debug_value_to_variable(&sema_core::pretty_print(key, 80), child.clone())
                 })
                 .collect(),
-            ValueView::HashMap(map) => {
+            ValueViewRef::HashMap(map) => {
                 let mut entries: Vec<_> = map.iter().collect();
                 entries.sort_by_key(|(key, _)| (*key).clone());
                 entries
@@ -3649,7 +3649,7 @@ impl VM {
                     })
                     .collect()
             }
-            ValueView::Record(record) => record
+            ValueViewRef::Record(record) => record
                 .fields
                 .iter()
                 .enumerate()
@@ -3662,7 +3662,7 @@ impl VM {
                     self.debug_value_to_variable(&name, child.clone())
                 })
                 .collect(),
-            ValueView::Bytevector(bytes) => bytes
+            ValueViewRef::Bytevector(bytes) => bytes
                 .iter()
                 .enumerate()
                 .map(|(i, byte)| {
@@ -3783,15 +3783,14 @@ fn map_access_hint(func: &str, coll: &Value) -> String {
 }
 
 fn vm_add(a: &Value, b: &Value) -> Result<Value, SemaError> {
-    use sema_core::ValueView;
-    match (a.view(), b.view()) {
-        (ValueView::Int(x), ValueView::Int(y)) => Ok(Value::int(x.wrapping_add(y))),
-        (ValueView::Float(x), ValueView::Float(y)) => Ok(Value::float(x + y)),
-        (ValueView::Int(x), ValueView::Float(y)) => Ok(Value::float(x as f64 + y)),
-        (ValueView::Float(x), ValueView::Int(y)) => Ok(Value::float(x + y as f64)),
-        (ValueView::String(x), ValueView::String(y)) => {
-            let mut s = (*x).clone();
-            s.push_str(&y);
+    match (a.view_ref(), b.view_ref()) {
+        (ValueViewRef::Int(x), ValueViewRef::Int(y)) => Ok(Value::int(x.wrapping_add(y))),
+        (ValueViewRef::Float(x), ValueViewRef::Float(y)) => Ok(Value::float(x + y)),
+        (ValueViewRef::Int(x), ValueViewRef::Float(y)) => Ok(Value::float(x as f64 + y)),
+        (ValueViewRef::Float(x), ValueViewRef::Int(y)) => Ok(Value::float(x + y as f64)),
+        (ValueViewRef::String(x), ValueViewRef::String(y)) => {
+            let mut s = x.to_string();
+            s.push_str(y);
             Ok(Value::string(&s))
         }
         _ => {
@@ -3799,10 +3798,8 @@ fn vm_add(a: &Value, b: &Value) -> Result<Value, SemaError> {
                 "number or string",
                 format!("{} and {}", a.type_name(), b.type_name()),
             );
-            // Most common mistake: one string + one non-string. `+` won't
-            // coerce — point them at `str`, which stringifies everything.
-            let mixing_string = matches!(a.view(), ValueView::String(_))
-                || matches!(b.view(), ValueView::String(_));
+            let mixing_string = matches!(a.view_ref(), ValueViewRef::String(_))
+                || matches!(b.view_ref(), ValueViewRef::String(_));
             Err(if mixing_string {
                 err.with_hint(
                     "+: cannot mix strings with other types; use (str a b ...) to build a string",
@@ -3816,12 +3813,11 @@ fn vm_add(a: &Value, b: &Value) -> Result<Value, SemaError> {
 
 #[inline(always)]
 fn vm_sub(a: &Value, b: &Value) -> Result<Value, SemaError> {
-    use sema_core::ValueView;
-    match (a.view(), b.view()) {
-        (ValueView::Int(x), ValueView::Int(y)) => Ok(Value::int(x.wrapping_sub(y))),
-        (ValueView::Float(x), ValueView::Float(y)) => Ok(Value::float(x - y)),
-        (ValueView::Int(x), ValueView::Float(y)) => Ok(Value::float(x as f64 - y)),
-        (ValueView::Float(x), ValueView::Int(y)) => Ok(Value::float(x - y as f64)),
+    match (a.view_ref(), b.view_ref()) {
+        (ValueViewRef::Int(x), ValueViewRef::Int(y)) => Ok(Value::int(x.wrapping_sub(y))),
+        (ValueViewRef::Float(x), ValueViewRef::Float(y)) => Ok(Value::float(x - y)),
+        (ValueViewRef::Int(x), ValueViewRef::Float(y)) => Ok(Value::float(x as f64 - y)),
+        (ValueViewRef::Float(x), ValueViewRef::Int(y)) => Ok(Value::float(x - y as f64)),
         _ => Err(SemaError::type_error(
             "number",
             format!("{} and {}", a.type_name(), b.type_name()),
@@ -3831,12 +3827,11 @@ fn vm_sub(a: &Value, b: &Value) -> Result<Value, SemaError> {
 
 #[inline(always)]
 fn vm_mul(a: &Value, b: &Value) -> Result<Value, SemaError> {
-    use sema_core::ValueView;
-    match (a.view(), b.view()) {
-        (ValueView::Int(x), ValueView::Int(y)) => Ok(Value::int(x.wrapping_mul(y))),
-        (ValueView::Float(x), ValueView::Float(y)) => Ok(Value::float(x * y)),
-        (ValueView::Int(x), ValueView::Float(y)) => Ok(Value::float(x as f64 * y)),
-        (ValueView::Float(x), ValueView::Int(y)) => Ok(Value::float(x * y as f64)),
+    match (a.view_ref(), b.view_ref()) {
+        (ValueViewRef::Int(x), ValueViewRef::Int(y)) => Ok(Value::int(x.wrapping_mul(y))),
+        (ValueViewRef::Float(x), ValueViewRef::Float(y)) => Ok(Value::float(x * y)),
+        (ValueViewRef::Int(x), ValueViewRef::Float(y)) => Ok(Value::float(x as f64 * y)),
+        (ValueViewRef::Float(x), ValueViewRef::Int(y)) => Ok(Value::float(x * y as f64)),
         _ => Err(SemaError::type_error(
             "number",
             format!("{} and {}", a.type_name(), b.type_name()),
@@ -3846,19 +3841,18 @@ fn vm_mul(a: &Value, b: &Value) -> Result<Value, SemaError> {
 
 #[inline(always)]
 fn vm_div(a: &Value, b: &Value) -> Result<Value, SemaError> {
-    use sema_core::ValueView;
-    match (a.view(), b.view()) {
-        (ValueView::Int(_), ValueView::Int(0)) => Err(SemaError::eval("division by zero")),
-        (ValueView::Int(x), ValueView::Int(y)) => {
+    match (a.view_ref(), b.view_ref()) {
+        (ValueViewRef::Int(_), ValueViewRef::Int(0)) => Err(SemaError::eval("division by zero")),
+        (ValueViewRef::Int(x), ValueViewRef::Int(y)) => {
             if x % y == 0 {
                 Ok(Value::int(x / y))
             } else {
                 Ok(Value::float(x as f64 / y as f64))
             }
         }
-        (ValueView::Float(x), ValueView::Float(y)) => Ok(Value::float(x / y)),
-        (ValueView::Int(x), ValueView::Float(y)) => Ok(Value::float(x as f64 / y)),
-        (ValueView::Float(x), ValueView::Int(y)) => Ok(Value::float(x / y as f64)),
+        (ValueViewRef::Float(x), ValueViewRef::Float(y)) => Ok(Value::float(x / y)),
+        (ValueViewRef::Int(x), ValueViewRef::Float(y)) => Ok(Value::float(x as f64 / y)),
+        (ValueViewRef::Float(x), ValueViewRef::Int(y)) => Ok(Value::float(x / y as f64)),
         _ => Err(SemaError::type_error(
             "number",
             format!("{} and {}", a.type_name(), b.type_name()),
@@ -3869,25 +3863,22 @@ fn vm_div(a: &Value, b: &Value) -> Result<Value, SemaError> {
 /// Numeric-coercing equality: matches stdlib `=` semantics.
 #[inline(always)]
 fn vm_eq(a: &Value, b: &Value) -> bool {
-    use sema_core::ValueView;
-    match (a.view(), b.view()) {
-        (ValueView::Int(x), ValueView::Int(y)) => x == y,
-        (ValueView::Float(x), ValueView::Float(y)) => x == y,
-        (ValueView::Int(x), ValueView::Float(y)) | (ValueView::Float(y), ValueView::Int(x)) => {
-            (x as f64) == y
-        }
+    match (a.view_ref(), b.view_ref()) {
+        (ValueViewRef::Int(x), ValueViewRef::Int(y)) => x == y,
+        (ValueViewRef::Float(x), ValueViewRef::Float(y)) => x == y,
+        (ValueViewRef::Int(x), ValueViewRef::Float(y))
+        | (ValueViewRef::Float(y), ValueViewRef::Int(x)) => (x as f64) == y,
         _ => a == b,
     }
 }
 
 fn vm_lt(a: &Value, b: &Value) -> Result<bool, SemaError> {
-    use sema_core::ValueView;
-    match (a.view(), b.view()) {
-        (ValueView::Int(x), ValueView::Int(y)) => Ok(x < y),
-        (ValueView::Float(x), ValueView::Float(y)) => Ok(x < y),
-        (ValueView::Int(x), ValueView::Float(y)) => Ok((x as f64) < y),
-        (ValueView::Float(x), ValueView::Int(y)) => Ok(x < (y as f64)),
-        (ValueView::String(x), ValueView::String(y)) => Ok(x < y),
+    match (a.view_ref(), b.view_ref()) {
+        (ValueViewRef::Int(x), ValueViewRef::Int(y)) => Ok(x < y),
+        (ValueViewRef::Float(x), ValueViewRef::Float(y)) => Ok(x < y),
+        (ValueViewRef::Int(x), ValueViewRef::Float(y)) => Ok((x as f64) < y),
+        (ValueViewRef::Float(x), ValueViewRef::Int(y)) => Ok(x < (y as f64)),
+        (ValueViewRef::String(x), ValueViewRef::String(y)) => Ok(x < y),
         _ => Err(SemaError::type_error(
             "comparable values",
             format!("{} and {}", a.type_name(), b.type_name()),

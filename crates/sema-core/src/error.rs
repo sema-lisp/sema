@@ -91,6 +91,23 @@ impl Span {
             end_col,
         }
     }
+
+    /// Check if `self` fully contains `other` (inclusive bounds).
+    pub fn contains(&self, other: &Span) -> bool {
+        let inner_start = (other.line, other.col);
+        let inner_end = (other.end_line, other.end_col);
+        let outer_start = (self.line, self.col);
+        let outer_end = (self.end_line, self.end_col);
+        inner_start >= outer_start && inner_end <= outer_end
+    }
+
+    /// Check if position `(line, col)` falls within this span (inclusive).
+    pub fn contains_pos(&self, line: usize, col: usize) -> bool {
+        let pos = (line, col);
+        let start = (self.line, self.col);
+        let end = (self.end_line, self.end_col);
+        pos >= start && pos <= end
+    }
 }
 
 impl fmt::Display for Span {

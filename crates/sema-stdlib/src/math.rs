@@ -1,11 +1,11 @@
-use sema_core::{check_arity, SemaError, Value, ValueView};
+use sema_core::{check_arity, SemaError, Value, ValueViewRef};
 
 use crate::register_fn;
 
 fn pow_impl(args: &[Value]) -> Result<Value, SemaError> {
     check_arity!(args, "pow", 2);
-    match (args[0].view(), args[1].view()) {
-        (ValueView::Int(base), ValueView::Int(exp)) if exp >= 0 => {
+    match (args[0].view_ref(), args[1].view_ref()) {
+        (ValueViewRef::Int(base), ValueViewRef::Int(exp)) if exp >= 0 => {
             Ok(Value::int(base.wrapping_pow(exp as u32)))
         }
         _ => {
@@ -40,9 +40,9 @@ fn float_to_int(f: f64, op: &str) -> Result<Value, SemaError> {
 
 fn ceil_impl(args: &[Value]) -> Result<Value, SemaError> {
     check_arity!(args, "ceil", 1);
-    match args[0].view() {
-        ValueView::Int(n) => Ok(Value::int(n)),
-        ValueView::Float(f) => float_to_int(f.ceil(), "ceil"),
+    match args[0].view_ref() {
+        ValueViewRef::Int(n) => Ok(Value::int(n)),
+        ValueViewRef::Float(f) => float_to_int(f.ceil(), "ceil"),
         _ => Err(SemaError::type_error("number", args[0].type_name())),
     }
 }
@@ -50,12 +50,12 @@ fn ceil_impl(args: &[Value]) -> Result<Value, SemaError> {
 pub fn register(env: &sema_core::Env) {
     register_fn(env, "abs", |args| {
         check_arity!(args, "abs", 1);
-        match args[0].view() {
-            ValueView::Int(n) => n.checked_abs().map(Value::int).ok_or_else(|| {
+        match args[0].view_ref() {
+            ValueViewRef::Int(n) => n.checked_abs().map(Value::int).ok_or_else(|| {
                 SemaError::eval("abs: |i64::MIN| overflows i64")
                     .with_hint("convert to a float first, e.g. (abs (* 1.0 n))")
             }),
-            ValueView::Float(f) => Ok(Value::float(f.abs())),
+            ValueViewRef::Float(f) => Ok(Value::float(f.abs())),
             _ => Err(SemaError::type_error("number", args[0].type_name())),
         }
     });
@@ -86,9 +86,9 @@ pub fn register(env: &sema_core::Env) {
 
     register_fn(env, "floor", |args| {
         check_arity!(args, "floor", 1);
-        match args[0].view() {
-            ValueView::Int(n) => Ok(Value::int(n)),
-            ValueView::Float(f) => float_to_int(f.floor(), "floor"),
+        match args[0].view_ref() {
+            ValueViewRef::Int(n) => Ok(Value::int(n)),
+            ValueViewRef::Float(f) => float_to_int(f.floor(), "floor"),
             _ => Err(SemaError::type_error("number", args[0].type_name())),
         }
     });
@@ -98,9 +98,9 @@ pub fn register(env: &sema_core::Env) {
 
     register_fn(env, "round", |args| {
         check_arity!(args, "round", 1);
-        match args[0].view() {
-            ValueView::Int(n) => Ok(Value::int(n)),
-            ValueView::Float(f) => float_to_int(f.round(), "round"),
+        match args[0].view_ref() {
+            ValueViewRef::Int(n) => Ok(Value::int(n)),
+            ValueViewRef::Float(f) => float_to_int(f.round(), "round"),
             _ => Err(SemaError::type_error("number", args[0].type_name())),
         }
     });
@@ -173,13 +173,13 @@ pub fn register(env: &sema_core::Env) {
 
     register_fn(env, "int", |args| {
         check_arity!(args, "int", 1);
-        match args[0].view() {
-            ValueView::Int(n) => Ok(Value::int(n)),
+        match args[0].view_ref() {
+            ValueViewRef::Int(n) => Ok(Value::int(n)),
             // Truncate toward zero, but reject NaN/inf/out-of-range like every
             // other rounding builtin (floor/ceil/round/truncate) — a raw cast
             // would saturate and silently return garbage.
-            ValueView::Float(f) => float_to_int(f.trunc(), "int"),
-            ValueView::String(s) => s
+            ValueViewRef::Float(f) => float_to_int(f.trunc(), "int"),
+            ValueViewRef::String(s) => s
                 .parse::<i64>()
                 .map(Value::int)
                 .map_err(|_| SemaError::eval(format!("cannot convert '{s}' to int"))),
@@ -192,10 +192,10 @@ pub fn register(env: &sema_core::Env) {
 
     register_fn(env, "float", |args| {
         check_arity!(args, "float", 1);
-        match args[0].view() {
-            ValueView::Int(n) => Ok(Value::float(n as f64)),
-            ValueView::Float(f) => Ok(Value::float(f)),
-            ValueView::String(s) => s
+        match args[0].view_ref() {
+            ValueViewRef::Int(n) => Ok(Value::float(n as f64)),
+            ValueViewRef::Float(f) => Ok(Value::float(f)),
+            ValueViewRef::String(s) => s
                 .parse::<f64>()
                 .map(Value::float)
                 .map_err(|_| SemaError::eval(format!("cannot convert '{s}' to float"))),
@@ -369,8 +369,8 @@ pub fn register(env: &sema_core::Env) {
 
     register_fn(env, "math/clamp", |args| {
         check_arity!(args, "math/clamp", 3);
-        match (args[0].view(), args[1].view(), args[2].view()) {
-            (ValueView::Int(v), ValueView::Int(lo), ValueView::Int(hi)) => {
+        match (args[0].view_ref(), args[1].view_ref(), args[2].view_ref()) {
+            (ValueViewRef::Int(v), ValueViewRef::Int(lo), ValueViewRef::Int(hi)) => {
                 Ok(Value::int(v.max(lo).min(hi)))
             }
             _ => {
@@ -395,15 +395,15 @@ pub fn register(env: &sema_core::Env) {
 
     register_fn(env, "math/sign", |args| {
         check_arity!(args, "math/sign", 1);
-        match args[0].view() {
-            ValueView::Int(n) => Ok(Value::int(if n > 0 {
+        match args[0].view_ref() {
+            ValueViewRef::Int(n) => Ok(Value::int(if n > 0 {
                 1
             } else if n < 0 {
                 -1
             } else {
                 0
             })),
-            ValueView::Float(f) => Ok(Value::int(if f > 0.0 {
+            ValueViewRef::Float(f) => Ok(Value::int(if f > 0.0 {
                 1
             } else if f < 0.0 {
                 -1
@@ -416,9 +416,9 @@ pub fn register(env: &sema_core::Env) {
 
     register_fn(env, "truncate", |args| {
         check_arity!(args, "truncate", 1);
-        match args[0].view() {
-            ValueView::Int(n) => Ok(Value::int(n)),
-            ValueView::Float(f) => float_to_int(f.trunc(), "truncate"),
+        match args[0].view_ref() {
+            ValueViewRef::Int(n) => Ok(Value::int(n)),
+            ValueViewRef::Float(f) => float_to_int(f.trunc(), "truncate"),
             _ => Err(SemaError::type_error("number", args[0].type_name())),
         }
     });
@@ -501,16 +501,16 @@ pub fn register(env: &sema_core::Env) {
 
     register_fn(env, "math/nan?", |args| {
         check_arity!(args, "math/nan?", 1);
-        match args[0].view() {
-            ValueView::Float(f) => Ok(Value::bool(f.is_nan())),
+        match args[0].view_ref() {
+            ValueViewRef::Float(f) => Ok(Value::bool(f.is_nan())),
             _ => Ok(Value::bool(false)),
         }
     });
 
     register_fn(env, "math/infinite?", |args| {
         check_arity!(args, "math/infinite?", 1);
-        match args[0].view() {
-            ValueView::Float(f) => Ok(Value::bool(f.is_infinite())),
+        match args[0].view_ref() {
+            ValueViewRef::Float(f) => Ok(Value::bool(f.is_infinite())),
             _ => Ok(Value::bool(false)),
         }
     });
@@ -520,11 +520,11 @@ pub fn register(env: &sema_core::Env) {
 }
 
 fn num_lt(a: &Value, b: &Value) -> Result<bool, SemaError> {
-    match (a.view(), b.view()) {
-        (ValueView::Int(a), ValueView::Int(b)) => Ok(a < b),
-        (ValueView::Float(a), ValueView::Float(b)) => Ok(a < b),
-        (ValueView::Int(a), ValueView::Float(b)) => Ok((a as f64) < b),
-        (ValueView::Float(a), ValueView::Int(b)) => Ok(a < (b as f64)),
+    match (a.view_ref(), b.view_ref()) {
+        (ValueViewRef::Int(a), ValueViewRef::Int(b)) => Ok(a < b),
+        (ValueViewRef::Float(a), ValueViewRef::Float(b)) => Ok(a < b),
+        (ValueViewRef::Int(a), ValueViewRef::Float(b)) => Ok((a as f64) < b),
+        (ValueViewRef::Float(a), ValueViewRef::Int(b)) => Ok(a < (b as f64)),
         _ => Err(SemaError::type_error("number", a.type_name())),
     }
 }

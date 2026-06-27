@@ -1,4 +1,4 @@
-use sema_core::{check_arity, SemaError, Value, ValueView};
+use sema_core::{check_arity, SemaError, Value, ValueViewRef};
 
 use crate::register_fn;
 
@@ -154,9 +154,10 @@ pub fn register(env: &sema_core::Env) {
         let items = get_sequence(&args[1], "filter")?;
         let mut result = Vec::new();
         for item in items {
-            let keep = call_function(&args[0], &[item.clone()])?;
+            let owned = item.clone();
+            let keep = call_function(&args[0], std::slice::from_ref(&owned))?;
             if keep.is_truthy() {
-                result.push(item.clone());
+                result.push(owned);
             }
         }
         Ok(Value::list(result))
@@ -827,9 +828,9 @@ pub fn register(env: &sema_core::Env) {
         let items = get_sequence(&args[1], "list/pluck")?;
         let mut result = Vec::with_capacity(items.len());
         for item in items {
-            let val = match item.view() {
-                ValueView::Map(m) => m.get(key).cloned().unwrap_or(Value::nil()),
-                ValueView::HashMap(m) => m.get(key).cloned().unwrap_or(Value::nil()),
+            let val = match item.view_ref() {
+                ValueViewRef::Map(m) => m.get(key).cloned().unwrap_or(Value::nil()),
+                ValueViewRef::HashMap(m) => m.get(key).cloned().unwrap_or(Value::nil()),
                 _ => Value::nil(),
             };
             result.push(val);
@@ -1240,11 +1241,11 @@ fn flatten_recursive(val: &Value, out: &mut Vec<Value>) {
 }
 
 fn num_lt(a: &Value, b: &Value) -> Result<bool, SemaError> {
-    match (a.view(), b.view()) {
-        (ValueView::Int(a), ValueView::Int(b)) => Ok(a < b),
-        (ValueView::Float(a), ValueView::Float(b)) => Ok(a < b),
-        (ValueView::Int(a), ValueView::Float(b)) => Ok((a as f64) < b),
-        (ValueView::Float(a), ValueView::Int(b)) => Ok(a < (b as f64)),
+    match (a.view_ref(), b.view_ref()) {
+        (ValueViewRef::Int(a), ValueViewRef::Int(b)) => Ok(a < b),
+        (ValueViewRef::Float(a), ValueViewRef::Float(b)) => Ok(a < b),
+        (ValueViewRef::Int(a), ValueViewRef::Float(b)) => Ok((a as f64) < b),
+        (ValueViewRef::Float(a), ValueViewRef::Int(b)) => Ok(a < (b as f64)),
         _ => Err(SemaError::type_error("number", a.type_name())),
     }
 }

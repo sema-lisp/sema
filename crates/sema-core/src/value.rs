@@ -641,6 +641,41 @@ pub enum ValueView {
     Channel(Rc<Channel>),
 }
 
+/// A borrowing view of a `Value` — like `ValueView` but returns references
+/// instead of cloning `Rc`s, avoiding refcount mutations on every comparison,
+/// hash, and ordering operation.
+pub enum ValueViewRef<'a> {
+    Nil,
+    Bool(bool),
+    Int(i64),
+    Float(f64),
+    String(&'a str),
+    Symbol(Spur),
+    Keyword(Spur),
+    Char(char),
+    List(&'a [Value]),
+    Vector(&'a [Value]),
+    Map(&'a BTreeMap<Value, Value>),
+    HashMap(&'a hashbrown::HashMap<Value, Value>),
+    Lambda(&'a Lambda),
+    Macro(&'a Macro),
+    NativeFn(&'a NativeFn),
+    Prompt(&'a Prompt),
+    Message(&'a Message),
+    Conversation(&'a Conversation),
+    ToolDef(&'a ToolDefinition),
+    Agent(&'a Agent),
+    Thunk(&'a Thunk),
+    Record(&'a Record),
+    Bytevector(&'a [u8]),
+    MultiMethod(&'a MultiMethod),
+    Stream(&'a StreamBox),
+    F64Array(&'a [f64]),
+    I64Array(&'a [i64]),
+    AsyncPromise(&'a AsyncPromise),
+    Channel(&'a Channel),
+}
+
 // ── The NaN-boxed Value type ──────────────────────────────────────
 
 /// The core Value type for all Sema data.
@@ -1053,6 +1088,81 @@ impl Value {
             TAG_I64_ARRAY => ValueView::I64Array(unsafe { self.get_rc::<Vec<i64>>() }),
             TAG_ASYNC_PROMISE => ValueView::AsyncPromise(unsafe { self.get_rc::<AsyncPromise>() }),
             TAG_CHANNEL => ValueView::Channel(unsafe { self.get_rc::<Channel>() }),
+            _ => unreachable!("invalid NaN-boxed tag: {}", tag),
+        }
+    }
+
+    /// Borrowing view — like `view()` but returns references instead of
+    /// bumping Rc refcounts.  Use this in hot paths like `PartialEq`,
+    /// `Hash`, `Ord`, and `Display`.
+    #[inline(always)]
+    pub fn view_ref(&self) -> ValueViewRef<'_> {
+        if !is_boxed(self.0) {
+            return ValueViewRef::Float(f64::from_bits(self.0));
+        }
+        let tag = get_tag(self.0);
+        match tag {
+            TAG_NIL => ValueViewRef::Nil,
+            TAG_FALSE => ValueViewRef::Bool(false),
+            TAG_TRUE => ValueViewRef::Bool(true),
+            TAG_INT_SMALL => {
+                let payload = get_payload(self.0);
+                let val = if payload & INT_SIGN_BIT != 0 {
+                    (payload | !PAYLOAD_MASK) as i64
+                } else {
+                    payload as i64
+                };
+                ValueViewRef::Int(val)
+            }
+            TAG_CHAR => {
+                let payload = get_payload(self.0);
+                ValueViewRef::Char(unsafe { char::from_u32_unchecked(payload as u32) })
+            }
+            TAG_SYMBOL => {
+                let payload = get_payload(self.0);
+                ValueViewRef::Symbol(bits_to_spur(payload as u32))
+            }
+            TAG_KEYWORD => {
+                let payload = get_payload(self.0);
+                ValueViewRef::Keyword(bits_to_spur(payload as u32))
+            }
+            TAG_INT_BIG => {
+                let val = unsafe { *self.borrow_ref::<i64>() };
+                ValueViewRef::Int(val)
+            }
+            // SAFETY: same tag/type correspondence as view() — see the
+            // comment in view().  borrow_ref returns &T without touching
+            // the refcount.
+            TAG_STRING => ValueViewRef::String(unsafe { self.borrow_ref::<String>() }),
+            TAG_LIST => ValueViewRef::List(unsafe { self.borrow_ref::<Vec<Value>>() }),
+            TAG_VECTOR => ValueViewRef::Vector(unsafe { self.borrow_ref::<Vec<Value>>() }),
+            TAG_MAP => ValueViewRef::Map(unsafe { self.borrow_ref::<BTreeMap<Value, Value>>() }),
+            TAG_HASHMAP => ValueViewRef::HashMap(unsafe {
+                self.borrow_ref::<hashbrown::HashMap<Value, Value>>()
+            }),
+            TAG_LAMBDA => ValueViewRef::Lambda(unsafe { self.borrow_ref::<Lambda>() }),
+            TAG_MACRO => ValueViewRef::Macro(unsafe { self.borrow_ref::<Macro>() }),
+            TAG_NATIVE_FN => ValueViewRef::NativeFn(unsafe { self.borrow_ref::<NativeFn>() }),
+            TAG_PROMPT => ValueViewRef::Prompt(unsafe { self.borrow_ref::<Prompt>() }),
+            TAG_MESSAGE => ValueViewRef::Message(unsafe { self.borrow_ref::<Message>() }),
+            TAG_CONVERSATION => {
+                ValueViewRef::Conversation(unsafe { self.borrow_ref::<Conversation>() })
+            }
+            TAG_TOOL_DEF => ValueViewRef::ToolDef(unsafe { self.borrow_ref::<ToolDefinition>() }),
+            TAG_AGENT => ValueViewRef::Agent(unsafe { self.borrow_ref::<Agent>() }),
+            TAG_THUNK => ValueViewRef::Thunk(unsafe { self.borrow_ref::<Thunk>() }),
+            TAG_RECORD => ValueViewRef::Record(unsafe { self.borrow_ref::<Record>() }),
+            TAG_BYTEVECTOR => ValueViewRef::Bytevector(unsafe { self.borrow_ref::<Vec<u8>>() }),
+            TAG_MULTIMETHOD => {
+                ValueViewRef::MultiMethod(unsafe { self.borrow_ref::<MultiMethod>() })
+            }
+            TAG_STREAM => ValueViewRef::Stream(unsafe { self.borrow_ref::<StreamBox>() }),
+            TAG_F64_ARRAY => ValueViewRef::F64Array(unsafe { self.borrow_ref::<Vec<f64>>() }),
+            TAG_I64_ARRAY => ValueViewRef::I64Array(unsafe { self.borrow_ref::<Vec<i64>>() }),
+            TAG_ASYNC_PROMISE => {
+                ValueViewRef::AsyncPromise(unsafe { self.borrow_ref::<AsyncPromise>() })
+            }
+            TAG_CHANNEL => ValueViewRef::Channel(unsafe { self.borrow_ref::<Channel>() }),
             _ => unreachable!("invalid NaN-boxed tag: {}", tag),
         }
     }
@@ -1742,33 +1852,33 @@ impl PartialEq for Value {
             return true;
         }
         // Different bits: could still be equal for heap types or -0.0/+0.0
-        match (self.view(), other.view()) {
-            (ValueView::Nil, ValueView::Nil) => true,
-            (ValueView::Bool(a), ValueView::Bool(b)) => a == b,
-            (ValueView::Int(a), ValueView::Int(b)) => a == b,
-            (ValueView::Float(a), ValueView::Float(b)) => a == b,
-            (ValueView::String(a), ValueView::String(b)) => a == b,
-            (ValueView::Symbol(a), ValueView::Symbol(b)) => a == b,
-            (ValueView::Keyword(a), ValueView::Keyword(b)) => a == b,
-            (ValueView::Char(a), ValueView::Char(b)) => a == b,
-            (ValueView::List(a), ValueView::List(b)) => a == b,
-            (ValueView::Vector(a), ValueView::Vector(b)) => a == b,
-            (ValueView::Map(a), ValueView::Map(b)) => a == b,
-            (ValueView::HashMap(a), ValueView::HashMap(b)) => a == b,
-            (ValueView::Record(a), ValueView::Record(b)) => {
+        match (self.view_ref(), other.view_ref()) {
+            (ValueViewRef::Nil, ValueViewRef::Nil) => true,
+            (ValueViewRef::Bool(a), ValueViewRef::Bool(b)) => a == b,
+            (ValueViewRef::Int(a), ValueViewRef::Int(b)) => a == b,
+            (ValueViewRef::Float(a), ValueViewRef::Float(b)) => a == b,
+            (ValueViewRef::String(a), ValueViewRef::String(b)) => a == b,
+            (ValueViewRef::Symbol(a), ValueViewRef::Symbol(b)) => a == b,
+            (ValueViewRef::Keyword(a), ValueViewRef::Keyword(b)) => a == b,
+            (ValueViewRef::Char(a), ValueViewRef::Char(b)) => a == b,
+            (ValueViewRef::List(a), ValueViewRef::List(b)) => a == b,
+            (ValueViewRef::Vector(a), ValueViewRef::Vector(b)) => a == b,
+            (ValueViewRef::Map(a), ValueViewRef::Map(b)) => a == b,
+            (ValueViewRef::HashMap(a), ValueViewRef::HashMap(b)) => a == b,
+            (ValueViewRef::Record(a), ValueViewRef::Record(b)) => {
                 a.type_tag == b.type_tag && a.fields == b.fields
             }
-            (ValueView::Bytevector(a), ValueView::Bytevector(b)) => a == b,
-            (ValueView::F64Array(a), ValueView::F64Array(b)) => {
+            (ValueViewRef::Bytevector(a), ValueViewRef::Bytevector(b)) => a == b,
+            (ValueViewRef::F64Array(a), ValueViewRef::F64Array(b)) => {
                 a.len() == b.len()
                     && a.iter()
                         .zip(b.iter())
                         .all(|(x, y)| x.to_bits() == y.to_bits())
             }
-            (ValueView::I64Array(a), ValueView::I64Array(b)) => a == b,
-            (ValueView::Stream(a), ValueView::Stream(b)) => Rc::ptr_eq(&a, &b),
-            (ValueView::AsyncPromise(a), ValueView::AsyncPromise(b)) => Rc::ptr_eq(&a, &b),
-            (ValueView::Channel(a), ValueView::Channel(b)) => Rc::ptr_eq(&a, &b),
+            (ValueViewRef::I64Array(a), ValueViewRef::I64Array(b)) => a == b,
+            (ValueViewRef::Stream(a), ValueViewRef::Stream(b)) => std::ptr::eq(a, b),
+            (ValueViewRef::AsyncPromise(a), ValueViewRef::AsyncPromise(b)) => std::ptr::eq(a, b),
+            (ValueViewRef::Channel(a), ValueViewRef::Channel(b)) => std::ptr::eq(a, b),
             _ => false,
         }
     }
@@ -1780,76 +1890,75 @@ impl Eq for Value {}
 
 impl Hash for Value {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        match self.view() {
-            ValueView::Nil => 0u8.hash(state),
-            ValueView::Bool(b) => {
+        match self.view_ref() {
+            ValueViewRef::Nil => 0u8.hash(state),
+            ValueViewRef::Bool(b) => {
                 1u8.hash(state);
                 b.hash(state);
             }
-            ValueView::Int(n) => {
+            ValueViewRef::Int(n) => {
                 2u8.hash(state);
                 n.hash(state);
             }
-            ValueView::Float(f) => {
+            ValueViewRef::Float(f) => {
                 3u8.hash(state);
-                // Normalize -0.0 to +0.0 so equal values hash identically
                 let bits = if f == 0.0 { 0u64 } else { f.to_bits() };
                 bits.hash(state);
             }
-            ValueView::String(s) => {
+            ValueViewRef::String(s) => {
                 4u8.hash(state);
                 s.hash(state);
             }
-            ValueView::Symbol(s) => {
+            ValueViewRef::Symbol(s) => {
                 5u8.hash(state);
                 s.hash(state);
             }
-            ValueView::Keyword(s) => {
+            ValueViewRef::Keyword(s) => {
                 6u8.hash(state);
                 s.hash(state);
             }
-            ValueView::Char(c) => {
+            ValueViewRef::Char(c) => {
                 7u8.hash(state);
                 c.hash(state);
             }
-            ValueView::List(l) => {
+            ValueViewRef::List(l) => {
                 8u8.hash(state);
                 l.hash(state);
             }
-            ValueView::Vector(v) => {
+            ValueViewRef::Vector(v) => {
                 9u8.hash(state);
                 v.hash(state);
             }
-            ValueView::Record(r) => {
+            ValueViewRef::Record(r) => {
                 10u8.hash(state);
                 r.type_tag.hash(state);
                 r.fields.hash(state);
             }
-            ValueView::Bytevector(bv) => {
+            ValueViewRef::Bytevector(bv) => {
                 11u8.hash(state);
                 bv.hash(state);
             }
-            ValueView::F64Array(arr) => {
+            ValueViewRef::F64Array(arr) => {
                 26u8.hash(state);
                 for v in arr.iter() {
                     v.to_bits().hash(state);
                 }
             }
-            ValueView::I64Array(arr) => {
+            ValueViewRef::I64Array(arr) => {
                 27u8.hash(state);
                 arr.hash(state);
             }
-            ValueView::Stream(s) => {
+            ValueViewRef::Stream(s) => {
                 25u8.hash(state);
-                (Rc::as_ptr(&s) as usize).hash(state);
+                (s as *const _ as usize).hash(state);
             }
-            ValueView::AsyncPromise(p) => {
+            ValueViewRef::AsyncPromise(p) => {
                 28u8.hash(state);
-                (Rc::as_ptr(&p) as usize).hash(state);
+                (p as *const _ as usize).hash(state);
             }
-            ValueView::Channel(c) => {
+            ValueViewRef::Channel(c) => {
                 29u8.hash(state);
-                (Rc::as_ptr(&c) as usize).hash(state);
+                (c as *const _ as usize).hash(state);
             }
             _ => {}
         }
@@ -1868,44 +1977,44 @@ impl Ord for Value {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         use std::cmp::Ordering;
         fn type_order(v: &Value) -> u8 {
-            match v.view() {
-                ValueView::Nil => 0,
-                ValueView::Bool(_) => 1,
-                ValueView::Int(_) => 2,
-                ValueView::Float(_) => 3,
-                ValueView::Char(_) => 4,
-                ValueView::String(_) => 5,
-                ValueView::Symbol(_) => 6,
-                ValueView::Keyword(_) => 7,
-                ValueView::List(_) => 8,
-                ValueView::Vector(_) => 9,
-                ValueView::Map(_) => 10,
-                ValueView::HashMap(_) => 11,
-                ValueView::Record(_) => 12,
-                ValueView::Bytevector(_) => 13,
-                ValueView::F64Array(_) => 14,
-                ValueView::I64Array(_) => 15,
-                ValueView::Stream(_) => 16,
+            match v.view_ref() {
+                ValueViewRef::Nil => 0,
+                ValueViewRef::Bool(_) => 1,
+                ValueViewRef::Int(_) => 2,
+                ValueViewRef::Float(_) => 3,
+                ValueViewRef::Char(_) => 4,
+                ValueViewRef::String(_) => 5,
+                ValueViewRef::Symbol(_) => 6,
+                ValueViewRef::Keyword(_) => 7,
+                ValueViewRef::List(_) => 8,
+                ValueViewRef::Vector(_) => 9,
+                ValueViewRef::Map(_) => 10,
+                ValueViewRef::HashMap(_) => 11,
+                ValueViewRef::Record(_) => 12,
+                ValueViewRef::Bytevector(_) => 13,
+                ValueViewRef::F64Array(_) => 14,
+                ValueViewRef::I64Array(_) => 15,
+                ValueViewRef::Stream(_) => 16,
                 _ => 17,
             }
         }
-        match (self.view(), other.view()) {
-            (ValueView::Nil, ValueView::Nil) => Ordering::Equal,
-            (ValueView::Bool(a), ValueView::Bool(b)) => a.cmp(&b),
-            (ValueView::Int(a), ValueView::Int(b)) => a.cmp(&b),
-            (ValueView::Float(a), ValueView::Float(b)) => a.total_cmp(&b),
-            (ValueView::String(a), ValueView::String(b)) => a.cmp(&b),
-            (ValueView::Symbol(a), ValueView::Symbol(b)) => compare_spurs(a, b),
-            (ValueView::Keyword(a), ValueView::Keyword(b)) => compare_spurs(a, b),
-            (ValueView::Char(a), ValueView::Char(b)) => a.cmp(&b),
-            (ValueView::List(a), ValueView::List(b)) => a.cmp(&b),
-            (ValueView::Vector(a), ValueView::Vector(b)) => a.cmp(&b),
-            (ValueView::Record(a), ValueView::Record(b)) => {
+        match (self.view_ref(), other.view_ref()) {
+            (ValueViewRef::Nil, ValueViewRef::Nil) => Ordering::Equal,
+            (ValueViewRef::Bool(a), ValueViewRef::Bool(b)) => a.cmp(&b),
+            (ValueViewRef::Int(a), ValueViewRef::Int(b)) => a.cmp(&b),
+            (ValueViewRef::Float(a), ValueViewRef::Float(b)) => a.total_cmp(&b),
+            (ValueViewRef::String(a), ValueViewRef::String(b)) => a.cmp(b),
+            (ValueViewRef::Symbol(a), ValueViewRef::Symbol(b)) => compare_spurs(a, b),
+            (ValueViewRef::Keyword(a), ValueViewRef::Keyword(b)) => compare_spurs(a, b),
+            (ValueViewRef::Char(a), ValueViewRef::Char(b)) => a.cmp(&b),
+            (ValueViewRef::List(a), ValueViewRef::List(b)) => a.cmp(b),
+            (ValueViewRef::Vector(a), ValueViewRef::Vector(b)) => a.cmp(b),
+            (ValueViewRef::Record(a), ValueViewRef::Record(b)) => {
                 compare_spurs(a.type_tag, b.type_tag).then_with(|| a.fields.cmp(&b.fields))
             }
-            (ValueView::Bytevector(a), ValueView::Bytevector(b)) => a.cmp(&b),
-            (ValueView::I64Array(a), ValueView::I64Array(b)) => a.cmp(&b),
-            (ValueView::F64Array(a), ValueView::F64Array(b)) => a
+            (ValueViewRef::Bytevector(a), ValueViewRef::Bytevector(b)) => a.cmp(b),
+            (ValueViewRef::I64Array(a), ValueViewRef::I64Array(b)) => a.cmp(b),
+            (ValueViewRef::F64Array(a), ValueViewRef::F64Array(b)) => a
                 .iter()
                 .zip(b.iter())
                 .map(|(x, y)| x.total_cmp(y))
@@ -1930,23 +2039,19 @@ fn truncate(s: &str, max: usize) -> String {
 
 impl fmt::Display for Value {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self.view() {
-            ValueView::Nil => write!(f, "nil"),
-            ValueView::Bool(true) => write!(f, "#t"),
-            ValueView::Bool(false) => write!(f, "#f"),
-            ValueView::Int(n) => write!(f, "{n}"),
-            ValueView::Float(n) => {
+        match self.view_ref() {
+            ValueViewRef::Nil => write!(f, "nil"),
+            ValueViewRef::Bool(true) => write!(f, "#t"),
+            ValueViewRef::Bool(false) => write!(f, "#f"),
+            ValueViewRef::Int(n) => write!(f, "{n}"),
+            ValueViewRef::Float(n) => {
                 if n.fract() == 0.0 {
                     write!(f, "{n:.1}")
                 } else {
                     write!(f, "{n}")
                 }
             }
-            ValueView::String(s) => {
-                // Readable form: escape so the output re-reads to the same string
-                // (round-trip). Bare strings printed via display/println/str go
-                // through a separate raw path, so this only affects nested/readable
-                // output. The reader parses these escapes back.
+            ValueViewRef::String(s) => {
                 write!(f, "\"")?;
                 for c in s.chars() {
                     match c {
@@ -1960,9 +2065,9 @@ impl fmt::Display for Value {
                 }
                 write!(f, "\"")
             }
-            ValueView::Symbol(s) => with_resolved(s, |name| write!(f, "{name}")),
-            ValueView::Keyword(s) => with_resolved(s, |name| write!(f, ":{name}")),
-            ValueView::Char(c) => match c {
+            ValueViewRef::Symbol(s) => with_resolved(s, |name| write!(f, "{name}")),
+            ValueViewRef::Keyword(s) => with_resolved(s, |name| write!(f, ":{name}")),
+            ValueViewRef::Char(c) => match c {
                 ' ' => write!(f, "#\\space"),
                 '\n' => write!(f, "#\\newline"),
                 '\t' => write!(f, "#\\tab"),
@@ -1970,7 +2075,7 @@ impl fmt::Display for Value {
                 '\0' => write!(f, "#\\nul"),
                 _ => write!(f, "#\\{c}"),
             },
-            ValueView::List(items) => {
+            ValueViewRef::List(items) => {
                 write!(f, "(")?;
                 for (i, item) in items.iter().enumerate() {
                     if i > 0 {
@@ -1980,7 +2085,7 @@ impl fmt::Display for Value {
                 }
                 write!(f, ")")
             }
-            ValueView::Vector(items) => {
+            ValueViewRef::Vector(items) => {
                 write!(f, "[")?;
                 for (i, item) in items.iter().enumerate() {
                     if i > 0 {
@@ -1990,7 +2095,7 @@ impl fmt::Display for Value {
                 }
                 write!(f, "]")
             }
-            ValueView::Map(map) => {
+            ValueViewRef::Map(map) => {
                 write!(f, "{{")?;
                 for (i, (k, v)) in map.iter().enumerate() {
                     if i > 0 {
@@ -2000,7 +2105,7 @@ impl fmt::Display for Value {
                 }
                 write!(f, "}}")
             }
-            ValueView::HashMap(map) => {
+            ValueViewRef::HashMap(map) => {
                 let mut entries: Vec<_> = map.iter().collect();
                 entries.sort_by_key(|(k1, _)| *k1);
                 write!(f, "{{")?;
@@ -2012,39 +2117,39 @@ impl fmt::Display for Value {
                 }
                 write!(f, "}}")
             }
-            ValueView::Lambda(l) => {
+            ValueViewRef::Lambda(l) => {
                 if let Some(name) = &l.name {
                     with_resolved(*name, |n| write!(f, "<lambda {n}>"))
                 } else {
                     write!(f, "<lambda>")
                 }
             }
-            ValueView::Macro(m) => with_resolved(m.name, |n| write!(f, "<macro {n}>")),
-            ValueView::NativeFn(n) => write!(f, "<native-fn {}>", n.name),
-            ValueView::Prompt(p) => write!(f, "<prompt {} messages>", p.messages.len()),
-            ValueView::Message(m) => {
+            ValueViewRef::Macro(m) => with_resolved(m.name, |n| write!(f, "<macro {n}>")),
+            ValueViewRef::NativeFn(n) => write!(f, "<native-fn {}>", n.name),
+            ValueViewRef::Prompt(p) => write!(f, "<prompt {} messages>", p.messages.len()),
+            ValueViewRef::Message(m) => {
                 write!(f, "<message {} \"{}\">", m.role, truncate(&m.content, 40))
             }
-            ValueView::Conversation(c) => {
+            ValueViewRef::Conversation(c) => {
                 write!(f, "<conversation {} messages>", c.messages.len())
             }
-            ValueView::ToolDef(t) => write!(f, "<tool {}>", t.name),
-            ValueView::Agent(a) => write!(f, "<agent {}>", a.name),
-            ValueView::Thunk(t) => {
+            ValueViewRef::ToolDef(t) => write!(f, "<tool {}>", t.name),
+            ValueViewRef::Agent(a) => write!(f, "<agent {}>", a.name),
+            ValueViewRef::Thunk(t) => {
                 if t.forced.borrow().is_some() {
                     write!(f, "<promise (forced)>")
                 } else {
                     write!(f, "<promise>")
                 }
             }
-            ValueView::Record(r) => {
+            ValueViewRef::Record(r) => {
                 with_resolved(r.type_tag, |tag| write!(f, "#<record {tag}"))?;
                 for field in &r.fields {
                     write!(f, " {field}")?;
                 }
                 write!(f, ">")
             }
-            ValueView::Bytevector(bv) => {
+            ValueViewRef::Bytevector(bv) => {
                 write!(f, "#u8(")?;
                 for (i, byte) in bv.iter().enumerate() {
                     if i > 0 {
@@ -2054,7 +2159,7 @@ impl fmt::Display for Value {
                 }
                 write!(f, ")")
             }
-            ValueView::F64Array(arr) => {
+            ValueViewRef::F64Array(arr) => {
                 write!(f, "#f64(")?;
                 for (i, v) in arr.iter().enumerate() {
                     if i > 0 {
@@ -2064,7 +2169,7 @@ impl fmt::Display for Value {
                 }
                 write!(f, ")")
             }
-            ValueView::I64Array(arr) => {
+            ValueViewRef::I64Array(arr) => {
                 write!(f, "#i64(")?;
                 for (i, v) in arr.iter().enumerate() {
                     if i > 0 {
@@ -2074,15 +2179,17 @@ impl fmt::Display for Value {
                 }
                 write!(f, ")")
             }
-            ValueView::MultiMethod(m) => with_resolved(m.name, |n| write!(f, "<multimethod {n}>")),
-            ValueView::Stream(s) => write!(f, "<stream:{}>", s.stream_type()),
-            ValueView::AsyncPromise(p) => match &*p.state.borrow() {
+            ValueViewRef::MultiMethod(m) => {
+                with_resolved(m.name, |n| write!(f, "<multimethod {n}>"))
+            }
+            ValueViewRef::Stream(s) => write!(f, "<stream:{}>", s.stream_type()),
+            ValueViewRef::AsyncPromise(p) => match &*p.state.borrow() {
                 PromiseState::Pending => write!(f, "<async-promise pending>"),
                 PromiseState::Resolved(v) => write!(f, "<async-promise resolved: {v}>"),
                 PromiseState::Rejected(e) => write!(f, "<async-promise rejected: {e}>"),
                 PromiseState::Cancelled => write!(f, "<async-promise cancelled>"),
             },
-            ValueView::Channel(c) => {
+            ValueViewRef::Channel(c) => {
                 let len = c.buffer.borrow().len();
                 if c.closed.get() {
                     write!(f, "<channel {len}/{} closed>", c.capacity)
@@ -2100,10 +2207,6 @@ impl fmt::Display for Value {
 /// representation exceeds `max_width` columns.  Small values that fit in
 /// one line are returned in the normal compact format.
 pub fn pretty_print(value: &Value, max_width: usize) -> String {
-    let compact = format!("{value}");
-    if compact.len() <= max_width {
-        return compact;
-    }
     let mut buf = String::new();
     pp_value(value, 0, max_width, &mut buf);
     buf
@@ -2120,14 +2223,14 @@ fn pp_value(value: &Value, indent: usize, max_width: usize, buf: &mut String) {
         return;
     }
 
-    match value.view() {
-        ValueView::List(items) => {
+    match value.view_ref() {
+        ValueViewRef::List(items) => {
             pp_seq(items.iter(), '(', ')', indent, max_width, buf);
         }
-        ValueView::Vector(items) => {
+        ValueViewRef::Vector(items) => {
             pp_seq(items.iter(), '[', ']', indent, max_width, buf);
         }
-        ValueView::Map(map) => {
+        ValueViewRef::Map(map) => {
             pp_map(
                 map.iter().map(|(k, v)| (k.clone(), v.clone())),
                 indent,
@@ -2135,7 +2238,7 @@ fn pp_value(value: &Value, indent: usize, max_width: usize, buf: &mut String) {
                 buf,
             );
         }
-        ValueView::HashMap(map) => {
+        ValueViewRef::HashMap(map) => {
             let mut entries: Vec<_> = map.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
             entries.sort_by(|(k1, _), (k2, _)| k1.cmp(k2));
             pp_map(entries.into_iter(), indent, max_width, buf);

@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
+use std::sync::OnceLock;
 
 /// A single documented parameter.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -100,10 +101,18 @@ pub struct DocIndex {
     pub entries: Vec<DocEntry>,
 }
 
+static BUILTIN_INDEX: OnceLock<DocIndex> = OnceLock::new();
+
 /// Load the committed doc index that's compiled into the binary. Used by the LSP and REPL.
-pub fn builtin_index() -> DocIndex {
-    const JSON: &str = include_str!("../builtin_docs.generated.json");
-    serde_json::from_str(JSON).expect("crates/sema-docs/builtin_docs.generated.json is valid")
+///
+/// The JSON is deserialized once on first call and cached in a `OnceLock` —
+/// subsequent calls (e.g. each `,apropos` in the REPL) return the cached
+/// reference without re-parsing the ~11K-line JSON.
+pub fn builtin_index() -> &'static DocIndex {
+    BUILTIN_INDEX.get_or_init(|| {
+        const JSON: &str = include_str!("../builtin_docs.generated.json");
+        serde_json::from_str(JSON).expect("crates/sema-docs/builtin_docs.generated.json is valid")
+    })
 }
 
 #[derive(Debug)]
@@ -387,5 +396,32 @@ pub fn build_index(entries: Vec<DocEntry>) -> DocIndex {
     DocIndex {
         version: 1,
         entries,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn builtin_index_is_cached() {
+        // Two calls must return the same reference (OnceLock caching).
+        let a = builtin_index();
+        let b = builtin_index();
+        assert!(
+            std::ptr::eq(a, b),
+            "builtin_index() should return a cached reference"
+        );
+    }
+
+    #[test]
+    fn builtin_index_has_entries() {
+        let idx = builtin_index();
+        assert!(!idx.entries.is_empty(), "doc index should have entries");
+        // Every entry must have a name and module.
+        for e in &idx.entries {
+            assert!(!e.name.is_empty(), "entry has empty name");
+            assert!(!e.module.is_empty(), "entry {} has empty module", e.name);
+        }
     }
 }

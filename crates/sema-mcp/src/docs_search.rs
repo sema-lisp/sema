@@ -11,7 +11,7 @@
 //! symbol. The parameters and the small synonym table were validated against a 68-query
 //! oracle (recall@5 ≈ 0.93); see `docs/plans/2026-06-25-mcp-docs-search.md`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
 
 use sema_docs::{builtin_index, DocEntry};
@@ -80,7 +80,7 @@ struct SearchIndex {
 static INDEX: OnceLock<SearchIndex> = OnceLock::new();
 
 fn index() -> &'static SearchIndex {
-    INDEX.get_or_init(|| SearchIndex::build(builtin_index().entries))
+    INDEX.get_or_init(|| SearchIndex::build(builtin_index().entries.clone()))
 }
 
 /// Search the documentation corpus, returning up to `limit` ranked hits (clamped to
@@ -121,20 +121,20 @@ fn tokenize(text: &str) -> Vec<String> {
 
 /// Expand query tokens with the synonym table, de-duplicated. Originals are always kept.
 fn expand_query(tokens: &[String]) -> Vec<String> {
+    let mut seen: HashSet<&str> = HashSet::new();
     let mut terms: Vec<String> = Vec::new();
-    let push = |t: &str, terms: &mut Vec<String>| {
-        if !terms.iter().any(|x| x == t) {
-            terms.push(t.to_string());
-        }
-    };
     for t in tokens {
-        push(t, &mut terms);
+        if seen.insert(t.as_str()) {
+            terms.push(t.clone());
+        }
     }
     for t in tokens {
         for (key, exps) in SYNONYMS {
             if t == key {
                 for e in *exps {
-                    push(e, &mut terms);
+                    if seen.insert(e) {
+                        terms.push(e.to_string());
+                    }
                 }
             }
         }
@@ -339,5 +339,38 @@ mod tests {
     #[test]
     fn empty_query_returns_nothing() {
         assert!(search("   ", 5).is_empty());
+    }
+
+    #[test]
+    fn expand_query_deduplicates() {
+        let tokens = vec!["map".to_string(), "map".to_string(), "filter".to_string()];
+        let expanded = expand_query(&tokens);
+        // No duplicates.
+        let mut seen = std::collections::HashSet::new();
+        for t in &expanded {
+            assert!(
+                seen.insert(t.as_str()),
+                "duplicate token `{t}` in expanded query"
+            );
+        }
+    }
+
+    #[test]
+    fn expand_query_adds_synonyms() {
+        let tokens = vec!["match".to_string()];
+        let expanded = expand_query(&tokens);
+        // Original is kept.
+        assert!(expanded.contains(&"match".to_string()));
+        // Synonym is added.
+        assert!(expanded.contains(&"satisfy".to_string()));
+    }
+
+    #[test]
+    fn expand_query_no_duplicates_with_synonyms() {
+        // "star" expands to "*" and "let*"; ensure none are duplicated.
+        let tokens = vec!["star".to_string(), "*".to_string()];
+        let expanded = expand_query(&tokens);
+        let star_count = expanded.iter().filter(|t| t.as_str() == "*").count();
+        assert_eq!(star_count, 1, "`*` should appear exactly once");
     }
 }

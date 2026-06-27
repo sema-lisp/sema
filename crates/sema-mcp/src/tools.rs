@@ -2,7 +2,7 @@ use serde_json::{json, Value as JsonValue};
 use std::path::Path;
 use std::sync::OnceLock;
 
-use sema_core::{SemaError, Value, ValueView};
+use sema_core::{SemaError, Value, ValueViewRef};
 use sema_eval::{call_value, Interpreter};
 
 use crate::notebook::{
@@ -723,7 +723,7 @@ pub fn list_mcp_tools(
 
     // 3. Discover User Defined deftool definitions in Interpreter
     interpreter.global_env.iter_bindings(|_spur, val| {
-        if let ValueView::ToolDef(td) = val.view() {
+        if let ValueViewRef::ToolDef(td) = val.view_ref() {
             if is_tool_allowed(&td.name, include_tools, exclude_tools) {
                 // Ignore hidden prefix "_"
                 if !td.name.starts_with('_') {
@@ -996,7 +996,7 @@ fn call_mcp_tool_inner(
             // First check user-defined deftool in env
             let env_val = interpreter.global_env.get(sema_core::intern(symbol));
             if let Some(v) = env_val {
-                if let ValueView::ToolDef(td) = v.view() {
+                if let ValueViewRef::ToolDef(td) = v.view_ref() {
                     let doc = format!(
                         "Tool: {}\nDescription: {}\nParameters: {}",
                         td.name,
@@ -1383,7 +1383,7 @@ fn call_mcp_tool_inner(
         _ => {
             let bindings = interpreter.global_env.get(sema_core::intern(name));
             if let Some(v) = bindings {
-                if let ValueView::ToolDef(td) = v.view() {
+                if let ValueViewRef::ToolDef(td) = v.view_ref() {
                     let sema_args = match json_args_to_sema(&td.parameters, arguments, &td.handler)
                     {
                         Ok(a) => a,

@@ -90,11 +90,7 @@ pub(crate) fn line_at(text: &str, idx: usize) -> Option<&str> {
 
 /// Check if `inner` span is fully contained within `outer` span.
 pub(crate) fn span_contains(outer: &Span, inner: &Span) -> bool {
-    let inner_start = (inner.line, inner.col);
-    let inner_end = (inner.end_line, inner.end_col);
-    let outer_start = (outer.line, outer.col);
-    let outer_end = (outer.end_line, outer.end_col);
-    inner_start >= outer_start && inner_end <= outer_end
+    outer.contains(inner)
 }
 
 /// Drop symbol occurrences that sit inside quoted (data) regions — a `(quote …)` form,

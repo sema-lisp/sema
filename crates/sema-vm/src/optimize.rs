@@ -6,6 +6,8 @@
 //! - If with constant test: (if #t a b) → a
 //! - And/Or with constant operands
 
+use std::borrow::Cow;
+
 use sema_core::{resolve as resolve_spur, Value};
 
 use crate::core_expr::{CoreExpr, PromptEntry};
@@ -78,7 +80,7 @@ fn optimize_inner(expr: CoreExpr, shadowed: &[String]) -> CoreExpr {
                 })
                 .collect();
             let inner_shadowed = if define_names.is_empty() {
-                shadowed.to_vec()
+                Cow::Borrowed(shadowed)
             } else {
                 extend_shadowed(shadowed, &define_names)
             };
@@ -300,14 +302,21 @@ fn optimize_inner(expr: CoreExpr, shadowed: &[String]) -> CoreExpr {
 }
 
 /// Build a new shadowed list, adding only names that are in FOLDABLE_NAMES.
-fn extend_shadowed(current: &[String], names: &[String]) -> Vec<String> {
-    let mut result = current.to_vec();
-    for name in names {
-        if FOLDABLE_NAMES.contains(&name.as_str()) && !result.contains(name) {
-            result.push(name.clone());
-        }
+/// Returns a borrowed Cow when no new names are shadowed (the common case),
+/// avoiding a Vec allocation on every `let`/`lambda`/`do`/`try` form.
+fn extend_shadowed<'a>(current: &'a [String], names: &[String]) -> Cow<'a, [String]> {
+    let to_add: Vec<&String> = names
+        .iter()
+        .filter(|name| FOLDABLE_NAMES.contains(&name.as_str()) && !current.contains(name))
+        .collect();
+    if to_add.is_empty() {
+        return Cow::Borrowed(current);
     }
-    result
+    let mut result = current.to_vec();
+    for name in to_add {
+        result.push(name.clone());
+    }
+    Cow::Owned(result)
 }
 
 fn try_fold_call(func: CoreExpr, args: Vec<CoreExpr>, tail: bool, shadowed: &[String]) -> CoreExpr {

@@ -33,7 +33,7 @@ impl BackendState {
                 items.push(CompletionItem {
                     label: name.to_string(),
                     kind: Some(CompletionItemKind::KEYWORD),
-                    detail: entry.map(builtin_docs::signature),
+                    detail: entry.map(|e| builtin_docs::signature(e)),
                     documentation: entry.map(|e| {
                         Documentation::MarkupContent(MarkupContent {
                             kind: MarkupKind::Markdown,
@@ -54,7 +54,7 @@ impl BackendState {
                 items.push(CompletionItem {
                     label: name.clone(),
                     kind: Some(CompletionItemKind::FUNCTION),
-                    detail: entry.map(builtin_docs::signature),
+                    detail: entry.map(|e| builtin_docs::signature(e)),
                     documentation: entry.map(|e| {
                         Documentation::MarkupContent(MarkupContent {
                             kind: MarkupKind::Markdown,

@@ -70,6 +70,12 @@ oracle (there's no second backend to differentially compare against).
 3. If it needs runtime helpers, add `__vm-<name>` native functions in `register_vm_delegates()` in `eval.rs`
 4. Add `eval_tests!` in `eval_test.rs`
 
+## Git Rules
+
+- **NEVER use `git stash` without `--keep-index`.** Stashing without `--keep-index` silently destroys uncommitted work from other agents. If you need to inspect a clean tree, use `git stash --keep-index` so staged work is preserved, or work inside a separate worktree (`git worktree add`).
+- **NEVER use `git stash` at all when not inside a dedicated worktree** — in the main checkout, stashing can clobber in-flight changes from parallel agents. Create a worktree instead.
+- **NEVER use `git checkout -- <file>` to restore a file** if you don't own the only uncommitted changes to it — this destroys other agents' work. Use `git show <ref>:<path>` to inspect, or coordinate via branches.
+
 ## Adding Functionality
 
 - **Builtin fn**: add to `crates/sema-stdlib/src/*.rs`, register in `register()`, add a test.

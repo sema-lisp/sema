@@ -2,7 +2,7 @@
 
 Sema is a Lisp with first-class LLM primitives, implemented in Rust. All code runs on a single evaluator: a [bytecode VM](./bytecode-vm.md). The runtime is single-threaded (`Rc`, not `Arc`), with deterministic destruction via reference counting instead of a garbage collector.
 
-The entire implementation is ~125k lines of Rust across 16 crates, each with a clear responsibility and strict dependency ordering.
+The entire implementation is ~180k lines of Rust across 17 crates, each with a clear responsibility and strict dependency ordering.
 
 ## Crate Map
 
@@ -42,7 +42,7 @@ The entire implementation is ~125k lines of Rust across 16 crates, each with a c
                      └────────────────┘
 ```
 
-**Dependency flow:** `sema-core ← sema-reader ← sema-vm ← sema-eval ← sema` — with `sema-eval` also pulling in `sema-stdlib` (to register builtins) and `sema-llm`, both of which depend only on `sema-core` (plus `sema-reader` for stdlib).
+**Dependency flow:** `sema-core ← sema-reader ← sema-vm ← sema-eval ← sema` — with `sema-eval` also pulling in `sema-stdlib` (to register builtins) and `sema-llm`, both of which depend only on `sema-core` (plus `sema-reader` for stdlib). `sema-stdlib` also depends on `sema-workflow` (a leaf crate depending only on `sema-core` + `sema-otel`) for workflow runtime types.
 
 The critical constraint: **sema-stdlib and sema-llm depend on sema-core, not on sema-eval.** This avoids circular dependencies but creates a problem — both crates sometimes need to evaluate user code. They solve it via dependency inversion:
 
@@ -69,6 +69,7 @@ This is discussed in detail in [The Circular Dependency Problem](#the-circular-d
 | **sema-wasm**  | WASM bindings             | Browser playground bindings, JS interop via `wasm-bindgen`                                                                                |
 | **sema-mcp**    | MCP server                      | Model Context Protocol server exposing Sema eval/build/notebook tools (`sema mcp`)                                                         |
 | **sema-docs**   | Doc generation (internal)       | Builtin-docs index generator (`make docs`); not shipped as a binary                                                                       |
+| **sema-workflow** | Dynamic-workflow runtime      | `WorkflowCtx`, `WorkflowEvent`, JSONL run-directory journal, `--resume` via memo sidecar; leaf crate — depends only on `sema-core` + `sema-otel` |
 | **sema**        | Binary                          | clap CLI, reedline REPL (highlighter / hinter / inspector live in `crates/sema/src/repl/`), `InterpreterBuilder` embedding API             |
 
 ## The Value Type

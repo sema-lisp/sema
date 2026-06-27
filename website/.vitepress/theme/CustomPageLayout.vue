@@ -72,18 +72,18 @@ const copyText = (id, event) => {
         <div class="nav-links" :class="{ open: menuOpen }" @click="closeMenu">
           <a href="/what-is-sema" :class="{ 'nav-active': activeNav === 'what-is-sema' }">What is Sema?</a>
 
-          <div class="nav-dropdown" :class="{ 'dd-active': docsActive }">
-            <a href="/docs/" class="dd-label">Docs <svg class="dd-caret" width="10" height="10" viewBox="0 0 10 10" fill="none" aria-hidden="true"><path d="M2 3.5L5 6.5L8 3.5" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg></a>
-            <div class="dd-menu">
-              <a v-for="item in docsItems" :key="item.key" :href="item.link"
-                 :class="{ 'nav-active': activeNav === item.key }">{{ item.label }}</a>
-            </div>
-          </div>
-
           <div class="nav-dropdown" :class="{ 'dd-active': featuresActive }">
             <a href="/feature/notebook" class="dd-label">Features <svg class="dd-caret" width="10" height="10" viewBox="0 0 10 10" fill="none" aria-hidden="true"><path d="M2 3.5L5 6.5L8 3.5" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg></a>
             <div class="dd-menu">
               <a v-for="item in featureItems" :key="item.key" :href="item.link"
+                 :class="{ 'nav-active': activeNav === item.key }">{{ item.label }}</a>
+            </div>
+          </div>
+
+          <div class="nav-dropdown" :class="{ 'dd-active': docsActive }">
+            <a href="/docs/" class="dd-label">Docs <svg class="dd-caret" width="10" height="10" viewBox="0 0 10 10" fill="none" aria-hidden="true"><path d="M2 3.5L5 6.5L8 3.5" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg></a>
+            <div class="dd-menu">
+              <a v-for="item in docsItems" :key="item.key" :href="item.link"
                  :class="{ 'nav-active': activeNav === item.key }">{{ item.label }}</a>
             </div>
           </div>

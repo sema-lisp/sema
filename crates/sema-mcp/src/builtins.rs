@@ -4,7 +4,7 @@ use std::future::Future;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use sema_core::{check_arity, Env, NativeFn, SemaError, Value};
+use sema_core::{check_arity, Env, NativeFn, SemaError, ToolDefinition, Value};
 use tokio::runtime::Runtime;
 
 use crate::client::{McpClient, McpClientConfig};
@@ -72,6 +72,20 @@ fn lookup_connection(handle: &str) -> Result<Rc<RefCell<McpConnection>>, SemaErr
                 "mcp connection {handle} is not registered; it may have been closed"
             ))
         })
+    })
+}
+
+fn call_tool_via_connection(
+    handle: &str,
+    tool_name: &str,
+    arguments_json: serde_json::Value,
+) -> Result<serde_json::Value, SemaError> {
+    let connection = lookup_connection(handle)?;
+    let mut connection = connection.borrow_mut();
+    let response = block_on(connection.client.call_tool(tool_name, arguments_json))
+        .map_err(|err| SemaError::eval(format!("mcp/call: {err}")))?;
+    serde_json::to_value(response).map_err(|err| {
+        SemaError::eval(format!("mcp/call: failed to serialize tool response: {err}"))
     })
 }
 
@@ -154,6 +168,40 @@ pub fn register_mcp_builtins(env: &Env) {
         Ok(Value::list(items))
     });
 
+    register_fn(env, "mcp/->tools", |args| {
+        check_arity!(args, "mcp/->tools", 1);
+        let handle = args[0].as_str().ok_or_else(|| {
+            SemaError::type_error("string", args[0].type_name())
+                .with_hint("mcp/->tools expects the opaque handle returned by mcp/connect")
+        })?;
+        let connection = lookup_connection(handle)?;
+        let mut connection = connection.borrow_mut();
+        let tools = block_on(connection.client.list_tools())
+            .map_err(|err| SemaError::eval(format!("mcp/->tools: {err}")))?;
+        let mut items = Vec::new();
+        for tool in tools {
+            let parameters = sema_core::json_to_value(&tool.input_schema);
+            let tool_name = tool.name.clone();
+            let connection_handle = handle.to_string();
+            let handler = Value::native_fn(NativeFn::simple("mcp/tool-handler", move |args| {
+                let arguments_json = if args.is_empty() {
+                    serde_json::Value::Object(Default::default())
+                } else {
+                    sema_core::value_to_json_lossy(&args[0])
+                };
+                let response_json = call_tool_via_connection(&connection_handle, &tool_name, arguments_json)?;
+                Ok(sema_core::json_to_value(&response_json))
+            }));
+            items.push(Value::tool_def(ToolDefinition {
+                name: tool.name,
+                description: tool.description,
+                parameters,
+                handler,
+            }));
+        }
+        Ok(Value::list(items))
+    });
+
     register_fn(env, "mcp/call", |args| {
         check_arity!(args, "mcp/call", 3);
         let handle = args[0].as_str().ok_or_else(|| {
@@ -165,17 +213,8 @@ pub fn register_mcp_builtins(env: &Env) {
                 .with_hint("mcp/call expects the tool name as a string")
         })?;
         let arguments_json = sema_core::value_to_json_lossy(&args[2]);
-        let connection = lookup_connection(handle)?;
-        let mut connection = connection.borrow_mut();
-        let response = block_on(connection.client.call_tool(tool_name, arguments_json))
-            .map_err(|err| SemaError::eval(format!("mcp/call: {err}")))?;
-        Ok(sema_core::json_to_value(
-            &serde_json::to_value(response).map_err(|err| {
-                SemaError::eval(format!(
-                    "mcp/call: failed to serialize tool response: {err}"
-                ))
-            })?,
-        ))
+        let response_json = call_tool_via_connection(handle, tool_name, arguments_json)?;
+        Ok(sema_core::json_to_value(&response_json))
     });
 
     register_fn(env, "mcp/close", |args| {

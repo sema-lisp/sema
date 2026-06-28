@@ -65,11 +65,10 @@ for line in sys.stdin:
     sys.stdout.flush()
 "#;
 
-    let mut client = McpClient::connect(McpClientConfig {
-        command: "python3".to_string(),
-        args: vec!["-c".to_string(), server_script.to_string()],
-        env: None,
-        cwd: None,
+    let mut client = McpClient::connect({
+        let mut config = McpClientConfig::new("python3");
+        config.args = vec!["-c".to_string(), server_script.to_string()];
+        config
     })
     .await
     .expect("failed to start MCP stdio client");

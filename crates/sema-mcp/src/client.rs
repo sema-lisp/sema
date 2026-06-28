@@ -14,6 +14,17 @@ pub struct McpClientConfig {
     pub cwd: Option<PathBuf>,
 }
 
+impl McpClientConfig {
+    pub fn new(command: impl Into<String>) -> Self {
+        Self {
+            command: command.into(),
+            args: Vec::new(),
+            env: None,
+            cwd: None,
+        }
+    }
+}
+
 pub struct McpClient {
     child: Child,
     stdin: ChildStdin,
@@ -117,7 +128,7 @@ impl McpClient {
         params: Option<serde_json::Value>,
     ) -> Result<serde_json::Value, String> {
         let id = self.next_id;
-        self.next_id = self.next_id.checked_add(1).unwrap_or(i64::MAX);
+        self.next_id = self.next_id.checked_add(1).unwrap_or(1);
 
         let request = JsonRpcRequest {
             jsonrpc: "2.0".to_string(),
@@ -145,16 +156,18 @@ impl McpClient {
             .map_err(|err| format!("failed to flush MCP request: {err}"))?;
 
         let mut response_line = String::new();
-        self.reader
+        let bytes_read = self
+            .reader
             .read_line(&mut response_line)
             .await
             .map_err(|err| format!("failed to read MCP response: {err}"))?;
 
+        if bytes_read == 0 {
+            return Err("MCP server closed the connection before responding".to_string());
+        }
+
         if response_line.trim().is_empty() {
-            return Err(
-                "MCP server returned an empty response (the connection may have closed)"
-                    .to_string(),
-            );
+            return Err("MCP server returned an empty response line".to_string());
         }
 
         let response: JsonRpcResponse = serde_json::from_str(response_line.trim())

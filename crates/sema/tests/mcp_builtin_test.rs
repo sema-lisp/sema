@@ -64,12 +64,12 @@ for line in sys.stdin:
     sys.stdout.flush()
 "#;
 
-    let script_literal = serde_json::to_string(server_script).unwrap();
+    let encoded_script = serde_json::to_string(server_script).unwrap();
     let interp = Interpreter::new();
 
     interp
         .eval_str(&format!(
-            r#"(define server (mcp/connect {{:command "python3" :args ["-c" {script_literal}]}}))"#
+            r#"(define server (mcp/connect {{:command "python3" :args ["-c" {encoded_script}]}}))"#
         ))
         .unwrap();
 
@@ -169,12 +169,12 @@ for line in sys.stdin:
     sys.stdout.flush()
 "#;
 
-    let script_literal = serde_json::to_string(server_script).unwrap();
+    let encoded_script = serde_json::to_string(server_script).unwrap();
     let interp = Interpreter::new();
 
     interp
         .eval_str(&format!(
-            r#"(define server (mcp/connect {{:command "python3" :args ["-c" {script_literal}]}}))"#
+            r#"(define server (mcp/connect {{:command "python3" :args ["-c" {encoded_script}]}}))"#
         ))
         .unwrap();
 
@@ -186,7 +186,9 @@ for line in sys.stdin:
     assert_eq!(tool_def.description, "Echo a string");
 
     let agent = interp
-        .eval_str(r#"(defagent mcp-agent {:system "agent" :tools (mcp/->tools server) :model "test"})"#)
+        .eval_str(
+            r#"(defagent mcp-agent {:system "agent" :tools (mcp/->tools server) :model "test"})"#,
+        )
         .unwrap();
     let agent = agent.as_agent_rc().unwrap();
     assert_eq!(agent.tools.len(), 1);

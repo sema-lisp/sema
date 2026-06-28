@@ -85,7 +85,9 @@ fn call_tool_via_connection(
     let response = block_on(connection.client.call_tool(tool_name, arguments_json))
         .map_err(|err| SemaError::eval(format!("mcp/call: {err}")))?;
     serde_json::to_value(response).map_err(|err| {
-        SemaError::eval(format!("mcp/call: failed to serialize tool response: {err}"))
+        SemaError::eval(format!(
+            "mcp/call: failed to serialize tool response: {err}"
+        ))
     })
 }
 
@@ -115,7 +117,9 @@ pub fn register_mcp_builtins(env: &Env) {
             .map(|object| {
                 object
                     .iter()
-                    .filter_map(|(key, value)| value.as_str().map(|s| (key.clone(), s.to_string())))
+                    .filter_map(|(key, value)| {
+                        value.as_str().map(|s| (key.to_string(), s.to_string()))
+                    })
                     .collect::<HashMap<_, _>>()
             });
         let cwd = config_json
@@ -183,13 +187,15 @@ pub fn register_mcp_builtins(env: &Env) {
             let parameters = sema_core::json_to_value(&tool.input_schema);
             let tool_name = tool.name.clone();
             let connection_handle = handle.to_string();
-            let handler = Value::native_fn(NativeFn::simple("mcp/tool-handler", move |args| {
+            let handler_name = format!("mcp/{tool_name}");
+            let handler = Value::native_fn(NativeFn::simple(&handler_name, move |args| {
                 let arguments_json = if args.is_empty() {
                     serde_json::Value::Object(Default::default())
                 } else {
                     sema_core::value_to_json_lossy(&args[0])
                 };
-                let response_json = call_tool_via_connection(&connection_handle, &tool_name, arguments_json)?;
+                let response_json =
+                    call_tool_via_connection(&connection_handle, &tool_name, arguments_json)?;
                 Ok(sema_core::json_to_value(&response_json))
             }));
             items.push(Value::tool_def(ToolDefinition {

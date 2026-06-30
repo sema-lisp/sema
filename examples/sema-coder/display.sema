@@ -31,6 +31,7 @@
 
 (define active-spinner #f)
 (define active-tool "")
+(define active-arg "")
 
 (define (tool-arg tool args)
   "Pick the most useful single arg to show inline for a tool call."
@@ -41,6 +42,14 @@
     ((member tool (list "grep" "find-files")) (get args :pattern ""))
     (else "")))
 
+(define (tool-result-line tool arg ms)
+  "The settled line shown after a tool call completes: ✔ tool arg Nms."
+  (format "  ~a ~a ~a ~a"
+    (ok "✔")
+    (accent-dim (term/style tool :bold))
+    (muted arg)
+    (faint (format "~ams" ms))))
+
 (define (on-tool-call event)
   (let ((evt  (:event event))
         (tool (:tool event))
@@ -48,16 +57,12 @@
     (cond
       ((= evt "start")
         (set! active-tool tool)
+        (set! active-arg (tool-arg tool (if (map? args) args {})))
         (set! active-spinner
-          (term/spinner-start
-            (muted (format "~a ~a" tool (tool-arg tool (if (map? args) args {})))))))
+          (term/spinner-start (muted (format "~a ~a" tool active-arg)))))
       ((= evt "end")
         (when active-spinner
           (term/spinner-stop active-spinner {})
           (set! active-spinner #f))
-        (let ((ms (get event :duration-ms 0)))
-          (io/println-error
-            (format "  ~a ~a ~a"
-              (ok "✔")
-              (accent-dim (term/style active-tool :bold))
-              (faint (format "~ams" ms)))))))))
+        (io/println-error
+          (tool-result-line active-tool active-arg (get event :duration-ms 0)))))))

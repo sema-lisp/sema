@@ -8,6 +8,11 @@ primitives (terminal screen control, path safety) is Rust.
 Inspired by the open-source [pi.dev](https://pi.dev) and
 [opencode](https://github.com/sst/opencode) TUIs — not a Claude Code clone.
 
+![Sema Coder — a sample session](screenshot.png)
+
+*(Sample session; the banner, prompt, tool lines, and `/help` are the app's real
+output.)*
+
 ## Run
 
 ```bash

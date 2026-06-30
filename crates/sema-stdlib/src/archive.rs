@@ -93,6 +93,7 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
             zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Deflated);
 
         let mut count = 0i64;
+        let mut seen = std::collections::HashSet::new();
         for f in files {
             let src = f
                 .as_str()
@@ -101,6 +102,13 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
                 .file_name()
                 .and_then(|n| n.to_str())
                 .ok_or_else(|| SemaError::eval(format!("zip/create: bad file path {src}")))?;
+            // Entries are keyed by basename; a duplicate would shadow earlier
+            // data (most extractors keep the last). Refuse rather than lose it.
+            if !seen.insert(name.to_string()) {
+                return Err(SemaError::eval(format!(
+                    "zip/create: duplicate entry name {name:?} (from {src})"
+                )));
+            }
             let data =
                 std::fs::read(src).map_err(|e| SemaError::Io(format!("zip/create {src}: {e}")))?;
             writer
@@ -207,6 +215,7 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
             files: &[Value],
         ) -> Result<i64, SemaError> {
             let mut count = 0i64;
+            let mut seen = std::collections::HashSet::new();
             for f in files {
                 let src = f
                     .as_str()
@@ -215,6 +224,13 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
                     .file_name()
                     .and_then(|n| n.to_str())
                     .ok_or_else(|| SemaError::eval(format!("tar/create: bad file path {src}")))?;
+                // Files are stored under their basename; a duplicate basename
+                // would silently shadow earlier data. Refuse it rather than lose it.
+                if !seen.insert(name.to_string()) {
+                    return Err(SemaError::eval(format!(
+                        "tar/create: duplicate entry name {name:?} (from {src})"
+                    )));
+                }
                 builder
                     .append_path_with_name(src, name)
                     .map_err(|e| SemaError::Io(format!("tar/create {src}: {e}")))?;
@@ -284,6 +300,14 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
             .map_err(|e| SemaError::eval(format!("tar/extract {tar_path}: {e}")))?
         {
             let mut entry = entry.map_err(|e| SemaError::eval(format!("tar/extract: {e}")))?;
+            // Symlink/hardlink guard: a link entry (e.g. `evil -> /etc`) followed
+            // by a regular entry written *through* it (`evil/passwd`) escapes
+            // dest-dir even though neither path contains `..`. Refuse link
+            // entries entirely so no traversal symlink is ever materialized.
+            let etype = entry.header().entry_type();
+            if etype.is_symlink() || etype.is_hard_link() {
+                continue;
+            }
             let path = entry
                 .path()
                 .map_err(|e| SemaError::eval(format!("tar/extract: {e}")))?;

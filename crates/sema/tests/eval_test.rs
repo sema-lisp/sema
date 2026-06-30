@@ -336,6 +336,11 @@ eval_tests! {
     // markup
     markdown_h1: r##"(string/contains? (markdown/to-html "# Hi") "<h1>")"## => Value::bool(true),
     html_text_strips_tags: r#"(html/text "<p>Hello <b>world</b></p>")"# => Value::string("Hello world"),
+    // Regressions from the wave-2 quality pass:
+    // overlapping redact spans must not panic (drops the overlapping one).
+    redact_spans_overlap_safe: r#"(redact/spans "0123456789" (list {:start 3 :end 6} {:start 0 :end 4}))"# => Value::string("\u{ab}redacted\u{bb}456789"),
+    // diff/stat counts a removed content line that renders as "---", not as a header.
+    diff_stat_content_dashes: r#"(:removed (diff/stat (diff/unified "keep\n--\n" "keep\n")))"# => Value::int(1),
 }
 
 // ============================================================

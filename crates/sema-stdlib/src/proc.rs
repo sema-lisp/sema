@@ -11,8 +11,8 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
 
 use sema_core::{check_arity, Caps, SemaError, Value};
 
@@ -21,8 +21,8 @@ struct Proc {
     stdin: Option<ChildStdin>,
     out: Arc<Mutex<Vec<u8>>>,
     err: Arc<Mutex<Vec<u8>>>,
-    out_done: Arc<AtomicBool>,
-    err_done: Arc<AtomicBool>,
+    out_thread: Option<JoinHandle<()>>,
+    err_thread: Option<JoinHandle<()>>,
 }
 
 thread_local! {
@@ -30,8 +30,10 @@ thread_local! {
     static NEXT_ID: Cell<i64> = const { Cell::new(1) };
 }
 
-/// Spawn a thread that drains `reader` into `buf` until EOF, then flips `done`.
-fn pump<R: Read + Send + 'static>(mut reader: R, buf: Arc<Mutex<Vec<u8>>>, done: Arc<AtomicBool>) {
+/// Spawn a thread that drains `reader` into `buf` until EOF. The returned
+/// handle is joined by `proc/wait`: a finished join means EOF was reached, so
+/// every byte the child wrote is in `buf` (the tail-buffering guarantee).
+fn pump<R: Read + Send + 'static>(mut reader: R, buf: Arc<Mutex<Vec<u8>>>) -> JoinHandle<()> {
     std::thread::spawn(move || {
         let mut chunk = [0u8; 8192];
         loop {
@@ -44,8 +46,7 @@ fn pump<R: Read + Send + 'static>(mut reader: R, buf: Arc<Mutex<Vec<u8>>>, done:
                 }
             }
         }
-        done.store(true, Ordering::SeqCst);
-    });
+    })
 }
 
 /// Take the integer handle from `args[idx]`.
@@ -123,18 +124,8 @@ fn spawn(args: &[Value]) -> Result<Value, SemaError> {
 
     let out = Arc::new(Mutex::new(Vec::new()));
     let err = Arc::new(Mutex::new(Vec::new()));
-    let out_done = Arc::new(AtomicBool::new(false));
-    let err_done = Arc::new(AtomicBool::new(false));
-    if let Some(so) = child.stdout.take() {
-        pump(so, out.clone(), out_done.clone());
-    } else {
-        out_done.store(true, Ordering::SeqCst);
-    }
-    if let Some(se) = child.stderr.take() {
-        pump(se, err.clone(), err_done.clone());
-    } else {
-        err_done.store(true, Ordering::SeqCst);
-    }
+    let out_thread = child.stdout.take().map(|so| pump(so, out.clone()));
+    let err_thread = child.stderr.take().map(|se| pump(se, err.clone()));
     let stdin = child.stdin.take();
 
     let id = NEXT_ID.with(|n| {
@@ -150,8 +141,8 @@ fn spawn(args: &[Value]) -> Result<Value, SemaError> {
                 stdin,
                 out,
                 err,
-                out_done,
-                err_done,
+                out_thread,
+                err_thread,
             },
         )
     });
@@ -221,24 +212,28 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
     });
 
     // proc/wait — block until exit, return the exit code (or -1 if signalled).
+    // The handle is removed from the registry first so we don't hold the
+    // thread-local borrow across the blocking wait (which would panic on any
+    // reentrant registry access and would block other proc ops). Joining the
+    // pump threads guarantees every byte the child wrote is buffered before we
+    // return (so a following proc/read-stdout sees the tail). The proc is
+    // re-inserted so reads still work after wait.
     crate::register_fn_gated(env, sandbox, Caps::PROCESS, "proc/wait", |args| {
         check_arity!(args, "proc/wait", 1);
         let id = handle(args, 0)?;
-        PROCS.with(|p| {
-            let mut procs = p.borrow_mut();
-            let pr = procs
-                .get_mut(&id)
-                .ok_or_else(|| SemaError::eval(format!("proc/wait: no such handle {id}")))?;
-            let status = pr
-                .child
-                .wait()
-                .map_err(|e| SemaError::Io(format!("proc/wait: {e}")))?;
-            // Let the pump threads finish flushing the pipes.
-            while !pr.out_done.load(Ordering::SeqCst) || !pr.err_done.load(Ordering::SeqCst) {
-                std::thread::yield_now();
-            }
-            Ok(Value::int(status.code().unwrap_or(-1) as i64))
-        })
+        let mut pr = PROCS
+            .with(|p| p.borrow_mut().remove(&id))
+            .ok_or_else(|| SemaError::eval(format!("proc/wait: no such handle {id}")))?;
+        let status = pr.child.wait();
+        if let Some(t) = pr.out_thread.take() {
+            let _ = t.join();
+        }
+        if let Some(t) = pr.err_thread.take() {
+            let _ = t.join();
+        }
+        PROCS.with(|p| p.borrow_mut().insert(id, pr));
+        let status = status.map_err(|e| SemaError::Io(format!("proc/wait: {e}")))?;
+        Ok(Value::int(status.code().unwrap_or(-1) as i64))
     });
 
     // proc/exit-code — Some(code) if exited, nil if still running.

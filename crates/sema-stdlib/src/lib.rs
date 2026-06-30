@@ -39,6 +39,8 @@ mod pio;
 mod predicates;
 #[cfg(not(target_arch = "wasm32"))]
 mod proc;
+#[cfg(not(target_arch = "wasm32"))]
+mod pty;
 mod reflect;
 mod regex_ops;
 mod secret;
@@ -109,6 +111,7 @@ pub fn register_stdlib(env: &Env, sandbox: &Sandbox) {
     #[cfg(not(target_arch = "wasm32"))]
     {
         proc::register(env, sandbox);
+        pty::register(env, sandbox);
         event::register(env);
         git::register(env, sandbox);
         archive::register(env, sandbox);

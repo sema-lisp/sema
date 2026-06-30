@@ -8,11 +8,15 @@ use std::collections::BTreeMap;
 
 use sema_core::{check_arity, Caps, SemaError, Value};
 
-/// Run `git` with `args`, returning trimmed-free stdout (raw, untrimmed) on a
-/// zero exit. On a non-zero exit, surface git's stderr. If the `git` binary
-/// can't be launched at all (not installed / not on PATH), report that clearly.
+/// Run `git` with `args`, returning raw (untrimmed) stdout on a zero exit. On a
+/// non-zero exit, surface git's stderr. If the `git` binary can't be launched at
+/// all (not installed / not on PATH), report that clearly.
+///
+/// `core.quotepath=false` is forced so non-ASCII paths come back as real UTF-8
+/// rather than octal-escaped, double-quoted strings.
 fn git(args: &[&str]) -> Result<String, SemaError> {
     let output = std::process::Command::new("git")
+        .args(["-c", "core.quotepath=false"])
         .args(args)
         .output()
         .map_err(|e| {
@@ -32,14 +36,30 @@ fn git(args: &[&str]) -> Result<String, SemaError> {
     }
 }
 
-/// The path field of a porcelain-v1 line, accounting for rename/copy entries
-/// which encode `old -> new` (we want the destination). The leading 3 chars of
-/// a porcelain line are `XY ` (two status chars + a space); the rest is the path.
-fn porcelain_path(rest: &str) -> &str {
-    match rest.split_once(" -> ") {
-        Some((_old, new)) => new,
-        None => rest,
+/// Parse `git status --porcelain=v1 -z` into `(code, path)` pairs. The NUL
+/// (`-z`) format is unambiguous: each record is `XY PATH\0`, and a rename/copy
+/// record is `XY NEW\0OLD\0` — so the destination path is the record itself and
+/// the following NUL field (the old path) is consumed. This avoids the `" -> "`
+/// arrow-parsing and quoting pitfalls of the newline format with paths that
+/// contain spaces, arrows, or non-ASCII bytes.
+fn status_entries() -> Result<Vec<(String, String)>, SemaError> {
+    let out = git(&["status", "--porcelain=v1", "-z"])?;
+    let mut entries = Vec::new();
+    let mut fields = out.split('\0');
+    while let Some(tok) = fields.next() {
+        if tok.len() < 3 {
+            continue; // empty trailing field or malformed
+        }
+        let code = tok[..2].to_string();
+        let path = tok[3..].to_string();
+        let bytes = code.as_bytes();
+        // Rename (R) / copy (C) records carry the old path as the next field.
+        if bytes[0] == b'R' || bytes[0] == b'C' || bytes[1] == b'R' || bytes[1] == b'C' {
+            let _old = fields.next();
+        }
+        entries.push((code, path));
     }
+    Ok(entries)
 }
 
 pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
@@ -57,23 +77,15 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
 
     crate::register_fn_gated(env, sandbox, Caps::PROCESS, "git/status", |args| {
         check_arity!(args, "git/status", 0);
-        let out = git(&["status", "--porcelain=v1"])?;
         let mut entries = Vec::new();
-        for line in out.lines() {
-            if line.is_empty() {
-                continue;
-            }
-            // Porcelain v1: two status chars (XY), a space, then the path.
-            let code: String = line.chars().take(2).collect();
-            let rest = if line.len() > 3 { &line[3..] } else { "" };
-            let path = porcelain_path(rest);
+        for (code, path) in status_entries()? {
             let untracked = code == "??";
             // Staged = the index (X) column carries a change (non-space, non-?).
             let x = code.chars().next().unwrap_or(' ');
             let staged = !untracked && x != ' ';
 
             let mut m = BTreeMap::new();
-            m.insert(Value::keyword("path"), Value::string(path));
+            m.insert(Value::keyword("path"), Value::string(&path));
             m.insert(Value::keyword("status"), Value::string(&code));
             m.insert(Value::keyword("staged"), Value::bool(staged));
             m.insert(Value::keyword("untracked"), Value::bool(untracked));
@@ -84,16 +96,10 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
 
     crate::register_fn_gated(env, sandbox, Caps::PROCESS, "git/changed-files", |args| {
         check_arity!(args, "git/changed-files", 0);
-        let out = git(&["status", "--porcelain=v1"])?;
         let mut files = Vec::new();
-        for line in out.lines() {
-            if line.is_empty() {
-                continue;
-            }
-            let rest = if line.len() > 3 { &line[3..] } else { "" };
-            let path = porcelain_path(rest);
+        for (_code, path) in status_entries()? {
             if !path.is_empty() {
-                files.push(Value::string(path));
+                files.push(Value::string(&path));
             }
         }
         Ok(Value::list(files))

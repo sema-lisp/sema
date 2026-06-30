@@ -275,10 +275,23 @@ pub fn register(env: &sema_core::Env) {
             edits.push((start, end, label));
         }
 
-        // Apply from the rightmost span so earlier offsets remain valid.
+        // Right-to-left replacement is only valid for NON-overlapping spans —
+        // otherwise a later replace_range can index into a multibyte
+        // replacement char («/») and panic. Drop spans that overlap an
+        // already-accepted one (keeping the earliest-starting).
         edits.sort_by_key(|(start, _, _)| *start);
+        let mut accepted: Vec<(usize, usize, Option<String>)> = Vec::new();
+        let mut last_end = 0usize;
+        for (start, end, label) in edits {
+            if start >= last_end {
+                last_end = end;
+                accepted.push((start, end, label));
+            }
+        }
+
+        // Apply from the rightmost span so earlier offsets remain valid.
         let mut out = text.to_string();
-        for (start, end, label) in edits.into_iter().rev() {
+        for (start, end, label) in accepted.into_iter().rev() {
             let replacement = match &label {
                 Some(l) => format!("\u{ab}redacted:{l}\u{bb}"),
                 None => "\u{ab}redacted\u{bb}".to_string(),

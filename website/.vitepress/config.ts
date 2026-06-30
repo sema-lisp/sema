@@ -165,6 +165,13 @@ export default defineConfig({
             { text: 'Records', link: '/docs/stdlib/records' },
             { text: 'Text Processing', link: '/docs/stdlib/text-processing' }
           ]
+        },
+        {
+          text: 'Agent & TUI Primitives',
+          collapsed: true,
+          items: [
+            { text: 'Overview', link: '/docs/stdlib/agent-primitives' }
+          ]
         }
       ],
 

@@ -66,6 +66,13 @@ pub fn register(env: &sema_core::Env) {
                         current_text.push_str(&t);
                     }
                 }
+                // A soft/hard break inside a heading is a word boundary; emit a
+                // space so `# line one\n  line two` doesn't become "line oneline two".
+                Event::SoftBreak | Event::HardBreak => {
+                    if current_level.is_some() {
+                        current_text.push(' ');
+                    }
+                }
                 Event::End(TagEnd::Heading(_)) => {
                     if let Some(level) = current_level.take() {
                         let mut m: BTreeMap<Value, Value> = BTreeMap::new();

@@ -55,3 +55,4 @@ zip.workspace = true
 pulldown-cmark.workspace = true
 scraper.workspace = true
 notify.workspace = true
+portable-pty.workspace = true

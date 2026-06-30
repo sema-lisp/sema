@@ -92,11 +92,35 @@ verified together). Native-only modules are gated `cfg(not(wasm32))`; pure ones
 Each module ships unit tests; all 53 new builtins have doc entries (coverage
 gate green).
 
+## Wave 2 — quality pass
+
+After landing, all wave-2 modules went through an adversarial review (three
+review passes). Fixes applied:
+
+- `proc/wait` no longer holds the registry borrow across the blocking wait, and
+  joins the pump threads instead of busy-spinning (hang/CPU fix).
+- `redact/spans` drops overlapping spans before the right-to-left apply — an
+  overlap previously could panic on a multibyte replacement-char boundary.
+- `diff/apply` bounds its drift search (±3 lines) instead of scanning the whole
+  file, so it can't latch onto a far-away coincidental context match.
+- `diff/stat` tracks hunk-body state so a content line rendering as `---`/`+++`
+  is counted, not mistaken for a file header; hunk headers reject negative starts.
+- `tar/extract` refuses symlink/hardlink entries (closes the symlink-traversal
+  escape); `zip/create`/`tar/create` reject duplicate basenames (no silent data loss).
+- `git/*` forces `core.quotepath=false` and parses NUL-delimited (`-z`)
+  porcelain, so renames and paths with spaces/non-ASCII come back correct.
+- `markdown/headings` inserts a space on soft/hard breaks.
+
+## PTY — shipped (wave 3)
+
+`pty.rs` (via `portable-pty`): `pty/spawn` `read` `write` `resize` `wait`
+`exit-code` `running?` `kill` `close`. The child runs under a real PTY (isatty
+is true), so REPLs/editors/color-aware tools behave correctly.
+
 ## Still deferred
 
-- **PTY** (`pty/spawn`/`resize`/`read`/`write`) — pseudo-terminal allocation;
-  `proc/*` covers streaming subprocesses, which was the MVP need.
-- **buffer/editor layer** and **test-harness DSL** (`deftest`/`expect`) — these
-  are best written in Sema (prelude/package level), not as Rust primitives.
+- **buffer/editor layer** and **test-harness DSL** (`deftest`/`expect`) — best
+  written in Sema (prelude/package level), not as Rust primitives. (The buffer
+  layer is explicitly out of scope.)
 - **`ast/spans`** — requires the reader to carry span info on the Value AST;
   `ast/symbols`/`find`/`rewrite` are expressible in Sema over quoted forms.

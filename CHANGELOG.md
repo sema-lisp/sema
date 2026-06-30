@@ -1,5 +1,46 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- **Agent & TUI host primitives** (issue #53) — the building blocks for
+  self-hosted terminal apps written in Sema (see the
+  [Sema Coder](https://github.com/HelgeSverre/sema/tree/main/examples/sema-coder)
+  reference app and the [Agent & TUI Primitives](https://sema-lang.com/docs/stdlib/agent-primitives)
+  docs):
+  - **Terminal screen control** — `term/enter-alt-screen`, `term/leave-alt-screen`,
+    `term/clear`, `term/clear-line`, `term/clear-below`, `term/move-to`,
+    `term/write-at`, `term/cursor-home`, `term/hide-cursor`, `term/show-cursor`,
+    `term/save-cursor`, `term/restore-cursor`, `term/enable-mouse`,
+    `term/disable-mouse`, `term/set-title`, `term/bell`, `term/flush`.
+  - **Streaming subprocesses** — `proc/spawn`, `proc/read-stdout`,
+    `proc/read-stderr`, `proc/write-stdin`, `proc/close-stdin`, `proc/wait`,
+    `proc/exit-code`, `proc/running?`, `proc/kill`, `proc/close`.
+  - **Pseudo-terminals** — `pty/spawn`, `pty/read`, `pty/write`, `pty/resize`,
+    `pty/wait`, `pty/exit-code`, `pty/running?`, `pty/kill`, `pty/close`.
+  - **Event loop** — `event/select` (over `:key`/`:proc`/`:timer` sources) and
+    `time/tick`.
+  - **File watching** — `fs/watch`, `fs/watch-events`, `fs/unwatch`.
+  - **Diff & patch** — `diff/unified`, `diff/parse`, `diff/apply`, `diff/hunks`,
+    `diff/stat`, `patch/apply-file`.
+  - **Read-only git** — `git/root`, `git/current-branch`, `git/status`,
+    `git/changed-files`, `git/diff`, `git/diff-files`, `git/recent-files`,
+    `git/ignore-matches?`.
+  - **Sema reflection & diagnostics** — `read/string`, `read/all`,
+    `format/form`, `sema/check-string`, `sema/check-file` (diagnostics as data).
+  - **Secrets & redaction** — `secret/detect`, `secret/redact`, `pii/detect`,
+    `redact/spans`, `hash/digest`.
+  - **Archives** — `gzip/compress`, `gzip/decompress`, `zip/create`,
+    `zip/extract`, `zip/list`, `tar/create`, `tar/extract`.
+  - **Markdown & HTML** — `markdown/to-html`, `markdown/headings`,
+    `markdown/frontmatter`, `html/parse`, `html/select`, `html/select-text`,
+    `html/text`.
+  - **Path safety & config** — `path/canonicalize`, `path/relative-to`,
+    `path/within?`, `sys/config-dir`.
+- **Sema Coder** (`examples/sema-coder/`) — a terminal coding agent written in
+  Sema with an extensible slash-command registry and single-file JSON config.
+
 ## 1.28.1
 
 ### Fixed

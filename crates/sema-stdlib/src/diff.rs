@@ -48,11 +48,17 @@ fn parse_hunk_header(line: &str) -> Option<(i64, i64, i64, i64, String)> {
     let new_part = parts.next()?.strip_prefix('+')?;
 
     let parse_range = |p: &str| -> Option<(i64, i64)> {
-        if let Some((s, c)) = p.split_once(',') {
-            Some((s.parse().ok()?, c.parse().ok()?))
+        let (s, c) = if let Some((s, c)) = p.split_once(',') {
+            (s.parse().ok()?, c.parse().ok()?)
         } else {
-            Some((p.parse().ok()?, 1))
+            (p.parse().ok()?, 1)
+        };
+        // Unified-diff line numbers are 1-based (0 only for empty side); a
+        // negative start is malformed.
+        if s < 0 || c < 0 {
+            return None;
         }
+        Some((s, c))
     };
     let (old_start, old_count) = parse_range(old_part)?;
     let (new_start, new_count) = parse_range(new_part)?;
@@ -187,15 +193,18 @@ fn apply_hunks(content: &str, hunks: &[Hunk]) -> Result<String, SemaError> {
             // Pure insertion: clamp the nominal position into range.
             nominal.max(0).min(lines.len() as i64) as usize
         } else {
-            // Try the nominal position first, then search outward a little to
-            // tolerate small drift from earlier hunks.
+            // Try the nominal position first, then search a SMALL window to
+            // tolerate minor drift from earlier hunks. The window is bounded
+            // (patch-style fuzz) so we don't latch onto a far-away coincidental
+            // context match in repetitive content (blank lines, lone `}`), which
+            // would silently splice the hunk in the wrong place.
+            const MAX_DRIFT: i64 = 3;
             let mut found: Option<usize> = None;
             if matches_at(nominal) {
                 found = Some(nominal.max(0) as usize);
             } else {
-                let max_drift = lines.len() as i64;
                 let mut delta = 1;
-                while delta <= max_drift {
+                while delta <= MAX_DRIFT {
                     if matches_at(nominal - delta) {
                         found = Some((nominal - delta) as usize);
                         break;
@@ -278,17 +287,28 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
         let mut added = 0i64;
         let mut removed = 0i64;
         let mut hunks = 0i64;
+        // Track hunk-body state so a content line that happens to start with
+        // `---`/`+++` (e.g. a removed `--` line renders as `---`) is counted,
+        // not mistaken for a file header. File headers only appear in the
+        // preamble before a hunk; `diff ` (git) starts a new file's preamble.
+        let mut in_hunk = false;
         for line in patch.lines() {
-            if line.starts_with("+++") || line.starts_with("---") {
-                // File headers, not content changes.
+            if line.starts_with("diff ") {
+                in_hunk = false;
                 continue;
             }
             if line.starts_with("@@") {
                 hunks += 1;
-            } else if line.starts_with('+') {
-                added += 1;
-            } else if line.starts_with('-') {
-                removed += 1;
+                in_hunk = true;
+                continue;
+            }
+            if !in_hunk {
+                continue; // preamble, incl. ---/+++ file headers and index lines
+            }
+            match line.as_bytes().first() {
+                Some(b'+') => added += 1,
+                Some(b'-') => removed += 1,
+                _ => {} // context (space), "\ No newline", blank
             }
         }
         let mut m = BTreeMap::new();

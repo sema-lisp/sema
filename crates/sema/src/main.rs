@@ -3087,7 +3087,8 @@ fn run_doc(
             if query.is_empty() {
                 return Err("usage: sema doc search <query>".to_string());
             }
-            let rendered = docs::render_search_results(&query, &docs::doc_search_results(&query, limit));
+            let rendered =
+                docs::render_search_results(&query, &docs::doc_search_results(&query, limit));
             docs::print_rendered(&rendered, pager).map_err(|e| format!("writing docs: {e}"))
         }
         Some(DocCommands::Apropos { pattern }) => {

@@ -4,8 +4,6 @@ use sema_core::SemaError;
 use sema_eval::SPECIAL_FORM_NAMES;
 use sema_reader::lexer::{tokenize, SpannedToken, Token};
 
-use crate::colors::enabled_stdout;
-
 // Sema brand palette from `crates/sema/src/colors.rs` / `website/.vitepress/theme/BrandGuide.vue`.
 const GOLD: Color = Color::Rgb(200, 168, 85);
 const SAGE: Color = Color::Rgb(168, 196, 122);
@@ -148,11 +146,9 @@ pub(crate) fn highlight_sema_ansi(line: &str) -> String {
 }
 
 /// Highlight Sema code blocks inside a Markdown doc string.
+#[cfg(test)]
 pub(crate) fn highlight_doc_markdown(md: &str) -> String {
-    if !enabled_stdout() {
-        return md.to_string();
-    }
-    crate::docs::render_terminal_markdown(md)
+    md.to_string()
 }
 
 /// Given the tokens of the buffer and the cursor position, return the

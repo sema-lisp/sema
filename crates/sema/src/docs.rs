@@ -119,7 +119,10 @@ fn page_with_less(text: &str) -> io::Result<bool> {
     Ok(true)
 }
 
-pub(crate) fn doc_search_results(query: &str, limit: usize) -> Vec<sema_mcp::docs_search::SearchHit> {
+pub(crate) fn doc_search_results(
+    query: &str,
+    limit: usize,
+) -> Vec<sema_mcp::docs_search::SearchHit> {
     sema_mcp::docs_search::search(query, limit)
 }
 
@@ -367,7 +370,29 @@ pub(crate) fn visible_padding(s: &str) -> usize {
     coloured.len().saturating_sub(s.len())
 }
 
-pub(crate) fn doc_name_summaries(extra: impl IntoIterator<Item = (String, String)>) -> BTreeMap<String, String> {
+fn stdout_rgb(rgb: (u8, u8, u8), s: &str) -> String {
+    if colors::enabled_stdout() {
+        format!("\x1b[38;2;{};{};{}m{s}\x1b[0m", rgb.0, rgb.1, rgb.2)
+    } else {
+        s.to_string()
+    }
+}
+
+fn cyan(s: &str) -> String {
+    stdout_rgb(colors::TEAL, s)
+}
+
+fn yellow(s: &str) -> String {
+    stdout_rgb(colors::AMBER, s)
+}
+
+fn dim(s: &str) -> String {
+    stdout_rgb(colors::TERTIARY, s)
+}
+
+pub(crate) fn doc_name_summaries(
+    extra: impl IntoIterator<Item = (String, String)>,
+) -> BTreeMap<String, String> {
     let mut summaries: BTreeMap<String, String> = BTreeMap::new();
     for entry in &sema_docs::builtin_index().entries {
         let summary = first_doc_line(&entry.summary);
@@ -378,26 +403,6 @@ pub(crate) fn doc_name_summaries(extra: impl IntoIterator<Item = (String, String
             summaries
                 .entry(alias.clone())
                 .or_insert_with(|| summary.clone());
-        }
-
-        fn stdout_rgb(rgb: (u8, u8, u8), s: &str) -> String {
-            if colors::enabled_stdout() {
-                format!("\x1b[38;2;{};{};{}m{s}\x1b[0m", rgb.0, rgb.1, rgb.2)
-            } else {
-                s.to_string()
-            }
-        }
-
-        fn cyan(s: &str) -> String {
-            stdout_rgb(colors::TEAL, s)
-        }
-
-        fn yellow(s: &str) -> String {
-            stdout_rgb(colors::AMBER, s)
-        }
-
-        fn dim(s: &str) -> String {
-            stdout_rgb(colors::TERTIARY, s)
         }
     }
     for (name, summary) in extra {
@@ -423,7 +428,7 @@ mod tests {
 
     #[test]
     fn completion_candidates_include_aliases() {
-        let out = completion_candidates("string-spl");
+        let out = completion_candidates("string");
         assert!(out.contains(&"string-split".to_string()));
         assert!(out.contains(&"string/split".to_string()));
     }

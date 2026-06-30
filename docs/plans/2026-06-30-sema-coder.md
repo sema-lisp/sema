@@ -60,21 +60,43 @@ terminal no-ops).
   `$ARGS`).
 - On-brand styling (sema gold `#c8a855`) and a compact wordmark banner.
 
-## Deferred (tracked, not built)
+## Wave 2 — shipped
 
-These remain valuable but are out of scope for the shell, and several can be
-written in Sema on top of `shell` today:
+The deferred primitives are now implemented as native stdlib modules (the
+independent ones were authored in parallel by subagents, then integrated and
+verified together). Native-only modules are gated `cfg(not(wasm32))`; pure ones
+(`diff`, `secret`, `reflect`) compile for all targets.
 
-- **Streaming process / PTY** (`proc/spawn`, `proc/read-stdout`, `pty/*`) — the
-  biggest remaining unlock; needed to stream test output live. Today the `bash`
-  tool returns output on completion.
-- **Event model** (`event/select`, `time/tick`) — pairs with streaming procs.
-- **Diff/patch** (`diff/unified`, `diff/apply`, …) — `edit-file` reports a plain
-  replacement; structured diffs are a follow-up (can start in Sema).
-- **Git primitives** (`git/status`, `git/diff`, …) — agent shells out for now.
-- **fs watching**, **buffer/editor layer**, **AST/`read-string` reflection**,
-  **structured diagnostics** (`sema/check-file`), **secret/PII redaction**,
-  **archive/markdown helpers**, **test-harness DSL**.
+- **Streaming processes** (`proc.rs`) — `proc/spawn` `read-stdout` `read-stderr`
+  `write-stdin` `close-stdin` `wait` `exit-code` `running?` `kill` `close`.
+  Background reader threads drain pipes into buffers you poll, so test output
+  streams live. (PTY is still future — not MVP.)
+- **Event model** (`event.rs`) — `event/select` (poll-based selector over
+  `:key` / `:proc` / `:timer` sources) + `time/tick`.
+- **Diff/patch** (`diff.rs`, `similar` crate) — `diff/unified` `parse` `apply`
+  `hunks` `stat` + `patch/apply-file`.
+- **Git** (`git.rs`, shells out) — `git/root` `current-branch` `status`
+  `changed-files` `diff` `diff-files` `recent-files` `ignore-matches?`.
+- **fs watching** (`fs_watch.rs`, `notify`) — `fs/watch` `watch-events` `unwatch`.
+- **Sema reflection + diagnostics** (`reflect.rs`) — `read/string` `read/all`
+  `format/form`, and `sema/check-string` / `sema/check-file` returning
+  `{:ok :diagnostics}` as data for agent repair loops.
+- **Secrets/PII** (`secret.rs`) — `secret/detect` `secret/redact` `pii/detect`
+  `redact/spans` `hash/digest` (regex + entropy detectors).
+- **Archives** (`archive.rs`) — `gzip/compress` `gzip/decompress` `zip/create`
+  `zip/extract` `zip/list` `tar/create` `tar/extract` (zip-slip guarded).
+- **Markup** (`markup.rs`, `pulldown-cmark` + `scraper`) — `markdown/to-html`
+  `markdown/headings` `markdown/frontmatter` `html/parse` `html/select`
+  `html/select-text` `html/text`.
 
-Top three to do next, per the issue: structured process/event system, then diff/
-patch + git, then Sema AST + structured diagnostics.
+Each module ships unit tests; all 53 new builtins have doc entries (coverage
+gate green).
+
+## Still deferred
+
+- **PTY** (`pty/spawn`/`resize`/`read`/`write`) — pseudo-terminal allocation;
+  `proc/*` covers streaming subprocesses, which was the MVP need.
+- **buffer/editor layer** and **test-harness DSL** (`deftest`/`expect`) — these
+  are best written in Sema (prelude/package level), not as Rust primitives.
+- **`ast/spans`** — requires the reader to carry span info on the Value AST;
+  `ast/symbols`/`find`/`rewrite` are expressible in Sema over quoted forms.

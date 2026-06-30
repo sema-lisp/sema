@@ -1,4 +1,6 @@
 #![allow(clippy::mutable_key_type, clippy::cloned_ref_to_slice_refs)]
+#[cfg(not(target_arch = "wasm32"))]
+mod archive;
 mod arithmetic;
 mod async_ops;
 #[cfg(not(target_arch = "wasm32"))]
@@ -10,6 +12,13 @@ mod context;
 mod crypto;
 mod csv_ops;
 mod datetime;
+mod diff;
+#[cfg(not(target_arch = "wasm32"))]
+mod event;
+#[cfg(not(target_arch = "wasm32"))]
+mod fs_watch;
+#[cfg(not(target_arch = "wasm32"))]
+mod git;
 #[cfg(not(target_arch = "wasm32"))]
 mod http;
 #[cfg(not(target_arch = "wasm32"))]
@@ -19,6 +28,8 @@ pub(crate) mod json;
 mod kv;
 mod list;
 mod map;
+#[cfg(not(target_arch = "wasm32"))]
+mod markup;
 mod math;
 mod meta;
 mod otel;
@@ -26,7 +37,11 @@ mod otel;
 mod pdf;
 mod pio;
 mod predicates;
+#[cfg(not(target_arch = "wasm32"))]
+mod proc;
+mod reflect;
 mod regex_ops;
+mod secret;
 #[cfg(not(target_arch = "wasm32"))]
 mod serial;
 #[cfg(not(target_arch = "wasm32"))]
@@ -87,6 +102,19 @@ pub fn register_stdlib(env: &Env, sandbox: &Sandbox) {
     stream::register(env);
     pio::register(env);
     typed_array::register(env);
+    // Agent/TUI host primitives (issue #53, wave 2)
+    secret::register(env);
+    diff::register(env, sandbox);
+    reflect::register(env, sandbox);
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        proc::register(env, sandbox);
+        event::register(env);
+        git::register(env, sandbox);
+        archive::register(env, sandbox);
+        markup::register(env);
+        fs_watch::register(env, sandbox);
+    }
     #[cfg(not(target_arch = "wasm32"))]
     workflow::register(env);
     async_ops::register(env);

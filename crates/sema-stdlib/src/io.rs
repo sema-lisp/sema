@@ -303,6 +303,25 @@ fn resolved_path(p: &str) -> std::path::PathBuf {
     std::fs::canonicalize(path).unwrap_or_else(|_| lexical_absolute(path))
 }
 
+/// Crate-internal: poll stdin for a key within `ms` and decode it, for
+/// `event/select`'s `:key` source. Returns the key event, or `None` if no key
+/// is ready (or on non-unix platforms, where raw key input isn't wired).
+#[cfg(unix)]
+pub(crate) fn poll_key_event(ms: u64) -> Option<Value> {
+    if !unix_stdin_ready(ms) {
+        return None;
+    }
+    match parse_key_input() {
+        Ok(Some(v)) => Some(v),
+        _ => None,
+    }
+}
+
+#[cfg(not(unix))]
+pub(crate) fn poll_key_event(_ms: u64) -> Option<Value> {
+    None
+}
+
 pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
     register_fn(env, "display", |args| {
         let mut output = String::new();

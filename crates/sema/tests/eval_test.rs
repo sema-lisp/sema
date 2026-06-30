@@ -315,6 +315,30 @@ eval_tests! {
 }
 
 // ============================================================
+// Agent/TUI host primitives — wave 2 (diff, secret, reflect,
+// archive, markup). Process/event/git/fs need a live OS handle and
+// are covered by the modules' own unit tests.
+// ============================================================
+
+eval_tests! {
+    // diff round-trips: applying the unified diff reconstructs `new`.
+    diff_apply_roundtrip: "(diff/apply \"a\\nb\\n\" (diff/unified \"a\\nb\\n\" \"a\\nc\\n\"))" => Value::string("a\nc\n"),
+    diff_stat_added: "(:added (diff/stat (diff/unified \"a\\n\" \"a\\nb\\n\")))" => Value::int(1),
+    // reflection
+    read_all_count: r#"(length (read/all "(a) (b) (c)"))"# => Value::int(3),
+    format_form_tidies: r#"(format/form (read/string "(define  x   1)"))"# => Value::string("(define x 1)"),
+    check_string_ok: r#"(:ok (sema/check-string "(+ 1 2)"))"# => Value::bool(true),
+    check_string_bad: r#"(:ok (sema/check-string "(+ 1 2"))"# => Value::bool(false),
+    // secrets
+    secret_redact_hides: r#"(string/contains? (secret/redact "k AKIAIOSFODNN7EXAMPLE") "redacted")"# => Value::bool(true),
+    // archive: gzip is a lossless round-trip
+    gzip_roundtrip_len: r#"(bytevector-length (gzip/decompress (gzip/compress "hello")))"# => Value::int(5),
+    // markup
+    markdown_h1: r##"(string/contains? (markdown/to-html "# Hi") "<h1>")"## => Value::bool(true),
+    html_text_strips_tags: r#"(html/text "<p>Hello <b>world</b></p>")"# => Value::string("Hello world"),
+}
+
+// ============================================================
 // Debug helpers
 // ============================================================
 

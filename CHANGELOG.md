@@ -4,19 +4,29 @@
 
 ### Added
 
-- **MCP client (stdio transport).** Sema can now act as an MCP *client*, not just
-  a server: `mcp/connect` launches an external MCP server as a child process,
-  performs the `initialize` handshake (including the required
-  `notifications/initialized` follow-up), and returns an opaque handle.
-  `mcp/tools` lists the server's tools, `mcp/call` invokes one, and `mcp/close`
-  shuts the server down. `mcp/tools->sema` converts a server's tools into the
-  same value shape `deftool` produces, so `defagent` can consume external MCP
-  tools with no agent-loop changes; a tool that reports `isError` surfaces as an
-  error the loop feeds back to the model. `mcp/connect` spawns a process and so
-  requires the `process` sandbox capability; tokens for servers that need them
-  are passed through the `:env` map. (Remote Streamable-HTTP transport and the
-  OAuth login flow remain future milestones — see
-  `docs/plans/2026-06-21-mcp-client-spike.md`.)
+- **MCP client.** Sema can now act as an MCP *client*, not just a server, over
+  every standard transport. `mcp/connect` picks the transport from its config:
+  `:command` spawns a **stdio** server (gated on the `process` capability;
+  credentials via the `:env` map), `:url` connects to a remote server over
+  **Streamable HTTP** (gated on `network`; MCP spec `2025-11-25`, with
+  `Mcp-Session-Id` / `MCP-Protocol-Version` handling and JSON-or-SSE responses),
+  and it auto-falls-back to the deprecated 2024-11-05 HTTP+SSE transport when a
+  server only speaks that. `mcp/tools` lists tools, `mcp/call` invokes one,
+  `mcp/close` disconnects, and `mcp/tools->sema` converts a server's tools into
+  the exact value shape `deftool` produces so `defagent` consumes external MCP
+  tools with no agent-loop changes (`isError` surfaces as an error).
+- **MCP client OAuth 2.1 login.** Remote servers that require authorization are
+  handled natively per the MCP authorization spec: on a `401`, Sema discovers the
+  authorization server (RFC 9728 protected-resource metadata → RFC 8414/OIDC
+  metadata), registers a client (RFC 7591 dynamic registration, a pre-registered
+  `:auth {:client-id …}`, or a cached one), and runs the Authorization-Code +
+  PKCE-S256 flow over an RFC 8252 loopback redirect — opening the system browser,
+  binding `resource=` (RFC 8707), then exchanging the code for tokens. Tokens are
+  cached in the OS keychain (with a `0600`-file fallback), so later connects are
+  silent; expired tokens are refreshed automatically. A headless RFC 8628
+  device-authorization flow and a bring-your-own-token option (`:headers`) are
+  also supported. `sema mcp login <url>` (with `--device` / `--client-id`) and
+  `sema mcp logout <url>` manage credentials from the CLI.
 
 ### Fixed
 

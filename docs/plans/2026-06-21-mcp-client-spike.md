@@ -1,14 +1,16 @@
 # MCP Client — spike & scoping (Sema as an MCP *client*)
 
-**Status:** Scoping / design sketch (2026-06-21; auth + HTTP transport added
-2026-06-23). **M1 + M2 shipped** (stdio transport, 2026-07-01): the Layer-1
-`mcp/connect|tools|call|close` primitives and the Layer-2 `mcp/tools->sema` agent
-adapter now exist for the **stdio** transport (`crates/sema-mcp/src/client.rs` +
-`builtins.rs`), capability-gated on `PROCESS`. M3 (Streamable HTTP) and M4 (OAuth
-login) remain future work. Answers the two questions raised: **how** would it work
-and **where** does it live (agent-only vs whole-language)? — and now also: how do
-we reach **authenticated remote servers** (Asana, Linear, hosted GitHub, …) and
-what is the login/token journey.
+**Status:** **M1–M4 + M4b shipped (2026-07-01)** on branch `feature/mcp-client`.
+The Layer-1 `mcp/connect|tools|call|close` primitives and the Layer-2
+`mcp/tools->sema` adapter work over **all** transports: stdio (`PROCESS`-gated),
+Streamable HTTP (`NETWORK`-gated, spec `2025-11-25`), and the deprecated
+2024-11-05 HTTP+SSE (auto-fallback). Remote OAuth 2.1 is native and complete —
+discovery (RFC 9728/8414), DCR (RFC 7591), Authorization-Code + PKCE-S256 over an
+RFC 8252 loopback browser flow with `resource=` (RFC 8707), keychain/`0600`-file
+token storage, auto-refresh, RFC 8628 device flow, and a `sema mcp login/logout`
+CLI. Each layer is covered by offline scripted-server tests. **Remaining:** a
+live end-to-end run against a real OAuth-gated provider (needs a human + browser),
+and M5 (MCP-call cassette recording). See the milestones section for detail.
 
 ## Decisions locked (2026-07-01)
 
@@ -431,12 +433,12 @@ agent tests that use MCP tools stay deterministic and offline in CI.
   network/keys) in `crates/sema/tests/mcp_builtin_test.rs`. *Acceptance met:* an
   agent completes a tool call deterministically in CI. (Cassette recording — the
   shared LLM/MCP tape format — is still M5.)
-- **M3 — native Streamable HTTP transport** (the wire contract above:
+- **M3 — native Streamable HTTP transport [SHIPPED 2026-07-01]** (the wire contract above:
   `Mcp-Session-Id`, JSON-or-SSE branching, `MCP-Protocol-Version`) **+
   `:headers`/bring-your-own-token + `:mcp-servers` sugar on `defagent`.**
   Capability-gated (`NETWORK`). *Acceptance:* connect to a remote server with a
   static bearer token (no OAuth yet) against a real Streamable-HTTP server.
-- **M4 — native OAuth 2.1 login flow** (the auth architecture above): the auth-store
+- **M4 — native OAuth 2.1 login flow [SHIPPED 2026-07-01]** (the auth architecture above): the auth-store
   trait + engine; config dir + token store (keychain w/ `0600`-file fallback);
   PRM/AS discovery; DCR/CIMD/pre-registered client; PKCE; browser open + loopback
   callback (deterministic→ephemeral port); refresh + `403` re-scope + self-heal;
@@ -445,7 +447,7 @@ agent tests that use MCP tools stay deterministic and offline in CI.
   OAuth-gated server (Asana/Linear). *Acceptance:* `mcp/connect` to a real
   OAuth-gated server completes the browser flow once, then reconnects silently from
   cached tokens; CI exercises the full flow against the local test IdP.
-- **M4b — device-authorization grant (RFC 8628) + legacy HTTP+SSE back-compat.** In
+- **M4b — device-authorization grant (RFC 8628) + legacy HTTP+SSE back-compat [SHIPPED 2026-07-01].** In
   scope for the first PR (Decision #3). Device flow: check AS metadata for
   `device_authorization_endpoint`; `POST /device/code` → display `user_code` +
   `verification_uri` → poll `/token` honoring `interval`/`slow_down`/

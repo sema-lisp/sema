@@ -12,6 +12,61 @@ The server communicates over standard input/output (stdio) using JSON-RPC 2.0.
 sema mcp
 ```
 
+Sema is also an MCP **client** — it can *consume* external MCP servers' tools (see [Sema as an MCP client](#sema-as-an-mcp-client) below).
+
+---
+
+## Sema as an MCP client
+
+`mcp/connect` connects to an external MCP server and returns an opaque handle; the transport is chosen from the config map. `mcp/tools` lists its tools, `mcp/call` invokes one, and `mcp/close` disconnects.
+
+```scheme
+;; stdio: spawn a local server (needs the `process` capability). Credentials for
+;; a server that wants them go through :env.
+(define fs (mcp/connect {:command "npx"
+                         :args ["-y" "@modelcontextprotocol/server-filesystem" "/tmp"]}))
+
+(mcp/tools fs)
+; => [{:name "read_file" :description "…" :input-schema {…}} …]
+
+(mcp/call fs "read_file" {:path "/tmp/notes.txt"})
+(mcp/close fs)
+
+;; remote over Streamable HTTP (needs the `network` capability):
+(define gh (mcp/connect {:url "https://mcp.example.com/mcp"
+                         :headers {"Authorization" "Bearer …"}}))   ; bring-your-own-token
+```
+
+### Using external tools from an agent
+
+`mcp/tools->sema` converts a server's tools into the same value shape `deftool` produces, so `defagent` uses them exactly like local tools — no agent-loop changes:
+
+```scheme
+(defagent librarian
+  {:model "claude-…"
+   :system "You manage files."
+   :tools (mcp/tools->sema fs)})     ; MCP tools become first-class agent tools
+```
+
+### Authenticated remote servers (OAuth)
+
+For a remote server that requires authorization, `mcp/connect` runs the standards-compliant OAuth 2.1 flow automatically on the first `401`: it discovers the authorization server (RFC 9728 → RFC 8414/OIDC), registers or reuses a client (RFC 7591 dynamic registration, or a pre-registered `:auth {:client-id "…"}`), and completes the Authorization-Code + PKCE flow by **opening your browser** (RFC 8252 loopback capture). Tokens are cached in your OS keychain (with a `0600`-file fallback) and refreshed automatically, so later connects are silent.
+
+```scheme
+;; Browser opens on first use; subsequent runs reuse the cached token.
+(define asana (mcp/connect {:url "https://mcp.asana.com/mcp"}))
+```
+
+You can also authenticate ahead of time (or on a headless box) from the CLI:
+
+```bash
+sema mcp login https://mcp.example.com/mcp            # opens a browser
+sema mcp login https://mcp.example.com/mcp --device   # headless device-code flow
+sema mcp logout https://mcp.example.com/mcp           # clear cached credentials
+```
+
+Connecting to an MCP server runs its tools with the *server's* authority, not Sema's sandbox — treat connecting to an untrusted server like running untrusted code.
+
 ---
 
 ## Default MCP Tools

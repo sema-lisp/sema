@@ -1,0 +1,90 @@
+;; ============================================================================
+;; packages/micro/tests/confidence.sema
+;; Tests for the micro/confidence recipe
+;; ============================================================================
+;;
+;; Run via:
+;; sema --no-llm --sandbox=no-network -l package.sema tests/confidence.sema
+
+(define (assert-eq actual expected label)
+  (if (equal? actual expected)
+    (println "  ✓ " label)
+    (error (format "  ✗ ~a: expected ~a, got ~a" label expected actual))))
+
+;; ----------------------------------------------------------------------------
+;; Mocking Framework
+;; ----------------------------------------------------------------------------
+;; We redefine `step` to inject candidate values deterministically without live
+;; LLM calls. The confidence macro relies purely on step returns.
+
+(define step-mock-fn nil)
+(defmacro step (prompt opts)
+  `(if step-mock-fn
+    (step-mock-fn ,prompt ,opts)
+    nil))
+
+(println "=== micro/confidence Tests ===")
+
+;; ----------------------------------------------------------------------------
+;; Test 1: accept-first
+;; ----------------------------------------------------------------------------
+(set! step-mock-fn
+  (lambda (prompt opts)
+    (cond
+      ((equal? (get opts :model) "m1") {:answer "A" :confidence 0.9})
+      (else nil))))
+
+(define r1
+  (micro/confidence
+    {:models ["m1" "m2"]
+     :threshold 0.8
+     :schema {:answer :string :confidence :number}}
+    "Prompt"))
+
+(assert-eq r1
+  {:answer "A" :confidence 0.9}
+  "accept-first: returns first candidate")
+
+;; ----------------------------------------------------------------------------
+;; Test 2: escalate-once then accept second
+;; ----------------------------------------------------------------------------
+(set! step-mock-fn
+  (lambda (prompt opts)
+    (cond
+      ((equal? (get opts :model) "m1") {:answer "A" :confidence 0.5})
+      ((equal? (get opts :model) "m2") {:answer "B" :confidence 0.85})
+      (else nil))))
+
+(define r2
+  (micro/confidence
+    {:models ["m1" "m2"]
+     :threshold 0.8
+     :schema {:answer :string :confidence :number}}
+    "Prompt"))
+
+(assert-eq r2
+  {:answer "B" :confidence 0.85}
+  "escalate-once: returns second candidate")
+
+;; ----------------------------------------------------------------------------
+;; Test 3: all-below-threshold returns last valid candidate
+;; ----------------------------------------------------------------------------
+(set! step-mock-fn
+  (lambda (prompt opts)
+    (cond
+      ((equal? (get opts :model) "m1") {:answer "A" :confidence 0.5})
+      ((equal? (get opts :model) "m2") {:answer "B" :confidence 0.6})
+      (else nil))))
+
+(define r3
+  (micro/confidence
+    {:models ["m1" "m2"]
+     :threshold 0.8
+     :schema {:answer :string :confidence :number}}
+    "Prompt"))
+
+(assert-eq r3
+  {:answer "B" :confidence 0.6}
+  "all-below-threshold: returns last candidate")
+
+(println "\nAll tests passed!")

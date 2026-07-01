@@ -1,0 +1,30 @@
+;; ============================================================================
+;; packages/micro/examples/confidence.sema
+;;
+;; Demonstrates the `micro/confidence` package: tries a sequence of models,
+;; accepting the first one that clears the confidence threshold. If all fail,
+;; it falls back to the best candidate.
+;; ============================================================================
+
+(when (nil? (env "OPENAI_API_KEY"))
+  (error "This example requires a real API key. Please set OPENAI_API_KEY to run live."))
+
+(println "Starting micro/confidence demo...")
+
+(defworkflow confidence-example
+  "Confidence escalation pattern demo"
+  {:phases ["Run"]}
+  (phase "Run")
+
+  (def r
+    (micro/confidence
+      {:name "support-answer"
+       :models ["gpt-4o-mini" "gpt-4o"]
+       :threshold 0.82
+       :schema {:answer :string :confidence :number}}
+      "What is the capital of France and why is it awesome? Answer briefly and rate your confidence."))
+
+  {:status :success :result r})
+
+(println "\nFinal Result:")
+(println (:result confidence-example))

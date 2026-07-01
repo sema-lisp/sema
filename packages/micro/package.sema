@@ -6,62 +6,36 @@
 ;; Recipe 1: confidence
 ;; Cheap model first, escalate only if needed.
 ;;
-;; (def answer
+;; This is a WORKFLOW-BODY macro. It journals organically via its `step` leaves.
+;; Use it inside a (defworkflow ...) body for full journaling, or at the top level
+;; (which runs the steps but journals nothing).
+;;
+;; (defworkflow escalate-demo
+;;   "Escalate based on confidence"
+;;   {:phases ["Run"]}
+;;   (phase "Run")
 ;;   (micro/confidence
-;;     {:name "support-answer"
-;;      :models ["ollama/qwen3-coder" "mistral/eu-small" "claude-sonnet-4-6"]
+;;     {:models ["ollama/qwen3-coder" "mistral/eu-small" "claude-sonnet-4-6"]
 ;;      :threshold 0.82
-;;      :schema answer-with-confidence}
+;;      :schema {:answer :string :confidence :number}}
 ;;     "Answer this support question using the docs."))
 
 (defmacro micro/confidence (config prompt)
   `(let ((mc-config# ,config)
-         (mc-prompt# ,prompt))
-     (let ((mc-models# (get mc-config# :models))
-           (mc-threshold# (get mc-config# :threshold))
-           (mc-schema# (get mc-config# :schema))
-           (mc-name# (get mc-config# :name)))
-       ;; Emit recipe.started event
-       ;; (Hack: using workflow/tool-call to inject a journal event)
-       (workflow/tool-call "micro.recipe.started" {:recipe "confidence" :name mc-name#})
-       (let loop ((models# mc-models#) (last-valid# nil))
-         (if (null? models#)
-           (begin
-             (workflow/tool-call "micro.recipe.ended" {:decision "fallback" :model (:model last-valid#)})
-             last-valid#)
-           (let ((model# (car models#))
-                 (rest-models# (cdr models#)))
-             ;; Catch both schema validation failures and standard LLM errors.
-             ;; We assume ANY error inside `step` is a failure to produce valid schema data.
-             (let ((res# (try {:ok (step mc-prompt# {:name (str "confidence:" model#)
-                                                     :model model#
-                                                     :schema mc-schema#})}
-                              (catch _e# {:err _e#}))))
-               (if (contains? res# :err)
-                 (begin
-                   ;; Escalated due to schema_invalid (or model failure)
-                   (workflow/tool-call "micro.escalated" {:from model#
-                                                          :to (if (null? rest-models#) "fallback" (car rest-models#))
-                                                          :reason "schema_invalid"})
-                   (loop rest-models# last-valid#))
-                 (let ((candidate# (:ok res#)))
-                   (if (nil? candidate#)
-                     ;; budget exceeded: `step` returns nil when latched.
-                     ;; Stop iteration and fallback to best valid candidate so far.
-                     (begin
-                       (workflow/tool-call "micro.recipe.ended" {:decision "fallback" :model (:model last-valid#)})
-                       last-valid#)
-                     (begin
-                       ;; We have a candidate matching the schema contract
-                       (workflow/tool-call "micro.candidate.completed" {:model model# :confidence (get candidate# :confidence)})
-                       (if (>= (get candidate# :confidence) mc-threshold#)
-                         (begin
-                           ;; accepted
-                           (workflow/tool-call "micro.recipe.ended" {:decision "accepted" :model model#})
-                           candidate#)
-                         (begin
-                           ;; below threshold, escalate
-                           (workflow/tool-call "micro.escalated" {:from model#
-                                                                  :to (if (null? rest-models#) "fallback" (car rest-models#))
-                                                                  :reason "confidence_below_threshold"})
-                           (loop rest-models# candidate#))))))))))))))
+        (mc-prompt# ,prompt))
+    (let ((mc-models# (get mc-config# :models))
+          (mc-threshold# (get mc-config# :threshold))
+          (mc-schema# (get mc-config# :schema)))
+      (let loop ((models# mc-models#) (last-valid# nil))
+        (if (empty? models#)
+          last-valid#
+          (let* ((model# (car models#))
+                 (rest-models# (cdr models#))
+                 (candidate#
+                   (step mc-prompt#
+                     {:name (str "confidence:" model#)
+                      :model model#
+                      :schema mc-schema#})))
+            (if (>= (get candidate# :confidence) mc-threshold#)
+              candidate#
+              (loop rest-models# candidate#))))))))

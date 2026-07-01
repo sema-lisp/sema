@@ -680,13 +680,10 @@
     opacity: 0;
     pointer-events: none;
   }
-  .loading-title {
-    font-family: var(--serif);
-    font-size: 2.5rem;
-    font-weight: 300;
-    letter-spacing: 0.06em;
-    color: var(--text-bright);
-    margin-bottom: 1rem;
+  .loading-logo {
+    height: 46px;
+    width: auto;
+    margin-bottom: 1.25rem;
   }
   .loading-joke {
     font-family: var(--mono);

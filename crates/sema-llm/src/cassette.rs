@@ -305,8 +305,14 @@ impl Cassette {
         self.dirty = true;
     }
 
-    /// Flush the tape to disk (idempotent; safe to call even if unchanged).
+    /// Flush the tape to disk — but only if it gained entries. A replay-only
+    /// session records nothing (`dirty` stays false), so `save`/`eject` won't
+    /// rewrite the file and silently drop any tape line `Tape::load` couldn't
+    /// parse.
     pub fn save(&self) -> std::io::Result<()> {
+        if !self.dirty {
+            return Ok(());
+        }
         self.tape.save(&self.path)
     }
 }

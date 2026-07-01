@@ -124,16 +124,26 @@ fn connect_stdio(config_json: &serde_json::Value) -> Result<Value, SemaError> {
                      http: {:url \"https://…/mcp\"}",
                 )
         })?;
-    let args_vec = config_json
-        .get("args")
-        .and_then(|value| value.as_array())
-        .map(|values| {
-            values
-                .iter()
-                .filter_map(|value| value.as_str().map(str::to_string))
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
+    // Every `:args` element must be a string — silently dropping a non-string
+    // would launch the server with a different command line than the user wrote.
+    let args_vec: Vec<String> = match config_json.get("args") {
+        None => Vec::new(),
+        Some(serde_json::Value::Array(values)) => {
+            let mut out = Vec::with_capacity(values.len());
+            for value in values {
+                let s = value.as_str().ok_or_else(|| {
+                    SemaError::eval("mcp/connect: every :args element must be a string")
+                })?;
+                out.push(s.to_string());
+            }
+            out
+        }
+        Some(_) => {
+            return Err(SemaError::eval(
+                "mcp/connect: :args must be a list of strings",
+            ));
+        }
+    };
     let env_map = config_json
         .get("env")
         .and_then(|value| value.as_object())

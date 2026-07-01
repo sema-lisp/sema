@@ -5830,7 +5830,7 @@
       "name": "mcp/close",
       "module": "mcp",
       "section": "MCP Client",
-      "summary": "Close an MCP connection. For a stdio server this terminates the child process; for an HTTP server it best-effort ends the session (`DELETE`). After closing, the handle is no longer valid. Dropping a handle without calling `mcp/close` still tears down a stdio child, but calling it explicitly is clearer and deterministic.",
+      "summary": "Close an MCP connection. For a stdio server this terminates the child process; for an HTTP server it best-effort ends the session (`DELETE`). After closing, the handle is no longer valid.",
       "params": [
         {
           "name": "handle",
@@ -5842,7 +5842,7 @@
       "examples": [
         "(define fs (mcp/connect {:command \"npx\" :args [\"-y\" \"server-filesystem\" \"/tmp\"]}))\n;; … use it …\n(mcp/close fs)"
       ],
-      "body": "```\n(mcp/close handle)\n```\n\nClose an MCP connection. For a stdio server this terminates the child process;\nfor an HTTP server it best-effort ends the session (`DELETE`). After closing, the\nhandle is no longer valid. Dropping a handle without calling `mcp/close` still\ntears down a stdio child, but calling it explicitly is clearer and deterministic.\n\n```sema\n(define fs (mcp/connect {:command \"npx\" :args [\"-y\" \"server-filesystem\" \"/tmp\"]}))\n;; … use it …\n(mcp/close fs)\n```"
+      "body": "```\n(mcp/close handle)\n```\n\nClose an MCP connection. For a stdio server this terminates the child process;\nfor an HTTP server it best-effort ends the session (`DELETE`). After closing, the\nhandle is no longer valid.\n\nAlways call `mcp/close` when you're done: a connection stays alive (and a stdio\nchild keeps running) until you close it or the Sema process exits — the handle is\njust an opaque string, so letting it go out of scope does **not** disconnect.\n\n```sema\n(define fs (mcp/connect {:command \"npx\" :args [\"-y\" \"server-filesystem\" \"/tmp\"]}))\n;; … use it …\n(mcp/close fs)\n```"
     },
     {
       "name": "mcp/connect",

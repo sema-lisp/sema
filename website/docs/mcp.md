@@ -222,7 +222,7 @@ sema mcp login  https://mcp.example.com/mcp --client-id ID   # pre-registered cl
 sema mcp logout https://mcp.example.com/mcp             # clear cached credentials
 ```
 
-**Token storage.** Credentials are kept per server URL in the OS keychain by default, falling back to a `0600`-permission file (`~/.config/sema/mcp-auth.json`, XDG-aware) on headless boxes. Override the backend with an environment variable:
+**Token storage.** Credentials are kept per server URL in the OS keychain by default, falling back to a `0600`-permission `mcp-auth.json` in the platform config directory on headless boxes (Linux: `$XDG_CONFIG_HOME` or `~/.config/sema/`; macOS: `~/Library/Application Support/sema/`; Windows: `%APPDATA%\sema\`). Override the backend with an environment variable:
 
 ```bash
 export SEMA_MCP_TOKEN_STORE=file      # force the 0600 file store (no keychain prompts)

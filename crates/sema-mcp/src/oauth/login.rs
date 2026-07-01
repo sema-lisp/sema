@@ -67,26 +67,44 @@ pub async fn discover(
             prm.resource, config.mcp_url
         ));
     }
-    let issuer = prm
-        .authorization_servers
-        .first()
-        .ok_or_else(|| "protected resource metadata lists no authorization servers".to_string())?
-        .clone();
-    let as_meta = discovery::fetch_authorization_server_metadata(client, &issuer).await?;
-    // RFC 8414 §3.3 (mix-up defense): the metadata's `issuer` MUST equal the
-    // issuer identifier we fetched it for.
-    if as_meta.issuer.trim_end_matches('/') != issuer.trim_end_matches('/') {
-        return Err(format!(
-            "authorization server metadata issuer ({}) does not match the requested issuer ({issuer}); \
-             refusing to authorize",
-            as_meta.issuer
-        ));
+    if prm.authorization_servers.is_empty() {
+        return Err("protected resource metadata lists no authorization servers".to_string());
     }
-    if !as_meta.supports_pkce_s256() {
-        return Err(format!(
-            "authorization server `{issuer}` does not advertise PKCE S256 support; refusing to proceed"
-        ));
+    // Try each advertised authorization server in order; use the first that
+    // resolves, matches its issuer (RFC 8414 §3.3 mix-up defense), and supports
+    // PKCE-S256. Collect why each was skipped for a useful error if none work.
+    let mut skipped: Vec<String> = Vec::new();
+    let mut chosen: Option<AuthorizationServerMetadata> = None;
+    for issuer in &prm.authorization_servers {
+        let as_meta = match discovery::fetch_authorization_server_metadata(client, issuer).await {
+            Ok(meta) => meta,
+            Err(e) => {
+                skipped.push(format!("{issuer}: {e}"));
+                continue;
+            }
+        };
+        if as_meta.issuer.trim_end_matches('/') != issuer.trim_end_matches('/') {
+            skipped.push(format!(
+                "{issuer}: metadata issuer ({}) does not match",
+                as_meta.issuer
+            ));
+            continue;
+        }
+        if !as_meta.supports_pkce_s256() {
+            skipped.push(format!("{issuer}: no PKCE S256 support"));
+            continue;
+        }
+        chosen = Some(as_meta);
+        break;
     }
+    let as_meta = chosen.ok_or_else(|| {
+        format!(
+            "no usable authorization server among {} advertised: {}",
+            prm.authorization_servers.len(),
+            skipped.join("; ")
+        )
+    })?;
+
     Ok(Discovered {
         resource: prm.resource.clone(),
         protected_resource: prm,

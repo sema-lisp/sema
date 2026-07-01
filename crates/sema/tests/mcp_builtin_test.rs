@@ -236,3 +236,28 @@ fn test_mcp_connect_denied_without_process_capability() {
         "unexpected error: {msg}"
     );
 }
+
+#[test]
+fn mcp_builtins_validate_arguments() {
+    let interp = Interpreter::new();
+    // Arity.
+    assert!(interp.eval_str("(mcp/call)").is_err());
+    assert!(interp.eval_str(r#"(mcp/call "h")"#).is_err());
+    assert!(interp.eval_str("(mcp/tools)").is_err());
+    // Handle must be a string.
+    assert!(interp.eval_str(r#"(mcp/call 42 "tool" {})"#).is_err());
+    assert!(interp.eval_str("(mcp/tools 42)").is_err());
+    // Unknown/closed handle is a clean error, not a panic.
+    let err = interp
+        .eval_str(r#"(mcp/call "mcp-does-not-exist" "tool" {})"#)
+        .expect_err("unknown handle must error");
+    assert!(
+        err.to_string().contains("not registered"),
+        "unexpected error: {err}"
+    );
+    // Non-string tool name.
+    let conn = connect_expr();
+    interp.eval_str(&conn).expect("connect");
+    assert!(interp.eval_str("(mcp/call server 42 {})").is_err());
+    interp.eval_str("(mcp/close server)").ok();
+}

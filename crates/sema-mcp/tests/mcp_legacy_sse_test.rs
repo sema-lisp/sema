@@ -56,6 +56,12 @@ class H(BaseHTTPRequestHandler):
                     "protocolVersion": "2024-11-05", "capabilities": {},
                     "serverInfo": {"name": "legacy-server", "version": "1.0"}}})
             elif method == "tools/list":
+                # Interleave a server->client notification and a server->client
+                # request whose id COLLIDES with the client's request, before the
+                # real response. A correct client skips both (they carry `method`)
+                # and returns only the real result.
+                q.put({"jsonrpc": "2.0", "method": "notifications/progress", "params": {}})
+                q.put({"jsonrpc": "2.0", "method": "ping", "id": rid})
                 q.put({"jsonrpc": "2.0", "id": rid, "result": {"tools": [
                     {"name": "legacy-echo", "description": "Echo",
                      "inputSchema": {"type": "object", "properties": {}}}]}})

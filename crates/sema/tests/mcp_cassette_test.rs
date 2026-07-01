@@ -100,3 +100,30 @@ fn mcp_call_records_then_replays_without_hitting_the_server() {
 
     interp.eval_str("(mcp/close server)").ok();
 }
+
+#[test]
+fn cassette_replay_miss_errors_on_argument_drift() {
+    let tape = tape_path();
+    let interp = Interpreter::new();
+    interp.eval_str(&connect_expr()).expect("connect");
+
+    // Record a call with specific arguments.
+    install_cassette(Cassette::load(tape.clone(), CassetteMode::Record));
+    interp
+        .eval_str(r#"(mcp/call server "count" {:x 1})"#)
+        .expect("record");
+    take_cassette().unwrap().save().unwrap();
+
+    // Replay a call whose arguments drifted → no matching tape entry → a hard
+    // replay-miss error (rather than silently hitting the network).
+    install_cassette(Cassette::load(tape, CassetteMode::Replay));
+    let err = interp
+        .eval_str(r#"(mcp/call server "count" {:x 2})"#)
+        .expect_err("argument drift must be a replay miss");
+    assert!(
+        format!("{err}").contains("replay miss"),
+        "got: {err}"
+    );
+    take_cassette();
+    interp.eval_str("(mcp/close server)").ok();
+}

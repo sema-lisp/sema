@@ -2,15 +2,19 @@
 
 Things that came out of the May 2026 quality sweep (Wave 6 audit) but were intentionally not fixed because they're too risky, too design-dependent, or have a cheap workaround. Each entry says *why* it's deferred so a future pass can decide whether to revisit.
 
-## LEX-1 — Scientific/exponential number literals (`1.0e19`) not supported
+## MCP-1 — Named/aliased MCP servers
 
-**Found 2026-06-23.** Number literals don't accept an exponent: `1.0e19`, `1e19`, `1.5e3`, `2e-5` all fail to parse as numbers — the lexer's `read_number` (`crates/sema-reader/src/lexer.rs:725`) reads digits and an optional `.digits` fraction but stops before `e`/`E`, so `e19` is lexed as a separate symbol → `Error: Unbound variable: e19`. **Desired:** parse `<mantissa>[eE][+-]?<digits>` as an `f64` (`1.0e19` → 1e19, `2e-5` → 0.00002). Conversions of an out-of-range exponent literal should then error mentioning `int`, e.g.:
+**Found 2026-07-01, during the MCP client PR (#59).** Every `mcp/connect` and `sema mcp login/logout` repeats the full server config (`:url`/`:command`). A convenience layer would let you declare a server once — a `name → {:url …}`/`{:command …}` mapping (in a script or a small config file) — and refer to it by name (`(mcp/connect "asana")`, `sema mcp login asana`). Pairs naturally with the token store, which already keys by canonical URL. **Deferred because** it's a pure ergonomics feature with a design choice (script-level form vs. a config file), orthogonal to the client's correctness, and best done after the base client lands.
 
-```rust
-assert!(eval_err("(int 1.0e19)").to_string().contains("int"));
-```
+## MCP-2 — `sema mcp list`
 
-**Deferred because** it's a small, self-contained lexer addition (extend `read_number` + a few reader unit tests around exponent edge cases: bare `1e3`, signed `2e-5`, uppercase `1E10`, and the `1.` / `.e` non-number cases), just not yet prioritized.
+**Found 2026-07-01 (PR #59).** No CLI command surfaces which remote servers have cached credentials or their token status. A `sema mcp list` would show authenticated/known servers (and, ideally, which script or config declared each — which depends on MCP-1). **Deferred because** it's additive tooling; the "which script declared it" part needs the alias registry from MCP-1 first.
+
+## MCP-3 — Fully-offline agent replay (cassette `tools/list` + `connect` skip)
+
+**Found 2026-07-01 (PR #59, M5 cassettes).** MCP `tools/call` results record/replay through the shared cassette, so agent tool *calls* replay offline. But `mcp/connect` (and its `initialize`/`tools/list`) still runs live on replay, so a fully server-less agent-session replay isn't possible yet — you still need the stdio server or the HTTP endpoint reachable to establish the connection and enumerate tools. Extending the cassette to record `tools/list` and short-circuit `connect` on replay would close this. **Deferred because** the common case (deterministic *call* replay for CI) is covered; connect/list recording is a larger seam (identity keying for the handshake, and for remote servers the OAuth/discovery legs) that isn't needed for the value M5 delivers.
+
+Also noted from the PR #59 merge review as low-priority, not-yet-done: capping the device-flow `slow_down` interval growth (the `+5` itself is RFC 8628-correct), and auto-reconnecting a Streamable-HTTP session on a mid-session `404` (currently surfaced as a `reconnect required` error rather than transparently re-initializing).
 
 ## ASYNC-1 — Dynamic-scope flags vs deferred async tasks (cache/budget visibility)
 
@@ -22,13 +26,7 @@ assert!(eval_err("(int 1.0e19)").to_string().contains("int"));
 
 ---
 
-Verified 2026-06-09: U6 ("did you mean" hints — shipped via `suggest_similar` in sema-core, attached in both backends) and U9 (REPL completeness check — replaced by the lexer-based `SemaValidator` in `crates/sema/src/repl/validator.rs`) were removed because they have since been fixed. Remaining entries re-verified as still open.
-
----
-
-## VM-1 — Stack traces on runtime errors (error UX) — ✅ RESOLVED
-
-**Resolved (2026-06-27):** The VM now captures the call stack at error time via `capture_vm_stack_trace()`, which walks `self.frames` innermost-to-outermost and synthesizes intrinsic frames for inline opcodes (`+`, `-`, `car`, etc.) by decoding the opcode at the failing PC. The trace is wrapped onto the error via `with_stack_trace()` before frame unwinding in `handle_exception`, and serialized as `:stack-trace` (list of `{:name :file :line :col}` maps) in `error_to_value`. Source spans are threaded through the main eval path via `compile_program_with_spans_and_natives`. 7 of 8 acceptance tests pass; the arity call-form note test (`test_arity_error_shows_call_form`) remains deferred as a separate concern.
+Verified 2026-06-09: U6 ("did you mean" hints) and U9 (REPL completeness check) were removed because they were fixed. Verified 2026-07-01: **LEX-1** (scientific/exponential number literals — `1e19`, `2e-5`, `1E10` now parse) and **VM-1** (VM stack traces on runtime errors) removed because they are fixed. Remaining entries re-verified as still open.
 
 ---
 

@@ -10742,6 +10742,16 @@
       "body": "Restore the TTY to cooked mode using the token returned by `io/tty-raw!`.\n\n```sema\n(io/tty-restore! tok)\n```"
     },
     {
+      "name": "io/with-raw-mode",
+      "module": "terminal",
+      "section": "Screen Control",
+      "summary": "Guard macro: put the controlling TTY into raw mode (via `io/tty-raw!`), run `body`, and **always** restore cooked mode on exit — even if `body` throws (the error is re-raised after restoring). Returns `body`'s value. This guard matters most: an unrestored raw TTY leaves the shell unusable (no echo, no line editing). The restore token is handled internally, so `body` binds nothing.",
+      "examples": [
+        "(io/with-raw-mode\n  (let loop ()\n    (let ((k (io/read-key)))\n      (unless (ctrl-c? k) (handle k) (loop)))))"
+      ],
+      "body": "Guard macro: put the controlling TTY into raw mode (via `io/tty-raw!`), run\n`body`, and **always** restore cooked mode on exit — even if `body` throws (the\nerror is re-raised after restoring). Returns `body`'s value. This guard matters\nmost: an unrestored raw TTY leaves the shell unusable (no echo, no line editing).\nThe restore token is handled internally, so `body` binds nothing.\n\n```sema\n(io/with-raw-mode\n  (let loop ()\n    (let ((k (io/read-key)))\n      (unless (ctrl-c? k) (handle k) (loop)))))\n```"
+    },
+    {
       "name": "term/bell",
       "module": "terminal",
       "section": "Screen Control",
@@ -11146,6 +11156,23 @@
         "(term/white \"hello\")"
       ],
       "body": "Wrap `text` in ANSI escape codes so it renders in white in a terminal that supports color.\n\n```sema\n(term/white \"hello\")\n```"
+    },
+    {
+      "name": "term/with-alt-screen",
+      "module": "terminal",
+      "section": "Screen Control",
+      "summary": "Guard macro: enter the alternate screen and hide the cursor, run `body`, and **always** restore both (show cursor, leave alt screen) on exit — even if `body` throws (the error is re-raised after restoring). Returns `body`'s value. Prevents a crash from leaving the terminal stuck in the alt buffer with a hidden cursor. Compose with `io/with-raw-mode` / `term/with-mouse` (outermost restores last).",
+      "examples": [
+        "(io/with-raw-mode\n  (term/with-alt-screen\n    (term/with-mouse\n      (run-tui))))   ; terminal is fully restored however this exits"
+      ],
+      "body": "Guard macro: enter the alternate screen and hide the cursor, run `body`, and\n**always** restore both (show cursor, leave alt screen) on exit — even if `body`\nthrows (the error is re-raised after restoring). Returns `body`'s value. Prevents\na crash from leaving the terminal stuck in the alt buffer with a hidden cursor.\nCompose with `io/with-raw-mode` / `term/with-mouse` (outermost restores last).\n\n```sema\n(io/with-raw-mode\n  (term/with-alt-screen\n    (term/with-mouse\n      (run-tui))))   ; terminal is fully restored however this exits\n```"
+    },
+    {
+      "name": "term/with-mouse",
+      "module": "terminal",
+      "section": "Screen Control",
+      "summary": "Guard macro: enable mouse reporting (`term/enable-mouse`), run `body`, and **always** disable it on exit — even if `body` throws (the error is re-raised after disabling). Returns `body`'s value. Without the guard, a crash leaves mouse reporting on and escape reports spew into the shell as garbage. `io/read-key` decodes reports as `{:kind :mouse …}` while enabled.",
+      "body": "Guard macro: enable mouse reporting (`term/enable-mouse`), run `body`, and\n**always** disable it on exit — even if `body` throws (the error is re-raised\nafter disabling). Returns `body`'s value. Without the guard, a crash leaves mouse\nreporting on and escape reports spew into the shell as garbage. `io/read-key`\ndecodes reports as `{:kind :mouse …}` while enabled."
     },
     {
       "name": "term/write-at",

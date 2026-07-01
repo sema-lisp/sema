@@ -327,6 +327,12 @@ eval_tests! {
     string_wrap_words: r#"(string/word-wrap "the quick brown fox" 10)"# => common::eval(r#"'("the quick" "brown fox")"#),
     string_wrap_hard_break: r#"(string/word-wrap "abcdefghij k" 5)"# => common::eval(r#"'("abcde" "fghij" "k")"#),
     string_wrap_keeps_newlines: r#"(string/word-wrap "a\nb" 10)"# => common::eval(r#"'("a" "b")"#),
+    // Terminal setup/teardown guard macros return the body value and re-raise
+    // after restoring (teardown always runs — the emitted escapes go to stdout).
+    guard_alt_screen_returns_body: "(term/with-alt-screen 1 2 3)" => Value::int(3),
+    guard_raw_mode_returns_body: "(io/with-raw-mode 42)" => Value::int(42),
+    guard_mouse_returns_body: "(term/with-mouse 7)" => Value::int(7),
+    guard_reraises_after_teardown: r#"(try (term/with-alt-screen (error "x")) (catch e "caught"))"# => Value::string("caught"),
 }
 
 // ============================================================

@@ -45,6 +45,10 @@
     reports (`{:kind :mouse …}`), both backward compatible; opt in with
     `term/enable-kitty-keys!` / `term/disable-kitty-keys!` (mouse via the
     existing `term/enable-mouse`, which now also reports drag).
+  - **Terminal setup guards** — `term/with-alt-screen`, `io/with-raw-mode`, and
+    `term/with-mouse` run a body and *always* restore the terminal on exit (even
+    if the body throws), so a crash can't leave the shell in raw mode / the alt
+    buffer / with mouse reporting on. Compose them outermost-restores-last.
 - **Streaming agent turns** — `agent/run` accepts an `:on-text` callback that
   streams the assistant reply token-by-token (in addition to `:on-tool-call`),
   so front-ends can render a reply as it arrives.

@@ -271,18 +271,6 @@ Yield-aware native functions must work on both closure paths (in-VM and the fres
 - `CallNative` optimization requires passing `known_natives` at compile time (done automatically by `eval_str_compiled`); without it, all global calls use `CallGlobal`
 - `set!` to a captured local is silently lost when the closure is invoked through a stdlib higher-order function (`map`, `filter`, `for-each`, …) — upvalue cells are closed to snapshots before every non-VM call, so the callback mutates a detached copy. Globals and in-VM calls are unaffected. Use `foldl` with explicit accumulator threading as a workaround.
 
-## CLI Usage
-
-The bytecode VM runs everything — no flag is required.
-
-```bash
-# Run a file
-sema examples/hello.sema
-
-# Start the REPL
-sema
-```
-
 ## Design Decisions
 
 ### Why Not Delete CoreExpr After Resolution?

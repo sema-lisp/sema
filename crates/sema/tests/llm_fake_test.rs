@@ -608,3 +608,121 @@ fn stream_does_not_fail_over_mid_stream() {
         "mid-stream error surfaces (no silent failover)"
     );
 }
+
+// ── agent/run :on-text streaming (the Sema Coder TUI needs live token deltas) ──
+
+/// `agent/run` with `:on-text` streams the assistant reply as deltas, in order,
+/// and the final `:response` equals their concatenation.
+#[test]
+fn agent_run_on_text_streams_deltas_in_order() {
+    let fake = FakeProvider::builder("fake")
+        .model("fake-model")
+        .stream(&["Hel", "lo, ", "world"])
+        .build();
+
+    let src = r#"
+        (defagent bot {:model "fake-model"})
+        (define trace "")
+        (let ((r (agent/run bot "hi"
+                   {:on-text (lambda (c) (set! trace (string-append trace c "|")))})))
+          (list (:response r) trace))
+    "#;
+    let (result, recorder) = eval_with_fake(src, fake);
+    let val = result.expect("agent/run with :on-text should complete");
+    let items = val.as_seq().expect("list result");
+    assert_eq!(items[0].as_str(), Some("Hello, world"), "final response");
+    assert_eq!(
+        items[1].as_str(),
+        Some("Hel|lo, |world|"),
+        "deltas must arrive in order, as separate chunks"
+    );
+    assert_eq!(recorder.call_count(), 1);
+}
+
+/// Streaming must survive a tool round: round 1 issues a tool call (no visible
+/// text), round 2 streams the final answer. Tool-result correlation is unchanged
+/// — the second request carries the tool result — and only round 2's text streams.
+#[test]
+fn agent_run_on_text_streams_after_a_tool_round() {
+    let fake = FakeProvider::builder("fake")
+        .model("fake-model")
+        .tool_call("call_1", "calc", serde_json::json!({"x": 2}))
+        .stream(&["The ", "answer ", "is 4"])
+        .build();
+
+    let src = r#"
+        (deftool calc "double a number" {:x {:type :number :description "n"}}
+          (lambda (x) "4"))
+        (defagent bot {:model "fake-model" :tools [calc] :max-turns 5})
+        (define trace "")
+        (let ((r (agent/run bot "double 2"
+                   {:on-text (lambda (c)
+                               (when (> (string/length c) 0)
+                                 (set! trace (string-append trace c "|"))))})))
+          (list (:response r) trace))
+    "#;
+    let (result, recorder) = eval_with_fake(src, fake);
+    let val = result.expect("agent/run streaming through a tool round should complete");
+    let items = val.as_seq().expect("list result");
+    assert_eq!(items[0].as_str(), Some("The answer is 4"), "final response");
+    assert_eq!(
+        items[1].as_str(),
+        Some("The |answer |is 4|"),
+        "only round 2's text streams, in order"
+    );
+    assert_eq!(
+        recorder.call_count(),
+        2,
+        "two provider calls: tool round + reply"
+    );
+}
+
+/// Regression: multi-turn tool history must round-trip. Turn 1 calls a tool; we
+/// feed its `:messages` back into turn 2. The re-sent history has to keep the
+/// assistant `tool_calls` turn AND the tool-result's `tool_call_id`, or providers
+/// reject it (e.g. Anthropic 400: `tool_use_id` empty). This once broke every
+/// multi-turn agent conversation that used a tool.
+#[test]
+fn agent_run_preserves_tool_correlation_across_turns() {
+    let fake = FakeProvider::builder("fake")
+        .model("fake-model")
+        .tool_call("call_abc", "calc", serde_json::json!({"x": 2})) // turn 1, round 1
+        .reply("four") // turn 1, round 2 (final)
+        .reply("done") // turn 2, round 1 (final)
+        .build();
+
+    let src = r#"
+        (deftool calc "double a number" {:x {:type :number :description "n"}}
+          (lambda (x) "4"))
+        (defagent bot {:model "fake-model" :tools [calc] :max-turns 5})
+        (define hist (:messages (agent/run bot "double 2" {:messages '()})))
+        (:response (agent/run bot "and again" {:messages hist}))
+    "#;
+    let (result, recorder) = eval_with_fake(src, fake);
+    result.expect("two turns with a tool round should complete");
+
+    // Turn 2's request is the last one recorded; it carries turn 1's history.
+    let reqs = recorder.requests();
+    let last = reqs.last().expect("a turn-2 request");
+    assert!(
+        last.messages
+            .iter()
+            .any(|m| m.role == "assistant" && !m.tool_calls.is_empty()),
+        "re-sent history must keep the assistant tool_calls turn"
+    );
+    let tool_msg = last
+        .messages
+        .iter()
+        .find(|m| m.role == "tool")
+        .expect("re-sent history must contain the tool-result message");
+    assert_eq!(
+        tool_msg.tool_call_id.as_deref(),
+        Some("call_abc"),
+        "the re-sent tool result must keep its tool_call_id"
+    );
+    assert_eq!(
+        tool_msg.tool_name.as_deref(),
+        Some("calc"),
+        "the re-sent tool result must keep its tool name"
+    );
+}

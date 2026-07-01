@@ -110,28 +110,9 @@ pub fn register(env: &sema_core::Env) {
         let text = args[0]
             .as_str()
             .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
-        // Remove ANSI escape sequences: ESC[ ... m
-        let mut result = String::with_capacity(text.len());
-        let mut chars = text.chars();
-        while let Some(ch) = chars.next() {
-            if ch == '\x1b' {
-                // Look for '['
-                if let Some(bracket) = chars.next() {
-                    if bracket == '[' {
-                        // Consume until 'm'
-                        for inner in chars.by_ref() {
-                            if inner == 'm' {
-                                break;
-                            }
-                        }
-                    }
-                    // else: not an ANSI sequence, skip the char after ESC
-                }
-            } else {
-                result.push(ch);
-            }
-        }
-        Ok(Value::string(&result))
+        // Strip ANSI escape sequences (full CSI + OSC, not just SGR). Shared with
+        // string/width & string/wrap via crate::strip_ansi.
+        Ok(Value::string(&crate::strip_ansi(text)))
     });
 
     // (term/rgb "text" r g b) -> 24-bit color
@@ -267,6 +248,122 @@ pub fn register(env: &sema_core::Env) {
             }
         });
 
+        Ok(Value::nil())
+    });
+
+    register_screen_control(env);
+}
+
+// ── Screen control ──────────────────────────────────────────────────────────
+//
+// Raw terminal screen primitives that emit ANSI/VT control sequences to stdout
+// so Sema TUIs (e.g. Sema Coder) don't have to hand-write escape codes. Each
+// write is flushed immediately so the effect is visible at human interaction
+// speed; render loops can still batch styled strings and call `term/flush`.
+
+/// Write a control sequence to stdout and flush it. Control codes are useless
+/// if they sit in a block buffer, so flush-per-call keeps behavior predictable.
+fn emit(seq: &str) -> Result<Value, SemaError> {
+    let mut out = std::io::stdout();
+    out.write_all(seq.as_bytes())
+        .and_then(|_| out.flush())
+        .map_err(|e| SemaError::Io(format!("term: {e}")))?;
+    Ok(Value::nil())
+}
+
+/// Register a zero-arg fn that emits a fixed control sequence.
+fn make_emit_fn(env: &sema_core::Env, name: &str, seq: &'static str) {
+    let fn_name = name.to_string();
+    register_fn(env, name, move |args| {
+        check_arity!(args, &fn_name, 0);
+        emit(seq)
+    });
+}
+
+/// 1-based row/col argument → terminal coordinate, clamped to ≥ 1 (VT cursor
+/// addressing is 1-based; 0 is treated as 1 by most terminals but we normalize).
+fn coord(arg: &Value) -> Result<i64, SemaError> {
+    let n = arg
+        .as_int()
+        .ok_or_else(|| SemaError::type_error("integer", arg.type_name()))?;
+    Ok(n.max(1))
+}
+
+fn register_screen_control(env: &sema_core::Env) {
+    // Alternate screen buffer — enter on app start, leave to restore the user's
+    // scrollback exactly as it was.
+    make_emit_fn(env, "term/enter-alt-screen", "\x1b[?1049h");
+    make_emit_fn(env, "term/leave-alt-screen", "\x1b[?1049l");
+
+    // Clearing
+    make_emit_fn(env, "term/clear", "\x1b[2J\x1b[H"); // whole screen + home
+    make_emit_fn(env, "term/clear-line", "\x1b[2K"); // current line
+    make_emit_fn(env, "term/clear-below", "\x1b[0J"); // cursor → end of screen
+
+    // Cursor
+    make_emit_fn(env, "term/cursor-home", "\x1b[H");
+    make_emit_fn(env, "term/hide-cursor", "\x1b[?25l");
+    make_emit_fn(env, "term/show-cursor", "\x1b[?25h");
+    make_emit_fn(env, "term/save-cursor", "\x1b7");
+    make_emit_fn(env, "term/restore-cursor", "\x1b8");
+
+    // Mouse reporting: button events (1000) + button-motion/drag (1002) + SGR
+    // extended coords (1006). io/read-key decodes the reports into {:kind :mouse …}.
+    make_emit_fn(
+        env,
+        "term/enable-mouse",
+        "\x1b[?1000h\x1b[?1002h\x1b[?1006h",
+    );
+    make_emit_fn(
+        env,
+        "term/disable-mouse",
+        "\x1b[?1000l\x1b[?1002l\x1b[?1006l",
+    );
+
+    // Kitty keyboard protocol (opt-in): push flags 17 = disambiguate (1) +
+    // report-associated-text (16). No event-types flag, so no repeat/release
+    // events (which would double-fire as key presses). Terminals without kitty
+    // support silently ignore this, and keys keep coming through the legacy path.
+    // io/read-key decodes `ESC [ … u` events, normalizing to the usual key maps
+    // plus an optional :mods list. Restore with the stack pop on exit.
+    make_emit_fn(env, "term/enable-kitty-keys!", "\x1b[>17u");
+    make_emit_fn(env, "term/disable-kitty-keys!", "\x1b[<u");
+
+    make_emit_fn(env, "term/bell", "\x07");
+
+    register_fn(env, "term/move-to", |args| {
+        check_arity!(args, "term/move-to", 2);
+        let row = coord(&args[0])?;
+        let col = coord(&args[1])?;
+        emit(&format!("\x1b[{row};{col}H"))
+    });
+
+    register_fn(env, "term/write-at", |args| {
+        check_arity!(args, "term/write-at", 3);
+        let row = coord(&args[0])?;
+        let col = coord(&args[1])?;
+        let text = args[2]
+            .as_str()
+            .ok_or_else(|| SemaError::type_error("string", args[2].type_name()))?;
+        emit(&format!("\x1b[{row};{col}H{text}"))
+    });
+
+    register_fn(env, "term/set-title", |args| {
+        check_arity!(args, "term/set-title", 1);
+        let title = args[0]
+            .as_str()
+            .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
+        // OSC 0 sets both icon name and window title; BEL terminates.
+        emit(&format!("\x1b]0;{title}\x07"))
+    });
+
+    // term/flush — explicit flush for code that batches styled writes with
+    // io/print before showing a frame. (Control fns above already self-flush.)
+    register_fn(env, "term/flush", |args| {
+        check_arity!(args, "term/flush", 0);
+        std::io::stdout()
+            .flush()
+            .map_err(|e| SemaError::Io(format!("term/flush: {e}")))?;
         Ok(Value::nil())
     });
 }

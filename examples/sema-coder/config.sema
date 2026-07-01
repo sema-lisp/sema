@@ -1,0 +1,46 @@
+;; config.sema — single-file JSON configuration for Sema Coder
+;;
+;; Lives at  <config-dir>/sema/sema-code/config.json
+;;   Linux:   ~/.config/sema/sema-code/config.json
+;;   macOS:   ~/Library/Application Support/sema/sema-code/config.json
+;;   Windows: %APPDATA%\sema\sema-code\config.json
+;;
+;; sys/config-dir resolves the platform base, so there is no OS branching here.
+
+(load "util.sema")
+
+(define (config-dir)
+  (path/join (sys/config-dir) "sema" "sema-code"))
+
+(define (config-path)
+  (path/join (config-dir) "config.json"))
+
+;; Defaults are the schema. Anything a user omits falls back to these; anything
+;; extra they add (e.g. their own :commands) is preserved on load.
+(define default-config
+  {:model           ""        ;; "" = auto-detect from API keys
+   :max-turns       50        ;; agent tool-loop budget per turn
+   :context-budget  80000     ;; token estimate before a /compact nudge
+   :approve-bash    #t        ;; reserved: prompt before running shell tools
+   :commands        {}})      ;; user-defined slash commands → shell templates
+
+(define (load-config)
+  "Read config from disk, merging over defaults. Missing file → defaults
+   (and the file is created so users have something to edit)."
+  (let ((path (config-path)))
+    (if (file/exists? path)
+      (try
+        (merge default-config (json/decode (file/read path)))
+        (catch e
+          (io/println-error
+            (format "  config: ignoring malformed ~a (~a)" path e))
+          default-config))
+      (begin (save-config default-config) default-config))))
+
+(define (save-config cfg)
+  "Persist config as pretty JSON, creating parent dirs as needed."
+  (ensure-dir (sys/config-dir))
+  (ensure-dir (path/join (sys/config-dir) "sema"))
+  (ensure-dir (config-dir))
+  (file/write (config-path) (json/encode-pretty cfg))
+  cfg)

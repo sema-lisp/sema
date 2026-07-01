@@ -362,3 +362,26 @@ Test if a path is absolute.
 (path/absolute? "/usr/bin")   ; => #t
 (path/absolute? "relative")  ; => #f
 ```
+
+## File watching
+
+Watch a path for changes and drain events non-blockingly. Requires `FS_READ`.
+
+```sema
+(define w (fs/watch "src" {:recursive true}))
+(for-each
+  (lambda (ev) (println (:kind ev) (:paths ev)))  ; :create/:modify/:remove/...
+  (fs/watch-events w))                            ; non-blocking drain
+(fs/unwatch w)
+```
+
+## Path safety
+
+Helpers for sandboxing file access — `path/within?` is the cornerstone
+(it resolves symlinks, so it catches `../` *and* symlink escapes).
+
+```sema
+(path/within? "/repo" "/repo/src/x")  ; => #t   (catches ../ and symlink escapes)
+(path/canonicalize "./src/../x")      ; real absolute path (errors if missing)
+(path/relative-to "/a/b" "/a/b/c/d")  ; => "c/d"
+```

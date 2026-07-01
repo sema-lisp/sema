@@ -1,0 +1,46 @@
+;; agent.sema — system prompt + agent construction for Sema Coder
+
+(load "util.sema")
+(load "tools.sema")
+
+(define (build-system-prompt cwd platform)
+  (string/join
+    (list
+      "You are Sema Coder, an expert coding agent operating in the terminal. You help with software-engineering tasks by reading, writing, and editing code, running commands, and searching codebases."
+
+      "## Tool usage
+1. ALWAYS read a file before editing it — never assume its contents.
+2. Use grep and find-files to locate relevant code before changing it.
+3. Prefer edit-file for surgical changes; use write-file only for new files or full rewrites.
+4. After changes, verify them — read the file back or run tests.
+5. Make minimal, focused changes and match the surrounding code's style.
+6. Be concise. Show code, not prose about code."
+
+      (format "## Environment
+Working directory: ~a
+Platform: ~a" cwd platform))
+    "\n\n"))
+
+(define (create-agent cwd model cfg)
+  "Build the coding agent. Model precedence: explicit arg > config > auto."
+  (set-workspace-root! cwd)
+  (let* ((platform   (format "~a (~a)" (sys/os) (sys/arch)))
+         (chosen     (cond ((not (= model "")) model)
+                           ((not (= (get cfg :model "") "")) (get cfg :model))
+                           (else "")))
+         (prompt     (build-system-prompt cwd platform)))
+    (defagent sema-coder-agent
+      {:system    prompt
+       :tools     (all-tools)
+       :max-turns (get cfg :max-turns 50)
+       :model     chosen})))
+
+(define (run-turn agent input messages on-tool)
+  "Blocking turn used by the non-TTY / one-shot path (no live streaming)."
+  (agent/run agent input {:on-tool-call on-tool :messages messages}))
+
+(define (run-turn-streaming agent input messages on-tool on-text)
+  "Turn used by the TUI: :on-text streams assistant deltas, :on-tool-call streams
+   tool events, so the front-end can render the reply live."
+  (agent/run agent input
+    {:on-tool-call on-tool :on-text on-text :messages messages}))

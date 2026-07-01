@@ -1,0 +1,68 @@
+;; display.sema — terminal output for Sema Coder
+;;
+;; Agent prose goes to stdout (so `-p` one-shot output is pipeable); all chrome
+;; (banner, prompts, tool lines, errors) goes to stderr. Styling flows through
+;; theme.sema so the palette stays in one place.
+
+(load "theme.sema")
+(load "util.sema")
+
+;; ── Prompt ───────────────────────────────────────────────────────
+
+(define (show-prompt)
+  (io/print-error (accent (term/style (string/append " " prompt-glyph " ") :bold))))
+
+;; ── Messages ─────────────────────────────────────────────────────
+
+(define (show-response text)
+  (println "")
+  (println text)
+  (println ""))
+
+(define (show-info text)  (io/println-error (muted  (format "  ~a" text))))
+(define (show-hint text)  (io/println-error (faint  (format "  ~a" text))))
+(define (show-error text) (io/println-error (bad    (format "  error: ~a" text))))
+(define (show-ok text)    (io/println-error (ok     (format "  ~a" text))))
+
+(define (show-divider)
+  (io/println-error (faint "  ──────────────────────────────────────")))
+
+;; ── Tool-call rendering (agent/run :on-tool-call hook) ───────────
+
+(define active-spinner #f)
+(define active-tool "")
+(define active-arg "")
+
+(define (tool-arg tool args)
+  "Pick the most useful single arg to show inline for a tool call."
+  (cond
+    ((member tool (list "read-file" "write-file" "edit-file" "list-dir"))
+      (get args :path ""))
+    ((equal? tool "bash")        (truncate-str (get args :command "") 60))
+    ((member tool (list "grep" "find-files")) (get args :pattern ""))
+    (else "")))
+
+(define (tool-result-line tool arg ms)
+  "The settled line shown after a tool call completes: ✔ tool arg Nms."
+  (format "  ~a ~a ~a ~a"
+    (ok "✔")
+    (accent-dim (term/style tool :bold))
+    (muted arg)
+    (faint (format "~ams" ms))))
+
+(define (on-tool-call event)
+  (let ((evt  (:event event))
+        (tool (:tool event))
+        (args (:args event)))
+    (cond
+      ((= evt "start")
+        (set! active-tool tool)
+        (set! active-arg (tool-arg tool (if (map? args) args {})))
+        (set! active-spinner
+          (term/spinner-start (muted (format "~a ~a" tool active-arg)))))
+      ((= evt "end")
+        (when active-spinner
+          (term/spinner-stop active-spinner {})
+          (set! active-spinner #f))
+        (io/println-error
+          (tool-result-line active-tool active-arg (get event :duration-ms 0)))))))

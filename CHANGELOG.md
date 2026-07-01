@@ -46,6 +46,62 @@
   tool, and arguments — so an agent-over-MCP flow can be captured once and
   replayed offline/deterministically in CI, with no network or live server.
 
+- **Agent & TUI host primitives** (issue #53) — the building blocks for
+  self-hosted terminal apps written in Sema (see the
+  [Sema Coder](https://github.com/HelgeSverre/sema/tree/main/examples/sema-coder)
+  reference app; the primitives are documented per module under the
+  [standard library reference](https://sema-lang.com/docs/stdlib/)):
+  - **Terminal screen control** — `term/enter-alt-screen`, `term/leave-alt-screen`,
+    `term/clear`, `term/clear-line`, `term/clear-below`, `term/move-to`,
+    `term/write-at`, `term/cursor-home`, `term/hide-cursor`, `term/show-cursor`,
+    `term/save-cursor`, `term/restore-cursor`, `term/enable-mouse`,
+    `term/disable-mouse`, `term/set-title`, `term/bell`, `term/flush`.
+  - **Streaming subprocesses** — `proc/spawn`, `proc/read-stdout`,
+    `proc/read-stderr`, `proc/write-stdin`, `proc/close-stdin`, `proc/wait`,
+    `proc/exit-code`, `proc/running?`, `proc/kill`, `proc/close`.
+  - **Pseudo-terminals** — `pty/spawn`, `pty/read`, `pty/write`, `pty/resize`,
+    `pty/wait`, `pty/exit-code`, `pty/running?`, `pty/kill`, `pty/close`.
+  - **Event loop** — `event/select` (over `:key`/`:proc`/`:timer` sources) and
+    `time/tick`.
+  - **File watching** — `fs/watch`, `fs/watch-events`, `fs/unwatch`.
+  - **Diff & patch** — `diff/unified`, `diff/parse`, `diff/apply`, `diff/hunks`,
+    `diff/stat`, `patch/apply-file`.
+  - **Read-only git** — `git/root`, `git/current-branch`, `git/status`,
+    `git/changed-files`, `git/diff`, `git/diff-files`, `git/recent-files`,
+    `git/ignore-matches?`.
+  - **Sema reflection & diagnostics** — `read/string`, `read/all`,
+    `format/form`, `sema/check-string`, `sema/check-file` (diagnostics as data).
+  - **Secrets & redaction** — `secret/detect`, `secret/redact`, `pii/detect`,
+    `redact/spans`, `hash/digest`.
+  - **Archives** — `gzip/compress`, `gzip/decompress`, `zip/create`,
+    `zip/extract`, `zip/list`, `tar/create`, `tar/extract`.
+  - **Markdown & HTML** — `markdown/to-html`, `markdown/headings`,
+    `markdown/frontmatter`, `html/parse`, `html/select`, `html/select-text`,
+    `html/text`.
+  - **Path safety & config** — `path/canonicalize`, `path/relative-to`,
+    `path/within?`, `sys/config-dir`.
+  - **Display-aware text** — `string/width` (terminal display columns; wide-char
+    and ANSI aware) and `string/word-wrap` (width-aware word wrapping).
+  - **Rich terminal input** — `io/read-key` now decodes the kitty keyboard
+    protocol (modifier reporting as an optional `:mods` list) and SGR mouse
+    reports (`{:kind :mouse …}`), both backward compatible; opt in with
+    `term/enable-kitty-keys!` / `term/disable-kitty-keys!` (mouse via the
+    existing `term/enable-mouse`, which now also reports drag).
+  - **Terminal setup guards** — `term/with-alt-screen`, `io/with-raw-mode`, and
+    `term/with-mouse` run a body and *always* restore the terminal on exit (even
+    if the body throws), so a crash can't leave the shell in raw mode / the alt
+    buffer / with mouse reporting on. Compose them outermost-restores-last.
+- **Streaming agent turns** — `agent/run` accepts an `:on-text` callback that
+  streams the assistant reply token-by-token (in addition to `:on-tool-call`),
+  so front-ends can render a reply as it arrives.
+- **`string->bytevector` / `bytevector->string`** — intuitive aliases for
+  `string->utf8` / `utf8->string` (a Sema string encodes to its UTF-8 bytes).
+- **Sema Coder** (`examples/sema-coder/`) — a terminal coding agent written in
+  Sema: a full-screen, frame-diffed TUI with a fuzzy `/` command palette, live
+  streaming, mouse-wheel scrolling, resize handling, and an extensible
+  slash-command registry + single-file JSON config (falls back to a plain
+  line-based REPL when stdout isn't a TTY).
+
 ### Fixed
 
 - **`sort` is type-safe and numerically correct without a comparator.**
@@ -62,6 +118,30 @@
   registered as an alias of `string-append` (matching how `string/append`
   already works). Behavior is unchanged — `str`, `string-append`, and
   `string/append` remain interchangeable.
+- **`path/within?` could be fooled by a symlink.** For a path that doesn't exist
+  yet (the "agent about to write a new file" case) it now resolves the deepest
+  existing ancestor — so a symlink inside the sandbox can't escape it — and no
+  longer rejects legitimate paths under a symlinked prefix (e.g. macOS
+  `/var`→`/private/var`).
+- **`term/strip` swallowed text after non-SGR sequences.** It now parses full CSI
+  and OSC sequences (cursor moves, clears, titles), not just colors.
+- **Arrow/navigation keys could leak as literal characters.** `io/read-key` reads
+  unbuffered from the raw fd so escape-sequence continuation bytes stay visible to
+  `select()`, fixing intermittent `^[[C`-style leakage under fast terminals.
+- **Streamed tool calls were dropped (Anthropic).** `stream_complete` now
+  assembles `tool_use` blocks into `tool_calls`, so a streaming `agent/run` turn
+  can call tools.
+- **Multi-turn tool history failed on re-send.** `agent/run`'s `:messages`
+  round-trip now preserves assistant `tool_calls` and the tool-result
+  `tool_call_id`/name, so a conversation that used a tool no longer errors on the
+  next turn (e.g. Anthropic `tool_use_id` validation).
+- **Archive extraction could silently overwrite.** `zip/extract` / `tar/extract`
+  reject two entries that map to the same target; `diff/apply` folds hunk drift
+  into its offset; `sys/which` honors `PATHEXT` on Windows.
+- **`sema/check-string` / `sema/check-file` dropped diagnostic detail.** A reader
+  error carrying a hint was wrapped, so the result reported a generic `:code
+  "error"` with no `:span`; it now classifies the root error and returns `:code
+  "syntax"` with the `:span` — important for agent repair loops.
 
 ### Docs and Website
 

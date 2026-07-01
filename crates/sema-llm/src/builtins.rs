@@ -1916,7 +1916,8 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
                     &tool_schemas,
                     max_tool_rounds,
                     on_tool_call.as_ref(),
-                    None,
+                    None, // on_text: llm/chat doesn't stream
+                    None, // agent_name
                     conv_scope,
                 )?;
                 Ok(Value::string(&result))
@@ -2602,6 +2603,12 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
             .as_ref()
             .and_then(|o| o.get(&Value::keyword("on-tool-call")).cloned());
 
+        // Optional streaming hook: called with each assistant text delta so a TUI
+        // can render the reply live. Absent → non-streaming (unchanged) behavior.
+        let on_text = opts
+            .as_ref()
+            .and_then(|o| o.get(&Value::keyword("on-text")).cloned());
+
         // Optional per-run reasoning effort, e.g. (agent/run a msg {:reasoning-effort :high}).
         let reasoning_effort = opts
             .as_ref()
@@ -2714,6 +2721,7 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
             &tool_schemas,
             agent.max_turns,
             on_tool_call.as_ref(),
+            on_text.as_ref(),
             Some(&agent.name),
             conv_scope,
         )?;
@@ -5476,6 +5484,42 @@ fn do_complete(request: ChatRequest) -> Result<ChatResponse, SemaError> {
     Ok(response)
 }
 
+/// Streaming counterpart of [`do_complete`] for the agent tool loop's `:on-text`
+/// option. Opens the same per-completion `chat` span/scope, but drives
+/// `stream_with_dispatch` and delivers each text delta to the Sema `on_text`
+/// callback. Returns the assembled [`ChatResponse`] so the loop's tool-call
+/// handling and `track_usage` accounting are byte-identical to the non-streaming
+/// path. Streaming bypasses the completion cache (like `llm/stream`).
+fn do_complete_streaming(
+    ctx: &EvalContext,
+    request: ChatRequest,
+    on_text: &Value,
+) -> Result<ChatResponse, SemaError> {
+    let _conv = if sema_otel::current_conversation_id().is_none() {
+        Some(sema_otel::set_conversation_scope(
+            &sema_otel::new_conversation_id(),
+            None,
+            None,
+        ))
+    } else {
+        None
+    };
+    let span = sema_otel::llm_span("chat");
+    span.set_request(
+        request.temperature,
+        request.max_tokens,
+        &request.stop_sequences,
+        request.reasoning_effort.as_deref(),
+    );
+    span.set_output_type(request.json_mode);
+    let mut chunk_cb = |chunk: &str| -> Result<(), crate::types::LlmError> {
+        sema_core::call_callback(ctx, on_text, &[Value::string(chunk)])
+            .map_err(|e| crate::types::LlmError::Config(e.to_string()))?;
+        Ok(())
+    };
+    stream_with_dispatch(request, &mut chunk_cb, &span)
+}
+
 /// Concurrent counterpart to [`do_complete`] + the native's post-call accounting,
 /// for the async-scheduler-task path. Mirrors the concurrent `llm/embed` flow,
 /// scaled to a completion: it runs the on-VM-thread stage (conv scope, detached
@@ -6613,7 +6657,45 @@ fn sema_list_to_chat_messages(val: &Value) -> Result<Vec<ChatMessage>, SemaError
                     .unwrap_or_else(|| v.to_string())
             })
             .unwrap_or_default();
-        messages.push(ChatMessage::new(role, content));
+        let mut msg = ChatMessage::new(role, content);
+        // Restore tool-call correlation written by chat_messages_to_sema_list so a
+        // re-sent history keeps the assistant tool_calls and the tool-result ids.
+        if let Some(tcs) = m
+            .get(&Value::keyword("tool-calls"))
+            .and_then(|v| v.as_seq())
+        {
+            msg.tool_calls = tcs
+                .iter()
+                .filter_map(|tc| {
+                    let tm = tc.as_map_rc()?;
+                    Some(ToolCall {
+                        id: tm
+                            .get(&Value::keyword("id"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string(),
+                        name: tm
+                            .get(&Value::keyword("name"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string(),
+                        arguments: tm
+                            .get(&Value::keyword("arguments"))
+                            .map(sema_core::value_to_json_lossy)
+                            .unwrap_or_else(|| serde_json::json!({})),
+                    })
+                })
+                .collect();
+        }
+        msg.tool_call_id = m
+            .get(&Value::keyword("tool-call-id"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        msg.tool_name = m
+            .get(&Value::keyword("tool-name"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        messages.push(msg);
     }
     Ok(messages)
 }
@@ -6628,6 +6710,33 @@ fn chat_messages_to_sema_list(messages: &[ChatMessage]) -> Value {
                 Value::keyword("content"),
                 Value::string(&msg.content.to_text()),
             );
+            // Preserve tool-call correlation so this history re-sends validly on the
+            // next turn. Without it, a re-sent assistant tool-call turn loses its
+            // tool_calls and the tool result loses its id — providers 400 on the
+            // empty tool_use_id / tool_call_id.
+            if !msg.tool_calls.is_empty() {
+                let tcs: Vec<Value> = msg
+                    .tool_calls
+                    .iter()
+                    .map(|tc| {
+                        let mut m = BTreeMap::new();
+                        m.insert(Value::keyword("id"), Value::string(&tc.id));
+                        m.insert(Value::keyword("name"), Value::string(&tc.name));
+                        m.insert(
+                            Value::keyword("arguments"),
+                            sema_core::json_to_value(&tc.arguments),
+                        );
+                        Value::map(m)
+                    })
+                    .collect();
+                map.insert(Value::keyword("tool-calls"), Value::list(tcs));
+            }
+            if let Some(ref id) = msg.tool_call_id {
+                map.insert(Value::keyword("tool-call-id"), Value::string(id));
+            }
+            if let Some(ref name) = msg.tool_name {
+                map.insert(Value::keyword("tool-name"), Value::string(name));
+            }
             Value::map(map)
         })
         .collect();
@@ -6648,6 +6757,7 @@ fn run_tool_loop(
     tool_schemas: &[ToolSchema],
     max_rounds: usize,
     on_tool_call: Option<&Value>,
+    on_text: Option<&Value>,
     agent_name: Option<&str>,
     ids: ConvScope,
 ) -> Result<(String, Vec<ChatMessage>), SemaError> {
@@ -6687,7 +6797,14 @@ fn run_tool_loop(
         request.reasoning_effort = reasoning_effort.clone();
         request.tools = tool_schemas.to_vec();
 
-        let response = match do_complete(request) {
+        // Stream the assistant text live when the caller supplied :on-text;
+        // otherwise take the plain (cache-eligible) path. Tool-call handling and
+        // usage accounting below are identical either way.
+        let completion = match on_text {
+            Some(cb) => do_complete_streaming(ctx, request, cb),
+            None => do_complete(request),
+        };
+        let response = match completion {
             Ok(r) => r,
             Err(e) => {
                 _agent_span.record_error("provider_error", &e.to_string());

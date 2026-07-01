@@ -12,7 +12,7 @@ The agent (built with `defagent`) carries a system prompt, a model, a tool set, 
 **Two shapes:**
 
 - `(agent/run agent message)` — returns just the final reply **string**.
-- `(agent/run agent message opts)` — returns a map `{:response ... :messages ...}`, where `:messages` is the full conversation (so you can continue it). `opts` accepts `:messages` (prior history to resume from) and `:on-tool-call` (a callback fired for each tool call). The callback receives an event map: `{:event "start" :tool name :args …}` before the tool runs and `{:event "end" :tool name :args … :result … :error bool :duration-ms n}` after.
+- `(agent/run agent message opts)` — returns a map `{:response ... :messages ...}`, where `:messages` is the full conversation (so you can continue it). `opts` accepts `:messages` (prior history to resume from), `:on-tool-call` (a callback fired for each tool call), and `:on-text` (a callback fired with each streamed assistant text delta). The tool callback receives an event map: `{:event "start" :tool name :args …}` before the tool runs and `{:event "end" :tool name :args … :result … :error bool :duration-ms n}` after. `:on-text` is called with each text chunk as the reply is generated, so a front-end can render the answer live; the streamed chunks concatenate to `:response`. Without `:on-text` the reply is returned whole (non-streaming). Tool calls work under streaming too.
 
 Each turn is generated with a fixed `max-tokens` of 4096. A turn that hits `:max-turns` returns whatever the model last produced — it does not error, so check the reply if the task may not have completed.
 

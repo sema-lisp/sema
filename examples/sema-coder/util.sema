@@ -1,0 +1,61 @@
+;; util.sema — path resolution, safety, and small string helpers
+;;
+;; Path safety leans on the host primitive (path/within?) rather than ad-hoc
+;; string checks: it canonicalizes symlinks, so it catches `../` AND symlink
+;; escapes that a substring test would miss.
+
+;; ── Workspace root (the sandbox boundary) ───────────────────────
+
+(define workspace-root ".")
+(define (set-workspace-root! path) (set! workspace-root path))
+
+(define (resolve-path root path)
+  "Join root and a relative path, then assert the result stays inside root.
+   Rejects absolute paths and any traversal that escapes the workspace."
+  (when (path/absolute? path)
+    (error (format "Absolute path not allowed: ~a" path)))
+  (let ((joined (path/join root path)))
+    (unless (path/within? root joined)
+      (error (format "Path escapes workspace: ~a" path)))
+    joined))
+
+(define (safe-path? root path)
+  "Return #t if path resolves to a location inside root."
+  (try (begin (resolve-path root path) #t) (catch e #f)))
+
+(define (ensure-dir path)
+  "Create directory (and parents) if it doesn't already exist."
+  (unless (file/exists? path)
+    (file/mkdir path)))
+
+;; ── String helpers ──────────────────────────────────────────────
+
+(define (truncate-str s max-len)
+  (if (> (string/length s) max-len)
+    (string/append (string/slice s 0 max-len) "…")
+    s))
+
+(define (count-lines text)
+  (length (string/split text "\n")))
+
+(define (lines->numbered text)
+  "Prepend 1-indexed line numbers (tab-separated) to each line."
+  (let ((lines (string/split text "\n")))
+    (string/join
+      (map
+        (lambda (pair) (format "~a\t~a" (+ 1 (car pair)) (cdr pair)))
+        (zip (range 0 (length lines)) lines))
+      "\n")))
+
+;; ── Time ─────────────────────────────────────────────────────────
+
+(define (timestamp) (number/to-string (time-ms)))
+
+;; ── Shell safety ─────────────────────────────────────────────────
+
+(define banned-patterns
+  '("rm -rf /" "rm -rf ~" "mkfs" "dd if=" "> /dev/sd" ":(){" "format c:"))
+
+(define (banned-command? cmd)
+  "Return #t if cmd contains a known-dangerous shell pattern."
+  (any (lambda (pat) (string/contains? cmd pat)) banned-patterns))

@@ -120,7 +120,7 @@ A `ms = 0` (or very short) timeout still lets work that is **synchronously ready
 
 Request cancellation of a spawned task. Returns `#t` if the call actually transitioned the promise into the `Cancelled` state, `#f` if there was nothing to cancel — the promise was already terminal (resolved, rejected, previously cancelled) or was never spawned in the first place (e.g. created via `async/resolved`).
 
-Cancellation never errors. The task transitions to `Cancelled`; subsequent `(await p)` raises `"async/await: task was cancelled"` (distinct from a normal rejection).
+Cancellation is best-effort and never errors. The next time the task hits a yield point it transitions to `Cancelled`; subsequent `(await p)` raises `"async/await: task was cancelled"` (distinct from a normal rejection).
 
 **What actually gets aborted.** If the cancelled task is parked on offloaded I/O, the underlying work is aborted where the runtime allows it:
 
@@ -324,12 +324,37 @@ Stdlib higher-order functions like `for-each`, `map`, `filter`, `foldl`, `sort-b
     (await consumer)))   ;; => 28
 ```
 
-Yielding **native** functions (e.g., `channel/recv`, `async/sleep`) passed *directly* as the callback produce a clear error pointing to the workaround:
+Yielding **native** functions (e.g., `channel/recv`, `async/sleep`) passed
+*directly* as the callback produce a clear error pointing to the workaround —
+when the native actually needs to suspend inside a scheduler task (i.e. in async
+context; at the top level a ready `channel/recv` just returns):
 
 ```sema
-;; Error: yielding native passed directly to a higher-order function — wrap in a lambda
-(map channel/recv (list ch ch ch))
+;; Inside a task — errors: yielding native passed directly to a higher-order function
+(await (async (map async/sleep (list 1 1 1))))
 
 ;; Correct: wrap the native in a lambda
-(map (fn (c) (channel/recv c)) (list ch ch ch))
+(await (async (map (fn (ms) (async/sleep ms)) (list 1 1 1))))
+```
+
+## Event loop
+
+`event/select` polls a list of sources and returns the first that's ready (or
+`nil` on timeout) — the unified wait a TUI loop needs, over keypresses,
+subprocess output, and timers.
+
+```sema
+(define proc (proc/spawn ["make" "watch"]))
+(let loop ()
+  (let ((ev (event/select
+              (list {:type :key}                 ; a keypress
+                    {:type :proc :handle proc}   ; output or exit
+                    (time/tick 16))              ; ~60fps redraw tick
+              1000)))                            ; ms timeout
+    (cond
+      ((nil? ev) (loop))                          ; timed out
+      ((= (:type ev) :key)   (handle-key (:value ev)))
+      ((= (:type ev) :proc)  (drain-output proc))
+      ((= (:type ev) :timer) (redraw)))
+    (loop)))
 ```

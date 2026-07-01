@@ -1,0 +1,118 @@
+;; ── Sema Coder — a terminal coding agent written in Sema ──
+;;
+;; Entry point: parse args, load config, build the agent, run the REPL.
+;;
+;;   sema examples/sema-coder/main.sema                 ;; interactive
+;;   sema examples/sema-coder/main.sema -- -p "..."     ;; one-shot
+;;   sema examples/sema-coder/main.sema -- -m <model>   ;; override model
+
+(load "banner.sema")
+(load "commands.sema")
+(load "tui.sema")
+
+(define VERSION "0.1.0")
+
+;; ── CLI parsing ──────────────────────────────────────────────────
+
+(define (parse-args args)
+  (let ((result {:model "" :prompt #f :help #f}))
+    (let loop ((rem args))
+      (if (null? rem)
+        result
+        (let ((arg (car rem)) (rest (cdr rem)))
+          (cond
+            ((member arg (list "-h" "--help"))
+              (set! result (assoc result :help #t)) (loop rest))
+            ((member arg (list "-m" "--model"))
+              (if (null? rest)
+                (begin (io/println-error "Error: --model requires a value") (exit 1))
+                (begin (set! result (assoc result :model (car rest))) (loop (cdr rest)))))
+            ((member arg (list "-p" "--print"))
+              (if (null? rest)
+                (begin (io/println-error "Error: --print requires a value") (exit 1))
+                (begin (set! result (assoc result :prompt (car rest))) (loop (cdr rest)))))
+            (else (loop rest))))))))
+
+(define (show-usage)
+  (println "Sema Coder — a terminal coding agent written in Sema")
+  (println "")
+  (println "Usage: sema examples/sema-coder/main.sema [-- options]")
+  (println "")
+  (println "Options:")
+  (println "  -m, --model <name>    Override the model")
+  (println "  -p, --print <prompt>  One-shot: run prompt, print result, exit")
+  (println "  -h, --help            Show this help")
+  (println "")
+  (println "Config: <config-dir>/sema/sema-code/config.json")
+  (println "Keys: ANTHROPIC_API_KEY or OPENAI_API_KEY"))
+
+;; ── Main ─────────────────────────────────────────────────────────
+
+(try
+  (begin
+    (define cli (parse-args (sys/args)))
+    (when (:help cli) (show-usage) (exit 0))
+
+    (define provider (llm/auto-configure))
+    (when (nil? provider)
+      (io/println-error "Error: No API key found. Set ANTHROPIC_API_KEY or OPENAI_API_KEY.")
+      (exit 1))
+
+    (define cfg   (load-config))
+    (define cwd   (sys/cwd))
+    (define model (:model cli))
+    (define agent (create-agent cwd model cfg))
+
+    ;; One-shot mode — prose to stdout, nothing else.
+    (when (:prompt cli)
+      (let ((result (run-turn agent (:prompt cli) '() on-tool-call)))
+        (println (:response result))
+        (exit 0)))
+
+    ;; Interactive, on a TTY → the full-screen TUI.
+    (when (sys/tty)
+      (tui-run cwd model cfg agent)
+      (exit 0))
+
+    ;; Not a TTY (piped/dumb terminal) → the plain line-based REPL below.
+    (show-banner VERSION)
+    (show-welcome cwd model)
+
+    (define state
+      {:messages '() :model model :cwd cwd :agent agent :config cfg})
+
+    (define eof-count 0)
+
+    (define (handle-input input)
+      (cond
+        ((or (nil? input) (and (= input "") (> eof-count 0)))
+          (io/println-error "")
+          (show-info "bye")
+          (exit 0))
+        ((= (string/trim input) "")
+          (set! eof-count (+ eof-count 1)))
+        ((slash-command? input)
+          (set! eof-count 0)
+          (let ((next (dispatch-command (parse-command input) state)))
+            (if (equal? next 'quit)
+              (begin (show-info "bye") (exit 0))
+              (set! state next))))
+        (else
+          (set! eof-count 0)
+          (let ((result (try
+                          (run-turn (:agent state) (string/trim input) (:messages state) on-tool-call)
+                          (catch e
+                            (show-error (format "agent error: ~a" (get e :message (str e))))
+                            #f))))
+            (when result
+              (show-response (:response result))
+              (set! state (assoc state :messages (:messages result))))))))
+
+    (let loop ()
+      (show-prompt)
+      (handle-input (io/read-line))
+      (loop)))
+
+  (catch e
+    (io/println-error (format "Fatal error: ~a" (get e :message (str e))))
+    (exit 1)))

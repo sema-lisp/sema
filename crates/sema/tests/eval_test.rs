@@ -292,6 +292,85 @@ eval_tests! {
 }
 
 // ============================================================
+// Host/app primitives — path safety, config dir, terminal control
+// (the missing pieces for self-hosted TUI apps like Sema Coder)
+// ============================================================
+
+eval_tests! {
+    // path/relative-to is pure path math (no fs).
+    path_relative_to_descendant: r#"(path/relative-to "/a/b" "/a/b/c/d")"# => Value::string("c/d"),
+    path_relative_to_sibling: r#"(path/relative-to "/a/b/c" "/a/x")"# => Value::string("../../x"),
+    path_relative_to_same: r#"(path/relative-to "/a/b" "/a/b")"# => Value::string("."),
+    // path/within? — containment after resolving `.`/`..` (lexical for non-existent paths).
+    path_within_descendant: r#"(path/within? "/a/b" "/a/b/c")"# => Value::bool(true),
+    path_within_self: r#"(path/within? "/a/b" "/a/b")"# => Value::bool(true),
+    path_within_escape: r#"(path/within? "/a/b" "/a/x")"# => Value::bool(false),
+    path_within_traversal_escape: r#"(path/within? "/a/b" "/a/b/../x")"# => Value::bool(false),
+    // sys/config-dir always yields a non-empty path string.
+    config_dir_is_string: "(string? (sys/config-dir))" => Value::bool(true),
+    // Terminal control sequences return nil (their effect is the bytes on stdout).
+    term_move_to_returns_nil: "(term/move-to 1 1)" => Value::nil(),
+    term_flush_returns_nil: "(term/flush)" => Value::nil(),
+    term_set_title_returns_nil: r#"(term/set-title "x")"# => Value::nil(),
+    // term/strip removes full CSI/OSC sequences, not just SGR (`…m`). A cursor
+    // move or OSC title must not swallow the visible text that follows it.
+    term_strip_sgr: r#"(term/strip "\x1b;[31mred\x1b;[0m")"# => Value::string("red"),
+    term_strip_cursor_move: r#"(term/strip "x\x1b;[10;5Hy")"# => Value::string("xy"),
+    term_strip_osc_title: r#"(term/strip "\x1b;]0;title\x07;after")"# => Value::string("after"),
+    term_strip_plain: r#"(term/strip "plain")"# => Value::string("plain"),
+    // string/width — terminal display columns (wide chars = 2, ANSI = 0).
+    string_width_ascii: r#"(string/width "hello")"# => Value::int(5),
+    string_width_cjk: r#"(string/width "日本語")"# => Value::int(6),
+    string_width_emoji: r#"(string/width "👋")"# => Value::int(2),
+    string_width_ignores_ansi: r#"(string/width (term/rgb "hi" 1 2 3))"# => Value::int(2),
+    // string/wrap — width-aware word wrapping to a list of lines.
+    string_wrap_words: r#"(string/word-wrap "the quick brown fox" 10)"# => common::eval(r#"'("the quick" "brown fox")"#),
+    string_wrap_hard_break: r#"(string/word-wrap "abcdefghij k" 5)"# => common::eval(r#"'("abcde" "fghij" "k")"#),
+    string_wrap_keeps_newlines: r#"(string/word-wrap "a\nb" 10)"# => common::eval(r#"'("a" "b")"#),
+    // Terminal setup/teardown guard macros return the body value and re-raise
+    // after restoring (teardown always runs — the emitted escapes go to stdout).
+    guard_alt_screen_returns_body: "(term/with-alt-screen 1 2 3)" => Value::int(3),
+    guard_raw_mode_returns_body: "(io/with-raw-mode 42)" => Value::int(42),
+    guard_mouse_returns_body: "(term/with-mouse 7)" => Value::int(7),
+    guard_reraises_after_teardown: r#"(try (term/with-alt-screen (error "x")) (catch e "caught"))"# => Value::string("caught"),
+    // string->bytevector: intuitive alias for string->utf8 (UTF-8 encode).
+    string_to_bytevector_alias: r#"(bytevector->string (string->bytevector "héllo"))"# => Value::string("héllo"),
+    // sema/check-string classifies a wrapped reader error as :syntax with a :span
+    // (regression: the error was being wrapped, dropping the code + span).
+    check_string_syntax_code: r#"(:code (car (:diagnostics (sema/check-string "(+ 1 2"))))"# => Value::string("syntax"),
+    check_string_has_span: r#"(map? (:span (car (:diagnostics (sema/check-string "(+ 1 2")))))"# => Value::bool(true),
+}
+
+// ============================================================
+// Agent/TUI host primitives — wave 2 (diff, secret, reflect,
+// archive, markup). Process/event/git/fs need a live OS handle and
+// are covered by the modules' own unit tests.
+// ============================================================
+
+eval_tests! {
+    // diff round-trips: applying the unified diff reconstructs `new`.
+    diff_apply_roundtrip: "(diff/apply \"a\\nb\\n\" (diff/unified \"a\\nb\\n\" \"a\\nc\\n\"))" => Value::string("a\nc\n"),
+    diff_stat_added: "(:added (diff/stat (diff/unified \"a\\n\" \"a\\nb\\n\")))" => Value::int(1),
+    // reflection
+    read_all_count: r#"(length (read/all "(a) (b) (c)"))"# => Value::int(3),
+    format_form_tidies: r#"(format/form (read/string "(define  x   1)"))"# => Value::string("(define x 1)"),
+    check_string_ok: r#"(:ok (sema/check-string "(+ 1 2)"))"# => Value::bool(true),
+    check_string_bad: r#"(:ok (sema/check-string "(+ 1 2"))"# => Value::bool(false),
+    // secrets
+    secret_redact_hides: r#"(string/contains? (secret/redact "k AKIAIOSFODNN7EXAMPLE") "redacted")"# => Value::bool(true),
+    // archive: gzip is a lossless round-trip
+    gzip_roundtrip_len: r#"(bytevector-length (gzip/decompress (gzip/compress "hello")))"# => Value::int(5),
+    // markup
+    markdown_h1: r##"(string/contains? (markdown/to-html "# Hi") "<h1>")"## => Value::bool(true),
+    html_text_strips_tags: r#"(html/text "<p>Hello <b>world</b></p>")"# => Value::string("Hello world"),
+    // Regressions from the wave-2 quality pass:
+    // overlapping redact spans must not panic (drops the overlapping one).
+    redact_spans_overlap_safe: r#"(redact/spans "0123456789" (list {:start 3 :end 6} {:start 0 :end 4}))"# => Value::string("\u{ab}redacted\u{bb}456789"),
+    // diff/stat counts a removed content line that renders as "---", not as a header.
+    diff_stat_content_dashes: r#"(:removed (diff/stat (diff/unified "keep\n--\n" "keep\n")))"# => Value::int(1),
+}
+
+// ============================================================
 // Debug helpers
 // ============================================================
 

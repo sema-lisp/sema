@@ -1,4 +1,6 @@
 #![allow(clippy::mutable_key_type, clippy::cloned_ref_to_slice_refs)]
+#[cfg(not(target_arch = "wasm32"))]
+mod archive;
 mod arithmetic;
 mod async_ops;
 #[cfg(not(target_arch = "wasm32"))]
@@ -10,6 +12,13 @@ mod context;
 mod crypto;
 mod csv_ops;
 mod datetime;
+mod diff;
+#[cfg(not(target_arch = "wasm32"))]
+mod event;
+#[cfg(not(target_arch = "wasm32"))]
+mod fs_watch;
+#[cfg(not(target_arch = "wasm32"))]
+mod git;
 #[cfg(not(target_arch = "wasm32"))]
 mod http;
 #[cfg(not(target_arch = "wasm32"))]
@@ -19,6 +28,8 @@ pub(crate) mod json;
 mod kv;
 mod list;
 mod map;
+#[cfg(not(target_arch = "wasm32"))]
+mod markup;
 mod math;
 mod meta;
 mod otel;
@@ -26,7 +37,13 @@ mod otel;
 mod pdf;
 mod pio;
 mod predicates;
+#[cfg(not(target_arch = "wasm32"))]
+mod proc;
+#[cfg(not(target_arch = "wasm32"))]
+mod pty;
+mod reflect;
 mod regex_ops;
+mod secret;
 #[cfg(not(target_arch = "wasm32"))]
 mod serial;
 #[cfg(not(target_arch = "wasm32"))]
@@ -50,6 +67,47 @@ pub mod workflow_check;
 #[cfg(not(target_arch = "wasm32"))]
 use sema_core::Caps;
 use sema_core::{Env, Sandbox, Value};
+
+/// Strip ANSI escape sequences from `s`: full CSI (`ESC[ … final-byte`), OSC
+/// (`ESC] … BEL|ST`), and other two-char escapes. Shared by `term/strip`,
+/// `string/width`, and `string/wrap` so display-width math ignores styling.
+pub(crate) fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch != '\x1b' {
+            out.push(ch);
+            continue;
+        }
+        match chars.next() {
+            // CSI: ESC [ (params/intermediates) final-byte in 0x40..=0x7E.
+            Some('[') => {
+                for inner in chars.by_ref() {
+                    if ('\u{40}'..='\u{7e}').contains(&inner) {
+                        break;
+                    }
+                }
+            }
+            // OSC: ESC ] … terminated by BEL (0x07) or ST (ESC \).
+            Some(']') => {
+                while let Some(inner) = chars.next() {
+                    if inner == '\x07' {
+                        break;
+                    }
+                    if inner == '\x1b' {
+                        if chars.peek() == Some(&'\\') {
+                            chars.next();
+                        }
+                        break;
+                    }
+                }
+            }
+            // Other two-char escapes (ESC 7, ESC 8, …): drop the byte after ESC.
+            _ => {}
+        }
+    }
+    out
+}
 
 pub fn register_stdlib(env: &Env, sandbox: &Sandbox) {
     #[cfg(target_arch = "wasm32")]
@@ -87,6 +145,20 @@ pub fn register_stdlib(env: &Env, sandbox: &Sandbox) {
     stream::register(env);
     pio::register(env);
     typed_array::register(env);
+    // Agent/TUI host primitives (issue #53, wave 2)
+    secret::register(env);
+    diff::register(env, sandbox);
+    reflect::register(env, sandbox);
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        proc::register(env, sandbox);
+        pty::register(env, sandbox);
+        event::register(env);
+        git::register(env, sandbox);
+        archive::register(env, sandbox);
+        markup::register(env);
+        fs_watch::register(env, sandbox);
+    }
     #[cfg(not(target_arch = "wasm32"))]
     workflow::register(env);
     async_ops::register(env);

@@ -1,0 +1,139 @@
+;; commands.sema — slash-command registry + built-ins
+;;
+;; Adding a command is one call:
+;;
+;;   (register-command! "name" "what it does"
+;;     (lambda (state args) ... return state (or 'quit)))
+;;
+;; A handler receives the live REPL state map and the argument string (text
+;; after the command name) and returns the next state. Built-ins below are
+;; registered the same way external code would register its own.
+;;
+;; Users can ALSO define commands declaratively in config.json without writing
+;; Sema — see the `:commands` map (name → shell template, $ARGS substituted).
+
+(load "display.sema")
+(load "config.sema")
+(load "agent.sema")
+
+;; ── Registry ─────────────────────────────────────────────────────
+
+(define *commands* {})        ;; name(string) → {:desc :handler}
+(define *command-order* '())  ;; registration order, for /help
+
+(define (register-command! name desc handler)
+  (set! *commands* (assoc *commands* name {:desc desc :handler handler}))
+  (unless (member name *command-order*)
+    (set! *command-order* (append *command-order* (list name)))))
+
+(define (slash-command? input)
+  (string/starts-with? (string/trim input) "/"))
+
+(define (parse-command input)
+  "\"/model gpt-x\" → {:name \"model\" :args \"gpt-x\"}"
+  (let* ((trimmed (string/trim input))
+         (sp      (string/index-of trimmed " ")))
+    (if sp
+      {:name (string/slice trimmed 1 sp)
+       :args (string/trim (string/slice trimmed sp (string/length trimmed)))}
+      {:name (string/slice trimmed 1 (string/length trimmed)) :args ""})))
+
+(define (user-command cfg name)
+  "Look up a config-defined shell command by name; nil if absent."
+  (get (get cfg :commands {}) (string->keyword name) nil))
+
+(define (dispatch-command cmd state)
+  (let* ((name (:name cmd))
+         (args (:args cmd))
+         (spec (get *commands* name nil))
+         (shell-tmpl (user-command (:config state) name)))
+    (cond
+      (spec ((:handler spec) state args))
+      (shell-tmpl (run-user-command shell-tmpl args) state)
+      (else
+        (show-error (format "unknown command: /~a (try /help)" name))
+        state))))
+
+(define (run-user-command template args)
+  "Run a config-defined command: substitute $ARGS, run in the workspace."
+  (let* ((cmd    (string/replace template "$ARGS" args))
+         (result (run-in-workspace cmd)))
+    (show-info (faint (string/append "$ " cmd)))
+    (let ((out (string/trim (:stdout result)))
+          (err (string/trim (:stderr result))))
+      (when (not (= out "")) (println out))
+      (when (not (= err "")) (io/println-error err)))))
+
+;; ── Built-in commands ────────────────────────────────────────────
+
+(define tool-names
+  (list "read-file" "write-file" "edit-file" "bash" "grep" "find-files" "list-dir"))
+
+(register-command! "help" "Show this help"
+  (lambda (state args)
+    (io/println-error "")
+    (io/println-error (heading "  Commands"))
+    (for-each
+      (lambda (name)
+        (let ((spec (get *commands* name {})))
+          (io/println-error
+            (format "    ~a  ~a"
+              (accent (string/pad-right (string/append "/" name) 16))
+              (muted (get spec :desc ""))))))
+      *command-order*)
+    (let ((user (keys (get (:config state) :commands {}))))
+      (when (not (null? user))
+        (io/println-error "")
+        (io/println-error (heading "  From config"))
+        (for-each
+          (lambda (k)
+            (io/println-error
+              (format "    ~a  ~a"
+                (accent (string/pad-right (string/append "/" (keyword->string k)) 16))
+                (muted (get (get (:config state) :commands {}) k "")))))
+          user)))
+    (io/println-error "")
+    state))
+
+(register-command! "model" "Show or switch the model: /model [name]"
+  (lambda (state args)
+    (if (= args "")
+      (begin
+        (show-info (format "model: ~a"
+          (let ((m (:model state))) (if (= m "") "auto" m))))
+        state)
+      (let* ((next (assoc state :model args))
+             (agent (create-agent (:cwd state) args (:config state))))
+        (show-ok (format "switched to ~a" args))
+        (assoc next :agent agent)))))
+
+(register-command! "clear" "Clear the conversation history"
+  (lambda (state args)
+    (show-info "conversation cleared")
+    (assoc state :messages '())))
+
+(register-command! "tools" "List the agent's tools"
+  (lambda (state args)
+    (io/println-error "")
+    (for-each (lambda (n) (io/println-error (format "    ~a" (accent n)))) tool-names)
+    (io/println-error "")
+    state))
+
+(register-command! "cwd" "Show the working directory"
+  (lambda (state args) (show-info (:cwd state)) state))
+
+(register-command! "config" "Show config path and current values"
+  (lambda (state args)
+    (show-info (format "config: ~a" (config-path)))
+    (println (json/encode-pretty (:config state)))
+    state))
+
+(register-command! "reload" "Reload config from disk and rebuild the agent"
+  (lambda (state args)
+    (let* ((cfg   (load-config))
+           (agent (create-agent (:cwd state) (:model state) cfg)))
+      (show-ok "config reloaded")
+      (assoc (assoc state :config cfg) :agent agent))))
+
+(register-command! "quit" "Exit Sema Coder" (lambda (state args) 'quit))
+(register-command! "exit" "Exit Sema Coder" (lambda (state args) 'quit))

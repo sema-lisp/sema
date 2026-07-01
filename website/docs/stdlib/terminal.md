@@ -374,12 +374,24 @@ The map's `:kind` field is one of:
 | `:ctrl`   | `:char` (string)        | Ctrl + letter (e.g., Ctrl-C → `{:kind :ctrl :char "c"}`) |
 | `:alt`    | `:char` (string)        | Alt/Meta + character (ESC + char sequence)      |
 | `:key`    | `:name` (keyword)       | Named key — see table below                     |
+| `:mouse`  | `:action` `:x` `:y` `:button` `:mods` | A mouse event (only after `term/enable-mouse`)  |
 
 Named keys (`:kind :key`) currently emitted:
 
 `:enter` `:tab` `:backspace` `:esc` `:up` `:down` `:left` `:right` `:home` `:end` `:delete` `:page-up` `:page-down` `:f1` `:f2` `:f3` `:f4`
 
-CSI/SS3 escape sequences (arrow keys, F1–F4, Page Up/Down, Delete) and UTF-8 continuation bytes are decoded for you with a 20 ms continuation-byte window. F5–F12 and Insert use longer escape sequences that aren't decoded yet — they fall through as raw characters.
+CSI/SS3 escape sequences (arrow keys, F1–F4, Page Up/Down, Delete) and UTF-8 continuation bytes are decoded for you. F5–F12 and Insert use longer escape sequences that aren't decoded yet — they fall through as raw characters.
+
+**Mouse** (after `term/enable-mouse`): SGR reports decode to
+`{:kind :mouse :action A :x col :y row :button N :mods (…)}`, where `A` is one of
+`:press` `:release` `:move` `:wheel-up` `:wheel-down` `:wheel-left` `:wheel-right`,
+coordinates are 1-based, and `:mods` (omitted when empty) lists `:shift`/`:alt`/`:ctrl`.
+
+**Kitty keyboard** (after `term/enable-kitty-keys!`, restore with
+`term/disable-kitty-keys!`): richer key events decode to the *same*
+`:char`/`:ctrl`/`:alt`/`:key` shapes above — so existing code is unaffected — plus
+an optional `:mods` list (e.g. Shift+A → `{:kind :char :char "A" :mods (:shift)}`).
+Both mouse and kitty decoding are opt-in; plain keys are byte-identical either way.
 
 ### `io/read-key-timeout`
 
@@ -477,3 +489,39 @@ Assumes interactive stdin — `io/tty-raw!` returns `nil` when stdin isn't a TTY
 (println "Status: " (color-status 301))  ; yellow "301"
 (println "Status: " (color-status 404))  ; red "404"
 ```
+
+## Screen control
+
+Beyond styling, these emit ANSI/VT control sequences so you never hand-write
+escape codes. Each self-flushes.
+
+```sema
+(term/enter-alt-screen)              ; switch to a clean alternate screen
+(term/hide-cursor)
+(term/clear)
+(term/write-at 3 5 (term/rgb "status: ok" 200 168 85))  ; row, col, text
+(term/move-to 1 1)
+(term/set-title "my app")
+(term/show-cursor)
+(term/leave-alt-screen)              ; restore the user's scrollback
+```
+
+Also: `term/clear-line`, `term/clear-below`, `term/cursor-home`,
+`term/save-cursor`, `term/restore-cursor`, `term/enable-mouse`,
+`term/disable-mouse`, `term/bell`, `term/flush`.
+
+### Setup guards
+
+Setting up a TUI leaves the terminal in a fragile state — if your program exits
+(or crashes) without restoring, the shell is left in raw mode, the alt screen, or
+with mouse reporting spewing escape codes. Guard macros **always** restore on
+exit, even if the body throws:
+
+```sema
+(io/with-raw-mode                 ; restores cooked mode
+  (term/with-alt-screen           ; restores the screen + cursor
+    (term/with-mouse              ; disables mouse reporting
+      (run-tui))))               ; terminal is fully restored however this exits
+```
+
+Compose them outermost-restores-last. Each returns the body's value.

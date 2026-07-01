@@ -129,7 +129,10 @@ export default defineConfig({
             { text: 'File I/O & Paths', link: '/docs/stdlib/file-io' },
             { text: 'PDF Processing', link: '/docs/stdlib/pdf' },
             { text: 'CSV Parsing', link: '/docs/stdlib/csv' },
-            { text: 'TOML Parsing', link: '/docs/stdlib/toml' }
+            { text: 'TOML Parsing', link: '/docs/stdlib/toml' },
+            { text: 'Archives', link: '/docs/stdlib/archive' },
+            { text: 'Diff & Patch', link: '/docs/stdlib/diff' },
+            { text: 'Markdown & HTML', link: '/docs/stdlib/markup' }
           ]
         },
         {
@@ -145,14 +148,18 @@ export default defineConfig({
           collapsed: true,
           items: [
             { text: 'System', link: '/docs/stdlib/system' },
+            { text: 'Processes & PTYs', link: '/docs/stdlib/process' },
+            { text: 'Git', link: '/docs/stdlib/git' },
             { text: 'SQLite Database', link: '/docs/stdlib/sqlite' },
             { text: 'Key-Value Store', link: '/docs/stdlib/kv-store' },
             { text: 'Serial Ports', link: '/docs/stdlib/serial' },
             { text: 'Regex Engine', link: '/docs/stdlib/regex' },
             { text: 'Crypto & Encoding', link: '/docs/stdlib/crypto' },
+            { text: 'Secrets & Redaction', link: '/docs/stdlib/secret' },
+            { text: 'Reflection & Diagnostics', link: '/docs/stdlib/reflect' },
             { text: 'Date & Time', link: '/docs/stdlib/datetime' },
             { text: 'Context Manager', link: '/docs/stdlib/context' },
-            { text: 'Terminal Styling', link: '/docs/stdlib/terminal' },
+            { text: 'Terminal', link: '/docs/stdlib/terminal' },
             { text: 'Playground & WASM', link: '/docs/stdlib/playground' }
           ]
         },

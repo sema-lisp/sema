@@ -25,9 +25,15 @@ hmac.workspace = true
 hex.workspace = true
 hashbrown.workspace = true
 unicode-normalization.workspace = true
+unicode-width.workspace = true
+unicode-segmentation.workspace = true
 caseless.workspace = true
 glob.workspace = true
 toml.workspace = true
+# Sema-on-Sema reflection (read/format/check) + diff/patch — pure, all targets.
+sema-vm.workspace = true
+sema-fmt.workspace = true
+similar.workspace = true
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 sema-workflow.workspace = true
@@ -44,3 +50,11 @@ futures.workspace = true
 mime_guess.workspace = true
 rusqlite.workspace = true
 serialport = "4"
+# Archives, markup, and fs-watching — native only.
+flate2.workspace = true
+tar.workspace = true
+zip.workspace = true
+pulldown-cmark.workspace = true
+scraper.workspace = true
+notify.workspace = true
+portable-pty.workspace = true

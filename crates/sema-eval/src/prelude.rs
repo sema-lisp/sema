@@ -76,6 +76,50 @@ pub const PRELUDE: &str = r#"
          (stream/close ,var)
          res#))))
 
+;; Terminal setup/teardown guards. Each runs BODY and ALWAYS restores on exit —
+;; even if BODY throws — so a crash can't leave the terminal broken. They mirror
+;; with-stream's try/catch-rethrow-then-cleanup shape and return BODY's value.
+;; Compose them (outermost restores last): typically
+;;   (io/with-raw-mode (term/with-alt-screen (term/with-mouse ...body...)))
+
+;; Enter the alternate screen + hide the cursor; restore both on exit.
+(defmacro term/with-alt-screen (. body)
+  `(begin
+     (term/enter-alt-screen)
+     (term/hide-cursor)
+     (let ((res# (try (begin ,@body)
+                   (catch e#
+                     (term/show-cursor)
+                     (term/leave-alt-screen)
+                     (throw e#)))))
+       (term/show-cursor)
+       (term/leave-alt-screen)
+       res#)))
+
+;; Put the TTY in raw mode; restore cooked mode on exit. An unrestored raw TTY
+;; leaves the shell unusable (no echo, no line editing), so this guard matters
+;; most. Binds nothing (the restore token is handled internally).
+(defmacro io/with-raw-mode (. body)
+  `(let ((raw# (io/tty-raw!)))
+     (let ((res# (try (begin ,@body)
+                   (catch e#
+                     (when raw# (io/tty-restore! raw#))
+                     (throw e#)))))
+       (when raw# (io/tty-restore! raw#))
+       res#)))
+
+;; Enable mouse reporting; disable it on exit so mouse escape reports don't spew
+;; into the shell afterward.
+(defmacro term/with-mouse (. body)
+  `(begin
+     (term/enable-mouse)
+     (let ((res# (try (begin ,@body)
+                   (catch e#
+                     (term/disable-mouse)
+                     (throw e#)))))
+       (term/disable-mouse)
+       res#)))
+
 ;; dotimes: execute body n times with a counter variable
 ;; (dotimes (i 10) (println i)) — prints 0..9
 (defmacro dotimes (binding . body)

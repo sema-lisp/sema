@@ -4,8 +4,86 @@ use std::rc::Rc;
 
 use sema_core::{check_arity, SemaError, Value, ValueView};
 use unicode_normalization::UnicodeNormalization;
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 use crate::register_fn;
+
+/// Terminal display width of `s`: ANSI escapes count as 0, wide chars as 2,
+/// combining marks as 0. Shared by `string/width` and `string/word-wrap`.
+fn display_width(s: &str) -> usize {
+    UnicodeWidthStr::width(crate::strip_ansi(s).as_str())
+}
+
+/// Hard-break a single word (no spaces) into chunks each ≤ `width` display
+/// columns, splitting on grapheme-cluster boundaries so combining sequences and
+/// emoji clusters are never split mid-cluster.
+fn grapheme_chunks(word: &str, width: usize) -> Vec<String> {
+    let mut chunks = Vec::new();
+    let mut cur = String::new();
+    let mut cur_w = 0usize;
+    for g in word.graphemes(true) {
+        let gw = UnicodeWidthStr::width(g);
+        if cur_w + gw > width && !cur.is_empty() {
+            chunks.push(std::mem::take(&mut cur));
+            cur_w = 0;
+        }
+        cur.push_str(g);
+        cur_w += gw;
+    }
+    if !cur.is_empty() {
+        chunks.push(cur);
+    }
+    if chunks.is_empty() {
+        chunks.push(String::new());
+    }
+    chunks
+}
+
+/// Word-wrap one paragraph (no embedded newlines) to `width` display columns.
+fn wrap_paragraph(para: &str, width: usize) -> Vec<String> {
+    if para.trim().is_empty() {
+        return vec![String::new()];
+    }
+    let mut lines = Vec::new();
+    let mut cur = String::new();
+    let mut cur_w = 0usize;
+    // Start a fresh current line from `word`, hard-breaking it if it's too wide.
+    let place = |word: &str, lines: &mut Vec<String>| -> (String, usize) {
+        let ww = display_width(word);
+        if ww <= width {
+            (word.to_string(), ww)
+        } else {
+            let mut chunks = grapheme_chunks(word, width);
+            let last = chunks.pop().unwrap_or_default();
+            lines.extend(chunks);
+            let lw = display_width(&last);
+            (last, lw)
+        }
+    };
+    for word in para.split(' ') {
+        if word.is_empty() {
+            continue; // collapse runs of spaces
+        }
+        let ww = display_width(word);
+        if cur.is_empty() {
+            let (c, w) = place(word, &mut lines);
+            cur = c;
+            cur_w = w;
+        } else if cur_w + 1 + ww <= width {
+            cur.push(' ');
+            cur.push_str(word);
+            cur_w += 1 + ww;
+        } else {
+            lines.push(std::mem::take(&mut cur));
+            let (c, w) = place(word, &mut lines);
+            cur = c;
+            cur_w = w;
+        }
+    }
+    lines.push(cur);
+    lines
+}
 
 thread_local! {
     static STRING_INTERN_TABLE: RefCell<HashMap<String, Rc<String>>> = RefCell::new(HashMap::new());
@@ -1237,6 +1315,39 @@ pub fn register(env: &sema_core::Env) {
             }
         });
         Ok(Value::string_from_rc(interned_rc))
+    });
+
+    // (string/width s) -> display columns S occupies in a terminal.
+    // Unlike string-length (which counts Unicode scalar values), this counts
+    // TERMINAL COLUMNS: CJK and other wide characters count as 2, combining
+    // marks as 0, and ANSI escape sequences (colors, cursor moves) as 0. This is
+    // what TUI layout, padding, and alignment need — char count is wrong there.
+    register_fn(env, "string/width", |args| {
+        check_arity!(args, "string/width", 1);
+        let s = args[0]
+            .as_str()
+            .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
+        Ok(Value::int(display_width(s) as i64))
+    });
+
+    // (string/word-wrap text width) -> list of lines, each ≤ WIDTH display
+    // columns. Word-wraps on spaces (collapsing runs), hard-breaks words longer
+    // than WIDTH by grapheme cluster, preserves explicit newlines as line breaks,
+    // and measures with display width so wrapping is correct for non-ASCII text.
+    // (Distinct from `string/wrap`, which wraps a string in delimiters.)
+    register_fn(env, "string/word-wrap", |args| {
+        check_arity!(args, "string/word-wrap", 2);
+        let text = args[0]
+            .as_str()
+            .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
+        let width = args[1].as_index("string/word-wrap")?.max(1);
+        let mut out = Vec::new();
+        for para in text.split('\n') {
+            for line in wrap_paragraph(para, width) {
+                out.push(Value::string(&line));
+            }
+        }
+        Ok(Value::list(out))
     });
 
     // Silent aliases for other Lisp dialects (undocumented)

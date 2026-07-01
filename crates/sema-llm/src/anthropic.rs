@@ -244,75 +244,158 @@ impl AnthropicProvider {
             });
         }
 
-        let mut full_content = String::new();
-        let mut input_tokens = 0u32;
-        let mut output_tokens = 0u32;
-        let mut cache_read_input_tokens = 0u32;
-        let mut cache_creation_input_tokens = 0u32;
-        let mut stop_reason = None;
-
+        let mut acc = AnthropicStreamAccum::default();
         crate::sse::parse_sse_stream(resp, |data| {
             if let Ok(event) = serde_json::from_str::<serde_json::Value>(data) {
-                match event.get("type").and_then(|t| t.as_str()) {
-                    Some("message_start") => {
-                        if let Some(usage) = event.pointer("/message/usage") {
-                            input_tokens = usage
-                                .get("input_tokens")
-                                .and_then(|v| v.as_u64())
-                                .unwrap_or(0) as u32;
-                            // Anthropic reports cache tokens SEPARATELY from input_tokens.
-                            cache_read_input_tokens = usage
-                                .get("cache_read_input_tokens")
-                                .and_then(|v| v.as_u64())
-                                .unwrap_or(0)
-                                as u32;
-                            cache_creation_input_tokens = usage
-                                .get("cache_creation_input_tokens")
-                                .and_then(|v| v.as_u64())
-                                .unwrap_or(0)
-                                as u32;
-                        }
-                    }
-                    Some("content_block_delta") => {
-                        if let Some(text) = event.pointer("/delta/text") {
-                            if let Some(s) = text.as_str() {
-                                full_content.push_str(s);
-                                on_chunk(s)?;
-                            }
-                        }
-                    }
-                    Some("message_delta") => {
-                        if let Some(usage) = event.get("usage") {
-                            output_tokens = usage
-                                .get("output_tokens")
-                                .and_then(|v| v.as_u64())
-                                .unwrap_or(0) as u32;
-                        }
-                        if let Some(sr) = event.pointer("/delta/stop_reason") {
-                            stop_reason = sr.as_str().map(|s| s.to_string());
-                        }
-                    }
-                    _ => {}
+                if let Some(text) = acc.on_event(&event) {
+                    on_chunk(&text)?;
                 }
             }
             Ok(())
         })
         .await?;
 
-        Ok(ChatResponse {
-            content: full_content,
+        Ok(acc.into_response(model_name))
+    }
+}
+
+/// Incremental accumulator for an Anthropic streaming (`stream=true`) response.
+///
+/// Kept as a plain struct rather than inline in the async loop so the tool_use
+/// assembly — the exact path that once dropped streamed tool calls, producing an
+/// empty turn — is unit-testable without a socket. Tool calls stream as
+/// `content_block_start {type:tool_use,id,name}` → repeated
+/// `content_block_delta {input_json_delta, partial_json}` (the arguments JSON
+/// arrives in fragments) → `content_block_stop`; blocks are keyed by `index` so
+/// several parallel tool calls in one turn don't interleave.
+#[derive(Default)]
+struct AnthropicStreamAccum {
+    content: String,
+    input_tokens: u32,
+    output_tokens: u32,
+    cache_read_input_tokens: u32,
+    cache_creation_input_tokens: u32,
+    stop_reason: Option<String>,
+    // index -> (id, name, partial-json)
+    tool_accs: std::collections::BTreeMap<u64, (String, String, String)>,
+    tool_calls: Vec<ToolCall>,
+}
+
+impl AnthropicStreamAccum {
+    /// Process one decoded SSE event; return any text delta to forward to the
+    /// caller's on_chunk callback (`None` for non-text events).
+    fn on_event(&mut self, event: &serde_json::Value) -> Option<String> {
+        let index = event.get("index").and_then(|v| v.as_u64()).unwrap_or(0);
+        match event.get("type").and_then(|t| t.as_str()) {
+            Some("message_start") => {
+                if let Some(usage) = event.pointer("/message/usage") {
+                    self.input_tokens = usage
+                        .get("input_tokens")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0) as u32;
+                    // Anthropic reports cache tokens SEPARATELY from input_tokens.
+                    self.cache_read_input_tokens = usage
+                        .get("cache_read_input_tokens")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0) as u32;
+                    self.cache_creation_input_tokens = usage
+                        .get("cache_creation_input_tokens")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0) as u32;
+                }
+                None
+            }
+            Some("content_block_start") => {
+                if event
+                    .pointer("/content_block/type")
+                    .and_then(|t| t.as_str())
+                    == Some("tool_use")
+                {
+                    let id = event
+                        .pointer("/content_block/id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let name = event
+                        .pointer("/content_block/name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    self.tool_accs.insert(index, (id, name, String::new()));
+                }
+                None
+            }
+            Some("content_block_delta") => {
+                if let Some(s) = event.pointer("/delta/text").and_then(|t| t.as_str()) {
+                    self.content.push_str(s);
+                    Some(s.to_string())
+                } else {
+                    if let Some(pj) = event
+                        .pointer("/delta/partial_json")
+                        .and_then(|t| t.as_str())
+                    {
+                        if let Some(acc) = self.tool_accs.get_mut(&index) {
+                            acc.2.push_str(pj);
+                        }
+                    }
+                    None
+                }
+            }
+            Some("content_block_stop") => {
+                if let Some(acc) = self.tool_accs.remove(&index) {
+                    self.tool_calls.push(Self::finalize(acc));
+                }
+                None
+            }
+            Some("message_delta") => {
+                if let Some(usage) = event.get("usage") {
+                    self.output_tokens = usage
+                        .get("output_tokens")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0) as u32;
+                }
+                if let Some(sr) = event.pointer("/delta/stop_reason") {
+                    self.stop_reason = sr.as_str().map(|s| s.to_string());
+                }
+                None
+            }
+            _ => None,
+        }
+    }
+
+    fn finalize(acc: (String, String, String)) -> ToolCall {
+        let (id, name, json) = acc;
+        let arguments = if json.trim().is_empty() {
+            serde_json::json!({})
+        } else {
+            serde_json::from_str(&json).unwrap_or_else(|_| serde_json::json!({}))
+        };
+        ToolCall {
+            id,
+            name,
+            arguments,
+        }
+    }
+
+    fn into_response(mut self, model: String) -> ChatResponse {
+        // Finalize any tool block that never saw a content_block_stop (defensive).
+        for acc in std::mem::take(&mut self.tool_accs).into_values() {
+            self.tool_calls.push(Self::finalize(acc));
+        }
+        ChatResponse {
+            content: self.content,
             role: "assistant".to_string(),
-            model: model_name.clone(),
-            tool_calls: Vec::new(),
+            model: model.clone(),
+            tool_calls: self.tool_calls,
             usage: Usage {
-                prompt_tokens: input_tokens,
-                completion_tokens: output_tokens,
-                model: model_name,
-                cache_read_input_tokens,
-                cache_creation_input_tokens,
+                prompt_tokens: self.input_tokens,
+                completion_tokens: self.output_tokens,
+                model,
+                cache_read_input_tokens: self.cache_read_input_tokens,
+                cache_creation_input_tokens: self.cache_creation_input_tokens,
             },
-            stop_reason,
-        })
+            stop_reason: self.stop_reason,
+        }
     }
 }
 
@@ -479,6 +562,43 @@ fn serialize_anthropic_content(content: &MessageContent) -> serde_json::Value {
 mod tests {
     use super::*;
     use crate::types::{ChatMessage, ChatRequest};
+
+    /// Regression: a streamed tool call must be assembled from its SSE fragments
+    /// (start → input_json_delta × N → stop), not dropped. Dropping it made the
+    /// agent loop see an empty turn and skip the tool entirely.
+    #[test]
+    fn streaming_assembles_tool_use_and_text() {
+        let events = [
+            serde_json::json!({"type":"message_start","message":{"usage":{"input_tokens":10}}}),
+            serde_json::json!({"type":"content_block_start","index":0,"content_block":{"type":"text"}}),
+            serde_json::json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Let me look. "}}),
+            serde_json::json!({"type":"content_block_stop","index":0}),
+            serde_json::json!({"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_01xyz","name":"list-dir"}}),
+            serde_json::json!({"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"path\":"}}),
+            serde_json::json!({"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"\".\"}"}}),
+            serde_json::json!({"type":"content_block_stop","index":1}),
+            serde_json::json!({"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":7}}),
+        ];
+        let mut acc = AnthropicStreamAccum::default();
+        let mut streamed = String::new();
+        for e in &events {
+            if let Some(t) = acc.on_event(e) {
+                streamed.push_str(&t);
+            }
+        }
+        let resp = acc.into_response("claude-x".into());
+
+        assert_eq!(streamed, "Let me look. ", "text deltas still stream");
+        assert_eq!(resp.content, "Let me look. ");
+        assert_eq!(resp.tool_calls.len(), 1, "the tool call must survive");
+        let tc = &resp.tool_calls[0];
+        assert_eq!(tc.id, "toolu_01xyz");
+        assert_eq!(tc.name, "list-dir");
+        assert_eq!(tc.arguments, serde_json::json!({"path": "."}));
+        assert_eq!(resp.stop_reason.as_deref(), Some("tool_use"));
+        assert_eq!(resp.usage.prompt_tokens, 10);
+        assert_eq!(resp.usage.completion_tokens, 7);
+    }
 
     #[test]
     fn budget_mapping() {

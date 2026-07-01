@@ -66,8 +66,11 @@ html {
   padding-top: 0 !important;
 }
 
-/* Prevent navbar from clipping doc page content */
-.VPDoc .content {
+/* Prevent navbar from clipping doc page content. Scoped to the direct content
+   column: the plain `.VPDoc .content` selector also matches the aside outline's
+   inner `.content` wrapper, and padding there pushes the links down while the
+   absolutely-positioned outline marker stays put — misaligning the marker. */
+.VPDoc > .container > .content {
   padding-top: 3rem !important;
 }
 

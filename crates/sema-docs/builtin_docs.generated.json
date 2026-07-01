@@ -2477,27 +2477,6 @@
       "syntax": "(apply f arg ... lst)"
     },
     {
-      "name": "assoc",
-      "module": "lists",
-      "section": "Association Lists",
-      "summary": "Look up a key in an association list (a list of `(key value)` pairs), using `equal?` (structural) comparison. Returns the **whole matching pair**, not just the value — so reach for the value with `cadr`. Returns `#f` when no key matches.",
-      "params": [
-        {
-          "name": "key",
-          "type": "any"
-        },
-        {
-          "name": "alist",
-          "type": "list"
-        }
-      ],
-      "returns": "any",
-      "examples": [
-        "(define alist '((\"a\" 1) (\"b\" 2) (\"c\" 3)))\n(assoc \"b\" alist)         ; => (\"b\" 2)\n(assoc \"z\" alist)         ; => #f\n\n;; Get the value, not the pair:\n(cadr (assoc \"b\" alist))  ; => 2"
-      ],
-      "body": "Look up a key in an association list (a list of `(key value)` pairs), using `equal?` (structural) comparison. Returns the **whole matching pair**, not just the value — so reach for the value with `cadr`. Returns `#f` when no key matches.\n\n```sema\n(define alist '((\"a\" 1) (\"b\" 2) (\"c\" 3)))\n(assoc \"b\" alist)         ; => (\"b\" 2)\n(assoc \"z\" alist)         ; => #f\n\n;; Get the value, not the pair:\n(cadr (assoc \"b\" alist))  ; => 2\n```\n\nBecause `#f` doubles as \"not found\", check membership before destructuring an unknown key. For larger or mutable lookups, a hash map (`{...}` / `get`) is faster than scanning an alist. See also `assq`/`assv` (other comparison flavors — in Sema all three compare by value)."
-    },
-    {
       "name": "assq",
       "module": "lists",
       "section": "Association Lists",
@@ -2861,7 +2840,7 @@
       "name": "first",
       "module": "lists",
       "section": "Construction & Access",
-      "summary": "Alias for `car`. Return the first element.",
+      "summary": "Alias for `car`. Return the first element of a list or vector. Returns `nil` for empty sequences (making it a safe \"index 0\" accessor — unlike `nth`, which errors out of bounds).",
       "params": [
         {
           "name": "lst",
@@ -2871,9 +2850,9 @@
       ],
       "returns": "any",
       "examples": [
-        "(first '(1 2 3))   ; => 1"
+        "(first '(1 2 3))   ; => 1\n(first [1 2 3])    ; => 1\n(first [])         ; => nil"
       ],
-      "body": "Alias for `car`. Return the first element.\n\n```sema\n(first '(1 2 3))   ; => 1\n```"
+      "body": "Alias for `car`. Return the first element of a list or vector. Returns `nil` for empty sequences (making it a safe \"index 0\" accessor — unlike `nth`, which errors out of bounds).\n\n```sema\n(first '(1 2 3))   ; => 1\n(first [1 2 3])    ; => 1\n(first [])         ; => nil\n```"
     },
     {
       "name": "flat-map",
@@ -3073,7 +3052,7 @@
       "name": "length",
       "module": "lists",
       "section": "Basic Operations",
-      "summary": "Return the number of elements in a list.",
+      "summary": "Return the number of elements in a collection. Works on lists, vectors, strings, maps, bytevectors, and typed arrays. See also `count`, which additionally treats `nil` as `0`.",
       "params": [
         {
           "name": "list",
@@ -3082,9 +3061,9 @@
       ],
       "returns": "int",
       "examples": [
-        "(length '(1 2 3))  ; => 3\n(length '())       ; => 0"
+        "(length '(1 2 3))  ; => 3\n(length '())       ; => 0\n(length [10 20 30]); => 3\n(length \"abc\")     ; => 3"
       ],
-      "body": "Return the number of elements in a list.\n\n```sema\n(length '(1 2 3))  ; => 3\n(length '())       ; => 0\n```"
+      "body": "Return the number of elements in a collection. Works on lists, vectors, strings, maps, bytevectors, and typed arrays. See also `count`, which additionally treats `nil` as `0`.\n\n```sema\n(length '(1 2 3))  ; => 3\n(length '())       ; => 0\n(length [10 20 30]); => 3\n(length \"abc\")     ; => 3\n```"
     },
     {
       "name": "list",
@@ -3515,7 +3494,7 @@
       "name": "nth",
       "module": "lists",
       "section": "Construction & Access",
-      "summary": "Return the element at index N (zero-based).",
+      "summary": "Return the element at index N (zero-based). Works on both lists and vectors.",
       "params": [
         {
           "name": "lst",
@@ -3530,9 +3509,10 @@
       ],
       "returns": "any",
       "examples": [
-        "(nth '(10 20 30) 1)   ; => 20\n(nth '(10 20 30) 0)   ; => 10"
+        "(nth '(10 20 30) 1)   ; => 20\n(nth '(10 20 30) 0)   ; => 10\n(nth [10 20 30] 2)    ; => 30",
+        "(nth [10 20 30] 3)\n; => error: index 3 out of bounds (length 3)"
       ],
-      "body": "Return the element at index N (zero-based).\n\n```sema\n(nth '(10 20 30) 1)   ; => 20\n(nth '(10 20 30) 0)   ; => 10\n```"
+      "body": "Return the element at index N (zero-based). Works on both lists and vectors.\n\n```sema\n(nth '(10 20 30) 1)   ; => 20\n(nth '(10 20 30) 0)   ; => 10\n(nth [10 20 30] 2)    ; => 30\n```\n\nOut of bounds is an error:\n\n```sema\n(nth [10 20 30] 3)\n; => error: index 3 out of bounds (length 3)\n```\n\nUse `first` for safe \"index 0\" access — it returns `nil` on empty sequences."
     },
     {
       "name": "partition",
@@ -3570,7 +3550,7 @@
       "name": "rest",
       "module": "lists",
       "section": "Construction & Access",
-      "summary": "Alias for `cdr`. Return the rest of the list.",
+      "summary": "Alias for `cdr`. Return everything after the first element. **Preserves type** — list in, list out; vector in, vector out.",
       "params": [
         {
           "name": "lst",
@@ -3579,9 +3559,9 @@
       ],
       "returns": "list",
       "examples": [
-        "(rest '(1 2 3))    ; => (2 3)"
+        "(rest '(1 2 3))    ; => (2 3)\n(rest [1 2 3])     ; => [2 3]\n(rest [])          ; => []\n(rest [1])         ; => []"
       ],
-      "body": "Alias for `cdr`. Return the rest of the list.\n\n```sema\n(rest '(1 2 3))    ; => (2 3)\n```"
+      "body": "Alias for `cdr`. Return everything after the first element. **Preserves type** — list in, list out; vector in, vector out.\n\n```sema\n(rest '(1 2 3))    ; => (2 3)\n(rest [1 2 3])     ; => [2 3]\n(rest [])          ; => []\n(rest [1])         ; => []\n```"
     },
     {
       "name": "reverse",
@@ -4511,9 +4491,10 @@
       "summary": "Add or update key-value pairs, returning a **new** map; the original is never mutated.",
       "returns": "map",
       "examples": [
-        "(assoc {:a 1} :b 2)          ; => {:a 1 :b 2}\n(assoc {:a 1} :a 99)         ; => {:a 99}  (existing key replaced)\n(assoc {} :a 1 :b 2 :c 3)    ; => {:a 1 :b 2 :c 3}  (multiple pairs)\n\n;; The input is unchanged — assoc returns a fresh map.\n(let ((m {:a 1}))\n  (assoc m :b 2)\n  m)                         ; => {:a 1}"
+        "(assoc {:a 1} :b 2)          ; => {:a 1 :b 2}\n(assoc {:a 1} :a 99)         ; => {:a 99}  (existing key replaced)\n(assoc {} :a 1 :b 2 :c 3)    ; => {:a 1 :b 2 :c 3}  (multiple pairs)\n\n;; The input is unchanged — assoc returns a fresh map.\n(let ((m {:a 1}))\n  (assoc m :b 2)\n  m)                         ; => {:a 1}",
+        "(define alist '((\"a\" 1) (\"b\" 2) (\"c\" 3)))\n(assoc \"b\" alist)         ; => (\"b\" 2)\n(assoc \"z\" alist)         ; => #f\n(cadr (assoc \"b\" alist))  ; => 2   (get the value, not the pair)"
       ],
-      "body": "Add or update key-value pairs, returning a **new** map; the original is never mutated.\n\nAccepts any number of trailing key/value pairs, applied left to right. `assoc` only touches the top level — to reach into a nested map use `assoc-in`/`map/assoc-in`. To remove a key instead, use `dissoc`.\n\n```sema\n(assoc {:a 1} :b 2)          ; => {:a 1 :b 2}\n(assoc {:a 1} :a 99)         ; => {:a 99}  (existing key replaced)\n(assoc {} :a 1 :b 2 :c 3)    ; => {:a 1 :b 2 :c 3}  (multiple pairs)\n\n;; The input is unchanged — assoc returns a fresh map.\n(let ((m {:a 1}))\n  (assoc m :b 2)\n  m)                         ; => {:a 1}\n```",
+      "body": "Add or update key-value pairs, returning a **new** map; the original is never mutated.\n\nAccepts any number of trailing key/value pairs, applied left to right. `assoc` only touches the top level — to reach into a nested map use `assoc-in`/`map/assoc-in`. To remove a key instead, use `dissoc`.\n\n```sema\n(assoc {:a 1} :b 2)          ; => {:a 1 :b 2}\n(assoc {:a 1} :a 99)         ; => {:a 99}  (existing key replaced)\n(assoc {} :a 1 :b 2 :c 3)    ; => {:a 1 :b 2 :c 3}  (multiple pairs)\n\n;; The input is unchanged — assoc returns a fresh map.\n(let ((m {:a 1}))\n  (assoc m :b 2)\n  m)                         ; => {:a 1}\n```\n\n## Association-list form\n\nCalled as `(assoc key alist)` — two arguments where the second is a list — `assoc`\ninstead does a classic Scheme association-list lookup: it scans a list of\n`(key value)` pairs using `equal?` (structural) comparison and returns the **whole\nmatching pair** (reach for the value with `cadr`), or `#f` when no key matches.\n\n```sema\n(define alist '((\"a\" 1) (\"b\" 2) (\"c\" 3)))\n(assoc \"b\" alist)         ; => (\"b\" 2)\n(assoc \"z\" alist)         ; => #f\n(cadr (assoc \"b\" alist))  ; => 2   (get the value, not the pair)\n```\n\nBecause `#f` doubles as \"not found\", check membership before destructuring an\nunknown key. For larger or mutable lookups, a hash map (`{...}` / `get`) is faster\nthan scanning an alist. See also `assq`/`assv` (other comparison flavors — in Sema\nall three compare by value).",
       "syntax": "(assoc map key val ...)"
     },
     {
@@ -5050,18 +5031,6 @@
       "syntax": "(<= num ...)"
     },
     {
-      "name": "=",
-      "module": "math",
-      "section": "Comparison",
-      "summary": "Equality. For numbers this is **numeric** equality, so `(= 1 1.0)` is `#t` even though the int and float differ in representation. For non-numbers it falls back to **structural** equality (recursing into lists, maps, vectors).",
-      "returns": "bool",
-      "examples": [
-        "(= 1 1)             ; => #t\n(= 1 1.0)           ; => #t   (numeric: int = float)\n(= 1 2)             ; => #f\n(= \"abc\" \"abc\")     ; => #t   (structural)\n(= '(1 2) '(1 2))   ; => #t   (recurses into the list)\n\n(eq? 1 1.0)         ; => #f   (no numeric coercion)"
-      ],
-      "body": "Equality. For numbers this is **numeric** equality, so `(= 1 1.0)` is `#t`\neven though the int and float differ in representation. For non-numbers it falls\nback to **structural** equality (recursing into lists, maps, vectors).\n\n`=` never errors on type mismatches — it just answers `#f` (or `#t`). That makes\nit the safe general-purpose equality. Contrast with `eq?`, which is stricter\nidentity/value equality: `(eq? 1 1.0)` is `#f` because the values are not the\nsame kind. Reach for `=` when comparing numbers or whole data structures; reach\nfor `eq?` when you want \"is this the exact same value\" (no int/float coercion).\n\n```sema\n(= 1 1)             ; => #t\n(= 1 1.0)           ; => #t   (numeric: int = float)\n(= 1 2)             ; => #f\n(= \"abc\" \"abc\")     ; => #t   (structural)\n(= '(1 2) '(1 2))   ; => #t   (recurses into the list)\n\n(eq? 1 1.0)         ; => #f   (no numeric coercion)\n```\n\nSee also: `eq?` (value identity), `<` / `>` (ordering — these *do* error on mixed\nor unorderable types, where `=` does not).",
-      "syntax": "(= a b ...)"
-    },
-    {
       "name": ">",
       "module": "math",
       "section": "Comparison",
@@ -5246,23 +5215,6 @@
         "e              ; => 2.718281828459045"
       ],
       "body": "Euler's number (2.71828...).\n\n```sema\ne              ; => 2.718281828459045\n```"
-    },
-    {
-      "name": "even?",
-      "module": "math",
-      "section": "Numeric Predicates",
-      "summary": "Test whether an integer is even. Requires an integer — passing a float errors rather than coercing. See `odd?` for the complement.",
-      "params": [
-        {
-          "name": "n",
-          "type": "int"
-        }
-      ],
-      "returns": "bool",
-      "examples": [
-        "(even? 4)      ; => #t\n(even? 0)      ; => #t\n(even? -2)     ; => #t\n(even? 3)      ; => #f"
-      ],
-      "body": "Test whether an integer is even. Requires an integer — passing a float errors rather than coercing. See `odd?` for the complement.\n\n```sema\n(even? 4)      ; => #t\n(even? 0)      ; => #t\n(even? -2)     ; => #t\n(even? 3)      ; => #f\n```"
     },
     {
       "name": "expt",
@@ -5774,33 +5726,6 @@
       "body": "Alias for [`mod`](#mod): truncated remainder whose sign follows the dividend.\n\n```sema\n(modulo 10 3)  ; => 1\n(modulo -7 2)  ; => -1\n```"
     },
     {
-      "name": "negative?",
-      "module": "math",
-      "section": "Numeric Predicates",
-      "summary": "Test if a number is negative.",
-      "examples": [
-        "(negative? -1) ; => #t\n(negative? 1)  ; => #f"
-      ],
-      "body": "Test if a number is negative.\n\n```sema\n(negative? -1) ; => #t\n(negative? 1)  ; => #f\n```"
-    },
-    {
-      "name": "odd?",
-      "module": "math",
-      "section": "Numeric Predicates",
-      "summary": "Test if an integer is odd.",
-      "params": [
-        {
-          "name": "n",
-          "type": "int"
-        }
-      ],
-      "returns": "bool",
-      "examples": [
-        "(odd? 3)       ; => #t\n(odd? 4)       ; => #f"
-      ],
-      "body": "Test if an integer is odd.\n\n```sema\n(odd? 3)       ; => #t\n(odd? 4)       ; => #f\n```"
-    },
-    {
       "name": "pi",
       "module": "math",
       "section": "Constants",
@@ -5809,23 +5734,6 @@
         "pi             ; => 3.141592653589793"
       ],
       "body": "The mathematical constant π (3.14159...).\n\n```sema\npi             ; => 3.141592653589793\n```"
-    },
-    {
-      "name": "positive?",
-      "module": "math",
-      "section": "Numeric Predicates",
-      "summary": "Test if a number is positive.",
-      "params": [
-        {
-          "name": "n",
-          "type": "number"
-        }
-      ],
-      "returns": "bool",
-      "examples": [
-        "(positive? 1)  ; => #t\n(positive? -1) ; => #f\n(positive? 0)  ; => #f"
-      ],
-      "body": "Test if a number is positive.\n\n```sema\n(positive? 1)  ; => #t\n(positive? -1) ; => #f\n(positive? 0)  ; => #f\n```"
     },
     {
       "name": "pow",
@@ -5890,23 +5798,6 @@
         "(truncate 3.7)  ; => 3\n(truncate -3.7) ; => -3   ; toward zero, not floor (-4)\n(truncate 3.9)  ; => 3"
       ],
       "body": "Drop the fractional part, rounding toward zero (so negatives round *up*). Unlike [`round`](#round), it never inspects the fraction — `3.9` truncates to `3`.\n\n```sema\n(truncate 3.7)  ; => 3\n(truncate -3.7) ; => -3   ; toward zero, not floor (-4)\n(truncate 3.9)  ; => 3\n```"
-    },
-    {
-      "name": "zero?",
-      "module": "math",
-      "section": "Numeric Predicates",
-      "summary": "Test if a number is zero.",
-      "params": [
-        {
-          "name": "n",
-          "type": "number"
-        }
-      ],
-      "returns": "bool",
-      "examples": [
-        "(zero? 0)      ; => #t\n(zero? 1)      ; => #f"
-      ],
-      "body": "Test if a number is zero.\n\n```sema\n(zero? 0)      ; => #t\n(zero? 1)      ; => #f\n```"
     },
     {
       "name": "memory/append",
@@ -6478,12 +6369,12 @@
       "name": "=",
       "module": "predicates",
       "section": "Equality",
-      "summary": "Equality. For numbers this is numeric equality (so `(= 1 1.0)` is `#t`); for non-numbers it falls back to structural equality. Unlike `<` / `>`, comparing non-numbers does not error — it reports whether the values are equal.",
+      "summary": "Equality. For numbers this is **numeric** equality, so `(= 1 1.0)` is `#t` even though the int and float differ in representation. For non-numbers it falls back to **structural** equality (recursing into lists, maps, vectors).",
       "returns": "bool",
       "examples": [
-        "(= 1 1)           ; => #t\n(= 1 1.0)         ; => #t\n(= 1 2)           ; => #f\n(= \"abc\" \"abc\")   ; => #t   (structural, not an error)\n(= 1 \"a\")         ; => #f"
+        "(= 1 1)             ; => #t\n(= 1 1.0)           ; => #t   (numeric: int = float)\n(= 1 2)             ; => #f\n(= \"abc\" \"abc\")     ; => #t   (structural)\n(= '(1 2) '(1 2))   ; => #t   (recurses into the list)\n\n(eq? 1 1.0)         ; => #f   (no numeric coercion)"
       ],
-      "body": "Equality. For numbers this is numeric equality (so `(= 1 1.0)` is `#t`); for\nnon-numbers it falls back to structural equality. Unlike `<` / `>`, comparing\nnon-numbers does not error — it reports whether the values are equal.\n\n```sema\n(= 1 1)           ; => #t\n(= 1 1.0)         ; => #t\n(= 1 2)           ; => #f\n(= \"abc\" \"abc\")   ; => #t   (structural, not an error)\n(= 1 \"a\")         ; => #f\n```",
+      "body": "Equality. For numbers this is **numeric** equality, so `(= 1 1.0)` is `#t`\neven though the int and float differ in representation. For non-numbers it falls\nback to **structural** equality (recursing into lists, maps, vectors).\n\n`=` never errors on type mismatches — it just answers `#f` (or `#t`). That makes\nit the safe general-purpose equality. Contrast with `eq?`, which is stricter\nidentity/value equality: `(eq? 1 1.0)` is `#f` because the values are not the\nsame kind. Reach for `=` when comparing numbers or whole data structures; reach\nfor `eq?` when you want \"is this the exact same value\" (no int/float coercion).\n\n```sema\n(= 1 1)             ; => #t\n(= 1 1.0)           ; => #t   (numeric: int = float)\n(= 1 2)             ; => #f\n(= \"abc\" \"abc\")     ; => #t   (structural)\n(= '(1 2) '(1 2))   ; => #t   (recurses into the list)\n\n(eq? 1 1.0)         ; => #f   (no numeric coercion)\n```\n\nSee also: `eq?` (value identity), `<` / `>` (ordering — these *do* error on mixed\nor unorderable types, where `=` does not).",
       "syntax": "(= a b ...)"
     },
     {
@@ -6609,7 +6500,7 @@
       "name": "even?",
       "module": "predicates",
       "section": "Numeric Predicates",
-      "summary": "Test if an integer is even. Requires an integer — passing a float raises a type error.",
+      "summary": "Test if an integer is even. Requires an integer — passing a float raises a type error. See `odd?` for the complement.",
       "params": [
         {
           "name": "n",
@@ -6620,7 +6511,7 @@
       "examples": [
         "(even? 4)    ; => #t\n(even? 3)    ; => #f\n(even? -2)   ; => #t   (sign doesn't matter)\n(even? 0)    ; => #t"
       ],
-      "body": "Test if an integer is even. Requires an integer — passing a float raises a type error.\n\n```sema\n(even? 4)    ; => #t\n(even? 3)    ; => #f\n(even? -2)   ; => #t   (sign doesn't matter)\n(even? 0)    ; => #t\n```"
+      "body": "Test if an integer is even. Requires an integer — passing a float raises a type error. See `odd?` for the complement.\n\n```sema\n(even? 4)    ; => #t\n(even? 3)    ; => #f\n(even? -2)   ; => #t   (sign doesn't matter)\n(even? 0)    ; => #t\n```"
     },
     {
       "name": "float?",
@@ -6980,9 +6871,9 @@
       ],
       "returns": "bool",
       "examples": [
-        "(vector? [1])   ; => #t\n(vector? '(1))  ; => #f"
+        "(vector? [1 2 3])   ; => #t\n(vector? '(1 2 3))  ; => #f\n(vector? 42)        ; => #f"
       ],
-      "body": "Test if a value is a vector.\n\n```sema\n(vector? [1])   ; => #t\n(vector? '(1))  ; => #f\n```"
+      "body": "Test if a value is a vector.\n\n```sema\n(vector? [1 2 3])   ; => #t\n(vector? '(1 2 3))  ; => #f\n(vector? 42)        ; => #f\n```"
     },
     {
       "name": "zero?",
@@ -7118,16 +7009,6 @@
       ],
       "body": "Define a new record type, generating a constructor, predicate, and one accessor per field.\n\n```sema\n(define-record-type point\n  (make-point x y)       ; constructor (positional args)\n  point?                  ; predicate\n  (x point-x)            ; (field-name accessor-name)\n  (y point-y))\n```\n\nEach of the three generated names is a normal binding you can call:\n\n```sema\n(define-record-type point\n  (make-point x y) point?\n  (x point-x) (y point-y))\n\n(define p (make-point 3 4))\n(point-x p)      ; => 3\n(point? p)       ; => #t\n(point? 42)      ; => #f\n(type p)         ; => :point\n```\n\nRecords are **immutable** — there are no generated field setters, so \"updating\" means constructing a new record (`(make-point (point-x p) 10)`). Unlike a plain map, the predicate gives you a real nominal type: two records with the same fields but different type names are distinguishable, and `point?` only answers `#t` for points.\n\nGeneral syntax:\n\n```sema\n(define-record-type <type-name>\n  (<constructor> <field-name> ...)\n  <predicate>\n  (<field-name> <accessor>) ...)\n```",
       "syntax": "(define-record-type type (constructor field ...) predicate (field accessor) ...)"
-    },
-    {
-      "name": "record?",
-      "module": "records",
-      "section": "Introspection",
-      "summary": "Test if a value is any record instance (of any record type).",
-      "examples": [
-        "(record? (make-point 3 4))   ; => #t\n(record? {:x 3 :y 4})        ; => #f\n(record? 42)                 ; => #f"
-      ],
-      "body": "Test if a value is any record instance (of any record type).\n\n```sema\n(record? (make-point 3 4))   ; => #t\n(record? {:x 3 :y 4})        ; => #f\n(record? 42)                 ; => #f\n```"
     },
     {
       "name": "type",
@@ -9939,11 +9820,11 @@
       "name": "sys/os",
       "module": "system",
       "section": "System Information",
-      "summary": "Return the operating system name.",
+      "summary": "Return the raw operating system name from the Rust target (`std::env::consts::OS`). This is an **open set** — besides `\"macos\"`, `\"linux\"`, and `\"windows\"` it can also report `\"ios\"`, `\"android\"`, `\"freebsd\"`, `\"dragonfly\"`, and others.",
       "examples": [
         "(sys/os)   ; => \"macos\""
       ],
-      "body": "Return the operating system name.\n\n```sema\n(sys/os)   ; => \"macos\"\n```"
+      "body": "Return the raw operating system name from the Rust target (`std::env::consts::OS`).\nThis is an **open set** — besides `\"macos\"`, `\"linux\"`, and `\"windows\"` it can also\nreport `\"ios\"`, `\"android\"`, `\"freebsd\"`, `\"dragonfly\"`, and others.\n\n```sema\n(sys/os)   ; => \"macos\"\n```\n\nUse `sys/platform` instead when you want a **closed, normalized set**\n(`\"macos\"` / `\"linux\"` / `\"windows\"` / `\"unknown\"`) that is safe to `match`/`cond`\non exhaustively."
     },
     {
       "name": "sys/pid",
@@ -9959,11 +9840,11 @@
       "name": "sys/platform",
       "module": "system",
       "section": "System Information",
-      "summary": "Return the platform name.",
+      "summary": "Return a normalized platform name, always one of the **closed set** `\"macos\"`, `\"linux\"`, `\"windows\"`, or `\"unknown\"`. Anything the build doesn't recognize collapses to `\"unknown\"`, so this is safe to branch on exhaustively.",
       "examples": [
         "(sys/platform)   ; => \"macos\" / \"linux\" / \"windows\""
       ],
-      "body": "Return the platform name.\n\n```sema\n(sys/platform)   ; => \"macos\" / \"linux\" / \"windows\"\n```"
+      "body": "Return a normalized platform name, always one of the **closed set**\n`\"macos\"`, `\"linux\"`, `\"windows\"`, or `\"unknown\"`. Anything the build doesn't\nrecognize collapses to `\"unknown\"`, so this is safe to branch on exhaustively.\n\n```sema\n(sys/platform)   ; => \"macos\" / \"linux\" / \"windows\"\n```\n\nFor the raw, open-ended OS name (e.g. `\"ios\"`, `\"android\"`, `\"freebsd\"`), use\n`sys/os`."
     },
     {
       "name": "sys/sema-home",
@@ -10974,45 +10855,6 @@
       "body": "```sema\n(let (([head second & tail] [1 2 3 4 5]))\n  [head second tail])\n; => [1 2 (3 4 5)]\n```\n\nNote: `tail` is a **list**, not a vector."
     },
     {
-      "name": "first",
-      "module": "vectors",
-      "section": "Indexed Access",
-      "summary": "Return the first element of a vector (or list). Returns `nil` for empty vectors.",
-      "params": [
-        {
-          "name": "vec",
-          "type": "vector",
-          "doc": "vector or list; nil if empty"
-        }
-      ],
-      "returns": "any",
-      "examples": [
-        "(first [1 2 3])   ; => 1\n(first [])        ; => nil"
-      ],
-      "body": "Return the first element of a vector (or list). Returns `nil` for empty vectors.\n\n```sema\n(first [1 2 3])   ; => 1\n(first [])        ; => nil\n```"
-    },
-    {
-      "name": "length",
-      "aliases": [
-        "count",
-        "empty?"
-      ],
-      "module": "vectors",
-      "section": "Predicates & Introspection",
-      "summary": "Vectors participate in Sema's generic collection functions:",
-      "params": [
-        {
-          "name": "vec",
-          "type": "vector"
-        }
-      ],
-      "returns": "int",
-      "examples": [
-        "(length [10 20 30])   ; => 3\n(count [10 20 30])    ; => 3\n(empty? [])           ; => #t\n(empty? [1])          ; => #f"
-      ],
-      "body": "Vectors participate in Sema's generic collection functions:\n\n```sema\n(length [10 20 30])   ; => 3\n(count [10 20 30])    ; => 3\n(empty? [])           ; => #t\n(empty? [1])          ; => #f\n```"
-    },
-    {
       "name": "list->vector",
       "module": "vectors",
       "section": "Conversion",
@@ -11021,47 +10863,6 @@
         "(list->vector '(1 2 3))   ; => [1 2 3]\n(list->vector '())         ; => []"
       ],
       "body": "Convert a list to a vector.\n\n```sema\n(list->vector '(1 2 3))   ; => [1 2 3]\n(list->vector '())         ; => []\n```"
-    },
-    {
-      "name": "nth",
-      "module": "vectors",
-      "section": "Indexed Access",
-      "summary": "Return the element at index `n` (zero-based). Works on both lists and vectors.",
-      "params": [
-        {
-          "name": "coll",
-          "type": "any",
-          "doc": "list or vector"
-        },
-        {
-          "name": "n",
-          "type": "int",
-          "doc": "zero-based index"
-        }
-      ],
-      "returns": "any",
-      "examples": [
-        "(nth [10 20 30] 0)    ; => 10\n(nth [10 20 30] 2)    ; => 30",
-        "(nth [10 20 30] 3)\n; => error: index 3 out of bounds (length 3)"
-      ],
-      "body": "Return the element at index `n` (zero-based). Works on both lists and vectors.\n\n```sema\n(nth [10 20 30] 0)    ; => 10\n(nth [10 20 30] 2)    ; => 30\n```\n\nOut of bounds is an error:\n\n```sema\n(nth [10 20 30] 3)\n; => error: index 3 out of bounds (length 3)\n```\n\nUse `first` for safe \"index 0\" access — it returns `nil` on empty sequences."
-    },
-    {
-      "name": "rest",
-      "module": "vectors",
-      "section": "Indexed Access",
-      "summary": "Return everything after the first element. **Preserves type** — vector in, vector out.",
-      "params": [
-        {
-          "name": "vec",
-          "type": "vector"
-        }
-      ],
-      "returns": "vector",
-      "examples": [
-        "(rest [1 2 3])    ; => [2 3]\n(rest [])         ; => []\n(rest [1])        ; => []"
-      ],
-      "body": "Return everything after the first element. **Preserves type** — vector in, vector out.\n\n```sema\n(rest [1 2 3])    ; => [2 3]\n(rest [])         ; => []\n(rest [1])        ; => []\n```"
     },
     {
       "name": "vector",
@@ -11160,23 +10961,6 @@
         ";; (3.0 4.0) has magnitude 5, so it normalizes to (0.6 0.8)\n(embedding/->list (vector/normalize (embedding/list->embedding '(3.0 4.0))))\n; => (0.6 0.8)"
       ],
       "body": "Return a unit-length copy of an embedding vector (each component divided by the vector's magnitude). The argument is a bytevector of packed little-endian f64 values (as produced by `embedding/list->embedding`), non-empty with a length that is a multiple of 8 bytes. A zero vector is returned unchanged (all zeros).\n\n```sema\n;; (3.0 4.0) has magnitude 5, so it normalizes to (0.6 0.8)\n(embedding/->list (vector/normalize (embedding/list->embedding '(3.0 4.0))))\n; => (0.6 0.8)\n```"
-    },
-    {
-      "name": "vector?",
-      "module": "vectors",
-      "section": "Predicates & Introspection",
-      "summary": "Test whether a value is a vector.",
-      "params": [
-        {
-          "name": "x",
-          "type": "any"
-        }
-      ],
-      "returns": "bool",
-      "examples": [
-        "(vector? [1 2 3])          ; => #t\n(vector? '(1 2 3))         ; => #f\n(vector? 42)               ; => #f"
-      ],
-      "body": "Test whether a value is a vector.\n\n```sema\n(vector? [1 2 3])          ; => #t\n(vector? '(1 2 3))         ; => #f\n(vector? 42)               ; => #f\n```"
     },
     {
       "name": ":static",

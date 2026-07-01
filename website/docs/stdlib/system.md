@@ -57,7 +57,10 @@ Return the current working directory.
 
 ### `sys/platform`
 
-Return the platform name.
+Return a normalized platform name — always one of the closed set `"macos"`,
+`"linux"`, `"windows"`, or `"unknown"`. Anything unrecognized collapses to
+`"unknown"`, so it is safe to branch on exhaustively. For the raw, open-ended OS
+name, use `sys/os`.
 
 ```sema
 (sys/platform)   ; => "macos" / "linux" / "windows"
@@ -65,7 +68,10 @@ Return the platform name.
 
 ### `sys/os`
 
-Return the operating system name.
+Return the raw operating system name from the Rust target
+(`std::env::consts::OS`). This is an open set — besides `"macos"`, `"linux"`, and
+`"windows"` it can also report `"ios"`, `"android"`, `"freebsd"`, and others. Use
+`sys/platform` when you want a normalized, closed set.
 
 ```sema
 (sys/os)   ; => "macos"

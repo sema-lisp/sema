@@ -1,5 +1,29 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- **`str` is now a real alias of `string-append`.** The two builtins had
+  byte-identical but separately copy-pasted implementations; `str` is now
+  registered as an alias of `string-append` (matching how `string/append`
+  already works). Behavior is unchanged — `str`, `string-append`, and
+  `string/append` remain interchangeable.
+
+### Docs and Website
+
+- **Consolidated duplicate builtin doc entries.** Thirteen builtins
+  (`odd?`, `even?`, `zero?`, `positive?`, `negative?`, `=`, `vector?`,
+  `record?`, `first`, `rest`, `nth`, `length`, `assoc`) each had two doc files
+  filed under different modules. Because LSP hover and REPL apropos index by
+  name, only one of each pair was ever surfaced while the other silently drifted;
+  each is now a single entry with the richer content merged in. The merged
+  `assoc` entry documents both its map-update and association-list forms.
+- **Clarified `sys/os` vs `sys/platform`.** Docs (builtin index and website)
+  now explain that `sys/os` returns the raw, open-ended OS name
+  (`"ios"`/`"android"`/`"freebsd"`/…) while `sys/platform` normalizes to the
+  closed set `"macos"`/`"linux"`/`"windows"`/`"unknown"`.
+
 ## 1.28.1
 
 ### Fixed

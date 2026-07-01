@@ -292,19 +292,6 @@ pub fn register(env: &sema_core::Env) {
         Ok(Value::string(&kw))
     });
 
-    register_fn(env, "str", |args| {
-        use std::fmt::Write;
-        let mut result = String::new();
-        for arg in args {
-            if let Some(s) = arg.as_str() {
-                result.push_str(s);
-            } else {
-                write!(&mut result, "{}", arg).unwrap();
-            }
-        }
-        Ok(Value::string(&result))
-    });
-
     register_fn(env, "number->string", |args| {
         check_arity!(args, "number->string", 1);
         match args[0].view() {
@@ -1274,7 +1261,9 @@ pub fn register(env: &sema_core::Env) {
 
     // module/function aliases for legacy Scheme names
     if let Some(v) = env.get(sema_core::intern("string-append")) {
-        env.set(sema_core::intern("string/append"), v);
+        env.set(sema_core::intern("string/append"), v.clone());
+        // `str` is Clojure-style stringify; identical to string-append today.
+        env.set(sema_core::intern("str"), v);
     }
     if let Some(v) = env.get(sema_core::intern("string-length")) {
         env.set(sema_core::intern("string/length"), v);

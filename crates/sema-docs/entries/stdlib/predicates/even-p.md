@@ -6,7 +6,7 @@ params: [{ name: n, type: int }]
 returns: "bool"
 ---
 
-Test if an integer is even. Requires an integer — passing a float raises a type error.
+Test if an integer is even. Requires an integer — passing a float raises a type error. See `odd?` for the complement.
 
 ```sema
 (even? 4)    ; => #t

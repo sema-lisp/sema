@@ -20,3 +20,22 @@ Accepts any number of trailing key/value pairs, applied left to right. `assoc` o
   (assoc m :b 2)
   m)                         ; => {:a 1}
 ```
+
+## Association-list form
+
+Called as `(assoc key alist)` — two arguments where the second is a list — `assoc`
+instead does a classic Scheme association-list lookup: it scans a list of
+`(key value)` pairs using `equal?` (structural) comparison and returns the **whole
+matching pair** (reach for the value with `cadr`), or `#f` when no key matches.
+
+```sema
+(define alist '(("a" 1) ("b" 2) ("c" 3)))
+(assoc "b" alist)         ; => ("b" 2)
+(assoc "z" alist)         ; => #f
+(cadr (assoc "b" alist))  ; => 2   (get the value, not the pair)
+```
+
+Because `#f` doubles as "not found", check membership before destructuring an
+unknown key. For larger or mutable lookups, a hash map (`{...}` / `get`) is faster
+than scanning an alist. See also `assq`/`assv` (other comparison flavors — in Sema
+all three compare by value).

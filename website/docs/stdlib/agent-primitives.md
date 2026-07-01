@@ -34,6 +34,44 @@ Also: `term/clear-line`, `term/clear-below`, `term/cursor-home`,
 `term/save-cursor`, `term/restore-cursor`, `term/enable-mouse`,
 `term/disable-mouse`, `term/bell`, `term/flush`.
 
+### Setup guards
+
+Setting up a TUI leaves the terminal in a fragile state — if your program exits
+(or crashes) without restoring, the shell is left in raw mode, the alt screen, or
+with mouse reporting spewing escape codes. Guard macros **always** restore on
+exit, even if the body throws:
+
+```sema
+(io/with-raw-mode                 ; restores cooked mode
+  (term/with-alt-screen           ; restores the screen + cursor
+    (term/with-mouse              ; disables mouse reporting
+      (run-tui))))               ; terminal is fully restored however this exits
+```
+
+Compose them outermost-restores-last. Each returns the body's value.
+
+### Rich keyboard & mouse input
+
+`io/read-key` / `io/read-key-timeout` return a key map (`{:kind :char/:ctrl/:alt/:key …}`).
+After `term/enable-mouse`, mouse reports decode to
+`{:kind :mouse :action :press/:release/:move/:wheel-up/:wheel-down :x :y :button :mods}`.
+After `term/enable-kitty-keys!` (opt-in; `term/disable-kitty-keys!` to restore),
+keys gain reliable modifier reporting as an optional `:mods` list
+(e.g. Shift+A → `{:kind :char :char "A" :mods (:shift)}`) — decoded to the same
+shapes as before, so existing code is unaffected. Both are opt-in and backward
+compatible.
+
+### Display-aware text
+
+Terminal layout needs *display columns*, not character counts (a CJK glyph is two
+columns, ANSI escapes are zero). `string/width` gives the rendered width and
+`string/word-wrap` wraps text to a column budget — both wide-char and ANSI aware.
+
+```sema
+(string/width "日本語")                 ; => 6   (string-length is 3)
+(string/word-wrap "the quick brown fox" 10)  ; => ("the quick" "brown fox")
+```
+
 ## Streaming processes
 
 Unlike `shell` (which blocks and returns output only after exit), `proc/*` hands

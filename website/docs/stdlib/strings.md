@@ -180,6 +180,31 @@ Pad a string on the right to a given width.
 (string/pad-right "42" 5 "0")   ; => "42000"
 ```
 
+### `string/width`
+
+Terminal **display width** in columns (not character count): wide characters
+(CJK, most emoji) count as 2, combining marks as 0, and ANSI escape sequences as
+0. Use it for terminal layout, padding, and alignment, where `string-length` is
+wrong for non-ASCII or styled text.
+
+```sema
+(string/width "hello")   ; => 5
+(string/width "日本語")   ; => 6   (string-length is 3)
+(string/width "👋")       ; => 2
+```
+
+### `string/word-wrap`
+
+Word-wrap text to a list of lines of at most N display columns. Wraps on spaces,
+hard-breaks over-long words on grapheme boundaries, preserves newlines, and
+measures with `string/width` (correct for non-ASCII). Distinct from `string/wrap`,
+which wraps a string in delimiters.
+
+```sema
+(string/word-wrap "the quick brown fox" 10)   ; => ("the quick" "brown fox")
+(string/word-wrap "日本語 の テスト" 8)         ; => ("日本語" "の テスト")
+```
+
 ### `string/number?`
 
 Test if a string represents a valid number.

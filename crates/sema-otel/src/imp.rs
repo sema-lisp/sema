@@ -25,7 +25,10 @@ static ENABLED: AtomicBool = AtomicBool::new(false);
 /// Set true once a meter provider is installed (OTLP-only — the JSONL file sink is
 /// trace-only). When false, metric recording is skipped.
 static METRICS_ENABLED: AtomicBool = AtomicBool::new(false);
-static INIT_ONCE: Once = Once::new();
+/// Set true once a provider is actually installed (by `init_from_env` or `configure`).
+/// A no-op init (nothing configured) leaves it `false`, so a later programmatic
+/// `otel/configure` can still install exactly one provider per process.
+static PROVIDER_INSTALLED: AtomicBool = AtomicBool::new(false);
 
 // GenAI metric histogram bucket boundaries (spec §2).
 const TOKEN_BUCKETS: &[f64] = &[
@@ -420,30 +423,130 @@ impl Drop for OtelGuard {
 /// Install a provider from the environment and return a guard, or `None` if no sink
 /// is configured (true zero-cost no-op) or init fails (degrade silently — never
 /// panic on the OTel path). This is the ONLY function that calls
-/// `global::set_tracer_provider` (Decision #14). Idempotent via `Once`.
+/// `global::set_tracer_provider` (Decision #14). Reads the §4.1 env table; the
+/// programmatic path (`configure`) writes that same env before calling in.
 pub fn init_from_env() -> Option<OtelGuard> {
-    let mut guard = None;
-    INIT_ONCE.call_once(|| {
-        let provider = build_provider();
-        let meter = build_meter_provider();
-        if provider.is_none() && meter.is_none() {
-            return; // nothing configured — zero-cost no-op
+    install_provider()
+}
+
+/// Build + install the tracer/meter providers from the current env, guarded so at most
+/// one provider is installed per process. A no-op call (nothing configured) does NOT
+/// consume the guard, so the CLI's startup `init_from_env` can be a no-op yet still
+/// leave a later `otel/configure` free to install. Shared by `init_from_env` +
+/// `configure`.
+fn install_provider() -> Option<OtelGuard> {
+    // Already installed (by a prior env init or configure)? The global provider can only
+    // be set once, so bail without touching it.
+    if PROVIDER_INSTALLED.load(Ordering::SeqCst) {
+        return None;
+    }
+    let provider = build_provider();
+    let meter = build_meter_provider();
+    if provider.is_none() && meter.is_none() {
+        return None; // nothing configured — zero-cost no-op, guard left unset
+    }
+    // Claim the single install slot. A racing second caller sees `true` and bails.
+    if PROVIDER_INSTALLED.swap(true, Ordering::SeqCst) {
+        return None;
+    }
+    if let Some(p) = &provider {
+        global::set_tracer_provider(p.clone());
+        ENABLED.store(true, Ordering::Relaxed);
+    }
+    if let Some(m) = &meter {
+        global::set_meter_provider(m.clone());
+        ENABLED.store(true, Ordering::Relaxed);
+        METRICS_ENABLED.store(true, Ordering::Relaxed);
+    }
+    // Register for flush-at-exit (Drop + atexit, take-once) so spans survive both
+    // normal return AND std::process::exit.
+    register_shutdown(provider, meter);
+    Some(OtelGuard { _private: () })
+}
+
+/// Programmatic OTel configuration produced by `otel/configure`, so a Sema script can
+/// point itself at a backend without any environment variables. Each field mirrors the
+/// env var of the same role (`endpoint` → `OTEL_EXPORTER_OTLP_ENDPOINT`, etc.);
+/// `configure` writes them into the process env and then runs the ordinary env-driven
+/// install path, so the exporter build + every hot-path reader (service name, release,
+/// content capture) pick them up unchanged. Keeps `sema-otel`'s public surface free of
+/// `opentelemetry` types.
+#[derive(Debug, Clone, Default)]
+pub struct OtelConfig {
+    /// `OTEL_EXPORTER_OTLP_ENDPOINT` — the backend address; setting it turns tracing on.
+    pub endpoint: Option<String>,
+    /// `SEMA_OTEL_FILE` — write JSONL spans to this path instead of the network.
+    pub file: Option<String>,
+    /// `OTEL_EXPORTER_OTLP_PROTOCOL` — `http/protobuf` (default) · `http/json` · `grpc`.
+    pub protocol: Option<String>,
+    /// `OTEL_EXPORTER_OTLP_HEADERS` — already formatted as comma-separated `name=value`
+    /// pairs (auth etc.). The builtin joins a header map / `:key` shorthand into this.
+    pub headers: Option<String>,
+    /// `OTEL_SERVICE_NAME` — the name runs appear under in the backend.
+    pub service_name: Option<String>,
+    /// `SEMA_OTEL_ENVIRONMENT` — deployment env label (`prod`, `staging`, …).
+    pub environment: Option<String>,
+    /// `SEMA_OTEL_RELEASE` — release/version stamp.
+    pub release: Option<String>,
+    /// `SEMA_OTEL_CAPTURE_CONTENT` — record prompt/response text (off by default).
+    pub capture_content: Option<bool>,
+}
+
+impl OtelConfig {
+    /// Write each set field into the process environment so the env-driven build path and
+    /// the hot-path readers observe it. Called just before install, before any exporter is
+    /// built, on the (single-threaded) VM thread.
+    fn apply_to_env(&self) {
+        fn set(key: &str, val: &Option<String>) {
+            if let Some(v) = val.as_deref().filter(|s| !s.is_empty()) {
+                // SAFETY: called on the single VM thread before any exporter/reader runs.
+                unsafe { std::env::set_var(key, v) };
+            }
         }
-        if let Some(p) = &provider {
-            global::set_tracer_provider(p.clone());
-            ENABLED.store(true, Ordering::Relaxed);
+        set("OTEL_EXPORTER_OTLP_ENDPOINT", &self.endpoint);
+        set("SEMA_OTEL_FILE", &self.file);
+        set("OTEL_EXPORTER_OTLP_PROTOCOL", &self.protocol);
+        set("OTEL_EXPORTER_OTLP_HEADERS", &self.headers);
+        set("OTEL_SERVICE_NAME", &self.service_name);
+        set("SEMA_OTEL_ENVIRONMENT", &self.environment);
+        set("SEMA_OTEL_RELEASE", &self.release);
+        if let Some(c) = self.capture_content {
+            // SAFETY: as above.
+            unsafe {
+                std::env::set_var(
+                    "SEMA_OTEL_CAPTURE_CONTENT",
+                    if c { "true" } else { "false" },
+                )
+            };
         }
-        if let Some(m) = &meter {
-            global::set_meter_provider(m.clone());
-            ENABLED.store(true, Ordering::Relaxed);
-            METRICS_ENABLED.store(true, Ordering::Relaxed);
+    }
+}
+
+/// The guard for a `configure`-installed provider, held for the process so its `Drop`
+/// (which flushes + shuts down) does NOT fire mid-run. Flush-at-exit is still covered by
+/// the `atexit` hook registered in `install_provider`.
+static CONFIGURED_GUARD: std::sync::Mutex<Option<OtelGuard>> = std::sync::Mutex::new(None);
+
+/// Configure + install telemetry from Sema code (`otel/configure`). Applies `cfg` to the
+/// environment, then runs the ordinary install path. Returns `true` when a provider was
+/// installed by this call, `false` when nothing was configured or one was already
+/// installed (by env at startup or an earlier `configure`) — programmatic config can
+/// only win if the environment didn't already set telemetry up. Never panics.
+pub fn configure(cfg: &OtelConfig) -> bool {
+    cfg.apply_to_env();
+    match install_provider() {
+        Some(guard) => {
+            // Retain the guard for the process; dropping it now would flush + tear the
+            // provider down immediately. `atexit` still flushes on exit.
+            if let Ok(mut slot) = CONFIGURED_GUARD.lock() {
+                *slot = Some(guard);
+            } else {
+                std::mem::forget(guard);
+            }
+            true
         }
-        // Register for flush-at-exit (Drop + atexit, take-once) so spans survive both
-        // normal return AND std::process::exit.
-        register_shutdown(provider, meter);
-        guard = Some(OtelGuard { _private: () });
-    });
-    guard
+        None => false,
+    }
 }
 
 /// Embedded mode: emit against whatever provider the host already installed in

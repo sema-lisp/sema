@@ -84,7 +84,8 @@ losing state. Budget caps, parallel/pipeline fan-out, and a live web viewer.
 Built-in, standards-compliant OpenTelemetry tracing + metrics for **every** LLM and
 agent run — no manual instrumentation. Each completion and tool call is auto-traced
 (`invoke_agent → chat → execute_tool`) with tokens, cost, and latency, exportable to
-any OTLP backend or a JSONL file. Off by default, zero-cost when off.
+any OTLP backend or a JSONL file — turned on with one environment variable or an
+`otel/configure` call. Off by default, zero-cost when off.
 
 - **[Tracing & Metrics](./observability.md)** — the GenAI spans and metrics, sessions,
   privacy controls, and embedding Sema in your own app.

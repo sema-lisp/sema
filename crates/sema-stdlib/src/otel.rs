@@ -250,4 +250,72 @@ pub fn register(env: &Env) {
         sema_otel::add_event(name, attrs);
         Ok(Value::nil())
     });
+
+    // (otel/configure {:endpoint "..." :key "..." ...}) — point Sema at a tracing backend
+    // from code instead of environment variables. Installs a provider on the first call;
+    // returns true if telemetry was turned on by this call, false if nothing was
+    // configured or telemetry was already active (env at startup / an earlier configure).
+    //
+    // Keys: :endpoint (OTLP url) · :file (JSONL path) · :protocol (http/protobuf|http/json|
+    // grpc) · :key (API key → `Authorization: Bearer <key>`) · :headers (a map of extra
+    // headers, or a pre-formatted "name=value,..." string) · :service-name · :environment ·
+    // :release · :capture-content (bool). Setting :endpoint or :file turns tracing on.
+    crate::register_fn(env, "otel/configure", |args| {
+        if args.len() != 1 {
+            return Err(SemaError::arity("otel/configure", "1", args.len()));
+        }
+        if args[0].as_map_rc().is_none() {
+            return Err(SemaError::type_error("map", args[0].type_name()));
+        }
+        let mut cfg = sema_otel::OtelConfig::default();
+        // Header pairs accumulate from :key and a :headers map; a :headers string is kept
+        // verbatim. All are joined into the comma-separated OTLP header format at the end.
+        let mut header_pairs: Vec<(String, String)> = Vec::new();
+        let mut header_str: Option<String> = None;
+
+        for (k, val) in map_entries(&args[0]) {
+            match k.as_str() {
+                "endpoint" => cfg.endpoint = as_name(&val),
+                "file" => cfg.file = val.as_str().map(|s| s.to_string()),
+                "protocol" => cfg.protocol = as_name(&val),
+                "service-name" | "service" => cfg.service_name = as_name(&val),
+                "environment" | "env" => cfg.environment = as_name(&val),
+                "release" => cfg.release = as_name(&val),
+                "capture-content" => cfg.capture_content = Some(val.as_bool().unwrap_or(false)),
+                // Shorthand: an API key becomes a Bearer auth header.
+                "key" => {
+                    if let Some(s) = val.as_str() {
+                        header_pairs.push(("Authorization".to_string(), format!("Bearer {s}")));
+                    }
+                }
+                "headers" => {
+                    if let Some(s) = val.as_str() {
+                        header_str = Some(s.to_string());
+                    } else {
+                        for (hk, hv) in map_entries(&val) {
+                            let hvs = hv
+                                .as_str()
+                                .map(|s| s.to_string())
+                                .unwrap_or_else(|| hv.to_string());
+                            header_pairs.push((hk, hvs));
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let mut parts: Vec<String> = header_pairs
+            .into_iter()
+            .map(|(n, v)| format!("{n}={v}"))
+            .collect();
+        if let Some(s) = header_str {
+            parts.push(s);
+        }
+        if !parts.is_empty() {
+            cfg.headers = Some(parts.join(","));
+        }
+
+        Ok(Value::bool(sema_otel::configure(&cfg)))
+    });
 }

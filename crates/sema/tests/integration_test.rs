@@ -4704,6 +4704,51 @@ fn sema_cmd() -> std::process::Command {
     std::process::Command::new(env!("CARGO_BIN_EXE_sema"))
 }
 
+/// End-to-end: `otel/configure` from Sema code (no env vars) turns tracing on and a
+/// user span is written to the configured JSONL file. Runs in a fresh subprocess so the
+/// global-provider guard is clean.
+#[test]
+fn test_otel_configure_from_sema_writes_spans() {
+    let path = std::env::temp_dir().join(format!(
+        "sema-otel-configure-e2e-{}.jsonl",
+        std::process::id()
+    ));
+    let path_str = path.to_str().unwrap().to_string();
+    let _ = std::fs::remove_file(&path);
+
+    let script = format!(
+        r#"(let ((on (otel/configure {{:file "{}" :service-name "e2e"}})))
+             (otel/span "from-sema" (fn () 42))
+             (println on))"#,
+        path_str.replace('\\', "\\\\")
+    );
+
+    let output = sema_cmd()
+        .env_remove("SEMA_OTEL_FILE")
+        .env_remove("OTEL_EXPORTER_OTLP_ENDPOINT")
+        .args(["-e", &script])
+        .output()
+        .expect("failed to run sema");
+
+    assert!(
+        output.status.success(),
+        "sema exited non-zero: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("#t"),
+        "otel/configure should return true when it installs a provider, got: {stdout}"
+    );
+
+    let contents = std::fs::read_to_string(&path).expect("jsonl trace file should exist");
+    let _ = std::fs::remove_file(&path);
+    assert!(
+        contents.contains("\"from-sema\""),
+        "expected the user span in the trace file, got:\n{contents}"
+    );
+}
+
 #[test]
 fn test_cli_provider_flag_sets_default_provider() {
     let output = sema_cmd()

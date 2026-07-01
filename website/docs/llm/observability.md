@@ -7,8 +7,9 @@ outline: [2, 3]
 Sema can record what happens inside every LLM and agent run — each model call, tool
 execution, retry, and notebook cell — as [OpenTelemetry](https://opentelemetry.io/)
 traces and metrics, and send them to a tool where you can browse them. You don't write
-any instrumentation: switch it on with one environment variable and `llm/complete`,
-`agent/run`, `llm/embed`, and the rest are recorded automatically.
+any instrumentation: switch it on with one environment variable — or one
+[`otel/configure`](#configuring-from-sema-code) call — and `llm/complete`, `agent/run`,
+`llm/embed`, and the rest are recorded automatically.
 
 If OpenTelemetry is new to you, the terms used below:
 
@@ -32,9 +33,10 @@ or crash your script: telemetry is sent in the background, out of the way of you
 
 ## How to turn it on
 
-Sema reads its tracing settings from **environment variables** — values you set in your
-shell. You can set them inline for a single command, or `export` them for the whole
-session:
+The usual way is **environment variables** — values you set in your shell. (To turn
+tracing on from inside a script instead, see
+[Configuring from Sema code](#configuring-from-sema-code) below.) You can set them inline
+for a single command, or `export` them for the whole session:
 
 ```bash
 # Inline — applies to this one run only:
@@ -52,6 +54,54 @@ Two variables decide *where* the data goes, and **setting either one turns traci
 
 Set neither and tracing stays off. The full list of variables is in
 [Configuration reference](#configuration-reference) below.
+
+### Configuring from Sema code
+
+Environment variables aren't the only way. `otel/configure` turns tracing on from inside
+a script, so a program can point itself at a backend without any shell setup:
+
+```sema
+;; Hosted backend with an API key — :key becomes an Authorization: Bearer header.
+(otel/configure {:endpoint "https://cloud.langfuse.com/api/public/otel"
+                 :key "sk_prod_123"
+                 :service-name "my-agent"})
+
+(llm/complete "say hi" {:max-tokens 16})   ; recorded against that backend
+```
+
+Call it once, early — before any `llm/*` or `agent/*` work. It installs a provider on
+the first call and returns `#t` when this call turned tracing on, or `#f` when nothing was
+configured or telemetry was already active (from the environment at startup, or an earlier
+`otel/configure`). One provider is installed per process, so environment configuration —
+if present — wins, and a later `otel/configure` is a no-op.
+
+The config map accepts:
+
+| Key | Maps to | What it does |
+| --- | --- | --- |
+| `:endpoint` | `OTEL_EXPORTER_OTLP_ENDPOINT` | Backend address. **Setting it turns tracing on.** |
+| `:file` | `SEMA_OTEL_FILE` | Write JSONL spans to a path instead of the network. Also turns tracing on. |
+| `:protocol` | `OTEL_EXPORTER_OTLP_PROTOCOL` | `"http/protobuf"` (default) · `"http/json"` · `"grpc"`. |
+| `:key` | `OTEL_EXPORTER_OTLP_HEADERS` | An API key, sent as `Authorization: Bearer <key>`. |
+| `:headers` | `OTEL_EXPORTER_OTLP_HEADERS` | Extra headers — a map (`{:x-project "app"}`) or a pre-formatted `"name=value,..."` string. |
+| `:service-name` | `OTEL_SERVICE_NAME` | The name runs appear under. |
+| `:environment` | `SEMA_OTEL_ENVIRONMENT` | Deployment label (`prod`, `staging`, …). |
+| `:release` | `SEMA_OTEL_RELEASE` | Release/version stamp. |
+| `:capture-content` | `SEMA_OTEL_CAPTURE_CONTENT` | `#t` to record prompt/response text (off by default — see [Privacy](#privacy)). |
+
+Each key maps to the environment variable of the same role, so a script that configures
+itself behaves exactly like one driven by the environment. Extra headers as a map:
+
+```sema
+(otel/configure {:endpoint "https://otlp.example.com"
+                 :headers {:x-project "checkout" :x-tenant "acme"}})
+```
+
+Or capture to a local file with no backend at all:
+
+```sema
+(otel/configure {:file "/tmp/sema-trace.jsonl"})
+```
 
 ## Quick start: see a trace in one minute
 
@@ -83,8 +133,9 @@ cost, and finish reason.
 ## Configuration reference
 
 Every setting is an environment variable (see [How to turn it on](#how-to-turn-it-on)
-for how to set them). The `OTEL_*` names come from OpenTelemetry itself; the
-`SEMA_OTEL_*` names are Sema conveniences.
+for how to set them) — or the matching `otel/configure` key (see
+[Configuring from Sema code](#configuring-from-sema-code)). The `OTEL_*` names come from
+OpenTelemetry itself; the `SEMA_OTEL_*` names are Sema conveniences.
 
 | Variable | What it does |
 | --- | --- |

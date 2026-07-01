@@ -19,6 +19,25 @@ pub fn init_from_env() -> Option<OtelGuard> {
 /// No-op on wasm.
 pub fn use_host_global() {}
 
+/// Programmatic OTel config (`otel/configure`). Mirrors the native struct so the stdlib
+/// builtin compiles for wasm; every field is inert here.
+#[derive(Debug, Clone, Default)]
+pub struct OtelConfig {
+    pub endpoint: Option<String>,
+    pub file: Option<String>,
+    pub protocol: Option<String>,
+    pub headers: Option<String>,
+    pub service_name: Option<String>,
+    pub environment: Option<String>,
+    pub release: Option<String>,
+    pub capture_content: Option<bool>,
+}
+
+/// Always `false` on wasm — there is nothing to install.
+pub fn configure(_cfg: &OtelConfig) -> bool {
+    false
+}
+
 /// Backend compat is native-only; always inactive on wasm.
 pub fn compat_active() -> bool {
     false

@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+### Added
+
+- **`otel/configure` — turn on tracing from Sema code.** Telemetry no longer
+  needs environment variables: `(otel/configure {:endpoint "..." :key "sk_..."})`
+  points Sema at an OTLP backend (or a JSONL file via `:file`) from inside a
+  script. `:key` becomes an `Authorization: Bearer` header; `:headers` takes a
+  map or a pre-formatted string; `:service-name`, `:environment`, `:release`, and
+  `:capture-content` mirror their env vars. Installs one provider per process and
+  returns `#t` when it turned tracing on (env config, if present, still wins).
+  See the [Observability guide](https://sema-lang.com/docs/llm/observability#configuring-from-sema-code).
+
 ### Fixed
 
 - **`str` is now a real alias of `string-append`.** The two builtins had

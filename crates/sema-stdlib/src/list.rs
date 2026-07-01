@@ -2,6 +2,25 @@ use sema_core::{check_arity, SemaError, Value, ValueViewRef};
 
 use crate::register_fn;
 
+/// Sort category of a value for the comparator-free `sort`. Ints and floats
+/// share the `Number` family (they must compare by numeric value, not by tag);
+/// every other type is only comparable to its own kind. `sort` refuses to order
+/// values whose categories differ, because `Value`'s cross-type `Ord` falls back
+/// to an internal tag order that is arbitrary and never what the caller meant.
+#[derive(PartialEq, Eq)]
+enum SortCategory {
+    Number,
+    Other(&'static str),
+}
+
+fn sort_category(v: &Value) -> SortCategory {
+    if v.is_int() || v.is_float() {
+        SortCategory::Number
+    } else {
+        SortCategory::Other(v.type_name())
+    }
+}
+
 fn repeat_impl(args: &[Value]) -> Result<Value, SemaError> {
     check_arity!(args, "list/repeat", 2);
     let n = args[0].as_index("list/repeat")?;
@@ -377,7 +396,33 @@ pub fn register(env: &sema_core::Env) {
         check_arity!(args, "sort", 1..=2);
         let mut items = get_sequence(&args[0], "sort")?.to_vec();
         if args.len() == 1 {
-            items.sort();
+            // Reject heterogeneous input up front: comparing across unrelated
+            // types would silently fall back to `Value`'s arbitrary tag order.
+            // Pass an explicit comparator (`sort-by` / 2-arg `sort`) to order
+            // mixed types deliberately.
+            if let Some(first) = items.first() {
+                let cat = sort_category(first);
+                if let Some(bad) = items.iter().find(|v| sort_category(v) != cat) {
+                    return Err(SemaError::type_error(first.type_name(), bad.type_name())
+                        .with_hint(
+                            "sort orders one type at a time; use `sort-by` or `(sort xs cmp)` \
+                             with a comparator to order mixed types",
+                        ));
+                }
+            }
+            // All-number lists must compare by numeric value: `Value`'s `Ord`
+            // orders every int before every float regardless of magnitude, so
+            // `(sort (list 3 1.5))` would otherwise misorder. Floats use a total
+            // order (NaN last) to keep the sort well-defined.
+            if matches!(items.first().map(sort_category), Some(SortCategory::Number)) {
+                items.sort_by(|a, b| {
+                    let x = a.as_float().unwrap();
+                    let y = b.as_float().unwrap();
+                    x.total_cmp(&y)
+                });
+            } else {
+                items.sort();
+            }
         } else {
             // Sort with comparator
             let mut err = None;

@@ -24,6 +24,8 @@ assert!(eval_err("(int 1.0e19)").to_string().contains("int"));
 
 Verified 2026-06-09: U6 ("did you mean" hints — shipped via `suggest_similar` in sema-core, attached in both backends) and U9 (REPL completeness check — replaced by the lexer-based `SemaValidator` in `crates/sema/src/repl/validator.rs`) were removed because they have since been fixed. Remaining entries re-verified as still open.
 
+Verified 2026-07-01: **N7** (`sort` on heterogeneous types) removed because it is fixed — comparator-free `sort` now raises a type error on mixed types and compares ints/floats numerically (`crates/sema-stdlib/src/list.rs`).
+
 ---
 
 ## VM-1 — Stack traces on runtime errors (error UX) — ✅ RESOLVED
@@ -55,18 +57,6 @@ Verified 2026-06-09: U6 ("did you mean" hints — shipped via `suggest_similar` 
 **Why deferred:** the helper functions return `()` today; restructuring to propagate errors via the existing `oneshot::Sender<ServerResponse>` requires a new `ServerResponse::Error` variant and changes to the axum-side handler. Medium-effort refactor with non-trivial blast radius.
 
 **Workaround today:** users normally build response maps with `http/ok`, `http/file`, etc. — those constructors always produce well-formed maps. The bug only triggers if a user builds a map by hand with the wrong `__*` markers. Low-likelihood in practice.
-
----
-
-## N7 — `sort` accepts heterogeneous types silently
-
-**Today:** `(sort (list 1 "a" {:k 1}))` returns an order based on `Value`'s `Ord` impl (which depends on Spur indices and tag order). Reproducible within a process but not portable, and it's never what the user wanted.
-
-**Proposed fix:** either (a) raise a type error when the input is heterogeneous, or (b) define a stable cross-type total order and document it.
-
-**Why deferred:** design call. Strictness is the safer choice for users but breaks anyone relying on the current behavior; defining a stable order is a long-term spec commitment. Wants an ADR.
-
-**Workaround today:** `(sort-by ...)` with an explicit comparator — works correctly across types because the user provides the comparator.
 
 ---
 

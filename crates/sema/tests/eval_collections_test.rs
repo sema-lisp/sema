@@ -76,6 +76,10 @@ eval_tests! {
     list_foldl_builds_reversed: "(foldl (fn (acc x) (cons x acc)) '() '(1 2 3))" => common::eval("'(3 2 1)"),
     list_foldr: "(foldr cons '() '(1 2 3))" => common::eval("'(1 2 3)"),
     list_sort: "(sort '(3 1 2))" => common::eval("'(1 2 3)"),
+    // Mixed int/float must order by numeric value, not by internal tag (which
+    // would group all ints before all floats and misplace 1.5).
+    list_sort_mixed_numbers: "(sort (list 3 1.5 2))" => common::eval("'(1.5 2 3)"),
+    list_sort_strings: r#"(sort (list "banana" "apple" "cherry"))"# => common::eval(r#"'("apple" "banana" "cherry")"#),
     list_sort_by: "(sort-by (fn (x) (- 0 x)) '(3 1 2))" => common::eval("'(3 2 1)"),
     list_flatten: "(flatten '(1 (2 3) (4 5)))" => common::eval("'(1 2 3 4 5)"),
     list_flatten_deep: "(flatten-deep '(1 (2 3) (4 (5))))" => common::eval("'(1 2 3 4 5)"),
@@ -182,6 +186,10 @@ eval_tests! {
 
 eval_error_tests! {
     chunk_zero: "(list/chunk 0 '(1 2 3))",
+    // Heterogeneous `sort` (no comparator) is a type error rather than a silent,
+    // tag-ordered nonsense result. Numbers are one family; other types aren't.
+    sort_mixed_int_string: r#"(sort (list 3 "a" 1))"#,
+    sort_mixed_number_map: "(sort (list 1 {:k 1}))",
 }
 
 // ============================================================

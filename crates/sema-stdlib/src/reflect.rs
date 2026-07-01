@@ -20,7 +20,10 @@ fn diagnostic(e: &SemaError) -> Value {
     let mut m = BTreeMap::new();
     m.insert(kw("level"), kw("error"));
     m.insert(kw("message"), Value::string(&e.to_string()));
-    let code = match e {
+    // Classify on the ROOT error: a reader error carrying a `.with_hint()` is
+    // wrapped in SemaError::WithContext, so matching `e` directly would miss the
+    // Reader arm and drop the "syntax" code + span. `inner()` unwraps the wrappers.
+    let code = match e.inner() {
         SemaError::Reader { span, .. } => {
             let mut s = BTreeMap::new();
             s.insert(kw("line"), Value::int(span.line as i64));

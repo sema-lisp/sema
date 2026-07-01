@@ -202,7 +202,7 @@ which wraps a string in delimiters.
 
 ```sema
 (string/word-wrap "the quick brown fox" 10)   ; => ("the quick" "brown fox")
-(string/word-wrap "日本語 の テスト" 8)         ; => ("日本語" "の テスト")
+(string/word-wrap "日本語 の テスト" 8)         ; => ("日本語" "の" "テスト")
 ```
 
 ### `string/number?`
@@ -347,7 +347,7 @@ Apply Unicode case folding to a string. Useful for case-insensitive comparisons 
 ```sema
 (string/foldcase "HELLO")        ; => "hello"
 (string/foldcase "Hello World")  ; => "hello world"
-(string/foldcase "Straße")       ; => "straße"
+(string/foldcase "Straße")       ; => "strasse"  (full folding maps ß → ss)
 (string/foldcase "ΩΜΕΓΑ")        ; => "ωμεγα"
 ```
 
@@ -826,10 +826,11 @@ Convert to Title Case headline.
 
 ### `string/words`
 
-Split a string into words (splits on non-alphanumeric boundaries).
+Split an identifier into words. Breaks on `_`, `-`, spaces, and `.`, plus
+camelCase / acronym case transitions. Other punctuation stays attached.
 
 ```sema
 (string/words "hello_world")     ; => ("hello" "world")
-(string/words "helloWorld")      ; => ("hello" "World")
-(string/words "Hello World!")    ; => ("Hello" "World")
+(string/words "helloWorld")      ; => ("hello" "World")   ; case transition
+(string/words "Hello World!")    ; => ("Hello" "World!")  ; "!" is not a boundary
 ```

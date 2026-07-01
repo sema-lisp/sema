@@ -12,6 +12,7 @@ require the `PROCESS` capability (see [System](/docs/stdlib/system)).
 (git/current-branch)
 (git/status)               ; list of {:path :status :staged :untracked}
 (git/changed-files)        ; list of paths
+(git/diff-files)           ; paths with unstaged changes (git diff --name-only)
 (git/diff)                 ; or (git/diff "path") — unified diff
 (git/recent-files 20)      ; files touched by the last N commits
 (git/ignore-matches? "target/x")   ; => #t

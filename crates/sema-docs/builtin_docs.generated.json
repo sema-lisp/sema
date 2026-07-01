@@ -520,29 +520,31 @@
     {
       "name": "string/to-utf8",
       "aliases": [
-        "string->utf8"
+        "string->utf8",
+        "string->bytevector"
       ],
       "module": "bytevectors",
       "section": "String Conversion",
-      "summary": "Encode a string as a UTF-8 bytevector — the raw bytes you'd write to a file or send over the network. ASCII characters map to one byte each; non-ASCII characters take two or more.",
+      "summary": "Encode a string as a UTF-8 bytevector — the raw bytes you'd write to a file or send over the network. ASCII characters map to one byte each; non-ASCII characters take two or more. Also available as `string->bytevector` (a Sema string encodes to its UTF-8 bytes).",
       "examples": [
         "(string/to-utf8 \"hi\")     ; => #u8(104 105)\n(string/to-utf8 \"é\")      ; => #u8(195 169)  (one char, two bytes)",
         "(utf8/to-string (string/to-utf8 \"héllo\"))   ; => \"héllo\""
       ],
-      "body": "Encode a string as a UTF-8 bytevector — the raw bytes you'd write to a file or send over the network. ASCII characters map to one byte each; non-ASCII characters take two or more.\n\n```sema\n(string/to-utf8 \"hi\")     ; => #u8(104 105)\n(string/to-utf8 \"é\")      ; => #u8(195 169)  (one char, two bytes)\n```\n\n`utf8/to-string` is the inverse, so the round-trip is lossless:\n\n```sema\n(utf8/to-string (string/to-utf8 \"héllo\"))   ; => \"héllo\"\n```"
+      "body": "Encode a string as a UTF-8 bytevector — the raw bytes you'd write to a file or send over the network. ASCII characters map to one byte each; non-ASCII characters take two or more. Also available as `string->bytevector` (a Sema string encodes to its UTF-8 bytes).\n\n```sema\n(string/to-utf8 \"hi\")     ; => #u8(104 105)\n(string/to-utf8 \"é\")      ; => #u8(195 169)  (one char, two bytes)\n```\n\n`utf8/to-string` is the inverse, so the round-trip is lossless:\n\n```sema\n(utf8/to-string (string/to-utf8 \"héllo\"))   ; => \"héllo\"\n```"
     },
     {
       "name": "utf8/to-string",
       "aliases": [
-        "utf8->string"
+        "utf8->string",
+        "bytevector->string"
       ],
       "module": "bytevectors",
       "section": "String Conversion",
-      "summary": "Decode a bytevector of UTF-8 bytes back into a string. This is the inverse of `string/to-utf8` — use it to turn bytes read from a file or socket into text.",
+      "summary": "Decode a bytevector of UTF-8 bytes back into a string. This is the inverse of `string/to-utf8` — use it to turn bytes read from a file or socket into text. Also available as `bytevector->string`.",
       "examples": [
         "(utf8/to-string #u8(104 105))       ; => \"hi\"\n(utf8/to-string #u8(195 169))       ; => \"é\"  (two bytes, one char)"
       ],
-      "body": "Decode a bytevector of UTF-8 bytes back into a string. This is the inverse of `string/to-utf8` — use it to turn bytes read from a file or socket into text.\n\n```sema\n(utf8/to-string #u8(104 105))       ; => \"hi\"\n(utf8/to-string #u8(195 169))       ; => \"é\"  (two bytes, one char)\n```"
+      "body": "Decode a bytevector of UTF-8 bytes back into a string. This is the inverse of `string/to-utf8` — use it to turn bytes read from a file or socket into text. Also available as `bytevector->string`.\n\n```sema\n(utf8/to-string #u8(104 105))       ; => \"hi\"\n(utf8/to-string #u8(195 169))       ; => \"é\"  (two bytes, one char)\n```"
     },
     {
       "name": "async/all",
@@ -10268,9 +10270,9 @@
       ],
       "returns": "list",
       "examples": [
-        "(string/word-wrap \"the quick brown fox\" 10)\n; => (\"the quick\" \"brown fox\")\n\n(string/word-wrap \"日本語 の テスト\" 8)\n; => (\"日本語\" \"の テスト\")"
+        "(string/word-wrap \"the quick brown fox\" 10)\n; => (\"the quick\" \"brown fox\")\n\n(string/word-wrap \"日本語 の テスト\" 8)\n; => (\"日本語\" \"の\" \"テスト\")"
       ],
-      "body": "Word-wrap `text` to lines of at most `width` display columns, returning a list of line strings. Wraps on spaces (collapsing runs), hard-breaks any word longer than `width` on grapheme-cluster boundaries, and preserves explicit newlines as line breaks. Widths are measured with `string/width`, so wrapping is correct for non-ASCII text. (Distinct from `string/wrap`, which wraps a string in left/right delimiters.)\n\n```sema\n(string/word-wrap \"the quick brown fox\" 10)\n; => (\"the quick\" \"brown fox\")\n\n(string/word-wrap \"日本語 の テスト\" 8)\n; => (\"日本語\" \"の テスト\")\n```"
+      "body": "Word-wrap `text` to lines of at most `width` display columns, returning a list of line strings. Wraps on spaces (collapsing runs), hard-breaks any word longer than `width` on grapheme-cluster boundaries, and preserves explicit newlines as line breaks. Widths are measured with `string/width`, so wrapping is correct for non-ASCII text. (Distinct from `string/wrap`, which wraps a string in left/right delimiters.)\n\n```sema\n(string/word-wrap \"the quick brown fox\" 10)\n; => (\"the quick\" \"brown fox\")\n\n(string/word-wrap \"日本語 の テスト\" 8)\n; => (\"日本語\" \"の\" \"テスト\")\n```"
     },
     {
       "name": "string/words",

@@ -215,9 +215,12 @@ pub fn register(env: &sema_core::Env) {
         env.set(sema_core::intern("bytevector/from-list"), v);
     }
     if let Some(v) = env.get(sema_core::intern("string->utf8")) {
-        env.set(sema_core::intern("string/to-utf8"), v);
+        env.set(sema_core::intern("string/to-utf8"), v.clone());
+        // Intuitive name: a Sema string encodes to its UTF-8 bytes.
+        env.set(sema_core::intern("string->bytevector"), v);
     }
     if let Some(v) = env.get(sema_core::intern("utf8->string")) {
-        env.set(sema_core::intern("utf8/to-string"), v);
+        env.set(sema_core::intern("utf8/to-string"), v.clone());
+        env.set(sema_core::intern("bytevector->string"), v);
     }
 }

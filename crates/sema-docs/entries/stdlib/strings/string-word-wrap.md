@@ -13,5 +13,5 @@ Word-wrap `text` to lines of at most `width` display columns, returning a list o
 ; => ("the quick" "brown fox")
 
 (string/word-wrap "日本語 の テスト" 8)
-; => ("日本語" "の テスト")
+; => ("日本語" "の" "テスト")
 ```

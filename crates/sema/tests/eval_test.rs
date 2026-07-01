@@ -333,6 +333,12 @@ eval_tests! {
     guard_raw_mode_returns_body: "(io/with-raw-mode 42)" => Value::int(42),
     guard_mouse_returns_body: "(term/with-mouse 7)" => Value::int(7),
     guard_reraises_after_teardown: r#"(try (term/with-alt-screen (error "x")) (catch e "caught"))"# => Value::string("caught"),
+    // string->bytevector: intuitive alias for string->utf8 (UTF-8 encode).
+    string_to_bytevector_alias: r#"(bytevector->string (string->bytevector "héllo"))"# => Value::string("héllo"),
+    // sema/check-string classifies a wrapped reader error as :syntax with a :span
+    // (regression: the error was being wrapped, dropping the code + span).
+    check_string_syntax_code: r#"(:code (car (:diagnostics (sema/check-string "(+ 1 2"))))"# => Value::string("syntax"),
+    check_string_has_span: r#"(map? (:span (car (:diagnostics (sema/check-string "(+ 1 2")))))"# => Value::bool(true),
 }
 
 // ============================================================

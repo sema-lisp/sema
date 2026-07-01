@@ -1,7 +1,11 @@
 # MCP Client — spike & scoping (Sema as an MCP *client*)
 
 **Status:** Scoping / design sketch (2026-06-21; auth + HTTP transport added
-2026-06-23). Not started. Answers the two questions raised: **how** would it work
+2026-06-23). **M1 + M2 shipped** (stdio transport, 2026-07-01): the Layer-1
+`mcp/connect|tools|call|close` primitives and the Layer-2 `mcp/tools->sema` agent
+adapter now exist for the **stdio** transport (`crates/sema-mcp/src/client.rs` +
+`builtins.rs`), capability-gated on `PROCESS`. M3 (Streamable HTTP) and M4 (OAuth
+login) remain future work. Answers the two questions raised: **how** would it work
 and **where** does it live (agent-only vs whole-language)? — and now also: how do
 we reach **authenticated remote servers** (Asana, Linear, hosted GitHub, …) and
 what is the login/token journey.
@@ -380,13 +384,19 @@ agent tests that use MCP tools stay deterministic and offline in CI.
   bridging `rmcp`'s async `RunningService` behind a `block_on` Rc handle (the one
   Option-A risk). Pick, then proceed. *Acceptance:* a one-page decision recorded
   here with the spike result.
-- **M1 — stdio client primitive:** `mcp/connect` (stdio) + `initialize` +
-  `mcp/tools` + `mcp/call` + `mcp/close`; capability-gated (`PROCESS`); a test
-  against the reference filesystem MCP server. *Acceptance:* list + call a real
-  MCP tool from Sema.
-- **M2 — agent adapter:** `mcp/tools->sema`; a `defagent` that uses an MCP tool
-  end-to-end (replayed via cassette in CI). *Acceptance:* an agent completes a
-  task using an external MCP tool, deterministically in CI.
+- **M1 — stdio client primitive [SHIPPED 2026-07-01]:** `mcp/connect` (stdio) +
+  `initialize` (with the mandatory `notifications/initialized`) + `mcp/tools` +
+  `mcp/call` + `mcp/close`; capability-gated (`PROCESS`); response-id correlation
+  (skips interleaved notifications) + a per-request timeout. Tested against a
+  scripted stdio server in `crates/sema-mcp/tests/mcp_client_test.rs`.
+  *Acceptance met:* list + call a tool from Sema.
+- **M2 — agent adapter [SHIPPED 2026-07-01]:** `mcp/tools->sema` inverts the MCP
+  `inputSchema` into the `deftool` params shape and wraps each tool in a handler
+  that rebuilds the arguments object and surfaces `isError` as a `SemaError`. A
+  `defagent` drives an external MCP tool end-to-end against a `FakeProvider` (no
+  network/keys) in `crates/sema/tests/mcp_builtin_test.rs`. *Acceptance met:* an
+  agent completes a tool call deterministically in CI. (Cassette recording — the
+  shared LLM/MCP tape format — is still M5.)
 - **M3 — native Streamable HTTP transport** (the wire contract above:
   `Mcp-Session-Id`, JSON-or-SSE branching, `MCP-Protocol-Version`) **+
   `:headers`/bring-your-own-token + `:mcp-servers` sugar on `defagent`.**

@@ -145,3 +145,64 @@ The MCP server exposes a set of stateful notebook management and evaluation tool
 To support interactive cell execution (where Cell 2 relies on variables or functions defined in Cell 1), the MCP server maintains an in-memory cache of notebook evaluation engines mapped by their canonical file paths.
 
 When a cell is evaluated, the cached engine runs the code, updates the cell output, saves the updated JSON representation back to disk, and returns the result, ensuring state is preserved across consecutive tool calls.
+
+---
+
+## Sema as an MCP Client
+
+The sections above cover Sema acting as an MCP **server**. Sema can also be an MCP **client** — connecting to an external MCP server and consuming its tools from Sema code, so you can use the wider MCP ecosystem (filesystem, GitHub, databases, …) without hand-writing a `deftool` for each.
+
+The client currently speaks the **stdio** transport: it launches the server as a child process and exchanges JSON-RPC 2.0 over its stdin/stdout. (Remote `Streamable HTTP` servers and the OAuth login flow for authenticated providers are a separate, future milestone.)
+
+### Client Builtins
+
+| Function | Description |
+|---|---|
+| `mcp/connect` | Launch a stdio MCP server, perform the `initialize` handshake, and return an opaque handle |
+| `mcp/tools` | List the server's tools as descriptor maps (`{:name :description :input-schema}`) |
+| `mcp/call` | Call a tool by name with an arguments map; returns the result (text collapses to a string) |
+| `mcp/tools->sema` | Convert the server's tools into `deftool`-shaped values ready to hand to `defagent` |
+| `mcp/close` | Terminate the server process and drop the handle |
+
+```scheme
+;; Connect to a stdio MCP server. :command is required; :args, :env and :cwd are optional.
+(define fs (mcp/connect {:command "npx"
+                         :args ["-y" "@modelcontextprotocol/server-filesystem" "/tmp"]}))
+
+(mcp/tools fs)
+; => ({:name "read_file" :description "…" :input-schema {…}} …)
+
+(mcp/call fs "read_file" {:path "/tmp/notes.txt"})
+; => "…file contents…"
+
+(mcp/close fs)
+```
+
+A server that needs a credential reads it from the environment Sema hands the child process, so pass tokens through the `:env` map:
+
+```scheme
+(define gh (mcp/connect {:command "github-mcp-server"
+                         :env {"GITHUB_TOKEN" (env "GITHUB_TOKEN")}}))
+```
+
+### Using MCP Tools in an Agent
+
+`mcp/tools->sema` produces values structurally identical to what `deftool` yields, so an agent uses them exactly like local tools — no new agent concepts:
+
+```scheme
+(define fs (mcp/connect {:command "npx"
+                         :args ["-y" "@modelcontextprotocol/server-filesystem" "/tmp"]}))
+
+(defagent librarian
+  {:model "claude-haiku-4-5-20251001"
+   :system "You manage files in /tmp."
+   :tools (mcp/tools->sema fs)})
+
+(agent/run librarian "Summarize the newest note in /tmp.")
+```
+
+A tool that reports `isError` surfaces as an error the agent loop feeds back to the model, so the agent can react to failures instead of treating them as success.
+
+### Security
+
+Connecting to an MCP server **spawns a process**, so `mcp/connect` requires the `process` capability (see the [`--sandbox`](/docs/cli) CLI flag) — a sandbox that denies process spawning cannot open MCP connections. Note that the tools a server exposes run with the **server's** authority, not Sema's sandbox: connecting to an untrusted MCP server is equivalent to running untrusted code.

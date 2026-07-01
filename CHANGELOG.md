@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+### Added
+
+- **MCP client (stdio transport).** Sema can now act as an MCP *client*, not just
+  a server: `mcp/connect` launches an external MCP server as a child process,
+  performs the `initialize` handshake (including the required
+  `notifications/initialized` follow-up), and returns an opaque handle.
+  `mcp/tools` lists the server's tools, `mcp/call` invokes one, and `mcp/close`
+  shuts the server down. `mcp/tools->sema` converts a server's tools into the
+  same value shape `deftool` produces, so `defagent` can consume external MCP
+  tools with no agent-loop changes; a tool that reports `isError` surfaces as an
+  error the loop feeds back to the model. `mcp/connect` spawns a process and so
+  requires the `process` sandbox capability; tokens for servers that need them
+  are passed through the `:env` map. (Remote Streamable-HTTP transport and the
+  OAuth login flow remain future milestones — see
+  `docs/plans/2026-06-21-mcp-client-spike.md`.)
+
 ### Fixed
 
 - **`str` is now a real alias of `string-append`.** The two builtins had

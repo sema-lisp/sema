@@ -27,6 +27,7 @@ pub type Result<T> = std::result::Result<T, SemaError>;
 pub struct InterpreterBuilder {
     stdlib: bool,
     llm: bool,
+    mcp: bool,
     sandbox: Sandbox,
     telemetry: sema_otel::TelemetryMode,
 }
@@ -43,6 +44,7 @@ impl InterpreterBuilder {
         Self {
             stdlib: true,
             llm: true,
+            mcp: true,
             sandbox: Sandbox::allow_all(),
             telemetry: sema_otel::TelemetryMode::Off,
         }
@@ -71,6 +73,12 @@ impl InterpreterBuilder {
         self
     }
 
+    /// Enable or disable the MCP client builtins (default: `true`).
+    pub fn with_mcp(mut self, enable: bool) -> Self {
+        self.mcp = enable;
+        self
+    }
+
     /// Set the sandbox configuration to restrict dangerous operations.
     pub fn with_sandbox(mut self, sandbox: Sandbox) -> Self {
         self.sandbox = sandbox;
@@ -91,6 +99,11 @@ impl InterpreterBuilder {
     /// Disable the LLM builtins.
     pub fn without_llm(self) -> Self {
         self.with_llm(false)
+    }
+
+    /// Disable the MCP client builtins.
+    pub fn without_mcp(self) -> Self {
+        self.with_mcp(false)
     }
 
     /// Build the [`Interpreter`] with the configured options.
@@ -117,6 +130,10 @@ impl InterpreterBuilder {
 
         if self.llm {
             sema_llm::builtins::register_llm_builtins(&env, &self.sandbox);
+        }
+
+        if self.mcp {
+            sema_mcp::register_mcp_builtins(&env, &self.sandbox);
         }
 
         let global_env = Rc::new(env);

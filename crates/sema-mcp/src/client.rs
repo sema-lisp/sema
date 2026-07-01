@@ -451,12 +451,13 @@ impl StdioTransport {
 
             let response: JsonRpcResponse = match serde_json::from_str(trimmed) {
                 Ok(response) => response,
-                // Not a response shape (e.g. a server->client notification/request);
-                // ignore it and keep waiting for our correlated reply.
+                // Not JSON-RPC at all; ignore and keep waiting.
                 Err(_) => continue,
             };
 
-            if !response_matches_id(&response, expected_id) {
+            // Skip server->client requests/notifications (they carry `method`) even
+            // when their id collides with ours — only a real response ends the wait.
+            if !response.is_response() || !response_matches_id(&response, expected_id) {
                 continue;
             }
             return extract_result(response);
@@ -625,7 +626,7 @@ impl HttpTransport {
                 .map_err(|err| format!("failed to read MCP response body: {err}"))?;
             let response: JsonRpcResponse = serde_json::from_str(text.trim())
                 .map_err(|err| format!("failed to decode MCP response: {err}"))?;
-            if !response_matches_id(&response, id) {
+            if !response.is_response() || !response_matches_id(&response, id) {
                 return Err(format!(
                     "MCP response id mismatch on `{method}` (expected {id})"
                 ));
@@ -697,7 +698,7 @@ impl HttpTransport {
         timeout: Duration,
     ) -> Result<serde_json::Value, String> {
         let mut stream = response.bytes_stream();
-        let mut buffer = String::new();
+        let mut buffer: Vec<u8> = Vec::new();
         let mut data_lines: Vec<String> = Vec::new();
 
         loop {
@@ -715,12 +716,9 @@ impl HttpTransport {
                 return Err("MCP SSE stream ended before the response arrived".to_string());
             };
             let chunk = chunk.map_err(|err| format!("failed to read MCP SSE stream: {err}"))?;
-            buffer.push_str(&String::from_utf8_lossy(&chunk));
+            buffer.extend_from_slice(&chunk);
 
-            while let Some(newline) = buffer.find('\n') {
-                let line = buffer[..newline].trim_end_matches('\r').to_string();
-                buffer.drain(..=newline);
-
+            while let Some(line) = take_line(&mut buffer) {
                 if line.is_empty() {
                     // Event boundary — try to correlate the accumulated data.
                     if let Some(result) = try_take_sse_event(&mut data_lines, expected_id)? {
@@ -754,7 +752,7 @@ struct LegacySseTransport {
     headers: HashMap<String, String>,
     #[allow(clippy::type_complexity)]
     stream: std::pin::Pin<Box<dyn futures::Stream<Item = Result<Vec<u8>, reqwest::Error>> + Send>>,
-    buffer: String,
+    buffer: Vec<u8>,
     /// Status + `WWW-Authenticate` of the most recent POST failure, so a mid-
     /// session `401`/`403` on a legacy server can be re-authorized like an HTTP
     /// one (parity — many servers still run this transport).
@@ -793,7 +791,7 @@ impl LegacySseTransport {
             post_url: String::new(),
             headers: config.headers,
             stream: Box::pin(stream),
-            buffer: String::new(),
+            buffer: Vec::new(),
             last_status: None,
             last_challenge: None,
         };
@@ -821,7 +819,7 @@ impl LegacySseTransport {
         loop {
             let (_event, data) = self.next_event(timeout).await?;
             if let Ok(response) = serde_json::from_str::<JsonRpcResponse>(&data) {
-                if response_matches_id(&response, id) {
+                if response.is_response() && response_matches_id(&response, id) {
                     return extract_result(response);
                 }
             }
@@ -874,9 +872,7 @@ impl LegacySseTransport {
         let mut event_type = String::new();
         let mut data_lines: Vec<String> = Vec::new();
         loop {
-            while let Some(newline) = self.buffer.find('\n') {
-                let line = self.buffer[..newline].trim_end_matches('\r').to_string();
-                self.buffer.drain(..=newline);
+            while let Some(line) = take_line(&mut self.buffer) {
                 if line.is_empty() {
                     if !data_lines.is_empty() || !event_type.is_empty() {
                         let event = if event_type.is_empty() {
@@ -898,7 +894,7 @@ impl LegacySseTransport {
                 .await
                 .map_err(|_| "legacy SSE stream stalled".to_string())?;
             match next {
-                Some(Ok(chunk)) => self.buffer.push_str(&String::from_utf8_lossy(&chunk)),
+                Some(Ok(chunk)) => self.buffer.extend_from_slice(&chunk),
                 Some(Err(err)) => return Err(format!("legacy SSE read error: {err}")),
                 None => return Err("legacy SSE stream closed unexpectedly".to_string()),
             }
@@ -914,6 +910,22 @@ fn resolve_url(base: &str, target: &str) -> Result<String, String> {
         .map_err(|e| format!("could not resolve legacy endpoint `{target}`: {e}"))
 }
 
+/// Pull the next complete line (through the `\n`) from a raw byte buffer,
+/// returning it without the trailing CR/LF, decoded as UTF-8. `None` when no
+/// complete line is buffered yet. Framing on the `\n` *byte* (which never
+/// appears inside a multi-byte UTF-8 sequence) and decoding whole lines — never
+/// arbitrary network chunks — keeps multi-byte characters intact across chunk
+/// boundaries.
+fn take_line(buffer: &mut Vec<u8>) -> Option<String> {
+    let newline = buffer.iter().position(|&b| b == b'\n')?;
+    let mut line: Vec<u8> = buffer.drain(..=newline).collect();
+    line.pop(); // drop '\n'
+    if line.last() == Some(&b'\r') {
+        line.pop();
+    }
+    Some(String::from_utf8_lossy(&line).into_owned())
+}
+
 /// Interpret an accumulated SSE event's `data` as a JSON-RPC message. Returns
 /// `Ok(Some(result))` when it is the correlated response, `Ok(None)` when it is
 /// an unrelated message to skip, and `Err` for an RPC-level error on our id.
@@ -926,11 +938,46 @@ fn try_take_sse_event(
     }
     let data = std::mem::take(data_lines).join("\n");
     match serde_json::from_str::<JsonRpcResponse>(&data) {
-        Ok(response) if response_matches_id(&response, expected_id) => {
+        Ok(response) if response.is_response() && response_matches_id(&response, expected_id) => {
             extract_result(response).map(Some)
         }
         // A server->client notification/request, or a response for a different
         // id — not ours; keep reading.
         _ => Ok(None),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::take_line;
+
+    #[test]
+    fn take_line_reassembles_utf8_split_across_chunks() {
+        // Feed the bytes one at a time (worst-case chunk boundaries). `take_line`
+        // must yield nothing until the '\n', then decode the whole line intact —
+        // the emoji (4 bytes) and accented chars must NOT become U+FFFD.
+        let full = "data: {\"text\":\"😀 café 日本\"}\n".as_bytes();
+        let mut buf: Vec<u8> = Vec::new();
+        for &b in &full[..full.len() - 1] {
+            buf.push(b);
+            assert!(
+                take_line(&mut buf).is_none(),
+                "no complete line before the newline"
+            );
+        }
+        buf.push(*full.last().unwrap());
+        assert_eq!(
+            take_line(&mut buf).as_deref(),
+            Some("data: {\"text\":\"😀 café 日本\"}")
+        );
+        assert!(take_line(&mut buf).is_none());
+    }
+
+    #[test]
+    fn take_line_strips_crlf_and_yields_lines_in_order() {
+        let mut buf = b"first\r\nsecond\n".to_vec();
+        assert_eq!(take_line(&mut buf).as_deref(), Some("first"));
+        assert_eq!(take_line(&mut buf).as_deref(), Some("second"));
+        assert!(take_line(&mut buf).is_none());
     }
 }

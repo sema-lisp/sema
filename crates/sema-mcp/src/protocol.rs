@@ -19,6 +19,21 @@ pub struct JsonRpcResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<JsonRpcError>,
     pub id: Option<serde_json::Value>,
+    // Present only on server→client *requests*/notifications the client may
+    // receive interleaved on a shared stream. Captured so the client can tell a
+    // request (has `method`) from its own response and never mis-correlate a
+    // colliding id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub method: Option<String>,
+}
+
+impl JsonRpcResponse {
+    /// True only for a genuine response to one of our requests: it must carry a
+    /// `result` or `error` and must NOT be a server-initiated request/notification
+    /// (which would carry `method`).
+    pub fn is_response(&self) -> bool {
+        self.method.is_none() && (self.result.is_some() || self.error.is_some())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -82,6 +97,21 @@ mod tests {
             !encoded.contains("params"),
             "params must be omitted when None: {encoded}"
         );
+    }
+
+    #[test]
+    fn is_response_distinguishes_replies_from_server_requests() {
+        let parse = |s: &str| serde_json::from_str::<JsonRpcResponse>(s).unwrap();
+        // A server->client request/notification with a colliding id is NOT our response.
+        assert!(!parse(r#"{"jsonrpc":"2.0","method":"ping","id":3}"#).is_response());
+        assert!(!parse(r#"{"jsonrpc":"2.0","method":"notifications/progress"}"#).is_response());
+        // A real result or error IS our response.
+        assert!(parse(r#"{"jsonrpc":"2.0","result":{"ok":true},"id":3}"#).is_response());
+        assert!(
+            parse(r#"{"jsonrpc":"2.0","error":{"code":-1,"message":"x"},"id":3}"#).is_response()
+        );
+        // Neither result nor error → not a usable response.
+        assert!(!parse(r#"{"jsonrpc":"2.0","id":3}"#).is_response());
     }
 
     #[test]

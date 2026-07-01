@@ -99,6 +99,7 @@ where
                             format!("Internal error: failed to serialize response: {e}"),
                         )),
                         id: resp.id.clone(),
+                        method: None,
                     };
                     // The fallback is a tiny, statically-shaped struct that should
                     // never fail to serialize; if it somehow does, emit a
@@ -136,6 +137,7 @@ where
         result: None,
         error: Some(JsonRpcError::new(-32700, format!("Parse error: {message}"))),
         id: None,
+        method: None,
     };
     if let Ok(s) = serde_json::to_string(&err_resp) {
         writer.write_all(format!("{s}\n").as_bytes()).await.ok();
@@ -209,12 +211,14 @@ fn handle_request(
             result: Some(res),
             error: None,
             id,
+            method: None,
         }),
         Err(err) => Some(JsonRpcResponse {
             jsonrpc: "2.0".to_string(),
             result: None,
             error: Some(err),
             id,
+            method: None,
         }),
     }
 }

@@ -5,33 +5,36 @@ import CustomPageLayout from './CustomPageLayout.vue'
 <template>
   <CustomPageLayout v-slot="{ copyText }">
 
-    <!-- ============ HERO ============ -->
-    <header class="hero">
-      <span class="hero-paren l" aria-hidden="true">(</span>
-      <span class="hero-paren r" aria-hidden="true">)</span>
+    <!-- ============ HERO (homepage-only: distinct, wide, editorial) ============ -->
+    <header class="hero home-hero">
       <div class="wrap">
-        <p class="eyebrow">A Lisp with LLM primitives<span class="sep">·</span>Rust<span class="sep">·</span>MIT</p>
-        <h1>Stop rewriting <em>the agent loop.</em></h1>
-        <p class="lede">
-          Every LLM script grows the same scaffolding: retries, caching, cost caps,
-          rate limits, tool dispatch, conversation state. <strong>Sema makes that
-          scaffolding the runtime</strong> — your script stays the size of its idea,
-          ships as a single binary, and your coding agent already speaks the language.
-        </p>
-        <div class="hero-actions">
-          <a class="btn btn-gold" href="/docs/">Get started</a>
-          <a class="btn btn-ghost" href="https://sema.run">Try it in the browser</a>
+        <div class="hero-head">
+          <p class="eyebrow">Agent-native Lisp<span class="sep">·</span>LLM workflows<span class="sep">·</span>Rust<span class="sep">·</span>MIT</p>
+          <h1>Agent-native language.<br><em>Runtime you trust.</em></h1>
         </div>
-        <div class="hero-actions">
-        <span class="install">
-          <span class="cmd-text">
-            <span class="dollar">$</span>
-            <span id="i1">curl -fsSL https://sema-lang.com/install.sh | sh</span>
+        <div class="hero-body">
+          <p class="lede">
+            Sema builds the agent plumbing into the language itself.
+            <strong>Model calls, typed tools, budgets, deterministic replay,
+            journaled runs, OpenTelemetry traces, and single-binary deploys</strong>
+            are primitives, not scaffolding — so the workflows your coding agent
+            writes stay small, inspectable, and easy to constrain, replay, and ship.
+          </p>
+          <div class="hero-actions">
+            <a class="btn btn-gold" href="/docs/">Get started</a>
+            <a class="btn btn-ghost" href="https://sema.run">Try it in the browser</a>
+          </div>
+          <div class="hero-actions">
+          <span class="install">
+            <span class="cmd-text">
+              <span class="dollar">$</span>
+              <span id="i1">curl -fsSL https://sema-lang.com/install.sh | sh</span>
+            </span>
+            <button class="copy" @click="copyText('i1', $event)">copy</button>
           </span>
-          <button class="copy" @click="copyText('i1', $event)">copy</button>
-        </span>
+          </div>
+          <p class="req">macOS · Linux · Windows · single static binary, no toolchain required</p>
         </div>
-        <p class="req">macOS · Linux · Windows · single static binary, no toolchain required</p>
       </div>
     </header>
 
@@ -142,14 +145,57 @@ messages = [{<span class="c-str">"role"</span>: <span class="c-str">"user"</span
       </div>
     </section>
 
+    <!-- ============ AGENT-NATIVE MEANS CHECKABLE ============ -->
+    <section id="checkable">
+      <div class="wrap">
+        <p class="kicker">Why agent-native matters</p>
+        <h2>Agent-native means checkable.</h2>
+        <p class="sub">
+          Generated code is only useful if you can constrain it. Sema workflows are
+          ordinary code, but the runtime sees the boundaries that matter:
+        </p>
+
+        <div class="checks">
+          <div class="check">
+            <span class="n">01</span>
+            <code>(agent/run coder task)</code>
+            <h3>Every call passes through the runtime</h3>
+            <p>Model calls, tool dispatches, results, and retries are all things the
+              runtime can observe — not logic buried inside an SDK.</p>
+          </div>
+          <div class="check">
+            <span class="n">02</span>
+            <code>(llm/with-budget {:max-cost-usd 1.00} f)</code>
+            <h3>Budgets and checkpoints are scopes</h3>
+            <p>A spend cap or a resume point is part of the run — not a comment the
+              late-night code path can forget.</p>
+          </div>
+          <div class="check">
+            <span class="n">03</span>
+            <code>(llm/extract {:amount :number} text)</code>
+            <h3>Outputs are values, not free text</h3>
+            <p>Schema-backed tools and extraction hand back typed data. Nothing
+              downstream has to re-parse a blob of prose.</p>
+          </div>
+        </div>
+
+        <p class="sub" style="margin-top:30px">
+          So a run can be replayed from cassettes, traced with OpenTelemetry, resumed
+          from a journal, and shipped as one binary — and, <em>coming soon</em>, guarded
+          by executable policies instead of “please be safe” prompt vibes.
+        </p>
+      </div>
+    </section>
+
     <!-- ============ AGENT / LISP OBJECTION ============ -->
     <section id="agents">
       <div class="wrap">
-        <p class="kicker">“Wait — a Lisp?”</p>
-        <h2>You won't write most of it anyway.</h2>
+        <p class="kicker">Why Lisp?</p>
+        <h2>Because the agent has to write it.</h2>
         <p class="sub">
-          Your coding agent will. And a Lisp is the language with the least surface
-          for an agent to be wrong about.
+          Sema is built as a small, stable target for generated programs — the
+          language with the least surface for an agent to be wrong about. The code is
+          already data, so the runtime can inspect it, check it, journal it, and replay it.
         </p>
 
         <div class="agent-grid">
@@ -245,7 +291,7 @@ messages = [{<span class="c-str">"role"</span>: <span class="c-str">"user"</span
     <section id="runtime">
       <div class="wrap">
         <p class="kicker">The runtime, in one screen</p>
-        <h2>Everything you'd otherwise hand-roll.</h2>
+        <h2>The agent runtime, not another framework.</h2>
 
         <div class="forms">
           <div class="form-row"><code>(llm/with-budget {:max-cost-usd 1.00} f)</code><span>hard spend cap, scoped to a block</span>
@@ -381,8 +427,78 @@ messages = [{<span class="c-str">"role"</span>: <span class="c-str">"user"</span
 </template>
 
 <style scoped>
-/* ---------- hero (page-specific padding) ---------- */
-.hero { padding: 104px 0 84px; }
+/* ---------- hero (homepage-only: distinct raised band, wide, two-column) ---------- */
+.home-hero {
+  background: var(--bg-raise);
+  border-bottom: 1px solid var(--border);
+  padding: clamp(76px, 9vw, 124px) 0;
+}
+.home-hero .wrap {
+  max-width: 1280px;
+  display: grid;
+  grid-template-columns: 1.12fr 0.88fr;
+  gap: clamp(40px, 5.5vw, 92px);
+  align-items: center;
+}
+.home-hero .hero-head { min-width: 0; }
+.home-hero .hero-head .eyebrow { margin-bottom: 24px; }
+.home-hero .hero-head h1 {
+  font-size: clamp(46px, 5.2vw, 88px);
+  line-height: 1.03;
+  max-width: 15ch;
+  margin-bottom: 0;
+}
+.home-hero .hero-body { min-width: 0; max-width: 52ch; }
+.home-hero .hero-body .lede { font-size: 18px; max-width: none; margin-bottom: 30px; }
+.home-hero .hero-body .hero-actions { margin-bottom: 16px; }
+.home-hero .hero-body .req { margin-top: 8px; }
+
+@media (max-width: 900px) {
+  .home-hero { padding: 64px 0 56px; }
+  .home-hero .wrap { grid-template-columns: 1fr; gap: 34px; align-items: start; }
+  .home-hero .hero-head h1 { max-width: 20ch; }
+  .home-hero .hero-body { max-width: 60ch; }
+}
+
+/* ---------- checkable cards ---------- */
+.checks {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 20px;
+  margin-top: 44px;
+}
+.check {
+  background: var(--bg-raise);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 24px 22px 26px;
+  transition: border-color .18s var(--ease);
+}
+.check:hover { border-color: var(--gold-line); }
+.check .n {
+  font-family: var(--font-mono); font-size: 12px;
+  letter-spacing: .12em; color: var(--gold);
+}
+.check code {
+  display: block; margin: 12px 0 18px;
+  font-family: var(--font-mono); font-size: 12.5px;
+  color: var(--gold-bright);
+  background: var(--gold-fade);
+  border: 1px solid var(--gold-line);
+  border-radius: 7px;
+  padding: 9px 11px;
+  overflow-x: auto; white-space: nowrap;
+}
+.check h3 {
+  font-family: var(--font-display); font-weight: 400;
+  font-size: 21px; line-height: 1.2; margin: 0 0 9px;
+}
+.check p {
+  color: var(--muted); font-size: 14.5px; line-height: 1.55; margin: 0;
+}
+@media (max-width: 860px) {
+  .checks { grid-template-columns: 1fr; }
+}
 
 /* ---------- comparison ---------- */
 .compare {

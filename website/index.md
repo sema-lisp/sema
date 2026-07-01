@@ -1,6 +1,6 @@
 ---
 layout: false
-title: Sema — A Lisp with LLM Primitives
+title: Sema — Agent-native Lisp for LLM Workflows
 titleTemplate: false
 ---
 

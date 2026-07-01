@@ -10,6 +10,42 @@ and **where** does it live (agent-only vs whole-language)? — and now also: how
 we reach **authenticated remote servers** (Asana, Linear, hosted GitHub, …) and
 what is the login/token journey.
 
+## Decisions locked (2026-07-01)
+
+Target spec revision: **`2025-11-25`** for BOTH transport and authorization (verified
+live against modelcontextprotocol.io). The `2026-07-28` revision is a release
+candidate — do NOT implement its additions (RFC 9207 `iss` validation, OIDC
+`application_type`, `Mcp-Method`/`Mcp-Name` routing headers) yet. This supersedes the
+older `2025-03-26` / `2025-06-18` version references elsewhere in this doc.
+
+1. **Build vs reuse → hand-roll + `oauth2` crate (Option B); M0 gate RESOLVED.**
+   Matches the shipped hand-rolled stdio client (M1/M2) and Sema's single-threaded
+   `block_on` model. `oauth2 = "5"` for PKCE-S256 + auth-code/refresh exchange (RFC
+   8707 `resource` via `.add_extra_param`); hand-roll RFC 9728/8414 discovery (~2
+   `GET`s + serde) and RFC 7591 DCR (one JSON `POST`). `rmcp` stays a documented
+   fallback + reference only. Early de-risk: confirm `oauth2 5` drives our reqwest
+   client via its `AsyncHttpClient` impl.
+2. **Token storage → OS keychain primary, `0600` JSON-file fallback.** `keyring` for
+   macOS Keychain / Windows Credential Manager / Linux Secret Service; fall back to a
+   `0600`-perm JSON file under the config dir on headless Linux/CI (no *automatic*
+   fallback exists — we implement it, with a visible plaintext warning). Keychain
+   calls block → wrap in `spawn_blocking`. Store per-server keyed by canonical URL:
+   tokens (access/refresh/expiry/scope) + DCR `client_info`.
+3. **First-PR scope = maximal completeness (all of the below must land + work before
+   the PR opens):** Streamable HTTP transport; bring-your-own-token (`:headers`);
+   full browser OAuth (discovery → DCR/pre-registered/CIMD → PKCE-S256 → loopback
+   capture → token exchange → refresh → `403 insufficient_scope` re-scope) with
+   keychain/file storage; **RFC 8628 device-authorization grant** for headless boxes
+   (capability-gated on AS support); print-URL-and-paste fallback as the always-
+   available floor; and **legacy 2024-11-05 HTTP+SSE back-compat** (POST→4xx→GET-for-
+   `endpoint`-event detection). `sema mcp login`/`logout` CLI. Crates: `oauth2`,
+   `webbrowser` (browser open, `hardened` feature), `tiny_http` (loopback listener),
+   `keyring`.
+
+Remaining genuine unknowns are per-server (e.g. whether Asana's AS accepts loopback
+redirect URIs) — resolved empirically during M4 against a live server, not blockers
+for starting M3.
+
 ## Context: today Sema is an MCP *server* only
 
 `crates/sema-mcp/` exposes Sema **to** external agents (protocol.rs, server.rs,
@@ -378,12 +414,10 @@ agent tests that use MCP tools stay deterministic and offline in CI.
 
 ## Milestones
 
-- **M0 — build-vs-reuse decision (gate before M3).** Resolve Option A (`rmcp`) vs
-  Option B (hand-roll + `oauth2`). Cheap spikes: (1) confirm `oauth2 = "5"` drives
-  our reqwest-0.13 client via `AsyncHttpClient` (the one Option-B risk); (2) sketch
-  bridging `rmcp`'s async `RunningService` behind a `block_on` Rc handle (the one
-  Option-A risk). Pick, then proceed. *Acceptance:* a one-page decision recorded
-  here with the spike result.
+- **M0 — build-vs-reuse decision [RESOLVED 2026-07-01 → Option B].** Hand-roll +
+  `oauth2` crate; see "Decisions locked" above. First implementation step of M3 is
+  the de-risk spike: confirm `oauth2 = "5"` drives our reqwest client via its
+  `AsyncHttpClient` impl.
 - **M1 — stdio client primitive [SHIPPED 2026-07-01]:** `mcp/connect` (stdio) +
   `initialize` (with the mandatory `notifications/initialized`) + `mcp/tools` +
   `mcp/call` + `mcp/close`; capability-gated (`PROCESS`); response-id correlation
@@ -411,6 +445,15 @@ agent tests that use MCP tools stay deterministic and offline in CI.
   OAuth-gated server (Asana/Linear). *Acceptance:* `mcp/connect` to a real
   OAuth-gated server completes the browser flow once, then reconnects silently from
   cached tokens; CI exercises the full flow against the local test IdP.
+- **M4b — device-authorization grant (RFC 8628) + legacy HTTP+SSE back-compat.** In
+  scope for the first PR (Decision #3). Device flow: check AS metadata for
+  `device_authorization_endpoint`; `POST /device/code` → display `user_code` +
+  `verification_uri` → poll `/token` honoring `interval`/`slow_down`/
+  `authorization_pending`; request `offline_access` for a refresh token (device flow
+  uses no PKCE). Legacy transport: on `initialize` POST failure (`4xx`), `GET` the
+  URL and detect a first `endpoint` SSE event → drive the deprecated two-endpoint
+  `2024-11-05` transport. *Acceptance:* headless login works via device flow against
+  the test IdP; a `2024-11-05` server connects via the SSE fallback.
 - **M5 — MCP-call cassette recording** (shared format with LLM cassettes).
 
 ## Open questions

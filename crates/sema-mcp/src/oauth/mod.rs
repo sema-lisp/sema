@@ -12,6 +12,7 @@
 //! discovery / registration HTTP is driven directly with our own reqwest client
 //! so nothing depends on `oauth2`'s (reqwest-0.12) built-in client.
 
+pub mod device;
 pub mod discovery;
 pub mod flow;
 pub mod login;

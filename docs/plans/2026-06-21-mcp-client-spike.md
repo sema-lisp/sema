@@ -463,8 +463,11 @@ agent tests that use MCP tools stay deterministic and offline in CI.
     and the CLI, instead of repeating the URL.
   - **`sema mcp list`** — show authenticated/known servers (and, if feasible, which
     script or config declared each) alongside token status.
-  - Mid-session **`403 insufficient_scope`** step-up re-scope (initial-login scope
-    handling is done; mid-call step-up is not yet wired into `mcp/call`).
+
+Mid-session auth recovery is **done** (2026-07-01): a `mcp/call` that gets a `401`
+(expired) refreshes/re-logs-in and retries; a `403 insufficient_scope` re-authorizes
+requesting the union of prior + challenged scopes and retries
+(`oauth::login::reauth_on_challenge`, wired into `call_tool_via_connection`).
 
 ## Open questions
 

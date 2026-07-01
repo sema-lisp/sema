@@ -235,3 +235,108 @@ pub async fn ensure_access_token(
     store.save(&creds)?;
     Ok(creds.tokens.access_token)
 }
+
+/// Order-preserving union of two space-separated scope strings.
+pub fn union_scopes(a: Option<&str>, b: Option<&str>) -> Option<String> {
+    let mut out: Vec<String> = Vec::new();
+    for source in [a, b].into_iter().flatten() {
+        for token in source.split_whitespace() {
+            if !out.iter().any(|s| s == token) {
+                out.push(token.to_string());
+            }
+        }
+    }
+    (!out.is_empty()).then(|| out.join(" "))
+}
+
+/// React to a mid-session auth challenge on an already-connected server and
+/// return a fresh access token to retry with, or `None` if the status isn't an
+/// auth challenge we handle. Handles two cases:
+///
+/// - **401** (token missing/expired): refresh with the stored refresh token, or
+///   fall back to a full login.
+/// - **403 `insufficient_scope`**: step-up — re-authorize requesting the *union*
+///   of the previously-granted scopes and the scopes the challenge demands.
+///
+/// New credentials are persisted. `redirect` is only used when a full
+/// (re-)authorization is required.
+pub async fn reauth_on_challenge(
+    client: &reqwest::Client,
+    store: &dyn TokenStore,
+    url: &str,
+    status: Option<u16>,
+    challenge_header: Option<&str>,
+    preconfigured_client_id: Option<&str>,
+    redirect: &dyn RedirectDriver,
+) -> Result<Option<String>, String> {
+    let challenge = challenge_header
+        .map(discovery::parse_www_authenticate)
+        .unwrap_or_default();
+    let existing = store.load(url);
+    let client_info = existing.as_ref().and_then(|c| c.client_info.clone());
+
+    match status {
+        Some(401) => {
+            // Try a refresh first, then fall back to a full login.
+            if let Some(creds) = &existing {
+                if creds.tokens.refresh_token.is_some() {
+                    let config = LoginConfig {
+                        mcp_url: url,
+                        resource_metadata_url: challenge.resource_metadata.as_deref(),
+                        requested_scope: creds.tokens.scope.as_deref(),
+                        preconfigured_client_id,
+                    };
+                    if let Ok(tokens) = refresh(client, &config, creds).await {
+                        let mut updated = creds.clone();
+                        updated.tokens = tokens;
+                        store.save(&updated)?;
+                        return Ok(Some(updated.tokens.access_token));
+                    }
+                }
+            }
+            let config = LoginConfig {
+                mcp_url: url,
+                resource_metadata_url: challenge.resource_metadata.as_deref(),
+                requested_scope: existing.as_ref().and_then(|c| c.tokens.scope.as_deref()),
+                preconfigured_client_id,
+            };
+            let creds = login(client, &config, client_info, redirect).await?;
+            store.save(&creds)?;
+            Ok(Some(creds.tokens.access_token))
+        }
+        Some(403) if challenge.error.as_deref() == Some("insufficient_scope") => {
+            let prior = existing.as_ref().and_then(|c| c.tokens.scope.clone());
+            let union = union_scopes(prior.as_deref(), challenge.scope.as_deref());
+            let config = LoginConfig {
+                mcp_url: url,
+                resource_metadata_url: challenge.resource_metadata.as_deref(),
+                requested_scope: union.as_deref(),
+                preconfigured_client_id,
+            };
+            let creds = login(client, &config, client_info, redirect).await?;
+            store.save(&creds)?;
+            Ok(Some(creds.tokens.access_token))
+        }
+        _ => Ok(None),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::union_scopes;
+
+    #[test]
+    fn union_scopes_dedupes_and_preserves_order() {
+        assert_eq!(
+            union_scopes(Some("read"), Some("read write")).as_deref(),
+            Some("read write")
+        );
+        assert_eq!(
+            union_scopes(Some("a b"), Some("c b")).as_deref(),
+            Some("a b c")
+        );
+        assert_eq!(union_scopes(None, Some("x")).as_deref(), Some("x"));
+        assert_eq!(union_scopes(Some("y"), None).as_deref(), Some("y"));
+        assert_eq!(union_scopes(None, None), None);
+    }
+}

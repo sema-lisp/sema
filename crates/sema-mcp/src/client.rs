@@ -542,6 +542,18 @@ impl HttpTransport {
 
         let status = response.status();
         self.last_status = (!status.is_success()).then_some(status.as_u16());
+        // Record any `WWW-Authenticate` challenge (cleared on success) so the auth
+        // layer can re-authorize and retry — a `401` (token missing/expired) or a
+        // `403 insufficient_scope` (needs step-up). Reflects the current response.
+        self.last_challenge = if status.is_success() {
+            None
+        } else {
+            response
+                .headers()
+                .get("www-authenticate")
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string)
+        };
         if status.as_u16() == 404 {
             // Session was terminated/expired; per the spec the client must start
             // a fresh session with a new `initialize`. Surface it so the caller
@@ -551,13 +563,6 @@ impl HttpTransport {
             ));
         }
         if status.as_u16() == 401 {
-            // Record the challenge so the auth layer can discover the
-            // authorization server, obtain a token, and retry.
-            self.last_challenge = response
-                .headers()
-                .get("www-authenticate")
-                .and_then(|v| v.to_str().ok())
-                .map(str::to_string);
             return Err(format!(
                 "MCP server requires authorization (HTTP 401) on `{method}`"
             ));

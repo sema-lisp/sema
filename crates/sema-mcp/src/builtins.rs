@@ -295,9 +295,66 @@ fn call_tool_via_connection(
     arguments_json: serde_json::Value,
 ) -> Result<serde_json::Value, SemaError> {
     let connection = lookup_connection(handle)?;
-    let mut connection = connection.borrow_mut();
-    block_on(connection.client.call_tool(tool_name, arguments_json))
+
+    let first = {
+        let mut conn = connection.borrow_mut();
+        block_on(conn.client.call_tool(tool_name, arguments_json.clone()))
+    };
+    let err = match first {
+        Ok(value) => return Ok(value),
+        Err(err) => err,
+    };
+
+    // A mid-session `401` (token expired) or `403 insufficient_scope` (needs
+    // step-up) on a remote HTTP server means "re-authorize and retry once".
+    let (status, challenge, url) = {
+        let conn = connection.borrow();
+        (
+            conn.client.http_last_status(),
+            conn.client.http_challenge(),
+            conn.client.http_url(),
+        )
+    };
+    if !matches!(status, Some(401) | Some(403)) {
+        return Err(SemaError::eval(format!("mcp/call: {err}")));
+    }
+    let Some(url) = url else {
+        return Err(SemaError::eval(format!("mcp/call: {err}")));
+    };
+    let token = match reauthorize(&url, status, challenge.as_deref()) {
+        Ok(Some(token)) => token,
+        // Not an auth challenge we handle, or re-auth failed — surface the
+        // original error.
+        _ => return Err(SemaError::eval(format!("mcp/call: {err}"))),
+    };
+
+    let mut conn = connection.borrow_mut();
+    conn.client.set_bearer_token(&token);
+    block_on(conn.client.call_tool(tool_name, arguments_json))
         .map_err(|err| SemaError::eval(format!("mcp/call: {err}")))
+}
+
+/// React to a mid-session auth challenge (refresh on `401`, step-up re-scope on
+/// `403 insufficient_scope`) and return a fresh access token to retry with.
+fn reauthorize(
+    url: &str,
+    status: Option<u16>,
+    challenge: Option<&str>,
+) -> Result<Option<String>, SemaError> {
+    let http = reqwest::Client::new();
+    let store = crate::oauth::store::default_store();
+    let driver = crate::oauth::loopback::LoopbackDriver::new(std::time::Duration::from_secs(300))
+        .map_err(|e| SemaError::eval(format!("mcp/call: {e}")))?;
+    block_on(crate::oauth::login::reauth_on_challenge(
+        &http,
+        store.as_ref(),
+        url,
+        status,
+        challenge,
+        None,
+        &driver,
+    ))
+    .map_err(|e| SemaError::eval(format!("mcp/call: re-authorization failed: {e}")))
 }
 
 /// Concatenate the `text` blocks of a `tools/call` result, if any.

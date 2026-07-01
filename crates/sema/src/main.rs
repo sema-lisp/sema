@@ -556,6 +556,16 @@ enum NotebookCommands {
     },
 }
 
+/// Build the standard CLI interpreter: stdlib + LLM (registered inside sema-eval)
+/// plus the MCP *client* builtins (`mcp/connect`, `mcp/tools`, `mcp/tools->sema`,
+/// …). The MCP builtins live in `sema-mcp`, which depends on `sema-eval`, so they
+/// can't be registered inside `sema-eval` itself — the binary wires them in here.
+fn build_interpreter(sandbox: &sema_core::Sandbox) -> Interpreter {
+    let interpreter = Interpreter::new_with_sandbox(sandbox);
+    sema_mcp::register_mcp_builtins(&interpreter.global_env, sandbox);
+    interpreter
+}
+
 fn main() {
     // Check for embedded archive before parsing CLI args
     if let Some(exit_code) = try_run_embedded() {
@@ -739,7 +749,7 @@ fn main() {
                 });
 
                 let sandbox = sema_core::Sandbox::allow_all();
-                let interpreter = Interpreter::new_with_sandbox(&sandbox);
+                let interpreter = build_interpreter(&sandbox);
 
                 let _ = interpreter.eval_str("(llm/auto-configure)");
 
@@ -792,7 +802,7 @@ fn main() {
         return;
     }
 
-    let interpreter = Interpreter::new_with_sandbox(&sandbox);
+    let interpreter = build_interpreter(&sandbox);
 
     // Set LLM env vars before auto-configure
     if let Some(model) = cli.chat_model.as_ref() {
@@ -1088,7 +1098,7 @@ fn run_workflow_command(command: WorkflowCommands, sandbox: &sema_core::Sandbox)
         std::thread::sleep(std::time::Duration::from_millis(250));
     }
 
-    let interpreter = Interpreter::new_with_sandbox(&effective_sandbox);
+    let interpreter = build_interpreter(&effective_sandbox);
 
     // Auto-configure an LLM provider from the environment (mirrors the default run
     // path), so a workflow whose leaves call `llm/*` works without self-configuring.
@@ -1403,7 +1413,7 @@ fn run_eval(
         None => sema_core::Sandbox::allow_all(),
     };
 
-    let interpreter = Interpreter::new_with_sandbox(&sandbox);
+    let interpreter = build_interpreter(&sandbox);
 
     // Auto-configure LLM unless --no-llm
     if !no_llm {
@@ -1612,7 +1622,7 @@ fn run_compile(file: &str, output: Option<&str>) {
 
     // Use Interpreter for macro expansion before compilation
     let sandbox = sema_core::Sandbox::allow_all();
-    let interpreter = Interpreter::new_with_sandbox(&sandbox);
+    let interpreter = build_interpreter(&sandbox);
 
     let result = match interpreter.compile_to_bytecode(&source) {
         Ok(r) => r,
@@ -1689,7 +1699,7 @@ fn try_run_embedded() -> Option<i32> {
     sema_core::vfs::init_vfs(arch.files);
 
     let sandbox = sema_core::Sandbox::allow_all();
-    let interpreter = Interpreter::new_with_sandbox(&sandbox);
+    let interpreter = build_interpreter(&sandbox);
 
     let _ = interpreter.eval_str("(llm/auto-configure)");
 
@@ -1830,7 +1840,7 @@ fn run_build(
     // Compute source hash and compile to bytecode
     let source_hash = crc32fast::hash(source.as_bytes());
     let sandbox = sema_core::Sandbox::allow_all();
-    let interpreter = Interpreter::new_with_sandbox(&sandbox);
+    let interpreter = build_interpreter(&sandbox);
 
     let result = match interpreter.compile_to_bytecode(&source) {
         Ok(r) => r,

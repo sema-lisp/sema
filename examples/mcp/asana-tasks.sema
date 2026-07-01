@@ -1,0 +1,61 @@
+;; ---------------------------------------------------------------------------
+;; MCP client demo: an agent that fetches YOUR Asana tasks via Asana's MCP server
+;; ---------------------------------------------------------------------------
+;;
+;; This connects Sema (as an MCP *client*) to Asana's hosted MCP server, exposes
+;; its tools to an agent, and asks the agent to list the tasks assigned to you.
+;;
+;; FIRST RUN: Asana requires OAuth. `mcp/connect` will open your browser to log
+;; in; the token is then cached (OS keychain, or a 0600 file) so later runs are
+;; silent. You can also pre-authenticate from the shell:
+;;
+;;     sema mcp login https://mcp.asana.com/sse
+;;
+;; Requirements:
+;;   - ANTHROPIC_API_KEY set in your environment (for the agent's model).
+;;   - Network access (this reaches Asana). Run unsandboxed (the default).
+;;
+;; NOTE: confirm Asana's current MCP endpoint from their docs and update
+;; `asana-url` below if it differs. Sema auto-detects Streamable-HTTP vs the
+;; legacy SSE transport, so either shape works.
+
+(define asana-url "https://mcp.asana.com/sse")
+
+;; The model the agent uses. Any tool-use-capable Claude model works; bump this
+;; to a stronger model if the agent struggles to pick the right Asana tool.
+(define agent-model "claude-sonnet-5")
+
+;; --- 1. Connect (this triggers the OAuth browser login on the first run) ------
+(println "Connecting to Asana MCP server…")
+(define asana (mcp/connect {:url asana-url}))
+(println "Connected.\n")
+
+;; --- 2. Sanity check: what tools does the server expose? ----------------------
+(println "Available Asana tools:")
+(for-each
+  (fn (tool) (println "  - " (:name tool) " — " (:description tool)))
+  (mcp/tools asana))
+(println "")
+
+;; --- 3. Define an agent whose tools ARE the Asana MCP tools -------------------
+(defagent asana-agent
+  {:system (str "You are an Asana assistant. Use the available Asana tools to "
+                "answer the user. When asked about tasks assigned to the user, "
+                "resolve the current user (the Asana 'me' user) and list their "
+                "assigned, incomplete tasks with due dates. Be concise.")
+   :model agent-model
+   :tools (mcp/tools->sema asana)
+   :max-turns 8})
+
+;; --- 4. Run it ----------------------------------------------------------------
+(println "Asking the agent to fetch your assigned tasks…\n")
+(define answer
+  (agent/run asana-agent
+             "List the tasks currently assigned to me in Asana. Include the task name and due date if there is one."))
+
+(println "=== Result ===")
+(println answer)
+
+;; --- 5. Clean up --------------------------------------------------------------
+(mcp/close asana)
+(println "\n(token usage: " (llm/session-usage) ")")

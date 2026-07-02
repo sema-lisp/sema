@@ -22,6 +22,7 @@
     "<html lang=\"en\">\n<head>\n"
     "<meta charset=\"utf-8\">\n"
     "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n"
+    "<link rel=\"icon\" href=\"data:,\">\n"
     "<title>Sema Web — " entry "</title>\n"
     "<script type=\"importmap\">\n"
     "{\n  \"imports\": {\n"

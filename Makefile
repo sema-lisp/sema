@@ -1,4 +1,4 @@
-.PHONY: all build release web-runtime build-pgo pgo-profile install install-pgo uninstall test test-lsp test-embedding-bench test-http test-llm check clippy fmt fmt-check clean run lint lint-links docs docs-check update-pricing examples examples-vm smoke-bytecode rag-demo test-providers fuzz fuzz-reader fuzz-eval fuzz-grammar fuzz-grammar-emit setup docs-search-gate bench-1m bench-10m bench-100m site-dev site-build site-preview site-deploy deploy coverage coverage-html bench bench-vm bench-save bench-suite bench-closure bench-numeric bench-compare bench-baseline profile profile-vm ts-setup ts-generate ts-test ts-playground js-lib-build js-lib-dev sema-web-example sema-web-example-build
+.PHONY: all build release web-runtime test-web-e2e build-pgo pgo-profile install install-pgo uninstall test test-lsp test-embedding-bench test-http test-llm check clippy fmt fmt-check clean run lint lint-links docs docs-check update-pricing examples examples-vm smoke-bytecode rag-demo test-providers fuzz fuzz-reader fuzz-eval fuzz-grammar fuzz-grammar-emit setup docs-search-gate bench-1m bench-10m bench-100m site-dev site-build site-preview site-deploy deploy coverage coverage-html bench bench-vm bench-save bench-suite bench-closure bench-numeric bench-compare bench-baseline profile profile-vm ts-setup ts-generate ts-test ts-playground js-lib-build js-lib-dev sema-web-example sema-web-example-build
 
 SEMA_WEB_EXAMPLE_DIR := examples/sema-web-app
 
@@ -112,6 +112,13 @@ example-notebook: build
 test-notebook-e2e: build
 	@echo "=== Running notebook E2E tests ==="
 	cd crates/sema-notebook/tests/e2e && npx playwright test
+
+# E2E for the `sema web` dev server: vendor the browser runtime, build the
+# release binary (which embeds it), then drive the real server in a browser.
+test-web-e2e: web-runtime
+	cargo build --release -p sema-lang
+	@echo "=== Running sema web dev-server E2E tests ==="
+	cd packages/sema-web && npx playwright test --config playwright.dev-server.config.ts
 
 mutants:
 	@echo "=== Mutation testing (high-value crates) ==="

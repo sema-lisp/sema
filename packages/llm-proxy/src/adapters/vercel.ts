@@ -1,5 +1,5 @@
 /**
- * Vercel Edge Functions adapter for the Sema LLM proxy.
+ * Vercel adapter for the Sema LLM proxy (App Router Route Handlers).
  *
  * ## Usage (App Router)
  *
@@ -12,9 +12,12 @@
  *   provider: "openai",
  *   apiKey: process.env.OPENAI_API_KEY!,
  * });
- *
- * export const runtime = "edge";
  * ```
+ *
+ * Don't declare `export const runtime = "edge"` — Vercel now deprecates
+ * Edge Functions for new projects. The default Node.js runtime supports
+ * streaming responses natively (via Fluid compute) and is what Vercel
+ * currently recommends.
  *
  * Then in your frontend:
  * ```js

@@ -105,7 +105,7 @@ npm install @sema-lang/sema-web @sema-lang/llm-proxy
 // api/llm/[...path].ts
 import { createVercelHandler } from "@sema-lang/llm-proxy/vercel";
 
-export default createVercelHandler({
+export const { GET, POST, OPTIONS } = createVercelHandler({
   provider: "openai",
   apiKey: process.env.OPENAI_API_KEY!,
   defaultModel: "gpt-4o",
@@ -113,13 +113,18 @@ export default createVercelHandler({
 });
 ```
 
+A plain `export default createVercelHandler({...})` won't work here — Vercel's
+`api/` directory expects either named exports per HTTP method (what the
+destructuring above produces) or a `fetch`-shaped default export, not an
+object of `{GET, POST, OPTIONS}` methods as the default export itself.
+
 **4. Build the app for production:**
 
 ```bash
 sema build --target web app.sema -o public/app.vfs
 ```
 
-**4. Create the HTML entry point:**
+**5. Create the HTML entry point:**
 
 ```html
 <!-- public/index.html -->
@@ -142,14 +147,14 @@ sema build --target web app.sema -o public/app.vfs
 </html>
 ```
 
-**5. Set environment variables:**
+**6. Set environment variables:**
 
 ```bash
 vercel env add OPENAI_API_KEY
 # Paste your API key when prompted
 ```
 
-**6. Deploy:**
+**7. Deploy:**
 
 ```bash
 vercel deploy          # Preview deployment
@@ -180,12 +185,17 @@ import { createNetlifyHandler } from "@sema-lang/llm-proxy/netlify";
 
 export default createNetlifyHandler({
   provider: "anthropic",
-  apiKey: Deno.env.get("ANTHROPIC_API_KEY")!,
+  apiKey: Netlify.env.get("ANTHROPIC_API_KEY")!,
   defaultModel: "claude-sonnet-4-20250514",
 });
 
 export const config = { path: "/api/llm/*" };
 ```
+
+Use the `Netlify.env` global to read environment variables in Edge
+Functions, not `Deno.env` directly — `Netlify.env` is scoped to variables
+declared for the Functions scope and is what Netlify's current docs document
+for this runtime.
 
 **3. Build the app for production:**
 

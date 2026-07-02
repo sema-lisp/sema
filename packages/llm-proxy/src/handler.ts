@@ -566,6 +566,9 @@ async function handleStream(
         "Content-Type": "text/event-stream",
         "Cache-Control": "no-cache",
         "Connection": "keep-alive",
+        // Prevent reverse proxies (nginx, and others that honor this
+        // convention) from buffering the stream before flushing to the client.
+        "X-Accel-Buffering": "no",
         ...corsHeaders(corsOrigin),
       },
       body: "",
@@ -622,6 +625,9 @@ async function handleStream(
       "Content-Type": "text/event-stream",
       "Cache-Control": "no-cache",
       "Connection": "keep-alive",
+      // Prevent reverse proxies (nginx, and others that honor this
+      // convention) from buffering the stream before flushing to the client.
+      "X-Accel-Buffering": "no",
       ...corsHeaders(corsOrigin),
     },
     body: "",

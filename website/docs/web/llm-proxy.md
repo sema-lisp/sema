@@ -32,19 +32,26 @@ Groq, Mistral, and xAI use the OpenAI-compatible API format internally.
 
 Each adapter wraps the core handler for a specific deployment platform. They convert platform-specific request/response objects to the internal `ProxyRequest`/`ProxyResponse` format.
 
-### Vercel (Edge Functions / Serverless)
+### Vercel (App Router)
 
 ```ts
 // api/llm/[...path].ts
 import { createVercelHandler } from "@sema-lang/llm-proxy/vercel";
 
-export default createVercelHandler({
+export const { GET, POST, OPTIONS } = createVercelHandler({
   provider: "openai",
   apiKey: process.env.OPENAI_API_KEY!,
   defaultModel: "gpt-4o",
   cors: "*",
 });
 ```
+
+A plain `export default createVercelHandler({...})` won't work — Vercel's
+`api/` directory expects named exports per HTTP method (what the
+destructuring above produces) or a `fetch`-shaped default export, not an
+object of `{GET, POST, OPTIONS}` methods as the default export itself. Don't
+add `export const runtime = "edge"` either — Vercel now deprecates Edge
+Functions for new projects; the default Node.js runtime streams natively.
 
 ### Netlify (Edge Functions)
 
@@ -54,12 +61,17 @@ import { createNetlifyHandler } from "@sema-lang/llm-proxy/netlify";
 
 export default createNetlifyHandler({
   provider: "anthropic",
-  apiKey: Deno.env.get("ANTHROPIC_API_KEY")!,
+  apiKey: Netlify.env.get("ANTHROPIC_API_KEY")!,
   defaultModel: "claude-sonnet-4-20250514",
 });
 
 export const config = { path: "/api/llm/*" };
 ```
+
+Use the `Netlify.env` global to read environment variables in Edge
+Functions, not `Deno.env` directly — `Netlify.env` is scoped to variables
+you've declared for the Functions scope and is what Netlify's current docs
+document for this runtime.
 
 ### Cloudflare Workers
 
@@ -67,17 +79,14 @@ export const config = { path: "/api/llm/*" };
 // src/worker.ts
 import { createCloudflareHandler } from "@sema-lang/llm-proxy/cloudflare";
 
-const handler = createCloudflareHandler({
-  provider: "openai",
-  apiKey: "", // Set at runtime from env
-});
-
 export default {
-  async fetch(request: Request, env: any) {
-    // Override apiKey from Worker environment binding
-    return handler(request, {
+  fetch(request: Request, env: { OPENAI_API_KEY: string }) {
+    // Constructed per-request so it can read the env binding, which isn't
+    // available at module-eval time in Workers.
+    return createCloudflareHandler({
+      provider: "openai",
       apiKey: env.OPENAI_API_KEY,
-    });
+    }).fetch(request);
   },
 };
 ```

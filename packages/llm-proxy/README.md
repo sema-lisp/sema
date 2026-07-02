@@ -12,7 +12,7 @@ npm install @sema-lang/llm-proxy
 
 ## Quick Start
 
-### Vercel (Edge Functions)
+### Vercel (App Router)
 
 Create `app/api/llm/[...path]/route.ts`:
 
@@ -23,9 +23,11 @@ export const { GET, POST, OPTIONS } = createVercelHandler({
   provider: "openai",
   apiKey: process.env.OPENAI_API_KEY!,
 });
-
-export const runtime = "edge";
 ```
+
+Don't add `export const runtime = "edge"` — Vercel now deprecates Edge
+Functions for new projects. Leave the default Node.js runtime, which
+supports streaming responses natively.
 
 ### Netlify Functions
 
@@ -68,7 +70,9 @@ import { createNodeHandler } from "@sema-lang/llm-proxy/node";
 
 const app = express();
 
-app.all("/api/llm/*", createNodeHandler({
+// Express 5 (the current default) requires named wildcards — a bare "*"
+// throws "Missing parameter name" at startup. On Express 4 use "/api/llm/*".
+app.all("/api/llm/*splat", createNodeHandler({
   provider: "openai",
   apiKey: process.env.OPENAI_API_KEY!,
 }));

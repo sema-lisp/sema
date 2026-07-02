@@ -18,8 +18,10 @@
  *   apiKey: process.env.OPENAI_API_KEY!,
  * });
  *
- * // Mount at any prefix
- * app.all("/api/llm/*", llmProxy);
+ * // Mount at any prefix. Express 5 (the current default) requires named
+ * // wildcards — a bare "*" throws "Missing parameter name" at startup.
+ * // On Express 4 use "/api/llm/*" instead.
+ * app.all("/api/llm/*splat", llmProxy);
  *
  * app.listen(3001);
  * ```
@@ -66,6 +68,8 @@ interface NodeResponse {
   writeHead(status: number, headers: Record<string, string>): void;
   write(chunk: string | Uint8Array): boolean;
   end(body?: string): void;
+  /** Not every framework's response wrapper exposes this — call defensively. */
+  flushHeaders?(): void;
 }
 
 /** Node.js HTTP handler function. */
@@ -152,6 +156,11 @@ export function createNodeHandler(config: ProxyConfig): NodeHandler {
             res.writeHead(proxyRes.status, proxyRes.headers);
             // If the response has a ReadableStream, pipe it directly for SSE
             if (proxyRes.stream) {
+              // Send headers immediately rather than letting Node buffer them
+              // until the first flush-worthy write — SSE clients (and any
+              // reverse proxy in front of them) should see the connection
+              // open right away.
+              res.flushHeaders?.();
               const reader = proxyRes.stream.getReader();
               try {
                 while (true) {

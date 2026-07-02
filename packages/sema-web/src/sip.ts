@@ -26,6 +26,23 @@ interface SemaInterpreterLike {
   evalStr(code: string): { value: string | null; output: string[]; error: string | null };
 }
 
+const SVG_NS = "http://www.w3.org/2000/svg";
+const MATHML_NS = "http://www.w3.org/1998/Math/MathML";
+
+/**
+ * HTML boolean content attributes (WHATWG list, minus `checked`, which is
+ * handled separately as a live DOM property rather than an attribute — see
+ * `applyAttributes`). For these, presence (not attribute *value*) means
+ * true, so `{:required false}` must remove the attribute rather than set it
+ * to the string `"false"` (which HTML still treats as present/true).
+ */
+const BOOLEAN_ATTRS = new Set([
+  "allowfullscreen", "async", "autofocus", "autoplay", "controls", "default",
+  "defer", "disabled", "formnovalidate", "hidden", "inert", "ismap",
+  "itemscope", "loop", "multiple", "muted", "nomodule", "novalidate", "open",
+  "playsinline", "readonly", "required", "reversed", "selected",
+]);
+
 /**
  * Render a SIP data structure to a DOM Node.
  *
@@ -37,10 +54,28 @@ interface SemaInterpreterLike {
  * Special attribute handling:
  * - `on-*` attributes are event handlers (value = Sema function name string)
  * - `style` can be a string or a map of CSS properties
- * - `class` sets className
- * - `value`, `checked`, `disabled` set corresponding DOM properties
+ * - `class` sets the class attribute (accepts a string or an array of
+ *   strings, space-joined; falsy/nil entries are dropped)
+ * - `value`, `checked` set corresponding DOM properties
+ * - Recognized HTML boolean attributes (`disabled`, `required`, `selected`,
+ *   etc.) toggle attribute presence based on truthiness
+ * - `nil`/`undefined` attribute values omit the attribute entirely, rather
+ *   than stringifying to the literal text `"null"`/`"undefined"`
+ *
+ * `<svg>` (and `<math>`) switch the element namespace for themselves and
+ * their descendants, as real HTML parsing does; a nested `<foreignObject>`
+ * switches back to the HTML namespace for its own children.
  */
 export function renderSip(node: any, interp: SemaInterpreterLike, ctx: SemaWebContext): Node {
+  return renderSipNode(node, interp, ctx, null);
+}
+
+function renderSipNode(
+  node: any,
+  interp: SemaInterpreterLike,
+  ctx: SemaWebContext,
+  namespaceURI: string | null,
+): Node {
   // null/nil -> empty text
   if (node === null || node === undefined) {
     return document.createTextNode("");
@@ -63,14 +98,29 @@ export function renderSip(node: any, interp: SemaInterpreterLike, ctx: SemaWebCo
     if (typeof tag !== "string") {
       const frag = document.createDocumentFragment();
       for (const child of node) {
-        frag.appendChild(renderSip(child, interp, ctx));
+        frag.appendChild(renderSipNode(child, interp, ctx, namespaceURI));
       }
       return frag;
     }
 
     // Strip keyword colon prefix: ":div" -> "div"
     const tagName = tag.startsWith(":") ? tag.slice(1) : tag;
-    const el = document.createElement(tagName);
+    const lowerTag = tagName.toLowerCase();
+
+    // Determine the namespace for this element (inherited from the parent
+    // by default) and its descendants.
+    let elNamespace = namespaceURI;
+    if (lowerTag === "svg") {
+      elNamespace = SVG_NS;
+    } else if (lowerTag === "math") {
+      elNamespace = MATHML_NS;
+    }
+    const el = elNamespace
+      ? document.createElementNS(elNamespace, tagName)
+      : document.createElement(tagName);
+    // <foreignObject> stays in the SVG namespace itself, but re-enters HTML
+    // content for its children, matching real HTML/SVG parsing.
+    const childNamespace = lowerTag === "foreignobject" ? null : elNamespace;
 
     let childStart = 0;
 
@@ -87,7 +137,7 @@ export function renderSip(node: any, interp: SemaInterpreterLike, ctx: SemaWebCo
 
     // Render children
     for (let i = childStart; i < rest.length; i++) {
-      el.appendChild(renderSip(rest[i], interp, ctx));
+      el.appendChild(renderSipNode(rest[i], interp, ctx, childNamespace));
     }
 
     return el;
@@ -102,10 +152,18 @@ export function renderSip(node: any, interp: SemaInterpreterLike, ctx: SemaWebCo
  *
  * Handles:
  * - `on-*` -> event listeners (value is a Sema function name)
- * - `style` -> CSS (string or property map)
- * - `class` -> className
- * - `value`, `checked`, `disabled` -> DOM properties
+ * - `style` -> CSS (string, or a map of properties -> values)
+ * - `class` -> the `class` attribute (string, or an array of strings —
+ *   space-joined, dropping falsy/nil entries)
+ * - `value`, `checked` -> DOM properties (not attributes — these reflect
+ *   live/user-editable state, not just the initial render)
+ * - Recognized HTML boolean attributes (`disabled`, `required`, `selected`,
+ *   etc. — see `BOOLEAN_ATTRS`) -> attribute presence toggled by truthiness
  * - Everything else -> setAttribute
+ *
+ * `nil`/`undefined` attribute values are always skipped entirely (the
+ * attribute is simply not set), rather than stringified to the literal
+ * text `"null"`/`"undefined"`.
  */
 function applyAttributes(
   el: Element,
@@ -119,6 +177,10 @@ function applyAttributes(
       key = key.slice(1);
     }
 
+    if (value === null || value === undefined) {
+      continue;
+    }
+
     if (key.startsWith("on-")) {
       // Event handler: set data attribute for delegated event handling
       const eventName = key.slice(3);
@@ -128,28 +190,41 @@ function applyAttributes(
           continue;
         }
         el.setAttribute(`data-sema-on-${eventName}`, value);
+      } else {
+        console.error(`[sema-web] Event handler value for "${key}" must be a string function name, got: ${typeof value}`);
       }
     } else if (key === "style") {
       if (typeof value === "string") {
-        (el as HTMLElement).setAttribute("style", value);
-      } else if (typeof value === "object" && value !== null) {
+        el.setAttribute("style", value);
+      } else if (typeof value === "object") {
         // Style map: {":color": "red", ":font-size": "14px"}
         for (let [prop, val] of Object.entries(value)) {
           if (prop.startsWith(":")) prop = prop.slice(1);
+          if (val === null || val === undefined) continue;
           (el as HTMLElement).style.setProperty(prop, String(val));
         }
       }
     } else if (key === "class") {
-      el.className = String(value);
+      if (value === false) {
+        // no-op: a conditional class idiom like {:class (if active "on" false)}
+      } else if (Array.isArray(value)) {
+        const joined = value
+          .filter((v) => v !== null && v !== undefined && v !== false && v !== "")
+          .map(String)
+          .join(" ");
+        if (joined) el.setAttribute("class", joined);
+      } else {
+        el.setAttribute("class", String(value));
+      }
     } else if (key === "value") {
       (el as HTMLInputElement).value = String(value);
     } else if (key === "checked") {
       (el as HTMLInputElement).checked = Boolean(value);
-    } else if (key === "disabled") {
+    } else if (BOOLEAN_ATTRS.has(key)) {
       if (value) {
-        el.setAttribute("disabled", "");
+        el.setAttribute(key, "");
       } else {
-        el.removeAttribute("disabled");
+        el.removeAttribute(key);
       }
     } else {
       el.setAttribute(key, String(value));

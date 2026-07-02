@@ -1,7 +1,10 @@
 # Design: `sema web` — the dev server
 
 **Date:** 2026-07-02
-**Status:** approved design, pre-implementation (spike complete)
+**Status:** M0/M1 shipped + M4 docs (2026-07-02). `sema web` serves an app in the
+browser, hot-reloads on edit, and proxies llm/* with server keys — verified
+end-to-end in a real browser (render, hot reload, and a live chat round-trip).
+M2 (concurrency / progressive streaming) and M3 (state-preserving HMR) deferred.
 **Related:** GitHub issue #18 (§11 Tooling), `docs/plans/2026-07-02-sema-web-framework-gaps.md`, `packages/llm-proxy/`
 
 ## 1. Problem
@@ -176,6 +179,16 @@ Full detail in `spikes/sema-web-devserver/README.md`. Summary:
 - `fs/watch` fires multiple events per change → debounce required.
 
 ## 11. Milestones
+
+**Shipped 2026-07-02:** M0 (asset embedding via `make web-runtime` + build.rs
+`web_runtime` cfg), M1 (the `Web` subcommand + `dev_server.sema`: serve embedded
+runtime + synthesized import-map shell + app source; short-poll hot reload;
+native LLM proxy speaking the production protocol; browser error overlay;
+auto-open), M4 (`website/docs/web/dev-server.md`). Gates: `make test-web-e2e`
+(Playwright render + hot reload), `crates/sema/tests/web_dev_server_test.rs`
+(serving contract + live proxy). **Deferred:** M2 (concurrency → progressive
+streaming; `/stream` currently single-shot), M3 (state-preserving HMR).
+
 
 - **M0 — asset-embedding spike:** prove the Rust launcher can embed + serve the
   wasm + sema-web bundle and boot an existing example with no npm. De-risks §9.1.

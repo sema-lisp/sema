@@ -243,6 +243,7 @@ export default defineConfig({
           items: [
             { text: 'Overview', link: '/docs/web/' },
             { text: 'Getting Started', link: '/docs/web/getting-started' },
+            { text: 'Dev Server', link: '/docs/web/dev-server' },
             { text: 'Building an App', link: '/docs/web/building-apps' },
             { text: 'Reactive State', link: '/docs/web/reactive-state' },
             { text: 'Components', link: '/docs/web/components' },

@@ -47,6 +47,20 @@
     "<script type=\"text/sema\" src=\"/app/" entry "?g=" (number->string generation) "\"></script>\n"
     "<script type=\"module\">\n"
     "  import { SemaWeb } from \"@sema-lang/sema-web\";\n"
+    ;; Dev-only error overlay: surface Sema init/app errors on the page instead
+    ;; of only in the console. The loader logs app-eval errors via console.error,
+    ;; so hooking it catches those too. Cleared on the next successful reload.
+    "  function __semaError(msg){\n"
+    "    let el=document.getElementById('__sema-error');\n"
+    "    if(!el){el=document.createElement('div');el.id='__sema-error';\n"
+    "      el.style.cssText='position:fixed;left:0;right:0;top:0;z-index:99999;background:#7f1d1d;color:#fee2e2;font:13px/1.5 ui-monospace,monospace;padding:12px 16px;white-space:pre-wrap;box-shadow:0 2px 12px rgba(0,0,0,.35);cursor:pointer';\n"
+    "      el.title='click to dismiss';el.onclick=()=>el.remove();document.body.appendChild(el);}\n"
+    "    el.textContent='\\u26a0 Sema error:\\n'+msg;\n"
+    "  }\n"
+    "  const __origErr=console.error;\n"
+    "  console.error=function(){__origErr.apply(console,arguments);\n"
+    "    const m=Array.from(arguments).map(String).join(' ');\n"
+    "    if(m.indexOf('[sema')>=0||m.indexOf('Error in')>=0)__semaError(m);};\n"
     "  try {\n"
     ;; With the proxy enabled, point the browser's llm/* at this same origin —
     ;; the dev server answers /complete, /chat, /stream, ... with server keys.
@@ -56,6 +70,7 @@
     "    window.__semaInitialized = true;\n"
     "  } catch (e) {\n"
     "    window.__semaInitError = String((e && e.message) || e);\n"
+    "    __semaError(String((e && e.message) || e));\n"
     "    console.error(e);\n"
     "  }\n"
     "</script>\n"

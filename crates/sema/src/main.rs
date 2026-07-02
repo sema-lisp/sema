@@ -5,7 +5,7 @@ use std::rc::Rc;
 use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::Shell;
 
-use sema_core::{archive, intern, pretty_print, SemaError, Value, ValueView};
+use sema_core::{archive, pretty_print, SemaError, Value, ValueView};
 use sema_eval::Interpreter;
 use serde::Deserialize;
 
@@ -3451,10 +3451,6 @@ fn install_completions(shell: Shell) {
     }
 }
 
-fn dirs_path() -> std::path::PathBuf {
-    sema_core::sema_home()
-}
-
 #[cfg(test)]
 mod tests {
     use super::{compile_source_to_bytecode, run_bytecode_bytes};
@@ -3474,7 +3470,9 @@ mod tests {
         let interp = Interpreter::new_with_sandbox(&Sandbox::allow_all());
         interp.global_env.set(
             intern("component/mount!"),
-            Value::native_fn(NativeFn::simple("component/mount!", |_args| Ok(Value::nil()))),
+            Value::native_fn(NativeFn::simple("component/mount!", |_args| {
+                Ok(Value::nil())
+            })),
         );
 
         run_bytecode_bytes(&interp, &bytes).expect("compiled program should execute");
@@ -3483,8 +3481,8 @@ mod tests {
             .global_env
             .get(intern("counter-view"))
             .expect("defcomponent should define counter-view");
-        let rendered =
-            sema_eval::call_value(&interp.ctx, &counter_view, &[]).expect("counter-view should be callable");
+        let rendered = sema_eval::call_value(&interp.ctx, &counter_view, &[])
+            .expect("counter-view should be callable");
 
         assert!(!rendered.is_nil(), "component should return SIP markup");
     }

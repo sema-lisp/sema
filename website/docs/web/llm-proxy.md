@@ -137,6 +137,14 @@ interface ProxyConfig {
 
   /** Rate limiting. */
   rateLimit?: RateLimitConfig;
+
+  /**
+   * Whether to trust proxy forwarding headers (`cf-connecting-ip`,
+   * `x-forwarded-for`, `x-real-ip`) for client identity, used to key rate
+   * limiting per-IP. See "Rate Limiting" below — the default differs by
+   * adapter.
+   */
+  trustProxyHeaders?: boolean | string[];
 }
 ```
 
@@ -200,7 +208,7 @@ createVercelHandler({
 
 ### Rate Limiting
 
-The proxy includes an in-memory sliding-window rate limiter. Requests are keyed by the `Authorization` header value (or `"anonymous"` if none).
+The proxy includes an in-memory sliding-window rate limiter. Each request is keyed by the first of these that's available: the client's IP address (if `trustProxyHeaders` resolves one), then the raw `Authorization` header value, then `"anonymous"`.
 
 ```ts
 createVercelHandler({
@@ -213,8 +221,24 @@ createVercelHandler({
 });
 ```
 
+`trustProxyHeaders` controls whether `cf-connecting-ip` / `x-forwarded-for` / `x-real-ip` are trusted for per-IP keying, and its **default differs by adapter**:
+
+- **Vercel, Cloudflare, Netlify** — defaults to `true`. These platforms' own edge network sets these headers, so unauthenticated traffic is rate-limited per-IP out of the box.
+- **Node** (`createNodeHandler`) — defaults to `false`. A self-hosted server can't assume there's a trusted reverse proxy in front rewriting these headers (a client could otherwise forge `X-Forwarded-For` to dodge the limit), so it's conservative by default.
+
+```ts
+createNodeHandler({
+  provider: "openai",
+  apiKey: process.env.OPENAI_API_KEY!,
+  trustProxyHeaders: true, // only if you terminate TLS/proxying yourself (nginx, etc.)
+});
+```
+
 ::: warning
-The rate limiter is in-memory and per-instance. In serverless environments where each invocation may run in a separate container, this provides a best-effort limit rather than a hard guarantee. For strict rate limiting, use an external store (Redis, etc.) via the `auth.verify` callback.
+Two things to watch for:
+
+1. **In-memory and per-instance.** In serverless environments where each invocation may run in a separate container, this provides a best-effort limit rather than a hard guarantee. For strict rate limiting, use an external store (Redis, etc.) via the `auth.verify` callback.
+2. **The Node adapter's shared "anonymous" bucket.** If you deploy with `createNodeHandler`, don't configure `auth`, and don't set `trustProxyHeaders`, every unauthenticated client falls into the *same* `"anonymous"` bucket — so `maxRequests` becomes a global cap shared by all your users, not a per-user limit. One busy client can lock everyone else out. Either enable `auth` (which keys by the caller's token) or set `trustProxyHeaders: true` (only if you're actually behind a proxy that sets these headers honestly) to get per-client limiting.
 :::
 
 ## Endpoints

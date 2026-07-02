@@ -214,10 +214,16 @@ Browser (sema-web)              @sema-lang/llm-proxy         LLM Provider
 
 ## Security
 
-- **API keys stay server-side** — never exposed to the browser
-- **Optional auth** — protect the proxy with Bearer tokens or custom verification
-- **CORS** — configurable origin restrictions
-- **No eval** — the proxy only forwards structured JSON requests
+**What this actually protects against:** a bundled/browser-side API key can be extracted from DevTools and used by anyone, unbounded, indefinitely. Proxying converts that into a chokepoint you control — the key itself never leaves the server, and you get one place to add auth, rate limits, CORS, and monitoring. It does **not**, by itself, prevent someone from using your proxy — it just gives you the tools to constrain who can and how much.
+
+- **API keys stay server-side** — never exposed to the browser.
+- **Auth is opt-in, off by default.** Add `auth: { token: "..." }` or a custom `verify()` callback to require a bearer token before any provider call is made.
+- **CORS defaults to `"*"` (open).** Set `cors: "https://your-app.com"` before going to production, unless your static files and proxy are served from the same origin.
+- **Rate limiting is in-memory and best-effort, not a hard cap.** It's per-instance (serverless invocations may not share state) and keyed by IP address only if `trustProxyHeaders` resolves one — which defaults to `true` on Vercel/Cloudflare/Netlify (their edge network sets these headers) but `false` on the Node adapter. Deploying `createNodeHandler` without `auth` or `trustProxyHeaders` means *all* unauthenticated clients share one rate-limit bucket — one busy client can throttle everyone else. See [Rate Limiting](https://sema-lang.com/docs/web/llm-proxy#rate-limiting) for the full breakdown.
+- **No spend cap.** Rate limiting bounds request *count*, not token usage or cost — a client within the limit can still send maximally expensive requests. Use your provider's own budget/usage alerts for that.
+- **No eval** — the proxy only forwards structured JSON requests.
+
+For deployment hardening guidance, see the [Production Checklist](https://sema-lang.com/docs/web/deployment#production-checklist) and the full [LLM Proxy guide](https://sema-lang.com/docs/web/llm-proxy).
 
 ## License
 

@@ -1,4 +1,4 @@
-.PHONY: all build release build-pgo pgo-profile install install-pgo uninstall test test-lsp test-embedding-bench test-http test-llm check clippy fmt fmt-check clean run lint lint-links docs docs-check update-pricing examples examples-vm smoke-bytecode rag-demo test-providers fuzz fuzz-reader fuzz-eval fuzz-grammar fuzz-grammar-emit setup docs-search-gate bench-1m bench-10m bench-100m site-dev site-build site-preview site-deploy deploy coverage coverage-html bench bench-vm bench-save bench-suite bench-closure bench-numeric bench-compare bench-baseline profile profile-vm ts-setup ts-generate ts-test ts-playground js-lib-build js-lib-dev sema-web-example sema-web-example-build
+.PHONY: all build release web-runtime build-pgo pgo-profile install install-pgo uninstall test test-lsp test-embedding-bench test-http test-llm check clippy fmt fmt-check clean run lint lint-links docs docs-check update-pricing examples examples-vm smoke-bytecode rag-demo test-providers fuzz fuzz-reader fuzz-eval fuzz-grammar fuzz-grammar-emit setup docs-search-gate bench-1m bench-10m bench-100m site-dev site-build site-preview site-deploy deploy coverage coverage-html bench bench-vm bench-save bench-suite bench-closure bench-numeric bench-compare bench-baseline profile profile-vm ts-setup ts-generate ts-test ts-playground js-lib-build js-lib-dev sema-web-example sema-web-example-build
 
 SEMA_WEB_EXAMPLE_DIR := examples/sema-web-app
 
@@ -239,6 +239,26 @@ sema-web-example-build:
 	cp node_modules/morphdom/dist/morphdom-esm.js $(SEMA_WEB_EXAMPLE_DIR)/dist/vendor/morphdom-esm.js
 	cargo run -p sema-lang -- build --target web $(SEMA_WEB_EXAMPLE_DIR)/app.sema -o $(SEMA_WEB_EXAMPLE_DIR)/dist/app.vfs
 	@echo "Built $(SEMA_WEB_EXAMPLE_DIR)/dist/app.vfs"
+
+# Vendor the browser runtime the `sema web` dev server embeds. Builds the WASM
+# VM + JS packages, then copies the ~8 files the browser needs into the sema
+# crate's assets dir, where build.rs picks them up (`web_runtime` cfg) and
+# include_bytes! embeds them. These artifacts are gitignored (built, multi-MB);
+# run this before `cargo build` if you want a `sema web`-capable binary.
+WEB_RUNTIME_DIR := crates/sema/src/web/assets
+web-runtime:
+	npm run build:wasm
+	npm run build
+	mkdir -p $(WEB_RUNTIME_DIR)/sema/backends
+	cp packages/sema-web/dist/index.js $(WEB_RUNTIME_DIR)/sema-web.js
+	cp packages/sema/dist/index.js $(WEB_RUNTIME_DIR)/sema/index.js
+	cp packages/sema/dist/vfs.js $(WEB_RUNTIME_DIR)/sema/vfs.js
+	cp packages/sema/dist/backends/*.js $(WEB_RUNTIME_DIR)/sema/backends/
+	cp packages/sema-wasm/pkg/sema_wasm.js $(WEB_RUNTIME_DIR)/sema_wasm.js
+	cp packages/sema-wasm/pkg/sema_wasm_bg.wasm $(WEB_RUNTIME_DIR)/sema_wasm_bg.wasm
+	cp node_modules/@preact/signals-core/dist/signals-core.module.js $(WEB_RUNTIME_DIR)/signals-core.module.js
+	cp node_modules/morphdom/dist/morphdom-esm.js $(WEB_RUNTIME_DIR)/morphdom-esm.js
+	@echo "Vendored web runtime -> $(WEB_RUNTIME_DIR) (rebuild the sema binary to embed)"
 
 sema-web-example: sema-web-example-build
 	@echo ""

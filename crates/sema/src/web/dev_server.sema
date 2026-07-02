@@ -1,0 +1,70 @@
+;; dev_server.sema — the `sema web` dev server.
+;;
+;; Launched by crates/sema/src/web/mod.rs, which injects `__web-config-json`
+;; (a JSON string) and runs this file. The server never evaluates the app's
+;; Sema — the browser WASM runtime does. Its job is plumbing: serve the embedded
+;; browser runtime + a synthesized HTML shell + the app's source files.
+
+(define config (json/decode __web-config-json))
+(define host (:host config))
+(define port (:port config))
+(define entry (:entry config))
+(define runtime-dir (:runtimeDir config))
+(define app-dir (:appDir config))
+
+;; The synthesized page. An <script type="importmap"> resolves the bare
+;; @sema-lang/* specifiers to the runtime we serve under /__sema; the app's
+;; source loads via <script type="text/sema" src="/app/...">; SemaWeb.init()
+;; boots it and flags readiness on window for the e2e harness.
+(define (shell-html)
+  (string-append
+    "<!DOCTYPE html>\n"
+    "<html lang=\"en\">\n<head>\n"
+    "<meta charset=\"utf-8\">\n"
+    "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n"
+    "<title>Sema Web — " entry "</title>\n"
+    "<script type=\"importmap\">\n"
+    "{\n  \"imports\": {\n"
+    "    \"@sema-lang/sema-web\": \"/__sema/sema-web.js\",\n"
+    "    \"@sema-lang/sema\": \"/__sema/sema/index.js\",\n"
+    "    \"@sema-lang/sema-wasm\": \"/__sema/sema_wasm.js\",\n"
+    "    \"@preact/signals-core\": \"/__sema/signals-core.module.js\",\n"
+    "    \"morphdom\": \"/__sema/morphdom-esm.js\"\n"
+    "  }\n}\n"
+    "</script>\n</head>\n<body>\n"
+    "<div id=\"app\"></div>\n"
+    "<script type=\"text/sema\" src=\"/app/" entry "\"></script>\n"
+    "<script type=\"module\">\n"
+    "  import { SemaWeb } from \"@sema-lang/sema-web\";\n"
+    "  try {\n"
+    "    await SemaWeb.init();\n"
+    "    window.__semaInitialized = true;\n"
+    "  } catch (e) {\n"
+    "    window.__semaInitError = String((e && e.message) || e);\n"
+    "    console.error(e);\n"
+    "  }\n"
+    "</script>\n"
+    "</body>\n</html>\n"))
+
+(define (handle-index req)
+  (http/html (shell-html)))
+
+;; /__sema/*  → embedded runtime (WASM + JS bundle), served with real MIME types.
+;; /app/*     → the app's source directory (raw .sema + any assets).
+(define routes
+  [[:get    "/"       handle-index]
+   [:static "/__sema" runtime-dir]
+   [:static "/app"    app-dir]])
+
+(define (announce info)
+  (println "")
+  (println (string-append "  Sema Web dev server"))
+  (println (string-append "  → " (:url info)))
+  (println (string-append "  serving " entry " from " app-dir))
+  (println ""))
+
+(http/serve (http/router routes)
+  {:host host
+   :port port
+   :port-fallback true
+   :on-listen announce})

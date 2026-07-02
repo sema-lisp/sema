@@ -63,6 +63,7 @@ mod docs;
 mod import_tracer;
 mod pkg;
 mod repl;
+mod web;
 mod workflow_check;
 mod workflow_view;
 
@@ -307,6 +308,24 @@ enum Commands {
     Notebook {
         #[command(subcommand)]
         command: NotebookCommands,
+    },
+    /// Dev server for a sema-web app — serves it in the browser with a native LLM proxy
+    Web {
+        /// Path to the app's entry `.sema` file
+        file: String,
+        /// Host to bind. Loopback by default; a non-loopback host exposes the
+        /// unauthenticated LLM proxy to the network.
+        #[arg(long, default_value = "127.0.0.1")]
+        host: String,
+        /// Port to listen on (advances to the next free port if taken)
+        #[arg(short, long, default_value = "3000")]
+        port: u16,
+        /// Don't open a browser automatically
+        #[arg(long)]
+        no_open: bool,
+        /// Disable the built-in LLM proxy
+        #[arg(long)]
+        no_llm: bool,
     },
     /// Dynamic workflows — run journaled workflows and view their runs
     Workflow {
@@ -853,6 +872,18 @@ fn main() {
             }
             Commands::Notebook { command } => {
                 run_notebook_command(command);
+            }
+            Commands::Web {
+                file,
+                host,
+                port,
+                no_open,
+                no_llm,
+            } => {
+                if let Err(e) = web::run(&file, &host, port, !no_open, !no_llm) {
+                    eprintln!("sema web: {e}");
+                    std::process::exit(1);
+                }
             }
             Commands::Workflow { command } => {
                 run_workflow_command(command, &sandbox);

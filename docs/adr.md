@@ -779,8 +779,11 @@ during every inter-round park; `async/timeout` cancels cleanly at the parks.
 - No native holds a `borrow_mut` across a callback / tool execution / inline-task
   spin (copy owned inputs out first).
 
-**Honest limits:** `:on-text` streaming rounds and synchronous CPU-bound tools
-between rounds block siblings (documented); the `spawn_blocking` LLM tier has no
+**Honest limits:** `:on-text` streaming rounds (reusing the synchronous
+`do_complete_streaming`) and synchronous CPU-bound tools between rounds block
+siblings; a synchronous `:on-text` callback works, but async work inside `:on-text`
+during a streaming round is unsupported (documented, not validated). The
+`spawn_blocking` LLM tier has no
 `AbortHandle`, so a cancelled agent's in-flight round completes on the worker and is
 discarded (best-effort). Per-task budget-across-yield under concurrent spawned agents
 is a pre-existing single-completion ASYNC-1 gap, closed separately (plan Step 7).

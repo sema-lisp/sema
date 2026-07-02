@@ -171,3 +171,60 @@ fn cancelling_agent_run_cuts_the_loop_short() {
          made {calls} — the timeout could not interrupt the blocking loop"
     );
 }
+
+/// Regression: when the turn cap is reached while the model is still emitting tool
+/// calls, the async driver must still execute that final round's tools — so the
+/// returned `:messages` ends with a correlated `tool_result`, never a dangling
+/// assistant `tool_calls` turn (which a follow-up run would feed back and providers
+/// reject). Mirrors the blocking `run_tool_loop`, which executes the last round's
+/// tools. `max-turns 2` against a 3-tool-round script forces the cap mid-tools.
+#[test]
+#[serial]
+fn round_cap_with_pending_tools_leaves_valid_history() {
+    reset_io_inflight();
+
+    let fake = FakeProvider::builder("fake")
+        .model("fake-model")
+        .tool_loop(3, "ping", serde_json::json!({ "n": 1 }), "never-reached")
+        .build();
+
+    let interp = Interpreter::new();
+    reset_runtime_state();
+    register_test_provider(Box::new(fake));
+
+    // Run the agent as a spawned task (async path) and await its result. With
+    // max-turns 2 the cap hits on round 2 while a tool call is pending.
+    let program = r#"
+        (deftool ping "ping" {:n {:type :number}} (fn (n) "pong"))
+        (defagent bot {:model "fake-model" :tools [ping] :max-turns 2})
+        (let ((res (async/await (async/spawn (fn () (agent/run bot "go" {:trace true}))))))
+          (let ((msgs (:messages res)))
+            ;; The last message must be a correlated tool result (has :tool-call-id),
+            ;; proving the final round's tools ran — not a dangling :tool-calls turn.
+            (list (not (nil? (get (last msgs) :tool-call-id)))
+                  ;; ...and every assistant :tool-calls turn is followed somewhere by a
+                  ;; matching tool result (no orphan tool call in the returned history).
+                  (every? (fn (m)
+                            (or (nil? (get m :tool-calls))
+                                (any? (fn (id)
+                                        (any? (fn (r) (= (get r :tool-call-id) id)) msgs))
+                                      (map (fn (tc) (get tc :id)) (get m :tool-calls)))))
+                          msgs))))
+    "#;
+    let val = interp
+        .eval_str_compiled(program)
+        .expect("cap-mid-tools agent evaluated");
+    let checks = val.as_list().expect("(last-is-tool-result all-correlated)");
+    assert_eq!(
+        checks[0].as_bool(),
+        Some(true),
+        "returned :messages must end with a tool result, not a dangling assistant \
+         tool_calls turn (the final round's tools were skipped at the cap)"
+    );
+    assert_eq!(
+        checks[1].as_bool(),
+        Some(true),
+        "every assistant tool_calls turn in the returned history must have a \
+         correlated tool result (no orphan tool call)"
+    );
+}

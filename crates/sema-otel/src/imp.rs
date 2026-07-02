@@ -291,7 +291,16 @@ pub fn current_conversation_id() -> Option<String> {
 /// touches these thread-locals can consult this to avoid a `panic`-on-drop abort when a
 /// leaked handle (e.g. a cancelled agent run) is finally dropped at thread exit.
 pub fn tls_alive() -> bool {
-    STACK.try_with(|_| ()).is_ok() && CONVERSATION_ID.try_with(|_| ()).is_ok()
+    // Must probe EVERY thread-local a held guard's `Drop` touches, or a leaked handle
+    // dropped mid-teardown still aborts. `SpanCore::drop` touches `STACK`;
+    // `ConversationGuard::drop` unconditionally touches `CONVERSATION_ID`, `SESSION_ID`,
+    // and `USER_ID` (all via `.with`, which aborts on a destroyed TLS). These share one
+    // `thread_local!` block, but std destroys them in an unspecified order, so a window
+    // exists where one is alive and another is already gone — probe all four.
+    STACK.try_with(|_| ()).is_ok()
+        && CONVERSATION_ID.try_with(|_| ()).is_ok()
+        && SESSION_ID.try_with(|_| ()).is_ok()
+        && USER_ID.try_with(|_| ()).is_ok()
 }
 
 /// Generate a fresh, cheap conversation id (monotonic counter mixed with wall-clock).

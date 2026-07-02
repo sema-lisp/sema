@@ -510,14 +510,18 @@ pub const PRELUDE: &str = r#"
 ;; In an async scheduler task, drive the agent conversation from bytecode: each
 ;; provider round is one native (`__agent-step`) that offloads + yields `AwaitIo`,
 ;; so sibling tasks overlap during the conversation, and `async/timeout`/`async/cancel`
-;; can cut the loop at an inter-round park. `__agent-drive` loops step→exec-tools until
-;; the handle reports `:done`; loop bounds (max-turns, consecutive-error abort) are
-;; enforced in the Rust handle. The synchronous / wasm path stays the byte-identical
-;; blocking native `__agent-run-blocking`.
+;; can cut the loop at an inter-round park. A round that produced tool calls ALWAYS
+;; executes them first (so the final round at the turn cap still runs its tools and
+;; leaves a valid `assistant(tool_calls) → tool_result` history, matching the blocking
+;; path — never a dangling tool-call turn), then finishes if `:done` or recurses. Loop
+;; bounds (max-turns, consecutive-error abort) are enforced in the Rust handle. The
+;; synchronous / wasm path stays the byte-identical blocking native `__agent-run-blocking`.
 (define (__agent-drive __h)
-  (if (:done (__agent-step __h))
-      (__agent-finish __h)
-      (begin (__agent-exec-tools __h) (__agent-drive __h))))
+  (let ((__r (__agent-step __h)))
+    (if (:has-tools __r)
+        (begin (__agent-exec-tools __h)
+               (if (:done __r) (__agent-finish __h) (__agent-drive __h)))
+        (__agent-finish __h))))
 
 (define (agent/run __agent __input . __rest)
   (if (__async-context?)

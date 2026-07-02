@@ -7485,8 +7485,11 @@ fn agent_apply_step_response(token: u64, resp: ChatResponse) -> Result<Value, Se
             ));
             st.pending_tool_calls = resp.tool_calls;
             st.round += 1;
-            // Round cap: stop without executing this round's tools (the final assistant
-            // is appended in `__agent-finish`).
+            // Round cap: mark done, but `:has-tools` stays true so the driver still runs
+            // this round's tools (`__agent-exec-tools`) before finishing — matching
+            // `run_tool_loop`, which executes the final round's tools and so leaves a
+            // valid `assistant(tool_calls) → tool_result` history rather than a dangling
+            // tool-call turn that a follow-up run would feed back and providers reject.
             if st.round >= st.max_rounds {
                 st.done = true;
             }
@@ -7574,8 +7577,8 @@ fn agent_step(ctx: &EvalContext, token: u64) -> Result<Value, SemaError> {
 /// tool-result messages. Never holds the slab borrow across a callback / tool call.
 fn agent_exec_tools(ctx: &EvalContext, token: u64) -> Result<Value, SemaError> {
     // Short-borrow: copy out the pending calls + tool set + callback, then drop.
-    let (pending, tools, on_tool_call): (Vec<ToolCall>, Vec<Value>, Option<Value>) =
-        AGENT_RUNS.with(|r| {
+    let (pending, tools, on_tool_call): (Vec<ToolCall>, Vec<Value>, Option<Value>) = AGENT_RUNS
+        .with(|r| {
             let mut slab = r.borrow_mut();
             let st = slab
                 .get_mut(&token)
@@ -7638,8 +7641,11 @@ fn agent_exec_tools(ctx: &EvalContext, token: u64) -> Result<Value, SemaError> {
                 Some(st) => st,
                 None => return,
             };
-            st.messages
-                .push(ChatMessage::tool_result(tc.id.clone(), tc.name.clone(), result));
+            st.messages.push(ChatMessage::tool_result(
+                tc.id.clone(),
+                tc.name.clone(),
+                result,
+            ));
             if is_error {
                 st.consecutive_errors += 1;
                 if st.consecutive_errors >= MAX_CONSECUTIVE_TOOL_ERRORS {

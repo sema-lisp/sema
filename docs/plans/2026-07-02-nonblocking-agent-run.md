@@ -161,8 +161,12 @@ sub-agent-reentrancy test (a tool that itself calls `agent/run`).
 ## Honest limits (documented, not silent)
 
 - **Streaming rounds block siblings**: `:on-text` drives the SSE stream inline on
-  the VM thread; that round does not yield. Documented; on-text callbacks are
-  validated synchronous-only.
+  the VM thread; that round does not yield (it reuses the pre-existing synchronous
+  `do_complete_streaming`). A synchronous `:on-text` callback works and receives
+  deltas; performing an **async operation inside `:on-text`** (e.g. `await`,
+  `channel/recv`, `async/sleep`) during a streaming round is **unsupported** — the
+  yield leaks mid-native. This is a documented limitation, not a rejected/validated
+  case; do not do async work inside `:on-text`.
 - **Synchronous CPU-bound tools between rounds block siblings** (no preemption of
   Sema code — the standing single-threaded limit).
 - **In-flight-round cancel is best-effort**: the `spawn_blocking` LLM tier has no

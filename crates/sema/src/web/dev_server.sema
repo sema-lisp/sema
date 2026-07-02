@@ -20,6 +20,8 @@
 (define watcher (fs/watch app-dir))
 (define generation 0)
 
+(define llm-enabled (:llm config))
+
 ;; The synthesized page. An <script type="importmap"> resolves the bare
 ;; @sema-lang/* specifiers to the runtime we serve under /__sema; the app's
 ;; source loads via <script type="text/sema" src="/app/...">; SemaWeb.init()
@@ -46,7 +48,11 @@
     "<script type=\"module\">\n"
     "  import { SemaWeb } from \"@sema-lang/sema-web\";\n"
     "  try {\n"
-    "    await SemaWeb.init();\n"
+    ;; With the proxy enabled, point the browser's llm/* at this same origin —
+    ;; the dev server answers /complete, /chat, /stream, ... with server keys.
+    (if llm-enabled
+      "    await SemaWeb.init({ llmProxy: window.location.origin });\n"
+      "    await SemaWeb.init();\n")
     "    window.__semaInitialized = true;\n"
     "  } catch (e) {\n"
     "    window.__semaInitError = String((e && e.message) || e);\n"
@@ -72,14 +78,78 @@
     (set! generation (+ generation 1)))
   (http/ok {:generation generation}))
 
+;; --- LLM proxy (enabled unless --no-llm) ------------------------------------
+;; Speaks the same protocol as @sema-lang/llm-proxy so the browser client works
+;; unchanged; each handler just calls native llm/* with the server's env keys.
+;; The request body carries the model/options the app passed, so it is forwarded
+;; as the opts map (llm/* reads only the keys it knows).
+
+;; The browser sends messages as JSON {role, content}; native llm/* wants
+;; message values with keyword roles.
+(define (->messages b)
+  (map (fn (m) (message (string->keyword (:role m)) (:content m)))
+       (:messages b)))
+
+(define (handle-complete req)
+  (let ((b (:json req)))
+    (http/ok {:content (llm/complete (:prompt b) b)})))
+
+(define (handle-chat req)
+  (let ((b (:json req)))
+    (http/ok {:content (llm/chat (->messages b) b)})))
+
+(define (handle-extract req)
+  (let ((b (:json req)))
+    (http/ok (llm/extract (:schema b) (:text b) b))))
+
+(define (handle-classify req)
+  (let ((b (:json req)))
+    (http/ok {:category (llm/classify (:categories b) (:text b) b)})))
+
+(define (handle-embed req)
+  (let ((b (:json req)))
+    (http/ok {:embedding (llm/embed (:text b) b)})))
+
+(define (handle-models req)
+  (http/ok {:models (llm/list-providers)}))
+
+;; Streaming endpoint: emit SSE `data:` events shaped as sema-web's client
+;; expects — {type:"token",text} then {type:"done"}.
+;;
+;; MVP caveat: progressive token-by-token streaming is deferred to the M2
+;; concurrency work. Native llm/stream drives its own tokio runtime and invokes
+;; the chunk callback from inside it, where the SSE channel's blocking send
+;; panics. So we run the non-streaming llm/chat (which returns on the main
+;; thread) and emit the whole reply as a single token. The response still
+;; renders; it just isn't revealed incrementally.
+(define (handle-stream req)
+  (let ((b (:json req)))
+    (http/stream
+      (fn (send)
+        (let ((text (llm/chat (->messages b) b)))
+          (send (json/encode {:type "token" :text text}))
+          (send (json/encode {:type "done"})))))))
+
 ;; /__sema/*    → embedded runtime (WASM + JS bundle), served with real MIME types.
 ;; /app/*       → the app's source directory (raw .sema + any assets).
 ;; /__dev/poll  → hot-reload generation (instant response; never blocks).
-(define routes
+(define base-routes
   [[:get    "/"           handle-index]
    [:get    "/__dev/poll" handle-poll]
    [:static "/__sema"     runtime-dir]
    [:static "/app"        app-dir]])
+
+(define llm-routes
+  [[:post "/complete" handle-complete]
+   [:post "/chat"     handle-chat]
+   [:post "/stream"   handle-stream]
+   [:post "/extract"  handle-extract]
+   [:post "/classify" handle-classify]
+   [:post "/embed"    handle-embed]
+   [:get  "/models"   handle-models]])
+
+(define routes
+  (if llm-enabled (append base-routes llm-routes) base-routes))
 
 (define (announce info)
   (println "")

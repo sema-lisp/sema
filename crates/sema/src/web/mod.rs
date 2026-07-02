@@ -57,6 +57,11 @@ pub fn run(entry: &str, host: &str, port: u16, open: bool, llm: bool) -> Result<
     interp
         .eval_str_in_global(&format!("(define __web-config-json {config_literal})"))
         .map_err(|e| format!("web config injection failed: {}", e.inner()))?;
+    // Configure LLM providers from env keys (as the CLI does) so the proxy can
+    // reach real providers. Harmless when no keys are set.
+    if llm {
+        let _ = interp.eval_str("(llm/auto-configure)");
+    }
     interp
         .eval_str_in_global(include_str!("dev_server.sema"))
         .map_err(|e| format!("dev server error: {}", e.inner()))?;

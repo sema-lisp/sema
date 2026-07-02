@@ -75,6 +75,12 @@ fn test_web_dev_server_serves_runtime_shell_and_app() {
         shell.contains("SemaWeb.init"),
         "shell must boot the runtime"
     );
+    // The LLM proxy is on by default, so the shell wires the browser's llm/*
+    // at this origin.
+    assert!(
+        shell.contains("llmProxy"),
+        "shell must wire the LLM proxy when enabled"
+    );
 
     // The WASM binary MUST be served as application/wasm for instantiateStreaming.
     let wasm = client
@@ -111,6 +117,43 @@ fn test_web_dev_server_serves_runtime_shell_and_app() {
     assert!(
         !app.text().unwrap_or_default().is_empty(),
         "app source should be non-empty"
+    );
+
+    child.kill().ok();
+    child.wait().ok();
+}
+
+#[test]
+#[ignore] // requires network + embedded runtime + ANTHROPIC_API_KEY
+fn test_web_dev_server_llm_proxy_complete_live() {
+    if std::env::var("ANTHROPIC_API_KEY").is_err() {
+        eprintln!("skipping: ANTHROPIC_API_KEY not set");
+        return;
+    }
+    let port = 19931;
+    let Some(mut child) = spawn_dev_server("examples/web/counter.sema", port) else {
+        return;
+    };
+
+    // The proxy speaks the production llm-proxy protocol: POST /complete with a
+    // prompt returns {content}. Uses a cheap model.
+    let client = reqwest::blocking::Client::new();
+    let resp = client
+        .post(format!("http://127.0.0.1:{port}/complete"))
+        .json(&serde_json::json!({
+            "prompt": "Reply with exactly one word: hello",
+            "model": "claude-haiku-4-5-20251001",
+            "max-tokens": 10,
+        }))
+        .timeout(Duration::from_secs(30))
+        .send()
+        .expect("POST /complete");
+    assert_eq!(resp.status(), 200, "proxy /complete should succeed");
+    let body: serde_json::Value = resp.json().expect("json body");
+    let content = body.get("content").and_then(|c| c.as_str()).unwrap_or("");
+    assert!(
+        !content.is_empty(),
+        "response should carry content, got: {body}"
     );
 
     child.kill().ok();

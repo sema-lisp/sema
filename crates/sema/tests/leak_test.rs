@@ -1,14 +1,13 @@
-//! CORE-2 leak-sizing oracle: recursive local closures form `Rc` cycles that
-//! reference counting cannot reclaim, so heap growth is unbounded in
-//! long-lived sessions (REPL, notebook, server, agents).
+//! CORE-2 leak oracles: recursive local closures and env⇄closure `define`s
+//! form `Rc` cycles that reference counting alone cannot reclaim. The cycle
+//! collector (`sema_core::cycle`, ADR #66, `docs/plans/2026-07-02-core2-gc.md`)
+//! severs them at safe points (`make_closure` threshold, top-level eval
+//! return, `Interpreter::drop`), so these tests assert BOUNDED live-heap
+//! growth across churn and teardown workloads. The controls prove the
+//! measurement harness itself is sound (same workload shapes without cycles
+//! stay flat under plain `Rc` drop).
 //!
-//! The `#[ignore]`d tests are the acceptance oracle for the cycle-collector
-//! work (`docs/plans/2026-07-02-core2-gc.md`): they assert BOUNDED live-heap
-//! growth and FAIL today, printing the measured leak rate. Un-ignore them when
-//! the collector lands. The non-ignored controls prove the measurement harness
-//! itself is sound (same workload shapes without cycles stay flat).
-//!
-//! Run the oracle: `cargo test -p sema-lang --test leak_test -- --ignored --nocapture`
+//! Run with rates printed: `cargo test -p sema-lang --test leak_test -- --nocapture`
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicIsize, Ordering};
@@ -119,9 +118,10 @@ fn assert_bounded_churn(program: &str, label: &str) {
 
 /// CORE-2 oracle, VM upvalue shape: each `churn` call creates a recursive
 /// local closure whose self-capture is an `Rc<UpvalueCell>` closed over the
-/// closure itself — an unreclaimable cycle. Grows ~300 B/iter today.
+/// closure itself — a cycle plain `Rc` drop cannot reclaim (~300 B/iter
+/// before the collector). The `make_closure` threshold safe point severs the
+/// cells mid-workload, so growth stays bounded even inside one long eval.
 #[test]
-#[ignore = "CORE-2 acceptance oracle: fails until the cycle collector lands (docs/plans/2026-07-02-core2-gc.md)"]
 fn recursive_local_closure_growth_is_bounded() {
     assert_bounded_churn(CHURN_RECURSIVE, "recursive-local-closure churn");
 }
@@ -135,38 +135,106 @@ fn nonrecursive_local_closure_growth_is_bounded() {
 
 const TEARDOWN_ITERS: usize = 10;
 
-fn interpreter_teardown_growth(program: Option<&str>) -> isize {
+/// Net growth of TEARDOWN_ITERS create→eval→drop cycles. `programs` runs as
+/// successive top-level evals on the one interpreter (later programs can rely
+/// on earlier ones being *executed* — e.g. a macro body reading a `define`d
+/// value at expansion time).
+///
+/// The warmup ends with a program-less quiescing teardown: its drop-time
+/// collection reclaims anything the last warmup run's drop could not (a
+/// retained env would otherwise be freed by measured run #1 and mask an
+/// equal-sized retention left by the final measured run — the "one-behind"
+/// cancellation). The measured window therefore starts from a fully-collected
+/// heap, so even a bounded last-drop-retains leak shows as growth.
+fn interpreter_teardown_growth(programs: &[&str]) -> isize {
     let _guard = MEASURE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let run_once = || {
         let interp = Interpreter::new();
-        if let Some(src) = program {
+        for src in programs {
             interp.eval_str_compiled(src).expect("eval");
         }
     };
     measure(
-        || (0..3).for_each(|_| run_once()),
+        || {
+            (0..3).for_each(|_| run_once());
+            drop(Interpreter::new());
+        },
         || (0..TEARDOWN_ITERS).for_each(|_| run_once()),
     )
+}
+
+fn assert_bounded_teardown(grown: isize, label: &str, leak_desc: &str) {
+    let per_drop = grown / TEARDOWN_ITERS as isize;
+    println!("{label}: net growth {grown} B over {TEARDOWN_ITERS} drops ({per_drop} B/drop)");
+    assert!(
+        grown < TEARDOWN_ITERS as isize * 4096,
+        "each dropped Interpreter leaked ~{per_drop} bytes ({leak_desc}; CORE-2)"
+    );
 }
 
 /// CORE-2 oracle, Env shape: `(define (f x) x)` makes the global env bind a
 /// closure whose `Closure::globals` points back at that env
 /// (`Env → binding → NativeFn → VmClosurePayload → Closure → globals → Env`),
-/// so dropping the Interpreter leaks its ENTIRE global environment — every
-/// builtin, the bindings map, all of it. One user-defined function suffices.
+/// which would pin the ENTIRE global environment past teardown — every
+/// builtin, the bindings map, all of it. `Interpreter::drop` releases its own
+/// env ref and runs an unpinned collection, severing the cycle so the env is
+/// freed with the interpreter.
 #[test]
-#[ignore = "CORE-2 acceptance oracle: fails until the cycle collector lands (docs/plans/2026-07-02-core2-gc.md)"]
 fn interpreter_teardown_frees_global_env() {
-    let grown = interpreter_teardown_growth(Some("(define (f x) x)"));
-    let per_drop = grown / TEARDOWN_ITERS as isize;
-    println!(
-        "interpreter teardown with one define: net growth {grown} B over {TEARDOWN_ITERS} drops ({per_drop} B/drop)"
+    let grown = interpreter_teardown_growth(&["(define (f x) x)"]);
+    assert_bounded_teardown(
+        grown,
+        "interpreter teardown with one define",
+        "whole global env pinned by the Env⇄Closure cycle",
     );
-    assert!(
-        grown < TEARDOWN_ITERS as isize * 4096,
-        "each dropped Interpreter leaked ~{per_drop} bytes (whole global env pinned by the \
-         Env⇄Closure cycle; CORE-2)"
+}
+
+/// CORE-2 oracle, consts shape: a macro expanding to a live closure VALUE is
+/// compiled into chunk consts (`lower_expr`'s catch-all `CoreExpr::Const`),
+/// making the const a real strong edge on the Env⇄Closure cycle. The tracer
+/// reports chunk consts exactly; untraced, the consts ref would act as a
+/// phantom external count keeping the injected closure — and through its home
+/// globals the whole global env — black at teardown.
+#[test]
+fn interpreter_teardown_with_macro_injected_const_frees_env() {
+    let grown = interpreter_teardown_growth(&[
+        "(define (f x) (* x 3))",
+        "(begin (defmacro inject () f) (define (user x) ((inject) x)) (user 2))",
+    ]);
+    assert_bounded_teardown(
+        grown,
+        "interpreter teardown with macro-injected const",
+        "global env pinned through an untraced chunk-consts edge",
     );
+}
+
+/// CORE-2 oracle, module shape: `import` caches export closures in
+/// `EvalContext.module_cache`, and the ctx outlives the teardown collection
+/// (fields drop after the `Drop` body) — so `Interpreter::drop` must clear the
+/// ctx-held Value stores first, or the cached exports keep the module env and,
+/// via its parent chain, the ENTIRE global env externally referenced.
+#[test]
+fn interpreter_teardown_with_import_frees_module_env() {
+    let dir = std::env::temp_dir().join(format!("sema-leak-import-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("create temp dir");
+    let path = dir.join("lib.sema");
+    std::fs::write(
+        &path,
+        "(define (private-helper x) (* x 10))\n\
+         (define (public-api x) (private-helper (+ x 1)))\n",
+    )
+    .expect("write module");
+    let program = format!(
+        r#"(begin (import "{}" public-api) (public-api 3))"#,
+        path.display()
+    );
+    let grown = interpreter_teardown_growth(&[&program]);
+    assert_bounded_teardown(
+        grown,
+        "interpreter teardown with module import",
+        "global env pinned by module-cache export closures held past the teardown collect",
+    );
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// CORE-2 M1 gate, builtin-delegate shape: the `register_vm_delegates` (and
@@ -177,14 +245,10 @@ fn interpreter_teardown_frees_global_env() {
 /// down cleanly under plain `Rc` drop — no collector involved.
 #[test]
 fn interpreter_teardown_without_defines_is_bounded() {
-    let grown = interpreter_teardown_growth(None);
-    let per_drop = grown / TEARDOWN_ITERS as isize;
-    println!(
-        "interpreter teardown (no defines): net growth {grown} B over {TEARDOWN_ITERS} drops ({per_drop} B/drop)"
-    );
-    assert!(
-        grown < TEARDOWN_ITERS as isize * 4096,
-        "each dropped Interpreter leaked ~{per_drop} bytes with no user code \
-         (builtin delegates strongly capture their home env; CORE-2)"
+    let grown = interpreter_teardown_growth(&[]);
+    assert_bounded_teardown(
+        grown,
+        "interpreter teardown (no defines)",
+        "no user code ran — builtin delegates strongly capture their home env",
     );
 }

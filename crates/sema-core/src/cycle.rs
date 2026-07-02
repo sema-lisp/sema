@@ -200,6 +200,19 @@ pub struct GcStats {
     pub aborted: bool,
 }
 
+impl GcStats {
+    /// All-zero stats (`Default`, usable in `const` contexts).
+    pub const fn new() -> Self {
+        GcStats {
+            candidates: 0,
+            traced: 0,
+            collected: 0,
+            pruned: 0,
+            aborted: false,
+        }
+    }
+}
+
 // ── Thread-local collector state ──────────────────────────────────
 
 thread_local! {
@@ -214,6 +227,8 @@ thread_local! {
         RefCell::new(HashMap::new());
     static COLLECTING: Cell<bool> = const { Cell::new(false) };
     static LAST_SURVIVORS: Cell<usize> = const { Cell::new(0) };
+    /// Stats of the last *completed* (non-aborted) pass, for `(gc/stats)`.
+    static LAST_STATS: Cell<GcStats> = const { Cell::new(GcStats::new()) };
 }
 
 /// Register a cycle-birth candidate. Plain O(1) push — no dedup: each of
@@ -520,25 +535,61 @@ pub fn collect(pins: &[NodePtr]) -> GcStats {
     ENV_SEEN.with(|s| s.borrow_mut().retain(|_, weak| weak.strong_count() > 0));
     LAST_SURVIVORS.with(|c| c.set(survivors));
 
-    GcStats {
+    let stats = GcStats {
         candidates,
         traced,
         collected,
         pruned,
         aborted: false,
+    };
+    LAST_STATS.with(|c| c.set(stats));
+    stats
+}
+
+/// Stats of the last completed collection pass (all-zero before the first
+/// one). Aborted passes mutate nothing and are not recorded.
+pub fn last_stats() -> GcStats {
+    LAST_STATS.with(|c| c.get())
+}
+
+/// Current registry length (live + not-yet-pruned dead entries) — the value
+/// the growth threshold is checked against.
+pub fn registry_len() -> usize {
+    REGISTRY.with(|r| r.borrow().len())
+}
+
+/// True when the registry has grown past the collection threshold and no
+/// collection is already running — the cheap pre-check that lets hot safe
+/// points (`make_closure`) skip building a pin set when no pass would run.
+pub fn should_collect() -> bool {
+    if COLLECTING.with(|c| c.get()) {
+        return false;
     }
+    let threshold = std::cmp::max(1024, 2 * LAST_SURVIVORS.with(|c| c.get()));
+    registry_len() > threshold
+}
+
+/// Pin set for a session root env: the wrapper allocation, its bindings, and
+/// every ancestor wrapper/bindings up the parent chain. Passing this to
+/// [`collect`]/[`maybe_collect`] keeps a pass from descending the live global
+/// namespace (a pure optimization — pinned nodes are externally referenced by
+/// definition).
+pub fn env_chain_pins(env: &Rc<Env>) -> Vec<NodePtr> {
+    let mut pins = vec![NodePtr::of_rc(env), NodePtr::of_env_bindings(env)];
+    let mut parent = env.parent.clone();
+    while let Some(p) = parent {
+        pins.push(NodePtr::of_rc(&p));
+        pins.push(NodePtr::of_env_bindings(&p));
+        parent = p.parent.clone();
+    }
+    pins
 }
 
 /// Threshold-gated [`collect`] for safe points: runs when the registry has
 /// grown past `max(1024, 2 × survivors of the last collect)` (CPython's
 /// generation-0 heuristic flattened to one generation).
 pub fn maybe_collect(pins: &[NodePtr]) -> Option<GcStats> {
-    if COLLECTING.with(|c| c.get()) {
-        return None;
-    }
-    let len = REGISTRY.with(|r| r.borrow().len());
-    let threshold = std::cmp::max(1024, 2 * LAST_SURVIVORS.with(|c| c.get()));
-    (len > threshold).then(|| collect(pins))
+    should_collect().then(|| collect(pins))
 }
 
 /// RAII guard for the thread-local `COLLECTING` flag: engaged for the whole

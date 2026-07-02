@@ -32,9 +32,11 @@ pub use context::{
     CallCallbackFn, EvalCallbackFn, EvalContext,
 };
 pub use cycle::{
-    collect as gc_collect, maybe_collect as gc_maybe_collect, register_candidate,
-    register_env_candidate, register_payload_tracer, trace_value, EnvBindings, GcEdge, GcNode,
-    GcStats, NodePtr, OpaqueSeverFn, OpaqueTraceFn, PayloadTracer,
+    collect as gc_collect, env_chain_pins as gc_env_chain_pins, last_stats as gc_last_stats,
+    maybe_collect as gc_maybe_collect, register_candidate, register_env_candidate,
+    register_payload_tracer, registry_len as gc_registry_len, should_collect as gc_should_collect,
+    trace_value, EnvBindings, GcEdge, GcNode, GcStats, NodePtr, OpaqueSeverFn, OpaqueTraceFn,
+    PayloadTracer,
 };
 pub use error::{CallFrame, SemaError, Span, SpanMap, StackTrace};
 pub use home::sema_home;

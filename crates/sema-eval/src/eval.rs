@@ -60,6 +60,33 @@ impl Drop for Interpreter {
         // inside shutdown_scheduler — a different interpreter's scheduler on
         // the same thread is left alone.
         sema_vm::shutdown_scheduler(&self.global_env);
+        // Skip the teardown collection while unwinding: a panic anywhere in
+        // the collector would be a panic-in-destructor-during-cleanup, which
+        // aborts the whole process instead of unwinding. Nothing is lost —
+        // the candidates stay registered, so the next safe point on this
+        // thread reclaims the env.
+        if std::thread::panicking() {
+            return;
+        }
+        // `self.ctx` outlives this Drop body (fields drop after it), and its
+        // caches hold Values: module-cache export closures keep their module
+        // envs — and via the parent chain the ENTIRE global env — externally
+        // referenced, so with them held the teardown collect would free
+        // nothing. Clear every ctx-held Value store first.
+        self.ctx.module_cache.borrow_mut().clear();
+        self.ctx.user_context.borrow_mut().clear();
+        self.ctx.hidden_context.borrow_mut().clear();
+        self.ctx.context_stacks.borrow_mut().clear();
+        // Release this interpreter's own strong ref to the env BEFORE the
+        // teardown collection: with it held, the env wrapper carries an
+        // external count and trial deletion (correctly) keeps the whole env.
+        // Once released, the only refs left are the Env⇄Closure cycle edges
+        // from top-level `define`s, which the collector severs. No pins — the
+        // dying env is exactly what must be traced. Anything still externally
+        // held (e.g. a user-kept `global_env` clone) survives, and the
+        // registry reclaims it at a later safe point once released.
+        drop(std::mem::replace(&mut self.global_env, Rc::new(Env::new())));
+        sema_core::gc_collect(&[]);
     }
 }
 
@@ -168,7 +195,16 @@ impl Interpreter {
         // Reset the loop-guard step counter so the limit (if any) is per top-level
         // eval, not cumulative across calls on a reused interpreter.
         self.ctx.eval_steps.set(0);
-        vm.execute(prog.closure, &self.ctx)
+        let result = vm.execute(prog.closure, &self.ctx);
+        // Cycle-collector safe point (CORE-2): a top-level form just finished
+        // (REPL line, notebook cell, script form, embedded eval), so no VM
+        // frames or env borrows are live. Pins skip descent into this
+        // interpreter's global namespace; the scheduler's globals are the same
+        // env (init_scheduler above), so the one chain covers both.
+        if sema_core::gc_should_collect() {
+            sema_core::gc_collect(&sema_core::gc_env_chain_pins(&self.global_env));
+        }
+        result
     }
 
     /// Compile source code to bytecode without executing.
@@ -1093,4 +1129,65 @@ pub fn register_vm_delegates(env: &Rc<Env>) {
             Ok(Value::nil())
         })),
     );
+
+    // gc/collect: run a full cycle collection now (CORE-2). User-facing —
+    // registered here (not sema-stdlib) because pin computation needs
+    // sema-vm's current-VM introspection. Pins skip descent into the live
+    // global namespace of the executing VM (or of this interpreter when
+    // called outside one); correctness never depends on pins — live objects
+    // are protected by their external strong counts.
+    let gc_env = Rc::downgrade(env);
+    env.set(
+        intern("gc/collect"),
+        Value::native_fn(NativeFn::simple("gc/collect", move |args| {
+            if !args.is_empty() {
+                return Err(SemaError::arity("gc/collect", "0", args.len()));
+            }
+            let pins = match sema_vm::current_vm_globals() {
+                Some(globals) => sema_core::gc_env_chain_pins(&globals),
+                None => match gc_env.upgrade() {
+                    Some(env) => sema_core::gc_env_chain_pins(&env),
+                    None => Vec::new(),
+                },
+            };
+            Ok(gc_stats_map(&sema_core::gc_collect(&pins)))
+        })),
+    );
+
+    // gc/stats: report the last completed collection's stats plus the current
+    // candidate-registry size, without collecting.
+    env.set(
+        intern("gc/stats"),
+        Value::native_fn(NativeFn::simple("gc/stats", |args| {
+            if !args.is_empty() {
+                return Err(SemaError::arity("gc/stats", "0", args.len()));
+            }
+            let mut map = gc_stats_btree(&sema_core::gc_last_stats());
+            map.insert(
+                Value::keyword("registry-size"),
+                Value::int(sema_core::gc_registry_len() as i64),
+            );
+            Ok(Value::map(map))
+        })),
+    );
+}
+
+/// `{:candidates N :traced N :collected N :pruned N}` for the gc builtins.
+fn gc_stats_btree(stats: &sema_core::GcStats) -> BTreeMap<Value, Value> {
+    let mut map = BTreeMap::new();
+    map.insert(
+        Value::keyword("candidates"),
+        Value::int(stats.candidates as i64),
+    );
+    map.insert(Value::keyword("traced"), Value::int(stats.traced as i64));
+    map.insert(
+        Value::keyword("collected"),
+        Value::int(stats.collected as i64),
+    );
+    map.insert(Value::keyword("pruned"), Value::int(stats.pruned as i64));
+    map
+}
+
+fn gc_stats_map(stats: &sema_core::GcStats) -> Value {
+    Value::map(gc_stats_btree(stats))
 }

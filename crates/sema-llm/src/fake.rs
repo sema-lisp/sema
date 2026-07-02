@@ -97,6 +97,30 @@ pub struct FakeProvider {
     /// finishes first, so a test can prove `async/pool-map` preserves INPUT order
     /// even when concurrent completions land out of order.
     echo: bool,
+    /// When set, `complete()` drives a deterministic multi-round tool loop keyed
+    /// entirely on the REQUEST content (not a shared queue): if the request holds
+    /// fewer than `rounds` assistant messages, it returns a tool call (a fresh id
+    /// per depth); otherwise it returns the final `text`. Because the decision is a
+    /// pure function of each request's own history, N concurrent multi-round
+    /// `agent/run`s stay deterministic no matter how their rounds interleave on the
+    /// scheduler — the property a shared `script` queue cannot provide. This is the
+    /// interleave-safe oracle for non-blocking `agent/run`.
+    tool_loop: Option<ToolLoopSpec>,
+}
+
+/// A deterministic, request-keyed multi-round tool-loop script (see
+/// [`FakeProvider::tool_loop`]). Every concurrent agent independently walks the
+/// same `rounds` tool calls then a final reply, keyed on its own message depth.
+#[derive(Clone)]
+pub struct ToolLoopSpec {
+    /// Number of tool-call rounds emitted before the final text reply.
+    rounds: usize,
+    /// Tool name to invoke each round.
+    tool_name: String,
+    /// JSON arguments passed to the tool each round.
+    args: serde_json::Value,
+    /// Final assistant text returned once `rounds` tool rounds are complete.
+    text: String,
 }
 
 impl FakeProvider {
@@ -110,6 +134,7 @@ impl FakeProvider {
             embed_delay_ms: 0,
             chat_delay_ms: 0,
             echo: false,
+            tool_loop: None,
         }
     }
 
@@ -128,6 +153,7 @@ pub struct FakeProviderBuilder {
     embed_delay_ms: u64,
     chat_delay_ms: u64,
     echo: bool,
+    tool_loop: Option<ToolLoopSpec>,
 }
 
 impl FakeProviderBuilder {
@@ -281,6 +307,28 @@ impl FakeProviderBuilder {
         self
     }
 
+    /// Drive a deterministic, request-keyed multi-round tool loop: emit `rounds`
+    /// tool calls (invoking `tool_name` with `args`) then the final reply `text`.
+    /// The round is decided per-request by counting assistant messages already in
+    /// the request, so N concurrent `agent/run`s stay deterministic no matter how
+    /// their rounds interleave (unlike the shared `script` queue). See
+    /// [`ToolLoopSpec`]. Ignores/overrides the scripted queue and `echo`.
+    pub fn tool_loop(
+        mut self,
+        rounds: usize,
+        tool_name: &str,
+        args: serde_json::Value,
+        text: &str,
+    ) -> Self {
+        self.tool_loop = Some(ToolLoopSpec {
+            rounds,
+            tool_name: tool_name.to_string(),
+            args,
+            text: text.to_string(),
+        });
+        self
+    }
+
     /// Script a rerank reply: `results` is `(original_index, relevance_score)` pairs,
     /// already ordered highest-relevance-first.
     pub fn rerank(mut self, results: &[(usize, f64)]) -> Self {
@@ -311,6 +359,7 @@ impl FakeProviderBuilder {
             embed_delay_ms: self.embed_delay_ms,
             chat_delay_ms: self.chat_delay_ms,
             echo: self.echo,
+            tool_loop: self.tool_loop,
         }
     }
 
@@ -377,11 +426,46 @@ impl LlmProvider for FakeProvider {
         } else {
             None
         };
+        // Deterministic multi-round tool loop keyed on THIS request's own history,
+        // so concurrent agents stay reproducible under any interleaving. Decided
+        // before `push` moves the request.
+        let tool_loop_reply = self.tool_loop.as_ref().map(|spec| {
+            let assistant_count = request
+                .messages
+                .iter()
+                .filter(|m| m.role == "assistant")
+                .count();
+            if assistant_count < spec.rounds {
+                // Another tool round: fresh id per depth so results correlate.
+                ChatResponse {
+                    content: String::new(),
+                    role: "assistant".to_string(),
+                    model: self.default_model.clone(),
+                    tool_calls: vec![ToolCall {
+                        id: format!("call_{assistant_count}"),
+                        name: spec.tool_name.clone(),
+                        arguments: spec.args.clone(),
+                    }],
+                    usage: Usage {
+                        prompt_tokens: 10,
+                        completion_tokens: 5,
+                        model: self.default_model.clone(),
+                        ..Default::default()
+                    },
+                    stop_reason: Some("tool_use".to_string()),
+                }
+            } else {
+                self.chat_text(&spec.text)
+            }
+        });
         self.recorder.requests.lock().unwrap().push(request);
         // Injected latency: on the async path this runs on a spawn_blocking
         // worker, so a real thread sleep is what lets two completions overlap.
         if self.chat_delay_ms > 0 {
             std::thread::sleep(std::time::Duration::from_millis(self.chat_delay_ms));
+        }
+        if let Some(resp) = tool_loop_reply {
+            return Ok(resp);
         }
         if let Some(text) = echoed {
             return Ok(self.chat_text(&text));

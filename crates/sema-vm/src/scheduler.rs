@@ -71,6 +71,14 @@ struct Task {
     /// `workflow/step` opened; swapped into the thread-local on task entry and back
     /// out on leave so concurrent sibling tasks don't clobber each other's tally.
     usage_scope: Box<dyn Any>,
+    /// This task's saved LLM dynamic scope (cache-enabled/ttl, tags/metadata, stream
+    /// pre-gate flag, and the active budget frame `Rc`), type-erased (`LlmDynScope`
+    /// lives in `sema-llm`). Captured at spawn so a task inherits the `with-cache`/
+    /// `with-budget` extent it was spawned in, and swapped in/out per step so a
+    /// deferred completion reads the dispatch-time flags — not whatever was reset after
+    /// the thunk returned (ASYNC-1). The budget frame is shared by `Rc` so a concurrent
+    /// fan-out charges one aggregate.
+    llm_scope: Box<dyn Any>,
 }
 
 // ── Scheduler ──────────────────────────────────────────────────────
@@ -156,6 +164,7 @@ impl Scheduler {
             wake_at: None,
             otel: sema_core::current_conversation_scope_boxed(),
             usage_scope: sema_core::current_usage_scope_boxed(),
+            llm_scope: sema_core::current_llm_scope_boxed(),
         });
 
         Ok(promise)
@@ -513,6 +522,7 @@ pub(crate) fn run_closure_as_inline_task(
         wake_at: None,
         otel: sema_core::current_conversation_scope_boxed(),
         usage_scope: sema_core::current_usage_scope_boxed(),
+        llm_scope: sema_core::current_llm_scope_boxed(),
     });
 
     // A cooperative (headless) debug session can pause this nested inline task at
@@ -688,6 +698,10 @@ struct ReinstallGuard<'a> {
     /// task entry. Restored on leave alongside `prev_otel` so concurrent tasks'
     /// per-leaf usage tallies stay isolated. `None` once consumed.
     prev_usage_scope: Option<Box<dyn Any>>,
+    /// The LLM dynamic scope (cache/budget/tags) displaced when this task's scope was
+    /// installed on entry. Restored on leave alongside the others (ASYNC-1). `None`
+    /// once consumed.
+    prev_llm_scope: Option<Box<dyn Any>>,
 }
 
 impl ReinstallGuard<'_> {
@@ -706,6 +720,16 @@ impl ReinstallGuard<'_> {
                 task.usage_scope = task_usage;
             }
             let _ = sema_core::install_task_usage_scope(prev_usage);
+        }
+        // Restore the LLM dynamic scope in lockstep (ASYNC-1): take this task's
+        // (possibly with-cache/with-budget-modified) scope back onto the task so it
+        // resumes with the same flags, then restore the scope active before this task ran.
+        if let Some(prev_llm) = self.prev_llm_scope.take() {
+            let task_llm = sema_core::take_task_llm_scope();
+            if let Some(task) = self.task.as_mut() {
+                task.llm_scope = task_llm;
+            }
+            let _ = sema_core::install_task_llm_scope(prev_llm);
         }
         let Some(prev) = self.prev_otel.take() else {
             return;
@@ -1065,12 +1089,18 @@ fn run_until_reentrant(
         // `workflow/step` opened via the spawn-time capture).
         let task_usage = std::mem::replace(&mut task.usage_scope, Box::new(()));
         let prev_usage_scope = sema_core::install_task_usage_scope(task_usage);
+        // Install this task's LLM dynamic scope (cache/budget/tags) alongside the others,
+        // so a completion made during the step reads the flags that were in force when
+        // the task was spawned rather than whatever the thunk reset them to (ASYNC-1).
+        let task_llm = std::mem::replace(&mut task.llm_scope, Box::new(()));
+        let prev_llm_scope = sema_core::install_task_llm_scope(task_llm);
         let mut guard = ReinstallGuard {
             sched,
             task: Some(task),
             armed: true,
             prev_otel: Some(prev_otel),
             prev_usage_scope: Some(prev_usage_scope),
+            prev_llm_scope: Some(prev_llm_scope),
         };
         let task = guard.task.as_mut().expect("in-flight task present");
 
@@ -1196,6 +1226,7 @@ mod tests {
                 armed: true,
                 prev_otel: None,
                 prev_usage_scope: None,
+                prev_llm_scope: None,
             };
             // Simulate a panic mid-step (e.g. an `unreachable!()` in the VM).
             panic!("simulated task panic");

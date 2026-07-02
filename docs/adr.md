@@ -742,3 +742,57 @@ The bytecode lowerer is scope-free — it resolves a special form from a call's 
 - *Document-only, no enforcement.* Rejected: leaves the silently-wrong-result trap in place.
 
 This lands on the **Common Lisp / Clojure** model (special operators are reserved in operator position; their value namespace is irrelevant here since Sema is a Lisp-1), not Scheme's. Regular non-special-form names — including builtin *functions* like `list`/`map`/`filter` — still shadow freely. See `docs/limitations.md` #36; regression tests `reserved_*` / `shadow_builtin_*` in `eval_test.rs`.
+
+### 66. LLM dynamic scope (cache / budget / tags) is captured per async task (PROPOSED)
+
+Status: **proposed 2026-07-02** — closes deferred item **ASYNC-1**. Plan:
+`docs/plans/2026-07-02-async-1-dynamic-scope-per-task.md`.
+
+Context: `llm/with-cache`, `llm/with-budget`, and per-call `:tags`/`:metadata` set
+**dynamically-scoped thread-locals** in `crates/sema-llm/src/builtins.rs`
+(`CACHE_ENABLED`, `BUDGET_*`, `CALL_TAGS`/`CALL_META`, `STREAM_BUDGET_PREGATE`) for
+the extent of a thunk, then reset them. The cooperative scheduler
+(`crates/sema-vm/src/scheduler.rs`) can defer a task spawned inside that thunk past
+the reset, so the task reads the flags at execution time as already-reset. Symptoms:
+`(llm/cache-stats)` under-reports async cache misses (the `async_cache_miss_is_counted`
+gate was removed as flaky), and — the real correctness gap — `llm/with-budget` does
+**not** gate a concurrent fan-out, because each deferred completion charges whatever
+budget frame is installed when it resolves, not the one active when it was dispatched.
+
+**Decision:** capture the LLM dynamic scope **per task**, mirroring the two per-task
+context swaps the scheduler already ships (Decision #53's OTel context and the
+per-leaf usage scope). One new `LlmDynScope` context, owned by sema-llm, reached
+through a type-erased fn-pointer seam in `sema-core/src/async_signal.rs` (byte-for-byte
+like `set_usage_scope_task_callbacks`), seeded at `async/spawn` and swapped in/out at
+each task step via the existing `ReinstallGuard` machinery. Two field kinds:
+
+- **Read-only snapshot** (value-copied per task): cache-enabled, cache-ttl, tags,
+  metadata, stream-pregate. Fixes visibility/accounting.
+- **Shared accumulator**: the active budget frame becomes a shared
+  `Rc<RefCell<BudgetFrame>>` (like `ACTIVE_LEAF_SCOPE`), captured by-`Rc` onto every
+  task so all siblings in one `with-budget` charge **one aggregate** — the property
+  that makes concurrent gating correct. The async completion poller captures that
+  frame's `Rc` at yield time and charges into it when the future lands, exactly as
+  it already does for the usage accumulator (`builtins.rs:6172`, `6226-6229`).
+
+Single-threaded cooperative execution means only one task runs at a time, so the
+shared frame uses `RefCell`, not a lock — consistent with `ACTIVE_LEAF_SCOPE`.
+
+**Alternatives considered:**
+- *Per-task value snapshot of budget too* (no shared `Rc`). Rejected: each of N
+  concurrent tasks would see the spawn-time spent value and none the others' spend,
+  so the cap would not gate the fan-out — leaving the exact correctness gap ASYNC-1
+  flags.
+- *Snapshot only cache/tags, keep budget deferred* (Scope A only). Rejected by owner:
+  budget-gating of concurrent fan-out is the real bug; do both.
+
+**Out of scope (documented follow-up):** `FALLBACK_CHAIN`, `RATE_LIMIT_*`, and the
+active `CASSETTE` are also dynamically scoped but are not part of the ASYNC-1 report
+and each has its own subtleties (a cassette is a shared recorder handle, not a value).
+Snapshotting them onto tasks is a separate additive change; leave `// ASYNC-1
+follow-up` markers at those sites.
+
+References: `docs/deferred.md` (ASYNC-1), Decision #53 (VM-per-task async),
+`crates/sema-vm/src/scheduler.rs` (otel/usage swaps at 67/73, 698-721, 1060-1067),
+`crates/sema-core/src/async_signal.rs:417-476` (usage-scope seam),
+`crates/sema-llm/src/builtins.rs` (dynamic-scope thread-locals + async poller).

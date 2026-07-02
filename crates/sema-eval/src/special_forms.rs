@@ -155,20 +155,34 @@ fn resolve_embedded_file(
     ctx: &EvalContext,
     spec: &str,
 ) -> Option<(std::path::PathBuf, std::path::PathBuf, Vec<u8>)> {
-    let direct = std::path::PathBuf::from(spec);
-    if let Some(bytes) = ctx.get_embedded_file(&direct) {
-        let file_path = module_file_path(spec, &direct, true);
-        return Some((direct, file_path, bytes));
+    // Archive keys are stored relative to the project root (e.g. "util.sema"),
+    // but imports are commonly written "./util.sema". Try the spec as written and
+    // with a leading "./" stripped, both as a direct key and relative to the
+    // importing file's dir.
+    let normalized = spec.strip_prefix("./").unwrap_or(spec);
+    let candidates = if normalized == spec {
+        vec![spec]
+    } else {
+        vec![normalized, spec]
+    };
+
+    for s in &candidates {
+        let direct = std::path::PathBuf::from(s);
+        if let Some(bytes) = ctx.get_embedded_file(&direct) {
+            let file_path = module_file_path(s, &direct, true);
+            return Some((direct, file_path, bytes));
+        }
     }
 
     let base_dir = ctx.current_file_dir()?;
-    let candidate = base_dir.join(spec);
-    let bytes = ctx.get_embedded_file(&candidate)?;
-    Some((
-        candidate.clone(),
-        module_file_path(spec, &candidate, false),
-        bytes,
-    ))
+    for s in &candidates {
+        let candidate = base_dir.join(s);
+        if let Some(bytes) = ctx.get_embedded_file(&candidate) {
+            let file_path = module_file_path(s, &candidate, false);
+            return Some((candidate, file_path, bytes));
+        }
+    }
+    None
 }
 
 fn eval_bytes_in_env(

@@ -34,8 +34,15 @@ pub fn run(entry: &str, host: &str, port: u16, open: bool, llm: bool) -> Result<
         .unwrap_or_else(|| std::path::PathBuf::from("."));
     let app_dir = std::fs::canonicalize(&app_dir)
         .map_err(|e| format!("resolving app dir {}: {e}", app_dir.display()))?;
+    let entry_canonical = std::fs::canonicalize(entry_path)
+        .map_err(|e| format!("resolving app entry {entry}: {e}"))?;
 
     let runtime_dir = runtime::extract().map_err(|e| format!("extracting web runtime: {e}"))?;
+
+    // Where the on-the-fly `.vfs` for a multi-file app is written (served under
+    // /__build). Per-process so parallel dev servers don't collide.
+    let build_dir = std::env::temp_dir().join(format!("sema-web-build-{}", std::process::id()));
+    std::fs::create_dir_all(&build_dir).map_err(|e| format!("creating build dir: {e}"))?;
 
     // Resolve a free port up front so auto-open targets the right URL. The probe
     // listener is dropped immediately; the Sema server rebinds it (a tiny race
@@ -58,6 +65,7 @@ pub fn run(entry: &str, host: &str, port: u16, open: bool, llm: bool) -> Result<
         "entry": entry_file,
         "appDir": app_dir.to_string_lossy(),
         "runtimeDir": runtime_dir.to_string_lossy(),
+        "buildDir": build_dir.to_string_lossy(),
         "open": open,
         "llm": llm,
     });
@@ -74,10 +82,64 @@ pub fn run(entry: &str, host: &str, port: u16, open: bool, llm: bool) -> Result<
     if llm {
         let _ = interp.eval_str("(llm/auto-configure)");
     }
+
+    // `(__web/prepare)` decides how the browser loads the app and (re)builds the
+    // multi-file archive. Registered natively because it reuses the compiler /
+    // import tracer; the Sema server calls it at startup and on each reload.
+    {
+        use sema_core::{intern, NativeFn, SemaError, Value};
+        let entry_pb = entry_canonical.clone();
+        let build_pb = build_dir.clone();
+        interp.global_env.set(
+            intern("__web/prepare"),
+            Value::native_fn(NativeFn::simple("__web/prepare", move |args| {
+                if !args.is_empty() {
+                    return Err(SemaError::arity("__web/prepare", "0", args.len()));
+                }
+                Ok(web_prepare(&entry_pb, &build_pb))
+            })),
+        );
+    }
+
     interp
         .eval_str_in_global(include_str!("dev_server.sema"))
         .map_err(|e| format!("dev server error: {}", e.inner()))?;
     Ok(())
+}
+
+/// Decide how the browser should load the app and, for multi-file apps, build a
+/// fresh `.vfs`. Single-file apps run from raw source (the browser compiles them
+/// → uniform error overlay, no build step). Multi-file apps use `import`, which
+/// can't resolve against the browser's (absent) filesystem, so they're compiled
+/// to a `.vfs` archive under `build_dir` — the same artifact `sema build
+/// --target web` produces, with correct import resolution. Returns a map
+/// `{:mode "source"|"archive"|"error" :error? "..."}`. Called on startup and on
+/// every reload, so adding/removing imports mid-session is handled.
+fn web_prepare(entry: &std::path::Path, build_dir: &std::path::Path) -> sema_core::Value {
+    let imports = match crate::import_tracer::trace_imports(entry) {
+        Ok(m) => m,
+        Err(e) => return web_mode_map("error", Some(&format!("import tracing failed: {e}"))),
+    };
+    if imports.is_empty() {
+        return web_mode_map("source", None);
+    }
+    match crate::build_web_archive(entry, &[]) {
+        Ok((bytes, _)) => match std::fs::write(build_dir.join("app.vfs"), &bytes) {
+            Ok(()) => web_mode_map("archive", None),
+            Err(e) => web_mode_map("error", Some(&format!("writing archive: {e}"))),
+        },
+        Err(e) => web_mode_map("error", Some(&e)),
+    }
+}
+
+fn web_mode_map(mode: &str, error: Option<&str>) -> sema_core::Value {
+    use sema_core::Value;
+    let mut m = std::collections::BTreeMap::new();
+    m.insert(Value::keyword("mode"), Value::string(mode));
+    if let Some(e) = error {
+        m.insert(Value::keyword("error"), Value::string(e));
+    }
+    Value::map(m)
 }
 
 /// Open the app in the default browser once the server accepts connections.

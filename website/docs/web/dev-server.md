@@ -86,10 +86,11 @@ overlay to dismiss it; the next successful reload clears it.
 
 ## Multi-file apps
 
-The dev server serves a **single entry file**. Apps that `(import ...)` other
-`.sema` modules need the compiled-archive path — build a `.vfs` with
-`sema build --target web` (see [Deployment](/docs/web/deployment)). Single-file
-apps — which includes every example — run directly.
+Multi-file apps work with no extra steps. A single-file app runs from raw source
+(the browser compiles it directly); an app that `(import ...)`s other `.sema`
+modules is compiled to a `.vfs` archive on the fly — the same artifact
+[`sema build --target web`](/docs/web/deployment) produces — and rebuilt on each
+reload. The dev server picks the right mode automatically; imports just resolve.
 
 ## How it compares
 

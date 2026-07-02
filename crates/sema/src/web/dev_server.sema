@@ -11,6 +11,15 @@
 (define entry (:entry config))
 (define runtime-dir (:runtimeDir config))
 (define app-dir (:appDir config))
+(define build-dir (:buildDir config))
+
+;; How the browser loads the app: single-file apps run from raw source; an app
+;; that uses `import` can't resolve modules against the browser's (absent) fs, so
+;; it's compiled to a `.vfs` under build-dir and served from /__build. `__web/prepare`
+;; (native) decides + (re)builds, returning {:mode "source"|"archive"|"error"}.
+(define app-state (__web/prepare))
+(define app-mode (:mode app-state))
+(define app-error (:error app-state))
 
 ;; Watch the app dir; each poll drains pending events and, if any fired, bumps a
 ;; generation the browser diffs against to trigger a reload. fs/watch emits
@@ -22,10 +31,25 @@
 
 (define llm-enabled (:llm config))
 
+;; The tag that loads the app: raw source for single-file apps, the compiled
+;; .vfs for multi-file, or a visible build error. Generation cache-busts it.
+(define (app-script-tag)
+  (cond
+    ((equal? app-mode "error")
+     (string-append
+       "<pre style=\"margin:1rem;padding:1rem;background:#7f1d1d;color:#fee2e2;"
+       "border-radius:8px;white-space:pre-wrap;font:13px/1.5 ui-monospace,monospace\">"
+       "Build error:\n" (or app-error "") "</pre>\n"))
+    ((equal? app-mode "archive")
+     (string-append "<script type=\"text/sema\" src=\"/__build/app.vfs?g="
+                    (number->string generation) "\"></script>\n"))
+    (else
+     (string-append "<script type=\"text/sema\" src=\"/app/" entry "?g="
+                    (number->string generation) "\"></script>\n"))))
+
 ;; The synthesized page. An <script type="importmap"> resolves the bare
-;; @sema-lang/* specifiers to the runtime we serve under /__sema; the app's
-;; source loads via <script type="text/sema" src="/app/...">; SemaWeb.init()
-;; boots it and flags readiness on window for the e2e harness.
+;; @sema-lang/* specifiers to the runtime we serve under /__sema; the app loads
+;; via app-script-tag; SemaWeb.init() boots it and flags readiness for e2e.
 (define (shell-html)
   (string-append
     "<!DOCTYPE html>\n"
@@ -44,7 +68,7 @@
     "  }\n}\n"
     "</script>\n</head>\n<body>\n"
     "<div id=\"app\"></div>\n"
-    "<script type=\"text/sema\" src=\"/app/" entry "?g=" (number->string generation) "\"></script>\n"
+    (app-script-tag)
     "<script type=\"module\">\n"
     "  import { SemaWeb } from \"@sema-lang/sema-web\";\n"
     ;; Dev-only error overlay: surface Sema init/app errors on the page instead
@@ -90,6 +114,11 @@
 
 (define (handle-poll req)
   (when (> (length (fs/watch-events watcher)) 0)
+    ;; Re-decide mode + rebuild the archive so edits (and added/removed imports)
+    ;; take effect on reload.
+    (let ((st (__web/prepare)))
+      (set! app-mode (:mode st))
+      (set! app-error (:error st)))
     (set! generation (+ generation 1)))
   (http/ok {:generation generation}))
 
@@ -152,6 +181,7 @@
   [[:get    "/"           handle-index]
    [:get    "/__dev/poll" handle-poll]
    [:static "/__sema"     runtime-dir]
+   [:static "/__build"    build-dir]
    [:static "/app"        app-dir]])
 
 (define llm-routes

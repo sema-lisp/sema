@@ -494,6 +494,9 @@ pub fn list_targets() {
         }
     }
     eprintln!();
+    eprintln!("Special targets:");
+    eprintln!("  web          → emits a .vfs archive for SemaWeb");
+    eprintln!();
     eprintln!("Aliases:");
     eprintln!("  linux        → x86_64-unknown-linux-gnu");
     eprintln!("  linux-arm    → aarch64-unknown-linux-gnu");

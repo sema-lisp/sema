@@ -1,0 +1,24 @@
+;; hello.sema — Simple DOM hello world
+;;
+;; Demonstrates basic DOM manipulation from Sema.
+;; Run in a page with: <div id="app"></div>
+
+(let ((app (dom/query "#app"))
+      (heading (dom/create-element "h1"))
+      (paragraph (dom/create-element "p")))
+
+  ;; Set content
+  (dom/set-text! heading "Hello from Sema!")
+  (dom/set-text! paragraph "This page is powered by Sema running in WebAssembly.")
+
+  ;; Style the heading
+  (dom/set-style! heading "color" "#6366f1")
+  (dom/set-style! heading "font-family" "system-ui, sans-serif")
+
+  ;; Style the paragraph
+  (dom/set-style! paragraph "color" "#64748b")
+  (dom/set-style! paragraph "font-size" "1.2rem")
+
+  ;; Add to page
+  (dom/append-child! app heading)
+  (dom/append-child! app paragraph))

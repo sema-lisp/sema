@@ -1,4 +1,5 @@
 #![allow(clippy::mutable_key_type)]
+pub mod archive;
 pub mod async_signal;
 pub mod context;
 pub mod cycle;
@@ -6,6 +7,7 @@ pub mod error;
 pub mod home;
 pub mod json;
 pub mod mcp_cassette;
+pub mod net;
 pub mod output_hook;
 pub mod resolve;
 pub mod sandbox;

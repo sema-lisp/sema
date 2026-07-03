@@ -98,7 +98,7 @@ fn build_one(
         }
 
         // Prefix tokens — attach to the following node
-        Token::Quote | Token::Quasiquote | Token::Unquote | Token::UnquoteSplice => {
+        Token::Quote | Token::Quasiquote | Token::Unquote | Token::UnquoteSplice | Token::Deref => {
             let prefix_tok = st.token.clone();
             if pos + 1 >= tokens.len() {
                 return Err(SemaError::eval("prefix token at end of input"));
@@ -453,6 +453,7 @@ fn token_width(tok: &Token) -> usize {
         Token::LBrace | Token::RBrace => 1,
         Token::Quote | Token::Quasiquote | Token::Unquote => 1,
         Token::UnquoteSplice => 2,
+        Token::Deref => 1,
         Token::ShortLambdaStart => 2,
         Token::BytevectorStart => 4,
         Token::Comment(text) => text.len(),
@@ -486,6 +487,7 @@ fn token_text(tok: &Token) -> Cow<'_, str> {
         Token::Quasiquote => Cow::Borrowed("`"),
         Token::Unquote => Cow::Borrowed(","),
         Token::UnquoteSplice => Cow::Borrowed(",@"),
+        Token::Deref => Cow::Borrowed("@"),
         Token::ShortLambdaStart => Cow::Borrowed("#("),
         Token::BytevectorStart => Cow::Borrowed("#u8("),
         Token::Comment(text) => Cow::Borrowed(text.as_str()),
@@ -499,6 +501,7 @@ fn prefix_text(tok: &Token) -> &'static str {
         Token::Quasiquote => "`",
         Token::Unquote => ",",
         Token::UnquoteSplice => ",@",
+        Token::Deref => "@",
         _ => "",
     }
 }

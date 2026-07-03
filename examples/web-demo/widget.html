@@ -1,0 +1,142 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Sema Chat Widget Demo</title>
+  <style>
+    @keyframes slideUp {
+      from { opacity: 0; transform: translateY(16px); }
+      to   { opacity: 1; transform: translateY(0); }
+    }
+    @keyframes blink {
+      0%, 80%, 100% { opacity: 0.3; }
+      40% { opacity: 1; }
+    }
+
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+      background: #09090b; color: #a1a1aa;
+      line-height: 1.7;
+    }
+
+    /* ── Landing page content ────────────────────────────── */
+    .landing { max-width: 720px; margin: 0 auto; padding: 4rem 2rem 8rem; }
+    .landing h1 {
+      font-size: 2.5rem; font-weight: 700; color: #fafafa;
+      margin-bottom: 0.5rem; letter-spacing: -0.02em;
+    }
+    .landing .subtitle {
+      font-size: 1.15rem; color: #71717a; margin-bottom: 3rem;
+    }
+    .landing h2 {
+      font-size: 1.25rem; font-weight: 600; color: #e4e4e7;
+      margin: 2.5rem 0 0.75rem; border-bottom: 1px solid #27272a;
+      padding-bottom: 0.5rem;
+    }
+    .landing p { margin-bottom: 1rem; }
+    .landing .card {
+      background: #18181b; border: 1px solid #27272a; border-radius: 12px;
+      padding: 1.5rem; margin-bottom: 1.25rem;
+    }
+    .landing .card h3 {
+      font-size: 1rem; font-weight: 600; color: #e4e4e7; margin-bottom: 0.5rem;
+    }
+    .landing code {
+      background: #27272a; color: #a78bfa; padding: 2px 6px;
+      border-radius: 4px; font-size: 0.85rem;
+    }
+    .landing .tag-row { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 1rem; }
+    .landing .tag {
+      background: #27272a; color: #818cf8; font-size: 0.75rem;
+      padding: 4px 10px; border-radius: 999px; font-weight: 500;
+    }
+  </style>
+</head>
+<body>
+
+  <!-- Sample landing page content to show the widget floating over -->
+  <div class="landing">
+    <h1>Sema Web</h1>
+    <p class="subtitle">A Lisp for the browser, powered by WebAssembly</p>
+
+    <h2>Overview</h2>
+    <p>
+      Sema Web brings the full Sema language to the browser with reactive state,
+      declarative UI rendering, and scoped CSS. Write expressive Lisp code that
+      compiles to efficient DOM updates via morphdom diffing.
+    </p>
+
+    <div class="card">
+      <h3>Reactive State</h3>
+      <p>
+        Create signals with <code>(state val)</code>, read them with
+        <code>@var</code>, and update with <code>(put! var val)</code>.
+        Components re-render automatically when their dependencies change.
+      </p>
+    </div>
+
+    <div class="card">
+      <h3>LLM Streaming</h3>
+      <p>
+        Use <code>(llm/chat-stream messages opts)</code> to get a reactive signal
+        that accumulates tokens as they arrive from the server. Components that
+        deref the stream signal re-render progressively.
+      </p>
+    </div>
+
+    <div class="card">
+      <h3>Scoped CSS</h3>
+      <p>
+        The <code>(css {...})</code> function generates unique class names and
+        injects scoped rules. Supports nested pseudo-selectors via
+        <code>&amp;</code> prefix keys.
+      </p>
+    </div>
+
+    <h2>Getting Started</h2>
+    <p>
+      Click the chat button in the bottom-right corner to try the AI assistant.
+      Your conversation is automatically saved to localStorage and restored on
+      reload. The widget demonstrates reactive state, computed values, LLM
+      streaming, scoped CSS, and component composition.
+    </p>
+
+    <div class="card">
+      <h3>Features Demonstrated</h3>
+      <p>
+        This page showcases an Intercom-style floating chat widget built entirely
+        in Sema. The widget is a single <code>.sema</code> file with no external
+        dependencies beyond the Sema Web runtime.
+      </p>
+      <div class="tag-row">
+        <span class="tag">reactive state</span>
+        <span class="tag">computed values</span>
+        <span class="tag">scoped CSS</span>
+        <span class="tag">SIP markup</span>
+        <span class="tag">event handling</span>
+        <span class="tag">LLM streaming</span>
+        <span class="tag">localStorage</span>
+        <span class="tag">DOM manipulation</span>
+        <span class="tag">components</span>
+      </div>
+    </div>
+
+    <h2>Architecture</h2>
+    <p>
+      The WASM interpreter evaluates Sema source at runtime. Reactive signals
+      (built on <code>@preact/signals-core</code>) drive automatic re-rendering.
+      SIP templates compile to virtual DOM trees that are efficiently patched
+      into the real DOM via morphdom. Event delegation on the mount target
+      dispatches to named Sema handler functions.
+    </p>
+  </div>
+
+  <!-- Chat widget mount point (empty div, widget renders into it) -->
+  <div id="chat-widget"></div>
+
+  <script type="text/sema" src="chat-widget.sema"></script>
+  <script type="module" src="widget-init.ts"></script>
+</body>
+</html>

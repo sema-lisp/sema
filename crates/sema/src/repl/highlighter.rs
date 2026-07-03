@@ -111,9 +111,12 @@ fn style_for(
                 Style::default()
             }
         }
-        Token::Quote | Token::Quasiquote | Token::Unquote | Token::UnquoteSplice | Token::Dot => {
-            Style::new().fg(TERTIARY)
-        }
+        Token::Quote
+        | Token::Quasiquote
+        | Token::Unquote
+        | Token::UnquoteSplice
+        | Token::Deref
+        | Token::Dot => Style::new().fg(TERTIARY),
         Token::ShortLambdaStart | Token::BytevectorStart => Style::new().fg(GOLD),
         Token::LParen
         | Token::RParen

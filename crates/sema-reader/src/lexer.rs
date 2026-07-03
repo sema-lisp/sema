@@ -18,6 +18,7 @@ pub enum Token {
     Quasiquote,
     Unquote,
     UnquoteSplice,
+    Deref,
     Int(i64),
     Float(f64),
     String(String),
@@ -204,6 +205,18 @@ pub fn tokenize(input: &str) -> Result<Vec<SpannedToken>, SemaError> {
                         byte_end: byte_offsets[i],
                     });
                 }
+            }
+
+            // Deref reader macro: @expr -> (deref expr)
+            '@' => {
+                col += 1;
+                i += 1;
+                tokens.push(SpannedToken {
+                    token: Token::Deref,
+                    span: span.with_end(line, col),
+                    byte_start: byte_offsets[i - 1],
+                    byte_end: byte_offsets[i],
+                });
             }
 
             // Strings

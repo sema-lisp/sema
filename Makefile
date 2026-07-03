@@ -1,4 +1,7 @@
-.PHONY: all build release build-pgo pgo-profile install install-pgo uninstall test test-lsp test-embedding-bench test-http test-llm check clippy fmt fmt-check clean run lint lint-links docs docs-check update-pricing examples smoke-bytecode rag-demo test-providers fuzz fuzz-reader fuzz-eval fuzz-grammar fuzz-grammar-emit setup docs-search-gate bench-1m bench-10m bench-100m site-dev site-build site-preview site-deploy deploy coverage coverage-html bench bench-vm bench-save bench-suite bench-closure bench-numeric bench-compare bench-baseline profile profile-vm ts-setup ts-generate ts-test ts-playground js-lib-build js-lib-dev
+.PHONY: all build release web-runtime test-web-e2e build-pgo pgo-profile install install-pgo uninstall test test-lsp test-embedding-bench test-http test-llm check clippy fmt fmt-check clean run lint lint-links docs docs-check update-pricing examples examples-vm smoke-bytecode rag-demo test-providers fuzz fuzz-reader fuzz-eval fuzz-grammar fuzz-grammar-emit setup docs-search-gate bench-1m bench-10m bench-100m site-dev site-build site-preview site-deploy deploy coverage coverage-html bench bench-vm bench-save bench-suite bench-closure bench-numeric bench-compare bench-baseline profile profile-vm ts-setup ts-generate ts-test ts-playground js-lib-build js-lib-dev sema-web-example sema-web-example-build
+
+SEMA_WEB_EXAMPLE_DIR := examples/sema-web-app
+
 build:
 	cargo build
 
@@ -110,6 +113,13 @@ test-notebook-e2e: build
 	@echo "=== Running notebook E2E tests ==="
 	cd crates/sema-notebook/tests/e2e && npx playwright test
 
+# E2E for the `sema web` dev server: vendor the browser runtime, build the
+# release binary (which embeds it), then drive the real server in a browser.
+test-web-e2e: web-runtime
+	cargo build --release -p sema-lang
+	@echo "=== Running sema web dev-server E2E tests ==="
+	cd packages/sema-web && npx playwright test --config playwright.dev-server.config.ts
+
 mutants:
 	@echo "=== Mutation testing (high-value crates) ==="
 	cargo mutants -p sema-stdlib --timeout 30 -- --test-threads=1
@@ -218,6 +228,50 @@ js-lib-build:
 
 js-lib-dev:
 	wasm-pack build crates/sema-wasm --target web --scope sema-lang --out-dir ../../packages/sema-wasm/pkg
+
+sema-web-example-build:
+	npm run build:wasm
+	npm run build
+	mkdir -p $(SEMA_WEB_EXAMPLE_DIR)/dist
+	mkdir -p $(SEMA_WEB_EXAMPLE_DIR)/dist/vendor
+	mkdir -p $(SEMA_WEB_EXAMPLE_DIR)/dist/vendor/sema
+	mkdir -p $(SEMA_WEB_EXAMPLE_DIR)/dist/vendor/sema/backends
+	cp packages/sema-web/dist/index.js $(SEMA_WEB_EXAMPLE_DIR)/dist/vendor/sema-web.js
+	cp packages/sema/dist/index.js $(SEMA_WEB_EXAMPLE_DIR)/dist/vendor/sema/index.js
+	cp packages/sema/dist/vfs.js $(SEMA_WEB_EXAMPLE_DIR)/dist/vendor/sema/vfs.js
+	cp packages/sema/dist/backends/*.js $(SEMA_WEB_EXAMPLE_DIR)/dist/vendor/sema/backends/
+	cp packages/sema-wasm/pkg/sema_wasm.js $(SEMA_WEB_EXAMPLE_DIR)/dist/vendor/sema_wasm.js
+	cp packages/sema-wasm/pkg/sema_wasm_bg.wasm $(SEMA_WEB_EXAMPLE_DIR)/dist/vendor/sema_wasm_bg.wasm
+	cp node_modules/@preact/signals-core/dist/signals-core.module.js $(SEMA_WEB_EXAMPLE_DIR)/dist/vendor/signals-core.module.js
+	cp node_modules/morphdom/dist/morphdom-esm.js $(SEMA_WEB_EXAMPLE_DIR)/dist/vendor/morphdom-esm.js
+	cargo run -p sema-lang -- build --target web $(SEMA_WEB_EXAMPLE_DIR)/app.sema -o $(SEMA_WEB_EXAMPLE_DIR)/dist/app.vfs
+	@echo "Built $(SEMA_WEB_EXAMPLE_DIR)/dist/app.vfs"
+
+# Vendor the browser runtime the `sema web` dev server embeds. Builds the WASM
+# VM + JS packages, then copies the ~8 files the browser needs into the sema
+# crate's assets dir, where build.rs picks them up (`web_runtime` cfg) and
+# include_bytes! embeds them. These artifacts are gitignored (built, multi-MB);
+# run this before `cargo build` if you want a `sema web`-capable binary.
+WEB_RUNTIME_DIR := crates/sema/src/web/assets
+web-runtime:
+	npm run build:wasm
+	npm run build
+	mkdir -p $(WEB_RUNTIME_DIR)/sema/backends
+	cp packages/sema-web/dist/index.js $(WEB_RUNTIME_DIR)/sema-web.js
+	cp packages/sema/dist/index.js $(WEB_RUNTIME_DIR)/sema/index.js
+	cp packages/sema/dist/vfs.js $(WEB_RUNTIME_DIR)/sema/vfs.js
+	cp packages/sema/dist/backends/*.js $(WEB_RUNTIME_DIR)/sema/backends/
+	cp packages/sema-wasm/pkg/sema_wasm.js $(WEB_RUNTIME_DIR)/sema_wasm.js
+	cp packages/sema-wasm/pkg/sema_wasm_bg.wasm $(WEB_RUNTIME_DIR)/sema_wasm_bg.wasm
+	cp node_modules/@preact/signals-core/dist/signals-core.module.js $(WEB_RUNTIME_DIR)/signals-core.module.js
+	cp node_modules/morphdom/dist/morphdom-esm.js $(WEB_RUNTIME_DIR)/morphdom-esm.js
+	@echo "Vendored web runtime -> $(WEB_RUNTIME_DIR) (rebuild the sema binary to embed)"
+
+sema-web-example: sema-web-example-build
+	@echo ""
+	@echo "Serving the Sema Web example folder."
+	@echo "Open: http://127.0.0.1:8788"
+	npx serve -l 8788 $(SEMA_WEB_EXAMPLE_DIR)
 
 # Playground
 deploy: site-deploy playground-deploy

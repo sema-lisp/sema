@@ -1,0 +1,14 @@
+(def count (state 0))
+
+(define (handle-inc ev) (update! count (fn (n) (+ n 1))))
+(define (handle-dec ev) (update! count (fn (n) (- n 1))))
+(define (handle-reset ev) (put! count 0))
+
+(defcomponent counter-view ()
+  [:div
+    [:p {:id "count-display"} (number->string @count)]
+    [:button {:id "btn-inc" :on-click "handle-inc"} "+"]
+    [:button {:id "btn-dec" :on-click "handle-dec"} "-"]
+    [:button {:id "btn-reset" :on-click "handle-reset"} "Reset"]])
+
+(mount! "#app" "counter-view")

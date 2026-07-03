@@ -1665,6 +1665,9 @@ fn register_wasm_io(env: &Env) {
 #[wasm_bindgen(js_name = SemaInterpreter)]
 pub struct WasmInterpreter {
     inner: sema_eval::Interpreter,
+    callback_handles: std::rc::Rc<RefCell<BTreeMap<u32, Value>>>,
+    callback_ids_by_value: std::rc::Rc<RefCell<BTreeMap<u64, u32>>>,
+    next_callback_id: std::rc::Rc<Cell<u32>>,
 }
 
 impl Default for WasmInterpreter {
@@ -1672,6 +1675,16 @@ impl Default for WasmInterpreter {
         Self::new()
     }
 }
+
+/// Summary of a loaded web archive: entry point, embedded file count, and the
+/// optional `sema-version` / `build-target` / `build-timestamp` metadata.
+type LoadedArchiveInfo = (
+    String,
+    usize,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
 
 #[wasm_bindgen(js_class = SemaInterpreter)]
 impl WasmInterpreter {
@@ -1686,7 +1699,12 @@ impl WasmInterpreter {
         // 10M steps is enough for complex examples but prevents runaway computation.
         interp.ctx.set_eval_step_limit(10_000_000);
 
-        WasmInterpreter { inner: interp }
+        WasmInterpreter {
+            inner: interp,
+            callback_handles: std::rc::Rc::new(RefCell::new(BTreeMap::new())),
+            callback_ids_by_value: std::rc::Rc::new(RefCell::new(BTreeMap::new())),
+            next_callback_id: std::rc::Rc::new(Cell::new(1)),
+        }
     }
 
     /// Evaluate code, returns JSON: {"value": "...", "output": ["...", ...], "error": null}
@@ -2442,7 +2460,12 @@ impl WasmInterpreter {
             }
         }
 
-        WasmInterpreter { inner: interp }
+        WasmInterpreter {
+            inner: interp,
+            callback_handles: std::rc::Rc::new(RefCell::new(BTreeMap::new())),
+            callback_ids_by_value: std::rc::Rc::new(RefCell::new(BTreeMap::new())),
+            next_callback_id: std::rc::Rc::new(Cell::new(1)),
+        }
     }
 
     /// Register a JavaScript function callable from Sema code.
@@ -2452,12 +2475,20 @@ impl WasmInterpreter {
 
         let callback = callback.clone();
         let fn_name = name.to_string();
+        let callback_handles = self.callback_handles.clone();
+        let callback_ids_by_value = self.callback_ids_by_value.clone();
+        let next_callback_id = self.next_callback_id.clone();
 
         let native = NativeFn::simple(&fn_name, move |args: &[Value]| {
             // Pass native JS values
             let js_array = js_sys::Array::new();
             for arg in args {
-                js_array.push(&sema_value_to_jsvalue(arg));
+                js_array.push(&sema_value_to_jsvalue_with_callbacks(
+                    arg,
+                    &callback_handles,
+                    &callback_ids_by_value,
+                    &next_callback_id,
+                ));
             }
 
             let result = callback.apply(&JsValue::NULL, &js_array).map_err(|e| {
@@ -2466,40 +2497,88 @@ impl WasmInterpreter {
             })?;
 
             // Convert JS result back to Sema value
-            if result.is_undefined() || result.is_null() {
-                Ok(Value::nil())
-            } else if let Some(b) = result.as_bool() {
-                Ok(Value::bool(b))
-            } else if let Some(n) = result.as_f64() {
-                if n.fract() == 0.0 && n >= i64::MIN as f64 && n <= i64::MAX as f64 {
-                    Ok(Value::int(n as i64))
-                } else {
-                    Ok(Value::float(n))
-                }
-            } else if let Some(s) = result.as_string() {
-                // Try parsing as JSON first for structured returns
-                match serde_json::from_str::<serde_json::Value>(&s) {
-                    Ok(json) if !json.is_string() => Ok(sema_core::json_to_value(&json)),
-                    _ => Ok(Value::string(&s)),
-                }
-            } else {
-                // Try to serialize via JSON for objects/arrays
-                match js_sys::JSON::stringify(&result) {
-                    Ok(json_str) => {
-                        let s: String = json_str.into();
-                        match serde_json::from_str::<serde_json::Value>(&s) {
-                            Ok(json) => Ok(sema_core::json_to_value(&json)),
-                            Err(_) => Ok(Value::string(&s)),
-                        }
-                    }
-                    Err(_) => Ok(Value::nil()),
-                }
-            }
+            js_value_to_sema_value_with_callbacks(&result, &callback_handles)
+                .map_err(|e| SemaError::eval(e.as_string().unwrap_or_else(|| format!("{:?}", e))))
         });
 
         self.inner
             .global_env
             .set_str(name, Value::native_fn(native));
+    }
+
+    /// Invoke a named global function directly with JS arguments.
+    ///
+    /// This avoids reparsing source strings and works for both tree-walker
+    /// lambdas and VM closures installed in the global environment.
+    #[wasm_bindgen(js_name = invokeGlobal)]
+    pub fn invoke_global(&self, name: &str, args: &js_sys::Array) -> Result<JsValue, JsValue> {
+        let spur = sema_core::intern(name);
+        let func = self
+            .inner
+            .global_env
+            .get(spur)
+            .ok_or_else(|| JsValue::from_str(&format!("Unbound variable: {name}")))?;
+
+        let mut sema_args = Vec::with_capacity(args.length() as usize);
+        for arg in args.iter() {
+            sema_args.push(js_value_to_sema_value_with_callbacks(
+                &arg,
+                &self.callback_handles,
+            )?);
+        }
+
+        match sema_eval::call_value(&self.inner.ctx, &func, &sema_args) {
+            Ok(val) => Ok(sema_value_to_jsvalue_with_callbacks(
+                &val,
+                &self.callback_handles,
+                &self.callback_ids_by_value,
+                &self.next_callback_id,
+            )),
+            Err(e) => Err(JsValue::from_str(&format!("{}", e.inner()))),
+        }
+    }
+
+    /// Invoke a stored callback handle directly with JS arguments.
+    #[wasm_bindgen(js_name = invokeCallback)]
+    pub fn invoke_callback(
+        &self,
+        callback_id: u32,
+        args: &js_sys::Array,
+    ) -> Result<JsValue, JsValue> {
+        let func = self
+            .callback_handles
+            .borrow()
+            .get(&callback_id)
+            .cloned()
+            .ok_or_else(|| JsValue::from_str(&format!("Unknown callback handle: {callback_id}")))?;
+
+        let mut sema_args = Vec::with_capacity(args.length() as usize);
+        for arg in args.iter() {
+            sema_args.push(js_value_to_sema_value_with_callbacks(
+                &arg,
+                &self.callback_handles,
+            )?);
+        }
+
+        match sema_eval::call_value(&self.inner.ctx, &func, &sema_args) {
+            Ok(val) => Ok(sema_value_to_jsvalue_with_callbacks(
+                &val,
+                &self.callback_handles,
+                &self.callback_ids_by_value,
+                &self.next_callback_id,
+            )),
+            Err(e) => Err(JsValue::from_str(&format!("{}", e.inner()))),
+        }
+    }
+
+    /// Release a callback handle that was materialized for JS.
+    #[wasm_bindgen(js_name = releaseCallback)]
+    pub fn release_callback(&self, callback_id: u32) {
+        if let Some(value) = self.callback_handles.borrow_mut().remove(&callback_id) {
+            self.callback_ids_by_value
+                .borrow_mut()
+                .remove(&value.raw_bits());
+        }
     }
 
     /// Inject a virtual module so that `(import "name")` resolves without a file.
@@ -2557,6 +2636,159 @@ impl WasmInterpreter {
                 escape_json(&format!("{}", e.inner()))
             ),
         };
+        js_sys::JSON::parse(&json_str).unwrap_or(JsValue::NULL)
+    }
+
+    /// Load a compiled web archive into the interpreter's embedded module table.
+    #[wasm_bindgen(js_name = loadArchive)]
+    pub fn load_archive(&self, archive_bytes: &[u8]) -> JsValue {
+        let result = (|| -> Result<LoadedArchiveInfo, SemaError> {
+            let archive = sema_core::archive::deserialize_archive_from_bytes(archive_bytes)
+                .map_err(|e| SemaError::eval(format!("invalid archive: {e}")))?;
+
+            let entry_point = Self::archive_metadata_value(&archive.metadata, "entry-point")
+                .unwrap_or_else(|| "__main__.semac".to_string());
+            let sema_version = Self::archive_metadata_value(&archive.metadata, "sema-version");
+            let build_target = Self::archive_metadata_value(&archive.metadata, "build-target");
+            let build_timestamp =
+                Self::archive_metadata_value(&archive.metadata, "build-timestamp");
+
+            Self::validate_web_archive_metadata(
+                sema_version.as_deref(),
+                build_target.as_deref(),
+                &entry_point,
+                archive.files.contains_key(&entry_point),
+            )?;
+
+            self.inner.ctx.clear_module_cache();
+            self.inner.ctx.clear_embedded_files();
+            for (path, bytes) in archive.files {
+                self.inner
+                    .ctx
+                    .set_embedded_file(std::path::PathBuf::from(path), bytes);
+            }
+
+            Ok((
+                entry_point,
+                self.inner.ctx.embedded_files.borrow().len(),
+                sema_version,
+                build_target,
+                build_timestamp,
+            ))
+        })();
+
+        let json_str = match result {
+            Ok((entry_point, file_count, sema_version, build_target, build_timestamp)) => format!(
+                "{{\"ok\":true,\"entryPoint\":\"{}\",\"fileCount\":{},\"semaVersion\":{},\"buildTarget\":{},\"buildTimestamp\":{},\"error\":null}}",
+                escape_json(&entry_point),
+                file_count,
+                Self::json_opt_str(sema_version.as_deref()),
+                Self::json_opt_str(build_target.as_deref()),
+                Self::json_opt_str(build_timestamp.as_deref()),
+            ),
+            Err(e) => format!(
+                "{{\"ok\":false,\"entryPoint\":null,\"fileCount\":0,\"semaVersion\":null,\"buildTarget\":null,\"buildTimestamp\":null,\"error\":\"{}\"}}",
+                escape_json(&format!("{}", e.inner()))
+            ),
+        };
+        js_sys::JSON::parse(&json_str).unwrap_or(JsValue::NULL)
+    }
+
+    fn archive_metadata_value(
+        metadata: &std::collections::HashMap<String, Vec<u8>>,
+        key: &str,
+    ) -> Option<String> {
+        metadata
+            .get(key)
+            .and_then(|value| std::str::from_utf8(value).ok())
+            .map(|value| value.to_string())
+    }
+
+    fn validate_web_archive_metadata(
+        sema_version: Option<&str>,
+        build_target: Option<&str>,
+        entry_point: &str,
+        has_entry_point: bool,
+    ) -> Result<(), SemaError> {
+        if let Some(target) = build_target {
+            if target != "web" {
+                return Err(SemaError::eval(format!(
+                    "archive build target mismatch: expected web, got {target}"
+                )));
+            }
+        }
+
+        if let Some(version) = sema_version {
+            let runtime_version = env!("CARGO_PKG_VERSION");
+            if version != runtime_version {
+                return Err(SemaError::eval(format!(
+                    "archive version mismatch: built with Sema {version}, runtime is {runtime_version}"
+                )));
+            }
+        }
+
+        if !has_entry_point {
+            return Err(SemaError::eval(format!(
+                "archive entry point not found: {entry_point}"
+            )));
+        }
+
+        Ok(())
+    }
+
+    fn json_opt_str(value: Option<&str>) -> String {
+        match value {
+            Some(value) => format!("\"{}\"", escape_json(value)),
+            None => "null".to_string(),
+        }
+    }
+
+    /// Execute an embedded archive entry path.
+    #[wasm_bindgen(js_name = runEntry)]
+    pub fn run_entry(&self, path: &str) -> JsValue {
+        OUTPUT.with(|o| o.borrow_mut().clear());
+        LINE_BUF.with(|b| b.borrow_mut().clear());
+
+        match self.run_embedded_entry_result(path) {
+            Ok(val) => self.eval_success_result(&val),
+            Err(e) => self.eval_error_result(&e),
+        }
+    }
+
+    /// Execute an embedded archive entry path with async HTTP replay support.
+    #[wasm_bindgen(js_name = runEntryAsync)]
+    pub async fn run_entry_async(&self, path: &str) -> JsValue {
+        clear_http_cache();
+
+        for _ in 0..MAX_REPLAYS {
+            OUTPUT.with(|o| o.borrow_mut().clear());
+            LINE_BUF.with(|b| b.borrow_mut().clear());
+
+            match self.run_embedded_entry_result(path) {
+                Ok(val) => return self.eval_success_result(&val),
+                Err(e) => {
+                    if is_http_await_marker(&e) {
+                        if let Some(json_str) = parse_http_marker(&e) {
+                            match perform_fetch_from_marker(&json_str).await {
+                                Ok((key, response)) => {
+                                    HTTP_CACHE.with(|c| {
+                                        c.borrow_mut().insert(key, response);
+                                    });
+                                    continue;
+                                }
+                                Err(fetch_err) => return self.eval_error_result(&fetch_err),
+                            }
+                        }
+                    }
+                    return self.eval_error_result(&e);
+                }
+            }
+        }
+
+        let json_str = format!(
+            "{{\"value\":null,\"output\":[],\"error\":\"{}\"}}",
+            escape_json("exceeded maximum number of HTTP requests (50)")
+        );
         js_sys::JSON::parse(&json_str).unwrap_or(JsValue::NULL)
     }
 
@@ -2820,6 +3052,85 @@ impl WasmInterpreter {
 }
 
 impl WasmInterpreter {
+    fn eval_success_result(&self, val: &sema_core::Value) -> JsValue {
+        let output = take_output();
+        let val_str = if val.is_nil() {
+            "null".to_string()
+        } else {
+            format!("\"{}\"", escape_json(&pretty_print(val, 80)))
+        };
+        let json_str = format!(
+            "{{\"value\":{},\"output\":[{}],\"error\":null}}",
+            val_str,
+            output
+                .iter()
+                .map(|s| format!("\"{}\"", escape_json(s)))
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        js_sys::JSON::parse(&json_str).unwrap_or(JsValue::NULL)
+    }
+
+    fn eval_error_result(&self, e: &sema_core::SemaError) -> JsValue {
+        let output = take_output();
+        let mut err_str = format!("{}", e.inner());
+        if let Some(trace) = e.stack_trace() {
+            err_str.push_str(&format!("\n{trace}"));
+        }
+        if let Some(hint) = e.hint() {
+            err_str.push_str(&format!("\n  hint: {hint}"));
+        }
+        if let Some(note) = e.note() {
+            err_str.push_str(&format!("\n  note: {note}"));
+        }
+        let json_str = format!(
+            "{{\"value\":null,\"output\":[{}],\"error\":\"{}\"}}",
+            output
+                .iter()
+                .map(|s| format!("\"{}\"", escape_json(s)))
+                .collect::<Vec<_>>()
+                .join(","),
+            escape_json(&err_str)
+        );
+        js_sys::JSON::parse(&json_str).unwrap_or(JsValue::NULL)
+    }
+
+    fn run_embedded_entry_result(&self, path: &str) -> Result<Value, SemaError> {
+        let entry_path = std::path::PathBuf::from(path);
+        let bytes = self
+            .inner
+            .ctx
+            .get_embedded_file(&entry_path)
+            .ok_or_else(|| SemaError::eval(format!("embedded entry not found: {path}")))?;
+
+        self.inner.ctx.push_file_path(entry_path.clone());
+        let result = (|| {
+            if sema_vm::is_bytecode_file(&bytes) {
+                let compiled = sema_vm::deserialize_from_bytes(&bytes)?;
+                sema_eval::execute_compile_result(
+                    &self.inner.ctx,
+                    self.inner.global_env.clone(),
+                    compiled,
+                )
+            } else {
+                let source = String::from_utf8(bytes).map_err(|e| {
+                    SemaError::eval(format!("embedded entry is not valid UTF-8: {e}"))
+                })?;
+                let (exprs, spans) = sema_reader::read_many_with_spans(&source)?;
+                self.inner.ctx.merge_span_table(spans.clone());
+                sema_eval::eval_module_body_vm(
+                    &self.inner.ctx,
+                    &self.inner.global_env,
+                    &exprs,
+                    &spans,
+                    Some(entry_path.clone()),
+                )
+            }
+        })();
+        self.inner.ctx.pop_file_path();
+        result
+    }
+
     fn debug_resume(&self, mode: sema_vm::StepMode) -> JsValue {
         DEBUG_SESSION.with(|s| {
             let mut session = s.borrow_mut();
@@ -2963,7 +3274,59 @@ impl WasmInterpreter {
     }
 }
 
-fn sema_value_to_jsvalue(val: &Value) -> JsValue {
+const CALLBACK_HANDLE_KEY: &str = "__semaCallbackHandle";
+
+fn callback_handle_from_js(value: &JsValue) -> Option<u32> {
+    if !value.is_object() {
+        return None;
+    }
+    let handle = js_sys::Reflect::get(value, &JsValue::from_str(CALLBACK_HANDLE_KEY)).ok()?;
+    let n = handle.as_f64()?;
+    if n.fract() == 0.0 && n >= 0.0 && n <= u32::MAX as f64 {
+        Some(n as u32)
+    } else {
+        None
+    }
+}
+
+fn make_callback_handle_object(callback_id: u32) -> JsValue {
+    let obj = js_sys::Object::new();
+    let _ = js_sys::Reflect::set(
+        &obj,
+        &JsValue::from_str(CALLBACK_HANDLE_KEY),
+        &JsValue::from_f64(callback_id as f64),
+    );
+    obj.into()
+}
+
+fn allocate_callback_handle(
+    val: &Value,
+    callback_handles: &std::rc::Rc<RefCell<BTreeMap<u32, Value>>>,
+    callback_ids_by_value: &std::rc::Rc<RefCell<BTreeMap<u64, u32>>>,
+    next_callback_id: &std::rc::Rc<Cell<u32>>,
+) -> u32 {
+    let raw_bits = val.raw_bits();
+    if let Some(existing) = callback_ids_by_value.borrow().get(&raw_bits).copied() {
+        return existing;
+    }
+
+    let callback_id = next_callback_id.get();
+    next_callback_id.set(callback_id.saturating_add(1));
+    callback_handles
+        .borrow_mut()
+        .insert(callback_id, val.clone());
+    callback_ids_by_value
+        .borrow_mut()
+        .insert(raw_bits, callback_id);
+    callback_id
+}
+
+fn sema_value_to_jsvalue_with_callbacks(
+    val: &Value,
+    callback_handles: &std::rc::Rc<RefCell<BTreeMap<u32, Value>>>,
+    callback_ids_by_value: &std::rc::Rc<RefCell<BTreeMap<u64, u32>>>,
+    next_callback_id: &std::rc::Rc<Cell<u32>>,
+) -> JsValue {
     match val.view() {
         ValueView::Nil => JsValue::NULL,
         ValueView::Bool(b) => JsValue::from_bool(b),
@@ -2972,6 +3335,14 @@ fn sema_value_to_jsvalue(val: &Value) -> JsValue {
         ValueView::String(s) => JsValue::from_str(&s),
         ValueView::Keyword(s) => JsValue::from_str(&format!(":{}", sema_core::resolve(s))),
         ValueView::Symbol(s) => JsValue::from_str(&sema_core::resolve(s)),
+        ValueView::Lambda(_) | ValueView::NativeFn(_) | ValueView::MultiMethod(_) => {
+            make_callback_handle_object(allocate_callback_handle(
+                val,
+                callback_handles,
+                callback_ids_by_value,
+                next_callback_id,
+            ))
+        }
         _ => {
             // For complex types (lists, maps, vectors), go through JSON.
             // Use lossy conversion so NaN/Infinity become null locally
@@ -2981,6 +3352,47 @@ fn sema_value_to_jsvalue(val: &Value) -> JsValue {
             js_sys::JSON::parse(&s).unwrap_or(JsValue::NULL)
         }
     }
+}
+
+fn js_value_to_sema_value_with_callbacks(
+    value: &JsValue,
+    callback_handles: &std::rc::Rc<RefCell<BTreeMap<u32, Value>>>,
+) -> Result<Value, JsValue> {
+    if let Some(callback_id) = callback_handle_from_js(value) {
+        return callback_handles
+            .borrow()
+            .get(&callback_id)
+            .cloned()
+            .ok_or_else(|| JsValue::from_str(&format!("Unknown callback handle: {callback_id}")));
+    }
+
+    if value.is_undefined() || value.is_null() {
+        return Ok(Value::nil());
+    }
+
+    if let Some(b) = value.as_bool() {
+        return Ok(Value::bool(b));
+    }
+
+    if let Some(n) = value.as_f64() {
+        if n.fract() == 0.0 && n >= i64::MIN as f64 && n <= i64::MAX as f64 {
+            return Ok(Value::int(n as i64));
+        }
+        return Ok(Value::float(n));
+    }
+
+    if let Some(s) = value.as_string() {
+        return Ok(Value::string(&s));
+    }
+
+    let json = js_sys::JSON::stringify(value)
+        .map_err(|e| JsValue::from_str(&format!("Failed to serialize JS value: {:?}", e)))?;
+    let json_str = json
+        .as_string()
+        .ok_or_else(|| JsValue::from_str("Failed to convert JS value to JSON string"))?;
+    let parsed: serde_json::Value = serde_json::from_str(&json_str)
+        .map_err(|e| JsValue::from_str(&format!("Failed to parse JSON value: {e}")))?;
+    Ok(sema_core::json_to_value(&parsed))
 }
 
 /// Format Sema source code. Returns JSON: {"formatted": "...", "error": null}
@@ -3070,5 +3482,44 @@ mod tests {
         );
         // The dedicated escapes are still preferred over the generic form.
         assert_eq!(escape_json("\t"), "\\t");
+    }
+
+    #[test]
+    fn web_archive_metadata_rejects_wrong_build_target() {
+        let err = WasmInterpreter::validate_web_archive_metadata(
+            Some(env!("CARGO_PKG_VERSION")),
+            Some("native"),
+            "__main__.semac",
+            true,
+        )
+        .unwrap_err();
+
+        assert!(format!("{}", err.inner()).contains("build target mismatch"));
+    }
+
+    #[test]
+    fn web_archive_metadata_rejects_version_mismatch() {
+        let err = WasmInterpreter::validate_web_archive_metadata(
+            Some("0.0.0"),
+            Some("web"),
+            "__main__.semac",
+            true,
+        )
+        .unwrap_err();
+
+        assert!(format!("{}", err.inner()).contains("archive version mismatch"));
+    }
+
+    #[test]
+    fn web_archive_metadata_rejects_missing_entry_point() {
+        let err = WasmInterpreter::validate_web_archive_metadata(
+            Some(env!("CARGO_PKG_VERSION")),
+            Some("web"),
+            "__main__.semac",
+            false,
+        )
+        .unwrap_err();
+
+        assert!(format!("{}", err.inner()).contains("entry point not found"));
     }
 }

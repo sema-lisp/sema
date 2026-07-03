@@ -6,6 +6,10 @@ outline: [2, 3]
 
 When running in the browser playground at [sema.run](https://sema.run), Sema executes as WebAssembly. Most stdlib functions work identically, but some behave differently due to browser sandbox constraints, and a few web-only functions are available.
 
+::: warning Chromium ARM64 Note
+Chrome/Chromium builds before version 147 contain a V8 ARM64 WebAssembly compiler bug that can crash the renderer on some heavy tree-walker workloads in the playground. If you hit a reproducible tab crash on Apple Silicon, update Chrome or retry in Firefox, Safari, or Chrome 147+.
+:::
+
 ## Web-Only Functions
 
 These functions are **only available in the WASM playground** — they access browser APIs that don't exist in the native CLI.

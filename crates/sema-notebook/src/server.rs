@@ -123,15 +123,23 @@ pub async fn serve(notebook_path: Option<PathBuf>, host: &str, port: u16) {
         .route("/vfs/list", get(vfs_list_handler))
         .with_state(state);
 
-    let addr = format!("{host}:{port}");
-    eprintln!("Sema Notebook server listening on http://{host}:{port}");
-
-    let listener = tokio::net::TcpListener::bind(&addr)
-        .await
+    // Bind with automatic port fallback: if the requested port is taken, walk
+    // to the next free one rather than failing (a first-party niceity).
+    let (std_listener, actual_port) = sema_core::net::bind_with_fallback(host, port, 100)
         .unwrap_or_else(|e| {
-            eprintln!("Failed to bind to {addr}: {e}");
+            eprintln!("Failed to bind to {host}:{port}: {e}");
             std::process::exit(1);
         });
+    if let Err(e) = std_listener.set_nonblocking(true) {
+        eprintln!("Failed to configure listener on {host}:{actual_port}: {e}");
+        std::process::exit(1);
+    }
+    let listener = tokio::net::TcpListener::from_std(std_listener).unwrap_or_else(|e| {
+        eprintln!("Failed to bind to {host}:{port}: {e}");
+        std::process::exit(1);
+    });
+
+    eprintln!("Sema Notebook server listening on http://{host}:{actual_port}");
 
     axum::serve(listener, app)
         .await

@@ -172,6 +172,13 @@ sub-agent-reentrancy test (a tool that itself calls `agent/run`).
 - **In-flight-round cancel is best-effort**: the `spawn_blocking` LLM tier has no
   `AbortHandle`; a cancelled agent's current round completes on the worker and is
   discarded. Cancellation is clean *at the parks between rounds*.
+- ~~Cancelled agents leak their slab entry (and never-ended agent span) until
+  `reset_runtime_state`~~ **CLOSED 2026-07-03**: the scheduler fires a
+  `task-reaped` callback (`sema-core` seam) at every cancellation transition, and
+  `sema-llm`'s registered sweep removes every `AGENT_RUNS` entry stamped with the
+  reaped task's id — ending the agent span balanced on the VM thread. Pinned by
+  `cancelled_agent_leaves_no_slab_entry_and_next_run_works` /
+  `cancelled_agent_span_is_exported` (agent_async_test.rs).
 - ~~Budget under concurrent spawned agents under-enforces~~ **CLOSED 2026-07-03**:
   ASYNC-1's per-task LLM scope capture (merged from main) composes with the
   offload's dispatch-time budget-frame `Rc` snapshot — enforcement crosses

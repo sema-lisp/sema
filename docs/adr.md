@@ -787,6 +787,11 @@ during a streaming round is unsupported (documented, not validated). The
 `AbortHandle`, so a cancelled agent's in-flight round completes on the worker and is
 discarded (best-effort). Per-task budget-across-yield under concurrent spawned agents
 is a pre-existing single-completion ASYNC-1 gap, closed separately (plan Step 7).
+~~Cancelled agents leak their slab entry (and never-ended agent span) until
+`reset_runtime_state`~~ — closed 2026-07-03: the scheduler's `task-reaped` callback
+(fired at every cancellation transition, never on ordinary completion) sweeps the
+`AGENT_RUNS` entries stamped with the cancelled task's id, ending the agent span
+balanced on the VM thread.
 
 **Alternatives considered:**
 - *Poller-chained (loop entirely in one native's poller).* Rejected: memory-safe but

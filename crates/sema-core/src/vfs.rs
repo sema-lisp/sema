@@ -27,32 +27,40 @@ pub fn is_vfs_active() -> bool {
     EMBEDDED_VFS.get().is_some()
 }
 
-/// Try to resolve a path against the VFS, normalizing it.
-/// The `base_dir` is used to resolve relative paths.
-/// Returns the VFS content if found.
-pub fn vfs_resolve_and_read(path: &str, base_dir: Option<&str>) -> Option<Vec<u8>> {
-    // Try the path as-is first
-    if let Some(data) = vfs_read(path) {
-        return Some(data);
+/// Resolve `path` to the canonical VFS key it matches, or `None`. Tries the path
+/// as-is, then lexically normalized (resolving "./"/".."/interior "." — this
+/// covers entry imports like `"./util.sema"` that have no `base_dir`), then
+/// relative to `base_dir`. The returned key is the one identity used for reads,
+/// caching, and `current_file`, so every spelling of the same module dedups.
+pub fn vfs_resolve_key(path: &str, base_dir: Option<&str>) -> Option<String> {
+    if vfs_read(path).is_some() {
+        return Some(path.to_string());
     }
-
-    // Try resolving relative to base_dir
+    if let Some(norm) = normalize_path(std::path::Path::new(path)) {
+        if norm != path && vfs_read(&norm).is_some() {
+            return Some(norm);
+        }
+    }
     if let Some(base) = base_dir {
-        let resolved = std::path::Path::new(base).join(path);
-        if let Some(normalized) = normalize_path(&resolved) {
-            if let Some(data) = vfs_read(&normalized) {
-                return Some(data);
+        if let Some(norm) = normalize_path(&std::path::Path::new(base).join(path)) {
+            if vfs_read(&norm).is_some() {
+                return Some(norm);
             }
         }
     }
-
     None
+}
+
+/// Try to resolve a path against the VFS (see [`vfs_resolve_key`]) and read it.
+pub fn vfs_resolve_and_read(path: &str, base_dir: Option<&str>) -> Option<Vec<u8>> {
+    vfs_resolve_key(path, base_dir).and_then(|k| vfs_read(&k))
 }
 
 /// Normalize a path by resolving `.` and `..` components without hitting the filesystem.
 /// Returns `None` if the path would traverse above the starting point (e.g., `../secret`
-/// or `a/../../secret`), preventing cross-package reads in the VFS.
-fn normalize_path(path: &std::path::Path) -> Option<String> {
+/// or `a/../../secret`), preventing cross-package reads in the VFS. This is the canonical
+/// key form for embedded/VFS module lookups, matching the keys the import tracer emits.
+pub fn normalize_path(path: &std::path::Path) -> Option<String> {
     let mut components = Vec::new();
     for comp in path.components() {
         match comp {

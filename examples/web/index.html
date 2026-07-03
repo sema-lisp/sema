@@ -1,0 +1,122 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Sema Web — Demo</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: system-ui, -apple-system, sans-serif;
+      background: #f8fafc;
+      color: #1e293b;
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      padding: 2rem;
+    }
+    header {
+      text-align: center;
+      margin-bottom: 2rem;
+    }
+    header h1 {
+      font-size: 2rem;
+      color: #6366f1;
+    }
+    header p {
+      color: #64748b;
+      margin-top: 0.5rem;
+    }
+    #app {
+      background: white;
+      border-radius: 12px;
+      padding: 2rem;
+      box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+      min-width: 320px;
+    }
+    button {
+      cursor: pointer;
+      border: 1px solid #d1d5db;
+      border-radius: 6px;
+      background: white;
+      transition: background 0.15s;
+    }
+    button:hover {
+      background: #f1f5f9;
+    }
+    .examples {
+      margin-top: 2rem;
+      display: flex;
+      gap: 0.5rem;
+    }
+    .examples a {
+      color: #6366f1;
+      text-decoration: none;
+      padding: 0.25rem 0.75rem;
+      border: 1px solid #6366f1;
+      border-radius: 6px;
+      font-size: 0.875rem;
+    }
+    .examples a:hover {
+      background: #6366f1;
+      color: white;
+    }
+    .examples a.active {
+      background: #6366f1;
+      color: white;
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Sema Web</h1>
+    <p>Embedded web scripting with <code>&lt;script type="text/sema"&gt;</code></p>
+  </header>
+
+  <div class="examples">
+    <a href="index.html" class="active">Imperative Counter</a>
+    <a href="reactive.html">Reactive Counter</a>
+    <a href="llm-chat.html">LLM Chat</a>
+  </div>
+
+  <div id="app">
+    <noscript>JavaScript is required to run Sema.</noscript>
+    <p style="color: #94a3b8;">Loading Sema…</p>
+  </div>
+
+  <!--
+    Sema scripts are embedded directly in the HTML page.
+    They are discovered and evaluated by SemaWeb.init().
+  -->
+  <script type="text/sema" src="counter.sema"></script>
+
+  <!--
+    Initialize the Sema web runtime.
+    This loads the WASM interpreter, registers DOM/store bindings,
+    and evaluates all <script type="text/sema"> tags.
+  -->
+  <script type="module">
+    // In production, import from "@sema-lang/sema-web"
+    // For this demo, we use a relative path to the built package
+    import { SemaWeb } from "@sema-lang/sema-web";
+
+    try {
+      // Clear the loading message
+      document.getElementById("app").innerHTML = "";
+
+      // Initialize Sema web runtime — this:
+      // 1. Loads the WASM interpreter
+      // 2. Registers dom/*, store/*, console/* functions
+      // 3. Discovers and evaluates <script type="text/sema"> tags
+      const web = await SemaWeb.init();
+
+      console.log(`Sema Web v${web.version()} initialized`);
+    } catch (e) {
+      document.getElementById("app").innerHTML =
+        `<p style="color: #ef4444;">Failed to initialize Sema: ${e.message}</p>`;
+      console.error("Sema init failed:", e);
+    }
+  </script>
+</body>
+</html>

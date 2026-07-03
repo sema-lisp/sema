@@ -1,0 +1,65 @@
+;; LLM Chat — demonstrates the LLM proxy from the browser
+;;
+;; This example uses reactive state + hiccup + mount! to build a simple
+;; chat interface that sends messages to an LLM via the proxy.
+;;
+;; Note: LLM calls use http/post internally, so the page must use
+;; evalAsync (which SemaWeb.init() does via the script loader).
+;; The WASM HTTP replay mechanism handles the async I/O transparently.
+
+;; ── State ──────────────────────────────────────────────
+
+(define messages (state '()))
+(define user-input (state ""))
+(define loading (state #f))
+
+;; ── Event handlers ─────────────────────────────────────
+
+(define (update-input ev)
+  (put! user-input (dom/get-value (dom/query "#chat-input"))))
+
+(define (send-message ev)
+  (let ((text @user-input))
+    (when (> (string-length text) 0)
+      ;; Add user message to the list
+      (update! messages (lambda (msgs)
+        (append msgs (list {:role "user" :content text}))))
+      (put! user-input "")
+      ;; Set the input value in the DOM
+      (dom/set-value! (dom/query "#chat-input") "")
+      ;; Mark loading
+      (put! loading #t)
+      ;; Send to LLM via proxy (uses evalAsync under the hood)
+      (let ((response (llm/chat @messages {:max-tokens 500})))
+        ;; Add assistant reply
+        (update! messages (lambda (msgs)
+          (append msgs (list {:role "assistant"
+                              :content (if (string? response)
+                                         response
+                                         (:content response))}))))
+        (put! loading #f)))))
+
+;; ── View component ─────────────────────────────────────
+
+(define (chat-view)
+  [:div {:class "chat-container"}
+    [:h2 "Sema LLM Chat"]
+    [:div {:class "messages"}
+      (map (lambda (msg)
+        [:div {:class (string-append "message " (:role msg))}
+          [:strong (string-append (:role msg) ": ")]
+          (:content msg)])
+        @messages)]
+    (if @loading
+      [:div {:class "loading"} "Thinking..."]
+      [:span])
+    [:div {:class "input-row"}
+      [:input {:id "chat-input"
+               :type "text"
+               :placeholder "Type a message..."
+               :on-keyup "update-input"}]
+      [:button {:on-click "send-message" :class "btn"} "Send"]]])
+
+;; ── Mount ──────────────────────────────────────────────
+
+(mount! "#app" "chat-view")

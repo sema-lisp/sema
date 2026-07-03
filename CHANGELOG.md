@@ -4,6 +4,28 @@
 
 ### Added
 
+- **Sema Web — run Sema apps in the browser.** The new `@sema-lang/sema-web`
+  package embeds the WASM VM in the browser with reactive state
+  (`state`/`computed`/`watch`), SIP markup (hiccup-style vectors), a component
+  system (`defcomponent`/`mount!`), and `dom/*`, `store/*`, `router/*`, `css/*`,
+  and browser `llm/*` namespaces. `@sema-lang/llm-proxy` ships drop-in Vercel /
+  Netlify / Cloudflare / Node adapters so browser `llm/*` calls reach real
+  providers with server-side keys. See the
+  [Sema Web guide](https://sema-lang.com/docs/web/).
+- **`sema web` — zero-config dev server.** `sema web app.sema` serves an app in
+  the browser with no bundler and no `npm install`: it embeds the browser runtime
+  (WASM VM + JS bundle) in the binary, serves your app, hot-reloads on file
+  change, and proxies `llm/*` to real providers using your environment keys.
+  Multi-file apps (that `import` other modules) are compiled to a `.vfs` on the
+  fly and resolve automatically, and a browser error overlay surfaces Sema errors
+  on the page. Options: `--port`, `--host`, `--no-open`, `--no-llm`. See the
+  [Dev Server guide](https://sema-lang.com/docs/web/dev-server).
+- **Automatic port fallback for `http/serve`.** Pass `{:port-fallback true}` and
+  a taken port advances to the next free one instead of failing;
+  `{:on-listen (fn (info) …)}` reports the bound `{:host :port :url}` (handy for
+  printing a URL or opening a browser). Off by default (backward-compatible); the
+  notebook server opts in. See the
+  [Web Server docs](https://sema-lang.com/docs/stdlib/web-server).
 - **CORE-2 fixed: cycle-collecting garbage collector.** Sema now reclaims reference
   cycles — a synchronous Bacon–Rajan cycle collector (ADR #66; design + measurements
   in `docs/plans/2026-07-02-core2-gc.md`) runs over the existing `Rc` heap with a
@@ -145,6 +167,19 @@
 
 ### Fixed
 
+- **`llm/stream` over `http/stream` streams progressively without panicking.**
+  The SSE channel was bounded and used a blocking send, which panicked ("cannot
+  block the current thread from within a runtime") when a handler fed tokens from
+  inside a provider's async runtime. It is now an unbounded, non-blocking channel,
+  so LLM tokens flow to the client as they arrive. WebSocket/file/raw responses
+  are unchanged.
+- **Robust module/import resolution in embedded and `.vfs` contexts.** Imports
+  written `./x`, `../x`, subdirectory, and nested-relative paths now resolve
+  correctly from a `sema build` standalone binary or a browser `.vfs` archive —
+  previously only an exact plain relative key matched, so multi-file apps broke
+  once bundled. Every spelling of a module normalizes to one key (so diamonds
+  dedup to a single evaluation), and a circular `(load ...)` now errors gracefully
+  instead of overflowing the stack.
 - **Conversation cost/usage is real, not estimated.** `conversation/say` now
   folds each turn's actual provider `usage` into the conversation, so
   `conversation/cost` and `conversation/stats` report the billed token/cost sum.

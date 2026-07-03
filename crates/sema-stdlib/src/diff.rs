@@ -11,10 +11,12 @@
 
 use std::collections::BTreeMap;
 
-use sema_core::{check_arity, Caps, SemaError, Value};
+use sema_core::{check_arity, SemaError, Value};
 use similar::TextDiff;
 
-use crate::{register_fn, register_fn_gated};
+use crate::register_fn;
+#[cfg(not(target_arch = "wasm32"))]
+use {crate::register_fn_gated, sema_core::Caps};
 
 /// A single parsed hunk header `@@ -old_start,old_count +new_start,new_count @@`
 /// together with the body lines that follow it.
@@ -256,6 +258,7 @@ fn apply_hunks(content: &str, hunks: &[Hunk]) -> Result<String, SemaError> {
     Ok(result)
 }
 
+#[cfg_attr(target_arch = "wasm32", allow(unused_variables))]
 pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
     // (diff/unified old new [context]) -> unified-diff string
     register_fn(env, "diff/unified", |args| {
@@ -455,6 +458,8 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
     });
 
     // (patch/apply-file path patch) -> number of hunks applied (int)
+    // Touches the real filesystem (not the VFS), so it's native-only.
+    #[cfg(not(target_arch = "wasm32"))]
     register_fn_gated(env, sandbox, Caps::FS_WRITE, "patch/apply-file", |args| {
         check_arity!(args, "patch/apply-file", 2);
         let path = args[0]

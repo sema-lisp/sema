@@ -1,0 +1,993 @@
+;; Trello-style AI Project Board — Sema Web flagship demo
+;; Showcases ALL sema-web features: reactive state, computed values,
+;; scoped CSS, SIP markup, event handling, LLM streaming, localStorage,
+;; DOM manipulation, timers, multiple mount points, batch updates.
+
+;; ── Reactive State ──────────────────────────────────────────────────
+
+(def next-id (state 100))
+(def board (state (list)))
+(def search-text (state ""))
+(def drag-card-id (state nil))
+(def drag-source-col (state nil))
+(def drag-over-col (state nil))
+(def selected-card-id (state nil))
+(def tick (state 0))
+(def ai-stream (state nil))
+(def ai-loading (state #f))
+(def adding-col (state nil))
+(def adding-text (state ""))
+
+;; ── Computed State ──────────────────────────────────────────────────
+
+(def total-count (computed (length @board)))
+(def done-count (computed (length (filter (fn (c) (equal? (get c :column) "done")) @board))))
+(def progress-pct (computed
+  (let ((t @total-count)
+        (d @done-count))
+    (if (or (null? t) (null? d) (= t 0)) 0
+      (/ (* d 100) t)))))
+(def search-active (computed (not (equal? @search-text ""))))
+
+;; ── ID Generation ───────────────────────────────────────────────────
+
+(define (gen-id)
+  (let ((id @next-id))
+    (update! next-id (fn (n) (+ n 1)))
+    (number->string id)))
+
+;; ── Seed Data ───────────────────────────────────────────────────────
+
+(define (make-seed-data)
+  (list
+    {:id "1" :title "Set up CI/CD pipeline"
+     :description "Configure GitHub Actions for automated testing and deployment"
+     :column "todo" :priority "high" :created-at 0 :ai-generated #f}
+    {:id "2" :title "Design landing page mockup"
+     :description "Create wireframes in Figma for the new marketing site"
+     :column "todo" :priority "medium" :created-at 0 :ai-generated #f}
+    {:id "3" :title "Implement user authentication"
+     :description "Add OAuth2 login with Google and GitHub providers"
+     :column "in-progress" :priority "urgent" :created-at 0 :ai-generated #f}
+    {:id "4" :title "Write API documentation"
+     :description "Document all REST endpoints with examples"
+     :column "in-progress" :priority "medium" :created-at 0 :ai-generated #f}
+    {:id "5" :title "Fix responsive layout on mobile"
+     :description "Header nav collapses incorrectly below 768px"
+     :column "done" :priority "high" :created-at 0 :ai-generated #f}
+    {:id "6" :title "Add unit tests for auth module"
+     :description "Cover login, signup, and token refresh flows"
+     :column "todo" :priority "low" :created-at 0 :ai-generated #f}))
+
+;; ── Persistence ─────────────────────────────────────────────────────
+
+(define (save-board)
+  (store/set! "sema-board-data" @board)
+  (store/set! "sema-board-next-id" @next-id))
+
+(define (load-board)
+  (let ((saved (store/get "sema-board-data"))
+        (saved-id (store/get "sema-board-next-id")))
+    (if (not (null? saved))
+      (begin
+        (put! board saved)
+        (when (not (null? saved-id))
+          (put! next-id saved-id)))
+      (put! board (make-seed-data)))))
+
+(load-board)
+
+;; Auto-save on any board change
+(define (on-board-change old new) (save-board))
+(watch board "on-board-change")
+
+;; Safe string conversion — handles numbers, strings, and nil
+(define (->str x)
+  (cond ((null? x) "0")
+        ((string? x) x)
+        (#t (number->string x))))
+
+;; ── Timer (1s tick for "time in column") ────────────────────────────
+
+(define (tick-clock)
+  (update! tick (fn (n) (+ n 1))))
+
+(js/set-interval "tick-clock" 1000)
+
+(define (format-elapsed secs)
+  (cond
+    ((< secs 60)
+     (string-append (number->string secs) "s"))
+    ((< secs 3600)
+     (string-append (number->string (/ (- secs (modulo secs 60)) 60)) "m"))
+    (#t
+     (let ((h (/ (- secs (modulo secs 3600)) 3600))
+           (m (/ (- (modulo secs 3600) (modulo (modulo secs 3600) 60)) 60)))
+       (string-append (number->string h) "h " (number->string m) "m")))))
+
+;; ── Board Helpers ───────────────────────────────────────────────────
+
+(define (find-card-by-id cards id)
+  (cond
+    ((null? cards) nil)
+    ((equal? (get (car cards) :id) id) (car cards))
+    (#t (find-card-by-id (cdr cards) id))))
+
+(define (cards-in-col col)
+  (filter (fn (c) (equal? (get c :column) col)) @board))
+
+(define (filtered-cards-for col)
+  (let ((cards (cards-in-col col))
+        (query (string/lower @search-text)))
+    (if (equal? query "")
+      cards
+      (filter (fn (c) (string/contains? (string/lower (get c :title)) query)) cards))))
+
+(define (col-count col)
+  (length (filtered-cards-for col)))
+
+(define (next-col col)
+  (cond ((equal? col "todo") "in-progress")
+        ((equal? col "in-progress") "done")
+        (#t nil)))
+
+(define (prev-col col)
+  (cond ((equal? col "done") "in-progress")
+        ((equal? col "in-progress") "todo")
+        (#t nil)))
+
+;; ── Board Mutations ─────────────────────────────────────────────────
+
+(define (add-card col title)
+  (when (not (equal? title ""))
+    (let ((card {:id (gen-id) :title title :description ""
+                 :column col :priority "medium"
+                 :created-at @tick :ai-generated #f}))
+      (update! board (fn (b) (append b (list card)))))))
+
+(define (delete-card id)
+  (update! board (fn (b) (filter (fn (c) (not (equal? (get c :id) id))) b)))
+  (when (equal? @selected-card-id id)
+    (put! selected-card-id nil)))
+
+(define (move-card id new-col)
+  (update! board (fn (b)
+    (map (fn (c)
+      (if (equal? (get c :id) id)
+        (assoc (assoc c :column new-col) :created-at @tick)
+        c)) b))))
+
+(define (update-card-field id field val)
+  (update! board (fn (b)
+    (map (fn (c)
+      (if (equal? (get c :id) id)
+        (assoc c field val)
+        c)) b))))
+
+;; ── Drag and Drop ───────────────────────────────────────────────────
+
+(define (get-card-id-from-event ev)
+  (if-let (el (dom/event-target-closest ev "[data-card-id]"))
+    ;; Force to string — WASM bridge may auto-convert "1" to 1
+    (->str (dom/get-attribute el "data-card-id"))
+    nil))
+
+(define (get-col-id-from-event ev)
+  (if-let (el (dom/event-target-closest ev "[data-col-id]"))
+    (dom/get-attribute el "data-col-id")
+    nil))
+
+;; Drag and drop via pointer events
+(define (clear-drag-state)
+  (put! drag-card-id nil)
+  (put! drag-source-col nil)
+  (put! drag-over-col nil))
+
+(define (handle-pointer-down-card ev)
+  (when-let (card-id-str (get-card-id-from-event ev))
+    (when-let (card (find-card-by-id @board card-id-str))
+      (put! drag-card-id card-id-str)
+      (put! drag-source-col (get card :column)))))
+
+(define (handle-pointer-move-col ev)
+  (when (not (null? @drag-card-id))
+    (when-let (col-id (get-col-id-from-event ev))
+      (put! drag-over-col col-id))))
+
+(define (handle-pointer-up-col ev)
+  (when (not (null? @drag-card-id))
+    (when-let (target-col (get-col-id-from-event ev))
+      (when (not (equal? target-col @drag-source-col))
+        (move-card @drag-card-id target-col))))
+  (clear-drag-state))
+
+;; ── Event Handlers ──────────────────────────────────────────────────
+
+(define (handle-search ev)
+  (put! search-text (dom/event-value ev)))
+
+(define (clear-search ev)
+  (put! search-text ""))
+
+(define (handle-card-click ev)
+  (when-let (card-id-str (get-card-id-from-event ev))
+    (put! selected-card-id card-id-str)))
+
+(define (handle-move-left ev)
+  (dom/stop-propagation! ev)
+  (dom/prevent-default! ev)
+  (when-let (card-id-str (get-card-id-from-event ev))
+    (when-let (card (find-card-by-id @board card-id-str))
+      (when-let (p (prev-col (get card :column)))
+        (move-card card-id-str p)))))
+
+(define (handle-move-right ev)
+  (dom/stop-propagation! ev)
+  (dom/prevent-default! ev)
+  (when-let (card-id-str (get-card-id-from-event ev))
+    (when-let (card (find-card-by-id @board card-id-str))
+      (when-let (n (next-col (get card :column)))
+        (move-card card-id-str n)))))
+
+(define (handle-delete ev)
+  (dom/stop-propagation! ev)
+  (dom/prevent-default! ev)
+  (when-let (card-id-str (get-card-id-from-event ev))
+    (delete-card card-id-str)))
+
+;; Add card flow
+(define (start-add-todo ev) (put! adding-col "todo"))
+(define (start-add-progress ev) (put! adding-col "in-progress"))
+(define (start-add-done ev) (put! adding-col "done"))
+
+(define (handle-add-input ev)
+  (put! adding-text (dom/event-value ev)))
+
+(define (submit-add-card ev)
+  (dom/prevent-default! ev)
+  (let ((text @adding-text)
+        (col @adding-col))
+    (when (not (equal? text ""))
+      (add-card col text)
+      (put! adding-text "")
+      (put! adding-col nil))))
+
+(define (cancel-add-card ev)
+  (put! adding-text "")
+  (put! adding-col nil))
+
+(define (handle-add-keydown ev)
+  (let ((key (dom/event-key ev)))
+    (cond
+      ((equal? key "Enter") (submit-add-card ev))
+      ((equal? key "Escape") (cancel-add-card ev))
+      (#t nil))))
+
+;; Modal handlers
+(define (close-modal ev)
+  (put! selected-card-id nil))
+
+(define (handle-modal-desc ev)
+  (when-let (id @selected-card-id)
+    (update-card-field id :description (dom/event-value ev))))
+
+(define (handle-modal-move-left ev)
+  (when-let (id @selected-card-id)
+    (when-let (card (find-card-by-id @board id))
+      (when-let (p (prev-col (get card :column)))
+        (move-card id p)))))
+
+(define (handle-modal-move-right ev)
+  (when-let (id @selected-card-id)
+    (when-let (card (find-card-by-id @board id))
+      (when-let (n (next-col (get card :column)))
+        (move-card id n)))))
+
+(define (handle-cycle-priority ev)
+  (when-let (id @selected-card-id)
+    (when-let (card (find-card-by-id @board id))
+      (let ((prio (get card :priority)))
+        (let ((new-prio (cond
+                          ((equal? prio "low") "medium")
+                          ((equal? prio "medium") "high")
+                          ((equal? prio "high") "urgent")
+                          (#t "low"))))
+          (update-card-field id :priority new-prio))))))
+
+;; Keyboard shortcuts
+(define (handle-global-keydown ev)
+  (let ((key (dom/event-key ev)))
+    (cond
+      ((equal? key "Escape")
+       (cond
+         ((not (null? @selected-card-id)) (put! selected-card-id nil))
+         ((not (null? @adding-col)) (cancel-add-card ev))
+         (@search-active (put! search-text ""))
+         (#t nil)))
+      ((equal? key "/")
+       (when-let (input (dom/query "#search-input"))
+         (dom/prevent-default! ev)
+         (dom/focus! input)))
+      ((equal? key "n")
+       ;; Only trigger if not typing in an input/textarea
+       (when-let (target (dom/event-target ev))
+         (let ((tag (dom/get-attribute target "tagName")))
+           (when (not (equal? tag "INPUT"))
+             (when (not (equal? tag "TEXTAREA"))
+               (put! adding-col "todo"))))))
+      (#t nil))))
+
+;; ── AI Task Generation ──────────────────────────────────────────────
+
+(define (build-board-context)
+  (let ((existing (map (fn (c)
+          (string-append "[" (get c :column) "] " (get c :title) " (" (get c :priority) ")"))
+        @board)))
+    (foldl (fn (acc s) (string-append acc s "\n")) "" existing)))
+
+(define (ai-generate-tasks ev)
+  (when (not @ai-loading)
+    (put! ai-loading #t)
+    (let ((context (build-board-context)))
+      (let ((prompt (string-append
+              "You are a project manager. Here is the current board:\n\n"
+              context
+              "\nGenerate 3 NEW tasks that complement this board. "
+              "They must be DIFFERENT from existing tasks. "
+              "Return ONLY a JSON array: [{\"title\":\"...\",\"priority\":\"low|medium|high|urgent\"}]\n"
+              "No markdown fences, no explanation, just the raw JSON array.")))
+        (let ((s (llm/chat-stream (list {:role "user" :content prompt}) {})))
+          (put! ai-stream s))))))
+
+;; Process completed AI stream — called via js/set-interval polling, NOT during render
+(define (poll-ai-stream)
+  (when-let (s @ai-stream)
+    (let ((val @s))
+      (when (get val :done)
+        (let ((text (get val :text)))
+          (when (not (equal? text ""))
+            ;; Try to extract JSON from the response (may contain markdown fences)
+            (let ((clean (if (string/contains? text "[")
+                          (substring text
+                            (string/index-of text "[")
+                            (+ 1 (string/last-index-of text "]")))
+                          text)))
+              (let ((tasks (try (json/decode clean) (catch e nil))))
+                (when (and (not (null? tasks)) (list? tasks))
+                  (map (fn (task)
+                    (let ((card {:id (gen-id)
+                                 :title (if (null? (get task :title)) "Untitled" (get task :title))
+                                 :description ""
+                                 :column "todo"
+                                 :priority (if (null? (get task :priority)) "medium" (get task :priority))
+                                 :created-at @tick
+                                 :ai-generated #t}))
+                      (update! board (fn (b) (append b (list card))))))
+                    tasks))))))
+        (put! ai-stream nil)
+        (put! ai-loading #f)))))
+
+;; Poll every 500ms for AI stream completion (avoids side effects during render)
+(js/set-interval "poll-ai-stream" 500)
+
+(define (render-ai-status)
+  (if-let (s @ai-stream)
+    (let ((val @s))
+      (if (get val :done)
+        [:span {:class streaming-indicator-style} "Processing..."]
+        [:span {:class streaming-indicator-style} "Generating tasks..."]))
+    [:span]))
+
+;; ── Scoped CSS ──────────────────────────────────────────────────────
+
+(def header-style
+  (css {:background "#0079bf"
+        :color "#fff"
+        :padding "8px 16px"
+        :display "flex"
+        :align-items "center"
+        :gap "16px"
+        :flex-shrink "0"
+        :box-shadow "0 1px 3px rgba(0,0,0,0.12)"}))
+
+(def header-title-style
+  (css {:font-size "18px"
+        :font-weight "700"
+        :letter-spacing "-0.01em"
+        :white-space "nowrap"
+        :display "flex"
+        :align-items "center"
+        :gap "8px"}))
+
+(def header-right-style
+  (css {:display "flex"
+        :align-items "center"
+        :gap "10px"
+        :margin-left "auto"}))
+
+(def search-wrap-style
+  (css {:position "relative"
+        :display "flex"
+        :align-items "center"}))
+
+(def search-input-style
+  (css {:padding "6px 12px 6px 30px"
+        :border "none"
+        :border-radius "4px"
+        :font-size "14px"
+        :background "hsla(0,0%,100%,0.3)"
+        :color "#fff"
+        :outline "none"
+        :width "220px"
+        :transition "background 0.2s, width 0.2s"
+        "&:focus" {:background "hsla(0,0%,100%,0.5)"
+                   :width "280px"}}))
+
+(def search-icon-style
+  (css {:position "absolute"
+        :left "8px"
+        :font-size "14px"
+        :color "hsla(0,0%,100%,0.7)"
+        :pointer-events "none"}))
+
+(def clear-search-btn-style
+  (css {:position "absolute"
+        :right "6px"
+        :background "none"
+        :border "none"
+        :color "hsla(0,0%,100%,0.7)"
+        :cursor "pointer"
+        :font-size "16px"
+        :padding "0 4px"
+        :line-height "1"
+        "&:hover" {:color "#fff"}}))
+
+(def progress-wrap-style
+  (css {:display "flex"
+        :align-items "center"
+        :gap "8px"
+        :font-size "12px"
+        :color "hsla(0,0%,100%,0.85)"}))
+
+(def progress-bar-bg-style
+  (css {:background "hsla(0,0%,100%,0.25)"
+        :border-radius "3px"
+        :height "6px"
+        :width "100px"
+        :overflow "hidden"}))
+
+(def progress-bar-fill-style
+  (css {:background "#61bd4f"
+        :height "100%"
+        :border-radius "3px"
+        :transition "width 0.3s ease"}))
+
+(def ai-btn-style
+  (css {:padding "6px 14px"
+        :border "none"
+        :border-radius "4px"
+        :font-size "13px"
+        :font-weight "600"
+        :background "#f2d600"
+        :color "#172b4d"
+        :cursor "pointer"
+        :white-space "nowrap"
+        :transition "background 0.15s, transform 0.1s"
+        "&:hover" {:background "#e6c700"
+                   :transform "scale(1.02)"}}))
+
+(def ai-btn-loading-style
+  (css {:padding "6px 14px"
+        :border "none"
+        :border-radius "4px"
+        :font-size "13px"
+        :font-weight "600"
+        :background "#a0a0a0"
+        :color "#fff"
+        :cursor "not-allowed"
+        :white-space "nowrap"
+        :opacity "0.8"}))
+
+(def streaming-indicator-style
+  (css {:font-size "12px"
+        :color "#c377e0"
+        :font-weight "500"
+        :animation "pulse 1.2s infinite"}))
+
+(def board-style
+  (css {:display "flex"
+        :gap "12px"
+        :padding "12px 16px"
+        :flex "1"
+        :overflow-x "auto"
+        :align-items "flex-start"
+        :background "#0079bf10"}))
+
+(def column-style
+  (css {:background "#ebecf0"
+        :border-radius "8px"
+        :width "310px"
+        :min-width "310px"
+        :max-height "calc(100vh - 80px)"
+        :display "flex"
+        :flex-direction "column"
+        :box-shadow "0 1px 2px rgba(9,30,66,0.08)"}))
+
+(def column-drag-over-style
+  (css {:background "#d6eaff"
+        :border-radius "8px"
+        :width "310px"
+        :min-width "310px"
+        :max-height "calc(100vh - 80px)"
+        :display "flex"
+        :flex-direction "column"
+        :box-shadow "0 0 0 2px #0079bf"}))
+
+(def col-header-style
+  (css {:padding "10px 12px"
+        :display "flex"
+        :align-items "center"
+        :justify-content "space-between"}))
+
+(def col-title-style
+  (css {:font-size "14px"
+        :font-weight "700"
+        :color "#172b4d"}))
+
+(def col-count-style
+  (css {:background "#dfe1e6"
+        :color "#5e6c84"
+        :font-size "12px"
+        :font-weight "600"
+        :border-radius "10px"
+        :padding "2px 8px"
+        :min-width "22px"
+        :text-align "center"}))
+
+(def cards-list-style
+  (css {:padding "0 8px 8px"
+        :overflow-y "auto"
+        :flex "1"
+        :display "flex"
+        :flex-direction "column"
+        :gap "8px"
+        :min-height "40px"}))
+
+(def card-style
+  (css {:background "#fff"
+        :border-radius "8px"
+        :padding "8px 12px"
+        :box-shadow "0 1px 2px rgba(9,30,66,0.15)"
+        :cursor "pointer"
+        :transition "box-shadow 0.15s, transform 0.1s"
+        :position "relative"
+        "&:hover" {:box-shadow "0 4px 12px rgba(9,30,66,0.2)"
+                   :transform "translateY(-1px)"}}))
+
+(def card-dragging-style
+  (css {:background "#e4f0ff"
+        :border-radius "8px"
+        :padding "8px 12px"
+        :box-shadow "0 4px 16px rgba(0,121,191,0.3)"
+        :cursor "grabbing"
+        :opacity "0.7"
+        :transform "rotate(2deg)"
+        :position "relative"}))
+
+(def card-title-style
+  (css {:font-size "14px"
+        :color "#172b4d"
+        :line-height "1.4"
+        :word-wrap "break-word"
+        :margin-bottom "6px"}))
+
+(def card-desc-preview-style
+  (css {:font-size "12px"
+        :color "#5e6c84"
+        :line-height "1.3"
+        :margin-bottom "6px"
+        :overflow "hidden"
+        :text-overflow "ellipsis"
+        :white-space "nowrap"}))
+
+(def card-meta-style
+  (css {:display "flex"
+        :align-items "center"
+        :gap "6px"
+        :flex-wrap "wrap"}))
+
+(def card-actions-style
+  (css {:display "flex"
+        :gap "4px"
+        :margin-top "6px"
+        :align-items "center"}))
+
+(def prio-badge-style
+  (css {:font-size "11px"
+        :font-weight "600"
+        :padding "1px 8px"
+        :border-radius "3px"
+        :text-transform "uppercase"
+        :letter-spacing "0.03em"}))
+
+(def prio-low (css {:background "#61bd4f" :color "#fff"}))
+(def prio-medium (css {:background "#0079bf" :color "#fff"}))
+(def prio-high (css {:background "#ff9f1a" :color "#fff"}))
+(def prio-urgent (css {:background "#eb5a46" :color "#fff"}))
+
+(def ai-tag-style
+  (css {:background "#c377e0"
+        :color "#fff"
+        :font-size "10px"
+        :font-weight "700"
+        :padding "1px 6px"
+        :border-radius "3px"
+        :text-transform "uppercase"}))
+
+(def timer-style
+  (css {:font-size "11px"
+        :color "#5e6c84"
+        :margin-left "auto"
+        :display "flex"
+        :align-items "center"
+        :gap "3px"}))
+
+(def action-btn-style
+  (css {:background "transparent"
+        :border "none"
+        :border-radius "4px"
+        :padding "2px 6px"
+        :font-size "13px"
+        :cursor "pointer"
+        :color "#5e6c84"
+        :transition "background 0.1s, color 0.1s"
+        "&:hover" {:background "#091e4214"
+                   :color "#172b4d"}}))
+
+(def delete-btn-style
+  (css {:background "transparent"
+        :border "none"
+        :border-radius "4px"
+        :padding "2px 6px"
+        :font-size "13px"
+        :cursor "pointer"
+        :color "#b04632"
+        :margin-left "auto"
+        :transition "background 0.1s"
+        "&:hover" {:background "#ffebe6"}}))
+
+(def add-btn-style
+  (css {:background "none"
+        :border "none"
+        :padding "8px 12px"
+        :font-size "14px"
+        :color "#5e6c84"
+        :cursor "pointer"
+        :text-align "left"
+        :width "100%"
+        :border-radius "0 0 8px 8px"
+        :transition "background 0.1s, color 0.1s"
+        "&:hover" {:background "#091e420a"
+                   :color "#172b4d"}}))
+
+(def add-form-style
+  (css {:padding "8px"
+        :display "flex"
+        :flex-direction "column"
+        :gap "6px"}))
+
+(def add-input-style
+  (css {:padding "8px 10px"
+        :border "2px solid #0079bf"
+        :border-radius "6px"
+        :font-size "14px"
+        :outline "none"
+        :color "#172b4d"
+        :background "#fff"}))
+
+(def add-actions-style
+  (css {:display "flex"
+        :gap "6px"
+        :align-items "center"}))
+
+(def add-submit-style
+  (css {:padding "6px 16px"
+        :background "#0079bf"
+        :color "#fff"
+        :border "none"
+        :border-radius "4px"
+        :font-size "13px"
+        :font-weight "600"
+        :cursor "pointer"
+        "&:hover" {:background "#026aa7"}}))
+
+(def add-cancel-style
+  (css {:background "none"
+        :border "none"
+        :font-size "20px"
+        :cursor "pointer"
+        :color "#5e6c84"
+        :padding "0 6px"
+        :line-height "1"
+        "&:hover" {:color "#172b4d"}}))
+
+(def empty-col-msg-style
+  (css {:color "#5e6c84"
+        :font-size "13px"
+        :text-align "center"
+        :padding "24px 8px"
+        :font-style "italic"}))
+
+;; Modal styles
+(def overlay-style
+  (css {:position "fixed"
+        :top "0" :left "0" :right "0" :bottom "0"
+        :background "rgba(0,0,0,0.5)"
+        :display "flex"
+        :align-items "flex-start"
+        :justify-content "center"
+        :padding-top "80px"
+        :z-index "1000"}))
+
+(def modal-style
+  (css {:background "#fff"
+        :border-radius "12px"
+        :padding "24px"
+        :width "520px"
+        :max-width "90vw"
+        :max-height "80vh"
+        :overflow-y "auto"
+        :box-shadow "0 12px 48px rgba(0,0,0,0.25)"}))
+
+(def modal-title-style
+  (css {:font-size "20px"
+        :font-weight "700"
+        :color "#172b4d"
+        :margin-bottom "4px"
+        :line-height "1.3"}))
+
+(def modal-section-label-style
+  (css {:font-size "12px"
+        :font-weight "600"
+        :color "#5e6c84"
+        :text-transform "uppercase"
+        :margin-top "16px"
+        :margin-bottom "6px"
+        :letter-spacing "0.04em"}))
+
+(def modal-desc-style
+  (css {:width "100%"
+        :min-height "80px"
+        :padding "10px"
+        :border "1px solid #dfe1e6"
+        :border-radius "6px"
+        :font-size "14px"
+        :color "#172b4d"
+        :outline "none"
+        :resize "vertical"
+        :font-family "inherit"
+        "&:focus" {:border-color "#0079bf"}}))
+
+(def modal-row-style
+  (css {:display "flex"
+        :align-items "center"
+        :gap "8px"
+        :margin-top "8px"}))
+
+(def modal-btn-style
+  (css {:padding "6px 14px"
+        :border "1px solid #dfe1e6"
+        :border-radius "4px"
+        :font-size "13px"
+        :cursor "pointer"
+        :background "#fff"
+        :color "#172b4d"
+        "&:hover" {:background "#f4f5f7"}}))
+
+(def modal-close-style
+  (css {:padding "8px 20px"
+        :background "#091e420a"
+        :border "none"
+        :border-radius "4px"
+        :font-size "14px"
+        :cursor "pointer"
+        :color "#172b4d"
+        :margin-top "20px"
+        "&:hover" {:background "#091e4214"}}))
+
+(def modal-col-badge-style
+  (css {:font-size "13px"
+        :color "#0079bf"
+        :font-weight "600"}))
+
+;; ── Render Components ───────────────────────────────────────────────
+
+(define (priority-badge prio)
+  (let ((cls (cond
+               ((equal? prio "low") prio-low)
+               ((equal? prio "medium") prio-medium)
+               ((equal? prio "high") prio-high)
+               ((equal? prio "urgent") prio-urgent)
+               (#t prio-medium))))
+    [:span {:class (string-append prio-badge-style " " cls)
+            :data-testid "priority-badge"} prio]))
+
+(define (col-display-name col)
+  (cond ((equal? col "todo") "To Do")
+        ((equal? col "in-progress") "In Progress")
+        ((equal? col "done") "Done")
+        (#t col)))
+
+(define (render-card card)
+  (let ((id (get card :id))
+        (title (get card :title))
+        (desc (get card :description))
+        (prio (get card :priority))
+        (col (get card :column))
+        (ai (get card :ai-generated))
+        (created (get card :created-at)))
+    (let ((is-dragging (equal? @drag-card-id id)))
+    [:div {:class (if is-dragging card-dragging-style card-style)
+           :data-testid "board-card"
+           :data-card-id (->str id)
+           :on-pointerdown "handle-pointer-down-card"
+           :on-click "handle-card-click"}
+      [:div {:class card-title-style :data-testid "card-title"} title]
+      (when (not (equal? desc ""))
+        [:div {:class card-desc-preview-style} desc])
+      [:div {:class card-meta-style}
+        (priority-badge prio)
+        (when ai [:span {:class ai-tag-style :data-testid "ai-badge"} "AI"])
+        [:span {:class timer-style}
+          "\u23F1 "
+          ;; Force re-render every tick
+          (begin @tick (format-elapsed (- @tick created)))]]
+      [:div {:class card-actions-style}
+        (when (not (equal? col "todo"))
+          [:button {:class action-btn-style
+                    :data-card-id (->str id)
+                    :on-click "handle-move-left"
+                    :data-testid "move-left-btn"
+                    :title "Move left"} "\u2190"])
+        (when (not (equal? col "done"))
+          [:button {:class action-btn-style
+                    :data-card-id (->str id)
+                    :on-click "handle-move-right"
+                    :data-testid "move-right-btn"
+                    :title "Move right"} "\u2192"])
+        [:button {:class delete-btn-style
+                  :data-card-id (->str id)
+                  :on-click "handle-delete"
+                  :data-testid "delete-btn"
+                  :title "Delete"} "\u2717"]]])))
+
+(define (render-add-form col)
+  (if (equal? @adding-col col)
+    [:div {:class add-form-style :data-testid "add-card-form"}
+      [:input {:class add-input-style
+               :placeholder "Enter a title for this card..."
+               :value @adding-text
+               :on-input "handle-add-input"
+               :on-keydown "handle-add-keydown"
+               :autocomplete "off"
+               :data-testid "add-card-input"
+               :id "add-card-input"}]
+      [:div {:class add-actions-style}
+        [:button {:class add-submit-style
+                  :on-click "submit-add-card"
+                  :data-testid "submit-add-card"} "Add Card"]
+        [:button {:class add-cancel-style
+                  :on-click "cancel-add-card"} "\u00D7"]]]
+    [:button {:class add-btn-style
+              :on-click (cond
+                          ((equal? col "todo") "start-add-todo")
+                          ((equal? col "in-progress") "start-add-progress")
+                          (#t "start-add-done"))
+              :data-testid (string-append "add-card-" col)}
+      "+ Add a card"]))
+
+(define (render-column col-id col-name)
+  (let ((cards (filtered-cards-for col-id))
+        (is-drag-target (equal? @drag-over-col col-id)))
+    [:div {:class (if is-drag-target column-drag-over-style column-style)
+           :data-testid (string-append "column-" col-id)
+           :data-col-id col-id
+           :on-pointermove "handle-pointer-move-col"
+           :on-pointerup "handle-pointer-up-col"}
+      [:div {:class col-header-style}
+        [:span {:class col-title-style} col-name]
+        [:span {:class col-count-style :data-testid (string-append "count-" col-id)}
+          (->str (length cards))]]
+      [:div {:class cards-list-style}
+        (if (null? cards)
+          [:div {:class empty-col-msg-style} "No cards yet"]
+          (map render-card cards))]
+      (render-add-form col-id)]))
+
+(define (render-header)
+  [:div {:class header-style :data-testid "board-header"}
+    [:span {:class header-title-style} "\u2630 Project Board"]
+    [:div {:class header-right-style}
+      [:div {:class search-wrap-style}
+        [:span {:class search-icon-style} "\u2315"]
+        [:input {:class search-input-style
+                 :type "text"
+                 :placeholder "Search cards..."
+                 :value @search-text
+                 :on-input "handle-search"
+                 :data-testid "search-input"
+                 :id "search-input"}]
+        (when @search-active
+          [:button {:class clear-search-btn-style
+                    :on-click "clear-search"
+                    :data-testid "clear-search"} "\u00D7"])]
+      [:div {:class progress-wrap-style :data-testid "progress-text"}
+        [:div {:class progress-bar-bg-style}
+          [:div {:class progress-bar-fill-style
+                 :style (string-append "width:" (->str @progress-pct) "%")
+                 :data-testid "progress-fill"}]]
+        [:span (string-append (->str @done-count) "/" (->str @total-count))]]
+      (if @ai-loading
+        [:button {:class ai-btn-loading-style :disabled "true"
+                  :data-testid "ai-generate-btn"} "Generating..."]
+        [:button {:class ai-btn-style
+                  :on-click "ai-generate-tasks"
+                  :data-testid "ai-generate-btn"} "\u2728 AI Generate"])]])
+
+;; ── Modal (detail view, mounted separately) ─────────────────────────
+
+(define (modal-view)
+  (if-let (id @selected-card-id)
+    (if-let (card (find-card-by-id @board id))
+      [:div {:class overlay-style :on-click "close-modal" :data-testid "card-modal"}
+        [:div {:class modal-style :on-click "stop-propagation"}
+          [:div {:class modal-title-style :data-testid "modal-title"} (get card :title)]
+          [:div {:class modal-section-label-style} "Column"]
+          [:div {:class modal-row-style}
+            [:span {:class modal-col-badge-style} (col-display-name (get card :column))]
+            [:button {:class modal-btn-style :on-click "handle-modal-move-left"
+                      :data-testid "modal-move-left"} "\u2190 Move Left"]
+            [:button {:class modal-btn-style :on-click "handle-modal-move-right"
+                      :data-testid "modal-move-right"} "Move Right \u2192"]]
+          [:div {:class modal-section-label-style} "Priority"]
+          [:div {:class modal-row-style}
+            (priority-badge (get card :priority))
+            [:button {:class modal-btn-style :on-click "handle-cycle-priority"
+                      :data-testid "cycle-priority"} "Cycle Priority"]]
+          [:div {:class modal-section-label-style} "Description"]
+          [:textarea {:class modal-desc-style
+                      :value (get card :description)
+                      :on-input "handle-modal-desc"
+                      :placeholder "Add a more detailed description..."
+                      :data-testid "modal-description"}]
+          [:div {:class modal-section-label-style} "Time in Column"]
+          [:div {:style "font-size:13px;color:#5e6c84"}
+            (begin @tick (format-elapsed (- @tick (get card :created-at))))]
+          (when (get card :ai-generated)
+            [:div {:style "margin-top:12px"}
+              [:span {:class ai-tag-style} "AI Generated"]])
+          [:button {:class modal-close-style :on-click "close-modal"
+                    :data-testid "modal-close"} "Close"]]]
+      [:span])
+    [:span]))
+
+(define (stop-propagation ev)
+  (dom/stop-propagation! ev))
+
+;; ── Board Root (main mount point) ───────────────────────────────────
+
+(define (board-root)
+  [:div {:style "display:flex;flex-direction:column;height:100vh"
+         :on-keydown "handle-global-keydown"}
+    (render-header)
+    [:div {:class board-style :data-testid "board-columns"}
+      (render-column "todo" "To Do")
+      (render-column "in-progress" "In Progress")
+      (render-column "done" "Done")]
+    (render-ai-status)
+    ;; Modal overlay (rendered inline — separate mount doesn't track state changes)
+    (modal-view)])
+
+;; ── Mount ───────────────────────────────────────────────────────────
+
+(mount! "#app" board-root)

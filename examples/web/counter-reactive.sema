@@ -1,0 +1,36 @@
+;; Reactive counter — demonstrates reactive state, hiccup, and mount!
+;;
+;; This counter uses Sema's reactive system:
+;; - `state` for mutable state
+;; - Hiccup vectors for declarative DOM
+;; - `mount!` for automatic re-rendering on state change
+
+;; ── State ──────────────────────────────────────────────
+
+(define count (state 0))
+
+;; ── Event handlers ─────────────────────────────────────
+
+(define (handle-increment ev)
+  (update! count (lambda (n) (+ n 1))))
+
+(define (handle-decrement ev)
+  (update! count (lambda (n) (- n 1))))
+
+(define (handle-reset ev)
+  (put! count 0))
+
+;; ── View component ─────────────────────────────────────
+
+(define (counter-view)
+  [:div {:class "counter"}
+    [:h2 "Sema Reactive Counter"]
+    [:div {:class "display"} @count]
+    [:div {:class "buttons"}
+      [:button {:on-click "handle-decrement" :class "btn"} "−"]
+      [:button {:on-click "handle-reset" :class "btn btn-secondary"} "Reset"]
+      [:button {:on-click "handle-increment" :class "btn"} "+"]]])
+
+;; ── Mount ──────────────────────────────────────────────
+
+(mount! "#app" "counter-view")

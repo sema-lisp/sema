@@ -7,7 +7,9 @@
 
 use std::collections::BTreeMap;
 
-use sema_core::{check_arity, Caps, SemaError, Value};
+#[cfg(not(target_arch = "wasm32"))]
+use sema_core::Caps;
+use sema_core::{check_arity, SemaError, Value};
 
 use crate::register_fn;
 
@@ -60,6 +62,7 @@ fn check_source(src: &str) -> Value {
     }
 }
 
+#[cfg_attr(target_arch = "wasm32", allow(unused_variables))]
 pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
     // read/string — parse exactly one form (canonical namespaced name; the bare
     // `read` builtin is the legacy alias).
@@ -100,6 +103,8 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
     });
 
     // sema/check-file — like check-string but reads a file first.
+    // Touches the real filesystem (not the VFS), so it's native-only.
+    #[cfg(not(target_arch = "wasm32"))]
     crate::register_fn_gated(env, sandbox, Caps::FS_READ, "sema/check-file", |args| {
         check_arity!(args, "sema/check-file", 1);
         let path = args[0]

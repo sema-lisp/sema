@@ -349,6 +349,41 @@ fn expand_macros_in(ctx: &EvalContext, env: &Env, expr: &Value) -> EvalResult {
     }
 }
 
+/// Run deserialized bytecode (a `.semac` payload) on a fresh VM rooted at
+/// `globals`. Used to `load`/`import` precompiled bytecode modules (e.g.
+/// embedded in a standalone-executable or web-archive VFS) the same way
+/// `eval_module_body_vm` runs source modules. Does NOT (re)initialize the
+/// async scheduler — callers nest this inside an already-running program and
+/// reuse the scheduler installed by the top-level VM driver.
+pub fn execute_compile_result(
+    ctx: &EvalContext,
+    globals: Rc<Env>,
+    result: sema_vm::CompileResult,
+) -> Result<Value, SemaError> {
+    let functions: Vec<Rc<sema_vm::Function>> = result.functions.into_iter().map(Rc::new).collect();
+    let main_cache_slots = result.chunk.n_global_cache_slots;
+    let closure = Rc::new(sema_vm::Closure {
+        func: Rc::new(sema_vm::Function {
+            name: None,
+            chunk: result.chunk,
+            upvalue_descs: Vec::new(),
+            upvalue_names: Vec::new(),
+            arity: 0,
+            has_rest: false,
+            local_names: Vec::new(),
+            local_scopes: Vec::new(),
+            source_file: None,
+            cache_offset: 0,
+        }),
+        upvalues: Vec::new(),
+        globals: None,
+        functions: None,
+    });
+
+    let mut vm = sema_vm::VM::new(globals, functions, &[], main_cache_slots)?;
+    vm.execute(closure, ctx)
+}
+
 /// Compile and run a `load`ed module body on the VM, one top-level form at a
 /// time so a `defmacro` / nested `load` that registers a macro is visible to
 /// later forms before they compile. `env` is the caller's shared global env, so

@@ -1,0 +1,19 @@
+(defmacro mount! (selector component-name)
+  `(component/mount! ,selector
+     ,(if (symbol? component-name)
+        (symbol->string component-name)
+        component-name)))
+
+(define (local name initial) (__component/local name initial))
+
+(define (on-mount fn) (__component/on-mount fn))
+
+(defmacro defcomponent (name params . body)
+  `(define ,name
+     (fn ,params ,@body)))
+
+(defmacro computed (expr)
+  `(__state/computed-create (fn () ,expr)))
+
+(defmacro batch (. body)
+  `(__state/batch-run (fn () ,@body)))

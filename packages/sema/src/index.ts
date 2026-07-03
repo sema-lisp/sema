@@ -98,6 +98,27 @@ export interface VFSStats {
   maxFileBytes: number;
 }
 
+/** Result of loading a compiled Sema web archive. */
+export interface ArchiveLoadResult {
+  ok: boolean;
+  entryPoint: string | null;
+  fileCount: number;
+  semaVersion: string | null;
+  buildTarget: string | null;
+  buildTimestamp: string | null;
+  error: string | null;
+}
+
+export interface SemaCallback {
+  (...args: any[]): any;
+  __semaCallbackHandle?: number;
+  __semaRelease?: () => void;
+}
+
+interface SemaCallbackMarker {
+  __semaCallbackHandle: number;
+}
+
 // Internal state
 let _init: typeof import("@sema-lang/sema-wasm").default | null = null;
 let _SemaInterpreter: typeof import("@sema-lang/sema-wasm").SemaInterpreter | null = null;
@@ -156,10 +177,57 @@ async function ensureInit(wasmUrl?: string | URL): Promise<void> {
 export class SemaInterpreter {
   private _inner: any; // SemaInterpreter wasm instance
   private _vfsBackend: VFSBackend | null;
+  private _callbackWrappers = new Map<number, SemaCallback>();
 
   private constructor(inner: any, vfsBackend: VFSBackend | null = null) {
     this._inner = inner;
     this._vfsBackend = vfsBackend;
+  }
+
+  private _extractCallbackHandle(value: any): number | null {
+    if (!value || (typeof value !== "object" && typeof value !== "function")) {
+      return null;
+    }
+    const handle = (value as SemaCallbackMarker).__semaCallbackHandle;
+    return typeof handle === "number" ? handle : null;
+  }
+
+  private _wrapCallbackHandle(handle: number): SemaCallback {
+    const existing = this._callbackWrappers.get(handle);
+    if (existing) return existing;
+
+    const wrapped = ((...args: any[]) => {
+      const result = this._inner.invokeCallback(handle, args);
+      return this._deserializeValue(result);
+    }) as SemaCallback;
+
+    Object.defineProperty(wrapped, "__semaCallbackHandle", {
+      configurable: true,
+      enumerable: false,
+      value: handle,
+      writable: false,
+    });
+
+    Object.defineProperty(wrapped, "__semaRelease", {
+      configurable: true,
+      enumerable: false,
+      value: () => {
+        this._callbackWrappers.delete(handle);
+        this._inner.releaseCallback(handle);
+      },
+      writable: false,
+    });
+
+    this._callbackWrappers.set(handle, wrapped);
+    return wrapped;
+  }
+
+  private _deserializeValue(value: any): any {
+    const handle = this._extractCallbackHandle(value);
+    if (handle != null) {
+      return this._wrapCallbackHandle(handle);
+    }
+    return value;
   }
 
   /**
@@ -263,6 +331,67 @@ export class SemaInterpreter {
   }
 
   /**
+   * Load a compiled `.vfs` archive produced by `sema build --target web`.
+   *
+   * The archive's modules become available to `runEntry()` and `import`.
+   */
+  loadArchive(bytes: ArrayBuffer | Uint8Array): ArchiveLoadResult {
+    const result = this._inner.loadArchive(toUint8Array(bytes)) as ArchiveLoadResult;
+    if (!result.ok) {
+      throw new Error(result.error ?? "Failed to load archive");
+    }
+    return result;
+  }
+
+  /**
+   * Execute an embedded archive entry path synchronously.
+   */
+  runEntry(path: string): EvalResult {
+    return this._inner.runEntry(path) as EvalResult;
+  }
+
+  /**
+   * Execute an embedded archive entry path with async HTTP replay support.
+   */
+  async runEntryAsync(path: string): Promise<EvalResult> {
+    return (await this._inner.runEntryAsync(path)) as EvalResult;
+  }
+
+  /**
+   * Invoke a named global function directly with native JS arguments.
+   */
+  invokeGlobal(name: string, ...args: any[]): any {
+    return this._deserializeValue(this._inner.invokeGlobal(name, args));
+  }
+
+  /**
+   * Invoke a callback handle or wrapped Sema callback function.
+   */
+  invokeCallback(callback: number | SemaCallback, ...args: any[]): any {
+    const handle =
+      typeof callback === "number"
+        ? callback
+        : this._extractCallbackHandle(callback);
+    if (handle == null) {
+      throw new Error("Expected a Sema callback handle or wrapped callback function");
+    }
+    return this._deserializeValue(this._inner.invokeCallback(handle, args));
+  }
+
+  /**
+   * Release a callback handle created when a Sema function value crossed into JS.
+   */
+  releaseCallback(callback: number | SemaCallback): void {
+    const handle =
+      typeof callback === "number"
+        ? callback
+        : this._extractCallbackHandle(callback);
+    if (handle == null) return;
+    this._callbackWrappers.delete(handle);
+    this._inner.releaseCallback(handle);
+  }
+
+  /**
    * Register a JavaScript function that can be called from Sema code.
    *
    * Arguments are passed as native JavaScript values (numbers, strings,
@@ -285,7 +414,10 @@ export class SemaInterpreter {
    * ```
    */
   registerFunction(name: string, fn: (...args: any[]) => any): void {
-    this._inner.registerFunction(name, fn);
+    this._inner.registerFunction(name, (...args: any[]) => {
+      const deserializedArgs = args.map((arg) => this._deserializeValue(arg));
+      return fn(...deserializedArgs);
+    });
   }
 
   /**
@@ -427,6 +559,7 @@ export class SemaInterpreter {
    * The interpreter cannot be used after calling this method.
    */
   dispose(): void {
+    this._callbackWrappers.clear();
     this._inner.free();
   }
 }
@@ -442,3 +575,7 @@ export type { IndexedDBBackendOptions } from "./backends/indexed-db.js";
 
 /** @deprecated Use `SemaInterpreter` instead. */
 export { SemaInterpreter as Interpreter };
+
+function toUint8Array(bytes: ArrayBuffer | Uint8Array): Uint8Array {
+  return bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+}

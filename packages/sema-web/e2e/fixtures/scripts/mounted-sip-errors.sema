@@ -1,0 +1,18 @@
+(def mode (state "ok"))
+(def clicks (state 0))
+
+(define (inc ev)
+  (update! clicks (fn (n) (+ n 1))))
+
+(defcomponent mounted-sip-errors-view ()
+  [:div
+    [:span {:id "before"} "before"]
+    (if (equal? @mode "bad-tag")
+      ["bad tag" "broken"]
+      [:span {:id "middle"} "ok"])
+    (if (equal? @mode "bad-attr")
+      [:button {"bad attr name" "x" :id "after" :on-click "inc"} "after"]
+      [:button {:id "after" :on-click "inc"} "after"])
+    [:span {:id "clicks"} (number->string @clicks)]])
+
+(mount! "#app" "mounted-sip-errors-view")

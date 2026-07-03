@@ -1,0 +1,66 @@
+{
+  "name": "@sema-lang/llm-proxy",
+  "version": "1.9.0",
+  "description": "Server-side LLM proxy for Sema web apps — deploy on Vercel, Netlify, Cloudflare Workers, or any Node.js server",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    },
+    "./vercel": {
+      "import": "./dist/adapters/vercel.js",
+      "types": "./dist/adapters/vercel.d.ts"
+    },
+    "./netlify": {
+      "import": "./dist/adapters/netlify.js",
+      "types": "./dist/adapters/netlify.d.ts"
+    },
+    "./cloudflare": {
+      "import": "./dist/adapters/cloudflare.js",
+      "types": "./dist/adapters/cloudflare.d.ts"
+    },
+    "./node": {
+      "import": "./dist/adapters/node.js",
+      "types": "./dist/adapters/node.d.ts"
+    }
+  },
+  "files": [
+    "dist/",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "test": "npm run build && node --test tests/*.test.js",
+    "prepublishOnly": "npm run build"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.0"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/HelgeSverre/sema",
+    "directory": "packages/llm-proxy"
+  },
+  "homepage": "https://sema-lang.com",
+  "keywords": [
+    "sema",
+    "llm",
+    "proxy",
+    "openai",
+    "anthropic",
+    "vercel",
+    "netlify",
+    "cloudflare",
+    "serverless",
+    "ai"
+  ],
+  "publishConfig": { "access": "public" },
+  "author": {
+    "name": "Helge Sverre",
+    "url": "https://helgesver.re"
+  }
+}

@@ -1,7 +1,7 @@
-import { test, expect, Page } from '@playwright/test';
+import { test, expect, type Page, type Browser } from '@playwright/test';
+import { examples } from '../src/examples.js';
 
-// Example file names as they appear in the sidebar tree
-const EXAMPLES = [
+const EXAMPLE_NAMES = [
   'hello.sema',
   'fibonacci.sema',
   'fizzbuzz.sema',
@@ -25,10 +25,47 @@ const EXAMPLES = [
   'fan-in.sema',
 ];
 
+const EXAMPLES = EXAMPLE_NAMES.map((name) => {
+  for (const category of examples) {
+    const file = category.files.find((candidate) => candidate.name === name);
+    if (file) {
+      return {
+        category: category.category,
+        id: file.id,
+        name: file.name,
+      };
+    }
+  }
+  throw new Error(`Example "${name}" not found in generated examples list`);
+});
+
 /** Wait for the WASM module to be ready. */
 async function waitForReady(page: Page) {
   await page.goto('/');
   await page.waitForSelector('[data-testid="status"].status-ready', { timeout: 15000 });
+}
+
+async function openExample(page: Page, example: { category: string; id: string; name: string }) {
+  const button = page.locator(`[data-example-id="${example.id}"]`);
+  const isCollapsed = await button.evaluate((el) =>
+    el.parentElement?.classList.contains('collapsed') ?? false
+  );
+
+  if (isCollapsed) {
+    const header = page.locator('.tree-category', { hasText: example.category }).first();
+    await header.click();
+  }
+
+  await button.click();
+}
+
+function isAffectedChromiumPerlin(browserName: string, browser: Browser, exampleName: string) {
+  if (exampleName !== 'perlin-noise.sema') return false;
+  if (browserName !== 'chromium') return false;
+  if (process.arch !== 'arm64') return false;
+
+  const major = Number.parseInt(browser.version().split('.')[0] ?? '', 10);
+  return Number.isFinite(major) && major < 147;
 }
 
 /** Type code into the editor, replacing existing content. */
@@ -46,23 +83,16 @@ test.beforeEach(async ({ page }) => {
   await waitForReady(page);
 });
 
-/** Expand every sidebar category so its example buttons are clickable.
- *  Only "Getting Started" is expanded by default; other categories collapse. */
-async function expandAllCategories(page: Page) {
-  await page.evaluate(() => {
-    document
-      .querySelectorAll('.tree-items.collapsed')
-      .forEach(el => el.classList.remove('collapsed'));
-  });
-}
-
 // ── Example smoke tests ──
 
-for (const name of EXAMPLES) {
-  test(`example: ${name}`, async ({ page }) => {
-    // Expand all categories, then click the example button in the sidebar tree
-    await expandAllCategories(page);
-    await page.click(`.tree-file:text("${name}")`);
+for (const example of EXAMPLES) {
+  test(`example: ${example.name}`, async ({ page, browser, browserName }) => {
+    test.fixme(
+      isAffectedChromiumPerlin(browserName, browser, example.name),
+      'Chromium <147 on ARM64 crashes in V8 when the tree-walker evaluates the perlin value-noise path'
+    );
+
+    await openExample(page, example);
 
     // Verify editor has content
     const editorValue = await page.getByTestId('editor').inputValue();
@@ -75,7 +105,7 @@ for (const name of EXAMPLES) {
     const errorEl = await page.$('#output .output-error');
     if (errorEl) {
       const errorText = await errorEl.textContent();
-      throw new Error(`Example "${name}" produced error: ${errorText}`);
+      throw new Error(`Example "${example.name}" produced error: ${errorText}`);
     }
 
     // Check we got some output (either output lines or a value)
@@ -91,8 +121,12 @@ for (const name of EXAMPLES) {
 
 test('whitespace preserved in output', async ({ page }) => {
   // Use the Maze example which relies on whitespace alignment
-  await expandAllCategories(page);
-  await page.click('.tree-file:text("maze.sema")');
+  const maze = EXAMPLES.find((example) => example.name === 'maze.sema');
+  if (!maze) {
+    throw new Error('Maze example not found in generated examples list');
+  }
+
+  await openExample(page, maze);
   await clickRunAndWait(page);
 
   // Check that output lines have white-space: pre

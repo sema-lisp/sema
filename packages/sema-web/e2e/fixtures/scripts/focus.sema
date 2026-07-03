@@ -1,0 +1,14 @@
+(def label (state "Type here"))
+(def counter (state 0))
+
+(define (update-label ev) (put! label (dom/event-value ev)))
+(define (bump ev) (update! counter (fn (n) (+ n 1))))
+
+(define (focus-view)
+  [:div
+    [:input {:id "text-input" :value @label :on-input "update-label"}]
+    [:p {:id "label-display"} @label]
+    [:button {:id "btn-bump" :on-click "bump"} "Bump counter"]
+    [:p {:id "counter-display"} (number->string @counter)]])
+
+(mount! "#app" "focus-view")

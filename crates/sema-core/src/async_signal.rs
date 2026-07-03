@@ -475,6 +475,72 @@ pub fn install_task_usage_scope(ctx: Box<dyn Any>) -> Box<dyn Any> {
     }
 }
 
+// ── Per-task LLM dynamic-scope seam ─────────────────────────────────
+//
+// `llm/with-cache`, `llm/with-budget`, and per-call `:tags`/`:metadata` set
+// dynamically-scoped thread-locals in `sema-llm` for the extent of a thunk, then
+// reset them. A task spawned inside that thunk reads those flags WHEN IT RUNS,
+// which the cooperative scheduler can defer past the reset — so the flags leak
+// across the task boundary (cache misses under-counted, and a `with-budget` cap
+// failing to gate a concurrent fan-out). Like the otel context and the leaf-usage
+// scope above, the scheduler captures this dynamic scope at task spawn and swaps it
+// in/out at each task step so concurrent siblings stay isolated. The read-only flags
+// (cache-enabled, tags, …) ride as a value snapshot; the budget frame rides as a
+// shared `Rc` so all siblings in one `with-budget` charge ONE aggregate. The scope
+// struct lives in `sema-llm`; `sema-core` reaches it through these type-erased
+// fn-pointer callbacks (mirroring the usage-scope seam). No-ops returning an empty
+// box when unregistered.
+
+/// Capture the current thread's LLM dynamic scope (cloning read-only values and the
+/// budget `Rc`) to seed onto a freshly-spawned task. `Box::new(())` when unregistered.
+pub type LlmScopeCaptureFn = fn() -> Box<dyn Any>;
+/// Take (mem::take) the current thread's LLM dynamic scope, leaving defaults.
+pub type LlmScopeTakeFn = fn() -> Box<dyn Any>;
+/// Install an LLM dynamic scope into the thread-locals, returning the one displaced.
+pub type LlmScopeInstallFn = fn(Box<dyn Any>) -> Box<dyn Any>;
+
+thread_local! {
+    static LLM_SCOPE_CAPTURE_CALLBACK: Cell<Option<LlmScopeCaptureFn>> = const { Cell::new(None) };
+    static LLM_SCOPE_TAKE_CALLBACK: Cell<Option<LlmScopeTakeFn>> = const { Cell::new(None) };
+    static LLM_SCOPE_INSTALL_CALLBACK: Cell<Option<LlmScopeInstallFn>> = const { Cell::new(None) };
+}
+
+/// Register the per-task LLM dynamic-scope callbacks. Called once at startup by
+/// `sema-llm` (the crate that owns the scope struct).
+pub fn set_llm_scope_task_callbacks(
+    capture: LlmScopeCaptureFn,
+    take: LlmScopeTakeFn,
+    install: LlmScopeInstallFn,
+) {
+    LLM_SCOPE_CAPTURE_CALLBACK.with(|cb| cb.set(Some(capture)));
+    LLM_SCOPE_TAKE_CALLBACK.with(|cb| cb.set(Some(take)));
+    LLM_SCOPE_INSTALL_CALLBACK.with(|cb| cb.set(Some(install)));
+}
+
+/// Capture the LLM dynamic scope to seed a spawned task.
+pub fn current_llm_scope_boxed() -> Box<dyn Any> {
+    match LLM_SCOPE_CAPTURE_CALLBACK.with(|cb| cb.get()) {
+        Some(f) => f(),
+        None => Box::new(()),
+    }
+}
+
+/// Take the LLM dynamic scope out of the thread-locals (leaving defaults).
+pub fn take_task_llm_scope() -> Box<dyn Any> {
+    match LLM_SCOPE_TAKE_CALLBACK.with(|cb| cb.get()) {
+        Some(f) => f(),
+        None => Box::new(()),
+    }
+}
+
+/// Install an LLM dynamic scope into the thread-locals, returning the one displaced.
+pub fn install_task_llm_scope(ctx: Box<dyn Any>) -> Box<dyn Any> {
+    match LLM_SCOPE_INSTALL_CALLBACK.with(|cb| cb.get()) {
+        Some(f) => f(ctx),
+        None => Box::new(()),
+    }
+}
+
 // ── Interrupt (cancellation) callback ───────────────────────────
 
 /// Callback that returns true when the running evaluation should be cancelled.

@@ -39,6 +39,20 @@ pub struct EvalContext {
     pub interactive: Cell<bool>,
 }
 
+/// RAII guard for a module-load scope: pops the load stack when dropped, so the
+/// stack stays balanced on every exit path (early return, `?`, panic). Created
+/// by [`EvalContext::enter_module_load`].
+pub struct ModuleLoadGuard<'a> {
+    ctx: &'a EvalContext,
+    path: PathBuf,
+}
+
+impl Drop for ModuleLoadGuard<'_> {
+    fn drop(&mut self) {
+        self.ctx.end_module_load(&self.path);
+    }
+}
+
 impl EvalContext {
     pub fn new() -> Self {
         EvalContext {
@@ -150,7 +164,15 @@ impl EvalContext {
         self.module_exports.borrow_mut().pop().flatten()
     }
 
-    pub fn begin_module_load(&self, path: &PathBuf) -> Result<(), SemaError> {
+    /// Enter a module-load scope, guarding against import/load cycles. The
+    /// returned [`ModuleLoadGuard`] pops the load stack when dropped, keeping it
+    /// balanced on any exit path. Errors if `path` is already being loaded.
+    pub fn enter_module_load(&self, path: PathBuf) -> Result<ModuleLoadGuard<'_>, SemaError> {
+        self.begin_module_load(&path)?;
+        Ok(ModuleLoadGuard { ctx: self, path })
+    }
+
+    fn begin_module_load(&self, path: &PathBuf) -> Result<(), SemaError> {
         let mut stack = self.module_load_stack.borrow_mut();
         if let Some(pos) = stack.iter().position(|p| p == path) {
             let mut cycle: Vec<String> = stack[pos..]
@@ -167,7 +189,7 @@ impl EvalContext {
         Ok(())
     }
 
-    pub fn end_module_load(&self, path: &PathBuf) {
+    fn end_module_load(&self, path: &PathBuf) {
         let mut stack = self.module_load_stack.borrow_mut();
         if matches!(stack.last(), Some(last) if last == path) {
             stack.pop();

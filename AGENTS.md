@@ -52,6 +52,7 @@ Dependency flow (arrows = "depends on"): `sema-core ← sema-reader ← sema-vm 
 - **Callback architecture** — Stdlib higher-order functions (map, filter, foldl, sort-by) call through `sema_core::call_callback`, which dispatches to the real evaluator via a thread-local callback registered at interpreter startup. No mini-eval — all evaluation goes through the full evaluator.
 - **Module system (EvalContext)** — `module_cache`, `current_file` (stack), `module_exports` are fields in `EvalContext` (`sema-core/src/context.rs`), threaded through the evaluator as `ctx: &EvalContext`. Modules identified by canonical file path. Module env is a child of the root env (gets builtins, not caller bindings). Paths resolve relative to the current file.
 - **Keywords as functions** — `(:name person)` works like `(get person :name)`, handled in `eval_step` when a `Value::Keyword` appears in head position.
+- **Invariant I2 (CORE-2 GC)** — a `NativeFn`'s boxed closure must not strongly capture anything that can transitively hold a `Value` or `Env` (that would form an uncollectable cycle the collector cannot trace). Traceable state belongs in `NativeFn.payload` (traced via a registered payload tracer); host infrastructure (e.g. the `__vm-*` delegates) captures `Weak` and upgrades at call time. See `docs/plans/2026-07-02-core2-gc.md` §2.
 
 ## Code Style
 

@@ -8,12 +8,12 @@ BENCH_DIR="examples/benchmarks"
 suite_benchmarks() {
   case "$1" in
     core)      echo "tak nqueens deriv" ;;
-    closure)   echo "upvalue-counter closure-storm higher-order-fold" ;;
+    closure)   echo "upvalue-counter closure-storm higher-order-fold recursive-closure-churn" ;;
     data)      echo "hashmap-bench bench-features" ;;
     string)    echo "string-pipeline" ;;
     numeric)   echo "tak nqueens deriv mandelbrot" ;;
     exception) echo "throw-catch" ;;
-    all)       echo "tak nqueens deriv upvalue-counter closure-storm higher-order-fold hashmap-bench bench-features string-pipeline mandelbrot throw-catch" ;;
+    all)       echo "tak nqueens deriv upvalue-counter closure-storm higher-order-fold recursive-closure-churn hashmap-bench bench-features string-pipeline mandelbrot throw-catch" ;;
     *)         return 1 ;;
   esac
 }

@@ -72,16 +72,18 @@ mod tests {
     }
 
     #[test]
-    fn uses_start_port_when_free() {
-        // Find a free port, release it, then confirm the helper reuses it
-        // rather than needlessly advancing.
+    fn binds_at_or_above_start_port() {
+        // Find a free port, release it, then bind from there. Fallback only
+        // advances upward, so the result must be >= the start (used the free
+        // start, or advanced if a parallel test grabbed it in between — asserting
+        // the exact port would be racy).
         let port = {
             let l = TcpListener::bind("127.0.0.1:0").unwrap();
             l.local_addr().unwrap().port()
         };
         let (_l, got) =
-            bind_with_fallback("127.0.0.1", port, 10).expect("just-freed port should be bindable");
-        assert_eq!(got, port, "a free start port should be used as-is");
+            bind_with_fallback("127.0.0.1", port, 50).expect("a free port should be bindable");
+        assert!(got >= port, "fallback never binds below the start port");
     }
 
     #[test]

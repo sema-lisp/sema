@@ -171,7 +171,7 @@
       ]
     },
     "special-form": {
-      "match": "(?<=[\\s(\\[{])(?:define|async|await|defn|def|progn|dotimes|for-range|with-retry|with-session|with-span|with-stream|defworkflow|defun|lambda|fn|if|if-let|cond|case|when|when-let|unless|let\\*?|letrec|begin|do|and|or|set!|quote|quasiquote|unquote-splicing|unquote|define-record-type|defmacro|defmethod|defmulti|defagent|deftool|try|catch|throw|import|module|export|load|delay|force|eval|macroexpand|else|prompt|message|match\\*|match)(?=[\\s)\\]}]|$)",
+      "match": "(?<=[\\s(\\[{])(?:define|async|await|defn|def|progn|dotimes|for-range|with-retry|with-session|with-span|with-stream|defworkflow|defun|lambda|fn|if|if-let|cond|case|when|when-let|unless|let\\*?|letrec|begin|do|while|and|or|set!|quote|quasiquote|unquote-splicing|unquote|define-record-type|defmacro|defmethod|defmulti|defagent|deftool|try|catch|throw|import|module|export|load|delay|force|eval|macroexpand|else|prompt|message|match\\*|match)(?=[\\s)\\]}]|$)",
       "name": "keyword.control.sema"
     },
     "operator": {
@@ -487,6 +487,146 @@
         {
           "comment": "issue #12 grammar sweep: workflow builtins",
           "match": "(?<=[\\s(\\[{])(?:settled/err\\?|settled/ok\\?|checkpoint|parallel|parallel-settled|phase|pipeline|pipeline-settled|settled-partition|step|workflow/check|workflow/checkpoint|workflow/phase|workflow/run|workflow/run-form|workflow/step|workflow/tool-call)(?=[\\s)\\]}]|$)",
+          "name": "support.function.sema"
+        },
+        {
+          "comment": "issue #12 grammar sweep (gated): db builtins",
+          "match": "(?<=[\\s(\\[{])(?:db/exec|db/query)(?=[\\s)\\]}]|$)",
+          "name": "support.function.sema"
+        },
+        {
+          "comment": "issue #12 grammar sweep (gated): diff builtins",
+          "match": "(?<=[\\s(\\[{])(?:diff/apply|diff/hunks|diff/parse|diff/stat|diff/unified)(?=[\\s)\\]}]|$)",
+          "name": "support.function.sema"
+        },
+        {
+          "comment": "issue #12 grammar sweep (gated): event builtins",
+          "match": "(?<=[\\s(\\[{])(?:event/select)(?=[\\s)\\]}]|$)",
+          "name": "support.function.sema"
+        },
+        {
+          "comment": "issue #12 grammar sweep (gated): format builtins",
+          "match": "(?<=[\\s(\\[{])(?:format/form)(?=[\\s)\\]}]|$)",
+          "name": "support.function.sema"
+        },
+        {
+          "comment": "issue #12 grammar sweep (gated): fs builtins",
+          "match": "(?<=[\\s(\\[{])(?:fs/unwatch|fs/watch|fs/watch-events)(?=[\\s)\\]}]|$)",
+          "name": "support.function.sema"
+        },
+        {
+          "comment": "issue #12 grammar sweep (gated): git builtins",
+          "match": "(?<=[\\s(\\[{])(?:git/changed-files|git/current-branch|git/diff|git/diff-files|git/ignore-matches\\?|git/recent-files|git/root|git/status)(?=[\\s)\\]}]|$)",
+          "name": "support.function.sema"
+        },
+        {
+          "comment": "issue #12 grammar sweep (gated): gzip builtins",
+          "match": "(?<=[\\s(\\[{])(?:gzip/compress|gzip/decompress)(?=[\\s)\\]}]|$)",
+          "name": "support.function.sema"
+        },
+        {
+          "comment": "issue #12 grammar sweep (gated): hash builtins",
+          "match": "(?<=[\\s(\\[{])(?:hash/digest)(?=[\\s)\\]}]|$)",
+          "name": "support.function.sema"
+        },
+        {
+          "comment": "issue #12 grammar sweep (gated): html builtins",
+          "match": "(?<=[\\s(\\[{])(?:html/parse|html/select|html/select-text|html/text)(?=[\\s)\\]}]|$)",
+          "name": "support.function.sema"
+        },
+        {
+          "comment": "issue #12 grammar sweep (gated): markdown builtins",
+          "match": "(?<=[\\s(\\[{])(?:markdown/frontmatter|markdown/headings|markdown/to-html)(?=[\\s)\\]}]|$)",
+          "name": "support.function.sema"
+        },
+        {
+          "comment": "issue #12 grammar sweep (gated): mcp builtins",
+          "match": "(?<=[\\s(\\[{])(?:mcp/call|mcp/close|mcp/connect|mcp/tools|mcp/tools->sema)(?=[\\s)\\]}]|$)",
+          "name": "support.function.sema"
+        },
+        {
+          "comment": "issue #12 grammar sweep (gated): patch builtins",
+          "match": "(?<=[\\s(\\[{])(?:patch/apply-file)(?=[\\s)\\]}]|$)",
+          "name": "support.function.sema"
+        },
+        {
+          "comment": "issue #12 grammar sweep (gated): path builtins",
+          "match": "(?<=[\\s(\\[{])(?:path/relative-to|path/within\\?)(?=[\\s)\\]}]|$)",
+          "name": "support.function.sema"
+        },
+        {
+          "comment": "issue #12 grammar sweep (gated): pii builtins",
+          "match": "(?<=[\\s(\\[{])(?:pii/detect)(?=[\\s)\\]}]|$)",
+          "name": "support.function.sema"
+        },
+        {
+          "comment": "issue #12 grammar sweep (gated): proc builtins",
+          "match": "(?<=[\\s(\\[{])(?:proc/close|proc/close-stdin|proc/exit-code|proc/kill|proc/read-stderr|proc/read-stdout|proc/running\\?|proc/spawn|proc/wait|proc/write-stdin)(?=[\\s)\\]}]|$)",
+          "name": "support.function.sema"
+        },
+        {
+          "comment": "issue #12 grammar sweep (gated): pty builtins",
+          "match": "(?<=[\\s(\\[{])(?:pty/close|pty/exit-code|pty/kill|pty/read|pty/resize|pty/running\\?|pty/spawn|pty/wait|pty/write)(?=[\\s)\\]}]|$)",
+          "name": "support.function.sema"
+        },
+        {
+          "comment": "issue #12 grammar sweep (gated): read builtins",
+          "match": "(?<=[\\s(\\[{])(?:read/all|read/string)(?=[\\s)\\]}]|$)",
+          "name": "support.function.sema"
+        },
+        {
+          "comment": "issue #12 grammar sweep (gated): redact builtins",
+          "match": "(?<=[\\s(\\[{])(?:redact/spans)(?=[\\s)\\]}]|$)",
+          "name": "support.function.sema"
+        },
+        {
+          "comment": "issue #12 grammar sweep (gated): secret builtins",
+          "match": "(?<=[\\s(\\[{])(?:secret/detect|secret/redact)(?=[\\s)\\]}]|$)",
+          "name": "support.function.sema"
+        },
+        {
+          "comment": "issue #12 grammar sweep (gated): sema builtins",
+          "match": "(?<=[\\s(\\[{])(?:sema/check-file|sema/check-string)(?=[\\s)\\]}]|$)",
+          "name": "support.function.sema"
+        },
+        {
+          "comment": "issue #12 grammar sweep (gated): serial builtins",
+          "match": "(?<=[\\s(\\[{])(?:serial/close|serial/list|serial/open|serial/read-line|serial/send|serial/write)(?=[\\s)\\]}]|$)",
+          "name": "support.function.sema"
+        },
+        {
+          "comment": "issue #12 grammar sweep (gated): string builtins",
+          "match": "(?<=[\\s(\\[{])(?:string/width|string/word-wrap)(?=[\\s)\\]}]|$)",
+          "name": "support.function.sema"
+        },
+        {
+          "comment": "issue #12 grammar sweep (gated): sys builtins",
+          "match": "(?<=[\\s(\\[{])(?:sys/config-dir)(?=[\\s)\\]}]|$)",
+          "name": "support.function.sema"
+        },
+        {
+          "comment": "issue #12 grammar sweep (gated): tar builtins",
+          "match": "(?<=[\\s(\\[{])(?:tar/create|tar/extract)(?=[\\s)\\]}]|$)",
+          "name": "support.function.sema"
+        },
+        {
+          "comment": "issue #12 grammar sweep (gated): term builtins",
+          "match": "(?<=[\\s(\\[{])(?:term/flush|term/move-to|term/set-title|term/write-at)(?=[\\s)\\]}]|$)",
+          "name": "support.function.sema"
+        },
+        {
+          "comment": "issue #12 grammar sweep (gated): time builtins",
+          "match": "(?<=[\\s(\\[{])(?:time/tick)(?=[\\s)\\]}]|$)",
+          "name": "support.function.sema"
+        },
+        {
+          "comment": "issue #12 grammar sweep (gated): zip builtins",
+          "match": "(?<=[\\s(\\[{])(?:zip/create|zip/extract|zip/list)(?=[\\s)\\]}]|$)",
+          "name": "support.function.sema"
+        },
+        {
+          "comment": "issue #12 grammar sweep (macros): io/term with- forms",
+          "match": "(?<=[\\s(\\[{])(?:io/with-raw-mode|term/with-alt-screen|term/with-mouse)(?=[\\s)\\]}]|$)",
           "name": "support.function.sema"
         }
       ]

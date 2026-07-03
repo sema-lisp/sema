@@ -1,6 +1,6 @@
 # Bytecode VM Status
 
-> Last updated: 2026-06-18 (tree-walker retired; VM is the sole evaluator)
+> Last updated: 2026-07-02 (CORE-2 cycle collector shipped; see *Memory: cycle collection*)
 
 ## Current State
 
@@ -72,6 +72,73 @@ All 10 original VM bugs from the early bring-up are fixed:
 | **9. Inner define forward references**                  | `(define (a) (b)) (define (b) 42)` inside function bodies failed — resolver didn't pre-scan for define names       | Fixed: `resolve_body()` pre-registers all inner define names before resolving expressions       |
 | **10. Stale upvalue cell reuse on slot reuse**           | Named-lets reusing the same slot after a native call got a Closed cell containing the old closure's value           | Fixed: `close_open_upvalues` clears entries after closing, preventing stale cell reuse          |
 
+## Memory: cycle collection (CORE-2)
+
+Reclamation is `Rc` drop plus a **synchronous Bacon–Rajan cycle collector** over the
+existing `Rc` heap (ADR #66; full design + measurements in
+`docs/plans/2026-07-02-core2-gc.md`). Reference cycles — recursive local closures
+(upvalue self-capture), env⇄closure home-globals cycles, and closure-free data cycles
+through `Thunk.forced` / promise state / channel buffers / multimethod tables — are
+found by trial deletion (MarkGray → Scan → CollectWhite) and reclaimed by **severing**
+the one mutable cell every Sema cycle must pass through, letting the ordinary `Rc`
+cascade free the memory. No object headers, no color bits, no change to `Value`'s
+NaN-boxing or to `Value::drop`; all collection state lives in a transient side map
+(`crates/sema-core/src/cycle.rs`).
+
+- **Candidates (creation-time registry, `Weak`):** VM closures with upvalues
+  (`make_closure`), home envs on first adoption, and the cold data constructors
+  (`delay`, promise creation, `channel/new`, `defmulti`). Zero-upvalue closures are
+  exempt (their cycles are covered by the registered home-env wrapper). Acyclic
+  garbage self-prunes as dead `Weak`s — `Value::drop` and call dispatch pay nothing.
+- **Trigger:** registry growth past `max(1024, 4 × survivors of the last pass)`
+  (CPython's gen-0 heuristic flattened to one generation), checked at closure *and*
+  data-candidate births plus the safe points; quiescent passes take a prune-only fast
+  path that never traces, so acyclic data churn costs a batched prune, not a trace.
+- **Safe points:** closure- and data-birth threshold (mid-VM / mid-eval), top-level
+  eval return, notebook cell eval + kernel reset, agent-loop turn boundary, scheduler
+  idle (all tasks done), `Interpreter::drop`, and explicit `(gc/collect)` / REPL
+  `,gc`. `(gc/stats)` reports the last pass + registry size.
+- **Observability:** with OpenTelemetry tracing enabled (`(otel/configure …)` or the
+  standard OTLP env init — nothing GC-specific to turn on), every pass that actually
+  runs (prune-only and aborted passes included; threshold-gated no-ops excluded)
+  emits a `gc.collect` span, retroactively timed to the pass's real duration and
+  nested under whatever span was active at the safe point (agent turn, notebook
+  cell, tool call). Attributes: `gc.trigger` (`threshold` | `eval-return` |
+  `interpreter-drop` | `notebook-cell` | `notebook-reset` | `agent-turn` |
+  `scheduler-idle` | `explicit`), `gc.candidates`, `gc.traced`, `gc.collected`,
+  `gc.pruned`, `gc.registry_before`, `gc.aborted`. Wiring: a thread-local observer
+  seam in `cycle.rs` (`set_gc_observer`, a plain `fn` — invariant I2), registered by
+  sema-llm's builtin setup (sema-core cannot depend on sema-otel). Unobserved or
+  telemetry-off passes pay one thread-local check; the no-pass path pays nothing.
+- **Invariants:** I1 — every cycle passes through a severable cell (env bindings,
+  upvalue cell, thunk `forced`, promise state, channel buffer, multimethod table);
+  I2 — native fns must not strongly capture `Env`/`Value` outside `NativeFn.payload`
+  (AGENTS.md). Live data is protected by external strong counts (Rust/VM stack refs),
+  so no root enumeration or shadow stack exists anywhere.
+- **Cost (M4 formal gate, Apple Silicon, release, interleaved hyperfine A/B vs the
+  pre-collector baseline):** upvalue-counter +0.1%, closure-storm +1.4%,
+  higher-order-fold +1.6%; recursive-closure churn reclaims at ~326 ns per cycle
+  (300k iters, 1.73× the leaking baseline's wall time; 1M iters: 325 ns/cycle, 1.83×).
+  Numeric suite: nqueens +0.4% and deriv −0.1% (within noise); tak +0.9% with zero
+  collector activity (`gc/stats` all-zero — layout noise, not GC work); mandelbrot
+  +12% — named-`let` loop entries birth a self-recursive candidate closure (a CORE-2
+  cycle) each (~7k cycles reclaimed per run, ~65 ns per birth), so it pays real
+  collection, not bookkeeping — the pre-collector baseline *leaks* on it (100-rep
+  same-shape run: 144.8 MB RSS growing linearly vs 16.8 MB flat with the collector).
+  Issue #62 (self-tail-call optimization: compile named-let self-recursion without
+  self-capture — no cycle, no closure birth) is the planned elimination of that cost.
+- **Memory win (1M-iteration recursive-closure churn, `/usr/bin/time -l`):** baseline
+  RSS 303.7 MB (unbounded — leaks every cycle); with the collector 16.0 MB (bounded).
+- **Pause sizing (`sys/elapsed`, 100k-candidate synthetic worst cases):** explicit
+  `(gc/collect)` over 100k **live** closures traces ~500k edges in 85–96 ms (5
+  samples, median ~88 ms) and frees nothing; a single batched collect of 100k **dead**
+  recursive-closure cycles takes ~137 ms (trace + sever + `Rc` cascade, ~1.4 µs/cycle
+  at that batch size). The threshold policy (`max(1024, 4 × survivors)`, prune-only
+  fast passes) keeps real batches ~3 orders smaller: the post-churn safe-point collect
+  runs in ~0.3 ms (~770 candidates), and a quiescent pass is ~37 µs. Steady-state
+  churn cost stays at the ~326 ns/cycle above because collection amortizes across
+  threshold-sized batches, never 100k-cycle ones.
+
 ## Performance
 
 > **Note (Jun 2026):** the numbers below are **pre-PGO** and from older runs. v1.19.2 shipped fat LTO (3–9%) and PGO (~25–29% on 1BRC, −11% to −40% on compute) in the release binaries — see [Performance Roadmap](performance-roadmap.md) §10/§13. Re-measure before relying on these.
@@ -84,7 +151,7 @@ All 10 original VM bugs from the early bring-up are fixed:
 
 ## Deferred Work
 
-- **Tracing GC:** Replace Rc-based reference counting — estimated ~1.3× speedup
+- **Tracing GC as the primary allocator:** replace Rc-based reference counting wholesale — estimated ~1.3× speedup, but rejected for CORE-2 (root enumeration across the stdlib FFI surface is fatal; see ADR #66 option C). Cycles are handled by the CORE-2 collector above; this entry remains only as a perf idea.
 - **Direct threading:** Computed goto dispatch — estimated 15–30% on tight loops
 - **Macro expansion caching:** Cache expanded macros to avoid redundant VM-native macro expansion
 - **Register-based VM:** Would reduce push/pop traffic but requires full rewrite

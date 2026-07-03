@@ -2181,24 +2181,21 @@ fn web_output_path(input: &std::path::Path, output: Option<&str>) -> std::path::
     }
 }
 
-fn run_build_web(file: &str, output: Option<&str>, includes: &[String]) -> Result<(), String> {
-    let path = std::path::Path::new(file);
-    if !path.exists() {
-        return Err(format!("source file not found: {file}"));
-    }
-
-    let source = std::fs::read_to_string(path).map_err(|e| format!("reading {file}: {e}"))?;
-
-    eprintln!("[1/5] Compiling {file} for web...");
-
+/// Compile an entry `.sema` plus its traced imports (and any `includes`) into a
+/// web `.vfs` archive. Returns the archive bytes and the number of traced
+/// imports (0 = single-file). Shared by `sema build --target web` and the
+/// `sema web` dev server, which builds an archive on the fly for multi-file apps.
+pub(crate) fn build_web_archive(
+    path: &std::path::Path,
+    includes: &[String],
+) -> Result<(Vec<u8>, usize), String> {
+    let source =
+        std::fs::read_to_string(path).map_err(|e| format!("reading {}: {e}", path.display()))?;
     let entry_bytecode = compile_source_to_bytecode(&source)?;
-
-    eprintln!("[2/5] Tracing imports...");
 
     let imports =
         import_tracer::trace_imports(path).map_err(|e| format!("tracing imports: {e}"))?;
-
-    eprintln!("[3/5] Compiling traced modules...");
+    let import_count = imports.len();
 
     let mut files = std::collections::HashMap::new();
     files.insert("__main__.semac".to_string(), entry_bytecode);
@@ -2253,8 +2250,6 @@ fn run_build_web(file: &str, output: Option<&str>, includes: &[String]) -> Resul
         }
     }
 
-    eprintln!("[4/5] Building web archive ({} files)...", files.len());
-
     let mut metadata = std::collections::HashMap::new();
     metadata.insert(
         "sema-version".to_string(),
@@ -2276,9 +2271,17 @@ fn run_build_web(file: &str, output: Option<&str>, includes: &[String]) -> Resul
         canonical_root.to_string_lossy().into_owned().into_bytes(),
     );
 
-    let archive_bytes = archive::serialize_archive(&metadata, &files);
+    Ok((archive::serialize_archive(&metadata, &files), import_count))
+}
 
-    eprintln!("[5/5] Writing web archive...");
+fn run_build_web(file: &str, output: Option<&str>, includes: &[String]) -> Result<(), String> {
+    let path = std::path::Path::new(file);
+    if !path.exists() {
+        return Err(format!("source file not found: {file}"));
+    }
+
+    eprintln!("Compiling {file} for web...");
+    let (archive_bytes, import_count) = build_web_archive(path, includes)?;
 
     let output_path = web_output_path(path, output);
     if let Some(parent) = output_path.parent() {
@@ -2291,12 +2294,10 @@ fn run_build_web(file: &str, output: Option<&str>, includes: &[String]) -> Resul
         .map_err(|e| format!("writing {}: {e}", output_path.display()))?;
 
     eprintln!(
-        "Built web archive: {} ({} bytes, {} bundled files)",
+        "Built web archive: {} ({} bytes, {} imports bundled)",
         output_path.display(),
-        std::fs::metadata(&output_path)
-            .map(|m| m.len())
-            .unwrap_or(0),
-        files.len()
+        archive_bytes.len(),
+        import_count
     );
     eprintln!(
         "  Load with <script type=\"text/sema\" src=\"{}\"></script>",

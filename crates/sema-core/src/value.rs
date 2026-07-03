@@ -880,7 +880,13 @@ impl Value {
     }
 
     pub fn thunk(t: Thunk) -> Value {
-        Value::from_rc_ptr(TAG_THUNK, Rc::new(t))
+        let rc = Rc::new(t);
+        // Cold data-cycle constructor (CORE-2, plan §5.2): a thunk can carry a
+        // closure-free cycle through its `forced` cell, so every fresh thunk
+        // is a collector candidate. `from_rc` wrappers are exempt — they wrap
+        // allocations registered at their own creation site.
+        crate::cycle::register_candidate(crate::cycle::GcNode::Thunk(Rc::downgrade(&rc)));
+        Value::from_rc_ptr(TAG_THUNK, rc)
     }
 
     pub fn thunk_from_rc(rc: Rc<Thunk>) -> Value {
@@ -920,7 +926,12 @@ impl Value {
     }
 
     pub fn multimethod(m: MultiMethod) -> Value {
-        Value::from_rc_ptr(TAG_MULTIMETHOD, Rc::new(m))
+        let rc = Rc::new(m);
+        // Cold data-cycle constructor (CORE-2): the method table / default
+        // cells can close a closure-free cycle (e.g. a method value that is
+        // the multimethod itself).
+        crate::cycle::register_candidate(crate::cycle::GcNode::MultiMethod(Rc::downgrade(&rc)));
+        Value::from_rc_ptr(TAG_MULTIMETHOD, rc)
     }
 
     pub fn multimethod_from_rc(rc: Rc<MultiMethod>) -> Value {
@@ -936,13 +947,24 @@ impl Value {
     }
 
     pub fn async_promise(promise: AsyncPromise) -> Value {
-        Value::from_rc_ptr(TAG_ASYNC_PROMISE, Rc::new(promise))
+        let rc = Rc::new(promise);
+        // Cold data-cycle constructor (CORE-2): a resolved promise can close a
+        // closure-free cycle through its state cell (e.g. resolved to a channel
+        // that buffers the promise). The scheduler's raw `Rc::new(AsyncPromise…)`
+        // spawn sites register their own candidates before wrapping via
+        // `async_promise_from_rc`.
+        crate::cycle::register_candidate(crate::cycle::GcNode::Promise(Rc::downgrade(&rc)));
+        Value::from_rc_ptr(TAG_ASYNC_PROMISE, rc)
     }
     pub fn async_promise_from_rc(rc: Rc<AsyncPromise>) -> Value {
         Value::from_rc_ptr(TAG_ASYNC_PROMISE, rc)
     }
     pub fn channel(ch: Channel) -> Value {
-        Value::from_rc_ptr(TAG_CHANNEL, Rc::new(ch))
+        let rc = Rc::new(ch);
+        // Cold data-cycle constructor (CORE-2): the buffer can hold values
+        // that reach back to the channel with no closure on the cycle.
+        crate::cycle::register_candidate(crate::cycle::GcNode::Channel(Rc::downgrade(&rc)));
+        Value::from_rc_ptr(TAG_CHANNEL, rc)
     }
     pub fn channel_from_rc(rc: Rc<Channel>) -> Value {
         Value::from_rc_ptr(TAG_CHANNEL, rc)
@@ -1165,6 +1187,65 @@ impl Value {
             TAG_CHANNEL => ValueViewRef::Channel(unsafe { self.borrow_ref::<Channel>() }),
             _ => unreachable!("invalid NaN-boxed tag: {}", tag),
         }
+    }
+
+    /// Data pointer of the heap allocation behind this value — the cycle
+    /// collector's node identity. `None` for floats and immediates.
+    pub(crate) fn heap_ptr(&self) -> Option<*const u8> {
+        if !is_boxed(self.0) {
+            return None;
+        }
+        match get_tag(self.0) {
+            TAG_NIL | TAG_FALSE | TAG_TRUE | TAG_INT_SMALL | TAG_CHAR | TAG_SYMBOL
+            | TAG_KEYWORD => None,
+            _ => Some(payload_to_ptr(get_payload(self.0))),
+        }
+    }
+
+    /// `Rc::strong_count` of the heap allocation behind this value, read
+    /// without perturbing the count (the collector's trial-deletion seed).
+    /// `None` for floats and immediates.
+    pub(crate) fn heap_strong_count(&self) -> Option<usize> {
+        /// Read the strong count of the `Rc<T>` whose data pointer is `ptr`.
+        ///
+        /// SAFETY: caller must pass the data pointer of a live `Rc<T>` with the
+        /// correct `T` for the value's tag (same tag→type table as `view()`,
+        /// `Clone`, and `Drop`). `ManuallyDrop` prevents the reconstructed `Rc`
+        /// from decrementing the count it merely reads — the established
+        /// pattern from `with_hashmap_mut_if_unique`.
+        unsafe fn count_at<T>(ptr: *const u8) -> usize {
+            let rc = std::mem::ManuallyDrop::new(unsafe { Rc::from_raw(ptr as *const T) });
+            Rc::strong_count(&rc)
+        }
+        let ptr = self.heap_ptr()?;
+        let n = unsafe {
+            match get_tag(self.0) {
+                TAG_INT_BIG => count_at::<i64>(ptr),
+                TAG_STRING => count_at::<String>(ptr),
+                TAG_LIST | TAG_VECTOR => count_at::<Vec<Value>>(ptr),
+                TAG_MAP => count_at::<BTreeMap<Value, Value>>(ptr),
+                TAG_HASHMAP => count_at::<hashbrown::HashMap<Value, Value>>(ptr),
+                TAG_LAMBDA => count_at::<Lambda>(ptr),
+                TAG_MACRO => count_at::<Macro>(ptr),
+                TAG_NATIVE_FN => count_at::<NativeFn>(ptr),
+                TAG_PROMPT => count_at::<Prompt>(ptr),
+                TAG_MESSAGE => count_at::<Message>(ptr),
+                TAG_CONVERSATION => count_at::<Conversation>(ptr),
+                TAG_TOOL_DEF => count_at::<ToolDefinition>(ptr),
+                TAG_AGENT => count_at::<Agent>(ptr),
+                TAG_THUNK => count_at::<Thunk>(ptr),
+                TAG_RECORD => count_at::<Record>(ptr),
+                TAG_BYTEVECTOR => count_at::<Vec<u8>>(ptr),
+                TAG_MULTIMETHOD => count_at::<MultiMethod>(ptr),
+                TAG_STREAM => count_at::<StreamBox>(ptr),
+                TAG_F64_ARRAY => count_at::<Vec<f64>>(ptr),
+                TAG_I64_ARRAY => count_at::<Vec<i64>>(ptr),
+                TAG_ASYNC_PROMISE => count_at::<AsyncPromise>(ptr),
+                TAG_CHANNEL => count_at::<Channel>(ptr),
+                _ => unreachable!("invalid heap tag in heap_strong_count"),
+            }
+        };
+        Some(n)
     }
 
     // -- Typed accessors (ergonomic, avoid full view match) --

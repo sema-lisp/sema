@@ -4,6 +4,13 @@ outline: [2, 3]
 
 # Getting Started
 
+::: tip Just want to run an app?
+The fastest path is the [dev server](/docs/web/dev-server): `sema web app.sema`
+serves your app in the browser with hot reload and a built-in LLM proxy — no
+`npm install`, no bundler. The rest of this page covers embedding the runtime in
+your own page.
+:::
+
 ## Installation
 
 ```sh

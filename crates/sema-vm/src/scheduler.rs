@@ -71,6 +71,14 @@ struct Task {
     /// `workflow/step` opened; swapped into the thread-local on task entry and back
     /// out on leave so concurrent sibling tasks don't clobber each other's tally.
     usage_scope: Box<dyn Any>,
+    /// This task's saved LLM dynamic scope (cache-enabled/ttl, tags/metadata, stream
+    /// pre-gate flag, and the active budget frame `Rc`), type-erased (`LlmDynScope`
+    /// lives in `sema-llm`). Captured at spawn so a task inherits the `with-cache`/
+    /// `with-budget` extent it was spawned in, and swapped in/out per step so a
+    /// deferred completion reads the dispatch-time flags — not whatever was reset after
+    /// the thunk returned (ASYNC-1). The budget frame is shared by `Rc` so a concurrent
+    /// fan-out charges one aggregate.
+    llm_scope: Box<dyn Any>,
 }
 
 // ── Scheduler ──────────────────────────────────────────────────────
@@ -139,6 +147,10 @@ impl Scheduler {
             state: RefCell::new(PromiseState::Pending),
             task_id: std::cell::Cell::new(id),
         });
+        // Cold data-cycle constructor (CORE-2): this promise is wrapped via
+        // `async_promise_from_rc` later, which registers nothing — register
+        // the candidate here, at the allocation.
+        sema_core::register_candidate(sema_core::GcNode::Promise(Rc::downgrade(&promise)));
 
         // Use the function table from the thunk's own compilation context,
         // not the scheduler's — each eval_str_compiled produces different functions.
@@ -156,6 +168,7 @@ impl Scheduler {
             wake_at: None,
             otel: sema_core::current_conversation_scope_boxed(),
             usage_scope: sema_core::current_usage_scope_boxed(),
+            llm_scope: sema_core::current_llm_scope_boxed(),
         });
 
         Ok(promise)
@@ -360,6 +373,29 @@ impl Scheduler {
         self.cancel_await_tree(target);
     }
 
+    /// On an `async/all`/`async/race` short-circuit, transitively cancel the
+    /// combinator's OWN still-pending siblings. When `async/all` rejects (or
+    /// `async/race` settles) the remaining in-flight members are abandoned: without
+    /// this they run on, and a reachable one survives the terminal-only reap, so its
+    /// span-owning `IoHandle` can strand to teardown and abort the process
+    /// (adversarial #7 — ASYNC-3). Mirrors the timeout path's `cancel_promise_task`
+    /// guard, scoped to the combinator's promise set. No-op for other targets.
+    fn cancel_abandoned_combinator_siblings(&mut self, target: &SchedulerTarget) {
+        let (SchedulerTarget::AllOf(promises) | SchedulerTarget::AnyOf(promises)) = target else {
+            return;
+        };
+        // Snapshot the still-pending members first: `cancel_promise_task` borrows
+        // `self.tasks` mutably and transitions promise state as it goes.
+        let pending: Vec<Rc<AsyncPromise>> = promises
+            .iter()
+            .filter(|p| matches!(&*p.state.borrow(), PromiseState::Pending))
+            .cloned()
+            .collect();
+        for p in &pending {
+            self.cancel_promise_task(p);
+        }
+    }
+
     /// Mark a task (by id) as cancelled and transition its promise into `Cancelled`,
     /// transitively cancelling whatever it awaits. Returns true if this call actually
     /// transitioned the task, false if it was already terminal/cancelled or no task
@@ -417,6 +453,22 @@ pub fn reset_scheduler_tasks() {
     SCHEDULER.with(|s| {
         if let Some(sched) = s.borrow_mut().as_mut() {
             sched.tasks.clear();
+        }
+    });
+}
+
+/// Drop the thread-local scheduler if it belongs to `globals` — called from
+/// `Interpreter::drop` so a dead interpreter's global env (and any leftover
+/// task VMs holding `Rc<Env>` clones) is not pinned until thread exit. The
+/// `ptr_eq` guard is load-bearing: many interpreters can live on one thread
+/// (test suites, embedders), and dropping interpreter A must not clobber a
+/// live interpreter B's scheduler (mirrors the reuse branch in
+/// `init_scheduler`). No-op when the slot is empty or owned by another env.
+pub fn shutdown_scheduler(globals: &Rc<Env>) {
+    SCHEDULER.with(|s| {
+        let mut slot = s.borrow_mut();
+        if matches!(slot.as_ref(), Some(sched) if Rc::ptr_eq(&sched.globals, globals)) {
+            *slot = None;
         }
     });
 }
@@ -486,6 +538,9 @@ pub(crate) fn run_closure_as_inline_task(
         state: RefCell::new(PromiseState::Pending),
         task_id: std::cell::Cell::new(id),
     });
+    // Cold data-cycle constructor (CORE-2): raw allocation, wrapped via
+    // `async_promise_from_rc` on resolution paths — register here.
+    sema_core::register_candidate(sema_core::GcNode::Promise(Rc::downgrade(&promise)));
 
     let mut vm = match VM::new_for_task(sched.globals.clone(), functions, &sched.native_spurs) {
         Ok(vm) => vm,
@@ -513,6 +568,7 @@ pub(crate) fn run_closure_as_inline_task(
         wake_at: None,
         otel: sema_core::current_conversation_scope_boxed(),
         usage_scope: sema_core::current_usage_scope_boxed(),
+        llm_scope: sema_core::current_llm_scope_boxed(),
     });
 
     // A cooperative (headless) debug session can pause this nested inline task at
@@ -599,6 +655,16 @@ fn run_scheduler_callback(
     // path and is gated by `in_async_context()` being true, so it is untouched.
     if !sema_core::in_async_context() {
         sched.reap_leftover_tasks();
+        // Scheduler-idle safe point (CORE-2, plan §5.2 point d): every task is
+        // done and reaped, so task VMs/promises just released their refs and
+        // async-born garbage (channels, promises, task-local closures) is at
+        // its most collectable. Deliberately NOT between task polls — a
+        // per-tick collect would re-trace live parked-task graphs constantly.
+        // Threshold-gated; pins computed only when a pass will actually run.
+        if sched.tasks.is_empty() && sema_core::gc_should_collect() {
+            let pins = sema_core::gc_env_chain_pins(&sched.globals);
+            sema_core::gc_threshold_collect(&pins, sema_core::GcTrigger::SchedulerIdle);
+        }
     }
 
     put_scheduler(sched);
@@ -688,6 +754,10 @@ struct ReinstallGuard<'a> {
     /// task entry. Restored on leave alongside `prev_otel` so concurrent tasks'
     /// per-leaf usage tallies stay isolated. `None` once consumed.
     prev_usage_scope: Option<Box<dyn Any>>,
+    /// The LLM dynamic scope (cache/budget/tags) displaced when this task's scope was
+    /// installed on entry. Restored on leave alongside the others (ASYNC-1). `None`
+    /// once consumed.
+    prev_llm_scope: Option<Box<dyn Any>>,
 }
 
 impl ReinstallGuard<'_> {
@@ -706,6 +776,16 @@ impl ReinstallGuard<'_> {
                 task.usage_scope = task_usage;
             }
             let _ = sema_core::install_task_usage_scope(prev_usage);
+        }
+        // Restore the LLM dynamic scope in lockstep (ASYNC-1): take this task's
+        // (possibly with-cache/with-budget-modified) scope back onto the task so it
+        // resumes with the same flags, then restore the scope active before this task ran.
+        if let Some(prev_llm) = self.prev_llm_scope.take() {
+            let task_llm = sema_core::take_task_llm_scope();
+            if let Some(task) = self.task.as_mut() {
+                task.llm_scope = task_llm;
+            }
+            let _ = sema_core::install_task_llm_scope(prev_llm);
         }
         let Some(prev) = self.prev_otel.take() else {
             return;
@@ -878,12 +958,14 @@ fn run_until_reentrant(
         }
 
         if let Some(result) = goal.status() {
+            sched.cancel_abandoned_combinator_siblings(target);
             return Ok(result);
         }
 
         sched.wake_blocked_tasks();
 
         if let Some(result) = goal.status() {
+            sched.cancel_abandoned_combinator_siblings(target);
             return Ok(result);
         }
 
@@ -1065,12 +1147,18 @@ fn run_until_reentrant(
         // `workflow/step` opened via the spawn-time capture).
         let task_usage = std::mem::replace(&mut task.usage_scope, Box::new(()));
         let prev_usage_scope = sema_core::install_task_usage_scope(task_usage);
+        // Install this task's LLM dynamic scope (cache/budget/tags) alongside the others,
+        // so a completion made during the step reads the flags that were in force when
+        // the task was spawned rather than whatever the thunk reset them to (ASYNC-1).
+        let task_llm = std::mem::replace(&mut task.llm_scope, Box::new(()));
+        let prev_llm_scope = sema_core::install_task_llm_scope(task_llm);
         let mut guard = ReinstallGuard {
             sched,
             task: Some(task),
             armed: true,
             prev_otel: Some(prev_otel),
             prev_usage_scope: Some(prev_usage_scope),
+            prev_llm_scope: Some(prev_llm_scope),
         };
         let task = guard.task.as_mut().expect("in-flight task present");
 
@@ -1196,6 +1284,7 @@ mod tests {
                 armed: true,
                 prev_otel: None,
                 prev_usage_scope: None,
+                prev_llm_scope: None,
             };
             // Simulate a panic mid-step (e.g. an `unreachable!()` in the VM).
             panic!("simulated task panic");

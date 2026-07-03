@@ -1,0 +1,29 @@
+;; recursive-closure-churn.sema — CORE-2 hot-path guard benchmark
+;; Tests: creation + drop of self-recursive LOCAL closures — the exact shape
+;; the cycle collector must reclaim. This benchmark is the "collector tax"
+;; canary: any per-closure-creation bookkeeping (candidate buffering, registry
+;; inserts) or collection pauses show up here first. Compare against a
+;; pre-collector baseline; the budget is <2% regression.
+;;
+;; Usage: sema examples/benchmarks/recursive-closure-churn.sema
+
+(println "=== Recursive Closure Churn Benchmark ===")
+
+;; Each churn call creates a recursive local closure (self-capture via
+;; upvalue cell) that becomes garbage immediately — an Rc cycle per call.
+(define (churn)
+  (define (loop n) (if (<= n 0) 0 (loop (- n 1))))
+  (loop 3))
+
+(define (run n acc)
+  (if (<= n 0) acc
+      (run (- n 1) (+ acc (churn)))))
+
+(define iterations 300000)
+
+(define t0 (sys/elapsed))
+(define result (run iterations 0))
+(define elapsed-ms (/ (- (sys/elapsed) t0) 1000000.0))
+
+(println f"Result: ${result}")
+(println f"${iterations} recursive-local-closure create+drop in ${elapsed-ms} ms")

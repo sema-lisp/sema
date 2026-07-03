@@ -12582,6 +12582,128 @@ fn test_sema_build_with_imports() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// `sema build` must embed + resolve imports written with weird path spellings
+/// (`./x/../x`, climbing subdirs then back to root) AND unicode module names —
+/// once the source is gone, only the embedded archive can satisfy them.
+#[test]
+fn test_sema_build_weird_and_unicode_imports_embedded() {
+    let dir = build_test_dir("weird-unicode");
+    std::fs::create_dir_all(dir.join("a/b/c")).unwrap();
+    std::fs::create_dir_all(dir.join("lïb-café")).unwrap();
+
+    // A deep chain where every hop uses a weird relative spelling.
+    std::fs::write(
+        dir.join("top.sema"),
+        "(module top (export tv) (define tv 100))",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("a/b/c/m3.sema"),
+        r#"(module m3 (export tv) (import "../../../top.sema"))"#,
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("a/b/m2.sema"),
+        r#"(module m2 (export tv) (import "./c/../c/m3.sema"))"#,
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("a/m1.sema"),
+        r#"(module m1 (export tv) (import "../a/./b/m2.sema"))"#,
+    )
+    .unwrap();
+    // A unicode module dir + a weird spelling of it.
+    std::fs::write(
+        dir.join("lïb-café/µtil.sema"),
+        "(module u (export uv) (define uv 42))",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("app.sema"),
+        "(import \"././a/m1.sema\")\n\
+         (import \"./lïb-café/../lïb-café/µtil.sema\")\n\
+         (println (+ tv uv))\n",
+    )
+    .unwrap();
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_sema"))
+        .args([
+            "build",
+            dir.join("app.sema").to_str().unwrap(),
+            "-o",
+            dir.join("app").to_str().unwrap(),
+        ])
+        .output()
+        .expect("failed to run sema build");
+    assert!(
+        output.status.success(),
+        "sema build failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Remove every source so resolution can only come from the embedded archive.
+    std::fs::remove_dir_all(dir.join("a")).unwrap();
+    std::fs::remove_dir_all(dir.join("lïb-café")).unwrap();
+    std::fs::remove_file(dir.join("top.sema")).unwrap();
+    std::fs::remove_file(dir.join("app.sema")).unwrap();
+
+    let run = std::process::Command::new(dir.join("app"))
+        .output()
+        .expect("failed to run bundled executable");
+    assert!(
+        run.status.success(),
+        "bundled executable failed: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&run.stdout).trim(), "142");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `sema compile` produces a `.semac` whose imports resolve from the filesystem
+/// at runtime. Weird spellings + unicode paths must resolve there too.
+#[test]
+fn test_compile_multifile_imports_resolve_from_fs() {
+    let dir = build_test_dir("compile-mf");
+    std::fs::create_dir_all(dir.join("lïb")).unwrap();
+    std::fs::write(
+        dir.join("lïb/µtil.sema"),
+        "(module u (export answer) (define answer 42))",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("app.sema"),
+        "(import \"./lïb/../lïb/µtil.sema\")\n(println answer)\n",
+    )
+    .unwrap();
+
+    let compiled = std::process::Command::new(env!("CARGO_BIN_EXE_sema"))
+        .args(["compile", dir.join("app.sema").to_str().unwrap()])
+        .output()
+        .expect("failed to run sema compile");
+    assert!(
+        compiled.status.success(),
+        "sema compile failed: {}",
+        String::from_utf8_lossy(&compiled.stderr)
+    );
+
+    // Run the .semac from its directory; the (still-present) source imports
+    // resolve from the filesystem.
+    let run = std::process::Command::new(env!("CARGO_BIN_EXE_sema"))
+        .current_dir(&dir)
+        .arg("app.semac")
+        .output()
+        .expect("failed to run .semac");
+    assert!(
+        run.status.success(),
+        "running .semac failed: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&run.stdout).trim(), "42");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn test_sema_build_with_include() {
     let dir = build_test_dir("include");

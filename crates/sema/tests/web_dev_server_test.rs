@@ -10,13 +10,14 @@ use std::io::Read;
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
-/// Spawn `sema web <app> --port <port>`. Returns `None` (and prints why) when
-/// the binary has no embedded runtime, so callers skip gracefully.
+/// Spawn `sema web <app> --port <port> --no-open`. Returns `None` (and prints
+/// why) when the binary has no embedded runtime, so callers skip gracefully.
+/// `--no-open` keeps the test from popping a real browser window.
 fn spawn_dev_server(app: &str, port: u16) -> Option<Child> {
     // Tests run with CWD = crate dir; the example paths are repo-root-relative.
     let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let mut child = Command::new(env!("CARGO_BIN_EXE_sema"))
-        .args(["web", app, "--port", &port.to_string()])
+        .args(["web", app, "--port", &port.to_string(), "--no-open"])
         .current_dir(&repo_root)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

@@ -1,0 +1,80 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
+<title>Sema Web — {{TITLE}}</title>
+<!-- Resolve the bare @sema-lang/* specifiers to the runtime served under /__sema. -->
+<script type="importmap">
+{
+  "imports": {
+    "@sema-lang/sema-web": "/__sema/sema-web.js",
+    "@sema-lang/sema": "/__sema/sema/index.js",
+    "@sema-lang/sema-wasm": "/__sema/sema_wasm.js",
+    "@preact/signals-core": "/__sema/signals-core.module.js",
+    "morphdom": "/__sema/morphdom-esm.js"
+  }
+}
+</script>
+</head>
+<body>
+<div id="app"></div>
+{{APP}}
+<script type="module">
+  import { SemaWeb } from "@sema-lang/sema-web";
+
+  // Dev-only error overlay: surface Sema init/app errors on the page instead of
+  // only in the console. The loader routes app-eval errors through console.error,
+  // so hooking it catches those too. Cleared on the next successful reload.
+  function __semaError(msg) {
+    let el = document.getElementById("__sema-error");
+    if (!el) {
+      el = document.createElement("div");
+      el.id = "__sema-error";
+      el.style.cssText =
+        "position:fixed;left:0;right:0;top:0;z-index:99999;background:#7f1d1d;color:#fee2e2;font:13px/1.5 ui-monospace,monospace;padding:12px 16px;white-space:pre-wrap;box-shadow:0 2px 12px rgba(0,0,0,.35);cursor:pointer";
+      el.title = "click to dismiss";
+      el.onclick = () => el.remove();
+      document.body.appendChild(el);
+    }
+    el.textContent = "⚠ Sema error:\n" + msg;
+  }
+  const __origErr = console.error;
+  console.error = function () {
+    __origErr.apply(console, arguments);
+    const m = Array.from(arguments).map(String).join(" ");
+    if (m.indexOf("[sema") >= 0 || m.indexOf("Error in") >= 0) __semaError(m);
+  };
+
+  try {
+    {{INIT}}
+    window.__semaInitialized = true;
+  } catch (e) {
+    window.__semaInitError = String((e && e.message) || e);
+    __semaError(String((e && e.message) || e));
+    console.error(e);
+  }
+</script>
+<!-- Hot reload: short-poll /__dev/poll (each returns instantly, never blocking
+     the sequential server) and full-reload when the generation bumps. -->
+<script>
+  (function () {
+    var g = null;
+    function p() {
+      fetch("/__dev/poll")
+        .then(function (r) { return r.ok ? r.json() : null; })
+        .then(function (d) {
+          if (d) {
+            if (g === null) { g = d.generation; }
+            else if (d.generation !== g) { location.reload(); return; }
+          }
+          setTimeout(p, 300);
+        })
+        .catch(function () { setTimeout(p, 600); });
+    }
+    p();
+  })();
+</script>
+</body>
+</html>

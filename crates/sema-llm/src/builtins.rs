@@ -43,15 +43,19 @@ thread_local! {
     /// completion exactly once.
     static USAGE_ACCUM_SUPPRESS: Cell<bool> = const { Cell::new(false) };
     static SESSION_COST: RefCell<f64> = const { RefCell::new(0.0) };
-    static BUDGET_LIMIT: RefCell<Option<f64>> = const { RefCell::new(None) };
-    static BUDGET_SPENT: RefCell<f64> = const { RefCell::new(0.0) };
-    static BUDGET_TOKEN_LIMIT: RefCell<Option<u64>> = const { RefCell::new(None) };
-    static BUDGET_TOKENS_SPENT: RefCell<u64> = const { RefCell::new(0) };
+    /// The budget frame in force for the CURRENT TASK, held behind a shared `Rc` so
+    /// that all concurrent tasks spawned inside one `llm/with-budget` charge ONE
+    /// aggregate frame (captured by-`Rc` onto each task at spawn via the per-task LLM
+    /// dynamic-scope seam, and re-installed around the async completion poller's
+    /// `track_usage`). `None` when no budget is active.
+    static ACTIVE_BUDGET: RefCell<Option<Rc<RefCell<BudgetFrame>>>> = const { RefCell::new(None) };
     /// When set (via `llm/with-budget {:on-stream :pre-gate}`), `llm/stream` checks the
     /// budget BEFORE opening a stream (usage is unknown until a stream ends, so this is
     /// the only honest place to gate). Default off — streams don't enforce the budget.
     static STREAM_BUDGET_PREGATE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    static BUDGET_STACK: RefCell<Vec<BudgetFrame>> = const { RefCell::new(Vec::new()) };
+    /// Saved outer budget frames for nested `llm/with-budget` scopes. A push installs a
+    /// fresh frame; the pop restores the frame recorded here.
+    static BUDGET_STACK: RefCell<Vec<Option<Rc<RefCell<BudgetFrame>>>>> = const { RefCell::new(Vec::new()) };
     /// Pluggable memory callbacks, set by `sema-stdlib` when it registers the memory
     /// module. Allows `agent/run` to seed from and append to a memory handle without
     /// depending on `sema-stdlib` (which would be circular).
@@ -229,7 +233,90 @@ pub fn register_usage_scope_task_callbacks() {
     );
 }
 
-#[derive(Clone)]
+// ── Per-task LLM dynamic scope (cache / budget / tags) — ASYNC-1 ─────
+//
+// `llm/with-cache`, `llm/with-budget`, and per-call `:tags`/`:metadata` set
+// dynamically-scoped thread-locals for the extent of a thunk, then reset them. A task
+// spawned inside that thunk reads them WHEN IT RUNS — which the cooperative scheduler
+// can defer past the reset. The scheduler captures this scope at `async/spawn` and
+// swaps it in/out at each task step (like the otel context and leaf-usage scope), so
+// concurrent siblings stay isolated. Read-only flags ride as a value snapshot; the
+// budget frame rides as a shared `Rc` so all siblings in one `with-budget` charge one
+// aggregate. Reached from `sema-core` through the type-erased fn-pointer seam.
+
+/// The dynamically-scoped LLM state captured onto a task and swapped in/out per step.
+struct LlmDynScope {
+    cache_enabled: bool,
+    cache_ttl_secs: i64,
+    stream_budget_pregate: bool,
+    call_tags: Vec<String>,
+    call_meta: Vec<(String, String)>,
+    /// The active budget frame, shared by `Rc` so concurrent siblings charge one aggregate.
+    budget: Option<Rc<RefCell<BudgetFrame>>>,
+}
+
+impl Default for LlmDynScope {
+    fn default() -> Self {
+        LlmDynScope {
+            cache_enabled: false,
+            cache_ttl_secs: 3600,
+            stream_budget_pregate: false,
+            call_tags: Vec::new(),
+            call_meta: Vec::new(),
+            budget: None,
+        }
+    }
+}
+
+/// Read (clone) the current thread's LLM dynamic scope without disturbing it.
+fn read_llm_scope() -> LlmDynScope {
+    LlmDynScope {
+        cache_enabled: CACHE_ENABLED.with(|c| c.get()),
+        cache_ttl_secs: CACHE_TTL_SECS.with(|c| c.get()),
+        stream_budget_pregate: STREAM_BUDGET_PREGATE.with(|c| c.get()),
+        call_tags: CALL_TAGS.with(|t| t.borrow().clone()),
+        call_meta: CALL_META.with(|m| m.borrow().clone()),
+        budget: ACTIVE_BUDGET.with(|b| b.borrow().clone()),
+    }
+}
+
+/// Overwrite the current thread's LLM dynamic scope with `s`, returning the previous one.
+fn write_llm_scope(s: LlmDynScope) -> LlmDynScope {
+    let prev = read_llm_scope();
+    CACHE_ENABLED.with(|c| c.set(s.cache_enabled));
+    CACHE_TTL_SECS.with(|c| c.set(s.cache_ttl_secs));
+    STREAM_BUDGET_PREGATE.with(|c| c.set(s.stream_budget_pregate));
+    CALL_TAGS.with(|t| *t.borrow_mut() = s.call_tags);
+    CALL_META.with(|m| *m.borrow_mut() = s.call_meta);
+    ACTIVE_BUDGET.with(|b| *b.borrow_mut() = s.budget);
+    prev
+}
+
+/// Capture (clone) the LLM dynamic scope to seed onto a freshly-spawned task.
+fn capture_llm_scope() -> Box<dyn std::any::Any> {
+    Box::new(read_llm_scope())
+}
+
+/// Take the LLM dynamic scope out of the thread-locals, leaving defaults.
+fn take_llm_scope() -> Box<dyn std::any::Any> {
+    Box::new(write_llm_scope(LlmDynScope::default()))
+}
+
+/// Install an LLM dynamic scope into the thread-locals, returning the one displaced.
+fn install_llm_scope(ctx: Box<dyn std::any::Any>) -> Box<dyn std::any::Any> {
+    let incoming: LlmDynScope = ctx
+        .downcast::<LlmDynScope>()
+        .map(|b| *b)
+        .unwrap_or_default();
+    Box::new(write_llm_scope(incoming))
+}
+
+/// Register the per-task LLM dynamic-scope callbacks with sema-core. Called once at startup.
+pub fn register_llm_scope_task_callbacks() {
+    sema_core::set_llm_scope_task_callbacks(capture_llm_scope, take_llm_scope, install_llm_scope);
+}
+
+#[derive(Clone, Default)]
 struct BudgetFrame {
     cost_limit: Option<f64>,
     cost_spent: f64,
@@ -339,12 +426,13 @@ pub fn reset_runtime_state() {
     // Idempotently register the per-task usage-scope seam (fn-pointer thread-locals)
     // so the scheduler can swap the active leaf scope in/out per task step.
     register_usage_scope_task_callbacks();
+    // Idempotently register the per-task LLM dynamic-scope seam (cache/budget/tags) so
+    // the scheduler can swap it in/out per task step (ASYNC-1).
+    register_llm_scope_task_callbacks();
     SESSION_COST.with(|c| *c.borrow_mut() = 0.0);
-    BUDGET_LIMIT.with(|l| *l.borrow_mut() = None);
-    BUDGET_SPENT.with(|s| *s.borrow_mut() = 0.0);
-    BUDGET_TOKEN_LIMIT.with(|l| *l.borrow_mut() = None);
-    BUDGET_TOKENS_SPENT.with(|s| *s.borrow_mut() = 0);
+    ACTIVE_BUDGET.with(|b| *b.borrow_mut() = None);
     BUDGET_STACK.with(|s| s.borrow_mut().clear());
+    STREAM_BUDGET_PREGATE.with(|c| c.set(false));
     PRICING_WARNING_SHOWN.with(|shown| shown.set(false));
     LISP_PROVIDERS.with(|p| p.borrow_mut().clear());
     CACHE_ENABLED.with(|c| c.set(false));
@@ -537,122 +625,130 @@ fn track_usage(usage: &Usage) -> Result<(), SemaError> {
         session.cache_creation_input_tokens += usage.cache_creation_input_tokens;
     });
 
-    // Check token budget
-    BUDGET_TOKEN_LIMIT.with(|limit| {
-        let limit = limit.borrow();
-        if let Some(max_tokens) = *limit {
-            BUDGET_TOKENS_SPENT.with(|spent| {
-                let mut spent = spent.borrow_mut();
-                *spent += total_tokens;
-                if *spent > max_tokens {
-                    return Err(SemaError::Llm(format!(
-                        "token budget exceeded: used {} of {} tokens",
-                        *spent, max_tokens
-                    )));
-                }
-                Ok(())
-            })
-        } else {
-            Ok(())
-        }
-    })?;
-
+    // Session cost is a global accumulator, tracked independently of any budget scope.
     if let Some(c) = cost {
         SESSION_COST.with(|sc| *sc.borrow_mut() += c);
+    }
 
-        // Check cost budget
-        BUDGET_LIMIT.with(|limit| {
-            let limit = limit.borrow();
-            if let Some(max_cost) = *limit {
-                BUDGET_SPENT.with(|spent| {
-                    let mut spent = spent.borrow_mut();
-                    *spent += c;
-                    if *spent > max_cost {
-                        return Err(SemaError::Llm(format!(
-                            "budget exceeded: spent ${:.4} of ${:.4} limit",
-                            *spent, max_cost
-                        )));
-                    }
-                    Ok(())
-                })
-            } else {
-                Ok(())
-            }
-        })?;
-    } else {
-        // Cost unknown — warn once if budget is active
-        BUDGET_LIMIT.with(|limit| {
-            if limit.borrow().is_some() {
-                PRICING_WARNING_SHOWN.with(|shown| {
-                    if !shown.get() {
-                        shown.set(true);
-                        eprintln!(
-                            "Warning: pricing unknown for model '{}'; budget enforcement is best-effort",
-                            usage.model
-                        );
-                    }
-                });
-            }
-        });
+    // Charge the active (per-task) budget frame and enforce its limits. Because the
+    // frame is shared by `Rc`, all concurrent tasks spawned in one `with-budget` charge
+    // one aggregate — so a fan-out is gated, not just a single sequential call.
+    if let Some(frame) = active_budget() {
+        charge_budget_frame(&frame, total_tokens, cost)?;
+        // Cost unknown while a cost cap is set — warn once (enforcement is best-effort).
+        if cost.is_none() && frame.borrow().cost_limit.is_some() {
+            PRICING_WARNING_SHOWN.with(|shown| {
+                if !shown.get() {
+                    shown.set(true);
+                    eprintln!(
+                        "Warning: pricing unknown for model '{}'; budget enforcement is best-effort",
+                        usage.model
+                    );
+                }
+            });
+        }
     }
 
     Ok(())
 }
 
-/// Set a budget limit for LLM calls.
+/// Clone the active (per-task) budget frame's `Rc`, if any. The sync path charges
+/// this via `track_usage`; the async completion poller captures it at yield time and
+/// re-installs it around its own `track_usage` so the charge lands on the frame that
+/// was active when the completion was DISPATCHED, not whatever is active when the
+/// future resolves.
+fn active_budget() -> Option<Rc<RefCell<BudgetFrame>>> {
+    ACTIVE_BUDGET.with(|b| b.borrow().clone())
+}
+
+/// Ensure an active budget frame exists (creating an unbounded one if none), returning
+/// its `Rc`. Used by the non-scoped `llm/set-budget`/`llm/set-token-budget` API.
+fn ensure_active_budget() -> Rc<RefCell<BudgetFrame>> {
+    ACTIVE_BUDGET.with(|b| {
+        b.borrow_mut()
+            .get_or_insert_with(|| Rc::new(RefCell::new(BudgetFrame::default())))
+            .clone()
+    })
+}
+
+/// Charge `total_tokens` / `cost` into `frame` and return `Err` if either limit is now
+/// exceeded. Cost is charged only when known (`Some`); the token charge always applies.
+/// Shared by the sync path and the async poller so both gate identically.
+fn charge_budget_frame(
+    frame: &Rc<RefCell<BudgetFrame>>,
+    total_tokens: u64,
+    cost: Option<f64>,
+) -> Result<(), SemaError> {
+    let mut f = frame.borrow_mut();
+    f.tokens_spent += total_tokens;
+    if let Some(max_tokens) = f.token_limit {
+        if f.tokens_spent > max_tokens {
+            return Err(SemaError::Llm(format!(
+                "token budget exceeded: used {} of {} tokens",
+                f.tokens_spent, max_tokens
+            )));
+        }
+    }
+    if let Some(c) = cost {
+        f.cost_spent += c;
+        if let Some(max_cost) = f.cost_limit {
+            if f.cost_spent > max_cost {
+                return Err(SemaError::Llm(format!(
+                    "budget exceeded: spent ${:.4} of ${:.4} limit",
+                    f.cost_spent, max_cost
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Set a cost budget limit for LLM calls (non-scoped API; mutates the active frame).
 pub fn set_budget(max_cost_usd: f64) {
-    BUDGET_LIMIT.with(|l| *l.borrow_mut() = Some(max_cost_usd));
-    BUDGET_SPENT.with(|s| *s.borrow_mut() = 0.0);
+    let frame = ensure_active_budget();
+    let mut f = frame.borrow_mut();
+    f.cost_limit = Some(max_cost_usd);
+    f.cost_spent = 0.0;
 }
 
-/// Set a token budget limit for LLM calls.
+/// Set a token budget limit for LLM calls (non-scoped API; mutates the active frame).
 pub fn set_token_budget(max_tokens: u64) {
-    BUDGET_TOKEN_LIMIT.with(|l| *l.borrow_mut() = Some(max_tokens));
-    BUDGET_TOKENS_SPENT.with(|s| *s.borrow_mut() = 0);
+    let frame = ensure_active_budget();
+    let mut f = frame.borrow_mut();
+    f.token_limit = Some(max_tokens);
+    f.tokens_spent = 0;
 }
 
-/// Clear the budget limit.
+/// Clear the budget limits on the active frame.
 pub fn clear_budget() {
-    BUDGET_LIMIT.with(|l| *l.borrow_mut() = None);
-    BUDGET_TOKEN_LIMIT.with(|l| *l.borrow_mut() = None);
+    if let Some(frame) = active_budget() {
+        let mut f = frame.borrow_mut();
+        f.cost_limit = None;
+        f.token_limit = None;
+    }
 }
 
-/// Push a scoped budget and reset spent for the new scope.
+/// Push a scoped budget: save the current active frame and install a FRESH one (spent
+/// reset to zero) for the new scope. Concurrent tasks spawned inside this scope capture
+/// the fresh frame's `Rc` and charge it as one aggregate.
 pub fn push_budget_scope(max_cost_usd: Option<f64>, max_tokens: Option<u64>) {
+    let prev = ACTIVE_BUDGET.with(|b| b.borrow().clone());
+    BUDGET_STACK.with(|stack| stack.borrow_mut().push(prev));
     let frame = BudgetFrame {
-        cost_limit: BUDGET_LIMIT.with(|l| *l.borrow()),
-        cost_spent: BUDGET_SPENT.with(|s| *s.borrow()),
-        token_limit: BUDGET_TOKEN_LIMIT.with(|l| *l.borrow()),
-        tokens_spent: BUDGET_TOKENS_SPENT.with(|s| *s.borrow()),
+        cost_limit: max_cost_usd,
+        cost_spent: 0.0,
+        token_limit: max_tokens,
+        tokens_spent: 0,
     };
-    BUDGET_STACK.with(|stack| stack.borrow_mut().push(frame));
-    if let Some(cost) = max_cost_usd {
-        set_budget(cost);
-    } else {
-        BUDGET_LIMIT.with(|l| *l.borrow_mut() = None);
-        BUDGET_SPENT.with(|s| *s.borrow_mut() = 0.0);
-    }
-    if let Some(tokens) = max_tokens {
-        set_token_budget(tokens);
-    } else {
-        BUDGET_TOKEN_LIMIT.with(|l| *l.borrow_mut() = None);
-        BUDGET_TOKENS_SPENT.with(|s| *s.borrow_mut() = 0);
-    }
+    ACTIVE_BUDGET.with(|b| *b.borrow_mut() = Some(Rc::new(RefCell::new(frame))));
 }
 
-/// Pop a scoped budget and restore the previous budget state.
+/// Pop a scoped budget and restore the previously-active frame (`None` at the outermost).
 pub fn pop_budget_scope() {
-    let prev = BUDGET_STACK.with(|stack| stack.borrow_mut().pop());
-    if let Some(frame) = prev {
-        BUDGET_LIMIT.with(|l| *l.borrow_mut() = frame.cost_limit);
-        BUDGET_SPENT.with(|s| *s.borrow_mut() = frame.cost_spent);
-        BUDGET_TOKEN_LIMIT.with(|l| *l.borrow_mut() = frame.token_limit);
-        BUDGET_TOKENS_SPENT.with(|s| *s.borrow_mut() = frame.tokens_spent);
-    } else {
-        clear_budget();
-        BUDGET_SPENT.with(|s| *s.borrow_mut() = 0.0);
-        BUDGET_TOKENS_SPENT.with(|s| *s.borrow_mut() = 0);
-    }
+    let prev = BUDGET_STACK
+        .with(|stack| stack.borrow_mut().pop())
+        .flatten();
+    ACTIVE_BUDGET.with(|b| *b.borrow_mut() = prev);
 }
 
 fn get_opt_string(opts: &BTreeMap<Value, Value>, key: &str) -> Option<String> {
@@ -1261,6 +1357,13 @@ fn guard_provider_url(unrestricted: bool, opts: &BTreeMap<Value, Value>) -> Resu
     Ok(())
 }
 
+/// Cycle-collector pass observer: forwards each pass to sema-otel as a
+/// `gc.collect` span (no-op while telemetry is disabled). A plain `fn`, so it
+/// cannot capture `Value`/`Env` state; it touches no Sema heap.
+fn gc_otel_observer(event: &sema_core::GcPassEvent) {
+    sema_otel::gc_pass_span(event);
+}
+
 pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
     let unrestricted = sandbox.is_unrestricted();
 
@@ -1274,6 +1377,13 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
     // thread-local fn pointers); registering here keeps it in a crate that names
     // both `sema_core` and `sema_otel`.
     sema_otel::register_task_callbacks();
+
+    // Cycle-collector observability: every collector pass that actually runs
+    // (any trigger, aborted included) emits a retroactively-timed `gc.collect`
+    // span, so GC work shows up on the same timeline as LLM/tool spans. Same
+    // seam as above — sema-core can't depend on sema-otel, and the observer is
+    // a plain `fn` (captures nothing; invariant I2). Idempotent.
+    sema_core::set_gc_observer(Some(gc_otel_observer));
 
     // Bridge the LLM cassette to MCP tool calls (sema-mcp consults this via
     // sema-core). Idempotent — just sets two thread-local fn pointers.
@@ -4626,20 +4736,22 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
 
     // (llm/budget-remaining) — query budget status
     register_fn(env, "llm/budget-remaining", |_args| {
-        let cost_limit = BUDGET_LIMIT.with(|l| *l.borrow());
-        let token_limit = BUDGET_TOKEN_LIMIT.with(|l| *l.borrow());
-        if cost_limit.is_none() && token_limit.is_none() {
+        let Some(frame) = active_budget() else {
+            return Ok(Value::nil());
+        };
+        let f = frame.borrow();
+        if f.cost_limit.is_none() && f.token_limit.is_none() {
             return Ok(Value::nil());
         }
         let mut map = BTreeMap::new();
-        if let Some(max_cost) = cost_limit {
-            let spent = BUDGET_SPENT.with(|s| *s.borrow());
+        if let Some(max_cost) = f.cost_limit {
+            let spent = f.cost_spent;
             map.insert(Value::keyword("limit"), Value::float(max_cost));
             map.insert(Value::keyword("spent"), Value::float(spent));
             map.insert(Value::keyword("remaining"), Value::float(max_cost - spent));
         }
-        if let Some(max_tokens) = token_limit {
-            let tokens_spent = BUDGET_TOKENS_SPENT.with(|s| *s.borrow());
+        if let Some(max_tokens) = f.token_limit {
+            let tokens_spent = f.tokens_spent;
             map.insert(Value::keyword("token-limit"), Value::int(max_tokens as i64));
             map.insert(
                 Value::keyword("tokens-spent"),
@@ -6205,6 +6317,13 @@ fn do_complete_async_yield(
     // makes async fan-out correct: a sibling leaf opening its own scope can't clobber
     // this in-flight leaf's tally.
     let usage_accum_slot = current_usage_accum();
+    // Capture the active BUDGET frame `Rc` the same way (ASYNC-1). The poller runs
+    // OUTSIDE the per-task install boundary (during `wake_blocked_tasks`), so the
+    // thread-local budget is whatever is active when the future lands — not the frame
+    // that was in force when this completion was dispatched. Re-installing THIS captured
+    // frame around `track_usage` below is what lets a concurrent `with-budget` fan-out
+    // charge one shared aggregate and gate correctly.
+    let budget_slot = active_budget();
     let request_for_messages = request;
     let handle = Rc::new(sema_core::IoHandle::new(move || {
         use tokio::sync::oneshot::error::TryRecvError;
@@ -6263,13 +6382,22 @@ fn do_complete_async_yield(
                     accumulate_into(slot, &resp.usage, cost);
                 }
                 // Account on the VM thread, then shape the value. A budget overrun
-                // fails the task, exactly as the sync path's `?`.
-                let track_result = USAGE_ACCUM_SUPPRESS.with(|s| {
-                    s.set(true);
-                    let r = track_usage(&resp.usage);
-                    s.set(false);
+                // fails the task, exactly as the sync path's `?`. Install THIS
+                // completion's captured budget frame as active around `track_usage` so
+                // the charge + limit check land on the dispatch-time frame (shared by
+                // `Rc` across the fan-out), then restore whatever was active.
+                let track_result = {
+                    let prev_budget = ACTIVE_BUDGET
+                        .with(|b| std::mem::replace(&mut *b.borrow_mut(), budget_slot.clone()));
+                    let r = USAGE_ACCUM_SUPPRESS.with(|s| {
+                        s.set(true);
+                        let r = track_usage(&resp.usage);
+                        s.set(false);
+                        r
+                    });
+                    ACTIVE_BUDGET.with(|b| *b.borrow_mut() = prev_budget);
                     r
-                });
+                };
                 if let Err(e) = track_result {
                     return sema_core::IoPoll::Ready(Err(e.to_string()));
                 }
@@ -6854,8 +6982,12 @@ fn stream_budget_pregate() -> Result<(), SemaError> {
     if !STREAM_BUDGET_PREGATE.with(|c| c.get()) {
         return Ok(());
     }
-    if let Some(limit) = BUDGET_LIMIT.with(|l| *l.borrow()) {
-        let spent = BUDGET_SPENT.with(|s| *s.borrow());
+    let Some(frame) = active_budget() else {
+        return Ok(());
+    };
+    let f = frame.borrow();
+    if let Some(limit) = f.cost_limit {
+        let spent = f.cost_spent;
         if spent >= limit {
             return Err(SemaError::Llm(format!(
                 "budget exceeded: ${spent:.4} of ${limit:.4} limit already spent — \
@@ -6863,8 +6995,8 @@ fn stream_budget_pregate() -> Result<(), SemaError> {
             )));
         }
     }
-    if let Some(limit) = BUDGET_TOKEN_LIMIT.with(|l| *l.borrow()) {
-        let spent = BUDGET_TOKENS_SPENT.with(|s| *s.borrow());
+    if let Some(limit) = f.token_limit {
+        let spent = f.tokens_spent;
         if spent >= limit {
             return Err(SemaError::Llm(format!(
                 "token budget exceeded: {spent} of {limit} tokens already used — \
@@ -7930,6 +8062,16 @@ fn run_tool_loop(
                 return Err(SemaError::Llm(msg));
             }
         }
+
+        // Agent-turn safe point (CORE-2, plan §5.2 point c): the round's tool
+        // handlers just ran arbitrary Sema code (the long-running-agent leak
+        // shape — recursive local helpers, channels, promises created per
+        // turn), and a long agent run never returns to a top-level safe point
+        // until it finishes. Threshold-gated. No pins: sema-llm cannot see the
+        // executing VM's env (it depends only on sema-core), and pins are a
+        // pure descent-skip optimization — correctness comes from external
+        // strong counts. Message history/correlation is untouched.
+        sema_core::gc_maybe_collect(&[], sema_core::GcTrigger::AgentTurn);
     }
 
     // Push final assistant message if we exhausted rounds

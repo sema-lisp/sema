@@ -285,17 +285,19 @@ fn register_promise_ops(env: &Env) {
         }
 
         // Collect results — propagate the first non-resolved settlement.
-        // Cancellation is reported distinctly from regular rejection.
+        // Report a REJECTION (the cause) in preference to a Cancelled sibling: on a
+        // rejection short-circuit the scheduler transitively cancels the still-pending
+        // siblings (ASYNC-3), so a cancelled task here is usually a *consequence* of
+        // another task's rejection — surfacing it would mask the real failure reason.
         let mut results = Vec::with_capacity(items.len());
         for p in &promises {
-            match &*p.state.borrow() {
-                PromiseState::Rejected(e) => {
-                    return Err(SemaError::eval(format!("async/all: task rejected: {e}")))
-                }
-                PromiseState::Cancelled => {
-                    return Err(SemaError::eval("async/all: task was cancelled"))
-                }
-                _ => {}
+            if let PromiseState::Rejected(e) = &*p.state.borrow() {
+                return Err(SemaError::eval(format!("async/all: task rejected: {e}")));
+            }
+        }
+        for p in &promises {
+            if matches!(&*p.state.borrow(), PromiseState::Cancelled) {
+                return Err(SemaError::eval("async/all: task was cancelled"));
             }
         }
         for p in promises {

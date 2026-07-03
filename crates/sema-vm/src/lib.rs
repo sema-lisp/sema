@@ -30,7 +30,8 @@ pub use opcodes::Op;
 pub use optimize::optimize as optimize_expr;
 pub use resolve::resolve_with_locals;
 pub use scheduler::{
-    init_scheduler, reset_scheduler_tasks, scheduler_task_count, with_coop_paused_task_vm,
+    init_scheduler, reset_scheduler_tasks, scheduler_task_count, shutdown_scheduler,
+    with_coop_paused_task_vm,
 };
 pub use serialize::{deserialize_from_bytes, is_bytecode_file, serialize_to_bytes};
 pub use vm::{

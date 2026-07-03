@@ -145,6 +145,16 @@ impl Engine {
             self.eval_source(&source)
         };
 
+        // Cell-eval safe point (CORE-2, plan §5.2 point b): the kernel is
+        // long-lived and each cell can leave garbage cycles (recursive local
+        // closures, data cycles) plus the just-replaced undo snapshot's
+        // released bindings. Threshold-gated; pins skip descent into the live
+        // kernel namespace.
+        if sema_core::gc_should_collect() {
+            let pins = sema_core::gc_env_chain_pins(&self.interpreter.global_env);
+            sema_core::gc_threshold_collect(&pins, sema_core::GcTrigger::NotebookCell);
+        }
+
         // Mark downstream cells as stale
         self.notebook.mark_downstream_stale(idx);
 
@@ -336,10 +346,24 @@ impl Engine {
         })
     }
 
-    /// Reset the interpreter and clear all cell outputs.
+    /// Reset the interpreter and clear all cell outputs. The old kernel's
+    /// memory is actually returned: its whole env⇄closure graph is reclaimed
+    /// by the cycle collector before this returns (CORE-2 — the shape-E
+    /// teardown leak used to pin ~168 KB per reset forever).
     pub fn reset(&mut self) {
-        self.interpreter = Interpreter::new();
+        // Drop the undo snapshot FIRST: it holds clones of every old global
+        // binding, and each clone is an external strong count that would
+        // (correctly) keep the dying env graph alive through the teardown
+        // collection run by `Interpreter::drop`.
         self.snapshot = None;
+        self.interpreter = Interpreter::new();
+        // Mop-up pass for anything the teardown collection could not prove
+        // dead at drop time (candidates stay registered, so late-released
+        // cycles are still discoverable). Pins: the fresh kernel's namespace.
+        sema_core::gc_collect(
+            &sema_core::gc_env_chain_pins(&self.interpreter.global_env),
+            sema_core::GcTrigger::NotebookReset,
+        );
         for cell in &mut self.notebook.cells {
             cell.outputs.clear();
             cell.stale = false;
@@ -477,6 +501,52 @@ mod tests {
 
         // x should be unbound after reset
         let (_, result) = engine.create_and_eval("x").unwrap();
+        assert_eq!(result.output.output_type, OutputType::Error);
+    }
+
+    /// CORE-2: `reset` must actually RETURN the old kernel's memory, not just
+    /// rebind a fresh interpreter next to an immortal env⇄closure graph. The
+    /// oracle is a `Weak` on the old global env's bindings allocation:
+    /// strong-count 0 after reset means the whole graph (defines, recursive
+    /// local closures, the data-only channel cycle, the undo snapshot's
+    /// clones) was reclaimed. Deterministic — no timing, no thresholds: reset
+    /// runs an explicit full collection.
+    #[test]
+    fn reset_returns_old_kernel_memory() {
+        let mut engine = test_engine();
+        // Populate every CORE-2 leak shape: a top-level define (shape E), a
+        // recursive local closure kept alive in a global (shape U), and a
+        // closure-free channel self-cycle (data shape).
+        engine
+            .create_and_eval(
+                "(begin
+                   (define (mk)
+                     (define (r n) (if (<= n 0) 0 (r (- n 1))))
+                     r)
+                   (define keep (mk))
+                   (define ch (channel/new 2))
+                   (channel/send ch (list ch))
+                   (keep 3))",
+            )
+            .unwrap();
+        // A second cell so the undo snapshot (taken BEFORE each eval) holds
+        // clones of the cycle bindings above — reset must release the
+        // snapshot before the teardown collection or those clones pin the
+        // dying graph as external references.
+        engine.create_and_eval("(keep 2)").unwrap();
+        let weak_bindings = std::rc::Rc::downgrade(&engine.interpreter.global_env.bindings);
+
+        engine.reset();
+
+        assert_eq!(
+            weak_bindings.strong_count(),
+            0,
+            "reset must reclaim the old kernel's entire env graph"
+        );
+        // The fresh kernel works and is unpolluted.
+        let (_, result) = engine.create_and_eval("(+ 20 22)").unwrap();
+        assert_eq!(result.output.display, "42");
+        let (_, result) = engine.create_and_eval("keep").unwrap();
         assert_eq!(result.output.output_type, OutputType::Error);
     }
 

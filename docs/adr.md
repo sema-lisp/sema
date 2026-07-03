@@ -779,13 +779,26 @@ during every inter-round park; `async/timeout` cancels cleanly at the parks.
 - No native holds a `borrow_mut` across a callback / tool execution / inline-task
   spin (copy owned inputs out first).
 
-**Honest limits:** `:on-text` streaming rounds (reusing the synchronous
-`do_complete_streaming`) and synchronous CPU-bound tools between rounds block
-siblings; a synchronous `:on-text` callback works, but async work inside `:on-text`
-during a streaming round is unsupported (documented, not validated). The
-`spawn_blocking` LLM tier has no
-`AbortHandle`, so a cancelled agent's in-flight round completes on the worker and is
-discarded (best-effort). Per-task budget-across-yield under concurrent spawned agents
+**Streaming (2026-07-03):** the same pattern extends to streaming. In async
+context `llm/stream` and agent `:on-text` rounds run the wire side (the
+provider's synchronous SSE drive) on the I/O pool, sending deltas over a
+channel; the bytecode `__stream-drive` prelude loop parks on `AwaitIo` between
+delta batches — the poller drains all currently-available deltas per wake — and
+calls the callback per delta IN TASK CONTEXT. Siblings interleave between a
+stream's deltas, and a callback that itself yields (`async/sleep`, channel ops,
+`await`) is supported. Usage is accounted exactly once, in the poller's
+finalize, mirroring `do_complete_async_yield`. Sync/top-level `llm/stream`
+keeps the byte-identical blocking native (`__llm-stream-blocking`). Oracle:
+`stream_async_test.rs`.
+
+**Honest limits:** an `:on-text`/`llm/stream` callback runs synchronously per
+delta on the VM thread — a CPU-bound callback still holds the thread between
+yields — and synchronous CPU-bound tools between rounds block siblings (no
+preemption of Sema code). The `spawn_blocking` LLM tier has no `AbortHandle`,
+so a cancelled agent's in-flight round completes on the worker and is discarded
+(best-effort); likewise a task cancelled while parked mid-stream abandons its
+stream-run slab entry and the wire worker streams to completion into a dead
+channel. Per-task budget-across-yield under concurrent spawned agents
 is a pre-existing single-completion ASYNC-1 gap, closed separately (plan Step 7).
 
 **Alternatives considered:**

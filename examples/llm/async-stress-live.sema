@@ -179,13 +179,35 @@
        (> chunk-count 1)
        (format "~a chunks" chunk-count))
 
+;; Streaming rounds are non-blocking in async context (ADR #68 streaming
+;; extension): a ticker runs beside the agent's :on-text round; ticks observed
+;; between the first and last delta prove siblings interleave mid-stream.
+;; Soft-checked — a provider may legitimately deliver a short reply as one chunk.
 (define delta-count 0)
-(define stream-res
-  (agent/run stress-bot "Reply with a two-line haiku about async. Do not call tools."
-    {:on-text (fn (d) (set! delta-count (+ delta-count 1)))}))
+(define stream-ticks (channel/new 2000))
+(define stream-snaps '())
+(define stream-pair
+  (async/all
+    (list
+      (async/spawn (fn ()
+        (dotimes (i 300) (async/sleep 5) (channel/send stream-ticks 1))))
+      (async/spawn (fn ()
+        (agent/run stress-bot "Reply with a two-line haiku about async. Do not call tools."
+          {:on-text (fn (d)
+                      (set! delta-count (+ delta-count 1))
+                      (set! stream-snaps (cons (channel/count stream-ticks) stream-snaps)))}))))))
+(define stream-res (nth stream-pair 1))
+(define ticks-during-stream
+  (if (> (length stream-snaps) 1)
+      (- (car stream-snaps) (car (reverse stream-snaps)))
+      0))
 (check "agent/run :on-text streams deltas"
        (and (> delta-count 0) (> (string-length (:response stream-res)) 0))
-       (format "~a deltas (streaming round runs inline — documented sibling-blocking limit)" delta-count))
+       (format "~a deltas" delta-count))
+(check-soft "sibling ticker advances BETWEEN :on-text deltas"
+       (> ticks-during-stream 0)
+       (format "~a ticks observed between first and last delta (needs a multi-chunk reply)"
+               ticks-during-stream))
 
 ;; ── 6. Mixed I/O storm ───────────────────────────────────────────────────────
 (println "── 6. mixed I/O storm (agent + completes + http + shell + ticker)")

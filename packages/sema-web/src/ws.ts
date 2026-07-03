@@ -225,13 +225,19 @@ export function registerWsBindings(interp: SemaInterpreterLike, ctx: SemaWebCont
   // binding (macros and functions share one env slot), so browser code calling
   // `(ws/listen conn {:on-message …})` reaches this instead of the recv-loop
   // macro.
+  // Use the symbol form `(define ws/listen (fn …))` — NOT `(define (ws/listen …))`.
+  // In the latter, `ws/listen` sits in call position and the prelude macro
+  // expands it before `define` runs ("define: expected a symbol"). As a bare
+  // symbol it is never treated as a macro head, so this cleanly rebinds the slot
+  // to a function.
   const wrapper = interp.evalStr(`
-    (define (ws/listen conn handlers)
-      (__ws/listen conn
-        (get handlers :on-open)
-        (get handlers :on-message)
-        (get handlers :on-close)
-        (get handlers :on-error)))`);
+    (define ws/listen
+      (fn (conn handlers)
+        (__ws/listen conn
+          (get handlers :on-open)
+          (get handlers :on-message)
+          (get handlers :on-close)
+          (get handlers :on-error))))`);
   if (wrapper.error) {
     throw new Error(`ws/listen wrapper failed to install: ${wrapper.error}`);
   }

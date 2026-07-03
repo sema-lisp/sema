@@ -3343,6 +3343,14 @@ fn sema_value_to_jsvalue_with_callbacks(
                 next_callback_id,
             ))
         }
+        // Bytevectors cross as a Uint8Array so binary payloads (e.g. a bytevector
+        // handed to ws/send) reach JS as bytes — not the "#u8(…)" string that the
+        // JSON fallback would produce.
+        ValueView::Bytevector(bytes) => {
+            let arr = js_sys::Uint8Array::new_with_length(bytes.len() as u32);
+            arr.copy_from(bytes.as_slice());
+            arr.into()
+        }
         _ => {
             // For complex types (lists, maps, vectors), go through JSON.
             // Use lossy conversion so NaN/Infinity become null locally
@@ -3383,6 +3391,17 @@ fn js_value_to_sema_value_with_callbacks(
 
     if let Some(s) = value.as_string() {
         return Ok(Value::string(&s));
+    }
+
+    // Binary payloads (e.g. a WebSocket binary frame handed to a ws/listen
+    // callback) arrive as a Uint8Array or ArrayBuffer. Preserve them as Sema
+    // bytevectors — JSON-stringifying a Uint8Array would yield a `{"0":…}`
+    // object, silently dropping the binary shape.
+    if let Some(arr) = value.dyn_ref::<js_sys::Uint8Array>() {
+        return Ok(Value::bytevector(arr.to_vec()));
+    }
+    if let Some(buf) = value.dyn_ref::<js_sys::ArrayBuffer>() {
+        return Ok(Value::bytevector(js_sys::Uint8Array::new(buf).to_vec()));
     }
 
     let json = js_sys::JSON::stringify(value)

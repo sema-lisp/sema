@@ -77,8 +77,23 @@ Attach evented handlers. All are optional:
 | `:on-close`    | `(conn info)` | the socket closed (`info` is `{:code :reason}`) |
 | `:on-error`    | `(conn err)`  | a connection error                           |
 
-Incoming binary frames are delivered as a bytevector. In the browser `ws/listen`
-returns immediately (it is evented — nothing to await).
+In the browser `ws/listen` returns immediately (it is evented — nothing to
+await).
+
+## Binary frames
+
+Binary works the same in the browser as on native. Send a bytevector (or
+`{:binary bv}`) and it goes out as a binary frame; an incoming binary frame is
+delivered to `:on-message` as a **bytevector** (not a string), byte-for-byte:
+
+```sema
+(ws/listen sock
+  {:on-open    (fn (c) (ws/send c (bytevector 1 2 3 255)))  ;; binary frame
+   :on-message (fn (c m)
+     (if (bytevector? m)
+       (handle-bytes m)      ;; binary frame → bytevector
+       (handle-text m)))})   ;; text frame  → string
+```
 
 ### `(ws/connected? conn)` → bool
 

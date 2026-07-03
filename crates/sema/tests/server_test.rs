@@ -1261,6 +1261,60 @@ fn test_websocket_multi_message() {
     child.wait().ok();
 }
 
+// A generic echo handler (recv -> send) round-trips *binary* frames as well as
+// text: server-side `:recv` surfaces a binary frame as a bytevector and `:send`
+// accepts a bytevector as a binary frame.
+#[test]
+#[ignore] // requires network
+fn test_websocket_binary_echo() {
+    use std::process::{Command, Stdio};
+    use std::time::Duration;
+    use tungstenite::Message;
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_sema"))
+        .arg("-e")
+        .arg(
+            r#"
+            (http/serve
+              (http/router
+                [[:ws "/echo" (fn (conn)
+                  (let loop ()
+                    (let ((msg ((:recv conn))))
+                      (when msg
+                        ((:send conn) msg)
+                        (loop)))))]])
+              {:port 19903})
+        "#,
+        )
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("Failed to spawn");
+
+    std::thread::sleep(Duration::from_millis(1500));
+
+    let (mut ws, _) = tungstenite::connect("ws://127.0.0.1:19903/echo").expect("WS connect");
+
+    // Binary frame with edge bytes (0, 255, 128) must round-trip byte-identical.
+    let payload = vec![1u8, 2, 3, 255, 0, 128, 64];
+    ws.send(Message::Binary(payload.clone().into())).unwrap();
+    let reply = ws.read().unwrap();
+    assert!(reply.is_binary(), "expected a binary echo, got {reply:?}");
+    assert_eq!(
+        reply.into_data().to_vec(),
+        payload,
+        "binary bytes must match"
+    );
+
+    // Text still works through the same handler.
+    ws.send(Message::Text("hi".into())).unwrap();
+    assert_eq!(ws.read().unwrap().into_text().unwrap().as_str(), "hi");
+
+    ws.close(None).ok();
+    child.kill().ok();
+    child.wait().ok();
+}
+
 #[test]
 #[ignore] // requires network
 fn test_websocket_close_from_server() {

@@ -409,8 +409,8 @@ The connection map:
 
 | Key      | Description                                              |
 | -------- | -------------------------------------------------------- |
-| `:send`  | `(send message)` — Send a string to the client           |
-| `:recv`  | `(recv)` — Block until a message arrives, `nil` on close |
+| `:send`  | `(send message)` — send a string (text frame) or a bytevector (binary frame) |
+| `:recv`  | `(recv)` — block until a message arrives; a text frame returns a string, a binary frame a bytevector, `nil` on close |
 | `:close` | `(close)` — Close the connection                         |
 
 ### WebSocket Routes

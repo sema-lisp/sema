@@ -22,8 +22,13 @@
   `ws/connect`, `ws/send`, `ws/close`, `ws/connected?`, and `ws/listen` all work
   there; the pull-based `ws/recv`/`ws/recv-timeout` stay native-only (the browser
   main thread can't block — receive via the evented `ws/listen`), and only
-  `:subprotocols` of the connect options apply in the browser. The server side
-  (`:ws` routes / `http/websocket`) already shipped. (#49)
+  `:subprotocols` of the connect options apply in the browser. **Binary frames
+  round-trip end-to-end** — client, browser, and the server-side `:ws` handler
+  all carry binary: server `:send` accepts a bytevector (binary frame) and
+  `:recv` surfaces a binary frame as a bytevector (text frames stay strings),
+  and browser `ws/send`/`ws/listen` marshal bytevectors as `Uint8Array` across
+  the WASM boundary. The server side (`:ws` routes / `http/websocket`) already
+  shipped. (#49)
 - **Self-tail-call optimization: named-let loops no longer birth a self-reference
   cycle (issue #62).** A self-recursive named-let / `letrec` loop whose name is
   referenced only in tail-call position no longer captures itself as an upvalue.

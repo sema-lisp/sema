@@ -219,7 +219,7 @@ enum Commands {
         /// Symbol to show documentation for (implicit `show`)
         symbol: Option<String>,
     },
-    /// Manage packages
+    /// Manage Sema packages and dependencies (add, install, publish)
     Pkg {
         #[command(subcommand)]
         command: PkgCommands,

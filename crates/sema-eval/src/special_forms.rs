@@ -634,6 +634,85 @@ mod tests {
     }
 
     #[test]
+    fn embedded_import_redundant_path_components() {
+        // Absurd but valid spelling that normalizes to the clean key "lib/u.sema".
+        let interp = Interpreter::new();
+        embed(&interp, "lib/u.sema", "(module u (export v) (define v 3))");
+        assert_eq!(
+            interp
+                .eval_str(r#"(import "./lib/./.././lib/u.sema") v"#)
+                .unwrap(),
+            Value::int(3)
+        );
+    }
+
+    #[test]
+    fn embedded_import_deep_weird_chain() {
+        // Every hop uses a weird spelling and climbs subdirs then back to root.
+        let interp = Interpreter::new();
+        embed(
+            &interp,
+            "top.sema",
+            r#"(module top (export MARK) (define MARK 42))"#,
+        );
+        embed(
+            &interp,
+            "a/b/c/m3.sema",
+            r#"(module m3 (export MARK) (import "../../../top.sema"))"#,
+        );
+        embed(
+            &interp,
+            "a/b/m2.sema",
+            r#"(module m2 (export MARK) (import "./c/../c/m3.sema"))"#,
+        );
+        embed(
+            &interp,
+            "a/m1.sema",
+            r#"(module m1 (export MARK) (import "../a/./b/m2.sema"))"#,
+        );
+        assert_eq!(
+            interp.eval_str(r#"(import "././a/m1.sema") MARK"#).unwrap(),
+            Value::int(42)
+        );
+    }
+
+    #[test]
+    fn embedded_import_unicode_and_emoji_paths() {
+        // UTF-8 module names + directories resolve byte-for-byte.
+        let interp = Interpreter::new();
+        embed(
+            &interp,
+            "lïb-café/µtil.sema",
+            "(module u (export v) (define v 1))",
+        );
+        embed(
+            &interp,
+            "rocket-🚀.sema",
+            "(module r (export w) (define w 2))",
+        );
+        assert_eq!(
+            interp
+                .eval_str(r#"(import "./lïb-café/µtil.sema") v"#)
+                .unwrap(),
+            Value::int(1)
+        );
+        assert_eq!(
+            interp.eval_str(r#"(import "./rocket-🚀.sema") w"#).unwrap(),
+            Value::int(2)
+        );
+    }
+
+    #[test]
+    fn embedded_import_escaping_root_is_rejected() {
+        // A spec that lexically escapes the archive root must NOT resolve from the
+        // embedded store (it would otherwise fall through to the host fs).
+        let interp = Interpreter::new();
+        embed(&interp, "u.sema", "(module u (export v) (define v 9))");
+        // "../u.sema" pops above the root → no embedded hit → no such file.
+        assert!(interp.eval_str(r#"(import "../u.sema") v"#).is_err());
+    }
+
+    #[test]
     fn compiled_entry_imports_embedded_package_modules() {
         let interp = Interpreter::new();
         let module = r#"

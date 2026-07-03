@@ -1,4 +1,4 @@
-.PHONY: llm-stress all build release web-runtime test-web-e2e build-pgo pgo-profile install install-pgo uninstall test test-lsp test-embedding-bench test-http test-llm check clippy fmt fmt-check clean run lint lint-links docs docs-check update-pricing examples examples-vm smoke-bytecode rag-demo test-providers fuzz fuzz-reader fuzz-eval fuzz-grammar fuzz-grammar-emit setup docs-search-gate bench-1m bench-10m bench-100m site-dev site-build site-preview site-deploy deploy coverage coverage-html bench bench-vm bench-save bench-suite bench-closure bench-numeric bench-compare bench-baseline profile profile-vm ts-setup ts-generate ts-test ts-playground js-lib-build js-lib-dev sema-web-example sema-web-example-build
+.PHONY: example-notebooks-async llm-stress all build release web-runtime test-web-e2e build-pgo pgo-profile install install-pgo uninstall test test-lsp test-embedding-bench test-http test-llm check clippy fmt fmt-check clean run lint lint-links docs docs-check update-pricing examples examples-vm smoke-bytecode rag-demo test-providers fuzz fuzz-reader fuzz-eval fuzz-grammar fuzz-grammar-emit setup docs-search-gate bench-1m bench-10m bench-100m site-dev site-build site-preview site-deploy deploy coverage coverage-html bench bench-vm bench-save bench-suite bench-closure bench-numeric bench-compare bench-baseline profile profile-vm ts-setup ts-generate ts-test ts-playground js-lib-build js-lib-dev sema-web-example sema-web-example-build
 
 SEMA_WEB_EXAMPLE_DIR := examples/sema-web-app
 
@@ -116,6 +116,12 @@ llm-stress: release
 example-notebook: build
 	@echo "=== Running example notebook ==="
 	cargo run --quiet -- notebook run examples/notebook/demo.sema-nb || true
+
+# Headless smoke for the async notebook series (the keyless, deterministic pair;
+# the network/LLM notebooks are run manually — see examples/notebook/README.md).
+example-notebooks-async: release
+	@./target/release/sema notebook run examples/notebook/async-basics.sema-nb
+	@./target/release/sema notebook run examples/notebook/realtime-monitor.sema-nb
 
 test-notebook-e2e: build
 	@echo "=== Running notebook E2E tests ==="

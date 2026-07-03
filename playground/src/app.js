@@ -458,6 +458,7 @@ async function run() {
   if (workerActive) {
     workerRunning = true;
     runBtn.textContent = 'Stop';
+    runBtn.removeAttribute('shortcut'); // sema-button renders the shortcut badge; hide it while "Stop"
     runBtn.classList.add('stop-btn');
     statusEl.textContent = 'Running…';
     statusEl.className = 'status-text status-loading';
@@ -484,7 +485,8 @@ async function run() {
 
   if (workerActive) {
     workerRunning = false;
-    runBtn.innerHTML = 'Run<span class="shortcut">⌘↵</span>';
+    runBtn.textContent = 'Run';
+    runBtn.setAttribute('shortcut', '⌘↵'); // restore the badge (rendered by sema-button)
     runBtn.classList.remove('stop-btn');
     const cancelled = result.error && result.error.includes('cancelled');
     statusEl.textContent = result.error ? (cancelled ? 'Stopped' : 'Error') : 'Ready';

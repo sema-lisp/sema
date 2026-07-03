@@ -58,17 +58,21 @@
     <div class="pane-header">
       <span class="pane-title">Source</span>
       <div style="display:flex;align-items:center;gap:0.75rem;">
-        <button class="run-btn fmt-btn" id="fmt-btn" data-testid="fmt-btn" disabled data-tooltip="Format code (sema fmt)">Fmt</button>
-        <button class="run-btn" id="run-btn" data-testid="run-btn" disabled data-tooltip="Run code (⌘+Enter)" data-tooltip-pos="right">
-          Run<span class="shortcut">⌘↵</span>
-        </button>
-        <button class="run-btn debug-btn" id="debug-btn" data-testid="debug-btn" disabled data-tooltip="Debug with breakpoints">Debug</button>
+        <sema-tooltip content="Format code (sema fmt)" placement="bottom">
+          <sema-button variant="secondary" id="fmt-btn" data-testid="fmt-btn" disabled>Fmt</sema-button>
+        </sema-tooltip>
+        <sema-tooltip content="Run code (⌘+Enter)" placement="right">
+          <sema-button variant="run" id="run-btn" data-testid="run-btn" shortcut="⌘↵" disabled>Run</sema-button>
+        </sema-tooltip>
+        <sema-tooltip content="Debug with breakpoints" placement="bottom">
+          <sema-button variant="secondary" id="debug-btn" data-testid="debug-btn" disabled>Debug</sema-button>
+        </sema-tooltip>
         <div class="debug-controls hidden" id="debug-controls" data-testid="debug-controls">
-          <button class="debug-ctrl-btn" id="dbg-continue" data-tooltip="Continue (F5)">▶</button>
-          <button class="debug-ctrl-btn" id="dbg-step-over" data-tooltip="Step Over (F10)">⏭</button>
-          <button class="debug-ctrl-btn" id="dbg-step-into" data-tooltip="Step Into (F11)">↓</button>
-          <button class="debug-ctrl-btn" id="dbg-step-out" data-tooltip="Step Out (⇧F11)">↑</button>
-          <button class="debug-ctrl-btn dbg-stop" id="dbg-stop" data-tooltip="Stop (Esc)">⬛</button>
+          <sema-tooltip content="Continue (F5)" placement="bottom"><sema-button variant="debug" id="dbg-continue" aria-label="Continue">▶</sema-button></sema-tooltip>
+          <sema-tooltip content="Step Over (F10)" placement="bottom"><sema-button variant="debug" id="dbg-step-over" aria-label="Step Over">⏭</sema-button></sema-tooltip>
+          <sema-tooltip content="Step Into (F11)" placement="bottom"><sema-button variant="debug" id="dbg-step-into" aria-label="Step Into">↓</sema-button></sema-tooltip>
+          <sema-tooltip content="Step Out (⇧F11)" placement="bottom"><sema-button variant="debug" id="dbg-step-out" aria-label="Step Out">↑</sema-button></sema-tooltip>
+          <sema-tooltip content="Stop (Esc)" placement="bottom"><sema-button variant="debug" danger id="dbg-stop" aria-label="Stop">⬛</sema-button></sema-tooltip>
         </div>
       </div>
     </div>
@@ -87,7 +91,9 @@
     <div class="pane output-pane">
       <div class="pane-header">
         <span class="pane-title">Output</span>
-        <button class="run-btn" id="clear-btn" data-testid="clear-btn" style="background: transparent; color: var(--text-dim); border: 1px solid var(--border);" data-tooltip="Clear output" data-tooltip-pos="right">Clear</button>
+        <sema-tooltip content="Clear output" placement="right">
+          <sema-button variant="ghost" id="clear-btn" data-testid="clear-btn">Clear</sema-button>
+        </sema-tooltip>
       </div>
       <div id="output" data-testid="output">
         <div class="output-welcome">Initializing Sema interpreter…</div>
@@ -105,9 +111,9 @@
             <label data-tooltip="sessionStorage, cleared when tab closes"><input type="radio" name="backend" value="session">Session</label>
             <label data-tooltip="IndexedDB, persistent with larger storage" data-tooltip-pos="right"><input type="radio" name="backend" value="indexeddb">IDB</label>
           </div>
-          <button class="btn-upload" id="upload-btn" data-tooltip="Upload files into the virtual filesystem">Upload</button>
-          <button class="btn-clear-vfs" id="clear-vfs-btn" data-tooltip="Delete all files from the virtual filesystem" data-tooltip-pos="right">Clear</button>
-          <button class="btn-collapse" id="files-collapse-btn" data-tooltip="Collapse files panel" data-tooltip-pos="right">▾</button>
+          <sema-tooltip content="Upload files into the virtual filesystem" placement="bottom"><sema-button variant="ghost" id="upload-btn">Upload</sema-button></sema-tooltip>
+          <sema-tooltip content="Delete all files from the virtual filesystem" placement="right"><sema-button variant="ghost" id="clear-vfs-btn">Clear</sema-button></sema-tooltip>
+          <sema-tooltip content="Collapse files panel" placement="right"><sema-button variant="icon" id="files-collapse-btn" aria-label="Collapse files panel">▾</sema-button></sema-tooltip>
         </div>
       </div>
       <div class="files-body" id="files-body">

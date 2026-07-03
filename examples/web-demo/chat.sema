@@ -1,0 +1,57 @@
+;; AI Chat — Sema Web demo
+;; Uses llm/chat-stream for progressive token rendering
+
+(def messages (state (list)))
+(def input-text (state ""))
+(def current-stream (state nil))
+
+(define (update-input ev)
+  (put! input-text (dom/event-value ev)))
+
+(define (send-message ev)
+  (dom/prevent-default! ev)
+  (let ((text @input-text))
+    (when (not (equal? text ""))
+      (let ((user-msg {:role "user" :content text}))
+        (update! messages (fn (msgs) (append msgs (list user-msg))))
+        (put! input-text "")
+        (let ((s (llm/chat-stream (list {:role "user" :content text}) {})))
+          (put! current-stream s))))))
+
+(define (format-message msg)
+  [:div {:class (string-append "message " (get msg :role))}
+    [:strong (string-append (get msg :role) ": ")]
+    [:span (get msg :content)]])
+
+(define (render-stream-status)
+  (if-let (s @current-stream)
+    (let ((val @s))
+      (if (get val :done)
+        (begin
+          ;; Move completed response to messages
+          (when (not (equal? (get val :text) ""))
+            (update! messages
+              (fn (msgs) (append msgs (list {:role "assistant" :content (get val :text)})))))
+          (put! current-stream nil)
+          [:span])
+        [:div {:class "message assistant streaming"}
+          [:strong "assistant: "]
+          [:span (get val :text)]]))
+    [:span]))
+
+(define (chat-view)
+  [:div {:class "chat-container"}
+    [:h2 "Sema AI Chat"]
+    [:div {:class "messages" :id "message-list"}
+      (map format-message @messages)
+      (render-stream-status)]
+    [:form {:class "input-area" :on-submit "send-message"}
+      [:input {:id "chat-input"
+               :type "text"
+               :placeholder "Ask something..."
+               :value @input-text
+               :on-input "update-input"
+               :autocomplete "off"}]
+      [:button {:type "submit"} "Send"]]])
+
+(mount! "#app" chat-view)

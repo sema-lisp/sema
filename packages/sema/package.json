@@ -42,6 +42,7 @@
     "embedded",
     "scripting-engine"
   ],
+  "publishConfig": { "access": "public" },
   "author": {
     "name": "Helge Sverre",
     "url": "https://helgesver.re"

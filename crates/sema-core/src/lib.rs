@@ -1,10 +1,13 @@
 #![allow(clippy::mutable_key_type)]
+pub mod archive;
 pub mod async_signal;
 pub mod context;
+pub mod cycle;
 pub mod error;
 pub mod home;
 pub mod json;
 pub mod mcp_cassette;
+pub mod net;
 pub mod output_hook;
 pub mod resolve;
 pub mod sandbox;
@@ -32,6 +35,14 @@ pub use async_signal::{
 pub use context::{
     call_callback, eval_callback, set_call_callback, set_eval_callback, with_stdlib_ctx,
     CallCallbackFn, EvalCallbackFn, EvalContext,
+};
+pub use cycle::{
+    collect as gc_collect, env_chain_pins as gc_env_chain_pins, last_stats as gc_last_stats,
+    maybe_collect as gc_maybe_collect, register_candidate, register_closure_birth,
+    register_env_candidate, register_payload_tracer, registry_len as gc_registry_len,
+    set_gc_observer, should_collect as gc_should_collect,
+    threshold_collect as gc_threshold_collect, trace_value, EnvBindings, GcEdge, GcNode,
+    GcPassEvent, GcStats, GcTrigger, NodePtr, OpaqueSeverFn, OpaqueTraceFn, PayloadTracer,
 };
 pub use error::{CallFrame, SemaError, Span, SpanMap, StackTrace};
 pub use home::sema_home;

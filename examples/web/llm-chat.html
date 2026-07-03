@@ -1,0 +1,179 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Sema LLM Chat</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: system-ui, -apple-system, sans-serif;
+      background: #0f172a;
+      color: #e2e8f0;
+      display: flex;
+      justify-content: center;
+      min-height: 100vh;
+      padding: 2rem;
+    }
+
+    .chat-container {
+      max-width: 600px;
+      width: 100%;
+    }
+
+    .chat-container h2 {
+      color: #818cf8;
+      font-size: 1.5rem;
+      margin-bottom: 1.5rem;
+      text-align: center;
+    }
+
+    .messages {
+      min-height: 200px;
+      max-height: 60vh;
+      overflow-y: auto;
+      margin-bottom: 1rem;
+      padding: 1rem;
+      background: #1e293b;
+      border-radius: 0.75rem;
+      border: 1px solid #334155;
+    }
+
+    .message {
+      margin-bottom: 0.75rem;
+      padding: 0.5rem 0.75rem;
+      border-radius: 0.5rem;
+      line-height: 1.5;
+    }
+
+    .message.user {
+      background: #312e81;
+    }
+
+    .message.assistant {
+      background: #1e3a5f;
+    }
+
+    .message strong {
+      color: #818cf8;
+      text-transform: capitalize;
+    }
+
+    .loading {
+      text-align: center;
+      color: #94a3b8;
+      padding: 0.5rem;
+      font-style: italic;
+    }
+
+    .input-row {
+      display: flex;
+      gap: 0.5rem;
+    }
+
+    .input-row input {
+      flex: 1;
+      padding: 0.6rem 1rem;
+      font-size: 1rem;
+      border: 1px solid #334155;
+      background: #1e293b;
+      color: #e2e8f0;
+      border-radius: 0.5rem;
+      outline: none;
+    }
+
+    .input-row input:focus {
+      border-color: #818cf8;
+    }
+
+    .btn {
+      padding: 0.6rem 1.5rem;
+      font-size: 1rem;
+      border: 1px solid #334155;
+      background: #4f46e5;
+      color: #fff;
+      border-radius: 0.5rem;
+      cursor: pointer;
+      transition: background 0.15s;
+    }
+
+    .btn:hover {
+      background: #4338ca;
+    }
+
+    .back-link {
+      position: fixed;
+      top: 1rem;
+      left: 1rem;
+      color: #818cf8;
+      text-decoration: none;
+      font-size: 0.9rem;
+    }
+
+    .back-link:hover {
+      text-decoration: underline;
+    }
+
+    .info {
+      position: fixed;
+      bottom: 1rem;
+      text-align: center;
+      width: 100%;
+      color: #475569;
+      font-size: 0.8rem;
+    }
+
+    .setup-note {
+      text-align: center;
+      color: #94a3b8;
+      font-size: 0.85rem;
+      margin-bottom: 1rem;
+      padding: 0.75rem;
+      background: #1e293b;
+      border-radius: 0.5rem;
+      border: 1px solid #334155;
+    }
+
+    .setup-note code {
+      background: #0f172a;
+      padding: 0.15rem 0.4rem;
+      border-radius: 0.25rem;
+      font-size: 0.8rem;
+    }
+  </style>
+</head>
+<body>
+  <a href="index.html" class="back-link">← Back to demos</a>
+
+  <div id="app">
+    <div class="setup-note">
+      <p><strong>Setup required:</strong> This demo needs a running LLM proxy server.</p>
+      <p>Configure the proxy URL in the <code>llmProxy</code> option below.</p>
+    </div>
+  </div>
+
+  <div class="info">
+    Powered by atoms + hiccup + mount! + llm/* proxy — chat messages are sent to your backend.
+  </div>
+
+  <!-- Sema chat component -->
+  <script type="text/sema" src="llm-chat.sema"></script>
+
+  <script type="module">
+    import { SemaWeb } from "@sema-lang/sema-web";
+
+    try {
+      const web = await SemaWeb.init({
+        // Point this to your LLM proxy backend
+        llmProxy: "http://localhost:3001/api/llm",
+      });
+      console.log(`Sema Web v${web.version()} initialized with LLM proxy`);
+    } catch (e) {
+      document.getElementById("app").innerHTML =
+        `<p style="color: #ef4444;">Failed to initialize Sema: ${e.message}</p>`;
+      console.error("Sema init failed:", e);
+    }
+  </script>
+</body>
+</html>

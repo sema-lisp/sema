@@ -1,0 +1,8 @@
+(def should-error (state false))
+
+(define (maybe-error-view)
+  (if @should-error
+    (error "intentional render error")
+    [:p {:id "content"} "OK"]))
+
+(mount! "#app" "maybe-error-view")

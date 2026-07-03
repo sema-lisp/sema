@@ -1,0 +1,3 @@
+(let ((el (dom/create-element "h1")))
+  (dom/set-text! el "Hello from compiled Sema!")
+  (dom/append-child! (dom/query "#app") el))

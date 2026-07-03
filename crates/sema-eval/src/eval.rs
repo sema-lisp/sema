@@ -1,6 +1,6 @@
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashSet};
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 
 use sema_core::{
     intern, resolve, Env, EvalContext, Macro, MultiMethod, NativeFn, SemaError, Spur, Thunk, Value,
@@ -49,6 +49,44 @@ pub struct Interpreter {
 impl Default for Interpreter {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl Drop for Interpreter {
+    fn drop(&mut self) {
+        // The thread-local scheduler holds an Rc clone of this interpreter's
+        // global env (plus any leftover task VMs with their own clones);
+        // release it so teardown actually frees the env. Guarded by ptr_eq
+        // inside shutdown_scheduler — a different interpreter's scheduler on
+        // the same thread is left alone.
+        sema_vm::shutdown_scheduler(&self.global_env);
+        // Skip the teardown collection while unwinding: a panic anywhere in
+        // the collector would be a panic-in-destructor-during-cleanup, which
+        // aborts the whole process instead of unwinding. Nothing is lost —
+        // the candidates stay registered, so the next safe point on this
+        // thread reclaims the env.
+        if std::thread::panicking() {
+            return;
+        }
+        // `self.ctx` outlives this Drop body (fields drop after it), and its
+        // caches hold Values: module-cache export closures keep their module
+        // envs — and via the parent chain the ENTIRE global env — externally
+        // referenced, so with them held the teardown collect would free
+        // nothing. Clear every ctx-held Value store first.
+        self.ctx.module_cache.borrow_mut().clear();
+        self.ctx.user_context.borrow_mut().clear();
+        self.ctx.hidden_context.borrow_mut().clear();
+        self.ctx.context_stacks.borrow_mut().clear();
+        // Release this interpreter's own strong ref to the env BEFORE the
+        // teardown collection: with it held, the env wrapper carries an
+        // external count and trial deletion (correctly) keeps the whole env.
+        // Once released, the only refs left are the Env⇄Closure cycle edges
+        // from top-level `define`s, which the collector severs. No pins — the
+        // dying env is exactly what must be traced. Anything still externally
+        // held (e.g. a user-kept `global_env` clone) survives, and the
+        // registry reclaims it at a later safe point once released.
+        drop(std::mem::replace(&mut self.global_env, Rc::new(Env::new())));
+        sema_core::gc_collect(&[], sema_core::GcTrigger::InterpreterDrop);
     }
 }
 
@@ -157,7 +195,19 @@ impl Interpreter {
         // Reset the loop-guard step counter so the limit (if any) is per top-level
         // eval, not cumulative across calls on a reused interpreter.
         self.ctx.eval_steps.set(0);
-        vm.execute(prog.closure, &self.ctx)
+        let result = vm.execute(prog.closure, &self.ctx);
+        // Cycle-collector safe point (CORE-2): a top-level form just finished
+        // (REPL line, notebook cell, script form, embedded eval), so no VM
+        // frames or env borrows are live. Pins skip descent into this
+        // interpreter's global namespace; the scheduler's globals are the same
+        // env (init_scheduler above), so the one chain covers both.
+        if sema_core::gc_should_collect() {
+            sema_core::gc_threshold_collect(
+                &sema_core::gc_env_chain_pins(&self.global_env),
+                sema_core::GcTrigger::EvalReturn,
+            );
+        }
+        result
     }
 
     /// Compile source code to bytecode without executing.
@@ -297,6 +347,41 @@ fn expand_macros_in(ctx: &EvalContext, env: &Env, expr: &Value) -> EvalResult {
         }
         _ => Ok(expr.clone()),
     }
+}
+
+/// Run deserialized bytecode (a `.semac` payload) on a fresh VM rooted at
+/// `globals`. Used to `load`/`import` precompiled bytecode modules (e.g.
+/// embedded in a standalone-executable or web-archive VFS) the same way
+/// `eval_module_body_vm` runs source modules. Does NOT (re)initialize the
+/// async scheduler — callers nest this inside an already-running program and
+/// reuse the scheduler installed by the top-level VM driver.
+pub fn execute_compile_result(
+    ctx: &EvalContext,
+    globals: Rc<Env>,
+    result: sema_vm::CompileResult,
+) -> Result<Value, SemaError> {
+    let functions: Vec<Rc<sema_vm::Function>> = result.functions.into_iter().map(Rc::new).collect();
+    let main_cache_slots = result.chunk.n_global_cache_slots;
+    let closure = Rc::new(sema_vm::Closure {
+        func: Rc::new(sema_vm::Function {
+            name: None,
+            chunk: result.chunk,
+            upvalue_descs: Vec::new(),
+            upvalue_names: Vec::new(),
+            arity: 0,
+            has_rest: false,
+            local_names: Vec::new(),
+            local_scopes: Vec::new(),
+            source_file: None,
+            cache_offset: 0,
+        }),
+        upvalues: Vec::new(),
+        globals: None,
+        functions: None,
+    });
+
+    let mut vm = sema_vm::VM::new(globals, functions, &[], main_cache_slots)?;
+    vm.execute(closure, ctx)
 }
 
 /// Compile and run a `load`ed module body on the VM, one top-level form at a
@@ -550,26 +635,41 @@ pub fn load_prelude(ctx: &EvalContext, env: &Rc<Env>) {
     }
 }
 
+/// Upgrade a delegate's weak env capture. Delegates are only callable through
+/// the env that owns them (compiled code resolves `__vm-*` as globals in that
+/// env), so a failed upgrade is unreachable in practice — the error is defense,
+/// not semantics.
+fn upgrade_delegate_env(weak: &Weak<Env>) -> Result<Rc<Env>, SemaError> {
+    weak.upgrade()
+        .ok_or_else(|| SemaError::eval("evaluator environment has been torn down"))
+}
+
+/// Register the `__vm-*` delegate natives into `env`.
+///
+/// Invariant I2 (CORE-2): each delegate's boxed closure captures the env it is
+/// registered into WEAKLY (`Weak<Env>`), never strongly — a strong capture
+/// would form an uncollectable `Env → NativeFn → Box<dyn Fn> → Env` cycle that
+/// pins the entire environment past Interpreter teardown.
 pub fn register_vm_delegates(env: &Rc<Env>) {
     // __vm-eval: macro-expand, compile, and run the expression on the bytecode
     // VM (rooted at the global env so top-level `define`s persist). The runtime
     // `(eval ...)` meta path is thus VM-native — it no longer round-trips
     // through the tree-walker's `eval_value` (M3 / Phase 1c).
-    let eval_env = env.clone();
+    let eval_env = Rc::downgrade(env);
     env.set(
         intern("__vm-eval"),
         Value::native_fn(NativeFn::with_ctx("__vm-eval", move |ctx, args| {
             if args.len() != 1 {
                 return Err(SemaError::arity("eval", "1", args.len()));
             }
+            let eval_env = upgrade_delegate_env(&eval_env)?;
             let expanded = expand_for_vm_in(ctx, &eval_env, &args[0])?;
             // A form that expands to nothing (e.g. a `defmacro`) yields nil.
             if expanded.is_nil() {
                 return Ok(Value::nil());
             }
             let prog = sema_vm::compile_program(std::slice::from_ref(&expanded), None)?;
-            let mut vm =
-                sema_vm::VM::new(eval_env.clone(), prog.functions, &[], prog.main_cache_slots)?;
+            let mut vm = sema_vm::VM::new(eval_env, prog.functions, &[], prog.main_cache_slots)?;
             vm.execute(prog.closure, ctx)
         })),
     );
@@ -608,7 +708,7 @@ pub fn register_vm_delegates(env: &Rc<Env>) {
     // through the tree-walker's eval_step dispatch. The driver handles VFS
     // resolution, file path push/pop, caching, and runs the loaded body on the
     // VM (M4). The path arrives already evaluated from the VM.
-    let load_env = env.clone();
+    let load_env = Rc::downgrade(env);
     env.set(
         intern("__vm-load"),
         Value::native_fn(NativeFn::with_ctx("__vm-load", move |ctx, args| {
@@ -618,7 +718,10 @@ pub fn register_vm_delegates(env: &Rc<Env>) {
             // Target the *currently executing* VM's env (the module being run),
             // falling back to the global env at top level, so a nested `load`
             // adds definitions to the right module env — not always the globals.
-            let target = sema_vm::current_vm_globals().unwrap_or_else(|| load_env.clone());
+            let target = match sema_vm::current_vm_globals() {
+                Some(t) => t,
+                None => upgrade_delegate_env(&load_env)?,
+            };
             match special_forms::eval_load(std::slice::from_ref(&args[0]), &target, ctx)? {
                 Trampoline::Value(v) => Ok(v),
                 Trampoline::Eval(..) => Ok(Value::nil()),
@@ -630,7 +733,7 @@ pub fn register_vm_delegates(env: &Rc<Env>) {
     // not through the tree-walker's eval_step dispatch. Under the VM backend the
     // driver compiles and runs the module body on the VM (M4). The path and
     // selective-import symbols arrive already evaluated from the VM.
-    let import_env = env.clone();
+    let import_env = Rc::downgrade(env);
     env.set(
         intern("__vm-import"),
         Value::native_fn(NativeFn::with_ctx("__vm-import", move |ctx, args| {
@@ -646,7 +749,10 @@ pub fn register_vm_delegates(env: &Rc<Env>) {
             // being run), falling back to the global env at top level. This keeps
             // a nested module's imports private to that module instead of leaking
             // into the global env (M4 nested-module isolation).
-            let target = sema_vm::current_vm_globals().unwrap_or_else(|| import_env.clone());
+            let target = match sema_vm::current_vm_globals() {
+                Some(t) => t,
+                None => upgrade_delegate_env(&import_env)?,
+            };
             match special_forms::eval_import(&imp_args, &target, ctx)? {
                 Trampoline::Value(v) => Ok(v),
                 Trampoline::Eval(..) => Ok(Value::nil()),
@@ -655,7 +761,7 @@ pub fn register_vm_delegates(env: &Rc<Env>) {
     );
 
     // __vm-defmacro: register a macro in the environment
-    let macro_env = env.clone();
+    let macro_env = Rc::downgrade(env);
     env.set(
         intern("__vm-defmacro"),
         Value::native_fn(NativeFn::simple("__vm-defmacro", move |args| {
@@ -684,6 +790,7 @@ pub fn register_vm_delegates(env: &Rc<Env>) {
                 return Err(SemaError::type_error("symbol or nil", args[2].type_name()));
             };
             let body = vec![args[3].clone()];
+            let macro_env = upgrade_delegate_env(&macro_env)?;
             macro_env.set(
                 name,
                 Value::macro_val(Macro {
@@ -701,7 +808,7 @@ pub fn register_vm_delegates(env: &Rc<Env>) {
     // (pure destructure) — no tree-walker round-trip. Used for defmacro that
     // reaches compilation (e.g. non-top-level) rather than expand-time
     // registration.
-    let dmf_env = env.clone();
+    let dmf_env = Rc::downgrade(env);
     env.set(
         intern("__vm-defmacro-form"),
         Value::native_fn(NativeFn::simple("__vm-defmacro-form", move |args| {
@@ -711,13 +818,14 @@ pub fn register_vm_delegates(env: &Rc<Env>) {
             let items = args[0]
                 .as_list()
                 .ok_or_else(|| SemaError::type_error("list", args[0].type_name()))?;
+            let dmf_env = upgrade_delegate_env(&dmf_env)?;
             register_defmacro(items, &dmf_env)?;
             Ok(Value::nil())
         })),
     );
 
     // __vm-define-record-type: delegate to the tree-walker
-    let drt_env = env.clone();
+    let drt_env = Rc::downgrade(env);
     env.set(
         intern("__vm-define-record-type"),
         Value::native_fn(NativeFn::simple("__vm-define-record-type", move |args| {
@@ -738,6 +846,7 @@ pub fn register_vm_delegates(env: &Rc<Env>) {
                     dr_args.push(spec.clone());
                 }
             }
+            let drt_env = upgrade_delegate_env(&drt_env)?;
             match special_forms::eval_define_record_type(&dr_args, &drt_env)? {
                 Trampoline::Value(v) => Ok(v),
                 Trampoline::Eval(..) => Ok(Value::nil()),
@@ -761,7 +870,7 @@ pub fn register_vm_delegates(env: &Rc<Env>) {
     );
 
     // __vm-force: force a thunk
-    let force_env = env.clone();
+    let force_env = Rc::downgrade(env);
     env.set(
         intern("__vm-force"),
         Value::native_fn(NativeFn::with_ctx("__vm-force", move |ctx, args| {
@@ -778,6 +887,7 @@ pub fn register_vm_delegates(env: &Rc<Env>) {
                     sema_core::call_callback(ctx, &thunk.body, &[])?
                 } else {
                     // Non-callable thunk body (a raw expr) — evaluate on the VM.
+                    let force_env = upgrade_delegate_env(&force_env)?;
                     eval_value_vm(ctx, &thunk.body, &force_env)?
                 };
                 *thunk.forced.borrow_mut() = Some(val.clone());
@@ -790,7 +900,7 @@ pub fn register_vm_delegates(env: &Rc<Env>) {
     );
 
     // __vm-macroexpand: expand a macro form via the tree-walker
-    let me_env = env.clone();
+    let me_env = Rc::downgrade(env);
     env.set(
         intern("__vm-macroexpand"),
         Value::native_fn(NativeFn::with_ctx("__vm-macroexpand", move |ctx, args| {
@@ -800,6 +910,9 @@ pub fn register_vm_delegates(env: &Rc<Env>) {
             if let Some(items) = args[0].as_list() {
                 if !items.is_empty() {
                     if let Some(spur) = items[0].as_symbol_spur() {
+                        // Upgrade lazily: the non-macro passthrough below never
+                        // touches the env.
+                        let me_env = upgrade_delegate_env(&me_env)?;
                         if let Some(mac_val) = me_env.get(spur) {
                             if let Some(mac) = mac_val.as_macro_rc() {
                                 // VM-native: expand the transformer on the VM.
@@ -920,7 +1033,7 @@ pub fn register_vm_delegates(env: &Rc<Env>) {
     // __vm-deftool: the VM has already evaluated description/parameters/handler
     // and passes them as values, so build the tool directly — no tree-walker
     // round-trip.
-    let tool_env = env.clone();
+    let tool_env = Rc::downgrade(env);
     env.set(
         intern("__vm-deftool"),
         Value::native_fn(NativeFn::simple("__vm-deftool", move |args| {
@@ -930,6 +1043,7 @@ pub fn register_vm_delegates(env: &Rc<Env>) {
             let name = args[0]
                 .as_symbol()
                 .ok_or_else(|| SemaError::eval("deftool: name must be a symbol"))?;
+            let tool_env = upgrade_delegate_env(&tool_env)?;
             special_forms::register_tool(
                 &name,
                 args[1].clone(),
@@ -942,7 +1056,7 @@ pub fn register_vm_delegates(env: &Rc<Env>) {
 
     // __vm-defagent: the VM has already evaluated the options map, so build the
     // agent directly — no tree-walker round-trip.
-    let agent_env = env.clone();
+    let agent_env = Rc::downgrade(env);
     env.set(
         intern("__vm-defagent"),
         Value::native_fn(NativeFn::simple("__vm-defagent", move |args| {
@@ -952,6 +1066,7 @@ pub fn register_vm_delegates(env: &Rc<Env>) {
             let name = args[0]
                 .as_symbol()
                 .ok_or_else(|| SemaError::eval("defagent: name must be a symbol"))?;
+            let agent_env = upgrade_delegate_env(&agent_env)?;
             special_forms::register_agent(&name, args[1].clone(), &agent_env)
         })),
     );
@@ -1052,4 +1167,68 @@ pub fn register_vm_delegates(env: &Rc<Env>) {
             Ok(Value::nil())
         })),
     );
+
+    // gc/collect: run a full cycle collection now (CORE-2). User-facing —
+    // registered here (not sema-stdlib) because pin computation needs
+    // sema-vm's current-VM introspection. Pins skip descent into the live
+    // global namespace of the executing VM (or of this interpreter when
+    // called outside one); correctness never depends on pins — live objects
+    // are protected by their external strong counts.
+    let gc_env = Rc::downgrade(env);
+    env.set(
+        intern("gc/collect"),
+        Value::native_fn(NativeFn::simple("gc/collect", move |args| {
+            if !args.is_empty() {
+                return Err(SemaError::arity("gc/collect", "0", args.len()));
+            }
+            let pins = match sema_vm::current_vm_globals() {
+                Some(globals) => sema_core::gc_env_chain_pins(&globals),
+                None => match gc_env.upgrade() {
+                    Some(env) => sema_core::gc_env_chain_pins(&env),
+                    None => Vec::new(),
+                },
+            };
+            Ok(gc_stats_map(&sema_core::gc_collect(
+                &pins,
+                sema_core::GcTrigger::Explicit,
+            )))
+        })),
+    );
+
+    // gc/stats: report the last completed collection's stats plus the current
+    // candidate-registry size, without collecting.
+    env.set(
+        intern("gc/stats"),
+        Value::native_fn(NativeFn::simple("gc/stats", |args| {
+            if !args.is_empty() {
+                return Err(SemaError::arity("gc/stats", "0", args.len()));
+            }
+            let mut map = gc_stats_btree(&sema_core::gc_last_stats());
+            map.insert(
+                Value::keyword("registry-size"),
+                Value::int(sema_core::gc_registry_len() as i64),
+            );
+            Ok(Value::map(map))
+        })),
+    );
+}
+
+/// `{:candidates N :traced N :collected N :pruned N}` for the gc builtins.
+fn gc_stats_btree(stats: &sema_core::GcStats) -> BTreeMap<Value, Value> {
+    let mut map = BTreeMap::new();
+    map.insert(
+        Value::keyword("candidates"),
+        Value::int(stats.candidates as i64),
+    );
+    map.insert(Value::keyword("traced"), Value::int(stats.traced as i64));
+    map.insert(
+        Value::keyword("collected"),
+        Value::int(stats.collected as i64),
+    );
+    map.insert(Value::keyword("pruned"), Value::int(stats.pruned as i64));
+    map
+}
+
+fn gc_stats_map(stats: &sema_core::GcStats) -> Value {
+    Value::map(gc_stats_btree(stats))
 }

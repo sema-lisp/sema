@@ -1,0 +1,105 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Sema Reactive Counter</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: system-ui, -apple-system, sans-serif;
+      background: #0f172a;
+      color: #e2e8f0;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      min-height: 100vh;
+    }
+
+    .counter {
+      text-align: center;
+    }
+
+    .counter h2 {
+      color: #818cf8;
+      font-size: 1.5rem;
+      margin-bottom: 1.5rem;
+    }
+
+    .display {
+      font-size: 4rem;
+      font-weight: bold;
+      color: #f1f5f9;
+      margin: 1rem 0;
+      font-variant-numeric: tabular-nums;
+    }
+
+    .buttons {
+      display: flex;
+      gap: 0.75rem;
+      justify-content: center;
+    }
+
+    .btn {
+      padding: 0.6rem 1.8rem;
+      font-size: 1.1rem;
+      border: 1px solid #334155;
+      background: #1e293b;
+      color: #e2e8f0;
+      border-radius: 0.5rem;
+      cursor: pointer;
+      transition: background 0.15s;
+    }
+
+    .btn:hover {
+      background: #334155;
+    }
+
+    .btn-secondary {
+      font-size: 0.9rem;
+      padding: 0.6rem 1.2rem;
+      color: #94a3b8;
+    }
+
+    .back-link {
+      position: fixed;
+      top: 1rem;
+      left: 1rem;
+      color: #818cf8;
+      text-decoration: none;
+      font-size: 0.9rem;
+    }
+
+    .back-link:hover {
+      text-decoration: underline;
+    }
+
+    .info {
+      position: fixed;
+      bottom: 1rem;
+      text-align: center;
+      width: 100%;
+      color: #475569;
+      font-size: 0.8rem;
+    }
+  </style>
+</head>
+<body>
+  <a href="index.html" class="back-link">← Back to imperative demo</a>
+
+  <div id="app"></div>
+
+  <div class="info">
+    Powered by atoms + hiccup + mount! — state changes automatically re-render the view.
+  </div>
+
+  <!-- Sema reactive component -->
+  <script type="text/sema" src="counter-reactive.sema"></script>
+
+  <script type="module">
+    import { SemaWeb } from "@sema-lang/sema-web";
+    await SemaWeb.init();
+  </script>
+</body>
+</html>

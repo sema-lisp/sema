@@ -103,28 +103,29 @@ Pattern can mirror the diagnostic-waiting in `test_diagnostics.py`.
 
 ---
 
-## CORE-2 — recursive-closure Rc cycle (memory leak), both backends
+## CORE-2 — recursive-closure Rc cycle (memory leak) — **FIXED (2026-07-02)**
 
-**Today:** a self-referential closure forms an `Rc` cycle that reference counting can't
-reclaim. On the **tree-walker** it's the whole-`Env` capture (`Lambda { env: Env }` +
-the env binding the name → the lambda). On the **VM** it's narrower but real: a
-local/returned recursive closure captures its own name as an `UpvalueCell` whose
-`Closed(Value)` holds the closure (`crates/sema-vm/src/resolve.rs:280-297`;
-`docs/plans/2026-02-16-compilation-strategy-investigation.md:1014-1016` calls it "the
-MOST common source of long-lived reference chains"). Top-level defines (globals) avoid it.
+**Was:** a self-referential closure formed an `Rc` cycle that reference counting couldn't
+reclaim: a local/returned recursive closure captures its own name as an `UpvalueCell`
+whose `Closed(Value)` holds the closure (shape U — measured 260 B leaked per churn
+iteration). The design work found two more live shapes: every top-level define forms an
+env⇄closure cycle that pins the whole global env at interpreter/notebook teardown
+(shape E, ~168 KB per drop), and the `__vm-*` delegates strongly captured the very env
+they were registered into (shape D, ~166 KB per drop with zero user code). The attempted
+`Weak` captured-env fix had been dropped — it broke the "module exports a fn calling a
+private helper" pattern (`vm_module_test`).
 
-**Correction (2026-06-18):** an earlier note claimed retiring the tree-walker closes
-CORE-2 because "the VM is cycle-free." That is **wrong** — the VM has its own cycle (above).
-Retiring the TW removes only the whole-`Env` variant.
-
-**Real fix:** cycle collection / a tracing GC over the `Rc<Value>`/`Env`/`UpvalueCell`
-graph (every production Scheme ships one for exactly this reason). The attempted `Weak`
-captured-env fix was dropped — it broke the common "module exports a fn calling a private
-helper" pattern (`vm_module_test`).
-
-**Why deferred:** only bites very long-lived sessions (REPL/notebook/server) with repeated
-recursive local defines; CLI/script runs are unaffected. A GC is a large investment; revisit
-when a real long-running workload shows growth (a `Rc::strong_count` leak test would size it).
+**Fix:** a synchronous Bacon–Rajan cycle collector over the existing `Rc` heap —
+**ADR #66**, design/measurements/milestones in `docs/plans/2026-07-02-core2-gc.md`,
+GC section in `docs/vm-status.md`. Creation-time candidate registry (VM closures, home
+envs, the cold data constructors `delay`/promise/`channel`/`defmulti`), trial deletion
+over a transient side map, reclamation by *severing* the one mutable cell every Sema
+cycle must pass through. No headers, no `Value`/`Rc` changes, `Value::drop` untouched.
+Shape D was fixed by refactor (delegates capture `Weak` — invariant I2 in AGENTS.md).
+Perf gate passed (plan §6 M4): storm +0.91%, upvalue-counter +1.41%, fold −0.01%,
+318 ns per reclaimed churn cycle. Oracles: `crates/sema/tests/leak_test.rs` (un-ignored),
+the `gc_stress_test.rs` suite, the agent-turn FakeProvider test in `llm_fake_test.rs`,
+and the notebook `reset_returns_old_kernel_memory` test.
 
 ---
 

@@ -1,0 +1,493 @@
+;; Sema Web compiled app example
+;;
+;; Build:
+;;   sema build --target web examples/sema-web-app/app.sema -o examples/sema-web-app/dist/app.vfs
+;;
+;; Run from the repository root:
+;;   make sema-web-example
+
+;; --- Routing ---------------------------------------------------------------
+
+(router/init! {"/" "overview-page"
+               "/active" "active-page"
+               "/completed" "completed-page"
+               "/about" "about-page"})
+
+;; --- Persistence -----------------------------------------------------------
+
+(def task-storage-key "sema-web-example/tasks")
+(def next-id-storage-key "sema-web-example/next-id")
+
+;; --- State ----------------------------------------------------------------
+
+(def tasks (state (or (store/get task-storage-key) '())))
+(def next-id (state (or (store/get next-id-storage-key) 1)))
+(def draft (state ""))
+
+(def route-match (computed (router/current-route)))
+
+(def current-page
+  (computed
+    (let ((route @route-match))
+      (if route
+          (:handler route)
+          "overview-page"))))
+
+(def total-count
+  (computed (length @tasks)))
+
+(def remaining-count
+  (computed
+    (length
+      (filter (fn (task) (not (:done task))) @tasks))))
+
+(def completed-count
+  (computed
+    (length
+      (filter (fn (task) (:done task)) @tasks))))
+
+(def visible-tasks
+  (computed
+    (let ((page @current-page)
+          (items @tasks))
+      (cond
+        ((equal? page "active-page")
+          (filter (fn (task) (not (:done task))) items))
+        ((equal? page "completed-page")
+          (filter (fn (task) (:done task)) items))
+        (else items)))))
+
+;; --- Styles ---------------------------------------------------------------
+
+(def shell-class
+  (css {:display "grid"
+        :gap "22px"
+        :padding "26px"
+        :background "rgba(255,252,245,0.86)"
+        :border "1px solid rgba(37,45,61,0.12)"
+        :border-radius "28px"
+        :box-shadow "0 20px 70px rgba(38,35,30,0.14)"
+        :backdrop-filter "blur(12px)"}))
+
+(def hero-class
+  (css {:display "grid"
+        :gap "10px"}))
+
+(def badge-class
+  (css {:display "inline-flex"
+        :align-items "center"
+        :width "fit-content"
+        :padding "6px 12px"
+        :border-radius "999px"
+        :font-size "12px"
+        :font-weight "700"
+        :letter-spacing "0.12em"
+        :text-transform "uppercase"
+        :background "#1d2433"
+        :color "#fff"}))
+
+(def title-class
+  (css {:font-size "clamp(1.6rem, 4vw, 2.8rem)"
+        :line-height "0.95"
+        :font-weight "700"
+        :letter-spacing "-0.03em"
+        :margin "0"}))
+
+(def copy-class
+  (css {:margin "0"
+        :max-width "700px"
+        :font-size "1rem"
+        :line-height "1.65"
+        :color "#5b6475"}))
+
+(def nav-class
+  (css {:display "flex"
+        :flex-wrap "wrap"
+        :gap "10px"}))
+
+(def nav-button-class
+  (css {:padding "10px 14px"
+        :border "1px solid rgba(37,45,61,0.12)"
+        :border-radius "999px"
+        :background "rgba(255,255,255,0.65)"
+        :color "#1d2433"
+        :font-size "14px"
+        :font-weight "600"
+        :cursor "pointer"
+        :transition "transform 120ms ease, background 120ms ease, border-color 120ms ease"
+        "&:hover" {:transform "translateY(-1px)"
+                   :background "#ffffff"
+                   :border-color "rgba(37,45,61,0.28)"}}))
+
+(def nav-button-active-class
+  (css {:background "#c7522a"
+        :border-color "#c7522a"
+        :color "#fff"}))
+
+(def grid-class
+  (css {:display "grid"
+        :grid-template-columns "minmax(0, 1.4fr) minmax(320px, 0.95fr)"
+        :gap "20px"}))
+
+(def column-class
+  (css {:display "grid"
+        :gap "18px"}))
+
+(def card-class
+  (css {:padding "18px"
+        :border-radius "20px"
+        :background "rgba(255,255,255,0.72)"
+        :border "1px solid rgba(37,45,61,0.1)"
+        :box-shadow "0 12px 30px rgba(38,35,30,0.08)"}))
+
+(def section-title-class
+  (css {:margin "0 0 8px"
+        :font-size "18px"
+        :font-weight "700"}))
+
+(def section-copy-class
+  (css {:margin "0"
+        :font-size "14px"
+        :line-height "1.55"
+        :color "#5b6475"}))
+
+(def stats-grid-class
+  (css {:display "grid"
+        :grid-template-columns "repeat(3, minmax(0, 1fr))"
+        :gap "12px"}))
+
+(def stat-class
+  (css {:padding "16px"
+        :border-radius "18px"
+        :background "#fffdf9"
+        :border "1px solid rgba(37,45,61,0.08)"}))
+
+(def stat-label-class
+  (css {:font-size "12px"
+        :font-weight "700"
+        :letter-spacing "0.08em"
+        :text-transform "uppercase"
+        :color "#7b5b4a"}))
+
+(def stat-value-class
+  (css {:margin-top "8px"
+        :font-size "30px"
+        :line-height "1"
+        :font-weight "700"}))
+
+(def composer-class
+  (css {:display "grid"
+        :gap "12px"}))
+
+(def input-class
+  (css {:width "100%"
+        :padding "14px 16px"
+        :border-radius "16px"
+        :border "1px solid rgba(37,45,61,0.12)"
+        :background "#fff"
+        :font-size "15px"
+        :color "#1d2433"
+        :outline "none"
+        "&:focus" {:border-color "#c7522a"
+                   :box-shadow "0 0 0 4px rgba(199,82,42,0.12)"}}))
+
+(def button-row-class
+  (css {:display "flex"
+        :flex-wrap "wrap"
+        :gap "10px"}))
+
+(def primary-button-class
+  (css {:padding "12px 16px"
+        :border "none"
+        :border-radius "16px"
+        :background "linear-gradient(135deg, #c7522a 0%, #df7c32 100%)"
+        :color "#fff"
+        :font-size "14px"
+        :font-weight "700"
+        :cursor "pointer"
+        :box-shadow "0 10px 24px rgba(199,82,42,0.24)"
+        "&:hover" {:filter "brightness(1.03)"}}))
+
+(def subtle-button-class
+  (css {:padding "12px 16px"
+        :border-radius "16px"
+        :border "1px solid rgba(37,45,61,0.12)"
+        :background "rgba(255,255,255,0.8)"
+        :color "#1d2433"
+        :font-size "14px"
+        :font-weight "600"
+        :cursor "pointer"
+        "&:hover" {:background "#fff"}}))
+
+(def list-class
+  (css {:display "grid"
+        :gap "12px"
+        :padding "0"
+        :margin "0"
+        :list-style "none"}))
+
+(def task-class
+  (css {:display "grid"
+        :grid-template-columns "auto 1fr auto"
+        :align-items "center"
+        :gap "12px"
+        :padding "14px 16px"
+        :border-radius "18px"
+        :background "#fffdf9"
+        :border "1px solid rgba(37,45,61,0.08)"}))
+
+(def task-done-class
+  (css {:background "rgba(225, 241, 230, 0.88)"
+        :border-color "rgba(86, 139, 92, 0.24)"}))
+
+(def icon-button-class
+  (css {:display "inline-flex"
+        :align-items "center"
+        :justify-content "center"
+        :width "36px"
+        :height "36px"
+        :border-radius "999px"
+        :border "1px solid rgba(37,45,61,0.12)"
+        :background "#fff"
+        :cursor "pointer"
+        :font-size "14px"
+        "&:hover" {:border-color "#c7522a"
+                   :color "#c7522a"}}))
+
+(def task-title-class
+  (css {:font-size "15px"
+        :font-weight "600"
+        :line-height "1.4"}))
+
+(def task-title-done-class
+  (css {:color "#5b6475"
+        :text-decoration "line-through"}))
+
+(def task-meta-class
+  (css {:font-size "12px"
+        :font-weight "700"
+        :letter-spacing "0.08em"
+        :text-transform "uppercase"
+        :color "#7b5b4a"}))
+
+(def empty-state-class
+  (css {:padding "18px"
+        :border-radius "18px"
+        :background "rgba(255,255,255,0.72)"
+        :border "1px dashed rgba(37,45,61,0.16)"
+        :color "#5b6475"}))
+
+(def about-list-class
+  (css {:display "grid"
+        :gap "10px"
+        :padding-left "18px"
+        :margin "12px 0 0"}))
+
+(def code-pill-class
+  (css {:display "inline-flex"
+        :align-items "center"
+        :padding "4px 8px"
+        :border-radius "999px"
+        :background "rgba(29,36,51,0.08)"
+        :font-size "13px"
+        :font-family "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace"}))
+
+;; --- Helpers --------------------------------------------------------------
+
+(define (task-id-from-event ev)
+  (-> ev dom/event-target (dom/get-attribute "data-id") string->number))
+
+(define (current-page-title)
+  (cond
+    ((equal? @current-page "active-page") "Active tasks")
+    ((equal? @current-page "completed-page") "Completed tasks")
+    ((equal? @current-page "about-page") "Build notes")
+    (else "Overview")))
+
+(define (nav-button label handler-name page-name)
+  [:button
+    {:class (if (equal? @current-page page-name)
+                (string-append nav-button-class " " nav-button-active-class)
+                nav-button-class)
+     :on-click handler-name}
+    label])
+
+(define (stat-card label value)
+  [:div {:class stat-class}
+    [:div {:class stat-label-class} label]
+    [:div {:class stat-value-class} value]])
+
+(define (task-row task)
+  [:li {:class (if (:done task)
+                   (string-append task-class " " task-done-class)
+                   task-class)}
+    [:button
+      {:class icon-button-class
+       :data-id (number->string (:id task))
+       :on-click "toggle-task"
+       :title (if (:done task) "Mark as active" "Mark as done")}
+      (if (:done task) "✓" "○")]
+    [:div
+      [:div {:class (if (:done task)
+                        (string-append task-title-class " " task-title-done-class)
+                        task-title-class)}
+        (:text task)]
+      [:div {:class task-meta-class}
+        (if (:done task) "Completed" "Open")]]
+    [:button
+      {:class icon-button-class
+       :data-id (number->string (:id task))
+       :on-click "remove-task"
+       :title "Remove task"}
+      "×"]])
+
+;; --- Actions --------------------------------------------------------------
+
+(define (set-draft ev)
+  (put! draft (dom/event-value ev)))
+
+(define (maybe-add-task ev)
+  (when (equal? (dom/event-key ev) "Enter")
+    (add-task ev)))
+
+(define (add-task ev)
+  (let ((text (string/trim @draft)))
+    (when (> (string/length text) 0)
+      (let ((id @next-id))
+        (batch
+          (update! tasks
+            (fn (items)
+              (append items (list {:id id :text text :done false}))))
+          (update! next-id (fn (n) (+ n 1)))
+          (put! draft ""))))))
+
+(define (toggle-task ev)
+  (let ((id (task-id-from-event ev)))
+    (update! tasks
+      (fn (items)
+        (map
+          (fn (task)
+            (if (equal? (:id task) id)
+                (assoc task :done (not (:done task)))
+                task))
+          items)))))
+
+(define (remove-task ev)
+  (let ((id (task-id-from-event ev)))
+    (update! tasks
+      (fn (items)
+        (filter
+          (fn (task) (not (equal? (:id task) id)))
+          items)))))
+
+(define (clear-completed ev)
+  (update! tasks
+    (fn (items)
+      (filter (fn (task) (not (:done task))) items))))
+
+(define (go-home ev)
+  (router/push! "/"))
+
+(define (go-active ev)
+  (router/push! "/active"))
+
+(define (go-completed ev)
+  (router/push! "/completed"))
+
+(define (go-about ev)
+  (router/push! "/about"))
+
+;; --- Views ----------------------------------------------------------------
+
+(define (summary-panel)
+  [:section {:class card-class}
+    [:h2 {:class section-title-class} "Application state"]
+    [:p {:class section-copy-class}
+      "The cards below are computed from signal state. Route changes and task updates re-render the UI automatically."]
+    [:div {:class stats-grid-class}
+      (stat-card "Total" @total-count)
+      (stat-card "Open" @remaining-count)
+      (stat-card "Done" @completed-count)]])
+
+(define (composer-panel)
+  [:section {:class card-class}
+    [:h2 {:class section-title-class} "Capture work"]
+    [:p {:class section-copy-class}
+      "Tasks persist through browser storage. Type a task, press Enter, or use the button."]
+    [:div {:class composer-class}
+      [:input {:class input-class
+               :value @draft
+               :placeholder "Add a task for the next release..."
+               :on-input "set-draft"
+               :on-keydown "maybe-add-task"}]
+      [:div {:class button-row-class}
+        [:button {:class primary-button-class :on-click "add-task"} "Add task"]
+        [:button {:class subtle-button-class :on-click "clear-completed"} "Clear completed"]]]])
+
+(define (task-list-panel)
+  [:section {:class card-class}
+    [:h2 {:class section-title-class} (current-page-title)]
+    [:p {:class section-copy-class}
+      (if (equal? @current-page "about-page")
+          "This route documents the compiled archive workflow."
+          "The router controls which subset of persisted tasks you see.")]
+    (if (equal? @current-page "about-page")
+        [:div
+          [:p {:class section-copy-class}
+            "Recommended production flow:"]
+          [:ol {:class about-list-class}
+            [:li "Write your UI in " [:span {:class code-pill-class} "app.sema"]]
+            [:li "Load it in development with " [:span {:class code-pill-class} "<script type=\"text/sema\" src=\"/app.sema\">"]]
+            [:li "Build a compiled archive with " [:span {:class code-pill-class} "sema build --target web"]]
+            [:li "Deploy the resulting " [:span {:class code-pill-class} "app.vfs"] " with the same HTML shape"]]
+          [:p {:class section-copy-class}
+            "This repository example uses "
+            [:span {:class code-pill-class} "make sema-web-example"]
+            " to build the archive and serve it locally."]]
+        (if (= (length @visible-tasks) 0)
+            [:div {:class empty-state-class}
+              (if (= @total-count 0)
+                  "No tasks yet. Add one above to see reactive rendering, storage persistence, and routing in action."
+                  "No tasks match this route yet. Try another tab or add more work.")]
+            [:ul {:class list-class}
+              (map task-row @visible-tasks)]))])
+
+;; --- Root component -------------------------------------------------------
+
+(defcomponent app-shell ()
+  (on-mount
+    (fn ()
+      (let ((task-watch
+              (watch tasks
+                (fn (old new)
+                  (store/set! task-storage-key new))))
+            (next-id-watch
+              (watch next-id
+                (fn (old new)
+                  (store/set! next-id-storage-key new)))))
+        (fn ()
+          (unwatch! task-watch)
+          (unwatch! next-id-watch)))))
+
+  [:div {:class shell-class}
+    [:section {:class hero-class}
+      [:div {:class badge-class} "Compiled archive"]
+      [:h2 {:class title-class} "Release planner"]
+      [:p {:class copy-class}
+        "A production-style Sema Web app with routing, persistence, scoped CSS, and compiled deployment. In development you can point the same HTML at "
+        [:span {:class code-pill-class} "app.sema"]
+        "; in production it loads "
+        [:span {:class code-pill-class} "dist/app.vfs"] "."]
+      [:div {:class nav-class}
+        (nav-button "Overview" "go-home" "overview-page")
+        (nav-button "Active" "go-active" "active-page")
+        (nav-button "Completed" "go-completed" "completed-page")
+        (nav-button "Build Notes" "go-about" "about-page")]]
+    [:div {:class grid-class}
+      [:div {:class column-class}
+        (summary-panel)
+        (composer-panel)]
+      [:div {:class column-class}
+        (task-list-panel)]]])
+
+(mount! "#app" "app-shell")

@@ -1,0 +1,71 @@
+{
+  "name": "@sema-lang/sema-web",
+  "version": "1.9.0",
+  "description": "Sema as an embedded web scripting language — DOM bindings, store API, and <script type=\"text/sema\"> support",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    }
+  },
+  "files": [
+    "dist/",
+    "README.md"
+  ],
+  "sideEffects": false,
+  "scripts": {
+    "bench": "tsx bench/perf.ts",
+    "bench:browser": "playwright test -c bench/browser/playwright.bench.config.ts --workers=1 --reporter=line",
+    "build": "tsup",
+    "test": "vitest run",
+    "test:coverage": "vitest run --coverage",
+    "test:watch": "vitest",
+    "test:e2e": "playwright test",
+    "prepublishOnly": "npm run build"
+  },
+  "dependencies": {
+    "@preact/signals-core": "^1.14.0",
+    "@sema-lang/sema": "^1.9.0",
+    "morphdom": "^2.7.8"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.58.2",
+    "@vitest/coverage-v8": "^4.1.2",
+    "@vitest/ui": "^4.1.2",
+    "jsdom": "^29.0.1",
+    "tsup": "^8.5.1",
+    "tsx": "^4.22.4",
+    "typescript": "^5.7.0",
+    "vite": "^8.0.3",
+    "vitest": "^4.1.2"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/HelgeSverre/sema",
+    "directory": "packages/sema-web"
+  },
+  "homepage": "https://sema-lang.com",
+  "keywords": [
+    "sema",
+    "lisp",
+    "web",
+    "dom",
+    "scripting",
+    "wasm",
+    "webassembly",
+    "embedded",
+    "scripting-engine",
+    "reactive"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "author": {
+    "name": "Helge Sverre",
+    "url": "https://helgesver.re"
+  }
+}

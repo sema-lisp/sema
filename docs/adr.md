@@ -743,6 +743,82 @@ The bytecode lowerer is scope-free — it resolves a special form from a call's 
 
 This lands on the **Common Lisp / Clojure** model (special operators are reserved in operator position; their value namespace is irrelevant here since Sema is a Lisp-1), not Scheme's. Regular non-special-form names — including builtin *functions* like `list`/`map`/`filter` — still shadow freely. See `docs/limitations.md` #36; regression tests `reserved_*` / `shadow_builtin_*` in `eval_test.rs`.
 
+### 66. CORE-2 memory strategy: synchronous Bacon–Rajan cycle collection over the existing `Rc` heap
+
+Self-referential closures form `Rc` cycles that reference counting never reclaims
+(CORE-2). Three confirmed shapes, all measured (`crates/sema/tests/leak_test.rs`):
+a recursive **local** closure's self-capture upvalue cell (260 B leaked per creation —
+the shape long-running agents hit every turn), the `Env ⇄ Closure` cycle through
+`Closure::globals` that every top-level fn `define` creates (~168 KB — the *entire*
+global env — leaked per `Interpreter` teardown), and ~11 `__vm-*`/tool/agent delegate
+builtins whose boxed `Fn` strongly captures the env they are registered into (~166 KB
+per teardown with zero user code).
+
+**Decision:** two-part fix, designed in `docs/plans/2026-07-02-core2-gc.md`:
+
+1. **Delegate captures become `Weak<Env>`** (they are host infrastructure only callable
+   *through* the env that owns them), establishing the invariant that a `NativeFn`'s
+   boxed closure must never strongly capture anything that can hold a `Value`/`Env` —
+   traceable state belongs in `NativeFn.payload`.
+2. **A synchronous Bacon–Rajan cycle collector** (the published algorithm PHP ships; we
+   use a creation-time candidate registry instead of PHP/CPython's decrement buffer —
+   possible because Sema's cycle-birth sites are a small closed set of cold
+   constructors: `MakeClosure`, env adoption, and `delay`/promise/`channel`/`defmulti`
+   for closure-free data cycles) over the **unchanged** `Rc` heap. Candidates are
+   `Weak`-registered at creation; collection trial-deletes candidate subgraphs using
+   `Rc::strong_count` + a transient side map (no headers, no color bits — NaN-boxing
+   untouched), and reclaims garbage cycles by **severing** the mutable cell every cycle
+   must pass through (`Env.bindings`, `UpvalueCell`, `Thunk.forced`, promise/channel/
+   multimethod cells), letting ordinary `Rc` drops cascade. No root enumeration is
+   needed — Rust-stack/VM-stack references surface as unaccounted strong counts, which
+   is what makes a tracing collector *feasible* here at all. Safe points: REPL/notebook/
+   agent-turn boundaries, `Interpreter::drop`, `(gc)`, plus a registry-growth threshold.
+
+**Alternatives rejected** (full analysis in the plan): decrement-buffered trial deletion
+(taxes `Value::drop` — the hottest path — and misses the Env shape, whose teardown never
+drops a `Value`); full tracing mark-sweep with GC handles (root enumeration across
+hundreds of stdlib natives holding `Value`s on the Rust stack is intractable; ~25-type
+handle migration); per-turn region reclamation (unsound without exactly the reachability
+analysis a collector does); `Weak` self-capture revisited (fixes only direct
+self-recursion — mutual recursion, `set!` cycles, data cycles, and the Env shape all
+still leak; the prior attempt already broke `vm_module_test`); off-the-shelf GC crates
+(`gc`, `bacon_rajan_cc` replace `Rc` wholesale and can't round-trip the NaN-box's
+`into_raw >> 3` encoding or trace `Rc<dyn Any>` payloads).
+
+Costs land only where long-running agents live: one `Weak` registration per closure
+creation (~ns, amortized by the four allocations `make_closure` already does; closures
+that capture zero upvalues — every plain top-level `define` — are exempt entirely,
+covered by their home env's wrapper candidate), zero change to `Value::drop`/call
+dispatch/`Rc` semantics, collection pauses bounded by candidate subgraphs (pinned
+session roots are not descended into). The perf gate (M4) splits by what a benchmark
+measures. **Bookkeeping tax** — workloads whose garbage is acyclic or whose closures
+stay live (`closure-storm`, `upvalue-counter`, `higher-order-fold`, the `numeric`
+suite): ≤2% mean regression vs the pre-collector baseline, hard gate. **Price of
+collection** — `recursive-closure-churn`, where every iteration births a garbage
+cycle: the pre-collector baseline *leaks* all of them (it does zero reclamation
+work), so this benchmark measures the cost of reclamation itself, not overhead on
+unchanged work, and a %-of-baseline budget mis-models it. Its criteria: ≤350 ns per
+reclaimed cycle (hard ceiling 1 µs), wall time ≤2.5× the leaking baseline, and the
+churn leak oracle stays green (memory bounded mid-eval — collection stays on the
+`make_closure` registry-growth threshold path). A benchmark's bucket is decided by
+measured collector activity (`gc/stats`), not suite label; zero-activity numeric
+deltas <1.5% are accepted as code-layout noise. M4 formal gate PASSED (Apple Silicon,
+release, order-balanced hyperfine A/B vs the pre-collector baseline): storm +1.4%,
+upvalue-counter +0.1%, fold +1.6%; churn 326 ns/reclaimed cycle at 1.73× wall (1M
+iters: 325 ns, 1.83×; RSS 303.7 MB unbounded → 16.0 MB bounded); nqueens +0.35% and
+deriv −0.05% within noise; tak +0.92% with `gc/stats` all-zero (layout noise);
+mandelbrot +12.1% sits in the price-of-collection bucket — its named-`let` loops
+birth a self-recursive closure (a CORE-2 cycle) per loop entry, ~7k cycles reclaimed
+per run, and the pre-collector baseline leaks on it (100-rep same-shape run: 144.8 MB
+growing linearly vs 16.8 MB flat), so the +12% is reclamation work the baseline never
+did, far under churn's accepted per-cycle/wall ceilings. Eliminating that closure
+birth entirely (compile named-let self-recursion without self-capture) is issue #62.
+The strong-reference graph user code sees is
+unchanged, so the module-exports-fn-calls-private-helper pattern (`vm_module_test`,
+the regression that killed the earlier `Weak`-env attempt) holds by construction.
+Acceptance oracles: three `#[ignore]`d leak-bound tests in
+`crates/sema/tests/leak_test.rs` that flip green as each part lands.
+
 ### 67. LLM dynamic scope (cache / budget / tags) is captured per async task (PROPOSED)
 
 Status: **proposed 2026-07-02** — closes deferred item **ASYNC-1**. Plan:

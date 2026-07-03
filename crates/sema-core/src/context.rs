@@ -15,6 +15,7 @@ pub type CallCallbackFn = fn(&EvalContext, &Value, &[Value]) -> Result<Value, Se
 
 pub struct EvalContext {
     pub module_cache: RefCell<BTreeMap<PathBuf, BTreeMap<String, Value>>>,
+    pub embedded_files: RefCell<BTreeMap<PathBuf, Vec<u8>>>,
     pub current_file: RefCell<Vec<PathBuf>>,
     pub module_exports: RefCell<Vec<Option<Vec<String>>>>,
     pub module_load_stack: RefCell<Vec<PathBuf>>,
@@ -38,10 +39,25 @@ pub struct EvalContext {
     pub interactive: Cell<bool>,
 }
 
+/// RAII guard for a module-load scope: pops the load stack when dropped, so the
+/// stack stays balanced on every exit path (early return, `?`, panic). Created
+/// by [`EvalContext::enter_module_load`].
+pub struct ModuleLoadGuard<'a> {
+    ctx: &'a EvalContext,
+    path: PathBuf,
+}
+
+impl Drop for ModuleLoadGuard<'_> {
+    fn drop(&mut self) {
+        self.ctx.end_module_load(&self.path);
+    }
+}
+
 impl EvalContext {
     pub fn new() -> Self {
         EvalContext {
             module_cache: RefCell::new(BTreeMap::new()),
+            embedded_files: RefCell::new(BTreeMap::new()),
             current_file: RefCell::new(Vec::new()),
             module_exports: RefCell::new(Vec::new()),
             module_load_stack: RefCell::new(Vec::new()),
@@ -65,6 +81,7 @@ impl EvalContext {
     pub fn new_with_sandbox(sandbox: Sandbox) -> Self {
         EvalContext {
             module_cache: RefCell::new(BTreeMap::new()),
+            embedded_files: RefCell::new(BTreeMap::new()),
             current_file: RefCell::new(Vec::new()),
             module_exports: RefCell::new(Vec::new()),
             module_load_stack: RefCell::new(Vec::new()),
@@ -112,6 +129,26 @@ impl EvalContext {
         self.module_cache.borrow_mut().insert(path, exports);
     }
 
+    pub fn clear_module_cache(&self) {
+        self.module_cache.borrow_mut().clear();
+    }
+
+    pub fn embedded_file_exists(&self, path: &PathBuf) -> bool {
+        self.embedded_files.borrow().contains_key(path)
+    }
+
+    pub fn get_embedded_file(&self, path: &PathBuf) -> Option<Vec<u8>> {
+        self.embedded_files.borrow().get(path).cloned()
+    }
+
+    pub fn set_embedded_file(&self, path: PathBuf, bytes: Vec<u8>) {
+        self.embedded_files.borrow_mut().insert(path, bytes);
+    }
+
+    pub fn clear_embedded_files(&self) {
+        self.embedded_files.borrow_mut().clear();
+    }
+
     pub fn set_module_exports(&self, names: Vec<String>) {
         let mut stack = self.module_exports.borrow_mut();
         if let Some(top) = stack.last_mut() {
@@ -127,7 +164,15 @@ impl EvalContext {
         self.module_exports.borrow_mut().pop().flatten()
     }
 
-    pub fn begin_module_load(&self, path: &PathBuf) -> Result<(), SemaError> {
+    /// Enter a module-load scope, guarding against import/load cycles. The
+    /// returned [`ModuleLoadGuard`] pops the load stack when dropped, keeping it
+    /// balanced on any exit path. Errors if `path` is already being loaded.
+    pub fn enter_module_load(&self, path: PathBuf) -> Result<ModuleLoadGuard<'_>, SemaError> {
+        self.begin_module_load(&path)?;
+        Ok(ModuleLoadGuard { ctx: self, path })
+    }
+
+    fn begin_module_load(&self, path: &PathBuf) -> Result<(), SemaError> {
         let mut stack = self.module_load_stack.borrow_mut();
         if let Some(pos) = stack.iter().position(|p| p == path) {
             let mut cycle: Vec<String> = stack[pos..]
@@ -144,7 +189,7 @@ impl EvalContext {
         Ok(())
     }
 
-    pub fn end_module_load(&self, path: &PathBuf) {
+    fn end_module_load(&self, path: &PathBuf) {
         let mut stack = self.module_load_stack.borrow_mut();
         if matches!(stack.last(), Some(last) if last == path) {
             stack.pop();

@@ -203,6 +203,8 @@ impl VmSpan {
     pub fn set_str(&self, _key: &'static str, _val: &str) {}
 }
 
+pub fn gc_pass_span(_event: &sema_core::GcPassEvent) {}
+
 pub fn add_event(_name: &str, _attrs: Vec<(String, String)>) {}
 
 // Sema-native tracing surface — inert on wasm.

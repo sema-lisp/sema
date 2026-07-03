@@ -1707,3 +1707,113 @@ fn test_middleware_logging() {
     child.kill().ok();
     child.wait().ok();
 }
+
+#[test]
+#[ignore] // requires network (binds localhost sockets)
+fn test_http_serve_port_fallback_and_on_listen() {
+    use std::io::{BufRead, BufReader};
+    use std::process::{Command, Stdio};
+    use std::time::Duration;
+
+    // Occupy the target port with a plain (no-fallback) server.
+    let mut occupier = Command::new(env!("CARGO_BIN_EXE_sema"))
+        .arg("-e")
+        .arg(r#"(http/serve (fn (req) (http/ok "a")) {:port 19910})"#)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("Failed to spawn occupier");
+    std::thread::sleep(Duration::from_millis(1200));
+
+    // A second server requests the same port with :port-fallback + :on-listen.
+    // It must land on a different port and report it via the callback.
+    let mut child = Command::new(env!("CARGO_BIN_EXE_sema"))
+        .arg("-e")
+        .arg(
+            r#"(http/serve (fn (req) (http/ok "b"))
+                  {:port 19910
+                   :port-fallback true
+                   :on-listen (fn (info)
+                     (println (string-append "BOUND:" (number->string (:port info)))))})"#,
+        )
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("Failed to spawn fallback server");
+
+    // Read the reported port from the on-listen callback's stdout line.
+    let stdout = child.stdout.take().expect("piped stdout");
+    let mut bound_port: Option<u16> = None;
+    for line in BufReader::new(stdout).lines() {
+        let line = line.unwrap_or_default();
+        if let Some(rest) = line.strip_prefix("BOUND:") {
+            bound_port = rest.trim().parse::<u16>().ok();
+            break;
+        }
+    }
+
+    let bound_port = bound_port.expect("fallback server should report a bound port");
+    assert_ne!(
+        bound_port, 19910,
+        "fallback must not reuse the occupied port"
+    );
+    assert!(
+        bound_port > 19910,
+        "fallback advances upward from the start port"
+    );
+
+    // Prove the fallback server actually serves on the new port.
+    let client = reqwest::blocking::Client::new();
+    let resp = client
+        .get(format!("http://127.0.0.1:{bound_port}/"))
+        .timeout(Duration::from_secs(5))
+        .send()
+        .expect("request to fallback port");
+    assert_eq!(resp.status(), 200);
+
+    child.kill().ok();
+    child.wait().ok();
+    occupier.kill().ok();
+    occupier.wait().ok();
+}
+
+#[test]
+#[ignore] // requires network (binds localhost sockets)
+fn test_http_serve_without_fallback_fails_on_taken_port() {
+    use std::process::{Command, Stdio};
+    use std::time::Duration;
+
+    // Occupy the port.
+    let mut occupier = Command::new(env!("CARGO_BIN_EXE_sema"))
+        .arg("-e")
+        .arg(r#"(http/serve (fn (req) (http/ok "a")) {:port 19912})"#)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("Failed to spawn occupier");
+    std::thread::sleep(Duration::from_millis(1200));
+
+    // Without fallback, binding the taken port must fail fast (opt-in contract).
+    let output = Command::new(env!("CARGO_BIN_EXE_sema"))
+        .arg("-e")
+        .arg(r#"(http/serve (fn (req) (http/ok "b")) {:port 19912})"#)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("Failed to spawn second server")
+        .wait_with_output()
+        .expect("second server should exit, not hang");
+
+    assert!(
+        !output.status.success(),
+        "http/serve on a taken port without fallback must error"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr).to_lowercase();
+    assert!(
+        stderr.contains("bind") || stderr.contains("in use") || stderr.contains("address"),
+        "error should mention the bind failure, got: {stderr}"
+    );
+
+    occupier.kill().ok();
+    occupier.wait().ok();
+}

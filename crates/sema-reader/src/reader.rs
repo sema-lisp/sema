@@ -160,6 +160,17 @@ impl Parser {
                 })?;
                 self.make_list_with_span(vec![Value::symbol("unquote-splicing"), inner], span)
             }
+            Some(Token::Deref) => {
+                self.advance();
+                let inner = self.parse_expr().map_err(|_| {
+                    SemaError::Reader {
+                        message: "deref (@) requires an expression after it".to_string(),
+                        span,
+                    }
+                    .with_hint("e.g. @x or @(atom)")
+                })?;
+                self.make_list_with_span(vec![Value::symbol("deref"), inner], span)
+            }
             Some(Token::BytevectorStart) => self.parse_bytevector(),
             Some(Token::ShortLambdaStart) => self.parse_short_lambda(),
             Some(_) => {
@@ -413,7 +424,11 @@ impl Parser {
                     depth -= 1;
                 }
                 // Quote-like prefixes at depth 0 could start a new form
-                Token::Quote | Token::Quasiquote | Token::Unquote | Token::UnquoteSplice => {
+                Token::Quote
+                | Token::Quasiquote
+                | Token::Unquote
+                | Token::UnquoteSplice
+                | Token::Deref => {
                     if depth == 0 {
                         return;
                     }
@@ -564,6 +579,7 @@ fn token_display(tok: &Token) -> &'static str {
         Token::Quasiquote => "`",
         Token::Unquote => ",",
         Token::UnquoteSplice => ",@",
+        Token::Deref => "@",
         Token::Dot => ".",
         Token::BytevectorStart => "#u8(",
         Token::Int(_) => "integer",
@@ -1157,6 +1173,70 @@ mod tests {
     }
 
     #[test]
+    fn test_read_deref_at_eof() {
+        assert!(read("@").is_err());
+    }
+
+    #[test]
+    fn test_read_deref_symbol() {
+        let result = read("@x").unwrap();
+        assert_eq!(
+            result,
+            Value::list(vec![Value::symbol("deref"), Value::symbol("x")])
+        );
+    }
+
+    #[test]
+    fn test_read_deref_longer_symbol() {
+        let result = read("@count").unwrap();
+        assert_eq!(
+            result,
+            Value::list(vec![Value::symbol("deref"), Value::symbol("count")])
+        );
+    }
+
+    #[test]
+    fn test_read_deref_list() {
+        let result = read("@(+ 1 2)").unwrap();
+        assert_eq!(
+            result,
+            Value::list(vec![
+                Value::symbol("deref"),
+                Value::list(vec![Value::symbol("+"), Value::int(1), Value::int(2),])
+            ])
+        );
+    }
+
+    #[test]
+    fn test_read_deref_in_list() {
+        let result = read("(list @a @b)").unwrap();
+        assert_eq!(
+            result,
+            Value::list(vec![
+                Value::symbol("list"),
+                Value::list(vec![Value::symbol("deref"), Value::symbol("a")]),
+                Value::list(vec![Value::symbol("deref"), Value::symbol("b")]),
+            ])
+        );
+    }
+
+    #[test]
+    fn test_read_unquote_splice_not_affected_by_deref() {
+        // Verify ,@ still works as unquote-splicing
+        let result = read("`(a ,@b)").unwrap();
+        assert_eq!(
+            result,
+            Value::list(vec![
+                Value::symbol("quasiquote"),
+                Value::list(vec![
+                    Value::symbol("a"),
+                    Value::list(vec![Value::symbol("unquote-splicing"), Value::symbol("b")]),
+                ])
+            ])
+        );
+    }
+
+    #[test]
     fn test_read_comment_after_expr() {
         assert_eq!(read_many("42 ; comment").unwrap(), vec![Value::int(42)]);
     }
@@ -1240,7 +1320,6 @@ mod tests {
 
     #[test]
     fn test_read_unexpected_char() {
-        assert!(read("@").is_err());
         assert!(read("$").is_err());
     }
 

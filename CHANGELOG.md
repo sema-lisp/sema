@@ -4,6 +4,60 @@
 
 ### Added
 
+- **Sema Web — run Sema apps in the browser.** The new `@sema-lang/sema-web`
+  package embeds the WASM VM in the browser with reactive state
+  (`state`/`computed`/`watch`), SIP markup (hiccup-style vectors), a component
+  system (`defcomponent`/`mount!`), and `dom/*`, `store/*`, `router/*`, `css/*`,
+  and browser `llm/*` namespaces. `@sema-lang/llm-proxy` ships drop-in Vercel /
+  Netlify / Cloudflare / Node adapters so browser `llm/*` calls reach real
+  providers with server-side keys. See the
+  [Sema Web guide](https://sema-lang.com/docs/web/).
+- **`sema web` — zero-config dev server.** `sema web app.sema` serves an app in
+  the browser with no bundler and no `npm install`: it embeds the browser runtime
+  (WASM VM + JS bundle) in the binary, serves your app, hot-reloads on file
+  change, and proxies `llm/*` to real providers using your environment keys.
+  Multi-file apps (that `import` other modules) are compiled to a `.vfs` on the
+  fly and resolve automatically, and a browser error overlay surfaces Sema errors
+  on the page. Options: `--port`, `--host`, `--no-open`, `--no-llm`. See the
+  [Dev Server guide](https://sema-lang.com/docs/web/dev-server).
+- **Automatic port fallback for `http/serve`.** Pass `{:port-fallback true}` and
+  a taken port advances to the next free one instead of failing;
+  `{:on-listen (fn (info) …)}` reports the bound `{:host :port :url}` (handy for
+  printing a URL or opening a browser). Off by default (backward-compatible); the
+  notebook server opts in. See the
+  [Web Server docs](https://sema-lang.com/docs/stdlib/web-server).
+- **CORE-2 fixed: cycle-collecting garbage collector.** Sema now reclaims reference
+  cycles — a synchronous Bacon–Rajan cycle collector (ADR #66; design + measurements
+  in `docs/plans/2026-07-02-core2-gc.md`) runs over the existing `Rc` heap with a
+  creation-time candidate registry, reclaiming garbage cycles by severing the one
+  mutable cell every Sema cycle must pass through (env bindings, upvalue cell, thunk
+  `forced`, promise state, channel buffer, multimethod table) and letting ordinary
+  `Rc` drops cascade. What users get: **long-lived sessions stop leaking** — REPL,
+  notebook server, HTTP/MCP servers, and long-running agents that define recursive
+  local helpers every turn (previously 260 B leaked per recursive closure, forever)
+  now stay memory-bounded, and **interpreter teardown frees everything** (previously
+  every `Interpreter` drop leaked its entire global env, ~168 KB, even with zero
+  user code — fatal for embedders and notebook kernel resets). Measured by the
+  counting-allocator oracles in `crates/sema/tests/leak_test.rs` (all seven green):
+  recursive-closure churn 260 B/iter → ~0 (bounded); teardown ~168 KB/drop → 0 B/drop
+  (no defines, macro-injected consts, module imports) and bounded with user defines;
+  1M-iteration churn RSS 303.7 MB → 16.0 MB. Collection runs at safe points (closure/
+  data-birth registry threshold, top-level eval return, notebook cell + kernel reset,
+  agent-turn boundary, scheduler idle, `Interpreter::drop`) plus on demand via the new
+  **`gc/collect` and `gc/stats` builtins** and the REPL `,gc` command. Perf gate
+  (interleaved hyperfine A/B vs the pre-collector baseline): closure bookkeeping
+  ≤1.6% on storm/upvalue-counter/fold; numeric within noise (tak's +0.9% shows
+  all-zero `gc/stats` — layout noise); reclamation costs ~326 ns per collected cycle
+  at 1.73× the *leaking* baseline's wall time on the churn canary; mandelbrot pays
+  +12% because its named-`let` loops birth a real cycle per entry — the baseline
+  leaks on it, and issue #62 (self-tail-call optimization) is the planned
+  elimination. Load-bearing invariant established in M1 (AGENTS.md, I2): a
+  `NativeFn`'s boxed closure must never strongly capture anything that can
+  transitively hold a `Value`/`Env` — traceable state belongs in `NativeFn.payload`;
+  the ~11 `__vm-*`/tool/agent delegates now capture their home env `Weak`. No object
+  headers, no color bits, no change to `Value`'s NaN-boxing, `Value::drop`, or the
+  strong-reference graph user code sees.
+
 - **`otel/configure` — turn on tracing from Sema code.** Telemetry no longer
   needs environment variables: `(otel/configure {:endpoint "..." :key "sk_..."})`
   points Sema at an OTLP backend (or a JSONL file via `:file`) from inside a
@@ -113,6 +167,19 @@
 
 ### Fixed
 
+- **`llm/stream` over `http/stream` streams progressively without panicking.**
+  The SSE channel was bounded and used a blocking send, which panicked ("cannot
+  block the current thread from within a runtime") when a handler fed tokens from
+  inside a provider's async runtime. It is now an unbounded, non-blocking channel,
+  so LLM tokens flow to the client as they arrive. WebSocket/file/raw responses
+  are unchanged.
+- **Robust module/import resolution in embedded and `.vfs` contexts.** Imports
+  written `./x`, `../x`, subdirectory, and nested-relative paths now resolve
+  correctly from a `sema build` standalone binary or a browser `.vfs` archive —
+  previously only an exact plain relative key matched, so multi-file apps broke
+  once bundled. Every spelling of a module normalizes to one key (so diamonds
+  dedup to a single evaluation), and a circular `(load ...)` now errors gracefully
+  instead of overflowing the stack.
 - **Conversation cost/usage is real, not estimated.** `conversation/say` now
   folds each turn's actual provider `usage` into the conversation, so
   `conversation/cost` and `conversation/stats` report the billed token/cost sum.

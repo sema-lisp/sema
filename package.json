@@ -1,0 +1,9 @@
+{
+  "private": true,
+  "workspaces": ["packages/*"],
+  "scripts": {
+    "build:wasm": "wasm-pack build crates/sema-wasm --target web --out-dir ../../packages/sema-wasm/pkg",
+    "build": "npm run build --workspaces --if-present",
+    "test": "npm test --workspaces --if-present"
+  }
+}

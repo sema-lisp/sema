@@ -1,0 +1,10 @@
+{
+  "name": "@sema-lang/sema-wasm",
+  "version": "1.9.0",
+  "type": "module",
+  "main": "./pkg/sema_wasm.js",
+  "types": "./pkg/sema_wasm.d.ts",
+  "files": ["pkg/"],
+  "publishConfig": { "access": "public" },
+  "sideEffects": false
+}

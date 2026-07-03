@@ -52,6 +52,7 @@ Dependency flow (arrows = "depends on"): `sema-core ← sema-reader ← sema-vm 
 - **Callback architecture** — Stdlib higher-order functions (map, filter, foldl, sort-by) call through `sema_core::call_callback`, which dispatches to the real evaluator via a thread-local callback registered at interpreter startup. No mini-eval — all evaluation goes through the full evaluator.
 - **Module system (EvalContext)** — `module_cache`, `current_file` (stack), `module_exports` are fields in `EvalContext` (`sema-core/src/context.rs`), threaded through the evaluator as `ctx: &EvalContext`. Modules identified by canonical file path. Module env is a child of the root env (gets builtins, not caller bindings). Paths resolve relative to the current file.
 - **Keywords as functions** — `(:name person)` works like `(get person :name)`, handled in `eval_step` when a `Value::Keyword` appears in head position.
+- **Invariant I2 (CORE-2 GC)** — a `NativeFn`'s boxed closure must not strongly capture anything that can transitively hold a `Value` or `Env` (that would form an uncollectable cycle the collector cannot trace). Traceable state belongs in `NativeFn.payload` (traced via a registered payload tracer); host infrastructure (e.g. the `__vm-*` delegates) captures `Weak` and upgrades at call time. See `docs/plans/2026-07-02-core2-gc.md` §2.
 
 ## Code Style
 
@@ -129,7 +130,7 @@ Hard-won conventions — follow these or you will reintroduce shipped bugs (see 
 
 ## Website
 
-- Hosted at **sema-lang.com**, deployed via `cd website && vercel --prod`
+- Hosted at **sema-lang.com**, deployed via `cd website && vercel --prod`. The Vercel CLI is **not** a repo dependency (it bundled a large vulnerable transitive subtree and nothing in CI/build/scripts used it) — install it globally (`npm i -g vercel`) or run it via `npx vercel --prod`.
 - **Deploy gotcha (monorepo):** the Vercel project is CLI-deployed and **uploads only `website/`** — so any `import` in the site that reaches *outside* `website/` (e.g. `../../../ui/dist/...` or `../../../examples/...`) builds locally but **fails on Vercel** ("No such file or directory"). Keep all site imports inside `website/`. The `<sema-code-typer>` brand-page showcase (which imports the repo-root `@sema/ui` bundle) is currently **commented out** in `website/.vitepress/theme/BrandGuide.vue` for this reason; re-enabling it needs the proper monorepo deploy fix (git-integrate the Vercel project — `sourceFilesOutsideRootDirectory` is already on — or vendor the bundle into `website/public/`). Verify a deploy actually promoted: a failed build leaves the previous deploy live (production looks unchanged).
 - The live homepage is the **`HomepageV2.vue`** component (via `website/index.md`), **not** any standalone `*.html` file.
 - VitePress site uses **clean URLs** (`cleanUrls: true` in both `config.ts` and `vercel.json`): the canonical form is extensionless, e.g. `https://sema-lang.com/docs/internals/lisp-comparison`. The build still writes `*.html` files and Vercel 308-redirects the `.html` form to the clean URL, so don't hardcode `.html` in internal doc links — write `/docs/lsp`, not `/docs/lsp.html`. Per-page `<link rel="canonical">` + `og:url` are emitted extensionless via `transformHead`. All docs pages are under `/docs/`.

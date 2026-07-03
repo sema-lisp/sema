@@ -1,0 +1,165 @@
+;; dev_server.sema — the `sema web` dev server.
+;;
+;; Launched by crates/sema/src/web/mod.rs, which injects `__web-config-json`
+;; (a JSON string) and runs this file. The server never evaluates the app's
+;; Sema — the browser WASM runtime does. Its job is plumbing: serve the embedded
+;; browser runtime + a synthesized HTML shell + the app's source files.
+
+(define config (json/decode __web-config-json))
+(define host (:host config))
+(define port (:port config))
+(define entry (:entry config))
+(define runtime-dir (:runtimeDir config))
+(define app-dir (:appDir config))
+(define build-dir (:buildDir config))
+(define shell-template (:shell config))
+
+;; How the browser loads the app: single-file apps run from raw source; an app
+;; that uses `import` can't resolve modules against the browser's (absent) fs, so
+;; it's compiled to a `.vfs` under build-dir and served from /__build. `__web/prepare`
+;; (native) decides + (re)builds, returning {:mode "source"|"archive"|"error"}.
+(define app-state (__web/prepare))
+(define app-mode (:mode app-state))
+(define app-error (:error app-state))
+
+;; Watch the app dir; each poll drains pending events and, if any fired, bumps a
+;; generation the browser diffs against to trigger a reload. fs/watch emits
+;; several events per save, but coalescing them into one bump per poll debounces.
+;; The generation also cache-busts the app-source URL (:static sends a 1h
+;; cache-control), so a full reload fetches the changed source instead of a copy.
+(define watcher (fs/watch app-dir))
+(define generation 0)
+
+(define llm-enabled (:llm config))
+
+;; The tag that loads the app: raw source for single-file apps, the compiled
+;; .vfs for multi-file, or a visible build error. Generation cache-busts it.
+(define (app-script-tag)
+  (cond
+    ((equal? app-mode "error")
+     (string-append
+       "<pre style=\"margin:1rem;padding:1rem;background:#7f1d1d;color:#fee2e2;"
+       "border-radius:8px;white-space:pre-wrap;font:13px/1.5 ui-monospace,monospace\">"
+       "Build error:\n" (or app-error "") "</pre>\n"))
+    ((equal? app-mode "archive")
+     (string-append "<script type=\"text/sema\" src=\"/__build/app.vfs?g="
+                    (number->string generation) "\"></script>\n"))
+    (else
+     (string-append "<script type=\"text/sema\" src=\"/app/" entry "?g="
+                    (number->string generation) "\"></script>\n"))))
+
+;; With the proxy enabled, point the browser's llm/* at this same origin — the
+;; dev server answers /complete, /chat, /stream, ... with server keys.
+(define (init-js)
+  (if llm-enabled
+    "await SemaWeb.init({ llmProxy: window.location.origin });"
+    "await SemaWeb.init();"))
+
+;; The synthesized page: fill the embedded shell template's placeholders. The
+;; static scaffold (import map, error overlay, hot-reload poll) lives in
+;; crates/sema/src/web/shell.html.
+(define (shell-html)
+  (-> shell-template
+      (string/replace "{{TITLE}}" entry)
+      (string/replace "{{APP}}" (app-script-tag))
+      (string/replace "{{INIT}}" (init-js))))
+
+(define (handle-index req)
+  (http/html (shell-html)))
+
+(define (handle-poll req)
+  (when (> (length (fs/watch-events watcher)) 0)
+    ;; Re-decide mode + rebuild the archive so edits (and added/removed imports)
+    ;; take effect on reload.
+    (let ((st (__web/prepare)))
+      (set! app-mode (:mode st))
+      (set! app-error (:error st)))
+    (set! generation (+ generation 1)))
+  (http/ok {:generation generation}))
+
+;; --- LLM proxy (enabled unless --no-llm) ------------------------------------
+;; Speaks the same protocol as @sema-lang/llm-proxy so the browser client works
+;; unchanged; each handler just calls native llm/* with the server's env keys.
+;; The request body carries the model/options the app passed, so it is forwarded
+;; as the opts map (llm/* reads only the keys it knows).
+
+;; The browser sends messages as JSON {role, content}; native llm/* wants
+;; message values with keyword roles.
+(define (->messages b)
+  (map (fn (m) (message (string->keyword (:role m)) (:content m)))
+       (:messages b)))
+
+(define (handle-complete req)
+  (let ((b (:json req)))
+    (http/ok {:content (llm/complete (:prompt b) b)})))
+
+(define (handle-chat req)
+  (let ((b (:json req)))
+    (http/ok {:content (llm/chat (->messages b) b)})))
+
+(define (handle-extract req)
+  (let ((b (:json req)))
+    (http/ok (llm/extract (:schema b) (:text b) b))))
+
+(define (handle-classify req)
+  (let ((b (:json req)))
+    (http/ok {:category (llm/classify (:categories b) (:text b) b)})))
+
+(define (handle-embed req)
+  (let ((b (:json req)))
+    (http/ok {:embedding (llm/embed (:text b) b)})))
+
+(define (handle-models req)
+  (http/ok {:models (llm/list-providers)}))
+
+;; Streaming endpoint: emit one SSE `data:` per token as {type:"token",text},
+;; then {type:"done"} — the shape sema-web's SSE client expects. Tokens stream
+;; progressively (the SSE channel is unbounded, so llm/stream's per-chunk
+;; callback can feed it from inside the provider's runtime without blocking).
+;;
+;; Note: while a stream is live it holds the single evaluator thread, so other
+;; requests queue behind it (head-of-line blocking — the deferred M2 concurrency
+;; work). Fine for a single-user dev loop.
+(define (handle-stream req)
+  (let ((b (:json req)))
+    (http/stream
+      (fn (send)
+        (llm/stream (->messages b)
+          (fn (chunk) (send (json/encode {:type "token" :text chunk})))
+          b)
+        (send (json/encode {:type "done"}))))))
+
+;; /__sema/*    → embedded runtime (WASM + JS bundle), served with real MIME types.
+;; /app/*       → the app's source directory (raw .sema + any assets).
+;; /__dev/poll  → hot-reload generation (instant response; never blocks).
+(define base-routes
+  [[:get    "/"           handle-index]
+   [:get    "/__dev/poll" handle-poll]
+   [:static "/__sema"     runtime-dir]
+   [:static "/__build"    build-dir]
+   [:static "/app"        app-dir]])
+
+(define llm-routes
+  [[:post "/complete" handle-complete]
+   [:post "/chat"     handle-chat]
+   [:post "/stream"   handle-stream]
+   [:post "/extract"  handle-extract]
+   [:post "/classify" handle-classify]
+   [:post "/embed"    handle-embed]
+   [:get  "/models"   handle-models]])
+
+(define routes
+  (if llm-enabled (append base-routes llm-routes) base-routes))
+
+(define (announce info)
+  (println "")
+  (println (string-append "  Sema Web dev server"))
+  (println (string-append "  → " (:url info)))
+  (println (string-append "  serving " entry " from " app-dir))
+  (println ""))
+
+(http/serve (http/router routes)
+  {:host host
+   :port port
+   :port-fallback true
+   :on-listen announce})

@@ -147,6 +147,10 @@ impl Scheduler {
             state: RefCell::new(PromiseState::Pending),
             task_id: std::cell::Cell::new(id),
         });
+        // Cold data-cycle constructor (CORE-2): this promise is wrapped via
+        // `async_promise_from_rc` later, which registers nothing — register
+        // the candidate here, at the allocation.
+        sema_core::register_candidate(sema_core::GcNode::Promise(Rc::downgrade(&promise)));
 
         // Use the function table from the thunk's own compilation context,
         // not the scheduler's — each eval_str_compiled produces different functions.
@@ -453,6 +457,22 @@ pub fn reset_scheduler_tasks() {
     });
 }
 
+/// Drop the thread-local scheduler if it belongs to `globals` — called from
+/// `Interpreter::drop` so a dead interpreter's global env (and any leftover
+/// task VMs holding `Rc<Env>` clones) is not pinned until thread exit. The
+/// `ptr_eq` guard is load-bearing: many interpreters can live on one thread
+/// (test suites, embedders), and dropping interpreter A must not clobber a
+/// live interpreter B's scheduler (mirrors the reuse branch in
+/// `init_scheduler`). No-op when the slot is empty or owned by another env.
+pub fn shutdown_scheduler(globals: &Rc<Env>) {
+    SCHEDULER.with(|s| {
+        let mut slot = s.borrow_mut();
+        if matches!(slot.as_ref(), Some(sched) if Rc::ptr_eq(&sched.globals, globals)) {
+            *slot = None;
+        }
+    });
+}
+
 /// Run `f` against the per-task VM of the task currently paused at a cooperative
 /// breakpoint, if any. Returns `None` when no task is paused (or it can no longer
 /// be found — e.g. it already resumed/completed), in which case the caller should
@@ -518,6 +538,9 @@ pub(crate) fn run_closure_as_inline_task(
         state: RefCell::new(PromiseState::Pending),
         task_id: std::cell::Cell::new(id),
     });
+    // Cold data-cycle constructor (CORE-2): raw allocation, wrapped via
+    // `async_promise_from_rc` on resolution paths — register here.
+    sema_core::register_candidate(sema_core::GcNode::Promise(Rc::downgrade(&promise)));
 
     let mut vm = match VM::new_for_task(sched.globals.clone(), functions, &sched.native_spurs) {
         Ok(vm) => vm,
@@ -632,6 +655,16 @@ fn run_scheduler_callback(
     // path and is gated by `in_async_context()` being true, so it is untouched.
     if !sema_core::in_async_context() {
         sched.reap_leftover_tasks();
+        // Scheduler-idle safe point (CORE-2, plan §5.2 point d): every task is
+        // done and reaped, so task VMs/promises just released their refs and
+        // async-born garbage (channels, promises, task-local closures) is at
+        // its most collectable. Deliberately NOT between task polls — a
+        // per-tick collect would re-trace live parked-task graphs constantly.
+        // Threshold-gated; pins computed only when a pass will actually run.
+        if sched.tasks.is_empty() && sema_core::gc_should_collect() {
+            let pins = sema_core::gc_env_chain_pins(&sched.globals);
+            sema_core::gc_threshold_collect(&pins, sema_core::GcTrigger::SchedulerIdle);
+        }
     }
 
     put_scheduler(sched);

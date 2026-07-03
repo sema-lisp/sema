@@ -8,6 +8,10 @@ outline: [2, 3]
 
 Sema can be embedded as a JavaScript scripting engine via WebAssembly. The WASM build runs entirely client-side — no server needed. You get the full Sema standard library (minus shell access and LLM functions) in the browser, including HTTP via `fetch()`, an in-memory virtual filesystem, and persistent definitions across evaluations.
 
+::: warning Chromium ARM64 Compatibility
+Chrome/Chromium versions earlier than 147 include a V8 ARM64 WebAssembly compiler bug that can crash the renderer on some large or hot workloads. If you see tab crashes on Apple Silicon, update Chrome or use Firefox, Safari, or Chrome 147+.
+:::
+
 Two npm packages are available:
 
 | Package | Description |

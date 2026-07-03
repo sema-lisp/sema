@@ -32,8 +32,11 @@ struct RawResponse {
 enum ServerResponse {
     /// A normal HTTP response.
     Raw(RawResponse),
-    /// An SSE stream: the receiver yields event data strings.
-    Sse(tokio::sync::mpsc::Receiver<String>),
+    /// An SSE stream: the receiver yields event data strings. Unbounded so the
+    /// producer's `send` never blocks — SSE handlers run on the evaluator thread
+    /// and may be inside a provider's `block_on` (e.g. llm/stream), where a
+    /// bounded `blocking_send` would panic ("block within a runtime").
+    Sse(tokio::sync::mpsc::UnboundedReceiver<String>),
     /// A WebSocket connection: bidirectional channels for message passing.
     WebSocket {
         /// Sends messages from axum (client) to the evaluator (server handler).
@@ -911,9 +914,9 @@ async fn handle_axum_request(
         Ok(ServerResponse::Sse(rx)) => {
             use axum::response::sse::{Event, Sse};
             use futures::stream::StreamExt;
-            use tokio_stream::wrappers::ReceiverStream;
+            use tokio_stream::wrappers::UnboundedReceiverStream;
 
-            let stream = ReceiverStream::new(rx)
+            let stream = UnboundedReceiverStream::new(rx)
                 .map(|data| Ok::<_, std::convert::Infallible>(Event::default().data(data)));
             Sse::new(stream).into_response()
         }
@@ -1065,6 +1068,26 @@ fn handle_file_response(
     });
 }
 
+/// Build the `send` native fn handed to an SSE handler. Extracted so a test can
+/// drive it from inside a tokio runtime — the exact condition (a handler
+/// streaming via `llm/stream`, which runs the callback inside the provider's
+/// `block_on`) that panicked when the channel was bounded + `blocking_send`.
+fn make_sse_send_fn(sse_tx: tokio::sync::mpsc::UnboundedSender<String>) -> Value {
+    use sema_core::NativeFn;
+    Value::native_fn(NativeFn::simple("http/stream/send", move |args| {
+        check_arity!(args, "http/stream/send", 1);
+        let msg = args[0]
+            .as_str()
+            .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
+        // Err only when the receiver dropped (client disconnected) — preserves
+        // the "SSE stream closed" contract.
+        sse_tx
+            .send(msg.to_string())
+            .map_err(|_| SemaError::eval("SSE stream closed"))?;
+        Ok(Value::nil())
+    }))
+}
+
 /// Handle an SSE stream response: extract the stream handler, create channels,
 /// send the SSE receiver to axum, then call the handler with a `send` function.
 fn handle_sse_response(
@@ -1072,7 +1095,7 @@ fn handle_sse_response(
     response_val: &Value,
     respond: tokio::sync::oneshot::Sender<ServerResponse>,
 ) {
-    use sema_core::{call_callback, NativeFn};
+    use sema_core::call_callback;
 
     let map = response_val.as_map_rc().unwrap();
     let stream_handler = map
@@ -1080,23 +1103,18 @@ fn handle_sse_response(
         .cloned()
         .unwrap();
 
-    // Create the SSE channel
-    let (sse_tx, sse_rx) = tokio::sync::mpsc::channel::<String>(256);
+    // Create the SSE channel. Unbounded because the handler runs on the
+    // evaluator thread and may `send` from inside a provider's block_on (e.g.
+    // llm/stream feeding tokens): UnboundedSender::send is synchronous and never
+    // asserts "not in a runtime", so it can't panic like blocking_send. Chunks
+    // are small and network-paced; a bounded try_send would silently drop tokens.
+    let (sse_tx, sse_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
 
     // Send the SSE receiver to axum so it can start streaming immediately
     let _ = respond.send(ServerResponse::Sse(sse_rx));
 
     // Build the `send` function for the Sema handler
-    let send_fn = Value::native_fn(NativeFn::simple("http/stream/send", move |args| {
-        check_arity!(args, "http/stream/send", 1);
-        let msg = args[0]
-            .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
-        sse_tx
-            .blocking_send(msg.to_string())
-            .map_err(|_| SemaError::eval("SSE stream closed"))?;
-        Ok(Value::nil())
-    }));
+    let send_fn = make_sse_send_fn(sse_tx);
 
     // Call the stream handler with the send function.
     // When it returns (or errors), the sse_tx is dropped, closing the stream.
@@ -1138,6 +1156,13 @@ fn handle_ws_response(
     // task only exits (and the socket only closes) when the *last* `Sender` is
     // dropped, so `ws/close` must release the sole sender — not a throwaway
     // clone. Mirrors the `in_rx` Option pattern below.
+    //
+    // NOTE: `ws/send`/`ws/recv` below use bounded blocking_send/blocking_recv,
+    // which are correct for the typical handler (runs on the evaluator thread,
+    // no nested runtime). But a WS handler that drives `llm/stream` (whose
+    // callback fires inside the provider's block_on) would hit the same "block
+    // within a runtime" panic the SSE path fixed with an unbounded channel. Left
+    // as a known limitation — WS+llm/stream isn't a shipped pattern yet.
     let out_tx = Rc::new(RefCell::new(Some(out_tx)));
     let out_tx_for_send = out_tx.clone();
     let send_fn = Value::native_fn(NativeFn::simple("ws/send", move |args| {
@@ -1237,9 +1262,15 @@ fn http_serve_impl(ctx: &sema_core::EvalContext, args: &[Value]) -> Result<Value
 
     let handler = args[0].clone();
 
-    // Parse options map (arg 1): {:port 3000 :host "0.0.0.0"}
+    // Parse options map (arg 1): {:port 3000 :host "0.0.0.0"
+    //                             :port-fallback true :on-listen (fn (info) ...)}
     let mut port: u16 = 3000;
     let mut host = "0.0.0.0".to_string();
+    // Off by default: `http/serve` fails fast on a taken port, preserving the
+    // long-standing contract. First-party servers (notebook, web dev server)
+    // opt in so users get automatic fallback there.
+    let mut port_fallback = false;
+    let mut on_listen: Option<Value> = None;
 
     if args.len() == 2 {
         if let Some(opts) = args[1].as_map_rc() {
@@ -1249,14 +1280,23 @@ fn http_serve_impl(ctx: &sema_core::EvalContext, args: &[Value]) -> Result<Value
             if let Some(h) = opts.get(&Value::keyword("host")).and_then(|v| v.as_str()) {
                 host = h.to_string();
             }
+            if let Some(f) = opts.get(&Value::keyword("port-fallback")) {
+                port_fallback = f.is_truthy();
+            }
+            if let Some(cb) = opts.get(&Value::keyword("on-listen")) {
+                if cb.as_native_fn_ref().is_some() || cb.as_lambda_rc().is_some() {
+                    on_listen = Some(cb.clone());
+                }
+            }
         }
     }
 
     // Create the mpsc channel for server requests (tokio async channel)
     let (tx, mut rx) = tokio::sync::mpsc::channel::<ServerRequest>(256);
 
-    // Create a std sync channel for ready signal
-    let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), String>>();
+    // Create a std sync channel for the ready signal, carrying the port the
+    // server actually bound to (may differ from `port` when fallback kicks in).
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<u16, String>>();
 
     let bind_host = host.clone();
     let bind_port = port;
@@ -1294,27 +1334,41 @@ fn http_serve_impl(ctx: &sema_core::EvalContext, args: &[Value]) -> Result<Value
                 }
             });
 
-            // Bind TCP listener
-            let addr = format!("{bind_host}:{bind_port}");
-            let listener = match tokio::net::TcpListener::bind(&addr).await {
-                Ok(l) => l,
+            // Bind the TCP listener. With fallback enabled, walk to the next
+            // free port on AddrInUse; otherwise bind the requested port only.
+            let bind_result = if port_fallback {
+                sema_core::net::bind_with_fallback(&bind_host, bind_port, 100).and_then(
+                    |(std_listener, actual)| {
+                        std_listener.set_nonblocking(true)?;
+                        let listener = tokio::net::TcpListener::from_std(std_listener)?;
+                        Ok((listener, actual))
+                    },
+                )
+            } else {
+                let addr = format!("{bind_host}:{bind_port}");
+                tokio::net::TcpListener::bind(&addr)
+                    .await
+                    .map(|listener| (listener, bind_port))
+            };
+            let (listener, actual_port) = match bind_result {
+                Ok(pair) => pair,
                 Err(e) => {
-                    let _ = ready_tx.send(Err(format!("bind {addr}: {e}")));
+                    let _ = ready_tx.send(Err(format!("bind {bind_host}:{bind_port}: {e}")));
                     return;
                 }
             };
 
-            // Signal success
-            let _ = ready_tx.send(Ok(()));
+            // Signal success with the port actually bound
+            let _ = ready_tx.send(Ok(actual_port));
 
             // Run the server
             let _ = axum::serve(listener, app).await;
         });
     });
 
-    // Wait for ready signal from the background thread
-    match ready_rx.recv() {
-        Ok(Ok(())) => {}
+    // Wait for the ready signal (carrying the actual bound port) from the thread
+    let actual_port = match ready_rx.recv() {
+        Ok(Ok(p)) => p,
         Ok(Err(e)) => {
             return Err(SemaError::Io(e));
         }
@@ -1323,9 +1377,25 @@ fn http_serve_impl(ctx: &sema_core::EvalContext, args: &[Value]) -> Result<Value
                 "http/serve: server thread died before binding",
             ));
         }
-    }
+    };
 
-    eprintln!("Listening on {host}:{port}");
+    eprintln!("Listening on {host}:{actual_port}");
+
+    // Hand the caller the address actually bound (host/port may differ from the
+    // request when :port-fallback picked the next free port) so it can print a
+    // URL or open a browser.
+    if let Some(cb) = &on_listen {
+        let mut info = BTreeMap::new();
+        info.insert(Value::keyword("host"), Value::string(&host));
+        info.insert(Value::keyword("port"), Value::int(actual_port as i64));
+        info.insert(
+            Value::keyword("url"),
+            Value::string(&format!("http://{host}:{actual_port}")),
+        );
+        if let Err(e) = call_callback(ctx, cb, &[Value::map(info)]) {
+            eprintln!("http/serve on-listen handler error: {e}");
+        }
+    }
 
     // Main evaluator loop: read requests from channel, call handler, send response
     while let Some(req) = rx.blocking_recv() {
@@ -1371,6 +1441,46 @@ fn http_serve_impl(ctx: &sema_core::EvalContext, args: &[Value]) -> Result<Value
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Regression guard for the real production send path: the actual
+    // `http/stream/send` native fn (as built by handle_sse_response) must work
+    // when invoked from inside a tokio runtime — the exact condition that
+    // panicked with the old bounded `blocking_send`. Reverting make_sse_send_fn
+    // to blocking_send makes this test panic.
+    #[test]
+    fn sse_send_fn_works_inside_runtime() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let send_fn = make_sse_send_fn(tx);
+        let native = send_fn.as_native_fn_ref().expect("native fn");
+        let ctx = sema_core::EvalContext::new();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let result = rt.block_on(async {
+            (native.func)(&ctx, &[Value::string("a")])?;
+            (native.func)(&ctx, &[Value::string("b")])
+        });
+        assert!(result.is_ok(), "send must not error/panic inside a runtime");
+        assert_eq!(rx.try_recv().unwrap(), "a");
+        assert_eq!(rx.try_recv().unwrap(), "b");
+
+        // When the receiver is dropped (client disconnect), send reports the
+        // "SSE stream closed" contract rather than panicking.
+        drop(rx);
+        let closed = (native.func)(&ctx, &[Value::string("c")]);
+        assert!(closed.is_err(), "send after receiver drop must Err");
+    }
+
+    // Documents the exact bug the unbounded channel fixes: a bounded
+    // `blocking_send` panics ("block within a runtime") when called inside a
+    // tokio context — which is what an llm/stream SSE handler did.
+    #[test]
+    #[should_panic]
+    fn bounded_blocking_send_panics_inside_runtime() {
+        let (tx, _rx) = tokio::sync::mpsc::channel::<String>(4);
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let _ = tx.blocking_send("x".to_string());
+        });
+    }
 
     #[test]
     fn test_match_exact_path() {

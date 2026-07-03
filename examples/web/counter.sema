@@ -1,0 +1,87 @@
+;; counter.sema — Interactive click counter
+;;
+;; Demonstrates DOM manipulation, event handling, and state management.
+;; Run in a page with: <div id="app"></div>
+
+;; ─── State ─────────────────────────────────────────────
+
+(define count 0)
+
+;; ─── Build UI ──────────────────────────────────────────
+
+(define app-root (dom/query "#app"))
+
+;; Title
+(let ((title (dom/create-element "h2")))
+  (dom/set-text! title "Sema Counter")
+  (dom/set-style! title "font-family" "system-ui, sans-serif")
+  (dom/set-style! title "color" "#374151")
+  (dom/append-child! app-root title))
+
+;; Display
+(define display-el (dom/create-element "div"))
+(dom/set-text! display-el "0")
+(dom/set-style! display-el "font-size" "4rem")
+(dom/set-style! display-el "font-family" "monospace")
+(dom/set-style! display-el "text-align" "center")
+(dom/set-style! display-el "padding" "1rem")
+(dom/append-child! app-root display-el)
+
+;; Button container
+(define btn-row (dom/create-element "div"))
+(dom/set-style! btn-row "display" "flex")
+(dom/set-style! btn-row "gap" "0.5rem")
+(dom/set-style! btn-row "justify-content" "center")
+(dom/append-child! app-root btn-row)
+
+;; Decrement button
+(define dec-btn (dom/create-element "button"))
+(dom/set-text! dec-btn "−")
+(dom/set-style! dec-btn "font-size" "1.5rem")
+(dom/set-style! dec-btn "padding" "0.5rem 1.5rem")
+(dom/append-child! btn-row dec-btn)
+
+;; Reset button
+(define reset-btn (dom/create-element "button"))
+(dom/set-text! reset-btn "Reset")
+(dom/set-style! reset-btn "font-size" "1rem")
+(dom/set-style! reset-btn "padding" "0.5rem 1rem")
+(dom/append-child! btn-row reset-btn)
+
+;; Increment button
+(define inc-btn (dom/create-element "button"))
+(dom/set-text! inc-btn "+")
+(dom/set-style! inc-btn "font-size" "1.5rem")
+(dom/set-style! inc-btn "padding" "0.5rem 1.5rem")
+(dom/append-child! btn-row inc-btn)
+
+;; ─── Event Handlers ────────────────────────────────────
+
+(define (update-display! evt)
+  (dom/set-text! display-el (number->string count)))
+
+(define (on-increment evt)
+  (set! count (+ count 1))
+  (update-display! nil))
+
+(define (on-decrement evt)
+  (set! count (- count 1))
+  (update-display! nil))
+
+(define (on-reset evt)
+  (set! count 0)
+  (update-display! nil))
+
+;; ─── Bind Events ───────────────────────────────────────
+
+(dom/on! inc-btn "click" "on-increment")
+(dom/on! dec-btn "click" "on-decrement")
+(dom/on! reset-btn "click" "on-reset")
+
+;; ─── Persist to localStorage ───────────────────────────
+
+;; Restore saved count on load
+(let ((saved (store/get "sema-counter")))
+  (when saved
+    (set! count (string->number saved))
+    (update-display! nil)))

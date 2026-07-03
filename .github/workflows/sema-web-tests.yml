@@ -1,0 +1,91 @@
+name: sema-web tests
+on:
+  push:
+    paths:
+      - ".github/workflows/sema-web-tests.yml"
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "crates/sema-core/**"
+      - "crates/sema-eval/**"
+      - "crates/sema-fmt/**"
+      - "crates/sema-otel/**"
+      - "crates/sema-reader/**"
+      - "crates/sema-stdlib/**"
+      - "crates/sema-vm/**"
+      - "crates/sema-wasm/**"
+      - "package-lock.json"
+      - "packages/llm-proxy/**"
+      - "packages/sema-web/**"
+      - "packages/sema/**"
+      - "packages/sema-wasm/**"
+  pull_request:
+    paths:
+      - ".github/workflows/sema-web-tests.yml"
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "crates/sema-core/**"
+      - "crates/sema-eval/**"
+      - "crates/sema-fmt/**"
+      - "crates/sema-otel/**"
+      - "crates/sema-reader/**"
+      - "crates/sema-stdlib/**"
+      - "crates/sema-vm/**"
+      - "crates/sema-wasm/**"
+      - "package-lock.json"
+      - "packages/llm-proxy/**"
+      - "packages/sema-web/**"
+      - "packages/sema/**"
+      - "packages/sema-wasm/**"
+
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm ci
+      - run: npx vitest run
+        working-directory: packages/sema-web
+
+  e2e:
+    runs-on: ubuntu-latest
+    needs: unit
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install system dependencies
+        # The archive-loading e2e test shells out to `cargo run -p sema-lang --
+        # build`, which compiles the native binary. That pulls in `serialport`
+        # (transitive `libudev-sys`), which needs libudev-dev on Linux. Mirrors
+        # the same install in ci.yml.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libudev-dev
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: actions/cache@v4
+        id: wasm-cache
+        with:
+          path: packages/sema-wasm/pkg
+          key: wasm-${{ hashFiles('Cargo.toml', 'Cargo.lock', 'crates/sema-core/**', 'crates/sema-eval/**', 'crates/sema-fmt/**', 'crates/sema-otel/**', 'crates/sema-reader/**', 'crates/sema-stdlib/**', 'crates/sema-vm/**', 'crates/sema-wasm/**') }}
+      - if: steps.wasm-cache.outputs.cache-hit != 'true'
+        run: |
+          cargo install wasm-pack
+          wasm-pack build crates/sema-wasm --target web --out-dir ../../packages/sema-wasm/pkg
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm ci
+      - run: npm run build --workspace=@sema-lang/sema
+      - run: npm run build --workspace=@sema-lang/sema-web
+      - run: npx playwright install --with-deps chromium
+        working-directory: packages/sema-web
+      - run: npx playwright test
+        working-directory: packages/sema-web
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: playwright-report
+          path: packages/sema-web/playwright-report/

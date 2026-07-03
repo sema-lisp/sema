@@ -1,0 +1,148 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Sema Web Compiled App Example</title>
+  <link rel="icon" href="data:,">
+  <style>
+    :root {
+      color-scheme: light;
+      --page-bg: radial-gradient(circle at top, #f7efe3 0%, #efe5d4 32%, #d8d3c5 100%);
+      --ink: #1d2433;
+      --muted: #5b6475;
+      --card: rgba(255, 252, 245, 0.88);
+      --line: rgba(37, 45, 61, 0.12);
+      --accent: #c7522a;
+      --accent-dark: #9d3f20;
+      --shadow: 0 18px 60px rgba(38, 35, 30, 0.14);
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      font-family: "Iowan Old Style", "Palatino Linotype", "Book Antiqua", Georgia, serif;
+      color: var(--ink);
+      background: var(--page-bg);
+    }
+
+    .page-shell {
+      width: min(1100px, calc(100% - 32px));
+      margin: 0 auto;
+      padding: 32px 0 48px;
+    }
+
+    .page-head {
+      display: grid;
+      gap: 8px;
+      margin-bottom: 24px;
+    }
+
+    .eyebrow {
+      font-size: 12px;
+      font-weight: 700;
+      letter-spacing: 0.22em;
+      text-transform: uppercase;
+      color: var(--accent-dark);
+    }
+
+    h1 {
+      margin: 0;
+      font-size: clamp(2.1rem, 5vw, 3.8rem);
+      line-height: 0.95;
+    }
+
+    .page-copy {
+      max-width: 780px;
+      color: var(--muted);
+      font-size: 1.02rem;
+      line-height: 1.6;
+    }
+
+    .runtime-note {
+      display: inline-flex;
+      align-items: center;
+      gap: 10px;
+      margin-top: 8px;
+      padding: 10px 14px;
+      border-radius: 999px;
+      background: rgba(255, 252, 245, 0.72);
+      border: 1px solid var(--line);
+      box-shadow: 0 8px 24px rgba(38, 35, 30, 0.08);
+      color: var(--muted);
+      font-size: 0.92rem;
+    }
+
+    .runtime-note code {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+      color: var(--ink);
+      background: rgba(29, 36, 51, 0.06);
+      padding: 2px 6px;
+      border-radius: 999px;
+    }
+
+    #app {
+      min-height: 480px;
+    }
+
+    .error {
+      padding: 18px 20px;
+      border-radius: 18px;
+      background: rgba(132, 32, 23, 0.08);
+      border: 1px solid rgba(132, 32, 23, 0.18);
+      box-shadow: var(--shadow);
+    }
+  </style>
+  <script type="importmap">
+    {
+      "imports": {
+        "@sema-lang/sema-web": "./dist/vendor/sema-web.js",
+        "@sema-lang/sema": "./dist/vendor/sema/index.js",
+        "@sema-lang/sema-wasm": "./dist/vendor/sema_wasm.js",
+        "@preact/signals-core": "./dist/vendor/signals-core.module.js",
+        "morphdom": "./dist/vendor/morphdom-esm.js"
+      }
+    }
+  </script>
+</head>
+<body>
+  <main class="page-shell">
+    <header class="page-head">
+      <div class="eyebrow">Production Example</div>
+      <h1>Sema Web as a compiled browser app</h1>
+      <div class="page-copy">
+        This page loads a compiled <code>.vfs</code> archive built from <code>app.sema</code>.
+        It demonstrates the production path: reactive state, routing, persistence, scoped CSS,
+        and component cleanup, all served as static files.
+      </div>
+      <div class="runtime-note">
+        Archive source:
+        <code>examples/sema-web-app/dist/app.vfs</code>
+      </div>
+    </header>
+
+    <div id="app">
+      <div class="runtime-note">Loading Sema Web…</div>
+    </div>
+  </main>
+
+  <script type="text/sema" src="dist/app.vfs"></script>
+  <script type="module">
+    import { SemaWeb } from "@sema-lang/sema-web";
+
+    try {
+      await SemaWeb.init();
+    } catch (error) {
+      const target = document.getElementById("app");
+      target.innerHTML = "";
+      const box = document.createElement("div");
+      box.className = "error";
+      box.textContent = `Failed to initialize Sema Web: ${error instanceof Error ? error.message : String(error)}`;
+      target.appendChild(box);
+      console.error(error);
+    }
+  </script>
+</body>
+</html>

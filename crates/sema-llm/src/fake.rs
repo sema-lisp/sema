@@ -91,6 +91,12 @@ pub struct FakeProvider {
     /// overlap on the cooperative scheduler (wall ≈ max, not sum) — the chat
     /// counterpart of `embed_delay_ms`. 0 = no delay (default).
     chat_delay_ms: u64,
+    /// Fixed wall-clock delay injected BETWEEN chunks in `stream_complete()`, so
+    /// a test can prove sibling tasks interleave between a stream's deltas (the
+    /// streaming counterpart of `chat_delay_ms`). On the non-blocking stream path
+    /// the chunks are emitted from a pool worker, so a real thread sleep is what
+    /// spaces the deltas out in wall time. 0 = no delay (default).
+    stream_chunk_delay_ms: u64,
     /// When set, `complete()` ignores the scripted queue and echoes the request's
     /// last user-message text as the response content. This correlates each reply
     /// to its prompt deterministically regardless of which `spawn_blocking` worker
@@ -133,6 +139,7 @@ impl FakeProvider {
             script: VecDeque::new(),
             embed_delay_ms: 0,
             chat_delay_ms: 0,
+            stream_chunk_delay_ms: 0,
             echo: false,
             tool_loop: None,
         }
@@ -152,6 +159,7 @@ pub struct FakeProviderBuilder {
     script: VecDeque<FakeReply>,
     embed_delay_ms: u64,
     chat_delay_ms: u64,
+    stream_chunk_delay_ms: u64,
     echo: bool,
     tool_loop: Option<ToolLoopSpec>,
 }
@@ -297,6 +305,16 @@ impl FakeProviderBuilder {
         self
     }
 
+    /// Inject a fixed wall-clock delay BETWEEN chunks in `stream_complete()`, so a
+    /// test can prove a sibling task advances between a stream's deltas (the
+    /// streaming counterpart of [`chat_delay`]).
+    ///
+    /// [`chat_delay`]: Self::chat_delay
+    pub fn stream_chunk_delay(mut self, ms: u64) -> Self {
+        self.stream_chunk_delay_ms = ms;
+        self
+    }
+
     /// Make `complete()` echo the request's last user-message text instead of
     /// popping the scripted queue. Lets a concurrency test prove input-order
     /// preservation (the reply is a function of the prompt, not arrival order).
@@ -359,6 +377,7 @@ impl FakeProviderBuilder {
             recorder: Arc::new(FakeRecorder::default()),
             embed_delay_ms: self.embed_delay_ms,
             chat_delay_ms: self.chat_delay_ms,
+            stream_chunk_delay_ms: self.stream_chunk_delay_ms,
             echo: self.echo,
             tool_loop: self.tool_loop,
         }
@@ -492,16 +511,26 @@ impl LlmProvider for FakeProvider {
         on_chunk: &mut dyn FnMut(&str) -> Result<(), LlmError>,
     ) -> Result<ChatResponse, LlmError> {
         self.recorder.requests.lock().unwrap().push(request);
+        // Real thread sleep between chunks (never before the first): on the
+        // non-blocking stream path this runs on a pool worker, so the sleep is
+        // what gives a sibling scheduler task wall time between deltas.
+        let paced = |i: usize| {
+            if i > 0 && self.stream_chunk_delay_ms > 0 {
+                std::thread::sleep(std::time::Duration::from_millis(self.stream_chunk_delay_ms));
+            }
+        };
         match self.next() {
             Some(FakeReply::Stream { chunks, response }) => {
-                for c in &chunks {
+                for (i, c) in chunks.iter().enumerate() {
+                    paced(i);
                     on_chunk(c)?;
                 }
                 Ok(response)
             }
             Some(FakeReply::StreamThenError { chunks, error }) => {
                 // Deliver the partial chunks to the callback, THEN fail.
-                for c in &chunks {
+                for (i, c) in chunks.iter().enumerate() {
+                    paced(i);
                     on_chunk(c)?;
                 }
                 Err(error)

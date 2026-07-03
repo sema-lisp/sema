@@ -8351,10 +8351,14 @@ fn stream_batch_map(deltas: Vec<Value>, done: bool) -> Value {
 /// (batching amortizes park/resume over fast token streams), finalizing the run
 /// when `Done` arrives. `blocking` waits for the first event (the sync-context
 /// fallback and pre-filled runs); the poller path never blocks. `Ok(None)` =
-/// nothing available yet (stay parked). A failure that arrives with NO deltas in
-/// its batch surfaces immediately (entry dropped); one that arrives WITH deltas
-/// is stored as `pending_error` so the callback still sees every delta delivered
-/// before the failure — the sync path's ordering.
+/// nothing available yet (stay parked).
+///
+/// A failure is NEVER surfaced through the poller (an `IoPoll::Ready(Err)`
+/// rejects the whole task — an in-task `try` could not catch it, and which path
+/// fired would depend on batch timing): it is always stored as `pending_error`
+/// and raised by the NEXT `__stream-next` as an ordinary native error —
+/// deterministic, catchable in task context (matching the sync path), and the
+/// callback still sees every delta delivered before the failure.
 fn stream_poll_batch(token: u64, blocking: bool) -> Result<Option<Value>, SemaError> {
     use std::sync::mpsc::TryRecvError;
 
@@ -8458,10 +8462,6 @@ fn stream_poll_batch(token: u64, blocking: bool) -> Result<Option<Value>, SemaEr
             Ok(Some(stream_batch_map(batch, true)))
         }
         Err(msg) => {
-            if batch.is_empty() {
-                STREAM_RUNS.with(|r| r.borrow_mut().remove(&token));
-                return Err(SemaError::Llm(msg));
-            }
             STREAM_RUNS.with(|r| {
                 if let Some(st) = r.borrow_mut().get_mut(&token) {
                     st.pending_error = Some(msg);

@@ -1,7 +1,7 @@
 export {
   SemaButton, SemaBadge, SemaTooltip, SemaToggle, SemaToggleGroup,
   SemaSplitter, SemaDialog, SemaDrawer, SemaTree, SemaTreeItem,
-  SemaPage, SemaElement, SemaCode, SemaCodeTyper, SemaTerminal,
+  SemaPage, SemaElement, SemaCode, SemaCodeEditor, SemaMarkdown, SemaEditableMarkdown, SemaCodeTyper, SemaTerminal,
   SemaPopover, SemaMenu, SemaMenuItem,
   SemaInput, SemaTextarea, SemaSelect, SemaField,
   SemaScrollArea, SemaSpinner, SemaKbd, SemaPagination, SemaToast, SemaToaster,

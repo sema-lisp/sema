@@ -81,6 +81,13 @@ export class SemaEditableMarkdown extends SemaElement {
     }
   };
 
+  private _onEmptyKeydown = (e: KeyboardEvent) => {
+    if (e.key === 'Enter' || e.key === ' ') {
+      e.preventDefault();
+      this._edit();
+    }
+  };
+
   render() {
     if (this._editing) {
       return html`<sema-code-editor
@@ -95,7 +102,14 @@ export class SemaEditableMarkdown extends SemaElement {
       ></sema-code-editor>`;
     }
     if (!this.value.trim()) {
-      return html`<div class="empty" data-testid="markdown-rendered" @click=${this._edit}>
+      return html`<div
+        class="empty"
+        data-testid="markdown-rendered"
+        role="button"
+        tabindex="0"
+        @click=${this._edit}
+        @keydown=${this._onEmptyKeydown}
+      >
         ${this.placeholder}
       </div>`;
     }

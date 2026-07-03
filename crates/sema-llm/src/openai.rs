@@ -655,6 +655,44 @@ impl LlmProvider for OpenAiProvider {
         result
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
+    fn complete_future(
+        &self,
+        request: ChatRequest,
+    ) -> Option<crate::provider::BoxCompletionFuture<'_>> {
+        Some(Box::pin(async move {
+            let result = self.complete_async(request.clone()).await;
+            // Same DROP_TEMPERATURE compat backstop as `complete()` (see there),
+            // with one async-path nuance: the future may resume on a DIFFERENT
+            // pool worker after the first attempt, so the retry must not depend
+            // on the thread-local learn — strip `temperature` from the retried
+            // request itself (wire-identical to the TLS drop in
+            // `build_request_body`). The TLS insert still happens so later calls
+            // that land on this worker skip the doomed first request.
+            if request.temperature.is_some() && is_official_openai_url(&self.base_url) {
+                if let Err(LlmError::Api {
+                    status: 400,
+                    message,
+                }) = &result
+                {
+                    if mentions_unsupported_temperature(message) {
+                        let model = self.resolve_model(&request.model);
+                        DROP_TEMPERATURE.with(|s| s.borrow_mut().insert(model));
+                        let mut retry = request;
+                        retry.temperature = None;
+                        return self.complete_async(retry).await;
+                    }
+                }
+            }
+            result
+        }))
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn embed_future(&self, request: EmbedRequest) -> Option<crate::provider::BoxEmbedFuture<'_>> {
+        Some(Box::pin(self.embed_async(request)))
+    }
+
     fn stream_complete(
         &self,
         request: ChatRequest,

@@ -2,11 +2,54 @@ use crate::types::{
     ChatRequest, ChatResponse, EmbedRequest, EmbedResponse, LlmError, RerankRequest, RerankResponse,
 };
 
-/// The core LLM provider trait. Sync interface — async internals are hidden.
+/// The boxed future shape of [`LlmProvider::complete_future`]. `Send` because it
+/// is awaited inside a future spawned onto the shared I/O pool and may migrate
+/// between worker threads.
+#[cfg(not(target_arch = "wasm32"))]
+pub type BoxCompletionFuture<'a> = std::pin::Pin<
+    Box<dyn std::future::Future<Output = Result<ChatResponse, LlmError>> + Send + 'a>,
+>;
+
+/// The boxed future shape of [`LlmProvider::embed_future`].
+#[cfg(not(target_arch = "wasm32"))]
+pub type BoxEmbedFuture<'a> = std::pin::Pin<
+    Box<dyn std::future::Future<Output = Result<EmbedResponse, LlmError>> + Send + 'a>,
+>;
+
+/// The core LLM provider trait. Sync interface — async internals are hidden —
+/// plus optional future-returning hooks (`complete_future` / `embed_future`)
+/// the async offload path uses to make cancellation REAL: an aborted spawned
+/// provider future is dropped mid-flight (connection torn down) instead of
+/// running to completion on a blocking worker.
 pub trait LlmProvider: Send + Sync {
     fn name(&self) -> &str;
     fn complete(&self, request: ChatRequest) -> Result<ChatResponse, LlmError>;
     fn default_model(&self) -> &str;
+
+    /// Async completion hook for the cancellable offload path.
+    ///
+    /// `Some(fut)`: the provider exposes its native async implementation; the
+    /// caller awaits it inside a future spawned on the shared I/O pool, so
+    /// aborting the task drops the in-flight request with it (true
+    /// cancellation). The future must be behaviorally identical to
+    /// `complete()` — including any compat self-heal `complete()` performs.
+    ///
+    /// `None` (the default): the provider is sync-only; the caller offloads the
+    /// blocking `complete()` to the pool's blocking tier instead, where
+    /// cancellation stays best-effort (the result is discarded but the call
+    /// runs to completion on the worker).
+    #[cfg(not(target_arch = "wasm32"))]
+    fn complete_future(&self, _request: ChatRequest) -> Option<BoxCompletionFuture<'_>> {
+        None
+    }
+
+    /// Async embedding hook — the embeddings counterpart of
+    /// [`complete_future`](Self::complete_future), with the same
+    /// `Some` = true-cancel / `None` = best-effort-blocking-fallback contract.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn embed_future(&self, _request: EmbedRequest) -> Option<BoxEmbedFuture<'_>> {
+        None
+    }
 
     /// Streaming — calls on_chunk for each text delta, returns full response at end.
     fn stream_complete(

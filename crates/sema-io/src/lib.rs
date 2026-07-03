@@ -18,17 +18,25 @@
 //!
 //! # Admission control (the probe-h deadlock, prevented by mechanism)
 //!
-//! Every [`io_spawn_blocking`] offload unit acquires a permit from
-//! [`OFFLOAD_SEM`] (448 permits) before entering the 512-slot blocking tier.
-//! The 64-slot headroom exists because an offloaded unit may `io_block_on` a
-//! reqwest future whose GaiResolver DNS lookup transiently needs ONE extra
-//! blocking slot: with permits == slots, a full-cap burst of such units
-//! deadlocks (each holds a slot while waiting for a slot); with depth-1
-//! headroom reserved, that deadlock is structurally unreachable. Excess
-//! offloads beyond 448 queue on the semaphore — behavior at realistic fan-out
-//! is identical. A permit is held for the closure's ENTIRE duration, including
-//! any retry-backoff `thread::sleep`s inside it — long backoffs occupy a permit
-//! by design (they occupy a blocking thread too).
+//! Every blocking-tier offload unit ([`io_spawn_blocking`] and
+//! [`io_offload_blocking`]) acquires a permit from [`OFFLOAD_SEM`] (448
+//! permits) before entering the 512-slot blocking tier. The 64-slot headroom
+//! exists because an offloaded unit may `io_block_on` a reqwest future whose
+//! GaiResolver DNS lookup transiently needs ONE extra blocking slot: with
+//! permits == slots, a full-cap burst of such units deadlocks (each holds a
+//! slot while waiting for a slot); with depth-1 headroom reserved, that
+//! deadlock is structurally unreachable. Excess offloads beyond 448 queue on
+//! the semaphore — behavior at realistic fan-out is identical. A permit is
+//! held for the closure's ENTIRE duration, including any retry-backoff
+//! `thread::sleep`s inside it — long backoffs occupy a permit by design (they
+//! occupy a blocking thread too).
+//!
+//! Futures spawned via [`io_spawn`] take NO permit: they run on the async
+//! workers and pin no blocking slot while suspended, so the semaphore guards
+//! only the tier that can exhaust blocking threads. An `io_spawn` future that
+//! needs sync work inside (e.g. a sync-only LLM provider under the async
+//! completion offload) goes through [`io_offload_blocking`], which is where
+//! its permit is taken.
 //!
 //! # Threading contract
 //!
@@ -51,7 +59,8 @@ use tokio::sync::Semaphore;
 /// Cap on the pool's blocking-thread tier.
 const MAX_BLOCKING_THREADS: usize = 512;
 
-/// Admission permits for `io_spawn_blocking` offload units. 64 below
+/// Admission permits for blocking-tier offload units (`io_spawn_blocking` /
+/// `io_offload_blocking`). 64 below
 /// [`MAX_BLOCKING_THREADS`]: depth-1 headroom for the one extra blocking slot a
 /// `block_on`'d future may transiently need (GaiResolver DNS) — see the module
 /// docs.
@@ -142,6 +151,37 @@ where
 {
     install();
     sema_core::io_spawn_blocking(Box::new(work));
+}
+
+/// Offload `work` to THE pool's blocking tier from ASYNC context and await its
+/// result — the awaitable sibling of [`io_spawn_blocking`], admission-
+/// controlled by the same [`OFFLOAD_SEM`] (see the module docs). The permit is
+/// moved INTO the blocking closure so it is held for the closure's entire run
+/// even if the awaiting future is aborted first. Cancellation here is
+/// best-effort by construction: aborting the awaiting future discards the
+/// result, but the closure cannot be interrupted and runs to completion on the
+/// worker.
+pub async fn io_offload_blocking<T, F>(work: F) -> T
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    install();
+    let permit = OFFLOAD_SEM
+        .acquire()
+        .await
+        .expect("OFFLOAD_SEM is never closed");
+    match pool()
+        .spawn_blocking(move || {
+            let _permit = permit;
+            work()
+        })
+        .await
+    {
+        Ok(v) => v,
+        Err(e) if e.is_panic() => std::panic::resume_unwind(e.into_panic()),
+        Err(e) => panic!("sema-io: blocking offload failed: {e}"),
+    }
 }
 
 /// Drive `fut` to completion ON THE CALLING THREAD using THE pool's reactor,

@@ -237,6 +237,11 @@ impl LlmProvider for OpenAiCompatEmbeddingProvider {
         sema_io::io_block_on(self.embed_async(request))
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
+    fn embed_future(&self, request: EmbedRequest) -> Option<crate::provider::BoxEmbedFuture<'_>> {
+        Some(Box::pin(self.embed_async(request)))
+    }
+
     fn rerank(&self, request: RerankRequest) -> Result<RerankResponse, LlmError> {
         match self.rerank {
             Some(dialect) => sema_io::io_block_on(self.rerank_async(request, dialect)),
@@ -376,6 +381,11 @@ impl LlmProvider for CohereEmbeddingProvider {
 
     fn embed(&self, request: EmbedRequest) -> Result<EmbedResponse, LlmError> {
         sema_io::io_block_on(self.embed_async(request))
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn embed_future(&self, request: EmbedRequest) -> Option<crate::provider::BoxEmbedFuture<'_>> {
+        Some(Box::pin(self.embed_async(request)))
     }
 
     fn rerank(&self, request: RerankRequest) -> Result<RerankResponse, LlmError> {

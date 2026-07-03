@@ -43,7 +43,6 @@ pub struct OpenAiProvider {
     default_model: String,
     send_stream_options: bool,
     client: reqwest::Client,
-    runtime: crate::http::BlockingRuntime,
 }
 
 impl OpenAiProvider {
@@ -68,7 +67,6 @@ impl OpenAiProvider {
         default_model: String,
         send_stream_options: bool,
     ) -> Result<Self, LlmError> {
-        let runtime = crate::http::create_runtime()?;
         Ok(OpenAiProvider {
             name,
             api_key,
@@ -76,7 +74,6 @@ impl OpenAiProvider {
             default_model,
             send_stream_options,
             client: crate::http::create_client(None)?,
-            runtime,
         })
     }
 
@@ -632,7 +629,11 @@ impl LlmProvider for OpenAiProvider {
     }
 
     fn complete(&self, request: ChatRequest) -> Result<ChatResponse, LlmError> {
-        let result = self.runtime.block_on(self.complete_async(request.clone()));
+        // GUARD: two io_block_on calls in this method, STRICTLY SEQUENTIAL and
+        // NEVER NESTED — the first fully returns before the retry's begins.
+        // Nesting a block_on inside a block_on'd future would panic (see the
+        // sema-io threading contract / tokio pin tests).
+        let result = sema_io::io_block_on(self.complete_async(request.clone()));
         // Compat backstop: gpt-5.0 / o-series reject a custom `temperature` with a
         // 400. Learn it per-model, drop temperature, and retry once — so portable
         // Sema code that sets :temperature still works on those models.
@@ -645,7 +646,7 @@ impl LlmProvider for OpenAiProvider {
                 if mentions_unsupported_temperature(message) {
                     let model = self.resolve_model(&request.model);
                     DROP_TEMPERATURE.with(|s| s.borrow_mut().insert(model));
-                    return self.runtime.block_on(self.complete_async(request));
+                    return sema_io::io_block_on(self.complete_async(request));
                 }
             }
         }
@@ -657,12 +658,13 @@ impl LlmProvider for OpenAiProvider {
         request: ChatRequest,
         on_chunk: &mut dyn FnMut(&str) -> Result<(), LlmError>,
     ) -> Result<ChatResponse, LlmError> {
-        self.runtime
-            .block_on(self.stream_complete_async(request, on_chunk))
+        // io_block_on drives ON THIS thread: `on_chunk` may touch non-Send Sema
+        // values and must never migrate to a pool worker.
+        sema_io::io_block_on(self.stream_complete_async(request, on_chunk))
     }
 
     fn batch_complete(&self, requests: Vec<ChatRequest>) -> Vec<Result<ChatResponse, LlmError>> {
-        self.runtime.block_on(async {
+        sema_io::io_block_on(async {
             let futures: Vec<_> = requests
                 .into_iter()
                 .map(|req| self.complete_async(req))
@@ -672,7 +674,7 @@ impl LlmProvider for OpenAiProvider {
     }
 
     fn embed(&self, request: EmbedRequest) -> Result<EmbedResponse, LlmError> {
-        self.runtime.block_on(self.embed_async(request))
+        sema_io::io_block_on(self.embed_async(request))
     }
 }
 

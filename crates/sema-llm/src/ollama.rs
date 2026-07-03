@@ -99,12 +99,10 @@ pub struct OllamaProvider {
     host: String,
     default_model: String,
     client: reqwest::Client,
-    runtime: crate::http::BlockingRuntime,
 }
 
 impl OllamaProvider {
     pub fn new(host: Option<String>, default_model: Option<String>) -> Result<Self, LlmError> {
-        let runtime = crate::http::create_runtime()?;
         let client = crate::http::create_client(None)?;
         Ok(OllamaProvider {
             host: host.unwrap_or_else(|| {
@@ -113,7 +111,6 @@ impl OllamaProvider {
             }),
             default_model: default_model.unwrap_or_else(|| "gemma4".to_string()),
             client,
-            runtime,
         })
     }
 
@@ -332,7 +329,7 @@ impl LlmProvider for OllamaProvider {
     }
 
     fn complete(&self, request: ChatRequest) -> Result<ChatResponse, LlmError> {
-        self.runtime.block_on(self.complete_async(request))
+        sema_io::io_block_on(self.complete_async(request))
     }
 
     fn stream_complete(
@@ -340,12 +337,13 @@ impl LlmProvider for OllamaProvider {
         request: ChatRequest,
         on_chunk: &mut dyn FnMut(&str) -> Result<(), LlmError>,
     ) -> Result<ChatResponse, LlmError> {
-        self.runtime
-            .block_on(self.stream_complete_async(request, on_chunk))
+        // io_block_on drives ON THIS thread: `on_chunk` may touch non-Send Sema
+        // values and must never migrate to a pool worker.
+        sema_io::io_block_on(self.stream_complete_async(request, on_chunk))
     }
 
     fn batch_complete(&self, requests: Vec<ChatRequest>) -> Vec<Result<ChatResponse, LlmError>> {
-        self.runtime.block_on(async {
+        sema_io::io_block_on(async {
             let futures: Vec<_> = requests
                 .into_iter()
                 .map(|req| self.complete_async(req))

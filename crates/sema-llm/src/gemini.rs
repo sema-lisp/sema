@@ -34,18 +34,15 @@ pub struct GeminiProvider {
     base_url: String,
     default_model: String,
     client: reqwest::Client,
-    runtime: crate::http::BlockingRuntime,
 }
 
 impl GeminiProvider {
     pub fn new(api_key: String, default_model: Option<String>) -> Result<Self, LlmError> {
-        let runtime = crate::http::create_runtime()?;
         Ok(GeminiProvider {
             api_key,
             base_url: "https://generativelanguage.googleapis.com/v1beta".to_string(),
             default_model: default_model.unwrap_or_else(|| "gemini-3.5-flash".to_string()),
             client: crate::http::create_client(None)?,
-            runtime,
         })
     }
 
@@ -455,7 +452,7 @@ impl LlmProvider for GeminiProvider {
     }
 
     fn complete(&self, request: ChatRequest) -> Result<ChatResponse, LlmError> {
-        self.runtime.block_on(self.complete_async(request))
+        sema_io::io_block_on(self.complete_async(request))
     }
 
     fn stream_complete(
@@ -463,12 +460,13 @@ impl LlmProvider for GeminiProvider {
         request: ChatRequest,
         on_chunk: &mut dyn FnMut(&str) -> Result<(), LlmError>,
     ) -> Result<ChatResponse, LlmError> {
-        self.runtime
-            .block_on(self.stream_complete_async(request, on_chunk))
+        // io_block_on drives ON THIS thread: `on_chunk` may touch non-Send Sema
+        // values and must never migrate to a pool worker.
+        sema_io::io_block_on(self.stream_complete_async(request, on_chunk))
     }
 
     fn batch_complete(&self, requests: Vec<ChatRequest>) -> Vec<Result<ChatResponse, LlmError>> {
-        self.runtime.block_on(async {
+        sema_io::io_block_on(async {
             let futures: Vec<_> = requests
                 .into_iter()
                 .map(|req| self.complete_async(req))

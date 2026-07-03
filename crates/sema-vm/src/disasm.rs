@@ -113,7 +113,7 @@ pub fn disassemble(chunk: &Chunk, name: Option<&str>) -> String {
 
     while pc < code.len() {
         let op_byte = code[pc];
-        let op = match op_from_u8(op_byte) {
+        let op = match Op::from_u8(op_byte) {
             Some(op) => op,
             None => {
                 writeln!(out, "{pc:04}  UNKNOWN({op_byte:#04x})").unwrap();
@@ -244,18 +244,6 @@ pub fn disassemble(chunk: &Chunk, name: Option<&str>) -> String {
     out
 }
 
-fn op_from_u8(byte: u8) -> Option<Op> {
-    // Must name the highest-numbered opcode (the last `Op` variant). Update when
-    // a new opcode is appended, or disasm mis-decodes it as UNKNOWN and the
-    // pc walk desynchronizes (caught by `make smoke-bytecode`).
-    const MAX_OP: u8 = Op::SelfTailCall as u8;
-    if byte > MAX_OP {
-        return None;
-    }
-    // Safety: Op is repr(u8) and we've bounds-checked
-    Some(unsafe { std::mem::transmute::<u8, Op>(byte) })
-}
-
 #[cfg(test)]
 mod tests {
     use sema_core::{intern, spur_to_bits, Value};
@@ -282,9 +270,10 @@ mod tests {
 
     #[test]
     fn test_disassemble_self_tail_call() {
-        // Regression: op_from_u8's MAX_OP bound must include SelfTailCall, or it
-        // decodes as UNKNOWN and the pc walk desynchronizes (a Const after it
-        // reads a garbage index). A following CONST must still disassemble.
+        // Regression: disasm must decode every real opcode (it delegates to the
+        // canonical `Op::from_u8`). A missed opcode would decode as UNKNOWN and
+        // desynchronize the pc walk (a Const after it reads a garbage index), so
+        // a following CONST must still disassemble at the right offset.
         let mut e = Emitter::new();
         e.emit_const(Value::int(7)).unwrap();
         e.emit_op(Op::SelfTailCall);

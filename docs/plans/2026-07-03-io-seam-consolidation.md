@@ -1,7 +1,9 @@
 # One I/O pool behind one seam (runtime consolidation, Slice A) — ADR #69
 
-**Status:** design approved (4 investigators incl. empirical tokio probes → synthesis →
-2-lens adversarial review → finalize, 2026-07-03) → implementing.
+**Status:** IMPLEMENTED (steps 1-7 landed 2026-07-03 on
+feature/true-async-agent-loop; both oracles green, allowlist exactly as
+designed below). Design: 4 investigators incl. empirical tokio probes →
+synthesis → 2-lens adversarial review → finalize, 2026-07-03.
 Goal (user-stated): *"the codebase must not sprawl ad-hoc mechanisms for what the
 scheduler should be handling"* — one park/wake mechanism (the scheduler + `AwaitIo`),
 one executor seam, N thin platform backends.

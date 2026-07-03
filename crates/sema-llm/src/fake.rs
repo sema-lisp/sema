@@ -211,6 +211,7 @@ impl FakeProviderBuilder {
                 id: id.to_string(),
                 name: name.to_string(),
                 arguments,
+                thought_signature: None,
             }],
             usage: Usage {
                 prompt_tokens: 10,
@@ -445,6 +446,7 @@ impl LlmProvider for FakeProvider {
                         id: format!("call_{assistant_count}"),
                         name: spec.tool_name.clone(),
                         arguments: spec.args.clone(),
+                        thought_signature: None,
                     }],
                     usage: Usage {
                         prompt_tokens: 10,

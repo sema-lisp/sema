@@ -178,6 +178,7 @@ impl AnthropicProvider {
                         id: id.clone(),
                         name: name.clone(),
                         arguments: input.clone(),
+                        thought_signature: None,
                     });
                 }
                 // Thinking / redacted_thinking / unknown blocks: ignore.
@@ -371,6 +372,7 @@ impl AnthropicStreamAccum {
             id,
             name,
             arguments,
+            thought_signature: None,
         }
     }
 

@@ -253,6 +253,7 @@ impl OpenAiProvider {
                         name: tc.function.name.clone(),
                         arguments: serde_json::from_str(&tc.function.arguments)
                             .unwrap_or(serde_json::Value::Object(serde_json::Map::new())),
+                        thought_signature: None,
                     })
                     .collect()
             })
@@ -418,6 +419,7 @@ impl OpenAiProvider {
                 name,
                 arguments: serde_json::from_str(&args)
                     .unwrap_or(serde_json::Value::Object(serde_json::Map::new())),
+                thought_signature: None,
             })
             .collect();
 
@@ -801,6 +803,7 @@ mod tests {
                         id: "call_1".into(),
                         name: "get_weather".into(),
                         arguments: serde_json::json!({"city": "Oslo"}),
+                        thought_signature: None,
                     }],
                 ),
                 ChatMessage::tool_result("call_1", "get_weather", "sunny"),

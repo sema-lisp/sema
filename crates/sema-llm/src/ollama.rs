@@ -39,6 +39,7 @@ fn parse_tool_calls(message: &serde_json::Value) -> Vec<ToolCall> {
                 id: format!("ollama-call-{i}"),
                 name,
                 arguments,
+                thought_signature: None,
             })
         })
         .collect()

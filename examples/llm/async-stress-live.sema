@@ -169,10 +169,12 @@
 
 ;; ── 5. Streaming ─────────────────────────────────────────────────────────────
 (println "── 5. streaming")
+;; Ask for a reply long enough that every provider splits it across deltas —
+;; anthropic can legitimately deliver a one-liner as a single chunk.
 (define chunk-count 0)
-(llm/stream "Count from 1 to 10, one number per line."
+(llm/stream "Write six short sentences about the sea, one per line."
             (fn (chunk) (set! chunk-count (+ chunk-count 1)))
-            {:max-tokens 100})
+            {:max-tokens 250})
 (check "llm/stream delivers progressive chunks"
        (> chunk-count 1)
        (format "~a chunks" chunk-count))
@@ -204,8 +206,8 @@
       (async/spawn (fn ()
         (dotimes (i 200) (async/sleep 10) (channel/send storm-ticks 1)))))))
 (define t-storm (elapsed-ms t0g))
-(define storm-http (list-ref storm 3))
-(define storm-shell (list-ref storm 4))
+(define storm-http (nth storm 3))
+(define storm-shell (nth storm 4))
 (check "storm: agent + completes + shell + ticker settled concurrently"
        (and (> (string-length (:stdout storm-shell)) 0)
             (> (channel/count storm-ticks) 0))
@@ -255,12 +257,17 @@
 (define (matrix-run pname model)
   (llm/set-default pname)
   (define t0m (sys/elapsed))
+  ;; A provider failure must FAIL this provider's check, not abort the script —
+  ;; the other providers still deserve their turn.
   (define reply
-    (async/await
-      (async/spawn (fn ()
-        (agent/run stress-bot two-round-msg)))))
+    (try
+      (async/await
+        (async/spawn (fn ()
+          (agent/run stress-bot two-round-msg))))
+      (catch e (format "ERROR: ~a" e))))
   (check (format "~a: live 2-tool-round agent (correlation on real wire)" pname)
-         (> (string-length reply) 0)
+         (and (> (string-length reply) 0)
+              (not (string/starts-with? reply "ERROR:")))
          (format "model=~a wall=~ams reply=~a" model (elapsed-ms t0m) reply)))
 
 (when (env "OPENAI_API_KEY") (matrix-run :openai "gpt-5.4-mini"))

@@ -1177,6 +1177,10 @@ fn parse_lisp_provider_response(val: &Value, model: &str) -> Result<ChatResponse
                                 id,
                                 name,
                                 arguments,
+                                thought_signature: tc_map
+                                    .get(&Value::keyword("thought-signature"))
+                                    .and_then(|v| v.as_str())
+                                    .map(|s| s.to_string()),
                             })
                         })
                         .collect()
@@ -7281,6 +7285,10 @@ fn sema_list_to_chat_messages(val: &Value) -> Result<Vec<ChatMessage>, SemaError
                             .get(&Value::keyword("arguments"))
                             .map(sema_core::value_to_json_lossy)
                             .unwrap_or_else(|| serde_json::json!({})),
+                        thought_signature: tm
+                            .get(&Value::keyword("thought-signature"))
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string()),
                     })
                 })
                 .collect();
@@ -7324,6 +7332,15 @@ fn chat_messages_to_sema_list(messages: &[ChatMessage]) -> Value {
                             Value::keyword("arguments"),
                             sema_core::json_to_value(&tc.arguments),
                         );
+                        // Gemini's opaque thoughtSignature must survive the Sema
+                        // round-trip too, or a :messages/:session continuation
+                        // re-sends the turn without it and Gemini 400s.
+                        if let Some(ref sig) = tc.thought_signature {
+                            m.insert(
+                                Value::keyword("thought-signature"),
+                                Value::string(sig),
+                            );
+                        }
                         Value::map(m)
                     })
                     .collect();

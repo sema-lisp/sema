@@ -1053,3 +1053,48 @@ fn zero_upvalue_module_closure_bound_in_importer_env_collected_at_teardown() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// ── Self-tail-call opt: no self-reference cycle per named-let entry ──
+
+#[test]
+fn self_tail_named_let_births_no_cycle() {
+    // A self-tail-only named-let elides its self upvalue (issue #62), so each
+    // loop entry creates no self-reference cycle for the collector to sever.
+    // The pure counter loop captures nothing, so its closure is not even
+    // registered as a candidate. After quiescing, running 300 such loops and
+    // collecting must free nothing.
+    let v = eval_ok(
+        "(begin
+           (gc/collect)
+           (define (churn i)
+             (if (= i 0)
+                 0
+                 (begin
+                   (let loop ((n 4)) (if (= n 0) n (loop (- n 1))))
+                   (churn (- i 1)))))
+           (define result (churn 300))
+           (list result (:collected (gc/collect))))",
+    );
+    assert_eq!(v, Value::list(vec![Value::int(0), Value::int(0)]));
+}
+
+#[test]
+fn self_tail_named_let_with_capture_still_collects_no_cycle() {
+    // A self-tail-only loop that also captures an outer variable keeps that
+    // upvalue (so its closure is registered), but eliding the self upvalue means
+    // there is no cycle: repeated entries leave only acyclic garbage, so a
+    // collection after quiescing severs nothing.
+    let v = eval_ok(
+        "(begin
+           (gc/collect)
+           (define (churn i)
+             (if (= i 0)
+                 :done
+                 (begin
+                   (let ((c i)) (let loop ((n 4) (acc 0)) (if (= n 0) (+ acc c) (loop (- n 1) (+ acc c)))))
+                   (churn (- i 1)))))
+           (define result (churn 300))
+           (list result (:collected (gc/collect))))",
+    );
+    assert_eq!(v, Value::list(vec![Value::keyword("done"), Value::int(0)]));
+}

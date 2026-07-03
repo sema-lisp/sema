@@ -129,6 +129,7 @@ fn patch_closure_func_ids(chunk: &mut Chunk, offset: u16) {
             | Op::StoreUpvalue
             | Op::Call
             | Op::TailCall
+            | Op::SelfTailCall
             | Op::MakeList
             | Op::MakeVector
             | Op::MakeMap
@@ -421,6 +422,14 @@ impl Compiler {
             VarResolution::Global { spur } => {
                 self.emit_load_global(spur)?;
             }
+            // SelfFn only ever appears as the operator of a tail `Call`, which
+            // `compile_call` intercepts before reaching here. Loading it as a
+            // value would mean the resolver mis-fired the self-tail-call opt.
+            VarResolution::SelfFn => {
+                return Err(SemaError::eval(
+                    "internal: self-recursive reference used outside tail-call position",
+                ));
+            }
         }
         Ok(())
     }
@@ -445,6 +454,11 @@ impl Compiler {
             VarResolution::Global { spur } => {
                 self.emit.emit_op(Op::StoreGlobal);
                 self.emit.emit_u32(spur_to_u32(spur));
+            }
+            // The resolver disqualifies the self-tail-call opt when the loop name
+            // is a `set!` target, so a SelfFn store is unreachable by construction.
+            VarResolution::SelfFn => {
+                unreachable!("self-recursive reference cannot be a set! target")
             }
         }
     }
@@ -679,6 +693,26 @@ impl Compiler {
         args: &[ResolvedExpr],
         tail: bool,
     ) -> Result<(), SemaError> {
+        // Self-tail-call: the resolver elided the self upvalue and marked this
+        // operator as the running closure (VarResolution::SelfFn). Emit
+        // SelfTailCall, which reuses the current frame's own closure — no callee
+        // is pushed onto the stack.
+        if tail {
+            if let ResolvedExpr::Var(vr) = func {
+                if matches!(vr.resolution, VarResolution::SelfFn) {
+                    for arg in args {
+                        self.compile_expr(arg)?;
+                        self.stack_height += 1;
+                    }
+                    let argc = args.len() as u16;
+                    self.emit.emit_op(Op::SelfTailCall);
+                    self.emit.emit_u16(argc);
+                    self.stack_height -= argc;
+                    return Ok(());
+                }
+            }
+        }
+
         // Intrinsic recognition: emit inline opcodes for known builtins.
         // This applies regardless of tail position since intrinsics don't create frames.
         if let ResolvedExpr::Var(vr) = func {
@@ -1324,6 +1358,7 @@ mod tests {
                 | Op::StoreUpvalue
                 | Op::Call
                 | Op::TailCall
+                | Op::SelfTailCall
                 | Op::MakeList
                 | Op::MakeVector
                 | Op::MakeMap
@@ -1873,6 +1908,41 @@ mod tests {
         let outer_ops = extract_ops(&outer.chunk);
         assert!(outer_ops.contains(&Op::MakeClosure));
         assert!(outer_ops.contains(&Op::TailCall) || outer_ops.contains(&Op::Call));
+    }
+
+    #[test]
+    fn test_compile_named_let_emits_self_tail_call() {
+        // A self-tail-only loop compiles to SelfTailCall and captures no self
+        // upvalue (issue #62): the loop function must not load a self upvalue.
+        let result = compile_str("(let loop ((n 5)) (if (= n 0) n (loop (- n 1))))");
+        let loop_fn = result
+            .functions
+            .iter()
+            .find(|f| extract_ops(&f.chunk).contains(&Op::SelfTailCall))
+            .expect("the loop function should emit SelfTailCall");
+        let ops = extract_ops(&loop_fn.chunk);
+        assert!(
+            !ops.contains(&Op::LoadUpvalue),
+            "loop must not load a self upvalue"
+        );
+        assert!(
+            loop_fn.upvalue_descs.is_empty(),
+            "loop function should capture nothing, got {:?}",
+            loop_fn.upvalue_descs
+        );
+    }
+
+    #[test]
+    fn test_compile_named_let_escaping_keeps_upvalue() {
+        // When the loop name escapes (passed to `list`), no SelfTailCall is
+        // emitted — the loop still captures itself and self-calls via LoadUpvalue.
+        let result = compile_str("(let loop ((n 5)) (if (= n 0) (list loop) (loop (- n 1))))");
+        for f in &result.functions {
+            assert!(
+                !extract_ops(&f.chunk).contains(&Op::SelfTailCall),
+                "escaping loop must not self-tail-call"
+            );
+        }
     }
 
     // --- compile_many ---

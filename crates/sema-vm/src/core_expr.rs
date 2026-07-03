@@ -9,6 +9,13 @@ pub enum VarResolution {
     Upvalue { index: u16 },
     /// Module-level / global binding.
     Global { spur: Spur },
+    /// The currently-executing closure itself. Produced by the self-tail-call
+    /// optimization for a self-recursive letrec/named-let binding whose name is
+    /// referenced only as the operator of a tail call: instead of capturing the
+    /// binding as an upvalue (which would form the CORE-2 self-reference cycle),
+    /// the reference reads the running frame's own closure. Only ever appears as
+    /// the `func` of a tail `Call`, which the compiler lowers to `SelfTailCall`.
+    SelfFn,
 }
 
 /// A resolved variable reference (name preserved for debugging).

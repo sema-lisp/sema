@@ -98,6 +98,7 @@ fn op_name(op: Op) -> &'static str {
         Op::StringLength => "STRING_LENGTH",
         Op::StringRef => "STRING_REF",
         Op::StringAppend => "STRING_APPEND",
+        Op::SelfTailCall => "SELF_TAIL_CALL",
     }
 }
 
@@ -112,7 +113,7 @@ pub fn disassemble(chunk: &Chunk, name: Option<&str>) -> String {
 
     while pc < code.len() {
         let op_byte = code[pc];
-        let op = match op_from_u8(op_byte) {
+        let op = match Op::from_u8(op_byte) {
             Some(op) => op,
             None => {
                 writeln!(out, "{pc:04}  UNKNOWN({op_byte:#04x})").unwrap();
@@ -174,7 +175,7 @@ pub fn disassemble(chunk: &Chunk, name: Option<&str>) -> String {
                 pc += 5;
             }
 
-            Op::Call | Op::TailCall => {
+            Op::Call | Op::TailCall | Op::SelfTailCall => {
                 let argc = read_u16(code, pc + 1);
                 writeln!(out, "{pc:04}  {:<16} {argc}", op_name(op)).unwrap();
                 pc += 3;
@@ -243,15 +244,6 @@ pub fn disassemble(chunk: &Chunk, name: Option<&str>) -> String {
     out
 }
 
-fn op_from_u8(byte: u8) -> Option<Op> {
-    const MAX_OP: u8 = Op::StringAppend as u8;
-    if byte > MAX_OP {
-        return None;
-    }
-    // Safety: Op is repr(u8) and we've bounds-checked
-    Some(unsafe { std::mem::transmute::<u8, Op>(byte) })
-}
-
 #[cfg(test)]
 mod tests {
     use sema_core::{intern, spur_to_bits, Value};
@@ -274,6 +266,26 @@ mod tests {
         assert!(output.contains("RETURN"));
         assert!(output.contains("1"));
         assert!(output.contains("2"));
+    }
+
+    #[test]
+    fn test_disassemble_self_tail_call() {
+        // Regression: disasm must decode every real opcode (it delegates to the
+        // canonical `Op::from_u8`). A missed opcode would decode as UNKNOWN and
+        // desynchronize the pc walk (a Const after it reads a garbage index), so
+        // a following CONST must still disassemble at the right offset.
+        let mut e = Emitter::new();
+        e.emit_const(Value::int(7)).unwrap();
+        e.emit_op(Op::SelfTailCall);
+        e.emit_u16(1);
+        e.emit_const(Value::int(9)).unwrap();
+        e.emit_op(Op::Return);
+        let chunk = e.into_chunk();
+        let output = disassemble(&chunk, Some("stc"));
+        assert!(output.contains("SELF_TAIL_CALL"), "got: {output}");
+        assert!(!output.contains("UNKNOWN"), "misaligned decode: {output}");
+        // The Const after SelfTailCall must decode at the right offset (value 9).
+        assert!(output.contains("; 9"), "post-op Const misaligned: {output}");
     }
 
     #[test]

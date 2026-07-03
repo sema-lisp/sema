@@ -747,6 +747,7 @@ fn advance_pc(code: &[u8], pc: usize) -> Result<(Op, usize), SemaError> {
         | Op::StoreUpvalue
         | Op::Call
         | Op::TailCall
+        | Op::SelfTailCall
         | Op::MakeList
         | Op::MakeVector
         | Op::MakeMap
@@ -1058,9 +1059,13 @@ fn stack_effect_operand(code: &[u8], pc: usize, op: Op) -> Result<u16, SemaError
     };
     match op {
         // u16 operand immediately after the opcode byte
-        Op::Call | Op::TailCall | Op::MakeList | Op::MakeVector | Op::MakeMap | Op::MakeHashMap => {
-            read_u16_at(1)
-        }
+        Op::Call
+        | Op::TailCall
+        | Op::SelfTailCall
+        | Op::MakeList
+        | Op::MakeVector
+        | Op::MakeMap
+        | Op::MakeHashMap => read_u16_at(1),
         // u16 native_id + u16 argc → argc is the second u16
         Op::CallNative => read_u16_at(3),
         // u32 spur + u16 argc + u16 cache_slot → argc is the u16 after the spur

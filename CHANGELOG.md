@@ -4,6 +4,22 @@
 
 ### Added
 
+- **Self-tail-call optimization: named-let loops no longer birth a self-reference
+  cycle (issue #62).** A self-recursive named-let / `letrec` loop whose name is
+  referenced only in tail-call position no longer captures itself as an upvalue.
+  The resolver detects the pattern and elides the self upvalue
+  (`VarResolution::SelfFn`); the compiler emits a new `SelfTailCall` opcode that
+  reuses the running frame's own closure instead of `LoadUpvalue`+`TailCall`. This
+  removes the CORE-2 self-reference cycle (ADR #66) at its hottest source — every
+  loop *entry* previously birthed a 3-node cycle for the collector to trace and
+  sever — and lets pure counter loops reach zero upvalues (skipping cycle-candidate
+  registration entirely). Measured ~22% faster on `mandelbrot.sema` (named-let per
+  pixel) with identical output. The optimization is conservative: it does not fire when
+  the loop name escapes (stored, passed, returned, `set!`, captured by an inner
+  lambda, or used in non-tail position) — those keep the real self-capture.
+  Verified by resolver/compiler unit tests, end-to-end eval oracles (including the
+  upvalue-index remap when a loop also captures outer variables), a `.semac`
+  round-trip + verifier test, and `gc_stress_test` no-cycle assertions.
 - **Sema Web — run Sema apps in the browser.** The new `@sema-lang/sema-web`
   package embeds the WASM VM in the browser with reactive state
   (`state`/`computed`/`watch`), SIP markup (hiccup-style vectors), a component
@@ -26,6 +42,16 @@
   printing a URL or opening a browser). Off by default (backward-compatible); the
   notebook server opts in. See the
   [Web Server docs](https://sema-lang.com/docs/stdlib/web-server).
+- **Transitive dependency resolution for `sema pkg`.** `sema pkg install` (and
+  `add`/`update`/`remove`) now walks each dependency's own `[deps]` and installs
+  the whole graph, instead of only the project's top-level manifest — no more
+  hand-flattening a dependency tree into your own `sema.toml`. Diamond conflicts
+  resolve deterministically: direct deps always win over transitive requests,
+  semver-compatible transitive versions pick the higher one, and incompatible
+  majors / conflicting git refs hard-error asking for an explicit override.
+  `sema.lock` records a per-entry `direct` flag (additive; defaults to `true`
+  when absent, so existing lock files are unaffected) so `--locked` and
+  `sema pkg list` can distinguish direct from transitive packages.
 - **CORE-2 fixed: cycle-collecting garbage collector.** Sema now reclaims reference
   cycles — a synchronous Bacon–Rajan cycle collector (ADR #66; design + measurements
   in `docs/plans/2026-07-02-core2-gc.md`) runs over the existing `Rc` heap with a

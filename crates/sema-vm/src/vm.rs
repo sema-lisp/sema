@@ -1932,6 +1932,22 @@ impl VM {
                         }
                         continue 'dispatch;
                     }
+                    op::SELF_TAIL_CALL => {
+                        // Self-recursive tail call: the callee is the current
+                        // frame's own closure, so no callee value is on the stack.
+                        // Cannot dispatch a native, so no async-yield path is
+                        // possible; only an arity mismatch can raise.
+                        let argc = read_u16!(code, pc) as usize;
+                        self.frames[fi].pc = pc;
+                        let saved_pc = pc - op::SIZE_OP_U16;
+                        if let Err(err) = self.self_tail_call(argc) {
+                            match self.handle_exception(err, saved_pc)? {
+                                ExceptionAction::Handled => {}
+                                ExceptionAction::Propagate(e) => return Err(e),
+                            }
+                        }
+                        continue 'dispatch;
+                    }
                     op::RETURN => {
                         let result = if !self.stack.is_empty() {
                             unsafe { pop_unchecked(&mut self.stack) }
@@ -3070,6 +3086,67 @@ impl VM {
         frame.closure = closure;
         frame.pc = 0;
         // base stays the same
+        frame.open_upvalues = None;
+
+        Ok(())
+    }
+
+    /// Self-recursive tail call (`Op::SelfTailCall`): the callee is the current
+    /// frame's own closure, so no callee value is on the stack — only `argc`
+    /// args. Reuses the frame in place (rebind args, jump to entry) reading the
+    /// closure straight off the frame instead of a `LoadUpvalue`.
+    ///
+    /// Emitted only inside a loop lambda's own compiled `Function`, which runs
+    /// solely as that closure's frame, so `frame.closure` is always the correct
+    /// self. Because the self upvalue was elided by the resolver
+    /// (`VarResolution::SelfFn`), no self cell is ever captured and no cycle
+    /// forms.
+    fn self_tail_call(&mut self, argc: usize) -> Result<(), SemaError> {
+        let closure = self.frames.last().unwrap().closure.clone();
+        let func = &closure.func;
+        let arity = func.arity as usize;
+        let has_rest = func.has_rest;
+        let n_locals = func.chunk.n_locals as usize;
+
+        // Arity check — a self-call can still be written with the wrong argument
+        // count, e.g. `(let loop ((a 1) (b 2)) (loop 1))`.
+        if has_rest {
+            if argc < arity {
+                return Err(SemaError::arity(
+                    func.name
+                        .map(resolve_spur)
+                        .unwrap_or_else(|| "<lambda>".to_string()),
+                    format!("{}+", arity),
+                    argc,
+                ));
+            }
+        } else if argc != arity {
+            return Err(SemaError::arity(
+                func.name
+                    .map(resolve_spur)
+                    .unwrap_or_else(|| "<lambda>".to_string()),
+                arity.to_string(),
+                argc,
+            ));
+        }
+
+        // Args sit directly on top of this frame's locals (no callee slot).
+        let src = self.stack.len() - argc;
+        let base = self.frames.last().unwrap().base;
+
+        // Close any open upvalue cells over this frame's locals before the args
+        // overwrite them. The self upvalue is never captured, but the loop body
+        // may still have made closures capturing OTHER loop locals.
+        if let Some(ref mut open) = self.frames.last_mut().unwrap().open_upvalues {
+            close_open_upvalues(open, &self.stack, base);
+        }
+
+        Self::copy_args_to_locals(&mut self.stack, base, src, arity, argc, has_rest);
+        self.stack.resize(base + n_locals, Value::nil());
+
+        // Reuse the frame: same closure, base and cache — just jump to entry.
+        let frame = self.frames.last_mut().unwrap();
+        frame.pc = 0;
         frame.open_upvalues = None;
 
         Ok(())
@@ -4669,6 +4746,54 @@ mod tests {
             err.to_string().contains("DUP on empty stack"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn self_tail_call_opcode_runs_a_countdown_loop() {
+        // Hand-assemble a self-recursive countdown that loops via SELF_TAIL_CALL
+        // (no callee on the stack — the VM reuses the current frame's closure):
+        //   (fn loop (n) (if (= n 0) n (loop (- n 1))))
+        use crate::emit::Emitter;
+        let mut e = Emitter::new();
+        e.emit_op(Op::LoadLocal0); // n
+        e.emit_const(Value::int(0)).unwrap();
+        e.emit_op(Op::Eq); // n == 0
+        let jf = e.emit_jump(Op::JumpIfFalse);
+        e.emit_op(Op::LoadLocal0); // n (== 0)
+        e.emit_op(Op::Return);
+        e.patch_jump(jf); // recursive branch
+        e.emit_op(Op::LoadLocal0); // n
+        e.emit_const(Value::int(1)).unwrap();
+        e.emit_op(Op::Sub); // n - 1
+        e.emit_op(Op::SelfTailCall);
+        e.emit_u16(1); // argc = 1
+        let mut chunk = e.into_chunk();
+        chunk.max_stack = 8;
+        chunk.n_locals = 1;
+        let func = Rc::new(Function {
+            name: Some(intern("loop")),
+            chunk,
+            upvalue_descs: vec![],
+            upvalue_names: vec![],
+            arity: 1,
+            has_rest: false,
+            local_names: vec![],
+            source_file: None,
+            local_scopes: Vec::new(),
+            cache_offset: 0,
+        });
+        let closure = Rc::new(Closure {
+            func: func.clone(),
+            upvalues: vec![],
+            globals: None,
+            functions: None,
+        });
+        let globals = make_test_env();
+        let ctx = EvalContext::new();
+        let mut vm = VM::new(globals, vec![func], &[], 0).unwrap();
+        vm.setup_for_call(closure, &[Value::int(5)]).unwrap();
+        let result = vm.run(&ctx).unwrap();
+        assert_eq!(result, Value::int(0));
     }
 
     #[test]

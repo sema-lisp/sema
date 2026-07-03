@@ -109,6 +109,13 @@ pub enum Op {
     StringLength, // pop string, push char count as int (1-arg only)
     StringRef,    // pop index, pop string → push char at index
     StringAppend, // pop two values, push concatenated string (2-arg only)
+
+    // Self-recursive tail call — the callee is the current frame's own closure,
+    // so no closure value is on the stack (contrast `TailCall`). Emitted by the
+    // compiler for self-tail-only named-let / letrec loops whose self upvalue
+    // was elided by the resolver (see `VarResolution::SelfFn`). Appended last to
+    // keep all preceding opcode numbers stable for `.semac` compatibility.
+    SelfTailCall, // u16 argc → tail call reusing the current frame's closure
 }
 
 impl Op {
@@ -188,15 +195,16 @@ impl Op {
             66 => Some(Op::StringLength),
             67 => Some(Op::StringRef),
             68 => Some(Op::StringAppend),
+            69 => Some(Op::SelfTailCall),
             _ => None,
         }
     }
 
     /// Static stack effect of this opcode.
     ///
-    /// For variable-arity opcodes (`Call`, `TailCall`, `CallGlobal`, `CallNative`,
-    /// `MakeList`, `MakeVector`, `MakeMap`, `MakeHashMap`) the caller must pass the
-    /// decoded operand count (`argc` / `n` / `n_pairs`); for all other opcodes the
+    /// For variable-arity opcodes (`Call`, `TailCall`, `SelfTailCall`, `CallGlobal`,
+    /// `CallNative`, `MakeList`, `MakeVector`, `MakeMap`, `MakeHashMap`) the caller
+    /// must pass the decoded operand count (`argc` / `n` / `n_pairs`); for all other opcodes the
     /// `operand` argument is ignored — pass `0`.
     ///
     /// This is the single source of truth used by the bytecode verifier
@@ -237,6 +245,11 @@ impl Op {
             },
             TailCall => StackEffect {
                 pops: operand + 1, // callee + args
+                pushes: 0,
+                exits_frame: true,
+            },
+            SelfTailCall => StackEffect {
+                pops: operand, // args only — the callee is the current frame's own closure
                 pushes: 0,
                 exits_frame: true,
             },
@@ -371,6 +384,7 @@ const _: () = {
             Op::StringLength => {}
             Op::StringRef => {}
             Op::StringAppend => {}
+            Op::SelfTailCall => {}
         }
     }
 };
@@ -447,6 +461,7 @@ pub mod op {
     pub const STRING_LENGTH: u8 = Op::StringLength as u8;
     pub const STRING_REF: u8 = Op::StringRef as u8;
     pub const STRING_APPEND: u8 = Op::StringAppend as u8;
+    pub const SELF_TAIL_CALL: u8 = Op::SelfTailCall as u8;
 
     // Instruction sizes (opcode byte + operand bytes)
     /// Size of a bare opcode with no operands: 1

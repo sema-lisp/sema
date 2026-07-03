@@ -425,7 +425,7 @@ The VM's hot dispatch loop uses an unchecked stack pop (`pop_unchecked`) for spe
 
 The verifier abstract-interprets each chunk:
 
-- Each opcode has a static stack effect (`Op::stack_effect()` — the single source of truth shared with the VM dispatch arms). Variable-arity opcodes (`Call`, `TailCall`, `CallGlobal`, `CallNative`, `MakeList`, `MakeVector`, `MakeMap`, `MakeHashMap`) compute their effect from the decoded operand count.
+- Each opcode has a static stack effect (`Op::stack_effect()` — the single source of truth shared with the VM dispatch arms). Variable-arity opcodes (`Call`, `TailCall`, `SelfTailCall`, `CallGlobal`, `CallNative`, `MakeList`, `MakeVector`, `MakeMap`, `MakeHashMap`) compute their effect from the decoded operand count. `SelfTailCall` pops only its `argc` args (the callee is the running frame's own closure, not a stack value) and exits the frame; the other calls pop the callee too.
 - A worklist tracks the operand-stack depth on entry to every reachable instruction, following fallthrough and jump edges. Exception handlers are seeded as additional roots at their known entry depth (`stack_depth - n_locals + 1`).
 - Join points must agree on depth exactly (strict-equality lattice, like the JVM/CLR verifiers). A disagreement, a reachable pop deeper than the current depth (underflow), a depth above the maximum (overflow), or control falling off the end of a chunk are all rejected with a descriptive `SemaError`.
 
@@ -446,6 +446,10 @@ To keep the common path off the `CallGlobal` → hash-lookup → `NativeFn` rout
 | `StringAppend` (0x44) | `string-append` | 2 | pop 2, push 1 | push the concatenation of two values (non-strings coerced via `Display`); the N-ary `string-append` stays on the generic path |
 
 String indexing is by **Unicode scalar (char)**, not byte, matching the stdlib semantics. These opcodes are additive within the existing encoding (single-byte, no new operand shapes), so they do not change the `format_version`.
+
+### Self-tail-call (`SelfTailCall` 0x45)
+
+`SelfTailCall argc` (`u16 argc`) is a tail call whose callee is the **current frame's own closure**, so — unlike `TailCall` — no callee value is pushed onto the stack; only the `argc` args are. The compiler emits it for a self-recursive named-let / `letrec` loop whose name is referenced only in tail-call position: the resolver elides the self upvalue (see `VarResolution::SelfFn` in `resolve.rs`), so the running frame reads its own closure instead of a captured cell — eliminating the per-entry self-reference cycle (issue #62 / ADR #66). It reuses the frame in place (rebind args, jump to entry, arity-checked). Additive within the existing encoding (`u16` operand, no new operand shape), so it does not change `format_version`.
 
 ## Example
 

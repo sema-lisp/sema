@@ -124,6 +124,24 @@ fn semac_balanced_program_accepted() {
     assert_eq!(result.chunk.consts.len(), 2);
 }
 
+/// A chunk containing `SelfTailCall` (issue #62) must serialize, pass the
+/// stack-balance verifier (it pops `argc` and exits the frame — no callee
+/// slot), and deserialize byte-for-byte unchanged.
+#[test]
+fn semac_self_tail_call_roundtrips_and_validates() {
+    let mut e = Emitter::new();
+    e.emit_const(sema_core::Value::int(0)).unwrap(); // one arg on the stack
+    e.emit_op(Op::SelfTailCall);
+    e.emit_u16(1); // argc = 1: pops 1, exits the frame
+    let mut chunk = e.into_chunk();
+    chunk.n_locals = 1;
+    chunk.max_stack = 2;
+    let original = chunk.code.clone();
+
+    let result = roundtrip_chunk(chunk).expect("SelfTailCall chunk must validate and round-trip");
+    assert_eq!(result.chunk.code, original);
+}
+
 /// A crafted exception entry whose `stack_depth` is inflated above what the
 /// protected range can actually supply must be rejected. The handler is
 /// reachable only via the exception edge (`Throw` has no fallthrough), so the

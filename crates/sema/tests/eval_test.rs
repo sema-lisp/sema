@@ -1741,3 +1741,65 @@ eval_error_tests! {
     prelude_macro_name_in_define_sugar_head_errors:
         "(define (step n) n)" => "define: expected a symbol",
 }
+
+// ============================================================
+// Self-tail-call optimization (issue #62)
+//
+// Self-recursive named-let / letrec loops whose name is referenced only in
+// tail-call position compile to SelfTailCall with the self upvalue elided.
+// These pin end-to-end correctness — especially the upvalue-index remap when
+// the self upvalue is dropped from a lambda that also captures outer variables.
+// ============================================================
+
+eval_tests! {
+    // Pure counter — loop captures nothing (0 upvalues after the opt).
+    stc_counter: "(let loop ((n 5)) (if (= n 0) n (loop (- n 1))))" => Value::int(0),
+    // Accumulator — still self-only.
+    stc_accumulator: "(let loop ((n 5) (acc 0)) (if (= n 0) acc (loop (- n 1) (+ acc n))))" => Value::int(15),
+    // Deep recursion proves the SelfTailCall reuses the frame (no stack growth).
+    stc_deep_tco: "(let loop ((n 1000000) (acc 0)) (if (= n 0) acc (loop (- n 1) (+ acc 1))))" => Value::int(1000000),
+
+    // Captures an outer var referenced AFTER the self-call → self upvalue is the
+    // high index, so dropping it needs no remap. c is captured (uv0), self (uv1).
+    stc_capture_no_shift:
+        "(let ((c 100)) (let loop ((n 5) (acc 0)) (if (= n 0) (+ acc c) (loop (- n 1) (+ acc c)))))" => Value::int(600),
+    // Captures an outer var referenced BEFORE the self-call → self upvalue is
+    // index 0, so dropping it shifts c from uv1 down to uv0. THE KEY REMAP CASE.
+    stc_capture_remap_one:
+        "(let ((c 100)) (let loop ((n 5)) (if (> n 0) (loop (- n 1)) c)))" => Value::int(100),
+    // Self before TWO captured vars → dropping self shifts both a and b down.
+    stc_capture_remap_two:
+        "(let ((a 10) (b 20)) (let loop ((n 2)) (if (> n 0) (loop (- n 1)) (+ a b))))" => Value::int(30),
+
+    // Self-recursion coexisting with a cross-reference (g) in the same lambda:
+    // only the self upvalue is elided; g stays a real upvalue. Self after g.
+    stc_self_and_crossref_no_shift:
+        "(letrec ((f (lambda (n acc) (if (= n 0) (g acc) (f (- n 1) (+ acc 1))))) (g (lambda (x) (* x 2)))) (f 5 0))" => Value::int(10),
+    // Same, but self is captured before g → g's upvalue index shifts on removal.
+    stc_self_and_crossref_shift:
+        "(letrec ((f (lambda (n acc) (if (> n 0) (f (- n 1) (+ acc 1)) (g acc)))) (g (lambda (x) (* x 2)))) (f 5 0))" => Value::int(10),
+
+    // Rest-param self-tail-call exercises the has_rest path in self_tail_call.
+    stc_rest_param:
+        "(letrec ((f (lambda (n . acc) (if (= n 0) acc (f (- n 1) n))))) (f 3))" => Value::list(vec![Value::int(1)]),
+
+    // Nested named-lets — both loops optimize independently.
+    stc_nested_named_lets:
+        "(let loop ((i 3) (sum 0)) (if (= i 0) sum (loop (- i 1) (+ sum (let inner ((j i) (p 0)) (if (= j 0) p (inner (- j 1) (+ p 1))))))))" => Value::int(6),
+
+    // Shadowing: an inner `let` rebinds `loop`; the outer self-call still
+    // optimizes because the shadow resolves to a local, not the self upvalue.
+    stc_shadowed_loop_name:
+        "(let loop ((n 2)) (if (= n 0) (let ((loop 99)) loop) (loop (- n 1))))" => Value::int(99),
+
+    // Escape: the loop name is consed into a list (used as a value), so the opt
+    // is disabled and the real self-capture is retained — result must be right.
+    stc_escape_as_value:
+        "(let loop ((n 3) (acc '())) (if (= n 0) (length acc) (loop (- n 1) (cons loop acc))))" => Value::int(3),
+}
+
+eval_error_tests! {
+    // A self-call with the wrong argument count still reports an arity error
+    // (the SelfTailCall opcode arity-checks against the loop lambda).
+    stc_wrong_arity: "(let loop ((a 1) (b 2)) (loop 1))" => "loop",
+}

@@ -586,6 +586,17 @@ fn resolve_letrec(
         let init = resolve_expr(init_expr, r)?;
         resolved_bindings.push((var_refs[i], init));
     }
+
+    // Self-tail-call optimization (issue #62): a binding bound to a lambda that
+    // references its own name only as a tail-call operator does not need to
+    // capture itself — the running frame already holds its own closure. Eliding
+    // the self upvalue removes the CORE-2 self-reference cycle (ADR #66).
+    for (vr, value) in resolved_bindings.iter_mut() {
+        if let VarResolution::Local { slot } = vr.resolution {
+            optimize_self_tail(value, slot);
+        }
+    }
+
     let resolved_body = resolve_body(body, r)?;
     r.pop_block();
 
@@ -593,6 +604,294 @@ fn resolve_letrec(
         bindings: resolved_bindings,
         body: resolved_body,
     })
+}
+
+/// If a resolved letrec binding value is a lambda whose only reference to its
+/// own name (captured from enclosing local `slot`) is as the operator of a tail
+/// call, elide that self upvalue and rewrite the self-calls to
+/// `VarResolution::SelfFn`. No-op otherwise. See issue #62.
+fn optimize_self_tail(value: &mut ResolvedExpr, slot: u16) {
+    // Peek through a span wrapper to reach the lambda (user `letrec` inits are
+    // spanned list forms; named-let inits are bare lambdas built in lowering).
+    let lambda = match value {
+        ResolvedExpr::Lambda(def) => def,
+        ResolvedExpr::Spanned(_, inner) => match inner.as_mut() {
+            ResolvedExpr::Lambda(def) => def,
+            _ => return,
+        },
+        _ => return,
+    };
+
+    // The upvalue (if any) that captures the loop's own enclosing local slot.
+    let Some(self_uv) = lambda
+        .upvalues
+        .iter()
+        .position(|d| matches!(d, UpvalueDesc::ParentLocal(s) if *s == slot))
+    else {
+        return; // loop name never referenced from its own body
+    };
+    let self_uv = self_uv as u16;
+
+    if !self_tail_only(&lambda.body, self_uv) {
+        return; // the name escapes — keep the real self-capture
+    }
+
+    // Qualified: rewrite references, then drop the now-unused self upvalue.
+    for e in &mut lambda.body {
+        rewrite_self_refs(e, self_uv);
+    }
+    lambda.upvalues.remove(self_uv as usize);
+    lambda.upvalue_names.remove(self_uv as usize);
+}
+
+/// True iff `vr` is a reference to the loop lambda's self upvalue.
+fn is_self_upvalue(vr: &VarRef, self_uv: u16) -> bool {
+    matches!(vr.resolution, VarResolution::Upvalue { index } if index == self_uv)
+}
+
+/// True iff a nested lambda captures the loop's self upvalue. The resolver
+/// chains captures through every intermediate frame, so a *direct* child lambda
+/// lists `ParentUpvalue(self_uv)` whenever any lambda at any depth references
+/// the loop name — one check suffices.
+fn lambda_captures_self(inner: &LambdaDef<VarRef>, self_uv: u16) -> bool {
+    inner
+        .upvalues
+        .iter()
+        .any(|d| matches!(d, UpvalueDesc::ParentUpvalue(i) if *i == self_uv))
+}
+
+/// True iff every reference to `self_uv` in `body` is the operator of a tail
+/// call — the precondition for eliding the self upvalue.
+fn self_tail_only(body: &[ResolvedExpr], self_uv: u16) -> bool {
+    body.iter().all(|e| scan_self_tail(e, self_uv))
+}
+
+/// Returns false as soon as a disqualifying use of `self_uv` is found: used as a
+/// value, `set!` target, non-tail-call operator, or captured by a nested lambda.
+fn scan_self_tail(e: &ResolvedExpr, self_uv: u16) -> bool {
+    use ResolvedExpr as E;
+    match e {
+        E::Var(vr) => !is_self_upvalue(vr, self_uv),
+        E::Set(vr, val) => !is_self_upvalue(vr, self_uv) && scan_self_tail(val, self_uv),
+        E::Call { func, args, tail } => {
+            // The only approved use is the operator of a tail call: skip the
+            // operator and check the arguments.
+            let func_ok =
+                if *tail && matches!(func.as_ref(), E::Var(vr) if is_self_upvalue(vr, self_uv)) {
+                    true
+                } else {
+                    scan_self_tail(func, self_uv)
+                };
+            func_ok && args.iter().all(|a| scan_self_tail(a, self_uv))
+        }
+        E::Lambda(inner) => !lambda_captures_self(inner, self_uv),
+        E::Const(_) | E::Quote(_) | E::DefineRecordType { .. } => true,
+        E::If { test, then, else_ } => {
+            scan_self_tail(test, self_uv)
+                && scan_self_tail(then, self_uv)
+                && scan_self_tail(else_, self_uv)
+        }
+        E::Begin(v) | E::And(v) | E::Or(v) | E::MakeList(v) | E::MakeVector(v) => {
+            v.iter().all(|x| scan_self_tail(x, self_uv))
+        }
+        E::Define(_, val)
+        | E::Throw(val)
+        | E::Load(val)
+        | E::Eval(val)
+        | E::Delay(val)
+        | E::Force(val)
+        | E::Macroexpand(val)
+        | E::Spanned(_, val) => scan_self_tail(val, self_uv),
+        E::Let { bindings, body }
+        | E::LetStar { bindings, body }
+        | E::Letrec { bindings, body } => {
+            bindings
+                .iter()
+                .all(|(_, init)| scan_self_tail(init, self_uv))
+                && body.iter().all(|x| scan_self_tail(x, self_uv))
+        }
+        E::Do(do_loop) => {
+            do_loop.vars.iter().all(|v| {
+                scan_self_tail(&v.init, self_uv)
+                    && v.step.as_ref().is_none_or(|s| scan_self_tail(s, self_uv))
+            }) && scan_self_tail(&do_loop.test, self_uv)
+                && do_loop.result.iter().all(|x| scan_self_tail(x, self_uv))
+                && do_loop.body.iter().all(|x| scan_self_tail(x, self_uv))
+        }
+        E::Try { body, handler, .. } => {
+            body.iter().all(|x| scan_self_tail(x, self_uv))
+                && handler.iter().all(|x| scan_self_tail(x, self_uv))
+        }
+        E::MakeMap(pairs) => pairs
+            .iter()
+            .all(|(k, v)| scan_self_tail(k, self_uv) && scan_self_tail(v, self_uv)),
+        E::Defmacro { body, .. } | E::Module { body, .. } => {
+            body.iter().all(|x| scan_self_tail(x, self_uv))
+        }
+        E::Import { path, .. } => scan_self_tail(path, self_uv),
+        E::Prompt(entries) => entries.iter().all(|entry| match entry {
+            PromptEntry::RoleContent { parts, .. } => {
+                parts.iter().all(|x| scan_self_tail(x, self_uv))
+            }
+            PromptEntry::Expr(x) => scan_self_tail(x, self_uv),
+        }),
+        E::Message { role, parts } => {
+            scan_self_tail(role, self_uv) && parts.iter().all(|x| scan_self_tail(x, self_uv))
+        }
+        E::Deftool {
+            description,
+            parameters,
+            handler,
+            ..
+        } => {
+            scan_self_tail(description, self_uv)
+                && scan_self_tail(parameters, self_uv)
+                && scan_self_tail(handler, self_uv)
+        }
+        E::Defagent { options, .. } => scan_self_tail(options, self_uv),
+    }
+}
+
+/// Remap a single reference during the rewrite: the self upvalue becomes
+/// `SelfFn`; upvalues above it shift down one (their slot vanished); everything
+/// else is untouched. `scan_self_tail` has already proven `self_uv` occurs only
+/// as tail-call operators, so every `Upvalue{self_uv}` reached here is one.
+fn remap_self_ref(vr: &mut VarRef, self_uv: u16) {
+    if let VarResolution::Upvalue { index } = vr.resolution {
+        if index == self_uv {
+            vr.resolution = VarResolution::SelfFn;
+        } else if index > self_uv {
+            vr.resolution = VarResolution::Upvalue { index: index - 1 };
+        }
+    }
+}
+
+/// Shift a direct nested lambda's parent-upvalue descriptors to match the loop
+/// lambda's shrunken upvalue list. Its body indexes its *own* upvalues, so we do
+/// not recurse into it.
+fn remap_nested_lambda(inner: &mut LambdaDef<VarRef>, self_uv: u16) {
+    for d in &mut inner.upvalues {
+        if let UpvalueDesc::ParentUpvalue(i) = d {
+            if *i > self_uv {
+                *d = UpvalueDesc::ParentUpvalue(*i - 1);
+            }
+        }
+    }
+}
+
+/// Rewrite every reference in a qualified loop body: self-calls to `SelfFn`,
+/// higher upvalues shifted down, nested lambda descriptors adjusted.
+fn rewrite_self_refs(e: &mut ResolvedExpr, self_uv: u16) {
+    use ResolvedExpr as E;
+    match e {
+        E::Var(vr) => remap_self_ref(vr, self_uv),
+        E::Set(vr, val) => {
+            remap_self_ref(vr, self_uv);
+            rewrite_self_refs(val, self_uv);
+        }
+        // Stop at nested lambdas: only their parent-upvalue descriptors index
+        // this frame's upvalue list; their bodies index their own.
+        E::Lambda(inner) => remap_nested_lambda(inner, self_uv),
+        E::Const(_) | E::Quote(_) | E::DefineRecordType { .. } => {}
+        E::If { test, then, else_ } => {
+            rewrite_self_refs(test, self_uv);
+            rewrite_self_refs(then, self_uv);
+            rewrite_self_refs(else_, self_uv);
+        }
+        E::Begin(v) | E::And(v) | E::Or(v) | E::MakeList(v) | E::MakeVector(v) => {
+            for x in v {
+                rewrite_self_refs(x, self_uv);
+            }
+        }
+        E::Call { func, args, .. } => {
+            rewrite_self_refs(func, self_uv);
+            for a in args {
+                rewrite_self_refs(a, self_uv);
+            }
+        }
+        E::Define(_, val)
+        | E::Throw(val)
+        | E::Load(val)
+        | E::Eval(val)
+        | E::Delay(val)
+        | E::Force(val)
+        | E::Macroexpand(val)
+        | E::Spanned(_, val) => rewrite_self_refs(val, self_uv),
+        E::Let { bindings, body }
+        | E::LetStar { bindings, body }
+        | E::Letrec { bindings, body } => {
+            for (_, init) in bindings {
+                rewrite_self_refs(init, self_uv);
+            }
+            for x in body {
+                rewrite_self_refs(x, self_uv);
+            }
+        }
+        E::Do(do_loop) => {
+            for v in &mut do_loop.vars {
+                rewrite_self_refs(&mut v.init, self_uv);
+                if let Some(s) = &mut v.step {
+                    rewrite_self_refs(s, self_uv);
+                }
+            }
+            rewrite_self_refs(&mut do_loop.test, self_uv);
+            for x in &mut do_loop.result {
+                rewrite_self_refs(x, self_uv);
+            }
+            for x in &mut do_loop.body {
+                rewrite_self_refs(x, self_uv);
+            }
+        }
+        E::Try { body, handler, .. } => {
+            for x in body {
+                rewrite_self_refs(x, self_uv);
+            }
+            for x in handler {
+                rewrite_self_refs(x, self_uv);
+            }
+        }
+        E::MakeMap(pairs) => {
+            for (k, v) in pairs {
+                rewrite_self_refs(k, self_uv);
+                rewrite_self_refs(v, self_uv);
+            }
+        }
+        E::Defmacro { body, .. } | E::Module { body, .. } => {
+            for x in body {
+                rewrite_self_refs(x, self_uv);
+            }
+        }
+        E::Import { path, .. } => rewrite_self_refs(path, self_uv),
+        E::Prompt(entries) => {
+            for entry in entries {
+                match entry {
+                    PromptEntry::RoleContent { parts, .. } => {
+                        for x in parts {
+                            rewrite_self_refs(x, self_uv);
+                        }
+                    }
+                    PromptEntry::Expr(x) => rewrite_self_refs(x, self_uv),
+                }
+            }
+        }
+        E::Message { role, parts } => {
+            rewrite_self_refs(role, self_uv);
+            for x in parts {
+                rewrite_self_refs(x, self_uv);
+            }
+        }
+        E::Deftool {
+            description,
+            parameters,
+            handler,
+            ..
+        } => {
+            rewrite_self_refs(description, self_uv);
+            rewrite_self_refs(parameters, self_uv);
+            rewrite_self_refs(handler, self_uv);
+        }
+        E::Defagent { options, .. } => rewrite_self_refs(options, self_uv),
+    }
 }
 
 fn resolve_do(do_loop: &DoLoop<Spur>, r: &mut Resolver) -> Result<ResolvedExpr, SemaError> {
@@ -1552,6 +1851,86 @@ mod tests {
             }
             other => panic!("expected Lambda, got {other:?}"),
         }
+    }
+
+    // ---- Self-tail-call optimization (issue #62) ----
+
+    /// Extract the loop lambda from a top-level named-let source.
+    fn loop_lambda(src: &str) -> LambdaDef<VarRef> {
+        match resolve_str(src) {
+            ResolvedExpr::Letrec { bindings, .. } => match &bindings[0].1 {
+                ResolvedExpr::Lambda(def) => def.clone(),
+                other => panic!("expected Lambda binding, got {other:?}"),
+            },
+            other => panic!("expected Letrec, got {other:?}"),
+        }
+    }
+
+    /// The func of the tail self-call in `(if (= n 0) <base> (loop <step>))`.
+    fn self_call_resolution(loop_fn: &LambdaDef<VarRef>) -> VarResolution {
+        match &loop_fn.body[0] {
+            ResolvedExpr::If { else_, .. } => match else_.as_ref() {
+                ResolvedExpr::Call { func, .. } => match func.as_ref() {
+                    ResolvedExpr::Var(vr) => vr.resolution,
+                    other => panic!("expected Var func, got {other:?}"),
+                },
+                other => panic!("expected Call in else branch, got {other:?}"),
+            },
+            other => panic!("expected If body, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_self_tail_call_named_let_elides_self_upvalue() {
+        // Counter loop: `loop` is referenced only as a tail-call operator, so the
+        // self upvalue is elided and the call resolves to SelfFn (no cycle).
+        let loop_fn = loop_lambda("(let loop ((n 5)) (if (= n 0) n (loop (- n 1))))");
+        assert!(
+            loop_fn.upvalues.is_empty(),
+            "self upvalue should be elided, got {:?}",
+            loop_fn.upvalues
+        );
+        assert_eq!(self_call_resolution(&loop_fn), VarResolution::SelfFn);
+    }
+
+    #[test]
+    fn test_self_tail_call_not_applied_when_loop_name_escapes() {
+        // `loop` passed as a value (to `list`) must keep the real self upvalue —
+        // the closure can be invoked from outside its own frame.
+        let loop_fn = loop_lambda("(let loop ((n 5)) (if (= n 0) (list loop) (loop (- n 1))))");
+        assert_eq!(
+            loop_fn.upvalues.len(),
+            1,
+            "escaping loop name keeps its self upvalue"
+        );
+        assert!(matches!(
+            self_call_resolution(&loop_fn),
+            VarResolution::Upvalue { .. }
+        ));
+    }
+
+    #[test]
+    fn test_self_tail_call_not_applied_for_non_tail_self_call() {
+        // Non-tail self-call `(+ 1 (loop ...))` disqualifies the optimization.
+        let loop_fn = loop_lambda("(let loop ((n 5)) (if (= n 0) 0 (+ 1 (loop (- n 1)))))");
+        assert_eq!(
+            loop_fn.upvalues.len(),
+            1,
+            "non-tail self-call keeps the self upvalue"
+        );
+    }
+
+    #[test]
+    fn test_self_tail_call_not_applied_when_captured_by_inner_lambda() {
+        // `loop` captured by a nested lambda needs a real upvalue (a different
+        // frame runs the inner lambda), so the opt must not fire.
+        let loop_fn =
+            loop_lambda("(let loop ((n 5)) (if (= n 0) (lambda () (loop 0)) (loop (- n 1))))");
+        assert_eq!(
+            loop_fn.upvalues.len(),
+            1,
+            "inner-lambda capture keeps the self upvalue"
+        );
     }
 
     #[test]

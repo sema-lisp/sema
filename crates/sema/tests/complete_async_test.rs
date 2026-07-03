@@ -519,3 +519,44 @@ fn sync_complete_outside_async_still_works() {
         .expect("sync complete should run against the fake");
     assert_eq!(val.as_str(), Some("sync answer"));
 }
+
+/// Budget enforcement crosses the spawn + AwaitIo-yield boundary: a completion
+/// running inside an `async/spawn`'d task, under `llm/with-budget`, must charge
+/// the CAPTURED budget frame (dispatch-time `Rc` snapshot, settled in the
+/// poller) — not whatever thread-local scope is live when the future lands.
+/// Composes ASYNC-1's per-task LLM scope capture with the offload path; closes
+/// the "budget-across-yield" gap the ADR #68/#69 plans tracked as step 7.
+#[test]
+#[serial]
+fn budget_enforced_across_spawn_and_yield() {
+    let _cap = sema_otel::testing::install();
+    reset_io_inflight();
+
+    // 100 prompt + 50 completion tokens >> the 5-token budget.
+    let fake = FakeProvider::builder("fake")
+        .model("fake-chat")
+        .chat_delay(50)
+        .reply_with_usage("over", 100, 50)
+        .build();
+    let interp = Interpreter::new();
+    reset_runtime_state();
+    register_test_provider(Box::new(fake));
+
+    let program = r#"
+        (llm/cache-clear)
+        (try
+          (begin
+            (llm/with-budget {:max-tokens 5}
+              (fn () (async/await (async/spawn (fn () (llm/complete "big"))))))
+            "no-error")
+          (catch e "budget-raised"))
+    "#;
+    let val = interp
+        .eval_str_compiled(program)
+        .expect("budget program evaluated");
+    assert_eq!(
+        val.as_str(),
+        Some("budget-raised"),
+        "a spawned completion must charge the captured budget frame and raise on overrun"
+    );
+}

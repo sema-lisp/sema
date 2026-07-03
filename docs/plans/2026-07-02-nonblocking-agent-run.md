@@ -172,6 +172,8 @@ sub-agent-reentrancy test (a tool that itself calls `agent/run`).
 - **In-flight-round cancel is best-effort**: the `spawn_blocking` LLM tier has no
   `AbortHandle`; a cancelled agent's current round completes on the worker and is
   discarded. Cancellation is clean *at the parks between rounds*.
-- **Budget under concurrent spawned agents** under-enforces until Step 7 (the
-  pre-existing `do_complete_async_yield` ASYNC-1 nuance, already in
-  `docs/deferred.md`).
+- ~~Budget under concurrent spawned agents under-enforces~~ **CLOSED 2026-07-03**:
+  ASYNC-1's per-task LLM scope capture (merged from main) composes with the
+  offload's dispatch-time budget-frame `Rc` snapshot — enforcement crosses
+  spawn+yield. Pinned by `budget_enforced_across_spawn_and_yield`
+  (complete_async_test.rs); Step 7 is done, no separate PR needed.

@@ -779,18 +779,32 @@ during every inter-round park; `async/timeout` cancels cleanly at the parks.
 - No native holds a `borrow_mut` across a callback / tool execution / inline-task
   spin (copy owned inputs out first).
 
-**Honest limits:** `:on-text` streaming rounds (reusing the synchronous
-`do_complete_streaming`) and synchronous CPU-bound tools between rounds block
-siblings; a synchronous `:on-text` callback works, but async work inside `:on-text`
-during a streaming round is unsupported (documented, not validated). LLM-tier
-cancellation is REAL for the native providers: the wire stage is an `io_spawn`ed
-pool future whose `AbortHook` feeds `IoHandle::with_abort` (like http/shell), so a
-cancelled agent's in-flight round is dropped mid-flight — connection torn down, no
-wasted round-trip (`run_fallback_retry_async` + per-provider `complete_future`;
-gate: `llm_request_is_aborted_on_timeout`). Only sync-only providers (the
-`complete_future` default impl, e.g. FakeProvider) stay best-effort: the blocking
-`complete()` runs out on the worker and its result is discarded. Per-task
-budget-across-yield under concurrent spawned agents
+**Streaming (2026-07-03):** the same pattern extends to streaming. In async
+context `llm/stream` and agent `:on-text` rounds run the wire side (the
+provider's synchronous SSE drive) on the I/O pool, sending deltas over a
+channel; the bytecode `__stream-drive` prelude loop parks on `AwaitIo` between
+delta batches — the poller drains all currently-available deltas per wake — and
+calls the callback per delta IN TASK CONTEXT. Siblings interleave between a
+stream's deltas, and a callback that itself yields (`async/sleep`, channel ops,
+`await`) is supported. Usage is accounted exactly once, in the poller's
+finalize, mirroring `do_complete_async_yield`. Sync/top-level `llm/stream`
+keeps the byte-identical blocking native (`__llm-stream-blocking`). Oracle:
+`stream_async_test.rs`.
+
+**Honest limits:** an `:on-text`/`llm/stream` callback runs synchronously per
+delta on the VM thread — a CPU-bound callback still holds the thread between
+yields — and synchronous CPU-bound tools between rounds block siblings (no
+preemption of Sema code). LLM-tier cancellation is REAL for the native
+providers: the completion wire stage is an `io_spawn`ed pool future whose
+`AbortHook` feeds `IoHandle::with_abort` (like http/shell), so a cancelled
+agent's in-flight round is dropped mid-flight — connection torn down
+(`run_fallback_retry_async` + per-provider `complete_future`; gate:
+`llm_request_is_aborted_on_timeout`). Best-effort remains for sync-only
+providers (the `complete_future` default impl, e.g. FakeProvider) and for the
+STREAMING wire stage (`spawn_blocking(provider.stream)`, no abort hook): a task
+cancelled mid-stream abandons its stream-run slab entry and the wire worker
+streams to completion into a dead channel. Per-task budget-across-yield under
+concurrent spawned agents
 is a pre-existing single-completion ASYNC-1 gap, closed separately (plan Step 7).
 ~~Cancelled agents leak their slab entry (and never-ended agent span) until
 `reset_runtime_state`~~ — closed 2026-07-03: the scheduler's `task-reaped` callback

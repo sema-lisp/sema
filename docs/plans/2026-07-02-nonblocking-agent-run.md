@@ -160,13 +160,22 @@ sub-agent-reentrancy test (a tool that itself calls `agent/run`).
 
 ## Honest limits (documented, not silent)
 
-- **Streaming rounds block siblings**: `:on-text` drives the SSE stream inline on
-  the VM thread; that round does not yield (it reuses the pre-existing synchronous
-  `do_complete_streaming`). A synchronous `:on-text` callback works and receives
-  deltas; performing an **async operation inside `:on-text`** (e.g. `await`,
-  `channel/recv`, `async/sleep`) during a streaming round is **unsupported** — the
-  yield leaks mid-native. This is a documented limitation, not a rejected/validated
-  case; do not do async work inside `:on-text`.
+- ~~Streaming rounds block siblings~~ **CLOSED 2026-07-03**: streaming got the
+  same lift-the-loop treatment. In async context `llm/stream` and agent `:on-text`
+  rounds run the wire side (the provider's synchronous SSE drive) on the I/O pool,
+  sending deltas over a channel; the bytecode `__stream-drive` loop parks on
+  `AwaitIo` between delta batches (the poller drains all currently-available
+  deltas per wake, amortizing park/resume over fast token streams) and calls the
+  callback per delta IN TASK CONTEXT — siblings interleave between deltas, and a
+  callback that itself yields (`async/sleep`, channel ops, `await`) is now
+  supported. Pinned by `stream_async_test.rs` (sibling-ticker-during-stream
+  oracle, yielding-callback, usage-once, ordering, mid-stream-error). The
+  remaining truth: **the callback itself runs synchronously per delta on the VM
+  thread** — a CPU-bound `:on-text` callback still holds the thread between
+  yields. Sync/top-level `llm/stream` keeps the byte-identical blocking native;
+  a cancelled task parked in `__stream-next` abandons its slab entry and the
+  wire worker streams to completion into a dead channel (best-effort, same as
+  completion offloads).
 - **Synchronous CPU-bound tools between rounds block siblings** (no preemption of
   Sema code — the standing single-threaded limit).
 - ~~In-flight-round cancel is best-effort~~ **CLOSED 2026-07-03**: the wire stage

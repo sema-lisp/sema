@@ -517,11 +517,20 @@ pub const PRELUDE: &str = r#"
 ;; bounds (max-turns, consecutive-error abort) are enforced in the Rust handle. The
 ;; synchronous / wasm path stays the byte-identical blocking native `__agent-run-blocking`.
 (define (__agent-drive __h)
-  (let ((__r (__agent-step __h)))
-    (if (:has-tools __r)
-        (begin (__agent-exec-tools __h)
-               (if (:done __r) (__agent-finish __h) (__agent-drive __h)))
-        (__agent-finish __h))))
+  (let ((__r0 (__agent-step __h)))
+    ;; A streaming (:on-text) round hands back {:stream tok :on-text cb} instead
+    ;; of running inline: drive the deltas in TASK context (the callback may
+    ;; itself yield; siblings interleave between delta batches), then apply the
+    ;; assembled response to the loop state (usage was accounted by the stream
+    ;; poller) to get the ordinary {:done :has-tools} map.
+    (let ((__r (if (nil? (:stream __r0))
+                   __r0
+                   (begin (__stream-drive (:stream __r0) (:on-text __r0))
+                          (__agent-stream-apply __h (:stream __r0))))))
+      (if (:has-tools __r)
+          (begin (__agent-exec-tools __h)
+                 (if (:done __r) (__agent-finish __h) (__agent-drive __h)))
+          (__agent-finish __h)))))
 
 (define (agent/run __agent __input . __rest)
   (if (__async-context?)
@@ -529,4 +538,32 @@ pub const PRELUDE: &str = r#"
         (try (__agent-drive __h)
              (catch __e (begin (__agent-finish __h) (throw __e)))))
       (apply __agent-run-blocking __agent __input __rest)))
+
+;; ── Non-blocking streaming (llm/stream + agent :on-text rounds, ADR #68) ──────
+;; Same pivotal constraint as the agent loop: a native cannot loop-yield, so the
+;; per-delta loop lives in bytecode. The wire side streams on the I/O pool into a
+;; channel; `__stream-next` parks on AwaitIo and resolves each batch of deltas as
+;; {:deltas [...] :done bool}; this driver calls the callback per delta IN TASK
+;; CONTEXT — a callback that itself yields (async/sleep, channel ops, await) is
+;; legal, and sibling tasks run between batches.
+(define (__stream-drive __tok __cb)
+  (let ((__r (__stream-next __tok)))
+    (begin
+      (for-each __cb (:deltas __r))
+      (if (:done __r) nil (__stream-drive __tok __cb)))))
+
+;; llm/stream: inside an async scheduler task, route through the non-blocking
+;; stream machinery (offloaded wire + per-batch parks) so siblings interleave
+;; between deltas; at top level / sync context the byte-identical blocking native
+;; runs. With no callback the deltas print to stdout, trailing newline included —
+;; matching the blocking native's default display.
+(define (llm/stream . __args)
+  (if (and (__async-context?) (not (null? __args)))
+      (let ((__cbs (filter procedure? (cdr __args)))
+            (__tok (apply __stream-begin __args)))
+        (let ((__cb (if (null? __cbs) (fn (__c) (display __c)) (car __cbs))))
+          (__stream-drive __tok __cb)
+          (let ((__out (__stream-finish __tok)))
+            (if (null? __cbs) (begin (newline) __out) __out))))
+      (apply __llm-stream-blocking __args)))
 "#;

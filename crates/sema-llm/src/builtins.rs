@@ -449,6 +449,7 @@ pub fn reset_runtime_state() {
     RETRY_BASE_MS.with(|c| c.set(500));
     NETWORK_MAX_RETRIES.with(|c| c.set(3));
     clear_agent_runs();
+    clear_stream_runs();
     pricing::clear_custom_pricing();
 }
 
@@ -2129,58 +2130,14 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
 
     // (llm/stream "prompt" callback {:max-tokens 200})
     // (llm/stream "prompt" {:max-tokens 200})  — prints to stdout
-    register_fn_ctx(env, "llm/stream", |ctx, args| {
-        if args.is_empty() || args.len() > 3 {
-            return Err(SemaError::arity("llm/stream", "1-3", args.len()));
-        }
-
-        // Parse the prompt/messages
-        let messages = if let Some(s) = args[0].as_str() {
-            vec![ChatMessage::new("user", s)]
-        } else if let Some(p) = args[0].as_prompt_rc() {
-            p.messages
-                .iter()
-                .map(|m| ChatMessage::new(m.role.to_string(), m.content.clone()))
-                .collect()
-        } else if args[0].as_seq().is_some() {
-            extract_messages(&args[0])?
-        } else {
-            return Err(SemaError::type_error(
-                "string, prompt, or messages",
-                args[0].type_name(),
-            ));
-        };
-
-        // Parse optional callback and opts
-        let mut callback: Option<Value> = None;
-        let mut opts_map: Option<Rc<BTreeMap<Value, Value>>> = None;
-
-        for arg in &args[1..] {
-            if arg.as_lambda_rc().is_some() || arg.as_native_fn_rc().is_some() {
-                callback = Some(arg.clone());
-            } else if let Some(m) = arg.as_map_rc() {
-                opts_map = Some(m);
-            }
-        }
-
-        let mut model = String::new();
-        let mut max_tokens = None;
-        let mut temperature = None;
-        let mut system = None;
-        let mut conv_scope = ConvScope::default();
-
-        if let Some(ref opts) = opts_map {
-            conv_scope = ConvScope::from_opts(Some(opts));
-            model = get_opt_string(opts, "model").unwrap_or_default();
-            max_tokens = get_opt_u32(opts, "max-tokens");
-            temperature = get_opt_f64(opts, "temperature");
-            system = get_opt_string(opts, "system");
-        }
-
-        let mut request = ChatRequest::new(model, messages);
-        request.max_tokens = max_tokens.or(Some(4096));
-        request.temperature = temperature;
-        request.system = system;
+    //
+    // The synchronous stream native. The public `llm/stream` is a prelude wrapper
+    // that dispatches here outside a scheduler task and to the non-blocking
+    // `__stream-begin`/`__stream-next` machinery inside one (siblings interleave
+    // between delta batches there).
+    register_fn_ctx(env, "__llm-stream-blocking", |ctx, args| {
+        let (request, callback, opts_map) = parse_stream_args(args)?;
+        let conv_scope = ConvScope::from_opts(opts_map.as_ref());
 
         // Streaming bypasses do_complete/track_usage, so it gets its own CLIENT span +
         // conversation scope. A caller-supplied id wins; else generate a fresh one (only
@@ -2994,6 +2951,60 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
     register_fn_ctx(env, "__agent-finish", |_ctx, args| {
         let token = agent_token_arg(args, "__agent-finish")?;
         agent_finish(token)
+    });
+
+    // Non-blocking streaming natives (the `__stream-drive` prelude loop's
+    // primitives; same bytecode-driven shape as the `__agent-*` loop above).
+    register_fn(env, "__stream-begin", |args| {
+        let (request, _callback, opts_map) = parse_stream_args(args)?;
+        let conv_scope = ConvScope::from_opts(opts_map.as_ref());
+        // Same scope rule as the blocking native: a caller-supplied id wins;
+        // else generate a fresh one only if no scope is already active. The
+        // DETACHED span captures the conversation id at creation, so the guard
+        // need only live across span creation.
+        let _conv = conv_scope.open().or_else(|| {
+            (sema_otel::current_conversation_id().is_none()).then(|| {
+                sema_otel::set_conversation_scope(&sema_otel::new_conversation_id(), None, None)
+            })
+        });
+        let span = sema_otel::llm_span_detached("chat");
+        span.set_request(
+            request.temperature,
+            request.max_tokens,
+            &request.stop_sequences,
+            None,
+        );
+        span.set_output_type(false);
+        if let Some(ref m) = opts_map {
+            let tags = get_opt_string_list(m, "tags");
+            if !tags.is_empty() {
+                span.set_tags(&tags);
+            }
+            let meta = get_opt_str_map(m, "metadata");
+            if !meta.is_empty() {
+                span.set_metadata(&meta);
+            }
+        }
+        stream_run_begin(request, span)
+    });
+    register_fn(env, "__stream-next", |args| {
+        if args.len() != 1 {
+            return Err(SemaError::arity("__stream-next", "1", args.len()));
+        }
+        stream_next(stream_token_arg(&args[0])?)
+    });
+    register_fn(env, "__stream-finish", |args| {
+        if args.len() != 1 {
+            return Err(SemaError::arity("__stream-finish", "1", args.len()));
+        }
+        stream_finish(stream_token_arg(&args[0])?)
+    });
+    register_fn(env, "__agent-stream-apply", |args| {
+        if args.len() != 2 {
+            return Err(SemaError::arity("__agent-stream-apply", "2", args.len()));
+        }
+        let agent_token = agent_token_arg(&args[..1], "__agent-stream-apply")?;
+        agent_stream_apply(agent_token, stream_token_arg(&args[1])?)
     });
 
     // (llm/pmap fn collection {:max-tokens N ...})
@@ -7084,6 +7095,68 @@ fn do_complete_with_provider(
     })
 }
 
+/// Parsed `llm/stream`-shaped args: the request, the optional callback, and the
+/// optional opts map.
+type StreamArgs = (
+    ChatRequest,
+    Option<Value>,
+    Option<Rc<BTreeMap<Value, Value>>>,
+);
+
+/// Parse `llm/stream`-shaped args — prompt/messages, then an optional callback
+/// (any procedure) and an optional opts map in either order — into the
+/// `ChatRequest` plus the raw callback/opts. Shared by the blocking native
+/// (`__llm-stream-blocking`) and the non-blocking `__stream-begin`, so both
+/// paths accept byte-identical calls.
+fn parse_stream_args(args: &[Value]) -> Result<StreamArgs, SemaError> {
+    if args.is_empty() || args.len() > 3 {
+        return Err(SemaError::arity("llm/stream", "1-3", args.len()));
+    }
+
+    let messages = if let Some(s) = args[0].as_str() {
+        vec![ChatMessage::new("user", s)]
+    } else if let Some(p) = args[0].as_prompt_rc() {
+        p.messages
+            .iter()
+            .map(|m| ChatMessage::new(m.role.to_string(), m.content.clone()))
+            .collect()
+    } else if args[0].as_seq().is_some() {
+        extract_messages(&args[0])?
+    } else {
+        return Err(SemaError::type_error(
+            "string, prompt, or messages",
+            args[0].type_name(),
+        ));
+    };
+
+    let mut callback: Option<Value> = None;
+    let mut opts_map: Option<Rc<BTreeMap<Value, Value>>> = None;
+    for arg in &args[1..] {
+        if arg.as_lambda_rc().is_some() || arg.as_native_fn_rc().is_some() {
+            callback = Some(arg.clone());
+        } else if let Some(m) = arg.as_map_rc() {
+            opts_map = Some(m);
+        }
+    }
+
+    let mut model = String::new();
+    let mut max_tokens = None;
+    let mut temperature = None;
+    let mut system = None;
+    if let Some(ref opts) = opts_map {
+        model = get_opt_string(opts, "model").unwrap_or_default();
+        max_tokens = get_opt_u32(opts, "max-tokens");
+        temperature = get_opt_f64(opts, "temperature");
+        system = get_opt_string(opts, "system");
+    }
+
+    let mut request = ChatRequest::new(model, messages);
+    request.max_tokens = max_tokens.or(Some(4096));
+    request.temperature = temperature;
+    request.system = system;
+    Ok((request, callback, opts_map))
+}
+
 /// Stream-open budget pre-gate. When `:on-stream :pre-gate` is active, refuse to OPEN a
 /// stream if the scope's spend is already at/over the cost or token limit. (A stream's own
 /// cost is unknown until it ends, so this is the only honest gate — a single in-flight
@@ -7865,10 +7938,34 @@ fn agent_step(ctx: &EvalContext, token: u64) -> Result<Value, SemaError> {
         StepPrep::Run(req, on_text) => (*req, on_text),
     };
 
-    // Streaming rounds (`:on-text`) and non-async context both run synchronously on
-    // the VM thread. Only the plain async path offloads + yields.
+    // Async context: a plain round offloads + yields; a streaming (`:on-text`)
+    // round opens a non-blocking stream run and hands the driver
+    // `{:stream tok :on-text cb}` — the prelude drives `__stream-drive` in TASK
+    // context (so the callback may itself yield, and siblings interleave between
+    // delta batches), then applies the assembled response via
+    // `__agent-stream-apply`, feeding `agent_apply_step_response` unchanged.
     #[cfg(not(target_arch = "wasm32"))]
-    if on_text.is_none() && sema_core::in_async_context() {
+    if sema_core::in_async_context() {
+        if let Some(cb) = on_text {
+            // Mirror `do_complete_streaming`'s scope/span setup, detached (the
+            // span is finalized by the stream poller after the last park).
+            let _conv = (sema_otel::current_conversation_id().is_none()).then(|| {
+                sema_otel::set_conversation_scope(&sema_otel::new_conversation_id(), None, None)
+            });
+            let span = sema_otel::llm_span_detached("chat");
+            span.set_request(
+                request.temperature,
+                request.max_tokens,
+                &request.stop_sequences,
+                request.reasoning_effort.as_deref(),
+            );
+            span.set_output_type(request.json_mode);
+            let stream_token = stream_run_begin(request, span)?;
+            let mut map = BTreeMap::new();
+            map.insert(Value::keyword("stream"), stream_token);
+            map.insert(Value::keyword("on-text"), cb);
+            return Ok(Value::map(map));
+        }
         return do_complete_async_yield(
             request,
             Box::new(move |resp| agent_apply_step_response(token, resp)),
@@ -7876,9 +7973,8 @@ fn agent_step(ctx: &EvalContext, token: u64) -> Result<Value, SemaError> {
     }
 
     // Synchronous round: an `:on-text` streaming round drives the SSE stream inline on
-    // the VM thread (it does not yield — documented sibling-blocking limit); a plain
-    // round in non-async context is the ordinary blocking completion. Either way the
-    // usage is accounted once and the state updated inline.
+    // the VM thread; a plain round in non-async context is the ordinary blocking
+    // completion. Either way the usage is accounted once and the state updated inline.
     let response = match on_text.as_ref() {
         Some(cb) => do_complete_streaming(ctx, request, cb)?,
         None => do_complete(request)?,
@@ -8059,6 +8155,593 @@ fn agent_finish(token: u64) -> Result<Value, SemaError> {
         Ok(Value::string(&result))
     }
     // `st` drops at the end of scope → agent span ends (balanced), conv scope restored.
+}
+
+// ── Non-blocking streaming (`llm/stream` + agent `:on-text` rounds) ──────────
+//
+// The streaming sibling of the `__agent-*` loop above, same ADR #68 shape: a
+// native cannot loop-yield (a yielded `AwaitIo` is not re-invoked, and a Sema
+// callback cannot run inside a poller), so the per-delta loop lives in bytecode
+// (`__stream-drive` in the prelude) over three natives — `__stream-begin` /
+// `__stream-next` / `__stream-finish` — coordinated by a slab entry that owns
+// the wire channel and the finalize context. The wire side (the provider's
+// synchronous SSE drive) runs on the I/O pool, sending each delta over an mpsc
+// channel; only `String`s and the final `ChatResponse` cross the thread
+// boundary, never a Sema `Value`.
+
+/// One event on a stream run's wire channel.
+enum StreamEvent {
+    /// A text delta, in arrival order.
+    Delta(String),
+    /// Terminal event: the assembled response (or the stream failure) plus the
+    /// registry name of the provider that served (or last attempted) it.
+    Done(Box<StreamDone>),
+}
+
+struct StreamDone {
+    result: Result<ChatResponse, LlmError>,
+    provider: String,
+}
+
+/// Per-run state for a non-blocking stream, keyed by an integer token in the
+/// thread-local `STREAM_RUNS` slab (its own slab — agent-loop state is not
+/// touched). Owns the wire receiver and everything the finalize needs on the VM
+/// thread after the last park.
+struct StreamRunState {
+    /// Wire-side receiver (`None` for pre-filled runs: cassette replay).
+    rx: Option<std::sync::mpsc::Receiver<StreamEvent>>,
+    /// Pre-filled events, drained before `rx`.
+    buffered: std::collections::VecDeque<StreamEvent>,
+    /// Detached chat span (parent captured at begin), finalized when `Done` lands.
+    span: Option<sema_otel::LlmSpan>,
+    /// This leaf's usage-accumulator frame, captured at begin (same reasoning as
+    /// `do_complete_async_yield`'s `usage_accum_slot`).
+    usage_accum_slot: Option<Rc<RefCell<LeafUsage>>>,
+    /// The dispatch-time budget frame `Rc` (ASYNC-1), re-installed around the
+    /// finalize's `track_usage`.
+    budget_slot: Option<Rc<RefCell<BudgetFrame>>>,
+    /// Set when a cassette is recording; the entry is written at finalize with
+    /// the collected chunk boundaries.
+    cassette_record_key: Option<String>,
+    /// Every delta drained so far (cassette recording preserves boundaries).
+    collected: Vec<String>,
+    first_token_seen: bool,
+    /// The assembled response, set once `Done(Ok)` has been finalized.
+    response: Option<ChatResponse>,
+    done: bool,
+    /// A failure that arrived in a batch that still carried deltas: stored so the
+    /// driver delivers those deltas to the callback first, then raised (and the
+    /// entry dropped) on the next `__stream-next`/`__stream-finish`.
+    pending_error: Option<String>,
+}
+
+impl Drop for StreamRunState {
+    fn drop(&mut self) {
+        // Normal path (finalize already took the span, or `reset_runtime_state`
+        // during eval): let the detached span end with the otel thread-locals
+        // alive. Thread teardown of a leaked (cancelled) run: forget the span
+        // rather than let its `Drop` touch dead TLS and abort the process
+        // (mirrors `AgentLoopState`).
+        if !sema_otel::tls_alive() {
+            std::mem::forget(self.span.take());
+        }
+    }
+}
+
+thread_local! {
+    /// Live non-blocking stream runs, keyed by the integer token handed to Sema.
+    static STREAM_RUNS: RefCell<std::collections::HashMap<u64, StreamRunState>> =
+        RefCell::new(std::collections::HashMap::new());
+    static STREAM_RUN_NEXT_ID: Cell<u64> = const { Cell::new(1) };
+}
+
+/// Clear any live stream-run state (called from `reset_runtime_state`). A task
+/// cancelled while parked in `__stream-next` abandons its entry here (the wire
+/// worker keeps streaming into the never-drained channel and is discarded —
+/// best-effort, like completion offloads), so this is also the leak backstop.
+fn clear_stream_runs() {
+    STREAM_RUNS.with(|r| r.borrow_mut().clear());
+    STREAM_RUN_NEXT_ID.with(|c| c.set(1));
+}
+
+/// Extract the integer token from a `__stream-*` native's arg.
+fn stream_token_arg(v: &Value) -> Result<u64, SemaError> {
+    v.as_int()
+        .filter(|n| *n >= 0)
+        .map(|n| n as u64)
+        .ok_or_else(|| SemaError::type_error("stream-run-handle", v.type_name()))
+}
+
+/// Walk the resolved provider chain, opening the stream against each provider in
+/// turn and emitting `StreamEvent`s. Fail-over happens ONLY before the first
+/// delta; once a chunk is out a mid-stream error surfaces (failing over would
+/// re-emit the already-delivered partial — same policy as
+/// `stream_with_dispatch`). Runs on a pool worker, so it touches NO
+/// thread-locals; always ends with exactly one `Done`.
+fn stream_wire_walk(
+    chain: &[ResolvedProvider],
+    request: &ChatRequest,
+    emit: &mut dyn FnMut(StreamEvent),
+) {
+    let mut last: Option<(LlmError, String)> = None;
+    for entry in chain {
+        let mut req = request.clone();
+        if let Some(m) = &entry.model {
+            req.model = m.clone();
+        } else if req.model.is_empty() {
+            req.model = entry.provider.default_model().to_string();
+        }
+        let mut emitted = false;
+        let result = {
+            let mut cb = |c: &str| -> Result<(), LlmError> {
+                emitted = true;
+                emit(StreamEvent::Delta(c.to_string()));
+                Ok(())
+            };
+            entry.provider.stream_complete(req, &mut cb)
+        };
+        match result {
+            Ok(resp) => {
+                emit(StreamEvent::Done(Box::new(StreamDone {
+                    result: Ok(resp),
+                    provider: entry.name.clone(),
+                })));
+                return;
+            }
+            Err(e) if emitted => {
+                // Mid-stream failure: surface; do NOT fail over (would duplicate).
+                emit(StreamEvent::Done(Box::new(StreamDone {
+                    result: Err(e),
+                    provider: entry.name.clone(),
+                })));
+                return;
+            }
+            Err(e) => {
+                eprintln!(
+                    "Provider '{}' failed to open stream: {e}, trying next...",
+                    entry.name
+                );
+                last = Some((e, entry.name.clone()));
+            }
+        }
+    }
+    let (e, name) = last.unwrap_or_else(|| {
+        (
+            LlmError::Config("all providers failed".to_string()),
+            String::new(),
+        )
+    });
+    emit(StreamEvent::Done(Box::new(StreamDone {
+        result: Err(e),
+        provider: name,
+    })));
+}
+
+/// Resolve the active fallback chain (or the default provider) into owned `Arc`
+/// clones on the VM thread, so the offloaded wire walk touches no thread-locals
+/// (mirrors the resolution inside `do_complete_async_yield`).
+fn resolve_stream_chain() -> Result<Vec<ResolvedProvider>, SemaError> {
+    PROVIDER_REGISTRY.with(|reg| {
+        let reg = reg.borrow();
+        let fallback = FALLBACK_CHAIN.with(|c| c.borrow().clone());
+        match fallback {
+            Some(entries) if !entries.is_empty() => entries
+                .iter()
+                .map(|e| {
+                    reg.get(&e.provider)
+                        .map(|p| ResolvedProvider {
+                            provider: p,
+                            name: e.provider.clone(),
+                            model: e.model.clone(),
+                        })
+                        .ok_or_else(|| {
+                            SemaError::Llm(format!("fallback provider '{}' not found", e.provider))
+                        })
+                })
+                .collect::<Result<Vec<_>, _>>(),
+            _ => {
+                let p = reg.default_provider().ok_or_else(|| {
+                    SemaError::Llm(
+                        "no LLM provider configured. Use (llm/configure :anthropic \
+                         {:api-key ...}) first"
+                            .to_string(),
+                    )
+                })?;
+                let name = p.name().to_string();
+                Ok(vec![ResolvedProvider {
+                    provider: p,
+                    name,
+                    model: None,
+                }])
+            }
+        }
+    })
+}
+
+/// Start a non-blocking stream run: budget pre-gate + rate limit, cassette
+/// decision on the VM thread (replay pre-fills the run — drained without
+/// parking; recording captures the key for finalize), chain resolution into
+/// `Arc` clones, then the wire walk offloaded onto the I/O pool with
+/// `notify_io_complete` after every send so the parked scheduler wakes per
+/// delta. `span` is the caller's DETACHED chat span (attributes already set);
+/// it is finalized when `Done` lands. Returns the slab token.
+fn stream_run_begin(request: ChatRequest, span: sema_otel::LlmSpan) -> Result<Value, SemaError> {
+    stream_budget_pregate()?;
+    enforce_rate_limit();
+
+    // Keyed by the request as-is (no default-model resolution), matching the
+    // synchronous `stream_with_cassette` so record/replay agree across paths.
+    let cassette_decision = CASSETTE.with(|c| {
+        c.borrow().as_ref().map(|cass| {
+            let key = compute_cache_key(&request);
+            (key.clone(), cass.decide(&key))
+        })
+    });
+    let mut buffered = std::collections::VecDeque::new();
+    let mut cassette_record_key = None;
+    let mut prefilled = false;
+    match cassette_decision {
+        Some((_, crate::cassette::Decision::Replay(entry))) => {
+            for ch in &entry.chunks {
+                buffered.push_back(StreamEvent::Delta(ch.clone()));
+            }
+            buffered.push_back(StreamEvent::Done(Box::new(StreamDone {
+                result: Ok(entry.to_response()),
+                provider: "cassette".to_string(),
+            })));
+            prefilled = true;
+        }
+        Some((k, crate::cassette::Decision::Miss(_))) => return Err(cassette_miss_error(&k)),
+        Some((k, crate::cassette::Decision::Record)) => cassette_record_key = Some(k),
+        _ => {}
+    }
+
+    let rx = if prefilled {
+        None
+    } else {
+        let chain = resolve_stream_chain()?;
+        let (tx, rx) = std::sync::mpsc::channel::<StreamEvent>();
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            sema_io::io_spawn_blocking(move || {
+                let mut emit = |ev: StreamEvent| {
+                    let _ = tx.send(ev);
+                    sema_core::notify_io_complete();
+                };
+                stream_wire_walk(&chain, &request, &mut emit);
+            });
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            // No I/O pool on wasm: run the walk inline (blocking) — deltas are
+            // delivered after the stream completes, in order, exactly once.
+            let mut emit = |ev: StreamEvent| {
+                let _ = tx.send(ev);
+            };
+            stream_wire_walk(&chain, &request, &mut emit);
+        }
+        Some(rx)
+    };
+
+    let state = StreamRunState {
+        rx,
+        buffered,
+        span: Some(span),
+        usage_accum_slot: current_usage_accum(),
+        budget_slot: active_budget(),
+        cassette_record_key,
+        collected: Vec::new(),
+        first_token_seen: false,
+        response: None,
+        done: false,
+        pending_error: None,
+    };
+    let token = STREAM_RUN_NEXT_ID.with(|c| {
+        let id = c.get();
+        c.set(id + 1);
+        id
+    });
+    STREAM_RUNS.with(|r| r.borrow_mut().insert(token, state));
+    Ok(Value::int(token as i64))
+}
+
+/// Post-stream work on the VM thread when `Done` lands — the streaming analogue
+/// of `do_complete_async_yield`'s poller finalize: span finalize,
+/// serving-provider stamp, cassette record, per-leaf usage fold +
+/// budget-installed `track_usage` (exactly once per streamed completion).
+/// Returns the response, or the error message to surface.
+fn stream_finalize(
+    done: StreamDone,
+    span: Option<sema_otel::LlmSpan>,
+    usage_accum_slot: Option<Rc<RefCell<LeafUsage>>>,
+    budget_slot: Option<Rc<RefCell<BudgetFrame>>>,
+    cassette_record_key: Option<String>,
+    collected: &[String],
+) -> Result<ChatResponse, String> {
+    match done.result {
+        Ok(resp) => {
+            if let Some(span) = span {
+                span.set_dispatch(&done.provider, &resp.model);
+                span.set_response(&response_facts(&done.provider, &resp));
+                // span drops here → ends the span.
+            }
+            // A cassette replay made no provider call — leave the serving stamp
+            // alone (matches the sync no-chain path's canonical pricing).
+            if done.provider != "cassette" && !done.provider.is_empty() {
+                set_serving_provider(&done.provider);
+            }
+            if let Some(key) = &cassette_record_key {
+                CASSETTE.with(|c| {
+                    if let Some(cass) = c.borrow_mut().as_mut() {
+                        cass.record_entry(crate::cassette::TapeEntry::from_stream(
+                            key, collected, &resp,
+                        ));
+                    }
+                });
+            }
+            // Fold into THIS run's captured accumulator frame, then suppress
+            // `track_usage`'s own fold — the poller runs outside the per-task
+            // install boundary, so the thread-local may hold a sibling's scope.
+            if let Some(slot) = &usage_accum_slot {
+                let cost = pricing::calculate_cost_for(&done.provider, &resp.usage);
+                accumulate_into(slot, &resp.usage, cost);
+            }
+            let track_result = {
+                let prev_budget = ACTIVE_BUDGET
+                    .with(|b| std::mem::replace(&mut *b.borrow_mut(), budget_slot.clone()));
+                let r = USAGE_ACCUM_SUPPRESS.with(|s| {
+                    s.set(true);
+                    let r = track_usage(&resp.usage);
+                    s.set(false);
+                    r
+                });
+                ACTIVE_BUDGET.with(|b| *b.borrow_mut() = prev_budget);
+                r
+            };
+            match track_result {
+                Ok(()) => Ok(resp),
+                Err(e) => Err(e.to_string()),
+            }
+        }
+        Err(e) => {
+            if let Some(span) = span {
+                span.record_error(llm_error_kind(&e), &e.to_string());
+            }
+            Err(e.to_string())
+        }
+    }
+}
+
+/// Build the `{:deltas [...] :done bool}` batch map `__stream-next` resolves to.
+fn stream_batch_map(deltas: Vec<Value>, done: bool) -> Value {
+    let mut map = BTreeMap::new();
+    map.insert(Value::keyword("deltas"), Value::list(deltas));
+    map.insert(Value::keyword("done"), Value::bool(done));
+    Value::map(map)
+}
+
+/// Drain every currently-available wire event for `token` into one batch
+/// (batching amortizes park/resume over fast token streams), finalizing the run
+/// when `Done` arrives. `blocking` waits for the first event (the sync-context
+/// fallback and pre-filled runs); the poller path never blocks. `Ok(None)` =
+/// nothing available yet (stay parked).
+///
+/// A failure is NEVER surfaced through the poller (an `IoPoll::Ready(Err)`
+/// rejects the whole task — an in-task `try` could not catch it, and which path
+/// fired would depend on batch timing): it is always stored as `pending_error`
+/// and raised by the NEXT `__stream-next` as an ordinary native error —
+/// deterministic, catchable in task context (matching the sync path), and the
+/// callback still sees every delta delivered before the failure.
+fn stream_poll_batch(token: u64, blocking: bool) -> Result<Option<Value>, SemaError> {
+    use std::sync::mpsc::TryRecvError;
+
+    let mut batch: Vec<Value> = Vec::new();
+    let mut done_event: Option<Box<StreamDone>> = None;
+    let mut closed = false;
+
+    // Short-borrow the slab: drain buffered events + the channel into the batch.
+    STREAM_RUNS.with(|r| -> Result<(), SemaError> {
+        let mut slab = r.borrow_mut();
+        let st = slab
+            .get_mut(&token)
+            .ok_or_else(|| SemaError::Llm("stream-run handle not found".to_string()))?;
+        loop {
+            let ev = if let Some(ev) = st.buffered.pop_front() {
+                Some(ev)
+            } else if let Some(rx) = &st.rx {
+                if blocking && batch.is_empty() {
+                    match rx.recv() {
+                        Ok(ev) => Some(ev),
+                        Err(_) => {
+                            closed = true;
+                            None
+                        }
+                    }
+                } else {
+                    match rx.try_recv() {
+                        Ok(ev) => Some(ev),
+                        Err(TryRecvError::Empty) => None,
+                        Err(TryRecvError::Disconnected) => {
+                            closed = true;
+                            None
+                        }
+                    }
+                }
+            } else {
+                None
+            };
+            match ev {
+                Some(StreamEvent::Delta(s)) => {
+                    if !st.first_token_seen {
+                        st.first_token_seen = true;
+                        if let Some(span) = st.span.as_ref() {
+                            span.mark_first_token();
+                        }
+                    }
+                    batch.push(Value::string(&s));
+                    st.collected.push(s);
+                }
+                Some(StreamEvent::Done(d)) => {
+                    done_event = Some(d);
+                    break;
+                }
+                None => break,
+            }
+        }
+        Ok(())
+    })?;
+
+    // A closed channel without a Done means the worker died mid-stream.
+    if done_event.is_none() && closed {
+        done_event = Some(Box::new(StreamDone {
+            result: Err(LlmError::Config("stream: io worker dropped".to_string())),
+            provider: String::new(),
+        }));
+    }
+
+    let Some(done) = done_event else {
+        return if batch.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(stream_batch_map(batch, false)))
+        };
+    };
+
+    // Done landed: take the finalize context out (short-borrow), run the
+    // finalize outside the slab borrow, then write the outcome back.
+    let ctx = STREAM_RUNS.with(|r| {
+        let mut slab = r.borrow_mut();
+        slab.get_mut(&token).map(|st| {
+            (
+                st.span.take(),
+                st.usage_accum_slot.take(),
+                st.budget_slot.take(),
+                st.cassette_record_key.take(),
+                std::mem::take(&mut st.collected),
+            )
+        })
+    });
+    let Some((span, usage_slot, budget_slot, record_key, collected)) = ctx else {
+        return Err(SemaError::Llm("stream-run handle not found".to_string()));
+    };
+    match stream_finalize(*done, span, usage_slot, budget_slot, record_key, &collected) {
+        Ok(resp) => {
+            STREAM_RUNS.with(|r| {
+                if let Some(st) = r.borrow_mut().get_mut(&token) {
+                    st.response = Some(resp);
+                    st.done = true;
+                }
+            });
+            Ok(Some(stream_batch_map(batch, true)))
+        }
+        Err(msg) => {
+            STREAM_RUNS.with(|r| {
+                if let Some(st) = r.borrow_mut().get_mut(&token) {
+                    st.pending_error = Some(msg);
+                }
+            });
+            Ok(Some(stream_batch_map(batch, false)))
+        }
+    }
+}
+
+/// `__stream-next(token) → {:deltas [str…] :done bool}`. In a scheduler task it
+/// parks on `AwaitIo`; the poller drains all currently-available deltas per wake
+/// (see `stream_poll_batch`). Pre-filled runs and non-async context drain
+/// blockingly without parking.
+fn stream_next(token: u64) -> Result<Value, SemaError> {
+    // The scheduler resumes the bytecode after the CALL via `replace_stack_top`
+    // (this native is not re-invoked); drain a stray resume value defensively.
+    if let Some(v) = sema_core::take_resume_value() {
+        return Ok(v);
+    }
+
+    enum Pre {
+        Err(String),
+        Done,
+        Run { prefilled: bool },
+    }
+    let pre = STREAM_RUNS.with(|r| {
+        let mut slab = r.borrow_mut();
+        let st = slab
+            .get_mut(&token)
+            .ok_or_else(|| SemaError::Llm("stream-run handle not found".to_string()))?;
+        if let Some(msg) = st.pending_error.take() {
+            // The deltas that preceded this failure were delivered last batch;
+            // the run is over — drop the entry and surface.
+            slab.remove(&token);
+            return Ok(Pre::Err(msg));
+        }
+        if st.done {
+            return Ok(Pre::Done);
+        }
+        Ok::<_, SemaError>(Pre::Run {
+            prefilled: st.rx.is_none(),
+        })
+    })?;
+
+    let prefilled = match pre {
+        Pre::Err(msg) => return Err(SemaError::Llm(msg)),
+        Pre::Done => return Ok(stream_batch_map(Vec::new(), true)),
+        Pre::Run { prefilled } => prefilled,
+    };
+
+    // Pre-filled runs resolve without parking (nothing to overlap — mirrors the
+    // cassette-replay no-yield path of `do_complete_async_yield`); outside a
+    // scheduler task fall back to a blocking drain.
+    if prefilled || !sema_core::in_async_context() {
+        loop {
+            if let Some(v) = stream_poll_batch(token, true)? {
+                return Ok(v);
+            }
+        }
+    }
+
+    let handle = Rc::new(sema_core::IoHandle::new(move || {
+        match stream_poll_batch(token, false) {
+            Ok(Some(v)) => sema_core::IoPoll::Ready(Ok(v)),
+            Ok(None) => sema_core::IoPoll::Pending,
+            Err(e) => sema_core::IoPoll::Ready(Err(e.to_string())),
+        }
+    }));
+    sema_core::set_yield_signal(sema_core::YieldReason::AwaitIo(handle));
+    Ok(Value::nil())
+}
+
+/// `__stream-finish(token) → content-string`. Cleans the slab entry and returns
+/// the assembled content (usage was already accounted, exactly once, when the
+/// poller finalized the `Done`).
+fn stream_finish(token: u64) -> Result<Value, SemaError> {
+    let mut st = STREAM_RUNS
+        .with(|r| r.borrow_mut().remove(&token))
+        .ok_or_else(|| SemaError::Llm("stream-run handle not found".to_string()))?;
+    if let Some(msg) = st.pending_error.take() {
+        return Err(SemaError::Llm(msg));
+    }
+    let resp = st
+        .response
+        .take()
+        .ok_or_else(|| SemaError::Llm("stream not finished".to_string()))?;
+    Ok(Value::string(&resp.content))
+}
+
+/// `__agent-stream-apply(agent-token, stream-token) → {:done :has-tools}`. The
+/// agent-path terminal for a driven streaming round: pops the stream slab entry
+/// and feeds the assembled `ChatResponse` to `agent_apply_step_response`
+/// unchanged (tool-call handling identical to a non-streaming round; usage was
+/// accounted by the stream poller).
+fn agent_stream_apply(agent_token: u64, stream_token: u64) -> Result<Value, SemaError> {
+    let mut st = STREAM_RUNS
+        .with(|r| r.borrow_mut().remove(&stream_token))
+        .ok_or_else(|| SemaError::Llm("stream-run handle not found".to_string()))?;
+    if let Some(msg) = st.pending_error.take() {
+        return Err(SemaError::Llm(msg));
+    }
+    let resp = st
+        .response
+        .take()
+        .ok_or_else(|| SemaError::Llm("stream not finished".to_string()))?;
+    agent_apply_step_response(agent_token, resp)
 }
 
 /// The tool execution loop: send -> check for tool_calls -> execute -> send results -> repeat.

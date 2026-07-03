@@ -253,6 +253,7 @@ export default defineConfig({
             { text: 'Routing', link: '/docs/web/routing' },
             { text: 'Scoped CSS', link: '/docs/web/css' },
             { text: 'HTTP & Streams', link: '/docs/web/http' },
+            { text: 'WebSockets', link: '/docs/web/websocket' },
             { text: 'LLM Integration', link: '/docs/web/llm' },
             { text: 'LLM Proxy', link: '/docs/web/llm-proxy' },
             { text: 'Deployment', link: '/docs/web/deployment' },

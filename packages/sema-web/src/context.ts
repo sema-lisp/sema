@@ -49,6 +49,12 @@ export interface StreamRegistration {
   close: () => void;
 }
 
+export interface SocketRegistration {
+  socket: WebSocket;
+  /** Sema callbacks wired via `ws/listen`, released on close/dispose. */
+  callbacks: SemaCallback[];
+}
+
 /** Error handler callback type. */
 export type ErrorHandler = (error: Error, context: string) => void;
 
@@ -95,6 +101,10 @@ export class SemaWebContext {
 
   /** Managed streaming resources keyed by signal id */
   streams = new Map<number, StreamRegistration>();
+
+  /** Open WebSocket connections keyed by numeric handle */
+  sockets = new Map<number, SocketRegistration>();
+  nextSocketId = 1;
 
   /** Per-signal cleanup hooks (used for callback-backed computed signals, etc.) */
   signalFinalizers = new Map<number, () => void>();
@@ -206,6 +216,17 @@ export function disposeContextResources(ctx: SemaWebContext): void {
     }
   }
   ctx.streams.clear();
+
+  for (const { socket, callbacks } of ctx.sockets.values()) {
+    try {
+      socket.onopen = socket.onmessage = socket.onclose = socket.onerror = null;
+      socket.close();
+    } catch (e) {
+      ctx.onerror(e instanceof Error ? e : new Error(String(e)), "websocket-cleanup");
+    }
+    for (const cb of callbacks) releaseCallback(cb);
+  }
+  ctx.sockets.clear();
 
   for (const cleanup of ctx.cleanupHooks) {
     try {

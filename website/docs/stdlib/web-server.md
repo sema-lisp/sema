@@ -409,8 +409,8 @@ The connection map:
 
 | Key      | Description                                              |
 | -------- | -------------------------------------------------------- |
-| `:send`  | `(send message)` — Send a string to the client           |
-| `:recv`  | `(recv)` — Block until a message arrives, `nil` on close |
+| `:send`  | `(send message)` — send a string (text frame) or a bytevector (binary frame) |
+| `:recv`  | `(recv)` — block until a message arrives; a text frame returns a string, a binary frame a bytevector, `nil` on close |
 | `:close` | `(close)` — Close the connection                         |
 
 ### WebSocket Routes
@@ -448,6 +448,120 @@ Use the `:ws` method in the router:
 
 (http/serve (http/router routes) {:port 3000})
 ```
+
+## WebSocket Client
+
+Connect to a WebSocket server with `ws/connect`. A connection is a closeable
+stream, so `with-open` closes it automatically — on both the normal and the
+error path.
+
+```sema
+(with-open (sock (ws/connect "wss://echo.websocket.events"))
+  (ws/send sock "hello")
+  (match (ws/recv sock)
+    {:text msg}   (println msg)
+    {:binary buf} (handle-bytes buf)
+    {:close info} :done))
+```
+
+### `ws/connect`
+
+`(ws/connect url)` / `(ws/connect url opts)` — open a connection to a `ws://` or
+`wss://` URL, returning a connection value. Blocks until the handshake completes
+(or fails). Requires the `network` capability. Inside an `async/spawn` task it
+yields cooperatively, so sibling tasks run while the handshake and later receives
+are in flight.
+
+`opts` is an optional map:
+
+| Key                  | Meaning                                                       |
+| -------------------- | ------------------------------------------------------------- |
+| `:headers`           | map of extra HTTP headers on the upgrade (e.g. auth tokens)   |
+| `:subprotocols`      | list of `Sec-WebSocket-Protocol` values to offer              |
+| `:timeout`           | handshake timeout in milliseconds                             |
+| `:retries`           | retry a failed handshake this many times (default `0`)        |
+| `:retry-backoff-ms`  | base backoff, doubled each retry and capped at 30s (default `500`) |
+
+```sema
+(ws/connect "wss://api.example.com/socket"
+  {:headers {"Authorization" "Bearer …"}
+   :subprotocols ["chat"]
+   :timeout 5000
+   :retries 3})
+```
+
+### `ws/send`
+
+`(ws/send conn msg)` — send a message. The frame type follows `msg`:
+
+| `msg`                | Frame sent                                              |
+| -------------------- | ------------------------------------------------------- |
+| string               | text frame                                              |
+| bytevector           | binary frame                                            |
+| `{:text s}`          | text frame (explicit)                                   |
+| `{:binary bv}`       | binary frame (explicit)                                 |
+| `{:json v}`          | text frame: `v` encoded as JSON                         |
+| any other map        | text frame: the map encoded as JSON                     |
+
+### `ws/recv` and `ws/recv-timeout`
+
+`(ws/recv conn)` — receive the next message, blocking until one arrives. Returns
+a single-key tagged map so a `match` can dispatch on the frame type:
+
+| Return value               | Meaning                                          |
+| -------------------------- | ------------------------------------------------ |
+| `{:text "…"}`              | a text frame                                     |
+| `{:binary #u8(…)}`         | a binary frame                                   |
+| `{:close {:code :reason}}` | the server closed the connection                 |
+| `nil`                      | the connection is fully drained and closed       |
+
+`(ws/recv-timeout conn ms)` is the same but returns the keyword `:timeout` if no
+message arrives within `ms` milliseconds (distinct from `nil`, which means
+closed). A protocol error surfaces as a thrown error you can `try`/`catch`.
+
+### `ws/ping`
+
+`(ws/ping conn)` / `(ws/ping conn payload)` — send a ping frame (optional string
+or bytevector payload); the server replies with a matching pong. Incoming pings
+are answered automatically.
+
+### `ws/close` and `ws/connected?`
+
+`(ws/close conn)` closes the connection (idempotent; also done for you by
+`with-open`). `(ws/connected? conn)` reports whether the socket is still live.
+
+### `ws/listen`
+
+`(ws/listen conn handlers)` drives a receive loop, dispatching each frame to the
+matching handler. It spawns an async task and returns its promise — `async/await`
+it (or run the scheduler) to drive the loop. All handlers are optional:
+
+| Handler        | Called with         | When                                   |
+| -------------- | ------------------- | -------------------------------------- |
+| `:on-open`     | `(conn)`            | once, before the loop                  |
+| `:on-message`  | `(conn msg)`        | each text (string) or binary (bytevector) frame |
+| `:on-close`    | `(conn info)`       | the connection closed (`info` is `{:code :reason}`) |
+| `:on-error`    | `(conn err)`        | a recv/protocol error (loop then stops) |
+
+```sema
+(with-open (sock (ws/connect "wss://stream.example.com"))
+  (async/await
+    (ws/listen sock
+      {:on-message (fn (conn msg) (println msg))
+       :on-close   (fn (conn info) (println "closed"))})))
+```
+
+> **Browser support.** The `ws/*` client also runs in the browser (Sema Web /
+> WASM), backed by the browser's native `WebSocket`: `ws/connect`, `ws/send`
+> (text/binary/JSON + `{:text}`/`{:binary}`/`{:json}` framing), `ws/close`,
+> `ws/connected?`, and `ws/listen` all work there. Because the browser main
+> thread cannot block, the pull-based `ws/recv` and `ws/recv-timeout` are
+> **native-only** — in the browser, receive with the evented `ws/listen`
+> (`:on-message` / `:on-open` / `:on-close` / `:on-error`), which mirrors how
+> browser SSE and `llm/chat-stream` deliver data. Connection `:headers`,
+> `:timeout`, and retry options are native-only too (the browser `WebSocket` API
+> only supports `:subprotocols`). See the
+> [Sema Web WebSocket guide](https://sema-lang.com/docs/web/websocket).
 
 ## Complete Examples
 

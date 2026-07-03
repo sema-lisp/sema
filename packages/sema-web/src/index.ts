@@ -46,6 +46,7 @@ import type { LlmProxyOptions } from "./llm.js";
 import { registerRouterBindings } from "./router.js";
 import { registerCssBindings } from "./css.js";
 import { registerHttpBindings } from "./http.js";
+import { registerWsBindings } from "./ws.js";
 import { loadScripts } from "./loader.js";
 import type { LoaderOptions } from "./loader.js";
 
@@ -118,6 +119,13 @@ export interface SemaWebOptions extends InterpreterOptions {
    * Default: `true`.
    */
   http?: boolean;
+
+  /**
+   * Whether to register the browser `ws/*` WebSocket client
+   * (`ws/connect`, `ws/send`, `ws/close`, `ws/connected?`, `ws/listen`).
+   * Default: `true`.
+   */
+  websocket?: boolean;
 
   /**
    * LLM proxy configuration. When provided, registers `llm/*` namespace
@@ -241,6 +249,11 @@ export class SemaWeb {
     // HTTP bindings (SSE, browser-specific wrappers)
     if (opts?.http !== false) {
       registerHttpBindings(interp, ctx);
+    }
+
+    // WebSocket client bindings (browser-native WebSocket)
+    if (opts?.websocket !== false) {
+      registerWsBindings(interp, ctx);
     }
 
     // LLM proxy bindings (forward llm/* calls to backend server)

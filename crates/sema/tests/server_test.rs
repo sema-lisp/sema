@@ -1261,6 +1261,60 @@ fn test_websocket_multi_message() {
     child.wait().ok();
 }
 
+// A generic echo handler (recv -> send) round-trips *binary* frames as well as
+// text: server-side `:recv` surfaces a binary frame as a bytevector and `:send`
+// accepts a bytevector as a binary frame.
+#[test]
+#[ignore] // requires network
+fn test_websocket_binary_echo() {
+    use std::process::{Command, Stdio};
+    use std::time::Duration;
+    use tungstenite::Message;
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_sema"))
+        .arg("-e")
+        .arg(
+            r#"
+            (http/serve
+              (http/router
+                [[:ws "/echo" (fn (conn)
+                  (let loop ()
+                    (let ((msg ((:recv conn))))
+                      (when msg
+                        ((:send conn) msg)
+                        (loop)))))]])
+              {:port 19903})
+        "#,
+        )
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("Failed to spawn");
+
+    std::thread::sleep(Duration::from_millis(1500));
+
+    let (mut ws, _) = tungstenite::connect("ws://127.0.0.1:19903/echo").expect("WS connect");
+
+    // Binary frame with edge bytes (0, 255, 128) must round-trip byte-identical.
+    let payload = vec![1u8, 2, 3, 255, 0, 128, 64];
+    ws.send(Message::Binary(payload.clone().into())).unwrap();
+    let reply = ws.read().unwrap();
+    assert!(reply.is_binary(), "expected a binary echo, got {reply:?}");
+    assert_eq!(
+        reply.into_data().to_vec(),
+        payload,
+        "binary bytes must match"
+    );
+
+    // Text still works through the same handler.
+    ws.send(Message::Text("hi".into())).unwrap();
+    assert_eq!(ws.read().unwrap().into_text().unwrap().as_str(), "hi");
+
+    ws.close(None).ok();
+    child.kill().ok();
+    child.wait().ok();
+}
+
 #[test]
 #[ignore] // requires network
 fn test_websocket_close_from_server() {
@@ -1302,6 +1356,250 @@ fn test_websocket_close_from_server() {
 
     child.kill().ok();
     child.wait().ok();
+}
+
+// ws/* error paths that never touch the network (no #[ignore] — run in CI).
+#[test]
+fn test_websocket_client_arg_errors() {
+    // Non-websocket value rejected with a typed error.
+    assert!(eval_err("(ws/recv 5)")
+        .to_string()
+        .contains("expected websocket"));
+    assert!(eval_err(r#"(ws/send 5 "x")"#)
+        .to_string()
+        .contains("expected websocket"));
+    // A real stream that is not a websocket is still rejected.
+    assert!(eval_err(r#"(ws/recv (stream/open-input "Cargo.toml"))"#)
+        .to_string()
+        .contains("expected websocket"));
+    // Non-ws:// URL is rejected before any connection attempt.
+    let err = eval_err(r#"(ws/connect "http://example.com")"#).to_string();
+    assert!(err.contains("not a websocket URL"), "{err}");
+    // Arity.
+    assert!(eval_err("(ws/connect)").to_string().contains("ws/connect"));
+    assert!(eval_err("(ws/send)").to_string().contains("ws/send"));
+    // Phase 2 ops reject non-websockets and bad arities too.
+    assert!(eval_err("(ws/recv-timeout 5 100)")
+        .to_string()
+        .contains("expected websocket"));
+    assert!(eval_err("(ws/ping 5)")
+        .to_string()
+        .contains("expected websocket"));
+    assert!(eval_err("(ws/recv-timeout)")
+        .to_string()
+        .contains("ws/recv-timeout"));
+}
+
+// The Sema WebSocket *client* (`ws/connect`/`ws/send`/`ws/recv`/`ws/close`),
+// round-tripped against the Sema WebSocket *server*. Drives both ends through
+// the binary: a server subprocess echoes "re:" + msg, and a client subprocess
+// connects, sends text and a JSON map, and prints each typed reply.
+#[test]
+#[ignore] // requires network
+fn test_websocket_client_round_trip() {
+    use std::process::{Command, Stdio};
+    use std::time::Duration;
+
+    let mut server = Command::new(env!("CARGO_BIN_EXE_sema"))
+        .arg("-e")
+        .arg(
+            r#"
+            (http/serve
+              (http/router
+                [[:ws "/chat" (fn (conn)
+                  (let loop ()
+                    (let ((msg ((:recv conn))))
+                      (when msg
+                        ((:send conn) (string-append "re:" msg))
+                        (loop)))))]])
+              {:port 19908})
+        "#,
+        )
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("Failed to spawn server");
+
+    std::thread::sleep(Duration::from_millis(1500));
+
+    // Client: text round-trip, connected? predicate, and a map sent as JSON text.
+    let client = Command::new(env!("CARGO_BIN_EXE_sema"))
+        .arg("-e")
+        .arg(
+            r#"
+            (with-open (sock (ws/connect "ws://127.0.0.1:19908/chat"))
+              (println (ws/connected? sock))
+              (ws/send sock "hello")
+              (println (ws/recv sock))
+              (ws/send sock {:n 42})
+              (println (ws/recv sock)))
+        "#,
+        )
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("Failed to run client");
+
+    server.kill().ok();
+    server.wait().ok();
+
+    let stdout = String::from_utf8_lossy(&client.stdout);
+    assert!(
+        client.status.success(),
+        "client failed: stdout={stdout:?} stderr={:?}",
+        String::from_utf8_lossy(&client.stderr)
+    );
+    assert!(
+        stdout.contains("#t"),
+        "connected? should be true: {stdout:?}"
+    );
+    assert!(
+        stdout.contains(r#"{:text "re:hello"}"#),
+        "text echo missing: {stdout:?}"
+    );
+    assert!(
+        stdout.contains(r#"re:{\"n\":42}"#),
+        "json-map echo missing: {stdout:?}"
+    );
+}
+
+// Phase 2 client: connect options, explicit `{:json …}` framing, ws/ping, and
+// ws/recv-timeout (both the timeout and the message case), against the echo server.
+#[test]
+#[ignore] // requires network
+fn test_websocket_client_options_and_framing() {
+    use std::process::{Command, Stdio};
+    use std::time::Duration;
+
+    let mut server = Command::new(env!("CARGO_BIN_EXE_sema"))
+        .arg("-e")
+        .arg(
+            r#"
+            (http/serve
+              (http/router
+                [[:ws "/chat" (fn (conn)
+                  (let loop ()
+                    (let ((msg ((:recv conn))))
+                      (when msg
+                        ((:send conn) (string-append "re:" msg))
+                        (loop)))))]])
+              {:port 19909})
+        "#,
+        )
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("Failed to spawn server");
+
+    std::thread::sleep(Duration::from_millis(1500));
+
+    let client = Command::new(env!("CARGO_BIN_EXE_sema"))
+        .arg("-e")
+        .arg(
+            r#"
+            (with-open (sock (ws/connect "ws://127.0.0.1:19909/chat"
+                               {:timeout 3000 :retries 2 :headers {"X-Test" "1"}}))
+              ;; {:json v} sends the inner value as JSON (not wrapped in {"json":…}).
+              (ws/send sock {:json {:type "ping"}})
+              (println (ws/recv sock))
+              (ws/ping sock "hb")
+              ;; Nothing pending yet → recv-timeout returns the :timeout keyword.
+              (println (ws/recv-timeout sock 300))
+              (ws/send sock "later")
+              (println (ws/recv-timeout sock 2000)))
+        "#,
+        )
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("Failed to run client");
+
+    server.kill().ok();
+    server.wait().ok();
+
+    let stdout = String::from_utf8_lossy(&client.stdout);
+    assert!(
+        client.status.success(),
+        "client failed: stdout={stdout:?} stderr={:?}",
+        String::from_utf8_lossy(&client.stderr)
+    );
+    assert!(
+        stdout.contains(r#"re:{\"type\":\"ping\"}"#),
+        "json framing missing: {stdout:?}"
+    );
+    assert!(
+        stdout.contains(":timeout"),
+        "recv-timeout missing: {stdout:?}"
+    );
+    assert!(
+        stdout.contains(r#"{:text "re:later"}"#),
+        "post-timeout message missing: {stdout:?}"
+    );
+}
+
+// Phase 2 client: the ws/listen evented macro. The server sends one message then
+// closes; the listen loop fires :on-message then :on-close.
+#[test]
+#[ignore] // requires network
+fn test_websocket_listen() {
+    use std::process::{Command, Stdio};
+    use std::time::Duration;
+
+    let mut server = Command::new(env!("CARGO_BIN_EXE_sema"))
+        .arg("-e")
+        .arg(
+            r#"
+            (http/serve
+              (http/router
+                [[:ws "/once" (fn (conn)
+                  (let ((msg ((:recv conn))))
+                    (when msg
+                      ((:send conn) "hello-listener")
+                      ((:close conn)))))]])
+              {:port 19910})
+        "#,
+        )
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("Failed to spawn server");
+
+    std::thread::sleep(Duration::from_millis(1500));
+
+    let client = Command::new(env!("CARGO_BIN_EXE_sema"))
+        .arg("-e")
+        .arg(
+            r#"
+            (with-open (sock (ws/connect "ws://127.0.0.1:19910/once"))
+              (ws/send sock "go")
+              (async/await
+                (ws/listen sock
+                  {:on-message (fn (c m) (println (list :got m)))
+                   :on-close   (fn (c info) (println :listener-closed))})))
+        "#,
+        )
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("Failed to run client");
+
+    server.kill().ok();
+    server.wait().ok();
+
+    let stdout = String::from_utf8_lossy(&client.stdout);
+    assert!(
+        client.status.success(),
+        "client failed: stdout={stdout:?} stderr={:?}",
+        String::from_utf8_lossy(&client.stderr)
+    );
+    assert!(
+        stdout.contains(r#"(:got "hello-listener")"#),
+        "on-message missing: {stdout:?}"
+    );
+    assert!(
+        stdout.contains(":listener-closed"),
+        "on-close missing: {stdout:?}"
+    );
 }
 
 // ---------------------------------------------------------------------------

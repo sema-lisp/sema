@@ -40,15 +40,23 @@ enum ServerResponse {
     /// A WebSocket connection: bidirectional channels for message passing.
     WebSocket {
         /// Sends messages from axum (client) to the evaluator (server handler).
-        incoming_tx: tokio::sync::mpsc::Sender<String>,
+        incoming_tx: tokio::sync::mpsc::Sender<WsMsg>,
         /// Receives messages from the evaluator (server handler) to axum (client).
-        outgoing_rx: tokio::sync::mpsc::Receiver<String>,
+        outgoing_rx: tokio::sync::mpsc::Receiver<WsMsg>,
     },
     /// A file to serve from disk (binary-safe, read on the axum/tokio side).
     File {
         path: std::path::PathBuf,
         content_type: String,
     },
+}
+
+/// A single WebSocket frame carried between the axum bridge and the evaluator's
+/// server-side `:send`/`:recv`. Text frames surface to Sema as strings, binary
+/// frames as bytevectors.
+enum WsMsg {
+    Text(String),
+    Binary(Vec<u8>),
 }
 
 /// A server request sent from the axum handler thread to the main evaluator thread.
@@ -971,25 +979,30 @@ async fn handle_axum_request(
 /// Bridge an axum WebSocket to the evaluator's channels.
 async fn bridge_websocket(
     socket: axum::extract::ws::WebSocket,
-    incoming_tx: tokio::sync::mpsc::Sender<String>,
-    mut outgoing_rx: tokio::sync::mpsc::Receiver<String>,
+    incoming_tx: tokio::sync::mpsc::Sender<WsMsg>,
+    mut outgoing_rx: tokio::sync::mpsc::Receiver<WsMsg>,
 ) {
     use axum::extract::ws::Message;
     use futures::{SinkExt, StreamExt};
 
     let (mut ws_sink, mut ws_stream) = socket.split();
 
-    // Task 1: forward messages from client (WebSocket) to evaluator
+    // Task 1: forward messages from client (WebSocket) to evaluator. Text frames
+    // become `WsMsg::Text`, binary frames `WsMsg::Binary`; ping/pong are handled
+    // by axum and ignored here.
     let incoming_tx_clone = incoming_tx.clone();
     let recv_task = tokio::spawn(async move {
         while let Some(Ok(msg)) = ws_stream.next().await {
-            match msg {
-                Message::Text(text) if incoming_tx_clone.send(text.to_string()).await.is_err() => {
-                    break;
+            let forwarded = match msg {
+                Message::Text(text) => incoming_tx_clone.send(WsMsg::Text(text.to_string())).await,
+                Message::Binary(bytes) => {
+                    incoming_tx_clone.send(WsMsg::Binary(bytes.to_vec())).await
                 }
-                Message::Text(_) => {}
                 Message::Close(_) => break,
-                _ => {} // ignore binary, ping, pong
+                _ => continue, // ping/pong
+            };
+            if forwarded.is_err() {
+                break;
             }
         }
         // Signal to the evaluator that the client disconnected by dropping the sender
@@ -999,7 +1012,11 @@ async fn bridge_websocket(
     // Task 2: forward messages from evaluator to client (WebSocket)
     let send_task = tokio::spawn(async move {
         while let Some(msg) = outgoing_rx.recv().await {
-            if ws_sink.send(Message::Text(msg.into())).await.is_err() {
+            let frame = match msg {
+                WsMsg::Text(s) => Message::Text(s.into()),
+                WsMsg::Binary(b) => Message::Binary(b.into()),
+            };
+            if ws_sink.send(frame).await.is_err() {
                 break;
             }
         }
@@ -1141,8 +1158,8 @@ fn handle_ws_response(
     let ws_handler = map.get(&Value::keyword("__ws_handler")).cloned().unwrap();
 
     // Create bidirectional channels
-    let (in_tx, in_rx) = tokio::sync::mpsc::channel::<String>(256); // client -> evaluator
-    let (out_tx, out_rx) = tokio::sync::mpsc::channel::<String>(256); // evaluator -> client
+    let (in_tx, in_rx) = tokio::sync::mpsc::channel::<WsMsg>(256); // client -> evaluator
+    let (out_tx, out_rx) = tokio::sync::mpsc::channel::<WsMsg>(256); // evaluator -> client
 
     // Send channels to axum for WebSocket bridging
     let _ = respond.send(ServerResponse::WebSocket {
@@ -1167,14 +1184,22 @@ fn handle_ws_response(
     let out_tx_for_send = out_tx.clone();
     let send_fn = Value::native_fn(NativeFn::simple("ws/send", move |args| {
         check_arity!(args, "ws/send", 1);
-        let msg = args[0]
-            .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
+        // A string sends a text frame; a bytevector sends a binary frame.
+        let msg = if let Some(s) = args[0].as_str() {
+            WsMsg::Text(s.to_string())
+        } else if let Some(b) = args[0].as_bytevector() {
+            WsMsg::Binary(b.to_vec())
+        } else {
+            return Err(SemaError::type_error(
+                "string or bytevector",
+                args[0].type_name(),
+            ));
+        };
         let guard = out_tx_for_send.borrow();
         let tx = guard
             .as_ref()
             .ok_or_else(|| SemaError::eval("WebSocket closed"))?;
-        tx.blocking_send(msg.to_string())
+        tx.blocking_send(msg)
             .map_err(|_| SemaError::eval("WebSocket closed"))?;
         Ok(Value::nil())
     }));
@@ -1187,7 +1212,9 @@ fn handle_ws_response(
         let mut rx_opt = in_rx_for_recv.borrow_mut();
         if let Some(rx) = rx_opt.as_mut() {
             match rx.blocking_recv() {
-                Some(msg) => Ok(Value::string(&msg)),
+                // Text frames surface as strings, binary frames as bytevectors.
+                Some(WsMsg::Text(s)) => Ok(Value::string(&s)),
+                Some(WsMsg::Binary(b)) => Ok(Value::bytevector(b)),
                 None => {
                     // Channel closed — remove the receiver
                     *rx_opt = None;

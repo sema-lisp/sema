@@ -9296,6 +9296,16 @@
       "body": "Type predicate — returns `#t` if the value is a stream.\n\n```sema\n(stream? (stream/byte-buffer))    ;; => #t\n(stream? 42)                      ;; => #f\n```"
     },
     {
+      "name": "with-open",
+      "module": "streams",
+      "section": "Resource Management",
+      "summary": "Macro that binds a closeable resource, executes the body, and closes it on exit — even if an error is thrown. A RAII alias of `with-stream` that reads naturally for files and sockets.",
+      "examples": [
+        "(with-open (sock (ws/connect \"wss://example.com\"))\n  (ws/send sock \"hi\")\n  (ws/recv sock))\n;; sock is closed here, even if the body threw"
+      ],
+      "body": "Macro that binds a closeable resource, executes the body, and closes it on exit — even if an error is thrown. A RAII alias of `with-stream` that reads naturally for files and sockets.\n\n```sema\n(with-open (sock (ws/connect \"wss://example.com\"))\n  (ws/send sock \"hi\")\n  (ws/recv sock))\n;; sock is closed here, even if the body threw\n```"
+    },
+    {
       "name": "with-stream",
       "module": "streams",
       "section": "Resource Management",
@@ -12355,6 +12365,153 @@
         "(tools->routes [my-tool other-tool])\n; => a list of route handlers for use with the web server"
       ],
       "body": "Convert a list of tool definitions (from `deftool`) into HTTP routes. Each tool gets a `POST /tools/<name>` endpoint that runs the tool handler against the request's JSON body, plus a `/tools/<name>/schema` endpoint exposing its parameter schema.\n\n```sema\n(tools->routes [my-tool other-tool])\n; => a list of route handlers for use with the web server\n```"
+    },
+    {
+      "name": "ws/close",
+      "module": "websocket",
+      "section": "WebSocket Client",
+      "summary": "Close a WebSocket connection. A `with-open` binding closes the connection automatically on exit, so an explicit `ws/close` is only needed for manually managed connections.",
+      "params": [
+        {
+          "name": "conn",
+          "type": "connection"
+        }
+      ],
+      "returns": "nil",
+      "examples": [
+        "(ws/close sock)"
+      ],
+      "body": "Close a WebSocket connection. A `with-open` binding closes the connection automatically on exit, so an explicit `ws/close` is only needed for manually managed connections.\n\n```sema\n(ws/close sock)\n```"
+    },
+    {
+      "name": "ws/connect",
+      "module": "websocket",
+      "section": "WebSocket Client",
+      "summary": "Open a WebSocket connection to a `ws://` or `wss://` server and return a connection handle.",
+      "params": [
+        {
+          "name": "url",
+          "type": "string"
+        },
+        {
+          "name": "opts",
+          "type": "map",
+          "doc": "optional :headers/:subprotocols/:timeout/:retries/:retry-backoff-ms"
+        }
+      ],
+      "returns": "connection",
+      "examples": [
+        "(define sock (ws/connect \"wss://echo.websocket.org\"))\n\n;; with options\n(ws/connect \"wss://api.example.com/stream\"\n  {:subprotocols [\"v1.chat\"] :timeout 5000 :retries 3})"
+      ],
+      "body": "Open a WebSocket connection to a `ws://` or `wss://` server and return a connection handle.\n\n- **url** — the `ws://`/`wss://` endpoint\n- **opts** — optional map: `:headers`, `:subprotocols`, `:timeout` (handshake), `:retries` and `:retry-backoff-ms` (exponential backoff). In the browser build only `:subprotocols` applies.\n\n```sema\n(define sock (ws/connect \"wss://echo.websocket.org\"))\n\n;; with options\n(ws/connect \"wss://api.example.com/stream\"\n  {:subprotocols [\"v1.chat\"] :timeout 5000 :retries 3})\n```"
+    },
+    {
+      "name": "ws/connected?",
+      "module": "websocket",
+      "section": "WebSocket Client",
+      "summary": "Return `true` while the WebSocket connection is open, `false` once it has closed.",
+      "params": [
+        {
+          "name": "conn",
+          "type": "connection"
+        }
+      ],
+      "returns": "bool",
+      "examples": [
+        "(when (ws/connected? sock)\n  (ws/send sock \"still here\"))"
+      ],
+      "body": "Return `true` while the WebSocket connection is open, `false` once it has closed.\n\n```sema\n(when (ws/connected? sock)\n  (ws/send sock \"still here\"))\n```"
+    },
+    {
+      "name": "ws/listen",
+      "module": "websocket",
+      "section": "WebSocket Client",
+      "summary": "Drive an evented receive loop over a connection, dispatching each frame to the matching handler. All handlers are optional: `:on-open` `(conn)`, `:on-message` `(conn msg)` where `msg` is a text string or binary bytevector, `:on-close` `(conn info)` where `info` is `{:code :reason}`, and `:on-error` `(conn err)`. On native it spawns an async task and returns its promise to await; in the browser it wires the socket's events directly.",
+      "examples": [
+        "(with-open (sock (ws/connect \"wss://stream.example.com\"))\n  (async/await\n    (ws/listen sock\n      {:on-message (fn (c m) (println m))\n       :on-close   (fn (c info) (println \"closed\" (:code info)))})))"
+      ],
+      "body": "Drive an evented receive loop over a connection, dispatching each frame to the matching handler. All handlers are optional: `:on-open` `(conn)`, `:on-message` `(conn msg)` where `msg` is a text string or binary bytevector, `:on-close` `(conn info)` where `info` is `{:code :reason}`, and `:on-error` `(conn err)`. On native it spawns an async task and returns its promise to await; in the browser it wires the socket's events directly.\n\n```sema\n(with-open (sock (ws/connect \"wss://stream.example.com\"))\n  (async/await\n    (ws/listen sock\n      {:on-message (fn (c m) (println m))\n       :on-close   (fn (c info) (println \"closed\" (:code info)))})))\n```"
+    },
+    {
+      "name": "ws/ping",
+      "module": "websocket",
+      "section": "WebSocket Client",
+      "summary": "Send a ping frame to keep the connection alive; the peer answers with a pong automatically. An optional string or bytevector payload is echoed in the pong.",
+      "params": [
+        {
+          "name": "conn",
+          "type": "connection"
+        },
+        {
+          "name": "payload",
+          "type": "any",
+          "doc": "optional string or bytevector"
+        }
+      ],
+      "returns": "nil",
+      "examples": [
+        "(ws/ping sock)\n(ws/ping sock \"keepalive\")"
+      ],
+      "body": "Send a ping frame to keep the connection alive; the peer answers with a pong automatically. An optional string or bytevector payload is echoed in the pong.\n\n```sema\n(ws/ping sock)\n(ws/ping sock \"keepalive\")\n```"
+    },
+    {
+      "name": "ws/recv",
+      "module": "websocket",
+      "section": "WebSocket Client",
+      "summary": "Block until the next frame arrives, returning a tagged map for `match`: `{:text s}`, `{:binary bv}`, or `{:close {:code … :reason …}}`, and `nil` once the connection is drained. Native only — in the browser, receive via `ws/listen`.",
+      "params": [
+        {
+          "name": "conn",
+          "type": "connection"
+        }
+      ],
+      "returns": "map",
+      "examples": [
+        "(match (ws/recv sock)\n  {:text t}   (println \"text:\" t)\n  {:binary b} (handle-bytes b)\n  {:close c}  (println \"closed\" (:code c))\n  nil         (println \"connection drained\"))"
+      ],
+      "body": "Block until the next frame arrives, returning a tagged map for `match`: `{:text s}`, `{:binary bv}`, or `{:close {:code … :reason …}}`, and `nil` once the connection is drained. Native only — in the browser, receive via `ws/listen`.\n\n```sema\n(match (ws/recv sock)\n  {:text t}   (println \"text:\" t)\n  {:binary b} (handle-bytes b)\n  {:close c}  (println \"closed\" (:code c))\n  nil         (println \"connection drained\"))\n```"
+    },
+    {
+      "name": "ws/recv-timeout",
+      "module": "websocket",
+      "section": "WebSocket Client",
+      "summary": "Like `ws/recv`, but returns the `:timeout` keyword if no frame arrives within `timeout-ms` milliseconds (distinct from `nil`, which means the connection closed). Native only.",
+      "params": [
+        {
+          "name": "conn",
+          "type": "connection"
+        },
+        {
+          "name": "timeout-ms",
+          "type": "int"
+        }
+      ],
+      "returns": "map",
+      "examples": [
+        "(match (ws/recv-timeout sock 2000)\n  :timeout    (println \"no message in 2s\")\n  {:text t}   (println t)\n  nil         (println \"closed\"))"
+      ],
+      "body": "Like `ws/recv`, but returns the `:timeout` keyword if no frame arrives within `timeout-ms` milliseconds (distinct from `nil`, which means the connection closed). Native only.\n\n```sema\n(match (ws/recv-timeout sock 2000)\n  :timeout    (println \"no message in 2s\")\n  {:text t}   (println t)\n  nil         (println \"closed\"))\n```"
+    },
+    {
+      "name": "ws/send",
+      "module": "websocket",
+      "section": "WebSocket Client",
+      "summary": "Send a message over a WebSocket connection. A string sends a text frame, a bytevector a binary frame, a map is sent as JSON text, and explicit framing selects the type.",
+      "params": [
+        {
+          "name": "conn",
+          "type": "connection"
+        },
+        {
+          "name": "message",
+          "type": "any"
+        }
+      ],
+      "returns": "nil",
+      "examples": [
+        "(ws/send sock \"hello\")                 ;; text\n(ws/send sock (bytevector 1 2 3))      ;; binary\n(ws/send sock {:type \"chat\" :body 1})  ;; JSON text\n(ws/send sock {:text \"hi\"})            ;; explicit text\n(ws/send sock {:binary (bytevector 9)});; explicit binary\n(ws/send sock {:json {:a 1}})          ;; explicit JSON"
+      ],
+      "body": "Send a message over a WebSocket connection. A string sends a text frame, a bytevector a binary frame, a map is sent as JSON text, and explicit framing selects the type.\n\n```sema\n(ws/send sock \"hello\")                 ;; text\n(ws/send sock (bytevector 1 2 3))      ;; binary\n(ws/send sock {:type \"chat\" :body 1})  ;; JSON text\n(ws/send sock {:text \"hi\"})            ;; explicit text\n(ws/send sock {:binary (bytevector 9)});; explicit binary\n(ws/send sock {:json {:a 1}})          ;; explicit JSON\n```"
     },
     {
       "name": "agent",

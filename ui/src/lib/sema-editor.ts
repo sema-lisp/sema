@@ -9,6 +9,9 @@ import { TextareaUndo } from '../internal/textarea-undo.js';
 import syntaxStyles from '../styles/syntax.css?inline';
 import scrollbarStyles from '../styles/scrollbar.css?inline';
 
+const SUPPORTS_FIELD_SIZING =
+  typeof CSS !== 'undefined' && typeof CSS.supports === 'function' && CSS.supports('field-sizing', 'content');
+
 /**
  * `<sema-editor>` — the single editable, syntax-highlighting code editor for the
  * Sema ecosystem (notebook cells, the playground, anywhere code is edited).
@@ -137,8 +140,12 @@ export class SemaEditor extends SemaElement {
         overflow: auto;
       }
       :host([autosize]) textarea {
+        /* Grow with content via CSS where supported (no measure-timing race);
+           the scrollHeight fallback in _grow() covers browsers without it. */
+        field-sizing: content;
         height: auto;
         min-height: 1.7em;
+        max-height: none;
         overflow: hidden;
       }
       textarea::selection {
@@ -197,11 +204,11 @@ export class SemaEditor extends SemaElement {
   firstUpdated() {
     const t = this._ta;
     if (t) this._undo = new TextareaUndo(t, { onChange: () => this._onInput() });
-    if (this.autosize) this._grow();
+    if (this.autosize && !SUPPORTS_FIELD_SIZING) this._grow();
   }
 
   updated(changed: Map<string, unknown>) {
-    if (changed.has('value') && this.autosize) this._grow();
+    if (changed.has('value') && this.autosize && !SUPPORTS_FIELD_SIZING) this._grow();
   }
 
   /** Clear the undo/redo history — call after loading unrelated content. */
@@ -228,7 +235,7 @@ export class SemaEditor extends SemaElement {
     const t = this._ta;
     if (!t) return;
     this.value = t.value;
-    if (this.autosize) this._grow();
+    if (this.autosize && !SUPPORTS_FIELD_SIZING) this._grow();
     this.dispatchEvent(
       new CustomEvent('input', { detail: { value: this.value }, bubbles: true, composed: true }),
     );
@@ -255,16 +262,53 @@ export class SemaEditor extends SemaElement {
   private _onKeydown = (e: KeyboardEvent) => {
     if (e.key === 'Tab' && !e.metaKey && !e.ctrlKey && !e.altKey) {
       e.preventDefault();
-      const t = this._ta;
-      if (!t) return;
-      const s = t.selectionStart;
-      const en = t.selectionEnd;
-      const pad = ' '.repeat(this.tabSize);
-      t.value = t.value.slice(0, s) + pad + t.value.slice(en);
-      t.selectionStart = t.selectionEnd = s + pad.length;
-      t.dispatchEvent(new Event('input', { bubbles: true }));
+      if (e.shiftKey) this._dedent();
+      else this._indent();
     }
   };
+
+  /** Tab: insert spaces at the cursor, or indent every line in a multi-line selection. */
+  private _indent() {
+    const t = this._ta;
+    if (!t) return;
+    const { selectionStart: s, selectionEnd: en, value } = t;
+    const pad = ' '.repeat(this.tabSize);
+    if (s === en || !value.slice(s, en).includes('\n')) {
+      t.value = value.slice(0, s) + pad + value.slice(en);
+      t.selectionStart = t.selectionEnd = s + pad.length;
+    } else {
+      const lineStart = value.lastIndexOf('\n', s - 1) + 1;
+      const block = value.slice(lineStart, en);
+      const indented = block.replace(/^/gm, pad);
+      t.value = value.slice(0, lineStart) + indented + value.slice(en);
+      t.selectionStart = lineStart;
+      t.selectionEnd = en + (indented.length - block.length);
+    }
+    t.dispatchEvent(new Event('input', { bubbles: true }));
+  }
+
+  /** Shift+Tab: remove up to `tab-size` leading spaces from each line in range. */
+  private _dedent() {
+    const t = this._ta;
+    if (!t) return;
+    const { selectionStart: s, selectionEnd: en, value } = t;
+    const lineStart = value.lastIndexOf('\n', s - 1) + 1;
+    const block = value.slice(lineStart, en);
+    let firstRemoved = 0;
+    let totalRemoved = 0;
+    const out = block.split('\n').map((line, i) => {
+      const lead = /^ */.exec(line)![0].length;
+      const remove = Math.min(lead, this.tabSize);
+      if (i === 0) firstRemoved = remove;
+      totalRemoved += remove;
+      return line.slice(remove);
+    });
+    if (totalRemoved === 0) return; // nothing to outdent (still swallow the Tab)
+    t.value = value.slice(0, lineStart) + out.join('\n') + value.slice(en);
+    t.selectionStart = Math.max(lineStart, s - firstRemoved);
+    t.selectionEnd = en - totalRemoved;
+    t.dispatchEvent(new Event('input', { bubbles: true }));
+  }
 
   private _gutterClick(line: number) {
     this.dispatchEvent(

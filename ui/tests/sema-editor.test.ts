@@ -61,6 +61,45 @@ describe('sema-editor', () => {
     expect(t.value.startsWith('  ')).toBe(true)
   })
 
+  it('Shift+Tab removes up to tab-size leading spaces (dedent)', async () => {
+    const el = await mount('tab-size="2"')
+    const t = ta(el)
+    el.value = '    (foo)'
+    await el.updateComplete
+    t.focus()
+    t.selectionStart = t.selectionEnd = 6
+    t.dispatchEvent(
+      new KeyboardEvent('keydown', { key: 'Tab', shiftKey: true, bubbles: true, cancelable: true }),
+    )
+    expect(el.value).toBe('  (foo)')
+  })
+
+  it('Tab indents every line of a multi-line selection', async () => {
+    const el = await mount('tab-size="2"')
+    const t = ta(el)
+    el.value = 'a\nb'
+    await el.updateComplete
+    t.focus()
+    t.selectionStart = 0
+    t.selectionEnd = 3
+    t.dispatchEvent(new KeyboardEvent('keydown', { key: 'Tab', bubbles: true, cancelable: true }))
+    expect(el.value).toBe('  a\n  b')
+  })
+
+  it('Shift+Tab dedents every line of a multi-line selection', async () => {
+    const el = await mount('tab-size="2"')
+    const t = ta(el)
+    el.value = '  a\n    b'
+    await el.updateComplete
+    t.focus()
+    t.selectionStart = 0
+    t.selectionEnd = el.value.length
+    t.dispatchEvent(
+      new KeyboardEvent('keydown', { key: 'Tab', shiftKey: true, bubbles: true, cancelable: true }),
+    )
+    expect(el.value).toBe('a\n  b')
+  })
+
   it('forwards the testid onto the inner textarea', async () => {
     const el = await mount('testid="cell-textarea"')
     expect(ta(el).getAttribute('data-testid')).toBe('cell-textarea')

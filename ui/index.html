@@ -463,6 +463,111 @@
       </div>
     </div>
 
+    <!-- ═══════ EDITOR ═══════ -->
+    <div class="demo-section-title">Editor</div>
+    <div class="demo-tab-hint" style="margin-bottom:1.25rem;">
+      <code style="font-family:var(--mono);color:var(--gold);">&lt;sema-editor&gt;</code> — the one editable, syntax-highlighting code editor (notebook + playground share it).
+      Same Shiki grammar as <code style="font-family:var(--mono);color:var(--gold);">&lt;sema-code&gt;</code>, plus an extensible gutter: line numbers, breakpoints, and a current/debug line.
+    </div>
+
+    <div class="demo-row">
+      <span class="demo-label">editable (sema)</span>
+      <div class="demo-cell" style="align-items:flex-start;">
+        <sema-editor id="ed-basic" style="height:150px;width:440px;"></sema-editor>
+      </div>
+    </div>
+
+    <div class="demo-row">
+      <span class="demo-label">gutter · breakpoints · current line</span>
+      <div class="demo-cell" style="align-items:flex-start;flex-direction:column;gap:0.4rem;">
+        <sema-editor id="ed-debug" line-numbers current-line="3" style="height:180px;width:440px;"></sema-editor>
+        <span style="font-size:0.78rem;color:var(--text-tertiary);">Click a line number to toggle a breakpoint — fires the <code style="font-family:var(--mono);color:var(--gold);">gutter-click</code> event.</span>
+      </div>
+    </div>
+
+    <div class="demo-row">
+      <span class="demo-label">autosize (grows to fit)</span>
+      <div class="demo-cell" style="align-items:flex-start;">
+        <sema-editor id="ed-auto" autosize style="width:440px;"></sema-editor>
+      </div>
+    </div>
+
+    <div class="demo-row">
+      <span class="demo-label">markdown source</span>
+      <div class="demo-cell" style="align-items:flex-start;">
+        <sema-editor id="ed-md" lang="markdown" autosize style="width:440px;"></sema-editor>
+      </div>
+    </div>
+
+    <!-- ═══════ MARKDOWN ═══════ -->
+    <div class="demo-section-title">Markdown</div>
+    <div class="demo-tab-hint" style="margin-bottom:1.25rem;">
+      <code style="font-family:var(--mono);color:var(--gold);">&lt;sema-markdown&gt;</code> — read-only Markdown rendering (marked + shared Shiki for fenced code).
+      Consumers pair it with <code style="font-family:var(--mono);color:var(--gold);">&lt;sema-editor&gt;</code> to switch between editing and preview.
+    </div>
+    <div class="demo-row">
+      <span class="demo-label">rendered</span>
+      <div class="demo-cell" style="align-items:flex-start;">
+        <sema-markdown id="md-demo" style="width:440px;display:block;"></sema-markdown>
+      </div>
+    </div>
+
+    <!-- ═══════ BADGE · SPINNER · KBD · PAGINATION ═══════ -->
+    <div class="demo-section-title">Badge · Spinner · Kbd · Pagination</div>
+    <div class="demo-row">
+      <span class="demo-label">badge</span>
+      <div class="demo-cell" style="gap:0.5rem;flex-wrap:wrap;">
+        <sema-badge>neutral</sema-badge>
+        <sema-badge variant="gold">gold</sema-badge>
+        <sema-badge variant="success">success</sema-badge>
+        <sema-badge variant="error" dot>error</sema-badge>
+        <sema-badge variant="gold" pill>pill</sema-badge>
+      </div>
+    </div>
+    <div class="demo-row">
+      <span class="demo-label">spinner</span>
+      <div class="demo-cell" style="gap:1.25rem;align-items:center;">
+        <sema-spinner size="sm"></sema-spinner>
+        <sema-spinner></sema-spinner>
+        <sema-spinner size="lg"></sema-spinner>
+      </div>
+    </div>
+    <div class="demo-row">
+      <span class="demo-label">kbd</span>
+      <div class="demo-cell" style="gap:0.5rem;">
+        <sema-kbd keys="⌘ S"></sema-kbd>
+        <sema-kbd keys="Shift Enter"></sema-kbd>
+        <sema-kbd keys="Ctrl C"></sema-kbd>
+      </div>
+    </div>
+    <div class="demo-row">
+      <span class="demo-label">pagination</span>
+      <div class="demo-cell">
+        <sema-pagination page="3" total="10"></sema-pagination>
+      </div>
+    </div>
+    <div class="demo-row">
+      <span class="demo-label">drawer</span>
+      <div class="demo-cell">
+        <sema-button id="open-drawer" variant="secondary">Open drawer</sema-button>
+        <sema-drawer id="demo-drawer" placement="right" label="Settings">
+          <div style="padding:1.25rem;">Drawer content — press Esc or click the backdrop to close.</div>
+        </sema-drawer>
+      </div>
+    </div>
+
+    <!-- ═══════ CODE TYPER ═══════ -->
+    <div class="demo-section-title">Code Typer</div>
+    <div class="demo-row">
+      <span class="demo-label">animated typing</span>
+      <div class="demo-cell" style="align-items:flex-start;">
+        <sema-code-typer lang="sema" loop style="width:440px;">(define (greet name)
+  (format "Hello, ~a!" name))
+
+(greet "Sema")</sema-code-typer>
+      </div>
+    </div>
+
     <!-- ═══════ RECIPES (DOGFOOD) ═══════ -->
     <div class="demo-section-title">Recipes — Install &amp; Usage</div>
     <div class="demo-tab-hint" style="margin-bottom:1.25rem;">
@@ -664,6 +769,19 @@
   </sema-container>
 </sema-page>
 
+<script type="text/markdown" id="md-src">
+# Sema Markdown
+
+Render **bold**, _italic_, and [links](https://sema-lang.com).
+
+- lists
+- with items
+
+```sema
+(define (square x) (* x x))
+(map square '(1 2 3 4 5))
+```
+</script>
 <script type="module">
   import './src/index.ts';
   import { toast } from './src/index.ts';
@@ -717,6 +835,39 @@
     for (const item of demoTree.querySelectorAll('sema-tree-item')) item.selected = false;
     if (e.detail.element) e.detail.element.selected = true;
   });
+
+  // Editor + Markdown demos
+  const $ = (id) => document.getElementById(id);
+  $('ed-basic').value = `; a tool the LLM can call
+(deftool get-weather
+  "Get weather for a city"
+  {:city {:type :string}}
+  (lambda (city)
+    (format "~a: 22C sunny" city)))`;
+
+  const dbg = $('ed-debug');
+  dbg.value = `(define (fib n)
+  (if (< n 2)
+      n
+      (+ (fib (- n 1))
+         (fib (- n 2)))))`;
+  dbg.breakpoints = [2, 4];
+  dbg.addEventListener('gutter-click', (e) => {
+    const line = e.detail.line;
+    const set = new Set(dbg.breakpoints);
+    set.has(line) ? set.delete(line) : set.add(line);
+    dbg.breakpoints = [...set];
+  });
+
+  $('ed-auto').value = `(map (lambda (x) (* x x)) '(1 2 3 4 5))`;
+  $('ed-md').value = `# Notebook cell
+
+Editing **markdown** source, previewed with sema-markdown.`;
+
+  $('md-demo').value = $('md-src').textContent.trim();
+
+  // Drawer wire-up
+  $('open-drawer').addEventListener('click', () => { $('demo-drawer').open = true; });
 </script>
 
 </body>

@@ -9,6 +9,10 @@
 
 .copy {
   position: absolute;
+  /* Above the code lines: with `lines`, each `.cl` is position:relative and would
+     otherwise paint over this absolutely-positioned button (equal auto z-index,
+     later in DOM). Keep the copy affordance clickable on top always. */
+  z-index: 2;
   top: var(--space-sm, 8px);
   right: var(--space-sm, 8px);
   font-family: var(--mono, 'JetBrains Mono', monospace);

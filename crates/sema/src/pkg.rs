@@ -1,3 +1,4 @@
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -176,12 +177,20 @@ fn cmd_add_git(spec: &str) -> Result<(), String> {
         Err(e) => eprintln!("Warning: could not update sema.toml: {e}"),
     }
 
-    match update_lock_entry(spec.path.as_str(), LockEntry::Git { git_ref, commit }) {
+    match update_lock_entry(
+        spec.path.as_str(),
+        LockEntry::Git {
+            git_ref,
+            commit,
+            direct: true,
+        },
+    ) {
         Ok(()) => println!("✓ Updated sema.lock"),
         Err(e) => eprintln!("Warning: could not update sema.lock: {e}"),
     }
 
-    Ok(())
+    // Pull in this package's own dependencies, if any (transitive resolution).
+    cmd_install(false)
 }
 
 fn cmd_add_registry(spec: &str, registry: Option<&str>) -> Result<(), String> {
@@ -221,12 +230,376 @@ fn cmd_add_registry(spec: &str, registry: Option<&str>) -> Result<(), String> {
             version,
             registry: registry_url,
             checksum,
+            direct: true,
         },
     ) {
         Ok(()) => println!("✓ Updated sema.lock"),
         Err(e) => eprintln!("Warning: could not update sema.lock: {e}"),
     }
 
+    // Pull in this package's own dependencies, if any (transitive resolution).
+    cmd_install(false)
+}
+
+/// Parse a `[deps]`-shaped TOML table into a plain name → version/ref map.
+fn parse_deps_table(
+    table: &toml::map::Map<String, toml::Value>,
+) -> Result<BTreeMap<String, String>, String> {
+    let mut result = BTreeMap::new();
+    for (name, value) in table {
+        let version = value.as_str().ok_or_else(|| {
+            format!("dep '{name}': expected a version/ref string (e.g., \"1.0.0\" or \"main\")")
+        })?;
+        result.insert(name.clone(), version.to_string());
+    }
+    Ok(result)
+}
+
+/// Resolve+install a package with no usable lock entry (fresh install or a
+/// version/ref bump). Does not touch sema.toml or the lock file.
+fn resolve_and_install_one(name: &str, version: &str) -> Result<LockEntry, String> {
+    if is_git_spec(name) {
+        let spec_str = format!("{name}@{version}");
+        let spec = sema_core::resolve::PackageSpec::parse(&spec_str).map_err(|e| e.to_string())?;
+        let (git_ref, commit) = install_git(&spec)?;
+        Ok(LockEntry::Git {
+            git_ref,
+            commit,
+            direct: false, // caller normalizes via LockEntry::set_direct
+        })
+    } else {
+        let registry_url = effective_registry(None);
+        let checksum = registry_install(name, version, &registry_url)?;
+        Ok(LockEntry::Registry {
+            version: version.to_string(),
+            registry: registry_url,
+            checksum,
+            direct: false,
+        })
+    }
+}
+
+/// Install (and integrity-verify) a package from an existing, matching lock entry.
+fn install_from_lock_entry(name: &str, entry: &LockEntry) -> Result<(), String> {
+    match entry {
+        LockEntry::Git {
+            git_ref, commit, ..
+        } => {
+            let spec_str = format!("{name}@{git_ref}");
+            let spec =
+                sema_core::resolve::PackageSpec::parse(&spec_str).map_err(|e| e.to_string())?;
+            install_git_locked(&spec, commit)
+        }
+        LockEntry::Registry {
+            version,
+            registry,
+            checksum,
+            ..
+        } => registry_install_locked(name, version, registry, checksum),
+    }
+}
+
+/// Read an already-installed package's own `[deps]` table. Missing manifest
+/// or missing `[deps]` section both mean "no dependencies" — not an error.
+fn read_dest_manifest_deps(name: &str) -> Result<BTreeMap<String, String>, String> {
+    let toml_path = packages_dir().join(name).join("sema.toml");
+    if !toml_path.exists() {
+        return Ok(BTreeMap::new());
+    }
+    let content = std::fs::read_to_string(&toml_path)
+        .map_err(|e| format!("Failed to read {}: {e}", toml_path.display()))?;
+    let doc: toml::Value = toml::from_str(&content)
+        .map_err(|e| format!("Failed to parse {}: {e}", toml_path.display()))?;
+    match doc.get("deps").and_then(|d| d.as_table()) {
+        Some(table) => parse_deps_table(table),
+        None => Ok(BTreeMap::new()),
+    }
+}
+
+/// Notable, non-fatal events produced while walking the dependency graph.
+#[derive(Debug, Clone, PartialEq)]
+enum ResolutionNote {
+    /// A direct dependency's pinned version/ref overrode a conflicting
+    /// transitive request for the same package.
+    DirectOverride {
+        name: String,
+        direct_version: String,
+        requested_by: String,
+        requested_version: String,
+    },
+    /// Two or more transitive requesters wanted different (but
+    /// semver-compatible) versions of the same registry package; the
+    /// higher one was chosen.
+    DiamondAutoResolved {
+        name: String,
+        chosen_version: String,
+        requesters: Vec<(String, String)>,
+    },
+}
+
+struct ResolvedPkg {
+    entry: LockEntry,
+    direct: bool,
+    /// (requester name — "<root>" for a direct dep, requested version/ref)
+    requesters: Vec<(String, String)>,
+}
+
+/// Decide how to reconcile two conflicting requests for the same transitive
+/// (non-direct) package. Registry packages auto-resolve to the higher
+/// version when they're semver-compatible (same major, or same 0.x minor);
+/// otherwise — including all git ref conflicts, which have no ordering —
+/// this is a hard error naming every known requester.
+fn resolve_diamond_conflict(
+    name: &str,
+    current_version: &str,
+    requested_version: &str,
+    requesters: &[(String, String)],
+) -> Result<String, String> {
+    let conflict_err = |detail: &str| -> String {
+        let requester_list = requesters
+            .iter()
+            .map(|(who, ver)| format!("  - {who} wants {ver}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        format!(
+            "Conflicting transitive dependency requirements for '{name}':\n{requester_list}\n\
+             {detail}\n\
+             Add an explicit \"{name}\" entry to your own sema.toml [deps] to force a version."
+        )
+    };
+
+    if is_git_spec(name) {
+        return Err(conflict_err(
+            "git refs cannot be automatically reconciled (no version ordering).",
+        ));
+    }
+
+    let current = semver::Version::parse(current_version).map_err(|_| {
+        conflict_err(&format!(
+            "'{current_version}' is not a valid semver version"
+        ))
+    })?;
+    let requested = semver::Version::parse(requested_version).map_err(|_| {
+        conflict_err(&format!(
+            "'{requested_version}' is not a valid semver version"
+        ))
+    })?;
+
+    let compatible = if current.major == 0 && requested.major == 0 {
+        current.minor == requested.minor
+    } else {
+        current.major == requested.major
+    };
+    if !compatible {
+        return Err(conflict_err("versions differ in a breaking (major) way."));
+    }
+
+    Ok(if requested > current {
+        requested_version.to_string()
+    } else {
+        current_version.to_string()
+    })
+}
+
+/// A hard cap on BFS iterations, as a backstop against pathological
+/// oscillating diamond conflicts (a reinstall re-enqueuing children that
+/// keep bouncing versions back and forth). Real dependency graphs never come
+/// close to this.
+const MAX_RESOLUTION_STEPS: usize = 10_000;
+
+/// Reads a package's own `[deps]` (name → version/ref spec) by name. Injected
+/// into `resolve_dependency_graph` so the graph walk stays unit-testable.
+type ReadManifestDeps<'a> = dyn Fn(&str) -> Result<BTreeMap<String, String>, String> + 'a;
+
+/// Walk the full transitive dependency graph starting from `direct_deps`,
+/// resolving/installing each package exactly once and reconciling conflicts
+/// per `resolve_diamond_conflict`. All I/O is injected so this is
+/// unit-testable without git/network. Returns the fully-flattened new lock,
+/// the names pruned from `existing_lock` (no longer reachable), and
+/// human-readable notes for the caller to print.
+fn resolve_dependency_graph(
+    direct_deps: &BTreeMap<String, String>,
+    existing_lock: &LockFile,
+    install_fresh: &mut dyn FnMut(&str, &str) -> Result<LockEntry, String>,
+    install_locked: &mut dyn FnMut(&str, &LockEntry) -> Result<(), String>,
+    read_manifest_deps: &ReadManifestDeps,
+) -> Result<(LockFile, Vec<String>, Vec<ResolutionNote>), String> {
+    let mut resolved: BTreeMap<String, ResolvedPkg> = BTreeMap::new();
+    let mut notes = Vec::new();
+    let mut queue: VecDeque<(String, String, String)> = VecDeque::new();
+    let mut steps: usize = 0;
+
+    let mut resolve_one = |name: &str, version: &str| -> Result<LockEntry, String> {
+        if let Some(existing) = existing_lock.entries.get(name) {
+            if existing.requested() == version {
+                install_locked(name, existing)?;
+                return Ok(existing.clone());
+            }
+        }
+        install_fresh(name, version)
+    };
+
+    // Phase 1: direct deps always resolve first and always win.
+    for (name, version) in direct_deps {
+        let mut entry = resolve_one(name, version)?;
+        entry.set_direct(true);
+        let children = read_manifest_deps(name)?;
+        resolved.insert(
+            name.clone(),
+            ResolvedPkg {
+                entry,
+                direct: true,
+                requesters: vec![("<root>".to_string(), version.clone())],
+            },
+        );
+        for (child_name, child_version) in children {
+            queue.push_back((child_name, child_version, name.clone()));
+        }
+    }
+
+    // Phase 2: BFS over transitive requests.
+    while let Some((name, version, requested_by)) = queue.pop_front() {
+        steps += 1;
+        if steps > MAX_RESOLUTION_STEPS {
+            return Err(format!(
+                "Dependency resolution did not converge after {MAX_RESOLUTION_STEPS} steps \
+                 (possible circular version requirement involving '{name}'). \
+                 Add an explicit \"{name}\" entry to your own sema.toml [deps] to pin it."
+            ));
+        }
+
+        match resolved.get_mut(&name) {
+            None => {
+                let mut entry = resolve_one(&name, &version)?;
+                entry.set_direct(false);
+                let children = read_manifest_deps(&name)?;
+                resolved.insert(
+                    name.clone(),
+                    ResolvedPkg {
+                        entry,
+                        direct: false,
+                        requesters: vec![(requested_by, version)],
+                    },
+                );
+                for (child_name, child_version) in children {
+                    queue.push_back((child_name, child_version, name.clone()));
+                }
+            }
+            Some(pkg) if pkg.direct => {
+                let direct_version = pkg.entry.requested().to_string();
+                if direct_version != version {
+                    notes.push(ResolutionNote::DirectOverride {
+                        name: name.clone(),
+                        direct_version,
+                        requested_by: requested_by.clone(),
+                        requested_version: version.clone(),
+                    });
+                }
+                pkg.requesters.push((requested_by, version));
+            }
+            Some(pkg) => {
+                let current_version = pkg.entry.requested().to_string();
+                pkg.requesters.push((requested_by, version.clone()));
+                if current_version == version {
+                    continue;
+                }
+                let chosen =
+                    resolve_diamond_conflict(&name, &current_version, &version, &pkg.requesters)?;
+                if chosen != current_version {
+                    let mut new_entry = resolve_one(&name, &chosen)?;
+                    new_entry.set_direct(false);
+                    let new_children = read_manifest_deps(&name)?;
+                    pkg.entry = new_entry;
+                    for (child_name, child_version) in new_children {
+                        queue.push_back((child_name, child_version, name.clone()));
+                    }
+                }
+                notes.push(ResolutionNote::DiamondAutoResolved {
+                    name: name.clone(),
+                    chosen_version: chosen,
+                    requesters: pkg.requesters.clone(),
+                });
+            }
+        }
+    }
+
+    let pruned: Vec<String> = existing_lock
+        .entries
+        .keys()
+        .filter(|name| !resolved.contains_key(name.as_str()))
+        .cloned()
+        .collect();
+
+    let mut new_lock = LockFile::new();
+    for (name, pkg) in resolved {
+        new_lock.entries.insert(name, pkg.entry);
+    }
+
+    Ok((new_lock, pruned, notes))
+}
+
+/// Pure, install-free reachability BFS used by `cmd_remove` to decide
+/// whether a package can be safely deleted. Uses whatever manifests are
+/// already on disk — never touches the network, never installs anything, and
+/// silently treats an unreadable manifest as "no further dependencies".
+fn compute_reachable(direct_deps: &BTreeMap<String, String>) -> BTreeSet<String> {
+    let mut reachable = BTreeSet::new();
+    let mut queue: VecDeque<String> = direct_deps.keys().cloned().collect();
+    while let Some(name) = queue.pop_front() {
+        if !reachable.insert(name.clone()) {
+            continue;
+        }
+        for child in read_dest_manifest_deps(&name).unwrap_or_default().keys() {
+            if !reachable.contains(child) {
+                queue.push_back(child.clone());
+            }
+        }
+    }
+    reachable
+}
+
+fn print_resolution_note(note: &ResolutionNote) {
+    match note {
+        ResolutionNote::DirectOverride {
+            name,
+            direct_version,
+            requested_by,
+            requested_version,
+        } => {
+            println!(
+                "  note: your direct pin of '{name}' ({direct_version}) overrides a transitive \
+                 request for {requested_version} from '{requested_by}'"
+            );
+        }
+        ResolutionNote::DiamondAutoResolved {
+            name,
+            chosen_version,
+            requesters,
+        } => {
+            let who: Vec<String> = requesters.iter().map(|(w, v)| format!("{w}@{v}")).collect();
+            println!(
+                "  note: '{name}' resolved to {chosen_version} across multiple requesters ({})",
+                who.join(", ")
+            );
+        }
+    }
+}
+
+/// `--locked` orphan check: only direct-flagged lock entries must appear in
+/// `sema.toml [deps]`. Transitive entries (`direct == false`) legitimately
+/// have no top-level `[deps]` key — they were pulled in by something that
+/// does. Pulled out as its own pure function so it's testable without
+/// actually installing anything (git/network are otherwise unavoidable once
+/// `cmd_install` reaches the install loop).
+fn check_locked_orphans(deps: &BTreeMap<String, String>, lock: &LockFile) -> Result<(), String> {
+    for (name, entry) in &lock.entries {
+        if entry.is_direct() && !deps.contains_key(name) {
+            return Err(format!(
+                "'{name}' is in sema.lock but not in sema.toml. \
+                 Run `sema pkg install` (without --locked) to update the lock file."
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -241,13 +614,14 @@ pub fn cmd_install(locked: bool) -> Result<(), String> {
     let doc: toml::Value =
         toml::from_str(&content).map_err(|e| format!("Failed to parse sema.toml: {e}"))?;
 
-    let deps = match doc.get("deps").and_then(|d| d.as_table()) {
+    let deps_table = match doc.get("deps").and_then(|d| d.as_table()) {
         Some(table) => table,
         None => {
             println!("No [deps] found in sema.toml, nothing to install.");
             return Ok(());
         }
     };
+    let deps = parse_deps_table(deps_table)?;
 
     let lock = read_lock_file()?;
 
@@ -257,9 +631,8 @@ pub fn cmd_install(locked: bool) -> Result<(), String> {
              Run `sema pkg install` first to generate sema.lock.",
         )?;
 
-        // Check for deps in sema.toml but not in lock
-        for (name, value) in deps {
-            let toml_version = value.as_str().unwrap_or("");
+        // Every direct dep in sema.toml must have a matching lock entry.
+        for (name, version) in &deps {
             match lock.entries.get(name) {
                 None => {
                     return Err(format!(
@@ -268,14 +641,10 @@ pub fn cmd_install(locked: bool) -> Result<(), String> {
                     ));
                 }
                 Some(entry) => {
-                    // Verify sema.toml version/ref matches lock
-                    let lock_ver = match entry {
-                        LockEntry::Git { git_ref, .. } => git_ref.as_str(),
-                        LockEntry::Registry { version, .. } => version.as_str(),
-                    };
-                    if !toml_version.is_empty() && lock_ver != toml_version {
+                    let lock_ver = entry.requested();
+                    if lock_ver != version {
                         return Err(format!(
-                            "Dep '{name}' version mismatch: sema.toml has \"{toml_version}\" \
+                            "Dep '{name}' version mismatch: sema.toml has \"{version}\" \
                              but sema.lock has \"{lock_ver}\". \
                              Run `sema pkg install` (without --locked) to update the lock file."
                         ));
@@ -284,119 +653,39 @@ pub fn cmd_install(locked: bool) -> Result<(), String> {
             }
         }
 
-        // Check for orphaned lock entries
-        for name in lock.entries.keys() {
-            if !deps.contains_key(name) {
-                return Err(format!(
-                    "'{name}' is in sema.lock but not in sema.toml. \
-                     Run `sema pkg install` (without --locked) to update the lock file."
-                ));
-            }
-        }
+        check_locked_orphans(&deps, lock)?;
 
-        // Install from lock
+        // Trust the lock's full flattened closure as-is (no network
+        // re-derivation of the graph) and install every entry in it.
         for (name, entry) in &lock.entries {
             println!("Installing {name} (locked)...");
-            match entry {
-                LockEntry::Git { git_ref, commit } => {
-                    let spec_str = format!("{name}@{git_ref}");
-                    let spec = sema_core::resolve::PackageSpec::parse(&spec_str)
-                        .map_err(|e| e.to_string())?;
-                    install_git_locked(&spec, commit)?;
-                }
-                LockEntry::Registry {
-                    version,
-                    registry,
-                    checksum,
-                } => {
-                    registry_install_locked(name, version, registry, checksum)?;
-                }
-            }
+            install_from_lock_entry(name, entry)?;
         }
 
         return Ok(());
     }
 
-    // Normal install: use lock when available, resolve otherwise
-    let mut new_lock = lock.unwrap_or_else(LockFile::new);
+    let existing_lock = lock.unwrap_or_else(LockFile::new);
 
-    // Prune orphaned lock entries (not in sema.toml)
-    let orphaned: Vec<String> = new_lock
-        .entries
-        .keys()
-        .filter(|name| !deps.contains_key(name.as_str()))
-        .cloned()
-        .collect();
-    for name in &orphaned {
-        eprintln!("Warning: '{name}' is in sema.lock but not in sema.toml, removing");
-        new_lock.entries.remove(name);
-    }
-
-    for (name, value) in deps {
-        let version = match value.as_str() {
-            Some(s) => s,
-            None => {
-                return Err(format!(
-                    "dep '{name}': expected a version/ref string (e.g., \"1.0.0\" or \"main\")"
-                ));
-            }
-        };
-
-        // Check if lock entry exists AND matches the sema.toml version/ref
-        let lock_matches = new_lock.entries.get(name).is_some_and(|entry| match entry {
-            LockEntry::Git { git_ref, .. } => git_ref == version,
-            LockEntry::Registry { version: v, .. } => v == version,
-        });
-
-        if lock_matches {
-            // Locked entry matches — install from lock
-            let entry = &new_lock.entries[name];
-            println!("Installing {name} (locked)...");
-            match entry {
-                LockEntry::Git { git_ref, commit } => {
-                    let spec_str = format!("{name}@{git_ref}");
-                    let spec = sema_core::resolve::PackageSpec::parse(&spec_str)
-                        .map_err(|e| e.to_string())?;
-                    install_git_locked(&spec, commit)?;
-                }
-                LockEntry::Registry {
-                    version,
-                    registry,
-                    checksum,
-                } => {
-                    registry_install_locked(name, version, registry, checksum)?;
-                }
-            }
-        } else {
-            // No lock entry or version changed — resolve fresh
-            if new_lock.entries.contains_key(name) {
-                eprintln!("Warning: '{name}' version changed in sema.toml, re-resolving...");
-            } else {
-                eprintln!("Warning: '{name}' not in sema.lock, resolving...");
-            }
+    let (new_lock, pruned, notes) = resolve_dependency_graph(
+        &deps,
+        &existing_lock,
+        &mut |name, version| {
             println!("Installing {name}...");
+            resolve_and_install_one(name, version)
+        },
+        &mut |name, entry| {
+            println!("Installing {name} (locked)...");
+            install_from_lock_entry(name, entry)
+        },
+        &read_dest_manifest_deps,
+    )?;
 
-            if is_git_spec(name) {
-                let spec_str = format!("{name}@{version}");
-                let spec =
-                    sema_core::resolve::PackageSpec::parse(&spec_str).map_err(|e| e.to_string())?;
-                let (git_ref, commit) = install_git(&spec)?;
-                new_lock
-                    .entries
-                    .insert(name.clone(), LockEntry::Git { git_ref, commit });
-            } else {
-                let registry_url = effective_registry(None);
-                let checksum = registry_install(name, version, &registry_url)?;
-                new_lock.entries.insert(
-                    name.clone(),
-                    LockEntry::Registry {
-                        version: version.to_string(),
-                        registry: registry_url,
-                        checksum,
-                    },
-                );
-            }
-        }
+    for name in &pruned {
+        eprintln!("Warning: '{name}' is no longer required, removing from sema.lock");
+    }
+    for note in &notes {
+        print_resolution_note(note);
     }
 
     write_lock_file(&new_lock)?;
@@ -405,10 +694,29 @@ pub fn cmd_install(locked: bool) -> Result<(), String> {
     Ok(())
 }
 
+/// Is `name` a direct dependency? Checked against the lock file's `direct`
+/// flag when a lock entry exists; a package not yet locked at all is treated
+/// as direct (matches pre-transitive-resolution behavior: everything used to
+/// be direct).
+fn is_direct_dep(name: &str) -> bool {
+    read_lock_file()
+        .ok()
+        .flatten()
+        .and_then(|l| l.entries.get(name).map(|e| e.is_direct()))
+        .unwrap_or(true)
+}
+
 pub fn cmd_update(name: Option<&str>) -> Result<(), String> {
     let pkg_dir = packages_dir();
 
     if let Some(name) = name {
+        if !is_direct_dep(name) {
+            return Err(format!(
+                "'{name}' is a transitive dependency — its version is controlled by whichever \
+                 package requires it. Add \"{name}\" to your own sema.toml [deps] to pin or \
+                 override it directly."
+            ));
+        }
         let dir = find_package_dir(&pkg_dir, name).ok_or_else(|| {
             format!("Package '{name}' not found. Run `sema pkg list` to see installed packages.")
         })?;
@@ -419,17 +727,35 @@ pub fn cmd_update(name: Option<&str>) -> Result<(), String> {
             println!("No packages installed.");
             return Ok(());
         }
+        // Only direct deps get force-bumped to latest here; transitive
+        // packages' versions are dictated by whatever their direct-dep
+        // requesters need, re-derived below by re-resolving the graph.
         for dir in &packages {
             let rel = dir.strip_prefix(&pkg_dir).unwrap_or(dir);
+            let rel_str = rel.to_string_lossy().to_string();
+            if !is_direct_dep(&rel_str) {
+                continue;
+            }
             if let Err(e) = update_single_package(&pkg_dir, dir) {
                 eprintln!("✗ Failed to update {}: {e}", rel.display());
             }
         }
     }
 
+    // Re-resolve the whole graph so transitive requirements introduced or
+    // dropped by the version bump(s) above get picked up or pruned.
+    if Path::new("sema.toml").exists() {
+        cmd_install(false)?;
+    }
+
     Ok(())
 }
 
+/// Update a single package to its latest version/ref. Only ever called for
+/// packages already confirmed direct (see `cmd_update`) — every lock write
+/// here is therefore `direct: true`, and `sema.toml` is only rewritten when
+/// the package is already listed there, so a transitive-only package can
+/// never get silently promoted into the root manifest.
 fn update_single_package(pkg_dir: &Path, dir: &Path) -> Result<(), String> {
     let rel = dir.strip_prefix(pkg_dir).unwrap_or(dir);
     let rel_str = rel.display().to_string();
@@ -461,9 +787,10 @@ fn update_single_package(pkg_dir: &Path, dir: &Path) -> Result<(), String> {
             let checksum = registry_install(&name, &latest, registry)?;
             println!("✓ Updated {} → {latest}", rel.display());
 
-            // Update sema.toml so install doesn't revert
-            let toml_path = Path::new("sema.toml");
-            if toml_path.exists() {
+            // Only rewrite sema.toml when this package is already a direct
+            // dependency there.
+            if read_dep_ref_from_toml(&name).is_some() {
+                let toml_path = Path::new("sema.toml");
                 let _ = add_dep_to_toml(toml_path, &name, &latest);
             }
 
@@ -473,6 +800,7 @@ fn update_single_package(pkg_dir: &Path, dir: &Path) -> Result<(), String> {
                     version: latest,
                     registry: registry.to_string(),
                     checksum,
+                    direct: true,
                 },
             );
         }
@@ -498,6 +826,7 @@ fn update_single_package(pkg_dir: &Path, dir: &Path) -> Result<(), String> {
             LockEntry::Git {
                 git_ref: current_ref,
                 commit,
+                direct: true,
             },
         );
     } else {
@@ -519,6 +848,49 @@ pub fn cmd_remove(name: &str) -> Result<(), String> {
         .to_string_lossy()
         .to_string();
 
+    // Remove from sema.toml [deps] FIRST so reachability below is computed
+    // against the post-removal set of direct dependencies — deleting the
+    // on-disk directory before checking this would leave a dangling lock
+    // entry if something else still needs the package transitively.
+    let toml_path = Path::new("sema.toml");
+    let mut removed_from_toml = false;
+    if toml_path.exists() {
+        match remove_dep_from_toml(toml_path, &rel_path) {
+            Ok(true) => removed_from_toml = true,
+            Ok(false) => {}
+            Err(e) => eprintln!("Warning: could not update sema.toml: {e}"),
+        }
+    }
+
+    let remaining_deps: BTreeMap<String, String> = toml_path
+        .exists()
+        .then(|| std::fs::read_to_string(toml_path).ok())
+        .flatten()
+        .and_then(|c| toml::from_str::<toml::Value>(&c).ok())
+        .and_then(|doc| {
+            doc.get("deps")
+                .and_then(|d| d.as_table())
+                .and_then(|t| parse_deps_table(t).ok())
+        })
+        .unwrap_or_default();
+    let reachable = compute_reachable(&remaining_deps);
+
+    if reachable.contains(&rel_path) {
+        // Still required transitively by something else — keep it on disk
+        // and demote its lock entry instead of deleting anything.
+        if let Ok(Some(mut lock)) = read_lock_file() {
+            if let Some(entry) = lock.entries.get_mut(&rel_path) {
+                entry.set_direct(false);
+                let _ = write_lock_file(&lock);
+            }
+        }
+        if removed_from_toml {
+            println!("✓ Removed {rel_path} from sema.toml");
+        }
+        println!("Kept {rel_path} installed — still required transitively by another dependency.");
+        return Ok(());
+    }
+
     std::fs::remove_dir_all(&dir).map_err(|e| format!("Failed to remove package: {e}"))?;
     println!("✓ Removed {rel_path}");
 
@@ -536,14 +908,8 @@ pub fn cmd_remove(name: &str) -> Result<(), String> {
         }
     }
 
-    // Remove from sema.toml [deps] if present
-    let toml_path = Path::new("sema.toml");
-    if toml_path.exists() {
-        match remove_dep_from_toml(toml_path, &rel_path) {
-            Ok(true) => println!("✓ Removed {rel_path} from sema.toml"),
-            Ok(false) => {}
-            Err(e) => eprintln!("Warning: could not update sema.toml: {e}"),
-        }
+    if removed_from_toml {
+        println!("✓ Removed {rel_path} from sema.toml");
     }
 
     // Remove from sema.lock if present
@@ -625,18 +991,38 @@ pub fn cmd_list() -> Result<(), String> {
         return Ok(());
     }
 
+    let lock = read_lock_file().ok().flatten();
+
     for dir in &packages {
         let rel = dir.strip_prefix(&pkg_dir).unwrap_or(dir);
+        let rel_str = rel.to_string_lossy().to_string();
+        let kind = lock
+            .as_ref()
+            .and_then(|l| l.entries.get(&rel_str))
+            .map(|e| {
+                if e.is_direct() {
+                    "direct"
+                } else {
+                    "transitive"
+                }
+            });
+
         if let Some(meta) = read_pkg_meta(dir) {
             let version = meta.get("version").and_then(|v| v.as_str()).unwrap_or("?");
             let source = meta
                 .get("registry")
                 .and_then(|v| v.as_str())
                 .unwrap_or("registry");
-            println!("  {} ({version}) [{}]", rel.display(), source);
+            match kind {
+                Some(k) => println!("  {} ({version}) [{source}, {k}]", rel.display()),
+                None => println!("  {} ({version}) [{source}]", rel.display()),
+            }
         } else {
             let current = current_git_ref(dir);
-            println!("  {} ({current}) [git]", rel.display());
+            match kind {
+                Some(k) => println!("  {} ({current}) [git, {k}]", rel.display()),
+                None => println!("  {} ({current}) [git]", rel.display()),
+            }
         }
     }
 
@@ -1439,23 +1825,53 @@ enum LockEntry {
     Git {
         git_ref: String,
         commit: String,
+        /// True if this package is a direct dependency in the project's own
+        /// `sema.toml [deps]`; false if it was pulled in transitively by
+        /// another package's manifest. Defaults to `true` when absent on
+        /// read, since every lock file predating transitive resolution only
+        /// ever contained direct entries.
+        direct: bool,
     },
     Registry {
         version: String,
         registry: String,
         checksum: String,
+        direct: bool,
     },
+}
+
+impl LockEntry {
+    fn is_direct(&self) -> bool {
+        match self {
+            LockEntry::Git { direct, .. } | LockEntry::Registry { direct, .. } => *direct,
+        }
+    }
+
+    /// The pinned version (registry) or ref (git) — the identity-independent
+    /// part of what was requested for this package.
+    fn requested(&self) -> &str {
+        match self {
+            LockEntry::Git { git_ref, .. } => git_ref,
+            LockEntry::Registry { version, .. } => version,
+        }
+    }
+
+    fn set_direct(&mut self, value: bool) {
+        match self {
+            LockEntry::Git { direct, .. } | LockEntry::Registry { direct, .. } => *direct = value,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
 struct LockFile {
-    entries: std::collections::BTreeMap<String, LockEntry>,
+    entries: BTreeMap<String, LockEntry>,
 }
 
 impl LockFile {
     fn new() -> Self {
         Self {
-            entries: std::collections::BTreeMap::new(),
+            entries: BTreeMap::new(),
         }
     }
 }
@@ -1490,7 +1906,7 @@ fn read_lock_file() -> Result<Option<LockFile>, String> {
         .and_then(|v| v.as_table())
         .unwrap_or(&empty_table);
 
-    let mut entries = std::collections::BTreeMap::new();
+    let mut entries = BTreeMap::new();
 
     for (name, value) in packages {
         let table = value
@@ -1500,6 +1916,12 @@ fn read_lock_file() -> Result<Option<LockFile>, String> {
             .get("source")
             .and_then(|v| v.as_str())
             .ok_or_else(|| format!("sema.lock: package '{name}' missing 'source' field"))?;
+        // Absent on every lock file written before transitive resolution
+        // existed — those files only ever contained direct entries.
+        let direct = table
+            .get("direct")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
 
         let entry = match source {
             "git" => {
@@ -1515,6 +1937,7 @@ fn read_lock_file() -> Result<Option<LockFile>, String> {
                 LockEntry::Git {
                     git_ref: git_ref.to_string(),
                     commit: commit.to_string(),
+                    direct,
                 }
             }
             "registry" => {
@@ -1540,6 +1963,7 @@ fn read_lock_file() -> Result<Option<LockFile>, String> {
                     version: version.to_string(),
                     registry: registry.to_string(),
                     checksum: checksum.to_string(),
+                    direct,
                 }
             }
             other => {
@@ -1567,20 +1991,27 @@ fn write_lock_file(lock: &LockFile) -> Result<(), String> {
     for (name, entry) in &lock.entries {
         let mut table = toml_edit::Table::new();
         match entry {
-            LockEntry::Git { git_ref, commit } => {
+            LockEntry::Git {
+                git_ref,
+                commit,
+                direct,
+            } => {
                 table["source"] = toml_edit::value("git");
                 table["ref"] = toml_edit::value(git_ref.as_str());
                 table["commit"] = toml_edit::value(commit.as_str());
+                table["direct"] = toml_edit::value(*direct);
             }
             LockEntry::Registry {
                 version,
                 registry,
                 checksum,
+                direct,
             } => {
                 table["source"] = toml_edit::value("registry");
                 table["version"] = toml_edit::value(version.as_str());
                 table["registry"] = toml_edit::value(registry.as_str());
                 table["checksum"] = toml_edit::value(checksum.as_str());
+                table["direct"] = toml_edit::value(*direct);
             }
         }
         packages[name] = toml_edit::Item::Table(table);
@@ -2566,6 +2997,7 @@ name = "myproject"
             LockEntry::Git {
                 git_ref: "main".to_string(),
                 commit: "abc123def456".to_string(),
+                direct: true,
             },
         );
 
@@ -2576,13 +3008,19 @@ name = "myproject"
         assert!(content.contains("[packages.\"github.com/user/repo\"]"));
         assert!(content.contains("source = \"git\""));
         assert!(content.contains("commit = \"abc123def456\""));
+        assert!(content.contains("direct = true"));
 
         let loaded = read_lock_file().unwrap().unwrap();
         assert_eq!(loaded.entries.len(), 1);
         match &loaded.entries["github.com/user/repo"] {
-            LockEntry::Git { git_ref, commit } => {
+            LockEntry::Git {
+                git_ref,
+                commit,
+                direct,
+            } => {
                 assert_eq!(git_ref, "main");
                 assert_eq!(commit, "abc123def456");
+                assert!(direct);
             }
             _ => panic!("Expected git entry"),
         }
@@ -2603,6 +3041,7 @@ name = "myproject"
                 version: "1.2.0".to_string(),
                 registry: "https://pkg.sema-lang.com".to_string(),
                 checksum: "deadbeef".to_string(),
+                direct: true,
             },
         );
 
@@ -2615,13 +3054,93 @@ name = "myproject"
                 version,
                 registry,
                 checksum,
+                direct,
             } => {
                 assert_eq!(version, "1.2.0");
                 assert_eq!(registry, "https://pkg.sema-lang.com");
                 assert_eq!(checksum, "deadbeef");
+                assert!(direct);
             }
             _ => panic!("Expected registry entry"),
         }
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[serial]
+    fn lock_file_round_trip_git_transitive() {
+        let dir = tmpdir("lock-git-transitive");
+        let _guard = TestDir::new(&dir);
+
+        let mut lock = LockFile::new();
+        lock.entries.insert(
+            "github.com/user/repo".to_string(),
+            LockEntry::Git {
+                git_ref: "main".to_string(),
+                commit: "abc123def456".to_string(),
+                direct: false,
+            },
+        );
+
+        write_lock_file(&lock).unwrap();
+
+        let content = fs::read_to_string(dir.join(LOCK_FILE)).unwrap();
+        assert!(content.contains("direct = false"));
+
+        let loaded = read_lock_file().unwrap().unwrap();
+        assert!(!loaded.entries["github.com/user/repo"].is_direct());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[serial]
+    fn lock_file_round_trip_registry_transitive() {
+        let dir = tmpdir("lock-registry-transitive");
+        let _guard = TestDir::new(&dir);
+
+        let mut lock = LockFile::new();
+        lock.entries.insert(
+            "http-helpers".to_string(),
+            LockEntry::Registry {
+                version: "1.2.0".to_string(),
+                registry: "https://pkg.sema-lang.com".to_string(),
+                checksum: "deadbeef".to_string(),
+                direct: false,
+            },
+        );
+
+        write_lock_file(&lock).unwrap();
+
+        let loaded = read_lock_file().unwrap().unwrap();
+        assert!(!loaded.entries["http-helpers"].is_direct());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[serial]
+    fn lock_file_direct_field_defaults_true_when_absent() {
+        let dir = tmpdir("lock-direct-default");
+        let _guard = TestDir::new(&dir);
+
+        fs::write(
+            LOCK_FILE,
+            "lock_version = 1\n\n\
+             [packages.foo]\n\
+             source = \"registry\"\n\
+             version = \"1.0.0\"\n\
+             registry = \"http://localhost\"\n\
+             checksum = \"aaa\"\n",
+        )
+        .unwrap();
+
+        let loaded = read_lock_file().unwrap().unwrap();
+        assert!(
+            loaded.entries["foo"].is_direct(),
+            "missing 'direct' field must default to true for backward compatibility"
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -2638,6 +3157,7 @@ name = "myproject"
             LockEntry::Git {
                 git_ref: "v1.0".to_string(),
                 commit: "aaa111".to_string(),
+                direct: true,
             },
         );
         lock.entries.insert(
@@ -2646,6 +3166,7 @@ name = "myproject"
                 version: "0.1.0".to_string(),
                 registry: "https://pkg.sema-lang.com".to_string(),
                 checksum: "bbb222".to_string(),
+                direct: true,
             },
         );
 
@@ -2679,6 +3200,7 @@ name = "myproject"
                 version: "1.0.0".to_string(),
                 registry: "https://pkg.sema-lang.com".to_string(),
                 checksum: "aaa".to_string(),
+                direct: true,
             },
         )
         .unwrap();
@@ -2693,6 +3215,7 @@ name = "myproject"
                 version: "2.0.0".to_string(),
                 registry: "https://pkg.sema-lang.com".to_string(),
                 checksum: "bbb".to_string(),
+                direct: true,
             },
         )
         .unwrap();
@@ -2719,6 +3242,7 @@ name = "myproject"
                 version: "1.0.0".to_string(),
                 registry: "https://pkg.sema-lang.com".to_string(),
                 checksum: "aaa".to_string(),
+                direct: true,
             },
         )
         .unwrap();
@@ -2728,6 +3252,7 @@ name = "myproject"
                 version: "2.0.0".to_string(),
                 registry: "https://pkg.sema-lang.com".to_string(),
                 checksum: "bbb".to_string(),
+                direct: true,
             },
         )
         .unwrap();
@@ -2916,6 +3441,377 @@ name = "myproject"
         assert!(err.contains("commit"), "got: {err}");
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    // ── check_locked_orphans tests (pure, no install/network) ─────────
+
+    #[test]
+    fn check_locked_orphans_allows_transitive_entry_missing_from_toml() {
+        let deps: BTreeMap<String, String> = [("foo".to_string(), "1.0.0".to_string())].into();
+        let mut lock = LockFile::new();
+        lock.entries
+            .insert("foo".to_string(), registry_entry("1.0.0", true));
+        lock.entries
+            .insert("bar".to_string(), registry_entry("2.0.0", false));
+
+        assert!(check_locked_orphans(&deps, &lock).is_ok());
+    }
+
+    #[test]
+    fn check_locked_orphans_rejects_direct_entry_missing_from_toml() {
+        let deps: BTreeMap<String, String> = [("foo".to_string(), "1.0.0".to_string())].into();
+        let mut lock = LockFile::new();
+        lock.entries
+            .insert("foo".to_string(), registry_entry("1.0.0", true));
+        lock.entries
+            .insert("bar".to_string(), registry_entry("2.0.0", true));
+
+        let err = check_locked_orphans(&deps, &lock).unwrap_err();
+        assert!(err.contains("bar"), "got: {err}");
+        assert!(err.contains("not in sema.toml"), "got: {err}");
+    }
+
+    // ── resolve_dependency_graph tests (pure, no install/network) ─────
+
+    fn registry_entry(version: &str, direct: bool) -> LockEntry {
+        LockEntry::Registry {
+            version: version.to_string(),
+            registry: "https://pkg.sema-lang.com".to_string(),
+            checksum: "deadbeef".to_string(),
+            direct,
+        }
+    }
+
+    fn git_entry(git_ref: &str, direct: bool) -> LockEntry {
+        LockEntry::Git {
+            git_ref: git_ref.to_string(),
+            commit: format!("sha-{git_ref}"),
+            direct,
+        }
+    }
+
+    fn direct_deps(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    /// Test harness for `resolve_dependency_graph`: records install calls and
+    /// serves canned manifests, so the graph-walking/conflict logic can be
+    /// exercised without git/network.
+    struct ResolverHarness {
+        manifests: BTreeMap<String, BTreeMap<String, String>>,
+        fresh_calls: std::cell::RefCell<Vec<(String, String)>>,
+        locked_calls: std::cell::RefCell<Vec<String>>,
+    }
+
+    impl ResolverHarness {
+        fn new() -> Self {
+            Self {
+                manifests: BTreeMap::new(),
+                fresh_calls: std::cell::RefCell::new(vec![]),
+                locked_calls: std::cell::RefCell::new(vec![]),
+            }
+        }
+
+        fn with_manifest(mut self, name: &str, deps: &[(&str, &str)]) -> Self {
+            self.manifests.insert(
+                name.to_string(),
+                deps.iter()
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect(),
+            );
+            self
+        }
+
+        fn run(
+            &self,
+            deps: &BTreeMap<String, String>,
+            existing_lock: &LockFile,
+        ) -> Result<(LockFile, Vec<String>, Vec<ResolutionNote>), String> {
+            let fresh_calls = &self.fresh_calls;
+            let locked_calls = &self.locked_calls;
+            let manifests = &self.manifests;
+            resolve_dependency_graph(
+                deps,
+                existing_lock,
+                &mut |name, version| {
+                    fresh_calls
+                        .borrow_mut()
+                        .push((name.to_string(), version.to_string()));
+                    if is_git_spec(name) {
+                        Ok(git_entry(version, false))
+                    } else {
+                        Ok(registry_entry(version, false))
+                    }
+                },
+                &mut |name, _entry| {
+                    locked_calls.borrow_mut().push(name.to_string());
+                    Ok(())
+                },
+                &|name| Ok(manifests.get(name).cloned().unwrap_or_default()),
+            )
+        }
+    }
+
+    #[test]
+    fn resolve_single_direct_dep_no_transitive() {
+        let h = ResolverHarness::new();
+        let (lock, pruned, notes) = h
+            .run(&direct_deps(&[("a", "1.0.0")]), &LockFile::new())
+            .unwrap();
+        assert_eq!(lock.entries.len(), 1);
+        assert!(lock.entries["a"].is_direct());
+        assert!(pruned.is_empty());
+        assert!(notes.is_empty());
+    }
+
+    #[test]
+    fn resolve_pulls_in_transitive_deps() {
+        let h = ResolverHarness::new()
+            .with_manifest("a", &[("b", "1.0.0")])
+            .with_manifest("b", &[("c", "1.0.0")]);
+        let (lock, _, _) = h
+            .run(&direct_deps(&[("a", "1.0.0")]), &LockFile::new())
+            .unwrap();
+        assert_eq!(lock.entries.len(), 3);
+        assert!(lock.entries["a"].is_direct());
+        assert!(!lock.entries["b"].is_direct());
+        assert!(!lock.entries["c"].is_direct());
+    }
+
+    #[test]
+    fn resolve_diamond_shared_dep_no_conflict_installed_once() {
+        let h = ResolverHarness::new()
+            .with_manifest("a", &[("shared", "1.0.0")])
+            .with_manifest("b", &[("shared", "1.0.0")]);
+        let (lock, _, _) = h
+            .run(
+                &direct_deps(&[("a", "1.0.0"), ("b", "1.0.0")]),
+                &LockFile::new(),
+            )
+            .unwrap();
+        assert_eq!(lock.entries.len(), 3);
+        let calls = h
+            .fresh_calls
+            .borrow()
+            .iter()
+            .filter(|(n, _)| n == "shared")
+            .count();
+        assert_eq!(calls, 1, "shared dep must be installed exactly once");
+    }
+
+    #[test]
+    fn resolve_diamond_registry_same_major_auto_resolves_to_higher() {
+        let h = ResolverHarness::new()
+            .with_manifest("a", &[("shared", "1.0.0")])
+            .with_manifest("b", &[("shared", "1.2.0")]);
+        let (lock, _, notes) = h
+            .run(
+                &direct_deps(&[("a", "1.0.0"), ("b", "1.0.0")]),
+                &LockFile::new(),
+            )
+            .unwrap();
+        assert_eq!(lock.entries["shared"].requested(), "1.2.0");
+        assert!(notes.iter().any(
+            |n| matches!(n, ResolutionNote::DiamondAutoResolved { name, .. } if name == "shared")
+        ));
+    }
+
+    #[test]
+    fn resolve_diamond_registry_different_major_hard_errors() {
+        let h = ResolverHarness::new()
+            .with_manifest("a", &[("shared", "1.0.0")])
+            .with_manifest("b", &[("shared", "2.0.0")]);
+        let err = h
+            .run(
+                &direct_deps(&[("a", "1.0.0"), ("b", "1.0.0")]),
+                &LockFile::new(),
+            )
+            .unwrap_err();
+        assert!(err.contains("shared"), "got: {err}");
+        assert!(err.contains("breaking"), "got: {err}");
+    }
+
+    #[test]
+    fn resolve_diamond_registry_unparseable_version_hard_errors() {
+        let h = ResolverHarness::new()
+            .with_manifest("a", &[("shared", "not-a-version")])
+            .with_manifest("b", &[("shared", "1.0.0")]);
+        let err = h
+            .run(
+                &direct_deps(&[("a", "1.0.0"), ("b", "1.0.0")]),
+                &LockFile::new(),
+            )
+            .unwrap_err();
+        assert!(err.contains("not a valid semver"), "got: {err}");
+    }
+
+    #[test]
+    fn resolve_diamond_git_different_refs_hard_errors() {
+        let h = ResolverHarness::new()
+            .with_manifest("a", &[("github.com/x/y", "v1.0")])
+            .with_manifest("b", &[("github.com/x/y", "v2.0")]);
+        let err = h
+            .run(
+                &direct_deps(&[("a", "main"), ("b", "main")]),
+                &LockFile::new(),
+            )
+            .unwrap_err();
+        assert!(err.contains("github.com/x/y"), "got: {err}");
+        assert!(err.contains("no version ordering"), "got: {err}");
+    }
+
+    #[test]
+    fn resolve_diamond_git_same_ref_no_conflict() {
+        let h = ResolverHarness::new()
+            .with_manifest("a", &[("github.com/x/y", "main")])
+            .with_manifest("b", &[("github.com/x/y", "main")]);
+        let (lock, _, notes) = h
+            .run(
+                &direct_deps(&[("a", "main"), ("b", "main")]),
+                &LockFile::new(),
+            )
+            .unwrap();
+        assert_eq!(lock.entries["github.com/x/y"].requested(), "main");
+        assert!(notes.is_empty());
+    }
+
+    #[test]
+    fn resolve_direct_pin_overrides_transitive_request_silently_with_note() {
+        let h = ResolverHarness::new().with_manifest("b", &[("shared", "2.0.0")]);
+        let (lock, _, notes) = h
+            .run(
+                &direct_deps(&[("shared", "1.0.0"), ("b", "1.0.0")]),
+                &LockFile::new(),
+            )
+            .unwrap();
+        assert_eq!(lock.entries["shared"].requested(), "1.0.0");
+        assert!(lock.entries["shared"].is_direct());
+        let calls: Vec<_> = h
+            .fresh_calls
+            .borrow()
+            .iter()
+            .filter(|(n, _)| n == "shared")
+            .cloned()
+            .collect();
+        assert_eq!(calls.len(), 1, "must not reinstall for the override");
+        assert!(notes
+            .iter()
+            .any(|n| matches!(n, ResolutionNote::DirectOverride { name, .. } if name == "shared")));
+    }
+
+    #[test]
+    fn resolve_cycle_does_not_infinite_loop() {
+        let h = ResolverHarness::new()
+            .with_manifest("a", &[("b", "1.0.0")])
+            .with_manifest("b", &[("a", "1.0.0")]);
+        let (lock, _, _) = h
+            .run(&direct_deps(&[("a", "1.0.0")]), &LockFile::new())
+            .unwrap();
+        assert_eq!(lock.entries.len(), 2);
+    }
+
+    #[test]
+    fn resolve_self_referential_manifest_is_noop() {
+        let h = ResolverHarness::new().with_manifest("a", &[("a", "1.0.0")]);
+        let (lock, _, _) = h
+            .run(&direct_deps(&[("a", "1.0.0")]), &LockFile::new())
+            .unwrap();
+        assert_eq!(lock.entries.len(), 1);
+    }
+
+    #[test]
+    fn resolve_diamond_reinstall_reenqueues_new_versions_deps() {
+        // foo@1.0.0 has no deps; foo@1.2.0 (same major, auto-resolved higher)
+        // depends on bar — the resolver must pick that dep up after the
+        // reinstall, not leave the graph stale at foo@1.0.0's (empty) deps.
+        let h = ResolverHarness::new()
+            .with_manifest("a", &[("foo", "1.0.0")])
+            .with_manifest("b", &[("foo", "1.2.0")]);
+        let foo_1_2_0_deps: BTreeMap<String, String> =
+            [("bar".to_string(), "1.0.0".to_string())].into();
+        let (lock, _, _) = resolve_dependency_graph(
+            &direct_deps(&[("a", "1.0.0"), ("b", "1.0.0")]),
+            &LockFile::new(),
+            &mut |name, version| {
+                if is_git_spec(name) {
+                    Ok(git_entry(version, false))
+                } else {
+                    Ok(registry_entry(version, false))
+                }
+            },
+            &mut |_, _| Ok(()),
+            &|name| {
+                if name == "foo" {
+                    Ok(foo_1_2_0_deps.clone())
+                } else {
+                    Ok(h.manifests.get(name).cloned().unwrap_or_default())
+                }
+            },
+        )
+        .unwrap();
+        assert_eq!(lock.entries["foo"].requested(), "1.2.0");
+        assert!(
+            lock.entries.contains_key("bar"),
+            "bar must be pulled in via foo's post-reinstall manifest"
+        );
+    }
+
+    #[test]
+    fn resolve_prunes_stale_lock_entries() {
+        let mut old_lock = LockFile::new();
+        old_lock
+            .entries
+            .insert("gone".to_string(), registry_entry("1.0.0", true));
+        let h = ResolverHarness::new();
+        let (lock, pruned, _) = h.run(&direct_deps(&[("a", "1.0.0")]), &old_lock).unwrap();
+        assert!(!lock.entries.contains_key("gone"));
+        assert_eq!(pruned, vec!["gone".to_string()]);
+    }
+
+    #[test]
+    fn resolve_reuses_lock_when_version_matches() {
+        let mut old_lock = LockFile::new();
+        old_lock
+            .entries
+            .insert("a".to_string(), registry_entry("1.0.0", true));
+        let h = ResolverHarness::new();
+        let (lock, _, _) = h.run(&direct_deps(&[("a", "1.0.0")]), &old_lock).unwrap();
+        assert_eq!(lock.entries["a"].requested(), "1.0.0");
+        assert!(
+            h.fresh_calls.borrow().is_empty(),
+            "must reuse the lock, not reinstall"
+        );
+        assert_eq!(h.locked_calls.borrow().as_slice(), ["a".to_string()]);
+    }
+
+    #[test]
+    fn resolve_unrelated_packages_resolve_independently() {
+        let h = ResolverHarness::new()
+            .with_manifest("a", &[("x", "1.0.0")])
+            .with_manifest("b", &[("y", "1.0.0")]);
+        let (lock, _, notes) = h
+            .run(
+                &direct_deps(&[("a", "1.0.0"), ("b", "1.0.0")]),
+                &LockFile::new(),
+            )
+            .unwrap();
+        assert_eq!(lock.entries.len(), 4);
+        assert!(notes.is_empty());
+    }
+
+    #[test]
+    fn resolve_install_fresh_error_propagates() {
+        let result = resolve_dependency_graph(
+            &direct_deps(&[("a", "1.0.0")]),
+            &LockFile::new(),
+            &mut |_, _| Err("boom".to_string()),
+            &mut |_, _| Ok(()),
+            &|_| Ok(BTreeMap::new()),
+        );
+        assert_eq!(result.unwrap_err(), "boom");
     }
 
     // ── cmd_install --locked logic tests ──────────────────────────────
@@ -3138,6 +4034,111 @@ name = "myproject"
         let _ = fs::remove_dir_all(&dir);
     }
 
+    // ── cmd_remove reachability tests ──────────────────────────────────
+    // No network involved: cmd_remove only touches sema.toml/sema.lock and
+    // whatever manifests already sit on disk under SEMA_HOME.
+
+    #[test]
+    #[serial]
+    fn cmd_remove_keeps_transitively_required_package_on_disk() {
+        let dir = tmpdir("remove-keep-cwd");
+        let sema_home = tmpdir("remove-keep-home");
+        let _guard = TestDir::new(&dir);
+        std::env::set_var("SEMA_HOME", sema_home.to_str().unwrap());
+
+        let pkg_dir = sema_home.join("packages");
+        fs::create_dir_all(pkg_dir.join("A")).unwrap();
+        fs::write(
+            pkg_dir.join("A").join("sema.toml"),
+            "[package]\nname = \"a\"\nversion = \"1.0.0\"\n\n[deps]\n",
+        )
+        .unwrap();
+        fs::create_dir_all(pkg_dir.join("B")).unwrap();
+        fs::write(
+            pkg_dir.join("B").join("sema.toml"),
+            "[package]\nname = \"b\"\nversion = \"1.0.0\"\n\n[deps]\nA = \"1.0.0\"\n",
+        )
+        .unwrap();
+
+        fs::write(
+            "sema.toml",
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n[deps]\nA = \"1.0.0\"\nB = \"1.0.0\"\n",
+        )
+        .unwrap();
+        fs::write(
+            LOCK_FILE,
+            "lock_version = 1\n\n\
+             [packages.A]\nsource = \"registry\"\nversion = \"1.0.0\"\nregistry = \"http://localhost\"\nchecksum = \"aaa\"\ndirect = true\n\n\
+             [packages.B]\nsource = \"registry\"\nversion = \"1.0.0\"\nregistry = \"http://localhost\"\nchecksum = \"bbb\"\ndirect = true\n",
+        )
+        .unwrap();
+
+        cmd_remove("A").unwrap();
+
+        assert!(
+            pkg_dir.join("A").exists(),
+            "A must be kept on disk — still required transitively by B"
+        );
+
+        let toml_content = fs::read_to_string("sema.toml").unwrap();
+        let doc: toml::Value = toml::from_str(&toml_content).unwrap();
+        assert!(
+            doc.get("deps").and_then(|d| d.get("A")).is_none(),
+            "A must be removed from the direct [deps]"
+        );
+
+        let lock = read_lock_file().unwrap().unwrap();
+        assert!(
+            !lock.entries["A"].is_direct(),
+            "A's lock entry must be demoted to transitive, not dropped"
+        );
+
+        std::env::remove_var("SEMA_HOME");
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&sema_home);
+    }
+
+    #[test]
+    #[serial]
+    fn cmd_remove_deletes_package_nothing_else_needs() {
+        let dir = tmpdir("remove-delete-cwd");
+        let sema_home = tmpdir("remove-delete-home");
+        let _guard = TestDir::new(&dir);
+        std::env::set_var("SEMA_HOME", sema_home.to_str().unwrap());
+
+        let pkg_dir = sema_home.join("packages");
+        fs::create_dir_all(pkg_dir.join("A")).unwrap();
+        fs::write(
+            pkg_dir.join("A").join("sema.toml"),
+            "[package]\nname = \"a\"\nversion = \"1.0.0\"\n\n[deps]\n",
+        )
+        .unwrap();
+
+        fs::write(
+            "sema.toml",
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n[deps]\nA = \"1.0.0\"\n",
+        )
+        .unwrap();
+        fs::write(
+            LOCK_FILE,
+            "lock_version = 1\n\n\
+             [packages.A]\nsource = \"registry\"\nversion = \"1.0.0\"\nregistry = \"http://localhost\"\nchecksum = \"aaa\"\ndirect = true\n",
+        )
+        .unwrap();
+
+        cmd_remove("A").unwrap();
+
+        assert!(
+            !pkg_dir.join("A").exists(),
+            "A must be deleted — nothing else needs it"
+        );
+        assert!(!Path::new(LOCK_FILE).exists(), "lock must be empty/removed");
+
+        std::env::remove_var("SEMA_HOME");
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&sema_home);
+    }
+
     // ── TOML key edge cases ───────────────────────────────────────────
 
     #[test]
@@ -3153,6 +4154,7 @@ name = "myproject"
             LockEntry::Git {
                 git_ref: "main".to_string(),
                 commit: "deadbeef12345678".to_string(),
+                direct: true,
             },
         );
         lock.entries.insert(
@@ -3160,6 +4162,7 @@ name = "myproject"
             LockEntry::Git {
                 git_ref: "v1.0.0-beta.1".to_string(),
                 commit: "cafebabe".to_string(),
+                direct: true,
             },
         );
 

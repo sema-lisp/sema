@@ -42,6 +42,16 @@
   printing a URL or opening a browser). Off by default (backward-compatible); the
   notebook server opts in. See the
   [Web Server docs](https://sema-lang.com/docs/stdlib/web-server).
+- **Transitive dependency resolution for `sema pkg`.** `sema pkg install` (and
+  `add`/`update`/`remove`) now walks each dependency's own `[deps]` and installs
+  the whole graph, instead of only the project's top-level manifest — no more
+  hand-flattening a dependency tree into your own `sema.toml`. Diamond conflicts
+  resolve deterministically: direct deps always win over transitive requests,
+  semver-compatible transitive versions pick the higher one, and incompatible
+  majors / conflicting git refs hard-error asking for an explicit override.
+  `sema.lock` records a per-entry `direct` flag (additive; defaults to `true`
+  when absent, so existing lock files are unaffected) so `--locked` and
+  `sema pkg list` can distinguish direct from transitive packages.
 - **CORE-2 fixed: cycle-collecting garbage collector.** Sema now reclaims reference
   cycles — a synchronous Bacon–Rajan cycle collector (ADR #66; design + measurements
   in `docs/plans/2026-07-02-core2-gc.md`) runs over the existing `Rc` heap with a

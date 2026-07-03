@@ -713,6 +713,43 @@ mod tests {
     }
 
     #[test]
+    fn embedded_import_combining_mark_byte_identical() {
+        // A decomposed (NFD) combining-mark module name resolves when the import
+        // string uses the identical byte sequence ("cafe" + U+0301).
+        let interp = Interpreter::new();
+        embed(
+            &interp,
+            "cafe\u{0301}.sema",
+            "(module m (export v) (define v 5))",
+        );
+        assert_eq!(
+            interp
+                .eval_str("(import \"./cafe\u{0301}.sema\") v")
+                .unwrap(),
+            Value::int(5)
+        );
+    }
+
+    #[test]
+    fn embedded_resolution_is_byte_exact_for_unicode() {
+        // Embedded/.vfs keys match byte-for-byte with no Unicode NFC/NFD folding,
+        // so a precomposed (NFC "café" = U+00E9) import does NOT resolve a
+        // decomposed (NFD "cafe" + U+0301) key. (macOS's fs is
+        // normalization-insensitive and would resolve it natively; the archive is
+        // byte-exact + portable, so keep the filename and import spec in the same
+        // normalization form.) This pins that documented behavior.
+        let interp = Interpreter::new();
+        embed(
+            &interp,
+            "cafe\u{0301}.sema",
+            "(module m (export v) (define v 5))",
+        );
+        assert!(interp
+            .eval_str("(import \"./caf\u{00e9}.sema\") v")
+            .is_err());
+    }
+
+    #[test]
     fn compiled_entry_imports_embedded_package_modules() {
         let interp = Interpreter::new();
         let module = r#"

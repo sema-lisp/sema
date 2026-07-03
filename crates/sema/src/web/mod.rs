@@ -68,6 +68,8 @@ pub fn run(entry: &str, host: &str, port: u16, open: bool, llm: bool) -> Result<
         "buildDir": build_dir.to_string_lossy(),
         "open": open,
         "llm": llm,
+        // The HTML shell template; dev_server.sema fills {{TITLE}}/{{APP}}/{{INIT}}.
+        "shell": include_str!("shell.html"),
     });
     let config_literal = serde_json::to_string(&config.to_string())
         .map_err(|e| format!("encoding web config: {e}"))?;

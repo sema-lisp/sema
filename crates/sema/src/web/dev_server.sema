@@ -12,6 +12,7 @@
 (define runtime-dir (:runtimeDir config))
 (define app-dir (:appDir config))
 (define build-dir (:buildDir config))
+(define shell-template (:shell config))
 
 ;; How the browser loads the app: single-file apps run from raw source; an app
 ;; that uses `import` can't resolve modules against the browser's (absent) fs, so
@@ -47,67 +48,21 @@
      (string-append "<script type=\"text/sema\" src=\"/app/" entry "?g="
                     (number->string generation) "\"></script>\n"))))
 
-;; The synthesized page. An <script type="importmap"> resolves the bare
-;; @sema-lang/* specifiers to the runtime we serve under /__sema; the app loads
-;; via app-script-tag; SemaWeb.init() boots it and flags readiness for e2e.
+;; With the proxy enabled, point the browser's llm/* at this same origin — the
+;; dev server answers /complete, /chat, /stream, ... with server keys.
+(define (init-js)
+  (if llm-enabled
+    "await SemaWeb.init({ llmProxy: window.location.origin });"
+    "await SemaWeb.init();"))
+
+;; The synthesized page: fill the embedded shell template's placeholders. The
+;; static scaffold (import map, error overlay, hot-reload poll) lives in
+;; crates/sema/src/web/shell.html.
 (define (shell-html)
-  (string-append
-    "<!DOCTYPE html>\n"
-    "<html lang=\"en\">\n<head>\n"
-    "<meta charset=\"utf-8\">\n"
-    "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n"
-    "<link rel=\"icon\" href=\"data:,\">\n"
-    "<title>Sema Web — " entry "</title>\n"
-    "<script type=\"importmap\">\n"
-    "{\n  \"imports\": {\n"
-    "    \"@sema-lang/sema-web\": \"/__sema/sema-web.js\",\n"
-    "    \"@sema-lang/sema\": \"/__sema/sema/index.js\",\n"
-    "    \"@sema-lang/sema-wasm\": \"/__sema/sema_wasm.js\",\n"
-    "    \"@preact/signals-core\": \"/__sema/signals-core.module.js\",\n"
-    "    \"morphdom\": \"/__sema/morphdom-esm.js\"\n"
-    "  }\n}\n"
-    "</script>\n</head>\n<body>\n"
-    "<div id=\"app\"></div>\n"
-    (app-script-tag)
-    "<script type=\"module\">\n"
-    "  import { SemaWeb } from \"@sema-lang/sema-web\";\n"
-    ;; Dev-only error overlay: surface Sema init/app errors on the page instead
-    ;; of only in the console. The loader logs app-eval errors via console.error,
-    ;; so hooking it catches those too. Cleared on the next successful reload.
-    "  function __semaError(msg){\n"
-    "    let el=document.getElementById('__sema-error');\n"
-    "    if(!el){el=document.createElement('div');el.id='__sema-error';\n"
-    "      el.style.cssText='position:fixed;left:0;right:0;top:0;z-index:99999;background:#7f1d1d;color:#fee2e2;font:13px/1.5 ui-monospace,monospace;padding:12px 16px;white-space:pre-wrap;box-shadow:0 2px 12px rgba(0,0,0,.35);cursor:pointer';\n"
-    "      el.title='click to dismiss';el.onclick=()=>el.remove();document.body.appendChild(el);}\n"
-    "    el.textContent='\\u26a0 Sema error:\\n'+msg;\n"
-    "  }\n"
-    "  const __origErr=console.error;\n"
-    "  console.error=function(){__origErr.apply(console,arguments);\n"
-    "    const m=Array.from(arguments).map(String).join(' ');\n"
-    "    if(m.indexOf('[sema')>=0||m.indexOf('Error in')>=0)__semaError(m);};\n"
-    "  try {\n"
-    ;; With the proxy enabled, point the browser's llm/* at this same origin —
-    ;; the dev server answers /complete, /chat, /stream, ... with server keys.
-    (if llm-enabled
-      "    await SemaWeb.init({ llmProxy: window.location.origin });\n"
-      "    await SemaWeb.init();\n")
-    "    window.__semaInitialized = true;\n"
-    "  } catch (e) {\n"
-    "    window.__semaInitError = String((e && e.message) || e);\n"
-    "    __semaError(String((e && e.message) || e));\n"
-    "    console.error(e);\n"
-    "  }\n"
-    "</script>\n"
-    ;; Hot reload: short-poll /__dev/poll (each returns instantly, so it never
-    ;; blocks the sequential server) and full-reload when the generation bumps.
-    "<script>\n"
-    "(function(){var g=null;function p(){"
-    "fetch('/__dev/poll').then(function(r){return r.ok?r.json():null;})"
-    ".then(function(d){if(d){if(g===null){g=d.generation;}"
-    "else if(d.generation!==g){location.reload();return;}}setTimeout(p,300);})"
-    ".catch(function(){setTimeout(p,600);});}p();})();\n"
-    "</script>\n"
-    "</body>\n</html>\n"))
+  (-> shell-template
+      (string/replace "{{TITLE}}" entry)
+      (string/replace "{{APP}}" (app-script-tag))
+      (string/replace "{{INIT}}" (init-js))))
 
 (define (handle-index req)
   (http/html (shell-html)))

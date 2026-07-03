@@ -7,6 +7,8 @@
 
 mod runtime;
 
+use std::io::IsTerminal;
+
 use sema_core::Sandbox;
 use sema_eval::Interpreter;
 
@@ -52,7 +54,9 @@ pub fn run(entry: &str, host: &str, port: u16, open: bool, llm: bool) -> Result<
         .map_err(|e| format!("no free port near {host}:{port}: {e}"))?;
     drop(probe);
 
-    if open {
+    // Auto-open only when attached to a terminal — never pop a browser from a
+    // non-interactive run (CI, a pipe, or a test that forgot `--no-open`).
+    if open && std::io::stdout().is_terminal() {
         spawn_browser_opener(host.to_string(), actual_port);
     }
 

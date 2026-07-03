@@ -77,16 +77,98 @@ fn pool_map_complete_overlaps_and_preserves_order() {
     );
 }
 
-// NOTE: a tight `async_cache_miss_is_counted` gate was removed as flaky. The
-// `CACHE_MISSES` increment on the async cache-miss path IS in place (it mirrors the
-// sync `do_complete`), and async completions DO participate in the cache (a
-// same-prompt repeat is served as a hit). But observing the miss COUNTER
-// deterministically right after a single async completion is unreliable:
-// `llm/with-cache` sets the dynamically-scoped `CACHE_ENABLED` flag only for the
-// duration of its thunk, and a task whose execution the scheduler defers past that
-// extent reads the flag as already reset — a pre-existing dynamic-scope-vs-async-task
-// visibility nuance (likely also affecting `llm/with-budget`), out of scope for this
-// slice and tracked in docs/deferred.md.
+/// ASYNC-1 (Scope A): a completion in a task spawned INSIDE `llm/with-cache` but
+/// AWAITED OUTSIDE the thunk's dynamic extent must still participate in the cache.
+/// The per-task dynamic-scope capture carries `CACHE_ENABLED` onto the task (seeded
+/// at `async/spawn`), so the deferred completion counts a miss and a same-prompt
+/// repeat is served as a hit — where before the task read the already-reset flag and
+/// silently bypassed the cache (`:misses 0`). This is the gate removed as flaky.
+#[test]
+#[serial]
+fn async_cache_miss_is_counted() {
+    let _cap = sema_otel::testing::install();
+    reset_io_inflight();
+
+    let fake = FakeProvider::builder("fake")
+        .model("fake-chat")
+        .chat_delay(30)
+        .echo()
+        .build();
+
+    let interp = Interpreter::new();
+    reset_runtime_state();
+    register_test_provider(Box::new(fake));
+
+    // `llm/cache-clear` wipes the persistent (on-disk) cache too — `reset_runtime_state`
+    // only clears the in-memory table, so a "hello" entry left by a prior run would make
+    // this dispatch a HIT and the intended first-miss would never be counted (the source
+    // of the earlier "flaky" removal — it was actually a non-hermetic disk cache).
+    // Spawn is inside the with-cache thunk; the await is OUTSIDE it, so the task
+    // executes after the with-cache extent has ended.
+    let program = r#"
+        (llm/cache-clear)
+        (define p (llm/with-cache (fn () (async/spawn (fn () (llm/complete "hello"))))))
+        (async/await p)
+        (:misses (llm/cache-stats))
+    "#;
+    let result = interp
+        .eval_str_compiled(program)
+        .expect("async cache program evaluated");
+    assert_eq!(
+        result.as_int(),
+        Some(1),
+        "a deferred async completion inside with-cache must count a cache miss \
+         (task inherits the with-cache dynamic scope)"
+    );
+}
+
+/// ASYNC-1 (Scope B, the correctness fix): a `with-budget` cap must gate the AGGREGATE
+/// of a CONCURRENT fan-out. Three completions spawned inside `with-budget` and awaited
+/// outside each cost $1.5 (echo usage 10+5 tokens at the priced rate). The $4.0 cap is
+/// chosen to sit ABOVE any single or double call ($1.5, $3.0) but BELOW the full
+/// aggregate ($4.5) — so it can only trip once ALL THREE have charged the shared frame,
+/// which both proves aggregate gating and avoids stranding an in-flight sibling (the
+/// last-charging task is the one that fails; the other two are already Done). Before
+/// the fix every deferred task charged whatever budget frame was installed when its
+/// future landed (None, popped after the thunk returned), so the fan-out silently
+/// completed uncapped. The fix makes the active budget a SHARED frame captured by-`Rc`
+/// onto each task, so all siblings charge one aggregate.
+#[test]
+#[serial]
+fn async_budget_gates_concurrent_fanout() {
+    let _cap = sema_otel::testing::install();
+    reset_io_inflight();
+
+    let fake = FakeProvider::builder("fake")
+        .model("fake-chat")
+        .chat_delay(30)
+        .echo()
+        .build();
+
+    let interp = Interpreter::new();
+    reset_runtime_state();
+    register_test_provider(Box::new(fake));
+
+    // Price so each echo completion (10 in + 5 out) costs $1.5; only the full trio
+    // ($4.5) exceeds the $4.0 cap. Spawn inside with-budget, await outside.
+    let program = r#"
+        (llm/set-pricing "fake-chat" 100000.0 100000.0)
+        (define ps
+          (llm/with-budget {:max-cost-usd 4.0}
+            (fn ()
+              (list (async/spawn (fn () (llm/complete "a")))
+                    (async/spawn (fn () (llm/complete "b")))
+                    (async/spawn (fn () (llm/complete "c")))))))
+        (async/all ps)
+    "#;
+    let err = interp
+        .eval_str_compiled(program)
+        .expect_err("concurrent fan-out aggregate must exceed the shared budget");
+    assert!(
+        err.to_string().contains("budget exceeded"),
+        "expected a budget-exceeded error from the concurrent fan-out, got: {err}"
+    );
+}
 
 /// `llm/classify` batched over `async/pool-map` overlaps and returns the correct
 /// categories (as keywords, matching the keyword category list).

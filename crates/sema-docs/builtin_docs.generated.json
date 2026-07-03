@@ -10655,6 +10655,28 @@
       "syntax": "(exit [code])"
     },
     {
+      "name": "gc/collect",
+      "module": "system",
+      "section": "Memory",
+      "summary": "Run a full cycle-collection pass now and return its stats as a map with `:candidates` (registered cycle candidates scanned), `:traced` (heap nodes visited), `:collected` (garbage nodes reclaimed), and `:pruned` (dead registry entries removed). Reference cycles (e.g. a recursive local closure capturing itself) are otherwise reclaimed automatically at safe points; call this to force a collection at a known-quiet moment or to observe reclamation directly. With OpenTelemetry tracing enabled, every collector pass (this one included) also emits a `gc.collect` span carrying the trigger and these stats as `gc.*` attributes.",
+      "returns": "map",
+      "examples": [
+        "(define (make-loop)\n  (define (loop n) (if (<= n 0) 0 (loop (- n 1))))\n  (loop 3))\n(make-loop)\n(gc/collect)   ; => {:candidates 3 :collected 4 :pruned 1 :traced 9}"
+      ],
+      "body": "Run a full cycle-collection pass now and return its stats as a map with `:candidates` (registered cycle candidates scanned), `:traced` (heap nodes visited), `:collected` (garbage nodes reclaimed), and `:pruned` (dead registry entries removed). Reference cycles (e.g. a recursive local closure capturing itself) are otherwise reclaimed automatically at safe points; call this to force a collection at a known-quiet moment or to observe reclamation directly. With OpenTelemetry tracing enabled, every collector pass (this one included) also emits a `gc.collect` span carrying the trigger and these stats as `gc.*` attributes.\n\n```sema\n(define (make-loop)\n  (define (loop n) (if (<= n 0) 0 (loop (- n 1))))\n  (loop 3))\n(make-loop)\n(gc/collect)   ; => {:candidates 3 :collected 4 :pruned 1 :traced 9}\n```"
+    },
+    {
+      "name": "gc/stats",
+      "module": "system",
+      "section": "Memory",
+      "summary": "Return the cycle collector's stats without collecting: the last completed collection's `:candidates`, `:traced`, `:collected`, and `:pruned` counts (all zero before the first collection), plus `:registry-size` — the current number of registered cycle candidates awaiting the next collection. Useful for diagnosing memory growth in long-running sessions.",
+      "returns": "map",
+      "examples": [
+        "(gc/stats)   ; => {:candidates 3 :collected 4 :pruned 1 :registry-size 2 :traced 9}"
+      ],
+      "body": "Return the cycle collector's stats without collecting: the last completed collection's `:candidates`, `:traced`, `:collected`, and `:pruned` counts (all zero before the first collection), plus `:registry-size` — the current number of registered cycle candidates awaiting the next collection. Useful for diagnosing memory growth in long-running sessions.\n\n```sema\n(gc/stats)   ; => {:candidates 3 :collected 4 :pruned 1 :registry-size 2 :traced 9}\n```"
+    },
+    {
       "name": "gensym",
       "module": "system",
       "section": "Metaprogramming",

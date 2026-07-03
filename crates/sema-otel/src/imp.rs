@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use opentelemetry::global;
 use opentelemetry::metrics::Histogram;
-use opentelemetry::trace::{SpanKind, Status, TraceContextExt, Tracer, TracerProvider};
+use opentelemetry::trace::{Span, SpanKind, Status, TraceContextExt, Tracer, TracerProvider};
 use opentelemetry::{Array, Context, InstrumentationScope, KeyValue, StringValue, Value};
 use opentelemetry_sdk::metrics::{PeriodicReader, SdkMeterProvider};
 use opentelemetry_sdk::trace::SdkTracerProvider;
@@ -1548,6 +1548,71 @@ impl VmSpan {
         if let Some(c) = &self.inner {
             c.set_str(key, val.to_string());
         }
+    }
+}
+
+/// Emit one completed `gc.collect` span for a cycle-collector pass.
+///
+/// The collector's observer fires *after* the pass finished (the collector
+/// cannot hold a span open — sema-core does not depend on sema-otel), so the
+/// span is recorded retroactively: built with an explicit start time
+/// (`now − duration`) and ended at `now`, giving it the pass's real extent on
+/// the timeline. Parented to the TL-stack top, so GC passes nest under
+/// whatever span was active when the safe point hit (agent turn, notebook
+/// cell, tool call) and surface as root spans otherwise (e.g. interpreter
+/// teardown). No-op when telemetry is disabled.
+pub fn gc_pass_span(event: &sema_core::GcPassEvent) {
+    if !ENABLED.load(Ordering::Relaxed) {
+        return;
+    }
+    let end = std::time::SystemTime::now();
+    let start_time = end
+        .checked_sub(std::time::Duration::from_nanos(event.duration_ns))
+        .unwrap_or(end);
+    let attrs = vec![
+        KeyValue::new("gc.trigger", event.trigger.as_str()),
+        KeyValue::new("gc.candidates", event.stats.candidates as i64),
+        KeyValue::new("gc.traced", event.stats.traced as i64),
+        KeyValue::new("gc.collected", event.stats.collected as i64),
+        KeyValue::new("gc.pruned", event.stats.pruned as i64),
+        KeyValue::new("gc.registry_before", event.registry_len_before as i64),
+        KeyValue::new("gc.aborted", event.stats.aborted),
+    ];
+    fn emit<T: Tracer>(
+        tracer: &T,
+        start_time: std::time::SystemTime,
+        end: std::time::SystemTime,
+        attrs: Vec<KeyValue>,
+        parent: &Context,
+    ) where
+        T::Span: Send + Sync + 'static,
+    {
+        let mut span = tracer
+            .span_builder("gc.collect")
+            .with_kind(SpanKind::Internal)
+            .with_start_time(start_time)
+            .with_attributes(attrs)
+            .start_with_context(tracer, parent);
+        span.end_with_timestamp(end);
+    }
+    let parent = STACK.with(|s| s.borrow().last().cloned());
+    let parent = parent.unwrap_or_else(Context::current);
+    let owned = OWNED_PROVIDER.with(|c| c.borrow().clone());
+    match owned {
+        Some(p) => emit(
+            &p.tracer_with_scope(scope()),
+            start_time,
+            end,
+            attrs,
+            &parent,
+        ),
+        None => emit(
+            &global::tracer_with_scope(scope()),
+            start_time,
+            end,
+            attrs,
+            &parent,
+        ),
     }
 }
 

@@ -1,6 +1,6 @@
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 
 use sema_core::{
     bits_to_spur,
@@ -88,6 +88,187 @@ struct VmClosurePayload {
     functions: Rc<Vec<Rc<Function>>>,
 }
 
+// ── Cycle-collector wiring (CORE-2, plan §3/§5.2) ────────────────────────
+//
+// sema-core's collector cannot see through `VmClosurePayload` or
+// `UpvalueCell` (sema-vm types), so sema-vm registers a payload tracer that
+// reports every heap edge the closure wrapper owns, with exact multiplicity
+// (trial deletion is arithmetic on these: an undercount leaks, an overcount
+// frees live data). Opaque trace/sever fns recover `&T` from the node's data
+// pointer — the collector keeps every traced allocation alive for the whole
+// pass, so the casts are sound.
+
+thread_local! {
+    /// Once-guard: the payload tracer is registered (per thread) at VM
+    /// construction — every `make_closure` (the sole producer of collector
+    /// candidates) runs inside a VM, so wiring there keeps this check off
+    /// the closure-creation hot path.
+    static CYCLE_GC_WIRED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn ensure_cycle_gc_wired() {
+    CYCLE_GC_WIRED.with(|wired| {
+        if !wired.get() {
+            wired.set(true);
+            sema_core::register_payload_tracer(
+                std::any::TypeId::of::<VmClosurePayload>(),
+                vm_closure_payload_tracer,
+            );
+        }
+    });
+}
+
+/// Edges of the whole closure-wrapper `NativeFn`: it holds exactly two strong
+/// refs to the payload allocation — the `payload` field and the fallback
+/// box's capture (`make_closure`'s invariant-I2 simplification) — so the
+/// payload edge is reported twice.
+fn vm_closure_payload_tracer(
+    payload: &Rc<dyn std::any::Any>,
+    sink: &mut dyn FnMut(sema_core::GcEdge),
+) -> bool {
+    for _ in 0..2 {
+        sink(sema_core::GcEdge::Opaque {
+            ptr: sema_core::NodePtr::of_rc(payload),
+            strong_count: Rc::strong_count(payload),
+            trace: trace_vm_closure_payload,
+            sever: sever_nothing,
+        });
+    }
+    true
+}
+
+/// Edges of a `VmClosurePayload`: one strong ref to the closure, one to the
+/// home function table.
+fn trace_vm_closure_payload(
+    ptr: sema_core::NodePtr,
+    sink: &mut dyn FnMut(sema_core::GcEdge),
+) -> bool {
+    // SAFETY: `ptr` is the data pointer of a live `Rc<VmClosurePayload>` —
+    // the collector holds every traced allocation alive for the duration of
+    // the pass (snapshot + side-map handles + deferred drops).
+    let payload = unsafe { &*(ptr.raw() as *const VmClosurePayload) };
+    sink(sema_core::GcEdge::Opaque {
+        ptr: sema_core::NodePtr::of_rc(&payload.closure),
+        strong_count: Rc::strong_count(&payload.closure),
+        trace: trace_vm_closure,
+        sever: sever_nothing,
+    });
+    sink(function_table_edge(&payload.functions));
+    true
+}
+
+/// Edges of a `Closure`: its `Function` template, one per upvalue-cell slot,
+/// the home-globals env wrapper, and the home function table.
+fn trace_vm_closure(ptr: sema_core::NodePtr, sink: &mut dyn FnMut(sema_core::GcEdge)) -> bool {
+    // SAFETY: live `Rc<Closure>` data pointer — see trace_vm_closure_payload.
+    let closure = unsafe { &*(ptr.raw() as *const Closure) };
+    sink(function_edge(&closure.func));
+    for cell in &closure.upvalues {
+        sink(sema_core::GcEdge::Opaque {
+            ptr: sema_core::NodePtr::of_rc(cell),
+            strong_count: Rc::strong_count(cell),
+            trace: trace_upvalue_cell,
+            sever: sever_upvalue_cell,
+        });
+    }
+    if let Some(globals) = &closure.globals {
+        sink(sema_core::GcEdge::Env(globals));
+    }
+    if let Some(functions) = &closure.functions {
+        sink(function_table_edge(functions));
+    }
+    true
+}
+
+/// Edge into a compilation unit's function table. Tables and `Function`
+/// templates are interior pass-through nodes (immutable, no severable cell)
+/// but NOT leaves: chunk consts are usually reader literals, yet macro
+/// expansion can compile any live value — including a closure — into them
+/// (`lower_expr`'s catch-all lowers a non-list expansion result to
+/// `CoreExpr::Const`). Left untraced, that consts edge would be a phantom
+/// external count pinning the closure's entire env graph past teardown.
+fn function_table_edge(table: &Rc<Vec<Rc<Function>>>) -> sema_core::GcEdge<'static> {
+    sema_core::GcEdge::Opaque {
+        ptr: sema_core::NodePtr::of_rc(table),
+        strong_count: Rc::strong_count(table),
+        trace: trace_function_table,
+        sever: sever_nothing,
+    }
+}
+
+/// Edge into one `Function` template (see [`function_table_edge`]).
+fn function_edge(func: &Rc<Function>) -> sema_core::GcEdge<'static> {
+    sema_core::GcEdge::Opaque {
+        ptr: sema_core::NodePtr::of_rc(func),
+        strong_count: Rc::strong_count(func),
+        trace: trace_function,
+        sever: sever_nothing,
+    }
+}
+
+/// Edges of a function table: one strong ref per `Function` template.
+fn trace_function_table(ptr: sema_core::NodePtr, sink: &mut dyn FnMut(sema_core::GcEdge)) -> bool {
+    // SAFETY: live `Rc<Vec<Rc<Function>>>` data pointer — see
+    // trace_vm_closure_payload.
+    let table = unsafe { &*(ptr.raw() as *const Vec<Rc<Function>>) };
+    for func in table {
+        sink(function_edge(func));
+    }
+    true
+}
+
+/// Edges of a `Function` template: one strong ref per chunk const.
+fn trace_function(ptr: sema_core::NodePtr, sink: &mut dyn FnMut(sema_core::GcEdge)) -> bool {
+    // SAFETY: live `Rc<Function>` data pointer — see trace_vm_closure_payload.
+    let func = unsafe { &*(ptr.raw() as *const Function) };
+    for c in &func.chunk.consts {
+        sink(sema_core::GcEdge::Value(c));
+    }
+    true
+}
+
+/// Edges of an `UpvalueCell`: `Closed` owns one `Value`; `Open` owns nothing
+/// (it points into a VM stack, whose slot is an external strong count that
+/// keeps the target black — and the owning frame's `open_upvalues` ref keeps
+/// the cell itself black, so an open cell can never be severed).
+fn trace_upvalue_cell(ptr: sema_core::NodePtr, sink: &mut dyn FnMut(sema_core::GcEdge)) -> bool {
+    // SAFETY: live `Rc<UpvalueCell>` data pointer — see trace_vm_closure_payload.
+    let cell = unsafe { &*(ptr.raw() as *const UpvalueCell) };
+    match cell.state.try_borrow() {
+        Ok(state) => {
+            if let UpvalueState::Closed(v) = &*state {
+                sink(sema_core::GcEdge::Value(v));
+            }
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+/// Sever a white upvalue cell: `Closed(v)` → `Closed(NIL)`, returning `v` so
+/// the collector defers its drop until all severing has completed.
+fn sever_upvalue_cell(ptr: sema_core::NodePtr) -> Option<Value> {
+    // SAFETY: live `Rc<UpvalueCell>` data pointer — see trace_vm_closure_payload.
+    let cell = unsafe { &*(ptr.raw() as *const UpvalueCell) };
+    match cell.state.try_borrow_mut() {
+        Ok(mut state) => match std::mem::replace(&mut *state, UpvalueState::Closed(Value::NIL)) {
+            UpvalueState::Closed(v) => Some(v),
+            UpvalueState::Open { .. } => None,
+        },
+        Err(_) => {
+            debug_assert!(false, "white upvalue cell borrowed during severing");
+            None
+        }
+    }
+}
+
+/// Payload, closure, function-table, and `Function` nodes have no severable
+/// cell of their own; their memory is reclaimed by the `Rc` cascade once
+/// cells/envs are cleared.
+fn sever_nothing(_: sema_core::NodePtr) -> Option<Value> {
+    None
+}
+
 /// Extracted VM closure: the closure itself and the function table from its compilation context.
 pub type VmClosureInfo = (Rc<Closure>, Rc<Vec<Rc<Function>>>);
 
@@ -157,6 +338,12 @@ pub struct VM {
     /// temporarily by `run_nested_closure` so a re-entrant in-VM HOF callback
     /// returns to its native caller without unwinding the parent's frames.
     frame_floor: usize,
+    /// One-entry cache of the last home env this VM registered with the
+    /// cycle collector (CORE-2): consecutive `make_closure`s share a home,
+    /// so a pointer-equality hit skips the collector's seen-set probe. The
+    /// `Weak` guards address reuse — a dead entry (strong count 0) never
+    /// matches, even if a fresh env landed on the same address.
+    gc_adopted_home: std::cell::RefCell<Weak<Env>>,
 }
 
 thread_local! {
@@ -526,6 +713,7 @@ impl VM {
             func.cache_offset = total_cache_slots;
             total_cache_slots += func.chunk.n_global_cache_slots as usize;
         }
+        ensure_cycle_gc_wired();
         Ok(VM {
             stack: Vec::with_capacity(256),
             frames: Vec::with_capacity(64),
@@ -536,6 +724,7 @@ impl VM {
             debug_values: HashMap::new(),
             next_debug_value_ref: DEBUG_VALUE_REF_BASE,
             frame_floor: 0,
+            gc_adopted_home: std::cell::RefCell::new(Weak::new()),
         })
     }
 
@@ -577,6 +766,7 @@ impl VM {
             .iter()
             .map(|f| f.chunk.n_global_cache_slots as usize)
             .sum();
+        ensure_cycle_gc_wired();
         VM {
             stack: Vec::with_capacity(256),
             frames: Vec::with_capacity(64),
@@ -587,6 +777,7 @@ impl VM {
             debug_values: HashMap::new(),
             next_debug_value_ref: DEBUG_VALUE_REF_BASE,
             frame_floor: 0,
+            gc_adopted_home: std::cell::RefCell::new(Weak::new()),
         }
     }
 
@@ -601,6 +792,7 @@ impl VM {
             .iter()
             .map(|f| f.chunk.n_global_cache_slots as usize)
             .sum();
+        ensure_cycle_gc_wired();
         Ok(VM {
             stack: Vec::with_capacity(256),
             frames: Vec::with_capacity(64),
@@ -611,6 +803,7 @@ impl VM {
             debug_values: HashMap::new(),
             next_debug_value_ref: DEBUG_VALUE_REF_BASE,
             frame_floor: 0,
+            gc_adopted_home: std::cell::RefCell::new(Weak::new()),
         })
     }
 
@@ -2973,33 +3166,65 @@ impl VM {
             None => self.globals.clone(),
         };
 
+        // Cycle-collector candidates (CORE-2), registered after construction
+        // below: the home env on first adoption, the new closure wrapper.
+        // Home-adoption 1-entry cache: only clone (and later probe the
+        // collector's seen-set for) the home when it isn't the one this VM
+        // last adopted. The `Weak` guards address reuse — a dead entry
+        // (strong count 0) never matches, even if a fresh env landed on the
+        // same address.
+        let home_for_gc: Option<Rc<Env>> = {
+            let cached = self.gc_adopted_home.borrow();
+            let hit = std::ptr::eq(cached.as_ptr(), Rc::as_ptr(&home_globals))
+                && cached.strong_count() > 0;
+            drop(cached);
+            if hit {
+                None
+            } else {
+                *self.gc_adopted_home.borrow_mut() = Rc::downgrade(&home_globals);
+                Some(home_globals.clone())
+            }
+        };
+
         let closure = Rc::new(Closure {
             func,
             upvalues,
-            globals: Some(home_globals.clone()),
+            globals: Some(home_globals),
             // The new closure's func-ids index the table the defining frame is
             // running against (set per frame activation in the dispatch loop).
             functions: Some(self.functions.clone()),
         });
-        let payload: Rc<dyn std::any::Any> = Rc::new(VmClosurePayload {
-            closure: closure.clone(),
+        let payload = Rc::new(VmClosurePayload {
+            closure,
             functions: self.functions.clone(),
         });
-        let closure_for_fallback = closure.clone();
-        let functions = self.functions.clone();
-        let globals = home_globals;
+        // The fallback box captures ONLY this payload Rc (invariant I2): the
+        // wrapper's strong edges into the closure graph are exactly payload ×2
+        // (the `payload` field + the box), both traced through the registered
+        // payload tracer. Closure/functions/globals are derived from it at call
+        // time.
+        let payload_for_box = Rc::clone(&payload);
+        let name = payload
+            .closure
+            .func
+            .name
+            .map(resolve_spur)
+            .unwrap_or_else(|| "<vm-closure>".to_string());
 
         // The NativeFn wrapper is used as a fallback when called from outside the VM
         // (e.g., from stdlib HOFs like map/filter). Inside the VM, call_value detects
         // the payload and pushes a CallFrame instead — no Rust recursion.
         let mut native_fn = sema_core::NativeFn::with_payload(
-            closure_for_fallback
-                .func
-                .name
-                .map(resolve_spur)
-                .unwrap_or_else(|| "<vm-closure>".to_string()),
-            payload,
+            name,
+            payload as Rc<dyn std::any::Any>,
             move |ctx, args| {
+                let closure = &payload_for_box.closure;
+                let functions = &payload_for_box.functions;
+                let globals = closure
+                    .globals
+                    .as_ref()
+                    .expect("MakeClosure closures always carry Some(home)");
+
                 // Inside an async task, route through the scheduler so any
                 // yield in the inner closure (channel/send, channel/recv,
                 // await, sleep) suspends cleanly. Otherwise the inner VM's
@@ -3012,7 +3237,7 @@ impl VM {
                     // to run on the fresh task VM stack.
                     return crate::scheduler::run_closure_as_inline_task(
                         ctx,
-                        closure_for_fallback.clone(),
+                        closure.clone(),
                         functions.clone(),
                         args,
                     );
@@ -3025,25 +3250,58 @@ impl VM {
                 // parent's stack slots so `set!` mutations flow back to the
                 // caller. Falls back to a fresh VM only when no compatible VM is
                 // on the stack (e.g. called directly from the tree-walker).
-                if let Some(result) =
-                    try_run_on_current_vm(&closure_for_fallback, &functions, &globals, args, ctx)
+                if let Some(result) = try_run_on_current_vm(closure, functions, globals, args, ctx)
                 {
                     return result;
                 }
 
                 // Foreign fresh VM: snapshot open upvalues against the owning
                 // VM (if any) before running on a different stack.
-                close_closure_upvalues_for_foreign_run(&closure_for_fallback);
+                close_closure_upvalues_for_foreign_run(closure);
                 let mut vm = VM::new_with_rc_functions(globals.clone(), functions.clone());
-                vm.setup_for_call(closure_for_fallback.clone(), args)?;
+                vm.setup_for_call(closure.clone(), args)?;
                 vm.run(ctx)
             },
         );
         // Mark this wrapper so `type`/`type_name` report `:lambda`, not `:native-fn`.
         native_fn.is_closure = true;
-        let native = Value::native_fn_from_rc(Rc::new(native_fn));
+        let native_rc = Rc::new(native_fn);
 
-        self.stack.push(native);
+        // Zero-upvalue exemption: a closure that captured NO upvalues is not
+        // registered as a cycle candidate (its home env still is). Sound
+        // because it owns no upvalue cells, so it cannot carry the severable
+        // link of any cycle (invariant I1) — every cycle it sits on closes
+        // through a cell owned by something else that is independently
+        // registered and reaches the whole cycle:
+        //   - env bindings on its home's parent chain (the Env⇄Closure
+        //     shapes): the home WRAPPER candidate registered by this very
+        //     call traces `parent` edges through every ancestor env;
+        //   - upvalue cells: owned by closures WITH upvalues (registered);
+        //   - data cells (thunk/promise/channel/multimethod): their cold
+        //     constructors register their own candidates, so even a data
+        //     cell smuggled into chunk consts by a macro (reachable only
+        //     through the shared function table) carries a covering
+        //     candidate.
+        // This keeps every top-level `(define (f ...))` — the common case —
+        // out of the registry: live ones aren't re-traced each pass, garbage
+        // ones die by plain Rc drop without a registry entry to prune.
+        let candidate = (n_upvalues > 0).then_some(&native_rc);
+        let should_collect = sema_core::register_closure_birth(home_for_gc.as_ref(), candidate);
+        drop(home_for_gc);
+        self.stack.push(Value::native_fn_from_rc(native_rc));
+
+        // Threshold-gated safe point: closure creation is the hot site where
+        // the candidate registry grows (cold data births run the same trigger
+        // inside register_candidate), so churn workloads that never return
+        // to a top-level safe point still collect. Mid-VM collection is safe —
+        // live objects are protected by external strong counts (VM stack,
+        // frames, open-upvalue refs) and any outstanding `RefCell` borrow
+        // aborts the pass cleanly. Pins skip descent into the executing VM's
+        // live global namespace; computed only when a pass will actually run.
+        if should_collect {
+            let pins = sema_core::gc_env_chain_pins(&self.globals);
+            sema_core::gc_threshold_collect(&pins, sema_core::GcTrigger::Threshold);
+        }
         Ok(())
     }
 

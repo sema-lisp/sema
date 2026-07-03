@@ -26,6 +26,38 @@
   printing a URL or opening a browser). Off by default (backward-compatible); the
   notebook server opts in. See the
   [Web Server docs](https://sema-lang.com/docs/stdlib/web-server).
+- **CORE-2 fixed: cycle-collecting garbage collector.** Sema now reclaims reference
+  cycles — a synchronous Bacon–Rajan cycle collector (ADR #66; design + measurements
+  in `docs/plans/2026-07-02-core2-gc.md`) runs over the existing `Rc` heap with a
+  creation-time candidate registry, reclaiming garbage cycles by severing the one
+  mutable cell every Sema cycle must pass through (env bindings, upvalue cell, thunk
+  `forced`, promise state, channel buffer, multimethod table) and letting ordinary
+  `Rc` drops cascade. What users get: **long-lived sessions stop leaking** — REPL,
+  notebook server, HTTP/MCP servers, and long-running agents that define recursive
+  local helpers every turn (previously 260 B leaked per recursive closure, forever)
+  now stay memory-bounded, and **interpreter teardown frees everything** (previously
+  every `Interpreter` drop leaked its entire global env, ~168 KB, even with zero
+  user code — fatal for embedders and notebook kernel resets). Measured by the
+  counting-allocator oracles in `crates/sema/tests/leak_test.rs` (all seven green):
+  recursive-closure churn 260 B/iter → ~0 (bounded); teardown ~168 KB/drop → 0 B/drop
+  (no defines, macro-injected consts, module imports) and bounded with user defines;
+  1M-iteration churn RSS 303.7 MB → 16.0 MB. Collection runs at safe points (closure/
+  data-birth registry threshold, top-level eval return, notebook cell + kernel reset,
+  agent-turn boundary, scheduler idle, `Interpreter::drop`) plus on demand via the new
+  **`gc/collect` and `gc/stats` builtins** and the REPL `,gc` command. Perf gate
+  (interleaved hyperfine A/B vs the pre-collector baseline): closure bookkeeping
+  ≤1.6% on storm/upvalue-counter/fold; numeric within noise (tak's +0.9% shows
+  all-zero `gc/stats` — layout noise); reclamation costs ~326 ns per collected cycle
+  at 1.73× the *leaking* baseline's wall time on the churn canary; mandelbrot pays
+  +12% because its named-`let` loops birth a real cycle per entry — the baseline
+  leaks on it, and issue #62 (self-tail-call optimization) is the planned
+  elimination. Load-bearing invariant established in M1 (AGENTS.md, I2): a
+  `NativeFn`'s boxed closure must never strongly capture anything that can
+  transitively hold a `Value`/`Env` — traceable state belongs in `NativeFn.payload`;
+  the ~11 `__vm-*`/tool/agent delegates now capture their home env `Weak`. No object
+  headers, no color bits, no change to `Value`'s NaN-boxing, `Value::drop`, or the
+  strong-reference graph user code sees.
+
 - **`otel/configure` — turn on tracing from Sema code.** Telemetry no longer
   needs environment variables: `(otel/configure {:endpoint "..." :key "sk_..."})`
   points Sema at an OTLP backend (or a JSONL file via `:file`) from inside a

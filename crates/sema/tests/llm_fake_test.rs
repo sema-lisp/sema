@@ -371,6 +371,115 @@ fn tool_handler_runs_full_evaluator_with_side_effects() {
     assert_eq!(recorder.call_count(), 2, "tool call round + final answer");
 }
 
+/// CORE-2 mid-agent-loop reclamation (`docs/plans/2026-07-02-core2-gc.md`
+/// §5.2): a long agent run must reclaim BETWEEN tool turns, not only when
+/// the whole eval returns. Turn 1's handler builds 700 garbage
+/// recursive-closure cycles and then churns 3000 dead channels; the channel
+/// births cross the registry-growth threshold inside the handler, so the
+/// data-birth trigger (`register_candidate`) severs the cycles and prunes
+/// the dead entries mid-turn. The turn-boundary `maybe_collect` stays a
+/// threshold-gated backstop that the growth policy keeps quiescent here
+/// (registry-at-rest never exceeds the threshold once births self-collect).
+/// Turn 2's handler observes the outcome as its FIRST action: bounded
+/// registry, a real prune, and an explicit collect that finds no garbage
+/// cycle left. Message correlation must be unchanged by passes running
+/// inside a tool handler. Deterministic — no timing; the fake scripts
+/// every round.
+#[test]
+fn agent_turn_boundary_collects_between_tool_turns() {
+    let fake = FakeProvider::builder("fake")
+        .model("fake-model")
+        .tool_call("call_1", "churn", serde_json::json!({"x": "one"}))
+        .tool_call("call_2", "churn", serde_json::json!({"x": "two"}))
+        .reply("all done")
+        .build();
+
+    let src = r#"
+        (define turn 0)
+        (define probe nil)
+        (define leftover nil)
+        (define (mk-cycle k)
+          (define (r n) (if (<= n 0) k (r (- n 1))))
+          r)
+        (define (spin i)
+          (if (<= i 0) nil (begin (mk-cycle i) (spin (- i 1)))))
+        (define (spam-channels i)
+          (if (<= i 0) nil (begin (channel/new 1) (spam-channels (- i 1)))))
+        (deftool churn "Churn the heap" {:x {:type :string}}
+          (lambda (x)
+            (set! turn (+ turn 1))
+            (if (= turn 1)
+                (begin (spin 700) (spam-channels 3000) "turn-1 done")
+                (begin (set! probe (gc/stats))
+                       (set! leftover (gc/collect))
+                       "turn-2 done"))))
+        (defagent bot {:model "fake-model" :tools [churn] :max-turns 5})
+        (define answer (agent/run bot "go"))
+        (list answer
+              (< (:registry-size probe) 1024)
+              (>= (:pruned probe) 900)
+              (:collected leftover))
+    "#;
+
+    let (result, recorder) = eval_with_fake(src, fake);
+    let val = result.expect("agent run with a churning tool handler should complete");
+    let items = val.as_seq().expect("result list");
+    // The loop completed correctly across the collections...
+    assert_eq!(items[0].as_str(), Some("all done"));
+    // ...and turn 2 observed the mid-turn passes: registry bounded well
+    // under the spam count, the last pass really pruned a dead batch, and
+    // the 700 garbage cycles were already severed before turn 2 started
+    // (the explicit collect has nothing left to reclaim).
+    assert_eq!(
+        items[1],
+        Value::bool(true),
+        "registry must be pruned before turn 2 (probe below 1024)"
+    );
+    assert_eq!(
+        items[2],
+        Value::bool(true),
+        "the last mid-turn pass must have pruned a dead-entry batch"
+    );
+    assert_eq!(
+        items[3],
+        Value::int(0),
+        "all garbage cycles must be reclaimed before turn 2's explicit collect"
+    );
+
+    // Zero behavior change to messages/correlation: 3 provider rounds, each
+    // tool round echoed the assistant tool_calls turn and fed back a
+    // correlated tool result.
+    let reqs = recorder.requests();
+    assert_eq!(reqs.len(), 3, "two tool rounds + the final answer");
+    let round2 = &reqs[1];
+    assert!(
+        round2
+            .messages
+            .iter()
+            .any(|m| m.role == "assistant" && !m.tool_calls.is_empty()),
+        "round 2 must echo the assistant's tool_calls"
+    );
+    assert!(
+        round2
+            .messages
+            .iter()
+            .any(|m| m.tool_call_id.as_deref() == Some("call_1")),
+        "round 2 must include the tool result correlated to call_1"
+    );
+    let round3 = &reqs[2];
+    assert!(
+        round3
+            .messages
+            .iter()
+            .any(|m| m.tool_call_id.as_deref() == Some("call_2")),
+        "round 3 must include the tool result correlated to call_2"
+    );
+    assert!(
+        round3.messages.len() > round2.messages.len(),
+        "history must keep growing across turns"
+    );
+}
+
 #[test]
 fn rerank_reorders_documents_by_relevance() {
     // Three candidates; the fake scripts a reordering: doc index 2 most relevant,

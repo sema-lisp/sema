@@ -13,6 +13,7 @@ pub const REPL_COMMANDS: &[&str] = &[
     ",h",
     ",env",
     ",builtins",
+    ",gc",
     ",type",
     ",time",
     ",doc",
@@ -52,6 +53,10 @@ pub fn dispatch(
         }
         ",builtins" => {
             print_builtins(interpreter);
+            return CommandOutcome::Handled;
+        }
+        ",gc" => {
+            run_gc(interpreter);
             return CommandOutcome::Handled;
         }
         _ => {}
@@ -130,6 +135,29 @@ pub fn dispatch(
     }
 
     CommandOutcome::Passthrough
+}
+
+/// `,gc` — run a full cycle collection (CORE-2) and print its stats plus the
+/// remaining candidate-registry size. Same pass as the `(gc/collect)` builtin,
+/// pinned to skip descent into the live REPL namespace.
+fn run_gc(interpreter: &Interpreter) {
+    let pins = sema_core::gc_env_chain_pins(&interpreter.global_env);
+    let stats = sema_core::gc_collect(&pins, sema_core::GcTrigger::Explicit);
+    if stats.aborted {
+        println!("gc: pass aborted (cell borrowed or collection already running)");
+        return;
+    }
+    println!(
+        "gc: collected {} of {} traced ({} candidates, {} registry entries pruned)",
+        stats.collected, stats.traced, stats.candidates, stats.pruned
+    );
+    println!(
+        "{}",
+        colors::dim(&format!(
+            "    registry: {} live candidates",
+            sema_core::gc_registry_len()
+        ))
+    );
 }
 
 fn record_source(expr: &str) {
@@ -212,6 +240,7 @@ fn print_help() {
     println!("  ,help / ,h       Show this help");
     println!("  ,env             Show defined variables");
     println!("  ,builtins        List all builtin functions");
+    println!("  ,gc              Run a cycle collection and show its stats");
     println!("  ,type EXPR       Show the type of a value");
     println!("  ,time EXPR       Evaluate and show elapsed time");
     println!("  ,doc NAME        Show info about a binding");

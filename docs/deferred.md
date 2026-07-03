@@ -16,9 +16,25 @@ Things that came out of the May 2026 quality sweep (Wave 6 audit) but were inten
 
 Also noted from the PR #59 merge review as low-priority, not-yet-done: capping the device-flow `slow_down` interval growth (the `+5` itself is RFC 8628-correct), and auto-reconnecting a Streamable-HTTP session on a mid-session `404` (currently surfaced as a `reconnect required` error rather than transparently re-initializing).
 
-## ASYNC-1 — Dynamic-scope flags vs deferred async tasks (cache/budget visibility)
+## ASYNC-3 — `async/all` early-reject strands a span-owning `IoHandle` (teardown abort)
 
-**Found 2026-06-23, during the concurrent-`llm/*` work.** `llm/with-cache` (and similarly `llm/with-budget`, per-call `:tags`/`:metadata`) sets a **dynamically-scoped thread-local** (`CACHE_ENABLED`, `BUDGET_*`, `CALL_TAGS`…) for the duration of its thunk, then resets it. An async task spawned inside that thunk reads the flag **when it actually executes** — and the scheduler can defer that execution past the point where the thunk returned and the flag was reset. Symptom: a single `(llm/with-cache … (fn () (async/all (list (async/spawn (fn () (llm/complete …)))))))` often reports `:misses 0` in `(llm/cache-stats)` (the task ran with `CACHE_ENABLED` already reset), and the `async_cache_miss_is_counted` test was removed as flaky for this reason. **Caching itself still works** for async completions awaited in-extent (a same-prompt repeat is served as a hit), so this is primarily an *accounting/visibility* nuance — but the same mechanism could mean `llm/with-budget` does **not** reliably gate concurrent completions, which would be a real correctness gap. **Deferred because** the fix is a design decision (snapshot the dynamic scope onto each task at `async/spawn` time and reinstall it when the task runs — a per-task dynamic-environment capture, akin to the per-task OTel context swap already shipped), not a one-liner, and it's orthogonal to the concurrency/cancellation slices it surfaced under. Revisit when wiring budgets to concurrent agent fan-out.
+**Found 2026-07-02, while landing the ASYNC-1 fix.** `async/all` (the `AllOf`
+scheduler target) short-circuits to `Complete` on the **first** rejecting task
+(`RunGoal::status`, `crates/sema-vm/src/scheduler.rs`), without cancelling the still
+in-flight siblings. A sibling parked on `Blocked(AwaitIo)` that is still *reachable*
+(its promise held by a Sema variable) is kept by the terminal-only reap
+(`reap_leftover_tasks`), so its span-owning `IoHandle` (e.g. an `llm/complete` offload)
+can survive to thread/process teardown — where its detached `LlmSpan` calls `span.end()`
+against a destructed OTel thread-local and aborts the process (the adversarial-#7 hazard
+the timeout path already guards via `cancel_promise_task`). The ASYNC-1 budget fix is the
+first thing to trigger this deterministically (a budget overrun *rejects* a task), but any
+task rejection with a slow reachable sibling under an active OTel exporter hits it. **Deferred
+because** the proper fix is a distinct async-cancellation-semantics decision — on an
+`async/all`/`async/race` short-circuit, transitively cancel + abort the abandoned in-flight
+siblings (extending `cancel_await_tree` to the combinator's promise set) — orthogonal to
+ASYNC-1's dynamic-scope capture. **Workaround:** the shipped `async_budget_gates_concurrent_fanout`
+gate sizes the cap to trip only once *all* siblings have charged (so none is left in-flight);
+real code that awaits every promise, or runs without an OTel exporter, is unaffected.
 
 ## ASYNC-2 — Stepping across the scheduler boundary into sibling async tasks
 
@@ -29,6 +45,8 @@ Also noted from the PR #59 merge review as low-priority, not-yet-done: capping t
 Verified 2026-06-09: U6 ("did you mean" hints — shipped via `suggest_similar` in sema-core, attached in both backends) and U9 (REPL completeness check — replaced by the lexer-based `SemaValidator` in `crates/sema/src/repl/validator.rs`) were removed because they have since been fixed. Remaining entries re-verified as still open.
 
 Verified 2026-07-01: **LEX-1** (scientific/exponential number literals — `1e19`, `2e-5`, `1E10` now parse), **VM-1** (VM stack traces on runtime errors — the VM now captures the call stack at error time and serializes it as `:stack-trace`), and **N7** (`sort` on heterogeneous types — comparator-free `sort` now raises a type error on mixed types and compares ints/floats numerically, `crates/sema-stdlib/src/list.rs`) were removed because they are fixed. Remaining entries re-verified as still open.
+
+Fixed 2026-07-02: **ASYNC-1** (dynamic-scope flags vs deferred async tasks) — `llm/with-cache`/`llm/with-budget`/per-call `:tags` are now captured per task and swapped in/out at each scheduler step (a third per-task context beside the otel + usage-scope swaps), with the active budget frame shared by `Rc` so a concurrent `with-budget` fan-out charges one aggregate. See ADR #67, `docs/plans/2026-07-02-async-1-dynamic-scope-per-task.md`; gates `async_cache_miss_is_counted` + `async_budget_gates_concurrent_fanout` in `crates/sema/tests/complete_async_test.rs`. (The follow-up teardown gap it surfaced is now tracked as ASYNC-3 above.)
 
 ---
 
@@ -85,28 +103,29 @@ Pattern can mirror the diagnostic-waiting in `test_diagnostics.py`.
 
 ---
 
-## CORE-2 — recursive-closure Rc cycle (memory leak), both backends
+## CORE-2 — recursive-closure Rc cycle (memory leak) — **FIXED (2026-07-02)**
 
-**Today:** a self-referential closure forms an `Rc` cycle that reference counting can't
-reclaim. On the **tree-walker** it's the whole-`Env` capture (`Lambda { env: Env }` +
-the env binding the name → the lambda). On the **VM** it's narrower but real: a
-local/returned recursive closure captures its own name as an `UpvalueCell` whose
-`Closed(Value)` holds the closure (`crates/sema-vm/src/resolve.rs:280-297`;
-`docs/plans/2026-02-16-compilation-strategy-investigation.md:1014-1016` calls it "the
-MOST common source of long-lived reference chains"). Top-level defines (globals) avoid it.
+**Was:** a self-referential closure formed an `Rc` cycle that reference counting couldn't
+reclaim: a local/returned recursive closure captures its own name as an `UpvalueCell`
+whose `Closed(Value)` holds the closure (shape U — measured 260 B leaked per churn
+iteration). The design work found two more live shapes: every top-level define forms an
+env⇄closure cycle that pins the whole global env at interpreter/notebook teardown
+(shape E, ~168 KB per drop), and the `__vm-*` delegates strongly captured the very env
+they were registered into (shape D, ~166 KB per drop with zero user code). The attempted
+`Weak` captured-env fix had been dropped — it broke the "module exports a fn calling a
+private helper" pattern (`vm_module_test`).
 
-**Correction (2026-06-18):** an earlier note claimed retiring the tree-walker closes
-CORE-2 because "the VM is cycle-free." That is **wrong** — the VM has its own cycle (above).
-Retiring the TW removes only the whole-`Env` variant.
-
-**Real fix:** cycle collection / a tracing GC over the `Rc<Value>`/`Env`/`UpvalueCell`
-graph (every production Scheme ships one for exactly this reason). The attempted `Weak`
-captured-env fix was dropped — it broke the common "module exports a fn calling a private
-helper" pattern (`vm_module_test`).
-
-**Why deferred:** only bites very long-lived sessions (REPL/notebook/server) with repeated
-recursive local defines; CLI/script runs are unaffected. A GC is a large investment; revisit
-when a real long-running workload shows growth (a `Rc::strong_count` leak test would size it).
+**Fix:** a synchronous Bacon–Rajan cycle collector over the existing `Rc` heap —
+**ADR #66**, design/measurements/milestones in `docs/plans/2026-07-02-core2-gc.md`,
+GC section in `docs/vm-status.md`. Creation-time candidate registry (VM closures, home
+envs, the cold data constructors `delay`/promise/`channel`/`defmulti`), trial deletion
+over a transient side map, reclamation by *severing* the one mutable cell every Sema
+cycle must pass through. No headers, no `Value`/`Rc` changes, `Value::drop` untouched.
+Shape D was fixed by refactor (delegates capture `Weak` — invariant I2 in AGENTS.md).
+Perf gate passed (plan §6 M4): storm +0.91%, upvalue-counter +1.41%, fold −0.01%,
+318 ns per reclaimed churn cycle. Oracles: `crates/sema/tests/leak_test.rs` (un-ignored),
+the `gc_stress_test.rs` suite, the agent-turn FakeProvider test in `llm_fake_test.rs`,
+and the notebook `reset_returns_old_kernel_memory` test.
 
 ---
 

@@ -1654,3 +1654,90 @@ eval_tests! {
     string_lines_count: r#"(length (string/lines "a\nb\r\nc\n"))"# => Value::int(3),
     string_lines_first: r#"(first (string/lines "x\ny"))"# => Value::string("x"),
 }
+
+// ============================================================
+// Cycle collector (CORE-2, ADR #66): gc/collect + gc/stats and the
+// plan §6-M3 adversarial shapes. Exact reclaim COUNTS are the trace
+// model's business (unit-tested in sema-core::cycle and sized by
+// leak_test.rs); these pin the semantic contract — garbage cycles
+// are reclaimed, live closures are never severed by a collection.
+// ============================================================
+
+eval_tests! {
+    gc_collect_returns_stats_map: "(map? (gc/collect))" => Value::bool(true),
+    gc_stats_has_registry_size: "(integer? (:registry-size (gc/stats)))" => Value::bool(true),
+    // Direct self-recursion (shape U): the churned closure's cell⇄closure
+    // cycle is unreachable after the call and must be reclaimed.
+    gc_self_recursive_local_collected: "(begin
+        (define (churn)
+          (define (loop n) (if (<= n 0) 0 (loop (- n 1))))
+          (loop 3))
+        (churn)
+        (> (:collected (gc/collect)) 0))" => Value::bool(true),
+    // Mutual local recursion: two cells, neither a self-capture — the shape
+    // that defeats any weak-self-edge scheme (plan §4 option E).
+    gc_mutual_local_recursion_collected: "(begin
+        (define (churn)
+          (define (ev? n) (if (<= n 0) true (od? (- n 1))))
+          (define (od? n) (if (<= n 0) false (ev? (- n 1))))
+          (ev? 4))
+        (churn)
+        (> (:collected (gc/collect)) 0))" => Value::bool(true),
+    // set!-through-cell cycle: the back-edge is written after creation.
+    gc_set_cell_cycle_collected: "(begin
+        (define (churn)
+          (define box nil)
+          (define (grab) box)
+          (set! box grab)
+          nil)
+        (churn)
+        (> (:collected (gc/collect)) 0))" => Value::bool(true),
+    // Live-closure guard: collecting mid-workload in a loop must never sever
+    // a reachable closure's cells — the recursive local closure keeps working
+    // across every pass (external strong counts protect it by construction).
+    gc_live_closure_never_severed: "(begin
+        (define (check n)
+          (define (fact k) (if (<= k 1) 1 (* k (fact (- k 1)))))
+          (if (<= n 0)
+              (fact 10)
+              (begin (gc/collect)
+                     (assert (= (fact 5) 120) \"live closure severed\")
+                     (check (- n 1)))))
+        (check 20))" => Value::int(3628800),
+    // A live mutual pair also survives collection (cells stay intact).
+    gc_live_mutual_pair_survives: "(begin
+        (define (make)
+          (define (ev? n) (if (<= n 0) true (od? (- n 1))))
+          (define (od? n) (if (<= n 0) false (ev? (- n 1))))
+          ev?)
+        (define keep (make))
+        (gc/collect)
+        (keep 7))" => Value::bool(false),
+}
+
+// ============================================================
+// Prelude macro-name collisions
+// (docs/bugs/prelude-macro-names-collide-with-user-defines.md)
+// ============================================================
+// Macro expansion rewrites ANY list whose head names a macro — define-sugar
+// heads included — and local defines cannot shadow a macro at call sites.
+// These pin (a) that the nested define-with-`let` shapes compile fine with a
+// non-colliding name (no lowering/resolution bug hides here), and (b) the
+// collision itself, so the write-up stays honest until the expander gains
+// binding-position awareness or scope-aware shadowing.
+
+eval_tests! {
+    nested_define_with_let_body_in_lambda: "(begin
+        (define (outer a) (fn () (define (stp n) (let ((v 1)) v)) (stp 3)))
+        ((outer 1)))" => Value::int(1),
+    nested_define_with_let_body_direct: "(begin
+        (define (outer a) (define (stp n) (let ((v 1)) v)) (stp 3))
+        (outer 1))" => Value::int(1),
+}
+
+eval_error_tests! {
+    // `step` is the prelude workflow macro; its expansion (a `let` template)
+    // lands in the define head, so define sugar sees no symbol.
+    prelude_macro_name_in_define_sugar_head_errors:
+        "(define (step n) n)" => "define: expected a symbol",
+}

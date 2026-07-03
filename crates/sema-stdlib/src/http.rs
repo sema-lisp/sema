@@ -3,16 +3,9 @@ use std::time::Duration;
 
 use sema_core::{check_arity, Caps, SemaError, Value, ValueView};
 
-thread_local! {
-    static HTTP_RUNTIME: tokio::runtime::Runtime = tokio::runtime::Runtime::new()
-        .expect("Failed to create HTTP tokio runtime");
-    static HTTP_CLIENT: reqwest::Client = reqwest::Client::new();
-}
-
 /// A process-wide `reqwest::Client` (`Send + Sync + Clone`) reused for every
-/// offloaded request, so connections pool across overlapping tasks. The
-/// thread-local `HTTP_CLIENT` cannot cross the thread boundary into the shared
-/// runtime, so the spawned path uses this one.
+/// request — sync and offloaded alike — so connections pool across threads and
+/// overlapping tasks.
 #[cfg(not(target_arch = "wasm32"))]
 static HTTP_SHARED_CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
 
@@ -127,33 +120,31 @@ fn http_request(
         return http_request_async(method, url, body, opts);
     }
 
-    // Top-level (not in a scheduler task): the original synchronous path,
-    // byte-identical in observable behavior to the pre-async implementation.
-    HTTP_RUNTIME.with(|rt| {
-        HTTP_CLIENT.with(|client| {
-            rt.block_on(async {
-                let builder = build_request(client, method, url, body, opts)?;
+    // Top-level (not in a scheduler task): the synchronous path. `io_block_on`
+    // drives the round-trip ON THIS (VM) thread using THE pool's reactor —
+    // observable behavior identical to a dedicated blocking runtime.
+    let client = http_shared_client();
+    sema_io::io_block_on(async {
+        let builder = build_request(&client, method, url, body, opts)?;
 
-                let response = builder
-                    .send()
-                    .await
-                    .map_err(|e| SemaError::Io(format!("http {method} {url}: {e}")))?;
+        let response = builder
+            .send()
+            .await
+            .map_err(|e| SemaError::Io(format!("http {method} {url}: {e}")))?;
 
-                let status = response.status().as_u16();
-                let mut headers = Vec::new();
-                for (k, v) in response.headers() {
-                    if let Ok(val) = v.to_str() {
-                        headers.push((k.as_str().to_string(), val.to_string()));
-                    }
-                }
-                let body_text = response
-                    .text()
-                    .await
-                    .map_err(|e| SemaError::Io(format!("http {method} {url}: read body: {e}")))?;
+        let status = response.status().as_u16();
+        let mut headers = Vec::new();
+        for (k, v) in response.headers() {
+            if let Ok(val) = v.to_str() {
+                headers.push((k.as_str().to_string(), val.to_string()));
+            }
+        }
+        let body_text = response
+            .text()
+            .await
+            .map_err(|e| SemaError::Io(format!("http {method} {url}: read body: {e}")))?;
 
-                Ok(build_response_value(status, &headers, &body_text))
-            })
-        })
+        Ok(build_response_value(status, &headers, &body_text))
     })
 }
 

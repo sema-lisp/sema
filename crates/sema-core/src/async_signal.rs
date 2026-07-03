@@ -41,11 +41,14 @@ pub struct IoHandle {
     /// Optional one-shot abort hook, run when the scheduler CANCELS a task parked on
     /// this handle (`async/cancel`, `async/timeout` expiry, or an interrupt) — NEVER
     /// on normal completion. It aborts the offloaded work where the runtime supports
-    /// it (a tokio `AbortHandle::abort()` for the `spawn`-based http/shell offloads,
-    /// dropping the in-flight future → connection torn down / `kill_on_drop` child
-    /// killed). For `spawn_blocking` offloads (the LLM tier) there is no hook — a
-    /// blocking closure cannot be interrupted, so cancellation stays best-effort
-    /// there (the result is discarded). Built via [`with_abort`]; `None` for [`new`].
+    /// it: all `spawn`-based offloads — http, shell, and the LLM wire stage — abort
+    /// via a tokio `AbortHandle::abort()`, dropping the in-flight future (connection
+    /// torn down / `kill_on_drop` child killed / provider request abandoned
+    /// mid-flight). Only work that bottoms out in a `spawn_blocking` closure (a
+    /// sync-only LLM provider under the `complete_future` default impl) cannot be
+    /// interrupted past the abort point — there cancellation stays best-effort (the
+    /// result is discarded, the closure runs out on the worker). Built via
+    /// [`with_abort`]; `None` for [`new`].
     ///
     /// [`with_abort`]: IoHandle::with_abort
     /// [`new`]: IoHandle::new

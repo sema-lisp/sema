@@ -333,6 +333,14 @@ impl LlmProvider for OllamaProvider {
         sema_io::io_block_on(self.complete_async(request))
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
+    fn complete_future(
+        &self,
+        request: ChatRequest,
+    ) -> Option<crate::provider::BoxCompletionFuture<'_>> {
+        Some(Box::pin(self.complete_async(request)))
+    }
+
     fn stream_complete(
         &self,
         request: ChatRequest,

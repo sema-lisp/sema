@@ -782,10 +782,15 @@ during every inter-round park; `async/timeout` cancels cleanly at the parks.
 **Honest limits:** `:on-text` streaming rounds (reusing the synchronous
 `do_complete_streaming`) and synchronous CPU-bound tools between rounds block
 siblings; a synchronous `:on-text` callback works, but async work inside `:on-text`
-during a streaming round is unsupported (documented, not validated). The
-`spawn_blocking` LLM tier has no
-`AbortHandle`, so a cancelled agent's in-flight round completes on the worker and is
-discarded (best-effort). Per-task budget-across-yield under concurrent spawned agents
+during a streaming round is unsupported (documented, not validated). LLM-tier
+cancellation is REAL for the native providers: the wire stage is an `io_spawn`ed
+pool future whose `AbortHook` feeds `IoHandle::with_abort` (like http/shell), so a
+cancelled agent's in-flight round is dropped mid-flight — connection torn down, no
+wasted round-trip (`run_fallback_retry_async` + per-provider `complete_future`;
+gate: `llm_request_is_aborted_on_timeout`). Only sync-only providers (the
+`complete_future` default impl, e.g. FakeProvider) stay best-effort: the blocking
+`complete()` runs out on the worker and its result is discarded. Per-task
+budget-across-yield under concurrent spawned agents
 is a pre-existing single-completion ASYNC-1 gap, closed separately (plan Step 7).
 ~~Cancelled agents leak their slab entry (and never-ended agent span) until
 `reset_runtime_state`~~ — closed 2026-07-03: the scheduler's `task-reaped` callback
@@ -828,6 +833,14 @@ the reactor = blocking all siblings), so it would force async-ifying the entire
 provider/retry/fallback/streaming/MCP surface — maximal churn in the most
 invariant-dense code — for no additional user-visible concurrency (verified: no
 benefit for file I/O or wasm either; both are spawn_blocking/fetch-shaped regardless).
+A *targeted* async extraction of just the non-streaming completion/embed wire path
+(per-provider `complete_future`/`embed_future` + `run_fallback_retry_async`) did
+land later — not for concurrency (none gained) but for TRUE cancellation of the
+LLM tier: the `spawn_blocking` closure could not be aborted, so a cancelled task's
+request ran to completion (money spent, connection held). The offload is now an
+`io_spawn`ed future with a real `AbortHook` (like http/shell); sync-only providers
+fall back to the admission-controlled blocking tier and remain best-effort. The
+sync top-level path, streaming, and MCP stay on the synchronous stack unchanged.
 
 **Enforcement:** a source-conformance test (`runtime_conformance_test.rs`) forbids
 runtime creation outside an explicit allowlist (sema-io; sema-otel's isolated OTLP

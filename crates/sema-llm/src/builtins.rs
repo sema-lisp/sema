@@ -3360,12 +3360,19 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
             let provider_name = provider.name().to_string();
             let (tx, mut rx) = tokio::sync::oneshot::channel::<Result<EmbedResponse, LlmError>>();
             let req2 = request.clone();
-            // Best-effort cancel: spawn_blocking work cannot be interrupted, so this
-            // handle has no abort hook (IoHandle::new) — on cancel/timeout the result
-            // is discarded but the request runs to completion (LLM tier; the
-            // spawn-based http/shell offloads get a real AbortHandle).
-            sema_io::io_spawn_blocking(move || {
-                let r = provider.embed(req2);
+            // Spawned pool future (the http/shell abort tier): providers with a
+            // native async embed path (`embed_future`) are dropped mid-flight on
+            // abort — true cancellation; sync-only providers fall back to the
+            // admission-controlled blocking tier, where cancel stays best-effort
+            // (result discarded, call runs to completion).
+            let abort = sema_io::io_spawn(async move {
+                let r = match provider.embed_future(req2.clone()) {
+                    Some(fut) => fut.await,
+                    None => {
+                        let p = provider.clone();
+                        sema_io::io_offload_blocking(move || p.embed(req2)).await
+                    }
+                };
                 let _ = tx.send(r);
                 sema_core::notify_io_complete();
             });
@@ -3376,59 +3383,67 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
             // (those drop at the yield).
             let key = cassette_key;
             let mut span_slot = Some(span);
-            let handle = Rc::new(sema_core::IoHandle::new(move || {
-                use tokio::sync::oneshot::error::TryRecvError;
-                match rx.try_recv() {
-                    Err(TryRecvError::Empty) => sema_core::IoPoll::Pending,
-                    Ok(Ok(resp)) => {
-                        if let Some(span) = span_slot.take() {
-                            span.set_dispatch(&provider_name, &req_model);
-                            span.set_response(&sema_otel::ResponseFacts {
-                                input_tokens: resp.usage.prompt_tokens,
-                                output_tokens: 0,
-                                response_model: resp.model.clone(),
-                                cost_usd: pricing::calculate_cost_for(&provider_name, &resp.usage),
-                                ..Default::default()
-                            });
-                            // span drops here → ends the span.
+            // On cancel/timeout the scheduler runs the abort hook, aborting the
+            // spawned wire future. Never called on normal completion.
+            let handle = Rc::new(sema_core::IoHandle::with_abort(
+                move || {
+                    use tokio::sync::oneshot::error::TryRecvError;
+                    match rx.try_recv() {
+                        Err(TryRecvError::Empty) => sema_core::IoPoll::Pending,
+                        Ok(Ok(resp)) => {
+                            if let Some(span) = span_slot.take() {
+                                span.set_dispatch(&provider_name, &req_model);
+                                span.set_response(&sema_otel::ResponseFacts {
+                                    input_tokens: resp.usage.prompt_tokens,
+                                    output_tokens: 0,
+                                    response_model: resp.model.clone(),
+                                    cost_usd: pricing::calculate_cost_for(
+                                        &provider_name,
+                                        &resp.usage,
+                                    ),
+                                    ..Default::default()
+                                });
+                                // span drops here → ends the span.
+                            }
+                            if recording {
+                                CASSETTE.with(|c| {
+                                    if let Some(cass) = c.borrow_mut().as_mut() {
+                                        cass.record_entry(crate::cassette::TapeEntry::from_embed(
+                                            &key,
+                                            &resp.model,
+                                            &resp.embeddings,
+                                            resp.usage.prompt_tokens,
+                                        ));
+                                    }
+                                });
+                            }
+                            // Decode the embedding (byte-identical to the sync path)
+                            // and account on the VM thread. `track_usage` only mutates
+                            // session-usage / budget thread-locals and reads static
+                            // pricing — it never spawns, yields, or touches the
+                            // scheduler — so it is safe to call here inside
+                            // `wake_blocked_tasks`'s `&mut self.tasks` borrow. A budget
+                            // overrun fails the task, exactly as the sync path's `?`.
+                            let value = embed_value_from_response(&resp, single);
+                            match track_usage(&resp.usage) {
+                                Ok(()) => sema_core::IoPoll::Ready(Ok(value)),
+                                Err(e) => sema_core::IoPoll::Ready(Err(e.to_string())),
+                            }
                         }
-                        if recording {
-                            CASSETTE.with(|c| {
-                                if let Some(cass) = c.borrow_mut().as_mut() {
-                                    cass.record_entry(crate::cassette::TapeEntry::from_embed(
-                                        &key,
-                                        &resp.model,
-                                        &resp.embeddings,
-                                        resp.usage.prompt_tokens,
-                                    ));
-                                }
-                            });
+                        Ok(Err(e)) => {
+                            if let Some(span) = span_slot.take() {
+                                span.record_error(llm_error_kind(&e), &e.to_string());
+                            }
+                            sema_core::IoPoll::Ready(Err(e.to_string()))
                         }
-                        // Decode the embedding (byte-identical to the sync path)
-                        // and account on the VM thread. `track_usage` only mutates
-                        // session-usage / budget thread-locals and reads static
-                        // pricing — it never spawns, yields, or touches the
-                        // scheduler — so it is safe to call here inside
-                        // `wake_blocked_tasks`'s `&mut self.tasks` borrow. A budget
-                        // overrun fails the task, exactly as the sync path's `?`.
-                        let value = embed_value_from_response(&resp, single);
-                        match track_usage(&resp.usage) {
-                            Ok(()) => sema_core::IoPoll::Ready(Ok(value)),
-                            Err(e) => sema_core::IoPoll::Ready(Err(e.to_string())),
+                        Err(TryRecvError::Closed) => {
+                            span_slot.take();
+                            sema_core::IoPoll::Ready(Err("embed: io worker dropped".to_string()))
                         }
                     }
-                    Ok(Err(e)) => {
-                        if let Some(span) = span_slot.take() {
-                            span.record_error(llm_error_kind(&e), &e.to_string());
-                        }
-                        sema_core::IoPoll::Ready(Err(e.to_string()))
-                    }
-                    Err(TryRecvError::Closed) => {
-                        span_slot.take();
-                        sema_core::IoPoll::Ready(Err("embed: io worker dropped".to_string()))
-                    }
-                }
-            }));
+                },
+                abort,
+            ));
             sema_core::set_yield_signal(sema_core::YieldReason::AwaitIo(handle));
             return Ok(Value::nil());
         }
@@ -6112,11 +6127,13 @@ fn do_complete_streaming(
 /// for the async-scheduler-task path. Mirrors the concurrent `llm/embed` flow,
 /// scaled to a completion: it runs the on-VM-thread stage (conv scope, detached
 /// `chat` span, request attrs, cache lookup, cassette decision, fallback-chain
-/// resolution into `Arc` clones) SYNCHRONOUSLY, then OFFLOADS the wire unit
-/// (`run_fallback_retry`) onto the shared runtime and YIELDS `AwaitIo` so sibling
-/// tasks overlap. All post-call work (span finalize, retry spans, cache store,
-/// cassette record, `track_usage`, content→Value) runs in the poller, on the VM
-/// thread, when the future lands — because the native is NOT re-invoked on resume.
+/// resolution into `Arc` clones) SYNCHRONOUSLY, then SPAWNS the wire unit
+/// (`run_fallback_retry_async`) as an abortable pool future and YIELDS `AwaitIo`
+/// so sibling tasks overlap — cancel/timeout runs the handle's abort hook, which
+/// drops the in-flight request. All post-call work (span finalize, retry spans,
+/// cache store, cassette record, `track_usage`, content→Value) runs in the
+/// poller, on the VM thread, when the future lands — because the native is NOT
+/// re-invoked on resume.
 ///
 /// `finalize` shapes the per-native return value from the `ChatResponse` (e.g.
 /// `Value::string(&resp.content)` for `llm/complete`). It runs in the poller on the
@@ -6253,9 +6270,9 @@ fn do_complete_async_yield(
     // Done on the VM thread so the offloaded worker touches no thread-locals.
     enforce_rate_limit();
     let max_retries = NETWORK_MAX_RETRIES.with(|c| c.get());
-    // Capture the retry-backoff base on the VM thread so the offloaded worker
-    // honors it (the worker has its own RETRY_BASE_MS TLS copy) — see
-    // `retry_backoff_ms`. Threaded through `run_fallback_retry`.
+    // Capture the retry-backoff base on the VM thread so the offloaded wire
+    // stage honors it (pool workers have their own RETRY_BASE_MS TLS copies) —
+    // see `retry_backoff_ms`. Threaded through `run_fallback_retry_async`.
     let retry_base_ms = RETRY_BASE_MS.with(|c| c.get());
     let chain: Vec<ResolvedProvider> = PROVIDER_REGISTRY.with(|reg| {
         let reg = reg.borrow();
@@ -6297,24 +6314,35 @@ fn do_complete_async_yield(
     let (tx, mut rx) =
         tokio::sync::oneshot::channel::<Result<CompleteOutcome, crate::types::LlmError>>();
     let req2 = request.clone();
-    // NOTE (async-path compat nuance): `provider.complete()` runs on a worker
-    // thread, so OpenAI's `DROP_TEMPERATURE` self-heal LEARNS into the worker's TLS,
-    // not the VM thread's. The WITHIN-call self-heal (400 → drop temperature → retry
-    // once) is fully preserved (it is encapsulated in one `complete()` call), so
-    // every async completion still succeeds; only the cross-call optimization (skip
-    // the doomed first request on later calls) is not shared across the VM thread —
-    // each async call may pay one extra 400+retry on temperature-rejecting models.
-    // Correctness holds; documented as a minor async-path divergence.
+    // NOTE (async-path compat nuance): the wire stage runs on pool workers, so
+    // OpenAI's `DROP_TEMPERATURE` self-heal LEARNS into a worker's TLS, not the
+    // VM thread's. The WITHIN-call self-heal (400 → drop temperature → retry
+    // once) is fully preserved (openai's `complete_future` strips temperature
+    // from the retried request explicitly), so every async completion still
+    // succeeds; only the cross-call optimization (skip the doomed first request
+    // on later calls) is not shared across the VM thread — each async call may
+    // pay one extra 400+retry on temperature-rejecting models. Correctness
+    // holds; documented as a minor async-path divergence.
     // Bump in-flight + peak on spawn so a test can prove simultaneity (mirrors the
     // io-sleep-once spike instrumentation).
     let prev = IO_INFLIGHT.fetch_add(1, Ordering::SeqCst) + 1;
     IO_PEAK.fetch_max(prev, Ordering::SeqCst);
-    // Admission-controlled offload onto THE pool: the permit is held for the
-    // whole wire unit, including any retry-backoff sleeps inside it.
-    sema_io::io_spawn_blocking(move || {
-        let r = run_fallback_retry(chain, req2, max_retries, retry_base_ms);
-        let _ =
-            IO_INFLIGHT.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| Some((v - 1).max(0)));
+    // Offloaded as a SPAWNED POOL FUTURE (the http/shell abort tier), not
+    // spawn_blocking: native-async providers are dropped mid-flight on abort —
+    // the in-flight request's connection is torn down, no wasted round-trip.
+    // Sync-only providers fall back to the admission-controlled blocking tier
+    // inside `complete_once_async`, where cancel stays best-effort.
+    let abort = sema_io::io_spawn(async move {
+        // Balance in-flight on EVERY exit — normal completion or abort-drop.
+        struct InflightGuard;
+        impl Drop for InflightGuard {
+            fn drop(&mut self) {
+                let _ = IO_INFLIGHT
+                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| Some((v - 1).max(0)));
+            }
+        }
+        let _inflight = InflightGuard;
+        let r = run_fallback_retry_async(chain, req2, max_retries, retry_base_ms).await;
         let _ = tx.send(r);
         sema_core::notify_io_complete();
     });
@@ -6337,100 +6365,106 @@ fn do_complete_async_yield(
     // charge one shared aggregate and gate correctly.
     let budget_slot = active_budget();
     let request_for_messages = request;
-    let handle = Rc::new(sema_core::IoHandle::new(move || {
-        use tokio::sync::oneshot::error::TryRecvError;
-        match rx.try_recv() {
-            Err(TryRecvError::Empty) => sema_core::IoPoll::Pending,
-            Ok(Ok(outcome)) => {
-                let CompleteOutcome {
-                    resp,
-                    serving_provider,
-                    serving_model,
-                    retry_events,
-                } = outcome;
-                if let Some(span) = span_slot.take() {
-                    // Emit retry spans + set the response facts UNDER this span so
-                    // children parent correctly (the detached span is not on the
-                    // stack). `entered` installs it as the active parent for the
-                    // closure, then restores.
-                    span.entered(|| {
-                        emit_retry_spans(&retry_events);
-                    });
-                    span.set_dispatch(&serving_provider, &serving_model);
-                    span.set_response(&response_facts(&serving_provider, &resp));
-                    span.set_messages(
-                        &messages_json(&request_for_messages.messages),
-                        &content_json("assistant", &resp.content),
-                        request_for_messages
-                            .system
-                            .as_deref()
-                            .map(|s| content_json("system", s))
-                            .as_deref(),
-                    );
-                    // span drops here → ends the span.
-                }
-                set_serving_provider(&serving_provider);
-                if let Some(key) = &cache_key {
-                    store_cached(key, &resp);
-                }
-                if let Some(key) = &cassette_record_key {
-                    CASSETTE.with(|c| {
-                        if let Some(cass) = c.borrow_mut().as_mut() {
-                            cass.record_entry(crate::cassette::TapeEntry::from_response(
-                                key, &resp,
-                            ));
-                        }
-                    });
-                }
-                // Fold this completion into the LEAF'S OWN captured accumulator frame —
-                // the `Rc` snapshotted at yield time, not whatever scope is active when
-                // the future lands (the poller runs outside the per-task install
-                // boundary, so the thread-local may now hold a sibling's scope). Price
-                // it the same way `track_usage` does — by the serving provider — then
-                // suppress `track_usage`'s own active-frame fold so this completion is
-                // counted exactly once.
-                if let Some(slot) = &usage_accum_slot {
-                    let cost = pricing::calculate_cost_for(&serving_provider, &resp.usage);
-                    accumulate_into(slot, &resp.usage, cost);
-                }
-                // Account on the VM thread, then shape the value. A budget overrun
-                // fails the task, exactly as the sync path's `?`. Install THIS
-                // completion's captured budget frame as active around `track_usage` so
-                // the charge + limit check land on the dispatch-time frame (shared by
-                // `Rc` across the fan-out), then restore whatever was active.
-                let track_result = {
-                    let prev_budget = ACTIVE_BUDGET
-                        .with(|b| std::mem::replace(&mut *b.borrow_mut(), budget_slot.clone()));
-                    let r = USAGE_ACCUM_SUPPRESS.with(|s| {
-                        s.set(true);
-                        let r = track_usage(&resp.usage);
-                        s.set(false);
+    // True cancellation: on cancel/timeout the scheduler runs the abort hook,
+    // which aborts the spawned wire future → the in-flight provider request is
+    // dropped (connection torn down). Never called on normal completion.
+    let handle = Rc::new(sema_core::IoHandle::with_abort(
+        move || {
+            use tokio::sync::oneshot::error::TryRecvError;
+            match rx.try_recv() {
+                Err(TryRecvError::Empty) => sema_core::IoPoll::Pending,
+                Ok(Ok(outcome)) => {
+                    let CompleteOutcome {
+                        resp,
+                        serving_provider,
+                        serving_model,
+                        retry_events,
+                    } = outcome;
+                    if let Some(span) = span_slot.take() {
+                        // Emit retry spans + set the response facts UNDER this span so
+                        // children parent correctly (the detached span is not on the
+                        // stack). `entered` installs it as the active parent for the
+                        // closure, then restores.
+                        span.entered(|| {
+                            emit_retry_spans(&retry_events);
+                        });
+                        span.set_dispatch(&serving_provider, &serving_model);
+                        span.set_response(&response_facts(&serving_provider, &resp));
+                        span.set_messages(
+                            &messages_json(&request_for_messages.messages),
+                            &content_json("assistant", &resp.content),
+                            request_for_messages
+                                .system
+                                .as_deref()
+                                .map(|s| content_json("system", s))
+                                .as_deref(),
+                        );
+                        // span drops here → ends the span.
+                    }
+                    set_serving_provider(&serving_provider);
+                    if let Some(key) = &cache_key {
+                        store_cached(key, &resp);
+                    }
+                    if let Some(key) = &cassette_record_key {
+                        CASSETTE.with(|c| {
+                            if let Some(cass) = c.borrow_mut().as_mut() {
+                                cass.record_entry(crate::cassette::TapeEntry::from_response(
+                                    key, &resp,
+                                ));
+                            }
+                        });
+                    }
+                    // Fold this completion into the LEAF'S OWN captured accumulator frame —
+                    // the `Rc` snapshotted at yield time, not whatever scope is active when
+                    // the future lands (the poller runs outside the per-task install
+                    // boundary, so the thread-local may now hold a sibling's scope). Price
+                    // it the same way `track_usage` does — by the serving provider — then
+                    // suppress `track_usage`'s own active-frame fold so this completion is
+                    // counted exactly once.
+                    if let Some(slot) = &usage_accum_slot {
+                        let cost = pricing::calculate_cost_for(&serving_provider, &resp.usage);
+                        accumulate_into(slot, &resp.usage, cost);
+                    }
+                    // Account on the VM thread, then shape the value. A budget overrun
+                    // fails the task, exactly as the sync path's `?`. Install THIS
+                    // completion's captured budget frame as active around `track_usage` so
+                    // the charge + limit check land on the dispatch-time frame (shared by
+                    // `Rc` across the fan-out), then restore whatever was active.
+                    let track_result = {
+                        let prev_budget = ACTIVE_BUDGET
+                            .with(|b| std::mem::replace(&mut *b.borrow_mut(), budget_slot.clone()));
+                        let r = USAGE_ACCUM_SUPPRESS.with(|s| {
+                            s.set(true);
+                            let r = track_usage(&resp.usage);
+                            s.set(false);
+                            r
+                        });
+                        ACTIVE_BUDGET.with(|b| *b.borrow_mut() = prev_budget);
                         r
-                    });
-                    ACTIVE_BUDGET.with(|b| *b.borrow_mut() = prev_budget);
-                    r
-                };
-                if let Err(e) = track_result {
-                    return sema_core::IoPoll::Ready(Err(e.to_string()));
+                    };
+                    if let Err(e) = track_result {
+                        return sema_core::IoPoll::Ready(Err(e.to_string()));
+                    }
+                    let finalize = finalize_slot.take().expect("finalize used once");
+                    match finalize(resp) {
+                        Ok(value) => sema_core::IoPoll::Ready(Ok(value)),
+                        Err(e) => sema_core::IoPoll::Ready(Err(e.to_string())),
+                    }
                 }
-                let finalize = finalize_slot.take().expect("finalize used once");
-                match finalize(resp) {
-                    Ok(value) => sema_core::IoPoll::Ready(Ok(value)),
-                    Err(e) => sema_core::IoPoll::Ready(Err(e.to_string())),
+                Ok(Err(e)) => {
+                    if let Some(span) = span_slot.take() {
+                        span.record_error(llm_error_kind(&e), &e.to_string());
+                    }
+                    sema_core::IoPoll::Ready(Err(e.to_string()))
+                }
+                Err(TryRecvError::Closed) => {
+                    span_slot.take();
+                    sema_core::IoPoll::Ready(Err("complete: io worker dropped".to_string()))
                 }
             }
-            Ok(Err(e)) => {
-                if let Some(span) = span_slot.take() {
-                    span.record_error(llm_error_kind(&e), &e.to_string());
-                }
-                sema_core::IoPoll::Ready(Err(e.to_string()))
-            }
-            Err(TryRecvError::Closed) => {
-                span_slot.take();
-                sema_core::IoPoll::Ready(Err("complete: io worker dropped".to_string()))
-            }
-        }
-    }));
+        },
+        abort,
+    ));
     sema_core::set_yield_signal(sema_core::YieldReason::AwaitIo(handle));
     Ok(Value::nil())
 }
@@ -6779,9 +6813,9 @@ fn retryable_wait(err: &crate::types::LlmError) -> Option<u64> {
 
 /// Capped exponential backoff with full jitter. A positive server hint wins.
 /// `base_ms` is the configured retry-backoff base, passed in explicitly (NOT read
-/// from the `RETRY_BASE_MS` thread-local here) so the async wire stage — which runs
-/// on a `spawn_blocking` worker thread that has its own TLS copy — honors the base
-/// the VM thread configured (incl. the `set_retry_base_ms(0)` test hook). The VM
+/// from the `RETRY_BASE_MS` thread-local here) so the async wire stage — which
+/// runs on pool worker threads with their own TLS copies — honors the base the
+/// VM thread configured (incl. the `set_retry_base_ms(0)` test hook). The VM
 /// thread captures the TL value and threads it down.
 fn retry_backoff_ms(attempt: u32, server_hint: u64, base_ms: u64) -> u64 {
     const CAP_MS: u64 = 30_000;
@@ -6821,10 +6855,10 @@ struct RetryEvent {
 
 /// Run `provider.complete` with retry on transient errors (429 / 5xx / network),
 /// using capped exponential backoff with jitter (429 honors `retry-after`),
-/// COLLECTING each retry as a [`RetryEvent`] rather than emitting otel spans. The
-/// backoff `std::thread::sleep` runs on whatever thread calls this — fine on the
-/// synchronous VM thread (provider `block_on` already returned) and on the
-/// `spawn_blocking` worker for the async path. Touches NO thread-locals.
+/// COLLECTING each retry as a [`RetryEvent`] rather than emitting otel spans.
+/// Synchronous-path loop (the VM thread; provider `block_on` already returned
+/// before the backoff `thread::sleep`); the async wire stage uses the twin
+/// [`complete_with_retry_collecting_async`]. Touches NO thread-locals.
 fn complete_with_retry_collecting(
     provider: &dyn LlmProvider,
     request: &ChatRequest,
@@ -6905,14 +6939,76 @@ struct CompleteOutcome {
     retry_events: Vec<RetryEvent>,
 }
 
-/// The OFFLOADABLE wire unit for a completion: walk the resolved fallback chain,
-/// calling each provider's SYNC `complete()` (via `complete_with_retry_collecting`,
-/// preserving DROP_TEMPERATURE self-heal + network retry), failing over on error.
-/// Does NO thread-local access — no cassette, cache, spans, `track_usage`, or
-/// `set_serving_provider` (those all stay on the VM thread, in the poller). Backoff
-/// sleeps run here, on the worker thread.
+/// One completion attempt for the async wire stage. Providers with a native
+/// async path (`complete_future`) are awaited in-place inside the spawned pool
+/// future — aborting the task drops the in-flight request (TRUE cancellation,
+/// connection torn down). Sync-only providers (the `complete_future` default —
+/// e.g. the FakeProvider test double) fall back to an admission-controlled
+/// blocking offload, where cancellation stays best-effort (result discarded,
+/// call runs to completion on the worker).
 #[cfg(not(target_arch = "wasm32"))]
-fn run_fallback_retry(
+async fn complete_once_async(
+    provider: &std::sync::Arc<dyn LlmProvider>,
+    request: &ChatRequest,
+) -> Result<ChatResponse, crate::types::LlmError> {
+    match provider.complete_future(request.clone()) {
+        Some(fut) => fut.await,
+        None => {
+            let p = provider.clone();
+            let req = request.clone();
+            sema_io::io_offload_blocking(move || p.complete(req)).await
+        }
+    }
+}
+
+/// Async twin of [`complete_with_retry_collecting`] for the spawned wire stage:
+/// same retry policy (429/5xx/network retryable with capped exponential
+/// backoff + full jitter, 429 honors `retry-after`, 4xx-non-429 fail fast) and
+/// the same collected [`RetryEvent`]s, but each attempt goes through
+/// [`complete_once_async`] and the backoff is a `tokio::time::sleep` — so an
+/// abort during either the attempt or the backoff drops the future instead of
+/// stranding a blocking worker. Touches NO thread-locals.
+#[cfg(not(target_arch = "wasm32"))]
+async fn complete_with_retry_collecting_async(
+    provider: &std::sync::Arc<dyn LlmProvider>,
+    request: &ChatRequest,
+    max_retries: u32,
+    base_ms: u64,
+) -> Result<(ChatResponse, Vec<RetryEvent>), crate::types::LlmError> {
+    let mut attempt = 0u32;
+    let mut events = Vec::new();
+    loop {
+        match complete_once_async(provider, request).await {
+            Ok(resp) => return Ok((resp, events)),
+            Err(e) => match retryable_wait(&e) {
+                Some(hint) if attempt < max_retries => {
+                    let wait = retry_backoff_ms(attempt, hint, base_ms);
+                    events.push(RetryEvent {
+                        attempt: attempt + 1,
+                        kind: llm_error_kind(&e),
+                        msg: e.to_string(),
+                        wait_ms: wait,
+                    });
+                    if wait > 0 {
+                        tokio::time::sleep(std::time::Duration::from_millis(wait)).await;
+                    }
+                    attempt += 1;
+                }
+                _ => return Err(e),
+            },
+        }
+    }
+}
+
+/// The OFFLOADED wire unit for an async completion: walk the resolved fallback
+/// chain (via [`complete_with_retry_collecting_async`], preserving
+/// DROP_TEMPERATURE self-heal + network retry), failing over on error. Does NO
+/// thread-local access — no cassette, cache, spans, `track_usage`, or
+/// `set_serving_provider` (those all stay on the VM thread, in the poller).
+/// Runs inside an `io_spawn`ed pool future, so the scheduler's abort hook
+/// cancels it mid-flight.
+#[cfg(not(target_arch = "wasm32"))]
+async fn run_fallback_retry_async(
     chain: Vec<ResolvedProvider>,
     request: ChatRequest,
     max_retries: u32,
@@ -6928,7 +7024,9 @@ fn run_fallback_retry(
         } else if req.model.is_empty() {
             req.model = entry.provider.default_model().to_string();
         }
-        match complete_with_retry_collecting(&*entry.provider, &req, max_retries, base_ms) {
+        match complete_with_retry_collecting_async(&entry.provider, &req, max_retries, base_ms)
+            .await
+        {
             Ok((resp, retry_events)) => {
                 return Ok(CompleteOutcome {
                     resp,

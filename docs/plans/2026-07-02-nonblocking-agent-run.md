@@ -169,9 +169,14 @@ sub-agent-reentrancy test (a tool that itself calls `agent/run`).
   case; do not do async work inside `:on-text`.
 - **Synchronous CPU-bound tools between rounds block siblings** (no preemption of
   Sema code — the standing single-threaded limit).
-- **In-flight-round cancel is best-effort**: the `spawn_blocking` LLM tier has no
-  `AbortHandle`; a cancelled agent's current round completes on the worker and is
-  discarded. Cancellation is clean *at the parks between rounds*.
+- ~~In-flight-round cancel is best-effort~~ **CLOSED 2026-07-03**: the wire stage
+  is an `io_spawn`ed future (`run_fallback_retry_async` over per-provider
+  `complete_future` hooks) with a real `AbortHook` in `IoHandle::with_abort` — a
+  cancelled agent's current round is dropped mid-flight (connection torn down),
+  like the http/shell tier. Pinned by `llm_request_is_aborted_on_timeout`
+  (true_cancel_test.rs). Best-effort remains only for sync-only providers (the
+  `complete_future` default impl, e.g. FakeProvider), pinned by
+  `sync_only_provider_cancel_is_best_effort`.
 - ~~Cancelled agents leak their slab entry (and never-ended agent span) until
   `reset_runtime_state`~~ **CLOSED 2026-07-03**: the scheduler fires a
   `task-reaped` callback (`sema-core` seam) at every cancellation transition, and

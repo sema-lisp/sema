@@ -1,9 +1,44 @@
 # Notebook UI refactor — editor + markdown components (first slice of #69)
 
-**Status:** design / awaiting approval
+**Status:** implemented (first pass) & verified — awaiting review
 **Branch:** `feature/notebook-ui-refactor`
 **Tracks:** issue #69 (Migrate notebook UI primitives to `@sema/ui`)
 **Date:** 2026-07-03
+
+> ## Implementation status (as-built)
+>
+> All three components shipped and wired into the notebook. Detailed TDD plan:
+> `2026-07-03-notebook-ui-refactor-plan.md`.
+>
+> - **`sema-code-editor`** — transparent textarea + synchronous highlight overlay
+>   (`internal/sema-tokenize.ts`, ported from the playground) + ported `TextareaUndo`
+>   + autosize + Tab-to-spaces + `testid` forwarded onto the inner textarea. `focus()`
+>   delegate; native `input`/`change` stopped at the boundary and re-emitted as typed
+>   `CustomEvent`s.
+> - **`sema-markdown`** — `marked` + shared Shiki for fences (degrades per-fence) +
+>   allowlist sanitizer.
+> - **`sema-editable-markdown`** — edit-in-place; click→edit, blur/Shift+Enter/Escape→render.
+> - **Notebook** — code cells → `sema-code-editor`, markdown cells → `sema-editable-markdown`;
+>   regex renderer + `_rendered`/`editMarkdown`/`insertTab`/`autoResize` deleted; bundle
+>   vendored to `crates/sema-notebook/src/ui/vendor/sema-ui.js` via `make notebook-ui-vendor`.
+>
+> **Verification.** `@sema/ui`: 28 new tests green (lint + typecheck + build clean). Notebook:
+> `cargo test -p sema-notebook` (49) + clippy clean; headless demo eval OK. **Live browser
+> (chrome-devtools MCP, real end-to-end):** page renders; 10 code editors highlight (live
+> `tok-*`); 6 markdown cells render (marked → `<h1>`/`<strong>`); click-to-edit, Shift+Enter
+> render, Tab-to-spaces, and cell eval (`(* 6 7)`→`42`) all work; `cell-textarea` testid
+> resolves through the shadow root.
+>
+> **Not done / caveats.**
+> - **Playwright e2e not run here:** the browser binary download failed silently in this
+>   environment (revision mismatch, no proxy). *No e2e spec changes were needed* — the
+>   testid-forwarding keeps `cell-textarea`/`markdown-rendered` working; the suite should
+>   pass once the browser installs. Equivalent coverage was obtained via chrome-devtools MCP.
+> - Naive bundling: only `sema-ui.js` is vendored (499 KB); non-`sema` markdown fences
+>   render unhighlighted (grammar chunks not served). Slim entry = follow-up.
+> - Pre-existing unrelated failure: `ui/tests/tokens.test.ts` (hardcoded hex in
+>   `sema-code-typer.ts`) fails at the branch base — untouched here.
+> - Playground still uses its own inline editor (dogfood deferred).
 
 ## 1. Context
 

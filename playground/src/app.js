@@ -11,7 +11,6 @@ let interp = null;
 let workerActive = false;
 // True while a worker eval is in flight (so the Run button acts as Stop).
 let workerRunning = false;
-let activeBtn = null;
 let vfsHost = null;
 let vfsBackend = null;
 let backendName = 'memory';
@@ -52,90 +51,66 @@ if (savedFilesCollapsed) {
 
 // ── Example sidebar ──
 
-const collapsedCategories = new Set();
+// Flat lookup: example id -> { id, name, code }.
+const examplesById = new Map();
+for (const cat of examples) for (const f of cat.files) examplesById.set(f.id, f);
 
+function loadExample(file) {
+  editorEl.value = file.code;
+  editorEl.resetHistory();
+  scheduleHighlight();
+  saveState({ lastExampleId: file.id, editorContent: file.code });
+}
+
+// Examples sidebar — dogfoods <sema-tree>: categories are expandable items, files
+// are selectable leaves. sema-tree owns expand/collapse, keyboard nav, and ARIA.
 function buildSidebar() {
   const tree = document.getElementById('sidebar-tree');
   const saved = loadState();
   const savedCollapsed = saved.collapsed || [];
 
   for (const cat of examples) {
-    const catDiv = document.createElement('div');
-
-    const header = document.createElement('div');
-    header.className = 'tree-category';
-    const chevron = document.createElement('span');
-    chevron.className = 'tree-chevron';
-    header.appendChild(chevron);
-    header.appendChild(document.createTextNode(cat.category));
-
-    const items = document.createElement('div');
-    items.className = 'tree-items';
-
-    // Determine initial collapsed state
-    const isGettingStarted = cat.category === 'Getting Started';
-    let collapsed;
-    if (savedCollapsed.length > 0) {
-      collapsed = savedCollapsed.includes(cat.category);
-    } else {
-      collapsed = !isGettingStarted;
-    }
-
-    if (collapsed) {
-      items.classList.add('collapsed');
-      collapsedCategories.add(cat.category);
-    }
-    chevron.textContent = collapsed ? '▸' : '▾';
-
-    header.onclick = () => {
-      items.classList.toggle('collapsed');
-      const nowCollapsed = items.classList.contains('collapsed');
-      chevron.textContent = nowCollapsed ? '▸' : '▾';
-      if (nowCollapsed) collapsedCategories.add(cat.category);
-      else collapsedCategories.delete(cat.category);
-      saveState({ collapsed: [...collapsedCategories] });
-    };
+    const catItem = document.createElement('sema-tree-item');
+    catItem.setAttribute('label', cat.category);
+    catItem.setAttribute('has-children', '');
+    const collapsed = savedCollapsed.length > 0
+      ? savedCollapsed.includes(cat.category)
+      : cat.category !== 'Getting Started';
+    if (!collapsed) catItem.setAttribute('expanded', '');
 
     for (const file of cat.files) {
-      const btn = document.createElement('button');
-      btn.className = 'tree-file';
-      btn.textContent = file.name;
-      btn.dataset.exampleId = file.id;
-      btn.onclick = () => {
-        editorEl.value = file.code;
-        if (activeBtn) activeBtn.classList.remove('active');
-        btn.classList.add('active');
-        activeBtn = btn;
-        saveState({ lastExampleId: file.id, editorContent: file.code });
-        editorEl.resetHistory();
-        scheduleHighlight();
-      };
-      items.appendChild(btn);
+      const fileItem = document.createElement('sema-tree-item');
+      fileItem.setAttribute('label', file.name);
+      fileItem.dataset.exampleId = file.id;
+      catItem.appendChild(fileItem);
     }
-
-    catDiv.appendChild(header);
-    catDiv.appendChild(items);
-    tree.appendChild(catDiv);
+    tree.appendChild(catItem);
   }
+
+  // Every click emits sema-tree-select (a category toggles expand first), so one
+  // handler both loads a picked file and persists which categories are collapsed.
+  tree.addEventListener('sema-tree-select', (e) => {
+    const el = e.detail.element;
+    const collapsed = [...tree.querySelectorAll('sema-tree-item[has-children]')]
+      .filter((it) => !it.expanded)
+      .map((it) => it.getAttribute('label'));
+    saveState({ collapsed });
+
+    const id = el?.dataset?.exampleId;
+    if (id && examplesById.has(id)) {
+      tree.querySelectorAll('sema-tree-item').forEach((it) => { it.selected = it === el; });
+      loadExample(examplesById.get(id));
+    }
+  });
 
   // Restore last selected example or editor content
-  if (saved.editorContent) {
-    editorEl.value = saved.editorContent;
-  }
+  if (saved.editorContent) editorEl.value = saved.editorContent;
   if (saved.lastExampleId) {
-    const btn = tree.querySelector(`[data-example-id="${CSS.escape(saved.lastExampleId)}"]`);
-    if (btn) {
-      btn.classList.add('active');
-      activeBtn = btn;
-      // Expand the parent category if collapsed
-      const items = btn.closest('.tree-items');
-      if (items && items.classList.contains('collapsed')) {
-        items.classList.remove('collapsed');
-        const chevron = items.previousElementSibling?.querySelector('.tree-chevron');
-        if (chevron) chevron.textContent = '▾';
-        const catName = items.previousElementSibling?.textContent?.trim();
-        if (catName) collapsedCategories.delete(catName);
-      }
+    const fileItem = tree.querySelector(`sema-tree-item[data-example-id="${CSS.escape(saved.lastExampleId)}"]`);
+    if (fileItem) {
+      fileItem.selected = true;
+      const parent = fileItem.parentElement; // the category <sema-tree-item>
+      if (parent && parent.tagName?.toLowerCase() === 'sema-tree-item') parent.setAttribute('expanded', '');
     }
   }
 }

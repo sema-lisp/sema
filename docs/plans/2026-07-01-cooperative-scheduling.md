@@ -57,16 +57,17 @@ The one primitive everything builds on:
 - **Blocking leaves converted**, gated on `in_async_context()` (sync path
   byte-identical): `http/*`, `shell`/subprocess, `llm/embed`.
 - **Bounded fan-out** `async/pool-map` (semaphore = capacity-N channel).
-- **Concurrent `llm/complete` / `classify` / `extract`** via
-  `spawn_blocking(run_fallback_retry)` — reuses the sync `provider.complete` path
-  so retry / `DROP_TEMPERATURE` self-heal / serving-provider all carry with zero
+- **Concurrent `llm/complete` / `classify` / `extract`** via an `io_spawn`ed
+  `run_fallback_retry_async` over per-provider `complete_future` hooks — same
+  retry / `DROP_TEMPERATURE` self-heal / serving-provider semantics with zero
   drift. `do_complete_async_yield` (`sema-llm/src/builtins.rs`) is the reusable
   single-completion-with-yield.
 - **Per-task OTel** context swap on task-switch + detached span carried in the
   `IoHandle` poller (so concurrent LLM spans don't cross-contaminate).
-- **True cancellation seam** on `IoHandle`: real socket/`killpg` abort for the
-  `spawn`-based `http`/`shell`; best-effort + round-cutoff for the
-  `spawn_blocking` LLM tier.
+- **True cancellation seam** on `IoHandle`: real abort for all `spawn`-based
+  offloads — socket for `http`, `killpg` for `shell`, dropped in-flight request
+  for the LLM wire stage; best-effort only for sync-only providers on the
+  blocking-tier fallback (`complete_future` default impl).
 - **Cooperative debugging**: breakpoints + stepping inside async tasks, task-correct
   stack/scope inspection and step-depth, through the scheduler (native DAP + WASM).
 
@@ -156,8 +157,10 @@ path for animation (which needs only `async/spawn` + `async/sleep`).
   blocking** scheduler until it settles — the caller's frame does not interleave
   during it (only *other* spawned tasks do). On the synchronous path
   (`run_nested_closure`) a yield is a hard error.
-- **Cancellation is tiered:** deterministic for `spawn`-based `shell`/`http`
-  (real abort); best-effort + round-cutoff for the `spawn_blocking` LLM tier.
+- **Cancellation is tiered:** deterministic (real abort) for every `spawn`-based
+  offload — `shell`, `http`, and the LLM wire stage; best-effort only where work
+  bottoms out in a blocking closure (sync-only providers via the
+  `complete_future` default impl).
 
 ## 5. Roadmap (folds the sub-plans' open items)
 

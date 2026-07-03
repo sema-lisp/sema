@@ -200,3 +200,17 @@ offloads); depth-1 headroom assumes no future block_on'd future needs >1 blockin
 slot; pre-existing probe-f panic class (Sema callbacks inside a block_on'd poll
 calling sync I/O) unchanged; always-live pool alters idle-thread footprint
 (intended); server.rs step has its escape hatch.
+
+**Follow-up landed (LLM-tier cancellation):** the "spawn_blocking LLM tier is
+best-effort-cancel" limit is closed for the native providers. The completion/embed
+wire stage moved from `io_spawn_blocking(sync closure)` to an `io_spawn`ed future
+(`run_fallback_retry_async` over per-provider `complete_future`/`embed_future`
+hooks) whose `AbortHook` slots into `IoHandle::with_abort` — cancel/timeout drops
+the in-flight request like the http/shell tier (gate:
+`llm_request_is_aborted_on_timeout` in `true_cancel_test.rs`). Consequence for the
+admission story: spawned wire futures take NO offload permit (they pin no blocking
+slot while suspended); the semaphore still guards the remaining blocking-tier
+users — `io_spawn_blocking` and the new awaitable `io_offload_blocking`, which is
+where sync-only providers (the `complete_future` default impl, e.g. FakeProvider)
+run and where cancellation remains best-effort (result discarded, closure runs
+out; gate: `sync_only_provider_cancel_is_best_effort`).

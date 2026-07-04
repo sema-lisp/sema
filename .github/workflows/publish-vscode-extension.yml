@@ -1,0 +1,96 @@
+name: Publish Sema VS Code Extension
+
+on:
+  push:
+    tags:
+      - "vscode-ext-v*"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Dry run (package only, skip publish)"
+        type: boolean
+        default: false
+      pre_release:
+        description: "Publish as pre-release"
+        type: boolean
+        default: false
+
+jobs:
+  publish:
+    name: Package and publish
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: editors/vscode/sema
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Extract version from tag
+        id: version
+        if: github.event_name == 'push'
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          # Strip the "vscode-ext-v" prefix to get semver (e.g. 1.2.3)
+          VERSION="${TAG#vscode-ext-v}"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Sync package.json version with tag
+        if: github.event_name == 'push'
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          npm pkg set version="$VERSION"
+          echo "Set extension version to $VERSION"
+
+      - name: Package extension (.vsix)
+        run: npx --yes @vscode/vsce package --no-git-tag-version --out sema.vsix
+
+      - name: Upload .vsix artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sema-${{ steps.version.outputs.version || 'manual' }}.vsix
+          path: editors/vscode/sema/sema.vsix
+          retention-days: 30
+
+      - name: Publish to VS Marketplace
+        if: ${{ !inputs.dry_run }}
+        env:
+          VSCE_PAT: ${{ secrets.VSCE_PAT }}
+        run: |
+          ARGS=""
+          if [ "${{ inputs.pre_release }}" = "true" ]; then
+            ARGS="--pre-release"
+          fi
+          npx --yes @vscode/vsce publish $ARGS --packagePath sema.vsix
+
+      - name: Publish to Open VSX Registry
+        if: ${{ !inputs.dry_run }}
+        env:
+          OVSX_PAT: ${{ secrets.OVSX_PAT }}
+        run: |
+          ARGS=""
+          if [ "${{ inputs.pre_release }}" = "true" ]; then
+            ARGS="--pre-release"
+          fi
+          npx --yes ovsx publish sema.vsix $ARGS -p "$OVSX_PAT"
+
+      - name: Create GitHub Release
+        if: ${{ github.event_name == 'push' && !inputs.dry_run }}
+        uses: softprops/action-gh-release@v2
+        with:
+          name: "Sema VS Code Extension v${{ steps.version.outputs.version }}"
+          tag_name: ${{ steps.version.outputs.tag }}
+          generate_release_notes: true
+          files: editors/vscode/sema/sema.vsix
+          draft: false
+          prerelease: ${{ inputs.pre_release == 'true' }}

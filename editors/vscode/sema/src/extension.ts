@@ -1,6 +1,7 @@
 import * as vscode from 'vscode';
 import * as path from 'path';
 import { LanguageClient, LanguageClientOptions, ServerOptions } from 'vscode-languageclient/node';
+import { registerNotebookEditor, disposeAllNotebookServers } from './notebook';
 
 let client: LanguageClient | undefined;
 
@@ -101,8 +102,21 @@ export async function activate(context: vscode.ExtensionContext) {
             }
         })
     );
+
+    // Debugging: the `sema dap` subcommand is a stdio DAP server. Register a
+    // factory that launches it; it shares the `sema.path` binary with the LSP.
+    context.subscriptions.push(
+        vscode.debug.registerDebugAdapterDescriptorFactory('sema', {
+            createDebugAdapterDescriptor: () => new vscode.DebugAdapterExecutable(semaPath, ['dap']),
+        })
+    );
+
+    // Notebooks: opening a .sema-nb file shows the notebook web UI (served by
+    // `sema notebook serve`) embedded in the editor pane.
+    registerNotebookEditor(context, outputChannel);
 }
 
 export function deactivate(): Thenable<void> | undefined {
+    disposeAllNotebookServers();
     return client?.stop();
 }

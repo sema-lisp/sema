@@ -5,21 +5,24 @@
   "version": "0.1.0",
   "publisher": "helgesverre",
   "author": {
-    "name": "Helge Sverre"
+    "name": "Helge Sverre",
+    "email": "helge.sverre@gmail.com"
   },
   "license": "MIT",
   "icon": "icon.png",
   "main": "./out/extension.js",
   "activationEvents": [
-    "onLanguage:sema"
+    "onLanguage:sema",
+    "onCustomEditor:sema.notebook",
+    "onDebugResolve:sema"
   ],
   "homepage": "https://sema-lang.com",
   "bugs": {
-    "url": "https://github.com/helgesverre/sema/issues"
+    "url": "https://github.com/HelgeSverre/sema/issues"
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/helgesverre/sema"
+    "url": "https://github.com/HelgeSverre/sema"
   },
   "engines": {
     "vscode": "^1.75.0"
@@ -51,7 +54,24 @@
         "extensions": [
           ".sema"
         ],
-        "configuration": "./language-configuration.json"
+        "configuration": "./language-configuration.json",
+        "icon": {
+          "light": "./icons/sema-file-light.svg",
+          "dark": "./icons/sema-file-dark.svg"
+        }
+      },
+      {
+        "id": "sema-notebook",
+        "aliases": [
+          "Sema Notebook"
+        ],
+        "extensions": [
+          ".sema-nb"
+        ],
+        "icon": {
+          "light": "./icons/sema-notebook-light.svg",
+          "dark": "./icons/sema-notebook-dark.svg"
+        }
       }
     ],
     "grammars": [
@@ -76,7 +96,69 @@
           "description": "Path to the sema binary"
         }
       }
-    }
+    },
+    "customEditors": [
+      {
+        "viewType": "sema.notebook",
+        "displayName": "Sema Notebook",
+        "selector": [
+          {
+            "filenamePattern": "*.sema-nb"
+          }
+        ],
+        "priority": "default"
+      }
+    ],
+    "debuggers": [
+      {
+        "type": "sema",
+        "label": "Sema",
+        "languages": [
+          "sema"
+        ],
+        "configurationAttributes": {
+          "launch": {
+            "required": [
+              "program"
+            ],
+            "properties": {
+              "program": {
+                "type": "string",
+                "description": "Absolute path to the .sema file to debug.",
+                "default": "${file}"
+              },
+              "stopOnEntry": {
+                "type": "boolean",
+                "description": "Break on the first line of the program.",
+                "default": false
+              }
+            }
+          }
+        },
+        "initialConfigurations": [
+          {
+            "type": "sema",
+            "request": "launch",
+            "name": "Debug Sema Program",
+            "program": "${file}",
+            "stopOnEntry": false
+          }
+        ],
+        "configurationSnippets": [
+          {
+            "label": "Sema: Debug Program",
+            "description": "Debug the current Sema program with the sema DAP server.",
+            "body": {
+              "type": "sema",
+              "request": "launch",
+              "name": "Debug Sema Program",
+              "program": "^\"\\${file}\"",
+              "stopOnEntry": false
+            }
+          }
+        ]
+      }
+    ]
   },
   "dependencies": {
     "vscode-languageclient": "^9.0.1"

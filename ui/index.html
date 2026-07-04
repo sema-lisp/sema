@@ -7,26 +7,26 @@
 <link rel="stylesheet" href="./demo.css">
 <style>
   /* Page wrapper — was .demo-container (demo.css); now <sema-container size="md"> dogfood.
-     sema-container is inline-axis only, so the old 2rem block padding stays in page CSS. */
-  .demo-shell { padding-block: 2rem; }
+     sema-container is inline-axis only, so the old 32px block padding stays in page CSS. */
+  .demo-shell { padding-block: 32px; }
 
   /* Layout section scaffolding — demo-page styles only, not part of @sema/ui */
   .demo-resize {
     max-width: 100%;
-    padding: 0.75rem;
+    padding: 12px;
     border: 1px dashed var(--border);
     border-radius: 4px;
     resize: horizontal;
     overflow: auto;
   }
-  .demo-resize > * + * { margin-block-start: 0.5rem; }
+  .demo-resize > * + * { margin-block-start: 8px; }
   .demo-box {
-    padding: 0.75rem;
+    padding: 12px;
     background: var(--bg-elevated);
     border: 1px solid var(--border);
     border-radius: 4px;
     font-family: var(--mono);
-    font-size: 0.65rem;
+    font-size: 10px;
     color: var(--text-tertiary);
   }
   .demo-trace { outline: 1px dashed var(--gold-dim); }
@@ -135,7 +135,7 @@
 
     <div class="demo-row">
       <span class="demo-label">placement</span>
-      <div class="demo-cell" style="gap:2rem;">
+      <div class="demo-cell" style="gap:32px;">
         <sema-tooltip content="I appear above" placement="top">
           <sema-button variant="primary">top</sema-button>
         </sema-tooltip>
@@ -153,7 +153,7 @@
 
     <div class="demo-row">
       <span class="demo-label">on icon</span>
-      <div class="demo-cell" style="gap:1.5rem;">
+      <div class="demo-cell" style="gap:24px;">
         <sema-tooltip content="Run cell (Shift+Enter)" placement="top">
           <sema-button variant="icon" aria-label="Run cell">&#x25B6;</sema-button>
         </sema-tooltip>
@@ -193,7 +193,7 @@
 
     <!-- ═══════ TABS ═══════ -->
     <div class="demo-section-title">Tabs</div>
-    <div class="demo-tab-hint" style="margin-bottom:1.25rem;">
+    <div class="demo-tab-hint" style="margin-bottom:20px;">
       Boundary: <code style="font-family:var(--mono);color:var(--gold);">&lt;sema-toggle-group&gt;</code> picks a value (radiogroup — the app reacts to sema-change); <code style="font-family:var(--mono);color:var(--gold);">&lt;sema-tabs&gt;</code> switches which content panel is visible. Arrows select immediately by default (APG automatic activation); toggle-group arrows only move focus.
     </div>
 
@@ -204,9 +204,9 @@
           <sema-tab value="readme">Readme</sema-tab>
           <sema-tab value="versions">Versions <span style="color:var(--text-tertiary);">12</span></sema-tab>
           <sema-tab value="deps" disabled>Dependencies</sema-tab>
-          <sema-tab-panel value="readme"><p style="font-family:var(--mono);font-size:0.72rem;color:var(--text-secondary);margin:0;">A Lisp for the LLM era. Keyboard: ←/→ wrap (skipping the disabled tab), Home/End jump.</p></sema-tab-panel>
-          <sema-tab-panel value="versions"><p style="font-family:var(--mono);font-size:0.72rem;color:var(--text-secondary);margin:0;">0.6.0 · 0.5.2 · 0.5.1 · 0.5.0 — twelve releases.</p></sema-tab-panel>
-          <sema-tab-panel value="deps"><p style="font-family:var(--mono);font-size:0.72rem;color:var(--text-secondary);margin:0;">unreachable while disabled</p></sema-tab-panel>
+          <sema-tab-panel value="readme"><p style="font-family:var(--mono);font-size:12px;color:var(--text-secondary);margin:0;">A Lisp for the LLM era. Keyboard: ←/→ wrap (skipping the disabled tab), Home/End jump.</p></sema-tab-panel>
+          <sema-tab-panel value="versions"><p style="font-family:var(--mono);font-size:12px;color:var(--text-secondary);margin:0;">0.6.0 · 0.5.2 · 0.5.1 · 0.5.0 — twelve releases.</p></sema-tab-panel>
+          <sema-tab-panel value="deps"><p style="font-family:var(--mono);font-size:12px;color:var(--text-secondary);margin:0;">unreachable while disabled</p></sema-tab-panel>
         </sema-tabs>
       </div>
     </div>
@@ -248,7 +248,7 @@
 
     <!-- ═══════ LAYOUT ═══════ -->
     <div class="demo-section-title">Layout</div>
-    <div class="demo-tab-hint" style="margin-bottom:1.25rem;">
+    <div class="demo-tab-hint" style="margin-bottom:20px;">
       Intrinsic layout primitives — this page's own wrapper is now a <code style="font-family:var(--mono);color:var(--gold);">&lt;sema-container size="md"&gt;</code>. The dashed boxes below are resizable: drag the corner handle (or resize the window) to watch columns reflow and panes stack — no viewport breakpoints anywhere.
     </div>
 
@@ -277,7 +277,7 @@
       <span class="demo-label">container custom max</span>
       <div class="demo-cell" style="align-items:flex-start;">
         <div class="demo-resize" style="width:780px;">
-          <sema-container class="demo-trace" style="--sema-container-max: 24rem;"><div class="demo-box">--sema-container-max: 24rem &middot; raw-length escape hatch &middot; still centered — resize me</div></sema-container>
+          <sema-container class="demo-trace" style="--sema-container-max: 384px;"><div class="demo-box">--sema-container-max: 384px &middot; raw-length escape hatch &middot; still centered — resize me</div></sema-container>
         </div>
       </div>
     </div>
@@ -315,17 +315,17 @@
       <span class="demo-label">composed</span>
       <div class="demo-cell" style="align-items:flex-start;">
         <div class="demo-resize" style="width:780px;">
-          <sema-sidebar side-width="13rem" gap="lg">
+          <sema-sidebar side-width="208px" gap="lg">
             <nav slot="aside" class="demo-box" aria-label="Composed demo">
               nav &middot; aside slot
-              <sema-grid min="240px" gap="xs" style="margin-top:0.5rem;">
-                <div class="demo-box">a min="240px" grid in a 13rem aside — the min(&hellip;, 100%) clamp keeps it from overflowing</div>
+              <sema-grid min="240px" gap="xs" style="margin-top:8px;">
+                <div class="demo-box">a min="240px" grid in a 208px aside — the min(&hellip;, 100%) clamp keeps it from overflowing</div>
                 <div class="demo-box">nested grid</div>
               </sema-grid>
             </nav>
             <article class="demo-box">
               article &middot; default slot
-              <sema-grid min="160px" gap="sm" style="margin-top:0.5rem;">
+              <sema-grid min="160px" gap="sm" style="margin-top:8px;">
                 <div class="demo-box">card</div>
                 <div class="demo-box">card</div>
                 <div class="demo-box">card</div>
@@ -341,8 +341,8 @@
       <span class="demo-label">sidebar</span>
       <div class="demo-cell" style="align-items:flex-start;">
         <div class="demo-resize" style="width:720px;">
-          <sema-sidebar side-width="12rem">
-            <div slot="aside" class="demo-box">aside &middot; side-width="12rem"</div>
+          <sema-sidebar side-width="192px">
+            <div slot="aside" class="demo-box">aside &middot; side-width="192px"</div>
             <div class="demo-box">content — grows to fill the row; when it can't hold 50% of it (the content-min default) the panes wrap to a stack, intrinsically</div>
           </sema-sidebar>
         </div>
@@ -353,7 +353,7 @@
       <span class="demo-label">sidebar bordered</span>
       <div class="demo-cell" style="align-items:flex-start;">
         <div class="demo-resize" style="width:720px;">
-          <sema-sidebar gap="none" side-width="12rem" style="border:1px solid var(--border);border-radius:4px;background:var(--bg-elevated);">
+          <sema-sidebar gap="none" side-width="192px" style="border:1px solid var(--border);border-radius:4px;background:var(--bg-elevated);">
             <div slot="aside" class="demo-box" style="background:none;border:0;border-radius:0;border-inline-end:1px solid var(--border);">gap="none"</div>
             <div class="demo-box" style="background:none;border:0;border-radius:0;">border-separated panes — the divider is page CSS on the aside, not a component style</div>
           </sema-sidebar>
@@ -372,9 +372,9 @@
       <span class="demo-label">horizontal</span>
       <div class="demo-cell">
         <div id="splitter-demo" style="display:flex;width:400px;height:100px;background:var(--bg-elevated);border:1px solid var(--border);border-radius:4px;overflow:hidden;">
-          <div id="splitter-left" style="width:200px;display:flex;align-items:center;justify-content:center;font-family:var(--mono);font-size:0.65rem;color:var(--text-tertiary);flex-shrink:0;">Panel A</div>
+          <div id="splitter-left" style="width:200px;display:flex;align-items:center;justify-content:center;font-family:var(--mono);font-size:10px;color:var(--text-tertiary);flex-shrink:0;">Panel A</div>
           <sema-splitter id="demo-splitter" direction="horizontal" min="60" max="300"></sema-splitter>
-          <div id="splitter-right" style="flex:1;display:flex;align-items:center;justify-content:center;font-family:var(--mono);font-size:0.65rem;color:var(--text-tertiary);">Panel B</div>
+          <div id="splitter-right" style="flex:1;display:flex;align-items:center;justify-content:center;font-family:var(--mono);font-size:10px;color:var(--text-tertiary);">Panel B</div>
         </div>
       </div>
     </div>
@@ -383,9 +383,9 @@
       <span class="demo-label">vertical</span>
       <div class="demo-cell">
         <div style="display:flex;flex-direction:column;width:300px;height:120px;background:var(--bg-elevated);border:1px solid var(--border);border-radius:4px;overflow:hidden;">
-          <div id="splitter-top" style="height:60px;display:flex;align-items:center;justify-content:center;font-family:var(--mono);font-size:0.65rem;color:var(--text-tertiary);flex-shrink:0;">Output</div>
+          <div id="splitter-top" style="height:60px;display:flex;align-items:center;justify-content:center;font-family:var(--mono);font-size:10px;color:var(--text-tertiary);flex-shrink:0;">Output</div>
           <sema-splitter id="demo-splitter-v" direction="vertical" min="30" max="90"></sema-splitter>
-          <div style="flex:1;display:flex;align-items:center;justify-content:center;font-family:var(--mono);font-size:0.65rem;color:var(--text-tertiary);">Files</div>
+          <div style="flex:1;display:flex;align-items:center;justify-content:center;font-family:var(--mono);font-size:10px;color:var(--text-tertiary);">Files</div>
         </div>
       </div>
     </div>
@@ -443,7 +443,7 @@
     <div class="demo-row">
       <span class="demo-label">categories</span>
       <div class="demo-cell" style="align-items:flex-start;">
-        <div style="width:240px;background:var(--bg-elevated);border:1px solid var(--border);border-radius:4px;padding:0.5rem 0;">
+        <div style="width:240px;background:var(--bg-elevated);border:1px solid var(--border);border-radius:4px;padding:8px 0;">
           <sema-tree id="demo-tree">
             <sema-tree-item label="getting-started" expanded has-children>
               <sema-tree-item label="hello.sema"></sema-tree-item>
@@ -524,7 +524,7 @@
 
     <!-- ═══════ EDITOR ═══════ -->
     <div class="demo-section-title">Editor</div>
-    <div class="demo-tab-hint" style="margin-bottom:1.25rem;">
+    <div class="demo-tab-hint" style="margin-bottom:20px;">
       <code style="font-family:var(--mono);color:var(--gold);">&lt;sema-editor&gt;</code> — the one editable, syntax-highlighting code editor (notebook + playground share it).
       Same Shiki grammar as <code style="font-family:var(--mono);color:var(--gold);">&lt;sema-code&gt;</code>, plus an extensible gutter: line numbers, breakpoints, and a current/debug line.
     </div>
@@ -538,9 +538,9 @@
 
     <div class="demo-row">
       <span class="demo-label">gutter · breakpoints · current line</span>
-      <div class="demo-cell" style="align-items:flex-start;flex-direction:column;gap:0.4rem;">
+      <div class="demo-cell" style="align-items:flex-start;flex-direction:column;gap:6px;">
         <sema-editor id="ed-debug" line-numbers current-line="3" style="height:180px;width:440px;"></sema-editor>
-        <span style="font-size:0.78rem;color:var(--text-tertiary);">Click a line number to toggle a breakpoint — fires the <code style="font-family:var(--mono);color:var(--gold);">gutter-click</code> event.</span>
+        <span style="font-size:12px;color:var(--text-tertiary);">Click a line number to toggle a breakpoint — fires the <code style="font-family:var(--mono);color:var(--gold);">gutter-click</code> event.</span>
       </div>
     </div>
 
@@ -560,7 +560,7 @@
 
     <!-- ═══════ MARKDOWN ═══════ -->
     <div class="demo-section-title">Markdown</div>
-    <div class="demo-tab-hint" style="margin-bottom:1.25rem;">
+    <div class="demo-tab-hint" style="margin-bottom:20px;">
       <code style="font-family:var(--mono);color:var(--gold);">&lt;sema-markdown&gt;</code> — read-only Markdown rendering (marked + shared Shiki for fenced code).
       Consumers pair it with <code style="font-family:var(--mono);color:var(--gold);">&lt;sema-editor&gt;</code> to switch between editing and preview.
     </div>
@@ -575,7 +575,7 @@
     <div class="demo-section-title">Badge · Spinner · Kbd · Pagination</div>
     <div class="demo-row">
       <span class="demo-label">badge</span>
-      <div class="demo-cell" style="gap:0.5rem;flex-wrap:wrap;">
+      <div class="demo-cell" style="gap:8px;flex-wrap:wrap;">
         <sema-badge>neutral</sema-badge>
         <sema-badge variant="gold">gold</sema-badge>
         <sema-badge variant="success">success</sema-badge>
@@ -585,7 +585,7 @@
     </div>
     <div class="demo-row">
       <span class="demo-label">spinner</span>
-      <div class="demo-cell" style="gap:1.25rem;align-items:center;">
+      <div class="demo-cell" style="gap:20px;align-items:center;">
         <sema-spinner size="sm"></sema-spinner>
         <sema-spinner></sema-spinner>
         <sema-spinner size="lg"></sema-spinner>
@@ -593,7 +593,7 @@
     </div>
     <div class="demo-row">
       <span class="demo-label">kbd</span>
-      <div class="demo-cell" style="gap:0.5rem;">
+      <div class="demo-cell" style="gap:8px;">
         <sema-kbd keys="⌘ S"></sema-kbd>
         <sema-kbd keys="Shift Enter"></sema-kbd>
         <sema-kbd keys="Ctrl C"></sema-kbd>
@@ -620,7 +620,7 @@
 
     <!-- ═══════ TERMINAL (DOGFOOD: INSTALL & USAGE RECIPES) ═══════ -->
     <div class="demo-section-title">Terminal — Install &amp; Usage Recipes</div>
-    <div class="demo-tab-hint" style="margin-bottom:1.25rem;">
+    <div class="demo-tab-hint" style="margin-bottom:20px;">
       The website homepage install/usage UI and a few <code style="font-family:var(--mono);color:var(--gold);">cli.html</code> examples, rebuilt with <code style="font-family:var(--mono);color:var(--gold);">&lt;sema-terminal&gt;</code> — no website code imported.
     </div>
 
@@ -714,7 +714,7 @@
       <div class="demo-cell">
         <sema-popover placement="bottom-start">
           <sema-button slot="trigger" variant="pill">Filters</sema-button>
-          <div style="padding:0.5rem 0.75rem; font-family:var(--mono); font-size:0.75rem; color:var(--text-secondary); max-width:16rem;">Any element works as popover content — not just menus.</div>
+          <div style="padding:8px 12px; font-family:var(--mono); font-size:12px; color:var(--text-secondary); max-width:256px;">Any element works as popover content — not just menus.</div>
         </sema-popover>
       </div>
     </div>
@@ -775,7 +775,7 @@
 
     <div class="demo-row">
       <span class="demo-label">field</span>
-      <div class="demo-cell" style="align-items:flex-start; gap:1.5rem;">
+      <div class="demo-cell" style="align-items:flex-start; gap:24px;">
         <sema-field label="Package name" hint="Lowercase, hyphen-separated." style="width:240px;">
           <sema-input placeholder="http-helpers" name="name"></sema-input>
         </sema-field>
@@ -791,7 +791,7 @@
     <div class="demo-row">
       <span class="demo-label">vertical</span>
       <div class="demo-cell" style="align-items:flex-start;">
-        <sema-scroll-area style="max-height:8rem; width:240px; border:1px solid var(--border); border-radius:6px; padding:0.5rem 0.75rem; font-family:var(--mono); font-size:0.75rem; color:var(--text-secondary);">
+        <sema-scroll-area style="max-height:128px; width:240px; border:1px solid var(--border); border-radius:6px; padding:8px 12px; font-family:var(--mono); font-size:12px; color:var(--text-secondary);">
           map · filter · foldl · foldr · reduce · for-each · apply<br>car · cdr · cons · list · append · reverse · length<br>string/split · string/join · string/upper · string/trim<br>file/read · file/write · file/exists? · path/join<br>http/get · http/post · json/encode · json/decode<br>llm/complete · llm/chat · llm/extract · agent/run<br>vector-store/create · vector-store/search<br>math/random · abs · sin · cos · sqrt · floor · ceil
         </sema-scroll-area>
       </div>

@@ -59,8 +59,8 @@ task vscode-package: [editors/vscode/sema/sema.vsix]
 # both the VS Marketplace and the Open VSX registry, like the CI workflow.
 @group ext
 @desc "Publish the VS Code extension to VS Marketplace + Open VSX"
-@require VSCE_PAT OVSX_PAT
 task vscode-publish: [vscode-package]
+    : "${VSCE_PAT:?set VSCE_PAT (or add to .env)}" "${OVSX_PAT:?set OVSX_PAT (or add to .env)}"
     @confirm "Publish the VS Code extension to VS Marketplace and Open VSX?"
     @cd editors/vscode/sema
     npx --yes @vscode/vsce publish --packagePath sema.vsix
@@ -94,8 +94,8 @@ task intellij-verify:
 @group ext
 @desc "Publish the IntelliJ plugin to the JetBrains Marketplace"
 @needs java
-@require PUBLISH_TOKEN
 task intellij-publish: [intellij-build]
+    : "${PUBLISH_TOKEN:?set PUBLISH_TOKEN (or add to .env; see editors/intellij/RELEASING.md)}"
     @confirm "Publish the IntelliJ plugin to the JetBrains Marketplace?"
     @cd editors/intellij
     ./gradlew publishPlugin

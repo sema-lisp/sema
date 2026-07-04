@@ -7,11 +7,13 @@ suite = "all"
 # The bytecode VM is the sole evaluator; `bench` == the VM suite.
 @group bench
 @desc "Run the benchmark suite (params: suite runs warmup)"
+@needs hyperfine "brew install hyperfine"
 task bench suite="all" runs="10" warmup="3": [release]
     ./scripts/bench.sh --suite {{suite}} --runs {{runs}} --warmup {{warmup}}
 
 @group bench
 @desc "Run benchmarks and export a per-commit JSON snapshot"
+@needs hyperfine "brew install hyperfine"
 task bench-save suite="all" runs="10" warmup="3": [release]
     mkdir -p target/bench
     ./scripts/bench.sh --suite {{suite}} --runs {{runs}} --warmup {{warmup}} \
@@ -19,22 +21,26 @@ task bench-save suite="all" runs="10" warmup="3": [release]
 
 @group bench
 @desc "Benchmark the closure suite"
+@needs hyperfine "brew install hyperfine"
 task bench-closure runs="10" warmup="3": [release]
     ./scripts/bench.sh --suite closure --runs {{runs}} --warmup {{warmup}}
 
 @group bench
 @desc "Benchmark the numeric suite"
+@needs hyperfine "brew install hyperfine"
 task bench-numeric runs="10" warmup="3": [release]
     ./scripts/bench.sh --suite numeric --runs {{runs}} --warmup {{warmup}}
 
 @group bench
 @desc "Export a baseline snapshot for later comparison"
+@needs hyperfine "brew install hyperfine"
 task bench-baseline runs="10" warmup="3": [release]
     mkdir -p target/bench
     ./scripts/bench.sh --runs {{runs}} --warmup {{warmup}} --export target/bench/baseline.json
 
 @group bench
 @desc "Benchmark and compare against target/bench/baseline.json"
+@needs hyperfine "brew install hyperfine"
 task bench-compare runs="10" warmup="3": [release]
     mkdir -p target/bench
     ./scripts/bench.sh --runs {{runs}} --warmup {{warmup}} \

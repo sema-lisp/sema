@@ -57,16 +57,26 @@ task _vendor-runtime: [build]
 # Vendor the browser runtime the `sema web` dev server embeds. build.rs picks
 # these up (web_runtime cfg) and include_bytes! embeds them. Rebuild the sema
 # binary afterward to embed. Artifacts are gitignored (built, multi-MB).
-@group wasm
-@desc "Vendor the sema-web browser runtime into the sema crate assets"
-task web-runtime:
+# Incremental vendoring (file recipes). Deps are the inputs `_vendor-runtime`
+# does NOT rewrite — the WASM VM pkg (itself an incremental file recipe) plus
+# the JS package sources. The npm-built `dist/` is deliberately NOT a dep: the
+# recipe rebuilds it, so tracking it would re-trigger vendoring on every run.
+# One vendored file per dir is the recipe output; the shared copy list lives in
+# `_vendor-runtime` so it stays DRY.
+file crates/sema/src/web/assets/sema_wasm_bg.wasm: packages/sema-wasm/pkg/sema_wasm_bg.wasm packages/sema/src/**/* packages/sema-web/src/**/*
     jake wasm._vendor-runtime {{web_runtime_dir}}
+
+@group wasm
+@desc "Vendor the sema-web browser runtime into the sema crate assets (incremental)"
+task web-runtime: [crates/sema/src/web/assets/sema_wasm_bg.wasm]
     echo "Vendored web runtime -> {{web_runtime_dir}} (rebuild the sema binary to embed)"
+
+file examples/sema-web-app/dist/vendor/sema_wasm_bg.wasm: packages/sema-wasm/pkg/sema_wasm_bg.wasm packages/sema/src/**/* packages/sema-web/src/**/*
+    jake wasm._vendor-runtime {{example_dir}}/dist/vendor
 
 @group wasm
 @desc "Build the sema-web-example demo app (WASM + vendored runtime + app.vfs)"
-task sema-web-example-build:
-    jake wasm._vendor-runtime {{example_dir}}/dist/vendor
+task sema-web-example-build: [examples/sema-web-app/dist/vendor/sema_wasm_bg.wasm]
     cargo run -p sema-lang -- build --target web {{example_dir}}/app.sema -o {{example_dir}}/dist/app.vfs
     echo "Built {{example_dir}}/dist/app.vfs"
 

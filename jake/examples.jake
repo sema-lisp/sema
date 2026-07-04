@@ -51,6 +51,7 @@ task example-notebook-serve: [build]
 @group llm
 @desc "LIVE async/streaming provider stress (real spend, needs API keys)"
 task llm-stress: [release]
+    : "${ANTHROPIC_API_KEY:?set it (or add to .env)}" "${OPENAI_API_KEY:?set it (or add to .env)}" "${GEMINI_API_KEY:?set it (or add to .env)}"
     ./target/release/sema examples/llm/async-stress-live.sema
 
 @group llm

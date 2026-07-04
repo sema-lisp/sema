@@ -28,6 +28,10 @@
 @import "jake/editors.jake" as ed
 @import "jake/release.jake" as release
 
+# Load .env so LLM/provider tasks pick up API keys (ANTHROPIC_API_KEY, …)
+# without polluting the shell. No-op when there's no .env.
+@dotenv
+
 # ── Aggregate pipelines ──────────────────────────────────────────────
 
 @group ci
@@ -42,6 +46,23 @@ task all: [lint, test, build]
 @desc "Full local CI gate: workspace tests + examples + bytecode smoke + lint + docs"
 task ci: [test-workspace, examples, smoke-bytecode, lint, docs-check]
     echo "CI gate green"
+
+# Runs the full CI gate, then prints the manual release steps from AGENTS.md.
+# The version-bump sed across Cargo.toml stays manual by design (too risky to
+# automate); this just gets you to a verified-green tree and reminds the steps.
+@group ci
+@desc "Run the CI gate, then print the manual release checklist"
+task release-preflight: [ci]
+    @echo ""
+    @echo "CI gate is green. To cut a release (see AGENTS.md 'Release Procedure'):"
+    @echo "  1. Bump workspace version + every inter-crate =X.Y.Z pin in Cargo.toml"
+    @echo "     sed -i '' -e 's/^version = \"OLD\"/version = \"NEW\"/' \\"
+    @echo "               -e 's/version = \"=OLD\"/version = \"=NEW\"/g' Cargo.toml"
+    @echo "     grep -c 'OLD' Cargo.toml   # must be 0"
+    @echo "  2. Add a ## X.Y.Z section at the top of CHANGELOG.md"
+    @echo "  3. cargo build --release && ./target/release/sema --version"
+    @echo "  4. git commit -m 'release: X.Y.Z' && git tag vX.Y.Z"
+    @echo "  5. git push origin main --tags   # then confirm 'gh run list' is green"
 
 # One-shot "ship the web": build playground, gate on E2E, deploy site + playground.
 @group deploy

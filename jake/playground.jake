@@ -7,6 +7,7 @@
 @desc "Build the playground (WASM VM + examples bundle)"
 task build:
     @needs wasm-pack "cargo install wasm-pack"
+    @needs node
     cd crates/sema-wasm && wasm-pack build --target web --out-dir ../../playground/pkg \
         -- --config 'profile.release.package.sema-wasm.opt-level="s"'
     cd playground && node build.mjs
@@ -14,7 +15,7 @@ task build:
 @group playground
 @desc "Build + serve the playground at :8787"
 task dev: [build]
-    @needs npx
+    @needs npx node
     cd playground && node scripts/gen-devtools-json.mjs
     cd playground && npx serve -l 8787
 

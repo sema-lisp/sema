@@ -11,6 +11,7 @@ clippy_crates = "-p sema-core -p sema-reader -p sema-eval -p sema-llm -p sema-st
 @desc "Dev build"
 task build:
     @needs cargo
+    @watch crates/**/*.rs Cargo.toml
     cargo build
 
 @group build
@@ -71,6 +72,7 @@ task uninstall:
 @group test
 @desc "Run all tests (http/llm ignored)"
 task test:
+    @watch crates/**/*.rs Cargo.toml
     cargo test
 
 @group test
@@ -98,6 +100,7 @@ task test-http:
 @group test
 @desc "LLM integration tests (requires API keys)"
 task test-llm:
+    : "${ANTHROPIC_API_KEY:?set ANTHROPIC_API_KEY (or add it to .env)}" "${OPENAI_API_KEY:?set OPENAI_API_KEY (or add it to .env)}"
     cargo test -p sema-lang --test llm_test -- --ignored --nocapture
 
 # ── Lint / format ────────────────────────────────────────────────────

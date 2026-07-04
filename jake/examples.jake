@@ -50,8 +50,8 @@ task example-notebook-serve: [build]
 # Manual gate for the true-async work; needs ANTHROPIC/OPENAI/GEMINI keys.
 @group llm
 @desc "LIVE async/streaming provider stress (real spend, needs API keys)"
+@require ANTHROPIC_API_KEY OPENAI_API_KEY GEMINI_API_KEY
 task llm-stress: [release]
-    : "${ANTHROPIC_API_KEY:?set it (or add to .env)}" "${OPENAI_API_KEY:?set it (or add to .env)}" "${GEMINI_API_KEY:?set it (or add to .env)}"
     ./target/release/sema examples/llm/async-stress-live.sema
 
 @group llm

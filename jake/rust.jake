@@ -99,8 +99,8 @@ task test-http:
 
 @group test
 @desc "LLM integration tests (requires API keys)"
+@require ANTHROPIC_API_KEY OPENAI_API_KEY
 task test-llm:
-    : "${ANTHROPIC_API_KEY:?set ANTHROPIC_API_KEY (or add it to .env)}" "${OPENAI_API_KEY:?set OPENAI_API_KEY (or add it to .env)}"
     cargo test -p sema-lang --test llm_test -- --ignored --nocapture
 
 # ── Lint / format ────────────────────────────────────────────────────

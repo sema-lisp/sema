@@ -17,9 +17,9 @@ export class SemaTooltip extends SemaElement {
         position: absolute;
         z-index: 200;
         font-family: var(--mono, 'JetBrains Mono', monospace);
-        font-size: 0.65rem;
+        font-size: var(--text-xxs, 10px);
         line-height: 1.4;
-        padding: 0.35rem 0.6rem;
+        padding: 6px 10px;
         background: var(--tooltip-bg, #1a1a1a);
         color: var(--text-primary, #d8d0c0);
         border: 1px solid var(--border, #1e1e1e);

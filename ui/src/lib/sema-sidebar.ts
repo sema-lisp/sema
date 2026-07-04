@@ -21,7 +21,7 @@ import type { GapToken } from '../internal/layout.js';
  * roles — consumers add landmarks (`<nav slot="aside">`).
  *
  * ```html
- * <sema-sidebar side-width="16rem" gap="xl">
+ * <sema-sidebar side-width="256px" gap="xl">
  *   <nav slot="aside" aria-label="Docs">…</nav>
  *   <article>…</article>
  * </sema-sidebar>
@@ -34,7 +34,7 @@ export class SemaSidebar extends SemaElement {
       :host {
         display: flex;
         flex-wrap: wrap;
-        --_side: var(--sema-sidebar-side, 18rem);
+        --_side: var(--sema-sidebar-side, 288px);
         --_content-min: var(--sema-sidebar-content-min, 50%);
         --_gap: var(--sema-sidebar-gap, var(--space-md, 16px));
         gap: var(--_gap);
@@ -55,7 +55,7 @@ export class SemaSidebar extends SemaElement {
     gapAttrStyles('gap', '--_gap'),
   ];
 
-  /** Aside flex-basis (any CSS length). Unset → 18rem. */
+  /** Aside flex-basis (any CSS length). Unset → 288px. */
   @property({ reflect: true, attribute: 'side-width' }) sideWidth?: string;
   /** Content pane min-inline-size (percentage) — the stacking threshold. Unset → 50%. */
   @property({ reflect: true, attribute: 'content-min' }) contentMin?: string;

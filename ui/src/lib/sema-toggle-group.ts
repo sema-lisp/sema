@@ -20,7 +20,7 @@ export class SemaToggleGroup extends SemaElement {
       :host {
         display: inline-flex;
         align-items: center;
-        gap: 0.5rem;
+        gap: 8px;
       }
       .group {
         display: flex;
@@ -31,7 +31,7 @@ export class SemaToggleGroup extends SemaElement {
         width: 1px;
         height: 16px;
         background: var(--border, #1e1e1e);
-        margin: 0 0.25rem;
+        margin: 0 4px;
       }
     `,
   ];

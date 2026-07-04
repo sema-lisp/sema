@@ -54,9 +54,9 @@ export class SemaButton extends SemaElement {
       :host([variant="primary"]) .button {
         background: var(--gold, #c8a855);
         color: var(--bg, #0c0c0c);
-        padding: 0.9rem 2.2rem;
+        padding: 14px 35px;
         border-radius: 6px;
-        font-size: 0.85rem;
+        font-size: var(--text-lg, 14px);
         font-weight: 500;
         letter-spacing: 0.04em;
       }
@@ -72,9 +72,9 @@ export class SemaButton extends SemaElement {
       :host([variant="secondary"]) .button {
         background: transparent;
         color: var(--text-primary, #d8d0c0);
-        padding: 0.9rem 2.2rem;
+        padding: 14px 35px;
         border-radius: 6px;
-        font-size: 0.85rem;
+        font-size: var(--text-lg, 14px);
         letter-spacing: 0.04em;
         border: 1px solid var(--border, #1e1e1e);
       }
@@ -87,9 +87,9 @@ export class SemaButton extends SemaElement {
       :host([variant="ghost"]) .button {
         background: transparent;
         color: var(--text-tertiary, #5a5448);
-        padding: 0.9rem 2.2rem;
+        padding: 14px 35px;
         border-radius: 6px;
-        font-size: 0.85rem;
+        font-size: var(--text-lg, 14px);
         letter-spacing: 0.04em;
       }
       :host([variant="ghost"]) .button:hover:not(:disabled) { color: var(--text-primary, #d8d0c0); }
@@ -104,7 +104,7 @@ export class SemaButton extends SemaElement {
         height: 32px;
         border-radius: 4px;
         color: var(--text-tertiary, #5a5448);
-        font-size: 0.8rem;
+        font-size: var(--text-md, 13px);
         padding: 0;
       }
       :host([variant="icon"]) .button:hover:not(:disabled) {
@@ -116,10 +116,10 @@ export class SemaButton extends SemaElement {
       :host([variant="pill"]) .button {
         background: transparent;
         color: var(--gold, #c8a855);
-        padding: 0.4rem 1rem;
+        padding: 6px 16px;
         border: 1px solid var(--gold-dim, rgba(200, 168, 85, 0.5));
         border-radius: 20px;
-        font-size: 0.75rem;
+        font-size: var(--text-sm, 12px);
         letter-spacing: 0.03em;
       }
       :host([variant="pill"]) .button:hover:not(:disabled) {
@@ -131,9 +131,9 @@ export class SemaButton extends SemaElement {
       :host([variant="run"]) .button {
         background: var(--gold, #c8a855);
         color: var(--bg, #0c0c0c);
-        padding: 0.3rem 0.9rem;
+        padding: 5px 14px;
         border-radius: 3px;
-        font-size: 0.7rem;
+        font-size: var(--text-xs, 11px);
         letter-spacing: 0.05em;
       }
       :host([variant="run"]) .button:hover:not(:disabled) { opacity: 0.85; }
@@ -147,13 +147,13 @@ export class SemaButton extends SemaElement {
       /* shortcut badge inside run */
       .shortcut {
         font-family: system-ui, -apple-system, sans-serif;
-        font-size: 0.6rem;
+        font-size: var(--text-xxs, 10px);
         opacity: 0.7;
-        margin-left: 0.5rem;
+        margin-left: 8px;
         background: rgba(0, 0, 0, 0.2);
         font-weight: bold;
         line-height: 1;
-        padding: 0.1rem 0.35rem;
+        padding: 2px 6px;
         border-radius: 4px;
         pointer-events: none;
         white-space: nowrap;
@@ -167,7 +167,7 @@ export class SemaButton extends SemaElement {
         border: 1px solid var(--border, #1e1e1e);
         color: var(--text-secondary, #a09888);
         font-family: system-ui, -apple-system, sans-serif;
-        font-size: 0.8rem;
+        font-size: var(--text-md, 13px);
         background: transparent;
       }
       :host([variant="debug"]) .button:hover:not(:disabled) {
@@ -191,7 +191,7 @@ export class SemaButton extends SemaElement {
         border-radius: 3px;
         background: var(--bg-elevated, #141414);
         color: var(--text-tertiary, #5a5448);
-        font-size: 0.65rem;
+        font-size: var(--text-xxs, 10px);
       }
       :host([variant="action"]) .button:hover:not(:disabled) {
         color: var(--gold, #c8a855);
@@ -217,8 +217,8 @@ export class SemaButton extends SemaElement {
       :host([size="sm"]) .button {
         height: var(--control-height-sm, 22px);
         box-sizing: border-box;
-        padding: 0 0.9rem;
-        font-size: 0.7rem;
+        padding: 0 14px;
+        font-size: var(--text-xs, 11px);
         border-radius: var(--radius-sm, 3px);
       }
       /* icon is a fixed square — sm shrinks the box to the shared control height. */

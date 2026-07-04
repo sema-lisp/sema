@@ -61,7 +61,7 @@ export class SemaEditor extends SemaElement {
         background: var(--bg-editor, #0a0a0a);
         color: var(--text-tertiary, #5a5448);
         font-family: var(--mono, 'JetBrains Mono', monospace);
-        font-size: 0.82rem;
+        font-size: var(--text-md, 13px);
         line-height: 1.7;
         padding: var(--space-sm, 8px) 0;
         text-align: right;
@@ -102,7 +102,7 @@ export class SemaEditor extends SemaElement {
         margin: 0;
         padding: var(--space-sm, 8px) var(--space-md, 12px);
         font-family: var(--mono, 'JetBrains Mono', monospace);
-        font-size: 0.82rem;
+        font-size: var(--text-md, 13px);
         line-height: 1.7;
         tab-size: 2;
         white-space: pre;

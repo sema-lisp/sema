@@ -24,7 +24,7 @@ export class SemaKbd extends SemaElement {
       }
       kbd {
         font-family: var(--mono, 'JetBrains Mono', monospace);
-        font-size: 0.7rem;
+        font-size: var(--text-xs, 11px);
         line-height: 1;
         color: var(--text-secondary, #a09888);
         background: var(--bg-elevated, #141414);
@@ -39,7 +39,7 @@ export class SemaKbd extends SemaElement {
       .sep {
         color: var(--text-tertiary, #5a5448);
         font-family: var(--mono, 'JetBrains Mono', monospace);
-        font-size: 0.65rem;
+        font-size: var(--text-xxs, 10px);
       }
     `,
   ];

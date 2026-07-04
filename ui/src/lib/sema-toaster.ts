@@ -78,7 +78,7 @@ export class SemaToaster extends SemaElement {
         flex-direction: column;
         gap: var(--space-sm, 8px);
         width: max-content;
-        max-width: min(24rem, 90vw);
+        max-width: min(384px, 90vw);
         pointer-events: auto;
       }
       :host([position^='bottom']) .region {

@@ -94,7 +94,7 @@ export class SemaCodeTyper extends SemaElement {
         padding: 0 9px;
         background: var(--bg, #131110);
         font-family: var(--mono, 'JetBrains Mono', monospace);
-        font-size: 0.8rem;
+        font-size: var(--text-md, 13px);
         font-weight: 600;
         line-height: 1;
       }
@@ -120,7 +120,7 @@ export class SemaCodeTyper extends SemaElement {
       .viewport {
         overflow: hidden;
         font-family: var(--mono, 'JetBrains Mono', monospace);
-        font-size: 0.8rem;
+        font-size: var(--text-md, 13px);
         line-height: 1.5;
         color: var(--text-primary, #e9e3d6);
         tab-size: 2;
@@ -171,7 +171,7 @@ export class SemaCodeTyper extends SemaElement {
         padding-top: 6px;
         border-top: 1px solid var(--border, #2b2620);
         font-family: var(--mono, 'JetBrains Mono', monospace);
-        font-size: 0.7rem;
+        font-size: var(--text-xs, 11px);
         color: var(--text-secondary, #968c79);
       }
       .status .mode {

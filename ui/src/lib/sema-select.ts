@@ -41,7 +41,7 @@ export class SemaSelect extends SemaElement {
         display: flex;
         align-items: center;
         justify-content: space-between;
-        gap: 0.5rem;
+        gap: 8px;
         cursor: pointer;
         text-align: left;
       }
@@ -66,29 +66,29 @@ export class SemaSelect extends SemaElement {
       .listbox {
         display: flex;
         flex-direction: column;
-        min-width: 10rem;
-        max-height: 16rem;
+        min-width: 160px;
+        max-height: 256px;
         overflow-y: auto;
         scrollbar-width: thin;
         scrollbar-color: var(--border, #1e1e1e) transparent;
       }
       .group-label {
         font-family: var(--mono, 'JetBrains Mono', monospace);
-        font-size: 0.6rem;
+        font-size: var(--text-xxs, 10px);
         text-transform: uppercase;
         letter-spacing: 0.06em;
         color: var(--text-tertiary, #5a5448);
-        padding: 0.4rem 0.7rem 0.2rem;
+        padding: 6px 11px 3px;
       }
       .option {
         display: flex;
         align-items: center;
-        gap: 0.5rem;
+        gap: 8px;
         width: 100%;
         font-family: var(--mono, 'JetBrains Mono', monospace);
-        font-size: 0.75rem;
+        font-size: var(--text-sm, 12px);
         text-align: left;
-        padding: 0.4rem 0.7rem;
+        padding: 6px 11px;
         border: none;
         border-radius: var(--radius-sm, 3px);
         background: transparent;

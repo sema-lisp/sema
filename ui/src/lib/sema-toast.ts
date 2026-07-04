@@ -20,17 +20,17 @@ export class SemaToast extends SemaElement {
       .toast {
         display: flex;
         align-items: flex-start;
-        gap: 0.6rem;
-        min-width: 15rem;
-        max-width: 24rem;
-        padding: 0.7rem 0.8rem;
+        gap: 10px;
+        min-width: 240px;
+        max-width: 384px;
+        padding: 11px 13px;
         background: var(--bg-elevated, #141414);
         border: 1px solid var(--border, #1e1e1e);
         border-left: 3px solid var(--accent, var(--text-secondary, #a09888));
         border-radius: var(--radius-md, 4px);
         box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4);
         font-family: var(--mono, 'JetBrains Mono', monospace);
-        font-size: 0.78rem;
+        font-size: var(--text-sm, 12px);
         line-height: 1.5;
         color: var(--text-primary, #d8d0c0);
         animation: toast-in 0.18s ease;
@@ -53,8 +53,8 @@ export class SemaToast extends SemaElement {
       }
       .close {
         flex-shrink: 0;
-        width: 1.2rem;
-        height: 1.2rem;
+        width: 19px;
+        height: 19px;
         display: flex;
         align-items: center;
         justify-content: center;
@@ -62,7 +62,7 @@ export class SemaToast extends SemaElement {
         border-radius: var(--radius-sm, 3px);
         background: transparent;
         color: var(--text-tertiary, #5a5448);
-        font-size: 0.9rem;
+        font-size: var(--text-lg, 14px);
         line-height: 1;
         cursor: pointer;
         transition: color 0.15s, background 0.15s;

@@ -49,7 +49,7 @@
   --space-4xl: 96px;
 
   /* ── Layout containers ── */
-  --container-prose: 48rem; /* long-form text measure — consumed by page CSS, not a size enum value */
+  --container-prose: 768px; /* long-form text measure — consumed by page CSS, not a size enum value */
   --container-md: 1000px; /* docs / showcase */
   --container-lg: 1200px; /* marketing sections (default) */
 
@@ -64,6 +64,18 @@
   /* ── Control sizing ── shared height for compact toolbar controls
      (sm buttons, toggles) so they line up on one row. */
   --control-height-sm: 22px;
+
+  /* ── Font-size scale (px) ── the design system is px-canonical (see spacing/
+     radius above). Components reference these with a px fallback so consumers
+     that don't load tokens.css still render correctly. */
+  --text-xxs: 10px;
+  --text-xs: 11px;
+  --text-sm: 12px;
+  --text-md: 13px;
+  --text-lg: 14px;
+  --text-xl: 16px;
+  --text-2xl: 18px;
+  --text-3xl: 22px;
 
   /* ── Focus ring ── shared :focus-visible treatment (gold outline) */
   --focus-ring-color: var(--gold);

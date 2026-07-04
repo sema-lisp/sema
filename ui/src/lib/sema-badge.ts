@@ -46,11 +46,11 @@ export class SemaBadge extends SemaElement {
         align-items: center;
         gap: 0.35em;
         font-family: var(--mono, 'JetBrains Mono', monospace);
-        font-size: 0.65rem;
+        font-size: var(--text-xxs, 10px);
         line-height: 1;
         letter-spacing: 0.04em;
         white-space: nowrap;
-        padding: 0.25rem 0.45rem;
+        padding: 4px 7px;
         border: 1px solid var(--_badge-border);
         border-radius: var(--radius-sm, 3px);
         background: var(--_badge-bg);
@@ -58,7 +58,7 @@ export class SemaBadge extends SemaElement {
       }
 
       :host([pill]) .badge {
-        padding: 0.25rem 0.7rem;
+        padding: 4px 11px;
         border-radius: var(--radius-pill, 20px);
       }
 

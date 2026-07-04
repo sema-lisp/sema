@@ -125,7 +125,7 @@ export class SemaPage extends SemaElement {
     body.style.background = 'var(--bg, #0c0c0c)';
     body.style.color = 'var(--text-secondary, #a09888)';
     body.style.fontFamily = 'var(--serif)';
-    body.style.fontSize = '1.15rem';
+    body.style.fontSize = '18px';
     body.style.lineHeight = '1.7';
     body.style.setProperty('-webkit-font-smoothing', 'antialiased');
 

@@ -23,7 +23,7 @@ export class SemaMenu extends SemaElement {
     css`
       :host {
         display: block;
-        min-width: 10rem;
+        min-width: 160px;
       }
       [role='menu'] {
         display: flex;
@@ -130,9 +130,9 @@ export class SemaMenuItem extends SemaElement {
         gap: var(--space-sm, 8px);
         width: 100%;
         font-family: var(--mono, 'JetBrains Mono', monospace);
-        font-size: 0.75rem;
+        font-size: var(--text-sm, 12px);
         text-align: left;
-        padding: 0.4rem 0.7rem;
+        padding: 6px 11px;
         border: none;
         border-radius: var(--radius-sm, 3px);
         background: transparent;

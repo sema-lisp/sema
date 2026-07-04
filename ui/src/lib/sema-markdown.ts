@@ -56,7 +56,7 @@ export class SemaMarkdown extends SemaElement {
       pre code {
         background: none;
         padding: 0;
-        font-size: 0.82rem;
+        font-size: var(--text-md, 13px);
       }
       a {
         color: var(--gold, #d4a537);

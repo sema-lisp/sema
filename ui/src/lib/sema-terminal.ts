@@ -57,7 +57,7 @@ export class SemaTerminal extends SemaElement {
         border-radius: var(--radius-lg, 6px);
         overflow-x: auto;
         font-family: var(--mono, 'JetBrains Mono', monospace);
-        font-size: 0.82rem;
+        font-size: var(--text-md, 13px);
         line-height: 1.7;
         color: var(--text-primary, #d8d0c0);
       }

@@ -80,10 +80,10 @@ export class SemaPagination extends SemaElement {
       }
       button {
         font-family: var(--mono, 'JetBrains Mono', monospace);
-        font-size: 0.7rem;
-        min-width: 1.85rem;
-        height: 1.85rem;
-        padding: 0 0.4rem;
+        font-size: var(--text-xs, 11px);
+        min-width: 30px;
+        height: 30px;
+        padding: 0 6px;
         display: inline-flex;
         align-items: center;
         justify-content: center;
@@ -114,11 +114,11 @@ export class SemaPagination extends SemaElement {
         cursor: default;
       }
       .ellipsis {
-        min-width: 1.5rem;
+        min-width: 24px;
         text-align: center;
         color: var(--text-tertiary, #5a5448);
         font-family: var(--mono, 'JetBrains Mono', monospace);
-        font-size: 0.7rem;
+        font-size: var(--text-xs, 11px);
         user-select: none;
       }
     `,

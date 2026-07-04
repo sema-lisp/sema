@@ -29,13 +29,13 @@ export class SemaField extends SemaElement {
       }
       .label {
         font-family: var(--mono, 'JetBrains Mono', monospace);
-        font-size: 0.7rem;
+        font-size: var(--text-xs, 11px);
         letter-spacing: 0.04em;
         color: var(--text-secondary, #a09888);
       }
       .msg {
         font-family: var(--mono, 'JetBrains Mono', monospace);
-        font-size: 0.65rem;
+        font-size: var(--text-xxs, 10px);
         color: var(--text-tertiary, #5a5448);
       }
       .msg.error {

@@ -15,9 +15,9 @@ export class SemaToggle extends SemaElement {
         height: var(--control-height-sm, 22px);
         box-sizing: border-box;
         font-family: var(--mono, 'JetBrains Mono', monospace);
-        font-size: 0.65rem;
+        font-size: var(--text-xxs, 10px);
         letter-spacing: 0.04em;
-        padding: 0 0.55rem;
+        padding: 0 9px;
         border-radius: 3px;
         cursor: pointer;
         color: var(--text-tertiary, #5a5448);

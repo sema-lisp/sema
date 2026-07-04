@@ -41,7 +41,7 @@ export class SemaDialog extends SemaElement {
 
       .header {
         font-family: var(--serif, 'Cormorant', Georgia, serif);
-        font-size: 1.4rem;
+        font-size: var(--text-3xl, 22px);
         font-weight: 400;
         color: var(--text-primary, #d8d0c0);
         padding: var(--space-lg, 24px) var(--space-lg, 24px) 0;
@@ -49,7 +49,7 @@ export class SemaDialog extends SemaElement {
 
       .body {
         font-family: var(--serif, 'Cormorant', Georgia, serif);
-        font-size: 1.15rem;
+        font-size: var(--text-2xl, 18px);
         line-height: 1.7;
         color: var(--text-secondary, #a09888);
         padding: var(--space-md, 16px) var(--space-lg, 24px);

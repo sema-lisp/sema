@@ -11,7 +11,7 @@ import scrollbarStyles from '../styles/scrollbar.css?inline';
  * scrolls its slotted content; `orientation` picks the axis.
  *
  * ```html
- * <sema-scroll-area style="max-height: 12rem;">…long content…</sema-scroll-area>
+ * <sema-scroll-area style="max-height: 192px;">…long content…</sema-scroll-area>
  * ```
  */
 export class SemaScrollArea extends SemaElement {

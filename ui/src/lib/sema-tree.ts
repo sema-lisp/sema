@@ -43,10 +43,10 @@ export class SemaTreeItem extends SemaElement {
       .row {
         display: flex;
         align-items: center;
-        gap: 0.35rem;
-        padding: 0.25rem 0.75rem;
+        gap: 6px;
+        padding: 4px 12px;
         font-family: var(--mono, 'JetBrains Mono', monospace);
-        font-size: 0.7rem;
+        font-size: var(--text-xs, 11px);
         color: var(--text-secondary, #a09888);
         cursor: pointer;
         user-select: none;
@@ -74,14 +74,14 @@ export class SemaTreeItem extends SemaElement {
       :host([depth='0'][has-children]) .row {
         text-transform: uppercase;
         letter-spacing: 0.06em;
-        font-size: 0.65rem;
+        font-size: var(--text-xxs, 10px);
         color: var(--text-tertiary, #5a5448);
         font-family: inherit;
       }
 
       .chevron {
-        font-size: 0.6rem;
-        width: 0.8rem;
+        font-size: var(--text-xxs, 10px);
+        width: 13px;
         text-align: center;
         flex-shrink: 0;
         color: var(--text-tertiary, #5a5448);
@@ -121,10 +121,10 @@ export class SemaTreeItem extends SemaElement {
   @state() private _hasSlotChildren = false;
 
   render() {
-    const padLeft = 0.75 + this.depth * 0.875;
+    const padLeft = 12 + this.depth * 14;
     return html`
       <div class="row" part="row" role="treeitem" tabindex=${this.tabbable ? '0' : '-1'}
-           style="padding-left:${padLeft}rem;"
+           style="padding-left:${padLeft}px;"
         aria-label=${this.label || nothing}
         aria-expanded=${this.hasChildren || this._hasSlotChildren ? String(this.expanded) : nothing}
         aria-selected=${String(this.selected)}

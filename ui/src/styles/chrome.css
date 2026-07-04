@@ -16,9 +16,9 @@
   top: var(--space-sm, 8px);
   right: var(--space-sm, 8px);
   font-family: var(--mono, 'JetBrains Mono', monospace);
-  font-size: 0.65rem;
+  font-size: var(--text-xxs, 10px);
   letter-spacing: 0.04em;
-  padding: 0.3rem 0.6rem;
+  padding: 5px 10px;
   border: 1px solid var(--border, #1e1e1e);
   border-radius: var(--radius-sm, 3px);
   background: var(--bg-elevated, #141414);

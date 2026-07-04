@@ -292,9 +292,9 @@ export class SemaTab extends SemaElement {
       :host {
         display: inline-flex;
         align-items: center;
-        gap: 0.4rem;
+        gap: 6px;
         font-family: var(--mono, 'JetBrains Mono', monospace);
-        font-size: 0.7rem;
+        font-size: var(--text-xs, 11px);
         letter-spacing: 0.02em;
         padding: var(--space-sm, 8px) var(--space-xs, 4px);
         cursor: pointer;

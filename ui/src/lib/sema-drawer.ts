@@ -101,7 +101,7 @@ export class SemaDrawer extends SemaElement {
       }
       .title {
         font-family: var(--serif, 'Cormorant', Georgia, serif);
-        font-size: 1.3rem;
+        font-size: var(--text-3xl, 22px);
         font-weight: 400;
         color: var(--text-primary, #d8d0c0);
         margin: 0;
@@ -118,7 +118,7 @@ export class SemaDrawer extends SemaElement {
         border-radius: var(--radius-md, 4px);
         color: var(--text-tertiary, #5a5448);
         font-family: var(--mono, 'JetBrains Mono', monospace);
-        font-size: 1rem;
+        font-size: var(--text-xl, 16px);
         line-height: 1;
         cursor: pointer;
         transition: color 0.15s, background 0.15s;

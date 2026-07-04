@@ -140,43 +140,24 @@ function buildVfsTree(dir) {
   return items;
 }
 
-function renderVfsTree(items, depth) {
-  const container = document.createDocumentFragment();
-
+// Dogfoods <sema-tree> like the examples sidebar: directories are expandable
+// parents (expanded by default so files are visible), files are selectable
+// leaves carrying their path. sema-tree owns the chevron, indentation,
+// expand/collapse, keyboard nav, and ARIA.
+function renderVfsItems(items, parent) {
   for (const item of items) {
+    const node = document.createElement('sema-tree-item');
+    node.setAttribute('label', item.name);
     if (item.isDir) {
-      const row = document.createElement('div');
-      row.className = 'vfs-tree-dir';
-      row.style.paddingLeft = (depth * 14 + 8) + 'px';
-
-      const chevron = document.createElement('span');
-      chevron.className = 'tree-chevron';
-      chevron.textContent = '▾';
-      row.appendChild(chevron);
-      row.appendChild(document.createTextNode(item.name + '/'));
-
-      const childContainer = document.createElement('div');
-      childContainer.appendChild(renderVfsTree(item.children, depth + 1));
-
-      row.addEventListener('click', () => {
-        const hidden = childContainer.style.display === 'none';
-        childContainer.style.display = hidden ? '' : 'none';
-        chevron.textContent = hidden ? '▾' : '▸';
-      });
-
-      container.appendChild(row);
-      container.appendChild(childContainer);
+      node.setAttribute('has-children', '');
+      node.setAttribute('expanded', '');
+      renderVfsItems(item.children, node);
     } else {
-      const row = document.createElement('div');
-      row.className = 'vfs-tree-file' + (item.fullPath === activeFilePath ? ' active' : '');
-      row.style.paddingLeft = (depth * 14 + 8) + 'px';
-      row.textContent = item.name;
-      row.addEventListener('click', () => viewFile(item.fullPath));
-      container.appendChild(row);
+      node.dataset.path = item.fullPath;
+      if (item.fullPath === activeFilePath) node.selected = true;
     }
+    parent.appendChild(node);
   }
-
-  return container;
 }
 
 function refreshFileTree() {
@@ -192,7 +173,14 @@ function refreshFileTree() {
     return;
   }
 
-  fileTreeEl.appendChild(renderVfsTree(items, 0));
+  const tree = document.createElement('sema-tree');
+  renderVfsItems(items, tree);
+  // A leaf carries data-path; a directory click just toggles expansion.
+  tree.addEventListener('sema-tree-select', (e) => {
+    const path = e.detail.element?.dataset?.path;
+    if (path) viewFile(path);
+  });
+  fileTreeEl.appendChild(tree);
 }
 
 // ── File Viewer ──

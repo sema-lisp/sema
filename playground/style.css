@@ -72,14 +72,6 @@
     gap: 1rem;
   }
 
-  .version-badge {
-    font-size: 0.7rem;
-    color: var(--text-dim);
-    border: 1px solid var(--border);
-    padding: 0.2rem 0.5rem;
-    border-radius: 3px;
-  }
-
   .header-link {
     font-size: 0.75rem;
     color: var(--text-dim);
@@ -127,75 +119,8 @@
     scrollbar-width: thin;
     scrollbar-color: var(--border) transparent;
   }
-  .tree-category {
-    cursor: pointer;
-    display: flex;
-    align-items: center;
-    gap: 0.35rem;
-    padding: 0.3rem 0.75rem;
-    font-size: 0.65rem;
-    letter-spacing: 0.06em;
-    text-transform: uppercase;
-    color: var(--text-dim);
-    user-select: none;
-  }
-  .tree-category:hover { color: var(--text); }
-  .tree-chevron {
-    font-size: 0.6rem;
-    width: 0.8rem;
-    text-align: center;
-  }
-  .tree-items.collapsed { display: none; }
-  .tree-file {
-    display: block;
-    width: 100%;
-    padding: 0.25rem 0.75rem 0.25rem 1.8rem;
-    font-family: var(--mono);
-    font-size: 0.7rem;
-    color: var(--text);
-    background: none;
-    border: none;
-    text-align: left;
-    cursor: pointer;
-    transition: color 0.1s, background 0.1s;
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
-  }
-  .tree-file:hover { color: var(--text-bright); background: var(--gold-glow); }
-  .tree-file.active { color: var(--gold); background: var(--gold-glow); }
-
-  /* ── VFS File Tree ── */
-  .vfs-tree-dir {
-    cursor: pointer;
-    display: flex;
-    align-items: center;
-    gap: 0.35rem;
-    padding: 0.25rem 0.75rem;
-    font-size: 0.7rem;
-    color: var(--text-dim);
-    user-select: none;
-    transition: color 0.1s;
-  }
-  .vfs-tree-dir:hover { color: var(--text); }
-  .vfs-tree-file {
-    display: block;
-    width: 100%;
-    padding: 0.25rem 0.75rem;
-    font-family: var(--mono);
-    font-size: 0.7rem;
-    color: var(--text);
-    background: none;
-    border: none;
-    text-align: left;
-    cursor: pointer;
-    transition: color 0.1s, background 0.1s;
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
-  }
-  .vfs-tree-file:hover { color: var(--text-bright); background: var(--gold-glow); }
-  .vfs-tree-file.active { color: var(--gold); background: var(--gold-glow); }
+  /* The examples sidebar and VFS file tree both dogfood <sema-tree>; only the
+     empty-state placeholder is bespoke. */
   .vfs-tree-empty {
     padding: 1rem 0.75rem;
     font-size: 0.7rem;

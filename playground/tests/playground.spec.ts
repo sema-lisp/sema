@@ -46,14 +46,16 @@ async function waitForReady(page: Page) {
 }
 
 async function openExample(page: Page, example: { category: string; id: string; name: string }) {
+  // The examples sidebar dogfoods <sema-tree>: files are <sema-tree-item> leaves
+  // keyed by data-example-id, nested under a category <sema-tree-item> that must
+  // be `expanded` for the leaf to be visible/clickable.
   const button = page.locator(`[data-example-id="${example.id}"]`);
-  const isCollapsed = await button.evaluate((el) =>
-    el.parentElement?.classList.contains('collapsed') ?? false
+  const parentExpanded = await button.evaluate((el) =>
+    el.parentElement?.hasAttribute('expanded') ?? false
   );
 
-  if (isCollapsed) {
-    const header = page.locator('.tree-category', { hasText: example.category }).first();
-    await header.click();
+  if (!parentExpanded) {
+    await page.locator(`sema-tree-item[label="${example.category}"]`).first().click();
   }
 
   await button.click();
@@ -244,8 +246,8 @@ test('worker path: upload a file and read it from a script (VFS upload + mirror)
     buffer: Buffer.from('hello from an uploaded file'),
   });
 
-  // It shows up in the file tree.
-  await page.waitForSelector('.vfs-tree-file:has-text("notes.txt")', { timeout: 5000 });
+  // It shows up in the file tree (a <sema-tree-item> leaf keyed by label).
+  await page.waitForSelector('sema-tree-item[label="notes.txt"]', { timeout: 5000 });
 
   // A worker-run script can read it — the uploaded file is seeded into the
   // worker via the VFS mirror (dumpVfs/loadVfs).
@@ -274,9 +276,9 @@ test('worker path: a file written during eval shows up in the file tree (VFS mir
   await page.waitForSelector('#output .output-timing', { timeout: 20000 });
 
   // The file the worker created must appear in the (mirror-backed) file tree.
-  await page.waitForSelector('.vfs-tree-file:has-text("from-worker.txt")', { timeout: 5000 });
-  const files = await page.$$eval('.vfs-tree-file', (els) =>
-    els.map((e) => (e.textContent || '').trim())
+  await page.waitForSelector('sema-tree-item[label="from-worker.txt"]', { timeout: 5000 });
+  const files = await page.$$eval('sema-tree-item[data-path]', (els) =>
+    els.map((e) => e.getAttribute('label') || '')
   );
   expect(files.some((f) => f.includes('from-worker.txt'))).toBe(true);
 });
@@ -389,7 +391,8 @@ test('evaluates a recursive fib correctly', async ({ page }) => {
 });
 
 test('hello.sema runs', async ({ page }) => {
-  await page.click('.tree-file:text("hello.sema")');
+  // hello.sema lives under "Getting Started", which is expanded by default.
+  await page.click('sema-tree-item[label="hello.sema"]');
   await clickRunAndWait(page);
 
   const errorEl = await page.$('#output .output-error');

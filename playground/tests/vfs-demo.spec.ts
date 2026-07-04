@@ -21,12 +21,12 @@ test('VFS: run file-creating script and check file tree', async ({ page }) => {
 
   await clickRun(page);
 
-  // File tree is always visible in the files panel
+  // File tree is always visible in the files panel. It dogfoods <sema-tree>,
+  // so entries are <sema-tree-item> nodes keyed by their `label` attribute.
   const fileTree = page.getByTestId('file-tree');
   await expect(fileTree).toBeVisible();
-  const treeText = await fileTree.innerText();
-  expect(treeText).toContain('test-dir');
-  expect(treeText).toContain('hello.txt');
+  await expect(fileTree.locator('sema-tree-item[label="test-dir"]')).toBeVisible();
+  await expect(fileTree.locator('sema-tree-item[label="hello.txt"]')).toBeVisible();
 });
 
 test('VFS: clicking a file shows content in preview pane', async ({ page }) => {
@@ -37,8 +37,8 @@ test('VFS: clicking a file shows content in preview pane', async ({ page }) => {
 `);
   await clickRun(page);
 
-  // Click on the file in the tree
-  const fileEntry = page.locator('.vfs-tree-file', { hasText: 'greeting.txt' });
+  // Click on the file in the tree (a <sema-tree-item> leaf)
+  const fileEntry = page.locator('sema-tree-item[label="greeting.txt"]');
   await fileEntry.click();
 
   // File viewer should show content

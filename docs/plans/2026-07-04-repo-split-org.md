@@ -86,6 +86,28 @@ Each plugin's publishing target (Marketplace/OpenVSX, JetBrains, MELPA, etc.) is
 7. **(optional, later)** Move `website`+`playground` together to their own repo.
 8. **Never:** split `crates/*`. Keep the Rust workspace as the mono.
 
+## Build automation across the split (Jakefile)
+
+The Makefile→Jake migration (PR #71, branch `feature/jakefile-migration`) is a modular `Jakefile` + `jake/*.jake`. Structuring it to mirror the split boundaries turns each extraction into a mechanical lift instead of a rewrite. Do (1)–(3) up front — they're cheap in the mono and pay off at every split.
+
+**Principle: one `jake/*.jake` module per split destination.** The root `Jakefile`'s `@import` list should map 1:1 to future repos, so splitting a plugin = delete one `@import` line + `git mv` the module into the new repo, where it becomes that repo's standalone Jakefile.
+
+1. **De-mix `jake/editors.jake`.** It currently bundles three different fates: the tree-sitter grammar (`ts-*`, splits *first* → `sema-lisp/tree-sitter-sema`), the VS Code/IntelliJ packaging (`ext` group → their own repos), and the browser E2E (`test-notebook-e2e`/`test-web-e2e`, *stays* in the mono). Split into `jake/grammar.jake`, `jake/editors.jake` (packaging only), and fold the E2E in with the crate/notebook it exercises. Then every module has exactly one destiny.
+
+2. **Root each split-bound module through one path variable** so it works in-mono and standalone unchanged. `jake/grammar.jake` already funnels through `ts_dir = "editors/tree-sitter-sema"`; after `git filter-repo` re-roots the grammar at repo root, the standalone copy just sets `ts_dir = "."` — no recipe edits. Same for editor packaging (`vscode_dir`, `intellij_dir`). The recipes already written (`ed.vscode-package`/`-publish`, `ed.intellij-build`/`-test`/`-verify`/`-publish`) are the right *content* for those repos' Jakefiles — they lift out with a namespace drop and a path re-root.
+
+3. **Put the `@sema/ui` bundle behind a single indirection — the big one.** Today `jake/ui.jake` builds the bundle from local source (`file ui/dist/sema-ui.js: ui/src/**`) and copies it into notebook/playground. After the npm extraction the bundle comes from `node_modules/@sema-lang/ui/dist`, not a local build. Localize that swap with two variables:
+   - `ui_bundle` — a **path** the vendor recipes depend on (today `ui/dist/sema-ui.js`; post-split `node_modules/@sema-lang/ui/dist/sema-ui.js`), and
+   - a pinned `ui_version`.
+
+   Then the *only* thing that changes on extraction is the "produce the bundle" step: the local `file … : ui/src/**` build recipe is swapped for `npm install @sema-lang/ui@{{ui_version}}`. The vendor-into-notebook/playground copies **don't change** — they already just copy `{{ui_bundle}}`. Better still, once `ui` is a real npm dep the consumers pull it through their own `package.json` + bundler and the hand-vendoring disappears entirely — so keep the vendoring a thin, clearly-labelled *temporary* layer isolated in `jake/ui.jake`, removable by deleting one module + `@import`. (This is exactly the vendored-copy workaround Tier C exists to kill.)
+
+4. **Codify the cross-repo pins + tmLanguage fetch as tasks.** The split trades vendored copies for *version pins* (grammar tag for Zed/Helix/nvim, `@sema-lang/ui` npm version, the tmLanguage tag the website CI-fetches). Pins rot without tooling. Add a pins variable block + a `jake pins` task that prints them, and a `jake site.fetch-grammar-assets` task that curls `sema.tmLanguage.json` from `sema-lisp/vscode-sema` at `{{tmlang_version}}` into `website/` — turning the "CI-fetch at a pinned tag" decision (see the splits doc) into one reviewable command instead of a manual step.
+
+5. **Retire, don't rewrite, on each split.** Because modules are per-destination, the Makefile-target retirement the pilot runbook lists (`ts-generate`/`ts-test`/`ts`) becomes: drop `@import "jake/grammar.jake"` and `git mv` it out. No recipe surgery in the mono.
+
+Net: with (1)–(3) in place, the tree-sitter and `ui` extractions each reduce to *move one module, swap one variable*. Jake itself gained the enablers during the spike — incremental `file` recipes, recipe-scoped `@require`, `@dotenv` (jake v0.9.1) — so each split-out repo can carry a tiny standalone Jakefile with the same ergonomics.
+
 ## Open questions
 - Org name final pick: `sema-lisp` (recommended) vs `sema-run` (domain match) vs `sema-org`.
 - Does the current `HelgeSverre/sema-lisp` repo get *renamed/transferred into* the org as the crates monorepo, or stay under the personal account with only the split-out repos in the org? (Recommendation: transfer the mono into the org too, so everything lives under one org; GitHub sets up redirects.)

@@ -69,14 +69,15 @@ export class SemaTreeItem extends SemaElement {
         background: var(--gold-glow, rgba(200, 168, 85, 0.08));
       }
 
-      /* Top-level parent items read as section headers (uppercased, dimmed, sans),
-         distinct from leaves. Gated to depth 0 so nested dirs stay normal. */
+      /* Top-level parent items read as section headers (uppercased, dimmed,
+         letter-spaced), distinct from leaves. Keeps the base --mono family so
+         the header never picks up the consumer's ambient font (e.g. a serif
+         page body). Gated to depth 0 so nested dirs stay normal. */
       :host([depth='0'][has-children]) .row {
         text-transform: uppercase;
         letter-spacing: 0.06em;
         font-size: var(--text-xxs, 10px);
         color: var(--text-tertiary, #5a5448);
-        font-family: inherit;
       }
 
       .chevron {

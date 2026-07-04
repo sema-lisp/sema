@@ -289,6 +289,20 @@
   (`"ios"`/`"android"`/`"freebsd"`/…) while `sys/platform` normalizes to the
   closed set `"macos"`/`"linux"`/`"windows"`/`"unknown"`.
 
+### Repository
+
+- **Editor plugins split into their own repos.** The editor plugins and the
+  tree-sitter grammar moved out of the monorepo into dedicated repositories under
+  the [`sema-lisp`](https://github.com/sema-lisp) org, each with its own CI and
+  publishing: `vscode-sema`, `zed-sema`, `intellij-sema`, `emacs-sema`,
+  `helix-sema`, `sema.nvim`, `sema.vim`, `tree-sitter-sema`, and a new
+  `sublime-sema` (Sublime Text support). Beyond syntax highlighting, several
+  plugins now wire up Sema's built-in language server (`sema lsp`), debugger
+  (`sema dap`), and MCP server (`sema mcp`). The `editors/` tree and its
+  build/publish workflows were removed from this repo, and the editor docs
+  (`README`, [sema-lang.com/docs/editors](https://sema-lang.com/docs/editors))
+  now point at the org repos.
+
 ## 1.28.1
 
 ### Fixed

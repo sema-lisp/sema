@@ -10,7 +10,7 @@ export {
   registerLanguage, toast, paginationItems,
 } from './lib/index.js';
 export type {
-  ButtonVariant, BadgeVariant, TooltipPlacement, SplitterDirection, DrawerPlacement, CodeFormatter, PopoverPlacement,
+  ButtonVariant, ButtonSize, BadgeVariant, TooltipPlacement, SplitterDirection, DrawerPlacement, CodeFormatter, PopoverPlacement,
   ToastVariant, ToasterPosition, ToastOptions, ToastHandle,
   ContainerSize, GridCols, GapToken, TabsActivation, SpinnerSize,
   SemaSelectEventDetail, SemaChangeEventDetail, SemaTreeSelectEventDetail, SemaPageChangeEventDetail, SemaResizeEventDetail,

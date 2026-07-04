@@ -3,6 +3,7 @@ import { property } from 'lit/decorators.js';
 import { SemaElement } from '../internal/sema-element.js';
 
 export type ButtonVariant = 'primary' | 'secondary' | 'ghost' | 'icon' | 'pill' | 'run' | 'debug' | 'action';
+export type ButtonSize = 'sm' | 'md';
 
 export class SemaButton extends SemaElement {
   static shadowRootOptions = {
@@ -210,10 +211,19 @@ export class SemaButton extends SemaElement {
         width: 13px;
         height: 13px;
       }
+
+      /* size=sm — compact toolbar metrics; placed last so it overrides the
+         form-scale text variants (secondary/ghost/primary) on equal specificity. */
+      :host([size="sm"]) .button {
+        padding: 0.3rem 0.9rem;
+        font-size: 0.7rem;
+        border-radius: var(--radius-sm, 3px);
+      }
     `,
   ];
 
   @property({ reflect: true }) variant: ButtonVariant = 'primary';
+  @property({ reflect: true }) size: ButtonSize = 'md';
   @property({ type: Boolean, reflect: true }) disabled = false;
   @property({ type: Boolean, reflect: true }) danger = false;
   @property({ attribute: 'shortcut' }) shortcut?: string;

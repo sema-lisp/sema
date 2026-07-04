@@ -69,4 +69,22 @@ describe('SemaButton', () => {
     const el = document.querySelector('sema-button')!
     expect(el.variant).toBe('primary')
   })
+
+  it('defaults to md size', async () => {
+    document.body.innerHTML = '<sema-button variant="secondary">x</sema-button>'
+    expect(document.querySelector('sema-button')!.size).toBe('md')
+  })
+
+  it('size="sm" reflects and applies compact metrics (smaller font) to the inner button', async () => {
+    document.body.innerHTML =
+      '<sema-button variant="secondary" size="sm">Fmt</sema-button><sema-button variant="secondary">Fmt</sema-button>'
+    const [sm, md] = document.querySelectorAll('sema-button')
+    await sm.updateComplete
+    await md.updateComplete
+    expect(sm.getAttribute('size')).toBe('sm')
+    const fs = (el: Element) =>
+      parseFloat(getComputedStyle(el.shadowRoot!.querySelector('button')!).fontSize)
+    // 0.7rem (~11px) is smaller than secondary's default 0.85rem (~13.6px)
+    expect(fs(sm)).toBeLessThan(fs(md))
+  })
 })

@@ -1,5 +1,5 @@
 export { SemaButton } from './sema-button.js';
-export type { ButtonVariant } from './sema-button.js';
+export type { ButtonVariant, ButtonSize } from './sema-button.js';
 
 export { SemaBadge } from './sema-badge.js';
 export type { BadgeVariant } from './sema-badge.js';

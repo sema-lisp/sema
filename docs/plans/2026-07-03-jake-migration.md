@@ -22,7 +22,7 @@ A modular `Jakefile` + `jake/*.jake` set porting the whole Makefile (96 recipes,
 | `jake/playground.jake` | `pg` | sema.run WASM playground build/dev/deploy |
 | `jake/bench.jake` | `bench` | hyperfine suites, 1BRC ladder, samply profile |
 | `jake/fuzz.jake` | `fuzz` | cargo-fuzz + in-Sema grammar fuzzer |
-| `jake/editors.jake` | `ed` | tree-sitter grammar + browser E2E suites |
+| `jake/editors.jake` | `ed` | tree-sitter grammar, **VS Code + IntelliJ extension packaging/publishing**, browser E2E |
 | `jake/release.jake` | `release` | coverage, mutation testing, publish-list guard |
 
 The daily drivers (`build`, `test`, `lint`, `fmt`, `run`) are imported **un-namespaced** so muscle

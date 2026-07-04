@@ -225,6 +225,27 @@
       </div>
     </div>
 
+    <!-- ═══════ PAGE ═══════ -->
+    <div class="demo-section-title">Page</div>
+    <div class="demo-tab-hint" style="margin-bottom:20px;">
+      The root wrapper — it provides the theme tokens (<code style="font-family:var(--mono);color:var(--gold);">--bg</code>, <code style="font-family:var(--mono);color:var(--gold);">--gold</code>, …), loads the brand fonts, and applies the body reset. It has no visible box of its own (<code style="font-family:var(--mono);color:var(--gold);">display:contents</code>) and owns global <code style="font-family:var(--mono);color:var(--gold);">document.body</code> styles, so it wraps the app once rather than nesting — <em>this very page</em> is wrapped in one.
+    </div>
+
+    <div class="demo-row">
+      <span class="demo-label">usage</span>
+      <div class="demo-cell" style="align-items:flex-start;">
+        <sema-code lang="html" copy style="width:520px;">
+          &lt;!-- full-height: pins body to 100vh, hides overflow --&gt;
+          &lt;!-- flex: makes body a column flexbox --&gt;
+          &lt;sema-page full-height flex&gt;
+            &lt;sema-container size="md"&gt;
+              &lt;!-- your app --&gt;
+            &lt;/sema-container&gt;
+          &lt;/sema-page&gt;
+        </sema-code>
+      </div>
+    </div>
+
     <!-- ═══════ LAYOUT ═══════ -->
     <div class="demo-section-title">Layout</div>
     <div class="demo-tab-hint" style="margin-bottom:1.25rem;">
@@ -386,6 +407,35 @@
         <sema-button variant="primary" id="dialog-confirm">Confirm</sema-button>
       </div>
     </sema-dialog>
+
+    <!-- ═══════ DRAWER ═══════ -->
+    <div class="demo-section-title">Drawer</div>
+    <div class="demo-tab-hint" style="margin-bottom:20px;">
+      Dockable slide-over panel — set <code style="font-family:var(--mono);color:var(--gold);">placement</code> to any edge. Press Esc or click the backdrop to close.
+    </div>
+
+    <div class="demo-row">
+      <span class="demo-label">placement</span>
+      <div class="demo-cell">
+        <sema-button variant="secondary" id="open-drawer-left">Left</sema-button>
+        <sema-button variant="secondary" id="open-drawer-right">Right</sema-button>
+        <sema-button variant="secondary" id="open-drawer-top">Top</sema-button>
+        <sema-button variant="secondary" id="open-drawer-bottom">Bottom</sema-button>
+      </div>
+    </div>
+
+    <sema-drawer id="drawer-left" placement="left" label="Left drawer">
+      <div style="padding:20px;">Docked to the left edge.</div>
+    </sema-drawer>
+    <sema-drawer id="drawer-right" placement="right" label="Settings">
+      <div style="padding:20px;">Docked to the right edge — the common settings/detail panel.</div>
+    </sema-drawer>
+    <sema-drawer id="drawer-top" placement="top" label="Top drawer">
+      <div style="padding:20px;">Docked to the top edge — good for notifications or search.</div>
+    </sema-drawer>
+    <sema-drawer id="drawer-bottom" placement="bottom" label="Bottom drawer">
+      <div style="padding:20px;">Docked to the bottom edge — a sheet-style panel.</div>
+    </sema-drawer>
 
     <!-- ═══════ TREE ═══════ -->
     <div class="demo-section-title">Tree</div>
@@ -555,15 +605,6 @@
         <sema-pagination page="3" total="10"></sema-pagination>
       </div>
     </div>
-    <div class="demo-row">
-      <span class="demo-label">drawer</span>
-      <div class="demo-cell">
-        <sema-button id="open-drawer" variant="secondary">Open drawer</sema-button>
-        <sema-drawer id="demo-drawer" placement="right" label="Settings">
-          <div style="padding:1.25rem;">Drawer content — press Esc or click the backdrop to close.</div>
-        </sema-drawer>
-      </div>
-    </div>
 
     <!-- ═══════ CODE TYPER ═══════ -->
     <div class="demo-section-title">Code Typer</div>
@@ -577,8 +618,8 @@
       </div>
     </div>
 
-    <!-- ═══════ RECIPES (DOGFOOD) ═══════ -->
-    <div class="demo-section-title">Recipes — Install &amp; Usage</div>
+    <!-- ═══════ TERMINAL (DOGFOOD: INSTALL & USAGE RECIPES) ═══════ -->
+    <div class="demo-section-title">Terminal — Install &amp; Usage Recipes</div>
     <div class="demo-tab-hint" style="margin-bottom:1.25rem;">
       The website homepage install/usage UI and a few <code style="font-family:var(--mono);color:var(--gold);">cli.html</code> examples, rebuilt with <code style="font-family:var(--mono);color:var(--gold);">&lt;sema-terminal&gt;</code> — no website code imported.
     </div>
@@ -875,8 +916,10 @@ Editing **markdown** source, previewed with sema-markdown.`;
 
   $('md-demo').value = $('md-src').textContent.trim();
 
-  // Drawer wire-up
-  $('open-drawer').addEventListener('click', () => { $('demo-drawer').open = true; });
+  // Drawer wire-up — one trigger per placement
+  for (const edge of ['left', 'right', 'top', 'bottom']) {
+    $(`open-drawer-${edge}`).addEventListener('click', () => { $(`drawer-${edge}`).open = true; });
+  }
 </script>
 
 </body>

@@ -1,5 +1,12 @@
 <script setup>
 import {ref} from 'vue'
+// The actual shipped, flattened icons (from assets/icons/svg via gen-brand-assets.py)
+// so this guide can't drift from what really ships.
+import {
+  sMarkTile as canonMark,
+  fileSemaLight as canonFileLight, fileSemaDark as canonFileDark,
+  fileSemac as canonSemac, fileNotebookLight as canonNbLight, fileNotebookDark as canonNbDark,
+} from './brandAssets'
 // TEMPORARILY DISABLED — Code Typer (<sema-code-typer>) showcase. These imports
 // reach outside website/ (../../../examples and ../../../ui/dist), which the
 // website-only Vercel deploy cannot resolve. Re-enable as part of the proper
@@ -110,13 +117,13 @@ const logoSubtleSvgCode = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 
 
 const icons = {
   oldSema: `<svg viewBox="0 0 16 16" width="64" height="64"><rect width="16" height="16" rx="3" fill="#1a1a1a"/><text x="8" y="12.5" text-anchor="middle" font-family="Georgia, 'Times New Roman', serif" font-weight="600" font-size="13" fill="#c8a855">S</text></svg>`,
-  newSema: `<svg viewBox="0 0 16 16" width="64" height="64"><rect width="16" height="16" rx="3" fill="#1a1a1a" stroke="#2b2620" stroke-width="0.5"/><text x="8" y="11" text-anchor="middle" font-family="'JetBrains Mono', monospace" font-weight="700" font-size="8" fill="#ffffff"><tspan fill="#c8a855">(</tspan>s<tspan fill="#c8a855">)</tspan></text></svg>`,
+  newSema: canonFileDark,
 
   oldSemac: `<svg viewBox="0 0 16 16" width="64" height="64"><rect width="16" height="16" rx="3" fill="#1a1a1a"/><text x="8" y="12.5" text-anchor="middle" font-family="Georgia, 'Times New Roman', serif" font-weight="600" font-size="13" fill="#7a7a7a">S</text><rect x="9" y="9" width="6" height="6" rx="1" fill="#c8a855" opacity="0.8"/><text x="12" y="13.5" text-anchor="middle" font-family="monospace" font-weight="700" font-size="5" fill="#1a1a1a">c</text></svg>`,
-  newSemac: `<svg viewBox="0 0 16 16" width="64" height="64"><rect width="16" height="16" rx="3" fill="#1a1a1a" stroke="#2b2620" stroke-width="0.5"/><text x="8" y="11" text-anchor="middle" font-family="'JetBrains Mono', monospace" font-weight="700" font-size="8" fill="#7a7a7a"><tspan fill="#6b6354">(</tspan>s<tspan fill="#6b6354">)</tspan></text><circle cx="12.5" cy="12.5" r="3" fill="#c8a855"/><text x="12.5" y="14.5" text-anchor="middle" font-family="'JetBrains Mono', monospace" font-weight="800" font-size="5.5" fill="#131110">c</text></svg>`,
+  newSemac: canonSemac,
 
   oldSemaNotebook: `<svg viewBox="0 0 16 16" width="64" height="64"><rect width="16" height="16" rx="3" fill="#1a1a1a"/><rect x="3" y="1.5" width="10" height="13" rx="1" fill="none" stroke="#c8a855" stroke-width="0.7" opacity="0.5"/><line x1="4" y1="5" x2="12" y2="5" stroke="#c8a855" stroke-width="0.6" opacity="0.35"/><line x1="4" y1="8" x2="10" y2="8" stroke="#c8a855" stroke-width="0.6" opacity="0.35"/><text x="8" y="12.5" text-anchor="middle" font-family="Georgia, 'Times New Roman', serif" font-weight="600" font-size="7" fill="#c8a855">S</text></svg>`,
-  newSemaNotebook: `<svg viewBox="0 0 16 16" width="64" height="64"><rect width="16" height="16" rx="3" fill="#1a1a1a" stroke="#2b2620" stroke-width="0.5"/><text x="7" y="11" text-anchor="middle" font-family="'JetBrains Mono', monospace" font-weight="700" font-size="7" fill="#ffffff"><tspan fill="#c8a855">(</tspan>s<tspan fill="#c8a855">)</tspan></text><rect x="10" y="10" width="5" height="5" rx="1" fill="#1a1a1a" stroke="#c8a855" stroke-width="0.7"/><line x1="11.5" y1="11.5" x2="13.5" y2="11.5" stroke="#c8a855" stroke-width="0.5"/><line x1="11.5" y1="13.5" x2="13" y2="13.5" stroke="#c8a855" stroke-width="0.5"/></svg>`,
+  newSemaNotebook: canonNbDark,
 
   oldSemaNotebookCells: `<svg viewBox="0 0 16 16" width="64" height="64"><rect width="16" height="16" rx="3" fill="#1a1a1a"/><rect x="3" y="1.5" width="10" height="13" rx="1" fill="#222" stroke="#c8a855" stroke-width="0.5" opacity="0.6"/><rect x="4" y="4" width="8" height="2.5" rx="0.5" fill="#c8a855" opacity="0.2"/><rect x="4" y="7.5" width="6" height="0.7" rx="0.3" fill="#aaa" opacity="0.4"/><rect x="4" y="9" width="4" height="0.7" rx="0.3" fill="#aaa" opacity="0.4"/><text x="8" y="12.5" text-anchor="middle" font-family="Georgia, 'Times New Roman', serif" font-weight="600" font-size="5" fill="#c8a855">S</text></svg>`,
   newSemaNotebookCells: `<svg viewBox="0 0 16 16" width="64" height="64"><rect width="16" height="16" rx="3" fill="#1a1a1a"/><rect x="3" y="1.5" width="10" height="13" rx="1" fill="#222" stroke="#c8a855" stroke-width="0.5" opacity="0.6"/><rect x="4" y="4" width="8" height="2.5" rx="0.5" fill="#c8a855" opacity="0.2"/><rect x="4" y="7.5" width="6" height="0.7" rx="0.3" fill="#aaa" opacity="0.4"/><rect x="4" y="9" width="4" height="0.7" rx="0.3" fill="#aaa" opacity="0.4"/><text x="8" y="13" text-anchor="middle" font-family="'JetBrains Mono', monospace" font-weight="700" font-size="4.5" fill="#ffffff"><tspan fill="#c8a855">(</tspan>s<tspan fill="#c8a855">)</tspan></text></svg>`,
@@ -128,17 +135,17 @@ const icons = {
   newSemaNotebookStacked: `<svg viewBox="0 0 16 16" width="64" height="64"><rect width="16" height="16" rx="3" fill="#1a1a1a"/><rect x="4" y="2.5" width="10" height="11" rx="1" fill="none" stroke="#c8a855" stroke-width="0.5" opacity="0.25"/><rect x="2.5" y="1.5" width="10" height="12" rx="1" fill="none" stroke="#c8a855" stroke-width="0.7" opacity="0.55"/><line x1="3.5" y1="5" x2="11.5" y2="5" stroke="#c8a855" stroke-width="0.6" opacity="0.35"/><line x1="3.5" y1="8" x2="9.5" y2="8" stroke="#c8a855" stroke-width="0.6" opacity="0.35"/><text x="7" y="11.5" text-anchor="middle" font-family="'JetBrains Mono', monospace" font-weight="700" font-size="5.5" fill="#ffffff"><tspan fill="#c8a855">(</tspan>s<tspan fill="#c8a855">)</tspan></text></svg>`,
 
   oldFavicon: `<svg viewBox="0 0 32 32" width="64" height="64"><rect width="32" height="32" rx="6" fill="#1a1a1a"/><text x="16" y="24.5" text-anchor="middle" font-family="Georgia, 'Times New Roman', serif" font-weight="600" font-size="26" fill="#c8a855">S</text></svg>`,
-  newFavicon: `<svg viewBox="0 0 32 32" width="64" height="64"><rect width="32" height="32" rx="6" fill="#1a1a1a" stroke="#2b2620" stroke-width="1"/><text x="16" y="22" text-anchor="middle" font-family="'JetBrains Mono', monospace" font-weight="700" font-size="15" fill="#ffffff"><tspan fill="#c8a855">(</tspan>s<tspan fill="#c8a855">)</tspan></text></svg>`,
+  newFavicon: canonMark,
 
-  fileSema: `<svg viewBox="0 0 16 16" width="32" height="32" fill="none"><text x="8" y="11.5" text-anchor="middle" font-family="'JetBrains Mono', monospace" font-weight="700" font-size="9" fill="#ffffff"><tspan fill="#c8a855" fill-opacity="0.65">(</tspan>s<tspan fill="#c8a855" fill-opacity="0.65">)</tspan></text></svg>`,
-  fileSemac: `<svg viewBox="0 0 16 16" width="32" height="32" fill="none"><text x="7" y="11.5" text-anchor="middle" font-family="'JetBrains Mono', monospace" font-weight="700" font-size="8.5" fill="#968c79"><tspan fill="#6b6354" fill-opacity="0.65">(</tspan>s<tspan fill="#6b6354" fill-opacity="0.65">)</tspan></text><circle cx="13" cy="12.5" r="2.8" fill="#c8a855"/><text x="13" y="14.2" text-anchor="middle" font-family="'JetBrains Mono', monospace" font-weight="800" font-size="5" fill="#131110">c</text></svg>`,
-  fileSemaNotebook: `<svg viewBox="0 0 16 16" width="32" height="32" fill="none"><text x="7" y="11.5" text-anchor="middle" font-family="'JetBrains Mono', monospace" font-weight="700" font-size="8.5" fill="#ffffff"><tspan fill="#c8a855" fill-opacity="0.65">(</tspan>s<tspan fill="#c8a855" fill-opacity="0.65">)</tspan></text><rect x="10.5" y="10.5" width="4.5" height="4.5" rx="0.5" fill="#131110" stroke="#c8a855" stroke-width="0.75"/><line x1="12" y1="12" x2="13.5" y2="12" stroke="#c8a855" stroke-width="0.5"/><line x1="12" y1="13.5" x2="13.5" y2="13.5" stroke="#c8a855" stroke-width="0.5"/></svg>`,
+  fileSema: canonFileDark,
+  fileSemac: canonSemac,
+  fileSemaNotebook: canonNbDark,
 
   // Light-theme variants: the glyph flips to a dark ink so it stays legible on
   // light IDE backgrounds (the dark-theme versions above use a white glyph).
   // .semac reads on both themes (muted gray), so it has no separate variant.
-  fileSemaLight: `<svg viewBox="0 0 16 16" width="32" height="32" fill="none"><text x="8" y="11.5" text-anchor="middle" font-family="'JetBrains Mono', monospace" font-weight="700" font-size="9" fill="#1a1a1a"><tspan fill="#c8a855" fill-opacity="0.65">(</tspan>s<tspan fill="#c8a855" fill-opacity="0.65">)</tspan></text></svg>`,
-  fileSemaNotebookLight: `<svg viewBox="0 0 16 16" width="32" height="32" fill="none"><text x="7" y="11.5" text-anchor="middle" font-family="'JetBrains Mono', monospace" font-weight="700" font-size="8.5" fill="#1a1a1a"><tspan fill="#c8a855" fill-opacity="0.65">(</tspan>s<tspan fill="#c8a855" fill-opacity="0.65">)</tspan></text><rect x="10.5" y="10.5" width="4.5" height="4.5" rx="0.5" fill="#ffffff" stroke="#c8a855" stroke-width="0.75"/><line x1="12" y1="12" x2="13.5" y2="12" stroke="#c8a855" stroke-width="0.5"/><line x1="12" y1="13.5" x2="13.5" y2="13.5" stroke="#c8a855" stroke-width="0.5"/></svg>`,
+  fileSemaLight: canonFileLight,
+  fileSemaNotebookLight: canonNbLight,
 
   // New-style notebook icon candidates (transparent (s) family). Not yet wired
   // into any product — parked here for future use (e.g. notebook actions /

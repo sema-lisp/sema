@@ -78,7 +78,10 @@ Each plugin's publishing target (Marketplace/OpenVSX, JetBrains, MELPA, etc.) is
 
 Decision reached after inventorying the folders. Coupling, not folder count, drives each call. **Nothing here is executed yet — this section records the target, per the "no moves until I say so" guardrail.**
 
-### `ui` → **SPLIT** (own repo + npm package), medium priority
+### `ui` → **SPLIT** (own repo + npm package), medium priority — *repo stood up 2026-07-05*
+
+> **Status (2026-07-05):** `sema-lisp/ui` created via history-preserving `git filter-repo`, package renamed `@sema/ui` → **`@sema-lang/ui`** (public, `publishConfig` provenance), CI green (typecheck/lint/281 tests/build), OIDC `publish-npm.yml` in place. **Not yet published** and **still present in the mono.** Remaining: (1) configure the npm Trusted Publisher on npmjs.org (`@sema-lang/ui` → repo `sema-lisp/ui` → workflow `publish-npm.yml`), (2) push `v0.1.0` to publish, (3) switch `website`/`playground`/`pkg` to consume the npm dep + re-enable the `<sema-code-typer>` showcase, (4) *then* remove `ui/` from the mono.
+
 `ui` is `@sema/ui` (v0.1.0, `private: true`, a web-components/Shiki bundle). Today it's **vendored by copy** into four places (`website/.vitepress/`, `pkg/static/`, `pkg/prototypes/`, and its own `ui/src/grammars/` tmLanguage copy) — the same drift hazard the grammar had. Publishing it as `@sema-lang/ui` and consuming it as a normal npm dep is the real fix: it kills the out-of-folder imports, lets `website`/`playground` depend on it cleanly, and re-enables the `<sema-code-typer>` brand showcase currently commented out in `BrandGuide.vue` (it breaks Vercel's `website/`-only upload by reaching up to the repo-root bundle). **Target repo:** `sema-lisp/ui`; **npm:** `@sema-lang/ui`. Do after the main-repo transfer settles; it's the highest-value Tier C item.
 
 ### `website` + `playground` → **KEEP coupled, KEEP in mono** (for now)

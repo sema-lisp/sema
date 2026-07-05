@@ -2,8 +2,8 @@
 
 use sea_orm::sea_query::Expr;
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, ConnectionTrait, DbErr, EntityTrait, QueryFilter, QueryOrder,
-    Set,
+    ActiveModelTrait, ColumnTrait, ConnectionTrait, DbErr, EntityTrait, PaginatorTrait,
+    QueryFilter, QueryOrder, Set,
 };
 
 use crate::dal::time;
@@ -53,6 +53,29 @@ pub async fn revoke<C: ConnectionTrait>(db: &C, token_id: i64, user_id: i64) -> 
         .await
         .map(|r| r.rows_affected)
         .unwrap_or(0)
+}
+
+/// Revoke every active token owned by `user_id`, stamping `revoked_at` in Rust.
+/// Returns the number of tokens revoked (0 if the user had none active).
+pub async fn revoke_all_for_user<C: ConnectionTrait>(db: &C, user_id: i64) -> u64 {
+    api_token::Entity::update_many()
+        .col_expr(api_token::Column::RevokedAt, Expr::value(time::now()))
+        .filter(api_token::Column::UserId.eq(user_id))
+        .filter(api_token::Column::RevokedAt.is_null())
+        .exec(db)
+        .await
+        .map(|r| r.rows_affected)
+        .unwrap_or(0)
+}
+
+/// Count a user's active (non-revoked) tokens.
+pub async fn count_active_for_user<C: ConnectionTrait>(db: &C, user_id: i64) -> i64 {
+    api_token::Entity::find()
+        .filter(api_token::Column::UserId.eq(user_id))
+        .filter(api_token::Column::RevokedAt.is_null())
+        .count(db)
+        .await
+        .unwrap_or(0) as i64
 }
 
 /// Look up an active (non-revoked) token by its hash.

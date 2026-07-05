@@ -9,7 +9,7 @@ use sea_orm::{
 };
 
 use crate::dal::time;
-use crate::entity::package;
+use crate::entity::{owner, package, package_version, report};
 
 /// Look up a package by its unique name.
 pub async fn find_by_name<C: ConnectionTrait>(
@@ -52,6 +52,66 @@ pub async fn update_description<C: ConnectionTrait>(
         .exec(db)
         .await
         .map(|_| ())
+}
+
+/// Admin: yank every version of a package by name. The subquery resolves the
+/// package id inside the UPDATE so it stays a single portable statement.
+/// Returns the number of versions yanked (0 if the package is missing or has
+/// no versions).
+pub async fn yank_all<C: ConnectionTrait>(db: &C, name: &str) -> u64 {
+    let result = db
+        .execute(Statement::from_sql_and_values(
+            db.get_database_backend(),
+            "UPDATE package_versions SET yanked = 1 WHERE package_id = (SELECT id FROM packages WHERE name = ?)",
+            [name.into()],
+        ))
+        .await;
+    result.map(|r| r.rows_affected()).unwrap_or(0)
+}
+
+/// Admin: delete a package and everything hanging off it — dependencies (via a
+/// version_id subquery), versions, owners, the package row, and any reports
+/// targeting it. Best-effort per step, mirroring the original handler. Returns
+/// `false` if no package with `name` exists (so the caller can 404), `true`
+/// once the cascade has run.
+pub async fn delete_by_name<C: ConnectionTrait>(db: &C, name: &str) -> bool {
+    let pkg_id = match find_by_name(db, name).await.ok().flatten() {
+        Some(p) => p.id,
+        None => return false,
+    };
+
+    // Delete dependencies via version_id join (raw SQL for subquery)
+    let _ = db
+        .execute(Statement::from_sql_and_values(
+            db.get_database_backend(),
+            "DELETE FROM dependencies WHERE version_id IN (SELECT id FROM package_versions WHERE package_id = ?)",
+            [pkg_id.into()],
+        ))
+        .await;
+
+    // Delete versions
+    let _ = package_version::Entity::delete_many()
+        .filter(package_version::Column::PackageId.eq(pkg_id))
+        .exec(db)
+        .await;
+
+    // Delete owners
+    let _ = owner::Entity::delete_many()
+        .filter(owner::Column::PackageId.eq(pkg_id))
+        .exec(db)
+        .await;
+
+    // Delete the package
+    let _ = package::Entity::delete_by_id(pkg_id).exec(db).await;
+
+    // Clean up any reports targeting this package
+    let _ = report::Entity::delete_many()
+        .filter(report::Column::TargetType.eq("package"))
+        .filter(report::Column::TargetName.eq(name))
+        .exec(db)
+        .await;
+
+    true
 }
 
 /// A single search hit: `(name, description, created_at)`.

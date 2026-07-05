@@ -16,11 +16,14 @@
 //! DAL functions take `&impl ConnectionTrait` so they compose with both a
 //! pooled connection and a transaction.
 
+pub mod admin;
+pub mod audit_log;
 pub mod deps;
 pub mod downloads;
 pub mod oauth;
 pub mod owners;
 pub mod packages;
+pub mod reports;
 pub mod sessions;
 pub mod time;
 pub mod tokens;

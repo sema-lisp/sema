@@ -1,6 +1,8 @@
 //! Session row storage and the session→user join used to authenticate cookies.
 
-use sea_orm::{ActiveModelTrait, ConnectionTrait, DbErr, EntityTrait, Set};
+use sea_orm::{
+    ActiveModelTrait, ColumnTrait, ConnectionTrait, DbErr, EntityTrait, QueryFilter, Set,
+};
 
 use crate::dal::time;
 use crate::entity::{session, user};
@@ -26,6 +28,16 @@ pub async fn create<C: ConnectionTrait>(
 /// returns the error for the caller to discard.
 pub async fn delete<C: ConnectionTrait>(db: &C, session_id: &str) -> Result<(), DbErr> {
     session::Entity::delete_by_id(session_id.to_string())
+        .exec(db)
+        .await
+        .map(|_| ())
+}
+
+/// Delete every session belonging to `user_id` (e.g. when the account is
+/// banned). Best-effort: the error is returned for the caller to discard.
+pub async fn delete_all_for_user<C: ConnectionTrait>(db: &C, user_id: i64) -> Result<(), DbErr> {
+    session::Entity::delete_many()
+        .filter(session::Column::UserId.eq(user_id))
         .exec(db)
         .await
         .map(|_| ())

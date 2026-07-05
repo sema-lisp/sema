@@ -1,11 +1,56 @@
 //! User lookups needed by other aggregates (kept intentionally minimal).
 
+use sea_orm::sea_query::Expr;
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, Condition, ConnectionTrait, DbErr, EntityTrait, QueryFilter, Set,
+    ActiveModelTrait, ColumnTrait, Condition, ConnectionTrait, DbErr, EntityTrait, QueryFilter,
+    Set, Value,
 };
 
 use crate::dal::time;
 use crate::entity::user;
+
+/// Look up a user by id.
+pub async fn find_by_id<C: ConnectionTrait>(
+    db: &C,
+    user_id: i64,
+) -> Result<Option<user::Model>, DbErr> {
+    user::Entity::find_by_id(user_id).one(db).await
+}
+
+/// Set or clear a user's banned state. Banning stamps `banned_at` with the
+/// current time; unbanning clears it to NULL.
+pub async fn set_banned<C: ConnectionTrait>(
+    db: &C,
+    user_id: i64,
+    banned: bool,
+) -> Result<(), DbErr> {
+    let value = if banned {
+        Expr::value(time::now())
+    } else {
+        Expr::value(Value::String(None))
+    };
+    user::Entity::update_many()
+        .col_expr(user::Column::BannedAt, value)
+        .filter(user::Column::Id.eq(user_id))
+        .exec(db)
+        .await
+        .map(|_| ())
+}
+
+/// Grant or revoke a user's admin role.
+pub async fn set_admin<C: ConnectionTrait>(
+    db: &C,
+    user_id: i64,
+    is_admin: bool,
+) -> Result<(), DbErr> {
+    let admin_val: i32 = if is_admin { 1 } else { 0 };
+    user::Entity::update_many()
+        .col_expr(user::Column::IsAdmin, Expr::value(admin_val))
+        .filter(user::Column::Id.eq(user_id))
+        .exec(db)
+        .await
+        .map(|_| ())
+}
 
 /// Look up a user by their unique username.
 pub async fn find_by_username<C: ConnectionTrait>(

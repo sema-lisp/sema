@@ -7,14 +7,13 @@ import {
   fileSemaLight as canonFileLight, fileSemaDark as canonFileDark,
   fileSemac as canonSemac, fileNotebookLight as canonNbLight, fileNotebookDark as canonNbDark,
 } from './brandAssets'
-// TEMPORARILY DISABLED — Code Typer (<sema-code-typer>) showcase. These imports
-// reach outside website/ (../../../examples and ../../../ui/dist), which the
-// website-only Vercel deploy cannot resolve. Re-enable as part of the proper
-// @sema/ui integration (see docs/plans/2026-06-21-mcp-client-spike.md sibling
-// work / monorepo deploy fix — git-integrate Vercel or vendor the bundle).
-// import {onMounted} from 'vue'
-// import mazeSource from '../../../examples/maze.sema?raw'
-// onMounted(() => { import('../../../ui/dist/sema-ui.js') })
+// Code Typer (<sema-code-typer>) showcase. The component ships as the published
+// @sema-lang/ui package (loaded lazily on the client), and the sample source is
+// vendored into website/ — so nothing reaches outside the website-only Vercel
+// deploy.
+import {onMounted} from 'vue'
+import mazeSource from './maze.sample.sema?raw'
+onMounted(() => { import('@sema-lang/ui/standalone') })
 
 const copied = ref({})
 
@@ -1385,12 +1384,7 @@ resp = client.messages.create(
           </div>
         </section>
 
-        <!-- 12. Code Typer — TEMPORARILY DISABLED.
-             The <sema-code-typer> showcase depends on the @sema/ui bundle and the
-             examples/maze.sema source, both outside website/, which the
-             website-only Vercel deploy can't resolve. Re-enable with the proper
-             @sema/ui integration + monorepo deploy fix (git-integrate Vercel, or
-             vendor the bundle into website/public/).
+        <!-- 12. Code Typer — <sema-code-typer> from the published @sema-lang/ui. -->
         <section id="typer" class="brand-section">
           <div class="section-meta">
             <span class="section-num">12</span>
@@ -1410,7 +1404,6 @@ resp = client.messages.create(
             </div>
           </ClientOnly>
         </section>
-        -->
       </main>
     </div>
   </div>

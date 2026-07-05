@@ -13,7 +13,6 @@
 #   jake/docs.jake     — builtin-doc index, pricing, link check
 #   jake/examples.jake — headless example + notebook + bytecode smoke runners + browser E2E
 #   jake/wasm.jake     — WASM VM build + browser-runtime vendoring (file recipes = incremental)
-#   jake/ui.jake       — @sema/ui component library build + vendoring into notebook/playground
 #   jake/web.jake      — VitePress docs site (build/preview/deploy/OG cards)
 #   jake/playground.jake — sema.run WASM playground (build/dev/deploy)
 #   jake/bench.jake    — hyperfine benchmarks + samply profiling
@@ -24,7 +23,6 @@
 @import "jake/docs.jake"
 @import "jake/examples.jake"
 @import "jake/wasm.jake" as wasm
-@import "jake/ui.jake" as ui
 @import "jake/web.jake" as site
 @import "jake/playground.jake" as pg
 @import "jake/bench.jake" as bench

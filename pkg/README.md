@@ -61,13 +61,12 @@ All configuration is via environment variables with sensible defaults:
 | `PORT` | `3000` | Listen port |
 | `DATABASE_URL` | `sqlite://data/registry.db?mode=rwc` | SQLite connection string |
 | `BLOB_DIR` | `data/blobs` | Directory for package tarballs |
-| `BASE_URL` | `http://localhost:3000` | Public URL (used in links) |
-| `SESSION_SECRET` | `change-me-in-production` | Secret for session cookies |
+| `BASE_URL` | `http://localhost:3000` | Public URL (used in links; enables `Secure` session cookies when `https://`) |
 | `MAX_TARBALL_BYTES` | `52428800` (50 MB) | Max upload size |
 | `MAX_DEPENDENCIES` | `64` | Max dependencies per published version |
 | `GITHUB_CLIENT_ID` | — | GitHub OAuth app client ID (optional) |
 | `GITHUB_CLIENT_SECRET` | — | GitHub OAuth app secret (optional) |
-| `OAUTH_TOKEN_KEY` | — | 32-char key for encrypting stored GitHub tokens (required for repo linking) |
+| `OAUTH_TOKEN_KEY` | — | 32-byte key encrypting stored GitHub tokens. **Required when GitHub OAuth is enabled** — the server refuses to boot if left at the insecure default. |
 
 ## API Endpoints
 
@@ -141,7 +140,7 @@ A package is either **CLI-uploaded** or **GitHub-linked**, never both. Once a pa
 
 1. Build: `cargo build --release`
 2. Copy `target/release/sema-pkg`, `templates/`, `static/`, and `migrations/` to your server
-3. Set `DATABASE_URL`, `BLOB_DIR`, `BASE_URL`, and `SESSION_SECRET`
+3. Set `DATABASE_URL`, `BLOB_DIR`, `BASE_URL` (use an `https://` URL so session cookies are marked `Secure`), and — if using GitHub OAuth — a unique `OAUTH_TOKEN_KEY`
 4. Run `sema-pkg` behind a reverse proxy (nginx/caddy) with TLS
 
 Or use the Docker image:

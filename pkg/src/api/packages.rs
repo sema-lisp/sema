@@ -21,6 +21,34 @@ use crate::{
 /// Magic bytes every gzip stream starts with (RFC 1952).
 const GZIP_MAGIC: [u8; 2] = [0x1f, 0x8b];
 
+/// Validate a published package name against a strict allowlist.
+///
+/// Names surface in HTML/JS contexts (the package page interpolates the name
+/// into Alpine `x-init`/`@click` JavaScript), so anything outside
+/// `[A-Za-z0-9._-]` — quotes, parens, angle brackets, semicolons, spaces — is
+/// rejected here to prevent a stored-XSS breakout. Also blocks `..` so the
+/// name can never be mistaken for a path traversal in derived filenames.
+pub fn validate_package_name(name: &str) -> Result<(), String> {
+    if name.is_empty() || name.len() > 64 {
+        return Err("Package name must be 1-64 characters".into());
+    }
+    if name.contains("..") {
+        return Err("Package name cannot contain '..'".into());
+    }
+    let bytes = name.as_bytes();
+    let is_alnum = |b: u8| b.is_ascii_alphanumeric();
+    if !is_alnum(bytes[0]) || !is_alnum(bytes[bytes.len() - 1]) {
+        return Err("Package name must start and end with a letter or digit".into());
+    }
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+    {
+        return Err("Package name may only contain letters, digits, '-', '_', and '.'".into());
+    }
+    Ok(())
+}
+
 // ── Publish ──
 
 #[derive(Deserialize, Default)]
@@ -50,6 +78,8 @@ pub async fn publish(
     if !scopes.contains("publish") {
         return Err(ApiError::forbidden("Token lacks publish scope"));
     }
+
+    validate_package_name(&name).map_err(ApiError::bad_request)?;
 
     let ver = semver::Version::parse(&version)
         .map_err(|_| ApiError::bad_request("Invalid semver version"))?;
@@ -107,6 +137,18 @@ pub async fn publish(
             "Too many dependencies (max {})",
             state.config.max_dependencies
         )));
+    }
+
+    // Repository URL, if given, must be an http(s) link — it is rendered as an
+    // `<a href>` on the package page, so a `javascript:`/`data:` scheme would
+    // be a stored-XSS vector.
+    if let Some(url) = &metadata.repository_url {
+        let is_http = url.starts_with("https://") || url.starts_with("http://");
+        if !url.is_empty() && !is_http {
+            return Err(ApiError::bad_request(
+                "repository_url must start with http:// or https://",
+            ));
+        }
     }
 
     for dep in &metadata.dependencies {

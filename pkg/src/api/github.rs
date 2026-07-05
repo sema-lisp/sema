@@ -69,6 +69,10 @@ pub async fn link(
         }
     };
 
+    // A repo's manifest name is attacker-controlled (they own the repo), so it
+    // must pass the same allowlist as a CLI publish before we store it.
+    crate::api::packages::validate_package_name(&manifest.name).map_err(ApiError::bad_request)?;
+
     // Check if package name is already taken
     let existing = package::Entity::find()
         .filter(package::Column::Name.eq(&manifest.name))
@@ -354,7 +358,9 @@ pub async fn webhook(
         return Err(ApiError::bad_request("Missing repository info"));
     }
 
-    // Find the package by github_repo
+    // Find the package by github_repo. Fold "unknown repo" into the same 403
+    // as a bad signature so an unauthenticated caller can't use the status
+    // code to enumerate which repos are linked.
     let pkg = package::Entity::find()
         .filter(package::Column::GithubRepo.eq(repo_full_name))
         .filter(package::Column::Source.eq("github"))
@@ -362,7 +368,7 @@ pub async fn webhook(
         .await
         .ok()
         .flatten()
-        .ok_or_else(|| ApiError::not_found("No linked package for this repo"))?;
+        .ok_or_else(|| ApiError::forbidden("Invalid signature"))?;
 
     let package_id = pkg.id;
 

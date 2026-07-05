@@ -11,6 +11,12 @@ async fn main() {
 
     let config = sema_pkg::config::Config::from_env();
 
+    // Fail closed on insecure production secrets before accepting any traffic.
+    if let Err(e) = config.check_production_secrets() {
+        eprintln!("Error: {e}");
+        std::process::exit(1);
+    }
+
     // Ensure data directories exist before connecting
     std::fs::create_dir_all(&config.blob_dir).expect("Failed to create blob dir");
     std::fs::create_dir_all("data").ok();

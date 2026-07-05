@@ -4,6 +4,21 @@
 
 ### Security
 
+- **Package registry (`pkg/`) — stored-XSS-to-admin-takeover and secret-default
+  fixes (from an adversarial review).** Published package names are now
+  validated against a strict allowlist (`[A-Za-z0-9._-]`, alnum-bounded, no
+  `..`) on both CLI publish and GitHub link; previously a name taken verbatim
+  from the URL was interpolated into the package page's Alpine `x-init`/`@click`
+  JavaScript, so a crafted name (e.g. `');fetch('/api/v1/admin/users/…/role',
+  {method:'PUT',body:'{"is_admin":true}'})//`) could run in an admin's browser
+  and self-promote to admin. `repository_url` is now required to be `http(s)`
+  (blocks a `javascript:` link on the package page). The server refuses to boot
+  when GitHub OAuth is enabled but `OAUTH_TOKEN_KEY` is left at the insecure
+  compiled-in default (stored GitHub tokens are AES-encrypted with it). The
+  webhook handler returns a uniform `403` for an unknown repo so the status code
+  can't be used to enumerate linked repositories. Removed the unused
+  `SESSION_SECRET` config (sessions use opaque random DB-backed ids; the key was
+  never referenced).
 - **Package registry (`pkg/`) auth hardening ahead of live deploy.** Logout now
   deletes the session row server-side, so a captured session cookie can no
   longer be replayed after the user logs out (previously the cookie stayed

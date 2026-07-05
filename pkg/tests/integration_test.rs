@@ -1117,6 +1117,98 @@ async fn test_security_banned_user_cannot_access_endpoints() {
     );
 }
 
+#[test]
+fn test_validate_package_name_blocks_xss_payloads() {
+    use sema_pkg::api::packages::validate_package_name;
+    // Legitimate names pass
+    for ok in ["x", "my-pkg", "lps-foo-bar", "http_client", "a.b.c", "Pkg9"] {
+        assert!(validate_package_name(ok).is_ok(), "{ok} should be valid");
+    }
+    // XSS breakout / path-traversal / structural payloads are rejected
+    for bad in [
+        "",
+        "');alert(1);('",
+        "a'b",
+        "a b",
+        "a<script>",
+        "a\"b",
+        "-lead",
+        "trail-",
+        "..",
+        "a..b",
+        ".hidden",
+        "a/b",
+    ] {
+        assert!(
+            validate_package_name(bad).is_err(),
+            "{bad:?} should be rejected"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_publish_rejects_xss_package_name() {
+    let (app, _dir) = test_app().await;
+    let session = register_user(app.clone(), "xssuser", "xss@example.com").await;
+    let token = create_api_token(app.clone(), &session, "xss-token").await;
+
+    // Percent-encoded "');alert(1);('" as a single path segment
+    let evil = "%27%29%3Balert%281%29%3B%28%27";
+    let res = publish_package_full(app.clone(), &token, evil, "1.0.0", &gzip(b"data"), "{}").await;
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn test_publish_rejects_non_http_repository_url() {
+    let (app, _dir) = test_app().await;
+    let session = register_user(app.clone(), "repouser", "repo@example.com").await;
+    let token = create_api_token(app.clone(), &session, "repo-token").await;
+
+    let meta = serde_json::json!({"repository_url": "javascript:alert(document.cookie)"});
+    let res = publish_package_full(
+        app.clone(),
+        &token,
+        "repo-pkg",
+        "1.0.0",
+        &gzip(b"data"),
+        &meta.to_string(),
+    )
+    .await;
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    let body = body_json(res).await;
+    assert!(body["error"].as_str().unwrap().contains("repository_url"));
+}
+
+#[test]
+fn test_check_production_secrets_rejects_default_key_with_github() {
+    use sema_pkg::config::{Config, DEFAULT_OAUTH_TOKEN_KEY};
+    let base = || Config {
+        host: "0.0.0.0".into(),
+        port: 3000,
+        database_url: "sqlite::memory:".into(),
+        blob_dir: "data/blobs".into(),
+        base_url: "https://example.com".into(),
+        github_client_id: None,
+        github_client_secret: None,
+        oauth_token_key: DEFAULT_OAUTH_TOKEN_KEY.into(),
+        max_tarball_bytes: 1024,
+        max_dependencies: 64,
+    };
+
+    // Default key + no GitHub OAuth: allowed (the key is never used)
+    assert!(base().check_production_secrets().is_ok());
+
+    // Default key + GitHub OAuth enabled: refuse to boot
+    let mut c = base();
+    c.github_client_id = Some("id".into());
+    c.github_client_secret = Some("secret".into());
+    assert!(c.check_production_secrets().is_err());
+
+    // GitHub OAuth enabled with a real key: allowed
+    c.oauth_token_key = "a-unique-production-key-32-bytes!".into();
+    assert!(c.check_production_secrets().is_ok());
+}
+
 #[tokio::test]
 async fn test_logout_invalidates_session_server_side() {
     let (app, _dir) = test_app().await;

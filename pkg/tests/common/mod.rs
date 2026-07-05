@@ -38,7 +38,6 @@ pub async fn test_app_with_state() -> (Router, Arc<AppState>, TempDir) {
         base_url: "http://localhost:3000".into(),
         github_client_id: None,
         github_client_secret: None,
-        session_secret: "test-secret".into(),
         oauth_token_key: "test-key-32-bytes-long-for-aes!!".into(),
         max_tarball_bytes: 10 * 1024 * 1024,
         max_dependencies: 64,

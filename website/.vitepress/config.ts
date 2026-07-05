@@ -293,6 +293,7 @@ export default defineConfig({
             { text: 'Code Formatter', link: '/docs/formatter' },
             { text: 'Shell Completions', link: '/docs/shell-completions' },
             { text: 'Editor Integration', link: '/docs/editors' },
+            { text: 'Structural Search (ast-grep)', link: '/docs/ast-grep' },
             { text: 'Language Server (LSP)', link: '/docs/lsp' },
             { text: 'Debugger (DAP)', link: '/docs/dap' },
             { text: 'MCP Server', link: '/docs/mcp' },

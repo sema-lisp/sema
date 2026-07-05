@@ -81,12 +81,13 @@ await build({
 });
 console.log('Bundled dist/app.js + dist/sema-worker.js');
 
-// 3. Vendor the @sema/ui web-component bundle (provides <sema-editor>). Built by
-//    the ui package (`cd ui && npm run build`); loaded by index.html before app.js.
-const SEMA_UI_SRC = '../ui/dist/sema-ui.js';
+// 3. Vendor the @sema-lang/ui web-component bundle (provides <sema-editor>). It
+//    comes from the published npm package (`npm install`); loaded by index.html
+//    before app.js.
+const SEMA_UI_SRC = 'node_modules/@sema-lang/ui/dist/sema-ui.js';
 if (existsSync(SEMA_UI_SRC)) {
   cpSync(SEMA_UI_SRC, join(DIST_DIR, 'sema-ui.js'));
-  console.log('Vendored dist/sema-ui.js from @sema/ui');
+  console.log('Vendored dist/sema-ui.js from @sema-lang/ui');
 } else {
-  console.warn(`WARNING: ${SEMA_UI_SRC} not found — run \`cd ui && npm run build\` first (<sema-editor> will be missing).`);
+  console.warn(`WARNING: ${SEMA_UI_SRC} not found — run \`npm install\` first (<sema-editor> will be missing).`);
 }

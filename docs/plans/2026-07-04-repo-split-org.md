@@ -1,7 +1,7 @@
 # Repo Split & GitHub Org Migration Plan
 
 **Date:** 2026-07-04 (status updated 2026-07-05)
-**Status:** **Tier B (editors + grammar) DONE**; Tier C decided (below), not executed; main-repo transfer pending.
+**Status:** **Tier B (editors + grammar) DONE**; **Tier C in progress** — `ui` split + published (`@sema-lang/ui`), `website`/`playground`/`pkg` kept in mono, `pkg` deferred; main-repo transfer pending.
 **Related:** `docs/plans/2026-02-16-editor-plugin-publishing.md` (per-editor publishing targets — this plan is the *repo-structure* prerequisite for those workflows)
 
 ## Status update (2026-07-05)
@@ -9,7 +9,9 @@
 - **Tier B complete.** The `sema-lisp` org exists and hosts nine live repos, each with its own green CI/publishing: `tree-sitter-sema`, `vscode-sema`, `zed-sema`, `intellij-sema`, `emacs-sema`, `helix-sema`, `sema.nvim`, `sema.vim`, `sublime-sema` (Sublime added post-plan). The three tree-sitter consumers (Zed/Helix/nvim) point at `sema-lisp/tree-sitter-sema` with pinned commits/tags.
 - **`editors/` removed from the mono** in this pass, along with the editor CI workflows (`subtree-split.yml`, `publish-vscode-extension.yml`, `intellij-build.yml`, `intellij-release.yml`), the Makefile `ts-*` targets, and the `codecov.yml` `editors/**` ignore. Editor docs (`website/docs/editors.md`, root `README.md`) now point at the org repos.
 - **Old `HelgeSverre/tree-sitter-sema` mirror** retired/deleted (0 stars, mirror-only; superseded by `sema-lisp/tree-sitter-sema`).
-- **Still pending:** Tier C execution (below), the main-repo transfer `HelgeSverre/sema` → `sema-lisp/sema` (last), and the outside-contributor PR (skipped for now).
+- **Tier C started.** `sema-lisp/ui` is live and **`@sema-lang/ui` publishes to npm via OIDC** (`0.1.1` shipped from CI with SLSA provenance). `ui/` is still in the mono until consumers migrate to the npm dep. `website`+`playground` stay in the mono; `pkg` split deferred (see Tier C below).
+- **Build automation.** The `feature/jakefile-migration` work is merged into `main` as a modular `Jakefile` **alongside** the Makefile (split-adapted — no editors module); each split repo (`tree-sitter-sema`, `vscode-sema`, `intellij-sema`, `ui`) carries a standalone `@rooted` Jakefile for future `workspace` meta-repo composition.
+- **Still pending:** migrate `website`/`playground`/`pkg` to consume `@sema-lang/ui` from npm then remove `ui/` from the mono; the main-repo transfer `HelgeSverre/sema` → `sema-lisp/sema` (last); the outside-contributor PR (skipped for now); optional full Makefile→Jake switch (retire Makefile + rewire CI).
 
 ## Goal
 

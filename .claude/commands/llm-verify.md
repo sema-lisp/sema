@@ -54,6 +54,6 @@ Useful live probes:
 ## Honesty check
 
 If a feature only partially works, fix it or document the limitation — never
-leave a doc/homepage claim the code doesn't back (see `docs/llm-agentic-audit.md`).
+leave a doc/homepage claim the code doesn't back (see `docs/plans/archive/2026-06-21-llm-agentic-audit.md`).
 Cache hits must report zero usage; canonical `ChatRequest` fields map per-provider
 (no provider branching in Sema code or builtins).

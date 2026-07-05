@@ -298,17 +298,22 @@ sema completions fish > ~/.config/fish/completions/sema.fish
 
 ### Editor Support
 
-| Editor           | Install                                                                                   |
-| ---------------- | ----------------------------------------------------------------------------------------- |
-| **VS Code**      | See [install instructions](https://sema-lang.com/docs/editors)                       |
-| **Zed**          | Install Dev Extension → select `editors/zed`                                              |
-| **Vim / Neovim** | `Plug 'helgesverre/sema', { 'rtp': 'editors/vim' }`                                       |
-| **Emacs**        | `(require 'sema-mode)` — see [docs](https://sema-lang.com/docs/editors)              |
-| **Helix**        | Copy `languages.toml` + query files — see [docs](https://sema-lang.com/docs/editors) |
+Each editor plugin lives in its own repo under the [`sema-lisp`](https://github.com/sema-lisp) org:
 
-All editors provide syntax highlighting for builtins, special forms, keyword literals, character literals, LLM primitives, and more.
+| Editor           | Repository                                                        | Install                                              |
+| ---------------- | ---------------------------------------------------------------- | ---------------------------------------------------- |
+| **VS Code**      | [`vscode-sema`](https://github.com/sema-lisp/vscode-sema)        | `ext install helgesverre.sema`                       |
+| **Zed**          | [`zed-sema`](https://github.com/sema-lisp/zed-sema)              | Extensions → search **Sema**                         |
+| **IntelliJ**     | [`intellij-sema`](https://github.com/sema-lisp/intellij-sema)    | JetBrains Marketplace → **Sema**                     |
+| **Neovim**       | [`sema.nvim`](https://github.com/sema-lisp/sema.nvim)            | `{ "sema-lisp/sema.nvim" }`                           |
+| **Vim**          | [`sema.vim`](https://github.com/sema-lisp/sema.vim)              | `Plug 'sema-lisp/sema.vim'`                           |
+| **Emacs**        | [`emacs-sema`](https://github.com/sema-lisp/emacs-sema)          | MELPA → `sema-mode`                                   |
+| **Helix**        | [`helix-sema`](https://github.com/sema-lisp/helix-sema)          | clone + `./install.sh`                               |
+| **Sublime Text** | [`sublime-sema`](https://github.com/sema-lisp/sublime-sema)      | Package Control → **Sema**                           |
 
-> 📖 Full installation instructions: **[sema-lang.com/docs/editors](https://sema-lang.com/docs/editors)**
+All plugins provide syntax highlighting; VS Code, Zed, IntelliJ, Neovim, Emacs, Helix, and Sublime also wire up the built-in **language server** (`sema lsp`), and several (VS Code, Zed, IntelliJ, Neovim, Helix) add **debugging** (`sema dap`) — some also register the **MCP server** (`sema mcp`). Zed, Helix, and Neovim highlight via the shared [`tree-sitter-sema`](https://github.com/sema-lisp/tree-sitter-sema) grammar; the others ship their own.
+
+> 📖 Full installation instructions and per-editor feature lists: **[sema-lang.com/docs/editors](https://sema-lang.com/docs/editors)**
 
 ### Notebook
 

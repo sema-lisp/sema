@@ -1283,7 +1283,7 @@ fn test_websocket_binary_echo() {
                       (when msg
                         ((:send conn) msg)
                         (loop)))))]])
-              {:port 19903})
+              {:port 19923})
         "#,
         )
         .stdout(Stdio::piped())
@@ -1293,7 +1293,7 @@ fn test_websocket_binary_echo() {
 
     std::thread::sleep(Duration::from_millis(1500));
 
-    let (mut ws, _) = tungstenite::connect("ws://127.0.0.1:19903/echo").expect("WS connect");
+    let (mut ws, _) = tungstenite::connect("ws://127.0.0.1:19923/echo").expect("WS connect");
 
     // Binary frame with edge bytes (0, 255, 128) must round-trip byte-identical.
     let payload = vec![1u8, 2, 3, 255, 0, 128, 64];
@@ -1412,7 +1412,7 @@ fn test_websocket_client_round_trip() {
                       (when msg
                         ((:send conn) (string-append "re:" msg))
                         (loop)))))]])
-              {:port 19908})
+              {:port 19920})
         "#,
         )
         .stdout(Stdio::piped())
@@ -1420,14 +1420,28 @@ fn test_websocket_client_round_trip() {
         .spawn()
         .expect("Failed to spawn server");
 
-    std::thread::sleep(Duration::from_millis(1500));
+    // Wait for the server subprocess to actually LISTEN (spawn + prelude + bind
+    // can take seconds under full-suite parallel load) — a fixed sleep flakes.
+    {
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            if std::net::TcpStream::connect("127.0.0.1:19920").is_ok() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "server on :19920 never started listening"
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
 
     // Client: text round-trip, connected? predicate, and a map sent as JSON text.
     let client = Command::new(env!("CARGO_BIN_EXE_sema"))
         .arg("-e")
         .arg(
             r#"
-            (with-open (sock (ws/connect "ws://127.0.0.1:19908/chat"))
+            (with-open (sock (ws/connect "ws://127.0.0.1:19920/chat"))
               (println (ws/connected? sock))
               (ws/send sock "hello")
               (println (ws/recv sock))
@@ -1483,7 +1497,7 @@ fn test_websocket_client_options_and_framing() {
                       (when msg
                         ((:send conn) (string-append "re:" msg))
                         (loop)))))]])
-              {:port 19909})
+              {:port 19921})
         "#,
         )
         .stdout(Stdio::piped())
@@ -1491,13 +1505,27 @@ fn test_websocket_client_options_and_framing() {
         .spawn()
         .expect("Failed to spawn server");
 
-    std::thread::sleep(Duration::from_millis(1500));
+    // Wait for the server subprocess to actually LISTEN (spawn + prelude + bind
+    // can take seconds under full-suite parallel load) — a fixed sleep flakes.
+    {
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            if std::net::TcpStream::connect("127.0.0.1:19921").is_ok() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "server on :19921 never started listening"
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
 
     let client = Command::new(env!("CARGO_BIN_EXE_sema"))
         .arg("-e")
         .arg(
             r#"
-            (with-open (sock (ws/connect "ws://127.0.0.1:19909/chat"
+            (with-open (sock (ws/connect "ws://127.0.0.1:19921/chat"
                                {:timeout 3000 :retries 2 :headers {"X-Test" "1"}}))
               ;; {:json v} sends the inner value as JSON (not wrapped in {"json":…}).
               (ws/send sock {:json {:type "ping"}})
@@ -1556,7 +1584,7 @@ fn test_websocket_listen() {
                     (when msg
                       ((:send conn) "hello-listener")
                       ((:close conn)))))]])
-              {:port 19910})
+              {:port 19922})
         "#,
         )
         .stdout(Stdio::piped())
@@ -1564,13 +1592,27 @@ fn test_websocket_listen() {
         .spawn()
         .expect("Failed to spawn server");
 
-    std::thread::sleep(Duration::from_millis(1500));
+    // Wait for the server subprocess to actually LISTEN (spawn + prelude + bind
+    // can take seconds under full-suite parallel load) — a fixed sleep flakes.
+    {
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            if std::net::TcpStream::connect("127.0.0.1:19922").is_ok() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "server on :19922 never started listening"
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
 
     let client = Command::new(env!("CARGO_BIN_EXE_sema"))
         .arg("-e")
         .arg(
             r#"
-            (with-open (sock (ws/connect "ws://127.0.0.1:19910/once"))
+            (with-open (sock (ws/connect "ws://127.0.0.1:19922/once"))
               (ws/send sock "go")
               (async/await
                 (ws/listen sock

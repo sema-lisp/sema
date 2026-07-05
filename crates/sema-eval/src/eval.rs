@@ -626,12 +626,23 @@ fn register_defmacro(items: &[Value], env: &Env) -> Result<(), SemaError> {
 pub fn load_prelude(ctx: &EvalContext, env: &Rc<Env>) {
     let exprs = sema_reader::read_many(crate::prelude::PRELUDE)
         .unwrap_or_else(|e| panic!("internal: prelude failed to parse: {e}"));
-    // The prelude is exclusively `defmacro` forms. Register them via the
-    // VM-native pre-expansion path so prelude loading never routes macro
-    // registration through the tree-walker's `eval_value`.
+    // The prelude is mostly `defmacro` forms (which expand to nil, registering the
+    // macro as a side effect) plus a few `define` forms (the async agent-loop driver).
+    // Register/expand via the VM-native path so prelude loading never routes through
+    // the tree-walker; a `define` expands to a non-nil form, which we compile + run on
+    // the VM (rooted at the global env) so its top-level binding persists.
     for expr in &exprs {
-        expand_for_vm_in(ctx, env, expr)
+        let expanded = expand_for_vm_in(ctx, env, expr)
             .unwrap_or_else(|e| panic!("internal: prelude failed to load: {e}"));
+        if expanded.is_nil() {
+            continue;
+        }
+        let prog = sema_vm::compile_program(std::slice::from_ref(&expanded), None)
+            .unwrap_or_else(|e| panic!("internal: prelude failed to compile: {e}"));
+        let mut vm = sema_vm::VM::new(env.clone(), prog.functions, &[], prog.main_cache_slots)
+            .unwrap_or_else(|e| panic!("internal: prelude VM init failed: {e}"));
+        vm.execute(prog.closure, ctx)
+            .unwrap_or_else(|e| panic!("internal: prelude failed to evaluate: {e}"));
     }
 }
 

@@ -33,6 +33,8 @@ SKIP_FILES=(
   # not a deterministic build-path test:
   "examples/stdlib/http.sema"   # makes real network requests — flaky/non-
                                 # deterministic; not exercising the build path.
+  "examples/llm/async-stress-live.sema" # LIVE provider stress (real spend) —
+                                # manual gate only, via `make llm-stress`.
 )
 is_skipped() { local f="$1"; for s in "${SKIP_FILES[@]}"; do [ "$f" = "$s" ] && return 0; done; return 1; }
 

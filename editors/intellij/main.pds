@@ -1,7 +1,0 @@
-//! Top-level model. Run `pds doc` to render its diagrams.
-
-/// The system this workspace models.
-public system App {
-    /// An example operation.
-    start();
-}

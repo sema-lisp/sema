@@ -23,7 +23,7 @@ make test-notebook-e2e  # Playwright E2E tests for notebook
 - Single eval test: `cargo test -p sema --test eval_test -- test_name` | Ignored tests: `cargo test -p sema -- --ignored`
 - Run file: `cargo run -- examples/hello.sema` | REPL: `cargo run` | Eval: `cargo run -- -e "(+ 1 2)"`
 - Integration tests: `crates/sema/tests/integration_test.rs`. Eval tests: `crates/sema/tests/eval_test.rs`. Reader unit tests: `crates/sema-reader/src/reader.rs`.
-- IntelliJ plugin: `editors/intellij/`. Unit tests: `./gradlew test` (JUnit 4). Full IDE integration: `./gradlew buildPlugin integrationTest`.
+- Editor plugins live in their own repos under the `sema-lisp` org (`vscode-sema`, `zed-sema`, `intellij-sema`, `emacs-sema`, `helix-sema`, `sema.nvim`, `sema.vim`, `sublime-sema`) and the grammar in `sema-lisp/tree-sitter-sema` — they are no longer in this repo. Each carries its own CI/publishing.
 
 ## Architecture (Cargo workspace)
 
@@ -97,7 +97,7 @@ The bytecode VM (`sema-vm`) is the **sole evaluator**. All tests run on the VM. 
 
 ## LLM & Agentic Features (sema-llm)
 
-Hard-won conventions — follow these or you will reintroduce shipped bugs (see `docs/llm-agentic-audit.md` and CHANGELOG 1.21.x):
+Hard-won conventions — follow these or you will reintroduce shipped bugs (see `docs/plans/archive/2026-06-21-llm-agentic-audit.md` and CHANGELOG 1.21.x):
 
 - **One canonical request, per-provider translation.** `ChatRequest` (in `sema-llm/src/types.rs`) is the single source of truth that Sema code produces; each provider's `build_request_body` (anthropic/openai/gemini/ollama) translates it to that provider's wire format. **Never branch on provider in Sema code or in builtins** — add the field to `ChatRequest` and map it in each serializer. Example: `:reasoning-effort` → OpenAI `reasoning_effort`, Anthropic extended thinking (`budget_tokens` + max-tokens/temperature adjustments), Gemini `thinkingConfig`.
 - **Tool-result correlation is mandatory.** The agent loop (`run_tool_loop`) must echo the assistant `tool_calls` turn and send results as correlated `ChatMessage::tool_result(id, name, content)`; each serializer maps that to its native shape (OpenAI `role:"tool"`+`tool_call_id`, Anthropic `tool_use`/`tool_result` blocks, Gemini `functionCall`/`functionResponse`). Plain user-text results silently break OpenAI-family providers.
@@ -135,7 +135,7 @@ Hard-won conventions — follow these or you will reintroduce shipped bugs (see 
 - **Deploy gotcha (monorepo):** the Vercel project is CLI-deployed and **uploads only `website/`** — so any `import` in the site that reaches *outside* `website/` (e.g. `../../../ui/dist/...` or `../../../examples/...`) builds locally but **fails on Vercel** ("No such file or directory"). Keep all site imports inside `website/`. The `<sema-code-typer>` brand-page showcase (which imports the repo-root `@sema/ui` bundle) is currently **commented out** in `website/.vitepress/theme/BrandGuide.vue` for this reason; re-enabling it needs the proper monorepo deploy fix (git-integrate the Vercel project — `sourceFilesOutsideRootDirectory` is already on — or vendor the bundle into `website/public/`). Verify a deploy actually promoted: a failed build leaves the previous deploy live (production looks unchanged).
 - The live homepage is the **`HomepageV2.vue`** component (via `website/index.md`), **not** any standalone `*.html` file.
 - VitePress site uses **clean URLs** (`cleanUrls: true` in both `config.ts` and `vercel.json`): the canonical form is extensionless, e.g. `https://sema-lang.com/docs/internals/lisp-comparison`. The build still writes `*.html` files and Vercel 308-redirects the `.html` form to the clean URL, so don't hardcode `.html` in internal doc links — write `/docs/lsp`, not `/docs/lsp.html`. Per-page `<link rel="canonical">` + `og:url` are emitted extensionless via `transformHead`. All docs pages are under `/docs/`.
-- **Syntax highlighting**: use `` ```sema `` for code blocks in website docs. The custom TextMate grammar is at `website/.vitepress/sema.tmLanguage.json` (copied from canonical source `editors/vscode/sema/syntaxes/sema.tmLanguage.json` — keep in sync). For GitHub markdown outside the website, `sema` won't be recognized — use `` ```scheme `` as fallback there.
+- **Syntax highlighting**: use `` ```sema `` for code blocks in website docs. The custom TextMate grammar is vendored at `website/.vitepress/sema.tmLanguage.json`, a copy of the canonical grammar now in the `sema-lisp/vscode-sema` repo (`syntaxes/sema.tmLanguage.json`) — re-copy from there when it changes (`pkg/` keeps its own copy too; the UI library is now the separate `sema-lisp/ui` repo). For GitHub markdown outside the website, `sema` won't be recognized — use `` ```scheme `` as fallback there.
 - **OpenGraph cards**: per-page social images are generated from `website/og-template.html` (the single design source — homepage + docs variants, driven by URL query params) by `website/scripts/generate-og.mjs` (headless Chromium via Playwright). Run `make site-og` (or `cd website && npm run og`) after editing the template, logo, page titles, or version, then commit the regenerated `website/public/og/*.jpg` plus `playground/og-playground.jpg`. `config.ts` `transformHead` wires each page to its card; slug/category/dimension logic is shared via `website/.vitepress/og.shared.mjs`.
 
 ## Design Docs

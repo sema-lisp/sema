@@ -42,8 +42,11 @@ jobs:
       - name: Check builtin docs (committed index fresh + fully documented)
         run: make docs-check
 
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
+
       - name: Run tests
-        run: cargo test --workspace
+        run: cargo nextest run --workspace --profile ci
 
       - name: Smoke test examples
         run: make examples

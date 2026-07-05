@@ -1328,69 +1328,59 @@ fn http_serve_impl(ctx: &sema_core::EvalContext, args: &[Value]) -> Result<Value
     let bind_host = host.clone();
     let bind_port = port;
 
-    // Spawn background thread with its own tokio runtime for axum
-    std::thread::spawn(move || {
-        let rt = match tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-        {
-            Ok(rt) => rt,
+    // Spawn the bind+serve future (Send + 'static) onto the process-wide I/O
+    // pool. The server runs for the process lifetime (the VM thread below sits
+    // in the handler loop until every request sender is gone), so the returned
+    // AbortHook is deliberately unused — dropping it does not abort.
+    let _abort = sema_io::io_spawn(async move {
+        let tx = tx;
+
+        // Build the axum router with a fallback handler that catches all requests.
+        // We manually extract WebSocketUpgrade from request parts when needed.
+        let app = axum::Router::new().fallback(move |req: axum::extract::Request| {
+            let tx = tx.clone();
+            async move {
+                // Try to extract WebSocketUpgrade from request parts
+                use axum::extract::FromRequestParts;
+                let (mut parts, body) = req.into_parts();
+                let ws_upgrade: Option<axum::extract::ws::WebSocketUpgrade> =
+                    axum::extract::ws::WebSocketUpgrade::from_request_parts(&mut parts, &())
+                        .await
+                        .ok();
+                let req = axum::extract::Request::from_parts(parts, body);
+                handle_axum_request(ws_upgrade, req, tx).await
+            }
+        });
+
+        // Bind the TCP listener. With fallback enabled, walk to the next
+        // free port on AddrInUse; otherwise bind the requested port only.
+        let bind_result = if port_fallback {
+            sema_core::net::bind_with_fallback(&bind_host, bind_port, 100).and_then(
+                |(std_listener, actual)| {
+                    std_listener.set_nonblocking(true)?;
+                    let listener = tokio::net::TcpListener::from_std(std_listener)?;
+                    Ok((listener, actual))
+                },
+            )
+        } else {
+            let addr = format!("{bind_host}:{bind_port}");
+            tokio::net::TcpListener::bind(&addr)
+                .await
+                .map(|listener| (listener, bind_port))
+        };
+        let (listener, actual_port) = match bind_result {
+            Ok(pair) => pair,
             Err(e) => {
-                let _ = ready_tx.send(Err(format!("failed to create runtime: {e}")));
+                let _ = ready_tx.send(Err(format!("bind {bind_host}:{bind_port}: {e}")));
                 return;
             }
         };
 
-        rt.block_on(async move {
-            let tx = tx;
+        // Signal success with the port actually bound
+        let _ = ready_tx.send(Ok(actual_port));
 
-            // Build the axum router with a fallback handler that catches all requests.
-            // We manually extract WebSocketUpgrade from request parts when needed.
-            let app = axum::Router::new().fallback(move |req: axum::extract::Request| {
-                let tx = tx.clone();
-                async move {
-                    // Try to extract WebSocketUpgrade from request parts
-                    use axum::extract::FromRequestParts;
-                    let (mut parts, body) = req.into_parts();
-                    let ws_upgrade: Option<axum::extract::ws::WebSocketUpgrade> =
-                        axum::extract::ws::WebSocketUpgrade::from_request_parts(&mut parts, &())
-                            .await
-                            .ok();
-                    let req = axum::extract::Request::from_parts(parts, body);
-                    handle_axum_request(ws_upgrade, req, tx).await
-                }
-            });
-
-            // Bind the TCP listener. With fallback enabled, walk to the next
-            // free port on AddrInUse; otherwise bind the requested port only.
-            let bind_result = if port_fallback {
-                sema_core::net::bind_with_fallback(&bind_host, bind_port, 100).and_then(
-                    |(std_listener, actual)| {
-                        std_listener.set_nonblocking(true)?;
-                        let listener = tokio::net::TcpListener::from_std(std_listener)?;
-                        Ok((listener, actual))
-                    },
-                )
-            } else {
-                let addr = format!("{bind_host}:{bind_port}");
-                tokio::net::TcpListener::bind(&addr)
-                    .await
-                    .map(|listener| (listener, bind_port))
-            };
-            let (listener, actual_port) = match bind_result {
-                Ok(pair) => pair,
-                Err(e) => {
-                    let _ = ready_tx.send(Err(format!("bind {bind_host}:{bind_port}: {e}")));
-                    return;
-                }
-            };
-
-            // Signal success with the port actually bound
-            let _ = ready_tx.send(Ok(actual_port));
-
-            // Run the server
-            let _ = axum::serve(listener, app).await;
-        });
+        // Run the server
+        let _ = axum::serve(listener, app).await;
     });
 
     // Wait for the ready signal (carrying the actual bound port) from the thread

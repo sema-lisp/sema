@@ -80,7 +80,6 @@ pub struct OpenAiCompatEmbeddingProvider {
     /// Set for providers that also offer a hosted reranker (Jina, Voyage).
     rerank: Option<RerankDialect>,
     client: reqwest::Client,
-    runtime: crate::http::BlockingRuntime,
 }
 
 impl OpenAiCompatEmbeddingProvider {
@@ -90,7 +89,6 @@ impl OpenAiCompatEmbeddingProvider {
         base_url: String,
         default_model: String,
     ) -> Result<Self, LlmError> {
-        let runtime = crate::http::create_runtime()?;
         Ok(Self {
             name,
             api_key,
@@ -98,7 +96,6 @@ impl OpenAiCompatEmbeddingProvider {
             default_model,
             rerank: None,
             client: crate::http::create_client(None)?,
-            runtime,
         })
     }
 
@@ -237,12 +234,17 @@ impl LlmProvider for OpenAiCompatEmbeddingProvider {
     }
 
     fn embed(&self, request: EmbedRequest) -> Result<EmbedResponse, LlmError> {
-        self.runtime.block_on(self.embed_async(request))
+        sema_io::io_block_on(self.embed_async(request))
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn embed_future(&self, request: EmbedRequest) -> Option<crate::provider::BoxEmbedFuture<'_>> {
+        Some(Box::pin(self.embed_async(request)))
     }
 
     fn rerank(&self, request: RerankRequest) -> Result<RerankResponse, LlmError> {
         match self.rerank {
-            Some(dialect) => self.runtime.block_on(self.rerank_async(request, dialect)),
+            Some(dialect) => sema_io::io_block_on(self.rerank_async(request, dialect)),
             None => Err(LlmError::Config(format!(
                 "{} does not support reranking",
                 self.name
@@ -256,17 +258,14 @@ pub struct CohereEmbeddingProvider {
     api_key: String,
     default_model: String,
     client: reqwest::Client,
-    runtime: crate::http::BlockingRuntime,
 }
 
 impl CohereEmbeddingProvider {
     pub fn new(api_key: String, default_model: Option<String>) -> Result<Self, LlmError> {
-        let runtime = crate::http::create_runtime()?;
         Ok(Self {
             api_key,
             default_model: default_model.unwrap_or_else(|| "embed-english-v3.0".to_string()),
             client: crate::http::create_client(None)?,
-            runtime,
         })
     }
 
@@ -381,10 +380,15 @@ impl LlmProvider for CohereEmbeddingProvider {
     }
 
     fn embed(&self, request: EmbedRequest) -> Result<EmbedResponse, LlmError> {
-        self.runtime.block_on(self.embed_async(request))
+        sema_io::io_block_on(self.embed_async(request))
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn embed_future(&self, request: EmbedRequest) -> Option<crate::provider::BoxEmbedFuture<'_>> {
+        Some(Box::pin(self.embed_async(request)))
     }
 
     fn rerank(&self, request: RerankRequest) -> Result<RerankResponse, LlmError> {
-        self.runtime.block_on(self.rerank_async(request))
+        sema_io::io_block_on(self.rerank_async(request))
     }
 }

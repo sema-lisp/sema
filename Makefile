@@ -1,4 +1,4 @@
-.PHONY: all build release web-runtime test-web-e2e build-pgo pgo-profile install install-pgo uninstall test test-lsp test-embedding-bench test-http test-llm check clippy fmt fmt-check clean run lint lint-links docs docs-check update-pricing examples examples-vm smoke-bytecode rag-demo test-providers fuzz fuzz-reader fuzz-eval fuzz-grammar fuzz-grammar-emit setup docs-search-gate bench-1m bench-10m bench-100m site-dev site-build site-preview site-deploy deploy coverage coverage-html bench bench-vm bench-save bench-suite bench-closure bench-numeric bench-compare bench-baseline profile profile-vm ts-setup ts-generate ts-test ts-playground js-lib-build js-lib-dev sema-web-example sema-web-example-build
+.PHONY: example-notebooks-async llm-stress all build release web-runtime test-web-e2e build-pgo pgo-profile install install-pgo uninstall test test-lsp test-embedding-bench test-http test-llm check clippy fmt fmt-check clean run lint lint-links docs docs-check update-pricing examples examples-vm smoke-bytecode icons-assets icons-flatten icons-check rag-demo test-providers fuzz fuzz-reader fuzz-eval fuzz-grammar fuzz-grammar-emit setup docs-search-gate bench-1m bench-10m bench-100m site-dev site-build site-preview site-deploy deploy coverage coverage-html bench bench-vm bench-save bench-suite bench-closure bench-numeric bench-compare bench-baseline profile profile-vm js-lib-build js-lib-dev sema-web-example sema-web-example-build
 
 SEMA_WEB_EXAMPLE_DIR := examples/sema-web-app
 
@@ -31,7 +31,7 @@ uninstall:
 	cargo uninstall sema-lang
 
 test:
-	cargo test
+	cargo nextest run
 
 test-lsp: release
 	cargo test -p sema-lsp
@@ -41,7 +41,7 @@ test-embedding-bench:
 	cargo test -p sema-lang --test embedding_bench -- --ignored --nocapture
 
 test-http:
-	cargo test -p sema-lang --test http_test -- --ignored --nocapture
+	cargo nextest run -p sema-lang --test http_test --run-ignored only --no-capture
 
 test-llm:
 	cargo test -p sema-lang --test llm_test -- --ignored --nocapture
@@ -50,7 +50,7 @@ check:
 	cargo check
 
 clippy:
-	cargo clippy -p sema-core -p sema-reader -p sema-eval -p sema-llm -p sema-stdlib -p sema-vm -p sema-lang -p sema-wasm -- -D warnings
+	cargo clippy -p sema-core -p sema-io -p sema-reader -p sema-eval -p sema-llm -p sema-stdlib -p sema-vm -p sema-lang -p sema-wasm -- -D warnings
 
 fmt:
 	cargo fmt
@@ -105,9 +105,23 @@ examples: release
 examples-build: release
 	@EXAMPLE_TIMEOUT=30 ./scripts/build-examples.sh
 
+# LIVE async/streaming stress against real provider APIs (real spend -- cents).
+# The manual verification gate for the true-async work (issue #61 / ADR #68/#69):
+# concurrent completions, non-blocking agent/run, cancellation, streaming, mixed
+# I/O storm, cache/budget, provider matrix. Deliberately NOT part of `examples`
+# (skip-listed); needs ANTHROPIC_API_KEY / OPENAI_API_KEY / GEMINI_API_KEY in env.
+llm-stress: release
+	@./target/release/sema examples/llm/async-stress-live.sema
+
 example-notebook: build
 	@echo "=== Running example notebook ==="
 	cargo run --quiet -- notebook run examples/notebook/demo.sema-nb || true
+
+# Headless smoke for the async notebook series (the keyless, deterministic pair;
+# the network/LLM notebooks are run manually — see examples/notebook/README.md).
+example-notebooks-async: release
+	@./target/release/sema notebook run examples/notebook/async-basics.sema-nb
+	@./target/release/sema notebook run examples/notebook/realtime-monitor.sema-nb
 
 test-notebook-e2e: build
 	@echo "=== Running notebook E2E tests ==="
@@ -150,6 +164,27 @@ example-notebook-serve: build
 
 smoke-bytecode: build
 	@./scripts/smoke-bytecode.sh ./target/debug/sema
+
+# assets/icons/svg/ is the canonical source of truth for every brand/editor icon.
+# `icons-assets` renders the png/ rasters and syncs every consumer copy (favicons,
+# VS Code marketplace icon, IntelliJ plugin + file icons, website showcase).
+# Needs librsvg (rsvg-convert). See assets/icons/README.md.
+icons-assets:
+	@python3 scripts/gen-icon-assets.py
+	@python3 scripts/gen-brand-assets.py
+
+# Icons draw their glyphs with <text font-family="JetBrains Mono"/Georgia>, which
+# only renders where the font is installed AND applied — broken as a distributable
+# icon. `icons-flatten` bakes the text into self-contained <path> outlines (needs
+# JetBrains Mono Bold+ExtraBold + Georgia installed + `pip install fonttools brotli`).
+ICON_SVGS := $(wildcard assets/icons/svg/*.svg)
+
+icons-flatten:
+	@python3 scripts/flatten-svg-text.py $(ICON_SVGS)
+
+# CI-safe guard: fails if any canonical icon still carries an un-flattened <text>.
+icons-check:
+	@python3 scripts/flatten-svg-text.py --check $(ICON_SVGS)
 
 # Hermetic gate: docs_search must work from the binary alone in a FROM-scratch
 # container (no source, no uncompiled docs, --network none). Requires docker + jq.
@@ -370,21 +405,3 @@ profile:
 
 profile-vm:
 	@$(MAKE) profile PROFILE_MODE=vm PROFILE_BENCH=$(PROFILE_BENCH)
-
-# Tree-sitter grammar
-TS_DIR := editors/tree-sitter-sema
-
-ts-setup:
-	cd $(TS_DIR) && npm install
-
-ts-generate: $(TS_DIR)/node_modules
-	cd $(TS_DIR) && npx tree-sitter generate
-
-$(TS_DIR)/node_modules:
-	cd $(TS_DIR) && npm install
-
-ts-test: ts-generate
-	cd $(TS_DIR) && npx tree-sitter test
-
-ts-playground: ts-generate
-	cd $(TS_DIR) && npx tree-sitter build --wasm && npx tree-sitter playground

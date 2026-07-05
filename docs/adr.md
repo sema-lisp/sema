@@ -50,7 +50,12 @@
 - Avoids `Arc<Mutex>` complexity since the Lisp is single-threaded
 - Provider auto-configures from env vars (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`)
 
-### 8. tokio runtime per provider
+### 8. tokio runtime per provider — SUPERSEDED (by #68 / the cooperative scheduler)
+
+> **Superseded.** The per-provider runtime + `block_on` sync facade is what froze
+> the cooperative scheduler during I/O. Blocking natives (`http/*`, `shell`,
+> `llm/*`) now offload onto a single shared runtime and yield `AwaitIo`, and the
+> multi-round agent loop yields per round (ADR #68). Kept below for the record.
 
 - Each provider creates its own `tokio::runtime::Runtime`
 - Uses `block_on` to present a sync interface
@@ -740,6 +745,141 @@ The bytecode lowerer is scope-free — it resolves a special form from a call's 
 **Alternatives considered:**
 - *Full scope-aware lowering* (the Scheme/hygienic model: a local binding shadows the special form everywhere, including operator position). Rejected: lowering is deliberately scope-free; threading lexical scope through all 35 special-form handlers + resolution is a large, regression-prone change for a payoff (rebinding `if` as a local) that is an anti-pattern anyway.
 - *Document-only, no enforcement.* Rejected: leaves the silently-wrong-result trap in place.
+
+### 68. Non-blocking multi-round `agent/run` — a Sema-driven step loop (supersedes #8)
+
+Full design + plan: `docs/plans/2026-07-02-nonblocking-agent-run.md`. Closes the
+last blocking frontier of issue #61 §3a: `agent/run` and `llm/chat`-with-tools drove
+`run_tool_loop`, a blocking `for` over rounds calling the synchronous `do_complete`,
+so a whole multi-round conversation froze every sibling scheduler task and could not
+be cancelled mid-flight — even though a single `llm/complete` already yields.
+
+**Decision:** decompose the tool loop. A **native cannot loop-yield** (a yielded
+`AwaitIo` is not re-invoked; a poller cannot arm a second yield; and tools cannot run
+inside a poller because the scheduler is out of its thread-local during
+`wake_blocked_tasks`, so an async tool would hard-error or degrade to blocking). So
+the round loop moves to **bytecode**: a thin Sema/prelude driver calls four internal
+natives — `__agent-begin` / `__agent-step` (one offloaded round → `AwaitIo` yield,
+reusing `do_complete_async_yield`) / `__agent-exec-tools` (tools run in ordinary task
+context, so async/sub-agent tools suspend correctly) / `__agent-finish` — over a
+Rust-owned opaque `AgentRun` handle (`Rc<RefCell<AgentRunState>>`, task-id-stamped)
+that owns messages/correlation, counters, and the agent OTel span. Siblings run
+during every inter-round park; `async/timeout` cancels cleanly at the parks.
+
+**Key invariants (adversarially reviewed):**
+- The agent span is **attached** on the per-task otel stack and carried across parks
+  by the existing `ReinstallGuard` swap; `__agent-finish` ends it **balanced** and
+  **idempotently** (also on `Drop`, since a cancelled task never runs a Sema
+  `finally`). No blind off-stack span drop (which `SpanCore::drop` would mis-pop).
+- The **blocking `run_tool_loop` is kept byte-identical** for the synchronous
+  (top-level) and `wasm32` paths; the new driver is additive, gated on
+  `in_async_context()`.
+- Per-round accounting (track_usage-once, cache/cassette, per-leaf usage,
+  serving-provider) is inherited unchanged from `do_complete_async_yield`.
+- No native holds a `borrow_mut` across a callback / tool execution / inline-task
+  spin (copy owned inputs out first).
+
+**Streaming (2026-07-03):** the same pattern extends to streaming. In async
+context `llm/stream` and agent `:on-text` rounds run the wire side (the
+provider's synchronous SSE drive) on the I/O pool, sending deltas over a
+channel; the bytecode `__stream-drive` prelude loop parks on `AwaitIo` between
+delta batches — the poller drains all currently-available deltas per wake — and
+calls the callback per delta IN TASK CONTEXT. Siblings interleave between a
+stream's deltas, and a callback that itself yields (`async/sleep`, channel ops,
+`await`) is supported. Usage is accounted exactly once, in the poller's
+finalize, mirroring `do_complete_async_yield`. Sync/top-level `llm/stream`
+keeps the byte-identical blocking native (`__llm-stream-blocking`). Oracle:
+`stream_async_test.rs`.
+
+**Honest limits:** an `:on-text`/`llm/stream` callback runs synchronously per
+delta on the VM thread — a CPU-bound callback still holds the thread between
+yields — and synchronous CPU-bound tools between rounds block siblings (no
+preemption of Sema code). LLM-tier cancellation is REAL for the native
+providers: the completion wire stage is an `io_spawn`ed pool future whose
+`AbortHook` feeds `IoHandle::with_abort` (like http/shell), so a cancelled
+agent's in-flight round is dropped mid-flight — connection torn down
+(`run_fallback_retry_async` + per-provider `complete_future`; gate:
+`llm_request_is_aborted_on_timeout`). Best-effort remains for sync-only
+providers (the `complete_future` default impl, e.g. FakeProvider) and for the
+STREAMING wire stage (`spawn_blocking(provider.stream)`, no abort hook): the
+wire worker streams to completion into a dead channel — but the cancelled
+task's `STREAM_RUNS` slab entry (and the detached chat span it owns) is reaped
+by the same task-reaped sweep that reclaims agent runs (gate:
+`cancelled_stream_slab_entries_are_reaped`). One error-shape asymmetry to know:
+a failing offloaded LEAF (http/shell/file, and a completion round) rejects the
+whole task at its yield point — an in-task `try` around just that call does not
+catch it — whereas a mid-STREAM failure is delivered as an ordinary catchable
+error from the next `__stream-next`. Per-task budget-across-yield under
+concurrent spawned agents
+is a pre-existing single-completion ASYNC-1 gap, closed separately (plan Step 7).
+~~Cancelled agents leak their slab entry (and never-ended agent span) until
+`reset_runtime_state`~~ — closed 2026-07-03: the scheduler's `task-reaped` callback
+(fired at every cancellation transition, never on ordinary completion) sweeps the
+`AGENT_RUNS` entries stamped with the cancelled task's id, ending the agent span
+balanced on the VM thread.
+
+**Alternatives considered:**
+- *Poller-chained (loop entirely in one native's poller).* Rejected: memory-safe but
+  a functional dead-end — a poller cannot arm a second yield, and an async tool run
+  from a poller hard-errors "async yield outside of scheduler context".
+- *Reimplement the whole loop in Sema.* Rejected: would re-derive the battle-tested
+  correlation/usage/error invariants (CHANGELOG 1.21.x) in Sema and drift. The handle
+  keeps them in Rust; only trivial loop control is in Sema.
+
+### 69. One I/O pool behind one seam — runtime consolidation (completes the supersession of #8)
+
+Full design + empirical probes + plan: `docs/plans/2026-07-03-io-seam-consolidation.md`.
+
+**Problem:** 19 tokio-runtime-creation sites; the core sprawl is two identical offload
+pools split by crate layering (sema-llm `SHARED_RT`, sema-stdlib `STDLIB_SHARED_RT`),
+a full runtime per provider *instance* (`BlockingRuntime`), a thread-local runtime for
+sync http, and an ad-hoc thread+runtime for `http/serve`. Ad-hoc mechanisms have
+already cost features (sema-web streaming deferral) and spawned a parallel
+suspend/resume system (the wasm http replay-with-cache hack).
+
+**Decision:** one executor seam in sema-core (`io_backend.rs` — tokio-free; the sixth
+instance of the type-erased-registration idiom), one process-wide pool behind it in a
+new leaf crate `crates/sema-io` (multi-thread, `enable_all`, named `sema-io-*`
+threads, **admission-control semaphore** reserving depth-1 blocking-slot headroom so
+nested DNS lookups can never deadlock the consolidated pool — an empirically probed
+regression risk, prevented by mechanism). `IoHandle`/`AwaitIo` stay the yield-side
+seam unchanged. A future wasm backend implements the two spawn ops over
+fetch/JS-promises (`block_on` is native-only; all its consumers are wasm-gated) —
+retiring the replay hack becomes a backend implementation, not new architecture.
+
+**Explicitly rejected:** the issue-#61 sketch of a *scheduler-owned current-thread
+runtime*. Empirical grounds: it cannot run the synchronous provider stack (blocking
+the reactor = blocking all siblings), so it would force async-ifying the entire
+provider/retry/fallback/streaming/MCP surface — maximal churn in the most
+invariant-dense code — for no additional user-visible concurrency (verified: no
+benefit for file I/O or wasm either; both are spawn_blocking/fetch-shaped regardless).
+A *targeted* async extraction of just the non-streaming completion/embed wire path
+(per-provider `complete_future`/`embed_future` + `run_fallback_retry_async`) did
+land later — not for concurrency (none gained) but for TRUE cancellation of the
+LLM tier: the `spawn_blocking` closure could not be aborted, so a cancelled task's
+request ran to completion (money spent, connection held). The offload is now an
+`io_spawn`ed future with a real `AbortHook` (like http/shell); sync-only providers
+fall back to the admission-controlled blocking tier and remain best-effort. The
+sync top-level path, streaming, and MCP stay on the synchronous stack unchanged.
+
+**Enforcement:** a source-conformance test (`runtime_conformance_test.rs`) forbids
+runtime creation outside an explicit allowlist (sema-io; sema-otel's isolated OTLP
+reactor; `main.rs` subcommand drivers; out-of-slice sema-mcp/notebook, tracked) and
+forbids bypassing the sanctioned `sema_io::io_*` wrappers — future sprawl fails CI,
+not review. Tokio-assumption pin tests in sema-io re-establish the probed contract
+(block_on-from-spawn_blocking legality, nested-fan-out deadlock bounds) on every CI
+run so a tokio upgrade that changes the rules fails loudly.
+
+**Scope kept honest:** sema-mcp (behavioral liveness change — own slice), notebook
+(std::mpsc cleanup, no seam), lsp (already correct Handle reuse), main.rs entry
+points, and otel's isolated export reactor stay as they are, each with recorded
+rationale. File-I/O yielding, previously deferred, now rides the seam:
+`file/read|read-bytes|read-lines|write|append|copy|delete` offload via
+`io_spawn_blocking` in async context (sync path untouched; small-file overhead
+measured at ~2.3x / +13 µs per 1 KB read, release — no size threshold needed);
+`file/exists?` and the stat/list predicates stay synchronous (microsecond ops,
+often in tight loops), and module/import loading reads `std::fs` directly so it
+never routes through the converted builtins.
 
 This lands on the **Common Lisp / Clojure** model (special operators are reserved in operator position; their value namespace is irrelevant here since Sema is a Lisp-1), not Scheme's. Regular non-special-form names — including builtin *functions* like `list`/`map`/`filter` — still shadow freely. See `docs/limitations.md` #36; regression tests `reserved_*` / `shadow_builtin_*` in `eval_test.rs`.
 

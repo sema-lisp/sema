@@ -467,9 +467,12 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    // All package import tracer tests share a single SEMA_HOME env var and must
-    // run sequentially in a single thread to avoid races with other tests.
+    // All package import-tracer tests mutate the process-global SEMA_HOME env
+    // var, as do pkg.rs's #[serial] tests — so these join the SAME serial_test
+    // global group. The module-local SEMA_HOME_LOCK alone cannot serialize
+    // against pkg.rs (two different locks guarding one global).
     #[test]
+    #[serial_test::serial]
     fn test_trace_package_imports() {
         with_fake_sema_home("pkg-all", |dir, sema_home| {
             // --- Set up fake packages ---
@@ -611,6 +614,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn test_trace_package_advanced_scenarios() {
         with_fake_sema_home("pkg-advanced", |dir, sema_home| {
             let pkgs = sema_home.join("packages");
@@ -940,6 +944,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn test_trace_package_internal_files_have_portable_keys() {
         // When a package has transitive relative imports (e.g., helpers.sema),
         // the VFS key for the internal file must be relative to the package

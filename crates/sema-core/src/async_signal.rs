@@ -41,11 +41,14 @@ pub struct IoHandle {
     /// Optional one-shot abort hook, run when the scheduler CANCELS a task parked on
     /// this handle (`async/cancel`, `async/timeout` expiry, or an interrupt) — NEVER
     /// on normal completion. It aborts the offloaded work where the runtime supports
-    /// it (a tokio `AbortHandle::abort()` for the `spawn`-based http/shell offloads,
-    /// dropping the in-flight future → connection torn down / `kill_on_drop` child
-    /// killed). For `spawn_blocking` offloads (the LLM tier) there is no hook — a
-    /// blocking closure cannot be interrupted, so cancellation stays best-effort
-    /// there (the result is discarded). Built via [`with_abort`]; `None` for [`new`].
+    /// it: all `spawn`-based offloads — http, shell, and the LLM wire stage — abort
+    /// via a tokio `AbortHandle::abort()`, dropping the in-flight future (connection
+    /// torn down / `kill_on_drop` child killed / provider request abandoned
+    /// mid-flight). Only work that bottoms out in a `spawn_blocking` closure (a
+    /// sync-only LLM provider under the `complete_future` default impl) cannot be
+    /// interrupted past the abort point — there cancellation stays best-effort (the
+    /// result is discarded, the closure runs out on the worker). Built via
+    /// [`with_abort`]; `None` for [`new`].
     ///
     /// [`with_abort`]: IoHandle::with_abort
     /// [`new`]: IoHandle::new
@@ -321,6 +324,64 @@ pub fn call_cancel_callback(task_id: u64) -> Result<bool, SemaError> {
         SemaError::eval("async/cancel: no async scheduler registered".to_string())
     })?;
     f(task_id)
+}
+
+// ── Task-reaped callback ────────────────────────────────────────
+
+/// Callback type for observing a task's transition into a terminal state it
+/// will NEVER resume from (cancellation via `async/cancel`, `async/timeout`
+/// expiry, transitive await-tree cancellation, or an interrupt). Takes the
+/// reaped task's id.
+///
+/// Fired by the scheduler on the VM thread, with the OTel thread-locals still
+/// alive — but with the reaped task's own per-task contexts (otel span stack,
+/// usage/LLM scopes) NOT installed; the cancellation driver's are. NEVER fired
+/// on ordinary completion (Done) or on a task's own error exit (Failed via a
+/// Sema error) — those paths run their own cleanup in bytecode; only a
+/// cancellation leaves per-task native state (e.g. an agent-run slab entry in
+/// `sema-llm`) with no other reclamation point.
+pub type TaskReapedFn = fn(u64);
+
+thread_local! {
+    static TASK_REAPED_CALLBACK: Cell<Option<TaskReapedFn>> = const { Cell::new(None) };
+}
+
+/// Register the task-reaped callback. Called by `sema-llm` at builtin
+/// registration (the crate that owns per-task native state needing reclamation).
+pub fn set_task_reaped_callback(f: TaskReapedFn) {
+    TASK_REAPED_CALLBACK.with(|cb| cb.set(Some(f)));
+}
+
+/// Notify the registered callback that `task_id` was reaped (cancelled and will
+/// never resume). Cheap no-op when no callback is installed. See
+/// [`TaskReapedFn`] for the firing contract.
+pub fn notify_task_reaped(task_id: u64) {
+    if let Some(f) = TASK_REAPED_CALLBACK.with(|cb| cb.get()) {
+        f(task_id);
+    }
+}
+
+// ── Current task id ─────────────────────────────────────────────
+
+thread_local! {
+    /// The scheduler task id currently executing on this thread, if any. Set by
+    /// the scheduler around each task step (mirroring `set_async_context`) so
+    /// natives that stash per-task state (e.g. `__agent-begin`'s slab entry) can
+    /// stamp it with its owning task for later reclamation via the task-reaped
+    /// callback. `None` outside any task step (top-level code).
+    static CURRENT_TASK_ID: Cell<Option<u64>> = const { Cell::new(None) };
+}
+
+/// The id of the task currently being stepped by the scheduler, or `None` when
+/// running top-level (non-task) code.
+pub fn current_task_id() -> Option<u64> {
+    CURRENT_TASK_ID.with(|c| c.get())
+}
+
+/// Install `id` as the current task id, returning the displaced value so the
+/// caller can restore it on step leave (nested inline-task runs stack correctly).
+pub fn set_current_task_id(id: Option<u64>) -> Option<u64> {
+    CURRENT_TASK_ID.with(|c| c.replace(id))
 }
 
 // ── Blocking-sleep callback ─────────────────────────────────────

@@ -1,6 +1,6 @@
 # Performance Internals
 
-Sema's evaluator is a bytecode VM (see [Bytecode VM](./bytecode-vm.md)). It reached that design through a long optimization journey. Early optimizations brought the [1 Billion Row Challenge](https://github.com/gunnarmorling/1brc) benchmark from **~25s to ~9.6s** on 10M rows using a "mini-eval" — a minimal evaluator inlined in the stdlib that bypassed the full trampoline. The mini-eval was later **removed** for architectural reasons (semantic drift from the real evaluator, and blocking the path to a bytecode VM). Fast-path optimizations in the (then) tree-walking evaluator partially recovered performance, bringing it to **~2,700ms on 1M rows** (vs ~960ms with the mini-eval). The bytecode VM now achieves **~1,150ms on 1M rows** and **~12,600ms on 10M rows**, more than recovering the mini-eval's performance through compilation rather than inlining. (The tree-walking interpreter has since been retired entirely.) This page documents each optimization, its history, and measured impact.
+Sema's evaluator is a bytecode VM (see [Bytecode VM](./bytecode-vm.md)). It reached that design through a long optimization journey. Early optimizations brought the [1 Billion Row Challenge](https://github.com/gunnarmorling/1brc) benchmark from **~25s to ~9.6s** on 10M rows using a "mini-eval" — a minimal evaluator inlined in the stdlib that bypassed the full trampoline. The mini-eval was later **removed** for architectural reasons (semantic drift from the real evaluator, and blocking the path to a bytecode VM). Fast-path optimizations in the (then) tree-walking evaluator partially recovered performance, bringing it to **~2,700ms on 1M rows** (vs ~960ms with the mini-eval). The bytecode VM now achieves **~1,100ms on 1M rows** and **~11,000ms on 10M rows** (re-measured 2026-07, see the note below), more than recovering the mini-eval's performance through compilation rather than inlining. (The tree-walking interpreter has since been retired entirely.) This page documents each optimization, its history, and measured impact.
 
 All benchmarks were run on Apple Silicon (M-series), processing the 1BRC dataset (semicolon-delimited weather station readings, one per line).
 
@@ -20,6 +20,18 @@ All benchmarks were run on Apple Silicon (M-series), processing the 1BRC dataset
 > **Note:** The mini-eval and its associated optimizations (env reuse, inlined builtins, custom number parser, SIMD split fast path) were removed to unblock the bytecode VM, which has since become Sema's sole evaluator. The bytecode VM provides a ~2.4× speedup over the (now-retired) tree-walker (~1,150ms vs ~2,700ms on 1M rows), more than recovering the mini-eval's performance through compilation. Fast-path optimizations (self-evaluating short-circuit, inline NativeFn dispatch, thread-local EvalContext, deferred cloning) partially recovered the tree-walker's performance before it was retired.
 
 > **VM compute benchmarks** (Feb 2026, post-stdlib intrinsics): TAK 1,248ms, upvalue-counter 450ms, deriv 887ms. The deriv benchmark — dominated by `car`/`cdr`/`cons`/`pair?` — improved 22% from stdlib intrinsic opcodes. The 1BRC numbers above are I/O-bound and less affected by VM compute optimizations.
+
+> **1BRC re-measured (Jul 2026)** — interleaved hyperfine A/B on the same machine
+> and datasets, v1.28.1 vs the cycle-collector + true-async work (ADR #66/#68/#69):
+> 1M rows 1,085ms → 1,101ms, 10M rows 10,861ms → 11,012ms — a **+1.4% delta,
+> attributed to the Bacon–Rajan cycle collector's bookkeeping (documented tax
+> envelope ≤1.6%)**, partially offset by the self-tail-call optimization (#62).
+> The cooperative-async runtime work (yielding LLM/http/shell/file natives, the
+> one-pool `sema-io` consolidation) measures **zero cost on synchronous programs**
+> — the sync execution path is byte-identical by construction, enforced by a
+> source-conformance test. In exchange, cycles are reclaimed automatically
+> (long-lived async servers no longer accrete unreachable closures) and blocking
+> I/O yields to the scheduler so sibling tasks interleave.
 
 ## Per-Instruction Inline Cache (Mar 2026)
 

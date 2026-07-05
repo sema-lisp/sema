@@ -3,16 +3,9 @@ use std::time::Duration;
 
 use sema_core::{check_arity, Caps, SemaError, Value, ValueView};
 
-thread_local! {
-    static HTTP_RUNTIME: tokio::runtime::Runtime = tokio::runtime::Runtime::new()
-        .expect("Failed to create HTTP tokio runtime");
-    static HTTP_CLIENT: reqwest::Client = reqwest::Client::new();
-}
-
 /// A process-wide `reqwest::Client` (`Send + Sync + Clone`) reused for every
-/// offloaded request, so connections pool across overlapping tasks. The
-/// thread-local `HTTP_CLIENT` cannot cross the thread boundary into the shared
-/// runtime, so the spawned path uses this one.
+/// request — sync and offloaded alike — so connections pool across threads and
+/// overlapping tasks.
 #[cfg(not(target_arch = "wasm32"))]
 static HTTP_SHARED_CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
 
@@ -22,8 +15,8 @@ fn http_shared_client() -> reqwest::Client {
     HTTP_SHARED_CLIENT.get_or_init(reqwest::Client::new).clone()
 }
 
-/// The response facts that cross the thread boundary back from the shared
-/// runtime to the VM thread. Only plain `Send` data — never a `Value`/`Rc`.
+/// The response facts that cross the thread boundary back from the I/O pool
+/// to the VM thread. Only plain `Send` data — never a `Value`/`Rc`.
 /// Decoded into the same `Value` shape as the sync path on the VM thread.
 #[cfg(not(target_arch = "wasm32"))]
 struct RawHttpResponse {
@@ -118,48 +111,46 @@ fn http_request(
     body: Option<&Value>,
     opts: Option<&Value>,
 ) -> Result<Value, SemaError> {
-    // Inside an `async/spawn`'d task: offload the round-trip onto the shared
-    // multi-thread runtime and yield `AwaitIo` so the scheduler can run sibling
-    // tasks while this request is in flight. The request is built and the
-    // response decoded on the VM thread; only `Send` facts cross the boundary.
+    // Inside an `async/spawn`'d task: offload the round-trip onto the process-wide
+    // I/O pool and yield `AwaitIo` so the scheduler can run sibling tasks while
+    // this request is in flight. The request is built and the response decoded on
+    // the VM thread; only `Send` facts cross the boundary.
     #[cfg(not(target_arch = "wasm32"))]
     if sema_core::in_async_context() {
         return http_request_async(method, url, body, opts);
     }
 
-    // Top-level (not in a scheduler task): the original synchronous path,
-    // byte-identical in observable behavior to the pre-async implementation.
-    HTTP_RUNTIME.with(|rt| {
-        HTTP_CLIENT.with(|client| {
-            rt.block_on(async {
-                let builder = build_request(client, method, url, body, opts)?;
+    // Top-level (not in a scheduler task): the synchronous path. `io_block_on`
+    // drives the round-trip ON THIS (VM) thread using THE pool's reactor —
+    // observable behavior identical to a dedicated blocking runtime.
+    let client = http_shared_client();
+    sema_io::io_block_on(async {
+        let builder = build_request(&client, method, url, body, opts)?;
 
-                let response = builder
-                    .send()
-                    .await
-                    .map_err(|e| SemaError::Io(format!("http {method} {url}: {e}")))?;
+        let response = builder
+            .send()
+            .await
+            .map_err(|e| SemaError::Io(format!("http {method} {url}: {e}")))?;
 
-                let status = response.status().as_u16();
-                let mut headers = Vec::new();
-                for (k, v) in response.headers() {
-                    if let Ok(val) = v.to_str() {
-                        headers.push((k.as_str().to_string(), val.to_string()));
-                    }
-                }
-                let body_text = response
-                    .text()
-                    .await
-                    .map_err(|e| SemaError::Io(format!("http {method} {url}: read body: {e}")))?;
+        let status = response.status().as_u16();
+        let mut headers = Vec::new();
+        for (k, v) in response.headers() {
+            if let Ok(val) = v.to_str() {
+                headers.push((k.as_str().to_string(), val.to_string()));
+            }
+        }
+        let body_text = response
+            .text()
+            .await
+            .map_err(|e| SemaError::Io(format!("http {method} {url}: read body: {e}")))?;
 
-                Ok(build_response_value(status, &headers, &body_text))
-            })
-        })
+        Ok(build_response_value(status, &headers, &body_text))
     })
 }
 
 /// The offloaded (async-context) path: build the request on the VM thread,
-/// `spawn` the send+read on the shared runtime, and yield an `AwaitIo` handle
-/// whose poll closure decodes the `Send` response facts into the identical
+/// `io_spawn` the send+read on the process-wide I/O pool, and yield an `AwaitIo`
+/// handle whose poll closure decodes the `Send` response facts into the identical
 /// `Value` shape the sync path returns. Returns `Ok(nil)` after arming the
 /// yield signal; the scheduler delivers the real value on resume.
 #[cfg(not(target_arch = "wasm32"))]
@@ -189,7 +180,7 @@ fn http_request_async(
 
     let (tx, mut rx) = tokio::sync::oneshot::channel::<Result<RawHttpResponse, String>>();
 
-    let join = crate::async_rt::stdlib_shared_rt().spawn(async move {
+    let abort = sema_io::io_spawn(async move {
         let result = async {
             let response = builder
                 .send()
@@ -218,10 +209,10 @@ fn http_request_async(
         sema_core::notify_io_complete();
     });
 
-    // True cancellation: on cancel/timeout the scheduler calls the abort hook, which
-    // aborts the spawned task → drops the in-flight reqwest future → the connection
-    // is torn down (no wasted round-trip). Never called on normal completion.
-    let abort_handle = join.abort_handle();
+    // True cancellation: on cancel/timeout the scheduler calls the abort hook (the
+    // seam's one-shot AbortHook), which aborts the spawned task → drops the in-flight
+    // reqwest future → the connection is torn down (no wasted round-trip). Never
+    // called on normal completion.
     let handle = Rc::new(sema_core::IoHandle::with_abort(
         move || match rx.try_recv() {
             Err(TryRecvError::Empty) => sema_core::IoPoll::Pending,
@@ -235,7 +226,7 @@ fn http_request_async(
                 sema_core::IoPoll::Ready(Err("http: request worker dropped".to_string()))
             }
         },
-        move || abort_handle.abort(),
+        abort,
     ));
     sema_core::set_yield_signal(sema_core::YieldReason::AwaitIo(handle));
     Ok(Value::nil())

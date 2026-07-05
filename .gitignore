@@ -64,8 +64,6 @@ yarn-error.log
 benchmarks/1brc/results/*/build/
 
 # Test artifacts
-/ui/.vitest-attachments
-/ui/tests/__screenshots__
 mutants.out/
 mutants.out.old/
 .vercel

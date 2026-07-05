@@ -394,13 +394,13 @@ fn ws_connect(url: &str, opts: ConnectOpts) -> Result<Value, SemaError> {
     let (evt_tx, evt_rx) = mpsc::channel::<WsEvent>(EVENT_CAP);
     let (ready_tx, mut ready_rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
 
-    let join = crate::async_rt::stdlib_shared_rt().spawn(pump(
+    let abort_pump = sema_io::io_spawn(Box::pin(pump(
         url.to_string(),
         opts,
         cmd_rx,
         evt_tx,
         ready_tx,
-    ));
+    )));
 
     let conn_val = Value::stream(WsConnection {
         cmd_tx,
@@ -409,7 +409,6 @@ fn ws_connect(url: &str, opts: ConnectOpts) -> Result<Value, SemaError> {
 
     if sema_core::in_async_context() {
         // Park until the handshake completes; the pump's per-event notify wakes us.
-        let abort_handle = join.abort_handle();
         let conn_for_poll = conn_val.clone();
         let handle = Rc::new(IoHandle::with_abort(
             move || match ready_rx.try_recv() {
@@ -420,7 +419,7 @@ fn ws_connect(url: &str, opts: ConnectOpts) -> Result<Value, SemaError> {
                     IoPoll::Ready(Err("ws/connect: connection worker dropped".to_string()))
                 }
             },
-            move || abort_handle.abort(),
+            abort_pump,
         ));
         sema_core::set_yield_signal(sema_core::YieldReason::AwaitIo(handle));
         return Ok(Value::nil());
@@ -543,7 +542,7 @@ fn ws_recv_timeout(args: &[Value]) -> Result<Value, SemaError> {
         Timeout,
     }
     let deadline = std::time::Instant::now() + std::time::Duration::from_millis(ms);
-    let outcome = crate::async_rt::stdlib_shared_rt().block_on(async {
+    let outcome = sema_io::io_block_on(async {
         loop {
             let polled = evt_rx.borrow_mut().try_recv();
             match polled {

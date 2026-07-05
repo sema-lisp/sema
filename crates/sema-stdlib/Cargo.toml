@@ -36,6 +36,7 @@ sema-fmt.workspace = true
 similar.workspace = true
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+sema-io.workspace = true
 sema-workflow.workspace = true
 sema-llm.workspace = true
 tokio.workspace = true

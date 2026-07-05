@@ -1,0 +1,12 @@
+[package]
+name = "sema-io"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "The process-wide tokio I/O pool behind sema-core's executor seam"
+
+[dependencies]
+sema-core.workspace = true
+tokio.workspace = true

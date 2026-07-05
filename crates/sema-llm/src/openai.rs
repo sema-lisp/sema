@@ -43,7 +43,6 @@ pub struct OpenAiProvider {
     default_model: String,
     send_stream_options: bool,
     client: reqwest::Client,
-    runtime: crate::http::BlockingRuntime,
 }
 
 impl OpenAiProvider {
@@ -68,7 +67,6 @@ impl OpenAiProvider {
         default_model: String,
         send_stream_options: bool,
     ) -> Result<Self, LlmError> {
-        let runtime = crate::http::create_runtime()?;
         Ok(OpenAiProvider {
             name,
             api_key,
@@ -76,7 +74,6 @@ impl OpenAiProvider {
             default_model,
             send_stream_options,
             client: crate::http::create_client(None)?,
-            runtime,
         })
     }
 
@@ -256,6 +253,7 @@ impl OpenAiProvider {
                         name: tc.function.name.clone(),
                         arguments: serde_json::from_str(&tc.function.arguments)
                             .unwrap_or(serde_json::Value::Object(serde_json::Map::new())),
+                        thought_signature: None,
                     })
                     .collect()
             })
@@ -421,6 +419,7 @@ impl OpenAiProvider {
                 name,
                 arguments: serde_json::from_str(&args)
                     .unwrap_or(serde_json::Value::Object(serde_json::Map::new())),
+                thought_signature: None,
             })
             .collect();
 
@@ -632,7 +631,11 @@ impl LlmProvider for OpenAiProvider {
     }
 
     fn complete(&self, request: ChatRequest) -> Result<ChatResponse, LlmError> {
-        let result = self.runtime.block_on(self.complete_async(request.clone()));
+        // GUARD: two io_block_on calls in this method, STRICTLY SEQUENTIAL and
+        // NEVER NESTED — the first fully returns before the retry's begins.
+        // Nesting a block_on inside a block_on'd future would panic (see the
+        // sema-io threading contract / tokio pin tests).
+        let result = sema_io::io_block_on(self.complete_async(request.clone()));
         // Compat backstop: gpt-5.0 / o-series reject a custom `temperature` with a
         // 400. Learn it per-model, drop temperature, and retry once — so portable
         // Sema code that sets :temperature still works on those models.
@@ -645,11 +648,49 @@ impl LlmProvider for OpenAiProvider {
                 if mentions_unsupported_temperature(message) {
                     let model = self.resolve_model(&request.model);
                     DROP_TEMPERATURE.with(|s| s.borrow_mut().insert(model));
-                    return self.runtime.block_on(self.complete_async(request));
+                    return sema_io::io_block_on(self.complete_async(request));
                 }
             }
         }
         result
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn complete_future(
+        &self,
+        request: ChatRequest,
+    ) -> Option<crate::provider::BoxCompletionFuture<'_>> {
+        Some(Box::pin(async move {
+            let result = self.complete_async(request.clone()).await;
+            // Same DROP_TEMPERATURE compat backstop as `complete()` (see there),
+            // with one async-path nuance: the future may resume on a DIFFERENT
+            // pool worker after the first attempt, so the retry must not depend
+            // on the thread-local learn — strip `temperature` from the retried
+            // request itself (wire-identical to the TLS drop in
+            // `build_request_body`). The TLS insert still happens so later calls
+            // that land on this worker skip the doomed first request.
+            if request.temperature.is_some() && is_official_openai_url(&self.base_url) {
+                if let Err(LlmError::Api {
+                    status: 400,
+                    message,
+                }) = &result
+                {
+                    if mentions_unsupported_temperature(message) {
+                        let model = self.resolve_model(&request.model);
+                        DROP_TEMPERATURE.with(|s| s.borrow_mut().insert(model));
+                        let mut retry = request;
+                        retry.temperature = None;
+                        return self.complete_async(retry).await;
+                    }
+                }
+            }
+            result
+        }))
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn embed_future(&self, request: EmbedRequest) -> Option<crate::provider::BoxEmbedFuture<'_>> {
+        Some(Box::pin(self.embed_async(request)))
     }
 
     fn stream_complete(
@@ -657,12 +698,13 @@ impl LlmProvider for OpenAiProvider {
         request: ChatRequest,
         on_chunk: &mut dyn FnMut(&str) -> Result<(), LlmError>,
     ) -> Result<ChatResponse, LlmError> {
-        self.runtime
-            .block_on(self.stream_complete_async(request, on_chunk))
+        // io_block_on drives ON THIS thread: `on_chunk` may touch non-Send Sema
+        // values and must never migrate to a pool worker.
+        sema_io::io_block_on(self.stream_complete_async(request, on_chunk))
     }
 
     fn batch_complete(&self, requests: Vec<ChatRequest>) -> Vec<Result<ChatResponse, LlmError>> {
-        self.runtime.block_on(async {
+        sema_io::io_block_on(async {
             let futures: Vec<_> = requests
                 .into_iter()
                 .map(|req| self.complete_async(req))
@@ -672,7 +714,7 @@ impl LlmProvider for OpenAiProvider {
     }
 
     fn embed(&self, request: EmbedRequest) -> Result<EmbedResponse, LlmError> {
-        self.runtime.block_on(self.embed_async(request))
+        sema_io::io_block_on(self.embed_async(request))
     }
 }
 
@@ -799,6 +841,7 @@ mod tests {
                         id: "call_1".into(),
                         name: "get_weather".into(),
                         arguments: serde_json::json!({"city": "Oslo"}),
+                        thought_signature: None,
                     }],
                 ),
                 ChatMessage::tool_result("call_1", "get_weather", "sunny"),

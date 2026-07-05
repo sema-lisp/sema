@@ -1,0 +1,256 @@
+{
+  "version": 1,
+  "metadata": {
+    "title": "Async Concurrency You Can See",
+    "created": "2026-07-03T00:00:00Z",
+    "modified": "2026-07-03T16:11:57.370546Z",
+    "sema_version": "1.28.1"
+  },
+  "cells": [
+    {
+      "id": "c00000001",
+      "type": "markdown",
+      "source": "# Async Concurrency You Can See\n\nSema has a **cooperative async runtime**: a single-threaded scheduler where tasks\n*interleave* — exactly one task runs Sema code at any moment, and blocking work\n(HTTP, LLM calls, subprocesses, file I/O) is offloaded so the task **yields** while\nit waits and siblings run.\n\nThis notebook teaches the whole model, with wall-clock proof for every claim:\n\n1. Tasks and promises — `async/spawn`, `async/await`\n2. The core payoff: **wall time ≈ max, not sum**\n3. Channels — communicating between tasks\n4. Watching interleaving happen\n5. Combinators — `async/all`, `async/race`, `async/timeout`\n6. Cancellation that actually cancels\n7. Bounded fan-out with `async/pool-map`\n8. Real I/O yields: subprocesses and files\n9. The honest limits — what does *not* yield\n\nEverything here is keyless and self-contained. Timings use `sys/elapsed`\n(nanoseconds), the right timer for benchmarking in Sema."
+    },
+    {
+      "id": "c00000002",
+      "type": "markdown",
+      "source": "## 1. Tasks and promises\n\n`async/spawn` takes a **thunk** (a zero-argument function) and returns a\n*promise* immediately. The task runs when the scheduler gets control —\n`async/await` drives the scheduler until the promise settles and returns its\nvalue."
+    },
+    {
+      "id": "c00000003",
+      "type": "code",
+      "source": "; A task is just a thunk handed to the scheduler.\n(define p (async/spawn (fn () (+ 40 2))))\n(println (format \"awaited result: ~a\" (async/await p)))",
+      "outputs": [
+        {
+          "type": "stdout",
+          "display": "awaited result: 42\n",
+          "timestamp": "2026-07-03T16:11:54.894920Z"
+        },
+        {
+          "type": "value",
+          "display": "",
+          "sema_value": "nil",
+          "timestamp": "2026-07-03T16:11:54.894905Z",
+          "duration_ms": 0
+        }
+      ]
+    },
+    {
+      "id": "c00000004",
+      "type": "markdown",
+      "source": "## 2. The core payoff: wall ≈ max, not sum\n\nThree tasks that each sleep 200 ms. Sequentially that's 600 ms. Spawned\nconcurrently, the scheduler interleaves their waits — total wall time is\nroughly the *longest single wait*, not the sum."
+    },
+    {
+      "id": "c00000005",
+      "type": "code",
+      "source": "(define (ms-since t0) (floor (/ (- (sys/elapsed) t0) 1000000)))\n\n;; Sequential: three 200 ms sleeps back to back.\n(define t0 (sys/elapsed))\n(async/await (async/spawn (fn () (async/sleep 200))))\n(async/await (async/spawn (fn () (async/sleep 200))))\n(async/await (async/spawn (fn () (async/sleep 200))))\n(println (format \"sequential: ~a ms (sum of waits)\" (ms-since t0)))\n\n;; Concurrent: spawn all three, then await them together.\n(define t1 (sys/elapsed))\n(async/all\n  (list (async/spawn (fn () (async/sleep 200)))\n        (async/spawn (fn () (async/sleep 200)))\n        (async/spawn (fn () (async/sleep 200)))))\n(println (format \"concurrent: ~a ms (max of waits)\" (ms-since t1)))",
+      "outputs": [
+        {
+          "type": "stdout",
+          "display": "sequential: 610 ms (sum of waits)\nconcurrent: 205 ms (max of waits)\n",
+          "timestamp": "2026-07-03T16:11:55.711170Z"
+        },
+        {
+          "type": "value",
+          "display": "",
+          "sema_value": "nil",
+          "timestamp": "2026-07-03T16:11:55.711168Z",
+          "duration_ms": 816
+        }
+      ]
+    },
+    {
+      "id": "c00000006",
+      "type": "markdown",
+      "source": "## 3. Channels\n\nChannels are how tasks talk. `channel/new` takes a capacity; `channel/send`\nparks the sender when the channel is full, `channel/recv` parks the receiver\nwhen it is empty — classic bounded producer/consumer backpressure, no locks."
+    },
+    {
+      "id": "c00000007",
+      "type": "code",
+      "source": "(define ch (channel/new 2))   ; capacity 2 → the producer gets ahead by at most 2\n\n(define producer\n  (async/spawn (fn ()\n    (dotimes (i 5)\n      (channel/send ch (* i i))\n      (println (format \"produced ~a\" (* i i))))\n    (channel/close ch))))\n\n(define consumer\n  (async/spawn (fn ()\n    (let loop ((total 0))\n      (let ((v (channel/recv ch)))       ; nil once closed and drained\n        (if (nil? v)\n            total\n            (begin\n              (println (format \"  consumed ~a\" v))\n              (loop (+ total v)))))))))\n\n(async/await producer)\n(println (format \"sum of squares: ~a\" (async/await consumer)))",
+      "outputs": [
+        {
+          "type": "stdout",
+          "display": "produced 0\nproduced 1\n  consumed 0\n  consumed 1\nproduced 4\nproduced 9\nproduced 16\n  consumed 4\n  consumed 9\n  consumed 16\nsum of squares: 30\n",
+          "timestamp": "2026-07-03T16:11:55.711425Z"
+        },
+        {
+          "type": "value",
+          "display": "",
+          "sema_value": "nil",
+          "timestamp": "2026-07-03T16:11:55.711424Z",
+          "duration_ms": 0
+        }
+      ]
+    },
+    {
+      "id": "c00000008",
+      "type": "markdown",
+      "source": "## 4. Watching interleaving happen\n\nThe proof that siblings *really* run during a wait: a worker alternates\nsleeps with prints, while a ticker counts in the background. The ticker's\ncount climbs **between** the worker's steps — that is the scheduler switching\ntasks at every yield point."
+    },
+    {
+      "id": "c00000009",
+      "type": "code",
+      "source": "(define ticks (channel/new 500))\n\n(define ticker\n  (async/spawn (fn ()\n    (dotimes (i 100)\n      (async/sleep 5)\n      (channel/send ticks 1)))))\n\n(define worker\n  (async/spawn (fn ()\n    (dotimes (step-n 4)\n      (async/sleep 60)\n      (println (format \"worker step ~a — ticker is at ~a\"\n                       step-n (channel/count ticks)))))))\n\n(async/await worker)\n(println (format \"ticker total while worker ran: ~a\" (channel/count ticks)))",
+      "outputs": [
+        {
+          "type": "stdout",
+          "display": "worker step 0 — ticker is at 11\nworker step 1 — ticker is at 23\nworker step 2 — ticker is at 35\nworker step 3 — ticker is at 47\nticker total while worker ran: 47\n",
+          "timestamp": "2026-07-03T16:11:56.007426Z"
+        },
+        {
+          "type": "value",
+          "display": "",
+          "sema_value": "nil",
+          "timestamp": "2026-07-03T16:11:56.007425Z",
+          "duration_ms": 295
+        }
+      ]
+    },
+    {
+      "id": "c00000010",
+      "type": "markdown",
+      "source": "## 5. Combinators\n\n- `async/all` — await every promise, results in order; a rejection wins over\n  a sibling cancellation so you see the *cause*.\n- `async/race` — first settled promise wins; the losers are **cancelled**\n  (not abandoned — their in-flight I/O is aborted where possible).\n- `async/timeout` — race a promise against a deadline; throws on expiry."
+    },
+    {
+      "id": "c00000011",
+      "type": "code",
+      "source": ";; race: the 50 ms task wins, the 5-second task is cancelled.\n(define t0 (sys/elapsed))\n(define winner\n  (async/race\n    (list (async/spawn (fn () (async/sleep 5000) :slow))\n          (async/spawn (fn () (async/sleep 50) :fast)))))\n(println (format \"race winner: ~a after ~a ms\" winner (ms-since t0)))",
+      "outputs": [
+        {
+          "type": "stdout",
+          "display": "race winner: :fast after 61 ms\n",
+          "timestamp": "2026-07-03T16:11:56.068804Z"
+        },
+        {
+          "type": "value",
+          "display": "",
+          "sema_value": "nil",
+          "timestamp": "2026-07-03T16:11:56.068799Z",
+          "duration_ms": 61
+        }
+      ]
+    },
+    {
+      "id": "c00000012",
+      "type": "markdown",
+      "source": "## 6. Cancellation that actually cancels\n\n`async/timeout` doesn't just stop *waiting* — it cancels the task, and the\ncancellation reaches in-flight work (a subprocess is killed, an HTTP request's\nconnection is torn down, an LLM round is aborted mid-flight for native\nproviders). The runtime stays healthy afterwards."
+    },
+    {
+      "id": "c00000013",
+      "type": "code",
+      "source": ";; Cancel a task that would run for 10 seconds. We time how long the\n;; timeout takes to fire, then prove the runtime still works.\n(define t0 (sys/elapsed))\n(define outcome\n  (try\n    (async/timeout 150 (async/spawn (fn () (async/sleep 10000) :done)))\n    (catch e :cancelled)))\n(println (format \"outcome: ~a after ~a ms (not 10000!)\" outcome (ms-since t0)))\n\n;; Business as usual afterwards:\n(println (format \"runtime healthy: ~a\" (async/await (async/spawn (fn () :ok)))))",
+      "outputs": [
+        {
+          "type": "stdout",
+          "display": "outcome: :cancelled after 182 ms (not 10000!)\nruntime healthy: :ok\n",
+          "timestamp": "2026-07-03T16:11:56.252019Z"
+        },
+        {
+          "type": "value",
+          "display": "",
+          "sema_value": "nil",
+          "timestamp": "2026-07-03T16:11:56.252017Z",
+          "duration_ms": 183
+        }
+      ]
+    },
+    {
+      "id": "c00000014",
+      "type": "markdown",
+      "source": "## 7. Bounded fan-out: `async/pool-map`\n\nUnbounded concurrency is a footgun (rate limits, memory, file handles).\n`async/pool-map` maps a function over a collection with at most N tasks in\nflight, and returns results **in input order** even when items finish out of\norder."
+    },
+    {
+      "id": "c00000015",
+      "type": "code",
+      "source": "(define (simulated-fetch id)\n  ;; Later items are FASTER, so completion order is reversed —\n  ;; pool-map still returns input order.\n  (async/sleep (- 100 (* id 15)))\n  (format \"item-~a\" id))\n\n(define t0 (sys/elapsed))\n(define results (async/pool-map simulated-fetch (list 0 1 2 3 4 5) 3))\n(println (format \"results (input order): ~a\" results))\n(println (format \"6 items, pool of 3: ~a ms\" (ms-since t0)))",
+      "outputs": [
+        {
+          "type": "stdout",
+          "display": "results (input order): (\"item-0\" \"item-1\" \"item-2\" \"item-3\" \"item-4\" \"item-5\")\n6 items, pool of 3: 150 ms\n",
+          "timestamp": "2026-07-03T16:11:56.402597Z"
+        },
+        {
+          "type": "value",
+          "display": "",
+          "sema_value": "nil",
+          "timestamp": "2026-07-03T16:11:56.402595Z",
+          "duration_ms": 150
+        }
+      ]
+    },
+    {
+      "id": "c00000016",
+      "type": "markdown",
+      "source": "## 8. Real I/O yields too\n\nSleeps are simulations. The same yield mechanics apply to *real* blocking\noperations: `shell` offloads the subprocess, `http/*` offloads the request,\n`file/*` offloads reads/writes, `llm/*` offloads provider calls. Three\nsubprocesses that each take ~300 ms run concurrently in ~300 ms:"
+    },
+    {
+      "id": "c00000017",
+      "type": "code",
+      "source": "(define t0 (sys/elapsed))\n(async/all\n  (list (async/spawn (fn () (shell \"sleep 0.3\")))\n        (async/spawn (fn () (shell \"sleep 0.3\")))\n        (async/spawn (fn () (shell \"sleep 0.3\")))))\n(println (format \"3 x 300ms subprocesses, concurrent: ~a ms\" (ms-since t0)))",
+      "outputs": [
+        {
+          "type": "stdout",
+          "display": "3 x 300ms subprocesses, concurrent: 318 ms\n",
+          "timestamp": "2026-07-03T16:11:56.721229Z"
+        },
+        {
+          "type": "value",
+          "display": "",
+          "sema_value": "nil",
+          "timestamp": "2026-07-03T16:11:56.721227Z",
+          "duration_ms": 318
+        }
+      ]
+    },
+    {
+      "id": "c00000018",
+      "type": "code",
+      "source": ";; File I/O yields as well. The worker task snapshots the ticker BEFORE and\n;; AFTER its own write — the delta is ticks that happened DURING the write,\n;; which is only possible if the write parked its task and let the ticker run.\n(define big (string/join (map (fn (i) \"0123456789abcdef\") (range 200000)) \"\"))\n(define io-ticks (channel/new 2000))\n(define io-delta\n  (async/all\n    (list\n      (async/spawn (fn ()\n        (dotimes (i 200) (async/sleep 1) (channel/send io-ticks 1))))\n      (async/spawn (fn ()\n        (let ((before (channel/count io-ticks)))\n          (file/write \"/tmp/sema-nb-async-demo.bin\" big)\n          (file/read \"/tmp/sema-nb-async-demo.bin\")\n          (file/delete \"/tmp/sema-nb-async-demo.bin\")\n          (- (channel/count io-ticks) before)))))))\n(println (format \"ticks DURING the write+read+delete: ~a\" (nth io-delta 1)))",
+      "outputs": [
+        {
+          "type": "stdout",
+          "display": "ticks DURING the write+read+delete: 3\n",
+          "timestamp": "2026-07-03T16:11:56.991875Z"
+        },
+        {
+          "type": "value",
+          "display": "",
+          "sema_value": "nil",
+          "timestamp": "2026-07-03T16:11:56.991874Z",
+          "duration_ms": 270
+        }
+      ]
+    },
+    {
+      "id": "c00000019",
+      "type": "markdown",
+      "source": "## 9. The honest limits\n\nCooperative scheduling means **no preemption**: a task doing CPU-bound Sema\nwork never yields, so siblings starve until it finishes. Watch the difference —\nthe ticker advances during a *sleeping* task but not during a *computing*\ntask:"
+    },
+    {
+      "id": "c00000020",
+      "type": "code",
+      "source": "(define (busy-sum n)      ; pure CPU: never yields\n  (let loop ((i 0) (acc 0))\n    (if (= i n) acc (loop (+ i 1) (+ acc i)))))\n\n;; Same before/after snapshot, but around CPU-bound work. The scheduler cannot\n;; preempt it, so the delta collapses to zero.\n(define cpu-ticks (channel/new 2000))\n(define cpu-delta\n  (async/all\n    (list\n      (async/spawn (fn ()\n        (dotimes (i 200) (async/sleep 1) (channel/send cpu-ticks 1))))\n      (async/spawn (fn ()\n        (let ((before (channel/count cpu-ticks)))\n          (busy-sum 3000000)\n          (- (channel/count cpu-ticks) before)))))))\n(println (format \"ticks DURING CPU-bound work: ~a  (vs during file I/O above)\"\n                 (nth cpu-delta 1)))",
+      "outputs": [
+        {
+          "type": "stdout",
+          "display": "ticks DURING CPU-bound work: 0  (vs during file I/O above)\n",
+          "timestamp": "2026-07-03T16:11:57.370533Z"
+        },
+        {
+          "type": "value",
+          "display": "",
+          "sema_value": "nil",
+          "timestamp": "2026-07-03T16:11:57.370531Z",
+          "duration_ms": 378
+        }
+      ]
+    },
+    {
+      "id": "c00000021",
+      "type": "markdown",
+      "source": "The delta is zero (or near it) — the CPU task held the thread for its whole computation, while the identical measurement around file I/O showed the ticker running freely. The rule of thumb:\n\n> **Waits interleave. Computation does not.**\n\nIf you need a heavy computation to coexist with responsive tasks, break it\ninto chunks with an occasional `(async/sleep 0)` to hand the scheduler a\nyield point.\n\n## Where to go next\n\n- **`concurrent-data-pipeline.sema-nb`** — this model applied to real HTTP APIs\n- **`llm-batch-enrichment.sema-nb`** — concurrent LLM calls with budgets and caching\n- **`research-agents.sema-nb`** — multi-round agents that don't block each other\n- **`realtime-monitor.sema-nb`** — WebSockets, channels, and a live aggregator"
+    }
+  ]
+}

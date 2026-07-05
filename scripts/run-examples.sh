@@ -52,6 +52,10 @@ SKIP_FILES=(
                                   # configure, which hit a provider (e.g. Ollama
                                   # at localhost:11434). Passes only where a
                                   # provider is reachable; must not gate CI.
+  "examples/llm/async-stress-live.sema" # LIVE async/streaming stress against
+                                  # real provider APIs (real spend, minutes of
+                                  # network). Manual verification gate for the
+                                  # true-async work — run via `make llm-stress`.
 )
 
 is_skipped() {

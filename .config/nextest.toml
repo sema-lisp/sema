@@ -1,0 +1,23 @@
+# cargo-nextest configuration. See https://nexte.st/docs/configuration/
+#
+# nextest is the sole local/CI test runner (`make test`, CI "Run tests" step).
+# It runs each test in its own process and schedules across all workspace test
+# binaries, which is ~2.6x faster than the libtest harness on this suite.
+#
+# Note: nextest does NOT run doctests. This repo has zero *executable* doctests
+# (all `///` code fences are `no_run`/`text`), so nothing is lost. If an
+# executable doctest is ever added, run `cargo test --doc` separately.
+
+[profile.default]
+# Ignored tests (http/llm/live) stay skipped, matching the old `cargo test`.
+# Surface slow tests instead of letting them silently dominate the tail.
+slow-timeout = { period = "60s", terminate-after = 3 }
+
+[profile.ci]
+# Emit JUnit XML for CI test reporting.
+retries = 1
+fail-fast = false
+slow-timeout = { period = "120s", terminate-after = 3 }
+
+[profile.ci.junit]
+path = "junit.xml"

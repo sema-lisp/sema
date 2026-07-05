@@ -1,0 +1,213 @@
+{
+  "version": 1,
+  "metadata": {
+    "title": "A Realtime Monitor: Channels as an Event Bus",
+    "created": "2026-07-03T00:00:00Z",
+    "modified": "2026-07-03T16:11:59.429007Z",
+    "sema_version": "1.28.1"
+  },
+  "cells": [
+    {
+      "id": "c00000001",
+      "type": "markdown",
+      "source": "# A Realtime Monitor: Channels as an Event Bus\n\nMost async tutorials stop at \"fetch three URLs concurrently\". Production systems\nhave a different shape: **many event sources fanning into one aggregator** that\nkeeps windowed stats and raises alerts. Log watchers, metrics collectors,\nchat bots — same skeleton every time:\n\n```\nsensor task ──┐\nsensor task ──┤\nsensor task ──┼──▶ channel (bus) ──▶ aggregator task ──▶ alerts + report\nsubprocess ───┤\nfile tailer ──┘\n```\n\nSema's cooperative runtime fits this naturally:\n\n- **each source is a task** — spawned once, runs its own cadence\n- **the bus is a channel** — `channel/send` / `channel/recv`, no locks\n- **backpressure is free** — a bounded channel parks fast producers until the\n  consumer catches up\n\nThis notebook builds the whole thing: three simulated sensors, two *real*\nsources (a subprocess poller and a file tailer), one aggregator with\nthresholds, a graceful shutdown, and an ASCII dashboard. Fully keyless and\nself-contained — treat it as a take-home template."
+    },
+    {
+      "id": "c00000002",
+      "type": "markdown",
+      "source": "## 1. The bus and the event shape\n\nOne decision matters up front: **bounded capacity**. An unbounded bus means a\nslow consumer silently grows memory until something falls over. A bounded one\n(`channel/new 256`) gives you backpressure instead — `channel/send` parks the\nproducer task when the bus is full, and the scheduler runs the consumer until\nthere's room. The failure mode becomes *visible latency*, not invisible memory.\n\nEvents are plain maps with a fixed shape — `{:source :kind :value :seq}` —\nso every consumer can destructure them without caring who sent them."
+    },
+    {
+      "id": "c00000003",
+      "type": "code",
+      "source": ";; The event bus: every source writes here, one aggregator drains it.\n(define bus (channel/new 256))\n\n;; Events are plain maps with a stable shape.\n(define (event source kind value seq)\n  {:source source :kind kind :value value :seq seq})\n\n;; A tiny 16-bit LCG so sensor readings are deterministic run to run.\n(define (lcg s) (mod (+ (* s 1309) 13849) 65536))\n\n(define alert-threshold 900)\n(println (format \"bus ready (capacity 256), alert threshold: ~a\" alert-threshold))",
+      "outputs": [
+        {
+          "type": "stdout",
+          "display": "bus ready (capacity 256), alert threshold: 900\n",
+          "timestamp": "2026-07-03T16:11:57.381860Z"
+        },
+        {
+          "type": "value",
+          "display": "",
+          "sema_value": "nil",
+          "timestamp": "2026-07-03T16:11:57.381858Z",
+          "duration_ms": 0
+        }
+      ]
+    },
+    {
+      "id": "c00000004",
+      "type": "markdown",
+      "source": "## 2. Simulated sensor sources\n\nThree producer tasks with different cadences. Each is **bounded** (14 readings,\nthen it returns) — a monitor demo must terminate, so no infinite loops. Values\nand jitter come from the seeded LCG, so the numbers are reproducible.\n\nThe `:pump` sensor deliberately emits an **anomalous spike every 7th reading**\n(950+, way above the 40–79 normal band). That gives the aggregator something\nto alert on, deterministically: 14 readings → exactly 2 spikes."
+    },
+    {
+      "id": "c00000005",
+      "type": "code",
+      "source": "(define (spawn-sensor name cadence-ms seed n spike-every)\n  (async/spawn (fn ()\n    (let loop ((i 0) (s seed))\n      (if (= i n)\n          name\n          (let* ((s2 (lcg s))\n                 (normal (+ 40 (mod s2 40)))     ; normal band: 40..79\n                 (spike? (and (> spike-every 0)\n                              (= (mod (+ i 1) spike-every) 0)))\n                 (v (if spike? (+ 950 (mod s2 40)) normal)))\n            (async/sleep (+ cadence-ms (mod s2 7)))  ; deterministic jitter\n            (channel/send bus (event name :reading v i))\n            (loop (+ i 1) s2)))))))\n\n(define temp-sensor (spawn-sensor :temp 25 7  14 0))\n(define load-sensor (spawn-sensor :load 35 21 14 0))\n(define pump-sensor (spawn-sensor :pump 30 42 14 7))   ; every 7th reading spikes\n\n(println \"3 sensor tasks spawned (14 readings each; :pump spikes every 7th)\")",
+      "outputs": [
+        {
+          "type": "stdout",
+          "display": "3 sensor tasks spawned (14 readings each; :pump spikes every 7th)\n",
+          "timestamp": "2026-07-03T16:11:57.382072Z"
+        },
+        {
+          "type": "value",
+          "display": "",
+          "sema_value": "nil",
+          "timestamp": "2026-07-03T16:11:57.382072Z",
+          "duration_ms": 0
+        }
+      ]
+    },
+    {
+      "id": "c00000006",
+      "type": "markdown",
+      "source": "## 3. A real source: polling a subprocess\n\nSimulations are fine, but the point of the pattern is mixing in **real I/O**.\nThis task periodically runs `ps -o rss= -p $$` (resident memory of the spawned\nshell, in KB — portable across macOS and Linux) and feeds the parsed number\nonto the same bus.\n\nBecause `shell` **offloads the subprocess and yields**, polling doesn't freeze\nthe sensors — while the poller waits on `ps`, the scheduler runs everyone else.\nThat's the whole reason a single-threaded runtime can host a monitor."
+    },
+    {
+      "id": "c00000007",
+      "type": "code",
+      "source": "(define proc-source\n  (async/spawn (fn ()\n    (dotimes (i 5)\n      (let* ((r (shell \"ps -o rss= -p $$\"))\n             (kb (string->number (string/trim (:stdout r)))))\n        (when kb\n          (channel/send bus (event :proc :rss-kb kb i))))\n      (async/sleep 70))\n    :proc)))\n\n(println \"subprocess poller spawned (5 samples of shell RSS)\")",
+      "outputs": [
+        {
+          "type": "stdout",
+          "display": "subprocess poller spawned (5 samples of shell RSS)\n",
+          "timestamp": "2026-07-03T16:11:57.382253Z"
+        },
+        {
+          "type": "value",
+          "display": "",
+          "sema_value": "nil",
+          "timestamp": "2026-07-03T16:11:57.382252Z",
+          "duration_ms": 0
+        }
+      ]
+    },
+    {
+      "id": "c00000008",
+      "type": "markdown",
+      "source": "## 4. Another real source: tailing a log file\n\nThe classic monitor input. One task plays a service **appending lines** to a\ntemp log; a watcher task polls the file, diffs the line count against what it\nlast saw, and emits a `:new-lines` event for each delta. `file/read` and\n`file/append` offload to the I/O pool and yield, same as `shell` — so neither\ntask blocks the other sources.\n\n(A real deployment would watch inode change or use OS notifications; periodic\ndiffing is the portable, dependency-free version of the same loop.)"
+    },
+    {
+      "id": "c00000009",
+      "type": "code",
+      "source": "(define log-path \"/tmp/sema-nb-monitor.log\")\n(file/write log-path \"\")   ; start the \"service log\" empty\n\n;; A pretend service, appending heartbeat lines.\n(define log-writer\n  (async/spawn (fn ()\n    (dotimes (i 10)\n      (file/append log-path (format \"line ~a: service heartbeat\\n\" i))\n      (async/sleep 35))\n    :writer)))\n\n(define (line-count path)\n  (count (filter (fn (l) (> (string-length l) 0))\n                 (string/split (file/read path) \"\\n\"))))\n\n;; The tailer: poll, diff, emit only when something changed.\n(define log-tailer\n  (async/spawn (fn ()\n    (let loop ((poll 0) (seen 0))\n      (if (= poll 8)\n          :tailer\n          (begin\n            (async/sleep 55)\n            (let ((n (line-count log-path)))\n              (when (> n seen)\n                (channel/send bus (event :logfile :new-lines (- n seen) poll)))\n              (loop (+ poll 1) n))))))))\n\n(println \"log writer + tailer spawned (10 lines, 8 polls)\")",
+      "outputs": [
+        {
+          "type": "stdout",
+          "display": "log writer + tailer spawned (10 lines, 8 polls)\n",
+          "timestamp": "2026-07-03T16:11:57.382575Z"
+        },
+        {
+          "type": "value",
+          "display": "",
+          "sema_value": "nil",
+          "timestamp": "2026-07-03T16:11:57.382574Z",
+          "duration_ms": 0
+        }
+      ]
+    },
+    {
+      "id": "c0000000a",
+      "type": "markdown",
+      "source": "## 5. The aggregator\n\nOne consumer drains the bus and folds every event into a per-source stats map:\ncount, running sum (for the mean), max, and alert count. When a `:reading`\ncrosses the threshold it prints an **ALERT** line immediately — that's your\nlive feed. This is where the event's `:kind` earns its keep: RSS samples and\nline counts live on very different scales, so the threshold only applies to\nsensor readings. (Real monitors go further: a per-kind threshold table.)\n\nNote the exit condition: `channel/recv` returns `nil` once the bus is *closed\nand drained*. The aggregator doesn't need to know how many producers exist or\nwhen they finish — shutdown is entirely the bus's problem.\n\nAfter spawning it, we let the system run for ~400 ms so you can see the first\nalerts trickle in while sources are still producing."
+    },
+    {
+      "id": "c0000000b",
+      "type": "code",
+      "source": "(define (note stats ev)\n  (let* ((src (:source ev))\n         (v (:value ev))\n         (cur (get stats src {:count 0 :sum 0 :max 0 :alerts 0}))\n         ;; the threshold is calibrated for sensor readings, so gate on :kind\n         (alert? (and (= (:kind ev) :reading) (> v alert-threshold)))\n         (next {:count  (+ (:count cur) 1)\n                :sum    (+ (:sum cur) v)\n                :max    (max (:max cur) v)\n                :alerts (+ (:alerts cur) (if alert? 1 0))}))\n    (when alert?\n      (println (format \"ALERT  ~a reading ~a exceeds threshold ~a\"\n                       src v alert-threshold)))\n    (assoc stats src next)))\n\n(define aggregator\n  (async/spawn (fn ()\n    (let loop ((stats {}) (n 0))\n      (let ((ev (channel/recv bus)))     ; nil once closed AND drained\n        (if (nil? ev)\n            {:stats stats :events n}\n            (loop (note stats ev) (+ n 1))))))))\n\n;; Drive the scheduler for ~400 ms: sources produce, aggregator consumes,\n;; and the first :pump spike (its 7th reading) should alert below.\n(async/await (async/spawn (fn () (async/sleep 400) :running)))\n(println \"monitor running — first alerts fired above\")",
+      "outputs": [
+        {
+          "type": "stdout",
+          "display": "ALERT  :pump reading 987 exceeds threshold 900\nmonitor running — first alerts fired above\n",
+          "timestamp": "2026-07-03T16:11:57.840612Z"
+        },
+        {
+          "type": "value",
+          "display": "",
+          "sema_value": "nil",
+          "timestamp": "2026-07-03T16:11:57.840611Z",
+          "duration_ms": 458
+        }
+      ]
+    },
+    {
+      "id": "c0000000c",
+      "type": "markdown",
+      "source": "## 6. Optional: a WebSocket source\n\nA production bus often has a network feed — a `wss://` stream of ticks or\nwebhook-ish events. Here we *try* one echo round-trip against a public echo\nserver and turn the reply into a bus event. External networks are not part of\nthis notebook's contract, so the whole thing is wrapped in `try`: **on any\nfailure it prints a note and moves on** — the monitor is green either way.\n\nOne honest constraint: don't run `http/serve` *inside* a notebook to fake the\nserver side — its handler loop blocks the cell forever. The server belongs in\nits own process; see `examples/web-server.sema` for that half."
+    },
+    {
+      "id": "c0000000d",
+      "type": "code",
+      "source": "(define ws-events\n  (try\n    (let ((conn (ws/connect \"wss://ws.postman-echo.com/raw\" {:timeout 4000})))\n      (ws/send conn \"monitor-echo-check\")\n      (let ((reply (ws/recv-timeout conn 4000)))\n        (ws/close conn)\n        (if (and (map? reply) (:text reply))\n            (begin\n              (channel/send bus (event :ws :echo (string-length (:text reply)) 0))\n              (println (format \"ws echo ok: ~a\" (:text reply)))\n              1)\n            (begin\n              (println \"(external ws unreachable — skipped)\")\n              0))))\n    (catch e\n      (println \"(external ws unreachable — skipped)\")\n      0)))\n\n(println (format \"ws source contributed ~a event(s)\" ws-events))",
+      "outputs": [
+        {
+          "type": "stdout",
+          "display": "ws echo ok: monitor-echo-check\nws source contributed 1 event(s)\n",
+          "timestamp": "2026-07-03T16:11:59.282315Z"
+        },
+        {
+          "type": "value",
+          "display": "",
+          "sema_value": "nil",
+          "timestamp": "2026-07-03T16:11:59.282313Z",
+          "duration_ms": 1441
+        }
+      ]
+    },
+    {
+      "id": "c0000000e",
+      "type": "markdown",
+      "source": "## 7. Graceful shutdown: close → drain → join\n\nShutdown ordering is where event buses usually go wrong. The safe sequence:\n\n1. **Wait for every producer** (`async/all`) — nobody may write after close.\n2. **Close the bus** (`channel/close`) — buffered events stay readable;\n   `channel/recv` starts returning `nil` only after the buffer is drained.\n3. **Join the consumer** (`async/await aggregator`) — it drains the tail,\n   hits `nil`, and returns its final stats.\n\nClose before producers finish and you drop events; skip the join and you\nreport before the tail is counted. Any remaining alerts (the second `:pump`\nspike) fire during this drain."
+    },
+    {
+      "id": "c0000000f",
+      "type": "code",
+      "source": ";; 1. every source finishes (all are bounded, so this terminates)\n(async/all (list temp-sensor load-sensor pump-sensor\n                 proc-source log-writer log-tailer))\n\n;; 2. close the bus — no more writes, buffered events still readable\n(channel/close bus)\n\n;; 3. join the consumer — it drains the tail and returns final stats\n(define result (async/await aggregator))\n(define stats (:stats result))\n\n(println (format \"bus closed — aggregator drained ~a events from ~a sources\"\n                 (:events result) (count (keys stats))))\n\n;; housekeeping: remove the temp log\n(file/delete log-path)\n(println \"temp log file removed\")",
+      "outputs": [
+        {
+          "type": "stdout",
+          "display": "ALERT  :pump reading 962 exceeds threshold 900\nbus closed — aggregator drained 54 events from 6 sources\ntemp log file removed\n",
+          "timestamp": "2026-07-03T16:11:59.428740Z"
+        },
+        {
+          "type": "value",
+          "display": "",
+          "sema_value": "nil",
+          "timestamp": "2026-07-03T16:11:59.428739Z",
+          "duration_ms": 146
+        }
+      ]
+    },
+    {
+      "id": "c00000010",
+      "type": "markdown",
+      "source": "## 8. The snapshot dashboard\n\nEverything is joined, so the stats map is final. Pure Sema formatting:\n`map/entries` gives a deterministic (sorted) source order, `string/pad-left`\nand `string/pad-right` line up the columns."
+    },
+    {
+      "id": "c00000011",
+      "type": "code",
+      "source": "(define (pad-num v w) (string/pad-left (format \"~a\" v) w))\n(define (mean-of s) (/ (round (* 10.0 (/ (:sum s) (:count s)))) 10.0))\n\n(define (row name s)\n  (format \"| ~a | ~a | ~a | ~a | ~a |\"\n          (string/pad-right (format \"~a\" name) 9)\n          (pad-num (:count s) 6)\n          (pad-num (mean-of s) 9)\n          (pad-num (:max s) 7)\n          (pad-num (:alerts s) 6)))\n\n(define sep \"+-----------+--------+-----------+---------+--------+\")\n(println sep)\n(println \"| source    | events |      mean |     max | alerts |\")\n(println sep)\n(for-each (fn (entry) (println (row (car entry) (cadr entry))))\n          (map/entries stats))\n(println sep)\n\n(define total-alerts\n  (foldl + 0 (map (fn (e) (:alerts (cadr e))) (map/entries stats))))\n(println (format \"total events: ~a   total alerts: ~a\"\n                 (:events result) total-alerts))",
+      "outputs": [
+        {
+          "type": "stdout",
+          "display": "+-----------+--------+-----------+---------+--------+\n| source    | events |      mean |     max | alerts |\n+-----------+--------+-----------+---------+--------+\n| :load     |     14 |      56.5 |      77 |      0 |\n| :logfile  |      6 |       1.7 |       2 |      0 |\n| :proc     |      5 |    1440.0 |    1440 |      0 |\n| :pump     |     14 |     189.5 |     987 |      2 |\n| :temp     |     14 |      55.6 |      74 |      0 |\n| :ws       |      1 |      18.0 |      18 |      0 |\n+-----------+--------+-----------+---------+--------+\ntotal events: 54   total alerts: 2\n",
+          "timestamp": "2026-07-03T16:11:59.429004Z"
+        },
+        {
+          "type": "value",
+          "display": "",
+          "sema_value": "nil",
+          "timestamp": "2026-07-03T16:11:59.429003Z",
+          "duration_ms": 0
+        }
+      ]
+    },
+    {
+      "id": "c00000012",
+      "type": "markdown",
+      "source": "## 9. Honest limits\n\n- **No preemption.** The scheduler is cooperative: a hot aggregator doing heavy\n  CPU work between `channel/recv` calls starves every source until it yields.\n  Keep per-event work small, or sprinkle `(async/sleep 0)` into anything heavy.\n- **The tailer counts, it doesn't stream.** Re-reading the whole file each poll\n  is fine for a demo; a real tailer tracks a byte offset.\n- **External feeds are optional by design.** The ws section degrades to a\n  skipped note — a monitor that requires the network to *demonstrate itself*\n  is a monitor you can't trust offline.\n- **Servers don't fit in cells.** `http/serve`'s handler loop blocks its cell\n  forever; run the serving side as its own process (`examples/web-server.sema`).\n\nThe template to take home: bounded bus, one event shape, bounded producers,\none consumer, close → drain → join.\n\n## Where to go next\n\n- **`async-basics.sema-nb`** — the scheduler model this notebook builds on\n- **`concurrent-data-pipeline.sema-nb`** — the same fan-in against real HTTP APIs\n- **`llm-batch-enrichment.sema-nb`** — concurrent LLM calls with budgets and caching\n- **`research-agents.sema-nb`** — multi-round agents that don't block each other"
+    }
+  ]
+}

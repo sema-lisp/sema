@@ -198,6 +198,11 @@ impl Scheduler {
                     }
                     *task.promise.state.borrow_mut() = PromiseState::Cancelled;
                     task.state = TaskState::Failed;
+                    // The task will never resume: let per-task native state (e.g.
+                    // an agent-run slab entry) reclaim now, on the VM thread with
+                    // OTel TLS alive. Fired only on this transition, never on
+                    // ordinary Done/Failed.
+                    sema_core::notify_task_reaped(task.id);
                 }
                 continue;
             }
@@ -326,6 +331,12 @@ impl Scheduler {
         task.cancelled = true;
         *task.promise.state.borrow_mut() = PromiseState::Cancelled;
         task.state = TaskState::Failed;
+        // The task will never resume from here: notify per-task native state (e.g.
+        // sema-llm's agent-run slab) so it reclaims now, on the VM thread with the
+        // OTel thread-locals alive — not at teardown. Fired only on an actual
+        // cancellation transition (the terminal/already-cancelled cases returned
+        // above), never on ordinary completion.
+        sema_core::notify_task_reaped(task.id);
         (true, awaited)
     }
 
@@ -758,6 +769,10 @@ struct ReinstallGuard<'a> {
     /// installed on entry. Restored on leave alongside the others (ASYNC-1). `None`
     /// once consumed.
     prev_llm_scope: Option<Box<dyn Any>>,
+    /// The current-task-id displaced when this task's id was published on entry
+    /// (`None` at top level, the outer task's id during a nested inline-task run).
+    /// Restored on leave. Outer `None` once consumed.
+    prev_task_id: Option<Option<u64>>,
 }
 
 impl ReinstallGuard<'_> {
@@ -766,6 +781,11 @@ impl ReinstallGuard<'_> {
     /// the otel context that was active before this task ran. Idempotent: a
     /// second call (Drop after the explicit reinstall) is a no-op.
     fn restore_otel(&mut self) {
+        // Restore the current-task-id in lockstep with the other per-task
+        // contexts (idempotent via the outer Option take).
+        if let Some(prev_id) = self.prev_task_id.take() {
+            let _ = sema_core::set_current_task_id(prev_id);
+        }
         // Restore the leaf-usage scope in lockstep with otel (both are per-task
         // thread-local contexts installed on entry). Take this task's (possibly
         // mid-completion) scope back out onto the task so it resumes with the same
@@ -948,9 +968,15 @@ fn run_until_reentrant(
         if sema_core::check_interrupt() {
             // Abort any in-flight offloaded work (real socket/process abort where
             // supported) before dropping the tasks on an interrupt (e.g. Ctrl-C).
+            // Non-terminal tasks will never resume — notify the task-reaped seam
+            // for each so per-task native state (agent-run slab entries) reclaims
+            // here, with OTel TLS alive, instead of leaking to teardown.
             for task in &sched.tasks {
                 if let TaskState::Blocked(YieldReason::AwaitIo(h)) = &task.state {
                     h.abort();
+                }
+                if !matches!(task.state, TaskState::Done | TaskState::Failed) {
+                    sema_core::notify_task_reaped(task.id);
                 }
             }
             sched.tasks.clear();
@@ -1121,6 +1147,10 @@ fn run_until_reentrant(
         if task.cancelled {
             *task.promise.state.borrow_mut() = PromiseState::Cancelled;
             task.state = TaskState::Failed;
+            // Never resumes from here — same reap notification as the other
+            // cancellation transitions (harmless if `cancel_one` already fired:
+            // the consumer's sweep is idempotent by slab-entry absence).
+            sema_core::notify_task_reaped(task.id);
             sched.tasks.push(task);
             continue;
         }
@@ -1152,6 +1182,11 @@ fn run_until_reentrant(
         // the task was spawned rather than whatever the thunk reset them to (ASYNC-1).
         let task_llm = std::mem::replace(&mut task.llm_scope, Box::new(()));
         let prev_llm_scope = sema_core::install_task_llm_scope(task_llm);
+        // Publish this task's id for the duration of its step so natives that
+        // stash per-task state (e.g. `__agent-begin`) can stamp their slab entry
+        // with the owning task for the task-reaped sweep. Displaced value is
+        // restored on leave so nested inline-task runs stack correctly.
+        let prev_task_id = sema_core::set_current_task_id(Some(task.id));
         let mut guard = ReinstallGuard {
             sched,
             task: Some(task),
@@ -1159,6 +1194,7 @@ fn run_until_reentrant(
             prev_otel: Some(prev_otel),
             prev_usage_scope: Some(prev_usage_scope),
             prev_llm_scope: Some(prev_llm_scope),
+            prev_task_id: Some(prev_task_id),
         };
         let task = guard.task.as_mut().expect("in-flight task present");
 
@@ -1285,6 +1321,7 @@ mod tests {
                 prev_otel: None,
                 prev_usage_scope: None,
                 prev_llm_scope: None,
+                prev_task_id: None,
             };
             // Simulate a panic mid-step (e.g. an `unreachable!()` in the VM).
             panic!("simulated task panic");

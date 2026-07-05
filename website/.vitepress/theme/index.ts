@@ -2,6 +2,7 @@ import DefaultTheme from 'vitepress/theme'
 import CustomHome from './CustomHome.vue'
 import HomepageV2 from './HomepageV2.vue'
 import BrandGuide from './BrandGuide.vue'
+import IconShowcase from './IconShowcase.vue'
 import CustomPageLayout from './CustomPageLayout.vue'
 import SemaLogo from './SemaLogo.vue'
 import FeatureNotebook from './FeatureNotebook.vue'
@@ -23,6 +24,7 @@ export default {
     app.component('CustomHome', CustomHome)
     app.component('HomepageV2', HomepageV2)
     app.component('BrandGuide', BrandGuide)
+    app.component('IconShowcase', IconShowcase)
     app.component('CustomPageLayout', CustomPageLayout)
     app.component('SemaLogo', SemaLogo)
     app.component('FeatureNotebook', FeatureNotebook)

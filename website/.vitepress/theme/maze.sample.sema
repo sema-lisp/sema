@@ -1,0 +1,132 @@
+;;; maze.sema — ASCII maze generator
+;;;
+;;; Uses iterative randomized depth-first search with an explicit stack
+;;; to carve a perfect maze, then renders it as ASCII art.
+;;;
+;;; Demonstrates: named let, maps as sparse grids, higher-order functions,
+;;;               random number generation, string building
+
+(define width   30)
+(define height  15)
+
+;;; --- Utilities ---
+
+;; Encode (x, y) as a string key for map lookup
+(define (pos x y) (str x "," y))
+
+;; Shuffle a list by repeatedly extracting a random element
+(define (shuffle lst)
+  (if (<= (length lst) 1)
+    lst
+    (let* ((i       (math/random-int 0 (- (length lst) 1)))
+           (picked  (nth lst i))
+           (rest    (append (take i lst) (drop (+ i 1) lst))))
+      (cons picked (shuffle rest)))))
+
+;;; --- Maze generation ---
+;;;
+;;; The maze lives on a (2W+1) × (2H+1) rendering grid.
+;;; Cells sit at odd coordinates (2x+1, 2y+1); walls fill the gaps.
+;;; We store passable positions in a map: "gx,gy" -> #t
+;;; and carve passages via randomized depth-first traversal
+;;; with an explicit stack to avoid Rust stack overflow.
+
+(define directions (list (list 0 -1) (list 0 1) (list -1 0) (list 1 0)))
+
+;; Find unvisited neighbors of cell (cx, cy) in random order
+(define (unvisited-neighbors grid cx cy)
+  (filter
+    (fn (entry)
+      (let ((nx (car entry)) (ny (cadr entry)))
+        (and (>= nx 0)
+          (< nx width)
+          (>= ny 0)
+          (< ny height)
+          (not (get grid (pos (+ (* nx 2) 1) (+ (* ny 2) 1)) #f)))))
+    (map
+      (fn (dir)
+        (list (+ cx (car dir)) (+ cy (cadr dir)) (car dir) (cadr dir)))
+      (shuffle directions))))
+
+;; Iterative depth-first maze carving
+;; Stack is a list of (cx cy) cells to backtrack to.
+;; Grid is a map of "gx,gy" -> #t for open positions.
+(define (generate-maze)
+  (let loop ((stack  (list (list 0 0)))
+             (grid   (assoc {} (pos 1 1) #t)))
+    (if (null? stack)
+      grid
+      (let* ((cell       (car stack))
+             (cx         (car cell))
+             (cy         (cadr cell))
+             (neighbors  (unvisited-neighbors grid cx cy)))
+        (if (null? neighbors)
+          ;; Backtrack
+          (loop (cdr stack) grid)
+          ;; Pick the first unvisited neighbor (already shuffled)
+          (let* ((next (car neighbors))
+                 (nx (car next))
+                 (ny (cadr next))
+                 (dx (nth next 2))
+                 (dy (nth next 3))
+                 ;; Open the neighbor cell
+                 (grid (assoc grid (pos (+ (* nx 2) 1) (+ (* ny 2) 1)) #t))
+                 ;; Open the wall between current and neighbor
+                 (grid (assoc grid (pos (+ (* cx 2) 1 dx) (+ (* cy 2) 1 dy)) #t)))
+            ;; Push current cell back (for backtracking) and new cell on top
+            (loop (cons (list nx ny) stack) grid)))))))
+
+;;; --- Rendering ---
+
+(define grid-w (+ (* 2 width) 1))
+(define grid-h (+ (* 2 height) 1))
+
+;; Check if position (x,y) is a wall
+(define (wall? grid x y)
+  (and (>= x 0)
+    (< x grid-w)
+    (>= y 0)
+    (< y grid-h)
+    (not (get grid (pos x y) #f))))
+
+;; Double-wide box chars to correct for ~2:1 char aspect ratio
+(define (box-char grid x y)
+  (let* ((u     (wall? grid x (- y 1)))
+         (d     (wall? grid x (+ y 1)))
+         (l     (wall? grid (- x 1) y))
+         (r     (wall? grid (+ x 1) y))
+         (bits  (+ (if u 1 0) (if d 2 0) (if l 4 0) (if r 8 0))))
+    (cond
+      ((= bits 15)  "┼─")
+      ((= bits 14)  "┬─")
+      ((= bits 13)  "┴─")
+      ((= bits 11)  "├─")
+      ((= bits 7)   "┤ ")
+      ((= bits 6)   "┐ ")
+      ((= bits 10)  "┌─")
+      ((= bits 5)   "┘ ")
+      ((= bits 9)   "└─")
+      ((= bits 12)  "──")
+      ((= bits 3)   "│ ")
+      ((= bits 1)   "│ ")
+      ((= bits 2)   "│ ")
+      ((= bits 4)   "─ ")
+      ((= bits 8)   "──")
+      (else         "· "))))
+
+(define (render grid)
+  (for-each
+    (fn (y)
+      (println
+        (string/join
+          (map
+            (fn (x)
+              (if (get grid (pos x y) #f) "  " (box-char grid x y)))
+            (range grid-w))
+          "")))
+    (range grid-h)))
+
+;;; --- Main ---
+
+(println (str "Generating " width "×" height " maze...\n"))
+(render (generate-maze))

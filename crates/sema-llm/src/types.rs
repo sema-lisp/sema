@@ -141,6 +141,14 @@ pub struct ToolCall {
     pub id: String,
     pub name: String,
     pub arguments: serde_json::Value,
+    /// Gemini's opaque per-call `thoughtSignature`: captured from the model's
+    /// `functionCall` part and echoed back verbatim when the assistant turn is
+    /// re-sent on the next round — Gemini 2.5+ rejects a resent tool-call turn
+    /// without it (400 INVALID_ARGUMENT). Opaque to every other provider (and
+    /// to Sema code); `None` everywhere but Gemini responses. Serde-defaulted
+    /// so cassette tapes recorded before this field replay unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thought_signature: Option<String>,
 }
 
 #[derive(Debug, Clone)]

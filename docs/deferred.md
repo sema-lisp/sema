@@ -322,3 +322,27 @@ These are not deferred — they're design questions that need a deliberate decis
 - Project `events.jsonl` into the dashboard first; SQLite remains a secondary index.
 - Add operator controls: pause/resume/cancel run, cancel/restart agent, inspect prompt/result/tool-transcript, export report.
 - Prefer SSE over WebSockets for the first live local dashboard stream.
+
+## Notebook: per-cell + per-session LLM cost tracking (status bar)
+
+Accumulate LLM spend for a notebook session and attribute it per cell / per
+run, surfaced as a per-cell badge and a session-cumulative status bar. Scoped
+2026-07-03 (see the GitHub issue for full context):
+
+- **Cell boundary**: `NotebookEngine::eval_cell` (engine.rs:108) / `eval_cells`
+  (:277); cells evaluate on the dedicated engine thread (bridge.rs), so
+  sema-llm's thread-local accounting is stable across cells.
+- **Mechanism**: reuse the per-leaf usage-scope seam (`open_usage_scope` /
+  `LeafUsage`, sema-llm builtins.rs:127/187) — open a scope per cell eval. It is
+  already async-correct: offload pollers fold into the Rc captured at dispatch
+  (the ASYNC-1 guarantee), so spend from tasks/agents/streams started in a cell
+  lands on that cell even though it settles in a poller.
+- **Plumbing**: `EvalResult` (engine.rs:50) gains usage; `EvalResponse`
+  (render.rs:164) serializes it; UI = ui/notebook.js + index.html (Alpine).
+- **Semantics**: badge = last-run cost of the cell; status bar = session
+  cumulative (parity with `(llm/session-usage)`); reset on kernel restart.
+  Cache hits report zero (shows "re-runs are free"); cassette replays charge
+  the recorded usage from the tape — decide whether to tag those visually.
+- Headless `notebook run` should print the same summary line at the end.
+
+Deferred: feature work, not async-runtime scope. Filed as a GitHub issue.

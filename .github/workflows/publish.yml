@@ -63,6 +63,7 @@ jobs:
 
           # Dependency order: a crate's path-deps must already be on crates.io.
           publish sema-core
+          publish sema-io
           publish sema-reader
           publish sema-vm
           publish sema-otel

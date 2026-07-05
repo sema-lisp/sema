@@ -3,8 +3,6 @@
 mod archive;
 mod arithmetic;
 mod async_ops;
-#[cfg(not(target_arch = "wasm32"))]
-mod async_rt;
 mod bitwise;
 mod bytevector;
 mod comparison;
@@ -114,6 +112,11 @@ pub(crate) fn strip_ansi(s: &str) -> String {
 pub fn register_stdlib(env: &Env, sandbox: &Sandbox) {
     #[cfg(target_arch = "wasm32")]
     let _ = sandbox;
+
+    // Install THE process-wide I/O pool behind the sema-core executor seam
+    // (ADR #69) so every offloading builtin below reaches one pool. Idempotent.
+    #[cfg(not(target_arch = "wasm32"))]
+    sema_io::install();
 
     arithmetic::register(env);
     comparison::register(env);

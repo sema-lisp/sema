@@ -100,8 +100,8 @@ fn shell_output_value(status_code: Option<i32>, stdout: &[u8], stderr: &[u8]) ->
     Value::map(result)
 }
 
-/// The subprocess facts that cross the thread boundary back from the shared
-/// runtime to the VM thread. Only plain `Send` data — never a `Value`/`Rc`.
+/// The subprocess facts that cross the thread boundary back from the I/O pool
+/// to the VM thread. Only plain `Send` data — never a `Value`/`Rc`.
 /// Decoded into the same `Value` shape as the sync path via [`shell_output_value`].
 struct RawShellOutput {
     status_code: Option<i32>,
@@ -109,8 +109,8 @@ struct RawShellOutput {
     stderr: Vec<u8>,
 }
 
-/// The offloaded (async-context) path: `spawn` the subprocess on the shared
-/// runtime and yield an `AwaitIo` handle whose poll closure decodes the `Send`
+/// The offloaded (async-context) path: `io_spawn` the subprocess on the process-
+/// wide I/O pool and yield an `AwaitIo` handle whose poll closure decodes the `Send`
 /// output facts into the identical `Value` shape the sync path returns. Returns
 /// `Ok(nil)` after arming the yield signal; the scheduler delivers the real
 /// value on resume.
@@ -136,7 +136,7 @@ fn shell_async(program: String, child_args: Vec<String>) -> Result<Value, SemaEr
     let pid_for_worker = pid_slot.clone();
     let pid_for_poll = pid_slot.clone();
 
-    let join = crate::async_rt::stdlib_shared_rt().spawn(async move {
+    let abort_task = sema_io::io_spawn(async move {
         let result = async {
             // Spawn (not `.output()`) so we can publish the pid before awaiting, then
             // gather output. `kill_on_drop` kills the direct child if this future is
@@ -174,14 +174,15 @@ fn shell_async(program: String, child_args: Vec<String>) -> Result<Value, SemaEr
         sema_core::notify_io_complete();
     });
 
-    // True cancellation: on cancel/timeout the scheduler runs this hook. It (a) aborts
-    // the spawned task (→ drops the kill_on_drop `Child` once the runtime processes it)
-    // AND (b) issues a SYNCHRONOUS `SIGKILL` to the child's whole PROCESS GROUP. (b) is
-    // what makes the kill reliable even when the program exits IMMEDIATELY after the
-    // timeout (e.g. a one-shot `sema -e`), where the runtime is torn down before it can
-    // process the async abort — and killing the GROUP (not just the `sh` pid) reaps the
-    // grandchildren a compound command forks. Fires only on cancellation.
-    let abort_handle = join.abort_handle();
+    // True cancellation: on cancel/timeout the scheduler runs this hook. It (a) runs
+    // the seam's one-shot AbortHook, aborting the spawned task (→ drops the
+    // kill_on_drop `Child` once the pool processes it) AND (b) issues a SYNCHRONOUS
+    // `SIGKILL` to the child's whole PROCESS GROUP. (b) is what makes the kill
+    // reliable even when the program exits IMMEDIATELY after the timeout (e.g. a
+    // one-shot `sema -e`), where the pool is torn down before it can process the
+    // async abort — and killing the GROUP (not just the `sh` pid) reaps the
+    // grandchildren a compound command forks. Fires only on cancellation; the killpg
+    // layer composes AROUND the seam's hook.
     #[cfg(unix)]
     let pid_for_abort = pid_slot;
     #[cfg(not(unix))]
@@ -207,7 +208,7 @@ fn shell_async(program: String, child_args: Vec<String>) -> Result<Value, SemaEr
             }
         },
         move || {
-            abort_handle.abort();
+            abort_task();
             #[cfg(unix)]
             {
                 let pid = pid_for_abort.load(Ordering::SeqCst);
@@ -265,8 +266,8 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
         // launch byte-identical commands.
         let (program, child_args) = shell_program_args(cmd, &cmd_args);
 
-        // Inside an `async/spawn`'d task: offload the subprocess onto the shared
-        // multi-thread runtime and yield `AwaitIo` so the scheduler can run
+        // Inside an `async/spawn`'d task: offload the subprocess onto the
+        // process-wide I/O pool and yield `AwaitIo` so the scheduler can run
         // sibling tasks while the child runs. Args are resolved and the result
         // `Value` decoded on the VM thread; only `Send` facts cross the boundary.
         if sema_core::in_async_context() {

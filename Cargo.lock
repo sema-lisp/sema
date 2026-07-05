@@ -3710,6 +3710,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "sema-io"
+version = "1.28.1"
+dependencies = [
+ "sema-core",
+ "tokio",
+]
+
+[[package]]
 name = "sema-lang"
 version = "1.28.1"
 dependencies = [
@@ -3735,6 +3743,7 @@ dependencies = [
  "sema-docs",
  "sema-eval",
  "sema-fmt",
+ "sema-io",
  "sema-llm",
  "sema-lsp",
  "sema-mcp",
@@ -3766,6 +3775,7 @@ dependencies = [
  "futures",
  "reqwest",
  "sema-core",
+ "sema-io",
  "sema-otel",
  "serde",
  "serde_json",
@@ -3886,6 +3896,7 @@ dependencies = [
  "scraper",
  "sema-core",
  "sema-fmt",
+ "sema-io",
  "sema-llm",
  "sema-otel",
  "sema-reader",

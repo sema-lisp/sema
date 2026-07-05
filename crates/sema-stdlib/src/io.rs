@@ -521,6 +521,68 @@ fn resolved_path(p: &str) -> std::path::PathBuf {
     }
 }
 
+/// Offload one blocking `std::fs` operation onto THE I/O pool's blocking tier
+/// and yield `AwaitIo`, parking the calling task until the op completes.
+///
+/// Used by the `file/*` builtins when running inside an `async/spawn`'d task,
+/// so a slow read/write (big file, cold media, network mount) doesn't stall
+/// sibling tasks. Callers must resolve + validate arguments (arity, types,
+/// sandbox caps/paths, VFS hits) on the VM thread FIRST; only `Send` facts
+/// cross the thread boundary (`work`'s captured paths/contents out, `T` back).
+/// `decode` turns the facts into the result `Value` on the VM thread, exactly
+/// like the http/shell pollers. Worker errors must be pre-rendered through
+/// [`fs_io_msg`] so the task rejection carries the byte-identical message the
+/// sync path's `SemaError::Io` would display.
+///
+/// No abort hook (`IoHandle::new`): unlike a subprocess or an HTTP round-trip
+/// there is nothing meaningful to tear down mid-flight — a file op finishes in
+/// bounded time — so cancellation is best-effort: the offloaded op runs to
+/// completion and its result is discarded (same policy as the LLM
+/// `spawn_blocking` tier).
+///
+/// Returns `Ok(nil)` after arming the yield signal; the scheduler delivers the
+/// real value on resume.
+fn fs_offload<T: Send + 'static>(
+    work: impl FnOnce() -> Result<T, String> + Send + 'static,
+    decode: impl Fn(T) -> Value + 'static,
+) -> Result<Value, SemaError> {
+    use std::rc::Rc;
+    use tokio::sync::oneshot::error::TryRecvError;
+
+    // Vestigial under CALL_NATIVE (the scheduler delivers the resume value via
+    // `replace_stack_top`, not by re-invoking this native), but kept for
+    // symmetry with the shipped `async/await` yield pattern.
+    if let Some(v) = sema_core::take_resume_value() {
+        return Ok(v);
+    }
+
+    let (tx, mut rx) = tokio::sync::oneshot::channel::<Result<T, String>>();
+    sema_io::io_spawn_blocking(move || {
+        let _ = tx.send(work());
+        // Wake the parked VM thread so it re-polls promptly.
+        sema_core::notify_io_complete();
+    });
+
+    let handle = Rc::new(sema_core::IoHandle::new(move || match rx.try_recv() {
+        Err(TryRecvError::Empty) => sema_core::IoPoll::Pending,
+        Ok(Ok(t)) => sema_core::IoPoll::Ready(Ok(decode(t))),
+        Ok(Err(msg)) => sema_core::IoPoll::Ready(Err(msg)),
+        Err(TryRecvError::Closed) => {
+            sema_core::IoPoll::Ready(Err("file: worker dropped".to_string()))
+        }
+    }));
+    sema_core::set_yield_signal(sema_core::YieldReason::AwaitIo(handle));
+    Ok(Value::nil())
+}
+
+/// Render a file-op failure exactly as the sync path raises it: through
+/// `SemaError::Io`'s `Display`. A task that fails on the sync path records
+/// `format!("{err}")` as its rejection message, so the offloaded path must
+/// pre-render the same form for sync/async rejections to be byte-identical.
+fn fs_io_msg(msg: String) -> String {
+    SemaError::Io(msg).to_string()
+}
+
 /// Crate-internal: poll stdin for a key within `ms` and decode it, for
 /// `event/select`'s `:key` source. Returns the key event, or `None` if no key
 /// is ready (or on non-unix platforms, where raw key input isn't wired).
@@ -610,6 +672,16 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
                     SemaError::Io(format!("file/read {path}: invalid UTF-8 in VFS: {e}"))
                 });
         }
+        if sema_core::in_async_context() {
+            let path = path.to_string();
+            return fs_offload(
+                move || {
+                    std::fs::read_to_string(&path)
+                        .map_err(|e| fs_io_msg(format!("file/read {path}: {e}")))
+                },
+                |s| Value::string(&s),
+            );
+        }
         let content = std::fs::read_to_string(path)
             .map_err(|e| SemaError::Io(format!("file/read {path}: {e}")))?;
         Ok(Value::string(&content))
@@ -623,6 +695,17 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
         let content = args[1]
             .as_str()
             .ok_or_else(|| SemaError::type_error("string", args[1].type_name()))?;
+        if sema_core::in_async_context() {
+            let path = path.to_string();
+            let content = content.to_string();
+            return fs_offload(
+                move || {
+                    std::fs::write(&path, &content)
+                        .map_err(|e| fs_io_msg(format!("file/write {path}: {e}")))
+                },
+                |()| Value::nil(),
+            );
+        }
         std::fs::write(path, content)
             .map_err(|e| SemaError::Io(format!("file/write {path}: {e}")))?;
         Ok(Value::nil())
@@ -641,6 +724,16 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
                 .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
             if let Some(data) = sema_core::vfs::vfs_read(path) {
                 return Ok(Value::bytevector(data));
+            }
+            if sema_core::in_async_context() {
+                let path = path.to_string();
+                return fs_offload(
+                    move || {
+                        std::fs::read(&path)
+                            .map_err(|e| fs_io_msg(format!("file/read-bytes {path}: {e}")))
+                    },
+                    Value::bytevector,
+                );
             }
             let bytes = std::fs::read(path)
                 .map_err(|e| SemaError::Io(format!("file/read-bytes {path}: {e}")))?;
@@ -738,14 +831,25 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
         let content = args[1]
             .as_str()
             .ok_or_else(|| SemaError::type_error("string", args[1].type_name()))?;
-        use std::io::Write;
-        let mut file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)
-            .map_err(|e| SemaError::Io(format!("file/append {path}: {e}")))?;
-        file.write_all(content.as_bytes())
-            .map_err(|e| SemaError::Io(format!("file/append {path}: {e}")))?;
+        fn append_impl(path: &str, content: &str) -> Result<(), String> {
+            use std::io::Write;
+            let mut file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .map_err(|e| format!("file/append {path}: {e}"))?;
+            file.write_all(content.as_bytes())
+                .map_err(|e| format!("file/append {path}: {e}"))
+        }
+        if sema_core::in_async_context() {
+            let path = path.to_string();
+            let content = content.to_string();
+            return fs_offload(
+                move || append_impl(&path, &content).map_err(fs_io_msg),
+                |()| Value::nil(),
+            );
+        }
+        append_impl(path, content).map_err(SemaError::Io)?;
         Ok(Value::nil())
     });
 
@@ -754,6 +858,16 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
         let path = args[0]
             .as_str()
             .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
+        if sema_core::in_async_context() {
+            let path = path.to_string();
+            return fs_offload(
+                move || {
+                    std::fs::remove_file(&path)
+                        .map_err(|e| fs_io_msg(format!("file/delete {path}: {e}")))
+                },
+                |()| Value::nil(),
+            );
+        }
         std::fs::remove_file(path)
             .map_err(|e| SemaError::Io(format!("file/delete {path}: {e}")))?;
         Ok(Value::nil())
@@ -1020,6 +1134,16 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
                     SemaError::Io(format!("file/read-lines {path}: invalid UTF-8 in VFS: {e}"))
                 })?
             } else {
+                if sema_core::in_async_context() {
+                    let path = path.to_string();
+                    return fs_offload(
+                        move || {
+                            std::fs::read_to_string(&path)
+                                .map_err(|e| fs_io_msg(format!("file/read-lines {path}: {e}")))
+                        },
+                        |content| Value::list(content.lines().map(Value::string).collect()),
+                    );
+                }
                 std::fs::read_to_string(path)
                     .map_err(|e| SemaError::Io(format!("file/read-lines {path}: {e}")))?
             };
@@ -1160,6 +1284,18 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
         let dest = args[1]
             .as_str()
             .ok_or_else(|| SemaError::type_error("string", args[1].type_name()))?;
+        if sema_core::in_async_context() {
+            let src = src.to_string();
+            let dest = dest.to_string();
+            return fs_offload(
+                move || {
+                    std::fs::copy(&src, &dest)
+                        .map(|_| ())
+                        .map_err(|e| fs_io_msg(format!("file/copy {src} -> {dest}: {e}")))
+                },
+                |()| Value::nil(),
+            );
+        }
         std::fs::copy(src, dest)
             .map_err(|e| SemaError::Io(format!("file/copy {src} -> {dest}: {e}")))?;
         Ok(Value::nil())

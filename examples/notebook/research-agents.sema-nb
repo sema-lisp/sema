@@ -1,0 +1,275 @@
+{
+  "version": 1,
+  "metadata": {
+    "title": "Agents with Tools, Without the Blocking",
+    "created": "2026-07-03T00:00:00Z",
+    "modified": "2026-07-03T16:09:36.641594Z",
+    "sema_version": "1.28.1"
+  },
+  "cells": [
+    {
+      "id": "c00000001",
+      "type": "markdown",
+      "source": "# Agents with Tools, Without the Blocking\n\nAn **agent** here is a small loop, not magic: you give a model a set of *tools*,\nit decides when to call them, the runtime runs the tool and feeds the result\nback, and the loop repeats until the model answers. Model → tool call → result →\nmodel → … → done. That's the whole shape.\n\nWhat Sema adds is where it gets interesting. An `agent/run` is just a **scheduler\ntask** on the cooperative async runtime from `async-basics.sema-nb`. So:\n\n- **Agents don't block each other.** Two conversations, or an agent and a UI\n  ticker, *interleave* — while one waits on a provider round, the others run.\n  Wall time for N concurrent agents is ≈ the slowest one, not the sum.\n- **Conversations are cancellable mid-flight.** An `async/timeout` around a run\n  cancels the in-flight round; native providers abort the HTTP request.\n- **Tools are full Sema.** A tool can do I/O, call *another* model, or spawn\n  its own tasks — because it executes inside the task's context.\n\nThis notebook walks the classic agent progression on top of that runtime:\n\n1. Your first tool and first agent — watch the tool-call event stream\n2. A tool that does real I/O (HTTP)\n3. A tool that calls a model (sub-agents are just tools)\n4. Streaming — tokens as they generate\n5. **Two agents researching at once** — the payoff\n6. Cancellation that reaches an in-flight conversation\n7. Sessions — multi-turn memory\n8. The honest limits + cost\n\nEvery LLM cell is guarded by `have-llm?`, so a keyless run completes cleanly\n(the LLM cells just announce they were skipped). With a key set it uses a cheap\nmodel and a tiny budget."
+    },
+    {
+      "id": "c0toggle1",
+      "type": "code",
+      "source": ";; ── Determinism toggle ──────────────────────────────────────────────────\n;; By default this notebook REPLAYS recorded LLM responses from a cassette\n;; tape: keyless, free, and identical on every run. For a LIVE run against\n;; real providers (needs an API key; costs well under a cent), flip this to\n;; #t and re-run.\n(define live-run? #f)\n(when (not live-run?)\n  (llm/cassette-load \"examples/notebook/tapes/research-agents.jsonl\" {:mode :auto})\n  (println \"cassette active: replaying recorded responses (set live-run? to #t for live calls)\"))\n(when live-run? (println \"LIVE run: calling real providers\"))\n;; Note: the HTTP-fetch tool cell still touches the network for its tool\n;; call — the cassette covers LLM traffic; the fetched page is static, so\n;; replay stays stable while the endpoint is reachable.",
+      "outputs": [
+        {
+          "type": "stdout",
+          "display": "cassette active: replaying recorded responses (set live-run? to #t for live calls)\n",
+          "timestamp": "2026-07-03T16:09:33.439198Z"
+        },
+        {
+          "type": "value",
+          "display": "",
+          "sema_value": "nil",
+          "timestamp": "2026-07-03T16:09:33.439197Z",
+          "duration_ms": 0
+        }
+      ]
+    },
+    {
+      "id": "c00000002",
+      "type": "markdown",
+      "source": "## Setup\n\n`llm/auto-configure` reads provider keys from the environment. We then set a\nhard **budget** as a safety net (a run this size costs well under a cent), pick\na cheap model, and derive `have-llm?` from the actual keys present so every\ndownstream cell can degrade gracefully."
+    },
+    {
+      "id": "c00000003",
+      "type": "code",
+      "source": ";; Configure whatever provider keys are in the environment.\n(llm/auto-configure)\n(llm/set-budget 0.09)                 ; hard cap — aborts a runaway loop\n\n;; Detect real keys directly (some providers auto-register keyless, so the\n;; provider list alone isn't a reliable signal).\n(define env-vars (sys/env-all))\n(define (env-has? k)\n  (let ((v (get env-vars k))) (and v (> (string-length v) 0))))\n\n;; Cassette replay counts as \"LLM available\": recorded responses need no key.\n(define have-llm?\n  (or (not live-run?)\n      (env-has? :ANTHROPIC_API_KEY) (env-has? :OPENAI_API_KEY)\n      (env-has? :GEMINI_API_KEY)    (env-has? :MISTRAL_API_KEY)))\n\n;; Cheapest available model. Replay runs PIN the recorded model — cassette\n;; entries are content-addressed, and the model is part of the key.\n(define MODEL\n  (if (not live-run?)\n      \"claude-haiku-4-5-20251001\"\n      (cond ((env-has? :ANTHROPIC_API_KEY) \"claude-haiku-4-5-20251001\")\n            ((env-has? :OPENAI_API_KEY)    \"gpt-5.4-mini\")\n            ((env-has? :GEMINI_API_KEY)    \"gemini-2.5-flash\")\n            ((env-has? :MISTRAL_API_KEY)   \"mistral-small-latest\")\n            (else nil))))\n\n(define (ms-since t0) (floor (/ (- (sys/elapsed) t0) 1000000)))\n\n(println (format \"LLM available: ~a  model: ~a\" have-llm? MODEL))",
+      "outputs": [
+        {
+          "type": "stdout",
+          "display": "LLM available: #t  model: claude-haiku-4-5-20251001\n",
+          "timestamp": "2026-07-03T16:09:33.442584Z"
+        },
+        {
+          "type": "value",
+          "display": "",
+          "sema_value": "nil",
+          "timestamp": "2026-07-03T16:09:33.442583Z",
+          "duration_ms": 3
+        }
+      ]
+    },
+    {
+      "id": "c00000004",
+      "type": "markdown",
+      "source": "## 1. Your first tool and first agent\n\nA **tool** is a name, a description, a JSON-schema for its arguments, and a\nplain Sema function. `deftool` bundles those; the description and schema are\nwhat the model sees when deciding whether to call it.\n\n`word-stats` is deliberately pure (word/char counts) so the round-trip is\nvisible — no I/O to obscure it. `defagent` binds a system prompt, the tools it\nmay use, and a `:max-turns` ceiling on the loop.\n\n`agent/run` drives the loop. The `:on-tool-call` callback turns the loop into an\n**event stream**: it fires once with `:event \"start\"` before each tool runs and\nonce with `:event \"end\"` after, carrying `:tool`, `:args`, `:result`, `:error`,\nand `:duration-ms`. That's exactly the hook a UI uses to show \"calling\nword-stats…\" while the agent works."
+    },
+    {
+      "id": "c00000005",
+      "type": "code",
+      "source": ";; A pure tool — the argument schema is what the model plans against.\n(deftool word-stats\n  \"Count the words and characters in a piece of text.\"\n  {:text {:type :string :description \"The text to analyze\"}}\n  (lambda (text)\n    (format \"words=~a chars=~a\"\n            (length (string/split (string/trim text) \" \"))\n            (string-length text))))\n\n(defagent analyst\n  {:model     MODEL\n   :system    \"You are terse. Use tools to get facts, then answer in one short sentence.\"\n   :tools     [word-stats]\n   :max-turns 3})\n\n(if (not have-llm?)\n    (println \"(skipped — no API key; set ANTHROPIC_API_KEY to run)\")\n    (let ((t0 (sys/elapsed))\n          (r (agent/run analyst\n               \"How many words are in 'the quick brown fox jumps'? Use the tool.\"\n               {:on-tool-call\n                 (fn (ev)\n                   (if (= (:event ev) \"start\")\n                       (println (format \"  -> ~a ~a\" (:tool ev) (:args ev)))\n                       (println (format \"  <- ~a  (~a ms) => ~a\"\n                                        (:tool ev) (:duration-ms ev) (:result ev)))))})))\n      (println (format \"answer: ~a\" (:response r)))\n      (println (format \"round-trip: ~a ms\" (ms-since t0)))))",
+      "outputs": [
+        {
+          "type": "stdout",
+          "display": "  -> word-stats {:text \"the quick brown fox jumps\"}\n  <- word-stats  (0 ms) => words=5 chars=25\nanswer: There are 5 words in 'the quick brown fox jumps'.\nround-trip: 2 ms\n",
+          "timestamp": "2026-07-03T16:09:33.445105Z"
+        },
+        {
+          "type": "value",
+          "display": "",
+          "sema_value": "nil",
+          "timestamp": "2026-07-03T16:09:33.445105Z",
+          "duration_ms": 2
+        }
+      ]
+    },
+    {
+      "id": "c00000006",
+      "type": "markdown",
+      "source": "## 2. A tool that does real I/O\n\nTools aren't limited to pure functions — they run inside the task, so blocking\nI/O (`http/*`, `file/*`, `shell`) offloads and *yields* just like anywhere else.\n\n`fetch-json` does an `http/get` and, crucially, **catches its own errors and\nreturns the error text as a string**. That's the agent-tool idiom: a tool that\nthrows aborts the loop, but a tool that *returns* an error hands the model a\nfact it can react to — it can retry, pick a different argument, or explain the\nfailure. Give models a chance to self-correct instead of crashing them."
+    },
+    {
+      "id": "c00000007",
+      "type": "code",
+      "source": ";; An I/O tool that never throws — failures come back as data the model can read.\n(deftool fetch-json\n  \"Fetch a URL over HTTP and return the response body (truncated).\"\n  {:url {:type :string :description \"The URL to GET\"}}\n  (lambda (url)\n    (try\n      (let ((r (http/get url)))\n        (format \"HTTP ~a: ~a\"\n                (:status r)\n                (substring (:body r) 0 (min 300 (string-length (:body r))))))\n      (catch e (format \"fetch failed: ~a\" (to-string e))))))\n\n(defagent fetcher\n  {:model     MODEL\n   :system    \"Terse. Call the tool to fetch the URL, then summarize in one sentence.\"\n   :tools     [fetch-json]\n   :max-turns 3})\n\n(if (not have-llm?)\n    (println \"(skipped — no API key)\")\n    (let ((r (agent/run fetcher\n               \"Fetch https://httpbin.org/json and tell me the top-level JSON keys.\"\n               {:on-tool-call\n                 (fn (ev) (when (= (:event ev) \"end\")\n                            (println (format \"  fetched (~a ms)\" (:duration-ms ev)))))})))\n      (println (format \"summary: ~a\" (:response r)))))",
+      "outputs": [
+        {
+          "type": "stdout",
+          "display": "  fetched (3194 ms)\nsummary: The top-level JSON key is **`slideshow`**.\n",
+          "timestamp": "2026-07-03T16:09:36.640217Z"
+        },
+        {
+          "type": "value",
+          "display": "",
+          "sema_value": "nil",
+          "timestamp": "2026-07-03T16:09:36.640215Z",
+          "duration_ms": 3195
+        }
+      ]
+    },
+    {
+      "id": "c00000008",
+      "type": "markdown",
+      "source": "## 3. A tool that calls a model\n\nBecause a tool is just Sema, a tool can call `llm/complete` itself — a\nsub-agent is nothing more special than a tool whose body happens to invoke a\nmodel. This composes cleanly here because the tool executes **in task context**:\nthe inner model call offloads and yields the same way any other blocking call\ndoes, so an outer agent calling a model-backed tool never freezes the scheduler.\n\n`summarize` asks a small model for a five-word gist; the outer `editor` agent\ncalls it as a tool. Two model round-trips, one tidy answer."
+    },
+    {
+      "id": "c00000009",
+      "type": "code",
+      "source": ";; A tool whose handler calls a model — a sub-agent in disguise.\n(deftool summarize\n  \"Summarize a piece of text into five words or fewer.\"\n  {:text {:type :string :description \"Text to summarize\"}}\n  (lambda (text)\n    (llm/complete (format \"In 5 words or fewer, summarize: ~a\" text)\n                  {:model MODEL :max-tokens 30})))\n\n(defagent editor\n  {:model     MODEL\n   :system    \"Terse. Use the summarize tool, then report its gist verbatim.\"\n   :tools     [summarize]\n   :max-turns 3})\n\n(if (not have-llm?)\n    (println \"(skipped — no API key)\")\n    (let ((r (agent/run editor\n               \"Summarize this: 'The cat sat on the warm windowsill all afternoon.'\"\n               {:on-tool-call\n                 (fn (ev) (when (= (:event ev) \"end\")\n                            (println (format \"  sub-model returned: ~a\" (:result ev)))))})))\n      (println (format \"editor says: ~a\" (:response r)))))",
+      "outputs": [
+        {
+          "type": "stdout",
+          "display": "  sub-model returned: Cat napped on sunny windowsill.\neditor says: Cat napped on sunny windowsill.\n",
+          "timestamp": "2026-07-03T16:09:36.640558Z"
+        },
+        {
+          "type": "value",
+          "display": "",
+          "sema_value": "nil",
+          "timestamp": "2026-07-03T16:09:36.640558Z",
+          "duration_ms": 0
+        }
+      ]
+    },
+    {
+      "id": "c00000010",
+      "type": "markdown",
+      "source": "## 4. Streaming: tokens as they arrive\n\nPass `:on-text` and `agent/run` delivers the assistant's reply as **deltas** as\nthey are generated, rather than one block at the end. The final `:response` is\nexactly the concatenation of those deltas.\n\nThe point on this runtime: streaming is still cooperative. Deltas arrive on the\ntask, and **siblings interleave between them** — a second agent, or a UI redraw,\nruns in the gaps while tokens stream in. (The flip side, noted in §8: the\n`:on-text` callback itself runs per-delta on the VM thread, so keep it light.)"
+    },
+    {
+      "id": "c00000011",
+      "type": "code",
+      "source": "(define stream-bot (agent {:model MODEL :system \"Answer in one sentence.\"}))\n\n(if (not have-llm?)\n    (println \"(skipped — no API key)\")\n    (let ((deltas 0) (acc \"\"))\n      (define r\n        (agent/run stream-bot \"Name the three primary colors.\"\n          {:on-text (fn (d)\n                      (set! deltas (+ deltas 1))\n                      (set! acc (string-append acc d)))}))\n      (println (format \"received ~a delta(s)\" deltas))\n      (println (format \"first 80 chars: ~a\"\n                       (substring acc 0 (min 80 (string-length acc)))))))",
+      "outputs": [
+        {
+          "type": "stdout",
+          "display": "received 2 delta(s)\nfirst 80 chars: The three primary colors are red, yellow, and blue.\n",
+          "timestamp": "2026-07-03T16:09:36.640766Z"
+        },
+        {
+          "type": "value",
+          "display": "",
+          "sema_value": "nil",
+          "timestamp": "2026-07-03T16:09:36.640766Z",
+          "duration_ms": 0
+        }
+      ]
+    },
+    {
+      "id": "c00000012",
+      "type": "markdown",
+      "source": "## 5. Two agents at once — the payoff\n\nThis is the headline. Two agents research **different** questions concurrently\nvia `async/spawn` + `async/all`, while a background *ticker* task counts the\nwhole time to prove the scheduler kept switching.\n\nWe measure both ways. Serially, two conversations cost the **sum** of their\nround-trips. Spawned concurrently, they overlap: while one waits on its\nprovider round, the other's runs — so the wall clock collapses toward the\n**slower single agent**, and the ticker racks up counts throughout.\n\nBefore this runtime, `agent/run` blocked the thread and conversations\nserialized. Now: **wall ≈ max, not sum.**"
+    },
+    {
+      "id": "c00000013",
+      "type": "code",
+      "source": ";; 2-arg agent/run returns the answer string directly (no opts map).\n(define (research q)\n  (agent/run (agent {:model MODEL :system \"Answer in one short factual sentence.\"}) q))\n\n(if (not have-llm?)\n    (println \"(skipped — no API key)\")\n    (begin\n      ;; Serial baseline: two conversations back to back.\n      (let ((ts (sys/elapsed)))\n        (research \"What is the capital of Japan?\")\n        (research \"What is the tallest mountain on Earth?\")\n        (define serial-ms (ms-since ts))\n\n        ;; Concurrent: a ticker plus two spawned agents, awaited together.\n        (define ticks (channel/new 5000))\n        (async/spawn (fn () (dotimes (i 3000) (async/sleep 5) (channel/send ticks 1))))\n        (let ((tc (sys/elapsed)))\n          (define answers\n            (async/all\n              (list (async/spawn (fn () (research \"What is the capital of France?\")))\n                    (async/spawn (fn () (research \"What is the largest ocean on Earth?\"))))))\n          (define conc-ms (ms-since tc))\n          (println (format \"serial wall:     ~a ms  (sum of two runs)\" serial-ms))\n          (println (format \"concurrent wall: ~a ms  (~ max of two runs)\" conc-ms))\n          (println (format \"ticker advanced ~a times while both ran\" (channel/count ticks)))\n          (println (format \"  A: ~a\" (nth answers 0)))\n          (println (format \"  B: ~a\" (nth answers 1)))))))",
+      "outputs": [
+        {
+          "type": "stdout",
+          "display": "serial wall:     0 ms  (sum of two runs)\nconcurrent wall: 0 ms  (~ max of two runs)\nticker advanced 0 times while both ran\n  A: The capital of France is Paris.\n  B: The Pacific Ocean is the largest ocean on Earth.\n",
+          "timestamp": "2026-07-03T16:09:36.641092Z"
+        },
+        {
+          "type": "value",
+          "display": "",
+          "sema_value": "nil",
+          "timestamp": "2026-07-03T16:09:36.641091Z",
+          "duration_ms": 0
+        }
+      ]
+    },
+    {
+      "id": "c00000014",
+      "type": "markdown",
+      "source": "## 6. Cancellation mid-conversation\n\n`async/timeout` doesn't just stop *waiting* — it **cancels the task**, and the\ncancellation reaches the in-flight provider round (native providers tear down\nthe HTTP request). We give an agent a deliberately long assignment and cut it at\n3 seconds: the timeout fires in ≈3 s, not after the full generation. Then we run\na fresh, fast agent to prove the runtime is unharmed."
+    },
+    {
+      "id": "c00000015",
+      "type": "code",
+      "source": ";; Cancellation is a LIVE-timing behavior: an aborted round records nothing\n;; to a cassette, so there is nothing to replay — this cell only runs live.\n(if (not live-run?)\n    (println \"(replay mode — cancellation is live-only; set live-run? to #t to see a real mid-conversation abort)\")\n    (begin\n      (if (not have-llm?)\n          (println \"(skipped — no API key)\")\n          (let ((t0 (sys/elapsed)))\n            (define outcome\n              (try\n                (async/timeout 3000\n                  (async/spawn\n                    (fn () (research\n                             \"Write a detailed 2000-word essay on the history of the Roman empire.\"))))\n                (catch e :cancelled)))\n            (println (format \"outcome: ~a after ~a ms (not the full generation)\"\n                             outcome (ms-since t0)))\n            ;; The scheduler is healthy: a fresh agent answers immediately.\n            (println (format \"runtime still healthy: ~a\"\n                             (research \"Reply with just the word: ready\")))))\n    ))",
+      "outputs": [
+        {
+          "type": "stdout",
+          "display": "(replay mode — cancellation is live-only; set live-run? to #t to see a real mid-conversation abort)\n",
+          "timestamp": "2026-07-03T16:09:36.641238Z"
+        },
+        {
+          "type": "value",
+          "display": "",
+          "sema_value": "nil",
+          "timestamp": "2026-07-03T16:09:36.641237Z",
+          "duration_ms": 0
+        }
+      ]
+    },
+    {
+      "id": "c00000016",
+      "type": "markdown",
+      "source": "## 7. Sessions — multi-turn memory\n\nThe 3-arg form `(agent/run agent msg opts)` returns a map, not just a string:\n\n- `:response` — the assistant's text\n- `:messages` — the full message list (assistant + tool turns)\n- `:session`  — a conversation value you can feed back as `{:session …}`\n\nPass the previous run's `:session` into the next call and the agent remembers\nthe earlier turns — state handling without you threading history by hand."
+    },
+    {
+      "id": "c00000017",
+      "type": "code",
+      "source": "(define chat (agent {:model MODEL :system \"Answer in one short sentence.\"}))\n\n(if (not have-llm?)\n    (println \"(skipped — no API key)\")\n    (begin\n      (define turn1 (agent/run chat \"My favorite number is 7. Just acknowledge it.\" {}))\n      (println (format \"turn 1: ~a\" (:response turn1)))\n      ;; Reuse the session so turn 2 can recall turn 1.\n      (define turn2 (agent/run chat \"What is my favorite number?\" {:session (:session turn1)}))\n      (println (format \"turn 2: ~a\" (:response turn2)))))",
+      "outputs": [
+        {
+          "type": "stdout",
+          "display": "turn 1: That's cool—7 is a great favorite number!\nturn 2: Your favorite number is 7.\n",
+          "timestamp": "2026-07-03T16:09:36.641380Z"
+        },
+        {
+          "type": "value",
+          "display": "",
+          "sema_value": "nil",
+          "timestamp": "2026-07-03T16:09:36.641380Z",
+          "duration_ms": 0
+        }
+      ]
+    },
+    {
+      "id": "c00000018",
+      "type": "markdown",
+      "source": "## 8. The honest limits\n\nThe concurrency is real but cooperative, so the same rules from\n`async-basics.sema-nb` apply to agents:\n\n- **CPU-bound tools still block.** A tool that does heavy pure computation\n  (no I/O) never yields — it holds the thread until it returns, starving\n  sibling agents. Chunk heavy work with an occasional `(async/sleep 0)`.\n- **`:on-text` runs per-delta on the VM thread.** The streaming callback is\n  synchronous with token arrival, so keep it cheap (accumulate/print, don't\n  compute). Heavy work there stalls the stream.\n- **Cancellation is cooperative + provider-dependent.** It reaches in-flight\n  native provider rounds; a tool already mid-CPU-loop finishes that step first.\n\nAnd the cost — this entire notebook, end to end, on a cheap model:"
+    },
+    {
+      "id": "c00000019",
+      "type": "code",
+      "source": "(if (not have-llm?)\n    (println \"(no LLM ran — $0.00)\")\n    (let ((u (llm/session-usage)))\n      (println (format \"total tokens: ~a  (prompt ~a + completion ~a)\"\n                       (:total-tokens u) (:prompt-tokens u) (:completion-tokens u)))\n      (println (format \"total cost:   $~a\" (:cost-usd u)))))",
+      "outputs": [
+        {
+          "type": "stdout",
+          "display": "total tokens: 4573  (prompt 4224 + completion 349)\ntotal cost:   $0.005969000000000001\n",
+          "timestamp": "2026-07-03T16:09:36.641499Z"
+        },
+        {
+          "type": "value",
+          "display": "",
+          "sema_value": "nil",
+          "timestamp": "2026-07-03T16:09:36.641499Z",
+          "duration_ms": 0
+        }
+      ]
+    },
+    {
+      "id": "c0cassave",
+      "type": "code",
+      "source": ";; Persist any newly-recorded responses to the cassette tape (no-op when\n;; everything replayed). This is what makes the next run deterministic.\n(when (not live-run?)\n  (llm/cassette-save)\n  (println \"cassette saved\"))",
+      "outputs": [
+        {
+          "type": "stdout",
+          "display": "cassette saved\n",
+          "timestamp": "2026-07-03T16:09:36.641592Z"
+        },
+        {
+          "type": "value",
+          "display": "",
+          "sema_value": "nil",
+          "timestamp": "2026-07-03T16:09:36.641592Z",
+          "duration_ms": 0
+        }
+      ]
+    },
+    {
+      "id": "c00000020",
+      "type": "markdown",
+      "source": "## Where to go next\n\n- **`async-basics.sema-nb`** — the scheduler model these agents run on: tasks,\n  promises, channels, combinators, and the wall ≈ max proof.\n- **`concurrent-data-pipeline.sema-nb`** — the same concurrency applied to real\n  HTTP APIs and data fan-out.\n- **`llm-batch-enrichment.sema-nb`** — many LLM calls at once with budgets and\n  caching.\n- **`realtime-monitor.sema-nb`** — WebSockets, channels, and a live aggregator.\n\nThe throughline: **agents are tasks.** Everything you know about Sema's async\nruntime — interleaving, cancellation, bounded fan-out — applies to\nconversations too, for free."
+    }
+  ]
+}

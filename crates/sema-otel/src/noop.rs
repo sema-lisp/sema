@@ -62,6 +62,11 @@ pub fn activate(_mode: TelemetryMode) -> Option<OtelGuard> {
 
 pub struct ConversationGuard;
 
+impl ConversationGuard {
+    /// Noop mirror of the real guard's non-restoring consume (cancelled-run reap).
+    pub fn defuse(self) {}
+}
+
 pub fn set_conversation_scope(
     _conversation_id: &str,
     _session_id: Option<&str>,
@@ -72,6 +77,12 @@ pub fn set_conversation_scope(
 
 pub fn current_conversation_id() -> Option<String> {
     None
+}
+
+/// wasm/noop: the guards are zero-sized and their `Drop` touches no thread-local, so
+/// dropping them is always safe.
+pub fn tls_alive() -> bool {
+    true
 }
 
 pub fn new_conversation_id() -> String {
@@ -157,6 +168,8 @@ impl AgentSpan {
     pub fn set_tags(&self, _tags: &[String]) {}
     pub fn set_metadata(&self, _meta: &[(String, String)]) {}
     pub fn record_error(&self, _kind: &str, _msg: &str) {}
+    /// Noop mirror of the real span's stack-free end (cancelled-run reap).
+    pub fn end_unstacked(self) {}
 }
 
 pub struct RetrieverSpan;

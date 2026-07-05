@@ -1,5 +1,5 @@
 import { defineConfig } from 'vitepress'
-// Canonical source: editors/vscode/sema/syntaxes/sema.tmLanguage.json
+// Vendored copy of the canonical grammar in sema-lisp/vscode-sema (syntaxes/sema.tmLanguage.json)
 import semaLang from './sema.tmLanguage.json'
 // Brand syntax theme — matches the hand-coded snippets + playground palette
 // (gold keywords, green strings, orange numbers, cyan :keywords, dim parens).
@@ -55,7 +55,9 @@ export default defineConfig({
   },
 
   sitemap: {
-    hostname: 'https://sema-lang.com'
+    hostname: 'https://sema-lang.com',
+    // /icons is an internal, unlinked manifest — keep it out of the sitemap.
+    transformItems: (items) => items.filter((i) => !/(^|\/)icons(\.html)?$/.test(i.url))
   },
 
   head: [
@@ -291,6 +293,7 @@ export default defineConfig({
             { text: 'Code Formatter', link: '/docs/formatter' },
             { text: 'Shell Completions', link: '/docs/shell-completions' },
             { text: 'Editor Integration', link: '/docs/editors' },
+            { text: 'Structural Search (ast-grep)', link: '/docs/ast-grep' },
             { text: 'Language Server (LSP)', link: '/docs/lsp' },
             { text: 'Debugger (DAP)', link: '/docs/dap' },
             { text: 'MCP Server', link: '/docs/mcp' },

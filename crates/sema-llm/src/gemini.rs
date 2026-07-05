@@ -34,18 +34,15 @@ pub struct GeminiProvider {
     base_url: String,
     default_model: String,
     client: reqwest::Client,
-    runtime: crate::http::BlockingRuntime,
 }
 
 impl GeminiProvider {
     pub fn new(api_key: String, default_model: Option<String>) -> Result<Self, LlmError> {
-        let runtime = crate::http::create_runtime()?;
         Ok(GeminiProvider {
             api_key,
             base_url: "https://generativelanguage.googleapis.com/v1beta".to_string(),
             default_model: default_model.unwrap_or_else(|| "gemini-3.5-flash".to_string()),
             client: crate::http::create_client(None)?,
-            runtime,
         })
     }
 
@@ -164,6 +161,13 @@ impl GeminiProvider {
                                         id: format!("gemini-call-{}", tool_call_idx),
                                         name,
                                         arguments,
+                                        // Sibling of functionCall in the part; must be
+                                        // echoed back on the next round or Gemini 2.5+
+                                        // rejects the resent turn with a 400.
+                                        thought_signature: part
+                                            .get("thoughtSignature")
+                                            .and_then(|s| s.as_str())
+                                            .map(|s| s.to_string()),
                                     });
                                     tool_call_idx += 1;
                                 }
@@ -229,9 +233,16 @@ impl GeminiProvider {
                     parts.push(serde_json::json!({ "text": text }));
                 }
                 for tc in &msg.tool_calls {
-                    parts.push(serde_json::json!({
+                    let mut part = serde_json::json!({
                         "functionCall": { "name": tc.name, "args": tc.arguments }
-                    }));
+                    });
+                    // Echo the opaque thoughtSignature captured from the model's
+                    // original functionCall part — Gemini 2.5+ rejects a resent
+                    // tool-call turn without it (400 INVALID_ARGUMENT).
+                    if let Some(sig) = &tc.thought_signature {
+                        part["thoughtSignature"] = serde_json::Value::String(sig.clone());
+                    }
+                    parts.push(part);
                 }
                 contents.push(serde_json::json!({ "role": "model", "parts": parts }));
                 continue;
@@ -369,6 +380,12 @@ impl GeminiProvider {
                                 id: format!("gemini-call-{}", tool_call_idx),
                                 name,
                                 arguments,
+                                // Sibling of functionCall in the part; echoed back on
+                                // the next round (Gemini 2.5+ 400s without it).
+                                thought_signature: part
+                                    .get("thoughtSignature")
+                                    .and_then(|s| s.as_str())
+                                    .map(|s| s.to_string()),
                             });
                             tool_call_idx += 1;
                         }
@@ -455,7 +472,15 @@ impl LlmProvider for GeminiProvider {
     }
 
     fn complete(&self, request: ChatRequest) -> Result<ChatResponse, LlmError> {
-        self.runtime.block_on(self.complete_async(request))
+        sema_io::io_block_on(self.complete_async(request))
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn complete_future(
+        &self,
+        request: ChatRequest,
+    ) -> Option<crate::provider::BoxCompletionFuture<'_>> {
+        Some(Box::pin(self.complete_async(request)))
     }
 
     fn stream_complete(
@@ -463,12 +488,13 @@ impl LlmProvider for GeminiProvider {
         request: ChatRequest,
         on_chunk: &mut dyn FnMut(&str) -> Result<(), LlmError>,
     ) -> Result<ChatResponse, LlmError> {
-        self.runtime
-            .block_on(self.stream_complete_async(request, on_chunk))
+        // io_block_on drives ON THIS thread: `on_chunk` may touch non-Send Sema
+        // values and must never migrate to a pool worker.
+        sema_io::io_block_on(self.stream_complete_async(request, on_chunk))
     }
 
     fn batch_complete(&self, requests: Vec<ChatRequest>) -> Vec<Result<ChatResponse, LlmError>> {
-        self.runtime.block_on(async {
+        sema_io::io_block_on(async {
             let futures: Vec<_> = requests
                 .into_iter()
                 .map(|req| self.complete_async(req))
@@ -540,5 +566,50 @@ mod tests {
         .is_err());
         assert!(build_url("https://x/v1beta", "a/b", "generateContent").is_err());
         assert!(build_url("https://x/v1beta", "bad\nmodel", "generateContent").is_err());
+    }
+
+    /// A resent assistant tool-call turn must echo the model's opaque
+    /// `thoughtSignature` in its functionCall part — Gemini 2.5+ rejects the
+    /// request with 400 INVALID_ARGUMENT otherwise (found live by the
+    /// `make llm-stress` provider matrix; FakeProvider cannot see wire drift).
+    #[test]
+    fn resent_tool_call_turn_echoes_thought_signature() {
+        use crate::types::{ChatMessage, ChatRequest, ToolCall};
+        let provider =
+            GeminiProvider::new("test-key".to_string(), Some("gemini-2.5-flash".into())).unwrap();
+        let mut messages = vec![ChatMessage::new("user", "go")];
+        messages.push(ChatMessage::assistant_with_tool_calls(
+            String::new(),
+            vec![
+                ToolCall {
+                    id: "gemini-call-0".into(),
+                    name: "note".into(),
+                    arguments: serde_json::json!({"text": "alpha"}),
+                    thought_signature: Some("sig-abc".into()),
+                },
+                // A call without a signature (e.g. from an older cassette) must
+                // serialize WITHOUT the key, not with null.
+                ToolCall {
+                    id: "gemini-call-1".into(),
+                    name: "note".into(),
+                    arguments: serde_json::json!({"text": "beta"}),
+                    thought_signature: None,
+                },
+            ],
+        ));
+        let body = provider
+            .build_request_body(&ChatRequest::new("gemini-2.5-flash".to_string(), messages));
+        let parts = body["contents"][1]["parts"]
+            .as_array()
+            .expect("model parts");
+        assert_eq!(
+            parts[0]["thoughtSignature"], "sig-abc",
+            "signature must be echoed as a sibling of functionCall"
+        );
+        assert!(
+            parts[1].get("thoughtSignature").is_none(),
+            "absent signature must serialize without the key"
+        );
+        assert_eq!(parts[0]["functionCall"]["name"], "note");
     }
 }

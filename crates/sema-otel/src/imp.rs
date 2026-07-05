@@ -251,6 +251,21 @@ impl Drop for ConversationGuard {
     }
 }
 
+impl ConversationGuard {
+    /// Consume the guard WITHOUT restoring the previous ids. For reaping a
+    /// CANCELLED agent run: the saved prev ids belong to the cancelled task's
+    /// per-task context (destroyed with the task), while the ids currently
+    /// installed belong to whoever drove the cancellation — a normal drop would
+    /// overwrite the driver's ids with the dead task's. Leak-free: the saved
+    /// strings are released here; only the restoring `Drop` is skipped.
+    pub fn defuse(mut self) {
+        self.prev_conv = None;
+        self.prev_session = None;
+        self.prev_user = None;
+        std::mem::forget(self);
+    }
+}
+
 /// Open a conversation scope. `session_id` defaults to the conversation id (so a single
 /// run groups in session-aware backends like Langfuse); `user_id` is inherited when
 /// `None`. Every span started while the returned guard is alive carries
@@ -283,6 +298,24 @@ pub fn set_conversation_scope(
 /// The conversation id of the active scope, if any.
 pub fn current_conversation_id() -> Option<String> {
     CONVERSATION_ID.with(|c| c.borrow().clone())
+}
+
+/// Whether this crate's thread-local span/scope storage is still accessible on the
+/// current thread. Returns `false` once the thread-locals have been destroyed (during
+/// thread teardown). A holder of a still-live [`ConversationGuard`] / span whose `Drop`
+/// touches these thread-locals can consult this to avoid a `panic`-on-drop abort when a
+/// leaked handle (e.g. a cancelled agent run) is finally dropped at thread exit.
+pub fn tls_alive() -> bool {
+    // Must probe EVERY thread-local a held guard's `Drop` touches, or a leaked handle
+    // dropped mid-teardown still aborts. `SpanCore::drop` touches `STACK`;
+    // `ConversationGuard::drop` unconditionally touches `CONVERSATION_ID`, `SESSION_ID`,
+    // and `USER_ID` (all via `.with`, which aborts on a destroyed TLS). These share one
+    // `thread_local!` block, but std destroys them in an unspecified order, so a window
+    // exists where one is alive and another is already gone — probe all four.
+    STACK.try_with(|_| ()).is_ok()
+        && CONVERSATION_ID.try_with(|_| ()).is_ok()
+        && SESSION_ID.try_with(|_| ()).is_ok()
+        && USER_ID.try_with(|_| ()).is_ok()
 }
 
 /// Generate a fresh, cheap conversation id (monotonic counter mixed with wall-clock).
@@ -1402,6 +1435,16 @@ impl AgentSpan {
     pub fn record_error(&self, kind: &str, msg: &str) {
         if let Some(c) = &self.inner {
             c.record_error(kind, msg);
+        }
+    }
+    /// End this span WITHOUT popping the thread-local span stack. For reaping a
+    /// CANCELLED agent run: the span's pushed context lives on the cancelled
+    /// task's saved span stack (destroyed with the task), while the stack
+    /// currently installed belongs to whoever drove the cancellation — a normal
+    /// (popping) end would mis-pop an unrelated span and corrupt that trace.
+    pub fn end_unstacked(mut self) {
+        if let Some(mut core) = self.inner.take() {
+            core.detached = true;
         }
     }
 }

@@ -1,0 +1,170 @@
+{
+  "version": 1,
+  "metadata": {
+    "title": "The Concurrent Data Pipeline",
+    "created": "2026-07-03T00:00:00Z",
+    "modified": "2026-07-03T15:43:22.375173Z",
+    "sema_version": "1.28.1"
+  },
+  "cells": [
+    {
+      "id": "c00000001",
+      "type": "markdown",
+      "source": "# The Concurrent Data Pipeline\n\nThe most common real-world async job has one shape:\n\n```\nfetch many things  →  parse each  →  aggregate  →  persist\n```\n\nPull N records from some API, decode them, roll them up, write a report. This\nnotebook builds that pipeline against a **real, keyless API**\n([Open-Meteo](https://open-meteo.com/) weather) and turns it into a template you\ncan adapt for actual work.\n\nWhy concurrency matters *here* specifically: the fetch stage is N independent\nnetwork round-trips. Done one at a time, wall-clock is the **sum** of the\nlatencies. Done concurrently, it collapses to roughly the **slowest single\nrequest** — `max`, not `sum`. Ten 200 ms fetches: 2 s sequential vs ~0.2 s\nconcurrent.\n\nWhat you take home:\n\n1. A resilient per-item fetch that survives a flaky API instead of dying on the\n   first 500.\n2. The one async gotcha that trips up everyone: **where** you must put `try`.\n3. Bounded fan-out (`async/pool-map`) so you stay a good API citizen.\n4. Aggregate + persist + read-back verification.\n\nEvery claim below is proven by a printed number. Timings use `sys/elapsed`\n(nanoseconds), the right benchmarking clock in Sema."
+    },
+    {
+      "id": "c00000002",
+      "type": "markdown",
+      "source": "## 1. The data source and a single fetch\n\nTen cities with coordinates. Open-Meteo needs no key and no auth — just\nlatitude/longitude query params. `http/get` returns `{:status ... :body ...}`,\nand `json/decode` turns the JSON body into a Sema map with **keyword keys**\n(so `(:current_weather data)` just works)."
+    },
+    {
+      "id": "c00000003",
+      "type": "code",
+      "source": ";; (lat . lon) for ten cities around the globe.\n(define cities\n  (list {:name \"Oslo\"       :lat 59.91 :lon 10.75}\n        {:name \"London\"     :lat 51.51 :lon -0.13}\n        {:name \"New York\"   :lat 40.71 :lon -74.01}\n        {:name \"Tokyo\"      :lat 35.68 :lon 139.69}\n        {:name \"Sydney\"     :lat -33.87 :lon 151.21}\n        {:name \"Cairo\"      :lat 30.04 :lon 31.24}\n        {:name \"Rio\"        :lat -22.91 :lon -43.17}\n        {:name \"Moscow\"     :lat 55.75 :lon 37.62}\n        {:name \"Cape Town\"  :lat -33.92 :lon 18.42}\n        {:name \"Reykjavik\"  :lat 64.15 :lon -21.94}))\n\n(define (build-url c)\n  (format \"https://api.open-meteo.com/v1/forecast?latitude=~a&longitude=~a&current_weather=true\"\n          (:lat c) (:lon c)))\n\n;; A single fetch. Note: HTTP status errors (4xx/5xx) come back as a normal\n;; {:status N} value — we turn those into an :ok false row here. Only a\n;; *network-level* failure (DNS, refused connection) throws; we handle that\n;; separately in section 3.\n(define (fetch-city c)\n  (let ((r (http/get (build-url c))))\n    (if (= (:status r) 200)\n        (let ((cw (:current_weather (json/decode (:body r)))))\n          {:city (:name c) :ok true\n           :temp (:temperature cw) :wind (:windspeed cw)})\n        {:city (:name c) :ok false :error (format \"HTTP ~a\" (:status r))})))\n\n(println \"Probing one city (Oslo):\")\n(println (fetch-city (car cities)))",
+      "outputs": [
+        {
+          "type": "stdout",
+          "display": "Probing one city (Oslo):\n{:city \"Oslo\" :ok #t :temp 19.9 :wind 12.6}\n",
+          "timestamp": "2026-07-03T15:43:17.623654Z"
+        },
+        {
+          "type": "value",
+          "display": "",
+          "sema_value": "nil",
+          "timestamp": "2026-07-03T15:43:17.623649Z",
+          "duration_ms": 1158
+        }
+      ]
+    },
+    {
+      "id": "c00000004",
+      "type": "markdown",
+      "source": "## 2. A fallback sample (so this teaches even offline)\n\nIf the network is unavailable when you run this, the fetch cells will produce\nerror rows (that is the whole point of the next section). So that the *parse*\nand *aggregate* stages still teach something, here is a canned Open-Meteo\nresponse — the exact JSON shape the API returns — parsed the same way."
+    },
+    {
+      "id": "c00000005",
+      "type": "code",
+      "source": ";; A real Open-Meteo response body, verbatim, as a string.\n(define sample-body\n  \"{\\\"latitude\\\":59.9,\\\"longitude\\\":10.75,\\\"current_weather\\\":{\\\"temperature\\\":21.4,\\\"windspeed\\\":9.2,\\\"weathercode\\\":1,\\\"time\\\":\\\"2026-07-03T15:00\\\"}}\")\n\n(define parsed (json/decode sample-body))\n(define cw (:current_weather parsed))\n(println (format \"parsed temperature: ~a °C\" (:temperature cw)))\n(println (format \"parsed windspeed:   ~a km/h\" (:windspeed cw)))\n\n;; A small canned dataset we can always aggregate, labelled as such, used as a\n;; fallback later if every live fetch fails.\n(define canned-rows\n  (list {:city \"Oslo (sample)\"   :ok true :temp 21.4 :wind 9.2}\n        {:city \"London (sample)\" :ok true :temp 18.0 :wind 14.1}\n        {:city \"Cairo (sample)\"  :ok true :temp 34.2 :wind 6.5}\n        {:city \"Moscow (sample)\" :ok true :temp 12.7 :wind 11.0}))\n(println (format \"canned fallback rows: ~a\" (length canned-rows)))",
+      "outputs": [
+        {
+          "type": "stdout",
+          "display": "parsed temperature: 21.4 °C\nparsed windspeed:   9.2 km/h\ncanned fallback rows: 4\n",
+          "timestamp": "2026-07-03T15:43:17.624090Z"
+        },
+        {
+          "type": "value",
+          "display": "",
+          "sema_value": "nil",
+          "timestamp": "2026-07-03T15:43:17.624089Z",
+          "duration_ms": 0
+        }
+      ]
+    },
+    {
+      "id": "c00000006",
+      "type": "markdown",
+      "source": "## 3. Resilience: catch on the *await* side, not inside the task\n\nAPIs fail. A pipeline that dies on one 500 or one dropped connection is a toy.\nSo each fetch must degrade to an error row, never abort the batch.\n\nHere is the trap. In Sema's async runtime, a blocking call like `http/get` is\n*offloaded* and the task **yields** at that point. If the call fails at the\nnetwork level, the whole **task rejects** at the yield point — and a `try`\nplaced *inside the task*, wrapped directly around `http/get`, **does not catch\nit**:\n\n```sema\n;; DOES NOT WORK — the reject escapes the in-task try:\n(async/spawn (fn () (try (http/get bad-url) (catch e :handled))))\n```\n\nThe reject surfaces where you **await** the promise. So that is where the `try`\nbelongs — around `async/await`:\n\n```sema\n;; WORKS — catch at the await side:\n(try (async/await p) (catch e :handled))\n```\n\n(HTTP *status* errors are different — those return a normal `{:status 500}`\nvalue, catchable anywhere, which is why `fetch-city` already handles them\ninline. The await-side `try` is specifically for *network-level* rejects.)\n\nThe cell below proves both halves of the asymmetry with one good city and one\ndeliberately dead URL."
+    },
+    {
+      "id": "c00000007",
+      "type": "code",
+      "source": ";; The reusable per-item-resilient runner: spawn every fetch, then await each\n;; inside its OWN try. A network reject becomes an error row; siblings survive.\n(define (fetch-all-resilient cs)\n  (let ((promises (map (fn (c) (async/spawn (fn () (fetch-city c)))) cs)))\n    (map (fn (p c)\n           (try (async/await p)\n                (catch e {:city (:name c) :ok false :error \"network error\"})))\n         promises cs)))\n\n;; Prove it: one reachable city + one dead host, fetched together.\n(define dead-url \"https://nonexistent-host-9c3f.invalid\")\n\n;; A fetch-city variant that hits the dead host, to force a network reject.\n(define (fetch-ghost _)\n  (let ((r (http/get dead-url)))               ; rejects at this yield point\n    {:city \"Ghost\" :ok true :temp (:status r) :wind 0}))\n\n(define promises\n  (list (async/spawn (fn () (fetch-city (car cities))))\n        (async/spawn (fn () (fetch-ghost nil)))))\n(define labels (list \"Oslo\" \"Ghost\"))\n(define demo\n  (map (fn (p name)\n         (try (async/await p)                  ; <-- catch belongs HERE\n              (catch e {:city name :ok false :error \"network error (caught!)\"})))\n       promises labels))\n(for-each println demo)",
+      "outputs": [
+        {
+          "type": "stdout",
+          "display": "{:city \"Oslo\" :ok #t :temp 19.9 :wind 12.6}\n{:city \"Ghost\" :error \"network error (caught!)\" :ok #f}\n",
+          "timestamp": "2026-07-03T15:43:17.883941Z"
+        },
+        {
+          "type": "value",
+          "display": "",
+          "sema_value": "nil",
+          "timestamp": "2026-07-03T15:43:17.883938Z",
+          "duration_ms": 259
+        }
+      ]
+    },
+    {
+      "id": "c00000008",
+      "type": "markdown",
+      "source": "## 4. Sequential vs concurrent — and why bounded\n\nNow the payoff. We fetch all ten cities two ways and time both.\n\n- **Sequential**: `map fetch-city` over the list — each blocks until done, so\n  wall-clock is the sum of latencies.\n- **Concurrent, bounded**: `async/pool-map` runs the fetches with at most *N*\n  in flight at once, returning results in input order.\n\n**Why bounded and not \"spawn all ten thousand at once\"?** Because a public API\nwill rate-limit or reject you, and your own machine has finite sockets, memory,\nand file handles. `async/pool-map` caps concurrency with a semaphore — you get\nthe speed-up without hammering the server or exhausting the client. Be a good\ncitizen: pick a small pool (here, 5).\n\nA pool of 5 over 10 cities is ~2 waves, so expect roughly a **2×** speed-up\nhere — not 10×. Bounded concurrency trades peak speed for politeness: wall-clock\nis about `ceil(N / pool) × (latency of the slowest request in a wave)`. Widen\nthe pool and it approaches `max`; that is the knob you tune against the API's\ntolerance.\n\nNote `async/pool-map` **re-raises** a network reject (it is a barrier, like\n`async/all`), so we wrap it in a `try` for the all-offline case. `fetch-city`\nalready absorbs HTTP-status errors, so on a healthy network every row comes\nback fine."
+    },
+    {
+      "id": "c00000009",
+      "type": "code",
+      "source": "(define (ms-since t0) (floor (/ (- (sys/elapsed) t0) 1000000)))\n\n;; Warm up DNS, TLS, and the connection pool with a small concurrent batch so\n;; both timings measure the same steady state (otherwise the first method\n;; unfairly eats connection setup, and the pool phase pays for cold sockets).\n(try (async/pool-map fetch-city cities 5) (catch e nil))\n\n;; Sequential — sum of latencies. Guard each call so one dead host can't abort.\n(define t0 (sys/elapsed))\n(define seq-rows\n  (map (fn (c) (try (fetch-city c)\n                    (catch e {:city (:name c) :ok false :error \"network error\"})))\n       cities))\n(define seq-ms (ms-since t0))\n(println (format \"sequential: ~a ms for ~a cities\" seq-ms (length cities)))\n\n;; Concurrent, bounded to 5 in flight. Re-raises on total network failure,\n;; so we degrade to an empty list and note it.\n(define t1 (sys/elapsed))\n(define results\n  (try (async/pool-map fetch-city cities 5)\n       (catch e '())))\n(define conc-ms (ms-since t1))\n(if (empty? results)\n    (println \"network unavailable — every live fetch failed (degraded path)\")\n    (println (format \"concurrent (pool of 5): ~a ms\" conc-ms)))\n(when (and (> conc-ms 0) (not (empty? results)))\n  (println (format \"speedup: ~ax\" (/ (round (* (/ seq-ms conc-ms) 10.0)) 10.0))))",
+      "outputs": [
+        {
+          "type": "stdout",
+          "display": "sequential: 2641 ms for 10 cities\nconcurrent (pool of 5): 747 ms\nspeedup: 3.5x\n",
+          "timestamp": "2026-07-03T15:43:22.372199Z"
+        },
+        {
+          "type": "value",
+          "display": "",
+          "sema_value": "nil",
+          "timestamp": "2026-07-03T15:43:22.372196Z",
+          "duration_ms": 4488
+        }
+      ]
+    },
+    {
+      "id": "c0000000a",
+      "type": "markdown",
+      "source": "## 5. Aggregate — warmest, coldest, mean, and a bar chart\n\nWith the rows in hand, the aggregate stage is pure Sema — no network, no deps.\nWe keep only the `:ok` rows, then compute warmest / coldest / mean and draw a\ntiny ASCII temperature chart. If every live fetch failed, we fall back to the\ncanned sample (clearly labelled) so the chart still renders."
+    },
+    {
+      "id": "c0000000b",
+      "type": "code",
+      "source": "(define ok-rows (filter (fn (r) (:ok r)) results))\n(define using-sample (empty? ok-rows))\n(define rows (if using-sample canned-rows ok-rows))\n(when using-sample\n  (println \";; live data unavailable — charting the canned sample instead\\n\"))\n\n(define temps (map (fn (r) (:temp r)) rows))\n(define hi (apply max temps))\n(define lo (apply min temps))\n(define mean (/ (apply + temps) (length temps)))\n(define (r1 x) (/ (round (* x 10.0)) 10.0))\n\n(define warmest (car (filter (fn (r) (= (:temp r) hi)) rows)))\n(define coldest (car (filter (fn (r) (= (:temp r) lo)) rows)))\n(println (format \"warmest: ~a at ~a °C\" (:city warmest) hi))\n(println (format \"coldest: ~a at ~a °C\" (:city coldest) lo))\n(println (format \"mean:    ~a °C across ~a cities\\n\" (r1 mean) (length rows)))\n\n;; ASCII bar chart, scaled across the observed range.\n(define span (max 1.0 (- hi lo)))\n(define (bar t)\n  (let ((n (+ 1 (round (* (/ (- t lo) span) 34)))))\n    (string/repeat \"#\" n)))\n(for-each\n  (fn (r)\n    (println (format \"~a ~a ~a°\"\n                     (string/pad-right (:city r) 16)\n                     (bar (:temp r))\n                     (r1 (:temp r)))))\n  (sort-by (fn (r) (- 0 (:temp r))) rows))",
+      "outputs": [
+        {
+          "type": "stdout",
+          "display": "warmest: New York at 36.6 °C\ncoldest: Sydney at 11.1 °C\nmean:    22.9 °C across 10 cities\n\nNew York         ################################### 36.6°\nCairo            ################################## 35.6°\nRio              ###################### 27.0°\nLondon           ###################### 26.7°\nMoscow           ##################### 25.9°\nTokyo            ############### 21.6°\nOslo             ############# 19.9°\nCape Town        ### 12.9°\nReykjavik        # 11.4°\nSydney           # 11.1°\n",
+          "timestamp": "2026-07-03T15:43:22.373069Z"
+        },
+        {
+          "type": "value",
+          "display": "",
+          "sema_value": "nil",
+          "timestamp": "2026-07-03T15:43:22.373067Z",
+          "duration_ms": 0
+        }
+      ]
+    },
+    {
+      "id": "c0000000c",
+      "type": "markdown",
+      "source": "## 6. Persist — write a JSON report and read it back\n\nThe last stage writes an aggregated report to disk with `json/encode` and then\nreads it back to verify the round-trip. Always persist the *shape* you would\nwant to consume later: the summary plus the per-city rows."
+    },
+    {
+      "id": "c0000000d",
+      "type": "code",
+      "source": "(define report\n  {:generated-at (format \"~a\" (sys/elapsed))\n   :source (if using-sample \"canned-sample\" \"open-meteo\")\n   :city-count (length rows)\n   :warmest {:city (:city warmest) :temp hi}\n   :coldest {:city (:city coldest) :temp lo}\n   :mean-temp (r1 mean)\n   :rows rows})\n\n(define path \"/tmp/sema-weather-report.json\")\n(file/write path (json/encode-pretty report))\n\n;; Read it back and confirm the round-trip survived encode → disk → decode.\n(define reloaded (json/decode (file/read path)))\n(println (format \"wrote report to: ~a\" path))\n(println (format \"bytes on disk:   ~a\" (string-length (file/read path))))\n(println (format \"roundtrip ok?    ~a  (~a rows, mean ~a °C)\"\n                 (= (:city-count reloaded) (length rows))\n                 (:city-count reloaded)\n                 (:mean-temp reloaded)))\n(file/delete path)",
+      "outputs": [
+        {
+          "type": "stdout",
+          "display": "wrote report to: /tmp/sema-weather-report.json\nbytes on disk:   1174\nroundtrip ok?    #t  (10 rows, mean 22.9 °C)\n",
+          "timestamp": "2026-07-03T15:43:22.375163Z"
+        },
+        {
+          "type": "value",
+          "display": "",
+          "sema_value": "nil",
+          "timestamp": "2026-07-03T15:43:22.375162Z",
+          "duration_ms": 2
+        }
+      ]
+    },
+    {
+      "id": "c0000000e",
+      "type": "markdown",
+      "source": "## 7. The honest limits\n\n- **Rate limits are real.** Open-Meteo is generous but not infinite; a\n  commercial API will 429 or ban you for unbounded fan-out. Keep the pool\n  small and back off on 429 (Sema's `http/*` already retries transient\n  failures with jitter).\n- **The catch-site asymmetry (section 3) is the #1 gotcha.** A `try` *inside*\n  an async task will not catch a reject that happens at a yield point (the\n  offloaded `http`/`shell`/`llm` call). Catch at the **await** side. HTTP\n  *status* errors are the exception — those are ordinary values.\n- **`async/pool-map` is all-or-nothing on network rejects.** It re-raises like\n  a barrier, so one dropped connection aborts the batch. For *per-item* network\n  resilience (some cities down, others fine) use the spawn-all + await-each-in-\n  `try` pattern from section 3 instead — it converts each failure to a row.\n- **When *not* to go concurrent:** if N is tiny (2–3 fast calls), if the API\n  forbids parallel requests, or if the work is CPU-bound rather than I/O-bound\n  (cooperative scheduling does not preempt computation — see\n  `async-basics.sema-nb` §9). Concurrency pays off precisely when you are\n  waiting on many independent I/O operations."
+    },
+    {
+      "id": "c0000000f",
+      "type": "markdown",
+      "source": "## Where to go next\n\nThis pipeline is the I/O-bound template; the sibling notebooks specialise it:\n\n- **`async-basics.sema-nb`** — the full async model with wall-clock proofs\n  (tasks, channels, combinators, cancellation, the no-preemption limit).\n- **`llm-batch-enrichment.sema-nb`** — the same fetch→parse→aggregate shape, but\n  each \"fetch\" is an LLM call, with budgets and caching layered on.\n- **`research-agents.sema-nb`** — multi-round agents that run concurrently\n  without blocking each other.\n- **`realtime-monitor.sema-nb`** — the streaming cousin: WebSockets, channels,\n  and a live aggregator instead of a one-shot batch."
+    }
+  ]
+}

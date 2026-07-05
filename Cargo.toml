@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/sema-core",
+    "crates/sema-io",
     "crates/sema-reader",
     "crates/sema-eval",
     "crates/sema-llm",
@@ -29,6 +30,7 @@ homepage = "https://sema-lang.com"
 
 [workspace.dependencies]
 sema-core = { version = "=1.28.1", path = "crates/sema-core" }
+sema-io = { version = "=1.28.1", path = "crates/sema-io" }
 sema-reader = { version = "=1.28.1", path = "crates/sema-reader" }
 sema-eval = { version = "=1.28.1", path = "crates/sema-eval" }
 sema-llm = { version = "=1.28.1", path = "crates/sema-llm" }

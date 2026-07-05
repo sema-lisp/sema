@@ -59,6 +59,7 @@ zip = { version = "8", default-features = false, features = ["deflate"] }
 libc = "0.2"
 
 [dev-dependencies]
+sema-io.workspace = true
 paste = "1"
 pio = "0.3"
 sema-otel = { workspace = true, features = ["testing"] }

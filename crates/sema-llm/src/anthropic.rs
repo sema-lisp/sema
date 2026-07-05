@@ -7,17 +7,14 @@ pub struct AnthropicProvider {
     api_key: String,
     default_model: String,
     client: reqwest::Client,
-    runtime: crate::http::BlockingRuntime,
 }
 
 impl AnthropicProvider {
     pub fn new(api_key: String, default_model: Option<String>) -> Result<Self, LlmError> {
-        let runtime = crate::http::create_runtime()?;
         Ok(AnthropicProvider {
             api_key,
             default_model: default_model.unwrap_or_else(|| "claude-sonnet-4-6".to_string()),
             client: crate::http::create_client(None)?,
-            runtime,
         })
     }
 
@@ -181,6 +178,7 @@ impl AnthropicProvider {
                         id: id.clone(),
                         name: name.clone(),
                         arguments: input.clone(),
+                        thought_signature: None,
                     });
                 }
                 // Thinking / redacted_thinking / unknown blocks: ignore.
@@ -374,6 +372,7 @@ impl AnthropicStreamAccum {
             id,
             name,
             arguments,
+            thought_signature: None,
         }
     }
 
@@ -509,7 +508,15 @@ impl LlmProvider for AnthropicProvider {
     }
 
     fn complete(&self, request: ChatRequest) -> Result<ChatResponse, LlmError> {
-        self.runtime.block_on(self.complete_async(request))
+        sema_io::io_block_on(self.complete_async(request))
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn complete_future(
+        &self,
+        request: ChatRequest,
+    ) -> Option<crate::provider::BoxCompletionFuture<'_>> {
+        Some(Box::pin(self.complete_async(request)))
     }
 
     fn stream_complete(
@@ -517,12 +524,13 @@ impl LlmProvider for AnthropicProvider {
         request: ChatRequest,
         on_chunk: &mut dyn FnMut(&str) -> Result<(), LlmError>,
     ) -> Result<ChatResponse, LlmError> {
-        self.runtime
-            .block_on(self.stream_complete_async(request, on_chunk))
+        // io_block_on drives ON THIS thread: `on_chunk` may touch non-Send Sema
+        // values and must never migrate to a pool worker.
+        sema_io::io_block_on(self.stream_complete_async(request, on_chunk))
     }
 
     fn batch_complete(&self, requests: Vec<ChatRequest>) -> Vec<Result<ChatResponse, LlmError>> {
-        self.runtime.block_on(async {
+        sema_io::io_block_on(async {
             let futures: Vec<_> = requests
                 .into_iter()
                 .map(|req| self.complete_async(req))

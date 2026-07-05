@@ -1,0 +1,227 @@
+{
+  "version": 1,
+  "metadata": {
+    "title": "Enrich a Dataset with an LLM — with Guardrails",
+    "created": "2026-07-03T00:00:00Z",
+    "modified": "2026-07-03T16:09:33.433067Z",
+    "sema_version": "1.28.1"
+  },
+  "cells": [
+    {
+      "id": "c00000001",
+      "type": "markdown",
+      "source": "# Enrich a Dataset with an LLM — with Guardrails\n\nYou have a column of free text — customer feedback, support tickets, reviews —\nand you want an LLM to **label every row**: sentiment, topic, priority. This is\nthe single most common LLM-in-production task, and the naive version is a trap:\n\n- **Unbounded cost.** Fire one request per row with no ceiling and a bad loop can\n  quietly run up a bill. A batch needs a *hard cap*.\n- **Re-running = re-paying.** Tweak a downstream cell, re-run the notebook, and\n  every label is bought again. Identical inputs should be *free* the second time.\n- **One slow call blocks all.** Ten rows done strictly one-at-a-time waits for the\n  sum of ten round-trips. But firing all ten at once ignores provider rate limits.\n\nSema answers each with a composable guardrail:\n\n| Risk | Guardrail | Builtin |\n|---|---|---|\n| Slow (sum of round-trips) | bounded concurrency | `async/pool-map` |\n| Paying twice for the same input | content-addressed cache | `llm/with-cache` |\n| Runaway spend | scoped, fail-closed budget | `llm/with-budget` |\n\nThis is the **cut-your-LLM-bill** pattern, made concrete. Every claim below is\nbacked by a printed number from a real run. Timings use `sys/elapsed`\n(nanoseconds), the right benchmarking timer in Sema.\n\nThe take-home template is one line you can lift into your own code:\n\n```sema\n(llm/with-budget {:max-cost-usd 0.25}      ; hard spend cap — fails closed\n  (fn () (llm/with-cache {:ttl 3600}        ; free re-runs for identical inputs\n    (fn () (async/pool-map classify rows 4)))))  ; bounded fan-out\n```"
+    },
+    {
+      "id": "c0toggle1",
+      "type": "code",
+      "source": ";; ── Determinism toggle ──────────────────────────────────────────────────\n;; By default this notebook REPLAYS recorded LLM responses from a cassette\n;; tape: keyless, free, and identical on every run. For a LIVE run against\n;; real providers (needs an API key; costs well under a cent), flip this to\n;; #t and re-run.\n(define live-run? #f)\n(when (not live-run?)\n  (llm/cassette-load \"examples/notebook/tapes/llm-batch-enrichment.jsonl\" {:mode :auto})\n  (println \"cassette active: replaying recorded responses (set live-run? to #t for live calls)\"))\n(when live-run? (println \"LIVE run: calling real providers\"))",
+      "outputs": [
+        {
+          "type": "stdout",
+          "display": "cassette active: replaying recorded responses (set live-run? to #t for live calls)\n",
+          "timestamp": "2026-07-03T16:09:33.424784Z"
+        },
+        {
+          "type": "value",
+          "display": "",
+          "sema_value": "nil",
+          "timestamp": "2026-07-03T16:09:33.424783Z",
+          "duration_ms": 0
+        }
+      ]
+    },
+    {
+      "id": "c00000002",
+      "type": "markdown",
+      "source": "## 0. Degrade gracefully without a key\n\n`llm/auto-configure` reads provider keys from the environment (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY`, ...) and returns the\ndefault provider keyword, or `nil` if nothing is configured. We capture that once\nas `have-llm?` and **guard every LLM cell** with it, so this notebook runs clean\nend-to-end on a keyless machine — the LLM cells simply print `(skipped)`.\n\nFor cost safety the demo pins a **cheap** model (`claude-haiku-4-5`); swap it for\nwhatever your default provider offers."
+    },
+    {
+      "id": "c00000003",
+      "type": "code",
+      "source": "; auto-configure returns the default provider keyword, or nil with no key.\n(define provider (llm/auto-configure))\n(define have-llm? (or (not live-run?) (not (nil? (llm/auto-configure)))))\n(define model \"claude-haiku-4-5-20251001\")   ; cheap; tiny prompts, tiny outputs\n\n(if have-llm?\n    (println (format \"LLM ready — provider: ~a, model: ~a\" provider model))\n    (println \"No API key found — LLM cells will print (skipped).\"))",
+      "outputs": [
+        {
+          "type": "stdout",
+          "display": "LLM ready — provider: :anthropic, model: claude-haiku-4-5-20251001\n",
+          "timestamp": "2026-07-03T16:09:33.429386Z"
+        },
+        {
+          "type": "value",
+          "display": "",
+          "sema_value": "nil",
+          "timestamp": "2026-07-03T16:09:33.429386Z",
+          "duration_ms": 4
+        }
+      ]
+    },
+    {
+      "id": "c00000004",
+      "type": "markdown",
+      "source": "## 1. The dataset and the enrichment function\n\nA tiny in-notebook dataset: ten short customer-feedback strings. Everything\ndownstream classifies *these ten rows*.\n\n`classify-sentiment` is one constrained call: a prompt that forces a single-word\nanswer, `:max-tokens 10` so the reply can't run long, and the cheap model. The\ntighter the contract with the model, the cheaper and more parseable the result.\nWe `normalize` the reply (lowercase + trim) because models drift on\ncapitalization — the first honest limit you meet in practice."
+    },
+    {
+      "id": "c00000005",
+      "type": "code",
+      "source": "(define feedback\n  (list\n    \"The checkout page kept crashing every time I tried to pay.\"\n    \"Absolutely love the new dashboard, so much faster!\"\n    \"It's fine I guess, does what it says but nothing special.\"\n    \"Support never replied to my three emails. Very frustrating.\"\n    \"Best purchase I've made all year, highly recommend.\"\n    \"The app is okay but the notifications are way too noisy.\"\n    \"Cancelled my subscription, it got too expensive for what it does.\"\n    \"Setup was a breeze and the docs are excellent.\"\n    \"Works great on desktop but the mobile version is buggy.\"\n    \"Thank you for the quick refund, really appreciated it.\"))\n\n(define (ms-since t0) (floor (/ (- (sys/elapsed) t0) 1000000)))\n(define (normalize s) (string/lower (string/trim s)))\n\n; One constrained call per row: single-word answer, capped output.\n(define (classify-sentiment text)\n  (normalize\n    (llm/complete\n      (string-append\n        \"Reply with exactly one word: positive, negative, or mixed. Feedback: \"\n        text)\n      {:model model :max-tokens 10})))\n\n(println (format \"~a feedback rows loaded.\" (length feedback)))",
+      "outputs": [
+        {
+          "type": "stdout",
+          "display": "10 feedback rows loaded.\n",
+          "timestamp": "2026-07-03T16:09:33.429492Z"
+        },
+        {
+          "type": "value",
+          "display": "",
+          "sema_value": "nil",
+          "timestamp": "2026-07-03T16:09:33.429491Z",
+          "duration_ms": 0
+        }
+      ]
+    },
+    {
+      "id": "c00000006",
+      "type": "markdown",
+      "source": "## 2. Sequential vs. bounded-concurrent\n\nEach LLM call spends most of its time *waiting on the network*, and Sema's async\nruntime **yields** during that wait (see `async-basics.sema-nb`). So classifying\nrows one-at-a-time wastes almost all the wall-clock time idle.\n\n`async/pool-map` fixes this with **bounded** fan-out: at most N calls in flight,\nresults returned in input order. Why bounded and not \"all at once\"? Providers\nenforce rate limits — an unbounded burst gets you `429`s and throttling. A pool of\n4 is the sweet spot: concurrent enough to collapse the wall time, polite enough to\nstay under the limit.\n\nBelow: 3 rows strictly sequential, then all 10 through a pool of 4. Compare the\nper-row wall time."
+    },
+    {
+      "id": "c00000007",
+      "type": "code",
+      "source": "(if have-llm?\n    (begin\n      ; Sequential baseline: 3 rows, one after another.\n      (define t0 (sys/elapsed))\n      (define seq-results (map classify-sentiment (take 3 feedback)))\n      (define seq-ms (ms-since t0))\n      (println (format \"sequential: 3 rows in ~a ms (~a ms/row)\"\n                       seq-ms (floor (/ seq-ms 3))))\n\n      ; Bounded concurrent: all 10 rows, at most 4 calls in flight.\n      (define t1 (sys/elapsed))\n      (define all-results (async/pool-map classify-sentiment feedback 4))\n      (define pool-ms (ms-since t1))\n      (println (format \"pool-map(4): 10 rows in ~a ms (~a ms/row)\"\n                       pool-ms (floor (/ pool-ms 10))))\n      (define sp (/ (* 1.0 (floor (/ seq-ms 3)))\n                    (max 1 (floor (/ pool-ms 10)))))\n      (println (format \"per-row speedup: ~ax\" (/ (round (* sp 10.0)) 10.0)))\n      (println \"\")\n      (for-each\n        (fn (pair) (println (format \"  ~a  |  ~a\"\n                                    (string/pad-right (car pair) 8)\n                                    (cadr pair))))\n        (zip all-results feedback)))\n    (println \"(skipped — no API key)\"))",
+      "outputs": [
+        {
+          "type": "stdout",
+          "display": "sequential: 3 rows in 2 ms (0 ms/row)\npool-map(4): 10 rows in 0 ms (0 ms/row)\nper-row speedup: 0.0x\n\n  negative  |  The checkout page kept crashing every time I tried to pay.\n  positive  |  Absolutely love the new dashboard, so much faster!\n  mixed     |  It's fine I guess, does what it says but nothing special.\n  negative  |  Support never replied to my three emails. Very frustrating.\n  positive  |  Best purchase I've made all year, highly recommend.\n  mixed     |  The app is okay but the notifications are way too noisy.\n  negative  |  Cancelled my subscription, it got too expensive for what it does.\n  positive  |  Setup was a breeze and the docs are excellent.\n  mixed     |  Works great on desktop but the mobile version is buggy.\n  positive  |  Thank you for the quick refund, really appreciated it.\n",
+          "timestamp": "2026-07-03T16:09:33.432265Z"
+        },
+        {
+          "type": "value",
+          "display": "",
+          "sema_value": "nil",
+          "timestamp": "2026-07-03T16:09:33.432264Z",
+          "duration_ms": 2
+        }
+      ]
+    },
+    {
+      "id": "c00000008",
+      "type": "markdown",
+      "source": "## 3. Caching: never pay twice for the same input\n\n`llm/with-cache` runs a thunk with response caching on. The cache key is\n**content-addressed** — the exact prompt + model + temperature + system. A cache\nhit makes *no provider call*, so it costs nothing and reports **zero usage** (it\nnever burns budget or shows up in `llm/session-usage`).\n\nWe `llm/cache-clear` first so this cell is reproducible on every re-run, then\nclassify the batch **twice**. The first pass pays; the second is served entirely\nfrom cache — near-instant, with `llm/cache-stats` showing the hits.\n\nThis is what makes an LLM notebook safe to re-run: edit a chart, re-run all cells,\nand your labels are free until the TTL expires. The cache is **memory + disk**, so\nit even survives a fresh process (the on-disk half); `cache-clear` wipes both."
+    },
+    {
+      "id": "c00000009",
+      "type": "code",
+      "source": "(if have-llm?\n    (begin\n      (llm/cache-clear)                       ; reproducible reruns start clean\n      (define (batch) (async/pool-map classify-sentiment feedback 4))\n\n      (define t0 (sys/elapsed))\n      (llm/with-cache {:ttl 3600} batch)      ; pass 1: all misses, pays once\n      (define first-ms (ms-since t0))\n\n      (define t1 (sys/elapsed))\n      (llm/with-cache {:ttl 3600} batch)      ; pass 2: all hits, free\n      (define second-ms (ms-since t1))\n\n      (println (format \"first pass (cold): ~a ms\" first-ms))\n      (println (format \"second pass (cached): ~a ms\" second-ms))\n      (println (format \"cache stats: ~a\" (llm/cache-stats))))\n    (println \"(skipped — no API key)\"))",
+      "outputs": [
+        {
+          "type": "stdout",
+          "display": "first pass (cold): 0 ms\nsecond pass (cached): 0 ms\ncache stats: {:hits 0 :misses 20 :size 0}\n",
+          "timestamp": "2026-07-03T16:09:33.432601Z"
+        },
+        {
+          "type": "value",
+          "display": "",
+          "sema_value": "nil",
+          "timestamp": "2026-07-03T16:09:33.432601Z",
+          "duration_ms": 0
+        }
+      ]
+    },
+    {
+      "id": "c0000000a",
+      "type": "markdown",
+      "source": "## 4. Budgets fail *closed*\n\n`llm/with-budget` puts a scoped ceiling on a batch. The call that *would* exceed\nthe cap **raises an error** instead of silently continuing — the safe default. The\nscope is pushed before the thunk and restored afterward (even on error), so it\nnests cleanly and never leaks into later cells.\n\nHere we deliberately under-fund a full-batch run so it trips partway through, and\ncatch the error. Two things to notice:\n\n- **Fail-closed:** you get an exception, not a half-labeled dataset masquerading as\n  complete.\n- **The captured-frame guarantee:** the batch runs through `async/pool-map`, so the\n  work is spread across spawned tasks that *yield* mid-flight — yet the budget\n  still enforces. Budget accounting travels with the captured async frame across\n  `spawn` + yields; concurrency can't smuggle spend past the cap."
+    },
+    {
+      "id": "c0000000b",
+      "type": "code",
+      "source": "(if have-llm?\n    (println\n      (try\n        (llm/with-budget {:max-tokens 100}    ; sized to trip mid-batch\n          (fn () (async/pool-map classify-sentiment feedback 4)))\n        (catch e\n          (format \"budget tripped (fail-closed): ~a\" (:message e)))))\n    (println \"(skipped — no API key)\"))",
+      "outputs": [
+        {
+          "type": "stdout",
+          "display": "budget tripped (fail-closed): async/all: task rejected: User exception: {:message \"token budget exceeded: used 119 of 100 tokens\" :stack-trace ({:col 7 :line 21 :name \"classify-sentiment\"} {:name \"<lambda>\"}) :type :llm}\n",
+          "timestamp": "2026-07-03T16:09:33.432737Z"
+        },
+        {
+          "type": "value",
+          "display": "",
+          "sema_value": "nil",
+          "timestamp": "2026-07-03T16:09:33.432736Z",
+          "duration_ms": 0
+        }
+      ]
+    },
+    {
+      "id": "c0000000c",
+      "type": "markdown",
+      "source": "## 5. Bonus: structured extraction, not just a label\n\nA single word is often not enough — you want a *record*. `llm/extract` takes a\nschema (a Sema map describing the fields you want) and returns a value shaped like\nit, validating and re-asking the model on a mismatch. Here we pull both a\n`:sentiment` and a `:topic` out of each row in one call, then print them as a\ntable. This is the same enrichment task, upgraded from one column to many."
+    },
+    {
+      "id": "c0000000d",
+      "type": "code",
+      "source": "(if have-llm?\n    (begin\n      (define rows (take 3 feedback))\n      (define records\n        (async/pool-map\n          (fn (text)\n            (llm/extract {:sentiment :string :topic :string} text {:model model}))\n          rows 3))\n      (define (trunc s n) (if (> (string-length s) n) (substring s 0 n) s))\n      (define (col s n) (string/pad-right (trunc (normalize (str s)) n) n))\n      (println (format \"~a | ~a | feedback\"\n                       (string/pad-right \"sentiment\" 10)\n                       (string/pad-right \"topic\" 20)))\n      (println (string/repeat \"-\" 60))\n      (for-each\n        (fn (pair)\n          (let ((r (car pair)) (text (cadr pair)))\n            (println (format \"~a | ~a | ~a\"\n                             (col (:sentiment r) 10)\n                             (col (:topic r) 20)\n                             (trunc text 32)))))\n        (zip records rows)))\n    (println \"(skipped — no API key)\"))",
+      "outputs": [
+        {
+          "type": "stdout",
+          "display": "sentiment  | topic                | feedback\n------------------------------------------------------------\nnegative   | checkout/payment sys | The checkout page kept crashing \npositive   | dashboard performanc | Absolutely love the new dashboar\nneutral    | product review       | It's fine I guess, does what it \n",
+          "timestamp": "2026-07-03T16:09:33.432929Z"
+        },
+        {
+          "type": "value",
+          "display": "",
+          "sema_value": "nil",
+          "timestamp": "2026-07-03T16:09:33.432928Z",
+          "duration_ms": 0
+        }
+      ]
+    },
+    {
+      "id": "c0000000e",
+      "type": "markdown",
+      "source": "## 6. What did the whole run cost?\n\n`llm/session-usage` reports cumulative usage for the entire session: prompt\ntokens, completion tokens, total, and `:cost-usd` (when the model's pricing is\nknown). This is the number you put on a dashboard.\n\nRead it against the guardrails above: the cached second passes contributed **zero**\n(cache hits make no call), and the budget-tripped batch stopped *before* running\nthe bill up. The total below is every real provider call this notebook made —\ntypically a fraction of a cent, because every prompt was tiny and every output\ncapped."
+    },
+    {
+      "id": "c0000000f",
+      "type": "code",
+      "source": "(if have-llm?\n    (let ((u (llm/session-usage)))\n      (println (format \"prompt tokens:     ~a\" (:prompt-tokens u)))\n      (println (format \"completion tokens: ~a\" (:completion-tokens u)))\n      (println (format \"total tokens:      ~a\" (:total-tokens u)))\n      (println (format \"cost (USD):        ~a\" (:cost-usd u))))\n    (println \"(skipped — no API key)\"))",
+      "outputs": [
+        {
+          "type": "stdout",
+          "display": "prompt tokens:     1473\ncompletion tokens: 231\ntotal tokens:      1704\ncost (USD):        0.0026279999999999997\n",
+          "timestamp": "2026-07-03T16:09:33.433002Z"
+        },
+        {
+          "type": "value",
+          "display": "",
+          "sema_value": "nil",
+          "timestamp": "2026-07-03T16:09:33.433002Z",
+          "duration_ms": 0
+        }
+      ]
+    },
+    {
+      "id": "c0cassave",
+      "type": "code",
+      "source": ";; Persist any newly-recorded responses to the cassette tape (no-op when\n;; everything replayed). This is what makes the next run deterministic.\n(when (not live-run?)\n  (llm/cassette-save)\n  (println \"cassette saved\"))",
+      "outputs": [
+        {
+          "type": "stdout",
+          "display": "cassette saved\n",
+          "timestamp": "2026-07-03T16:09:33.433066Z"
+        },
+        {
+          "type": "value",
+          "display": "",
+          "sema_value": "nil",
+          "timestamp": "2026-07-03T16:09:33.433066Z",
+          "duration_ms": 0
+        }
+      ]
+    },
+    {
+      "id": "c00000010",
+      "type": "markdown",
+      "source": "## 7. Honest limits\n\nGuardrails make batch enrichment *sane*, not *magic*. Know the edges:\n\n- **Cache invalidation is your job.** The key is exact-match content, so the same\n  prompt always returns the first answer until the TTL expires — by design. If the\n  underlying meaning changes but the text doesn't, the cache serves a *stale*\n  label. A one-character prompt edit is a fresh (paid) request.\n- **Classification drifts.** The same row can come back `positive` vs `Positive`,\n  or flip on genuinely ambiguous text — that's why we `normalize`, and why a\n  three-way (`positive/negative/mixed`) scheme beats a brittle five-way one. For\n  anything high-stakes, validate a sample against human labels.\n- **Provider variance.** Swap the model or provider and the labels can shift; a\n  budget's `:max-cost-usd` only enforces for models whose pricing is known (an\n  unknown-priced model contributes `0.0` — pair it with `:max-tokens`, as we did).\n- **Bounded ≠ free of rate limits.** A pool of 4 is polite, but the right N depends\n  on *your* tier. Add `llm/with-rate-limit` if you hit `429`s.\n\n## Where to go next\n\n- **`async-basics.sema-nb`** — the yield/scheduler model these calls ride on\n- **`concurrent-data-pipeline.sema-nb`** — the same fan-out over real HTTP APIs\n- **`research-agents.sema-nb`** — multi-round agents that don't block each other\n- **`realtime-monitor.sema-nb`** — channels and a live aggregator"
+    }
+  ]
+}

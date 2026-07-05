@@ -5,6 +5,7 @@ pub mod context;
 pub mod cycle;
 pub mod error;
 pub mod home;
+pub mod io_backend;
 pub mod json;
 pub mod mcp_cassette;
 pub mod net;
@@ -19,18 +20,19 @@ pub use async_signal::{
     blocking_sleep_ms, call_cancel_callback, call_run_scheduler, call_run_scheduler_all_of,
     call_run_scheduler_any_of, call_run_scheduler_target, call_run_scheduler_timeout,
     call_spawn_callback, check_interrupt, clear_blocking_sleep_callback, clear_interrupt_callback,
-    current_conversation_scope_boxed, current_llm_scope_boxed, current_usage_scope_boxed,
-    debug_coop_resume_pending, in_async_context, install_task_llm_scope, install_task_otel,
-    install_task_usage_scope, io_park, notify_io_complete, set_async_context,
-    set_blocking_sleep_callback, set_cancel_callback, set_debug_coop_resume,
-    set_interrupt_callback, set_llm_scope_task_callbacks, set_otel_task_callbacks,
-    set_resume_value, set_run_scheduler_callback, set_spawn_callback,
-    set_usage_scope_task_callbacks, set_yield_signal, take_debug_coop_resume, take_resume_value,
-    take_task_llm_scope, take_task_otel, take_task_usage_scope, take_yield_signal, BlockingSleepFn,
-    CancelCallbackFn, DebugCoopResume, InterruptCallbackFn, IoHandle, IoPoll, LlmScopeCaptureFn,
-    LlmScopeInstallFn, LlmScopeTakeFn, OtelInstallFn, OtelScopeFn, OtelTakeFn,
-    RunSchedulerCallbackFn, SchedulerRunResult, SchedulerTarget, SpawnCallbackFn,
-    UsageScopeCaptureFn, UsageScopeInstallFn, UsageScopeTakeFn, YieldReason,
+    current_conversation_scope_boxed, current_llm_scope_boxed, current_task_id,
+    current_usage_scope_boxed, debug_coop_resume_pending, in_async_context, install_task_llm_scope,
+    install_task_otel, install_task_usage_scope, io_park, notify_io_complete, notify_task_reaped,
+    set_async_context, set_blocking_sleep_callback, set_cancel_callback, set_current_task_id,
+    set_debug_coop_resume, set_interrupt_callback, set_llm_scope_task_callbacks,
+    set_otel_task_callbacks, set_resume_value, set_run_scheduler_callback, set_spawn_callback,
+    set_task_reaped_callback, set_usage_scope_task_callbacks, set_yield_signal,
+    take_debug_coop_resume, take_resume_value, take_task_llm_scope, take_task_otel,
+    take_task_usage_scope, take_yield_signal, BlockingSleepFn, CancelCallbackFn, DebugCoopResume,
+    InterruptCallbackFn, IoHandle, IoPoll, LlmScopeCaptureFn, LlmScopeInstallFn, LlmScopeTakeFn,
+    OtelInstallFn, OtelScopeFn, OtelTakeFn, RunSchedulerCallbackFn, SchedulerRunResult,
+    SchedulerTarget, SpawnCallbackFn, TaskReapedFn, UsageScopeCaptureFn, UsageScopeInstallFn,
+    UsageScopeTakeFn, YieldReason,
 };
 pub use context::{
     call_callback, eval_callback, set_call_callback, set_eval_callback, with_stdlib_ctx,
@@ -46,6 +48,10 @@ pub use cycle::{
 };
 pub use error::{CallFrame, SemaError, Span, SpanMap, StackTrace};
 pub use home::sema_home;
+pub use io_backend::{
+    io_backend, io_block_on, io_spawn, io_spawn_blocking, set_io_backend, AbortHook, BoxIoFuture,
+    IoBackend,
+};
 pub use json::{json_to_value, key_to_string, value_to_json, value_to_json_lossy};
 pub use lasso::Spur;
 pub use mcp_cassette::{

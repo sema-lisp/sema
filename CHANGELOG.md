@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+### Changed
+
+- **Package registry (`pkg/`) now runs on SQLite, PostgreSQL, and MySQL from one
+  binary**, with a clean Data Access Layer (per
+  `docs/plans/2026-07-05-pkg-dal-multi-engine.md`). The engine is inferred from
+  the `DATABASE_URL` scheme; `db::connect()` applies SQLite-only tuning where
+  relevant and runs SeaORM programmatic migrations (`src/migration/`) that emit
+  correct DDL per engine, replacing the SQLite-dialect `migrations/*.sql`. All
+  database access moved out of handlers into per-aggregate modules under
+  `src/dal/` (`packages`, `versions`, `owners`, `deps`, `users`, `sessions`,
+  `tokens`, `reports`, `audit_log`, `oauth`, `downloads`, `admin`, `sync_log`,
+  `time`); handlers are now parse/authorize → call DAL → shape response and
+  contain no SQL. Portability is by construction: timestamps are generated in
+  Rust (no `datetime('now')`/`CURRENT_TIMESTAMP`), upserts use SeaORM
+  `on_conflict`, and any raw SQL is standard and parameterized. `make
+  test-all-drivers` runs the suite against all three engines. Removed the unused
+  `SESSION_SECRET` config. HTTP behavior is unchanged.
+
 ### Security
 
 - **Package registry (`pkg/`) — stored-XSS-to-admin-takeover and secret-default

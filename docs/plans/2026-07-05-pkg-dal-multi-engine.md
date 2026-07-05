@@ -1,7 +1,11 @@
 # Package Registry — Multi-Engine Data Access Layer
 
 **Date:** 2026-07-05
-**Status:** In progress
+**Status:** Done (2026-07-05). All four stages shipped. Every handler is thin;
+all DB access is behind `src/dal/` (verified: no `Entity::find` / raw
+`Statement` / `ActiveModel` outside `src/dal`, `src/entity`, `src/migration`).
+No engine-specific SQL remains. 85 tests green on SQLite; `make test-all-drivers`
+is the cross-engine oracle.
 **Goal:** Make `pkg/` (the registry) run cleanly on SQLite, PostgreSQL, and MySQL by
 routing all database access through a well-defined, testable Data Access Layer
 (DAL), and replacing SQLite-only migrations with engine-agnostic SeaORM

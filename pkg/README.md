@@ -59,7 +59,7 @@ All configuration is via environment variables with sensible defaults:
 |---|---|---|
 | `HOST` | `0.0.0.0` | Bind address |
 | `PORT` | `3000` | Listen port |
-| `DATABASE_URL` | `sqlite://data/registry.db?mode=rwc` | SQLite connection string |
+| `DATABASE_URL` | `sqlite://data/registry.db?mode=rwc` | Database URL. The engine is inferred from the scheme — `sqlite:`, `postgres:`, or `mysql:` (see [Database engines](#database-engines)). |
 | `BLOB_DIR` | `data/blobs` | Directory for package tarballs |
 | `BASE_URL` | `http://localhost:3000` | Public URL (used in links; enables `Secure` session cookies when `https://`) |
 | `MAX_TARBALL_BYTES` | `52428800` (50 MB) | Max upload size |
@@ -67,6 +67,36 @@ All configuration is via environment variables with sensible defaults:
 | `GITHUB_CLIENT_ID` | — | GitHub OAuth app client ID (optional) |
 | `GITHUB_CLIENT_SECRET` | — | GitHub OAuth app secret (optional) |
 | `OAUTH_TOKEN_KEY` | — | 32-byte key encrypting stored GitHub tokens. **Required when GitHub OAuth is enabled** — the server refuses to boot if left at the insecure default. |
+
+## Database engines
+
+The registry runs on **SQLite**, **PostgreSQL**, or **MySQL** from the same
+binary — the engine is chosen by the `DATABASE_URL` scheme:
+
+```bash
+DATABASE_URL="sqlite://data/registry.db?mode=rwc"          # default
+DATABASE_URL="postgres://user:pass@host:5432/sema"         # PostgreSQL
+DATABASE_URL="mysql://user:pass@host:3306/sema"            # MySQL
+```
+
+On startup the server infers the backend, applies SQLite-only tuning (WAL) where
+relevant, and runs the schema migrations (`src/migration/`, SeaORM programmatic
+migrations that emit correct DDL per engine). No manual schema step is needed.
+
+All database access goes through the Data Access Layer in `src/dal/` (one module
+per aggregate: `packages`, `versions`, `owners`, `deps`, `users`, `sessions`,
+`tokens`, `reports`, `audit_log`, `oauth`, `downloads`, plus `admin` read models
+and a `time` helper). Handlers never touch SQL directly, and the DAL avoids
+engine-specific constructs — timestamps are generated in Rust, upserts use
+SeaORM's `on_conflict`, and any raw SQL is standard and parameterized. This is
+what keeps all three engines behaving identically; add new queries to the DAL,
+not to handlers.
+
+Run the suite against all three engines (Docker):
+
+```bash
+make test-all-drivers   # SQLite + PostgreSQL + MySQL via docker-compose.test.yml
+```
 
 ## API Endpoints
 
@@ -139,7 +169,7 @@ A package is either **CLI-uploaded** or **GitHub-linked**, never both. Once a pa
 ## Self-Hosting
 
 1. Build: `cargo build --release`
-2. Copy `target/release/sema-pkg`, `templates/`, `static/`, and `migrations/` to your server
+2. Copy `target/release/sema-pkg`, `templates/`, and `static/` to your server (schema migrations are compiled into the binary and run automatically on startup)
 3. Set `DATABASE_URL`, `BLOB_DIR`, `BASE_URL` (use an `https://` URL so session cookies are marked `Secure`), and — if using GitHub OAuth — a unique `OAUTH_TOKEN_KEY`
 4. Run `sema-pkg` behind a reverse proxy (nginx/caddy) with TLS
 

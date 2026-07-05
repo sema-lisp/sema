@@ -1,7 +1,7 @@
 # Repo Split & GitHub Org Migration Plan
 
 **Date:** 2026-07-04 (status updated 2026-07-05)
-**Status:** **Tier B (editors + grammar) DONE**; **Tier C in progress** — `ui` split + published (`@sema-lang/ui`), `website`/`playground`/`pkg` kept in mono, `pkg` deferred; main-repo transfer pending.
+**Status:** **Tier B (editors + grammar) DONE**; **Tier C: `ui` DONE** — split, published (`@sema-lang/ui`, OIDC+provenance), and removed from the mono (website consumes the npm dep); `website`+`playground` kept in mono, `pkg` split deferred; main-repo transfer pending.
 **Related:** `docs/plans/2026-02-16-editor-plugin-publishing.md` (per-editor publishing targets — this plan is the *repo-structure* prerequisite for those workflows)
 
 ## Status update (2026-07-05)
@@ -11,7 +11,8 @@
 - **Old `HelgeSverre/tree-sitter-sema` mirror** retired/deleted (0 stars, mirror-only; superseded by `sema-lisp/tree-sitter-sema`).
 - **Tier C started.** `sema-lisp/ui` is live and **`@sema-lang/ui` publishes to npm via OIDC** (`0.1.1` shipped from CI with SLSA provenance). `ui/` is still in the mono until consumers migrate to the npm dep. `website`+`playground` stay in the mono; `pkg` split deferred (see Tier C below).
 - **Build automation.** The `feature/jakefile-migration` work is merged into `main` as a modular `Jakefile` **alongside** the Makefile (split-adapted — no editors module); each split repo (`tree-sitter-sema`, `vscode-sema`, `intellij-sema`, `ui`) carries a standalone `@rooted` Jakefile for future `workspace` meta-repo composition.
-- **Still pending:** migrate `website`/`playground`/`pkg` to consume `@sema-lang/ui` from npm then remove `ui/` from the mono; the main-repo transfer `HelgeSverre/sema` → `sema-lisp/sema` (last); the outside-contributor PR (skipped for now); optional full Makefile→Jake switch (retire Makefile + rewire CI).
+- **`ui/` removed from the mono (2026-07-05).** `website` consumes `@sema-lang/ui` from npm (showcase re-enabled); `ui/` + `jake/ui.jake` deleted. `pkg` still carries its own vendored tmLanguage copy (grammar, not the ui bundle) — unaffected.
+- **Still pending:** the main-repo transfer `HelgeSverre/sema` → `sema-lisp/sema` (last); the outside-contributor PR (skipped for now); optional full Makefile→Jake switch (retire Makefile + rewire CI); rewire `feature/notebook-ui-refactor` to the `@sema-lang/ui` npm dep when it merges.
 
 ## Goal
 
@@ -82,7 +83,9 @@ Decision reached after inventorying the folders. Coupling, not folder count, dri
 
 ### `ui` → **SPLIT** (own repo + npm package), medium priority — *repo stood up 2026-07-05*
 
-> **Status (2026-07-05):** `sema-lisp/ui` live — history-preserving `git filter-repo` (re-seeded from the `feature/notebook-ui-refactor` px-canonical work so it carries the latest components: `sema-editor`, `sema-markdown`, `textarea-undo`), renamed `@sema/ui` → **`@sema-lang/ui`**, CI green (typecheck/lint/283 tests/build), standalone `@rooted` Jakefile added. **Published: `@sema-lang/ui@0.1.0`** (manual bootstrap, no provenance) and the **npm OIDC Trusted Publisher is configured** (`sema-lisp/ui` → `publish-npm.yml`), so every future `v*` tag publishes via CI with provenance. Stray mono tags/branches purged from the repo. **`ui/` is still in the mono.** Remaining: (1) switch `website`/`playground`/`pkg` to consume `@sema-lang/ui` from npm + re-enable the `<sema-code-typer>` showcase, (2) *then* remove `ui/` from the mono (flip `jake/ui.jake` stage-1 to `npm install @sema-lang/ui`).
+> **Status (2026-07-05):** `sema-lisp/ui` live — history-preserving `git filter-repo` (re-seeded from the `feature/notebook-ui-refactor` px-canonical work so it carries the latest components: `sema-editor`, `sema-markdown`, `textarea-undo`), renamed `@sema/ui` → **`@sema-lang/ui`**, CI green (typecheck/lint/283 tests/build), standalone `@rooted` Jakefile added. **Published: `@sema-lang/ui@0.1.0`** (manual bootstrap, no provenance) and the **npm OIDC Trusted Publisher is configured** (`sema-lisp/ui` → `publish-npm.yml`), so every future `v*` tag publishes via CI with provenance. Stray mono tags/branches purged. OIDC validated end-to-end: **`@sema-lang/ui@0.1.1` shipped from CI with SLSA provenance**.
+>
+> **✅ DONE (2026-07-05): `ui/` removed from the mono.** On `main` nothing actually consumed the local bundle (the notebook crate embeds its own Alpine UI; playground/pkg don't use it) — the only consumer was the disabled `<sema-code-typer>` brand showcase. So: `website` now depends on `@sema-lang/ui` (npm) and the showcase is **re-enabled** (lazy `@sema-lang/ui/standalone` + `maze.sample.sema` vendored into `website/` so nothing reaches outside the Vercel website-only upload); `ui/` (87 files) and `jake/ui.jake` deleted. **Caveat:** the unmerged `feature/notebook-ui-refactor` branch still consumes a *local* `ui/` — when it lands it must be rewired to the `@sema-lang/ui` npm dep (the branch's ui code is already preserved in `sema-lisp/ui`).
 
 `ui` is `@sema/ui` (v0.1.0, `private: true`, a web-components/Shiki bundle). Today it's **vendored by copy** into four places (`website/.vitepress/`, `pkg/static/`, `pkg/prototypes/`, and its own `ui/src/grammars/` tmLanguage copy) — the same drift hazard the grammar had. Publishing it as `@sema-lang/ui` and consuming it as a normal npm dep is the real fix: it kills the out-of-folder imports, lets `website`/`playground` depend on it cleanly, and re-enables the `<sema-code-typer>` brand showcase currently commented out in `BrandGuide.vue` (it breaks Vercel's `website/`-only upload by reaching up to the repo-root bundle). **Target repo:** `sema-lisp/ui`; **npm:** `@sema-lang/ui`. Do after the main-repo transfer settles; it's the highest-value Tier C item.
 

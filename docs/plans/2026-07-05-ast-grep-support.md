@@ -2,6 +2,12 @@
 
 **Status: investigated & verified working end-to-end (2026-07-05). No changes to Sema or the grammar required.**
 
+> **Update (same day):** tier 1 is done — docs page at `website/docs/ast-grep.md`
+> (`/docs/ast-grep`), wired into the sidebar with an OG card. Tier 2 is staged —
+> the verified `@ast-grep/lang-sema` package lives in `contrib/ast-grep/lang-sema/`
+> with submission instructions in `contrib/ast-grep/README.md`; the upstream PR to
+> `ast-grep/langs` needs a fork under a human account. Tier 3 (rule pack) remains open.
+
 ast-grep is a tree-sitter-based structural search/lint/rewrite tool. It supports
 arbitrary languages via its *custom language* mechanism: point `sgconfig.yml` at a
 tree-sitter grammar compiled as a dynamic library. Since the canonical grammar in

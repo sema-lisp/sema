@@ -1,0 +1,53 @@
+{
+  "name": "@ast-grep/lang-sema",
+  "version": "0.0.1",
+  "description": "Sema language support for @ast-grep/napi",
+  "main": "index.js",
+  "scripts": {
+    "build": "tree-sitter build -o parser.so",
+    "source": "node nursery.js source",
+    "prepublishOnly": "node nursery.js source",
+    "postinstall": "node postinstall.js",
+    "test": "node nursery.js test"
+  },
+  "files": [
+    "index.js",
+    "index.d.ts",
+    "type.d.ts",
+    "postinstall.js",
+    "src",
+    "prebuilds"
+  ],
+  "keywords": [
+    "ast-grep",
+    "ast-grep-lang",
+    "sema"
+  ],
+  "author": "Helge Sverre <helge.sverre@gmail.com>",
+  "license": "MIT",
+  "dependencies": {
+    "@ast-grep/setup-lang": "0.0.6"
+  },
+  "peerDependencies": {
+    "tree-sitter-cli": "0.26.7"
+  },
+  "peerDependenciesMeta": {
+    "tree-sitter-cli": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "tree-sitter-sema": "github:sema-lisp/tree-sitter-sema#v0.2.0",
+    "@ast-grep/nursery": "0.0.9",
+    "tree-sitter-cli": "0.26.7"
+  },
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "tree-sitter-cli"
+    ]
+  }
+}

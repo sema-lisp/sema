@@ -127,6 +127,20 @@ test-notebook-e2e: build
 	@echo "=== Running notebook E2E tests ==="
 	cd crates/sema-notebook/tests/e2e && npx playwright test
 
+# Vendor the @sema-lang/ui bundle into the notebook crate, where it is embedded
+# via include_str! (single-binary, offline — like the bundled fonts). The library
+# lives in its own repo (sema-lisp/ui) and ships to npm, so the bundle is pulled
+# from the published package (pinned SEMA_UI_VERSION) rather than a local build.
+# Re-run after bumping SEMA_UI_VERSION. Naive copy: only the main bundle is
+# vendored; lazily-loaded Shiki grammar chunks aren't served, so non-`sema` code
+# fences in markdown degrade to unhighlighted (the `sema` grammar is bundled).
+SEMA_UI_VERSION := 0.1.1
+notebook-ui-vendor:
+	mkdir -p crates/sema-notebook/src/ui/vendor
+	curl -fsSL https://unpkg.com/@sema-lang/ui@$(SEMA_UI_VERSION)/dist/sema-ui.js \
+	  -o crates/sema-notebook/src/ui/vendor/sema-ui.js
+	@echo "Vendored @sema-lang/ui@$(SEMA_UI_VERSION) -> crates/sema-notebook/src/ui/vendor/sema-ui.js"
+
 # E2E for the `sema web` dev server: vendor the browser runtime, build the
 # release binary (which embeds it), then drive the real server in a browser.
 test-web-e2e: web-runtime
@@ -325,7 +339,7 @@ deploy-all: playground-build
 
 playground-build:
 	cd crates/sema-wasm && wasm-pack build --target web --out-dir ../../playground/pkg -- --config 'profile.release.package.sema-wasm.opt-level="s"'
-	cd playground && node build.mjs
+	cd playground && npm install && node build.mjs
 
 playground-dev: playground-build
 	cd playground && node scripts/gen-devtools-json.mjs

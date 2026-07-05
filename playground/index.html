@@ -40,7 +40,7 @@
     <span class="logo-sub">Playground</span>
   </a>
   <div class="header-right">
-    <span class="version-badge" id="version">loading…</span>
+    <sema-badge id="version" variant="neutral">loading…</sema-badge>
     <a href="https://sema-lang.com/docs/" class="header-link">Docs</a>
     <a href="https://github.com/HelgeSverre/sema" class="header-link">GitHub</a>
   </div>
@@ -51,72 +51,76 @@
     <div class="sidebar-header">
       <span class="sidebar-title">Examples</span>
     </div>
-    <div class="sidebar-tree" id="sidebar-tree" data-testid="sidebar-tree"></div>
+    <sema-tree id="sidebar-tree" class="sidebar-tree" data-testid="sidebar-tree"></sema-tree>
   </div>
-  <div class="splitter splitter-v" id="splitter-sidebar" data-testid="splitter-sidebar"></div>
+  <sema-splitter id="splitter-sidebar" data-testid="splitter-sidebar" direction="horizontal"></sema-splitter>
   <div class="pane editor-pane">
     <div class="pane-header">
       <span class="pane-title">Source</span>
       <div style="display:flex;align-items:center;gap:0.75rem;">
-        <button class="run-btn fmt-btn" id="fmt-btn" data-testid="fmt-btn" disabled data-tooltip="Format code (sema fmt)">Fmt</button>
-        <button class="run-btn" id="run-btn" data-testid="run-btn" disabled data-tooltip="Run code (⌘+Enter)" data-tooltip-pos="right">
-          Run<span class="shortcut">⌘↵</span>
-        </button>
-        <button class="run-btn debug-btn" id="debug-btn" data-testid="debug-btn" disabled data-tooltip="Debug with breakpoints">Debug</button>
+        <sema-tooltip content="Format code (sema fmt)" placement="bottom">
+          <sema-button variant="secondary" size="sm" id="fmt-btn" data-testid="fmt-btn" disabled>Fmt</sema-button>
+        </sema-tooltip>
+        <sema-tooltip content="Run code (⌘+Enter)" placement="right">
+          <sema-button variant="run" id="run-btn" data-testid="run-btn" shortcut="⌘↵" disabled>Run</sema-button>
+        </sema-tooltip>
+        <sema-tooltip content="Debug with breakpoints" placement="bottom">
+          <sema-button variant="secondary" size="sm" id="debug-btn" data-testid="debug-btn" disabled>Debug</sema-button>
+        </sema-tooltip>
         <div class="debug-controls hidden" id="debug-controls" data-testid="debug-controls">
-          <button class="debug-ctrl-btn" id="dbg-continue" data-tooltip="Continue (F5)">▶</button>
-          <button class="debug-ctrl-btn" id="dbg-step-over" data-tooltip="Step Over (F10)">⏭</button>
-          <button class="debug-ctrl-btn" id="dbg-step-into" data-tooltip="Step Into (F11)">↓</button>
-          <button class="debug-ctrl-btn" id="dbg-step-out" data-tooltip="Step Out (⇧F11)">↑</button>
-          <button class="debug-ctrl-btn dbg-stop" id="dbg-stop" data-tooltip="Stop (Esc)">⬛</button>
+          <sema-tooltip content="Continue (F5)" placement="bottom"><sema-button variant="debug" id="dbg-continue" aria-label="Continue">▶</sema-button></sema-tooltip>
+          <sema-tooltip content="Step Over (F10)" placement="bottom"><sema-button variant="debug" id="dbg-step-over" aria-label="Step Over">⏭</sema-button></sema-tooltip>
+          <sema-tooltip content="Step Into (F11)" placement="bottom"><sema-button variant="debug" id="dbg-step-into" aria-label="Step Into">↓</sema-button></sema-tooltip>
+          <sema-tooltip content="Step Out (⇧F11)" placement="bottom"><sema-button variant="debug" id="dbg-step-out" aria-label="Step Out">↑</sema-button></sema-tooltip>
+          <sema-tooltip content="Stop (Esc)" placement="bottom"><sema-button variant="debug" danger id="dbg-stop" aria-label="Stop">⬛</sema-button></sema-tooltip>
         </div>
       </div>
     </div>
     <div class="editor-wrap">
-      <div class="editor-gutter" id="editor-gutter"></div>
-      <textarea id="editor" data-testid="editor" spellcheck="false" placeholder=";; Write Sema code here…
+      <sema-editor id="editor" testid="editor" line-numbers style="height:100%;width:100%;" placeholder=";; Write Sema code here…
 ;; Press ⌘+Enter or click Run to evaluate
 
 (define (greet name)
   (format &quot;Hello, ~a!&quot; name))
 
-(greet &quot;world&quot;)"></textarea>
-      <pre class="editor-highlight" id="editor-highlight" aria-hidden="true"></pre>
+(greet &quot;world&quot;)"></sema-editor>
     </div>
   </div>
-  <div class="splitter splitter-v" id="splitter-editor" data-testid="splitter-editor"></div>
+  <sema-splitter id="splitter-editor" data-testid="splitter-editor" direction="horizontal"></sema-splitter>
   <div class="right-column">
     <div class="pane output-pane">
       <div class="pane-header">
         <span class="pane-title">Output</span>
-        <button class="run-btn" id="clear-btn" data-testid="clear-btn" style="background: transparent; color: var(--text-dim); border: 1px solid var(--border);" data-tooltip="Clear output" data-tooltip-pos="right">Clear</button>
+        <sema-tooltip content="Clear output" placement="left">
+          <sema-button variant="ghost" size="sm" id="clear-btn" data-testid="clear-btn">Clear</sema-button>
+        </sema-tooltip>
       </div>
       <div id="output" data-testid="output">
         <div class="output-welcome">Initializing Sema interpreter…</div>
       </div>
     </div>
-    <div class="splitter splitter-h" id="splitter-output" data-testid="splitter-output"></div>
+    <sema-splitter id="splitter-output" data-testid="splitter-output" direction="vertical"></sema-splitter>
     <div class="files-panel" id="files-panel" data-testid="files-panel">
       <div class="pane-header files-panel-header">
         <span class="pane-title">Files</span>
         <div style="display:flex;align-items:center;gap:0.5rem;">
           <span class="vfs-stats" id="vfs-stats" data-testid="vfs-stats"></span>
-          <div class="engine-toggle" id="backend-toggle" data-testid="backend-toggle">
-            <label class="active" data-tooltip="In-memory only, lost on refresh"><input type="radio" name="backend" value="memory" checked>Memory</label>
-            <label data-tooltip="localStorage, persists across sessions"><input type="radio" name="backend" value="local">Local</label>
-            <label data-tooltip="sessionStorage, cleared when tab closes"><input type="radio" name="backend" value="session">Session</label>
-            <label data-tooltip="IndexedDB, persistent with larger storage" data-tooltip-pos="right"><input type="radio" name="backend" value="indexeddb">IDB</label>
-          </div>
-          <button class="btn-upload" id="upload-btn" data-tooltip="Upload files into the virtual filesystem">Upload</button>
-          <button class="btn-clear-vfs" id="clear-vfs-btn" data-tooltip="Delete all files from the virtual filesystem" data-tooltip-pos="right">Clear</button>
-          <button class="btn-collapse" id="files-collapse-btn" data-tooltip="Collapse files panel" data-tooltip-pos="right">▾</button>
+          <sema-toggle-group id="backend-toggle" data-testid="backend-toggle" value="memory">
+            <sema-tooltip content="In-memory only, lost on refresh" placement="top"><sema-toggle value="memory">Memory</sema-toggle></sema-tooltip>
+            <sema-tooltip content="localStorage, persists across sessions" placement="top"><sema-toggle value="local">Local</sema-toggle></sema-tooltip>
+            <sema-tooltip content="sessionStorage, cleared when tab closes" placement="top"><sema-toggle value="session">Session</sema-toggle></sema-tooltip>
+            <sema-tooltip content="IndexedDB, persistent with larger storage" placement="top"><sema-toggle value="indexeddb">IDB</sema-toggle></sema-tooltip>
+          </sema-toggle-group>
+          <sema-tooltip content="Upload files into the virtual filesystem" placement="bottom"><sema-button variant="ghost" size="sm" id="upload-btn">Upload</sema-button></sema-tooltip>
+          <sema-tooltip content="Delete all files from the virtual filesystem" placement="left"><sema-button variant="ghost" size="sm" id="clear-vfs-btn">Clear</sema-button></sema-tooltip>
+          <sema-tooltip content="Collapse files panel" placement="right"><sema-button variant="icon" size="sm" id="files-collapse-btn" aria-label="Collapse files panel">▾</sema-button></sema-tooltip>
         </div>
       </div>
       <div class="files-body" id="files-body">
         <div class="file-tree-pane" id="file-tree" data-testid="file-tree">
           <div class="vfs-tree-empty">(empty — run code to create files)</div>
         </div>
-        <div class="splitter splitter-v" id="splitter-filetree" data-testid="splitter-filetree"></div>
+        <sema-splitter id="splitter-filetree" data-testid="splitter-filetree" direction="horizontal"></sema-splitter>
         <div class="file-preview-pane" id="file-viewer" data-testid="file-viewer">
           <div class="viewer-placeholder">Click a file to preview</div>
         </div>
@@ -160,6 +164,9 @@
 })();
 </script>
 
+<!-- @sema/ui web components (vendored). Loaded before app.js so <sema-editor> is
+     defined when app.js queries it. -->
+<script type="module" src="dist/sema-ui.js"></script>
 <script type="module" src="dist/app.js"></script>
 </body>
 </html>

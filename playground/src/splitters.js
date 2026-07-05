@@ -1,4 +1,6 @@
-// Draggable splitter system — persists sizes to localStorage
+// Splitter wiring. The drag/keyboard/ARIA behaviour lives in <sema-splitter>; this
+// module owns the layout — it applies each splitter's resize delta (or absolute
+// keyboard target) to the CSS custom properties that size the panes, and persists.
 
 const STORAGE_KEY = 'sema-playground';
 
@@ -11,26 +13,25 @@ function saveState(patch) {
   localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
 }
 
-function draggable(el, axis, onMove, onEnd) {
-  el.addEventListener('mousedown', (e) => {
-    e.preventDefault();
-    const start = axis === 'x' ? e.clientX : e.clientY;
-    el.classList.add('active');
-    document.body.style.cursor = axis === 'x' ? 'col-resize' : 'row-resize';
-    document.body.style.userSelect = 'none';
-
-    const move = (e) => onMove(( axis === 'x' ? e.clientX : e.clientY) - start);
-    const up = () => {
-      el.classList.remove('active');
-      document.body.style.cursor = '';
-      document.body.style.userSelect = '';
-      document.removeEventListener('mousemove', move);
-      document.removeEventListener('mouseup', up);
-      if (onEnd) onEnd();
-    };
-    document.addEventListener('mousemove', move);
-    document.addEventListener('mouseup', up);
+/**
+ * Wire a <sema-splitter> to a size. `get`/`set` read/apply the current size;
+ * `clamp` bounds it; `persist` saves on release. `invert` flips the delta (a bar
+ * whose pane grows as you drag *up*).
+ */
+function wire(id, { get, set, clamp, persist, invert = false }) {
+  const sp = document.getElementById(id);
+  if (!sp) return;
+  let base = null;
+  sp.setValue(get());
+  sp.addEventListener('sema-resize-start', () => { base = get(); });
+  sp.addEventListener('sema-resize', (e) => {
+    if (base == null) base = get();
+    const d = invert ? -e.detail.delta : e.detail.delta;
+    const size = clamp(e.detail.absolute ? e.detail.delta : base + d);
+    set(size);
+    sp.setValue(size);
   });
+  sp.addEventListener('sema-resize-end', () => { base = null; persist(); });
 }
 
 export function initSplitters() {
@@ -43,66 +44,58 @@ export function initSplitters() {
   let sidebarW = saved.sidebarW ?? 200;
   mainEl.style.setProperty('--sidebar-w', sidebarW + 'px');
 
-  let sidebarStart;
-  draggable(document.getElementById('splitter-sidebar'), 'x',
-    (delta) => {
-      if (sidebarStart == null) sidebarStart = sidebarW;
-      sidebarW = Math.max(120, Math.min(400, sidebarStart + delta));
-      mainEl.style.setProperty('--sidebar-w', sidebarW + 'px');
-      applyEditorRatio();
-    },
-    () => { sidebarStart = null; saveState({ sidebarW }); }
-  );
-
   // ── 2. Editor / right-column ratio ──
   let editorRatio = saved.editorRatio ?? 0.55;
-
   function applyEditorRatio() {
     const available = mainEl.clientWidth - sidebarW - 8;
-    const rightW = Math.round(available * (1 - editorRatio));
-    mainEl.style.setProperty('--right-col-w', rightW + 'px');
+    mainEl.style.setProperty('--right-col-w', Math.round(available * (1 - editorRatio)) + 'px');
   }
   applyEditorRatio();
   window.addEventListener('resize', applyEditorRatio);
-
-  let editorStart;
-  draggable(document.getElementById('splitter-editor'), 'x',
-    (delta) => {
-      if (editorStart == null) editorStart = editorRatio;
-      const available = mainEl.clientWidth - sidebarW - 8;
-      const editorW = Math.max(200, Math.min(available - 200, Math.round(available * editorStart) + delta));
-      editorRatio = editorW / available;
-      applyEditorRatio();
-    },
-    () => { editorStart = null; saveState({ editorRatio }); }
-  );
 
   // ── 3. Output / files height ──
   let filesH = saved.filesH ?? 200;
   filesBody.style.setProperty('--files-h', filesH + 'px');
 
-  let filesStart;
-  draggable(document.getElementById('splitter-output'), 'y',
-    (delta) => {
-      if (filesStart == null) filesStart = filesH;
-      const totalH = rightCol.clientHeight;
-      filesH = Math.max(60, Math.min(totalH - 120, filesStart - delta));
-      filesBody.style.setProperty('--files-h', filesH + 'px');
-    },
-    () => { filesStart = null; saveState({ filesH }); }
-  );
-
   // ── 4. File tree width ──
   let filetreeW = saved.filetreeW ?? 200;
   filesBody.style.setProperty('--filetree-w', filetreeW + 'px');
 
-  let ftStart;
-  draggable(document.getElementById('splitter-filetree'), 'x',
-    (delta) => {
-      if (ftStart == null) ftStart = filetreeW;
-      filetreeW = Math.max(100, Math.min(400, ftStart + delta));
-      filesBody.style.setProperty('--filetree-w', filetreeW + 'px');
-    },
-    () => { ftStart = null; saveState({ filetreeW }); }
-  );
+  wire('splitter-sidebar', {
+    get: () => sidebarW,
+    set: (v) => { sidebarW = v; mainEl.style.setProperty('--sidebar-w', v + 'px'); applyEditorRatio(); },
+    clamp: (v) => Math.max(120, Math.min(400, v)),
+    persist: () => saveState({ sidebarW }),
+  });
+
+  // Editor ratio: the drag delta changes the editor's pixel width; store as a ratio.
+  const editorSp = document.getElementById('splitter-editor');
+  if (editorSp) {
+    let base = null;
+    const startRatio = () => { base = editorRatio; };
+    editorSp.addEventListener('sema-resize-start', startRatio);
+    editorSp.addEventListener('sema-resize', (e) => {
+      if (base == null) base = editorRatio;
+      const available = mainEl.clientWidth - sidebarW - 8;
+      const editorW = Math.max(200, Math.min(available - 200, Math.round(available * base) + e.detail.delta));
+      editorRatio = editorW / available;
+      applyEditorRatio();
+    });
+    editorSp.addEventListener('sema-resize-end', () => { base = null; saveState({ editorRatio }); });
+  }
+
+  wire('splitter-output', {
+    get: () => filesH,
+    set: (v) => { filesH = v; filesBody.style.setProperty('--files-h', v + 'px'); },
+    clamp: (v) => Math.max(60, Math.min(rightCol.clientHeight - 120, v)),
+    persist: () => saveState({ filesH }),
+    invert: true,
+  });
+
+  wire('splitter-filetree', {
+    get: () => filetreeW,
+    set: (v) => { filetreeW = v; filesBody.style.setProperty('--filetree-w', v + 'px'); },
+    clamp: (v) => Math.max(100, Math.min(400, v)),
+    persist: () => saveState({ filetreeW }),
+  });
 }

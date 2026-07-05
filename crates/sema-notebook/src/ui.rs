@@ -19,6 +19,10 @@ pub fn asset(path: &str) -> Option<(String, String)> {
             "application/javascript".to_string(),
         )),
         "notebook.js" => Some((js().to_string(), "application/javascript".to_string())),
+        "vendor/sema-ui.js" => Some((
+            sema_ui_js().to_string(),
+            "application/javascript".to_string(),
+        )),
         _ => None,
     }
 }
@@ -52,4 +56,11 @@ fn alpine_js() -> &'static str {
 
 fn js() -> &'static str {
     include_str!("ui/notebook.js")
+}
+
+/// The `@sema/ui` web-component bundle, vendored from `ui/dist/sema-ui.js` by the
+/// `notebook-ui-vendor` make target. Provides `<sema-code-editor>`,
+/// `<sema-markdown>`, and `<sema-editable-markdown>` for the notebook cells.
+fn sema_ui_js() -> &'static str {
+    include_str!("ui/vendor/sema-ui.js")
 }

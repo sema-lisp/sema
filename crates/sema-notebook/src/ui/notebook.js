@@ -39,13 +39,13 @@ document.addEventListener('alpine:init', () => {
         const data = await this.api('GET', '/api/notebook');
         this.title = data.title || 'Untitled';
         this.canUndo = !!data.can_undo;
-        // Preserve _rendered flags for markdown cells
-        const oldRendered = {};
-        this.cells.forEach(c => { if (c._rendered !== undefined) oldRendered[c.id] = c._rendered; });
+        // The notebook owns the markdown edit<->render toggle (`_rendered`): preserve
+        // it across reloads; new/empty markdown opens in edit, content-bearing renders.
+        const prev = {};
+        this.cells.forEach(c => { if (c._rendered !== undefined) prev[c.id] = c._rendered; });
         this.cells = (data.cells || []).map(c => {
-          // Auto-render markdown cells with content
-          if (c.cell_type === 'markdown' && c.source) {
-            c._rendered = oldRendered[c.id] !== undefined ? oldRendered[c.id] : true;
+          if (c.cell_type === 'markdown') {
+            c._rendered = prev[c.id] !== undefined ? prev[c.id] : !!(c.source && c.source.trim());
           }
           return c;
         });
@@ -110,7 +110,10 @@ document.addEventListener('alpine:init', () => {
         await this.load();
         this.focusedCellId = data.id;
         this.$nextTick(() => {
-          const el = document.querySelector('#cell-' + data.id + ' textarea');
+          // The editable control lives in the editor's shadow root; the host
+          // element's focus() delegates into it. (A new/empty markdown cell opens
+          // in edit mode, so it too renders a <sema-editor>.)
+          const el = document.querySelector('#cell-' + data.id + ' sema-editor');
           if (el) el.focus();
         });
       } catch (e) {
@@ -127,7 +130,10 @@ document.addEventListener('alpine:init', () => {
         await this.load();
         this.focusedCellId = data.id;
         this.$nextTick(() => {
-          const el = document.querySelector('#cell-' + data.id + ' textarea');
+          // The editable control lives in the editor's shadow root; the host
+          // element's focus() delegates into it. (A new/empty markdown cell opens
+          // in edit mode, so it too renders a <sema-editor>.)
+          const el = document.querySelector('#cell-' + data.id + ' sema-editor');
           if (el) el.focus();
         });
       } catch (e) {
@@ -211,8 +217,21 @@ document.addEventListener('alpine:init', () => {
       return this.api('POST', '/api/title', { title: this.title }).catch(() => {});
     },
 
-    // Editor lost focus: persist the source, and return non-empty markdown cells
-    // to their rendered view (blur is the natural "done editing" signal).
+    // ── Markdown edit <-> render (consumer-owned toggle over the primitives) ──
+    // Click a rendered <sema-markdown> to edit its source in a <sema-editor>.
+    editMarkdown(id) {
+      const cell = this.cells.find(c => c.id === id);
+      if (!cell) return;
+      cell._rendered = false;
+      this.focusedCellId = id;
+      this.$nextTick(() => {
+        const ed = document.querySelector('#cell-' + id + ' sema-editor');
+        if (ed) ed.focus();
+      });
+    },
+
+    // Editor lost focus (or Escape): persist, and return a non-empty markdown cell
+    // to its rendered view (blur is the natural "done editing" signal).
     onBlur(cell) {
       this.persistSource(cell);
       if (cell.cell_type === 'markdown' && cell.source.trim()) {
@@ -220,60 +239,15 @@ document.addEventListener('alpine:init', () => {
       }
     },
 
-    // ── Markdown ──
-    editMarkdown(id) {
-      const cell = this.cells.find(c => c.id === id);
-      if (cell) {
-        cell._rendered = false;
-        this.focusedCellId = id;
-        this.$nextTick(() => {
-          const ta = document.querySelector('#cell-' + id + ' textarea');
-          if (ta) ta.focus();
-        });
-      }
-    },
-
-    renderMarkdown(src) {
-      let html = this.escapeHtml(src);
-      html = html.replace(/^#### (.+)$/gm, '<h4>$1</h4>');
-      html = html.replace(/^### (.+)$/gm, '<h3>$1</h3>');
-      html = html.replace(/^## (.+)$/gm, '<h2>$1</h2>');
-      html = html.replace(/^# (.+)$/gm, '<h1>$1</h1>');
-      html = html.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
-      html = html.replace(/\*(.+?)\*/g, '<em>$1</em>');
-      html = html.replace(/`([^`]+)`/g, '<code>$1</code>');
-      html = html.replace(/```[\w]*\n([\s\S]*?)```/g, '<pre><code>$1</code></pre>');
-      html = html.replace(/^- (.+)$/gm, '<li>$1</li>');
-      html = html.replace(/(<li>.*<\/li>\n?)+/g, (m) => '<ul>' + m + '</ul>');
-      html = html.replace(/^(?!<[hup]|<li|<ul|<ol|<pre)(.+)$/gm, '<p>$1</p>');
-      return html;
-    },
-
     // ── Keyboard / Input ──
+    // Shift+Enter renders a markdown cell; in a code cell it evaluates.
     handleShiftEnter(cell) {
       if (cell.cell_type === 'markdown') {
-        cell._rendered = true;
+        this.persistSource(cell);
+        if (cell.source.trim()) cell._rendered = true;
       } else {
         this.evalCell(cell.id);
       }
-    },
-
-    insertTab(el, cell) {
-      const start = el.selectionStart;
-      el.value = el.value.substring(0, start) + '  ' + el.value.substring(el.selectionEnd);
-      el.selectionStart = el.selectionEnd = start + 2;
-      cell.source = el.value;
-      this.autoResize(el);
-    },
-
-    // ── Helpers ──
-    escapeHtml(str) {
-      return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
-    },
-
-    autoResize(el) {
-      el.style.height = 'auto';
-      el.style.height = el.scrollHeight + 'px';
     },
 
     formatMeta(output) {

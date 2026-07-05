@@ -1,7 +1,5 @@
 import init, { SemaInterpreter, formatCode } from '../pkg/sema_wasm.js';
 import { examples } from './examples.js';
-import { highlightSema } from './highlight.js';
-import { TextareaUndo } from './undo.js';
 import { makeVfsHost, BACKENDS } from './vfs-backends.js';
 import { initSplitters } from './splitters.js';
 import { workerEvalEnabled, initWorker, evalViaWorker, cancelWorker, setWorkerOutputHandler } from './worker-client.js';
@@ -13,7 +11,6 @@ let interp = null;
 let workerActive = false;
 // True while a worker eval is in flight (so the Run button acts as Stop).
 let workerRunning = false;
-let activeBtn = null;
 let vfsHost = null;
 let vfsBackend = null;
 let backendName = 'memory';
@@ -54,90 +51,66 @@ if (savedFilesCollapsed) {
 
 // ── Example sidebar ──
 
-const collapsedCategories = new Set();
+// Flat lookup: example id -> { id, name, code }.
+const examplesById = new Map();
+for (const cat of examples) for (const f of cat.files) examplesById.set(f.id, f);
 
+function loadExample(file) {
+  editorEl.value = file.code;
+  editorEl.resetHistory();
+  scheduleHighlight();
+  saveState({ lastExampleId: file.id, editorContent: file.code });
+}
+
+// Examples sidebar — dogfoods <sema-tree>: categories are expandable items, files
+// are selectable leaves. sema-tree owns expand/collapse, keyboard nav, and ARIA.
 function buildSidebar() {
   const tree = document.getElementById('sidebar-tree');
   const saved = loadState();
   const savedCollapsed = saved.collapsed || [];
 
   for (const cat of examples) {
-    const catDiv = document.createElement('div');
-
-    const header = document.createElement('div');
-    header.className = 'tree-category';
-    const chevron = document.createElement('span');
-    chevron.className = 'tree-chevron';
-    header.appendChild(chevron);
-    header.appendChild(document.createTextNode(cat.category));
-
-    const items = document.createElement('div');
-    items.className = 'tree-items';
-
-    // Determine initial collapsed state
-    const isGettingStarted = cat.category === 'Getting Started';
-    let collapsed;
-    if (savedCollapsed.length > 0) {
-      collapsed = savedCollapsed.includes(cat.category);
-    } else {
-      collapsed = !isGettingStarted;
-    }
-
-    if (collapsed) {
-      items.classList.add('collapsed');
-      collapsedCategories.add(cat.category);
-    }
-    chevron.textContent = collapsed ? '▸' : '▾';
-
-    header.onclick = () => {
-      items.classList.toggle('collapsed');
-      const nowCollapsed = items.classList.contains('collapsed');
-      chevron.textContent = nowCollapsed ? '▸' : '▾';
-      if (nowCollapsed) collapsedCategories.add(cat.category);
-      else collapsedCategories.delete(cat.category);
-      saveState({ collapsed: [...collapsedCategories] });
-    };
+    const catItem = document.createElement('sema-tree-item');
+    catItem.setAttribute('label', cat.category);
+    catItem.setAttribute('has-children', '');
+    const collapsed = savedCollapsed.length > 0
+      ? savedCollapsed.includes(cat.category)
+      : cat.category !== 'Getting Started';
+    if (!collapsed) catItem.setAttribute('expanded', '');
 
     for (const file of cat.files) {
-      const btn = document.createElement('button');
-      btn.className = 'tree-file';
-      btn.textContent = file.name;
-      btn.dataset.exampleId = file.id;
-      btn.onclick = () => {
-        editorEl.value = file.code;
-        if (activeBtn) activeBtn.classList.remove('active');
-        btn.classList.add('active');
-        activeBtn = btn;
-        saveState({ lastExampleId: file.id, editorContent: file.code });
-        editorUndo.reset();
-        scheduleHighlight();
-      };
-      items.appendChild(btn);
+      const fileItem = document.createElement('sema-tree-item');
+      fileItem.setAttribute('label', file.name);
+      fileItem.dataset.exampleId = file.id;
+      catItem.appendChild(fileItem);
     }
-
-    catDiv.appendChild(header);
-    catDiv.appendChild(items);
-    tree.appendChild(catDiv);
+    tree.appendChild(catItem);
   }
+
+  // Every click emits sema-tree-select (a category toggles expand first), so one
+  // handler both loads a picked file and persists which categories are collapsed.
+  tree.addEventListener('sema-tree-select', (e) => {
+    const el = e.detail.element;
+    const collapsed = [...tree.querySelectorAll('sema-tree-item[has-children]')]
+      .filter((it) => !it.expanded)
+      .map((it) => it.getAttribute('label'));
+    saveState({ collapsed });
+
+    const id = el?.dataset?.exampleId;
+    if (id && examplesById.has(id)) {
+      tree.querySelectorAll('sema-tree-item').forEach((it) => { it.selected = it === el; });
+      loadExample(examplesById.get(id));
+    }
+  });
 
   // Restore last selected example or editor content
-  if (saved.editorContent) {
-    editorEl.value = saved.editorContent;
-  }
+  if (saved.editorContent) editorEl.value = saved.editorContent;
   if (saved.lastExampleId) {
-    const btn = tree.querySelector(`[data-example-id="${CSS.escape(saved.lastExampleId)}"]`);
-    if (btn) {
-      btn.classList.add('active');
-      activeBtn = btn;
-      // Expand the parent category if collapsed
-      const items = btn.closest('.tree-items');
-      if (items && items.classList.contains('collapsed')) {
-        items.classList.remove('collapsed');
-        const chevron = items.previousElementSibling?.querySelector('.tree-chevron');
-        if (chevron) chevron.textContent = '▾';
-        const catName = items.previousElementSibling?.textContent?.trim();
-        if (catName) collapsedCategories.delete(catName);
-      }
+    const fileItem = tree.querySelector(`sema-tree-item[data-example-id="${CSS.escape(saved.lastExampleId)}"]`);
+    if (fileItem) {
+      fileItem.selected = true;
+      const parent = fileItem.parentElement; // the category <sema-tree-item>
+      if (parent && parent.tagName?.toLowerCase() === 'sema-tree-item') parent.setAttribute('expanded', '');
     }
   }
 }
@@ -167,43 +140,24 @@ function buildVfsTree(dir) {
   return items;
 }
 
-function renderVfsTree(items, depth) {
-  const container = document.createDocumentFragment();
-
+// Dogfoods <sema-tree> like the examples sidebar: directories are expandable
+// parents (expanded by default so files are visible), files are selectable
+// leaves carrying their path. sema-tree owns the chevron, indentation,
+// expand/collapse, keyboard nav, and ARIA.
+function renderVfsItems(items, parent) {
   for (const item of items) {
+    const node = document.createElement('sema-tree-item');
+    node.setAttribute('label', item.name);
     if (item.isDir) {
-      const row = document.createElement('div');
-      row.className = 'vfs-tree-dir';
-      row.style.paddingLeft = (depth * 14 + 8) + 'px';
-
-      const chevron = document.createElement('span');
-      chevron.className = 'tree-chevron';
-      chevron.textContent = '▾';
-      row.appendChild(chevron);
-      row.appendChild(document.createTextNode(item.name + '/'));
-
-      const childContainer = document.createElement('div');
-      childContainer.appendChild(renderVfsTree(item.children, depth + 1));
-
-      row.addEventListener('click', () => {
-        const hidden = childContainer.style.display === 'none';
-        childContainer.style.display = hidden ? '' : 'none';
-        chevron.textContent = hidden ? '▾' : '▸';
-      });
-
-      container.appendChild(row);
-      container.appendChild(childContainer);
+      node.setAttribute('has-children', '');
+      node.setAttribute('expanded', '');
+      renderVfsItems(item.children, node);
     } else {
-      const row = document.createElement('div');
-      row.className = 'vfs-tree-file' + (item.fullPath === activeFilePath ? ' active' : '');
-      row.style.paddingLeft = (depth * 14 + 8) + 'px';
-      row.textContent = item.name;
-      row.addEventListener('click', () => viewFile(item.fullPath));
-      container.appendChild(row);
+      node.dataset.path = item.fullPath;
+      if (item.fullPath === activeFilePath) node.selected = true;
     }
+    parent.appendChild(node);
   }
-
-  return container;
 }
 
 function refreshFileTree() {
@@ -219,7 +173,14 @@ function refreshFileTree() {
     return;
   }
 
-  fileTreeEl.appendChild(renderVfsTree(items, 0));
+  const tree = document.createElement('sema-tree');
+  renderVfsItems(items, tree);
+  // A leaf carries data-path; a directory click just toggles expansion.
+  tree.addEventListener('sema-tree-select', (e) => {
+    const path = e.detail.element?.dataset?.path;
+    if (path) viewFile(path);
+  });
+  fileTreeEl.appendChild(tree);
 }
 
 // ── File Viewer ──
@@ -359,8 +320,8 @@ clearVfsBtn.addEventListener('click', async () => {
 
 const backendToggle = document.getElementById('backend-toggle');
 
-backendToggle.addEventListener('change', async (e) => {
-  const newName = e.target.value;
+backendToggle.addEventListener('sema-change', async (e) => {
+  const newName = e.detail.value;
   if (newName === backendName || !interp) return;
 
   const newBackend = BACKENDS[newName]();
@@ -371,10 +332,7 @@ backendToggle.addEventListener('change', async (e) => {
   vfsBackend = newBackend;
   backendName = newName;
   saveState({ backend: newName });
-
-  backendToggle.querySelectorAll('label').forEach(l => {
-    l.classList.toggle('active', l.querySelector('input').value === newName);
-  });
+  // <sema-toggle-group> owns the selected/active state.
 
   activeFilePath = null;
   fileViewerEl.innerHTML = '<div class="viewer-placeholder">Click a file to preview</div>';
@@ -415,13 +373,7 @@ async function main() {
   const storedBackend = saved.backend ?? 'memory';
   if (BACKENDS[storedBackend]) {
     backendName = storedBackend;
-    const radio = backendToggle.querySelector(`input[value="${storedBackend}"]`);
-    if (radio) {
-      radio.checked = true;
-      backendToggle.querySelectorAll('label').forEach(l => {
-        l.classList.toggle('active', l.querySelector('input').value === storedBackend);
-      });
-    }
+    backendToggle.value = storedBackend; // group reflects the selected toggle
   }
 
   vfsBackend = BACKENDS[backendName]();
@@ -460,6 +412,7 @@ async function run() {
   if (workerActive) {
     workerRunning = true;
     runBtn.textContent = 'Stop';
+    runBtn.removeAttribute('shortcut'); // sema-button renders the shortcut badge; hide it while "Stop"
     runBtn.classList.add('stop-btn');
     statusEl.textContent = 'Running…';
     statusEl.className = 'status-text status-loading';
@@ -486,7 +439,8 @@ async function run() {
 
   if (workerActive) {
     workerRunning = false;
-    runBtn.innerHTML = 'Run<span class="shortcut">⌘↵</span>';
+    runBtn.textContent = 'Run';
+    runBtn.setAttribute('shortcut', '⌘↵'); // restore the badge (rendered by sema-button)
     runBtn.classList.remove('stop-btn');
     const cancelled = result.error && result.error.includes('cancelled');
     statusEl.textContent = result.error ? (cancelled ? 'Stopped' : 'Error') : 'Ready';
@@ -567,7 +521,7 @@ document.getElementById('fmt-btn').addEventListener('click', () => {
     div.textContent = `Format error: ${result.error}`;
     outputEl.appendChild(div);
   } else if (result.formatted !== null) {
-    editorUndo.transact(() => { editorEl.value = result.formatted; });
+    editorEl.value = result.formatted;
     scheduleHighlight();
     debounceSaveEditor();
   }
@@ -578,45 +532,21 @@ document.getElementById('clear-btn').addEventListener('click', () => {
   outputEl.innerHTML = '';
 });
 
-// ── Syntax highlighting ──
+// ── Editor (<sema-editor>: highlighting + gutter + breakpoints + undo built-in) ──
 
 const editorEl = document.getElementById('editor');
-const hlEl = document.getElementById('editor-highlight');
-let hlRaf = 0;
 
-function scheduleHighlight() {
-  cancelAnimationFrame(hlRaf);
-  hlRaf = requestAnimationFrame(() => {
-    hlEl.innerHTML = highlightSema(editorEl.value);
-    updateGutter();
-  });
-}
-
-function syncScroll() {
-  hlEl.scrollTop = editorEl.scrollTop;
-  hlEl.scrollLeft = editorEl.scrollLeft;
-  gutterEl.scrollTop = editorEl.scrollTop;
-  updateLineHighlight();
-}
-
-// ── Line number gutter ──
-
-const gutterEl = document.getElementById('editor-gutter');
-
+// Push breakpoint + current-line state into the editor's gutter. Line numbers and
+// syntax highlighting are rendered by the component from its own value.
 function updateGutter() {
-  const code = editorEl.value;
-  const lineCount = (code.match(/\n/g) || []).length + 1;
-  gutterEl.innerHTML = '';
-  for (let i = 1; i <= lineCount; i++) {
-    const line = document.createElement('div');
-    line.className = 'gutter-line';
-    if (breakpoints.has(i)) line.classList.add('breakpoint');
-    if (currentDebugLine === i) line.classList.add('current-line');
-    line.textContent = i;
-    line.addEventListener('click', () => toggleBreakpoint(i));
-    gutterEl.appendChild(line);
-  }
-  updateLineHighlight();
+  editorEl.breakpoints = Array.from(breakpoints);
+  editorEl.currentLine = currentDebugLine || 0;
+}
+
+// Kept for call-site compatibility: the editor highlights itself, so a refresh
+// only needs to re-sync the gutter markers.
+function scheduleHighlight() {
+  updateGutter();
 }
 
 function setsEqual(a, b) {
@@ -674,21 +604,6 @@ function toggleBreakpoint(lineNum) {
   }
 }
 
-function updateLineHighlight() {
-  const existing = document.querySelector('.debug-line-highlight');
-  if (existing) existing.remove();
-
-  if (currentDebugLine !== null) {
-    const style = getComputedStyle(editorEl);
-    const lineHeight = parseFloat(style.lineHeight) || 21.45;
-    const paddingTop = parseFloat(style.paddingTop) || 20;
-    const hl = document.createElement('div');
-    hl.className = 'debug-line-highlight';
-    hl.style.top = `${paddingTop + (currentDebugLine - 1) * lineHeight - editorEl.scrollTop}px`;
-    editorEl.parentElement.appendChild(hl);
-  }
-}
-
 // ── Debug state machine ──
 
 const debugBtn = document.getElementById('debug-btn');
@@ -705,7 +620,7 @@ function setDebugState(state) {
       runBtn.disabled = false;
       fmtBtn.disabled = false;
       debugControls.classList.add('hidden');
-      editorEl.readOnly = false;
+      editorEl.readonly = false;
       currentDebugLine = null;
       validBreakpointLines = null;
       updateGutter();
@@ -719,7 +634,7 @@ function setDebugState(state) {
       runBtn.disabled = true;
       fmtBtn.disabled = true;
       debugControls.classList.remove('hidden');
-      editorEl.readOnly = true;
+      editorEl.readonly = true;
       document.getElementById('status').textContent = 'Debugging…';
       document.getElementById('status').className = 'status-text status-loading';
       break;
@@ -728,7 +643,7 @@ function setDebugState(state) {
       runBtn.disabled = true;
       fmtBtn.disabled = true;
       debugControls.classList.remove('hidden');
-      editorEl.readOnly = true;
+      editorEl.readonly = true;
       document.getElementById('status').textContent = `Paused at line ${currentDebugLine}`;
       document.getElementById('status').className = 'status-text status-loading';
       break;
@@ -842,10 +757,7 @@ function showDebugError(e) {
 }
 
 function scrollToLine(line) {
-  const lineHeight = parseFloat(getComputedStyle(editorEl).lineHeight) || 21.45;
-  const targetScroll = (line - 1) * lineHeight - editorEl.clientHeight / 2 + lineHeight;
-  editorEl.scrollTop = Math.max(0, targetScroll);
-  syncScroll();
+  editorEl.scrollToLine(line);
 }
 
 function updateVariablesPanel() {
@@ -925,20 +837,18 @@ document.getElementById('dbg-stop').addEventListener('click', () => {
   setDebugState('idle');
 });
 
-// ── Undo/redo ──
-
-const editorUndo = new TextareaUndo(editorEl, { onChange: scheduleHighlight });
+// ── Editor events ──
+// The editor emits `input` (CustomEvent<{value}>) on edits; it also highlights,
+// gutters, scroll-syncs, and manages undo internally. Clicking a gutter line fires
+// `gutter-click` — we own the breakpoint policy (snap to valid lines).
 
 editorEl.addEventListener('input', () => {
-  scheduleHighlight();
   debounceSaveEditor();
   // Invalidate valid breakpoint lines cache when code changes
   validBreakpointLines = null;
   validLinesCode = null;
 });
-editorEl.addEventListener('scroll', syncScroll);
-editorEl.addEventListener('focus', () => hlEl.classList.add('focused'));
-editorEl.addEventListener('blur', () => hlEl.classList.remove('focused'));
+editorEl.addEventListener('gutter-click', (e) => toggleBreakpoint(e.detail.line));
 
 // Debounced editor content save
 let saveTimer = 0;
@@ -981,39 +891,7 @@ editorEl.addEventListener('keydown', (e) => {
     e.preventDefault();
     run();
   }
-  if (e.key === 'Tab') {
-    e.preventDefault();
-    editorUndo.transact(() => {
-      const ta = editorEl;
-      const v = ta.value;
-      const start = ta.selectionStart;
-      const end = ta.selectionEnd;
-      const isDedent = e.shiftKey;
-      const ls = v.lastIndexOf('\n', start - 1) + 1;
-
-      if (start === end) {
-        if (!isDedent) {
-          ta.setRangeText('  ', start, end, 'end');
-        } else {
-          let rm = v.startsWith('  ', ls) ? 2 : v.charAt(ls) === ' ' ? 1 : 0;
-          if (rm) {
-            ta.setRangeText('', ls, ls + rm, 'preserve');
-            ta.setSelectionRange(Math.max(ls, start - rm), Math.max(ls, start - rm));
-          }
-        }
-      } else {
-        const endAdj = (end > start && v[end - 1] === '\n') ? end - 1 : end;
-        const le = v.indexOf('\n', endAdj);
-        const blockEnd = le === -1 ? v.length : le;
-        const block = v.slice(ls, blockEnd);
-        const replacement = isDedent
-          ? block.replace(/^ {1,2}/gm, '')
-          : block.replace(/^/gm, '  ');
-        ta.setRangeText(replacement, ls, blockEnd, 'select');
-      }
-    });
-    scheduleHighlight();
-  }
+  // Tab / Shift+Tab indentation is handled inside <sema-editor>.
 });
 
 // Highlight initial content

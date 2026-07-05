@@ -5,18 +5,12 @@ use axum::{
     response::{IntoResponse, Redirect},
     Json,
 };
-use sea_orm::sea_query::{Expr, OnConflict};
-use sea_orm::*;
+use sea_orm::TransactionTrait;
 use serde::Deserialize;
 use std::sync::Arc;
 
 use super::ApiError;
-use crate::{
-    auth::TokenUser,
-    blob,
-    entity::{dependency, owner, package, package_version, user},
-    AppState,
-};
+use crate::{auth::TokenUser, blob, dal, AppState};
 
 /// Magic bytes every gzip stream starts with (RFC 1952).
 const GZIP_MAGIC: [u8; 2] = [0x1f, 0x8b];
@@ -164,9 +158,7 @@ pub async fn publish(
     }
 
     // Ownership / source checks (reads; the writes below run in one transaction)
-    let existing = package::Entity::find()
-        .filter(package::Column::Name.eq(&name))
-        .one(&state.db)
+    let existing = dal::packages::find_by_name(&state.db, &name)
         .await
         .map_err(|_| ApiError::internal("Database error"))?;
 
@@ -177,28 +169,22 @@ pub async fn publish(
             ));
         }
 
-        let is_owner = owner::Entity::find()
-            .filter(owner::Column::PackageId.eq(pkg.id))
-            .filter(owner::Column::UserId.eq(user.id))
-            .count(&state.db)
+        let is_owner = dal::owners::is_owner(&state.db, pkg.id, user.id)
             .await
-            .unwrap_or(0);
+            .unwrap_or(false);
 
-        if is_owner == 0 {
+        if !is_owner {
             return Err(ApiError::forbidden("You are not an owner of this package"));
         }
     }
 
     let version_str = ver.to_string();
     if let Some(pkg) = &existing {
-        let exists = package_version::Entity::find()
-            .filter(package_version::Column::PackageId.eq(pkg.id))
-            .filter(package_version::Column::Version.eq(&version_str))
-            .count(&state.db)
+        let exists = dal::versions::exists(&state.db, pkg.id, &version_str)
             .await
-            .unwrap_or(0);
+            .unwrap_or(false);
 
-        if exists > 0 {
+        if exists {
             return Err(ApiError::conflict("Version already exists"));
         }
     }
@@ -221,25 +207,16 @@ pub async fn publish(
     let package_id = match &existing {
         Some(pkg) => pkg.id,
         None => {
-            let new_pkg = package::ActiveModel {
-                name: Set(name.clone()),
-                description: Set(metadata.description.clone()),
-                repository_url: Set(metadata.repository_url.clone()),
-                source: Set("upload".into()),
-                created_at: Set(crate::dal::time::now()),
-                ..Default::default()
-            };
-            let pkg = new_pkg
-                .insert(&txn)
-                .await
-                .map_err(|_| ApiError::internal("Failed to create package"))?;
+            let pkg = dal::packages::create(
+                &txn,
+                &name,
+                &metadata.description,
+                metadata.repository_url.clone(),
+            )
+            .await
+            .map_err(|_| ApiError::internal("Failed to create package"))?;
 
-            let new_owner = owner::ActiveModel {
-                package_id: Set(pkg.id),
-                user_id: Set(user.id),
-            };
-            new_owner
-                .insert(&txn)
+            dal::owners::add(&txn, pkg.id, user.id)
                 .await
                 .map_err(|_| ApiError::internal("Failed to create package owner"))?;
 
@@ -247,44 +224,27 @@ pub async fn publish(
         }
     };
 
-    let new_version = package_version::ActiveModel {
-        package_id: Set(package_id),
-        version: Set(version_str.clone()),
-        checksum_sha256: Set(checksum.clone()),
-        blob_key: Set(blob_key),
-        size_bytes: Set(size as i64),
-        sema_version_req: Set(metadata.sema_version_req.clone()),
-        published_at: Set(crate::dal::time::now()),
-        ..Default::default()
-    };
-
-    let version_model = new_version
-        .insert(&txn)
-        .await
-        .map_err(|_| ApiError::internal("Failed to insert version"))?;
+    let version_model = dal::versions::create(
+        &txn,
+        package_id,
+        &version_str,
+        &checksum,
+        blob_key,
+        size as i64,
+        metadata.sema_version_req.clone(),
+    )
+    .await
+    .map_err(|_| ApiError::internal("Failed to insert version"))?;
 
     for dep in &metadata.dependencies {
-        let new_dep = dependency::ActiveModel {
-            version_id: Set(version_model.id),
-            dependency_name: Set(dep.name.clone()),
-            version_req: Set(dep.version_req.clone()),
-            ..Default::default()
-        };
-        new_dep
-            .insert(&txn)
+        dal::deps::insert(&txn, version_model.id, &dep.name, &dep.version_req)
             .await
             .map_err(|_| ApiError::internal("Failed to insert dependency"))?;
     }
 
     // Refresh the description on existing packages (new ones got it at insert)
     if existing.is_some() && !metadata.description.is_empty() {
-        package::Entity::update_many()
-            .col_expr(
-                package::Column::Description,
-                Expr::value(&metadata.description),
-            )
-            .filter(package::Column::Id.eq(package_id))
-            .exec(&txn)
+        dal::packages::update_description(&txn, package_id, &metadata.description)
             .await
             .map_err(|_| ApiError::internal("Failed to update package description"))?;
     }
@@ -321,9 +281,7 @@ pub async fn get_package(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let pkg = package::Entity::find()
-        .filter(package::Column::Name.eq(&name))
-        .one(&state.db)
+    let pkg = dal::packages::find_by_name(&state.db, &name)
         .await
         .ok()
         .flatten()
@@ -331,10 +289,7 @@ pub async fn get_package(
 
     let pkg_id = pkg.id;
 
-    let versions = package_version::Entity::find()
-        .filter(package_version::Column::PackageId.eq(pkg_id))
-        .order_by_desc(package_version::Column::PublishedAt)
-        .all(&state.db)
+    let versions = dal::versions::list_for_package(&state.db, pkg_id)
         .await
         .unwrap_or_default();
 
@@ -353,35 +308,11 @@ pub async fn get_package(
         })
         .collect();
 
-    // Owners via join query
-    let owner_rows = state
-        .db
-        .query_all(Statement::from_sql_and_values(
-            state.db.get_database_backend(),
-            "SELECT u.username FROM users u JOIN owners o ON o.user_id = u.id WHERE o.package_id = $1",
-            [pkg_id.into()],
-        ))
+    let owners = dal::owners::list_usernames(&state.db, pkg_id)
         .await
         .unwrap_or_default();
 
-    let owners: Vec<String> = owner_rows
-        .iter()
-        .filter_map(|r| r.try_get("", "username").ok())
-        .collect();
-
-    // Total downloads
-    let dl_row = state
-        .db
-        .query_one(Statement::from_sql_and_values(
-            state.db.get_database_backend(),
-            "SELECT COALESCE(SUM(count), 0) as cnt FROM download_daily WHERE package_name = $1",
-            [name.clone().into()],
-        ))
-        .await
-        .ok()
-        .flatten();
-
-    let dl_count: i64 = dl_row.and_then(|r| r.try_get("", "cnt").ok()).unwrap_or(0);
+    let dl_count = dal::downloads::total(&state.db, &name).await.unwrap_or(0);
 
     Ok(Json(serde_json::json!({
         "package": {
@@ -403,36 +334,24 @@ pub async fn download(
     State(state): State<Arc<AppState>>,
     Path((name, version)): Path<(String, String)>,
 ) -> Result<axum::response::Response, ApiError> {
-    // Join query to find the version row
-    let row = state
-        .db
-        .query_one(Statement::from_sql_and_values(
-            state.db.get_database_backend(),
-            r#"SELECT pv.blob_key, pv.tarball_url FROM package_versions pv
-               JOIN packages p ON p.id = pv.package_id
-               WHERE p.name = $1 AND pv.version = $2 AND pv.yanked = 0"#,
-            [name.clone().into(), version.clone().into()],
-        ))
+    let target = dal::versions::download_target(&state.db, &name, &version)
         .await
         .ok()
-        .flatten();
-
-    let row = row.ok_or_else(|| ApiError::not_found("Version not found"))?;
+        .flatten()
+        .ok_or_else(|| ApiError::not_found("Version not found"))?;
 
     // Record the download (engine-portable upsert via the DAL).
-    let _ = crate::dal::downloads::record(&state.db, &name, &version).await;
+    let _ = dal::downloads::record(&state.db, &name, &version).await;
 
     // GitHub-linked packages: redirect to upstream tarball
-    let tarball_url: Option<String> = row.try_get("", "tarball_url").ok();
-    if let Some(url) = tarball_url {
+    if let Some(url) = target.tarball_url {
         if !url.is_empty() {
             return Ok(Redirect::temporary(&url).into_response());
         }
     }
 
     // Upload-sourced packages: serve blob from disk
-    let blob_key: String = row.try_get("", "blob_key").unwrap_or_default();
-    let data = blob::read(&state.config.blob_dir, &blob_key)
+    let data = blob::read(&state.config.blob_dir, &target.blob_key)
         .await
         .ok_or_else(|| ApiError::internal("Blob not found on disk"))?;
 
@@ -456,65 +375,25 @@ pub async fn download_stats(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
 ) -> impl IntoResponse {
-    let backend = state.db.get_database_backend();
-
-    // Total downloads
-    let total_row = state
-        .db
-        .query_one(Statement::from_sql_and_values(
-            backend,
-            "SELECT COALESCE(SUM(count), 0) as cnt FROM download_daily WHERE package_name = $1",
-            [name.clone().into()],
-        ))
-        .await
-        .ok()
-        .flatten();
-
-    let total: i64 = total_row
-        .and_then(|r| r.try_get("", "cnt").ok())
-        .unwrap_or(0);
+    let total = dal::downloads::total(&state.db, &name).await.unwrap_or(0);
 
     // Daily counts (last 90 days). The cutoff date is computed in Rust and
     // bound, so no engine-specific date function is needed.
     let cutoff = crate::dal::time::date_days_ago(90);
-    let daily_rows = state
-        .db
-        .query_all(Statement::from_sql_and_values(
-            backend,
-            "SELECT download_date, SUM(count) as count FROM download_daily WHERE package_name = $1 AND download_date >= $2 GROUP BY download_date ORDER BY download_date ASC",
-            [name.clone().into(), cutoff.into()],
-        ))
+    let daily: Vec<serde_json::Value> = dal::downloads::daily_since(&state.db, &name, &cutoff)
         .await
-        .unwrap_or_default();
-
-    let daily: Vec<serde_json::Value> = daily_rows
-        .iter()
-        .filter_map(|r| {
-            let date: String = r.try_get("", "download_date").ok()?;
-            let count: i64 = r.try_get("", "count").ok()?;
-            Some(serde_json::json!({ "date": date, "count": count }))
-        })
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(date, count)| serde_json::json!({ "date": date, "count": count }))
         .collect();
 
-    // Per-version totals
-    let version_rows = state
-        .db
-        .query_all(Statement::from_sql_and_values(
-            backend,
-            "SELECT version, SUM(count) as total FROM download_daily WHERE package_name = $1 GROUP BY version ORDER BY total DESC",
-            [name.clone().into()],
-        ))
-        .await
-        .unwrap_or_default();
-
-    let versions: serde_json::Map<String, serde_json::Value> = version_rows
-        .iter()
-        .filter_map(|r| {
-            let version: String = r.try_get("", "version").ok()?;
-            let total: i64 = r.try_get("", "total").ok()?;
-            Some((version, serde_json::json!(total)))
-        })
-        .collect();
+    let versions: serde_json::Map<String, serde_json::Value> =
+        dal::downloads::per_version(&state.db, &name)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(version, total)| (version, serde_json::json!(total)))
+            .collect();
 
     Json(serde_json::json!({
         "package": name,
@@ -540,56 +419,23 @@ pub async fn search(
     let q = params.q.unwrap_or_default();
     let per_page = params.per_page.unwrap_or(20).min(100);
     let page = params.page.unwrap_or(1).max(1);
-    let pattern = format!("%{q}%");
+    let offset = (page - 1) * per_page;
 
-    let backend = state.db.get_database_backend();
-
-    // Search with LIKE on name and description
-    let rows = state
-        .db
-        .query_all(Statement::from_sql_and_values(
-            backend,
-            r#"SELECT name, description, created_at FROM packages
-               WHERE name LIKE $1 OR description LIKE $2
-               ORDER BY name
-               LIMIT $3 OFFSET $4"#,
-            [
-                pattern.clone().into(),
-                pattern.clone().into(),
-                per_page.into(),
-                ((page - 1) * per_page).into(),
-            ],
-        ))
+    let packages: Vec<serde_json::Value> = dal::packages::search(&state.db, &q, per_page, offset)
         .await
-        .unwrap_or_default();
-
-    let packages: Vec<serde_json::Value> = rows
-        .iter()
-        .filter_map(|r| {
-            let name: String = r.try_get("", "name").ok()?;
-            let description: String = r.try_get("", "description").ok()?;
-            let created_at: String = r.try_get("", "created_at").ok()?;
-            Some(serde_json::json!({
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(name, description, created_at)| {
+            serde_json::json!({
                 "name": name,
                 "description": description,
                 "created_at": created_at,
-            }))
+            })
         })
         .collect();
 
-    let total_row = state
-        .db
-        .query_one(Statement::from_sql_and_values(
-            backend,
-            "SELECT COUNT(*) as cnt FROM packages WHERE name LIKE $1 OR description LIKE $2",
-            [pattern.clone().into(), pattern.into()],
-        ))
+    let total = dal::packages::search_count(&state.db, &q)
         .await
-        .ok()
-        .flatten();
-
-    let total: i64 = total_row
-        .and_then(|r| r.try_get("", "cnt").ok())
         .unwrap_or(0);
 
     Json(serde_json::json!({
@@ -607,60 +453,30 @@ pub async fn yank(
     TokenUser { user, .. }: TokenUser,
     Path((name, version)): Path<(String, String)>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let backend = state.db.get_database_backend();
-
-    // Check ownership via join
-    let owner_row = state
-        .db
-        .query_one(Statement::from_sql_and_values(
-            backend,
-            r#"SELECT COUNT(*) as cnt FROM owners o
-               JOIN packages p ON p.id = o.package_id
-               WHERE p.name = $1 AND o.user_id = $2"#,
-            [name.clone().into(), user.id.into()],
-        ))
-        .await
-        .ok()
-        .flatten();
-
-    let is_owner: i64 = owner_row
-        .and_then(|r| r.try_get("", "cnt").ok())
-        .unwrap_or(0);
-
-    if is_owner == 0 {
-        return Err(ApiError::forbidden("Not an owner"));
-    }
-
-    // Find the package to get its ID for the update
-    let pkg = package::Entity::find()
-        .filter(package::Column::Name.eq(&name))
-        .one(&state.db)
+    // Resolve the package id only if the caller owns it.
+    let package_id = dal::owners::package_id_if_owner(&state.db, &name, user.id)
         .await
         .ok()
         .flatten()
-        .ok_or_else(|| ApiError::not_found("Version not found"))?;
+        .ok_or_else(|| ApiError::forbidden("Not an owner"))?;
 
-    let result = package_version::Entity::update_many()
-        .col_expr(package_version::Column::Yanked, Expr::value(1))
-        .filter(package_version::Column::PackageId.eq(pkg.id))
-        .filter(package_version::Column::Version.eq(&version))
-        .exec(&state.db)
+    let rows_affected = dal::versions::yank(&state.db, package_id, &version)
+        .await
+        .unwrap_or(0);
+
+    if rows_affected > 0 {
+        crate::audit::log(
+            &state.db,
+            &user.username,
+            "yank",
+            Some("version"),
+            Some(&name),
+            Some(&version),
+        )
         .await;
-
-    match result {
-        Ok(r) if r.rows_affected > 0 => {
-            crate::audit::log(
-                &state.db,
-                &user.username,
-                "yank",
-                Some("version"),
-                Some(&name),
-                Some(&version),
-            )
-            .await;
-            Ok(Json(serde_json::json!({"ok": true})))
-        }
-        _ => Err(ApiError::not_found("Version not found")),
+        Ok(Json(serde_json::json!({"ok": true})))
+    } else {
+        Err(ApiError::not_found("Version not found"))
     }
 }
 
@@ -670,25 +486,14 @@ pub async fn list_owners(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
 ) -> impl IntoResponse {
-    let rows = state
-        .db
-        .query_all(Statement::from_sql_and_values(
-            state.db.get_database_backend(),
-            r#"SELECT u.username FROM users u
-               JOIN owners o ON o.user_id = u.id
-               JOIN packages p ON p.id = o.package_id
-               WHERE p.name = $1"#,
-            [name.into()],
-        ))
-        .await
-        .unwrap_or_default();
+    let owners = match dal::packages::find_by_name(&state.db, &name).await {
+        Ok(Some(pkg)) => dal::owners::list_usernames(&state.db, pkg.id)
+            .await
+            .unwrap_or_default(),
+        _ => Vec::new(),
+    };
 
-    let owners: Vec<String> = rows
-        .iter()
-        .filter_map(|r| r.try_get("", "username").ok())
-        .collect();
-
-    Json(serde_json::json!({"owners": owners}))
+    Json(serde_json::json!({ "owners": owners }))
 }
 
 #[derive(Deserialize)]
@@ -702,30 +507,15 @@ pub async fn add_owner(
     Path(name): Path<String>,
     Json(body): Json<OwnerRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let backend = state.db.get_database_backend();
-
     // Check caller is an owner
-    let pkg_row = state
-        .db
-        .query_one(Statement::from_sql_and_values(
-            backend,
-            r#"SELECT p.id FROM packages p
-               JOIN owners o ON o.package_id = p.id
-               WHERE p.name = $1 AND o.user_id = $2"#,
-            [name.clone().into(), user.id.into()],
-        ))
+    let pkg_id = dal::owners::package_id_if_owner(&state.db, &name, user.id)
         .await
         .ok()
-        .flatten();
-
-    let pkg_id: i64 = pkg_row
-        .and_then(|r| r.try_get("", "id").ok())
+        .flatten()
         .ok_or_else(|| ApiError::forbidden("Not an owner or package not found"))?;
 
     // Find the target user
-    let new_owner_id = user::Entity::find()
-        .filter(user::Column::Username.eq(&body.username))
-        .one(&state.db)
+    let new_owner_id = dal::users::find_by_username(&state.db, &body.username)
         .await
         .ok()
         .flatten()
@@ -733,19 +523,7 @@ pub async fn add_owner(
         .ok_or_else(|| ApiError::not_found("User not found"))?;
 
     // INSERT OR IGNORE
-    let new_owner_model = owner::ActiveModel {
-        package_id: Set(pkg_id),
-        user_id: Set(new_owner_id),
-    };
-    let _ = owner::Entity::insert(new_owner_model)
-        .on_conflict(
-            OnConflict::columns([owner::Column::PackageId, owner::Column::UserId])
-                .do_nothing()
-                .to_owned(),
-        )
-        .do_nothing()
-        .exec(&state.db)
-        .await;
+    let _ = dal::owners::add(&state.db, pkg_id, new_owner_id).await;
 
     crate::audit::log(
         &state.db,
@@ -766,51 +544,27 @@ pub async fn remove_owner(
     Path(name): Path<String>,
     Json(body): Json<OwnerRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let backend = state.db.get_database_backend();
-
     // Check caller is an owner
-    let pkg_row = state
-        .db
-        .query_one(Statement::from_sql_and_values(
-            backend,
-            r#"SELECT p.id FROM packages p
-               JOIN owners o ON o.package_id = p.id
-               WHERE p.name = $1 AND o.user_id = $2"#,
-            [name.clone().into(), user.id.into()],
-        ))
+    let pkg_id = dal::owners::package_id_if_owner(&state.db, &name, user.id)
         .await
         .ok()
-        .flatten();
-
-    let pkg_id: i64 = pkg_row
-        .and_then(|r| r.try_get("", "id").ok())
+        .flatten()
         .ok_or_else(|| ApiError::forbidden("Not an owner or package not found"))?;
 
     // Check owner count
-    let owner_count = owner::Entity::find()
-        .filter(owner::Column::PackageId.eq(pkg_id))
-        .count(&state.db)
-        .await
-        .unwrap_or(0);
+    let owner_count = dal::owners::count(&state.db, pkg_id).await.unwrap_or(0);
 
     if owner_count <= 1 {
         return Err(ApiError::bad_request("Cannot remove the last owner"));
     }
 
     // Find target user and delete ownership
-    let target = user::Entity::find()
-        .filter(user::Column::Username.eq(&body.username))
-        .one(&state.db)
+    if let Some(target_user) = dal::users::find_by_username(&state.db, &body.username)
         .await
         .ok()
-        .flatten();
-
-    if let Some(target_user) = target {
-        let _ = owner::Entity::delete_many()
-            .filter(owner::Column::PackageId.eq(pkg_id))
-            .filter(owner::Column::UserId.eq(target_user.id))
-            .exec(&state.db)
-            .await;
+        .flatten()
+    {
+        let _ = dal::owners::remove(&state.db, pkg_id, target_user.id).await;
     }
 
     crate::audit::log(

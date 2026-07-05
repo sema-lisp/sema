@@ -2,12 +2,10 @@
 
 **Status: investigated & verified working end-to-end (2026-07-05). No changes to Sema or the grammar required.**
 
-> **Update (same day):** tier 1 is done — docs page at `website/docs/ast-grep.md`
-> (`/docs/ast-grep`), wired into the sidebar with an OG card, live on
-> sema-lang.com. Tier 2 (`@ast-grep/lang-sema`) was built and verified directly in
-> a fork of `ast-grep/langs` and submitted upstream as a PR — no staged copy is
-> kept in this repo, since the package only needs to exist in the ast-grep/langs
-> monorepo once merged. Tier 3 (rule pack) remains open.
+> **Update (same day):** deferred — see `docs/deferred.md` (AST-GREP-1). The docs
+> page (tier 1) was published then pulled back; tier 2 (`@ast-grep/lang-sema`
+> upstream PR) was attempted and parked after the `ast-grep/langs` monorepo's
+> full install broke on an unrelated package. Revisit per the deferred entry.
 
 ast-grep is a tree-sitter-based structural search/lint/rewrite tool. It supports
 arbitrary languages via its *custom language* mechanism: point `sgconfig.yml` at a

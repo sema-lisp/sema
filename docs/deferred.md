@@ -323,6 +323,42 @@ These are not deferred — they're design questions that need a deliberate decis
 - Add operator controls: pause/resume/cancel run, cancel/restart agent, inspect prompt/result/tool-transcript, export report.
 - Prefer SSE over WebSockets for the first live local dashboard stream.
 
+## AST-GREP-1 — Upstream `@ast-grep/lang-sema` PR to ast-grep/langs
+
+**Found 2026-07-05.** ast-grep works with Sema today via its custom-language
+mechanism (compile `tree-sitter-sema`'s grammar to a `.so`, point `sgconfig.yml`
+at it) — verified end-to-end, no code changes needed on our side. A polished
+`@ast-grep/lang-sema` package (the standard contribution path for
+`@ast-grep/napi`'s `registerDynamicLanguage`) was written and passed its own
+isolated test (nursery.js: parse, `(define $NAME $VAL)` match, metavariable
+capture). Full details: `docs/plans/2026-07-05-ast-grep-support.md`.
+
+**Attempted:** forked `ast-grep/langs`, dropped the package into `packages/sema`,
+tried to verify it the way the monorepo expects — a root `pnpm install`
+(needed because the root `postinstall` recompiles every workspace package).
+That install fails for reasons unrelated to Sema: `tree-sitter-dart`'s native
+Node binding doesn't compile against this machine's Node 26 (V8
+`GetAlignedPointerFromInternalField` API changed), plus flaky npm-registry
+timeouts fetching ~30 unrelated language grammars/binaries.
+
+**Why deferred:** getting a green full-monorepo install wasn't worth fighting
+through an unrelated package's broken native build. The lower-risk path (verify
+`packages/sema` in an isolated standalone npm project outside the monorepo,
+the way the original investigation did, then open the PR and let ast-grep's own
+CI do the full build) was offered but the whole effort was parked for now
+instead. **The `website/docs/ast-grep.md` docs page was pulled from the live
+site and sidebar** (was briefly published) since the upstream package isn't
+actually shipped — no point advertising `@ast-grep/lang-sema` before it exists
+on npm. The CLI-only workflow (manual `.so` build) still works and needs no
+package; it just isn't separately documented right now.
+
+**To resume:** either (a) verify `packages/sema` standalone outside the
+`ast-grep/langs` checkout and open the PR from that verified state, ignoring
+the rest of the monorepo's install health, or (b) retry the full monorepo
+install once `tree-sitter-dart` (or the Node/node-gyp toolchain) is fixed
+upstream. A GitHub fork (`HelgeSverre/langs`) already exists with the package
+staged in `packages/sema` if picking this back up.
+
 ## Notebook: per-cell + per-session LLM cost tracking (status bar)
 
 Accumulate LLM spend for a notebook session and attribute it per cell / per

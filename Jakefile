@@ -19,6 +19,11 @@
 #   jake/fuzz.jake     — cargo-fuzz + in-Sema grammar fuzzer
 #   jake/release.jake  — coverage, mutation testing, publish-list guard
 
+# `@rooted` so the `sema-lisp/workspace` meta-repo can `@import "sema/Jakefile" as
+# sema` and have these recipes' relative paths (jake/*.jake, scripts/, crates/)
+# resolve against this dir. No-op when run standalone from the repo root.
+@rooted
+
 @import "jake/rust.jake"
 @import "jake/docs.jake"
 @import "jake/examples.jake"

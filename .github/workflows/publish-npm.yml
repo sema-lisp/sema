@@ -107,3 +107,21 @@ jobs:
       - name: Publish @sema-lang/sema
         working-directory: packages/sema
         run: npm publish --provenance --access public || echo "Already published, skipping"
+
+      # Standalone TS packages — version-locked to the workspace release, built and
+      # published with provenance via the same OIDC trusted publisher.
+      - name: Publish @sema-lang/llm-proxy
+        working-directory: packages/llm-proxy
+        run: |
+          npm version "${{ steps.version.outputs.version }}" --no-git-tag-version --allow-same-version
+          npm install
+          npm run build
+          npm publish --provenance --access public || echo "Already published, skipping"
+
+      - name: Publish @sema-lang/sema-web
+        working-directory: packages/sema-web
+        run: |
+          npm version "${{ steps.version.outputs.version }}" --no-git-tag-version --allow-same-version
+          npm install
+          npm run build
+          npm publish --provenance --access public || echo "Already published, skipping"

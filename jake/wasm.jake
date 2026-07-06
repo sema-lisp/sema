@@ -3,8 +3,8 @@
 # Two consumers embed a WASM-compiled Sema VM:
 #   1. the `sema web` dev server (crates/sema/src/web/assets, embedded via build.rs)
 #   2. the sema-web-example demo app
-# Both need the same ~8 runtime files. The Makefile duplicated the copy list
-# across `web-runtime` and `sema-web-example-build`; here it's a shared recipe.
+# Both need the same ~8 runtime files, so the copy list is a single shared
+# `_vendor-runtime` recipe rather than duplicated per consumer.
 
 web_runtime_dir = "crates/sema/src/web/assets"
 example_dir = "examples/sema-web-app"

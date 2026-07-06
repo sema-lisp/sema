@@ -235,7 +235,7 @@ Follow the repo convention (network tests `#[ignore]`, deterministic tests alway
    non-socket stream → assert `SemaError` messages. Goes in `eval_test.rs`.
 3. **Async/concurrency** — in `vm_async_test.rs`: two `async/spawn` tasks each `ws/recv` on separate
    connections, plus `async/timeout` cancelling a hung `ws/recv` (proves the abort hook).
-4. **Lint/docs gates** — `make lint`, and a docs page so `make docs-check` passes.
+4. **Lint/docs gates** — `jake lint`, and a docs page so `jake docs-check` passes.
 
 ## 7. Phasing
 

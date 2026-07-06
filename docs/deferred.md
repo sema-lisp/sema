@@ -173,16 +173,13 @@ and the notebook `reset_returns_old_kernel_memory` test.
 
 ---
 
-## TOOL-1 — Migrate the Makefile to a justfile
+## TOOL-1 — Migrate the Makefile to a task runner ✅ RESOLVED (2026-07-06)
 
-**Deferred (revisit later) — 2026-06-22.** The build/dev/deploy automation lives in a
-single growing `Makefile`. The intent is to move it to a [`justfile`](https://github.com/casey/just),
-whose tooling is better suited to a task runner (real argument passing, no `.PHONY`
-bookkeeping, no tab/space footguns, per-recipe shebangs, `just --list` discovery, dotenv
-support). Not urgent — the Makefile works — so parked until there's appetite for the
-one-time port plus updating CI and the docs that reference `make` targets. When it
-happens, mirror the current targets (`build`/`release`/`test`/`lint`/`examples`/
-`smoke-bytecode`/`deploy`/`deploy-all`/…) one-for-one first, then improve.
+Done — migrated to [Jake](https://jakefile.dev) (`helgesverre/jake`, dogfooding our own
+tool) rather than `just`. The `Makefile` is retired; build automation is the modular
+`Jakefile` + `jake/*.jake` (grouped/namespaced recipes, params, `@needs` pre-flight,
+`@confirm` on deploys, incremental `file` recipes). CI installs the jake release binary
+and calls the recipes; the docs that referenced `make` targets were swept to `jake`.
 
 ## TOOL-2 — Speed up CI drastically (it's painful)
 
@@ -221,7 +218,7 @@ unstarted. The implementation plan was archived to `docs/plans/archive/2026-06-2
 Remaining work:
 
 - **Record a tape corpus** for the playground `llm-tools` examples and the agentic test
-  suite; wire `SEMA_LLM_CASSETTE_MODE=replay` into `make test` so the suite runs green with
+  suite; wire `SEMA_LLM_CASSETTE_MODE=replay` into `jake test` so the suite runs green with
   no API keys. (The keyless oracle today is the scripted `FakeProvider`; cassettes would add
   real-response replay on top.)
 - **Open questions** carried from the plan: a `NullProvider` inner so pure-replay needs zero

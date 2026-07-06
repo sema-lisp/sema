@@ -774,7 +774,7 @@ cargo test
 **Step 5: Run lints**
 
 ```bash
-make lint
+jake lint
 ```
 
 Expected: all pass. Fix any failures before committing.

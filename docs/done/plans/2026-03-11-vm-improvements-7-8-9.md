@@ -328,7 +328,7 @@ Run: `cargo check 2>&1 | head -50`
 
 - [ ] **Step 12: Run the full test suite**
 
-Run: `make test`
+Run: `jake test`
 
 Expected: All tests pass. This is a pure refactor — no behavioral changes.
 
@@ -616,7 +616,7 @@ Key locations (all need arm splits):
 
 - [ ] **Step 14: Run the full test suite**
 
-Run: `make test`
+Run: `jake test`
 
 Expected: All tests pass.
 
@@ -959,7 +959,7 @@ Expected: All pass.
 
 - [ ] **Step 15: Run the full test suite**
 
-Run: `make test`
+Run: `jake test`
 
 Expected: All tests pass.
 

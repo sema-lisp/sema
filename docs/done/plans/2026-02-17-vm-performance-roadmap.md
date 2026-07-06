@@ -593,7 +593,7 @@ hyperfine --runs 5 --warmup 1 --style full \
   -n "janet: nqueens" "janet examples/benchmarks/nqueens.janet"
 
 # Profile with samply if regression or unexpected result
-make profile PROFILE_BENCH=tak PROFILE_MODE=vm
+jake bench.profile PROFILE_BENCH=tak PROFILE_MODE=vm
 ```
 
 Record results in `docs/benchmarks/vm-optimization-log.md` with git SHA, date, and phase.

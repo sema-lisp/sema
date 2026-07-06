@@ -563,7 +563,7 @@ Expected: All tests pass (existing + 17 new PDF tests)
 
 **Step 2: Run lint**
 
-Run: `make lint`
+Run: `jake lint`
 Expected: No warnings or errors
 
 **Step 3: Fix any issues found, then commit if needed**
@@ -796,7 +796,7 @@ Expected: All tests pass
 
 **Step 2: Run lint**
 
-Run: `make lint`
+Run: `jake lint`
 Expected: Clean
 
 **Step 3: Test the example again (clean state)**

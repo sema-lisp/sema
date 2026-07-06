@@ -180,11 +180,11 @@ Full detail in `spikes/sema-web-devserver/README.md`. Summary:
 
 ## 11. Milestones
 
-**Shipped 2026-07-02:** M0 (asset embedding via `make web-runtime` + build.rs
+**Shipped 2026-07-02:** M0 (asset embedding via `jake wasm.web-runtime` + build.rs
 `web_runtime` cfg), M1 (the `Web` subcommand + `dev_server.sema`: serve embedded
 runtime + synthesized import-map shell + app source; short-poll hot reload;
 native LLM proxy speaking the production protocol; browser error overlay;
-auto-open), M4 (`website/docs/web/dev-server.md`). Gates: `make test-web-e2e`
+auto-open), M4 (`website/docs/web/dev-server.md`). Gates: `jake test.web-e2e`
 (Playwright render + hot reload), `crates/sema/tests/web_dev_server_test.rs`
 (serving contract + live proxy). **M2 Tier 1 shipped
 (2026-07-02):** the SSE channel is now unbounded + non-blocking, fixing the

@@ -8,7 +8,7 @@
 
 LSP testing today is three disconnected layers:
 
-1. **Python pytest suite** (`crates/sema-lsp/tests/e2e/`, 17 files, ~46 tests, pytest-lsp): per-feature happy paths. Weaknesses: `asyncio.sleep(0.3)` races after every didOpen (`helpers.py:33`), a manual kill-timeout workaround for tower-lsp#399 (`conftest.py:57-66`), and **not run in CI** (only `make test-lsp`; ci.yml never invokes pytest).
+1. **Python pytest suite** (`crates/sema-lsp/tests/e2e/`, 17 files, ~46 tests, pytest-lsp): per-feature happy paths. Weaknesses: `asyncio.sleep(0.3)` races after every didOpen (`helpers.py:33`), a manual kill-timeout workaround for tower-lsp#399 (`conftest.py:57-66`), and **not run in CI** (only `jake test.lsp`; ci.yml never invokes pytest).
 2. **Rust smoke test** (`crates/sema-lsp/tests/lsp_e2e_test.rs`): spawns the built binary over stdio with hand-rolled JSON-RPC framing; one test covering capability advertisement + formatting + selectionRange round-trips.
 3. **IntelliJ plugin integration tests** (active work, LSP4IJ + Starter framework): real-client coverage, but JetBrains-specific and slow.
 
@@ -56,7 +56,7 @@ Key architectural facts that shape the design:
 2. **Feature migration** — port all Python feature tests to Layer-1 fixtures with insta snapshots; small `.sema` fixture corpus (unicode, f-strings, regex literals, error-recovery cases). *Exit: Python suite deletable.*
 3. **Compliance suite** — capability matrix, lifecycle ordering, cancel, unknown methods/notifications, strict typed deserialization.
 4. **Encoding + robustness** — UTF-16 astral wire tests, reader-span differential checks, framing fuzz cases, out-of-range no-panic sweep.
-5. **CI hardening + retirement** — delete Python e2e dir, update `make test-lsp`, verify ci.yml coverage, document fixture format.
+5. **CI hardening + retirement** — delete Python e2e dir, update `jake test.lsp`, verify ci.yml coverage, document fixture format.
 
 ## Tools
 

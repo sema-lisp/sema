@@ -6,7 +6,7 @@
 
 ## Implemented (final decisions)
 
-- **Embed shape:** full set — `make update-pricing` (`scripts/update-pricing.sh`) downloads
+- **Embed shape:** full set — `jake update-pricing` (`scripts/update-pricing.sh`) downloads
   models.dev `api.json`, normalizes to our flat schema keeping *every* vendor listing (canonical
   first-party flagged per id), and writes `crates/sema-llm/src/pricing-data.json` (~1 MB, 2,400+
   ids / 4,900+ listings), embedded via `include_str!`.
@@ -99,7 +99,7 @@ research flips the earlier B1 recommendation → **single-source on models.dev**
 
 ### 1. Generator (offline, mirrors the existing builtin-docs regen pattern)
 
-Add `make update-pricing` (cf. `make docs` at `Makefile:50` + its `git diff --exit-code` check):
+Add `jake update-pricing` (cf. `jake docs` at `Makefile:50` + its `git diff --exit-code` check):
 
 - Download `models.dev/api.json`.
 - Flatten + normalize to our existing flat schema
@@ -138,7 +138,7 @@ generator can widen the provider allowlist trivially if we want more later.
   generator script does, so we can share the logic (or just reuse the script's flat output shape
   and have Rust parse models.dev natively only on the runtime path).
 - **(B3) Drop runtime fetch entirely.** Rely on the embedded models.dev snapshot refreshed via
-  `make update-pricing` per release. Simplest; no runtime network, no 2.36 MB parse. Prices are
+  `jake update-pricing` per release. Simplest; no runtime network, no 2.36 MB parse. Prices are
   only as fresh as the last build — acceptable since prices move slowly and the embed already
   comes from the best source.
 
@@ -156,7 +156,7 @@ Either way the hand-maintained `match` **and** the llm-prices.com fetch are remo
 
 ## Scope / effort
 
-- Generator script + `make update-pricing` target: ~half day.
+- Generator script + `jake update-pricing` target: ~half day.
 - Embed plumbing (`include_str!` + `OnceLock`, delete `match`, wire as layer 3): ~half day.
 - Tests: snapshot parses; known default models resolve a non-`None` price; precedence ordering;
   offline path returns embed not `None`. ~quarter day.

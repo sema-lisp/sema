@@ -47,7 +47,7 @@ SKIP_FILES=(
                                   # (a flaky endpoint / 503 must not fail the
                                   # smoke run). Same rationale as
                                   # build-examples.sh. HTTP is covered by the
-                                  # ignored integration suite (make test-http).
+                                  # ignored integration suite (jake test.http).
   "examples/glados-downloads.sema" # LLM demo: calls llm/extract + llm/auto-
                                   # configure, which hit a provider (e.g. Ollama
                                   # at localhost:11434). Passes only where a
@@ -55,7 +55,7 @@ SKIP_FILES=(
   "examples/llm/async-stress-live.sema" # LIVE async/streaming stress against
                                   # real provider APIs (real spend, minutes of
                                   # network). Manual verification gate for the
-                                  # true-async work — run via `make llm-stress`.
+                                  # true-async work — run via `jake llm-stress`.
 )
 
 is_skipped() {

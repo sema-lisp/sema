@@ -26,7 +26,7 @@ A modular `Jakefile` + `jake/*.jake` set porting the whole Makefile (96 recipes,
 | `jake/release.jake` | `release` | coverage, mutation testing, publish-list guard |
 
 The daily drivers (`build`, `test`, `lint`, `fmt`, `run`) are imported **un-namespaced** so muscle
-memory carries over (`jake build` == `make build`). Everything else is namespaced to keep `jake -l`
+memory carries over (`jake build` == `jake build`). Everything else is namespaced to keep `jake -l`
 navigable.
 
 ## Why Jake is a real improvement here (verified)

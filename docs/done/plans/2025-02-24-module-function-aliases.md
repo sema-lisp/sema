@@ -390,7 +390,7 @@ Expected: ALL PASS, no regressions
 
 **Step 2: Run clippy**
 
-Run: `make lint`
+Run: `jake lint`
 Expected: No warnings
 
 **Step 3: Final commit if any fixups needed**

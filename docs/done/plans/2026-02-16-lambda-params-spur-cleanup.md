@@ -490,7 +490,7 @@ Run: `cargo build 2>&1 | tail -5`
 Run: `cargo test 2>&1 | tail -20`
 Expected: 0 compile errors, all 712+ tests pass.
 
-Run: `make lint 2>&1 | tail -10`
+Run: `jake lint 2>&1 | tail -10`
 Expected: clean (no fmt or clippy warnings).
 
 ---
@@ -504,7 +504,7 @@ Expected: all tests pass.
 
 **Step 2: Run lint**
 
-Run: `make lint 2>&1 | tail -10`
+Run: `jake lint 2>&1 | tail -10`
 Expected: clean.
 
 **Step 3: Quick smoke test**

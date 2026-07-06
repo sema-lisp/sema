@@ -10,7 +10,7 @@
 # build time via include_str! and refresh it with minor patch releases rather than
 # fetching at runtime. Run this, review the diff, and commit.
 #
-# Usage: make update-pricing   (or: scripts/update-pricing.sh)
+# Usage: jake update-pricing   (or: scripts/update-pricing.sh)
 
 set -euo pipefail
 

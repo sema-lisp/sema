@@ -68,7 +68,7 @@ This is discussed in detail in [The Circular Dependency Problem](#the-circular-d
 | **sema-notebook** | Notebook interface       | `.sema-nb` JSON format, evaluation engine, HTTP server with REST API, embedded browser UI, Markdown export                                 |
 | **sema-wasm**  | WASM bindings             | Browser playground bindings, JS interop via `wasm-bindgen`                                                                                |
 | **sema-mcp**    | MCP server                      | Model Context Protocol server exposing Sema eval/build/notebook tools (`sema mcp`)                                                         |
-| **sema-docs**   | Doc generation (internal)       | Builtin-docs index generator (`make docs`); not shipped as a binary                                                                       |
+| **sema-docs**   | Doc generation (internal)       | Builtin-docs index generator (`jake docs`); not shipped as a binary                                                                       |
 | **sema-workflow** | Dynamic-workflow runtime      | `WorkflowCtx`, `WorkflowEvent`, JSONL run-directory journal, `--resume` via memo sidecar; leaf crate — depends only on `sema-core` + `sema-otel` |
 | **sema**        | Binary                          | clap CLI, reedline REPL (highlighter / hinter / inspector live in `crates/sema/src/repl/`), `InterpreterBuilder` embedding API             |
 

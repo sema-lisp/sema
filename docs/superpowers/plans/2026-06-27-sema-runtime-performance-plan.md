@@ -729,7 +729,7 @@ Use a small test fixture or inline byte data.
 
 ```bash
 cargo test -p sema
-make build-pgo
+jake build-pgo
 SEMA_SKIP_BUILD=1 ./benchmarks/1brc/run-native-benchmarks.py benchmarks/data/bench-10m.txt
 ```
 
@@ -1175,7 +1175,7 @@ Expose `(gc/collect)` as a stdlib function in `crates/sema-stdlib/src/meta.rs` o
 
 ```bash
 cargo test
-make build-pgo
+jake build-pgo
 SEMA_SKIP_BUILD=1 ./benchmarks/1brc/run-native-benchmarks.py benchmarks/data/bench-10m.txt
 ```
 
@@ -1278,7 +1278,7 @@ Adjust `bytes/parse-int10` to produce tenths-of-degrees if the input has one dec
 **Command:**
 
 ```bash
-make build-pgo
+jake build-pgo
 SEMA_SKIP_BUILD=1 ./benchmarks/1brc/run-native-benchmarks.py benchmarks/data/bench-10m.txt
 ```
 

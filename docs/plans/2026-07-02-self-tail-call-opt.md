@@ -119,4 +119,4 @@ compiled `Function`, which executes only as that closure's frame — so
 - serialize round-trip of a chunk containing `SelfTailCall`.
 - GC: 100-rep pure counter named-let births no cycle candidate / no leak
   (extend `gc_stress_test.rs`).
-- `make bench-vm` closure + numeric suites; `gc_stress_test` stays green.
+- `jake bench.run` closure + numeric suites; `gc_stress_test` stays green.

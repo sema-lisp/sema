@@ -130,7 +130,7 @@ Expected: All pass
 
 **Step 4: Benchmark**
 
-Run: `make bench-vm`
+Run: `jake bench.run`
 Expected: Measurable improvement on tak (target: 15-30% faster)
 
 **Step 5: Commit**
@@ -224,7 +224,7 @@ Expected: All pass (including `test_vm_counter_closure`, `test_vm_shared_mutable
 
 **Step 5: Benchmark**
 
-Run: `make bench-vm`
+Run: `jake bench.run`
 Expected: Significant improvement on tak (31.8M fewer heap allocations)
 
 **Step 6: Commit**

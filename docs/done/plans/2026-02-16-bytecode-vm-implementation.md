@@ -15,7 +15,7 @@
 - `cargo test -p sema-vm` — unit tests for compiler + VM
 - `cargo test -p sema --test integration_test` — all 545 integration tests
 - `cargo test` — all 712 tests
-- `make lint` — `cargo fmt --check` + `cargo clippy -- -D warnings`
+- `jake lint` — `cargo fmt --check` + `cargo clippy -- -D warnings`
 - Benchmark: `cargo run --release -- benchmarks/1brc/1brc.sema -- benchmarks/data/bench-1m.txt`
 
 ---
@@ -204,7 +204,7 @@ pub use opcodes::Op;
 
 Add `"crates/sema-vm"` to the `[workspace] members` list and add `sema-vm = { path = "crates/sema-vm" }` to `[workspace.dependencies]`.
 
-**Step 6: Run `cargo build -p sema-vm` and `make lint`**
+**Step 6: Run `cargo build -p sema-vm` and `jake lint`**
 
 Expected: compiles clean, no warnings.
 
@@ -261,7 +261,7 @@ For each `Const` opcode, show the constant value from the pool as a comment. For
 
 **Step 4: Verify**
 
-Run `cargo test -p sema-vm` and `make lint`. All tests pass, lint clean.
+Run `cargo test -p sema-vm` and `jake lint`. All tests pass, lint clean.
 
 **Step 5: Commit**
 
@@ -567,7 +567,7 @@ mod tests {
 }
 ```
 
-**Step 4: Run `cargo test -p sema-vm` and `make lint`**
+**Step 4: Run `cargo test -p sema-vm` and `jake lint`**
 
 **Step 5: Commit**
 
@@ -682,7 +682,7 @@ fn test_resolve_captured_mutated() {
 }
 ```
 
-**Step 4: Run `cargo test -p sema-vm` and `make lint`**
+**Step 4: Run `cargo test -p sema-vm` and `jake lint`**
 
 **Step 5: Commit**
 
@@ -767,7 +767,7 @@ fn test_compile_lambda() {
 }
 ```
 
-**Step 4: Run `cargo test -p sema-vm` and `make lint`**
+**Step 4: Run `cargo test -p sema-vm` and `jake lint`**
 
 **Step 5: Commit**
 
@@ -955,7 +955,7 @@ fn test_vm_tail_call() {
 }
 ```
 
-**Step 6: Run `cargo test -p sema-vm` and `make lint`**
+**Step 6: Run `cargo test -p sema-vm` and `jake lint`**
 
 **Step 7: Commit**
 
@@ -1017,7 +1017,7 @@ fn test_native_string_length() {
 }
 ```
 
-**Step 5: Run `cargo test -p sema-vm` and `make lint`**
+**Step 5: Run `cargo test -p sema-vm` and `jake lint`**
 
 **Step 6: Commit**
 
@@ -1081,7 +1081,7 @@ fn test_shared_mutable_upvalue() {
 }
 ```
 
-**Step 4: Run `cargo test -p sema-vm` and `make lint`**
+**Step 4: Run `cargo test -p sema-vm` and `jake lint`**
 
 **Step 5: Commit**
 
@@ -1182,7 +1182,7 @@ fn test_compiled_arithmetic() {
 }
 ```
 
-**Step 7: Run `cargo test` and `make lint`**
+**Step 7: Run `cargo test` and `jake lint`**
 
 **Step 8: Commit**
 
@@ -1230,7 +1230,7 @@ Port the most critical integration tests to verify compiled execution. Start wit
 - List operations (map, filter, fold)
 - Define-record-type
 
-**Step 3: Run `cargo test` and `make lint`**
+**Step 3: Run `cargo test` and `jake lint`**
 
 **Step 4: Commit**
 

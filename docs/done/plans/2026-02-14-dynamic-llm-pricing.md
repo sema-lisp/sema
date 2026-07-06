@@ -648,7 +648,7 @@ m if m.contains("moonshot") => Some((0.50, 1.50)),
 Run: `cargo test -p sema-llm -- pricing::tests -v`
 Expected: All PASS.
 
-Run: `make lint`
+Run: `jake lint`
 Expected: PASS.
 
 **Step 4: Commit**
@@ -844,7 +844,7 @@ Expected: All tests PASS.
 
 **Step 2: Run lint**
 
-Run: `make lint`
+Run: `jake lint`
 Expected: PASS (fmt-check + clippy -D warnings).
 
 **Step 3: Manual smoke test**

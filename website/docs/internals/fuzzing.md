@@ -67,9 +67,9 @@ Arithmetic (`+ - *` incl. variadic, `min`/`max`, `mod`, `abs`, unary `-`, `expt`
 ## Running it
 
 ```bash
-make fuzz-grammar                          # default sweep (random seed)
-make fuzz-grammar SEED=123 N=20000 DEPTH=6 # pinned, larger, deeper
-make fuzz-grammar-emit                     # print sample generated programs
+jake fuzz.grammar                          # default sweep (random seed)
+jake fuzz.grammar SEED=123 N=20000 DEPTH=6 # pinned, larger, deeper
+jake fuzz.grammar-emit                     # print sample generated programs
 ```
 
 Exit status: `0` all clear, `1` a deterministic value/round-trip mismatch (the program prints the offending form, expected, actual, and the reproducing seed), `2` a hard crash (the driver prints the reproducing seed).

@@ -211,7 +211,7 @@ enum TaskState {
    - Do: Remove the "Async concurrency" dual_eval_tests! and dual_eval_error_tests! blocks (last ~195 lines).
    - Verify: `cargo test -p sema --test dual_eval_test`
 
-**Phase exit criteria**: `make test` passes with all async functionality temporarily stubbed out. No `YieldReason` or `SemaError::Yield` anywhere in the codebase. No `unsafe impl Send/Sync` for async types.
+**Phase exit criteria**: `jake test` passes with all async functionality temporarily stubbed out. No `YieldReason` or `SemaError::Yield` anywhere in the codebase. No `unsafe impl Send/Sync` for async types.
 
 ### Phase 2: VM yield mechanism and scheduler
 
@@ -278,7 +278,7 @@ enum TaskState {
    - Do: Ensure default (VM) runs async correctly. Ensure `--tw` gives clear error on async. Wire up scheduler initialization in the VM execution path.
    - Verify: `cargo run -- -e "(let ((p (async (+ 1 2)))) (await p))"` (no flag needed — VM is default)
 
-**Phase exit criteria**: All 62 async tests pass (VM-only). New side-effect correctness tests pass. `make test` fully green. `--tw` gives clear error on async forms.
+**Phase exit criteria**: All 62 async tests pass (VM-only). New side-effect correctness tests pass. `jake test` fully green. `--tw` gives clear error on async forms.
 
 ### Phase 4: Documentation and cleanup
 
@@ -298,7 +298,7 @@ enum TaskState {
    - Do: Either close PR #29 and open a new PR, or force-push the new implementation onto the same branch
    - Verify: PR review
 
-**Phase exit criteria**: All documentation updated. `make all` passes. PR ready for review.
+**Phase exit criteria**: All documentation updated. `jake all` passes. PR ready for review.
 
 ---
 

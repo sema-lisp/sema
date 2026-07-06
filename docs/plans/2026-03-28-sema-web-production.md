@@ -970,11 +970,11 @@ All subsequent work depends on this. Cannot parallelize.
 - Add `Token::Deref` to lexer, parser dispatch in `crates/sema-reader/src/reader.rs`
 - Add tests: `@x` → `(deref x)`, `@(+ 1 2)` → `(deref (+ 1 2))`
 - Remove `assert!(read("@").is_err())` test
-- Verify: `make test` — all Rust tests pass including new `@` tests
+- Verify: `jake test` — all Rust tests pass including new `@` tests
 
 **1c. Verify `put!`/`update!` are safe names** (quick grep, no agent needed)
 
-**Checkpoint**: `make test` passes, `npm install` works from root.
+**Checkpoint**: `jake test` passes, `npm install` works from root.
 
 ---
 
@@ -1089,7 +1089,7 @@ All docs are independent pages. Launch up to 3 agents in parallel:
 
 - Update CHANGELOG.md with all changes
 - Bump versions to 2.0.0 for sema-web, minor bump for llm-proxy
-- Full verification: `make test && npm run build && npm test && cd packages/sema-web && npm run test:e2e`
+- Full verification: `jake test && npm run build && npm test && cd packages/sema-web && npm run test:e2e`
 - Code review via superpowers:code-reviewer agent
 
 ---

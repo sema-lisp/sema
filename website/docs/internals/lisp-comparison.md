@@ -133,7 +133,7 @@ This is one workload. Different benchmarks would reorder things:
 
 - **Dataset:** 10,000,000 rows (~124 MiB), 40 weather stations, from the [1BRC spec](https://github.com/gunnarmorling/1brc).
 - **Environment:** macOS 15.6 / Apple M2 Max, native Homebrew runtimes (June 2026). Sema 1.19.2 (PGO). Gauche 0.9.15. Others are the current Homebrew formulae / downloaded binaries.
-- **Measurement:** wall-clock, best of 3 consecutive runs per dialect, via `benchmarks/1brc/run-native-benchmarks.py` (all dialects measured together in one session). Sema is timed as the prebuilt PGO binary (`make build-pgo`, run with `SEMA_SKIP_BUILD=1`).
+- **Measurement:** wall-clock, best of 3 consecutive runs per dialect, via `benchmarks/1brc/run-native-benchmarks.py` (all dialects measured together in one session). Sema is timed as the prebuilt PGO binary (`jake build-pgo`, run with `SEMA_SKIP_BUILD=1`).
 - **Verification:** all fifteen implementations produce byte-identical normalized output (sorted stations, 1-decimal rounding) — checked every run.
 - **Implementations:** each *optimized* entry uses a comparable best effort (hand-rolled int×10 parser; block/byte I/O where the runtime benefits); the *simple* table uses each dialect's naive idiom. PicoLisp is omitted (no native Homebrew formula).
 
@@ -144,7 +144,7 @@ This is one workload. Different benchmarks would reorder things:
 python3 benchmarks/1brc/generate-test-data.py 10000000 benchmarks/data/bench-10m.txt
 
 # Build the PGO Sema binary, then run the native matrix against it
-make build-pgo
+jake build-pgo
 SEMA_SKIP_BUILD=1 ./benchmarks/1brc/run-native-benchmarks.py benchmarks/data/bench-10m.txt
 ```
 

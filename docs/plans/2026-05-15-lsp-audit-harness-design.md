@@ -108,7 +108,7 @@ For invariants like "reference count from LSP matches reference count from AST w
 Stratified sampling rather than every byte offset (millions of offsets for a 10k-line file): every identifier start, every `(`, every `)`, every string boundary, plus random offsets. Cap ~500 probes per file.
 
 ### CI integration
-New `make test-lsp-harness` target. Runs in CI on every PR. Excluded from default `make test` because it's slow (~minutes for 143 files × N capabilities).
+New `jake test.lsp-harness` target. Runs in CI on every PR. Excluded from default `jake test` because it's slow (~minutes for 143 files × N capabilities).
 
 ## Editor verification layer
 
@@ -146,7 +146,7 @@ The audit deliverable is the harness + the findings list. Fixes are a separate b
 Phase complete when:
 1. Harness runs green on all 143 `examples/` files (zero invariant violations).
 2. All adversarial fixtures pass (responses match `.expected.json`).
-3. `make test-lsp-harness` integrated into CI.
+3. `jake test.lsp-harness` integrated into CI.
 4. vscode + helix automated smoke tests passing.
 5. intellij/vim/emacs/zed smoke checklists documented and manually walked once.
 6. `docs/lsp-audit/findings.md` exists and is empty, or every entry has a linked fix PR or explicit deferred-with-rationale.

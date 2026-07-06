@@ -14,7 +14,7 @@ Editor plugins live in their own repos (`sema-lisp/<editor>-sema`) and carry
 their own icon copies; they pull from the canonical SVGs in `assets/icons/svg/`
 out-of-band, so this script no longer writes into any editor tree.
 
-Edit the SVGs in assets/icons/svg/, then re-run: `make icons-assets`. Consumers
+Edit the SVGs in assets/icons/svg/, then re-run: `jake icons-assets`. Consumers
 are always overwritten from canonical, so this folder is authoritative.
 
 Requires rsvg-convert (librsvg): `brew install librsvg`.

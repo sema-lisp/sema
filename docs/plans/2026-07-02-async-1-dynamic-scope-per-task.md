@@ -172,7 +172,7 @@ or `complete_async_test.rs`). **These are the CI regression oracle.**
    scope emits the tags on its span (assert via `sema_otel::testing::install()`, as
    `complete_async_test.rs` already does).
 6. **No-regression**: `cargo test -p sema` async + llm suites, plus
-   `cargo test --workspace && make examples && make smoke-bytecode && make lint`.
+   `cargo test --workspace && jake examples && jake smoke-bytecode && jake lint`.
 7. **Live smoke** (best-effort, keys in env): one real `with-budget` fan-out on a
    cheap model (`claude-haiku-4-5-20251001` / `gpt-5.4-mini`) confirming the cap
    fires. Ollama-down remains the hard-fail lever for fallback paths.

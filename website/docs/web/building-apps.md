@@ -158,7 +158,7 @@ It demonstrates:
 From the repository root, build and run it with:
 
 ```bash
-make sema-web-example
+jake wasm.sema-web-example
 ```
 
 Then open:

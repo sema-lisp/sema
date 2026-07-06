@@ -1629,12 +1629,12 @@ git commit -m "docs: add executable format specification for sema build"
 
 **Step 1: Run full test suite**
 
-Run: `make test`
+Run: `jake test`
 Expected: All tests pass (including new build tests).
 
 **Step 2: Run lint**
 
-Run: `make lint`
+Run: `jake lint`
 Expected: No warnings.
 
 **Step 3: Manual smoke test**

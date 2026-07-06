@@ -34,7 +34,7 @@ Task 15 (document metadata): depends on Task 4 (text chunking)
 cargo test                                          # All tests
 cargo test -p sema --test integration_test          # Integration tests only
 cargo test -p sema --test integration_test -- name  # Single test
-make lint                                           # Lint
+jake lint                                           # Lint
 cargo test -p sema-llm                              # sema-llm unit tests
 cargo test -p sema-stdlib                           # sema-stdlib unit tests
 ```

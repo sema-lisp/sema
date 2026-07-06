@@ -5,18 +5,18 @@ Canonical instructions for any coding agent working in this repo. `CLAUDE.md` ju
 ## Build & Test
 
 ```bash
-make build              # dev build
-make release            # optimized build
-make test               # all tests (http tests ignored)
-make test-http          # HTTP integration tests (requires network)
-make lint               # fmt-check + clippy -D warnings
-make fmt                # cargo fmt
-make install            # install to ~/.cargo/bin (LTO, no PGO)
-make install-pgo        # PGO build + install (slower build, faster runtime)
-make all                # lint + test + build
-make run                # start REPL
-make example-notebook   # run demo notebook headlessly
-make test-notebook-e2e  # Playwright E2E tests for notebook
+jake build              # dev build
+jake release            # optimized build
+jake test               # all tests (http tests ignored)
+jake test.http          # HTTP integration tests (requires network)
+jake lint               # fmt-check + clippy -D warnings
+jake fmt                # cargo fmt
+jake install            # install to ~/.cargo/bin (LTO, no PGO)
+jake install-pgo        # PGO build + install (slower build, faster runtime)
+jake all                # lint + test + build
+jake run                # start REPL
+jake example-notebook   # run demo notebook headlessly
+jake test.notebook-e2e  # Playwright E2E tests for notebook
 ```
 
 - Single crate: `cargo test -p sema-reader` | Single test: `cargo test -p sema --test integration_test -- test_name`
@@ -67,7 +67,7 @@ Dependency flow (arrows = "depends on"): `sema-core ← sema-reader ← sema-vm 
 - Spec: `website/docs/internals/bytecode-format.md` — **this is the single source of truth**
 - Serialization/deserialization lives in `crates/sema-vm/src/serialize.rs`
 - **Any change to opcodes, Chunk, Function, ExceptionEntry, or UpvalueDesc MUST update both the format spec and the serializer**
-- **Adding an opcode**: *append* the `Op` variant — never insert (discriminants are positional and index `.semac` files). Then update every site that switches on the opcode: `from_u8`, `stack_effect`, `_assert_all_ops_covered`, the `op` module const (`opcodes.rs`); `advance_pc` + `stack_effect_operand` (`serialize.rs`); the two bytecode walks in `compiler.rs`; `op_name` + the decode arm (`disasm.rs`); the VM dispatch arm (`vm.rs`); and the spec above. A missed pc-walk/decode site desyncs the disassembler silently — **verify with `make smoke-bytecode`** (compile → disasm → run every example); unit tests won't catch it.
+- **Adding an opcode**: *append* the `Op` variant — never insert (discriminants are positional and index `.semac` files). Then update every site that switches on the opcode: `from_u8`, `stack_effect`, `_assert_all_ops_covered`, the `op` module const (`opcodes.rs`); `advance_pc` + `stack_effect_operand` (`serialize.rs`); the two bytecode walks in `compiler.rs`; `op_name` + the decode arm (`disasm.rs`); the VM dispatch arm (`vm.rs`); and the spec above. A missed pc-walk/decode site desyncs the disassembler silently — **verify with `jake smoke-bytecode`** (compile → disasm → run every example); unit tests won't catch it.
 - Format: 24-byte header (magic `\x00SEM` + version + flags), then sections (string table, function table, main chunk, optional debug sections)
 - Spur remapping: global opcodes use string-table indices in the file, remapped to process-local Spurs on load
 
@@ -80,13 +80,13 @@ The bytecode VM (`sema-vm`) is the **sole evaluator**. All tests run on the VM. 
 - **Integration / equivalence**: `integration_test.rs`, `vm_integration_test.rs`
 - I/O, LLM, sandbox, CLI, module/import, server tests → `integration_test.rs`
 - **LLM / agent paths (keyless, deterministic)**: `crates/sema/tests/llm_fake_test.rs` uses `sema_llm::fake::FakeProvider` — a scripted provider (canned replies, tool calls, errors, streamed chunks) installed as the default via `sema_llm::builtins::register_test_provider`. It records every request (`FakeRecorder`) so tests can assert on the exact messages the runtime built (e.g. round-2 tool-result correlation). Test hooks: `set_retry_base_ms(0)` (no real sleeps) and `set_network_max_retries`. **Always add a FakeProvider test when changing the agent loop, retry, cache, budget, or provider serializers** — this is the CI regression oracle that runs without API keys.
-- Notebook E2E tests: `crates/sema-notebook/tests/e2e/` (Playwright, run via `make test-notebook-e2e`)
+- Notebook E2E tests: `crates/sema-notebook/tests/e2e/` (Playwright, run via `jake test.notebook-e2e`)
 - A few `#[ignore]`d tests in `integration_test.rs` are a ready acceptance suite for the deferred VM stack-trace parity work (see `docs/deferred.md`).
 
 ### Fuzzing
 
-- **Byte-level (cargo-fuzz)**: `make fuzz` (nightly + cargo-fuzz). Mutates raw bytes to find reader/eval panics — targets in `crates/sema-reader/fuzz` and `crates/sema-eval/fuzz`.
-- **Grammar-based (in Sema)**: `make fuzz-grammar` (release binary). Generates random *valid* Sema programs and checks a printer/reader round-trip oracle and a compiler/VM value oracle; detects VM panics. Written in Sema at `fuzz/grammar-fuzz.sema`, driven by `scripts/grammar-fuzz.sh`. Every finding reproduces from one integer seed; `make fuzz-grammar-emit` prints sample programs. See `fuzz/README.md`.
+- **Byte-level (cargo-fuzz)**: `jake fuzz.all` (nightly + cargo-fuzz). Mutates raw bytes to find reader/eval panics — targets in `crates/sema-reader/fuzz` and `crates/sema-eval/fuzz`.
+- **Grammar-based (in Sema)**: `jake fuzz.grammar` (release binary). Generates random *valid* Sema programs and checks a printer/reader round-trip oracle and a compiler/VM value oracle; detects VM panics. Written in Sema at `fuzz/grammar-fuzz.sema`, driven by `scripts/grammar-fuzz.sh`. Every finding reproduces from one integer seed; `jake fuzz.grammar-emit` prints sample programs. See `fuzz/README.md`.
 
 ## Adding Functionality
 
@@ -113,7 +113,7 @@ Hard-won conventions — follow these or you will reintroduce shipped bugs (see 
 
 ## Release Procedure
 
-1. **Run the full CI-equivalent suite locally** (plain `cargo test` is NOT enough — it skips the example/bytecode smoke tests that run in CI): `cargo test --workspace && make examples && make smoke-bytecode && make lint && make docs-check` — all must pass. Skipping `make examples`/`make smoke-bytecode` locally is how a regression once shipped past four releases. The crates.io and npm publish workflows `needs:` a `verify` gate (`.github/workflows/verify.yml`) — a red suite blocks publishing. After pushing the tag, confirm `gh run list` shows CI **and** the publish gate green; never assume "started" == "passed". (The cargo-dist `Release`/binaries workflow is autogenerated and not gated — treat its result as advisory.)
+1. **Run the full CI-equivalent suite locally** (plain `cargo test` is NOT enough — it skips the example/bytecode smoke tests that run in CI): `cargo test --workspace && jake examples && jake smoke-bytecode && jake lint && jake docs-check` — all must pass. Skipping `jake examples`/`jake smoke-bytecode` locally is how a regression once shipped past four releases. The crates.io and npm publish workflows `needs:` a `verify` gate (`.github/workflows/verify.yml`) — a red suite blocks publishing. After pushing the tag, confirm `gh run list` shows CI **and** the publish gate green; never assume "started" == "passed". (The cargo-dist `Release`/binaries workflow is autogenerated and not gated — treat its result as advisory.)
 2. **Bump versions** in `Cargo.toml`: the workspace version *and* every inter-crate `=X.Y.Z` pin. One-shot: `sed -i '' -e 's/^version = "OLD"/version = "NEW"/' -e 's/version = "=OLD"/version = "=NEW"/g' Cargo.toml`, then confirm `grep -c 'OLD' Cargo.toml` is `0` (no stale version string remains).
 3. **Update CHANGELOG.md** — add a new `## X.Y.Z` section at the top.
 4. **Build release**: `cargo build --release` (also refreshes `Cargo.lock`); verify `./target/release/sema --version`.
@@ -136,7 +136,7 @@ Hard-won conventions — follow these or you will reintroduce shipped bugs (see 
 - The live homepage is the **`HomepageV2.vue`** component (via `website/index.md`), **not** any standalone `*.html` file.
 - VitePress site uses **clean URLs** (`cleanUrls: true` in both `config.ts` and `vercel.json`): the canonical form is extensionless, e.g. `https://sema-lang.com/docs/internals/lisp-comparison`. The build still writes `*.html` files and Vercel 308-redirects the `.html` form to the clean URL, so don't hardcode `.html` in internal doc links — write `/docs/lsp`, not `/docs/lsp.html`. Per-page `<link rel="canonical">` + `og:url` are emitted extensionless via `transformHead`. All docs pages are under `/docs/`.
 - **Syntax highlighting**: use `` ```sema `` for code blocks in website docs. The custom TextMate grammar is vendored at `website/.vitepress/sema.tmLanguage.json`, a copy of the canonical grammar now in the `sema-lisp/vscode-sema` repo (`syntaxes/sema.tmLanguage.json`) — re-copy from there when it changes. The package registry (`sema-lisp/pkg`) and the UI library (`sema-lisp/ui`) are now their own repos and keep their own vendored copies. For GitHub markdown outside the website, `sema` won't be recognized — use `` ```scheme `` as fallback there.
-- **OpenGraph cards**: per-page social images are generated from `website/og-template.html` (the single design source — homepage + docs variants, driven by URL query params) by `website/scripts/generate-og.mjs` (headless Chromium via Playwright). Run `make site-og` (or `cd website && npm run og`) after editing the template, logo, page titles, or version, then commit the regenerated `website/public/og/*.jpg` plus `playground/og-playground.jpg`. `config.ts` `transformHead` wires each page to its card; slug/category/dimension logic is shared via `website/.vitepress/og.shared.mjs`. **Generation is idempotent**: `generate-og.mjs` hashes each card's inputs (template + fonts + per-page params) into `website/og-manifest.json` and skips any card whose hash is unchanged and whose image still exists — so a card that didn't change is never re-encoded (a fresh JPEG differs byte-for-byte across Chromium versions and would churn git). A no-op run launches no browser. **Commit `website/og-manifest.json` alongside the images.** The renderer version is deliberately *not* in the hash; pass `--force` (`npm run og -- --force`) to rebuild every card after a Chromium/design change that the hash can't see.
+- **OpenGraph cards**: per-page social images are generated from `website/og-template.html` (the single design source — homepage + docs variants, driven by URL query params) by `website/scripts/generate-og.mjs` (headless Chromium via Playwright). Run `jake site.og` (or `cd website && npm run og`) after editing the template, logo, page titles, or version, then commit the regenerated `website/public/og/*.jpg` plus `playground/og-playground.jpg`. `config.ts` `transformHead` wires each page to its card; slug/category/dimension logic is shared via `website/.vitepress/og.shared.mjs`. **Generation is idempotent**: `generate-og.mjs` hashes each card's inputs (template + fonts + per-page params) into `website/og-manifest.json` and skips any card whose hash is unchanged and whose image still exists — so a card that didn't change is never re-encoded (a fresh JPEG differs byte-for-byte across Chromium versions and would churn git). A no-op run launches no browser. **Commit `website/og-manifest.json` alongside the images.** The renderer version is deliberately *not* in the hash; pass `--force` (`npm run og -- --force`) to rebuild every card after a Chromium/design change that the hash can't see.
 
 ## Design Docs
 

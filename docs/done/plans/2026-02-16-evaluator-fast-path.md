@@ -516,11 +516,11 @@ Trampoline::Value and the clones were wasted."
 
 ---
 
-### Task 5: Run `make lint` and final benchmark
+### Task 5: Run `jake lint` and final benchmark
 
 **Step 1: Lint**
 
-Run: `make lint`
+Run: `jake lint`
 Expected: clean (no warnings, no errors)
 
 **Step 2: Final benchmark comparison**

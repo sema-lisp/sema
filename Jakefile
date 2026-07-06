@@ -1,8 +1,8 @@
 # Jakefile — build automation for Sema (Lisp with LLM primitives, in Rust)
 #
-# Modular Jake recipes, ported from the Makefile. Run `jake -l` for the grouped
-# recipe list, `jake -s <recipe>` for details. This lives alongside the Makefile
-# during the transition; both drive the same underlying scripts.
+# The sole build entry point (the Makefile has been retired). Run `jake -l` for
+# the grouped recipe list, `jake -s <recipe>` for details. CI installs the jake
+# release binary and calls these recipes directly.
 #
 # The editor plugins and tree-sitter grammar now live in their own repos under
 # the sema-lisp org (each carries its own Jakefile), so there is no editors

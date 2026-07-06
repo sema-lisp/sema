@@ -888,7 +888,7 @@ Expected: all tests pass. Pay special attention to:
 
 **Step 2: Run clippy**
 
-Run: `make lint`
+Run: `jake lint`
 Expected: no warnings.
 
 **Step 3: Test module loading (import/load)**

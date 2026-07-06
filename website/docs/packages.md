@@ -503,7 +503,7 @@ sema main.sema
 
 ## Self-Hosted Registry
 
-Sema's package registry is designed to be self-hostable. The registry server ships in the [`pkg/`](https://github.com/helgesverre/sema/tree/main/pkg) directory of the Sema repository — it's a single Rust binary backed by SQLite that serves both a web UI and a REST API. See its [README](https://github.com/helgesverre/sema/tree/main/pkg#readme) for build and deployment instructions.
+Sema's package registry is designed to be self-hostable. The registry server ships in the [`pkg/`](https://github.com/sema-lisp/sema/tree/main/pkg) directory of the Sema repository — it's a single Rust binary backed by SQLite that serves both a web UI and a REST API. See its [README](https://github.com/sema-lisp/sema/tree/main/pkg#readme) for build and deployment instructions.
 
 To point the CLI at your own registry instance:
 

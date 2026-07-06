@@ -99,4 +99,4 @@ Combine PDF extraction with [LLM structured extraction](../llm/extraction) to bu
 (println (format "Amount: ~a" (get result :amount)))
 ```
 
-See the full [GLaDOS receipt processor example](https://github.com/helgesverre/sema/blob/main/examples/glados-downloads.sema) for a complete implementation.
+See the full [GLaDOS receipt processor example](https://github.com/sema-lisp/sema/blob/main/examples/glados-downloads.sema) for a complete implementation.

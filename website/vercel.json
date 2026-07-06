@@ -7,12 +7,12 @@
   "redirects": [
     {
       "source": "/install.sh",
-      "destination": "https://github.com/HelgeSverre/sema/releases/latest/download/sema-lang-installer.sh",
+      "destination": "https://github.com/sema-lisp/sema/releases/latest/download/sema-lang-installer.sh",
       "statusCode": 302
     },
     {
       "source": "/install.ps1",
-      "destination": "https://github.com/HelgeSverre/sema/releases/latest/download/sema-lang-installer.ps1",
+      "destination": "https://github.com/sema-lisp/sema/releases/latest/download/sema-lang-installer.ps1",
       "statusCode": 302
     }
   ]

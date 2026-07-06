@@ -18,7 +18,7 @@
     </p>
     <div class="hero-actions">
       <a href="/docs/" class="hero-btn primary">Get Started</a>
-      <a href="https://github.com/HelgeSverre/sema" class="hero-btn secondary">GitHub</a>
+      <a href="https://github.com/sema-lisp/sema" class="hero-btn secondary">GitHub</a>
     </div>
     <div class="hero-install-inline">
       <span class="prompt">$</span> brew install helgesverre/tap/sema-lang
@@ -654,7 +654,7 @@
     </div>
     <div class="install-card">
       <h3>From source</h3>
-<pre><code><span class="prompt">$</span> git clone https://github.com/HelgeSverre/sema
+<pre><code><span class="prompt">$</span> git clone https://github.com/sema-lisp/sema
 <span class="prompt">$</span> cd sema && cargo build --release</code></pre>
     </div>
   </div>
@@ -677,7 +677,7 @@
 
 <!-- ——— Footer ——— -->
 <footer>
-  <p>MIT &mdash; <a href="https://github.com/HelgeSverre/sema">source</a></p>
+  <p>MIT &mdash; <a href="https://github.com/sema-lisp/sema">source</a></p>
 </footer>
 
 </div>

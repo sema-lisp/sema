@@ -8196,12 +8196,12 @@
       "name": "serial/send",
       "module": "serial",
       "section": "I/O",
-      "summary": "Convenience for line-oriented JSON protocols (such as the [sema-bridge](https://github.com/HelgeSverre/sema/tree/main/examples) firmware that ships with the Pico examples). Writes `command + \"\\n\"`, flushes, reads one line back, and parses it as JSON. Returns `nil` if the response line is empty.",
+      "summary": "Convenience for line-oriented JSON protocols (such as the [sema-bridge](https://github.com/sema-lisp/sema/tree/main/examples) firmware that ships with the Pico examples). Writes `command + \"\\n\"`, flushes, reads one line back, and parses it as JSON. Returns `nil` if the response line is empty.",
       "examples": [
         "(serial/send handle command) → parsed-json | nil",
         "(serial/send pico \"{\\\"cmd\\\":\\\"led-on\\\",\\\"pin\\\":25}\")\n;; => {:ok #t}\n\n(serial/send pico \"{\\\"cmd\\\":\\\"adc-read\\\",\\\"pin\\\":26}\")\n;; => {:ok #t :value 2048}"
       ],
-      "body": "```sema\n(serial/send handle command) → parsed-json | nil\n```\n\nConvenience for line-oriented JSON protocols (such as the [sema-bridge](https://github.com/HelgeSverre/sema/tree/main/examples) firmware that ships with the Pico examples). Writes `command + \"\\n\"`, flushes, reads one line back, and parses it as JSON. Returns `nil` if the response line is empty.\n\n```sema\n(serial/send pico \"{\\\"cmd\\\":\\\"led-on\\\",\\\"pin\\\":25}\")\n;; => {:ok #t}\n\n(serial/send pico \"{\\\"cmd\\\":\\\"adc-read\\\",\\\"pin\\\":26}\")\n;; => {:ok #t :value 2048}\n```"
+      "body": "```sema\n(serial/send handle command) → parsed-json | nil\n```\n\nConvenience for line-oriented JSON protocols (such as the [sema-bridge](https://github.com/sema-lisp/sema/tree/main/examples) firmware that ships with the Pico examples). Writes `command + \"\\n\"`, flushes, reads one line back, and parses it as JSON. Returns `nil` if the response line is empty.\n\n```sema\n(serial/send pico \"{\\\"cmd\\\":\\\"led-on\\\",\\\"pin\\\":25}\")\n;; => {:ok #t}\n\n(serial/send pico \"{\\\"cmd\\\":\\\"adc-read\\\",\\\"pin\\\":26}\")\n;; => {:ok #t :value 2048}\n```"
     },
     {
       "name": "serial/write",

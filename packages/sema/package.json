@@ -28,7 +28,7 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/HelgeSverre/sema",
+    "url": "https://github.com/sema-lisp/sema",
     "directory": "packages/sema"
   },
   "homepage": "https://sema-lang.com/docs/embedding-js.html",

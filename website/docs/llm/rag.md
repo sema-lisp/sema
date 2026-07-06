@@ -18,7 +18,7 @@ Sema has the whole pipeline as first-class primitives:
 
 The recipe everyone converges on is **retrieve many, rerank to a few**. Vector search has high recall but coarse ordering — because the query and each document are embedded *separately*, the score can't model how they interact. A reranker reads them *together*, so it's far more precise. You retrieve a generous shortlist by cosine (say top 12), then let the reranker pick the best 4.
 
-This guide builds a working example that indexes Sema's **own builtin documentation** and answers "which function do I use?" questions. The full file is [`examples/llm/rag-docs-search.sema`](https://github.com/HelgeSverre/sema/blob/main/examples/llm/rag-docs-search.sema).
+This guide builds a working example that indexes Sema's **own builtin documentation** and answers "which function do I use?" questions. The full file is [`examples/llm/rag-docs-search.sema`](https://github.com/sema-lisp/sema/blob/main/examples/llm/rag-docs-search.sema).
 
 ## Setup
 

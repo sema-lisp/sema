@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="https://raw.githubusercontent.com/helgesverre/sema/main/assets/og-github.jpg" alt="Sema — Stop rewriting the agent loop." width="800">
+  <img src="https://raw.githubusercontent.com/sema-lisp/sema/main/assets/og-github.jpg" alt="Sema — Stop rewriting the agent loop." width="800">
 </p>
 
 <p align="center">
@@ -10,7 +10,7 @@
 <p align="center">
   <a href="https://sema.run"><img src="https://img.shields.io/badge/try_it-sema.run-c8a855?style=flat" alt="Playground"></a>
   <a href="https://sema-lang.com/docs/"><img src="https://img.shields.io/badge/docs-sema--lang.com-c8a855?style=flat" alt="Docs"></a>
-  <a href="https://github.com/HelgeSverre/sema/releases/latest"><img src="https://img.shields.io/github/v/tag/HelgeSverre/sema?label=version&color=c8a855&style=flat" alt="Version"></a>
+  <a href="https://github.com/sema-lisp/sema/releases/latest"><img src="https://img.shields.io/github/v/tag/sema-lisp/sema?label=version&color=c8a855&style=flat" alt="Version"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-c8a855?style=flat" alt="License"></a>
 </p>
 
@@ -18,8 +18,8 @@
   <a href="https://sema-lang.com/docs/"><b>Docs</b></a> ·
   <a href="https://sema.run"><b>Playground</b></a> ·
   <a href="https://sema-lang.com/docs/for-agents"><b>For Agents</b></a> ·
-  <a href="https://github.com/helgesverre/sema/tree/main/examples"><b>Examples</b></a> ·
-  <a href="https://github.com/HelgeSverre/sema/issues"><b>Issues</b></a>
+  <a href="https://github.com/sema-lisp/sema/tree/main/examples"><b>Examples</b></a> ·
+  <a href="https://github.com/sema-lisp/sema/issues"><b>Issues</b></a>
 </p>
 
 **Stop rewriting the agent loop.** Every LLM script grows the same scaffolding — retries, caching, cost caps, rate limits, tool dispatch, conversation state. Sema makes that scaffolding the runtime: your script stays the size of its idea, ships as a single binary, and your coding agent already speaks the language.
@@ -246,7 +246,7 @@ Install pre-built binaries (no Rust required):
 curl -fsSL https://sema-lang.com/install.sh | sh
 
 # Windows (PowerShell)
-powershell -ExecutionPolicy ByPass -c "irm https://github.com/HelgeSverre/sema/releases/latest/download/sema-lang-installer.ps1 | iex"
+powershell -ExecutionPolicy ByPass -c "irm https://github.com/sema-lisp/sema/releases/latest/download/sema-lang-installer.ps1 | iex"
 
 # Homebrew (macOS / Linux)
 brew install helgesverre/tap/sema-lang
@@ -261,7 +261,7 @@ cargo install sema-lang
 Or build from source:
 
 ```bash
-git clone https://github.com/HelgeSverre/sema
+git clone https://github.com/sema-lisp/sema
 cd sema && cargo build --release
 # Binary at target/release/sema
 ```
@@ -347,30 +347,30 @@ The **MCP server** lets LLM clients (Claude Desktop, Cursor, Claude Code) compil
 
 ## Example Programs
 
-The [`examples/`](https://github.com/helgesverre/sema/tree/main/examples) directory has 50+ programs:
+The [`examples/`](https://github.com/sema-lisp/sema/tree/main/examples) directory has 50+ programs:
 
 | Example                                                                                                       | What it does                                                 |
 | ------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------ |
-| [`coding-agent.sema`](https://github.com/helgesverre/sema/blob/main/examples/ai-tools/coding-agent.sema)      | Full coding agent with file editing, search, and shell tools |
-| [`review.sema`](https://github.com/helgesverre/sema/blob/main/examples/ai-tools/review.sema)                  | AI code reviewer for git diffs                               |
-| [`commit-msg.sema`](https://github.com/helgesverre/sema/blob/main/examples/ai-tools/commit-msg.sema)          | Generate conventional commit messages from staged changes    |
-| [`summarize.sema`](https://github.com/helgesverre/sema/blob/main/examples/ai-tools/summarize.sema)            | Summarize files or piped input                               |
-| [`game-of-life.sema`](https://github.com/helgesverre/sema/blob/main/examples/game-of-life.sema)               | Conway's Game of Life                                        |
-| [`brainfuck.sema`](https://github.com/helgesverre/sema/blob/main/examples/brainfuck.sema)                     | Brainfuck interpreter                                        |
-| [`mandelbrot.sema`](https://github.com/helgesverre/sema/blob/main/examples/mandelbrot.sema)                   | ASCII Mandelbrot set                                         |
-| [`json-api.sema`](https://github.com/helgesverre/sema/blob/main/examples/json-api.sema)                       | Fetch and process JSON APIs                                  |
-| [`test-vision.sema`](https://github.com/helgesverre/sema/blob/main/examples/llm/test-vision.sema)             | Vision extraction and multi-modal chat tests                 |
-| [`test-extract.sema`](https://github.com/helgesverre/sema/blob/main/examples/llm/test-extract.sema)           | Structured extraction and classification                     |
-| [`test-batch.sema`](https://github.com/helgesverre/sema/blob/main/examples/llm/test-batch.sema)               | Batch/parallel LLM completions                               |
-| [`test-pipeline.sema`](https://github.com/helgesverre/sema/blob/main/examples/llm/test-pipeline.sema)         | Caching, budgets, rate limiting, retry, fallback chains      |
-| [`test-text-tools.sema`](https://github.com/helgesverre/sema/blob/main/examples/llm/test-text-tools.sema)     | Text chunking, prompt templates, document abstraction        |
-| [`test-vector-store.sema`](https://github.com/helgesverre/sema/blob/main/examples/llm/test-vector-store.sema) | In-memory vector store with similarity search                |
-| [`test-kv-store.sema`](https://github.com/helgesverre/sema/blob/main/examples/llm/test-kv-store.sema)         | Persistent JSON-backed key-value store                       |
-| [`expr-evaluator.sema`](https://github.com/helgesverre/sema/blob/main/examples/expr-evaluator.sema)           | Mini calculator using `match` on tagged vectors              |
-| [`shape-geometry.sema`](https://github.com/helgesverre/sema/blob/main/examples/shape-geometry.sema)           | Shape areas/perimeters with map pattern matching             |
-| [`http-router.sema`](https://github.com/helgesverre/sema/blob/main/examples/http-router.sema)                 | HTTP router with `match` on nested maps and guards           |
-| [`destructuring.sema`](https://github.com/helgesverre/sema/blob/main/examples/destructuring.sema)             | Comprehensive destructuring showcase (vector, map, lambda)   |
-| [`demo.sema-nb`](https://github.com/helgesverre/sema/blob/main/examples/notebook/demo.sema-nb)               | Interactive notebook demo (run with `sema notebook serve`)   |
+| [`coding-agent.sema`](https://github.com/sema-lisp/sema/blob/main/examples/ai-tools/coding-agent.sema)      | Full coding agent with file editing, search, and shell tools |
+| [`review.sema`](https://github.com/sema-lisp/sema/blob/main/examples/ai-tools/review.sema)                  | AI code reviewer for git diffs                               |
+| [`commit-msg.sema`](https://github.com/sema-lisp/sema/blob/main/examples/ai-tools/commit-msg.sema)          | Generate conventional commit messages from staged changes    |
+| [`summarize.sema`](https://github.com/sema-lisp/sema/blob/main/examples/ai-tools/summarize.sema)            | Summarize files or piped input                               |
+| [`game-of-life.sema`](https://github.com/sema-lisp/sema/blob/main/examples/game-of-life.sema)               | Conway's Game of Life                                        |
+| [`brainfuck.sema`](https://github.com/sema-lisp/sema/blob/main/examples/brainfuck.sema)                     | Brainfuck interpreter                                        |
+| [`mandelbrot.sema`](https://github.com/sema-lisp/sema/blob/main/examples/mandelbrot.sema)                   | ASCII Mandelbrot set                                         |
+| [`json-api.sema`](https://github.com/sema-lisp/sema/blob/main/examples/json-api.sema)                       | Fetch and process JSON APIs                                  |
+| [`test-vision.sema`](https://github.com/sema-lisp/sema/blob/main/examples/llm/test-vision.sema)             | Vision extraction and multi-modal chat tests                 |
+| [`test-extract.sema`](https://github.com/sema-lisp/sema/blob/main/examples/llm/test-extract.sema)           | Structured extraction and classification                     |
+| [`test-batch.sema`](https://github.com/sema-lisp/sema/blob/main/examples/llm/test-batch.sema)               | Batch/parallel LLM completions                               |
+| [`test-pipeline.sema`](https://github.com/sema-lisp/sema/blob/main/examples/llm/test-pipeline.sema)         | Caching, budgets, rate limiting, retry, fallback chains      |
+| [`test-text-tools.sema`](https://github.com/sema-lisp/sema/blob/main/examples/llm/test-text-tools.sema)     | Text chunking, prompt templates, document abstraction        |
+| [`test-vector-store.sema`](https://github.com/sema-lisp/sema/blob/main/examples/llm/test-vector-store.sema) | In-memory vector store with similarity search                |
+| [`test-kv-store.sema`](https://github.com/sema-lisp/sema/blob/main/examples/llm/test-kv-store.sema)         | Persistent JSON-backed key-value store                       |
+| [`expr-evaluator.sema`](https://github.com/sema-lisp/sema/blob/main/examples/expr-evaluator.sema)           | Mini calculator using `match` on tagged vectors              |
+| [`shape-geometry.sema`](https://github.com/sema-lisp/sema/blob/main/examples/shape-geometry.sema)           | Shape areas/perimeters with map pattern matching             |
+| [`http-router.sema`](https://github.com/sema-lisp/sema/blob/main/examples/http-router.sema)                 | HTTP router with `match` on nested maps and guards           |
+| [`destructuring.sema`](https://github.com/sema-lisp/sema/blob/main/examples/destructuring.sema)             | Comprehensive destructuring showcase (vector, map, lambda)   |
+| [`demo.sema-nb`](https://github.com/sema-lisp/sema/blob/main/examples/notebook/demo.sema-nb)               | Interactive notebook demo (run with `sema notebook serve`)   |
 
 ## Why Sema?
 
@@ -423,4 +423,4 @@ crates/
 
 ## License
 
-MIT — see [LICENSE](https://github.com/helgesverre/sema/blob/main/LICENSE).
+MIT — see [LICENSE](https://github.com/sema-lisp/sema/blob/main/LICENSE).

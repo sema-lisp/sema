@@ -80,7 +80,7 @@ Read until `\n`, then trim trailing `\r` / `\n` and return the line. Blocks unti
 (serial/send handle command) → parsed-json | nil
 ```
 
-Convenience for line-oriented JSON protocols (such as the [sema-bridge](https://github.com/HelgeSverre/sema/tree/main/examples) firmware that ships with the Pico examples). Writes `command + "\n"`, flushes, reads one line back, and parses it as JSON. Returns `nil` if the response line is empty.
+Convenience for line-oriented JSON protocols (such as the [sema-bridge](https://github.com/sema-lisp/sema/tree/main/examples) firmware that ships with the Pico examples). Writes `command + "\n"`, flushes, reads one line back, and parses it as JSON. Returns `nil` if the response line is empty.
 
 ```sema
 (serial/send pico "{\"cmd\":\"led-on\",\"pin\":25}")

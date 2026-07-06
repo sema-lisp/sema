@@ -363,7 +363,7 @@ messages = [{<span class="c-str">"role"</span>: <span class="c-str">"user"</span
           <li><strong>Not a full Scheme.</strong> No numeric tower, no call/cc, auto-gensym instead of syntax-rules.
           </li>
           <li><strong>Young.</strong> Solid and tested, not battle-hardened at scale. Pin a version; read the <a
-            href="https://github.com/HelgeSverre/sema/blob/main/CHANGELOG.md">changelog</a>.
+            href="https://github.com/sema-lisp/sema/blob/main/CHANGELOG.md">changelog</a>.
           </li>
         </ul>
       </div>
@@ -417,7 +417,7 @@ messages = [{<span class="c-str">"role"</span>: <span class="c-str">"user"</span
           </div>
           <div class="hero-actions" style="justify-content:center; margin-top:24px">
             <a class="btn btn-gold" href="https://sema.run">Open the playground</a>
-            <a class="btn btn-ghost" href="https://github.com/HelgeSverre/sema">View source</a>
+            <a class="btn btn-ghost" href="https://github.com/sema-lisp/sema">View source</a>
           </div>
         </div>
       </div>

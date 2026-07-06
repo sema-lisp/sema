@@ -86,7 +86,7 @@ const copyText = (id, event) => {
           <a href="https://sema.run" target="_blank" rel="noopener" class="vp-external-link-icon">
             Playground
           </a>
-          <a class="nav-gh" href="https://github.com/HelgeSverre/sema" aria-label="GitHub" target="_blank"
+          <a class="nav-gh" href="https://github.com/sema-lisp/sema" aria-label="GitHub" target="_blank"
              rel="noopener">
             <svg viewBox="0 0 16 16" class="gh-svg" aria-hidden="true">
               <path fill="currentColor"
@@ -107,8 +107,8 @@ const copyText = (id, event) => {
         <span>
           <a href="/docs/">Docs</a> ·
           <a href="/docs/internals/lisp-comparison">Benchmarks</a> ·
-          <a href="https://github.com/HelgeSverre/sema/blob/main/CHANGELOG.md">Changelog</a> ·
-          <a href="https://github.com/HelgeSverre/sema">GitHub</a> ·
+          <a href="https://github.com/sema-lisp/sema/blob/main/CHANGELOG.md">Changelog</a> ·
+          <a href="https://github.com/sema-lisp/sema">GitHub</a> ·
           <a href="/brand">Brand</a> ·
           <a href="/llms.txt">llms.txt</a>
         </span>

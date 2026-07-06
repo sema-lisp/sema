@@ -148,7 +148,7 @@ make build-pgo
 SEMA_SKIP_BUILD=1 ./benchmarks/1brc/run-native-benchmarks.py benchmarks/data/bench-10m.txt
 ```
 
-Implementation source: [`benchmarks/1brc/`](https://github.com/HelgeSverre/sema/tree/main/benchmarks/1brc) (optimized) and [`benchmarks/1brc/simple/`](https://github.com/HelgeSverre/sema/tree/main/benchmarks/1brc/simple) (simple/idiomatic).
+Implementation source: [`benchmarks/1brc/`](https://github.com/sema-lisp/sema/tree/main/benchmarks/1brc) (optimized) and [`benchmarks/1brc/simple/`](https://github.com/sema-lisp/sema/tree/main/benchmarks/1brc/simple) (simple/idiomatic).
 
 <script setup>
 import { onMounted } from 'vue'

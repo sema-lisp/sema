@@ -316,7 +316,7 @@ export default defineConfig({
     },
 
     socialLinks: [
-      { icon: 'github', link: 'https://github.com/HelgeSverre/sema' },
+      { icon: 'github', link: 'https://github.com/sema-lisp/sema' },
     ],
 
     outline: {
@@ -325,7 +325,7 @@ export default defineConfig({
     },
 
     editLink: {
-      pattern: 'https://github.com/HelgeSverre/sema/edit/main/website/:path',
+      pattern: 'https://github.com/sema-lisp/sema/edit/main/website/:path',
       text: 'Edit this page on GitHub'
     },
 

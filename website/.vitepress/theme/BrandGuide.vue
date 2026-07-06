@@ -308,9 +308,9 @@ const copyIcon = (key) => {
                   <span style="color: var(--border); margin: 0 4px;">·</span>
                   <a href="#overview" style="color: var(--text-secondary); text-decoration: none; margin: 0 6px;">Benchmarks</a>
                   <span style="color: var(--border); margin: 0 4px;">·</span>
-                  <a href="https://github.com/HelgeSverre/sema" target="_blank" style="color: var(--text-secondary); text-decoration: none; margin: 0 6px;">Changelog</a>
+                  <a href="https://github.com/sema-lisp/sema" target="_blank" style="color: var(--text-secondary); text-decoration: none; margin: 0 6px;">Changelog</a>
                   <span style="color: var(--border); margin: 0 4px;">·</span>
-                  <a href="https://github.com/HelgeSverre/sema" target="_blank" style="color: var(--text-secondary); text-decoration: none; margin-left: 6px;">GitHub</a>
+                  <a href="https://github.com/sema-lisp/sema" target="_blank" style="color: var(--text-secondary); text-decoration: none; margin-left: 6px;">GitHub</a>
                 </span>
               </div>
             </footer>
@@ -418,7 +418,7 @@ const copyIcon = (key) => {
                 <p class="kicker" style="font-family: 'Cormorant', Georgia, serif; font-size: 1.15rem; color: #c8a855; font-style: italic; margin: 0 0 0.5rem 0;">“Wait — a Lisp?”</p>
                 <h2 style="font-family: 'Cormorant', Georgia, serif; font-size: 2.2rem; font-weight: 300; color: #e9e3d6; margin: 0 0 1rem 0; line-height: 1.25;">You won't write most of it anyway.</h2>
                 <p class="sub" style="font-size: 1.05rem; color: #968c79; line-height: 1.6; max-width: 42rem; margin: 0;">
-                  Your coding agent will. And a Lisp is the <strong>language with the least surface</strong> for an agent to be wrong about—see the <a href="https://github.com/HelgeSverre/sema" target="_blank" style="text-decoration: underline; color: var(--gold);">open-source repository</a> to review the <u>complete language specifications</u>.
+                  Your coding agent will. And a Lisp is the <strong>language with the least surface</strong> for an agent to be wrong about—see the <a href="https://github.com/sema-lisp/sema" target="_blank" style="text-decoration: underline; color: var(--gold);">open-source repository</a> to review the <u>complete language specifications</u>.
                 </p>
               </div>
             </div>
@@ -453,7 +453,7 @@ const copyIcon = (key) => {
                     <span><strong>Minimal footprint.</strong> The entire compiler and VM is a single statically linked binary with <u>zero external runtime dependencies</u>.</span>
                   </li>
                   <li>
-                    <span><strong>Instant startup.</strong> VM boots in less than 1ms. Fast enough for <a href="https://github.com/HelgeSverre/sema" target="_blank" style="text-decoration: underline; color: var(--gold);">serverless functions</a> and ephemeral CLI invocations.</span>
+                    <span><strong>Instant startup.</strong> VM boots in less than 1ms. Fast enough for <a href="https://github.com/sema-lisp/sema" target="_blank" style="text-decoration: underline; color: var(--gold);">serverless functions</a> and ephemeral CLI invocations.</span>
                   </li>
                 </ul>
               </div>
@@ -1217,9 +1217,29 @@ resp = client.messages.create(
                 <td>Community package registry API (Rust, Axum, SQLite)</td>
               </tr>
               <tr>
+                <td class="inv-name">GitHub Organization</td>
+                <td><a href="https://github.com/sema-lisp" target="_blank">github.com/sema-lisp</a></td>
+                <td>Org hosting the loosely-coupled components (editor plugins, grammar, UI library)</td>
+              </tr>
+              <tr>
                 <td class="inv-name">GitHub Repository</td>
-                <td><a href="https://github.com/HelgeSverre/sema" target="_blank">github.com/HelgeSverre/sema</a></td>
+                <td><a href="https://github.com/sema-lisp/sema" target="_blank">github.com/sema-lisp/sema</a></td>
                 <td>Primary codebase repository (Cargo multi-crate workspace)</td>
+              </tr>
+              <tr>
+                <td class="inv-name">Editor Plugins</td>
+                <td><a href="https://github.com/sema-lisp" target="_blank">sema-lisp/&#123;vscode,zed,intellij,emacs,helix,sublime&#125;-sema, sema.&#123;vim,nvim&#125;</a></td>
+                <td>Per-editor plugin repos (VS Code, Zed, IntelliJ, Emacs, Helix, Sublime, Vim, Neovim)</td>
+              </tr>
+              <tr>
+                <td class="inv-name">Tree-sitter Grammar</td>
+                <td><a href="https://github.com/sema-lisp/tree-sitter-sema" target="_blank">github.com/sema-lisp/tree-sitter-sema</a></td>
+                <td>Shared grammar consumed by Zed, Helix, and Neovim (pinned commit/tag)</td>
+              </tr>
+              <tr>
+                <td class="inv-name">UI Library</td>
+                <td><a href="https://github.com/sema-lisp/ui" target="_blank">github.com/sema-lisp/ui</a> · <code>@sema-lang/ui</code></td>
+                <td>Lit-based web components (published to npm), consumed by the site, notebook, and playground</td>
               </tr>
               <tr>
                 <td class="inv-name">Homebrew Crate</td>

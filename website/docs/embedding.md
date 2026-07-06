@@ -21,7 +21,7 @@ Or use the latest unreleased version from git:
 
 ```toml
 [dependencies]
-sema-lang = { git = "https://github.com/HelgeSverre/sema" }
+sema-lang = { git = "https://github.com/sema-lisp/sema" }
 ```
 
 Evaluate an expression in three lines:

@@ -39,7 +39,7 @@ cargo install sema-lang
 Or build from source:
 
 ```bash
-git clone https://github.com/HelgeSverre/sema
+git clone https://github.com/sema-lisp/sema
 cd sema
 cargo build --release
 # Binary is at target/release/sema

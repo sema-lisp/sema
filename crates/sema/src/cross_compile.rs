@@ -7,7 +7,7 @@ use sha2::{Digest, Sha256};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
-const GITHUB_REPO: &str = "HelgeSverre/sema";
+const GITHUB_REPO: &str = "sema-lisp/sema";
 
 /// Maximum runtime binary size we'll accept (200 MB).
 const MAX_RUNTIME_SIZE: u64 = 200 * 1024 * 1024;

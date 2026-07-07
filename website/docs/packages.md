@@ -503,9 +503,29 @@ sema main.sema
 
 ## Self-Hosted Registry
 
-Sema's package registry is designed to be self-hostable. The registry server ships in the [`pkg/`](https://github.com/sema-lisp/sema/tree/main/pkg) directory of the Sema repository — it's a single Rust binary backed by SQLite that serves both a web UI and a REST API. See its [README](https://github.com/sema-lisp/sema/tree/main/pkg#readme) for build and deployment instructions.
+Sema's package registry is a single Rust binary that serves both a web UI and a REST API, backed by SQLite (or Postgres/MySQL) with package tarballs on the local disk or any S3-compatible bucket. It lives in its own repository, [`sema-lisp/pkg`](https://github.com/sema-lisp/pkg). Running your own is the intended way to host private or internal packages.
 
-To point the CLI at your own registry instance:
+Pick a deployment style — full instructions, including object-storage setup and backups, are in [`pkg/DEPLOYMENT.md`](https://github.com/sema-lisp/pkg/blob/main/DEPLOYMENT.md):
+
+- **[Fly.io](https://github.com/sema-lisp/pkg/blob/main/DEPLOYMENT.md#path-a--flyio-recommended) (recommended)** — one machine with SQLite on a volume, tarballs in Tigris, and [Litestream](https://litestream.io) continuously backing the database up to Tigris. The `fly.toml` in the repo does it all; the machine holds no irreplaceable state.
+- **[Docker Compose](https://github.com/sema-lisp/pkg/blob/main/DEPLOYMENT.md#path-b--self-host-with-docker-compose)** — your own VM, with a Litestream sidecar replicating the database to R2 / S3 / Tigris.
+- **[Bare binary + systemd](https://github.com/sema-lisp/pkg/blob/main/DEPLOYMENT.md#path-c--bare-binary--systemd)** — no Docker; just the binary and an env file, with filesystem blobs (back up one directory) or object storage.
+- **[Managed Postgres + S3](https://github.com/sema-lisp/pkg/blob/main/DEPLOYMENT.md#path-d--horizontal-scale-managed-postgres--s3)** — stateless, for running many replicas behind a load balancer.
+
+The fastest path (Fly.io):
+
+```bash
+fly apps create my-registry
+fly volumes create sema_pkg_data --region ams --size 3
+fly storage create              # provisions Tigris + injects its credentials
+fly deploy
+# The API can't create the first admin (chicken-and-egg), so use the operator CLI:
+fly ssh console -C "sema-pkg admin create you you@example.com 'a-strong-password'"
+```
+
+The operator CLI (`sema-pkg admin|package|stats|doctor`) manages users, roles, bans, tokens, and package takedowns without touching the database — see the [Admin CLI](https://github.com/sema-lisp/pkg/blob/main/DEPLOYMENT.md#admin-cli) reference.
+
+Then point the CLI at your instance:
 
 ```bash
 # Set as default registry

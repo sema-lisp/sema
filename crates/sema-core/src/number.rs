@@ -176,6 +176,21 @@ impl SemaNumber {
         self.add(other.neg())
     }
 
+    /// Non-negative magnitude. For a real number this is the usual absolute
+    /// value (exactness-preserving: an exact input stays exact). For a
+    /// `Complex`, this is its `f64` hypot — always inexact, since the tower
+    /// has no exact square root in general.
+    pub fn abs(self) -> SemaNumber {
+        use num_traits::Signed;
+        match self {
+            SemaNumber::Integer(n) => SemaNumber::Integer(n.abs()),
+            SemaNumber::Rational(r) => SemaNumber::Rational(r.abs()),
+            SemaNumber::Real(f) => SemaNumber::Real(f.abs()),
+            SemaNumber::Complex(c) => SemaNumber::Real(c.re.to_f64().hypot(c.im.to_f64())),
+        }
+        .normalize()
+    }
+
     #[allow(clippy::should_implement_trait)]
     pub fn mul(self, other: SemaNumber) -> SemaNumber {
         let (a, b) = SemaNumber::promote(self, other);
@@ -581,6 +596,23 @@ mod tests {
             two().add(SemaNumber::Real(0.5)),
             SemaNumber::Real(_)
         ));
+    }
+
+    #[test]
+    fn abs_preserves_exactness_over_reals_inexact_over_complex() {
+        let n = |v: i64| SemaNumber::Integer(BigInt::from(v));
+        // exact integer stays exact
+        assert!(matches!(n(-5).abs(), SemaNumber::Integer(v) if v == BigInt::from(5)));
+        assert!(matches!(n(5).abs(), SemaNumber::Integer(v) if v == BigInt::from(5)));
+        // exact rational stays exact
+        let neg_half = SemaNumber::Rational(BigRational::new(BigInt::from(-1), BigInt::from(2)));
+        assert!(matches!(neg_half.abs(),
+            SemaNumber::Rational(r) if r == BigRational::new(BigInt::one(), BigInt::from(2))));
+        // inexact real stays inexact
+        assert!(matches!(SemaNumber::Real(-2.5).abs(), SemaNumber::Real(f) if f == 2.5));
+        // complex magnitude is the (inexact) hypot of its components
+        let c = SemaNumber::Complex(Box::new(Complex { re: n(3), im: n(4) }));
+        assert!(matches!(c.abs(), SemaNumber::Real(f) if f == 5.0));
     }
 
     #[test]

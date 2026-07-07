@@ -1449,6 +1449,35 @@ eval_tests! {
     complex_lit_leading_pos_imag: "+2i" => common::eval("0+2i"),
 }
 
+// Task 3.3: complex builtins (make-rectangular/make-polar/real-part/imag-part/
+// magnitude/angle), complex?/real? predicates, and sqrt of a negative real
+// returning a complex. `complex?` is true for every number (R7RS); `real?` is
+// true for anything that is not `Complex`.
+eval_tests! {
+    make_rectangular_basic: "(make-rectangular 3 4)" => common::eval("3+4i"),
+    real_part_complex: "(real-part 3+4i)" => common::eval("3"),
+    imag_part_complex: "(imag-part 3+4i)" => common::eval("4"),
+    real_part_real: "(real-part 5)" => common::eval("5"),
+    imag_part_real: "(imag-part 5)" => common::eval("0"),
+    magnitude_complex: "(magnitude 3+4i)" => common::eval("5.0"),
+    // magnitude of an exact real stays exact (R7RS): |−5| = 5, not 5.0.
+    magnitude_real_negative: "(magnitude -5)" => common::eval("5"),
+    complex_mul: "(* 3+4i 1-2i)" => common::eval("11-2i"),
+    complex_add: "(+ 1+2i 3+4i)" => common::eval("4+6i"),
+    complex_pred_complex: "(complex? 3+4i)" => common::eval("#t"),
+    complex_pred_real: "(complex? 5)" => common::eval("#t"),
+    real_pred_complex: "(real? 3+4i)" => common::eval("#f"),
+    real_pred_real: "(real? 5)" => common::eval("#t"),
+    // sqrt of a negative real returns an inexact complex on the imaginary axis.
+    sqrt_neg_one: "(sqrt -1)" => common::eval("0+1.0i"),
+    sqrt_neg_four: "(sqrt -4)" => common::eval("0+2.0i"),
+    // make-polar with angle 0: components are bit-exact (cos(0)=1, sin(0)=0).
+    make_polar_real_part: "(real-part (make-polar 5.0 0.0))" => Value::float(5.0),
+    make_polar_imag_part: "(imag-part (make-polar 5.0 0.0))" => Value::float(0.0),
+    angle_positive_real: "(angle 5)" => Value::float(0.0),
+    angle_negative_real: "(angle -5)" => Value::float(std::f64::consts::PI),
+}
+
 // Task 2.4: rational?/exact?/inexact?/exact-integer?/numerator/denominator.
 eval_tests! {
     rational_pred_rational: "(rational? 1/3)" => common::eval("#t"),

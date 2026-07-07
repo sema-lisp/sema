@@ -85,6 +85,19 @@ pub fn register(env: &sema_core::Env) {
         Ok(Value::bool(args[0].is_int() || args[0].is_bigint()))
     });
 
+    register_fn(env, "complex?", |args| {
+        check_arity!(args, "complex?", 1);
+        // Every number is complex per R7RS (the tower's top level).
+        Ok(Value::bool(args[0].as_number().is_some()))
+    });
+
+    register_fn(env, "real?", |args| {
+        check_arity!(args, "real?", 1);
+        Ok(Value::bool(
+            args[0].as_number().is_some_and(|n| n.is_real()),
+        ))
+    });
+
     register_fn(env, "string?", |args| {
         check_arity!(args, "string?", 1);
         Ok(Value::bool(args[0].as_str().is_some()))

@@ -167,10 +167,104 @@ pub fn register(env: &sema_core::Env) {
 
     register_fn(env, "sqrt", |args| {
         check_arity!(args, "sqrt", 1);
-        let f = args[0]
-            .as_float()
+        let n = args[0]
+            .as_number()
             .ok_or_else(|| SemaError::type_error("number", args[0].type_name()))?;
-        Ok(Value::float(f.sqrt()))
+        match n {
+            SemaNumber::Complex(c) => {
+                // Principal complex square root via polar form:
+                // sqrt(r·e^iθ) = sqrt(r)·e^(iθ/2).
+                let (re, im) = (c.re.to_f64(), c.im.to_f64());
+                let r = re.hypot(im).sqrt();
+                let theta = im.atan2(re) / 2.0;
+                Ok(Value::complex(
+                    SemaNumber::Real(r * theta.cos()),
+                    SemaNumber::Real(r * theta.sin()),
+                ))
+            }
+            real if real.cmp_real(&SemaNumber::from_i64(0)) == Some(std::cmp::Ordering::Less) => {
+                // A negative real has no real square root: sqrt(-x) = sqrt(x)·i.
+                let mag = (-real.to_f64()).sqrt();
+                Ok(Value::complex(
+                    SemaNumber::from_i64(0),
+                    SemaNumber::Real(mag),
+                ))
+            }
+            real => Ok(Value::float(real.to_f64().sqrt())),
+        }
+    });
+
+    register_fn(env, "make-rectangular", |args| {
+        check_arity!(args, "make-rectangular", 2);
+        let re = args[0]
+            .as_number()
+            .filter(|n| n.is_real())
+            .ok_or_else(|| SemaError::type_error("real", args[0].type_name()))?;
+        let im = args[1]
+            .as_number()
+            .filter(|n| n.is_real())
+            .ok_or_else(|| SemaError::type_error("real", args[1].type_name()))?;
+        Ok(Value::complex(re, im))
+    });
+
+    register_fn(env, "make-polar", |args| {
+        check_arity!(args, "make-polar", 2);
+        let m = args[0]
+            .as_number()
+            .filter(|n| n.is_real())
+            .map(|n| n.to_f64())
+            .ok_or_else(|| SemaError::type_error("real", args[0].type_name()))?;
+        let a = args[1]
+            .as_number()
+            .filter(|n| n.is_real())
+            .map(|n| n.to_f64())
+            .ok_or_else(|| SemaError::type_error("real", args[1].type_name()))?;
+        Ok(Value::complex(
+            SemaNumber::Real(m * a.cos()),
+            SemaNumber::Real(m * a.sin()),
+        ))
+    });
+
+    register_fn(env, "real-part", |args| {
+        check_arity!(args, "real-part", 1);
+        match args[0].as_number() {
+            Some(SemaNumber::Complex(c)) => Ok(Value::from_number(c.re)),
+            Some(real) => Ok(Value::from_number(real)),
+            None => Err(SemaError::type_error("number", args[0].type_name())),
+        }
+    });
+
+    register_fn(env, "imag-part", |args| {
+        check_arity!(args, "imag-part", 1);
+        match args[0].as_number() {
+            Some(SemaNumber::Complex(c)) => Ok(Value::from_number(c.im)),
+            // A real number has an exact 0 imaginary part per R7RS.
+            Some(_) => Ok(Value::int(0)),
+            None => Err(SemaError::type_error("number", args[0].type_name())),
+        }
+    });
+
+    register_fn(env, "magnitude", |args| {
+        check_arity!(args, "magnitude", 1);
+        match args[0].as_number() {
+            // `abs` already covers every tower level: exact for real inputs,
+            // the (inexact) hypot for `Complex`.
+            Some(n) => Ok(Value::from_number(n.abs())),
+            None => Err(SemaError::type_error("number", args[0].type_name())),
+        }
+    });
+
+    register_fn(env, "angle", |args| {
+        check_arity!(args, "angle", 1);
+        match args[0].as_number() {
+            Some(SemaNumber::Complex(c)) => Ok(Value::float(c.im.to_f64().atan2(c.re.to_f64()))),
+            Some(real) => Ok(Value::float(if real.to_f64() < 0.0 {
+                std::f64::consts::PI
+            } else {
+                0.0
+            })),
+            None => Err(SemaError::type_error("number", args[0].type_name())),
+        }
     });
 
     register_fn(env, "pow", pow_impl);

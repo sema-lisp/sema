@@ -83,6 +83,57 @@ impl SemaNumber {
             other => other,
         }
     }
+
+    /// Lossy projection to `f64` for inexact operations (`sqrt`, `sin`, mixed
+    /// arithmetic). A `Complex` cannot project to a real — returns `f64::NAN`;
+    /// callers that can receive complex must special-case it before calling.
+    pub fn to_f64(&self) -> f64 {
+        use num_traits::ToPrimitive;
+        match self {
+            SemaNumber::Integer(n) => n.to_f64().unwrap_or(f64::INFINITY),
+            SemaNumber::Rational(r) => r.to_f64().unwrap_or(f64::INFINITY),
+            SemaNumber::Real(f) => *f,
+            SemaNumber::Complex(_) => f64::NAN,
+        }
+    }
+
+    /// Tower level for promotion ordering.
+    fn level(&self) -> u8 {
+        match self {
+            SemaNumber::Integer(_) => 0,
+            SemaNumber::Rational(_) => 1,
+            SemaNumber::Real(_) => 2,
+            SemaNumber::Complex(_) => 3,
+        }
+    }
+
+    /// Lift `self` up to the given level (never down). `Integer→Rational` is
+    /// exact; `→Real` uses `to_f64`; `→Complex` pairs with an exact 0
+    /// imaginary part.
+    fn lift_to(self, level: u8) -> SemaNumber {
+        use num_traits::Zero;
+        match (self.level(), level) {
+            (a, b) if a >= b => self,
+            (0, 1) => match self {
+                SemaNumber::Integer(n) => SemaNumber::Rational(BigRational::from(n)),
+                _ => unreachable!(),
+            },
+            (_, 2) => SemaNumber::Real(self.to_f64()),
+            (_, 3) => SemaNumber::Complex(Box::new(Complex {
+                re: self,
+                im: SemaNumber::Integer(BigInt::zero()),
+            })),
+            // (0,1) handled; (1,2)/(2,3) handled by the level==2/3 arms above.
+            _ => self,
+        }
+    }
+
+    /// Lift both operands to `max(level(a), level(b))` so a binary op has a
+    /// single same-level case to implement per level.
+    pub fn promote(a: SemaNumber, b: SemaNumber) -> (SemaNumber, SemaNumber) {
+        let target = a.level().max(b.level());
+        (a.lift_to(target), b.lift_to(target))
+    }
 }
 
 #[cfg(test)]
@@ -121,5 +172,30 @@ mod tests {
             im: SemaNumber::Real(0.0),
         }));
         assert!(matches!(c2.normalize(), SemaNumber::Complex(_)));
+    }
+
+    #[test]
+    fn to_f64_projection() {
+        assert_eq!(SemaNumber::Integer(BigInt::from(7)).to_f64(), 7.0);
+        assert_eq!(
+            SemaNumber::Rational(BigRational::new(BigInt::one(), BigInt::from(4))).to_f64(),
+            0.25
+        );
+        assert_eq!(SemaNumber::Real(1.5).to_f64(), 1.5);
+    }
+
+    #[test]
+    fn promote_to_common_level() {
+        // Integer + Rational → both Rational
+        let (a, b) = SemaNumber::promote(
+            SemaNumber::Integer(BigInt::from(2)),
+            SemaNumber::Rational(BigRational::new(BigInt::one(), BigInt::from(2))),
+        );
+        assert!(matches!(a, SemaNumber::Rational(_)));
+        assert!(matches!(b, SemaNumber::Rational(_)));
+        // Integer + Real → both Real
+        let (a, b) = SemaNumber::promote(SemaNumber::Integer(BigInt::from(2)), SemaNumber::Real(0.5));
+        assert!(matches!(a, SemaNumber::Real(_)));
+        assert!(matches!(b, SemaNumber::Real(_)));
     }
 }

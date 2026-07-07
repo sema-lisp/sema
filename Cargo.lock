@@ -3951,6 +3951,8 @@ dependencies = [
  "md5",
  "mime_guess",
  "notify",
+ "num-bigint",
+ "num-integer",
  "pdf-extract",
  "portable-pty",
  "pulldown-cmark",

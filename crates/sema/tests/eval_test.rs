@@ -1524,6 +1524,24 @@ eval_tests! {
     denominator_integer: "(denominator 5)" => common::eval("1"),
 }
 
+// Task 5.1: comparison and sign predicates over the full tower.
+eval_tests! {
+    lt_rationals: "(< 1/3 1/2)" => common::eval("#t"),
+    lt_rational_float: "(< 1/2 0.6)" => common::eval("#t"),
+    gt_bignum: "(> 170141183460469231731687303715884105728 9223372036854775807)" => common::eval("#t"),
+    eq_rational_float: "(= 1/2 0.5)" => common::eval("#t"),
+    eq_multi_arg_mixed: "(= 2 2.0 4/2)" => common::eval("#t"),
+    zero_pred_rational_zero: "(zero? 0/5)" => common::eval("#t"),
+    positive_pred_rational: "(positive? 1/3)" => common::eval("#t"),
+    negative_pred_rational: "(negative? -1/3)" => common::eval("#t"),
+    even_pred_bignum: "(even? 170141183460469231731687303715884105728)" => common::eval("#t"),
+    odd_pred_bignum: "(odd? 170141183460469231731687303715884105729)" => common::eval("#t"),
+}
+
+eval_error_tests! {
+    lt_complex_errors: "(< 1+2i 3)" => "cannot order complex",
+}
+
 // Regression tests for the runtime bug-hunt fixes (2026-07-07).
 eval_tests! {
     // Int↔float comparison is exact above 2^53 (was lossy: `as f64` collapsed

@@ -4484,6 +4484,10 @@ fn vm_lt(a: &Value, b: &Value) -> Result<bool, SemaError> {
         }
         (ValueViewRef::String(x), ValueViewRef::String(y)) => Ok(x < y),
         _ => match (a.as_number(), b.as_number()) {
+            (Some(x), Some(y)) if !x.is_real() || !y.is_real() => {
+                Err(SemaError::eval("cannot order complex numbers")
+                    .with_hint("complex numbers have no ordering; use = or zero? instead"))
+            }
             (Some(x), Some(y)) => Ok(x.cmp_real(&y) == Some(std::cmp::Ordering::Less)),
             _ => Err(SemaError::type_error(
                 "comparable values",

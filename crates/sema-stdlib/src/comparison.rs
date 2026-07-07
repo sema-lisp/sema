@@ -1,25 +1,27 @@
 use std::cmp::Ordering;
 
-use sema_core::num::cmp_int_float;
-use sema_core::{check_arity, SemaError, Value, ValueViewRef};
+use num_integer::Integer;
+use sema_core::number::SemaNumber;
+use sema_core::{check_arity, SemaError, Value};
 
 use crate::register_fn;
 
-/// Exact numeric ordering across int/float, or `None` for NaN. Errors if either
-/// argument is not a number.
+/// Exact numeric ordering across the whole tower (int/bignum/rational/float),
+/// or `None` for an unordered NaN. Errors if either argument is not a number,
+/// or if either is complex (complex numbers have no ordering — only `=`/
+/// `zero?` are meaningful for them).
 fn num_partial_cmp(a: &Value, b: &Value) -> Result<Option<Ordering>, SemaError> {
-    match (a.view_ref(), b.view_ref()) {
-        (ValueViewRef::Int(x), ValueViewRef::Int(y)) => Ok(Some(x.cmp(&y))),
-        (ValueViewRef::Float(x), ValueViewRef::Float(y)) => Ok(x.partial_cmp(&y)),
-        (ValueViewRef::Int(x), ValueViewRef::Float(y)) => Ok(cmp_int_float(x, y)),
-        (ValueViewRef::Float(x), ValueViewRef::Int(y)) => {
-            Ok(cmp_int_float(y, x).map(Ordering::reverse))
-        }
-        (ValueViewRef::Int(_) | ValueViewRef::Float(_), _) => {
-            Err(SemaError::type_error("number", b.type_name()))
-        }
-        _ => Err(SemaError::type_error("number", a.type_name())),
+    let na = a
+        .as_number()
+        .ok_or_else(|| SemaError::type_error("number", a.type_name()))?;
+    let nb = b
+        .as_number()
+        .ok_or_else(|| SemaError::type_error("number", b.type_name()))?;
+    if !na.is_real() || !nb.is_real() {
+        return Err(SemaError::eval("cannot order complex numbers")
+            .with_hint("complex numbers have no ordering; use = or zero? instead"));
     }
+    Ok(na.cmp_real(&nb))
 }
 
 fn num_cmp(
@@ -57,28 +59,14 @@ pub fn register(env: &sema_core::Env) {
     register_fn(env, "=", |args| {
         check_arity!(args, "=", 2..);
         for pair in args.windows(2) {
-            match (pair[0].view_ref(), pair[1].view_ref()) {
-                (ValueViewRef::Int(a), ValueViewRef::Int(b)) => {
-                    if a != b {
+            match (pair[0].as_number(), pair[1].as_number()) {
+                (Some(a), Some(b)) => {
+                    if !a.num_eq(&b) {
                         return Ok(Value::bool(false));
                     }
                 }
-                (ValueViewRef::Int(a), ValueViewRef::Float(b))
-                | (ValueViewRef::Float(b), ValueViewRef::Int(a)) => {
-                    if cmp_int_float(a, b) != Some(Ordering::Equal) {
-                        return Ok(Value::bool(false));
-                    }
-                }
-                (ValueViewRef::Float(a), ValueViewRef::Float(b)) => {
-                    if a != b {
-                        return Ok(Value::bool(false));
-                    }
-                }
-                _ => {
-                    if pair[0] != pair[1] {
-                        return Ok(Value::bool(false));
-                    }
-                }
+                (None, _) => return Err(SemaError::type_error("number", pair[0].type_name())),
+                (_, None) => return Err(SemaError::type_error("number", pair[1].type_name())),
             }
         }
         Ok(Value::bool(true))
@@ -96,44 +84,47 @@ pub fn register(env: &sema_core::Env) {
 
     register_fn(env, "zero?", |args| {
         check_arity!(args, "zero?", 1);
-        match args[0].view_ref() {
-            ValueViewRef::Int(n) => Ok(Value::bool(n == 0)),
-            ValueViewRef::Float(f) => Ok(Value::bool(f == 0.0)),
-            _ => Err(SemaError::type_error("number", args[0].type_name())),
-        }
+        let n = args[0]
+            .as_number()
+            .ok_or_else(|| SemaError::type_error("number", args[0].type_name()))?;
+        Ok(Value::bool(
+            n.cmp_real(&SemaNumber::from_i64(0)) == Some(Ordering::Equal),
+        ))
     });
 
     register_fn(env, "positive?", |args| {
         check_arity!(args, "positive?", 1);
-        match args[0].view_ref() {
-            ValueViewRef::Int(n) => Ok(Value::bool(n > 0)),
-            ValueViewRef::Float(f) => Ok(Value::bool(f > 0.0)),
-            _ => Err(SemaError::type_error("number", args[0].type_name())),
-        }
+        let n = args[0]
+            .as_number()
+            .ok_or_else(|| SemaError::type_error("number", args[0].type_name()))?;
+        Ok(Value::bool(
+            n.cmp_real(&SemaNumber::from_i64(0)) == Some(Ordering::Greater),
+        ))
     });
 
     register_fn(env, "negative?", |args| {
         check_arity!(args, "negative?", 1);
-        match args[0].view_ref() {
-            ValueViewRef::Int(n) => Ok(Value::bool(n < 0)),
-            ValueViewRef::Float(f) => Ok(Value::bool(f < 0.0)),
-            _ => Err(SemaError::type_error("number", args[0].type_name())),
-        }
+        let n = args[0]
+            .as_number()
+            .ok_or_else(|| SemaError::type_error("number", args[0].type_name()))?;
+        Ok(Value::bool(
+            n.cmp_real(&SemaNumber::from_i64(0)) == Some(Ordering::Less),
+        ))
     });
 
     register_fn(env, "even?", |args| {
         check_arity!(args, "even?", 1);
-        match args[0].view_ref() {
-            ValueViewRef::Int(n) => Ok(Value::bool(n % 2 == 0)),
-            _ => Err(SemaError::type_error("int", args[0].type_name())),
-        }
+        let n = args[0]
+            .as_bigint()
+            .ok_or_else(|| SemaError::type_error("integer", args[0].type_name()))?;
+        Ok(Value::bool(n.is_even()))
     });
 
     register_fn(env, "odd?", |args| {
         check_arity!(args, "odd?", 1);
-        match args[0].view_ref() {
-            ValueViewRef::Int(n) => Ok(Value::bool(n % 2 != 0)),
-            _ => Err(SemaError::type_error("int", args[0].type_name())),
-        }
+        let n = args[0]
+            .as_bigint()
+            .ok_or_else(|| SemaError::type_error("integer", args[0].type_name()))?;
+        Ok(Value::bool(n.is_odd()))
     });
 }

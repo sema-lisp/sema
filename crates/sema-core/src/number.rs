@@ -23,7 +23,7 @@ pub enum SemaNumber {
 /// A non-real number `re + im·i`. Components are `Integer`, `Rational`, or
 /// `Real` — never `Complex`. Exactness is per-component (a complex is exact
 /// iff both components are exact).
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Complex {
     pub re: SemaNumber,
     pub im: SemaNumber,
@@ -404,6 +404,63 @@ impl SemaNumber {
     }
 }
 
+impl PartialEq for SemaNumber {
+    fn eq(&self, other: &Self) -> bool {
+        use SemaNumber::*;
+        match (self, other) {
+            (Integer(a), Integer(b)) => a == b,
+            (Rational(a), Rational(b)) => a == b,
+            (Real(a), Real(b)) => a.to_bits() == b.to_bits(),
+            (Complex(a), Complex(b)) => a.re == b.re && a.im == b.im,
+            _ => false,
+        }
+    }
+}
+impl Eq for SemaNumber {}
+impl std::hash::Hash for SemaNumber {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        use SemaNumber::*;
+        match self {
+            Integer(n) => {
+                0u8.hash(state);
+                n.hash(state);
+            }
+            Rational(r) => {
+                1u8.hash(state);
+                r.hash(state);
+            }
+            Real(f) => {
+                2u8.hash(state);
+                f.to_bits().hash(state);
+            }
+            Complex(c) => {
+                3u8.hash(state);
+                c.re.hash(state);
+                c.im.hash(state);
+            }
+        }
+    }
+}
+impl Ord for SemaNumber {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        use SemaNumber::*;
+        self.level()
+            .cmp(&other.level())
+            .then_with(|| match (self, other) {
+                (Integer(a), Integer(b)) => a.cmp(b),
+                (Rational(a), Rational(b)) => a.cmp(b),
+                (Real(a), Real(b)) => a.total_cmp(b),
+                (Complex(a), Complex(b)) => a.re.cmp(&b.re).then_with(|| a.im.cmp(&b.im)),
+                _ => std::cmp::Ordering::Equal, // different levels already decided by level().cmp
+            })
+    }
+}
+impl PartialOrd for SemaNumber {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
 impl SemaNumber {
     /// Parse an integer of arbitrary size in the given radix (2..=36). Accepts
     /// an optional leading `+`/`-`. Returns `None` on any invalid digit.
@@ -629,5 +686,18 @@ mod tests {
         // rejects garbage
         assert!(SemaNumber::parse_rational("1/0").is_none()); // zero denominator
         assert!(SemaNumber::parse_int_radix("xyz", 16).is_none());
+    }
+
+    #[test]
+    fn structural_traits() {
+        use std::collections::HashSet;
+        let a = SemaNumber::Integer(BigInt::from(3));
+        let b = SemaNumber::Integer(BigInt::from(3));
+        assert_eq!(a, b);
+        let mut set = HashSet::new();
+        set.insert(SemaNumber::Real(1.5));
+        assert!(set.contains(&SemaNumber::Real(1.5)));
+        // Ordering by level then value (used only for deterministic map keys).
+        assert!(SemaNumber::Integer(BigInt::from(1)) < SemaNumber::Real(0.0)); // level 0 < 2
     }
 }

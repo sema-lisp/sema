@@ -71,6 +71,7 @@ const VAL_HASHMAP: u8 = 0x0B;
 const VAL_BYTEVECTOR: u8 = 0x0C;
 const VAL_BIGINT: u8 = 0x0D;
 const VAL_RATIONAL: u8 = 0x0E;
+const VAL_COMPLEX: u8 = 0x0F;
 
 const MAX_VALUE_DEPTH: usize = 128;
 
@@ -179,6 +180,11 @@ pub fn serialize_value(
                 buf.extend_from_slice(&len.to_le_bytes());
                 buf.extend_from_slice(&bytes);
             }
+        }
+        ValueView::Complex(c) => {
+            buf.push(VAL_COMPLEX);
+            serialize_value(&Value::from_number(c.re.clone()), buf, stb)?;
+            serialize_value(&Value::from_number(c.im.clone()), buf, stb)?;
         }
         // Runtime-only types cannot appear in bytecode constant pools
         _ => {
@@ -403,6 +409,19 @@ fn deserialize_value_inner(
             Ok(Value::rational(num_rational::BigRational::new(
                 numer, denom,
             )))
+        }
+        VAL_COMPLEX => {
+            let re = deserialize_value_inner(buf, cursor, table, remap, depth + 1)?;
+            let im = deserialize_value_inner(buf, cursor, table, remap, depth + 1)?;
+            let (re, im) = (
+                re.as_number().ok_or_else(|| {
+                    SemaError::eval("non-numeric real part in serialized complex")
+                })?,
+                im.as_number().ok_or_else(|| {
+                    SemaError::eval("non-numeric imaginary part in serialized complex")
+                })?,
+            );
+            Ok(Value::complex(re, im))
         }
         _ => Err(SemaError::eval(format!(
             "unknown value tag in bytecode: 0x{tag:02x}"
@@ -1485,6 +1504,21 @@ mod tests {
         use num_rational::BigRational;
         let r = BigRational::new(BigInt::from(1), BigInt::from(3));
         let val = sema_core::Value::rational(r);
+        let mut stb = StringTableBuilder::default();
+        let mut buf = Vec::new();
+        serialize_value(&val, &mut buf, &mut stb).unwrap();
+        let table = stb.finish();
+        let remap = build_remap_table(&table);
+        let mut cursor = 0;
+        let back = deserialize_value(&buf, &mut cursor, &table, &remap).unwrap();
+        assert_eq!(back, val);
+        assert_eq!(cursor, buf.len());
+    }
+
+    #[test]
+    fn complex_constant_roundtrips() {
+        use sema_core::number::SemaNumber;
+        let val = sema_core::Value::complex(SemaNumber::from_i64(3), SemaNumber::from_i64(4));
         let mut stb = StringTableBuilder::default();
         let mut buf = Vec::new();
         serialize_value(&val, &mut buf, &mut stb).unwrap();

@@ -271,6 +271,7 @@ Each constant is serialized as a **type tag** (1 byte) followed by type-specific
 | `0x0C` | Bytevector | 4 bytes: length (u32), then `length` raw bytes |
 | `0x0D` | BigInt | 4 bytes: byte-length (u32), then that many bytes of two's-complement little-endian magnitude (`num-bigint`'s `to_signed_bytes_le`) |
 | `0x0E` | Rational | Two `0x0D`-style parts (numerator, then denominator): each a 4-byte byte-length (u32) followed by that many bytes of two's-complement little-endian magnitude |
+| `0x0F` | Complex | Two nested SerializedValues (real part, then imaginary part); each component is itself an Int/BigInt/Rational/Float SerializedValue |
 
 ### Values That Cannot Appear in Bytecode
 

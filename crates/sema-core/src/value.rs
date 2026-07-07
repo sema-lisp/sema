@@ -12,6 +12,7 @@ use num_rational::BigRational;
 use num_traits::ToPrimitive;
 
 use crate::error::SemaError;
+use crate::number::Complex as SemaComplex;
 use crate::number::SemaNumber;
 use crate::EvalContext;
 
@@ -550,6 +551,7 @@ const TAG_ASYNC_PROMISE: u64 = 28;
 const TAG_CHANNEL: u64 = 29;
 const TAG_BIGINT: u64 = 30;
 const TAG_RATIONAL: u64 = 31;
+const TAG_COMPLEX: u64 = 32;
 
 /// Small-int range: [-2^44, 2^44 - 1] = [-17_592_186_044_416, +17_592_186_044_415]
 const SMALL_INT_MIN: i64 = -(1i64 << 44);
@@ -621,6 +623,7 @@ pub enum ValueView {
     Int(i64),
     BigInt(Rc<BigInt>),
     Rational(Rc<BigRational>),
+    Complex(Rc<SemaComplex>),
     Float(f64),
     String(Rc<String>),
     Symbol(Spur),
@@ -658,6 +661,7 @@ pub enum ValueViewRef<'a> {
     Int(i64),
     BigInt(&'a BigInt),
     Rational(&'a BigRational),
+    Complex(&'a SemaComplex),
     Float(f64),
     String(&'a str),
     Symbol(Spur),
@@ -802,6 +806,12 @@ impl Value {
         } else {
             Value::from_rc_ptr(TAG_RATIONAL, Rc::new(r))
         }
+    }
+
+    /// Construct a complex number from its real/imaginary tower components,
+    /// normalizing an exact-zero imaginary part down to the real part alone.
+    pub fn complex(re: SemaNumber, im: SemaNumber) -> Value {
+        Value::from_number(SemaNumber::Complex(Box::new(SemaComplex { re, im })))
     }
 
     pub fn string(s: &str) -> Value {
@@ -1113,6 +1123,7 @@ impl Value {
             }
             TAG_BIGINT => ValueView::BigInt(unsafe { self.get_rc::<BigInt>() }),
             TAG_RATIONAL => ValueView::Rational(unsafe { self.get_rc::<BigRational>() }),
+            TAG_COMPLEX => ValueView::Complex(unsafe { self.get_rc::<SemaComplex>() }),
             // SAFETY: every TAG_X arm below calls `get_rc::<T>()` where T matches the
             // type stored by the corresponding Value::<x>() constructor. The Clone and
             // Drop impls elsewhere in this file mirror this dispatch table — when adding
@@ -1186,6 +1197,7 @@ impl Value {
             }
             TAG_BIGINT => ValueViewRef::BigInt(unsafe { self.borrow_ref::<BigInt>() }),
             TAG_RATIONAL => ValueViewRef::Rational(unsafe { self.borrow_ref::<BigRational>() }),
+            TAG_COMPLEX => ValueViewRef::Complex(unsafe { self.borrow_ref::<SemaComplex>() }),
             // SAFETY: same tag/type correspondence as view() — see the
             // comment in view().  borrow_ref returns &T without touching
             // the refcount.
@@ -1257,6 +1269,7 @@ impl Value {
                 TAG_INT_BIG => count_at::<i64>(ptr),
                 TAG_BIGINT => count_at::<BigInt>(ptr),
                 TAG_RATIONAL => count_at::<BigRational>(ptr),
+                TAG_COMPLEX => count_at::<SemaComplex>(ptr),
                 TAG_STRING => count_at::<String>(ptr),
                 TAG_LIST | TAG_VECTOR => count_at::<Vec<Value>>(ptr),
                 TAG_MAP => count_at::<BTreeMap<Value, Value>>(ptr),
@@ -1296,6 +1309,7 @@ impl Value {
             TAG_FALSE | TAG_TRUE => "bool",
             TAG_INT_SMALL | TAG_INT_BIG | TAG_BIGINT => "int",
             TAG_RATIONAL => "rational",
+            TAG_COMPLEX => "complex",
             TAG_CHAR => "char",
             TAG_SYMBOL => "symbol",
             TAG_KEYWORD => "keyword",
@@ -1358,6 +1372,11 @@ impl Value {
     #[inline(always)]
     pub fn is_rational(&self) -> bool {
         is_boxed(self.0) && get_tag(self.0) == TAG_RATIONAL
+    }
+
+    #[inline(always)]
+    pub fn is_complex(&self) -> bool {
+        is_boxed(self.0) && get_tag(self.0) == TAG_COMPLEX
     }
 
     #[inline(always)]
@@ -1470,27 +1489,35 @@ impl Value {
     }
 
     /// Lift any numeric Value into the tower type for arithmetic. `None` for
-    /// non-numbers. (Extended with Complex arm in Phase 3.)
+    /// non-numbers.
     pub fn as_number(&self) -> Option<SemaNumber> {
         match self.view_ref() {
             ValueViewRef::Int(n) => Some(SemaNumber::from_i64(n)),
             ValueViewRef::BigInt(n) => Some(SemaNumber::Integer(n.clone())),
             ValueViewRef::Rational(r) => Some(SemaNumber::Rational(r.clone())),
+            ValueViewRef::Complex(c) => Some(SemaNumber::Complex(Box::new(c.clone()))),
             ValueViewRef::Float(f) => Some(SemaNumber::Real(f)),
             _ => None,
         }
     }
 
-    /// Lower a tower number to the tightest Value. (Extended with Complex arm
-    /// in Phase 3.)
+    /// Lower a tower number to the tightest Value.
     pub fn from_number(n: SemaNumber) -> Value {
         match n.normalize() {
             SemaNumber::Integer(big) => Value::from_bigint(big),
             SemaNumber::Rational(r) => Value::rational(r),
             SemaNumber::Real(f) => Value::float(f),
-            SemaNumber::Complex(_) => {
-                unreachable!("complex Values are introduced in Phase 3")
-            }
+            SemaNumber::Complex(c) => Value::from_rc_ptr(TAG_COMPLEX, Rc::new(*c)),
+        }
+    }
+
+    /// Lift a complex Value to the tower's `Complex` component pair. `None`
+    /// for non-complex Values.
+    pub fn as_complex(&self) -> Option<SemaComplex> {
+        if let ValueViewRef::Complex(c) = self.view_ref() {
+            Some(c.clone())
+        } else {
+            None
         }
     }
 
@@ -1923,6 +1950,7 @@ impl Clone for Value {
                         TAG_INT_BIG => Rc::increment_strong_count(ptr as *const i64),
                         TAG_BIGINT => Rc::increment_strong_count(ptr as *const BigInt),
                         TAG_RATIONAL => Rc::increment_strong_count(ptr as *const BigRational),
+                        TAG_COMPLEX => Rc::increment_strong_count(ptr as *const SemaComplex),
                         TAG_STRING => Rc::increment_strong_count(ptr as *const String),
                         TAG_LIST | TAG_VECTOR => {
                             Rc::increment_strong_count(ptr as *const Vec<Value>)
@@ -1979,6 +2007,7 @@ impl Drop for Value {
                         TAG_INT_BIG => drop(Rc::from_raw(ptr as *const i64)),
                         TAG_BIGINT => drop(Rc::from_raw(ptr as *const BigInt)),
                         TAG_RATIONAL => drop(Rc::from_raw(ptr as *const BigRational)),
+                        TAG_COMPLEX => drop(Rc::from_raw(ptr as *const SemaComplex)),
                         TAG_STRING => drop(Rc::from_raw(ptr as *const String)),
                         TAG_LIST | TAG_VECTOR => drop(Rc::from_raw(ptr as *const Vec<Value>)),
                         TAG_MAP => drop(Rc::from_raw(ptr as *const BTreeMap<Value, Value>)),
@@ -2036,6 +2065,7 @@ impl PartialEq for Value {
             (ValueViewRef::Int(a), ValueViewRef::Int(b)) => a == b,
             (ValueViewRef::BigInt(a), ValueViewRef::BigInt(b)) => a == b,
             (ValueViewRef::Rational(a), ValueViewRef::Rational(b)) => a == b,
+            (ValueViewRef::Complex(a), ValueViewRef::Complex(b)) => a.re == b.re && a.im == b.im,
             (ValueViewRef::Float(a), ValueViewRef::Float(b)) => a == b,
             (ValueViewRef::String(a), ValueViewRef::String(b)) => a == b,
             (ValueViewRef::Symbol(a), ValueViewRef::Symbol(b)) => a == b,
@@ -2087,6 +2117,11 @@ impl Hash for Value {
             ValueViewRef::Rational(r) => {
                 31u8.hash(state);
                 r.hash(state);
+            }
+            ValueViewRef::Complex(c) => {
+                32u8.hash(state);
+                c.re.hash(state);
+                c.im.hash(state);
             }
             ValueViewRef::Float(f) => {
                 3u8.hash(state);
@@ -2184,6 +2219,7 @@ impl Ord for Value {
                 ValueViewRef::I64Array(_) => 15,
                 ValueViewRef::Stream(_) => 16,
                 ValueViewRef::Rational(_) => 18,
+                ValueViewRef::Complex(_) => 19,
                 _ => 17,
             }
         }
@@ -2195,6 +2231,9 @@ impl Ord for Value {
             (ValueViewRef::Int(a), ValueViewRef::BigInt(b)) => BigInt::from(a).cmp(b),
             (ValueViewRef::BigInt(a), ValueViewRef::Int(b)) => a.cmp(&BigInt::from(b)),
             (ValueViewRef::Rational(a), ValueViewRef::Rational(b)) => a.cmp(b),
+            (ValueViewRef::Complex(a), ValueViewRef::Complex(b)) => {
+                a.re.cmp(&b.re).then_with(|| a.im.cmp(&b.im))
+            }
             (ValueViewRef::Float(a), ValueViewRef::Float(b)) => {
                 // Normalize signed zeros so -0.0 and +0.0 are the same map key:
                 // Hash already collapses them and `=` treats them equal, but
@@ -2248,6 +2287,9 @@ impl fmt::Display for Value {
             ValueViewRef::Int(n) => write!(f, "{n}"),
             ValueViewRef::BigInt(n) => write!(f, "{n}"),
             ValueViewRef::Rational(r) => write!(f, "{}/{}", r.numer(), r.denom()),
+            ValueViewRef::Complex(c) => {
+                write!(f, "{}", SemaNumber::Complex(Box::new((*c).clone())))
+            }
             ValueViewRef::Float(n) => {
                 if n.fract() == 0.0 {
                     write!(f, "{n:.1}")
@@ -2537,6 +2579,11 @@ impl fmt::Debug for Value {
             ValueView::Int(n) => write!(f, "Int({n})"),
             ValueView::BigInt(n) => write!(f, "Int({n})"),
             ValueView::Rational(r) => write!(f, "Rational({}/{})", r.numer(), r.denom()),
+            ValueView::Complex(c) => write!(
+                f,
+                "Complex({})",
+                SemaNumber::Complex(Box::new((*c).clone()))
+            ),
             ValueView::Float(n) => write!(f, "Float({n})"),
             ValueView::String(s) => write!(f, "String({:?})", &**s),
             ValueView::Symbol(s) => write!(f, "Symbol({})", resolve(s)),
@@ -3227,5 +3274,25 @@ mod tests {
         assert!(!two.is_rational());
         assert_eq!(two.as_int(), Some(2));
         assert_eq!(third.clone(), third);
+    }
+
+    #[test]
+    fn complex_roundtrip_and_normalize() {
+        use crate::number::SemaNumber;
+        let n = |v: i64| SemaNumber::from_i64(v);
+        let c = Value::complex(n(3), n(4));
+        assert!(c.is_complex());
+        assert_eq!(c.to_string(), "3+4i");
+        assert_eq!(c.type_name(), "complex");
+        let comp = c.as_complex().unwrap();
+        assert_eq!(comp.re, n(3));
+        assert_eq!(comp.im, n(4));
+        // Structural equality/clone/drop refcount safety.
+        let c2 = c.clone();
+        assert_eq!(c, c2);
+        // Exact-zero imaginary part normalizes down to the real part alone.
+        let real = Value::complex(n(5), n(0));
+        assert!(!real.is_complex());
+        assert_eq!(real.as_int(), Some(5));
     }
 }

@@ -135,6 +135,11 @@ impl SemaNumber {
         (a.lift_to(target), b.lift_to(target))
     }
 
+    // `add`/`sub`/`mul`/`div`/`neg` deliberately mirror the `std::ops` method
+    // names (this is the tower's public arithmetic interface, consumed by
+    // later phases as `SemaNumber::add` etc.) rather than implementing the
+    // traits, since `div` must return `Result` for divide-by-zero signalling.
+    #[allow(clippy::should_implement_trait)]
     pub fn neg(self) -> SemaNumber {
         match self {
             SemaNumber::Integer(n) => SemaNumber::Integer(-n),
@@ -148,25 +153,30 @@ impl SemaNumber {
         .normalize()
     }
 
+    #[allow(clippy::should_implement_trait)]
     pub fn add(self, other: SemaNumber) -> SemaNumber {
         let (a, b) = SemaNumber::promote(self, other);
         match (a, b) {
             (SemaNumber::Integer(x), SemaNumber::Integer(y)) => SemaNumber::Integer(x + y),
             (SemaNumber::Rational(x), SemaNumber::Rational(y)) => SemaNumber::Rational(x + y),
             (SemaNumber::Real(x), SemaNumber::Real(y)) => SemaNumber::Real(x + y),
-            (SemaNumber::Complex(x), SemaNumber::Complex(y)) => SemaNumber::Complex(Box::new(Complex {
-                re: x.re.add(y.re),
-                im: x.im.add(y.im),
-            })),
+            (SemaNumber::Complex(x), SemaNumber::Complex(y)) => {
+                SemaNumber::Complex(Box::new(Complex {
+                    re: x.re.add(y.re),
+                    im: x.im.add(y.im),
+                }))
+            }
             _ => unreachable!("promote guarantees equal levels"),
         }
         .normalize()
     }
 
+    #[allow(clippy::should_implement_trait)]
     pub fn sub(self, other: SemaNumber) -> SemaNumber {
         self.add(other.neg())
     }
 
+    #[allow(clippy::should_implement_trait)]
     pub fn mul(self, other: SemaNumber) -> SemaNumber {
         let (a, b) = SemaNumber::promote(self, other);
         match (a, b) {
@@ -196,6 +206,7 @@ impl SemaNumber {
 pub struct DivByZero;
 
 impl SemaNumber {
+    #[allow(clippy::should_implement_trait)]
     pub fn div(self, other: SemaNumber) -> Result<SemaNumber, DivByZero> {
         use num_traits::Zero;
         // Guard exact-zero divisor up front (before promotion, so `1/0` and
@@ -208,12 +219,17 @@ impl SemaNumber {
         let (a, b) = SemaNumber::promote(self, other);
         let out = match (a, b) {
             // Integer/Integer → exact rational (reduces; normalize collapses to Integer if whole).
-            (SemaNumber::Integer(x), SemaNumber::Integer(y)) => SemaNumber::Rational(BigRational::new(x, y)),
+            (SemaNumber::Integer(x), SemaNumber::Integer(y)) => {
+                SemaNumber::Rational(BigRational::new(x, y))
+            }
             (SemaNumber::Rational(x), SemaNumber::Rational(y)) => SemaNumber::Rational(x / y),
             (SemaNumber::Real(x), SemaNumber::Real(y)) => SemaNumber::Real(x / y),
             (SemaNumber::Complex(x), SemaNumber::Complex(y)) => {
                 // (a+bi)/(c+di) = ((a+bi)(c-di)) / (c²+d²)
-                let denom = y.re.clone().mul(y.re.clone()).add(y.im.clone().mul(y.im.clone()));
+                let denom =
+                    y.re.clone()
+                        .mul(y.re.clone())
+                        .add(y.im.clone().mul(y.im.clone()));
                 let num = SemaNumber::Complex(x).mul(SemaNumber::Complex(Box::new(Complex {
                     re: y.re,
                     im: y.im.neg(),
@@ -246,7 +262,9 @@ impl SemaNumber {
 
     pub fn num_eq(&self, other: &SemaNumber) -> bool {
         match (self, other) {
-            (SemaNumber::Complex(a), SemaNumber::Complex(b)) => a.re.num_eq(&b.re) && a.im.num_eq(&b.im),
+            (SemaNumber::Complex(a), SemaNumber::Complex(b)) => {
+                a.re.num_eq(&b.re) && a.im.num_eq(&b.im)
+            }
             (SemaNumber::Complex(_), _) | (_, SemaNumber::Complex(_)) => false,
             _ => self.cmp_real(other) == Some(std::cmp::Ordering::Equal),
         }
@@ -290,7 +308,9 @@ impl SemaNumber {
         // Mixed or both-exact: lift any (finite) Real to an exact rational.
         let to_exact = |v: &SemaNumber| -> SemaNumber {
             match v {
-                SemaNumber::Real(f) => SemaNumber::real_to_exact(*f).expect("finite (checked above)"),
+                SemaNumber::Real(f) => {
+                    SemaNumber::real_to_exact(*f).expect("finite (checked above)")
+                }
                 other => other.clone(),
             }
         };
@@ -330,7 +350,9 @@ impl std::fmt::Display for SemaNumber {
                 fmt_real(&c.re, f)?;
                 // Explicit sign then magnitude, so `0-1i` reads back correctly.
                 let (sign, mag) = match &c.im {
-                    SemaNumber::Integer(v) if *v < BigInt::zero() => ('-', SemaNumber::Integer(-v.clone())),
+                    SemaNumber::Integer(v) if *v < BigInt::zero() => {
+                        ('-', SemaNumber::Integer(-v.clone()))
+                    }
                     SemaNumber::Rational(r) if *r < BigRational::from(BigInt::zero()) => {
                         ('-', SemaNumber::Rational(-r.clone()))
                     }
@@ -369,7 +391,9 @@ impl SemaNumber {
     /// exactness should error; R7RS `inexact->exact` on ±inf/NaN is undefined).
     pub fn to_exact(self) -> SemaNumber {
         match self {
-            SemaNumber::Real(f) => SemaNumber::real_to_exact(f).map(|n| n.normalize()).unwrap_or(SemaNumber::Real(f)),
+            SemaNumber::Real(f) => SemaNumber::real_to_exact(f)
+                .map(|n| n.normalize())
+                .unwrap_or(SemaNumber::Real(f)),
             SemaNumber::Complex(c) => SemaNumber::Complex(Box::new(Complex {
                 re: c.re.to_exact(),
                 im: c.im.to_exact(),
@@ -377,6 +401,40 @@ impl SemaNumber {
             .normalize(),
             exact => exact,
         }
+    }
+}
+
+impl SemaNumber {
+    /// Parse an integer of arbitrary size in the given radix (2..=36). Accepts
+    /// an optional leading `+`/`-`. Returns `None` on any invalid digit.
+    pub fn parse_int_radix(digits: &str, radix: u32) -> Option<SemaNumber> {
+        let (sign, body) = match digits.strip_prefix('-') {
+            Some(rest) => (num_bigint::Sign::Minus, rest),
+            None => (
+                num_bigint::Sign::Plus,
+                digits.strip_prefix('+').unwrap_or(digits),
+            ),
+        };
+        if body.is_empty() {
+            return None;
+        }
+        let bytes = body.as_bytes();
+        let magnitude = num_bigint::BigUint::parse_bytes(bytes, radix)?;
+        Some(SemaNumber::Integer(BigInt::from_biguint(sign, magnitude)).normalize())
+    }
+
+    /// Parse `numer/denom` (decimal, sign on the numerator). `None` on a zero
+    /// denominator or invalid digits.
+    pub fn parse_rational(s: &str) -> Option<SemaNumber> {
+        use num_traits::Zero;
+        use std::str::FromStr;
+        let (n, d) = s.split_once('/')?;
+        let numer = BigInt::from_str(n).ok()?;
+        let denom = BigInt::from_str(d).ok()?;
+        if denom.is_zero() {
+            return None;
+        }
+        Some(SemaNumber::Rational(BigRational::new(numer, denom)).normalize())
     }
 }
 
@@ -438,7 +496,8 @@ mod tests {
         assert!(matches!(a, SemaNumber::Rational(_)));
         assert!(matches!(b, SemaNumber::Rational(_)));
         // Integer + Real → both Real
-        let (a, b) = SemaNumber::promote(SemaNumber::Integer(BigInt::from(2)), SemaNumber::Real(0.5));
+        let (a, b) =
+            SemaNumber::promote(SemaNumber::Integer(BigInt::from(2)), SemaNumber::Real(0.5));
         assert!(matches!(a, SemaNumber::Real(_)));
         assert!(matches!(b, SemaNumber::Real(_)));
     }
@@ -461,7 +520,10 @@ mod tests {
         // -(1/2) = -1/2
         assert_eq!(half().neg().to_f64(), -0.5);
         // contagion: 2 + 0.5 = 2.5 as Real
-        assert!(matches!(two().add(SemaNumber::Real(0.5)), SemaNumber::Real(_)));
+        assert!(matches!(
+            two().add(SemaNumber::Real(0.5)),
+            SemaNumber::Real(_)
+        ));
     }
 
     #[test]
@@ -474,11 +536,16 @@ mod tests {
         // 6 / 3 = 2 (normalizes to Integer)
         assert!(matches!(n(6).div(n(3)).unwrap(), SemaNumber::Integer(k) if k == BigInt::from(2)));
         // 1 / 2.0 = 0.5 (inexact contagion)
-        assert!(matches!(n(1).div(SemaNumber::Real(2.0)).unwrap(), SemaNumber::Real(_)));
+        assert!(matches!(
+            n(1).div(SemaNumber::Real(2.0)).unwrap(),
+            SemaNumber::Real(_)
+        ));
         // divide by exact zero → error
         assert!(n(1).div(n(0)).is_err());
         // divide by inexact zero → real infinity (IEEE), NOT an error
-        assert!(matches!(n(1).div(SemaNumber::Real(0.0)).unwrap(), SemaNumber::Real(f) if f.is_infinite()));
+        assert!(
+            matches!(n(1).div(SemaNumber::Real(0.0)).unwrap(), SemaNumber::Real(f) if f.is_infinite())
+        );
     }
 
     #[test]
@@ -495,7 +562,10 @@ mod tests {
         assert_eq!(n(3).cmp_real(&n(2)), Some(Ordering::Greater));
         // exact bignum vs float above 2^53 stays exact (no lossy cast)
         let big = SemaNumber::Integer(BigInt::from(9_007_199_254_740_993_i64));
-        assert_eq!(big.cmp_real(&SemaNumber::Real(9_007_199_254_740_992.0)), Some(Ordering::Greater));
+        assert_eq!(
+            big.cmp_real(&SemaNumber::Real(9_007_199_254_740_992.0)),
+            Some(Ordering::Greater)
+        );
         // complex is unordered
         let i = SemaNumber::Complex(Box::new(Complex { re: n(0), im: n(1) }));
         assert_eq!(i.cmp_real(&n(0)), None);
@@ -514,7 +584,10 @@ mod tests {
         assert_eq!(SemaNumber::Real(2.5).to_string(), "2.5");
         let c = SemaNumber::Complex(Box::new(Complex { re: n(3), im: n(4) }));
         assert_eq!(c.to_string(), "3+4i");
-        let c2 = SemaNumber::Complex(Box::new(Complex { re: n(0), im: n(-1) }));
+        let c2 = SemaNumber::Complex(Box::new(Complex {
+            re: n(0),
+            im: n(-1),
+        }));
         assert_eq!(c2.to_string(), "0-1i");
     }
 
@@ -527,9 +600,34 @@ mod tests {
         assert!(matches!(SemaNumber::Real(0.5).to_exact(),
             SemaNumber::Rational(r) if r == BigRational::new(BigInt::one(), BigInt::from(2))));
         // inexact 2.0 → exact 2 (normalizes to Integer)
-        assert!(matches!(SemaNumber::Real(2.0).to_exact(), SemaNumber::Integer(k) if k == BigInt::from(2)));
+        assert!(
+            matches!(SemaNumber::Real(2.0).to_exact(), SemaNumber::Integer(k) if k == BigInt::from(2))
+        );
         // bridges
         assert!(matches!(SemaNumber::from_i64(5), SemaNumber::Integer(k) if k == BigInt::from(5)));
         assert!(matches!(SemaNumber::from_f64(1.5), SemaNumber::Real(f) if f == 1.5));
+    }
+
+    #[test]
+    fn parse_literals() {
+        // arbitrary-precision decimal beyond i64
+        let big =
+            SemaNumber::parse_int_radix("170141183460469231731687303715884105728", 10).unwrap();
+        assert!(matches!(big, SemaNumber::Integer(_)));
+        // hex / binary
+        assert!(matches!(SemaNumber::parse_int_radix("ff", 16).unwrap(),
+            SemaNumber::Integer(n) if n == BigInt::from(255)));
+        assert!(matches!(SemaNumber::parse_int_radix("-101", 2).unwrap(),
+            SemaNumber::Integer(n) if n == BigInt::from(-5)));
+        // rational
+        assert!(matches!(SemaNumber::parse_rational("22/7").unwrap(),
+            SemaNumber::Rational(r) if r == BigRational::new(BigInt::from(22), BigInt::from(7))));
+        // 6/3 → normalizes to Integer 2
+        assert!(
+            matches!(SemaNumber::parse_rational("6/3").unwrap(), SemaNumber::Integer(n) if n == BigInt::from(2))
+        );
+        // rejects garbage
+        assert!(SemaNumber::parse_rational("1/0").is_none()); // zero denominator
+        assert!(SemaNumber::parse_int_radix("xyz", 16).is_none());
     }
 }

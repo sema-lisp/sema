@@ -1468,9 +1468,10 @@ eval_tests! {
     complex_pred_real: "(complex? 5)" => common::eval("#t"),
     real_pred_complex: "(real? 3+4i)" => common::eval("#f"),
     real_pred_real: "(real? 5)" => common::eval("#t"),
-    // sqrt of a negative real returns an inexact complex on the imaginary axis.
-    sqrt_neg_one: "(sqrt -1)" => common::eval("0+1.0i"),
-    sqrt_neg_four: "(sqrt -4)" => common::eval("0+2.0i"),
+    // sqrt of a negative exact perfect square is an exact complex on the
+    // imaginary axis (R7RS: (sqrt -1) => +i); non-squares stay inexact.
+    sqrt_neg_one: "(sqrt -1)" => common::eval("0+1i"),
+    sqrt_neg_four: "(sqrt -4)" => common::eval("0+2i"),
     // make-polar with angle 0: components are bit-exact (cos(0)=1, sin(0)=0).
     make_polar_real_part: "(real-part (make-polar 5.0 0.0))" => Value::float(5.0),
     make_polar_imag_part: "(imag-part (make-polar 5.0 0.0))" => Value::float(0.0),

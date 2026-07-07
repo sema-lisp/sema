@@ -153,6 +153,28 @@ impl SemaNumber {
         .normalize()
     }
 
+    /// The exact square root of a non-negative exact perfect square, else
+    /// `None`. Keeps `(sqrt 4) => 2` exact and lets `(sqrt -1) => +i` produce
+    /// an exact imaginary part (R7RS). Inexact reals and non-squares yield
+    /// `None`, leaving the caller to fall back to `f64::sqrt`.
+    pub fn exact_sqrt(&self) -> Option<SemaNumber> {
+        use num_traits::Signed;
+        match self {
+            SemaNumber::Integer(n) if !n.is_negative() => {
+                let root = n.sqrt();
+                (&root * &root == *n).then_some(SemaNumber::Integer(root))
+            }
+            SemaNumber::Rational(r) if !r.is_negative() => {
+                // A reduced non-negative rational is a perfect square iff its
+                // numerator and denominator are both perfect squares.
+                let (rn, rd) = (r.numer().sqrt(), r.denom().sqrt());
+                (&rn * &rn == *r.numer() && &rd * &rd == *r.denom())
+                    .then(|| SemaNumber::Rational(BigRational::new(rn, rd)).normalize())
+            }
+            _ => None,
+        }
+    }
+
     #[allow(clippy::should_implement_trait)]
     pub fn add(self, other: SemaNumber) -> SemaNumber {
         let (a, b) = SemaNumber::promote(self, other);

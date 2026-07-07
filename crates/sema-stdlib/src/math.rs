@@ -184,13 +184,19 @@ pub fn register(env: &sema_core::Env) {
             }
             real if real.cmp_real(&SemaNumber::from_i64(0)) == Some(std::cmp::Ordering::Less) => {
                 // A negative real has no real square root: sqrt(-x) = sqrt(x)·i.
-                let mag = (-real.to_f64()).sqrt();
-                Ok(Value::complex(
-                    SemaNumber::from_i64(0),
-                    SemaNumber::Real(mag),
-                ))
+                // An exact perfect square keeps an exact imaginary part
+                // (R7RS: (sqrt -1) => +i, (sqrt -4) => +2i).
+                let mag = real.clone().abs();
+                let im = mag
+                    .exact_sqrt()
+                    .unwrap_or_else(|| SemaNumber::Real(mag.to_f64().sqrt()));
+                Ok(Value::complex(SemaNumber::from_i64(0), im))
             }
-            real => Ok(Value::float(real.to_f64().sqrt())),
+            // An exact perfect square stays exact: (sqrt 4) => 2.
+            real => match real.exact_sqrt() {
+                Some(root) => Ok(Value::from_number(root)),
+                None => Ok(Value::float(real.to_f64().sqrt())),
+            },
         }
     });
 

@@ -453,6 +453,10 @@ impl Parser {
                 ..
             }) => Ok(Value::int(*n)),
             Some(SpannedToken {
+                token: Token::BigInt(n),
+                ..
+            }) => Ok(Value::from_bigint(n.clone())),
+            Some(SpannedToken {
                 token: Token::Float(f),
                 ..
             }) => Ok(Value::float(*f)),
@@ -583,6 +587,7 @@ fn token_display(tok: &Token) -> &'static str {
         Token::Dot => ".",
         Token::BytevectorStart => "#u8(",
         Token::Int(_) => "integer",
+        Token::BigInt(_) => "integer",
         Token::Float(_) => "float",
         Token::String(_) => "string",
         Token::Symbol(_) => "symbol",

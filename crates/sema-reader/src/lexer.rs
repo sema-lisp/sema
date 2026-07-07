@@ -20,6 +20,7 @@ pub enum Token {
     UnquoteSplice,
     Deref,
     Int(i64),
+    BigInt(num_bigint::BigInt),
     Float(f64),
     String(String),
     FString(Vec<FStringPart>),
@@ -778,11 +779,19 @@ fn read_number(chars: &[char], span: &Span) -> Result<(Token, usize), SemaError>
         })?;
         Ok((Token::Float(f), i))
     } else {
-        let n: i64 = s.parse().map_err(|_| SemaError::Reader {
-            message: format!("invalid integer: {s}"),
-            span: *span,
-        })?;
-        Ok((Token::Int(n), i))
+        match s.parse::<i64>() {
+            Ok(n) => Ok((Token::Int(n), i)),
+            Err(_) => {
+                // Out of i64 range: parse as an arbitrary-precision integer.
+                let big = num_bigint::BigInt::parse_bytes(s.as_bytes(), 10).ok_or_else(|| {
+                    SemaError::Reader {
+                        message: format!("invalid integer: {s}"),
+                        span: *span,
+                    }
+                })?;
+                Ok((Token::BigInt(big), i))
+            }
+        }
     }
 }
 
@@ -972,6 +981,25 @@ mod tests {
                 "newline",
                 "sym:b"
             ]
+        );
+    }
+
+    #[test]
+    fn out_of_range_integer_lexes_as_bigint() {
+        use num_bigint::BigInt;
+        use std::str::FromStr;
+        let first = |src: &str| tokenize(src).unwrap().into_iter().next().unwrap().token;
+        assert_eq!(
+            first("170141183460469231731687303715884105728"),
+            Token::BigInt(BigInt::from_str("170141183460469231731687303715884105728").unwrap())
+        );
+        // in-range still lexes as Int
+        assert_eq!(first("42"), Token::Int(42));
+        assert_eq!(first("-9223372036854775808"), Token::Int(i64::MIN));
+        // one past i64::MAX is a bignum
+        assert_eq!(
+            first("9223372036854775808"),
+            Token::BigInt(BigInt::from_str("9223372036854775808").unwrap())
         );
     }
 }

@@ -98,7 +98,9 @@ fn style_for(
     let base = match token {
         Token::String(_) | Token::FString(_) | Token::Char(_) => Style::new().fg(SAGE),
         Token::Regex(_) => Style::new().fg(SECONDARY),
-        Token::Int(_) | Token::Float(_) | Token::Bool(_) => Style::new().fg(AMBER),
+        Token::Int(_) | Token::BigInt(_) | Token::Float(_) | Token::Bool(_) => {
+            Style::new().fg(AMBER)
+        }
         Token::Keyword(_) => Style::new().fg(TEAL),
         Token::Comment(_) => Style::new().fg(TERTIARY),
         Token::Symbol(name) => {

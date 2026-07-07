@@ -233,6 +233,78 @@ impl SemaNumber {
     }
 }
 
+impl SemaNumber {
+    /// Convert a finite `f64` to its exact rational value (no rounding). Used
+    /// so exact-vs-inexact comparison never loses precision above 2^53.
+    fn real_to_exact(f: f64) -> Option<SemaNumber> {
+        if !f.is_finite() {
+            return None;
+        }
+        // BigRational::from_float is exact for finite inputs.
+        num_rational::BigRational::from_float(f).map(SemaNumber::Rational)
+    }
+
+    pub fn num_eq(&self, other: &SemaNumber) -> bool {
+        match (self, other) {
+            (SemaNumber::Complex(a), SemaNumber::Complex(b)) => a.re.num_eq(&b.re) && a.im.num_eq(&b.im),
+            (SemaNumber::Complex(_), _) | (_, SemaNumber::Complex(_)) => false,
+            _ => self.cmp_real(other) == Some(std::cmp::Ordering::Equal),
+        }
+    }
+
+    /// Ordering for real numbers. `None` if either operand is complex or a NaN.
+    /// Exact-vs-inexact converts the float to an exact rational so the compare
+    /// is precise even above 2^53.
+    pub fn cmp_real(&self, other: &SemaNumber) -> Option<std::cmp::Ordering> {
+        use std::cmp::Ordering;
+        if matches!(self, SemaNumber::Complex(_)) || matches!(other, SemaNumber::Complex(_)) {
+            return None;
+        }
+        // If both inexact, compare as f64 (preserves NaN → None).
+        if let (SemaNumber::Real(x), SemaNumber::Real(y)) = (self, other) {
+            return x.partial_cmp(y);
+        }
+        // Fast path for the infinity/NaN cases: if exactly one side is a
+        // non-finite Real, its sign decides.
+        match (self, other) {
+            (SemaNumber::Real(f), _) if !f.is_finite() => {
+                return if f.is_nan() {
+                    None
+                } else if *f > 0.0 {
+                    Some(Ordering::Greater)
+                } else {
+                    Some(Ordering::Less)
+                };
+            }
+            (_, SemaNumber::Real(f)) if !f.is_finite() => {
+                return if f.is_nan() {
+                    None
+                } else if *f > 0.0 {
+                    Some(Ordering::Less)
+                } else {
+                    Some(Ordering::Greater)
+                };
+            }
+            _ => {}
+        }
+        // Mixed or both-exact: lift any (finite) Real to an exact rational.
+        let to_exact = |v: &SemaNumber| -> SemaNumber {
+            match v {
+                SemaNumber::Real(f) => SemaNumber::real_to_exact(*f).expect("finite (checked above)"),
+                other => other.clone(),
+            }
+        };
+        let a = to_exact(self);
+        let b = to_exact(other);
+        let (a, b) = SemaNumber::promote(a, b);
+        match (a, b) {
+            (SemaNumber::Integer(x), SemaNumber::Integer(y)) => Some(x.cmp(&y)),
+            (SemaNumber::Rational(x), SemaNumber::Rational(y)) => Some(x.cmp(&y)),
+            _ => unreachable!("both exact after real_to_exact + promote"),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -332,5 +404,26 @@ mod tests {
         assert!(n(1).div(n(0)).is_err());
         // divide by inexact zero → real infinity (IEEE), NOT an error
         assert!(matches!(n(1).div(SemaNumber::Real(0.0)).unwrap(), SemaNumber::Real(f) if f.is_infinite()));
+    }
+
+    #[test]
+    fn compare_and_equal() {
+        use std::cmp::Ordering;
+        let n = |v: i64| SemaNumber::Integer(BigInt::from(v));
+        let half = SemaNumber::Rational(BigRational::new(BigInt::one(), BigInt::from(2)));
+        // 1/2 = 0.5 across exact/inexact
+        assert!(half.num_eq(&SemaNumber::Real(0.5)));
+        // 2 = 2.0
+        assert!(n(2).num_eq(&SemaNumber::Real(2.0)));
+        // ordering
+        assert_eq!(half.cmp_real(&n(1)), Some(Ordering::Less));
+        assert_eq!(n(3).cmp_real(&n(2)), Some(Ordering::Greater));
+        // exact bignum vs float above 2^53 stays exact (no lossy cast)
+        let big = SemaNumber::Integer(BigInt::from(9_007_199_254_740_993_i64));
+        assert_eq!(big.cmp_real(&SemaNumber::Real(9_007_199_254_740_992.0)), Some(Ordering::Greater));
+        // complex is unordered
+        let i = SemaNumber::Complex(Box::new(Complex { re: n(0), im: n(1) }));
+        assert_eq!(i.cmp_real(&n(0)), None);
+        assert!(!i.num_eq(&n(0)));
     }
 }

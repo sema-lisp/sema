@@ -54,6 +54,35 @@ impl SemaNumber {
     pub fn is_real(&self) -> bool {
         !matches!(self, SemaNumber::Complex(_))
     }
+
+    /// Collapse to the tightest canonical form (see the type invariants).
+    /// Cheap and idempotent; every lowering constructor and arithmetic result
+    /// passes through it.
+    pub fn normalize(self) -> SemaNumber {
+        use num_traits::{One, Zero};
+        match self {
+            SemaNumber::Rational(r) => {
+                if r.denom().is_one() {
+                    SemaNumber::Integer(r.numer().clone())
+                } else {
+                    SemaNumber::Rational(r)
+                }
+            }
+            SemaNumber::Complex(c) => {
+                let re = c.re.normalize();
+                let im = c.im.normalize();
+                // Exact zero imaginary part ⇒ a real number. An inexact 0.0
+                // must be preserved (the value is still non-real per R7RS).
+                let im_is_exact_zero = matches!(&im, SemaNumber::Integer(n) if n.is_zero());
+                if im_is_exact_zero {
+                    re
+                } else {
+                    SemaNumber::Complex(Box::new(Complex { re, im }))
+                }
+            }
+            other => other,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -72,5 +101,25 @@ mod tests {
         assert!(half.is_exact());
         assert!(!half.is_integer());
         assert!(half.is_real());
+    }
+
+    #[test]
+    fn normalize_collapses() {
+        use num_traits::Zero;
+        // 4/2 → Integer(2)
+        let r = SemaNumber::Rational(BigRational::new(BigInt::from(4), BigInt::from(2)));
+        assert!(matches!(r.normalize(), SemaNumber::Integer(n) if n == BigInt::from(2)));
+        // 3 + 0i → Integer(3)
+        let c = SemaNumber::Complex(Box::new(Complex {
+            re: SemaNumber::Integer(BigInt::from(3)),
+            im: SemaNumber::Integer(BigInt::zero()),
+        }));
+        assert!(matches!(c.normalize(), SemaNumber::Integer(n) if n == BigInt::from(3)));
+        // 3 + 0.0i stays complex (0.0 is an INEXACT zero, not exact zero)
+        let c2 = SemaNumber::Complex(Box::new(Complex {
+            re: SemaNumber::Integer(BigInt::from(3)),
+            im: SemaNumber::Real(0.0),
+        }));
+        assert!(matches!(c2.normalize(), SemaNumber::Complex(_)));
     }
 }

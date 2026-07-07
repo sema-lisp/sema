@@ -1356,12 +1356,12 @@ eval_error_tests! {
     force_non_promise_errors: "(force 42)" => "thunk",
 }
 
-// `expt` still raises on i64 overflow (it is generalized to bignums in a later
-// phase). The 2-operand `+`/`-`/`*` VM fast path no longer raises — those cases
-// promote to bignum (see the `vm_*_overflow_promotes` tests above).
-eval_error_tests! {
-    expt_result_overflow_errors: "(expt 2 64)" => "integer overflow",
-    expt_exponent_overflow_errors: "(expt 2 4294967296)" => "integer overflow",
+// `expt` is generalized to the full tower in Task 5.5: an exact base with a
+// non-negative exact integer exponent now returns an exact bignum instead of
+// raising on i64 overflow (repeated squaring keeps this cheap even for large
+// exponents — see the Task 5.5 block below for the exhaustive coverage).
+eval_tests! {
+    expt_i64_overflow_promotes_to_bignum: "(expt 2 64)" => common::eval("18446744073709551616"),
 }
 
 // The inline `AddInt`/`SubInt`/`MulInt` VM opcodes (2-operand form, chosen by
@@ -1577,6 +1577,23 @@ eval_tests! {
     gcd_bignum: "(gcd 100000000000000000000 10)" => common::eval("10"),
     lcm_basic: "(lcm 4 6)" => common::eval("12"),
     mod_basic: "(mod 10 3)" => common::eval("1"),
+}
+
+// Task 5.5: `expt` exact for integer exponents (repeated squaring; a negative
+// exponent of an exact base yields an exact reciprocal rational), plus the
+// transcendental functions accepting exact (bignum/rational) arguments via
+// `to_f64` instead of erroring (they previously only accepted fixnum/float).
+eval_tests! {
+    expt_bignum_exact: "(expt 2 100)" => common::eval("1267650600228229401496703205376"),
+    expt_negative_exponent_exact_rational: "(expt 2 -3)" => common::eval("1/8"),
+    expt_rational_base: "(expt 1/2 3)" => common::eval("1/8"),
+    expt_float_base_int_exponent: "(expt 2.0 10)" => common::eval("1024.0"),
+    expt_float_exponent: "(expt 2 0.5)" => common::eval("1.4142135623730951"),
+    sin_accepts_rational: "(sin 1/2)" => common::eval("0.479425538604203"),
+    cos_accepts_rational: "(cos 1/2)" => common::eval("0.8775825618903728"),
+    log_accepts_bignum: "(log 170141183460469231731687303715884105728)" => common::eval("88.02969193111305"),
+    math_tan_accepts_rational: "(math/tan 1/4)" => common::eval("0.25534192122103627"),
+    math_exp_accepts_bignum: "(math/exp 2)" => common::eval("7.38905609893065"),
 }
 
 // Regression tests for the runtime bug-hunt fixes (2026-07-07).

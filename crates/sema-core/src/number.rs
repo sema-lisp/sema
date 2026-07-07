@@ -346,6 +346,36 @@ impl SemaNumber {
         };
         Ok(out.normalize())
     }
+
+    /// Raise `self` to an arbitrary-precision integer exponent via repeated
+    /// squaring — O(log |exp|) multiplications, so `(expt 2 100)` costs ~7
+    /// squarings rather than 100. A negative exponent yields the reciprocal
+    /// (an exact base stays exact: `2^-3 => 1/8`); base 0 with a negative
+    /// exponent divides by zero. Only meaningful for exact/inexact reals —
+    /// callers pick this path themselves (float exponents fall back to
+    /// `f64::powf` at the builtin layer).
+    pub fn powi(self, exp: &BigInt) -> Result<SemaNumber, DivByZero> {
+        use num_integer::Integer;
+        use num_traits::{Signed, Zero};
+        let negative = exp.is_negative();
+        let mut e = if negative { -exp } else { exp.clone() };
+        let mut result = SemaNumber::from_i64(1);
+        let mut base = self;
+        while !e.is_zero() {
+            if e.is_odd() {
+                result = result.mul(base.clone());
+            }
+            e = e.div_floor(&BigInt::from(2));
+            if !e.is_zero() {
+                base = base.clone().mul(base);
+            }
+        }
+        if negative {
+            SemaNumber::from_i64(1).div(result)
+        } else {
+            Ok(result)
+        }
+    }
 }
 
 impl SemaNumber {
@@ -837,5 +867,28 @@ mod tests {
         assert!(set.contains(&SemaNumber::Real(1.5)));
         // Ordering by level then value (used only for deterministic map keys).
         assert!(SemaNumber::Integer(BigInt::from(1)) < SemaNumber::Real(0.0)); // level 0 < 2
+    }
+
+    #[test]
+    fn powi_repeated_squaring() {
+        let n = |v: i64| SemaNumber::Integer(BigInt::from(v));
+        // 2^100 is exact and beyond i64 range.
+        let expected: BigInt = "1267650600228229401496703205376".parse().unwrap();
+        assert!(
+            matches!(n(2).powi(&BigInt::from(100)).unwrap(), SemaNumber::Integer(v) if v == expected)
+        );
+        // negative exponent -> exact reciprocal rational
+        assert!(matches!(n(2).powi(&BigInt::from(-3)).unwrap(),
+            SemaNumber::Rational(r) if r == BigRational::new(BigInt::one(), BigInt::from(8))));
+        // rational base
+        let half = SemaNumber::Rational(BigRational::new(BigInt::one(), BigInt::from(2)));
+        assert!(matches!(half.powi(&BigInt::from(3)).unwrap(),
+            SemaNumber::Rational(r) if r == BigRational::new(BigInt::one(), BigInt::from(8))));
+        // exponent 0 -> exact 1, even for base 0
+        assert!(
+            matches!(n(0).powi(&BigInt::from(0)).unwrap(), SemaNumber::Integer(v) if v == BigInt::one())
+        );
+        // 0 base with negative exponent divides by zero
+        assert!(n(0).powi(&BigInt::from(-1)).is_err());
     }
 }

@@ -7,34 +7,29 @@ use sema_core::{check_arity, SemaError, Value, ValueViewRef};
 
 use crate::register_fn;
 
+/// `expt`/`pow`/`math/pow`: an exact base (integer/rational) raised to an
+/// exact integer exponent stays exact — computed via `SemaNumber::powi`
+/// (repeated squaring), so `(expt 2 100)` is a bignum rather than an
+/// overflow error and `(expt 2 -3) => 1/8` rather than a float. Any other
+/// combination (float base, or a non-integer/float exponent) projects both
+/// operands to `f64` and uses `powf`, matching the prior behavior.
 fn pow_impl(args: &[Value]) -> Result<Value, SemaError> {
     check_arity!(args, "pow", 2);
-    match (args[0].view_ref(), args[1].view_ref()) {
-        (ValueViewRef::Int(base), ValueViewRef::Int(exp)) if exp >= 0 => {
-            // 0/1/-1 have bounded powers for any exponent; everything else must
-            // fit u32 and not overflow i64. The old `wrapping_pow(exp as u32)`
-            // truncated the exponent (e.g. 2^32 → 0) *and* wrapped the result.
-            let result = match base {
-                0 => Some(if exp == 0 { 1 } else { 0 }),
-                1 => Some(1),
-                -1 => Some(if exp % 2 == 0 { 1 } else { -1 }),
-                _ => u32::try_from(exp).ok().and_then(|e| base.checked_pow(e)),
-            };
-            result.map(Value::int).ok_or_else(|| {
-                SemaError::eval("expt: integer overflow (result exceeds i64 range)")
-                    .with_hint("use floats (e.g. (pow 2.0 64.0)) for large powers")
-            })
-        }
-        _ => {
-            let base = args[0]
-                .as_float()
-                .ok_or_else(|| SemaError::type_error("number", args[0].type_name()))?;
-            let exp = args[1]
-                .as_float()
-                .ok_or_else(|| SemaError::type_error("number", args[1].type_name()))?;
-            Ok(Value::float(base.powf(exp)))
+    let base = args[0]
+        .as_number()
+        .ok_or_else(|| SemaError::type_error("number", args[0].type_name()))?;
+    let exp = args[1]
+        .as_number()
+        .ok_or_else(|| SemaError::type_error("number", args[1].type_name()))?;
+    if base.is_exact() {
+        if let SemaNumber::Integer(exp_int) = &exp {
+            let result = base
+                .powi(exp_int)
+                .map_err(|_| SemaError::eval("expt: 0 raised to a negative power"))?;
+            return Ok(Value::from_number(result));
         }
     }
+    Ok(Value::float(base.to_f64().powf(exp.to_f64())))
 }
 
 /// Convert a (rounded) float to an i64, rejecting NaN/infinite values and
@@ -93,6 +88,22 @@ fn round_op(
 
 fn ceil_impl(args: &[Value]) -> Result<Value, SemaError> {
     round_op(args, "ceil", SemaNumber::ceil)
+}
+
+/// Lift a transcendental function's argument to `f64`, accepting any real
+/// in the tower (fixnum, bignum, rational, float) — unlike `as_float`, which
+/// only handles fixnums and floats and errors on bignum/rational operands.
+/// Complex is rejected explicitly rather than silently projecting through
+/// `to_f64`'s NaN sentinel.
+fn real_arg(v: &Value, name: &str) -> Result<f64, SemaError> {
+    let n = v
+        .as_number()
+        .ok_or_else(|| SemaError::type_error("number", v.type_name()))?;
+    if !n.is_real() {
+        return Err(SemaError::type_error("real number", v.type_name())
+            .with_hint(format!("{name}: complex has no real projection")));
+    }
+    Ok(n.to_f64())
 }
 
 pub fn register(env: &sema_core::Env) {
@@ -288,26 +299,17 @@ pub fn register(env: &sema_core::Env) {
 
     register_fn(env, "log", |args| {
         check_arity!(args, "log", 1);
-        let f = args[0]
-            .as_float()
-            .ok_or_else(|| SemaError::type_error("number", args[0].type_name()))?;
-        Ok(Value::float(f.ln()))
+        Ok(Value::float(real_arg(&args[0], "log")?.ln()))
     });
 
     register_fn(env, "sin", |args| {
         check_arity!(args, "sin", 1);
-        let f = args[0]
-            .as_float()
-            .ok_or_else(|| SemaError::type_error("number", args[0].type_name()))?;
-        Ok(Value::float(f.sin()))
+        Ok(Value::float(real_arg(&args[0], "sin")?.sin()))
     });
 
     register_fn(env, "cos", |args| {
         check_arity!(args, "cos", 1);
-        let f = args[0]
-            .as_float()
-            .ok_or_else(|| SemaError::type_error("number", args[0].type_name()))?;
-        Ok(Value::float(f.cos()))
+        Ok(Value::float(real_arg(&args[0], "cos")?.cos()))
     });
 
     // Bind pi and e as constants (bare symbol access)
@@ -424,69 +426,44 @@ pub fn register(env: &sema_core::Env) {
 
     register_fn(env, "math/tan", |args| {
         check_arity!(args, "math/tan", 1);
-        let f = args[0]
-            .as_float()
-            .ok_or_else(|| SemaError::type_error("number", args[0].type_name()))?;
-        Ok(Value::float(f.tan()))
+        Ok(Value::float(real_arg(&args[0], "math/tan")?.tan()))
     });
 
     register_fn(env, "math/asin", |args| {
         check_arity!(args, "math/asin", 1);
-        let f = args[0]
-            .as_float()
-            .ok_or_else(|| SemaError::type_error("number", args[0].type_name()))?;
-        Ok(Value::float(f.asin()))
+        Ok(Value::float(real_arg(&args[0], "math/asin")?.asin()))
     });
 
     register_fn(env, "math/acos", |args| {
         check_arity!(args, "math/acos", 1);
-        let f = args[0]
-            .as_float()
-            .ok_or_else(|| SemaError::type_error("number", args[0].type_name()))?;
-        Ok(Value::float(f.acos()))
+        Ok(Value::float(real_arg(&args[0], "math/acos")?.acos()))
     });
 
     register_fn(env, "math/atan", |args| {
         check_arity!(args, "math/atan", 1);
-        let f = args[0]
-            .as_float()
-            .ok_or_else(|| SemaError::type_error("number", args[0].type_name()))?;
-        Ok(Value::float(f.atan()))
+        Ok(Value::float(real_arg(&args[0], "math/atan")?.atan()))
     });
 
     register_fn(env, "math/atan2", |args| {
         check_arity!(args, "math/atan2", 2);
-        let y = args[0]
-            .as_float()
-            .ok_or_else(|| SemaError::type_error("number", args[0].type_name()))?;
-        let x = args[1]
-            .as_float()
-            .ok_or_else(|| SemaError::type_error("number", args[1].type_name()))?;
+        let y = real_arg(&args[0], "math/atan2")?;
+        let x = real_arg(&args[1], "math/atan2")?;
         Ok(Value::float(y.atan2(x)))
     });
 
     register_fn(env, "math/exp", |args| {
         check_arity!(args, "math/exp", 1);
-        let f = args[0]
-            .as_float()
-            .ok_or_else(|| SemaError::type_error("number", args[0].type_name()))?;
-        Ok(Value::float(f.exp()))
+        Ok(Value::float(real_arg(&args[0], "math/exp")?.exp()))
     });
 
     register_fn(env, "math/log10", |args| {
         check_arity!(args, "math/log10", 1);
-        let f = args[0]
-            .as_float()
-            .ok_or_else(|| SemaError::type_error("number", args[0].type_name()))?;
-        Ok(Value::float(f.log10()))
+        Ok(Value::float(real_arg(&args[0], "math/log10")?.log10()))
     });
 
     register_fn(env, "math/log2", |args| {
         check_arity!(args, "math/log2", 1);
-        let f = args[0]
-            .as_float()
-            .ok_or_else(|| SemaError::type_error("number", args[0].type_name()))?;
-        Ok(Value::float(f.log2()))
+        Ok(Value::float(real_arg(&args[0], "math/log2")?.log2()))
     });
 
     register_fn(env, "math/random", |args| {
@@ -565,26 +542,17 @@ pub fn register(env: &sema_core::Env) {
 
     register_fn(env, "math/sinh", |args| {
         check_arity!(args, "math/sinh", 1);
-        let f = args[0]
-            .as_float()
-            .ok_or_else(|| SemaError::type_error("number", args[0].type_name()))?;
-        Ok(Value::float(f.sinh()))
+        Ok(Value::float(real_arg(&args[0], "math/sinh")?.sinh()))
     });
 
     register_fn(env, "math/cosh", |args| {
         check_arity!(args, "math/cosh", 1);
-        let f = args[0]
-            .as_float()
-            .ok_or_else(|| SemaError::type_error("number", args[0].type_name()))?;
-        Ok(Value::float(f.cosh()))
+        Ok(Value::float(real_arg(&args[0], "math/cosh")?.cosh()))
     });
 
     register_fn(env, "math/tanh", |args| {
         check_arity!(args, "math/tanh", 1);
-        let f = args[0]
-            .as_float()
-            .ok_or_else(|| SemaError::type_error("number", args[0].type_name()))?;
-        Ok(Value::float(f.tanh()))
+        Ok(Value::float(real_arg(&args[0], "math/tanh")?.tanh()))
     });
 
     register_fn(env, "math/degrees->radians", |args| {

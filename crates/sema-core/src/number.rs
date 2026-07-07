@@ -305,6 +305,47 @@ impl SemaNumber {
     }
 }
 
+/// Format a real component the way Sema prints floats/ints (shared by the
+/// complex arm so `2.0+0.5i` matches standalone `2.0`/`0.5`).
+fn fmt_real(n: &SemaNumber, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    match n {
+        SemaNumber::Integer(v) => write!(f, "{v}"),
+        SemaNumber::Rational(r) => write!(f, "{}/{}", r.numer(), r.denom()),
+        SemaNumber::Real(v) => {
+            if v.fract() == 0.0 && v.is_finite() {
+                write!(f, "{v:.1}")
+            } else {
+                write!(f, "{v}")
+            }
+        }
+        SemaNumber::Complex(_) => unreachable!("complex component is never complex"),
+    }
+}
+
+impl std::fmt::Display for SemaNumber {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        use num_traits::Zero;
+        match self {
+            SemaNumber::Complex(c) => {
+                fmt_real(&c.re, f)?;
+                // Explicit sign then magnitude, so `0-1i` reads back correctly.
+                let (sign, mag) = match &c.im {
+                    SemaNumber::Integer(v) if *v < BigInt::zero() => ('-', SemaNumber::Integer(-v.clone())),
+                    SemaNumber::Rational(r) if *r < BigRational::from(BigInt::zero()) => {
+                        ('-', SemaNumber::Rational(-r.clone()))
+                    }
+                    SemaNumber::Real(v) if v.is_sign_negative() => ('-', SemaNumber::Real(-v)),
+                    other => ('+', other.clone()),
+                };
+                write!(f, "{sign}")?;
+                fmt_real(&mag, f)?;
+                write!(f, "i")
+            }
+            real => fmt_real(real, f),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -425,5 +466,21 @@ mod tests {
         let i = SemaNumber::Complex(Box::new(Complex { re: n(0), im: n(1) }));
         assert_eq!(i.cmp_real(&n(0)), None);
         assert!(!i.num_eq(&n(0)));
+    }
+
+    #[test]
+    fn display_round_trippable() {
+        let n = |v: i64| SemaNumber::Integer(BigInt::from(v));
+        assert_eq!(n(42).to_string(), "42");
+        assert_eq!(
+            SemaNumber::Rational(BigRational::new(BigInt::one(), BigInt::from(3))).to_string(),
+            "1/3"
+        );
+        assert_eq!(SemaNumber::Real(2.0).to_string(), "2.0");
+        assert_eq!(SemaNumber::Real(2.5).to_string(), "2.5");
+        let c = SemaNumber::Complex(Box::new(Complex { re: n(3), im: n(4) }));
+        assert_eq!(c.to_string(), "3+4i");
+        let c2 = SemaNumber::Complex(Box::new(Complex { re: n(0), im: n(-1) }));
+        assert_eq!(c2.to_string(), "0-1i");
     }
 }

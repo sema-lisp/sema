@@ -2193,9 +2193,21 @@ impl VM {
                     op::NEGATE => {
                         let a = unsafe { pop_unchecked(&mut self.stack) };
                         if let Some(n) = a.as_int() {
-                            self.stack.push(Value::int(n.wrapping_neg()));
+                            match n.checked_neg() {
+                                Some(v) => self.stack.push(Value::int(v)),
+                                // i64::MIN negation overflows i64; promote to a bignum
+                                // instead of raising or silently wrapping (matches the
+                                // stdlib `-` unary case in sema-stdlib/src/arithmetic.rs).
+                                None => self
+                                    .stack
+                                    .push(Value::from_number(SemaNumber::from_i64(n).neg())),
+                            }
                         } else if let Some(f) = a.as_float() {
                             self.stack.push(Value::float(-f));
+                        } else if let Some(n) = a.as_number() {
+                            // Bignum/rational/complex operand: fold through the tower
+                            // instead of raising (mirrors vm_add/vm_sub/vm_mul above).
+                            self.stack.push(Value::from_number(n.neg()));
                         } else {
                             let err = SemaError::type_error("number", a.type_name());
                             handle_err!(self, fi, pc, err, pc - op::SIZE_OP, 'dispatch);

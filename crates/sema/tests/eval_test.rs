@@ -1404,6 +1404,17 @@ eval_tests! {
         => common::eval("85070591730234615847396907784232501249"),
     vm_lt_bignum: "(< 9223372036854775807 9223372036854775808)" => common::eval("#t"),
     vm_eq_bignum: "(= 9223372036854775808 9223372036854775808)" => common::eval("#t"),
+    // The VM's inline unary `NEGATE` opcode (compiled from single-arg `-`)
+    // must also fall through to the tower for bignum operands instead of
+    // raising a type error — found by the grammar fuzzer's bignum leaves.
+    vm_negate_bignum: "(- 170141183460469231731687303715884105728)"
+        => common::eval("-170141183460469231731687303715884105728"),
+    // `sort`'s comparator-free path must treat bignums as part of the same
+    // numeric sort category as fixnums (both are just "int"), not reject the
+    // list as heterogeneous — found by the grammar fuzzer mixing fixnum and
+    // bignum leaves in the same list.
+    sort_mixed_fixnum_bignum: "(sort (list 170141183460469231731687303715884105728 3 -5))"
+        => common::eval("(list -5 3 170141183460469231731687303715884105728)"),
 }
 
 // Task 1.6: `integer?`/`number?` recognize bignums; `integer?` is true for

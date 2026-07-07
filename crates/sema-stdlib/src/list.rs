@@ -1,10 +1,15 @@
+use sema_core::number::SemaNumber;
 use sema_core::{check_arity, SemaError, Value, ValueViewRef};
 
 use crate::register_fn;
 
-/// Sort category of a value for the comparator-free `sort`. Ints and floats
-/// share the `Number` family (they must compare by numeric value, not by tag);
-/// every other type is only comparable to its own kind. `sort` refuses to order
+/// Sort category of a value for the comparator-free `sort`. Every real number
+/// (fixnum, bignum, rational, float) shares the `Number` family and compares by
+/// numeric value, not by tag — otherwise a bignum (a distinct heap tag from a
+/// fixnum, though still just "int") would look like a different type than a
+/// fixnum and get rejected as heterogeneous. Complex numbers have no total
+/// order, so they stay out of `Number` and are only comparable to each other.
+/// Every other type is only comparable to its own kind. `sort` refuses to order
 /// values whose categories differ, because `Value`'s cross-type `Ord` falls back
 /// to an internal tag order that is arbitrary and never what the caller meant.
 #[derive(PartialEq, Eq)]
@@ -14,7 +19,7 @@ enum SortCategory {
 }
 
 fn sort_category(v: &Value) -> SortCategory {
-    if v.is_int() || v.is_float() {
+    if v.as_number().is_some_and(|n| n.is_real()) {
         SortCategory::Number
     } else {
         SortCategory::Other(v.type_name())
@@ -412,13 +417,28 @@ pub fn register(env: &sema_core::Env) {
             }
             // All-number lists must compare by numeric value: `Value`'s `Ord`
             // orders every int before every float regardless of magnitude, so
-            // `(sort (list 3 1.5))` would otherwise misorder. Floats use a total
-            // order (NaN last) to keep the sort well-defined.
+            // `(sort (list 3 1.5))` would otherwise misorder. `cmp_real` compares
+            // across the whole real tower (fixnum/bignum/rational/float) exactly,
+            // without narrowing bignums through a lossy f64 cast; a NaN float
+            // sorts last (matching the pre-tower `f64::total_cmp` behavior).
             if matches!(items.first().map(sort_category), Some(SortCategory::Number)) {
                 items.sort_by(|a, b| {
-                    let x = a.as_float().unwrap();
-                    let y = b.as_float().unwrap();
-                    x.total_cmp(&y)
+                    let x = a.as_number().unwrap();
+                    let y = b.as_number().unwrap();
+                    x.cmp_real(&y).unwrap_or_else(|| {
+                        // `cmp_real` returns `None` only for a NaN operand here
+                        // (this branch excludes complex numbers); break the tie
+                        // so every NaN lands after every non-NaN, and NaNs are
+                        // mutually equal (a valid total order for sorting).
+                        let x_nan = matches!(x, SemaNumber::Real(f) if f.is_nan());
+                        let y_nan = matches!(y, SemaNumber::Real(f) if f.is_nan());
+                        match (x_nan, y_nan) {
+                            (true, true) => std::cmp::Ordering::Equal,
+                            (true, false) => std::cmp::Ordering::Greater,
+                            (false, true) => std::cmp::Ordering::Less,
+                            (false, false) => std::cmp::Ordering::Equal,
+                        }
+                    })
                 });
             } else {
                 items.sort();

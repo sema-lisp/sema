@@ -21,6 +21,7 @@ pub enum Token {
     Deref,
     Int(i64),
     BigInt(num_bigint::BigInt),
+    Rational(num_rational::BigRational),
     Float(f64),
     String(String),
     FString(Vec<FStringPart>),
@@ -771,6 +772,45 @@ fn read_number(chars: &[char], span: &Span) -> Result<(Token, usize), SemaError>
             is_float = true;
         }
     }
+    // Rational tail: `/` immediately followed by ≥1 digit (optionally after the
+    // integer body). `1/3`, `-22/7`. A `/` not followed by a digit is left to
+    // the symbol lexer (so `/` and `a/b`-symbols are unaffected).
+    if !is_float
+        && i < chars.len()
+        && chars[i] == '/'
+        && i + 1 < chars.len()
+        && chars[i + 1].is_ascii_digit()
+    {
+        let denom_start = i + 1;
+        let mut j = denom_start;
+        while j < chars.len() && chars[j].is_ascii_digit() {
+            j += 1;
+        }
+        let numer_str: String = chars[..i].iter().collect();
+        let denom_str: String = chars[denom_start..j].iter().collect();
+        let numer = num_bigint::BigInt::parse_bytes(numer_str.as_bytes(), 10).ok_or_else(|| {
+            SemaError::Reader {
+                message: format!("invalid rational numerator: {numer_str}"),
+                span: *span,
+            }
+        })?;
+        let denom = num_bigint::BigInt::parse_bytes(denom_str.as_bytes(), 10).ok_or_else(|| {
+            SemaError::Reader {
+                message: format!("invalid rational denominator: {denom_str}"),
+                span: *span,
+            }
+        })?;
+        if denom == num_bigint::BigInt::from(0) {
+            return Err(SemaError::Reader {
+                message: "rational literal has zero denominator".into(),
+                span: *span,
+            });
+        }
+        return Ok((
+            Token::Rational(num_rational::BigRational::new(numer, denom)),
+            j,
+        ));
+    }
     let s: String = chars[..i].iter().collect();
     if is_float {
         let f: f64 = s.parse().map_err(|_| SemaError::Reader {
@@ -1001,5 +1041,24 @@ mod tests {
             first("9223372036854775808"),
             Token::BigInt(BigInt::from_str("9223372036854775808").unwrap())
         );
+    }
+
+    #[test]
+    fn rational_literals() {
+        use num_bigint::BigInt;
+        use num_rational::BigRational;
+        let first = |src: &str| tokenize(src).unwrap().into_iter().next().unwrap().token;
+        assert_eq!(
+            first("1/3"),
+            Token::Rational(BigRational::new(BigInt::from(1), BigInt::from(3)))
+        );
+        assert_eq!(
+            first("-22/7"),
+            Token::Rational(BigRational::new(BigInt::from(-22), BigInt::from(7)))
+        );
+        // a lone slash is still the division symbol
+        assert!(matches!(first("/"), Token::Symbol(s) if s == "/"));
+        // 1.5/2 is NOT a rational (float numerator) — 1.5 then symbol
+        assert_eq!(first("1.5"), Token::Float(1.5));
     }
 }

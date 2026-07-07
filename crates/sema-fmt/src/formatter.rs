@@ -444,6 +444,7 @@ fn token_width(tok: &Token) -> usize {
         Token::String(s) => escape_string(s).len() + 2, // quotes
         Token::Int(n) => n.to_string().len(),
         Token::BigInt(n) => n.to_string().len(),
+        Token::Rational(r) => r.to_string().len(),
         Token::Float(f) => format_float(*f).len(),
         Token::Bool(true) => 2,
         Token::Bool(false) => 2,
@@ -474,6 +475,7 @@ fn token_text(tok: &Token) -> Cow<'_, str> {
         Token::Regex(s) => Cow::Owned(format!("#\"{}\"", escape_regex(s))),
         Token::Int(n) => Cow::Owned(n.to_string()),
         Token::BigInt(n) => Cow::Owned(n.to_string()),
+        Token::Rational(r) => Cow::Owned(r.to_string()),
         Token::Float(f) => Cow::Owned(format_float(*f)),
         Token::Bool(true) => Cow::Borrowed("#t"),
         Token::Bool(false) => Cow::Borrowed("#f"),

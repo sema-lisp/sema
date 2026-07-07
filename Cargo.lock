@@ -3925,6 +3925,7 @@ name = "sema-reader"
 version = "1.28.1"
 dependencies = [
  "num-bigint",
+ "num-rational",
  "proptest",
  "sema-core",
 ]

@@ -101,6 +101,7 @@ fn style_for(
         Token::Int(_)
         | Token::BigInt(_)
         | Token::Rational(_)
+        | Token::Complex(_, _)
         | Token::Float(_)
         | Token::Bool(_) => Style::new().fg(AMBER),
         Token::Keyword(_) => Style::new().fg(TEAL),

@@ -460,9 +460,9 @@ fn token_width(tok: &Token) -> usize {
         Token::BytevectorStart => 4,
         Token::Comment(text) => text.len(),
         Token::Newline => 1,
-        // FString and Regex have variable-length formatted output — fall back
-        // to token_text for correctness (these are rare in width measurement).
-        Token::FString(_) | Token::Regex(_) => token_text(tok).len(),
+        // FString, Regex, and Complex have variable-length formatted output —
+        // fall back to token_text for correctness (rare in width measurement).
+        Token::FString(_) | Token::Regex(_) | Token::Complex(_, _) => token_text(tok).len(),
     }
 }
 
@@ -476,6 +476,16 @@ fn token_text(tok: &Token) -> Cow<'_, str> {
         Token::Int(n) => Cow::Owned(n.to_string()),
         Token::BigInt(n) => Cow::Owned(n.to_string()),
         Token::Rational(r) => Cow::Owned(r.to_string()),
+        Token::Complex(re, im) => {
+            use sema_core::number::{Complex, SemaNumber};
+            Cow::Owned(
+                SemaNumber::Complex(Box::new(Complex {
+                    re: re.clone(),
+                    im: im.clone(),
+                }))
+                .to_string(),
+            )
+        }
         Token::Float(f) => Cow::Owned(format_float(*f)),
         Token::Bool(true) => Cow::Borrowed("#t"),
         Token::Bool(false) => Cow::Borrowed("#f"),

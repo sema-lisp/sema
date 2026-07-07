@@ -1,3 +1,4 @@
+use sema_core::number::SemaNumber;
 use sema_core::{SemaError, Span};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -23,6 +24,9 @@ pub enum Token {
     BigInt(num_bigint::BigInt),
     Rational(num_rational::BigRational),
     Float(f64),
+    /// A complex literal `re + im·i` (e.g. `3+4i`, `+i`, `2i`, `1.5+2.5i`).
+    /// Components are real tower numbers (int, rational, or float).
+    Complex(SemaNumber, SemaNumber),
     String(String),
     FString(Vec<FStringPart>),
     ShortLambdaStart,
@@ -551,6 +555,21 @@ pub fn tokenize(input: &str) -> Result<Vec<SpannedToken>, SemaError> {
                         byte_start: byte_offsets[token_start],
                         byte_end: byte_offsets[i],
                     });
+                } else if (ch == '+' || ch == '-')
+                    && try_imaginary_tail(&chars, i, &span)?.is_some()
+                {
+                    // Pure imaginary with a leading sign: `+i`, `-i`, `+2i`, `-3.5i`.
+                    // (`-2i` with a digit right after `-` is handled by read_number.)
+                    let token_start = i;
+                    let (im, end) = try_imaginary_tail(&chars, i, &span)?.unwrap();
+                    col += end - i;
+                    i = end;
+                    tokens.push(SpannedToken {
+                        token: Token::Complex(SemaNumber::from_i64(0), im),
+                        span: span.with_end(line, col),
+                        byte_start: byte_offsets[token_start],
+                        byte_end: byte_offsets[i],
+                    });
                 } else if is_symbol_start(ch) {
                     let start = i;
                     while i < chars.len() && is_symbol_char(chars[i]) {
@@ -812,6 +831,20 @@ fn read_number(chars: &[char], span: &Span) -> Result<(Token, usize), SemaError>
         ));
     }
     let s: String = chars[..i].iter().collect();
+    // Complex Case A: the leading real is the imaginary magnitude — `<real>i<delim>`
+    // (e.g. `2i`, `1.5i`). A trailing `i` only counts when a delimiter follows,
+    // so `3ix` stays `Int(3)` + symbol `ix`.
+    if i < chars.len() && chars[i] == 'i' && is_delimiter_at(chars, i + 1) {
+        let im = parse_real_component(&s, is_float, span)?;
+        return Ok((Token::Complex(SemaNumber::from_i64(0), im), i + 1));
+    }
+    // Complex Case B: `<real>(+|-)<ureal>i<delim>` (e.g. `3+4i`, `1.5+2.5i`).
+    if i < chars.len() && (chars[i] == '+' || chars[i] == '-') {
+        if let Some((im, consumed)) = try_imaginary_tail(chars, i, span)? {
+            let re = parse_real_component(&s, is_float, span)?;
+            return Ok((Token::Complex(re, im), consumed));
+        }
+    }
     if is_float {
         let f: f64 = s.parse().map_err(|_| SemaError::Reader {
             message: format!("invalid float: {s}"),
@@ -833,6 +866,112 @@ fn read_number(chars: &[char], span: &Span) -> Result<(Token, usize), SemaError>
             }
         }
     }
+}
+
+/// Turn a numeric substring into a real tower number. `is_float` distinguishes a
+/// float spelling (`1.5`, `2e3`) from an exact one; a `/` in `s` marks a rational.
+fn parse_real_component(s: &str, is_float: bool, span: &Span) -> Result<SemaNumber, SemaError> {
+    let invalid = || SemaError::Reader {
+        message: format!("invalid number component: {s}"),
+        span: *span,
+    };
+    if is_float {
+        let f: f64 = s.parse().map_err(|_| invalid())?;
+        Ok(SemaNumber::from_f64(f))
+    } else if s.contains('/') {
+        SemaNumber::parse_rational(s).ok_or_else(invalid)
+    } else {
+        SemaNumber::parse_int_radix(s, 10).ok_or_else(invalid)
+    }
+}
+
+/// True at EOF or when `chars[idx]` ends an atom (so a trailing `i` is only read
+/// as imaginary when it is not part of a longer identifier like `pi`/`list`).
+fn is_delimiter_at(chars: &[char], idx: usize) -> bool {
+    idx >= chars.len() || is_delimiter(chars[idx])
+}
+
+fn is_delimiter(ch: char) -> bool {
+    matches!(
+        ch,
+        ' ' | '\t' | '\r' | '\n' | '(' | ')' | '[' | ']' | '{' | '}' | '"' | ';' | '\'' | '`' | ','
+    )
+}
+
+/// Lex an imaginary tail starting at `start`: an optional sign, an optional
+/// `ureal` (int / rational / float; empty means magnitude ±1), then `i` followed
+/// by a token delimiter. Returns the imaginary `SemaNumber` and the absolute end
+/// index, or `None` when the characters are not a delimited imaginary tail (so
+/// the caller falls back to symbol/number lexing). A bare `i` with no sign and no
+/// magnitude is NOT imaginary (it is the identifier `i`).
+fn try_imaginary_tail(
+    chars: &[char],
+    start: usize,
+    span: &Span,
+) -> Result<Option<(SemaNumber, usize)>, SemaError> {
+    let mut i = start;
+    let mut sign_neg = false;
+    let mut had_sign = false;
+    if i < chars.len() && (chars[i] == '+' || chars[i] == '-') {
+        sign_neg = chars[i] == '-';
+        had_sign = true;
+        i += 1;
+    }
+    let ureal_start = i;
+    while i < chars.len() && chars[i].is_ascii_digit() {
+        i += 1;
+    }
+    let mut is_float = false;
+    // Fractional part.
+    if i < chars.len() && chars[i] == '.' && i + 1 < chars.len() && chars[i + 1].is_ascii_digit() {
+        i += 1;
+        while i < chars.len() && chars[i].is_ascii_digit() {
+            i += 1;
+        }
+        is_float = true;
+    }
+    // Exponent (only when a digit actually follows the optional sign).
+    if i < chars.len() && (chars[i] == 'e' || chars[i] == 'E') {
+        let mut j = i + 1;
+        if j < chars.len() && (chars[j] == '+' || chars[j] == '-') {
+            j += 1;
+        }
+        if j < chars.len() && chars[j].is_ascii_digit() {
+            i = j;
+            while i < chars.len() && chars[i].is_ascii_digit() {
+                i += 1;
+            }
+            is_float = true;
+        }
+    }
+    // Rational magnitude `a/b`.
+    if !is_float
+        && i < chars.len()
+        && chars[i] == '/'
+        && i + 1 < chars.len()
+        && chars[i + 1].is_ascii_digit()
+    {
+        i += 1;
+        while i < chars.len() && chars[i].is_ascii_digit() {
+            i += 1;
+        }
+    }
+    let ureal: String = chars[ureal_start..i].iter().collect();
+    // Must be `i` then a delimiter to count as imaginary.
+    if i >= chars.len() || chars[i] != 'i' || !is_delimiter_at(chars, i + 1) {
+        return Ok(None);
+    }
+    // A bare `i` (no sign, no magnitude) is the identifier `i`, not `1i`.
+    if ureal.is_empty() && !had_sign {
+        return Ok(None);
+    }
+    let magnitude = if ureal.is_empty() {
+        SemaNumber::from_i64(1)
+    } else {
+        parse_real_component(&ureal, is_float, span)?
+    };
+    let im = if sign_neg { magnitude.neg() } else { magnitude };
+    Ok(Some((im, i + 1)))
 }
 
 fn is_symbol_start(ch: char) -> bool {
@@ -1041,6 +1180,77 @@ mod tests {
             first("9223372036854775808"),
             Token::BigInt(BigInt::from_str("9223372036854775808").unwrap())
         );
+    }
+
+    #[test]
+    fn parse_real_component_forms() {
+        use num_bigint::BigInt;
+        use num_rational::BigRational;
+        let span = Span::point(1, 1);
+        assert_eq!(
+            parse_real_component("3", false, &span).unwrap(),
+            SemaNumber::Integer(BigInt::from(3))
+        );
+        assert_eq!(
+            parse_real_component("-7", false, &span).unwrap(),
+            SemaNumber::Integer(BigInt::from(-7))
+        );
+        assert_eq!(
+            parse_real_component("1/2", false, &span).unwrap(),
+            SemaNumber::Rational(BigRational::new(BigInt::from(1), BigInt::from(2)))
+        );
+        assert_eq!(
+            parse_real_component("1.5", true, &span).unwrap(),
+            SemaNumber::Real(1.5)
+        );
+        assert!(parse_real_component("xyz", false, &span).is_err());
+    }
+
+    #[test]
+    fn try_imaginary_tail_forms() {
+        let span = Span::point(1, 1);
+        let tail = |src: &str, start: usize| {
+            let chars: Vec<char> = src.chars().collect();
+            try_imaginary_tail(&chars, start, &span).unwrap()
+        };
+        // `+4i` at the start of a tail → magnitude 4, ends at index 3.
+        assert_eq!(tail("+4i", 0), Some((SemaNumber::from_i64(4), 3)));
+        // `-1i` → magnitude -1.
+        assert_eq!(tail("-1i", 0), Some((SemaNumber::from_i64(-1), 3)));
+        // Bare signed imaginary `+i` / `-i` → ±1.
+        assert_eq!(tail("+i", 0), Some((SemaNumber::from_i64(1), 2)));
+        assert_eq!(tail("-i", 0), Some((SemaNumber::from_i64(-1), 2)));
+        // Float magnitude.
+        assert_eq!(tail("+2.5i", 0), Some((SemaNumber::Real(2.5), 5)));
+        // Followed by a delimiter (paren) still matches, ends before `)`.
+        assert_eq!(tail("+4i)", 0), Some((SemaNumber::from_i64(4), 3)));
+        // Not a delimiter after `i` → not an imaginary tail.
+        assert_eq!(tail("+4ix", 0), None);
+        // Bare `i` with no sign is the identifier, not an imaginary.
+        assert_eq!(tail("i", 0), None);
+        // No trailing `i` at all.
+        assert_eq!(tail("+4", 0), None);
+    }
+
+    #[test]
+    fn complex_literals() {
+        use sema_core::number::SemaNumber;
+        let n = |v: i64| SemaNumber::from_i64(v);
+        let first = |src: &str| tokenize(src).unwrap().into_iter().next().unwrap().token;
+        assert_eq!(first("3+4i"), Token::Complex(n(3), n(4)));
+        assert_eq!(first("0-1i"), Token::Complex(n(0), n(-1)));
+        assert_eq!(first("+i"), Token::Complex(n(0), n(1)));
+        assert_eq!(first("-i"), Token::Complex(n(0), n(-1)));
+        assert_eq!(first("2i"), Token::Complex(n(0), n(2)));
+        assert_eq!(
+            first("1.5+2.5i"),
+            Token::Complex(SemaNumber::Real(1.5), SemaNumber::Real(2.5))
+        );
+        // plain numbers unaffected
+        assert_eq!(first("42"), Token::Int(42));
+        // a symbol containing i is not a complex
+        assert!(matches!(first("list"), Token::Symbol(s) if s == "list"));
+        assert!(matches!(first("pi"), Token::Symbol(s) if s == "pi"));
     }
 
     #[test]

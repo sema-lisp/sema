@@ -1435,6 +1435,20 @@ eval_error_tests! {
     div_by_zero_still_errors: "(/ 1 0)" => "division by zero",
 }
 
+// Task 3.2: the reader parses complex literals through the full pipeline
+// (lexer -> reader -> compile -> VM). Equality across literal spellings is the
+// oracle: `+i`, `2i`, `3+4i` must read to the same values as their canonical
+// `re±imi` forms.
+eval_tests! {
+    complex_lit_rect: "3+4i" => common::eval("3+4i"),
+    complex_lit_plus_i: "+i" => common::eval("0+1i"),
+    complex_lit_minus_i: "-i" => common::eval("0-1i"),
+    complex_lit_pure_imag: "2i" => common::eval("0+2i"),
+    complex_lit_neg_imag: "0-1i" => common::eval("-i"),
+    complex_lit_float: "1.5+2.5i" => common::eval("1.5+2.5i"),
+    complex_lit_leading_pos_imag: "+2i" => common::eval("0+2i"),
+}
+
 // Task 2.4: rational?/exact?/inexact?/exact-integer?/numerator/denominator.
 eval_tests! {
     rational_pred_rational: "(rational? 1/3)" => common::eval("#t"),

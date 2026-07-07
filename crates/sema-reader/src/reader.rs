@@ -461,6 +461,10 @@ impl Parser {
                 ..
             }) => Ok(Value::rational(r.clone())),
             Some(SpannedToken {
+                token: Token::Complex(re, im),
+                ..
+            }) => Ok(Value::complex(re.clone(), im.clone())),
+            Some(SpannedToken {
                 token: Token::Float(f),
                 ..
             }) => Ok(Value::float(*f)),
@@ -593,6 +597,7 @@ fn token_display(tok: &Token) -> &'static str {
         Token::Int(_) => "integer",
         Token::BigInt(_) => "integer",
         Token::Rational(_) => "rational",
+        Token::Complex(_, _) => "complex",
         Token::Float(_) => "float",
         Token::String(_) => "string",
         Token::Symbol(_) => "symbol",

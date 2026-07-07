@@ -67,6 +67,12 @@
 
 ### Added
 
+- **Playground deep-links to examples via `?example=`.** Loading the playground
+  with an `?example=` query param auto-opens that example, making a URL a
+  shareable direct link to a specific example. The value accepts either the full
+  id (`?example=getting-started/quicksort.sema`) or a bare filename
+  (`?example=quicksort.sema`), case-insensitively and with an optional `.sema`
+  suffix; an unknown value falls back to the restored last-session state.
 - **WebSocket client (`ws/*`).** Connect to `ws://`/`wss://` servers with
   `ws/connect` (options map: `:headers`, `:subprotocols`, `:timeout`, `:retries`,
   `:retry-backoff-ms` with exponential backoff), then `ws/send`, `ws/recv`,

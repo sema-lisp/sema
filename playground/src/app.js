@@ -55,6 +55,21 @@ if (savedFilesCollapsed) {
 const examplesById = new Map();
 for (const cat of examples) for (const f of cat.files) examplesById.set(f.id, f);
 
+// Resolve a `?example=` query-param value to an example. Accepts either the
+// full id (`getting-started/hello.sema`) or a bare filename (`hello.sema`),
+// case-insensitively and with an optional `.sema` suffix — so shared links can
+// be terse. Returns the example object, or null if nothing matches.
+function resolveExampleParam(raw) {
+  if (!raw) return null;
+  const want = raw.trim().toLowerCase().replace(/\.sema$/, '');
+  for (const f of examplesById.values()) {
+    const id = f.id.toLowerCase().replace(/\.sema$/, '');
+    const name = f.name.toLowerCase().replace(/\.sema$/, '');
+    if (id === want || name === want) return f;
+  }
+  return null;
+}
+
 function loadExample(file) {
   editorEl.value = file.code;
   editorEl.resetHistory();
@@ -103,10 +118,16 @@ function buildSidebar() {
     }
   });
 
-  // Restore last selected example or editor content
-  if (saved.editorContent) editorEl.value = saved.editorContent;
-  if (saved.lastExampleId) {
-    const fileItem = tree.querySelector(`sema-tree-item[data-example-id="${CSS.escape(saved.lastExampleId)}"]`);
+  // A `?example=` query param auto-opens that example, overriding saved state —
+  // this makes a URL a shareable direct link to a specific example.
+  const requested = resolveExampleParam(new URLSearchParams(location.search).get('example'));
+  const restoreId = requested ? requested.id : saved.lastExampleId;
+
+  if (requested) loadExample(requested);
+  else if (saved.editorContent) editorEl.value = saved.editorContent;
+
+  if (restoreId) {
+    const fileItem = tree.querySelector(`sema-tree-item[data-example-id="${CSS.escape(restoreId)}"]`);
     if (fileItem) {
       fileItem.selected = true;
       const parent = fileItem.parentElement; // the category <sema-tree-item>

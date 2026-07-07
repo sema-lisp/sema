@@ -138,6 +138,44 @@ test('whitespace preserved in output', async ({ page }) => {
   expect(style).toBe('pre');
 });
 
+// ── Deep-linking to an example via ?example= ──
+
+test('?example= auto-opens the example by bare filename', async ({ page }) => {
+  await page.goto('/?example=quicksort.sema');
+  await page.waitForSelector('[data-testid="status"].status-ready', { timeout: 15000 });
+
+  // Editor loaded the quicksort source, and its sidebar leaf is selected.
+  const editorValue = await page.getByTestId('editor').inputValue();
+  expect(editorValue).toContain('qsort');
+  await expect(
+    page.locator('[data-example-id="getting-started/quicksort.sema"]')
+  ).toHaveAttribute('selected', /.*/);
+
+  // And it actually runs.
+  await clickRunAndWait(page);
+  const errorEl = await page.$('#output .output-error');
+  expect(errorEl).toBeNull();
+});
+
+test('?example= accepts the full id too', async ({ page }) => {
+  await page.goto('/?example=getting-started/fibonacci.sema');
+  await page.waitForSelector('[data-testid="status"].status-ready', { timeout: 15000 });
+
+  const editorValue = await page.getByTestId('editor').inputValue();
+  expect(editorValue).toContain('fib');
+});
+
+test('unknown ?example= falls back without breaking the editor', async ({ page }) => {
+  await page.goto('/?example=does-not-exist.sema');
+  await page.waitForSelector('[data-testid="status"].status-ready', { timeout: 15000 });
+
+  // No example is force-selected; the editor is still usable.
+  await setEditorCode(page, '(+ 40 2)');
+  await clickRunAndWait(page);
+  const value = await page.$eval('#output .output-value', el => el.textContent);
+  expect(value).toContain('42');
+});
+
 // ── VM evaluation tests (bytecode VM is the sole evaluator) ──
 
 test('runs code with the bytecode VM', async ({ page }) => {

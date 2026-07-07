@@ -52,6 +52,15 @@
 
 ### Fixed
 
+- **`sema pkg` now retries transient registry failures instead of aborting the
+  install.** All registry HTTP calls (install/download, package info, publish,
+  search, yank) go through a shared client with connect/request timeouts and a
+  bounded retry loop (up to 4 attempts) for HTTP 429, 5xx, and network/timeout
+  errors. On 429 the server's `Retry-After` is honored (clamped); otherwise the
+  delay backs off exponentially with jitter. Previously a single 429 or blip
+  anywhere in dependency resolution failed the whole install. Regression tests:
+  `send_with_retry_*` and `jittered_stays_within_bounds` in `pkg.rs`.
+
 - **`time/format` no longer aborts the process on an invalid format string**
   (`"%"`, `"%Q"`, `"%-8"`, …). chrono's `DelayedFormat` panics inside
   `Display::to_string` for bad specifiers; formatting now goes through

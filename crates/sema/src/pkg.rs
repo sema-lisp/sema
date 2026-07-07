@@ -1452,6 +1452,103 @@ fn registry_install(name: &str, version: &str, registry_url: &str) -> Result<Str
     Ok(checksum)
 }
 
+/// Total per-request timeout (a whole tarball download must finish within it).
+const HTTP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+/// Connection-establishment timeout — fail fast on an unreachable registry.
+const HTTP_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+/// Retry budget for transient failures (429 / 5xx / network errors).
+const HTTP_MAX_ATTEMPTS: u32 = 4;
+const HTTP_BASE_BACKOFF: std::time::Duration = std::time::Duration::from_millis(500);
+const HTTP_MAX_BACKOFF: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// A blocking HTTP client with sane timeouts and bounded redirect following.
+/// The registry may 302 to GitHub for meta-registry packages, so redirects are
+/// followed (capped) rather than surfaced.
+fn http_client() -> Result<reqwest::blocking::Client, String> {
+    reqwest::blocking::Client::builder()
+        .connect_timeout(HTTP_CONNECT_TIMEOUT)
+        .timeout(HTTP_TIMEOUT)
+        .redirect(reqwest::redirect::Policy::limited(10))
+        .build()
+        .map_err(|e| format!("Failed to create HTTP client: {e}"))
+}
+
+/// Parse a `Retry-After` delta-seconds header into a bounded Duration.
+fn parse_retry_after(resp: &reqwest::blocking::Response) -> Option<std::time::Duration> {
+    let secs: u64 = resp
+        .headers()
+        .get(reqwest::header::RETRY_AFTER)?
+        .to_str()
+        .ok()?
+        .trim()
+        .parse()
+        .ok()?;
+    // Clamp: never trust a server telling us to sleep for minutes.
+    Some(std::time::Duration::from_secs(secs.clamp(1, 60)))
+}
+
+/// Add up to ~25% positive jitter so many clients retrying at once don't
+/// resynchronize into a thundering herd. Dependency-free pseudo-randomness from
+/// the wall clock is plenty for spreading retries.
+fn jittered(d: std::time::Duration) -> std::time::Duration {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|t| t.subsec_nanos())
+        .unwrap_or(0) as u64;
+    let extra = d.as_millis() as u64 * (nanos % 250) / 1000;
+    d + std::time::Duration::from_millis(extra)
+}
+
+/// Send a request with retries for *transient* failures: HTTP 429, any 5xx, and
+/// network/timeout errors. `build` produces a fresh request each attempt so the
+/// body can be replayed (reqwest bodies are single-use). On 429 the server's
+/// `Retry-After` is honored (clamped); otherwise the delay grows exponentially
+/// with jitter. Success and non-retryable 4xx (404, 401, …) return immediately.
+fn send_with_retry<F>(
+    what: &str,
+    mut build: F,
+) -> Result<reqwest::blocking::Response, String>
+where
+    F: FnMut() -> reqwest::Result<reqwest::blocking::Response>,
+{
+    let mut backoff = HTTP_BASE_BACKOFF;
+    for attempt in 1..=HTTP_MAX_ATTEMPTS {
+        let last = attempt == HTTP_MAX_ATTEMPTS;
+        match build() {
+            Ok(resp) => {
+                let status = resp.status();
+                let transient = status.as_u16() == 429 || status.is_server_error();
+                if !transient || last {
+                    return Ok(resp);
+                }
+                let wait = parse_retry_after(&resp)
+                    .unwrap_or(backoff)
+                    .clamp(HTTP_BASE_BACKOFF, HTTP_MAX_BACKOFF);
+                eprintln!(
+                    "  {what}: {status}, retrying in {:.1}s ({attempt}/{HTTP_MAX_ATTEMPTS})",
+                    wait.as_secs_f64()
+                );
+                std::thread::sleep(jittered(wait));
+                backoff = (backoff * 2).min(HTTP_MAX_BACKOFF);
+            }
+            Err(e) => {
+                if last {
+                    return Err(format!(
+                        "{what} failed after {HTTP_MAX_ATTEMPTS} attempts: {e}"
+                    ));
+                }
+                eprintln!(
+                    "  {what}: {e}, retrying in {:.1}s ({attempt}/{HTTP_MAX_ATTEMPTS})",
+                    backoff.as_secs_f64()
+                );
+                std::thread::sleep(jittered(backoff));
+                backoff = (backoff * 2).min(HTTP_MAX_BACKOFF);
+            }
+        }
+    }
+    unreachable!("the final attempt always returns")
+}
+
 /// Download a registry package and return (tarball_bytes, checksum).
 /// The registry may return a redirect (e.g. to GitHub for meta-registry packages),
 /// so we explicitly follow redirects.
@@ -1461,19 +1558,17 @@ fn registry_download(
     registry_url: &str,
 ) -> Result<(Vec<u8>, String), String> {
     let token = read_token();
-    let client = reqwest::blocking::Client::builder()
-        .redirect(reqwest::redirect::Policy::limited(10))
-        .build()
-        .map_err(|e| format!("Failed to create HTTP client: {e}"))?;
+    let client = http_client()?;
     let base = registry_url.trim_end_matches('/');
 
     let url = format!("{base}/api/v1/packages/{name}/{version}/download");
-    let mut req = client.get(&url);
-    if let Some(ref t) = token {
-        req = req.header("Authorization", format!("Bearer {t}"));
-    }
-
-    let resp = req.send().map_err(|e| format!("Download failed: {e}"))?;
+    let resp = send_with_retry("Download", || {
+        let mut req = client.get(&url);
+        if let Some(ref t) = token {
+            req = req.header("Authorization", format!("Bearer {t}"));
+        }
+        req.send()
+    })?;
     if !resp.status().is_success() {
         let status = resp.status();
         let body: serde_json::Value = resp.json().unwrap_or_default();
@@ -1532,16 +1627,18 @@ fn registry_install_locked(
 
 /// Fetch package info from the registry.
 fn registry_package_info(name: &str, registry_url: &str) -> Result<serde_json::Value, String> {
-    let client = reqwest::blocking::Client::new();
+    let client = http_client()?;
     let base = registry_url.trim_end_matches('/');
     let url = format!("{base}/api/v1/packages/{name}");
+    let token = read_token();
 
-    let mut req = client.get(&url);
-    if let Some(t) = read_token() {
-        req = req.header("Authorization", format!("Bearer {t}"));
-    }
-
-    let resp = req.send().map_err(|e| format!("Request failed: {e}"))?;
+    let resp = send_with_retry("Fetch package", || {
+        let mut req = client.get(&url);
+        if let Some(ref t) = token {
+            req = req.header("Authorization", format!("Bearer {t}"));
+        }
+        req.send()
+    })?;
     if !resp.status().is_success() {
         let status = resp.status();
         let body: serde_json::Value = resp.json().unwrap_or_default();
@@ -1614,28 +1711,30 @@ pub fn cmd_publish(registry: Option<&str>) -> Result<(), String> {
         "sema_version_req": pkg.get("sema_version_req").and_then(|v| v.as_str()),
     });
 
-    // Upload
+    // Upload. The multipart Form is single-use, so rebuild it (from owned bytes)
+    // on each retry attempt.
     let url = format!("{base}/api/v1/packages/{name}/{version}");
-    let form = reqwest::blocking::multipart::Form::new()
-        .part(
-            "tarball",
-            reqwest::blocking::multipart::Part::bytes(tarball)
-                .file_name("package.tar.gz")
-                .mime_str("application/gzip")
-                .unwrap(),
-        )
-        .part(
-            "metadata",
-            reqwest::blocking::multipart::Part::text(metadata.to_string()),
-        );
-
-    let client = reqwest::blocking::Client::new();
-    let resp = client
-        .put(&url)
-        .header("Authorization", format!("Bearer {token}"))
-        .multipart(form)
-        .send()
-        .map_err(|e| format!("Upload failed: {e}"))?;
+    let client = http_client()?;
+    let metadata = metadata.to_string();
+    let resp = send_with_retry("Upload", || {
+        let form = reqwest::blocking::multipart::Form::new()
+            .part(
+                "tarball",
+                reqwest::blocking::multipart::Part::bytes(tarball.clone())
+                    .file_name("package.tar.gz")
+                    .mime_str("application/gzip")
+                    .unwrap(),
+            )
+            .part(
+                "metadata",
+                reqwest::blocking::multipart::Part::text(metadata.clone()),
+            );
+        client
+            .put(&url)
+            .header("Authorization", format!("Bearer {token}"))
+            .multipart(form)
+            .send()
+    })?;
 
     if resp.status().is_success() {
         let body: serde_json::Value = resp
@@ -1664,11 +1763,8 @@ pub fn cmd_search(query: &str, registry: Option<&str>) -> Result<(), String> {
     let base = registry_url.trim_end_matches('/');
     let url = format!("{base}/api/v1/search?q={}", urlencoded(query));
 
-    let client = reqwest::blocking::Client::new();
-    let resp = client
-        .get(&url)
-        .send()
-        .map_err(|e| format!("Search failed: {e}"))?;
+    let client = http_client()?;
+    let resp = send_with_retry("Search", || client.get(&url).send())?;
 
     if !resp.status().is_success() {
         let status = resp.status();
@@ -1722,12 +1818,13 @@ pub fn cmd_yank(spec: &str, registry: Option<&str>) -> Result<(), String> {
     let base = registry_url.trim_end_matches('/');
 
     let url = format!("{base}/api/v1/packages/{name}/{version}/yank");
-    let client = reqwest::blocking::Client::new();
-    let resp = client
-        .post(&url)
-        .header("Authorization", format!("Bearer {token}"))
-        .send()
-        .map_err(|e| format!("Yank failed: {e}"))?;
+    let client = http_client()?;
+    let resp = send_with_retry("Yank", || {
+        client
+            .post(&url)
+            .header("Authorization", format!("Bearer {token}"))
+            .send()
+    })?;
 
     if resp.status().is_success() {
         println!("✓ Yanked {name}@{version}");
@@ -4194,5 +4291,61 @@ name = "myproject"
         assert!(loaded.entries.is_empty());
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn jittered_stays_within_bounds() {
+        let base = std::time::Duration::from_millis(1000);
+        for _ in 0..50 {
+            let j = jittered(base);
+            assert!(j >= base, "jitter must never shorten the backoff");
+            // Up to ~25% positive jitter.
+            assert!(j <= base + std::time::Duration::from_millis(250));
+        }
+    }
+
+    // A minimal one-shot HTTP server: replays the given raw responses, one per
+    // accepted connection, on a background thread. Returns the bound address.
+    fn mock_server(responses: Vec<&'static str>) -> std::net::SocketAddr {
+        use std::io::Read;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for body in responses {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut buf = [0u8; 2048];
+                let _ = stream.read(&mut buf); // drain the request line/headers
+                let _ = stream.write_all(body.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+        addr
+    }
+
+    #[test]
+    fn send_with_retry_recovers_after_transient_429() {
+        // First attempt 429 (no Retry-After → base backoff), second attempt 200.
+        let addr = mock_server(vec![
+            "HTTP/1.1 429 Too Many Requests\r\nContent-Length: 2\r\n\r\n{}",
+            "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK",
+        ]);
+        let client = http_client().unwrap();
+        let url = format!("http://{addr}/");
+        let resp = send_with_retry("Test", || client.get(&url).send()).unwrap();
+        assert!(resp.status().is_success(), "should recover on retry");
+    }
+
+    #[test]
+    fn send_with_retry_surfaces_last_response_after_exhausting_attempts() {
+        // Always 429: after HTTP_MAX_ATTEMPTS the last 429 response is returned
+        // (not an error), so the caller renders the server's message. Uses a
+        // Retry-After of 1s, which the loop clamps and honors.
+        let responses =
+            vec!["HTTP/1.1 429 Too Many Requests\r\nRetry-After: 1\r\nContent-Length: 2\r\n\r\n{}"; HTTP_MAX_ATTEMPTS as usize];
+        let addr = mock_server(responses);
+        let client = http_client().unwrap();
+        let url = format!("http://{addr}/");
+        let resp = send_with_retry("Test", || client.get(&url).send()).unwrap();
+        assert_eq!(resp.status().as_u16(), 429, "final response should surface");
     }
 }

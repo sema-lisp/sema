@@ -166,7 +166,9 @@
   (fn (item)
     (let* ((label         (nth item 0))
            (value         (nth item 1))
-           (bar-len       (round (* (/ value (+ chart-max 0.0)) max-bar-width)))
+           ;; `round` preserves inexactness (a float in, a float out), so
+           ;; convert explicitly to the int `string/repeat` needs.
+           (bar-len       (int (round (* (/ value (+ chart-max 0.0)) max-bar-width))))
            (bar           (string/repeat "█" bar-len))
            (padded-label  (string/pad-right label (+ max-label-len 1))))
       (println (format "  ~a|~a ~a" padded-label bar value))))

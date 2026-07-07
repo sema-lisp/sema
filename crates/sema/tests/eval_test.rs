@@ -1554,6 +1554,17 @@ eval_tests! {
     floor_int_identity: "(floor 5)" => common::eval("5"),
 }
 
+// Task 5.3: abs/min/max over the tower, with R7RS inexactness contagion
+// (if any argument is inexact, the result is inexact even when the winning
+// extremum itself was exact).
+eval_tests! {
+    abs_rational: "(abs -1/3)" => common::eval("1/3"),
+    abs_bignum: "(abs -170141183460469231731687303715884105728)"
+        => common::eval("170141183460469231731687303715884105728"),
+    min_contagion_inexact: "(min 1/2 1/3 0.4)" => common::eval("0.3333333333333333"),
+    max_rational: "(max 1/2 1/3)" => common::eval("1/2"),
+}
+
 // Regression tests for the runtime bug-hunt fixes (2026-07-07).
 eval_tests! {
     // Int↔float comparison is exact above 2^53 (was lossy: `as f64` collapsed

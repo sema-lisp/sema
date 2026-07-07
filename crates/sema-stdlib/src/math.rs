@@ -1,3 +1,5 @@
+use std::cmp::Ordering;
+
 use sema_core::number::SemaNumber;
 use sema_core::{check_arity, SemaError, Value, ValueViewRef};
 
@@ -100,47 +102,28 @@ pub fn register(env: &sema_core::Env) {
                     .with_hint("convert to a float first, e.g. (abs (* 1.0 n))")
             }),
             ValueViewRef::Float(f) => Ok(Value::float(f.abs())),
-            // Exact rationals (and any other tower number): negate iff negative,
-            // preserving exactness. `as_number` lifts to the tower and
-            // `from_number` lowers back to the tightest representation.
-            ValueViewRef::Rational(_) => {
+            // Bignum/rational/complex: `SemaNumber::abs` is exactness-preserving
+            // for reals (negate iff negative) and projects a complex to its
+            // (inexact) magnitude.
+            _ => {
                 let n = args[0]
                     .as_number()
                     .ok_or_else(|| SemaError::type_error("number", args[0].type_name()))?;
-                let out = if n.cmp_real(&SemaNumber::from_i64(0)) == Some(std::cmp::Ordering::Less)
-                {
-                    n.neg()
-                } else {
-                    n
-                };
-                Ok(Value::from_number(out))
+                Ok(Value::from_number(n.abs()))
             }
-            _ => Err(SemaError::type_error("number", args[0].type_name())),
         }
     });
 
     register_fn(env, "min", |args| {
-        check_arity!(args, "min", 1..);
-        let mut result = args[0].clone();
-        for arg in &args[1..] {
-            let cmp_result = num_lt(&result, arg)?;
-            if !cmp_result {
-                result = arg.clone();
-            }
-        }
-        Ok(result)
+        min_max_fold(args, "min", |ord| {
+            matches!(ord, Ordering::Less | Ordering::Equal)
+        })
     });
 
     register_fn(env, "max", |args| {
-        check_arity!(args, "max", 1..);
-        let mut result = args[0].clone();
-        for arg in &args[1..] {
-            let cmp_result = num_lt(arg, &result)?;
-            if !cmp_result {
-                result = arg.clone();
-            }
-        }
-        Ok(result)
+        min_max_fold(args, "max", |ord| {
+            matches!(ord, Ordering::Greater | Ordering::Equal)
+        })
     });
 
     register_fn(env, "floor", |args| {
@@ -690,14 +673,39 @@ pub fn register(env: &sema_core::Env) {
     env.set_str("math/nan", Value::float(f64::NAN));
 }
 
-fn num_lt(a: &Value, b: &Value) -> Result<bool, SemaError> {
-    match (a.view_ref(), b.view_ref()) {
-        (ValueViewRef::Int(a), ValueViewRef::Int(b)) => Ok(a < b),
-        (ValueViewRef::Float(a), ValueViewRef::Float(b)) => Ok(a < b),
-        (ValueViewRef::Int(a), ValueViewRef::Float(b)) => Ok((a as f64) < b),
-        (ValueViewRef::Float(a), ValueViewRef::Int(b)) => Ok(a < (b as f64)),
-        _ => Err(SemaError::type_error("number", a.type_name())),
+/// Shared fold for `min`/`max` over the whole tower. `keep_first` decides,
+/// given the ordering of the running extremum relative to the next
+/// candidate, whether to keep the extremum (`true`) or replace it. Applies
+/// R7RS inexactness contagion: if *any* argument was inexact, the winner is
+/// converted to inexact at the end, even if the winning value itself was
+/// exact.
+fn min_max_fold(
+    args: &[Value],
+    name: &str,
+    keep_first: impl Fn(Ordering) -> bool,
+) -> Result<Value, SemaError> {
+    check_arity!(args, name, 1..);
+    let mut best = args[0]
+        .as_number()
+        .ok_or_else(|| SemaError::type_error("number", args[0].type_name()))?;
+    let mut any_inexact = !best.is_exact();
+    for arg in &args[1..] {
+        let n = arg
+            .as_number()
+            .ok_or_else(|| SemaError::type_error("number", arg.type_name()))?;
+        any_inexact = any_inexact || !n.is_exact();
+        let ord = best.cmp_real(&n).ok_or_else(|| {
+            SemaError::eval(format!("{name}: cannot order these numbers"))
+                .with_hint("complex numbers (and NaN) have no ordering")
+        })?;
+        if !keep_first(ord) {
+            best = n;
+        }
     }
+    if any_inexact {
+        best = best.to_inexact();
+    }
+    Ok(Value::from_number(best))
 }
 
 #[cfg(test)]

@@ -22,7 +22,16 @@ pub fn register(env: &sema_core::Env) {
             .as_str()
             .ok_or_else(|| SemaError::type_error("string", args[1].type_name()))?;
         let dt = timestamp_to_datetime(ts)?;
-        Ok(Value::string(&dt.format(fmt).to_string()))
+        // chrono's DelayedFormat panics inside Display::to_string on invalid
+        // format specifiers; writing through fmt::Write surfaces the error.
+        use std::fmt::Write;
+        let mut out = String::new();
+        write!(out, "{}", dt.format(fmt)).map_err(|_| {
+            SemaError::eval(format!("time/format: invalid format string: {fmt:?}")).with_hint(
+                "time/format uses chrono format specifiers like %Y-%m-%d %H:%M:%S (see https://docs.rs/chrono/latest/chrono/format/strftime/index.html)",
+            )
+        })?;
+        Ok(Value::string(&out))
     });
 
     register_fn(env, "time/parse", |args| {

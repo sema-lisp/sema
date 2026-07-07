@@ -70,6 +70,14 @@ eval_tests! {
     time_date_parts: "(get (time/date-parts 0.0) :year)" => Value::int(1970),
 }
 
+// Invalid chrono format strings must raise a SemaError, not abort the process
+// (chrono's DelayedFormat panics inside .to_string() on bad specifiers).
+eval_error_tests! {
+    time_format_err_lone_percent: r#"(time/format 0.0 "%")"# => "time/format: invalid format string",
+    time_format_err_bad_specifier: r#"(time/format 0.0 "%Q")"# => "time/format: invalid format string",
+    time_format_err_bad_padding: r#"(time/format 0.0 "%-8")"# => "time/format: invalid format string",
+}
+
 // ============================================================
 // Env operations
 // ============================================================

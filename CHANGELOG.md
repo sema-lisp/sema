@@ -52,6 +52,12 @@
 
 ### Fixed
 
+- **`time/format` no longer aborts the process on an invalid format string**
+  (`"%"`, `"%Q"`, `"%-8"`, …). chrono's `DelayedFormat` panics inside
+  `Display::to_string` for bad specifiers; formatting now goes through
+  `fmt::Write` and surfaces a `SemaError` with a strftime hint, matching
+  `time/parse`. Regression tests: `time_format_err_*` in `eval_io_test.rs`.
+
 - **VM: HOF callback dispatch no longer strands closures on a foreign stack**
   (panic at `vm.rs` `LOAD_UPVALUE`, or silent wrong-slot reads/writes when the
   bad index happened to be in bounds). Root cause: `try_run_on_current_vm`

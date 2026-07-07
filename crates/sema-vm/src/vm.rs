@@ -381,23 +381,48 @@ impl Drop for CurrentVmGuard {
     }
 }
 
+/// Identity of the root ancestor of an env chain: the root's `bindings`
+/// allocation. All envs of one interpreter — the global env, module envs, and
+/// closure homes — chain up to the same root *bindings*, so this is a stable
+/// "same interpreter universe" test that doesn't depend on which frame a VM
+/// happens to be paused in. The `Env` struct itself is not a usable identity:
+/// module envs parent to a fresh `Rc` *clone* of the root
+/// (`create_module_env`), and per-form module VMs wrap further clones — all of
+/// which share the root's `bindings` Rc.
+fn env_root(env: &Rc<Env>) -> *const () {
+    let mut cur = env;
+    while let Some(parent) = &cur.parent {
+        cur = parent;
+    }
+    Rc::as_ptr(&cur.bindings) as *const ()
+}
+
 /// Try to run `closure` on the live VM currently executing a native call on
 /// this thread. Returns `Some(result)` if a compatible VM was found and the
 /// closure was dispatched in-VM; `None` if no compatible VM is registered (the
 /// caller should fall back to a fresh VM).
 ///
-/// "Compatible" means the running VM shares the same `functions` table and
-/// `globals` as the closure's compilation context — i.e. the closure belongs to
-/// that VM, so its open upvalue cells point into that VM's live stack.
+/// "Compatible" means the closure belongs to the same interpreter universe as
+/// the VM (their env chains share a root). Per-frame state is NOT compared:
+/// the run loop re-points `self.globals`/`self.functions` at every frame
+/// activation from the frame's own closure (M1 + M4), so a same-interpreter
+/// closure from any module runs correctly as a nested frame. Running nested is
+/// not just an optimization — it keeps the closure graph's still-open upvalue
+/// cells connected to the stack that owns them. A fresh-VM fallback only
+/// snapshots the *dispatched* closure's cells; a closure it reaches
+/// transitively (via captured data or module state) would dereference open
+/// cells against the wrong stack — out-of-bounds at best, a silent wrong-slot
+/// read/write at worst.
 fn try_run_on_current_vm(
     closure: &Rc<Closure>,
-    functions: &Rc<Vec<Rc<Function>>>,
     globals: &Rc<Env>,
     args: &[Value],
     ctx: &EvalContext,
 ) -> Option<Result<Value, SemaError>> {
-    // Snapshot the top compatible VM pointer, then release the borrow before
-    // re-entering the VM (the nested run may itself register a new current VM).
+    let closure_root = env_root(globals);
+    // Snapshot the innermost compatible VM pointer, then release the borrow
+    // before re-entering the VM (the nested run may itself register a new
+    // current VM).
     let vm_ptr = CURRENT_VM.with(|stack| {
         let stack = stack.borrow();
         stack.iter().rev().copied().find(|&ptr| {
@@ -405,7 +430,7 @@ fn try_run_on_current_vm(
             // native call that registered it is on the Rust stack, which is
             // strictly the case here (we are inside that native call).
             let vm = unsafe { &*ptr };
-            Rc::ptr_eq(&vm.functions, functions) && Rc::ptr_eq(&vm.globals, globals)
+            env_root(&vm.globals) == closure_root
         })
     })?;
     // SAFETY: the owning VM is paused at the native call site that registered
@@ -660,6 +685,18 @@ pub fn close_closure_upvalues_for_foreign_run(closure: &Closure) {
             }
         }
     }
+}
+
+/// Error for dereferencing an Open upvalue cell whose stack slot is not on the
+/// executing VM's stack — a closure with open upvalues escaped its owning VM
+/// without being snapshotted (see `close_closure_upvalues_for_foreign_run`).
+#[cold]
+#[inline(never)]
+fn foreign_upvalue_error() -> SemaError {
+    SemaError::eval(
+        "captured variable's stack slot is not on this VM \
+         (a closure with open upvalues escaped its owning VM)",
+    )
 }
 
 /// Close all open upvalues in the given open_upvalues vec, reading from the stack.
@@ -1221,11 +1258,20 @@ impl VM {
         // this depth (rather than emptying the whole call stack).
         let floor = self.frames.len();
         let stack_floor = self.stack.len();
+        // The nested run's frame activations re-point `self.globals` /
+        // `self.functions` (M1 + M4) and nothing re-activates the paused
+        // caller's frame until it resumes. Save/restore them so the VM's live
+        // state stays coherent with the paused frame while the native call is
+        // still in progress (e.g. `current_vm_globals()` for nested imports).
+        let saved_globals = self.globals.clone();
+        let saved_functions = self.functions.clone();
         self.setup_for_call(closure, args)?;
         let saved_floor = self.frame_floor;
         self.frame_floor = floor;
         let result = self.run_inner(ctx, None);
         self.frame_floor = saved_floor;
+        self.globals = saved_globals;
+        self.functions = saved_functions;
         match result {
             Ok(crate::debug::VmExecResult::Finished(v)) => Ok(v),
             Ok(crate::debug::VmExecResult::Stopped(_))
@@ -1789,27 +1835,56 @@ impl VM {
                     // --- Upvalues ---
                     op::LOAD_UPVALUE => {
                         let idx = read_u16!(code, pc) as usize;
-                        let val = {
+                        let resolved = {
                             let state = self.frames[fi].closure.upvalues[idx].state.borrow();
                             match &*state {
-                                UpvalueState::Closed(v) => v.clone(),
-                                UpvalueState::Open { frame_base, slot } => {
-                                    self.stack[*frame_base + *slot].clone()
-                                }
+                                UpvalueState::Closed(v) => Ok(v.clone()),
+                                UpvalueState::Open { frame_base, slot } => Err(*frame_base + *slot),
                             }
+                        };
+                        let val = match resolved {
+                            Ok(v) => v,
+                            // An Open cell indexes the stack of the VM that
+                            // created it. Out of bounds means a closure with
+                            // open upvalues escaped onto a foreign stack
+                            // without being snapshotted — error, don't panic
+                            // the process.
+                            Err(stack_idx) => match self.stack.get(stack_idx) {
+                                Some(v) => v.clone(),
+                                None => {
+                                    let err = foreign_upvalue_error();
+                                    let saved_pc = pc - op::SIZE_OP_U16;
+                                    handle_err!(self, fi, pc, err, saved_pc, 'dispatch)
+                                }
+                            },
                         };
                         self.stack.push(val);
                     }
                     op::STORE_UPVALUE => {
                         let idx = read_u16!(code, pc) as usize;
                         let val = unsafe { pop_unchecked(&mut self.stack) };
-                        {
+                        let open_target = {
                             let mut state =
                                 self.frames[fi].closure.upvalues[idx].state.borrow_mut();
                             match &mut *state {
-                                UpvalueState::Closed(v) => *v = val,
+                                UpvalueState::Closed(v) => {
+                                    *v = val;
+                                    None
+                                }
                                 UpvalueState::Open { frame_base, slot } => {
-                                    self.stack[*frame_base + *slot] = val;
+                                    Some((*frame_base + *slot, val))
+                                }
+                            }
+                        };
+                        if let Some((stack_idx, val)) = open_target {
+                            // See LOAD_UPVALUE: an out-of-bounds Open cell
+                            // means the closure escaped its owning VM.
+                            match self.stack.get_mut(stack_idx) {
+                                Some(slot) => *slot = val,
+                                None => {
+                                    let err = foreign_upvalue_error();
+                                    let saved_pc = pc - op::SIZE_OP_U16;
+                                    handle_err!(self, fi, pc, err, saved_pc, 'dispatch)
                                 }
                             }
                         }
@@ -3327,8 +3402,7 @@ impl VM {
                 // parent's stack slots so `set!` mutations flow back to the
                 // caller. Falls back to a fresh VM only when no compatible VM is
                 // on the stack (e.g. called directly from the tree-walker).
-                if let Some(result) = try_run_on_current_vm(closure, functions, globals, args, ctx)
-                {
+                if let Some(result) = try_run_on_current_vm(closure, globals, args, ctx) {
                     return result;
                 }
 

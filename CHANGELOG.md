@@ -52,6 +52,28 @@
 
 ### Fixed
 
+- **VM: HOF callback dispatch no longer strands closures on a foreign stack**
+  (panic at `vm.rs` `LOAD_UPVALUE`, or silent wrong-slot reads/writes when the
+  bad index happened to be in bounds). Root cause: `try_run_on_current_vm`
+  compared the dispatched closure against the paused VM's *frame-dynamic*
+  `globals`/`functions` — left stale by `run_nested_closure` — so a
+  same-interpreter callback could be spuriously declined and run on a fresh VM,
+  where any *transitively* reached closure with still-open upvalues
+  dereferenced the paused VM's stack coordinates. Surfaced by `sema-log`'s
+  appender dispatch (`for-each` over closures in module state, one capturing a
+  local); the same decline also silently dropped `set!` write-back through any
+  imported HOF wrapper (`(hof/each (fn (x) (set! n ...)) xs)` left `n`
+  untouched). Fix: compatibility is now root-env identity ("same interpreter
+  universe"), keyed on the root env's `bindings` allocation — module envs
+  parent to fresh `Rc` clones of the root, so the `Env` pointer itself is not
+  an identity — with per-frame env/table restore making cross-module nested
+  runs correct by construction. `run_nested_closure` saves/restores
+  `globals`/`functions`, and out-of-bounds open-upvalue access raises a
+  catchable error instead of panicking. Regression tests:
+  `test_hof_dispatch_open_upvalue_{deep_nesting_no_panic,shallow_write_back}`,
+  `test_imported_hof_wrapper_set_write_back`,
+  `test_imported_hof_transitive_closure_no_slot_clobber`.
+
 - **Package registry (`pkg/`) pre-deploy hardening** (per
   `docs/plans/2026-06-09-pkg-registry-predeploy-hardening.md`): publish is now
   atomic — package, owner, version, and dependency rows are written in a single

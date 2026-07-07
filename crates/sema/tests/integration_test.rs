@@ -815,6 +815,176 @@ fn test_nested_import_does_not_leak_non_exported_bindings() {
     );
 }
 
+/// Fixture for the open-upvalue dispatch regression tests: a `registry` module
+/// whose `reg/emit` dispatches handler closures through a HOF (`for-each`),
+/// and a `runner` module that invokes thunks through `map`. The combination
+/// drives callbacks through the native→VM re-entry path with frames from
+/// several modules interleaved, so an earlier callback's frame activation
+/// re-points the VM's live `globals`/`functions` before the next handler is
+/// dispatched from the same paused native. Such a dispatch must run nested on
+/// the VM that owns the handlers' open upvalue cells — a callback strayed onto
+/// a fresh VM dereferences those cells against the wrong stack: out of bounds
+/// (process panic at LOAD_UPVALUE) when the index is high, a silent wrong-slot
+/// read/write when it happens to be in bounds. The `set!` write-back
+/// assertions below catch the silent variant.
+fn write_dispatch_fixture_modules(dir: &std::path::Path) -> (String, String) {
+    let registry = dir.join("registry.sema");
+    let runner = dir.join("runner.sema");
+    std::fs::write(
+        &registry,
+        r#"(module registry
+             (export reg/set! reg/emit)
+             (define handlers {})
+             (defun reg/set! (m) (set! handlers m))
+             (defun reg/emit (ev)
+               (for-each (fn (entry) ((cadr entry) ev))
+                         (map/entries handlers))))"#,
+    )
+    .unwrap();
+    std::fs::write(
+        &runner,
+        r#"(module runner
+             (export run/all)
+             (define (run-one f) (try (begin (f) #t) (catch e e)))
+             (defun run/all (. fns) (map run-one fns)))"#,
+    )
+    .unwrap();
+    (lisp_path(&registry), lisp_path(&runner))
+}
+
+#[test]
+fn test_hof_dispatch_open_upvalue_deep_nesting_no_panic() {
+    // Deep variant: the capturing closure's frame sits under two layers of
+    // nested HOF dispatch, so its open upvalue's stack index is far beyond
+    // what a fresh fallback VM's stack would hold.
+    let dir = unique_temp_dir("hof-upvalue-deep");
+    let (registry, runner) = write_dispatch_fixture_modules(&dir);
+    assert_eq!(
+        eval(&format!(
+            r#"
+            (begin
+              (import "{registry}")
+              (import "{runner}")
+              (define captured (list))
+              (defun capture (ev) (set! captured (append captured (list ev))))
+              (define result -1)
+              (defun t ()
+                (define local-events (list))
+                (define (local-handler ev)
+                  (set! local-events (append local-events (list ev))))
+                ;; :a sorts before :b — the first dispatch (main-env `capture`)
+                ;; re-points the VM's live globals before :b is dispatched.
+                (reg/set! {{:a capture :b local-handler}})
+                (reg/emit {{:msg 1}})
+                (set! result (length local-events)))
+              (run/all t)
+              (list result (length captured)))
+        "#
+        )),
+        eval("'(1 1)"),
+        "set! through the handler's open upvalue must flow back to the defining frame"
+    );
+}
+
+#[test]
+fn test_hof_dispatch_open_upvalue_shallow_write_back() {
+    // Shallow variant: the open upvalue's stack index is small enough to be
+    // in bounds on a fresh VM's stack, where a strayed dispatch reads and
+    // writes the wrong slot with no error — only the write-back assertion
+    // catches it.
+    let dir = unique_temp_dir("hof-upvalue-shallow");
+    let (registry, _) = write_dispatch_fixture_modules(&dir);
+    assert_eq!(
+        eval(&format!(
+            r#"
+            (begin
+              (import "{registry}")
+              (define captured (list))
+              (defun capture (ev) (set! captured (append captured (list ev))))
+              (defun t ()
+                (define local-events (list))
+                (define (local-handler ev)
+                  (set! local-events (append local-events (list ev))))
+                (reg/set! {{:a capture :b local-handler}})
+                (reg/emit {{:msg 1}})
+                (length local-events))
+              (t))
+        "#
+        )),
+        Value::int(1),
+        "handler must observe and mutate the real captured local, not a foreign stack slot"
+    );
+}
+
+#[test]
+fn test_imported_hof_wrapper_set_write_back() {
+    // A caller-supplied closure dispatched as the direct argument of an
+    // imported module's HOF wrapper. The module env's parent is a fresh Rc
+    // clone of the root env, so an identity test on the root Env Rc can never
+    // match across the import boundary — compatibility must key on the root's
+    // shared bindings. A dispatch strayed onto a fresh VM snapshots the
+    // closure's open upvalue and the `set!` never reaches the caller's slot.
+    let dir = unique_temp_dir("imported-hof-write-back");
+    let hof = dir.join("hof.sema");
+    std::fs::write(
+        &hof,
+        "(module hof (export hof/each) (defun hof/each (f xs) (for-each f xs)))",
+    )
+    .unwrap();
+    assert_eq!(
+        eval(&format!(
+            r#"
+            (begin
+              (import "{}")
+              (let ((n 0))
+                (hof/each (fn (x) (set! n (+ n 1))) (list 1 2 3))
+                n))
+        "#,
+            lisp_path(&hof)
+        )),
+        Value::int(3),
+        "set! through an imported HOF wrapper must flow back to the caller's local"
+    );
+}
+
+#[test]
+fn test_imported_hof_transitive_closure_no_slot_clobber() {
+    // A closure reached *transitively* by the dispatched callback (not the
+    // callback itself) writes through its open upvalue. On a strayed fresh VM
+    // the write resolves against the callback frame's slots instead, silently
+    // clobbering an unrelated local — both bystander integrity and the real
+    // write-back are asserted.
+    let dir = unique_temp_dir("imported-hof-clobber");
+    let hof = dir.join("hof.sema");
+    std::fs::write(
+        &hof,
+        "(module hof (export hof/each) (defun hof/each (f xs) (for-each f xs)))",
+    )
+    .unwrap();
+    assert_eq!(
+        eval(&format!(
+            r#"
+            (begin
+              (import "{}")
+              (define observed nil)
+              (define (outer)
+                (let ((secret 111))
+                  (let ((writer (fn () (set! secret 222))))
+                    (hof/each (fn (x)
+                                (let ((a :a) (b :b) (c :c))
+                                  (writer)
+                                  (set! observed (list a b c))))
+                              (list 0))
+                    secret)))
+              (list (outer) observed))
+        "#,
+            lisp_path(&hof)
+        )),
+        eval("'(222 (:a :b :c))"),
+        "transitive closure writes must reach their own slot and no other"
+    );
+}
+
 #[test]
 fn test_cyclic_import_returns_error_instead_of_stack_overflow() {
     let dir = unique_temp_dir("cyclic-import");

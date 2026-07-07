@@ -15,6 +15,10 @@ lasso.workspace = true
 hashbrown.workspace = true
 toml.workspace = true
 crc32fast = "1"
+num-bigint = "0.4"
+num-integer = "0.1"
+num-rational = "0.4"
+num-traits = "0.2"
 
 # Stack-growth for deep recursive value walks + native→VM re-entry (see
 # `stack::maybe_grow`). Not available on wasm (no stack growth), so gate it off

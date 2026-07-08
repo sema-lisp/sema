@@ -82,6 +82,36 @@ pub const PRELUDE: &str = r#"
 (defmacro with-open (binding . body)
   `(with-stream ,binding ,@body))
 
+;; guard: R7RS structured exception handling.
+;; (guard (var clause ...) body ...) evaluates body; if a condition is raised
+;; (via `throw` or a native runtime error), it is bound to var and the clauses
+;; are evaluated like `cond` (an `else` clause, if present, must be last). If
+;; no clause matches, the condition is re-raised in guard's own dynamic
+;; position (guard's try/catch has already unwound body's frames, so the
+;; re-throw propagates from here, not from deep inside body).
+;;
+;; Consistent with try/catch, var is bound to Sema's error MAP
+;; ({:type ... :message ... :value <thrown>}), not the raw raised object —
+;; there is no bare `raise` in Sema, only `throw`. Use (:value var) to get the
+;; value passed to (throw x); (:type var)/(:message var) for native errors
+;; (division by zero, unbound variable, (error "msg"), etc).
+;; (guard (e ((string? (:value e)) (:value e)) (else :unknown)) (throw "x"))
+(defmacro guard (spec . body)
+  (let ((var (car spec))
+        (clauses (cdr spec)))
+    (let ((has-else
+            (and (not (null? clauses))
+                 (let ((last-clause (car (reverse clauses))))
+                   (and (list? last-clause)
+                        (equal? (car last-clause) 'else))))))
+      `(try
+         (begin ,@body)
+         (catch ,var
+           (cond ,@clauses
+                 ,@(if has-else
+                       (list)
+                       (list (list 'else (list 'throw var))))))))))
+
 ;; ws/listen: drive a receive loop on a websocket, dispatching each frame to the
 ;; matching handler. Spawns an async task and returns its promise — await it (or
 ;; run the scheduler) to actually drive the loop. All handlers are optional:

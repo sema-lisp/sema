@@ -2331,4 +2331,12 @@ eval_error_tests! {
         r#"(call-with-values (lambda () (throw "boom")) list)"# => "boom",
     mv_let_values_producer_error_propagates:
         r#"(let-values (((a) (throw "bad"))) a)"# => "bad",
+    // R7RS 5.3.3: define-values matches formals like a lambda's parameters, so
+    // too many produced values for a fixed formal list is an arity error (not a
+    // silent drop of the surplus).
+    mv_define_values_too_many_values_errors:
+        "(begin (define-values (a b) (values 1 2 3)) (list a b))" => "expects 2",
+    // Too few produced values is likewise a clean arity error.
+    mv_define_values_too_few_values_errors:
+        "(begin (define-values (a b c) (values 1 2)) a)" => "expects 3",
 }

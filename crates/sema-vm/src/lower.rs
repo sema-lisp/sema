@@ -1185,6 +1185,16 @@ fn lower_let_star_values(args: &[Value], tail: bool) -> Result<CoreExpr, SemaErr
 /// desugars to a `begin` of plain `define`s: bundle the producer's values into a
 /// gensym'd temp list via `call-with-values`/`list`, then `nth`/`drop` it apart —
 /// mirroring how `(define [a b] expr)` desugars to a `Begin` of `Define`s.
+///
+/// Because `nth`/`drop` are lenient (they ignore surplus elements and only error
+/// with a confusing out-of-bounds message when short), the raw list-splitting
+/// would silently accept a wrong value count. R7RS 5.3.3 matches `formals`
+/// against the produced values exactly like a lambda's parameters, so we first
+/// `apply` an otherwise-inert lambda with the SAME formals to the value list:
+/// that reuses the standard lambda-arity check and raises the normal
+/// `expects N` error on any count mismatch (a `rest` formal makes it accept the
+/// surplus, matching lambda semantics), before the (now guaranteed in-range)
+/// `nth`/`drop` binds each name.
 fn lower_define_values(args: &[Value]) -> Result<CoreExpr, SemaError> {
     if args.len() != 2 {
         return Err(SemaError::arity("define-values", "2", args.len()));
@@ -1193,7 +1203,7 @@ fn lower_define_values(args: &[Value]) -> Result<CoreExpr, SemaError> {
     let thunk = make_producer_thunk(&args[1])?;
     let tmp = gensym("dv");
 
-    let mut defines = Vec::with_capacity(params.len() + 2);
+    let mut defines = Vec::with_capacity(params.len() + 3);
     defines.push(CoreExpr::Define(
         tmp,
         Box::new(CoreExpr::Call {
@@ -1202,6 +1212,24 @@ fn lower_define_values(args: &[Value]) -> Result<CoreExpr, SemaError> {
             tail: false,
         }),
     ));
+    // Arity check: apply a formals-shaped inert lambda to the value list so a
+    // wrong value count surfaces as the normal lambda-arity error.
+    defines.push(CoreExpr::Call {
+        func: Box::new(CoreExpr::Var(intern("apply"))),
+        args: vec![
+            CoreExpr::Lambda(LambdaDef {
+                name: None,
+                params: params.clone(),
+                rest,
+                body: vec![CoreExpr::Const(Value::nil())],
+                upvalues: vec![],
+                upvalue_names: vec![],
+                n_locals: 0,
+            }),
+            CoreExpr::Var(tmp),
+        ],
+        tail: false,
+    });
     for (i, param) in params.iter().enumerate() {
         defines.push(CoreExpr::Define(
             *param,

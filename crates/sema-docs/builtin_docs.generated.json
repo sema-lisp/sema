@@ -5581,12 +5581,12 @@
       "name": "/",
       "module": "math",
       "section": "Basic Arithmetic",
-      "summary": "Divide numbers. Returns a float when the division is not exact (so `(/ 10 3)` is `3.3333...`, not `3`). For truncated integer division use [`math/quotient`](#math-quotient).",
+      "summary": "Divide numbers. Dividing two exact numbers (integers or rationals) stays exact: an inexact result becomes a reduced exact rational rather than a float, so `(/ 10 3)` is `10/3`, not `3.3333...`. Introducing a float operand makes the result inexact. For truncated integer division use [`math/quotient`](#math-quotient).",
       "returns": "number",
       "examples": [
-        "(/ 10 2)      ;; => 5\n(/ 10 3)      ;; => 3.3333333333333335\n(/ 10.0 3)    ;; => 3.3333333333333335"
+        "(/ 10 2)      ;; => 5\n(/ 10 3)      ;; => 10/3               (exact rational, not a float)\n(/ 10.0 3)    ;; => 3.3333333333333335 (a float operand makes it inexact)"
       ],
-      "body": "Divide numbers. Returns a float when the division is not exact (so `(/ 10 3)` is `3.3333...`, not `3`). For truncated integer division use [`math/quotient`](#math-quotient).\n\n```sema\n(/ 10 2)      ;; => 5\n(/ 10 3)      ;; => 3.3333333333333335\n(/ 10.0 3)    ;; => 3.3333333333333335\n```",
+      "body": "Divide numbers. Dividing two exact numbers (integers or rationals) stays exact: an inexact result becomes a reduced exact rational rather than a float, so `(/ 10 3)` is `10/3`, not `3.3333...`. Introducing a float operand makes the result inexact. For truncated integer division use [`math/quotient`](#math-quotient).\n\n```sema\n(/ 10 2)      ;; => 5\n(/ 10 3)      ;; => 10/3               (exact rational, not a float)\n(/ 10.0 3)    ;; => 3.3333333333333335 (a float operand makes it inexact)\n```",
       "syntax": "(/ num num ...)"
     },
     {
@@ -5787,21 +5787,21 @@
       "name": "ceil",
       "module": "math",
       "section": "Numeric Utilities",
-      "summary": "Round up toward positive infinity. For negatives this rounds *toward* zero (`-2.7` → `-2`). The mirror of `floor`; alias `ceiling`.",
+      "summary": "Round up toward positive infinity. For negatives this rounds *toward* zero (`-2.7` → `-2`). The mirror of `floor`; alias `ceiling`. Exactness-preserving: a float input rounds to a float, an exact rational rounds to an exact integer.",
       "examples": [
-        "(ceil 3.2)    ; => 4\n(ceil -2.7)   ; => -2\n(ceil 5)      ; => 5    (already an integer, unchanged)"
+        "(ceil 3.2)    ; => 4.0\n(ceil -2.7)   ; => -2.0\n(ceil 7/2)    ; => 4     (exact rational -> exact integer)\n(ceil 5)      ; => 5     (already an integer, unchanged)"
       ],
-      "body": "Round up toward positive infinity. For negatives this rounds *toward* zero (`-2.7` → `-2`). The mirror of `floor`; alias `ceiling`.\n\n```sema\n(ceil 3.2)    ; => 4\n(ceil -2.7)   ; => -2\n(ceil 5)      ; => 5    (already an integer, unchanged)\n```"
+      "body": "Round up toward positive infinity. For negatives this rounds *toward* zero (`-2.7` → `-2`). The mirror of `floor`; alias `ceiling`. Exactness-preserving: a float input rounds to a float, an exact rational rounds to an exact integer.\n\n```sema\n(ceil 3.2)    ; => 4.0\n(ceil -2.7)   ; => -2.0\n(ceil 7/2)    ; => 4     (exact rational -> exact integer)\n(ceil 5)      ; => 5     (already an integer, unchanged)\n```"
     },
     {
       "name": "ceiling",
       "module": "math",
       "section": "Scheme Aliases",
-      "summary": "Alias for `ceil`.",
+      "summary": "Alias for `ceil` — the R7RS spelling. Same exactness-preserving behavior: a float rounds to a float, an exact rational rounds to an exact integer.",
       "examples": [
-        "(ceiling 3.2)  ; => 4"
+        "(ceiling 3.2)  ; => 4.0\n(ceiling 7/2)  ; => 4     (exact rational -> exact integer)"
       ],
-      "body": "Alias for `ceil`.\n\n```sema\n(ceiling 3.2)  ; => 4\n```"
+      "body": "Alias for `ceil` — the R7RS spelling. Same exactness-preserving behavior: a float rounds to a float, an exact rational rounds to an exact integer.\n\n```sema\n(ceiling 3.2)  ; => 4.0\n(ceiling 7/2)  ; => 4     (exact rational -> exact integer)\n```"
     },
     {
       "name": "cos",
@@ -5912,7 +5912,7 @@
       "name": "expt",
       "module": "math",
       "section": "Scheme Aliases",
-      "summary": "Raise a base to a power, `(expt base exponent)`. The Scheme name for `pow`. Integer base and exponent give an integer result; a fractional exponent gives a float (so `(expt x 0.5)` is a square root) and a negative exponent gives the reciprocal.",
+      "summary": "Raise a base to a power, `(expt base exponent)`. The Scheme name for `pow`. An exact integer base with an exact integer exponent stays exact: a non-negative exponent gives an exact integer (bignum if it overflows a machine word), and a negative exponent gives the exact reciprocal as a rational. A fractional exponent gives a float (so `(expt x 0.5)` is a square root).",
       "params": [
         {
           "name": "base",
@@ -5925,9 +5925,9 @@
       ],
       "returns": "number",
       "examples": [
-        "(expt 2 10)    ; => 1024\n(expt 9 0.5)   ; => 3.0     (square root)\n(expt 2 -1)    ; => 0.5     (reciprocal)"
+        "(expt 2 10)    ; => 1024\n(expt 2 100)   ; => 1267650600228229401496703205376   (exact bignum)\n(expt 9 0.5)   ; => 3.0     (square root)\n(expt 2 -1)    ; => 1/2     (exact reciprocal, not a float)"
       ],
-      "body": "Raise a base to a power, `(expt base exponent)`. The Scheme name for `pow`. Integer base and exponent give an integer result; a fractional exponent gives a float (so `(expt x 0.5)` is a square root) and a negative exponent gives the reciprocal.\n\n```sema\n(expt 2 10)    ; => 1024\n(expt 9 0.5)   ; => 3.0     (square root)\n(expt 2 -1)    ; => 0.5     (reciprocal)\n```"
+      "body": "Raise a base to a power, `(expt base exponent)`. The Scheme name for `pow`. An exact integer base with an exact integer exponent stays exact: a non-negative exponent gives an exact integer (bignum if it overflows a machine word), and a negative exponent gives the exact reciprocal as a rational. A fractional exponent gives a float (so `(expt x 0.5)` is a square root).\n\n```sema\n(expt 2 10)    ; => 1024\n(expt 2 100)   ; => 1267650600228229401496703205376   (exact bignum)\n(expt 9 0.5)   ; => 3.0     (square root)\n(expt 2 -1)    ; => 1/2     (exact reciprocal, not a float)\n```"
     },
     {
       "name": "float",
@@ -5949,18 +5949,18 @@
       "name": "floor",
       "module": "math",
       "section": "Numeric Utilities",
-      "summary": "Round down toward negative infinity. For negatives this rounds *away* from zero (`-2.3` → `-3`), unlike `int`, which truncates toward zero (`-2.3` → `-2`).",
+      "summary": "Round down toward negative infinity. For negatives this rounds *away* from zero (`-2.3` → `-3`), unlike `int`, which truncates toward zero (`-2.3` → `-2`). `floor` is exactness-preserving: a float input rounds to a float, and an exact rational rounds to an exact integer.",
       "params": [
         {
           "name": "n",
           "type": "number"
         }
       ],
-      "returns": "int",
+      "returns": "number",
       "examples": [
-        "(floor 3.7)   ; => 3\n(floor -2.3)  ; => -3   (down, not -2)\n(int -2.3)    ; => -2   (contrast: toward zero)"
+        "(floor 3.7)   ; => 3.0\n(floor -2.3)  ; => -3.0  (down, not -2.0)\n(floor 7/2)   ; => 3     (exact rational -> exact integer)\n(int -2.3)    ; => -2    (contrast: toward zero)"
       ],
-      "body": "Round down toward negative infinity. For negatives this rounds *away* from zero (`-2.3` → `-3`), unlike `int`, which truncates toward zero (`-2.3` → `-2`).\n\n```sema\n(floor 3.7)   ; => 3\n(floor -2.3)  ; => -3   (down, not -2)\n(int -2.3)    ; => -2   (contrast: toward zero)\n```"
+      "body": "Round down toward negative infinity. For negatives this rounds *away* from zero (`-2.3` → `-3`), unlike `int`, which truncates toward zero (`-2.3` → `-2`). `floor` is exactness-preserving: a float input rounds to a float, and an exact rational rounds to an exact integer.\n\n```sema\n(floor 3.7)   ; => 3.0\n(floor -2.3)  ; => -3.0  (down, not -2.0)\n(floor 7/2)   ; => 3     (exact rational -> exact integer)\n(int -2.3)    ; => -2    (contrast: toward zero)\n```"
     },
     {
       "name": "gcd",
@@ -6405,11 +6405,11 @@
       "name": "math/nan?",
       "module": "math",
       "section": "Numeric Predicates",
-      "summary": "Test whether a value is NaN (\"not a number\"). This is the *only* reliable NaN check: NaN is never equal to anything, including itself, so `(= x math/nan)` is always `#f`. NaN arises from undefined operations like `(/ 0.0 0.0)` or `(sqrt -1)`.",
+      "summary": "Test whether a value is NaN (\"not a number\"). This is the *only* reliable NaN check: NaN is never equal to anything, including itself, so `(= x math/nan)` is always `#f`. NaN arises from undefined float operations like `(/ 0.0 0.0)`.",
       "examples": [
-        "(math/nan? math/nan)        ; => #t\n(math/nan? 42)              ; => #f\n(math/nan? (sqrt -1))       ; => #t\n(= math/nan math/nan)       ; => #f   ; why you need this predicate"
+        "(math/nan? math/nan)        ; => #t\n(math/nan? 42)              ; => #f\n(math/nan? (/ 0.0 0.0))     ; => #t\n(math/nan? (sqrt -1))       ; => #f   ; negative sqrt is now complex (0+1i), not NaN\n(= math/nan math/nan)       ; => #f   ; why you need this predicate"
       ],
-      "body": "Test whether a value is NaN (\"not a number\"). This is the *only* reliable NaN check: NaN is never equal to anything, including itself, so `(= x math/nan)` is always `#f`. NaN arises from undefined operations like `(/ 0.0 0.0)` or `(sqrt -1)`.\n\n```sema\n(math/nan? math/nan)        ; => #t\n(math/nan? 42)              ; => #f\n(math/nan? (sqrt -1))       ; => #t\n(= math/nan math/nan)       ; => #f   ; why you need this predicate\n```"
+      "body": "Test whether a value is NaN (\"not a number\"). This is the *only* reliable NaN check: NaN is never equal to anything, including itself, so `(= x math/nan)` is always `#f`. NaN arises from undefined float operations like `(/ 0.0 0.0)`.\n\n```sema\n(math/nan? math/nan)        ; => #t\n(math/nan? 42)              ; => #f\n(math/nan? (/ 0.0 0.0))     ; => #t\n(math/nan? (sqrt -1))       ; => #f   ; negative sqrt is now complex (0+1i), not NaN\n(= math/nan math/nan)       ; => #f   ; why you need this predicate\n```"
     },
     {
       "name": "math/pow",
@@ -6717,11 +6717,11 @@
       "name": "pow",
       "module": "math",
       "section": "Numeric Utilities",
-      "summary": "Raise a number to a power. Two non-negative integers give an integer result; a fractional or negative exponent (or float operands) yields a float. Same as [`math/pow`](#math-pow); `expt` is a Scheme-style alias.",
+      "summary": "Raise a number to a power. Exact integer operands stay exact: a non-negative exponent gives an exact integer result, and a negative exponent gives the exact reciprocal as a rational — it does not fall back to a float. A fractional exponent (or float operands) yields a float. `expt` is the Scheme-style alias, with identical semantics.",
       "examples": [
-        "(pow 2 10)    ; => 1024\n(pow 3 3)     ; => 27\n(pow 2 -1)    ; => 0.5   ; negative exponent -> float\n(pow 9 0.5)   ; => 3.0   ; fractional exponent -> square root"
+        "(pow 2 10)    ; => 1024\n(pow 3 3)     ; => 27\n(pow 2 -1)    ; => 1/2   ; negative exponent -> exact rational, not a float\n(pow 9 0.5)   ; => 3.0   ; fractional exponent -> square root"
       ],
-      "body": "Raise a number to a power. Two non-negative integers give an integer result; a fractional or negative exponent (or float operands) yields a float. Same as [`math/pow`](#math-pow); `expt` is a Scheme-style alias.\n\n```sema\n(pow 2 10)    ; => 1024\n(pow 3 3)     ; => 27\n(pow 2 -1)    ; => 0.5   ; negative exponent -> float\n(pow 9 0.5)   ; => 3.0   ; fractional exponent -> square root\n```"
+      "body": "Raise a number to a power. Exact integer operands stay exact: a non-negative exponent gives an exact integer result, and a negative exponent gives the exact reciprocal as a rational — it does not fall back to a float. A fractional exponent (or float operands) yields a float. `expt` is the Scheme-style alias, with identical semantics.\n\n```sema\n(pow 2 10)    ; => 1024\n(pow 3 3)     ; => 27\n(pow 2 -1)    ; => 1/2   ; negative exponent -> exact rational, not a float\n(pow 9 0.5)   ; => 3.0   ; fractional exponent -> square root\n```"
     },
     {
       "name": "quotient",
@@ -6829,18 +6829,18 @@
       "name": "round",
       "module": "math",
       "section": "Numeric Utilities",
-      "summary": "Round to the nearest integer, with ties (`.5`) rounded *away from zero*. For decimal-place rounding use [`math/round-to`](#math-round-to); to drop the fraction toward zero use [`truncate`](#truncate).",
+      "summary": "Round to the nearest integer, with ties (`.5`) rounded to the nearest *even* integer (banker's rounding, per R7RS) rather than away from zero. `round` is also exactness-preserving: a float input rounds to a float, an exact rational rounds to an exact integer. For decimal-place rounding use [`math/round-to`](#math-round-to); to drop the fraction toward zero use [`truncate`](#truncate).",
       "params": [
         {
           "name": "n",
           "type": "number"
         }
       ],
-      "returns": "int",
+      "returns": "number",
       "examples": [
-        "(round 3.5)   ; => 4\n(round 3.4)   ; => 3\n(round 2.5)   ; => 3    ; tie rounds away from zero (not to even)\n(round -2.5)  ; => -3"
+        "(round 3.5)   ; => 4.0\n(round 3.4)   ; => 3.0\n(round 2.5)   ; => 2.0   ; tie rounds to even, not away from zero\n(round -2.5)  ; => -2.0  ; tie rounds to even\n(round 7/2)   ; => 4     ; exact rational -> exact integer (tie to even)"
       ],
-      "body": "Round to the nearest integer, with ties (`.5`) rounded *away from zero*. For decimal-place rounding use [`math/round-to`](#math-round-to); to drop the fraction toward zero use [`truncate`](#truncate).\n\n```sema\n(round 3.5)   ; => 4\n(round 3.4)   ; => 3\n(round 2.5)   ; => 3    ; tie rounds away from zero (not to even)\n(round -2.5)  ; => -3\n```"
+      "body": "Round to the nearest integer, with ties (`.5`) rounded to the nearest *even* integer (banker's rounding, per R7RS) rather than away from zero. `round` is also exactness-preserving: a float input rounds to a float, an exact rational rounds to an exact integer. For decimal-place rounding use [`math/round-to`](#math-round-to); to drop the fraction toward zero use [`truncate`](#truncate).\n\n```sema\n(round 3.5)   ; => 4.0\n(round 3.4)   ; => 3.0\n(round 2.5)   ; => 2.0   ; tie rounds to even, not away from zero\n(round -2.5)  ; => -2.0  ; tie rounds to even\n(round 7/2)   ; => 4     ; exact rational -> exact integer (tie to even)\n```"
     },
     {
       "name": "sin",
@@ -6856,18 +6856,18 @@
       "name": "sqrt",
       "module": "math",
       "section": "Numeric Utilities",
-      "summary": "Square root. Always returns a float (even for perfect squares). A negative input yields `NaN` rather than raising.",
+      "summary": "Square root. An exact perfect square returns an exact integer result rather than a float; other non-negative inputs return a float. A negative input returns a complex number rather than `NaN` or raising.",
       "params": [
         {
           "name": "n",
           "type": "number"
         }
       ],
-      "returns": "float",
+      "returns": "number",
       "examples": [
-        "(sqrt 16)     ; => 4.0\n(sqrt 2)      ; => 1.4142135623730951\n(sqrt -1)     ; => NaN   ; no complex numbers; guard with (math/nan? ...)"
+        "(sqrt 16)     ; => 4          (exact perfect square, not 4.0)\n(sqrt 2)      ; => 1.4142135623730951\n(sqrt -1)     ; => 0+1i       (complex result, not NaN)"
       ],
-      "body": "Square root. Always returns a float (even for perfect squares). A negative input yields `NaN` rather than raising.\n\n```sema\n(sqrt 16)     ; => 4.0\n(sqrt 2)      ; => 1.4142135623730951\n(sqrt -1)     ; => NaN   ; no complex numbers; guard with (math/nan? ...)\n```"
+      "body": "Square root. An exact perfect square returns an exact integer result rather than a float; other non-negative inputs return a float. A negative input returns a complex number rather than `NaN` or raising.\n\n```sema\n(sqrt 16)     ; => 4          (exact perfect square, not 4.0)\n(sqrt 2)      ; => 1.4142135623730951\n(sqrt -1)     ; => 0+1i       (complex result, not NaN)\n```"
     },
     {
       "name": "string->number",
@@ -6898,11 +6898,11 @@
       "name": "truncate",
       "module": "math",
       "section": "Scheme Aliases",
-      "summary": "Drop the fractional part, rounding toward zero (so negatives round *up*). Unlike [`round`](#round), it never inspects the fraction — `3.9` truncates to `3`.",
+      "summary": "Drop the fractional part, rounding toward zero (so negatives round *up*). Unlike [`round`](#round), it never inspects the fraction — `3.9` truncates to `3`. Exactness-preserving: a float input truncates to a float, an exact rational truncates to an exact integer.",
       "examples": [
-        "(truncate 3.7)  ; => 3\n(truncate -3.7) ; => -3   ; toward zero, not floor (-4)\n(truncate 3.9)  ; => 3"
+        "(truncate 3.7)  ; => 3.0\n(truncate -3.7) ; => -3.0  ; toward zero, not floor (-4.0)\n(truncate 3.9)  ; => 3.0\n(truncate 7/2)  ; => 3     (exact rational -> exact integer)"
       ],
-      "body": "Drop the fractional part, rounding toward zero (so negatives round *up*). Unlike [`round`](#round), it never inspects the fraction — `3.9` truncates to `3`.\n\n```sema\n(truncate 3.7)  ; => 3\n(truncate -3.7) ; => -3   ; toward zero, not floor (-4)\n(truncate 3.9)  ; => 3\n```"
+      "body": "Drop the fractional part, rounding toward zero (so negatives round *up*). Unlike [`round`](#round), it never inspects the fraction — `3.9` truncates to `3`. Exactness-preserving: a float input truncates to a float, an exact rational truncates to an exact integer.\n\n```sema\n(truncate 3.7)  ; => 3.0\n(truncate -3.7) ; => -3.0  ; toward zero, not floor (-4.0)\n(truncate 3.9)  ; => 3.0\n(truncate 7/2)  ; => 3     (exact rational -> exact integer)\n```"
     },
     {
       "name": "mcp/call",
@@ -7847,11 +7847,11 @@
       "name": "integer?",
       "module": "predicates",
       "section": "Numeric Predicates",
-      "summary": "Test if a value is an integer. This checks the runtime *type*, not the mathematical value — a float like `3.0` is not an integer even though it has no fractional part.",
+      "summary": "Test if a value is an integer. This is R7RS *value-based*: any number with no fractional part is an integer regardless of representation — an integer-valued float like `3.0` counts, and so do bignums (arbitrary-precision integers beyond machine-word range).",
       "examples": [
-        "(integer? 42)     ; => #t\n(integer? 3.14)   ; => #f\n(integer? 3.0)    ; => #f   (it's a float, not an int)\n(integer? \"42\")   ; => #f"
+        "(integer? 42)     ; => #t\n(integer? 3.14)   ; => #f\n(integer? 3.0)    ; => #t   (integer-valued float — checked by value, not type)\n(integer? \"42\")   ; => #f"
       ],
-      "body": "Test if a value is an integer. This checks the runtime *type*, not the mathematical value — a float like `3.0` is not an integer even though it has no fractional part.\n\n```sema\n(integer? 42)     ; => #t\n(integer? 3.14)   ; => #f\n(integer? 3.0)    ; => #f   (it's a float, not an int)\n(integer? \"42\")   ; => #f\n```\n\nUse `number?` to accept ints and floats alike; use `float?` for the float case."
+      "body": "Test if a value is an integer. This is R7RS *value-based*: any number with no fractional part is an integer regardless of representation — an integer-valued float like `3.0` counts, and so do bignums (arbitrary-precision integers beyond machine-word range).\n\n```sema\n(integer? 42)     ; => #t\n(integer? 3.14)   ; => #f\n(integer? 3.0)    ; => #t   (integer-valued float — checked by value, not type)\n(integer? \"42\")   ; => #f\n```\n\nUse `number?` to accept any numeric type; use `float?` to check specifically for the float representation."
     },
     {
       "name": "keyword?",

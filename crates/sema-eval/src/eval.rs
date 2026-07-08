@@ -258,6 +258,12 @@ pub fn expand_for_vm_in(ctx: &EvalContext, env: &Env, expr: &Value) -> EvalResul
                 register_defmacro(items, env)?;
                 return Ok(Value::nil());
             }
+            if name == "define-syntax" {
+                // Register the R7RS syntax-rules transformer directly (pure
+                // destructure), mirroring the `defmacro` branch.
+                register_define_syntax(items, env)?;
+                return Ok(Value::nil());
+            }
             if name == "begin" || name == "progn" {
                 let mut new_items = vec![Value::symbol_from_spur(s)];
                 let mut changed = false;
@@ -291,6 +297,11 @@ fn expand_macros_in(ctx: &EvalContext, env: &Env, expr: &Value) -> EvalResult {
                 }
                 if let Some(mac_val) = env.get(s) {
                     if let Some(mac) = mac_val.as_macro_rc() {
+                        if mac.syntax_rules.is_some() {
+                            // R7RS syntax-rules: pattern-match + template expand.
+                            let expanded = crate::syntax_rules::expand(&mac, &items[1..], env)?;
+                            return expand_macros_in(ctx, env, &expanded);
+                        }
                         // VM-native expansion: apply the transformer on the VM,
                         // not the tree-walker.
                         let expanded = apply_macro_vm(ctx, &mac, &items[1..], env)?;
@@ -615,9 +626,111 @@ fn register_defmacro(items: &[Value], env: &Env) -> Result<(), SemaError> {
             rest_param,
             body,
             name: name_spur,
+            syntax_rules: None,
         }),
     );
     Ok(())
+}
+
+/// Register a `define-syntax` form's R7RS `syntax-rules` transformer in `env`
+/// (pure destructure) — the syntax-rules counterpart of [`register_defmacro`].
+/// `items[0]` is the `define-syntax` symbol; the rest are name + transformer.
+fn register_define_syntax(items: &[Value], env: &Env) -> Result<(), SemaError> {
+    let args = &items[1..];
+    if args.len() != 2 {
+        return Err(SemaError::eval(
+            "define-syntax: expected (define-syntax name (syntax-rules ...))",
+        ));
+    }
+    let name_spur = args[0]
+        .as_symbol_spur()
+        .ok_or_else(|| SemaError::eval("define-syntax: name must be a symbol"))?;
+    let sr = parse_syntax_rules(&args[1])?;
+    env.set(
+        name_spur,
+        Value::macro_val(Macro {
+            params: Vec::new(),
+            rest_param: None,
+            body: Vec::new(),
+            name: name_spur,
+            syntax_rules: Some(Rc::new(sr)),
+        }),
+    );
+    Ok(())
+}
+
+/// Parse a `(syntax-rules (literals...) (pattern template)...)` transformer form
+/// — with an optional custom-ellipsis symbol before the literals list — into a
+/// [`sema_core::SyntaxRules`].
+fn parse_syntax_rules(form: &Value) -> Result<sema_core::SyntaxRules, SemaError> {
+    let elems = form.as_list().ok_or_else(|| {
+        SemaError::eval("define-syntax: transformer must be a (syntax-rules ...) form")
+    })?;
+    let head_ok = elems
+        .first()
+        .and_then(|v| v.as_symbol_spur())
+        .is_some_and(|s| resolve(s) == "syntax-rules");
+    if !head_ok {
+        return Err(SemaError::eval(
+            "define-syntax: transformer must be a (syntax-rules ...) form",
+        ));
+    }
+    if elems.len() < 2 {
+        return Err(SemaError::eval(
+            "syntax-rules: malformed — expected (syntax-rules (literals...) rules...)",
+        ));
+    }
+    // Optional custom ellipsis: a symbol in the slot where the literals list is
+    // otherwise expected.
+    let mut idx = 1;
+    let ellipsis = if elems[idx].as_symbol_spur().is_some() {
+        let e = elems[idx].as_symbol_spur().unwrap();
+        idx += 1;
+        e
+    } else {
+        intern("...")
+    };
+    let literals_val = elems
+        .get(idx)
+        .ok_or_else(|| SemaError::eval("syntax-rules: malformed — missing literals list"))?;
+    let literals_list = literals_val
+        .as_list()
+        .ok_or_else(|| SemaError::eval("syntax-rules: literals must be a list"))?;
+    let literals: Vec<Spur> = literals_list
+        .iter()
+        .map(|v| {
+            v.as_symbol_spur()
+                .ok_or_else(|| SemaError::eval("syntax-rules: each literal must be a symbol"))
+        })
+        .collect::<Result<_, _>>()?;
+    idx += 1;
+    let mut rules = Vec::new();
+    for rule in &elems[idx..] {
+        let rl = rule
+            .as_list()
+            .ok_or_else(|| SemaError::eval("syntax-rules: each rule must be (pattern template)"))?;
+        if rl.len() < 2 {
+            return Err(SemaError::eval(
+                "syntax-rules: each rule must be (pattern template)",
+            ));
+        }
+        let pattern = rl[0].clone();
+        // R7RS rules have a single template; tolerate multiple by wrapping them
+        // in an implicit `begin`.
+        let template = if rl.len() == 2 {
+            rl[1].clone()
+        } else {
+            let mut begin = vec![Value::symbol("begin")];
+            begin.extend(rl[1..].iter().cloned());
+            Value::list(begin)
+        };
+        rules.push((pattern, template));
+    }
+    Ok(sema_core::SyntaxRules {
+        literals,
+        ellipsis,
+        rules,
+    })
 }
 
 /// Register `__vm-*` native functions that the bytecode VM calls back into
@@ -809,6 +922,7 @@ pub fn register_vm_delegates(env: &Rc<Env>) {
                     rest_param,
                     body,
                     name,
+                    syntax_rules: None,
                 }),
             );
             Ok(Value::nil())
@@ -831,6 +945,25 @@ pub fn register_vm_delegates(env: &Rc<Env>) {
                 .ok_or_else(|| SemaError::type_error("list", args[0].type_name()))?;
             let dmf_env = upgrade_delegate_env(&dmf_env)?;
             register_defmacro(items, &dmf_env)?;
+            Ok(Value::nil())
+        })),
+    );
+
+    // __vm-define-syntax: register a complete `(define-syntax ...)` form directly
+    // (pure destructure). Used when a define-syntax reaches compilation (e.g.
+    // non-top-level) rather than expand-time registration.
+    let dsf_env = Rc::downgrade(env);
+    env.set(
+        intern("__vm-define-syntax"),
+        Value::native_fn(NativeFn::simple("__vm-define-syntax", move |args| {
+            if args.len() != 1 {
+                return Err(SemaError::arity("define-syntax", "1", args.len()));
+            }
+            let items = args[0]
+                .as_list()
+                .ok_or_else(|| SemaError::type_error("list", args[0].type_name()))?;
+            let dsf_env = upgrade_delegate_env(&dsf_env)?;
+            register_define_syntax(items, &dsf_env)?;
             Ok(Value::nil())
         })),
     );
@@ -926,6 +1059,9 @@ pub fn register_vm_delegates(env: &Rc<Env>) {
                         let me_env = upgrade_delegate_env(&me_env)?;
                         if let Some(mac_val) = me_env.get(spur) {
                             if let Some(mac) = mac_val.as_macro_rc() {
+                                if mac.syntax_rules.is_some() {
+                                    return crate::syntax_rules::expand(&mac, &items[1..], &me_env);
+                                }
                                 // VM-native: expand the transformer on the VM.
                                 return apply_macro_vm(ctx, &mac, &items[1..], &me_env);
                             }

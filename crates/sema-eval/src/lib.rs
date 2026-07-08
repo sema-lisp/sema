@@ -4,6 +4,7 @@ mod destructure;
 mod eval;
 mod prelude;
 mod special_forms;
+mod syntax_rules;
 
 pub use debug_session::{is_debug_session_active, set_debug_session_active};
 pub use eval::{

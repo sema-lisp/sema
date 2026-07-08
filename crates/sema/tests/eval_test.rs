@@ -2474,6 +2474,42 @@ eval_tests! {
             (syntax-rules () ((_ c body ...) (if c (begin body ...) #f))))
           (my-when #t 1 2 3))
     "# => Value::int(3),
+
+    // Binder-directed hygiene: a template that references a user-defined global
+    // FUNCTION must keep that name verbatim (not alpha-rename it), so it still
+    // resolves after whole-program pre-expansion. Regression for the bug where
+    // `helper` became `helper__0` (Unbound variable).
+    sr_calls_user_function: r#"
+        (begin
+          (define (helper x) (* x 10))
+          (define-syntax m (syntax-rules () ((_ x) (helper x))))
+          (m 4))
+    "# => Value::int(40),
+
+    // A template that references a user-defined global VARIABLE keeps it verbatim.
+    sr_references_user_global: r#"
+        (begin
+          (define g 100)
+          (define-syntax getg (syntax-rules () ((_) g)))
+          (getg))
+    "# => Value::int(100),
+
+    // Calling a user function through the template with ellipsis-spread args.
+    sr_calls_user_function_ellipsis: r#"
+        (begin
+          (define (sum3 a b c) (+ a b c))
+          (define-syntax s3 (syntax-rules () ((_ e ...) (sum3 e ...))))
+          (s3 4 5 6))
+    "# => Value::int(15),
+
+    // A template-introduced binder (`r`) is still renamed and never leaks:
+    // the outer user `r` is untouched by the expansion.
+    sr_binder_does_not_leak: r#"
+        (begin
+          (define-syntax twice (syntax-rules () ((_ e) (let ((r e)) (+ r r)))))
+          (define r 1000)
+          (list (twice 5) r))
+    "# => common::eval("'(10 1000)"),
 }
 
 eval_error_tests! {

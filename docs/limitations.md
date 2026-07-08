@@ -74,9 +74,9 @@ The stack-trace machinery — call frames, file locations, and source spans, bou
 Full math suite: `math/quotient`, `math/remainder`, `math/gcd`, `math/lcm`, `math/tan`, `math/asin`, `math/acos`, `math/atan`, `math/atan2`, `math/exp`, `math/log10`, `math/log2`, `math/random`, `math/random-int`, `math/clamp`, `math/sign`.
 Bitwise: `bit/and`, `bit/or`, `bit/xor`, `bit/not`, `bit/shift-left`, `bit/shift-right`.
 
-### 15. No `guard` (R7RS Style)
+### ~~15. No `guard` (R7RS Style)~~ → RESOLVED
 
-We chose `try`/`catch`/`throw` over R7RS `guard`. The error map with `:type` keyword enables pattern matching in the handler via `cond`.
+R7RS `(guard (var clause ...) body ...)` is implemented (as a prelude macro over `try`/`catch`), alongside the R7RS `raise` procedure. Clauses are tried like `cond` (with optional `else`); when no clause matches, the condition is re-raised to the enclosing handler rather than swallowed. `guard` catches both `(raise obj)` and native runtime errors. The pre-existing `try`/`catch`/`throw` with `:type`-keyed error maps remains available too.
 
 ---
 

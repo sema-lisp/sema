@@ -1040,9 +1040,26 @@ fn is_delimiter_at(chars: &[char], idx: usize) -> bool {
 }
 
 fn is_delimiter(ch: char) -> bool {
+    // `#` always begins a reader construct (`#(`, `#"…"`, `#x`, `#t`, …), so it
+    // ends a number just like `(` does — `3+4i#(…)` splits the same way
+    // `123#(…)` does.
     matches!(
         ch,
-        ' ' | '\t' | '\r' | '\n' | '(' | ')' | '[' | ']' | '{' | '}' | '"' | ';' | '\'' | '`' | ','
+        ' ' | '\t'
+            | '\r'
+            | '\n'
+            | '('
+            | ')'
+            | '['
+            | ']'
+            | '{'
+            | '}'
+            | '"'
+            | ';'
+            | '\''
+            | '`'
+            | ','
+            | '#'
     )
 }
 
@@ -1150,6 +1167,28 @@ mod tests {
             Token::Comment(text) => assert_eq!(text, "; comment"),
             _ => panic!("expected Comment token"),
         }
+    }
+
+    #[test]
+    fn test_complex_literal_terminated_by_hash() {
+        // `#` begins a reader construct, so it delimits a trailing `i` the
+        // same way `(` does: `3+4i#(…)` is Complex + short lambda, matching
+        // how `123#(…)` splits into Int + short lambda.
+        let toks = |src: &str| -> Vec<Token> {
+            tokenize(src)
+                .unwrap()
+                .into_iter()
+                .map(|t| t.token)
+                .collect()
+        };
+        assert!(matches!(
+            toks("3+4i#(+ 1 2)").as_slice(),
+            [Token::Complex(_, _), Token::ShortLambdaStart, ..]
+        ));
+        assert!(matches!(
+            toks("2i#(+ 1 2)").as_slice(),
+            [Token::Complex(_, _), Token::ShortLambdaStart, ..]
+        ));
     }
 
     #[test]

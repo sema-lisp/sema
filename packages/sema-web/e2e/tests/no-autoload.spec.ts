@@ -6,5 +6,5 @@ test("autoLoad: false prevents script tags from executing", async ({ page }) => 
   await waitForSema(page);
 
   // The inline sema script should NOT have run
-  await expect(page.locator("#app")).toHaveText("untouched");
+  await expect(page.getByTestId("app")).toHaveText("untouched");
 });

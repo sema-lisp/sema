@@ -5,7 +5,7 @@ test("input retains focus and value after unrelated state change", async ({ page
   await page.goto("/focus.html");
   await waitForSema(page);
 
-  const input = page.locator("#text-input");
+  const input = page.getByTestId("text-input");
   await input.click();
   await input.fill("hello");
 
@@ -25,5 +25,5 @@ test("input retains focus and value after unrelated state change", async ({ page
   await expect(input).toHaveValue("hello");
 
   // Counter should have updated
-  await expect(page.locator("#counter-display")).toHaveText("1");
+  await expect(page.getByTestId("counter-display")).toHaveText("1");
 });

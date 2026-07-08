@@ -16,35 +16,35 @@ test.describe("Board demo — core board rendering and manual interactions", () 
     await page.goto("/board.html");
     await waitForSema(page);
 
-    await expect(page.locator('[data-testid="board-header"]')).toBeVisible();
-    await expect(page.locator('[data-testid="column-todo"]')).toBeVisible();
-    await expect(page.locator('[data-testid="column-in-progress"]')).toBeVisible();
-    await expect(page.locator('[data-testid="column-done"]')).toBeVisible();
+    await expect(page.getByTestId("board-header")).toBeVisible();
+    await expect(page.getByTestId("column-todo")).toBeVisible();
+    await expect(page.getByTestId("column-in-progress")).toBeVisible();
+    await expect(page.getByTestId("column-done")).toBeVisible();
 
     // Seed data: 3 todo, 2 in-progress, 1 done (see make-seed-data in board.sema)
-    await expect(page.locator('[data-testid="count-todo"]')).toHaveText("3");
-    await expect(page.locator('[data-testid="count-in-progress"]')).toHaveText("2");
-    await expect(page.locator('[data-testid="count-done"]')).toHaveText("1");
+    await expect(page.getByTestId("count-todo")).toHaveText("3");
+    await expect(page.getByTestId("count-in-progress")).toHaveText("2");
+    await expect(page.getByTestId("count-done")).toHaveText("1");
 
-    await expect(page.locator('[data-testid="progress-text"]')).toContainText("1/6");
-    await expect(page.locator('[data-testid="board-card"]')).toHaveCount(6);
+    await expect(page.getByTestId("progress-text")).toContainText("1/6");
+    await expect(page.getByTestId("board-card")).toHaveCount(6);
   });
 
   test("manual card creation via the add-card form", async ({ page }) => {
     await page.goto("/board.html");
     await waitForSema(page);
 
-    await page.click('[data-testid="add-card-todo"]');
-    await expect(page.locator('[data-testid="add-card-form"]')).toBeVisible();
+    await page.getByTestId("add-card-todo").click();
+    await expect(page.getByTestId("add-card-form")).toBeVisible();
 
-    await page.fill('[data-testid="add-card-input"]', "Ship the release notes");
-    await page.click('[data-testid="submit-add-card"]');
+    await page.getByTestId("add-card-input").fill("Ship the release notes");
+    await page.getByTestId("submit-add-card").click();
 
     // Form closes and the new card appears in the todo column
-    await expect(page.locator('[data-testid="add-card-form"]')).toHaveCount(0);
-    await expect(page.locator('[data-testid="count-todo"]')).toHaveText("4");
+    await expect(page.getByTestId("add-card-form")).toHaveCount(0);
+    await expect(page.getByTestId("count-todo")).toHaveText("4");
     await expect(
-      page.locator('[data-testid="column-todo"] [data-testid="card-title"]', {
+      page.getByTestId("column-todo").getByTestId("card-title").filter({
         hasText: "Ship the release notes",
       }),
     ).toBeVisible();
@@ -55,17 +55,17 @@ test.describe("Board demo — core board rendering and manual interactions", () 
     await waitForSema(page);
 
     // "Implement user authentication" is seeded in the in-progress column
-    const card = page.locator('[data-testid="board-card"]', {
+    const card = page.getByTestId("board-card").filter({
       hasText: "Implement user authentication",
     });
     await expect(card).toBeVisible();
 
-    await card.locator('[data-testid="move-right-btn"]').click();
+    await card.getByTestId("move-right-btn").click();
 
-    await expect(page.locator('[data-testid="count-in-progress"]')).toHaveText("1");
-    await expect(page.locator('[data-testid="count-done"]')).toHaveText("2");
+    await expect(page.getByTestId("count-in-progress")).toHaveText("1");
+    await expect(page.getByTestId("count-done")).toHaveText("2");
     await expect(
-      page.locator('[data-testid="column-done"] [data-testid="board-card"]', {
+      page.getByTestId("column-done").getByTestId("board-card").filter({
         hasText: "Implement user authentication",
       }),
     ).toBeVisible();
@@ -75,18 +75,18 @@ test.describe("Board demo — core board rendering and manual interactions", () 
     await page.goto("/board.html");
     await waitForSema(page);
 
-    const card = page.locator('[data-testid="board-card"]', { hasText: "Write API documentation" });
+    const card = page.getByTestId("board-card").filter({ hasText: "Write API documentation" });
     await card.click();
 
-    const modal = page.locator('[data-testid="card-modal"]');
+    const modal = page.getByTestId("card-modal");
     await expect(modal).toBeVisible();
-    await expect(page.locator('[data-testid="modal-title"]')).toHaveText("Write API documentation");
+    await expect(page.getByTestId("modal-title")).toHaveText("Write API documentation");
 
     // Seeded priority is "medium" -> cycles to "high"
-    await page.click('[data-testid="cycle-priority"]');
-    await expect(modal.locator('[data-testid="priority-badge"]')).toHaveText("high");
+    await page.getByTestId("cycle-priority").click();
+    await expect(modal.getByTestId("priority-badge")).toHaveText("high");
 
-    await page.click('[data-testid="modal-close"]');
+    await page.getByTestId("modal-close").click();
     await expect(modal).toHaveCount(0);
   });
 });
@@ -96,25 +96,26 @@ test.describe("Board demo — AI task generation (mocked LLM stream)", () => {
     await page.goto("/board.html");
     await waitForSema(page);
 
-    await expect(page.locator('[data-testid="board-card"]')).toHaveCount(6);
+    await expect(page.getByTestId("board-card")).toHaveCount(6);
 
-    await page.click('[data-testid="ai-generate-btn"]');
+    await page.getByTestId("ai-generate-btn").click();
 
     // Button flips to a disabled "Generating..." state while the stream is open
-    await expect(page.locator('[data-testid="ai-generate-btn"]')).toHaveText("Generating...");
+    await expect(page.getByTestId("ai-generate-btn")).toHaveText("Generating...");
 
     // The mock proxy recognizes the board's task-generation prompt and streams
     // back a canned JSON array of 3 tasks; board.sema decodes it via its
     // poll-ai-stream interval and appends AI-tagged cards to the "todo" column.
-    await expect(page.locator('[data-testid="ai-badge"]')).toHaveCount(3, { timeout: 10_000 });
-    await expect(page.locator('[data-testid="board-card"]')).toHaveCount(9);
+    await expect(page.getByTestId("ai-badge")).toHaveCount(3, { timeout: 10_000 });
+    await expect(page.getByTestId("board-card")).toHaveCount(9);
 
     // Button reverts once generation completes
-    await expect(page.locator('[data-testid="ai-generate-btn"]')).toHaveText("✨ AI Generate");
+    await expect(page.getByTestId("ai-generate-btn")).toHaveText("✨ AI Generate");
 
     const aiTitles = await page
-      .locator('[data-testid="board-card"]', { has: page.locator('[data-testid="ai-badge"]') })
-      .locator('[data-testid="card-title"]')
+      .getByTestId("board-card")
+      .filter({ has: page.getByTestId("ai-badge") })
+      .getByTestId("card-title")
       .allTextContents();
     expect(aiTitles).toEqual([
       "Set up staging environment",

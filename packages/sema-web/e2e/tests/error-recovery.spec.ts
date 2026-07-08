@@ -7,7 +7,7 @@ test("component recovers after render error", async ({ page }) => {
   await waitForSema(page);
 
   // Initially renders OK
-  await expect(page.locator("#content")).toHaveText("OK");
+  await expect(page.getByTestId("content")).toHaveText("OK");
 
   // Trigger an error in the render function
   await semaEval(page, "(put! should-error true)");
@@ -23,5 +23,5 @@ test("component recovers after render error", async ({ page }) => {
   await semaEval(page, "(put! should-error false)");
 
   // Should render OK again
-  await expect(page.locator("#content")).toHaveText("OK");
+  await expect(page.getByTestId("content")).toHaveText("OK");
 });

@@ -22,7 +22,7 @@ test("mounted SVG SIP uses real namespaces and delegated events in Chromium", as
     htmlInside: "http://www.w3.org/1999/xhtml",
   });
 
-  await expect(page.locator("#toggle-state")).toHaveText("off");
-  await page.click("#icon");
-  await expect(page.locator("#toggle-state")).toHaveText("on");
+  await expect(page.getByTestId("toggle-state")).toHaveText("off");
+  await page.getByTestId("icon").click();
+  await expect(page.getByTestId("toggle-state")).toHaveText("on");
 });

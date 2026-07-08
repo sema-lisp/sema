@@ -2,7 +2,7 @@
 <html>
 <head><title>No Autoload Test</title></head>
 <body>
-<div id="app">untouched</div>
+<div id="app" data-testid="app">untouched</div>
 <script type="text/sema">
 (dom/set-text! (dom/query "#app") "This should NOT run")
 </script>

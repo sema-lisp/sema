@@ -38,6 +38,9 @@ test("renders and runs the app in the browser", async ({ page }) => {
 
   // The app's Sema source rendered its DOM.
   await expect(page.getByRole("heading", { name: "Sema Counter" })).toBeVisible();
+  // #app comes from crates/sema/src/web/shell.html (the `sema web` dev-server
+  // template); the app source itself is examples/web/counter.sema — both are
+  // outside packages/sema-web, so there's no data-testid to add here.
   await expect(page.locator("#app")).toContainText("0");
 
   // Event handlers work end-to-end: clicking + runs Sema, updates the DOM.

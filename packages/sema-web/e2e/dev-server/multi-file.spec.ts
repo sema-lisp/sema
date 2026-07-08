@@ -42,6 +42,8 @@ test("runs a multi-file app (import resolves via the built .vfs)", async ({ page
   expect(initError, "SemaWeb.init() should not error").toBeFalsy();
 
   // The imported module's export rendered — the `import` resolved in the browser.
+  // #app / #__sema-error come from crates/sema/src/web/shell.html (the `sema web`
+  // dev-server template), outside packages/sema-web — no data-testid to add here.
   await expect(page.locator("#app")).toHaveText("Imported module works");
   // No error overlay.
   await expect(page.locator("#__sema-error")).toHaveCount(0);

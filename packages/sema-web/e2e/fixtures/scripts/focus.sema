@@ -6,9 +6,9 @@
 
 (define (focus-view)
   [:div
-    [:input {:id "text-input" :value @label :on-input "update-label"}]
+    [:input {:id "text-input" :value @label :on-input "update-label" :data-testid "text-input"}]
     [:p {:id "label-display"} @label]
-    [:button {:id "btn-bump" :on-click "bump"} "Bump counter"]
-    [:p {:id "counter-display"} (number->string @counter)]])
+    [:button {:id "btn-bump" :on-click "bump" :data-testid "btn-bump"} "Bump counter"]
+    [:p {:id "counter-display" :data-testid "counter-display"} (number->string @counter)]])
 
 (mount! "#app" "focus-view")

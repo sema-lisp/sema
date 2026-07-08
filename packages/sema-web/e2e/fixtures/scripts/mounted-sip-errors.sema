@@ -6,13 +6,13 @@
 
 (defcomponent mounted-sip-errors-view ()
   [:div
-    [:span {:id "before"} "before"]
+    [:span {:id "before" :data-testid "before"} "before"]
     (if (equal? @mode "bad-tag")
       ["bad tag" "broken"]
-      [:span {:id "middle"} "ok"])
+      [:span {:id "middle" :data-testid "middle"} "ok"])
     (if (equal? @mode "bad-attr")
-      [:button {"bad attr name" "x" :id "after" :on-click "inc"} "after"]
-      [:button {:id "after" :on-click "inc"} "after"])
-    [:span {:id "clicks"} (number->string @clicks)]])
+      [:button {"bad attr name" "x" :id "after" :on-click "inc" :data-testid "after"} "after"]
+      [:button {:id "after" :on-click "inc" :data-testid "after"} "after"])
+    [:span {:id "clicks" :data-testid "clicks"} (number->string @clicks)]])
 
 (mount! "#app" "mounted-sip-errors-view")

@@ -13,26 +13,28 @@ test.describe("Chat widget demo — mocked SSE streaming", () => {
     await page.goto("/chat-widget.html");
     await waitForSema(page);
 
-    await expect(page.locator('[data-testid="chat-fab"]')).toBeVisible();
-    await expect(page.locator('[data-testid="chat-panel"]')).toHaveCount(0);
+    await expect(page.getByTestId("chat-fab")).toBeVisible();
+    await expect(page.getByTestId("chat-panel")).toHaveCount(0);
 
-    await page.click('[data-testid="chat-fab"]');
-    await expect(page.locator('[data-testid="chat-panel"]')).toBeVisible();
+    await page.getByTestId("chat-fab").click();
+    await expect(page.getByTestId("chat-panel")).toBeVisible();
 
-    await page.click('[data-testid="close-btn"]');
-    await expect(page.locator('[data-testid="chat-panel"]')).toHaveCount(0);
+    await page.getByTestId("close-btn").click();
+    await expect(page.getByTestId("chat-panel")).toHaveCount(0);
   });
 
   test("sending a message shows a typing indicator, streams incrementally, then lands in the transcript", async ({ page }) => {
     await page.goto("/chat-widget.html");
     await waitForSema(page);
 
-    await page.click('[data-testid="chat-fab"]');
-    await expect(page.locator('[data-testid="chat-panel"]')).toBeVisible();
+    await page.getByTestId("chat-fab").click();
+    await expect(page.getByTestId("chat-panel")).toBeVisible();
 
     // Track the streaming bubble's shape over time: it starts as a
     // typing-indicator (no text yet), then flips to a growing streaming-msg
     // once the first token arrives.
+    // NOTE: runs inside the page's own JS context via page.evaluate(), so it
+    // uses document.querySelector directly rather than a Playwright locator.
     await page.evaluate(() => {
       (window as any).__states = [];
       const container = document.querySelector("#widget-msg-list")!;
@@ -48,19 +50,19 @@ test.describe("Chat widget demo — mocked SSE streaming", () => {
       obs.observe(container, { childList: true, subtree: true, characterData: true });
     });
 
-    await page.fill('[data-testid="chat-input"]', "Hi widget");
-    await page.click('[data-testid="send-btn"]');
+    await page.getByTestId("chat-input").fill("Hi widget");
+    await page.getByTestId("send-btn").click();
 
-    await expect(page.locator('[data-testid="msg-user"]')).toHaveText("Hi widget");
-    await expect(page.locator('[data-testid="chat-input"]')).toHaveValue("");
+    await expect(page.getByTestId("msg-user")).toHaveText("Hi widget");
+    await expect(page.getByTestId("chat-input")).toHaveValue("");
 
     const finalText = "Mock reply to: Hi widget";
 
-    await expect(page.locator('[data-testid="msg-assistant"]')).toHaveText(finalText, {
+    await expect(page.getByTestId("msg-assistant")).toHaveText(finalText, {
       timeout: 5_000,
     });
-    await expect(page.locator('[data-testid="streaming-msg"]')).toHaveCount(0);
-    await expect(page.locator('[data-testid="typing-indicator"]')).toHaveCount(0);
+    await expect(page.getByTestId("streaming-msg")).toHaveCount(0);
+    await expect(page.getByTestId("typing-indicator")).toHaveCount(0);
 
     const states: string[] = await page.evaluate(() => (window as any).__states);
     // Must have seen the typing indicator before any streamed text appeared.
@@ -77,21 +79,21 @@ test.describe("Chat widget demo — mocked SSE streaming", () => {
     await page.goto("/chat-widget.html");
     await waitForSema(page);
 
-    await page.click('[data-testid="chat-fab"]');
-    await page.fill('[data-testid="chat-input"]', "Remember this");
-    await page.click('[data-testid="send-btn"]');
+    await page.getByTestId("chat-fab").click();
+    await page.getByTestId("chat-input").fill("Remember this");
+    await page.getByTestId("send-btn").click();
 
-    await expect(page.locator('[data-testid="msg-assistant"]')).toHaveText(
+    await expect(page.getByTestId("msg-assistant")).toHaveText(
       "Mock reply to: Remember this",
       { timeout: 5_000 },
     );
 
     await page.reload();
     await waitForSema(page);
-    await page.click('[data-testid="chat-fab"]');
+    await page.getByTestId("chat-fab").click();
 
-    await expect(page.locator('[data-testid="msg-user"]')).toHaveText("Remember this");
-    await expect(page.locator('[data-testid="msg-assistant"]')).toHaveText(
+    await expect(page.getByTestId("msg-user")).toHaveText("Remember this");
+    await expect(page.getByTestId("msg-assistant")).toHaveText(
       "Mock reply to: Remember this",
     );
   });

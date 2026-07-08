@@ -58,6 +58,8 @@ test.afterAll(() => {
 test("built .vfs archives load and execute in the browser", async ({ page }) => {
   await page.goto("/archive-basic.html");
   await waitForSema(page);
+  // #app comes from crates/sema/src/web/shell.html (the dev-server template),
+  // outside packages/sema-web — no data-testid to add here.
   await expect(page.locator("#app")).toHaveText("Hello from compiled Sema!");
 });
 
@@ -65,17 +67,17 @@ test("built .vfs archives support defcomponent and mount!", async ({ page }) => 
   await page.goto("/archive-counter.html");
   await waitForSema(page);
 
-  const display = page.locator("#count-display");
+  const display = page.getByTestId("count-display");
   await expect(display).toHaveText("0");
 
-  await page.click("#btn-inc");
-  await page.click("#btn-inc");
+  await page.getByTestId("btn-inc").click();
+  await page.getByTestId("btn-inc").click();
   await expect(display).toHaveText("2");
 
-  await page.click("#btn-dec");
+  await page.getByTestId("btn-dec").click();
   await expect(display).toHaveText("1");
 
-  await page.click("#btn-reset");
+  await page.getByTestId("btn-reset").click();
   await expect(display).toHaveText("0");
 });
 

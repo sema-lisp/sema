@@ -6,9 +6,9 @@
 
 (defcomponent counter-view ()
   [:div
-    [:p {:id "count-display"} (number->string @count)]
-    [:button {:id "btn-inc" :on-click "handle-inc"} "+"]
-    [:button {:id "btn-dec" :on-click "handle-dec"} "-"]
-    [:button {:id "btn-reset" :on-click "handle-reset"} "Reset"]])
+    [:p {:id "count-display" :data-testid "count-display"} (number->string @count)]
+    [:button {:id "btn-inc" :on-click "handle-inc" :data-testid "btn-inc"} "+"]
+    [:button {:id "btn-dec" :on-click "handle-dec" :data-testid "btn-dec"} "-"]
+    [:button {:id "btn-reset" :on-click "handle-reset" :data-testid "btn-reset"} "Reset"]])
 
 (mount! "#app" "counter-view")

@@ -453,6 +453,18 @@ impl Parser {
                 ..
             }) => Ok(Value::int(*n)),
             Some(SpannedToken {
+                token: Token::BigInt(n),
+                ..
+            }) => Ok(Value::from_bigint(n.clone())),
+            Some(SpannedToken {
+                token: Token::Rational(r),
+                ..
+            }) => Ok(Value::rational(r.clone())),
+            Some(SpannedToken {
+                token: Token::Complex(re, im),
+                ..
+            }) => Ok(Value::complex(re.clone(), im.clone())),
+            Some(SpannedToken {
                 token: Token::Float(f),
                 ..
             }) => Ok(Value::float(*f)),
@@ -583,6 +595,9 @@ fn token_display(tok: &Token) -> &'static str {
         Token::Dot => ".",
         Token::BytevectorStart => "#u8(",
         Token::Int(_) => "integer",
+        Token::BigInt(_) => "integer",
+        Token::Rational(_) => "rational",
+        Token::Complex(_, _) => "complex",
         Token::Float(_) => "float",
         Token::String(_) => "string",
         Token::Symbol(_) => "symbol",
@@ -886,8 +901,11 @@ mod tests {
 
     #[test]
     fn test_read_int_overflow() {
-        // i64::MAX + 1 should error, not silently wrap
-        assert!(read("9999999999999999999999").is_err());
+        // i64::MAX + 1 lexes as a bignum rather than erroring or silently
+        // wrapping.
+        let v = read("9999999999999999999999").unwrap();
+        assert!(v.is_bigint());
+        assert_eq!(v.to_string(), "9999999999999999999999");
     }
 
     #[test]

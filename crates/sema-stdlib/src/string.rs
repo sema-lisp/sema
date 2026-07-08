@@ -2,7 +2,8 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use sema_core::{check_arity, SemaError, Value, ValueView};
+use sema_core::number::SemaNumber;
+use sema_core::{check_arity, SemaError, Value, ValueView, ValueViewRef};
 use unicode_normalization::UnicodeNormalization;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
@@ -391,26 +392,76 @@ pub fn register(env: &sema_core::Env) {
         Ok(Value::string(&kw))
     });
 
+    // `(number->string n [radix])`. Radix 10 (the default) uses the tower's
+    // own `Display` (handles int/bignum/rational/float/complex uniformly);
+    // any other radix (2, 8, 16) requires an exact integer and formats its
+    // digits directly via `BigInt::to_str_radix`.
     register_fn(env, "number->string", |args| {
-        check_arity!(args, "number->string", 1);
-        match args[0].view() {
-            ValueView::Int(n) => Ok(Value::string(&n.to_string())),
-            ValueView::Float(f) => Ok(Value::string(&f.to_string())),
-            _ => Err(SemaError::type_error("number", args[0].type_name())),
+        check_arity!(args, "number->string", 1..=2);
+        let radix = match args.get(1) {
+            Some(r) => r
+                .as_int()
+                .ok_or_else(|| SemaError::type_error("integer", r.type_name()))?,
+            None => 10,
+        };
+        if radix == 10 {
+            let n = args[0]
+                .as_number()
+                .ok_or_else(|| SemaError::type_error("number", args[0].type_name()))?;
+            return Ok(Value::string(&n.to_string()));
         }
+        if !matches!(radix, 2 | 8 | 16) {
+            return Err(SemaError::eval(format!(
+                "number->string: unsupported radix {radix} (expected 2, 8, 10, or 16)"
+            )));
+        }
+        let n = args[0]
+            .as_bigint()
+            .ok_or_else(|| SemaError::type_error("exact integer", args[0].type_name()))?;
+        Ok(Value::string(&n.to_str_radix(radix as u32)))
     });
 
+    // `(string->number s [radix])`. Never errors on unparseable input — R7RS
+    // has it return `#f` instead. Radix 10 (the default) delegates to the
+    // reader's own number lexing (accepted only if the string is exactly one
+    // numeric token), so it parses ints, bignums, rationals, floats, and
+    // complex literals for free. Any other radix (2, 8, 16) requires the
+    // string to be a bare (optionally signed) integer in that base.
     register_fn(env, "string->number", |args| {
-        check_arity!(args, "string->number", 1);
+        check_arity!(args, "string->number", 1..=2);
         let s = args[0]
             .as_str()
             .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
-        if let Ok(n) = s.parse::<i64>() {
-            Ok(Value::int(n))
-        } else if let Ok(f) = s.parse::<f64>() {
-            Ok(Value::float(f))
-        } else {
-            Err(SemaError::eval(format!("cannot parse '{s}' as number")))
+        let radix = match args.get(1) {
+            Some(r) => r
+                .as_int()
+                .ok_or_else(|| SemaError::type_error("integer", r.type_name()))?,
+            None => 10,
+        };
+        if radix != 10 {
+            if !matches!(radix, 2 | 8 | 16) {
+                return Err(SemaError::eval(format!(
+                    "string->number: unsupported radix {radix} (expected 2, 8, 10, or 16)"
+                )));
+            }
+            return Ok(match SemaNumber::parse_int_radix(s, radix as u32) {
+                Some(n) => Value::from_number(n),
+                None => Value::bool(false),
+            });
+        }
+        let is_number = |v: &Value| {
+            matches!(
+                v.view_ref(),
+                ValueViewRef::Int(_)
+                    | ValueViewRef::BigInt(_)
+                    | ValueViewRef::Rational(_)
+                    | ValueViewRef::Complex(_)
+                    | ValueViewRef::Float(_)
+            )
+        };
+        match sema_reader::read_many(s) {
+            Ok(exprs) if exprs.len() == 1 && is_number(&exprs[0]) => Ok(exprs[0].clone()),
+            _ => Ok(Value::bool(false)),
         }
     });
 

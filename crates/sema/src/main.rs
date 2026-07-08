@@ -3623,13 +3623,13 @@ mod tests {
         let interp = Interpreter::new_with_sandbox(&Sandbox::allow_all());
         interp.global_env.set(
             intern("__state/computed-create"),
-            Value::native_fn(NativeFn::simple("__state/computed-create", |args| {
+            Value::native_fn(NativeFn::simple("__state/computed-create", |_args| {
                 Ok(Value::string("computed-ok"))
             })),
         );
         interp.global_env.set(
             intern("__state/batch-run"),
-            Value::native_fn(NativeFn::simple("__state/batch-run", |args| {
+            Value::native_fn(NativeFn::simple("__state/batch-run", |_args| {
                 Ok(Value::string("batch-ok"))
             })),
         );

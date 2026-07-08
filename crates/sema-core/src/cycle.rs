@@ -102,8 +102,8 @@ impl NodePtr {
 
     /// Node identity of a cycle-capable heap value. `None` for immediates and
     /// leaf heap types (strings, bytevectors, numeric arrays, big ints,
-    /// prompts, messages, conversations, streams) — leaves cannot sit on a
-    /// cycle and are never given nodes.
+    /// prompts, messages, conversations, streams, bignums, rationals,
+    /// complex) — leaves cannot sit on a cycle and are never given nodes.
     pub fn of_value(v: &Value) -> Option<NodePtr> {
         value_node_ptr(v)
     }

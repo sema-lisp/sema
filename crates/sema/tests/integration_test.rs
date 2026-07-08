@@ -326,8 +326,9 @@ fn test_math_functions() {
     assert_eq!(eval("(abs -5)"), Value::int(5));
     assert_eq!(eval("(min 3 1 2)"), Value::int(1));
     assert_eq!(eval("(max 3 1 2)"), Value::int(3));
-    assert_eq!(eval("(floor 3.7)"), Value::int(3));
-    assert_eq!(eval("(ceil 3.2)"), Value::int(4));
+    // Exactness-preserving (R7RS): a float argument rounds to a float.
+    assert_eq!(eval("(floor 3.7)"), Value::float(3.0));
+    assert_eq!(eval("(ceil 3.2)"), Value::float(4.0));
 }
 
 #[test]
@@ -1616,15 +1617,17 @@ fn test_keyword_as_fn_missing_key() {
 
 #[test]
 fn test_round() {
-    assert_eq!(eval("(round 3.4)"), Value::int(3));
-    assert_eq!(eval("(round 3.5)"), Value::int(4));
-    assert_eq!(eval("(round -1.5)"), Value::int(-2));
+    // Exactness-preserving (R7RS): a float argument rounds to a float.
+    assert_eq!(eval("(round 3.4)"), Value::float(3.0));
+    assert_eq!(eval("(round 3.5)"), Value::float(4.0));
+    assert_eq!(eval("(round -1.5)"), Value::float(-2.0));
     assert_eq!(eval("(round 5)"), Value::int(5)); // int passthrough
 }
 
 #[test]
 fn test_sqrt() {
-    assert_eq!(eval("(sqrt 16)"), Value::float(4.0));
+    // sqrt of a perfect square is exact (R7RS): 16 => 4, not 4.0.
+    assert_eq!(eval("(sqrt 16)"), Value::int(4));
     assert_float_eq("(sqrt 2.0)", 2.0_f64.sqrt());
 }
 
@@ -1712,8 +1715,8 @@ fn test_mixed_int_float_arithmetic() {
     assert_eq!(eval("(* 3 1.5)"), Value::float(4.5));
     assert_eq!(eval("(- 10 2.5)"), Value::float(7.5));
     assert_eq!(eval("(/ 10 2)"), Value::int(5)); // integer division when exact
-    assert_eq!(eval("(/ 7 2)"), Value::float(3.5)); // non-exact → float
-    assert_eq!(eval("(/ 7.0 2)"), Value::float(3.5));
+    assert_eq!(eval("(/ 7 2)"), eval("7/2")); // exact/exact → exact rational (R7RS)
+    assert_eq!(eval("(/ 7.0 2)"), Value::float(3.5)); // inexact operand → float
 }
 
 #[test]
@@ -2834,10 +2837,8 @@ fn test_string_to_number() {
     assert_eq!(eval(r#"(string->number "42")"#), Value::int(42));
     assert_eq!(eval(r#"(string->number "-7")"#), Value::int(-7));
     assert_eq!(eval(r#"(string->number "3.14")"#), Value::float(3.14));
-    // Invalid string should error
-    assert!(eval_err(r#"(string->number "abc")"#)
-        .to_string()
-        .contains("cannot parse"));
+    // Unparseable input returns #f rather than erroring (R7RS).
+    assert_eq!(eval(r#"(string->number "abc")"#), Value::bool(false));
 }
 
 // JSON encode-pretty
@@ -5659,8 +5660,9 @@ fn test_bytevector_display() {
 
 #[test]
 fn test_truncate() {
-    assert_eq!(eval("(truncate 3.9)"), Value::int(3));
-    assert_eq!(eval("(truncate -3.9)"), Value::int(-3));
+    // Exactness-preserving (R7RS): a float argument truncates to a float.
+    assert_eq!(eval("(truncate 3.9)"), Value::float(3.0));
+    assert_eq!(eval("(truncate -3.9)"), Value::float(-3.0));
     assert_eq!(eval("(truncate 5)"), Value::int(5));
 }
 
@@ -5668,7 +5670,7 @@ fn test_truncate() {
 fn test_scheme_aliases() {
     assert_eq!(eval("(modulo 17 5)"), Value::int(2));
     assert_eq!(eval("(expt 2 10)"), Value::int(1024));
-    assert_eq!(eval("(ceiling 3.2)"), Value::int(4));
+    assert_eq!(eval("(ceiling 3.2)"), Value::float(4.0)); // exactness-preserving
 }
 
 #[test]

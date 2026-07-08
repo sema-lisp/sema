@@ -1,3 +1,4 @@
+use sema_core::number::SemaNumber;
 use sema_core::{SemaError, Span};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -20,7 +21,12 @@ pub enum Token {
     UnquoteSplice,
     Deref,
     Int(i64),
+    BigInt(num_bigint::BigInt),
+    Rational(num_rational::BigRational),
     Float(f64),
+    /// A complex literal `re + im·i` (e.g. `3+4i`, `+i`, `2i`, `1.5+2.5i`).
+    /// Components are real tower numbers (int, rational, or float).
+    Complex(SemaNumber, SemaNumber),
     String(String),
     FString(Vec<FStringPart>),
     ShortLambdaStart,
@@ -391,6 +397,22 @@ pub fn tokenize(input: &str) -> Result<Vec<SpannedToken>, SemaError> {
                                 i += 1;
                             }
                         }
+                        'x' | 'X' | 'o' | 'O' | 'b' | 'B' | 'd' | 'D' | 'e' | 'E' | 'i' | 'I' => {
+                            // Numeric prefix literal: any combination of a radix
+                            // prefix (`#x/#o/#b/#d`) and an exactness prefix
+                            // (`#e/#i`), in either order (`#e#xFF`, `#x#e1F`),
+                            // followed by the number body. Bignum-capable; the
+                            // result is lowered to the tightest token.
+                            let (token, len) = read_hash_number(&chars[i..], &span)?;
+                            col += len;
+                            i += len;
+                            tokens.push(SpannedToken {
+                                token,
+                                span: span.with_end(line, col),
+                                byte_start: byte_offsets[token_start],
+                                byte_end: byte_offsets[i],
+                            });
+                        }
                         _ => {
                             return Err(SemaError::Reader {
                                 message: format!(
@@ -545,6 +567,21 @@ pub fn tokenize(input: &str) -> Result<Vec<SpannedToken>, SemaError> {
                     col += len;
                     tokens.push(SpannedToken {
                         token: tok,
+                        span: span.with_end(line, col),
+                        byte_start: byte_offsets[token_start],
+                        byte_end: byte_offsets[i],
+                    });
+                } else if (ch == '+' || ch == '-')
+                    && try_imaginary_tail(&chars, i, &span)?.is_some()
+                {
+                    // Pure imaginary with a leading sign: `+i`, `-i`, `+2i`, `-3.5i`.
+                    // (`-2i` with a digit right after `-` is handled by read_number.)
+                    let token_start = i;
+                    let (im, end) = try_imaginary_tail(&chars, i, &span)?.unwrap();
+                    col += end - i;
+                    i = end;
+                    tokens.push(SpannedToken {
+                        token: Token::Complex(SemaNumber::from_i64(0), im),
                         span: span.with_end(line, col),
                         byte_start: byte_offsets[token_start],
                         byte_end: byte_offsets[i],
@@ -735,6 +772,138 @@ fn read_string_escape(
     Ok(())
 }
 
+/// Read a `#`-prefixed numeric literal. `chars[0]` is the leading `#`. Consumes
+/// any chain of radix (`#x/#o/#b/#d`) and exactness (`#e/#i`) prefixes in either
+/// order, then the number body, applies the exactness override, and lowers the
+/// result to the tightest `Token`. Returns the token and the chars consumed.
+fn read_hash_number(chars: &[char], span: &Span) -> Result<(Token, usize), SemaError> {
+    let mut radix: Option<u32> = None;
+    let mut exact: Option<bool> = None;
+    let mut i = 0;
+    // Consume the prefix chain: each prefix is `#` followed by a letter.
+    while i + 1 < chars.len() && chars[i] == '#' {
+        match chars[i + 1] {
+            c @ ('x' | 'X' | 'o' | 'O' | 'b' | 'B' | 'd' | 'D') => {
+                if radix.is_some() {
+                    return Err(SemaError::Reader {
+                        message: "duplicate radix prefix".into(),
+                        span: *span,
+                    });
+                }
+                radix = Some(match c {
+                    'x' | 'X' => 16,
+                    'o' | 'O' => 8,
+                    'b' | 'B' => 2,
+                    _ => 10,
+                });
+            }
+            'e' | 'E' => {
+                if exact.is_some() {
+                    return Err(SemaError::Reader {
+                        message: "duplicate exactness prefix".into(),
+                        span: *span,
+                    });
+                }
+                exact = Some(true);
+            }
+            'i' | 'I' => {
+                if exact.is_some() {
+                    return Err(SemaError::Reader {
+                        message: "duplicate exactness prefix".into(),
+                        span: *span,
+                    });
+                }
+                exact = Some(false);
+            }
+            other => {
+                return Err(SemaError::Reader {
+                    message: format!("unexpected character after #: '{other}'"),
+                    span: *span,
+                });
+            }
+        }
+        i += 2;
+    }
+    // Parse the number body. A non-decimal radix admits only integers; a decimal
+    // body (`#d`, or no radix at all) uses the full number grammar.
+    let (num, body_len) = match radix {
+        Some(r) if r != 10 => read_radix_integer(&chars[i..], r, span)?,
+        _ => {
+            let (tok, len) = read_number(&chars[i..], span)?;
+            (token_to_number(tok, span)?, len)
+        }
+    };
+    // Apply the exactness override, then lower to the tightest token.
+    let num = match exact {
+        Some(true) => num.to_exact(),
+        Some(false) => num.to_inexact(),
+        None => num,
+    };
+    Ok((number_to_token(num), i + body_len))
+}
+
+/// Read a sign-optional, arbitrary-precision integer in `radix` (2/8/16) from the
+/// start of `chars`. Returns the number and the chars consumed.
+fn read_radix_integer(
+    chars: &[char],
+    radix: u32,
+    span: &Span,
+) -> Result<(SemaNumber, usize), SemaError> {
+    let mut j = 0;
+    if j < chars.len() && (chars[j] == '+' || chars[j] == '-') {
+        j += 1;
+    }
+    let body_start = j;
+    while j < chars.len() && chars[j].is_ascii_alphanumeric() {
+        j += 1;
+    }
+    if j == body_start {
+        return Err(SemaError::Reader {
+            message: format!("expected digits after radix-{radix} prefix"),
+            span: *span,
+        });
+    }
+    let digits: String = chars[..j].iter().collect();
+    let n = SemaNumber::parse_int_radix(&digits, radix).ok_or_else(|| SemaError::Reader {
+        message: format!("invalid radix-{radix} literal: {digits}"),
+        span: *span,
+    })?;
+    Ok((n, j))
+}
+
+/// Lift a numeric `Token` into a `SemaNumber` (for applying an exactness prefix).
+/// A non-numeric token is a reader error.
+fn token_to_number(tok: Token, span: &Span) -> Result<SemaNumber, SemaError> {
+    match tok {
+        Token::Int(v) => Ok(SemaNumber::from_i64(v)),
+        Token::BigInt(b) => Ok(SemaNumber::Integer(b)),
+        Token::Rational(r) => Ok(SemaNumber::Rational(r)),
+        Token::Float(f) => Ok(SemaNumber::from_f64(f)),
+        Token::Complex(re, im) => Ok(SemaNumber::Complex(Box::new(sema_core::number::Complex {
+            re,
+            im,
+        }))),
+        _ => Err(SemaError::Reader {
+            message: "expected a number after exactness/radix prefix".into(),
+            span: *span,
+        }),
+    }
+}
+
+/// Lower a `SemaNumber` to the tightest numeric `Token` (i64-range integers →
+/// `Int`, larger → `BigInt`, rationals → `Rational`, reals → `Float`).
+fn number_to_token(n: SemaNumber) -> Token {
+    match n {
+        SemaNumber::Integer(big) => match i64::try_from(&big) {
+            Ok(v) => Token::Int(v),
+            Err(_) => Token::BigInt(big),
+        },
+        SemaNumber::Rational(r) => Token::Rational(r),
+        SemaNumber::Real(f) => Token::Float(f),
+        SemaNumber::Complex(c) => Token::Complex(c.re, c.im),
+    }
+}
+
 fn read_number(chars: &[char], span: &Span) -> Result<(Token, usize), SemaError> {
     let mut i = 0;
     if chars[i] == '-' {
@@ -770,7 +939,60 @@ fn read_number(chars: &[char], span: &Span) -> Result<(Token, usize), SemaError>
             is_float = true;
         }
     }
+    // Rational tail: `/` immediately followed by ≥1 digit (optionally after the
+    // integer body). `1/3`, `-22/7`. A `/` not followed by a digit is left to
+    // the symbol lexer (so `/` and `a/b`-symbols are unaffected).
+    if !is_float
+        && i < chars.len()
+        && chars[i] == '/'
+        && i + 1 < chars.len()
+        && chars[i + 1].is_ascii_digit()
+    {
+        let denom_start = i + 1;
+        let mut j = denom_start;
+        while j < chars.len() && chars[j].is_ascii_digit() {
+            j += 1;
+        }
+        let numer_str: String = chars[..i].iter().collect();
+        let denom_str: String = chars[denom_start..j].iter().collect();
+        let numer = num_bigint::BigInt::parse_bytes(numer_str.as_bytes(), 10).ok_or_else(|| {
+            SemaError::Reader {
+                message: format!("invalid rational numerator: {numer_str}"),
+                span: *span,
+            }
+        })?;
+        let denom = num_bigint::BigInt::parse_bytes(denom_str.as_bytes(), 10).ok_or_else(|| {
+            SemaError::Reader {
+                message: format!("invalid rational denominator: {denom_str}"),
+                span: *span,
+            }
+        })?;
+        if denom == num_bigint::BigInt::from(0) {
+            return Err(SemaError::Reader {
+                message: "rational literal has zero denominator".into(),
+                span: *span,
+            });
+        }
+        return Ok((
+            Token::Rational(num_rational::BigRational::new(numer, denom)),
+            j,
+        ));
+    }
     let s: String = chars[..i].iter().collect();
+    // Complex Case A: the leading real is the imaginary magnitude — `<real>i<delim>`
+    // (e.g. `2i`, `1.5i`). A trailing `i` only counts when a delimiter follows,
+    // so `3ix` stays `Int(3)` + symbol `ix`.
+    if i < chars.len() && chars[i] == 'i' && is_delimiter_at(chars, i + 1) {
+        let im = parse_real_component(&s, is_float, span)?;
+        return Ok((Token::Complex(SemaNumber::from_i64(0), im), i + 1));
+    }
+    // Complex Case B: `<real>(+|-)<ureal>i<delim>` (e.g. `3+4i`, `1.5+2.5i`).
+    if i < chars.len() && (chars[i] == '+' || chars[i] == '-') {
+        if let Some((im, consumed)) = try_imaginary_tail(chars, i, span)? {
+            let re = parse_real_component(&s, is_float, span)?;
+            return Ok((Token::Complex(re, im), consumed));
+        }
+    }
     if is_float {
         let f: f64 = s.parse().map_err(|_| SemaError::Reader {
             message: format!("invalid float: {s}"),
@@ -778,12 +1000,143 @@ fn read_number(chars: &[char], span: &Span) -> Result<(Token, usize), SemaError>
         })?;
         Ok((Token::Float(f), i))
     } else {
-        let n: i64 = s.parse().map_err(|_| SemaError::Reader {
-            message: format!("invalid integer: {s}"),
-            span: *span,
-        })?;
-        Ok((Token::Int(n), i))
+        match s.parse::<i64>() {
+            Ok(n) => Ok((Token::Int(n), i)),
+            Err(_) => {
+                // Out of i64 range: parse as an arbitrary-precision integer.
+                let big = num_bigint::BigInt::parse_bytes(s.as_bytes(), 10).ok_or_else(|| {
+                    SemaError::Reader {
+                        message: format!("invalid integer: {s}"),
+                        span: *span,
+                    }
+                })?;
+                Ok((Token::BigInt(big), i))
+            }
+        }
     }
+}
+
+/// Turn a numeric substring into a real tower number. `is_float` distinguishes a
+/// float spelling (`1.5`, `2e3`) from an exact one; a `/` in `s` marks a rational.
+fn parse_real_component(s: &str, is_float: bool, span: &Span) -> Result<SemaNumber, SemaError> {
+    let invalid = || SemaError::Reader {
+        message: format!("invalid number component: {s}"),
+        span: *span,
+    };
+    if is_float {
+        let f: f64 = s.parse().map_err(|_| invalid())?;
+        Ok(SemaNumber::from_f64(f))
+    } else if s.contains('/') {
+        SemaNumber::parse_rational(s).ok_or_else(invalid)
+    } else {
+        SemaNumber::parse_int_radix(s, 10).ok_or_else(invalid)
+    }
+}
+
+/// True at EOF or when `chars[idx]` ends an atom (so a trailing `i` is only read
+/// as imaginary when it is not part of a longer identifier like `pi`/`list`).
+fn is_delimiter_at(chars: &[char], idx: usize) -> bool {
+    idx >= chars.len() || is_delimiter(chars[idx])
+}
+
+fn is_delimiter(ch: char) -> bool {
+    // `#` always begins a reader construct (`#(`, `#"…"`, `#x`, `#t`, …), so it
+    // ends a number just like `(` does — `3+4i#(…)` splits the same way
+    // `123#(…)` does.
+    matches!(
+        ch,
+        ' ' | '\t'
+            | '\r'
+            | '\n'
+            | '('
+            | ')'
+            | '['
+            | ']'
+            | '{'
+            | '}'
+            | '"'
+            | ';'
+            | '\''
+            | '`'
+            | ','
+            | '#'
+    )
+}
+
+/// Lex an imaginary tail starting at `start`: an optional sign, an optional
+/// `ureal` (int / rational / float; empty means magnitude ±1), then `i` followed
+/// by a token delimiter. Returns the imaginary `SemaNumber` and the absolute end
+/// index, or `None` when the characters are not a delimited imaginary tail (so
+/// the caller falls back to symbol/number lexing). A bare `i` with no sign and no
+/// magnitude is NOT imaginary (it is the identifier `i`).
+fn try_imaginary_tail(
+    chars: &[char],
+    start: usize,
+    span: &Span,
+) -> Result<Option<(SemaNumber, usize)>, SemaError> {
+    let mut i = start;
+    let mut sign_neg = false;
+    let mut had_sign = false;
+    if i < chars.len() && (chars[i] == '+' || chars[i] == '-') {
+        sign_neg = chars[i] == '-';
+        had_sign = true;
+        i += 1;
+    }
+    let ureal_start = i;
+    while i < chars.len() && chars[i].is_ascii_digit() {
+        i += 1;
+    }
+    let mut is_float = false;
+    // Fractional part.
+    if i < chars.len() && chars[i] == '.' && i + 1 < chars.len() && chars[i + 1].is_ascii_digit() {
+        i += 1;
+        while i < chars.len() && chars[i].is_ascii_digit() {
+            i += 1;
+        }
+        is_float = true;
+    }
+    // Exponent (only when a digit actually follows the optional sign).
+    if i < chars.len() && (chars[i] == 'e' || chars[i] == 'E') {
+        let mut j = i + 1;
+        if j < chars.len() && (chars[j] == '+' || chars[j] == '-') {
+            j += 1;
+        }
+        if j < chars.len() && chars[j].is_ascii_digit() {
+            i = j;
+            while i < chars.len() && chars[i].is_ascii_digit() {
+                i += 1;
+            }
+            is_float = true;
+        }
+    }
+    // Rational magnitude `a/b`.
+    if !is_float
+        && i < chars.len()
+        && chars[i] == '/'
+        && i + 1 < chars.len()
+        && chars[i + 1].is_ascii_digit()
+    {
+        i += 1;
+        while i < chars.len() && chars[i].is_ascii_digit() {
+            i += 1;
+        }
+    }
+    let ureal: String = chars[ureal_start..i].iter().collect();
+    // Must be `i` then a delimiter to count as imaginary.
+    if i >= chars.len() || chars[i] != 'i' || !is_delimiter_at(chars, i + 1) {
+        return Ok(None);
+    }
+    // A bare `i` (no sign, no magnitude) is the identifier `i`, not `1i`.
+    if ureal.is_empty() && !had_sign {
+        return Ok(None);
+    }
+    let magnitude = if ureal.is_empty() {
+        SemaNumber::from_i64(1)
+    } else {
+        parse_real_component(&ureal, is_float, span)?
+    };
+    let im = if sign_neg { magnitude.neg() } else { magnitude };
+    Ok(Some((im, i + 1)))
 }
 
 fn is_symbol_start(ch: char) -> bool {
@@ -814,6 +1167,28 @@ mod tests {
             Token::Comment(text) => assert_eq!(text, "; comment"),
             _ => panic!("expected Comment token"),
         }
+    }
+
+    #[test]
+    fn test_complex_literal_terminated_by_hash() {
+        // `#` begins a reader construct, so it delimits a trailing `i` the
+        // same way `(` does: `3+4i#(…)` is Complex + short lambda, matching
+        // how `123#(…)` splits into Int + short lambda.
+        let toks = |src: &str| -> Vec<Token> {
+            tokenize(src)
+                .unwrap()
+                .into_iter()
+                .map(|t| t.token)
+                .collect()
+        };
+        assert!(matches!(
+            toks("3+4i#(+ 1 2)").as_slice(),
+            [Token::Complex(_, _), Token::ShortLambdaStart, ..]
+        ));
+        assert!(matches!(
+            toks("2i#(+ 1 2)").as_slice(),
+            [Token::Complex(_, _), Token::ShortLambdaStart, ..]
+        ));
     }
 
     #[test]
@@ -973,5 +1348,153 @@ mod tests {
                 "sym:b"
             ]
         );
+    }
+
+    #[test]
+    fn out_of_range_integer_lexes_as_bigint() {
+        use num_bigint::BigInt;
+        use std::str::FromStr;
+        let first = |src: &str| tokenize(src).unwrap().into_iter().next().unwrap().token;
+        assert_eq!(
+            first("170141183460469231731687303715884105728"),
+            Token::BigInt(BigInt::from_str("170141183460469231731687303715884105728").unwrap())
+        );
+        // in-range still lexes as Int
+        assert_eq!(first("42"), Token::Int(42));
+        assert_eq!(first("-9223372036854775808"), Token::Int(i64::MIN));
+        // one past i64::MAX is a bignum
+        assert_eq!(
+            first("9223372036854775808"),
+            Token::BigInt(BigInt::from_str("9223372036854775808").unwrap())
+        );
+    }
+
+    #[test]
+    fn parse_real_component_forms() {
+        use num_bigint::BigInt;
+        use num_rational::BigRational;
+        let span = Span::point(1, 1);
+        assert_eq!(
+            parse_real_component("3", false, &span).unwrap(),
+            SemaNumber::Integer(BigInt::from(3))
+        );
+        assert_eq!(
+            parse_real_component("-7", false, &span).unwrap(),
+            SemaNumber::Integer(BigInt::from(-7))
+        );
+        assert_eq!(
+            parse_real_component("1/2", false, &span).unwrap(),
+            SemaNumber::Rational(BigRational::new(BigInt::from(1), BigInt::from(2)))
+        );
+        assert_eq!(
+            parse_real_component("1.5", true, &span).unwrap(),
+            SemaNumber::Real(1.5)
+        );
+        assert!(parse_real_component("xyz", false, &span).is_err());
+    }
+
+    #[test]
+    fn try_imaginary_tail_forms() {
+        let span = Span::point(1, 1);
+        let tail = |src: &str, start: usize| {
+            let chars: Vec<char> = src.chars().collect();
+            try_imaginary_tail(&chars, start, &span).unwrap()
+        };
+        // `+4i` at the start of a tail → magnitude 4, ends at index 3.
+        assert_eq!(tail("+4i", 0), Some((SemaNumber::from_i64(4), 3)));
+        // `-1i` → magnitude -1.
+        assert_eq!(tail("-1i", 0), Some((SemaNumber::from_i64(-1), 3)));
+        // Bare signed imaginary `+i` / `-i` → ±1.
+        assert_eq!(tail("+i", 0), Some((SemaNumber::from_i64(1), 2)));
+        assert_eq!(tail("-i", 0), Some((SemaNumber::from_i64(-1), 2)));
+        // Float magnitude.
+        assert_eq!(tail("+2.5i", 0), Some((SemaNumber::Real(2.5), 5)));
+        // Followed by a delimiter (paren) still matches, ends before `)`.
+        assert_eq!(tail("+4i)", 0), Some((SemaNumber::from_i64(4), 3)));
+        // Not a delimiter after `i` → not an imaginary tail.
+        assert_eq!(tail("+4ix", 0), None);
+        // Bare `i` with no sign is the identifier, not an imaginary.
+        assert_eq!(tail("i", 0), None);
+        // No trailing `i` at all.
+        assert_eq!(tail("+4", 0), None);
+    }
+
+    #[test]
+    fn complex_literals() {
+        use sema_core::number::SemaNumber;
+        let n = |v: i64| SemaNumber::from_i64(v);
+        let first = |src: &str| tokenize(src).unwrap().into_iter().next().unwrap().token;
+        assert_eq!(first("3+4i"), Token::Complex(n(3), n(4)));
+        assert_eq!(first("0-1i"), Token::Complex(n(0), n(-1)));
+        assert_eq!(first("+i"), Token::Complex(n(0), n(1)));
+        assert_eq!(first("-i"), Token::Complex(n(0), n(-1)));
+        assert_eq!(first("2i"), Token::Complex(n(0), n(2)));
+        assert_eq!(
+            first("1.5+2.5i"),
+            Token::Complex(SemaNumber::Real(1.5), SemaNumber::Real(2.5))
+        );
+        // plain numbers unaffected
+        assert_eq!(first("42"), Token::Int(42));
+        // a symbol containing i is not a complex
+        assert!(matches!(first("list"), Token::Symbol(s) if s == "list"));
+        assert!(matches!(first("pi"), Token::Symbol(s) if s == "pi"));
+    }
+
+    #[test]
+    fn rational_literals() {
+        use num_bigint::BigInt;
+        use num_rational::BigRational;
+        let first = |src: &str| tokenize(src).unwrap().into_iter().next().unwrap().token;
+        assert_eq!(
+            first("1/3"),
+            Token::Rational(BigRational::new(BigInt::from(1), BigInt::from(3)))
+        );
+        assert_eq!(
+            first("-22/7"),
+            Token::Rational(BigRational::new(BigInt::from(-22), BigInt::from(7)))
+        );
+        // a lone slash is still the division symbol
+        assert!(matches!(first("/"), Token::Symbol(s) if s == "/"));
+        // 1.5/2 is NOT a rational (float numerator) — 1.5 then symbol
+        assert_eq!(first("1.5"), Token::Float(1.5));
+    }
+
+    #[test]
+    fn radix_prefixes() {
+        let first = |src: &str| tokenize(src).unwrap().into_iter().next().unwrap().token;
+        assert_eq!(first("#xFF"), Token::Int(255));
+        assert_eq!(first("#b101"), Token::Int(5));
+        assert_eq!(first("#o17"), Token::Int(15));
+        assert_eq!(first("#d10"), Token::Int(10));
+        assert_eq!(first("#x-1F"), Token::Int(-31));
+        assert_eq!(first("#xff"), Token::Int(255)); // lowercase digits
+                                                    // bignum-capable
+        use num_bigint::BigInt;
+        use std::str::FromStr;
+        assert_eq!(
+            first("#xFFFFFFFFFFFFFFFFF"),
+            Token::BigInt(BigInt::from_str("295147905179352825855").unwrap())
+        );
+    }
+
+    #[test]
+    fn exactness_prefixes() {
+        use num_bigint::BigInt;
+        use num_rational::BigRational;
+        let first = |src: &str| tokenize(src).unwrap().into_iter().next().unwrap().token;
+        // #i makes an exact literal inexact
+        assert_eq!(first("#i1/2"), Token::Float(0.5));
+        assert_eq!(first("#i3"), Token::Float(3.0));
+        // #e makes an inexact literal exact
+        assert_eq!(
+            first("#e1.5"),
+            Token::Rational(BigRational::new(BigInt::from(3), BigInt::from(2)))
+        );
+        // #e on a whole float collapses to an integer
+        assert_eq!(first("#e2.0"), Token::Int(2));
+        // combinable with radix, in either order
+        assert_eq!(first("#e#xFF"), Token::Int(255));
+        assert_eq!(first("#x#e1F"), Token::Int(31));
+        assert_eq!(first("#i#xFF"), Token::Float(255.0));
     }
 }

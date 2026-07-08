@@ -50,7 +50,7 @@ dashmap = "6"
 regex = "1"
 thiserror = "2"
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde_json = { version = "1", features = ["arbitrary_precision"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "net", "io-std", "io-util", "process", "time"] }
 reqwest = { version = "0.13", features = ["json", "stream", "blocking", "multipart"] }
 futures = "0.3"

@@ -3,13 +3,13 @@ name: "sqrt"
 module: "math"
 section: "Numeric Utilities"
 params: [{ name: n, type: number }]
-returns: "float"
+returns: "number"
 ---
 
-Square root. Always returns a float (even for perfect squares). A negative input yields `NaN` rather than raising.
+Square root. An exact perfect square returns an exact integer result rather than a float; other non-negative inputs return a float. A negative input returns a complex number rather than `NaN` or raising.
 
 ```sema
-(sqrt 16)     ; => 4.0
+(sqrt 16)     ; => 4          (exact perfect square, not 4.0)
 (sqrt 2)      ; => 1.4142135623730951
-(sqrt -1)     ; => NaN   ; no complex numbers; guard with (math/nan? ...)
+(sqrt -1)     ; => 0+1i       (complex result, not NaN)
 ```

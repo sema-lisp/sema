@@ -18,10 +18,10 @@ Character-level dispatch drives the lexer. Each iteration inspects the current c
 - **`` ` ``** — emit `Token::Quasiquote`
 - **`,`** — peek ahead: `,@` emits `Token::UnquoteSplice`, otherwise `Token::Unquote`
 - **`"`** — enter string mode, handle escape sequences
-- **`#`** — dispatch on next char: `#t`/`#f` for booleans, `#\` for character literals, `#u8(` for bytevector start, `#(` for short lambdas, `#"` for regex literals (raw strings, no escape processing), `#!` for a shebang line (line 1 only)
+- **`#`** — dispatch on next char: `#t`/`#f` for booleans, `#\` for character literals, `#u8(` for bytevector start, `#(` for short lambdas, `#"` for regex literals (raw strings, no escape processing), `#!` for a shebang line (line 1 only), and the numeric radix (`#x`/`#o`/`#b`/`#d`) and exactness (`#e`/`#i`) prefixes (see [Numeric Literals](#numeric-literals))
 - **`:`** — keyword (Clojure-style `:foo`)
 - **`f` followed by `"`** — f-string, accumulating literal parts and `${expr}` interpolations
-- **Digit or `-` followed by digit** — number (integer or float)
+- **Digit or `-` followed by digit** — number: an integer, bignum, rational (`1/3`), float, or complex (`3+4i`), per [Numeric Literals](#numeric-literals)
 - **Otherwise** — symbol character, accumulate until delimiter
 
 Every token is wrapped in a `SpannedToken` that records where it begins and ends — both as line/column positions and as byte offsets into the source string (the byte offsets enable exact source extraction for the formatter and LSP). This is the only place source positions enter the system — everything downstream inherits or discards them.
@@ -60,7 +60,10 @@ The full `Token` enum:
 | `Unquote`               | `,`              | `,x`                    |
 | `UnquoteSplice`         | `,@`             | `,@xs`                  |
 | `Int(i64)`              | digits           | `42`, `-7`              |
+| `BigInt(BigInt)`        | out-of-range digits | `99999999999999999999` |
+| `Rational(BigRational)` | `n/d`            | `1/3`, `3/6`            |
 | `Float(f64)`            | digits with `.`  | `3.14`, `-0.5`          |
+| `Complex(re, im)`       | `re±imi`         | `3+4i`, `+i`, `2i`      |
 | `String(String)`        | `"..."`          | `"hello"`               |
 | `FString(Vec<FStringPart>)` | `f"..."`     | `f"hi ${name}"`         |
 | `Regex(String)`         | `#"..."`         | `#"\d+"`                |
@@ -94,6 +97,9 @@ parse_expr
   ├── BytevectorStart → parse_bytevector → Value::Bytevector
   ├── ShortLambdaStart → parse_short_lambda → (lambda (%1 …) body)
   ├── Int       → Value::Int
+  ├── BigInt    → Value::bigint
+  ├── Rational  → Value::rational
+  ├── Complex   → Value::complex
   ├── Float     → Value::Float
   ├── String    → Value::String
   ├── FString   → desugar        → Value::List [str, part, …]
@@ -117,6 +123,69 @@ F-strings and regex literals are desugared in `parse_atom`: an f-string becomes 
 The parser produces `Value` nodes directly. There is no separate AST type — the same `Value` type used at runtime is the representation of parsed code. This is the Lisp tradition: code is data, and the reader produces data.
 
 > **Comparison:** Racket's reader is configurable with [readtables](https://docs.racket-lang.org/reference/readtables.html) — user code can define new reader syntax. Common Lisp goes further with [reader macros](https://www.lispworks.com/documentation/HyperSpec/Body/02_d.htm) that can override any character's parsing behavior. Sema has neither — quote sugar is hardcoded in the lexer, and there's no mechanism for user-defined reader extensions. This is a deliberate simplicity trade-off: the reader is predictable, the implementation is ~1,400 lines (lexer + parser, excluding tests), and all syntax is documented in one place. See Nystrom's [_Crafting Interpreters_](https://craftinginterpreters.com/parsing-expressions.html) for a thorough treatment of recursive descent parsing, or Aho et al., _Compilers: Principles, Techniques, and Tools_ (the Dragon Book), §4.4 for the theory.
+
+## Numeric Literals
+
+Sema implements the full [numeric tower](/docs/stdlib/math#the-numeric-tower), and the lexer parses each tower type directly from source — the parser only lifts the resulting `Token` into a `Value`. Numeric lexing lives in `crates/sema-reader/src/lexer.rs`.
+
+### Integers and bignums
+
+A plain integer lexes as `Token::Int(i64)` when it fits in an `i64`; an out-of-range integer literal is lexed as an arbitrary-precision `Token::BigInt` instead of overflowing. There is no separate bignum syntax — width is decided by the value.
+
+```sema
+42                          ; Int
+-7                          ; Int
+99999999999999999999999999  ; BigInt (out of i64 range)
+```
+
+### Rationals
+
+A `/` immediately followed by one or more digits makes a rational literal, lexed as `Token::Rational` and reduced to lowest terms at read time.
+
+```sema
+1/3    ; => 1/3
+3/6    ; => 1/2   (reduced)
+```
+
+### Complex literals
+
+Complex numbers are written in rectangular form with a trailing `i`, lexed as `Token::Complex(re, im)` whose components are themselves tower reals (int, rational, or float):
+
+```sema
+3+4i       ; real 3, imaginary 4
+1.5+2.5i   ; float components
+3-4i       ; negative imaginary
++i  -i     ; 0+1i, 0-1i
+2i  -2i    ; pure imaginary: 0+2i, 0-2i
+```
+
+A trailing `i` is only read as imaginary when a **delimiter** follows, so `3ix` still lexes as `Int(3)` followed by the symbol `ix` — the imaginary form does not swallow identifier characters.
+
+### Radix and exactness prefixes
+
+A number body may be preceded by any combination of a **radix** prefix and an **exactness** prefix, in either order:
+
+| Prefix | Meaning |
+| --- | --- |
+| `#x` / `#o` / `#b` / `#d` | radix 16 / 8 / 2 / 10 (integers only for non-decimal bases) |
+| `#e` / `#i` | force the value exact / inexact |
+
+```sema
+#xFF     ; => 255
+#o17     ; => 15
+#b1010   ; => 10
+#d42     ; => 42
+#e1.5    ; => 3/2    (float forced exact)
+#i1/2    ; => 0.5    (rational forced inexact)
+#e#xFF   ; => 255    (combined, either order)
+#x#eFF   ; => 255
+```
+
+Duplicate radix or exactness prefixes are a reader error.
+
+### The `#` delimiter
+
+Because `#` always begins a reader construct (`#(`, `#"…"`, `#x`, `#t`, …), it also **ends** a number, exactly like `(` does. This matters for the trailing `i` of a complex literal: `3+4i#(…)` splits into the complex `3+4i` and a short-lambda `#(…)`, the same way `123#(…)` splits into `Int(123)` and `#(…)`.
 
 ## Quote Desugaring
 

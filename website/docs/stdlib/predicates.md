@@ -82,23 +82,60 @@ Test if a value is a map.
 
 ## Numeric Predicates
 
+Sema implements the full R7RS [numeric tower](/docs/stdlib/math#the-numeric-tower), so two families of predicates apply to numbers: **type/level** tests (`number?`, `integer?`, `rational?`, `real?`, `complex?`, `float?`) and **exactness** tests (`exact?`, `inexact?`, `exact-integer?`). The type predicates nest — every integer is rational, every rational is real, every real is complex — so `complex?` is the widest and true for *all* numbers.
+
 ### `number?`
 
-Test if a value is a number (integer or float).
+Test if a value is a number — anything in the tower (integer, bignum, rational, float, or complex). Equivalent to [`complex?`](#complex).
 
 ```sema
 (number? 42)     ; => #t
 (number? 3.14)   ; => #t
+(number? 1/3)    ; => #t
 (number? "42")   ; => #f
 ```
 
 ### `integer?`
 
-Test if a value is an integer.
+Test if a value is an integer, per R7RS: true for any exact integer (including bignums) **and** for an integer-valued float like `3.0`. A float with a fractional part is not an integer. To exclude integer-valued floats, use [`exact-integer?`](#exact-integer); to test representation, use [`float?`](#float).
 
 ```sema
 (integer? 42)     ; => #t
 (integer? 3.14)   ; => #f
+(integer? 3.0)    ; => #t   ; integer-valued float
+```
+
+### `rational?`
+
+Test if a number is rational — exact and expressible as a ratio of two integers. Every exact integer and exact rational qualifies; floats and non-real complex numbers do not. (This tracks *exactness*, so it is stricter than strict R7RS where a finite float is also rational.)
+
+```sema
+(rational? 42)     ; => #t
+(rational? 1/3)    ; => #t
+(rational? 3.14)   ; => #f
+(rational? 3+4i)   ; => #f
+```
+
+### `real?`
+
+Test if a number is real — has no non-zero imaginary part. Every integer, rational, and float is real; `real?` is false *only* for a complex with a genuine imaginary component. A complex whose imaginary part is exact zero collapses to a real, so `3+0i` is real.
+
+```sema
+(real? 42)     ; => #t
+(real? 3.14)   ; => #t
+(real? 3+4i)   ; => #f
+(real? 3+0i)   ; => #t
+```
+
+### `complex?`
+
+Test if a value is a number. In R7RS the number types nest, so `complex?` is true for *every* number in the tower and false only for non-numbers. It is the widest numeric predicate.
+
+```sema
+(complex? 42)     ; => #t
+(complex? 3.14)   ; => #t
+(complex? 3+4i)   ; => #t
+(complex? "hi")   ; => #f
 ```
 
 ### `float?`
@@ -108,6 +145,40 @@ Test if a value is a floating-point number.
 ```sema
 (float? 3.14)   ; => #t
 (float? 42)     ; => #f
+```
+
+### `exact?`
+
+Test if a number is exact — represented without floating point. Exact numbers are integers, exact rationals, and complex numbers whose parts are both exact. The complement of [`inexact?`](#inexact) on numbers.
+
+```sema
+(exact? 42)      ; => #t
+(exact? 1/3)     ; => #t
+(exact? 3.14)    ; => #f
+(exact? 3+4i)    ; => #t
+(exact? 3.0+4i)  ; => #f
+```
+
+### `inexact?`
+
+Test if a number is inexact — carries a floating-point component. True for any float and for any complex with at least one inexact part. The complement of [`exact?`](#exact) on numbers.
+
+```sema
+(inexact? 42)      ; => #f
+(inexact? 3.14)    ; => #t
+(inexact? 1/3)     ; => #f
+(inexact? 3.0+4i)  ; => #t
+```
+
+### `exact-integer?`
+
+Test if a value is an exact integer — true exactly when both `exact?` and `integer?` hold. Stricter than a bare `integer?`: `2.0` is an integer value but inexact, so it fails.
+
+```sema
+(exact-integer? 42)    ; => #t
+(exact-integer? 1/2)   ; => #f
+(exact-integer? 2.0)   ; => #f
+(exact-integer? 3+0i)  ; => #t
 ```
 
 ### `zero?`

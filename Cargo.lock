@@ -2439,10 +2439,40 @@ dependencies = [
 ]
 
 [[package]]
+name = "num-bigint"
+version = "0.4.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c89e69e7e0f03bea5ef08013795c25018e101932225a656383bd384495ecc367"
+dependencies = [
+ "num-integer",
+ "num-traits",
+]
+
+[[package]]
 name = "num-conv"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf97ec579c3c42f953ef76dbf8d55ac91fb219dde70e49aa4a6b7d74e9919050"
+
+[[package]]
+name = "num-integer"
+version = "0.1.46"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7969661fd2958a5cb096e56c8e1ad0444ac2bbcd0061bd28660485a44879858f"
+dependencies = [
+ "num-traits",
+]
+
+[[package]]
+name = "num-rational"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f83d14da390562dca69fc84082e73e548e1ad308d24accdedd2720017cb37824"
+dependencies = [
+ "num-bigint",
+ "num-integer",
+ "num-traits",
+]
 
 [[package]]
 name = "num-traits"
@@ -3690,6 +3720,10 @@ dependencies = [
  "crc32fast",
  "hashbrown 0.17.1",
  "lasso",
+ "num-bigint",
+ "num-integer",
+ "num-rational",
+ "num-traits",
  "serde_json",
  "stacker",
  "thiserror 2.0.18",
@@ -3890,6 +3924,8 @@ dependencies = [
 name = "sema-reader"
 version = "1.29.0"
 dependencies = [
+ "num-bigint",
+ "num-rational",
  "proptest",
  "sema-core",
 ]
@@ -3915,6 +3951,8 @@ dependencies = [
  "md5",
  "mime_guess",
  "notify",
+ "num-bigint",
+ "num-integer",
  "pdf-extract",
  "portable-pty",
  "pulldown-cmark",
@@ -3953,6 +3991,9 @@ version = "1.29.0"
 dependencies = [
  "hashbrown 0.17.1",
  "lasso",
+ "num-bigint",
+ "num-integer",
+ "num-rational",
  "sema-core",
  "sema-reader",
 ]

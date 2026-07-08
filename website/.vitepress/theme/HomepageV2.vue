@@ -360,7 +360,7 @@ messages = [{<span class="c-str">"role"</span>: <span class="c-str">"user"</span
           <li><strong>No JIT.</strong> A bytecode compiler and a stack-based VM. If your bottleneck is number crunching, use Rust
             — or embed Sema in it.
           </li>
-          <li><strong>Not a full Scheme.</strong> No numeric tower, no call/cc, auto-gensym instead of syntax-rules.
+          <li><strong>Not a full Scheme.</strong> No call/cc, auto-gensym instead of syntax-rules.
           </li>
           <li><strong>Young.</strong> Solid and tested, not battle-hardened at scale. Pin a version; read the <a
             href="https://github.com/sema-lisp/sema/blob/main/CHANGELOG.md">changelog</a>.

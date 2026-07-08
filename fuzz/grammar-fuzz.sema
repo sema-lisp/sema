@@ -6,7 +6,9 @@
 ;;   1. Round-trip (reader <-> printer):   (= form (read (str form)))
 ;;      Generates arbitrary valid s-expression *data* and asserts that printing
 ;;      it and reading it back yields a structurally equal value. Any asymmetry
-;;      between the printer and the reader falls straight out.
+;;      between the printer and the reader falls straight out. Atoms include
+;;      bignums (beyond i64), exact rationals (`a/b`), and complex numbers
+;;      (`a+bi`), so a regression in their Display/reader round-trip is caught.
 ;;
 ;;   2. Differential value oracle (compiler/VM):  (= expected (eval form))
 ;;      Generates *well-typed, closed* programs over int / bool / float / string /
@@ -20,7 +22,10 @@
 ;;      comparisons, even?/odd?/zero?/positive?/negative?, and/or/not, if, cond,
 ;;      case, match (incl. binding), multi-binding/mixed-type let, multi-arg
 ;;      lambdas + application, curried closures, set!, try/throw/catch, apply,
-;;      named-let TCO recursion (large N), and list/vector/map/string ops.
+;;      named-let TCO recursion (large N), and list/vector/map/string ops. Int
+;;      leaves occasionally widen to a bignum beyond i64, so every int
+;;      production above also gets exercised with tower operands; dedicated
+;;      "law" cases exercise rational and complex literal arithmetic.
 ;;      Excluded by design: non-deterministic surfaces (LLM, time, randomness,
 ;;      uuid, file/network IO, async timing) — no stable oracle.
 ;;
@@ -107,8 +112,29 @@
   ;; k/1000 style values exercise float printing + shortest-round-trip parsing
   (/ (rng-range! -1000000 1000000) 1000.0))
 
+(define (gen-bignum)
+  ;; A random integer safely beyond i64::MAX (9223372036854775807): the
+  ;; product of two 10-digit factors is at least 1.6e19, always out of i64
+  ;; range regardless of sign — exercises the TAG_BIGINT reader/printer path.
+  (let ((a (rng-range! 4000000000 9999999999))
+        (b (rng-range! 4000000000 9999999999)))
+    (if (rng-bool!) (* a b) (- (* a b)))))
+
+(define (gen-rational-atom)
+  ;; Bias away from denominator-1 collapse (which would just normalize to an
+  ;; integer) so the `a/b` reader/printer path gets real exercise.
+  (let* ((d (rng-pick! (list 2 3 5 7 11 13 17 19)))
+         (n0 (rng-range! -999 999))
+         (n  (if (= 0 (mod n0 d)) (+ n0 1) n0)))
+    (/ n d)))
+
+(define (gen-complex-atom)
+  ;; A nonzero imaginary part so normalization never collapses it to a real —
+  ;; exercises the `a+bi` reader/printer path.
+  (make-rectangular (rng-range! -50 50) (rng-pick! *nz*)))
+
 (define (gen-atom)
-  (let ((c (rng-int! 8)))
+  (let ((c (rng-int! 11)))
     (cond
       ((= c 0) (rng-range! -100000 100000))
       ((= c 1) (gen-float))
@@ -117,7 +143,10 @@
       ((= c 4) (gen-string))
       ((= c 5) (rng-pick! *sym-pool*))
       ((= c 6) (rng-pick! *kw-pool*))
-      (else    (rng-pick! *char-pool*)))))
+      ((= c 7) (rng-pick! *char-pool*))
+      ((= c 8) (gen-bignum))
+      ((= c 9) (gen-rational-atom))
+      (else    (gen-complex-atom)))))
 
 (define (gen-list depth)
   (let ((k (rng-int! 5)))
@@ -233,9 +262,13 @@
 
 (define (gen-int-leaf env)
   (let ((r (maybe-ref env 'int)))
-    (if (and (not (null? r)) (rng-bool!))
-        r
-        (let ((n (rng-range! -12 12))) (mk n n)))))
+    (cond
+      ((and (not (null? r)) (rng-bool!)) r)
+      ;; Occasionally leaf into a bignum instead of a small int, so every int
+      ;; production (arithmetic, mod, bit ops, comparisons, control flow) also
+      ;; gets exercised with operands beyond i64 through the compile/VM oracle.
+      ((= 0 (rng-int! 6)) (let ((n (gen-bignum))) (mk n n)))
+      (else (let ((n (rng-range! -12 12))) (mk n n))))))
 
 (define (gen-int-bin op env depth f)
   (let ((a (gen-int env (- depth 1))) (b (gen-int env (- depth 1))))
@@ -695,7 +728,7 @@
 (define (law form) (mk form #t))     ; a law: must evaluate to #t on a correct VM
 
 (define (gen-law env depth)
-  (let ((c (rng-int! 15)))
+  (let ((c (rng-int! 17)))
     (cond
       ;; reverse == fold-cons
       ((= c 0)
@@ -777,6 +810,16 @@
              (cc (gen-int env (- depth 1))))
          (law (list '= (list '* (gf a) (list '+ (gf b) (gf cc)))
                     (list '+ (list '* (gf a) (gf b)) (list '* (gf a) (gf cc)))))))
+      ;; rational literal commutativity — exercises the `a/b` reader literal
+      ;; and its arithmetic end-to-end through the compile/VM oracle.
+      ((= c 14)
+       (let ((r (gen-rational-atom)))
+         (law (list '= (list '+ r 1) (list '+ 1 r)))))
+      ;; complex literal commutativity — exercises the `a+bi` reader literal
+      ;; end-to-end through the compile/VM oracle.
+      ((= c 15)
+       (let ((z (gen-complex-atom)))
+         (law (list '= (list '+ z 1) (list '+ 1 z)))))
       ;; vector->list preserves count
       (else
        (let ((v (gen-vec env (- depth 1))))

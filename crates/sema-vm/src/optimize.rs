@@ -8,6 +8,7 @@
 
 use std::borrow::Cow;
 
+use sema_core::number::SemaNumber;
 use sema_core::{resolve as resolve_spur, Value};
 
 use crate::core_expr::{CoreExpr, PromptEntry};
@@ -349,18 +350,30 @@ fn fold_binary_op(name: &str, a: &Value, b: &Value) -> Option<Value> {
     let ai = a.as_int()?;
     let bi = b.as_int()?;
     match name {
-        // On overflow, don't fold: leave the call for the runtime, which raises
-        // an "integer overflow" error rather than silently wrapping.
+        // On overflow, don't fold: leave the call for the runtime, which
+        // promotes the result to a bignum rather than silently wrapping.
         "+" => ai.checked_add(bi).map(Value::int),
         "-" => ai.checked_sub(bi).map(Value::int),
         "*" => ai.checked_mul(bi).map(Value::int),
         "/" => {
             if bi == 0 {
                 None
-            } else if ai % bi == 0 {
+            } else if ai.checked_rem(bi) == Some(0) {
+                // checked_rem rules out the i64::MIN / -1 overflow pair (it
+                // yields None there), so the quotient always fits a fixnum.
                 Some(Value::int(ai / bi))
             } else {
-                Some(Value::float(ai as f64 / bi as f64))
+                // Not evenly divisible (exact rational), or i64::MIN / -1
+                // (quotient 2^63 overflows a fixnum): fold through the tower,
+                // matching the runtime `/` (stdlib native fn + `vm_div`)
+                // instead of a lossy float — constant folding must not change
+                // semantics. A whole-valued rational normalizes to an integer,
+                // so the overflow pair folds to a bignum.
+                Some(Value::from_number(
+                    SemaNumber::from_i64(ai)
+                        .div(SemaNumber::from_i64(bi))
+                        .unwrap(),
+                ))
             }
         }
         "<" => Some(Value::bool(ai < bi)),

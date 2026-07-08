@@ -359,39 +359,6 @@ pub fn validate(entries: &[DocEntry], strict: bool) -> Result<Vec<String>> {
     }
 }
 
-/// Drop duplicate entries within the same module (first wins, in load order).
-/// Returns one warning per drop.
-pub fn dedupe(entries: &mut Vec<DocEntry>) -> Vec<String> {
-    let mut seen: HashSet<(String, String)> = HashSet::new();
-    let mut warnings = Vec::new();
-    entries.retain(|e| {
-        let names: Vec<&String> = std::iter::once(&e.name).chain(e.aliases.iter()).collect();
-        // Report the SPECIFIC name/alias that collided. A canonical-name-vs-other-entry's
-        // ALIAS clash would otherwise be reported only by `e.name`, hiding the real cause.
-        if let Some(clash) = names
-            .iter()
-            .find(|n| seen.contains(&(e.module.clone(), n.to_string())))
-        {
-            let via = if **clash == e.name {
-                String::new()
-            } else {
-                format!(" (via alias `{clash}`)")
-            };
-            warnings.push(format!(
-                "dropped duplicate `{}`{via} in module `{}`",
-                e.name, e.module
-            ));
-            false
-        } else {
-            for n in names {
-                seen.insert((e.module.clone(), n.clone()));
-            }
-            true
-        }
-    });
-    warnings
-}
-
 pub fn build_index(entries: Vec<DocEntry>) -> DocIndex {
     DocIndex {
         version: 1,

@@ -4,13 +4,13 @@ module: "predicates"
 section: "Numeric Predicates"
 ---
 
-Test if a value is an integer. This checks the runtime *type*, not the mathematical value — a float like `3.0` is not an integer even though it has no fractional part.
+Test if a value is an integer. This is R7RS *value-based*: any number with no fractional part is an integer regardless of representation — an integer-valued float like `3.0` counts, and so do bignums (arbitrary-precision integers beyond machine-word range).
 
 ```sema
 (integer? 42)     ; => #t
 (integer? 3.14)   ; => #f
-(integer? 3.0)    ; => #f   (it's a float, not an int)
+(integer? 3.0)    ; => #t   (integer-valued float — checked by value, not type)
 (integer? "42")   ; => #f
 ```
 
-Use `number?` to accept ints and floats alike; use `float?` for the float case.
+Use `number?` to accept any numeric type; use `float?` to check specifically for the float representation.

@@ -5,6 +5,7 @@ use std::rc::{Rc, Weak};
 use sema_core::{
     bits_to_spur,
     error::{suggest_similar, veteran_hint, CallFrame as CoreCallFrame, StackTrace},
+    number::SemaNumber,
     resolve as resolve_spur, Env, EvalContext, NativeFn, SemaError, Spur, Value, ValueViewRef,
     NAN_INT_SMALL_PATTERN, NAN_PAYLOAD_BITS, NAN_PAYLOAD_MASK, NAN_TAG_MASK, TAG_NATIVE_FN,
 };
@@ -2192,9 +2193,21 @@ impl VM {
                     op::NEGATE => {
                         let a = unsafe { pop_unchecked(&mut self.stack) };
                         if let Some(n) = a.as_int() {
-                            self.stack.push(Value::int(n.wrapping_neg()));
+                            match n.checked_neg() {
+                                Some(v) => self.stack.push(Value::int(v)),
+                                // i64::MIN negation overflows i64; promote to a bignum
+                                // instead of raising or silently wrapping (matches the
+                                // stdlib `-` unary case in sema-stdlib/src/arithmetic.rs).
+                                None => self
+                                    .stack
+                                    .push(Value::from_number(SemaNumber::from_i64(n).neg())),
+                            }
                         } else if let Some(f) = a.as_float() {
                             self.stack.push(Value::float(-f));
+                        } else if let Some(n) = a.as_number() {
+                            // Bignum/rational/complex operand: fold through the tower
+                            // instead of raising (mirrors vm_add/vm_sub/vm_mul above).
+                            self.stack.push(Value::from_number(n.neg()));
                         } else {
                             let err = SemaError::type_error("number", a.type_name());
                             handle_err!(self, fi, pc, err, pc - op::SIZE_OP, 'dispatch);
@@ -2330,9 +2343,10 @@ impl VM {
                                 (((a_bits & NAN_PAYLOAD_MASK) << SIGN_SHIFT) as i64) >> SIGN_SHIFT;
                             let bx =
                                 (((b_bits & NAN_PAYLOAD_MASK) << SIGN_SHIFT) as i64) >> SIGN_SHIFT;
-                            // Two 45-bit smalls can multiply past i64 (up to ~2^88);
-                            // check and raise rather than wrap. Value::int boxes the
-                            // in-range result when it overflows the 45-bit small range.
+                            // Two 45-bit smalls can multiply past i64 (up to ~2^88).
+                            // Value::int boxes an in-range result that overflows the
+                            // 45-bit small range; a genuine i64 overflow promotes to a
+                            // bignum through the tower rather than raising.
                             match ax.checked_mul(bx) {
                                 Some(p) => unsafe {
                                     std::ptr::write(
@@ -2341,11 +2355,15 @@ impl VM {
                                     );
                                     self.stack.set_len(len - 1);
                                 },
-                                None => {
-                                    unsafe { self.stack.set_len(len - 2) };
-                                    let err = int_overflow("*");
-                                    handle_err!(self, fi, pc, err, pc - op::SIZE_OP, 'dispatch);
-                                }
+                                None => unsafe {
+                                    std::ptr::write(
+                                        self.stack.as_mut_ptr().add(len - 2),
+                                        Value::from_number(
+                                            SemaNumber::from_i64(ax).mul(SemaNumber::from_i64(bx)),
+                                        ),
+                                    );
+                                    self.stack.set_len(len - 1);
+                                },
                             }
                         } else {
                             let b = unsafe { pop_unchecked(&mut self.stack) };
@@ -2591,7 +2609,9 @@ impl VM {
                     }
                     op::IS_NUMBER => {
                         let val = unsafe { pop_unchecked(&mut self.stack) };
-                        self.stack.push(Value::bool(val.is_int() || val.is_float()));
+                        // Matches stdlib `number?`: any tower number (fixnum,
+                        // bignum, float, and later rational/complex).
+                        self.stack.push(Value::bool(val.as_number().is_some()));
                     }
                     op::IS_STRING => {
                         let val = unsafe { pop_unchecked(&mut self.stack) };
@@ -2683,27 +2703,10 @@ impl VM {
                     op::MOD => {
                         let b = unsafe { pop_unchecked(&mut self.stack) };
                         let a = unsafe { pop_unchecked(&mut self.stack) };
-                        match (a.as_int(), b.as_int()) {
-                            (Some(ai), Some(bi)) => {
-                                if bi == 0 {
-                                    let err = SemaError::eval("modulo by zero");
-                                    handle_err!(self, fi, pc, err, pc - op::SIZE_OP, 'dispatch);
-                                } else {
-                                    self.stack.push(Value::int(ai % bi));
-                                }
-                            }
-                            _ => {
-                                let af = a.as_float().or_else(|| a.as_int().map(|i| i as f64));
-                                let bf = b.as_float().or_else(|| b.as_int().map(|i| i as f64));
-                                match (af, bf) {
-                                    (Some(af), Some(bf)) => {
-                                        self.stack.push(Value::float(af % bf));
-                                    }
-                                    _ => {
-                                        let err = SemaError::type_error("number", a.type_name());
-                                        handle_err!(self, fi, pc, err, pc - op::SIZE_OP, 'dispatch);
-                                    }
-                                }
+                        match vm_mod(&a, &b) {
+                            Ok(v) => self.stack.push(v),
+                            Err(err) => {
+                                handle_err!(self, fi, pc, err, pc - op::SIZE_OP, 'dispatch)
                             }
                         }
                     }
@@ -4322,19 +4325,15 @@ fn map_access_hint(func: &str, coll: &Value) -> String {
     }
 }
 
-/// Error for an i64 arithmetic overflow. Integer ops raise this rather than
-/// silently wrapping (there is no bignum type to promote to).
-fn int_overflow(op: &str) -> SemaError {
-    SemaError::eval(format!("{op}: integer overflow (result exceeds i64 range)"))
-        .with_hint("use floats for values beyond ±2^63")
-}
-
 fn vm_add(a: &Value, b: &Value) -> Result<Value, SemaError> {
     match (a.view_ref(), b.view_ref()) {
-        (ValueViewRef::Int(x), ValueViewRef::Int(y)) => x
-            .checked_add(y)
-            .map(Value::int)
-            .ok_or_else(|| int_overflow("+")),
+        (ValueViewRef::Int(x), ValueViewRef::Int(y)) => match x.checked_add(y) {
+            Some(s) => Ok(Value::int(s)),
+            // i64 overflow promotes to a bignum instead of raising.
+            None => Ok(Value::from_number(
+                SemaNumber::from_i64(x).add(SemaNumber::from_i64(y)),
+            )),
+        },
         (ValueViewRef::Float(x), ValueViewRef::Float(y)) => Ok(Value::float(x + y)),
         (ValueViewRef::Int(x), ValueViewRef::Float(y)) => Ok(Value::float(x as f64 + y)),
         (ValueViewRef::Float(x), ValueViewRef::Int(y)) => Ok(Value::float(x + y as f64)),
@@ -4344,6 +4343,11 @@ fn vm_add(a: &Value, b: &Value) -> Result<Value, SemaError> {
             Ok(Value::string(&s))
         }
         _ => {
+            // Non-fixnum numeric operands (bignum now; rational/complex in later
+            // phases) fold through the tower.
+            if let (Some(x), Some(y)) = (a.as_number(), b.as_number()) {
+                return Ok(Value::from_number(x.add(y)));
+            }
             let err = SemaError::type_error(
                 "number or string",
                 format!("{} and {}", a.type_name(), b.type_name()),
@@ -4364,55 +4368,86 @@ fn vm_add(a: &Value, b: &Value) -> Result<Value, SemaError> {
 #[inline(always)]
 fn vm_sub(a: &Value, b: &Value) -> Result<Value, SemaError> {
     match (a.view_ref(), b.view_ref()) {
-        (ValueViewRef::Int(x), ValueViewRef::Int(y)) => x
-            .checked_sub(y)
-            .map(Value::int)
-            .ok_or_else(|| int_overflow("-")),
+        (ValueViewRef::Int(x), ValueViewRef::Int(y)) => match x.checked_sub(y) {
+            Some(s) => Ok(Value::int(s)),
+            // i64 overflow promotes to a bignum instead of raising.
+            None => Ok(Value::from_number(
+                SemaNumber::from_i64(x).sub(SemaNumber::from_i64(y)),
+            )),
+        },
         (ValueViewRef::Float(x), ValueViewRef::Float(y)) => Ok(Value::float(x - y)),
         (ValueViewRef::Int(x), ValueViewRef::Float(y)) => Ok(Value::float(x as f64 - y)),
         (ValueViewRef::Float(x), ValueViewRef::Int(y)) => Ok(Value::float(x - y as f64)),
-        _ => Err(SemaError::type_error(
-            "number",
-            format!("{} and {}", a.type_name(), b.type_name()),
-        )),
+        _ => match (a.as_number(), b.as_number()) {
+            (Some(x), Some(y)) => Ok(Value::from_number(x.sub(y))),
+            _ => Err(SemaError::type_error(
+                "number",
+                format!("{} and {}", a.type_name(), b.type_name()),
+            )),
+        },
     }
 }
 
 #[inline(always)]
 fn vm_mul(a: &Value, b: &Value) -> Result<Value, SemaError> {
     match (a.view_ref(), b.view_ref()) {
-        (ValueViewRef::Int(x), ValueViewRef::Int(y)) => x
-            .checked_mul(y)
-            .map(Value::int)
-            .ok_or_else(|| int_overflow("*")),
+        (ValueViewRef::Int(x), ValueViewRef::Int(y)) => match x.checked_mul(y) {
+            Some(p) => Ok(Value::int(p)),
+            // i64 overflow promotes to a bignum instead of raising.
+            None => Ok(Value::from_number(
+                SemaNumber::from_i64(x).mul(SemaNumber::from_i64(y)),
+            )),
+        },
         (ValueViewRef::Float(x), ValueViewRef::Float(y)) => Ok(Value::float(x * y)),
         (ValueViewRef::Int(x), ValueViewRef::Float(y)) => Ok(Value::float(x as f64 * y)),
         (ValueViewRef::Float(x), ValueViewRef::Int(y)) => Ok(Value::float(x * y as f64)),
-        _ => Err(SemaError::type_error(
-            "number",
-            format!("{} and {}", a.type_name(), b.type_name()),
-        )),
+        _ => match (a.as_number(), b.as_number()) {
+            (Some(x), Some(y)) => Ok(Value::from_number(x.mul(y))),
+            _ => Err(SemaError::type_error(
+                "number",
+                format!("{} and {}", a.type_name(), b.type_name()),
+            )),
+        },
     }
 }
 
 #[inline(always)]
 fn vm_div(a: &Value, b: &Value) -> Result<Value, SemaError> {
     match (a.view_ref(), b.view_ref()) {
-        (ValueViewRef::Int(_), ValueViewRef::Int(0)) => Err(SemaError::eval("division by zero")),
+        (ValueViewRef::Int(_), ValueViewRef::Int(0)) => Err(SemaError::eval("division by zero")
+            .with_hint("/: guard with (if (zero? d) ... (/ n d))")),
         (ValueViewRef::Int(x), ValueViewRef::Int(y)) => {
-            if x % y == 0 {
+            if x.checked_rem(y) == Some(0) {
+                // checked_rem rules out the i64::MIN / -1 overflow pair (it
+                // yields None there), so the quotient always fits a fixnum.
                 Ok(Value::int(x / y))
             } else {
-                Ok(Value::float(x as f64 / y as f64))
+                // Not evenly divisible (exact rational, not a lossy float),
+                // or i64::MIN / -1: the whole-valued rational normalizes to
+                // an integer, promoting the 2^63 quotient to a bignum.
+                Ok(Value::from_number(
+                    SemaNumber::from_i64(x)
+                        .div(SemaNumber::from_i64(y))
+                        .unwrap(),
+                ))
             }
         }
         (ValueViewRef::Float(x), ValueViewRef::Float(y)) => Ok(Value::float(x / y)),
         (ValueViewRef::Int(x), ValueViewRef::Float(y)) => Ok(Value::float(x as f64 / y)),
         (ValueViewRef::Float(x), ValueViewRef::Int(y)) => Ok(Value::float(x / y as f64)),
-        _ => Err(SemaError::type_error(
-            "number",
-            format!("{} and {}", a.type_name(), b.type_name()),
-        )),
+        // Any other numeric combination (bignum, rational) divides exactly
+        // through the tower; an exact-zero divisor signals, matching the
+        // stdlib `/` native fn.
+        _ => match (a.as_number(), b.as_number()) {
+            (Some(x), Some(y)) => x.div(y).map(Value::from_number).map_err(|_| {
+                SemaError::eval("/: division by zero")
+                    .with_hint("/: guard with (if (zero? d) ... (/ n d))")
+            }),
+            _ => Err(SemaError::type_error(
+                "number",
+                format!("{} and {}", a.type_name(), b.type_name()),
+            )),
+        },
     }
 }
 
@@ -4428,7 +4463,11 @@ fn vm_eq(a: &Value, b: &Value) -> bool {
         | (ValueViewRef::Float(y), ValueViewRef::Int(x)) => {
             sema_core::num::cmp_int_float(x, y) == Some(std::cmp::Ordering::Equal)
         }
-        _ => a == b,
+        _ => match (a.as_number(), b.as_number()) {
+            (Some(x), Some(y)) => x.num_eq(&y),
+            // Non-numbers fall back to structural equality.
+            _ => a == b,
+        },
     }
 }
 
@@ -4443,10 +4482,42 @@ fn vm_lt(a: &Value, b: &Value) -> Result<bool, SemaError> {
             Ok(sema_core::num::cmp_int_float(y, x) == Some(std::cmp::Ordering::Greater))
         }
         (ValueViewRef::String(x), ValueViewRef::String(y)) => Ok(x < y),
-        _ => Err(SemaError::type_error(
-            "comparable values",
-            format!("{} and {}", a.type_name(), b.type_name()),
-        )),
+        _ => match (a.as_number(), b.as_number()) {
+            (Some(x), Some(y)) if !x.is_real() || !y.is_real() => {
+                Err(SemaError::eval("cannot order complex numbers")
+                    .with_hint("complex numbers have no ordering; use = or zero? instead"))
+            }
+            (Some(x), Some(y)) => Ok(x.cmp_real(&y) == Some(std::cmp::Ordering::Less)),
+            _ => Err(SemaError::type_error(
+                "comparable values",
+                format!("{} and {}", a.type_name(), b.type_name()),
+            )),
+        },
+    }
+}
+
+/// `mod`/`modulo` intrinsic: floored division (result takes the sign of the
+/// divisor) over any exact integer (fixnum or bignum), matching the stdlib
+/// `mod` native fn. Float operands keep the existing `%` (IEEE truncated
+/// remainder) behavior.
+fn vm_mod(a: &Value, b: &Value) -> Result<Value, SemaError> {
+    use num_integer::Integer;
+    match (a.view_ref(), b.view_ref()) {
+        (ValueViewRef::Float(x), ValueViewRef::Float(y)) => Ok(Value::float(x % y)),
+        (ValueViewRef::Int(x), ValueViewRef::Float(y)) => Ok(Value::float(x as f64 % y)),
+        (ValueViewRef::Float(x), ValueViewRef::Int(y)) => Ok(Value::float(x % y as f64)),
+        _ => {
+            let n = a
+                .as_bigint()
+                .ok_or_else(|| SemaError::type_error("integer", a.type_name()))?;
+            let d = b
+                .as_bigint()
+                .ok_or_else(|| SemaError::type_error("integer", b.type_name()))?;
+            if d == num_bigint::BigInt::from(0) {
+                return Err(SemaError::eval("modulo by zero"));
+            }
+            Ok(Value::from_bigint(n.mod_floor(&d)))
+        }
     }
 }
 
@@ -5313,11 +5384,12 @@ mod tests {
     // --- Regression tests: division and equality semantics ---
 
     #[test]
-    fn test_vm_div_int_returns_float_when_non_whole() {
+    fn test_vm_div_int_returns_rational_when_non_whole() {
+        // R7RS: exact/exact division yields an exact rational, not a float.
         let globals = make_test_env();
         let ctx = EvalContext::new();
         let result = eval_str("(/ 3 2)", &globals, &ctx).unwrap();
-        assert_eq!(result, Value::float(1.5));
+        assert_eq!(result, eval_str("3/2", &globals, &ctx).unwrap());
     }
 
     #[test]
@@ -5330,14 +5402,11 @@ mod tests {
 
     #[test]
     fn test_vm_div_int_negative_non_whole() {
+        // R7RS: exact/exact division yields an exact rational (7/3), not a float.
         let globals = make_test_env();
         let ctx = EvalContext::new();
         let result = eval_str("(/ 7 3)", &globals, &ctx).unwrap();
-        assert!(
-            result.as_float().is_some(),
-            "expected float, got {:?}",
-            result
-        );
+        assert_eq!(result, eval_str("7/3", &globals, &ctx).unwrap());
     }
 
     #[test]
@@ -6070,12 +6139,13 @@ mod tests {
             globals: None,
             functions: None,
         });
-        let mut vm = VM::new(globals, vec![], &[], 0).unwrap();
+        let mut vm = VM::new(globals.clone(), vec![], &[], 0).unwrap();
         let result = vm.execute(closure, &ctx).unwrap();
+        // R7RS: exact/exact division yields an exact rational (3/2), not a float or 1.
         assert_eq!(
             result,
-            Value::float(1.5),
-            "Op::Div 3/2 should return 1.5, not 1"
+            eval_str("3/2", &globals, &ctx).unwrap(),
+            "Op::Div 3/2 should return the exact rational 3/2"
         );
     }
 

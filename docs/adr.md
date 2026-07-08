@@ -1012,3 +1012,71 @@ References: `docs/deferred.md` (ASYNC-1), Decision #53 (VM-per-task async),
 `crates/sema-vm/src/scheduler.rs` (otel/usage swaps at 67/73, 698-721, 1060-1067),
 `crates/sema-core/src/async_signal.rs:417-476` (usage-scope seam),
 `crates/sema-llm/src/builtins.rs` (dynamic-scope thread-locals + async poller).
+
+### 68. Full Numeric Tower: exact integers, rationals, complex (IMPLEMENTED)
+
+Status: **implemented 2026-07-07** — resolves limitation #16. Plan:
+`docs/plans/2026-07-07-numeric-tower.md`.
+
+**Design:** A complete R7RS-style numeric tower — arbitrary-precision integers, exact
+rationals, inexact reals, and complex numbers — with correct exactness contagion.
+The implementation is layered:
+
+- **SemaNumber currency type** (`crates/sema-core/src/number.rs`): A closed-world
+  tower enum `{Integer(BigInt), Rational(BigRational), Real(f64), Complex(Box<Complex>)}`
+  with no NaN-boxing dependency, unit-tested in isolation. Every arithmetic operation
+  (`add`, `sub`, `mul`, `div`, `neg`) and comparison (`num_eq`, `cmp_real`) is proven here,
+  then integrated into the runtime. Normalization is automatic: a Rational with denom 1
+  collapses to Integer; a Complex with exact-zero imaginary collapses to its real part.
+
+- **Three new leaf tags in Value** (`crates/sema-core/src/value.rs`): `TAG_BIGINT`,
+  `TAG_RATIONAL`, `TAG_COMPLEX`, alongside the existing `TAG_INT_SMALL`/`TAG_INT_BIG`
+  for `i64` and `f64`. Each is a leaf (holds no Value), so the GC treats them like strings.
+  Bridge functions `Value::as_number()` / `Value::from_number()` lift operands into
+  SemaNumber, compute, and lower back to the tightest Value form.
+
+- **VM fast path + tower fallthrough** (`crates/sema-vm/src/vm.rs`): The inline
+  `ADD_INT`, `SUB_INT`, `MUL_INT`, `LT_INT` opcodes handle i64/f64 with no loss.
+  On overflow or non-fixnum operands, they fall through to `vm_add`/`vm_sub`/`vm_mul`
+  and similar, which lift via `as_number`, compute in the tower, and lower the result.
+  The stdlib dual-arithmetic paths (`sema-stdlib/src/arithmetic.rs` etc.) follow
+  the same lift-compute-lower pattern, so VM and stdlib agree on every operand pair.
+
+- **Reader support** (`crates/sema-reader/src/lexer.rs`): Radix prefixes (`#x`, `#o`,
+  `#b`, `#d`), exactness prefixes (`#e`, `#i`), rational literals (`1/3`), and complex
+  literals (`3+4i`) are fully supported and combinable (`#x#e1F`).
+
+- **Bytecode serialization** (`crates/sema-vm/src/serialize.rs`): New constant kinds
+  `VAL_BIGINT`, `VAL_RATIONAL`, `VAL_COMPLEX` so `.semac` files round-trip the full tower.
+
+**Exactness contagion:** When any operand of `+`, `*`, etc. is inexact (a float), the
+result is inexact, even if the other operands are exact. This is R7RS-correct and
+preserves precision information throughout the tower.
+
+**Design trade-offs:**
+
+- **Typed arrays remain fixed-width** (`TAG_I64_ARRAY`, `TAG_F64_ARRAY`): Performance
+  containers for SIMD-like operations. Storing a bignum/rational into one narrows it or
+  errors. This is intentional, not a tower gap; the tower is for general numeric computation.
+  See ADR #69 (deferred note at `docs/deferred.md`).
+
+- **Fast path performance:** Inline opcodes for small ints/floats remain unchanged;
+  tower fallthrough only fires on overflow or non-fixnum operands, so hot loops on
+  in-range arithmetic see no slowdown.
+
+**Scope (completed phases):**
+- Phase 0: Standalone `SemaNumber` tower with arithmetic, comparison, display, parsing.
+- Phase 1: Wire bignums into `Value` with `TAG_BIGINT` + overflow promotion.
+- Phase 2: Add rationals with `TAG_RATIONAL` + `numerator`/`denominator` accessors.
+- Phase 3: Add complex with `TAG_COMPLEX` + `make-rectangular`/`make-polar` + `sqrt` of negatives.
+- Phase 4: Reader completeness (radix + exactness prefixes).
+- Phase 5: Generalize every numeric builtin (comparison, rounding, bitwise, division families, expt, transcendentals, number↔string, exact-integer-sqrt, rationalize).
+- Phase 6: Cross-cutting (JSON en/decode, fuzzer round-trips, builtin docs, limitations update, ADR).
+
+**Out of scope (documented deferral):** Continuations, hygienic macros, multiple return
+values, dynamic binding.
+
+References: `crates/sema-core/src/number.rs` (tower implementation), `crates/sema-core/src/value.rs`
+(NaN-box integration), `crates/sema-vm/src/vm.rs` (VM arithmetic), `crates/sema-stdlib/src/`
+(generalized builtins), `crates/sema-reader/src/lexer.rs` (reader literals), `website/docs/internals/bytecode-format.md`
+(serialization spec).

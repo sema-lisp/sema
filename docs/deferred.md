@@ -356,6 +356,26 @@ install once `tree-sitter-dart` (or the Node/node-gyp toolchain) is fixed
 upstream. A GitHub fork (`HelgeSverre/langs`) already exists with the package
 staged in `packages/sema` if picking this back up.
 
+## TYPED-ARRAY-1 — Typed arrays remain fixed-width by design (not a numeric-tower gap)
+
+**Confirmed by design 2026-07-07.** The full numeric tower (ADR #68) adds arbitrary-precision
+integers, exact rationals, and complex numbers to all general arithmetic and numeric builtins.
+However, typed arrays (`TAG_I64_ARRAY` for `i64-array`, `TAG_F64_ARRAY` for `f64-array`) remain
+fixed-width `i64`/`f64` containers **by design** — they are performance-oriented collection types,
+analogous to SIMD vectors, intended for fast bulk operations on homogeneous in-range data.
+
+**Semantics:** Storing a bignum, rational, or complex into a typed array either (a) narrows
+the value (e.g., storing `1/3` into an `i64-array` truncates to `0`), or (b) raises a type
+error, depending on the specific operation. This is intentional and consistent with the array's
+fixed-footprint guarantee. The numeric tower is for general-purpose computation; typed arrays
+are for performance-critical tight loops.
+
+**Not a gap:** This is not a "no full numeric tower" limitation — the tower is complete for
+all arithmetic, comparison, and numeric builtins. Typed arrays are an orthogonal performance
+feature, not part of the numeric tower's scope. Applications needing arbitrary-precision
+arithmetic use general lists or other dynamic collections; applications needing arrays use
+typed arrays with appropriately-in-range inputs.
+
 ## Notebook: per-cell + per-session LLM cost tracking (status bar)
 
 Accumulate LLM spend for a notebook session and attribute it per cell / per

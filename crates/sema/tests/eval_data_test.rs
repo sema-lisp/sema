@@ -25,6 +25,11 @@ eval_tests! {
     json_decode_number: r#"(json/decode "42")"# => Value::int(42),
     json_roundtrip_map: r#"(get (json/decode (json/encode {:a 1})) :a)"# => Value::int(1),
     json_roundtrip_vector: r#"(length (json/decode (json/encode [1 2 3])))"# => Value::int(3),
+    json_encode_bigint: "(json/encode 170141183460469231731687303715884105728)" => common::eval("\"170141183460469231731687303715884105728\""),
+    json_encode_rational: "(json/encode 1/3)" => common::eval("\"\\\"1/3\\\"\""),
+    json_encode_complex: "(json/encode 3+4i)" => common::eval("\"\\\"3+4i\\\"\""),
+    json_decode_bigint: r#"(json/decode "170141183460469231731687303715884105728")"# => common::eval("170141183460469231731687303715884105728"),
+    json_roundtrip_bigint: "(equal? (json/decode (json/encode 170141183460469231731687303715884105728)) 170141183460469231731687303715884105728)" => Value::bool(true),
 }
 
 // ============================================================

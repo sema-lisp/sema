@@ -401,12 +401,15 @@ eval_tests! {
 eval_tests! {
     math_abs_negative: "(abs -5)" => Value::int(5),
     math_abs_positive: "(abs 5)" => Value::int(5),
-    math_floor_basic: "(floor 3.7)" => Value::int(3),
-    math_sqrt_basic: "(sqrt 9)" => Value::float(3.0),
+    // floor/round are exactness-preserving (R7RS): a float argument rounds to a
+    // float, not an int (see plan Task 5.2).
+    math_floor_basic: "(floor 3.7)" => Value::float(3.0),
+    // sqrt of a perfect square is exact (R7RS): (sqrt 9) => 3, not 3.0.
+    math_sqrt_basic: "(sqrt 9)" => Value::int(3),
     math_min_two: "(min 3 7)" => Value::int(3),
     math_max_two: "(max 3 7)" => Value::int(7),
-    math_round_basic: "(round 3.6)" => Value::int(4),
-    math_round_down: "(round 3.2)" => Value::int(3),
+    math_round_basic: "(round 3.6)" => Value::float(4.0),
+    math_round_down: "(round 3.2)" => Value::float(3.0),
 }
 
 eval_error_tests! {

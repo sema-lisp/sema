@@ -1,4 +1,4 @@
-use sema_docs::{build_index, dedupe, parse_entry, validate, DocIndex};
+use sema_docs::{build_index, parse_entry, validate, DocIndex};
 use std::path::PathBuf;
 
 fn p() -> PathBuf {
@@ -70,8 +70,9 @@ fn db_exec_batch_warns_about_sql_injection() {
 }
 
 #[test]
-fn validate_and_dedupe() {
-    // Cross-module: same name in different modules is kept.
+fn validate_accepts_cross_module_and_rejects_same_module_dups() {
+    // Cross-module: the same name in different modules is fine — the key is
+    // (module, name), so `length` can exist in both `lists` and `vectors`.
     let a = parse_entry(&p(), "---\nname: \"length\"\n---\nLen.\n", "lists", false).unwrap();
     let b = parse_entry(
         &p(),
@@ -80,26 +81,64 @@ fn validate_and_dedupe() {
         false,
     )
     .unwrap();
-    let mut v = vec![a, b];
-    let warns = dedupe(&mut v);
-    assert_eq!(v.len(), 2);
-    assert!(warns.is_empty());
-    validate(&v, true).unwrap();
+    validate(&[a, b], true).unwrap();
 
-    // Same-module: duplicate name in the same module is dropped.
+    // Same-module: a duplicate name is a HARD error — doc entries are never
+    // silently dropped. The filename is an arbitrary slug and the canonical
+    // `name` is unique per module, so a same-module collision is always an
+    // authoring bug that must surface, not be papered over.
     let c = parse_entry(&p(), "---\nname: \"dup\"\n---\nFirst.\n", "m", false).unwrap();
     let d = parse_entry(&p(), "---\nname: \"dup\"\n---\nSecond.\n", "m", false).unwrap();
-    let mut v2 = vec![c, d];
-    let warns2 = dedupe(&mut v2);
-    assert_eq!(v2.len(), 1);
-    assert!(warns2[0].contains("dropped duplicate `dup` in module `m`"));
+    let err = validate(&[c, d], false);
+    assert!(
+        err.is_err(),
+        "a duplicate (module, name) must be a hard error"
+    );
+    assert!(format!("{}", err.unwrap_err()).contains("dup"));
 
-    // Empty summary warning / strict error.
+    // Empty summary: a warning normally, a hard error under strict (the gate).
     let bare = parse_entry(&p(), "---\nname: \"x\"\n---\n", "m", false).unwrap();
     assert!(!validate(std::slice::from_ref(&bare), false)
         .unwrap()
         .is_empty()); // warn
     assert!(validate(&[bare], true).is_err()); // strict error
+}
+
+#[test]
+fn validate_rejects_alias_colliding_with_another_entrys_name() {
+    // Regression (numeric tower): `inexact` was documented both as a first-class
+    // entry AND declared as an alias of `exact->inexact` in the same `math`
+    // module. When `dedupe` ran before `validate`, it silently dropped the
+    // standalone `inexact.md` (first-wins), losing that builtin's docs from the
+    // index while the gate stayed green. The gen pipeline now runs `validate`
+    // first, so an alias colliding with another entry's canonical name (or
+    // alias) MUST be a hard error, in strict and non-strict alike.
+    let aliased = parse_entry(
+        &p(),
+        "---\nname: \"exact->inexact\"\naliases: [\"inexact\"]\n---\nConvert to inexact.\n",
+        "math",
+        false,
+    )
+    .unwrap();
+    let standalone = parse_entry(
+        &p(),
+        "---\nname: \"inexact\"\n---\nConvert.\n",
+        "math",
+        false,
+    )
+    .unwrap();
+    for strict in [false, true] {
+        let result = validate(&[aliased.clone(), standalone.clone()], strict);
+        assert!(
+            result.is_err(),
+            "alias `inexact` colliding with a same-module entry named `inexact` must be a hard error (strict={strict})"
+        );
+        let msg = format!("{}", result.unwrap_err());
+        assert!(
+            msg.contains("inexact") && msg.to_lowercase().contains("duplicate"),
+            "error should name the colliding entry: {msg}"
+        );
+    }
 }
 
 #[test]

@@ -494,6 +494,157 @@ pub(crate) fn eval_load(
     Ok(Trampoline::Value(result))
 }
 
+/// (define-record-type <name> (<ctor> <field> ...) <pred> (<field> <accessor> [<mutator>]) ...)
+pub(crate) fn eval_define_record_type(args: &[Value], env: &Env) -> Result<Trampoline, SemaError> {
+    if args.len() < 3 {
+        return Err(SemaError::eval(
+            "define-record-type: requires at least type name, constructor, and predicate",
+        ));
+    }
+
+    let type_name = args[0]
+        .as_symbol()
+        .ok_or_else(|| SemaError::eval("define-record-type: type name must be a symbol"))?;
+    let type_tag = intern(&type_name);
+
+    let ctor_spec = args[1]
+        .as_list()
+        .ok_or_else(|| SemaError::eval("define-record-type: constructor spec must be a list"))?;
+    if ctor_spec.is_empty() {
+        return Err(SemaError::eval(
+            "define-record-type: constructor spec must have a name",
+        ));
+    }
+    let ctor_name = ctor_spec[0]
+        .as_symbol()
+        .ok_or_else(|| SemaError::eval("define-record-type: constructor name must be a symbol"))?;
+    let field_names: Vec<String> = ctor_spec[1..]
+        .iter()
+        .map(|v| {
+            v.as_symbol()
+                .ok_or_else(|| SemaError::eval("define-record-type: field name must be a symbol"))
+        })
+        .collect::<Result<_, _>>()?;
+    let field_name_spurs: Vec<Spur> = field_names.iter().map(|name| intern(name)).collect();
+    let field_count = field_names.len();
+
+    let pred_name = args[2]
+        .as_symbol()
+        .ok_or_else(|| SemaError::eval("define-record-type: predicate must be a symbol"))?;
+
+    let ctor_name_clone = ctor_name.clone();
+    let record_field_names = field_name_spurs.clone();
+    env.set_str(
+        &ctor_name,
+        Value::native_fn(sema_core::NativeFn::simple(
+            ctor_name.clone(),
+            move |args: &[Value]| {
+                if args.len() != field_count {
+                    return Err(SemaError::arity(
+                        &ctor_name_clone,
+                        field_count.to_string(),
+                        args.len(),
+                    ));
+                }
+                Ok(Value::record(Record {
+                    type_tag,
+                    field_names: record_field_names.clone(),
+                    fields: args.to_vec(),
+                }))
+            },
+        )),
+    );
+
+    let pred_name_for_closure = pred_name.clone();
+    let pred_name_for_set = pred_name.clone();
+    env.set_str(
+        &pred_name_for_set,
+        Value::native_fn(sema_core::NativeFn::simple(
+            pred_name,
+            move |args: &[Value]| {
+                if args.len() != 1 {
+                    return Err(SemaError::arity(&pred_name_for_closure, "1", args.len()));
+                }
+                Ok(Value::bool(
+                    args[0].as_record().is_some_and(|r| r.type_tag == type_tag),
+                ))
+            },
+        )),
+    );
+
+    for field_spec_val in &args[3..] {
+        let field_spec = field_spec_val
+            .as_list()
+            .ok_or_else(|| SemaError::eval("define-record-type: field spec must be a list"))?;
+        if field_spec.len() < 2 {
+            return Err(SemaError::eval(
+                "define-record-type: field spec must have at least (field-name accessor)",
+            ));
+        }
+
+        let field_name = field_spec[0]
+            .as_symbol()
+            .ok_or_else(|| SemaError::eval("define-record-type: field name must be a symbol"))?;
+
+        let field_idx = field_names
+            .iter()
+            .position(|n| n == &field_name)
+            .ok_or_else(|| {
+                SemaError::eval(format!(
+                    "define-record-type: field '{field_name}' not in constructor"
+                ))
+            })?;
+
+        let accessor_name = field_spec[1]
+            .as_symbol()
+            .ok_or_else(|| SemaError::eval("define-record-type: accessor must be a symbol"))?;
+
+        let accessor_name_for_closure = accessor_name.clone();
+        let accessor_name_for_set = accessor_name.clone();
+        let type_name_for_err = type_name.clone();
+        env.set_str(
+            &accessor_name_for_set,
+            Value::native_fn(sema_core::NativeFn::simple(
+                accessor_name,
+                move |args: &[Value]| {
+                    if args.len() != 1 {
+                        return Err(SemaError::arity(
+                            &accessor_name_for_closure,
+                            "1",
+                            args.len(),
+                        ));
+                    }
+                    match args[0].as_record() {
+                        Some(r) if r.type_tag == type_tag => Ok(r.fields[field_idx].clone()),
+                        _ => Err(SemaError::type_error(
+                            &type_name_for_err,
+                            args[0].type_name(),
+                        )),
+                    }
+                },
+            )),
+        );
+    }
+
+    Ok(Trampoline::Value(Value::nil()))
+}
+
+/// Parse parameter list, handling rest params (e.g., `(a b . rest)`)
+pub(crate) fn parse_params(names: &[Spur]) -> (Vec<Spur>, Option<Spur>) {
+    let dot = intern(".");
+    if let Some(pos) = names.iter().position(|s| *s == dot) {
+        let params = names[..pos].to_vec();
+        let rest = if pos + 1 < names.len() {
+            Some(names[pos + 1])
+        } else {
+            None
+        };
+        (params, rest)
+    } else {
+        (names.to_vec(), None)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
@@ -799,156 +950,5 @@ mod tests {
             .eval_str(r#"(load "nested/main.sema") loaded-value"#)
             .unwrap();
         assert_eq!(result, Value::int(42));
-    }
-}
-
-/// (define-record-type <name> (<ctor> <field> ...) <pred> (<field> <accessor> [<mutator>]) ...)
-pub(crate) fn eval_define_record_type(args: &[Value], env: &Env) -> Result<Trampoline, SemaError> {
-    if args.len() < 3 {
-        return Err(SemaError::eval(
-            "define-record-type: requires at least type name, constructor, and predicate",
-        ));
-    }
-
-    let type_name = args[0]
-        .as_symbol()
-        .ok_or_else(|| SemaError::eval("define-record-type: type name must be a symbol"))?;
-    let type_tag = intern(&type_name);
-
-    let ctor_spec = args[1]
-        .as_list()
-        .ok_or_else(|| SemaError::eval("define-record-type: constructor spec must be a list"))?;
-    if ctor_spec.is_empty() {
-        return Err(SemaError::eval(
-            "define-record-type: constructor spec must have a name",
-        ));
-    }
-    let ctor_name = ctor_spec[0]
-        .as_symbol()
-        .ok_or_else(|| SemaError::eval("define-record-type: constructor name must be a symbol"))?;
-    let field_names: Vec<String> = ctor_spec[1..]
-        .iter()
-        .map(|v| {
-            v.as_symbol()
-                .ok_or_else(|| SemaError::eval("define-record-type: field name must be a symbol"))
-        })
-        .collect::<Result<_, _>>()?;
-    let field_name_spurs: Vec<Spur> = field_names.iter().map(|name| intern(name)).collect();
-    let field_count = field_names.len();
-
-    let pred_name = args[2]
-        .as_symbol()
-        .ok_or_else(|| SemaError::eval("define-record-type: predicate must be a symbol"))?;
-
-    let ctor_name_clone = ctor_name.clone();
-    let record_field_names = field_name_spurs.clone();
-    env.set_str(
-        &ctor_name,
-        Value::native_fn(sema_core::NativeFn::simple(
-            ctor_name.clone(),
-            move |args: &[Value]| {
-                if args.len() != field_count {
-                    return Err(SemaError::arity(
-                        &ctor_name_clone,
-                        field_count.to_string(),
-                        args.len(),
-                    ));
-                }
-                Ok(Value::record(Record {
-                    type_tag,
-                    field_names: record_field_names.clone(),
-                    fields: args.to_vec(),
-                }))
-            },
-        )),
-    );
-
-    let pred_name_for_closure = pred_name.clone();
-    let pred_name_for_set = pred_name.clone();
-    env.set_str(
-        &pred_name_for_set,
-        Value::native_fn(sema_core::NativeFn::simple(
-            pred_name,
-            move |args: &[Value]| {
-                if args.len() != 1 {
-                    return Err(SemaError::arity(&pred_name_for_closure, "1", args.len()));
-                }
-                Ok(Value::bool(
-                    args[0].as_record().is_some_and(|r| r.type_tag == type_tag),
-                ))
-            },
-        )),
-    );
-
-    for field_spec_val in &args[3..] {
-        let field_spec = field_spec_val
-            .as_list()
-            .ok_or_else(|| SemaError::eval("define-record-type: field spec must be a list"))?;
-        if field_spec.len() < 2 {
-            return Err(SemaError::eval(
-                "define-record-type: field spec must have at least (field-name accessor)",
-            ));
-        }
-
-        let field_name = field_spec[0]
-            .as_symbol()
-            .ok_or_else(|| SemaError::eval("define-record-type: field name must be a symbol"))?;
-
-        let field_idx = field_names
-            .iter()
-            .position(|n| n == &field_name)
-            .ok_or_else(|| {
-                SemaError::eval(format!(
-                    "define-record-type: field '{field_name}' not in constructor"
-                ))
-            })?;
-
-        let accessor_name = field_spec[1]
-            .as_symbol()
-            .ok_or_else(|| SemaError::eval("define-record-type: accessor must be a symbol"))?;
-
-        let accessor_name_for_closure = accessor_name.clone();
-        let accessor_name_for_set = accessor_name.clone();
-        let type_name_for_err = type_name.clone();
-        env.set_str(
-            &accessor_name_for_set,
-            Value::native_fn(sema_core::NativeFn::simple(
-                accessor_name,
-                move |args: &[Value]| {
-                    if args.len() != 1 {
-                        return Err(SemaError::arity(
-                            &accessor_name_for_closure,
-                            "1",
-                            args.len(),
-                        ));
-                    }
-                    match args[0].as_record() {
-                        Some(r) if r.type_tag == type_tag => Ok(r.fields[field_idx].clone()),
-                        _ => Err(SemaError::type_error(
-                            &type_name_for_err,
-                            args[0].type_name(),
-                        )),
-                    }
-                },
-            )),
-        );
-    }
-
-    Ok(Trampoline::Value(Value::nil()))
-}
-
-/// Parse parameter list, handling rest params (e.g., `(a b . rest)`)
-pub(crate) fn parse_params(names: &[Spur]) -> (Vec<Spur>, Option<Spur>) {
-    let dot = intern(".");
-    if let Some(pos) = names.iter().position(|s| *s == dot) {
-        let params = names[..pos].to_vec();
-        let rest = if pos + 1 < names.len() {
-            Some(names[pos + 1])
-        } else {
-            None
-        };
-        (params, rest)
-    } else {
-        (names.to_vec(), None)
     }
 }

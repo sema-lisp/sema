@@ -79,6 +79,21 @@ eval_error_tests! {
     sci_int_overflow: "(int 1.0e19)" => "int",
 }
 
+// `int` and `float` accept the whole real tower: bignums pass through `int`
+// unchanged, and `float` projects bignums/rationals inexactly.
+eval_tests! {
+    int_of_bignum_is_identity: "(int 9223372036854775808)"
+        => common::eval("9223372036854775808"),
+    float_of_rational_projects: "(float 1/2)" => Value::float(0.5),
+    float_of_bignum_projects: "(float 9223372036854775808)"
+        => Value::float(9223372036854775808.0),
+}
+
+eval_error_tests! {
+    // Complex has no real projection, so `float` rejects it.
+    float_of_complex_rejected: "(float 3+4i)" => "real",
+}
+
 // ============================================================
 // Pattern Matching
 // ============================================================
@@ -1347,7 +1362,8 @@ eval_tests! {
 
 eval_error_tests! {
     string_repeat_negative_errors: r#"(string/repeat "ab" -1)"# => "non-negative",
-    abs_i64_min_errors: "(abs -9223372036854775808)" => "overflows i64",
+    // `(abs -9223372036854775808)` no longer errors — it promotes to an exact
+    // bignum (see `boundary_abs_min` in the numeric-tower parity block).
     // TODO(test-strength): VM `nth` uses generic "out of bounds" while tree-walker
     // says "non-negative" — strengthen after error UX wave unifies them.
     nth_negative_errors: "(nth (list 1 2 3) -1)",
@@ -1356,14 +1372,319 @@ eval_error_tests! {
     force_non_promise_errors: "(force 42)" => "thunk",
 }
 
-// Integer arithmetic raises on i64 overflow rather than silently wrapping
-// (there is no bignum type to promote to). Consistent with `abs` on i64::MIN.
+// `expt` is generalized to the full tower in Task 5.5: an exact base with a
+// non-negative exact integer exponent now returns an exact bignum instead of
+// raising on i64 overflow (repeated squaring keeps this cheap even for large
+// exponents — see the Task 5.5 block below for the exhaustive coverage).
+eval_tests! {
+    expt_i64_overflow_promotes_to_bignum: "(expt 2 64)" => common::eval("18446744073709551616"),
+}
+
+// The inline `AddInt`/`SubInt`/`MulInt` VM opcodes (2-operand form, chosen by
+// `try_compile_intrinsic` on `(name, argc)`) promote to bignum on i64 overflow
+// instead of raising, matching the stdlib `+`/`-`/`*` native functions.
+eval_tests! {
+    add_overflow_promotes: "(+ 9223372036854775807 1)" => common::eval("9223372036854775808"),
+    sub_underflow_promotes: "(- -9223372036854775808 1)" => common::eval("-9223372036854775809"),
+    mul_overflow_promotes: "(* 9223372036854775807 9223372036854775807)"
+        => common::eval("85070591730234615847396907784232501249"),
+    // i64::MIN / -1 is the one integer division whose quotient (2^63)
+    // overflows a fixnum — it must promote to a bignum, not panic. The
+    // literal form exercises compile-time constant folding; the lambda form
+    // exercises the runtime `vm_div` fast path.
+    div_i64_min_by_neg1_folded_promotes: "(/ -9223372036854775808 -1)"
+        => common::eval("9223372036854775808"),
+    div_i64_min_by_neg1_runtime_promotes: "((fn (n d) (/ n d)) -9223372036854775808 -1)"
+        => common::eval("9223372036854775808"),
+}
+
+// Stdlib `+ - *` promote to bignum on i64 overflow instead of raising.
+//
+// These all use 3+ operands so the compiler emits a plain call to the
+// registered `+`/`-`/`*` native functions rather than the 2-operand-only
+// `AddInt`/`SubInt`/`MulInt` VM intrinsics (see the note above) — the VM
+// fast path itself is promoted separately in Task 1.5.
+eval_tests! {
+    bignum_mul_overflow_promotes: "(* 1000000000000 1000000000000 1)" => common::eval("1000000000000000000000000"),
+    bignum_add_overflow_promotes: "(+ 9223372036854775807 1 0)" => common::eval("9223372036854775808"),
+    bignum_sub_underflow_promotes: "(- -9223372036854775808 1 0)" => common::eval("-9223372036854775809"),
+    // factorial-style product stays exact
+    bignum_factorial_25: "(let loop ((i 1) (acc 1)) (if (> i 25) acc (loop (+ i 1 0) (* acc i 1))))"
+        => common::eval("15511210043330985984000000"),
+    // mixing bignum with float is inexact contagion
+    bignum_plus_float_is_inexact: "(+ 1000000000000000000000000 0.0 0)" => common::eval("1e24"),
+    // in-range arithmetic is byte-identical to before
+    bignum_add_in_range: "(+ 2 3)" => common::eval("5"),
+    bignum_mul_in_range: "(* 6 7)" => common::eval("42"),
+}
+
+// Task 1.5: the VM's inline `AddInt`/`MulInt`/`LtInt`/`EqInt` intrinsics and
+// their generic `vm_add`/`vm_mul`/`vm_lt`/`vm_eq` helpers promote to bignum on
+// i64 overflow (2-operand form compiles to the intrinsic opcodes).
+eval_tests! {
+    vm_add_overflow_promotes: "(let ((a 9223372036854775807)) (+ a a))"
+        => common::eval("18446744073709551614"),
+    vm_mul_overflow_promotes: "(let ((a 9223372036854775807)) (* a a))"
+        => common::eval("85070591730234615847396907784232501249"),
+    vm_lt_bignum: "(< 9223372036854775807 9223372036854775808)" => common::eval("#t"),
+    vm_eq_bignum: "(= 9223372036854775808 9223372036854775808)" => common::eval("#t"),
+    // The VM's inline unary `NEGATE` opcode (compiled from single-arg `-`)
+    // must also fall through to the tower for bignum operands instead of
+    // raising a type error — found by the grammar fuzzer's bignum leaves.
+    vm_negate_bignum: "(- 170141183460469231731687303715884105728)"
+        => common::eval("-170141183460469231731687303715884105728"),
+    // `sort`'s comparator-free path must treat bignums as part of the same
+    // numeric sort category as fixnums (both are just "int"), not reject the
+    // list as heterogeneous — found by the grammar fuzzer mixing fixnum and
+    // bignum leaves in the same list.
+    sort_mixed_fixnum_bignum: "(sort (list 170141183460469231731687303715884105728 3 -5))"
+        => common::eval("(list -5 3 170141183460469231731687303715884105728)"),
+}
+
+// Task 1.6: `integer?`/`number?` recognize bignums; `integer?` is true for
+// integer-valued floats (R7RS sense) and false for non-integer floats.
+eval_tests! {
+    integer_pred_bignum: "(integer? 170141183460469231731687303715884105728)" => common::eval("#t"),
+    number_pred_bignum: "(number? 170141183460469231731687303715884105728)" => common::eval("#t"),
+    integer_pred_whole_float: "(integer? 2.0)" => common::eval("#t"),
+    integer_pred_fractional_float: "(integer? 2.5)" => common::eval("#f"),
+}
+
+// Task 2.3: `/` yields exact rationals through both the stdlib native fn and
+// the VM's `vm_div` fast path — no more lossy `result as i64`/float stopgap.
+eval_tests! {
+    div_exact_rational: "(/ 1 3)" => common::eval("1/3"),
+    div_exact_whole: "(/ 6 3)" => common::eval("2"),
+    div_exact_rational_reduces: "(/ 10 4)" => common::eval("5/2"),
+    div_float_contagion: "(/ 1 2.0)" => common::eval("0.5"),
+    div_rational_add: "(+ 1/2 1/3)" => common::eval("5/6"),
+    div_rational_mul: "(* 2/3 3/4)" => common::eval("1/2"),
+    div_rational_sub: "(- 1/2 1/3)" => common::eval("1/6"),
+    div_rational_fold: "(/ 1 3 2)" => common::eval("1/6"),
+    // VM inline fast path (2-operand call compiles to the DivInt-style intrinsic).
+    vm_div_exact_rational: "(let ((a 1) (b 3)) (/ a b))" => common::eval("1/3"),
+    vm_div_exact_whole: "(let ((a 6) (b 3)) (/ a b))" => common::eval("2"),
+}
+
 eval_error_tests! {
-    add_overflow_errors: "(+ 9223372036854775807 1)" => "integer overflow",
-    sub_underflow_errors: "(- -9223372036854775808 1)" => "integer overflow",
-    mul_overflow_errors: "(* 9223372036854775807 9223372036854775807)" => "integer overflow",
-    expt_result_overflow_errors: "(expt 2 64)" => "integer overflow",
-    expt_exponent_overflow_errors: "(expt 2 4294967296)" => "integer overflow",
+    div_by_zero_still_errors: "(/ 1 0)" => "division by zero",
+}
+
+// Task 3.2: the reader parses complex literals through the full pipeline
+// (lexer -> reader -> compile -> VM). Equality across literal spellings is the
+// oracle: `+i`, `2i`, `3+4i` must read to the same values as their canonical
+// `re±imi` forms.
+eval_tests! {
+    complex_lit_rect: "3+4i" => common::eval("3+4i"),
+    complex_lit_plus_i: "+i" => common::eval("0+1i"),
+    complex_lit_minus_i: "-i" => common::eval("0-1i"),
+    complex_lit_pure_imag: "2i" => common::eval("0+2i"),
+    complex_lit_neg_imag: "0-1i" => common::eval("-i"),
+    complex_lit_float: "1.5+2.5i" => common::eval("1.5+2.5i"),
+    complex_lit_leading_pos_imag: "+2i" => common::eval("0+2i"),
+}
+
+// Task 3.3: complex builtins (make-rectangular/make-polar/real-part/imag-part/
+// magnitude/angle), complex?/real? predicates, and sqrt of a negative real
+// returning a complex. `complex?` is true for every number (R7RS); `real?` is
+// true for anything that is not `Complex`.
+eval_tests! {
+    make_rectangular_basic: "(make-rectangular 3 4)" => common::eval("3+4i"),
+    real_part_complex: "(real-part 3+4i)" => common::eval("3"),
+    imag_part_complex: "(imag-part 3+4i)" => common::eval("4"),
+    real_part_real: "(real-part 5)" => common::eval("5"),
+    imag_part_real: "(imag-part 5)" => common::eval("0"),
+    magnitude_complex: "(magnitude 3+4i)" => common::eval("5.0"),
+    // magnitude of an exact real stays exact (R7RS): |−5| = 5, not 5.0.
+    magnitude_real_negative: "(magnitude -5)" => common::eval("5"),
+    complex_mul: "(* 3+4i 1-2i)" => common::eval("11-2i"),
+    complex_add: "(+ 1+2i 3+4i)" => common::eval("4+6i"),
+    complex_pred_complex: "(complex? 3+4i)" => common::eval("#t"),
+    complex_pred_real: "(complex? 5)" => common::eval("#t"),
+    real_pred_complex: "(real? 3+4i)" => common::eval("#f"),
+    real_pred_real: "(real? 5)" => common::eval("#t"),
+    // sqrt of a negative exact perfect square is an exact complex on the
+    // imaginary axis (R7RS: (sqrt -1) => +i); non-squares stay inexact.
+    sqrt_neg_one: "(sqrt -1)" => common::eval("0+1i"),
+    sqrt_neg_four: "(sqrt -4)" => common::eval("0+2i"),
+    // make-polar with angle 0: components are bit-exact (cos(0)=1, sin(0)=0).
+    make_polar_real_part: "(real-part (make-polar 5.0 0.0))" => Value::float(5.0),
+    make_polar_imag_part: "(imag-part (make-polar 5.0 0.0))" => Value::float(0.0),
+    angle_positive_real: "(angle 5)" => Value::float(0.0),
+    angle_negative_real: "(angle -5)" => Value::float(std::f64::consts::PI),
+}
+
+// Task 4.1: radix prefixes #x/#o/#b/#d — sign-aware, bignum-capable.
+eval_tests! {
+    radix_hex: "#xFF" => common::eval("255"),
+    radix_hex_lower: "#xff" => common::eval("255"),
+    radix_octal: "#o17" => common::eval("15"),
+    radix_binary: "#b101" => common::eval("5"),
+    radix_decimal: "#d10" => common::eval("10"),
+    radix_hex_negative: "#x-1F" => common::eval("-31"),
+    radix_hex_bignum: "#xFFFFFFFFFFFFFFFFF" => common::eval("295147905179352825855"),
+    radix_hex_in_arithmetic: "(+ #x10 #x10)" => common::eval("32"),
+}
+
+// Task 4.2: #e/#i exactness prefixes (combinable with radix) and the
+// exact/inexact/exact->inexact/inexact->exact builtins.
+eval_tests! {
+    exact_to_inexact: "(exact->inexact 1/2)" => common::eval("0.5"),
+    inexact_to_exact: "(inexact->exact 0.5)" => common::eval("1/2"),
+    exact_of_float: "(exact 2.0)" => common::eval("2"),
+    inexact_of_int: "(inexact 3)" => common::eval("3.0"),
+    exact_prefix_float: "#e1.5" => common::eval("3/2"),
+    inexact_prefix_rational: "#i1/2" => common::eval("0.5"),
+    // combinable radix + exactness prefixes, in either order
+    exact_prefix_with_radix: "#e#xFF" => common::eval("255"),
+    radix_then_exact_prefix: "#x#e1F" => common::eval("31"),
+    inexact_prefix_with_radix: "#i#xFF" => common::eval("255.0"),
+}
+
+// Task 2.4: rational?/exact?/inexact?/exact-integer?/numerator/denominator.
+eval_tests! {
+    rational_pred_rational: "(rational? 1/3)" => common::eval("#t"),
+    rational_pred_integer: "(rational? 5)" => common::eval("#t"),
+    rational_pred_float: "(rational? 2.5)" => common::eval("#f"),
+    exact_pred_rational: "(exact? 1/3)" => common::eval("#t"),
+    exact_pred_integer: "(exact? 5)" => common::eval("#t"),
+    exact_pred_float: "(exact? 2.5)" => common::eval("#f"),
+    inexact_pred_float: "(inexact? 2.5)" => common::eval("#t"),
+    exact_integer_pred_int: "(exact-integer? 5)" => common::eval("#t"),
+    exact_integer_pred_rational: "(exact-integer? 1/3)" => common::eval("#f"),
+    exact_integer_pred_float: "(exact-integer? 2.0)" => common::eval("#f"),
+    numerator_reduces: "(numerator 6/4)" => common::eval("3"),
+    denominator_reduces: "(denominator 6/4)" => common::eval("2"),
+    numerator_integer: "(numerator 5)" => common::eval("5"),
+    denominator_integer: "(denominator 5)" => common::eval("1"),
+}
+
+// Task 5.1: comparison and sign predicates over the full tower.
+eval_tests! {
+    lt_rationals: "(< 1/3 1/2)" => common::eval("#t"),
+    lt_rational_float: "(< 1/2 0.6)" => common::eval("#t"),
+    gt_bignum: "(> 170141183460469231731687303715884105728 9223372036854775807)" => common::eval("#t"),
+    eq_rational_float: "(= 1/2 0.5)" => common::eval("#t"),
+    eq_multi_arg_mixed: "(= 2 2.0 4/2)" => common::eval("#t"),
+    zero_pred_rational_zero: "(zero? 0/5)" => common::eval("#t"),
+    positive_pred_rational: "(positive? 1/3)" => common::eval("#t"),
+    negative_pred_rational: "(negative? -1/3)" => common::eval("#t"),
+    even_pred_bignum: "(even? 170141183460469231731687303715884105728)" => common::eval("#t"),
+    odd_pred_bignum: "(odd? 170141183460469231731687303715884105729)" => common::eval("#t"),
+}
+
+eval_error_tests! {
+    lt_complex_errors: "(< 1+2i 3)" => "cannot order complex",
+}
+
+// Task 5.2: floor/ceiling/round/truncate over rationals and bignums, with
+// R7RS banker's rounding (round-half-to-even) for the tie case.
+eval_tests! {
+    floor_rational: "(floor 7/2)" => common::eval("3"),
+    ceiling_rational: "(ceiling 7/2)" => common::eval("4"),
+    round_rational_ties_up_to_even: "(round 7/2)" => common::eval("4"),
+    round_rational_ties_down_to_even: "(round 5/2)" => common::eval("2"),
+    truncate_negative_rational: "(truncate -7/2)" => common::eval("-3"),
+    floor_float_stays_inexact: "(floor 2.5)" => common::eval("2.0"),
+    floor_int_identity: "(floor 5)" => common::eval("5"),
+}
+
+// Task 5.3: abs/min/max over the tower, with R7RS inexactness contagion
+// (if any argument is inexact, the result is inexact even when the winning
+// extremum itself was exact).
+eval_tests! {
+    abs_rational: "(abs -1/3)" => common::eval("1/3"),
+    abs_bignum: "(abs -170141183460469231731687303715884105728)"
+        => common::eval("170141183460469231731687303715884105728"),
+    min_contagion_inexact: "(min 1/2 1/3 0.4)" => common::eval("0.3333333333333333"),
+    max_rational: "(max 1/2 1/3)" => common::eval("1/2"),
+}
+
+// Task 5.4: quotient/remainder/modulo/mod/gcd/lcm over bignums, R7RS division
+// semantics (modulo/mod floored — sign of divisor; remainder/quotient
+// truncated — sign of dividend).
+eval_tests! {
+    quotient_bignum: "(quotient 100000000000000000000 7)" => common::eval("14285714285714285714"),
+    remainder_bignum: "(remainder 100000000000000000000 7)" => common::eval("2"),
+    modulo_negative_dividend: "(modulo -7 3)" => common::eval("2"),
+    remainder_negative_dividend: "(remainder -7 3)" => common::eval("-1"),
+    gcd_basic: "(gcd 12 18)" => common::eval("6"),
+    gcd_bignum: "(gcd 100000000000000000000 10)" => common::eval("10"),
+    lcm_basic: "(lcm 4 6)" => common::eval("12"),
+    mod_basic: "(mod 10 3)" => common::eval("1"),
+}
+
+// `math/quotient`/`math/remainder`/`math/gcd`/`math/lcm` are aliases of the
+// unprefixed R7RS names (same shared impl, mirroring `pow`/`expt`/`math/pow`)
+// — they must agree on bignums and on variadic gcd/lcm, not just fixnums.
+eval_tests! {
+    math_quotient_bignum: "(math/quotient 100000000000000000000 7)" => common::eval("14285714285714285714"),
+    math_remainder_bignum: "(math/remainder 100000000000000000000 7)" => common::eval("2"),
+    math_gcd_bignum: "(math/gcd 100000000000000000000 10)" => common::eval("10"),
+    math_lcm_basic: "(math/lcm 4 6)" => common::eval("12"),
+    gcd_variadic: "(gcd 12 18 24)" => common::eval("6"),
+    math_gcd_variadic: "(math/gcd 12 18 24)" => common::eval("6"),
+    lcm_variadic: "(lcm 2 3 4)" => common::eval("12"),
+    math_lcm_variadic: "(math/lcm 2 3 4)" => common::eval("12"),
+    quotient_and_math_quotient_agree: "(= (quotient 100000000000000000000 7) (math/quotient 100000000000000000000 7))" => common::eval("#t"),
+    remainder_and_math_remainder_agree: "(= (remainder -7 3) (math/remainder -7 3))" => common::eval("#t"),
+    gcd_and_math_gcd_agree: "(= (gcd 48 36) (math/gcd 48 36))" => common::eval("#t"),
+    lcm_and_math_lcm_agree: "(= (lcm 4 6) (math/lcm 4 6))" => common::eval("#t"),
+}
+
+// Task 5.5: `expt` exact for integer exponents (repeated squaring; a negative
+// exponent of an exact base yields an exact reciprocal rational), plus the
+// transcendental functions accepting exact (bignum/rational) arguments via
+// `to_f64` instead of erroring (they previously only accepted fixnum/float).
+eval_tests! {
+    expt_bignum_exact: "(expt 2 100)" => common::eval("1267650600228229401496703205376"),
+    expt_negative_exponent_exact_rational: "(expt 2 -3)" => common::eval("1/8"),
+    expt_rational_base: "(expt 1/2 3)" => common::eval("1/8"),
+    expt_float_base_int_exponent: "(expt 2.0 10)" => common::eval("1024.0"),
+    expt_float_exponent: "(expt 2 0.5)" => common::eval("1.4142135623730951"),
+    sin_accepts_rational: "(sin 1/2)" => common::eval("0.479425538604203"),
+    cos_accepts_rational: "(cos 1/2)" => common::eval("0.8775825618903728"),
+    log_accepts_bignum: "(log 170141183460469231731687303715884105728)" => common::eval("88.02969193111305"),
+    math_tan_accepts_rational: "(math/tan 1/4)" => common::eval("0.25534192122103627"),
+    math_exp_accepts_bignum: "(math/exp 2)" => common::eval("7.38905609893065"),
+}
+
+// Task 5.6: `number->string`/`string->number` with radix over the tower.
+// `string->number` never errors — unparseable input returns `#f` (R7RS).
+eval_tests! {
+    number_to_string_radix_16: "(number->string 255 16)" => common::eval("\"ff\""),
+    number_to_string_rational: "(number->string 1/3)" => common::eval("\"1/3\""),
+    number_to_string_default_radix: "(number->string 255)" => common::eval("\"255\""),
+    string_to_number_radix_16: "(string->number \"ff\" 16)" => common::eval("255"),
+    string_to_number_rational: "(string->number \"1/3\")" => common::eval("1/3"),
+    string_to_number_float: "(string->number \"3.14\")" => common::eval("3.14"),
+    string_to_number_unparseable_is_false: "(string->number \"nope\")" => common::eval("#f"),
+    string_to_number_complex: "(string->number \"3+4i\")" => common::eval("3+4i"),
+}
+
+// Task 5.7: `exact-integer-sqrt` (isqrt with remainder, bignum-aware) and
+// `rationalize` (simplest rational within a tolerance, R7RS exactness
+// contagion). `rationalize`'s expected literals are the actual output of the
+// Stern–Brocot implementation, pinned as the oracle.
+eval_tests! {
+    exact_integer_sqrt_nonsquare: "(exact-integer-sqrt 17)" => common::eval("'(4 1)"),
+    exact_integer_sqrt_bignum: "(exact-integer-sqrt 100000000000000000000)" => common::eval("'(10000000000 0)"),
+    exact_integer_sqrt_perfect_square: "(exact-integer-sqrt 144)" => common::eval("'(12 0)"),
+    rationalize_exact_stays_exact: "(rationalize 1/3 1/100)" => common::eval("1/3"),
+    rationalize_classic_scheme: "(rationalize 3/10 1/10)" => common::eval("1/3"),
+    rationalize_inexact_pi: "(rationalize 3.14159 1/100)" => common::eval("3.142857142857143"),
+}
+
+// Task 5.8: bitwise ops are bignum-aware (two's-complement semantics via
+// `BigInt`) — shifts and bitwise combinators operate correctly on operands
+// beyond i64 range instead of erroring or truncating.
+eval_tests! {
+    bit_shift_left_bignum: "(bit/shift-left 1 100)" => common::eval("1267650600228229401496703205376"),
+    bit_and_bignum: "(bit/and 170141183460469231731687303715884105727 255)" => common::eval("255"),
+    bit_or_bignum: "(bit/or 1152921504606846976 1)" => common::eval("1152921504606846977"),
+    bit_xor_bignum: "(bit/xor 170141183460469231731687303715884105728 1)" => common::eval("170141183460469231731687303715884105729"),
+    bit_not_bignum: "(bit/not 170141183460469231731687303715884105728)" => common::eval("-170141183460469231731687303715884105729"),
+    bit_shift_right_bignum: "(bit/shift-right 1267650600228229401496703205376 100)" => Value::int(1),
 }
 
 // Regression tests for the runtime bug-hunt fixes (2026-07-07).
@@ -1382,6 +1703,44 @@ eval_tests! {
     // process (stacker grows the stack); these complete and return a value.
     deep_structure_str_no_abort: "(string-length (str (foldl (fn (acc _) (list acc)) (list 1) (range 5000))))" => Value::int(10003),
     deep_reentrant_recursion_no_abort: "(begin (define (nest d) (if (= d 0) 0 (+ 1 (first (map (fn (x) (nest (- d 1))) (list 0)))))) (nest 1000))" => Value::int(1000),
+}
+
+// Task 7.1: VM/stdlib parity at the i64 boundary. Each case pins the same
+// literal oracle whether the operands flow through the inline `*_INT` VM fast
+// path (forced by `let`-binding the operands so they are runtime values, not
+// foldable constants) or the stdlib native `+`/`-`/`*` (direct literal call).
+// A divergence between the two arithmetic paths fails exactly one case.
+eval_tests! {
+    // i64::MAX + 1 overflows the fixnum path and promotes to a bignum.
+    boundary_add_max_direct: "(+ 9223372036854775807 1)" => common::eval("9223372036854775808"),
+    boundary_add_max_vm: "(let ((a 9223372036854775807) (b 1)) (+ a b))"
+        => common::eval("9223372036854775808"),
+    // i64::MIN - 1 underflows and promotes.
+    boundary_sub_min_direct: "(- -9223372036854775808 1)" => common::eval("-9223372036854775809"),
+    boundary_sub_min_vm: "(let ((a -9223372036854775808) (b 1)) (- a b))"
+        => common::eval("-9223372036854775809"),
+    // Multiplication overflow promotes: i64::MAX * 2.
+    boundary_mul_overflow_direct: "(* 9223372036854775807 2)" => common::eval("18446744073709551614"),
+    boundary_mul_overflow_vm: "(let ((a 9223372036854775807) (b 2)) (* a b))"
+        => common::eval("18446744073709551614"),
+    // Negating i64::MIN cannot fit in i64 (|MIN| = MAX+1) → promotes to bignum.
+    boundary_neg_min: "(- -9223372036854775808)" => common::eval("9223372036854775808"),
+    boundary_abs_min: "(abs -9223372036854775808)" => common::eval("9223372036854775808"),
+    // The just-past-i64 literal is a bignum that reads and compares exactly.
+    boundary_one_past_max_is_bignum: "(integer? 9223372036854775808)" => common::eval("#t"),
+    boundary_past_max_eq: "(= (+ 9223372036854775807 1) 9223372036854775808)" => common::eval("#t"),
+    // i64::MAX itself stays exact and fixnum-representable.
+    boundary_max_identity: "(+ 9223372036854775807 0)" => common::eval("9223372036854775807"),
+    boundary_min_identity_vm: "(let ((a -9223372036854775808) (b 0)) (+ a b))"
+        => common::eval("-9223372036854775808"),
+    // Exact/inexact mix at the boundary: any inexact operand makes it inexact,
+    // and the fixnum overflow path still yields the same float either way.
+    boundary_add_inexact_direct: "(+ 9223372036854775807 1.0)" => common::eval("9223372036854775808.0"),
+    boundary_add_inexact_vm: "(let ((a 9223372036854775807) (b 1.0)) (+ a b))"
+        => common::eval("9223372036854775808.0"),
+    // Round-trip: a bignum minus the same bignum returns to a fixnum zero.
+    boundary_round_trip_to_fixnum: "(- (+ 9223372036854775807 1) 9223372036854775808)"
+        => Value::int(0),
 }
 
 // ============================================================
@@ -1480,10 +1839,10 @@ fn vm_type_of_lambda_is_lambda() {
 // cleanly on both backends.
 // ---------------------------------------------------------------------------
 eval_error_tests! {
-    // STD-1
-    bit_shift_left_overflow: "(bit/shift-left 1 64)" => "shift",
+    // STD-1: negative shift counts still error. A shift count >= 64 is no
+    // longer an error (Task 5.8) — it now promotes to a bignum result, see
+    // `bit_shift_left_bignum`/`bit_shift_right_bignum` above.
     bit_shift_left_negative: "(bit/shift-left 1 -1)" => "shift",
-    bit_shift_right_overflow: "(bit/shift-right 1 64)" => "shift",
     bit_shift_right_negative: "(bit/shift-right 1 -1)" => "shift",
     // STD-2
     random_int_reversed_bounds: "(math/random-int 10 5)" => "math/random-int",

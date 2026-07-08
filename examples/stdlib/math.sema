@@ -37,23 +37,26 @@
 (println)
 
 ;; --- floor / ceil / ceiling / round / truncate ---
+;; Exactness-preserving (R7RS): a float argument rounds to a float, an exact
+;; rational/integer rounds to an exact integer. `round` uses banker's
+;; rounding (ties go to the nearest even integer).
 (println "floor / ceil / ceiling / round / truncate:")
-(println "  (floor 3.7)    => " (floor 3.7)) ;; => 3
-(println "  (floor -3.7)   => " (floor -3.7)) ;; => -4
-(println "  (ceil 3.2)     => " (ceil 3.2)) ;; => 4
-(println "  (ceil -3.2)    => " (ceil -3.2)) ;; => -3
-(println "  (ceiling 3.2)  => " (ceiling 3.2)) ;; => 4 (alias for ceil)
-(println "  (round 3.5)    => " (round 3.5)) ;; => 4
-(println "  (round 3.4)    => " (round 3.4)) ;; => 3
-(println "  (round -2.5)   => " (round -2.5)) ;; => -2 or -3
-(println "  (truncate 3.9) => " (truncate 3.9)) ;; => 3
-(println "  (truncate -3.9) => " (truncate -3.9)) ;; => -3
+(println "  (floor 3.7)    => " (floor 3.7)) ;; => 3.0
+(println "  (floor -3.7)   => " (floor -3.7)) ;; => -4.0
+(println "  (ceil 3.2)     => " (ceil 3.2)) ;; => 4.0
+(println "  (ceil -3.2)    => " (ceil -3.2)) ;; => -3.0
+(println "  (ceiling 3.2)  => " (ceiling 3.2)) ;; => 4.0 (alias for ceil)
+(println "  (round 3.5)    => " (round 3.5)) ;; => 4.0
+(println "  (round 3.4)    => " (round 3.4)) ;; => 3.0
+(println "  (round -2.5)   => " (round -2.5)) ;; => -2.0 (ties to even)
+(println "  (truncate 3.9) => " (truncate 3.9)) ;; => 3.0
+(println "  (truncate -3.9) => " (truncate -3.9)) ;; => -3.0
 (println "  (floor 5)      => " (floor 5)) ;; => 5 (int passthrough)
-(assert-eq (floor 3.7) 3 "(floor 3.7) = 3")
-(assert-eq (ceil 3.2) 4 "(ceil 3.2) = 4")
-(assert-eq (ceiling 3.2) 4 "(ceiling 3.2) = 4")
-(assert-eq (truncate 3.9) 3 "(truncate 3.9) = 3")
-(assert-eq (truncate -3.9) -3 "(truncate -3.9) = -3")
+(assert-eq (floor 3.7) 3.0 "(floor 3.7) = 3.0")
+(assert-eq (ceil 3.2) 4.0 "(ceil 3.2) = 4.0")
+(assert-eq (ceiling 3.2) 4.0 "(ceiling 3.2) = 4.0")
+(assert-eq (truncate 3.9) 3.0 "(truncate 3.9) = 3.0")
+(assert-eq (truncate -3.9) -3.0 "(truncate -3.9) = -3.0")
 (println)
 
 ;; --- sqrt ---

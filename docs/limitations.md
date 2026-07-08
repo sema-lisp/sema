@@ -82,10 +82,6 @@ We chose `try`/`catch`/`throw` over R7RS `guard`. The error map with `:type` key
 
 ## Low — Completeness Only
 
-### 16. No Full Numeric Tower
-
-Only `i64` and `f64`. No rationals (`1/3`), bignums, or complex numbers.
-
 ### ~~17. No Char Type~~ → RESOLVED
 
 Full character type: `#\a`, `#\space`, `#\newline` literals. `char?`, `char->integer`, `integer->char`, `char-alphabetic?`, `char-numeric?`, `char-whitespace?`, `char-upper-case?`, `char-lower-case?`, `char-upcase`, `char-downcase`, `char->string`, `string->char`, `string->list`, `list->string`. `string-ref` and `string/chars` now return `Char` values.
@@ -218,7 +214,6 @@ The last line is the footgun: `and` in head position is the special form, not th
 | #   | Gap                                      | Priority | Effort    | Notes                                                                        |
 | --- | ---------------------------------------- | -------- | --------- | ---------------------------------------------------------------------------- |
 | 15  | No `guard` (R7RS)                        | Low      | Low       | `try`/`catch` covers the use case; `guard` is syntactic sugar                |
-| 16  | No Full Numeric Tower                    | Low      | High      | Rationals/bignums require `num` crate integration throughout                 |
 | 18  | No Continuations                         | Low      | Very High | Requires CPS transform or VM rewrite; trampoline can't capture continuations |
 | 19  | No Multiple Return Values                | Low      | Medium    | `values`/`call-with-values` need eval changes                                |
 | 20  | No Dynamic Binding                       | Low      | Medium    | `parameterize`/`make-parameter` via thread-local state                       |

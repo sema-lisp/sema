@@ -10,6 +10,7 @@ pub mod json;
 pub mod mcp_cassette;
 pub mod net;
 pub mod num;
+pub mod number;
 pub mod output_hook;
 pub mod resolve;
 pub mod sandbox;

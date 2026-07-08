@@ -69,6 +69,9 @@ const VAL_VECTOR: u8 = 0x09;
 const VAL_MAP: u8 = 0x0A;
 const VAL_HASHMAP: u8 = 0x0B;
 const VAL_BYTEVECTOR: u8 = 0x0C;
+const VAL_BIGINT: u8 = 0x0D;
+const VAL_RATIONAL: u8 = 0x0E;
+const VAL_COMPLEX: u8 = 0x0F;
 
 const MAX_VALUE_DEPTH: usize = 128;
 
@@ -161,6 +164,27 @@ pub fn serialize_value(
             buf.push(VAL_BYTEVECTOR);
             buf.extend_from_slice(&len.to_le_bytes());
             buf.extend_from_slice(&bv);
+        }
+        ValueView::BigInt(n) => {
+            buf.push(VAL_BIGINT);
+            let bytes = n.to_signed_bytes_le();
+            let len = checked_u32(bytes.len(), "bigint byte length")?;
+            buf.extend_from_slice(&len.to_le_bytes());
+            buf.extend_from_slice(&bytes);
+        }
+        ValueView::Rational(r) => {
+            buf.push(VAL_RATIONAL);
+            for part in [r.numer(), r.denom()] {
+                let bytes = part.to_signed_bytes_le();
+                let len = checked_u32(bytes.len(), "rational part byte length")?;
+                buf.extend_from_slice(&len.to_le_bytes());
+                buf.extend_from_slice(&bytes);
+            }
+        }
+        ValueView::Complex(c) => {
+            buf.push(VAL_COMPLEX);
+            serialize_value(&Value::from_number(c.re.clone()), buf, stb)?;
+            serialize_value(&Value::from_number(c.im.clone()), buf, stb)?;
         }
         // Runtime-only types cannot appear in bytecode constant pools
         _ => {
@@ -362,6 +386,42 @@ fn deserialize_value_inner(
             let len = read_u32_le(buf, cursor)? as usize;
             let data = read_bytes(buf, cursor, len)?;
             Ok(Value::bytevector(data))
+        }
+        VAL_BIGINT => {
+            let len = read_u32_le(buf, cursor)? as usize;
+            let bytes = read_bytes(buf, cursor, len)?;
+            Ok(Value::from_bigint(
+                num_bigint::BigInt::from_signed_bytes_le(&bytes),
+            ))
+        }
+        VAL_RATIONAL => {
+            let read_part =
+                |buf: &[u8], cursor: &mut usize| -> Result<num_bigint::BigInt, SemaError> {
+                    let len = read_u32_le(buf, cursor)? as usize;
+                    let bytes = read_bytes(buf, cursor, len)?;
+                    Ok(num_bigint::BigInt::from_signed_bytes_le(&bytes))
+                };
+            let numer = read_part(buf, cursor)?;
+            let denom = read_part(buf, cursor)?;
+            if denom == num_bigint::BigInt::from(0) {
+                return Err(SemaError::eval("zero denominator in serialized rational"));
+            }
+            Ok(Value::rational(num_rational::BigRational::new(
+                numer, denom,
+            )))
+        }
+        VAL_COMPLEX => {
+            let re = deserialize_value_inner(buf, cursor, table, remap, depth + 1)?;
+            let im = deserialize_value_inner(buf, cursor, table, remap, depth + 1)?;
+            let (re, im) = (
+                re.as_number().ok_or_else(|| {
+                    SemaError::eval("non-numeric real part in serialized complex")
+                })?,
+                im.as_number().ok_or_else(|| {
+                    SemaError::eval("non-numeric imaginary part in serialized complex")
+                })?,
+            );
+            Ok(Value::complex(re, im))
         }
         _ => Err(SemaError::eval(format!(
             "unknown value tag in bytecode: 0x{tag:02x}"
@@ -826,7 +886,7 @@ pub fn remap_indices_to_spurs(code: &mut [u8], remap: &[Spur]) -> Result<(), Sem
 // ── File format constants ─────────────────────────────────────────
 
 const MAGIC: [u8; 4] = [0x00, b'S', b'E', b'M'];
-const FORMAT_VERSION: u16 = 4;
+const FORMAT_VERSION: u16 = 5;
 const SECTION_STRING_TABLE: u16 = 0x01;
 const SECTION_FUNCTION_TABLE: u16 = 0x02;
 const SECTION_MAIN_CHUNK: u16 = 0x03;
@@ -1419,6 +1479,55 @@ mod tests {
         assert!(idx > 0);
         let idx2 = builder.intern_spur(spur);
         assert_eq!(idx, idx2);
+    }
+
+    #[test]
+    fn bigint_constant_roundtrips() {
+        use num_bigint::BigInt;
+        use std::str::FromStr;
+        let n = BigInt::from_str("170141183460469231731687303715884105728").unwrap();
+        let val = sema_core::Value::from_bigint(n);
+        let mut stb = StringTableBuilder::default();
+        let mut buf = Vec::new();
+        serialize_value(&val, &mut buf, &mut stb).unwrap();
+        let table = stb.finish();
+        let remap = build_remap_table(&table);
+        let mut cursor = 0;
+        let back = deserialize_value(&buf, &mut cursor, &table, &remap).unwrap();
+        assert_eq!(back, val);
+        assert_eq!(cursor, buf.len());
+    }
+
+    #[test]
+    fn rational_constant_roundtrips() {
+        use num_bigint::BigInt;
+        use num_rational::BigRational;
+        let r = BigRational::new(BigInt::from(1), BigInt::from(3));
+        let val = sema_core::Value::rational(r);
+        let mut stb = StringTableBuilder::default();
+        let mut buf = Vec::new();
+        serialize_value(&val, &mut buf, &mut stb).unwrap();
+        let table = stb.finish();
+        let remap = build_remap_table(&table);
+        let mut cursor = 0;
+        let back = deserialize_value(&buf, &mut cursor, &table, &remap).unwrap();
+        assert_eq!(back, val);
+        assert_eq!(cursor, buf.len());
+    }
+
+    #[test]
+    fn complex_constant_roundtrips() {
+        use sema_core::number::SemaNumber;
+        let val = sema_core::Value::complex(SemaNumber::from_i64(3), SemaNumber::from_i64(4));
+        let mut stb = StringTableBuilder::default();
+        let mut buf = Vec::new();
+        serialize_value(&val, &mut buf, &mut stb).unwrap();
+        let table = stb.finish();
+        let remap = build_remap_table(&table);
+        let mut cursor = 0;
+        let back = deserialize_value(&buf, &mut cursor, &table, &remap).unwrap();
+        assert_eq!(back, val);
+        assert_eq!(cursor, buf.len());
     }
 
     #[test]

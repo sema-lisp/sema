@@ -89,9 +89,12 @@ pub struct Value(u64);
 //   Nil, Bool, Char, Symbol(Spur), Keyword(Spur), IntSmall(±2^44)
 //
 // Heap types (Rc pointer in 45-bit payload):
-//   IntBig, String, List, Vector, Map, HashMap, Lambda, Macro, NativeFn,
-//   Prompt, Message, Conversation, ToolDef, Agent, Thunk, Record, Bytevector,
-//   MultiMethod, Stream, F64Array, I64Array, AsyncPromise, Channel
+//   IntBig, BigInt, Rational, Complex, String, List, Vector, Map, HashMap,
+//   Lambda, Macro, NativeFn, Prompt, Message, Conversation, ToolDef, Agent,
+//   Thunk, Record, Bytevector, MultiMethod, Stream, F64Array, I64Array,
+//   AsyncPromise, Channel
+//   (IntBig = i64 too wide for the 45-bit immediate; BigInt/Rational/Complex
+//    are the numeric-tower types: arbitrary-precision int, exact ratio, complex)
 //
 // Pattern matching via val.view() → ValueView enum
 ```

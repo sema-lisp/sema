@@ -5,7 +5,7 @@ outline: [2, 3]
 # Bytecode File Format (`.semac`)
 
 ::: tip Versioned build artifact
-The `.semac` format is stable and used in production — `sema compile`, `sema disasm`, and `sema build` all rely on it, and a verifier guarantees untrusted files can be loaded safely. It is **versioned** (currently `4`): the header records the format version, and the loader requires an exact match, so a `.semac` is a build artifact tied to the Sema version that produced it rather than a long-term portable interchange format. When a format change bumps the version, recompile from source. See [Versioning Strategy](#versioning-strategy).
+The `.semac` format is stable and used in production — `sema compile`, `sema disasm`, and `sema build` all rely on it, and a verifier guarantees untrusted files can be loaded safely. It is **versioned** (currently `5`): the header records the format version, and the loader requires an exact match, so a `.semac` is a build artifact tied to the Sema version that produced it rather than a long-term portable interchange format. When a format change bumps the version, recompile from source. See [Versioning Strategy](#versioning-strategy).
 :::
 
 ## Overview
@@ -81,7 +81,7 @@ All multi-byte integers are **little-endian**. All strings are **UTF-8**.
 | Offset | Size | Field | Description |
 |--------|------|-------|-------------|
 | 0 | 4 | `magic` | `\x00SEM` (`0x00`, `0x53`, `0x45`, `0x4D`) |
-| 4 | 2 | `format_version` | Bytecode format version (currently `4`) |
+| 4 | 2 | `format_version` | Bytecode format version (currently `5`) |
 | 6 | 2 | `flags` | Bit flags (see below) |
 | 8 | 2 | `sema_major` | Sema version major that produced this file |
 | 10 | 2 | `sema_minor` | Sema version minor |
@@ -269,6 +269,9 @@ Each constant is serialized as a **type tag** (1 byte) followed by type-specific
 | `0x0A` | Map | 2 bytes: n_pairs (u16), then `n_pairs × 2` recursive SerializedValues (key, value alternating) |
 | `0x0B` | HashMap | Same as Map (`0x0A`) — tag distinguishes sorted vs hash map |
 | `0x0C` | Bytevector | 4 bytes: length (u32), then `length` raw bytes |
+| `0x0D` | BigInt | 4 bytes: byte-length (u32), then that many bytes of two's-complement little-endian magnitude (`num-bigint`'s `to_signed_bytes_le`) |
+| `0x0E` | Rational | Two `0x0D`-style parts (numerator, then denominator): each a 4-byte byte-length (u32) followed by that many bytes of two's-complement little-endian magnitude |
+| `0x0F` | Complex | Two nested SerializedValues (real part, then imaginary part); each component is itself an Int/BigInt/Rational/Float SerializedValue |
 
 ### Values That Cannot Appear in Bytecode
 
@@ -505,7 +508,7 @@ offset  bytes                      meaning
 ------  -----------------------    --------------------------------------------
 HEADER (24 bytes)
  0x00   00 53 45 4D                magic  "\x00SEM"
- 0x04   04 00                      format_version = 4
+ 0x04   05 00                      format_version = 5
  0x06   00 00                      flags = 0
  0x08   01 00                      sema major = 1   ┐
  0x0A   13 00                      sema minor = 19  ├ compiled by Sema 1.19.1
@@ -551,9 +554,9 @@ That is the whole format with nothing hidden: a 24-byte header, three length-pre
 
 ## Versioning Strategy
 
-- `format_version` started at `1` and increments on any breaking change to the binary format. Version `2` added `n_global_cache_slots` and the inline-cache operands; version `3` added per-function upvalue names to the debug metadata; version `4` (current) added per-function `local_scopes` (block-scope PC ranges) to the debug metadata.
+- `format_version` started at `1` and increments on any breaking change to the binary format. Version `2` added `n_global_cache_slots` and the inline-cache operands; version `3` added per-function upvalue names to the debug metadata; version `4` added per-function `local_scopes` (block-scope PC ranges) to the debug metadata; version `5` (current) added the `BigInt`/`Rational`/`Complex` constant tags (`0x0D`–`0x0F`) for the numeric tower.
 - `sema_major`/`sema_minor`/`sema_patch` record the compiler version for diagnostics
-- The loader requires an exact `format_version` match and refuses anything else with a clear error: `"unsupported bytecode format version 1 (expected 4). Recompile from source."`
+- The loader requires an exact `format_version` match and refuses anything else with a clear error: `"unsupported bytecode format version 1 (expected 5). Recompile from source."`
 - Within the same `format_version`, new section types can be added without breaking older loaders (unknown sections are skipped)
 
 ## Comparison with Other Languages

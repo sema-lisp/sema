@@ -15,16 +15,45 @@ Sema's numeric error behavior follows one rule, split by type:
 (/ 1.0 0)     ; => inf
 (/ -1.0 0)    ; => -inf
 (/ 0.0 0.0)   ; => NaN
-(sqrt -1)     ; => NaN
 (log 0)       ; => -inf
 (log -1)      ; => NaN
 (pow 0 0)     ; => 1
-(pow 2 -1)    ; => 0.5
+(pow 2 -1)    ; => 1/2
 ```
 
 This matches the hardware and mainstream numeric languages, so `NaN` propagates and `inf` accumulates rather than forcing error handling around every operation. If you need to reject these, test with `math/nan?` / `math/infinite?` explicitly.
 
-> **Integer overflow wraps** (two's-complement) — Sema does not yet have arbitrary-precision integers, so e.g. `(+ 9223372036854775807 1)` wraps to a negative number rather than raising or promoting. (See ADR #64.)
+> **No integer overflow** — Sema has a full numeric tower, so exact integer arithmetic never wraps. A result beyond `i64` range promotes to an arbitrary-precision bignum: `(+ 9223372036854775807 1)` → `9223372036854775808`, `(* 1000000000000 1000000000000)` → `1000000000000000000000000`. Exact division yields rationals (`(/ 1 3)` → `1/3`) and `(sqrt -1)` → `0+1i`. (See ADR #64 and the numeric-tower ADR.)
+
+## The Numeric Tower
+
+Sema implements the full R7RS **numeric tower**, a nested hierarchy of number types:
+
+```
+integer  ⊂  rational  ⊂  real  ⊂  complex
+```
+
+Every integer is a rational, every rational is real, every real is complex — so [`complex?`](/docs/stdlib/predicates#complex) is true for *every* number, and [`integer?`](/docs/stdlib/predicates#integer) is the narrowest test. Two independent axes describe a value: its **level** in the tower (integer / rational / real / complex) and its **exactness** (exact vs. inexact).
+
+- **Exact numbers** — integers (any size — they promote to bignums instead of overflowing), exact rationals like `1/3`, and complex numbers whose parts are both exact — carry no rounding error.
+- **Inexact numbers** — floats and any complex with a floating-point part — follow IEEE 754.
+- **Exactness contagion:** an operation is exact only when *all* its operands are exact; a single float makes the whole result inexact. This is why `(/ 1 3)` is the exact `1/3` but `(/ 1.0 3)` is `0.3333…`.
+
+### Literal grammar
+
+The reader parses each tower type directly, and every literal round-trips through print → read:
+
+| Form | Example | Reads as |
+| --- | --- | --- |
+| Rational | `1/3`, `3/6` (→ `1/2`) | exact ratio, reduced to lowest terms |
+| Complex (rectangular) | `3+4i`, `1.5+2.5i`, `3-4i` | real + imaginary part |
+| Pure imaginary | `+i`, `-i`, `2i`, `-2i` | `0 ± ni` |
+| Radix prefix | `#xFF` (255), `#o17` (15), `#b1010` (10), `#d42` | base 16 / 8 / 2 / 10 integer |
+| Exactness prefix | `#e1.5` (→ `3/2`), `#i1/2` (→ `0.5`) | force exact / inexact |
+| Combined | `#e#xFF`, `#x#eFF` | radix + exactness, either order |
+| Bignum | `99999999999999999999999999` | out-of-range integer literals become bignums |
+
+See the [reader internals](/docs/internals/reader#numeric-literals) for the full grammar.
 
 ## Basic Arithmetic
 
@@ -60,21 +89,23 @@ Multiply numbers together.
 
 ### `/`
 
-Divide numbers. Returns a float when the division is not exact (so `(/ 10 3)` is `3.3333...`, not `3`). For truncated integer division use [`math/quotient`](#math-quotient).
+Divide numbers. Exact-by-exact division is *exact*: it yields a reduced rational when the result is not a whole number (so `(/ 10 3)` is `10/3`, not `3.333…`), collapsing back to an integer when the denominator reduces to 1. A float operand makes the result a float (inexact contagion). For truncated integer division use [`quotient`](#quotient) (or its `math/quotient` alias).
 
 ```sema
 (/ 10 2)      ;; => 5
-(/ 10 3)      ;; => 3.3333333333333335
+(/ 10 3)      ;; => 10/3
+(/ 10 4)      ;; => 5/2
 (/ 10.0 3)    ;; => 3.3333333333333335
 ```
 
 ### `mod`
 
-Modulo (remainder after division).
+Modulo. On exact integers this is *floored* division — the result takes the sign of the **divisor**, per R7RS — so `(mod -7 2)` is `1`, not `-1`. (Float operands keep the IEEE truncated `%`, whose sign follows the dividend.) For the truncated integer counterpart whose sign follows the dividend, use [`remainder`](#remainder).
 
 ```sema
 (mod 10 3)    ; => 1
 (mod 7 2)     ; => 1
+(mod -7 2)    ; => 1
 ```
 
 ## Comparison
@@ -170,11 +201,12 @@ Raise a number to a power.
 
 ### `sqrt`
 
-Square root.
+Square root. The square root of an exact perfect square is returned *exactly* (`(sqrt 16)` is `4`, not `4.0`); otherwise the result is an inexact float. The square root of a negative number is complex.
 
 ```sema
-(sqrt 16)     ; => 4.0
-(sqrt 2)      ; => 1.4142...
+(sqrt 16)     ; => 4
+(sqrt 2)      ; => 1.4142135623730951
+(sqrt -1)     ; => 0+1i
 ```
 
 ### `log`
@@ -188,29 +220,32 @@ Natural logarithm.
 
 ### `floor`
 
-Round down to nearest integer.
+Round down toward negative infinity. **Exactness-preserving**: a float argument rounds to a float (`3.7` → `3.0`), while an exact rational rounds to an exact integer (`7/2` → `3`).
 
 ```sema
-(floor 3.7)   ; => 3
-(floor -2.3)  ; => -3
+(floor 3.7)   ; => 3.0
+(floor -2.3)  ; => -3.0
+(floor 7/2)   ; => 3
 ```
 
 ### `ceil`
 
-Round up to nearest integer.
+Round up toward positive infinity. Exactness-preserving, like `floor`.
 
 ```sema
-(ceil 3.2)    ; => 4
-(ceil -2.7)   ; => -2
+(ceil 3.2)    ; => 4.0
+(ceil -2.7)   ; => -2.0
+(ceil 7/2)    ; => 4
 ```
 
 ### `round`
 
-Round to nearest integer.
+Round to the nearest integer, ties to even (banker's rounding). Exactness-preserving: a float rounds to a float, an exact rational to an exact integer.
 
 ```sema
-(round 3.5)   ; => 4
-(round 3.4)   ; => 3
+(round 3.5)   ; => 4.0
+(round 3.4)   ; => 3.0
+(round 7/2)   ; => 4
 ```
 
 ### `math/round-to`
@@ -354,42 +389,231 @@ Base-2 logarithm.
 (math/log2 1024)   ; => 10.0
 ```
 
-## Integer Math
+## Integer Division
 
-### `math/gcd`
+These operate on exact integers, are **bignum-aware** (they promote past `i64` automatically), and raise on a zero divisor. Each has a slash-namespaced alias (`math/quotient`, `math/remainder`, `math/gcd`, `math/lcm`) that is the identical function.
 
-Greatest common divisor.
+### `quotient`
+
+Truncated integer division: `n ÷ d` rounded **toward zero**, so `(quotient -7 2)` is `-3` (not floored to `-4`), per R7RS. Alias: `math/quotient`.
 
 ```sema
-(math/gcd 12 8)    ; => 4
-(math/gcd 15 10)   ; => 5
+(quotient 10 3)   ; => 3
+(quotient -7 2)   ; => -3
+(quotient 100000000000000000000 7)  ; => 14285714285714285714
 ```
 
-### `math/lcm`
+### `remainder`
 
-Least common multiple.
+Remainder of truncated division: the result takes the sign of the **dividend** `n`. Pairs with `quotient` so that `(+ (* (quotient n d) d) (remainder n d))` reconstructs `n`. Contrast [`mod`](#mod), whose sign follows the divisor. Alias: `math/remainder`.
 
 ```sema
-(math/lcm 4 6)     ; => 12
-(math/lcm 3 5)     ; => 15
+(remainder 10 3)  ; => 1
+(remainder -7 2)  ; => -1
+(remainder 7 -2)  ; => 1
 ```
 
-### `math/quotient`
+### `gcd`
 
-Integer quotient (truncated division).
+Greatest common divisor — the largest non-negative integer dividing every argument. Variadic and sign-independent; `(gcd)` is `0`. Alias: `math/gcd`.
 
 ```sema
-(math/quotient 10 3)  ; => 3
-(math/quotient 7 2)   ; => 3
+(gcd 12 8)     ; => 4
+(gcd 15 10 25) ; => 5
+(gcd -12 8)    ; => 4
+(gcd)          ; => 0
 ```
 
-### `math/remainder`
+### `lcm`
 
-Remainder after truncated division.
+Least common multiple — the smallest non-negative integer every argument divides. Variadic and sign-independent; `0` if any argument is `0`; `(lcm)` is `1`. Alias: `math/lcm`.
 
 ```sema
-(math/remainder 10 3) ; => 1
-(math/remainder 7 2)  ; => 1
+(lcm 4 6)      ; => 12
+(lcm 2 3 4)    ; => 12
+(lcm 0 5)      ; => 0
+(lcm)          ; => 1
+```
+
+## Exactness & Rationals
+
+Utilities for moving between exact and inexact forms and for working with exact rationals. See [The Numeric Tower](#the-numeric-tower) for the underlying model.
+
+### `exact`
+
+Convert a number to its exact form. A finite float becomes the *exact* rational it actually represents (reduced, and normalized to an integer when the denominator is 1); already-exact numbers pass through. `inexact->exact` is the longer R7RS spelling.
+
+```sema
+(exact 0.5)       ; => 1/2
+(exact 2.0)       ; => 2
+(exact 1/3)       ; => 1/3
+(exact 3.14159)   ; => 3537115888337719/1125899906842624
+```
+
+The last result is exact but surprising: `3.14159` is not representable in binary, so `exact` returns the precise fraction the double stores. Use [`rationalize`](#rationalize) for a tidy approximation.
+
+### `inexact`
+
+Convert a number to inexact (floating-point) form — an exact rational becomes its nearest `f64`, and each part of a complex becomes a float. `exact->inexact` is the longer R7RS spelling.
+
+```sema
+(inexact 1/3)   ; => 0.3333333333333333
+(inexact 42)    ; => 42.0
+(inexact 3+4i)  ; => 3.0+4.0i
+```
+
+### `exact->inexact`
+
+R7RS spelling of [`inexact`](#inexact) — identical behavior.
+
+```sema
+(exact->inexact 1/3)   ; => 0.3333333333333333
+(exact->inexact 42)    ; => 42.0
+```
+
+### `inexact->exact`
+
+R7RS spelling of [`exact`](#exact) — identical behavior.
+
+```sema
+(inexact->exact 0.5)   ; => 1/2
+(inexact->exact 2.0)   ; => 2
+(inexact->exact 0.1)   ; => 3602879701896397/36028797018963968
+```
+
+`0.1` shows the caveat: it has no finite binary expansion, so its exact value is that large power-of-two fraction, not `1/10`.
+
+### `numerator`
+
+Numerator of an exact rational, taken in lowest terms (the sign lives on the numerator). An integer `n` is `n/1`. A float or complex argument raises a type error — convert with `exact` first.
+
+```sema
+(numerator 22/7)   ; => 22
+(numerator -6/4)   ; => -3
+(numerator 42)     ; => 42
+```
+
+### `denominator`
+
+Denominator of an exact rational, in lowest terms. An integer's denominator is `1`.
+
+```sema
+(denominator 22/7)   ; => 7
+(denominator -6/4)   ; => 2
+(denominator 42)     ; => 1
+```
+
+### `rationalize`
+
+Find the *simplest* rational within `tol` of `x` (smallest denominator in `[x-|tol|, x+|tol|]`), per R7RS. Exactness follows contagion: the result is exact only when **both** arguments are exact.
+
+```sema
+(rationalize 1/3 1/1000)            ; => 1/3
+(rationalize (exact 3.14159) 1/100) ; => 22/7
+(rationalize 3.14159 1/100)         ; => 3.142857142857143
+(rationalize 1/2 0.01)              ; => 0.5
+```
+
+The last two show contagion — an inexact `x` *or* an inexact `tol` gives an inexact (float) answer.
+
+### `exact-integer-sqrt`
+
+Exact integer square root of a non-negative integer. Returns a two-element list `(s r)` with `s = ⌊√n⌋` and `s*s + r = n`; exact even for bignums.
+
+```sema
+(exact-integer-sqrt 17)   ; => (4 1)
+(exact-integer-sqrt 100)  ; => (10 0)
+(exact-integer-sqrt 15241578750190521) ; => (123456789 0)
+```
+
+## Complex Numbers
+
+A complex number `a+bi` has a real and an imaginary part. A complex whose imaginary part is *exact* zero collapses to a real, so `real?` is true for `3+0i`. Polar conversions run through `sin`/`cos`/`atan2` in floating point, so [`make-polar`](#make-polar), [`magnitude`](#magnitude), and [`angle`](#angle) are always inexact.
+
+### `make-rectangular`
+
+Construct a complex from a real and an imaginary part. An *exact*-zero imaginary part collapses to the real; an *inexact* zero (`0.0`) stays complex.
+
+```sema
+(make-rectangular 3 4)     ; => 3+4i
+(make-rectangular 1/3 1/2) ; => 1/3+1/2i
+(make-rectangular 2 0)     ; => 2
+(make-rectangular 3 0.0)   ; => 3+0.0i
+```
+
+### `make-polar`
+
+Construct a complex from magnitude `r` and angle `θ` (radians): `r·cos θ + r·sin θ·i`. Always inexact.
+
+```sema
+(make-polar 2 0)                ; => 2.0+0.0i
+(make-polar 5 (math/atan2 3 4)) ; => 4.0+3.0i
+```
+
+### `real-part`
+
+Real part of a number (the number itself for a real). Preserves exactness.
+
+```sema
+(real-part 3+4i)   ; => 3
+(real-part 5i)     ; => 0
+(real-part 2.5)    ; => 2.5
+```
+
+### `imag-part`
+
+Imaginary part of a number (exact `0` for any real). Preserves exactness.
+
+```sema
+(imag-part 3+4i)   ; => 4
+(imag-part 5i)     ; => 5
+(imag-part 2.5)    ; => 0
+```
+
+### `magnitude`
+
+Magnitude (modulus, absolute value). For a complex `a+bi` this is `√(a²+b²)`, computed in floating point (so it is inexact); for a real it is the absolute value and preserves exactness.
+
+```sema
+(magnitude 3+4i)   ; => 5.0
+(magnitude -5)     ; => 5
+(magnitude 1/3)    ; => 1/3
+```
+
+### `angle`
+
+Angle (argument) of a complex in radians, in (-π, π]: `atan2(b, a)`. Always inexact — a positive real gives `0.0`, a negative real gives π.
+
+```sema
+(angle 3+4i)   ; => 0.9272952180016122
+(angle 5)      ; => 0.0
+(angle -5)     ; => 3.141592653589793
+```
+
+## Number ↔ String
+
+### `number->string`
+
+Render any number in the tower as a string. An optional radix of 2, 8, 10, or 16 selects the output base — but a non-decimal radix accepts only exact integers.
+
+```sema
+(number->string 42)     ; => "42"
+(number->string 1/3)    ; => "1/3"
+(number->string 3+4i)   ; => "3+4i"
+(number->string 255 16) ; => "ff"
+(number->string 5 2)    ; => "101"
+```
+
+### `string->number`
+
+Parse a string as a number, returning `#f` (never an error) on invalid input. The default radix 10 accepts the whole tower (integers, rationals, floats, complex); a radix of 2, 8, or 16 parses an integer in that base.
+
+```sema
+(string->number "42")    ; => 42
+(string->number "1/3")   ; => 1/3
+(string->number "3+4i")  ; => 3+4i
+(string->number "ff" 16) ; => 255
+(string->number "nope")  ; => #f
 ```
 
 ## Random Numbers
@@ -584,27 +808,30 @@ Alias for `mod`.
 
 ### `expt`
 
-Alias for `pow` (Scheme name for exponentiation).
+Alias for `pow` (Scheme name for exponentiation). With exact integer arguments the result is exact and bignum-aware — no overflow — and a negative exponent yields an exact rational.
 
 ```sema
-(expt 2 10)   ; => 1024
+(expt 2 10)    ; => 1024
+(expt 2 100)   ; => 1267650600228229401496703205376
+(expt 2 -1)    ; => 1/2
 ```
 
 ### `ceiling`
 
-Alias for `ceil`.
+Alias for `ceil` (exactness-preserving, so a float rounds to a float).
 
 ```sema
-(ceiling 3.2)  ; => 4
+(ceiling 3.2)  ; => 4.0
 ```
 
 ### `truncate`
 
-Truncate toward zero.
+Round toward zero (drop the fractional part). Exactness-preserving: a float truncates to a float, an exact rational to an exact integer.
 
 ```sema
-(truncate 3.7)  ; => 3
-(truncate -3.7) ; => -3
+(truncate 3.7)  ; => 3.0
+(truncate -3.7) ; => -3.0
+(truncate 7/2)  ; => 3
 ```
 
 ## Bitwise Operations

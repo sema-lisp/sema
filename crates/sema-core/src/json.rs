@@ -6,6 +6,7 @@
 
 use std::collections::BTreeMap;
 
+use crate::number::SemaNumber;
 use crate::{resolve, SemaError, Value, ValueView};
 
 /// Convert a Sema Value to a JSON value, erroring on NaN/Infinity and unsupported types.
@@ -19,6 +20,14 @@ pub fn value_to_json(val: &Value) -> Result<serde_json::Value, SemaError> {
         ValueView::Float(f) => serde_json::Number::from_f64(f)
             .map(serde_json::Value::Number)
             .ok_or_else(|| SemaError::eval("cannot encode NaN/Infinity as JSON")),
+        // JSON's number syntax permits arbitrary-precision integers: emit the
+        // bignum's decimal digits directly as a JSON number.
+        ValueView::BigInt(n) => bignum_to_json_number(n.to_string()),
+        // JSON has no rational or complex number form; emit the reader-
+        // round-trippable string form (`"1/3"`, `"3+4i"`) so encoding never fails.
+        ValueView::Rational(_) | ValueView::Complex(_) => {
+            Ok(serde_json::Value::String(val.to_string()))
+        }
         ValueView::String(s) => Ok(serde_json::Value::String(s.to_string())),
         ValueView::Keyword(s) => Ok(serde_json::Value::String(resolve(s))),
         ValueView::Symbol(s) => Ok(serde_json::Value::String(resolve(s))),
@@ -57,6 +66,16 @@ pub fn value_to_json_lossy(val: &Value) -> serde_json::Value {
         ValueView::Float(f) => serde_json::Number::from_f64(f)
             .map(serde_json::Value::Number)
             .unwrap_or(serde_json::Value::Null),
+        // JSON's number syntax permits arbitrary-precision integers: emit the
+        // bignum's decimal digits directly as a JSON number.
+        ValueView::BigInt(n) => {
+            bignum_to_json_number(n.to_string()).unwrap_or(serde_json::Value::Null)
+        }
+        // JSON has no rational or complex number form; emit the reader-
+        // round-trippable string form (`"1/3"`, `"3+4i"`).
+        ValueView::Rational(_) | ValueView::Complex(_) => {
+            serde_json::Value::String(val.to_string())
+        }
         ValueView::String(s) => serde_json::Value::String(s.to_string()),
         ValueView::Keyword(s) => serde_json::Value::String(resolve(s)),
         ValueView::Symbol(s) => serde_json::Value::String(resolve(s)),
@@ -81,6 +100,15 @@ pub fn value_to_json_lossy(val: &Value) -> serde_json::Value {
     })
 }
 
+/// Encode a bignum's decimal digit string as a raw JSON integer literal.
+/// Requires serde_json's `arbitrary_precision` feature so the digits survive
+/// the round-trip through `serde_json::Number` without collapsing to `f64`.
+fn bignum_to_json_number(digits: String) -> Result<serde_json::Value, SemaError> {
+    let n: serde_json::Number = serde_json::from_str(&digits)
+        .map_err(|e| SemaError::eval(format!("cannot encode bignum as JSON: {e}")))?;
+    Ok(serde_json::Value::Number(n))
+}
+
 /// Convert a JSON value to a Sema Value.
 pub fn json_to_value(json: &serde_json::Value) -> Value {
     match json {
@@ -89,6 +117,14 @@ pub fn json_to_value(json: &serde_json::Value) -> Value {
         serde_json::Value::Number(n) => {
             if let Some(i) = n.as_i64() {
                 Value::int(i)
+            } else if !n.is_f64() {
+                // An integer literal beyond i64 range: parse the exact decimal
+                // digits (preserved verbatim by serde_json's arbitrary_precision
+                // feature) into a bignum instead of losing precision to f64.
+                match SemaNumber::parse_int_radix(n.as_str(), 10) {
+                    Some(SemaNumber::Integer(big)) => Value::from_bigint(big),
+                    _ => n.as_f64().map(Value::float).unwrap_or_else(Value::nil),
+                }
             } else if let Some(f) = n.as_f64() {
                 Value::float(f)
             } else {
@@ -349,5 +385,37 @@ mod tests {
     fn test_key_to_string_int() {
         let s = key_to_string(&Value::int(42));
         assert_eq!(s, "42");
+    }
+
+    #[test]
+    fn test_bigint_encodes_as_raw_json_digits() {
+        // 2^127: well beyond i64/u64 range.
+        let digits = "170141183460469231731687303715884105728";
+        let big: num_bigint::BigInt = digits.parse().unwrap();
+        let val = Value::from_bigint(big);
+
+        let json = value_to_json(&val).unwrap();
+        assert!(json.is_number(), "expected a JSON number, got: {json}");
+        assert_eq!(serde_json::to_string(&json).unwrap(), digits);
+    }
+
+    #[test]
+    fn test_bigint_decodes_exactly_from_raw_json_digits() {
+        let digits = "170141183460469231731687303715884105728";
+        let json: serde_json::Value = serde_json::from_str(digits).unwrap();
+
+        let val = json_to_value(&json);
+
+        let big: num_bigint::BigInt = digits.parse().unwrap();
+        assert_eq!(val, Value::from_bigint(big));
+    }
+
+    #[test]
+    fn test_rational_encodes_as_quoted_string() {
+        let r = num_rational::BigRational::new(1.into(), 3.into());
+        let val = Value::rational(r);
+
+        let json = value_to_json(&val).unwrap();
+        assert_eq!(json, serde_json::Value::String("1/3".to_string()));
     }
 }

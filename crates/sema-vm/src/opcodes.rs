@@ -91,7 +91,7 @@ pub enum Op {
     IsNull,    // pop value, push #t if nil or empty list
     IsPair,    // pop value, push #t if non-empty list
     IsList,    // pop value, push #t if list
-    IsNumber,  // pop value, push #t if int or float
+    IsNumber,  // pop value, push #t if a tower number (int, bignum, or float)
     IsString,  // pop value, push #t if string
     IsSymbol,  // pop value, push #t if symbol
     Length,    // pop collection, push its length as int

@@ -40,7 +40,7 @@ This page defines the technical vocabulary used across Sema's documentation — 
 
 **Hygiene / variable capture** — variable capture is the bug where a binding a macro introduces accidentally shadows a user's same-named variable. Auto-gensym (`foo#`) and `gensym` produce unique symbols to prevent it, giving hygienic macros.
 
-**IEEE 754 float policy** — Sema's numeric rule split by type: integer division/modulo by zero raises an error, while floating point follows IEEE 754 (overflow and undefined results yield `inf`, `-inf`, or `NaN`). Integer overflow wraps two's-complement (no bignums). `math/nan?`/`math/infinite?` test the special floats; JSON/TOML cannot encode `NaN`/`Infinity`.
+**IEEE 754 float policy** — Sema's numeric rule split by type: integer division/modulo by zero raises an error, while floating point follows IEEE 754 (overflow and undefined results yield `inf`, `-inf`, or `NaN`). Exact integer arithmetic never wraps or overflows — a result beyond `i64` range promotes to an arbitrary-precision bignum (part of Sema's full numeric tower: bignums, exact rationals, and complex numbers). `math/nan?`/`math/infinite?` test the special floats; JSON/TOML cannot encode `NaN`/`Infinity`.
 
 **Keyword** — a colon-prefixed, self-evaluating identifier (e.g. `:name`, `:ok`), commonly a map key. Keywords double as accessor functions: `(:name m)` is equivalent to `(get m :name)`. Clojure-style; interned as a `Spur`. Also used as error `:type` tags and as the result of `(type x)`.
 

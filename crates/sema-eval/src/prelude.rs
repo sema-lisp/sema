@@ -574,6 +574,54 @@ pub const PRELUDE: &str = r#"
                                   (go# (+ n# 1) (* delay# wr-fac#)))))))))
          (go# 1 wr-base#)))))
 
+;; make-parameter: R7RS parameter object. Returns a variadic procedure closed
+;; over a mutable cell (the current value) and an optional converter.
+;;   (p)      -> current value
+;;   (p v)    -> SRFI-39 mutate: set the value to (converter v), return it
+;; The remaining two-arg forms are a private protocol used by `parameterize`
+;; to install/restore values without re-applying the converter on restore:
+;;   (p '__param-convert v) -> (converter v), no mutation (convert-only)
+;;   (p '__param-raw v)     -> set the value to v AS-IS, no conversion (raw set)
+;; Any non-'__param-convert first arg of a 2-arg call takes the raw-set path,
+;; but callers should use '__param-raw for clarity.
+;; (make-parameter 10 (lambda (x) (* x 2))) => a parameter whose value is always
+;; doubled on install; the converter runs once at (make-parameter) time too.
+(define (make-parameter init . rest)
+  (let* ((converter (if (null? rest) (lambda (x) x) (car rest)))
+         (value (converter init)))
+    (lambda (. args)
+      (cond
+        ((null? args) value)
+        ((null? (cdr args)) (set! value (converter (car args))) value)
+        ((eq? (car args) '__param-convert) (converter (cadr args)))
+        (else (set! value (cadr args)) value)))))
+
+;; __parameterize: engine behind the `parameterize` macro. Converts every new
+;; value BEFORE installing any of them (a throwing converter leaves every
+;; parameter untouched — atomic all-or-nothing), then installs, runs thunk,
+;; and restores the RAW old values (never re-converted) whether thunk returns
+;; normally or raises — mirroring the with-stream/with-retry catch-rethrow-
+;; then-restore idiom.
+(define (__parameterize params vals thunk)
+  (let ((news (map (lambda (p v) (p '__param-convert v)) params vals)))
+    (let ((olds (map (lambda (p) (p)) params)))
+      (map (lambda (p n) (p '__param-raw n)) params news)
+      (let ((res (try (thunk)
+                   (catch e
+                     (map (lambda (p o) (p '__param-raw o)) params olds)
+                     (throw e)))))
+        (map (lambda (p o) (p '__param-raw o)) params olds)
+        res))))
+
+;; parameterize: dynamically rebind parameters for the extent of body,
+;; restoring the prior value on exit (including on a raised condition).
+;; (parameterize ((p v) ...) body ...)
+(defmacro parameterize (bindings . body)
+  `(__parameterize
+     (list ,@(map car bindings))
+     (list ,@(map cadr bindings))
+     (fn () ,@body)))
+
 ;; async/spawn-all: spawn a list of zero-arg thunks as concurrent tasks and await
 ;; them all, returning results in INPUT order. The ergonomic form of the very common
 ;; `(async/all (map (fn (th) (async/spawn th)) thunks))`. Unbounded — every thunk gets

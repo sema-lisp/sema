@@ -265,6 +265,28 @@ eval_tests! {
 }
 
 // ============================================================
+// Guard (R7RS structured exception handling)
+// ============================================================
+
+eval_tests! {
+    guard_message_from_user_throw: r#"(guard (e ((keyword? (:type e)) (:message e))) (throw "boom"))"# => Value::string("\"boom\""),
+    guard_literal_true_test: "(guard (e (#t (:value e))) (throw 42))" => Value::int(42),
+    guard_else_fallback: "(guard (e ((equal? (:value e) :bad) :handled) (else :fallback)) (throw :other))" => Value::keyword("fallback"),
+    guard_body_no_condition: "(guard (e ((number? (:value e)) (+ 1 (:value e)))) 100)" => Value::int(100),
+    guard_nested_rethrow_wraps: r#"(try (guard (e ((equal? (:value e) 1) :inner)) (throw 2)) (catch outer (:value (:value outer))))"# => Value::int(2),
+    guard_native_error_caught: "(guard (e (else (string? (:message e)))) (/ 1 0))" => Value::bool(true),
+    guard_tail_position: "((lambda () (guard (e (else (:value e))) (throw 99))))" => Value::int(99),
+    guard_multi_clause_dispatch: "(guard (e ((equal? (:value e) 5) 'a) ((equal? (:value e) 6) 'b) (else 'c)) (throw 6))" => Value::symbol("b"),
+    guard_else_can_rethrow: r#"(try (guard (e (else (throw {:code 500}))) (throw {:code 400})) (catch o (:code (:value o))))"# => Value::int(500),
+}
+
+eval_error_tests! {
+    guard_no_match_reraises: "(guard (e ((equal? (:value e) 1) :one)) (throw 2))" => "2",
+    guard_empty_clauses_rethrow: "(guard (e) (throw 7))" => "7",
+    guard_type_dispatch_no_else_reraises: r#"(guard (e ((eq? (:type e) :user) (:value e))) (error "oops"))"# => "oops",
+}
+
+// ============================================================
 // Do Loop Edge Cases
 // ============================================================
 

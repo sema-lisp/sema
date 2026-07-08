@@ -29,7 +29,7 @@ The features that shell out to `sema` (LSP, DAP, MCP, run/format) need the `sema
 
 ## VS Code
 
-TextMate-grammar highlighting plus a full LSP client, a bundled debug adapter, an embedded notebook editor, and the Sema MCP server.
+TextMate-grammar highlighting plus a full LSP client, a debug adapter that runs `sema dap`, an embedded notebook editor, and the Sema MCP server.
 
 ### Install
 

@@ -1283,13 +1283,14 @@ fn test_http_post_wrong_arity() {
     assert_arity_error(r#"(http/post "https://httpbin.org/post")"#);
 }
 
-// Unknown method → error (http.rs line 31)
+// Any valid HTTP token method is accepted (QUERY/RFC 10008, OPTIONS, custom);
+// only a method with illegal characters errors — at build time, no request made.
 #[test]
-fn test_http_request_unknown_method() {
-    let err = eval_err(r#"(http/request "BOGUS" "https://httpbin.org/get")"#);
+fn test_http_request_invalid_method() {
+    let err = eval_err(r#"(http/request "BAD METHOD" "http://127.0.0.1:1/x")"#);
     assert!(
         matches!(err.inner(), SemaError::Eval(_)),
-        "expected Eval error for unknown method, got: {err}"
+        "expected Eval error for an invalid method token, got: {err}"
     );
 }
 

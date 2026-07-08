@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 1.29.0 — 2026-07-08
 
 ### Added
 
@@ -159,6 +159,20 @@
 
 ### Added
 
+- **HTTP client: binary bodies, downloads, and multipart uploads.** The request
+  body may now be a **bytevector** (sent as raw bytes); `{:as :bytes}` returns
+  the response `:body` as a bytevector (binary downloads — pair with
+  `file/write-bytes`); and `:multipart` in the options map sends a
+  `multipart/form-data` body for file uploads
+  (`{:name .. :content <string|bytevector> :filename ..? :content-type ..?}`).
+  This unblocks wrapping voice/media/document services (audio, images, PDF
+  upload/download) from Sema.
+- **HTTP QUERY method (RFC 10008)**, in both the client and the web server.
+  `http/query` sends a QUERY request (safe + idempotent like GET, with a body
+  like POST); `http/request` now accepts any valid method token (QUERY, OPTIONS,
+  …); and the router matches `:query` routes. The HTTP client tests no longer
+  depend on httpbin — they run against an in-process mock server and are no
+  longer `#[ignore]`d.
 - **Playground deep-links to examples via `?example=`.** Loading the playground
   with an `?example=` query param auto-opens that example, making a URL a
   shareable direct link to a specific example. The value accepts either the full

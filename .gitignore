@@ -91,3 +91,4 @@ index.db
 
 # sema web dev-server embedded browser runtime (vendored by `make web-runtime`)
 crates/sema/src/web/assets/
+.jake

@@ -15,6 +15,27 @@ fn http_shared_client() -> reqwest::Client {
     HTTP_SHARED_CLIENT.get_or_init(reqwest::Client::new).clone()
 }
 
+/// A decoded response body: text by default, or raw bytes when the caller asks
+/// for `{:as :bytes}` (audio/image/PDF downloads that must not go through a
+/// lossy UTF-8 decode). Both variants are `Send`, so they cross the I/O-pool
+/// boundary unchanged.
+enum HttpBody {
+    Text(String),
+    Bytes(Vec<u8>),
+}
+
+/// Whether the caller requested a raw-bytes response body (`{:as :bytes}`).
+fn opts_want_bytes(opts: Option<&Value>) -> bool {
+    opts.and_then(|o| o.as_map_rc())
+        .and_then(|m| m.get(&Value::keyword("as")).cloned())
+        .map(|v| match v.view() {
+            ValueView::Keyword(s) => sema_core::resolve(s) == "bytes",
+            ValueView::String(s) => s.as_ref() == "bytes",
+            _ => false,
+        })
+        .unwrap_or(false)
+}
+
 /// The response facts that cross the thread boundary back from the I/O pool
 /// to the VM thread. Only plain `Send` data — never a `Value`/`Rc`.
 /// Decoded into the same `Value` shape as the sync path on the VM thread.
@@ -22,7 +43,55 @@ fn http_shared_client() -> reqwest::Client {
 struct RawHttpResponse {
     status: u16,
     headers: Vec<(String, String)>,
-    body: String,
+    body: HttpBody,
+}
+
+/// Build a `multipart/form-data` body from a `:multipart` list. Each element is
+/// a map: `{:name "field" :content <string|bytevector> :filename "x.pdf"?
+/// :content-type "application/pdf"?}`. A `:filename` (or bytevector content)
+/// makes it a file part.
+#[cfg(not(target_arch = "wasm32"))]
+fn build_multipart(val: &Value) -> Result<reqwest::multipart::Form, SemaError> {
+    let parts = val
+        .as_seq()
+        .ok_or_else(|| SemaError::eval("http: :multipart must be a list of part maps"))?;
+    let mut form = reqwest::multipart::Form::new();
+    for part_val in parts {
+        let m = part_val
+            .as_map_rc()
+            .ok_or_else(|| SemaError::eval("http: each :multipart part must be a map"))?;
+        let name = m
+            .get(&Value::keyword("name"))
+            .and_then(|v| v.as_str().map(|s| s.to_string()))
+            .ok_or_else(|| SemaError::eval("http: a :multipart part is missing :name"))?;
+        let content = m.get(&Value::keyword("content")).ok_or_else(|| {
+            SemaError::eval(format!(
+                "http: :multipart part '{name}' is missing :content"
+            ))
+        })?;
+        let mut part = if let Some(bytes) = content.as_bytevector() {
+            reqwest::multipart::Part::bytes(bytes.to_vec())
+        } else if let Some(s) = content.as_str() {
+            reqwest::multipart::Part::text(s.to_string())
+        } else {
+            return Err(SemaError::eval(format!(
+                "http: :multipart part '{name}' :content must be a string or bytevector"
+            )));
+        };
+        if let Some(fname) = m.get(&Value::keyword("filename")).and_then(|v| v.as_str()) {
+            part = part.file_name(fname.to_string());
+        }
+        if let Some(ct) = m
+            .get(&Value::keyword("content-type"))
+            .and_then(|v| v.as_str())
+        {
+            part = part
+                .mime_str(ct)
+                .map_err(|e| SemaError::eval(format!("http: invalid :content-type '{ct}': {e}")))?;
+        }
+        form = form.part(name, part);
+    }
+    Ok(form)
 }
 
 /// Resolve the method/url/headers/body `Value`s into a fully-built
@@ -42,10 +111,16 @@ fn build_request(
         "DELETE" => client.delete(url),
         "PATCH" => client.patch(url),
         "HEAD" => client.head(url),
-        other => return Err(SemaError::eval(format!("http: unknown method {other}"))),
+        // Any other valid HTTP token method — QUERY (RFC 10008), OPTIONS, TRACE,
+        // or a bespoke one. `from_bytes` rejects illegal characters.
+        other => match reqwest::Method::from_bytes(other.as_bytes()) {
+            Ok(m) => client.request(m, url),
+            Err(_) => return Err(SemaError::eval(format!("http: invalid method {other}"))),
+        },
     };
 
     // Apply options
+    let mut multipart_val: Option<Value> = None;
     if let Some(opts_val) = opts {
         if let Some(opts_map) = opts_val.as_map_rc() {
             if let Some(headers_val) = opts_map.get(&Value::keyword("headers")) {
@@ -69,12 +144,24 @@ fn build_request(
                     builder = builder.timeout(Duration::from_millis(ms as u64));
                 }
             }
+            multipart_val = opts_map.get(&Value::keyword("multipart")).cloned();
         }
     }
 
-    // Apply body
+    // Body: multipart form takes precedence, then a bytevector (raw bytes), then
+    // a string (as-is), then a map (auto-JSON), else the value's printed form.
+    #[cfg(not(target_arch = "wasm32"))]
+    if let Some(mp) = multipart_val {
+        builder = builder.multipart(build_multipart(&mp)?);
+        return Ok(builder);
+    }
+    #[cfg(target_arch = "wasm32")]
+    let _ = &multipart_val;
+
     if let Some(body_val) = body {
-        if let Some(s) = body_val.as_str() {
+        if let Some(bytes) = body_val.as_bytevector() {
+            builder = builder.body(bytes.to_vec());
+        } else if let Some(s) = body_val.as_str() {
             builder = builder.body(s.to_string());
         } else if body_val.as_map_rc().is_some() {
             let json = sema_core::value_to_json_lossy(body_val);
@@ -92,17 +179,43 @@ fn build_request(
 }
 
 /// Decode the response facts (status/headers/body) into the Sema response
-/// `Value` map. Identical shape for the sync and async paths.
-fn build_response_value(status: u16, headers: &[(String, String)], body: &str) -> Value {
+/// `Value` map. Identical shape for the sync and async paths. `:body` is a
+/// string by default, or a bytevector when the request asked for `{:as :bytes}`.
+fn build_response_value(status: u16, headers: &[(String, String)], body: HttpBody) -> Value {
     let mut headers_map = BTreeMap::new();
     for (k, v) in headers {
         headers_map.insert(Value::keyword(k), Value::string(v));
     }
+    let body_val = match body {
+        HttpBody::Text(s) => Value::string(&s),
+        HttpBody::Bytes(b) => Value::bytevector(b),
+    };
     let mut result = BTreeMap::new();
     result.insert(Value::keyword("status"), Value::int(status as i64));
     result.insert(Value::keyword("headers"), Value::map(headers_map));
-    result.insert(Value::keyword("body"), Value::string(body));
+    result.insert(Value::keyword("body"), body_val);
     Value::map(result)
+}
+
+/// Read a reqwest response body as text or raw bytes per the caller's request.
+async fn read_http_body(
+    response: reqwest::Response,
+    want_bytes: bool,
+    ctx: &str,
+) -> Result<HttpBody, String> {
+    if want_bytes {
+        response
+            .bytes()
+            .await
+            .map(|b| HttpBody::Bytes(b.to_vec()))
+            .map_err(|e| format!("{ctx}: read body: {e}"))
+    } else {
+        response
+            .text()
+            .await
+            .map(HttpBody::Text)
+            .map_err(|e| format!("{ctx}: read body: {e}"))
+    }
 }
 
 fn http_request(
@@ -123,6 +236,7 @@ fn http_request(
     // Top-level (not in a scheduler task): the synchronous path. `io_block_on`
     // drives the round-trip ON THIS (VM) thread using THE pool's reactor —
     // observable behavior identical to a dedicated blocking runtime.
+    let want_bytes = opts_want_bytes(opts);
     let client = http_shared_client();
     sema_io::io_block_on(async {
         let builder = build_request(&client, method, url, body, opts)?;
@@ -139,12 +253,11 @@ fn http_request(
                 headers.push((k.as_str().to_string(), val.to_string()));
             }
         }
-        let body_text = response
-            .text()
+        let body = read_http_body(response, want_bytes, &format!("http {method} {url}"))
             .await
-            .map_err(|e| SemaError::Io(format!("http {method} {url}: read body: {e}")))?;
+            .map_err(SemaError::Io)?;
 
-        Ok(build_response_value(status, &headers, &body_text))
+        Ok(build_response_value(status, &headers, body))
     })
 }
 
@@ -170,6 +283,7 @@ fn http_request_async(
         return Ok(v);
     }
 
+    let want_bytes = opts_want_bytes(opts);
     let client = http_shared_client();
     let builder = build_request(&client, method, url, body, opts)?;
 
@@ -193,10 +307,12 @@ fn http_request_async(
                     headers.push((k.as_str().to_string(), val.to_string()));
                 }
             }
-            let body = response
-                .text()
-                .await
-                .map_err(|e| format!("http {method_owned} {url_owned}: read body: {e}"))?;
+            let body = read_http_body(
+                response,
+                want_bytes,
+                &format!("http {method_owned} {url_owned}"),
+            )
+            .await?;
             Ok(RawHttpResponse {
                 status,
                 headers,
@@ -219,7 +335,7 @@ fn http_request_async(
             Ok(Ok(raw)) => sema_core::IoPoll::Ready(Ok(build_response_value(
                 raw.status,
                 &raw.headers,
-                &raw.body,
+                raw.body,
             ))),
             Ok(Err(msg)) => sema_core::IoPoll::Ready(Err(msg)),
             Err(TryRecvError::Closed) => {
@@ -260,6 +376,18 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
         let body = &args[1];
         let opts = args.get(2);
         http_request("PUT", url, Some(body), opts)
+    });
+
+    // QUERY (RFC 10008): safe + idempotent like GET, but carries a request body
+    // like POST — for queries too large or structured for the URL.
+    crate::register_fn_gated(env, sandbox, Caps::NETWORK, "http/query", |args| {
+        check_arity!(args, "http/query", 2..=3);
+        let url = args[0]
+            .as_str()
+            .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
+        let body = &args[1];
+        let opts = args.get(2);
+        http_request("QUERY", url, Some(body), opts)
     });
 
     crate::register_fn_gated(env, sandbox, Caps::NETWORK, "http/delete", |args| {

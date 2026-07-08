@@ -12,8 +12,8 @@ section: "HTTP"
 Make an HTTP PUT request. Behaves identically to `http/post` — map bodies are auto-JSON-encoded.
 
 - **url** — string, the request URL
-- **body** — request body (string or map)
-- **opts** — optional map with `:headers` and/or `:timeout`
+- **body** — request body: a map (auto-JSON), string (as-is), or bytevector (raw bytes)
+- **opts** — optional map with `:headers`, `:timeout`, `:as` (`:text`/`:bytes`), and/or `:multipart`
 
 ```sema
 (http/put "https://api.example.com/users/42"

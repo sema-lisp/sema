@@ -14,8 +14,8 @@ Make an HTTP request with any method. Use this for methods not covered by the co
 
 - **method** — string, HTTP method (case-insensitive, converted to uppercase). Supported: `GET`, `POST`, `PUT`, `DELETE`, `PATCH`, `HEAD`
 - **url** — string, the request URL
-- **opts** — optional map with `:headers` and/or `:timeout`
-- **body** — optional request body (string or map)
+- **opts** — optional map with `:headers`, `:timeout`, `:as` (`:text` (default) or `:bytes` for a bytevector response body), and/or `:multipart` (a list of part maps for `multipart/form-data` uploads)
+- **body** — optional request body: a map (auto-JSON), string (as-is), or bytevector (raw bytes)
 
 ```sema
 ;; PATCH request

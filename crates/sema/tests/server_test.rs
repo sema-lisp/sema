@@ -2157,3 +2157,33 @@ fn test_http_serve_without_fallback_fails_on_taken_port() {
     occupier.kill().ok();
     occupier.wait().ok();
 }
+
+// ── QUERY method routing (RFC 10008) ───────────────────────────────────────
+// The router is a pure function, so QUERY dispatch is tested in-process without
+// binding a socket.
+
+#[test]
+fn test_router_query_method_routes() {
+    // A :query route matches a QUERY request and runs its handler.
+    let result = eval(
+        r#"
+        (let ((app (http/router (list (vector :query "/search"
+                     (fn (req) (http/ok {:method (str (:method req)) :body (:body req)})))))))
+          (:status (app {:method :query :path "/search" :body "q=hi"})))
+    "#,
+    );
+    assert_eq!(result, Value::int(200));
+}
+
+#[test]
+fn test_router_query_does_not_match_get() {
+    // A GET request must not fall into a :query route (distinct methods).
+    let result = eval(
+        r#"
+        (let ((app (http/router (list (vector :query "/search"
+                     (fn (req) (http/ok {:ok 1})))))))
+          (:status (app {:method :get :path "/search"})))
+    "#,
+    );
+    assert_eq!(result, Value::int(404));
+}

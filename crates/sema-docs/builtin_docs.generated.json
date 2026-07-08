@@ -2733,7 +2733,7 @@
       "examples": [
         "(http/delete \"https://api.example.com/users/42\"\n  {:headers {\"Authorization\" \"Bearer tok_abc123\"}})"
       ],
-      "body": "```\n(http/delete url)\n(http/delete url opts)\n```\n\nMake an HTTP DELETE request.\n\n- **url** — string, the request URL\n- **opts** — optional map with `:headers` and/or `:timeout`\n\n```sema\n(http/delete \"https://api.example.com/users/42\"\n  {:headers {\"Authorization\" \"Bearer tok_abc123\"}})\n```"
+      "body": "```\n(http/delete url)\n(http/delete url opts)\n```\n\nMake an HTTP DELETE request.\n\n- **url** — string, the request URL\n- **opts** — optional map with `:headers`, `:timeout`, and/or `:as` (`:text`/`:bytes`)\n\n```sema\n(http/delete \"https://api.example.com/users/42\"\n  {:headers {\"Authorization\" \"Bearer tok_abc123\"}})\n```"
     },
     {
       "name": "http/get",
@@ -2748,14 +2748,14 @@
         {
           "name": "opts",
           "type": "map",
-          "doc": "optional :headers/:timeout"
+          "doc": "optional :headers/:timeout/:as"
         }
       ],
       "returns": "map",
       "examples": [
-        ";; Simple GET\n(http/get \"https://httpbin.org/get\")\n\n;; GET with custom headers\n(http/get \"https://api.example.com/users\"\n  {:headers {:authorization \"Bearer my-token\"}})"
+        ";; Simple GET\n(http/get \"https://httpbin.org/get\")\n\n;; GET with custom headers\n(http/get \"https://api.example.com/users\"\n  {:headers {:authorization \"Bearer my-token\"}})\n\n;; Download binary data as a bytevector and save it\n(let ((resp (http/get \"https://example.com/image.png\" {:as :bytes})))\n  (file/write-bytes \"image.png\" (:body resp)))"
       ],
-      "body": "```\n(http/get url)\n(http/get url opts)\n```\n\nMake an HTTP GET request.\n\n- **url** — string, the request URL\n- **opts** — optional map with `:headers` and/or `:timeout`\n\n```sema\n;; Simple GET\n(http/get \"https://httpbin.org/get\")\n\n;; GET with custom headers\n(http/get \"https://api.example.com/users\"\n  {:headers {:authorization \"Bearer my-token\"}})\n```"
+      "body": "```\n(http/get url)\n(http/get url opts)\n```\n\nMake an HTTP GET request.\n\n- **url** — string, the request URL\n- **opts** — optional map with `:headers`, `:timeout`, and/or `:as` (`:text` (default) or `:bytes` to receive the response body as a bytevector — for binary downloads)\n\n```sema\n;; Simple GET\n(http/get \"https://httpbin.org/get\")\n\n;; GET with custom headers\n(http/get \"https://api.example.com/users\"\n  {:headers {:authorization \"Bearer my-token\"}})\n\n;; Download binary data as a bytevector and save it\n(let ((resp (http/get \"https://example.com/image.png\" {:as :bytes})))\n  (file/write-bytes \"image.png\" (:body resp)))\n```"
     },
     {
       "name": "http/post",
@@ -2763,9 +2763,9 @@
       "section": "HTTP",
       "summary": "Make an HTTP POST request.",
       "examples": [
-        ";; POST with a map body (auto-JSON-encoded)\n(http/post \"https://httpbin.org/post\"\n  {:name \"Ada\" :age 36})\n\n;; POST with string body and custom headers\n(http/post \"https://api.example.com/webhook\"\n  \"raw payload\"\n  {:headers {\"Content-Type\" \"text/plain\"}})\n\n;; POST with JSON body and auth\n(http/post \"https://api.example.com/users\"\n  {:name \"Ada\" :role \"admin\"}\n  {:headers {\"Authorization\" \"Bearer tok_abc123\"}\n   :timeout 10000})"
+        ";; POST with a map body (auto-JSON-encoded)\n(http/post \"https://httpbin.org/post\"\n  {:name \"Ada\" :age 36})\n\n;; POST with string body and custom headers\n(http/post \"https://api.example.com/webhook\"\n  \"raw payload\"\n  {:headers {\"Content-Type\" \"text/plain\"}})\n\n;; Upload raw bytes; receive the response body as a bytevector\n(http/post \"https://api.example.com/upload\"\n  (file/read-bytes \"photo.jpg\")\n  {:headers {\"Content-Type\" \"image/jpeg\"} :as :bytes})\n\n;; Multipart file upload (positional body ignored when :multipart is set)\n(http/post \"https://api.example.com/documents\"\n  {}\n  {:multipart (list\n     {:name \"purpose\" :content \"rag-ingest\"}\n     {:name \"file\" :filename \"report.pdf\"\n      :content (file/read-bytes \"report.pdf\")\n      :content-type \"application/pdf\"})})"
       ],
-      "body": "```\n(http/post url body)\n(http/post url body opts)\n```\n\nMake an HTTP POST request.\n\n- **url** — string, the request URL\n- **body** — request body: a string (sent as-is) or a map (auto-encoded as JSON with `Content-Type: application/json`)\n- **opts** — optional map with `:headers` and/or `:timeout`\n\n```sema\n;; POST with a map body (auto-JSON-encoded)\n(http/post \"https://httpbin.org/post\"\n  {:name \"Ada\" :age 36})\n\n;; POST with string body and custom headers\n(http/post \"https://api.example.com/webhook\"\n  \"raw payload\"\n  {:headers {\"Content-Type\" \"text/plain\"}})\n\n;; POST with JSON body and auth\n(http/post \"https://api.example.com/users\"\n  {:name \"Ada\" :role \"admin\"}\n  {:headers {\"Authorization\" \"Bearer tok_abc123\"}\n   :timeout 10000})\n```"
+      "body": "```\n(http/post url body)\n(http/post url body opts)\n```\n\nMake an HTTP POST request.\n\n- **url** — string, the request URL\n- **body** — request body: a map (auto-encoded as JSON with `Content-Type: application/json`), a string (sent as-is), or a bytevector (sent as raw bytes). Ignored when `:multipart` is set.\n- **opts** — optional map with `:headers`, `:timeout`, `:as` (`:text` (default) or `:bytes` for a bytevector response body), and/or `:multipart` (a list of `{:name .. :content <string|bytevector> :filename ..? :content-type ..?}` part maps for `multipart/form-data` uploads)\n\n```sema\n;; POST with a map body (auto-JSON-encoded)\n(http/post \"https://httpbin.org/post\"\n  {:name \"Ada\" :age 36})\n\n;; POST with string body and custom headers\n(http/post \"https://api.example.com/webhook\"\n  \"raw payload\"\n  {:headers {\"Content-Type\" \"text/plain\"}})\n\n;; Upload raw bytes; receive the response body as a bytevector\n(http/post \"https://api.example.com/upload\"\n  (file/read-bytes \"photo.jpg\")\n  {:headers {\"Content-Type\" \"image/jpeg\"} :as :bytes})\n\n;; Multipart file upload (positional body ignored when :multipart is set)\n(http/post \"https://api.example.com/documents\"\n  {}\n  {:multipart (list\n     {:name \"purpose\" :content \"rag-ingest\"}\n     {:name \"file\" :filename \"report.pdf\"\n      :content (file/read-bytes \"report.pdf\")\n      :content-type \"application/pdf\"})})\n```"
     },
     {
       "name": "http/put",
@@ -2775,7 +2775,18 @@
       "examples": [
         "(http/put \"https://api.example.com/users/42\"\n  {:name \"Ada Lovelace\" :role \"admin\"})"
       ],
-      "body": "```\n(http/put url body)\n(http/put url body opts)\n```\n\nMake an HTTP PUT request. Behaves identically to `http/post` — map bodies are auto-JSON-encoded.\n\n- **url** — string, the request URL\n- **body** — request body (string or map)\n- **opts** — optional map with `:headers` and/or `:timeout`\n\n```sema\n(http/put \"https://api.example.com/users/42\"\n  {:name \"Ada Lovelace\" :role \"admin\"})\n```"
+      "body": "```\n(http/put url body)\n(http/put url body opts)\n```\n\nMake an HTTP PUT request. Behaves identically to `http/post` — map bodies are auto-JSON-encoded.\n\n- **url** — string, the request URL\n- **body** — request body: a map (auto-JSON), string (as-is), or bytevector (raw bytes)\n- **opts** — optional map with `:headers`, `:timeout`, `:as` (`:text`/`:bytes`), and/or `:multipart`\n\n```sema\n(http/put \"https://api.example.com/users/42\"\n  {:name \"Ada Lovelace\" :role \"admin\"})\n```"
+    },
+    {
+      "name": "http/query",
+      "module": "http-json",
+      "section": "HTTP",
+      "summary": "Make an HTTP QUERY request ([RFC 10008](https://datatracker.ietf.org/doc/rfc10008/)). QUERY is safe and idempotent like `GET`, but carries a request body like `POST` — for queries too large or structured to fit in the URL. The server processes the enclosed content and returns the result.",
+      "examples": [
+        ";; Send a structured query in the body instead of the URL\n(let ((resp (http/query \"https://api.example.com/search\"\n              {:filter {:status \"active\"} :limit 50})))\n  (json/decode (:body resp)))",
+        "(http/router\n  (list (vector :query \"/search\"\n          (fn (req) (http/ok (run-search (json/decode (:body req))))))))"
+      ],
+      "body": "```\n(http/query url body)\n(http/query url body opts)\n```\n\nMake an HTTP QUERY request ([RFC 10008](https://datatracker.ietf.org/doc/rfc10008/)). QUERY is safe and idempotent like `GET`, but carries a request body like `POST` — for queries too large or structured to fit in the URL. The server processes the enclosed content and returns the result.\n\n- **url** — string, the request URL\n- **body** — request body: a map (auto-encoded as JSON), a string (sent as-is), or a bytevector (raw bytes)\n- **opts** — optional map with `:headers`, `:timeout`, and/or `:as` (`:text` (default) or `:bytes`)\n\n```sema\n;; Send a structured query in the body instead of the URL\n(let ((resp (http/query \"https://api.example.com/search\"\n              {:filter {:status \"active\"} :limit 50})))\n  (json/decode (:body resp)))\n```\n\nThe web server matches QUERY requests with a `:query` route:\n\n```sema\n(http/router\n  (list (vector :query \"/search\"\n          (fn (req) (http/ok (run-search (json/decode (:body req))))))))\n```"
     },
     {
       "name": "http/request",
@@ -2785,7 +2796,7 @@
       "examples": [
         ";; PATCH request\n(http/request \"PATCH\" \"https://api.example.com/users/42\"\n  {:headers {\"Content-Type\" \"application/json\"}}\n  {:name \"Updated Name\"})\n\n;; HEAD request (body will be empty)\n(define resp (http/request \"HEAD\" \"https://example.com\"))\n(:status resp)    ; => 200\n(:body resp)      ; => \"\""
       ],
-      "body": "```\n(http/request method url)\n(http/request method url opts)\n(http/request method url opts body)\n```\n\nMake an HTTP request with any method. Use this for methods not covered by the convenience functions (e.g., `PATCH`, `HEAD`).\n\n- **method** — string, HTTP method (case-insensitive, converted to uppercase). Supported: `GET`, `POST`, `PUT`, `DELETE`, `PATCH`, `HEAD`\n- **url** — string, the request URL\n- **opts** — optional map with `:headers` and/or `:timeout`\n- **body** — optional request body (string or map)\n\n```sema\n;; PATCH request\n(http/request \"PATCH\" \"https://api.example.com/users/42\"\n  {:headers {\"Content-Type\" \"application/json\"}}\n  {:name \"Updated Name\"})\n\n;; HEAD request (body will be empty)\n(define resp (http/request \"HEAD\" \"https://example.com\"))\n(:status resp)    ; => 200\n(:body resp)      ; => \"\"\n```"
+      "body": "```\n(http/request method url)\n(http/request method url opts)\n(http/request method url opts body)\n```\n\nMake an HTTP request with any method. Use this for methods not covered by the convenience functions (e.g., `PATCH`, `HEAD`).\n\n- **method** — string, HTTP method (case-insensitive, converted to uppercase). Supported: `GET`, `POST`, `PUT`, `DELETE`, `PATCH`, `HEAD`\n- **url** — string, the request URL\n- **opts** — optional map with `:headers`, `:timeout`, `:as` (`:text` (default) or `:bytes` for a bytevector response body), and/or `:multipart` (a list of part maps for `multipart/form-data` uploads)\n- **body** — optional request body: a map (auto-JSON), string (as-is), or bytevector (raw bytes)\n\n```sema\n;; PATCH request\n(http/request \"PATCH\" \"https://api.example.com/users/42\"\n  {:headers {\"Content-Type\" \"application/json\"}}\n  {:name \"Updated Name\"})\n\n;; HEAD request (body will be empty)\n(define resp (http/request \"HEAD\" \"https://example.com\"))\n(:status resp)    ; => 200\n(:body resp)      ; => \"\"\n```"
     },
     {
       "name": "json/decode",

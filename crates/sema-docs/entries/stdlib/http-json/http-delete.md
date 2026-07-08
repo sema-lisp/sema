@@ -12,7 +12,7 @@ section: "HTTP"
 Make an HTTP DELETE request.
 
 - **url** — string, the request URL
-- **opts** — optional map with `:headers` and/or `:timeout`
+- **opts** — optional map with `:headers`, `:timeout`, and/or `:as` (`:text`/`:bytes`)
 
 ```sema
 (http/delete "https://api.example.com/users/42"

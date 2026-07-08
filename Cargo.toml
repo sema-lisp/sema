@@ -21,28 +21,28 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "1.28.1"
+version = "1.29.0"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/sema-lisp/sema"
 homepage = "https://sema-lang.com"
 
 [workspace.dependencies]
-sema-core = { version = "=1.28.1", path = "crates/sema-core" }
-sema-io = { version = "=1.28.1", path = "crates/sema-io" }
-sema-reader = { version = "=1.28.1", path = "crates/sema-reader" }
-sema-eval = { version = "=1.28.1", path = "crates/sema-eval" }
-sema-llm = { version = "=1.28.1", path = "crates/sema-llm" }
-sema-stdlib = { version = "=1.28.1", path = "crates/sema-stdlib" }
-sema-vm = { version = "=1.28.1", path = "crates/sema-vm" }
-sema-fmt = { version = "=1.28.1", path = "crates/sema-fmt" }
-sema-lsp = { version = "=1.28.1", path = "crates/sema-lsp" }
-sema-dap = { version = "=1.28.1", path = "crates/sema-dap" }
-sema-notebook = { version = "=1.28.1", path = "crates/sema-notebook" }
-sema-docs = { version = "=1.28.1", path = "crates/sema-docs" }
-sema-mcp = { version = "=1.28.1", path = "crates/sema-mcp" }
-sema-otel = { version = "=1.28.1", path = "crates/sema-otel" }
-sema-workflow = { version = "=1.28.1", path = "crates/sema-workflow" }
+sema-core = { version = "=1.29.0", path = "crates/sema-core" }
+sema-io = { version = "=1.29.0", path = "crates/sema-io" }
+sema-reader = { version = "=1.29.0", path = "crates/sema-reader" }
+sema-eval = { version = "=1.29.0", path = "crates/sema-eval" }
+sema-llm = { version = "=1.29.0", path = "crates/sema-llm" }
+sema-stdlib = { version = "=1.29.0", path = "crates/sema-stdlib" }
+sema-vm = { version = "=1.29.0", path = "crates/sema-vm" }
+sema-fmt = { version = "=1.29.0", path = "crates/sema-fmt" }
+sema-lsp = { version = "=1.29.0", path = "crates/sema-lsp" }
+sema-dap = { version = "=1.29.0", path = "crates/sema-dap" }
+sema-notebook = { version = "=1.29.0", path = "crates/sema-notebook" }
+sema-docs = { version = "=1.29.0", path = "crates/sema-docs" }
+sema-mcp = { version = "=1.29.0", path = "crates/sema-mcp" }
+sema-otel = { version = "=1.29.0", path = "crates/sema-otel" }
+sema-workflow = { version = "=1.29.0", path = "crates/sema-workflow" }
 
 tower-lsp = "0.20"
 dashmap = "6"

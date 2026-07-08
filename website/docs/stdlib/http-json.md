@@ -20,7 +20,7 @@ All HTTP functions return a map with three keys:
 |------------|--------|------------------------------------------------------|
 | `:status`  | int    | HTTP status code (e.g., `200`, `404`, `500`)         |
 | `:headers` | map    | Response headers as keyword-keyed map                |
-| `:body`    | string | Response body as a raw string                        |
+| `:body`    | string \| bytevector | Response body — a string by default, or a bytevector with `{:as :bytes}` |
 
 ```sema
 (define resp (http/get "https://httpbin.org/get"))
@@ -30,16 +30,18 @@ All HTTP functions return a map with three keys:
 (:body resp)      ; => "{\"args\": {}, ...}"
 ```
 
-Headers are returned with keyword keys derived from the header name (e.g., `Content-Type` becomes `:content-type`). The body is always a raw string — use `json/decode` to parse JSON responses.
+Headers are returned with keyword keys derived from the header name (e.g., `Content-Type` becomes `:content-type`). The body is a raw string by default — use `json/decode` to parse JSON responses, or `{:as :bytes}` to get a bytevector for binary downloads (see [Binary bodies & downloads](#binary-bodies-downloads)).
 
 ### Options Map
 
 The `http/get`, `http/post`, `http/put`, `http/delete`, and `http/request` functions accept an optional **options map** with the following keys:
 
-| Key        | Type | Description                                         |
-|------------|------|-----------------------------------------------------|
-| `:headers` | map  | Request headers (string or keyword keys both work)  |
-| `:timeout` | int  | Request timeout in milliseconds                     |
+| Key          | Type | Description                                                              |
+|--------------|------|--------------------------------------------------------------------------|
+| `:headers`   | map  | Request headers (string or keyword keys both work)                       |
+| `:timeout`   | int  | Request timeout in milliseconds                                          |
+| `:as`        | keyword | Response body decoding: `:text` (default) or `:bytes` (a bytevector)  |
+| `:multipart` | list | Send a `multipart/form-data` body (file uploads) — see [Multipart & file uploads](#multipart-file-uploads) |
 
 ```sema
 ;; Custom headers and timeout
@@ -47,6 +49,55 @@ The `http/get`, `http/post`, `http/put`, `http/delete`, and `http/request` funct
   {:headers {"Authorization" "Bearer tok_abc123"
              "Accept" "application/json"}
    :timeout 5000})
+```
+
+### Binary bodies & downloads
+
+The request **body** may be a **bytevector** to send raw bytes (a binary
+upload); it's sent verbatim with no JSON encoding. Set your own
+`Content-Type` header if the server needs one.
+
+Pass `{:as :bytes}` to receive the response `:body` as a **bytevector** instead
+of a string — required for binary payloads (audio, images, PDFs) that would be
+corrupted by UTF-8 text decoding. Pair with `file/write-bytes` to save a
+download.
+
+```sema
+;; Download binary data and save it to disk
+(let ((resp (http/get "https://api.example.com/audio.mp3" {:as :bytes})))
+  (file/write-bytes "out.mp3" (:body resp)))
+
+;; Upload raw bytes (e.g. an image read from disk)
+(http/post "https://api.example.com/upload"
+  (file/read-bytes "photo.jpg")
+  {:headers {"Content-Type" "image/jpeg"}})
+```
+
+### Multipart & file uploads
+
+Set `:multipart` in the options map to a **list of part maps** to send a
+`multipart/form-data` body. Each part is `{:name "..." :content ...}` plus
+optional `:filename` and `:content-type`. A `:filename` (or bytevector content)
+marks the part as an uploaded file. When `:multipart` is present the positional
+`body` is ignored.
+
+| Part key        | Type                  | Description                                    |
+|-----------------|-----------------------|------------------------------------------------|
+| `:name`         | string (required)     | The form field name                            |
+| `:content`      | string \| bytevector  | The field value or file bytes (required)       |
+| `:filename`     | string (optional)     | Upload as a file with this name                |
+| `:content-type` | string (optional)     | MIME type for the part                         |
+
+```sema
+;; Upload a file alongside a text field
+(http/post "https://api.example.com/documents"
+  {}    ; positional body ignored when :multipart is set
+  {:headers {"Authorization" "Bearer tok_abc123"}
+   :multipart (list
+     {:name "purpose"  :content "rag-ingest"}
+     {:name "file"     :filename "report.pdf"
+      :content (file/read-bytes "report.pdf")
+      :content-type "application/pdf"})})
 ```
 
 ### `http/get`
@@ -59,7 +110,7 @@ The `http/get`, `http/post`, `http/put`, `http/delete`, and `http/request` funct
 Make an HTTP GET request.
 
 - **url** — string, the request URL
-- **opts** — optional map with `:headers` and/or `:timeout`
+- **opts** — optional [options map](#options-map): `:headers`, `:timeout`, `:as` (`:text`/`:bytes`), `:multipart`
 
 ```sema
 ;; Simple GET
@@ -80,8 +131,8 @@ Make an HTTP GET request.
 Make an HTTP POST request.
 
 - **url** — string, the request URL
-- **body** — request body: a string (sent as-is) or a map (auto-encoded as JSON with `Content-Type: application/json`)
-- **opts** — optional map with `:headers` and/or `:timeout`
+- **body** — request body: a map (auto-encoded as JSON with `Content-Type: application/json`), a string (sent as-is), or a bytevector (sent as raw bytes). Ignored when `:multipart` is set.
+- **opts** — optional [options map](#options-map): `:headers`, `:timeout`, `:as` (`:text`/`:bytes`), `:multipart`
 
 ```sema
 ;; POST with a map body (auto-JSON-encoded)
@@ -111,7 +162,7 @@ Make an HTTP PUT request. Behaves identically to `http/post` — map bodies are 
 
 - **url** — string, the request URL
 - **body** — request body (string or map)
-- **opts** — optional map with `:headers` and/or `:timeout`
+- **opts** — optional [options map](#options-map): `:headers`, `:timeout`, `:as` (`:text`/`:bytes`), `:multipart`
 
 ```sema
 (http/put "https://api.example.com/users/42"
@@ -128,7 +179,7 @@ Make an HTTP PUT request. Behaves identically to `http/post` — map bodies are 
 Make an HTTP DELETE request.
 
 - **url** — string, the request URL
-- **opts** — optional map with `:headers` and/or `:timeout`
+- **opts** — optional [options map](#options-map): `:headers`, `:timeout`, `:as` (`:text`/`:bytes`), `:multipart`
 
 ```sema
 (http/delete "https://api.example.com/users/42"
@@ -147,7 +198,7 @@ Make an HTTP request with any method. Use this for methods not covered by the co
 
 - **method** — string, HTTP method (case-insensitive, converted to uppercase). Supported: `GET`, `POST`, `PUT`, `DELETE`, `PATCH`, `HEAD`
 - **url** — string, the request URL
-- **opts** — optional map with `:headers` and/or `:timeout`
+- **opts** — optional [options map](#options-map): `:headers`, `:timeout`, `:as` (`:text`/`:bytes`), `:multipart`
 - **body** — optional request body (string or map)
 
 ```sema

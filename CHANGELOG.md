@@ -1,6 +1,6 @@
 # Changelog
 
-## 1.29.0 — 2026-07-08
+## Unreleased
 
 ### Added
 
@@ -33,6 +33,18 @@
     and `numerator`/`denominator` all operate across the whole tower. Bitwise ops
     are bignum-aware (two's-complement via `BigInt`), and JSON encodes bignums
     natively (rationals/complex as strings).
+
+### Changed
+
+- **Bytecode format version is now `5`** (was `4`): the constant pool gains
+  `BigInt`/`Rational`/`Complex` tags (`0x0D`–`0x0F`) for the numeric tower.
+  Breaking for `.semac` artifacts — recompile from source.
+- **Integer overflow promotes to a bignum instead of raising.** The catchable
+  "integer overflow" error that 1.29.0 introduced for `+`/`-`/`*`/`expt` is
+  gone; those operations now return the exact value (see the numeric tower
+  above).
+
+## 1.29.0 — 2026-07-08
 
 ### Changed
 
@@ -91,11 +103,11 @@
   stack on demand (`sema_core::stack::maybe_grow`, via `stacker`; a plain call
   on wasm), so deep-but-finite work completes and true runaways still hit the
   catchable frame guard.
-- **Integer overflow no longer silently wraps to a wrong number.** `+`, `-`,
-  `*`, and `expt` on i64 previously wrapped on overflow; they now promote to an
-  arbitrary-precision bignum via the numeric tower (see Added above), so the
-  result is always mathematically correct. `expt` also no longer truncates its
-  exponent (`(expt 2 4294967296)` was computing 2^0).
+- **Integer overflow raises instead of silently wrapping.** `+`, `-`, `*`, and
+  `expt` on i64 now return a catchable "integer overflow" error (checked
+  arithmetic in the stdlib, VM, and constant folder) rather than wrapping to a
+  wrong number — consistent with `abs` on `i64::MIN`. `expt` also no longer
+  truncates its exponent (`(expt 2 4294967296)` was computing 2^0).
 - **Int↔float comparison is exact above 2^53.** `=`/`<`/`>`/`<=`/`>=` between an
   int and a float compared via a lossy `as f64` cast, so e.g.
   `(= 9007199254740993 9007199254740992.0)` was `#t`. They now compare exactly.

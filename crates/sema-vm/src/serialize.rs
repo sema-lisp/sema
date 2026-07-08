@@ -886,7 +886,7 @@ pub fn remap_indices_to_spurs(code: &mut [u8], remap: &[Spur]) -> Result<(), Sem
 // ── File format constants ─────────────────────────────────────────
 
 const MAGIC: [u8; 4] = [0x00, b'S', b'E', b'M'];
-const FORMAT_VERSION: u16 = 4;
+const FORMAT_VERSION: u16 = 5;
 const SECTION_STRING_TABLE: u16 = 0x01;
 const SECTION_FUNCTION_TABLE: u16 = 0x02;
 const SECTION_MAIN_CHUNK: u16 = 0x03;

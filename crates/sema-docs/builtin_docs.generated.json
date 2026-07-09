@@ -1216,6 +1216,33 @@
       "body": "Push a temporary context frame for the duration of a thunk. The frame is automatically popped when the thunk completes — even if it raises an error.\n\n```sema\n(context/set :env \"production\")\n\n(context/with {:env \"staging\" :debug #t}\n  (lambda ()\n    (context/get :env)      ; => \"staging\"\n    (context/get :debug)))  ; => #t\n\n(context/get :env)    ; => \"production\" (restored)\n(context/get :debug)  ; => nil (gone)\n```\n\nScopes nest naturally — inner values shadow outer ones:\n\n```sema\n(context/set :a 1)\n(context/with {:b 2}\n  (lambda ()\n    (context/with {:c 3}\n      (lambda ()\n        (list (context/get :a) (context/get :b) (context/get :c))))))\n; => (1 2 3)\n```\n\nValues set with `context/set` inside a `context/with` block are written to the inner frame and discarded when the scope exits. If you need a value to persist, set it before entering `context/with`."
     },
     {
+      "name": "make-parameter",
+      "module": "control-flow",
+      "summary": "R7RS parameter object constructor. `(make-parameter init)` / `(make-parameter init converter)` returns a **parameter** — a zero-argument procedure that returns its current value. `converter`, if given, is applied to `init` immediately and to every value `parameterize` (or a direct mutating call) later installs; it runs exactly once per install, never on restore.",
+      "params": [
+        {
+          "name": "init",
+          "type": "any"
+        },
+        {
+          "name": "converter",
+          "type": "procedure",
+          "doc": "optional; defaults to identity"
+        }
+      ],
+      "returns": "procedure",
+      "see_also": [
+        "parameterize"
+      ],
+      "examples": [
+        "(define radix (make-parameter 10))\n\n(radix)\n;; => 10",
+        "(define scale (make-parameter 1 (lambda (x) (* x 2))))\n\n(scale)\n;; => 2 (converter already applied to init)",
+        "(define mode (make-parameter :normal))\n\n(mode :debug)\n(mode)\n;; => :debug",
+        "(parameterize ((radix 16))\n  (radix))\n;; => 16\n\n(radix)\n;; => 10 (restored)"
+      ],
+      "body": "R7RS parameter object constructor. `(make-parameter init)` / `(make-parameter init converter)` returns a **parameter** — a zero-argument procedure that returns its current value. `converter`, if given, is applied to `init` immediately and to every value `parameterize` (or a direct mutating call) later installs; it runs exactly once per install, never on restore.\n\n```sema\n(define radix (make-parameter 10))\n\n(radix)\n;; => 10\n```\n\n```sema\n(define scale (make-parameter 1 (lambda (x) (* x 2))))\n\n(scale)\n;; => 2 (converter already applied to init)\n```\n\nCalling a parameter with one argument mutates it directly (SRFI-39 style), converting the new value:\n\n```sema\n(define mode (make-parameter :normal))\n\n(mode :debug)\n(mode)\n;; => :debug\n```\n\nFor a *dynamically scoped* rebinding that restores automatically — including across a raised condition — use `parameterize` instead of mutating a parameter directly:\n\n```sema\n(parameterize ((radix 16))\n  (radix))\n;; => 16\n\n(radix)\n;; => 10 (restored)\n```\n\n**Note:** `make-parameter` is defined in the prelude and does not require an import. A parameter object is an ordinary closure over a mutable cell, so it is captured, passed, and garbage-collected like any other procedure.\n\nSee also: `parameterize`."
+    },
+    {
       "name": "conversation/add-message",
       "module": "conversation",
       "summary": "Append a message with the given role to the conversation **without calling the model**, returning a new conversation. Role must be `:system`, `:user`, `:assistant`, or `:tool`. Use it to seed a conversation with prior turns, inject a synthetic assistant message, or replay a saved transcript — anywhere you want to grow the history but not pay for an LLM call. Contrast with `conversation/say`, which appends a user message *and* the model's generated reply.",
@@ -3087,6 +3114,19 @@
       "body": "Compositions of `car` and `cdr`. Available: `caar`, `cadr`, `cdar`, `cddr`, `caaar`, `caadr`, `cadar`, `caddr`, `cdaar`, `cdadr`, `cddar`, `cdddr`.\n\n```sema\n(cadr '(1 2 3))    ; => 2\n(caddr '(1 2 3))   ; => 3\n```"
     },
     {
+      "name": "call-with-values",
+      "module": "lists",
+      "section": "Multiple Values",
+      "summary": "Call the zero-argument `producer` thunk, then apply `consumer` to whatever it produced. If `producer` returned a bundle from `values` (zero or two-or-more values), each becomes a separate argument to `consumer`; an ordinary single value (including a plain, non-`values` return) is passed as `consumer`'s one argument.",
+      "returns": "any",
+      "examples": [
+        "(call-with-values (lambda () (values 1 2)) +)          ; => 3\n(call-with-values (lambda () (values 1 2 3)) list)      ; => (1 2 3)\n(call-with-values (lambda () 42) list)                  ; => (42)   ; single value, not spread\n(call-with-values (lambda () (values)) (lambda () 99))  ; => 99     ; zero values, zero-arg consumer",
+        "(call-with-values (lambda () (values 1 2)) (lambda (x) x))\n;; Arity error: <lambda> expects 1 args, got 2"
+      ],
+      "body": "Call the zero-argument `producer` thunk, then apply `consumer` to whatever it produced. If `producer` returned a bundle from `values` (zero or two-or-more values), each becomes a separate argument to `consumer`; an ordinary single value (including a plain, non-`values` return) is passed as `consumer`'s one argument.\n\n```sema\n(call-with-values (lambda () (values 1 2)) +)          ; => 3\n(call-with-values (lambda () (values 1 2 3)) list)      ; => (1 2 3)\n(call-with-values (lambda () 42) list)                  ; => (42)   ; single value, not spread\n(call-with-values (lambda () (values)) (lambda () 99))  ; => 99     ; zero values, zero-arg consumer\n```\n\nIf the number of produced values doesn't match `consumer`'s arity, the call fails with the ordinary lambda-arity error (R7RS's \"wrong number of values\"):\n\n```sema\n(call-with-values (lambda () (values 1 2)) (lambda (x) x))\n;; Arity error: <lambda> expects 1 args, got 2\n```\n\nAn error thrown by `producer` (or by `consumer`) propagates normally — `call-with-values` does not catch or swallow it.\n\n`let-values` and `let*-values` are the binding-form sugar built on top of `call-with-values`; reach for those directly when you just want local names bound to the produced values.\n\n**Note:** because `producer`/`consumer` are invoked through the same native dispatch as `apply`, a call across this boundary is not a true VM tail call — deep recursion written through `call-with-values` won't get the same tail-call optimization as a plain named-let.\n\n**See also:** `values` (produce the values), `apply` (spread a list's elements as arguments), `let-values`/`let*-values` (binding-form sugar).",
+      "syntax": "(call-with-values producer consumer)"
+    },
+    {
       "name": "car",
       "module": "lists",
       "section": "Construction & Access",
@@ -4190,6 +4230,19 @@
         "(tap 42 (fn (x) (println x)))   ; prints 42, returns 42\n\n(-> (range 5)\n    (tap (fn (xs) (println \"got:\" xs)))   ; logs (0 1 2 3 4), passes it through\n    (reverse))                            ; => (4 3 2 1 0)"
       ],
       "body": "Run a side-effecting function on a value, then return the **original value** unchanged — whatever the function returns is discarded. The value comes first, the function second: `(tap value f)`.\n\nThis lets you splice logging or inspection into the middle of a thread-first (`->`) pipeline without breaking the data flow.\n\n```sema\n(tap 42 (fn (x) (println x)))   ; prints 42, returns 42\n\n(-> (range 5)\n    (tap (fn (xs) (println \"got:\" xs)))   ; logs (0 1 2 3 4), passes it through\n    (reverse))                            ; => (4 3 2 1 0)\n```"
+    },
+    {
+      "name": "values",
+      "module": "lists",
+      "section": "Multiple Values",
+      "summary": "Produce zero or more values from a single expression, for use with `call-with-values`, `let-values`, `let*-values`, or `define-values`. This is R7RS's mechanism for a producer to return more than one value without packing them into a list.",
+      "returns": "any",
+      "examples": [
+        "(+ (values 5) 1)          ; => 6\n(= (values 5) 5)          ; => #t",
+        "(call-with-values (lambda () (values 1 2 3)) +)   ; => 6\n(let-values (((a b) (values 1 2))) (+ a b))       ; => 3"
+      ],
+      "body": "Produce zero or more values from a single expression, for use with `call-with-values`, `let-values`, `let*-values`, or `define-values`. This is R7RS's mechanism for a producer to return more than one value without packing them into a list.\n\n`(values x)` — exactly one value — is identity: it returns `x` unchanged, so a single-value `values` call flows through ordinary single-value contexts like arithmetic or comparison exactly as if `values` weren't there.\n\n```sema\n(+ (values 5) 1)          ; => 6\n(= (values 5) 5)          ; => #t\n```\n\nZero or two-or-more values only make sense when spread by one of the values-consuming forms:\n\n```sema\n(call-with-values (lambda () (values 1 2 3)) +)   ; => 6\n(let-values (((a b) (values 1 2))) (+ a b))       ; => 3\n```\n\nPassing a multiple-values result to an ordinary function that isn't expecting one (i.e. not through `call-with-values`/`let-values`/`define-values`) is unspecified by R7RS; Sema currently represents it as an opaque record, so it won't silently spread into that function's arguments.\n\n**See also:** `call-with-values` (call a producer, spread its values into a consumer), `let-values`/`let*-values` (bind multiple values as local variables), `define-values` (bind multiple values as top-level/global definitions).",
+      "syntax": "(values expr ...)"
     },
     {
       "name": "zip",
@@ -9052,6 +9105,17 @@
       "special_form": true
     },
     {
+      "name": "define-values",
+      "module": "special-forms",
+      "summary": "Bind the values produced by `producer` to top-level (or, inside a body, local) definitions — the `define` analogue of `let-values`. Formals follow the same rules: `(a b)` for exact names, dotted `(a . rest)` for a fixed prefix plus the remaining values as a list.",
+      "examples": [
+        "(define-values (a b) (values 10 20))\n(+ a b)\n;; => 30\n\n(define-values (q . r) (values 1 2 3))\nr\n;; => (2 3)"
+      ],
+      "body": "Bind the values produced by `producer` to top-level (or, inside a body, local) definitions — the `define` analogue of `let-values`. Formals follow the same rules: `(a b)` for exact names, dotted `(a . rest)` for a fixed prefix plus the remaining values as a list.\n\n```sema\n(define-values (a b) (values 10 20))\n(+ a b)\n;; => 30\n\n(define-values (q . r) (values 1 2 3))\nr\n;; => (2 3)\n```\n\nA producer that isn't a call to `values` is treated as a single value, same as `let-values`/`call-with-values`.\n\n**See also:** `let-values`/`let*-values` (scoped binding versions), `call-with-values`, `values`.",
+      "syntax": "(define-values (name ...) producer)",
+      "special_form": true
+    },
+    {
       "name": "defmacro",
       "module": "special-forms",
       "summary": "Define a compile-time macro. Macros receive their arguments unevaluated as Sema data structures and must return a new form that the evaluator then expands and evaluates. `defmacro` takes a name symbol, a parameter list, and one or more body expressions.",
@@ -9301,6 +9365,20 @@
       "special_form": true
     },
     {
+      "name": "guard",
+      "module": "special-forms",
+      "summary": "R7RS-style structured exception handling. Evaluates the `body` expressions; if no error occurs, `guard` returns the value of the last one. If an error is raised (via `raise`/`throw` or a native runtime error), it is bound to `var` and the `clause`s are evaluated exactly like `cond` — the first clause whose test is truthy has its body evaluated and returned, and an `else` clause (if present, and last) always matches.",
+      "examples": [
+        "(guard (e ((string? e) e)\n          (else :unknown))\n  (raise \"boom\"))\n;; => \"boom\"",
+        "(guard (e ((number? e) (* 2 e)))\n  100)\n;; => 100 (body did not raise, clauses are never evaluated)",
+        "(guard (e ((= e 1) :one))\n  (raise 2))\n;; => propagates \"User exception: 2\" — no clause matched and there is no `else`",
+        "(guard (e (else (:message e)))\n  (/ 1 0))\n;; => \"division by zero\" (a native error, not a raise, is still caught)"
+      ],
+      "body": "R7RS-style structured exception handling. Evaluates the `body` expressions; if no error occurs, `guard` returns the value of the last one. If an error is raised (via `raise`/`throw` or a native runtime error), it is bound to `var` and the `clause`s are evaluated exactly like `cond` — the first clause whose test is truthy has its body evaluated and returned, and an `else` clause (if present, and last) always matches.\n\nIf none of the clauses match and there is no `else`, the condition is **re-raised** from `guard`'s own position rather than swallowed.\n\n`var` is bound to the **raised object itself**. For `(raise obj)` / `(throw obj)` that is `obj` — clause tests read it directly:\n\n```sema\n(guard (e ((string? e) e)\n          (else :unknown))\n  (raise \"boom\"))\n;; => \"boom\"\n```\n\n```sema\n(guard (e ((number? e) (* 2 e)))\n  100)\n;; => 100 (body did not raise, clauses are never evaluated)\n```\n\n```sema\n(guard (e ((= e 1) :one))\n  (raise 2))\n;; => propagates \"User exception: 2\" — no clause matched and there is no `else`\n```\n\nA native runtime error (division by zero, an unbound variable, `(error \"msg\")`, a type error) has no raw raised object, so `var` is Sema's error **map** (`{:type ... :message ... :value ...}`). Discriminate such errors with `(:type var)` / `(:message var)`, gating on `(map? var)` first since keyword access on a raw non-map raised value would itself error:\n\n```sema\n(guard (e (else (:message e)))\n  (/ 1 0))\n;; => \"division by zero\" (a native error, not a raise, is still caught)\n```\n\n**Note:** `guard` expands to `try`/`catch` wrapping a `cond` and is defined in the prelude; it does not require an import. It unwraps the `:user` error wrapper so `var` is the raw raised object, and re-raises `var` on no-match, so an outer `guard` recovers the same raw object (or the same native error map).\n\n`(car '())` / `(first [])` return `nil` in Sema (a deliberate safe-accessor deviation from R7RS `car`), so they do **not** raise and `guard` never fires on them.",
+      "syntax": "(guard (var clause ...) body ...)",
+      "special_form": true
+    },
+    {
       "name": "if",
       "module": "special-forms",
       "summary": "Two-branch conditional special form. Evaluates `condition`, and if it is truthy evaluates `then-expr`; otherwise evaluates `else-expr`. Only the selected branch is evaluated — the other is never touched. In Sema, only `nil` and `#f` are falsy; every other value (including `0`, empty strings, and empty lists) is truthy.",
@@ -9380,6 +9458,29 @@
       ],
       "body": "`let*` creates local bindings sequentially. Each init expression is evaluated in an environment that already contains the previous bindings, so later bindings can refer to earlier ones. The result is the value of the last body expression.\n\nLike `let`, `let*` supports destructuring with vector and map patterns. It is useful when a computation builds on values computed just before it, avoiding the need for deeply nested `let` forms.\n\n```sema\n(let* ((x 10) (y (* x 2)))\n  (+ x y))\n;; => 30\n```\n\n```sema\n(let* (({:keys [name age]} {:name \"Ada\" :age 36})\n       (greeting (format \"Hello, ~a\" name)))\n  greeting)\n;; => \"Hello, Ada\"\n```\n\n```sema\n(let* ((base 2)\n       (exp 8)\n       (result (expt base exp)))\n  result)\n;; => 256\n```\n\n**See also:** `let` (parallel — inits cannot see sibling bindings), `letrec` (for mutually recursive functions, where every name is visible to every init at once).",
       "syntax": "(let* ((name value) ...) body ...)",
+      "special_form": true
+    },
+    {
+      "name": "let*-values",
+      "module": "special-forms",
+      "summary": "Like `let-values`, but binding is **sequential**: each clause's `producer` is evaluated in an environment that already contains every earlier clause's bindings, so a later clause can refer to an earlier one's names. Formals follow the same rules as `let-values` — `(a b)`, dotted `(a . rest)`, or a bare symbol binding all values as a list.",
+      "examples": [
+        "(define a 100)\n(let*-values (((a) (values 1))\n              ((b) (values a)))   ; sees the NEW a (1) from the clause just above\n  b)\n;; => 1\n\n(let*-values (((a b) (values 1 2))\n              ((c) (values (+ a b))))\n  c)\n;; => 3"
+      ],
+      "body": "Like `let-values`, but binding is **sequential**: each clause's `producer` is evaluated in an environment that already contains every earlier clause's bindings, so a later clause can refer to an earlier one's names. Formals follow the same rules as `let-values` — `(a b)`, dotted `(a . rest)`, or a bare symbol binding all values as a list.\n\n```sema\n(define a 100)\n(let*-values (((a) (values 1))\n              ((b) (values a)))   ; sees the NEW a (1) from the clause just above\n  b)\n;; => 1\n\n(let*-values (((a b) (values 1 2))\n              ((c) (values (+ a b))))\n  c)\n;; => 3\n```\n\n**See also:** `let-values` (parallel — later producers can't see earlier bindings), `call-with-values`, `define-values`.",
+      "syntax": "(let*-values (((name ...) producer) ...) body ...)",
+      "special_form": true
+    },
+    {
+      "name": "let-values",
+      "module": "special-forms",
+      "summary": "Bind the values produced by one or more `values`-producing expressions to local names, then evaluate `body`. Like `let`, binding is **parallel**: every `producer` is evaluated against the *outer* environment before any clause's names come into scope, so a later clause cannot see an earlier clause's bindings.",
+      "examples": [
+        "(let-values (((a b) (values 1 2)))\n  (+ a b))\n;; => 3\n\n(let-values (((a . rest) (values 1 2 3)))\n  rest)\n;; => (2 3)\n\n(let-values ((all (values 1 2 3)))\n  all)\n;; => (1 2 3)",
+        "(define a 100)\n(let-values (((a) (values 1))\n             ((b) (values a)))   ; sees the OUTER a (100), not the new binding above\n  b)\n;; => 100"
+      ],
+      "body": "Bind the values produced by one or more `values`-producing expressions to local names, then evaluate `body`. Like `let`, binding is **parallel**: every `producer` is evaluated against the *outer* environment before any clause's names come into scope, so a later clause cannot see an earlier clause's bindings.\n\nEach clause's formals can be:\n\n- `(a b)` — bind exactly that many values by name.\n- `(a . rest)` — bind the first values by name, remaining values as a list in `rest` (dotted formals, same shape as a lambda's rest parameter).\n- `all` (a bare symbol, no parens) — bind ALL produced values as a single list.\n\nA producer that isn't a call to `values` is treated as a single value.\n\n```sema\n(let-values (((a b) (values 1 2)))\n  (+ a b))\n;; => 3\n\n(let-values (((a . rest) (values 1 2 3)))\n  rest)\n;; => (2 3)\n\n(let-values ((all (values 1 2 3)))\n  all)\n;; => (1 2 3)\n```\n\nMultiple clauses evaluate independently against the outer environment:\n\n```sema\n(define a 100)\n(let-values (((a) (values 1))\n             ((b) (values a)))   ; sees the OUTER a (100), not the new binding above\n  b)\n;; => 100\n```\n\nIf a clause produces the wrong number of values for its formals, that's an arity error (R7RS \"wrong number of values\"). A producer's error propagates normally.\n\n**See also:** `let*-values` (sequential — later producers see earlier bindings), `call-with-values` (the lower-level primitive this desugars to), `define-values` (top-level/global version).",
+      "syntax": "(let-values (((name ...) producer) ...) body ...)",
       "special_form": true
     },
     {
@@ -9475,6 +9576,20 @@
       ],
       "body": "Short-circuit logical OR. Evaluates expressions from left to right and returns the first truthy value it encounters. If all expressions are falsy, it returns the value of the last expression. With no arguments, `or` returns `#f`.\n\nBecause it is a special form, `or` stops evaluating as soon as a truthy result is found; subsequent expressions are never touched. This is useful for providing default values, trying alternatives, or fallbacks. Only `nil` and `#f` are falsy in Sema.\n\n```sema\n(or #f #t)            ; => #t\n(or #f #f)            ; => #f\n```\n\n```sema\n(define config nil)\n(or config {})        ; => {} (default when config is nil)\n```\n\n```sema\n(define port (or (:port env) 8080))\nport                  ; => 8080 if env has no :port key\n```\n\n```sema\n(or)                  ; => #f\n(or 42 (crash))       ; => 42 (crash is never called)\n```",
       "syntax": "(or expr ...)",
+      "special_form": true
+    },
+    {
+      "name": "parameterize",
+      "module": "special-forms",
+      "summary": "R7RS dynamic binding. `parameterize` evaluates each `val`, converts it through the corresponding parameter's converter (see `make-parameter`), installs the converted values, runs `body`, and always restores every parameter to its **prior** value before returning — even if `body` raises. The result is `body`'s last value (or the propagated condition, after restoration).",
+      "examples": [
+        "(define radix (make-parameter 10))\n\n(radix)\n;; => 10\n\n(parameterize ((radix 16))\n  (radix))\n;; => 16\n\n(radix)\n;; => 10 (restored)",
+        "(define counter (make-parameter 0 (lambda (x) (+ x 1))))\n\n(list (counter)\n      (parameterize ((counter 10)) (counter))\n      (counter))\n;; => (1 11 1) — restore uses the saved raw 1, not (+ 1 1)",
+        "(define capped (make-parameter 1 (lambda (x) (if (> x 5) (error \"too big\") x))))\n\n(guard (e (else :rejected))\n  (parameterize ((capped 10)) (capped)))\n;; => :rejected, and (capped) is still 1",
+        "(define mode (make-parameter :normal))\n\n(parameterize ((mode :outer))\n  (list (mode)\n        (parameterize ((mode :inner)) (mode))\n        (mode)))\n;; => (:outer :inner :outer)"
+      ],
+      "body": "R7RS dynamic binding. `parameterize` evaluates each `val`, converts it through the corresponding parameter's converter (see `make-parameter`), installs the converted values, runs `body`, and always restores every parameter to its **prior** value before returning — even if `body` raises. The result is `body`'s last value (or the propagated condition, after restoration).\n\n```sema\n(define radix (make-parameter 10))\n\n(radix)\n;; => 10\n\n(parameterize ((radix 16))\n  (radix))\n;; => 16\n\n(radix)\n;; => 10 (restored)\n```\n\nConversion happens once, at install time; restoration sets the saved value back **raw** (it is never re-converted), so a non-idempotent converter cannot drift the parameter across repeated `parameterize` entries:\n\n```sema\n(define counter (make-parameter 0 (lambda (x) (+ x 1))))\n\n(list (counter)\n      (parameterize ((counter 10)) (counter))\n      (counter))\n;; => (1 11 1) — restore uses the saved raw 1, not (+ 1 1)\n```\n\nAll bindings in a single `parameterize` form are converted **before** any of them are installed, so a converter that raises leaves every parameter untouched:\n\n```sema\n(define capped (make-parameter 1 (lambda (x) (if (> x 5) (error \"too big\") x))))\n\n(guard (e (else :rejected))\n  (parameterize ((capped 10)) (capped)))\n;; => :rejected, and (capped) is still 1\n```\n\nRestoration runs on both the normal exit path and on a raised condition (the condition is re-raised after restoring), and `parameterize` forms nest — an inner `parameterize` restores back to the outer one's value, not the original:\n\n```sema\n(define mode (make-parameter :normal))\n\n(parameterize ((mode :outer))\n  (list (mode)\n        (parameterize ((mode :inner)) (mode))\n        (mode)))\n;; => (:outer :inner :outer)\n```\n\n**Note:** `parameterize` is defined in the prelude (a macro over `try`/`catch`, mirroring `with-stream`'s cleanup idiom) and does not require an import. Because it must run its restore step after `body`, `body` is not in tail position.\n\nSee also: `make-parameter`.",
+      "syntax": "(parameterize ((param val) ...) body ...)",
       "special_form": true
     },
     {
@@ -11379,6 +11494,23 @@
         "(symbol? (gensym))      ; => #t\n(= (gensym) (gensym))   ; => #f  (every call is distinct)\n\n;; A swap macro that needs a temporary — gensym keeps it from\n;; capturing a variable the caller might also be named.\n(defmacro swap2 (a b)\n  (let ((tmp (gensym \"tmp\")))\n    (list 'let (list (list tmp a))\n          (list 'set! a b)\n          (list 'set! b tmp))))\n\n(define x 1)\n(define y 2)\n(swap2 x y)\n(list x y)   ; => (2 1)"
       ],
       "body": "Generate a fresh, unique symbol. The optional `prefix` (default `\"g\"`) is prepended to a global counter so each call yields a distinct name (`tmp__0`, `tmp__1`, ...) that cannot collide with anything in user code.\n\nThis is the standard fix for macro **variable capture**: when a macro introduces a temporary binding, hard-coding a name like `tmp` would clobber a caller's own `tmp`. Binding to a gensym instead guarantees the temporary is invisible to the expansion site.\n\n```sema\n(symbol? (gensym))      ; => #t\n(= (gensym) (gensym))   ; => #f  (every call is distinct)\n\n;; A swap macro that needs a temporary — gensym keeps it from\n;; capturing a variable the caller might also be named.\n(defmacro swap2 (a b)\n  (let ((tmp (gensym \"tmp\")))\n    (list 'let (list (list tmp a))\n          (list 'set! a b)\n          (list 'set! b tmp))))\n\n(define x 1)\n(define y 2)\n(swap2 x y)\n(list x y)   ; => (2 1)\n```"
+    },
+    {
+      "name": "raise",
+      "module": "system",
+      "section": "Errors",
+      "summary": "R7RS `raise`: raise an arbitrary object as an exception. Unlike `error` (which takes a message string and produces an `:eval` error), `raise` signals the object itself — any value, not just a string.",
+      "params": [
+        {
+          "name": "obj",
+          "type": "any"
+        }
+      ],
+      "examples": [
+        "(try (raise 42) (catch e (:value e)))     ; => 42\n(try (raise {:code 404}) (catch e (:value e)))  ; => {:code 404}",
+        "(guard (e ((number? e) (* 2 e)) (else :other))\n  (raise 21))\n;; => 42"
+      ],
+      "body": "R7RS `raise`: raise an arbitrary object as an exception. Unlike `error` (which takes a message string and produces an `:eval` error), `raise` signals the object itself — any value, not just a string.\n\n`raise` is a first-class procedure and is identical in effect to the `throw` special form: both build a `:user` exception. It exists so the raised object can be passed to `raise` from higher-order code (e.g. partially applied) where a special form cannot go.\n\n```sema\n(try (raise 42) (catch e (:value e)))     ; => 42\n(try (raise {:code 404}) (catch e (:value e)))  ; => {:code 404}\n```\n\n`guard` recovers the raised object directly (it unwraps the `:user` wrapper), so clause tests read it raw:\n\n```sema\n(guard (e ((number? e) (* 2 e)) (else :other))\n  (raise 21))\n;; => 42\n```\n\nSee `throw` (the special-form equivalent), `error` (message-based failures), and `guard` / `try` for handling."
     },
     {
       "name": "retry",

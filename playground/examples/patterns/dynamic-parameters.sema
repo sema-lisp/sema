@@ -1,0 +1,47 @@
+;; Dynamic binding with `make-parameter` / `parameterize`
+;;
+;; A parameter object is a zero-arg procedure that returns its current value.
+;; `parameterize` rebinds it for the *dynamic extent* of a body and restores
+;; the old value on exit — even if the body escapes non-locally via `raise`.
+;;
+;; That makes parameters perfect for implicit, ambient context you don't want
+;; to thread through every call: here an indentation depth and a log level.
+
+;; Ambient context — no need to pass these as arguments everywhere.
+(define indent    (make-parameter 0))
+(define log-level (make-parameter 'info))
+
+(define (spaces n) (if (<= n 0) "" (string-append "  " (spaces (- n 1)))))
+
+(define (log level msg)
+  ;; Only emit if the message's level is at or above the current threshold.
+  (when (or (eq? (log-level) 'debug) (not (eq? level 'debug)))
+    (println (spaces (indent)) msg)))
+
+;; Walk a nested structure; each level deepens `indent` for its dynamic extent.
+(define (show node)
+  (if (list? node)
+      (begin
+        (log 'info (str "▸ node (" (length node) " children)"))
+        ;; parameterize: children print one level deeper, then depth restores.
+        (parameterize ((indent (+ (indent) 1)))
+          (for-each show node)))
+      (log 'info (str "• " node))))
+
+(println "── tree at default depth ──")
+(show (list 1 (list 2 3) (list 4 (list 5 6))))
+
+(println)
+(println "── same tree, but starting indented and with debug logging ──")
+(parameterize ((indent 2) (log-level 'debug))
+  (log 'debug "(debug messages now visible)")
+  (show (list 'a (list 'b 'c))))
+
+;; Restoration holds even on non-local exit: the raise unwinds out of the
+;; parameterized body, yet `indent` is back to its outer value afterward.
+(println)
+(println "depth before: " (indent))
+(guard (e (#t 'ignored))
+  (parameterize ((indent 99))
+    (raise 'boom)))
+(println "depth after a raise inside parameterize: " (indent) "  (restored)")

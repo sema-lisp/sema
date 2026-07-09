@@ -216,7 +216,9 @@ fn classify_form(children: &[Node]) -> FormKind {
             | "define-syntax"
             | "syntax-rules",
         ) => FormKind::Body,
-        Some("let" | "let*" | "letrec" | "when-let" | "if-let") => FormKind::Binding,
+        Some("let" | "let*" | "letrec" | "let-values" | "let*-values" | "when-let" | "if-let") => {
+            FormKind::Binding
+        }
         Some("cond" | "case" | "match") => FormKind::Clause,
         Some("->" | "->>" | "as->" | "some->") => FormKind::Threading,
         Some("try") => FormKind::TryCatch,

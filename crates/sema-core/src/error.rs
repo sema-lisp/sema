@@ -281,8 +281,8 @@ pub fn veteran_hint(name: &str) -> Option<&'static str> {
         "not=" => Some("Use (not (equal? a b)) for inequality in Sema"),
 
         // Scheme / Racket
-        "define-syntax" | "syntax-rules" | "syntax-case" => {
-            Some("Sema uses 'defmacro' for macro definitions")
+        "syntax-case" => {
+            Some("Sema supports 'define-syntax' with 'syntax-rules', or use 'defmacro'")
         }
         "call-with-current-continuation" | "call/cc" => Some(
             "Sema doesn't support first-class continuations; use 'try'/'throw' for control flow",
@@ -296,8 +296,8 @@ pub fn veteran_hint(name: &str) -> Option<&'static str> {
         "hash-ref" => Some("Sema uses 'get' to look up values in maps"),
         "hash-set!" => Some("Sema maps are immutable; use 'assoc' to create an updated copy"),
         "hash-map?" => Some("Sema uses 'map?' to check if a value is a map"),
-        "with-exception-handler" | "raise" => {
-            Some("Sema uses 'try'/'catch' and 'throw' for exception handling")
+        "with-exception-handler" => {
+            Some("Sema uses 'try'/'catch', 'throw'/'raise', and 'guard' for exception handling")
         }
 
         _ => None,

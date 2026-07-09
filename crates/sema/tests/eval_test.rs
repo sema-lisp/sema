@@ -2183,3 +2183,346 @@ eval_error_tests! {
     // (the SelfTailCall opcode arity-checks against the loop lambda).
     stc_wrong_arity: "(let loop ((a 1) (b 2)) (loop 1))" => "loop",
 }
+
+// ============================================================
+// R7RS make-parameter / parameterize
+// ============================================================
+// A parameter object is a zero-arg procedure returning its current value.
+// `parameterize` dynamically rebinds parameters to (converter v) for the
+// extent of its body, restoring the prior (unconverted) value on exit —
+// including on non-local exit via a raised condition.
+
+eval_tests! {
+    param_basic_call: "((make-parameter 42))" => Value::int(42),
+    param_is_procedure: "(procedure? (make-parameter 5))" => Value::bool(true),
+
+    param_install_then_restore:
+        "(let ((p (make-parameter 1))) (list (p) (parameterize ((p 2)) (p)) (p)))"
+        => Value::list(vec![Value::int(1), Value::int(2), Value::int(1)]),
+
+    param_body_value_returned:
+        "(let ((p (make-parameter 1))) (parameterize ((p 2)) (+ (p) 100)))" => Value::int(102),
+
+    param_converter_applied_to_init_and_new:
+        "(let ((p (make-parameter 10 (lambda (x) (* x 2))))) (list (p) (parameterize ((p 5)) (p)) (p)))"
+        => Value::list(vec![Value::int(20), Value::int(10), Value::int(20)]),
+
+    // Non-idempotent converter proves restore is RAW (not re-converted): if
+    // restore re-applied the converter, the final value would be 2, not 1.
+    param_restore_is_raw_not_reconverted:
+        "(let ((p (make-parameter 0 (lambda (x) (+ x 1))))) (list (p) (parameterize ((p 10)) (p)) (p)))"
+        => Value::list(vec![Value::int(1), Value::int(11), Value::int(1)]),
+
+    param_nested_extents:
+        "(let ((p (make-parameter 1))) (parameterize ((p 2)) (list (p) (parameterize ((p 3)) (p)) (p))))"
+        => Value::list(vec![Value::int(2), Value::int(3), Value::int(2)]),
+
+    param_multiple_parameters:
+        "(let ((a (make-parameter 1)) (b (make-parameter 2))) (parameterize ((a 10) (b 20)) (list (a) (b))))"
+        => Value::list(vec![Value::int(10), Value::int(20)]),
+
+    param_multi_form_body_last_value:
+        "(let ((p (make-parameter 0))) (parameterize ((p 9)) (p) (* (p) (p))))" => Value::int(81),
+
+    param_restored_after_throw:
+        r#"(let ((p (make-parameter 1))) (try (parameterize ((p 2)) (throw "boom")) (catch e nil)) (p))"#
+        => Value::int(1),
+
+    param_error_reraised_and_value_restored:
+        r#"(let ((p (make-parameter 1))) (list (try (parameterize ((p 2)) (error "x")) (catch e :caught)) (p)))"#
+        => Value::list(vec![Value::keyword("caught"), Value::int(1)]),
+
+    // Atomicity: a throwing converter must install NOTHING — all new values are
+    // converted before any parameter is mutated.
+    param_throwing_converter_installs_nothing:
+        r#"(let ((p (make-parameter 1 (lambda (x) (if (> x 5) (error "big") x))))) (list (try (parameterize ((p 10)) (p)) (catch e :caught)) (p)))"#
+        => Value::list(vec![Value::keyword("caught"), Value::int(1)]),
+
+    param_throwing_value_expr_never_enters:
+        r#"(let ((p (make-parameter 1))) (list (try (parameterize ((p (error "bad"))) (p)) (catch e :caught)) (p)))"#
+        => Value::list(vec![Value::keyword("caught"), Value::int(1)]),
+
+    param_empty_binding_list: "(parameterize () 42)" => Value::int(42),
+
+    // SRFI-39 style mutating call: (p v) sets and converts the new value.
+    param_mutating_call: "(let ((p (make-parameter 1))) (p 5) (p))" => Value::int(5),
+    param_mutating_call_applies_converter:
+        "(let ((p (make-parameter 1 (lambda (x) (* x 10))))) (p 5) (p))" => Value::int(50),
+}
+
+eval_error_tests! {
+    // An uncaught error inside a parameterize body propagates with its message
+    // (parameterize restores state but does not swallow the condition).
+    param_uncaught_body_error_propagates:
+        r#"(let ((p (make-parameter 1))) (parameterize ((p 2)) (error "kaboom")))"# => "kaboom",
+}
+
+// ============================================================
+// R7RS multiple values: `values`, `call-with-values`,
+// `let-values`/`let*-values`, `define-values`
+// ============================================================
+
+eval_tests! {
+    mv_call_with_values_variadic_consumer:
+        "(call-with-values (lambda () (values 1 2)) +)" => Value::int(3),
+    mv_call_with_values_list_consumer:
+        "(call-with-values (lambda () (values 1 2 3)) list)" => common::eval("'(1 2 3)"),
+    // A single-value producer (no `values` call) is treated as ONE value, not
+    // spread — `list` receives it as its sole argument.
+    mv_call_with_values_single_value_producer:
+        "(call-with-values (lambda () 42) list)" => common::eval("'(42)"),
+    mv_call_with_values_zero_values_into_variadic:
+        "(call-with-values (lambda () (values)) +)" => Value::int(0),
+    mv_call_with_values_zero_values_into_zero_arg_consumer:
+        "(call-with-values (lambda () (values)) (lambda () 99))" => Value::int(99),
+    mv_call_with_values_fixed_arity_consumer:
+        "(call-with-values (lambda () (values 1 2 3)) (lambda (a b c) (* a b c)))" => Value::int(6),
+    // R7RS: `(values x)` is identity, so a single value flows through ordinary
+    // single-value contexts unchanged.
+    mv_single_value_identity_in_comparison: "(= (values 5) 5)" => Value::bool(true),
+    mv_single_value_flows_through_arithmetic: "(+ (values 5) 1)" => Value::int(6),
+
+    mv_let_values_basic: "(let-values (((a b) (values 1 2))) (+ a b))" => Value::int(3),
+    mv_let_values_multiple_clauses:
+        "(let-values (((a b) (values 1 2)) ((c d) (values 3 4))) (+ a b c d))" => Value::int(10),
+    // Dotted/rest formals: `(a . rest)` binds the first value to `a` and the
+    // remaining values as a list to `rest`.
+    mv_let_values_dotted_rest:
+        "(let-values (((a . rest) (values 1 2 3))) rest)"
+        => Value::list(vec![Value::int(2), Value::int(3)]),
+    // Bare-symbol formals bind ALL produced values as a single list.
+    mv_let_values_bare_symbol_formals:
+        "(let-values ((all (values 1 2 3))) all)"
+        => Value::list(vec![Value::int(1), Value::int(2), Value::int(3)]),
+    mv_let_values_empty_bindings: "(let-values () 7)" => Value::int(7),
+    // PARALLEL: let-values evaluates every producer against the OUTER
+    // environment, so the second clause's producer sees the outer `a`, not the
+    // first clause's freshly-bound `a`.
+    mv_let_values_is_parallel:
+        "(let ((a 100)) (let-values (((a) (values 1)) ((b) (values a))) b))" => Value::int(100),
+    // SEQUENTIAL: let*-values's second producer sees the first clause's binding.
+    mv_let_star_values_is_sequential:
+        "(let ((a 100)) (let*-values (((a) (values 1)) ((b) (values a))) b))" => Value::int(1),
+    mv_let_star_values_chained:
+        "(let*-values (((a b) (values 1 2)) ((c) (values (+ a b)))) c)" => Value::int(3),
+
+    mv_define_values_basic:
+        "(begin (define-values (a b) (values 10 20)) (+ a b))" => Value::int(30),
+    mv_define_values_dotted_rest:
+        "(begin (define-values (q . r) (values 1 2 3)) r)"
+        => Value::list(vec![Value::int(2), Value::int(3)]),
+
+    // Builtins (including call-with-values itself) are first-class procedures.
+    mv_call_with_values_is_a_procedure: "(procedure? call-with-values)" => Value::bool(true),
+}
+
+eval_error_tests! {
+    // Too many produced values for the consumer's fixed arity is a normal
+    // lambda/apply arity error (R7RS "wrong number of values").
+    mv_let_values_too_many_values_errors:
+        "(let-values (((a b) (values 1 2 3))) a)" => "expects 2",
+    mv_call_with_values_consumer_arity_mismatch:
+        r#"(call-with-values (lambda () (values 1 2)) (lambda (x) x))"# => "expects 1",
+    mv_call_with_values_producer_not_callable:
+        "(call-with-values 5 list)" => "not callable",
+    // A producer error propagates as a normal thrown/re-raised error through
+    // call-with-values (no swallowing).
+    mv_call_with_values_producer_error_propagates:
+        r#"(call-with-values (lambda () (throw "boom")) list)"# => "boom",
+    mv_let_values_producer_error_propagates:
+        r#"(let-values (((a) (throw "bad"))) a)"# => "bad",
+    // R7RS 5.3.3: define-values matches formals like a lambda's parameters, so
+    // too many produced values for a fixed formal list is an arity error (not a
+    // silent drop of the surplus).
+    mv_define_values_too_many_values_errors:
+        "(begin (define-values (a b) (values 1 2 3)) (list a b))" => "expects 2",
+    // Too few produced values is likewise a clean arity error.
+    mv_define_values_too_few_values_errors:
+        "(begin (define-values (a b c) (values 1 2)) a)" => "expects 3",
+}
+
+// ============================================================
+// R7RS syntax-rules (define-syntax)
+// ============================================================
+
+eval_tests! {
+    // Basic pattern/template + set!
+    sr_swap_basic: r#"
+        (begin
+          (define-syntax swap!
+            (syntax-rules ()
+              ((_ a b) (let ((tmp a)) (set! a b) (set! b tmp)))))
+          (define x 1) (define y 2) (swap! x y) (list x y))
+    "# => common::eval("'(2 1)"),
+
+    // HYGIENE: introduced `tmp` must not capture the user's `tmp`
+    sr_swap_hygiene: r#"
+        (begin
+          (define-syntax swap!
+            (syntax-rules ()
+              ((_ a b) (let ((tmp a)) (set! a b) (set! b tmp)))))
+          (define tmp 1) (define y 2) (swap! tmp y) (list tmp y))
+    "# => common::eval("'(2 1)"),
+
+    // HYGIENE: introduced `t` must not capture user `t`; recursive ellipsis
+    sr_my_or_hygiene: r#"
+        (begin
+          (define-syntax my-or
+            (syntax-rules ()
+              ((_) #f)
+              ((_ e) e)
+              ((_ e1 e2 ...) (let ((t e1)) (if t t (my-or e2 ...))))))
+          (define t 5) (my-or #f t))
+    "# => Value::int(5),
+
+    // Recursive expansion terminates as the ellipsis list shrinks
+    sr_my_or_recursive: r#"
+        (begin
+          (define-syntax my-or
+            (syntax-rules ()
+              ((_) #f)
+              ((_ e) e)
+              ((_ e1 e2 ...) (let ((t e1)) (if t t (my-or e2 ...))))))
+          (my-or #f #f 7))
+    "# => Value::int(7),
+
+    // Ellipsis, multiple matches
+    sr_ellipsis_multiple: r#"
+        (begin
+          (define-syntax my-list (syntax-rules () ((_ x ...) (list x ...))))
+          (my-list 1 2 3))
+    "# => common::eval("'(1 2 3)"),
+
+    // Ellipsis, ZERO matches
+    sr_ellipsis_zero: r#"
+        (begin
+          (define-syntax my-list (syntax-rules () ((_ x ...) (list x ...))))
+          (my-list))
+    "# => common::eval("'()"),
+
+    // Nested ellipsis over (name val) pairs; two ellipsis vars in lockstep
+    sr_my_let: r#"
+        (begin
+          (define-syntax my-let
+            (syntax-rules ()
+              ((_ ((name val) ...) body ...)
+               ((lambda (name ...) body ...) val ...))))
+          (my-let ((a 1) (b 2)) (+ a b)))
+    "# => Value::int(3),
+
+    // Multiple rules / arity dispatch, first-match wins
+    sr_multi_rule: r#"
+        (begin
+          (define-syntax f
+            (syntax-rules ()
+              ((_ a) (+ a 1))
+              ((_ a b) (+ a b))))
+          (list (f 10) (f 3 4)))
+    "# => common::eval("'(11 7)"),
+
+    // Literal identifier `=>` matched structurally
+    sr_literal: r#"
+        (begin
+          (define-syntax my-cond1
+            (syntax-rules (=>)
+              ((_ (test => proc)) (let ((v test)) (if v (proc v) #f)))))
+          (my-cond1 (5 => (fn (n) (* n 2)))))
+    "# => Value::int(10),
+
+    // macroexpand path works; `*` kept (global), not renamed
+    sr_macroexpand: r#"
+        (begin
+          (define-syntax dbl (syntax-rules () ((_ x) (* 2 x))))
+          (macroexpand '(dbl 5)))
+    "# => common::eval("'(* 2 5)"),
+
+    // try/throw/catch kept verbatim by hygiene (special forms + `catch`
+    // auxiliary keyword); the expansion runs. Sema's catch binds the error
+    // object, so read its :value to recover the thrown datum.
+    sr_special_forms_kept: r#"
+        (begin
+          (define-syntax g
+            (syntax-rules () ((_ x) (try (throw x) (catch err (:value err))))))
+          (g "boom"))
+    "# => Value::string("boom"),
+
+    // Custom ellipsis symbol (`ooo`; Sema's reader treats `:` as a keyword
+    // prefix so R7RS's conventional `:::` is not a readable symbol here)
+    sr_custom_ellipsis: r#"
+        (begin
+          (define-syntax my-list2
+            (syntax-rules ooo () ((_ x ooo) (list x ooo))))
+          (my-list2 1 2))
+    "# => common::eval("'(1 2)"),
+
+    // TCO is preserved through syntax-rules: expansion happens before lowering,
+    // so a template that places the recursive call in tail position is lowered
+    // with normal tail-call analysis. Without TCO this deep loop would overflow.
+    sr_tco_preserved: r#"
+        (begin
+          (define-syntax my-if
+            (syntax-rules () ((_ c t e) (cond (c t) (else e)))))
+          (define (loop n acc)
+            (my-if (= n 0) acc (loop (- n 1) (+ acc 1))))
+          (loop 100000 0))
+    "# => Value::int(100000),
+
+    // Ellipsis body spliced into begin, tail value
+    sr_when_body: r#"
+        (begin
+          (define-syntax my-when
+            (syntax-rules () ((_ c body ...) (if c (begin body ...) #f))))
+          (my-when #t 1 2 3))
+    "# => Value::int(3),
+
+    // Binder-directed hygiene: a template that references a user-defined global
+    // FUNCTION must keep that name verbatim (not alpha-rename it), so it still
+    // resolves after whole-program pre-expansion. Regression for the bug where
+    // `helper` became `helper__0` (Unbound variable).
+    sr_calls_user_function: r#"
+        (begin
+          (define (helper x) (* x 10))
+          (define-syntax m (syntax-rules () ((_ x) (helper x))))
+          (m 4))
+    "# => Value::int(40),
+
+    // A template that references a user-defined global VARIABLE keeps it verbatim.
+    sr_references_user_global: r#"
+        (begin
+          (define g 100)
+          (define-syntax getg (syntax-rules () ((_) g)))
+          (getg))
+    "# => Value::int(100),
+
+    // Calling a user function through the template with ellipsis-spread args.
+    sr_calls_user_function_ellipsis: r#"
+        (begin
+          (define (sum3 a b c) (+ a b c))
+          (define-syntax s3 (syntax-rules () ((_ e ...) (sum3 e ...))))
+          (s3 4 5 6))
+    "# => Value::int(15),
+
+    // A template-introduced binder (`r`) is still renamed and never leaks:
+    // the outer user `r` is untouched by the expansion.
+    sr_binder_does_not_leak: r#"
+        (begin
+          (define-syntax twice (syntax-rules () ((_ e) (let ((r e)) (+ r r)))))
+          (define r 1000)
+          (list (twice 5) r))
+    "# => common::eval("'(10 1000)"),
+}
+
+eval_error_tests! {
+    // No rule matches arity
+    sr_no_match: r#"
+        (begin
+          (define-syntax only1 (syntax-rules () ((_ a) a)))
+          (only1 1 2))
+    "# => "no matching syntax-rules",
+
+    // Malformed transformer
+    sr_malformed: "(define-syntax bad (syntax-rules))" => "syntax-rules",
+
+    // Name must be a symbol
+    sr_bad_name: "(define-syntax 5 (syntax-rules () ((_ a) a)))" => "define-syntax",
+}

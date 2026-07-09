@@ -25,7 +25,7 @@ pub use debug::{
 };
 pub use disasm::disassemble;
 pub use emit::Emitter;
-pub use lower::lower;
+pub use lower::{is_special_form, lower};
 pub use opcodes::Op;
 pub use optimize::optimize as optimize_expr;
 pub use resolve::resolve_with_locals;

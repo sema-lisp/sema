@@ -82,6 +82,51 @@ pub const PRELUDE: &str = r#"
 (defmacro with-open (binding . body)
   `(with-stream ,binding ,@body))
 
+;; guard: R7RS structured exception handling.
+;; (guard (var clause ...) body ...) evaluates body; if a condition is raised
+;; (via `raise`/`throw` or a native runtime error), it is bound to var and the
+;; clauses are evaluated like `cond` (an `else` clause, if present, must be
+;; last). If no clause matches, the condition is re-raised in guard's own
+;; dynamic position (guard's try/catch has already unwound body's frames, so
+;; the re-raise propagates from here, not from deep inside body).
+;;
+;; R7RS semantics: var is bound to the RAISED OBJECT. For (raise obj)/(throw
+;; obj) that is obj itself (the raw value) — so clause tests read it directly:
+;;   (guard (e ((string? e) e) (else :unknown)) (raise "x")) ; => "x"
+;; A native runtime error ((/ 1 0), (car 5), (error "msg"), an unbound
+;; variable, …) has no raw raised object, so var is Sema's error MAP
+;; ({:type ... :message ... :value ...}); dispatch on (:type e)/(:message e).
+;; A clause that wants only native errors should gate on (map? e) first, since
+;; keyword access like (:type e) raises a type error on a raw non-map object.
+;;
+;; NOTE: (car '()) / (first []) return nil in Sema (a deliberate safe-accessor
+;; deviation from R7RS `car`), so they do NOT raise and guard never fires on
+;; them — use (car 5) or (/ 1 0) to see guard catch a native runtime error.
+(defmacro guard (spec . body)
+  (let ((var (car spec))
+        (clauses (cdr spec)))
+    (let ((has-else
+            (and (not (null? clauses))
+                 (let ((last-clause (car (reverse clauses))))
+                   (and (list? last-clause)
+                        (equal? (car last-clause) 'else))))))
+      `(try
+         (begin ,@body)
+         (catch guard-err#
+           ;; Unwrap the {:type :user :value obj} wrapper so var is the raw
+           ;; raised object; native errors (non-:user) stay as the error map.
+           (let ((,var (if (equal? (:type guard-err#) :user)
+                           (:value guard-err#)
+                           guard-err#)))
+             (cond ,@clauses
+                   ,@(if has-else
+                         (list)
+                         ;; No clause matched: re-raise the object bound to var.
+                         ;; Re-raising var (not the wrapper) keeps re-raise
+                         ;; faithful — an outer guard again unwraps :user and
+                         ;; recovers the same raw object (or native error map).
+                         (list (list 'else (list 'raise var)))))))))))
+
 ;; ws/listen: drive a receive loop on a websocket, dispatching each frame to the
 ;; matching handler. Spawns an async task and returns its promise — await it (or
 ;; run the scheduler) to actually drive the loop. All handlers are optional:
@@ -528,6 +573,54 @@ pub const PRELUDE: &str = r#"
                                   (async/sleep delay#)    ; cooperative backoff
                                   (go# (+ n# 1) (* delay# wr-fac#)))))))))
          (go# 1 wr-base#)))))
+
+;; make-parameter: R7RS parameter object. Returns a variadic procedure closed
+;; over a mutable cell (the current value) and an optional converter.
+;;   (p)      -> current value
+;;   (p v)    -> SRFI-39 mutate: set the value to (converter v), return it
+;; The remaining two-arg forms are a private protocol used by `parameterize`
+;; to install/restore values without re-applying the converter on restore:
+;;   (p '__param-convert v) -> (converter v), no mutation (convert-only)
+;;   (p '__param-raw v)     -> set the value to v AS-IS, no conversion (raw set)
+;; Any non-'__param-convert first arg of a 2-arg call takes the raw-set path,
+;; but callers should use '__param-raw for clarity.
+;; (make-parameter 10 (lambda (x) (* x 2))) => a parameter whose value is always
+;; doubled on install; the converter runs once at (make-parameter) time too.
+(define (make-parameter init . rest)
+  (let* ((converter (if (null? rest) (lambda (x) x) (car rest)))
+         (value (converter init)))
+    (lambda (. args)
+      (cond
+        ((null? args) value)
+        ((null? (cdr args)) (set! value (converter (car args))) value)
+        ((eq? (car args) '__param-convert) (converter (cadr args)))
+        (else (set! value (cadr args)) value)))))
+
+;; __parameterize: engine behind the `parameterize` macro. Converts every new
+;; value BEFORE installing any of them (a throwing converter leaves every
+;; parameter untouched — atomic all-or-nothing), then installs, runs thunk,
+;; and restores the RAW old values (never re-converted) whether thunk returns
+;; normally or raises — mirroring the with-stream/with-retry catch-rethrow-
+;; then-restore idiom.
+(define (__parameterize params vals thunk)
+  (let ((news (map (lambda (p v) (p '__param-convert v)) params vals)))
+    (let ((olds (map (lambda (p) (p)) params)))
+      (map (lambda (p n) (p '__param-raw n)) params news)
+      (let ((res (try (thunk)
+                   (catch e
+                     (map (lambda (p o) (p '__param-raw o)) params olds)
+                     (throw e)))))
+        (map (lambda (p o) (p '__param-raw o)) params olds)
+        res))))
+
+;; parameterize: dynamically rebind parameters for the extent of body,
+;; restoring the prior value on exit (including on a raised condition).
+;; (parameterize ((p v) ...) body ...)
+(defmacro parameterize (bindings . body)
+  `(__parameterize
+     (list ,@(map car bindings))
+     (list ,@(map cadr bindings))
+     (fn () ,@body)))
 
 ;; async/spawn-all: spawn a list of zero-arg thunks as concurrent tasks and await
 ;; them all, returning results in INPUT order. The ergonomic form of the very common

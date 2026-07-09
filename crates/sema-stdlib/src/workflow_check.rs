@@ -74,7 +74,19 @@ impl Diag {
 /// one of these is NOT statically known to (not) return a `{:status …}` map, and we stay
 /// silent rather than emit a false `W-NO-STATUS`.
 const CONTROL_FLOW_HEADS: &[&str] = &[
-    "let", "let*", "letrec", "do", "begin", "if", "when", "unless", "cond", "case", "match",
+    "let",
+    "let*",
+    "let-values",
+    "let*-values",
+    "letrec",
+    "do",
+    "begin",
+    "if",
+    "when",
+    "unless",
+    "cond",
+    "case",
+    "match",
 ];
 
 /// Statically check one workflow source string. Pure: no I/O, no eval, no LLM. Returns the

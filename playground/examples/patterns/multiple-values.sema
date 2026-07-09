@@ -1,0 +1,41 @@
+;; Multiple return values — `values`, `call-with-values`, `let-values`
+;;
+;; Some computations naturally produce *several* answers at once. Instead of
+;; packing them into a list (and unpacking by index at every call site), a
+;; procedure can return several values with `(values …)` and the caller can
+;; bind them by name with `let-values`. `(values x)` is just `x`, so a single
+;; value flows through ordinary expressions untouched.
+
+;; One pass, three answers: count, sum, and mean of a list.
+(define (stats xs)
+  (let ((n (length xs))
+        (total (foldl + 0 xs)))
+    (values n total (/ total n))))
+
+;; Split a list into (matching, non-matching) — two lists, one call.
+(define (partition pred xs)
+  (values (filter pred xs)
+          (filter (fn (x) (not (pred x))) xs)))
+
+;; Euclidean division: quotient and remainder together.
+(define (divmod a b)
+  (values (quotient a b) (remainder a b)))
+
+(define data (list 3 1 4 1 5 9 2 6))
+
+(let-values (((count total mean) (stats data)))
+  (println "stats:   count=" count "  sum=" total "  mean=" mean))
+
+(let-values (((evens odds) (partition even? data)))
+  (println "evens:   " evens)
+  (println "odds:    " odds))
+
+(let-values (((q r) (divmod 2026 12)))
+  (println "2026 = " q " × 12 + " r))
+
+;; `call-with-values` wires a producer's values straight into a consumer:
+(println "divmod via call-with-values: "
+         (call-with-values (fn () (divmod 100 7)) list))
+
+;; A single value passes through normal contexts with no ceremony:
+(println "1 + (values 41) = " (+ 1 (values 41)))

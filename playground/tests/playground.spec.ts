@@ -23,6 +23,11 @@ const EXAMPLE_NAMES = [
   'worker-pool.sema',
   'pipeline.sema',
   'fan-in.sema',
+  // R7RS language features — guard, dynamic binding, multiple values, hygienic macros
+  'error-recovery.sema',
+  'dynamic-parameters.sema',
+  'multiple-values.sema',
+  'hygienic-macros.sema',
 ];
 
 const EXAMPLES = EXAMPLE_NAMES.map((name) => {
@@ -42,7 +47,7 @@ const EXAMPLES = EXAMPLE_NAMES.map((name) => {
 /** Wait for the WASM module to be ready. */
 async function waitForReady(page: Page) {
   await page.goto('/');
-  await page.waitForSelector('[data-testid="status"].status-ready', { timeout: 15000 });
+  await expect(page.getByTestId('status')).toHaveClass(/status-ready/, { timeout: 15000 });
 }
 
 async function openExample(page: Page, example: { category: string; id: string; name: string }) {
@@ -142,7 +147,7 @@ test('whitespace preserved in output', async ({ page }) => {
 
 test('?example= auto-opens the example by bare filename', async ({ page }) => {
   await page.goto('/?example=quicksort.sema');
-  await page.waitForSelector('[data-testid="status"].status-ready', { timeout: 15000 });
+  await expect(page.getByTestId('status')).toHaveClass(/status-ready/, { timeout: 15000 });
 
   // Editor loaded the quicksort source, and its sidebar leaf is selected.
   const editorValue = await page.getByTestId('editor').inputValue();
@@ -159,7 +164,7 @@ test('?example= auto-opens the example by bare filename', async ({ page }) => {
 
 test('?example= accepts the full id too', async ({ page }) => {
   await page.goto('/?example=getting-started/fibonacci.sema');
-  await page.waitForSelector('[data-testid="status"].status-ready', { timeout: 15000 });
+  await expect(page.getByTestId('status')).toHaveClass(/status-ready/, { timeout: 15000 });
 
   const editorValue = await page.getByTestId('editor').inputValue();
   expect(editorValue).toContain('fib');
@@ -167,7 +172,7 @@ test('?example= accepts the full id too', async ({ page }) => {
 
 test('unknown ?example= falls back without breaking the editor', async ({ page }) => {
   await page.goto('/?example=does-not-exist.sema');
-  await page.waitForSelector('[data-testid="status"].status-ready', { timeout: 15000 });
+  await expect(page.getByTestId('status')).toHaveClass(/status-ready/, { timeout: 15000 });
 
   // No example is force-selected; the editor is still usable.
   await setEditorCode(page, '(+ 40 2)');
@@ -212,7 +217,7 @@ test('?no-worker forces the main-thread fallback (instant virtual-clock sleep)',
   // opts out to the main-thread interpreter, where async/sleep is an instant
   // no-op. A 2s sleep must therefore complete near-instantly (proving fallback).
   await page.goto('/?no-worker');
-  await page.waitForSelector('[data-testid="status"].status-ready', { timeout: 20000 });
+  await expect(page.getByTestId('status')).toHaveClass(/status-ready/, { timeout: 20000 });
 
   await setEditorCode(page, '(await (async (async/sleep 2000) 42))');
   const t0 = Date.now();
@@ -229,7 +234,7 @@ test('worker path: async/sleep paces in real wall-clock while the UI stays respo
   // Opt into the worker eval path (?worker). Requires cross-origin isolation,
   // which the dev server provides via serve.json (COOP/COEP).
   await page.goto('/?worker');
-  await page.waitForSelector('[data-testid="status"].status-ready', { timeout: 20000 });
+  await expect(page.getByTestId('status')).toHaveClass(/status-ready/, { timeout: 20000 });
 
   // The worker path must actually be active (cross-origin isolated + SAB),
   // otherwise this would silently fall back to the instant main-thread path.
@@ -275,7 +280,7 @@ test('worker path: async/sleep paces in real wall-clock while the UI stays respo
 
 test('worker path: upload a file and read it from a script (VFS upload + mirror)', async ({ page }) => {
   await page.goto('/?worker');
-  await page.waitForSelector('[data-testid="status"].status-ready', { timeout: 20000 });
+  await expect(page.getByTestId('status')).toHaveClass(/status-ready/, { timeout: 20000 });
 
   // Upload a file via the hidden file input — it lands in the VFS at /uploads/.
   await page.setInputFiles('#vfs-upload', {
@@ -307,7 +312,7 @@ test('worker path: a file written during eval shows up in the file tree (VFS mir
   // synced via dumpVfs/loadVfs after each run, so the file tree must reflect
   // files the worker created.
   await page.goto('/?worker');
-  await page.waitForSelector('[data-testid="status"].status-ready', { timeout: 20000 });
+  await expect(page.getByTestId('status')).toHaveClass(/status-ready/, { timeout: 20000 });
 
   await setEditorCode(page, '(file/write "/from-worker.txt" "hi from the worker")\n(println "wrote it")');
   await page.getByTestId('run-btn').click();
@@ -326,7 +331,7 @@ test('worker path: http/get works via synchronous XHR (no replay)', async ({ pag
   // main-thread replay-the-whole-program hack. Hit a same-origin file so the
   // test is reliable (no network, no cross-origin CORP/COEP concerns).
   await page.goto('/?worker');
-  await page.waitForSelector('[data-testid="status"].status-ready', { timeout: 20000 });
+  await expect(page.getByTestId('status')).toHaveClass(/status-ready/, { timeout: 20000 });
 
   const origin = await page.evaluate(() => location.origin);
   await setEditorCode(page, `(:status (http/get "${origin}/index.html"))`);
@@ -341,7 +346,7 @@ test('worker path: http/get works via synchronous XHR (no replay)', async ({ pag
 
 test('worker path: output streams live (incrementally), not all at the end', async ({ page }) => {
   await page.goto('/?worker');
-  await page.waitForSelector('[data-testid="status"].status-ready', { timeout: 20000 });
+  await expect(page.getByTestId('status')).toHaveClass(/status-ready/, { timeout: 20000 });
 
   // Three prints separated by real ~300ms sleeps. With live streaming the lines
   // must appear one at a time as the program runs — not batched at the end.
@@ -373,7 +378,7 @@ test('worker path: output streams live (incrementally), not all at the end', asy
 
 test('worker path: Stop cancels a running program and the worker survives', async ({ page }) => {
   await page.goto('/?worker');
-  await page.waitForSelector('[data-testid="status"].status-ready', { timeout: 20000 });
+  await expect(page.getByTestId('status')).toHaveClass(/status-ready/, { timeout: 20000 });
 
   // A long real sleep (5s) via the scheduler (async/await), so on the worker it
   // actually blocks ~5s on Atomics.wait — giving us a window to cancel it.

@@ -1,7 +1,14 @@
 use sema_core::number::SemaNumber;
-use sema_core::{check_arity, SemaError, Value, ValueViewRef};
+use sema_core::{check_arity, intern, Record, SemaError, Value, ValueViewRef};
 
 use crate::register_fn;
+
+/// Record `type_tag` used to bundle zero-or-multiple values produced by `values`
+/// and unpacked by `call-with-values`. Chosen to be unlikely to collide with a
+/// user `define-record-type` tag; R7RS leaves "multiple values leaking into a
+/// single-value context" unspecified, so a user constructing this exact tag via
+/// `define-record-type` is already outside spec.
+const MULTIPLE_VALUES_TAG: &str = "%multiple-values%";
 
 /// Sort category of a value for the comparator-free `sort`. Every real number
 /// (fixnum, bignum, rational, float) shares the `Number` family and compares by
@@ -266,6 +273,33 @@ pub fn register(env: &sema_core::Env) {
         let mut all_args: Vec<Value> = args[1..args.len() - 1].to_vec();
         all_args.extend(last_items.iter().cloned());
         call_function(func, &all_args)
+    });
+
+    // R7RS `values`: 1 arg is just that value (so it flows through ordinary
+    // single-value contexts like `(+ 1 (values 2))`); 0 or 2+ args bundle into
+    // a `Record` tagged `MULTIPLE_VALUES_TAG` that only `call-with-values`
+    // inspects. Any other consumer sees an opaque record — R7RS leaves
+    // multi-values-in-single-value-context unspecified.
+    register_fn(env, "values", |args| match args.len() {
+        1 => Ok(args[0].clone()),
+        _ => Ok(Value::record(Record {
+            type_tag: intern(MULTIPLE_VALUES_TAG),
+            field_names: vec![],
+            fields: args.to_vec(),
+        })),
+    });
+
+    // R7RS `call-with-values`: call `producer` with no args, spread its result
+    // (a values-bundle or a single ordinary value) as arguments to `consumer`.
+    register_fn(env, "call-with-values", |args| {
+        check_arity!(args, "call-with-values", 2);
+        let produced = call_function(&args[0], &[])?;
+        match produced.as_record() {
+            Some(rec) if rec.type_tag == intern(MULTIPLE_VALUES_TAG) => {
+                call_function(&args[1], &rec.fields.clone())
+            }
+            _ => call_function(&args[1], &[produced]),
+        }
     });
 
     register_fn(env, "take", |args| {

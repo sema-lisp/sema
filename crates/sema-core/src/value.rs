@@ -189,12 +189,32 @@ pub struct Lambda {
 }
 
 /// A macro definition.
+///
+/// A procedural `defmacro` uses `params`/`rest_param`/`body` and leaves
+/// `syntax_rules` as `None`. An R7RS `(define-syntax name (syntax-rules ...))`
+/// leaves the procedural fields empty and carries its transformer in
+/// `syntax_rules`. Both share `TAG_MACRO` so env lookup, display, and GC
+/// tracing treat them uniformly.
 #[derive(Debug, Clone)]
 pub struct Macro {
     pub params: Vec<Spur>,
     pub rest_param: Option<Spur>,
     pub body: Vec<Value>,
     pub name: Spur,
+    /// `Some` for a `syntax-rules` transformer; `None` for procedural macros.
+    pub syntax_rules: Option<Rc<SyntaxRules>>,
+}
+
+/// An R7RS `syntax-rules` transformer: a list of `(pattern template)` rewrite
+/// rules, a set of literal identifiers matched by name, and the ellipsis symbol
+/// (`...` by default, or a custom one). Patterns and templates are stored as raw
+/// quoted `Value` data (list/symbol structure), so they are traced by the GC.
+#[derive(Debug, Clone)]
+pub struct SyntaxRules {
+    pub literals: Vec<Spur>,
+    pub ellipsis: Spur,
+    /// Each entry is `(pattern, template)`.
+    pub rules: Vec<(Value, Value)>,
 }
 
 /// A lazy promise: delay/force with memoization.

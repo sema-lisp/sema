@@ -1,0 +1,57 @@
+;; Grow the language with hygienic `syntax-rules` macros
+;;
+;; Macros transform code before it runs, so they can add control flow a
+;; function never could (a function evaluates its arguments first — a loop
+;; can't). `syntax-rules` matches a pattern and rewrites it into a template,
+;; with two superpowers:
+;;   • ellipsis `...` for variable-arity patterns, and
+;;   • HYGIENE — names a macro introduces can't clash with your names, and a
+;;     macro's template can freely call your own functions.
+
+;; A new control form: `while`. Impossible as a function — `test` and `body`
+;; must be re-evaluated each pass, not evaluated once up front.
+(define-syntax while
+  (syntax-rules ()
+    ((_ test body ...)
+     (let loop ()
+       (when test
+         body ...
+         (loop))))))
+
+;; `swap!` introduces a temporary `tmp`. Hygiene guarantees it never captures
+;; (or is captured by) a `tmp` in your code — try it below.
+(define-syntax swap!
+  (syntax-rules ()
+    ((_ a b) (let ((tmp a)) (set! a b) (set! b tmp)))))
+
+;; Two rules, matched top-to-bottom: `(inc! x)` and `(inc! x n)`.
+(define-syntax inc!
+  (syntax-rules ()
+    ((_ x)   (set! x (+ x 1)))
+    ((_ x n) (set! x (+ x n)))))
+
+;; Ellipsis in action: average of any number of arguments (`x ...` used twice).
+(define-syntax average
+  (syntax-rules ()
+    ((_ x ...) (/ (+ x ...) (length (list x ...))))))
+
+;; ── Use the macros ──
+
+;; Iterative Fibonacci built from `while` + `swap!` + `inc!`.
+(define (fib n)
+  (let ((a 0) (b 1) (i 0))
+    (while (< i n)
+      (set! b (+ a b))   ; b = a + b
+      (swap! a b)        ; (a, b) = (b, a+b)
+      (inc! i))
+    a))
+
+(println "fib 0..10: " (map fib (list 0 1 2 3 4 5 6 7 8 9 10)))
+(println "average:   " (average 10 20 30 40))
+
+;; Hygiene, demonstrated: our own `tmp` survives a `swap!` that uses `tmp`.
+(define tmp "my precious data")
+(define x 111)
+(define y 222)
+(swap! x y)
+(println "after swap!:  x=" x "  y=" y "  tmp=" tmp "  ← untouched")

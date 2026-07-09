@@ -631,6 +631,14 @@ pub fn trace_value(v: &Value, sink: &mut dyn FnMut(GcEdge)) -> bool {
             for expr in &m.body {
                 sink(GcEdge::Value(expr));
             }
+            // syntax-rules transformers hold quoted pattern/template data as
+            // Values — trace them so they are not untraced roots.
+            if let Some(sr) = &m.syntax_rules {
+                for (pat, tmpl) in &sr.rules {
+                    sink(GcEdge::Value(pat));
+                    sink(GcEdge::Value(tmpl));
+                }
+            }
             true
         }
         ValueViewRef::Lambda(l) => {

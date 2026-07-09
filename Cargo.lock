@@ -3996,6 +3996,7 @@ dependencies = [
  "num-rational",
  "sema-core",
  "sema-reader",
+ "smallvec",
 ]
 
 [[package]]

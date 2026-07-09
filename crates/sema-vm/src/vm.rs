@@ -2,6 +2,8 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
 use std::rc::{Rc, Weak};
 
+use smallvec::SmallVec;
+
 use sema_core::{
     bits_to_spur,
     error::{suggest_similar, veteran_hint, CallFrame as CoreCallFrame, StackTrace},
@@ -2084,11 +2086,14 @@ impl VM {
                         // that crossing point (see close_closure_upvalues_for_foreign_run).
                         let native = self.native_fns[native_id].clone();
                         let args_start = self.stack.len() - argc;
-                        // Copy args into an owned Vec and drop them from the stack
-                        // before the call so no borrow of self.stack is held while
-                        // the native may re-enter this VM (run_nested_closure needs
-                        // &mut self via the CURRENT_VM pointer).
-                        let call_args: Vec<Value> = self.stack.split_off(args_start);
+                        // Move args into an owned buffer and drop them from the
+                        // stack before the call so no borrow of self.stack is held
+                        // while the native may re-enter this VM (run_nested_closure
+                        // needs &mut self via the CURRENT_VM pointer). SmallVec
+                        // keeps argc <= 8 off the heap; drain moves without
+                        // refcount traffic.
+                        let call_args: SmallVec<[Value; 8]> =
+                            self.stack.drain(args_start..).collect();
                         let result = {
                             let _vm_guard = CurrentVmGuard::enter(self);
                             (native.func)(ctx, &call_args)
@@ -2869,12 +2874,12 @@ impl VM {
                 return self.call_vm_closure(closure, argc);
             }
             // C1: keep open upvalues open across the call so a re-entrant
-            // in-VM HOF callback can write back through them. Copy args into an
-            // owned Vec (releasing the stack borrow) so the native may re-enter
-            // this VM via run_nested_closure. Closures crossing onto a foreign
-            // stack are snapshotted at the crossing point.
+            // in-VM HOF callback can write back through them. Move args into an
+            // owned buffer (releasing the stack borrow) so the native may
+            // re-enter this VM via run_nested_closure. Closures crossing onto a
+            // foreign stack are snapshotted at the crossing point.
             let func_rc = self.stack[func_idx].as_native_fn_rc().unwrap();
-            let call_args: Vec<Value> = self.stack.split_off(func_idx + 1);
+            let call_args: SmallVec<[Value; 8]> = self.stack.drain(func_idx + 1..).collect();
             self.stack.pop(); // pop the native fn value
             let result = {
                 let _vm_guard = CurrentVmGuard::enter(self);
@@ -2902,11 +2907,11 @@ impl VM {
         } else {
             // C1: keep upvalues open across the callback. The callback may
             // re-enter this VM (e.g. a multimethod whose handler is a VM
-            // closure). Copy args into an owned Vec so no stack borrow is held
-            // during the (possibly re-entrant) call. Closures crossing onto a
-            // foreign stack are snapshotted at the crossing point.
+            // closure). Move args into an owned buffer so no stack borrow is
+            // held during the (possibly re-entrant) call. Closures crossing
+            // onto a foreign stack are snapshotted at the crossing point.
             let func_val = self.stack[func_idx].clone();
-            let call_args: Vec<Value> = self.stack.split_off(func_idx + 1);
+            let call_args: SmallVec<[Value; 8]> = self.stack.drain(func_idx + 1..).collect();
             self.stack.pop(); // pop the callable value
             let result = {
                 let _vm_guard = CurrentVmGuard::enter(self);
@@ -2958,12 +2963,13 @@ impl VM {
         ctx: &EvalContext,
     ) -> Result<(), SemaError> {
         if func_val.raw_tag() == Some(TAG_NATIVE_FN) {
-            // C1: keep upvalues open; copy args so the native may re-enter this
-            // VM via run_nested_closure without an outstanding stack borrow.
-            // Closures crossing onto a foreign stack are snapshotted there.
+            // C1: keep upvalues open; move args off the stack so the native may
+            // re-enter this VM via run_nested_closure without an outstanding
+            // stack borrow. Closures crossing onto a foreign stack are
+            // snapshotted there.
             let func_rc = func_val.as_native_fn_rc().unwrap();
             let args_start = self.stack.len() - argc;
-            let call_args: Vec<Value> = self.stack.split_off(args_start);
+            let call_args: SmallVec<[Value; 8]> = self.stack.drain(args_start..).collect();
             let result = {
                 let _vm_guard = CurrentVmGuard::enter(self);
                 (func_rc.func)(ctx, &call_args)
@@ -2986,11 +2992,12 @@ impl VM {
             self.stack.push(result);
             Ok(())
         } else {
-            // C1: keep upvalues open; copy args so a re-entrant callback can
-            // run in-VM without an outstanding stack borrow. Closures crossing
-            // onto a foreign stack are snapshotted at the crossing point.
+            // C1: keep upvalues open; move args off the stack so a re-entrant
+            // callback can run in-VM without an outstanding stack borrow.
+            // Closures crossing onto a foreign stack are snapshotted at the
+            // crossing point.
             let args_start = self.stack.len() - argc;
-            let call_args: Vec<Value> = self.stack.split_off(args_start);
+            let call_args: SmallVec<[Value; 8]> = self.stack.drain(args_start..).collect();
             let result = {
                 let _vm_guard = CurrentVmGuard::enter(self);
                 sema_core::call_callback(ctx, &func_val, &call_args)

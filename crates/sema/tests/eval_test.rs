@@ -2001,6 +2001,10 @@ eval_tests! {
     string_append_coerce_num: r#"(string-append "n=" 42)"# => Value::string("n=42"),
     // N-ary string-append stays on the generic path and must still work.
     string_append_nary: r#"(string-append "a" "b" "c" "d")"# => Value::string("abcd"),
+    // More than 8 args exercises the native-call arg buffer's heap-spill path.
+    string_append_many_args:
+        r#"(string-append "a" "b" "c" "d" "e" "f" "g" "h" "i" "j")"# => Value::string("abcdefghij"),
+    native_call_many_args: "(max 1 2 3 4 5 6 7 8 9 10)" => Value::int(10),
     // Multi-byte operands exercise the exact-capacity concat path.
     string_append_unicode: r#"(string-append "hé" "llø")"# => Value::string("héllø"),
 

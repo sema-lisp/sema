@@ -70,9 +70,11 @@ fn measure(warmup: impl FnOnce(), f: impl FnOnce()) -> isize {
     live_bytes() - before
 }
 
+// The self-call must be non-tail: a tail-only self-recursion elides its self
+// capture (issue #62) and never forms the cycle this oracle measures.
 const CHURN_RECURSIVE: &str = r#"
 (define (churn)
-  (define (loop n) (if (<= n 0) 0 (loop (- n 1))))
+  (define (loop n) (if (<= n 0) 0 (+ 1 (loop (- n 1)))))
   (loop 3))
 (define (run n)
   (if (<= n 0) nil

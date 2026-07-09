@@ -473,11 +473,19 @@ impl Compiler {
     ) -> Result<(), SemaError> {
         // Peephole: (if (not X) then else) → compile X, JumpIfTrue to else
         // Avoids emitting NOT + JumpIfFalse, saving one opcode dispatch.
-        if let ResolvedExpr::Call { func, args, .. } = test {
+        // Fires exactly when the Not intrinsic would: a global `not` not
+        // (re)defined in this program — a redefined `not` must dispatch to
+        // the user's definition. Peeks through a span wrapper on the test
+        // (the Not that would carry the span is never emitted).
+        let bare_test = match test {
+            ResolvedExpr::Spanned(_, inner) => inner.as_ref(),
+            other => other,
+        };
+        if let ResolvedExpr::Call { func, args, .. } = bare_test {
             if args.len() == 1 {
                 if let ResolvedExpr::Var(vr) = func.as_ref() {
                     if let VarResolution::Global { spur } = vr.resolution {
-                        if resolve_spur(spur) == "not" {
+                        if resolve_spur(spur) == "not" && !self.redefined_globals.contains(&spur) {
                             self.compile_expr(&args[0])?;
                             let else_jump = self.emit.emit_jump(Op::JumpIfTrue);
                             self.compile_expr(then)?;
@@ -538,8 +546,12 @@ impl Compiler {
     // --- Lambda ---
 
     fn compile_lambda(&mut self, def: &LambdaDef<VarRef>) -> Result<(), SemaError> {
-        // Compile the lambda body into a separate function
+        // Compile the lambda body into a separate function. The redefinition
+        // guard travels with it: intrinsics and the if-not peephole must
+        // dispatch generically to a (re)defined global at any nesting depth,
+        // not just in the top-level chunk.
         let mut inner = Compiler::new();
+        inner.redefined_globals = self.redefined_globals.clone();
         inner.n_locals = def.n_locals;
         for (slot, &name) in def.params.iter().enumerate() {
             inner.local_names.push((slot as u16, name));
@@ -1633,6 +1645,32 @@ mod tests {
         );
         // Should NOT contain Not opcode
         assert!(!inner_ops.contains(&Op::Not));
+    }
+
+    #[test]
+    fn test_compile_if_not_peephole_guarded_by_redefinition() {
+        // A `not` (re)defined anywhere in the program disables the peephole:
+        // the test dispatches to the user's `not` (generic global call) and
+        // the if branches with JumpIfFalse.
+        let result = compile_many_str("(define not (lambda (x) x)) (lambda (x) (if (not x) 1 2))");
+        let if_fn = result
+            .functions
+            .iter()
+            .find(|f| {
+                let ops = extract_ops(&f.chunk);
+                ops.contains(&Op::JumpIfFalse) || ops.contains(&Op::JumpIfTrue)
+            })
+            .expect("the lambda containing the if");
+        let ops = extract_ops(&if_fn.chunk);
+        assert!(
+            !ops.contains(&Op::JumpIfTrue),
+            "redefined `not` must not trigger the polarity peephole: {ops:?}"
+        );
+        assert!(
+            ops.contains(&Op::CallGlobal),
+            "the test must dispatch to the user-defined `not`: {ops:?}"
+        );
+        assert!(!ops.contains(&Op::Not), "no Not intrinsic either: {ops:?}");
     }
 
     // --- Let forms ---

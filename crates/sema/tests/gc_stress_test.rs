@@ -504,7 +504,9 @@ fn deep_closure_capture_chain_live_and_garbage() {
     // NativeFn → payload → closure → cell → NativeFn per link, so the
     // worklist (not native recursion) must carry the depth. The live chain
     // returns its full length before and after a 500-link garbage chain
-    // (hung off a recursive closure) is reclaimed.
+    // (hung off a recursive closure) is reclaimed. `r`'s inner self-call is
+    // non-tail so the closure really self-captures — a tail-only
+    // self-recursion elides the capture (issue #62) and forms no cycle.
     let v = eval_ok(
         "(begin
            (gc/collect)
@@ -518,7 +520,7 @@ fn deep_closure_capture_chain_live_and_garbage() {
            (define total (chain))
            (define (mk-garbage-chain)
              (define c (make-chain 500))
-             (define (r k) (if (<= k 0) c (r (- k 1))))
+             (define (r k) (if (<= k 0) c (r (r (- k 1)))))
              nil)
            (mk-garbage-chain)
            (list total (> (:collected (gc/collect)) 500) (chain)))",
@@ -608,7 +610,11 @@ fn deep_nested_list_garbage_collected_without_crash_live_kept() {
     // A 3000-deep nested list hangs off a garbage recursive closure's cell:
     // MarkGray/Scan/CollectWhite must walk it with worklists (a per-level
     // native frame would overflow). The same structure held live must come
-    // back intact — full depth verified by walking it.
+    // back intact — full depth verified by walking it. The garbage `r`'s
+    // inner self-call is non-tail so the closure really self-captures — a
+    // tail-only self-recursion elides the capture (issue #62) and forms no
+    // cycle; the live `r` keeps the tail shape to pin that an elided closure
+    // still resolves its captures when called.
     let v = eval_ok(
         "(begin
            (gc/collect)
@@ -616,7 +622,7 @@ fn deep_nested_list_garbage_collected_without_crash_live_kept() {
            (define (depth v acc) (if (list? v) (depth (first v) (+ acc 1)) acc))
            (define (mk-garbage)
              (define deep (nest 3000 42))
-             (define (r k) (if (<= k 0) deep (r (- k 1))))
+             (define (r k) (if (<= k 0) deep (r (r (- k 1)))))
              nil)
            (mk-garbage)
            (define freed (:collected (gc/collect)))

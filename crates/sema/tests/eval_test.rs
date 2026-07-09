@@ -1662,6 +1662,56 @@ eval_tests! {
     string_to_number_complex: "(string->number \"3+4i\")" => common::eval("3+4i"),
 }
 
+// `string->number` decimal fast path: plain i64/float token shapes parse
+// directly; every other input falls back to the reader round-trip. This is a
+// differential suite across that boundary — each expected literal is the
+// output of the reader-backed path, so fast-path and fallback answers must
+// coincide exactly (including the deliberate rejections: the lexer reads
+// `+5`, `.5`, `5.`, `1e`, and `1_000` as symbols or multiple tokens).
+eval_tests! {
+    str2num_int: r#"(string->number "42")"# => Value::int(42),
+    str2num_negative_int: r#"(string->number "-5")"# => Value::int(-5),
+    str2num_leading_zeros: r#"(string->number "007")"# => Value::int(7),
+    str2num_negative_zero_int: r#"(string->number "-0")"# => Value::int(0),
+    str2num_plus_prefix_rejected: r#"(string->number "+5")"# => Value::bool(false),
+    str2num_underscores_rejected: r#"(string->number "1_000")"# => Value::bool(false),
+    str2num_float: r#"(string->number "12.5")"# => Value::float(12.5),
+    str2num_neg_float: r#"(string->number "-12.5")"# => Value::float(-12.5),
+    str2num_zero_float: r#"(string->number "0.0")"# => Value::float(0.0),
+    str2num_exponent: r#"(string->number "1e3")"# => Value::float(1000.0),
+    str2num_exponent_upper: r#"(string->number "1E3")"# => Value::float(1000.0),
+    str2num_exponent_neg_sign: r#"(string->number "1.5e-3")"# => Value::float(0.0015),
+    str2num_exponent_pos_sign: r#"(string->number "2e+2")"# => Value::float(200.0),
+    str2num_huge_exponent_is_inf: r#"(string->number "1e999")"# => Value::float(f64::INFINITY),
+    str2num_neg_zero_float_keeps_sign:
+        r#"(< (/ 1.0 (string->number "-0.0")) 0.0)"# => Value::bool(true),
+    str2num_leading_dot_rejected: r#"(string->number ".5")"# => Value::bool(false),
+    str2num_trailing_dot_rejected: r#"(string->number "5.")"# => Value::bool(false),
+    str2num_neg_leading_dot_rejected: r#"(string->number "-.5")"# => Value::bool(false),
+    str2num_bare_exponent_rejected: r#"(string->number "1e")"# => Value::bool(false),
+    str2num_bare_exponent_sign_rejected: r#"(string->number "1e+")"# => Value::bool(false),
+    str2num_double_dot_rejected: r#"(string->number "1..2")"# => Value::bool(false),
+    str2num_second_dot_rejected: r#"(string->number "1.2.3")"# => Value::bool(false),
+    str2num_surrounding_whitespace: "(string->number \" \\t42\\n \")" => Value::int(42),
+    str2num_comment_after_token: r#"(string->number "42 ; c")"# => Value::int(42),
+    str2num_empty_rejected: r#"(string->number "")"# => Value::bool(false),
+    str2num_blank_rejected: r#"(string->number "   ")"# => Value::bool(false),
+    str2num_minus_alone_rejected: r#"(string->number "-")"# => Value::bool(false),
+    str2num_i64_max: r#"(string->number "9223372036854775807")"# => Value::int(i64::MAX),
+    str2num_i64_min: r#"(string->number "-9223372036854775808")"# => Value::int(i64::MIN),
+    str2num_bignum_above_i64: r#"(string->number "9223372036854775808")"#
+        => common::eval("9223372036854775808"),
+    str2num_bignum_below_i64: r#"(string->number "-9223372036854775809")"#
+        => common::eval("-9223372036854775809"),
+    str2num_rational_falls_back: r#"(string->number "1/2")"# => common::eval("1/2"),
+    str2num_hex_prefix_falls_back: r##"(string->number "#x10")"## => Value::int(16),
+    str2num_imaginary_falls_back: r#"(string->number "2i")"# => common::eval("2i"),
+    str2num_inf_symbol_form: r#"(string->number "inf")"# => Value::float(f64::INFINITY),
+    str2num_nan_symbol_form: r#"(math/nan? (string->number "nan"))"# => Value::bool(true),
+    str2num_r7rs_inf_form_rejected: r#"(string->number "+inf.0")"# => Value::bool(false),
+    str2num_r7rs_neg_inf_form_rejected: r#"(string->number "-inf.0")"# => Value::bool(false),
+}
+
 // Task 5.7: `exact-integer-sqrt` (isqrt with remainder, bignum-aware) and
 // `rationalize` (simplest rational within a tolerance, R7RS exactness
 // contagion). `rationalize`'s expected literals are the actual output of the
@@ -1899,6 +1949,55 @@ eval_error_tests! {
     optimizer_rest_param_shadows_builtin: "((lambda (x . +) (+ 1 2)) 9 5)",
 }
 
+// ============================================================
+// (if (not X) then else) branch-polarity peephole
+//
+// The compiler folds the Not into the branch (compile X, invert the jump).
+// These pin that exactly one arm — the right one — evaluates, and that the
+// fold is suppressed when `not` is (re)defined in the same program, matching
+// the Not intrinsic's redefinition guard.
+// ============================================================
+
+eval_tests! {
+    // Side-effecting arms: only the taken arm may run.
+    if_not_polarity_takes_else_arm:
+        "(begin
+           (define log '())
+           (define (note v) (set! log (cons v log)) v)
+           (define (pick x) (if (not x) (note 'then-arm) (note 'else-arm)))
+           (list (pick #t) log))" => common::eval("'(else-arm (else-arm))"),
+    if_not_polarity_takes_then_arm:
+        "(begin
+           (define log '())
+           (define (note v) (set! log (cons v log)) v)
+           (define (pick x) (if (not x) (note 'then-arm) (note 'else-arm)))
+           (list (pick #f) log))" => common::eval("'(then-arm (then-arm))"),
+    // Nested (not (not x)) keeps double-negation semantics.
+    if_not_not_polarity:
+        "(begin (define (pick x) (if (not (not x)) 'truthy 'falsy)) (list (pick 1) (pick #f)))"
+        => common::eval("'(truthy falsy)"),
+    // A user-defined `not` in the same program disables the fold: the if
+    // dispatches to the redefinition (identity here), so a truthy argument
+    // takes the then arm.
+    if_not_redefined_before_use:
+        "(begin
+           (define not (lambda (x) x))
+           (define (pick x) (if (not x) 'not-was-truthy 'not-was-falsy))
+           (list (pick 1) (pick #f)))" => common::eval("'(not-was-truthy not-was-falsy)"),
+    // Define-after-use: the guard scans the whole program, so a later
+    // (define not ...) still disables the fold for earlier code.
+    if_not_redefined_after_use:
+        "(begin
+           (define (pick x) (if (not x) 'not-was-truthy 'not-was-falsy))
+           (define not (lambda (x) x))
+           (list (pick 1) (pick #f)))" => common::eval("'(not-was-truthy not-was-falsy)"),
+    // A lexically shadowed `not` resolves as a local, never as the global
+    // intrinsic — no fold, the local binding is called.
+    if_not_lexically_shadowed:
+        "(let ((not (lambda (x) x))) (if (not 1) 'shadow-truthy 'shadow-falsy))"
+        => common::eval("'shadow-truthy"),
+}
+
 // Wide-integer runtime arithmetic: operands beyond the ±2^44 small-int fast-path
 // range, applied via a lambda so the optimizer cannot constant-fold them. This
 // exercises the vm_add/vm_sub/vm_mul fallback helpers at runtime (the small-int
@@ -2058,10 +2157,12 @@ eval_tests! {
     gc_collect_returns_stats_map: "(map? (gc/collect))" => Value::bool(true),
     gc_stats_has_registry_size: "(integer? (:registry-size (gc/stats)))" => Value::bool(true),
     // Direct self-recursion (shape U): the churned closure's cell⇄closure
-    // cycle is unreachable after the call and must be reclaimed.
+    // cycle is unreachable after the call and must be reclaimed. The self-call
+    // is non-tail — a tail-only self-recursion elides its self capture
+    // (issue #62) and never forms the cycle.
     gc_self_recursive_local_collected: "(begin
         (define (churn)
-          (define (loop n) (if (<= n 0) 0 (loop (- n 1))))
+          (define (loop n) (if (<= n 0) 0 (+ 1 (loop (- n 1)))))
           (loop 3))
         (churn)
         (> (:collected (gc/collect)) 0))" => Value::bool(true),
@@ -2187,6 +2288,51 @@ eval_tests! {
     // is disabled and the real self-capture is retained — result must be right.
     stc_escape_as_value:
         "(let loop ((n 3) (acc '())) (if (= n 0) (length acc) (loop (- n 1) (cons loop acc))))" => Value::int(3),
+
+    // --- Internal defines get the same treatment as letrec bindings ---
+
+    // Deep self-tail recursion through an internal define reuses the frame
+    // (SelfTailCall): 1e6 iterations must not grow the stack.
+    stc_internal_define_deep_tco:
+        "(begin
+           (define (run)
+             (define (loop n acc) (if (= n 0) acc (loop (- n 1) (+ acc 1))))
+             (loop 1000000 0))
+           (run))" => Value::int(1000000),
+    // Internal define capturing an outer local referenced before the
+    // self-call: dropping the self upvalue shifts the other capture down.
+    stc_internal_define_capture_remap:
+        "(begin
+           (define (run c)
+             (define (loop n) (if (> n 0) (loop (- n 1)) c))
+             (loop 5))
+           (run 100))" => Value::int(100),
+    // Escape inside the define's own body (name consed into a list) disables
+    // the opt; the real self-capture keeps working.
+    stc_internal_define_escape_as_value:
+        "(begin
+           (define (run)
+             (define (loop n acc) (if (= n 0) (length acc) (loop (- n 1) (cons loop acc))))
+             (loop 3 '()))
+           (run))" => Value::int(3),
+    // The define's name returned as a value from the ENCLOSING function is a
+    // plain local load in the outer frame; the returned closure still
+    // self-recurses correctly.
+    stc_internal_define_returned_fn:
+        "(begin
+           (define (mk)
+             (define (f n) (if (= n 0) 'done (f (- n 1))))
+             f)
+           ((mk) 5))" => common::eval("'done"),
+    // Mutually recursive internal defines reference each OTHER (no self
+    // upvalue to elide); cross-captures must survive untouched.
+    stc_internal_define_mutual_recursion:
+        "(begin
+           (define (run n)
+             (define (ev? x) (if (= x 0) #t (od? (- x 1))))
+             (define (od? x) (if (= x 0) #f (ev? (- x 1))))
+             (ev? n))
+           (list (run 10) (run 11)))" => common::eval("'(#t #f)"),
 }
 
 eval_error_tests! {

@@ -290,7 +290,12 @@ fn resolve_expr_inner(expr: &CoreExpr, r: &mut Resolver) -> Result<ResolvedExpr,
                     .current()
                     .find_local(*spur)
                     .unwrap_or_else(|| r.define_local(*spur));
-                let val = resolve_expr(expr, r)?;
+                let mut val = resolve_expr(expr, r)?;
+                // A self-recursive internal define gets the same self-tail-call
+                // optimization as a letrec binding (issue #62): a lambda that
+                // references its own name only as a tail-call operator elides
+                // the self upvalue and self-calls compile to SelfTailCall.
+                optimize_self_tail(&mut val, slot);
                 Ok(ResolvedExpr::Set(
                     VarRef {
                         name: *spur,
@@ -1930,6 +1935,51 @@ mod tests {
             loop_fn.upvalues.len(),
             1,
             "inner-lambda capture keeps the self upvalue"
+        );
+    }
+
+    /// Extract the lambda assigned by the first internal define of a
+    /// single-lambda top-level source.
+    fn internal_define_lambda(src: &str) -> LambdaDef<VarRef> {
+        match resolve_str(src) {
+            ResolvedExpr::Lambda(def) => match &def.body[0] {
+                ResolvedExpr::Set(_, val) => match val.as_ref() {
+                    ResolvedExpr::Lambda(inner) => inner.clone(),
+                    other => panic!("expected Lambda RHS, got {other:?}"),
+                },
+                other => panic!("expected Set for internal define, got {other:?}"),
+            },
+            other => panic!("expected Lambda, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_self_tail_call_internal_define_elides_self_upvalue() {
+        // An internal define whose lambda references its own name only as a
+        // tail-call operator gets the letrec treatment: self upvalue elided,
+        // self-call resolved to SelfFn.
+        let loop_fn = internal_define_lambda(
+            "(lambda () (define (loop n) (if (= n 0) n (loop (- n 1)))) (loop 5))",
+        );
+        assert!(
+            loop_fn.upvalues.is_empty(),
+            "self upvalue should be elided, got {:?}",
+            loop_fn.upvalues
+        );
+        assert_eq!(self_call_resolution(&loop_fn), VarResolution::SelfFn);
+    }
+
+    #[test]
+    fn test_self_tail_call_internal_define_escape_keeps_upvalue() {
+        // The define's name used as a value inside its own body (consed into a
+        // list) keeps the real self upvalue.
+        let loop_fn = internal_define_lambda(
+            "(lambda () (define (loop n) (if (= n 0) n (car (list loop n)))) (loop 5))",
+        );
+        assert_eq!(
+            loop_fn.upvalues.len(),
+            1,
+            "escaping define name keeps its self upvalue"
         );
     }
 

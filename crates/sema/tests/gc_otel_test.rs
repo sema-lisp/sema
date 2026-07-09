@@ -27,12 +27,13 @@ fn gc_pass_emits_gc_collect_span_with_trigger_and_stats() {
 
     // Recursive-closure churn: each `churn` call creates a self-recursive
     // local closure that becomes a garbage Rc cycle immediately — the exact
-    // shape the collector reclaims. 100 iterations stay under the collection
-    // threshold, so the cycles are still uncollected when the explicit
-    // `(gc/collect)` runs.
+    // shape the collector reclaims. The self-call is non-tail (a tail-only
+    // self-recursion elides its self capture, issue #62, and forms no cycle).
+    // 100 iterations stay under the collection threshold, so the cycles are
+    // still uncollected when the explicit `(gc/collect)` runs.
     let src = r#"
         (define (churn)
-          (define (loop n) (if (<= n 0) 0 (loop (- n 1))))
+          (define (loop n) (if (<= n 0) 0 (+ 1 (loop (- n 1)))))
           (loop 3))
         (define (run n) (if (<= n 0) 0 (begin (churn) (run (- n 1)))))
         (run 100)

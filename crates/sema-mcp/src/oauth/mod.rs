@@ -17,6 +17,7 @@ pub mod discovery;
 pub mod flow;
 pub mod login;
 pub mod loopback;
+pub mod scoped;
 pub mod store;
 
 use oauth2::{CsrfToken, PkceCodeChallenge, PkceCodeVerifier};

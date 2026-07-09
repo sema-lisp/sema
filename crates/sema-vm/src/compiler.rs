@@ -1325,7 +1325,7 @@ impl Compiler {
 
     // --- Forms that delegate to runtime native calls ---
     // These forms cannot be fully compiled to bytecode because they need
-    // access to the tree-walker (eval, macros, modules) or have complex
+    // access to the evaluator (eval, macros, modules) or have complex
     // runtime semantics. They are compiled as calls to well-known global
     // functions that the VM/interpreter provides.
 

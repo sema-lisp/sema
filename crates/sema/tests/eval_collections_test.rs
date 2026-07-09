@@ -57,8 +57,7 @@ eval_tests! {
 // ============================================================
 
 eval_tests! {
-    // Foundational ops: hand-constructed expected values so the oracle does not
-    // depend on the tree-walker (see docs/bugs/eval-tw-oracle-circularity.md).
+    // Foundational ops: hand-constructed expected values.
     list_car: "(car '(1 2 3))" => Value::int(1),
     list_cdr: "(cdr '(1 2 3))" => Value::list(vec![Value::int(2), Value::int(3)]),
     list_cons: "(cons 1 '(2 3))" => Value::list(vec![Value::int(1), Value::int(2), Value::int(3)]),

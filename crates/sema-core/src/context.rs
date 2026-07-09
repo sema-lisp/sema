@@ -30,8 +30,8 @@ pub struct EvalContext {
     pub max_eval_depth: Cell<usize>,
     pub eval_step_limit: Cell<usize>,
     pub eval_steps: Cell<usize>,
-    /// Optional wall-clock deadline for evaluation. When set, both the
-    /// tree-walker and the bytecode VM periodically check whether the current
+    /// Optional wall-clock deadline for evaluation. When set,
+    /// the bytecode VM periodically checks whether the current
     /// time has passed this instant and, if so, abort with an error. Used by
     /// the notebook engine to bound how long a single cell evaluation can run.
     pub eval_deadline: Cell<Option<Instant>>,

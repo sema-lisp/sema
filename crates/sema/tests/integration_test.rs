@@ -1770,8 +1770,7 @@ fn test_type_errors() {
     assert!(matches!(err.inner(), SemaError::Type { .. }));
     let err = eval_err("(car 42)");
     assert!(matches!(err.inner(), SemaError::Type { .. }));
-    // NOTE: `(< "a" "b")` is a *type error on the tree-walker* but the VM (the
-    // sole evaluator) supports lexicographic string comparison, returning #t.
+    // NOTE: `(< "a" "b")` supports lexicographic string comparison, returning #t.
     // That VM capability is the canonical behavior now, so this is no longer a
     // type-error case.
     assert_eq!(eval(r#"(< "a" "b")"#), Value::bool(true));
@@ -5486,9 +5485,9 @@ fn test_delay_memoization() {
 
 #[test]
 fn test_force_non_promise() {
-    // Calling `force` on a non-promise is now an error (D4): previously the
-    // tree-walker silently returned the argument as-is, but this hid bugs and
-    // diverged from the VM intrinsic. Both backends now reject non-promises.
+    // Calling `force` on a non-promise is now an error (D4): previously it
+    // silently returned the argument as-is, but this hid bugs and
+    // diverged from the VM intrinsic. Non-promises are now rejected.
     let err = eval_err("(force 42)");
     assert!(
         format!("{err}").contains("thunk"),
@@ -7178,7 +7177,7 @@ fn test_sandbox_fs_read_denied() {
 
 // EVAL-3: `import` must be gated behind FS_READ like other filesystem reads.
 // Without the sandbox check, a restricted interpreter could read arbitrary
-// source files off disk via (import ...) on the tree-walker backend.
+// source files off disk via (import ...).
 #[test]
 fn test_sandbox_import_denied() {
     let sandbox = sema_core::Sandbox::deny(sema_core::Caps::FS_READ);

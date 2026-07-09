@@ -132,7 +132,7 @@ impl Interpreter {
 
     /// Evaluate a single expression on the VM. M6: the VM is the sole evaluator.
     ///
-    /// NOTE (deliberate behavior change vs. the retired tree-walker): all eval
+    /// NOTE (deliberate behavior change): all eval
     /// entry points now run in the global env, so top-level `define`s persist
     /// across calls. The old `eval`/`eval_str` child-env isolation is gone —
     /// maintaining two env semantics was the dual-evaluator complexity being
@@ -256,7 +256,7 @@ pub fn expand_for_vm_in(ctx: &EvalContext, env: &Env, expr: &Value) -> EvalResul
             let name = resolve(s);
             if name == "defmacro" {
                 // Register the macro directly (pure destructure) — the VM macro
-                // path must not route through the tree-walker's `eval_value`.
+                // path is direct.
                 register_defmacro(items, env)?;
                 return Ok(Value::nil());
             }
@@ -304,8 +304,7 @@ fn expand_macros_in(ctx: &EvalContext, env: &Env, expr: &Value) -> EvalResult {
                             let expanded = crate::syntax_rules::expand(&mac, &items[1..], env)?;
                             return expand_macros_in(ctx, env, &expanded);
                         }
-                        // VM-native expansion: apply the transformer on the VM,
-                        // not the tree-walker.
+                        // VM-native expansion: apply the transformer on the VM.
                         let expanded = apply_macro_vm(ctx, &mac, &items[1..], env)?;
                         return expand_macros_in(ctx, env, &expanded);
                     }
@@ -448,8 +447,8 @@ pub fn eval_module_body_vm(
 
 /// VM-native evaluation for callback consumers (e.g. sema-llm tool handlers):
 /// macro-expand, compile, and run `expr` on a fresh bytecode VM rooted at `env`.
-/// This is the VM-backed counterpart of `eval_value`, used to keep the
-/// eval-callback path off the tree-walker (M5 / Phase 1c). Each call builds a
+/// This is used to keep the
+/// eval-callback path on the VM. Each call builds a
 /// throwaway VM over a clone of `env` (sharing its bindings), so it is suited to
 /// one-shot evaluation rather than a persistent define-accumulating session.
 pub fn eval_value_vm(ctx: &EvalContext, expr: &Value, env: &Env) -> EvalResult {
@@ -474,8 +473,7 @@ pub fn call_value(ctx: &EvalContext, func: &Value, args: &[Value]) -> EvalResult
         ValueView::NativeFn(native) => (native.func)(ctx, args),
         ValueView::Lambda(_) => {
             // Raw `Lambda` values never occur on the VM path (user lambdas are
-            // NativeFn-wrapped VM closures); the tree-walker that produced them
-            // has been retired.
+            // NativeFn-wrapped VM closures).
             Err(SemaError::eval(
                 "internal: raw lambda value reached call_value (VM closures are native-fn-wrapped)"
                     .to_string(),
@@ -545,9 +543,9 @@ fn call_multimethod(ctx: &EvalContext, mm: &Rc<MultiMethod>, args: &[Value]) -> 
 /// Run a trampoline to completion iteratively.
 /// Used by `call_value` so that stdlib HOF callbacks (map, for-each, etc.)
 /// don't grow the Rust call stack for every evaluation step.
-/// Apply a macro by evaluating its body on the **bytecode VM** (no tree-walker).
+/// Apply a macro by evaluating its body on the **bytecode VM**.
 ///
-/// This is the VM-native counterpart of [`apply_macro`]. The macro's
+/// The macro's
 /// (unevaluated) arguments are bound — together with a possible rest list — as
 /// *globals* in a transient child env of `caller_env`; the transformer body is
 /// then compiled fresh per call site (so auto-gensym stays hygienic — a cached
@@ -557,8 +555,7 @@ fn call_multimethod(ctx: &EvalContext, mm: &Rc<MultiMethod>, args: &[Value]) -> 
 /// globals lets the compiled body resolve them via `GetGlobal`.
 ///
 /// Used by the VM macro pre-expansion path (`expand_macros_in`) and
-/// `__vm-macroexpand`. The tree-walker's own lazy expansion keeps using
-/// [`apply_macro`] until the tree-walker is retired.
+/// `__vm-macroexpand`.
 pub fn apply_macro_vm(
     ctx: &EvalContext,
     mac: &sema_core::Macro,
@@ -567,7 +564,7 @@ pub fn apply_macro_vm(
 ) -> Result<Value, SemaError> {
     let env = Rc::new(Env::with_parent(Rc::new(caller_env.clone())));
 
-    // Bind parameters to unevaluated forms (same arity rules as apply_macro).
+    // Bind parameters to unevaluated forms.
     if let Some(rest) = mac.rest_param {
         if args.len() < mac.params.len() {
             return Err(SemaError::arity(
@@ -600,8 +597,7 @@ pub fn apply_macro_vm(
     // macros do) must be compiled as data, not re-expanded. Any macro call the
     // transformer *produces* is re-expanded by the caller (`expand_macros_in`
     // recurses on the returned form). `compile_program` lowers quasiquote /
-    // unquote / unquote-splicing directly, matching the tree-walker's
-    // `eval_value` over the same body.
+    // unquote / unquote-splicing directly.
     let mut result = Value::nil();
     for expr in &mac.body {
         let prog = sema_vm::compile_program(std::slice::from_ref(expr), None)?;
@@ -611,9 +607,9 @@ pub fn apply_macro_vm(
     Ok(result)
 }
 
-/// Register a `defmacro` form's macro in `env` **without** the tree-walker — a
+/// Register a `defmacro` form's macro in `env` — a
 /// pure destructure mirroring `special_forms::eval_defmacro`. Used by the VM
-/// pre-expansion path so registering a macro never routes through `eval_value`.
+/// pre-expansion path so registering a macro is direct.
 fn register_defmacro(items: &[Value], env: &Env) -> Result<(), SemaError> {
     // items[0] is the `defmacro` symbol; the rest are name, params, body…
     let args = &items[1..];
@@ -750,15 +746,15 @@ fn parse_syntax_rules(form: &Value) -> Result<sema_core::SyntaxRules, SemaError>
 }
 
 /// Register `__vm-*` native functions that the bytecode VM calls back into
-/// the tree-walker for forms that cannot be fully compiled.
+/// the evaluator for forms that cannot be fully compiled.
 /// Load built-in macros (threading, when-let, if-let) into the global environment.
 pub fn load_prelude(ctx: &EvalContext, env: &Rc<Env>) {
     let exprs = sema_reader::read_many(crate::prelude::PRELUDE)
         .unwrap_or_else(|e| panic!("internal: prelude failed to parse: {e}"));
     // The prelude is mostly `defmacro` forms (which expand to nil, registering the
     // macro as a side effect) plus a few `define` forms (the async agent-loop driver).
-    // Register/expand via the VM-native path so prelude loading never routes through
-    // the tree-walker; a `define` expands to a non-nil form, which we compile + run on
+    // Register/expand via the VM-native path; a `define`
+    // expands to a non-nil form, which we compile + run on
     // the VM (rooted at the global env) so its top-level binding persists.
     for expr in &exprs {
         let expanded = expand_for_vm_in(ctx, env, expr)
@@ -793,8 +789,7 @@ fn upgrade_delegate_env(weak: &Weak<Env>) -> Result<Rc<Env>, SemaError> {
 pub fn register_vm_delegates(env: &Rc<Env>) {
     // __vm-eval: macro-expand, compile, and run the expression on the bytecode
     // VM (rooted at the global env so top-level `define`s persist). The runtime
-    // `(eval ...)` meta path is thus VM-native — it no longer round-trips
-    // through the tree-walker's `eval_value` (M3 / Phase 1c).
+    // `(eval ...)` meta path is thus VM-native.
     let eval_env = Rc::downgrade(env);
     env.set(
         intern("__vm-eval"),
@@ -818,7 +813,7 @@ pub fn register_vm_delegates(env: &Rc<Env>) {
     // declared export list with the active module-load scope, so `import`
     // restricts the copied bindings to exactly those names. Without this the VM
     // exported every top-level binding (private helpers leaked). Mirrors the
-    // tree-walker's `set_module_exports` call in eval_module.
+    // module loader's `set_module_exports` call in eval_module.
     env.set(
         intern("__vm-module-exports"),
         Value::native_fn(NativeFn::with_ctx(
@@ -844,8 +839,8 @@ pub fn register_vm_delegates(env: &Rc<Env>) {
         )),
     );
 
-    // __vm-load: call the load driver (special_forms::eval_load) directly, not
-    // through the tree-walker's eval_step dispatch. The driver handles VFS
+    // __vm-load: call the load driver (special_forms::eval_load) directly.
+    // The driver handles VFS
     // resolution, file path push/pop, caching, and runs the loaded body on the
     // VM (M4). The path arrives already evaluated from the VM.
     let load_env = Rc::downgrade(env);
@@ -869,8 +864,8 @@ pub fn register_vm_delegates(env: &Rc<Env>) {
         })),
     );
 
-    // __vm-import: call the import driver (special_forms::eval_import) directly,
-    // not through the tree-walker's eval_step dispatch. Under the VM backend the
+    // __vm-import: call the import driver (special_forms::eval_import) directly.
+    // Under the VM backend the
     // driver compiles and runs the module body on the VM (M4). The path and
     // selective-import symbols arrive already evaluated from the VM.
     let import_env = Rc::downgrade(env);
@@ -946,7 +941,7 @@ pub fn register_vm_delegates(env: &Rc<Env>) {
     );
 
     // __vm-defmacro-form: register a complete `(defmacro ...)` form directly
-    // (pure destructure) — no tree-walker round-trip. Used for defmacro that
+    // (pure destructure). Used for defmacro that
     // reaches compilation (e.g. non-top-level) rather than expand-time
     // registration.
     let dmf_env = Rc::downgrade(env);
@@ -984,7 +979,7 @@ pub fn register_vm_delegates(env: &Rc<Env>) {
         })),
     );
 
-    // __vm-define-record-type: delegate to the tree-walker
+    // __vm-define-record-type: delegate to the evaluator
     let drt_env = Rc::downgrade(env);
     env.set(
         intern("__vm-define-record-type"),
@@ -993,8 +988,8 @@ pub fn register_vm_delegates(env: &Rc<Env>) {
                 return Err(SemaError::arity("define-record-type", "5", args.len()));
             }
             // Build the `(define-record-type ...)` argument list (without the head
-            // symbol) and register the type directly via the pure destructure —
-            // no tree-walker round-trip. eval_define_record_type only sets native
+            // symbol) and register the type directly via the pure destructure.
+            // eval_define_record_type only sets native
             // ctor/predicate/accessor fns in the env; it evaluates no user code.
             let mut ctor_form = vec![args[1].clone()];
             if let Some(fields) = args[3].as_list() {
@@ -1059,7 +1054,7 @@ pub fn register_vm_delegates(env: &Rc<Env>) {
         })),
     );
 
-    // __vm-macroexpand: expand a macro form via the tree-walker
+    // __vm-macroexpand: expand a macro form
     let me_env = Rc::downgrade(env);
     env.set(
         intern("__vm-macroexpand"),
@@ -1192,10 +1187,8 @@ pub fn register_vm_delegates(env: &Rc<Env>) {
         })),
     );
 
-    // __vm-deftool: delegate to tree-walker
     // __vm-deftool: the VM has already evaluated description/parameters/handler
-    // and passes them as values, so build the tool directly — no tree-walker
-    // round-trip.
+    // and passes them as values, so build the tool directly.
     let tool_env = Rc::downgrade(env);
     env.set(
         intern("__vm-deftool"),
@@ -1218,7 +1211,7 @@ pub fn register_vm_delegates(env: &Rc<Env>) {
     );
 
     // __vm-defagent: the VM has already evaluated the options map, so build the
-    // agent directly — no tree-walker round-trip.
+    // agent directly.
     let agent_env = Rc::downgrade(env);
     env.set(
         intern("__vm-defagent"),

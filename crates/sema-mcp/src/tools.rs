@@ -377,7 +377,7 @@ pub fn json_args_to_sema(
     }
 
     // Variadic handler: collect overflow into the rest parameter. The evaluator
-    // (both tree-walker and VM) collects trailing args beyond the fixed arity
+    // collects trailing args beyond the fixed arity
     // into a list, so we append the rest values flat here.
     if let Some(rest_name) = &shape.rest {
         if let Some(rest_val) = json_obj.get(rest_name) {

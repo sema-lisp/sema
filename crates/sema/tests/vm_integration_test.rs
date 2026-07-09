@@ -9,8 +9,7 @@ fn eval_vm(input: &str) -> Value {
         .unwrap_or_else(|_| panic!("VM failed: {input}"))
 }
 
-/// Evaluate `input` on the VM and assert it succeeds. (This once cross-checked the
-/// tree-walker against the VM; with the tree-walker retired it is a single-evaluator
+/// Evaluate `input` on the VM and assert it succeeds. (This is a single-evaluator
 /// smoke check that the construct evaluates without error — correctness for the
 /// canonical cases is pinned with a literal via [`assert_evals_to`].)
 fn assert_evals(input: &str) {
@@ -792,7 +791,8 @@ fn test_bug_recursion_depth_50() {
 
 #[test]
 fn test_bug_recursion_depth_1000() {
-    // Tree-walker handles 10000+ easily; VM should handle 1000
+    // VM should handle 1000
+    // TODO: Stress test this to 10 million to see where it breaks
     assert_evals(
         "(begin
            (define (count n) (if (= n 0) 0 (count (- n 1))))
@@ -1652,7 +1652,7 @@ fn test_vm_compiler_depth_limit() {
     assert!(err.contains("depth"), "expected depth error, got: {err}");
 }
 
-// === M2: VM-native macro expansion (no tree-walker) ===
+// === M2: VM-native macro expansion ===
 //
 // These are *absolute oracle* tests pinned to literal values, run on the VM
 // backend. They guard the M2 change that made macro expansion (`apply_macro_vm`)
@@ -1753,7 +1753,7 @@ fn vm_macro_quasiquote_and_gensym_oracle() {
     );
 }
 
-// === M3: VM-native runtime eval/apply (no tree-walker) ===
+// === M3: VM-native runtime eval/apply ===
 
 #[test]
 fn vm_eval_apply_oracle() {
@@ -1773,9 +1773,8 @@ fn vm_eval_apply_oracle() {
 
 #[test]
 fn vm_eval_is_vm_native_runs_async() {
-    // The decisive proof that `__vm-eval` runs on the VM, not the tree-walker:
+    // Proof that `__vm-eval` runs on the VM:
     // async/await is a VM-only feature, so this only succeeds if the eval'd form
-    // is compiled and executed on the bytecode VM (the tree-walker errors with
-    // "await requires the VM backend").
+    // is compiled and executed on the bytecode VM.
     assert_eq!(eval_vm("(eval '(await (async (+ 40 2))))"), Value::int(42));
 }

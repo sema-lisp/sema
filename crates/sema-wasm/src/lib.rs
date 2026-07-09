@@ -2509,8 +2509,8 @@ impl WasmInterpreter {
 
     /// Invoke a named global function directly with JS arguments.
     ///
-    /// This avoids reparsing source strings and works for both tree-walker
-    /// lambdas and VM closures installed in the global environment.
+    /// This avoids reparsing source strings and works for functions
+    /// installed in the global environment.
     #[wasm_bindgen(js_name = invokeGlobal)]
     pub fn invoke_global(&self, name: &str, args: &js_sys::Array) -> Result<JsValue, JsValue> {
         let spur = sema_core::intern(name);

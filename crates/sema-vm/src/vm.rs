@@ -284,9 +284,7 @@ pub fn extract_vm_closure(val: &Value) -> Option<VmClosureInfo> {
 }
 
 /// Build an `Unbound` error decorated with a "Did you mean ...?" hint
-/// when the name closely matches one in `globals`. Mirrors the tree-walker
-/// path in `sema-eval/src/eval.rs::eval_step` so users get the same
-/// suggestions regardless of backend.
+/// when the name closely matches one in `globals`.
 fn unbound_global_error(name_spur: Spur, globals: &Env) -> SemaError {
     let name = resolve_spur(name_spur);
     let mut err = SemaError::Unbound(name.clone());
@@ -3644,7 +3642,7 @@ impl VM {
                 // keeps the closure's open upvalue cells connected to the
                 // parent's stack slots so `set!` mutations flow back to the
                 // caller. Falls back to a fresh VM only when no compatible VM is
-                // on the stack (e.g. called directly from the tree-walker).
+                // on the stack.
                 if let Some(result) = try_run_on_current_vm(closure, globals, args, ctx) {
                     return result;
                 }
@@ -3787,7 +3785,7 @@ impl VM {
                 // Restore stack to handler state
                 self.stack.truncate(base + entry.stack_depth as usize);
 
-                // Push error value as a map matching the tree-walker's error_to_value format
+                // Push error value as a map
                 let error_val = error_to_value(&err);
                 self.stack.push(error_val);
 
@@ -4385,7 +4383,7 @@ enum ExceptionAction {
     Propagate(SemaError),
 }
 
-/// Convert a SemaError into a Sema map value, matching the tree-walker's format.
+/// Convert a SemaError into a Sema map value.
 fn error_to_value(err: &SemaError) -> Value {
     let inner = err.inner();
     let mut map = BTreeMap::new();

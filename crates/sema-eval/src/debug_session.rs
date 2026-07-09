@@ -1,7 +1,7 @@
-//! Debug-session awareness for the tree-walking evaluator.
+//! Debug-session awareness for dynamically loaded code.
 //!
-//! Code pulled in via `(load ...)` / `(import ...)` is evaluated on the
-//! tree-walker, which does not participate in the VM's debug loop. As a result,
+//! Code pulled in via `(load ...)` / `(import ...)` is evaluated on a
+//! fresh VM instance, which does not participate in the current VM's debug loop. As a result,
 //! breakpoints set in dynamically loaded/imported files never hit, silently.
 //!
 //! To avoid that being a silent surprise, the DAP server marks a debug session

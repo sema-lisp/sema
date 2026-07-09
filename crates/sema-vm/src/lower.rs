@@ -952,7 +952,7 @@ fn lower_defmacro(args: &[Value]) -> Result<CoreExpr, SemaError> {
     if args.len() < 3 {
         return Err(SemaError::arity("defmacro", "3+", args.len()));
     }
-    // Delegate defmacro entirely to the tree-walker: reconstruct the original
+    // Delegate defmacro entirely to the evaluator: reconstruct the original
     // form and pass it quoted to __vm-defmacro-form so the body stays unevaluated.
     let mut form = vec![Value::symbol("defmacro")];
     form.extend(args.iter().cloned());

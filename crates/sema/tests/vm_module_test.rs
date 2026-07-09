@@ -1,6 +1,6 @@
-//! Tests for VM-backed `(load ...)` and `(import ...)`: when the VM is the active
-//! backend, a module's body is compiled and run on the bytecode VM (not the
-//! tree-walker), so async/channels work in modules and the code runs at VM speed.
+//! Tests for `(load ...)` and `(import ...)`: a module's body is compiled
+//! and run on the bytecode VM, so async/channels work in modules and the
+//! code runs at VM speed.
 //!
 //! `(import ...)` also runs its module body on the VM (M4). Module isolation —
 //! an exported fn calling a private module helper — holds because M1 gives each
@@ -35,8 +35,7 @@ fn vm(input: &str) -> Result<Value, String> {
         .map_err(|e| e.to_string())
 }
 
-/// Evaluate on the VM and assert the result equals `expected`. (These cases once
-/// cross-checked against the tree-walker; with it retired we pin a literal oracle.)
+/// Evaluate on the VM and assert the result equals `expected`.
 fn assert_vm_eq(input: &str, expected: Value) {
     let v = vm(input).unwrap_or_else(|e| panic!("VM failed for `{input}`: {e}"));
     assert_eq!(v, expected, "unexpected result for `{input}`");
@@ -192,16 +191,13 @@ fn vm_import_keeps_module_isolation() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-// (Removed `vm_backend_flag_resets_for_single_expr_eval`: it asserted the
-// tree-walker backend-flag reset — now obsolete, as every eval entry point runs
-// on the VM, so async in a loaded file always works regardless of entry point.)
 
 // === M4: VM-native import (module body runs on the VM) ===
 
 #[test]
 fn vm_import_runs_on_vm_async_in_module() {
-    // Decisive proof import runs on the VM: an imported fn uses async/await
-    // (a VM-only feature). On the tree-walker this errors; here it must succeed.
+    // Proof that import runs on the VM: an imported fn uses async/await
+    // (a VM-only feature).
     let dir = temp_dir("imp-async");
     let m = write(
         &dir,

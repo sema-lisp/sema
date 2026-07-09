@@ -977,8 +977,8 @@ fn backend_thread(
                         });
                     })));
 
-                    // Mark a debug session active so that tree-walker-evaluated
-                    // load/import (which bypass the VM debug loop) can emit a
+                    // Mark a debug session active so that load/import
+                    // (which currently bypass the VM debug loop) can emit a
                     // one-time warning that breakpoints in those files won't
                     // hit. Runs on the same backend thread as execute_debug, so
                     // the thread-local flag is observed by the evaluator. See

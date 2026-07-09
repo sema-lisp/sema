@@ -1,6 +1,6 @@
 //! End-to-end serialize round-trip tests for the bytecode format.
 //!
-//! Each test: compile → serialize → deserialize → run in VM → compare to tree-walker.
+//! Each test: compile → serialize → deserialize → run in VM → compare to direct eval.
 
 mod common;
 

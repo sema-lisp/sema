@@ -684,7 +684,7 @@ eval_tests! {
 }
 
 // ============================================================
-// Auto-gensym — macro hygiene tests (tree-walker + VM)
+// Auto-gensym — macro hygiene tests
 // ============================================================
 
 eval_tests! {
@@ -1364,8 +1364,7 @@ eval_error_tests! {
     string_repeat_negative_errors: r#"(string/repeat "ab" -1)"# => "non-negative",
     // `(abs -9223372036854775808)` no longer errors — it promotes to an exact
     // bignum (see `boundary_abs_min` in the numeric-tower parity block).
-    // TODO(test-strength): VM `nth` uses generic "out of bounds" while tree-walker
-    // says "non-negative" — strengthen after error UX wave unifies them.
+    // TODO(test-strength): strengthen after error UX wave unifies them.
     nth_negative_errors: "(nth (list 1 2 3) -1)",
     take_negative_errors: "(take -1 (list 1 2 3))" => "non-negative",
     drop_negative_errors: "(drop -1 (list 1 2 3))" => "non-negative",
@@ -1831,8 +1830,8 @@ fn alias_time_now_ms() {
 // ============================================================
 // Audit regressions — IGNORED until upvalue model lands
 // ============================================================
-// These tests document known bugs in the VM backend. They assert the *correct*
-// behavior (matching the tree-walker), so once the open-upvalue runtime is in
+// These tests document known bugs in the VM backend. They assert the correct
+// behavior, so once the open-upvalue runtime is in
 // place and these tests are un-ignored they will act as confirmation that the
 // fix landed.
 //
@@ -1906,7 +1905,7 @@ eval_error_tests! {
     list_repeat_negative: "(list/repeat -1 0)" => "non-negative",
     list_page_negative_per_page: "(list/page (list 1 2 3) 1 -1)" => "non-negative",
     list_pad_negative_len: "(list/pad (list 1) -1 0)" => "non-negative",
-    // VM-3 (VM NTH opcode; tree-walker nth already guards)
+    // VM-3 (VM NTH opcode)
     nth_negative_index: "(nth (list 1 2 3) -1)" => "non-negative",
 }
 
@@ -2969,4 +2968,27 @@ eval_tests! {
     owned_args_upvalue_writeback: "(let ((n 0)) (foldl (fn (acc x) (set! n (+ n x)) (+ acc x)) 0 (list 1 2 3)) n)" => Value::int(6),
     // A throw inside the callback unwinds cleanly out of the owned run.
     owned_args_callback_throw: "(try (foldl (fn (acc x) (if (> x 2) (throw \"boom\") (+ acc x))) 0 (list 1 2 3)) (catch e (:value e)))" => common::eval("\"boom\""),
+}
+
+// Issue #80: (catch e ... (throw e)) must re-raise the caught condition as
+// itself — same :type/:message, no per-layer {:type :user} wrapping — so the
+// prelude cleanup guards (io/with-raw-mode, term/with-alt-screen, ...) compose
+// without mangling errors.
+eval_tests! {
+    rethrow_keeps_condition_type: "(try (try (+ 1 undefined-var) (catch e (throw e))) (catch e2 (:type e2)))" => Value::keyword("unbound"),
+    rethrow_keeps_condition_message: "(try (try (+ 1 undefined-var) (catch e (throw e))) (catch e2 (:message e2)))" => Value::string("Unbound variable: undefined-var"),
+    rethrow_three_layers_is_stable: "(let ((one (try (+ 1 undefined-var) (catch a (:message a)))) (three (try (try (try (+ 1 undefined-var) (catch a (throw a))) (catch b (throw b))) (catch c (:message c))))) (= one three))" => Value::bool(true),
+    rethrow_raw_value_roundtrip: "(try (try (throw 42) (catch e (throw e))) (catch e2 (:value e2)))" => Value::int(42),
+    rethrow_raw_value_type_stays_user: "(try (try (throw 42) (catch e (throw e))) (catch e2 (:type e2)))" => Value::keyword("user"),
+    reraise_via_raise_keeps_type: "(try (try (+ 1 undefined-var) (catch e (raise e))) (catch e2 (:type e2)))" => Value::keyword("unbound"),
+    // A thrown map that merely resembles a condition is still a user value:
+    // no :type keyword from the condition set, or no string :message.
+    throw_plain_map_still_wraps: "(try (throw {:message \"m\" :k 1}) (catch e (:type e)))" => Value::keyword("user"),
+    throw_lookalike_map_still_wraps: "(try (throw {:type :custom :message \"m\"}) (catch e (:type e)))" => Value::keyword("user"),
+}
+
+eval_error_tests! {
+    // The top-level report of a re-thrown native error is the original
+    // message, not a stringified condition map.
+    rethrown_error_prints_original_message: "(try (+ 1 undefined-var) (catch e (throw e)))" => "Unbound variable: undefined-var",
 }

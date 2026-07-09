@@ -470,9 +470,8 @@ fn channel_zero_capacity_error() {
 
 #[test]
 fn default_backend_accepts_async() {
-    // The tree-walker is retired; every eval entry point runs on the VM, so
-    // async/await is accepted via the default `eval_str` path (it used to error
-    // with "requires the VM backend" on the tree-walker).
+    // Every eval entry point runs on the VM, so async/await is accepted
+    // via the default `eval_str` path.
     let interp = sema_eval::Interpreter::new();
     let result = interp
         .eval_str("(await (async (+ 1 2)))")

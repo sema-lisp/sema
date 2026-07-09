@@ -182,8 +182,7 @@ eval_tests! {
 // ============================================================
 
 eval_tests! {
-    // Foundational ops: hand-constructed expected values so the oracle does not
-    // depend on the tree-walker (see docs/bugs/eval-tw-oracle-circularity.md).
+    // Foundational ops: hand-constructed expected values.
     quote_list: "(car '(a b c))" => Value::symbol("a"),
     quasiquote_basic: "(begin (define x 42) (car (cdr `(a ,x b))))" => Value::int(42),
     unquote_splicing: "(begin (define xs '(2 3)) `(1 ,@xs 4))" => Value::list(vec![Value::int(1), Value::int(2), Value::int(3), Value::int(4)]),

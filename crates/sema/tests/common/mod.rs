@@ -12,9 +12,8 @@ pub fn eval(input: &str) -> Value {
         .unwrap_or_else(|e| panic!("eval failed for `{input}`: {e}"))
 }
 
-/// Generate one test per case, asserting the evaluated value. With the tree-walker
-/// retired there is a single evaluator, so each case emits ONE `test_name` function
-/// (no `_tw`/`_vm` duplication); the macro's value is pinning a literal expected value.
+/// Generate one test per case, asserting the evaluated value. Each case emits
+/// ONE `test_name` function; the macro's value is pinning a literal expected value.
 ///
 /// Usage:
 /// ```ignore
@@ -35,7 +34,7 @@ macro_rules! eval_tests {
     };
 }
 
-/// Generate error tests for both tree-walker and VM backends.
+/// Generate error tests.
 ///
 /// Supports two per-entry forms (mix freely within one invocation):
 ///

@@ -16,26 +16,6 @@ Things that came out of the May 2026 quality sweep (Wave 6 audit) but were inten
 
 Also noted from the PR #59 merge review as low-priority, not-yet-done: capping the device-flow `slow_down` interval growth (the `+5` itself is RFC 8628-correct), and auto-reconnecting a Streamable-HTTP session on a mid-session `404` (currently surfaced as a `reconnect required` error rather than transparently re-initializing).
 
-## ASYNC-3 — `async/all` early-reject strands a span-owning `IoHandle` (teardown abort)
-
-**Found 2026-07-02, while landing the ASYNC-1 fix.** `async/all` (the `AllOf`
-scheduler target) short-circuits to `Complete` on the **first** rejecting task
-(`RunGoal::status`, `crates/sema-vm/src/scheduler.rs`), without cancelling the still
-in-flight siblings. A sibling parked on `Blocked(AwaitIo)` that is still *reachable*
-(its promise held by a Sema variable) is kept by the terminal-only reap
-(`reap_leftover_tasks`), so its span-owning `IoHandle` (e.g. an `llm/complete` offload)
-can survive to thread/process teardown — where its detached `LlmSpan` calls `span.end()`
-against a destructed OTel thread-local and aborts the process (the adversarial-#7 hazard
-the timeout path already guards via `cancel_promise_task`). The ASYNC-1 budget fix is the
-first thing to trigger this deterministically (a budget overrun *rejects* a task), but any
-task rejection with a slow reachable sibling under an active OTel exporter hits it. **Deferred
-because** the proper fix is a distinct async-cancellation-semantics decision — on an
-`async/all`/`async/race` short-circuit, transitively cancel + abort the abandoned in-flight
-siblings (extending `cancel_await_tree` to the combinator's promise set) — orthogonal to
-ASYNC-1's dynamic-scope capture. **Workaround:** the shipped `async_budget_gates_concurrent_fanout`
-gate sizes the cap to trip only once *all* siblings have charged (so none is left in-flight);
-real code that awaits every promise, or runs without an OTel exporter, is unaffected.
-
 ## ASYNC-2 — Stepping across the scheduler boundary into sibling async tasks
 
 **Found 2026-06-23; residual of the async-breakpoints fix.** Breakpoints inside async tasks now fully work under both the native DAP and the WASM playground: a breakpoint in an `(async …)` / `(async/spawn …)` body stops, `Continue` resumes, inspection (stack/scopes/variables) targets the paused **task's** VM frames, and Step Over/Out follow the task's own call depth (gate tests: `crates/sema/tests/dap_async_breakpoint_test.rs`, `crates/sema/tests/wasm_async_debug_test.rs`, `playground/tests/async-debugger.spec.ts`). The one remaining gap: stepping (Step Into/Over/Out) does **not** follow control *across* the scheduler boundary into sibling tasks or back to the main VM — while a task is paused, siblings stay parked and a step stays within the current task slice. **Deferred because** cross-task stepping is a distinct design problem (the stepper would have to model the cooperative scheduler's task graph, not just one VM's frame depth), it's an enhancement rather than the reported bug, and the STOP+CONTINUE+inspect slice already covers the common debugging need. Revisit if async stepping across tasks becomes a real workflow ask.
@@ -45,6 +25,15 @@ real code that awaits every promise, or runs without an OTel exporter, is unaffe
 Verified 2026-06-09: U6 ("did you mean" hints — shipped via `suggest_similar` in sema-core, attached in both backends) and U9 (REPL completeness check — replaced by the lexer-based `SemaValidator` in `crates/sema/src/repl/validator.rs`) were removed because they have since been fixed. Remaining entries re-verified as still open.
 
 Verified 2026-07-01: **LEX-1** (scientific/exponential number literals — `1e19`, `2e-5`, `1E10` now parse), **VM-1** (VM stack traces on runtime errors — the VM now captures the call stack at error time and serializes it as `:stack-trace`), and **N7** (`sort` on heterogeneous types — comparator-free `sort` now raises a type error on mixed types and compares ints/floats numerically, `crates/sema-stdlib/src/list.rs`) were removed because they are fixed. Remaining entries re-verified as still open.
+
+Fixed 2026-07-02: **ASYNC-3** (`async/all` early-reject stranding a span-owning
+`IoHandle` to teardown) — `cancel_abandoned_combinator_siblings` in the scheduler
+transitively cancels + IO-aborts a combinator's still-pending siblings when
+`async/all` rejects or `async/race` settles, on the VM thread with the OTel
+thread-locals alive. Commit `a2c8a0ad`; gates `async_all_reject_cancels_pending_sibling`,
+`async_race_cancels_losing_siblings`, `combinator_short_circuit_spares_unrelated_task`
+in `crates/sema/tests/vm_async_test.rs`. (This entry lingered here for a week after
+the fix landed — the fix shipped the same day the entry was written.)
 
 Fixed 2026-07-02: **ASYNC-1** (dynamic-scope flags vs deferred async tasks) — `llm/with-cache`/`llm/with-budget`/per-call `:tags` are now captured per task and swapped in/out at each scheduler step (a third per-task context beside the otel + usage-scope swaps), with the active budget frame shared by `Rc` so a concurrent `with-budget` fan-out charges one aggregate. See ADR #67, `docs/plans/2026-07-02-async-1-dynamic-scope-per-task.md`; gates `async_cache_miss_is_counted` + `async_budget_gates_concurrent_fanout` in `crates/sema/tests/complete_async_test.rs`. (The follow-up teardown gap it surfaced is now tracked as ASYNC-3 above.)
 

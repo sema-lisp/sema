@@ -21,17 +21,15 @@ Janet remains the most meaningful comparison — both are embeddable scripting l
 
 ## Where the Time Goes
 
-### ~60% — Stdlib call overhead
+The percentages below were measured on the July 2026 binaries (samply, PGO-adjacent release-with-debug, M2 Max) — for the pre-campaign shape see `docs/benchmarks/2026-02-19-1brc-vm-profile.md`.
 
-Every `string/split`, `assoc`, `string->number` goes through: VM → `CallGlobal` → hash lookup in `Env` → downcast `Rc<NativeFn>` → allocate args slice → call Rust function → wrap result back to `Value`. Janet's register VM calls C functions with a direct pointer — no `Rc` downcasting, no `ValueView` unpacking.
+### Compute-heavy code (tak-shaped): dispatch is king
 
-### ~25% — Rc refcounting
+Pre-`CallSelf`, tak's self time split roughly: **~23% dispatch preamble** (`pc` bounds check ~7.6%, opcode fetch/`pc += 1` ~7.3%, `match op` ~8.4%), **~15% local loads** (`stack.push(stack[base+n].clone())`), ~8% `Value` drops, the rest in opcode bodies. `CallSelf` cut the call count; the per-instruction preamble and local-load traffic remain the dominant residual costs (see Headroom).
 
-Every `Value::clone()` is an `Rc::clone()` for heap types (strings, lists, maps). Every drop decrements. The NaN-boxing is clever — small ints/bools/symbols are unboxed `u64` — but strings and lists still pay the refcount cost on every copy and drop. Janet uses a tracing GC, so copies are free (just pointer copies) and collection is batched.
+### Data-heavy code (1BRC-shaped): refcount churn and native-call boundaries
 
-### ~15% — Data structure overhead
-
-`BTreeMap` for env lookups, `Rc<Vec<Value>>` for lists (no cons cells), `Rc<String>` for every string value. Each imposes allocation and indirection costs on hot paths.
+Pre-campaign, `drop_in_place<Value>` was ~20% of 1BRC self time, plus `Rc::drop_slow` ~3% and per-row map clones (`HashMap::clone` ~3%) caused by fold accumulators never reaching the COW gates with refcount 1. `TakeLocal` + the owned-args protocol removed the map churn; the `bytes`/`mutable-array` APIs removed most per-row allocations; SmallVec removed the per-native-call args `Vec`. The residual is the remaining ~3–5 native calls per row and generic `Value` clone/drop traffic.
 
 ## Tier 1: Big Wins (2–5× total speedup possible)
 
@@ -73,10 +71,11 @@ Considerations:
 - GC pause latency may matter for interactive/streaming use cases — generational GC could help
 - This is the single biggest architectural bottleneck but also the most invasive change
 
-### 3. Stack-allocated strings for short-lived intermediates
+### 3. Stack-allocated strings for short-lived intermediates ❌ (superseded)
 
 **Impact:** Estimated ~1.2× on I/O-heavy workloads
 **Effort:** Medium (days)
+**Status:** ❌ Superseded (Jul 2026). The costs this targeted are gone by other means: `file/fold-lines-bytes` + `bytes/*` ops (with optional start/end ranges) let hot loops avoid intermediate strings entirely; `Value::string_owned` removed the double-copy on owned-`String` construction; `string/split`-heavy code now mostly hits COW-unlocked paths. An arena remains incompatible with escaping values (see Previously Tried).
 
 In the 1BRC hot loop, `string/split` creates 2 temporary `Rc<String>` per line that are immediately consumed and dropped. An arena or bump allocator for strings that don't escape the current call frame would eliminate millions of `Rc` alloc/dealloc pairs.
 
@@ -137,15 +136,11 @@ This would be a full rewrite of `crates/sema-vm/src/vm.rs` and the emitter. Cons
 
 The VM has a 16-entry direct-mapped `global_cache` that works well for the current workloads. The Spur bit distribution already maps cleanly to the 16 slots. Per-callsite IC (storing cache data alongside bytecode) remains a potential improvement but requires a different approach — either embedding IC indices in the instruction encoding or using a side table keyed by `(function_id, pc)`.
 
-### 8. Specialize hot higher-order functions
+### 8. Specialize hot higher-order functions ✅ (partial)
 
 **Impact:** 10–20% on functional-style code
 **Effort:** Medium
-
-`file/fold-lines`, `map`, `filter`, `reduce` are the hottest higher-order functions. The VM could recognize these patterns and:
-- Keep the closure's call frame alive across iterations (avoid per-call frame setup/teardown)
-- Reuse the argument slots instead of pushing/popping
-- Fuse map+filter chains into a single loop
+**Status:** ✅ Partial (Jul 2026). The owned-args callback protocol (`call_callback_owned`) moves the accumulator through `file/fold-lines`, `file/fold-lines-bytes`, `foldl`, and `reduce`, which — combined with `TakeLocal` — is what unlocks in-place COW updates in fold bodies (measured −38% on 1BRC-simple). Remaining ideas, unmeasured: keep the closure's frame alive across iterations (avoid per-call setup/teardown), reuse argument slots, fuse map+filter chains.
 
 ### 9. String interning for string values ✅
 
@@ -171,7 +166,22 @@ Janet was ~1.6× ahead on 1BRC-optimized at the start of the July 2026 campaign;
 | Self-tail-call on internal defines | −4% nqueens | resolver |
 | Single-allocation strings (`Value::string_owned`) | −1.5–4% | core + VM + stdlib |
 
-Direct threading (#4), register VM (#6), quickening (#14), and the JIT (#15) remain unexplored headroom — the dispatch preamble was still ~23% of tak's profile before `CallSelf` reduced the call count.
+## Remaining Headroom (post-campaign)
+
+Ordered by expected impact per effort, with the July 2026 profile evidence that motivates each. None of these are needed to stay ahead of Janet; they are the path toward the Chicken/Guile tier.
+
+| # | Idea | Evidence / expected win | Effort |
+| --- | --- | --- | --- |
+| H1 | **Direct threading / dispatch restructure** (#4): kill the per-instruction `pc` bounds check and re-entered `match` — tail-dispatch via fn-pointer table or an `unsafe` fetch with compiler-verified `pc` invariants | bounds check 7.6% + fetch 7.3% + `match` 8.4% of tak self time (~23% total) | Medium–Large |
+| H2 | **O(1) `cdr` via tail-sharing list slices**: lists are `Rc<Vec<Value>>`, so `rest` copies; nqueens/deriv-shaped code pays per-element | est. 20–40% nqueens, 10–20% deriv (reader-estimated, unprofiled since) | Week+ |
+| H3 | **Wider `TakeLocal` liveness**: the shipped analysis is maximally conservative (straight-line-to-exit regions only; whole-function opt-outs for loops/try). A real last-use dataflow pass would extend move semantics into loop bodies and branches | LoadLocal clone traffic was ~15% of tak; loops are where accumulators actually live | Week+ |
+| H4 | **Stay in the dispatch loop across frame-preserving transitions** (CallNative, same-closure calls): each native call exits/re-enters `run_inner` | ~3–5 native calls/row remain in 1BRC-opt | Days |
+| H5 | **Decoded-callee inline cache**: `CALL_GLOBAL` cache hits still pay a `Value` clone + `Any`-downcast per call; cache the decoded `Rc<Closure>` instead. Covers cross-function calls that `CallSelf` doesn't | tak's residual call cost; note the 256-entry Knuth-hash expansion regressed 2.4× in Feb 2026 — keep the 16-slot direct-mapped shape | Days |
+| H6 | **Superinstructions** (fused local/const operand ops, compare-and-branch) | dispatch-count −30–50% on arithmetic-heavy code (estimate) | Days, opcode-append discipline |
+| H7 | **Unified `Value` clone/drop fast path**: collapse the ~25-arm tag match into refcount-inc/dec + cold typed-free — verify first with cargo-asm whether LLVM already merged the arms under PGO | clone/drop is still the universal hot primitive (~20% of 1BRC pre-campaign) | Hours to verify, days to land |
+| H8 | **Register VM** (#6), **quickening** (#14), **copy-and-patch JIT** (#15) | the tier-jump options; see their sections | Large–Very large |
+
+Cross-unit intrinsic/fold redefinition (`load`/REPL redefining `not`, `car`, …) is a known semantic residual documented in `docs/limitations.md` — any future dispatch work should keep its eligibility rules bulk-compatible with the same-unit guards shipped in July 2026.
 
 ## Tier 4: Build & Compiler Tuning (Free Wins)
 

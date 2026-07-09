@@ -1,5 +1,7 @@
 # Authenticated MCP servers in workflow runs — scoping (future feature)
 
+> **Status (2026-07-09):** the hard blocker is gone — the MCP client with OAuth shipped (`crates/sema-mcp/{client.rs,client_auth.rs,oauth/}`, PR #59). The workflow `:mcp` projection and dashboard auth surface described here are still not started; this plan is now actionable as written.
+
 **Status:** Scoping / future feature (2026-06-24). **Not started.** Depends on work
 that does not exist yet (the MCP *client* + its OAuth engine). This doc scopes the
 *workflow + dashboard* integration: how a `defworkflow` declares the MCP servers /

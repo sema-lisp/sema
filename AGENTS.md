@@ -146,5 +146,4 @@ Hard-won conventions — follow these or you will reintroduce shipped bugs (see 
 - `docs/deferred.md` — items parked with rationale (won't-fix or revisit-later)
 - `docs/plans/` — individual implementation plans, named `YYYY-MM-DD-<slug>.md` (completed plans move to `docs/plans/archive/`)
 - `docs/vm-status.md`, `docs/performance-roadmap.md` — VM internals reference
-- `docs/IDEAS.md` — feature tracker (consolidated from issues)
 - `docs/bugs/` — short write-ups of specific known test/code issues

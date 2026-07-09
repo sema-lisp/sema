@@ -1013,7 +1013,7 @@ References: `docs/deferred.md` (ASYNC-1), Decision #53 (VM-per-task async),
 `crates/sema-core/src/async_signal.rs:417-476` (usage-scope seam),
 `crates/sema-llm/src/builtins.rs` (dynamic-scope thread-locals + async poller).
 
-### 68. Full Numeric Tower: exact integers, rationals, complex (IMPLEMENTED)
+### 70. Full Numeric Tower: exact integers, rationals, complex (IMPLEMENTED)
 
 Status: **implemented 2026-07-07** — resolves limitation #16. Plan:
 `docs/plans/2026-07-07-numeric-tower.md`.

@@ -1,6 +1,6 @@
 # Bytecode VM Status
 
-> Last updated: 2026-07-02 (CORE-2 cycle collector shipped; see *Memory: cycle collection*)
+> Last updated: 2026-07-09 (July perf campaign: CallSelf/TakeLocal/MutArr* opcodes, owned-args callback protocol; format v5)
 
 ## Current State
 
@@ -22,7 +22,7 @@ Source → Reader → Macro Expand → Lower (Expr<Spur>) → Optimize → Resol
 
 **Same-VM execution:** VM closures carry an opaque `payload: Option<Rc<dyn Any>>` on `NativeFn`. The payload holds a `VmClosurePayload` (closure + function table). When `call_value` encounters a payload, it downcasts and pushes a `CallFrame` on the **same VM** — no fresh `VM::new()`. This eliminates native stack growth. True TCO is implemented via `tail_call_vm_closure`, which reuses the current frame, enabling 100K+ depth tail recursion.
 
-**NativeFn fallback:** Closures passed to stdlib higher-order functions (map, filter, etc.) still go through the NativeFn wrapper interface, which creates a short-lived VM. This ensures interop with `sema-stdlib` which depends on `sema-core`, not `sema-vm`.
+**NativeFn fallback:** Closures passed to stdlib higher-order functions (map, filter, etc.) go through the NativeFn wrapper interface, which re-enters the running VM as a nested frame (`CURRENT_VM` + `run_nested_closure`; a fresh VM only for genuinely foreign threads). Folds hand the accumulator over by move (`call_callback_owned`), so with `TakeLocal` a fold accumulator reaches the copy-on-write gates with a unique reference. This preserves interop with `sema-stdlib`, which depends on `sema-core`, not `sema-vm`.
 
 **Open upvalues (Lua-style):** Upvalue cells hold a stack index (`Open { frame_base, slot }`) instead of an eagerly-copied value. LoadLocal/StoreLocal are unconditional stack access — no dual-write to upvalue cells needed. Cells are closed (value copied from stack into cell) at frame exit (Return, TailCall, exception unwind) and before non-VM calls (to protect against the NativeFn fallback creating a fresh VM that can't resolve Open cells). After closing, entries in `open_upvalues` are cleared to prevent stale cell reuse when slots are reused across scopes.
 
@@ -34,18 +34,18 @@ Source → Reader → Macro Expand → Lower (Expr<Spur>) → Optimize → Resol
 
 ## Opcodes
 
-64 opcodes across 8 categories:
+74 opcodes across 8 categories:
 
 - **Stack/constants:** Const, Nil, True, False, Pop, Dup
-- **Variables:** LoadLocal(0-3), StoreLocal(0-3), LoadUpvalue, StoreUpvalue, LoadGlobal, StoreGlobal, DefineGlobal
-- **Control flow:** Jump, JumpIfFalse, JumpIfTrue, Call, TailCall, Return, Throw
+- **Variables:** LoadLocal(0-3), StoreLocal(0-3), TakeLocal (moving last-use load), LoadUpvalue, StoreUpvalue, LoadGlobal, StoreGlobal, DefineGlobal
+- **Control flow:** Jump, JumpIfFalse, JumpIfTrue, Call, TailCall, Return, Throw, SelfTailCall, CallSelf (direct self-calls skip the global cache)
 - **Functions:** MakeClosure, CallNative, CallGlobal
 - **Arithmetic (generic):** Add, Sub, Mul, Div, Negate, Not, Eq, Lt, Gt, Le, Ge
 - **Arithmetic (int fast-path):** AddInt, SubInt, MulInt, LtInt, EqInt — operate directly on NaN-boxed bits, no Clone/Drop
 - **Data constructors:** MakeList, MakeVector, MakeMap, MakeHashMap
-- **Intrinsic stdlib ops:** Car, Cdr, Cons, IsNull, IsPair, IsList, IsNumber, IsString, IsSymbol, Length, Append, Get, ContainsQ
+- **Intrinsic stdlib ops:** Car, Cdr, Cons, IsNull, IsPair, IsList, IsNumber, IsString, IsSymbol, Length, Append, Get, ContainsQ, Nth, StringLength/StringRef/StringAppend, MutArrGet, MutArrSet
 
-**Per-instruction inline cache:** `LoadGlobal` (7 bytes: op + u32 spur + u16 cache_slot) and `CallGlobal` (9 bytes: op + u32 spur + u16 argc + u16 cache_slot) each get a dedicated cache slot in a side array. On hit (matching spur + env version), global access is a single array index — no HashMap lookup. Cache entries store `(spur_bits, version, value)` to guard against cross-VM closure slot collisions. Bytecode format version 2.
+**Per-instruction inline cache:** `LoadGlobal` (7 bytes: op + u32 spur + u16 cache_slot) and `CallGlobal` (9 bytes: op + u32 spur + u16 argc + u16 cache_slot) each get a dedicated cache slot in a side array. On hit (matching spur + env version), global access is a single array index — no HashMap lookup. Cache entries store `(spur_bits, version, value)` to guard against cross-VM closure slot collisions. Bytecode format version 5.
 
 ## Known Limitations
 
@@ -141,13 +141,9 @@ NaN-boxing or to `Value::drop`; all collection state lives in a transient side m
 
 ## Performance
 
-> **Note (Jun 2026):** the numbers below are **pre-PGO** and from older runs. v1.19.2 shipped fat LTO (3–9%) and PGO (~25–29% on 1BRC, −11% to −40% on compute) in the release binaries — see [Performance Roadmap](performance-roadmap.md) §10/§13. Re-measure before relying on these.
+As of the July 2026 campaign (v1.30.0, PGO builds, M2 Max), **Sema leads Janet on every suite benchmark** — 1BRC-optimized 10M in 3.6s vs Janet's 5.1s, tak 937ms vs 1,190ms — and is the fastest entry with no JIT and no native codegen in the 15-dialect 1BRC comparison. See [Performance Roadmap](performance-roadmap.md) for the current-state table, per-item impact, and remaining headroom; `website/docs/internals/lisp-comparison.md` for the full matrix.
 
-- **1BRC (10M rows, VM):** ~15.9s — dominated by Rc/drop (~35%), VM dispatch (16.5%), HashMap::clone (5.8%)
-- **Compute benchmarks (VM):** TAK 8.04s, deriv 1.84s (post-NaN-boxing)
 - **VM vs (retired) tree-walker:** the VM was ~1.7–2× faster on compute-heavy workloads, which motivated retiring the tree-walker
-- **Janet comparison:** ~1.7× behind Janet on 1BRC (both are embeddable bytecode VMs, no JIT)
-- See [Performance Roadmap](performance-roadmap.md) for detailed analysis and optimization plan
 
 ## Deferred Work
 

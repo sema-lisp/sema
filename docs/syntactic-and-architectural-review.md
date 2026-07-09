@@ -1,5 +1,7 @@
 # Sema Lisp — Syntactic & Architectural Review
 
+> **Dated snapshot:** assessed against v1.27.1 (2026-06-24). The 1.30.0 numeric tower, R7RS quartet (guard/parameterize/values/syntax-rules), and the July 2026 performance campaign shipped after this review — re-verify any proposal here against current main before acting on it.
+
 Comprehensive review of syntactic improvements and architectural recommendations.
 Assessed against v1.27.1 on 2026-06-24. Verified against source on 2026-06-24.
 

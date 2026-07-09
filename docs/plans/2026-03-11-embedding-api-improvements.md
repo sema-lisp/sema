@@ -1,5 +1,7 @@
 # Embedding API Improvements for Editor Integration
 
+> **Status (2026-07-09):** §4 (coroutines/yielding) is superseded — the cooperative scheduler + `AwaitIo` shipped a different mechanism (see `docs/plans/2026-07-01-cooperative-scheduling.md`). §1–3 (public step-limit control, `register_fn_typed`, `IntoValue`/`FromValue` conversions) remain unbuilt and still relevant for embedders.
+
 > **Context:** Token Editor (a Rust text editor) is planning to embed Sema as its scripting language. During the design phase, several gaps were identified in Sema's public embedding API that create friction or block features. This document captures the needed changes with context and rationale.
 >
 > **Related:** `/Users/helge/code/token-editor/docs/feature/sema-scripting-integration.md`

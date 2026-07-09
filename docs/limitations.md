@@ -1,7 +1,7 @@
 # Sema Lisp — Known Limitations & Gaps
 
 Assessed against standard Scheme (R7RS) and practical Lisp expectations.
-Status: originally written as of v0.5.0; verified and updated against v1.16.0 on 2026-06-09.
+Status: originally written as of v0.5.0; verified and updated against v1.30.0 on 2026-07-09.
 
 ---
 
@@ -172,7 +172,9 @@ Full R7RS character comparison: `char=?`, `char<?`, `char>?`, `char<=?`, `char>=
 
 ### 26. No `with-exception-handler`
 
-Only `try`/`catch`/`throw`. No R7RS `with-exception-handler` / `raise` / `raise-continuable`.
+`try`/`catch`/`throw`, `guard`, and `raise` are in (1.30.0); a re-thrown caught
+condition re-raises as itself. Still missing: R7RS `with-exception-handler` and
+`raise-continuable`.
 
 ### ~~27. No `define-values`~~ → RESOLVED
 
@@ -268,9 +270,7 @@ The last line is the footgun: `and` in head position is the special form, not th
 
 | #   | Gap                                      | Priority | Effort    | Notes                                                                        |
 | --- | ---------------------------------------- | -------- | --------- | ---------------------------------------------------------------------------- |
-| 15  | No `guard` (R7RS)                        | Low      | Low       | `try`/`catch` covers the use case; `guard` is syntactic sugar                |
 | 18  | No Continuations                         | Low      | Very High | Requires CPS transform or VM rewrite; trampoline can't capture continuations |
-| 20  | No Dynamic Binding                       | Low      | Medium    | `parameterize`/`make-parameter` via thread-local state                       |
 | 21  | Hygienic Macros (`syntax-rules`) partial | —        | —         | Shipped: pattern/ellipsis/literals + binder-directed hygiene; see §21 for caveats |
 | 22  | No Tail Position in `do` Body            | Low      | Low       | Body is for side effects; result exprs already have TCO                      |
 | 23  | No `string-set!`                         | Low      | Low       | Intentional — immutable strings are simpler and safer                        |
@@ -283,8 +283,8 @@ The last line is the footgun: `and` in head position is the special form, not th
 
 ## Recommended Next Implementations
 
-1. **Dynamic binding** (#20) — `make-parameter`/`parameterize` via thread-local storage fits the existing architecture.
-2. **`guard`** (#15) — Low effort syntactic sugar over `try`/`catch`.
+1. **VM `eval` locals reification** (#33) — the only remaining Medium-priority gap: `eval` sees globals but not enclosing lexical locals.
+2. **`with-exception-handler`** (#26) — the last piece of the R7RS exception story now that `guard`/`raise` are in.
 
 ---
 
@@ -292,7 +292,7 @@ The last line is the footgun: `and` in head position is the special form, not th
 
 - **Closures** — Properly implemented with lexical scoping
 - **Tail Call Optimization** — Trampoline-based, works for direct recursion in `if`/`cond`/`let`/`begin`/`and`/`or`/`when`/`unless` + named `let`
-- **Data types** — Int, Float, String, Char, Symbol, Keyword, List, Vector, Map, Record, Bytevector, Bool, Nil, Promise + LLM types
+- **Data types** — Int (arbitrary precision), Rational, Complex, Float, String, Char, Symbol, Keyword, List, Vector, Map, Record, Bytevector, Mutable containers, Bool, Nil, Promise + LLM types (full R7RS numeric tower since 1.30.0)
 - **Record types** — R7RS `define-record-type` with constructors, predicates, field accessors. `record?`, `type` returns record tag
 - **Multiple values** — R7RS `values`, `call-with-values`, `let-values`, `let*-values`, `define-values`
 - **Bytevectors** — `#u8(1 2 3)` literal syntax. `make-bytevector`, `bytevector`, `bytevector-length`, `bytevector-u8-ref`, `bytevector-u8-set!` (COW), `bytevector-copy`, `bytevector-append`, `bytevector->list`, `list->bytevector`, `utf8->string`, `string->utf8`

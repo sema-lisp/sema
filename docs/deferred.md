@@ -358,7 +358,7 @@ staged in `packages/sema` if picking this back up.
 
 ## TYPED-ARRAY-1 — Typed arrays remain fixed-width by design (not a numeric-tower gap)
 
-**Confirmed by design 2026-07-07.** The full numeric tower (ADR #68) adds arbitrary-precision
+**Confirmed by design 2026-07-07.** The full numeric tower (ADR #70) adds arbitrary-precision
 integers, exact rationals, and complex numbers to all general arithmetic and numeric builtins.
 However, typed arrays (`TAG_I64_ARRAY` for `i64-array`, `TAG_F64_ARRAY` for `f64-array`) remain
 fixed-width `i64`/`f64` containers **by design** — they are performance-oriented collection types,

@@ -1297,13 +1297,15 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
                     if n == 0 {
                         break;
                     }
-                    // Lines carry no terminator: strip the trailing \n and \r.
+                    // Lines carry no terminator: strip a trailing \n or \r\n.
+                    // The \r is only stripped as part of a \r\n pair — a bare
+                    // \r at EOF is line content, exactly as in file/fold-lines.
                     let mut end = line_buf.len();
                     if end > 0 && line_buf[end - 1] == b'\n' {
                         end -= 1;
-                    }
-                    if end > 0 && line_buf[end - 1] == b'\r' {
-                        end -= 1;
+                        if end > 0 && line_buf[end - 1] == b'\r' {
+                            end -= 1;
+                        }
                     }
                     let line_val = Value::bytevector(line_buf[..end].to_vec());
                     let call_args = [std::mem::replace(&mut acc, Value::nil()), line_val];

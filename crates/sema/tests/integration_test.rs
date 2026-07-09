@@ -3422,6 +3422,23 @@ fn test_file_fold_lines_bytes() {
     ));
     assert_eq!(empty, Value::int(42));
 
+    // CR parity with file/fold-lines: \r is only stripped as part of a \r\n
+    // pair, so a final unterminated line ending in a bare \r keeps it as
+    // content. Line lengths must match the string sibling's exactly.
+    std::fs::write(format!("{dir}/cr.txt"), "line1\r\nline2\rmid\nlast\r").expect("write fixture");
+    let byte_lens = eval(&format!(
+        r#"(file/fold-lines-bytes "{dir}/cr.txt"
+             (fn (acc line) (cons (bytes/length line) acc))
+             '())"#
+    ));
+    let str_lens = eval(&format!(
+        r#"(file/fold-lines "{dir}/cr.txt"
+             (fn (acc line) (cons (string-length line) acc))
+             '())"#
+    ));
+    assert_eq!(byte_lens, eval("'(5 9 5)"));
+    assert_eq!(byte_lens, str_lens);
+
     // Arity errors
     assert_arity_error(r#"(file/fold-lines-bytes "f" (fn (a b) a))"#);
     assert_arity_error(r#"(file/fold-lines-bytes)"#);

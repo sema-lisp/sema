@@ -2001,6 +2001,13 @@ eval_tests! {
     string_append_coerce_num: r#"(string-append "n=" 42)"# => Value::string("n=42"),
     // N-ary string-append stays on the generic path and must still work.
     string_append_nary: r#"(string-append "a" "b" "c" "d")"# => Value::string("abcd"),
+    // Multi-byte operands exercise the exact-capacity concat path.
+    string_append_unicode: r#"(string-append "hé" "llø")"# => Value::string("héllø"),
+
+    // `+` on two strings concatenates (vm_add's string arm).
+    plus_string_concat: r#"(+ "foo" "bar")"# => Value::string("foobar"),
+    plus_string_empty_left: r#"(+ "" "x")"# => Value::string("x"),
+    plus_string_unicode: r#"(+ "hé" "llø")"# => Value::string("héllø"),
 }
 
 eval_error_tests! {

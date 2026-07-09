@@ -2807,18 +2807,27 @@ impl VM {
                         }
                     }
                     op::STRING_APPEND => {
-                        use std::fmt::Write;
                         let b = unsafe { pop_unchecked(&mut self.stack) };
                         let a = unsafe { pop_unchecked(&mut self.stack) };
-                        let mut result = String::new();
-                        for arg in [&a, &b] {
-                            if let Some(s) = arg.as_str() {
-                                result.push_str(s);
-                            } else {
-                                write!(&mut result, "{}", arg).unwrap();
+                        let result = if let (Some(x), Some(y)) = (a.as_str(), b.as_str()) {
+                            // Both strings: one exact-capacity allocation.
+                            let mut s = String::with_capacity(x.len() + y.len());
+                            s.push_str(x);
+                            s.push_str(y);
+                            s
+                        } else {
+                            use std::fmt::Write;
+                            let mut s = String::new();
+                            for arg in [&a, &b] {
+                                if let Some(x) = arg.as_str() {
+                                    s.push_str(x);
+                                } else {
+                                    write!(&mut s, "{}", arg).unwrap();
+                                }
                             }
-                        }
-                        self.stack.push(Value::string(&result));
+                            s
+                        };
+                        self.stack.push(Value::string_owned(result));
                     }
 
                     _ => {
@@ -4338,9 +4347,10 @@ fn vm_add(a: &Value, b: &Value) -> Result<Value, SemaError> {
         (ValueViewRef::Int(x), ValueViewRef::Float(y)) => Ok(Value::float(x as f64 + y)),
         (ValueViewRef::Float(x), ValueViewRef::Int(y)) => Ok(Value::float(x + y as f64)),
         (ValueViewRef::String(x), ValueViewRef::String(y)) => {
-            let mut s = x.to_string();
+            let mut s = String::with_capacity(x.len() + y.len());
+            s.push_str(x);
             s.push_str(y);
-            Ok(Value::string(&s))
+            Ok(Value::string_owned(s))
         }
         _ => {
             // Non-fixnum numeric operands (bignum now; rational/complex in later

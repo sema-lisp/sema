@@ -101,6 +101,8 @@ fn op_name(op: Op) -> &'static str {
         Op::SelfTailCall => "SELF_TAIL_CALL",
         Op::CallSelf => "CALL_SELF",
         Op::TakeLocal => "TAKE_LOCAL",
+        Op::MutArrGet => "MUT_ARR_GET",
+        Op::MutArrSet => "MUT_ARR_SET",
     }
 }
 

@@ -8,6 +8,7 @@ pub mod home;
 pub mod io_backend;
 pub mod json;
 pub mod mcp_cassette;
+pub mod mutable_ops;
 pub mod net;
 pub mod num;
 pub mod number;
@@ -62,6 +63,7 @@ pub use mcp_cassette::{
     clear_mcp_cassette_hook, mcp_cassette_decide, mcp_cassette_record, set_mcp_cassette_hook,
     McpCassetteDecision,
 };
+pub use mutable_ops::{mutable_array_get, mutable_array_set};
 pub use output_hook::{set_stderr_hook, set_stdout_hook, write_stderr, write_stdout};
 pub use sandbox::{Caps, Sandbox};
 pub use text_util::truncate_chars;

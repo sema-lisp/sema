@@ -464,6 +464,17 @@ String indexing is by **Unicode scalar (char)**, not byte, matching the stdlib s
 
 Because the slot is proven dead, the nil left behind is unobservable by the program. The only surface that can still read the slot is the **debug inspector** (DAP variable views / `evaluate`): a variable whose last use has executed displays as `nil` for the remainder of its lexical scope. This is accepted debugger behavior, mirroring registerized locals in native debuggers. Additive within the existing encoding (`u16` operand, no new operand shape), so it does not change `format_version`.
 
+### Mutable-array accessors (`MutArrGet` 0x48, `MutArrSet` 0x49)
+
+Single-byte inline intrinsics for the `mutable-array` accessors, following the same emission rules as the other stdlib intrinsics (canonical global name, exact arity, name not redefined anywhere in the program):
+
+| Opcode | Source form | Stack effect | Behavior |
+|--------|-------------|--------------|----------|
+| `MutArrGet` (0x48) | `(mutable-array/get arr idx)` | pop 2, push 1 | push `arr[idx]`; errors on non-array, negative/non-int index, or out-of-bounds index |
+| `MutArrSet` (0x49) | `(mutable-array/set! arr idx val)` | pop 3, push 1 | `arr[idx] = val`, push the array itself (the Sema-level return value); errors on non-array, negative/non-int index, or out-of-bounds index |
+
+The 3-arg (default) form of `mutable-array/get` and any wrong-arity call stay on the generic `CallGlobal` path — the native owns the default logic and the arity errors. Both opcodes share their implementation with the stdlib natives (`sema_core::mutable_ops`), so error messages are byte-identical across dispatch paths. Additive within the existing encoding (single-byte, no new operand shapes), so they do not change `format_version`.
+
 ## Example
 
 Given this source file:

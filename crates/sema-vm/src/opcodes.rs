@@ -132,6 +132,15 @@ pub enum Op {
     // fast paths (`with_hashmap_mut_if_unique` & co.) can fire. Appended last to
     // keep all preceding opcode numbers stable for `.semac` compatibility.
     TakeLocal, // u16 slot → push locals[slot]; locals[slot] = nil
+
+    // Mutable-array intrinsics — inline `mutable-array/get` (2-arg form) and
+    // `mutable-array/set!`, bypassing the CallGlobal native dispatch in
+    // imperative hot loops (1BRC-style per-row stats updates). Semantics and
+    // error messages are shared with the stdlib natives via
+    // `sema_core::mutable_array_get` / `mutable_array_set`. Appended last to
+    // keep all preceding opcode numbers stable for `.semac` compatibility.
+    MutArrGet, // pop index, pop array → push array[index]
+    MutArrSet, // pop value, pop index, pop array → array[index] = value; push array
 }
 
 impl Op {
@@ -214,6 +223,8 @@ impl Op {
             69 => Some(Op::SelfTailCall),
             70 => Some(Op::CallSelf),
             71 => Some(Op::TakeLocal),
+            72 => Some(Op::MutArrGet),
+            73 => Some(Op::MutArrSet),
             _ => None,
         }
     }
@@ -295,13 +306,18 @@ impl Op {
             },
             // binary ops — 2 pops, 1 push
             Add | Sub | Mul | Div | Eq | Lt | Gt | Le | Ge | AddInt | SubInt | MulInt | LtInt
-            | EqInt | Cons | Append | Get | ContainsQ | Mod | Nth | StringRef | StringAppend => {
-                StackEffect {
-                    pops: 2,
-                    pushes: 1,
-                    exits_frame: false,
-                }
-            }
+            | EqInt | Cons | Append | Get | ContainsQ | Mod | Nth | StringRef | StringAppend
+            | MutArrGet => StackEffect {
+                pops: 2,
+                pushes: 1,
+                exits_frame: false,
+            },
+            // ternary ops — 3 pops, 1 push
+            MutArrSet => StackEffect {
+                pops: 3,
+                pushes: 1,
+                exits_frame: false,
+            },
             // unary ops — 1 pop, 1 push
             Negate | Not | Car | Cdr | Length | IsNull | IsPair | IsList | IsNumber | IsString
             | IsSymbol | StringLength => StackEffect {
@@ -405,6 +421,8 @@ const _: () = {
             Op::SelfTailCall => {}
             Op::CallSelf => {}
             Op::TakeLocal => {}
+            Op::MutArrGet => {}
+            Op::MutArrSet => {}
         }
     }
 };
@@ -484,6 +502,8 @@ pub mod op {
     pub const SELF_TAIL_CALL: u8 = Op::SelfTailCall as u8;
     pub const CALL_SELF: u8 = Op::CallSelf as u8;
     pub const TAKE_LOCAL: u8 = Op::TakeLocal as u8;
+    pub const MUT_ARR_GET: u8 = Op::MutArrGet as u8;
+    pub const MUT_ARR_SET: u8 = Op::MutArrSet as u8;
 
     // Instruction sizes (opcode byte + operand bytes)
     /// Size of a bare opcode with no operands: 1

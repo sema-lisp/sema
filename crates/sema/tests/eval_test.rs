@@ -2706,6 +2706,27 @@ eval_tests! {
     mutable_array_not_equal_to_vector: "(equal? (mutable-array/new 1 0) [0])" => Value::bool(false),
     // Cyclic comparison terminates (coinductive equality, no infinite loop).
     mutable_array_cyclic_equal_terminates: "(let ((a (mutable-array/new)) (b (mutable-array/new))) (mutable-array/push! a a) (mutable-array/push! b b) (equal? a b))" => Value::bool(true),
+    // --- MutArrGet / MutArrSet intrinsic opcodes (2-arg get, 3-arg set!) ---
+    // These pin observational equivalence with the native path; expected
+    // values were verified against the pre-intrinsic binary.
+    mutable_array_set_get_roundtrip: "(let ((a (mutable-array/new 3 0))) (mutable-array/set! a 1 42) (mutable-array/get a 1))" => Value::int(42),
+    // set! returns the array itself (not the value, not nil) …
+    mutable_array_set_returns_array: "(let ((a (mutable-array/new 2 0))) (mutable-array/->vector (mutable-array/set! a 0 9)))" => common::eval("[9 0]"),
+    // … and the very same handle (identity, not a copy).
+    mutable_array_set_returns_same_handle: "(let ((a (mutable-array/new 1 0))) (eq? a (mutable-array/set! a 0 1)))" => Value::bool(true),
+    // Left-to-right evaluation: the value expression runs after arr/idx and
+    // may itself mutate the array; its write is then overwritten.
+    mutable_array_set_eval_order: "(let ((a (mutable-array/new 1 1))) (mutable-array/set! a 0 (begin (mutable-array/set! a 0 5) (+ (mutable-array/get a 0) 1))) (mutable-array/get a 0))" => Value::int(6),
+    // Nested accessors compose (a set! through a get result).
+    mutable_array_nested_set_through_get: "(let ((a (mutable-array/new 1 0)) (b (mutable-array/new 1 0))) (mutable-array/set! a 0 b) (mutable-array/set! (mutable-array/get a 0) 0 :deep) (mutable-array/get b 0))" => Value::keyword("deep"),
+    // In-bounds 3-arg get ignores the default (stays on the native path).
+    mutable_array_get_default_in_bounds: "(mutable-array/get (mutable-array/new 2 7) 1 :missing)" => Value::int(7),
+    // Intrinsic errors unwind through try/catch like the native's.
+    mutable_array_get_oob_catchable: "(try (mutable-array/get (mutable-array/new) 5) (catch e :caught))" => Value::keyword("caught"),
+    // Redefinition guard: a program-level redefine disables the intrinsic.
+    mutable_array_get_redefined: "(define (mutable-array/get a i) :mine) (mutable-array/get (mutable-array/new 1 5) 0)" => Value::keyword("mine"),
+    // A let-bound shadow resolves locally (never the intrinsic).
+    mutable_array_get_local_shadow: "(let ((mutable-array/get (fn (a i) :local))) (mutable-array/get 1 2))" => Value::keyword("local"),
     mutable_cell_round_trip: "(let ((c (mutable-cell/new 1))) (mutable-cell/set! c 99) (mutable-cell/get c))" => Value::int(99),
     mutable_cell_shared_mutation: "(let* ((c (mutable-cell/new 0)) (d c)) (mutable-cell/set! c 5) (mutable-cell/get d))" => Value::int(5),
     mutable_cell_equal_by_contents: "(equal? (mutable-cell/new 1) (mutable-cell/new 1))" => Value::bool(true),
@@ -2713,9 +2734,19 @@ eval_tests! {
 }
 
 eval_error_tests! {
-    mutable_array_get_oob: "(mutable-array/get (mutable-array/new) 0)" => "out of bounds",
-    mutable_array_set_oob: "(mutable-array/set! (mutable-array/new) 0 1)" => "out of bounds",
-    mutable_array_set_negative_index: "(mutable-array/set! (mutable-array/new 1 0) -1 5)" => "non-negative",
+    // get/set! errors are raised by the MutArrGet/MutArrSet intrinsic arms;
+    // the full messages are pinned (shared with the natives via
+    // sema_core::mutable_ops, so both paths stay byte-identical).
+    mutable_array_get_oob: "(mutable-array/get (mutable-array/new) 0)" => "mutable-array/get: index 0 out of bounds (length 0)",
+    mutable_array_get_type_error: "(mutable-array/get [1] 0)" => "expected mutable-array, got vector",
+    mutable_array_get_negative_index: "(mutable-array/get (mutable-array/new 1 0) -1)" => "mutable-array/get: expected a non-negative integer, got -1",
+    mutable_array_get_non_int_index: "(mutable-array/get (mutable-array/new 1 0) :x)" => "expected int, got keyword",
+    mutable_array_set_oob: "(mutable-array/set! (mutable-array/new) 0 1)" => "mutable-array/set!: index 0 out of bounds (length 0)",
+    mutable_array_set_type_error: "(mutable-array/set! [1] 0 1)" => "expected mutable-array, got vector",
+    mutable_array_set_negative_index: "(mutable-array/set! (mutable-array/new 1 0) -1 5)" => "mutable-array/set!: expected a non-negative integer, got -1",
+    mutable_array_set_non_int_index: "(mutable-array/set! (mutable-array/new 1 0) \"x\" 5)" => "expected int, got string",
+    // Wrong-arity calls fall through to the native, whose arity error fires.
+    mutable_array_set_arity: "(mutable-array/set! (mutable-array/new 1 0) 0)" => "mutable-array/set!",
     mutable_array_push_type_error: "(mutable-array/push! [1] 2)" => "mutable-array",
     mutable_array_new_arity: "(mutable-array/new 1 2 3)" => "mutable-array/new",
     mutable_cell_get_type_error: "(mutable-cell/get 5)" => "mutable-cell",

@@ -54,38 +54,17 @@ pub fn register(env: &sema_core::Env) {
         Ok(args[0].clone())
     });
 
+    // get/set! share their implementation (and error messages) with the VM's
+    // MutArrGet / MutArrSet intrinsic opcodes via sema_core::mutable_ops.
     register_fn(env, "mutable-array/get", |args| {
         check_arity!(args, "mutable-array/get", 2..=3);
-        let arr = as_array(&args[0], "mutable-array/get")?;
-        let idx = args[1].as_index("mutable-array/get")?;
-        let items = arr.items.borrow();
-        match items.get(idx) {
-            Some(v) => Ok(v.clone()),
-            None if args.len() == 3 => Ok(args[2].clone()),
-            None => Err(SemaError::eval(format!(
-                "mutable-array/get: index {idx} out of bounds (length {})",
-                items.len()
-            ))),
-        }
+        sema_core::mutable_array_get(&args[0], &args[1], args.get(2))
     });
 
     register_fn(env, "mutable-array/set!", |args| {
         check_arity!(args, "mutable-array/set!", 3);
-        let arr = as_array(&args[0], "mutable-array/set!")?;
-        let idx = args[1].as_index("mutable-array/set!")?;
-        let mut items = arr.items.borrow_mut();
-        let len = items.len();
-        match items.get_mut(idx) {
-            Some(slot) => {
-                *slot = args[2].clone();
-                drop(items);
-                Ok(args[0].clone())
-            }
-            None => Err(SemaError::eval(format!(
-                "mutable-array/set!: index {idx} out of bounds (length {len})"
-            ))
-            .with_hint("set! writes to an existing slot; use mutable-array/push! to grow")),
-        }
+        sema_core::mutable_array_set(&args[0], &args[1], args[2].clone())?;
+        Ok(args[0].clone())
     });
 
     register_fn(env, "mutable-array/length", |args| {

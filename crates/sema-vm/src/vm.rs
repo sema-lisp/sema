@@ -3020,6 +3020,33 @@ impl VM {
                         self.stack.push(Value::string_owned(result));
                     }
 
+                    // --- Mutable-array intrinsics (implementation shared with
+                    //     sema-stdlib/src/mutable.rs via sema_core::mutable_ops,
+                    //     so errors are byte-identical across dispatch paths) ---
+                    op::MUT_ARR_GET => {
+                        let idx = unsafe { pop_unchecked(&mut self.stack) };
+                        let arr = unsafe { pop_unchecked(&mut self.stack) };
+                        match sema_core::mutable_array_get(&arr, &idx, None) {
+                            Ok(v) => self.stack.push(v),
+                            Err(err) => {
+                                handle_err!(self, fi, pc, err, pc - op::SIZE_OP, 'dispatch)
+                            }
+                        }
+                    }
+                    op::MUT_ARR_SET => {
+                        let val = unsafe { pop_unchecked(&mut self.stack) };
+                        let idx = unsafe { pop_unchecked(&mut self.stack) };
+                        let arr = unsafe { pop_unchecked(&mut self.stack) };
+                        match sema_core::mutable_array_set(&arr, &idx, val) {
+                            // The Sema-level contract returns the array itself;
+                            // the popped handle goes straight back — no clone.
+                            Ok(()) => self.stack.push(arr),
+                            Err(err) => {
+                                handle_err!(self, fi, pc, err, pc - op::SIZE_OP, 'dispatch)
+                            }
+                        }
+                    }
+
                     _ => {
                         return Err(SemaError::eval(format!("VM: invalid opcode {}", op)));
                     }
@@ -4507,6 +4534,8 @@ fn intrinsic_name(opcode: Op) -> Option<&'static str> {
         Op::StringLength => Some("string-length"),
         Op::StringRef => Some("string-ref"),
         Op::StringAppend => Some("string-append"),
+        Op::MutArrGet => Some("mutable-array/get"),
+        Op::MutArrSet => Some("mutable-array/set!"),
         Op::Throw => Some("throw"),
         _ => None,
     }

@@ -889,6 +889,12 @@ impl Compiler {
             ("mod", 2) | ("modulo", 2) => Op::Mod,
             // Indexed access
             ("nth", 2) => Op::Nth,
+            // Mutable-array accessors. Only the exact arities are intrinsified:
+            // the 3-arg (default) form of get and any wrong-arity call fall
+            // through to the native, which owns the default logic and the
+            // arity errors.
+            ("mutable-array/get", 2) => Op::MutArrGet,
+            ("mutable-array/set!", 3) => Op::MutArrSet,
             // String operations (legacy Scheme names, Decision #24).
             // string-append is N-ary in stdlib; only the 2-arg case is
             // intrinsified (mirrors the Append precedent) — N-ary stays generic.
@@ -1863,6 +1869,80 @@ mod tests {
         let result = compile_str("(foo 1 2)");
         let ops = extract_ops(&result.chunk);
         assert_eq!(ops, vec![Op::Const, Op::Const, Op::CallGlobal, Op::Return]);
+    }
+
+    #[test]
+    fn test_compile_intrinsic_mut_arr_get() {
+        let result = compile_str("(mutable-array/get a 0)");
+        let ops = extract_ops(&result.chunk);
+        assert_eq!(
+            ops,
+            vec![Op::LoadGlobal, Op::Const, Op::MutArrGet, Op::Return]
+        );
+    }
+
+    #[test]
+    fn test_compile_intrinsic_mut_arr_set() {
+        let result = compile_str("(mutable-array/set! a 0 1)");
+        let ops = extract_ops(&result.chunk);
+        assert_eq!(
+            ops,
+            vec![
+                Op::LoadGlobal,
+                Op::Const,
+                Op::Const,
+                Op::MutArrSet,
+                Op::Return
+            ]
+        );
+    }
+
+    #[test]
+    fn test_compile_mut_arr_get_default_form_stays_call_global() {
+        // The 3-arg (default) form is not intrinsified — the native owns the
+        // default logic.
+        let result = compile_str("(mutable-array/get a 0 :missing)");
+        let ops = extract_ops(&result.chunk);
+        assert!(
+            !ops.contains(&Op::MutArrGet),
+            "3-arg get must not intrinsify: {ops:?}"
+        );
+        assert!(
+            ops.contains(&Op::CallGlobal),
+            "3-arg get dispatches to the native: {ops:?}"
+        );
+    }
+
+    #[test]
+    fn test_compile_mut_arr_set_wrong_arity_stays_call_global() {
+        // Wrong-arity calls fall through to the native so its arity error fires.
+        let result = compile_str("(mutable-array/set! a 0)");
+        let ops = extract_ops(&result.chunk);
+        assert!(
+            !ops.contains(&Op::MutArrSet),
+            "2-arg set! must not intrinsify: {ops:?}"
+        );
+        assert!(
+            ops.contains(&Op::CallGlobal),
+            "2-arg set! dispatches to the native: {ops:?}"
+        );
+    }
+
+    #[test]
+    fn test_compile_mut_arr_intrinsics_guarded_by_redefinition() {
+        // A program-level (re)define of the accessor disables the intrinsic —
+        // calls dispatch to the user's definition.
+        let result =
+            compile_many_str("(define (mutable-array/get a i) :mine) (mutable-array/get x 0)");
+        let ops = extract_ops(&result.chunk);
+        assert!(
+            !ops.contains(&Op::MutArrGet),
+            "redefined mutable-array/get must not intrinsify: {ops:?}"
+        );
+        assert!(
+            ops.contains(&Op::CallGlobal),
+            "must dispatch to the user fn: {ops:?}"
+        );
     }
 
     #[test]

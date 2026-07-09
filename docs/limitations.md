@@ -238,7 +238,7 @@ A program compiled as one unit bakes calls to *known builtins* into `CallNative`
 (import "string-utils") (truncate "hello" 3)  ; => Arity error: truncate expects 1 args, got 2
 ```
 
-This worked on the retired tree-walker (late name resolution). On the VM, avoid shadowing a builtin name from an imported/loaded module (rename it, e.g. `truncate-str`), or `define` the override at top level in the same program. A general fix (conservatively disabling `CallNative` for programs containing `import`/`load`) was rejected for the per-call perf cost.
+This worked on the retired tree-walker (late name resolution). On the VM, avoid shadowing a builtin name from an imported/loaded module (rename it, e.g. `truncate-str`), or `define` the override at top level in the same program. A general fix (conservatively disabling `CallNative` for programs containing `import`/`load`) was rejected for the per-call perf cost. The same compilation-unit boundary applies in the other direction to the intrinsic opcodes and the constant folder: a top-level `(define not ...)` (or any foldable/intrinsic name — `+`, `car`, `=` …) in one unit is invisible to code compiled in a *different* unit (a `(load ...)`ed file, a later REPL line), which still dispatches to — or folds with — the builtin.
 
 ### 35. Eager bulk allocators can exhaust memory (resource DoS, found by fuzzing)
 

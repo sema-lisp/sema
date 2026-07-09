@@ -123,6 +123,14 @@ const MAX_RESOLVE_DEPTH: usize = 256;
 struct Resolver {
     scopes: Vec<FunctionScope>,
     depth: usize,
+    /// One frame per body being resolved: names that body may rebind after
+    /// their defining form (`set!` targets anywhere within it, plus names
+    /// defined more than once in the same block). An internal define of such
+    /// a name is disqualified from the self-tail-call optimization — the
+    /// binding is mutable (letrec* semantics), so its recursion must resolve
+    /// through the current binding, not stay hard-bound to the original
+    /// closure. Conservative: a match in any enclosing frame disqualifies.
+    rebound_names: Vec<std::collections::HashSet<Spur>>,
 }
 
 impl Resolver {
@@ -130,7 +138,12 @@ impl Resolver {
         Resolver {
             scopes: vec![FunctionScope::new(true)],
             depth: 0,
+            rebound_names: Vec::new(),
         }
+    }
+
+    fn is_rebound(&self, name: Spur) -> bool {
+        self.rebound_names.iter().any(|s| s.contains(&name))
     }
 
     fn current(&mut self) -> &mut FunctionScope {
@@ -237,24 +250,7 @@ fn resolve_expr_inner(expr: &CoreExpr, r: &mut Resolver) -> Result<ResolvedExpr,
             else_: Box::new(resolve_expr(else_, r)?),
         }),
 
-        CoreExpr::Begin(exprs) => {
-            // Inside a function, pre-register all inner define names so they can
-            // reference each other (letrec* semantics / R5RS internal defines).
-            if !(r.current().is_top_level && r.current().blocks.len() == 1) {
-                for expr in exprs {
-                    let inner = match expr {
-                        CoreExpr::Spanned(_, inner) => inner.as_ref(),
-                        other => other,
-                    };
-                    if let CoreExpr::Define(spur, _) = inner {
-                        if r.current().find_local(*spur).is_none() {
-                            r.define_local(*spur);
-                        }
-                    }
-                }
-            }
-            Ok(ResolvedExpr::Begin(resolve_exprs(exprs, r)?))
-        }
+        CoreExpr::Begin(exprs) => Ok(ResolvedExpr::Begin(resolve_body(exprs, r)?)),
 
         CoreExpr::Set(spur, expr) => {
             let val = resolve_expr(expr, r)?;
@@ -295,7 +291,11 @@ fn resolve_expr_inner(expr: &CoreExpr, r: &mut Resolver) -> Result<ResolvedExpr,
                 // optimization as a letrec binding (issue #62): a lambda that
                 // references its own name only as a tail-call operator elides
                 // the self upvalue and self-calls compile to SelfTailCall.
-                optimize_self_tail(&mut val, slot);
+                // Not when an enclosing body rebinds the name (sibling set!
+                // or redefine): the recursion must observe the rebinding.
+                if !r.is_rebound(*spur) {
+                    optimize_self_tail(&mut val, slot);
+                }
                 Ok(ResolvedExpr::Set(
                     VarRef {
                         name: *spur,
@@ -438,10 +438,14 @@ fn resolve_exprs(exprs: &[CoreExpr], r: &mut Resolver) -> Result<Vec<ResolvedExp
     exprs.iter().map(|e| resolve_expr(e, r)).collect()
 }
 
-/// Resolve a body (lambda, let, letrec, etc.) with R5RS internal define semantics:
-/// pre-register all inner define names so they can forward-reference each other.
+/// Resolve a body (lambda, let, letrec, begin, etc.) with R5RS internal define
+/// semantics: pre-register all inner define names so they can forward-reference
+/// each other. Also records the body's rebound names (see `Resolver::rebound_names`)
+/// for the duration, so internal defines of those names keep their real
+/// self-capture instead of taking the self-tail-call optimization.
 fn resolve_body(exprs: &[CoreExpr], r: &mut Resolver) -> Result<Vec<ResolvedExpr>, SemaError> {
-    if !(r.current().is_top_level && r.current().blocks.len() == 1) {
+    let scoped = !(r.current().is_top_level && r.current().blocks.len() == 1);
+    if scoped {
         for expr in exprs {
             let inner = match expr {
                 CoreExpr::Spanned(_, inner) => inner.as_ref(),
@@ -453,8 +457,138 @@ fn resolve_body(exprs: &[CoreExpr], r: &mut Resolver) -> Result<Vec<ResolvedExpr
                 }
             }
         }
+        let mut rebound = std::collections::HashSet::new();
+        let mut defined = std::collections::HashSet::new();
+        for expr in exprs {
+            collect_rebinds(expr, true, &mut rebound, &mut defined);
+        }
+        r.rebound_names.push(rebound);
     }
-    resolve_exprs(exprs, r)
+    let result = resolve_exprs(exprs, r);
+    if scoped {
+        r.rebound_names.pop();
+    }
+    result
+}
+
+/// Collect names a body may rebind after their defining form: every `set!`
+/// target at any depth (a `set!` in a nested lambda still writes the outer
+/// binding through an upvalue), plus names defined more than once in the same
+/// block (`same_block` — nested lambda/let/letrec/do bodies bind their defines
+/// in their own scope, so only `begin` chains stay in-block). Name-based and
+/// therefore conservative: a `set!` of a shadowing binding also matches, which
+/// only costs the optimization, never correctness.
+fn collect_rebinds(
+    e: &CoreExpr,
+    same_block: bool,
+    rebound: &mut std::collections::HashSet<Spur>,
+    defined: &mut std::collections::HashSet<Spur>,
+) {
+    fn walk_all(
+        exprs: &[CoreExpr],
+        rebound: &mut std::collections::HashSet<Spur>,
+        defined: &mut std::collections::HashSet<Spur>,
+    ) {
+        for x in exprs {
+            collect_rebinds(x, false, rebound, defined);
+        }
+    }
+    match e {
+        CoreExpr::Set(spur, val) => {
+            rebound.insert(*spur);
+            collect_rebinds(val, false, rebound, defined);
+        }
+        CoreExpr::Define(spur, val) => {
+            if same_block && !defined.insert(*spur) {
+                rebound.insert(*spur);
+            }
+            collect_rebinds(val, false, rebound, defined);
+        }
+        CoreExpr::Begin(exprs) => {
+            for x in exprs {
+                collect_rebinds(x, same_block, rebound, defined);
+            }
+        }
+        CoreExpr::Spanned(_, inner) => collect_rebinds(inner, same_block, rebound, defined),
+        CoreExpr::Const(_) | CoreExpr::Var(_) | CoreExpr::Quote(_) => {}
+        CoreExpr::DefineRecordType { .. } => {}
+        CoreExpr::If { test, then, else_ } => {
+            collect_rebinds(test, false, rebound, defined);
+            collect_rebinds(then, false, rebound, defined);
+            collect_rebinds(else_, false, rebound, defined);
+        }
+        CoreExpr::Lambda(def) => walk_all(&def.body, rebound, defined),
+        CoreExpr::Call { func, args, .. } => {
+            collect_rebinds(func, false, rebound, defined);
+            walk_all(args, rebound, defined);
+        }
+        CoreExpr::Let { bindings, body }
+        | CoreExpr::LetStar { bindings, body }
+        | CoreExpr::Letrec { bindings, body } => {
+            for (_, init) in bindings {
+                collect_rebinds(init, false, rebound, defined);
+            }
+            walk_all(body, rebound, defined);
+        }
+        CoreExpr::Do(do_loop) => {
+            for v in &do_loop.vars {
+                collect_rebinds(&v.init, false, rebound, defined);
+                if let Some(step) = &v.step {
+                    collect_rebinds(step, false, rebound, defined);
+                }
+            }
+            collect_rebinds(&do_loop.test, false, rebound, defined);
+            walk_all(&do_loop.result, rebound, defined);
+            walk_all(&do_loop.body, rebound, defined);
+        }
+        CoreExpr::Try { body, handler, .. } => {
+            walk_all(body, rebound, defined);
+            walk_all(handler, rebound, defined);
+        }
+        CoreExpr::Throw(val)
+        | CoreExpr::Load(val)
+        | CoreExpr::Eval(val)
+        | CoreExpr::Delay(val)
+        | CoreExpr::Force(val)
+        | CoreExpr::Macroexpand(val) => collect_rebinds(val, false, rebound, defined),
+        CoreExpr::And(exprs)
+        | CoreExpr::Or(exprs)
+        | CoreExpr::MakeList(exprs)
+        | CoreExpr::MakeVector(exprs) => walk_all(exprs, rebound, defined),
+        CoreExpr::MakeMap(pairs) => {
+            for (k, v) in pairs {
+                collect_rebinds(k, false, rebound, defined);
+                collect_rebinds(v, false, rebound, defined);
+            }
+        }
+        CoreExpr::Defmacro { body, .. } | CoreExpr::Module { body, .. } => {
+            walk_all(body, rebound, defined);
+        }
+        CoreExpr::Import { path, .. } => collect_rebinds(path, false, rebound, defined),
+        CoreExpr::Prompt(entries) => {
+            for entry in entries {
+                match entry {
+                    PromptEntry::RoleContent { parts, .. } => walk_all(parts, rebound, defined),
+                    PromptEntry::Expr(x) => collect_rebinds(x, false, rebound, defined),
+                }
+            }
+        }
+        CoreExpr::Message { role, parts } => {
+            collect_rebinds(role, false, rebound, defined);
+            walk_all(parts, rebound, defined);
+        }
+        CoreExpr::Deftool {
+            description,
+            parameters,
+            handler,
+            ..
+        } => {
+            collect_rebinds(description, false, rebound, defined);
+            collect_rebinds(parameters, false, rebound, defined);
+            collect_rebinds(handler, false, rebound, defined);
+        }
+        CoreExpr::Defagent { options, .. } => collect_rebinds(options, false, rebound, defined),
+    }
 }
 
 fn resolve_prompt_entry(
@@ -596,9 +730,24 @@ fn resolve_letrec(
     // references its own name only as a tail-call operator does not need to
     // capture itself — the running frame already holds its own closure. Eliding
     // the self upvalue removes the CORE-2 self-reference cycle (ADR #66).
+    // A binding the letrec form itself rebinds (a `set!` in an init or the
+    // body, or a body define reusing the binding's slot) keeps its real
+    // self-capture: letrec bindings are mutable, so the recursion must
+    // resolve through the current binding.
+    let mut rebound = std::collections::HashSet::new();
+    let mut defined: std::collections::HashSet<Spur> =
+        bindings.iter().map(|(name, _)| *name).collect();
+    for (_, init) in bindings {
+        collect_rebinds(init, false, &mut rebound, &mut defined);
+    }
+    for expr in body {
+        collect_rebinds(expr, true, &mut rebound, &mut defined);
+    }
     for (vr, value) in resolved_bindings.iter_mut() {
         if let VarResolution::Local { slot } = vr.resolution {
-            optimize_self_tail(value, slot);
+            if !rebound.contains(&vr.name) {
+                optimize_self_tail(value, slot);
+            }
         }
     }
 
@@ -1980,6 +2129,50 @@ mod tests {
             loop_fn.upvalues.len(),
             1,
             "escaping define name keeps its self upvalue"
+        );
+    }
+
+    #[test]
+    fn test_self_tail_call_internal_define_sibling_set_keeps_upvalue() {
+        // A sibling set! of the define's name rebinds the (letrec*-mutable)
+        // binding, so the self-call must keep resolving through the real
+        // upvalue — hard-binding it to the original closure would let an
+        // escaped copy keep recursing into the pre-set! definition.
+        let loop_fn = internal_define_lambda(
+            "(lambda () (define (loop n) (if (= n 0) n (loop (- n 1)))) (set! loop (lambda (n) n)) (loop 5))",
+        );
+        assert_eq!(
+            loop_fn.upvalues.len(),
+            1,
+            "sibling set! keeps the self upvalue"
+        );
+    }
+
+    #[test]
+    fn test_self_tail_call_internal_define_redefine_keeps_upvalue() {
+        // A second define of the same name reuses the slot — a rebinding,
+        // same as set!.
+        let loop_fn = internal_define_lambda(
+            "(lambda () (define (loop n) (if (= n 0) n (loop (- n 1)))) (define (loop n) n) (loop 5))",
+        );
+        assert_eq!(
+            loop_fn.upvalues.len(),
+            1,
+            "sibling redefine keeps the self upvalue"
+        );
+    }
+
+    #[test]
+    fn test_self_tail_call_letrec_sibling_set_keeps_upvalue() {
+        // Same hole on the letrec path: a body set! of a binding name
+        // disqualifies that binding's self-tail optimization.
+        let loop_fn = loop_lambda(
+            "(letrec ((loop (lambda (n) (if (= n 0) n (loop (- n 1)))))) (set! loop (lambda (n) n)) (loop 5))",
+        );
+        assert_eq!(
+            loop_fn.upvalues.len(),
+            1,
+            "letrec body set! keeps the self upvalue"
         );
     }
 

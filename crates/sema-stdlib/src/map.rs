@@ -9,9 +9,11 @@ use crate::register_fn;
 
 /// Reject interior-mutable containers (mutable arrays/cells) as map keys:
 /// their contents can change after insertion, which would silently corrupt
-/// the map's lookup invariants (hash bucket / sort position).
+/// the map's lookup invariants (hash bucket / sort position). The check is
+/// deep — a key that merely wraps a mutable container (e.g. a vector holding
+/// a mutable array) mutates underneath the map all the same.
 pub(crate) fn check_map_key(key: &Value, who: &str) -> Result<(), SemaError> {
-    if key.is_mutable_container() {
+    if key.contains_mutable_container() {
         return Err(
             SemaError::type_error("immutable map key", key.type_name()).with_hint(format!(
                 "{who}: freeze the key first (mutable-array/->vector or mutable-cell/get)"
@@ -435,6 +437,7 @@ pub fn register(env: &sema_core::Env) {
 
     register_fn(env, "map/update", |args| {
         check_arity!(args, "map/update", 3);
+        check_map_key(&args[1], "map/update")?;
         if let Some(rc) = args[0].as_map_rc() {
             let mut map = match Rc::try_unwrap(rc) {
                 Ok(map) => map,
@@ -677,6 +680,9 @@ pub fn register(env: &sema_core::Env) {
         if path.is_empty() {
             return Ok(args[2].clone());
         }
+        for key in &path {
+            check_map_key(key, "assoc-in")?;
+        }
         fn assoc_in_recursive(m: &Value, path: &[Value], val: &Value) -> Result<Value, SemaError> {
             let key = &path[0];
             if path.len() == 1 {
@@ -738,6 +744,9 @@ pub fn register(env: &sema_core::Env) {
         };
         if path.is_empty() {
             return call_function(&args[2], &[args[0].clone()]);
+        }
+        for key in &path {
+            check_map_key(key, "update-in")?;
         }
         fn update_in_recursive(m: &Value, path: &[Value], f: &Value) -> Result<Value, SemaError> {
             let key = &path[0];

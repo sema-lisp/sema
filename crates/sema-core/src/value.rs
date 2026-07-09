@@ -2082,6 +2082,51 @@ impl Value {
     pub fn is_mutable_container(&self) -> bool {
         is_boxed(self.0) && matches!(get_tag(self.0), TAG_MUTABLE_ARRAY | TAG_MUTABLE_CELL)
     }
+
+    /// True if this value is, or transitively contains, an interior-mutable
+    /// container. Map keys must be deeply immutable: a vector wrapping a
+    /// mutable array still mutates underneath the map, corrupting lookup
+    /// order just as a bare mutable key would (Ord recurses into container
+    /// elements). Iterative worklist — no visited set or depth cap needed
+    /// because the walk never descends into a mutable container (it returns
+    /// true on sight) and cycles are only constructible through one.
+    pub fn contains_mutable_container(&self) -> bool {
+        fn scan(v: &Value, pending: &mut Vec<Value>) -> bool {
+            if v.is_mutable_container() {
+                return true;
+            }
+            match v.view_ref() {
+                ValueViewRef::List(items) | ValueViewRef::Vector(items) => {
+                    pending.extend(items.iter().cloned());
+                }
+                ValueViewRef::Map(m) => {
+                    for (k, val) in m.iter() {
+                        pending.push(k.clone());
+                        pending.push(val.clone());
+                    }
+                }
+                ValueViewRef::HashMap(m) => {
+                    for (k, val) in m.iter() {
+                        pending.push(k.clone());
+                        pending.push(val.clone());
+                    }
+                }
+                ValueViewRef::Record(r) => pending.extend(r.fields.iter().cloned()),
+                _ => {}
+            }
+            false
+        }
+        let mut pending = Vec::new();
+        if scan(self, &mut pending) {
+            return true;
+        }
+        while let Some(v) = pending.pop() {
+            if scan(&v, &mut pending) {
+                return true;
+            }
+        }
+        false
+    }
 }
 
 // ── Clone ─────────────────────────────────────────────────────────
@@ -2206,17 +2251,21 @@ impl Drop for Value {
 thread_local! {
     /// Pairs of mutable-container allocations currently being compared
     /// structurally. Mutable arrays/cells are the only heap types with both
-    /// content-based equality and interior mutability, so they are the only
-    /// place `PartialEq` can meet cyclic data: without this guard, comparing
-    /// two distinct self-referential arrays would recurse forever.
-    static EQ_IN_FLIGHT: RefCell<Vec<(usize, usize)>> = const { RefCell::new(Vec::new()) };
+    /// content-based comparison and interior mutability, so they are the only
+    /// place `PartialEq`/`Ord` can meet cyclic data: without this guard,
+    /// comparing two distinct self-referential arrays would recurse forever.
+    /// Shared between `PartialEq` and `Ord` — an equality assumption in
+    /// flight is exactly the coinductive hypothesis a nested `cmp` of the
+    /// same pair should answer `Equal` to (and vice versa).
+    static CMP_IN_FLIGHT: RefCell<Vec<(usize, usize)>> = const { RefCell::new(Vec::new()) };
 }
 
-/// Run `cmp` with the `(a, b)` allocation pair marked in-flight. A pair
-/// already in flight compares equal without descending (coinductive
-/// equality — the R7RS `equal?` answer for cyclic structures).
-fn eq_with_cycle_guard(a: usize, b: usize, cmp: impl FnOnce() -> bool) -> bool {
-    let already_in_flight = EQ_IN_FLIGHT.with(|s| {
+/// Run `body` with the `(a, b)` allocation pair marked in-flight. A pair
+/// already in flight yields `on_cycle` without descending (coinductive
+/// comparison — the R7RS `equal?` answer for cyclic structures: `true` for
+/// equality, `Ordering::Equal` for ordering).
+fn with_cycle_guard<T>(a: usize, b: usize, on_cycle: T, body: impl FnOnce() -> T) -> T {
+    let already_in_flight = CMP_IN_FLIGHT.with(|s| {
         let mut s = s.borrow_mut();
         if s.contains(&(a, b)) {
             true
@@ -2226,20 +2275,20 @@ fn eq_with_cycle_guard(a: usize, b: usize, cmp: impl FnOnce() -> bool) -> bool {
         }
     });
     if already_in_flight {
-        return true;
+        return on_cycle;
     }
     // Pop on every exit path (including a panicking comparator) so a stale
     // pair can never make a later, unrelated comparison lie.
     struct PopGuard;
     impl Drop for PopGuard {
         fn drop(&mut self) {
-            EQ_IN_FLIGHT.with(|s| {
+            CMP_IN_FLIGHT.with(|s| {
                 s.borrow_mut().pop();
             });
         }
     }
     let _guard = PopGuard;
-    cmp()
+    body()
 }
 
 impl PartialEq for Value {
@@ -2294,17 +2343,19 @@ impl PartialEq for Value {
             // guard keeps self-referential arrays/cells from recursing
             // forever; an unavailable borrow (contents mid-mutation) is not
             // observably equal, so it compares false.
-            (ValueViewRef::MutableArray(a), ValueViewRef::MutableArray(b)) => eq_with_cycle_guard(
+            (ValueViewRef::MutableArray(a), ValueViewRef::MutableArray(b)) => with_cycle_guard(
                 a as *const MutableArray as usize,
                 b as *const MutableArray as usize,
+                true,
                 || match (a.items.try_borrow(), b.items.try_borrow()) {
                     (Ok(x), Ok(y)) => *x == *y,
                     _ => false,
                 },
             ),
-            (ValueViewRef::MutableCell(a), ValueViewRef::MutableCell(b)) => eq_with_cycle_guard(
+            (ValueViewRef::MutableCell(a), ValueViewRef::MutableCell(b)) => with_cycle_guard(
                 a as *const MutableCell as usize,
                 b as *const MutableCell as usize,
+                true,
                 || match (a.value.try_borrow(), b.value.try_borrow()) {
                     (Ok(x), Ok(y)) => *x == *y,
                     _ => false,
@@ -2448,6 +2499,10 @@ impl Ord for Value {
                 ValueViewRef::Stream(_) => 16,
                 ValueViewRef::Rational(_) => 18,
                 ValueViewRef::Complex(_) => 19,
+                // Distinct ranks: an array and a cell must never compare
+                // Equal (Eq/Ord consistency — see the cmp arms below).
+                ValueViewRef::MutableArray(_) => 20,
+                ValueViewRef::MutableCell(_) => 21,
                 _ => 17,
             }
         }
@@ -2487,6 +2542,35 @@ impl Ord for Value {
                 .map(|(x, y)| x.total_cmp(y))
                 .find(|o| *o != std::cmp::Ordering::Equal)
                 .unwrap_or_else(|| a.len().cmp(&b.len())),
+            // Deep content comparison, parallel to the immutable Vector/List
+            // arms and consistent with `PartialEq` (Eq/Ord agreement is what
+            // keeps distinct values from aliasing as BTreeMap/BTreeSet keys).
+            // An in-flight pair compares Equal — the coinductive convention
+            // `PartialEq` uses — so a self-referential array cannot hang cmp.
+            // Contents mid-mutation (borrow unavailable) order by allocation
+            // address: a stable within-process tiebreak that, like the
+            // PartialEq `false` answer, never calls two distinct live
+            // mutations equal.
+            (ValueViewRef::MutableArray(a), ValueViewRef::MutableArray(b)) => {
+                let pa = a as *const MutableArray as usize;
+                let pb = b as *const MutableArray as usize;
+                with_cycle_guard(pa, pb, Ordering::Equal, || {
+                    match (a.items.try_borrow(), b.items.try_borrow()) {
+                        (Ok(x), Ok(y)) => (*x).cmp(&*y),
+                        _ => pa.cmp(&pb),
+                    }
+                })
+            }
+            (ValueViewRef::MutableCell(a), ValueViewRef::MutableCell(b)) => {
+                let pa = a as *const MutableCell as usize;
+                let pb = b as *const MutableCell as usize;
+                with_cycle_guard(pa, pb, Ordering::Equal, || {
+                    match (a.value.try_borrow(), b.value.try_borrow()) {
+                        (Ok(x), Ok(y)) => (*x).cmp(&y),
+                        _ => pa.cmp(&pb),
+                    }
+                })
+            }
             _ => type_order(self).cmp(&type_order(other)),
         }
     }

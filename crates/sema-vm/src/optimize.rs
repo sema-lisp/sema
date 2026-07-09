@@ -18,7 +18,47 @@ use crate::core_expr::{CoreExpr, PromptEntry};
 const FOLDABLE_NAMES: &[&str] = &["+", "-", "*", "/", "<", ">", "<=", ">=", "=", "not"];
 
 pub fn optimize(expr: CoreExpr) -> CoreExpr {
-    optimize_inner(expr, &Vec::new())
+    optimize_inner(expr, &[])
+}
+
+/// Optimize one top-level form of a multi-form program. `redefined` holds the
+/// foldable builtin names (re)defined by ANY of the program's top-level forms
+/// (see [`redefined_foldable_names`]): folding is suppressed for them, so a
+/// sibling `(define not ...)` reaches constant-argument calls in every form —
+/// matching the compiler's program-wide `redefined_globals` guard on the
+/// intrinsic/peephole path. Suppression never changes semantics for a
+/// define-after-use form either: the un-folded call dispatches through the
+/// global at runtime, exactly like the non-constant-argument path.
+pub fn optimize_with_redefined(expr: CoreExpr, redefined: &[String]) -> CoreExpr {
+    optimize_inner(expr, redefined)
+}
+
+/// Collect the FOLDABLE_NAMES (re)defined at the top level of any program
+/// form. Top-level `begin`s splice, so they are scanned too; deeper defines
+/// are local bindings the Begin/Let shadow scans already handle.
+pub fn redefined_foldable_names(exprs: &[CoreExpr]) -> Vec<String> {
+    fn scan(e: &CoreExpr, out: &mut Vec<String>) {
+        match e {
+            CoreExpr::Define(spur, _) => {
+                let name = resolve_spur(*spur);
+                if FOLDABLE_NAMES.contains(&name.as_str()) && !out.contains(&name) {
+                    out.push(name);
+                }
+            }
+            CoreExpr::Begin(exprs) => {
+                for x in exprs {
+                    scan(x, out);
+                }
+            }
+            CoreExpr::Spanned(_, inner) => scan(inner, out),
+            _ => {}
+        }
+    }
+    let mut out = Vec::new();
+    for e in exprs {
+        scan(e, &mut out);
+    }
+    out
 }
 
 fn optimize_inner(expr: CoreExpr, shadowed: &[String]) -> CoreExpr {

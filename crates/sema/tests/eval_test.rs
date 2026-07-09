@@ -1996,6 +1996,23 @@ eval_tests! {
     if_not_lexically_shadowed:
         "(let ((not (lambda (x) x))) (if (not 1) 'shadow-truthy 'shadow-falsy))"
         => common::eval("'shadow-truthy"),
+    // Constant-argument calls are folded per top-level form, so the folder
+    // must see SIBLING top-level redefinitions too (not just same-begin
+    // ones): (not 1) must reach the user's identity fn, not fold to #f.
+    fold_not_redefined_sibling_toplevel:
+        "(define not (lambda (x) x)) (not 1)" => Value::int(1),
+    fold_if_not_redefined_sibling_toplevel:
+        "(define not odd?) (if (not 3) 'then 'else)" => common::eval("'then"),
+    // Same for arithmetic FOLDABLE_NAMES; the oracle is the resolved-call
+    // (non-constant-argument) path pinned below.
+    fold_plus_redefined_sibling_toplevel:
+        "(define + (lambda (a b) 99)) (+ 1 2)" => Value::int(99),
+    fold_plus_redefined_nonconstant_oracle:
+        "(define + (lambda (a b) 99)) (define x 1) (+ x 2)" => Value::int(99),
+    // Define-after-use: suppression only defers to runtime dispatch, which
+    // still sees the builtin until the later define executes.
+    fold_not_redefined_after_use_runs_builtin:
+        "(define r (not 1)) (define not (lambda (x) x)) r" => Value::bool(false),
 }
 
 // Wide-integer runtime arithmetic: operands beyond the ±2^44 small-int fast-path
@@ -2333,6 +2350,46 @@ eval_tests! {
              (define (od? x) (if (= x 0) #f (ev? (- x 1))))
              (ev? n))
            (list (run 10) (run 11)))" => common::eval("'(#t #f)"),
+
+    // --- Rebinding disqualifies the optimization (letrec* semantics) ---
+
+    // A sibling set! rebinds the internal define; a copy saved before the
+    // set! must recurse into the CURRENT binding, not the original closure.
+    stc_internal_define_sibling_set_rebinds:
+        "(begin
+           (define (test)
+             (define (f n) (if (= n 0) 'done (f (- n 1))))
+             (define g f)
+             (set! f (fn (n) 'other))
+             (g 3))
+           (test))" => common::eval("'other"),
+    // Same when the set! happens inside a sibling helper (the rebind scan
+    // sees through nested lambdas).
+    stc_internal_define_setter_lambda_rebinds:
+        "(begin
+           (define (test)
+             (define (f n) (if (= n 0) 'done (f (- n 1))))
+             (define g f)
+             (define (patch!) (set! f (fn (n) 'other)))
+             (patch!)
+             (g 3))
+           (test))" => common::eval("'other"),
+    // A second define of the same name reuses the slot — also a rebinding.
+    stc_internal_define_redefine_rebinds:
+        "(begin
+           (define (test)
+             (define (f n) (if (= n 0) 'done (f (- n 1))))
+             (define g f)
+             (define (f n) 'other)
+             (g 3))
+           (test))" => common::eval("'other"),
+    // The letrec path has the same rule: a body set! of a binding name must
+    // reach copies of the original closure.
+    stc_letrec_sibling_set_rebinds:
+        "(letrec ((f (lambda (n) (if (= n 0) 'done (f (- n 1))))))
+           (let ((g f))
+             (set! f (lambda (n) 'other))
+             (g 3)))" => common::eval("'other"),
 }
 
 eval_error_tests! {
@@ -2706,6 +2763,19 @@ eval_tests! {
     mutable_array_not_equal_to_vector: "(equal? (mutable-array/new 1 0) [0])" => Value::bool(false),
     // Cyclic comparison terminates (coinductive equality, no infinite loop).
     mutable_array_cyclic_equal_terminates: "(let ((a (mutable-array/new)) (b (mutable-array/new))) (mutable-array/push! a a) (mutable-array/push! b b) (equal? a b))" => Value::bool(true),
+    // Ord agrees with equality (content-based): distinct mutable containers
+    // are distinct BTreeMap/BTreeSet keys, so the transient-collection
+    // helpers (frequencies, list/unique, list/group-by) group by content at
+    // call time instead of aliasing every mutable container to one key.
+    mutable_array_frequencies_distinct: "(let ((a (mutable-array/new 1 1)) (b (mutable-array/new 1 2))) (vals (frequencies (list a b))))" => common::eval("'(1 1)"),
+    mutable_array_frequencies_merges_equal_contents: "(let ((a (mutable-array/new 1 1)) (b (mutable-array/new 1 1))) (vals (frequencies (list a b))))" => common::eval("'(2)"),
+    mutable_array_unique_keeps_distinct: "(let ((a (mutable-array/new 1 1)) (b (mutable-array/new 1 2))) (length (list/unique (list a b))))" => Value::int(2),
+    mutable_array_group_by_keeps_groups: "(let ((a (mutable-array/new 1 1)) (b (mutable-array/new 1 2))) (length (keys (list/group-by (lambda (x) x) (list a b)))))" => Value::int(2),
+    mutable_array_vs_cell_distinct_keys: "(length (list/unique (list (mutable-array/new) (mutable-cell/new nil))))" => Value::int(2),
+    mutable_array_sort_by_content: "(map (lambda (x) (mutable-array/get x 0)) (sort-by (lambda (x) x) (list (mutable-array/new 1 2) (mutable-array/new 1 1))))" => common::eval("'(1 2)"),
+    // Cyclic ordering terminates: an in-flight pair compares Equal (the same
+    // coinductive convention as equality), so unique collapses the pair.
+    mutable_array_cyclic_ord_terminates: "(let ((a (mutable-array/new)) (b (mutable-array/new))) (mutable-array/push! a a) (mutable-array/push! b b) (length (list/unique (list a b))))" => Value::int(1),
     mutable_cell_round_trip: "(let ((c (mutable-cell/new 1))) (mutable-cell/set! c 99) (mutable-cell/get c))" => Value::int(99),
     mutable_cell_shared_mutation: "(let* ((c (mutable-cell/new 0)) (d c)) (mutable-cell/set! c 5) (mutable-cell/get d))" => Value::int(5),
     mutable_cell_equal_by_contents: "(equal? (mutable-cell/new 1) (mutable-cell/new 1))" => Value::bool(true),
@@ -2725,6 +2795,17 @@ eval_error_tests! {
     mutable_array_assoc_key_rejected: "(assoc {} (mutable-array/new) 1)" => "immutable map key",
     mutable_array_literal_key_rejected: "(let ((a (mutable-array/new))) {a 1})" => "immutable map key",
     mutable_cell_hashmap_key_rejected: "(hashmap/new (mutable-cell/new 1) 2)" => "immutable map key",
+    // The guard covers every key-insert path, not just the constructors.
+    mutable_array_map_update_key_rejected: "(map/update {} (mutable-array/new) (lambda (v) 1))" => "immutable map key",
+    mutable_array_assoc_in_key_rejected: "(assoc-in {} (list (mutable-array/new)) 1)" => "immutable map key",
+    mutable_array_assoc_in_nested_path_key_rejected: "(assoc-in {} (list :a (mutable-array/new)) 1)" => "immutable map key",
+    mutable_array_update_in_key_rejected: "(update-in {} [(mutable-array/new)] (lambda (v) 1))" => "immutable map key",
+    // The guard is deep: a key that merely wraps a mutable container is
+    // rejected too (the wrapper's Ord recurses into the mutable contents).
+    mutable_array_nested_vector_key_rejected: "(hash-map (vector (mutable-array/new)) 10)" => "immutable map key",
+    mutable_cell_nested_list_key_rejected: "(assoc {} (list (mutable-cell/new 1)) 2)" => "immutable map key",
+    mutable_array_nested_literal_key_rejected: "(let ((a (mutable-array/new))) {[a] 1})" => "immutable map key",
+    mutable_array_nested_map_value_key_rejected: "(hashmap/new {:k (mutable-array/new)} 1)" => "immutable map key",
 }
 
 // ============================================================

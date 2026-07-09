@@ -152,7 +152,7 @@ short canonical names — predicates always stay un-namespaced.
 | `file/read`, `file/write`, `file/append`                                                                      | File read/write              |
 | `file/read-bytes`, `file/write-bytes`                                                                         | Binary file I/O              |
 | `file/read-lines`, `file/write-lines`                                                                         | Line-based I/O               |
-| `file/for-each-line`, `file/fold-lines`                                                                       | Streaming line I/O           |
+| `file/for-each-line`, `file/fold-lines`, `file/fold-lines-bytes`                                              | Streaming line I/O           |
 | `file/delete`, `file/rename`, `file/copy`                                                                     | File management              |
 | `file/exists?`, `file/is-file?`, `file/is-directory?`, `file/is-symlink?`                                     | File predicates              |
 | `file/list`, `file/mkdir`, `file/info`                                                                        | Directory operations         |
@@ -248,6 +248,8 @@ short canonical names — predicates always stay un-namespaced.
 | `bytevector/copy`, `bytevector/append`                         | Copy & append     |
 | `bytevector/to-list`, `list/to-bytevector`                         | List conversion   |
 | `utf8/to-string`, `string/to-utf8`                                 | String conversion |
+| `bytes/length`, `bytes/ref`, `bytes/find`, `bytes/slice`           | Byte-oriented ops (hot loops) |
+| `bytes/->string`, `bytes/parse-int10`                              | Byte decoding & parsing |
 
 ### [Streams](./streams)
 
@@ -334,6 +336,16 @@ short canonical names — predicates always stay un-namespaced.
 | `f64-array/map`, `i64-array/map`                          | Map over elements      |
 | `f64-array/fold`, `i64-array/fold`                        | Fold over elements     |
 | `f64-array?`, `i64-array?`                                | Type predicates        |
+
+### [Mutable Containers](./mutable)
+
+| Function                                                    | Description                        |
+| ----------------------------------------------------------- | ---------------------------------- |
+| `mutable-array/new`                                         | Create (empty, capacity, or n×fill) |
+| `mutable-array/push!`, `mutable-array/set!`                 | In-place update (return the array) |
+| `mutable-array/get`, `mutable-array/length`                 | Access                             |
+| `mutable-array/->vector`                                    | Freeze to an immutable vector      |
+| `mutable-cell/new`, `mutable-cell/get`, `mutable-cell/set!` | Single mutable slot                |
 
 ### [Context](./context)
 

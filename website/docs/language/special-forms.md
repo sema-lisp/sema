@@ -402,6 +402,142 @@ Add `when` after a pattern for conditional matching:
   ([a [b c]] (+ a b c)))               ; => 6
 ```
 
+## Multiple Values
+
+R7RS multiple return values: a producer can return more than one value from a single expression — without packing them into a list — and a small family of forms spreads or binds those values.
+
+### `values`
+
+Produce zero or more values, for consumption by `call-with-values`, `let-values`, `let*-values`, or `define-values`.
+
+`(values x)` — exactly one value — is identity: it returns `x` unchanged, so a single-value `values` call flows through ordinary contexts as if `values` weren't there.
+
+```sema
+(+ (values 5) 1)                       ; => 6 (one value is identity)
+(let-values (((a b) (values 1 2)))
+  (+ a b))                             ; => 3
+```
+
+::: warning Escaping bundles
+Zero or two-or-more values only make sense when consumed by one of the values-consuming forms. Letting a bundle escape into an ordinary single-value context — `(list (values 1 2))`, printing it, storing it — is unspecified by R7RS; Sema currently represents it as an opaque record (`#<record %multiple-values% 1 2>`) rather than silently spreading it into arguments.
+:::
+
+### `call-with-values`
+
+The lower-level primitive: call a zero-argument `producer` thunk, then apply `consumer` to whatever it produced. A `values` bundle becomes separate arguments; an ordinary single value is passed as the consumer's one argument.
+
+```sema
+(call-with-values (lambda () (values 1 2)) +)           ; => 3
+(call-with-values (lambda () (values 1 2 3)) list)      ; => (1 2 3)
+(call-with-values (lambda () 42) list)                  ; => (42)  single value, not spread
+(call-with-values (lambda () (values)) (lambda () 99))  ; => 99    zero values
+```
+
+If the number of produced values doesn't match the consumer's arity, the call fails with the ordinary arity error (R7RS's "wrong number of values"). Note that producer/consumer are invoked through the same native dispatch as `apply`, so a call across this boundary is not a true VM tail call — deep recursion written through `call-with-values` won't get the same tail-call optimization as a plain named `let`.
+
+### `let-values`
+
+Bind the values produced by one or more producers to local names. Like `let`, binding is **parallel**: every producer is evaluated against the outer environment before any clause's names come into scope.
+
+Each clause's formals can be `(a b)` (exact count), dotted `(a . rest)` (fixed prefix, remaining values as a list), or a bare symbol (all values as a list):
+
+```sema
+(let-values (((a b) (values 1 2)))
+  (+ a b))                             ; => 3
+
+(let-values (((a . rest) (values 1 2 3)))
+  rest)                                ; => (2 3)
+
+(let-values ((all (values 1 2 3)))
+  all)                                 ; => (1 2 3)
+```
+
+```sema
+(define a 100)
+(let-values (((a) (values 1))
+             ((b) (values a)))         ; sees the OUTER a (100)
+  b)                                   ; => 100
+```
+
+### `let*-values`
+
+Like `let-values`, but binding is **sequential** — each producer sees every earlier clause's bindings:
+
+```sema
+(define a 100)
+(let*-values (((a) (values 1))
+              ((b) (values a)))        ; sees the NEW a from the clause above
+  b)                                   ; => 1
+```
+
+### `define-values`
+
+The `define` analogue: bind produced values as top-level (or body-local) definitions. Formals follow the same rules as `let-values`.
+
+```sema
+(define-values (a b) (values 10 20))
+(+ a b)                                ; => 30
+
+(define-values (q . r) (values 1 2 3))
+r                                      ; => (2 3)
+```
+
+## Dynamic Binding
+
+R7RS parameter objects: values that can be rebound for the dynamic extent of a body and automatically restored on exit.
+
+### `make-parameter`
+
+Create a **parameter** — a zero-argument procedure that returns its current value. An optional converter is applied to the initial value immediately and to every value later installed (once per install, never on restore).
+
+```sema
+(define radix (make-parameter 10))
+(radix)                                ; => 10
+
+(define scale (make-parameter 1 (lambda (x) (* x 2))))
+(scale)                                ; => 2 (converter already applied to init)
+```
+
+Calling a parameter with one argument mutates it directly (SRFI-39 style) — but for scoped rebinding, prefer `parameterize`.
+
+### `parameterize`
+
+Evaluate each value, convert it through the parameter's converter, install the converted values, run `body`, and always restore every parameter to its **prior** value before returning — even if `body` raises (the condition is re-raised after restoration).
+
+```sema
+(define radix (make-parameter 10))
+
+(parameterize ((radix 16))
+  (radix))                             ; => 16
+
+(radix)                                ; => 10 (restored)
+```
+
+Restoration also happens on a non-local exit via `raise`:
+
+```sema
+(define mode (make-parameter :normal))
+
+(guard (e (else (mode)))
+  (parameterize ((mode :debug))
+    (raise "boom")))                   ; => :normal — restored before the guard ran
+```
+
+`parameterize` forms nest — an inner form restores back to the outer one's value, not the original:
+
+```sema
+(parameterize ((mode :outer))
+  (list (mode)
+        (parameterize ((mode :inner)) (mode))
+        (mode)))                       ; => (:outer :inner :outer)
+```
+
+Conversion happens once, at install time; restoration puts the saved value back raw, so a non-idempotent converter can't drift the parameter across repeated entries.
+
+::: warning Async tasks
+Restoration is unwind-on-error only (Sema has no `call/cc`). If a `parameterize` body suspends at an async yield point instead of returning or raising, the parameter stays bound across the yield and can be observed by sibling tasks until the body resumes. Synchronous dynamic scoping is fully correct.
+:::
+
 ## Sequencing & Logic
 
 ### `begin`
@@ -633,6 +769,57 @@ Throw any value as an error.
 (throw "something went wrong")
 (throw {:code 404 :reason "not found"})
 ```
+
+### `raise`
+
+R7RS `raise`: signal an arbitrary object as an exception. Identical in effect to `throw`, but it's a first-class procedure, so it can be passed to higher-order code where a special form cannot go.
+
+```sema
+(try (raise 42) (catch e (:value e)))          ; => 42
+(try (raise {:code 404}) (catch e (:value e))) ; => {:code 404}
+```
+
+Unlike `error` (which takes a message string), `raise` signals the object itself — any value, not just a string.
+
+### `guard`
+
+R7RS structured exception handling.
+
+```sema
+(guard (var clause ...) body ...)
+```
+
+Evaluates the body; if nothing is raised, `guard` returns the body's last value. If an error is raised — via `raise`/`throw` **or** a native runtime error — it is bound to `var` and the clauses are tried exactly like `cond`, with an optional `else`:
+
+```sema
+(guard (e ((string? e) (str "caught: " e))
+          (else :unknown))
+  (raise "boom"))                      ; => "caught: boom"
+
+(guard (e ((number? e) (* 2 e)))
+  100)                                 ; => 100 (no raise — clauses never run)
+```
+
+For `(raise obj)` / `(throw obj)`, `var` is bound to the raised object itself. A native runtime error (division by zero, unbound variable, `(error "msg")`) has no raw raised object, so `var` is the same error map `try`/`catch` produces — discriminate with `(:type e)` / `(:message e)`, gating on `(map? e)` first if a raw raised value could also reach the clause:
+
+```sema
+(guard (e (else (:message e)))
+  (/ 1 0))                             ; => "division by zero"
+```
+
+If no clause matches and there is no `else`, the condition is **re-raised** rather than swallowed — an outer `guard` (or `try`) recovers the same object:
+
+```sema
+(guard (outer ((number? outer) (* 10 outer)))
+  (guard (e ((string? e) e))           ; 7 is not a string — no match
+    (raise 7)))                        ; => 70 (re-raised to the outer guard)
+```
+
+This makes `guard` safer than a catch-all `try`/`catch`: conditions you didn't anticipate propagate instead of being silently absorbed.
+
+::: tip
+`(car '())` and `(first [])` return `nil` in Sema (a deliberate safe-accessor deviation from R7RS), so they don't raise — `guard` never fires on them.
+:::
 
 ## Async / Await
 

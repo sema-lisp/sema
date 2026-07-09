@@ -6,7 +6,7 @@ outline: [2, 3]
 
 ## Macros
 
-Sema supports `defmacro`-style macros with quasiquoting, unquoting, and splicing.
+Sema supports two macro systems: procedural `defmacro`-style macros with quasiquoting, unquoting, and splicing, and R7RS pattern-based [`define-syntax` / `syntax-rules`](#define-syntax-syntax-rules) macros with automatic hygiene.
 
 ### `defmacro`
 
@@ -70,6 +70,87 @@ This prevents **variable capture** — a common bug where macro-introduced bindi
      (set! ,a ,b)
      (set! ,b tmp#)))
 ```
+
+### `define-syntax` / `syntax-rules`
+
+R7RS pattern-based macros. Instead of computing an expansion with quasiquote, you declare rewrite rules — each a `(pattern template)` pair. Rules are tried in order and the first matching pattern wins; `...` (ellipsis) matches a sequence of forms.
+
+```sema
+(define-syntax my-or
+  (syntax-rules ()
+    ((_) #f)
+    ((_ e) e)
+    ((_ e1 e2 ...)
+     (let ((t e1)) (if t t (my-or e2 ...))))))
+
+(my-or #f #f 7)   ; => 7
+```
+
+The first argument to `syntax-rules` is a list of **literal identifiers** — symbols that must appear verbatim in the call rather than binding a pattern variable:
+
+```sema
+(define-syntax go
+  (syntax-rules (to)
+    ((_ to x) (list :to x))
+    ((_ x)    (list :plain x))))
+
+(go to 1)   ; => (:to 1)
+(go 2)      ; => (:plain 2)
+```
+
+Nested ellipsis in patterns lets you destructure binding-list shapes:
+
+```sema
+(define-syntax my-let
+  (syntax-rules ()
+    ((_ ((name val) ...) body)
+     ((lambda (name ...) body) val ...))))
+
+(my-let ((a 1) (b 2)) (+ a b))   ; => 3
+```
+
+#### Hygiene
+
+`syntax-rules` templates are hygienic without manual gensyms. Hygiene is **binder-directed**: identifiers the template introduces *as binders* (the variables of a template's `let`, `let*`, `letrec`, `lambda`, `define`, `do`, or named `let`) are automatically alpha-renamed to a fresh symbol on every expansion — so they can never capture a user variable of the same name:
+
+```sema
+(define-syntax swap!
+  (syntax-rules ()
+    ((_ a b)
+     (let ((tmp a)) (set! a b) (set! b tmp)))))
+
+(define tmp 1)
+(define x 2)
+(swap! tmp x)
+(list tmp x)   ; => (2 1) — the template's tmp did not capture the user's tmp
+```
+
+Every *other* template identifier — free references to user-defined globals, builtins, and the macro's own name for recursion — is kept verbatim and resolves at the use site at runtime:
+
+```sema
+(define (double n) (* 2 n))
+(define-syntax d (syntax-rules () ((_ x) (double x))))
+(d 21)   ; => 42
+```
+
+`macroexpand` works on `syntax-rules` macros too and shows the renaming:
+
+```sema
+(macroexpand '(swap! x y))
+;; => (let ((tmp__0 x)) (set! x y) (set! y tmp__0))
+```
+
+**Caveats** (the hygiene is an approximation, not full R7RS referential transparency):
+
+- Only template-introduced *binders* are renamed. The other direction isn't covered: if the use site shadows a global or special form that the template references freely, the template sees the shadowing binding.
+- Templates support a single level of ellipsis; a template with ellipsis depth > 1 (`x ... ...`) is rejected with a clear error rather than mis-expanded.
+- Like `defmacro`, `define-syntax` must appear at the top level (or inside a top-level `begin`) to be visible to sibling forms — one nested inside a lambda or `let` body is not.
+- `syntax-case` is not supported.
+
+#### `defmacro` or `syntax-rules`?
+
+- **`syntax-rules`** — reach for it when the macro is a structural rewrite: it's declarative, hygiene is automatic, and the definition is portable R7RS.
+- **`defmacro`** — reach for it when the expansion needs real computation (inspecting arguments, generating different shapes, calling functions at expansion time): the whole language is available. Use [auto-gensym (`foo#`)](#auto-gensym-foo) for any bindings the expansion introduces.
 
 ### Built-in Macros
 

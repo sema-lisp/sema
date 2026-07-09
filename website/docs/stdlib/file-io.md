@@ -175,6 +175,19 @@ Fold over lines of a file with an accumulator. Uses a 256KB buffer for high thro
 ; => number of lines
 ```
 
+### `file/fold-lines-bytes`
+
+Like `file/fold-lines`, but the reducer receives each line as a **bytevector** — trailing `\n` / `\r\n` stripped, no UTF-8 validation. Built for [`bytes/*`](/docs/stdlib/bytevectors#byte-oriented-operations) parsing pipelines that avoid per-line string decoding: `bytes/find` the separator, `bytes/parse-int10` the number, `bytes/->string` only what must become text.
+
+```sema
+;; Sum one-decimal temperatures from "Name;-12.3" lines as ints ×10.
+(file/fold-lines-bytes "measurements.txt"
+  (fn (acc line)
+    (let ((semi (bytes/find line 59)))          ; 59 = ';'
+      (+ acc (bytes/parse-int10 line (+ semi 1)))))
+  0)
+```
+
 ### `file/delete`
 
 Delete a file.

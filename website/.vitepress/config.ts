@@ -121,7 +121,8 @@ export default defineConfig({
             { text: 'Maps & HashMaps', link: '/docs/stdlib/maps' },
             { text: 'Predicates', link: '/docs/stdlib/predicates' },
             { text: 'Bytevectors', link: '/docs/stdlib/bytevectors' },
-            { text: 'Typed Arrays', link: '/docs/stdlib/typed-arrays' }
+            { text: 'Typed Arrays', link: '/docs/stdlib/typed-arrays' },
+            { text: 'Mutable Containers', link: '/docs/stdlib/mutable' }
           ]
         },
         {

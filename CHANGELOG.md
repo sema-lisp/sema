@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 1.30.0 — 2026-07-09
 
 ### Added
 
@@ -34,11 +34,88 @@
     are bignum-aware (two's-complement via `BigInt`), and JSON encodes bignums
     natively (rationals/complex as strings).
 
+- **R7RS language quartet** — four independent language features closing the
+  remaining "is it a real Scheme?" gaps:
+  - **`guard` + `raise`** — `(guard (var clause ...) body ...)` evaluates body;
+    a raised condition is bound to `var` and tried against the clauses like
+    `cond` (with `else`); an unmatched condition **re-raises** to the enclosing
+    handler. Catches both `(raise obj)` and native runtime errors.
+  - **`make-parameter` / `parameterize`** — dynamic binding with an optional
+    converter; bindings restore on exit, including non-local exit via `raise`.
+  - **Multiple values** — `values`, `call-with-values`, `let-values`,
+    `let*-values`, `define-values`; `(values x)` is identity. (Bare multiple
+    values escaping into a single-value context are R7RS-unspecified — see
+    `docs/limitations.md`.)
+  - **`define-syntax` + `syntax-rules`** — literal identifiers, ellipsis,
+    multiple rules, and **binder-directed hygiene**: only identifiers the
+    template introduces as binders are alpha-renamed, so a template `let tmp`
+    cannot capture a user `tmp`, while macros that call user-defined functions
+    keep working in whole-program mode.
+- **Mutable containers** — `mutable-array/new` (capacity or `n fill`),
+  `mutable-array/push!`, `mutable-array/get` (optional default),
+  `mutable-array/set!`, `mutable-array/length`, `mutable-array/->vector`, and
+  `mutable-cell/new`/`get`/`set!`. In-place mutation for hot accumulation
+  loops; `push!`/`set!` return the array for chaining; `nth` works on mutable
+  arrays. Equality and ordering are content-based (identity fast path,
+  terminating on cyclic structures); mutable containers are rejected as map
+  keys (deep check — a vector wrapping one is rejected too). Traced by the
+  CORE-2 cycle collector.
+- **Byte-oriented bytevector ops** — `bytes/length`, `bytes/ref`, `bytes/find`
+  (byte, bytevector, or string needle), `bytes/slice`, `bytes/->string`
+  (checked UTF-8), and `bytes/parse-int10` (ASCII `-?d+(.d)?` scaled ×10, the
+  1BRC-style integer parser). `bytes/find`/`bytes/->string`/`bytes/parse-int10`
+  take optional start/end so hot loops parse sub-ranges without slicing.
+- **`file/fold-lines-bytes`** — like `file/fold-lines`, but the callback
+  receives each line as a bytevector: no UTF-8 validation or string decode on
+  the hot path (`\n` / `\r\n` stripped).
+
+### Performance
+
+- **Sema now leads Janet on every benchmark in the suite**, and is the fastest
+  entry with no JIT and no native codegen in the 15-dialect 1BRC comparison
+  (see `website/docs/internals/lisp-comparison.md`). PGO builds, Apple M2 Max,
+  10 M rows: 1BRC-optimized 3.6 s vs Janet 5.0 s (was 8.2 s / 1.6× behind);
+  1BRC-simple 6.3 s vs 10.0 s; tak 937 ms vs 1,190 ms; nqueens 1,497 ms vs
+  1,704 ms. The work, roughly by impact:
+  - **`TakeLocal` + owned-args callback protocol.** The compiler moves a
+    never-captured local's statically-last use instead of cloning it, and
+    stdlib folds (`file/fold-lines`, `file/fold-lines-bytes`, `foldl`,
+    `reduce`) hand the accumulator to the callback by move — so a fold
+    accumulator reaches `assoc`'s copy-on-write gate with a unique reference
+    and idiomatic immutable-update loops mutate in place (1BRC-simple −38%
+    with unchanged benchmark source). Aliased values still copy.
+  - **`CallSelf`.** Top-level `(define (f ...))` self-recursion calls the
+    current frame's own closure directly — no global-cache probe, no downcast
+    (tak −25%). Tail self-calls in the same position now use the existing
+    `SelfTailCall`. Guarded by the same program-wide redefinition rule as the
+    intrinsics, extended to `set!`.
+  - **`MutArrGet` / `MutArrSet` intrinsics** for `mutable-array/get`/`set!`
+    (1BRC-optimized −10%).
+  - **SmallVec argument buffers** for native calls — the per-call heap `Vec`
+    at all five call sites is gone; ≤8 args live on the Rust stack (1BRC
+    −8–11%).
+  - **`run_inner` monomorphized over debug mode** — the release dispatch loop
+    compiles out per-instruction debug hooks (tak −11–13%); the DAP path uses
+    the debug instantiation.
+  - **Self-tail-call optimization now applies to internal defines** (nqueens
+    −4%).
+  - **`string->number` fast decimal parse** — plain integers/decimals skip the
+    reader round-trip, falling back for radix/rational/edge forms (1BRC-simple
+    −10%).
+  - **Single-allocation string construction** (`Value::string_owned`) and a
+    with-capacity `string-append` fast path.
+  - **PGO training corpus** now includes the byte-oriented and naive 1BRC
+    tiers, so release builds lay out the new hot paths from real profiles.
+
 ### Changed
 
 - **Bytecode format version is now `5`** (was `4`): the constant pool gains
   `BigInt`/`Rational`/`Complex` tags (`0x0D`–`0x0F`) for the numeric tower.
   Breaking for `.semac` artifacts — recompile from source.
+- **Four opcodes appended** (`CallSelf` `0x46`, `TakeLocal` `0x47`,
+  `MutArrGet` `0x48`, `MutArrSet` `0x49`). Append-only: existing `.semac`
+  files load unchanged, but files compiled by this version may not load on
+  older binaries.
 - **Integer overflow promotes to a bignum instead of raising.** The catchable
   "integer overflow" error that 1.29.0 introduced for `+`/`-`/`*`/`expt` is
   gone; those operations now return the exact value (see the numeric tower
@@ -60,6 +137,21 @@
 - **`int`/`float` conversions accept the whole real tower.** They now convert
   bignums and exact rationals (e.g. `(int 5/2)` ⇒ `2`, `(float 1/3)`), not just
   fixnums and floats.
+- **Self-tail-call optimization respects rebinding.** A `letrec`/internal
+  define whose name is later rebound with `set!` (or a duplicate define) in the
+  enclosing body no longer gets the direct self-call rewrite, so an escaped
+  closure sees the rebound binding, per letrec* semantics. (The `letrec` case
+  was a pre-existing hole.)
+- **The constant folder respects same-unit redefinitions.** A program that
+  redefines a foldable builtin at top level — `(define not (lambda (x) x))
+  (not 1)` — no longer has constant-argument calls folded with the builtin's
+  semantics. (Cross-unit redefinition via `load`/REPL remains a documented
+  limitation.)
+- **`sema disasm --json` no longer desyncs.** The JSON bytecode walk advanced
+  `LoadGlobal` by the wrong operand width and lacked arms for the call
+  opcodes, panicking mid-chunk on self-calls.
+- **`guard` re-raise, parameter restore, and hygiene edge cases** are covered
+  by an adversarial test battery (see PR #75 for the full list).
 
 ## 1.29.0 — 2026-07-08
 

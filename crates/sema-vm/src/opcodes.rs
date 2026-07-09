@@ -116,6 +116,14 @@ pub enum Op {
     // was elided by the resolver (see `VarResolution::SelfFn`). Appended last to
     // keep all preceding opcode numbers stable for `.semac` compatibility.
     SelfTailCall, // u16 argc → tail call reusing the current frame's closure
+
+    // Direct self-call — the non-tail counterpart of `SelfTailCall`: the callee
+    // is the current frame's own closure, so no callee value is on the stack and
+    // no global lookup / callable dispatch happens. Emitted inside a top-level
+    // `(define (f ...))` lambda for direct calls to `f` when nothing else in the
+    // program rebinds the name (see `Compiler::self_global`). Appended last to
+    // keep all preceding opcode numbers stable for `.semac` compatibility.
+    CallSelf, // u16 argc → push a frame for the current frame's own closure
 }
 
 impl Op {
@@ -196,6 +204,7 @@ impl Op {
             67 => Some(Op::StringRef),
             68 => Some(Op::StringAppend),
             69 => Some(Op::SelfTailCall),
+            70 => Some(Op::CallSelf),
             _ => None,
         }
     }
@@ -253,8 +262,8 @@ impl Op {
                 pushes: 0,
                 exits_frame: true,
             },
-            CallGlobal | CallNative => StackEffect {
-                pops: operand, // args only (callee resolved by id/spur)
+            CallGlobal | CallNative | CallSelf => StackEffect {
+                pops: operand, // args only (callee resolved by id/spur/current frame)
                 pushes: 1,
                 exits_frame: false,
             },
@@ -385,6 +394,7 @@ const _: () = {
             Op::StringRef => {}
             Op::StringAppend => {}
             Op::SelfTailCall => {}
+            Op::CallSelf => {}
         }
     }
 };
@@ -462,6 +472,7 @@ pub mod op {
     pub const STRING_REF: u8 = Op::StringRef as u8;
     pub const STRING_APPEND: u8 = Op::StringAppend as u8;
     pub const SELF_TAIL_CALL: u8 = Op::SelfTailCall as u8;
+    pub const CALL_SELF: u8 = Op::CallSelf as u8;
 
     // Instruction sizes (opcode byte + operand bytes)
     /// Size of a bare opcode with no operands: 1

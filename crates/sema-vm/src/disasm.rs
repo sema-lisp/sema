@@ -99,6 +99,7 @@ fn op_name(op: Op) -> &'static str {
         Op::StringRef => "STRING_REF",
         Op::StringAppend => "STRING_APPEND",
         Op::SelfTailCall => "SELF_TAIL_CALL",
+        Op::CallSelf => "CALL_SELF",
     }
 }
 
@@ -175,7 +176,7 @@ pub fn disassemble(chunk: &Chunk, name: Option<&str>) -> String {
                 pc += 5;
             }
 
-            Op::Call | Op::TailCall | Op::SelfTailCall => {
+            Op::Call | Op::TailCall | Op::SelfTailCall | Op::CallSelf => {
                 let argc = read_u16(code, pc + 1);
                 writeln!(out, "{pc:04}  {:<16} {argc}", op_name(op)).unwrap();
                 pc += 3;

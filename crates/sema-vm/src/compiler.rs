@@ -66,6 +66,21 @@ pub fn compile(
             compiler.redefined_globals.insert(spur);
         });
     }
+    // Self-call fast-path eligibility: a top-level `(define (f ...))` may call
+    // itself directly (CallSelf / SelfTailCall — no global lookup) only when
+    // nothing else in the program can rebind `f`. A second `define` of the same
+    // name or a global `set!` at any depth opts the name out — the same
+    // program-wide redefinition rule the intrinsics use, extended to `set!`.
+    {
+        let mut seen: HashSet<Spur> = HashSet::new();
+        for expr in exprs {
+            scan_global_rebinds(expr, &mut |spur, is_set| {
+                if is_set || !seen.insert(spur) {
+                    compiler.self_rebound_globals.insert(spur);
+                }
+            });
+        }
+    }
     compiler.n_locals = n_locals;
     for (i, expr) in exprs.iter().enumerate() {
         compiler.compile_expr(expr)?;
@@ -100,6 +115,139 @@ fn collect_defines(expr: &ResolvedExpr, f: &mut impl FnMut(Spur)) {
     }
 }
 
+/// Walk a resolved tree and report every site that (re)binds a global name:
+/// `Define` nodes (`is_set = false`) and `set!` targets that resolved as Global
+/// (`is_set = true`). Unlike `collect_defines` (the intrinsics' shallow
+/// top-level walk), this descends into lambda, module, and binding bodies so
+/// the self-call fast path is disabled by a rebind at any depth.
+fn scan_global_rebinds(expr: &ResolvedExpr, f: &mut impl FnMut(Spur, bool)) {
+    use ResolvedExpr as E;
+    match expr {
+        E::Const(_) | E::Quote(_) | E::Var(_) | E::DefineRecordType { .. } => {}
+        E::Define(spur, val) => {
+            f(*spur, false);
+            scan_global_rebinds(val, f);
+        }
+        E::Set(vr, val) => {
+            if let VarResolution::Global { spur } = vr.resolution {
+                f(spur, true);
+            }
+            scan_global_rebinds(val, f);
+        }
+        E::Lambda(def) => {
+            for e in &def.body {
+                scan_global_rebinds(e, f);
+            }
+        }
+        E::If { test, then, else_ } => {
+            scan_global_rebinds(test, f);
+            scan_global_rebinds(then, f);
+            scan_global_rebinds(else_, f);
+        }
+        E::Begin(v) | E::And(v) | E::Or(v) | E::MakeList(v) | E::MakeVector(v) => {
+            for e in v {
+                scan_global_rebinds(e, f);
+            }
+        }
+        E::Call { func, args, .. } => {
+            scan_global_rebinds(func, f);
+            for a in args {
+                scan_global_rebinds(a, f);
+            }
+        }
+        E::Let { bindings, body }
+        | E::LetStar { bindings, body }
+        | E::Letrec { bindings, body } => {
+            for (_, init) in bindings {
+                scan_global_rebinds(init, f);
+            }
+            for e in body {
+                scan_global_rebinds(e, f);
+            }
+        }
+        E::Do(do_loop) => {
+            for v in &do_loop.vars {
+                scan_global_rebinds(&v.init, f);
+                if let Some(s) = &v.step {
+                    scan_global_rebinds(s, f);
+                }
+            }
+            scan_global_rebinds(&do_loop.test, f);
+            for e in &do_loop.result {
+                scan_global_rebinds(e, f);
+            }
+            for e in &do_loop.body {
+                scan_global_rebinds(e, f);
+            }
+        }
+        E::Try { body, handler, .. } => {
+            for e in body {
+                scan_global_rebinds(e, f);
+            }
+            for e in handler {
+                scan_global_rebinds(e, f);
+            }
+        }
+        E::Throw(val)
+        | E::Load(val)
+        | E::Eval(val)
+        | E::Delay(val)
+        | E::Force(val)
+        | E::Macroexpand(val)
+        | E::Spanned(_, val) => scan_global_rebinds(val, f),
+        E::MakeMap(pairs) => {
+            for (k, v) in pairs {
+                scan_global_rebinds(k, f);
+                scan_global_rebinds(v, f);
+            }
+        }
+        E::Defmacro { body, .. } | E::Module { body, .. } => {
+            for e in body {
+                scan_global_rebinds(e, f);
+            }
+        }
+        E::Import { path, .. } => scan_global_rebinds(path, f),
+        E::Prompt(entries) => {
+            for entry in entries {
+                match entry {
+                    PromptEntry::RoleContent { parts, .. } => {
+                        for e in parts {
+                            scan_global_rebinds(e, f);
+                        }
+                    }
+                    PromptEntry::Expr(e) => scan_global_rebinds(e, f),
+                }
+            }
+        }
+        E::Message { role, parts } => {
+            scan_global_rebinds(role, f);
+            for e in parts {
+                scan_global_rebinds(e, f);
+            }
+        }
+        E::Deftool {
+            description,
+            parameters,
+            handler,
+            ..
+        } => {
+            scan_global_rebinds(description, f);
+            scan_global_rebinds(parameters, f);
+            scan_global_rebinds(handler, f);
+        }
+        E::Defagent { options, .. } => scan_global_rebinds(options, f),
+    }
+}
+
+/// True iff `expr` is a lambda, peeking through span wrappers.
+fn is_lambda_shaped(expr: &ResolvedExpr) -> bool {
+    match expr {
+        ResolvedExpr::Lambda(_) => true,
+        ResolvedExpr::Spanned(_, inner) => is_lambda_shaped(inner),
+        _ => false,
+    }
+}
+
 /// Walk bytecode and add `offset` to all MakeClosure func_id operands.
 fn patch_closure_func_ids(chunk: &mut Chunk, offset: u16) {
     let code = &mut chunk.code;
@@ -130,6 +278,7 @@ fn patch_closure_func_ids(chunk: &mut Chunk, offset: u16) {
             | Op::Call
             | Op::TailCall
             | Op::SelfTailCall
+            | Op::CallSelf
             | Op::MakeList
             | Op::MakeVector
             | Op::MakeMap
@@ -178,6 +327,19 @@ struct Compiler {
     /// Global names that are (re)defined in this program — intrinsics must not
     /// be emitted for these since the user may have changed the binding.
     redefined_globals: HashSet<Spur>,
+    /// Global names bound more than once (second `define`) or `set!` anywhere
+    /// in this program — the self-call fast path must not fire for these.
+    self_rebound_globals: HashSet<Spur>,
+    /// The global name of the top-level define whose own lambda body this
+    /// compiler is compiling, when that name is eligible for the self-call fast
+    /// path. Calls to it compile to CallSelf / SelfTailCall (the running
+    /// frame's closure IS the defined function). `None` for the top-level
+    /// chunk and for nested lambdas, whose frames are not the defined function.
+    self_global: Option<Spur>,
+    /// Handoff slot from `compile_define` to `compile_lambda`: arms
+    /// `self_global` on the inner compiler for the define's own lambda (the
+    /// next lambda compiled, reached only through span wrappers).
+    pending_self_global: Option<Spur>,
     /// Local slot names for debugger scope inspection.
     local_names: Vec<(u16, Spur)>,
     /// Block scope `(slot, start_pc, end_pc)` of each block-introduced local, so
@@ -207,6 +369,9 @@ impl Compiler {
             native_id_map: hashbrown::HashMap::new(),
             next_cache_slot: 0,
             redefined_globals: HashSet::new(),
+            self_rebound_globals: HashSet::new(),
+            self_global: None,
+            pending_self_global: None,
             local_names: Vec::new(),
             local_scopes: Vec::new(),
         }
@@ -536,7 +701,16 @@ impl Compiler {
     }
 
     fn compile_define(&mut self, spur: Spur, val: &ResolvedExpr) -> Result<(), SemaError> {
-        self.compile_expr(val)?;
+        // A define's own lambda may call itself directly — the running frame's
+        // closure IS the defined function — when nothing in the program rebinds
+        // the name. Hand the name to compile_lambda, which arms the self-call
+        // fast path (CallSelf / SelfTailCall) on the lambda's own compiler.
+        if is_lambda_shaped(val) && !self.self_rebound_globals.contains(&spur) {
+            self.pending_self_global = Some(spur);
+        }
+        let result = self.compile_expr(val);
+        self.pending_self_global = None;
+        result?;
         self.emit.emit_op(Op::DefineGlobal);
         self.emit.emit_u32(spur_to_u32(spur));
         self.emit.emit_op(Op::Nil); // define returns nil
@@ -552,6 +726,12 @@ impl Compiler {
         // not just in the top-level chunk.
         let mut inner = Compiler::new();
         inner.redefined_globals = self.redefined_globals.clone();
+        inner.self_rebound_globals = self.self_rebound_globals.clone();
+        // Arm the self-call fast path iff this lambda is the value of an
+        // eligible top-level define (set by compile_define). `take()` keeps it
+        // off nested lambdas — their running frames are not the defined
+        // function, so a self-call there must stay a global call.
+        inner.self_global = self.pending_self_global.take();
         inner.n_locals = def.n_locals;
         for (slot, &name) in def.params.iter().enumerate() {
             inner.local_names.push((slot as u16, name));
@@ -718,6 +898,29 @@ impl Compiler {
                     }
                     let argc = args.len() as u16;
                     self.emit.emit_op(Op::SelfTailCall);
+                    self.emit.emit_u16(argc);
+                    self.stack_height -= argc;
+                    return Ok(());
+                }
+            }
+        }
+
+        // Direct self-call: inside an eligible top-level define's own lambda, a
+        // call to the defining name targets the running frame's own closure —
+        // no global lookup, no callable dispatch. Tail calls reuse the frame
+        // (SelfTailCall); non-tail calls push a frame directly (CallSelf).
+        // Value (non-operator) references to the name stay LoadGlobal, so
+        // identity and escape semantics are unchanged.
+        if let ResolvedExpr::Var(vr) = func {
+            if let VarResolution::Global { spur } = vr.resolution {
+                if self.self_global == Some(spur) {
+                    for arg in args {
+                        self.compile_expr(arg)?;
+                        self.stack_height += 1;
+                    }
+                    let argc = args.len() as u16;
+                    self.emit
+                        .emit_op(if tail { Op::SelfTailCall } else { Op::CallSelf });
                     self.emit.emit_u16(argc);
                     self.stack_height -= argc;
                     return Ok(());
@@ -1371,6 +1574,7 @@ mod tests {
                 | Op::Call
                 | Op::TailCall
                 | Op::SelfTailCall
+                | Op::CallSelf
                 | Op::MakeList
                 | Op::MakeVector
                 | Op::MakeMap
@@ -1981,6 +2185,115 @@ mod tests {
                 "escaping loop must not self-tail-call"
             );
         }
+    }
+
+    // --- CallSelf: direct self-call fast path for top-level defines ---
+
+    fn find_fn<'a>(result: &'a CompileResult, name: &str) -> &'a Function {
+        result
+            .functions
+            .iter()
+            .find(|f| f.name == Some(intern(name)))
+            .unwrap_or_else(|| panic!("no compiled function named `{name}`"))
+    }
+
+    #[test]
+    fn test_compile_define_nontail_self_call_emits_call_self() {
+        let result = compile_str("(define (f n) (if (< n 2) 1 (+ (f (- n 1)) n)))");
+        let ops = extract_ops(&find_fn(&result, "f").chunk);
+        assert!(
+            ops.contains(&Op::CallSelf),
+            "non-tail self-call must emit CallSelf: {ops:?}"
+        );
+        assert!(
+            !ops.contains(&Op::CallGlobal),
+            "self-call must not go through CallGlobal: {ops:?}"
+        );
+    }
+
+    #[test]
+    fn test_compile_define_tail_self_call_emits_self_tail_call() {
+        let result = compile_str("(define (walk n) (if (= n 0) 'done (walk (- n 1))))");
+        let ops = extract_ops(&find_fn(&result, "walk").chunk);
+        assert!(
+            ops.contains(&Op::SelfTailCall),
+            "tail self-call must emit SelfTailCall: {ops:?}"
+        );
+        assert!(
+            !ops.contains(&Op::TailCall) && !ops.contains(&Op::LoadGlobal),
+            "tail self-call must not load the global: {ops:?}"
+        );
+    }
+
+    #[test]
+    fn test_compile_redefined_name_disables_self_call() {
+        // A second define of the same name opts it out — every call dispatches
+        // through the global so redefinition behaves exactly as before.
+        let result = compile_many_str("(define (f n) (+ (f (- n 1)) 1)) (define (f n) 42)");
+        for func in &result.functions {
+            let ops = extract_ops(&func.chunk);
+            assert!(
+                !ops.contains(&Op::CallSelf) && !ops.contains(&Op::SelfTailCall),
+                "redefined name must not self-call: {ops:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_compile_global_set_disables_self_call() {
+        // A global set! anywhere in the program (here inside another function)
+        // opts the name out of the self-call fast path.
+        let result = compile_many_str("(define (f n) (+ (f (- n 1)) 1)) (define (g) (set! f 9))");
+        for func in &result.functions {
+            let ops = extract_ops(&func.chunk);
+            assert!(
+                !ops.contains(&Op::CallSelf) && !ops.contains(&Op::SelfTailCall),
+                "set! name must not self-call: {ops:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_compile_mutual_recursion_stays_global() {
+        // Calls to a DIFFERENT global never become self-calls.
+        let result = compile_many_str("(define (f n) (g n)) (define (g n) (f n))");
+        for func in &result.functions {
+            let ops = extract_ops(&func.chunk);
+            assert!(
+                !ops.contains(&Op::CallSelf) && !ops.contains(&Op::SelfTailCall),
+                "mutual recursion must stay on the global path: {ops:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_compile_nested_lambda_self_name_stays_global() {
+        // A nested lambda's running frame is not `f`, so its call to f must
+        // stay a global call even though the enclosing define is eligible.
+        let result = compile_str("(define (f n) (+ 1 ((lambda (x) (f x)) n)))");
+        for func in &result.functions {
+            let ops = extract_ops(&func.chunk);
+            assert!(
+                !ops.contains(&Op::CallSelf) && !ops.contains(&Op::SelfTailCall),
+                "nested lambda must not self-call the outer define: {ops:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_compile_value_reference_stays_load_global() {
+        // Operator self-calls get CallSelf; a value (non-operator) reference to
+        // the name stays LoadGlobal, preserving identity/escape semantics.
+        let result = compile_str("(define (f n) (if (= n 0) f (car (list (f (- n 1))))))");
+        let ops = extract_ops(&find_fn(&result, "f").chunk);
+        assert!(
+            ops.contains(&Op::CallSelf),
+            "operator self-call must emit CallSelf: {ops:?}"
+        );
+        assert!(
+            ops.contains(&Op::LoadGlobal),
+            "value self-reference must stay LoadGlobal: {ops:?}"
+        );
     }
 
     // --- compile_many ---

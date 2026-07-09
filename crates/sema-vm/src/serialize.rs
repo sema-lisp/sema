@@ -808,6 +808,7 @@ fn advance_pc(code: &[u8], pc: usize) -> Result<(Op, usize), SemaError> {
         | Op::Call
         | Op::TailCall
         | Op::SelfTailCall
+        | Op::CallSelf
         | Op::MakeList
         | Op::MakeVector
         | Op::MakeMap
@@ -1122,6 +1123,7 @@ fn stack_effect_operand(code: &[u8], pc: usize, op: Op) -> Result<u16, SemaError
         Op::Call
         | Op::TailCall
         | Op::SelfTailCall
+        | Op::CallSelf
         | Op::MakeList
         | Op::MakeVector
         | Op::MakeMap

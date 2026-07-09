@@ -2760,3 +2760,38 @@ eval_error_tests! {
     bytes_parse_int10_empty: "(bytes/parse-int10 (string->utf8 \"\"))" => "digit",
     bytes_to_string_invalid_utf8: "(bytes/->string (bytevector 255 254))" => "invalid UTF-8",
 }
+
+// ============================================================
+// CallSelf: direct self-call fast path for top-level defines
+// ============================================================
+
+eval_tests! {
+    // Deep non-tail self-recursion (tak-shaped) runs on CallSelf frames.
+    call_self_tak: "(define (tak x y z) (if (not (< y x)) z (tak (tak (- x 1) y z) (tak (- y 1) z x) (tak (- z 1) x y)))) (tak 6 4 2)" => Value::int(3),
+    call_self_fib: "(define (fib n) (if (< n 2) n (+ (fib (- n 1)) (fib (- n 2))))) (fib 15)" => Value::int(610),
+    call_self_deep_nontail: "(define (count n) (if (= n 0) 0 (+ 1 (count (- n 1))))) (count 1000)" => Value::int(1000),
+    // REPL-style redefinition: a second define opts the name out, so the later
+    // call dispatches to the new binding exactly as before.
+    call_self_redefinition: "(define (f n) (if (= n 0) 0 (+ 1 (f (- n 1))))) (define r1 (f 3)) (define (f n) 42) (list r1 (f 3))" => common::eval("'(3 42)"),
+    // A global set! (even mid-recursion, through a helper) opts the name out:
+    // the recursive call sees the rebound global, as it always did.
+    call_self_set_mid_run: "(define (redef!) (set! f (fn (n) 100))) (define (f n) (if (= n 0) 0 (begin (redef!) (+ 1 (f (- n 1)))))) (f 3)" => Value::int(101),
+    // Mutual recursion never takes the self-call path.
+    call_self_mutual_recursion: "(define (my-even n) (if (= n 0) #t (my-odd (- n 1)))) (define (my-odd n) (if (= n 0) #f (my-even (- n 1)))) (list (my-even 10) (my-odd 7))" => common::eval("'(#t #t)"),
+    // A value reference to the name stays a plain global load: identity is
+    // preserved and the escaped closure still recurses correctly.
+    call_self_identity_preserved: "(define (f n) (if (= n 0) 'done (car (list (f (- n 1)))))) (define g f) (list (eq? f g) (f 2) (g 2))" => common::eval("'(#t done done)"),
+    call_self_escaped_value_call: "(define (f n) (if (= n 0) 0 (+ 1 ((first (list f)) (- n 1))))) (f 3)" => Value::int(3),
+    // Rest params flow through the self-call frame setup.
+    call_self_rest_params: "(define (f x . rest) (if (null? rest) x (+ 1 (f (car rest))))) (f 1 2)" => Value::int(3),
+    // Interplay with internal defines and letrec: shadowed names resolve as
+    // locals/upvalues and never hijack the enclosing define's fast path.
+    call_self_internal_define_mix: "(define (f n) (define (g k) (if (= k 0) 0 (+ 1 (g (- k 1))))) (+ (g n) (if (= n 0) 0 (f (- n 1))))) (f 2)" => Value::int(3),
+    call_self_internal_define_shadows: "(define (f n) (define (f k) (* k 2)) (f n)) (f 5)" => Value::int(10),
+    call_self_letrec_shadows: "(define (f n) (letrec ((f (lambda (k) (if (= k 0) 0 (+ 1 (f (- k 1))))))) (f n))) (f 4)" => Value::int(4),
+}
+
+eval_error_tests! {
+    // Arity is still checked on the self-call frame path.
+    call_self_arity_error: "(define (f n) (if (= n 0) 0 (+ 1 (f)))) (f 1)" => "expects 1 args, got 0",
+}

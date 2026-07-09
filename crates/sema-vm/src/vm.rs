@@ -2070,6 +2070,25 @@ impl VM {
                         }
                         continue 'dispatch;
                     }
+                    op::CALL_SELF => {
+                        // Direct (non-tail) self-call: the callee is the current
+                        // frame's own closure — no global lookup, no callable
+                        // dispatch, and no callee value on the stack (contrast
+                        // Call / CallGlobal); only the argc args are. Cannot
+                        // dispatch a native, so no async-yield path is possible;
+                        // only an arity mismatch or frame overflow can raise.
+                        let argc = read_u16!(code, pc) as usize;
+                        self.frames[fi].pc = pc;
+                        let saved_pc = pc - op::SIZE_OP_U16;
+                        let closure = self.frames[fi].closure.clone();
+                        if let Err(err) = self.call_vm_closure_direct(closure, argc) {
+                            match self.handle_exception(err, saved_pc)? {
+                                ExceptionAction::Handled => {}
+                                ExceptionAction::Propagate(e) => return Err(e),
+                            }
+                        }
+                        continue 'dispatch;
+                    }
                     op::RETURN => {
                         let result = if !self.stack.is_empty() {
                             unsafe { pop_unchecked(&mut self.stack) }

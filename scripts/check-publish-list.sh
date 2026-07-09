@@ -31,4 +31,25 @@ if [ -n "$extra" ]; then
   echo "$extra" | sed 's/^/  - /'
 fi
 
-echo "publish list OK: all $(echo "$publishable" | wc -l | tr -d ' ') publishable crates are present."
+# Order check: a crate's intra-workspace deps must be published before it, or
+# `cargo publish` fails to resolve the `=X.Y.Z` pin against the crates.io index
+# (this half-published v1.30.0: sema-stdlib gained a sema-fmt dep that sat later
+# in the list).
+order=$(grep -oE 'publish sema-[a-z]+' "$WF" | awk '{print $2}')
+pos() { echo "$order" | grep -n "^$1\$" | cut -d: -f1; }
+edges=$(cargo metadata --no-deps --format-version 1 --manifest-path "$ROOT/Cargo.toml" \
+  | jq -r '.packages[] | select(.publish != []) | .name as $n
+           | .dependencies[] | select(.name | startswith("sema-")) | "\($n) \(.name)"')
+bad=0
+while read -r crate dep; do
+  [ -z "$crate" ] && continue
+  cp=$(pos "$crate"); dp=$(pos "$dep")
+  # deps not in the list (publish=false crates) are caught by the checks above
+  if [ -n "$cp" ] && [ -n "$dp" ] && [ "$dp" -gt "$cp" ]; then
+    echo "::error::publish order: $dep must be published before $crate (currently after)"
+    bad=1
+  fi
+done <<< "$edges"
+[ "$bad" -eq 1 ] && exit 1
+
+echo "publish list OK: all $(echo "$publishable" | wc -l | tr -d ' ') publishable crates present, dependency order valid."

@@ -65,6 +65,7 @@ jobs:
           publish sema-core
           publish sema-io
           publish sema-reader
+          publish sema-fmt
           publish sema-vm
           publish sema-otel
           publish sema-workflow
@@ -72,7 +73,6 @@ jobs:
           publish sema-stdlib
           publish sema-eval
           publish sema-docs
-          publish sema-fmt
           publish sema-dap
           publish sema-notebook
           publish sema-lsp

@@ -15,9 +15,11 @@
 
 ;; --- Format a station's results ---
 ;; Stats array layout: [min, max, sum, count] — ints scaled by 10.
-;; Dividing by 10.0 recovers the float a direct string->float parse would
-;; produce (both are the correctly-rounded f64 of the same decimal), so the
-;; round1 pipeline prints identical digits.
+;; min/max are exact tenths: int/10.0 is the correctly-rounded f64 of the
+;; same decimal, so round1 is the identity on them. The mean is computed
+;; from the exact int sum; it agrees with a float-accumulation pipeline
+;; except when the true mean is an exact half-tenth (round's ties-to-even
+;; can land 0.1 apart) — the benchmark generator's data has no such ties.
 (define (format-station name stats)
   (let ((mn  (round1 (/ (nth stats 0) 10.0)))
         (avg (round1 (/ (/ (nth stats 2) 10.0) (nth stats 3))))

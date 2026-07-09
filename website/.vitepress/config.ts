@@ -95,6 +95,7 @@ export default defineConfig({
         items: [
           { text: 'Standard Library', link: '/docs/stdlib/' },
           { text: 'LLM & Agents', link: '/docs/llm/' },
+          { text: 'Sema Web', link: '/docs/web/' },
           { text: 'CLI & Tooling', link: '/docs/cli' }
         ]
       },
@@ -240,9 +241,13 @@ export default defineConfig({
             { text: 'Feature Comparison', link: '/docs/internals/feature-comparison' },
             { text: 'Glossary', link: '/docs/internals/glossary' }
           ]
-        },
+        }
+      ],
+
+      '/docs/web/': [
         {
           text: 'Sema Web',
+          collapsed: false,
           items: [
             { text: 'Overview', link: '/docs/web/' },
             { text: 'Getting Started', link: '/docs/web/getting-started' },
@@ -307,6 +312,14 @@ export default defineConfig({
           items: [
             { text: 'Embedding in Rust', link: '/docs/embedding' },
             { text: 'Embedding in JavaScript', link: '/docs/embedding-js' }
+          ]
+        },
+        {
+          text: 'Sema Web',
+          collapsed: false,
+          items: [
+            { text: 'Overview', link: '/docs/web/' },
+            { text: 'Getting Started', link: '/docs/web/getting-started' }
           ]
         }
       ]

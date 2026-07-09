@@ -3439,6 +3439,56 @@ fn test_file_fold_lines_bytes() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+/// Pins the exact aggregate line of `benchmarks/1brc/1brc.sema` on an
+/// adversarial fixture: negative temps, -0.x forms, a single-row station,
+/// a multi-byte UTF-8 name, a mean landing on a round-half tie
+/// (ties-to-even), and a blank line (skipped). The expected string is what
+/// a float/string reference implementation (string/split + string->float +
+/// float stats) produces on the same fixture — the correctness oracle for
+/// the benchmark's byte-oriented int*10 hot loop.
+#[test]
+fn test_1brc_benchmark_output() {
+    let dir = unique_temp_dir("1brc-output");
+    let fixture = dir.join("measurements.txt");
+    std::fs::write(
+        &fixture,
+        "Oslo;-12.3\nOslo;-0.3\nOslo;0.0\nKuala Lumpur;27.8\nKuala Lumpur;27.9\n\
+         São Paulo;20.1\nSolo;-7.8\nLima;5.0\nTie;1.0\nTie;1.1\n\
+         T2;0.3\nT2;0.3\nT2;0.3\nHot;99.9\nCold;-99.9\nCold;-99.8\n\
+         NegMean;-0.1\nNegMean;-0.2\n\nZed;0.1\n",
+    )
+    .expect("write fixture");
+
+    let script = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../benchmarks/1brc/1brc.sema"
+    );
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_sema"))
+        .args([script, "--", fixture.to_str().unwrap()])
+        .output()
+        .expect("failed to run 1brc.sema");
+    assert!(
+        output.status.success(),
+        "1brc.sema failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let aggregate = stdout
+        .lines()
+        .find(|l| l.starts_with('{'))
+        .expect("no aggregate line in 1brc output");
+    assert_eq!(
+        aggregate,
+        "{Cold=-99.9/-99.8/-99.8, Hot=99.9/99.9/99.9, Kuala Lumpur=27.8/27.8/27.9, \
+         Lima=5.0/5.0/5.0, NegMean=-0.2/-0.2/-0.1, Oslo=-12.3/-4.2/0.0, \
+         Solo=-7.8/-7.8/-7.8, São Paulo=20.1/20.1/20.1, T2=0.3/0.3/0.3, \
+         Tie=1.0/1.0/1.1, Zed=0.1/0.1/0.1}"
+    );
+
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 #[test]
 fn test_file_copy() {
     let dir = temp_path("sema-test-copy");

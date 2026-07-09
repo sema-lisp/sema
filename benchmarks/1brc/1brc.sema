@@ -1,17 +1,27 @@
 ;; 1brc.sema — One Billion Row Challenge solution
 ;; Usage: sema examples/1brc.sema <measurements-file>
 ;; Reads semicolon-delimited weather measurements and computes min/mean/max per station.
+;;
+;; The hot loop is byte-oriented and allocation-light: lines arrive as
+;; bytevectors (file/fold-lines-bytes), temperatures are parsed as ints
+;; scaled by 10 (bytes/parse-int10: "-12.3" -> -123), and each station's
+;; stats live in a mutable array updated in place. The accumulator hashmap
+;; is only assoc'd when a station first appears (~station-count times);
+;; every other row mutates the existing stats array.
 
 ;; --- Round to 1 decimal place ---
 (define (round1 x)
   (/ (round (* x 10.0)) 10.0))
 
 ;; --- Format a station's results ---
-;; Stats vector layout: [min, max, sum, count]
+;; Stats array layout: [min, max, sum, count] — ints scaled by 10.
+;; Dividing by 10.0 recovers the float a direct string->float parse would
+;; produce (both are the correctly-rounded f64 of the same decimal), so the
+;; round1 pipeline prints identical digits.
 (define (format-station name stats)
-  (let ((mn  (round1 (nth stats 0)))
-        (avg (round1 (/ (nth stats 2) (nth stats 3))))
-        (mx  (round1 (nth stats 1))))
+  (let ((mn  (round1 (/ (nth stats 0) 10.0)))
+        (avg (round1 (/ (/ (nth stats 2) 10.0) (nth stats 3))))
+        (mx  (round1 (/ (nth stats 1) 10.0))))
     (format "~a=~a/~a/~a" name mn avg mx)))
 
 ;; --- Parse CLI arguments (after "--") ---
@@ -32,22 +42,24 @@
 (define t0 (time-ms))
 
 (define result
-  (file/fold-lines input-file
+  (file/fold-lines-bytes input-file
     (fn (acc line)
-      (if (= line "")
-          acc
-          (let* ((parts (string/split line ";"))
-                 (name (first parts))
-                 (temp (string->float (nth parts 1)))
-                 (existing (get acc name)))
-            (if (nil? existing)
-                (assoc acc name (vector temp temp temp 1))
-                (assoc acc name
-                  (vector
-                    (min temp (nth existing 0))
-                    (max temp (nth existing 1))
-                    (+ temp (nth existing 2))
-                    (+ 1 (nth existing 3))))))))
+      (let ((semi (bytes/find line 59)))          ; 59 = ';'
+        (if semi
+            (let* ((name (bytes/->string line 0 semi))
+                   (temp (bytes/parse-int10 line (+ semi 1)))
+                   (stats (get acc name)))
+              (if stats
+                  (begin
+                    (when (< temp (nth stats 0)) (mutable-array/set! stats 0 temp))
+                    (when (> temp (nth stats 1)) (mutable-array/set! stats 1 temp))
+                    (mutable-array/set! stats 2 (+ (nth stats 2) temp))
+                    (mutable-array/set! stats 3 (+ (nth stats 3) 1))
+                    acc)
+                  (let ((e (mutable-array/new 4 temp)))
+                    (mutable-array/set! e 3 1)
+                    (assoc acc name e))))
+            acc)))
     (hashmap/new)))
 
 (define t1 (time-ms))

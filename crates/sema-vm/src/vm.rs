@@ -2,6 +2,8 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
 use std::rc::{Rc, Weak};
 
+use smallvec::SmallVec;
+
 use sema_core::{
     bits_to_spur,
     error::{suggest_similar, veteran_hint, CallFrame as CoreCallFrame, StackTrace},
@@ -886,7 +888,7 @@ impl VM {
         let _active = ActiveDebugGuard::enter(debug);
 
         loop {
-            let step = match self.run_inner(ctx, Some(debug)) {
+            let step = match self.run_inner::<true>(ctx, Some(debug)) {
                 Ok(step) => step,
                 Err(e) => {
                     // Uncaught runtime error. If the exception breakpoint filter
@@ -1153,7 +1155,7 @@ impl VM {
                     match reconstruct_coop_resume_value(&how) {
                         Ok(resume_value) => {
                             self.replace_stack_top(resume_value);
-                            return self.run_inner(ctx, Some(debug));
+                            return self.run_inner::<true>(ctx, Some(debug));
                         }
                         Err(e) => return Err(e),
                     }
@@ -1165,7 +1167,7 @@ impl VM {
         // session registered so a task breakpoint hit during this step (e.g. the
         // main VM reaches an await whose task then breaks) surfaces as a stop.
         let _active = ActiveDebugGuard::enter(debug);
-        let result = self.run_inner(ctx, Some(debug))?;
+        let result = self.run_inner::<true>(ctx, Some(debug))?;
         if let Some(info) = take_coop_task_stop() {
             return surface_coop_task_stop(info);
         }
@@ -1209,7 +1211,7 @@ impl VM {
         // cooperative stop (see `step_task_debug`). The guard drops when control
         // returns to JS — correct, since no scheduler runs between JS calls.
         let _active = ActiveDebugGuard::enter(debug);
-        let result = self.run_inner(ctx, Some(debug))?;
+        let result = self.run_inner::<true>(ctx, Some(debug))?;
         // If a task breakpoint fired during this drive, the scheduler-driving
         // native yielded the main VM (AsyncYield) and recorded the stop; surface
         // it to JS as a cooperative Stop instead of the raw AsyncYield.
@@ -1225,7 +1227,7 @@ impl VM {
     }
 
     fn run(&mut self, ctx: &EvalContext) -> Result<Value, SemaError> {
-        match self.run_inner(ctx, None)? {
+        match self.run_inner::<false>(ctx, None)? {
             crate::debug::VmExecResult::Finished(v) => Ok(v),
             crate::debug::VmExecResult::Stopped(_) | crate::debug::VmExecResult::Yielded => {
                 unreachable!("Stopped/Yielded without debug state")
@@ -1272,7 +1274,7 @@ impl VM {
         // Each native→VM re-entry nests a fresh dispatch loop on the *Rust*
         // stack; grow it on demand so deep re-entrant recursion hits the VM's
         // catchable frame guard instead of overflowing the OS stack (SIGABRT).
-        let result = sema_core::stack::maybe_grow(|| self.run_inner(ctx, None));
+        let result = sema_core::stack::maybe_grow(|| self.run_inner::<false>(ctx, None));
         self.frame_floor = saved_floor;
         self.globals = saved_globals;
         self.functions = saved_functions;
@@ -1311,11 +1313,11 @@ impl VM {
         &mut self,
         ctx: &EvalContext,
     ) -> Result<crate::debug::VmExecResult, SemaError> {
-        self.run_inner(ctx, None)
+        self.run_inner::<false>(ctx, None)
     }
 
     /// Debug-aware resume of an async task step: like [`run_async`] but with the
-    /// breakpoint/step machinery live (`run_inner(ctx, Some(debug))`). The async
+    /// breakpoint/step machinery live (`run_inner::<true>`). The async
     /// scheduler uses this for parked-task resumes when a debug session is active,
     /// so a breakpoint on a line that runs only inside the task can stop. A
     /// returned `Stopped` is handled by the scheduler via [`handle_debug_stop`].
@@ -1324,7 +1326,7 @@ impl VM {
         ctx: &EvalContext,
         debug: &mut crate::debug::DebugState,
     ) -> Result<crate::debug::VmExecResult, SemaError> {
-        self.run_inner(ctx, Some(debug))
+        self.run_inner::<true>(ctx, Some(debug))
     }
 
     /// Replace the top of the stack with a value.
@@ -1353,7 +1355,7 @@ impl VM {
             base,
             open_upvalues: None,
         });
-        self.run_inner(ctx, None)
+        self.run_inner::<false>(ctx, None)
     }
 
     /// Debug-aware first step of an async task: like [`execute_async`] but with the
@@ -1376,7 +1378,7 @@ impl VM {
             base,
             open_upvalues: None,
         });
-        self.run_inner(ctx, Some(debug))
+        self.run_inner::<true>(ctx, Some(debug))
     }
 
     /// Prepare the VM to run `closure` with `args` already bound to its
@@ -1436,11 +1438,21 @@ impl VM {
         Ok(())
     }
 
-    fn run_inner(
+    /// Core dispatch loop, monomorphized over `DEBUG`. The `DEBUG = false`
+    /// instantiation compiles the per-instruction debug hook (breakpoints,
+    /// command polling, span tracking) out entirely, keeping the release
+    /// path's registers and i-cache free of it; every debug-session entry
+    /// point routes through `DEBUG = true`. Callers must pass `debug: None`
+    /// when `DEBUG` is `false`.
+    fn run_inner<const DEBUG: bool>(
         &mut self,
         ctx: &EvalContext,
         mut debug: Option<&mut crate::debug::DebugState>,
     ) -> Result<crate::debug::VmExecResult, SemaError> {
+        debug_assert!(
+            DEBUG || debug.is_none(),
+            "run_inner::<false> must not receive a DebugState"
+        );
         // Raw-pointer macros for reading operands without bounds checks in inner loop
         //
         // SAFETY for read_u16!/read_u32!/read_i32!: $pc..$pc+N must be in-bounds
@@ -1542,7 +1554,7 @@ impl VM {
         // so breakpoints re-trigger on new loop iterations.
         let mut dispatch_count: u32 = 0;
         'dispatch: loop {
-            if dispatch_count > 0 {
+            if DEBUG && dispatch_count > 0 {
                 if let Some(ref mut dbg) = debug {
                     dbg.resume_skip = false;
                 }
@@ -1590,7 +1602,7 @@ impl VM {
             }
 
             // Cache the next span boundary to avoid binary_search per instruction
-            let (mut next_span_idx, mut next_span_pc) = if debug.is_some() {
+            let (mut next_span_idx, mut next_span_pc) = if DEBUG && debug.is_some() {
                 let spans = &frame.closure.func.chunk.spans;
                 let idx = match spans.binary_search_by_key(&(pc as u32), |(p, _)| *p) {
                     Ok(i) => i,
@@ -1613,108 +1625,91 @@ impl VM {
                 let op = unsafe { *code.add(pc) };
                 pc += 1;
 
-                // Debug hook: span-cached check and command polling
-                if let Some(ref mut dbg) = debug {
-                    // Poll for Pause/Disconnect every 128 instructions
-                    debug_poll_counter = debug_poll_counter.wrapping_add(1);
-                    if debug_poll_counter & 127 == 0 {
-                        while let Ok(cmd) = dbg.command_rx.try_recv() {
-                            match cmd {
-                                crate::debug::DebugCommand::Pause => {
-                                    dbg.pause_requested = true;
-                                }
-                                crate::debug::DebugCommand::Disconnect => {
-                                    self.frames[fi].pc = pc;
-                                    return Ok(crate::debug::VmExecResult::Finished(Value::nil()));
-                                }
-                                crate::debug::DebugCommand::SetBreakpoints {
-                                    file,
-                                    breakpoints,
-                                    reply,
-                                } => {
-                                    let ids =
-                                        dbg.set_breakpoints_with_conditions(&file, &breakpoints);
-                                    let _ = reply.send(ids);
-                                }
-                                crate::debug::DebugCommand::SetExceptionBreakpoints {
-                                    break_on_uncaught,
-                                } => {
-                                    dbg.break_on_uncaught = break_on_uncaught;
-                                }
-                                // State queries are valid while the program is
-                                // running. Reply with the current state instead
-                                // of dropping them: the DAP server blocks a
-                                // spawn_blocking thread on `reply_rx.recv()`, so
-                                // a dropped reply leaks that thread and hangs the
-                                // session (the `stackTrace`-while-running case).
-                                crate::debug::DebugCommand::GetStackTrace { reply } => {
-                                    self.frames[fi].pc = pc; // sync live pc for the trace
-                                    let _ = reply.send(self.debug_stack_trace());
-                                }
-                                crate::debug::DebugCommand::GetScopes { frame_id, reply } => {
-                                    let _ = reply.send(self.debug_scopes(frame_id));
-                                }
-                                crate::debug::DebugCommand::GetVariables { reference, reply } => {
-                                    let _ = reply.send(self.debug_variables(reference));
-                                }
-                                crate::debug::DebugCommand::Evaluate { reply, .. } => {
-                                    let _ = reply.send(Err(
-                                        "evaluate is only available while execution is stopped"
-                                            .to_string(),
-                                    ));
-                                }
-                                crate::debug::DebugCommand::SetVariable { reply, .. } => {
-                                    let _ = reply.send(Err(
+                // Debug hook: span-cached check and command polling. Compiled
+                // out entirely in the DEBUG = false instantiation.
+                if DEBUG {
+                    if let Some(ref mut dbg) = debug {
+                        // Poll for Pause/Disconnect every 128 instructions
+                        debug_poll_counter = debug_poll_counter.wrapping_add(1);
+                        if debug_poll_counter & 127 == 0 {
+                            while let Ok(cmd) = dbg.command_rx.try_recv() {
+                                match cmd {
+                                    crate::debug::DebugCommand::Pause => {
+                                        dbg.pause_requested = true;
+                                    }
+                                    crate::debug::DebugCommand::Disconnect => {
+                                        self.frames[fi].pc = pc;
+                                        return Ok(crate::debug::VmExecResult::Finished(
+                                            Value::nil(),
+                                        ));
+                                    }
+                                    crate::debug::DebugCommand::SetBreakpoints {
+                                        file,
+                                        breakpoints,
+                                        reply,
+                                    } => {
+                                        let ids = dbg
+                                            .set_breakpoints_with_conditions(&file, &breakpoints);
+                                        let _ = reply.send(ids);
+                                    }
+                                    crate::debug::DebugCommand::SetExceptionBreakpoints {
+                                        break_on_uncaught,
+                                    } => {
+                                        dbg.break_on_uncaught = break_on_uncaught;
+                                    }
+                                    // State queries are valid while the program is
+                                    // running. Reply with the current state instead
+                                    // of dropping them: the DAP server blocks a
+                                    // spawn_blocking thread on `reply_rx.recv()`, so
+                                    // a dropped reply leaks that thread and hangs the
+                                    // session (the `stackTrace`-while-running case).
+                                    crate::debug::DebugCommand::GetStackTrace { reply } => {
+                                        self.frames[fi].pc = pc; // sync live pc for the trace
+                                        let _ = reply.send(self.debug_stack_trace());
+                                    }
+                                    crate::debug::DebugCommand::GetScopes { frame_id, reply } => {
+                                        let _ = reply.send(self.debug_scopes(frame_id));
+                                    }
+                                    crate::debug::DebugCommand::GetVariables {
+                                        reference,
+                                        reply,
+                                    } => {
+                                        let _ = reply.send(self.debug_variables(reference));
+                                    }
+                                    crate::debug::DebugCommand::Evaluate { reply, .. } => {
+                                        let _ = reply.send(Err(
+                                            "evaluate is only available while execution is stopped"
+                                                .to_string(),
+                                        ));
+                                    }
+                                    crate::debug::DebugCommand::SetVariable { reply, .. } => {
+                                        let _ = reply.send(Err(
                                         "setVariable is only available while execution is stopped"
                                             .to_string(),
                                     ));
+                                    }
+                                    // Step/Continue have no paused frame to act on
+                                    // while running; ignore them.
+                                    _ => {}
                                 }
-                                // Step/Continue have no paused frame to act on
-                                // while running; ignore them.
-                                _ => {}
                             }
                         }
-                    }
 
-                    let op_pc = (pc - 1) as u32;
-                    // Fast path: skip if not at a span boundary (single integer compare)
-                    let at_span = if op_pc == next_span_pc {
-                        let spans = &self.frames[fi].closure.func.chunk.spans;
-                        let line = spans[next_span_idx].1.line as u32;
-                        let file = self.frames[fi].closure.func.source_file.clone();
-                        next_span_idx += 1;
-                        next_span_pc = spans
-                            .get(next_span_idx)
-                            .map(|(p, _)| *p)
-                            .unwrap_or(u32::MAX);
-                        Some((file, line))
-                    } else if op_pc > next_span_pc {
-                        // Jumped past — resync via binary search
-                        let spans = &self.frames[fi].closure.func.chunk.spans;
-                        match spans.binary_search_by_key(&op_pc, |(p, _)| *p) {
-                            Ok(i) => {
-                                let line = spans[i].1.line as u32;
-                                let file = self.frames[fi].closure.func.source_file.clone();
-                                next_span_idx = i + 1;
-                                next_span_pc = spans
-                                    .get(next_span_idx)
-                                    .map(|(p, _)| *p)
-                                    .unwrap_or(u32::MAX);
-                                Some((file, line))
-                            }
-                            Err(i) => {
-                                next_span_idx = i;
-                                next_span_pc = spans.get(i).map(|(p, _)| *p).unwrap_or(u32::MAX);
-                                None
-                            }
-                        }
-                    } else if next_span_idx > 0 {
-                        // Check for backward jump: op_pc is before our current
-                        // span window (e.g., loop back-edge). Resync via binary search.
-                        // Clear resume_skip so breakpoints re-trigger on new iterations.
-                        let spans = &self.frames[fi].closure.func.chunk.spans;
-                        if op_pc <= spans[next_span_idx - 1].0 {
-                            dbg.resume_skip = false;
+                        let op_pc = (pc - 1) as u32;
+                        // Fast path: skip if not at a span boundary (single integer compare)
+                        let at_span = if op_pc == next_span_pc {
+                            let spans = &self.frames[fi].closure.func.chunk.spans;
+                            let line = spans[next_span_idx].1.line as u32;
+                            let file = self.frames[fi].closure.func.source_file.clone();
+                            next_span_idx += 1;
+                            next_span_pc = spans
+                                .get(next_span_idx)
+                                .map(|(p, _)| *p)
+                                .unwrap_or(u32::MAX);
+                            Some((file, line))
+                        } else if op_pc > next_span_pc {
+                            // Jumped past — resync via binary search
+                            let spans = &self.frames[fi].closure.func.chunk.spans;
                             match spans.binary_search_by_key(&op_pc, |(p, _)| *p) {
                                 Ok(i) => {
                                     let line = spans[i].1.line as u32;
@@ -1733,59 +1728,91 @@ impl VM {
                                     None
                                 }
                             }
+                        } else if next_span_idx > 0 {
+                            // Check for backward jump: op_pc is before our current
+                            // span window (e.g., loop back-edge). Resync via binary search.
+                            // Clear resume_skip so breakpoints re-trigger on new iterations.
+                            let spans = &self.frames[fi].closure.func.chunk.spans;
+                            if op_pc <= spans[next_span_idx - 1].0 {
+                                dbg.resume_skip = false;
+                                match spans.binary_search_by_key(&op_pc, |(p, _)| *p) {
+                                    Ok(i) => {
+                                        let line = spans[i].1.line as u32;
+                                        let file = self.frames[fi].closure.func.source_file.clone();
+                                        next_span_idx = i + 1;
+                                        next_span_pc = spans
+                                            .get(next_span_idx)
+                                            .map(|(p, _)| *p)
+                                            .unwrap_or(u32::MAX);
+                                        Some((file, line))
+                                    }
+                                    Err(i) => {
+                                        next_span_idx = i;
+                                        next_span_pc =
+                                            spans.get(i).map(|(p, _)| *p).unwrap_or(u32::MAX);
+                                        None
+                                    }
+                                }
+                            } else {
+                                None
+                            }
                         } else {
                             None
-                        }
-                    } else {
-                        None
-                    };
+                        };
 
-                    if let Some((file, line)) = at_span {
-                        if dbg.resume_skip {
-                            // Keep skipping while on the same line as last stop.
-                            // This prevents re-triggering breakpoints on multi-opcode lines.
-                            let same_line = dbg
-                                .last_stop_line
-                                .as_ref()
-                                .is_some_and(|(_, last_line)| line == *last_line);
-                            if !same_line {
-                                dbg.resume_skip = false;
+                        if let Some((file, line)) = at_span {
+                            if dbg.resume_skip {
+                                // Keep skipping while on the same line as last stop.
+                                // This prevents re-triggering breakpoints on multi-opcode lines.
+                                let same_line = dbg
+                                    .last_stop_line
+                                    .as_ref()
+                                    .is_some_and(|(_, last_line)| line == *last_line);
+                                if !same_line {
+                                    dbg.resume_skip = false;
+                                }
                             }
-                        }
-                        if !dbg.resume_skip {
-                            let frame_depth = self.frames.len();
-                            if dbg.should_stop(file.as_ref(), line, frame_depth)
-                                && self.debug_condition_allows_stop(file.as_ref(), line, dbg, ctx)
-                            {
-                                self.frames[fi].pc = pc - 1;
-                                let reason = if dbg.pause_requested {
-                                    crate::debug::StopReason::Pause
-                                } else if dbg.step_mode != crate::debug::StepMode::Continue {
-                                    crate::debug::StopReason::Step
-                                } else {
-                                    crate::debug::StopReason::Breakpoint
-                                };
-                                dbg.last_stop_line = file.as_ref().map(|f| (f.clone(), line));
-                                dbg.pause_requested = false;
-                                dbg.resume_skip = true;
-                                return Ok(crate::debug::VmExecResult::Stopped(
-                                    crate::debug::StopInfo {
-                                        reason,
-                                        file: file.clone(),
+                            if !dbg.resume_skip {
+                                let frame_depth = self.frames.len();
+                                if dbg.should_stop(file.as_ref(), line, frame_depth)
+                                    && self.debug_condition_allows_stop(
+                                        file.as_ref(),
                                         line,
-                                    },
-                                ));
+                                        dbg,
+                                        ctx,
+                                    )
+                                {
+                                    self.frames[fi].pc = pc - 1;
+                                    let reason = if dbg.pause_requested {
+                                        crate::debug::StopReason::Pause
+                                    } else if dbg.step_mode != crate::debug::StepMode::Continue {
+                                        crate::debug::StopReason::Step
+                                    } else {
+                                        crate::debug::StopReason::Breakpoint
+                                    };
+                                    dbg.last_stop_line = file.as_ref().map(|f| (f.clone(), line));
+                                    dbg.pause_requested = false;
+                                    dbg.resume_skip = true;
+                                    return Ok(crate::debug::VmExecResult::Stopped(
+                                        crate::debug::StopInfo {
+                                            reason,
+                                            file: file.clone(),
+                                            line,
+                                        },
+                                    ));
+                                }
                             }
                         }
-                    }
 
-                    // Instruction budget yield check (for cooperative WASM execution).
-                    // Checked every 128 instructions, after breakpoints so they take priority.
-                    if debug_poll_counter & 127 == 0 && dbg.instructions_remaining > 0 {
-                        dbg.instructions_remaining = dbg.instructions_remaining.saturating_sub(128);
-                        if dbg.instructions_remaining == 0 {
-                            self.frames[fi].pc = pc - 1;
-                            return Ok(crate::debug::VmExecResult::Yielded);
+                        // Instruction budget yield check (for cooperative WASM execution).
+                        // Checked every 128 instructions, after breakpoints so they take priority.
+                        if debug_poll_counter & 127 == 0 && dbg.instructions_remaining > 0 {
+                            dbg.instructions_remaining =
+                                dbg.instructions_remaining.saturating_sub(128);
+                            if dbg.instructions_remaining == 0 {
+                                self.frames[fi].pc = pc - 1;
+                                return Ok(crate::debug::VmExecResult::Yielded);
+                            }
                         }
                     }
                 }
@@ -2084,11 +2111,14 @@ impl VM {
                         // that crossing point (see close_closure_upvalues_for_foreign_run).
                         let native = self.native_fns[native_id].clone();
                         let args_start = self.stack.len() - argc;
-                        // Copy args into an owned Vec and drop them from the stack
-                        // before the call so no borrow of self.stack is held while
-                        // the native may re-enter this VM (run_nested_closure needs
-                        // &mut self via the CURRENT_VM pointer).
-                        let call_args: Vec<Value> = self.stack.split_off(args_start);
+                        // Move args into an owned buffer and drop them from the
+                        // stack before the call so no borrow of self.stack is held
+                        // while the native may re-enter this VM (run_nested_closure
+                        // needs &mut self via the CURRENT_VM pointer). SmallVec
+                        // keeps argc <= 8 off the heap; drain moves without
+                        // refcount traffic.
+                        let call_args: SmallVec<[Value; 8]> =
+                            self.stack.drain(args_start..).collect();
                         let result = {
                             let _vm_guard = CurrentVmGuard::enter(self);
                             (native.func)(ctx, &call_args)
@@ -2807,18 +2837,27 @@ impl VM {
                         }
                     }
                     op::STRING_APPEND => {
-                        use std::fmt::Write;
                         let b = unsafe { pop_unchecked(&mut self.stack) };
                         let a = unsafe { pop_unchecked(&mut self.stack) };
-                        let mut result = String::new();
-                        for arg in [&a, &b] {
-                            if let Some(s) = arg.as_str() {
-                                result.push_str(s);
-                            } else {
-                                write!(&mut result, "{}", arg).unwrap();
+                        let result = if let (Some(x), Some(y)) = (a.as_str(), b.as_str()) {
+                            // Both strings: one exact-capacity allocation.
+                            let mut s = String::with_capacity(x.len() + y.len());
+                            s.push_str(x);
+                            s.push_str(y);
+                            s
+                        } else {
+                            use std::fmt::Write;
+                            let mut s = String::new();
+                            for arg in [&a, &b] {
+                                if let Some(x) = arg.as_str() {
+                                    s.push_str(x);
+                                } else {
+                                    write!(&mut s, "{}", arg).unwrap();
+                                }
                             }
-                        }
-                        self.stack.push(Value::string(&result));
+                            s
+                        };
+                        self.stack.push(Value::string_owned(result));
                     }
 
                     _ => {
@@ -2860,12 +2899,12 @@ impl VM {
                 return self.call_vm_closure(closure, argc);
             }
             // C1: keep open upvalues open across the call so a re-entrant
-            // in-VM HOF callback can write back through them. Copy args into an
-            // owned Vec (releasing the stack borrow) so the native may re-enter
-            // this VM via run_nested_closure. Closures crossing onto a foreign
-            // stack are snapshotted at the crossing point.
+            // in-VM HOF callback can write back through them. Move args into an
+            // owned buffer (releasing the stack borrow) so the native may
+            // re-enter this VM via run_nested_closure. Closures crossing onto a
+            // foreign stack are snapshotted at the crossing point.
             let func_rc = self.stack[func_idx].as_native_fn_rc().unwrap();
-            let call_args: Vec<Value> = self.stack.split_off(func_idx + 1);
+            let call_args: SmallVec<[Value; 8]> = self.stack.drain(func_idx + 1..).collect();
             self.stack.pop(); // pop the native fn value
             let result = {
                 let _vm_guard = CurrentVmGuard::enter(self);
@@ -2893,11 +2932,11 @@ impl VM {
         } else {
             // C1: keep upvalues open across the callback. The callback may
             // re-enter this VM (e.g. a multimethod whose handler is a VM
-            // closure). Copy args into an owned Vec so no stack borrow is held
-            // during the (possibly re-entrant) call. Closures crossing onto a
-            // foreign stack are snapshotted at the crossing point.
+            // closure). Move args into an owned buffer so no stack borrow is
+            // held during the (possibly re-entrant) call. Closures crossing
+            // onto a foreign stack are snapshotted at the crossing point.
             let func_val = self.stack[func_idx].clone();
-            let call_args: Vec<Value> = self.stack.split_off(func_idx + 1);
+            let call_args: SmallVec<[Value; 8]> = self.stack.drain(func_idx + 1..).collect();
             self.stack.pop(); // pop the callable value
             let result = {
                 let _vm_guard = CurrentVmGuard::enter(self);
@@ -2949,12 +2988,13 @@ impl VM {
         ctx: &EvalContext,
     ) -> Result<(), SemaError> {
         if func_val.raw_tag() == Some(TAG_NATIVE_FN) {
-            // C1: keep upvalues open; copy args so the native may re-enter this
-            // VM via run_nested_closure without an outstanding stack borrow.
-            // Closures crossing onto a foreign stack are snapshotted there.
+            // C1: keep upvalues open; move args off the stack so the native may
+            // re-enter this VM via run_nested_closure without an outstanding
+            // stack borrow. Closures crossing onto a foreign stack are
+            // snapshotted there.
             let func_rc = func_val.as_native_fn_rc().unwrap();
             let args_start = self.stack.len() - argc;
-            let call_args: Vec<Value> = self.stack.split_off(args_start);
+            let call_args: SmallVec<[Value; 8]> = self.stack.drain(args_start..).collect();
             let result = {
                 let _vm_guard = CurrentVmGuard::enter(self);
                 (func_rc.func)(ctx, &call_args)
@@ -2977,11 +3017,12 @@ impl VM {
             self.stack.push(result);
             Ok(())
         } else {
-            // C1: keep upvalues open; copy args so a re-entrant callback can
-            // run in-VM without an outstanding stack borrow. Closures crossing
-            // onto a foreign stack are snapshotted at the crossing point.
+            // C1: keep upvalues open; move args off the stack so a re-entrant
+            // callback can run in-VM without an outstanding stack borrow.
+            // Closures crossing onto a foreign stack are snapshotted at the
+            // crossing point.
             let args_start = self.stack.len() - argc;
-            let call_args: Vec<Value> = self.stack.split_off(args_start);
+            let call_args: SmallVec<[Value; 8]> = self.stack.drain(args_start..).collect();
             let result = {
                 let _vm_guard = CurrentVmGuard::enter(self);
                 sema_core::call_callback(ctx, &func_val, &call_args)
@@ -4338,9 +4379,10 @@ fn vm_add(a: &Value, b: &Value) -> Result<Value, SemaError> {
         (ValueViewRef::Int(x), ValueViewRef::Float(y)) => Ok(Value::float(x as f64 + y)),
         (ValueViewRef::Float(x), ValueViewRef::Int(y)) => Ok(Value::float(x + y as f64)),
         (ValueViewRef::String(x), ValueViewRef::String(y)) => {
-            let mut s = x.to_string();
+            let mut s = String::with_capacity(x.len() + y.len());
+            s.push_str(x);
             s.push_str(y);
-            Ok(Value::string(&s))
+            Ok(Value::string_owned(s))
         }
         _ => {
             // Non-fixnum numeric operands (bignum now; rational/complex in later

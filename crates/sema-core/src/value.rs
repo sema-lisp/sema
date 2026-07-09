@@ -838,6 +838,13 @@ impl Value {
         Value::from_rc_ptr(TAG_STRING, Rc::new(s.to_string()))
     }
 
+    /// Construct a string value from an already-owned `String` without the
+    /// extra copy `Value::string(&s)` would make. Prefer this whenever the
+    /// caller has just built the `String` and won't use it again.
+    pub fn string_owned(s: String) -> Value {
+        Value::from_rc_ptr(TAG_STRING, Rc::new(s))
+    }
+
     pub fn string_from_rc(rc: Rc<String>) -> Value {
         Value::from_rc_ptr(TAG_STRING, rc)
     }

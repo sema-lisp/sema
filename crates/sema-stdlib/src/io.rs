@@ -667,7 +667,7 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
             .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
         if let Some(data) = sema_core::vfs::vfs_read(path) {
             return String::from_utf8(data)
-                .map(|s| Value::string(&s))
+                .map(Value::string_owned)
                 .map_err(|e| {
                     SemaError::Io(format!("file/read {path}: invalid UTF-8 in VFS: {e}"))
                 });
@@ -679,12 +679,12 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
                     std::fs::read_to_string(&path)
                         .map_err(|e| fs_io_msg(format!("file/read {path}: {e}")))
                 },
-                |s| Value::string(&s),
+                Value::string_owned,
             );
         }
         let content = std::fs::read_to_string(path)
             .map_err(|e| SemaError::Io(format!("file/read {path}: {e}")))?;
-        Ok(Value::string(&content))
+        Ok(Value::string_owned(content))
     });
 
     crate::register_fn_path_gated(env, sandbox, Caps::FS_WRITE, "file/write", &[0], |args| {
@@ -792,7 +792,7 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
                 input.pop();
             }
         }
-        Ok(Value::string(&input))
+        Ok(Value::string_owned(input))
     });
 
     register_fn(env, "read", |args| {
@@ -1350,7 +1350,7 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
             .read_to_string(&mut buf)
             .map_err(|e| SemaError::Io(format!("read-stdin: {e}")))?;
         STDIN_EOF.with(|f| f.set(true));
-        Ok(Value::string(&buf))
+        Ok(Value::string_owned(buf))
     });
 
     // io/flush — flush stdout

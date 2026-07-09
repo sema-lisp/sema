@@ -1,59 +1,134 @@
-;; game-of-life.sema — Conway's Game of Life with ASCII visualization
+;; game-of-life.sema — (sema) game-of-life: Conway's Game of Life as a live,
+;; full-screen, Sema-branded TUI.
 ;; Usage: sema examples/game-of-life.sema
+;;
+;; The grid fills the whole terminal and resizes live on SIGWINCH. Each
+;; terminal character packs a 2x2 block of cells via Unicode quadrant glyphs
+;; (▘▝▖▗▚▞▀▄▌▐▛▜▙▟█), doubling the effective resolution in both axes versus
+;; one cell per character. Demonstrates term/* (alt-screen, cursor control,
+;; styling, kitty keyboard protocol), io/* (raw-mode key input), sys/*
+;; (terminal size + resize signal), and mutable-array for an O(1)-indexed,
+;; in-place double-buffered grid (a persistent list-of-lists grid would be
+;; too slow to recompute every tick at full-terminal scale).
+;;
+;; Controls: [space] pause/resume  [r] reseed  [up/down] speed
+;;           [left/right] seed density  [click/drag] draw · [right] erase
+;;           [q] / [esc] / ^C / ^D quit
 
-(println "=== Conway's Game of Life ===")
-(println "")
+;; Fine-grained simulation grid; each terminal char shows a 2x2 block of it,
+;; so these are double the minimum terminal footprint in each axis.
+(define MIN-ROWS 20)
+(define MIN-COLS 40)
+(define MARGIN 1) ; blank terminal rows/cols left around the box on every side
 
-;; Grid dimensions
-(define ROWS 20)
-(define COLS 40)
+;; Generation delay / key-poll timeout, in ms — [up]/[down] adjust it. 0
+;; means "don't wait for input at all", so the loop free-runs at whatever
+;; speed compute + render can sustain (the "as fast as possible" max speed).
+(define DEFAULT-TICK-MS 90)
+(define MIN-TICK-MS 0)
+(define MAX-TICK-MS 400)
+(define TICK-STEP-MS 10)
 
-;; Create a blank grid (list of lists, all zeros)
-(define (make-grid rows cols)
-  (map (fn (_) (map (fn (_) 0) (range cols))) (range rows)))
+;; Live-cell probability used on reseed — [left]/[right] adjust it.
+(define DEFAULT-DENSITY 0.15)
+(define MIN-DENSITY 0.05)
+(define MAX-DENSITY 0.5)
+(define DENSITY-STEP 0.05)
 
-;; Access a cell with toroidal wrapping
-(define (grid-get grid r c rows cols)
-  (nth (nth grid (mod r rows)) (mod c cols)))
+;; Raw mode (cfmakeraw) disables output post-processing, so a bare "\n" does
+;; NOT return the cursor to column 1 on a real terminal — every line must be
+;; positioned explicitly. Same technique as examples/sema-coder/tui.sema.
+(define ESC "\x1b;")
+(define (goto row col)
+  (string-append ESC "[" (number->string row) ";" (number->string col) "H"))
 
-;; Set a cell in the grid (returns new grid)
-(define (grid-set grid r c val)
-  (map
-    (fn (ri)
-      (if (= ri r)
-        (map
-          (fn (ci)
-            (if (= ci c) val (nth (nth grid ri) ci)))
-          (range COLS))
-        (nth grid ri)))
-    (range ROWS)))
+;; --- Sema brand palette ---
+;; Warm gold accent on a dark canvas, matching sema-lang.com and the
+;; examples/sema-coder/theme.sema TUI palette; vendored here (rather than
+;; loaded) so this example stays a single self-contained file.
+(define (accent text) (term/rgb text 200 168 85)) ; brand gold #c8a855
+(define (accent-dim text) (term/rgb text 160 136 56)) ; darker gold #a08838
+(define (bright text) (term/rgb text 255 255 255)) ; pure white
+(define (muted text) (term/rgb text 150 140 121)) ; warm gray
 
-;; Set multiple cells from a list of (row col) pairs
-(define (grid-set-cells grid cells)
-  (foldl (fn (g cell) (grid-set g (car cell) (cadr cell) 1))
-    grid
-    cells))
+;; Parentheses in gold, letters in bold white — the canonical (sema) wordmark.
+(define (wordmark)
+  (string-append (accent "(") (bright (term/style "sema" :bold)) (accent ")")))
 
-;; Count live neighbors (8 surrounding cells with wrapping)
-;; Add ROWS/COLS before subtracting to avoid unsigned underflow
+(define (wordmark-with suffix)
+  (string-append (wordmark) " " (accent-dim (term/style suffix :bold))))
+
+;; Unicode quadrant glyphs indexed by (tl*8 + tr*4 + bl*2 + br) — one glyph
+;; per one of the 16 on/off combinations of a 2x2 block of cells.
+(define QUADRANTS
+  (vector " "
+    "▗"
+    "▖"
+    "▄"
+    "▝"
+    "▐"
+    "▞"
+    "▟"
+    "▘"
+    "▚"
+    "▌"
+    "▙"
+    "▀"
+    "▜"
+    "▛"
+    "█"))
+
+;; A glider stamped into every fresh seed — a familiar traveller amid the noise.
+(define GLIDER (list (list 1 2) (list 2 3) (list 3 1) (list 3 2) (list 3 3)))
+
+;; --- Mutable UI/sim state ---
+(define *rows* MIN-ROWS)
+(define *cols* MIN-COLS)
+(define *grid* (mutable-array/new))
+(define *next-grid* (mutable-array/new))
+(define *generation* 0)
+(define *alive-count* 0)
+(define *paused* #f)
+(define *should-quit* #f)
+(define *resize-pending* #t)
+(define *tick-ms* DEFAULT-TICK-MS)
+(define *density* DEFAULT-DENSITY)
+
+;; --- Grid access (toroidal wrapping) ---
+(define (cell-index r c) (+ (* (mod r *rows*) *cols*) (mod c *cols*)))
+(define (cell-get grid r c) (mutable-array/get grid (cell-index r c)))
+(define (cell-set! grid r c v) (mutable-array/set! grid (cell-index r c) v))
+
+;; Set all 4 fine cells of the 2x2 block at (r0,c0) to V — a mouse click only
+;; has terminal-cell resolution, so drawing acts on a whole QUADRANTS block.
+(define (paint-block! r0 c0 v)
+  (cell-set! *grid* r0 c0 v)
+  (cell-set! *grid* r0 (+ c0 1) v)
+  (cell-set! *grid* (+ r0 1) c0 v)
+  (cell-set! *grid* (+ r0 1) (+ c0 1) v))
+
+(define (toggle-block! r0 c0)
+  (paint-block! r0 c0 (if (= (cell-get *grid* r0 c0) 1) 0 1)))
+
+;; Count live neighbors (8 surrounding cells, wrapping).
+;; Add rows/cols before subtracting to avoid going negative.
 (define (count-neighbors grid r c)
-  (let ((ru (+ r ROWS -1))
+  (let ((ru (+ r *rows* -1))
         (rd (+ r 1))
-        (cl (+ c COLS -1))
+        (cl (+ c *cols* -1))
         (cr (+ c 1)))
-    (+ (grid-get grid ru cl ROWS COLS)
-      (grid-get grid ru c ROWS COLS)
-      (grid-get grid ru cr ROWS COLS)
-      (grid-get grid r cl ROWS COLS)
-      (grid-get grid r cr ROWS COLS)
-      (grid-get grid rd cl ROWS COLS)
-      (grid-get grid rd c ROWS COLS)
-      (grid-get grid rd cr ROWS COLS))))
+    (+ (cell-get grid ru cl)
+      (cell-get grid ru c)
+      (cell-get grid ru cr)
+      (cell-get grid r cl)
+      (cell-get grid r cr)
+      (cell-get grid rd cl)
+      (cell-get grid rd c)
+      (cell-get grid rd cr))))
 
-;; Apply Game of Life rules to compute next cell state
-(define (next-cell grid r c)
-  (let* ((alive  (grid-get grid r c ROWS COLS))
-         (n      (count-neighbors grid r c)))
+(define (next-cell-state grid r c)
+  (let* ((alive (cell-get grid r c))
+         (n (count-neighbors grid r c)))
     (cond
       ((and (= alive 1) (< n 2)) 0)
       ; underpopulation
@@ -63,81 +138,243 @@
       ; reproduction
       (else alive)))) ; survival or stays dead
 
-;; Compute next generation (returns new grid)
-(define (next-generation grid)
-  (map
-    (fn (r)
-      (map (fn (c) (next-cell grid r c))
-        (range COLS)))
-    (range ROWS)))
+;; Compute the next generation into *next-grid*, then swap buffers in place —
+;; no per-generation grid reallocation.
+(define (step-generation!)
+  (let ((alive 0))
+    (dotimes (r *rows*)
+      (dotimes (c *cols*)
+        (let ((next (next-cell-state *grid* r c)))
+          (mutable-array/set! *next-grid* (cell-index r c) next)
+          (set! alive (+ alive next)))))
+    (let ((tmp *grid*))
+      (set! *grid* *next-grid*)
+      (set! *next-grid* tmp))
+    (set! *generation* (+ *generation* 1))
+    (set! *alive-count* alive)))
 
-;; Count total live cells
 (define (count-alive grid)
-  (foldl + 0 (map (fn (row) (foldl + 0 row)) grid)))
+  (let ((total 0))
+    (dotimes (i (* *rows* *cols*))
+      (set! total (+ total (mutable-array/get grid i))))
+    total))
 
-;; Render a single row as a string
-(define (render-row row)
-  (string/join (map (fn (cell) (if (= cell 1) "█" " ")) row)
-    ""))
+;; --- Seeding ---
+(define (reseed!)
+  (dotimes (i (* *rows* *cols*))
+    (mutable-array/set! *grid* i (if (< (math/random) *density*) 1 0))
+    (mutable-array/set! *next-grid* i 0))
+  (for-each
+    (fn (cell) (cell-set! *grid* (car cell) (cadr cell) 1))
+    GLIDER)
+  (set! *generation* 0)
+  (set! *alive-count* (count-alive *grid*)))
 
-;; Display the grid
-(define (display-grid grid gen)
-  (let ((alive   (count-alive grid))
-        (border  (string/repeat "─" COLS)))
-    (println (format "Generation ~a  |  Live cells: ~a" gen alive))
-    (println (string/append "┌" border "┐"))
-    (for-each
-      (fn (row) (println (string/append "│" (render-row row) "│")))
-      grid)
-    (println (string/append "└" border "┘"))
-    (println "")))
+;; --- Sizing ---
+;; Reserve 2 terminal rows (title bar + status bar, which double as the
+;; top/bottom border) and 2 cols (side border), plus a blank MARGIN on every
+;; side so the box doesn't touch the terminal edge; each remaining terminal
+;; cell packs a 2x2 block of the fine grid.
+(define (resize-buffers!)
+  (set! *grid* (mutable-array/new (* *rows* *cols*) 0))
+  (set! *next-grid* (mutable-array/new (* *rows* *cols*) 0)))
 
-;; --- Seed the grid with classic patterns ---
-(define grid (make-grid ROWS COLS))
+(define (recompute-size!)
+  (let ((sz (sys/term-size)))
+    (when (map? sz)
+      (set! *rows* (max MIN-ROWS (* 2 (- (:rows sz) 2 (* 2 MARGIN)))))
+      (set! *cols* (max MIN-COLS (* 2 (- (:cols sz) 2 (* 2 MARGIN)))))))
+  (resize-buffers!)
+  (reseed!)
+  (term/clear)
+  (set! *resize-pending* #f))
 
-;; Glider at (2, 2) — moves diagonally
-;; .X.
-;; ..X
-;; XXX
-(define grid
-  (grid-set-cells grid
-    (list (list 2 3) (list 3 4) (list 4 2) (list 4 3) (list 4 4))))
+(define (check-resize!)
+  (sys/check-signals)
+  (when *resize-pending* (recompute-size!)))
 
-;; Blinker at (5, 15) — period 2 oscillator
-;; XXX
-(define grid
-  (grid-set-cells grid
-    (list (list 5 15) (list 5 16) (list 5 17))))
+;; --- Rendering ---
+;; No per-frame term/clear (that flashes) — every frame redraws exactly the
+;; same shape at the same position, so overwriting it in place is
+;; flicker-free. Each terminal character renders a 2x2 block of fine cells
+;; via QUADRANTS, so a 20x40 fine grid only needs a 10x20 terminal area.
 
-;; R-pentomino at (8, 20) — chaotic, long-lived
-;; .XX
-;; XX.
-;; .X.
-(define grid
-  (grid-set-cells grid
-    (list (list 8 21)
-      (list 8 22)
-      (list 9 20)
-      (list 9 21)
-      (list 10 21))))
+(define (speed-label)
+  (if (<= *tick-ms* MIN-TICK-MS)
+    "max"
+    (string-append (number->string *tick-ms*) "ms")))
 
-;; --- Run simulation ---
-(define NUM-GENERATIONS 20)
+(define (density-percent) (int (round (* *density* 100))))
 
-(define t-start (time-ms))
+(define (quadrant-glyph r0 r1 c0 c1)
+  (let* ((tl (cell-get *grid* r0 c0))
+         (tr (cell-get *grid* r0 c1))
+         (bl (cell-get *grid* r1 c0))
+         (br (cell-get *grid* r1 c1))
+         (idx (+ (* tl 8) (* tr 4) (* bl 2) br)))
+    (nth QUADRANTS idx)))
 
-;; Display initial state and run generations
-(define (run grid gen)
-  (display-grid grid gen)
-  (if (< gen NUM-GENERATIONS)
-    (run (next-generation grid) (+ gen 1))
-    grid))
+(define (render-term-row tr term-cols)
+  (let ((r0 (* tr 2)) (r1 (+ (* tr 2) 1)))
+    (string/join
+      (map (fn (tc) (quadrant-glyph r0 r1 (* tc 2) (+ (* tc 2) 1)))
+        (range term-cols))
+      "")))
 
-(define final-grid (run grid 0))
+;; A titled border line: CORNER-L "─ " LABEL " " then enough "─" to reach
+;; TOTAL-WIDTH, then CORNER-R. LABEL may already carry ANSI styling —
+;; string/width (not string-length) measures its true display width so the
+;; fill math stays correct.
+(define (border-line corner-l corner-r label total-width)
+  (let* ((prefix
+           (string-append (accent-dim (string-append corner-l "─ "))
+             label
+             (accent-dim " ")))
+         (used (string/width prefix))
+         (fill (max 0 (- total-width used 1))))
+    (string-append prefix
+      (accent-dim (string/repeat "─" fill))
+      (accent-dim corner-r))))
 
-(define t-end (time-ms))
+;; Returns the frame as a list of plain lines (top border, grid rows...,
+;; bottom border) — NOT joined by "\n". render! positions each one itself.
+(define (build-frame-lines)
+  (let* ((term-rows (quotient *rows* 2))
+         (term-cols (quotient *cols* 2))
+         (total-width (+ term-cols 2))
+         (status
+           (string-append
+             (muted
+               (format "gen ~a · alive ~a · ~ax~a · ~a · seed ~a%"
+                 *generation*
+                 *alive-count*
+                 *cols*
+                 *rows*
+                 (speed-label)
+                 (density-percent)))
+             (if *paused*
+               (string-append (muted " · ")
+                 (accent (term/style "PAUSED" :bold)))
+               "")))
+         (top
+           (border-line "┌" "┐" (wordmark-with "game-of-life") total-width))
+         (bottom (border-line "└" "┘" status total-width))
+         (body
+           (map
+             (fn (tr)
+               (string-append (accent-dim "│")
+                 (accent (render-term-row tr term-cols))
+                 (accent-dim "│")))
+             (range term-rows))))
+    (append (list top) body (list bottom))))
 
-(println
-  (format "Simulation complete: ~a generations in ~a ms"
-    NUM-GENERATIONS
-    (- t-end t-start)))
+;; 1-based terminal position of the grid's top-left content character —
+;; MARGIN, then the top/left border row/col, then the content starts.
+(define (grid-origin-row) (+ 2 MARGIN))
+(define (grid-origin-col) (+ 2 MARGIN))
+
+;; Map an absolute 1-based terminal mouse position to the fine-grid (r0 c0)
+;; origin of the 2x2 block under it, or nil when outside the grid area.
+(define (mouse->cell x y)
+  (let ((term-rows (quotient *rows* 2))
+        (term-cols (quotient *cols* 2))
+        (tr (- y (grid-origin-row)))
+        (tc (- x (grid-origin-col))))
+    (if (and (>= tr 0) (< tr term-rows) (>= tc 0) (< tc term-cols))
+      (list (* tr 2) (* tc 2))
+      nil)))
+
+;; Explicitly goto's every line at (1+MARGIN, 1+MARGIN) and down, rather than
+;; relying on "\n" to return to column 1 (see the ESC/goto comment above) —
+;; and it's what carves out the safe margin around the box. Still one
+;; display + one io/flush per frame, so cursor moves and content never
+;; interleave out of order.
+(define (render!)
+  (let ((col (+ 1 MARGIN)) (row0 (+ 1 MARGIN)))
+    (let loop ((i 0) (lines (build-frame-lines)) (out ""))
+      (if (null? lines)
+        (begin
+          (display out)
+          (io/flush))
+        (loop (+ i 1)
+          (cdr lines)
+          (string-append out (goto (+ row0 i) col) (car lines)))))))
+
+;; --- Input handling ---
+(define (adjust-speed! delta)
+  (set! *tick-ms* (max MIN-TICK-MS (min MAX-TICK-MS (+ *tick-ms* delta)))))
+
+;; Re-seeds immediately so a density change is visible right away, rather
+;; than only taking effect on the next manual [r].
+(define (adjust-density! delta)
+  (set! *density* (max MIN-DENSITY (min MAX-DENSITY (+ *density* delta))))
+  (reseed!))
+
+(define (handle-key k)
+  (let ((kind (:kind k))
+        (ch (:char k))
+        (name (:name k)))
+    (cond
+      ((and (equal? kind :char) (equal? ch "q")) (set! *should-quit* #t))
+      ((and (equal? kind :char) (equal? ch " ")) (set! *paused* (not *paused*)))
+      ((and (equal? kind :char) (equal? ch "r")) (reseed!))
+      ((and (equal? kind :ctrl) (or (equal? ch "c") (equal? ch "d")))
+        (set! *should-quit* #t))
+      ((and (equal? kind :key) (equal? name :esc)) (set! *should-quit* #t))
+      ((and (equal? kind :key) (equal? name :up))
+        (adjust-speed! (- TICK-STEP-MS)))
+      ((and (equal? kind :key) (equal? name :down)) (adjust-speed! TICK-STEP-MS))
+      ((and (equal? kind :key) (equal? name :left))
+        (adjust-density! (- DENSITY-STEP)))
+      ((and (equal? kind :key) (equal? name :right))
+        (adjust-density! DENSITY-STEP))
+      ((equal? kind :mouse) (handle-mouse k))
+      (else nil))))
+
+;; Left click/drag paints alive cells; right click/drag erases. Only :press
+;; and :move carry a meaningful click — :release/:wheel-* are ignored.
+(define (handle-mouse k)
+  (let ((action (:action k))
+        (button (:button k))
+        (cell (mouse->cell (:x k) (:y k))))
+    (when cell
+      (let ((r0 (car cell)) (c0 (cadr cell)))
+        (cond
+          ((and (equal? action :press) (= button 0)) (toggle-block! r0 c0))
+          ((and (equal? action :press) (= button 2)) (paint-block! r0 c0 0))
+          ((and (equal? action :move) (= button 0)) (paint-block! r0 c0 1))
+          ((and (equal? action :move) (= button 2)) (paint-block! r0 c0 0))
+          (else nil))))))
+
+;; --- Main loop ---
+;; The kitty keyboard protocol gives terminals that support it more reliable
+;; key decoding (modifiers, unambiguous key identification); unsupported
+;; terminals silently keep using the legacy encoding. Must be disabled again
+;; before raw mode is left, so it's guarded here rather than left to exit.
+(define (run!)
+  (recompute-size!)
+  (sys/on-signal :winch (fn () (set! *resize-pending* #t)))
+  (term/set-title "(sema) game-of-life")
+  (term/enable-kitty-keys!)
+  (render!)
+  (let ((result
+          (try
+            (let loop ()
+              (check-resize!)
+              (let ((k (io/read-key-timeout *tick-ms*)))
+                (when k (handle-key k))
+                (unless *should-quit*
+                  ;; Skip the step on a tick where the user is actively
+                  ;; clicking/dragging, so a drawn cell is visible for at
+                  ;; least one frame before the simulation can compute it away.
+                  (unless (or *paused* (and k (equal? (:kind k) :mouse)))
+                    (step-generation!))
+                  (render!)
+                  (loop))))
+            (catch e
+              (term/disable-kitty-keys!)
+              (throw e)))))
+    (term/disable-kitty-keys!)
+    result))
+
+(io/with-raw-mode (term/with-alt-screen (term/with-mouse (run!))))

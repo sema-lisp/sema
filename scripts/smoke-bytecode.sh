@@ -46,6 +46,12 @@ run_test() {
             echo "  SKIP  $f (interactive)"
             return
             ;;
+        game-of-life.sema)
+            # Full-screen TUI — reads keys in a loop, no natural exit
+            skipped=$((skipped + 1))
+            echo "  SKIP  $f (interactive)"
+            return
+            ;;
         pico-*.sema)
             # Pico 2 hardware examples — require a serial port to a real device
             skipped=$((skipped + 1))

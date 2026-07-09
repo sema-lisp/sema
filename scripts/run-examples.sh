@@ -37,6 +37,8 @@ SKIP_FILES=(
   "examples/web-server.sema"      # http/serve — never exits
   "examples/eliza-web.sema"       # http/serve — never exits
   "examples/eliza.sema"           # interactive read-line chatbot
+  "examples/game-of-life.sema"    # full-screen TUI — reads keys in a loop,
+                                  # no natural exit without a 'q' keypress
   "examples/pico-blink.sema"      # Raspberry Pi Pico hardware
   "examples/pico-jukebox.sema"
   "examples/pico-midi.sema"

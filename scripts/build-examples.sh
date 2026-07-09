@@ -28,6 +28,7 @@ BIN="target/release/sema"
 SKIP_FILES=(
   # interactive / server / hardware (same as run-examples.sh)
   "examples/web-server.sema" "examples/eliza-web.sema" "examples/eliza.sema"
+  "examples/game-of-life.sema" # full-screen TUI — reads keys, no natural exit
   "examples/pico-blink.sema" "examples/pico-jukebox.sema" "examples/pico-midi.sema"
   "examples/pico-piano.sema" "examples/pico-show.sema" "examples/stdlib/io.sema"
   # not a deterministic build-path test:

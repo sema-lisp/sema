@@ -1872,7 +1872,6 @@ fn vm_set_through_for_each_hof_propagates() {
 /// for stdlib HOF interop (Decision #50). Once the open-upvalue model removes
 /// the cross-VM-copy hack, this should unify.
 #[test]
-#[ignore = "C1 related: VM type reflection — see docs/limitations.md #31"]
 fn vm_type_of_lambda_is_lambda() {
     let src = "(type (fn (x) x))";
     assert_eq!(

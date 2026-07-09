@@ -189,6 +189,15 @@ pub enum SemaError {
     #[error("User exception: {0}")]
     UserException(Value),
 
+    /// A re-raised condition map — the `{:type ... :message ...}` value a
+    /// `catch`/`guard` handler was bound to, thrown again. Kept as that map
+    /// verbatim so catching and re-throwing is idempotent: N nested
+    /// `(catch e ... (throw e))` guards surface the same condition as one.
+    /// Displays as the condition's `:message` so the top-level report reads
+    /// like the original error, not a stringified map.
+    #[error("{}", condition_message(.0))]
+    Condition(Value),
+
     #[error("{inner}")]
     WithTrace {
         inner: Box<SemaError>,
@@ -304,9 +313,62 @@ pub fn veteran_hint(name: &str) -> Option<&'static str> {
     }
 }
 
+/// The `:type` keywords `error_to_value` puts on condition maps. A thrown map
+/// is only treated as a re-raised condition when its `:type` is one of these
+/// (and `:message` is a string) — user data maps that merely resemble a
+/// condition keep the wrap-as-user-exception behavior.
+const CONDITION_TYPES: &[&str] = &[
+    "eval",
+    "type-error",
+    "arity",
+    "unbound",
+    "user",
+    "io",
+    "llm",
+    "reader",
+    "permission-denied",
+];
+
+/// The `:message` of a condition map, for `Display` of `SemaError::Condition`.
+/// Falls back to the whole map's printed form if the shape is unexpected.
+fn condition_message(condition: &Value) -> String {
+    condition
+        .as_map_ref()
+        .and_then(|m| m.get(&Value::keyword("message")))
+        .and_then(|msg| msg.as_str().map(str::to_string))
+        .unwrap_or_else(|| condition.to_string())
+}
+
+/// True when `value` has the exact shape of a caught condition map:
+/// a map with a known keyword `:type` and a string `:message`.
+fn is_condition_map(value: &Value) -> bool {
+    let Some(map) = value.as_map_ref() else {
+        return false;
+    };
+    let known_type = map
+        .get(&Value::keyword("type"))
+        .and_then(|t| t.as_keyword())
+        .is_some_and(|kw| CONDITION_TYPES.contains(&kw.as_str()));
+    known_type
+        && map
+            .get(&Value::keyword("message"))
+            .is_some_and(|m| m.as_str().is_some())
+}
+
 impl SemaError {
     pub fn eval(msg: impl Into<String>) -> Self {
         SemaError::Eval(msg.into())
+    }
+
+    /// The error a `throw`/`raise` of `value` raises: a caught condition map
+    /// re-raises as itself (`Condition`) so nested catch/re-throw guards don't
+    /// wrap it again per layer; anything else is a fresh `UserException`.
+    pub fn from_thrown(value: Value) -> Self {
+        if is_condition_map(&value) {
+            SemaError::Condition(value)
+        } else {
+            SemaError::UserException(value)
+        }
     }
 
     pub fn type_error(expected: impl Into<String>, got: impl Into<String>) -> Self {

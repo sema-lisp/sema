@@ -2322,7 +2322,9 @@ impl VM {
                     // --- Exceptions ---
                     op::THROW => {
                         let val = unsafe { pop_unchecked(&mut self.stack) };
-                        let err = SemaError::UserException(val);
+                        // A caught condition map re-raises as itself; anything
+                        // else raises as a fresh user exception.
+                        let err = SemaError::from_thrown(val);
                         handle_err!(self, fi, pc, err, pc - op::SIZE_OP, 'dispatch);
                     }
 
@@ -4386,6 +4388,12 @@ enum ExceptionAction {
 /// Convert a SemaError into a Sema map value.
 fn error_to_value(err: &SemaError) -> Value {
     let inner = err.inner();
+    // A re-raised condition IS its map already — hand it back unchanged so
+    // every catch layer binds the same value (its :stack-trace stays the
+    // original error's; the re-throw site adds nothing).
+    if let SemaError::Condition(condition) = inner {
+        return condition.clone();
+    }
     let mut map = BTreeMap::new();
     match inner {
         SemaError::Eval(msg) => {
@@ -4467,6 +4475,9 @@ fn error_to_value(err: &SemaError) -> Value {
         }
         SemaError::WithTrace { .. } | SemaError::WithContext { .. } => {
             unreachable!("inner() already unwraps these")
+        }
+        SemaError::Condition(_) => {
+            unreachable!("handled by the early return above")
         }
     }
 

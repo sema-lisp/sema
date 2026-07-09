@@ -824,13 +824,14 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
     });
 
     // R7RS `raise`: raise an arbitrary object as an exception. Identical to the
-    // `throw` special form (both build a `UserException`), but a first-class
-    // procedure so it can be passed around / partially applied. `guard` (and
-    // `try`/`catch`) recover the raised object via the `{:type :user :value ...}`
-    // error map; `guard` unwraps `:value` so its variable is the raw object.
+    // `throw` special form, but a first-class procedure so it can be passed
+    // around / partially applied. A raw object raises as a `UserException`,
+    // recovered via the `{:type :user :value ...}` error map (`guard` unwraps
+    // `:value` so its variable is the raw object); a caught condition map
+    // re-raises as itself, so nested catch/re-raise guards stay idempotent.
     register_fn(env, "raise", |args| {
         check_arity!(args, "raise", 1);
-        Err(SemaError::UserException(args[0].clone()))
+        Err(SemaError::from_thrown(args[0].clone()))
     });
 
     crate::register_fn_path_gated(env, sandbox, Caps::FS_WRITE, "file/append", &[0], |args| {

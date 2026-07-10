@@ -1,5 +1,5 @@
 import { readdirSync, readFileSync, writeFileSync, mkdirSync, existsSync, cpSync } from 'fs';
-import { join, basename } from 'path';
+import { join } from 'path';
 import { build } from 'esbuild';
 
 const EXAMPLES_DIR = 'examples';
@@ -77,17 +77,27 @@ await build({
   minify: false,
   sourcemap: true, // source-level debugging in DevTools (maps dist -> src)
   target: 'es2020',
-  external: ['../pkg/*'],
+  // '../pkg/*' is the WASM glue (loaded relative to dist/ at runtime, not part of
+  // the bundle). './sema-ui.js' is the vendored @sema-lang/ui bundle below — app.js
+  // imports `toast` from it; esbuild passes the specifier through unchanged, and
+  // since it's already loaded as a module script before app.js, the browser
+  // resolves both to the same dist/sema-ui.js module (no duplicate component
+  // registration).
+  external: ['../pkg/*', './sema-ui.js'],
 });
 console.log('Bundled dist/app.js + dist/sema-worker.js');
 
-// 3. Vendor the @sema-lang/ui web-component bundle (provides <sema-editor>). It
-//    comes from the published npm package (`npm install`); loaded by index.html
-//    before app.js.
-const SEMA_UI_SRC = 'node_modules/@sema-lang/ui/dist/sema-ui.js';
-if (existsSync(SEMA_UI_SRC)) {
-  cpSync(SEMA_UI_SRC, join(DIST_DIR, 'sema-ui.js'));
-  console.log('Vendored dist/sema-ui.js from @sema-lang/ui');
-} else {
-  console.warn(`WARNING: ${SEMA_UI_SRC} not found — run \`npm install\` first (<sema-editor> will be missing).`);
+// 3. Vendor the @sema-lang/ui web-component bundle (provides <sema-editor>) and its
+//    design tokens. Both come from the published npm package (`npm install`);
+//    loaded by index.html before app.js / style.css respectively.
+function vendorFromSemaUi(srcRelPath, destName, missingHint) {
+  const src = join('node_modules/@sema-lang/ui', srcRelPath);
+  if (existsSync(src)) {
+    cpSync(src, join(DIST_DIR, destName));
+    console.log(`Vendored dist/${destName} from @sema-lang/ui`);
+  } else {
+    console.warn(`WARNING: ${src} not found — run \`npm install\` first (${missingHint}).`);
+  }
 }
+vendorFromSemaUi('dist/sema-ui.js', 'sema-ui.js', '<sema-editor> will be missing');
+vendorFromSemaUi('src/styles/tokens.css', 'tokens.css', 'design tokens will be missing');

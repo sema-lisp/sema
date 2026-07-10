@@ -1,22 +1,6 @@
-:root {
-    --bg: #0c0c0c;
-    --bg-editor: #0a0a0a;
-    --bg-output: #080808;
-    --bg-toolbar: #111;
-    --border: #1e1e1e;
-    --border-focus: #333;
-    --gold: #c8a855;
-    --gold-dim: rgba(200, 168, 85, 0.5);
-    --gold-glow: rgba(200, 168, 85, 0.08);
-    --text: #a09888;
-    --text-bright: #d8d0c0;
-    --text-dim: #5a5448;
-    --error: #c85555;
-    --error-bg: rgba(200, 85, 85, 0.06);
-    --success: #6a9955;
-    --mono: 'JetBrains Mono', monospace;
-    --serif: 'Cormorant', Georgia, serif;
-  }
+/* Design tokens (--bg, --gold, --text-primary/secondary/tertiary, --mono, --serif,
+   etc.) come from dist/tokens.css, vendored from @sema-lang/ui and linked in
+   index.html before this file. Nothing playground-specific to override here. */
 
   * { margin: 0; padding: 0; box-sizing: border-box; }
 
@@ -24,7 +8,7 @@
 
   body {
     background: var(--bg);
-    color: var(--text);
+    color: var(--text-secondary);
     font-family: var(--mono);
     font-size: 14px;
     height: 100vh;
@@ -63,7 +47,7 @@
     font-size: 1rem;
     font-weight: 300;
     letter-spacing: 0.08em;
-    color: var(--text-dim);
+    color: var(--text-tertiary);
   }
 
   .header-right {
@@ -74,7 +58,7 @@
 
   .header-link {
     font-size: 0.75rem;
-    color: var(--text-dim);
+    color: var(--text-tertiary);
     text-decoration: none;
     transition: color 0.15s;
   }
@@ -84,7 +68,7 @@
   main {
     flex: 1;
     display: grid;
-    grid-template-columns: var(--sidebar-w, 200px) 4px 1fr 4px var(--right-col-w, 45fr);
+    grid-template-columns: var(--sidebar-w, 200px) 4px 1fr 4px var(--right-col-w, 480px);
     min-height: 0;
   }
 
@@ -109,7 +93,7 @@
     font-size: 0.7rem;
     letter-spacing: 0.08em;
     text-transform: uppercase;
-    color: var(--text-dim);
+    color: var(--text-tertiary);
   }
 
   .sidebar-tree {
@@ -124,26 +108,10 @@
   .vfs-tree-empty {
     padding: 1rem 0.75rem;
     font-size: 0.7rem;
-    color: var(--text-dim);
+    color: var(--text-tertiary);
     font-style: italic;
   }
 
-  /* ── File panel buttons ── */
-  .btn-upload, .btn-clear-vfs {
-    font-family: var(--mono);
-    font-size: 0.65rem;
-    padding: 0.2rem 0.5rem;
-    border-radius: 3px;
-    cursor: pointer;
-    border: 1px solid var(--border);
-    background: transparent;
-    color: var(--text-dim);
-    transition: color 0.15s, border-color 0.15s;
-  }
-  .btn-upload:hover, .btn-clear-vfs:hover {
-    color: var(--text);
-    border-color: var(--text-dim);
-  }
   .drop-overlay {
     position: absolute;
     inset: 0;
@@ -183,7 +151,7 @@
     font-size: 0.7rem;
     letter-spacing: 0.08em;
     text-transform: uppercase;
-    color: var(--text-dim);
+    color: var(--text-tertiary);
   }
 
   .editor-wrap {
@@ -192,219 +160,13 @@
     overflow: hidden;
     min-height: 0;
   }
-  .editor-highlight,
-  textarea#editor {
-    position: absolute;
-    top: 0; left: 0;
-    width: 100%;
-    height: 100%;
-    padding: 1.25rem 1.25rem 1.25rem calc(40px + 1rem);
-    font-family: var(--mono);
-    font-size: 13px;
-    line-height: 1.65;
-    tab-size: 2;
-    white-space: pre-wrap;
-    word-wrap: break-word;
-    overflow-wrap: break-word;
-    border: none;
-    margin: 0;
-  }
-  .editor-highlight {
-    pointer-events: none;
-    color: var(--text-bright);
-    background: var(--bg-editor);
-    z-index: 0;
-    overflow: auto;
-    scrollbar-width: thin;
-    scrollbar-color: var(--border) transparent;
-  }
-  textarea#editor {
-    color: transparent;
-    caret-color: var(--gold);
-    background: transparent;
-    outline: none;
-    resize: none;
-    z-index: 1;
-    -webkit-text-fill-color: transparent;
-    scrollbar-width: thin;
-    scrollbar-color: var(--border) transparent;
-  }
-  textarea#editor::placeholder { color: var(--text-dim); -webkit-text-fill-color: var(--text-dim); }
-  textarea#editor::selection { background: var(--gold); color: var(--bg); -webkit-text-fill-color: var(--bg); }
-  .editor-highlight.focused { background: #0b0b0b; }
-
-  /* ── Line number gutter ── */
-  .editor-gutter {
-    position: absolute;
-    top: 0;
-    left: 0;
-    width: 40px;
-    height: 100%;
-    padding-top: 1.25rem;
-    font-family: var(--mono);
-    font-size: 13px;
-    line-height: 1.65;
-    color: var(--text-dim);
-    background: var(--bg-editor);
-    border-right: 1px solid var(--border);
-    overflow: hidden;
-    z-index: 2;
-    user-select: none;
-    cursor: default;
-  }
-  .gutter-line {
-    padding: 0 6px 0 0;
-    text-align: right;
-    height: 1.65em;
-    position: relative;
-    cursor: pointer;
-    transition: color 0.1s;
-  }
-  .gutter-line:hover {
-    color: var(--text);
-  }
-  .gutter-line.breakpoint::before {
-    content: '●';
-    position: absolute;
-    left: 3px;
-    color: var(--error);
-    font-size: 10px;
-    line-height: 1.65em;
-  }
-  .gutter-line.breakpoint {
-    color: var(--error);
-  }
-  .gutter-line.current-line {
-    background: rgba(200, 168, 85, 0.15);
-    color: var(--gold);
-  }
-
-  /* ── Debug current line highlight ── */
-  .debug-line-highlight {
-    position: absolute;
-    left: 40px;
-    right: 0;
-    height: 1.65em;
-    background: rgba(200, 168, 85, 0.1);
-    border-left: 2px solid var(--gold);
-    pointer-events: none;
-    z-index: 0;
-  }
-
-  .hl-comment { color: var(--text-dim); font-style: italic; }
-  .hl-string { color: #a8c47a; }
-  .hl-keyword { color: var(--gold); }
-  .hl-number { color: #d19a66; }
-  .hl-boolean { color: #d19a66; }
-  .hl-keyword-lit { color: #7aacb8; }
-  .hl-paren { color: #6a6258; }
-
-  /* ── Run button ── */
-  .run-btn {
-    font-family: var(--mono);
-    font-size: 0.7rem;
-    letter-spacing: 0.05em;
-    color: var(--bg);
-    background: var(--gold);
-    border: none;
-    padding: 0.3rem 0.9rem;
-    border-radius: 3px;
-    cursor: pointer;
-    transition: opacity 0.15s;
-  }
-  .run-btn:hover { opacity: 0.85; }
-  .run-btn:active { opacity: 0.7; }
-  .run-btn:disabled {
-    opacity: 0.4;
-    cursor: not-allowed;
-  }
-
-  .run-btn.fmt-btn {
-    background: transparent;
-    color: var(--text-dim);
-    border: 1px solid var(--border);
-  }
-  .run-btn.fmt-btn:hover { opacity: 0.85; color: var(--gold); border-color: var(--gold); }
-
-  .run-btn .shortcut {
-    font-family: system-ui, -apple-system, sans-serif;
-    font-size: 0.6rem;
-    opacity: 0.7;
-    margin-left: 0.5rem;
-    background: rgba(0, 0, 0, 0.2);
-    font-weight: bold;
-    line-height: 1;
-    padding: 0.1rem 0.35rem;
-    border-radius: 4px;
-  }
-
-  /* ── Engine toggle ── */
-  .engine-toggle {
-    display: flex;
-    align-items: center;
-    gap: 0.5rem;
-    font-size: 0.65rem;
-    color: var(--text-dim);
-    letter-spacing: 0.04em;
-  }
-  .engine-toggle label {
-    cursor: pointer;
-    padding: 0.2rem 0.45rem;
-    border-radius: 3px;
-    transition: color 0.15s, background 0.15s;
-  }
-  .engine-toggle label:hover { color: var(--text); }
-  .engine-toggle label.active {
-    color: var(--gold);
-    background: var(--gold-glow);
-  }
-  .engine-toggle input[type="radio"] { display: none; }
-
-  .toggle-separator {
-    width: 1px;
-    height: 16px;
-    background: var(--border);
-  }
-
   /* ── Debug controls ── */
-  .debug-btn {
-    background: transparent;
-    color: var(--gold);
-    border: 1px solid var(--gold-dim);
-  }
-  .debug-btn:hover:not(:disabled) {
-    background: var(--gold-glow);
-  }
   .debug-controls {
     display: flex;
     align-items: center;
     gap: 0.25rem;
   }
   .debug-controls.hidden { display: none; }
-  .debug-ctrl-btn {
-    font-family: system-ui, -apple-system, sans-serif;
-    font-size: 0.8rem;
-    width: 28px;
-    height: 24px;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    border: 1px solid var(--border);
-    border-radius: 3px;
-    background: transparent;
-    color: var(--text);
-    cursor: pointer;
-    transition: background 0.15s, color 0.15s, border-color 0.15s;
-  }
-  .debug-ctrl-btn:hover {
-    background: var(--gold-glow);
-    color: var(--gold);
-    border-color: var(--gold-dim);
-  }
-  .debug-ctrl-btn.dbg-stop:hover {
-    color: var(--error);
-    border-color: var(--error);
-  }
 
   /* ── Debug variables panel ── */
   .debug-vars-panel {
@@ -416,7 +178,7 @@
     font-size: 0.65rem;
     letter-spacing: 0.08em;
     text-transform: uppercase;
-    color: var(--text-dim);
+    color: var(--text-tertiary);
     margin-bottom: 0.5rem;
   }
   .debug-var-row {
@@ -429,31 +191,11 @@
     color: var(--gold);
   }
   .debug-var-value {
-    color: var(--text-bright);
+    color: var(--text-primary);
   }
   .debug-var-type {
-    color: var(--text-dim);
+    color: var(--text-tertiary);
     font-size: 0.7rem;
-  }
-
-  /* ── Splitters ── */
-  .splitter {
-    background: var(--border);
-    flex-shrink: 0;
-    position: relative;
-    z-index: 5;
-    transition: background 0.15s;
-  }
-  .splitter:hover, .splitter.active {
-    background: var(--gold-dim);
-  }
-  .splitter-v {
-    width: 4px;
-    cursor: col-resize;
-  }
-  .splitter-h {
-    height: 4px;
-    cursor: row-resize;
   }
 
   /* ── Right column (output + files) ── */
@@ -482,7 +224,7 @@
     scrollbar-color: var(--border) transparent;
   }
 
-  .output-line { color: var(--text); white-space: pre; }
+  .output-line { color: var(--text-secondary); white-space: pre; }
   .output-value {
     color: var(--gold);
     border-left: 2px solid var(--gold-dim);
@@ -499,14 +241,14 @@
     white-space: pre-wrap;
   }
   .output-timing {
-    color: var(--text-dim);
+    color: var(--text-tertiary);
     font-size: 0.7rem;
     margin-top: 0.75rem;
     padding-top: 0.5rem;
     border-top: 1px solid var(--border);
   }
   .output-welcome {
-    color: var(--text-dim);
+    color: var(--text-tertiary);
     font-style: italic;
   }
 
@@ -542,32 +284,18 @@
     font-size: 13px;
     line-height: 1.65;
     white-space: pre-wrap;
-    color: var(--text);
+    color: var(--text-secondary);
     scrollbar-width: thin;
     scrollbar-color: var(--border) transparent;
   }
   .viewer-placeholder {
-    color: var(--text-dim);
+    color: var(--text-tertiary);
     font-style: italic;
   }
   .vfs-stats {
     font-size: 0.6rem;
-    color: var(--text-dim);
+    color: var(--text-tertiary);
   }
-  .btn-collapse {
-    font-family: var(--mono);
-    font-size: 0.7rem;
-    padding: 0.1rem 0.3rem;
-    border-radius: 3px;
-    cursor: pointer;
-    border: 1px solid var(--border);
-    background: transparent;
-    color: var(--text-dim);
-    transition: color 0.15s;
-    line-height: 1;
-  }
-  .btn-collapse:hover { color: var(--text); }
-
   /* ── Status bar ── */
   .status-bar {
     display: flex;
@@ -582,7 +310,7 @@
 
   .status-text {
     font-size: 0.65rem;
-    color: var(--text-dim);
+    color: var(--text-tertiary);
   }
 
   .status-ready { color: var(--success); }
@@ -613,7 +341,7 @@
   .loading-joke {
     font-family: var(--mono);
     font-size: 0.85rem;
-    color: var(--text-dim);
+    color: var(--text-tertiary);
     max-width: 380px;
     text-align: center;
     line-height: 1.5;
@@ -638,43 +366,6 @@
     50% { opacity: 1; }
   }
 
-  /* ── Tooltips ── */
-  [data-tooltip] {
-    position: relative;
-  }
-  [data-tooltip]::after {
-    content: attr(data-tooltip);
-    position: absolute;
-    bottom: calc(100% + 6px);
-    left: 50%;
-    transform: translateX(-50%);
-    background: #1a1a1a;
-    color: var(--text-bright);
-    font-family: var(--mono);
-    font-size: 0.65rem;
-    line-height: 1.4;
-    padding: 0.35rem 0.6rem;
-    border-radius: 4px;
-    border: 1px solid var(--border);
-    white-space: nowrap;
-    pointer-events: none;
-    opacity: 0;
-    transition: opacity 0.15s;
-    z-index: 100;
-  }
-  [data-tooltip]:hover::after {
-    opacity: 1;
-  }
-  [data-tooltip-pos="left"]::after {
-    left: 0;
-    transform: none;
-  }
-  [data-tooltip-pos="right"]::after {
-    left: auto;
-    right: 0;
-    transform: none;
-  }
-
   /* ── Responsive ── */
   @media (max-width: 768px) {
     main { grid-template-columns: 1fr; grid-template-rows: auto 1fr 1fr; }
@@ -682,5 +373,4 @@
     .editor-pane { border-right: none; border-bottom: 1px solid var(--border); }
     .files-body { grid-template-columns: 1fr; height: auto; }
     .file-tree-pane { border-right: none; border-bottom: 1px solid var(--border); max-height: 150px; }
-    .splitter-v { display: none; }
   }

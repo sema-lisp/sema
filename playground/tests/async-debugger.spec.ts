@@ -1,4 +1,5 @@
 import { test, expect, Page } from '@playwright/test';
+import { toggleBreakpoint, getCurrentDebugLine } from './gutter';
 
 // E2E gate (Slice 2): breakpoints INSIDE async tasks STOP + CONTINUE in the
 // cooperative WASM playground debugger. Modeled on debugger.spec.ts — same UI
@@ -12,24 +13,6 @@ async function waitForReady(page: Page) {
 
 async function setEditorCode(page: Page, code: string) {
   await page.getByTestId('editor').fill(code);
-}
-
-/** Click a gutter line number to toggle a breakpoint.
- *  `.gutter-line` is rendered inside <sema-editor> (from @sema-lang/ui, not this
- *  repo) with no exposed role/testid for individual line numbers — CSS nth-child
- *  is the only way to target a specific line. */
-async function toggleBreakpoint(page: Page, lineNum: number) {
-  await page.locator(`.gutter-line:nth-child(${lineNum})`).click();
-}
-
-/** Get the current line the debugger highlights.
- *  `.gutter-line` internals come from <sema-editor> (@sema-lang/ui) — see
- *  toggleBreakpoint for why CSS stays the fallback locator here. */
-async function getCurrentDebugLine(page: Page): Promise<number | null> {
-  const locator = page.locator('.gutter-line.current-line');
-  if ((await locator.count()) === 0) return null;
-  const text = await locator.textContent();
-  return text ? parseInt(text, 10) : null;
 }
 
 /** Get all error output. */

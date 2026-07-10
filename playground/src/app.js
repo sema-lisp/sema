@@ -3,6 +3,7 @@ import { examples } from './examples.js';
 import { makeVfsHost, BACKENDS } from './vfs-backends.js';
 import { initSplitters } from './splitters.js';
 import { workerEvalEnabled, initWorker, evalViaWorker, cancelWorker, setWorkerOutputHandler } from './worker-client.js';
+import { toast } from './sema-ui.js';
 
 let interp = null;
 // When true, eval runs on a Web Worker (real wall-clock async/sleep, responsive
@@ -141,6 +142,11 @@ function buildSidebar() {
 const fileTreeEl = document.getElementById('file-tree');
 const fileViewerEl = document.getElementById('file-viewer');
 
+// The persistent <sema-tree> root, built once and patched in place by
+// reconcileVfsItems() on every refresh (null while the VFS is empty and the
+// placeholder text is shown instead).
+let vfsTreeEl = null;
+
 function buildVfsTree(dir) {
   let entries;
   try { entries = interp.listFiles(dir); } catch { return []; }
@@ -162,46 +168,76 @@ function buildVfsTree(dir) {
 }
 
 // Dogfoods <sema-tree> like the examples sidebar: directories are expandable
-// parents (expanded by default so files are visible), files are selectable
-// leaves carrying their path. sema-tree owns the chevron, indentation,
-// expand/collapse, keyboard nav, and ARIA.
-function renderVfsItems(items, parent) {
+// parents, files are selectable leaves carrying their path. sema-tree owns the
+// chevron, indentation, expand/collapse, keyboard nav, and ARIA.
+//
+// Patches `parent`'s <sema-tree-item> children to match `items` in place:
+// existing nodes are matched by name+kind and reused, so a directory the user
+// collapsed stays collapsed across refreshes; only additions/removals touch
+// the DOM, and reordering moves existing nodes via insertBefore. Selection
+// (`.selected`) is out of scope here — refreshFileTree() resyncs it from
+// `activeFilePath` in one pass after the whole tree has settled.
+function reconcileVfsItems(items, parent) {
+  const existing = new Map();
+  for (const child of parent.children) {
+    if (child.tagName === 'SEMA-TREE-ITEM') existing.set(child.getAttribute('label'), child);
+  }
+
+  let prev = null;
   for (const item of items) {
-    const node = document.createElement('sema-tree-item');
-    node.setAttribute('label', item.name);
+    let node = existing.get(item.name);
+    if (node && node.hasAttribute('has-children') === item.isDir) {
+      existing.delete(item.name);
+    } else {
+      node = document.createElement('sema-tree-item');
+      node.setAttribute('label', item.name);
+      if (item.isDir) {
+        node.setAttribute('has-children', '');
+        node.setAttribute('expanded', ''); // directories start expanded
+      }
+    }
+
     if (item.isDir) {
-      node.setAttribute('has-children', '');
-      node.setAttribute('expanded', '');
-      renderVfsItems(item.children, node);
+      reconcileVfsItems(item.children, node);
     } else {
       node.dataset.path = item.fullPath;
-      if (item.fullPath === activeFilePath) node.selected = true;
     }
-    parent.appendChild(node);
+
+    const ref = prev ? prev.nextSibling : parent.firstChild;
+    if (ref !== node) parent.insertBefore(node, ref);
+    prev = node;
   }
+
+  // Anything left in `existing` was removed from the VFS (or changed kind).
+  for (const node of existing.values()) node.remove();
 }
 
 function refreshFileTree() {
   if (!interp) return;
-  fileTreeEl.innerHTML = '';
   const items = buildVfsTree('/');
 
   if (items.length === 0) {
-    const empty = document.createElement('div');
-    empty.className = 'vfs-tree-empty';
-    empty.textContent = '(empty — run code to create files)';
-    fileTreeEl.appendChild(empty);
+    vfsTreeEl = null;
+    fileTreeEl.innerHTML = '<div class="vfs-tree-empty">(empty — run code to create files)</div>';
     return;
   }
 
-  const tree = document.createElement('sema-tree');
-  renderVfsItems(items, tree);
-  // A leaf carries data-path; a directory click just toggles expansion.
-  tree.addEventListener('sema-tree-select', (e) => {
-    const path = e.detail.element?.dataset?.path;
-    if (path) viewFile(path);
-  });
-  fileTreeEl.appendChild(tree);
+  if (!vfsTreeEl) {
+    fileTreeEl.innerHTML = '';
+    vfsTreeEl = document.createElement('sema-tree');
+    // A leaf carries data-path; a directory click just toggles expansion.
+    vfsTreeEl.addEventListener('sema-tree-select', (e) => {
+      const path = e.detail.element?.dataset?.path;
+      if (path) viewFile(path);
+    });
+    fileTreeEl.appendChild(vfsTreeEl);
+  }
+
+  reconcileVfsItems(items, vfsTreeEl);
+
+  for (const node of vfsTreeEl.querySelectorAll('sema-tree-item[data-path]')) {
+    node.selected = node.dataset.path === activeFilePath;
+  }
 }
 
 // ── File Viewer ──
@@ -293,7 +329,7 @@ async function uploadFiles(fileList) {
   let uploaded = 0;
   for (const file of fileList) {
     if (file.size > 1024 * 1024) {
-      document.getElementById('status').textContent = `Skipped ${file.name} (>1MB)`;
+      toast.warning(`Skipped ${file.name} (>1MB)`);
       continue;
     }
     try {
@@ -302,13 +338,12 @@ async function uploadFiles(fileList) {
       interp.writeFile(path, text);
       uploaded++;
     } catch (e) {
-      document.getElementById('status').textContent = `Upload failed: ${e.message}`;
+      toast.error(`Upload failed: ${e.message}`);
     }
   }
 
   if (uploaded > 0) {
-    document.getElementById('status').textContent = `Uploaded ${uploaded} file(s) to /uploads/`;
-    document.getElementById('status').className = 'status-text status-ready';
+    toast.success(`Uploaded ${uploaded} file(s) to /uploads/`);
 
     if (backendName !== 'memory' && vfsBackend) {
       try { await vfsBackend.flush(vfsHost); } catch {}
@@ -326,9 +361,18 @@ async function uploadFiles(fileList) {
   refreshVfsStats();
 }
 
-// Clear VFS
-clearVfsBtn.addEventListener('click', async () => {
+// Clear VFS — gated behind a confirm dialog (destructive, irreversible).
+const clearVfsDialog = document.getElementById('clear-vfs-dialog');
+
+clearVfsBtn.addEventListener('click', () => {
   if (!interp) return;
+  clearVfsDialog.show();
+});
+
+document.getElementById('clear-vfs-cancel-btn').addEventListener('click', () => clearVfsDialog.close());
+
+document.getElementById('clear-vfs-confirm-btn').addEventListener('click', async () => {
+  clearVfsDialog.close();
   interp.resetVFS();
   if (vfsBackend?.reset) await vfsBackend.reset();
   activeFilePath = null;
@@ -435,7 +479,7 @@ async function run() {
     workerRunning = true;
     runBtn.textContent = 'Stop';
     runBtn.removeAttribute('shortcut'); // sema-button renders the shortcut badge; hide it while "Stop"
-    runBtn.classList.add('stop-btn');
+    runBtn.danger = true; // run-variant danger styling marks Stop as destructive
     statusEl.textContent = 'Running…';
     statusEl.className = 'status-text status-loading';
     // Clear now so streamed output lines (see setWorkerOutputHandler) land in a
@@ -463,7 +507,7 @@ async function run() {
     workerRunning = false;
     runBtn.textContent = 'Run';
     runBtn.setAttribute('shortcut', '⌘↵'); // restore the badge (rendered by sema-button)
-    runBtn.classList.remove('stop-btn');
+    runBtn.danger = false;
     const cancelled = result.error && result.error.includes('cancelled');
     statusEl.textContent = result.error ? (cancelled ? 'Stopped' : 'Error') : 'Ready';
     statusEl.className = result.error
@@ -517,7 +561,7 @@ async function run() {
     try {
       await vfsBackend.flush(vfsHost);
     } catch (e) {
-      document.getElementById('status').textContent = `Persist failed: ${e.message}`;
+      toast.error(`Persist failed: ${e.message}`);
     }
   }
 

@@ -1,4 +1,5 @@
 import { test, expect } from '@playwright/test';
+import { toggleBreakpoint, getCurrentDebugLine } from './gutter';
 
 test('debug exchange-rates via UI with HTTP fetch', async ({ page }) => {
   const logs: string[] = [];
@@ -16,10 +17,7 @@ test('debug exchange-rates via UI with HTTP fetch', async ({ page }) => {
   await page.getByTestId('editor').fill(code);
 
   // Set breakpoint on line 13 (the println after HTTP data is parsed).
-  // `.gutter-line` is rendered inside <sema-editor> (@sema-lang/ui, not this
-  // repo) with no exposed testid/role per line — CSS nth-child is the only way
-  // to target a specific line.
-  await page.locator('.gutter-line:nth-child(13)').click();
+  await toggleBreakpoint(page, 13);
 
   // Click Debug
   await page.getByTestId('debug-btn').click();
@@ -33,10 +31,8 @@ test('debug exchange-rates via UI with HTTP fetch', async ({ page }) => {
   const status = await page.getByTestId('status').textContent();
   console.log('Status after debug + HTTP:', status);
 
-  // The debugger should have stopped (either entry or breakpoint). Same
-  // ui-library caveat as above for `.gutter-line`.
-  const curLineLocator = page.locator('.gutter-line.current-line');
-  const lineNum = (await curLineLocator.count()) > 0 ? await curLineLocator.textContent() : 'null';
+  // The debugger should have stopped (either entry or breakpoint).
+  const lineNum = await getCurrentDebugLine(page);
   console.log('Stopped at line:', lineNum);
 
   // Continue to breakpoint at line 13

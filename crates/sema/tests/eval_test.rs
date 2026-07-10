@@ -2817,6 +2817,18 @@ eval_tests! {
     mutable_array_get_redefined: "(define (mutable-array/get a i) :mine) (mutable-array/get (mutable-array/new 1 5) 0)" => Value::keyword("mine"),
     // A let-bound shadow resolves locally (never the intrinsic).
     mutable_array_get_local_shadow: "(let ((mutable-array/get (fn (a i) :local))) (mutable-array/get 1 2))" => Value::keyword("local"),
+    // --- Sequence HOF / length interop (#91): the shared `get_sequence`
+    // coercion accepts a mutable-array by snapshotting it up front, so
+    // map/filter/for-each and generic `length` treat it like a list/vector.
+    mutable_array_map_interop: "(let ((a (mutable-array/new))) (mutable-array/push! a 5) (mutable-array/push! a 6) (map (lambda (x) (* x 2)) a))" => common::eval("'(10 12)"),
+    mutable_array_filter_interop: "(let ((a (mutable-array/new))) (mutable-array/push! a 1) (mutable-array/push! a 2) (mutable-array/push! a 3) (filter odd? a))" => common::eval("'(1 3)"),
+    // for-each returns nil; observe its effect by accumulating into a cell.
+    mutable_array_for_each_interop: "(let ((a (mutable-array/new)) (sum (mutable-cell/new 0))) (mutable-array/push! a 3) (mutable-array/push! a 4) (for-each (lambda (x) (mutable-cell/set! sum (+ (mutable-cell/get sum) x))) a) (mutable-cell/get sum))" => Value::int(7),
+    mutable_array_length_interop: "(let ((a (mutable-array/new))) (mutable-array/push! a 5) (mutable-array/push! a 6) (length a))" => Value::int(2),
+    // Reentrancy: the snapshot is taken before the loop, so a callback that
+    // grows the same array does not panic ("already borrowed") and iteration
+    // still ranges over the original two elements.
+    mutable_array_map_reentrant_snapshot: "(let ((a (mutable-array/new))) (mutable-array/push! a 1) (mutable-array/push! a 2) (map (lambda (x) (mutable-array/push! a 99) x) a))" => common::eval("'(1 2)"),
     mutable_cell_round_trip: "(let ((c (mutable-cell/new 1))) (mutable-cell/set! c 99) (mutable-cell/get c))" => Value::int(99),
     mutable_cell_shared_mutation: "(let* ((c (mutable-cell/new 0)) (d c)) (mutable-cell/set! c 5) (mutable-cell/get d))" => Value::int(5),
     mutable_cell_equal_by_contents: "(equal? (mutable-cell/new 1) (mutable-cell/new 1))" => Value::bool(true),

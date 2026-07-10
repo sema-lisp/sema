@@ -2806,9 +2806,15 @@ impl VM {
                             self.stack.push(Value::int(m.len() as i64));
                         } else if let Some(arr) = val.as_mutable_array() {
                             self.stack.push(Value::int(arr.items.borrow().len() as i64));
+                        } else if let Some(bv) = val.as_bytevector() {
+                            self.stack.push(Value::int(bv.len() as i64));
+                        } else if let Some(arr) = val.as_f64_array() {
+                            self.stack.push(Value::int(arr.len() as i64));
+                        } else if let Some(arr) = val.as_i64_array() {
+                            self.stack.push(Value::int(arr.len() as i64));
                         } else {
                             let err = SemaError::type_error(
-                                "list, vector, string, map, hashmap, or mutable-array",
+                                "list, vector, string, map, hashmap, bytevector, typed array, or mutable-array",
                                 val.type_name(),
                             );
                             handle_err!(self, fi, pc, err, pc - op::SIZE_OP, 'dispatch);

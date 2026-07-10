@@ -88,7 +88,7 @@ pub fn register(env: &sema_core::Env) {
             Ok(Value::int(arr.items.borrow().len() as i64))
         } else {
             Err(SemaError::type_error(
-                "list, vector, string, map, bytevector, typed array, or mutable-array",
+                "list, vector, string, map, hashmap, bytevector, typed array, or mutable-array",
                 args[0].type_name(),
             )
             .with_hint("length: expected a sequence or collection"))

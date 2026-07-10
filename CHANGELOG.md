@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+### Added
+
+- **`string/truncate-width`** (#92) — clamp a string to a target display width,
+  the truncation counterpart to `string/width`. Splits on grapheme-cluster
+  boundaries so wide glyphs (CJK, emoji) are never cut in half, and takes an
+  optional ellipsis string appended within the width budget. TUI cells that
+  clip long text (palette descriptions, tool-arg cells) no longer misalign by
+  falling back to a codepoint count.
+
 ### Changed
 
 - **`examples/sema-coder` moved to its own repo** (like the editor plugins) —

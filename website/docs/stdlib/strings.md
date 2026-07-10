@@ -205,6 +205,22 @@ which wraps a string in delimiters.
 (string/word-wrap "日本語 の テスト" 8)         ; => ("日本語" "の" "テスト")
 ```
 
+### `string/truncate-width`
+
+Clamp a string to a target **display width**, in columns — the truncation
+counterpart to `string/width`. Splits on grapheme-cluster boundaries, so wide
+characters (CJK, most emoji) are never cut in half. A string already at or
+under the width is returned unchanged; like `string/pad-left`/`string/pad-right`
+only pad, this only shrinks. An optional `ellipsis` string is appended within
+the width budget when the input is truncated.
+
+```sema
+(string/truncate-width "hello world" 5)        ; => "hello"
+(string/truncate-width "hi" 10)                ; => "hi"        ; already fits, unchanged
+(string/truncate-width "日本語です" 6)          ; => "日本語"
+(string/truncate-width "hello world" 6 "…")    ; => "hello…"
+```
+
 ### `string/number?`
 
 Test if a string represents a valid number.

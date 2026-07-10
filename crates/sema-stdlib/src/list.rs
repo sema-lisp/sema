@@ -192,6 +192,29 @@ pub fn register(env: &sema_core::Env) {
         }
     });
 
+    register_fn(env, "map-indexed", |args| {
+        check_arity!(args, "map-indexed", 2);
+        let items = get_sequence(&args[1], "map-indexed")?;
+        let mut result = Vec::with_capacity(items.len());
+        for (i, item) in items.iter().enumerate() {
+            result.push(call_function(
+                &args[0],
+                &[Value::int(i as i64), item.clone()],
+            )?);
+        }
+        Ok(Value::list(result))
+    });
+
+    register_fn(env, "enumerate", |args| {
+        check_arity!(args, "enumerate", 1);
+        let items = get_sequence(&args[0], "enumerate")?;
+        let mut result = Vec::with_capacity(items.len());
+        for (i, item) in items.iter().enumerate() {
+            result.push(Value::list(vec![Value::int(i as i64), item.clone()]));
+        }
+        Ok(Value::list(result))
+    });
+
     register_fn(env, "filter", |args| {
         check_arity!(args, "filter", 2);
         let items = get_sequence(&args[1], "filter")?;

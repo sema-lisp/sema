@@ -3491,6 +3491,18 @@
       "body": "Drop the leading elements of `seq` for which `pred` is truthy, returning the rest unchanged. Same as `list/drop-while`.\n\n```sema\n(drop-while (fn (x) (< x 4)) '(1 2 3 4 1))   ; => (4 1)\n```"
     },
     {
+      "name": "enumerate",
+      "module": "lists",
+      "section": "Higher-Order Functions",
+      "summary": "Pair each element of `seq` with its 0-based index, returning a list of `(index element)` lists. Accepts a list or vector; the input is never mutated and the result is always a list.",
+      "returns": "list",
+      "examples": [
+        "(enumerate '(10 20 30))   ; => ((0 10) (1 20) (2 30))\n(enumerate (vector 'a 'b)) ; => ((0 a) (1 b))"
+      ],
+      "body": "Pair each element of `seq` with its 0-based index, returning a list of `(index element)` lists. Accepts a list or vector; the input is never mutated and the result is always a list.\n\n```sema\n(enumerate '(10 20 30))   ; => ((0 10) (1 20) (2 30))\n(enumerate (vector 'a 'b)) ; => ((0 a) (1 b))\n```\n\n`(enumerate xs)` is equivalent to `(map-indexed list xs)`. See also: `map-indexed` (transform with the index instead of just pairing).",
+      "syntax": "(enumerate seq)"
+    },
+    {
       "name": "every",
       "module": "lists",
       "section": "Searching",
@@ -4175,6 +4187,18 @@
       ],
       "body": "Apply a function to each element of a list, collecting the results into a new list. The input is never mutated.\n\nGiven several lists, `map` walks them in lockstep, calling the function with one element from each. Iteration stops at the **shortest** list, so mismatched lengths are truncated rather than erroring.\n\n```sema\n(map (fn (x) (* x x)) '(1 2 3))   ; => (1 4 9)\n(map + '(1 2 3) '(10 20 30))      ; => (11 22 33)\n(map + '(1 2 3) '(10 20))         ; => (11 22)   ; stops at shortest\n```\n\nSee also: `mapcar` (alias), `for-each` (run side effects, discard results), `filter`/`list/reject` (keep/drop by predicate).",
       "syntax": "(map f lst ...)"
+    },
+    {
+      "name": "map-indexed",
+      "module": "lists",
+      "section": "Higher-Order Functions",
+      "summary": "Apply `f` to each element of `seq` along with its 0-based index, collecting the results into a new list. `f` is called as `(f index element)`. Accepts a list or vector; the input is never mutated and the result is always a list.",
+      "returns": "list",
+      "examples": [
+        "(map-indexed (fn (i x) (list i x)) '(10 20 30))   ; => ((0 10) (1 20) (2 30))\n(map-indexed (fn (i x) (+ i x)) (vector 10 20 30)) ; => (10 21 32)"
+      ],
+      "body": "Apply `f` to each element of `seq` along with its 0-based index, collecting the results into a new list. `f` is called as `(f index element)`. Accepts a list or vector; the input is never mutated and the result is always a list.\n\n```sema\n(map-indexed (fn (i x) (list i x)) '(10 20 30))   ; => ((0 10) (1 20) (2 30))\n(map-indexed (fn (i x) (+ i x)) (vector 10 20 30)) ; => (10 21 32)\n```\n\nSee also: `map` (no index), `enumerate` (pairs elements with their index without transforming them).",
+      "syntax": "(map-indexed f seq)"
     },
     {
       "name": "mapcar",

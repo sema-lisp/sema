@@ -1357,6 +1357,32 @@ eval_tests! {
 }
 
 // ============================================================
+// map-indexed and enumerate (#90)
+// ============================================================
+
+eval_tests! {
+    map_indexed_basic: "(map-indexed (fn (i x) (list i x)) '(10 20 30))"
+        => common::eval("'((0 10) (1 20) (2 30))"),
+    map_indexed_empty: "(map-indexed (fn (i x) (list i x)) '())" => Value::list(vec![]),
+    map_indexed_vector_input: "(map-indexed (fn (i x) (+ i x)) (vector 10 20 30))"
+        => Value::list(vec![Value::int(10), Value::int(21), Value::int(32)]),
+    map_indexed_index_only: "(map-indexed (fn (i x) i) '(a b c))"
+        => Value::list(vec![Value::int(0), Value::int(1), Value::int(2)]),
+
+    enumerate_basic: "(enumerate '(10 20 30))" => common::eval("'((0 10) (1 20) (2 30))"),
+    enumerate_empty: "(enumerate '())" => Value::list(vec![]),
+    enumerate_vector_input: "(enumerate (vector 'a 'b))" => common::eval("'((0 a) (1 b))"),
+    enumerate_then_map_destructure: "(map (fn (pair) (car pair)) (enumerate '(x y z)))"
+        => Value::list(vec![Value::int(0), Value::int(1), Value::int(2)]),
+}
+
+eval_error_tests! {
+    map_indexed_wrong_arity: "(map-indexed (fn (i x) x))" => "arity",
+    map_indexed_non_sequence_errors: "(map-indexed (fn (i x) x) 5)" => "list or vector",
+    enumerate_non_sequence_errors: "(enumerate 5)" => "list or vector",
+}
+
+// ============================================================
 // Input validation — negative counts/indices (C7, C8, C9)
 // ============================================================
 

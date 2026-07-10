@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+### Added
+
+- **`map-indexed` and `enumerate` builtins** (#90). `(map-indexed f xs)` calls
+  `f` with each element's 0-based index and value (`(f i x)`), collecting
+  results into a list; `(enumerate xs)` pairs each element with its index as
+  `(index element)` lists. Both accept a list or vector and always return a
+  list.
+
 ### Changed
 
 - **`examples/sema-coder` moved to its own repo** (like the editor plugins) —

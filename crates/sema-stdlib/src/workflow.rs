@@ -24,7 +24,10 @@ use sema_core::{SemaError, Value};
 use sema_workflow::context;
 use sema_workflow::event::WorkflowEvent;
 use std::collections::BTreeMap;
+use std::rc::Rc;
 use std::time::Instant;
+
+use crate::workflow_mcp::{self, ServerResolution, WorkflowMcpResolver};
 
 /// A keyword/string argument as a plain `String` (checkpoint keys, phase labels).
 fn as_name(v: &Value) -> Option<String> {
@@ -139,6 +142,67 @@ fn budget_failed_envelope() -> Value {
     Value::map(m)
 }
 
+/// The `{:status :needs-auth …}` envelope (docs/plans/2026-06-24-workflow-mcp-auth.md
+/// §3): `:servers` is the plain list of alias strings (plan-exact shape — a `sema
+/// mcp login <alias>` / dashboard consumer keys off it); `:auth` is the additive
+/// detail vector (server/url/persist) a login-guidance UI uses. `needs_auth` is
+/// `(alias, url, persist)` triples in resolution order.
+fn needs_auth_envelope(needs_auth: &[(String, String, String)]) -> Value {
+    let mut m = BTreeMap::new();
+    m.insert(Value::keyword("status"), Value::keyword("needs-auth"));
+    m.insert(
+        Value::keyword("servers"),
+        Value::list(
+            needs_auth
+                .iter()
+                .map(|(alias, _url, _persist)| Value::string(alias))
+                .collect(),
+        ),
+    );
+    m.insert(
+        Value::keyword("auth"),
+        Value::list(
+            needs_auth
+                .iter()
+                .map(|(alias, url, persist)| {
+                    let mut e = BTreeMap::new();
+                    e.insert(Value::keyword("server"), Value::string(alias));
+                    e.insert(Value::keyword("url"), Value::string(url));
+                    e.insert(Value::keyword("persist"), Value::string(persist));
+                    Value::map(e)
+                })
+                .collect(),
+        ),
+    );
+    Value::map(m)
+}
+
+/// Close a run BEFORE the body thunk ever ran: close the last open phase (a
+/// no-op — the implicit auth-resolution step runs before any `(phase …)`
+/// marker), emit `run.ended`, write `result.json`, drop the scope guard.
+/// Shared by every pre-body `:mcp` gate exit (an invalid declaration, no
+/// resolver registered, or the resolver reporting `Failed`/`NeedsAuth`) — on
+/// all of these the workflow body NEVER runs.
+fn end_run_before_body(
+    ctx: &context::WorkflowCtx,
+    guard: context::WorkflowGuard,
+    status: &str,
+    reason: String,
+    envelope: Value,
+) -> Value {
+    close_open_phase(ctx, status);
+    ctx.emit(WorkflowEvent::RunEnded {
+        seq: ctx.next_seq(),
+        ts: ctx.ts(),
+        status: status.into(),
+        reason: Some(reason),
+        dur_ms: ctx.dur_ms(),
+    });
+    ctx.write_result(&envelope);
+    drop(guard);
+    envelope
+}
+
 pub fn register(env: &sema_core::Env) {
     // (workflow/run name doc meta thunk) — open a run scope, journal start/end, return
     // the {:status ...} envelope. `name`/`doc` are strings; `meta` is the workflow's
@@ -180,6 +244,145 @@ pub fn register(env: &sema_core::Env) {
             });
         }
 
+        // ── Implicit :mcp auth-resolution step, before the body thunk ─────────
+        // (docs/plans/2026-06-24-workflow-mcp-auth.md §3). A workflow with no
+        // :mcp meta key parses to an empty Vec here (O(1) on the absent key), so
+        // every branch below is skipped and the body runs exactly as it did
+        // before this feature — byte-identical for the no-:mcp case.
+        let decls = match workflow_mcp::declared_mcp(&meta) {
+            Ok(d) => d,
+            Err(e) => {
+                let ctx = context::current()
+                    .ok_or_else(|| SemaError::eval("workflow/run: scope not established"))?;
+                let envelope = failed_envelope(&e.to_string());
+                return Ok(end_run_before_body(
+                    &ctx,
+                    guard,
+                    "failed",
+                    "mcp declaration invalid".to_string(),
+                    envelope,
+                ));
+            }
+        };
+
+        // Handles resolved below (if any), closed exactly once after the body
+        // exits (success, error, or budget-fail) further down.
+        let mut mcp_close: Option<(Rc<dyn WorkflowMcpResolver>, Vec<Value>)> = None;
+
+        if !decls.is_empty() {
+            let ctx = context::current()
+                .ok_or_else(|| SemaError::eval("workflow/run: scope not established"))?;
+            ctx.set_mcp_declared(decls.iter().map(|d| d.alias.clone()).collect());
+
+            let Some(resolver) = workflow_mcp::workflow_mcp_resolver() else {
+                let envelope = failed_envelope(
+                    "workflow declares :mcp servers but this build has no MCP resolver \
+                     registered",
+                );
+                return Ok(end_run_before_body(
+                    &ctx,
+                    guard,
+                    "failed",
+                    "mcp resolution failed".to_string(),
+                    envelope,
+                ));
+            };
+
+            let resolutions = resolver.resolve(&decls, &name, &ctx.run_id());
+
+            let mut connected: BTreeMap<String, Value> = BTreeMap::new();
+            let mut connected_handles: Vec<Value> = Vec::new();
+            let mut needs_auth: Vec<(String, String, String)> = Vec::new();
+            let mut failures: Vec<(String, String)> = Vec::new();
+
+            // Emit events per resolution IN THE GIVEN (alias-sorted) order — the
+            // resolver returns them in the same order as `decls`.
+            for resolution in &resolutions {
+                match resolution {
+                    ServerResolution::Connected {
+                        alias,
+                        handle,
+                        auth,
+                    } => {
+                        connected.insert(alias.clone(), handle.clone());
+                        connected_handles.push(handle.clone());
+                        if let Some(grant) = auth {
+                            ctx.emit(WorkflowEvent::AuthGranted {
+                                seq: ctx.next_seq(),
+                                ts: ctx.ts(),
+                                server: alias.clone(),
+                                scopes: grant.scopes.clone(),
+                                expires_at: grant.expires_at,
+                                source: grant.source.clone(),
+                            });
+                        }
+                    }
+                    ServerResolution::NeedsAuth {
+                        alias,
+                        url,
+                        scopes,
+                        tools,
+                        persist,
+                    } => {
+                        ctx.emit(WorkflowEvent::AuthRequired {
+                            seq: ctx.next_seq(),
+                            ts: ctx.ts(),
+                            server: alias.clone(),
+                            scopes: scopes.clone(),
+                            tools: tools.clone(),
+                            persist: persist.clone(),
+                        });
+                        needs_auth.push((alias.clone(), url.clone(), persist.clone()));
+                    }
+                    ServerResolution::Failed { alias, reason } => {
+                        ctx.emit(WorkflowEvent::AuthFailed {
+                            seq: ctx.next_seq(),
+                            ts: ctx.ts(),
+                            server: alias.clone(),
+                            reason: reason.clone(),
+                        });
+                        failures.push((alias.clone(), reason.clone()));
+                    }
+                }
+            }
+
+            // Outcome precedence: any Failed wins over any NeedsAuth. Both close
+            // whatever DID connect before ending the run — the body NEVER runs.
+            if !failures.is_empty() {
+                resolver.close(&connected_handles);
+                let msg = failures
+                    .iter()
+                    .map(|(alias, reason)| format!("{alias}: {reason}"))
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                let envelope = failed_envelope(&msg);
+                return Ok(end_run_before_body(
+                    &ctx,
+                    guard,
+                    "failed",
+                    "mcp resolution failed".to_string(),
+                    envelope,
+                ));
+            }
+            if !needs_auth.is_empty() {
+                resolver.close(&connected_handles);
+                let envelope = needs_auth_envelope(&needs_auth);
+                return Ok(end_run_before_body(
+                    &ctx,
+                    guard,
+                    "needs-auth",
+                    "authentication required".to_string(),
+                    envelope,
+                ));
+            }
+
+            // Every declared server connected: publish handles for
+            // workflow/mcp-handle, and remember (resolver, handles) so the tail
+            // below closes them EXACTLY once on every subsequent exit.
+            ctx.set_mcp_handles(connected);
+            mcp_close = Some((resolver, connected_handles));
+        }
+
         // Run the body thunk in the same VM.
         let result = crate::list::call_function(thunk, &[]);
 
@@ -193,6 +396,13 @@ pub fn register(env: &sema_core::Env) {
                 Some("workflow body returned an error".to_string()),
             ),
         };
+
+        // Close any resolved MCP handles exactly once, regardless of how the body
+        // exited (success, error, or the budget-fail decided just below). A no-op
+        // (mcp_close stays None) for a workflow with no :mcp — byte-identical.
+        if let Some((resolver, handles)) = mcp_close.take() {
+            resolver.close(&handles);
+        }
 
         if let Some(ctx) = context::current() {
             // A tripped budget cap fails the run regardless of the body's own outcome
@@ -469,6 +679,48 @@ pub fn register(env: &sema_core::Env) {
             // Read: return the stored value or nil.
             Ok(ctx.read_checkpoint(&key).unwrap_or_else(Value::nil))
         }
+    });
+
+    // (workflow/mcp-handle alias) — the resolved MCP connection handle for a
+    // declared `:mcp` alias (a symbol or keyword). Only meaningful once
+    // workflow/run's implicit auth-resolution step has completed: the
+    // `defworkflow` macro's generated `(let ((asana (workflow/mcp-handle
+    // (quote asana))) …) ,@body)` bindings live INSIDE the body thunk, which
+    // workflow/run only invokes after every declared server resolves to
+    // Connected — so that call site is always safe. A direct/manual call
+    // site (not the macro-generated one) is still handled defensively below.
+    crate::register_fn(env, "workflow/mcp-handle", |args| {
+        if args.len() != 1 {
+            return Err(SemaError::arity("workflow/mcp-handle", "1", args.len()));
+        }
+        let alias = args[0]
+            .as_symbol()
+            .or_else(|| args[0].as_keyword())
+            .ok_or_else(|| {
+                SemaError::type_error("symbol or keyword", args[0].type_name())
+                    .with_hint("e.g. (workflow/mcp-handle 'asana) or (workflow/mcp-handle :asana)")
+            })?;
+        let ctx = context::current().ok_or_else(|| {
+            SemaError::eval("workflow/mcp-handle outside a workflow/run")
+                .with_hint("call workflow/mcp-handle from inside a running workflow's body")
+        })?;
+        if let Some(handle) = ctx.mcp_handle(&alias) {
+            return Ok(handle);
+        }
+        if ctx.is_mcp_declared(&alias) {
+            return Err(SemaError::eval(format!(
+                "workflow/mcp-handle: `{alias}` is declared but this run has not resolved its \
+                 :mcp servers yet"
+            ))
+            .with_hint(
+                "workflow/mcp-handle is only valid inside the workflow body, after the \
+                 implicit auth-resolution step",
+            ));
+        }
+        Err(SemaError::eval(format!(
+            "workflow/mcp-handle: `{alias}` is not declared in this workflow's :mcp meta"
+        ))
+        .with_hint("declare it in :mcp {alias {...}} in the defworkflow meta map"))
     });
 
     // (workflow/check src) — static-check a workflow source string (or any value,

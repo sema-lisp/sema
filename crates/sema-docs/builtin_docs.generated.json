@@ -13756,6 +13756,16 @@
       "body": "Record or read a keyed checkpoint in the active workflow context. With two\narguments, `(workflow/checkpoint key thunk)` records and returns `(thunk)`,\nemits a `checkpoint` event with a `content_key`, and stores the canonical value\nin the run memo sidecar. On `--resume`, a memoized checkpoint returns the stored\nvalue before evaluating `thunk`, so expensive or side-effecting write thunks do\nnot rerun. With one argument, `(workflow/checkpoint key)` reads the value back\nfrom the run-scoped state bag, returning `nil` if the key has not been written.\nUsually written via the `checkpoint` macro, which wraps the write expression in\nthe thunk for you.\n\n```sema\n(workflow/checkpoint :files\n  (fn () (list \"a.php\" \"b.php\" \"c.php\")))   ; record + return\n\n(workflow/checkpoint :files)                ; read back\n```\n\nSee also: `checkpoint`, `workflow/run`, `workflow/phase`."
     },
     {
+      "name": "workflow/mcp-handle",
+      "module": "workflow",
+      "section": "Dynamic Workflows",
+      "summary": "The resolved MCP connection handle for a declared `:mcp` alias. `(workflow/mcp-handle alias)` takes a symbol or keyword and returns the opaque handle `workflow/run`'s implicit auth-resolution step connected for that alias, for use with `mcp/call`/`mcp/tools`/`mcp/tools->sema`. Only valid inside a workflow body, after resolution — `defworkflow` generates a `let` binding per declared `:mcp` alias that calls this for you, so most code never calls it directly. Errors (with a hint) if called outside a workflow run, for an alias not declared in the workflow's `:mcp` meta, or for an alias declared but not yet resolved.",
+      "examples": [
+        "(defworkflow triage\n  \"Triage new bugs into the Asana board.\"\n  {:mcp {asana {:url \"https://mcp.asana.com/mcp\" :auth {:scopes [\"default\"]}}}}\n  (phase \"Triage\")\n  ;; `asana` is already bound to (workflow/mcp-handle 'asana) by defworkflow.\n  (mcp/call asana \"create_task\" {\"name\" \"Fix the thing\"}))"
+      ],
+      "body": "The resolved MCP connection handle for a declared `:mcp` alias. `(workflow/mcp-handle alias)` takes a symbol or keyword and returns the opaque handle `workflow/run`'s implicit auth-resolution step connected for that alias, for use with `mcp/call`/`mcp/tools`/`mcp/tools->sema`. Only valid inside a workflow body, after resolution — `defworkflow` generates a `let` binding per declared `:mcp` alias that calls this for you, so most code never calls it directly. Errors (with a hint) if called outside a workflow run, for an alias not declared in the workflow's `:mcp` meta, or for an alias declared but not yet resolved.\n\n```sema\n(defworkflow triage\n  \"Triage new bugs into the Asana board.\"\n  {:mcp {asana {:url \"https://mcp.asana.com/mcp\" :auth {:scopes [\"default\"]}}}}\n  (phase \"Triage\")\n  ;; `asana` is already bound to (workflow/mcp-handle 'asana) by defworkflow.\n  (mcp/call asana \"create_task\" {\"name\" \"Fix the thing\"}))\n```\n\nSee also: `defworkflow`, `workflow/run`, `mcp/call`."
+    },
+    {
       "name": "workflow/phase",
       "module": "workflow",
       "section": "Dynamic Workflows",

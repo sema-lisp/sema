@@ -106,6 +106,19 @@ pub struct WorkflowCtx {
     /// Cached fixed-ts override (read once at construction). `Some` ⇒ deterministic
     /// seam: `ts()` returns this string and `dur_ms()` returns 0.
     fixed_ts: Option<String>,
+    /// Aliases declared in this run's `:mcp` meta (set once, right after the meta
+    /// map's `:mcp` key parses successfully — BEFORE auth-resolution runs), so
+    /// `workflow/mcp-handle` can tell "not declared" apart from "declared but this
+    /// run hasn't resolved its MCP servers yet" (docs/plans/2026-06-24-workflow-mcp-auth.md
+    /// §3). Empty for a workflow with no `:mcp`.
+    mcp_declared: RefCell<Vec<String>>,
+    /// Opaque, resolved MCP connection handles, keyed by declared alias. Populated
+    /// ONCE by `workflow/run`'s auth-resolution step, after every declared server
+    /// resolves to `Connected` (never partially — a `NeedsAuth`/`Failed` outcome
+    /// ends the run before the body runs at all). Values are `Value`s the resolver
+    /// handed back; this crate stays MCP-ignorant and never interprets them —
+    /// see `crates/sema-stdlib/src/workflow_mcp.rs`'s resolver seam.
+    mcp_handles: RefCell<BTreeMap<String, Value>>,
 }
 
 impl WorkflowCtx {
@@ -162,6 +175,8 @@ impl WorkflowCtx {
             args_json,
             args_fingerprint,
             fixed_ts,
+            mcp_declared: RefCell::new(Vec::new()),
+            mcp_handles: RefCell::new(BTreeMap::new()),
         })
     }
 
@@ -420,6 +435,32 @@ impl WorkflowCtx {
     /// Best-effort flush of the journal writer (e.g. at `run.ended`).
     pub fn flush(&self) {
         self.journal.borrow_mut().flush();
+    }
+
+    // ── MCP handle registry (docs/plans/2026-06-24-workflow-mcp-auth.md §3) ────
+
+    /// Record the aliases declared in this run's `:mcp` meta, BEFORE
+    /// auth-resolution runs. `workflow/mcp-handle` uses this to distinguish an
+    /// undeclared alias from one that's declared but not resolved yet.
+    pub fn set_mcp_declared(&self, aliases: Vec<String>) {
+        *self.mcp_declared.borrow_mut() = aliases;
+    }
+
+    /// Whether `alias` appears in this run's `:mcp` declarations.
+    pub fn is_mcp_declared(&self, alias: &str) -> bool {
+        self.mcp_declared.borrow().iter().any(|a| a == alias)
+    }
+
+    /// Install the resolved MCP handles for this run — called once, after every
+    /// declared server resolves to `Connected` and before the body thunk runs.
+    pub fn set_mcp_handles(&self, handles: BTreeMap<String, Value>) {
+        *self.mcp_handles.borrow_mut() = handles;
+    }
+
+    /// The resolved handle for a declared alias, if any (`None` before
+    /// resolution completes, or if `alias` was never declared).
+    pub fn mcp_handle(&self, alias: &str) -> Option<Value> {
+        self.mcp_handles.borrow().get(alias).cloned()
     }
 }
 
@@ -794,6 +835,38 @@ mod tests {
         assert_eq!(ctx.read_checkpoint("files"), None);
         ctx.store_checkpoint("files", Value::int(3));
         assert_eq!(ctx.read_checkpoint("files"), Some(Value::int(3)));
+    }
+
+    // ── MCP handle registry ──────────────────────────────────────────────
+
+    #[test]
+    fn mcp_handle_registry_starts_empty_and_undeclared() {
+        let ctx = WorkflowCtx::new("wf_t".into(), Journal::null(), BTreeMap::new());
+        assert_eq!(ctx.mcp_handle("asana"), None);
+        assert!(!ctx.is_mcp_declared("asana"));
+    }
+
+    #[test]
+    fn mcp_declared_tracks_aliases_before_handles_resolve() {
+        let ctx = WorkflowCtx::new("wf_t".into(), Journal::null(), BTreeMap::new());
+        ctx.set_mcp_declared(vec!["asana".to_string(), "fs".to_string()]);
+        // Declared, but resolution hasn't populated a handle yet.
+        assert!(ctx.is_mcp_declared("asana"));
+        assert_eq!(ctx.mcp_handle("asana"), None);
+        assert!(!ctx.is_mcp_declared("zebra"));
+    }
+
+    #[test]
+    fn mcp_handle_returns_resolved_handle_by_alias() {
+        let ctx = WorkflowCtx::new("wf_t".into(), Journal::null(), BTreeMap::new());
+        ctx.set_mcp_declared(vec!["asana".to_string(), "fs".to_string()]);
+        let mut handles = BTreeMap::new();
+        handles.insert("asana".to_string(), Value::string("mcp-1"));
+        handles.insert("fs".to_string(), Value::string("mcp-2"));
+        ctx.set_mcp_handles(handles);
+        assert_eq!(ctx.mcp_handle("asana"), Some(Value::string("mcp-1")));
+        assert_eq!(ctx.mcp_handle("fs"), Some(Value::string("mcp-2")));
+        assert_eq!(ctx.mcp_handle("nope"), None);
     }
 
     #[test]

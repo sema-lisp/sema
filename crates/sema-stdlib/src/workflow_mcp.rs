@@ -29,7 +29,9 @@
 //! and this runtime parser never disagree about what shape is valid.
 
 use sema_core::{SemaError, Value};
+use std::cell::RefCell;
 use std::collections::BTreeMap;
+use std::rc::Rc;
 
 // ── public types ─────────────────────────────────────────────────────────────
 
@@ -397,6 +399,104 @@ fn parse_persist(alias: &str, spec_map: &BTreeMap<Value, Value>) -> Result<McpPe
     }
 }
 
+// ── runtime resolver seam ────────────────────────────────────────────────────
+//
+// Crate-dependency law: sema-stdlib must NOT depend on sema-mcp. Everything
+// that requires OAuth/connect/close knowledge is behind [`WorkflowMcpResolver`],
+// implemented by the binary crate (`sema-lang`, `crates/sema/src/workflow_mcp.rs`)
+// over `sema-mcp` and installed via [`set_workflow_mcp_resolver`]. `workflow/run`
+// (`crates/sema-stdlib/src/workflow.rs`) is the ONLY caller of this seam — it
+// never touches `sema-mcp` types directly, only the [`McpDecl`]s above and the
+// opaque `Value` handles below. See `docs/plans/2026-06-24-workflow-mcp-auth.md` §3.
+
+/// One authorized server's auth provenance, for the `auth.granted` journal
+/// event. Redaction rule (plan §4): scopes + expiry only, NEVER token material.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AuthGrant {
+    pub scopes: Vec<String>,
+    pub expires_at: Option<u64>,
+    /// One of `"cached"`, `"refreshed"`, `"consented"`.
+    pub source: String,
+}
+
+/// One declared server's resolution outcome. [`WorkflowMcpResolver::resolve`]
+/// returns a `Vec` of these in the SAME (alias-sorted) order as the `decls` it
+/// was given, so `workflow/run` can emit events in a deterministic, replayable
+/// order (plan §7).
+#[derive(Debug, Clone)]
+pub enum ServerResolution {
+    /// Connected — silently from a cached/refreshed token, from fresh consent,
+    /// or because the server needs no auth at all. `handle` is an OPAQUE
+    /// `Value` (an `mcp/connect`-shaped handle); this crate never interprets
+    /// it, only stores it in the run's handle registry and hands it back to
+    /// [`WorkflowMcpResolver::close`]. `auth` is `Some` only when an OAuth
+    /// grant was actually involved (absent for stdio / open / bring-your-own
+    /// `:headers` servers).
+    Connected {
+        alias: String,
+        handle: Value,
+        auth: Option<AuthGrant>,
+    },
+    /// No usable session could be found (or refreshed) for this server; the
+    /// run gates here — the headless precursor of plan §3. `url` is the MCP
+    /// server endpoint (for login guidance); `scopes`/`tools`/`persist` mirror
+    /// the declaration, for the consent/manifest surface.
+    NeedsAuth {
+        alias: String,
+        url: String,
+        scopes: Vec<String>,
+        tools: Vec<String>,
+        persist: String,
+    },
+    /// The server could not be resolved for a reason OTHER than missing auth
+    /// (bad config, network/process error, sandbox denial, a connect that
+    /// otherwise rejected the handshake, …).
+    Failed { alias: String, reason: String },
+}
+
+/// Implemented by the binary crate over `sema-mcp`; the sole crossing point
+/// from the leaf runtime into MCP/OAuth territory.
+pub trait WorkflowMcpResolver {
+    /// Resolve every declared server for one run. `workflow` is the
+    /// `defworkflow` name and `run_id` the active run's id — both are for the
+    /// resolver's own bookkeeping (e.g. naming a `:persist :workflow`/`:run`
+    /// directory), not interpreted by this crate.
+    fn resolve(&self, decls: &[McpDecl], workflow: &str, run_id: &str) -> Vec<ServerResolution>;
+
+    /// Best-effort close of every handle previously returned as `Connected`.
+    /// MUST NOT panic or otherwise abort the caller — `workflow/run` calls
+    /// this from its failure/cleanup paths, where a close error must never
+    /// mask (or replace) the real outcome being reported.
+    fn close(&self, handles: &[Value]);
+}
+
+thread_local! {
+    /// The process' registered resolver, if any. `None` means "this build has
+    /// no MCP resolver" — `workflow/run` turns that into a failed envelope
+    /// with a hint, rather than panicking or silently skipping the gate.
+    static RESOLVER: RefCell<Option<Rc<dyn WorkflowMcpResolver>>> = const { RefCell::new(None) };
+}
+
+/// Install the process' [`WorkflowMcpResolver`]. The binary crate (`sema-lang`)
+/// does this alongside `sema_mcp::register_mcp_builtins`, so every path that can
+/// run a workflow (REPL, `sema run`, `sema workflow run`) has one. Replaceable —
+/// a test installs a fake resolver by calling this again; there is deliberately
+/// no "already set" guard, since tests routinely swap it between cases.
+pub fn set_workflow_mcp_resolver(r: Rc<dyn WorkflowMcpResolver>) {
+    RESOLVER.with(|slot| *slot.borrow_mut() = Some(r));
+}
+
+/// Clear the registered resolver (test teardown / isolating one test's fake
+/// resolver from the next).
+pub fn clear_workflow_mcp_resolver() {
+    RESOLVER.with(|slot| *slot.borrow_mut() = None);
+}
+
+/// The active resolver on this thread, if one is registered.
+pub fn workflow_mcp_resolver() -> Option<Rc<dyn WorkflowMcpResolver>> {
+    RESOLVER.with(|slot| slot.borrow().clone())
+}
+
 // ── tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -724,5 +824,50 @@ mod tests {
             e.to_string().contains("asana"),
             "error should name the alias"
         );
+    }
+
+    // ── resolver seam ────────────────────────────────────────────────────
+
+    struct StubResolver;
+    impl WorkflowMcpResolver for StubResolver {
+        fn resolve(
+            &self,
+            _decls: &[McpDecl],
+            _workflow: &str,
+            _run_id: &str,
+        ) -> Vec<ServerResolution> {
+            Vec::new()
+        }
+        fn close(&self, _handles: &[Value]) {}
+    }
+
+    // These three tests share the process-global thread-local RESOLVER slot;
+    // each leaves it cleared on exit so it can't leak into another test in
+    // this binary (cargo runs unit tests within one binary on multiple
+    // threads by default, but the thread-local means each test thread has its
+    // own slot anyway — clearing is just good hygiene, not a race guard).
+
+    #[test]
+    fn resolver_slot_starts_empty() {
+        clear_workflow_mcp_resolver();
+        assert!(workflow_mcp_resolver().is_none());
+    }
+
+    #[test]
+    fn set_workflow_mcp_resolver_installs_it() {
+        set_workflow_mcp_resolver(Rc::new(StubResolver));
+        assert!(workflow_mcp_resolver().is_some());
+        clear_workflow_mcp_resolver();
+    }
+
+    #[test]
+    fn set_workflow_mcp_resolver_is_replaceable() {
+        set_workflow_mcp_resolver(Rc::new(StubResolver));
+        let first = workflow_mcp_resolver().unwrap();
+        set_workflow_mcp_resolver(Rc::new(StubResolver));
+        let second = workflow_mcp_resolver().unwrap();
+        // Replacing installs a genuinely different Rc (not a no-op / same pointer).
+        assert!(!Rc::ptr_eq(&first, &second));
+        clear_workflow_mcp_resolver();
     }
 }

@@ -8,16 +8,19 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashMap};
-use std::sync::mpsc::{channel, Receiver};
+use std::sync::mpsc::{channel, Receiver, Sender};
 
-use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
+use notify::{Event, EventKind, RecursiveMode, Watcher};
 use sema_core::{check_arity, Caps, SemaError, Value};
 
 use crate::register_fn;
 
 struct Watch {
-    _watcher: RecommendedWatcher,
     rx: Receiver<Event>,
+    // Dropping this ends the background watcher thread (its `recv` errors),
+    // which drops the watcher and stops watching — so removing the registry
+    // entry (`fs/unwatch`) tears the watch down.
+    _stop: Sender<()>,
 }
 
 thread_local! {
@@ -52,36 +55,48 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
             .map(|v| v.is_truthy())
             .unwrap_or(true);
 
-        let (tx, rx) = channel();
-        let mut watcher = notify::recommended_watcher(move |res: notify::Result<Event>| {
-            if let Ok(ev) = res {
-                let _ = tx.send(ev);
-            }
-        })
-        .map_err(|e| SemaError::Io(format!("fs/watch: {e}")))?;
+        // Surface the common error (bad path) synchronously; the actual
+        // registration below runs off-thread and can't report back.
+        if !std::path::Path::new(path).exists() {
+            return Err(SemaError::Io(format!(
+                "fs/watch {path}: no such file or directory"
+            )));
+        }
         let mode = if recursive {
             RecursiveMode::Recursive
         } else {
             RecursiveMode::NonRecursive
         };
-        watcher
-            .watch(std::path::Path::new(path), mode)
-            .map_err(|e| SemaError::Io(format!("fs/watch {path}: {e}")))?;
+
+        let (tx, rx) = channel();
+        let (stop_tx, stop_rx) = channel::<()>();
+        let path = path.to_string();
+        // Establish the watch on a background thread: a recursive registration
+        // over a large tree (or a filesystem root) can take a long time and must
+        // never block the caller — e.g. `sema web`, which creates this watcher
+        // before binding its HTTP server. The watcher lives on this thread and
+        // is dropped (stopping the watch) once `stop_tx` in the registry entry
+        // is dropped.
+        std::thread::spawn(move || {
+            let mut watcher =
+                match notify::recommended_watcher(move |res: notify::Result<Event>| {
+                    if let Ok(ev) = res {
+                        let _ = tx.send(ev);
+                    }
+                }) {
+                    Ok(w) => w,
+                    Err(_) => return,
+                };
+            let _ = watcher.watch(std::path::Path::new(&path), mode);
+            let _ = stop_rx.recv(); // park until the registry entry is dropped
+        });
 
         let id = NEXT_ID.with(|n| {
             let id = n.get();
             n.set(id + 1);
             id
         });
-        WATCHERS.with(|w| {
-            w.borrow_mut().insert(
-                id,
-                Watch {
-                    _watcher: watcher,
-                    rx,
-                },
-            )
-        });
+        WATCHERS.with(|w| w.borrow_mut().insert(id, Watch { rx, _stop: stop_tx }));
         Ok(Value::int(id))
     });
 

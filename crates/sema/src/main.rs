@@ -66,7 +66,11 @@ mod pkg;
 mod repl;
 mod web;
 mod workflow_check;
-mod workflow_view;
+// The dashboard server itself lives in the `sema` LIBRARY crate
+// (`crates/sema/src/lib.rs` → `pub mod workflow_view;`), not here, so
+// `crates/sema/tests/*.rs` integration tests can drive it in-process. Referenced
+// below as `sema::workflow_view::…`.
+use sema::workflow_view;
 
 /// Read a source file with consistent, friendly error messages.
 ///

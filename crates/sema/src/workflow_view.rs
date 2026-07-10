@@ -7,24 +7,53 @@
 //! live-tail cursor) is a later upgrade; this spike parses the frozen journal
 //! client-side and polls while a run is still `running`.
 //!
-//! Security: loopback-only by default and NO auth — the same trusted-local-developer
-//! tool model the notebook server documents. Binding a non-loopback host exposes the
-//! run directory's contents to the network; that is the operator's responsibility.
+//! Security: loopback-only by default. GET routes are unauthenticated — the same
+//! trusted-local-developer tool model the notebook server documents. Binding a
+//! non-loopback host exposes the run directory's contents (and, per below, the
+//! write endpoints) to the network; that is the operator's responsibility.
+//!
+//! **Write-route hardening (plan §8):** `connect`/`forget` (`connect` module)
+//! can trigger a real OAuth consent screen, so "loopback + no auth" alone is not
+//! enough for those two routes — a malicious local page could otherwise POST to
+//! them blind. At startup this server mints a random 32-hex session token
+//! (`sema_mcp::random_hex_token`) and substitutes it into the served HTML in
+//! place of the `__SEMA_VIEW_TOKEN__` placeholder (see `route`'s `"/"` case).
+//! Every write route requires header `X-Sema-View-Token: <token>` matching
+//! exactly; missing or wrong is a `403` with no side effects. This is
+//! deliberately cheap, not a rewrite: the custom header ALSO forces a CORS
+//! preflight on any cross-origin request, which this server never answers (no
+//! `Access-Control-Allow-Origin` handling at all), so a third-party page's
+//! browser-issued `fetch` can't even reach the route; the token defeats a
+//! same-origin/drive-by guess. GET routes stay unauthenticated (read-only,
+//! same trust model as before).
 //!
 //! No new crate dependency: a ~hand-rolled HTTP/1.1 handler over the `tokio` net/io
-//! the binary already pulls in (the notebook uses axum; a 4-route read-only static
-//! server does not need it).
+//! the binary already pulls in (the notebook uses axum; a handful of routes does
+//! not need it).
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
 pub mod auth;
+mod connect;
 pub mod ingest;
+
+use connect::ServerState;
+
+/// The common write/read-route response shape: `(status line, content-type,
+/// body)`. `status`/`content_type` are always `'static` literals; `body` is
+/// the one owned/dynamic piece.
+pub(crate) type JsonResponse = (&'static str, &'static str, Vec<u8>);
 
 const INDEX_HTML: &str = include_str!("workflow_view/index.html");
 const ALPINE_JS: &str = include_str!("workflow_view/alpine.min.js");
+/// Substituted for the real per-process session token at response time (see
+/// the module doc's §8 note). Must match the placeholder literal embedded in
+/// `workflow_view/index.html`'s `<script>`.
+const VIEW_TOKEN_PLACEHOLDER: &str = "__SEMA_VIEW_TOKEN__";
 
 /// Serve the viewer for the runs under `run_dir`, exiting the process on a bind
 /// failure. Used by the standalone `sema workflow view` command.
@@ -50,12 +79,46 @@ pub async fn serve_result(
         println!("Sema workflow viewer:  http://{addr}");
         println!("  runs: {}", run_dir.display());
     }
+    let state = Arc::new(ServerState::new(
+        run_dir,
+        sema_mcp::random_hex_token(),
+        None,
+    ));
+    accept_loop(listener, state).await;
+    Ok(())
+}
+
+/// TEST-ONLY seam: bind an ephemeral loopback port and serve it in the
+/// background, returning the bound address and the minted session token so an
+/// integration test's own HTTP client can drive the write endpoints (with the
+/// correct `X-Sema-View-Token`) without guessing or parsing it out of the HTML.
+/// `opener` overrides the browser opener `connect` hands to
+/// `sema_mcp::login_interactive` — the same `LoopbackDriver::with_opener` seam
+/// `workflow_mcp_interactive_test.rs`'s `visiting_opener` drives, extended to
+/// this server. `None` uses the real, sandbox-gated opener (never exercised in
+/// tests — CI has no browser and no display).
+///
+/// Not used by any CLI path; `serve`/`serve_result` above are what `sema
+/// workflow view` actually runs.
+pub async fn serve_test(
+    run_dir: PathBuf,
+    opener: Option<connect::TestOpenerFn>,
+) -> std::io::Result<(std::net::SocketAddr, String)> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let token = sema_mcp::random_hex_token();
+    let state = Arc::new(ServerState::new(run_dir, token.clone(), opener));
+    tokio::spawn(accept_loop(listener, state));
+    Ok((addr, token))
+}
+
+async fn accept_loop(listener: TcpListener, state: Arc<ServerState>) {
     loop {
         match listener.accept().await {
             Ok((stream, _)) => {
-                let run_dir = run_dir.clone();
+                let state = Arc::clone(&state);
                 tokio::spawn(async move {
-                    let _ = handle(stream, &run_dir).await;
+                    let _ = handle(stream, state).await;
                 });
             }
             Err(e) => eprintln!("workflow view: accept error: {e}"),
@@ -65,8 +128,10 @@ pub async fn serve_result(
 
 /// Read one request, route it, write one response, close. (No keep-alive — fine for
 /// a local dev viewer; the browser opens fresh connections per fetch.)
-async fn handle(mut stream: TcpStream, run_dir: &Path) -> std::io::Result<()> {
-    // Read until end of headers. Requests here are tiny (GET, no body).
+async fn handle(mut stream: TcpStream, state: Arc<ServerState>) -> std::io::Result<()> {
+    // Read until end of headers. Requests here are tiny (GET, or a POST with no
+    // body — the write routes carry everything they need in the URL + the
+    // X-Sema-View-Token header, never a body).
     let mut buf = Vec::with_capacity(1024);
     let mut tmp = [0u8; 1024];
     loop {
@@ -80,15 +145,11 @@ async fn handle(mut stream: TcpStream, run_dir: &Path) -> std::io::Result<()> {
         }
     }
     let head = String::from_utf8_lossy(&buf);
-    let path = head
-        .lines()
-        .next()
-        .and_then(|line| line.split_whitespace().nth(1))
-        .unwrap_or("/");
+    let (method, path, token_header) = parse_request(&head);
     // Strip any query string before routing.
     let path = path.split('?').next().unwrap_or("/");
 
-    let (status, content_type, body): (&str, &str, Vec<u8>) = route(path, run_dir);
+    let (status, content_type, body) = route(method, path, token_header.as_deref(), &state);
     let resp = format!(
         "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\nCache-Control: no-store\r\n\r\n",
         body.len()
@@ -98,58 +159,124 @@ async fn handle(mut stream: TcpStream, run_dir: &Path) -> std::io::Result<()> {
     stream.flush().await
 }
 
-fn route(path: &str, run_dir: &Path) -> (&'static str, &'static str, Vec<u8>) {
-    if path == "/" {
-        return ("200 OK", "text/html; charset=utf-8", INDEX_HTML.into());
+/// Parse the request line's method + path, plus the `X-Sema-View-Token` header
+/// (case-insensitive name, per RFC 7230) if present. Any other header is
+/// ignored — this server has no use for them.
+fn parse_request(head: &str) -> (&str, &str, Option<String>) {
+    let mut lines = head.lines();
+    let request_line = lines.next().unwrap_or("");
+    let mut parts = request_line.split_whitespace();
+    let method = parts.next().unwrap_or("GET");
+    let path = parts.next().unwrap_or("/");
+
+    let mut token = None;
+    for line in lines {
+        if line.is_empty() {
+            break;
+        }
+        if let Some((name, value)) = line.split_once(':') {
+            if name.trim().eq_ignore_ascii_case("x-sema-view-token") {
+                token = Some(value.trim().to_string());
+            }
+        }
     }
-    if path == "/alpine.min.js" {
+    (method, path, token)
+}
+
+fn not_found() -> JsonResponse {
+    ("404 Not Found", "text/plain", b"no such run/file".to_vec())
+}
+
+fn forbidden() -> JsonResponse {
+    (
+        "403 Forbidden",
+        "application/json",
+        br#"{"error":"missing or invalid X-Sema-View-Token"}"#.to_vec(),
+    )
+}
+
+fn route(
+    method: &str,
+    path: &str,
+    token_header: Option<&str>,
+    state: &Arc<ServerState>,
+) -> JsonResponse {
+    if method == "GET" && path == "/" {
+        let body = INDEX_HTML.replacen(VIEW_TOKEN_PLACEHOLDER, &state.token, 1);
+        return ("200 OK", "text/html; charset=utf-8", body.into_bytes());
+    }
+    if method == "GET" && path == "/alpine.min.js" {
         return (
             "200 OK",
             "application/javascript; charset=utf-8",
             ALPINE_JS.into(),
         );
     }
-    if path == "/api/runs" {
+    if method == "GET" && path == "/api/runs" {
         return (
             "200 OK",
             "application/json",
-            list_runs(run_dir).into_bytes(),
+            list_runs(&state.run_dir).into_bytes(),
         );
     }
     // Additive cross-run index (SQLite projection): a rich runs list with status, agent
     // count, tokens, and NULL-aware cost. Leaves the per-run JSONL routes untouched.
-    if path == "/api/index/runs" {
-        return ("200 OK", "application/json", index_runs_json(run_dir));
+    if method == "GET" && path == "/api/index/runs" {
+        return (
+            "200 OK",
+            "application/json",
+            index_runs_json(&state.run_dir),
+        );
     }
-    // /api/run/<id>/<file> — <id> a single safe segment, <file> a whitelisted name.
+    // /api/run/<id>/… — <id> a single safe segment.
     if let Some(rest) = path.strip_prefix("/api/run/") {
-        if let Some((id, file)) = rest.split_once('/') {
+        let segs: Vec<&str> = rest.split('/').collect();
+        match (method, segs.as_slice()) {
             // Read-only MCP auth status, derived server-side from the journal +
-            // metadata manifest (never the token store — see `auth`'s module doc).
-            if file == "auth" {
+            // metadata manifest + this process's own in-memory flow state (never
+            // the token store itself — see `auth`'s module doc).
+            ("GET", [id, "auth"]) => {
                 if is_safe_segment(id) {
+                    let overrides = state.flow_snapshot(id);
                     return (
                         "200 OK",
                         "application/json",
-                        auth::auth_status_json(run_dir, id),
+                        auth::auth_status_json(&state.run_dir, id, &overrides),
                     );
                 }
-                return ("404 Not Found", "text/plain", b"no such run/file".to_vec());
+                not_found()
             }
-            let (ctype, ok) = match file {
-                "events.jsonl" => ("application/x-ndjson", true),
-                "result.json" | "metadata.json" | "args.json" => ("application/json", true),
-                _ => ("", false),
-            };
-            if ok && is_safe_segment(id) {
-                if let Ok(bytes) = std::fs::read(run_dir.join(id).join(file)) {
-                    return ("200 OK", ctype, bytes);
+            // Write routes: token required BEFORE any validation/side effect —
+            // a wrong/missing token must never reveal whether a run or alias
+            // exists, and must never start a flow.
+            ("POST", [id, "auth", alias, action @ ("connect" | "forget")]) => {
+                if token_header != Some(state.token.as_str()) {
+                    return forbidden();
+                }
+                match *action {
+                    "connect" => connect::handle_connect(state, id, alias),
+                    "forget" => connect::handle_forget(state, id, alias),
+                    _ => unreachable!("action is exactly \"connect\" or \"forget\""),
                 }
             }
+            ("GET", [id, file]) => {
+                let (ctype, ok) = match *file {
+                    "events.jsonl" => ("application/x-ndjson", true),
+                    "result.json" | "metadata.json" | "args.json" => ("application/json", true),
+                    _ => ("", false),
+                };
+                if ok && is_safe_segment(id) {
+                    if let Ok(bytes) = std::fs::read(state.run_dir.join(id).join(file)) {
+                        return ("200 OK", ctype, bytes);
+                    }
+                }
+                not_found()
+            }
+            _ => not_found(),
         }
-        return ("404 Not Found", "text/plain", b"no such run/file".to_vec());
+    } else {
+        ("404 Not Found", "text/plain", b"not found".to_vec())
     }
-    ("404 Not Found", "text/plain", b"not found".to_vec())
 }
 
 /// JSON array of run-ids: immediate child dirs of `run_dir` that contain an
@@ -207,6 +334,16 @@ fn is_safe_segment(s: &str) -> bool {
 mod tests {
     use super::*;
 
+    const TEST_TOKEN: &str = "test-token-0123456789abcdef0123456789abcdef";
+
+    fn test_state(dir: &Path) -> Arc<ServerState> {
+        Arc::new(ServerState::new(
+            dir.to_path_buf(),
+            TEST_TOKEN.to_string(),
+            None,
+        ))
+    }
+
     #[test]
     fn safe_segment_rejects_traversal() {
         assert!(is_safe_segment("content-live4"));
@@ -222,39 +359,95 @@ mod tests {
     #[test]
     fn static_routes_resolve() {
         let dir = std::path::Path::new("/nonexistent-run-dir");
-        let (s1, ct1, b1) = route("/", dir);
+        let state = test_state(dir);
+        let (s1, ct1, b1) = route("GET", "/", None, &state);
         assert_eq!(s1, "200 OK");
         assert!(ct1.starts_with("text/html"));
         assert!(!b1.is_empty());
+        // The session token is substituted into the served HTML, and the raw
+        // placeholder never leaks through.
+        let text1 = String::from_utf8(b1).unwrap();
+        assert!(text1.contains(TEST_TOKEN), "{text1}");
+        assert!(!text1.contains("__SEMA_VIEW_TOKEN__"), "{text1}");
 
-        let (s2, ct2, _) = route("/alpine.min.js", dir);
+        let (s2, ct2, _) = route("GET", "/alpine.min.js", None, &state);
         assert_eq!(s2, "200 OK");
         assert!(ct2.contains("javascript"));
 
         // Unknown run dir → empty runs list, still valid JSON.
-        let (s3, _, b3) = route("/api/runs", dir);
+        let (s3, _, b3) = route("GET", "/api/runs", None, &state);
         assert_eq!(s3, "200 OK");
         assert_eq!(String::from_utf8(b3).unwrap(), "[]");
 
         // Traversal in the run id → 404, never reads outside run_dir.
-        let (s4, _, _) = route("/api/run/../../etc/events.jsonl", dir);
+        let (s4, _, _) = route("GET", "/api/run/../../etc/events.jsonl", None, &state);
         assert_eq!(s4, "404 Not Found");
 
-        let (s5, _, _) = route("/nope", dir);
+        let (s5, _, _) = route("GET", "/nope", None, &state);
         assert_eq!(s5, "404 Not Found");
     }
 
     #[test]
     fn auth_route_resolves_and_rejects_traversal() {
         let dir = std::path::Path::new("/nonexistent-run-dir");
+        let state = test_state(dir);
         // Unknown run → empty auth manifest, still valid JSON, never a 500.
-        let (s1, ct1, b1) = route("/api/run/no-such-run/auth", dir);
+        let (s1, ct1, b1) = route("GET", "/api/run/no-such-run/auth", None, &state);
         assert_eq!(s1, "200 OK");
         assert_eq!(ct1, "application/json");
         assert_eq!(String::from_utf8(b1).unwrap(), "[]");
 
         // Traversal in the run id → 404, same discipline as the other run routes.
-        let (s2, _, _) = route("/api/run/../../etc/auth", dir);
+        let (s2, _, _) = route("GET", "/api/run/../../etc/auth", None, &state);
         assert_eq!(s2, "404 Not Found");
+    }
+
+    // ── Task 10: write-route token hardening + validation (all return before
+    // any `spawn_blocking`, so none of these need a tokio runtime) ──────────
+
+    #[test]
+    fn connect_without_token_is_403() {
+        let dir = std::path::Path::new("/nonexistent-run-dir");
+        let state = test_state(dir);
+        let (s, ct, b) = route("POST", "/api/run/some-run/auth/asana/connect", None, &state);
+        assert_eq!(s, "403 Forbidden");
+        assert_eq!(ct, "application/json");
+        assert!(String::from_utf8(b).unwrap().contains("X-Sema-View-Token"));
+    }
+
+    #[test]
+    fn connect_with_wrong_token_is_403() {
+        let dir = std::path::Path::new("/nonexistent-run-dir");
+        let state = test_state(dir);
+        let (s, _, _) = route(
+            "POST",
+            "/api/run/some-run/auth/asana/connect",
+            Some("definitely-not-the-token"),
+            &state,
+        );
+        assert_eq!(s, "403 Forbidden");
+    }
+
+    #[test]
+    fn forget_without_token_is_403() {
+        let dir = std::path::Path::new("/nonexistent-run-dir");
+        let state = test_state(dir);
+        let (s, _, _) = route("POST", "/api/run/some-run/auth/asana/forget", None, &state);
+        assert_eq!(s, "403 Forbidden");
+    }
+
+    #[test]
+    fn connect_with_correct_token_but_no_such_run_is_404_not_a_spawn() {
+        // No metadata.json under this (nonexistent) run dir → 404 before ever
+        // touching `spawn_blocking`, so this needs no tokio runtime at all.
+        let dir = std::path::Path::new("/nonexistent-run-dir");
+        let state = test_state(dir);
+        let (s, _, _) = route(
+            "POST",
+            "/api/run/some-run/auth/asana/connect",
+            Some(TEST_TOKEN),
+            &state,
+        );
+        assert_eq!(s, "404 Not Found");
     }
 }

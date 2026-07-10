@@ -1,19 +1,30 @@
-//! `GET /api/run/:id/auth` — read-only MCP auth status for the dashboard.
+//! `GET /api/run/:id/auth` — MCP auth status for the dashboard.
 //!
-//! Derives its answer ONLY from the run directory's own frozen artifacts: the
-//! redacted `:mcp` manifest recorded in `metadata.json` (aliases, url/command,
-//! whether `:auth` was declared, `:tools`, `:persist`) and the LATEST relevant
-//! `auth.*` event per alias across `events.jsonl` + every `events.resume-<n>.jsonl`
-//! segment, in segment order. This module never touches the token store — that
-//! needs key material and belongs to the write endpoints (item (d),
-//! `docs/plans/2026-06-24-workflow-mcp-auth.md` §9), deliberately deferred — so it
-//! can never leak a token, header, or other credential material.
+//! Derives its baseline answer ONLY from the run directory's own frozen
+//! artifacts: the redacted `:mcp` manifest recorded in `metadata.json`
+//! (aliases, url/command, whether `:auth` was declared, `:tools`, `:persist`)
+//! and the LATEST relevant `auth.*` event per alias across `events.jsonl` +
+//! every `events.resume-<n>.jsonl` segment, in segment order. This module
+//! itself never touches the token store — that needs key material and belongs
+//! to the write endpoints (`super::connect`) — so it can never leak a token,
+//! header, or other credential material by itself.
+//!
+//! On top of that journal-derived baseline, `auth_status_json` merges in-memory
+//! [`FlowState`] overrides recorded by a same-process `connect`/`forget` call
+//! (`super::connect::ServerState::flows`): a pending/just-finished dashboard
+//! login for an alias overrides that alias's row entirely — `Connecting` ->
+//! `"connecting"`, `Authorized` -> `"authorized"` (+ its `expires_at`),
+//! `Failed` -> `"failed"` (+ `reason`) — so the panel sees the flow's outcome
+//! immediately, without waiting for a NEW run to write a fresh `auth.*` event.
+//! An alias with no override falls back to the journal derivation, unchanged.
 //!
 //! Degrades to `[]` on anything missing or malformed, same discipline as
 //! `workflow_view::index_runs_json` — this endpoint never 500s the viewer.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
+
+use super::connect::FlowState;
 
 /// The latest `auth.*` outcome seen for one alias, folded across journal segments.
 #[derive(Debug, Clone, PartialEq)]
@@ -29,27 +40,67 @@ enum AuthEvent {
 /// [`super::is_safe_segment`] — this function only ever joins `run_dir.join(id)`,
 /// so it can't escape `run_dir` even so, but the route-level check is what keeps a
 /// traversal-shaped `id` out of the filesystem calls entirely.
-pub fn auth_status_json(run_dir: &Path, id: &str) -> Vec<u8> {
+///
+/// `overrides` is this run's in-memory flow-state snapshot (alias -> latest
+/// `connect`/`forget` outcome), from `super::connect::ServerState::flow_snapshot`
+/// — empty for every request until a dashboard `connect` has run at least once.
+///
+/// `pub(crate)`, not `pub`: [`FlowState`] itself is `pub(crate)` (server-side
+/// flow state never needs to leave this crate), so this stays in step —
+/// `super::route` (the only caller) is in the same crate.
+pub(crate) fn auth_status_json(
+    run_dir: &Path,
+    id: &str,
+    overrides: &HashMap<String, FlowState>,
+) -> Vec<u8> {
     let now_unix = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    status_json_at(run_dir, id, now_unix)
+    status_json_merged(run_dir, id, now_unix, overrides)
 }
 
+/// [`auth_status_json`] with no flow overrides — the pure journal-derived
+/// answer. Kept separate (rather than threading an empty map through every
+/// call site) so the read-only-status tests below stay untouched by the
+/// write-path's addition. Test-only: every non-test caller already has (or
+/// can trivially get) a real overrides map via [`auth_status_json`].
+#[cfg(test)]
 fn status_json_at(run_dir: &Path, id: &str, now_unix: u64) -> Vec<u8> {
-    let rows = build_rows(run_dir, id, now_unix);
+    status_json_merged(run_dir, id, now_unix, &HashMap::new())
+}
+
+fn status_json_merged(
+    run_dir: &Path,
+    id: &str,
+    now_unix: u64,
+    overrides: &HashMap<String, FlowState>,
+) -> Vec<u8> {
+    let rows = build_rows(run_dir, id, now_unix, overrides);
     serde_json::to_vec(&serde_json::Value::Array(rows)).unwrap_or_else(|_| b"[]".to_vec())
 }
 
-fn build_rows(run_dir: &Path, id: &str, now_unix: u64) -> Vec<serde_json::Value> {
+fn build_rows(
+    run_dir: &Path,
+    id: &str,
+    now_unix: u64,
+    overrides: &HashMap<String, FlowState>,
+) -> Vec<serde_json::Value> {
     let dir = run_dir.join(id);
     let Some(mcp) = read_mcp_manifest(&dir) else {
         return Vec::new();
     };
     let latest = latest_auth_events(&dir);
     mcp.iter()
-        .map(|(alias, spec)| row_for(alias, spec, latest.get(alias.as_str()), now_unix))
+        .map(|(alias, spec)| {
+            row_for(
+                alias,
+                spec,
+                latest.get(alias.as_str()),
+                now_unix,
+                overrides.get(alias.as_str()),
+            )
+        })
         .collect()
 }
 
@@ -136,16 +187,18 @@ fn str_list_field(spec: &serde_json::Value, key: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// Build one response row from a manifest spec + its folded journal status.
-/// Reads ONLY `url`/`command`/`auth`/`tools`/`persist` off `spec` — `headers`/`env`
-/// (already `<redacted>`, but redaction is defense in depth, not a license to
-/// forward them) are never touched, so no header/token material can reach this
-/// endpoint's response even by accident.
+/// Build one response row from a manifest spec + its folded journal status,
+/// then let a same-process flow override (if any) win entirely — see the
+/// module doc. Reads ONLY `url`/`command`/`auth`/`tools`/`persist` off `spec`
+/// — `headers`/`env` (already `<redacted>`, but redaction is defense in depth,
+/// not a license to forward them) are never touched, so no header/token
+/// material can reach this endpoint's response even by accident.
 fn row_for(
     alias: &str,
     spec: &serde_json::Value,
     latest: Option<&AuthEvent>,
     now_unix: u64,
+    flow_override: Option<&FlowState>,
 ) -> serde_json::Value {
     let auth = spec.get("auth").filter(|a| a.is_object());
     let needs_auth = auth.is_some();
@@ -157,22 +210,38 @@ fn row_for(
     let url = str_field(spec, "url");
     let command = str_field(spec, "command");
 
-    let (status, expires_at) = match latest {
-        Some(AuthEvent::Granted { expires_at }) => {
-            if expires_at.is_some_and(|exp| exp < now_unix) {
-                ("expired", None)
-            } else {
-                ("authorized", *expires_at)
+    let journal_status = || -> (&'static str, Option<u64>) {
+        match latest {
+            Some(AuthEvent::Granted { expires_at }) => {
+                if expires_at.is_some_and(|exp| exp < now_unix) {
+                    ("expired", None)
+                } else {
+                    ("authorized", *expires_at)
+                }
             }
+            Some(AuthEvent::Required) => ("needs-consent", None),
+            Some(AuthEvent::Failed) => ("failed", None),
+            // No auth.* event at all: a declared-with-:auth server that never ran the
+            // resolution step reads as "needs-consent" (never a false "authorized");
+            // a server with no :auth at all needs no flow, so "open" — never
+            // "authorized" for a server that was simply never gated.
+            None if needs_auth => ("needs-consent", None),
+            None => ("open", None),
         }
-        Some(AuthEvent::Required) => ("needs-consent", None),
-        Some(AuthEvent::Failed) => ("failed", None),
-        // No auth.* event at all: a declared-with-:auth server that never ran the
-        // resolution step reads as "needs-consent" (never a false "authorized");
-        // a server with no :auth at all needs no flow, so "open" — never
-        // "authorized" for a server that was simply never gated.
-        None if needs_auth => ("needs-consent", None),
-        None => ("open", None),
+    };
+
+    // A same-process flow state, when present, overrides the journal-derived
+    // status entirely — it is strictly newer information (this process's own
+    // in-flight or just-finished `connect`), and a `Failed` flow carries a
+    // `reason` the journal alone never would.
+    let (status, expires_at, reason) = match flow_override {
+        Some(FlowState::Connecting) => ("connecting", None, None),
+        Some(FlowState::Authorized { expires_at }) => ("authorized", *expires_at, None),
+        Some(FlowState::Failed { reason }) => ("failed", None, Some(reason.clone())),
+        None => {
+            let (status, expires_at) = journal_status();
+            (status, expires_at, None)
+        }
     };
 
     let mut row = serde_json::Map::new();
@@ -195,6 +264,9 @@ fn row_for(
     }
     if let Some(exp) = expires_at {
         row.insert("expires_at".into(), serde_json::json!(exp));
+    }
+    if let Some(r) = reason {
+        row.insert("reason".into(), serde_json::Value::String(r));
     }
     serde_json::Value::Object(row)
 }
@@ -453,6 +525,100 @@ mod tests {
         let text = String::from_utf8(status_json_at(&root, "r1", 0)).unwrap();
         assert!(!text.contains("Bearer"), "{text}");
         assert!(!text.contains("headers"), "{text}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ── Task 10: in-memory flow-state overrides (`super::connect`) ────────────
+
+    fn manifest_one_http_alias(run: &Path) {
+        write(
+            run,
+            "metadata.json",
+            r#"{"workflow":"w","meta":{"mcp":{"asana":{"url":"https://mcp.asana.com/mcp","auth":{"scopes":["default"]},"persist":"workflow"}}}}"#,
+        );
+        write(
+            run,
+            "events.jsonl",
+            r#"{"event":"auth.required","seq":0,"ts":"0","server":"asana","scopes":["default"],"persist":"workflow"}"#,
+        );
+    }
+
+    #[test]
+    fn connecting_override_wins_over_needs_consent_journal_status() {
+        let root = temp_dir("override-connecting");
+        let run = root.join("r1");
+        std::fs::create_dir_all(&run).unwrap();
+        manifest_one_http_alias(&run);
+
+        let mut overrides = HashMap::new();
+        overrides.insert("asana".to_string(), FlowState::Connecting);
+
+        let text = String::from_utf8(status_json_merged(&root, "r1", 0, &overrides)).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(v[0]["status"], "connecting");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn authorized_override_wins_and_carries_expires_at() {
+        let root = temp_dir("override-authorized");
+        let run = root.join("r1");
+        std::fs::create_dir_all(&run).unwrap();
+        manifest_one_http_alias(&run);
+
+        let mut overrides = HashMap::new();
+        overrides.insert(
+            "asana".to_string(),
+            FlowState::Authorized {
+                expires_at: Some(9999),
+            },
+        );
+
+        let text = String::from_utf8(status_json_merged(&root, "r1", 0, &overrides)).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(v[0]["status"], "authorized");
+        assert_eq!(v[0]["expires_at"], 9999);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn failed_override_wins_and_carries_reason_never_a_secret() {
+        let root = temp_dir("override-failed");
+        let run = root.join("r1");
+        std::fs::create_dir_all(&run).unwrap();
+        manifest_one_http_alias(&run);
+
+        let mut overrides = HashMap::new();
+        overrides.insert(
+            "asana".to_string(),
+            FlowState::Failed {
+                reason: "consent declined".to_string(),
+            },
+        );
+
+        let text = String::from_utf8(status_json_merged(&root, "r1", 0, &overrides)).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(v[0]["status"], "failed");
+        assert_eq!(v[0]["reason"], "consent declined");
+        assert!(!text.contains("Bearer"), "{text}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn no_override_falls_back_to_journal_status_unchanged() {
+        let root = temp_dir("override-absent");
+        let run = root.join("r1");
+        std::fs::create_dir_all(&run).unwrap();
+        manifest_one_http_alias(&run);
+
+        // An override present for a DIFFERENT alias must not affect this one.
+        let mut overrides = HashMap::new();
+        overrides.insert("other-alias".to_string(), FlowState::Connecting);
+
+        let merged = String::from_utf8(status_json_merged(&root, "r1", 0, &overrides)).unwrap();
+        let plain = String::from_utf8(status_json_at(&root, "r1", 0)).unwrap();
+        assert_eq!(merged, plain);
+        assert!(merged.contains(r#""status":"needs-consent""#), "{merged}");
         let _ = std::fs::remove_dir_all(&root);
     }
 }

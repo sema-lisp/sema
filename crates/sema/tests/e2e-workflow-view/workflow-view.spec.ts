@@ -195,3 +195,44 @@ test('auth panel is hidden entirely for a run with no :mcp declarations', async 
   await expect(page.getByTestId('auth-panel')).toBeHidden();
   await expect(page.getByTestId('auth-row')).toHaveCount(0);
 });
+
+// Task 10: one-click Connect/Forget — the write endpoints + panel buttons.
+// Playwright only asserts the buttons RENDER (idiom, testids, alongside the
+// existing CLI hint): a full OAuth round trip is out of scope here — the Rust
+// integration tests (workflow_view_connect_test.rs) own end-to-end flow
+// correctness against a mock authorization server.
+
+test('auth panel: [Connect] renders on the needs-consent row, alongside the CLI hint', async ({ page }) => {
+  await openMcpAuth(page);
+  const asana = page.getByTestId('auth-row').and(page.locator('[data-alias="asana"]'));
+  const connectBtn = asana.getByTestId('auth-connect');
+  await expect(connectBtn).toHaveCount(1);
+  await expect(connectBtn).toHaveText('[Connect]');
+  expect(await connectBtn.evaluate((el) => el.tagName)).toBe('SPAN');
+  // No inline JS attribute — click wiring happens via `.onclick =` in script,
+  // the file's existing idiom (see renderPhases/renderDetail), not `onclick=`.
+  expect(await connectBtn.evaluate((el) => el.getAttribute('onclick'))).toBeNull();
+  // Connect is additive — the CLI hint is still there too, not replaced.
+  await expect(page.getByTestId('auth-hint')).toHaveCount(1);
+  // Still no actual <button> element anywhere in the panel.
+  await expect(page.locator('#auth-panel button')).toHaveCount(0);
+});
+
+test('auth panel: [Forget] renders on the authorized row, with a re-run hint', async ({ page }) => {
+  await openMcpAuth(page);
+  const linear = page.getByTestId('auth-row').and(page.locator('[data-alias="linear"]'));
+  const forgetBtn = linear.getByTestId('auth-forget');
+  await expect(forgetBtn).toHaveCount(1);
+  await expect(forgetBtn).toHaveText('[Forget]');
+  expect(await forgetBtn.evaluate((el) => el.tagName)).toBe('SPAN');
+  expect(await forgetBtn.evaluate((el) => el.getAttribute('onclick'))).toBeNull();
+  await expect(page.getByTestId('auth-rerun-hint')).toHaveText('re-run the workflow to proceed');
+  await expect(page.locator('#auth-panel button')).toHaveCount(0);
+});
+
+test('auth panel: an open row (no :auth declared) gets neither Connect nor Forget', async ({ page }) => {
+  await openMcpAuth(page);
+  const fsserver = page.getByTestId('auth-row').and(page.locator('[data-alias="fsserver"]'));
+  await expect(fsserver.getByTestId('auth-connect')).toHaveCount(0);
+  await expect(fsserver.getByTestId('auth-forget')).toHaveCount(0);
+});

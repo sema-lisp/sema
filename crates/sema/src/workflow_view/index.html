@@ -72,7 +72,9 @@
 
   /* ---- AUTH PANEL — terminal-quiet: a row per declared MCP server, same idiom
      as the agent ledger (.arow family), no chrome. Hidden entirely (not just
-     collapsed) when the run declared no :mcp servers. ---- */
+     collapsed) when the run declared no :mcp servers. The row itself stays
+     inert (no click/drill-in) — only the bracket-label [Connect]/[Forget]
+     span is interactive. ---- */
   .auth-panel{border-bottom:1px solid var(--border);padding:9px 0 8px;}
   .auth-panel[hidden]{display:none;}
   /* higher specificity than the later .arow/.arow:hover rules (body-grid section),
@@ -82,6 +84,11 @@
   .g-warn{color:var(--amber);}
   .auth-hint{margin:-2px 20px 5px 34px;color:var(--text-tertiary);font-size:var(--fs-meta);
     user-select:text;-webkit-user-select:text;}
+  /* [Connect]/[Forget] — a text-styled affordance, NOT a big button, matching
+     the file's bracket-label idiom (e.g. the footer keybar). */
+  .auth-action{color:var(--gold-dim);cursor:pointer;font-size:var(--fs-meta);letter-spacing:.3px;
+    white-space:nowrap;flex:0 0 auto;}
+  .auth-action:hover{color:var(--gold);}
 
   /* ============================ BODY GRID ============================ */
   .body{flex:1;display:grid;grid-template-columns:230px minmax(0,1fr) 420px;min-height:0;}
@@ -287,7 +294,7 @@
     </div>
   </div>
 
-  <!-- AUTH PANEL — read-only MCP auth status; hidden when the run declared no :mcp -->
+  <!-- AUTH PANEL — MCP auth status + one-click Connect/Forget; hidden when the run declared no :mcp -->
   <div class="auth-panel" id="auth-panel" data-testid="auth-panel" hidden>
     <div class="col-label">Auth</div>
     <div id="auth-rows"></div>
@@ -332,8 +339,13 @@
 // Live data — fetched from the viewer server in load(); see init() at the bottom.
 let EVENTS = [];
 let RESULT_ENVELOPE = {};
-let AUTH_ROWS = [];   // /api/run/<id>/auth — read-only MCP auth manifest + status
+let AUTH_ROWS = [];   // /api/run/<id>/auth — MCP auth manifest + status (journal + live flow)
 let SELECTED_RUN = null;
+// Session-hardening token (docs/plans/2026-06-24-workflow-mcp-auth.md §8):
+// substituted server-side at response time — see `workflow_view.rs`'s
+// VIEW_TOKEN_PLACEHOLDER. Required on every write route; never sent anywhere
+// but this server, and never logged.
+const VIEW_TOKEN = "__SEMA_VIEW_TOKEN__";
 function emptyModel(){ return { run:{ended:false,status:null}, phases:[], phaseBySeq:new Map(), agents:new Map(), latestBudgetLimit:null }; }
 let M = emptyModel();
 
@@ -761,10 +773,14 @@ function renderStream(){
 }
 
 /* =========================================================================
-   AUTH PANEL — read-only: one row per declared MCP server (alias · status),
-   from GET /api/run/<id>/auth. No [Connect]/[Forget] — those are write
-   endpoints, deferred (item (d), needs CSRF work first). Hidden entirely when
-   the run declared no :mcp servers (AUTH_ROWS is empty).
+   AUTH PANEL — one row per declared MCP server (alias · status), from
+   GET /api/run/<id>/auth. [Connect] on needs-consent/expired/failed rows,
+   [Forget] on authorized rows — bracket-label spans (NOT buttons), matching
+   the file's terminal-quiet idiom. A click POSTs to the write endpoint with
+   the session token, optimistically flips the row to "connecting…" (dim
+   pulse), and the existing 1s poll (see init()) picks up the terminal state
+   from the server's merged flow status — no separate refresh path needed.
+   Hidden entirely when the run declared no :mcp servers (AUTH_ROWS is empty).
    ========================================================================= */
 function fmtHHMM(unixSecs){
   if(unixSecs==null) return "";
@@ -774,6 +790,7 @@ function fmtHHMM(unixSecs){
 function authGlyph(status){
   if(status==="authorized") return `<span class="aglyph g-ok">${G.ok}</span>`;
   if(status==="failed")     return `<span class="aglyph g-fail">${G.fail}</span>`;
+  if(status==="connecting") return `<span class="aglyph g-pend pulse">${G.run}</span>`;
   if(status==="needs-consent" || status==="expired")
                              return `<span class="aglyph g-warn">${G.pend}</span>`;
   return `<span class="aglyph g-pend">${G.bud}</span>`;               // "open" — no flow needed
@@ -781,6 +798,7 @@ function authGlyph(status){
 function authText(row){
   switch(row.status){
     case "needs-consent": return `${row.alias} · not connected`;
+    case "connecting":    return `${row.alias} · connecting…`;
     case "authorized":    return row.expires_at!=null
                              ? `${row.alias} · authorized · expires ${fmtHHMM(row.expires_at)}`
                              : `${row.alias} · authorized`;
@@ -788,6 +806,17 @@ function authText(row){
     case "failed":        return `${row.alias} · failed`;
     default:              return `${row.alias} · open`;               // "open" or any unknown future status
   }
+}
+// The bracket-label action for a row's status, or "" for statuses with no
+// write action (open, connecting — already mid-flight).
+function authAction(row){
+  if(row.status==="needs-consent" || row.status==="expired" || row.status==="failed"){
+    return `<span class="auth-action" data-testid="auth-connect" data-action="connect">[Connect]</span>`;
+  }
+  if(row.status==="authorized"){
+    return `<span class="auth-action" data-testid="auth-forget" data-action="forget">[Forget]</span>`;
+  }
+  return `<span></span>`;
 }
 function renderAuth(){
   const panel = document.getElementById("auth-panel");
@@ -797,16 +826,49 @@ function renderAuth(){
   let html = "";
   for(const row of AUTH_ROWS){
     html += `<div class="arow auth-row" data-testid="auth-row" data-alias="${esc(row.alias)}" `+
-              `data-status="${esc(row.status)}" style="grid-template-columns:16px 1fr">`+
+              `data-status="${esc(row.status)}" style="grid-template-columns:16px 1fr auto">`+
             authGlyph(row.status)+
-            `<span class="albl ell">${esc(authText(row))}</span></div>`;
-    // Selectable command text, NOT a button — this panel is read-only (no
-    // [Connect]/[Forget]; the write flow is a separate, deferred surface).
+            `<span class="albl ell">${esc(authText(row))}</span>`+
+            authAction(row)+
+            `</div>`;
+    // Selectable command text (CLI parity), kept alongside [Connect] on a
+    // needs-consent row — not a substitute for it.
     if(row.status==="needs-consent" && row.url){
       html += `<div class="auth-hint" data-testid="auth-hint">sema mcp login ${esc(row.url)}</div>`;
     }
+    // The headless run that produced this page already exited — an
+    // in-dashboard [Connect] can authenticate the NEXT run, but can't resume
+    // this one in-process.
+    if(row.status==="authorized"){
+      html += `<div class="auth-hint" data-testid="auth-rerun-hint">re-run the workflow to proceed</div>`;
+    }
   }
   rowsEl.innerHTML = html;
+  rowsEl.querySelectorAll(".auth-action[data-action]").forEach(el=>{
+    el.onclick = ()=>{
+      const alias = el.closest(".auth-row").dataset.alias;
+      triggerAuthAction(alias, el.dataset.action);
+    };
+  });
+}
+// POST /api/run/<id>/auth/<alias>/connect|forget with the session token.
+// Fire-and-forget: the 1s poll already running (see init()) reconciles the
+// real outcome, so no response body is even inspected here.
+async function triggerAuthAction(alias, action){
+  if(!SELECTED_RUN) return;
+  if(action==="connect"){
+    // Optimistic UI: flip this row to "connecting…" immediately (dim pulse)
+    // instead of waiting up to 1s for the next poll.
+    const row = AUTH_ROWS.find(r=>r.alias===alias);
+    if(row) row.status = "connecting";
+    renderAuth();
+  }
+  try{
+    await fetch(
+      `/api/run/${encodeURIComponent(SELECTED_RUN)}/auth/${encodeURIComponent(alias)}/${action}`,
+      { method: "POST", headers: { "X-Sema-View-Token": VIEW_TOKEN } }
+    );
+  }catch(e){ /* the next poll reconciles regardless of a network hiccup here */ }
 }
 
 /* =========================================================================

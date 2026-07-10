@@ -317,7 +317,12 @@ fn split_scopes(scope: Option<&str>) -> Vec<String> {
 /// name the `:workflow`/`:run` scoped directories; `store_encryption_key`
 /// failures (env var unset AND no OS keyring) only matter for those two file
 /// scopes — `:keyring` and `:none` never call it.
-fn store_for(
+///
+/// `pub(crate)`: the dashboard's `POST …/connect|forget` write endpoints
+/// (`crate::workflow_view::connect`) reuse this exact resolution so a session
+/// persisted from the panel lands in the SAME store a subsequent `workflow/run`
+/// would resolve — one persistence policy, not two.
+pub(crate) fn store_for(
     persist: McpPersist,
     workflow: &str,
     run_id: &str,

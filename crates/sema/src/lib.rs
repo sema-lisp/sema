@@ -15,6 +15,13 @@
 use std::rc::Rc;
 
 pub mod workflow_mcp;
+// `sema workflow view` — the dashboard server. Lives in the library (not just
+// `main.rs`) so `crates/sema/tests/*.rs` integration tests can drive it
+// in-process (bind a real server, POST against it), the same way
+// `workflow_mcp_e2e_test.rs`/`workflow_mcp_interactive_test.rs` already drive
+// `workflow_mcp` in-process. One copy of the module; `main.rs` calls it via
+// `sema::workflow_view::…`.
+pub mod workflow_view;
 
 // Re-export core types.
 pub use sema_core::{intern, resolve, with_resolved, Caps, Env, Sandbox, SemaError, Value};

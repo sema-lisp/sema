@@ -20,6 +20,7 @@ use std::path::{Path, PathBuf};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
+pub mod auth;
 pub mod ingest;
 
 const INDEX_HTML: &str = include_str!("workflow_view/index.html");
@@ -123,6 +124,18 @@ fn route(path: &str, run_dir: &Path) -> (&'static str, &'static str, Vec<u8>) {
     // /api/run/<id>/<file> — <id> a single safe segment, <file> a whitelisted name.
     if let Some(rest) = path.strip_prefix("/api/run/") {
         if let Some((id, file)) = rest.split_once('/') {
+            // Read-only MCP auth status, derived server-side from the journal +
+            // metadata manifest (never the token store — see `auth`'s module doc).
+            if file == "auth" {
+                if is_safe_segment(id) {
+                    return (
+                        "200 OK",
+                        "application/json",
+                        auth::auth_status_json(run_dir, id),
+                    );
+                }
+                return ("404 Not Found", "text/plain", b"no such run/file".to_vec());
+            }
             let (ctype, ok) = match file {
                 "events.jsonl" => ("application/x-ndjson", true),
                 "result.json" | "metadata.json" | "args.json" => ("application/json", true),
@@ -229,5 +242,19 @@ mod tests {
 
         let (s5, _, _) = route("/nope", dir);
         assert_eq!(s5, "404 Not Found");
+    }
+
+    #[test]
+    fn auth_route_resolves_and_rejects_traversal() {
+        let dir = std::path::Path::new("/nonexistent-run-dir");
+        // Unknown run → empty auth manifest, still valid JSON, never a 500.
+        let (s1, ct1, b1) = route("/api/run/no-such-run/auth", dir);
+        assert_eq!(s1, "200 OK");
+        assert_eq!(ct1, "application/json");
+        assert_eq!(String::from_utf8(b1).unwrap(), "[]");
+
+        // Traversal in the run id → 404, same discipline as the other run routes.
+        let (s2, _, _) = route("/api/run/../../etc/auth", dir);
+        assert_eq!(s2, "404 Not Found");
     }
 }

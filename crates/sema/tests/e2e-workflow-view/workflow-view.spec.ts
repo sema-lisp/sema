@@ -138,3 +138,60 @@ test('phase ledger shows ALL declared phases, un-started ones pending', async ({
   // header rollup counts only STARTED phases (2), while the ledger shows all 4
   await expect(page.getByTestId('r-phases')).toHaveText('2');
 });
+
+// mcp-auth (Task 6): a run declaring :mcp servers, gated on asana (needs-consent)
+// while linear is already authorized and fsserver (stdio, no :auth) needs no flow
+// at all — GET /api/run/:id/auth + the needs-auth pill + the read-only Auth panel.
+
+async function openMcpAuth(page: Page) {
+  await page.goto('/?run=mcp-auth', { waitUntil: 'networkidle' });
+  await page.getByTestId('auth-row').first().waitFor({ timeout: 15000 });
+}
+
+test('needs-auth run: the status pill reflects run.ended status "needs-auth"', async ({ page }) => {
+  await openMcpAuth(page);
+  const pill = page.getByTestId('status-pill');
+  await expect(pill).toHaveText('needs-auth');
+  // The text alone isn't enough to prove the mapping — assert the dedicated
+  // `.pill.needs-auth` class (and its distinct amber color) actually landed,
+  // not a fallback `.pill.success` that happens to show the same string.
+  await expect(pill).toHaveClass(/needs-auth/);
+  await expect(pill).not.toHaveClass(/success/);
+  const color = await pill.evaluate((el) => getComputedStyle(el).color);
+  expect(color).toBe('rgb(217, 140, 61)'); // --amber:#d98c3d
+});
+
+test('auth panel: one row per declared server, alias + status text', async ({ page }) => {
+  await openMcpAuth(page);
+  const rows = page.getByTestId('auth-row');
+  await expect(rows).toHaveCount(3);
+
+  const asana = rows.and(page.locator('[data-alias="asana"]'));
+  await expect(asana).toHaveAttribute('data-status', 'needs-consent');
+  await expect(asana).toContainText('asana · not connected');
+
+  const linear = rows.and(page.locator('[data-alias="linear"]'));
+  await expect(linear).toHaveAttribute('data-status', 'authorized');
+  await expect(linear).toContainText('linear · authorized · expires');
+
+  const fsserver = rows.and(page.locator('[data-alias="fsserver"]'));
+  await expect(fsserver).toHaveAttribute('data-status', 'open');
+  await expect(fsserver).toContainText('fsserver · open');
+});
+
+test('auth panel: needs-consent row shows a selectable login hint, not a button', async ({ page }) => {
+  await openMcpAuth(page);
+  const hints = page.getByTestId('auth-hint');
+  // Exactly one hint — only the needs-consent row (asana) gets one; the
+  // authorized and open rows don't.
+  await expect(hints).toHaveCount(1);
+  await expect(hints.first()).toHaveText('sema mcp login https://mcp.asana.com/mcp');
+  expect(await hints.first().evaluate((el) => el.tagName)).toBe('DIV');
+  await expect(page.locator('#auth-panel button')).toHaveCount(0);
+});
+
+test('auth panel is hidden entirely for a run with no :mcp declarations', async ({ page }) => {
+  await open(page); // audit-auth fixture: no metadata.json, so no :mcp manifest
+  await expect(page.getByTestId('auth-panel')).toBeHidden();
+  await expect(page.getByTestId('auth-row')).toHaveCount(0);
+});

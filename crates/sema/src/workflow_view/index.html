@@ -10,6 +10,9 @@
     --bg:#131110; --bg-elevated:#181512; --bg-editor:#1c1916; --bg-output:#0f0d0c;
     --text-primary:#e9e3d6; --text-secondary:#968c79; --text-tertiary:#6b6354;
     --border:#2b2620; --border-focus:#c8a855; --success:#6a9955; --error:#c85555;
+    /* amber — attention-needed states (needs-auth pill, needs-consent/expired auth rows),
+       deliberately a different hue from --gold (which already means "running/live"). */
+    --amber:#d98c3d; --amber-dim:rgba(217,140,61,.5); --amber-soft:rgba(217,140,61,.14);
     --mono:'JetBrains Mono',ui-monospace,'SF Mono',Menlo,Consolas,monospace;
     --serif:'Cormorant',Georgia,'Times New Roman',serif;
 
@@ -48,6 +51,7 @@
   .pill.running{color:var(--gold);border-color:var(--gold-dim);background:var(--gold-soft);}
   .pill.success{color:var(--success);border-color:#33402a;background:rgba(106,153,85,.12);}
   .pill.failed{color:var(--error);border-color:#4a2828;background:rgba(200,85,85,.12);}
+  .pill.needs-auth{color:var(--amber);border-color:var(--amber-dim);background:var(--amber-soft);}
   .elapsed{color:var(--text-secondary);flex:0 0 auto;font-variant-numeric:tabular-nums;}
   .rollup{justify-self:end;color:var(--text-secondary);
     display:flex;gap:8px;align-items:baseline;font-size:var(--fs-small);flex:0 0 auto;white-space:nowrap;}
@@ -65,6 +69,19 @@
   .budget-bar{flex:1;height:3px;background:#211d18;overflow:hidden;position:relative;min-width:24px;}
   .budget-bar i{position:absolute;left:0;top:0;bottom:0;background:var(--gold-dim);}
   .budget-line .bnum{flex:0 0 auto;color:var(--text-secondary);}
+
+  /* ---- AUTH PANEL — terminal-quiet: a row per declared MCP server, same idiom
+     as the agent ledger (.arow family), no chrome. Hidden entirely (not just
+     collapsed) when the run declared no :mcp servers. ---- */
+  .auth-panel{border-bottom:1px solid var(--border);padding:9px 0 8px;}
+  .auth-panel[hidden]{display:none;}
+  /* higher specificity than the later .arow/.arow:hover rules (body-grid section),
+     so an auth row reads as inert — it is display-only, no click/drill-in. */
+  .arow.auth-row{cursor:default;}
+  .arow.auth-row:hover{background:transparent;box-shadow:none;}
+  .g-warn{color:var(--amber);}
+  .auth-hint{margin:-2px 20px 5px 34px;color:var(--text-tertiary);font-size:var(--fs-meta);
+    user-select:text;-webkit-user-select:text;}
 
   /* ============================ BODY GRID ============================ */
   .body{flex:1;display:grid;grid-template-columns:230px minmax(0,1fr) 420px;min-height:0;}
@@ -270,6 +287,12 @@
     </div>
   </div>
 
+  <!-- AUTH PANEL — read-only MCP auth status; hidden when the run declared no :mcp -->
+  <div class="auth-panel" id="auth-panel" data-testid="auth-panel" hidden>
+    <div class="col-label">Auth</div>
+    <div id="auth-rows"></div>
+  </div>
+
   <!-- BODY -->
   <div class="body">
     <div class="phases" id="phases"><div class="col-label">Phases</div></div>
@@ -309,6 +332,7 @@
 // Live data — fetched from the viewer server in load(); see init() at the bottom.
 let EVENTS = [];
 let RESULT_ENVELOPE = {};
+let AUTH_ROWS = [];   // /api/run/<id>/auth — read-only MCP auth manifest + status
 let SELECTED_RUN = null;
 function emptyModel(){ return { run:{ended:false,status:null}, phases:[], phaseBySeq:new Map(), agents:new Map(), latestBudgetLimit:null }; }
 let M = emptyModel();
@@ -737,6 +761,55 @@ function renderStream(){
 }
 
 /* =========================================================================
+   AUTH PANEL — read-only: one row per declared MCP server (alias · status),
+   from GET /api/run/<id>/auth. No [Connect]/[Forget] — those are write
+   endpoints, deferred (item (d), needs CSRF work first). Hidden entirely when
+   the run declared no :mcp servers (AUTH_ROWS is empty).
+   ========================================================================= */
+function fmtHHMM(unixSecs){
+  if(unixSecs==null) return "";
+  const d = new Date(unixSecs*1000);
+  return String(d.getHours()).padStart(2,"0")+":"+String(d.getMinutes()).padStart(2,"0");
+}
+function authGlyph(status){
+  if(status==="authorized") return `<span class="aglyph g-ok">${G.ok}</span>`;
+  if(status==="failed")     return `<span class="aglyph g-fail">${G.fail}</span>`;
+  if(status==="needs-consent" || status==="expired")
+                             return `<span class="aglyph g-warn">${G.pend}</span>`;
+  return `<span class="aglyph g-pend">${G.bud}</span>`;               // "open" — no flow needed
+}
+function authText(row){
+  switch(row.status){
+    case "needs-consent": return `${row.alias} · not connected`;
+    case "authorized":    return row.expires_at!=null
+                             ? `${row.alias} · authorized · expires ${fmtHHMM(row.expires_at)}`
+                             : `${row.alias} · authorized`;
+    case "expired":       return `${row.alias} · expired`;
+    case "failed":        return `${row.alias} · failed`;
+    default:              return `${row.alias} · open`;               // "open" or any unknown future status
+  }
+}
+function renderAuth(){
+  const panel = document.getElementById("auth-panel");
+  const rowsEl = document.getElementById("auth-rows");
+  if(!AUTH_ROWS.length){ panel.hidden = true; rowsEl.innerHTML = ""; return; }
+  panel.hidden = false;
+  let html = "";
+  for(const row of AUTH_ROWS){
+    html += `<div class="arow auth-row" data-testid="auth-row" data-alias="${esc(row.alias)}" `+
+              `data-status="${esc(row.status)}" style="grid-template-columns:16px 1fr">`+
+            authGlyph(row.status)+
+            `<span class="albl ell">${esc(authText(row))}</span></div>`;
+    // Selectable command text, NOT a button — this panel is read-only (no
+    // [Connect]/[Forget]; the write flow is a separate, deferred surface).
+    if(row.status==="needs-consent" && row.url){
+      html += `<div class="auth-hint" data-testid="auth-hint">sema mcp login ${esc(row.url)}</div>`;
+    }
+  }
+  rowsEl.innerHTML = html;
+}
+
+/* =========================================================================
    HEADER + LIVE TICK
    ========================================================================= */
 function paintHeader(){
@@ -745,7 +818,8 @@ function paintHeader(){
   const live = !M.run.ended;
   const pill = document.getElementById("status-pill");
   const st = M.run.status || (live?"running":"success");
-  pill.className = "pill "+(live?"running":(st==="failed"?"failed":"success"));
+  const pillCls = live ? "running" : (st==="failed" ? "failed" : st==="needs-auth" ? "needs-auth" : "success");
+  pill.className = "pill "+pillCls;
   pill.textContent = st;
 
   document.getElementById("r-phases").textContent = r.phases;
@@ -807,6 +881,7 @@ async function loadRun(runId){
   try{ const r=await fetch('/api/run/'+encodeURIComponent(runId)+'/events.jsonl'); text=await r.text(); }catch(e){}
   EVENTS = text.split('\n').filter(l=>l.trim()).map(l=>{try{return JSON.parse(l);}catch(e){return null;}}).filter(Boolean);
   try{ const r=await fetch('/api/run/'+encodeURIComponent(runId)+'/result.json'); RESULT_ENVELOPE=await r.json(); }catch(e){ RESULT_ENVELOPE={}; }
+  try{ const r=await fetch('/api/run/'+encodeURIComponent(runId)+'/auth'); AUTH_ROWS=await r.json(); }catch(e){ AUTH_ROWS=[]; }
   M = project(EVENTS);
   // Default selection: the open/live phase (or the last phase), and its live/first agent.
   if(selPhaseSeq==null || !M.phaseBySeq.has(selPhaseSeq)){
@@ -818,7 +893,7 @@ async function loadRun(runId){
     selPhaseSeq = p ? p.start_seq : null;
     if(p){ const la=p.agents.find(x=>x.status==null); selAgent=(la||p.agents[0])?.agent_id||null; }
   }
-  paintHeader(); renderPhases(); renderDetail(); renderStream();
+  paintHeader(); renderAuth(); renderPhases(); renderDetail(); renderStream();
   return !M.run.ended;
 }
 async function init(){

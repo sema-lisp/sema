@@ -1,0 +1,29 @@
+{
+  "workflow": "mcp-auth",
+  "doc": "Fixture: a run declaring :mcp servers, gated on asana (needs-consent) while linear is already authorized and fsserver needs no flow at all.",
+  "run_id": "wf_mcp_auth_9c21",
+  "code_version": "c0ffee01",
+  "meta": {
+    "budget": { "usd": 1.0 },
+    "mcp": {
+      "asana": {
+        "url": "https://mcp.asana.com/mcp",
+        "headers": { "Authorization": "<redacted>" },
+        "auth": { "scopes": ["default"] },
+        "tools": ["create_task", "search_tasks"],
+        "persist": "workflow"
+      },
+      "linear": {
+        "url": "https://mcp.linear.app/mcp",
+        "headers": { "Authorization": "<redacted>" },
+        "auth": { "scopes": ["default"] },
+        "tools": ["create_issue"],
+        "persist": "run"
+      },
+      "fsserver": {
+        "command": "npx",
+        "args": ["-y", "@modelcontextprotocol/server-filesystem", "."]
+      }
+    }
+  }
+}

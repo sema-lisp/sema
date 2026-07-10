@@ -1,0 +1,7 @@
+{
+  "status": "needs-auth",
+  "servers": ["asana"],
+  "auth": [
+    { "server": "asana", "url": "https://mcp.asana.com/mcp", "persist": "workflow" }
+  ]
+}

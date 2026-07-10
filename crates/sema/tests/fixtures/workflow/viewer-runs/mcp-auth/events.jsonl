@@ -1,0 +1,4 @@
+{"seq":0,"ts":"1970-01-01T00:00:00Z","event":"run.started","run_id":"wf_mcp_auth_9c21","workflow":"mcp-auth","code_version":"c0ffee01","args_json":"{}"}
+{"seq":1,"ts":"1970-01-01T00:00:00Z","event":"auth.required","server":"asana","scopes":["default"],"tools":["create_task","search_tasks"],"persist":"workflow"}
+{"seq":2,"ts":"1970-01-01T00:00:00Z","event":"auth.granted","server":"linear","scopes":["default"],"expires_at":4102444800,"source":"consented"}
+{"seq":3,"ts":"1970-01-01T00:00:00Z","event":"run.ended","status":"needs-auth","reason":"authentication required","dur_ms":8}

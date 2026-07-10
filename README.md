@@ -11,6 +11,7 @@
   <a href="https://sema.run"><img src="https://img.shields.io/badge/try_it-sema.run-c8a855?style=flat" alt="Playground"></a>
   <a href="https://sema-lang.com/docs/"><img src="https://img.shields.io/badge/docs-sema--lang.com-c8a855?style=flat" alt="Docs"></a>
   <a href="https://github.com/sema-lisp/sema/releases/latest"><img src="https://img.shields.io/github/v/tag/sema-lisp/sema?label=version&color=c8a855&style=flat" alt="Version"></a>
+  <a href="https://codecov.io/gh/sema-lisp/sema"><img src="https://codecov.io/gh/sema-lisp/sema/graph/badge.svg" alt="Coverage"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-c8a855?style=flat" alt="License"></a>
 </p>
 

@@ -166,6 +166,22 @@ Apply a function to each element of one or more lists.
 (map + '(1 2 3) '(10 20 30))          ; => (11 22 33)
 ```
 
+### `map-indexed`
+
+Like `map`, but calls the function with the index and the element: `(f index element)`.
+
+```sema
+(map-indexed (fn (i x) (list i x)) '(10 20 30))   ; => ((0 10) (1 20) (2 30))
+```
+
+### `enumerate`
+
+Pair each element with its 0-based index.
+
+```sema
+(enumerate '(10 20 30))   ; => ((0 10) (1 20) (2 30))
+```
+
 ### `filter`
 
 Return elements that satisfy a predicate.

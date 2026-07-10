@@ -4,6 +4,17 @@
 
 ### Added
 
+- **`map-indexed` and `enumerate` builtins** (#90). `(map-indexed f xs)` calls
+  `f` with each element's 0-based index and value (`(f i x)`), collecting
+  results into a list; `(enumerate xs)` pairs each element with its index as
+  `(index element)` lists. Both accept a list or vector and always return a
+  list.
+- **`string/truncate-width`** (#92) — clamp a string to a target display width,
+  the truncation counterpart to `string/width`. Splits on grapheme-cluster
+  boundaries so wide glyphs (CJK, emoji) are never cut in half, and takes an
+  optional ellipsis string appended within the width budget. TUI cells that
+  clip long text (palette descriptions, tool-arg cells) no longer misalign by
+  falling back to a codepoint count.
 - **`sema update`** — updates sema to the latest (or a specific `--version`)
   released binary in place. Downloads with a byte-progress bar, verifies the
   SHA256 checksum against the same `.sha256` sidecar cargo-dist publishes for

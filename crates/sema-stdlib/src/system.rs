@@ -364,8 +364,9 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
         ))
     });
 
-    // shell/quote — POSIX-quote a string for safe interpolation into a `sh -c`
-    // command line. Pure (string→string), so ungated like other string helpers.
+    // shell/quote — POSIX-quote a string for safe interpolation into a POSIX `sh -c`
+    // command line (Unix). Note: the single-string form of `shell` uses `cmd /C` on Windows.
+    // Pure (string→string), so ungated like other string helpers.
     register_fn(env, "shell/quote", |args| {
         check_arity!(args, "shell/quote", 1);
         let s = args[0]

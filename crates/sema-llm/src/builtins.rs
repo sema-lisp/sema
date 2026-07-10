@@ -1245,6 +1245,40 @@ fn register_fn_ctx_gated(
     }
 }
 
+/// Like [`register_fn_ctx_gated`], but binds the native under a different ENV SYMBOL
+/// (`reg_name`) than the name used for the capability-check error / `NativeFn`
+/// display (`display_name`). Used to split a Sema-visible entry point (e.g.
+/// `llm/chat`) into several internal native entry points (a blocking twin, an
+/// async-loop `-begin`) that must all deny with the SAME `PermissionDenied {
+/// function: "llm/chat", .. }` a sandboxed caller saw before the split — the
+/// prelude dispatcher decides at runtime which internal native actually runs, but
+/// every one of them gates identically under the public name.
+fn register_fn_ctx_gated_as(
+    env: &Env,
+    sandbox: &sema_core::Sandbox,
+    cap: sema_core::Caps,
+    reg_name: &str,
+    display_name: &str,
+    f: impl Fn(&sema_core::EvalContext, &[Value]) -> Result<Value, SemaError> + 'static,
+) {
+    if sandbox.is_unrestricted() {
+        env.set(
+            sema_core::intern(reg_name),
+            Value::native_fn(NativeFn::with_ctx(display_name, f)),
+        );
+    } else {
+        let sandbox = sandbox.clone();
+        let fn_name = display_name.to_string();
+        env.set(
+            sema_core::intern(reg_name),
+            Value::native_fn(NativeFn::with_ctx(display_name, move |ctx, args| {
+                sandbox.check(cap, &fn_name)?;
+                f(ctx, args)
+            })),
+        );
+    }
+}
+
 /// Extract the host from a provider `base-url`/`host` string without pulling in
 /// a URL-parsing dependency. Handles `scheme://`, userinfo, `[ipv6]`, and ports.
 fn url_host(url: &str) -> Option<String> {
@@ -2026,10 +2060,21 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
     });
 
     // (llm/chat messages {:model "..." :tools [...] :tool-mode :auto ...})
-    register_fn_ctx_gated(
+    // Synchronous / no-tools-needed twin. The Sema-visible `llm/chat` is a prelude
+    // dispatcher (mirrors `agent/run`): in async context WITH a configured tool
+    // loop it drives `__chat-begin` + the shared `__agent-*` step natives instead
+    // (a native can't loop-yield across multiple provider rounds); every other
+    // case — top level, or async with no `:tools`/`:tool-mode :none` — reaches
+    // this native, which is otherwise byte-identical to the pre-split `llm/chat`
+    // (its own `in_async_context()` branch below already offloads the no-tools
+    // completion — WP-LLM-SIMPLE). Gated as "llm/chat" (not this native's own
+    // registration name) so a sandboxed caller sees the same `PermissionDenied`
+    // regardless of which internal entry point actually runs.
+    register_fn_ctx_gated_as(
         env,
         sandbox,
         sema_core::Caps::LLM,
+        "__llm-chat-blocking",
         "llm/chat",
         |ctx, args| {
             if args.is_empty() || args.len() > 2 {
@@ -2106,7 +2151,14 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
                 track_usage(&response.usage)?;
                 Ok(Value::string(&response.content))
             } else {
-                // Chat with tool execution loop
+                // Chat with tool execution loop, synchronously — `run_tool_loop` is a
+                // Rust `for` over rounds that blocks the VM thread per round. Reached
+                // from top level (this IS "the" tool loop there) and, in principle,
+                // from async context too, but the prelude dispatcher never routes an
+                // async call with a configured tool loop here: `__chat-begin` returns
+                // a token (not nil) whenever `tools`/`tool-mode` would take this
+                // branch, so the dispatcher drives `__agent-step`/`__agent-exec-tools`
+                // instead (see the `llm/chat` prelude entry, sema-eval/prelude.rs).
                 let tool_schemas = build_tool_schemas(&tools)?;
                 let (result, _msgs) = run_tool_loop(
                     ctx,
@@ -2977,6 +3029,23 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
         let token = agent_token_arg(args, "__agent-finish")?;
         agent_finish(token)
     });
+
+    // `llm/chat`'s `:tools` twin of `__agent-begin`: builds an ordinary agent-loop
+    // handle directly from raw messages + an options map (llm/chat has no
+    // session/memory/agent-object surface to unpack), so the SAME `__agent-step` /
+    // `__agent-exec-tools` / `__agent-finish` / `__agent-drive` machinery above
+    // drives it. Returns nil (not a token) when no tool loop is needed, so the
+    // prelude dispatcher falls through to `__llm-chat-blocking`, which already
+    // offloads the plain-completion case (WP-LLM-SIMPLE). Gated as "llm/chat" —
+    // see `register_fn_ctx_gated_as`.
+    register_fn_ctx_gated_as(
+        env,
+        sandbox,
+        sema_core::Caps::LLM,
+        "__chat-begin",
+        "llm/chat",
+        |_ctx, args| chat_begin(args),
+    );
 
     // Non-blocking streaming natives (the `__stream-drive` prelude loop's
     // primitives; same bytecode-driven shape as the `__agent-*` loop above).
@@ -8037,6 +8106,140 @@ fn agent_begin(args: &[Value]) -> Result<Value, SemaError> {
         memory_handle,
         pre_user_count,
         agent_model: agent.model.clone(),
+        agent_span: Some(agent_span),
+        conv_guard,
+        owning_task_id: sema_core::current_task_id(),
+    };
+
+    let token = AGENT_RUN_NEXT_ID.with(|c| {
+        let id = c.get();
+        c.set(id + 1);
+        id
+    });
+    AGENT_RUNS.with(|r| r.borrow_mut().insert(token, state));
+    Ok(Value::int(token as i64))
+}
+
+/// `__chat-begin(messages, opts?) → token-int | nil`. The `:tools` twin of
+/// `__agent-begin`: `llm/chat` takes the full message list + tools/model/system
+/// inline per call — no defagent to unpack, no `:session`/`:memory` surface — so
+/// this builds the SAME `AgentLoopState` shape directly from the parsed args,
+/// mirroring `run_tool_loop`'s own setup (a caller-id-or-fresh conversation scope +
+/// a nameless agent span) rather than `agent_begin`'s (which threads a defagent's
+/// identity + `:session`/`:memory` resolution through). The options parsing below
+/// is intentionally byte-identical to `__llm-chat-blocking`'s.
+///
+/// Returns nil when no tool loop is needed — the same `tools.is_empty() ||
+/// tool_mode == "none"` condition `__llm-chat-blocking` checks — so the prelude
+/// dispatcher falls through to that native, which already offloads the
+/// plain-completion case in async context (WP-LLM-SIMPLE); nothing agent-loop
+/// specific (span, conversation scope, slab entry) is created on that path.
+/// `has_opts: false` unconditionally, so `__agent-finish` returns llm/chat's
+/// bare-string contract, never the `{:response ...}` agent envelope.
+fn chat_begin(args: &[Value]) -> Result<Value, SemaError> {
+    if args.is_empty() || args.len() > 2 {
+        return Err(SemaError::arity("llm/chat", "1-2", args.len()));
+    }
+    let messages = extract_messages(&args[0])?;
+
+    let mut model = String::new();
+    let mut max_tokens = None;
+    let mut temperature = None;
+    let mut system = None;
+    let mut reasoning_effort = None;
+    let mut tools: Vec<Value> = Vec::new();
+    let mut tool_mode = "auto".to_string();
+    let mut max_tool_rounds = 10usize;
+    let mut on_tool_call: Option<Value> = None;
+    let mut conv_scope = ConvScope::default();
+
+    let opts = args.get(1).and_then(|v| v.as_map_rc());
+    if let Some(ref o) = opts {
+        conv_scope = ConvScope::from_opts(Some(o));
+        model = get_opt_string(o, "model").unwrap_or_default();
+        max_tokens = get_opt_u32(o, "max-tokens");
+        temperature = get_opt_f64(o, "temperature");
+        system = get_opt_string(o, "system");
+        reasoning_effort = get_opt_effort(o, "reasoning-effort");
+        on_tool_call = o.get(&Value::keyword("on-tool-call")).cloned();
+        if let Some(t) = o.get(&Value::keyword("tools")).and_then(|v| v.as_seq()) {
+            tools = t.to_vec();
+        }
+        if let Some(mode) = o.get(&Value::keyword("tool-mode")) {
+            if let Some(s) = mode.as_keyword() {
+                tool_mode = s;
+            }
+        }
+        if let Some(rounds) = o.get(&Value::keyword("max-tool-rounds")) {
+            if let Some(n) = rounds.as_int() {
+                max_tool_rounds = n as usize;
+            }
+        }
+    }
+
+    if tools.is_empty() || tool_mode == "none" {
+        return Ok(Value::nil());
+    }
+
+    let tool_schemas = build_tool_schemas(&tools)?;
+    let first_input = messages
+        .iter()
+        .find(|m| m.role == "user")
+        .map(|m| m.content.to_text())
+        .unwrap_or_default();
+
+    // `run_tool_loop`'s own scope resolution (a caller-supplied id wins; otherwise
+    // a fresh one) — not `agent_begin`'s :session/:memory-aware precedence, which
+    // llm/chat has neither of.
+    let output_conv_id = conv_scope
+        .conversation
+        .clone()
+        .unwrap_or_else(sema_otel::new_conversation_id);
+    let conv_guard = Some(sema_otel::set_conversation_scope(
+        &output_conv_id,
+        conv_scope.session.as_deref(),
+        conv_scope.user.as_deref(),
+    ));
+    // Nameless agent span — matches `run_tool_loop`'s `agent_span(None)` call for
+    // llm/chat (only `agent/run` names the span after its defagent).
+    let agent_span = sema_otel::agent_span(None);
+    if let Some(o) = opts.as_ref() {
+        let tags = get_opt_string_list(o, "tags");
+        let meta = get_opt_str_map(o, "metadata");
+        if !tags.is_empty() {
+            agent_span.set_tags(&tags);
+        }
+        if !meta.is_empty() {
+            agent_span.set_metadata(&meta);
+        }
+    }
+
+    let agent_model = model.clone();
+    let state = AgentLoopState {
+        messages,
+        tools,
+        tool_schemas,
+        model,
+        max_tokens,
+        temperature,
+        system,
+        reasoning_effort,
+        on_tool_call,
+        on_text: None, // llm/chat doesn't stream
+        round: 0,
+        max_rounds: max_tool_rounds,
+        consecutive_errors: 0,
+        pending_tool_calls: Vec::new(),
+        last_content: String::new(),
+        first_input,
+        done: false,
+        abort_error: None,
+        final_pushed: false,
+        output_conv_id,
+        has_opts: false, // llm/chat always returns the bare completion string
+        memory_handle: None,
+        pre_user_count: 0,
+        agent_model,
         agent_span: Some(agent_span),
         conv_guard,
         owning_task_id: sema_core::current_task_id(),

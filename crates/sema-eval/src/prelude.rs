@@ -735,6 +735,52 @@ pub const PRELUDE: &str = r#"
              (catch __e (begin (__agent-finish __h) (throw __e)))))
       (apply __agent-run-blocking __agent __input __rest)))
 
+;; llm/chat: a thin dispatcher, exactly like `agent/run` above (closes the drift
+;; documented in docs/plans/archive/2026-07-02-nonblocking-agent-run.md, whose plan
+;; said BOTH agent/run and llm/chat's tool loop would become dispatchers — only
+;; agent/run had shipped). `llm/chat`'s `:tools` loop is `run_tool_loop` under the
+;; hood too, and a native can't loop-yield across multiple provider rounds any more
+;; here than in the agent case, so in async context this reuses the SAME driver:
+;; `__chat-begin` builds an ordinary agent-loop handle straight from the raw
+;; messages + opts (llm/chat has no defagent/:session/:memory to unpack) and
+;; `__agent-drive` runs it — tool rounds interleave with sibling tasks exactly like
+;; an agent/run loop does. `__chat-begin` returns nil when the call has no
+;; `:tools` (or `:tool-mode :none`) to loop over; that case, and the whole
+;; sync/top-level path, falls through to `__llm-chat-blocking` — which already
+;; offloads its own plain-completion case in async context (WP-LLM-SIMPLE), so
+;; nothing agent-loop-shaped (span, conversation scope, slab entry) is created for
+;; it. `__chat-begin` forces the loop state's `has_opts` false, so `__agent-finish`
+;; returns llm/chat's bare completion-string contract, never the agent `{:response
+;; ...}` envelope — the Sema-visible signature/return shape/error behavior of
+;; `llm/chat` is unchanged either way.
+;;
+;; `__llm-chat-blocking` is dispatched through `__chat-call-blocking`, NOT `apply`:
+;; `apply` invokes its target via `call_function` (sema-stdlib/list.rs), which
+;; rejects a native that actually sets the yield signal when called that way
+;; (`check_hof_yield` — only a direct bytecode CALL propagates a yield cleanly),
+;; and `__llm-chat-blocking`'s no-`:tools` branch genuinely yields in async
+;; context (`do_complete_async_yield`, WP-LLM-SIMPLE). `__chat-begin` never
+;; yields, so `apply`ing it above is fine regardless of arg count.
+(define (llm/chat . __chat-args)
+  (if (__async-context?)
+      (let ((__h (apply __chat-begin __chat-args)))
+        (if (nil? __h)
+            (__chat-call-blocking __chat-args)
+            (try (__agent-drive __h)
+                 (catch __e (begin (__agent-finish __h) (throw __e))))))
+      (__chat-call-blocking __chat-args)))
+
+;; Direct-call dispatch for `__llm-chat-blocking`'s 1-or-2-arg contract (see the
+;; `apply` note above). A malformed call (0 or 3+ args) falls through to `apply`
+;; instead — safe there, since the native's own arity check rejects it before
+;; touching anything that could yield, so `apply`'s HOF-yield guard never fires.
+(define (__chat-call-blocking __args)
+  (cond
+    ((null? __args) (apply __llm-chat-blocking __args))
+    ((null? (cdr __args)) (__llm-chat-blocking (car __args)))
+    ((null? (cddr __args)) (__llm-chat-blocking (car __args) (cadr __args)))
+    (else (apply __llm-chat-blocking __args))))
+
 ;; ── Non-blocking streaming (llm/stream + agent :on-text rounds, ADR #68) ──────
 ;; Same pivotal constraint as the agent loop: a native cannot loop-yield, so the
 ;; per-delta loop lives in bytecode. The wire side streams on the I/O pool into a

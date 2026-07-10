@@ -114,3 +114,75 @@ fn tools_with_schema_returns_text_and_ignores_schema_v1() {
     // The tool call still journaled.
     assert_eq!(wc::events_of(&out.events, "agent.tool_call").len(), 1);
 }
+
+/// WP-LLM-CHAT-TOOLS: `step`'s `:tools` branch expands to `llm/chat` (see the `step`
+/// macro doc comment in sema-eval/prelude.rs), which is now a non-blocking dispatcher
+/// in async context — so two concurrent `step`s each running a real tool loop must
+/// NOT block a sibling task for their combined duration. Proven end to end through
+/// the `step` macro (not `llm/chat` directly), via a deterministic channel-ordering
+/// signal rather than a wall-clock assert.
+#[test]
+fn tools_step_fanout_lets_sibling_run_during_two_concurrent_loops() {
+    let fake = FakeProvider::builder("fake")
+        .model("fake-model")
+        .chat_delay(150)
+        .tool_loop(
+            1,
+            "get-weather",
+            serde_json::json!({ "city": "Oslo" }),
+            "sunny",
+        )
+        .build();
+
+    let src = format!(
+        r#"
+        {WEATHER_TOOL}
+        (defworkflow tool-fanout
+          "two concurrent :tools steps don't block a sibling task"
+          {{:phases ["Go"]}}
+          (phase "Go")
+          (let ((out (channel/new 8)))
+            (async/all
+              (list
+                (async/spawn (fn ()
+                  (step "weather in Oslo?" {{:tools [get-weather] :name "scout-a"}})
+                  (channel/send out "step-a")))
+                (async/spawn (fn ()
+                  (step "weather in Bergen?" {{:tools [get-weather] :name "scout-b"}})
+                  (channel/send out "step-b")))
+                (async/spawn (fn () (sleep 20) (channel/send out "sibling")))))
+            (let ((order (list (channel/recv out) (channel/recv out) (channel/recv out))))
+              {{:status :success :order order}})))
+    "#
+    );
+
+    let out = wc::run_once(&src, fake, "wf_tools_fanout");
+
+    assert_eq!(out.result["status"], "success");
+    let order: Vec<String> = out.result["order"]
+        .as_array()
+        .expect("order array")
+        .iter()
+        .map(|v| v.as_str().expect("string entry").to_string())
+        .collect();
+    let sibling_pos = order
+        .iter()
+        .position(|v| v == "sibling")
+        .expect("sibling value received");
+    let step_a_pos = order
+        .iter()
+        .position(|v| v == "step-a")
+        .expect("step-a value received");
+    let step_b_pos = order
+        .iter()
+        .position(|v| v == "step-b")
+        .expect("step-b value received");
+    assert!(
+        sibling_pos < step_a_pos && sibling_pos < step_b_pos,
+        "sibling task must complete while BOTH steps' tool loops are still in \
+         flight — the step macro's :tools path must be non-blocking, got {order:?}"
+    );
+
+    // Both steps genuinely ran a real (correlated) tool call.
+    assert_eq!(wc::events_of(&out.events, "agent.tool_call").len(), 2);
+}

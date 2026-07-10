@@ -298,7 +298,9 @@ fn needs_auth_or_interactive(
             if decl.persist != McpPersist::None {
                 let _ = scoped_store.save(&creds);
             }
-            connect_with_token(decl, &creds.tokens, "consented")
+            // `None`: this connect IS the interactive retry — a still-rejected
+            // freshly-consented token must gate immediately, never prompt again.
+            connect_with_token(decl, &creds.tokens, "consented", None)
         }
         Err(reason) => {
             eprintln!("{}: authentication failed — {reason}", decl.alias);
@@ -402,7 +404,7 @@ fn resolve_authenticated_http(
 
     let now = store::now_unix();
     if !stored.tokens.is_expired(now, EXPIRY_SKEW_SECS) {
-        return connect_with_token(decl, &stored.tokens, "cached");
+        return connect_with_token(decl, &stored.tokens, "cached", Some((workflow, run_id)));
     }
 
     if stored.tokens.refresh_token.is_some() {
@@ -417,7 +419,12 @@ fn resolve_authenticated_http(
             Ok(tokens) => {
                 stored.tokens = tokens;
                 let _ = scoped_store.save(&stored);
-                return connect_with_token(decl, &stored.tokens, "refreshed");
+                return connect_with_token(
+                    decl,
+                    &stored.tokens,
+                    "refreshed",
+                    Some((workflow, run_id)),
+                );
             }
             Err(_) => {
                 // Refresh failure re-gates rather than deleting the stored
@@ -433,10 +440,27 @@ fn resolve_authenticated_http(
 }
 
 /// Connect with a resolved access token attached as a Bearer header. A connect
-/// that itself reports `NeedsAuth` (the server rejects the token) re-gates
-/// WITHOUT deleting the stored credentials — a transient server-side issue
-/// shouldn't force a fresh consent when the token might still be valid on retry.
-fn connect_with_token(decl: &McpDecl, tokens: &TokenSet, source: &str) -> ServerResolution {
+/// that itself reports `NeedsAuth` (the server rejects a token this process
+/// believed was locally fresh) re-gates WITHOUT deleting the stored
+/// credentials — a transient server-side issue shouldn't force a fresh consent
+/// when the token might still be valid on the next run.
+///
+/// `retry_ctx`: `Some((workflow, run_id))` allows ONE interactive retry on that
+/// `NeedsAuth` (via [`needs_auth_or_interactive`]) when interactive auth is
+/// enabled — `needs_auth_or_interactive` applies its own
+/// `interactive_auth_enabled`/`browser_open_allowed` gate, so passing `Some`
+/// here is a "may retry", not a "will retry". `None` disables the retry
+/// entirely; the ONE existing caller that passes `None` is
+/// `needs_auth_or_interactive` itself, feeding back the token it just
+/// consented to — that call IS the retry, so a second `NeedsAuth` here must
+/// gate straight to `needs_auth` rather than prompting again (a one-shot
+/// guard, not recursion).
+fn connect_with_token(
+    decl: &McpDecl,
+    tokens: &TokenSet,
+    source: &str,
+    retry_ctx: Option<(&str, &str)>,
+) -> ServerResolution {
     let cfg = spec_config_value(&decl.spec, Some(&tokens.access_token));
     let opts = ConnectOpts {
         interactive_auth: false,
@@ -454,7 +478,12 @@ fn connect_with_token(decl: &McpDecl, tokens: &TokenSet, source: &str) -> Server
         },
         Err(ConnectFailure::NeedsAuth { url }) => {
             let auth = decl.auth.clone().unwrap_or_default();
-            needs_auth(decl, &auth, &url)
+            match retry_ctx {
+                Some((workflow, run_id)) => {
+                    needs_auth_or_interactive(decl, &auth, &url, workflow, run_id)
+                }
+                None => needs_auth(decl, &auth, &url),
+            }
         }
         Err(ConnectFailure::Failed(reason)) => ServerResolution::Failed {
             alias: decl.alias.clone(),

@@ -195,6 +195,23 @@ fn forbidden() -> JsonResponse {
     )
 }
 
+/// Constant-time comparison for the write-route session-token check: a naive
+/// `!=` bails out at the first mismatched byte, giving a timing attacker a
+/// byte-at-a-time oracle to guess `state.token` with. `header` missing is
+/// still a fast reject (there is no byte content to compare in constant
+/// time against), but any present header of the RIGHT length is compared for
+/// its full length regardless of where the mismatch is.
+fn token_matches(header: Option<&str>, expected: &str) -> bool {
+    let Some(given) = header else {
+        return false;
+    };
+    let (a, b) = (given.as_bytes(), expected.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
 fn route(
     method: &str,
     path: &str,
@@ -250,7 +267,7 @@ fn route(
             // a wrong/missing token must never reveal whether a run or alias
             // exists, and must never start a flow.
             ("POST", [id, "auth", alias, action @ ("connect" | "forget")]) => {
-                if token_header != Some(state.token.as_str()) {
+                if !token_matches(token_header, &state.token) {
                     return forbidden();
                 }
                 match *action {
@@ -426,6 +443,40 @@ mod tests {
             &state,
         );
         assert_eq!(s, "403 Forbidden");
+    }
+
+    #[test]
+    fn connect_with_same_length_wrong_token_is_403() {
+        // Same length as TEST_TOKEN, differing only in the last byte — the
+        // case a short-circuiting `==`/`!=` and the constant-time compare
+        // must reject identically.
+        let dir = std::path::Path::new("/nonexistent-run-dir");
+        let state = test_state(dir);
+        let mut wrong = TEST_TOKEN.to_string();
+        wrong.pop();
+        wrong.push('0');
+        assert_eq!(wrong.len(), TEST_TOKEN.len());
+        assert_ne!(wrong, TEST_TOKEN);
+        let (s, _, _) = route(
+            "POST",
+            "/api/run/some-run/auth/asana/connect",
+            Some(wrong.as_str()),
+            &state,
+        );
+        assert_eq!(s, "403 Forbidden");
+    }
+
+    #[test]
+    fn token_matches_is_constant_time_safe_and_correct() {
+        assert!(token_matches(Some(TEST_TOKEN), TEST_TOKEN));
+        assert!(!token_matches(None, TEST_TOKEN));
+        assert!(!token_matches(Some(""), TEST_TOKEN));
+        assert!(!token_matches(Some("short"), TEST_TOKEN));
+        // Same length, last byte differs.
+        let mut wrong = TEST_TOKEN.to_string();
+        wrong.pop();
+        wrong.push('0');
+        assert!(!token_matches(Some(&wrong), TEST_TOKEN));
     }
 
     #[test]

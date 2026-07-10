@@ -195,10 +195,13 @@ pub async fn post_token(
                 None => err.error,
             });
         }
+        // Not OAuth-error-shaped JSON: the body is unknown-shaped and possibly
+        // sensitive (a stack trace, an internal error page, …), so it never
+        // goes into the error string — only the status and a byte count.
         return Err(format!(
-            "token endpoint HTTP {}: {}",
+            "token endpoint HTTP {}: unrecognized error body ({} bytes)",
             status.as_u16(),
-            text.trim()
+            text.len()
         ));
     }
 
@@ -250,6 +253,47 @@ mod tests {
         assert!(
             !url.contains("scope="),
             "no scope param when none requested"
+        );
+    }
+
+    /// A non-OAuth-error-shaped `500` body (an internal error page, a stack
+    /// trace, …) must never be embedded verbatim in the returned error string
+    /// — only the HTTP status and a byte count. `device.rs::poll_for_token`
+    /// pattern-matches `err.starts_with("authorization_pending" | "slow_down")`
+    /// against the OAuth-error-shaped branch ABOVE this one; this test only
+    /// touches the fallback, so that contract is untouched (proved by the
+    /// `sema-mcp` device/flow test suite continuing to pass).
+    #[tokio::test]
+    async fn post_token_error_redacts_unrecognized_body() {
+        let server =
+            tiny_http::Server::http("127.0.0.1:0").expect("bind mock token-endpoint listener");
+        let port = server
+            .server_addr()
+            .to_ip()
+            .expect("loopback address")
+            .port();
+        let handler = std::thread::spawn(move || {
+            let request = server.recv().expect("receive token request");
+            let response = tiny_http::Response::from_string("secret-blob").with_status_code(500);
+            let _ = request.respond(response);
+        });
+
+        let client = reqwest::Client::new();
+        let err = post_token(
+            &client,
+            &format!("http://127.0.0.1:{port}/token"),
+            vec![("grant_type", "authorization_code")],
+            None,
+        )
+        .await
+        .expect_err("a non-OAuth-shaped 500 body must still be an error");
+
+        handler.join().expect("mock server thread panicked");
+
+        assert!(err.contains("500"), "status must be preserved: {err}");
+        assert!(
+            !err.contains("secret-blob"),
+            "raw body must never be embedded: {err}"
         );
     }
 }

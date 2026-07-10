@@ -115,8 +115,7 @@ pub fn register(env: &sema_core::Env) {
             if let Some(v) = take_resume_value() {
                 return Ok(v);
             }
-            let deadline = started + Duration::from_millis(timeout_ms as u64);
-            return crate::io::await_io_until(deadline, move || {
+            return crate::io::await_io_until(started, timeout_ms as u64, move || {
                 sources.iter().find_map(|s| ready(s, started).map(Ok))
             });
         }

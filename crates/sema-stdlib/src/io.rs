@@ -603,31 +603,40 @@ pub(crate) fn poll_key_event(_ms: u64) -> Option<Value> {
 }
 
 /// Cooperatively poll `ready` on the scheduler thread until it yields a value or
-/// `deadline` passes (then `nil`), rather than blocking the OS thread in a
-/// `select(2)`/`sleep` wait. The async-context path of `io/read-key-timeout` and
-/// `event/select`: a "wait for input OR agent progress" loop must not stall the
-/// single cooperative scheduler thread while it waits, so we arm the same
-/// `AwaitIo` yield the file/http/shell async paths use — its poll closure
-/// re-checks readiness each scheduler tick (every sibling step, and at worst
-/// ~50 ms while every task is parked). `ready` returns `Some(Ok(v))` when input
-/// is available, `Some(Err(e))` to reject the task, or `None` while still
-/// waiting.
+/// `timeout_ms` milliseconds have elapsed since `started` (then `nil`), rather
+/// than blocking the OS thread in a `select(2)`/`sleep` wait. The async-context
+/// path of `io/read-key-timeout` and `event/select`: a "wait for input OR agent
+/// progress" loop must not stall the single cooperative scheduler thread while
+/// it waits, so we arm the same `AwaitIo` yield the file/http/shell async paths
+/// use — its poll closure re-checks readiness each scheduler tick (every
+/// sibling step, and at worst ~50 ms while every task is parked). `ready`
+/// returns `Some(Ok(v))` when input is available, `Some(Err(e))` to reject the
+/// task, or `None` while still waiting.
+///
+/// The timeout is checked as `started.elapsed() >= timeout_ms`, never as
+/// `started + Duration` — `Instant + Duration` panics on overflow, and unlike
+/// the sync path (`unix_stdin_ready`, a plain `libc::select` timeval) an
+/// arbitrarily large `ms` must not be able to crash the scheduler thread.
 ///
 /// Unlike the `fs_offload`/`shell_async` poll closures (which cross no thread
 /// boundary but deliberately capture only `Send` data), `ready` here runs
 /// entirely on the VM thread and MAY capture Sema `Value`s (e.g. `event/select`'s
 /// source maps). That is sound: the cycle collector (Bacon–Rajan trial deletion)
 /// cannot trace into the boxed closure, so any `Value` it holds keeps a strong
-/// `Rc` the collector never subtracts — conservatively pinned, never freed — and
-/// the handle is dropped the moment the task resumes, so nothing leaks.
+/// `Rc` the collector can't account for — but only for as long as the
+/// `IoHandle` is alive. The handle (closure and all) is dropped the moment the
+/// task resumes or is cancelled, which releases those `Rc`s normally; nothing
+/// is pinned beyond the handle's own lifetime.
 pub(crate) fn await_io_until(
-    deadline: std::time::Instant,
+    started: std::time::Instant,
+    timeout_ms: u64,
     mut ready: impl FnMut() -> Option<Result<Value, String>> + 'static,
 ) -> Result<Value, SemaError> {
+    let timeout = std::time::Duration::from_millis(timeout_ms);
     let handle = std::rc::Rc::new(sema_core::IoHandle::new(move || match ready() {
         Some(Ok(v)) => sema_core::IoPoll::Ready(Ok(v)),
         Some(Err(e)) => sema_core::IoPoll::Ready(Err(e)),
-        None if std::time::Instant::now() >= deadline => sema_core::IoPoll::Ready(Ok(Value::nil())),
+        None if started.elapsed() >= timeout => sema_core::IoPoll::Ready(Ok(Value::nil())),
         None => sema_core::IoPoll::Pending,
     }));
     sema_core::set_yield_signal(sema_core::YieldReason::AwaitIo(handle));
@@ -1542,8 +1551,8 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
                 if let Some(v) = sema_core::take_resume_value() {
                     return Ok(v);
                 }
-                let deadline = std::time::Instant::now() + std::time::Duration::from_millis(ms);
-                return await_io_until(deadline, || {
+                let started = std::time::Instant::now();
+                return await_io_until(started, ms, || {
                     if !unix_stdin_ready(0) {
                         return None;
                     }

@@ -342,6 +342,16 @@ eval_tests! {
     string_wrap_words: r#"(string/word-wrap "the quick brown fox" 10)"# => common::eval(r#"'("the quick" "brown fox")"#),
     string_wrap_hard_break: r#"(string/word-wrap "abcdefghij k" 5)"# => common::eval(r#"'("abcde" "fghij" "k")"#),
     string_wrap_keeps_newlines: r#"(string/word-wrap "a\nb" 10)"# => common::eval(r#"'("a" "b")"#),
+    // string/truncate-width — clamp to display columns, grapheme-safe, optional ellipsis.
+    string_truncate_width_unchanged: r#"(string/truncate-width "hello" 10)"# => Value::string("hello"),
+    string_truncate_width_exact: r#"(string/truncate-width "hello" 5)"# => Value::string("hello"),
+    string_truncate_width_plain: r#"(string/truncate-width "hello world" 5)"# => Value::string("hello"),
+    string_truncate_width_cjk: r#"(string/truncate-width "日本語です" 6)"# => Value::string("日本語"),
+    string_truncate_width_emoji_boundary: r#"(string/truncate-width "a👋b" 2)"# => Value::string("a"),
+    string_truncate_width_ellipsis: r#"(string/truncate-width "hello world" 6 "…")"# => Value::string("hello…"),
+    string_truncate_width_ellipsis_unchanged: r#"(string/truncate-width "hi" 6 "…")"# => Value::string("hi"),
+    string_truncate_width_ellipsis_too_wide: r#"(string/truncate-width "hello world" 1 "…")"# => Value::string("…"),
+    string_truncate_width_zero: r#"(string/truncate-width "hello" 0)"# => Value::string(""),
     // Terminal setup/teardown guard macros return the body value and re-raise
     // after restoring (teardown always runs — the emitted escapes go to stdout).
     guard_alt_screen_returns_body: "(term/with-alt-screen 1 2 3)" => Value::int(3),
@@ -1378,8 +1388,8 @@ eval_tests! {
 
 eval_error_tests! {
     map_indexed_wrong_arity: "(map-indexed (fn (i x) x))" => "arity",
-    map_indexed_non_sequence_errors: "(map-indexed (fn (i x) x) 5)" => "list or vector",
-    enumerate_non_sequence_errors: "(enumerate 5)" => "list or vector",
+    map_indexed_non_sequence_errors: "(map-indexed (fn (i x) x) 5)" => "list, vector, or mutable-array",
+    enumerate_non_sequence_errors: "(enumerate 5)" => "list, vector, or mutable-array",
 }
 
 // ============================================================
@@ -1923,6 +1933,7 @@ eval_error_tests! {
     // STD-4
     string_pad_left_negative: r#"(string/pad-left "x" -1)"# => "non-negative",
     string_pad_right_negative: r#"(string/pad-right "x" -1)"# => "non-negative",
+    string_truncate_width_negative: r#"(string/truncate-width "x" -1)"# => "non-negative",
     // STD-5
     list_chunk_negative: "(list/chunk -1 (list 1 2 3))" => "non-negative",
     list_split_at_negative: "(list/split-at (list 1 2 3) -1)" => "non-negative",

@@ -9,6 +9,12 @@
   results into a list; `(enumerate xs)` pairs each element with its index as
   `(index element)` lists. Both accept a list or vector and always return a
   list.
+- **`string/truncate-width`** (#92) — clamp a string to a target display width,
+  the truncation counterpart to `string/width`. Splits on grapheme-cluster
+  boundaries so wide glyphs (CJK, emoji) are never cut in half, and takes an
+  optional ellipsis string appended within the width budget. TUI cells that
+  clip long text (palette descriptions, tool-arg cells) no longer misalign by
+  falling back to a codepoint count.
 
 ### Changed
 

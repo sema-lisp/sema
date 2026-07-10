@@ -57,6 +57,27 @@ pub fn mcp_login(url: &str, use_device: bool, client_id: Option<&str>) -> Result
     })
 }
 
+/// Store a pre-issued access token directly, skipping discovery/DCR/OAuth
+/// entirely — the headless/CI escape hatch (plan §5: "accepts a … pre-issued
+/// token"). `expires_in` (seconds, relative to now) becomes an absolute
+/// `expires_at`; `None` stores a non-expiring token. Never echoes `token`.
+pub fn mcp_login_token(url: &str, token: &str, expires_in: Option<u64>) -> Result<(), String> {
+    let creds = oauth::store::StoredCredentials {
+        server_url: url.to_string(),
+        tokens: oauth::store::TokenSet::from_response(
+            token.to_string(),
+            None,
+            expires_in,
+            None,
+            oauth::store::now_unix(),
+        ),
+        client_info: None,
+    };
+    oauth::store::default_store().save(&creds)?;
+    eprintln!("Authenticated to {url}. Token cached.");
+    Ok(())
+}
+
 /// Remove any cached credentials for a remote MCP server.
 pub fn mcp_logout(url: &str) -> Result<(), String> {
     oauth::store::default_store().delete(url)?;

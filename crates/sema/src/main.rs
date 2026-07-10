@@ -395,11 +395,18 @@ enum McpAuthCommands {
         /// The MCP server URL (e.g. https://mcp.example.com/mcp)
         url: String,
         /// Use the device-authorization flow instead of opening a browser
-        #[arg(long)]
+        #[arg(long, conflicts_with = "token")]
         device: bool,
         /// A pre-registered OAuth client id (when the server has no dynamic registration)
         #[arg(long = "client-id", value_name = "ID")]
         client_id: Option<String>,
+        /// Store a pre-issued access token directly, skipping discovery/DCR/OAuth
+        /// entirely — the headless/CI escape hatch (no browser, no device flow).
+        #[arg(long, conflicts_with = "device", value_name = "TOKEN")]
+        token: Option<String>,
+        /// Seconds until the pre-issued --token expires (omit for a non-expiring token)
+        #[arg(long, requires = "token", value_name = "SECS")]
+        expires_in: Option<u64>,
     },
     /// Remove cached credentials for a remote MCP server
     Logout {
@@ -498,6 +505,10 @@ enum PkgCommands {
 enum WorkflowCommands {
     /// Run a workflow file (a `.sema` program that `defworkflow`s and runs it),
     /// journaling a frozen run-directory and writing `result.json`.
+    ///
+    /// Exit codes: 0 success, 1 failed, 2 the run needs MCP authentication (see
+    /// stderr for which server(s) and the `sema mcp login` command to run, then
+    /// re-run this workflow).
     Run {
         /// Path to the `.sema` workflow file.
         file: String,
@@ -820,8 +831,16 @@ fn main() {
                     let result = match auth {
                         McpAuthCommands::Login {
                             url,
+                            token: Some(token),
+                            expires_in,
+                            ..
+                        } => sema_mcp::mcp_login_token(&url, &token, expires_in),
+                        McpAuthCommands::Login {
+                            url,
                             device,
                             client_id,
+                            token: None,
+                            ..
                         } => sema_mcp::mcp_login(&url, device, client_id.as_deref()),
                         McpAuthCommands::Logout { url } => sema_mcp::mcp_logout(&url),
                     };
@@ -1244,16 +1263,24 @@ fn run_workflow_command(command: WorkflowCommands, sandbox: &sema_core::Sandbox)
     let exit_code = match interpreter.eval_str_compiled(&content) {
         Ok(envelope) => {
             drain_async_scheduler(&interpreter);
-            let failed = envelope
+            let status = envelope
                 .as_map_rc()
                 .and_then(|m| m.get(&Value::keyword("status")).cloned())
-                .and_then(|s| s.as_keyword())
-                .is_some_and(|s| s == "failed");
-            if failed {
-                eprintln!("workflow failed: {}", pretty_print(&envelope, 80));
-                1
-            } else {
-                0
+                .and_then(|s| s.as_keyword());
+            match status.as_deref() {
+                Some("failed") => {
+                    eprintln!("workflow failed: {}", pretty_print(&envelope, 80));
+                    1
+                }
+                // The headless-precursor gate (docs/plans/2026-06-24-workflow-mcp-auth.md
+                // §3/§5): a declared `:mcp` server had no usable session. Distinct exit
+                // code so a CI/orchestrator script can branch on "needs a human to log
+                // in" vs. a genuine failure.
+                Some("needs-auth") => {
+                    eprint!("{}", format_needs_auth_guidance(&envelope));
+                    2
+                }
+                _ => 0,
             }
         }
         Err(e) => {
@@ -1271,6 +1298,40 @@ fn run_workflow_command(command: WorkflowCommands, sandbox: &sema_core::Sandbox)
         }
     }
     std::process::exit(exit_code);
+}
+
+/// Render the stderr guidance for a `{:status :needs-auth :auth [{:server :url
+/// :persist} …]}` run envelope: terse, terminal-quiet (no banners), one `sema mcp
+/// login` line per server, aliases column-aligned. A malformed/missing `:auth`
+/// vector degrades to a 0-server header rather than panicking — the exit code
+/// alone (2) is still meaningful to a script even if the guidance text is thin.
+fn format_needs_auth_guidance(envelope: &Value) -> String {
+    let entries: Vec<(String, String)> = envelope
+        .as_map_rc()
+        .and_then(|m| m.get(&Value::keyword("auth")).cloned())
+        .and_then(|a| a.as_list_rc().or_else(|| a.as_vector_rc()))
+        .map(|list| {
+            list.iter()
+                .filter_map(|entry| {
+                    let m = entry.as_map_rc()?;
+                    let server = m.get(&Value::keyword("server"))?.as_str()?.to_string();
+                    let url = m.get(&Value::keyword("url"))?.as_str()?.to_string();
+                    Some((server, url))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let width = entries.iter().map(|(s, _)| s.len()).max().unwrap_or(0);
+    let mut out = format!(
+        "run needs authentication for {} MCP server(s):\n",
+        entries.len()
+    );
+    for (server, url) in &entries {
+        out.push_str(&format!("  {server:<width$}  sema mcp login {url}\n"));
+    }
+    out.push_str("then re-run this workflow. (or authenticate from `sema workflow view`)\n");
+    out
 }
 
 /// Best-effort: open `url` in the default browser via the platform opener. Silent
@@ -3688,5 +3749,49 @@ mod tests {
 
         assert_eq!(doubled, Value::string("computed-ok"));
         assert_eq!(batched, Value::string("batch-ok"));
+    }
+
+    // ── format_needs_auth_guidance ─────────────────────────────────────────
+
+    #[test]
+    fn needs_auth_guidance_matches_the_brief_verbatim() {
+        let envelope = sema_reader::read(
+            r#"{:status :needs-auth
+                :servers ["asana" "linear"]
+                :auth [{:server "asana" :url "https://mcp.asana.com/mcp" :persist "workflow"}
+                       {:server "linear" :url "https://mcp.linear.app/mcp" :persist "workflow"}]}"#,
+        )
+        .expect("valid sema literal");
+
+        let expected = concat!(
+            "run needs authentication for 2 MCP server(s):\n",
+            "  asana   sema mcp login https://mcp.asana.com/mcp\n",
+            "  linear  sema mcp login https://mcp.linear.app/mcp\n",
+            "then re-run this workflow. (or authenticate from `sema workflow view`)\n",
+        );
+        assert_eq!(format_needs_auth_guidance(&envelope), expected);
+    }
+
+    #[test]
+    fn needs_auth_guidance_single_server() {
+        let envelope = sema_reader::read(
+            r#"{:status :needs-auth
+                :servers ["gated"]
+                :auth [{:server "gated" :url "http://127.0.0.1:1/mcp" :persist "run"}]}"#,
+        )
+        .expect("valid sema literal");
+
+        let out = format_needs_auth_guidance(&envelope);
+        assert!(out.starts_with("run needs authentication for 1 MCP server(s):\n"));
+        assert!(out.contains("  gated  sema mcp login http://127.0.0.1:1/mcp\n"));
+        assert!(out
+            .ends_with("then re-run this workflow. (or authenticate from `sema workflow view`)\n"));
+    }
+
+    #[test]
+    fn needs_auth_guidance_missing_auth_vector_degrades_to_zero_servers() {
+        let envelope = sema_reader::read(r#"{:status :needs-auth}"#).expect("valid sema literal");
+        let out = format_needs_auth_guidance(&envelope);
+        assert!(out.starts_with("run needs authentication for 0 MCP server(s):\n"));
     }
 }

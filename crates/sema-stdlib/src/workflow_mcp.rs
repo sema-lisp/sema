@@ -685,6 +685,15 @@ mod tests {
     }
 
     #[test]
+    fn headers_key_must_be_string() {
+        let e = err_of(r#"{:mcp {asana {:url "https://x" :headers {42 "Bearer t"}}}}"#);
+        assert!(
+            e.to_string().contains(":headers keys must be strings"),
+            "{e}"
+        );
+    }
+
+    #[test]
     fn headers_parses_string_pairs() {
         let decls = declared_mcp(&meta_of(
             r#"{:mcp {asana {:url "https://x" :headers {"Authorization" "Bearer t"}}}}"#,
@@ -703,6 +712,12 @@ mod tests {
     fn env_value_must_be_string() {
         let e = err_of(r#"{:mcp {fs {:command "npx" :env {"TOKEN" 1}}}}"#);
         assert!(e.to_string().contains(":env value"), "{e}");
+    }
+
+    #[test]
+    fn env_key_must_be_string() {
+        let e = err_of(r#"{:mcp {fs {:command "npx" :env {42 "value"}}}}"#);
+        assert!(e.to_string().contains(":env keys must be strings"), "{e}");
     }
 
     #[test]

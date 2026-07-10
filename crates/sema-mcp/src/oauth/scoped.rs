@@ -270,11 +270,6 @@ impl ScopedFileStore {
         }
     }
 
-    /// The directory this store writes into.
-    pub fn dir(&self) -> &Path {
-        &self.dir
-    }
-
     fn file_path(&self, server_url: &str) -> PathBuf {
         self.dir.join(server_filename(server_url))
     }
@@ -492,7 +487,7 @@ pub fn store_encryption_key() -> Result<[u8; 32], String> {
 #[cfg(test)]
 mod tests {
     use super::super::store::{ClientInfo, StoredCredentials, TokenSet, TokenStore};
-    use super::{store_encryption_key, MemoryStore, PersistScope, ScopedFileStore};
+    use super::{store_encryption_key, Envelope, MemoryStore, PersistScope, ScopedFileStore};
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -573,6 +568,34 @@ mod tests {
             hit_a_file = true;
         }
         assert!(hit_a_file, "expected save() to create a file");
+    }
+
+    #[test]
+    fn scoped_file_store_uses_a_fresh_nonce_per_save() {
+        let dir = temp_root().join("auth");
+        let store = ScopedFileStore::new(dir.clone(), KEY_A);
+        let creds = sample("https://mcp.example.com/mcp");
+
+        let envelope_nonce = || {
+            let mut path = None;
+            for entry in std::fs::read_dir(&dir).unwrap() {
+                path = Some(entry.unwrap().path());
+            }
+            let bytes = std::fs::read(path.unwrap()).unwrap();
+            let envelope: Envelope = serde_json::from_slice(&bytes).unwrap();
+            envelope.nonce
+        };
+
+        store.save(&creds).unwrap();
+        let first_nonce = envelope_nonce();
+
+        store.save(&creds).unwrap();
+        let second_nonce = envelope_nonce();
+
+        assert_ne!(
+            first_nonce, second_nonce,
+            "two successive save()s of the same credentials must use independent random nonces"
+        );
     }
 
     #[test]

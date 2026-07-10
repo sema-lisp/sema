@@ -159,7 +159,8 @@ pub enum WorkflowEvent {
     },
 
     /// Last line of every run. `status` mirrors the `{:status …}` envelope's status
-    /// (`"success"` / `"failed"`); `reason` carries the failure reason when failed.
+    /// (`"success"` / `"failed"` / `"needs-auth"`); `reason` carries the failure
+    /// reason when failed.
     #[serde(rename = "run.ended")]
     RunEnded {
         seq: u64,
@@ -235,6 +236,7 @@ pub enum WorkflowEvent {
         /// The workflow's declared alias for the server, never a token, header, or
         /// URL with credentials.
         server: String,
+        /// The `:mcp` spec's requested OAuth scopes.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         scopes: Vec<String>,
         /// Absolute unix-seconds expiry of the granted session; `None` when the

@@ -237,12 +237,20 @@ fn resolve_authenticated_http(
     // default (keyring/file) store — a hit there is imported (saved) into the
     // scoped store (except :none, which just uses it for this run), so a prior
     // `sema mcp login <url>` satisfies any workflow (the plan's headless loop).
-    let (stored, imported_from_default) = match scoped_store.load(url) {
-        Some(creds) => (Some(creds), false),
-        None => match store::default_store().load(url) {
-            Some(creds) => (Some(creds), true),
-            None => (None, false),
-        },
+    // `:keyring` persist skips the fallback: `store_for` already resolved
+    // `scoped_store` to `default_store()` for that scope, so re-querying it
+    // would just hit the same store, and "importing" a hit into itself is a
+    // no-op save worth skipping.
+    let (stored, imported_from_default) = if decl.persist == McpPersist::Keyring {
+        (scoped_store.load(url), false)
+    } else {
+        match scoped_store.load(url) {
+            Some(creds) => (Some(creds), false),
+            None => match store::default_store().load(url) {
+                Some(creds) => (Some(creds), true),
+                None => (None, false),
+            },
+        }
     };
 
     let Some(mut stored) = stored else {

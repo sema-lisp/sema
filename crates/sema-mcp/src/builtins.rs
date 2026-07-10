@@ -553,12 +553,11 @@ fn tool_is_allowed(allowed_tools: &Option<Vec<String>>, tool_name: &str) -> bool
 /// network call: an undeclared tool never reaches the wire, even in cassette
 /// record mode.
 fn check_tool_allowed(connection: &McpConnection, tool_name: &str) -> Result<(), SemaError> {
-    let Some(allowed) = &connection.allowed_tools else {
-        return Ok(());
-    };
-    if allowed.iter().any(|t| t == tool_name) {
+    if tool_is_allowed(&connection.allowed_tools, tool_name) {
         return Ok(());
     }
+    // `tool_is_allowed` only returns `false` for `Some(list)`, so this is populated.
+    let allowed = connection.allowed_tools.as_deref().unwrap_or_default();
     let manifest = if allowed.is_empty() {
         "(none)".to_string()
     } else {

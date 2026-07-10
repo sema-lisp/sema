@@ -85,7 +85,7 @@
 (for-each
   (fn (item)
     (let* ((label (nth item 0)) (value (nth item 1))
-           (bar-len (round (* (/ value (+ chart-max 0.0)) 40))))
+           (bar-len (int (round (* (/ value (+ chart-max 0.0)) 40)))))
       (println (format "  ~a|~a ~a"
         (string/pad-right label (+ max-label-len 1))
         (string/repeat "█" bar-len) value))))

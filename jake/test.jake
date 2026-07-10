@@ -46,7 +46,7 @@ task provider: [build]
 
 # ── Browser E2E (Playwright) ─────────────────────────────────────────
 # The editor plugins live in their own repos; these exercise the mono's own
-# browser surfaces (notebook crate + sema-web dev server).
+# browser surfaces (notebook crate, sema-web dev server, and the playground).
 
 @group test
 @desc "Notebook browser E2E (Playwright)"
@@ -66,3 +66,16 @@ task web-e2e: [wasm.web-runtime]
     echo "=== Running sema web dev-server E2E tests ==="
     @cd packages/sema-web
     npx playwright test --config playwright.dev-server.config.ts
+
+# playground/ isn't an npm workspace member (unlike packages/sema-web, whose
+# deps a root `npm ci` already covers), so this installs its own deps before
+# driving the specs. Depends on pg.build so the WASM VM + examples bundle the
+# specs exercise are current.
+@group test
+@desc "Playground browser E2E (Playwright)"
+task playground-e2e: [pg.build]
+    @needs npx npm
+    echo "=== Running playground E2E tests ==="
+    @cd playground
+    npm install
+    npx playwright test

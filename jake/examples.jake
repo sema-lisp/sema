@@ -44,6 +44,27 @@ task example-notebooks-async: [release]
 task example-notebook-serve: [build]
     cargo run --quiet -- notebook serve examples/notebook/demo.sema-nb
 
+# ── UI library vendoring ─────────────────────────────────────────────
+
+# Vendor the @sema-lang/ui bundle + design tokens into the notebook crate,
+# where they are embedded via include_str! (single-binary, offline — like the
+# bundled fonts). The library lives in its own repo (sema-lisp/ui) and ships
+# to npm, so both files are pulled from the published package (pinned
+# SEMA_UI_VERSION) rather than a local build. Re-run after bumping
+# SEMA_UI_VERSION. Naive copy: only the main bundle is vendored; lazily-loaded
+# Shiki grammar chunks aren't served, so non-`sema` code fences in markdown
+# degrade to unhighlighted (the `sema` grammar is bundled).
+SEMA_UI_VERSION = "0.2.0"
+
+@group notebook
+@desc "Vendor @sema-lang/ui bundle + tokens.css into the notebook crate (pinned SEMA_UI_VERSION)"
+@needs curl
+task notebook-ui-vendor:
+    mkdir -p crates/sema-notebook/src/ui/vendor
+    curl -fsSL https://unpkg.com/@sema-lang/ui@{{SEMA_UI_VERSION}}/dist/sema-ui.js -o crates/sema-notebook/src/ui/vendor/sema-ui.js
+    curl -fsSL https://unpkg.com/@sema-lang/ui@{{SEMA_UI_VERSION}}/src/styles/tokens.css -o crates/sema-notebook/src/ui/vendor/tokens.css
+    echo "Vendored @sema-lang/ui@{{SEMA_UI_VERSION}} -> crates/sema-notebook/src/ui/vendor/{sema-ui.js,tokens.css}"
+
 # ── LLM / provider smokes (real spend / keys) ────────────────────────
 
 # LIVE async/streaming stress against real provider APIs (real spend — cents).

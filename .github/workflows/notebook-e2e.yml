@@ -1,0 +1,62 @@
+name: notebook e2e
+
+on:
+  push:
+    paths:
+      - ".github/workflows/notebook-e2e.yml"
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "crates/sema-notebook/**"
+  pull_request:
+    paths:
+      - ".github/workflows/notebook-e2e.yml"
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "crates/sema-notebook/**"
+
+jobs:
+  e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install system dependencies
+        # The webServer command (playwright.config.ts) shells out to
+        # `cargo run --bin sema -- notebook serve`, which compiles the native
+        # binary. That pulls in `serialport` (transitive `libudev-sys`), which
+        # needs libudev-dev on Linux. Mirrors the same install in ci.yml.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libudev-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo + target
+        uses: Swatinem/rust-cache@v2
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Pre-build the sema binary
+        # The playwright webServer launches `cargo run --bin sema` with a 60s
+        # startup timeout; a cold-cache debug build takes minutes. Building here
+        # keeps the in-webServer `cargo run` near-instant.
+        run: cargo build --bin sema
+
+      - run: npm ci
+        working-directory: crates/sema-notebook/tests/e2e
+
+      - run: npx playwright install --with-deps chromium
+        working-directory: crates/sema-notebook/tests/e2e
+
+      - run: npx playwright test
+        working-directory: crates/sema-notebook/tests/e2e
+
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: playwright-results
+          # test-results/ (traces, screenshots, error context) is always
+          # produced; the config declares no html reporter.
+          path: crates/sema-notebook/tests/e2e/test-results/

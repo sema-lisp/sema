@@ -23,6 +23,7 @@ pub fn asset(path: &str) -> Option<(String, String)> {
             sema_ui_js().to_string(),
             "application/javascript".to_string(),
         )),
+        "vendor/tokens.css" => Some((tokens_css().to_string(), "text/css".to_string())),
         _ => None,
     }
 }
@@ -67,4 +68,15 @@ fn js() -> &'static str {
 ///     -o crates/sema-notebook/src/ui/vendor/sema-ui.js
 fn sema_ui_js() -> &'static str {
     include_str!("ui/vendor/sema-ui.js")
+}
+
+/// The `@sema-lang/ui` design-token sheet — the `--gold*`/`--text-*`/spacing/radius
+/// custom properties the component bundle's own styles fall back to. Linked before
+/// `style.css` so the notebook's palette overrides land on top. Vendored from the
+/// published npm package's `src/styles/tokens.css`. Refresh alongside `sema_ui_js`
+/// by fetching the pinned version from the unpkg CDN:
+///   curl -fsSL https://unpkg.com/@sema-lang/ui@<version>/src/styles/tokens.css \
+///     -o crates/sema-notebook/src/ui/vendor/tokens.css
+fn tokens_css() -> &'static str {
+    include_str!("ui/vendor/tokens.css")
 }

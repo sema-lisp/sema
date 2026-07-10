@@ -7,7 +7,7 @@ use sha2::{Digest, Sha256};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
-const GITHUB_REPO: &str = "sema-lisp/sema";
+pub(crate) const GITHUB_REPO: &str = "sema-lisp/sema";
 
 /// Maximum runtime binary size we'll accept (200 MB).
 const MAX_RUNTIME_SIZE: u64 = 200 * 1024 * 1024;
@@ -62,7 +62,7 @@ pub fn is_windows_target(target: &str) -> bool {
 }
 
 /// Return the binary name for a given target ("sema" or "sema.exe").
-fn binary_name(target: &str) -> &'static str {
+pub(crate) fn binary_name(target: &str) -> &'static str {
     if is_windows_target(target) {
         "sema.exe"
     } else {
@@ -176,7 +176,7 @@ pub fn ensure_runtime(target: &str, no_cache: bool) -> Result<PathBuf, Box<dyn s
 }
 
 /// Build a reqwest client with timeouts and a user-agent.
-fn http_client() -> Result<reqwest::blocking::Client, reqwest::Error> {
+pub(crate) fn http_client() -> Result<reqwest::blocking::Client, reqwest::Error> {
     reqwest::blocking::Client::builder()
         .user_agent(format!("sema/{}", env!("CARGO_PKG_VERSION")))
         .connect_timeout(std::time::Duration::from_secs(10))
@@ -369,7 +369,7 @@ fn download_runtime(
 /// - `abc123def...  filename.tar.xz`  (hash + filename, separated by whitespace)
 ///
 /// Returns the lowercase hex hash, or None if invalid.
-fn parse_sha256_checksum(text: &str) -> Option<String> {
+pub(crate) fn parse_sha256_checksum(text: &str) -> Option<String> {
     let hash = text.split_whitespace().next()?;
     // SHA256 is exactly 64 hex characters
     if hash.len() != 64 || !hash.chars().all(|c| c.is_ascii_hexdigit()) {
@@ -381,7 +381,7 @@ fn parse_sha256_checksum(text: &str) -> Option<String> {
 /// Extract the sema binary from a `.tar.xz` archive.
 ///
 /// Only extracts regular files; rejects symlinks, hardlinks, and oversized entries.
-fn extract_tar_xz(
+pub(crate) fn extract_tar_xz(
     data: &[u8],
     output_path: &Path,
     target: &str,
@@ -435,7 +435,7 @@ fn extract_tar_xz(
 /// Extract the sema binary from a `.zip` archive.
 ///
 /// Only extracts regular files; rejects directories and oversized entries.
-fn extract_zip(
+pub(crate) fn extract_zip(
     data: &[u8],
     output_path: &Path,
     target: &str,

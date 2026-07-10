@@ -431,6 +431,61 @@ fn test_load_special_form() {
 }
 
 #[test]
+fn test_load_recursive_fn_reads_live_global_after_cross_fn_set() {
+    // Regression for issue #82: a self-recursive function DEFINED IN A `load`ed
+    // unit that directly reads a mutable global must observe a cross-function
+    // `set!` to that global performed mid-loop. The write itself lands (fresh
+    // calls see it), but a broken VM kept the in-flight recursive reader pinned
+    // to the pre-`set!` value forever — an infinite loop (the shape of every
+    // "loop until a callback flips a flag" event loop, e.g. a TUI `/quit`).
+    //
+    // Root cause: each top-level form of a `load`ed unit runs on its own per-form
+    // VM over a clone of the caller env, and `Env::clone` used to fork the
+    // version cell the inline global cache is keyed on. So `run` and `quit!`
+    // captured home-globals handles with *independent* version cells that share
+    // one bindings map: `quit!`'s `set!` bumped only its own cell, while `run`'s
+    // recursive reader kept hitting its own never-bumped cache entry and served
+    // the pre-`set!` value forever.
+    //
+    // The manifestation is inline-cache-slot-layout sensitive (adding a colliding
+    // global read to the reproducing functions accidentally masks it), so this
+    // test keeps the exact reported repro shape (named-let + a direct `unless`
+    // read + a trailing form) and bounds a regressed hang with an eval step limit
+    // rather than by editing the loop — a broken build errors out fast instead of
+    // wedging CI.
+    let dir = std::env::temp_dir().join(format!("sema-issue82-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let lib = dir.join("lib.sema");
+    std::fs::write(
+        &lib,
+        r#"
+(define *sq* #f)
+(define (quit!) (set! *sq* #t))
+(define (advance i) (when (= i 2) (quit!)))
+(define (run)
+  (let loop ((i 0))
+    (advance i)
+    (unless *sq* (loop (+ i 1))))
+  'exited-ok)
+"#,
+    )
+    .unwrap();
+    let lib_path = lib.to_string_lossy().replace('\\', "/");
+
+    let interp = Interpreter::new();
+    // Bound a regressed infinite loop: the guard fires on the named-let's
+    // backward jump, so a broken build hits the limit and errors rather than
+    // hanging. The fixed build exits after 3 iterations, far under the limit.
+    interp.ctx.set_eval_step_limit(1_000_000);
+    let result = interp
+        .eval_str(&format!("(load \"{lib_path}\")\n(run)"))
+        .expect("issue #82: recursive reader in a loaded unit never observed the cross-function set! (step limit tripped)");
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert_eq!(result, eval("'exited-ok"));
+}
+
+#[test]
 fn test_defmacro() {
     assert_eq!(
         eval(

@@ -5,12 +5,13 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Sema Notebook</title>
 <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%231a1a1a'/%3E%3Ctext x='16' y='22' text-anchor='middle' font-family='JetBrains Mono,monospace' font-weight='700' font-size='15' fill='%23ffffff'%3E%3Ctspan fill='%23c8a855'%3E(%3C/tspan%3Es%3Ctspan fill='%23c8a855'%3E)%3C/tspan%3E%3C/text%3E%3C/svg%3E">
+<link rel="stylesheet" href="/ui/vendor/tokens.css">
 <link rel="stylesheet" href="/ui/style.css">
 <!-- @sema/ui web components (vendored, offline). Registers <sema-editor>,
      <sema-markdown>, etc. Lit applies any properties Alpine sets before upgrade,
      so load order relative to Alpine is safe. -->
 <script type="module" src="/ui/vendor/sema-ui.js"></script>
-<script defer src="/ui/notebook.js"></script>
+<script type="module" src="/ui/notebook.js"></script>
 <script defer src="/ui/alpine.min.js"></script>
 </head>
 
@@ -25,45 +26,57 @@
     <span class="logo-text">Notebook</span>
   </div>
   <div class="toolbar-center">
-    <input type="text" id="notebook-title" data-testid="notebook-title" x-model="title" @blur="persistTitle()">
+    <sema-input id="notebook-title" testid="notebook-title" :value="title" @input="title = $event.target.value" @change="persistTitle()"></sema-input>
     <svg class="edit-icon" width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
       <path d="M11.5 1.5l3 3L5 14H2v-3L11.5 1.5z"/>
     </svg>
   </div>
   <div class="toolbar-right">
-    <button type="button" class="toolbar-btn" title="Add code cell" data-testid="btn-add-code" @click="addCell('code')">
-      <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
-        <polyline points="4,2 1,8 4,14"/><polyline points="12,2 15,8 12,14"/><line x1="10" y1="2" x2="6" y2="14"/>
-      </svg>
-    </button>
-    <button type="button" class="toolbar-btn" title="Add markdown cell" data-testid="btn-add-markdown" @click="addCell('markdown')">
-      <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
-        <line x1="2" y1="3" x2="14" y2="3"/><line x1="2" y1="7" x2="10" y2="7"/><line x1="2" y1="11" x2="14" y2="11"/>
-      </svg>
-    </button>
+    <sema-tooltip content="Add code cell">
+      <sema-button variant="icon" size="sm" data-testid="btn-add-code" @click="addCell('code')">
+        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+          <polyline points="4,2 1,8 4,14"/><polyline points="12,2 15,8 12,14"/><line x1="10" y1="2" x2="6" y2="14"/>
+        </svg>
+      </sema-button>
+    </sema-tooltip>
+    <sema-tooltip content="Add markdown cell">
+      <sema-button variant="icon" size="sm" data-testid="btn-add-markdown" @click="addCell('markdown')">
+        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+          <line x1="2" y1="3" x2="14" y2="3"/><line x1="2" y1="7" x2="10" y2="7"/><line x1="2" y1="11" x2="14" y2="11"/>
+        </svg>
+      </sema-button>
+    </sema-tooltip>
     <div class="toolbar-sep"></div>
-    <button type="button" class="toolbar-btn" title="Run all cells" data-testid="btn-run-all" @click="evalAll()">
-      <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
-        <polygon points="3,1 13,8 3,15" fill="currentColor" stroke="none"/>
-      </svg>
-    </button>
-    <button type="button" class="toolbar-btn" id="undo-btn" title="Undo last cell" data-testid="btn-undo" :disabled="!canUndo" @click="undo()">
-      <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
-        <path d="M3 7h7a3 3 0 0 1 0 6H8"/><polyline points="6,4 3,7 6,10"/>
-      </svg>
-    </button>
+    <sema-tooltip content="Run all cells">
+      <sema-button variant="icon" size="sm" data-testid="btn-run-all" @click="evalAll()">
+        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+          <polygon points="3,1 13,8 3,15" fill="currentColor" stroke="none"/>
+        </svg>
+      </sema-button>
+    </sema-tooltip>
+    <sema-tooltip content="Undo last cell">
+      <sema-button variant="icon" size="sm" id="undo-btn" data-testid="btn-undo" :disabled="!canUndo" @click="undo()">
+        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M3 7h7a3 3 0 0 1 0 6H8"/><polyline points="6,4 3,7 6,10"/>
+        </svg>
+      </sema-button>
+    </sema-tooltip>
     <div class="toolbar-sep"></div>
-    <button type="button" class="toolbar-btn" title="Save notebook" data-testid="btn-save" :class="{ 'save-flash': saveFeedback }" @click="save()">
-      <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
-        <path d="M13 15H3a1 1 0 01-1-1V2a1 1 0 011-1h8l3 3v10a1 1 0 01-1 1z"/>
-        <path d="M10 1v3H6"/><rect x="5" y="9" width="6" height="4"/>
-      </svg>
-    </button>
-    <button type="button" class="toolbar-btn" title="Reset environment" data-testid="btn-reset" @click="reset()">
-      <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
-        <path d="M1 4v4h4"/><path d="M2.5 10A6 6 0 1 0 4 4L1 8"/>
-      </svg>
-    </button>
+    <sema-tooltip content="Save notebook">
+      <sema-button variant="icon" size="sm" data-testid="btn-save" @click="save()">
+        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M13 15H3a1 1 0 01-1-1V2a1 1 0 011-1h8l3 3v10a1 1 0 01-1 1z"/>
+          <path d="M10 1v3H6"/><rect x="5" y="9" width="6" height="4"/>
+        </svg>
+      </sema-button>
+    </sema-tooltip>
+    <sema-tooltip content="Reset environment">
+      <sema-button variant="icon" size="sm" data-testid="btn-reset" @click="openReset()">
+        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M1 4v4h4"/><path d="M2.5 10A6 6 0 1 0 4 4L1 8"/>
+        </svg>
+      </sema-button>
+    </sema-tooltip>
   </div>
 </div>
 
@@ -76,8 +89,8 @@
       <div class="empty-state" data-testid="empty-state">
         <span class="empty-state-text">Empty notebook</span>
         <div class="empty-state-actions">
-          <button type="button" class="pill-btn" data-testid="btn-empty-add-code" @click="addCell('code')">+ Code</button>
-          <button type="button" class="pill-btn" data-testid="btn-empty-add-markdown" @click="addCell('markdown')">+ Markdown</button>
+          <sema-button variant="pill" data-testid="btn-empty-add-code" @click="addCell('code')">+ Code</sema-button>
+          <sema-button variant="pill" data-testid="btn-empty-add-markdown" @click="addCell('markdown')">+ Markdown</sema-button>
         </div>
       </div>
     </template>
@@ -86,14 +99,17 @@
     <template x-if="cells.length > 0">
       <div>
         <!-- Top divider -->
-        <div class="cell-divider" data-testid="cell-divider"
-             @mouseenter="$el.classList.add('visible')" @mouseleave="if (openDropdownId !== 'top') $el.classList.remove('visible')">
+        <div class="cell-divider" data-testid="cell-divider">
           <div class="cell-divider-line"></div>
-          <button type="button" class="add-cell-btn" data-testid="btn-add-cell" @click.stop="openDropdownId = openDropdownId === 'top' ? null : 'top'">+</button>
-          <div class="add-cell-dropdown" data-testid="add-cell-dropdown" :class="{ open: openDropdownId === 'top' }">
-            <button type="button" data-testid="btn-insert-code" @click="insertCell('code', 'top')">Code</button>
-            <button type="button" data-testid="btn-insert-markdown" @click="insertCell('markdown', 'top')">Markdown</button>
-          </div>
+          <sema-popover placement="bottom-start">
+            <sema-button slot="trigger" variant="icon" size="sm" data-testid="btn-add-cell">+</sema-button>
+            <!-- sema-select covers both mouse and keyboard activation (the menu
+                 suppresses the native click on Enter/Space). -->
+            <sema-menu data-testid="add-cell-dropdown" @sema-select="insertCell($event.detail.value, 'top')">
+              <sema-menu-item value="code" data-testid="btn-insert-code">Code</sema-menu-item>
+              <sema-menu-item value="markdown" data-testid="btn-insert-markdown">Markdown</sema-menu-item>
+            </sema-menu>
+          </sema-popover>
         </div>
 
         <!-- Cells -->
@@ -110,7 +126,7 @@
               <!-- Gutter -->
               <div class="cell-gutter" data-testid="cell-gutter">
                 <template x-if="cell.cell_type !== 'code'">
-                  <span data-testid="gutter-markdown" style="color:var(--text-dim)">M</span>
+                  <span data-testid="gutter-markdown" style="color:var(--text-tertiary)">M</span>
                 </template>
                 <template x-if="cell.cell_type === 'code' && cell._loading">
                   <div class="spinner" data-testid="gutter-spinner"></div>
@@ -120,7 +136,7 @@
                         x-text="'[' + cell.cell_number + (cell.stale ? '*' : '') + ']'"></span>
                 </template>
                 <template x-if="cell.cell_type === 'code' && !cell._loading && cell.cell_number == null">
-                  <span data-testid="gutter-empty" style="color:var(--text-dim)">[ ]</span>
+                  <span data-testid="gutter-empty" style="color:var(--text-tertiary)">[ ]</span>
                 </template>
               </div>
 
@@ -129,25 +145,33 @@
 
                 <!-- Hover actions -->
                 <div class="cell-actions" data-testid="cell-actions">
-                  <button x-show="cell.cell_type === 'code'" type="button" class="cell-action-btn" title="Run" data-testid="btn-cell-run" @click="evalCell(cell.id)">
-                    <svg viewBox="0 0 16 16" fill="currentColor"><polygon points="4,2 13,8 4,14"/></svg>
-                  </button>
-                  <button type="button" class="cell-action-btn" title="Move up" data-testid="btn-cell-move-up" @click="moveCell(cell.id, -1)">
-                    <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><line x1="8" y1="13" x2="8" y2="3"/><polyline points="4,7 8,3 12,7"/></svg>
-                  </button>
-                  <button type="button" class="cell-action-btn" title="Move down" data-testid="btn-cell-move-down" @click="moveCell(cell.id, 1)">
-                    <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><line x1="8" y1="3" x2="8" y2="13"/><polyline points="4,9 8,13 12,9"/></svg>
-                  </button>
-                  <button type="button" class="cell-action-btn delete" title="Delete" data-testid="btn-cell-delete" @click="deleteCell(cell.id)">
-                    <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><polyline points="2,4 14,4"/><path d="M5 4V2h6v2"/><path d="M3 4l1 10h8l1-10"/></svg>
-                  </button>
+                  <sema-tooltip content="Run" x-show="cell.cell_type === 'code'">
+                    <sema-button variant="action" aria-label="Run" data-testid="btn-cell-run" @click="evalCell(cell.id)">
+                      <svg viewBox="0 0 16 16" fill="currentColor"><polygon points="4,2 13,8 4,14"/></svg>
+                    </sema-button>
+                  </sema-tooltip>
+                  <sema-tooltip content="Move up">
+                    <sema-button variant="action" aria-label="Move up" data-testid="btn-cell-move-up" @click="moveCell(cell.id, -1)">
+                      <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><line x1="8" y1="13" x2="8" y2="3"/><polyline points="4,7 8,3 12,7"/></svg>
+                    </sema-button>
+                  </sema-tooltip>
+                  <sema-tooltip content="Move down">
+                    <sema-button variant="action" aria-label="Move down" data-testid="btn-cell-move-down" @click="moveCell(cell.id, 1)">
+                      <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><line x1="8" y1="3" x2="8" y2="13"/><polyline points="4,9 8,13 12,9"/></svg>
+                    </sema-button>
+                  </sema-tooltip>
+                  <sema-tooltip content="Delete">
+                    <sema-button variant="action" danger aria-label="Delete" data-testid="btn-cell-delete" @click="deleteCell(cell.id)">
+                      <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><polyline points="2,4 14,4"/><path d="M5 4V2h6v2"/><path d="M3 4l1 10h8l1-10"/></svg>
+                    </sema-button>
+                  </sema-tooltip>
                 </div>
 
                 <!-- Markdown cell: consumer-owned edit <-> render toggle, composed from
                      the sema-editor (source) + sema-markdown (rendered) primitives. -->
                 <template x-if="cell.cell_type === 'markdown' && cell._rendered">
                   <sema-markdown
-                    data-testid="markdown-rendered"
+                    testid="markdown-rendered"
                     x-effect="$el.value = cell.source"
                     @click="editMarkdown(cell.id)"
                   ></sema-markdown>
@@ -171,7 +195,10 @@
 
                 <!-- Code cell: syntax-highlighting editor. Native keydown bubbles
                      (composed) from the shadow textarea, so Alpine's @keydown.* still
-                     fire on the host; Tab/undo are handled inside the component. -->
+                     fire on the host; Tab/undo are handled inside the component.
+                     Persist on focusout, not change: a Tab-indent mutates the value
+                     via script, which never sets the native dirty flag, so change
+                     alone would skip persisting it. -->
                 <template x-if="cell.cell_type === 'code'">
                   <div class="cell-editor" data-testid="cell-editor">
                     <sema-editor
@@ -182,11 +209,11 @@
                       x-effect="if ($el.value !== cell.source) $el.value = cell.source"
                       @focusin="focusedCellId = cell.id"
                       @input="cell.source = $event.detail.value"
-                      @change="persistSource(cell)"
+                      @focusout="persistSource(cell)"
                       @keydown.shift.enter.prevent="handleShiftEnter(cell)"
                       @keydown.meta.enter.prevent="evalCellStay(cell.id)"
                       @keydown.ctrl.enter.prevent="evalCellStay(cell.id)"
-                      @keydown.escape="focusedCellId = null"
+                      @keydown.escape="$event.target.blur(); focusedCellId = null"
                     ></sema-editor>
                     <span x-show="!shiftEnterUsed && focusedCellId === cell.id" class="shift-enter-hint" data-testid="shift-enter-hint">Shift+Enter</span>
                   </div>
@@ -213,7 +240,7 @@
                             <template x-if="output.output_type === 'value' && output.content">
                               <span style="color:var(--gold)" x-text="output.content"></span>
                             </template>
-                            <button x-show="output.output_type === 'error' && canUndo" class="undo-inline-btn" type="button" @click="undo()">Undo cell</button>
+                            <sema-button x-show="output.output_type === 'error' && canUndo" variant="pill" @click="undo()">Undo cell</sema-button>
                           </div>
                         </div>
                       </template>
@@ -225,14 +252,15 @@
             </div>
 
             <!-- Divider after cell -->
-            <div class="cell-divider" data-testid="cell-divider"
-                 @mouseenter="$el.classList.add('visible')" @mouseleave="if (openDropdownId !== cell.id) $el.classList.remove('visible')">
+            <div class="cell-divider" data-testid="cell-divider">
               <div class="cell-divider-line"></div>
-              <button type="button" class="add-cell-btn" data-testid="btn-add-cell" @click.stop="openDropdownId = openDropdownId === cell.id ? null : cell.id">+</button>
-              <div class="add-cell-dropdown" data-testid="add-cell-dropdown" :class="{ open: openDropdownId === cell.id }">
-                <button type="button" data-testid="btn-insert-code" @click="insertCell('code', cell.id)">Code</button>
-                <button type="button" data-testid="btn-insert-markdown" @click="insertCell('markdown', cell.id)">Markdown</button>
-              </div>
+              <sema-popover placement="bottom-start">
+                <sema-button slot="trigger" variant="icon" size="sm" data-testid="btn-add-cell">+</sema-button>
+                <sema-menu data-testid="add-cell-dropdown" @sema-select="insertCell($event.detail.value, cell.id)">
+                  <sema-menu-item value="code" data-testid="btn-insert-code">Code</sema-menu-item>
+                  <sema-menu-item value="markdown" data-testid="btn-insert-markdown">Markdown</sema-menu-item>
+                </sema-menu>
+              </sema-popover>
             </div>
           </div>
         </template>
@@ -247,6 +275,13 @@
   <span class="status-text" id="cell-count" data-testid="cell-count" x-text="cells.length + ' cell' + (cells.length !== 1 ? 's' : '')">0 cells</span>
   <span class="status-text status-ready" id="status-indicator" data-testid="status-indicator">Ready</span>
 </div>
+
+<!-- ── Reset confirm ── -->
+<sema-dialog data-testid="reset-dialog" label="Reset environment" :open="resetDialogOpen" @sema-close="resetDialogOpen = false">
+  Reset the environment? All cell outputs will be cleared.
+  <sema-button slot="footer" variant="secondary" data-testid="btn-reset-cancel" @click="resetDialogOpen = false">Cancel</sema-button>
+  <sema-button slot="footer" variant="primary" data-testid="btn-reset-confirm" @click="confirmReset()">Reset</sema-button>
+</sema-dialog>
 
 </body>
 </html>

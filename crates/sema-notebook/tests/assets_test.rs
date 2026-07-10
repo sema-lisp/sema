@@ -18,3 +18,19 @@ fn serves_vendored_sema_ui_bundle() {
     );
     assert_eq!(ct, "application/javascript");
 }
+
+/// The vendored `@sema-lang/ui` token sheet (the published npm package's
+/// `src/styles/tokens.css`) must be served at `/ui/vendor/tokens.css` so the
+/// component bundle's `var(--token, #fallback)` references resolve to the
+/// library's palette, not just their hardcoded fallbacks.
+#[test]
+fn serves_vendored_tokens_css() {
+    let asset = sema_notebook::ui::asset("vendor/tokens.css");
+    assert!(asset.is_some(), "vendored tokens.css must be served");
+    let (body, ct) = asset.unwrap();
+    assert!(
+        body.contains("--text-primary"),
+        "tokens sheet should define the text-* namespace the notebook bridges to",
+    );
+    assert_eq!(ct, "text/css");
+}

@@ -1,4 +1,6 @@
-/* Sema Notebook — Alpine.js Component */
+/* Sema Notebook — Alpine.js Component (ES module) */
+import { toast } from './vendor/sema-ui.js';
+
 document.addEventListener('alpine:init', () => {
   Alpine.data('notebook', () => ({
     // ── State ──
@@ -7,18 +9,11 @@ document.addEventListener('alpine:init', () => {
     focusedCellId: null,
     canUndo: false,
     shiftEnterUsed: localStorage.getItem('sema-nb-shift-enter-used') === 'true',
-    openDropdownId: null,
-    saveFeedback: false,
+    resetDialogOpen: false,
 
     // ── Lifecycle ──
     init() {
       this.load();
-      // Close dropdowns on outside click
-      document.addEventListener('click', (e) => {
-        if (!e.target.closest('.add-cell-btn') && !e.target.closest('.add-cell-dropdown')) {
-          this.openDropdownId = null;
-        }
-      });
     },
 
     // ── API helper ──
@@ -101,6 +96,21 @@ document.addEventListener('alpine:init', () => {
       }
     },
 
+    // The editable control lives in the editor's shadow root; the host element's
+    // focus() delegates into it. (A new/empty markdown cell opens in edit mode, so
+    // it too renders a <sema-editor>.) `sema-editor` upgrades asynchronously (it
+    // registers from a `type="module"` script), so a focus() called right after
+    // Alpine renders the host can land before upgrade and silently no-op —
+    // customElements.whenDefined guards against that race.
+    focusCellEditor(id) {
+      this.$nextTick(() => {
+        customElements.whenDefined('sema-editor').then(() => {
+          const el = document.querySelector('#cell-' + id + ' sema-editor');
+          if (el) el.focus();
+        });
+      });
+    },
+
     // ── Cell management ──
     async addCell(type, afterId) {
       try {
@@ -109,33 +119,20 @@ document.addEventListener('alpine:init', () => {
         const data = await this.api('POST', '/api/cells', body);
         await this.load();
         this.focusedCellId = data.id;
-        this.$nextTick(() => {
-          // The editable control lives in the editor's shadow root; the host
-          // element's focus() delegates into it. (A new/empty markdown cell opens
-          // in edit mode, so it too renders a <sema-editor>.)
-          const el = document.querySelector('#cell-' + data.id + ' sema-editor');
-          if (el) el.focus();
-        });
+        this.focusCellEditor(data.id);
       } catch (e) {
         console.error('Failed to create cell:', e);
       }
     },
 
     async insertCell(type, afterId) {
-      this.openDropdownId = null;
       const body = { type, source: '' };
       if (afterId && afterId !== 'top') body.after = afterId;
       try {
         const data = await this.api('POST', '/api/cells', body);
         await this.load();
         this.focusedCellId = data.id;
-        this.$nextTick(() => {
-          // The editable control lives in the editor's shadow root; the host
-          // element's focus() delegates into it. (A new/empty markdown cell opens
-          // in edit mode, so it too renders a <sema-editor>.)
-          const el = document.querySelector('#cell-' + data.id + ' sema-editor');
-          if (el) el.focus();
-        });
+        this.focusCellEditor(data.id);
       } catch (e) {
         console.error('Failed to insert cell:', e);
       }
@@ -174,10 +171,9 @@ document.addEventListener('alpine:init', () => {
         // stale content and the edits appear lost.
         await Promise.all([this.persistTitle(), ...this.cells.map(c => this.persistSource(c))]);
         await this.api('POST', '/api/save');
-        this.saveFeedback = true;
-        setTimeout(() => { this.saveFeedback = false; }, 600);
+        toast.success('Saved');
       } catch (e) {
-        alert('Save failed: ' + e.message);
+        toast.error('Save failed: ' + e.message);
       }
     },
 
@@ -191,8 +187,12 @@ document.addEventListener('alpine:init', () => {
       }
     },
 
-    async reset() {
-      if (!confirm('Reset the environment? All cell outputs will be cleared.')) return;
+    openReset() {
+      this.resetDialogOpen = true;
+    },
+
+    async confirmReset() {
+      this.resetDialogOpen = false;
       try {
         await this.api('POST', '/api/reset');
         this.canUndo = false;
@@ -211,8 +211,8 @@ document.addEventListener('alpine:init', () => {
     },
 
     // Push the notebook title to the server. Like cell source, the title is
-    // client-only state (x-model) until synced, so without this a renamed
-    // notebook would save under its old title.
+    // client-only state until synced, so without this a renamed notebook would
+    // save under its old title.
     persistTitle() {
       return this.api('POST', '/api/title', { title: this.title }).catch(() => {});
     },
@@ -224,10 +224,7 @@ document.addEventListener('alpine:init', () => {
       if (!cell) return;
       cell._rendered = false;
       this.focusedCellId = id;
-      this.$nextTick(() => {
-        const ed = document.querySelector('#cell-' + id + ' sema-editor');
-        if (ed) ed.focus();
-      });
+      this.focusCellEditor(id);
     },
 
     // Editor lost focus (or Escape): persist, and return a non-empty markdown cell

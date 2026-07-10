@@ -2,6 +2,50 @@
 
 Canonical instructions for any coding agent working in this repo. `CLAUDE.md` just points here.
 
+## Shipping invariant — NO dev-checkout assumptions in shipped code (HARD RULE)
+
+A shipped `sema` (crates.io / `cargo install`, a cargo-dist archive, the shell
+installer, or Homebrew) runs on a machine that has **none** of: this git repo,
+`jake`, `npm`/`node`/`wasm-pack`, gitignored-or-generated build artifacts, or the
+maintainer's absolute paths. Any user-facing behavior that depends on those is a
+**shipped bug**, not a dev convenience. This is non-negotiable. It already
+happened once: `sema web` shipped telling users to run `jake wasm.web-runtime`
+because its runtime assets were gitignored and a `build.rs` file-existence check
+silently compiled the feature out. It must never recur. Enforced rules:
+
+- **Anything a shipped command needs at runtime MUST be a git-tracked package
+  input embedded at build time** (`include_str!` / `include_bytes!` / `rust_embed`
+  over a *tracked* path). `cargo package` ships only git-tracked files, so never
+  `include_*!` a gitignored or build-generated path — the `.crate` would lack it.
+  If a `jake` recipe generates the artifact, **commit the generated output**
+  (don't `.gitignore` it), and verify it embeds the whole directory (prefer
+  `rust_embed`/`include_dir` over a hand-maintained file list that can drift).
+- **`build.rs` must NEVER change what compiles based on file existence, an env
+  var, or the network.** `Path::new(...).exists()` gating a `rustc-cfg` is true in
+  your tree and false from a packaged `.crate` → a silently reduced binary. Use an
+  unconditional `include_*!` (a missing input then *fails the build loudly*) or an
+  explicit, documented Cargo feature — never an implicit file-presence gate.
+- **No runtime path may point into the source tree.** `env!("CARGO_MANIFEST_DIR")`,
+  `env!("OUT_DIR")`, and repo-relative reads (`examples/`, `website/`, `Jakefile`,
+  …) are fine in `tests/` and `build.rs` (they run from the checkout) but
+  **forbidden in shipped runtime code**. Resolve companion binaries via
+  `std::env::current_exe()`, not repo layout.
+- **Never emit a user-facing message telling an installed user to run `jake`,
+  `make`, `cargo build`, `npm`, or otherwise assume they have the repo.** If a
+  feature can be absent, degrade with an action the *end user* can actually take.
+- **Shelling out to a dev tool** (`jake`, `cargo`, `npm`, `node`, `wasm-pack`,
+  `vercel`) from a shipped code path is a bug. `git` is acceptable only where it
+  is the feature's inherent prerequisite (`sema pkg`, git stdlib bindings).
+
+**Regression gate (required for any packaged-behavior feature):**
+`scripts/test-packaged-sema-web.sh` builds the real `sema-lang` `.crate`, rebuilds
+from its *unpacked* contents, and runs the shipped command — the checkout is never
+on the path. It runs in `.github/workflows/verify.yml`, which gates both crates.io
+publishing and the cargo-dist release. A plain `cargo test` from the checkout
+**cannot** catch this class of bug (the checkout has everything the `.crate`
+lacks); a package-boundary test is the only thing that can. Any new embedded-asset
+or install-path feature MUST add equivalent coverage.
+
 ## Build & Test
 
 ```bash
@@ -19,8 +63,8 @@ jake example-notebook   # run demo notebook headlessly
 jake test.notebook-e2e  # Playwright E2E tests for notebook
 ```
 
-- Single crate: `cargo test -p sema-reader` | Single test: `cargo test -p sema --test integration_test -- test_name`
-- Single eval test: `cargo test -p sema --test eval_test -- test_name` | Ignored tests: `cargo test -p sema -- --ignored`
+- Single crate: `cargo test -p sema-reader` | Single test: `cargo test -p sema-lang --test integration_test -- test_name`
+- Single eval test: `cargo test -p sema-lang --test eval_test -- test_name` | Ignored tests: `cargo test -p sema-lang -- --ignored`
 - Run file: `cargo run -- examples/hello.sema` | REPL: `cargo run` | Eval: `cargo run -- -e "(+ 1 2)"`
 - Integration tests: `crates/sema/tests/integration_test.rs`. Eval tests: `crates/sema/tests/eval_test.rs`. Reader unit tests: `crates/sema-reader/src/reader.rs`.
 - Editor plugins live in their own repos under the `sema-lisp` org (`vscode-sema`, `zed-sema`, `intellij-sema`, `emacs-sema`, `helix-sema`, `sema.nvim`, `sema.vim`, `sublime-sema`) and the grammar in `sema-lisp/tree-sitter-sema` — they are no longer in this repo. Each carries its own CI/publishing.
@@ -44,7 +88,7 @@ Dependency flow (arrows = "depends on"): `sema-core ← sema-reader ← sema-vm 
 - **sema-docs** → Builtin docs index generator. Each builtin is a markdown file in `crates/sema-docs/entries/`; `sema-docs gen` produces a JSON index consumed by LSP hover/completion and REPL apropos.
 - **sema-fmt** → Code formatter for Sema source files
 - **sema-wasm** → WASM bindings for the browser playground at sema.run
-- **sema** → Binary: clap CLI + reedline REPL + `sema build` (standalone executables) + `sema compile`/`sema disasm` + `sema lsp` + `sema dap` + `sema fmt` + `sema notebook` + integration tests. REPL submodules live in `crates/sema/src/repl/` (editor, highlighter, hinter, validator, inspector, commands).
+- **sema** → Binary: clap CLI + reedline REPL + `sema build` (standalone executables) + `sema compile`/`sema disasm` + `sema lsp` + `sema dap` + `sema fmt` + `sema notebook` + integration tests. REPL submodules live in `crates/sema/src/repl/` (editor, highlighter, hinter, validator, inspector, commands). Its Cargo **package** name is `sema-lang` (the binary target is `sema`), so `cargo -p` commands use `-p sema-lang`.
 
 ## Key Design Patterns
 

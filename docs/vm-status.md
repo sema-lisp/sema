@@ -45,7 +45,7 @@ Source → Reader → Macro Expand → Lower (Expr<Spur>) → Optimize → Resol
 - **Data constructors:** MakeList, MakeVector, MakeMap, MakeHashMap
 - **Intrinsic stdlib ops:** Car, Cdr, Cons, IsNull, IsPair, IsList, IsNumber, IsString, IsSymbol, Length, Append, Get, ContainsQ, Nth, StringLength/StringRef/StringAppend, MutArrGet, MutArrSet
 
-**Per-instruction inline cache:** `LoadGlobal` (7 bytes: op + u32 spur + u16 cache_slot) and `CallGlobal` (9 bytes: op + u32 spur + u16 argc + u16 cache_slot) each get a dedicated cache slot in a side array. On hit (matching spur + env version), global access is a single array index — no HashMap lookup. Cache entries store `(spur_bits, version, value)` to guard against cross-VM closure slot collisions. Bytecode format version 5.
+**Per-instruction inline cache:** `LoadGlobal` (7 bytes: op + u32 spur + u16 cache_slot) and `CallGlobal` (9 bytes: op + u32 spur + u16 argc + u16 cache_slot) each get a dedicated cache slot in a side array. On hit (matching spur + env version), global access is a single array index — no HashMap lookup. Cache entries store `(spur_bits, version, CachedGlobal)` — the callee pre-decoded on miss as `Plain(Value)`, `VmClosure(value, closure, functions)`, or `Native(value, fn)` — so a hit dispatches with no `Value` clone or downcast, guarded against cross-VM closure slot collisions. Successful native calls stay inside the dispatch loop (no per-call frame reload); exceptions, yields, and debug hooks re-enter it. Bytecode format version 5.
 
 ## Known Limitations
 

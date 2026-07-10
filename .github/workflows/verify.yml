@@ -58,8 +58,75 @@ jobs:
       - name: Run tests
         run: cargo nextest run --workspace --profile ci
 
+      - name: Smoke test packaged web runtime
+        run: ./scripts/test-packaged-sema-web.sh
+
       - name: Smoke test examples
         run: jake examples
 
       - name: Smoke test bytecode
         run: jake smoke-bytecode
+
+  # Rebuild the embedded `sema web` browser runtime from source and fail if the
+  # committed copy drifted — so a stale or unbuildable wasm can NEVER be
+  # published. The runtime under crates/sema/src/web/assets is a checked-in
+  # generated artifact; this is the standard "generated files are up to date"
+  # gate. The toolchain is PINNED so the rebuild is byte-reproducible: when you
+  # regenerate the runtime, use these same versions (rustc 1.97, wasm-pack 0.15,
+  # wasm-bindgen via Cargo.lock, `npm ci`) and bump the pins here together.
+  # In-browser behavior of the runtime is covered by sema-web-tests.yml
+  # (Playwright) — make that a required check for full "never ship broken" cover.
+  web-runtime:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libudev-dev pkg-config
+
+      - name: Install Rust (pinned) + wasm target
+        uses: dtolnay/rust-toolchain@1.97.0
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Cache cargo + target
+        uses: Swatinem/rust-cache@v2
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm ci
+
+      - name: Install pinned wasm-pack
+        uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-pack@0.15.0
+
+      - name: Install jake
+        run: |
+          mkdir -p "$HOME/.local/bin"
+          curl -fsSL https://github.com/HelgeSverre/jake/releases/latest/download/jake-linux-x86_64 -o "$HOME/.local/bin/jake"
+          chmod +x "$HOME/.local/bin/jake"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      # Force a full rebuild (the vendored files are incremental `file` recipes),
+      # then compare against the committed copy.
+      - name: Rebuild the embedded web runtime from source
+        run: |
+          rm -rf crates/sema/src/web/assets
+          jake wasm.web-runtime
+
+      - name: Fail if the committed runtime drifted from source
+        run: |
+          drift=0
+          if ! git diff --quiet -- crates/sema/src/web/assets; then drift=1; fi
+          if [ -n "$(git ls-files --others --exclude-standard crates/sema/src/web/assets)" ]; then drift=1; fi
+          if [ "$drift" = 1 ]; then
+            echo "::error::Embedded web runtime is stale. Run 'jake wasm.web-runtime' and commit crates/sema/src/web/assets/."
+            git --no-pager status --porcelain -- crates/sema/src/web/assets
+            git --no-pager diff --stat -- crates/sema/src/web/assets
+            exit 1
+          fi
+          echo "embedded web runtime matches source ✓"

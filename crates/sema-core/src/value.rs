@@ -810,10 +810,9 @@ impl Value {
             let payload = (n as u64) & PAYLOAD_MASK;
             Value(make_boxed(TAG_INT_SMALL, payload))
         } else {
-            // Out of range: heap-allocate
-            let rc = Rc::new(n);
-            let ptr = Rc::into_raw(rc) as *const u8;
-            Value(make_boxed(TAG_INT_BIG, ptr_to_payload(ptr)))
+            // Out of range: heap-allocate (through the boxing funnel so the
+            // uniform-header guards in `from_rc_ptr` apply here too)
+            Value::from_rc_ptr(TAG_INT_BIG, Rc::new(n))
         }
     }
 
@@ -866,7 +865,26 @@ impl Value {
     // -- Heap constructors --
 
     fn from_rc_ptr<T>(tag: u64, rc: Rc<T>) -> Value {
+        // Compile-time guard for the uniform clone/drop fast path: a payload
+        // whose alignment exceeded the RcBox header would sit at a different
+        // offset, and the tag-free header read would corrupt the refcount.
+        // Enforced per-instantiation, so every future heap payload type is
+        // covered automatically (see RC_HEADER).
+        const { assert!(std::mem::align_of::<T>() <= RC_HEADER) };
+        #[cfg(debug_assertions)]
+        let count = Rc::strong_count(&rc);
         let ptr = Rc::into_raw(rc) as *const u8;
+        // Validate the header offset on every boxing in debug builds: the
+        // strong count read through the uniform offset must agree with `Rc`.
+        #[cfg(debug_assertions)]
+        unsafe {
+            debug_assert_eq!(
+                rc_strong_cell(ptr).get(),
+                count,
+                "RcBox header offset mismatch for {}",
+                std::any::type_name::<T>()
+            );
+        }
         Value(make_boxed(tag, ptr_to_payload(ptr)))
     }
 
@@ -2139,6 +2157,83 @@ impl Value {
 
 // ── Clone ─────────────────────────────────────────────────────────
 
+/// Byte offset from an `Rc` payload pointer back to its box's strong count.
+///
+/// `std`'s `RcBox` is `#[repr(C)] { strong: Cell<usize>, weak: Cell<usize>, value: T }`,
+/// so for any payload whose alignment fits the two-count header, the value
+/// lands exactly one header past the box — on every target the strong count
+/// lives at `ptr - RC_HEADER`, the same offset for all heap tags alike. That
+/// uniformity is what lets `Clone`/`Drop` bump the refcount without
+/// dispatching on the tag.
+///
+/// Two guards keep this sound: the alignment bound is a compile-time assert
+/// per payload type in `from_rc_ptr` (the single boxing funnel), and the
+/// header offset itself is pinned against a real `Rc` both by
+/// `tests::rc_header_matches_std_layout` and by a debug assertion on every
+/// boxing — a std `RcBox` layout change fails loudly instead of corrupting
+/// memory.
+const RC_HEADER: usize = 2 * std::mem::size_of::<usize>();
+
+/// The strong-count cell of the `RcBox` that owns `ptr`'s payload.
+///
+/// # Safety
+/// `ptr` must have come from `Rc::into_raw` for one of the heap payload types
+/// (all satisfy the `RC_HEADER` alignment bound above), and that `Rc`
+/// allocation must still be live.
+#[inline(always)]
+unsafe fn rc_strong_cell<'a>(ptr: *const u8) -> &'a Cell<usize> {
+    &*(ptr.sub(RC_HEADER) as *const Cell<usize>)
+}
+
+/// Typed free for a heap value whose last strong reference is going away:
+/// reconstruct the `Rc` (strong count 1) and drop it, running the payload's
+/// destructor and releasing the box exactly as a plain `Rc` drop would
+/// (including the weak-count bookkeeping). Out of line — `Value::drop`'s hot
+/// path is the uniform decrement; this per-tag dispatch is only paid on the
+/// final release.
+///
+/// # Safety
+/// `ptr` came from `Rc::into_raw` for the payload type `tag` denotes, and the
+/// strong count is exactly 1 (this call consumes that last reference).
+///
+/// Out of line but deliberately NOT `#[cold]`: workloads that free on every
+/// iteration (a throw/catch loop discarding condition maps, a churn loop)
+/// make this path hot, and a cold attribute would override the PGO profile's
+/// better judgment about its layout.
+#[inline(never)]
+unsafe fn drop_last_heap_ref(tag: u64, ptr: *const u8) {
+    match tag {
+        TAG_INT_BIG => drop(Rc::from_raw(ptr as *const i64)),
+        TAG_BIGINT => drop(Rc::from_raw(ptr as *const BigInt)),
+        TAG_RATIONAL => drop(Rc::from_raw(ptr as *const BigRational)),
+        TAG_COMPLEX => drop(Rc::from_raw(ptr as *const SemaComplex)),
+        TAG_STRING => drop(Rc::from_raw(ptr as *const String)),
+        TAG_LIST | TAG_VECTOR => drop(Rc::from_raw(ptr as *const Vec<Value>)),
+        TAG_MAP => drop(Rc::from_raw(ptr as *const BTreeMap<Value, Value>)),
+        TAG_HASHMAP => drop(Rc::from_raw(ptr as *const hashbrown::HashMap<Value, Value>)),
+        TAG_LAMBDA => drop(Rc::from_raw(ptr as *const Lambda)),
+        TAG_MACRO => drop(Rc::from_raw(ptr as *const Macro)),
+        TAG_NATIVE_FN => drop(Rc::from_raw(ptr as *const NativeFn)),
+        TAG_PROMPT => drop(Rc::from_raw(ptr as *const Prompt)),
+        TAG_MESSAGE => drop(Rc::from_raw(ptr as *const Message)),
+        TAG_CONVERSATION => drop(Rc::from_raw(ptr as *const Conversation)),
+        TAG_TOOL_DEF => drop(Rc::from_raw(ptr as *const ToolDefinition)),
+        TAG_AGENT => drop(Rc::from_raw(ptr as *const Agent)),
+        TAG_THUNK => drop(Rc::from_raw(ptr as *const Thunk)),
+        TAG_RECORD => drop(Rc::from_raw(ptr as *const Record)),
+        TAG_BYTEVECTOR => drop(Rc::from_raw(ptr as *const Vec<u8>)),
+        TAG_MULTIMETHOD => drop(Rc::from_raw(ptr as *const MultiMethod)),
+        TAG_STREAM => drop(Rc::from_raw(ptr as *const StreamBox)),
+        TAG_F64_ARRAY => drop(Rc::from_raw(ptr as *const Vec<f64>)),
+        TAG_I64_ARRAY => drop(Rc::from_raw(ptr as *const Vec<i64>)),
+        TAG_ASYNC_PROMISE => drop(Rc::from_raw(ptr as *const AsyncPromise)),
+        TAG_CHANNEL => drop(Rc::from_raw(ptr as *const Channel)),
+        TAG_MUTABLE_ARRAY => drop(Rc::from_raw(ptr as *const MutableArray)),
+        TAG_MUTABLE_CELL => drop(Rc::from_raw(ptr as *const MutableCell)),
+        _ => {} // unreachable, but don't panic in drop
+    }
+}
+
 impl Clone for Value {
     #[inline(always)]
     fn clone(&self) -> Self {
@@ -2151,46 +2246,25 @@ impl Clone for Value {
             // Immediates: trivial copy
             TAG_NIL | TAG_FALSE | TAG_TRUE | TAG_INT_SMALL | TAG_CHAR | TAG_SYMBOL
             | TAG_KEYWORD => Value(self.0),
-            // Heap pointers: increment refcount
+            // Heap pointers: one uniform strong-count bump — the RcBox header
+            // sits at the same offset for every heap payload (see RC_HEADER),
+            // so no per-tag dispatch is needed.
             _ => {
-                let payload = get_payload(self.0);
-                let ptr = payload_to_ptr(payload);
-                // Increment refcount based on type
+                debug_assert!(
+                    (TAG_INT_BIG..=TAG_MUTABLE_CELL).contains(&tag),
+                    "invalid heap tag in clone: {tag}"
+                );
+                let ptr = payload_to_ptr(get_payload(self.0));
+                // SAFETY: every boxed non-immediate tag carries a live
+                // `Rc::into_raw` pointer (the `rc_strong_cell` contract).
                 unsafe {
-                    match tag {
-                        TAG_INT_BIG => Rc::increment_strong_count(ptr as *const i64),
-                        TAG_BIGINT => Rc::increment_strong_count(ptr as *const BigInt),
-                        TAG_RATIONAL => Rc::increment_strong_count(ptr as *const BigRational),
-                        TAG_COMPLEX => Rc::increment_strong_count(ptr as *const SemaComplex),
-                        TAG_STRING => Rc::increment_strong_count(ptr as *const String),
-                        TAG_LIST | TAG_VECTOR => {
-                            Rc::increment_strong_count(ptr as *const Vec<Value>)
-                        }
-                        TAG_MAP => Rc::increment_strong_count(ptr as *const BTreeMap<Value, Value>),
-                        TAG_HASHMAP => Rc::increment_strong_count(
-                            ptr as *const hashbrown::HashMap<Value, Value>,
-                        ),
-                        TAG_LAMBDA => Rc::increment_strong_count(ptr as *const Lambda),
-                        TAG_MACRO => Rc::increment_strong_count(ptr as *const Macro),
-                        TAG_NATIVE_FN => Rc::increment_strong_count(ptr as *const NativeFn),
-                        TAG_PROMPT => Rc::increment_strong_count(ptr as *const Prompt),
-                        TAG_MESSAGE => Rc::increment_strong_count(ptr as *const Message),
-                        TAG_CONVERSATION => Rc::increment_strong_count(ptr as *const Conversation),
-                        TAG_TOOL_DEF => Rc::increment_strong_count(ptr as *const ToolDefinition),
-                        TAG_AGENT => Rc::increment_strong_count(ptr as *const Agent),
-                        TAG_THUNK => Rc::increment_strong_count(ptr as *const Thunk),
-                        TAG_RECORD => Rc::increment_strong_count(ptr as *const Record),
-                        TAG_BYTEVECTOR => Rc::increment_strong_count(ptr as *const Vec<u8>),
-                        TAG_MULTIMETHOD => Rc::increment_strong_count(ptr as *const MultiMethod),
-                        TAG_STREAM => Rc::increment_strong_count(ptr as *const StreamBox),
-                        TAG_F64_ARRAY => Rc::increment_strong_count(ptr as *const Vec<f64>),
-                        TAG_I64_ARRAY => Rc::increment_strong_count(ptr as *const Vec<i64>),
-                        TAG_ASYNC_PROMISE => Rc::increment_strong_count(ptr as *const AsyncPromise),
-                        TAG_CHANNEL => Rc::increment_strong_count(ptr as *const Channel),
-                        TAG_MUTABLE_ARRAY => Rc::increment_strong_count(ptr as *const MutableArray),
-                        TAG_MUTABLE_CELL => Rc::increment_strong_count(ptr as *const MutableCell),
-                        _ => unreachable!("invalid heap tag in clone: {}", tag),
+                    let strong = rc_strong_cell(ptr);
+                    let n = strong.get().wrapping_add(1);
+                    if n == 0 {
+                        // Refcount overflow — abort, as `Rc::clone` would.
+                        std::process::abort();
                     }
+                    strong.set(n);
                 }
                 Value(self.0)
             }
@@ -2211,42 +2285,22 @@ impl Drop for Value {
             // Immediates: nothing to free
             TAG_NIL | TAG_FALSE | TAG_TRUE | TAG_INT_SMALL | TAG_CHAR | TAG_SYMBOL
             | TAG_KEYWORD => {}
-            // Heap pointers: drop the Rc
+            // Heap pointers: uniform decrement; the per-tag typed free runs
+            // only when the last reference goes away (cold, out of line).
             _ => {
-                let payload = get_payload(self.0);
-                let ptr = payload_to_ptr(payload);
+                debug_assert!(
+                    (TAG_INT_BIG..=TAG_MUTABLE_CELL).contains(&tag),
+                    "invalid heap tag in drop: {tag}"
+                );
+                let ptr = payload_to_ptr(get_payload(self.0));
+                // SAFETY: same RcBox-header contract as `Clone`; at count 1
+                // this value owns the final reference, which the typed free
+                // consumes.
                 unsafe {
-                    match tag {
-                        TAG_INT_BIG => drop(Rc::from_raw(ptr as *const i64)),
-                        TAG_BIGINT => drop(Rc::from_raw(ptr as *const BigInt)),
-                        TAG_RATIONAL => drop(Rc::from_raw(ptr as *const BigRational)),
-                        TAG_COMPLEX => drop(Rc::from_raw(ptr as *const SemaComplex)),
-                        TAG_STRING => drop(Rc::from_raw(ptr as *const String)),
-                        TAG_LIST | TAG_VECTOR => drop(Rc::from_raw(ptr as *const Vec<Value>)),
-                        TAG_MAP => drop(Rc::from_raw(ptr as *const BTreeMap<Value, Value>)),
-                        TAG_HASHMAP => {
-                            drop(Rc::from_raw(ptr as *const hashbrown::HashMap<Value, Value>))
-                        }
-                        TAG_LAMBDA => drop(Rc::from_raw(ptr as *const Lambda)),
-                        TAG_MACRO => drop(Rc::from_raw(ptr as *const Macro)),
-                        TAG_NATIVE_FN => drop(Rc::from_raw(ptr as *const NativeFn)),
-                        TAG_PROMPT => drop(Rc::from_raw(ptr as *const Prompt)),
-                        TAG_MESSAGE => drop(Rc::from_raw(ptr as *const Message)),
-                        TAG_CONVERSATION => drop(Rc::from_raw(ptr as *const Conversation)),
-                        TAG_TOOL_DEF => drop(Rc::from_raw(ptr as *const ToolDefinition)),
-                        TAG_AGENT => drop(Rc::from_raw(ptr as *const Agent)),
-                        TAG_THUNK => drop(Rc::from_raw(ptr as *const Thunk)),
-                        TAG_RECORD => drop(Rc::from_raw(ptr as *const Record)),
-                        TAG_BYTEVECTOR => drop(Rc::from_raw(ptr as *const Vec<u8>)),
-                        TAG_MULTIMETHOD => drop(Rc::from_raw(ptr as *const MultiMethod)),
-                        TAG_STREAM => drop(Rc::from_raw(ptr as *const StreamBox)),
-                        TAG_F64_ARRAY => drop(Rc::from_raw(ptr as *const Vec<f64>)),
-                        TAG_I64_ARRAY => drop(Rc::from_raw(ptr as *const Vec<i64>)),
-                        TAG_ASYNC_PROMISE => drop(Rc::from_raw(ptr as *const AsyncPromise)),
-                        TAG_CHANNEL => drop(Rc::from_raw(ptr as *const Channel)),
-                        TAG_MUTABLE_ARRAY => drop(Rc::from_raw(ptr as *const MutableArray)),
-                        TAG_MUTABLE_CELL => drop(Rc::from_raw(ptr as *const MutableCell)),
-                        _ => {} // unreachable, but don't panic in drop
+                    let strong = rc_strong_cell(ptr);
+                    match strong.get() {
+                        1 => drop_last_heap_ref(tag, ptr),
+                        n => strong.set(n - 1),
                     }
                 }
             }
@@ -2951,7 +3005,16 @@ impl fmt::Debug for Value {
 pub struct Env {
     pub bindings: Rc<RefCell<SpurMap<Spur, Value>>>,
     pub parent: Option<Rc<Env>>,
-    pub version: Cell<u64>,
+    /// Monotonic mutation counter the VM's inline global cache is keyed on.
+    /// Held behind an `Rc` so it travels *with* `bindings`: every `Env` handle
+    /// cloned from this one shares this same cell. A mutation through any handle
+    /// (a `set!` on a `load`ed unit's per-form-VM clone, a different frame's
+    /// home-globals handle) is therefore observed by a cache entry keyed on any
+    /// other handle to the same bindings — a fresh cell per clone would let a
+    /// recursive reader keep serving a value its own handle's `set!` never bumped
+    /// (issue #82). A distinct bindings map (`new`/`with_parent`) still gets its
+    /// own cell, since it is a genuinely independent scope.
+    pub version: Rc<Cell<u64>>,
 }
 
 impl Env {
@@ -2959,7 +3022,7 @@ impl Env {
         Env {
             bindings: Rc::new(RefCell::new(SpurMap::new())),
             parent: None,
-            version: Cell::new(0),
+            version: Rc::new(Cell::new(0)),
         }
     }
 
@@ -2967,15 +3030,14 @@ impl Env {
         Env {
             bindings: Rc::new(RefCell::new(SpurMap::new())),
             parent: Some(parent),
-            version: Cell::new(0),
+            version: Rc::new(Cell::new(0)),
         }
     }
 
-    /// Bump the environment's version counter. The VM's inline global cache is
-    /// keyed on this version, so call this after mutating `bindings` through a
-    /// different `Env` handle that shares the same `bindings` Rc but has its own
-    /// version cell (e.g. a `load`ed module body run on a cloned-Env VM), so a
-    /// VM observing this `Env` re-reads instead of serving a stale cached value.
+    /// Bump the version counter shared by every handle to this scope's bindings.
+    /// The VM's inline global cache is keyed on it, so bumping after any mutation
+    /// makes every VM observing this scope (through any clone) re-read instead of
+    /// serving a stale cached value.
     pub fn bump_version(&self) {
         self.version.set(self.version.get().wrapping_add(1));
     }
@@ -3107,6 +3169,21 @@ mod tests {
     #[test]
     fn test_size_of_value() {
         assert_eq!(std::mem::size_of::<Value>(), 8);
+    }
+
+    #[test]
+    fn rc_header_matches_std_layout() {
+        // The uniform clone/drop fast path reads the strong count at
+        // `payload_ptr - RC_HEADER`; pin that offset against a real `Rc` so a
+        // std `RcBox` layout change fails loudly instead of corrupting memory.
+        let rc = Rc::new(String::from("layout probe"));
+        let extra = Rc::clone(&rc);
+        let raw = Rc::into_raw(rc);
+        unsafe {
+            assert_eq!(rc_strong_cell(raw as *const u8).get(), 2);
+            drop(Rc::from_raw(raw));
+        }
+        drop(extra);
     }
 
     #[test]

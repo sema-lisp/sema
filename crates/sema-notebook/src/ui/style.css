@@ -24,8 +24,11 @@
 
 /* Palette: canonical Sema brand tokens (see the website brand guide — "Warm
    Architectural Dark"). Backgrounds are layered warm near-blacks, not neutral
-   grey, and gold is the sole accent. Keep these in sync with the brand guide's
-   variables.css. */
+   grey, and gold is the sole accent. `/ui/vendor/tokens.css` (the library's
+   token sheet, linked before this file) supplies the rest of the palette
+   (--gold*, --success, --error*, --mono, --serif, spacing/radius, etc.) — only
+   the values the notebook diverges on are overridden here, in the library's
+   own `--text-primary`/`--text-secondary`/`--text-tertiary` namespace. */
 :root {
   --bg: #131110;
   --bg-editor: #1c1916;
@@ -33,25 +36,16 @@
   --bg-elevated: #181512;
   --border: #2b2620;
   --border-focus: #4a4336;
-  --gold: #c8a855;
-  --gold-dim: rgba(200, 168, 85, 0.5);
-  --gold-glow: rgba(200, 168, 85, 0.08);
-  --gold-soft: rgba(200, 168, 85, 0.14);
-  --text: #968c79;
-  --text-bright: #e9e3d6;
-  --text-dim: #6b6354;
-  --success: #6a9955;
-  --error: #c85555;
-  --error-bg: rgba(200, 85, 85, 0.06);
-  --mono: 'JetBrains Mono', monospace;
-  --serif: 'Cormorant', Georgia, serif;
+  --text-primary: #e9e3d6;
+  --text-secondary: #968c79;
+  --text-tertiary: #6b6354;
 }
 
 * { margin: 0; padding: 0; box-sizing: border-box; }
 
 body {
   background: var(--bg);
-  color: var(--text);
+  color: var(--text-secondary);
   font-family: var(--mono);
   font-size: 14px;
   height: 100vh;
@@ -86,7 +80,7 @@ body {
   font-size: 1.2rem;
   font-weight: 300;
   letter-spacing: 0.06em;
-  color: var(--text-bright);
+  color: var(--text-primary);
 }
 
 .toolbar-center {
@@ -101,20 +95,28 @@ body {
 .toolbar-center:hover { background: var(--gold-glow); }
 .toolbar-center:hover .edit-icon { opacity: 1; }
 
-#notebook-title {
+/* `sema-input`'s own chrome (border, background, padding) is stripped via its
+   `control` part so the title reads as plain serif text until focused. */
+#notebook-title::part(control) {
   font-family: var(--serif);
   font-size: 1.1rem;
   font-weight: 400;
-  color: var(--text-bright);
+  color: var(--text-primary);
   background: none;
   border: none;
   outline: none;
+  box-shadow: none;
   text-align: center;
   min-width: 120px;
+  padding: 0;
+}
+#notebook-title::part(control):focus-visible {
+  border: none;
+  box-shadow: none;
 }
 
 .edit-icon {
-  color: var(--text-dim);
+  color: var(--text-tertiary);
   opacity: 0;
   transition: opacity 0.15s;
   flex-shrink: 0;
@@ -126,53 +128,12 @@ body {
   gap: 0.25rem;
 }
 
-.toolbar-btn {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  width: 32px;
-  height: 32px;
-  border: none;
-  border-radius: 4px;
-  background: transparent;
-  color: var(--text-dim);
-  cursor: pointer;
-  transition: color 0.15s, background 0.15s;
-  position: relative;
-}
-.toolbar-btn:hover { color: var(--gold); background: var(--gold-glow); }
-.toolbar-btn:disabled { opacity: 0.25; cursor: default; pointer-events: none; }
-.toolbar-btn.save-flash { color: var(--success); }
-.toolbar-btn svg { width: 16px; height: 16px; }
-
 .toolbar-sep {
   width: 1px;
   height: 20px;
   background: var(--border);
   margin: 0 0.25rem;
 }
-
-/* Tooltip */
-.toolbar-btn[title]::after {
-  content: attr(title);
-  position: absolute;
-  bottom: calc(100% + 6px);
-  left: 50%;
-  transform: translateX(-50%);
-  background: var(--bg-elevated);
-  color: var(--text-bright);
-  font-family: var(--mono);
-  font-size: 0.6rem;
-  padding: 0.3rem 0.5rem;
-  border-radius: 3px;
-  border: 1px solid var(--border);
-  white-space: nowrap;
-  pointer-events: none;
-  opacity: 0;
-  transition: opacity 0.15s;
-  z-index: 200;
-}
-.toolbar-btn:hover[title]::after { opacity: 1; }
 
 /* Cells container */
 #cells {
@@ -202,23 +163,10 @@ body {
   font-family: var(--serif);
   font-size: 1.3rem;
   font-weight: 300;
-  color: var(--text-dim);
+  color: var(--text-tertiary);
   letter-spacing: 0.04em;
 }
 .empty-state-actions { display: flex; gap: 0.75rem; }
-.pill-btn {
-  font-family: var(--mono);
-  font-size: 0.75rem;
-  color: var(--gold);
-  background: transparent;
-  border: 1px solid var(--gold-dim);
-  padding: 0.4rem 1rem;
-  border-radius: 20px;
-  cursor: pointer;
-  transition: background 0.15s, border-color 0.15s;
-  letter-spacing: 0.03em;
-}
-.pill-btn:hover { background: var(--gold-glow); border-color: var(--gold); }
 
 /* Cell */
 .cell {
@@ -236,7 +184,7 @@ body {
   padding-top: 0.65rem;
   font-family: var(--mono);
   font-size: 0.7rem;
-  color: var(--text-dim);
+  color: var(--text-tertiary);
   user-select: none;
 }
 .cell-gutter .exec-count { color: var(--gold); font-size: 0.7rem; }
@@ -273,52 +221,15 @@ body {
 }
 .cell:hover .cell-actions { opacity: 1; }
 
-.cell-action-btn {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  width: 24px;
-  height: 24px;
-  border: none;
-  border-radius: 3px;
-  background: var(--bg-elevated);
-  color: var(--text-dim);
-  cursor: pointer;
-  transition: color 0.15s, background 0.15s;
-}
-.cell-action-btn:hover { color: var(--gold); background: var(--gold-glow); }
-.cell-action-btn.delete:hover { color: var(--error); }
-.cell-action-btn svg { width: 13px; height: 13px; }
-
 /* Editor */
 .cell-editor { position: relative; }
-.cell-editor textarea {
-  display: block;
-  width: 100%;
-  padding: 0.6rem 0.75rem;
-  font-family: var(--mono);
-  font-size: 13px;
-  line-height: 1.65;
-  color: var(--text-bright);
-  background: var(--bg-editor);
-  border: 1px solid var(--border);
-  border-radius: 3px;
-  outline: none;
-  resize: none;
-  overflow: hidden;
-  tab-size: 2;
-  caret-color: var(--gold);
-  transition: border-color 0.15s;
-}
-.cell-editor textarea:focus { border-color: var(--border-focus); }
-.cell-editor textarea::selection { background: var(--gold-soft); }
 
 .shift-enter-hint {
   position: absolute;
   bottom: 0.4rem;
   right: 0.5rem;
   font-size: 0.6rem;
-  color: var(--text-dim);
+  color: var(--text-tertiary);
   letter-spacing: 0.03em;
   opacity: 0;
   transition: opacity 0.15s;
@@ -345,7 +256,7 @@ body {
 
 .output-chevron {
   font-size: 0.6rem;
-  color: var(--text-dim);
+  color: var(--text-tertiary);
   transition: transform 0.15s;
   width: 1rem;
   text-align: center;
@@ -354,7 +265,7 @@ body {
 
 .output-meta {
   font-size: 0.7rem;
-  color: var(--text-dim);
+  color: var(--text-tertiary);
 }
 
 .cell-output-content {
@@ -363,7 +274,7 @@ body {
   font-size: 13px;
   line-height: 1.65;
   word-break: break-word;
-  color: var(--text);
+  color: var(--text-secondary);
 }
 /* Preserve significant whitespace on the output text itself, never on the
    container. Alpine's x-if templates leave whitespace-only text nodes (the
@@ -382,69 +293,6 @@ body {
   background: var(--error-bg);
 }
 
-/* Inline undo button (shown in error outputs) */
-.undo-inline-btn {
-  display: block;
-  margin-top: 0.5rem;
-  padding: 0.2rem 0.6rem;
-  font-family: var(--mono);
-  font-size: 11px;
-  color: var(--gold);
-  background: transparent;
-  border: 1px solid var(--gold-dim);
-  border-radius: 4px;
-  cursor: pointer;
-}
-.undo-inline-btn:hover {
-  background: var(--gold-glow);
-  border-color: var(--gold);
-}
-
-/* Markdown rendered */
-.markdown-rendered {
-  padding: 0.6rem 0.75rem;
-  cursor: text;
-  line-height: 1.7;
-  color: var(--text-bright);
-}
-.markdown-rendered h1,
-.markdown-rendered h2,
-.markdown-rendered h3,
-.markdown-rendered h4 {
-  font-family: var(--serif);
-  font-weight: 500;
-  color: var(--text-bright);
-  margin: 0.5em 0 0.3em;
-}
-.markdown-rendered h1 { font-size: 1.8rem; }
-.markdown-rendered h2 { font-size: 1.4rem; }
-.markdown-rendered h3 { font-size: 1.15rem; }
-.markdown-rendered h4 { font-size: 1rem; }
-.markdown-rendered p { margin: 0.4em 0; }
-.markdown-rendered code {
-  font-family: var(--mono);
-  font-size: 0.9em;
-  background: var(--bg-editor);
-  padding: 0.15em 0.4em;
-  border-radius: 3px;
-}
-.markdown-rendered pre {
-  background: var(--bg-editor);
-  padding: 0.6rem 0.75rem;
-  border-radius: 3px;
-  margin: 0.5em 0;
-  overflow-x: auto;
-}
-.markdown-rendered pre code { background: none; padding: 0; }
-.markdown-rendered ul, .markdown-rendered ol { padding-left: 1.5em; margin: 0.4em 0; }
-.markdown-rendered strong { color: var(--gold); }
-.markdown-rendered em { font-style: italic; }
-.markdown-rendered a {
-  color: var(--gold);
-  text-decoration: underline;
-  text-underline-offset: 2px;
-}
-
 /* Between-cell divider */
 .cell-divider {
   display: flex;
@@ -456,13 +304,12 @@ body {
   opacity: 0;
   transition: opacity 0.2s;
 }
-/* `.visible` is toggled by the divider's mouseenter/leave handlers and kept on
-   while its insert dropdown is open, so the divider (and the dropdown, its
-   opacity-inheriting child) stays visible when the pointer crosses the gap from
-   the "+" button down to the dropdown items. Without this rule the divider only
-   showed on :hover and the dropdown faded out from under the cursor. */
+/* Stays visible while its insert popover is open (not just on :hover), so the
+   divider — and the popover panel nested inside it — doesn't fade out from
+   under the cursor when the pointer moves down from the "+" trigger onto a
+   menu item. */
 .cell-divider:hover,
-.cell-divider.visible { opacity: 1; }
+.cell-divider:has(sema-popover[open]) { opacity: 1; }
 .cell-divider-line {
   position: absolute;
   left: 0; right: 0;
@@ -470,57 +317,6 @@ body {
   height: 1px;
   background: var(--border);
 }
-.add-cell-btn {
-  position: relative;
-  z-index: 2;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  width: 22px;
-  height: 22px;
-  border-radius: 50%;
-  border: 1px solid var(--border);
-  background: var(--bg);
-  color: var(--gold);
-  font-family: var(--mono);
-  font-size: 0.8rem;
-  padding: 0;
-  cursor: pointer;
-  transition: border-color 0.15s, background 0.15s;
-}
-.add-cell-btn:hover { border-color: var(--gold); background: var(--gold-glow); }
-
-.add-cell-dropdown {
-  position: absolute;
-  top: 100%;
-  left: 50%;
-  transform: translateX(-50%);
-  margin-top: 4px;
-  background: var(--bg-elevated);
-  border: 1px solid var(--border);
-  border-radius: 4px;
-  overflow: hidden;
-  z-index: 50;
-  display: none;
-}
-.add-cell-dropdown.open { display: block; }
-.add-cell-dropdown button {
-  display: block;
-  width: 100%;
-  padding: 0.4rem 1rem;
-  font-family: var(--mono);
-  font-size: 0.7rem;
-  color: var(--text);
-  background: none;
-  border: none;
-  outline: none;
-  cursor: pointer;
-  text-align: left;
-  white-space: nowrap;
-  transition: background 0.1s, color 0.1s;
-}
-.add-cell-dropdown button:hover { background: var(--gold-glow); color: var(--gold); }
-.add-cell-dropdown button + button { border-top: 1px solid var(--border); }
 
 /* Status bar */
 #status-bar {
@@ -533,7 +329,7 @@ body {
   background: var(--bg);
   flex-shrink: 0;
 }
-.status-text { font-size: 0.65rem; color: var(--text-dim); }
+.status-text { font-size: 0.65rem; color: var(--text-tertiary); }
 .status-ready { color: var(--success); }
 
 /* Focus styles */

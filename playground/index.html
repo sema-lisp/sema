@@ -23,6 +23,7 @@
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Cormorant:ital,wght@0,300;0,400;0,500;0,600;1,400&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="dist/tokens.css">
 <link rel="stylesheet" href="style.css">
 <script src="https://analytics.ahrefs.com/analytics.js" data-key="uWnQU807Ceb7ddKtr+H6sA" async></script>
 </head>
@@ -61,7 +62,7 @@
         <sema-tooltip content="Format code (sema fmt)" placement="bottom">
           <sema-button variant="secondary" size="sm" id="fmt-btn" data-testid="fmt-btn" disabled>Fmt</sema-button>
         </sema-tooltip>
-        <sema-tooltip content="Run code (⌘+Enter)" placement="right">
+        <sema-tooltip content="Run code (⌘+Enter)" placement="bottom">
           <sema-button variant="run" id="run-btn" data-testid="run-btn" shortcut="⌘↵" disabled>Run</sema-button>
         </sema-tooltip>
         <sema-tooltip content="Debug with breakpoints" placement="bottom">
@@ -128,6 +129,13 @@
       </div>
     </div>
     <input type="file" id="vfs-upload" multiple hidden>
+    <sema-dialog id="clear-vfs-dialog" data-testid="clear-vfs-dialog" label="Clear all files?">
+      <p>This deletes every file in the virtual filesystem. This cannot be undone.</p>
+      <div slot="footer">
+        <sema-button variant="ghost" id="clear-vfs-cancel-btn" data-testid="btn-clear-vfs-cancel">Cancel</sema-button>
+        <sema-button variant="primary" id="clear-vfs-confirm-btn" data-testid="btn-clear-vfs-confirm">Clear</sema-button>
+      </div>
+    </sema-dialog>
   </div>
 </main>
 

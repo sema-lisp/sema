@@ -889,11 +889,10 @@ pub fn eval_module_body_vm(
         )?;
         result = vm.execute(prog.closure, ctx)?;
     }
-    // Each per-form VM ran on a clone of `env` with its own version cell, so any
-    // globals (re)defined by the body did not bump `env`'s version. Bump it now
-    // so the calling VM (whose globals share `env`'s bindings) invalidates its
-    // inline global cache and re-reads, rather than serving stale cached values.
-    env.bump_version();
+    // Each per-form VM ran on `Rc::new(env.clone())`; the clone shares both
+    // `env`'s bindings map and its version cell (`Env::version` is `Rc`-held),
+    // so any global the body (re)defined or `set!`d already bumped the version
+    // the calling VM's inline cache is keyed on — no explicit re-bump needed.
     Ok(result)
 }
 

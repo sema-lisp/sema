@@ -342,6 +342,16 @@ eval_tests! {
     string_wrap_words: r#"(string/word-wrap "the quick brown fox" 10)"# => common::eval(r#"'("the quick" "brown fox")"#),
     string_wrap_hard_break: r#"(string/word-wrap "abcdefghij k" 5)"# => common::eval(r#"'("abcde" "fghij" "k")"#),
     string_wrap_keeps_newlines: r#"(string/word-wrap "a\nb" 10)"# => common::eval(r#"'("a" "b")"#),
+    // string/truncate-width — clamp to display columns, grapheme-safe, optional ellipsis.
+    string_truncate_width_unchanged: r#"(string/truncate-width "hello" 10)"# => Value::string("hello"),
+    string_truncate_width_exact: r#"(string/truncate-width "hello" 5)"# => Value::string("hello"),
+    string_truncate_width_plain: r#"(string/truncate-width "hello world" 5)"# => Value::string("hello"),
+    string_truncate_width_cjk: r#"(string/truncate-width "日本語です" 6)"# => Value::string("日本語"),
+    string_truncate_width_emoji_boundary: r#"(string/truncate-width "a👋b" 2)"# => Value::string("a"),
+    string_truncate_width_ellipsis: r#"(string/truncate-width "hello world" 6 "…")"# => Value::string("hello…"),
+    string_truncate_width_ellipsis_unchanged: r#"(string/truncate-width "hi" 6 "…")"# => Value::string("hi"),
+    string_truncate_width_ellipsis_too_wide: r#"(string/truncate-width "hello world" 1 "…")"# => Value::string("…"),
+    string_truncate_width_zero: r#"(string/truncate-width "hello" 0)"# => Value::string(""),
     // Terminal setup/teardown guard macros return the body value and re-raise
     // after restoring (teardown always runs — the emitted escapes go to stdout).
     guard_alt_screen_returns_body: "(term/with-alt-screen 1 2 3)" => Value::int(3),
@@ -1357,6 +1367,32 @@ eval_tests! {
 }
 
 // ============================================================
+// map-indexed and enumerate (#90)
+// ============================================================
+
+eval_tests! {
+    map_indexed_basic: "(map-indexed (fn (i x) (list i x)) '(10 20 30))"
+        => common::eval("'((0 10) (1 20) (2 30))"),
+    map_indexed_empty: "(map-indexed (fn (i x) (list i x)) '())" => Value::list(vec![]),
+    map_indexed_vector_input: "(map-indexed (fn (i x) (+ i x)) (vector 10 20 30))"
+        => Value::list(vec![Value::int(10), Value::int(21), Value::int(32)]),
+    map_indexed_index_only: "(map-indexed (fn (i x) i) '(a b c))"
+        => Value::list(vec![Value::int(0), Value::int(1), Value::int(2)]),
+
+    enumerate_basic: "(enumerate '(10 20 30))" => common::eval("'((0 10) (1 20) (2 30))"),
+    enumerate_empty: "(enumerate '())" => Value::list(vec![]),
+    enumerate_vector_input: "(enumerate (vector 'a 'b))" => common::eval("'((0 a) (1 b))"),
+    enumerate_then_map_destructure: "(map (fn (pair) (car pair)) (enumerate '(x y z)))"
+        => Value::list(vec![Value::int(0), Value::int(1), Value::int(2)]),
+}
+
+eval_error_tests! {
+    map_indexed_wrong_arity: "(map-indexed (fn (i x) x))" => "arity",
+    map_indexed_non_sequence_errors: "(map-indexed (fn (i x) x) 5)" => "list, vector, or mutable-array",
+    enumerate_non_sequence_errors: "(enumerate 5)" => "list, vector, or mutable-array",
+}
+
+// ============================================================
 // Input validation — negative counts/indices (C7, C8, C9)
 // ============================================================
 
@@ -1897,6 +1933,7 @@ eval_error_tests! {
     // STD-4
     string_pad_left_negative: r#"(string/pad-left "x" -1)"# => "non-negative",
     string_pad_right_negative: r#"(string/pad-right "x" -1)"# => "non-negative",
+    string_truncate_width_negative: r#"(string/truncate-width "x" -1)"# => "non-negative",
     // STD-5
     list_chunk_negative: "(list/chunk -1 (list 1 2 3))" => "non-negative",
     list_split_at_negative: "(list/split-at (list 1 2 3) -1)" => "non-negative",
@@ -2817,6 +2854,18 @@ eval_tests! {
     mutable_array_get_redefined: "(define (mutable-array/get a i) :mine) (mutable-array/get (mutable-array/new 1 5) 0)" => Value::keyword("mine"),
     // A let-bound shadow resolves locally (never the intrinsic).
     mutable_array_get_local_shadow: "(let ((mutable-array/get (fn (a i) :local))) (mutable-array/get 1 2))" => Value::keyword("local"),
+    // --- Sequence HOF / length interop (#91): the shared `get_sequence`
+    // coercion accepts a mutable-array by snapshotting it up front, so
+    // map/filter/for-each and generic `length` treat it like a list/vector.
+    mutable_array_map_interop: "(let ((a (mutable-array/new))) (mutable-array/push! a 5) (mutable-array/push! a 6) (map (lambda (x) (* x 2)) a))" => common::eval("'(10 12)"),
+    mutable_array_filter_interop: "(let ((a (mutable-array/new))) (mutable-array/push! a 1) (mutable-array/push! a 2) (mutable-array/push! a 3) (filter odd? a))" => common::eval("'(1 3)"),
+    // for-each returns nil; observe its effect by accumulating into a cell.
+    mutable_array_for_each_interop: "(let ((a (mutable-array/new)) (sum (mutable-cell/new 0))) (mutable-array/push! a 3) (mutable-array/push! a 4) (for-each (lambda (x) (mutable-cell/set! sum (+ (mutable-cell/get sum) x))) a) (mutable-cell/get sum))" => Value::int(7),
+    mutable_array_length_interop: "(let ((a (mutable-array/new))) (mutable-array/push! a 5) (mutable-array/push! a 6) (length a))" => Value::int(2),
+    // Reentrancy: the snapshot is taken before the loop, so a callback that
+    // grows the same array does not panic ("already borrowed") and iteration
+    // still ranges over the original two elements.
+    mutable_array_map_reentrant_snapshot: "(let ((a (mutable-array/new))) (mutable-array/push! a 1) (mutable-array/push! a 2) (map (lambda (x) (mutable-array/push! a 99) x) a))" => common::eval("'(1 2)"),
     mutable_cell_round_trip: "(let ((c (mutable-cell/new 1))) (mutable-cell/set! c 99) (mutable-cell/get c))" => Value::int(99),
     mutable_cell_shared_mutation: "(let* ((c (mutable-cell/new 0)) (d c)) (mutable-cell/set! c 5) (mutable-cell/get d))" => Value::int(5),
     mutable_cell_equal_by_contents: "(equal? (mutable-cell/new 1) (mutable-cell/new 1))" => Value::bool(true),

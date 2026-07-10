@@ -1029,6 +1029,16 @@ fn validate_chunk_bytecode(
     let code = &chunk.code;
     let n_locals = chunk.n_locals as usize;
 
+    // An empty chunk has no terminator, so activating it violates the
+    // pc-bounds invariant at pc 0 (every executable chunk is non-empty and
+    // Return-terminated). The compiler never emits one (empty programs
+    // compile to `Nil; Return`), so reject rather than trust.
+    if code.is_empty() {
+        return Err(SemaError::eval(format!(
+            "in {label}: empty bytecode chunk (missing Return terminator)"
+        )));
+    }
+
     // First pass: collect valid instruction boundaries and validate operand indices
     let mut valid_pcs = std::collections::HashSet::new();
     let mut jump_targets: Vec<(usize, isize)> = Vec::new(); // (source_pc, target_pc)

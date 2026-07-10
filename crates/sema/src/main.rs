@@ -63,6 +63,7 @@ mod docs;
 mod import_tracer;
 mod pkg;
 mod repl;
+mod update;
 mod web;
 mod workflow_check;
 mod workflow_view;
@@ -361,6 +362,20 @@ enum Commands {
         /// Disable LLM features
         #[arg(long)]
         no_llm: bool,
+    },
+    /// Update sema itself to the latest released version
+    Update {
+        /// Check for an available update without installing it
+        #[arg(long)]
+        check: bool,
+
+        /// Install a specific version instead of the latest (e.g. "1.30.0")
+        #[arg(long)]
+        version: Option<String>,
+
+        /// Skip the confirmation prompt
+        #[arg(short = 'y', long)]
+        yes: bool,
     },
 }
 
@@ -898,6 +913,21 @@ fn main() {
                 no_llm,
             } => {
                 run_eval(stdin, expr, json, path, sandbox, no_llm);
+            }
+            Commands::Update {
+                check,
+                version,
+                yes,
+            } => {
+                let opts = update::UpdateOptions {
+                    check_only: check,
+                    target_version: version,
+                    yes,
+                };
+                if let Err(e) = update::run(opts) {
+                    eprintln!("Error: {e}");
+                    std::process::exit(1);
+                }
             }
         }
         return;

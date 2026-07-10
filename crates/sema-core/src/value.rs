@@ -2951,7 +2951,16 @@ impl fmt::Debug for Value {
 pub struct Env {
     pub bindings: Rc<RefCell<SpurMap<Spur, Value>>>,
     pub parent: Option<Rc<Env>>,
-    pub version: Cell<u64>,
+    /// Monotonic mutation counter the VM's inline global cache is keyed on.
+    /// Held behind an `Rc` so it travels *with* `bindings`: every `Env` handle
+    /// cloned from this one shares this same cell. A mutation through any handle
+    /// (a `set!` on a `load`ed unit's per-form-VM clone, a different frame's
+    /// home-globals handle) is therefore observed by a cache entry keyed on any
+    /// other handle to the same bindings — a fresh cell per clone would let a
+    /// recursive reader keep serving a value its own handle's `set!` never bumped
+    /// (issue #82). A distinct bindings map (`new`/`with_parent`) still gets its
+    /// own cell, since it is a genuinely independent scope.
+    pub version: Rc<Cell<u64>>,
 }
 
 impl Env {
@@ -2959,7 +2968,7 @@ impl Env {
         Env {
             bindings: Rc::new(RefCell::new(SpurMap::new())),
             parent: None,
-            version: Cell::new(0),
+            version: Rc::new(Cell::new(0)),
         }
     }
 
@@ -2967,15 +2976,14 @@ impl Env {
         Env {
             bindings: Rc::new(RefCell::new(SpurMap::new())),
             parent: Some(parent),
-            version: Cell::new(0),
+            version: Rc::new(Cell::new(0)),
         }
     }
 
-    /// Bump the environment's version counter. The VM's inline global cache is
-    /// keyed on this version, so call this after mutating `bindings` through a
-    /// different `Env` handle that shares the same `bindings` Rc but has its own
-    /// version cell (e.g. a `load`ed module body run on a cloned-Env VM), so a
-    /// VM observing this `Env` re-reads instead of serving a stale cached value.
+    /// Bump the version counter shared by every handle to this scope's bindings.
+    /// The VM's inline global cache is keyed on it, so bumping after any mutation
+    /// makes every VM observing this scope (through any clone) re-read instead of
+    /// serving a stale cached value.
     pub fn bump_version(&self) {
         self.version.set(self.version.get().wrapping_add(1));
     }

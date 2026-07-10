@@ -1785,6 +1785,14 @@ impl VM {
             let _ = frame; // release borrow so we can mutate self
 
             loop {
+                // Provably dead for well-formed bytecode (the compiler
+                // terminates every chunk with `Return` and patches jumps
+                // in-chunk; `validate_bytecode` proves the same pc-bounds
+                // invariants for loaded `.semac`) and measurably free: a
+                // never-taken branch predicts perfectly, so an unchecked
+                // fetch benches no faster (tak/nqueens, M2 Max). Kept as a
+                // real check — it turns a VM bug into a clean error instead
+                // of an out-of-bounds read.
                 if pc >= code_len {
                     return Err(SemaError::eval(format!(
                         "VM: program counter out of bounds (pc={pc}, len={code_len})"
@@ -6028,6 +6036,9 @@ mod tests {
     fn test_vm_oob_jump_returns_error() {
         // Issue #1: A jump that goes past the end of bytecode should return
         // an error, not cause undefined behavior from unsafe pointer reads.
+        // (A crafted .semac with such a jump never reaches the VM — see
+        // `semac_oob_jump_rejected_at_load` in
+        // tests/bytecode_validator_regression.rs.)
         use crate::emit::Emitter;
         use crate::opcodes::Op;
 

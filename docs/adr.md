@@ -521,9 +521,9 @@ Out of scope for this ADR: also unifies the fix for `(type (fn (x) x))` returnin
 
 References: MEMORY.md (Upvalue model section), `crates/sema-vm/src/resolve.rs` (Lua-style resolution, already done), `crates/sema-vm/src/vm.rs` (Load/Store sites, `tail_call_vm_closure`), `docs/limitations.md` #31.
 
-### 56. Bytecode stack-depth verifier for .semac loading (PROPOSED)
+### 56. Bytecode stack-depth verifier for .semac loading
 
-Status: **proposed** — fixes audit bug C11 (see `docs/limitations.md` #32). Not yet implemented.
+Status: **implemented** — fixes audit bug C11 (see `docs/limitations.md` #32). `verify_stack_balance` in `crates/sema-vm/src/serialize.rs`, wired into `validate_bytecode` / `deserialize_from_bytes`; regression suite at `crates/sema-vm/tests/bytecode_validator_regression.rs`. As implemented, join points use a strict-equality lattice (not a `min` join), exception handlers are seeded as extra roots at their declared entry depth (validated against the computed depths in the protected range), and the same reachability walk also proves the pc-bounds invariants: no reachable fall-off-the-end or jump to end-of-code, bounds-checked handler pcs, and no empty chunks.
 
 Context: the VM uses `pop_unchecked` at 90+ call sites in `crates/sema-vm/src/vm.rs`. This relies on the in-process compiler emitting stack-balanced bytecode. `.semac` files loaded via `crates/sema-vm/src/serialize.rs::validate_bytecode` are *not* verified for stack balance — only structural checks (magic, version, table bounds, jump targets). A crafted/corrupted `.semac` can cause UB in release: `set_len(usize::MAX)` after underflow, then OOB reads.
 
@@ -576,7 +576,7 @@ Trade-offs:
 - Verifier must agree with `vm.rs` dispatch exactly. Mismatches are bugs in *either* direction; adding `Op::stack_effect()` as a single source of truth (used by both verifier and any future fuzzer) reduces drift.
 - Does not catch type errors (e.g. `Add` on non-numbers) — those remain runtime checks. Only catches arithmetic-on-stack-depth violations.
 
-Once this lands, `.semac` files from untrusted sources can be loaded safely. Until it does, see `docs/limitations.md` #32 for the trust-model caveat.
+See `docs/limitations.md` #32 for the resulting trust model (what verification does and does not cover).
 
 References: `crates/sema-vm/src/vm.rs::pop_unchecked` (the unsafe site), `crates/sema-vm/src/serialize.rs::validate_bytecode` (where the new pass plugs in), `crates/sema-vm/src/opcodes.rs` (canonical opcode list), `docs/limitations.md` #32.
 

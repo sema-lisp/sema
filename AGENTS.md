@@ -19,8 +19,8 @@ jake example-notebook   # run demo notebook headlessly
 jake test.notebook-e2e  # Playwright E2E tests for notebook
 ```
 
-- Single crate: `cargo test -p sema-reader` | Single test: `cargo test -p sema --test integration_test -- test_name`
-- Single eval test: `cargo test -p sema --test eval_test -- test_name` | Ignored tests: `cargo test -p sema -- --ignored`
+- Single crate: `cargo test -p sema-reader` | Single test: `cargo test -p sema-lang --test integration_test -- test_name`
+- Single eval test: `cargo test -p sema-lang --test eval_test -- test_name` | Ignored tests: `cargo test -p sema-lang -- --ignored`
 - Run file: `cargo run -- examples/hello.sema` | REPL: `cargo run` | Eval: `cargo run -- -e "(+ 1 2)"`
 - Integration tests: `crates/sema/tests/integration_test.rs`. Eval tests: `crates/sema/tests/eval_test.rs`. Reader unit tests: `crates/sema-reader/src/reader.rs`.
 - Editor plugins live in their own repos under the `sema-lisp` org (`vscode-sema`, `zed-sema`, `intellij-sema`, `emacs-sema`, `helix-sema`, `sema.nvim`, `sema.vim`, `sublime-sema`) and the grammar in `sema-lisp/tree-sitter-sema` — they are no longer in this repo. Each carries its own CI/publishing.
@@ -44,7 +44,7 @@ Dependency flow (arrows = "depends on"): `sema-core ← sema-reader ← sema-vm 
 - **sema-docs** → Builtin docs index generator. Each builtin is a markdown file in `crates/sema-docs/entries/`; `sema-docs gen` produces a JSON index consumed by LSP hover/completion and REPL apropos.
 - **sema-fmt** → Code formatter for Sema source files
 - **sema-wasm** → WASM bindings for the browser playground at sema.run
-- **sema** → Binary: clap CLI + reedline REPL + `sema build` (standalone executables) + `sema compile`/`sema disasm` + `sema lsp` + `sema dap` + `sema fmt` + `sema notebook` + integration tests. REPL submodules live in `crates/sema/src/repl/` (editor, highlighter, hinter, validator, inspector, commands).
+- **sema** → Binary: clap CLI + reedline REPL + `sema build` (standalone executables) + `sema compile`/`sema disasm` + `sema lsp` + `sema dap` + `sema fmt` + `sema notebook` + integration tests. REPL submodules live in `crates/sema/src/repl/` (editor, highlighter, hinter, validator, inspector, commands). Its Cargo **package** name is `sema-lang` (the binary target is `sema`), so `cargo -p` commands use `-p sema-lang`.
 
 ## Key Design Patterns
 

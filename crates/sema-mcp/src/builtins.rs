@@ -65,6 +65,17 @@ struct McpConnection {
     /// Stable server identity (url, or `stdio\0command args`) used to key the
     /// cassette so tool calls record/replay deterministically across runs.
     identity: String,
+    /// From [`ConnectOpts::interactive_auth`]. `mcp/connect` always connects
+    /// with `true`; a connection made via [`connect_from_config`] with
+    /// `interactive_auth: false` stays non-interactive for its whole
+    /// lifetime — a mid-session 401/403 in `reauthorize` may still refresh
+    /// silently, but never falls back to a browser login (see
+    /// [`NoInteractiveDriver`]).
+    interactive_auth: bool,
+    /// From [`ConnectOpts::allowed_tools`]. `None` is unrestricted (today's
+    /// `mcp/connect` behavior); `Some(list)` restricts `mcp/call` and filters
+    /// `mcp/tools`/`mcp/tools->sema` to exactly these tool names.
+    allowed_tools: Option<Vec<String>>,
 }
 
 fn block_on<F: Future>(future: F) -> F::Output {
@@ -102,9 +113,18 @@ fn gate(sandbox: &Sandbox, cap: Caps) -> Result<(), SemaError> {
 }
 
 /// Register a live connection under a fresh opaque handle and return the handle.
-fn register_connection(client: McpClient, identity: String) -> Result<Value, SemaError> {
+fn register_connection(
+    client: McpClient,
+    identity: String,
+    opts: &ConnectOpts,
+) -> Result<Value, SemaError> {
     let handle = next_handle();
-    let connection = Rc::new(RefCell::new(McpConnection { client, identity }));
+    let connection = Rc::new(RefCell::new(McpConnection {
+        client,
+        identity,
+        interactive_auth: opts.interactive_auth,
+        allowed_tools: opts.allowed_tools.clone(),
+    }));
     CONNECTIONS.with(|connections| {
         connections.borrow_mut().insert(handle.clone(), connection);
     });
@@ -112,8 +132,10 @@ fn register_connection(client: McpClient, identity: String) -> Result<Value, Sem
 }
 
 /// Connect to a stdio MCP server (`:command` + optional `:args`/`:env`/`:cwd`),
-/// run the handshake, and register the connection.
-fn connect_stdio(config_json: &serde_json::Value) -> Result<Value, SemaError> {
+/// run the handshake, and register the connection. Stdio servers never speak
+/// OAuth, so `opts.interactive_auth` is only carried through for `mcp/call`'s
+/// bookkeeping (it is meaningless here); `opts.allowed_tools` applies as usual.
+fn connect_stdio(config_json: &serde_json::Value, opts: &ConnectOpts) -> Result<Value, SemaError> {
     let command = config_json
         .get("command")
         .and_then(|value| value.as_str())
@@ -180,16 +202,29 @@ fn connect_stdio(config_json: &serde_json::Value) -> Result<Value, SemaError> {
         let _ = block_on(client.close());
         return Err(SemaError::eval(format!("mcp/connect: {err}")));
     }
-    register_connection(client, identity)
+    register_connection(client, identity, opts)
 }
 
 /// Connect to a remote Streamable-HTTP MCP server (`:url` + optional
 /// `:headers`), run the handshake, and register the connection.
-fn connect_http(config_json: &serde_json::Value) -> Result<Value, SemaError> {
+///
+/// When `opts.interactive_auth` is `false`, a `401`/`403` OAuth challenge is
+/// never chased: [`obtain_access_token`] (and therefore the browser opener and
+/// loopback listener it drives) is never called, and the connect fails with
+/// [`ConnectOutcome::NeedsAuth`] instead. A caller that wants a silent
+/// reconnect from a cached token should inject it directly via
+/// `:headers {"Authorization" "Bearer …"}` before calling — that value already
+/// flows straight into `McpHttpConfig.headers` below, so no new surface is
+/// needed for token injection.
+fn connect_http(
+    config_json: &serde_json::Value,
+    opts: &ConnectOpts,
+) -> Result<Value, ConnectOutcome> {
     let url = config_json
         .get("url")
         .and_then(|value| value.as_str())
-        .ok_or_else(|| SemaError::eval("mcp/connect requires a :url entry for http transport"))?;
+        .ok_or_else(|| SemaError::eval("mcp/connect requires a :url entry for http transport"))
+        .map_err(ConnectOutcome::Sema)?;
     let mut headers = config_json
         .get("headers")
         .and_then(|value| value.as_object())
@@ -212,54 +247,68 @@ fn connect_http(config_json: &serde_json::Value) -> Result<Value, SemaError> {
         url: url.to_string(),
         headers: headers.clone(),
     }))
-    .map_err(|err| SemaError::eval(format!("mcp/connect: {err}")))?;
+    .map_err(|err| ConnectOutcome::Sema(SemaError::eval(format!("mcp/connect: {err}"))))?;
 
     if let Err(err) = block_on(client.initialize()) {
         if let Some(challenge) = client.http_challenge() {
+            if !opts.interactive_auth {
+                // Non-interactive: report the auth requirement instead of
+                // chasing it — no discovery, no browser, no loopback bind.
+                let _ = block_on(client.close());
+                return Err(ConnectOutcome::NeedsAuth(url.to_string()));
+            }
             // A `401` means the server requires OAuth; run the login flow, attach
             // the token, and retry. Some authenticated servers (e.g. Asana) gate
             // *all* requests behind auth and only reveal that they actually speak
             // the legacy HTTP+SSE transport once authorized — so a `404`/`405` on
             // the authenticated Streamable POST means "retry over legacy SSE with
             // the token attached", not a hard failure.
-            let token = obtain_access_token(url, &challenge, preconfigured_client_id.as_deref())?;
+            let token = obtain_access_token(url, &challenge, preconfigured_client_id.as_deref())
+                .map_err(ConnectOutcome::Sema)?;
             headers.insert("Authorization".to_string(), format!("Bearer {token}"));
             client.set_bearer_token(&token);
             if let Err(err2) = block_on(client.initialize()) {
                 let status = client.http_last_status();
                 let _ = block_on(client.close());
                 if matches!(status, Some(404) | Some(405)) {
-                    return connect_legacy(url, headers);
+                    return connect_legacy(url, headers, opts);
                 }
-                return Err(SemaError::eval(format!(
+                return Err(ConnectOutcome::Sema(SemaError::eval(format!(
                     "mcp/connect: handshake failed after authorization: {err2}"
-                )));
+                ))));
             }
         } else if matches!(client.http_last_status(), Some(404) | Some(405)) {
             // Unauthenticated server that only speaks the deprecated 2024-11-05
             // HTTP+SSE transport (POST→4xx→GET-`endpoint`).
             let _ = block_on(client.close());
-            return connect_legacy(url, headers);
+            return connect_legacy(url, headers, opts);
         } else {
             let _ = block_on(client.close());
-            return Err(SemaError::eval(format!("mcp/connect: {err}")));
+            return Err(ConnectOutcome::Sema(SemaError::eval(format!(
+                "mcp/connect: {err}"
+            ))));
         }
     }
-    register_connection(client, url.to_string())
+    register_connection(client, url.to_string(), opts).map_err(ConnectOutcome::Sema)
 }
 
 /// Connect over the deprecated 2024-11-05 HTTP+SSE transport. `headers` carries
 /// any bearer token obtained during the OAuth flow, so authenticated legacy
 /// servers (e.g. Asana) work.
-fn connect_legacy(url: &str, headers: HashMap<String, String>) -> Result<Value, SemaError> {
+fn connect_legacy(
+    url: &str,
+    headers: HashMap<String, String>,
+    opts: &ConnectOpts,
+) -> Result<Value, ConnectOutcome> {
     let mut legacy = block_on(McpClient::connect_legacy_sse(McpHttpConfig {
         url: url.to_string(),
         headers,
     }))
-    .map_err(|e| SemaError::eval(format!("mcp/connect: {e}")))?;
-    block_on(legacy.initialize())
-        .map_err(|e| SemaError::eval(format!("mcp/connect (legacy SSE): {e}")))?;
-    register_connection(legacy, url.to_string())
+    .map_err(|e| ConnectOutcome::Sema(SemaError::eval(format!("mcp/connect: {e}"))))?;
+    block_on(legacy.initialize()).map_err(|e| {
+        ConnectOutcome::Sema(SemaError::eval(format!("mcp/connect (legacy SSE): {e}")))
+    })?;
+    register_connection(legacy, url.to_string(), opts).map_err(ConnectOutcome::Sema)
 }
 
 /// Run (or reuse) the OAuth login for a remote server that answered `401`, and
@@ -302,9 +351,10 @@ fn obtain_access_token(
     })
 }
 
-fn config_to_json(args: &[Value]) -> Result<serde_json::Value, SemaError> {
-    check_arity!(args, "mcp/connect", 1);
-    let config = &args[0];
+/// Convert a Sema config map — `mcp/connect`'s single argument, or a config
+/// value a caller of [`connect_from_config`] builds programmatically — into the
+/// JSON shape the transport dispatch and connect helpers below expect.
+fn value_to_config_json(config: &Value) -> Result<serde_json::Value, SemaError> {
     let map = config.as_map_ref().ok_or_else(|| {
         SemaError::type_error("map", config.type_name())
             .with_hint("mcp/connect expects a single config map; use {:command ...}")
@@ -318,6 +368,141 @@ fn config_to_json(args: &[Value]) -> Result<serde_json::Value, SemaError> {
         config_json.insert(key_str, sema_core::value_to_json_lossy(value));
     }
     Ok(serde_json::Value::Object(config_json))
+}
+
+fn config_to_json(args: &[Value]) -> Result<serde_json::Value, SemaError> {
+    check_arity!(args, "mcp/connect", 1);
+    value_to_config_json(&args[0])
+}
+
+// ── the public non-interactive / least-privilege connect entry point ──────
+
+/// Options for [`connect_from_config`]. `mcp/connect` (the interactive Sema
+/// builtin) always connects with `ConnectOpts { interactive_auth: true,
+/// allowed_tools: None }` — today's unrestricted, browser-capable behavior.
+#[derive(Debug, Clone, Default)]
+pub struct ConnectOpts {
+    /// When `false`, a `401`/`403` OAuth challenge encountered while
+    /// connecting NEVER launches an interactive flow — no system browser, no
+    /// loopback listener bound. The connect fails with
+    /// [`ConnectFailure::NeedsAuth`] instead, naming the server URL that
+    /// challenged. A caller that already holds a cached/valid token should
+    /// inject it directly via `:headers {"Authorization" "Bearer …"}` on the
+    /// config map before calling — that flows straight into
+    /// `McpHttpConfig.headers`, so no separate injection surface exists or is
+    /// needed. A connection made with `false` also stays non-interactive for
+    /// its whole lifetime: a mid-session 401/403 during `mcp/call` may still
+    /// self-heal via a stored refresh token, but never falls back to a
+    /// browser login (see the crate-internal `NoInteractiveDriver`).
+    pub interactive_auth: bool,
+    /// When `Some(list)`, the resulting connection is restricted to exactly
+    /// these tool names: `mcp/call` of any other tool name fails before any
+    /// cassette lookup or network call, and `mcp/tools`/`mcp/tools->sema` only
+    /// ever surface the allowed subset — an agent given this connection's
+    /// tools never even sees an undeclared one. `Some(vec![])` is a valid
+    /// degenerate case (no tools callable). `None` is unrestricted — today's
+    /// `mcp/connect` behavior.
+    pub allowed_tools: Option<Vec<String>>,
+}
+
+/// Why [`connect_from_config`] failed to establish a connection.
+#[derive(Debug)]
+pub enum ConnectFailure {
+    /// The server demands OAuth consent and `opts.interactive_auth` was
+    /// `false`, so no browser/loopback flow was attempted. `url` is the MCP
+    /// server endpoint that issued the challenge — typically used to gate a
+    /// workflow run and prompt the user to authenticate out-of-band (e.g. via
+    /// a dashboard or `sema mcp login`), then retry the connect once a token
+    /// has been persisted.
+    NeedsAuth { url: String },
+    /// Any other connect failure: bad config, network error, process spawn
+    /// failure, sandbox denial, handshake failure, and — on the interactive
+    /// path — a failed OAuth login. The message is meant for end users; any
+    /// structured hint the underlying error carried is folded into it.
+    Failed(String),
+}
+
+/// Outcome of the shared connect helpers, before it is narrowed for a
+/// particular caller: the native `mcp/connect` builtin (always
+/// `interactive_auth: true`) unwraps this straight back into the original
+/// `SemaError` — hint and note intact, byte-identical to before this
+/// function existed — while [`connect_from_config`] collapses it into the
+/// simpler public [`ConnectFailure`].
+enum ConnectOutcome {
+    NeedsAuth(String),
+    Sema(SemaError),
+}
+
+/// Gate on the sandbox captured by the most recent [`register_mcp_builtins`]
+/// call on this thread (unrestricted if that was never called), dispatch on
+/// transport, and connect. Shared by `mcp/connect` and [`connect_from_config`]
+/// so the two can never drift.
+fn connect_with_opts(
+    config_json: &serde_json::Value,
+    opts: &ConnectOpts,
+) -> Result<Value, ConnectOutcome> {
+    let sandbox = SANDBOX.with(|s| s.borrow().clone());
+    if config_json.get("url").and_then(|v| v.as_str()).is_some() {
+        gate(&sandbox, Caps::NETWORK).map_err(ConnectOutcome::Sema)?;
+        connect_http(config_json, opts)
+    } else {
+        gate(&sandbox, Caps::PROCESS).map_err(ConnectOutcome::Sema)?;
+        connect_stdio(config_json, opts).map_err(ConnectOutcome::Sema)
+    }
+}
+
+/// Connect to an MCP server from a config map (the same shape `mcp/connect`
+/// accepts: `{:url ...}` for Streamable HTTP / legacy SSE, `{:command ...}`
+/// for stdio), honoring [`ConnectOpts`]. This is `mcp/connect`'s underlying
+/// implementation, exposed as a Rust entry point for callers that need
+/// options the Sema builtin doesn't take — namely a workflow runtime that
+/// must connect declared MCP servers headlessly (never popping a browser
+/// mid-run) and enforce a least-privilege `:tools` manifest.
+///
+/// Returns the same opaque handle `Value` `mcp/connect` does, registered in
+/// the same thread-local connection table — so a handle obtained here works
+/// with `mcp/call`/`mcp/tools`/`mcp/tools->sema`/`mcp/close` exactly as if it
+/// came from `(mcp/connect ...)`, as long as those builtins are evaluated on
+/// the same thread. Sandbox gates (`Caps::NETWORK` for `:url`, `Caps::PROCESS`
+/// for `:command`) apply exactly as they do for `mcp/connect`.
+pub fn connect_from_config(config: &Value, opts: ConnectOpts) -> Result<Value, ConnectFailure> {
+    let outcome = value_to_config_json(config)
+        .map_err(ConnectOutcome::Sema)
+        .and_then(|config_json| connect_with_opts(&config_json, &opts));
+    outcome.map_err(connect_outcome_to_failure)
+}
+
+/// Collapse a [`ConnectOutcome`] into the public [`ConnectFailure`]. Any hint
+/// the original `SemaError` carried is appended to the message — `Display`
+/// alone would drop it (hints are a separate structured field), and
+/// `ConnectFailure::Failed` is intentionally a plain string.
+fn connect_outcome_to_failure(outcome: ConnectOutcome) -> ConnectFailure {
+    match outcome {
+        ConnectOutcome::NeedsAuth(url) => ConnectFailure::NeedsAuth { url },
+        ConnectOutcome::Sema(err) => {
+            let mut message = err.to_string();
+            if let Some(hint) = err.hint() {
+                message.push_str(&format!(" (hint: {hint})"));
+            }
+            ConnectFailure::Failed(message)
+        }
+    }
+}
+
+/// Unwrap a [`ConnectOutcome`] produced with `interactive_auth: true` (the
+/// native `mcp/connect` builtin's own path) back into the original
+/// `SemaError`, hint/note intact — this is what keeps `mcp/connect`'s error
+/// messages byte-identical across the refactor. `NeedsAuth` cannot occur here
+/// (it is only returned when `opts.interactive_auth` is `false`); handled
+/// defensively rather than with a panic in case that invariant ever changes.
+fn connect_outcome_to_sema_error(outcome: ConnectOutcome) -> SemaError {
+    match outcome {
+        ConnectOutcome::Sema(err) => err,
+        ConnectOutcome::NeedsAuth(url) => SemaError::eval(format!(
+            "mcp/connect: server at {url} requires authorization (unexpected: an interactive \
+             connect should have attempted login)"
+        )),
+    }
 }
 
 fn require_handle<'a>(args: &'a [Value], fn_name: &str) -> Result<&'a str, SemaError> {
@@ -353,6 +538,38 @@ fn cassette_key(identity: &str, tool: &str, args: &serde_json::Value) -> String 
     format!("mcp-{:x}", hasher.finalize())
 }
 
+/// True when `tool_name` is callable under a connection's `:tools` manifest:
+/// `None` is unrestricted, `Some(list)` allows only the named tools (including
+/// the degenerate empty list, which allows none). Shared by the `mcp/call`
+/// enforcement below and the `mcp/tools`/`mcp/tools->sema` list filters.
+fn tool_is_allowed(allowed_tools: &Option<Vec<String>>, tool_name: &str) -> bool {
+    match allowed_tools {
+        None => true,
+        Some(list) => list.iter().any(|t| t == tool_name),
+    }
+}
+
+/// Enforce a connection's `:tools` manifest before any cassette lookup or
+/// network call: an undeclared tool never reaches the wire, even in cassette
+/// record mode.
+fn check_tool_allowed(connection: &McpConnection, tool_name: &str) -> Result<(), SemaError> {
+    let Some(allowed) = &connection.allowed_tools else {
+        return Ok(());
+    };
+    if allowed.iter().any(|t| t == tool_name) {
+        return Ok(());
+    }
+    let manifest = if allowed.is_empty() {
+        "(none)".to_string()
+    } else {
+        allowed.join(", ")
+    };
+    Err(SemaError::eval(format!(
+        "mcp/call: tool `{tool_name}` is not declared in this connection's :tools manifest [{manifest}]"
+    ))
+    .with_hint("declared in the workflow's :mcp :tools manifest; add it there to allow it"))
+}
+
 /// Invoke a tool, routing through the cassette when one is active: a replay hit
 /// returns the recorded result without touching the network; otherwise the real
 /// call runs and its result is recorded.
@@ -362,6 +579,7 @@ fn call_tool_via_connection(
     arguments_json: serde_json::Value,
 ) -> Result<serde_json::Value, SemaError> {
     let connection = lookup_connection(handle)?;
+    check_tool_allowed(&connection.borrow(), tool_name)?;
     let key = cassette_key(&connection.borrow().identity, tool_name, &arguments_json);
 
     match sema_core::mcp_cassette_decide(&key) {
@@ -415,7 +633,8 @@ fn call_tool_real(
     let Some(url) = url else {
         return Err(SemaError::eval(format!("mcp/call: {err}")));
     };
-    let token = match reauthorize(&url, status, challenge.as_deref()) {
+    let interactive_auth = connection.borrow().interactive_auth;
+    let token = match reauthorize(&url, status, challenge.as_deref(), interactive_auth) {
         Ok(Some(token)) => token,
         // Not an auth challenge we handle, or re-auth failed — surface the
         // original error.
@@ -430,30 +649,70 @@ fn call_tool_real(
         .map_err(|err| SemaError::eval(format!("mcp/call: {err}")))
 }
 
+/// A [`RedirectDriver`](crate::oauth::loopback::RedirectDriver) for
+/// non-interactive connections (`ConnectOpts::interactive_auth: false`).
+/// `reauth_on_challenge`'s refresh-token path never calls `drive()` — a valid
+/// stored refresh token self-heals a `401` without any redirect — but its full
+/// login fallback (no/expired refresh token, or a `403 insufficient_scope`
+/// step-up, which always needs fresh consent) does call it. Failing `drive()`
+/// cleanly here, with no changes to `oauth/login.rs`, is what keeps a
+/// non-interactive connection from ever popping a browser for the rest of its
+/// lifetime.
+struct NoInteractiveDriver;
+
+impl crate::oauth::loopback::RedirectDriver for NoInteractiveDriver {
+    fn redirect_uri(&self) -> String {
+        // `login()` reads this to build the authorize URL / register a DCR
+        // client BEFORE calling `drive()`, which always errors below — so this
+        // is never actually dialed, but must be a well-formed loopback URI.
+        "http://127.0.0.1:1/callback".to_string()
+    }
+
+    fn drive(&self, _authorize_url: &str, _expected_state: &str) -> Result<String, String> {
+        Err("interactive authentication is disabled for this connection".to_string())
+    }
+}
+
 /// React to a mid-session auth challenge (refresh on `401`, step-up re-scope on
 /// `403 insufficient_scope`) and return a fresh access token to retry with.
+/// `interactive_auth` (from the connection's [`ConnectOpts`]) selects the
+/// redirect driver: the real loopback+browser flow, or [`NoInteractiveDriver`]
+/// so a login fallback fails cleanly instead of popping a browser mid-run.
 fn reauthorize(
     url: &str,
     status: Option<u16>,
     challenge: Option<&str>,
+    interactive_auth: bool,
 ) -> Result<Option<String>, SemaError> {
     let http = reqwest::Client::new();
     let store = crate::oauth::store::default_store();
-    let driver = crate::oauth::loopback::LoopbackDriver::with_opener(
-        std::time::Duration::from_secs(300),
-        gated_browser_opener(),
-    )
-    .map_err(|e| SemaError::eval(format!("mcp/call: {e}")))?;
-    block_on(crate::oauth::login::reauth_on_challenge(
-        &http,
-        store.as_ref(),
-        url,
-        status,
-        challenge,
-        None,
-        &driver,
-    ))
-    .map_err(|e| SemaError::eval(format!("mcp/call: re-authorization failed: {e}")))
+    let result = if interactive_auth {
+        let driver = crate::oauth::loopback::LoopbackDriver::with_opener(
+            std::time::Duration::from_secs(300),
+            gated_browser_opener(),
+        )
+        .map_err(|e| SemaError::eval(format!("mcp/call: {e}")))?;
+        block_on(crate::oauth::login::reauth_on_challenge(
+            &http,
+            store.as_ref(),
+            url,
+            status,
+            challenge,
+            None,
+            &driver,
+        ))
+    } else {
+        block_on(crate::oauth::login::reauth_on_challenge(
+            &http,
+            store.as_ref(),
+            url,
+            status,
+            challenge,
+            None,
+            &NoInteractiveDriver,
+        ))
+    };
+    result.map_err(|e| SemaError::eval(format!("mcp/call: re-authorization failed: {e}")))
 }
 
 /// Concatenate the `text` blocks of a `tools/call` result, if any.
@@ -539,21 +798,18 @@ pub fn register_mcp_builtins(env: &Env, sandbox: &Sandbox) {
 
     // `mcp/connect` picks its transport from the config map at runtime, so the
     // capability it needs is not fixed: a `:url` server is network I/O
-    // (`NETWORK`), a `:command` server spawns a process (`PROCESS`). Gate inside
-    // the handler rather than via a single fixed-capability wrapper.
-    {
-        let sandbox = sandbox.clone();
-        register_fn(env, "mcp/connect", move |args| {
-            let config_json = config_to_json(args)?;
-            if config_json.get("url").and_then(|v| v.as_str()).is_some() {
-                gate(&sandbox, Caps::NETWORK)?;
-                connect_http(&config_json)
-            } else {
-                gate(&sandbox, Caps::PROCESS)?;
-                connect_stdio(&config_json)
-            }
-        });
-    }
+    // (`NETWORK`), a `:command` server spawns a process (`PROCESS`). Gating and
+    // dispatch live in `connect_with_opts`, shared with `connect_from_config`;
+    // this just supplies the interactive, unrestricted options `mcp/connect`
+    // has always used and unwraps the outcome back to the original `SemaError`.
+    register_fn(env, "mcp/connect", |args| {
+        let config_json = config_to_json(args)?;
+        let opts = ConnectOpts {
+            interactive_auth: true,
+            allowed_tools: None,
+        };
+        connect_with_opts(&config_json, &opts).map_err(connect_outcome_to_sema_error)
+    });
 
     register_fn(env, "mcp/tools", |args| {
         check_arity!(args, "mcp/tools", 1);
@@ -564,6 +820,7 @@ pub fn register_mcp_builtins(env: &Env, sandbox: &Sandbox) {
             .map_err(|err| SemaError::eval(format!("mcp/tools: {err}")))?;
         let items = tools
             .into_iter()
+            .filter(|tool| tool_is_allowed(&connection.allowed_tools, &tool.name))
             .map(|tool| {
                 let mut entry = BTreeMap::new();
                 entry.insert(Value::keyword("name"), Value::string(&tool.name));
@@ -591,6 +848,11 @@ pub fn register_mcp_builtins(env: &Env, sandbox: &Sandbox) {
 
         let mut items = Vec::new();
         for tool in tools {
+            if !tool_is_allowed(&connection.allowed_tools, &tool.name) {
+                // Not in the connection's :tools manifest — an agent given
+                // this connection's tools must never even see it.
+                continue;
+            }
             let (parameters, ordered) = schema_to_params(&tool.input_schema);
             let tool_name = tool.name.clone();
             let connection_handle = handle.to_string();
@@ -657,4 +919,42 @@ pub fn register_mcp_builtins(env: &Env, sandbox: &Sandbox) {
             .map_err(|err| SemaError::eval(format!("mcp/close: {err}")))?;
         Ok(Value::nil())
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::oauth::loopback::RedirectDriver;
+
+    #[test]
+    fn no_interactive_driver_never_dials_and_fails_cleanly() {
+        let driver = NoInteractiveDriver;
+        // Well-formed enough for `login()` to build an authorize URL / DCR
+        // request with it, even though it is never actually dialed.
+        assert!(driver.redirect_uri().starts_with("http://127.0.0.1"));
+        let err = driver
+            .drive("https://example.com/authorize", "some-state")
+            .expect_err("a non-interactive driver must refuse to drive a login");
+        assert_eq!(
+            err,
+            "interactive authentication is disabled for this connection"
+        );
+    }
+
+    #[test]
+    fn tool_is_allowed_none_is_unrestricted() {
+        assert!(tool_is_allowed(&None, "anything"));
+    }
+
+    #[test]
+    fn tool_is_allowed_some_restricts_to_the_list() {
+        let allowed = Some(vec!["create_task".to_string(), "search_tasks".to_string()]);
+        assert!(tool_is_allowed(&allowed, "create_task"));
+        assert!(!tool_is_allowed(&allowed, "delete_everything"));
+    }
+
+    #[test]
+    fn tool_is_allowed_empty_list_allows_nothing() {
+        assert!(!tool_is_allowed(&Some(Vec::new()), "anything"));
+    }
 }

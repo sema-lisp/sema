@@ -1,4 +1,5 @@
 import { test, expect, Page } from '@playwright/test';
+import { toggleBreakpoint, getCurrentDebugLine, getBreakpointLines } from './gutter';
 
 async function waitForReady(page: Page) {
   await page.goto('/');
@@ -9,35 +10,9 @@ async function setEditorCode(page: Page, code: string) {
   await page.getByTestId('editor').fill(code);
 }
 
-/** Click a gutter line number to toggle a breakpoint.
- *  `.gutter-line` is rendered inside <sema-editor> (from @sema-lang/ui, not this
- *  repo) with no exposed role/testid for individual line numbers — CSS nth-child
- *  is the only way to target a specific line. */
-async function toggleBreakpoint(page: Page, lineNum: number) {
-  await page.locator(`.gutter-line:nth-child(${lineNum})`).click();
-}
-
 /** Get the current debug state from the status bar. */
 async function getStatus(page: Page): Promise<string> {
   return await page.getByTestId('status').textContent() ?? '';
-}
-
-/** Get the current line the debugger highlights.
- *  `.gutter-line` internals come from <sema-editor> (@sema-lang/ui) — see
- *  toggleBreakpoint for why CSS stays the fallback locator here. */
-async function getCurrentDebugLine(page: Page): Promise<number | null> {
-  const locator = page.locator('.gutter-line.current-line');
-  if ((await locator.count()) === 0) return null;
-  const text = await locator.textContent();
-  return text ? parseInt(text, 10) : null;
-}
-
-/** Get all breakpoint line numbers.
- *  `.gutter-line` internals come from <sema-editor> (@sema-lang/ui) — see
- *  toggleBreakpoint for why CSS stays the fallback locator here. */
-async function getBreakpointLines(page: Page): Promise<number[]> {
-  const texts = await page.locator('.gutter-line.breakpoint').allTextContents();
-  return texts.map(t => parseInt(t, 10));
 }
 
 /** Get all output lines (text content). */
@@ -397,25 +372,22 @@ test.describe('Debugger', () => {
     expect(status).toBe('Ready');
   });
 
-  test('infinite loop yields and stop button works', async ({ page }) => {
-    // An infinite loop — the VM should yield and let us click Stop
+  test('infinite loop in the debugger self-terminates via the step limit', async ({ page }) => {
+    // An infinite loop — the VM's step-limit guard terminates it and returns
+    // to idle (too fast for a user to reach Stop, which idle then hides).
     await setEditorCode(page, '(define (loop) (loop))\n(loop)');
-    
+
     await page.getByTestId('debug-btn').click();
     await waitForPaused(page);
-    
+
     // Continue — this enters the infinite loop
     await page.getByTestId('dbg-continue').click();
-    
-    // Wait a moment for the yield loop to start
-    await page.waitForTimeout(500);
-    
-    // Click stop — should work because VM yields to event loop
-    await page.getByTestId('dbg-stop').click();
-    await waitForIdle(page, 3000);
-    
+
+    await waitForIdle(page, 15000);
+
     const status = await getStatus(page);
     expect(status).toBe('Ready');
+    await expect(page.getByTestId('output')).toContainText(/step limit/);
   });
 
   test('stack trace shows frames', async ({ page }) => {

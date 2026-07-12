@@ -102,19 +102,15 @@ fn spawn(args: &[Value]) -> Result<Value, SemaError> {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
-    // Optional opts map: {:cwd "path" :env {"KEY" "val" ...}}
-    if let Some(opts) = args.get(1) {
-        if let Some(m) = opts.as_map_ref() {
-            if let Some(cwd) = m.get(&Value::keyword("cwd")).and_then(|v| v.as_str()) {
-                cmd.current_dir(cwd);
-            }
-            if let Some(em) = m.get(&Value::keyword("env")).and_then(|v| v.as_map_ref()) {
-                for (k, val) in em.iter() {
-                    if let (Some(k), Some(val)) = (k.as_str(), val.as_str()) {
-                        cmd.env(k, val);
-                    }
-                }
-            }
+    // Optional opts map: {:cwd "path" :env {"KEY" "val" ...}}. Shared extraction
+    // with `shell` so both APIs interpret the map identically.
+    if let Some(m) = args.get(1).and_then(|v| v.as_map_ref()) {
+        let (cwd, env_vars) = crate::system::command_opts(m);
+        if let Some(dir) = &cwd {
+            cmd.current_dir(dir);
+        }
+        for (k, val) in &env_vars {
+            cmd.env(k, val);
         }
     }
 

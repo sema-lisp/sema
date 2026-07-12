@@ -36,6 +36,23 @@ pub enum UpvalueState {
     Open { frame_base: usize, slot: usize },
     /// Owns the value after the defining frame has exited.
     Closed(Value),
+    /// Detached from a foreign VM's stack — the cell owns its `value`, so it is
+    /// safe to read/write on ANY VM stack (C1: it no longer indexes the owning
+    /// VM's stack) — yet the defining frame is STILL LIVE and still tracks this
+    /// slot in its `open_upvalues`. A closure that escapes onto a foreign stack
+    /// (an `async/spawn` task VM, a fresh fallback VM, an inline-task HOF)
+    /// transitions its still-`Open` cells here instead of fully `Closed`ing them,
+    /// so the defining frame's later `StoreLocal`/`StoreUpvalue` writes continue
+    /// to flow into `value` (see the STORE_LOCAL / STORE_UPVALUE dispatch arms).
+    /// This preserves capture-by-cell semantics across the spawn boundary. The
+    /// frame promotes it to a real `Closed` (with the final `value`) when it
+    /// exits (`close_open_upvalues`). `frame_base`/`slot` are retained for
+    /// symmetry with `Open` and to identify the tracking frame slot.
+    Tracked {
+        frame_base: usize,
+        slot: usize,
+        value: Value,
+    },
 }
 
 /// A mutable cell for captured variables (upvalues).
@@ -89,6 +106,65 @@ pub struct Closure {
 struct VmClosurePayload {
     closure: Rc<Closure>,
     functions: Rc<Vec<Rc<Function>>>,
+}
+
+/// A decoded global binding held in an inline-cache slot. `LoadGlobal` slots
+/// store the plain value; `CallGlobal` slots pre-decode the callee once at
+/// fill time so every subsequent hit dispatches with no `Value` clone and no
+/// payload downcast. Each variant keeps the bound `Value` reachable so a slot
+/// satisfies either opcode (foreign function tables can alias cache indices;
+/// the spur+version guard, not the variant, is the correctness gate).
+#[derive(Clone)]
+enum CachedGlobal {
+    /// The bound value as-is: `LoadGlobal` slots, and `CallGlobal` slots whose
+    /// callee is not a native fn (keywords, callables routed via `call_callback`).
+    Plain(Value),
+    /// A VM closure: the `NativeFn`'s `VmClosurePayload` pre-extracted. A hit
+    /// re-checks `functions` against the VM's current table by pointer,
+    /// exactly as the uncached decode does (the table swaps per frame).
+    VmClosure {
+        value: Value,
+        closure: Rc<Closure>,
+        functions: Rc<Vec<Rc<Function>>>,
+    },
+    /// A native fn with no VM-closure payload: called without re-extracting
+    /// the `Rc` from the `Value`.
+    Native { value: Value, func: Rc<NativeFn> },
+}
+
+impl CachedGlobal {
+    /// Decode a callee for a `CallGlobal` slot.
+    fn decode(val: Value) -> CachedGlobal {
+        if val.raw_tag() == Some(TAG_NATIVE_FN) {
+            let payload = {
+                let native = val.as_native_fn_ref().unwrap();
+                native
+                    .payload
+                    .as_ref()
+                    .and_then(|p| p.downcast_ref::<VmClosurePayload>())
+                    .map(|vmc| (vmc.closure.clone(), vmc.functions.clone()))
+            };
+            if let Some((closure, functions)) = payload {
+                return CachedGlobal::VmClosure {
+                    value: val,
+                    closure,
+                    functions,
+                };
+            }
+            let func = val.as_native_fn_rc().unwrap();
+            return CachedGlobal::Native { value: val, func };
+        }
+        CachedGlobal::Plain(val)
+    }
+
+    /// The bound value, regardless of how it was decoded.
+    fn value(&self) -> &Value {
+        match self {
+            CachedGlobal::Plain(v)
+            | CachedGlobal::VmClosure { value: v, .. }
+            | CachedGlobal::Native { value: v, .. } => v,
+        }
+    }
 }
 
 // ── Cycle-collector wiring (CORE-2, plan §3/§5.2) ────────────────────────
@@ -239,8 +315,13 @@ fn trace_upvalue_cell(ptr: sema_core::NodePtr, sink: &mut dyn FnMut(sema_core::G
     let cell = unsafe { &*(ptr.raw() as *const UpvalueCell) };
     match cell.state.try_borrow() {
         Ok(state) => {
-            if let UpvalueState::Closed(v) = &*state {
-                sink(sema_core::GcEdge::Value(v));
+            // `Closed` and `Tracked` both OWN a `Value` reachable only through
+            // the cell — trace it so the collector keeps it alive. `Open` owns
+            // nothing (its slot lives on a VM stack, an external strong count).
+            match &*state {
+                UpvalueState::Closed(v) => sink(sema_core::GcEdge::Value(v)),
+                UpvalueState::Tracked { value, .. } => sink(sema_core::GcEdge::Value(value)),
+                UpvalueState::Open { .. } => {}
             }
             true
         }
@@ -248,14 +329,20 @@ fn trace_upvalue_cell(ptr: sema_core::NodePtr, sink: &mut dyn FnMut(sema_core::G
     }
 }
 
-/// Sever a white upvalue cell: `Closed(v)` → `Closed(NIL)`, returning `v` so
-/// the collector defers its drop until all severing has completed.
+/// Sever a white upvalue cell: a value-owning state (`Closed(v)`/`Tracked{value:v}`)
+/// → `Closed(NIL)`, returning `v` so the collector defers its drop until all
+/// severing has completed. `Open` owns nothing, so it yields `None`.
 fn sever_upvalue_cell(ptr: sema_core::NodePtr) -> Option<Value> {
     // SAFETY: live `Rc<UpvalueCell>` data pointer — see trace_vm_closure_payload.
     let cell = unsafe { &*(ptr.raw() as *const UpvalueCell) };
     match cell.state.try_borrow_mut() {
         Ok(mut state) => match std::mem::replace(&mut *state, UpvalueState::Closed(Value::NIL)) {
             UpvalueState::Closed(v) => Some(v),
+            // A `Tracked` cell owns its value like `Closed`; hand it to the
+            // collector for deferred drop. (Defensive: a tracked cell is kept
+            // black by its live frame's `open_upvalues`, so it should never be
+            // reached as white/severable.)
+            UpvalueState::Tracked { value, .. } => Some(value),
             UpvalueState::Open { .. } => None,
         },
         Err(_) => {
@@ -326,9 +413,10 @@ pub struct VM {
     frames: Vec<CallFrame>,
     globals: Rc<Env>,
     functions: Rc<Vec<Rc<Function>>>,
-    /// Per-instruction inline cache for global lookups: (spur_bits, env_version, value).
+    /// Per-instruction inline cache for global lookups:
+    /// (spur_bits, env_version, decoded binding).
     /// spur_bits distinguishes globals sharing the same slot (cross-VM closures).
-    inline_cache: Vec<(u32, u64, Value)>,
+    inline_cache: Vec<(u32, u64, CachedGlobal)>,
     /// Resolved native function table: native_id → (NativeFn Rc, name).
     /// Populated at VM creation from the compiler's native_table + global env.
     native_fns: Vec<Rc<NativeFn>>,
@@ -709,19 +797,27 @@ pub fn with_active_debug<R>(f: impl FnOnce(&mut crate::debug::DebugState) -> R) 
     Some(f(debug))
 }
 
-/// Close `closure`'s still-open upvalue cells against the VM(s) currently
-/// running a native call on this thread, snapshotting their values from the
-/// owning VM's live stack.
+/// Detach `closure`'s still-open upvalue cells from the stack of the VM(s)
+/// currently running a native call on this thread, giving each cell an owned
+/// value read from that owning VM's live stack.
 ///
 /// MUST be called before a VM closure is dispatched onto a *foreign* stack — a
 /// fresh fallback VM, or an async task VM created by `spawn` /
 /// `run_closure_as_inline_task`. An Open cell holds `{ frame_base, slot }`
 /// indices into the VM that created it; reading it on a different VM's stack is
-/// out-of-bounds. Snapshotting here (while the owning VM is paused at its native
-/// call) detaches the cells safely.
+/// out-of-bounds. Detaching here (while the owning VM is paused at its native
+/// call) makes the cells safe to read on the foreign stack (C1).
 ///
-/// A no-op for cells that are already Closed or whose owning frame is no longer
-/// on any registered VM's stack.
+/// A detached cell becomes `Tracked` — NOT fully `Closed` — while its defining
+/// frame is still live, and its `open_upvalues` entry is deliberately KEPT: the
+/// frame's later `StoreLocal`/`StoreUpvalue` writes propagate into the tracked
+/// value (so a task observes post-spawn mutations of a captured local, issue
+/// #104), and the frame promotes it to a real `Closed` when it exits
+/// (`close_open_upvalues`). This preserves capture-by-cell semantics across the
+/// spawn boundary without ever letting a cell dangle onto a foreign stack.
+///
+/// A no-op for cells that are already Closed/Tracked or whose owning frame is no
+/// longer on any registered VM's stack.
 pub fn close_closure_upvalues_for_foreign_run(closure: &Closure) {
     // Snapshot the registered VM pointers, then operate through them. The
     // pointers are valid for the duration of this call (see CURRENT_VM docs).
@@ -731,26 +827,31 @@ pub fn close_closure_upvalues_for_foreign_run(closure: &Closure) {
             let state = cell.state.borrow();
             match &*state {
                 UpvalueState::Open { frame_base, slot } => (*frame_base, *slot),
-                UpvalueState::Closed(_) => continue,
+                // Already detached (owns its value, safe on any stack).
+                UpvalueState::Closed(_) | UpvalueState::Tracked { .. } => continue,
             }
         };
         // Find the registered VM that owns this cell (its frame is on that
         // VM's stack). Walk most-recent first.
         for &ptr in ptrs.iter().rev() {
             // SAFETY: pointer registered by a live CurrentVmGuard on the Rust
-            // stack; the owning VM is paused and not otherwise borrowed.
-            let vm = unsafe { &mut *ptr };
+            // stack; the owning VM is paused and not otherwise borrowed. We only
+            // read its stack here (no frame mutation), so a shared ref suffices.
+            let vm = unsafe { &*ptr };
             if frame_base + slot < vm.stack.len() && vm.frames.iter().any(|f| f.base == frame_base)
             {
                 let value = vm.stack[frame_base + slot].clone();
-                *cell.state.borrow_mut() = UpvalueState::Closed(value);
-                if let Some(frame) = vm.frames.iter_mut().find(|f| f.base == frame_base) {
-                    if let Some(open) = frame.open_upvalues.as_mut() {
-                        if let Some(entry) = open.get_mut(slot) {
-                            *entry = None;
-                        }
-                    }
-                }
+                // Tracked, not Closed: keep the cell bound to the still-live
+                // defining frame so post-spawn `StoreLocal`/`StoreUpvalue`
+                // writes keep flowing into it (issue #104). The frame's
+                // `open_upvalues[slot]` entry is intentionally left in place
+                // (do NOT clear it) so those stores can find the cell and the
+                // frame closes it for real on exit.
+                *cell.state.borrow_mut() = UpvalueState::Tracked {
+                    frame_base,
+                    slot,
+                    value,
+                };
                 break;
             }
         }
@@ -787,12 +888,23 @@ fn check_literal_map_keys(items: &[Value]) -> Result<(), SemaError> {
 }
 
 /// Close all open upvalues in the given open_upvalues vec, reading from the stack.
+///
+/// `Open` cells are closed with the current stack value. A `Tracked` cell
+/// (detached-but-live: its defining frame — this one — is exiting) is finalized
+/// with its OWN `value`, which already reflects the latest parent `StoreLocal`
+/// and task `StoreUpvalue` writes (its stack slot only saw the parent writes),
+/// so the tracked value is the authoritative final value.
 fn close_open_upvalues(open: &mut [Option<Rc<UpvalueCell>>], stack: &[Value], base: usize) {
     for (slot, maybe_cell) in open.iter_mut().enumerate() {
         if let Some(cell) = maybe_cell {
             let mut state = cell.state.borrow_mut();
-            if matches!(&*state, UpvalueState::Open { .. }) {
-                *state = UpvalueState::Closed(stack[base + slot].clone());
+            let closed = match &mut *state {
+                UpvalueState::Open { .. } => Some(stack[base + slot].clone()),
+                UpvalueState::Tracked { value, .. } => Some(std::mem::replace(value, Value::nil())),
+                UpvalueState::Closed(_) => None,
+            };
+            if let Some(v) = closed {
+                *state = UpvalueState::Closed(v);
             }
         }
         *maybe_cell = None;
@@ -810,8 +922,17 @@ fn close_open_upvalues_above(
         if slot >= min_slot {
             if let Some(cell) = maybe_cell {
                 let mut state = cell.state.borrow_mut();
-                if matches!(&*state, UpvalueState::Open { .. }) {
-                    *state = UpvalueState::Closed(stack[base + slot].clone());
+                // Mirror `close_open_upvalues`: `Open` closes from the stack, a
+                // detached-but-live `Tracked` finalizes with its own value.
+                let closed = match &mut *state {
+                    UpvalueState::Open { .. } => Some(stack[base + slot].clone()),
+                    UpvalueState::Tracked { value, .. } => {
+                        Some(std::mem::replace(value, Value::nil()))
+                    }
+                    UpvalueState::Closed(_) => None,
+                };
+                if let Some(v) = closed {
+                    *state = UpvalueState::Closed(v);
                 }
             }
             *maybe_cell = None;
@@ -843,7 +964,7 @@ impl VM {
             frames: Vec::with_capacity(64),
             globals,
             functions: Rc::new(functions),
-            inline_cache: vec![(u32::MAX, 0, Value::nil()); total_cache_slots],
+            inline_cache: vec![(u32::MAX, 0, CachedGlobal::Plain(Value::nil())); total_cache_slots],
             native_fns,
             debug_values: HashMap::new(),
             next_debug_value_ref: DEBUG_VALUE_REF_BASE,
@@ -881,7 +1002,7 @@ impl VM {
         let needed = func.cache_offset + func.chunk.n_global_cache_slots as usize;
         if needed > self.inline_cache.len() {
             self.inline_cache
-                .resize(needed, (u32::MAX, 0, Value::nil()));
+                .resize(needed, (u32::MAX, 0, CachedGlobal::Plain(Value::nil())));
         }
     }
 
@@ -896,7 +1017,7 @@ impl VM {
             frames: Vec::with_capacity(64),
             globals,
             functions,
-            inline_cache: vec![(u32::MAX, 0, Value::nil()); total_cache_slots],
+            inline_cache: vec![(u32::MAX, 0, CachedGlobal::Plain(Value::nil())); total_cache_slots],
             native_fns: Vec::new(),
             debug_values: HashMap::new(),
             next_debug_value_ref: DEBUG_VALUE_REF_BASE,
@@ -922,7 +1043,7 @@ impl VM {
             frames: Vec::with_capacity(64),
             globals,
             functions,
-            inline_cache: vec![(u32::MAX, 0, Value::nil()); total_cache_slots],
+            inline_cache: vec![(u32::MAX, 0, CachedGlobal::Plain(Value::nil())); total_cache_slots],
             native_fns,
             debug_values: HashMap::new(),
             next_debug_value_ref: DEBUG_VALUE_REF_BASE,
@@ -1670,11 +1791,15 @@ impl VM {
             ctx.check_loop_interrupt()?;
             let fi = self.frames.len() - 1;
             let frame = &self.frames[fi];
-            let code = frame.closure.func.chunk.code.as_ptr();
-            let consts: *const [Value] = frame.closure.func.chunk.consts.as_slice();
-            let base = frame.base;
+            // `mut` because the frame-preserving native-call fast paths
+            // (CallNative / CallGlobal's Native arm) re-derive these from the
+            // frame after the call instead of keeping them live across it —
+            // that keeps the dispatch loop's register pressure flat.
+            let mut code = frame.closure.func.chunk.code.as_ptr();
+            let mut consts: *const [Value] = frame.closure.func.chunk.consts.as_slice();
+            let mut base = frame.base;
             let mut pc = frame.pc;
-            let code_len = frame.closure.func.chunk.code.len();
+            let mut code_len = frame.closure.func.chunk.code.len();
             // Point `self.globals` and `self.functions` at the running closure's
             // home env / function table (a `None` closure — the top-level main
             // closure — uses the VM's base snapshots). The hot global opcodes
@@ -1721,6 +1846,14 @@ impl VM {
             let _ = frame; // release borrow so we can mutate self
 
             loop {
+                // Provably dead for well-formed bytecode (the compiler
+                // terminates every chunk with `Return` and patches jumps
+                // in-chunk; `validate_bytecode` proves the same pc-bounds
+                // invariants for loaded `.semac`) and measurably free: a
+                // never-taken branch predicts perfectly, so an unchecked
+                // fetch benches no faster (tak/nqueens, M2 Max). Kept as a
+                // real check — it turns a VM bug into a clean error instead
+                // of an out-of-bounds read.
                 if pc >= code_len {
                     return Err(SemaError::eval(format!(
                         "VM: program counter out of bounds (pc={pc}, len={code_len})"
@@ -1974,6 +2107,7 @@ impl VM {
                     op::STORE_LOCAL => {
                         let slot = read_u16!(code, pc) as usize;
                         let val = unsafe { pop_unchecked(&mut self.stack) };
+                        self.propagate_local_store_to_tracked(fi, slot, &val);
                         self.stack[base + slot] = val;
                     }
 
@@ -1984,6 +2118,9 @@ impl VM {
                             let state = self.frames[fi].closure.upvalues[idx].state.borrow();
                             match &*state {
                                 UpvalueState::Closed(v) => Ok(v.clone()),
+                                // Detached-but-live: read the owned value — safe
+                                // on any VM stack (it no longer indexes a stack).
+                                UpvalueState::Tracked { value, .. } => Ok(value.clone()),
                                 UpvalueState::Open { frame_base, slot } => Err(*frame_base + *slot),
                             }
                         };
@@ -2016,6 +2153,12 @@ impl VM {
                                     *v = val;
                                     None
                                 }
+                                // Detached-but-live: write the owned value in
+                                // place — no stack slot to touch on this VM.
+                                UpvalueState::Tracked { value, .. } => {
+                                    *value = val;
+                                    None
+                                }
                                 UpvalueState::Open { frame_base, slot } => {
                                     Some((*frame_base + *slot, val))
                                 }
@@ -2043,12 +2186,13 @@ impl VM {
                         let version = self.globals.version.get();
                         let entry = &self.inline_cache[cache_idx];
                         if entry.0 == bits && entry.1 == version {
-                            self.stack.push(entry.2.clone());
+                            self.stack.push(entry.2.value().clone());
                         } else {
                             let spur = bits_to_spur(bits);
                             match self.globals.get(spur) {
                                 Some(val) => {
-                                    self.inline_cache[cache_idx] = (bits, version, val.clone());
+                                    self.inline_cache[cache_idx] =
+                                        (bits, version, CachedGlobal::Plain(val.clone()));
                                     self.stack.push(val);
                                 }
                                 None => {
@@ -2276,7 +2420,26 @@ impl VM {
                                 handle_err!(self, fi, pc, err, saved_pc, 'dispatch);
                             }
                         }
-                        continue 'dispatch;
+                        // The native completed on this frame (a re-entrant
+                        // callback ran nested — run_nested_closure floors at
+                        // this frame and restores globals/functions), so stay
+                        // in the inner loop instead of re-entering 'dispatch.
+                        // The length check guards the invariant; DEBUG
+                        // re-enters so stepping/breakpoint semantics are
+                        // unchanged.
+                        if DEBUG || self.frames.len() != fi + 1 {
+                            continue 'dispatch;
+                        }
+                        // Re-derive the frame-cached locals from the unchanged
+                        // frame rather than keeping them live across the native
+                        // call (frames[fi].pc was synced to the post-operand pc
+                        // above).
+                        let frame = &self.frames[fi];
+                        code = frame.closure.func.chunk.code.as_ptr();
+                        consts = frame.closure.func.chunk.consts.as_slice();
+                        base = frame.base;
+                        pc = frame.pc;
+                        code_len = frame.closure.func.chunk.code.len();
                     }
 
                     // --- Data constructors ---
@@ -2621,45 +2784,35 @@ impl VM {
                         self.frames[fi].pc = pc;
                         let saved_pc = pc - op::SIZE_CALL_GLOBAL;
 
-                        // Look up the global (with inline cache)
+                        // Look up the global; a miss decodes the callee into
+                        // the inline cache so every hit dispatches from the
+                        // pre-decoded entry (no Value clone, no downcast).
                         let cache_idx = self.frames[fi].cache_base + cache_slot;
                         let version = self.globals.version.get();
                         let entry = &self.inline_cache[cache_idx];
-                        let func_val = if entry.0 == bits && entry.1 == version {
-                            entry.2.clone()
-                        } else {
+                        if entry.0 != bits || entry.1 != version {
                             let spur = bits_to_spur(bits);
                             match self.globals.get(spur) {
                                 Some(val) => {
-                                    self.inline_cache[cache_idx] = (bits, version, val.clone());
-                                    val
+                                    self.inline_cache[cache_idx] =
+                                        (bits, version, CachedGlobal::decode(val));
                                 }
                                 None => {
                                     let err = unbound_global_error(spur, &self.globals);
                                     handle_err!(self, fi, pc, err, saved_pc, 'dispatch);
                                 }
                             }
-                        };
+                        }
 
-                        // Fast path: VM closure — use direct call without function slot
-                        if func_val.raw_tag() == Some(TAG_NATIVE_FN) {
-                            let vm_closure_data = {
-                                let native = func_val.as_native_fn_ref().unwrap();
-                                native.payload.as_ref().and_then(|p| {
-                                    p.downcast_ref::<VmClosurePayload>().map(|vmc| {
-                                        let closure = vmc.closure.clone();
-                                        let functions =
-                                            if Rc::ptr_eq(&vmc.functions, &self.functions) {
-                                                None
-                                            } else {
-                                                Some(vmc.functions.clone())
-                                            };
-                                        (closure, functions)
-                                    })
-                                })
-                            };
-                            if let Some((closure, functions)) = vm_closure_data {
-                                if let Some(f) = functions {
+                        match &self.inline_cache[cache_idx].2 {
+                            // Fast path: VM closure — direct call without a
+                            // function slot on the stack.
+                            CachedGlobal::VmClosure {
+                                closure, functions, ..
+                            } => {
+                                let closure = closure.clone();
+                                if !Rc::ptr_eq(functions, &self.functions) {
+                                    let f = functions.clone();
                                     self.functions = f;
                                 }
                                 if let Err(err) = self.call_vm_closure_direct(closure, argc) {
@@ -2670,44 +2823,96 @@ impl VM {
                                 }
                                 continue 'dispatch;
                             }
-                        }
-
-                        // Slow path: non-VM callable — use call_value_with
-                        if let Err(err) = self.call_value_with(func_val, argc, ctx) {
-                            drop(sema_core::take_yield_signal());
-                            match self.handle_exception(err, saved_pc)? {
-                                ExceptionAction::Handled => {}
-                                ExceptionAction::Propagate(e) => return Err(e),
+                            CachedGlobal::Native { func, .. } => {
+                                let func = func.clone();
+                                match self.call_native_with(&func, argc, ctx) {
+                                    Ok(()) => {
+                                        if let Some(reason) = sema_core::take_yield_signal() {
+                                            // The call already pushed a result value.
+                                            // Replace it with a nil placeholder; on
+                                            // resume the scheduler substitutes the
+                                            // actual resume value.
+                                            if let Some(top) = self.stack.last_mut() {
+                                                *top = Value::nil();
+                                            }
+                                            self.frames[fi].pc = pc; // PC already past CALL_GLOBAL
+                                            return Ok(crate::debug::VmExecResult::AsyncYield(
+                                                reason,
+                                            ));
+                                        }
+                                        // The native completed on this frame (a
+                                        // re-entrant callback ran nested —
+                                        // run_nested_closure floors at this frame
+                                        // and restores globals/functions), so stay
+                                        // in the inner loop instead of re-entering
+                                        // 'dispatch. The length check guards the
+                                        // invariant; DEBUG re-enters so stepping
+                                        // and breakpoint semantics are unchanged.
+                                        if DEBUG || self.frames.len() != fi + 1 {
+                                            continue 'dispatch;
+                                        }
+                                        // Re-derive the frame-cached locals from
+                                        // the unchanged frame rather than keeping
+                                        // them live across the native call
+                                        // (frames[fi].pc was synced to the
+                                        // post-operand pc above).
+                                        let frame = &self.frames[fi];
+                                        code = frame.closure.func.chunk.code.as_ptr();
+                                        consts = frame.closure.func.chunk.consts.as_slice();
+                                        base = frame.base;
+                                        pc = frame.pc;
+                                        code_len = frame.closure.func.chunk.code.len();
+                                    }
+                                    Err(err) => {
+                                        drop(sema_core::take_yield_signal());
+                                        handle_err!(self, fi, pc, err, saved_pc, 'dispatch);
+                                    }
+                                }
+                            }
+                            // Slow path: non-native callable — use call_value_with
+                            CachedGlobal::Plain(value) => {
+                                let func_val = value.clone();
+                                if let Err(err) = self.call_value_with(func_val, argc, ctx) {
+                                    drop(sema_core::take_yield_signal());
+                                    match self.handle_exception(err, saved_pc)? {
+                                        ExceptionAction::Handled => {}
+                                        ExceptionAction::Propagate(e) => return Err(e),
+                                    }
+                                }
+                                // Check if the native signaled async yield
+                                if let Some(reason) = sema_core::take_yield_signal() {
+                                    // The call already pushed a result value. Replace it
+                                    // with nil placeholder. On resume, the scheduler replaces
+                                    // this with the actual resume value.
+                                    if let Some(top) = self.stack.last_mut() {
+                                        *top = Value::nil();
+                                    }
+                                    self.frames[fi].pc = pc; // PC already past CALL_GLOBAL
+                                    return Ok(crate::debug::VmExecResult::AsyncYield(reason));
+                                }
+                                continue 'dispatch;
                             }
                         }
-                        // Check if a native function (called via call_value_with) signaled async yield
-                        if let Some(reason) = sema_core::take_yield_signal() {
-                            // call_value_with already pushed a result value. Replace it
-                            // with nil placeholder. On resume, the scheduler replaces
-                            // this with the actual resume value.
-                            if let Some(top) = self.stack.last_mut() {
-                                *top = Value::nil();
-                            }
-                            self.frames[fi].pc = pc; // PC already past CALL_GLOBAL
-                            return Ok(crate::debug::VmExecResult::AsyncYield(reason));
-                        }
-                        continue 'dispatch;
                     }
 
                     op::STORE_LOCAL0 => {
                         let val = unsafe { pop_unchecked(&mut self.stack) };
+                        self.propagate_local_store_to_tracked(fi, 0, &val);
                         self.stack[base] = val;
                     }
                     op::STORE_LOCAL1 => {
                         let val = unsafe { pop_unchecked(&mut self.stack) };
+                        self.propagate_local_store_to_tracked(fi, 1, &val);
                         self.stack[base + 1] = val;
                     }
                     op::STORE_LOCAL2 => {
                         let val = unsafe { pop_unchecked(&mut self.stack) };
+                        self.propagate_local_store_to_tracked(fi, 2, &val);
                         self.stack[base + 2] = val;
                     }
                     op::STORE_LOCAL3 => {
                         let val = unsafe { pop_unchecked(&mut self.stack) };
+                        self.propagate_local_store_to_tracked(fi, 3, &val);
                         self.stack[base + 3] = val;
                     }
 
@@ -2804,9 +3009,17 @@ impl VM {
                             self.stack.push(Value::int(m.len() as i64));
                         } else if let Some(m) = val.as_hashmap_rc() {
                             self.stack.push(Value::int(m.len() as i64));
+                        } else if let Some(arr) = val.as_mutable_array() {
+                            self.stack.push(Value::int(arr.items.borrow().len() as i64));
+                        } else if let Some(bv) = val.as_bytevector() {
+                            self.stack.push(Value::int(bv.len() as i64));
+                        } else if let Some(arr) = val.as_f64_array() {
+                            self.stack.push(Value::int(arr.len() as i64));
+                        } else if let Some(arr) = val.as_i64_array() {
+                            self.stack.push(Value::int(arr.len() as i64));
                         } else {
                             let err = SemaError::type_error(
-                                "list, vector, string, map, or hashmap",
+                                "list, vector, string, map, hashmap, bytevector, typed array, or mutable-array",
                                 val.type_name(),
                             );
                             handle_err!(self, fi, pc, err, pc - op::SIZE_OP, 'dispatch);
@@ -3214,6 +3427,29 @@ impl VM {
         }
     }
 
+    /// Call a plain native fn (no VM-closure payload) whose `Rc` was
+    /// pre-decoded by the CALL_GLOBAL inline cache. Args are on top of the
+    /// stack; no function value is on the stack.
+    fn call_native_with(
+        &mut self,
+        func: &Rc<NativeFn>,
+        argc: usize,
+        ctx: &EvalContext,
+    ) -> Result<(), SemaError> {
+        // C1: keep upvalues open; move args off the stack so the native may
+        // re-enter this VM via run_nested_closure without an outstanding
+        // stack borrow. Closures crossing onto a foreign stack are
+        // snapshotted at the crossing point.
+        let args_start = self.stack.len() - argc;
+        let call_args: SmallVec<[Value; 8]> = self.stack.drain(args_start..).collect();
+        let result = {
+            let _vm_guard = CurrentVmGuard::enter(self);
+            (func.func)(ctx, &call_args)
+        };
+        result.map(|val| self.stack.push(val))?;
+        Ok(())
+    }
+
     /// Push a new CallFrame for a VM closure called via CALL_GLOBAL.
     /// No function value is on the stack — only args. `base = stack.len() - argc`.
     /// Args are already in place; we just extend the stack for remaining locals.
@@ -3484,6 +3720,27 @@ impl VM {
         } else {
             for i in 0..arity {
                 stack[dst + i] = stack[src + i].clone();
+            }
+        }
+    }
+
+    /// Mirror a captured local's write into a detached-but-live `Tracked`
+    /// upvalue cell (issue #104). When a closure escaped this frame onto a
+    /// foreign stack (an `async/spawn` task, a fresh fallback VM, an inline-task
+    /// HOF), `close_closure_upvalues_for_foreign_run` detached the shared cell
+    /// to `Tracked` but left it registered in this frame's `open_upvalues`; the
+    /// cell no longer reads this stack slot, so a plain stack write would be
+    /// invisible to the task. Propagate the write into the cell's owned value so
+    /// the task observes post-spawn mutations. Cheap no-op for the common cases:
+    /// non-capturing frames (`open_upvalues == None`), uncaptured slots, and
+    /// ordinary `Open`/`Closed` cells.
+    #[inline]
+    fn propagate_local_store_to_tracked(&self, fi: usize, slot: usize, val: &Value) {
+        if let Some(open) = &self.frames[fi].open_upvalues {
+            if let Some(Some(cell)) = open.get(slot) {
+                if let UpvalueState::Tracked { value, .. } = &mut *cell.state.borrow_mut() {
+                    *value = val.clone();
+                }
             }
         }
     }
@@ -3926,6 +4183,7 @@ impl VM {
             .map(|(i, uv)| {
                 let val = match &*uv.state.borrow() {
                     UpvalueState::Closed(v) => v.clone(),
+                    UpvalueState::Tracked { value, .. } => value.clone(),
                     UpvalueState::Open { frame_base, slot } => {
                         self.stack[*frame_base + *slot].clone()
                     }
@@ -4195,6 +4453,7 @@ impl VM {
     fn debug_upvalue_value(&self, upvalue: &UpvalueCell) -> Value {
         match &*upvalue.state.borrow() {
             UpvalueState::Closed(value) => value.clone(),
+            UpvalueState::Tracked { value, .. } => value.clone(),
             UpvalueState::Open { frame_base, slot } => self
                 .stack
                 .get(*frame_base + *slot)
@@ -4282,6 +4541,12 @@ impl VM {
             match &mut *state {
                 UpvalueState::Closed(slot_value) => {
                     *slot_value = value.clone();
+                }
+                UpvalueState::Tracked {
+                    value: tracked_value,
+                    ..
+                } => {
+                    *tracked_value = value.clone();
                 }
                 UpvalueState::Open { frame_base, slot } => {
                     let Some(slot_value) = self.stack.get_mut(*frame_base + *slot) else {
@@ -5883,6 +6148,9 @@ mod tests {
     fn test_vm_oob_jump_returns_error() {
         // Issue #1: A jump that goes past the end of bytecode should return
         // an error, not cause undefined behavior from unsafe pointer reads.
+        // (A crafted .semac with such a jump never reaches the VM — see
+        // `semac_oob_jump_rejected_at_load` in
+        // tests/bytecode_validator_regression.rs.)
         use crate::emit::Emitter;
         use crate::opcodes::Op;
 

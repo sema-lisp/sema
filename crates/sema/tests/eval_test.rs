@@ -342,6 +342,16 @@ eval_tests! {
     string_wrap_words: r#"(string/word-wrap "the quick brown fox" 10)"# => common::eval(r#"'("the quick" "brown fox")"#),
     string_wrap_hard_break: r#"(string/word-wrap "abcdefghij k" 5)"# => common::eval(r#"'("abcde" "fghij" "k")"#),
     string_wrap_keeps_newlines: r#"(string/word-wrap "a\nb" 10)"# => common::eval(r#"'("a" "b")"#),
+    // string/truncate-width — clamp to display columns, grapheme-safe, optional ellipsis.
+    string_truncate_width_unchanged: r#"(string/truncate-width "hello" 10)"# => Value::string("hello"),
+    string_truncate_width_exact: r#"(string/truncate-width "hello" 5)"# => Value::string("hello"),
+    string_truncate_width_plain: r#"(string/truncate-width "hello world" 5)"# => Value::string("hello"),
+    string_truncate_width_cjk: r#"(string/truncate-width "日本語です" 6)"# => Value::string("日本語"),
+    string_truncate_width_emoji_boundary: r#"(string/truncate-width "a👋b" 2)"# => Value::string("a"),
+    string_truncate_width_ellipsis: r#"(string/truncate-width "hello world" 6 "…")"# => Value::string("hello…"),
+    string_truncate_width_ellipsis_unchanged: r#"(string/truncate-width "hi" 6 "…")"# => Value::string("hi"),
+    string_truncate_width_ellipsis_too_wide: r#"(string/truncate-width "hello world" 1 "…")"# => Value::string("…"),
+    string_truncate_width_zero: r#"(string/truncate-width "hello" 0)"# => Value::string(""),
     // Terminal setup/teardown guard macros return the body value and re-raise
     // after restoring (teardown always runs — the emitted escapes go to stdout).
     guard_alt_screen_returns_body: "(term/with-alt-screen 1 2 3)" => Value::int(3),
@@ -1357,6 +1367,32 @@ eval_tests! {
 }
 
 // ============================================================
+// map-indexed and enumerate (#90)
+// ============================================================
+
+eval_tests! {
+    map_indexed_basic: "(map-indexed (fn (i x) (list i x)) '(10 20 30))"
+        => common::eval("'((0 10) (1 20) (2 30))"),
+    map_indexed_empty: "(map-indexed (fn (i x) (list i x)) '())" => Value::list(vec![]),
+    map_indexed_vector_input: "(map-indexed (fn (i x) (+ i x)) (vector 10 20 30))"
+        => Value::list(vec![Value::int(10), Value::int(21), Value::int(32)]),
+    map_indexed_index_only: "(map-indexed (fn (i x) i) '(a b c))"
+        => Value::list(vec![Value::int(0), Value::int(1), Value::int(2)]),
+
+    enumerate_basic: "(enumerate '(10 20 30))" => common::eval("'((0 10) (1 20) (2 30))"),
+    enumerate_empty: "(enumerate '())" => Value::list(vec![]),
+    enumerate_vector_input: "(enumerate (vector 'a 'b))" => common::eval("'((0 a) (1 b))"),
+    enumerate_then_map_destructure: "(map (fn (pair) (car pair)) (enumerate '(x y z)))"
+        => Value::list(vec![Value::int(0), Value::int(1), Value::int(2)]),
+}
+
+eval_error_tests! {
+    map_indexed_wrong_arity: "(map-indexed (fn (i x) x))" => "arity",
+    map_indexed_non_sequence_errors: "(map-indexed (fn (i x) x) 5)" => "list, vector, or mutable-array",
+    enumerate_non_sequence_errors: "(enumerate 5)" => "list, vector, or mutable-array",
+}
+
+// ============================================================
 // Input validation — negative counts/indices (C7, C8, C9)
 // ============================================================
 
@@ -1897,6 +1933,7 @@ eval_error_tests! {
     // STD-4
     string_pad_left_negative: r#"(string/pad-left "x" -1)"# => "non-negative",
     string_pad_right_negative: r#"(string/pad-right "x" -1)"# => "non-negative",
+    string_truncate_width_negative: r#"(string/truncate-width "x" -1)"# => "non-negative",
     // STD-5
     list_chunk_negative: "(list/chunk -1 (list 1 2 3))" => "non-negative",
     list_split_at_negative: "(list/split-at (list 1 2 3) -1)" => "non-negative",
@@ -2242,11 +2279,33 @@ eval_tests! {
         (outer 1))" => Value::int(1),
 }
 
+// Prelude macro names are ordinary identifiers in binding positions: lexical
+// bindings and same-unit top-level defines shadow macros, and binding
+// positions themselves (define-sugar heads, params, let names) never expand.
+eval_tests! {
+    define_sugar_head_shadows_prelude_macro: "(define (step n) n) (step 3)" => Value::int(3),
+    top_level_define_shadows_macro_call_site: "(define step (fn (n) n)) (step 7)" => Value::int(7),
+    define_of_phase_shadows_locally: "(define (phase n) n) (phase 5)" => Value::int(5),
+    lambda_param_shadows_macro: "((fn (step) (step 4)) (fn (n) (* n 2)))" => Value::int(8),
+    let_binding_shadows_macro: "(let ((step (fn (n) (+ n 1)))) (step 4))" => Value::int(5),
+    let_star_binding_shadows_macro: "(let* ((step (fn (n) n)) (r (step 9))) r)" => Value::int(9),
+    internal_define_shadows_macro: "(define (outer) (define (step n) n) (step 3)) (outer)" => Value::int(3),
+    internal_define_in_lambda_shadows: "(define (outer a) (fn () (define (step n) (let ((v 1)) v)) (step 3))) ((outer 1))" => Value::int(1),
+    catch_var_named_after_macro_binds: "(try (throw 42) (catch step (:value step)))" => Value::int(42),
+    match_pattern_var_shadows_macro: "(match (list (fn (n) n) 2) ([step x] (step x)))" => Value::int(2),
+}
+
 eval_error_tests! {
-    // `step` is the prelude workflow macro; its expansion (a `let` template)
-    // lands in the define head, so define sugar sees no symbol.
-    prelude_macro_name_in_define_sugar_head_errors:
-        "(define (step n) n)" => "define: expected a symbol",
+    // Defining `phase` must NOT clobber `workflow/phase` (the macro expands to
+    // a workflow/phase call; pre-fix the define-sugar head expanded and
+    // silently redefined it). The original native still type-errors on an int.
+    define_of_phase_does_not_clobber_workflow:
+        "(define (phase n) n) (workflow/phase 3)" => "expected string",
+    // Shadowing is lexical: outside the (fn (step) ...) scope the `checkpoint`
+    // macro still expands (its runtime then rejects it outside a workflow —
+    // which is the proof the macro path ran, not an unbound/shadowed call).
+    shadow_is_lexical_not_global:
+        "(begin ((fn (step) (step 1)) (fn (n) n)) (checkpoint \"cp\"))" => "checkpoint outside a workflow",
 }
 
 // ============================================================
@@ -2795,6 +2854,18 @@ eval_tests! {
     mutable_array_get_redefined: "(define (mutable-array/get a i) :mine) (mutable-array/get (mutable-array/new 1 5) 0)" => Value::keyword("mine"),
     // A let-bound shadow resolves locally (never the intrinsic).
     mutable_array_get_local_shadow: "(let ((mutable-array/get (fn (a i) :local))) (mutable-array/get 1 2))" => Value::keyword("local"),
+    // --- Sequence HOF / length interop (#91): the shared `get_sequence`
+    // coercion accepts a mutable-array by snapshotting it up front, so
+    // map/filter/for-each and generic `length` treat it like a list/vector.
+    mutable_array_map_interop: "(let ((a (mutable-array/new))) (mutable-array/push! a 5) (mutable-array/push! a 6) (map (lambda (x) (* x 2)) a))" => common::eval("'(10 12)"),
+    mutable_array_filter_interop: "(let ((a (mutable-array/new))) (mutable-array/push! a 1) (mutable-array/push! a 2) (mutable-array/push! a 3) (filter odd? a))" => common::eval("'(1 3)"),
+    // for-each returns nil; observe its effect by accumulating into a cell.
+    mutable_array_for_each_interop: "(let ((a (mutable-array/new)) (sum (mutable-cell/new 0))) (mutable-array/push! a 3) (mutable-array/push! a 4) (for-each (lambda (x) (mutable-cell/set! sum (+ (mutable-cell/get sum) x))) a) (mutable-cell/get sum))" => Value::int(7),
+    mutable_array_length_interop: "(let ((a (mutable-array/new))) (mutable-array/push! a 5) (mutable-array/push! a 6) (length a))" => Value::int(2),
+    // Reentrancy: the snapshot is taken before the loop, so a callback that
+    // grows the same array does not panic ("already borrowed") and iteration
+    // still ranges over the original two elements.
+    mutable_array_map_reentrant_snapshot: "(let ((a (mutable-array/new))) (mutable-array/push! a 1) (mutable-array/push! a 2) (map (lambda (x) (mutable-array/push! a 99) x) a))" => common::eval("'(1 2)"),
     mutable_cell_round_trip: "(let ((c (mutable-cell/new 1))) (mutable-cell/set! c 99) (mutable-cell/get c))" => Value::int(99),
     mutable_cell_shared_mutation: "(let* ((c (mutable-cell/new 0)) (d c)) (mutable-cell/set! c 5) (mutable-cell/get d))" => Value::int(5),
     mutable_cell_equal_by_contents: "(equal? (mutable-cell/new 1) (mutable-cell/new 1))" => Value::bool(true),
@@ -2991,4 +3062,15 @@ eval_error_tests! {
     // The top-level report of a re-thrown native error is the original
     // message, not a stringified condition map.
     rethrown_error_prints_original_message: "(try (+ 1 undefined-var) (catch e (throw e)))" => "Unbound variable: undefined-var",
+}
+
+// shell/quote — POSIX single-quote quoting so a value survives `sh -c` as one
+// literal word. Wraps in single quotes; each embedded `'` becomes `'\''`; the
+// empty string becomes `''`.
+eval_tests! {
+    shell_quote_space: r#"(shell/quote "a b")"# => Value::string("'a b'"),
+    shell_quote_plain: r#"(shell/quote "abc")"# => Value::string("'abc'"),
+    shell_quote_empty: r#"(shell/quote "")"# => Value::string("''"),
+    shell_quote_single_quote: r#"(shell/quote "a'b")"# => Value::string(r#"'a'\''b'"#),
+    shell_quote_metachars: r#"(shell/quote "$x; rm -rf /")"# => Value::string("'$x; rm -rf /'"),
 }

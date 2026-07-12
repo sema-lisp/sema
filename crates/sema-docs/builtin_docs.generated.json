@@ -3491,6 +3491,18 @@
       "body": "Drop the leading elements of `seq` for which `pred` is truthy, returning the rest unchanged. Same as `list/drop-while`.\n\n```sema\n(drop-while (fn (x) (< x 4)) '(1 2 3 4 1))   ; => (4 1)\n```"
     },
     {
+      "name": "enumerate",
+      "module": "lists",
+      "section": "Higher-Order Functions",
+      "summary": "Pair each element of `seq` with its 0-based index, returning a list of `(index element)` lists. Accepts a list or vector; the input is never mutated and the result is always a list.",
+      "returns": "list",
+      "examples": [
+        "(enumerate '(10 20 30))   ; => ((0 10) (1 20) (2 30))\n(enumerate (vector 'a 'b)) ; => ((0 a) (1 b))"
+      ],
+      "body": "Pair each element of `seq` with its 0-based index, returning a list of `(index element)` lists. Accepts a list or vector; the input is never mutated and the result is always a list.\n\n```sema\n(enumerate '(10 20 30))   ; => ((0 10) (1 20) (2 30))\n(enumerate (vector 'a 'b)) ; => ((0 a) (1 b))\n```\n\n`(enumerate xs)` is equivalent to `(map-indexed list xs)`. See also: `map-indexed` (transform with the index instead of just pairing).",
+      "syntax": "(enumerate seq)"
+    },
+    {
       "name": "every",
       "module": "lists",
       "section": "Searching",
@@ -4175,6 +4187,18 @@
       ],
       "body": "Apply a function to each element of a list, collecting the results into a new list. The input is never mutated.\n\nGiven several lists, `map` walks them in lockstep, calling the function with one element from each. Iteration stops at the **shortest** list, so mismatched lengths are truncated rather than erroring.\n\n```sema\n(map (fn (x) (* x x)) '(1 2 3))   ; => (1 4 9)\n(map + '(1 2 3) '(10 20 30))      ; => (11 22 33)\n(map + '(1 2 3) '(10 20))         ; => (11 22)   ; stops at shortest\n```\n\nSee also: `mapcar` (alias), `for-each` (run side effects, discard results), `filter`/`list/reject` (keep/drop by predicate).",
       "syntax": "(map f lst ...)"
+    },
+    {
+      "name": "map-indexed",
+      "module": "lists",
+      "section": "Higher-Order Functions",
+      "summary": "Apply `f` to each element of `seq` along with its 0-based index, collecting the results into a new list. `f` is called as `(f index element)`. Accepts a list or vector; the input is never mutated and the result is always a list.",
+      "returns": "list",
+      "examples": [
+        "(map-indexed (fn (i x) (list i x)) '(10 20 30))   ; => ((0 10) (1 20) (2 30))\n(map-indexed (fn (i x) (+ i x)) (vector 10 20 30)) ; => (10 21 32)"
+      ],
+      "body": "Apply `f` to each element of `seq` along with its 0-based index, collecting the results into a new list. `f` is called as `(f index element)`. Accepts a list or vector; the input is never mutated and the result is always a list.\n\n```sema\n(map-indexed (fn (i x) (list i x)) '(10 20 30))   ; => ((0 10) (1 20) (2 30))\n(map-indexed (fn (i x) (+ i x)) (vector 10 20 30)) ; => (10 21 32)\n```\n\nSee also: `map` (no index), `enumerate` (pairs elements with their index without transforming them).",
+      "syntax": "(map-indexed f seq)"
     },
     {
       "name": "mapcar",
@@ -11635,6 +11659,18 @@
       "body": "Remove trailing whitespace only. See `string/trim-left` for the leading side and `string/trim` for both.\n\n```sema\n(string/trim-right \"hi  \")     ; => \"hi\"\n(string/trim-right \"  hi  \")   ; => \"  hi\"   ; leading space kept\n```"
     },
     {
+      "name": "string/truncate-width",
+      "module": "strings",
+      "section": "Core String Operations",
+      "summary": "Clamp a string to a target **display width**, in columns — the truncation counterpart to `string/width`. Splits on grapheme-cluster boundaries, so wide characters (CJK, most emoji) are never cut in half. A string already at or under the width is returned unchanged; like `string/pad-left`/`string/pad-right` only pad, this only shrinks.",
+      "returns": "string",
+      "examples": [
+        "(string/truncate-width \"hello world\" 5)        ; => \"hello\"\n(string/truncate-width \"hi\" 10)                ; => \"hi\"            ; already fits, unchanged\n(string/truncate-width \"日本語です\" 6)          ; => \"日本語\"        ; grapheme-safe (wide chars = 2 cols)\n(string/truncate-width \"hello world\" 6 \"…\")    ; => \"hello…\"\n(string/truncate-width \"hi\" 6 \"…\")             ; => \"hi\"            ; fits, ellipsis unused"
+      ],
+      "body": "Clamp a string to a target **display width**, in columns — the truncation counterpart to `string/width`. Splits on grapheme-cluster boundaries, so wide characters (CJK, most emoji) are never cut in half. A string already at or under the width is returned unchanged; like `string/pad-left`/`string/pad-right` only pad, this only shrinks.\n\nWith an optional `ellipsis` string, an over-width input is truncated to leave room for it, and the ellipsis is appended — the result never exceeds `width` columns. If `ellipsis` itself is wider than `width`, it's truncated in the content's place.\n\n```sema\n(string/truncate-width \"hello world\" 5)        ; => \"hello\"\n(string/truncate-width \"hi\" 10)                ; => \"hi\"            ; already fits, unchanged\n(string/truncate-width \"日本語です\" 6)          ; => \"日本語\"        ; grapheme-safe (wide chars = 2 cols)\n(string/truncate-width \"hello world\" 6 \"…\")    ; => \"hello…\"\n(string/truncate-width \"hi\" 6 \"…\")             ; => \"hi\"            ; fits, ellipsis unused\n```",
+      "syntax": "(string/truncate-width s width [ellipsis])"
+    },
+    {
       "name": "string/unwrap",
       "module": "strings",
       "section": "Prefix & Suffix",
@@ -11897,10 +11933,22 @@
       "summary": "Run a shell command. Returns a map with `:stdout`, `:stderr`, and `:exit-code`.",
       "returns": "map",
       "examples": [
-        "(shell \"echo hello\")\n; => {:exit-code 0 :stderr \"\" :stdout \"hello\\n\"}\n\n(:stdout (shell \"echo hello\"))   ; => \"hello\\n\""
+        "(shell \"echo hello\")\n; => {:exit-code 0 :stderr \"\" :stdout \"hello\\n\"}\n\n(:stdout (shell \"echo hello\"))          ; => \"hello\\n\"\n\n(:stdout (shell \"pwd\" {:cwd \"/tmp\"}))   ; => \"/tmp\\n\"\n(:stdout (shell \"echo $FOO\" {:env {\"FOO\" \"bar\"}}))  ; => \"bar\\n\""
       ],
-      "body": "Run a shell command. Returns a map with `:stdout`, `:stderr`, and `:exit-code`.\n\n```sema\n(shell \"echo hello\")\n; => {:exit-code 0 :stderr \"\" :stdout \"hello\\n\"}\n\n(:stdout (shell \"echo hello\"))   ; => \"hello\\n\"\n```",
-      "syntax": "(shell cmd arg ...)"
+      "body": "Run a shell command. Returns a map with `:stdout`, `:stderr`, and `:exit-code`.\n\nA single string runs through the system shell (`sh -c` on Unix, `cmd /C` on Windows); extra positional\nstrings run the program directly (no shell). An optional trailing options map\n`{:cwd \"path\" :env {\"KEY\" \"val\"}}` pins the working directory and injects\nenvironment variables (same shape as `proc/spawn`).\n\n```sema\n(shell \"echo hello\")\n; => {:exit-code 0 :stderr \"\" :stdout \"hello\\n\"}\n\n(:stdout (shell \"echo hello\"))          ; => \"hello\\n\"\n\n(:stdout (shell \"pwd\" {:cwd \"/tmp\"}))   ; => \"/tmp\\n\"\n(:stdout (shell \"echo $FOO\" {:env {\"FOO\" \"bar\"}}))  ; => \"bar\\n\"\n```\n\nUse `shell/quote` to safely interpolate an untrusted value into a single-string\ncommand.",
+      "syntax": "(shell cmd arg ... opts?)"
+    },
+    {
+      "name": "shell/quote",
+      "module": "system",
+      "section": "Shell & Process Control",
+      "summary": "POSIX single-quote a string so it survives a POSIX shell (e.g. `sh -c`) as one literal word — no metacharacter is special inside single quotes, so this defuses command injection. Wraps the value in single quotes and rewrites each embedded `'` as `\\'\\''`; the empty string becomes `''`. Note: the single-string form of `shell` uses `sh -c` on Unix but `cmd /C` on Windows.",
+      "returns": "string",
+      "examples": [
+        "(shell/quote \"a b\")            ; => \"'a b'\"\n(shell/quote \"a'b\")            ; => \"'a'\\\\''b'\"\n(shell/quote \"\")               ; => \"''\"\n\n(shell (str \"echo \" (shell/quote \"hi; rm -rf /\")))\n; => {:exit-code 0 :stdout \"hi; rm -rf /\\n\" ...}  ; the payload is echoed, not run"
+      ],
+      "body": "POSIX single-quote a string so it survives a POSIX shell (e.g. `sh -c`) as one literal word —\nno metacharacter is special inside single quotes, so this defuses command injection. Wraps the\nvalue in single quotes and rewrites each embedded `'` as `\\'\\''`; the empty string becomes `''`.\nNote: the single-string form of `shell` uses `sh -c` on Unix but `cmd /C` on Windows.\n\n```sema\n(shell/quote \"a b\")            ; => \"'a b'\"\n(shell/quote \"a'b\")            ; => \"'a'\\\\''b'\"\n(shell/quote \"\")               ; => \"''\"\n\n(shell (str \"echo \" (shell/quote \"hi; rm -rf /\")))\n; => {:exit-code 0 :stdout \"hi; rm -rf /\\n\" ...}  ; the payload is echoed, not run\n```",
+      "syntax": "(shell/quote s)"
     },
     {
       "name": "spy",

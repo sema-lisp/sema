@@ -175,10 +175,10 @@ impl Interpreter {
     /// rooted at `globals`. Shared by every eval entry point (M6: single
     /// evaluator). `define`s land in `globals`.
     fn run_exprs_on_vm(&self, exprs: &[Value], globals: &Rc<Env>) -> EvalResult {
-        let mut expanded = Vec::with_capacity(exprs.len());
-        for expr in exprs {
-            expanded.push(expand_for_vm_in(&self.ctx, globals, expr)?);
-        }
+        // Batch expansion: a top-level define in ANY form shadows a same-named
+        // macro in EVERY form of this program (all forms expand before any
+        // executes, so the env can't provide that shadowing naturally).
+        let expanded = expand_for_vm_batch(&self.ctx, globals, exprs)?;
         let known_natives = collect_native_names(globals);
         let span_map = self.ctx.span_table.borrow().clone();
         let prog = sema_vm::compile_program_with_spans_and_natives(
@@ -242,6 +242,143 @@ impl Interpreter {
     pub fn expand_for_vm(&self, expr: &Value) -> EvalResult {
         expand_for_vm_in(&self.ctx, &self.global_env, expr)
     }
+
+    /// Expand a multi-form program with cross-form define shadowing — use this
+    /// (not per-form `expand_for_vm`) whenever all forms expand before any runs.
+    pub fn expand_for_vm_batch(&self, exprs: &[Value]) -> Result<Vec<Value>, SemaError> {
+        expand_for_vm_batch(&self.ctx, &self.global_env, exprs)
+    }
+}
+
+/// Lexical names that shadow macros during expansion (a linked stack of
+/// frames, innermost first). Macro expansion is name-based and runs before
+/// scope resolution; without this, a user binding named after a prelude macro
+/// (`step`, `phase`, ...) is rewritten as a macro call — in a define-sugar
+/// head that is a hard compile error, and for `phase`-shaped macros it
+/// silently clobbers the runtime binding the template calls.
+struct Shadow<'a> {
+    names: HashSet<Spur>,
+    parent: Option<&'a Shadow<'a>>,
+}
+
+impl<'a> Shadow<'a> {
+    fn child(&'a self, names: HashSet<Spur>) -> Shadow<'a> {
+        Shadow {
+            names,
+            parent: Some(self),
+        }
+    }
+
+    fn contains(&self, s: Spur) -> bool {
+        self.names.contains(&s) || self.parent.is_some_and(|p| p.contains(s))
+    }
+}
+
+/// Collect every symbol in a binding pattern (a param list, a let binding
+/// name, a match/destructure pattern). Deliberately conservative: any symbol
+/// anywhere in the pattern counts as bound. Over-collecting only suppresses
+/// macro expansion where a same-named binding plausibly exists — the safe
+/// direction.
+fn collect_pattern_symbols(pattern: &Value, out: &mut HashSet<Spur>) {
+    if let Some(s) = pattern.as_symbol_spur() {
+        out.insert(s);
+        return;
+    }
+    if let Some(items) = pattern.as_list() {
+        for item in items {
+            collect_pattern_symbols(item, out);
+        }
+        return;
+    }
+    match pattern.view() {
+        ValueView::Vector(items) => {
+            for item in items.iter() {
+                collect_pattern_symbols(item, out);
+            }
+        }
+        ValueView::Map(map) => {
+            for (k, v) in map.iter() {
+                collect_pattern_symbols(k, out);
+                collect_pattern_symbols(v, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Names a form defines at its sequence level (top level or a body), for
+/// letrec*-style shadowing: `define` (sugar + plain), `define-values`,
+/// `defmulti`, `deftool`, `defagent`, and `define-record-type` (constructor,
+/// predicate, and accessors included). Recurses into `begin`/`progn`.
+fn collect_defined_names(expr: &Value, out: &mut HashSet<Spur>) {
+    let Some(items) = expr.as_list() else { return };
+    let Some(head) = items.first().and_then(|v| v.as_symbol_spur()) else {
+        return;
+    };
+    match resolve(head).as_str() {
+        "begin" | "progn" => {
+            for item in &items[1..] {
+                collect_defined_names(item, out);
+            }
+        }
+        "define" | "defmulti" | "deftool" | "defagent" => {
+            if let Some(target) = items.get(1) {
+                if let Some(s) = target.as_symbol_spur() {
+                    out.insert(s);
+                } else if let Some(sugar) = target.as_list() {
+                    // Sugar head: (define (name . params) ...) defines `name`.
+                    if let Some(s) = sugar.first().and_then(|v| v.as_symbol_spur()) {
+                        out.insert(s);
+                    }
+                }
+            }
+        }
+        "define-values" => {
+            if let Some(formals) = items.get(1) {
+                collect_pattern_symbols(formals, out);
+            }
+        }
+        "define-record-type" => {
+            // (define-record-type Name (ctor field...) pred (field accessor [setter])...)
+            for part in &items[1..] {
+                collect_pattern_symbols(part, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Expand the forms of a body sequence: names defined anywhere in the body
+/// shadow macros throughout it (letrec* semantics, matching the resolver).
+fn expand_body(
+    ctx: &EvalContext,
+    env: &Env,
+    body: &[Value],
+    shadow: &Shadow,
+) -> Result<Vec<Value>, SemaError> {
+    let mut defined = HashSet::new();
+    for form in body {
+        collect_defined_names(form, &mut defined);
+    }
+    let inner = shadow.child(defined);
+    body.iter()
+        .map(|form| expand_macros_in(ctx, env, form, &inner))
+        .collect()
+}
+
+/// Rebuild a list form only if any element changed, preserving Rc pointer
+/// identity otherwise (span lookups are keyed by pointer).
+fn rebuilt_list(original: &Value, items: &[Value], expanded: Vec<Value>) -> Value {
+    let changed = expanded
+        .iter()
+        .zip(items.iter())
+        .any(|(a, b)| a.raw_bits() != b.raw_bits())
+        || expanded.len() != items.len();
+    if changed {
+        Value::list(expanded)
+    } else {
+        original.clone()
+    }
 }
 
 /// Pre-process a top-level expression for VM compilation, expanding macro calls
@@ -250,7 +387,44 @@ impl Interpreter {
 /// for a `load`ed module body it is the same shared global env, so a `defmacro`
 /// registers where `expand_macros_in` looks it up and inherited macros still
 /// resolve via the parent chain.
+///
+/// A form's own `define`s shadow same-named macros inside it. For a multi-form
+/// program use [`expand_for_vm_batch`], which lets a top-level
+/// `(define step ...)` shadow the macro in sibling forms too.
 pub fn expand_for_vm_in(ctx: &EvalContext, env: &Env, expr: &Value) -> EvalResult {
+    let mut defined = HashSet::new();
+    collect_defined_names(expr, &mut defined);
+    let shadow = Shadow {
+        names: defined,
+        parent: None,
+    };
+    expand_top_form(ctx, env, expr, &shadow)
+}
+
+/// Expand a whole multi-form program: names defined by ANY top-level form
+/// shadow same-named macros in EVERY form (mirroring the compiler's
+/// redefined-globals rule for intrinsics), so `(define (step n) n) (step 3)`
+/// calls the user's function rather than expanding the prelude macro.
+pub fn expand_for_vm_batch(
+    ctx: &EvalContext,
+    env: &Env,
+    exprs: &[Value],
+) -> Result<Vec<Value>, SemaError> {
+    let mut defined = HashSet::new();
+    for expr in exprs {
+        collect_defined_names(expr, &mut defined);
+    }
+    let shadow = Shadow {
+        names: defined,
+        parent: None,
+    };
+    exprs
+        .iter()
+        .map(|expr| expand_top_form(ctx, env, expr, &shadow))
+        .collect()
+}
+
+fn expand_top_form(ctx: &EvalContext, env: &Env, expr: &Value, shadow: &Shadow) -> EvalResult {
     if let Some(items) = expr.as_list() {
         if let Some(s) = items.first().and_then(|v| v.as_symbol_spur()) {
             let name = resolve(s);
@@ -270,7 +444,7 @@ pub fn expand_for_vm_in(ctx: &EvalContext, env: &Env, expr: &Value) -> EvalResul
                 let mut new_items = vec![Value::symbol_from_spur(s)];
                 let mut changed = false;
                 for item in &items[1..] {
-                    let expanded = expand_for_vm_in(ctx, env, item)?;
+                    let expanded = expand_top_form(ctx, env, item, shadow)?;
                     if expanded.raw_bits() != item.raw_bits() {
                         changed = true;
                     }
@@ -283,13 +457,16 @@ pub fn expand_for_vm_in(ctx: &EvalContext, env: &Env, expr: &Value) -> EvalResul
             }
         }
     }
-    expand_macros_in(ctx, env, expr)
+    expand_macros_in(ctx, env, expr, shadow)
 }
 
 /// Recursively expand macro calls, resolving macros via `env` (walking the
-/// parent chain). Preserves Rc pointer identity when no expansion occurs so span
-/// lookups (keyed by Rc pointer) remain valid.
-fn expand_macros_in(ctx: &EvalContext, env: &Env, expr: &Value) -> EvalResult {
+/// parent chain). Scope-aware: binding positions (define-sugar heads, params,
+/// let names, match patterns) never expand, and a head symbol that a lexical
+/// binding shadows is treated as an ordinary call. Preserves Rc pointer
+/// identity when no expansion occurs so span lookups (keyed by Rc pointer)
+/// remain valid.
+fn expand_macros_in(ctx: &EvalContext, env: &Env, expr: &Value, shadow: &Shadow) -> EvalResult {
     if let Some(items) = expr.as_list() {
         if !items.is_empty() {
             if let Some(s) = items.first().and_then(|v| v.as_symbol_spur()) {
@@ -297,31 +474,47 @@ fn expand_macros_in(ctx: &EvalContext, env: &Env, expr: &Value) -> EvalResult {
                 if name == "quote" {
                     return Ok(expr.clone());
                 }
-                if let Some(mac_val) = env.get(s) {
-                    if let Some(mac) = mac_val.as_macro_rc() {
-                        if mac.syntax_rules.is_some() {
-                            // R7RS syntax-rules: pattern-match + template expand.
-                            let expanded = crate::syntax_rules::expand(&mac, &items[1..], env)?;
-                            return expand_macros_in(ctx, env, &expanded);
+                // Binding forms expand structurally so their bound names
+                // shadow macros in exactly the scopes the resolver gives them.
+                match name.as_str() {
+                    "define" => return expand_define_form(ctx, env, expr, items, shadow),
+                    "fn" | "lambda" => return expand_lambda_form(ctx, env, expr, items, shadow),
+                    "let" | "let*" | "letrec" | "let-values" | "let*-values" => {
+                        return expand_let_form(ctx, env, expr, items, shadow, &name)
+                    }
+                    "do" => return expand_do_form(ctx, env, expr, items, shadow),
+                    "try" => return expand_try_form(ctx, env, expr, items, shadow),
+                    "match" | "match*" => return expand_match_form(ctx, env, expr, items, shadow),
+                    "define-values" => {
+                        // Formals are a binding position; only the value expands.
+                        let mut expanded: Vec<Value> = items[..items.len().min(2)].to_vec();
+                        for item in items.iter().skip(2) {
+                            expanded.push(expand_macros_in(ctx, env, item, shadow)?);
                         }
-                        // VM-native expansion: apply the transformer on the VM.
-                        let expanded = apply_macro_vm(ctx, &mac, &items[1..], env)?;
-                        return expand_macros_in(ctx, env, &expanded);
+                        return Ok(rebuilt_list(expr, items, expanded));
+                    }
+                    _ => {}
+                }
+                if !shadow.contains(s) {
+                    if let Some(mac_val) = env.get(s) {
+                        if let Some(mac) = mac_val.as_macro_rc() {
+                            if mac.syntax_rules.is_some() {
+                                // R7RS syntax-rules: pattern-match + template expand.
+                                let expanded = crate::syntax_rules::expand(&mac, &items[1..], env)?;
+                                return expand_macros_in(ctx, env, &expanded, shadow);
+                            }
+                            // VM-native expansion: apply the transformer on the VM.
+                            let expanded = apply_macro_vm(ctx, &mac, &items[1..], env)?;
+                            return expand_macros_in(ctx, env, &expanded, shadow);
+                        }
                     }
                 }
             }
             let expanded: Vec<Value> = items
                 .iter()
-                .map(|v| expand_macros_in(ctx, env, v))
+                .map(|v| expand_macros_in(ctx, env, v, shadow))
                 .collect::<Result<_, _>>()?;
-            let changed = expanded
-                .iter()
-                .zip(items.iter())
-                .any(|(a, b)| a.raw_bits() != b.raw_bits());
-            if !changed {
-                return Ok(expr.clone());
-            }
-            return Ok(Value::list(expanded));
+            return Ok(rebuilt_list(expr, items, expanded));
         }
     }
 
@@ -329,7 +522,7 @@ fn expand_macros_in(ctx: &EvalContext, env: &Env, expr: &Value) -> EvalResult {
         ValueView::Vector(items) => {
             let expanded: Vec<Value> = items
                 .iter()
-                .map(|v| expand_macros_in(ctx, env, v))
+                .map(|v| expand_macros_in(ctx, env, v, shadow))
                 .collect::<Result<_, _>>()?;
             let changed = expanded
                 .iter()
@@ -345,8 +538,8 @@ fn expand_macros_in(ctx: &EvalContext, env: &Env, expr: &Value) -> EvalResult {
             let mut changed = false;
             let mut expanded = BTreeMap::new();
             for (key, value) in map.iter() {
-                let expanded_key = expand_macros_in(ctx, env, key)?;
-                let expanded_value = expand_macros_in(ctx, env, value)?;
+                let expanded_key = expand_macros_in(ctx, env, key, shadow)?;
+                let expanded_value = expand_macros_in(ctx, env, value, shadow)?;
                 changed |= expanded_key.raw_bits() != key.raw_bits()
                     || expanded_value.raw_bits() != value.raw_bits();
                 expanded.insert(expanded_key, expanded_value);
@@ -361,7 +554,266 @@ fn expand_macros_in(ctx: &EvalContext, env: &Env, expr: &Value) -> EvalResult {
     }
 }
 
-/// Run deserialized bytecode (a `.semac` payload) on a fresh VM rooted at
+/// `(define name expr)` / `(define (name . params) body...)`: the head is a
+/// binding position (never expanded); the defined name and any params shadow
+/// macros in the value/body.
+fn expand_define_form(
+    ctx: &EvalContext,
+    env: &Env,
+    expr: &Value,
+    items: &[Value],
+    shadow: &Shadow,
+) -> EvalResult {
+    let Some(target) = items.get(1) else {
+        return Ok(expr.clone());
+    };
+    let mut bound = HashSet::new();
+    collect_pattern_symbols(target, &mut bound);
+    let inner = shadow.child(bound);
+    let mut expanded: Vec<Value> = items[..2.min(items.len())].to_vec();
+    expanded.extend(expand_body(ctx, env, &items[2..], &inner)?);
+    Ok(rebuilt_list(expr, items, expanded))
+}
+
+/// `(fn params body...)`: params are a binding position and shadow the body.
+fn expand_lambda_form(
+    ctx: &EvalContext,
+    env: &Env,
+    expr: &Value,
+    items: &[Value],
+    shadow: &Shadow,
+) -> EvalResult {
+    let Some(params) = items.get(1) else {
+        return Ok(expr.clone());
+    };
+    let mut bound = HashSet::new();
+    collect_pattern_symbols(params, &mut bound);
+    let inner = shadow.child(bound);
+    let mut expanded: Vec<Value> = items[..2.min(items.len())].to_vec();
+    expanded.extend(expand_body(ctx, env, &items[2..], &inner)?);
+    Ok(rebuilt_list(expr, items, expanded))
+}
+
+/// The `let` family, named `let` included. Init scoping follows the form:
+/// `let`/`let-values` inits see the outer scope, the starred forms see the
+/// bindings accumulated so far, `letrec` inits see everything.
+fn expand_let_form(
+    ctx: &EvalContext,
+    env: &Env,
+    expr: &Value,
+    items: &[Value],
+    shadow: &Shadow,
+    form: &str,
+) -> EvalResult {
+    // Named let: (let name ((v init)...) body...)
+    let named = form == "let" && items.get(1).is_some_and(|v| v.as_symbol_spur().is_some());
+    let bindings_idx = if named { 2 } else { 1 };
+    let Some(bindings_form) = items.get(bindings_idx) else {
+        return Ok(expr.clone());
+    };
+    let pairs: Vec<Value> = if let Some(l) = bindings_form.as_list() {
+        l.to_vec()
+    } else if let ValueView::Vector(v) = bindings_form.view() {
+        v.to_vec()
+    } else {
+        // Malformed; let the lowering report it. Expand generically.
+        let expanded: Vec<Value> = items
+            .iter()
+            .map(|v| expand_macros_in(ctx, env, v, shadow))
+            .collect::<Result<_, _>>()?;
+        return Ok(rebuilt_list(expr, items, expanded));
+    };
+
+    let mut bound = HashSet::new();
+    if named {
+        collect_pattern_symbols(&items[1], &mut bound);
+    }
+    if form == "letrec" {
+        for pair in &pairs {
+            if let Some(p) = pair.as_list().and_then(|p| p.first().cloned()) {
+                collect_pattern_symbols(&p, &mut bound);
+            }
+        }
+    }
+
+    let sequential = form == "let*" || form == "let*-values";
+    let mut new_pairs = Vec::with_capacity(pairs.len());
+    for pair in &pairs {
+        let Some(pair_items) = pair.as_list() else {
+            new_pairs.push(pair.clone());
+            continue;
+        };
+        let init_scope = shadow.child(bound.clone());
+        let mut new_pair: Vec<Value> = Vec::with_capacity(pair_items.len());
+        for (i, part) in pair_items.iter().enumerate() {
+            if i == 0 {
+                // The binding pattern itself never expands.
+                new_pair.push(part.clone());
+            } else {
+                new_pair.push(expand_macros_in(ctx, env, part, &init_scope)?);
+            }
+        }
+        if sequential || form == "letrec" {
+            if let Some(p) = pair_items.first() {
+                collect_pattern_symbols(p, &mut bound);
+            }
+            new_pairs.push(rebuilt_list(pair, pair_items, new_pair));
+        } else {
+            new_pairs.push(rebuilt_list(pair, pair_items, new_pair));
+        }
+    }
+    if !sequential && form != "letrec" {
+        // Plain let / let-values: all names bind only in the body.
+        for pair in &pairs {
+            if let Some(p) = pair.as_list().and_then(|p| p.first().cloned()) {
+                collect_pattern_symbols(&p, &mut bound);
+            }
+        }
+    }
+
+    let body_scope = shadow.child(bound);
+    let mut expanded: Vec<Value> = items[..bindings_idx].to_vec();
+    expanded.push(Value::list(new_pairs));
+    expanded.extend(expand_body(
+        ctx,
+        env,
+        &items[bindings_idx + 1..],
+        &body_scope,
+    )?);
+    Ok(rebuilt_list(expr, items, expanded))
+}
+
+/// Scheme `do`: `(do ((var init step)...) (test result...) body...)` — vars
+/// bind in steps, the test/result, and the body; inits see the outer scope.
+fn expand_do_form(
+    ctx: &EvalContext,
+    env: &Env,
+    expr: &Value,
+    items: &[Value],
+    shadow: &Shadow,
+) -> EvalResult {
+    let Some(specs) = items.get(1).and_then(|v| v.as_list().map(|l| l.to_vec())) else {
+        let expanded: Vec<Value> = items
+            .iter()
+            .map(|v| expand_macros_in(ctx, env, v, shadow))
+            .collect::<Result<_, _>>()?;
+        return Ok(rebuilt_list(expr, items, expanded));
+    };
+    let mut bound = HashSet::new();
+    for spec in &specs {
+        if let Some(p) = spec.as_list().and_then(|p| p.first().cloned()) {
+            collect_pattern_symbols(&p, &mut bound);
+        }
+    }
+    let inner = shadow.child(bound);
+    let mut new_specs = Vec::with_capacity(specs.len());
+    for spec in &specs {
+        let Some(spec_items) = spec.as_list() else {
+            new_specs.push(spec.clone());
+            continue;
+        };
+        let mut new_spec = Vec::with_capacity(spec_items.len());
+        for (i, part) in spec_items.iter().enumerate() {
+            match i {
+                0 => new_spec.push(part.clone()),
+                1 => new_spec.push(expand_macros_in(ctx, env, part, shadow)?),
+                _ => new_spec.push(expand_macros_in(ctx, env, part, &inner)?),
+            }
+        }
+        new_specs.push(rebuilt_list(spec, spec_items, new_spec));
+    }
+    let mut expanded: Vec<Value> = vec![items[0].clone(), Value::list(new_specs)];
+    for item in items.iter().skip(2) {
+        expanded.push(expand_macros_in(ctx, env, item, &inner)?);
+    }
+    Ok(rebuilt_list(expr, items, expanded))
+}
+
+/// `try`: catch clauses bind their error variable over the handler body.
+fn expand_try_form(
+    ctx: &EvalContext,
+    env: &Env,
+    expr: &Value,
+    items: &[Value],
+    shadow: &Shadow,
+) -> EvalResult {
+    let mut expanded: Vec<Value> = vec![items[0].clone()];
+    for item in items.iter().skip(1) {
+        let is_catch = item
+            .as_list()
+            .and_then(|l| l.first().and_then(|h| h.as_symbol_spur()))
+            .is_some_and(|h| resolve(h) == "catch");
+        if is_catch {
+            let clause = item.as_list().unwrap();
+            let mut bound = HashSet::new();
+            if let Some(var) = clause.get(1) {
+                collect_pattern_symbols(var, &mut bound);
+            }
+            let inner = shadow.child(bound);
+            let mut new_clause: Vec<Value> = clause[..2.min(clause.len())].to_vec();
+            for part in clause.iter().skip(2) {
+                new_clause.push(expand_macros_in(ctx, env, part, &inner)?);
+            }
+            expanded.push(rebuilt_list(item, clause, new_clause));
+        } else {
+            expanded.push(expand_macros_in(ctx, env, item, shadow)?);
+        }
+    }
+    Ok(rebuilt_list(expr, items, expanded))
+}
+
+/// `match`/`match*`: each clause's pattern is a binding position (never
+/// expanded) whose symbols shadow the clause's guard and body.
+fn expand_match_form(
+    ctx: &EvalContext,
+    env: &Env,
+    expr: &Value,
+    items: &[Value],
+    shadow: &Shadow,
+) -> EvalResult {
+    let mut expanded: Vec<Value> = vec![items[0].clone()];
+    if let Some(scrutinee) = items.get(1) {
+        expanded.push(expand_macros_in(ctx, env, scrutinee, shadow)?);
+    }
+    for clause in items.iter().skip(2) {
+        let parts: Option<Vec<Value>> = if let Some(l) = clause.as_list() {
+            Some(l.to_vec())
+        } else if let ValueView::Vector(v) = clause.view() {
+            Some(v.to_vec())
+        } else {
+            None
+        };
+        let Some(parts) = parts else {
+            expanded.push(expand_macros_in(ctx, env, clause, shadow)?);
+            continue;
+        };
+        if parts.is_empty() {
+            expanded.push(clause.clone());
+            continue;
+        }
+        let mut bound = HashSet::new();
+        collect_pattern_symbols(&parts[0], &mut bound);
+        let inner = shadow.child(bound);
+        let mut new_parts = vec![parts[0].clone()];
+        for part in parts.iter().skip(1) {
+            new_parts.push(expand_macros_in(ctx, env, part, &inner)?);
+        }
+        let changed = new_parts
+            .iter()
+            .zip(parts.iter())
+            .any(|(a, b)| a.raw_bits() != b.raw_bits());
+        if !changed {
+            expanded.push(clause.clone());
+        } else if clause.as_list().is_some() {
+            expanded.push(Value::list(new_parts));
+        } else {
+            expanded.push(Value::vector(new_parts));
+        }
+    }
+    Ok(rebuilt_list(expr, items, expanded))
+}
+
+/// Run deserialized bytecode/// Run deserialized bytecode (a `.semac` payload) on a fresh VM rooted at
 /// `globals`. Used to `load`/`import` precompiled bytecode modules (e.g.
 /// embedded in a standalone-executable or web-archive VFS) the same way
 /// `eval_module_body_vm` runs source modules. Does NOT (re)initialize the
@@ -437,11 +889,10 @@ pub fn eval_module_body_vm(
         )?;
         result = vm.execute(prog.closure, ctx)?;
     }
-    // Each per-form VM ran on a clone of `env` with its own version cell, so any
-    // globals (re)defined by the body did not bump `env`'s version. Bump it now
-    // so the calling VM (whose globals share `env`'s bindings) invalidates its
-    // inline global cache and re-reads, rather than serving stale cached values.
-    env.bump_version();
+    // Each per-form VM ran on `Rc::new(env.clone())`; the clone shares both
+    // `env`'s bindings map and its version cell (`Env::version` is `Rc`-held),
+    // so any global the body (re)defined or `set!`d already bumped the version
+    // the calling VM's inline cache is keyed on — no explicit re-bump needed.
     Ok(result)
 }
 

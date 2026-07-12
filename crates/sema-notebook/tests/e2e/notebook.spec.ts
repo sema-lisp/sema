@@ -14,34 +14,11 @@ function cells(page: Page) {
   return page.getByTestId('cell');
 }
 
-/** Get a cell by its 0-based index. */
-function cellAt(page: Page, index: number) {
-  return cells(page).nth(index);
-}
-
 /** Get cells of a specific type. */
 function cellsOfType(page: Page, type: 'code' | 'markdown') {
   // data-cell-type is a real data attribute (not a testid) used to distinguish
   // code/markdown cells; narrow the testid-selected set with it via `.and()`.
   return page.getByTestId('cell').and(page.locator(`[data-cell-type="${type}"]`));
-}
-
-/** Wait for a cell's output to appear (stdout or value or error). */
-async function waitForOutput(page: Page, cellIndex: number) {
-  const cell = cellAt(page, cellIndex);
-  await cell.getByTestId(/^cell-output-/).first().waitFor({ timeout: 15000 });
-}
-
-/** Get the text content of a cell's output. */
-async function getOutputText(page: Page, cellIndex: number) {
-  const cell = cellAt(page, cellIndex);
-  const outputs = cell.getByTestId('output-content');
-  const count = await outputs.count();
-  const texts: string[] = [];
-  for (let i = 0; i < count; i++) {
-    texts.push((await outputs.nth(i).textContent()) ?? '');
-  }
-  return texts.join('\n').trim();
 }
 
 // ── Page Structure Tests ───────────────────────────────────────
@@ -62,7 +39,10 @@ test.describe('Page structure', () => {
   });
 
   test('undo button is disabled initially', async ({ page }) => {
-    await expect(page.getByTestId('btn-undo')).toBeDisabled();
+    // toHaveJSProperty, not toBeDisabled: Playwright honors aria-disabled only
+    // on elements with a role, and the sema-button host deliberately has none
+    // (the native disabled lives on its shadow <button>).
+    await expect(page.getByTestId('btn-undo')).toHaveJSProperty('disabled', true);
   });
 
   test('notebook title is displayed', async ({ page }) => {
@@ -360,9 +340,12 @@ test.describe('Focus and keyboard', () => {
     const codeCell = cellsOfType(page, 'code').first();
     const textarea = codeCell.getByTestId('cell-textarea');
 
-    // Focus and move to start
+    // Focus, then place the caret at document start explicitly: the component
+    // assigns `.value` programmatically on load, which parks the caret at the
+    // end, and macOS Home moves to the start of the (visual) line rather than
+    // the document — neither lands at position 0.
     await textarea.focus();
-    await page.keyboard.press('Home');
+    await textarea.evaluate((t: HTMLTextAreaElement) => t.setSelectionRange(0, 0));
     await page.keyboard.press('Tab');
     await page.waitForTimeout(200);
 
@@ -371,12 +354,19 @@ test.describe('Focus and keyboard', () => {
     expect(value).toMatch(/^  /);
   });
 
-  test('Cmd+S triggers save', async ({ page }) => {
-    // Just verify it doesn't error — save flashes the button green
-    const saveBtn = page.getByTestId('btn-save');
+  test('Cmd+S triggers save and shows a success toast', async ({ page }) => {
     await page.keyboard.press('Meta+s');
-    // Brief flash of green — hard to assert timing, just ensure no error
-    await page.waitForTimeout(300);
+
+    // toast() lazily appends a <sema-toaster> to document.body and renders a
+    // <sema-toast> inside its (open) shadow root — a plain tag locator pierces
+    // it, and the message is real light-DOM slotted text so textContent sees it
+    // without reaching into shadow DOM.
+    const toast = page.locator('sema-toast');
+    // save() awaits persisting the title and every cell's source before it
+    // toasts — give it the same headroom as the suite's other network-bound waits.
+    await expect(toast).toBeVisible({ timeout: 15000 });
+    await expect(toast).toHaveText(/Saved/);
+    await expect(toast).toHaveAttribute('variant', 'success');
   });
 });
 
@@ -460,9 +450,11 @@ test.describe('Reset', () => {
     let outputs = page.getByTestId(/^cell-output-/);
     expect(await outputs.count()).toBeGreaterThan(0);
 
-    // Reset via UI
-    page.on('dialog', dialog => dialog.accept());
+    // Reset via UI: a sema-dialog confirm, not a native window.confirm.
     await page.getByTestId('btn-reset').click();
+    const dialog = page.getByTestId('reset-dialog');
+    await expect(dialog).toBeVisible();
+    await dialog.getByTestId('btn-reset-confirm').click();
     await page.waitForTimeout(1000);
 
     // Outputs should be gone
@@ -485,7 +477,7 @@ test.describe('Undo', () => {
 
     // Load page — undo should be enabled
     await waitForLoad(page);
-    await expect(page.getByTestId('btn-undo')).toBeEnabled();
+    await expect(page.getByTestId('btn-undo')).toHaveJSProperty('disabled', false);
   });
 
   test('undo reverts cell evaluation', async ({ page, request }) => {
@@ -700,10 +692,12 @@ test.describe('Regression — notebook UI fixes', () => {
     const dropdown = divider.getByTestId('add-cell-dropdown');
     await expect(dropdown).toBeVisible();
 
-    // Moving onto a dropdown item must NOT fade the divider (and its dropdown
-    // child) out — the .visible class keeps opacity at 1 while it is open.
+    // The popover is click-open (not hover-open), so there's no hover-bridge to
+    // lose in the first place — this now guards the divider's
+    // `:has(sema-popover[open])` CSS fallback: moving off the "+" trigger onto a
+    // menu item must not fade the divider (and the popover panel nested inside
+    // it) out from under the cursor.
     await dropdown.getByTestId('btn-insert-code').hover();
-    await expect(divider).toHaveClass(/visible/);
     await expect.poll(() => divider.evaluate((el) => getComputedStyle(el).opacity)).toBe('1');
     await expect(dropdown.getByTestId('btn-insert-code')).toBeVisible();
   });

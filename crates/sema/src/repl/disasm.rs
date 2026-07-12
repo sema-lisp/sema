@@ -29,7 +29,7 @@ pub fn run(interpreter: &Interpreter, expr_str: &str) {
         }
     };
 
-    let expanded: Result<Vec<_>, _> = exprs.iter().map(|e| interpreter.expand_for_vm(e)).collect();
+    let expanded: Result<Vec<_>, _> = interpreter.expand_for_vm_batch(&exprs);
     let expanded = match expanded {
         Ok(v) => v,
         Err(e) => {

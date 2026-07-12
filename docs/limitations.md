@@ -219,13 +219,13 @@ Still-open related symptoms from the same dual-path design (NOT addressed here):
 
 Note: `set!`-through-HOF inside an *async task* still follows the pre-existing fresh-task-VM semantics (it is snapshotted on spawn), since async tasks run on dedicated VM stacks.
 
-### 32. Bytecode stack-balance validation gap (C11, HIGH)
+### 32. Bytecode trust model: unchecked VM stack ops, load-time verification (C11 — closed)
 
-The VM's main dispatch loop uses `pop_unchecked` at ~67 call sites (`crates/sema-vm/src/vm.rs`). This is safe **only** because the in-process bytecode compiler is stack-balanced by construction (every emitted sequence pushes/pops by a known delta). The on-disk `.semac` format has no such guarantee: `validate_bytecode` (in `crates/sema-vm/src/serialize.rs`) currently checks magic, version, table bounds, and jump targets, but it does **not** abstract-interpret the instruction stream to verify stack balance.
+The VM's main dispatch loop trusts its bytecode to be stack-balanced: `pop_unchecked` pops without a bounds check (~90 call sites in `crates/sema-vm/src/vm.rs`). (The per-instruction `pc` bounds check, by contrast, is retained — a never-taken branch is measurably free, and it turns a VM bug into a clean error instead of an out-of-bounds read.)
 
-A hand-crafted (or corrupted) `.semac` file with a leading `Pop`, an unbalanced `Call`, or a missing push before a binary op causes undefined behavior in release builds: `pop_unchecked` reads `stack[len - 1]` after subtracting from an empty `Vec`, calls `set_len(usize::MAX)`, and subsequent pushes/pops corrupt arbitrary memory.
+In-process bytecode is balanced by construction: the compiler emits matched push/pop sequences, terminates every chunk with `Return`, and patches every jump to an emitted instruction. Deserialized `.semac` bytecode is proven equivalent by `validate_bytecode` (`crates/sema-vm/src/serialize.rs`, run inside `deserialize_from_bytes`) — structural checks (operand widths, const/local/upvalue/func-id/native-id ranges, jump targets on instruction boundaries, non-empty chunks) plus the abstract stack-depth verifier of ADR #56 (`verify_stack_balance`): a worklist walk from pc 0 and every exception-handler entry that rejects any chunk where a reachable opcode could underflow the operand stack, control could fall off the end of a chunk or jump to end-of-code, or a handler's declared entry depth disagrees with the computed depths in its protected range. Regression suite: `crates/sema-vm/tests/bytecode_validator_regression.rs`.
 
-**For now, `.semac` files should be treated as trusted-source-only.** Do not load `.semac` from network/untrusted sources without verification. The planned fix is a stack-depth verifier — see the ADR "Bytecode stack-depth verifier for .semac loading" in `docs/adr.md` and the implementation plan `docs/plans/2026-05-15-adi-bytecode-verifier.md`.
+What verification does **not** cover: runtime types (`Add` on non-numbers stays a runtime error), `max_stack` honesty (the VM guards `Dup` on an empty stack explicitly rather than trusting it), and resource use — a verified chunk can still loop forever or allocate unboundedly (see #35). Loading `.semac` from untrusted sources no longer risks the unchecked-pop UB class, but running it is still running a program: apply the same sandboxing judgment as for untrusted source code.
 
 ### 33. VM `eval` sees globals only — no lexical locals
 

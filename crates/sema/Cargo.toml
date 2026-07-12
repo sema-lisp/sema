@@ -55,6 +55,12 @@ flate2.workspace = true
 crc32fast = "1"
 xz2 = "0.1"
 zip = { version = "8", default-features = false, features = ["deflate"] }
+# Embeds the `sema web` browser runtime (src/web/assets/**) into the binary at
+# compile time. `debug-embed` forces embedding in every profile so a build never
+# reads the assets from the source tree at runtime — see src/web/runtime.rs.
+rust-embed = { version = "8", features = ["debug-embed"] }
+self-replace.workspace = true
+indicatif.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

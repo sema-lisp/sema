@@ -1304,3 +1304,186 @@ fn parallel_and_pipeline_handle_empty_and_zero_stages() {
         common::eval(r#"'(1 2 3)"#)
     );
 }
+
+// === Regression #104: async/spawn keeps captured locals live across the spawn boundary ===
+//
+// `async/spawn` runs the task on a dedicated task VM whose stack differs from the
+// spawning VM's, so a still-open upvalue cell (which indexes the spawning VM's
+// stack) must be detached before the task can read it (C1: cells must not dangle
+// on a foreign stack). The detach used to snapshot the cell by VALUE at spawn time
+// and sever it from the defining frame's slot, so a `set!` to the captured local
+// that ran AFTER the spawn but BEFORE the task first read it was lost — the task
+// saw the stale spawn-time value. The fix keeps the detached cell TRACKED to the
+// still-live defining frame so later `StoreLocal` writes flow into it.
+#[test]
+fn spawn_observes_set_of_captured_local_after_spawn() {
+    // The `set! x 42` runs before the task body ever reads `x` (the task only
+    // advances when `await` drives the scheduler), so the task must observe 42.
+    assert_eq!(
+        eval(
+            r#"(define (demo)
+                 (define x nil)
+                 (define p (async/spawn (fn () (async/sleep 5) x)))
+                 (set! x 42)
+                 (await p))
+               (demo)"#
+        ),
+        Value::int(42)
+    );
+}
+
+// Control: the SAME capture + `set!` shape WITHOUT a spawn shares the cell
+// correctly (plain C1 open-upvalue semantics). Kept alongside the spawn case so a
+// regression that breaks the non-spawn path is distinguishable from a spawn-only
+// regression.
+#[test]
+fn no_spawn_observes_set_of_captured_local() {
+    assert_eq!(
+        eval(
+            r#"(define (demo)
+                 (define x nil)
+                 (define f (fn () x))
+                 (set! x 42)
+                 (f))
+               (demo)"#
+        ),
+        Value::int(42)
+    );
+}
+
+// Multiple post-spawn mutations before the task reads: the task must observe the
+// LAST write, not the spawn-time snapshot nor an intermediate value.
+#[test]
+fn spawn_observes_latest_of_several_post_spawn_writes() {
+    assert_eq!(
+        eval(
+            r#"(define (demo)
+                 (define x 0)
+                 (define p (async/spawn (fn () (async/sleep 5) x)))
+                 (set! x 1)
+                 (set! x 2)
+                 (set! x 99)
+                 (await p))
+               (demo)"#
+        ),
+        Value::int(99)
+    );
+}
+
+// Two tasks sharing the same captured local both observe the post-spawn write,
+// and the deduplicated shared cell stays consistent across both task VMs.
+#[test]
+fn two_spawns_share_captured_local_after_set() {
+    assert_eq!(
+        eval(
+            r#"(define (demo)
+                 (define x 0)
+                 (define p (async/spawn (fn () (async/sleep 5) x)))
+                 (define q (async/spawn (fn () (async/sleep 5) x)))
+                 (set! x 7)
+                 (+ (await p) (await q)))
+               (demo)"#
+        ),
+        Value::int(14)
+    );
+}
+
+// The value captured after a post-spawn `set!` must be usable as a heap value
+// (string), exercising that the tracked cell owns its value across the boundary
+// (GC-reachability of the tracked value, not just an immediate int).
+#[test]
+fn spawn_observes_post_spawn_heap_value() {
+    assert_eq!(
+        eval(
+            r#"(define (demo)
+                 (define s "before")
+                 (define p (async/spawn (fn () (async/sleep 5) s)))
+                 (set! s "after")
+                 (await p))
+               (demo)"#
+        ),
+        Value::string("after")
+    );
+}
+
+// === event/select and io/read-key-timeout yield in async context (#88) ===
+
+// event/select must NOT block the cooperative scheduler thread while it waits.
+// A task that `event/select`s on a source that never fires (a bogus :proc handle)
+// with an 80ms timeout is spawned FIRST; a sibling task that only sends a marker
+// is spawned second. If event/select blocked the OS thread for the whole timeout,
+// the sibling could not run until the select returned, so the select's marker
+// (:select-done) would reach the log channel FIRST. Because it yields, the sibling
+// runs to completion the instant the select parks — so :sibling-ran lands first.
+// This ordering is deterministic (the sibling does no I/O and no sleep, so it
+// finishes immediately once scheduled), which is exactly what distinguishes a
+// cooperative yield from a blocking wait.
+#[test]
+fn event_select_yields_to_sibling_in_async_context() {
+    let out = eval(
+        r#"
+        (let ((log (channel/new 4)))
+          (async/all
+            (list
+              (async
+                (event/select (list {:type :proc :handle 999999}) 80)
+                (channel/send log :select-done))
+              (async
+                (channel/send log :sibling-ran))))
+          (list (channel/recv log) (channel/recv log)))
+    "#,
+    );
+    assert_eq!(
+        out,
+        Value::list(vec![
+            Value::keyword("sibling-ran"),
+            Value::keyword("select-done"),
+        ]),
+        "event/select must yield so the sibling runs before the select's timeout resolves"
+    );
+}
+
+// event/select with no ready source still returns nil on timeout from within an
+// async context (the cooperative path must preserve the sync return semantics).
+#[test]
+fn event_select_times_out_to_nil_in_async_context() {
+    assert_eq!(
+        eval(r#"(await (async (event/select (list {:type :proc :handle 999999}) 20)))"#),
+        Value::nil()
+    );
+}
+
+// io/read-key-timeout: without a TTY we cannot deterministically feed a keystroke
+// nor force a clean idle timeout (a non-TTY stdin is often at EOF, which the first
+// poll resolves to nil immediately). So this does NOT prove the yield-during-wait
+// behavior — the event/select test above is the deterministic cooperative-yield
+// oracle. What it DOES prove: the async-context branch is wired up, returns
+// (nil on timeout/EOF, or a key), and neither panics nor deadlocks the scheduler
+// while a co-scheduled sibling task also runs to completion. Unix-only because
+// io/read-key-timeout is registered only on Unix.
+#[cfg(unix)]
+#[test]
+fn read_key_timeout_async_branch_completes_with_sibling() {
+    let out = eval(
+        r#"
+        (let ((log (channel/new 4)))
+          (async/all
+            (list
+              (async
+                (io/read-key-timeout 20)
+                (channel/send log :key-done))
+              (async
+                (channel/send log :sibling-ran))))
+          ;; Drain both markers as a set; ordering is NOT asserted (it depends on
+          ;; whether stdin is at EOF, which varies by test environment).
+          (let ((a (channel/recv log)) (b (channel/recv log)))
+            (list (or (= a :key-done) (= b :key-done))
+                  (or (= a :sibling-ran) (= b :sibling-ran)))))
+    "#,
+    );
+    assert_eq!(
+        out,
+        Value::list(vec![Value::bool(true), Value::bool(true)]),
+        "both the read-key-timeout task and its sibling must complete without deadlock"
+    );
+}

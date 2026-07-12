@@ -92,6 +92,8 @@ similar = "2"
 pulldown-cmark = "0.12"
 scraper = "0.21"
 notify = "6"
+self-replace = "1"
+indicatif = "0.18"
 portable-pty = "0.9"
 
 # MCP client OAuth (native, hand-rolled per Option B). oauth2 provides PKCE-S256

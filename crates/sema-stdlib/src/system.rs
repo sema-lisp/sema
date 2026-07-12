@@ -82,6 +82,53 @@ fn shell_program_args(cmd: &str, cmd_args: &[&str]) -> (String, Vec<String>) {
     }
 }
 
+/// Extract a `{:cwd "path" :env {"KEY" "val" ...}}` options map into owned,
+/// `Send` data: an optional working directory and a list of env overrides.
+/// Shared by `shell` and `proc/spawn` so both interpret the options map
+/// identically; owning `String`s (not borrows) lets the async `shell` path move
+/// them across the I/O-pool thread boundary.
+pub(crate) fn command_opts(
+    opts: &std::collections::BTreeMap<Value, Value>,
+) -> (Option<String>, Vec<(String, String)>) {
+    let cwd = opts
+        .get(&Value::keyword("cwd"))
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    let mut env = Vec::new();
+    if let Some(em) = opts
+        .get(&Value::keyword("env"))
+        .and_then(|v| v.as_map_ref())
+    {
+        for (k, val) in em.iter() {
+            if let (Some(k), Some(val)) = (k.as_str(), val.as_str()) {
+                env.push((k.to_string(), val.to_string()));
+            }
+        }
+    }
+    (cwd, env)
+}
+
+/// POSIX single-quote a string so it survives `sh -c` as one literal word. Wrap
+/// in single quotes; each embedded `'` becomes `'\''` (close-quote, escaped
+/// literal quote, reopen). The empty string becomes `''`. Robust for arbitrary
+/// input — no shell metacharacter is special inside single quotes.
+fn posix_shell_quote(s: &str) -> String {
+    if s.is_empty() {
+        return "''".to_string();
+    }
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('\'');
+    for c in s.chars() {
+        if c == '\'' {
+            out.push_str("'\\''");
+        } else {
+            out.push(c);
+        }
+    }
+    out.push('\'');
+    out
+}
+
 /// Decode a finished child's status/stdout/stderr into the Sema `shell` result
 /// map. Identical shape for the sync and async paths: `:stdout`/`:stderr` are
 /// lossy-UTF-8 strings and `:exit-code` is the exit code (or `-1` when the
@@ -114,7 +161,12 @@ struct RawShellOutput {
 /// output facts into the identical `Value` shape the sync path returns. Returns
 /// `Ok(nil)` after arming the yield signal; the scheduler delivers the real
 /// value on resume.
-fn shell_async(program: String, child_args: Vec<String>) -> Result<Value, SemaError> {
+fn shell_async(
+    program: String,
+    child_args: Vec<String>,
+    cwd: Option<String>,
+    env_vars: Vec<(String, String)>,
+) -> Result<Value, SemaError> {
     use std::rc::Rc;
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::Arc;
@@ -146,6 +198,13 @@ fn shell_async(program: String, child_args: Vec<String>) -> Result<Value, SemaEr
                 .kill_on_drop(true)
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped());
+            // Honor the options map's :cwd / :env, matching the sync path.
+            if let Some(dir) = &cwd {
+                cmd.current_dir(dir);
+            }
+            for (k, v) in &env_vars {
+                cmd.env(k, v);
+            }
             // Put the child in its own process group so a compound/pipelined command
             // (`sh -c "a; b"`) — where `sh` forks the real workers as grandchildren —
             // can be torn down as a GROUP on abort, not just the `sh` leader.
@@ -254,13 +313,23 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
         let cmd = args[0]
             .as_str()
             .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
-        let cmd_args: Vec<&str> = args[1..]
+
+        // A trailing map is an options map (`{:cwd "path" :env {...}}`), never an
+        // argv element — so the positional string-argv form is unchanged. Only
+        // the LAST arg qualifies, and only when it is actually a map; a string in
+        // that slot still means an argv element.
+        let (argv, opts) = match args[1..].split_last() {
+            Some((last, rest)) if last.as_map_ref().is_some() => (rest, last.as_map_ref()),
+            _ => (&args[1..], None),
+        };
+        let cmd_args: Vec<&str> = argv
             .iter()
             .map(|a| {
                 a.as_str()
                     .ok_or_else(|| SemaError::type_error("string", a.type_name()))
             })
             .collect::<Result<_, _>>()?;
+        let (cwd, env_vars) = opts.map(command_opts).unwrap_or_default();
 
         // Resolve the program + argv exactly once, shared by both paths so they
         // launch byte-identical commands.
@@ -271,13 +340,20 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
         // sibling tasks while the child runs. Args are resolved and the result
         // `Value` decoded on the VM thread; only `Send` facts cross the boundary.
         if sema_core::in_async_context() {
-            return shell_async(program, child_args);
+            return shell_async(program, child_args, cwd, env_vars);
         }
 
         // Top-level (not in a scheduler task): the original synchronous path,
         // byte-identical in observable behavior to the pre-async implementation.
-        let output = std::process::Command::new(&program)
-            .args(&child_args)
+        let mut command = std::process::Command::new(&program);
+        command.args(&child_args);
+        if let Some(dir) = &cwd {
+            command.current_dir(dir);
+        }
+        for (k, v) in &env_vars {
+            command.env(k, v);
+        }
+        let output = command
             .output()
             .map_err(|e| SemaError::Io(format!("shell: {e}")))?;
 
@@ -286,6 +362,17 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
             &output.stdout,
             &output.stderr,
         ))
+    });
+
+    // shell/quote — POSIX-quote a string for safe interpolation into a POSIX `sh -c`
+    // command line (Unix). Note: the single-string form of `shell` uses `cmd /C` on Windows.
+    // Pure (string→string), so ungated like other string helpers.
+    register_fn(env, "shell/quote", |args| {
+        check_arity!(args, "shell/quote", 1);
+        let s = args[0]
+            .as_str()
+            .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
+        Ok(Value::string(&posix_shell_quote(s)))
     });
 
     crate::register_fn_gated(env, sandbox, Caps::PROCESS, "exit", |args| {

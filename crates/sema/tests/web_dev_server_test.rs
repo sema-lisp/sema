@@ -1,19 +1,15 @@
 //! Integration tests for the `sema web` dev server's serving layer.
 //!
-//! These spawn the real binary. They require the browser runtime to be
-//! embedded (`jake wasm.web-runtime` before building); when it isn't, the server
-//! exits with a clear message and the test skips rather than failing, so a
-//! plain `cargo build` checkout still passes. Marked `#[ignore]` like the other
-//! server tests (they bind localhost sockets).
+//! These spawn the real binary and exercise its embedded browser runtime.
+//! Marked `#[ignore]` like the other server tests because they bind localhost
+//! sockets.
 
 use std::io::Read;
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
-/// Spawn `sema web <app> --port <port> --no-open`. Returns `None` (and prints
-/// why) when the binary has no embedded runtime, so callers skip gracefully.
-/// `--no-open` keeps the test from popping a real browser window.
-fn spawn_dev_server(app: &str, port: u16) -> Option<Child> {
+/// Spawn `sema web <app> --port <port> --no-open` and require it to remain up.
+fn spawn_dev_server(app: &str, port: u16) -> Child {
     // Tests run with CWD = crate dir; the example paths are repo-root-relative.
     let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let mut child = Command::new(env!("CARGO_BIN_EXE_sema"))
@@ -26,28 +22,24 @@ fn spawn_dev_server(app: &str, port: u16) -> Option<Child> {
 
     std::thread::sleep(Duration::from_millis(1500));
 
-    // If it already exited, the runtime is likely not embedded — skip.
-    if let Ok(Some(_)) = child.try_wait() {
+    if let Some(status) = child.try_wait().expect("query sema web process") {
         let mut err = String::new();
         if let Some(mut s) = child.stderr.take() {
             let _ = s.read_to_string(&mut err);
         }
-        eprintln!(
-            "skipping: `sema web` exited early ({}). Run `jake wasm.web-runtime` and rebuild.",
-            err.trim()
+        panic!(
+            "`sema web` exited during startup with {status}: {}",
+            err.trim(),
         );
-        return None;
     }
-    Some(child)
+    child
 }
 
 #[test]
-#[ignore] // requires network + embedded web runtime (`jake wasm.web-runtime`)
+#[ignore] // binds a localhost socket
 fn test_web_dev_server_serves_runtime_shell_and_app() {
     let port = 19930;
-    let Some(mut child) = spawn_dev_server("examples/web/counter.sema", port) else {
-        return;
-    };
+    let mut child = spawn_dev_server("examples/web/counter.sema", port);
 
     let client = reqwest::blocking::Client::new();
     let base = format!("http://127.0.0.1:{port}");
@@ -132,9 +124,7 @@ fn test_web_dev_server_llm_proxy_complete_live() {
         return;
     }
     let port = 19931;
-    let Some(mut child) = spawn_dev_server("examples/web/counter.sema", port) else {
-        return;
-    };
+    let mut child = spawn_dev_server("examples/web/counter.sema", port);
 
     // The proxy speaks the production llm-proxy protocol: POST /complete with a
     // prompt returns {content}. Uses a cheap model.

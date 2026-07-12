@@ -37,6 +37,36 @@ fn pad_to_width(s: &str, target: usize, pad_char: char, left: bool) -> String {
     }
 }
 
+/// Clamp `s` to a target *display width*, splitting on grapheme-cluster
+/// boundaries (never mid-cluster) so combining sequences and emoji are kept
+/// whole. Strings already at/under the target are returned unchanged — like
+/// `pad_to_width`, this never grows a string, only shrinks it. When `ellipsis`
+/// is non-empty and `s` is over width, content is truncated to leave room for
+/// the ellipsis, which is then appended; if `ellipsis` alone is wider than the
+/// target, it's truncated in its place (recursing with `ellipsis = ""`).
+fn truncate_to_width(s: &str, target: usize, ellipsis: &str) -> String {
+    if display_width(s) <= target {
+        return s.to_string();
+    }
+    let ellipsis_w = display_width(ellipsis);
+    if ellipsis_w > target {
+        return truncate_to_width(ellipsis, target, "");
+    }
+    let budget = target - ellipsis_w;
+    let mut out = String::new();
+    let mut w = 0usize;
+    for g in s.graphemes(true) {
+        let gw = UnicodeWidthStr::width(g);
+        if w + gw > budget {
+            break;
+        }
+        out.push_str(g);
+        w += gw;
+    }
+    out.push_str(ellipsis);
+    out
+}
+
 /// Hard-break a single word (no spaces) into chunks each ≤ `width` display
 /// columns, splitting on grapheme-cluster boundaries so combining sequences and
 /// emoji clusters are never split mid-cluster.
@@ -1482,6 +1512,29 @@ pub fn register(env: &sema_core::Env) {
             }
         }
         Ok(Value::list(out))
+    });
+
+    // (string/truncate-width s width [ellipsis]) -> S clamped to WIDTH display
+    // columns, splitting on grapheme-cluster boundaries so wide glyphs (CJK,
+    // emoji) are never cut in half. Strings already at/under WIDTH are
+    // returned unchanged — this only shrinks, unlike string/pad-* which only
+    // grows. With ELLIPSIS, an over-width string is truncated to leave room
+    // for it, and the ellipsis is appended (so the total never exceeds WIDTH);
+    // without it, truncation is a plain clamp.
+    register_fn(env, "string/truncate-width", |args| {
+        check_arity!(args, "string/truncate-width", 2..=3);
+        let s = args[0]
+            .as_str()
+            .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
+        let width = args[1].as_index("string/truncate-width")?;
+        let ellipsis = if args.len() == 3 {
+            args[2]
+                .as_str()
+                .ok_or_else(|| SemaError::type_error("string", args[2].type_name()))?
+        } else {
+            ""
+        };
+        Ok(Value::string_owned(truncate_to_width(s, width, ellipsis)))
     });
 
     // Silent aliases for other Lisp dialects (undocumented)

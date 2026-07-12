@@ -14,12 +14,6 @@ use sema_eval::Interpreter;
 
 /// Serve the sema-web app at `entry` in the browser. Blocks until interrupted.
 pub fn run(entry: &str, host: &str, port: u16, open: bool, llm: bool) -> Result<(), String> {
-    if !runtime::is_available() {
-        return Err("this `sema` build has no embedded web runtime.\n  \
-             Run `jake wasm.web-runtime` to vendor it, then rebuild the binary."
-            .to_string());
-    }
-
     let entry_path = std::path::Path::new(entry);
     if !entry_path.is_file() {
         return Err(format!("app entry not found: {entry}"));

@@ -1,0 +1,88 @@
+:root {
+  --bg: #0c0c0c;
+  --bg-elevated: #141414;
+  --bg-editor: #0a0a0a;
+  --bg-output: #080808;
+  --bg-toolbar: #111;
+  --gold: #c8a855;
+  --gold-dim: rgba(200, 168, 85, 0.5);
+  --gold-glow: rgba(200, 168, 85, 0.08);
+  --gold-soft: rgba(200, 168, 85, 0.14);
+  --text-primary: #d8d0c0;
+  --text-secondary: #a09888;
+  --text-tertiary: #5a5448;
+  --success: #6a9955;
+  --error: #c85555;
+  --error-bg: rgba(200, 85, 85, 0.06);
+  --border: #1e1e1e;
+  --border-focus: #333;
+  --tooltip-bg: #1a1a1a;
+  /* Three-font system (matches the website): serif for editorial headings,
+     sans for body/prose, mono for code and UI chrome. */
+  --serif: 'Cormorant', Georgia, serif;
+  --sans: 'Inter', system-ui, -apple-system, sans-serif;
+  --mono: 'JetBrains Mono', monospace;
+
+  /* ── Syntax highlighting palette ──
+     Source of truth: the reconciliation table in brand/index.html ("Recommended"
+     column), which resolves the historical website-vs-playground divergence.
+     Consumed by syntax.css (.tok-* classes) and <sema-code>. */
+  --syntax-comment: var(--text-tertiary);     /* #5a5448 — reuse text-dim, italic */
+  --syntax-keyword: var(--gold);              /* #c8a855 — control/definition forms */
+  --syntax-string: #a8c47a;                   /* brighter green, readable on dark */
+  --syntax-number: #d19a66;
+  --syntax-boolean: #d19a66;                  /* booleans/nil — same as number */
+  --syntax-keyword-lit: #7aacb8;              /* :keywords — teal, distinct from gold */
+  --syntax-builtin: #88a8b8;                  /* support.function (stdlib) */
+  --syntax-function: #88a8b8;                 /* entity.name.function — = builtin */
+  --syntax-variable: #b898c8;
+  --syntax-punctuation: #6a6258;              /* parens/brackets — dim but visible */
+  --syntax-operator: var(--gold);             /* arithmetic/threading/quote forms */
+  --syntax-escape: #c8d8a8;                   /* string escape sequences */
+  --syntax-property: #7aacb8;                 /* object keys (JSON), HTML attributes */
+
+  /* ── Spacing scale (px) ── from brand/index.html spacing reference */
+  --space-xs: 4px;
+  --space-sm: 8px;
+  --space-md: 16px;
+  --space-lg: 24px;
+  --space-xl: 32px;
+  --space-2xl: 48px;
+  --space-3xl: 64px;
+  --space-4xl: 96px;
+
+  /* ── Layout containers ── */
+  --container-prose: 768px; /* long-form text measure — consumed by page CSS, not a size enum value */
+  --container-md: 1000px; /* docs / showcase */
+  --container-lg: 1200px; /* marketing sections (default) */
+
+  /* ── Border radius scale ── from brand/index.html radius reference */
+  --radius-sm: 3px;
+  --radius-md: 4px;
+  --radius-lg: 6px;
+  --radius-xl: 8px;
+  --radius-pill: 20px;
+  --radius-full: 50%;
+
+  /* ── Control sizing ── shared height for compact toolbar controls
+     (sm buttons, toggles) so they line up on one row. */
+  --control-height-sm: 22px;
+
+  /* ── Font-size scale (px) ── the design system is px-canonical (see spacing/
+     radius above). Components reference these with a px fallback so consumers
+     that don't load tokens.css still render correctly. */
+  --text-xxs: 10px;
+  --text-xs: 11px;
+  --text-sm: 12px;
+  --text-md: 13px;
+  --text-lg: 14px;
+  --text-xl: 16px;
+  --text-2xl: 18px;
+  --text-3xl: 22px;
+
+  /* ── Focus ring ── shared :focus-visible treatment (gold outline) */
+  --focus-ring-color: var(--gold);
+  --focus-ring-color-subtle: var(--gold-dim);
+  --focus-ring-width: 1px;
+  --focus-ring-offset: 1px;
+}

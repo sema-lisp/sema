@@ -151,3 +151,28 @@ fn shell_sync_path_unchanged() {
         "sync path must return the identical value shape"
     );
 }
+
+/// The async (offloaded) path must honor the trailing `{:env ...}` options map,
+/// not silently drop it — the injected var must reach the child spawned on the
+/// I/O pool.
+#[test]
+#[serial]
+fn shell_async_honors_env_option() {
+    let interp = Interpreter::new();
+    let program = r#"
+        (first
+          (async/all
+            (list
+              (async/spawn
+                (fn () (:stdout (shell "echo $SEMA_ASYNC_FOO"
+                                       {:env {"SEMA_ASYNC_FOO" "async-bar"}})))))))
+    "#;
+    let result = interp
+        .eval_str_compiled(program)
+        .expect("async shell with :env evaluated");
+    assert_eq!(
+        result.as_str().map(str::trim),
+        Some("async-bar"),
+        "async shell must honor the :env options map"
+    );
+}

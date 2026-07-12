@@ -2065,17 +2065,10 @@ impl WasmInterpreter {
         }
 
         // Expand macros
-        let mut expanded = Vec::new();
-        for expr in &exprs {
-            match self.inner.expand_for_vm(expr) {
-                Ok(exp) => {
-                    if !exp.is_nil() {
-                        expanded.push(exp);
-                    }
-                }
-                Err(e) => return self.debug_error_result(&e),
-            }
-        }
+        let expanded: Vec<_> = match self.inner.expand_for_vm_batch(&exprs) {
+            Ok(v) => v.into_iter().filter(|e| !e.is_nil()).collect(),
+            Err(e) => return self.debug_error_result(&e),
+        };
         if expanded.is_empty() {
             return self.debug_finished_result(&sema_core::Value::nil());
         }
@@ -2321,17 +2314,10 @@ impl WasmInterpreter {
             return result;
         }
 
-        let mut expanded = Vec::new();
-        for expr in &exprs {
-            match self.inner.expand_for_vm(expr) {
-                Ok(exp) => {
-                    if !exp.is_nil() {
-                        expanded.push(exp);
-                    }
-                }
-                Err(_) => return result,
-            }
-        }
+        let expanded: Vec<_> = match self.inner.expand_for_vm_batch(&exprs) {
+            Ok(v) => v.into_iter().filter(|e| !e.is_nil()).collect(),
+            Err(_) => return result,
+        };
         if expanded.is_empty() {
             return result;
         }

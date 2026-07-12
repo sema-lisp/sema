@@ -218,6 +218,43 @@ fn semac_call_native_zero_id_rejected_when_table_empty() {
     );
 }
 
+/// A jump past the end of the chunk must be rejected at load time, not left
+/// for the VM's runtime pc bounds check to trip mid-program. Pass 2 of
+/// `validate_chunk_bytecode` rejects the target outright; the stack-balance
+/// walk independently rejects any *reachable* control transfer to
+/// `code.len()` or beyond ("falls off the end"). Together these prove the
+/// pc-bounds invariant for loaded bytecode (ADR #56).
+#[test]
+fn semac_oob_jump_rejected_at_load() {
+    let mut e = Emitter::new();
+    e.emit_op(Op::Jump);
+    e.emit_i32(1000); // target pc 1005; the chunk is 6 bytes
+    e.emit_op(Op::Return);
+    let chunk = e.into_chunk();
+
+    let err = expect_rejected(chunk, "out-of-chunk jump");
+    assert!(
+        err.contains("out-of-bounds"),
+        "expected out-of-bounds jump rejection, got: {err}"
+    );
+}
+
+/// An empty chunk must be rejected at load time: it has no terminator, so
+/// activating it violates the pc-bounds invariant at pc 0 (today the VM's
+/// runtime check catches that; rejecting up front keeps the invariant fully
+/// verifier-backed). The compiler never emits an empty chunk (empty programs
+/// compile to `Nil; Return`), so nothing legitimate is lost.
+#[test]
+fn semac_empty_chunk_rejected() {
+    let chunk = Emitter::new().into_chunk();
+
+    let err = expect_rejected(chunk, "empty chunk");
+    assert!(
+        err.contains("empty bytecode chunk"),
+        "expected empty-chunk rejection, got: {err}"
+    );
+}
+
 /// A pure LINEAR stack-growth sequence (no back-edge) must be rejected by the
 /// `MAX_STACK_DEPTH` overflow bound specifically. The existing dup-overflow test
 /// uses a self-loop, which trips the join-depth-disagreement check instead, so it

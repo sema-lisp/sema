@@ -602,6 +602,47 @@ pub(crate) fn poll_key_event(_ms: u64) -> Option<Value> {
     None
 }
 
+/// Cooperatively poll `ready` on the scheduler thread until it yields a value or
+/// `timeout_ms` milliseconds have elapsed since `started` (then `nil`), rather
+/// than blocking the OS thread in a `select(2)`/`sleep` wait. The async-context
+/// path of `io/read-key-timeout` and `event/select`: a "wait for input OR agent
+/// progress" loop must not stall the single cooperative scheduler thread while
+/// it waits, so we arm the same `AwaitIo` yield the file/http/shell async paths
+/// use — its poll closure re-checks readiness each scheduler tick (every
+/// sibling step, and at worst ~50 ms while every task is parked). `ready`
+/// returns `Some(Ok(v))` when input is available, `Some(Err(e))` to reject the
+/// task, or `None` while still waiting.
+///
+/// The timeout is checked as `started.elapsed() >= timeout_ms`, never as
+/// `started + Duration` — `Instant + Duration` panics on overflow, and unlike
+/// the sync path (`unix_stdin_ready`, a plain `libc::select` timeval) an
+/// arbitrarily large `ms` must not be able to crash the scheduler thread.
+///
+/// Unlike the `fs_offload`/`shell_async` poll closures (which cross no thread
+/// boundary but deliberately capture only `Send` data), `ready` here runs
+/// entirely on the VM thread and MAY capture Sema `Value`s (e.g. `event/select`'s
+/// source maps). That is sound: the cycle collector (Bacon–Rajan trial deletion)
+/// cannot trace into the boxed closure, so any `Value` it holds keeps a strong
+/// `Rc` the collector can't account for — but only for as long as the
+/// `IoHandle` is alive. The handle (closure and all) is dropped the moment the
+/// task resumes or is cancelled, which releases those `Rc`s normally; nothing
+/// is pinned beyond the handle's own lifetime.
+pub(crate) fn await_io_until(
+    started: std::time::Instant,
+    timeout_ms: u64,
+    mut ready: impl FnMut() -> Option<Result<Value, String>> + 'static,
+) -> Result<Value, SemaError> {
+    let timeout = std::time::Duration::from_millis(timeout_ms);
+    let handle = std::rc::Rc::new(sema_core::IoHandle::new(move || match ready() {
+        Some(Ok(v)) => sema_core::IoPoll::Ready(Ok(v)),
+        Some(Err(e)) => sema_core::IoPoll::Ready(Err(e)),
+        None if started.elapsed() >= timeout => sema_core::IoPoll::Ready(Ok(Value::nil())),
+        None => sema_core::IoPoll::Pending,
+    }));
+    sema_core::set_yield_signal(sema_core::YieldReason::AwaitIo(handle));
+    Ok(Value::nil())
+}
+
 pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
     register_fn(env, "display", |args| {
         let mut output = String::new();
@@ -1499,6 +1540,33 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
                 .as_int()
                 .ok_or_else(|| SemaError::type_error("integer", args[0].type_name()))?
                 as u64;
+
+            // In an async task, park on a cooperative poll instead of blocking the
+            // scheduler thread in `select(2)` for the whole timeout, so a "key OR
+            // agent progress" loop lets sibling tasks run while it waits. Once a
+            // first byte is ready `parse_key_input` may briefly block reading a
+            // multi-byte sequence — identical to the sync path — but the idle wait
+            // no longer does. The sync path below is byte-identical to before.
+            if sema_core::in_async_context() {
+                if let Some(v) = sema_core::take_resume_value() {
+                    return Ok(v);
+                }
+                let started = std::time::Instant::now();
+                return await_io_until(started, ms, || {
+                    if !unix_stdin_ready(0) {
+                        return None;
+                    }
+                    match parse_key_input() {
+                        Ok(Some(v)) => Some(Ok(v)),
+                        Ok(None) => {
+                            STDIN_EOF.with(|f| f.set(true));
+                            Some(Ok(Value::nil()))
+                        }
+                        Err(e) => Some(Err(e.to_string())),
+                    }
+                });
+            }
+
             if !unix_stdin_ready(ms) {
                 return Ok(Value::nil());
             }

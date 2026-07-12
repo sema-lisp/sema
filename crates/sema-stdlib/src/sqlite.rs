@@ -348,6 +348,34 @@ fn collect_query_rows(
     rows.collect()
 }
 
+/// Run `sql` against `conn` with `params`, stepping the cursor exactly once —
+/// the `db/query-one` counterpart to `collect_query_rows`. Mirrors the
+/// pre-offload sync implementation's `stmt.query_map(...).next()`: later rows
+/// (and whatever runtime error they might raise, e.g. SQLite's "integer
+/// overflow") are never evaluated, so a query whose first row is fine but a
+/// later row errors still succeeds, and a huge result set costs O(1) rather
+/// than buffering every row before returning the first.
+fn collect_first_query_row(
+    conn: &Connection,
+    sql: &str,
+    params: &[SqlValue],
+) -> rusqlite::Result<Option<Vec<(String, SqlValue)>>> {
+    let mut stmt = conn.prepare(sql)?;
+    let col_count = stmt.column_count();
+    let col_names: Vec<String> = (0..col_count)
+        .map(|i| stmt.column_name(i).unwrap().to_string())
+        .collect();
+    let mut rows = stmt.query_map(params_from_iter(params.iter()), |row| {
+        let mut r = Vec::with_capacity(col_count);
+        for (i, name) in col_names.iter().enumerate() {
+            let val: SqlValue = row.get(i)?;
+            r.push((name.clone(), val));
+        }
+        Ok(r)
+    })?;
+    rows.next().transpose()
+}
+
 fn row_pairs_to_map(row: Vec<(String, SqlValue)>) -> BTreeMap<Value, Value> {
     let mut map = BTreeMap::new();
     for (name, val) in row {
@@ -621,14 +649,7 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
                     "db/query-one",
                     handle,
                     move |conn| {
-                        collect_query_rows(conn, &sql, &params)
-                            .map(|mut rows| {
-                                if rows.is_empty() {
-                                    None
-                                } else {
-                                    Some(rows.remove(0))
-                                }
-                            })
+                        collect_first_query_row(conn, &sql, &params)
                             .map_err(|e| eval_msg("db/query-one", e))
                     },
                     row_to_value,
@@ -636,14 +657,8 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
             }
 
             with_conn("db/query-one", &handle, |conn| {
-                collect_query_rows(conn, &sql, &params)
-                    .map(|mut rows| {
-                        row_to_value(if rows.is_empty() {
-                            None
-                        } else {
-                            Some(rows.remove(0))
-                        })
-                    })
+                collect_first_query_row(conn, &sql, &params)
+                    .map(row_to_value)
                     .map_err(|e| SemaError::eval(format!("db/query-one: {e}")))
             })
         },

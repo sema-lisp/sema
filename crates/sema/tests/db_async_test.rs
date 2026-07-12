@@ -162,6 +162,35 @@ fn db_open_file_async_roundtrip() {
     );
 }
 
+/// Regression: the async `db/query-one` offload must stop at the first row,
+/// exactly like the sync path (`collect_first_query_row`, not
+/// `collect_query_rows` + `remove(0)`). A later row that would raise a SQLite
+/// runtime error (`abs(i64::MIN)` overflows) must never be evaluated.
+#[test]
+fn db_async_query_one_stops_at_first_row() {
+    let interp = Interpreter::new();
+    let result = interp
+        .eval_str_compiled(
+            r#"
+            (await (async/spawn (fn ()
+              (db/open-memory "qo-lazy-async")
+              (db/exec "qo-lazy-async" "CREATE TABLE t (x INTEGER)")
+              (db/exec "qo-lazy-async" "INSERT INTO t VALUES (1)")
+              (db/exec "qo-lazy-async" "INSERT INTO t VALUES (-9223372036854775808)")
+              (let ((row (db/query-one "qo-lazy-async" "SELECT abs(x) AS ax FROM t")))
+                (db/close "qo-lazy-async")
+                row))))
+            "#,
+        )
+        .expect("async db/query-one must not evaluate the overflowing second row");
+    assert_eq!(
+        result
+            .as_map_ref()
+            .and_then(|m| m.get(&Value::keyword("ax")).and_then(|v| v.as_int())),
+        Some(1)
+    );
+}
+
 /// Three sibling tasks all call `db/exec` on the SAME handle concurrently.
 /// Only one can hold the checkout at a time; the others must queue (the
 /// `Acquire` phase re-attempting checkout each poll) rather than deadlock,

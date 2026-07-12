@@ -14593,6 +14593,32 @@ fn test_db_query_one() {
     interp.eval_str(r#"(db/close "qo")"#).unwrap();
 }
 
+// Regression: db/query-one must stop at the first row (stmt.query_map(...).next()
+// semantics), never evaluating later rows. A later row that would raise a SQLite
+// runtime error (here, `abs(i64::MIN)` overflows) must not surface — the old
+// eager-collect-then-remove(0) implementation scanned every row first and would
+// turn this into an error instead of returning the first row.
+#[test]
+fn test_db_query_one_stops_at_first_row() {
+    let interp = Interpreter::new();
+    interp.eval_str(r#"(db/open-memory "qo-lazy")"#).unwrap();
+    interp
+        .eval_str(r#"(db/exec "qo-lazy" "CREATE TABLE t (x INTEGER)")"#)
+        .unwrap();
+    interp
+        .eval_str(r#"(db/exec "qo-lazy" "INSERT INTO t VALUES (1)")"#)
+        .unwrap();
+    interp
+        .eval_str(r#"(db/exec "qo-lazy" "INSERT INTO t VALUES (-9223372036854775808)")"#)
+        .unwrap();
+    let result = interp
+        .eval_str(r#"(db/query-one "qo-lazy" "SELECT abs(x) AS ax FROM t")"#)
+        .unwrap();
+    let row = result.as_map_ref().unwrap();
+    assert_eq!(row.get(&Value::keyword("ax")).unwrap(), &Value::int(1));
+    interp.eval_str(r#"(db/close "qo-lazy")"#).unwrap();
+}
+
 #[test]
 fn test_db_last_insert_id() {
     let interp = Interpreter::new();

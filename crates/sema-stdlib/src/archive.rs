@@ -1,7 +1,28 @@
+//! Archive builtins (`zip/*`, `tar/*`, `gzip/*`).
+//!
+//! `zip/create`/`zip/extract`/`zip/list`/`tar/create`/`tar/extract` do real
+//! file I/O plus CPU-bound (de)compression — reading/writing whole files and
+//! walking a zip/tar central directory can take a while for a large archive.
+//! Each builtin's actual work lives in a plain `*_work` function that returns
+//! `Result<T, SemaError>` and touches nothing but its own arguments (no VM
+//! state, no `Value` construction beyond what the caller already parsed out of
+//! `args`); the registered native calls it directly at top level, or — inside
+//! `async/spawn` (`in_async_context()`) — offloads it onto the process-wide
+//! I/O pool via `fs_offload` (`io.rs`) so the archive work doesn't block the
+//! VM thread (and every sibling task) for its whole duration. The offload's
+//! `work` closure runs `*_work` entirely on the worker thread and converts any
+//! `SemaError` to its rendered `String` (`.to_string()`) before returning —
+//! `SemaError` itself never crosses the thread boundary (GLOBAL RULES: never
+//! move `Value`/`SemaError`/`Rc`/`RefCell` across threads), only the plain
+//! `Send` result (`i64` counts, `Vec<String>` entry names) does. The final
+//! `Value` is built back on the VM thread when the scheduler polls the
+//! completed offload. `gzip/compress`/`gzip/decompress` are pure in-memory
+//! transforms and stay synchronous always — nothing to offload.
+
 use std::io::{Read as _, Write as _};
 use std::path::{Component, Path, PathBuf};
 
-use sema_core::{check_arity, Caps, SemaError, Value};
+use sema_core::{check_arity, in_async_context, Caps, SemaError, Value};
 
 use crate::{register_fn, register_fn_gated};
 
@@ -49,6 +70,255 @@ fn looks_gzip(path: &str) -> bool {
     lower.ends_with(".tar.gz") || lower.ends_with(".tgz")
 }
 
+/// `zip/create`'s actual work: build `out_path` from `files`, each stored
+/// under its basename. Shared verbatim by the sync and offloaded-async paths.
+fn zip_create_work(out_path: &str, files: &[String]) -> Result<i64, SemaError> {
+    let file = std::fs::File::create(out_path)
+        .map_err(|e| SemaError::Io(format!("zip/create {out_path}: {e}")))?;
+    let mut writer = zip::ZipWriter::new(file);
+    let options: zip::write::FileOptions<()> =
+        zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+
+    let mut count = 0i64;
+    let mut seen = std::collections::HashSet::new();
+    for src in files {
+        let name = Path::new(src)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .ok_or_else(|| SemaError::eval(format!("zip/create: bad file path {src}")))?;
+        // Entries are keyed by basename; a duplicate would shadow earlier
+        // data (most extractors keep the last). Refuse rather than lose it.
+        if !seen.insert(name.to_string()) {
+            return Err(SemaError::eval(format!(
+                "zip/create: duplicate entry name {name:?} (from {src})"
+            )));
+        }
+        let data =
+            std::fs::read(src).map_err(|e| SemaError::Io(format!("zip/create {src}: {e}")))?;
+        writer
+            .start_file(name, options)
+            .map_err(|e| SemaError::eval(format!("zip/create: {e}")))?;
+        writer
+            .write_all(&data)
+            .map_err(|e| SemaError::Io(format!("zip/create {src}: {e}")))?;
+        count += 1;
+    }
+    writer
+        .finish()
+        .map_err(|e| SemaError::eval(format!("zip/create: {e}")))?;
+    Ok(count)
+}
+
+/// `zip/extract`'s actual work: unpack `zip_path` into `dest_dir`. Shared
+/// verbatim by the sync and offloaded-async paths.
+fn zip_extract_work(zip_path: &str, dest_dir: &str) -> Result<i64, SemaError> {
+    let file = std::fs::File::open(zip_path)
+        .map_err(|e| SemaError::Io(format!("zip/extract {zip_path}: {e}")))?;
+    let mut archive = zip::ZipArchive::new(file)
+        .map_err(|e| SemaError::eval(format!("zip/extract {zip_path}: {e}")))?;
+
+    let dest_root = Path::new(dest_dir);
+    std::fs::create_dir_all(dest_root)
+        .map_err(|e| SemaError::Io(format!("zip/extract {dest_dir}: {e}")))?;
+
+    let mut count = 0i64;
+    let mut seen: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+    for i in 0..archive.len() {
+        let mut entry = archive
+            .by_index(i)
+            .map_err(|e| SemaError::eval(format!("zip/extract: {e}")))?;
+        let name = entry.name().to_string();
+        // zip-slip guard: skip entries whose path would escape dest-dir.
+        let rel = match safe_relative(&name) {
+            Some(r) => r,
+            None => continue,
+        };
+        let target = dest_root.join(&rel);
+        if entry.is_dir() || name.ends_with('/') {
+            std::fs::create_dir_all(&target)
+                .map_err(|e| SemaError::Io(format!("zip/extract {name}: {e}")))?;
+        } else {
+            // A foreign archive can carry two file entries that map to the
+            // same target; the create-side dedup doesn't protect extraction,
+            // so refuse the duplicate instead of silently overwriting.
+            if !seen.insert(rel.clone()) {
+                return Err(SemaError::eval(format!(
+                    "zip/extract: duplicate entry target {} — refusing to overwrite",
+                    rel.display()
+                )));
+            }
+            if let Some(parent) = target.parent() {
+                std::fs::create_dir_all(parent)
+                    .map_err(|e| SemaError::Io(format!("zip/extract {name}: {e}")))?;
+            }
+            let mut out = std::fs::File::create(&target)
+                .map_err(|e| SemaError::Io(format!("zip/extract {name}: {e}")))?;
+            std::io::copy(&mut entry, &mut out)
+                .map_err(|e| SemaError::Io(format!("zip/extract {name}: {e}")))?;
+        }
+        count += 1;
+    }
+    Ok(count)
+}
+
+/// `zip/list`'s actual work: read `zip_path`'s central directory entry names.
+/// Shared verbatim by the sync and offloaded-async paths.
+fn zip_list_work(zip_path: &str) -> Result<Vec<String>, SemaError> {
+    let file = std::fs::File::open(zip_path)
+        .map_err(|e| SemaError::Io(format!("zip/list {zip_path}: {e}")))?;
+    let mut archive = zip::ZipArchive::new(file)
+        .map_err(|e| SemaError::eval(format!("zip/list {zip_path}: {e}")))?;
+    let mut names = Vec::with_capacity(archive.len());
+    for i in 0..archive.len() {
+        let entry = archive
+            .by_index(i)
+            .map_err(|e| SemaError::eval(format!("zip/list: {e}")))?;
+        names.push(entry.name().to_string());
+    }
+    Ok(names)
+}
+
+/// Append `files` to `builder`, each stored under its basename; refuses a
+/// duplicate basename rather than silently shadowing earlier data. Used by
+/// both the gzip and plain writers in [`tar_create_work`], and — via that
+/// function — by the sync and offloaded-async paths of `tar/create`.
+fn tar_add_files<W: std::io::Write>(
+    builder: &mut tar::Builder<W>,
+    files: &[String],
+) -> Result<i64, SemaError> {
+    let mut count = 0i64;
+    let mut seen = std::collections::HashSet::new();
+    for src in files {
+        let name = Path::new(src)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .ok_or_else(|| SemaError::eval(format!("tar/create: bad file path {src}")))?;
+        if !seen.insert(name.to_string()) {
+            return Err(SemaError::eval(format!(
+                "tar/create: duplicate entry name {name:?} (from {src})"
+            )));
+        }
+        builder
+            .append_path_with_name(src, name)
+            .map_err(|e| SemaError::Io(format!("tar/create {src}: {e}")))?;
+        count += 1;
+    }
+    Ok(count)
+}
+
+/// `tar/create`'s actual work: build `out_path` from `files`, gzip-compressed
+/// if `out_path` looks gzip (see [`looks_gzip`]), else plain tar. Shared
+/// verbatim by the sync and offloaded-async paths.
+fn tar_create_work(out_path: &str, files: &[String]) -> Result<i64, SemaError> {
+    let out_file = std::fs::File::create(out_path)
+        .map_err(|e| SemaError::Io(format!("tar/create {out_path}: {e}")))?;
+
+    if looks_gzip(out_path) {
+        let encoder = flate2::write::GzEncoder::new(out_file, flate2::Compression::default());
+        let mut builder = tar::Builder::new(encoder);
+        let count = tar_add_files(&mut builder, files)?;
+        let encoder = builder
+            .into_inner()
+            .map_err(|e| SemaError::Io(format!("tar/create {out_path}: {e}")))?;
+        encoder
+            .finish()
+            .map_err(|e| SemaError::Io(format!("tar/create {out_path}: {e}")))?;
+        Ok(count)
+    } else {
+        let mut builder = tar::Builder::new(out_file);
+        let count = tar_add_files(&mut builder, files)?;
+        builder
+            .finish()
+            .map_err(|e| SemaError::Io(format!("tar/create {out_path}: {e}")))?;
+        Ok(count)
+    }
+}
+
+/// `tar/extract`'s actual work: unpack `tar_path` (gzip auto-detected by
+/// extension or magic bytes) into `dest_dir`. Shared verbatim by the sync and
+/// offloaded-async paths.
+fn tar_extract_work(tar_path: &str, dest_dir: &str) -> Result<i64, SemaError> {
+    let raw = std::fs::read(tar_path)
+        .map_err(|e| SemaError::Io(format!("tar/extract {tar_path}: {e}")))?;
+    // gzip magic: 0x1f 0x8b. Auto-detect by extension OR magic bytes.
+    let gzipped = looks_gzip(tar_path) || raw.starts_with(&[0x1f, 0x8b]);
+
+    let dest_root = Path::new(dest_dir);
+    std::fs::create_dir_all(dest_root)
+        .map_err(|e| SemaError::Io(format!("tar/extract {dest_dir}: {e}")))?;
+
+    // Decompress up front (if needed) so the rest is a single tar-reading path.
+    let tar_bytes: Vec<u8> = if gzipped {
+        let mut decoder = flate2::read::GzDecoder::new(&raw[..]);
+        let mut out = Vec::new();
+        decoder
+            .read_to_end(&mut out)
+            .map_err(|e| SemaError::eval(format!("tar/extract {tar_path}: {e}")))?;
+        out
+    } else {
+        raw
+    };
+
+    let mut archive = tar::Archive::new(&tar_bytes[..]);
+    let mut count = 0i64;
+    let mut seen: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+    for entry in archive
+        .entries()
+        .map_err(|e| SemaError::eval(format!("tar/extract {tar_path}: {e}")))?
+    {
+        let mut entry = entry.map_err(|e| SemaError::eval(format!("tar/extract: {e}")))?;
+        // Symlink/hardlink guard: a link entry (e.g. `evil -> /etc`) followed
+        // by a regular entry written *through* it (`evil/passwd`) escapes
+        // dest-dir even though neither path contains `..`. Refuse link
+        // entries entirely so no traversal symlink is ever materialized.
+        let etype = entry.header().entry_type();
+        if etype.is_symlink() || etype.is_hard_link() {
+            continue;
+        }
+        let path = entry
+            .path()
+            .map_err(|e| SemaError::eval(format!("tar/extract: {e}")))?;
+        let name = path.to_string_lossy().to_string();
+        // Traversal guard: skip entries that would escape dest-dir.
+        let rel = match safe_relative(&name) {
+            Some(r) => r,
+            None => continue,
+        };
+        let target = dest_root.join(&rel);
+        // Refuse a second entry mapping to the same file target (foreign
+        // archives bypass the create-side dedup); directories may recur.
+        if !entry.header().entry_type().is_dir() && !seen.insert(rel.clone()) {
+            return Err(SemaError::eval(format!(
+                "tar/extract: duplicate entry target {} — refusing to overwrite",
+                rel.display()
+            )));
+        }
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| SemaError::Io(format!("tar/extract {name}: {e}")))?;
+        }
+        entry
+            .unpack(&target)
+            .map_err(|e| SemaError::Io(format!("tar/extract {name}: {e}")))?;
+        count += 1;
+    }
+    Ok(count)
+}
+
+/// Extract a list of string paths out of a Sema list `Value`, for builtins
+/// that need the owned `Vec<String>` up front (both to validate before doing
+/// any work, and because the offloaded-async path needs `Send` owned data).
+fn string_list_arg(list: &[Value], fn_name: &str) -> Result<Vec<String>, SemaError> {
+    list.iter()
+        .map(|f| {
+            f.as_str()
+                .map(|s| s.to_string())
+                .ok_or_else(|| SemaError::type_error("string", f.type_name()))
+        })
+        .collect::<Result<Vec<String>, SemaError>>()
+        .map_err(|e| SemaError::eval(format!("{fn_name}: {e}")))
+}
+
 pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
     // (gzip/compress bytes-or-string) -> gzip-compressed bytevector. Pure.
     register_fn(env, "gzip/compress", |args| {
@@ -81,47 +351,22 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
         check_arity!(args, "zip/create", 2);
         let out_path = args[0]
             .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
-        let files = args[1]
-            .as_list()
-            .ok_or_else(|| SemaError::type_error("list", args[1].type_name()))?;
+            .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?
+            .to_string();
+        let files = string_list_arg(
+            args[1]
+                .as_list()
+                .ok_or_else(|| SemaError::type_error("list", args[1].type_name()))?,
+            "zip/create",
+        )?;
 
-        let file = std::fs::File::create(out_path)
-            .map_err(|e| SemaError::Io(format!("zip/create {out_path}: {e}")))?;
-        let mut writer = zip::ZipWriter::new(file);
-        let options: zip::write::FileOptions<()> =
-            zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Deflated);
-
-        let mut count = 0i64;
-        let mut seen = std::collections::HashSet::new();
-        for f in files {
-            let src = f
-                .as_str()
-                .ok_or_else(|| SemaError::type_error("string", f.type_name()))?;
-            let name = Path::new(src)
-                .file_name()
-                .and_then(|n| n.to_str())
-                .ok_or_else(|| SemaError::eval(format!("zip/create: bad file path {src}")))?;
-            // Entries are keyed by basename; a duplicate would shadow earlier
-            // data (most extractors keep the last). Refuse rather than lose it.
-            if !seen.insert(name.to_string()) {
-                return Err(SemaError::eval(format!(
-                    "zip/create: duplicate entry name {name:?} (from {src})"
-                )));
-            }
-            let data =
-                std::fs::read(src).map_err(|e| SemaError::Io(format!("zip/create {src}: {e}")))?;
-            writer
-                .start_file(name, options)
-                .map_err(|e| SemaError::eval(format!("zip/create: {e}")))?;
-            writer
-                .write_all(&data)
-                .map_err(|e| SemaError::Io(format!("zip/create {src}: {e}")))?;
-            count += 1;
+        if in_async_context() {
+            return crate::io::fs_offload(
+                move || zip_create_work(&out_path, &files).map_err(|e| e.to_string()),
+                Value::int,
+            );
         }
-        writer
-            .finish()
-            .map_err(|e| SemaError::eval(format!("zip/create: {e}")))?;
+        let count = zip_create_work(&out_path, &files)?;
         Ok(Value::int(count))
     });
 
@@ -130,57 +375,20 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
         check_arity!(args, "zip/extract", 2);
         let zip_path = args[0]
             .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
+            .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?
+            .to_string();
         let dest_dir = args[1]
             .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[1].type_name()))?;
+            .ok_or_else(|| SemaError::type_error("string", args[1].type_name()))?
+            .to_string();
 
-        let file = std::fs::File::open(zip_path)
-            .map_err(|e| SemaError::Io(format!("zip/extract {zip_path}: {e}")))?;
-        let mut archive = zip::ZipArchive::new(file)
-            .map_err(|e| SemaError::eval(format!("zip/extract {zip_path}: {e}")))?;
-
-        let dest_root = Path::new(dest_dir);
-        std::fs::create_dir_all(dest_root)
-            .map_err(|e| SemaError::Io(format!("zip/extract {dest_dir}: {e}")))?;
-
-        let mut count = 0i64;
-        let mut seen: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
-        for i in 0..archive.len() {
-            let mut entry = archive
-                .by_index(i)
-                .map_err(|e| SemaError::eval(format!("zip/extract: {e}")))?;
-            let name = entry.name().to_string();
-            // zip-slip guard: skip entries whose path would escape dest-dir.
-            let rel = match safe_relative(&name) {
-                Some(r) => r,
-                None => continue,
-            };
-            let target = dest_root.join(&rel);
-            if entry.is_dir() || name.ends_with('/') {
-                std::fs::create_dir_all(&target)
-                    .map_err(|e| SemaError::Io(format!("zip/extract {name}: {e}")))?;
-            } else {
-                // A foreign archive can carry two file entries that map to the
-                // same target; the create-side dedup doesn't protect extraction,
-                // so refuse the duplicate instead of silently overwriting.
-                if !seen.insert(rel.clone()) {
-                    return Err(SemaError::eval(format!(
-                        "zip/extract: duplicate entry target {} — refusing to overwrite",
-                        rel.display()
-                    )));
-                }
-                if let Some(parent) = target.parent() {
-                    std::fs::create_dir_all(parent)
-                        .map_err(|e| SemaError::Io(format!("zip/extract {name}: {e}")))?;
-                }
-                let mut out = std::fs::File::create(&target)
-                    .map_err(|e| SemaError::Io(format!("zip/extract {name}: {e}")))?;
-                std::io::copy(&mut entry, &mut out)
-                    .map_err(|e| SemaError::Io(format!("zip/extract {name}: {e}")))?;
-            }
-            count += 1;
+        if in_async_context() {
+            return crate::io::fs_offload(
+                move || zip_extract_work(&zip_path, &dest_dir).map_err(|e| e.to_string()),
+                Value::int,
+            );
         }
+        let count = zip_extract_work(&zip_path, &dest_dir)?;
         Ok(Value::int(count))
     });
 
@@ -189,19 +397,19 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
         check_arity!(args, "zip/list", 1);
         let zip_path = args[0]
             .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
-        let file = std::fs::File::open(zip_path)
-            .map_err(|e| SemaError::Io(format!("zip/list {zip_path}: {e}")))?;
-        let mut archive = zip::ZipArchive::new(file)
-            .map_err(|e| SemaError::eval(format!("zip/list {zip_path}: {e}")))?;
-        let mut names = Vec::with_capacity(archive.len());
-        for i in 0..archive.len() {
-            let entry = archive
-                .by_index(i)
-                .map_err(|e| SemaError::eval(format!("zip/list: {e}")))?;
-            names.push(Value::string(entry.name()));
+            .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?
+            .to_string();
+
+        if in_async_context() {
+            return crate::io::fs_offload(
+                move || zip_list_work(&zip_path).map_err(|e| e.to_string()),
+                |names: Vec<String>| Value::list(names.iter().map(|s| Value::string(s)).collect()),
+            );
         }
-        Ok(Value::list(names))
+        let names = zip_list_work(&zip_path)?;
+        Ok(Value::list(
+            names.iter().map(|s| Value::string(s)).collect(),
+        ))
     });
 
     // (tar/create out-path files) -> entry count. gzip-compressed if out-path
@@ -210,64 +418,22 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
         check_arity!(args, "tar/create", 2);
         let out_path = args[0]
             .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
-        let files = args[1]
-            .as_list()
-            .ok_or_else(|| SemaError::type_error("list", args[1].type_name()))?;
+            .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?
+            .to_string();
+        let files = string_list_arg(
+            args[1]
+                .as_list()
+                .ok_or_else(|| SemaError::type_error("list", args[1].type_name()))?,
+            "tar/create",
+        )?;
 
-        let out_file = std::fs::File::create(out_path)
-            .map_err(|e| SemaError::Io(format!("tar/create {out_path}: {e}")))?;
-
-        // Build into the appropriate writer; the count is gathered first so we
-        // can return it after finishing/flushing the underlying stream.
-        fn add_files<W: std::io::Write>(
-            builder: &mut tar::Builder<W>,
-            files: &[Value],
-        ) -> Result<i64, SemaError> {
-            let mut count = 0i64;
-            let mut seen = std::collections::HashSet::new();
-            for f in files {
-                let src = f
-                    .as_str()
-                    .ok_or_else(|| SemaError::type_error("string", f.type_name()))?;
-                let name = Path::new(src)
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .ok_or_else(|| SemaError::eval(format!("tar/create: bad file path {src}")))?;
-                // Files are stored under their basename; a duplicate basename
-                // would silently shadow earlier data. Refuse it rather than lose it.
-                if !seen.insert(name.to_string()) {
-                    return Err(SemaError::eval(format!(
-                        "tar/create: duplicate entry name {name:?} (from {src})"
-                    )));
-                }
-                builder
-                    .append_path_with_name(src, name)
-                    .map_err(|e| SemaError::Io(format!("tar/create {src}: {e}")))?;
-                count += 1;
-            }
-            Ok(count)
+        if in_async_context() {
+            return crate::io::fs_offload(
+                move || tar_create_work(&out_path, &files).map_err(|e| e.to_string()),
+                Value::int,
+            );
         }
-
-        let count = if looks_gzip(out_path) {
-            let encoder = flate2::write::GzEncoder::new(out_file, flate2::Compression::default());
-            let mut builder = tar::Builder::new(encoder);
-            let count = add_files(&mut builder, files)?;
-            let encoder = builder
-                .into_inner()
-                .map_err(|e| SemaError::Io(format!("tar/create {out_path}: {e}")))?;
-            encoder
-                .finish()
-                .map_err(|e| SemaError::Io(format!("tar/create {out_path}: {e}")))?;
-            count
-        } else {
-            let mut builder = tar::Builder::new(out_file);
-            let count = add_files(&mut builder, files)?;
-            builder
-                .finish()
-                .map_err(|e| SemaError::Io(format!("tar/create {out_path}: {e}")))?;
-            count
-        };
+        let count = tar_create_work(&out_path, &files)?;
         Ok(Value::int(count))
     });
 
@@ -277,75 +443,20 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
         check_arity!(args, "tar/extract", 2);
         let tar_path = args[0]
             .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
+            .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?
+            .to_string();
         let dest_dir = args[1]
             .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[1].type_name()))?;
+            .ok_or_else(|| SemaError::type_error("string", args[1].type_name()))?
+            .to_string();
 
-        let raw = std::fs::read(tar_path)
-            .map_err(|e| SemaError::Io(format!("tar/extract {tar_path}: {e}")))?;
-        // gzip magic: 0x1f 0x8b. Auto-detect by extension OR magic bytes.
-        let gzipped = looks_gzip(tar_path) || raw.starts_with(&[0x1f, 0x8b]);
-
-        let dest_root = Path::new(dest_dir);
-        std::fs::create_dir_all(dest_root)
-            .map_err(|e| SemaError::Io(format!("tar/extract {dest_dir}: {e}")))?;
-
-        // Decompress up front (if needed) so the rest is a single tar-reading path.
-        let tar_bytes: Vec<u8> = if gzipped {
-            let mut decoder = flate2::read::GzDecoder::new(&raw[..]);
-            let mut out = Vec::new();
-            decoder
-                .read_to_end(&mut out)
-                .map_err(|e| SemaError::eval(format!("tar/extract {tar_path}: {e}")))?;
-            out
-        } else {
-            raw
-        };
-
-        let mut archive = tar::Archive::new(&tar_bytes[..]);
-        let mut count = 0i64;
-        let mut seen: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
-        for entry in archive
-            .entries()
-            .map_err(|e| SemaError::eval(format!("tar/extract {tar_path}: {e}")))?
-        {
-            let mut entry = entry.map_err(|e| SemaError::eval(format!("tar/extract: {e}")))?;
-            // Symlink/hardlink guard: a link entry (e.g. `evil -> /etc`) followed
-            // by a regular entry written *through* it (`evil/passwd`) escapes
-            // dest-dir even though neither path contains `..`. Refuse link
-            // entries entirely so no traversal symlink is ever materialized.
-            let etype = entry.header().entry_type();
-            if etype.is_symlink() || etype.is_hard_link() {
-                continue;
-            }
-            let path = entry
-                .path()
-                .map_err(|e| SemaError::eval(format!("tar/extract: {e}")))?;
-            let name = path.to_string_lossy().to_string();
-            // Traversal guard: skip entries that would escape dest-dir.
-            let rel = match safe_relative(&name) {
-                Some(r) => r,
-                None => continue,
-            };
-            let target = dest_root.join(&rel);
-            // Refuse a second entry mapping to the same file target (foreign
-            // archives bypass the create-side dedup); directories may recur.
-            if !entry.header().entry_type().is_dir() && !seen.insert(rel.clone()) {
-                return Err(SemaError::eval(format!(
-                    "tar/extract: duplicate entry target {} — refusing to overwrite",
-                    rel.display()
-                )));
-            }
-            if let Some(parent) = target.parent() {
-                std::fs::create_dir_all(parent)
-                    .map_err(|e| SemaError::Io(format!("tar/extract {name}: {e}")))?;
-            }
-            entry
-                .unpack(&target)
-                .map_err(|e| SemaError::Io(format!("tar/extract {name}: {e}")))?;
-            count += 1;
+        if in_async_context() {
+            return crate::io::fs_offload(
+                move || tar_extract_work(&tar_path, &dest_dir).map_err(|e| e.to_string()),
+                Value::int,
+            );
         }
+        let count = tar_extract_work(&tar_path, &dest_dir)?;
         Ok(Value::int(count))
     });
 }

@@ -36,6 +36,23 @@ pub enum UpvalueState {
     Open { frame_base: usize, slot: usize },
     /// Owns the value after the defining frame has exited.
     Closed(Value),
+    /// Detached from a foreign VM's stack — the cell owns its `value`, so it is
+    /// safe to read/write on ANY VM stack (C1: it no longer indexes the owning
+    /// VM's stack) — yet the defining frame is STILL LIVE and still tracks this
+    /// slot in its `open_upvalues`. A closure that escapes onto a foreign stack
+    /// (an `async/spawn` task VM, a fresh fallback VM, an inline-task HOF)
+    /// transitions its still-`Open` cells here instead of fully `Closed`ing them,
+    /// so the defining frame's later `StoreLocal`/`StoreUpvalue` writes continue
+    /// to flow into `value` (see the STORE_LOCAL / STORE_UPVALUE dispatch arms).
+    /// This preserves capture-by-cell semantics across the spawn boundary. The
+    /// frame promotes it to a real `Closed` (with the final `value`) when it
+    /// exits (`close_open_upvalues`). `frame_base`/`slot` are retained for
+    /// symmetry with `Open` and to identify the tracking frame slot.
+    Tracked {
+        frame_base: usize,
+        slot: usize,
+        value: Value,
+    },
 }
 
 /// A mutable cell for captured variables (upvalues).
@@ -298,8 +315,13 @@ fn trace_upvalue_cell(ptr: sema_core::NodePtr, sink: &mut dyn FnMut(sema_core::G
     let cell = unsafe { &*(ptr.raw() as *const UpvalueCell) };
     match cell.state.try_borrow() {
         Ok(state) => {
-            if let UpvalueState::Closed(v) = &*state {
-                sink(sema_core::GcEdge::Value(v));
+            // `Closed` and `Tracked` both OWN a `Value` reachable only through
+            // the cell — trace it so the collector keeps it alive. `Open` owns
+            // nothing (its slot lives on a VM stack, an external strong count).
+            match &*state {
+                UpvalueState::Closed(v) => sink(sema_core::GcEdge::Value(v)),
+                UpvalueState::Tracked { value, .. } => sink(sema_core::GcEdge::Value(value)),
+                UpvalueState::Open { .. } => {}
             }
             true
         }
@@ -307,14 +329,20 @@ fn trace_upvalue_cell(ptr: sema_core::NodePtr, sink: &mut dyn FnMut(sema_core::G
     }
 }
 
-/// Sever a white upvalue cell: `Closed(v)` → `Closed(NIL)`, returning `v` so
-/// the collector defers its drop until all severing has completed.
+/// Sever a white upvalue cell: a value-owning state (`Closed(v)`/`Tracked{value:v}`)
+/// → `Closed(NIL)`, returning `v` so the collector defers its drop until all
+/// severing has completed. `Open` owns nothing, so it yields `None`.
 fn sever_upvalue_cell(ptr: sema_core::NodePtr) -> Option<Value> {
     // SAFETY: live `Rc<UpvalueCell>` data pointer — see trace_vm_closure_payload.
     let cell = unsafe { &*(ptr.raw() as *const UpvalueCell) };
     match cell.state.try_borrow_mut() {
         Ok(mut state) => match std::mem::replace(&mut *state, UpvalueState::Closed(Value::NIL)) {
             UpvalueState::Closed(v) => Some(v),
+            // A `Tracked` cell owns its value like `Closed`; hand it to the
+            // collector for deferred drop. (Defensive: a tracked cell is kept
+            // black by its live frame's `open_upvalues`, so it should never be
+            // reached as white/severable.)
+            UpvalueState::Tracked { value, .. } => Some(value),
             UpvalueState::Open { .. } => None,
         },
         Err(_) => {
@@ -769,19 +797,27 @@ pub fn with_active_debug<R>(f: impl FnOnce(&mut crate::debug::DebugState) -> R) 
     Some(f(debug))
 }
 
-/// Close `closure`'s still-open upvalue cells against the VM(s) currently
-/// running a native call on this thread, snapshotting their values from the
-/// owning VM's live stack.
+/// Detach `closure`'s still-open upvalue cells from the stack of the VM(s)
+/// currently running a native call on this thread, giving each cell an owned
+/// value read from that owning VM's live stack.
 ///
 /// MUST be called before a VM closure is dispatched onto a *foreign* stack — a
 /// fresh fallback VM, or an async task VM created by `spawn` /
 /// `run_closure_as_inline_task`. An Open cell holds `{ frame_base, slot }`
 /// indices into the VM that created it; reading it on a different VM's stack is
-/// out-of-bounds. Snapshotting here (while the owning VM is paused at its native
-/// call) detaches the cells safely.
+/// out-of-bounds. Detaching here (while the owning VM is paused at its native
+/// call) makes the cells safe to read on the foreign stack (C1).
 ///
-/// A no-op for cells that are already Closed or whose owning frame is no longer
-/// on any registered VM's stack.
+/// A detached cell becomes `Tracked` — NOT fully `Closed` — while its defining
+/// frame is still live, and its `open_upvalues` entry is deliberately KEPT: the
+/// frame's later `StoreLocal`/`StoreUpvalue` writes propagate into the tracked
+/// value (so a task observes post-spawn mutations of a captured local, issue
+/// #104), and the frame promotes it to a real `Closed` when it exits
+/// (`close_open_upvalues`). This preserves capture-by-cell semantics across the
+/// spawn boundary without ever letting a cell dangle onto a foreign stack.
+///
+/// A no-op for cells that are already Closed/Tracked or whose owning frame is no
+/// longer on any registered VM's stack.
 pub fn close_closure_upvalues_for_foreign_run(closure: &Closure) {
     // Snapshot the registered VM pointers, then operate through them. The
     // pointers are valid for the duration of this call (see CURRENT_VM docs).
@@ -791,26 +827,31 @@ pub fn close_closure_upvalues_for_foreign_run(closure: &Closure) {
             let state = cell.state.borrow();
             match &*state {
                 UpvalueState::Open { frame_base, slot } => (*frame_base, *slot),
-                UpvalueState::Closed(_) => continue,
+                // Already detached (owns its value, safe on any stack).
+                UpvalueState::Closed(_) | UpvalueState::Tracked { .. } => continue,
             }
         };
         // Find the registered VM that owns this cell (its frame is on that
         // VM's stack). Walk most-recent first.
         for &ptr in ptrs.iter().rev() {
             // SAFETY: pointer registered by a live CurrentVmGuard on the Rust
-            // stack; the owning VM is paused and not otherwise borrowed.
-            let vm = unsafe { &mut *ptr };
+            // stack; the owning VM is paused and not otherwise borrowed. We only
+            // read its stack here (no frame mutation), so a shared ref suffices.
+            let vm = unsafe { &*ptr };
             if frame_base + slot < vm.stack.len() && vm.frames.iter().any(|f| f.base == frame_base)
             {
                 let value = vm.stack[frame_base + slot].clone();
-                *cell.state.borrow_mut() = UpvalueState::Closed(value);
-                if let Some(frame) = vm.frames.iter_mut().find(|f| f.base == frame_base) {
-                    if let Some(open) = frame.open_upvalues.as_mut() {
-                        if let Some(entry) = open.get_mut(slot) {
-                            *entry = None;
-                        }
-                    }
-                }
+                // Tracked, not Closed: keep the cell bound to the still-live
+                // defining frame so post-spawn `StoreLocal`/`StoreUpvalue`
+                // writes keep flowing into it (issue #104). The frame's
+                // `open_upvalues[slot]` entry is intentionally left in place
+                // (do NOT clear it) so those stores can find the cell and the
+                // frame closes it for real on exit.
+                *cell.state.borrow_mut() = UpvalueState::Tracked {
+                    frame_base,
+                    slot,
+                    value,
+                };
                 break;
             }
         }
@@ -847,12 +888,23 @@ fn check_literal_map_keys(items: &[Value]) -> Result<(), SemaError> {
 }
 
 /// Close all open upvalues in the given open_upvalues vec, reading from the stack.
+///
+/// `Open` cells are closed with the current stack value. A `Tracked` cell
+/// (detached-but-live: its defining frame — this one — is exiting) is finalized
+/// with its OWN `value`, which already reflects the latest parent `StoreLocal`
+/// and task `StoreUpvalue` writes (its stack slot only saw the parent writes),
+/// so the tracked value is the authoritative final value.
 fn close_open_upvalues(open: &mut [Option<Rc<UpvalueCell>>], stack: &[Value], base: usize) {
     for (slot, maybe_cell) in open.iter_mut().enumerate() {
         if let Some(cell) = maybe_cell {
             let mut state = cell.state.borrow_mut();
-            if matches!(&*state, UpvalueState::Open { .. }) {
-                *state = UpvalueState::Closed(stack[base + slot].clone());
+            let closed = match &mut *state {
+                UpvalueState::Open { .. } => Some(stack[base + slot].clone()),
+                UpvalueState::Tracked { value, .. } => Some(std::mem::replace(value, Value::nil())),
+                UpvalueState::Closed(_) => None,
+            };
+            if let Some(v) = closed {
+                *state = UpvalueState::Closed(v);
             }
         }
         *maybe_cell = None;
@@ -870,8 +922,17 @@ fn close_open_upvalues_above(
         if slot >= min_slot {
             if let Some(cell) = maybe_cell {
                 let mut state = cell.state.borrow_mut();
-                if matches!(&*state, UpvalueState::Open { .. }) {
-                    *state = UpvalueState::Closed(stack[base + slot].clone());
+                // Mirror `close_open_upvalues`: `Open` closes from the stack, a
+                // detached-but-live `Tracked` finalizes with its own value.
+                let closed = match &mut *state {
+                    UpvalueState::Open { .. } => Some(stack[base + slot].clone()),
+                    UpvalueState::Tracked { value, .. } => {
+                        Some(std::mem::replace(value, Value::nil()))
+                    }
+                    UpvalueState::Closed(_) => None,
+                };
+                if let Some(v) = closed {
+                    *state = UpvalueState::Closed(v);
                 }
             }
             *maybe_cell = None;
@@ -2046,6 +2107,7 @@ impl VM {
                     op::STORE_LOCAL => {
                         let slot = read_u16!(code, pc) as usize;
                         let val = unsafe { pop_unchecked(&mut self.stack) };
+                        self.propagate_local_store_to_tracked(fi, slot, &val);
                         self.stack[base + slot] = val;
                     }
 
@@ -2056,6 +2118,9 @@ impl VM {
                             let state = self.frames[fi].closure.upvalues[idx].state.borrow();
                             match &*state {
                                 UpvalueState::Closed(v) => Ok(v.clone()),
+                                // Detached-but-live: read the owned value — safe
+                                // on any VM stack (it no longer indexes a stack).
+                                UpvalueState::Tracked { value, .. } => Ok(value.clone()),
                                 UpvalueState::Open { frame_base, slot } => Err(*frame_base + *slot),
                             }
                         };
@@ -2086,6 +2151,12 @@ impl VM {
                             match &mut *state {
                                 UpvalueState::Closed(v) => {
                                     *v = val;
+                                    None
+                                }
+                                // Detached-but-live: write the owned value in
+                                // place — no stack slot to touch on this VM.
+                                UpvalueState::Tracked { value, .. } => {
+                                    *value = val;
                                     None
                                 }
                                 UpvalueState::Open { frame_base, slot } => {
@@ -2826,18 +2897,22 @@ impl VM {
 
                     op::STORE_LOCAL0 => {
                         let val = unsafe { pop_unchecked(&mut self.stack) };
+                        self.propagate_local_store_to_tracked(fi, 0, &val);
                         self.stack[base] = val;
                     }
                     op::STORE_LOCAL1 => {
                         let val = unsafe { pop_unchecked(&mut self.stack) };
+                        self.propagate_local_store_to_tracked(fi, 1, &val);
                         self.stack[base + 1] = val;
                     }
                     op::STORE_LOCAL2 => {
                         let val = unsafe { pop_unchecked(&mut self.stack) };
+                        self.propagate_local_store_to_tracked(fi, 2, &val);
                         self.stack[base + 2] = val;
                     }
                     op::STORE_LOCAL3 => {
                         let val = unsafe { pop_unchecked(&mut self.stack) };
+                        self.propagate_local_store_to_tracked(fi, 3, &val);
                         self.stack[base + 3] = val;
                     }
 
@@ -3649,6 +3724,27 @@ impl VM {
         }
     }
 
+    /// Mirror a captured local's write into a detached-but-live `Tracked`
+    /// upvalue cell (issue #104). When a closure escaped this frame onto a
+    /// foreign stack (an `async/spawn` task, a fresh fallback VM, an inline-task
+    /// HOF), `close_closure_upvalues_for_foreign_run` detached the shared cell
+    /// to `Tracked` but left it registered in this frame's `open_upvalues`; the
+    /// cell no longer reads this stack slot, so a plain stack write would be
+    /// invisible to the task. Propagate the write into the cell's owned value so
+    /// the task observes post-spawn mutations. Cheap no-op for the common cases:
+    /// non-capturing frames (`open_upvalues == None`), uncaptured slots, and
+    /// ordinary `Open`/`Closed` cells.
+    #[inline]
+    fn propagate_local_store_to_tracked(&self, fi: usize, slot: usize, val: &Value) {
+        if let Some(open) = &self.frames[fi].open_upvalues {
+            if let Some(Some(cell)) = open.get(slot) {
+                if let UpvalueState::Tracked { value, .. } = &mut *cell.state.borrow_mut() {
+                    *value = val.clone();
+                }
+            }
+        }
+    }
+
     // --- MakeClosure ---
 
     fn make_closure(&mut self) -> Result<(), SemaError> {
@@ -4087,6 +4183,7 @@ impl VM {
             .map(|(i, uv)| {
                 let val = match &*uv.state.borrow() {
                     UpvalueState::Closed(v) => v.clone(),
+                    UpvalueState::Tracked { value, .. } => value.clone(),
                     UpvalueState::Open { frame_base, slot } => {
                         self.stack[*frame_base + *slot].clone()
                     }
@@ -4356,6 +4453,7 @@ impl VM {
     fn debug_upvalue_value(&self, upvalue: &UpvalueCell) -> Value {
         match &*upvalue.state.borrow() {
             UpvalueState::Closed(value) => value.clone(),
+            UpvalueState::Tracked { value, .. } => value.clone(),
             UpvalueState::Open { frame_base, slot } => self
                 .stack
                 .get(*frame_base + *slot)
@@ -4443,6 +4541,12 @@ impl VM {
             match &mut *state {
                 UpvalueState::Closed(slot_value) => {
                     *slot_value = value.clone();
+                }
+                UpvalueState::Tracked {
+                    value: tracked_value,
+                    ..
+                } => {
+                    *tracked_value = value.clone();
                 }
                 UpvalueState::Open { frame_base, slot } => {
                     let Some(slot_value) = self.stack.get_mut(*frame_base + *slot) else {

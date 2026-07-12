@@ -1305,6 +1305,107 @@ fn parallel_and_pipeline_handle_empty_and_zero_stages() {
     );
 }
 
+// === Regression #104: async/spawn keeps captured locals live across the spawn boundary ===
+//
+// `async/spawn` runs the task on a dedicated task VM whose stack differs from the
+// spawning VM's, so a still-open upvalue cell (which indexes the spawning VM's
+// stack) must be detached before the task can read it (C1: cells must not dangle
+// on a foreign stack). The detach used to snapshot the cell by VALUE at spawn time
+// and sever it from the defining frame's slot, so a `set!` to the captured local
+// that ran AFTER the spawn but BEFORE the task first read it was lost — the task
+// saw the stale spawn-time value. The fix keeps the detached cell TRACKED to the
+// still-live defining frame so later `StoreLocal` writes flow into it.
+#[test]
+fn spawn_observes_set_of_captured_local_after_spawn() {
+    // The `set! x 42` runs before the task body ever reads `x` (the task only
+    // advances when `await` drives the scheduler), so the task must observe 42.
+    assert_eq!(
+        eval(
+            r#"(define (demo)
+                 (define x nil)
+                 (define p (async/spawn (fn () (async/sleep 5) x)))
+                 (set! x 42)
+                 (await p))
+               (demo)"#
+        ),
+        Value::int(42)
+    );
+}
+
+// Control: the SAME capture + `set!` shape WITHOUT a spawn shares the cell
+// correctly (plain C1 open-upvalue semantics). Kept alongside the spawn case so a
+// regression that breaks the non-spawn path is distinguishable from a spawn-only
+// regression.
+#[test]
+fn no_spawn_observes_set_of_captured_local() {
+    assert_eq!(
+        eval(
+            r#"(define (demo)
+                 (define x nil)
+                 (define f (fn () x))
+                 (set! x 42)
+                 (f))
+               (demo)"#
+        ),
+        Value::int(42)
+    );
+}
+
+// Multiple post-spawn mutations before the task reads: the task must observe the
+// LAST write, not the spawn-time snapshot nor an intermediate value.
+#[test]
+fn spawn_observes_latest_of_several_post_spawn_writes() {
+    assert_eq!(
+        eval(
+            r#"(define (demo)
+                 (define x 0)
+                 (define p (async/spawn (fn () (async/sleep 5) x)))
+                 (set! x 1)
+                 (set! x 2)
+                 (set! x 99)
+                 (await p))
+               (demo)"#
+        ),
+        Value::int(99)
+    );
+}
+
+// Two tasks sharing the same captured local both observe the post-spawn write,
+// and the deduplicated shared cell stays consistent across both task VMs.
+#[test]
+fn two_spawns_share_captured_local_after_set() {
+    assert_eq!(
+        eval(
+            r#"(define (demo)
+                 (define x 0)
+                 (define p (async/spawn (fn () (async/sleep 5) x)))
+                 (define q (async/spawn (fn () (async/sleep 5) x)))
+                 (set! x 7)
+                 (+ (await p) (await q)))
+               (demo)"#
+        ),
+        Value::int(14)
+    );
+}
+
+// The value captured after a post-spawn `set!` must be usable as a heap value
+// (string), exercising that the tracked cell owns its value across the boundary
+// (GC-reachability of the tracked value, not just an immediate int).
+#[test]
+fn spawn_observes_post_spawn_heap_value() {
+    assert_eq!(
+        eval(
+            r#"(define (demo)
+                 (define s "before")
+                 (define p (async/spawn (fn () (async/sleep 5) s)))
+                 (set! s "after")
+                 (await p))
+               (demo)"#
+        ),
+        Value::string("after")
+    );
+}
+
 // === event/select and io/read-key-timeout yield in async context (#88) ===
 
 // event/select must NOT block the cooperative scheduler thread while it waits.

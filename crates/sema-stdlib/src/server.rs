@@ -1283,6 +1283,34 @@ fn register_serve(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
 fn http_serve_impl(ctx: &sema_core::EvalContext, args: &[Value]) -> Result<Value, SemaError> {
     use sema_core::call_callback;
 
+    // `http/serve` below runs its own blocking accept loop on THIS thread
+    // (`rx.blocking_recv()` in the dispatch loop) for the life of the server —
+    // by design at top level, where it's the only thing this thread will ever
+    // do again. Inside `async/spawn` that thread IS the VM thread the
+    // cooperative scheduler drives every task on, so the loop would never
+    // return control to the scheduler: every sibling task, and every future
+    // poll of anything else, freezes forever with no error, no log, nothing
+    // to debug. A full non-blocking rearchitecture (yield-aware dispatch +
+    // per-connection handler tasks) is real design work, deliberately
+    // deferred (see docs/deferred.md); until then, fail fast and loud instead
+    // of hanging silently.
+    if sema_core::in_async_context() {
+        // The core message alone must carry enough to explain the failure: a
+        // task's rejection is flattened to a plain string when it crosses the
+        // promise boundary (`format!("{e}")` in the scheduler), so the hint
+        // below is only guaranteed to survive for an UNCAUGHT top-level call
+        // (no async/spawn) — the CLI's error reporter prints `.hint()`
+        // separately. `async/await`ing a rejected task only sees this message.
+        return Err(SemaError::eval(
+            "http/serve runs a blocking accept loop; it cannot be started inside async/spawn or \
+             another async context — start it from the top level instead",
+        )
+        .with_hint(
+            "async http/serve (concurrent, non-blocking connection handling) is tracked as \
+             deferred work — see docs/deferred.md",
+        ));
+    }
+
     if args.is_empty() || args.len() > 2 {
         return Err(SemaError::arity("http/serve", "1-2", args.len()));
     }
@@ -1414,7 +1442,22 @@ fn http_serve_impl(ctx: &sema_core::EvalContext, args: &[Value]) -> Result<Value
         }
     }
 
-    // Main evaluator loop: read requests from channel, call handler, send response
+    // Main evaluator loop: read requests from channel, call handler, send response.
+    //
+    // Single-consumer by construction: every connection (HTTP or WebSocket)
+    // funnels through this one `rx`, and this loop handles ONE `ServerRequest`
+    // at a time on the evaluator thread before looping back to `blocking_recv`
+    // for the next. A WebSocket handler's `(:recv conn)` (`ws/recv` above,
+    // `blocking_recv` on its own per-connection channel) only ever gets called
+    // from inside `call_callback` below — so a WS handler idling in `ws/recv`
+    // waiting on its client keeps this loop from picking up the NEXT request
+    // (HTTP or WS) until that client sends something or disconnects. axum
+    // itself is fully concurrent (each connection gets its own task and can
+    // queue on the bounded `tx`), but the single evaluator thread draining
+    // that queue serially is the actual concurrency ceiling. Fixing this needs
+    // a yield-aware dispatch loop with a handler task per connection —
+    // deliberately not attempted here (see docs/deferred.md); this comment
+    // documents the limitation, not a bug to chase.
     while let Some(req) = rx.blocking_recv() {
         match req {
             ServerRequest::Http { raw, respond } => {
@@ -1497,6 +1540,49 @@ mod tests {
         rt.block_on(async {
             let _ = tx.blocking_send("x".to_string());
         });
+    }
+
+    // WP-SERVE-GUARD: `http/serve` must fail fast — not bind a port, not spawn
+    // the axum future, not touch `rx.blocking_recv()` — the instant it's
+    // called from inside an async context, since that blocking accept loop
+    // would otherwise freeze the cooperative scheduler forever with no error.
+    // Exercises `http_serve_impl` directly under a forced `in_async_context()`
+    // so the returned `SemaError` (and its `.hint()`) can be inspected before
+    // a task's promise rejection flattens it to a plain string (see the
+    // comment at the guard's call site) — a plain `Interpreter::eval` test
+    // going through `async/spawn`/`async/await` could only see the flattened
+    // message, not the hint.
+    #[test]
+    fn http_serve_errors_immediately_in_async_context() {
+        // Thread-local; reset unconditionally (including on panic) so this
+        // test can't leak `in_async_context() == true` into whichever test
+        // the harness runs next on the same worker thread.
+        struct ResetAsyncContext;
+        impl Drop for ResetAsyncContext {
+            fn drop(&mut self) {
+                sema_core::set_async_context(false);
+            }
+        }
+        let _reset = ResetAsyncContext;
+        sema_core::set_async_context(true);
+
+        let ctx = sema_core::EvalContext::new();
+        let result = http_serve_impl(&ctx, &[]);
+
+        let err = result.expect_err(
+            "http/serve must return Err immediately in async context, not attempt to bind/serve",
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("async/spawn") && msg.to_lowercase().contains("top level"),
+            "error message should name async/spawn and point at the top level, got: {msg}"
+        );
+        assert_eq!(
+            err.hint().map(|h| h.contains("deferred.md")),
+            Some(true),
+            "error hint should point at docs/deferred.md, got hint: {:?}",
+            err.hint()
+        );
     }
 
     #[test]

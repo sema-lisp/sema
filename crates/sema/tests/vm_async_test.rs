@@ -1304,3 +1304,85 @@ fn parallel_and_pipeline_handle_empty_and_zero_stages() {
         common::eval(r#"'(1 2 3)"#)
     );
 }
+
+// === event/select and io/read-key-timeout yield in async context (#88) ===
+
+// event/select must NOT block the cooperative scheduler thread while it waits.
+// A task that `event/select`s on a source that never fires (a bogus :proc handle)
+// with an 80ms timeout is spawned FIRST; a sibling task that only sends a marker
+// is spawned second. If event/select blocked the OS thread for the whole timeout,
+// the sibling could not run until the select returned, so the select's marker
+// (:select-done) would reach the log channel FIRST. Because it yields, the sibling
+// runs to completion the instant the select parks — so :sibling-ran lands first.
+// This ordering is deterministic (the sibling does no I/O and no sleep, so it
+// finishes immediately once scheduled), which is exactly what distinguishes a
+// cooperative yield from a blocking wait.
+#[test]
+fn event_select_yields_to_sibling_in_async_context() {
+    let out = eval(
+        r#"
+        (let ((log (channel/new 4)))
+          (async/all
+            (list
+              (async
+                (event/select (list {:type :proc :handle 999999}) 80)
+                (channel/send log :select-done))
+              (async
+                (channel/send log :sibling-ran))))
+          (list (channel/recv log) (channel/recv log)))
+    "#,
+    );
+    assert_eq!(
+        out,
+        Value::list(vec![
+            Value::keyword("sibling-ran"),
+            Value::keyword("select-done"),
+        ]),
+        "event/select must yield so the sibling runs before the select's timeout resolves"
+    );
+}
+
+// event/select with no ready source still returns nil on timeout from within an
+// async context (the cooperative path must preserve the sync return semantics).
+#[test]
+fn event_select_times_out_to_nil_in_async_context() {
+    assert_eq!(
+        eval(r#"(await (async (event/select (list {:type :proc :handle 999999}) 20)))"#),
+        Value::nil()
+    );
+}
+
+// io/read-key-timeout: without a TTY we cannot deterministically feed a keystroke
+// nor force a clean idle timeout (a non-TTY stdin is often at EOF, which the first
+// poll resolves to nil immediately). So this does NOT prove the yield-during-wait
+// behavior — the event/select test above is the deterministic cooperative-yield
+// oracle. What it DOES prove: the async-context branch is wired up, returns
+// (nil on timeout/EOF, or a key), and neither panics nor deadlocks the scheduler
+// while a co-scheduled sibling task also runs to completion. Unix-only because
+// io/read-key-timeout is registered only on Unix.
+#[cfg(unix)]
+#[test]
+fn read_key_timeout_async_branch_completes_with_sibling() {
+    let out = eval(
+        r#"
+        (let ((log (channel/new 4)))
+          (async/all
+            (list
+              (async
+                (io/read-key-timeout 20)
+                (channel/send log :key-done))
+              (async
+                (channel/send log :sibling-ran))))
+          ;; Drain both markers as a set; ordering is NOT asserted (it depends on
+          ;; whether stdin is at EOF, which varies by test environment).
+          (let ((a (channel/recv log)) (b (channel/recv log)))
+            (list (or (= a :key-done) (= b :key-done))
+                  (or (= a :sibling-ran) (= b :sibling-ran)))))
+    "#,
+    );
+    assert_eq!(
+        out,
+        Value::list(vec![Value::bool(true), Value::bool(true)]),
+        "both the read-key-timeout task and its sibling must complete without deadlock"
+    );
+}

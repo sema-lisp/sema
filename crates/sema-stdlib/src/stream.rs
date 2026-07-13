@@ -27,8 +27,9 @@
 //! deadlocking against it) — that combination falls through to the existing
 //! synchronous loop even inside async context: still correct, just a narrow,
 //! documented blocking window for that one call. A copy with exactly one
-//! file-backed side checks out only that side; the memory/stdio side is
-//! read/written on the VM thread (fast, no I/O).
+//! file-backed side checks out only that side; an in-memory counterpart is
+//! read/written on the VM thread (fast, no real I/O), while a *stdin* source is
+//! offloaded to a worker (it can block waiting on real input).
 //!
 //! At top level (no scheduler) every builtin keeps today's synchronous shape
 //! byte-for-byte.
@@ -876,7 +877,29 @@ mod io_streams {
         stream: &Rc<StreamBox>,
         n: usize,
     ) -> Result<Option<Value>, SemaError> {
-        if !in_async_context() || stream.stream_type() != "file-input" {
+        if !in_async_context() {
+            return Ok(None);
+        }
+        // *stdin* does real, potentially-blocking I/O (unlike in-memory byte
+        // streams): offload the read so a waiting-for-input read can't stall the
+        // cooperative scheduler. stdin is process-global and stateless, so we
+        // read it directly on the worker instead of checking out the (VM-thread-
+        // bound) stream box.
+        if stream.stream_type() == "stdin" {
+            let v = crate::io::fs_offload(
+                move || {
+                    let mut buf = vec![0u8; n];
+                    let read = std::io::stdin()
+                        .read(&mut buf)
+                        .map_err(|e| render(format!("stream/read: stdin: {e}")))?;
+                    buf.truncate(read);
+                    Ok(buf)
+                },
+                |bytes: Vec<u8>| Value::bytevector(bytes),
+            )?;
+            return Ok(Some(v));
+        }
+        if stream.stream_type() != "file-input" {
             return Ok(None);
         }
         if stream.is_closed() {
@@ -906,7 +929,36 @@ mod io_streams {
     pub(super) fn maybe_async_read_line(
         stream: &Rc<StreamBox>,
     ) -> Result<Option<Value>, SemaError> {
-        if !in_async_context() || stream.stream_type() != "file-input" {
+        if !in_async_context() {
+            return Ok(None);
+        }
+        // *stdin* — see maybe_async_read: offload the blocking line read.
+        if stream.stream_type() == "stdin" {
+            let v = crate::io::fs_offload(
+                move || {
+                    let mut line = String::new();
+                    let n = std::io::stdin()
+                        .read_line(&mut line)
+                        .map_err(|e| render(format!("stream/read-line: stdin: {e}")))?;
+                    if n == 0 {
+                        return Ok(None); // EOF, nothing read at all
+                    }
+                    if line.ends_with('\n') {
+                        line.pop();
+                        if line.ends_with('\r') {
+                            line.pop();
+                        }
+                    }
+                    Ok(Some(line))
+                },
+                |line: Option<String>| match line {
+                    None => Value::nil(),
+                    Some(s) => Value::string(&s),
+                },
+            )?;
+            return Ok(Some(v));
+        }
+        if stream.stream_type() != "file-input" {
             return Ok(None);
         }
         if stream.is_closed() {
@@ -1097,8 +1149,46 @@ mod io_streams {
             return Ok(Some(v));
         }
 
-        // dst_file: src is memory/stdio. Read everything from src NOW (fast,
-        // sync, on the VM thread — never real I/O), then offload the write.
+        // dst_file: src is an in-memory or *stdin* source.
+        //
+        // *stdin* does real, potentially-blocking I/O, so read AND write run on
+        // the worker: check out the file writer and stream stdin straight into it
+        // there. Keeps `(stream/copy *stdin* file-out)` from stalling the
+        // cooperative scheduler while it waits on input.
+        if src.stream_type() == "stdin" {
+            let s1 = dst.clone();
+            let s2 = dst.clone();
+            let s3 = dst.clone();
+            let v = checkout_offload(
+                "stream/copy",
+                move || try_checkout_output(&s1, "stream/write"),
+                move |w| reinstall_output(&s2, w),
+                move |msg| tombstone_output(&s3, msg),
+                move |writer: &mut BufWriter<std::fs::File>| -> Result<usize, String> {
+                    let mut stdin = std::io::stdin();
+                    let mut chunk = [0u8; 8192];
+                    let mut total = 0usize;
+                    loop {
+                        let n = stdin
+                            .read(&mut chunk)
+                            .map_err(|e| render(format!("stream/copy: stdin: {e}")))?;
+                        if n == 0 {
+                            break;
+                        }
+                        writer
+                            .write_all(&chunk[..n])
+                            .map_err(|e| render(format!("stream/copy: I/O error: {e}")))?;
+                        total += n;
+                    }
+                    Ok(total)
+                },
+                move |total: usize| -> Result<Value, SemaError> { Ok(Value::int(total as i64)) },
+            )?;
+            return Ok(Some(v));
+        }
+
+        // In-memory source: reading is a fast in-process copy (no real I/O), so
+        // do it on the VM thread now, then offload the file write.
         let mut buf = Vec::new();
         let mut chunk = [0u8; 8192];
         loop {

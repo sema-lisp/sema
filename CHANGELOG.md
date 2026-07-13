@@ -112,6 +112,23 @@
 
 ### Fixed
 
+- **OpenAI `reasoning_effort` compat is smarter and no longer over-broad.**
+  gpt-5.6+ reject a non-`none` `reasoning_effort` alongside function tools on
+  `/chat/completions` ("use /v1/responses or set reasoning_effort to 'none'");
+  the self-heal that learns this (`FORCE_EFFORT_NONE`) now pins effort to `none`
+  **only when tools are present**, so a tool-free call to the same model keeps
+  the caller's effort instead of being silently downgraded. Reasoning models
+  (gpt-5 series / o-series) now drop a custom `temperature` **proactively**
+  (no doomed first request), an unsupported effort **value** (`minimal`/`max`
+  on gpt-5.6) is clamped to the nearest accepted tier by reading the "Supported
+  values are: …" list out of the 400, and the temperature / effort-tools /
+  effort-value backstops now **chain** through one bounded retry loop so a
+  request tripping several at once recovers in a single turn.
+- **`stream/copy`, `stream/read`, and `stream/read-line` on `*stdin*` no longer
+  block the async scheduler.** Inside `async`, a blocking stdin read is now
+  offloaded to a worker (matching the file-backed path) instead of running
+  synchronously on the VM thread, so a `(stream/copy *stdin* out)` can't stall
+  cooperative scheduling while it waits on input.
 - **Installed `sema web` builds now contain their browser runtime.** The
   crates.io package, GitHub release archives, shell installer, and Homebrew
   formula embed the WASM VM and JavaScript runtime and work offline. Version

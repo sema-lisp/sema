@@ -1,5 +1,5 @@
 use std::cell::RefCell;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
@@ -19,12 +19,23 @@ thread_local! {
     /// Models that reject a non-`none` `reasoning_effort` when function tools are
     /// present on `/chat/completions` (gpt-5.6 and newer: "Function tools with
     /// reasoning_effort are not supported … use /v1/responses or set
-    /// reasoning_effort to 'none'"). Learned at runtime from that 400, after
-    /// which we pin `reasoning_effort` to `none` for the model so a tool-using
-    /// agent keeps working. Reasoning + tools *and* a higher effort needs the
-    /// Responses API, which this provider does not yet speak.
+    /// reasoning_effort to 'none'"). Learned at runtime from that 400. Kept
+    /// REACTIVE rather than proactive-per-family because some reasoning models
+    /// (e.g. gpt-5.1) DO accept tools+effort — forcing `none` for every reasoning
+    /// model would needlessly disable their reasoning.
     static FORCE_EFFORT_NONE: RefCell<HashSet<String>> = RefCell::new(HashSet::new());
+
+    /// Per-model set of `reasoning_effort` values the model actually accepts,
+    /// learned by READING the "Supported values are: …" list out of an
+    /// unsupported-value 400 (e.g. gpt-5.6 accepts none/low/medium/high/xhigh but
+    /// not `minimal`/`max`). A later request with a rejected effort is clamped to
+    /// the nearest accepted value instead of hard-failing the turn.
+    static EFFORT_SUPPORTED: RefCell<HashMap<String, Vec<String>>> =
+        RefCell::new(HashMap::new());
 }
+
+/// Canonical reasoning-effort tiers, low → high, for nearest-match clamping.
+const EFFORT_ORDER: &[&str] = &["none", "minimal", "low", "medium", "high", "xhigh", "max"];
 
 /// The official OpenAI API and Azure OpenAI require the gpt-5/o-series parameter
 /// conventions (`max_completion_tokens`, temperature restrictions); compatibility
@@ -33,6 +44,19 @@ fn is_official_openai_url(base_url: &str) -> bool {
     base_url.contains("api.openai.com")
         || base_url.contains("openai.azure.com")
         || base_url.contains("cognitiveservices.azure.com")
+}
+
+/// Heuristic: is MODEL an OpenAI reasoning model (gpt-5 series or o-series)?
+/// Reasoning models reject a custom `temperature` (only the default is accepted)
+/// — a stable, documented family rule we apply PROACTIVELY so a portable
+/// `:temperature` becomes a no-op there without paying a doomed first request.
+/// The `*-chat*` aliases (e.g. gpt-5-chat-latest) are non-reasoning. Anything the
+/// heuristic misses is still caught by the reactive DROP_TEMPERATURE net.
+fn is_reasoning_model(model: &str) -> bool {
+    (model.starts_with("gpt-5") && !model.contains("chat"))
+        || model.starts_with("o1")
+        || model.starts_with("o3")
+        || model.starts_with("o4")
 }
 
 /// Detect an OpenAI 400 that rejects a custom `temperature` (covers both
@@ -56,15 +80,53 @@ fn mentions_reasoning_effort_tools_conflict(body: &str) -> bool {
         && (lower.contains("not supported") || lower.contains("/v1/responses"))
 }
 
-/// A request is a candidate for the reasoning_effort/tools retry only when it
-/// set a non-`none` effort against the official OpenAI endpoint — compat
-/// endpoints (Ollama/OpenRouter/…) don't raise this 400.
-fn wants_effort_retry(request: &ChatRequest, base_url: &str) -> bool {
-    is_official_openai_url(base_url)
-        && request
-            .reasoning_effort
-            .as_deref()
-            .is_some_and(|e| e != "none")
+/// Detect the OpenAI 400 that rejects a `reasoning_effort` VALUE (not the
+/// tools interaction) — e.g. "Unsupported value: 'reasoning_effort' does not
+/// support 'minimal' with this model. Supported values are: 'none', 'low', …".
+fn mentions_unsupported_effort_value(body: &str) -> bool {
+    let lower = body.to_lowercase();
+    lower.contains("reasoning_effort")
+        && lower.contains("does not support")
+        && !lower.contains("tool")
+}
+
+/// Pull the accepted effort values out of an unsupported-value 400 by matching
+/// the canonical tiers that appear (quoted) in the message. Returns None if none
+/// are found (so the caller leaves the request unchanged).
+fn parse_unsupported_effort(body: &str) -> Option<Vec<String>> {
+    let lower = body.to_lowercase();
+    let found: Vec<String> = EFFORT_ORDER
+        .iter()
+        .filter(|tier| lower.contains(&format!("'{tier}'")))
+        // The rejected value itself is also quoted; keep only those listed after
+        // "supported values", i.e. drop the one the message says is unsupported.
+        .filter(|tier| !lower.contains(&format!("support '{tier}'")))
+        .map(|t| t.to_string())
+        .collect();
+    if found.is_empty() {
+        None
+    } else {
+        Some(found)
+    }
+}
+
+/// Clamp a requested effort to the nearest value in SUPPORTED (by canonical
+/// tier distance; ties prefer the higher tier). Returns the request unchanged if
+/// it is already supported or SUPPORTED is empty.
+fn clamp_effort(requested: &str, supported: &[String]) -> String {
+    if supported.iter().any(|s| s == requested) || supported.is_empty() {
+        return requested.to_string();
+    }
+    let idx = |e: &str| EFFORT_ORDER.iter().position(|t| *t == e);
+    let Some(req_idx) = idx(requested) else {
+        return requested.to_string();
+    };
+    supported
+        .iter()
+        .filter_map(|s| idx(s).map(|i| (s, i)))
+        .min_by_key(|(_, i)| (req_idx.abs_diff(*i), usize::MAX - *i))
+        .map(|(s, _)| s.clone())
+        .unwrap_or_else(|| requested.to_string())
 }
 
 pub struct OpenAiProvider {
@@ -205,18 +267,34 @@ impl OpenAiProvider {
         } else {
             (request.max_tokens, None)
         };
-        // Omit temperature for models we've learned reject it (see DROP_TEMPERATURE).
-        let temperature = if DROP_TEMPERATURE.with(|s| s.borrow().contains(&model)) {
+        // Reasoning models (gpt-5 series, o-series) reject a custom `temperature`
+        // — only the default is accepted. Drop it PROACTIVELY for those families,
+        // and REACTIVELY for any model learned at runtime (DROP_TEMPERATURE), so a
+        // portable `:temperature` stays a harmless no-op there.
+        let reasoning = is_official_openai && is_reasoning_model(&model);
+        let temperature = if reasoning || DROP_TEMPERATURE.with(|s| s.borrow().contains(&model)) {
             None
         } else {
             request.temperature
         };
-        // Pin reasoning_effort to `none` for models we've learned reject a
-        // non-none effort with tools on /chat/completions (see FORCE_EFFORT_NONE).
-        let reasoning_effort = if FORCE_EFFORT_NONE.with(|s| s.borrow().contains(&model)) {
+        // reasoning_effort. On `/chat/completions` a model we've learned rejects
+        // effort+tools must send exactly `none` WHEN TOOLS ARE PRESENT — any other
+        // value, including omitting it, 400s. (Gated on tools: a tool-free call to
+        // the same model must keep the caller's effort.) Otherwise honor the
+        // requested effort, clamped to the model's learned accepted set if known.
+        let has_tools = !tools.is_empty();
+        let reasoning_effort = if is_official_openai
+            && has_tools
+            && FORCE_EFFORT_NONE.with(|s| s.borrow().contains(&model))
+        {
             Some("none".to_string())
         } else {
-            request.reasoning_effort.clone()
+            request.reasoning_effort.clone().map(|eff| {
+                EFFORT_SUPPORTED.with(|s| match s.borrow().get(&model) {
+                    Some(sup) => clamp_effort(&eff, sup),
+                    None => eff,
+                })
+            })
         };
 
         OpenAiRequest {
@@ -232,6 +310,55 @@ impl OpenAiProvider {
             stream_options: None,
             response_format,
         }
+    }
+
+    /// Inspect a 400 for a known OpenAI compat quirk on THIS request; if found,
+    /// learn it (per-model) and return a corrected request to retry, else None.
+    /// Corrections compose — a caller retry loop applies this repeatedly so a
+    /// request tripping several quirks at once (temperature AND effort) recovers.
+    /// Only official OpenAI raises these; compat endpoints return None.
+    fn correct_for_400(&self, request: &ChatRequest, message: &str) -> Option<ChatRequest> {
+        if !is_official_openai_url(&self.base_url) {
+            return None;
+        }
+        let model = self.resolve_model(&request.model);
+
+        // Custom temperature rejected (reasoning models).
+        if request.temperature.is_some() && mentions_unsupported_temperature(message) {
+            DROP_TEMPERATURE.with(|s| s.borrow_mut().insert(model));
+            let mut retry = request.clone();
+            retry.temperature = None;
+            return Some(retry);
+        }
+
+        // Function tools + a non-`none` effort on /chat/completions. Pin to
+        // `none` (also covers the omitted-effort case, which 400s the same way).
+        if mentions_reasoning_effort_tools_conflict(message)
+            && request.reasoning_effort.as_deref() != Some("none")
+        {
+            FORCE_EFFORT_NONE.with(|s| s.borrow_mut().insert(model));
+            let mut retry = request.clone();
+            retry.reasoning_effort = Some("none".to_string());
+            return Some(retry);
+        }
+
+        // Unsupported reasoning_effort VALUE — read the accepted set from the
+        // error and clamp to the nearest, so a portable effort keeps working.
+        if let Some(eff) = request.reasoning_effort.clone() {
+            if mentions_unsupported_effort_value(message) {
+                if let Some(supported) = parse_unsupported_effort(message) {
+                    let clamped = clamp_effort(&eff, &supported);
+                    if clamped != eff {
+                        EFFORT_SUPPORTED.with(|s| s.borrow_mut().insert(model, supported));
+                        let mut retry = request.clone();
+                        retry.reasoning_effort = Some(clamped);
+                        return Some(retry);
+                    }
+                }
+            }
+        }
+
+        None
     }
 
     async fn complete_async(&self, request: ChatRequest) -> Result<ChatResponse, LlmError> {
@@ -669,43 +796,30 @@ impl LlmProvider for OpenAiProvider {
     }
 
     fn complete(&self, request: ChatRequest) -> Result<ChatResponse, LlmError> {
-        // GUARD: two io_block_on calls in this method, STRICTLY SEQUENTIAL and
-        // NEVER NESTED — the first fully returns before the retry's begins.
-        // Nesting a block_on inside a block_on'd future would panic (see the
-        // sema-io threading contract / tokio pin tests).
-        let result = sema_io::io_block_on(self.complete_async(request.clone()));
-        // Compat backstop: gpt-5.0 / o-series reject a custom `temperature` with a
-        // 400. Learn it per-model, drop temperature, and retry once — so portable
-        // Sema code that sets :temperature still works on those models.
-        if request.temperature.is_some() && is_official_openai_url(&self.base_url) {
-            if let Err(LlmError::Api {
+        // GUARD: the io_block_on calls in this method are STRICTLY SEQUENTIAL and
+        // NEVER NESTED — each fully returns before the next begins. Nesting a
+        // block_on inside a block_on'd future would panic (see the sema-io
+        // threading contract / tokio pin tests).
+        //
+        // Compat self-heal: on a 400 naming a known quirk (temperature rejected,
+        // effort+tools conflict, unsupported effort value), learn it and retry
+        // with a corrected request. Bounded so several quirks can chain without
+        // ever looping on a persistent 400.
+        let mut request = request;
+        let mut result = sema_io::io_block_on(self.complete_async(request.clone()));
+        for _ in 0..EFFORT_ORDER.len() {
+            let Err(LlmError::Api {
                 status: 400,
                 message,
             }) = &result
-            {
-                if mentions_unsupported_temperature(message) {
-                    let model = self.resolve_model(&request.model);
-                    DROP_TEMPERATURE.with(|s| s.borrow_mut().insert(model));
-                    return sema_io::io_block_on(self.complete_async(request));
-                }
-            }
-        }
-        // Compat backstop: gpt-5.6+ reject a non-none reasoning_effort with tools
-        // on /chat/completions. Learn it per-model, pin effort to none, retry once.
-        if wants_effort_retry(&request, &self.base_url) {
-            if let Err(LlmError::Api {
-                status: 400,
-                message,
-            }) = &result
-            {
-                if mentions_reasoning_effort_tools_conflict(message) {
-                    let model = self.resolve_model(&request.model);
-                    FORCE_EFFORT_NONE.with(|s| s.borrow_mut().insert(model));
-                    let mut retry = request;
-                    retry.reasoning_effort = Some("none".to_string());
-                    return sema_io::io_block_on(self.complete_async(retry));
-                }
-            }
+            else {
+                break;
+            };
+            let Some(corrected) = self.correct_for_400(&request, message) else {
+                break;
+            };
+            request = corrected;
+            result = sema_io::io_block_on(self.complete_async(request.clone()));
         }
         result
     }
@@ -716,46 +830,26 @@ impl LlmProvider for OpenAiProvider {
         request: ChatRequest,
     ) -> Option<crate::provider::BoxCompletionFuture<'_>> {
         Some(Box::pin(async move {
-            let result = self.complete_async(request.clone()).await;
-            // Same DROP_TEMPERATURE compat backstop as `complete()` (see there),
-            // with one async-path nuance: the future may resume on a DIFFERENT
-            // pool worker after the first attempt, so the retry must not depend
-            // on the thread-local learn — strip `temperature` from the retried
-            // request itself (wire-identical to the TLS drop in
-            // `build_request_body`). The TLS insert still happens so later calls
-            // that land on this worker skip the doomed first request.
-            if request.temperature.is_some() && is_official_openai_url(&self.base_url) {
-                if let Err(LlmError::Api {
+            // Same chained compat self-heal as `complete()`. Async-path nuance:
+            // the future may resume on a different pool worker, so the retried
+            // request carries its own correction (correct_for_400 rewrites the
+            // request, not just the thread-local) — the TLS learn is only an
+            // optimization for later calls that land on this worker.
+            let mut request = request;
+            let mut result = self.complete_async(request.clone()).await;
+            for _ in 0..EFFORT_ORDER.len() {
+                let Err(LlmError::Api {
                     status: 400,
                     message,
                 }) = &result
-                {
-                    if mentions_unsupported_temperature(message) {
-                        let model = self.resolve_model(&request.model);
-                        DROP_TEMPERATURE.with(|s| s.borrow_mut().insert(model));
-                        let mut retry = request;
-                        retry.temperature = None;
-                        return self.complete_async(retry).await;
-                    }
-                }
-            }
-            // Same reasoning_effort/tools backstop as `complete()`; the retried
-            // request pins effort to `none` itself (the future may resume on a
-            // different worker than the thread-local learn).
-            if wants_effort_retry(&request, &self.base_url) {
-                if let Err(LlmError::Api {
-                    status: 400,
-                    message,
-                }) = &result
-                {
-                    if mentions_reasoning_effort_tools_conflict(message) {
-                        let model = self.resolve_model(&request.model);
-                        FORCE_EFFORT_NONE.with(|s| s.borrow_mut().insert(model));
-                        let mut retry = request;
-                        retry.reasoning_effort = Some("none".to_string());
-                        return self.complete_async(retry).await;
-                    }
-                }
+                else {
+                    break;
+                };
+                let Some(corrected) = self.correct_for_400(&request, message) else {
+                    break;
+                };
+                request = corrected;
+                result = self.complete_async(request.clone()).await;
             }
             result
         }))
@@ -772,26 +866,27 @@ impl LlmProvider for OpenAiProvider {
         on_chunk: &mut dyn FnMut(&str) -> Result<(), LlmError>,
     ) -> Result<ChatResponse, LlmError> {
         // io_block_on drives ON THIS thread: `on_chunk` may touch non-Send Sema
-        // values and must never migrate to a pool worker. Two io_block_on calls
+        // values and must never migrate to a pool worker. The io_block_on calls
         // below are STRICTLY SEQUENTIAL and NEVER NESTED (see `complete`).
-        let result = sema_io::io_block_on(self.stream_complete_async(request.clone(), on_chunk));
-        // Compat backstop: gpt-5.6+ reject a non-none reasoning_effort with tools
-        // on /chat/completions. The 400 lands before any chunk is emitted, so a
-        // retry with effort pinned to `none` can't double up on `on_chunk`.
-        if wants_effort_retry(&request, &self.base_url) {
-            if let Err(LlmError::Api {
+        //
+        // Same chained compat self-heal as `complete()`. A 400 lands before any
+        // chunk is emitted (status is checked before the SSE parse), so retrying
+        // can't double up on `on_chunk`.
+        let mut request = request;
+        let mut result = sema_io::io_block_on(self.stream_complete_async(request.clone(), on_chunk));
+        for _ in 0..EFFORT_ORDER.len() {
+            let Err(LlmError::Api {
                 status: 400,
                 message,
             }) = &result
-            {
-                if mentions_reasoning_effort_tools_conflict(message) {
-                    let model = self.resolve_model(&request.model);
-                    FORCE_EFFORT_NONE.with(|s| s.borrow_mut().insert(model));
-                    let mut retry = request;
-                    retry.reasoning_effort = Some("none".to_string());
-                    return sema_io::io_block_on(self.stream_complete_async(retry, on_chunk));
-                }
-            }
+            else {
+                break;
+            };
+            let Some(corrected) = self.correct_for_400(&request, message) else {
+                break;
+            };
+            request = corrected;
+            result = sema_io::io_block_on(self.stream_complete_async(request.clone(), on_chunk));
         }
         result
     }
@@ -841,12 +936,28 @@ fn serialize_openai_content(content: &MessageContent) -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{ChatMessage, ChatRequest, ToolCall};
+    use crate::types::{ChatMessage, ChatRequest, ToolCall, ToolSchema};
 
     fn req_with_max() -> ChatRequest {
         let mut r = ChatRequest::new("gpt-5.4-mini".into(), vec![ChatMessage::new("user", "hi")]);
         r.max_tokens = Some(100);
         r
+    }
+
+    fn tool() -> ToolSchema {
+        ToolSchema {
+            name: "get_weather".into(),
+            description: "weather".into(),
+            parameters: serde_json::json!({"type": "object"}),
+        }
+    }
+
+    /// Clear the runtime-learned quirk caches so a test starts clean regardless of
+    /// what ran before it on a reused test thread (thread_locals persist per-thread).
+    fn reset_learned() {
+        DROP_TEMPERATURE.with(|s| s.borrow_mut().clear());
+        FORCE_EFFORT_NONE.with(|s| s.borrow_mut().clear());
+        EFFORT_SUPPORTED.with(|s| s.borrow_mut().clear());
     }
 
     #[test]
@@ -876,20 +987,28 @@ mod tests {
     }
 
     #[test]
-    fn memoized_model_drops_temperature() {
+    fn temperature_dropped_for_reasoning_models() {
+        reset_learned();
         let p = OpenAiProvider::new("k".into(), None, None).unwrap();
-        let mut r = ChatRequest::new("gpt-5.0".into(), vec![ChatMessage::new("user", "hi")]);
+        // Proactive: a reasoning model (gpt-5 family) never sends a custom
+        // temperature — dropped without any 400 round-trip.
+        let mut r = ChatRequest::new("gpt-5.6-luna".into(), vec![ChatMessage::new("user", "hi")]);
         r.temperature = Some(0.2);
-        // Before learning: temperature is sent.
-        assert_eq!(p.build_request_body(&r).temperature, Some(0.2));
-        // After learning the model rejects it: omitted.
-        DROP_TEMPERATURE.with(|s| s.borrow_mut().insert("gpt-5.0".to_string()));
         assert_eq!(p.build_request_body(&r).temperature, None);
-        DROP_TEMPERATURE.with(|s| s.borrow_mut().clear());
+        // Reactive net: a model the heuristic doesn't recognize keeps sending
+        // temperature until a 400 teaches us otherwise.
+        let mut r2 =
+            ChatRequest::new("some-custom-model".into(), vec![ChatMessage::new("user", "hi")]);
+        r2.temperature = Some(0.2);
+        assert_eq!(p.build_request_body(&r2).temperature, Some(0.2));
+        DROP_TEMPERATURE.with(|s| s.borrow_mut().insert("some-custom-model".to_string()));
+        assert_eq!(p.build_request_body(&r2).temperature, None);
+        reset_learned();
     }
 
     #[test]
     fn forwards_reasoning_effort() {
+        reset_learned();
         let p = OpenAiProvider::new("k".into(), None, None).unwrap();
         let mut r = ChatRequest::new("gpt-5.4-mini".into(), vec![ChatMessage::new("user", "hi")]);
         r.reasoning_effort = Some("high".into());
@@ -913,39 +1032,117 @@ mod tests {
     }
 
     #[test]
-    fn memoized_model_pins_effort_to_none() {
+    fn effort_pinned_to_none_only_when_tools_present() {
+        reset_learned();
         let p = OpenAiProvider::new("k".into(), None, None).unwrap();
-        let mut r = ChatRequest::new("gpt-5.6-luna".into(), vec![ChatMessage::new("user", "hi")]);
-        r.reasoning_effort = Some("high".into());
-        // Before learning: the requested effort is sent as-is.
-        assert_eq!(
-            p.build_request_body(&r).reasoning_effort.as_deref(),
-            Some("high")
-        );
-        // After learning the model rejects effort with tools: pinned to none.
         FORCE_EFFORT_NONE.with(|s| s.borrow_mut().insert("gpt-5.6-luna".to_string()));
+        // With tools: pinned to `none` (the model rejects effort+tools on chat).
+        let mut with_tools =
+            ChatRequest::new("gpt-5.6-luna".into(), vec![ChatMessage::new("user", "hi")]);
+        with_tools.reasoning_effort = Some("high".into());
+        with_tools.tools = vec![tool()];
         assert_eq!(
-            p.build_request_body(&r).reasoning_effort.as_deref(),
+            p.build_request_body(&with_tools).reasoning_effort.as_deref(),
             Some("none")
         );
-        FORCE_EFFORT_NONE.with(|s| s.borrow_mut().clear());
+        // WITHOUT tools: the caller's effort is preserved — a tool-free call must
+        // not be downgraded just because the model was learned from a tools call.
+        let mut no_tools =
+            ChatRequest::new("gpt-5.6-luna".into(), vec![ChatMessage::new("user", "hi")]);
+        no_tools.reasoning_effort = Some("high".into());
+        assert_eq!(
+            p.build_request_body(&no_tools).reasoning_effort.as_deref(),
+            Some("high")
+        );
+        reset_learned();
     }
 
     #[test]
-    fn effort_retry_only_for_official_non_none() {
-        let official = OpenAiProvider::new("k".into(), None, None).unwrap();
+    fn reasoning_model_heuristic() {
+        assert!(is_reasoning_model("gpt-5.6-luna"));
+        assert!(is_reasoning_model("gpt-5.5"));
+        assert!(is_reasoning_model("o3-mini"));
+        assert!(is_reasoning_model("o4-mini"));
+        assert!(!is_reasoning_model("gpt-5-chat-latest")); // chat alias = non-reasoning
+        assert!(!is_reasoning_model("gpt-4o"));
+        assert!(!is_reasoning_model("llama-3.3-70b"));
+    }
+
+    #[test]
+    fn clamp_effort_to_nearest_supported() {
+        let sup: Vec<String> = ["none", "low", "medium", "high", "xhigh"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(clamp_effort("minimal", &sup), "low"); // tie none/low → higher tier
+        assert_eq!(clamp_effort("max", &sup), "xhigh"); // above the top → clamp down
+        assert_eq!(clamp_effort("high", &sup), "high"); // already accepted
+        assert_eq!(clamp_effort("high", &[]), "high"); // nothing learned → unchanged
+    }
+
+    #[test]
+    fn parse_supported_effort_from_400() {
+        let msg = "Unsupported value: 'reasoning_effort' does not support 'minimal' with this \
+                   model. Supported values are: 'none', 'low', 'medium', 'high', and 'xhigh'.";
+        assert!(mentions_unsupported_effort_value(msg));
+        // The rejected value ('minimal') is excluded; only the accepted set remains.
+        assert_eq!(
+            parse_unsupported_effort(msg).unwrap(),
+            vec!["none", "low", "medium", "high", "xhigh"]
+        );
+        // The tools-conflict 400 is a different quirk, not an effort-value error.
+        assert!(!mentions_unsupported_effort_value(
+            "Function tools with reasoning_effort are not supported for gpt-5.6-luna in \
+             /v1/chat/completions. To use function tools, use /v1/responses or set \
+             reasoning_effort to 'none'."
+        ));
+    }
+
+    #[test]
+    fn correct_for_400_learns_each_quirk() {
+        reset_learned();
+        let p = OpenAiProvider::new("k".into(), None, None).unwrap();
+        // temperature rejected → dropped
+        let mut r = ChatRequest::new("gpt-5.6-luna".into(), vec![ChatMessage::new("user", "hi")]);
+        r.temperature = Some(0.2);
+        let c = p
+            .correct_for_400(
+                &r,
+                "Unsupported value: 'temperature' does not support 0.2. Only the default (1) \
+                 value is supported.",
+            )
+            .unwrap();
+        assert_eq!(c.temperature, None);
+        // unsupported effort value → clamped to nearest accepted
+        let mut r2 = ChatRequest::new("gpt-5.6-luna".into(), vec![ChatMessage::new("user", "hi")]);
+        r2.reasoning_effort = Some("minimal".into());
+        let c2 = p
+            .correct_for_400(
+                &r2,
+                "Unsupported value: 'reasoning_effort' does not support 'minimal' with this \
+                 model. Supported values are: 'none', 'low', 'medium', 'high', and 'xhigh'.",
+            )
+            .unwrap();
+        assert_eq!(c2.reasoning_effort.as_deref(), Some("low"));
+        // effort + tools conflict → pinned to none
+        let mut r3 = ChatRequest::new("gpt-5.6-luna".into(), vec![ChatMessage::new("user", "hi")]);
+        r3.reasoning_effort = Some("high".into());
+        r3.tools = vec![tool()];
+        let c3 = p
+            .correct_for_400(
+                &r3,
+                "Function tools with reasoning_effort are not supported ... use /v1/responses \
+                 or set reasoning_effort to 'none'.",
+            )
+            .unwrap();
+        assert_eq!(c3.reasoning_effort.as_deref(), Some("none"));
+        // compat endpoints don't raise these 400s → no correction
         let compat =
             OpenAiProvider::new("k".into(), Some("http://localhost:1234/v1".into()), None).unwrap();
-        let mut r = ChatRequest::new("gpt-5.6-luna".into(), vec![ChatMessage::new("user", "hi")]);
-        r.reasoning_effort = Some("high".into());
-        assert!(wants_effort_retry(&r, &official.base_url));
-        // Compat endpoints don't raise this 400 — never retry there.
-        assert!(!wants_effort_retry(&r, &compat.base_url));
-        // Already `none`, or unset: nothing to retry.
-        r.reasoning_effort = Some("none".into());
-        assert!(!wants_effort_retry(&r, &official.base_url));
-        r.reasoning_effort = None;
-        assert!(!wants_effort_retry(&r, &official.base_url));
+        assert!(compat
+            .correct_for_400(&r, "Unsupported value: 'temperature' does not support 0.2")
+            .is_none());
+        reset_learned();
     }
 
     #[test]

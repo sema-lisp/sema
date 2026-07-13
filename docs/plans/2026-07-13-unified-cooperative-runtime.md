@@ -1,6 +1,6 @@
 # Unified Cooperative Runtime Rewrite
 
-> **Status:** Approved architecture; written specification awaiting final review.
+> **Status:** Approved architecture and expanded execution plan.
 > **Implementation status:** No production rewrite layer is accepted yet. The
 > characterization commit at `52293e61` is provisional and must be corrected as
 > described in [Task 01 status](#task-01-status).
@@ -693,6 +693,20 @@ must have an owner and deletion gate; none is releaseable.
 
 There is no per-layer profiling task.
 
+The executable task files are:
+
+1. [Task 01 — contracts, characterization, and inventory](2026-07-13-unified-cooperative-runtime-task-01.md)
+2. [Task 02 — core runtime data model](2026-07-13-unified-cooperative-runtime-task-02.md)
+3. [Task 03 — scheduler, interpreter, and VM continuations](2026-07-13-unified-cooperative-runtime-task-03.md)
+4. [Task 04 — language concurrency and structured ownership](2026-07-13-unified-cooperative-runtime-task-04.md)
+5. [Task 05 — interruptible I/O and bounded resources](2026-07-13-unified-cooperative-runtime-task-05.md)
+6. [Task 06 — task context and orchestration integrations](2026-07-13-unified-cooperative-runtime-task-06.md)
+7. [Task 07 — native, service, notebook, debugger, and WASM hosts](2026-07-13-unified-cooperative-runtime-task-07.md)
+8. [Task 08 — legacy deletion, docs, examples, and shipped assets](2026-07-13-unified-cooperative-runtime-task-08.md)
+9. [Task 09 — adversarial, model, fuzz, stress, and leak verification](2026-07-13-unified-cooperative-runtime-task-09.md)
+10. [Task 10 — six-round independent review campaign](2026-07-13-unified-cooperative-runtime-task-10.md)
+11. [Task 11 — final profiling, benchmarking, and release readiness](2026-07-13-unified-cooperative-runtime-task-11.md)
+
 ## Verification strategy
 
 ### Per-layer gates
@@ -869,9 +883,9 @@ The revised task must address these known defects in its own plan and evidence:
   loser continues. The owned-loser case belongs to the concurrency-layer task
   that introduces `async/race-owned`; it is not a valid current-runtime
   characterization oracle.
-- Existing earlier tests that expect `async/race` to cancel supplied siblings
-  must also be inventoried and corrected rather than left as contradictory
-  oracles.
+- Existing earlier tests that expect `async/all` or `async/race` to cancel
+  supplied siblings must also be inventoried and corrected rather than left as
+  contradictory oracles.
 - `ready_spinner_does_not_starve_due_timer` currently terminates only because of
   the legacy one-million-tick failure. Once that ceiling is deleted, an unfair
   runtime would hang in-process forever. Move the fairness oracle behind an

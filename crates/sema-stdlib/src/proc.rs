@@ -656,7 +656,7 @@ fn proc_close_async(id: i64) -> Result<Value, SemaError> {
                         "proc/close was cancelled while reaping the killed process; the \
                          process was already killed but this handle can no longer reach \
                          it"
-                            .to_string(),
+                        .to_string(),
                     ),
                 );
             });
@@ -1029,11 +1029,8 @@ mod async_offload_tests {
         sema_core::set_async_context(true);
         let f = e.get_str("proc/write-stdin").expect("fn registered");
         let nf = f.as_native_fn_ref().expect("native fn");
-        let armed = (nf.func)(
-            &EvalContext::default(),
-            &[h.clone(), Value::string("nope")],
-        )
-        .expect("arms a yield");
+        let armed = (nf.func)(&EvalContext::default(), &[h.clone(), Value::string("nope")])
+            .expect("arms a yield");
         assert_eq!(armed, Value::nil());
         let reason = sema_core::take_yield_signal().expect("yield armed");
         let handle = match reason {
@@ -1127,10 +1124,7 @@ mod async_offload_tests {
         let nf = f.as_native_fn_ref().expect("native fn");
         let err = (nf.func)(&EvalContext::default(), &[h.clone()])
             .expect_err("busy handle should error immediately, not yield");
-        assert!(
-            err.to_string().contains("busy"),
-            "unexpected error: {err}"
-        );
+        assert!(err.to_string().contains("busy"), "unexpected error: {err}");
         sema_core::set_async_context(false);
 
         // Reinstall the real Proc and clean up through the normal sync path.

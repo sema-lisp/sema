@@ -363,7 +363,9 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
                     let handle = next_handle();
                     let reader = BufReader::new(port);
                     PORTS.with(|ports| {
-                        ports.borrow_mut().insert(handle, PortSlot::Available(reader))
+                        ports
+                            .borrow_mut()
+                            .insert(handle, PortSlot::Available(reader))
                     });
                     Value::int(handle as i64)
                 },
@@ -380,7 +382,11 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
 
         let handle = next_handle();
         let reader = BufReader::new(port);
-        PORTS.with(|ports| ports.borrow_mut().insert(handle, PortSlot::Available(reader)));
+        PORTS.with(|ports| {
+            ports
+                .borrow_mut()
+                .insert(handle, PortSlot::Available(reader))
+        });
         Ok(Value::int(handle as i64))
     });
 
@@ -432,7 +438,8 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
                     let port = reader.get_mut();
                     port.write_all(data.as_bytes())
                         .map_err(|e| eval_msg("serial/write", e))?;
-                    port.flush().map_err(|e| eval_msg("serial/write flush", e))?;
+                    port.flush()
+                        .map_err(|e| eval_msg("serial/write flush", e))?;
                     Ok(())
                 },
                 |()| Value::nil(),
@@ -512,8 +519,7 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
                         .map_err(|e| eval_msg("serial/send write", e))?;
                     port.write_all(b"\n")
                         .map_err(|e| eval_msg("serial/send write", e))?;
-                    port.flush()
-                        .map_err(|e| eval_msg("serial/send flush", e))?;
+                    port.flush().map_err(|e| eval_msg("serial/send flush", e))?;
 
                     // Read response line
                     let mut line = String::new();
@@ -666,8 +672,7 @@ mod tests {
     #[test]
     fn write_sync_path_missing_handle_unchanged() {
         let e = env();
-        let err =
-            native(&e, "serial/write")(&[Value::int(999), Value::string("hi")]).unwrap_err();
+        let err = native(&e, "serial/write")(&[Value::int(999), Value::string("hi")]).unwrap_err();
         assert_eq!(
             err.to_string(),
             "Eval error: serial/write: invalid handle 999"
@@ -677,18 +682,16 @@ mod tests {
     #[test]
     fn write_async_path_missing_handle_matches_sync_text() {
         let e = env();
-        let err = drive_async(|| {
-            native(&e, "serial/write")(&[Value::int(999), Value::string("hi")])
-        })
-        .unwrap_err();
+        let err =
+            drive_async(|| native(&e, "serial/write")(&[Value::int(999), Value::string("hi")]))
+                .unwrap_err();
         assert_eq!(err, "Eval error: serial/write: invalid handle 999");
     }
 
     #[test]
     fn send_sync_path_missing_handle_unchanged() {
         let e = env();
-        let err =
-            native(&e, "serial/send")(&[Value::int(999), Value::string("ping")]).unwrap_err();
+        let err = native(&e, "serial/send")(&[Value::int(999), Value::string("ping")]).unwrap_err();
         assert_eq!(
             err.to_string(),
             "Eval error: serial/send: invalid handle 999"
@@ -698,10 +701,9 @@ mod tests {
     #[test]
     fn send_async_path_missing_handle_matches_sync_text() {
         let e = env();
-        let err = drive_async(|| {
-            native(&e, "serial/send")(&[Value::int(999), Value::string("ping")])
-        })
-        .unwrap_err();
+        let err =
+            drive_async(|| native(&e, "serial/send")(&[Value::int(999), Value::string("ping")]))
+                .unwrap_err();
         assert_eq!(err, "Eval error: serial/send: invalid handle 999");
     }
 

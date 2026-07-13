@@ -680,9 +680,8 @@ mod async_offload_tests {
     fn gzip_round_trip_offloads_async() {
         let env = make_env();
         let original = b"hello, sema gzip async round-trip \x00\x01\x02 payload".to_vec();
-        let compressed = drive_async(|| {
-            native(&env, "gzip/compress")(&[Value::bytevector(original.clone())])
-        });
+        let compressed =
+            drive_async(|| native(&env, "gzip/compress")(&[Value::bytevector(original.clone())]));
         assert!(compressed.as_bytevector().is_some());
         let decompressed = drive_async(|| native(&env, "gzip/decompress")(&[compressed.clone()]));
         assert_eq!(decompressed.as_bytevector().unwrap(), &original[..]);

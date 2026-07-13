@@ -642,245 +642,241 @@ fn build_router_dispatch_fn(routes: std::rc::Rc<Vec<(String, String, Value)>>) -
     Value::native_fn(NativeFn::with_ctx(
         "http/router/dispatch",
         move |ctx: &EvalContext, args: &[Value]| {
-                    check_arity!(args, "http/router/dispatch", 1);
-                    let req = &args[0];
+            check_arity!(args, "http/router/dispatch", 1);
+            let req = &args[0];
 
-                    // Extract method from request map
-                    let req_map = req
-                        .as_map_rc()
-                        .ok_or_else(|| SemaError::type_error("map", req.type_name()))?;
+            // Extract method from request map
+            let req_map = req
+                .as_map_rc()
+                .ok_or_else(|| SemaError::type_error("map", req.type_name()))?;
 
-                    let req_method = req_map
-                        .get(&Value::keyword("method"))
-                        .ok_or_else(|| SemaError::eval("http/router: request missing :method"))?
-                        .as_keyword()
-                        .ok_or_else(|| SemaError::type_error("keyword", "other"))?;
+            let req_method = req_map
+                .get(&Value::keyword("method"))
+                .ok_or_else(|| SemaError::eval("http/router: request missing :method"))?
+                .as_keyword()
+                .ok_or_else(|| SemaError::type_error("keyword", "other"))?;
 
-                    let req_path = req_map
-                        .get(&Value::keyword("path"))
-                        .ok_or_else(|| SemaError::eval("http/router: request missing :path"))?
-                        .as_str()
-                        .ok_or_else(|| SemaError::type_error("string", "other"))?
-                        .to_string();
+            let req_path = req_map
+                .get(&Value::keyword("path"))
+                .ok_or_else(|| SemaError::eval("http/router: request missing :path"))?
+                .as_str()
+                .ok_or_else(|| SemaError::type_error("string", "other"))?
+                .to_string();
 
-                    // Try each route
-                    for (method, pattern, handler) in routes.iter() {
-                        // WebSocket routes match GET requests (WS upgrade starts as GET)
-                        let is_ws_route = method == "ws";
-                        // Static routes only match GET/HEAD requests
-                        let is_static_route = method == "static";
-                        if is_ws_route || is_static_route {
-                            if req_method != "get" && req_method != "head" {
-                                continue;
-                            }
-                        } else if method != "any" && method != &req_method {
+            // Try each route
+            for (method, pattern, handler) in routes.iter() {
+                // WebSocket routes match GET requests (WS upgrade starts as GET)
+                let is_ws_route = method == "ws";
+                // Static routes only match GET/HEAD requests
+                let is_static_route = method == "static";
+                if is_ws_route || is_static_route {
+                    if req_method != "get" && req_method != "head" {
+                        continue;
+                    }
+                } else if method != "any" && method != &req_method {
+                    continue;
+                }
+
+                // Path matching
+                if let Some(params) = match_path(pattern, &req_path) {
+                    // For static routes, resolve the file and return a file marker
+                    if is_static_route {
+                        let dir_path = handler.as_str().unwrap_or("");
+                        let rel_path = params
+                            .iter()
+                            .find(|(k, _)| k == "*")
+                            .map(|(_, v)| v.as_str())
+                            .unwrap_or("");
+
+                        // Security: reject path traversal
+                        if rel_path.contains("..") {
+                            let mut headers = BTreeMap::new();
+                            headers
+                                .insert(Value::string("content-type"), Value::string("text/plain"));
+                            let mut result = BTreeMap::new();
+                            result.insert(Value::keyword("status"), Value::int(400));
+                            result.insert(Value::keyword("headers"), Value::map(headers));
+                            result.insert(Value::keyword("body"), Value::string("Bad Request"));
+                            return Ok(Value::map(result));
+                        }
+
+                        let file_path = std::path::Path::new(dir_path).join(rel_path);
+
+                        // If it's a directory, try index.html
+                        let file_path = if file_path.is_dir() {
+                            file_path.join("index.html")
+                        } else {
+                            file_path
+                        };
+
+                        if !file_path.exists() {
+                            // Don't match — fall through to other routes
+                            // (allows SPA fallback as a later catch-all). This
+                            // decision must stay synchronous even in async
+                            // context: `continue`ing this loop after an
+                            // offloaded yield isn't possible — resuming an
+                            // `AwaitIo` delivers its decoded value directly as
+                            // this whole dispatch call's result, bypassing any
+                            // further routes — so only the *terminal* work below
+                            // (which always ends in a `return`, never `continue`)
+                            // is safe to offload. `exists()`/`is_dir()` are also
+                            // single fast stat syscalls, unlike `canonicalize()`
+                            // below which can walk a full symlink chain.
                             continue;
                         }
 
-                        // Path matching
-                        if let Some(params) = match_path(pattern, &req_path) {
-                            // For static routes, resolve the file and return a file marker
-                            if is_static_route {
-                                let dir_path = handler
-                                    .as_str()
-                                    .unwrap_or("");
-                                let rel_path = params.iter()
-                                    .find(|(k, _)| k == "*")
-                                    .map(|(_, v)| v.as_str())
-                                    .unwrap_or("");
-
-                                // Security: reject path traversal
-                                if rel_path.contains("..") {
-                                    let mut headers = BTreeMap::new();
-                                    headers.insert(
-                                        Value::string("content-type"),
-                                        Value::string("text/plain"),
+                        // From here on every path returns (403 escape or the
+                        // `__file` marker) — no more `continue`s — so it's safe
+                        // to offload the rest onto the I/O pool when running
+                        // inside `async/spawn`, instead of stalling the single
+                        // cooperative VM thread on `canonicalize()`'s
+                        // symlink-resolving stat chain.
+                        if sema_core::in_async_context() {
+                            let dir_path_owned = dir_path.to_string();
+                            let file_path_owned = file_path.clone();
+                            return crate::io::fs_offload(
+                                move || {
+                                    // Security (STD-11): confirm the resolved file
+                                    // stays inside dir_path. The ".." substring
+                                    // check above can't catch symlink/junction
+                                    // escapes; canonicalize() resolves links, then
+                                    // we verify the prefix.
+                                    let escapes = match (
+                                        std::fs::canonicalize(&dir_path_owned),
+                                        std::fs::canonicalize(&file_path_owned),
+                                    ) {
+                                        (Ok(base), Ok(real)) => !real.starts_with(&base),
+                                        _ => true,
+                                    };
+                                    let content_type = mime_guess::from_path(&file_path_owned)
+                                        .first_or_octet_stream()
+                                        .to_string();
+                                    Ok((
+                                        escapes,
+                                        file_path_owned.to_string_lossy().to_string(),
+                                        content_type,
+                                    ))
+                                },
+                                |(escapes, path_str, content_type)| {
+                                    if escapes {
+                                        let mut headers = BTreeMap::new();
+                                        headers.insert(
+                                            Value::string("content-type"),
+                                            Value::string("text/plain"),
+                                        );
+                                        let mut result = BTreeMap::new();
+                                        result.insert(Value::keyword("status"), Value::int(403));
+                                        result
+                                            .insert(Value::keyword("headers"), Value::map(headers));
+                                        result.insert(
+                                            Value::keyword("body"),
+                                            Value::string("Forbidden"),
+                                        );
+                                        return Value::map(result);
+                                    }
+                                    let mut map = BTreeMap::new();
+                                    map.insert(Value::keyword("__file"), Value::bool(true));
+                                    map.insert(
+                                        Value::keyword("__file_path"),
+                                        Value::string(&path_str),
                                     );
-                                    let mut result = BTreeMap::new();
-                                    result.insert(Value::keyword("status"), Value::int(400));
-                                    result.insert(Value::keyword("headers"), Value::map(headers));
-                                    result.insert(Value::keyword("body"), Value::string("Bad Request"));
-                                    return Ok(Value::map(result));
-                                }
-
-                                let file_path = std::path::Path::new(dir_path).join(rel_path);
-
-                                // If it's a directory, try index.html
-                                let file_path = if file_path.is_dir() {
-                                    file_path.join("index.html")
-                                } else {
-                                    file_path
-                                };
-
-                                if !file_path.exists() {
-                                    // Don't match — fall through to other routes
-                                    // (allows SPA fallback as a later catch-all). This
-                                    // decision must stay synchronous even in async
-                                    // context: `continue`ing this loop after an
-                                    // offloaded yield isn't possible — resuming an
-                                    // `AwaitIo` delivers its decoded value directly as
-                                    // this whole dispatch call's result, bypassing any
-                                    // further routes — so only the *terminal* work below
-                                    // (which always ends in a `return`, never `continue`)
-                                    // is safe to offload. `exists()`/`is_dir()` are also
-                                    // single fast stat syscalls, unlike `canonicalize()`
-                                    // below which can walk a full symlink chain.
-                                    continue;
-                                }
-
-                                // From here on every path returns (403 escape or the
-                                // `__file` marker) — no more `continue`s — so it's safe
-                                // to offload the rest onto the I/O pool when running
-                                // inside `async/spawn`, instead of stalling the single
-                                // cooperative VM thread on `canonicalize()`'s
-                                // symlink-resolving stat chain.
-                                if sema_core::in_async_context() {
-                                    let dir_path_owned = dir_path.to_string();
-                                    let file_path_owned = file_path.clone();
-                                    return crate::io::fs_offload(
-                                        move || {
-                                            // Security (STD-11): confirm the resolved file
-                                            // stays inside dir_path. The ".." substring
-                                            // check above can't catch symlink/junction
-                                            // escapes; canonicalize() resolves links, then
-                                            // we verify the prefix.
-                                            let escapes = match (
-                                                std::fs::canonicalize(&dir_path_owned),
-                                                std::fs::canonicalize(&file_path_owned),
-                                            ) {
-                                                (Ok(base), Ok(real)) => !real.starts_with(&base),
-                                                _ => true,
-                                            };
-                                            let content_type = mime_guess::from_path(&file_path_owned)
-                                                .first_or_octet_stream()
-                                                .to_string();
-                                            Ok((
-                                                escapes,
-                                                file_path_owned.to_string_lossy().to_string(),
-                                                content_type,
-                                            ))
-                                        },
-                                        |(escapes, path_str, content_type)| {
-                                            if escapes {
-                                                let mut headers = BTreeMap::new();
-                                                headers.insert(
-                                                    Value::string("content-type"),
-                                                    Value::string("text/plain"),
-                                                );
-                                                let mut result = BTreeMap::new();
-                                                result.insert(Value::keyword("status"), Value::int(403));
-                                                result.insert(Value::keyword("headers"), Value::map(headers));
-                                                result.insert(
-                                                    Value::keyword("body"),
-                                                    Value::string("Forbidden"),
-                                                );
-                                                return Value::map(result);
-                                            }
-                                            let mut map = BTreeMap::new();
-                                            map.insert(Value::keyword("__file"), Value::bool(true));
-                                            map.insert(
-                                                Value::keyword("__file_path"),
-                                                Value::string(&path_str),
-                                            );
-                                            map.insert(
-                                                Value::keyword("__file_content_type"),
-                                                Value::string(&content_type),
-                                            );
-                                            Value::map(map)
-                                        },
+                                    map.insert(
+                                        Value::keyword("__file_content_type"),
+                                        Value::string(&content_type),
                                     );
-                                }
+                                    Value::map(map)
+                                },
+                            );
+                        }
 
-                                // Security (STD-11): confirm the resolved file stays
-                                // inside dir_path. The ".." substring check above can't
-                                // catch symlink/junction escapes; canonicalize() resolves
-                                // links, then we verify the prefix.
-                                let escapes = match (
-                                    std::fs::canonicalize(dir_path),
-                                    std::fs::canonicalize(&file_path),
-                                ) {
-                                    (Ok(base), Ok(real)) => !real.starts_with(&base),
-                                    _ => true,
-                                };
-                                if escapes {
-                                    let mut headers = BTreeMap::new();
-                                    headers.insert(
-                                        Value::string("content-type"),
-                                        Value::string("text/plain"),
-                                    );
-                                    let mut result = BTreeMap::new();
-                                    result.insert(Value::keyword("status"), Value::int(403));
-                                    result.insert(Value::keyword("headers"), Value::map(headers));
-                                    result.insert(Value::keyword("body"), Value::string("Forbidden"));
-                                    return Ok(Value::map(result));
-                                }
+                        // Security (STD-11): confirm the resolved file stays
+                        // inside dir_path. The ".." substring check above can't
+                        // catch symlink/junction escapes; canonicalize() resolves
+                        // links, then we verify the prefix.
+                        let escapes = match (
+                            std::fs::canonicalize(dir_path),
+                            std::fs::canonicalize(&file_path),
+                        ) {
+                            (Ok(base), Ok(real)) => !real.starts_with(&base),
+                            _ => true,
+                        };
+                        if escapes {
+                            let mut headers = BTreeMap::new();
+                            headers
+                                .insert(Value::string("content-type"), Value::string("text/plain"));
+                            let mut result = BTreeMap::new();
+                            result.insert(Value::keyword("status"), Value::int(403));
+                            result.insert(Value::keyword("headers"), Value::map(headers));
+                            result.insert(Value::keyword("body"), Value::string("Forbidden"));
+                            return Ok(Value::map(result));
+                        }
 
-                                let content_type = mime_guess::from_path(&file_path)
-                                    .first_or_octet_stream()
-                                    .to_string();
+                        let content_type = mime_guess::from_path(&file_path)
+                            .first_or_octet_stream()
+                            .to_string();
 
-                                let mut map = BTreeMap::new();
-                                map.insert(Value::keyword("__file"), Value::bool(true));
-                                map.insert(
-                                    Value::keyword("__file_path"),
-                                    Value::string(&file_path.to_string_lossy()),
-                                );
-                                map.insert(
-                                    Value::keyword("__file_content_type"),
-                                    Value::string(&content_type),
-                                );
-                                return Ok(Value::map(map));
-                            }
+                        let mut map = BTreeMap::new();
+                        map.insert(Value::keyword("__file"), Value::bool(true));
+                        map.insert(
+                            Value::keyword("__file_path"),
+                            Value::string(&file_path.to_string_lossy()),
+                        );
+                        map.insert(
+                            Value::keyword("__file_content_type"),
+                            Value::string(&content_type),
+                        );
+                        return Ok(Value::map(map));
+                    }
 
-                            // Build params map (keyword keys)
-                            let mut params_map = BTreeMap::new();
-                            for (k, v) in &params {
-                                params_map.insert(Value::keyword(k), Value::string(v));
-                            }
+                    // Build params map (keyword keys)
+                    let mut params_map = BTreeMap::new();
+                    for (k, v) in &params {
+                        params_map.insert(Value::keyword(k), Value::string(v));
+                    }
 
-                            // Merge params into existing :params in the request
-                            let existing_params = req_map
-                                .get(&Value::keyword("params"))
-                                .and_then(|v| v.as_map_rc());
+                    // Merge params into existing :params in the request
+                    let existing_params = req_map
+                        .get(&Value::keyword("params"))
+                        .and_then(|v| v.as_map_rc());
 
-                            if let Some(existing) = existing_params {
-                                for (k, v) in existing.iter() {
-                                    params_map.entry(k.clone()).or_insert_with(|| v.clone());
-                                }
-                            }
-
-                            // Build new request with merged params
-                            let mut new_req = (*req_map).clone();
-                            new_req.insert(Value::keyword("params"), Value::map(params_map));
-                            let new_req_val = Value::map(new_req);
-
-                            // For WebSocket routes, return a marker map instead of calling handler
-                            if is_ws_route {
-                                let mut ws_map = BTreeMap::new();
-                                ws_map.insert(Value::keyword("__websocket"), Value::bool(true));
-                                ws_map.insert(Value::keyword("__ws_handler"), handler.clone());
-                                ws_map.insert(Value::keyword("__ws_request"), new_req_val);
-                                return Ok(Value::map(ws_map));
-                            }
-
-                            // Call handler
-                            return call_callback(ctx, handler, &[new_req_val]);
+                    if let Some(existing) = existing_params {
+                        for (k, v) in existing.iter() {
+                            params_map.entry(k.clone()).or_insert_with(|| v.clone());
                         }
                     }
 
-                    // No route matched — return 404
-                    let mut headers = BTreeMap::new();
-                    headers.insert(
-                        Value::string("content-type"),
-                        Value::string("application/json"),
-                    );
-                    let mut result = BTreeMap::new();
-                    result.insert(Value::keyword("status"), Value::int(404));
-                    result.insert(Value::keyword("headers"), Value::map(headers));
-                    result.insert(Value::keyword("body"), Value::string("\"Not Found\""));
-                    Ok(Value::map(result))
-                },
-            ))
+                    // Build new request with merged params
+                    let mut new_req = (*req_map).clone();
+                    new_req.insert(Value::keyword("params"), Value::map(params_map));
+                    let new_req_val = Value::map(new_req);
+
+                    // For WebSocket routes, return a marker map instead of calling handler
+                    if is_ws_route {
+                        let mut ws_map = BTreeMap::new();
+                        ws_map.insert(Value::keyword("__websocket"), Value::bool(true));
+                        ws_map.insert(Value::keyword("__ws_handler"), handler.clone());
+                        ws_map.insert(Value::keyword("__ws_request"), new_req_val);
+                        return Ok(Value::map(ws_map));
+                    }
+
+                    // Call handler
+                    return call_callback(ctx, handler, &[new_req_val]);
+                }
+            }
+
+            // No route matched — return 404
+            let mut headers = BTreeMap::new();
+            headers.insert(
+                Value::string("content-type"),
+                Value::string("application/json"),
+            );
+            let mut result = BTreeMap::new();
+            result.insert(Value::keyword("status"), Value::int(404));
+            result.insert(Value::keyword("headers"), Value::map(headers));
+            result.insert(Value::keyword("body"), Value::string("\"Not Found\""));
+            Ok(Value::map(result))
+        },
+    ))
 }
 
 /// Convert an HTTP method string (e.g. "GET") to a lowercase keyword Value (e.g. :get).
@@ -1914,20 +1910,16 @@ mod async_offload_tests {
             .get(sema_core::intern("http/file"))
             .expect("http/file registered");
 
-        let sync_result = call_native(&http_file, &[Value::string(&file_path_s)])
-            .expect("sync http/file ok");
-        let async_result =
-            drive_async(|| call_native(&http_file, &[Value::string(&file_path_s)]));
+        let sync_result =
+            call_native(&http_file, &[Value::string(&file_path_s)]).expect("sync http/file ok");
+        let async_result = drive_async(|| call_native(&http_file, &[Value::string(&file_path_s)]));
 
         assert_eq!(
             sync_result, async_result,
             "offloaded http/file must match the sync __file marker byte-for-byte"
         );
         let map = async_result.as_map_rc().expect("map");
-        assert_eq!(
-            map.get(&Value::keyword("__file")),
-            Some(&Value::bool(true))
-        );
+        assert_eq!(map.get(&Value::keyword("__file")), Some(&Value::bool(true)));
         assert_eq!(
             map.get(&Value::keyword("__file_content_type")),
             Some(&Value::string("text/plain"))
@@ -2058,8 +2050,8 @@ mod async_offload_tests {
         let async_router = async_env
             .get(sema_core::intern("http/router"))
             .expect("http/router registered");
-        let async_dispatch = call_native(&async_router, &[static_routes(&dir)])
-            .expect("router construction ok");
+        let async_dispatch =
+            call_native(&async_router, &[static_routes(&dir)]).expect("router construction ok");
         let async_result =
             drive_async(|| call_native(&async_dispatch, &[make_request("/assets/app.js")]));
 
@@ -2068,10 +2060,7 @@ mod async_offload_tests {
             "offloaded dispatch must match the sync __file marker byte-for-byte"
         );
         let map = async_result.as_map_rc().expect("map");
-        assert_eq!(
-            map.get(&Value::keyword("__file")),
-            Some(&Value::bool(true))
-        );
+        assert_eq!(map.get(&Value::keyword("__file")), Some(&Value::bool(true)));
 
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -588,7 +588,7 @@ fn pty_close_async(id: i64) -> Result<Value, SemaError> {
                         "pty/close was cancelled while reaping the killed process; the \
                          process was already killed but this handle can no longer reach \
                          it"
-                            .to_string(),
+                        .to_string(),
                     ),
                 );
             });
@@ -986,10 +986,7 @@ mod async_offload_tests {
         let nf = f.as_native_fn_ref().expect("native fn");
         let err = (nf.func)(&EvalContext::default(), &[h.clone()])
             .expect_err("busy handle should error immediately, not yield");
-        assert!(
-            err.to_string().contains("busy"),
-            "unexpected error: {err}"
-        );
+        assert!(err.to_string().contains("busy"), "unexpected error: {err}");
         sema_core::set_async_context(false);
 
         // Reinstall the real Pty and clean up through the normal sync path.

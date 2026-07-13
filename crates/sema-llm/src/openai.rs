@@ -873,7 +873,8 @@ impl LlmProvider for OpenAiProvider {
         // chunk is emitted (status is checked before the SSE parse), so retrying
         // can't double up on `on_chunk`.
         let mut request = request;
-        let mut result = sema_io::io_block_on(self.stream_complete_async(request.clone(), on_chunk));
+        let mut result =
+            sema_io::io_block_on(self.stream_complete_async(request.clone(), on_chunk));
         for _ in 0..EFFORT_ORDER.len() {
             let Err(LlmError::Api {
                 status: 400,
@@ -997,8 +998,10 @@ mod tests {
         assert_eq!(p.build_request_body(&r).temperature, None);
         // Reactive net: a model the heuristic doesn't recognize keeps sending
         // temperature until a 400 teaches us otherwise.
-        let mut r2 =
-            ChatRequest::new("some-custom-model".into(), vec![ChatMessage::new("user", "hi")]);
+        let mut r2 = ChatRequest::new(
+            "some-custom-model".into(),
+            vec![ChatMessage::new("user", "hi")],
+        );
         r2.temperature = Some(0.2);
         assert_eq!(p.build_request_body(&r2).temperature, Some(0.2));
         DROP_TEMPERATURE.with(|s| s.borrow_mut().insert("some-custom-model".to_string()));
@@ -1042,7 +1045,9 @@ mod tests {
         with_tools.reasoning_effort = Some("high".into());
         with_tools.tools = vec![tool()];
         assert_eq!(
-            p.build_request_body(&with_tools).reasoning_effort.as_deref(),
+            p.build_request_body(&with_tools)
+                .reasoning_effort
+                .as_deref(),
             Some("none")
         );
         // WITHOUT tools: the caller's effort is preserved — a tool-free call must

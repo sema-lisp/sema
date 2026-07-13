@@ -18,6 +18,10 @@ thread_local! {
     static TTY_STORE: RefCell<std::collections::BTreeMap<i64, libc::termios>> =
         const { RefCell::new(std::collections::BTreeMap::new()) };
     static TTY_COUNTER: Cell<i64> = const { Cell::new(0) };
+    // Count of outstanding DSR (cursor-position) queries. A `CSI…R` is a cursor
+    // report only when one is pending; otherwise it's modified-F3 keyboard input
+    // (`CSI 1;<mod>R`), which is byte-identical to a CPR reply.
+    static EXPECT_CPR: Cell<u32> = const { Cell::new(0) };
 }
 
 // Returns true if stdin has data ready to read within `timeout_ms` milliseconds (0 = non-blocking).
@@ -294,10 +298,12 @@ fn parse_legacy_csi(csi: &[u8]) -> (&'static str, u32) {
         b'H' => "home",
         b'F' => "end",
         b'Z' => "shift-tab",
-        // Modified F1/F2/F4 arrive as CSI `1;<mod>P/Q/S`. (F3's `…R` form is
-        // ambiguous with the cursor-position report, which is decoded upstream.)
+        // Modified F1-F4 arrive as CSI `1;<mod>P/Q/R/S`. F3's `…R` is byte-shaped
+        // like a cursor-position report; the dispatcher only reaches here for `R`
+        // when no DSR reply is outstanding, so it's genuinely modified-F3.
         b'P' => "f1",
         b'Q' => "f2",
+        b'R' => "f3",
         b'S' => "f4",
         b'~' => match first {
             b"1" | b"7" => "home",
@@ -359,6 +365,9 @@ mod legacy_csi_tests {
         assert_eq!(parse_legacy_csi(b"24~"), ("f12", 0));
         assert_eq!(parse_legacy_csi(b"1;2P"), ("f1", 1)); // shift+F1
         assert_eq!(parse_legacy_csi(b"15;5~"), ("f5", 4)); // ctrl+F5
+                                                           // Unsolicited CSI…R reaches parse_legacy_csi as modified-F3 (the
+                                                           // dispatcher only routes R to CPR when a DSR reply is outstanding).
+        assert_eq!(parse_legacy_csi(b"1;2R"), ("f3", 1)); // shift+F3
     }
 }
 
@@ -388,6 +397,10 @@ mod terminal_response_tests {
         assert!(is_kw(&m, "kind", "cpr"));
         assert_eq!(kw(&m, "row"), Some(Value::int(12)));
         assert_eq!(kw(&m, "col"), Some(Value::int(40)));
+        // DECXCPR form `CSI ? row;col R` (leading ? stripped).
+        let d = decode_cpr(b"?12;40R");
+        assert_eq!(kw(&d, "row"), Some(Value::int(12)));
+        assert_eq!(kw(&d, "col"), Some(Value::int(40)));
     }
 
     #[test]
@@ -490,7 +503,12 @@ fn csi_params(body: &[u8]) -> Vec<u32> {
 /// the reply to a DSR `ESC[6n` query.
 #[cfg(unix)]
 fn decode_cpr(csi: &[u8]) -> Value {
-    let p = csi_params(&csi[..csi.len().saturating_sub(1)]);
+    // Strip the final `R` and an optional leading `?` (DECXCPR: `CSI ? row;col R`).
+    let mut body = &csi[..csi.len().saturating_sub(1)];
+    if body.first() == Some(&b'?') {
+        body = &body[1..];
+    }
+    let p = csi_params(body);
     let mut m = std::collections::BTreeMap::new();
     m.insert(Value::keyword("kind"), Value::keyword("cpr"));
     m.insert(
@@ -666,23 +684,26 @@ fn read_one_csi(budget_ms: u64) -> Result<Option<Vec<u8>>, SemaError> {
     }
 }
 
-/// Detect kitty-keyboard support: send `CSI ?u` followed by a DSR barrier
-/// (`CSI 6n`). A supporting terminal answers the flags query (`ESC[?…u`) before
-/// the cursor-position reply; a non-supporting one only answers the DSR. Must be
-/// called in raw mode; returns false when stdin is not a TTY or nothing replies.
+/// Detect kitty-keyboard support: send the flags query `CSI ?u` followed by a
+/// Primary Device Attributes barrier `CSI c` (the method the kitty spec
+/// recommends). A supporting terminal answers the flags query (`ESC[?…u`) before
+/// the DA reply (`ESC[?…c`); a non-supporting one answers only DA. Must be called
+/// in raw mode; returns false when stdin is not a TTY or nothing replies.
+/// NOTE: inside tmux, kitty forwarding is off by default and detection may
+/// silently fail — prefer letting the user force-enable when `$TMUX` is set.
 #[cfg(unix)]
 fn probe_kitty_support() -> Result<bool, SemaError> {
     if !stdin_is_tty() {
         return Ok(false);
     }
-    write_stdout("\x1b[?u\x1b[6n")?;
+    write_stdout("\x1b[?u\x1b[c")?;
     while let Some(csi) = read_one_csi(200)? {
         let last = *csi.last().unwrap_or(&0);
         if last == b'u' && csi.first() == Some(&b'?') {
             return Ok(true);
         }
-        if last == b'R' {
-            return Ok(false); // barrier reached with no kitty reply
+        if last == b'c' {
+            return Ok(false); // DA barrier reached with no kitty reply
         }
     }
     Ok(false)
@@ -785,7 +806,19 @@ fn parse_key_input() -> Result<Option<Value>, SemaError> {
             if last == b'c' && (first == b'?' || first == b'>') {
                 return Ok(Some(decode_device_attributes(&csi, first)));
             }
-            if last == b'R' {
+            // A `CSI…R` is a cursor-position report only when we solicited one;
+            // otherwise it's modified-F3 (`CSI 1;<mod>R`) → fall through to keys.
+            if last == b'R'
+                && EXPECT_CPR.with(|c| {
+                    let n = c.get();
+                    if n > 0 {
+                        c.set(n - 1);
+                        true
+                    } else {
+                        false
+                    }
+                })
+            {
                 return Ok(Some(decode_cpr(&csi)));
             }
             if last == b'~' && csi.starts_with(b"27;") {
@@ -2552,6 +2585,15 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
         register_fn(env, "term/cursor-position", |args| {
             check_arity!(args, "term/cursor-position", 0);
             query_cursor_position()
+        });
+        // term/query-cursor-position → write DSR and arm the CPR flag, so the
+        // reply (arriving later via io/read-key) is decoded as :cpr rather than
+        // being mistaken for modified-F3 (`CSI 1;<mod>R`).
+        register_fn(env, "term/query-cursor-position", |args| {
+            check_arity!(args, "term/query-cursor-position", 0);
+            EXPECT_CPR.with(|c| c.set(c.get().saturating_add(1)));
+            write_stdout("\x1b[6n")?;
+            Ok(Value::nil())
         });
     }
 

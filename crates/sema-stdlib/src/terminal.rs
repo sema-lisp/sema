@@ -392,9 +392,9 @@ fn register_screen_control(env: &sema_core::Env) {
     make_emit_fn(env, "term/disable-focus-events", "\x1b[?1004l");
 
     // Terminal queries — each writes a request whose reply arrives via io/read-key:
-    //   query-cursor-position (DSR)  → {:kind :cpr :row :col}
     //   query-primary/secondary-da   → {:kind :device-attributes :device …}
-    make_emit_fn(env, "term/query-cursor-position", "\x1b[6n");
+    // (query-cursor-position lives in io.rs — it must also arm the CPR flag so a
+    //  reply is told apart from modified-F3, which is byte-identical.)
     make_emit_fn(env, "term/query-primary-da", "\x1b[c");
     make_emit_fn(env, "term/query-secondary-da", "\x1b[>c");
 

@@ -1592,3 +1592,147 @@ fn read_key_timeout_async_branch_completes_with_sibling() {
         "both the read-key-timeout task and its sibling must complete without deadlock"
     );
 }
+
+// === Unified cooperative runtime characterization ===
+
+#[test]
+fn awaited_child_mutation_is_visible_to_parent() {
+    // Parent and child must retain one shared lexical cell across suspension.
+    assert_eq!(
+        eval(
+            r#"
+            (define (mutate-from-child)
+              (define value 0)
+              (define child (async/spawn (fn () (set! value 42))))
+              (await child)
+              value)
+            (mutate-from-child)
+            "#,
+        ),
+        Value::int(42),
+    );
+}
+
+#[test]
+fn race_with_settled_winner_cancels_owned_pending_loser() {
+    // The fast path must apply the same owned-loser cancellation as a scheduled race.
+    assert_eq!(
+        eval(
+            r#"
+            (define loser (async (async/sleep 1000) :too-late))
+            (define winner (async/resolved :winner))
+            (async/race (list winner loser))
+            (async/cancelled? loser)
+            "#,
+        ),
+        Value::bool(true),
+    );
+}
+
+#[test]
+fn sleep_rejects_duration_negative_before_rounding() {
+    // A negative input remains invalid even when nearest-integer rounding would produce zero.
+    let err = eval_vm_err("(async/sleep -0.4)");
+    assert!(
+        err.contains("non-negative"),
+        "expected non-negative duration error, got: {err}"
+    );
+}
+
+#[test]
+fn sleep_rejects_non_finite_durations_cleanly() {
+    // NaN and infinities are never valid deadlines.
+    for input in [
+        "(async/sleep math/nan)",
+        "(async/sleep math/infinity)",
+        "(async/sleep (- math/infinity))",
+    ] {
+        let err = eval_vm_err(input);
+        assert!(
+            err.contains("finite"),
+            "expected finite duration error for {input}, got: {err}"
+        );
+    }
+}
+
+#[test]
+fn sleep_rejects_overflowing_finite_duration_cleanly() {
+    // A finite float outside the duration representation must return a language error.
+    let err = eval_vm_err("(async/sleep 1e100)");
+    assert!(
+        err.contains("exceeds maximum") || err.contains("range"),
+        "expected duration range error, got: {err}"
+    );
+}
+
+#[test]
+fn channel_rejects_unrepresentable_capacity_without_panicking() {
+    // Capacity validation must reject this before VecDeque attempts an allocation.
+    let err = eval_vm_err("(channel/new 9223372036854775807)");
+    assert!(
+        err.contains("capacity"),
+        "expected channel capacity error, got: {err}"
+    );
+}
+
+#[test]
+fn scheduler_workload_beyond_tick_ceiling_completes() {
+    // A scheduler safety policy must not reject a finite cooperative workload.
+    assert_eq!(
+        eval(
+            r#"
+            (await
+              (async
+                (let loop ((remaining 1000001))
+                  (if (= remaining 0)
+                      :complete
+                      (begin
+                        (async/sleep 0)
+                        (loop (- remaining 1)))))))
+            "#,
+        ),
+        Value::keyword("complete"),
+    );
+}
+
+#[test]
+fn ready_spinner_does_not_starve_due_timer() {
+    // A continuously ready task must not prevent a positive-duration timer from becoming ready.
+    assert_eq!(
+        eval(
+            r#"
+            (define spinner
+              (async
+                (let loop ()
+                  (async/sleep 0)
+                  (loop))))
+            (define timer (async (async/sleep 1) :timer-fired))
+            (list (async/race (list spinner timer))
+                  (async/cancelled? spinner))
+            "#,
+        ),
+        Value::list(vec![Value::keyword("timer-fired"), Value::bool(true)]),
+    );
+}
+
+#[test]
+fn nested_aggregate_callback_can_spawn_await_and_resume_parent() {
+    // A callback's nested suspension must resume through its parent task without re-entry.
+    assert_eq!(
+        eval(
+            r#"
+            (await
+              (async
+                (map
+                  (fn (n)
+                    (let ((values
+                            (async/all
+                              (list (async (+ n 1))
+                                    (async (+ n 2))))))
+                      (await (async (+ (car values) (cadr values))))))
+                  (list 1 10 100))))
+            "#,
+        ),
+        Value::list(vec![Value::int(5), Value::int(23), Value::int(203)]),
+    );
+}

@@ -229,6 +229,65 @@ fn decode_kitty(csi: &[u8]) -> Value {
     Value::map(m)
 }
 
+/// Parse a legacy CSI body (the bytes after `ESC [`, including the final byte)
+/// into a key name and an xterm modifier bitmask. Handles the bare forms
+/// (`A`, `3~`, …) and the modified forms `1;<mod><final>` and `<n>;<mod>~`,
+/// where `<mod>` is `1 + bitmask` (shift=1, alt=2, ctrl=4, super=8). mbits is 0
+/// when no modifier is present, keeping bare keys byte-identical to before.
+#[cfg(unix)]
+fn parse_legacy_csi(csi: &[u8]) -> (&'static str, u32) {
+    let last = *csi.last().unwrap_or(&0);
+    let params = &csi[..csi.len().saturating_sub(1)];
+    let mut fields = params.split(|&b| b == b';');
+    let first = fields.next().unwrap_or(b"");
+    let mbits = fields
+        .next()
+        .and_then(|f| std::str::from_utf8(f).ok())
+        .and_then(|s| s.parse::<u32>().ok())
+        .map(|m| m.saturating_sub(1))
+        .unwrap_or(0);
+    let name = match last {
+        b'A' => "up",
+        b'B' => "down",
+        b'C' => "right",
+        b'D' => "left",
+        b'H' => "home",
+        b'F' => "end",
+        b'Z' => "shift-tab",
+        b'~' => match first {
+            b"3" => "delete",
+            b"5" => "page-up",
+            b"6" => "page-down",
+            _ => "unknown",
+        },
+        _ => "unknown",
+    };
+    (name, mbits)
+}
+
+#[cfg(all(test, unix))]
+mod legacy_csi_tests {
+    use super::parse_legacy_csi;
+
+    #[test]
+    fn bare_sequences_are_unmodified() {
+        assert_eq!(parse_legacy_csi(b"C"), ("right", 0));
+        assert_eq!(parse_legacy_csi(b"D"), ("left", 0));
+        assert_eq!(parse_legacy_csi(b"3~"), ("delete", 0));
+        assert_eq!(parse_legacy_csi(b"5~"), ("page-up", 0));
+        assert_eq!(parse_legacy_csi(b"Z"), ("shift-tab", 0));
+    }
+
+    #[test]
+    fn modified_arrows_carry_the_modifier_bitmask() {
+        // xterm modparam = 1 + bitmask (shift=1, alt=2, ctrl=4).
+        assert_eq!(parse_legacy_csi(b"1;3C"), ("right", 2)); // alt (Option)
+        assert_eq!(parse_legacy_csi(b"1;3D"), ("left", 2)); // alt (Option)
+        assert_eq!(parse_legacy_csi(b"1;5C"), ("right", 4)); // ctrl
+        assert_eq!(parse_legacy_csi(b"3;3~"), ("delete", 2)); // alt+delete
+    }
+}
+
 // Parse a key event from stdin (assuming raw mode).
 // Returns Ok(None) on EOF, Ok(Some(value)) on success.
 #[cfg(unix)]
@@ -283,22 +342,15 @@ fn parse_key_input() -> Result<Option<Value>, SemaError> {
             if last == b'u' {
                 return Ok(Some(decode_kitty(&csi)));
             }
-            let name = match csi.as_slice() {
-                b"A" => "up",
-                b"B" => "down",
-                b"C" => "right",
-                b"D" => "left",
-                b"H" => "home",
-                b"F" => "end",
-                b"Z" => "shift-tab",
-                b"3~" => "delete",
-                b"5~" => "page-up",
-                b"6~" => "page-down",
-                _ => "unknown",
-            };
+            // Parse the bare table plus the xterm `1;<mod><final>` / `<n>;<mod>~`
+            // modifier forms, so Ctrl/Alt(Option)+arrow reach Sema with :mods.
+            let (name, mbits) = parse_legacy_csi(&csi);
             let mut m = std::collections::BTreeMap::new();
             m.insert(Value::keyword("kind"), Value::keyword("key"));
             m.insert(Value::keyword("name"), Value::keyword(name));
+            if let Some(mods) = mods_list(mbits) {
+                m.insert(Value::keyword("mods"), mods);
+            }
             return Ok(Some(Value::map(m)));
         }
 

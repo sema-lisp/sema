@@ -259,6 +259,15 @@ fn trace_vm_closure(ptr: sema_core::NodePtr, sink: &mut dyn FnMut(sema_core::GcE
     true
 }
 
+fn vm_closure_edge(closure: &Rc<Closure>) -> sema_core::GcEdge<'static> {
+    sema_core::GcEdge::Opaque {
+        ptr: sema_core::NodePtr::of_rc(closure),
+        strong_count: Rc::strong_count(closure),
+        trace: trace_vm_closure,
+        sever: sever_nothing,
+    }
+}
+
 /// Edge into a compilation unit's function table. Tables and `Function`
 /// templates are interior pass-through nodes (immutable, no severable cell)
 /// but NOT leaves: chunk consts are usually reader literals, yet macro
@@ -435,6 +444,23 @@ pub struct VM {
     gc_adopted_home: std::cell::RefCell<Weak<Env>>,
     instruction_budget: Option<usize>,
     instructions_executed: usize,
+}
+
+impl sema_core::runtime::Trace for VM {
+    fn trace(&self, sink: &mut dyn FnMut(sema_core::GcEdge<'_>)) -> bool {
+        sink(sema_core::GcEdge::Env(&self.globals));
+        sink(function_table_edge(&self.functions));
+        for value in &self.stack {
+            sink(sema_core::GcEdge::Value(value));
+        }
+        for frame in &self.frames {
+            sink(vm_closure_edge(&frame.closure));
+        }
+        for value in self.debug_values.values() {
+            sink(sema_core::GcEdge::Value(value));
+        }
+        true
+    }
 }
 
 thread_local! {
@@ -1601,12 +1627,16 @@ impl VM {
         &mut self,
         ctx: &EvalContext,
         instruction_limit: usize,
-    ) -> Result<crate::debug::VmExecResult, SemaError> {
+    ) -> crate::debug::VmQuantumResult {
         self.instruction_budget = Some(instruction_limit);
         self.instructions_executed = 0;
-        let result = self.run_inner::<false>(ctx, None);
+        let outcome = self.run_inner::<false>(ctx, None);
+        let instructions = self.instructions_executed;
         self.instruction_budget = None;
-        result
+        crate::debug::VmQuantumResult {
+            outcome,
+            instructions,
+        }
     }
 
     /// Debug-aware resume of an async task step: like [`run_async`] but with the
@@ -1951,13 +1981,15 @@ impl VM {
                         "VM: program counter out of bounds (pc={pc}, len={code_len})"
                     )));
                 }
-                if self.instruction_budget == Some(self.instructions_executed) {
-                    self.frames[fi].pc = pc;
-                    return Ok(crate::debug::VmExecResult::QuantumExpired {
-                        instructions: self.instructions_executed,
-                    });
+                if let Some(budget) = self.instruction_budget {
+                    if budget == self.instructions_executed {
+                        self.frames[fi].pc = pc;
+                        return Ok(crate::debug::VmExecResult::QuantumExpired {
+                            instructions: self.instructions_executed,
+                        });
+                    }
+                    self.instructions_executed += 1;
                 }
-                self.instructions_executed += 1;
                 let op = unsafe { *code.add(pc) };
                 pc += 1;
 
@@ -5617,13 +5649,16 @@ mod tests {
 
         let mut expiries = 0;
         loop {
-            match vm.run_quantum(&ctx, 7).expect("quantum") {
+            let quantum = vm.run_quantum(&ctx, 7);
+            match quantum.outcome.expect("quantum") {
                 crate::debug::VmExecResult::QuantumExpired { instructions } => {
                     assert_eq!(instructions, 7);
+                    assert_eq!(quantum.instructions, 7);
                     expiries += 1;
                 }
                 crate::debug::VmExecResult::Finished(value) => {
                     assert_eq!(value.as_int(), Some(0));
+                    assert!(quantum.instructions <= 7);
                     break;
                 }
                 other => panic!("unexpected quantum result: {other:?}"),

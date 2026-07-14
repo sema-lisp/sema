@@ -410,6 +410,12 @@ pub enum VmExecResult {
     AsyncYield(sema_core::YieldReason),
 }
 
+/// One budgeted VM dispatch result with exact instruction consumption.
+pub struct VmQuantumResult {
+    pub outcome: Result<VmExecResult, sema_core::SemaError>,
+    pub instructions: usize,
+}
+
 /// Information about why and where the VM stopped.
 #[derive(Debug, Clone)]
 pub struct StopInfo {

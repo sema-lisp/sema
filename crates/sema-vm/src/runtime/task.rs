@@ -5,14 +5,29 @@ use sema_core::runtime::{
     TaskRelations, TaskSettlement, Trace, WaitGeneration, WaitId,
 };
 
-/// A suspended native-to-call return edge owned by the task rather than the Rust stack.
-pub struct ContinuationFrame {
-    continuation: Box<dyn NativeContinuation>,
+/// The explicit owner of a callable result while its caller is suspended.
+pub enum ContinuationFrame {
+    Native {
+        continuation: Box<dyn NativeContinuation>,
+    },
+    VmNativeBoundary {
+        continuation: Box<dyn NativeContinuation>,
+    },
 }
 
 impl ContinuationFrame {
-    pub fn new(continuation: Box<dyn NativeContinuation>) -> Self {
-        Self { continuation }
+    pub fn native(continuation: Box<dyn NativeContinuation>) -> Self {
+        Self::Native { continuation }
+    }
+
+    pub fn vm_native(continuation: Box<dyn NativeContinuation>) -> Self {
+        Self::VmNativeBoundary { continuation }
+    }
+
+    fn into_continuation(self) -> Box<dyn NativeContinuation> {
+        match self {
+            Self::Native { continuation } | Self::VmNativeBoundary { continuation } => continuation,
+        }
     }
 
     pub fn resume(
@@ -20,13 +35,17 @@ impl ContinuationFrame {
         context: &mut sema_core::runtime::NativeCallContext<'_>,
         input: ResumeInput,
     ) -> sema_core::runtime::NativeResult {
-        self.continuation.resume(context, input)
+        self.into_continuation().resume(context, input)
     }
 }
 
 impl Trace for ContinuationFrame {
     fn trace(&self, sink: &mut dyn FnMut(sema_core::cycle::GcEdge<'_>)) -> bool {
-        self.continuation.trace(sink)
+        match self {
+            Self::Native { continuation } | Self::VmNativeBoundary { continuation } => {
+                continuation.trace(sink)
+            }
+        }
     }
 }
 

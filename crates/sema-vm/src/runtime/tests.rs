@@ -138,13 +138,13 @@ fn runtime_drive_charges_external_extract_decode_resume_and_apply_stages() {
         .expect("root admitted");
 
     let one = drive_budget(1);
-    for expected_work in 1..=8 {
+    for expected_work in 1..=9 {
         let state = runtime.drive(&one).expect("bounded stage");
         assert!(matches!(
             state,
             super::DriveState::Progress { work_items: 1, .. }
         ));
-        if expected_work < 8 {
+        if expected_work < 9 {
             assert!(matches!(handle.poll_result(), RootPoll::Pending));
         }
     }
@@ -218,6 +218,173 @@ fn continuation_chain_is_traceable_and_bounded_by_drive_work_items() {
     );
 }
 
+struct RecordingContinuation(Arc<Mutex<Vec<&'static str>>>);
+
+impl Trace for RecordingContinuation {
+    fn trace(&self, _sink: &mut dyn FnMut(sema_core::cycle::GcEdge<'_>)) -> bool {
+        true
+    }
+}
+
+impl NativeContinuation for RecordingContinuation {
+    fn resume(
+        self: Box<Self>,
+        _context: &mut NativeCallContext<'_>,
+        input: ResumeInput,
+    ) -> NativeResult {
+        self.0.lock().unwrap().push(match input {
+            ResumeInput::Returned(_) => "resume-returned",
+            ResumeInput::Failed(_) => "resume-failed",
+            ResumeInput::Cancelled(_) => "resume-cancelled",
+        });
+        Ok(NativeOutcome::Return(Value::int(9)))
+    }
+}
+
+#[test]
+fn continuation_call_apply_invoke_resume_and_final_apply_are_distinct_turns() {
+    let runtime = runtime_with_inline_executor(Rc::new(FakeClock::new()));
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let native_events = Arc::clone(&events);
+    let handle = runtime
+        .submit_test_root(TestPreparedTask::native(Ok(NativeOutcome::Call(
+            NativeCall {
+                callable: Value::native_fn(sema_core::NativeFn::simple_result(
+                    "recording-native",
+                    move |_| {
+                        native_events.lock().unwrap().push("invoke");
+                        Ok(NativeOutcome::Return(Value::int(8)))
+                    },
+                )),
+                args: Vec::new(),
+                continuation: Box::new(RecordingContinuation(Arc::clone(&events))),
+            },
+        ))))
+        .unwrap();
+
+    let one = drive_budget(1);
+    let expected = [
+        vec![],
+        vec![],
+        vec![],
+        vec!["invoke"],
+        vec!["invoke"],
+        vec!["invoke", "resume-returned"],
+        vec!["invoke", "resume-returned"],
+    ];
+    for events_after_turn in expected {
+        let report = runtime.drive(&one).unwrap();
+        assert!(matches!(
+            report,
+            super::DriveState::Progress { work_items: 1, .. }
+        ));
+        assert_eq!(*events.lock().unwrap(), events_after_turn);
+    }
+    while matches!(handle.poll_result(), RootPoll::Pending) {
+        runtime.drive(&one).unwrap();
+    }
+    assert!(matches!(
+        handle.poll_result(),
+        RootPoll::Ready(settlement)
+            if matches!(settlement.outcome, TaskOutcome::Returned(ref value) if value.as_int() == Some(9))
+    ));
+}
+
+#[test]
+fn invalid_callable_failure_is_delivered_to_its_continuation() {
+    let runtime = runtime_with_inline_executor(Rc::new(FakeClock::new()));
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let handle = runtime
+        .submit_test_root(TestPreparedTask::native(Ok(NativeOutcome::Call(
+            NativeCall {
+                callable: Value::int(3),
+                args: Vec::new(),
+                continuation: Box::new(RecordingContinuation(Arc::clone(&events))),
+            },
+        ))))
+        .unwrap();
+    while matches!(handle.poll_result(), RootPoll::Pending) {
+        runtime.drive(&drive_budget(1)).unwrap();
+    }
+    assert_eq!(*events.lock().unwrap(), vec!["resume-failed"]);
+}
+
+#[test]
+fn cancellation_before_callable_invocation_is_delivered_to_its_continuation() {
+    let runtime = runtime_with_inline_executor(Rc::new(FakeClock::new()));
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let native_events = Arc::clone(&events);
+    let handle = runtime
+        .submit_test_root(TestPreparedTask::native(Ok(NativeOutcome::Call(
+            NativeCall {
+                callable: Value::native_fn(sema_core::NativeFn::simple_result(
+                    "must-not-run",
+                    move |_| {
+                        native_events.lock().unwrap().push("invoked");
+                        Ok(NativeOutcome::Return(Value::NIL))
+                    },
+                )),
+                args: Vec::new(),
+                continuation: Box::new(RecordingContinuation(Arc::clone(&events))),
+            },
+        ))))
+        .unwrap();
+    runtime.drive(&drive_budget(1)).unwrap();
+    runtime.drive(&drive_budget(1)).unwrap();
+    runtime.drive(&drive_budget(1)).unwrap();
+    assert!(handle.cancel(CancelReason::Explicit));
+    while matches!(handle.poll_result(), RootPoll::Pending) {
+        runtime.drive(&drive_budget(1)).unwrap();
+    }
+    assert_eq!(*events.lock().unwrap(), vec!["resume-cancelled"]);
+}
+
+#[test]
+fn native_call_into_sema_closure_and_back_to_native_uses_task_vm() {
+    let forms = sema_reader::read_many("(lambda (f value) (f value))").unwrap();
+    let program = crate::compile_program(&forms, None).unwrap();
+    let context = sema_core::EvalContext::new();
+    let mut vm = crate::VM::new(
+        Rc::new(sema_core::Env::new()),
+        program.functions,
+        &program.native_table,
+        program.main_cache_slots,
+    )
+    .unwrap();
+    let callable = vm.execute(program.closure, &context).unwrap();
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let inner_events = Arc::clone(&events);
+    let inner_native = Value::native_fn(sema_core::NativeFn::simple("inner", move |args| {
+        inner_events.lock().unwrap().push("inner-native");
+        Ok(args[0].clone())
+    }));
+    let runtime = runtime_with_inline_executor(Rc::new(FakeClock::new()));
+    let handle = runtime
+        .submit_test_root(TestPreparedTask::native(Ok(NativeOutcome::Call(
+            NativeCall {
+                callable,
+                args: vec![inner_native, Value::int(17)],
+                continuation: Box::new(RecordingContinuation(Arc::clone(&events))),
+            },
+        ))))
+        .unwrap();
+    while matches!(handle.poll_result(), RootPoll::Pending) {
+        let report = runtime.drive(&drive_budget(1)).unwrap();
+        assert!(matches!(
+            report,
+            super::DriveState::Progress { work_items: 1, .. }
+        ));
+        assert!(
+            runtime.trace(&mut |_| {}),
+            "every VM-call stage is traceable"
+        );
+    }
+    assert_eq!(
+        *events.lock().unwrap(),
+        vec!["inner-native", "resume-returned"]
+    );
+}
+
 #[test]
 fn runtime_forced_trace_keeps_values_in_root_settlement_and_every_pending_stage() {
     let runtime = runtime_with_inline_executor(Rc::new(FakeClock::new()));
@@ -243,6 +410,8 @@ fn runtime_forced_trace_keeps_values_in_root_settlement_and_every_pending_stage(
     assert_eq!(edge_count(&runtime), 2, "continuation stage owners");
     runtime.drive(&drive_budget(1)).unwrap();
     assert_eq!(edge_count(&runtime), 2, "apply stage outcome");
+    runtime.drive(&drive_budget(1)).unwrap();
+    assert_eq!(edge_count(&runtime), 2, "settlement action outcome");
     runtime.drive(&drive_budget(1)).unwrap();
     assert_eq!(edge_count(&runtime), 2, "settlement action outcome");
     runtime.drive(&drive_budget(1)).unwrap();
@@ -575,9 +744,10 @@ fn runtime_wait_and_operation_exhaustion_are_separate_transactional_seams() {
     for kind in ["wait", "operation"] {
         let runtime = runtime_with_inline_executor(Rc::new(FakeClock::new()));
         runtime.force_completion_identity_exhaustion_for_test(kind);
+        let events = Arc::new(Mutex::new(Vec::new()));
         let handle = runtime
             .submit_test_root(TestPreparedTask::native(Ok(NativeOutcome::Suspend(
-                external_suspend(Arc::new(Mutex::new(Vec::new()))),
+                external_suspend(Arc::clone(&events)),
             ))))
             .unwrap();
         assert!(matches!(
@@ -588,10 +758,8 @@ fn runtime_wait_and_operation_exhaustion_are_separate_transactional_seams() {
         let RootPoll::Ready(settlement) = handle.poll_result() else {
             panic!("identity exhaustion settles the root")
         };
-        let TaskOutcome::Failed(error) = &settlement.outcome else {
-            panic!("identity exhaustion is a task failure")
-        };
-        assert!(error.to_string().contains(kind));
+        assert!(matches!(settlement.outcome, TaskOutcome::Returned(_)));
+        assert_eq!(*events.lock().unwrap(), vec!["failed"]);
     }
 }
 

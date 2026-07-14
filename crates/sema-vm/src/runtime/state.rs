@@ -6,12 +6,13 @@ use std::rc::{Rc, Weak};
 use std::sync::Arc;
 use std::time::Instant;
 
+use crate::{extract_vm_closure, VmExecResult, VM};
 #[cfg(test)]
 use sema_core::runtime::ExternalFailure;
 use sema_core::runtime::{
-    CancelReason, CancellationView, ExecutorShutdown, IdCounter, IoExecutor, NativeCallContext,
-    NativeOutcome, NativeResult, ResumeInput, RootId, RuntimeScopedIdCounter, SettlementSeq,
-    TaskContextHandle, TaskId, TaskOutcome, TaskSettlement, Trace,
+    CancelReason, CancellationView, ExecutorShutdown, IdCounter, IoExecutor, NativeCall,
+    NativeCallContext, NativeOutcome, NativeResult, ResumeInput, RootId, RuntimeScopedIdCounter,
+    SettlementSeq, TaskContextHandle, TaskId, TaskOutcome, TaskSettlement, Trace,
 };
 #[cfg(test)]
 use sema_core::runtime::{CancellationParent, LifetimeOwner, TaskRelations};
@@ -88,7 +89,9 @@ struct RuntimeTask {
     record: TaskRecord,
     payload: TaskPayload,
     pending_resume: Option<PendingResume>,
-    continuations: Vec<ContinuationFrame>,
+    suspended_owner: Option<ReturnOwner>,
+    vm_call: Option<VM>,
+    vm_owner: Option<ReturnOwner>,
     context: TaskContextHandle,
 }
 
@@ -118,6 +121,8 @@ struct RuntimeState {
     handle_cleanup: VecDeque<RootId>,
     pending: VecDeque<PendingStage>,
     drive_cursor: usize,
+    active_instruction_limit: usize,
+    turn_instructions: usize,
     shutting_down: bool,
     terminal_fault: Option<RuntimeFault>,
     #[cfg(test)]
@@ -147,7 +152,12 @@ impl Trace for RuntimeTask {
                 .as_ref()
                 .is_none_or(|pending| pending.trace(sink))
             && self.payload.trace(sink)
-            && self.continuations.iter().all(|frame| frame.trace(sink))
+            && self
+                .suspended_owner
+                .as_ref()
+                .is_none_or(|owner| owner.trace(sink))
+            && self.vm_call.as_ref().is_none_or(|vm| vm.trace(sink))
+            && self.vm_owner.as_ref().is_none_or(|owner| owner.trace(sink))
             && self.context.trace(sink)
     }
 }
@@ -188,6 +198,8 @@ impl Runtime {
                 handle_cleanup: VecDeque::new(),
                 pending: VecDeque::new(),
                 drive_cursor: 0,
+                active_instruction_limit: usize::MAX,
+                turn_instructions: 0,
                 shutting_down: false,
                 terminal_fault: None,
                 #[cfg(test)]
@@ -249,7 +261,9 @@ impl Runtime {
                 record: TaskRecord::new(task, relations),
                 payload: TaskPayload::Test(prepared),
                 pending_resume: None,
-                continuations: Vec::new(),
+                suspended_owner: None,
+                vm_call: None,
+                vm_owner: None,
                 context: TaskContextHandle::default(),
             },
         );
@@ -261,6 +275,11 @@ impl Runtime {
     }
 
     pub fn drive(&self, budget: &DriveBudget) -> Result<DriveState, RuntimeFault> {
+        {
+            let mut state = self.state.borrow_mut();
+            state.active_instruction_limit = budget.instruction_limit_per_task.get();
+            state.turn_instructions = 0;
+        }
         let start = self.state.borrow().clock.now();
         let mut work_items = 0;
         let mut root_visits = 0;
@@ -354,6 +373,7 @@ impl Runtime {
         }
 
         let state = self.state.borrow();
+        let instructions = state.turn_instructions;
         if let Some(fault) = &state.terminal_fault {
             return Err(fault.clone());
         }
@@ -364,7 +384,7 @@ impl Runtime {
         if work_items > 0 {
             Ok(DriveState::Progress {
                 work_items,
-                instructions: 0,
+                instructions,
                 ready_remaining,
             })
         } else if state.shutting_down
@@ -582,10 +602,25 @@ impl Runtime {
             PendingStage::Decode(pending) => PendingStage::Continue(pending.invoke_decoder()),
             PendingStage::Continue(pending) => {
                 let task = pending.task_id();
-                PendingStage::Apply(task, pending.invoke_continuation())
+                let owner = self
+                    .state
+                    .borrow_mut()
+                    .tasks
+                    .get_mut(&task)
+                    .and_then(|task| task.suspended_owner.take())
+                    .unwrap_or(ReturnOwner::Root);
+                PendingStage::Apply(task, owner, pending.invoke_continuation())
             }
-            PendingStage::Apply(task, result) => {
-                self.apply_native_result(task, result)?;
+            PendingStage::Invoke(task, owner, call) => {
+                self.invoke_callable(task, owner, call)?;
+                return Ok(true);
+            }
+            PendingStage::Resume(task, owner, frame, input) => {
+                self.resume_continuation(task, owner, frame, input)?;
+                return Ok(true);
+            }
+            PendingStage::Apply(task, owner, result) => {
+                self.apply_native_result(task, owner, result)?;
                 return Ok(true);
             }
         };
@@ -620,6 +655,36 @@ impl Runtime {
             TaskAction::Resume(pending)
         } else if let Some(cancel) = task.record.cancellation() {
             TaskAction::Settle(root, task_id, TaskOutcome::Cancelled(cancel.reason))
+        } else if let Some(mut vm) = task.vm_call.take() {
+            let (context, instruction_limit) = {
+                let state = self.state.borrow();
+                (Rc::clone(&state._context), state.active_instruction_limit)
+            };
+            let quantum = vm.run_quantum(&context, instruction_limit);
+            self.state.borrow_mut().turn_instructions += quantum.instructions;
+            match quantum.outcome {
+                Ok(VmExecResult::QuantumExpired { .. }) => {
+                    task.vm_call = Some(vm);
+                    TaskAction::Yield(root, task_id)
+                }
+                Ok(VmExecResult::Finished(value)) => TaskAction::VmResult(
+                    task_id,
+                    task.vm_owner.take().expect("VM call has a return owner"),
+                    Ok(NativeOutcome::Return(value)),
+                ),
+                Err(error) => TaskAction::VmResult(
+                    task_id,
+                    task.vm_owner.take().expect("VM call has a return owner"),
+                    Err(error),
+                ),
+                Ok(other) => TaskAction::VmResult(
+                    task_id,
+                    task.vm_owner.take().expect("VM call has a return owner"),
+                    Err(sema_core::SemaError::eval(format!(
+                        "unsupported runtime VM stop: {other:?}"
+                    ))),
+                ),
+            }
         } else {
             match &mut task.payload {
                 #[cfg(not(test))]
@@ -666,7 +731,18 @@ impl Runtime {
                 state.ready.enqueue(root, task_id);
             }
             TaskAction::Settle(root, task_id, outcome) => self.settle(root, task_id, outcome)?,
-            TaskAction::Native(task_id, result) => self.apply_native_result(task_id, result)?,
+            TaskAction::Native(task_id, result) => {
+                self.state
+                    .borrow_mut()
+                    .pending
+                    .push_back(PendingStage::Apply(task_id, ReturnOwner::Root, result));
+            }
+            TaskAction::VmResult(task_id, owner, result) => {
+                self.state
+                    .borrow_mut()
+                    .pending
+                    .push_back(PendingStage::Apply(task_id, owner, result));
+            }
             #[cfg(test)]
             TaskAction::Timer(task_id, deadline) => {
                 let mut state = self.state.borrow_mut();
@@ -698,7 +774,7 @@ impl Runtime {
                 self.state
                     .borrow_mut()
                     .pending
-                    .push_back(PendingStage::Apply(task_id, result));
+                    .push_back(PendingStage::Apply(task_id, ReturnOwner::Root, result));
             }
             TaskAction::Resume(pending) => {
                 self.state
@@ -713,31 +789,39 @@ impl Runtime {
     fn apply_native_result(
         &self,
         task_id: TaskId,
+        owner: ReturnOwner,
         result: NativeResult,
     ) -> Result<(), RuntimeFault> {
-        let has_continuation = self
-            .state
-            .borrow()
-            .tasks
-            .get(&task_id)
-            .is_some_and(|task| !task.continuations.is_empty());
-        if has_continuation {
-            match result {
-                Ok(NativeOutcome::Return(value)) => {
-                    return self.resume_continuation(task_id, ResumeInput::Returned(value));
-                }
-                Err(error) => {
-                    return self.resume_continuation(task_id, ResumeInput::Failed(error));
-                }
-                other => return self.apply_native_outcome(task_id, other),
-            }
+        match (owner, result) {
+            (ReturnOwner::Continuation(parent, frame), Ok(NativeOutcome::Return(value))) => self
+                .state
+                .borrow_mut()
+                .pending
+                .push_back(PendingStage::Resume(
+                    task_id,
+                    *parent,
+                    frame,
+                    ResumeInput::Returned(value),
+                )),
+            (ReturnOwner::Continuation(parent, frame), Err(error)) => self
+                .state
+                .borrow_mut()
+                .pending
+                .push_back(PendingStage::Resume(
+                    task_id,
+                    *parent,
+                    frame,
+                    ResumeInput::Failed(error),
+                )),
+            (owner, result) => return self.apply_native_outcome(task_id, owner, result),
         }
-        self.apply_native_outcome(task_id, result)
+        Ok(())
     }
 
     fn apply_native_outcome(
         &self,
         task_id: TaskId,
+        owner: ReturnOwner,
         result: NativeResult,
     ) -> Result<(), RuntimeFault> {
         let root = self
@@ -751,9 +835,13 @@ impl Runtime {
             })?;
         match result {
             Ok(NativeOutcome::Return(value)) => {
+                debug_assert!(matches!(owner, ReturnOwner::Root));
                 self.settle(root, task_id, TaskOutcome::Returned(value))
             }
-            Err(error) => self.settle(root, task_id, TaskOutcome::Failed(error)),
+            Err(error) => {
+                debug_assert!(matches!(owner, ReturnOwner::Root));
+                self.settle(root, task_id, TaskOutcome::Failed(error))
+            }
             Ok(NativeOutcome::Suspend(suspend)) => {
                 let (mut task, mut waits) =
                     {
@@ -768,11 +856,9 @@ impl Runtime {
                         })?;
                         (task, waits)
                     };
-                let registration = waits.register_external(
-                    &mut task.record,
-                    suspend,
-                    TaskContextHandle::default(),
-                );
+                let registration =
+                    waits.register_external(&mut task.record, suspend, task.context.clone());
+                task.suspended_owner = Some(owner);
                 let mut state = self.state.borrow_mut();
                 state.waits = Some(waits);
                 state.tasks.insert(task_id, task);
@@ -782,79 +868,177 @@ impl Runtime {
                         state.pending.push_back(PendingStage::Decode(*pending));
                         Ok(())
                     }
-                    Err(RegisterExternalError::IdExhausted(kind, _)) => {
-                        drop(state);
-                        self.settle(
-                            root,
+                    Err(RegisterExternalError::IdExhausted(kind, suspend)) => {
+                        let owner = state
+                            .tasks
+                            .get_mut(&task_id)
+                            .and_then(|task| task.suspended_owner.take())
+                            .unwrap_or(ReturnOwner::Root);
+                        state.pending.push_back(PendingStage::Resume(
                             task_id,
-                            TaskOutcome::Failed(sema_core::SemaError::eval(format!(
+                            owner,
+                            ContinuationFrame::native(suspend.continuation),
+                            ResumeInput::Failed(sema_core::SemaError::eval(format!(
                                 "runtime {kind} identity exhausted"
                             ))),
-                        )
+                        ));
+                        Ok(())
                     }
                 }
             }
             Ok(NativeOutcome::Call(call)) => {
-                let mut state = self.state.borrow_mut();
-                let eval_context = Rc::clone(&state._context);
-                let task =
-                    state
-                        .tasks
-                        .get_mut(&task_id)
-                        .ok_or_else(|| RuntimeFault::Invariant {
-                            message: "calling task disappeared".into(),
-                        })?;
-                task.continuations
-                    .push(ContinuationFrame::new(call.continuation));
-                let native =
-                    call.callable
-                        .as_native_fn_rc()
-                        .ok_or_else(|| RuntimeFault::Invariant {
-                            message:
-                                "Sema closure continuation execution is deferred to Task 4 Step 4"
-                                    .into(),
-                        })?;
-                let mut task_context = task.context.borrow_mut();
-                let mut context = NativeCallContext {
-                    task_context: &mut task_context,
-                    cancellation: CancellationView::new(false, None),
-                };
-                let result = native.invoke_runtime(&eval_context, &mut context, &call.args);
-                drop(task_context);
-                state
+                self.state
+                    .borrow_mut()
                     .pending
-                    .push_back(PendingStage::Apply(task_id, result));
+                    .push_back(PendingStage::Invoke(task_id, owner, call));
                 Ok(())
             }
         }
     }
 
-    fn resume_continuation(&self, task_id: TaskId, input: ResumeInput) -> Result<(), RuntimeFault> {
-        let mut state = self.state.borrow_mut();
-        let Some(task) = state.tasks.get_mut(&task_id) else {
+    fn invoke_callable(
+        &self,
+        task_id: TaskId,
+        owner: ReturnOwner,
+        call: NativeCall,
+    ) -> Result<(), RuntimeFault> {
+        let (eval_context, context, cancellation) = {
+            let state = self.state.borrow();
+            let task = state
+                .tasks
+                .get(&task_id)
+                .ok_or_else(|| RuntimeFault::Invariant {
+                    message: "calling task disappeared".into(),
+                })?;
+            (
+                Rc::clone(&state._context),
+                task.context.clone(),
+                task.record.cancellation(),
+            )
+        };
+        if let Some(cancellation) = cancellation {
+            let frame = if extract_vm_closure(&call.callable).is_some() {
+                ContinuationFrame::vm_native(call.continuation)
+            } else {
+                ContinuationFrame::native(call.continuation)
+            };
+            self.state
+                .borrow_mut()
+                .pending
+                .push_back(PendingStage::Resume(
+                    task_id,
+                    owner,
+                    frame,
+                    ResumeInput::Cancelled(cancellation.reason),
+                ));
+            return Ok(());
+        }
+        let (frame, result) =
+            if let Some((closure, functions)) = extract_vm_closure(&call.callable) {
+                let globals = closure
+                    .globals
+                    .clone()
+                    .ok_or_else(|| RuntimeFault::Invariant {
+                        message: "VM closure has no home environment".into(),
+                    })?;
+                let mut vm = VM::new_for_task(globals, functions, &[]).map_err(|error| {
+                    RuntimeFault::Invariant {
+                        message: format!("failed to create task VM: {error}"),
+                    }
+                })?;
+                let frame = ContinuationFrame::vm_native(call.continuation);
+                match vm.setup_for_call(closure, &call.args) {
+                    Ok(()) => {
+                        let mut state = self.state.borrow_mut();
+                        let task = state.tasks.get_mut(&task_id).ok_or_else(|| {
+                            RuntimeFault::Invariant {
+                                message: "calling task disappeared".into(),
+                            }
+                        })?;
+                        task.vm_call = Some(vm);
+                        task.vm_owner = Some(ReturnOwner::Continuation(Box::new(owner), frame));
+                        task.record
+                            .yield_ready()
+                            .map_err(|error| RuntimeFault::Invariant {
+                                message: format!("VM callable failed to yield ready: {error:?}"),
+                            })?;
+                        let root = task.record.relations().origin_root;
+                        state.ready.enqueue(root, task_id);
+                        return Ok(());
+                    }
+                    Err(error) => (frame, Err(error)),
+                }
+            } else if let Some(native) = call.callable.as_native_fn_rc() {
+                let mut task_context = context.borrow_mut();
+                let mut native_context = NativeCallContext {
+                    task_context: &mut task_context,
+                    cancellation: CancellationView::new(
+                        cancellation.is_some(),
+                        cancellation.map(|request| request.reason),
+                    ),
+                };
+                (
+                    ContinuationFrame::native(call.continuation),
+                    native.invoke_runtime(&eval_context, &mut native_context, &call.args),
+                )
+            } else {
+                (
+                    ContinuationFrame::vm_native(call.continuation),
+                    Err(sema_core::SemaError::type_error(
+                        "callable",
+                        call.callable.type_name(),
+                    )),
+                )
+            };
+        self.state
+            .borrow_mut()
+            .pending
+            .push_back(PendingStage::Apply(
+                task_id,
+                ReturnOwner::Continuation(Box::new(owner), frame),
+                result,
+            ));
+        Ok(())
+    }
+
+    fn resume_continuation(
+        &self,
+        task_id: TaskId,
+        owner: ReturnOwner,
+        frame: ContinuationFrame,
+        input: ResumeInput,
+    ) -> Result<(), RuntimeFault> {
+        let (context, cancellation) = {
+            let state = self.state.borrow();
+            let Some(task) = state.tasks.get(&task_id) else {
+                return Err(RuntimeFault::Invariant {
+                    message: "continuation task disappeared".into(),
+                });
+            };
+            (task.context.clone(), task.record.cancellation())
+        };
+        let mut task_context = context.borrow_mut();
+        let mut native_context = NativeCallContext {
+            task_context: &mut task_context,
+            cancellation: CancellationView::new(
+                cancellation.is_some(),
+                cancellation.map(|request| request.reason),
+            ),
+        };
+        let input = cancellation
+            .map(|request| ResumeInput::Cancelled(request.reason))
+            .unwrap_or(input);
+        let resumed = frame.resume(&mut native_context, input);
+        drop(task_context);
+        if !self.state.borrow().tasks.contains_key(&task_id) {
             return Err(RuntimeFault::Invariant {
                 message: "continuation task disappeared".into(),
             });
         };
-        let Some(frame) = task.continuations.pop() else {
-            return Err(RuntimeFault::Invariant {
-                message: "continuation frame disappeared".into(),
-            });
-        };
-        let mut task_context = task.context.borrow_mut();
-        let cancellation = task.record.cancellation();
-        let mut context = NativeCallContext {
-            task_context: &mut task_context,
-            cancellation: CancellationView::new(
-                cancellation.is_some(),
-                cancellation.map(|c| c.reason),
-            ),
-        };
-        let resumed = frame.resume(&mut context, input);
-        drop(task_context);
-        state
+        self.state
+            .borrow_mut()
             .pending
-            .push_back(PendingStage::Apply(task_id, resumed));
+            .push_back(PendingStage::Apply(task_id, owner, resumed));
         Ok(())
     }
 
@@ -1311,6 +1495,7 @@ enum TaskAction {
     Yield(RootId, TaskId),
     Settle(RootId, TaskId, TaskOutcome),
     Native(TaskId, NativeResult),
+    VmResult(TaskId, ReturnOwner, NativeResult),
     #[cfg(test)]
     Timer(TaskId, Instant),
     #[cfg(test)]
@@ -1322,7 +1507,14 @@ enum PendingStage {
     Action(TaskAction),
     Decode(PendingResume),
     Continue(PendingResume),
-    Apply(TaskId, NativeResult),
+    Invoke(TaskId, ReturnOwner, NativeCall),
+    Resume(TaskId, ReturnOwner, ContinuationFrame, ResumeInput),
+    Apply(TaskId, ReturnOwner, NativeResult),
+}
+
+enum ReturnOwner {
+    Root,
+    Continuation(Box<ReturnOwner>, ContinuationFrame),
 }
 
 impl Trace for PendingStage {
@@ -1330,10 +1522,26 @@ impl Trace for PendingStage {
         match self {
             Self::Action(action) => action.trace(sink),
             Self::Decode(pending) | Self::Continue(pending) => pending.trace(sink),
-            Self::Apply(_, result) => match result {
-                Ok(outcome) => outcome.trace(sink),
-                Err(error) => error.trace(sink),
-            },
+            Self::Invoke(_, owner, call) => owner.trace(sink) && call.trace(sink),
+            Self::Resume(_, owner, frame, input) => {
+                owner.trace(sink) && frame.trace(sink) && input.trace(sink)
+            }
+            Self::Apply(_, owner, result) => {
+                owner.trace(sink)
+                    && match result {
+                        Ok(outcome) => outcome.trace(sink),
+                        Err(error) => error.trace(sink),
+                    }
+            }
+        }
+    }
+}
+
+impl Trace for ReturnOwner {
+    fn trace(&self, sink: &mut dyn FnMut(sema_core::cycle::GcEdge<'_>)) -> bool {
+        match self {
+            Self::Root => true,
+            Self::Continuation(parent, frame) => parent.trace(sink) && frame.trace(sink),
         }
     }
 }
@@ -1346,6 +1554,13 @@ impl Trace for TaskAction {
                 Ok(outcome) => outcome.trace(sink),
                 Err(error) => error.trace(sink),
             },
+            Self::VmResult(_, owner, result) => {
+                owner.trace(sink)
+                    && match result {
+                        Ok(outcome) => outcome.trace(sink),
+                        Err(error) => error.trace(sink),
+                    }
+            }
             #[cfg(test)]
             Self::NativeCall(_, _) => true,
             #[cfg(test)]

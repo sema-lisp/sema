@@ -22,7 +22,9 @@ deterministic async integration tests.
 
 - **Status:** Ready only after Task 03 is accepted and committed.
 - **Dependencies:** Interpreter-owned multi-root runtime, VM continuations,
-  fair bounded driving, generations, cleanup registry, captured-cell coherence.
+  fair bounded driving, generations, cleanup registry, captured-cell coherence,
+  and the temporary one-way `LegacyAsyncAbiAdapter` that carries current
+  language behavior without owning or driving a scheduler.
 - **Immutable inputs:** Master promise states, observational operations, detached
   spawn, owned operations, `async/run`, validation, and structured conditions.
 - **Exact start state:** Clean worktree; latest commit subject is
@@ -56,10 +58,7 @@ deterministic async integration tests.
 
 **Create**
 
-- `crates/sema-vm/src/runtime/promise.rs` — runtime promise registry and
-  observations.
 - `crates/sema-vm/src/runtime/scope.rs` — owned child scopes and cleanup state.
-- `crates/sema-vm/src/runtime/channel.rs` — bounded channel state and waits.
 - `crates/sema-stdlib/src/async_owned.rs` — thunk-taking structured operations.
 - `crates/sema/tests/async_contract_test.rs` — language contract matrix.
 - `crates/sema/tests/async_owned_test.rs` — ownership/reaping matrix.
@@ -71,6 +70,10 @@ deterministic async integration tests.
 
 **Modify**
 
+- `crates/sema-vm/src/runtime/promise.rs` — complete public promise predicates,
+  diagnostics, and observation semantics on Task 03's four-state registry.
+- `crates/sema-vm/src/runtime/channel.rs` — complete bounded-channel validation,
+  close behavior, and public waits on Task 03's identity registry.
 - `crates/sema-core/src/value.rs` — four-state promise handle and channel handle.
 - `crates/sema-core/src/cycle.rs` — trace pending observations, settlements, and
   channel values.
@@ -90,6 +93,16 @@ deterministic async integration tests.
   `async/with-timeout` with a thunk.
 - `docs/internals/async-runtime-inventory.md` and the legacy baseline — remove
   language-layer bridges and record any compatibility aliases.
+
+`LegacyAsyncAbiAdapter` is a migration input, not a permanent compatibility
+surface. Tasks 1–7 replace each adapted promise, spawn, observation, timer,
+barrier, and channel path with runtime-native state. Task 7 deletes the adapter
+and every remaining signal/resume TLS or scheduler-drive symbol before Task 8
+begins, except the exact `AwaitIo` signal functions and producer-side
+`take_resume_value` references inventoried under `LegacyAwaitIoBridge` for Tasks
+05–08. The separate `LegacyRuntimeBridge` may remain only for producers with an
+explicit Task 05–08 owner; neither bridge provides scheduling or runtime
+driving.
 
 ## Exact language surface
 
@@ -136,7 +149,7 @@ promise whose message contains “cancelled” is still failed.
 ```rust
 pub enum PromisePoll {
     Pending,
-    Settled(TaskSettlement),
+    Settled(Rc<TaskSettlement>),
 }
 
 pub struct Observation {
@@ -149,7 +162,7 @@ pub struct OwnedScope {
     pub id: ScopeId,
     pub owner: TaskId,
     pub children: Vec<TaskId>,
-    pub primary: Option<TaskSettlement>,
+    pub primary: Option<Rc<TaskSettlement>>,
     pub state: ScopeState,
 }
 
@@ -373,14 +386,28 @@ Channel state owns buffered `Value`s and waiter IDs on the runtime thread.
 Cancellation removes exactly one wait generation. Capacity validation happens
 before integer conversion and allocation.
 
-- [ ] **Step 3: Run**
+- [ ] **Step 3: Delete the temporary language ABI adapter**
+
+After channel tests are GREEN, remove `LegacyAsyncAbiAdapter` and all remaining
+production references to `set_yield_signal`, `take_yield_signal`,
+`set_resume_value`, `take_resume_value`, `call_run_scheduler*`,
+`SchedulerTarget`, and `SchedulerRunResult`. Refresh the inventory and legacy
+baseline. The only permitted matches are the exact `LegacyAwaitIoBridge`
+signal/poller and producer-side compatibility checks assigned to Tasks 05–08.
+No replacement may own a task store, timer, ready queue, clock, or nested drive
+loop.
+
+- [ ] **Step 4: Run**
 
 ```bash
 cargo test -p sema-lang --test async_contract_test -- channel
 cargo test -p sema-core cycle
+rg -n 'LegacyAsyncAbiAdapter|set_yield_signal|take_yield_signal|set_resume_value|take_resume_value|call_run_scheduler|SchedulerTarget|SchedulerRunResult' crates --glob '*.rs'
 ```
 
-Expected: channel matrix passes without polling or wall-clock sleeps.
+Expected: channel matrix passes without polling or wall-clock sleeps; the
+legacy-symbol search has no production language-layer matches outside the exact
+inventoried `LegacyAwaitIoBridge` producer list.
 
 ## Task 8: Migrate cancellation-dependent call sites
 
@@ -422,8 +449,9 @@ cancelled.
 cargo test -p sema-lang --test async_condition_test
 ```
 
-Expected: cancellation maps contain `:type`, `:reason`, `:task-id`, and
-`:root-id`; timeout maps contain `:type` and `:duration-ms`; rethrow preserves
+Expected: cancellation maps contain the accepted stable `:type`, `:reason`, and
+`:root-id` keys, with `:scope-id`/`:operation-id` when that relation exists;
+timeout maps contain `:type` and `:duration-ms`; rethrow preserves
 identity and `spawned by`/`awaited by`/`cancelled by` links.
 
 - [ ] **Step 2: Run layer gates**

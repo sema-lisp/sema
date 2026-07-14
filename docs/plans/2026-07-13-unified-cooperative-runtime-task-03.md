@@ -63,6 +63,10 @@ deterministic clocks, Cargo integration tests.
 - `crates/sema-vm/src/runtime/ready.rs` — per-root FIFO and root rotation.
 - `crates/sema-vm/src/runtime/timer.rs` — monotonic timer heap and test clock.
 - `crates/sema-vm/src/runtime/wait.rs` — wait registration/generation checks.
+- `crates/sema-vm/src/runtime/promise.rs` — minimal final four-state promise
+  registry and observation sets required by the Task 03 language ABI bridge.
+- `crates/sema-vm/src/runtime/channel.rs` — minimal final channel identity and
+  wait registry; Task 04 completes the public channel contract.
 - `crates/sema-vm/src/runtime/drive.rs` — bounded turn orchestration.
 - `crates/sema-vm/src/runtime/cleanup.rs` — cancellation and quarantine reaping.
 - `crates/sema-vm/src/runtime/debug.rs` — stop-the-world debugger state.
@@ -76,6 +80,12 @@ deterministic clocks, Cargo integration tests.
 **Modify**
 
 - `crates/sema-vm/src/lib.rs` — export runtime API.
+- `crates/sema-core/src/runtime/native.rs` — add traced runtime requests and
+  promise-set waits; `NativeCallContext` remains capability-free.
+- `crates/sema-core/src/runtime/executor.rs` — expose one doc-hidden universal
+  wait-identity issue path used by internal and external waits.
+- `crates/sema-core/src/value.rs` and `crates/sema-core/src/cycle.rs` — add
+  checked promise/channel handles backed only by runtime identity.
 - `crates/sema-vm/src/vm.rs` — resumable native frames, instruction quanta,
   shared captured-cell reads/writes, safe points, and suspend results.
 - `crates/sema-vm/src/debug.rs` — replace ambiguous yield variants with explicit
@@ -89,6 +99,19 @@ deterministic clocks, Cargo integration tests.
 - `crates/sema-eval/src/lib.rs` — export root/drive types needed by hosts later.
 - `crates/sema-eval/src/debug_session.rs` — bind debug state to the interpreter
   runtime instead of a parallel execution loop.
+- `crates/sema-stdlib/src/async_ops.rs` — move existing suspending language
+  entry points onto the native continuation ABI before removing the scheduler
+  ABI; final promise/channel/ownership semantics remain Task 04.
+- `crates/sema-stdlib/src/system.rs` — move the compatibility sleep producer to
+  the runtime timer path; only inventoried `AwaitIo` producers retain signals.
+- `crates/sema-stdlib/src/io.rs` — make legacy I/O pollers return data only;
+  streaming callbacks execute as separately charged same-task native calls.
+- `crates/sema/src/lib.rs` and `crates/sema-wasm/src/lib.rs` — replace direct
+  `Interpreter` struct literals with the runtime-aware constructor.
+- `crates/sema/src/main.rs`, `crates/sema/src/workflow_view/ingest.rs`,
+  `crates/sema-dap/src/server.rs`, and `crates/sema-mcp/src/tools.rs` — classify
+  direct VM host execution and route it through root preparation or an explicit
+  Task 07-owned host boundary.
 - `crates/sema/tests/vm_async_test.rs` — turn scheduler/captured-cell
   characterization from RED to GREEN without changing its oracle.
 - `docs/internals/async-runtime-inventory.md` and the legacy baseline — record
@@ -107,18 +130,16 @@ pub struct VmRootOptions {
 }
 
 pub struct PreparedRoot {
-    pub vm: VM,
-    pub entry: Value,
+    vm: VM,
 }
 
-#[derive(Clone)]
 pub struct RootHandle {
     runtime: Weak<RefCell<RuntimeState>>,
     id: RootId,
-    lease: RootHandleLease,
 }
 
 pub struct DriveBudget {
+    pub work_item_limit: NonZeroUsize,
     pub completion_limit: NonZeroUsize,
     pub timer_limit: NonZeroUsize,
     pub root_visit_limit: NonZeroUsize,
@@ -128,10 +149,15 @@ pub struct DriveBudget {
 }
 
 pub enum DriveState {
-    Progress { work_items: usize, ready_remaining: bool },
+    Progress {
+        work_items: usize,
+        instructions: usize,
+        ready_remaining: bool,
+    },
     Idle {
         next_deadline: Option<Instant>,
         inbox_wakeup_required: bool,
+        legacy_io_wakeup_required: bool,
     },
     Quiescent,
     DebugStopped(DebugStop),
@@ -148,8 +174,25 @@ pub enum RuntimeCreateError {
     ExecutorAttach(ExecutorAttachError),
 }
 
+pub enum SubmitRootError {
+    IdExhausted,
+    ShuttingDown,
+}
+
+pub enum RuntimeFault {
+    IdExhausted { kind: &'static str },
+    Invariant { message: String },
+}
+
+pub enum RootPoll {
+    Pending,
+    Ready(Rc<TaskSettlement>),
+    RuntimeDropped,
+}
+
 impl Runtime {
     pub fn new(
+        context: Rc<EvalContext>,
         clock: Rc<dyn RuntimeClock>,
         executor: Arc<dyn IoExecutor>,
     ) -> Result<Self, RuntimeCreateError>;
@@ -157,10 +200,11 @@ impl Runtime {
         &self,
         prepared: PreparedRoot,
         options: VmRootOptions,
-    ) -> RootHandle;
-    pub fn drive(&self, budget: DriveBudget) -> DriveState;
+    ) -> Result<RootHandle, SubmitRootError>;
+    pub fn drive(&self, budget: &DriveBudget) -> Result<DriveState, RuntimeFault>;
     pub fn cancel_root(&self, root: RootId, reason: CancelReason) -> bool;
-    pub fn shutdown(&self, options: ShutdownOptions) -> ShutdownReport;
+    pub fn shutdown(&self, options: &ShutdownOptions) -> Result<ShutdownReport, RuntimeFault>;
+    pub fn close_for_interpreter_drop(&self);
 }
 
 impl RootHandle {
@@ -171,13 +215,21 @@ impl RootHandle {
 ```
 
 `RuntimeState` is private. `Runtime` is the interpreter-owned strong handle and
-is not `Clone`; root handles retain only `Weak` access to the same state. This
-internal-handle shape lets `submit_root(&self, ...)` construct a non-owning
-`RootHandle` without introducing a second runtime owner. Its cloneable lease
-increments an explicit runtime-side handle count; every drop decrements it.
+is not `Clone`; root handles retain only `Weak` access to the same state.
+`RootHandle::clone` upgrades the weak pointer and increments an explicit
+runtime-side handle count when the runtime is alive; every drop upgrades and
+decrements it when possible. There is no independently cloneable lease.
 Settlement remains pollable while that count is nonzero. Final-handle drop is
 queued as cleanup, and the root is reaped only after settlement and after all
 descendant, debugger, output, and tracing retention reaches zero.
+
+`Runtime` owns the interpreter's `Rc<EvalContext>` because every VM quantum and
+the Task 02 legacy-native fallback require it. The runtime installs the active
+task's `TaskContextHandle` only for the duration of legacy callback invocation;
+runtime-aware natives receive only `NativeCallContext`. `PreparedRoot` is opaque
+and contains a VM whose initial frame was already installed by a fallible
+`VM::prepare_entry(Rc<Closure>)`; it does not carry a second `Value` that can
+disagree with the VM entry.
 
 `Runtime::new` creates its thread-safe completion inbox, calls
 `CompletionRegistrar::register` to receive a fresh `RuntimeId` plus the
@@ -193,19 +245,29 @@ production `sema-io` implementation at host construction sites. Constructor
 tests force registrar exhaustion and each executor attachment failure and assert
 the exact `RuntimeCreateError` variant.
 
-`RootPoll` is `Pending`, `Ready(Result<Value, SemaError>)`, or
-`RuntimeDropped`. Polling never drives the runtime. Result retrieval is
-idempotent and never consumes the stored settlement.
+Task 03 adds fallible `Interpreter::try_new*` and one parts constructor that
+accepts an executor. Existing infallible constructors use a documented local
+executor that attaches successfully and rejects unsupported external submissions
+through the ordinary registered rejection path; they never unwrap attachment or
+identity allocation. If runtime identity allocation fails, the compatibility
+constructor records a terminal initialization error and every evaluation returns
+that error without admitting a root. Direct struct literals in `sema` and
+`sema-wasm` are replaced by the parts constructor. Task 05 replaces the local
+executor at native host construction sites, and Task 07 finalizes host-facing
+fallible construction.
+
+`RootPoll::Ready` returns the retained `Rc<TaskSettlement>`, preserving the
+three-way returned/failed/cancelled outcome and its `SettlementSeq`. Polling
+never drives, takes, or mutates runtime state. It is idempotent for every live
+handle, including after the main task record is reaped. `RuntimeDropped` means
+the weak runtime pointer no longer upgrades, not that a result was consumed.
 
 ```rust
 pub enum TaskState {
     Ready,
     Running,
-    Waiting {
-        wait_id: WaitId,
-        generation: WaitGeneration,
-    },
-    Settled(TaskSettlement),
+    Waiting(WaitKey),
+    Settled(Rc<TaskSettlement>),
 }
 
 pub enum VmExecResult {
@@ -216,28 +278,127 @@ pub enum VmExecResult {
     DebugStopped(DebugStop),
 }
 
+pub enum RuntimeRequest {
+    Spawn {
+        callable: Value,
+        continuation: Box<dyn NativeContinuation>,
+    },
+    CancelPromise {
+        promise: PromiseId,
+        continuation: Box<dyn NativeContinuation>,
+    },
+    CreateChannel {
+        capacity: usize,
+        continuation: Box<dyn NativeContinuation>,
+    },
+    ChannelOp {
+        channel: ChannelId,
+        operation: ChannelOperation,
+        continuation: Box<dyn NativeContinuation>,
+    },
+    CreateSettledPromise {
+        outcome: TaskOutcome,
+        continuation: Box<dyn NativeContinuation>,
+    },
+    InspectPromise {
+        promise: PromiseId,
+        continuation: Box<dyn NativeContinuation>,
+    },
+    OriginBarrier {
+        continuation: Box<dyn NativeContinuation>,
+    },
+}
+
+pub enum ChannelOperation {
+    Close,
+    TryReceive,
+    Inspect(ChannelQuery),
+}
+
+pub enum ChannelQuery { Closed, Count, Empty, Full }
+
+pub enum PromiseSetMode {
+    All,
+    Race,
+    Timeout(Duration),
+}
+
+pub struct PromiseSetWait {
+    pub promises: Vec<PromiseId>,
+    pub mode: PromiseSetMode,
+}
+
 pub struct CancellationRequest {
     pub reason: CancelReason,
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct WaitKey {
+    pub id: WaitId,
+    pub generation: WaitGeneration,
+}
+
+pub enum RootState {
+    Running { main_task: TaskId },
+    Settled(Rc<TaskSettlement>),
+}
+
+pub struct RootRecord {
+    id: RootId,
+    state: RootState,
+}
+
+pub struct TaskRecord {
+    id: TaskId,
+    relations: TaskRelations,
+    state: TaskState,
+    cancellation: Option<CancellationRequest>,
+}
+
+pub enum StateName { Ready, Running, Waiting, Settled }
+
+pub enum TaskTransitionError {
+    Invalid { from: StateName, to: StateName },
+    WaitMismatch { expected: WaitKey, actual: WaitKey },
+}
+
+pub enum RootTransitionError {
+    WrongMainTask { expected: TaskId, actual: TaskId },
+    AlreadySettled,
+}
+
 /// Exists only after `Runtime::apply_native_suspend` registers an external
 /// request; it is never a second unregistered request type.
-pub struct RegisteredExternalWait {
-    pub operation_id: OperationId,
-    pub expected_kind: CompletionKind,
-    pub decoder: Box<dyn CompletionDecoder>,
-    pub queue_cancel: ExecutorCancelHandle,
-    pub continuation: Box<dyn NativeContinuation>,
+struct RegisteredExternalWait {
+    identity: WaitIdentity,
+    task_id: TaskId,
+    decoder: Box<dyn CompletionDecoder>,
+    resource: ResourceClass,
+    queue_cancel: ExecutorCancelHandle,
+    continuation: Box<dyn NativeContinuation>,
 }
 ```
 
-All state transitions go through named methods that reject illegal edges in
-debug and test builds. `Running -> Running`, `Settled -> Ready`, and any other
-transition out of `Settled` are defects. Cleanup progress is side state on the
-task/cleanup registry rather than a lifecycle variant, and reaping removes a
-settled record from `TaskStore`; neither changes the master lifecycle. Each task
-stores `Option<CancellationRequest>` separately from `TaskState`; setting it is
-idempotent and does not prematurely turn a task awaiting cleanup into settled.
+`TaskRecord::new(id, relations)` starts in `Ready`. The exact legal edges are
+`start: Ready -> Running`, `yield_ready: Running -> Ready`,
+`wait: Running -> Waiting(key)`, `wake: Waiting(same key) -> Ready`, and
+`settle: Ready|Running|Waiting -> Settled`. `wake` with a different key returns
+`TaskTransitionError::WaitMismatch`; every other illegal edge returns
+`TaskTransitionError::Invalid { from, to }`. `RootRecord::new(id, main_task)`
+starts in `Running { main_task }`; `RootRecord::settle(main_task, settlement)`
+accepts only that same task and retains the exact `Rc<TaskSettlement>`, while a
+wrong task or duplicate settlement returns `RootTransitionError`.
+
+All transitions return `Result` in every build;
+debug/test builds additionally assert store/queue agreement after successful
+transitions. `Running -> Running`, duplicate settlement, and every transition
+out of `Settled` return an error naming stable `StateName` values. `wait`
+accepts one universal `WaitKey`. `settle(sequence, outcome)` constructs, stores,
+and returns the sole `Rc<TaskSettlement>`; the record never owns the sequence
+allocator. `request_cancellation(reason) -> bool` is idempotent and first-reason
+wins. Cleanup progress is side state on the task/cleanup registry rather than a
+lifecycle variant, and reaping removes a settled record from `TaskStore`;
+neither changes the master lifecycle.
 
 `ReadyRoots` stores one FIFO `VecDeque<TaskId>` per `RootId` plus a rotating
 `VecDeque<RootId>`. Enqueuing a second ready task for an already-present root
@@ -245,8 +406,16 @@ does not enqueue the root twice. After one task quantum, a still-runnable root
 moves to the back. Within that root, a yielded task moves behind tasks already
 ready there.
 
-Wait lookup uses `(WaitId, WaitGeneration)`. Each registration also stores its
-`OperationId`, decoder, cancellation policy, and waiting task.
+Wait lookup uses `(WaitId, WaitGeneration)`. `WaitIdentity` stores the complete
+`RuntimeId`, `WaitId`, `WaitGeneration`, `OperationId`, and `CompletionKind`.
+Each active registration is the sole owner of that identity, decoder,
+`ResourceClass`, queue-control half, continuation, and waiting task relation.
+`CompletionRegistrar` owns the runtime's only `WaitId` and `WaitGeneration`
+counters. A doc-hidden `issue_wait_identity()` returns the runtime-scoped pair
+for timers, promises, channels, barriers, and legacy-I/O waits.
+`issue_identity(kind)` calls that same allocator and adds the external-only
+`OperationId`, kind, and binding authority. No second runtime/VM wait counter
+exists, so internal and external wait keys cannot collide.
 `RegisteredExternalWait` is the only registered external shape. Its `Trace`
 implementation delegates to its decoder and continuation with exact direct
 multiplicity. The record remains an external root despite implementing `Trace`;
@@ -287,15 +456,19 @@ safe.
 `Runtime::apply_native_suspend` owns one external-registration transaction. It
 reads `NativeSuspend.wait`; for `WaitKind::External`, it reads
 `prepared.completion_kind()` to issue the complete identity before moving the
-sole `Box<PreparedExternalOperation>` into registrar binding. It allocates
-`OperationId`, `WaitId`, `WaitGeneration`, and completion identity. Its private
-registrar then binds that runtime-issued identity and prepared operation and
-splits the binding: the runtime receives the decoder, resource, and queue-control
-half, while the executor-facing half is one opaque `ExecutorSubmission`. In one
-atomic state transition, the runtime installs those runtime-local pieces in
-`RegisteredExternalWait`, installs the concrete `ResourceClass` cleanup entry,
-and changes the task from `Running` to `Waiting`. Only after that transition
-commits does it submit the opaque `ExecutorSubmission`. `sema-io` cannot name the
+sole `Box<PreparedExternalOperation>` into registrar binding. Its private
+registrar is the sole allocator: `CompletionRegistrar::issue_identity(kind)`
+allocates `OperationId`, `WaitId`, and `WaitGeneration` and returns the complete
+private-capability identity. The registrar then binds that runtime-issued
+identity and prepared operation and
+splits the binding: the runtime receives the decoder, sole active
+`ResourceClass`, and queue-control half, while the executor-facing half is one
+opaque `ExecutorSubmission`. A private pending-registration owner holds all
+parts until one atomic state transition installs `RegisteredExternalWait`,
+increments live-resource accounting, and changes the task from `Running` to
+`Waiting`. Active resources are not cleanup entries. Only after that transition
+commits and the `RuntimeState` borrow is released does the runtime submit the
+opaque `ExecutorSubmission`. `sema-io` cannot name the
 sink or obtain a registrar for this runtime. The executor cannot drain the
 completion inbox reentrantly during this transition, so
 an executor that completes inline during `submit` sees fully registered waiting
@@ -304,15 +477,23 @@ There is no second `ExternalWait`, double registration, or clone/move of the
 decoder, resource, queue handle, continuation, job, or start token.
 No producer or executor allocates a runtime identity.
 
+Normal completion removes the active wait and its resource. Cancellation or
+rejection invokes the active resource's one-shot policy; only `PendingReap`, a
+hook error, or admitted quarantined work transfers that sole resource owner to
+`CleanupRegistry`. No active operation is simultaneously represented in the
+cleanup registry.
+
 Every callback transition follows extract/invoke/apply: under one short
 `RuntimeState` borrow, remove the registration and extract decoder,
 continuation, VM/task bookkeeping, and pending transition; drop that borrow;
 construct `NativeCallContext` from mutable task context and a cancellation
 snapshot and invoke decoder/callback/continuation; then reborrow state only to
 validate and apply the returned transition. VM execution of
-`NativeOutcome::Call` invokes the callable's doc-hidden
-`NativeFn::invoke_runtime` cross-crate and remains explicit runtime work, not a
-capability on the context. Tests cover suspend/resume/suspend
+`NativeOutcome::Call` dispatches every callable form through the same task VM.
+Native callables use doc-hidden `NativeFn::invoke_runtime`; VM closures,
+keywords, multimethods, and other callable forms use the VM's ordinary call
+dispatch. This remains explicit runtime work, not a capability on the context.
+Tests cover suspend/resume/suspend
 through one continuation, a callback that enqueues a completion while running,
 and nested native-to-Sema-to-native suspension; none may panic from a nested
 `RefCell` borrow or process the enqueued completion reentrantly.
@@ -346,21 +527,80 @@ The runtime assigns `SettlementSeq` at the single transition into `Settled`.
 Sequence assignment occurs before waking observers, so pre-settled promise races
 can be ordered later without list-order bias.
 
+Every checked allocator failure is handled without wrapping, sentinels,
+`unwrap`, or `expect`. Root/task allocation fails submission. Wait/operation and
+generation exhaustion fails the running operation only after restoring every
+extracted owner to a valid task/wait/cleanup record. Settlement-sequence
+exhaustion is a terminal `RuntimeFault`: the runtime rejects new submissions,
+preserves existing sequenced settlements for polling, and begins bounded
+cancellation and cleanup rather than publishing an unsequenced outcome.
+
+One drive turn has a global work-item budget in addition to its source-specific
+caps. Dequeueing one completion, firing one timer, attempting one cleanup reap,
+visiting one ready task, invoking one native callable, resuming one native
+continuation, or applying one resulting native transition consumes one work
+item. A native transition ends the current root visit; no immediate call/resume
+loop can run without consuming another global credit. VM dispatch charges one
+instruction per decoded opcode and checks before the next opcode after saving
+the current PC. Credits do not reset across VM/native/VM transitions. Bounded
+source rounds reserve eligible root visits so a completion or timer storm cannot
+consume the entire turn before ready work runs. The wall-clock limit is only a
+secondary host-latency guard checked between work items.
+
+Each native continuation frame records the caller frame depth, original call
+site PC, tail/non-tail disposition, and sole continuation. A Sema callee runs on
+the same task VM. Return or an uncaught error at that boundary stops VM dispatch
+and becomes `ResumeInput::Returned` or `ResumeInput::Failed`; it does not resume
+the bytecode caller first. Quantum expiry preserves the complete bytecode and
+native-boundary stacks. A continuation returning another `Call` or `Suspend`
+replaces or extends the boundary without cloning it. Final native return pushes
+one result according to the saved call disposition; final native failure enters
+the ordinary exception machinery at the saved native call site. Child-task VM
+creation is the only operation that detaches open upvalues, and it shares the
+existing `UpvalueCell` rather than copying captured state. Task VMs and stacks
+remain explicit external GC roots; the runtime does not register an entire VM or
+task record as an opaque payload.
+
+Task 03 extends `NativeOutcome` with `Runtime(RuntimeRequest)` and `WaitKind`
+with `PromiseSet(PromiseSetWait)`. These are traced, consuming commands handled
+by `Runtime` after VM dispatch returns; they do not put a runtime handle or
+command capability on `NativeCallContext`. `Spawn` creates the runtime task and
+its stable promise handle, `CancelPromise` targets that checked identity,
+`CreateChannel` allocates the final checked channel identity, `OriginBarrier`
+registers a generation-aware wait, `CreateSettledPromise` allocates a sequenced
+returned/failed/cancelled synthetic promise, `InspectPromise` returns the exact
+pending/returned/failed/cancelled state used by predicates, and promise-set
+waits implement the existing all/race/timeout mechanism. Each command/settlement resumes its sole
+continuation and consumes a work item. The promise registry uses the final
+pending/returned/failed/cancelled partition and canonical
+`Rc<TaskSettlement>`; the channel registry owns buffered values and
+generation-checked waiters. Task 04 completes public semantics, predicates,
+structured ownership, and validation on these same records rather than
+replacing a temporary state model.
+
 ## Task 1: Implement root/task state machines from tests
 
-**Files:** `runtime/root.rs`, `runtime/task.rs`, `runtime/tests.rs`
+**Files:** `runtime/mod.rs`, `runtime/root.rs`, `runtime/task.rs`,
+`runtime/tests.rs`, `crates/sema-vm/src/lib.rs`
 
 - [ ] **Step 1: Write failing transition-table tests**
 
 Test every legal edge and representative illegal edges. Include returned,
-failed, and cancelled settlements and prove the settlement sequence is assigned
-once. Test that origin root, cancellation parent, and lifetime owner never
-change when a task changes state.
+failed, and cancelled settlements and prove one canonical
+`Rc<TaskSettlement>` is assigned once. Test that origin root, cancellation
+parent, and lifetime owner never change when a task changes state. This first
+slice tests pure records only; root-handle retention, submission exhaustion,
+terminal runtime faults, and reaping are tested in Task 3 after runtime state,
+drive, and cleanup exist.
 
 - [ ] **Step 2: Implement the records and transition methods**
 
 Use checked IDs from Task 02. Do not expose mutable task/root fields outside the
-runtime module.
+runtime module. Task 1 owns initial module scaffolding and the private test
+module so later queue/wait workers add submodules without competing for setup.
+The pure root record contains identity and state only; Task 3 adds checked
+retention counters with handle/reaping tests, and Task 6 adds initial context and
+output ownership when root submission is composed.
 
 - [ ] **Step 3: Run**
 
@@ -432,6 +672,16 @@ cleanup-only completion, wrong-kind cleanup completion, duplicate after reap,
 bound expiry, and shutdown returning zero live cleanup after an in-bound
 completion. A cancelled observer/task outcome never changes when cleanup-only
 completion arrives.
+Add completion and timer backlogs larger than both their source caps and the
+global work-item cap. Assert ready roots still receive reserved visits, reported
+work never exceeds `work_item_limit`, and no task receives two VM quanta in one
+root visit.
+Poll returned, failed, and cancelled root settlements repeatedly through two
+cloned handles; drop either clone first; reap the main task while retaining the
+other handle; and prove only final-handle drop makes the root reap-eligible.
+Force root, task, wait/operation, and settlement-sequence exhaustion and assert
+the exact submission/operation or terminal runtime-fault path without an
+unsequenced settlement or leaked extracted owner.
 
 - [ ] **Step 2: Implement registration and bounded drains**
 
@@ -448,20 +698,24 @@ cargo test -p sema-vm runtime::tests::drive_limits
 
 Expected: deterministic tests pass without wall-clock delays.
 
-## Task 4: Make the VM resumable through explicit frames
+## Task 4: Make the VM resumable and migrate the suspending ABI
 
-**Files:** `vm.rs`, `debug.rs`, `runtime/task.rs`, `runtime/tests.rs`
+**Files:** `vm.rs`, `debug.rs`, `runtime/task.rs`, `runtime/tests.rs`,
+`async_signal.rs`, `scheduler.rs`, `async_ops.rs`, `system.rs`, `io.rs`
 
 - [ ] **Step 1: Write failing VM continuation tests**
 
 Test native return, native call into a Sema closure, suspend/resume with each
 outcome, nested native-to-Sema-to-native calls, exception propagation across a
 continuation, cancellation at a safe point, and repeated quantum expiry.
+Add an immediate native call/continuation chain longer than `work_item_limit`
+and a zero-duration suspend chain; each drive turn must stop at the exact cap.
 
 - [ ] **Step 2: Add explicit continuation frames**
 
 Store them in traceable VM/task state. Remove the `set_yield_signal` plus dummy
-`nil` protocol from the VM dispatch path. A native call returns
+`nil` protocol from the VM dispatch path only after Step 4 migrates every
+reachable suspending builtin. A native call returns
 `VmExecResult::Native`; the runtime executes or registers it, then resumes the
 same VM through an explicit frame.
 
@@ -472,15 +726,71 @@ losing stack, open-upvalue, handler, or debug state. Zero-work spinning inside a
 native continuation is forbidden: each continuation transition consumes a
 drive work item.
 
-- [ ] **Step 4: Run focused VM suites**
+- [ ] **Step 4: Move the existing language suspension mechanism onto the runtime**
+
+Add a temporary `LegacyAsyncAbiAdapter` used only by Task 04-owned language
+semantics. It translates existing `async/spawn`, pending `async/await`, sleep,
+blocked channel operations, `async/cancel`, `async/all`, `async/race`,
+`async/timeout`, `async/run`, synthetic promise constructors, and promise
+predicates into `NativeOutcome::{Return, Call, Suspend, Runtime}` over the final
+Task 03 runtime request and identity registries.
+It owns no task table, ready queue, timer heap, clock, scheduler target loop, or
+strong runtime handle; performs no TLS runtime lookup; and never calls
+`Runtime::drive`, `Interpreter::eval*`, `VM::execute`, or
+`call_run_scheduler*`. Each adapter continuation owns its observation/wait state
+and is consumed exactly once. It may preserve only the existing observable
+language behavior assigned for correction in Task 04; it may not recreate a
+second scheduler, promise ownership model, or cancellation tree. Record every
+adapted builtin in the inventory with Task 04 as deletion owner.
+
+The adapter is deleted in Task 04 after runtime-native promise observation,
+detached spawn, combinators, and channels exist, before Task 04 acceptance.
+`LegacyRuntimeBridge` may remain only for producers assigned to Tasks 05–08; it
+cannot schedule tasks or drive the runtime.
+
+Task 03 separately retains `LegacyAwaitIoBridge` for the exact unmigrated
+producer call sites assigned to Tasks 05–08. It is not a scheduler: the VM may
+inspect only `YieldReason::AwaitIo` after a legacy native returns, discard that
+native's placeholder `nil`, and install the `Rc<IoHandle>` as one runtime-local
+polled wait. The bridge obtains one universal registrar-issued `WaitKey`,
+installs the keyed record, and commits `Running -> Waiting(key)` before polling;
+completion and cancellation remove that exact key before resumption or abort.
+Each nonblocking poll consumes one drive work item; pending handles
+remain parked and are revisited only in a later bounded source round; completion
+resumes the original VM call frame directly; cancellation invokes `abort` once.
+The bridge owns no task store, clock, ready queue, recursive drive callback, or
+resume-value slot. `set_yield_signal`/`take_yield_signal` and producer-side
+`take_resume_value` may remain only for the exact inventoried `AwaitIo` callers;
+all promise/channel/sleep/debug uses are deleted in Task 03. Tasks 05–08 replace
+those callers with registered external operations and delete the bridge.
+When a legacy-I/O wait is pending, `DriveState::Idle` sets
+`legacy_io_wakeup_required`. `async_signal` exposes a generation snapshot and
+`io_park_since(generation, timeout)` so notification between drive and park is
+observed rather than missed. Because the legacy condvar and completion inbox
+cannot be selected together, native compatibility hosts cap every legacy-I/O
+park at `LEGACY_IO_POLL_MAX = 10ms` and use the minimum of that cap and the next
+timer deadline; inbox work is therefore delayed by at most the bridge cap.
+Browser hosts schedule a macrotask while any legacy-I/O wait remains.
+`Runtime::drive` itself never waits or polls an unbounded batch.
+
+Legacy I/O poll closures return result data only. They may not invoke Sema
+callbacks or create a VM. Streaming/file callbacks previously reached through
+`run_closure_foreign_sync` are extracted from the poller and invoked through
+`NativeOutcome::Call` on the waiting task; each callback and continuation
+transition consumes its own work item and may suspend normally. Focused stream
+tests prove a callback chain longer than the drive budget is split across turns.
+
+- [ ] **Step 5: Run focused VM suites**
 
 ```bash
 cargo test -p sema-vm runtime::tests::continuation
 cargo test -p sema-vm runtime::tests::quantum
 cargo test -p sema-lang --test vm_integration_test
+cargo test -p sema-lang --test vm_async_test
 ```
 
-Expected: all selected tests pass and no nested scheduler entry occurs.
+Expected: all selected tests pass except the exact Task 04 language-contract
+RED cases; no nested scheduler entry or dummy-`nil` suspension remains.
 
 ## Task 5: Repair shared captured-cell coherence
 
@@ -511,7 +821,10 @@ Expected: captured-mutation characterization turns GREEN and GC tests pass.
 ## Task 6: Compose the interpreter-owned runtime
 
 **Files:** `runtime/mod.rs`, `runtime/drive.rs`, `eval.rs`, `lib.rs`,
-`scheduler.rs`, `async_signal.rs`, `runtime_roots_test.rs`
+`scheduler.rs`, `async_signal.rs`, `crates/sema/src/lib.rs`,
+`crates/sema/src/main.rs`, `crates/sema/src/workflow_view/ingest.rs`,
+`crates/sema-wasm/src/lib.rs`, `crates/sema-dap/src/server.rs`,
+`crates/sema-mcp/src/tools.rs`, `runtime_roots_test.rs`
 
 - [ ] **Step 1: Add failing multiple-root integration tests**
 
@@ -527,27 +840,72 @@ alive until its last descendant/debug/tracing reference is released.
 `Interpreter::eval*` prepares one root, submits it, and repeatedly drives until
 that root settles while still servicing other roots. The method does not wait
 for detached tasks. Runtime construction happens once in `Interpreter::new*`.
+`Interpreter` stores `ctx: Rc<EvalContext>` and `runtime: Option<Runtime>`; the
+`Option` exists only so drop can destroy runtime execution edges before context
+and environment collection. Add `try_new*` plus a parts constructor, and update
+every direct struct literal in `sema` and `sema-wasm`.
+
+Inventory every production VM constructor/preparer and execution surface,
+including `VM::new*`, `prepare_entry`, `execute*`, `run*`, `start_cooperative`,
+`run_cooperative`, `execute_compile_result`, `eval_value_vm`, `call_value*`,
+`run_closure_foreign_sync`, `run_nested_closure_args`, `call_run_scheduler*`, and
+`Runtime::drive`. Classify each as: (A) host root preparation followed by outer
+submit-and-drive; (B) same-task nested work represented by a VM/native
+continuation frame; (C) bootstrap/compile-time synchronous work with a test
+proving suspension is rejected without leaving a wait; (D) a foreign
+synchronous boundary that rejects suspension and rolls back cleanly; or (E) an
+explicit temporary host boundary in CLI `.semac`, DAP, WASM, notebook, or MCP
+with an exact Task 07 deletion owner. Arbitrary user code is never C or D. No
+active-task path creates a fresh VM, recursively drives the runtime, or
+manufactures a synchronous result from a suspending call. Task 03 updates the
+named owner files enough to compile and route host-executable user code through
+A or E, adds their focused compile/tests to the gate, and records every
+occurrence and classification in evidence.
 
 - [ ] **Step 3: Remove TLS scheduler ownership**
 
 Delete task vectors, IDs, virtual clock, and global env ownership from
-`scheduler.rs`. Any temporary function kept for Task 04 must delegate to the
-active interpreter runtime through `NativeCallContext`, be named in the
-inventory, and carry a Task 04 deletion owner.
+`scheduler.rs`. After Task 4's ABI migration, delete signal/resume TLS,
+`call_run_scheduler*`, scheduler target loops, and TLS spawn/cancel callbacks,
+except the exact `AwaitIo` signal functions retained solely by
+`LegacyAwaitIoBridge` for Tasks 05–08.
+Any temporary Task 04 adapter is the one-way `LegacyAsyncAbiAdapter` defined in
+Task 4: it receives task/runtime operations through `NativeCallContext`, owns no
+scheduler state, is named in the inventory, and carries a Task 04 deletion
+owner.
 
-- [ ] **Step 4: Run root and scheduler characterizations**
+- [ ] **Step 4: Implement explicit interpreter teardown**
+
+`Interpreter::drop` first takes `runtime` from its `Option`, calls nonblocking,
+idempotent `close_for_interpreter_drop`, and drops the runtime. That operation
+rejects admission, closes/detaches the executor lease while the inbox still
+exists, requests cancellation, and removes all runtime-local VM, continuation,
+decoder, task-context, output, and safely removable resource edges. It never
+invokes user continuations or runs an unbounded shutdown loop from `Drop`.
+Admitted dispatches may finish only against their send-safe terminal sink.
+
+After runtime destruction, clear every `EvalContext` value store, release the
+interpreter's `global_env` strong reference, and finally run the
+`InterpreterDrop` collection. During unwinding, perform containment and edge
+release but skip collection. Close the completion inbox only after executor
+detach/lease shutdown can no longer start new submissions. Add counted drop
+tests proving this order and proving no delivery accesses interpreter state
+after drop begins.
+
+- [ ] **Step 5: Run root and scheduler characterizations**
 
 ```bash
 cargo test -p sema-lang --test runtime_roots_test
 cargo test -p sema-lang --test vm_async_test -- scheduler
 cargo test -p sema-lang --test unified_runtime_watchdog_test
+cargo check -p sema-dap -p sema-mcp -p sema-wasm
 ```
 
 Expected: root/fairness/watchdog cases pass. Exact Task 04 language-combinator
 RED cases may remain. Unmigrated resource, LLM, and MCP producers still run
-through the named `LegacyRuntimeBridge` and remain listed with deletion owners
-in Tasks 05, 06, and 07/08 as applicable; they are not silently treated as Task
-04 RED cases.
+through the named `LegacyAwaitIoBridge`/`LegacyRuntimeBridge` and remain listed
+with deletion owners in Tasks 05, 06, and 07/08 as applicable; they are not
+silently treated as Task 04 RED cases.
 
 ## Task 7: Integrate debugger stop-the-world behavior
 
@@ -588,11 +946,16 @@ cargo fmt --all -- --check
 cargo clippy -p sema-vm -p sema-eval --all-targets -- -D warnings
 scripts/check-unified-runtime-legacy.sh > /tmp/runtime-legacy.actual
 diff -u docs/plans/evidence/unified-cooperative-runtime/legacy-symbols.baseline /tmp/runtime-legacy.actual
+rg -n 'set_yield_signal|take_yield_signal|set_resume_value|take_resume_value|call_run_scheduler|SchedulerTarget|SchedulerRunResult' crates --glob '*.rs'
 git diff --check
 ```
 
 Expected: all scheduler/root/VM/capture oracles owned by Task 03 are GREEN.
 Only exact Task 04 language-contract RED cases may remain and must be itemized.
+The legacy-symbol search may find only the explicitly inventoried
+`LegacyAsyncAbiAdapter` and exact `LegacyAwaitIoBridge` producer list. It finds
+no scheduler owner, recursive drive callback, promise/channel/sleep signal, or
+resume-value slot used by the new runtime.
 
 - [ ] **Step 2: Record evidence and assign independent review**
 

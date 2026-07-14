@@ -871,13 +871,24 @@ occurrence and classification in evidence.
     - _`9854376a` adds `MonotonicClock`/`NullExecutor` host adapters; `3003aacd`
       adds `Interpreter::eval_via_runtime` — GATE GREEN: an interpreter routes a
       synchronous eval through the runtime (`(+ 1 2)` → `3`)._
-    - _BLOCKER for real user code (next slice = Task 04 native-ABI migration):
-      a user function whose body calls a native re-enters the evaluator via the
-      legacy `call_value`/`run_closure_foreign_sync` path, which the runtime
-      correctly rejects inside a quantum (`VM::run` guard, vm.rs:1601). The
-      `NativeOutcome::Call` dispatch machinery exists (state.rs:1351 →
-      `invoke_callable`); the migration must route those calls through it.
-      Ignored test `eval_via_runtime_shares_interpreter_globals` pins this._
+    - _TEMPORARY BRIDGE landed (2026-07-14): legacy user closures called across
+      context boundaries during a quantum now evaluate through the runtime via
+      `EvalContext::suspend_runtime_quantum` (context.rs). A cross-context
+      `define`d closure re-enters through `call_value` → the `make_closure`
+      native wrapper; with shared globals it runs as a nested frame on the live
+      runtime VM (`run_nested_closure_args`), otherwise on a fresh foreign VM
+      (`call_closure_owned` / `run_closure_foreign_sync` / the wrapper's fresh-VM
+      arm). All those sites are the NON-async, synchronous-only legacy-callback
+      re-entry path (the async case routes to `run_closure_as_inline_task`
+      first), so they never touch the scheduler; each suspends the quantum flag
+      for the nested run. GATE GREEN: `eval_via_runtime_shares_interpreter_globals`
+      now passes (un-ignored). The genuine fresh-VM entry guard in `VM::run`
+      (vm.rs:1601) still rejects non-suspended re-entry._
+    - _STILL PENDING (Task 04 native-ABI migration owns deletion of the bridge):
+      the proper fix routes native/closure re-entry through
+      `NativeOutcome::Call` (state.rs:1351 → `invoke_callable`) instead of a
+      nested/fresh VM under a suspended quantum. Deleting `suspend_runtime_quantum`
+      and its call sites is the Task 04 deletion owner._
     - _Still pending for Step 2: `ctx: Rc<EvalContext>`, interpreter-owned
       single shared-context `runtime: Option<Runtime>` with drop ordering,
       `try_new*`/parts constructors, real executor, and `sema`/`sema-wasm`

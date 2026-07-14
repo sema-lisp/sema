@@ -1,7 +1,7 @@
 use std::rc::Rc;
 
 use sema_core::runtime::{
-    CancelReason, SettlementSeq, TaskId, TaskOutcome, TaskRelations, TaskSettlement,
+    CancelReason, SettlementSeq, TaskId, TaskOutcome, TaskRelations, TaskSettlement, Trace,
     WaitGeneration, WaitId,
 };
 
@@ -9,6 +9,15 @@ use sema_core::runtime::{
 pub struct WaitKey {
     pub id: WaitId,
     pub generation: WaitGeneration,
+}
+
+impl Trace for TaskRecord {
+    fn trace(&self, sink: &mut dyn FnMut(sema_core::cycle::GcEdge<'_>)) -> bool {
+        match &self.state {
+            TaskState::Settled(settlement) => settlement.trace(sink),
+            _ => true,
+        }
+    }
 }
 
 #[derive(Debug)]

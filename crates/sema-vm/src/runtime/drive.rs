@@ -31,6 +31,7 @@ pub enum DriveState {
         legacy_io_wakeup_required: bool,
     },
     Quiescent,
+    ShutdownComplete,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]

@@ -1,6 +1,6 @@
 use std::rc::Rc;
 
-use sema_core::runtime::{RootId, TaskId, TaskSettlement};
+use sema_core::runtime::{RootId, TaskId, TaskSettlement, Trace};
 
 #[derive(Debug)]
 pub enum RootState {
@@ -81,5 +81,14 @@ impl RootRecord {
         }
         self.state = RootState::Settled(settlement);
         Ok(())
+    }
+}
+
+impl Trace for RootRecord {
+    fn trace(&self, sink: &mut dyn FnMut(sema_core::cycle::GcEdge<'_>)) -> bool {
+        match &self.state {
+            RootState::Running { .. } => true,
+            RootState::Settled(settlement) => settlement.trace(sink),
+        }
     }
 }

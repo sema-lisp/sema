@@ -143,9 +143,9 @@ impl PendingResume {
 
 pub struct WaitRuntime {
     runtime_id: RuntimeId,
-    registrar: CompletionRegistrar,
-    lease: Arc<dyn ExecutorLease>,
-    inbox: Receiver<ExternalCompletion>,
+    registrar: Option<CompletionRegistrar>,
+    lease: Option<Arc<dyn ExecutorLease>>,
+    inbox: Option<Receiver<ExternalCompletion>>,
     deferred: VecDeque<ExternalCompletion>,
     active: HashMap<WaitKey, RegisteredExternalWait>,
     cleanup: HashMap<WaitKey, CleanupEntry>,
@@ -175,9 +175,9 @@ impl WaitRuntime {
             .map_err(RuntimeCreateError::ExecutorAttach)?;
         Ok(Self {
             runtime_id,
-            registrar,
-            lease,
-            inbox,
+            registrar: Some(registrar),
+            lease: Some(lease),
+            inbox: Some(inbox),
             deferred: VecDeque::new(),
             active: HashMap::new(),
             cleanup: HashMap::new(),
@@ -194,6 +194,8 @@ impl WaitRuntime {
 
     pub fn issue_internal_wait(&self) -> Result<WaitKey, sema_core::runtime::IdExhausted> {
         self.registrar
+            .as_ref()
+            .expect("open wait runtime has registrar")
             .issue_wait_identity()
             .map(|(id, generation)| WaitKey { id, generation })
     }
@@ -208,7 +210,12 @@ impl WaitRuntime {
             panic!("external wait required");
         };
         let kind = prepared.completion_kind();
-        let identity = match self.registrar.issue_identity(kind) {
+        let identity = match self
+            .registrar
+            .as_ref()
+            .expect("closed wait runtime rejects admission before registration")
+            .issue_identity(kind)
+        {
             Ok(identity) => identity,
             Err(_) => return Err(RegisterExternalError::IdExhausted(suspend)),
         };
@@ -228,6 +235,8 @@ impl WaitRuntime {
         };
         let binding = self
             .registrar
+            .as_ref()
+            .expect("registrar retained through binding")
             .bind(identity, *prepared)
             .expect("runtime-issued identity binds its declared kind");
         let (runtime, submission) = binding.split();
@@ -245,7 +254,12 @@ impl WaitRuntime {
                 context,
             },
         );
-        if let Err(rejected) = self.lease.submit(submission) {
+        if let Err(rejected) = self
+            .lease
+            .as_ref()
+            .expect("lease retained through submission")
+            .submit(submission)
+        {
             let _ = rejected.rollback();
             let wait = self.active.remove(&key).expect("registered before submit");
             task.reject_wait(key)
@@ -276,11 +290,14 @@ impl WaitRuntime {
         &mut self,
         task: &mut TaskRecord,
     ) -> Option<(CompletionRoute, Option<PendingResume>)> {
-        let completion = match self
-            .deferred
-            .pop_front()
-            .map_or_else(|| self.inbox.try_recv(), Ok)
-        {
+        let completion = match self.deferred.pop_front().map_or_else(
+            || {
+                self.inbox
+                    .as_ref()
+                    .map_or(Err(TryRecvError::Disconnected), Receiver::try_recv)
+            },
+            Ok,
+        ) {
             Ok(completion) => completion,
             Err(TryRecvError::Empty | TryRecvError::Disconnected) => return None,
         };
@@ -436,6 +453,15 @@ impl WaitRuntime {
     }
     pub fn cleanup_len(&self) -> usize {
         self.cleanup.len()
+    }
+
+    pub fn close(&mut self) -> Option<Arc<dyn ExecutorLease>> {
+        self.inbox.take();
+        self.registrar.take();
+        self.lease.take()
+    }
+    pub fn is_closed(&self) -> bool {
+        self.lease.is_none()
     }
     pub fn late_completions(&self) -> usize {
         self.late_completions

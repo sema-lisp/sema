@@ -9,6 +9,7 @@ use std::time::Instant;
 use sema_core::runtime::{
     CancelReason, IdCounter, IoExecutor, NativeOutcome, NativeResult, RootId,
     RuntimeScopedIdCounter, SettlementSeq, TaskContextHandle, TaskId, TaskOutcome, TaskSettlement,
+    Trace,
 };
 #[cfg(test)]
 use sema_core::runtime::{CancellationParent, LifetimeOwner, TaskRelations};
@@ -37,6 +38,7 @@ pub enum RootPoll {
     Pending,
     Ready(Rc<TaskSettlement>),
     RuntimeDropped,
+    InvariantViolation,
 }
 
 #[derive(Clone, Debug)]
@@ -63,9 +65,16 @@ pub struct RootHandle {
     id: RootId,
 }
 
+impl Trace for Runtime {
+    fn trace(&self, sink: &mut dyn FnMut(sema_core::cycle::GcEdge<'_>)) -> bool {
+        self.state.try_borrow().is_ok_and(|state| state.trace(sink))
+    }
+}
+
 struct RuntimeTask {
     record: TaskRecord,
     payload: TaskPayload,
+    pending_resume: Option<PendingResume>,
 }
 
 // Task 4 replaces this placeholder with the VM-backed PreparedRoot payload.
@@ -94,6 +103,39 @@ struct RuntimeState {
     pending: VecDeque<PendingStage>,
     shutting_down: bool,
     terminal_fault: Option<RuntimeFault>,
+}
+
+impl Trace for RuntimeState {
+    fn trace(&self, sink: &mut dyn FnMut(sema_core::cycle::GcEdge<'_>)) -> bool {
+        self.waits.trace(sink)
+            && self.roots.values().all(|root| root.trace(sink))
+            && self.tasks.values().all(|task| task.trace(sink))
+            && self.pending.iter().all(|stage| stage.trace(sink))
+    }
+}
+
+impl Trace for RuntimeTask {
+    fn trace(&self, sink: &mut dyn FnMut(sema_core::cycle::GcEdge<'_>)) -> bool {
+        self.record.trace(sink)
+            && self
+                .pending_resume
+                .as_ref()
+                .is_none_or(|pending| pending.trace(sink))
+            && self.payload.trace(sink)
+    }
+}
+
+impl Trace for TaskPayload {
+    fn trace(&self, sink: &mut dyn FnMut(sema_core::cycle::GcEdge<'_>)) -> bool {
+        #[cfg(not(test))]
+        let _ = sink;
+        match self {
+            #[cfg(not(test))]
+            Self::UnavailableUntilTask4 => true,
+            #[cfg(test)]
+            Self::Test(task) => task.trace(sink),
+        }
+    }
 }
 
 impl Runtime {
@@ -132,14 +174,16 @@ impl Runtime {
         if state.shutting_down || state.terminal_fault.is_some() {
             return Err(SubmitRootError::ShuttingDown);
         }
-        let root = state
-            .root_ids
+        let mut root_ids = state.root_ids.clone();
+        let mut task_ids = state.task_ids.clone();
+        let root = root_ids
             .allocate()
             .map_err(|_| SubmitRootError::IdExhausted)?;
-        let task = state
-            .task_ids
+        let task = task_ids
             .allocate()
             .map_err(|_| SubmitRootError::IdExhausted)?;
+        state.root_ids = root_ids;
+        state.task_ids = task_ids;
         let relations = TaskRelations {
             origin_root: root,
             cancellation_parent: CancellationParent::Root(root),
@@ -151,6 +195,7 @@ impl Runtime {
             RuntimeTask {
                 record: TaskRecord::new(task, relations),
                 payload: TaskPayload::Test(prepared),
+                pending_resume: None,
             },
         );
         state.ready.enqueue(root, task);
@@ -212,6 +257,12 @@ impl Runtime {
                 instructions: 0,
                 ready_remaining,
             })
+        } else if state.shutting_down
+            && state.waits.is_closed()
+            && state.tasks.is_empty()
+            && state.waits.active_len() == 0
+        {
+            Ok(DriveState::ShutdownComplete)
         } else if state.roots.is_empty() && state.waits.active_len() == 0 {
             Ok(DriveState::Quiescent)
         } else {
@@ -249,7 +300,20 @@ impl Runtime {
             state.tasks.insert(task_id, task);
             if let Some((_route, pending)) = drained {
                 if let Some(pending) = pending {
-                    state.pending.push_back(PendingStage::Decode(pending));
+                    let task_id = pending.task_id();
+                    let root = state
+                        .tasks
+                        .get(&task_id)
+                        .expect("completion task remains registered")
+                        .record
+                        .relations()
+                        .origin_root;
+                    state
+                        .tasks
+                        .get_mut(&task_id)
+                        .expect("completion task remains registered")
+                        .pending_resume = Some(pending);
+                    state.ready.enqueue(root, task_id);
                 }
                 return true;
             }
@@ -278,37 +342,48 @@ impl Runtime {
     }
 
     fn visit_ready(&self) -> Result<bool, RuntimeFault> {
-        let action = {
+        let (root, task_id, mut task) = {
             let mut state = self.state.borrow_mut();
             let Some((root, task_id)) = state.ready.dequeue() else {
                 return Ok(false);
             };
             let task = state
                 .tasks
-                .get_mut(&task_id)
+                .remove(&task_id)
                 .ok_or_else(|| RuntimeFault::Invariant {
                     message: "ready scheduler referenced missing task".into(),
                 })?;
-            task.record
-                .start()
-                .map_err(|error| RuntimeFault::Invariant {
-                    message: format!("ready task failed to start: {error:?}"),
-                })?;
-            if let Some(cancel) = task.record.cancellation() {
-                TaskAction::Settle(root, task_id, TaskOutcome::Cancelled(cancel.reason))
-            } else {
-                match &mut task.payload {
-                    #[cfg(not(test))]
-                    TaskPayload::UnavailableUntilTask4 => {
-                        return Err(RuntimeFault::Invariant {
-                            message: "VM root execution belongs to Task 4".into(),
-                        });
-                    }
-                    #[cfg(test)]
-                    TaskPayload::Test(prepared) => prepared.next(root, task_id),
+            (root, task_id, task)
+        };
+        task.record
+            .start()
+            .map_err(|error| RuntimeFault::Invariant {
+                message: format!("ready task failed to start: {error:?}"),
+            })?;
+        let action = if let Some(pending) = task.pending_resume.take() {
+            TaskAction::Resume(pending)
+        } else if let Some(cancel) = task.record.cancellation() {
+            TaskAction::Settle(root, task_id, TaskOutcome::Cancelled(cancel.reason))
+        } else {
+            match &mut task.payload {
+                #[cfg(not(test))]
+                TaskPayload::UnavailableUntilTask4 => {
+                    return Err(RuntimeFault::Invariant {
+                        message: "VM root execution belongs to Task 4".into(),
+                    });
                 }
+                #[cfg(test)]
+                TaskPayload::Test(prepared) => prepared.next(root, task_id),
             }
         };
+        {
+            let mut state = self.state.borrow_mut();
+            if state.tasks.insert(task_id, task).is_some() {
+                return Err(RuntimeFault::Invariant {
+                    message: "task identity reused during extracted quantum".into(),
+                });
+            }
+        }
         self.apply_action(action)
     }
 
@@ -332,6 +407,12 @@ impl Runtime {
             }
             TaskAction::Settle(root, task_id, outcome) => self.settle(root, task_id, outcome)?,
             TaskAction::Native(task_id, result) => self.apply_native_result(task_id, result)?,
+            TaskAction::Resume(pending) => {
+                self.state
+                    .borrow_mut()
+                    .pending
+                    .push_back(PendingStage::Decode(pending));
+            }
         }
         Ok(true)
     }
@@ -478,21 +559,34 @@ impl Runtime {
         let active_waits = state.waits.active_len();
         let retained_cleanup = state.waits.cleanup_len();
         let live_tasks = state.tasks.len();
-        Ok(ShutdownReport {
+        let report = ShutdownReport {
             clean: live_tasks == 0 && active_waits == 0 && retained_cleanup == 0,
             live_roots: state.roots.len(),
             live_tasks,
             active_waits,
             retained_cleanup,
-        })
+        };
+        drop(state);
+        let lease = self.state.borrow_mut().waits.close();
+        if let Some(lease) = lease {
+            lease.shutdown(options.deadline);
+        }
+        Ok(report)
     }
 
     pub fn close_for_interpreter_drop(&self) {
-        let mut state = self.state.borrow_mut();
-        state.shutting_down = true;
-        for task in state.tasks.values_mut() {
-            task.record
-                .request_cancellation(CancelReason::InterpreterShutdown);
+        let (lease, deadline) = {
+            let mut state = self.state.borrow_mut();
+            state.shutting_down = true;
+            for task in state.tasks.values_mut() {
+                task.record
+                    .request_cancellation(CancelReason::InterpreterShutdown);
+            }
+            let deadline = state.clock.now();
+            (state.waits.close(), deadline)
+        };
+        if let Some(lease) = lease {
+            lease.shutdown(deadline);
         }
     }
 
@@ -519,7 +613,8 @@ impl RootHandle {
         let state = runtime.borrow();
         match state.roots.get(&self.id).map(RootRecord::state) {
             Some(RootState::Settled(settlement)) => RootPoll::Ready(Rc::clone(settlement)),
-            Some(RootState::Running { .. }) | None => RootPoll::Pending,
+            Some(RootState::Running { .. }) => RootPoll::Pending,
+            None => RootPoll::InvariantViolation,
         }
     }
 
@@ -542,9 +637,12 @@ impl RootHandle {
 impl Clone for RootHandle {
     fn clone(&self) -> Self {
         if let Some(runtime) = self.runtime.upgrade() {
-            if let Some(root) = runtime.borrow_mut().roots.get_mut(&self.id) {
-                let _ = root.retain_handle();
-            }
+            let mut state = runtime.borrow_mut();
+            let root = state
+                .roots
+                .get_mut(&self.id)
+                .expect("live root handle must reference a registered root");
+            assert!(root.retain_handle(), "root handle count overflow");
         }
         Self {
             runtime: self.runtime.clone(),
@@ -575,12 +673,25 @@ enum TaskAction {
     Yield(RootId, TaskId),
     Settle(RootId, TaskId, TaskOutcome),
     Native(TaskId, NativeResult),
+    Resume(PendingResume),
 }
 
 enum PendingStage {
     Decode(PendingResume),
     Continue(PendingResume),
     Apply(TaskId, NativeResult),
+}
+
+impl Trace for PendingStage {
+    fn trace(&self, sink: &mut dyn FnMut(sema_core::cycle::GcEdge<'_>)) -> bool {
+        match self {
+            Self::Decode(pending) | Self::Continue(pending) => pending.trace(sink),
+            Self::Apply(_, result) => match result {
+                Ok(outcome) => outcome.trace(sink),
+                Err(error) => error.trace(sink),
+            },
+        }
+    }
 }
 
 #[cfg(test)]
@@ -618,6 +729,21 @@ impl TestPreparedTask {
                     .take()
                     .unwrap_or_else(|| Err(sema_core::SemaError::eval("test task resumed twice"))),
             ),
+        }
+    }
+}
+
+#[cfg(test)]
+impl Trace for TestPreparedTask {
+    fn trace(&self, sink: &mut dyn FnMut(sema_core::cycle::GcEdge<'_>)) -> bool {
+        match self {
+            Self::Return(Some(value)) => {
+                sink(sema_core::cycle::GcEdge::Value(value));
+                true
+            }
+            Self::Native(Some(Ok(outcome))) => outcome.trace(sink),
+            Self::Native(Some(Err(error))) => error.trace(sink),
+            _ => true,
         }
     }
 }

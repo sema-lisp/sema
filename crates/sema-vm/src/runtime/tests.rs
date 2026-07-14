@@ -108,13 +108,13 @@ fn runtime_drive_charges_external_extract_decode_resume_and_apply_stages() {
         .expect("root admitted");
 
     let one = drive_budget(1);
-    for expected_work in 1..=5 {
+    for expected_work in 1..=6 {
         let state = runtime.drive(&one).expect("bounded stage");
         assert!(matches!(
             state,
             super::DriveState::Progress { work_items: 1, .. }
         ));
-        if expected_work < 5 {
+        if expected_work < 6 {
             assert!(matches!(handle.poll_result(), RootPoll::Pending));
         }
     }

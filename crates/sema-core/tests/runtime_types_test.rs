@@ -207,15 +207,26 @@ fn condition_cancellation_reasons_are_stable_keywords_and_optional_fields_are_om
 
 #[test]
 fn condition_maps_for_cancellation_and_timeout_reraise_verbatim() {
-    for condition_type in ["cancelled", "timeout"] {
-        let value = Value::map(BTreeMap::from([
-            (Value::keyword("type"), Value::keyword(condition_type)),
-            (Value::keyword("message"), Value::string("stopped")),
-        ]));
+    let conditions = [
+        SemaError::cancelled_condition(
+            "stopped",
+            CancelReason::Explicit,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        ),
+        SemaError::timeout_condition("timed out", "runtime/wait", u64::MAX, None),
+    ];
 
-        assert!(matches!(
-            SemaError::from_thrown(value),
-            SemaError::Condition(_)
-        ));
+    for condition in conditions {
+        let SemaError::Condition(expected) = condition else {
+            panic!("condition constructor returned the wrong error variant");
+        };
+        let actual = SemaError::from_thrown(expected.clone());
+
+        assert!(matches!(actual, SemaError::Condition(value) if value == expected));
     }
 }

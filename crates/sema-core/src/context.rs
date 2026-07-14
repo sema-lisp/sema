@@ -156,6 +156,29 @@ impl EvalContext {
         self.runtime_quantum_active.get()
     }
 
+    /// TEMPORARY BRIDGE — suspend the "runtime quantum active" flag for the
+    /// lifetime of the returned guard, restoring the previous value on `Drop`.
+    ///
+    /// The unified cooperative runtime forbids entering a *fresh* VM while a
+    /// runtime quantum is active (that would re-enter the scheduler off-plan).
+    /// But legacy user closures that cross context boundaries are still
+    /// dispatched through `sema_core::call_callback`, which runs them on a fresh
+    /// foreign VM. Those foreign-run helpers are contractually
+    /// SYNCHRONOUS-ONLY (their callback must not yield/await/spawn), so the
+    /// nested VM never touches the runtime scheduler — it is safe to run it with
+    /// the quantum flag suspended.
+    ///
+    /// This is a one-way bridge that merely carries current language behavior.
+    /// It MUST be deleted together with the Task 04 `NativeOutcome::Call`
+    /// migration of legacy callback re-entry, which replaces fresh-VM re-entry
+    /// with a scheduler-native call and removes the need to suspend the flag.
+    pub fn suspend_runtime_quantum(&self) -> QuantumSuspendGuard<'_> {
+        QuantumSuspendGuard {
+            ctx: self,
+            previous: self.runtime_quantum_active.replace(false),
+        }
+    }
+
     pub fn take_task_context(&self) -> Option<TaskContextHandle> {
         self.task_context.borrow_mut().take()
     }
@@ -489,6 +512,20 @@ pub struct RuntimeQuantumGuard<'a> {
 impl Drop for RuntimeQuantumGuard<'_> {
     fn drop(&mut self) {
         self.ctx.runtime_quantum_active.set(false);
+    }
+}
+
+/// Guard returned by [`EvalContext::suspend_runtime_quantum`]. TEMPORARY bridge
+/// — restores the prior `runtime_quantum_active` value on `Drop`. Deleted with
+/// the Task 04 `NativeOutcome::Call` migration (see `suspend_runtime_quantum`).
+pub struct QuantumSuspendGuard<'a> {
+    ctx: &'a EvalContext,
+    previous: bool,
+}
+
+impl Drop for QuantumSuspendGuard<'_> {
+    fn drop(&mut self) {
+        self.ctx.runtime_quantum_active.set(self.previous);
     }
 }
 

@@ -1931,14 +1931,12 @@ mod runtime_eval_tests {
         assert_eq!(result, Value::int(3));
     }
 
-    // Pending the Task 04 native-ABI migration: calling a user function whose
-    // body invokes a native (`*`) re-enters the evaluator through the legacy
-    // `call_value` callback, which the runtime correctly REJECTS inside a
-    // quantum ("legacy native callback cannot re-enter a VM during an active
-    // runtime quantum"). Native/higher-order calls must move to
-    // `NativeOutcome::Call` before this passes — that is the next slice.
+    // A legacy user closure (`double`, defined via `eval_str`) called from a
+    // runtime quantum re-enters through the `call_value` callback onto a fresh
+    // foreign VM. That synchronous nested run is carried by the TEMPORARY
+    // `suspend_runtime_quantum` bridge until the Task 04 `NativeOutcome::Call`
+    // migration makes legacy callback re-entry scheduler-native.
     #[test]
-    #[ignore = "blocked on Task 04 NativeOutcome::Call migration of legacy native callbacks"]
     fn eval_via_runtime_shares_interpreter_globals() {
         let interp = Interpreter::new();
         interp

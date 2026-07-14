@@ -684,6 +684,13 @@ pub fn call_closure_owned(
     if let Err(e) = vm.setup_for_call_args(closure, CallArgs::Owned(args)) {
         return Some(Err(e));
     }
+    // TEMPORARY BRIDGE: a legacy user closure re-entered via `call_callback`
+    // runs SYNCHRONOUSLY on this fresh foreign VM (no yield/await/spawn), so it
+    // never touches the runtime scheduler. Suspend the quantum flag so the
+    // `run` entry guard doesn't reject this synchronous nested run during an
+    // active runtime quantum. Deleted with the Task 04 `NativeOutcome::Call`
+    // migration of legacy callback re-entry (see `suspend_runtime_quantum`).
+    let _q = ctx.suspend_runtime_quantum();
     Some(vm.run(ctx))
 }
 
@@ -719,6 +726,13 @@ pub fn run_closure_foreign_sync(
     close_closure_upvalues_for_foreign_run(&closure);
     let mut vm = VM::new_with_rc_functions(globals, functions, native_fns);
     vm.setup_for_call_args(closure, CallArgs::Borrowed(args))?;
+    // TEMPORARY BRIDGE: this helper is contractually SYNCHRONOUS-ONLY (its
+    // callback must not yield/await/spawn), so the fresh VM never touches the
+    // runtime scheduler. Suspend the quantum flag so the `run` entry guard
+    // doesn't reject this synchronous nested run during an active runtime
+    // quantum. Deleted with the Task 04 `NativeOutcome::Call` migration of
+    // legacy callback re-entry (see `suspend_runtime_quantum`).
+    let _q = ctx.suspend_runtime_quantum();
     vm.run(ctx)
 }
 
@@ -1633,9 +1647,19 @@ impl VM {
         args: CallArgs,
         ctx: &EvalContext,
     ) -> Result<Value, SemaError> {
-        if ctx.runtime_quantum_active() {
-            return Err(legacy_vm_entry_during_quantum_error());
-        }
+        // TEMPORARY BRIDGE: this in-VM nested run is the synchronous
+        // legacy-callback re-entry path — it is reached only from the
+        // NON-async wrapper branches (both `make_closure`'s native wrapper and
+        // `call_closure_owned` route the async case to
+        // `run_closure_as_inline_task` *before* trying the current VM). The
+        // callback runs synchronously to completion here (an AsyncYield below
+        // is treated as an unrecoverable error), so it never touches the
+        // runtime scheduler. Suspend the quantum flag for the nested run so the
+        // re-entry guard doesn't reject legacy user closures called across
+        // context boundaries during an active runtime quantum. Deleted with the
+        // Task 04 `NativeOutcome::Call` migration of legacy callback re-entry
+        // (see `EvalContext::suspend_runtime_quantum`).
+        let _q = ctx.suspend_runtime_quantum();
         // Floor = the parent's current frame depth. After setup_for_call pushes
         // the callee frame, the loop must stop unwinding once it pops back to
         // this depth (rather than emptying the whole call stack).
@@ -4143,6 +4167,16 @@ impl VM {
                     payload_for_box.native_fns.clone(),
                 );
                 vm.setup_for_call(closure.clone(), args)?;
+                // TEMPORARY BRIDGE: a legacy user closure re-entered via
+                // `call_callback` (e.g. a global `define`d fn called from
+                // another VM context) runs SYNCHRONOUSLY on this fresh foreign
+                // VM — this non-async wrapper arm never yields/awaits/spawns,
+                // so it never touches the runtime scheduler. Suspend the quantum
+                // flag so the `run` entry guard doesn't reject this synchronous
+                // nested run during an active runtime quantum. Deleted with the
+                // Task 04 `NativeOutcome::Call` migration of legacy callback
+                // re-entry (see `suspend_runtime_quantum`).
+                let _q = ctx.suspend_runtime_quantum();
                 vm.run(ctx)
             },
         );
@@ -5538,8 +5572,14 @@ mod tests {
         assert_eq!(suspended.frame_count(), 1);
     }
 
+    // TEMPORARY BRIDGE: a legacy user closure re-entered via the `call_value`
+    // callback during a runtime quantum runs SYNCHRONOUSLY on a fresh foreign
+    // VM (it cannot yield/await/spawn), carried by `suspend_runtime_quantum`.
+    // Before the bridge this rejected with the re-entry guard; the guard still
+    // protects genuine (non-suspended) fresh-VM entry via `VM::run`. Deleted
+    // with the Task 04 `NativeOutcome::Call` migration of legacy callbacks.
     #[test]
-    fn closure_fallback_rejects_vm_entry_during_runtime_quantum() {
+    fn closure_fallback_runs_synchronously_during_runtime_quantum() {
         let globals = make_test_env();
         let calls = Rc::new(std::cell::Cell::new(0));
         let calls_for_native = Rc::clone(&calls);
@@ -5547,7 +5587,7 @@ mod tests {
             intern("quantum-probe"),
             Value::native_fn(NativeFn::simple("quantum-probe", move |_| {
                 calls_for_native.set(calls_for_native.get() + 1);
-                Ok(Value::nil())
+                Ok(Value::int(9))
             })),
         );
         let ctx = EvalContext::new();
@@ -5555,14 +5595,17 @@ mod tests {
         let native = callback.as_native_fn_ref().expect("VM closure wrapper");
         let _quantum = ctx.enter_runtime_quantum().unwrap();
 
-        let error = (native.func)(&ctx, &[]).unwrap_err();
+        let result = (native.func)(&ctx, &[]).expect("bridged sync run");
 
-        assert_eq!(calls.get(), 0, "callback bytecode must not execute");
+        assert_eq!(
+            calls.get(),
+            1,
+            "callback bytecode must execute via the bridge"
+        );
+        assert_eq!(result, Value::int(9));
         assert!(
-            error
-                .to_string()
-                .contains("cannot re-enter a VM during an active runtime quantum"),
-            "unexpected guard error: {error}"
+            ctx.runtime_quantum_active(),
+            "quantum flag restored after the bridged sync run"
         );
     }
 

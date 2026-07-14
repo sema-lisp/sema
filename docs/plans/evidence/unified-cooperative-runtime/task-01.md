@@ -236,8 +236,8 @@ Second-amendment verification:
 | Finite yields and fairness watchdog | Task 03 |
 | Legacy source matches | Tasks 02–08 |
 
-Independent acceptance review is controller-owned and remains pending. This
-evidence does not claim that review.
+At this checkpoint, independent acceptance review remained pending. The final
+acceptance record appears below.
 
 ## Third acceptance amendment
 
@@ -273,7 +273,8 @@ removals for review but does not independently prohibit all additions.
 The exact intentional RED set is unchanged: supplied `async/all` sibling and
 scheduled `async/race` loser observation, captured mutation, negative
 sleep/timeout validation, unrepresentable channel capacity, finite tick ceiling,
-and watchdog fairness. Independent acceptance remains pending.
+and watchdog fairness. Independent acceptance remained pending at this
+third-amendment checkpoint and was completed after the corrections below.
 
 ## Important acceptance findings correction
 

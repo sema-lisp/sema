@@ -95,13 +95,14 @@ impl BoundedDriver {
         while report.work_items < limit {
             let unvisited_reserved = reserved_roots - report.root_visits;
             let remaining_credits = limit - report.work_items;
-            let source = if unvisited_reserved > 0 && remaining_credits <= unvisited_reserved {
-                3
-            } else {
-                let source = self.source_cursor % 4;
-                self.source_cursor = (self.source_cursor + 1) % 4;
-                source
-            };
+            let source =
+                if limit > 1 && unvisited_reserved > 0 && remaining_credits <= unvisited_reserved {
+                    3
+                } else {
+                    let source = self.source_cursor % 4;
+                    self.source_cursor = (self.source_cursor + 1) % 4;
+                    source
+                };
             let progressed = match source {
                 0 if report.completions < budget.completion_limit.get()
                     && !self.completions.is_empty() =>

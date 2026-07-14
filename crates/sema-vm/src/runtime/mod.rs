@@ -12,7 +12,9 @@ pub use task::{
     CancellationRequest, StateName, TaskRecord, TaskState, TaskTransitionError, WaitKey,
 };
 pub use timer::TimerQueue;
-pub use wait::{CompletionRoute, PendingResume, RuntimeCreateError, WaitRuntime};
+pub use wait::{
+    CompletionRoute, PendingResume, RegisterExternalError, RuntimeCreateError, WaitRuntime,
+};
 
 #[cfg(test)]
 mod tests;

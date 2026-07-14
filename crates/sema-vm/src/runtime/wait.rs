@@ -7,7 +7,7 @@ use sema_core::runtime::{
     CompletionSender, ExecutorAttachError, ExecutorCancelHandle, ExecutorLease, ExternalCompletion,
     ExternalFailure, IoExecutor, NativeCallContext, NativeContinuation, NativeResult,
     NativeSuspend, OperationId, ResourceClass, ResumeInput, RuntimeId, TaskContextHandle, TaskId,
-    WaitGeneration, WaitId, WaitKind,
+    Trace, WaitGeneration, WaitId, WaitKind,
 };
 
 use super::{TaskRecord, WaitKey};
@@ -23,6 +23,20 @@ pub enum CompletionRoute {
     Active,
     Cleanup,
     Late,
+}
+
+pub enum RegisterExternalError {
+    IdExhausted(NativeSuspend),
+    Rejected(Box<PendingResume>),
+}
+
+impl std::fmt::Debug for RegisterExternalError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::IdExhausted(_) => "IdExhausted(..)",
+            Self::Rejected(_) => "Rejected(..)",
+        })
+    }
 }
 
 struct InboxSender(Sender<ExternalCompletion>);
@@ -46,6 +60,15 @@ struct RegisteredExternalWait {
     context: TaskContextHandle,
 }
 
+impl Trace for RegisteredExternalWait {
+    fn trace(&self, sink: &mut dyn FnMut(sema_core::cycle::GcEdge<'_>)) -> bool {
+        self.decoder.trace(sink)
+            && self.resource.trace(sink)
+            && self.continuation.trace(sink)
+            && self.context.trace(sink)
+    }
+}
+
 struct CleanupEntry {
     runtime_id: RuntimeId,
     operation_id: OperationId,
@@ -57,6 +80,7 @@ struct CleanupEntry {
 }
 
 pub struct PendingResume {
+    key: WaitKey,
     task_id: TaskId,
     decoder: Option<Box<dyn CompletionDecoder>>,
     continuation: Box<dyn NativeContinuation>,
@@ -66,9 +90,24 @@ pub struct PendingResume {
     cancellation: CancellationView,
 }
 
+impl Trace for PendingResume {
+    fn trace(&self, sink: &mut dyn FnMut(sema_core::cycle::GcEdge<'_>)) -> bool {
+        self.decoder
+            .as_ref()
+            .is_none_or(|decoder| decoder.trace(sink))
+            && self.continuation.trace(sink)
+            && self.context.trace(sink)
+            && self.input.as_ref().is_none_or(|input| input.trace(sink))
+    }
+}
+
 impl PendingResume {
     pub fn task_id(&self) -> TaskId {
         self.task_id
+    }
+
+    pub fn wait_key(&self) -> WaitKey {
+        self.key
     }
 
     pub fn invoke_decoder(mut self) -> Self {
@@ -107,11 +146,18 @@ pub struct WaitRuntime {
     registrar: CompletionRegistrar,
     lease: Arc<dyn ExecutorLease>,
     inbox: Receiver<ExternalCompletion>,
+    deferred: VecDeque<ExternalCompletion>,
     active: HashMap<WaitKey, RegisteredExternalWait>,
     cleanup: HashMap<WaitKey, CleanupEntry>,
     cleanup_order: VecDeque<WaitKey>,
     late_completions: usize,
     quarantine_reaped: usize,
+}
+
+impl Trace for WaitRuntime {
+    fn trace(&self, sink: &mut dyn FnMut(sema_core::cycle::GcEdge<'_>)) -> bool {
+        self.active.values().all(|wait| wait.trace(sink))
+    }
 }
 
 impl WaitRuntime {
@@ -127,6 +173,7 @@ impl WaitRuntime {
             registrar,
             lease,
             inbox,
+            deferred: VecDeque::new(),
             active: HashMap::new(),
             cleanup: HashMap::new(),
             cleanup_order: VecDeque::new(),
@@ -139,20 +186,29 @@ impl WaitRuntime {
         self.runtime_id
     }
 
+    pub fn issue_internal_wait(&self) -> Result<WaitKey, sema_core::runtime::IdExhausted> {
+        self.registrar
+            .issue_wait_identity()
+            .map(|(id, generation)| WaitKey { id, generation })
+    }
+
     pub fn register_external(
         &mut self,
         task: &mut TaskRecord,
         suspend: NativeSuspend,
         context: TaskContextHandle,
-    ) -> Result<WaitKey, Box<PendingResume>> {
-        let WaitKind::External(prepared) = suspend.wait else {
+    ) -> Result<WaitKey, RegisterExternalError> {
+        let WaitKind::External(prepared) = &suspend.wait else {
             panic!("external wait required");
         };
         let kind = prepared.completion_kind();
-        let identity = self
-            .registrar
-            .issue_identity(kind)
-            .expect("wait identity available in task harness");
+        let identity = match self.registrar.issue_identity(kind) {
+            Ok(identity) => identity,
+            Err(_) => return Err(RegisterExternalError::IdExhausted(suspend)),
+        };
+        let WaitKind::External(prepared) = suspend.wait else {
+            unreachable!("wait kind checked before identity issuance")
+        };
         let key = WaitKey {
             id: identity.wait_id(),
             generation: identity.generation(),
@@ -188,31 +244,18 @@ impl WaitRuntime {
             let wait = self.active.remove(&key).expect("registered before submit");
             task.reject_wait(key)
                 .expect("rejection restores waiting task");
-            return Err(Box::new(self.finish_rejection(key, wait)));
+            return Err(RegisterExternalError::Rejected(Box::new(
+                self.finish_rejection(key, wait),
+            )));
         }
         Ok(key)
     }
 
-    fn finish_rejection(
-        &mut self,
-        key: WaitKey,
-        mut wait: RegisteredExternalWait,
-    ) -> PendingResume {
+    fn finish_rejection(&mut self, key: WaitKey, wait: RegisteredExternalWait) -> PendingResume {
         let _ = wait.queue_cancel.cancel_before_start();
-        let cancellation = wait.resource.cancel();
-        let quarantine = wait.resource.bound().is_some();
-        let retain = quarantine
-            || matches!(
-                cancellation,
-                Some(Ok(sema_core::runtime::CancelDisposition::PendingReap) | Err(_))
-            );
-        let last_error = cancellation
-            .and_then(Result::err)
-            .map(|error| error.to_string());
-        if retain {
-            self.insert_cleanup(key, &wait.identity, wait.resource, quarantine, last_error);
-        }
+        drop(wait.resource);
         PendingResume {
+            key,
             task_id: wait.task_id,
             decoder: Some(wait.decoder),
             continuation: wait.continuation,
@@ -223,8 +266,15 @@ impl WaitRuntime {
         }
     }
 
-    pub fn drain_one(&mut self) -> Option<(CompletionRoute, Option<PendingResume>)> {
-        let completion = match self.inbox.try_recv() {
+    pub fn drain_one(
+        &mut self,
+        task: &mut TaskRecord,
+    ) -> Option<(CompletionRoute, Option<PendingResume>)> {
+        let completion = match self
+            .deferred
+            .pop_front()
+            .map_or_else(|| self.inbox.try_recv(), Ok)
+        {
             Ok(completion) => completion,
             Err(TryRecvError::Empty | TryRecvError::Disconnected) => return None,
         };
@@ -232,15 +282,21 @@ impl WaitRuntime {
             id: completion.wait_id,
             generation: completion.generation,
         };
-        if self
-            .active
-            .get(&key)
-            .is_some_and(|wait| identity_matches(&wait.identity, &completion))
-        {
+        if let Some(wait) = self.active.get(&key) {
+            if !identity_matches(&wait.identity, &completion) {
+                self.late_completions += 1;
+                return Some((CompletionRoute::Late, None));
+            }
+            if wait.task_id != task.id() || task.wait_key() != Some(key) {
+                self.deferred.push_front(completion);
+                return None;
+            }
+            task.wake(key).ok()?;
             let wait = self.active.remove(&key).expect("identity checked");
             return Some((
                 CompletionRoute::Active,
                 Some(PendingResume {
+                    key,
                     task_id: wait.task_id,
                     decoder: Some(wait.decoder),
                     continuation: wait.continuation,
@@ -258,7 +314,7 @@ impl WaitRuntime {
                     && entry.kind == completion.kind
             }
         }) {
-            self.cleanup.remove(&key);
+            self.remove_cleanup(key);
             self.quarantine_reaped += 1;
             return Some((CompletionRoute::Cleanup, None));
         }
@@ -266,11 +322,15 @@ impl WaitRuntime {
         Some((CompletionRoute::Late, None))
     }
 
-    pub fn cancel(&mut self, task: &TaskRecord, key: WaitKey) -> Option<PendingResume> {
-        let mut wait = self.active.remove(&key)?;
-        debug_assert_eq!(wait.task_id, task.id());
-        let _ = wait.queue_cancel.cancel_before_start();
+    pub fn cancel(&mut self, task: &mut TaskRecord, key: WaitKey) -> Option<PendingResume> {
+        let wait = self.active.get(&key)?;
+        if wait.task_id != task.id() || task.wait_key() != Some(key) {
+            return None;
+        }
         let reason = task.cancellation()?.reason;
+        task.wake(key).ok()?;
+        let mut wait = self.active.remove(&key).expect("validated active wait");
+        let _ = wait.queue_cancel.cancel_before_start();
         let cancellation = wait.resource.cancel();
         let quarantine = wait.resource.bound().is_some();
         let retain = match &cancellation {
@@ -286,6 +346,7 @@ impl WaitRuntime {
         }
         drop(wait.decoder);
         Some(PendingResume {
+            key,
             task_id: wait.task_id,
             decoder: None,
             continuation: wait.continuation,
@@ -317,6 +378,18 @@ impl WaitRuntime {
             },
         );
         self.cleanup_order.push_back(key);
+    }
+
+    fn remove_cleanup(&mut self, key: WaitKey) -> Option<CleanupEntry> {
+        let entry = self.cleanup.remove(&key)?;
+        if let Some(position) = self
+            .cleanup_order
+            .iter()
+            .position(|candidate| *candidate == key)
+        {
+            self.cleanup_order.remove(position);
+        }
+        Some(entry)
     }
 
     pub fn reap_cleanup(&mut self, limit: usize) -> usize {

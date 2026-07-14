@@ -1,3 +1,4 @@
+use std::any::Any;
 use std::cell::Cell;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
@@ -22,7 +23,7 @@ use super::{
     root::{RootRecord, RootState, RootTransitionError},
     task::{CancellationRequest, StateName, TaskRecord, TaskTransitionError, WaitKey},
     timer::TimerQueue,
-    wait::{CompletionRoute, RuntimeCreateError, WaitRuntime},
+    wait::{CompletionRoute, RegisterExternalError, RuntimeCreateError, WaitRuntime},
 };
 
 #[derive(Clone, Copy)]
@@ -100,6 +101,68 @@ struct CountingContinuation(Arc<Mutex<Vec<&'static str>>>);
 impl Trace for CountingContinuation {
     fn trace(&self, _sink: &mut dyn FnMut(sema_core::cycle::GcEdge<'_>)) -> bool {
         true
+    }
+}
+
+struct EdgeLocal(Value);
+impl Trace for EdgeLocal {
+    fn trace(&self, sink: &mut dyn FnMut(sema_core::cycle::GcEdge<'_>)) -> bool {
+        sink(sema_core::cycle::GcEdge::Value(&self.0));
+        true
+    }
+}
+impl sema_core::runtime::TaskLocalValue for EdgeLocal {
+    fn inherit(&self) -> Rc<dyn sema_core::runtime::TaskLocalValue> {
+        Rc::new(Self(self.0.clone()))
+    }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
+struct EdgeDecoder(Value);
+impl Trace for EdgeDecoder {
+    fn trace(&self, sink: &mut dyn FnMut(sema_core::cycle::GcEdge<'_>)) -> bool {
+        sink(sema_core::cycle::GcEdge::Value(&self.0));
+        true
+    }
+}
+impl CompletionDecoder for EdgeDecoder {
+    fn decode(
+        self: Box<Self>,
+        _context: &mut NativeCallContext<'_>,
+        _result: Result<sema_core::runtime::SendPayload, sema_core::runtime::ExternalFailure>,
+    ) -> Result<Value, SemaError> {
+        Ok(self.0)
+    }
+}
+
+struct EdgeContinuation(Value);
+impl Trace for EdgeContinuation {
+    fn trace(&self, sink: &mut dyn FnMut(sema_core::cycle::GcEdge<'_>)) -> bool {
+        sink(sema_core::cycle::GcEdge::Value(&self.0));
+        true
+    }
+}
+impl NativeContinuation for EdgeContinuation {
+    fn resume(
+        self: Box<Self>,
+        _context: &mut NativeCallContext<'_>,
+        _input: ResumeInput,
+    ) -> NativeResult {
+        Ok(NativeOutcome::Return(self.0))
+    }
+}
+
+fn edge_suspend() -> NativeSuspend {
+    NativeSuspend {
+        wait: WaitKind::External(Box::new(PreparedExternalOperation::quarantined_blocking(
+            CompletionKind::try_from_raw(3).unwrap(),
+            Box::new(EdgeDecoder(Value::string("decoder"))),
+            sema_core::runtime::QuarantineBound::hard_deadline(Duration::from_secs(1)).unwrap(),
+            || Ok(Box::new(())),
+        ))),
+        continuation: Box::new(EdgeContinuation(Value::string("continuation"))),
     }
 }
 impl NativeContinuation for CountingContinuation {
@@ -183,10 +246,15 @@ fn wait_inline_completion_observes_registered_state_then_consumes_owners_once() 
     assert_eq!(task.state_name(), StateName::Waiting);
     assert_eq!(runtime.active_len(), 1);
 
-    let Some((CompletionRoute::Active, Some(pending))) = runtime.drain_one() else {
+    let Some((CompletionRoute::Active, Some(pending))) = runtime.drain_one(&mut task) else {
         panic!("completion must extract a pending resume");
     };
     assert_eq!(pending.task_id(), task.id());
+    assert_eq!(
+        pending.wait_key(),
+        task.wait_key().unwrap_or_else(|| pending.wait_key())
+    );
+    assert_eq!(task.state_name(), StateName::Ready);
     let pending = pending.invoke_decoder();
     assert_eq!(&*events.lock().unwrap(), &["decode"]);
     assert!(matches!(
@@ -195,7 +263,7 @@ fn wait_inline_completion_observes_registered_state_then_consumes_owners_once() 
     ));
     assert_eq!(&*events.lock().unwrap(), &["decode", "returned"]);
     assert_eq!(runtime.active_len(), 0);
-    assert!(runtime.drain_one().is_none());
+    assert!(runtime.drain_one(&mut task).is_none());
 }
 
 #[test]
@@ -214,8 +282,11 @@ fn wait_submit_rejection_traverses_decoder_then_continuation() {
         external_suspend(Arc::clone(&events)),
         TaskContextHandle::default(),
     );
-    let pending = result.expect_err("submission must be rejected");
+    let Err(RegisterExternalError::Rejected(pending)) = result else {
+        panic!("submission rejection expected")
+    };
     assert_eq!(task.state_name(), StateName::Running);
+    assert_eq!(runtime.cleanup_len(), 0);
     let pending = pending.invoke_decoder();
     assert_eq!(&*events.lock().unwrap(), &["decode"]);
     assert!(matches!(
@@ -224,6 +295,111 @@ fn wait_submit_rejection_traverses_decoder_then_continuation() {
     ));
     assert_eq!(&*events.lock().unwrap(), &["decode", "failed"]);
     assert_eq!(runtime.active_len(), 0);
+}
+
+#[test]
+fn wait_completion_for_wrong_task_preserves_active_wait() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let executor = Arc::new(FakeExecutor {
+        mode: FakeSubmit::Inline,
+        failure: None,
+    });
+    let mut runtime = WaitRuntime::new(executor).unwrap();
+    let mut ids = Ids::new();
+    let mut owner = task(&mut ids);
+    let mut stranger = task(&mut ids);
+    owner.start().unwrap();
+    stranger.start().unwrap();
+    runtime
+        .register_external(
+            &mut owner,
+            external_suspend(events),
+            TaskContextHandle::default(),
+        )
+        .unwrap();
+
+    assert!(runtime.drain_one(&mut stranger).is_none());
+    assert_eq!(runtime.active_len(), 1);
+    assert_eq!(owner.state_name(), StateName::Waiting);
+    assert!(matches!(
+        runtime.drain_one(&mut owner),
+        Some((CompletionRoute::Active, Some(_)))
+    ));
+    assert_eq!(owner.state_name(), StateName::Ready);
+}
+
+#[test]
+fn wait_trace_reports_exact_owned_edges_and_fails_on_borrowed_context() {
+    let executor = Arc::new(FakeExecutor {
+        mode: FakeSubmit::Inline,
+        failure: None,
+    });
+    let mut runtime = WaitRuntime::new(executor).unwrap();
+    let mut ids = Ids::new();
+    let mut task = task(&mut ids);
+    task.start().unwrap();
+    let context = TaskContextHandle::default();
+    context
+        .borrow_mut()
+        .insert(Rc::new(EdgeLocal(Value::string("context"))));
+    runtime
+        .register_external(&mut task, edge_suspend(), context.clone())
+        .unwrap();
+    let mut edges = 0;
+    assert!(runtime.trace(&mut |_| edges += 1));
+    assert_eq!(edges, 3);
+
+    let Some((CompletionRoute::Active, Some(pending))) = runtime.drain_one(&mut task) else {
+        panic!("pending resume expected")
+    };
+    edges = 0;
+    assert!(pending.trace(&mut |_| edges += 1));
+    assert_eq!(edges, 3);
+    let pending = pending.invoke_decoder();
+    edges = 0;
+    assert!(pending.trace(&mut |_| edges += 1));
+    assert_eq!(edges, 3);
+
+    let borrow = context.borrow_mut();
+    edges = 0;
+    assert!(!pending.trace(&mut |_| edges += 1));
+    assert_eq!(edges, 1);
+    drop(borrow);
+}
+
+#[test]
+fn wait_cancel_requires_canonical_request_and_exact_owner_key() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let executor = Arc::new(FakeExecutor {
+        mode: FakeSubmit::Inline,
+        failure: None,
+    });
+    let mut runtime = WaitRuntime::new(executor).unwrap();
+    let mut ids = Ids::new();
+    let mut owner = task(&mut ids);
+    let mut stranger = task(&mut ids);
+    owner.start().unwrap();
+    stranger.start().unwrap();
+    let key = runtime
+        .register_external(
+            &mut owner,
+            external_suspend(events),
+            TaskContextHandle::default(),
+        )
+        .unwrap();
+    let _ = ids.wait_key();
+    let stale = ids.wait_key();
+
+    assert!(runtime.cancel(&mut owner, key).is_none());
+    stranger.request_cancellation(CancelReason::Explicit);
+    assert!(runtime.cancel(&mut stranger, key).is_none());
+    owner.request_cancellation(CancelReason::Timeout);
+    assert!(runtime.cancel(&mut owner, stale).is_none());
+    assert_eq!(runtime.active_len(), 1);
+    assert_eq!(owner.state_name(), StateName::Waiting);
+    assert!(runtime.cancel(&mut owner, key).is_some());
+    assert_eq!(runtime.active_len(), 0);
+    assert_eq!(owner.state_name(), StateName::Ready);
 }
 
 #[test]
@@ -260,13 +436,16 @@ fn wait_cancel_uses_first_task_reason_and_only_quarantine_completion_reaps_clean
     };
     assert!(quarantine_task.request_cancellation(CancelReason::Timeout));
     assert!(!quarantine_task.request_cancellation(CancelReason::Explicit));
-    let pending = quarantine.cancel(&quarantine_task, key).unwrap();
+    let pending = quarantine.cancel(&mut quarantine_task, key).unwrap();
+    assert_eq!(quarantine_task.state_name(), StateName::Ready);
     assert!(matches!(
         pending.invoke_continuation(),
         Ok(NativeOutcome::Return(_))
     ));
     assert_eq!(
-        quarantine.drain_one().map(|item| item.0),
+        quarantine
+            .drain_one(&mut quarantine_task)
+            .map(|item| item.0),
         Some(CompletionRoute::Cleanup)
     );
     assert_eq!(quarantine.quarantine_reaped(), 1);
@@ -284,9 +463,11 @@ fn wait_cancel_uses_first_task_reason_and_only_quarantine_completion_reaps_clean
         panic!("registration accepted")
     };
     interruptible_task.request_cancellation(CancelReason::Owner);
-    interruptible.cancel(&interruptible_task, key).unwrap();
+    interruptible.cancel(&mut interruptible_task, key).unwrap();
     assert_eq!(
-        interruptible.drain_one().map(|item| item.0),
+        interruptible
+            .drain_one(&mut interruptible_task)
+            .map(|item| item.0),
         Some(CompletionRoute::Late)
     );
     assert_eq!(interruptible.cleanup_len(), 1);
@@ -321,11 +502,15 @@ impl RuntimeClock for FakeClock {
 #[test]
 fn timer_same_deadline_is_fifo_and_zero_duration_is_immediately_due() {
     let clock = FakeClock::new();
-    let mut ids = Ids::new();
+    let executor = Arc::new(FakeExecutor {
+        mode: FakeSubmit::Inline,
+        failure: None,
+    });
+    let runtime = WaitRuntime::new(executor).unwrap();
     let mut timers = TimerQueue::new();
-    let first = ids.wait_key();
-    let second = ids.wait_key();
-    let zero = ids.wait_key();
+    let first = runtime.issue_internal_wait().unwrap();
+    let second = runtime.issue_internal_wait().unwrap();
+    let zero = runtime.issue_internal_wait().unwrap();
     timers.insert(clock.now() + Duration::from_millis(5), first);
     timers.insert(clock.now() + Duration::from_millis(5), second);
     timers.insert(clock.now(), zero);
@@ -435,7 +620,24 @@ fn drive_does_not_consume_unvisited_reserved_roots() {
     assert_eq!(first.work_items, 1);
     assert_eq!(second.work_items, 1);
     assert!(first.ready_remaining || second.ready_remaining);
-    assert_eq!(driver.pending_ready_roots(), 1);
+    assert_eq!(driver.pending_ready_roots(), 2);
+}
+
+#[test]
+fn drive_rotation_persists_for_repeated_one_credit_calls() {
+    let clock = FakeClock::new();
+    let mut driver = BoundedDriver::new(Rc::new(clock));
+    driver.add_completions(8);
+    driver.add_timers(8);
+    driver.add_cleanup(8);
+    driver.add_ready_roots(8);
+    let budget = drive_budget(1);
+    let reports: Vec<_> = (0..8).map(|_| driver.drive(&budget)).collect();
+
+    assert!(reports.iter().any(|report| report.completions == 1));
+    assert!(reports.iter().any(|report| report.timers == 1));
+    assert!(reports.iter().any(|report| report.cleanup == 1));
+    assert!(reports.iter().any(|report| report.root_visits == 1));
 }
 
 struct Ids {

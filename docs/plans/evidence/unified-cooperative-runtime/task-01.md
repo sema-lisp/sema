@@ -313,3 +313,11 @@ Task 02 restricts `ExecutorSubmission::for_registered_wait` to
 submission, and `sema-io` receives only that submission plus access to its
 sealed driver. `SubmissionRejected::into_rollback` destroys the private sink
 inside `sema-core` and returns only the job, start token, and rejection kind.
+
+## Independent acceptance
+
+The controller-owned final review covered the complete Task 01 range from
+`b19e5cad` through `e3d3cae4`. It found no remaining Critical, Important, or
+Minor issues and accepted Task 01. The exact intentional RED set remains assigned
+to Tasks 03 and 04. Native Windows watchdog execution remains a binding Task 07
+CI gate and cannot be replaced by cross-compilation evidence.

@@ -20,8 +20,9 @@ Markdown evidence, Cargo, Jake.
 
 ## Execution contract
 
-- **Status:** Not accepted; this amended plan supersedes the provisional Task 01
-  work and must pass controller-owned acceptance review before later tasks run.
+- **Status:** Accepted after controller-owned independent review of the complete
+  Task 01 range through `e3d3cae4`; no Critical, Important, or Minor findings
+  remain.
 - **Dependencies:** Architecture commit `8acca1de` and the master specification.
 - **Immutable inputs:** The approved observation/ownership, multiple-root,
   cancellation, fairness, resource, host, and final-profiling contracts.

@@ -1,9 +1,8 @@
 # Unified Cooperative Runtime Rewrite
 
 > **Status:** Approved architecture and expanded execution plan.
-> **Implementation status:** No production rewrite layer is accepted yet. The
-> characterization commit at `52293e61` is provisional and must be corrected as
-> described in [Task 01 status](#task-01-status).
+> **Implementation status:** Task 01 contracts, characterization, inventory,
+> and watchdog gates are accepted. No production rewrite layer is accepted yet.
 
 This specification defines the runtime that every implementation task must
 produce. The ordered task files execute it as horizontal layers; they may not
@@ -952,9 +951,11 @@ An implementation agent does not approve its own task.
 ## Task 01 status
 
 Task 01 was partially executed in commit `52293e61` before this specification
-resolved ownership and fairness semantics. It is **not accepted**.
+resolved ownership and fairness semantics. The amended Task 01 range through
+`e3d3cae4` corrected the issues below and passed independent acceptance review.
+Task 01 is **accepted**; Tasks 02 and later remain unimplemented.
 
-The revised task must address these known defects in its own plan and evidence:
+The accepted amendment addressed these defects in its plan and evidence:
 
 - `race_with_settled_winner_cancels_owned_pending_loser` contradicts the public
   observational `async/race` contract. Replace it with a test proving a supplied
@@ -975,7 +976,7 @@ The revised task must address these known defects in its own plan and evidence:
 
 The useful characterization tests for captured mutation, duration validation,
 capacity validation, finite yield count, and nested callback composition remain
-inputs to the corrected task.
+inputs to the production implementation tasks.
 
 ## Release gates
 

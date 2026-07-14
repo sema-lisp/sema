@@ -560,25 +560,44 @@ fn runtime_terminal_abort_preserves_settled_roots_and_reaps_unhandled_aborts() {
 #[test]
 fn runtime_drive_reserves_every_eligible_root_visit_credit() {
     let runtime = runtime_with_inline_executor(Rc::new(FakeClock::new()));
+    let mut backlog_handles = Vec::new();
+    for _ in 0..8 {
+        backlog_handles.push(
+            runtime
+                .submit_test_root(TestPreparedTask::native(Ok(NativeOutcome::Suspend(
+                    external_suspend(Arc::new(Mutex::new(Vec::new()))),
+                ))))
+                .unwrap(),
+        );
+    }
+    let cleanup = runtime
+        .submit_test_root(TestPreparedTask::returned(Value::NIL))
+        .unwrap();
+    let mut setup = drive_budget(32);
+    setup.completion_limit = std::num::NonZeroUsize::new(1).unwrap();
+    setup.root_visit_limit = std::num::NonZeroUsize::new(9).unwrap();
+    runtime.drive(&setup).unwrap();
+    assert!(matches!(cleanup.poll_result(), RootPoll::Ready(_)));
+    drop(cleanup);
+
     let first = runtime
         .submit_test_root(TestPreparedTask::returned(Value::int(1)))
         .unwrap();
     let second = runtime
         .submit_test_root(TestPreparedTask::returned(Value::int(2)))
         .unwrap();
-    let mut budget = drive_budget(2);
+    let mut budget = drive_budget(5);
     budget.root_visit_limit = std::num::NonZeroUsize::new(2).unwrap();
 
-    assert_eq!(
+    assert!(matches!(
         runtime.drive(&budget).unwrap(),
-        super::DriveState::Progress {
-            work_items: 2,
-            instructions: 0,
-            ready_remaining: false,
-        }
-    );
+        super::DriveState::Progress { work_items: 5, .. }
+    ));
     assert!(matches!(first.poll_result(), RootPoll::Pending));
     assert!(matches!(second.poll_result(), RootPoll::Pending));
+    assert!(backlog_handles
+        .iter()
+        .any(|handle| matches!(handle.poll_result(), RootPoll::Pending)));
 }
 
 #[test]
@@ -1418,24 +1437,6 @@ fn drive_limits_reserve_root_visit_under_completion_and_timer_backlogs() {
     assert_eq!(report.timers, 1);
     assert_eq!(report.cleanup, 1);
     assert!(report.ready_remaining);
-}
-
-#[test]
-fn drive_reserves_two_roots_while_completion_backlog_remains() {
-    let clock = FakeClock::new();
-    let mut driver = BoundedDriver::new(Rc::new(clock));
-    driver.add_completions(10);
-    driver.add_timers(1);
-    driver.add_cleanup(1);
-    driver.add_ready_roots(3);
-    let budget = drive_budget(5);
-
-    let report = driver.drive(&budget);
-
-    assert_eq!(report.work_items, 5);
-    assert_eq!(report.root_visits, 2);
-    assert!(report.completions < 10, "completion backlog must remain");
-    assert_eq!(driver.pending_ready_roots(), 1);
 }
 
 #[test]

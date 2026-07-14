@@ -35,9 +35,10 @@ impl TaskContext {
     }
 
     pub fn get<T: TaskLocalValue + 'static>(&self) -> Option<&T> {
-        self.extensions
-            .get(&TypeId::of::<T>())
-            .and_then(|value| value.as_any().downcast_ref())
+        self.extensions.get(&TypeId::of::<T>()).and_then(|value| {
+            let value: &dyn Any = value.as_ref();
+            value.downcast_ref()
+        })
     }
 
     pub fn remove<T: TaskLocalValue + 'static>(&mut self) -> Option<Rc<T>> {
@@ -54,8 +55,9 @@ impl TaskContext {
                 .iter()
                 .map(|(type_id, value)| {
                     let inherited = value.inherit();
+                    let inherited_any: &dyn Any = inherited.as_ref();
                     assert_eq!(
-                        inherited.as_any().type_id(),
+                        inherited_any.type_id(),
                         *type_id,
                         "task-local inheritance changed concrete type"
                     );
@@ -310,6 +312,24 @@ mod tests {
 
     struct WrongInheritance;
 
+    struct SpoofedInheritance(WrongInheritance);
+
+    impl Trace for SpoofedInheritance {
+        fn trace(&self, _sink: &mut dyn FnMut(GcEdge<'_>)) -> bool {
+            true
+        }
+    }
+
+    impl TaskLocalValue for SpoofedInheritance {
+        fn inherit(&self) -> Rc<dyn TaskLocalValue> {
+            Rc::new(Self(WrongInheritance))
+        }
+
+        fn as_any(&self) -> &dyn Any {
+            &self.0
+        }
+    }
+
     impl Trace for WrongInheritance {
         fn trace(&self, _sink: &mut dyn FnMut(GcEdge<'_>)) -> bool {
             true
@@ -318,10 +338,7 @@ mod tests {
 
     impl TaskLocalValue for WrongInheritance {
         fn inherit(&self) -> Rc<dyn TaskLocalValue> {
-            Rc::new(Resettable {
-                value: 0,
-                inherit_calls: Rc::new(Cell::new(0)),
-            })
+            Rc::new(SpoofedInheritance(WrongInheritance))
         }
 
         fn as_any(&self) -> &dyn Any {

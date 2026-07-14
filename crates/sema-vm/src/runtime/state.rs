@@ -754,15 +754,34 @@ impl Runtime {
             PendingStage::Decode(pending) => PendingStage::Continue(pending.invoke_decoder()),
             PendingStage::Continue(pending) => {
                 let task = pending.task_id();
-                let owner = self
-                    .state
-                    .borrow_mut()
-                    .tasks
-                    .get_mut(&task)
-                    .and_then(|task| task.suspended_owner.take())
-                    .ok_or_else(|| RuntimeFault::Invariant {
-                        message: "resumed task has no installed return owner".into(),
-                    })?;
+                let (owner, cancellation) = {
+                    let mut state = self.state.borrow_mut();
+                    state
+                        .tasks
+                        .get_mut(&task)
+                        .and_then(|task| {
+                            task.suspended_owner
+                                .take()
+                                .map(|owner| (owner, task.record.cancellation()))
+                        })
+                        .ok_or_else(|| RuntimeFault::Invariant {
+                            message: "resumed task has no installed return owner".into(),
+                        })?
+                };
+                // A sticky cancellation may have landed after the completion woke
+                // this task Ready. Resume the continuation as cancelled — parity
+                // with resume_continuation — instead of with the stale completion
+                // value, so root/explicit/shutdown cancellation is not dropped.
+                if let Some(request) = cancellation {
+                    let frame = ContinuationFrame::native(pending.into_continuation());
+                    self.resume_continuation(
+                        task,
+                        owner,
+                        frame,
+                        ResumeInput::Cancelled(request.reason),
+                    )?;
+                    return Ok(true);
+                }
                 PendingStage::Apply(task, owner, pending.invoke_continuation())
             }
             PendingStage::Invoke(task, owner, call) => {
@@ -1151,23 +1170,40 @@ impl Runtime {
         owner: ReturnOwner,
         result: NativeResult,
     ) -> Result<(), RuntimeFault> {
-        let root = self
-            .state
-            .borrow()
-            .tasks
-            .get(&task_id)
-            .map(|task| task.record.relations().origin_root)
-            .ok_or_else(|| RuntimeFault::Invariant {
-                message: "native result task disappeared".into(),
-            })?;
+        let (root, cancellation) = {
+            let state = self.state.borrow();
+            let task = state
+                .tasks
+                .get(&task_id)
+                .ok_or_else(|| RuntimeFault::Invariant {
+                    message: "native result task disappeared".into(),
+                })?;
+            (
+                task.record.relations().origin_root,
+                task.record.cancellation(),
+            )
+        };
         match result {
+            // A task that returns or fails while a cancellation is sticky settles
+            // Cancelled: catching cancellation for cleanup cannot convert it into a
+            // success or a plain failure (cancellation-cleanup mode).
             Ok(NativeOutcome::Return(value)) => {
                 debug_assert!(matches!(owner, ReturnOwner::Root));
-                self.settle(root, task_id, TaskOutcome::Returned(value))
+                match cancellation {
+                    Some(request) => {
+                        self.settle(root, task_id, TaskOutcome::Cancelled(request.reason))
+                    }
+                    None => self.settle(root, task_id, TaskOutcome::Returned(value)),
+                }
             }
             Err(error) => {
                 debug_assert!(matches!(owner, ReturnOwner::Root));
-                self.settle(root, task_id, TaskOutcome::Failed(error))
+                match cancellation {
+                    Some(request) => {
+                        self.settle(root, task_id, TaskOutcome::Cancelled(request.reason))
+                    }
+                    None => self.settle(root, task_id, TaskOutcome::Failed(error)),
+                }
             }
             Ok(NativeOutcome::Suspend(suspend)) => {
                 if matches!(

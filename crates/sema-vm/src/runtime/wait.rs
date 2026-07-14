@@ -153,6 +153,13 @@ impl PendingResume {
             self.input.expect("decoder is charged before continuation"),
         )
     }
+
+    /// Surrender the continuation so the runtime can resume it through the
+    /// cancellation-reconciling path when a sticky cancellation landed after the
+    /// completion woke the task. The decoded completion value is discarded.
+    pub fn into_continuation(self) -> Box<dyn NativeContinuation> {
+        self.continuation
+    }
 }
 
 pub struct WaitRuntime {

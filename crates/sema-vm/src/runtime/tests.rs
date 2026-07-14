@@ -1679,10 +1679,9 @@ fn runtime_shutdown_cancels_waiting_task_and_reaps_quarantine_completion() {
     let RootPoll::Ready(settlement) = handle.poll_result() else {
         panic!("waiting root settles during shutdown");
     };
-    assert!(matches!(
-        &settlement.outcome,
-        TaskOutcome::Returned(value) if *value == Value::NIL
-    ));
+    // The continuation observed cancellation and returned; shutdown cancellation
+    // cannot be defeated by that return, so the task settles Cancelled.
+    assert!(matches!(&settlement.outcome, TaskOutcome::Cancelled(_)));
 }
 
 #[test]
@@ -1715,6 +1714,48 @@ fn runtime_cancel_and_reap_hooks_may_poll_root_handle_reentrantly() {
         .unwrap();
     REENTRANT_HANDLE.with(|slot| slot.borrow_mut().take());
     assert!(report.clean);
+}
+
+#[test]
+fn external_completion_after_cancellation_request_settles_cancelled_not_returned() {
+    // Regression: a cancellation requested after an external completion has been
+    // drained (task Ready with a pending resume) but before the task is visited
+    // must still be observed by the continuation and settle the task Cancelled.
+    let clock = Rc::new(FakeClock::new());
+    let runtime = runtime_with_inline_executor(clock.clone());
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let handle = runtime
+        .submit_test_root(TestPreparedTask::native(Ok(NativeOutcome::Suspend(
+            external_suspend(Arc::clone(&events)),
+        ))))
+        .expect("root admitted");
+    // Register the external wait; the inline job's completion now sits in the
+    // inbox while the task is still Waiting.
+    runtime.drive(&drive_budget(2)).expect("register wait");
+    assert!(matches!(handle.poll_result(), RootPoll::Pending));
+
+    // Cancellation is requested while that completion is still queued.
+    handle.cancel(CancelReason::Explicit);
+
+    // Draining the completion wakes the task; the resume must reconcile the
+    // sticky cancellation rather than resuming with the stale completion value.
+    while matches!(handle.poll_result(), RootPoll::Pending) {
+        runtime.drive(&drive_budget(8)).unwrap();
+    }
+    let RootPoll::Ready(settlement) = handle.poll_result() else {
+        panic!("cancelled root settles");
+    };
+    assert!(
+        matches!(settlement.outcome, TaskOutcome::Cancelled(_)),
+        "cancelled task must not settle Returned: {:?}",
+        settlement.outcome
+    );
+    assert_eq!(
+        events.lock().unwrap().last().copied(),
+        Some("cancelled"),
+        "continuation observed the wrong resume input: {:?}",
+        events.lock().unwrap()
+    );
 }
 
 #[test]

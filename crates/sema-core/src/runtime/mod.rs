@@ -27,8 +27,8 @@ pub use ids::{
     TaskId, WaitGeneration, WaitId,
 };
 pub use native::{
-    CancellationView, ChannelOperation, ChannelQuery, ChannelReceive, ChannelWait, NativeCall,
-    NativeCallContext, NativeContinuation, NativeOutcome, NativeResult, NativeSuspend,
+    CancellationView, ChannelOperation, ChannelQuery, ChannelReceive, ChannelSend, ChannelWait,
+    NativeCall, NativeCallContext, NativeContinuation, NativeOutcome, NativeResult, NativeSuspend,
     PromiseSetMode, PromiseSetWait, ResumeInput, RuntimeRequest, RuntimeResponse, WaitKind,
 };
 pub use resource::{

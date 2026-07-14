@@ -70,6 +70,10 @@ pub enum RuntimeRequest {
         promise: PromiseId,
         continuation: Box<dyn NativeContinuation>,
     },
+    PromiseSetWait {
+        wait: PromiseSetWait,
+        continuation: Box<dyn NativeContinuation>,
+    },
     OriginBarrier {
         continuation: Box<dyn NativeContinuation>,
     },
@@ -104,7 +108,15 @@ pub enum RuntimeResponse {
     Value(Value),
     Cancelled(bool),
     Settlement(Option<Rc<TaskSettlement>>),
+    Settlements(Vec<Rc<TaskSettlement>>),
     Receive(ChannelReceive),
+    Send(ChannelSend),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ChannelSend {
+    Sent,
+    Closed,
 }
 
 #[derive(Clone, Debug)]
@@ -197,7 +209,8 @@ impl Trace for RuntimeRequest {
             Self::CancelPromise { continuation, .. }
             | Self::CreateChannel { continuation, .. }
             | Self::ChannelOp { continuation, .. }
-            | Self::InspectPromise { continuation, .. } => continuation.trace(sink),
+            | Self::InspectPromise { continuation, .. }
+            | Self::PromiseSetWait { continuation, .. } => continuation.trace(sink),
             Self::OriginBarrier { continuation } => continuation.trace(sink),
         }
     }
@@ -209,6 +222,9 @@ impl Trace for RuntimeResponse {
             Self::Value(value) => sink(GcEdge::Value(value)),
             Self::Receive(ChannelReceive::Received(value)) => sink(GcEdge::Value(value)),
             Self::Settlement(Some(settlement)) => return settlement.trace(sink),
+            Self::Settlements(settlements) => {
+                return settlements.iter().all(|settlement| settlement.trace(sink));
+            }
             _ => {}
         }
         true

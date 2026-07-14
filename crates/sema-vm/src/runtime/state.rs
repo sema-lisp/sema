@@ -13,7 +13,7 @@ use sema_core::runtime::{
     CancelReason, CancellationView, ExecutorShutdown, IdCounter, IoExecutor, NativeCall,
     NativeCallContext, NativeOutcome, NativeResult, ResumeInput, RootId, RuntimeRequest,
     RuntimeResponse, RuntimeScopedIdCounter, SettlementSeq, TaskContextHandle, TaskId, TaskOutcome,
-    TaskSettlement, Trace,
+    TaskSettlement, Trace, WaitKind,
 };
 #[cfg(test)]
 use sema_core::runtime::{CancellationParent, LifetimeOwner, TaskRelations};
@@ -21,7 +21,7 @@ use sema_core::EvalContext;
 #[cfg(test)]
 use sema_core::Value;
 
-use super::channel::ChannelClose;
+use super::channel::{ChannelClose, ChannelWake};
 use super::{
     ChannelRegistry, ContinuationFrame, DriveBudget, DriveState, PendingResume, PromiseRegistry,
     PromiseState, ReadyScheduler, RegisterExternalError, RootRecord, RootState, RuntimeClock,
@@ -124,6 +124,8 @@ struct RuntimeState {
     timers: TimerQueue,
     handle_cleanup: VecDeque<RootId>,
     pending: VecDeque<PendingStage>,
+    protocol_waits: HashMap<super::WaitKey, ProtocolWait>,
+    task_promises: HashMap<TaskId, sema_core::runtime::PromiseId>,
     drive_cursor: usize,
     drive_active: bool,
     active_instruction_limit: usize,
@@ -144,6 +146,21 @@ struct RuntimeState {
     ready_visit_count: usize,
 }
 
+enum ProtocolWaitKind {
+    Promises(sema_core::runtime::PromiseSetWait),
+    Channel {
+        channel: sema_core::runtime::ChannelId,
+        receive: bool,
+    },
+}
+
+struct ProtocolWait {
+    task: TaskId,
+    kind: ProtocolWaitKind,
+    owner: ReturnOwner,
+    continuation: ContinuationFrame,
+}
+
 impl Trace for RuntimeState {
     fn trace(&self, sink: &mut dyn FnMut(sema_core::cycle::GcEdge<'_>)) -> bool {
         self.waits.as_ref().is_none_or(|waits| waits.trace(sink))
@@ -151,6 +168,10 @@ impl Trace for RuntimeState {
             && self.tasks.values().all(|task| task.trace(sink))
             && self.promises.trace(sink)
             && self.channels.trace(sink)
+            && self
+                .protocol_waits
+                .values()
+                .all(|wait| wait.owner.trace(sink) && wait.continuation.trace(sink))
             && self.pending.iter().all(|stage| stage.trace(sink))
     }
 }
@@ -211,6 +232,8 @@ impl Runtime {
                 timers: TimerQueue::new(),
                 handle_cleanup: VecDeque::new(),
                 pending: VecDeque::new(),
+                protocol_waits: HashMap::new(),
+                task_promises: HashMap::new(),
                 drive_cursor: 0,
                 drive_active: false,
                 active_instruction_limit: usize::MAX,
@@ -290,6 +313,68 @@ impl Runtime {
             runtime: Rc::downgrade(&self.state),
             id: root,
         })
+    }
+
+    #[cfg(test)]
+    pub(super) fn create_pending_promise_for_test(&self) -> sema_core::runtime::PromiseId {
+        self.state
+            .borrow_mut()
+            .promises
+            .allocate_pending(None)
+            .expect("test promise identity")
+    }
+
+    #[cfg(test)]
+    pub(super) fn submit_test_root_with_promise(
+        &self,
+        prepared: TestPreparedTask,
+    ) -> Result<(RootHandle, sema_core::runtime::PromiseId), SubmitRootError> {
+        let handle = self.submit_test_root(prepared)?;
+        let mut state = self.state.borrow_mut();
+        let task = match state.roots[&handle.id].state() {
+            RootState::Running { main_task } => *main_task,
+            RootState::Settled(_) | RootState::Aborted => {
+                unreachable!("new test root is running")
+            }
+        };
+        let promise = state
+            .promises
+            .allocate_pending(Some(task))
+            .map_err(|_| SubmitRootError::IdExhausted)?;
+        state.task_promises.insert(task, promise);
+        drop(state);
+        Ok((handle, promise))
+    }
+
+    #[cfg(test)]
+    pub(super) fn settle_promise_for_test(
+        &self,
+        promise: sema_core::runtime::PromiseId,
+        outcome: TaskOutcome,
+    ) -> Rc<TaskSettlement> {
+        let mut state = self.state.borrow_mut();
+        let sequence = state
+            .settlement_ids
+            .allocate()
+            .expect("test settlement identity");
+        let settlement = Rc::new(TaskSettlement { sequence, outcome });
+        let wakes = state
+            .promises
+            .settle(promise, Rc::clone(&settlement))
+            .expect("test promise is pending");
+        if !wakes.is_empty() {
+            state.pending.push_back(PendingStage::PromiseWakes(wakes));
+        }
+        settlement
+    }
+
+    #[cfg(test)]
+    pub(super) fn create_channel_for_test(&self, capacity: usize) -> sema_core::runtime::ChannelId {
+        self.state
+            .borrow_mut()
+            .channels
+            .allocate(capacity)
+            .expect("test channel identity")
     }
 
     pub fn drive(&self, budget: &DriveBudget) -> Result<DriveState, RuntimeFault> {
@@ -509,6 +594,43 @@ impl Runtime {
     fn cancel_waiting(&self) -> Result<bool, RuntimeFault> {
         {
             let mut state = self.state.borrow_mut();
+            let selected = state.tasks.iter().find_map(|(id, task)| {
+                let key = task.record.wait_key()?;
+                (task.record.cancellation().is_some() && state.protocol_waits.contains_key(&key))
+                    .then_some((*id, key))
+            });
+            if let Some((task_id, key)) = selected {
+                let wait = state
+                    .protocol_waits
+                    .remove(&key)
+                    .expect("selected protocol wait exists");
+                match &wait.kind {
+                    ProtocolWaitKind::Promises(set) => {
+                        for promise in &set.promises {
+                            let _ = state.promises.cancel_observation(*promise, key);
+                        }
+                    }
+                    ProtocolWaitKind::Channel { channel, .. } => {
+                        let _ = state.channels.cancel_wait(*channel, key);
+                    }
+                }
+                let task = state.tasks.get_mut(&task_id).expect("selected task exists");
+                task.record
+                    .reject_wait(key)
+                    .map_err(|error| RuntimeFault::Invariant {
+                        message: format!("cancelled protocol task failed to resume: {error:?}"),
+                    })?;
+                state.pending.push_back(PendingStage::ApplyRuntimeResponse(
+                    task_id,
+                    wait.owner,
+                    wait.continuation,
+                    Err(sema_core::SemaError::eval("protocol wait cancelled")),
+                ));
+                return Ok(true);
+            }
+        }
+        {
+            let mut state = self.state.borrow_mut();
             let timer_task = state.tasks.iter().find_map(|(id, task)| {
                 (task.record.state_name() == super::StateName::Waiting
                     && task.record.cancellation().is_some())
@@ -669,7 +791,9 @@ impl Runtime {
                 return Ok(true);
             }
             PendingStage::PromiseWakes(mut wakes) => {
-                wakes.pop_front();
+                if let Some((key, task)) = wakes.pop_front() {
+                    self.consume_promise_wake(key, task)?;
+                }
                 if !wakes.is_empty() {
                     self.state
                         .borrow_mut()
@@ -680,7 +804,7 @@ impl Runtime {
             }
             PendingStage::ChannelClose(mut close) => {
                 if let Some(wake) = close.next_wake() {
-                    self.state.borrow_mut().channels.emit_wake(wake);
+                    self.consume_channel_wake(wake)?;
                 }
                 if !close.is_empty() {
                     self.state
@@ -690,9 +814,109 @@ impl Runtime {
                 }
                 return Ok(true);
             }
+            PendingStage::ChannelWake(wake) => {
+                self.consume_channel_wake(wake)?;
+                return Ok(true);
+            }
         };
         self.state.borrow_mut().pending.push_back(next);
         Ok(true)
+    }
+
+    fn consume_promise_wake(
+        &self,
+        key: super::WaitKey,
+        task_id: TaskId,
+    ) -> Result<(), RuntimeFault> {
+        let response = {
+            let state = self.state.borrow();
+            let Some(wait) = state.protocol_waits.get(&key) else {
+                return Ok(());
+            };
+            if wait.task != task_id {
+                return Ok(());
+            }
+            let ProtocolWaitKind::Promises(set) = &wait.kind else {
+                return Ok(());
+            };
+            promise_set_response(&state.promises, set)?
+        };
+        if let Some(response) = response {
+            self.finish_protocol_wait(key, task_id, Ok(response))?;
+        }
+        Ok(())
+    }
+
+    fn consume_channel_wake(&self, wake: ChannelWake) -> Result<(), RuntimeFault> {
+        let response = match wake.result {
+            super::ChannelResult::Sent => {
+                RuntimeResponse::Send(sema_core::runtime::ChannelSend::Sent)
+            }
+            super::ChannelResult::Received(value) => {
+                RuntimeResponse::Receive(sema_core::runtime::ChannelReceive::Received(value))
+            }
+            super::ChannelResult::Closed => {
+                let receive = self
+                    .state
+                    .borrow()
+                    .protocol_waits
+                    .get(&wake.key)
+                    .is_some_and(|wait| {
+                        matches!(wait.kind, ProtocolWaitKind::Channel { receive: true, .. })
+                    });
+                if receive {
+                    RuntimeResponse::Receive(sema_core::runtime::ChannelReceive::Closed)
+                } else {
+                    RuntimeResponse::Send(sema_core::runtime::ChannelSend::Closed)
+                }
+            }
+            super::ChannelResult::Waiting => return Ok(()),
+        };
+        self.finish_protocol_wait(wake.key, wake.task, Ok(response))
+    }
+
+    fn finish_protocol_wait(
+        &self,
+        key: super::WaitKey,
+        task_id: TaskId,
+        response: Result<RuntimeResponse, sema_core::SemaError>,
+    ) -> Result<(), RuntimeFault> {
+        let extracted = {
+            let mut state = self.state.borrow_mut();
+            let Some(wait) = state.protocol_waits.remove(&key) else {
+                return Ok(());
+            };
+            if wait.task != task_id {
+                state.protocol_waits.insert(key, wait);
+                return Ok(());
+            }
+            if let ProtocolWaitKind::Promises(set) = &wait.kind {
+                for promise in &set.promises {
+                    let _ = state.promises.cancel_observation(*promise, key);
+                }
+            }
+            let task = state
+                .tasks
+                .get_mut(&task_id)
+                .ok_or_else(|| RuntimeFault::Invariant {
+                    message: "protocol wake task disappeared".into(),
+                })?;
+            task.record
+                .reject_wait(key)
+                .map_err(|error| RuntimeFault::Invariant {
+                    message: format!("protocol wake transition failed: {error:?}"),
+                })?;
+            wait
+        };
+        let wait = extracted;
+        let mut state = self.state.borrow_mut();
+        state.pending.push_back(PendingStage::ApplyRuntimeResponse(
+            task_id,
+            wait.owner,
+            wait.continuation,
+            response,
+        ));
+        Ok(())
     }
 
     fn visit_ready(&self) -> Result<bool, RuntimeFault> {
@@ -946,6 +1170,12 @@ impl Runtime {
                 self.settle(root, task_id, TaskOutcome::Failed(error))
             }
             Ok(NativeOutcome::Suspend(suspend)) => {
+                if matches!(
+                    &suspend.wait,
+                    WaitKind::Promise(_) | WaitKind::PromiseSet(_) | WaitKind::Channel(_)
+                ) {
+                    return self.install_protocol_suspend(task_id, owner, suspend);
+                }
                 if !matches!(suspend.wait, sema_core::runtime::WaitKind::External(_)) {
                     self.state
                         .borrow_mut()
@@ -1022,12 +1252,68 @@ impl Runtime {
         }
     }
 
+    fn install_protocol_suspend(
+        &self,
+        task_id: TaskId,
+        owner: ReturnOwner,
+        suspend: sema_core::runtime::NativeSuspend,
+    ) -> Result<(), RuntimeFault> {
+        let frame = ContinuationFrame::native(suspend.continuation);
+        let mut state = self.state.borrow_mut();
+        let key = state
+            .waits
+            .as_ref()
+            .expect("wait runtime installed")
+            .issue_internal_wait()
+            .map_err(|_| RuntimeFault::IdExhausted { kind: "wait" })?;
+        let result = match suspend.wait {
+            WaitKind::Promise(promise) => install_promise_wait(
+                &mut state,
+                task_id,
+                key,
+                sema_core::runtime::PromiseSetWait {
+                    promises: vec![promise],
+                    mode: sema_core::runtime::PromiseSetMode::Race,
+                },
+                owner,
+                frame,
+            ),
+            WaitKind::PromiseSet(wait) => {
+                install_promise_wait(&mut state, task_id, key, wait, owner, frame)
+            }
+            WaitKind::Channel(wait) => {
+                install_channel_wait(&mut state, task_id, key, wait, owner, frame)
+            }
+            WaitKind::Timer(_) | WaitKind::External(_) => unreachable!("filtered protocol wait"),
+        };
+        if let Err(error) = result {
+            let (owner, frame, error) = *error;
+            state.pending.push_back(PendingStage::ApplyRuntimeResponse(
+                task_id,
+                owner,
+                frame,
+                Err(error),
+            ));
+        }
+        Ok(())
+    }
+
     fn dispatch_runtime(
         &self,
         task_id: TaskId,
         owner: ReturnOwner,
         request: RuntimeRequest,
     ) -> Result<(), RuntimeFault> {
+        if let RuntimeRequest::PromiseSetWait { wait, continuation } = request {
+            return self.install_protocol_suspend(
+                task_id,
+                owner,
+                sema_core::runtime::NativeSuspend {
+                    wait: WaitKind::PromiseSet(wait),
+                    continuation,
+                },
+            );
+        }
         if let RuntimeRequest::Spawn {
             callable,
             continuation,
@@ -1126,6 +1412,9 @@ impl Runtime {
             let mut state = self.state.borrow_mut();
             match request {
                 RuntimeRequest::Spawn { .. } => unreachable!("spawn extracted before borrow"),
+                RuntimeRequest::PromiseSetWait { .. } => {
+                    unreachable!("promise wait extracted before borrow")
+                }
                 RuntimeRequest::CreateChannel {
                     capacity,
                     continuation,
@@ -1228,15 +1517,17 @@ impl Runtime {
                 ),
             }
         };
-        self.state
-            .borrow_mut()
-            .pending
-            .push_back(PendingStage::ApplyRuntimeResponse(
-                task_id,
-                owner,
-                ContinuationFrame::native(continuation),
-                response,
-            ));
+        let mut state = self.state.borrow_mut();
+        if let Some(wake) = state.channels.pop_wake() {
+            state.pending.push_back(PendingStage::ChannelWake(wake));
+        }
+        state.pending.push_back(PendingStage::ApplyRuntimeResponse(
+            task_id,
+            owner,
+            ContinuationFrame::native(continuation),
+            response,
+        ));
+        drop(state);
         self.state
             .borrow()
             .terminal_fault
@@ -1441,6 +1732,17 @@ impl Runtime {
             .record
             .settle(sequence, outcome)
             .expect("live task settlement is infallible");
+        if let Some(promise) = state.task_promises.remove(&task_id) {
+            let wakes = state
+                .promises
+                .settle(promise, Rc::clone(&settlement))
+                .map_err(|error| RuntimeFault::Invariant {
+                    message: format!("task promise settlement failed: {error:?}"),
+                })?;
+            if !wakes.is_empty() {
+                state.pending.push_back(PendingStage::PromiseWakes(wakes));
+            }
+        }
         let root_record = state.roots.get_mut(&root).expect("root prevalidated");
         root_record
             .settle(task_id, settlement)
@@ -1557,7 +1859,7 @@ impl Runtime {
     }
 
     fn abort_terminal_state(&self, fault: &RuntimeFault) {
-        let (pending, tasks) = {
+        let (pending, protocol_waits, tasks) = {
             let mut state = self.state.borrow_mut();
             state.terminal_fault = Some(fault.clone());
             let pending = std::mem::take(&mut state.pending);
@@ -1569,9 +1871,14 @@ impl Runtime {
                 }
             }
             state.handle_cleanup.extend(newly_eligible);
-            (pending, std::mem::take(&mut state.tasks))
+            (
+                pending,
+                std::mem::take(&mut state.protocol_waits),
+                std::mem::take(&mut state.tasks),
+            )
         };
         drop(pending);
+        drop(protocol_waits);
         drop(tasks);
     }
 
@@ -1791,6 +2098,199 @@ fn registry_error(error: super::RegistryError) -> sema_core::SemaError {
     })
 }
 
+type ProtocolInstallError = Box<(ReturnOwner, ContinuationFrame, sema_core::SemaError)>;
+
+fn promise_set_response(
+    promises: &PromiseRegistry,
+    wait: &sema_core::runtime::PromiseSetWait,
+) -> Result<Option<RuntimeResponse>, RuntimeFault> {
+    let mut settled = Vec::with_capacity(wait.promises.len());
+    for promise in &wait.promises {
+        match promises
+            .state(*promise)
+            .map_err(|error| RuntimeFault::Invariant {
+                message: format!("registered promise wait became invalid: {error:?}"),
+            })? {
+            PromiseState::Pending => {}
+            PromiseState::Returned(value)
+            | PromiseState::Failed(value)
+            | PromiseState::Cancelled(value) => settled.push(value),
+        }
+    }
+    settled.sort_by_key(|settlement| settlement.sequence);
+    Ok(match wait.mode {
+        sema_core::runtime::PromiseSetMode::Race => settled
+            .into_iter()
+            .next()
+            .map(|settlement| RuntimeResponse::Settlement(Some(settlement))),
+        sema_core::runtime::PromiseSetMode::All if settled.len() == wait.promises.len() => {
+            Some(RuntimeResponse::Settlements(settled))
+        }
+        sema_core::runtime::PromiseSetMode::All => None,
+        sema_core::runtime::PromiseSetMode::Timeout(_) => None,
+    })
+}
+
+fn install_promise_wait(
+    state: &mut RuntimeState,
+    task_id: TaskId,
+    key: super::WaitKey,
+    wait: sema_core::runtime::PromiseSetWait,
+    owner: ReturnOwner,
+    frame: ContinuationFrame,
+) -> Result<(), ProtocolInstallError> {
+    if wait.promises.is_empty() && !matches!(wait.mode, sema_core::runtime::PromiseSetMode::All) {
+        return Err(Box::new((
+            owner,
+            frame,
+            sema_core::SemaError::eval("promise race requires at least one promise"),
+        )));
+    }
+    if matches!(wait.mode, sema_core::runtime::PromiseSetMode::Timeout(_)) {
+        return Err(Box::new((
+            owner,
+            frame,
+            sema_core::SemaError::eval("promise timeout waits require the timer barrier slice"),
+        )));
+    }
+    let response = match promise_set_response(&state.promises, &wait) {
+        Ok(response) => response,
+        Err(fault) => {
+            return Err(Box::new((
+                owner,
+                frame,
+                sema_core::SemaError::eval(format!("{fault:?}")),
+            )))
+        }
+    };
+    if let Some(response) = response {
+        state.pending.push_back(PendingStage::ApplyRuntimeResponse(
+            task_id,
+            owner,
+            frame,
+            Ok(response),
+        ));
+        return Ok(());
+    }
+    let mut observed = Vec::new();
+    for promise in &wait.promises {
+        match state.promises.observe(*promise, key, task_id) {
+            Ok(true) => observed.push(*promise),
+            Ok(false) => {}
+            Err(error) => {
+                for promise in observed {
+                    let _ = state.promises.cancel_observation(promise, key);
+                }
+                return Err(Box::new((owner, frame, registry_error(error))));
+            }
+        }
+    }
+    if let Err(error) = state
+        .tasks
+        .get_mut(&task_id)
+        .expect("protocol task exists")
+        .record
+        .wait(key)
+    {
+        for promise in observed {
+            let _ = state.promises.cancel_observation(promise, key);
+        }
+        return Err(Box::new((
+            owner,
+            frame,
+            sema_core::SemaError::eval(format!("promise wait transition failed: {error:?}")),
+        )));
+    }
+    state.protocol_waits.insert(
+        key,
+        ProtocolWait {
+            task: task_id,
+            kind: ProtocolWaitKind::Promises(wait),
+            owner,
+            continuation: frame,
+        },
+    );
+    Ok(())
+}
+
+fn install_channel_wait(
+    state: &mut RuntimeState,
+    task_id: TaskId,
+    key: super::WaitKey,
+    wait: sema_core::runtime::ChannelWait,
+    owner: ReturnOwner,
+    frame: ContinuationFrame,
+) -> Result<(), ProtocolInstallError> {
+    let (channel, receive, result) = match wait {
+        sema_core::runtime::ChannelWait::Send { channel, value } => (
+            channel,
+            false,
+            state.channels.send(channel, key, task_id, value),
+        ),
+        sema_core::runtime::ChannelWait::Receive { channel } => {
+            (channel, true, state.channels.receive(channel, key, task_id))
+        }
+    };
+    let result = match result {
+        Ok(result) => result,
+        Err(error) => return Err(Box::new((owner, frame, registry_error(error)))),
+    };
+    if let Some(wake) = state.channels.pop_wake() {
+        state.pending.push_back(PendingStage::ChannelWake(wake));
+    }
+    if result == super::ChannelResult::Waiting {
+        if let Err(error) = state
+            .tasks
+            .get_mut(&task_id)
+            .expect("protocol task exists")
+            .record
+            .wait(key)
+        {
+            let _ = state.channels.cancel_wait(channel, key);
+            return Err(Box::new((
+                owner,
+                frame,
+                sema_core::SemaError::eval(format!("channel wait transition failed: {error:?}")),
+            )));
+        }
+        state.protocol_waits.insert(
+            key,
+            ProtocolWait {
+                task: task_id,
+                kind: ProtocolWaitKind::Channel { channel, receive },
+                owner,
+                continuation: frame,
+            },
+        );
+        return Ok(());
+    }
+    let response = match (receive, result) {
+        (true, super::ChannelResult::Received(value)) => {
+            RuntimeResponse::Receive(sema_core::runtime::ChannelReceive::Received(value))
+        }
+        (true, super::ChannelResult::Closed) => {
+            RuntimeResponse::Receive(sema_core::runtime::ChannelReceive::Closed)
+        }
+        (false, super::ChannelResult::Sent) => {
+            RuntimeResponse::Send(sema_core::runtime::ChannelSend::Sent)
+        }
+        (false, super::ChannelResult::Closed) => {
+            RuntimeResponse::Send(sema_core::runtime::ChannelSend::Closed)
+        }
+        (_, super::ChannelResult::Waiting) => unreachable!("handled waiting channel"),
+        (true, super::ChannelResult::Sent) | (false, super::ChannelResult::Received(_)) => {
+            unreachable!("channel result matches operation")
+        }
+    };
+    state.pending.push_back(PendingStage::ApplyRuntimeResponse(
+        task_id,
+        owner,
+        frame,
+        Ok(response),
+    ));
+    Ok(())
+}
+
 struct ActiveDriveGuard(Rc<RefCell<RuntimeState>>);
 
 impl Drop for ActiveDriveGuard {
@@ -1908,6 +2408,7 @@ enum PendingStage {
     ),
     PromiseWakes(VecDeque<(super::WaitKey, TaskId)>),
     ChannelClose(ChannelClose),
+    ChannelWake(ChannelWake),
 }
 
 enum ReturnOwner {
@@ -1942,6 +2443,7 @@ impl Trace for PendingStage {
             }
             Self::PromiseWakes(_) => true,
             Self::ChannelClose(close) => close.trace(sink),
+            Self::ChannelWake(wake) => wake.trace(sink),
         }
     }
 }

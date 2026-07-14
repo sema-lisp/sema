@@ -510,6 +510,161 @@ fn promise_observer_cancellation_does_not_cancel_supplied_promise() {
     ));
 }
 
+struct CaptureRuntimeContinuation(Rc<RefCell<Vec<sema_core::runtime::RuntimeResponse>>>);
+
+impl Trace for CaptureRuntimeContinuation {
+    fn trace(&self, _: &mut dyn FnMut(sema_core::cycle::GcEdge<'_>)) -> bool {
+        true
+    }
+}
+
+impl NativeContinuation for CaptureRuntimeContinuation {
+    fn resume(self: Box<Self>, _: &mut NativeCallContext<'_>, input: ResumeInput) -> NativeResult {
+        let ResumeInput::Runtime(response) = input else {
+            panic!("protocol wait must resume with a runtime response");
+        };
+        self.0.borrow_mut().push(response);
+        Ok(NativeOutcome::Return(Value::NIL))
+    }
+}
+
+#[test]
+fn runtime_delayed_promise_wait_resumes_with_canonical_settlement() {
+    let runtime = runtime_with_inline_executor(Rc::new(FakeClock::new()));
+    let promise = runtime.create_pending_promise_for_test();
+    let responses = Rc::new(RefCell::new(Vec::new()));
+    let handle = runtime
+        .submit_test_root(TestPreparedTask::native(Ok(NativeOutcome::Runtime(
+            sema_core::runtime::RuntimeRequest::PromiseSetWait {
+                wait: sema_core::runtime::PromiseSetWait {
+                    promises: vec![promise],
+                    mode: sema_core::runtime::PromiseSetMode::Race,
+                },
+                continuation: Box::new(CaptureRuntimeContinuation(Rc::clone(&responses))),
+            },
+        ))))
+        .unwrap();
+
+    runtime.drive(&drive_budget(8)).unwrap();
+    assert!(matches!(handle.poll_result(), RootPoll::Pending));
+    let settlement = runtime.settle_promise_for_test(promise, TaskOutcome::Returned(Value::FALSE));
+    while matches!(handle.poll_result(), RootPoll::Pending) {
+        runtime.drive(&drive_budget(1)).unwrap();
+    }
+    let captured = responses.borrow();
+    let sema_core::runtime::RuntimeResponse::Settlement(Some(observed)) = &captured[0] else {
+        panic!("race returns one settlement");
+    };
+    assert!(Rc::ptr_eq(&settlement, observed));
+    assert!(matches!(&settlement.outcome, TaskOutcome::Returned(value) if *value == Value::FALSE));
+}
+
+#[test]
+fn runtime_promise_all_orders_canonical_settlements_not_input_order() {
+    let runtime = runtime_with_inline_executor(Rc::new(FakeClock::new()));
+    let first = runtime.create_pending_promise_for_test();
+    let second = runtime.create_pending_promise_for_test();
+    let responses = Rc::new(RefCell::new(Vec::new()));
+    let handle = runtime
+        .submit_test_root(TestPreparedTask::native(Ok(NativeOutcome::Runtime(
+            sema_core::runtime::RuntimeRequest::PromiseSetWait {
+                wait: sema_core::runtime::PromiseSetWait {
+                    promises: vec![first, second],
+                    mode: sema_core::runtime::PromiseSetMode::All,
+                },
+                continuation: Box::new(CaptureRuntimeContinuation(Rc::clone(&responses))),
+            },
+        ))))
+        .unwrap();
+    runtime.drive(&drive_budget(8)).unwrap();
+    let second_settlement =
+        runtime.settle_promise_for_test(second, TaskOutcome::Returned(Value::int(2)));
+    runtime.drive(&drive_budget(1)).unwrap();
+    assert!(matches!(handle.poll_result(), RootPoll::Pending));
+    let first_settlement =
+        runtime.settle_promise_for_test(first, TaskOutcome::Returned(Value::int(1)));
+    while matches!(handle.poll_result(), RootPoll::Pending) {
+        runtime.drive(&drive_budget(1)).unwrap();
+    }
+    let captured = responses.borrow();
+    let sema_core::runtime::RuntimeResponse::Settlements(settlements) = &captured[0] else {
+        panic!("all returns canonical settlements");
+    };
+    assert!(Rc::ptr_eq(&settlements[0], &second_settlement));
+    assert!(Rc::ptr_eq(&settlements[1], &first_settlement));
+}
+
+#[test]
+fn runtime_task_promise_publishes_the_tasks_canonical_settlement_once() {
+    let runtime = runtime_with_inline_executor(Rc::new(FakeClock::new()));
+    let (source, promise) = runtime
+        .submit_test_root_with_promise(TestPreparedTask::returned(Value::int(7)))
+        .unwrap();
+    let responses = Rc::new(RefCell::new(Vec::new()));
+    let observer = runtime
+        .submit_test_root(TestPreparedTask::native(Ok(NativeOutcome::Runtime(
+            sema_core::runtime::RuntimeRequest::PromiseSetWait {
+                wait: sema_core::runtime::PromiseSetWait {
+                    promises: vec![promise],
+                    mode: sema_core::runtime::PromiseSetMode::Race,
+                },
+                continuation: Box::new(CaptureRuntimeContinuation(Rc::clone(&responses))),
+            },
+        ))))
+        .unwrap();
+    while matches!(observer.poll_result(), RootPoll::Pending) {
+        runtime.drive(&drive_budget(1)).unwrap();
+    }
+    let RootPoll::Ready(source_settlement) = source.poll_result() else {
+        panic!("source settled");
+    };
+    let sema_core::runtime::RuntimeResponse::Settlement(Some(observed)) = &responses.borrow()[0]
+    else {
+        panic!("observer received settlement");
+    };
+    assert!(Rc::ptr_eq(&source_settlement, observed));
+}
+
+#[test]
+fn runtime_blocked_channel_receive_preserves_false_rendezvous_value() {
+    let runtime = runtime_with_inline_executor(Rc::new(FakeClock::new()));
+    let channel = runtime.create_channel_for_test(0);
+    let received = Rc::new(RefCell::new(Vec::new()));
+    let receiver = runtime
+        .submit_test_root(TestPreparedTask::native(Ok(NativeOutcome::Suspend(
+            NativeSuspend {
+                wait: WaitKind::Channel(sema_core::runtime::ChannelWait::Receive { channel }),
+                continuation: Box::new(CaptureRuntimeContinuation(Rc::clone(&received))),
+            },
+        ))))
+        .unwrap();
+    runtime.drive(&drive_budget(8)).unwrap();
+    let sender = runtime
+        .submit_test_root(TestPreparedTask::native(Ok(NativeOutcome::Suspend(
+            NativeSuspend {
+                wait: WaitKind::Channel(sema_core::runtime::ChannelWait::Send {
+                    channel,
+                    value: Value::FALSE,
+                }),
+                continuation: Box::new(CaptureRuntimeContinuation(Rc::new(RefCell::new(
+                    Vec::new(),
+                )))),
+            },
+        ))))
+        .unwrap();
+    while matches!(receiver.poll_result(), RootPoll::Pending)
+        || matches!(sender.poll_result(), RootPoll::Pending)
+    {
+        runtime.drive(&drive_budget(1)).unwrap();
+    }
+    assert!(matches!(
+        &received.borrow()[0],
+        sema_core::runtime::RuntimeResponse::Receive(
+            sema_core::runtime::ChannelReceive::Received(value)
+        ) if *value == Value::FALSE
+    ));
+}
+
 #[test]
 fn channel_buffer_fifo_close_and_exact_waiter_cleanup() {
     let (runtime, issuers) = runtime_issuers();

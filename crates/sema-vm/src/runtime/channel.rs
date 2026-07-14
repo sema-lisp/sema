@@ -22,6 +22,15 @@ pub struct ChannelWake {
     pub task: TaskId,
     pub result: ChannelResult,
 }
+
+impl Trace for ChannelWake {
+    fn trace(&self, sink: &mut dyn FnMut(sema_core::cycle::GcEdge<'_>)) -> bool {
+        if let ChannelResult::Received(value) = &self.result {
+            sink(sema_core::cycle::GcEdge::Value(value));
+        }
+        true
+    }
+}
 struct Sender {
     key: WaitKey,
     task: TaskId,
@@ -156,8 +165,8 @@ impl ChannelRegistry {
         };
         Ok(Some(ChannelClose { senders, receivers }))
     }
-    pub(crate) fn emit_wake(&mut self, wake: ChannelWake) {
-        self.wakes.push_back(wake);
+    pub(crate) fn pop_wake(&mut self) -> Option<ChannelWake> {
+        self.wakes.pop_front()
     }
     pub fn inspect(
         &mut self,

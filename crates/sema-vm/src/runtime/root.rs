@@ -6,6 +6,7 @@ use sema_core::runtime::{RootId, TaskId, TaskSettlement, Trace};
 pub enum RootState {
     Running { main_task: TaskId },
     Settled(Rc<TaskSettlement>),
+    Aborted,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -66,9 +67,14 @@ impl RootRecord {
     }
 
     pub fn is_reap_eligible(&self) -> bool {
-        matches!(self.state, RootState::Settled(_))
+        matches!(self.state, RootState::Settled(_) | RootState::Aborted)
             && self.handle_count == 0
             && self.live_descendants == 0
+    }
+
+    pub fn abort(&mut self) {
+        self.state = RootState::Aborted;
+        self.live_descendants = 0;
     }
 
     pub fn settle(
@@ -98,7 +104,7 @@ impl RootRecord {
 impl Trace for RootRecord {
     fn trace(&self, sink: &mut dyn FnMut(sema_core::cycle::GcEdge<'_>)) -> bool {
         match &self.state {
-            RootState::Running { .. } => true,
+            RootState::Running { .. } | RootState::Aborted => true,
             RootState::Settled(settlement) => settlement.trace(sink),
         }
     }

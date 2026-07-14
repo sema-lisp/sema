@@ -37,6 +37,7 @@ pub enum RuntimeFault {
 pub enum RootPoll {
     Pending,
     Ready(Rc<TaskSettlement>),
+    Aborted(RuntimeFault),
     RuntimeDropped,
     InvariantViolation,
 }
@@ -102,6 +103,7 @@ struct RuntimeState {
     ready: ReadyScheduler,
     handle_cleanup: VecDeque<RootId>,
     pending: VecDeque<PendingStage>,
+    drive_cursor: usize,
     shutting_down: bool,
     terminal_fault: Option<RuntimeFault>,
     #[cfg(test)]
@@ -162,6 +164,7 @@ impl Runtime {
                 ready: ReadyScheduler::new(),
                 handle_cleanup: VecDeque::new(),
                 pending: VecDeque::new(),
+                drive_cursor: 0,
                 shutting_down: false,
                 terminal_fault: None,
                 #[cfg(test)]
@@ -215,6 +218,8 @@ impl Runtime {
         let mut work_items = 0;
         let mut root_visits = 0;
         let mut cleanup = 0;
+        let mut completions = 0;
+        let mut no_progress = 0;
 
         while work_items < budget.work_item_limit.get() {
             if self
@@ -227,34 +232,50 @@ impl Runtime {
             {
                 break;
             }
-            if cleanup < budget.cleanup_limit.get() && self.cleanup_one() {
-                cleanup += 1;
+            if self.state.borrow().shutting_down && self.cancel_waiting()? {
                 work_items += 1;
+                no_progress = 0;
                 continue;
             }
-            if self.cancel_waiting()? {
+            let reserve_root = budget.work_item_limit.get() > 1
+                && root_visits == 0
+                && work_items + 1 == budget.work_item_limit.get();
+            let source = if reserve_root {
+                4
+            } else {
+                let mut state = self.state.borrow_mut();
+                let source = state.drive_cursor;
+                state.drive_cursor = (state.drive_cursor + 1) % 5;
+                source
+            };
+            let progressed = match source {
+                0 if completions < budget.completion_limit.get() && self.drain_completion() => {
+                    completions += 1;
+                    true
+                }
+                1 if cleanup < budget.cleanup_limit.get()
+                    && (self.cleanup_one() || self.reap_one()) =>
+                {
+                    cleanup += 1;
+                    true
+                }
+                2 => self.cancel_waiting()?,
+                3 => self.advance_pending()?,
+                4 if root_visits < budget.root_visit_limit.get() && self.visit_ready()? => {
+                    root_visits += 1;
+                    true
+                }
+                _ => false,
+            };
+            if progressed {
                 work_items += 1;
-                continue;
+                no_progress = 0;
+            } else {
+                no_progress += 1;
+                if no_progress == 5 {
+                    break;
+                }
             }
-            if self.drain_completion() {
-                work_items += 1;
-                continue;
-            }
-            if cleanup < budget.cleanup_limit.get() && self.reap_one() {
-                cleanup += 1;
-                work_items += 1;
-                continue;
-            }
-            if self.advance_pending()? {
-                work_items += 1;
-                continue;
-            }
-            if root_visits < budget.root_visit_limit.get() && self.visit_ready()? {
-                root_visits += 1;
-                work_items += 1;
-                continue;
-            }
-            break;
         }
 
         let state = self.state.borrow();
@@ -517,6 +538,8 @@ impl Runtime {
             }
             TaskAction::Settle(root, task_id, outcome) => self.settle(root, task_id, outcome)?,
             TaskAction::Native(task_id, result) => self.apply_native_result(task_id, result)?,
+            #[cfg(test)]
+            TaskAction::NativeCall(task_id, call) => self.apply_native_result(task_id, call())?,
             TaskAction::Resume(pending) => {
                 self.state
                     .borrow_mut()
@@ -682,7 +705,7 @@ impl Runtime {
     }
 
     pub fn shutdown(&self, options: &ShutdownOptions) -> Result<ShutdownReport, RuntimeFault> {
-        let original_fault = self.state.borrow().terminal_fault.clone();
+        let mut terminal_fault = self.state.borrow().terminal_fault.clone();
         {
             let mut state = self.state.borrow_mut();
             state.shutting_down = true;
@@ -694,15 +717,12 @@ impl Runtime {
         loop {
             let state = match self.drive(&options.drive_budget) {
                 Ok(state) => state,
-                Err(fault) if original_fault.as_ref() == Some(&fault) => {
-                    self.discard_one_terminal_task();
-                    DriveState::Progress {
-                        work_items: 1,
-                        instructions: 0,
-                        ready_remaining: false,
-                    }
+                Err(fault) => {
+                    terminal_fault.get_or_insert_with(|| fault.clone());
+                    while matches!(self.cancel_waiting(), Ok(true)) {}
+                    self.abort_terminal_state(&fault);
+                    break;
                 }
-                Err(fault) => return Err(fault),
             };
             let now = self.state.borrow().clock.now();
             let cleanup_complete = {
@@ -748,16 +768,19 @@ impl Runtime {
         if let Some(waits) = self.state.borrow_mut().waits.as_mut() {
             waits.close_inbox();
         }
-        original_fault.map_or(Ok(report), Err)
+        terminal_fault.map_or(Ok(report), Err)
     }
 
-    fn discard_one_terminal_task(&self) {
+    fn abort_terminal_state(&self, fault: &RuntimeFault) {
         let removed = {
             let mut state = self.state.borrow_mut();
-            let Some(task_id) = state.tasks.keys().next().copied() else {
-                return;
-            };
-            state.tasks.remove(&task_id)
+            state.terminal_fault = Some(fault.clone());
+            state.pending.clear();
+            state.ready = ReadyScheduler::new();
+            for root in state.roots.values_mut() {
+                root.abort();
+            }
+            std::mem::take(&mut state.tasks)
         };
         drop(removed);
     }
@@ -823,6 +846,10 @@ impl RootHandle {
         match state.roots.get(&self.id).map(RootRecord::state) {
             Some(RootState::Settled(settlement)) => RootPoll::Ready(Rc::clone(settlement)),
             Some(RootState::Running { .. }) => RootPoll::Pending,
+            Some(RootState::Aborted) => state
+                .terminal_fault
+                .clone()
+                .map_or(RootPoll::InvariantViolation, RootPoll::Aborted),
             None => RootPoll::InvariantViolation,
         }
     }
@@ -882,6 +909,8 @@ enum TaskAction {
     Yield(RootId, TaskId),
     Settle(RootId, TaskId, TaskOutcome),
     Native(TaskId, NativeResult),
+    #[cfg(test)]
+    NativeCall(TaskId, Box<dyn FnOnce() -> NativeResult>),
     Resume(PendingResume),
 }
 
@@ -913,6 +942,8 @@ impl Trace for TaskAction {
                 Ok(outcome) => outcome.trace(sink),
                 Err(error) => error.trace(sink),
             },
+            #[cfg(test)]
+            Self::NativeCall(_, _) => true,
             Self::Resume(pending) => pending.trace(sink),
             Self::Yield(_, _) => true,
         }
@@ -924,6 +955,7 @@ pub(super) enum TestPreparedTask {
     Return(Option<Value>),
     YieldForever,
     Native(Option<NativeResult>),
+    NativeCall(Option<Box<dyn FnOnce() -> NativeResult>>),
 }
 
 #[cfg(test)]
@@ -940,6 +972,10 @@ impl TestPreparedTask {
         Self::Native(Some(result))
     }
 
+    pub(super) fn native_call(call: impl FnOnce() -> NativeResult + 'static) -> Self {
+        Self::NativeCall(Some(Box::new(call)))
+    }
+
     fn next(&mut self, root: RootId, task: TaskId) -> TaskAction {
         match self {
             Self::Return(value) => TaskAction::Settle(
@@ -953,6 +989,10 @@ impl TestPreparedTask {
                 result
                     .take()
                     .unwrap_or_else(|| Err(sema_core::SemaError::eval("test task resumed twice"))),
+            ),
+            Self::NativeCall(call) => TaskAction::NativeCall(
+                task,
+                call.take().expect("test native callable executes once"),
             ),
         }
     }
@@ -968,6 +1008,7 @@ impl Trace for TestPreparedTask {
             }
             Self::Native(Some(Ok(outcome))) => outcome.trace(sink),
             Self::Native(Some(Err(error))) => error.trace(sink),
+            Self::NativeCall(_) => true,
             _ => true,
         }
     }

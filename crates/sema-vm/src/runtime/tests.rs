@@ -52,6 +52,12 @@ fn poll_reentrant_handle() {
     });
 }
 
+fn poll_and_cancel_reentrant_handle() {
+    let handle = REENTRANT_HANDLE.with(|slot| slot.borrow().clone().unwrap());
+    assert!(matches!(handle.poll_result(), RootPoll::Pending));
+    assert!(handle.cancel(CancelReason::Explicit));
+}
+
 #[test]
 fn runtime_root_handles_poll_canonical_settlement_and_reap_after_final_drop() {
     let clock = Rc::new(FakeClock::new());
@@ -224,6 +230,71 @@ fn runtime_pending_apply_keeps_cycle_through_forced_collection_until_settlement_
 }
 
 #[test]
+fn runtime_pending_action_keeps_cycle_through_forced_collection() {
+    let runtime = runtime_with_inline_executor(Rc::new(FakeClock::new()));
+    let (value, weak) = cyclic_cell();
+    let _handle = runtime
+        .submit_test_root(TestPreparedTask::native(Ok(NativeOutcome::Return(value))))
+        .unwrap();
+
+    runtime.drive(&drive_budget(1)).unwrap();
+    sema_core::cycle::collect(&[], sema_core::cycle::GcTrigger::Explicit);
+
+    assert!(
+        weak.upgrade().is_some(),
+        "pending action is a runtime GC root"
+    );
+}
+
+#[test]
+fn runtime_native_quantum_may_poll_and_cancel_root_reentrantly() {
+    let runtime = runtime_with_inline_executor(Rc::new(FakeClock::new()));
+    let handle = runtime
+        .submit_test_root(TestPreparedTask::native_call(|| {
+            poll_and_cancel_reentrant_handle();
+            Ok(NativeOutcome::Return(Value::int(7)))
+        }))
+        .unwrap();
+    REENTRANT_HANDLE.with(|slot| *slot.borrow_mut() = Some(handle.clone()));
+
+    runtime.drive(&drive_budget(2)).unwrap();
+    assert!(!handle.cancel(CancelReason::Timeout));
+
+    REENTRANT_HANDLE.with(|slot| slot.borrow_mut().take());
+}
+
+#[test]
+fn runtime_drive_rotates_past_completion_backlog_to_visit_root() {
+    let runtime = runtime_with_inline_executor(Rc::new(FakeClock::new()));
+    let mut backlog_handles = Vec::new();
+    for _ in 0..8 {
+        backlog_handles.push(
+            runtime
+                .submit_test_root(TestPreparedTask::native(Ok(NativeOutcome::Suspend(
+                    external_suspend(Arc::new(Mutex::new(Vec::new()))),
+                ))))
+                .unwrap(),
+        );
+    }
+    let mut setup = drive_budget(32);
+    setup.completion_limit = std::num::NonZeroUsize::new(1).unwrap();
+    runtime.drive(&setup).unwrap();
+
+    let root = runtime
+        .submit_test_root(TestPreparedTask::returned(Value::int(11)))
+        .unwrap();
+    let mut one = drive_budget(1);
+    one.completion_limit = std::num::NonZeroUsize::new(1).unwrap();
+    for _ in 0..50 {
+        runtime.drive(&one).unwrap();
+        if matches!(root.poll_result(), RootPoll::Ready(_)) {
+            return;
+        }
+    }
+    panic!("completion backlog starved the ready root across drive turns");
+}
+
+#[test]
 fn runtime_continuation_may_suspend_again_without_nested_state_borrow() {
     let runtime = runtime_with_inline_executor(Rc::new(FakeClock::new()));
     let events = Arc::new(Mutex::new(Vec::new()));
@@ -384,7 +455,30 @@ fn runtime_settlement_exhaustion_preserves_owner_until_terminal_shutdown() {
         0,
         "terminal cleanup cancels every task"
     );
-    assert!(matches!(handle.poll_result(), RootPoll::Pending));
+    assert!(matches!(handle.poll_result(), RootPoll::Aborted(_)));
+}
+
+#[test]
+fn runtime_shutdown_finalizes_fault_first_raised_during_shutdown() {
+    let clock = Rc::new(FakeClock::new());
+    let runtime = runtime_with_inline_executor(clock.clone());
+    let handle = runtime
+        .submit_test_root(TestPreparedTask::returned(Value::int(9)))
+        .unwrap();
+    runtime.force_settlement_exhaustion_for_test();
+
+    assert_eq!(
+        runtime.shutdown(&super::ShutdownOptions {
+            deadline: clock.now() + Duration::from_secs(1),
+            drive_budget: drive_budget(8),
+        }),
+        Err(super::RuntimeFault::IdExhausted { kind: "settlement" })
+    );
+    assert_eq!(runtime.task_count(), 0);
+    assert!(matches!(handle.poll_result(), RootPoll::Aborted(_)));
+    drop(handle);
+    runtime.drive(&drive_budget(8)).unwrap_err();
+    assert_eq!(runtime.root_count(), 0);
 }
 
 #[test]

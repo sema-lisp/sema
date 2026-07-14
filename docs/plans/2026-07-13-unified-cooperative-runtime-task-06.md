@@ -22,8 +22,9 @@ Higher-level fan-out is built on Task 04 owned scopes and Task 05 I/O jobs.
 ## Execution contract
 
 - **Status:** Ready only after Task 05 is accepted and committed.
-- **Dependencies:** Task-context extension API/guard, final owned scopes, Task 05
-  jobs/resource cleanup, FakeProvider and existing subsystem fixtures.
+- **Dependencies:** Task 02 task-context extension shell and handle, final owned
+  scopes, Task 05 jobs/resource cleanup, FakeProvider and existing subsystem
+  fixtures. Task 06 defines and implements the guard and named-field migration.
 - **Immutable inputs:** Master field-by-field inheritance table, sandbox
   non-widening, accounting/cache invariants, orchestration ownership, and trace
   lineage.
@@ -96,6 +97,13 @@ Higher-level fan-out is built on Task 04 owned scopes and Task 05 I/O jobs.
   cancellable calls, owned handlers.
 - Existing LLM, agent, workflow, MCP, OTel, GC, and cassette tests named below.
 - Runtime inventory, conformance guard, and legacy baseline.
+
+Task 02 added only `HashMap<TypeId, Rc<dyn TaskLocalValue>>`,
+`TaskContextHandle`, child-extension inheritance, and the optional handle on
+`EvalContext`. This task owns the exhaustive field-by-field ownership table and
+migration of existing sandbox, module/current-file, call-stack, output, tracing,
+usage, and context fields; it must not assume those fields were already copied
+into `TaskContext`.
 
 ## Exact context extension contracts
 

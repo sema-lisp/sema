@@ -323,9 +323,9 @@ interpreter.
 
 Before submission, the runtime registers the exact wait generation, decoder,
 runtime-selected completion kind, and concrete resource/cancel hook. It gives
-the executor an opaque submission whose core-owned driver contains a send-only
-job and private identity/kind-bearing completion sink; `sema-io` cannot access
-the sink, and the driver never exposes it to the job. Preparation also
+the executor an opaque submission whose core-owned dispatch wrappers contain a
+send-only job and private identity/kind-bearing completion sink; `sema-io`
+cannot access the sink, and the wrappers never expose it to the job. Preparation also
 creates a shared atomic queue-control pair before wait registration: the runtime
 stores the cancel handle and submits the non-cloneable start token with the job.
 `Queued -> Cancelled` versus `Queued -> Running` is the sole cancel/dequeue
@@ -355,16 +355,17 @@ deliver through the sink or enqueue a completion.
 
 The one core seam is `ExecutorLease::submit(ExecutorSubmission) ->
 Result<RunningSubmission, SubmissionRejected>`. `ExecutorSubmission` is an
-opaque owning queue item. Its sealed public driver lets `sema-io` ask the
-`sema-core` adapter to claim/run/cancel and deliver, but never exposes the
-private `CompletionSink` across the crate boundary.
+opaque owning queue item with inherent `into_dispatch()` and `reject(kind)`
+methods. `sema-io` dispatches the resulting `Async` or `Blocking` wrapper; each
+wrapper claims/runs/cancels and delivers without exposing the private
+`CompletionSink` across the crate boundary. No additional executor trait is required.
 `ExecutorJobControl` creates the `ExecutorCancelHandle` and non-cloneable token;
 `CancelBeforeStart` and `ExecutorStartDecision` name the CAS outcomes.
-`SubmissionRejected::into_rollback` destroys the private sink inside `sema-core`
-and returns only the rejection kind, job, and start token for rollback, so
-rejection cannot forge delivery.
-`PreparedExternalOperation` owns the runtime decoder/resource plus exactly one
-job and token. Registration allocates operation/wait/generation/completion
+`SubmissionRejected` owns the rejected submission, exposes its kind and
+operation ID, and consumes itself for rollback without exposing the sink.
+`PreparedExternalOperation` has private fields and only compatible
+interruptible-async, interruptible-blocking, and quarantined-blocking
+constructors. Registration allocates operation/wait/generation/completion
 identity; producers and executors allocate no runtime IDs.
 
 Completion routing checks full runtime/wait/generation/operation/kind identity
@@ -384,9 +385,11 @@ with a pre-run effect is `INTERRUPTIBLE` with an exactly-once cleanup hook, or i
 All conversion to and from Sema values, continuation execution, promise
 settlement, tracing, and GC interaction occurs on the interpreter thread.
 Runtime bookkeeping is extracted under its `RefCell` borrow, the borrow is
-dropped before any native/decoder/continuation/output/cancel callback receives
+dropped before any native/decoder/continuation callback receives
 `NativeCallContext`, and state is reborrowed only to apply the returned
-transition.
+transition. That context contains only mutable task context and an owned
+cancellation snapshot; Sema execution is requested through `NativeOutcome::Call`
+and output routing is supplied by the later task-context migration.
 Compile-time types should make the boundary difficult to violate; source scans
 and focused compile-fail or trait tests guard it.
 

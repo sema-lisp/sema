@@ -25,9 +25,10 @@ deterministic clocks, Cargo integration tests.
 - **Immutable inputs:** Master runtime ownership, roots/shared globals,
   lifecycle, fair scheduling, drive turns, waits, shutdown, memory, and debugger
   contracts.
-- **Exact start state:** Clean worktree; latest commit subject is
-  `refactor(runtime): define core runtime contracts`; Task 01–02 gates are GREEN
-  except the exact Task 03/04 RED cases recorded in Task 02 evidence.
+- **Exact start state:** Clean worktree; the accepted Task 02 implementation
+  commit is an ancestor of `HEAD`; later chronology commits are allowed. Task
+  01–02 gates are GREEN except the exact Task 03/04 RED cases recorded in Task
+  02 evidence.
 - **Parallel work:** State-machine/queue tests and fake-clock/wait tests may run
   in parallel. VM continuation/upvalue edits have one owner; interpreter/runtime
   composition starts after the internal runtime tests merge; debugger work
@@ -101,7 +102,7 @@ pub struct Runtime {
 }
 
 pub struct VmRootOptions {
-    pub context: TaskContext,
+    pub context: TaskContextHandle,
     pub output: Rc<dyn OutputSink>,
 }
 
@@ -273,10 +274,10 @@ safe.
 `Box<PreparedExternalOperation>` exactly once, allocates `OperationId`,
 `WaitId`, `WaitGeneration`, and completion identity, and installs `RegisteredExternalWait`, the concrete
 `ResourceClass` cleanup entry, and the task's `Running -> Waiting` state before
-it constructs the opaque `ExecutorSubmission` through the checked `sema-core`
-`pub(in crate::runtime)` factory (which privately constructs the sink) and calls
-Task 05 submission. The
-driver cannot drain the completion inbox reentrantly during this transition, so
+it asks the `sema-core::runtime` registration helper to construct the opaque
+`ExecutorSubmission` and private sink, then calls the lease. Runtime-private
+construction is not callable by `sema-io`. The executor cannot drain the
+completion inbox reentrantly during this transition, so
 an executor that completes inline during `submit` sees fully registered waiting
 state; its completion is processed only after `apply_native_suspend` returns.
 There is no second `ExternalWait`, double registration, or clone/move of the
@@ -286,9 +287,11 @@ No producer or executor allocates a runtime identity.
 Every callback transition follows extract/invoke/apply: under one short
 `RuntimeState` borrow, remove the registration and extract decoder,
 continuation, VM/task bookkeeping, and pending transition; drop that borrow;
-construct `NativeCallContext` and invoke decoder/callback/continuation; then
-reborrow state only to validate and apply the returned transition. Output and
-cancellation callbacks obey the same rule. Tests cover suspend/resume/suspend
+construct `NativeCallContext` from mutable task context and a cancellation
+snapshot and invoke decoder/callback/continuation; then reborrow state only to
+validate and apply the returned transition. VM execution of
+`NativeOutcome::Call` remains explicit runtime work, not a capability on the
+context. Tests cover suspend/resume/suspend
 through one continuation, a callback that enqueues a completion while running,
 and nested native-to-Sema-to-native suspension; none may panic from a nested
 `RefCell` borrow or process the enqueued completion reentrantly.

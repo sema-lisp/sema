@@ -1758,6 +1758,24 @@ impl VM {
         self.run_inner::<false>(ctx, None)
     }
 
+    /// Seed the main call frame for `closure` without executing it, so the
+    /// unified runtime can drive this VM as a task through `run_quantum`. Mirrors
+    /// the frame setup in `execute_async`, but performs no evaluation — the first
+    /// `run_quantum` runs the top-level chunk from its entry point.
+    pub fn seed_main_frame(&mut self, closure: Rc<Closure>) {
+        self.ensure_cache_space(&closure.func);
+        let base = self.stack.len();
+        let n_locals = closure.func.chunk.n_locals as usize;
+        self.stack.resize(base + n_locals, Value::nil());
+        self.frames.push(CallFrame {
+            cache_base: closure.func.cache_offset,
+            closure,
+            pc: 0,
+            base,
+            open_upvalues: None,
+        });
+    }
+
     /// Debug-aware first step of an async task: like [`execute_async`] but with the
     /// breakpoint/step machinery live. Used by the scheduler to start a task when a
     /// debug session is active.

@@ -319,6 +319,55 @@ impl Runtime {
         })
     }
 
+    /// Submit a real VM-backed root: the task runs its pre-seeded VM through
+    /// `run_quantum` and settles with the VM result. The `Test` payload is inert
+    /// here — `vm_call` takes precedence in `visit_ready`, so it is never invoked.
+    #[cfg(test)]
+    pub(super) fn submit_vm_root(&self, vm: VM) -> Result<RootHandle, SubmitRootError> {
+        let mut state = self.state.borrow_mut();
+        if state.shutting_down || state.terminal_fault.is_some() {
+            return Err(SubmitRootError::ShuttingDown);
+        }
+        if state.force_root_exhaustion
+            || state.force_task_exhaustion
+            || state.root_ids.is_exhausted()
+            || state.task_ids.is_exhausted()
+        {
+            return Err(SubmitRootError::IdExhausted);
+        }
+        let root = state
+            .root_ids
+            .allocate()
+            .map_err(|_| SubmitRootError::IdExhausted)?;
+        let task = state
+            .task_ids
+            .allocate()
+            .map_err(|_| SubmitRootError::IdExhausted)?;
+        let relations = TaskRelations {
+            origin_root: root,
+            cancellation_parent: CancellationParent::Root(root),
+            lifetime_owner: LifetimeOwner::Root(root),
+        };
+        state.roots.insert(root, RootRecord::new(root, task));
+        state.tasks.insert(
+            task,
+            RuntimeTask {
+                record: TaskRecord::new(task, relations),
+                payload: TaskPayload::Test(TestPreparedTask::returned(Value::NIL)),
+                pending_resume: None,
+                suspended_owner: None,
+                vm_call: Some(vm),
+                vm_owner: Some(ReturnOwner::Root),
+                context: TaskContextHandle::default(),
+            },
+        );
+        state.ready.enqueue(root, task);
+        Ok(RootHandle {
+            runtime: Rc::downgrade(&self.state),
+            id: root,
+        })
+    }
+
     #[cfg(test)]
     pub(super) fn create_pending_promise_for_test(&self) -> sema_core::runtime::PromiseId {
         self.state

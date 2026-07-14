@@ -597,6 +597,37 @@ impl NativeContinuation for CaptureFailureContinuation {
 }
 
 #[test]
+fn runtime_executes_a_real_vm_root_to_a_returned_value() {
+    // The unified runtime drives a real compiled Sema root via run_quantum and
+    // settles with its value — the first end-to-end evaluation through the runtime.
+    let vals = sema_reader::read_many("(+ 1 2)").expect("parse");
+    let prog = crate::compile_program(&vals, None).expect("compile");
+    let mut vm = crate::VM::new_for_task_with_native_fns(
+        Rc::new(sema_core::Env::new()),
+        Rc::new(prog.functions),
+        Rc::new(Vec::new()),
+    );
+    vm.seed_main_frame(prog.closure);
+
+    let runtime = runtime_with_inline_executor(Rc::new(FakeClock::new()));
+    let handle = runtime.submit_vm_root(vm).expect("root admitted");
+    let mut guard = 0;
+    while matches!(handle.poll_result(), RootPoll::Pending) {
+        runtime.drive(&drive_budget(64)).unwrap();
+        guard += 1;
+        assert!(guard < 100, "real vm root did not settle");
+    }
+    let RootPoll::Ready(settlement) = handle.poll_result() else {
+        panic!("real vm root settles");
+    };
+    assert!(
+        matches!(&settlement.outcome, TaskOutcome::Returned(v) if *v == Value::int(3)),
+        "expected Returned(3), got {:?}",
+        settlement.outcome
+    );
+}
+
+#[test]
 fn runtime_delayed_promise_wait_resumes_with_canonical_settlement() {
     let runtime = runtime_with_inline_executor(Rc::new(FakeClock::new()));
     let promise = runtime.create_pending_promise_for_test();

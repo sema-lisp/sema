@@ -1247,6 +1247,14 @@ impl Runtime {
                     task.vm_call = Some(vm);
                     TaskAction::VmSpawn(task_id, thunk)
                 }
+                // `async/cancel`: the frame parked with a nil placeholder on its
+                // stack top; the runtime requests cancellation of the spawned
+                // task behind the promise and resumes this frame with the
+                // boolean first-request result.
+                YieldReason::Cancel(promise) => {
+                    task.vm_call = Some(vm);
+                    TaskAction::VmCancel(task_id, promise)
+                }
                 // `async/await`: park this frame on the promise; the runtime
                 // resumes it (via `replace_stack_top`) when the promise settles,
                 // or raises the rejection into it (via `resume_with_error`).
@@ -1483,6 +1491,7 @@ impl Runtime {
                 }
             }
             TaskAction::VmSpawn(task_id, thunk) => self.spawn_detached(task_id, thunk)?,
+            TaskAction::VmCancel(task_id, promise) => self.cancel_promise(task_id, promise)?,
             TaskAction::VmAwait(task_id, promise) => self.await_promise(task_id, promise)?,
             TaskAction::VmAwaitSet(task_id, promises, mode) => {
                 self.await_promise_set(task_id, promises, mode)?
@@ -2220,6 +2229,52 @@ impl Runtime {
             value
         };
         self.resume_running_vm(spawner, VmResume::Value(promise_value))
+    }
+
+    /// Request cancellation of the spawned task behind `promise` on behalf of a
+    /// VM task running `async/cancel`, then resume the requester with the boolean
+    /// first-request result.
+    ///
+    /// Returns `#t` ONLY when this call records the FIRST cancellation request
+    /// for a still-pending spawned task; `#f` for a synthetic promise (no task),
+    /// an already-terminal promise, an already-requested task, or a task that no
+    /// longer exists (already reaped). Requesting is idempotent.
+    ///
+    /// The request is sticky (`TaskRecord::request_cancellation`); the target's
+    /// active wait (timer / promise / channel) is interrupted by the drive loop's
+    /// `cancel_waiting` pass, so a task blocked on a long `async/sleep` stops at
+    /// the next cooperative boundary and settles Cancelled promptly rather than
+    /// after its full deadline. The promise is only OBSERVED here — its state
+    /// flips to Cancelled when the target task settles, not synchronously.
+    fn cancel_promise(
+        &self,
+        requester: TaskId,
+        promise: Rc<sema_core::AsyncPromise>,
+    ) -> Result<(), RuntimeFault> {
+        let requested = {
+            let mut state = self.state.borrow_mut();
+            let raw = promise.task_id.get();
+            let terminal = !matches!(&*promise.state.borrow(), sema_core::PromiseState::Pending);
+            if raw == 0 || terminal {
+                // Synthetic promise (async/resolved / async/rejected) or an
+                // already-settled promise: nothing to cancel.
+                false
+            } else {
+                match TaskId::try_from_raw(raw) {
+                    Ok(target) if state.spawned_promises.contains_key(&target) => {
+                        state.tasks.get_mut(&target).is_some_and(|task| {
+                            task.record.request_cancellation(CancelReason::Explicit)
+                        })
+                    }
+                    // Not a live spawned task (reaped, or never a runtime task).
+                    _ => false,
+                }
+            }
+        };
+        self.resume_running_vm(
+            requester,
+            VmResume::Value(sema_core::Value::bool(requested)),
+        )
     }
 
     /// Park a VM task on `promise` until it settles. If it already settled
@@ -3103,9 +3158,21 @@ fn await_rejected_error(message: &str) -> sema_core::SemaError {
     sema_core::SemaError::eval(format!("async/await: task rejected: {core}"))
 }
 
-/// The `await`-on-cancelled-promise error, distinct from a normal rejection.
+/// The `await`-on-cancelled-promise error: a structured, catchable `:cancelled`
+/// condition (NOT a plain rejection). A `(catch e ...)` binds the condition map,
+/// so `(:type e)` is `:cancelled`. The Sema promise carries no `CancelReason`,
+/// so a generic `Explicit` reason is used.
 fn await_cancelled_error() -> sema_core::SemaError {
-    sema_core::SemaError::eval("async/await: task was cancelled")
+    sema_core::SemaError::cancelled_condition(
+        "async/await: awaited task was cancelled",
+        CancelReason::Explicit,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
 }
 
 /// Strip any nested `async/await: task rejected:` prefix off a promise rejection
@@ -3530,6 +3597,10 @@ enum TaskAction {
     /// `async/spawn`: create a detached task from the thunk and resume the
     /// spawning task (`TaskId`) with the new promise value.
     VmSpawn(TaskId, sema_core::Value),
+    /// `async/cancel`: request cancellation of the spawned task behind the
+    /// promise and resume the requesting task (`TaskId`) with the boolean
+    /// first-request result.
+    VmCancel(TaskId, Rc<sema_core::AsyncPromise>),
     /// `async/await`: park the task (`TaskId`) on the promise until it settles.
     VmAwait(TaskId, Rc<sema_core::AsyncPromise>),
     /// `async/all` / `async/race` / `async/timeout`: park the task (`TaskId`) on
@@ -3641,6 +3712,7 @@ impl Trace for TaskAction {
                 sink(sema_core::cycle::GcEdge::Value(thunk));
                 true
             }
+            Self::VmCancel(_, promise) => trace_promise(promise, sink),
             Self::VmAwait(_, promise) => trace_promise(promise, sink),
             Self::VmAwaitSet(_, promises, _) => {
                 promises.iter().all(|promise| trace_promise(promise, sink))

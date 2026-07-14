@@ -180,6 +180,13 @@ pub enum YieldReason {
     /// spawning frame with the promise value; the legacy scheduler never sees
     /// this variant (it spawns via the spawn callback instead).
     Spawn(Value),
+    /// Requesting cancellation of the spawned task behind a promise. The unified
+    /// runtime records the (idempotent) cancellation request on the target task,
+    /// interrupts its active wait so it stops at the next cooperative boundary,
+    /// and resumes the requesting frame with the boolean first-request result.
+    /// The legacy scheduler never sees this variant (it cancels via the cancel
+    /// callback instead).
+    Cancel(Rc<AsyncPromise>),
     /// Waiting for an offloaded I/O future (e.g. an HTTP round-trip running on a
     /// background runtime) to complete. The scheduler polls the handle and parks
     /// the VM thread on the process-global IO-completion signal while in flight.

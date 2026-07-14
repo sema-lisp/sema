@@ -287,6 +287,13 @@ impl Scheduler {
                         "internal error: channel/close yield reached the legacy scheduler"
                             .to_string(),
                     ),
+                    // `Cancel` is a unified-runtime-only yield: the legacy
+                    // scheduler cancels through the cancel callback synchronously
+                    // and never parks a task on it.
+                    YieldReason::Cancel(_) => WakeAction::Fail(
+                        "internal error: async/cancel yield reached the legacy scheduler"
+                            .to_string(),
+                    ),
                 };
 
                 match action {

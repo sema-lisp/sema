@@ -42,12 +42,21 @@ fn rejected_error(e: &str) -> SemaError {
     SemaError::eval(format!("async/await: task rejected: {core}"))
 }
 
-/// Format the `await`-on-cancelled-promise error. Distinct from a
-/// normal rejection so users can branch on `:type :cancelled` once
-/// we expose that.
+/// Format the `await`-on-cancelled-promise error as a structured, catchable
+/// `:cancelled` condition (not a plain rejection): `(:type e)` on the caught
+/// value is `:cancelled`. The promise carries no `CancelReason`, so a generic
+/// `Explicit` reason is used. Mirrors `runtime::state::await_cancelled_error`.
 fn cancelled_error() -> SemaError {
-    SemaError::eval("async/await: task was cancelled")
-        .with_hint("the task was cancelled via async/cancel before it produced a value")
+    SemaError::cancelled_condition(
+        "async/await: awaited task was cancelled",
+        sema_core::runtime::CancelReason::Explicit,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
 }
 
 // ── Helpers ──────────────────────────────────────────────────────
@@ -262,6 +271,15 @@ fn register_promise_ops(env: &Env) {
     register_fn(env, "async/cancel", |args| {
         check_arity!(args, "async/cancel", 1);
         let promise = expect_promise(args, "async/cancel", 0)?;
+        // Under the unified runtime, surface a Cancel yield: the runtime records
+        // the (idempotent) cancellation request on the target spawned task,
+        // interrupts its active wait, and resumes this frame with the boolean
+        // first-request result (via `replace_stack_top`). The legacy scheduler
+        // path uses the cancel callback instead.
+        if in_runtime_quantum() {
+            set_yield_signal(YieldReason::Cancel(promise));
+            return Ok(Value::nil()); // placeholder; runtime substitutes the boolean
+        }
         let task_id = promise.task_id.get();
         if task_id == 0 {
             // Never-spawned promise (async/resolved / async/rejected).

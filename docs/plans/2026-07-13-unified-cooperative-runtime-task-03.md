@@ -862,6 +862,15 @@ named owner files enough to compile and route host-executable user code through
 A or E, adds their focused compile/tests to the gate, and records every
 occurrence and classification in evidence.
 
+  - _Progress (2026-07-14, `04e090fa`): VM-root execution seam proven at the
+    runtime level — `VM::seed_main_frame` + `Runtime::submit_vm_root` drive a
+    real compiled root through the existing `run_quantum` arm to `Returned`
+    (test `runtime_executes_a_real_vm_root_to_a_returned_value`, gate = `(+ 1 2)`
+    → `Returned(3)`). This is the prerequisite for `eval*`. Still pending for
+    Step 2: `Interpreter` storing `runtime: Option<Runtime>`, `eval*`
+    prepare/submit/drive, `try_new*`/parts constructors, and the `sema`/
+    `sema-wasm` struct-literal updates. Box stays unchecked until those land._
+
 - [ ] **Step 3: Remove TLS scheduler ownership**
 
 Delete task vectors, IDs, virtual clock, and global env ownership from

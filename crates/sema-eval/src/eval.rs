@@ -230,6 +230,21 @@ impl Interpreter {
                 .map_err(|e| SemaError::eval(format!("runtime fault: {e:?}")))?
             {
                 DriveState::Progress { .. } => {}
+                // The root is parked on a timer (`async/sleep`): the only pending
+                // work is a future deadline. Wait out the earliest deadline on a
+                // real clock, then drive again so `fire_timer` wakes the VM. Any
+                // other idle shape (no deadline, or an inbox/IO wait this
+                // synchronous path can't service) is an unsupported suspension.
+                DriveState::Idle {
+                    next_deadline: Some(deadline),
+                    inbox_wakeup_required: false,
+                    ..
+                } => {
+                    let now = std::time::Instant::now();
+                    if deadline > now {
+                        std::thread::sleep(deadline - now);
+                    }
+                }
                 _ => {
                     return Err(SemaError::eval(
                         "eval_via_runtime: root did not settle (async/IO is not supported on the synchronous runtime path)",
@@ -2054,16 +2069,42 @@ mod runtime_eval_tests {
         assert_eq!(result, Value::int(42));
     }
 
-    // BOUNDARY (next slice): the runtime eval path deliberately does NOT wire up
-    // the legacy yield-signal async scheduler (`init_scheduler`) that
-    // `run_exprs_on_vm` installs — the whole point of the unified runtime is to
-    // replace it with a real executor, which this synchronous `NullExecutor`
-    // path does not yet provide. So any true async primitive fails fast rather
-    // than silently running on the legacy scheduler. `async/spawn` hits it with
-    // the exact error below. Ignored + documented so the async-executor slice
-    // has a concrete target; run with `--ignored` to observe the boundary.
+    // ACCEPTANCE GATE (Task 04 native-suspend ABI, first async op): `async/sleep`
+    // runs end-to-end through the unified runtime. The VM native yields via the
+    // TLS yield signal (surfaced as `VmExecResult::AsyncYield(Sleep)`); the
+    // runtime parks the VM in `vm_call`, arms a real timer wait, and resumes the
+    // same VM frame with nil once `fire_timer` fires. No legacy scheduler is
+    // installed — the runtime's own timer/drive loop drives the suspension.
     #[test]
-    #[ignore = "async needs the real executor; runtime path has no scheduler yet"]
+    fn eval_via_runtime_async_sleep_settles_after_timer_fires() {
+        let interp = Interpreter::new();
+        // A tiny real duration: the drive loop waits out the deadline on the
+        // runtime's MonotonicClock, then the timer fires and the VM resumes.
+        let result = interp
+            .eval_str_via_runtime("(async/sleep 2)")
+            .expect("async/sleep settles through the runtime");
+        assert_eq!(result, Value::nil());
+    }
+
+    // The VM resumes AFTER the sleep and continues the rest of the program,
+    // proving the frame is genuinely parked and resumed (not settled early).
+    #[test]
+    fn eval_via_runtime_async_sleep_resumes_and_continues() {
+        let interp = Interpreter::new();
+        let result = interp
+            .eval_str_via_runtime("(begin (async/sleep 2) (+ 40 2))")
+            .expect("program continues past async/sleep");
+        assert_eq!(result, Value::int(42));
+    }
+
+    // BOUNDARY (next slice): `async/spawn` still needs the promise/detached-task
+    // machinery (Task 04 Task 2), which the runtime eval path does not yet wire.
+    // Unlike `async/sleep` (a pure timer wait resumed in place), spawn creates an
+    // interpreter-owned task and returns a promise — no VM-resume seam covers it.
+    // Ignored + documented so that slice has a concrete target; run with
+    // `--ignored` to observe the boundary.
+    #[test]
+    #[ignore = "async/spawn needs the detached-task/promise slice (Task 04 Task 2)"]
     fn eval_via_runtime_async_spawn_is_unsupported_boundary() {
         let interp = Interpreter::new();
         let result = interp.eval_str_via_runtime("(async/spawn (fn () 1))");

@@ -123,6 +123,10 @@ impl<I: RuntimeIdType> IdCounter<I> {
         Ok(I::from_nonzero(current))
     }
 
+    pub fn is_exhausted(&self) -> bool {
+        self.next.is_none()
+    }
+
     #[cfg(test)]
     fn starting_at(next: u64) -> Self {
         Self {
@@ -179,7 +183,7 @@ scoped_id_type!(RootId);
 scoped_id_type!(PromiseId);
 scoped_id_type!(ChannelId);
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct RuntimeScopedIdCounter<I> {
     runtime: RuntimeId,
     local: IdCounter<NonZeroU64>,
@@ -205,6 +209,10 @@ impl<I: RuntimeScopedIdType> RuntimeScopedIdCounter<I> {
         self.local
             .allocate()
             .map(|local| <I as private::ScopedSealed>::from_parts(self.runtime, local))
+    }
+
+    pub fn is_exhausted(&self) -> bool {
+        self.local.is_exhausted()
     }
 }
 

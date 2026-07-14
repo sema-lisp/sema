@@ -67,8 +67,10 @@ fn channel_registry_is_fifo_and_cancellation_is_exact() {
         failure: None,
     }))
     .unwrap();
-    let send_key = waits.issue_internal_wait().unwrap();
-    let receive_key = waits.issue_internal_wait().unwrap();
+    let mut send_key = waits.issue_internal_wait().unwrap();
+    send_key.runtime = runtime;
+    let mut receive_key = waits.issue_internal_wait().unwrap();
+    receive_key.runtime = runtime;
     assert_eq!(
         channels
             .send(
@@ -86,8 +88,149 @@ fn channel_registry_is_fifo_and_cancellation_is_exact() {
             .unwrap(),
         ChannelResult::Received(Value::int(4))
     );
-    assert_eq!(channels.take_wake(send_key).unwrap().key, send_key);
+    let wake = channels.take_wake(send_key).unwrap();
+    assert_eq!(wake.key, send_key);
+    assert_eq!(wake.task, TaskId::try_from_raw(1).unwrap());
     assert!(!channels.cancel_wait(channel, receive_key).unwrap());
+}
+
+#[test]
+fn channel_try_receive_rendezvous_and_promotes_blocked_senders() {
+    use super::{ChannelRegistry, ChannelResult};
+    let runtime = RuntimeId::allocate().unwrap();
+    let mut channels = ChannelRegistry::new(runtime);
+    let waits = WaitRuntime::new(Arc::new(FakeExecutor {
+        mode: FakeSubmit::Inline,
+        failure: None,
+    }))
+    .unwrap();
+    let keys: Vec<_> = (0..5)
+        .map(|_| {
+            let mut key = waits.issue_internal_wait().unwrap();
+            key.runtime = runtime;
+            key
+        })
+        .collect();
+    let unbuffered = channels.allocate(0).unwrap();
+    assert_eq!(
+        channels
+            .send(
+                unbuffered,
+                keys[0],
+                TaskId::try_from_raw(1).unwrap(),
+                Value::FALSE
+            )
+            .unwrap(),
+        ChannelResult::Waiting
+    );
+    assert_eq!(
+        channels.try_receive(unbuffered).unwrap(),
+        ChannelResult::Received(Value::FALSE)
+    );
+    assert_eq!(
+        channels.take_wake(keys[0]).unwrap().result,
+        ChannelResult::Sent
+    );
+
+    let buffered = channels.allocate(1).unwrap();
+    assert_eq!(
+        channels
+            .send(
+                buffered,
+                keys[1],
+                TaskId::try_from_raw(2).unwrap(),
+                Value::int(1)
+            )
+            .unwrap(),
+        ChannelResult::Sent
+    );
+    assert_eq!(
+        channels
+            .send(
+                buffered,
+                keys[2],
+                TaskId::try_from_raw(3).unwrap(),
+                Value::int(2)
+            )
+            .unwrap(),
+        ChannelResult::Waiting
+    );
+    assert_eq!(
+        channels.try_receive(buffered).unwrap(),
+        ChannelResult::Received(Value::int(1))
+    );
+    assert_eq!(
+        channels.take_wake(keys[2]).unwrap().result,
+        ChannelResult::Sent
+    );
+    assert_eq!(
+        channels.try_receive(buffered).unwrap(),
+        ChannelResult::Received(Value::int(2))
+    );
+}
+
+#[test]
+fn promise_observers_preserve_registration_order_and_reject_duplicates() {
+    let runtime = RuntimeId::allocate().unwrap();
+    let mut promises = super::PromiseRegistry::new(runtime);
+    let promise = promises.allocate_pending(None).unwrap();
+    let waits = WaitRuntime::new(Arc::new(FakeExecutor {
+        mode: FakeSubmit::Inline,
+        failure: None,
+    }))
+    .unwrap();
+    let keys: Vec<_> = (0..3)
+        .map(|_| {
+            let mut key = waits.issue_internal_wait().unwrap();
+            key.runtime = runtime;
+            key
+        })
+        .collect();
+    let tasks: Vec<_> = (1..=3)
+        .map(|raw| TaskId::try_from_raw(raw).unwrap())
+        .collect();
+    for (&key, &task) in keys.iter().zip(&tasks) {
+        assert!(promises.observe(promise, key, task).unwrap());
+    }
+    assert!(matches!(
+        promises.observe(promise, keys[1], tasks[1]),
+        Err(super::RegistryError::DuplicateWait)
+    ));
+    assert!(promises.cancel_observation(promise, keys[1]).unwrap());
+    let settlement = Rc::new(sema_core::runtime::TaskSettlement {
+        sequence: IdCounter::<SettlementSeq>::new().allocate().unwrap(),
+        outcome: TaskOutcome::Returned(Value::int(1)),
+    });
+    assert_eq!(
+        promises.settle(promise, Rc::clone(&settlement)).unwrap(),
+        vec![(keys[0], tasks[0]), (keys[2], tasks[2])]
+    );
+    assert!(matches!(
+        promises.settle(promise, settlement),
+        Err(super::RegistryError::AlreadySettled)
+    ));
+}
+
+#[test]
+fn dormant_protocol_wait_fails_through_continuation() {
+    let runtime = runtime_with_inline_executor(Rc::new(FakeClock::new()));
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let foreign_runtime = RuntimeId::allocate().unwrap();
+    let promise = super::PromiseRegistry::new(foreign_runtime)
+        .allocate_pending(None)
+        .unwrap();
+    let handle = runtime
+        .submit_test_root(TestPreparedTask::native(Ok(NativeOutcome::Suspend(
+            sema_core::runtime::NativeSuspend {
+                wait: sema_core::runtime::WaitKind::Promise(promise),
+                continuation: Box::new(RecordingContinuation(Arc::clone(&events))),
+            },
+        ))))
+        .unwrap();
+    while matches!(handle.poll_result(), RootPoll::Pending) {
+        runtime.drive(&drive_budget(1)).unwrap();
+    }
+    assert_eq!(*events.lock().unwrap(), vec!["resume-failed"]);
 }
 
 struct RuntimeResponseContinuation(Arc<Mutex<Vec<&'static str>>>);
@@ -147,7 +290,8 @@ fn promise_observer_cancellation_does_not_cancel_supplied_promise() {
         failure: None,
     }))
     .unwrap();
-    let key = waits.issue_internal_wait().unwrap();
+    let mut key = waits.issue_internal_wait().unwrap();
+    key.runtime = runtime;
     assert!(promises
         .observe(promise, key, TaskId::try_from_raw(10).unwrap())
         .unwrap());
@@ -173,7 +317,11 @@ fn channel_buffer_fifo_close_and_exact_waiter_cleanup() {
     }))
     .unwrap();
     let keys: Vec<_> = (0..4)
-        .map(|_| waits.issue_internal_wait().unwrap())
+        .map(|_| {
+            let mut key = waits.issue_internal_wait().unwrap();
+            key.runtime = runtime;
+            key
+        })
         .collect();
     assert_eq!(
         channels
@@ -2379,6 +2527,7 @@ fn timer_cancel_removes_only_exact_generation_and_updates_deadline() {
     let mut timers = TimerQueue::new();
     let old = ids.wait_key();
     let replacement = WaitKey {
+        runtime: old.runtime,
         id: old.id,
         generation: ids.generations.allocate().expect("generation available"),
     };
@@ -2387,6 +2536,7 @@ fn timer_cancel_removes_only_exact_generation_and_updates_deadline() {
     timers.insert(clock.now() + Duration::from_secs(2), replacement);
 
     assert!(!timers.cancel(WaitKey {
+        runtime: old.runtime,
         id: old.id,
         generation: absent_generation,
     }));
@@ -2558,6 +2708,7 @@ fn drive_rotation_persists_for_repeated_one_credit_calls() {
 }
 
 struct Ids {
+    runtime: RuntimeId,
     tasks: IdCounter<TaskId>,
     roots: RuntimeScopedIdCounter<RootId>,
     scopes: IdCounter<ScopeId>,
@@ -2570,6 +2721,7 @@ impl Ids {
     fn new() -> Self {
         let runtime = RuntimeId::allocate().expect("runtime ID available");
         Self {
+            runtime,
             tasks: IdCounter::new(),
             roots: RuntimeScopedIdCounter::new(runtime),
             scopes: IdCounter::new(),
@@ -2581,6 +2733,7 @@ impl Ids {
 
     fn wait_key(&mut self) -> WaitKey {
         WaitKey {
+            runtime: self.runtime,
             id: self.waits.allocate().expect("wait ID available"),
             generation: self
                 .generations

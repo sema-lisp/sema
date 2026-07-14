@@ -1,7 +1,7 @@
 use std::rc::Rc;
 
 use sema_core::runtime::{
-    CancelReason, NativeContinuation, ResumeInput, SettlementSeq, TaskId, TaskOutcome,
+    CancelReason, NativeContinuation, ResumeInput, RuntimeId, SettlementSeq, TaskId, TaskOutcome,
     TaskRelations, TaskSettlement, Trace, WaitGeneration, WaitId,
 };
 
@@ -51,8 +51,16 @@ impl Trace for ContinuationFrame {
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct WaitKey {
-    pub id: WaitId,
-    pub generation: WaitGeneration,
+    pub(crate) runtime: RuntimeId,
+    pub(crate) id: WaitId,
+    pub(crate) generation: WaitGeneration,
+}
+
+impl WaitKey {
+    #[allow(dead_code)]
+    pub(crate) fn runtime(self) -> RuntimeId {
+        self.runtime
+    }
 }
 
 impl Trace for TaskRecord {

@@ -1,4 +1,6 @@
-use std::collections::HashMap;
+#![cfg_attr(not(test), allow(dead_code))]
+
+use std::collections::{HashMap, VecDeque};
 use std::rc::Rc;
 
 use sema_core::runtime::{
@@ -13,8 +15,8 @@ pub enum RegistryError {
     WrongRuntime,
     Unknown,
     AlreadySettled,
+    DuplicateWait,
     IdExhausted,
-    NonMonotonicSettlement,
 }
 
 #[derive(Clone, Debug)]
@@ -28,14 +30,13 @@ pub enum PromiseState {
 struct PromiseRecord {
     task: Option<TaskId>,
     settlement: Option<Rc<TaskSettlement>>,
-    waiters: HashMap<WaitKey, TaskId>,
+    waiters: VecDeque<(WaitKey, TaskId)>,
 }
 
 pub struct PromiseRegistry {
     runtime: RuntimeId,
     ids: RuntimeScopedIdCounter<PromiseId>,
     records: HashMap<PromiseId, PromiseRecord>,
-    last_settlement: Option<sema_core::runtime::SettlementSeq>,
 }
 
 impl PromiseRegistry {
@@ -44,20 +45,25 @@ impl PromiseRegistry {
             runtime,
             ids: RuntimeScopedIdCounter::new(runtime),
             records: HashMap::new(),
-            last_settlement: None,
         }
     }
     pub fn allocate_pending(&mut self, task: Option<TaskId>) -> Result<PromiseId, IdExhausted> {
-        let id = self.ids.allocate()?;
+        let id = self.reserve_id()?;
+        self.insert_pending(id, task);
+        Ok(id)
+    }
+    pub(crate) fn reserve_id(&mut self) -> Result<PromiseId, IdExhausted> {
+        self.ids.allocate()
+    }
+    pub(crate) fn insert_pending(&mut self, id: PromiseId, task: Option<TaskId>) {
         self.records.insert(
             id,
             PromiseRecord {
                 task,
                 settlement: None,
-                waiters: HashMap::new(),
+                waiters: VecDeque::new(),
             },
         );
-        Ok(id)
     }
     pub fn task(&self, id: PromiseId) -> Result<Option<TaskId>, RegistryError> {
         Ok(self.record(id)?.task)
@@ -77,24 +83,15 @@ impl PromiseRegistry {
         id: PromiseId,
         settlement: Rc<TaskSettlement>,
     ) -> Result<Vec<(WaitKey, TaskId)>, RegistryError> {
-        if self
-            .last_settlement
-            .is_some_and(|last| settlement.sequence <= last)
-        {
-            return Err(RegistryError::NonMonotonicSettlement);
-        }
-        let sequence = settlement.sequence;
-        let mut waiters: Vec<_> = {
+        let waiters = {
             let record = self.record_mut(id)?;
             if record.settlement.is_some() {
                 return Err(RegistryError::AlreadySettled);
             }
             record.settlement = Some(settlement);
-            record.waiters.drain().collect()
+            std::mem::take(&mut record.waiters)
         };
-        self.last_settlement = Some(sequence);
-        waiters.sort_by_key(|(key, _)| (key.id, key.generation));
-        Ok(waiters)
+        Ok(waiters.into())
     }
     pub fn observe(
         &mut self,
@@ -102,11 +99,21 @@ impl PromiseRegistry {
         key: WaitKey,
         task: TaskId,
     ) -> Result<bool, RegistryError> {
+        if key.runtime() != self.runtime {
+            return Err(RegistryError::WrongRuntime);
+        }
         let record = self.record_mut(id)?;
         if record.settlement.is_some() {
             return Ok(false);
         }
-        record.waiters.insert(key, task);
+        if record
+            .waiters
+            .iter()
+            .any(|(registered, _)| *registered == key)
+        {
+            return Err(RegistryError::DuplicateWait);
+        }
+        record.waiters.push_back((key, task));
         Ok(true)
     }
     pub fn cancel_observation(
@@ -114,7 +121,18 @@ impl PromiseRegistry {
         id: PromiseId,
         key: WaitKey,
     ) -> Result<bool, RegistryError> {
-        Ok(self.record_mut(id)?.waiters.remove(&key).is_some())
+        if key.runtime() != self.runtime {
+            return Err(RegistryError::WrongRuntime);
+        }
+        let waiters = &mut self.record_mut(id)?.waiters;
+        let Some(index) = waiters
+            .iter()
+            .position(|(registered, _)| *registered == key)
+        else {
+            return Ok(false);
+        };
+        waiters.remove(index);
+        Ok(true)
     }
     fn record(&self, id: PromiseId) -> Result<&PromiseRecord, RegistryError> {
         if id.runtime() != self.runtime {

@@ -243,22 +243,21 @@ impl Runtime {
         if state.shutting_down || state.terminal_fault.is_some() {
             return Err(SubmitRootError::ShuttingDown);
         }
-        let mut root_ids = state.root_ids.clone();
-        let mut task_ids = state.task_ids.clone();
-        let root = (!state.force_root_exhaustion)
-            .then(|| root_ids.allocate())
-            .transpose()
-            .ok()
-            .flatten()
-            .ok_or(SubmitRootError::IdExhausted)?;
-        let task = (!state.force_task_exhaustion)
-            .then(|| task_ids.allocate())
-            .transpose()
-            .ok()
-            .flatten()
-            .ok_or(SubmitRootError::IdExhausted)?;
-        state.root_ids = root_ids;
-        state.task_ids = task_ids;
+        if state.force_root_exhaustion
+            || state.force_task_exhaustion
+            || state.root_ids.is_exhausted()
+            || state.task_ids.is_exhausted()
+        {
+            return Err(SubmitRootError::IdExhausted);
+        }
+        let root = state
+            .root_ids
+            .allocate()
+            .map_err(|_| SubmitRootError::IdExhausted)?;
+        let task = state
+            .task_ids
+            .allocate()
+            .map_err(|_| SubmitRootError::IdExhausted)?;
         let relations = TaskRelations {
             origin_root: root,
             cancellation_parent: CancellationParent::Root(root),
@@ -911,6 +910,20 @@ impl Runtime {
                 self.settle(root, task_id, TaskOutcome::Failed(error))
             }
             Ok(NativeOutcome::Suspend(suspend)) => {
+                if !matches!(suspend.wait, sema_core::runtime::WaitKind::External(_)) {
+                    self.state
+                        .borrow_mut()
+                        .pending
+                        .push_back(PendingStage::Resume(
+                            task_id,
+                            owner,
+                            ContinuationFrame::native(suspend.continuation),
+                            ResumeInput::Failed(sema_core::SemaError::eval(
+                                "runtime wait protocol is not active",
+                            )),
+                        ));
+                    return Ok(());
+                }
                 let (mut task, mut waits) =
                     {
                         let mut state = self.state.borrow_mut();
@@ -1006,13 +1019,14 @@ impl Runtime {
                     continuation,
                 } => {
                     let response = (|| {
+                        let promise = state.promises.reserve_id().map_err(|_| {
+                            sema_core::SemaError::eval("runtime promise identity exhausted")
+                        })?;
                         let sequence = state.settlement_ids.allocate().map_err(|_| {
                             sema_core::SemaError::eval("runtime settlement identity exhausted")
                         })?;
                         let settlement = Rc::new(TaskSettlement { sequence, outcome });
-                        let promise = state.promises.allocate_pending(None).map_err(|_| {
-                            sema_core::SemaError::eval("runtime promise identity exhausted")
-                        })?;
+                        state.promises.insert_pending(promise, None);
                         state
                             .promises
                             .settle(promise, settlement)
@@ -1071,9 +1085,14 @@ impl Runtime {
                             .map(|closed| RuntimeResponse::Value(sema_core::Value::bool(closed))),
                         ChannelOperation::TryReceive => {
                             state.channels.try_receive(channel).map(|result| {
-                                RuntimeResponse::Value(match result {
-                                    super::ChannelResult::Received(value) => value,
-                                    _ => sema_core::Value::FALSE,
+                                RuntimeResponse::Receive(match result {
+                                    super::ChannelResult::Received(value) => {
+                                        sema_core::runtime::ChannelReceive::Received(value)
+                                    }
+                                    super::ChannelResult::Closed => {
+                                        sema_core::runtime::ChannelReceive::Closed
+                                    }
+                                    _ => sema_core::runtime::ChannelReceive::Empty,
                                 })
                             })
                         }
@@ -1629,10 +1648,8 @@ fn registry_error(error: super::RegistryError) -> sema_core::SemaError {
         super::RegistryError::WrongRuntime => "runtime handle belongs to another runtime",
         super::RegistryError::Unknown => "runtime handle is stale or unknown",
         super::RegistryError::AlreadySettled => "promise is already settled",
+        super::RegistryError::DuplicateWait => "runtime wait is already registered",
         super::RegistryError::IdExhausted => "runtime identity exhausted",
-        super::RegistryError::NonMonotonicSettlement => {
-            "promise settlement sequence is not monotonic"
-        }
     })
 }
 

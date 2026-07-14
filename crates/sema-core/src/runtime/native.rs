@@ -104,6 +104,14 @@ pub enum RuntimeResponse {
     Value(Value),
     Cancelled(bool),
     Settlement(Option<Rc<TaskSettlement>>),
+    Receive(ChannelReceive),
+}
+
+#[derive(Clone, Debug)]
+pub enum ChannelReceive {
+    Received(Value),
+    Empty,
+    Closed,
 }
 
 pub struct NativeCall {
@@ -199,6 +207,7 @@ impl Trace for RuntimeResponse {
     fn trace(&self, sink: &mut dyn FnMut(GcEdge<'_>)) -> bool {
         match self {
             Self::Value(value) => sink(GcEdge::Value(value)),
+            Self::Receive(ChannelReceive::Received(value)) => sink(GcEdge::Value(value)),
             Self::Settlement(Some(settlement)) => return settlement.trace(sink),
             _ => {}
         }

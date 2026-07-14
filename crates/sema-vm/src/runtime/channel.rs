@@ -1,3 +1,5 @@
+#![cfg_attr(not(test), allow(dead_code))]
+
 use std::collections::{HashMap, VecDeque};
 
 use sema_core::runtime::{
@@ -73,6 +75,9 @@ impl ChannelRegistry {
         task: TaskId,
         value: Value,
     ) -> Result<ChannelResult, RegistryError> {
+        if key.runtime() != self.runtime {
+            return Err(RegistryError::WrongRuntime);
+        }
         let channel = self.channel_mut(id)?;
         if channel.closed {
             return Ok(ChannelResult::Closed);
@@ -98,29 +103,13 @@ impl ChannelRegistry {
         key: WaitKey,
         task: TaskId,
     ) -> Result<ChannelResult, RegistryError> {
+        if key.runtime() != self.runtime {
+            return Err(RegistryError::WrongRuntime);
+        }
+        if let Some(result) = self.dequeue(id)? {
+            return Ok(result);
+        }
         let channel = self.channel_mut(id)?;
-        if let Some(value) = channel.buffer.pop_front() {
-            if let Some(sender) = channel.senders.pop_front() {
-                channel.buffer.push_back(sender.value);
-                self.wakes.push_back(ChannelWake {
-                    key: sender.key,
-                    task: sender.task,
-                    result: ChannelResult::Sent,
-                });
-            }
-            return Ok(ChannelResult::Received(value));
-        }
-        if let Some(sender) = channel.senders.pop_front() {
-            self.wakes.push_back(ChannelWake {
-                key: sender.key,
-                task: sender.task,
-                result: ChannelResult::Sent,
-            });
-            return Ok(ChannelResult::Received(sender.value));
-        }
-        if channel.closed {
-            return Ok(ChannelResult::Closed);
-        }
         channel.receivers.push_back(Receiver { key, task });
         Ok(ChannelResult::Waiting)
     }
@@ -165,19 +154,12 @@ impl ChannelRegistry {
         })
     }
     pub fn try_receive(&mut self, id: ChannelId) -> Result<ChannelResult, RegistryError> {
-        let channel = self.channel_mut(id)?;
-        Ok(channel.buffer.pop_front().map_or_else(
-            || {
-                if channel.closed {
-                    ChannelResult::Closed
-                } else {
-                    ChannelResult::Waiting
-                }
-            },
-            ChannelResult::Received,
-        ))
+        Ok(self.dequeue(id)?.unwrap_or(ChannelResult::Waiting))
     }
     pub fn cancel_wait(&mut self, id: ChannelId, key: WaitKey) -> Result<bool, RegistryError> {
+        if key.runtime() != self.runtime {
+            return Err(RegistryError::WrongRuntime);
+        }
         let channel = self.channel_mut(id)?;
         if let Some(i) = channel.senders.iter().position(|w| w.key == key) {
             channel.senders.remove(i);
@@ -192,6 +174,29 @@ impl ChannelRegistry {
     pub fn take_wake(&mut self, key: WaitKey) -> Option<ChannelWake> {
         let index = self.wakes.iter().position(|wake| wake.key == key)?;
         self.wakes.remove(index)
+    }
+    fn dequeue(&mut self, id: ChannelId) -> Result<Option<ChannelResult>, RegistryError> {
+        let channel = self.channel_mut(id)?;
+        if let Some(value) = channel.buffer.pop_front() {
+            if let Some(sender) = channel.senders.pop_front() {
+                channel.buffer.push_back(sender.value);
+                self.wakes.push_back(ChannelWake {
+                    key: sender.key,
+                    task: sender.task,
+                    result: ChannelResult::Sent,
+                });
+            }
+            return Ok(Some(ChannelResult::Received(value)));
+        }
+        if let Some(sender) = channel.senders.pop_front() {
+            self.wakes.push_back(ChannelWake {
+                key: sender.key,
+                task: sender.task,
+                result: ChannelResult::Sent,
+            });
+            return Ok(Some(ChannelResult::Received(sender.value)));
+        }
+        Ok(channel.closed.then_some(ChannelResult::Closed))
     }
     fn channel_mut(&mut self, id: ChannelId) -> Result<&mut Channel, RegistryError> {
         if id.runtime() != self.runtime {

@@ -219,7 +219,11 @@ impl WaitRuntime {
             .as_ref()
             .expect("open wait runtime has registrar")
             .issue_wait_identity()
-            .map(|(id, generation)| WaitKey { id, generation })
+            .map(|(id, generation)| WaitKey {
+                runtime: self.runtime_id,
+                id,
+                generation,
+            })
     }
 
     pub fn register_external(
@@ -253,6 +257,7 @@ impl WaitRuntime {
             unreachable!("wait kind checked before identity issuance")
         };
         let key = WaitKey {
+            runtime: self.runtime_id,
             id: identity.wait_id(),
             generation: identity.generation(),
         };
@@ -332,6 +337,7 @@ impl WaitRuntime {
             Err(TryRecvError::Empty | TryRecvError::Disconnected) => return None,
         };
         let key = WaitKey {
+            runtime: self.runtime_id,
             id: completion.wait_id,
             generation: completion.generation,
         };
@@ -388,6 +394,7 @@ impl WaitRuntime {
         let completion = self.deferred.front();
         completion.and_then(|completion| {
             let key = WaitKey {
+                runtime: self.runtime_id,
                 id: completion.wait_id,
                 generation: completion.generation,
             };
@@ -403,6 +410,7 @@ impl WaitRuntime {
             return false;
         };
         let key = WaitKey {
+            runtime: self.runtime_id,
             id: completion.wait_id,
             generation: completion.generation,
         };

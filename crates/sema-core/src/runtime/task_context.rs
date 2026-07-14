@@ -8,7 +8,7 @@ use crate::cycle::GcEdge;
 
 use super::Trace;
 
-pub trait TaskLocalValue: Trace {
+pub trait TaskLocalValue: Trace + Any {
     fn inherit(&self) -> Rc<dyn TaskLocalValue>;
     fn as_any(&self) -> &dyn Any;
 }
@@ -24,11 +24,14 @@ impl TaskContext {
         Self::default()
     }
 
-    pub fn insert<T: TaskLocalValue + 'static>(
-        &mut self,
-        value: Rc<T>,
-    ) -> Option<Rc<dyn TaskLocalValue>> {
-        self.extensions.insert(TypeId::of::<T>(), value)
+    pub fn insert<T: TaskLocalValue + 'static>(&mut self, value: Rc<T>) -> Option<Rc<T>> {
+        self.extensions
+            .insert(TypeId::of::<T>(), value)
+            .map(|previous| {
+                let previous: Rc<dyn Any> = previous;
+                Rc::downcast::<T>(previous)
+                    .expect("task-local map key must match its concrete value type")
+            })
     }
 
     pub fn get<T: TaskLocalValue + 'static>(&self) -> Option<&T> {
@@ -37,8 +40,11 @@ impl TaskContext {
             .and_then(|value| value.as_any().downcast_ref())
     }
 
-    pub fn remove<T: TaskLocalValue + 'static>(&mut self) -> Option<Rc<dyn TaskLocalValue>> {
-        self.extensions.remove(&TypeId::of::<T>())
+    pub fn remove<T: TaskLocalValue + 'static>(&mut self) -> Option<Rc<T>> {
+        self.extensions.remove(&TypeId::of::<T>()).map(|value| {
+            let value: Rc<dyn Any> = value;
+            Rc::downcast::<T>(value).expect("task-local map key must match its concrete value type")
+        })
     }
 
     pub fn inherit_for_child(&self) -> Self {
@@ -46,7 +52,15 @@ impl TaskContext {
             extensions: self
                 .extensions
                 .iter()
-                .map(|(type_id, value)| (*type_id, value.inherit()))
+                .map(|(type_id, value)| {
+                    let inherited = value.inherit();
+                    assert_eq!(
+                        inherited.as_any().type_id(),
+                        *type_id,
+                        "task-local inheritance changed concrete type"
+                    );
+                    (*type_id, inherited)
+                })
                 .collect(),
         }
     }
@@ -72,6 +86,12 @@ impl TaskContextHandle {
 
     pub fn inherit_for_child(&self) -> Self {
         Self(Rc::new(RefCell::new(self.borrow().inherit_for_child())))
+    }
+}
+
+impl Trace for TaskContextHandle {
+    fn trace(&self, sink: &mut dyn FnMut(GcEdge<'_>)) -> bool {
+        self.0.try_borrow().is_ok_and(|context| context.trace(sink))
     }
 }
 
@@ -138,10 +158,11 @@ mod tests {
     #[test]
     fn task_context_typed_operations_keep_type_ids_separate() {
         let mut context = TaskContext::default();
-        context.insert(Rc::new(Shared {
+        let first = Rc::new(Shared {
             value: Rc::new("shared".into()),
             inherit_calls: Rc::new(Cell::new(0)),
-        }));
+        });
+        assert!(context.insert(Rc::clone(&first)).is_none());
         context.insert(Rc::new(Resettable {
             value: 7,
             inherit_calls: Rc::new(Cell::new(0)),
@@ -149,7 +170,14 @@ mod tests {
 
         assert_eq!(context.get::<Shared>().unwrap().value.as_str(), "shared");
         assert_eq!(context.get::<Resettable>().unwrap().value, 7);
-        assert!(context.remove::<Shared>().is_some());
+        let replacement = Rc::new(Shared {
+            value: Rc::new("replacement".into()),
+            inherit_calls: Rc::new(Cell::new(0)),
+        });
+        let replaced: Rc<Shared> = context.insert(Rc::clone(&replacement)).unwrap();
+        assert!(Rc::ptr_eq(&replaced, &first));
+        let removed: Rc<Shared> = context.remove::<Shared>().unwrap();
+        assert!(Rc::ptr_eq(&removed, &replacement));
         assert!(context.get::<Shared>().is_none());
         assert_eq!(context.get::<Resettable>().unwrap().value, 7);
     }
@@ -260,5 +288,53 @@ mod tests {
         assert!(!context.trace(&mut |_| {}));
         assert_eq!(failure.get(), 1);
         assert!(other.get() <= 1);
+    }
+
+    #[test]
+    fn task_context_handle_trace_returns_false_while_mutably_borrowed() {
+        let calls = Rc::new(Cell::new(0));
+        let handle = TaskContextHandle::default();
+        handle.borrow_mut().insert(Rc::new(CountTrace {
+            calls: Rc::clone(&calls),
+            succeeds: true,
+        }));
+
+        let active_borrow = handle.borrow_mut();
+        assert!(!handle.trace(&mut |_| {}));
+        assert_eq!(calls.get(), 0);
+        drop(active_borrow);
+
+        assert!(handle.trace(&mut |_| {}));
+        assert_eq!(calls.get(), 1);
+    }
+
+    struct WrongInheritance;
+
+    impl Trace for WrongInheritance {
+        fn trace(&self, _sink: &mut dyn FnMut(GcEdge<'_>)) -> bool {
+            true
+        }
+    }
+
+    impl TaskLocalValue for WrongInheritance {
+        fn inherit(&self) -> Rc<dyn TaskLocalValue> {
+            Rc::new(Resettable {
+                value: 0,
+                inherit_calls: Rc::new(Cell::new(0)),
+            })
+        }
+
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "task-local inheritance changed concrete type")]
+    fn task_context_child_rejects_inheritance_type_mismatch() {
+        let mut context = TaskContext::default();
+        context.insert(Rc::new(WrongInheritance));
+
+        let _ = context.inherit_for_child();
     }
 }

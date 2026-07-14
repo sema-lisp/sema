@@ -24,7 +24,103 @@ use super::{
     task::{CancellationRequest, StateName, TaskRecord, TaskTransitionError, WaitKey},
     timer::TimerQueue,
     wait::{CompletionRoute, RegisterExternalError, RuntimeCreateError, WaitRuntime},
+    RootPoll, Runtime, TestPreparedTask,
 };
+
+fn runtime_with_inline_executor(clock: Rc<dyn RuntimeClock>) -> Runtime {
+    Runtime::new(
+        Rc::new(sema_core::EvalContext::new()),
+        clock,
+        Arc::new(FakeExecutor {
+            mode: FakeSubmit::Inline,
+            failure: None,
+        }),
+    )
+    .expect("runtime")
+}
+
+#[test]
+fn runtime_root_handles_poll_canonical_settlement_and_reap_after_final_drop() {
+    let clock = Rc::new(FakeClock::new());
+    let runtime = runtime_with_inline_executor(clock);
+    let handle = runtime
+        .submit_test_root(TestPreparedTask::returned(Value::int(42)))
+        .expect("root admitted");
+    let clone = handle.clone();
+
+    assert!(matches!(handle.poll_result(), RootPoll::Pending));
+    let report = runtime.drive(&drive_budget(8)).expect("drive");
+    assert!(matches!(report, super::DriveState::Progress { .. }));
+    let RootPoll::Ready(first) = handle.poll_result() else {
+        panic!("root should settle");
+    };
+    let RootPoll::Ready(second) = clone.poll_result() else {
+        panic!("clone should observe settlement");
+    };
+    assert!(Rc::ptr_eq(&first, &second));
+    assert_eq!(runtime.task_count(), 0, "settled main task may be reaped");
+    assert_eq!(runtime.root_count(), 1, "live handles retain settled root");
+    drop(handle);
+    runtime.drive(&drive_budget(8)).expect("cleanup turn");
+    assert_eq!(runtime.root_count(), 1);
+    drop(clone);
+    runtime.drive(&drive_budget(8)).expect("final cleanup turn");
+    assert_eq!(runtime.root_count(), 0);
+}
+
+#[test]
+fn runtime_cancel_is_sticky_and_settles_root_once() {
+    let runtime = runtime_with_inline_executor(Rc::new(FakeClock::new()));
+    let handle = runtime
+        .submit_test_root(TestPreparedTask::yield_forever())
+        .expect("root admitted");
+    assert!(handle.cancel(CancelReason::Explicit));
+    assert!(!handle.cancel(CancelReason::Timeout));
+    runtime.drive(&drive_budget(8)).expect("drive cancellation");
+    let RootPoll::Ready(settlement) = handle.poll_result() else {
+        panic!("cancelled root should settle");
+    };
+    assert!(matches!(
+        settlement.outcome,
+        TaskOutcome::Cancelled(CancelReason::Explicit)
+    ));
+}
+
+#[test]
+fn runtime_drop_turns_weak_root_handle_into_runtime_dropped() {
+    let runtime = runtime_with_inline_executor(Rc::new(FakeClock::new()));
+    let handle = runtime
+        .submit_test_root(TestPreparedTask::yield_forever())
+        .expect("root admitted");
+    drop(runtime);
+    assert!(matches!(handle.poll_result(), RootPoll::RuntimeDropped));
+    assert!(!handle.cancel(CancelReason::Explicit));
+}
+
+#[test]
+fn runtime_drive_charges_external_extract_decode_resume_and_apply_stages() {
+    let runtime = runtime_with_inline_executor(Rc::new(FakeClock::new()));
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let handle = runtime
+        .submit_test_root(TestPreparedTask::native(Ok(NativeOutcome::Suspend(
+            external_suspend(Arc::clone(&events)),
+        ))))
+        .expect("root admitted");
+
+    let one = drive_budget(1);
+    for expected_work in 1..=5 {
+        let state = runtime.drive(&one).expect("bounded stage");
+        assert!(matches!(
+            state,
+            super::DriveState::Progress { work_items: 1, .. }
+        ));
+        if expected_work < 5 {
+            assert!(matches!(handle.poll_result(), RootPoll::Pending));
+        }
+    }
+    assert_eq!(*events.lock().unwrap(), vec!["decode", "returned"]);
+    assert!(matches!(handle.poll_result(), RootPoll::Ready(_)));
+}
 
 #[derive(Clone, Copy)]
 enum FakeSubmit {

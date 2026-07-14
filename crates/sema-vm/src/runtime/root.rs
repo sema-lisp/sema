@@ -17,6 +17,8 @@ pub enum RootTransitionError {
 pub struct RootRecord {
     id: RootId,
     state: RootState,
+    handle_count: usize,
+    live_descendants: usize,
 }
 
 impl RootRecord {
@@ -24,6 +26,8 @@ impl RootRecord {
         Self {
             id,
             state: RootState::Running { main_task },
+            handle_count: 1,
+            live_descendants: 1,
         }
     }
 
@@ -33,6 +37,32 @@ impl RootRecord {
 
     pub fn state(&self) -> &RootState {
         &self.state
+    }
+
+    pub fn handle_count(&self) -> usize {
+        self.handle_count
+    }
+
+    pub fn retain_handle(&mut self) -> bool {
+        let Some(count) = self.handle_count.checked_add(1) else {
+            return false;
+        };
+        self.handle_count = count;
+        true
+    }
+
+    pub fn release_handle(&mut self) {
+        self.handle_count = self.handle_count.saturating_sub(1);
+    }
+
+    pub fn release_descendant(&mut self) {
+        self.live_descendants = self.live_descendants.saturating_sub(1);
+    }
+
+    pub fn is_reap_eligible(&self) -> bool {
+        matches!(self.state, RootState::Settled(_))
+            && self.handle_count == 0
+            && self.live_descendants == 0
     }
 
     pub fn settle(

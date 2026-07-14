@@ -23,6 +23,11 @@ pub struct ChannelWake {
     pub result: ChannelResult,
 }
 
+pub enum CancelledChannelWait {
+    Sender(Value),
+    Receiver,
+}
+
 impl Trace for ChannelWake {
     fn trace(&self, sink: &mut dyn FnMut(sema_core::cycle::GcEdge<'_>)) -> bool {
         if let ChannelResult::Received(value) = &self.result {
@@ -186,20 +191,24 @@ impl ChannelRegistry {
     pub fn try_receive(&mut self, id: ChannelId) -> Result<ChannelResult, RegistryError> {
         Ok(self.dequeue(id)?.unwrap_or(ChannelResult::Waiting))
     }
-    pub fn cancel_wait(&mut self, id: ChannelId, key: WaitKey) -> Result<bool, RegistryError> {
+    pub fn cancel_wait(
+        &mut self,
+        id: ChannelId,
+        key: WaitKey,
+    ) -> Result<Option<CancelledChannelWait>, RegistryError> {
         if key.runtime() != self.runtime {
             return Err(RegistryError::WrongRuntime);
         }
         let channel = self.channel_mut(id)?;
         if let Some(i) = channel.senders.iter().position(|w| w.key == key) {
-            channel.senders.remove(i);
-            return Ok(true);
+            let sender = channel.senders.remove(i).expect("located sender exists");
+            return Ok(Some(CancelledChannelWait::Sender(sender.value)));
         }
         if let Some(i) = channel.receivers.iter().position(|w| w.key == key) {
             channel.receivers.remove(i);
-            return Ok(true);
+            return Ok(Some(CancelledChannelWait::Receiver));
         }
-        Ok(false)
+        Ok(None)
     }
     pub fn take_wake(&mut self, key: WaitKey) -> Option<ChannelWake> {
         let index = self.wakes.iter().position(|wake| wake.key == key)?;

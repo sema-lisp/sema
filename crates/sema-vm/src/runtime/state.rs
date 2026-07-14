@@ -1260,12 +1260,25 @@ impl Runtime {
     ) -> Result<(), RuntimeFault> {
         let frame = ContinuationFrame::native(suspend.continuation);
         let mut state = self.state.borrow_mut();
-        let key = state
+        let key = match state
             .waits
             .as_ref()
             .expect("wait runtime installed")
             .issue_internal_wait()
-            .map_err(|_| RuntimeFault::IdExhausted { kind: "wait" })?;
+        {
+            Ok(key) => key,
+            Err(_) => {
+                state.pending.push_back(PendingStage::ApplyRuntimeResponse(
+                    task_id,
+                    owner,
+                    frame,
+                    Err(sema_core::SemaError::eval(
+                        "runtime wait identity exhausted",
+                    )),
+                ));
+                return Ok(());
+            }
+        };
         let result = match suspend.wait {
             WaitKind::Promise(promise) => install_promise_wait(
                 &mut state,
@@ -2032,6 +2045,11 @@ impl Runtime {
     }
 
     #[cfg(test)]
+    pub(super) fn protocol_wait_count_for_test(&self) -> usize {
+        self.state.borrow().protocol_waits.len()
+    }
+
+    #[cfg(test)]
     pub(super) fn force_timer_failure_for_test(&self, kind: &str) {
         let mut state = self.state.borrow_mut();
         match kind {
@@ -2105,27 +2123,34 @@ fn promise_set_response(
     wait: &sema_core::runtime::PromiseSetWait,
 ) -> Result<Option<RuntimeResponse>, RuntimeFault> {
     let mut settled = Vec::with_capacity(wait.promises.len());
+    let mut fail_fast = Vec::new();
     for promise in &wait.promises {
         match promises
             .state(*promise)
             .map_err(|error| RuntimeFault::Invariant {
                 message: format!("registered promise wait became invalid: {error:?}"),
             })? {
-            PromiseState::Pending => {}
-            PromiseState::Returned(value)
-            | PromiseState::Failed(value)
-            | PromiseState::Cancelled(value) => settled.push(value),
+            PromiseState::Pending => settled.push(None),
+            PromiseState::Returned(value) => settled.push(Some(value)),
+            PromiseState::Failed(value) | PromiseState::Cancelled(value) => {
+                fail_fast.push(Rc::clone(&value));
+                settled.push(Some(value));
+            }
         }
     }
-    settled.sort_by_key(|settlement| settlement.sequence);
     Ok(match wait.mode {
         sema_core::runtime::PromiseSetMode::Race => settled
             .into_iter()
-            .next()
+            .flatten()
+            .min_by_key(|settlement| settlement.sequence)
             .map(|settlement| RuntimeResponse::Settlement(Some(settlement))),
-        sema_core::runtime::PromiseSetMode::All if settled.len() == wait.promises.len() => {
-            Some(RuntimeResponse::Settlements(settled))
-        }
+        sema_core::runtime::PromiseSetMode::All if !fail_fast.is_empty() => fail_fast
+            .into_iter()
+            .min_by_key(|settlement| settlement.sequence)
+            .map(|settlement| RuntimeResponse::Settlement(Some(settlement))),
+        sema_core::runtime::PromiseSetMode::All if settled.iter().all(Option::is_some) => Some(
+            RuntimeResponse::Settlements(settled.into_iter().flatten().collect()),
+        ),
         sema_core::runtime::PromiseSetMode::All => None,
         sema_core::runtime::PromiseSetMode::Timeout(_) => None,
     })
@@ -2173,7 +2198,11 @@ fn install_promise_wait(
         return Ok(());
     }
     let mut observed = Vec::new();
+    let mut unique = std::collections::HashSet::new();
     for promise in &wait.promises {
+        if !unique.insert(*promise) {
+            continue;
+        }
         match state.promises.observe(*promise, key, task_id) {
             Ok(true) => observed.push(*promise),
             Ok(false) => {}

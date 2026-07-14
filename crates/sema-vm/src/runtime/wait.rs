@@ -225,6 +225,10 @@ impl WaitRuntime {
     }
 
     pub fn issue_internal_wait(&self) -> Result<WaitKey, sema_core::runtime::IdExhausted> {
+        #[cfg(test)]
+        if self.force_wait_exhaustion {
+            return Err(sema_core::runtime::IdExhausted);
+        }
         self.registrar
             .as_ref()
             .expect("open wait runtime has registrar")

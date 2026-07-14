@@ -29,5 +29,7 @@ pub use wait::{
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+pub(crate) use channel::CancelledChannelWait;
 pub(crate) use channel::{ChannelRegistry, ChannelResult};
 pub(crate) use promise::{PromiseRegistry, PromiseState, RegistryError};

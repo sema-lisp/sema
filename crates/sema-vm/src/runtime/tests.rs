@@ -110,7 +110,59 @@ fn channel_registry_is_fifo_and_cancellation_is_exact() {
     let wake = channels.take_wake(send_key).unwrap();
     assert_eq!(wake.key, send_key);
     assert_eq!(wake.task, TaskId::try_from_raw(1).unwrap());
-    assert!(!channels.cancel_wait(channel, receive_key).unwrap());
+    assert!(channels
+        .cancel_wait(channel, receive_key)
+        .unwrap()
+        .is_none());
+}
+
+#[test]
+fn channel_cancel_wait_surfaces_blocked_sender_value_and_receiver_kind() {
+    use super::{CancelledChannelWait, ChannelRegistry, ChannelResult};
+    let (runtime, issuers) = runtime_issuers();
+    let (_, _, channel_ids) = issuers.into_parts();
+    let mut channels = ChannelRegistry::new(runtime, channel_ids);
+    let channel = channels.allocate(0).unwrap();
+    let waits = WaitRuntime::new(Arc::new(FakeExecutor {
+        mode: FakeSubmit::Inline,
+        failure: None,
+    }))
+    .unwrap();
+
+    // A blocked sender on an unbuffered channel with no receiver.
+    let mut send_key = waits.issue_internal_wait().unwrap();
+    send_key.runtime = runtime;
+    assert_eq!(
+        channels
+            .send(
+                channel,
+                send_key,
+                TaskId::try_from_raw(1).unwrap(),
+                Value::int(7)
+            )
+            .unwrap(),
+        ChannelResult::Waiting
+    );
+    // Cancelling the sender surfaces its unsent value rather than swallowing it.
+    match channels.cancel_wait(channel, send_key).unwrap() {
+        Some(CancelledChannelWait::Sender(value)) => assert_eq!(value, Value::int(7)),
+        Some(CancelledChannelWait::Receiver) => panic!("cancelled a sender, got a receiver"),
+        None => panic!("expected a registered sender wait to cancel"),
+    }
+
+    // A blocked receiver on the now-empty channel is distinguishable from a sender.
+    let mut receive_key = waits.issue_internal_wait().unwrap();
+    receive_key.runtime = runtime;
+    assert_eq!(
+        channels
+            .receive(channel, receive_key, TaskId::try_from_raw(2).unwrap())
+            .unwrap(),
+        ChannelResult::Waiting
+    );
+    assert!(matches!(
+        channels.cancel_wait(channel, receive_key).unwrap(),
+        Some(CancelledChannelWait::Receiver)
+    ));
 }
 
 #[test]
@@ -528,6 +580,22 @@ impl NativeContinuation for CaptureRuntimeContinuation {
     }
 }
 
+struct CaptureFailureContinuation(Rc<Cell<usize>>);
+
+impl Trace for CaptureFailureContinuation {
+    fn trace(&self, _: &mut dyn FnMut(sema_core::cycle::GcEdge<'_>)) -> bool {
+        true
+    }
+}
+
+impl NativeContinuation for CaptureFailureContinuation {
+    fn resume(self: Box<Self>, _: &mut NativeCallContext<'_>, input: ResumeInput) -> NativeResult {
+        assert!(matches!(input, ResumeInput::Failed(_)));
+        self.0.set(self.0.get() + 1);
+        Ok(NativeOutcome::Return(Value::NIL))
+    }
+}
+
 #[test]
 fn runtime_delayed_promise_wait_resumes_with_canonical_settlement() {
     let runtime = runtime_with_inline_executor(Rc::new(FakeClock::new()));
@@ -560,7 +628,7 @@ fn runtime_delayed_promise_wait_resumes_with_canonical_settlement() {
 }
 
 #[test]
-fn runtime_promise_all_orders_canonical_settlements_not_input_order() {
+fn runtime_promise_all_preserves_input_order_after_reverse_settlement() {
     let runtime = runtime_with_inline_executor(Rc::new(FakeClock::new()));
     let first = runtime.create_pending_promise_for_test();
     let second = runtime.create_pending_promise_for_test();
@@ -590,8 +658,108 @@ fn runtime_promise_all_orders_canonical_settlements_not_input_order() {
     let sema_core::runtime::RuntimeResponse::Settlements(settlements) = &captured[0] else {
         panic!("all returns canonical settlements");
     };
-    assert!(Rc::ptr_eq(&settlements[0], &second_settlement));
-    assert!(Rc::ptr_eq(&settlements[1], &first_settlement));
+    assert!(Rc::ptr_eq(&settlements[0], &first_settlement));
+    assert!(Rc::ptr_eq(&settlements[1], &second_settlement));
+}
+
+#[test]
+fn runtime_pending_duplicate_promise_is_valid_for_all_and_race() {
+    for mode in [
+        sema_core::runtime::PromiseSetMode::All,
+        sema_core::runtime::PromiseSetMode::Race,
+    ] {
+        let runtime = runtime_with_inline_executor(Rc::new(FakeClock::new()));
+        let promise = runtime.create_pending_promise_for_test();
+        let responses = Rc::new(RefCell::new(Vec::new()));
+        let handle = runtime
+            .submit_test_root(TestPreparedTask::native(Ok(NativeOutcome::Runtime(
+                sema_core::runtime::RuntimeRequest::PromiseSetWait {
+                    wait: sema_core::runtime::PromiseSetWait {
+                        promises: vec![promise, promise],
+                        mode,
+                    },
+                    continuation: Box::new(CaptureRuntimeContinuation(Rc::clone(&responses))),
+                },
+            ))))
+            .unwrap();
+        runtime.drive(&drive_budget(8)).unwrap();
+        assert!(matches!(handle.poll_result(), RootPoll::Pending));
+        let settlement =
+            runtime.settle_promise_for_test(promise, TaskOutcome::Returned(Value::int(3)));
+        while matches!(handle.poll_result(), RootPoll::Pending) {
+            runtime.drive(&drive_budget(1)).unwrap();
+        }
+        match &responses.borrow()[0] {
+            sema_core::runtime::RuntimeResponse::Settlements(settlements) => {
+                assert_eq!(settlements.len(), 2);
+                assert!(settlements.iter().all(|item| Rc::ptr_eq(item, &settlement)));
+            }
+            sema_core::runtime::RuntimeResponse::Settlement(Some(item)) => {
+                assert!(Rc::ptr_eq(item, &settlement));
+            }
+            response => panic!("unexpected duplicate wait response: {response:?}"),
+        };
+    }
+}
+
+#[test]
+fn runtime_promise_all_fail_fast_leaves_pending_sibling_observable() {
+    for outcome in [
+        TaskOutcome::Failed(SemaError::eval("failed")),
+        TaskOutcome::Cancelled(CancelReason::Explicit),
+    ] {
+        let runtime = runtime_with_inline_executor(Rc::new(FakeClock::new()));
+        let failed = runtime.create_pending_promise_for_test();
+        let pending = runtime.create_pending_promise_for_test();
+        let responses = Rc::new(RefCell::new(Vec::new()));
+        let handle = runtime
+            .submit_test_root(TestPreparedTask::native(Ok(NativeOutcome::Runtime(
+                sema_core::runtime::RuntimeRequest::PromiseSetWait {
+                    wait: sema_core::runtime::PromiseSetWait {
+                        promises: vec![pending, failed],
+                        mode: sema_core::runtime::PromiseSetMode::All,
+                    },
+                    continuation: Box::new(CaptureRuntimeContinuation(Rc::clone(&responses))),
+                },
+            ))))
+            .unwrap();
+        runtime.drive(&drive_budget(8)).unwrap();
+        let terminal = runtime.settle_promise_for_test(failed, outcome);
+        while matches!(handle.poll_result(), RootPoll::Pending) {
+            runtime.drive(&drive_budget(1)).unwrap();
+        }
+        let sema_core::runtime::RuntimeResponse::Settlement(Some(observed)) =
+            &responses.borrow()[0]
+        else {
+            panic!("all fail-fast returns terminal settlement");
+        };
+        assert!(Rc::ptr_eq(observed, &terminal));
+        runtime.settle_promise_for_test(pending, TaskOutcome::Returned(Value::int(9)));
+    }
+}
+
+#[test]
+fn protocol_internal_wait_exhaustion_fails_through_continuation() {
+    let runtime = runtime_with_inline_executor(Rc::new(FakeClock::new()));
+    let promise = runtime.create_pending_promise_for_test();
+    let resumes = Rc::new(Cell::new(0));
+    runtime.force_completion_identity_exhaustion_for_test("wait");
+    let handle = runtime
+        .submit_test_root(TestPreparedTask::native(Ok(NativeOutcome::Runtime(
+            sema_core::runtime::RuntimeRequest::PromiseSetWait {
+                wait: sema_core::runtime::PromiseSetWait {
+                    promises: vec![promise],
+                    mode: sema_core::runtime::PromiseSetMode::Race,
+                },
+                continuation: Box::new(CaptureFailureContinuation(Rc::clone(&resumes))),
+            },
+        ))))
+        .unwrap();
+    while matches!(handle.poll_result(), RootPoll::Pending) {
+        runtime.drive(&drive_budget(1)).unwrap();
+    }
+    assert_eq!(resumes.get(), 1);
+    assert_eq!(runtime.protocol_wait_count_for_test(), 0);
 }
 
 #[test]

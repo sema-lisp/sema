@@ -21,7 +21,9 @@ fn duration_ms(value: &Value, who: &str) -> Result<i64, SemaError> {
         Ok(i)
     } else if let Some(f) = value.as_float() {
         if !f.is_finite() {
-            return Err(SemaError::eval(format!("{who}: duration must be a finite number")));
+            return Err(SemaError::eval(format!(
+                "{who}: duration must be a finite number"
+            )));
         }
         Ok(f.round() as i64)
     } else {

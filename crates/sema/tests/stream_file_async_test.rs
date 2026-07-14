@@ -478,10 +478,20 @@ fn closure_with_upvalue_passed_as_data_into_async_task_survives() {
             (run-thunk (fn () tmp))                ; captured string upvalue
             (run-thunk (fn () (+ n 1))))))         ; captured int upvalue
     "#;
-    let result = interp.eval_str_compiled(program).expect("program evaluated");
+    let result = interp
+        .eval_str_compiled(program)
+        .expect("program evaluated");
     let items = result.as_list().expect("async/all list");
-    assert_eq!(items[0].as_str(), Some("SCRATCH"), "string upvalue survived escape into task");
-    assert_eq!(items[1].as_int(), Some(42), "int upvalue survived escape into task");
+    assert_eq!(
+        items[0].as_str(),
+        Some("SCRATCH"),
+        "string upvalue survived escape into task"
+    );
+    assert_eq!(
+        items[1].as_int(),
+        Some(42),
+        "int upvalue survived escape into task"
+    );
 }
 
 /// Regression: a CYCLIC closure graph (a→b→n, passed into a task) must snapshot
@@ -497,6 +507,8 @@ fn cyclic_closures_passed_into_async_task_terminate() {
                    (b (fn () (str "b" n))))
             (async/all (list (run-thunk a)))))
     "#;
-    let result = interp.eval_str_compiled(program).expect("cyclic-closure program evaluated");
+    let result = interp
+        .eval_str_compiled(program)
+        .expect("cyclic-closure program evaluated");
     assert_eq!(result.as_list().unwrap()[0].as_str(), Some("ab7"));
 }

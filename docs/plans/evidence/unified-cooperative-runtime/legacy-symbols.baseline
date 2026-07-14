@@ -321,44 +321,44 @@ crates/sema-stdlib/src/archive.rs:667:                sema_core::IoPoll::Ready(E
 crates/sema-stdlib/src/archive.rs:668:                sema_core::IoPoll::Pending => {
 crates/sema-stdlib/src/archive.rs:673:                    std::thread::sleep(Duration::from_millis(2));
 crates/sema-stdlib/src/async_ops.rs:10:    SemaError, Value, ValueView, YieldReason,
-crates/sema-stdlib/src/async_ops.rs:126:        call_spawn_callback(ctx, args[0].clone())
-crates/sema-stdlib/src/async_ops.rs:135:        if let Some(val) = take_resume_value() {
-crates/sema-stdlib/src/async_ops.rs:151:        if in_async_context() {
-crates/sema-stdlib/src/async_ops.rs:152:            set_yield_signal(YieldReason::AwaitPromise(promise));
-crates/sema-stdlib/src/async_ops.rs:157:        if call_run_scheduler(ctx, Some(promise.clone()))? == SchedulerRunResult::DebugPaused {
-crates/sema-stdlib/src/async_ops.rs:162:            // native re-runs on resume via `take_resume_value` above.
-crates/sema-stdlib/src/async_ops.rs:164:                SchedulerTarget::One(promise.clone()),
-crates/sema-stdlib/src/async_ops.rs:167:            set_yield_signal(YieldReason::AwaitPromise(promise));
-crates/sema-stdlib/src/async_ops.rs:184:        if call_run_scheduler(ctx, None)? == SchedulerRunResult::DebugPaused {
-crates/sema-stdlib/src/async_ops.rs:185:            set_debug_coop_resume(SchedulerTarget::All, DebugCoopResume::Run);
-crates/sema-stdlib/src/async_ops.rs:188:            // surrogate. `run_cooperative` re-drives `SchedulerTarget::All`.
-crates/sema-stdlib/src/async_ops.rs:189:            set_yield_signal(YieldReason::Sleep(0));
-crates/sema-stdlib/src/async_ops.rs:259:        let transitioned = sema_core::call_cancel_callback(task_id)?;
-crates/sema-stdlib/src/async_ops.rs:287:        if call_run_scheduler_all_of(ctx, promises.clone())? == SchedulerRunResult::DebugPaused {
-crates/sema-stdlib/src/async_ops.rs:291:                SchedulerTarget::AllOf(promises.clone()),
-crates/sema-stdlib/src/async_ops.rs:300:            set_yield_signal(YieldReason::AwaitPromise(pending));
-crates/sema-stdlib/src/async_ops.rs:359:        if call_run_scheduler_any_of(ctx, promises.clone())? == SchedulerRunResult::DebugPaused {
-crates/sema-stdlib/src/async_ops.rs:361:                SchedulerTarget::AnyOf(promises.clone()),
-crates/sema-stdlib/src/async_ops.rs:369:            set_yield_signal(YieldReason::AwaitPromise(pending));
-crates/sema-stdlib/src/async_ops.rs:426:        match call_run_scheduler_timeout(ctx, promise.clone(), ms as u64)? {
-crates/sema-stdlib/src/async_ops.rs:427:            SchedulerRunResult::TimedOut => {
-crates/sema-stdlib/src/async_ops.rs:430:            SchedulerRunResult::DebugPaused => {
-crates/sema-stdlib/src/async_ops.rs:433:                    SchedulerTarget::One(promise.clone()),
-crates/sema-stdlib/src/async_ops.rs:436:                set_yield_signal(YieldReason::AwaitPromise(promise));
-crates/sema-stdlib/src/async_ops.rs:439:            SchedulerRunResult::Complete => {}
-crates/sema-stdlib/src/async_ops.rs:475:        // that whole delta in one `thread::sleep`; without a bound an
-crates/sema-stdlib/src/async_ops.rs:485:        if in_async_context() {
-crates/sema-stdlib/src/async_ops.rs:486:            if let Some(cached) = take_resume_value() {
-crates/sema-stdlib/src/async_ops.rs:489:            set_yield_signal(YieldReason::Sleep(ms as u64));
-crates/sema-stdlib/src/async_ops.rs:494:        std::thread::sleep(std::time::Duration::from_millis(ms as u64));
-crates/sema-stdlib/src/async_ops.rs:533:        if in_async_context() {
-crates/sema-stdlib/src/async_ops.rs:534:            if let Some(cached) = take_resume_value() {
-crates/sema-stdlib/src/async_ops.rs:541:            if in_async_context() {
-crates/sema-stdlib/src/async_ops.rs:542:                set_yield_signal(YieldReason::ChannelSend(ch, args[1].clone()));
-crates/sema-stdlib/src/async_ops.rs:559:        if in_async_context() {
-crates/sema-stdlib/src/async_ops.rs:560:            if let Some(cached) = take_resume_value() {
-crates/sema-stdlib/src/async_ops.rs:572:        if in_async_context() {
-crates/sema-stdlib/src/async_ops.rs:573:            set_yield_signal(YieldReason::ChannelRecv(ch));
+crates/sema-stdlib/src/async_ops.rs:128:        call_spawn_callback(ctx, args[0].clone())
+crates/sema-stdlib/src/async_ops.rs:137:        if let Some(val) = take_resume_value() {
+crates/sema-stdlib/src/async_ops.rs:153:        if in_async_context() {
+crates/sema-stdlib/src/async_ops.rs:154:            set_yield_signal(YieldReason::AwaitPromise(promise));
+crates/sema-stdlib/src/async_ops.rs:159:        if call_run_scheduler(ctx, Some(promise.clone()))? == SchedulerRunResult::DebugPaused {
+crates/sema-stdlib/src/async_ops.rs:164:            // native re-runs on resume via `take_resume_value` above.
+crates/sema-stdlib/src/async_ops.rs:166:                SchedulerTarget::One(promise.clone()),
+crates/sema-stdlib/src/async_ops.rs:169:            set_yield_signal(YieldReason::AwaitPromise(promise));
+crates/sema-stdlib/src/async_ops.rs:186:        if call_run_scheduler(ctx, None)? == SchedulerRunResult::DebugPaused {
+crates/sema-stdlib/src/async_ops.rs:187:            set_debug_coop_resume(SchedulerTarget::All, DebugCoopResume::Run);
+crates/sema-stdlib/src/async_ops.rs:190:            // surrogate. `run_cooperative` re-drives `SchedulerTarget::All`.
+crates/sema-stdlib/src/async_ops.rs:191:            set_yield_signal(YieldReason::Sleep(0));
+crates/sema-stdlib/src/async_ops.rs:261:        let transitioned = sema_core::call_cancel_callback(task_id)?;
+crates/sema-stdlib/src/async_ops.rs:289:        if call_run_scheduler_all_of(ctx, promises.clone())? == SchedulerRunResult::DebugPaused {
+crates/sema-stdlib/src/async_ops.rs:293:                SchedulerTarget::AllOf(promises.clone()),
+crates/sema-stdlib/src/async_ops.rs:302:            set_yield_signal(YieldReason::AwaitPromise(pending));
+crates/sema-stdlib/src/async_ops.rs:361:        if call_run_scheduler_any_of(ctx, promises.clone())? == SchedulerRunResult::DebugPaused {
+crates/sema-stdlib/src/async_ops.rs:363:                SchedulerTarget::AnyOf(promises.clone()),
+crates/sema-stdlib/src/async_ops.rs:371:            set_yield_signal(YieldReason::AwaitPromise(pending));
+crates/sema-stdlib/src/async_ops.rs:428:        match call_run_scheduler_timeout(ctx, promise.clone(), ms as u64)? {
+crates/sema-stdlib/src/async_ops.rs:429:            SchedulerRunResult::TimedOut => {
+crates/sema-stdlib/src/async_ops.rs:432:            SchedulerRunResult::DebugPaused => {
+crates/sema-stdlib/src/async_ops.rs:435:                    SchedulerTarget::One(promise.clone()),
+crates/sema-stdlib/src/async_ops.rs:438:                set_yield_signal(YieldReason::AwaitPromise(promise));
+crates/sema-stdlib/src/async_ops.rs:441:            SchedulerRunResult::Complete => {}
+crates/sema-stdlib/src/async_ops.rs:477:        // that whole delta in one `thread::sleep`; without a bound an
+crates/sema-stdlib/src/async_ops.rs:487:        if in_async_context() {
+crates/sema-stdlib/src/async_ops.rs:488:            if let Some(cached) = take_resume_value() {
+crates/sema-stdlib/src/async_ops.rs:491:            set_yield_signal(YieldReason::Sleep(ms as u64));
+crates/sema-stdlib/src/async_ops.rs:496:        std::thread::sleep(std::time::Duration::from_millis(ms as u64));
+crates/sema-stdlib/src/async_ops.rs:535:        if in_async_context() {
+crates/sema-stdlib/src/async_ops.rs:536:            if let Some(cached) = take_resume_value() {
+crates/sema-stdlib/src/async_ops.rs:543:            if in_async_context() {
+crates/sema-stdlib/src/async_ops.rs:544:                set_yield_signal(YieldReason::ChannelSend(ch, args[1].clone()));
+crates/sema-stdlib/src/async_ops.rs:561:        if in_async_context() {
+crates/sema-stdlib/src/async_ops.rs:562:            if let Some(cached) = take_resume_value() {
+crates/sema-stdlib/src/async_ops.rs:574:        if in_async_context() {
+crates/sema-stdlib/src/async_ops.rs:575:            set_yield_signal(YieldReason::ChannelRecv(ch));
 crates/sema-stdlib/src/async_ops.rs:6:    call_run_scheduler, call_run_scheduler_all_of, call_run_scheduler_any_of,
 crates/sema-stdlib/src/async_ops.rs:7:    call_run_scheduler_timeout, call_spawn_callback, check_arity, in_async_context,
 crates/sema-stdlib/src/async_ops.rs:8:    set_debug_coop_resume, set_yield_signal, take_resume_value, AsyncPromise, Channel,

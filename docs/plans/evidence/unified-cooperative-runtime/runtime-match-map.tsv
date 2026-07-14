@@ -414,118 +414,118 @@ R02	crates/sema-stdlib/src/archive.rs:667:                sema_core::IoPoll::Rea
 R02	crates/sema-stdlib/src/archive.rs:668:                sema_core::IoPoll::Pending => {
 R02	crates/sema-stdlib/src/archive.rs:673:                    std::thread::sleep(Duration::from_millis(2));
 R01A	crates/sema-stdlib/src/async_ops.rs:10:    SemaError, Value, ValueView, YieldReason,
-R01D	crates/sema-stdlib/src/async_ops.rs:123:    // async/spawn — spawn a thunk as an async task, returns a promise
-R01D	crates/sema-stdlib/src/async_ops.rs:124:    register_fn_ctx(env, "async/spawn", |ctx, args| {
-R01D	crates/sema-stdlib/src/async_ops.rs:125:        check_arity!(args, "async/spawn", 1);
-R01D	crates/sema-stdlib/src/async_ops.rs:126:        call_spawn_callback(ctx, args[0].clone())
-R01A	crates/sema-stdlib/src/async_ops.rs:129:    // async/await — wait for a promise to resolve
-R01A	crates/sema-stdlib/src/async_ops.rs:130:    register_fn_ctx(env, "async/await", |ctx, args| {
-R01A	crates/sema-stdlib/src/async_ops.rs:131:        check_arity!(args, "async/await", 1);
-R01A	crates/sema-stdlib/src/async_ops.rs:132:        let promise = expect_promise(args, "async/await", 0)?;
-R01A	crates/sema-stdlib/src/async_ops.rs:135:        if let Some(val) = take_resume_value() {
-R01A	crates/sema-stdlib/src/async_ops.rs:151:        if in_async_context() {
-R01A	crates/sema-stdlib/src/async_ops.rs:152:            set_yield_signal(YieldReason::AwaitPromise(promise));
-R01A	crates/sema-stdlib/src/async_ops.rs:157:        if call_run_scheduler(ctx, Some(promise.clone()))? == SchedulerRunResult::DebugPaused {
+R01D	crates/sema-stdlib/src/async_ops.rs:125:    // async/spawn — spawn a thunk as an async task, returns a promise
+R01D	crates/sema-stdlib/src/async_ops.rs:126:    register_fn_ctx(env, "async/spawn", |ctx, args| {
+R01D	crates/sema-stdlib/src/async_ops.rs:127:        check_arity!(args, "async/spawn", 1);
+R01D	crates/sema-stdlib/src/async_ops.rs:128:        call_spawn_callback(ctx, args[0].clone())
+R01A	crates/sema-stdlib/src/async_ops.rs:131:    // async/await — wait for a promise to resolve
+R01A	crates/sema-stdlib/src/async_ops.rs:132:    register_fn_ctx(env, "async/await", |ctx, args| {
+R01A	crates/sema-stdlib/src/async_ops.rs:133:        check_arity!(args, "async/await", 1);
+R01A	crates/sema-stdlib/src/async_ops.rs:134:        let promise = expect_promise(args, "async/await", 0)?;
+R01A	crates/sema-stdlib/src/async_ops.rs:137:        if let Some(val) = take_resume_value() {
+R01A	crates/sema-stdlib/src/async_ops.rs:153:        if in_async_context() {
+R01A	crates/sema-stdlib/src/async_ops.rs:154:            set_yield_signal(YieldReason::AwaitPromise(promise));
+R01A	crates/sema-stdlib/src/async_ops.rs:159:        if call_run_scheduler(ctx, Some(promise.clone()))? == SchedulerRunResult::DebugPaused {
 R01B	crates/sema-stdlib/src/async_ops.rs:15:/// Parse a duration-in-milliseconds argument for `async/sleep` / `async/timeout`.
-R01A	crates/sema-stdlib/src/async_ops.rs:162:            // native re-runs on resume via `take_resume_value` above.
-R01A	crates/sema-stdlib/src/async_ops.rs:164:                SchedulerTarget::One(promise.clone()),
-R01A	crates/sema-stdlib/src/async_ops.rs:167:            set_yield_signal(YieldReason::AwaitPromise(promise));
-R01A	crates/sema-stdlib/src/async_ops.rs:176:                "async/await: still pending after scheduler run",
-R01D	crates/sema-stdlib/src/async_ops.rs:181:    // async/run — run all pending tasks to completion
-R01D	crates/sema-stdlib/src/async_ops.rs:182:    register_fn_ctx(env, "async/run", |ctx, args| {
-R01D	crates/sema-stdlib/src/async_ops.rs:183:        check_arity!(args, "async/run", 0);
-R01D	crates/sema-stdlib/src/async_ops.rs:184:        if call_run_scheduler(ctx, None)? == SchedulerRunResult::DebugPaused {
-R01D	crates/sema-stdlib/src/async_ops.rs:185:            set_debug_coop_resume(SchedulerTarget::All, DebugCoopResume::Run);
-R01D	crates/sema-stdlib/src/async_ops.rs:188:            // surrogate. `run_cooperative` re-drives `SchedulerTarget::All`.
-R01D	crates/sema-stdlib/src/async_ops.rs:189:            set_yield_signal(YieldReason::Sleep(0));
-R01D	crates/sema-stdlib/src/async_ops.rs:244:    // async/cancel — request cancellation of a spawned async task.
-R01D	crates/sema-stdlib/src/async_ops.rs:250:    register_fn(env, "async/cancel", |args| {
-R01D	crates/sema-stdlib/src/async_ops.rs:251:        check_arity!(args, "async/cancel", 1);
-R01D	crates/sema-stdlib/src/async_ops.rs:252:        let promise = expect_promise(args, "async/cancel", 0)?;
-R01D	crates/sema-stdlib/src/async_ops.rs:259:        let transitioned = sema_core::call_cancel_callback(task_id)?;
-R01D	crates/sema-stdlib/src/async_ops.rs:263:    // async/cancelled? — true exactly when the promise is in the Cancelled state.
-R01D	crates/sema-stdlib/src/async_ops.rs:268:    register_fn(env, "async/cancelled?", |args| {
-R01D	crates/sema-stdlib/src/async_ops.rs:269:        check_arity!(args, "async/cancelled?", 1);
-R01D	crates/sema-stdlib/src/async_ops.rs:270:        let promise = expect_promise(args, "async/cancelled?", 0)?;
-R01A	crates/sema-stdlib/src/async_ops.rs:275:    // async/all — run scheduler and collect results from all promises
-R01A	crates/sema-stdlib/src/async_ops.rs:276:    register_fn_ctx(env, "async/all", |ctx, args| {
-R01A	crates/sema-stdlib/src/async_ops.rs:277:        check_arity!(args, "async/all", 1);
-R01A	crates/sema-stdlib/src/async_ops.rs:278:        let items = expect_list_or_vector(&args[0], "async/all")?;
-R01A	crates/sema-stdlib/src/async_ops.rs:282:            .map(|item| expect_promise(std::slice::from_ref(item), "async/all", 0))
-R01A	crates/sema-stdlib/src/async_ops.rs:287:        if call_run_scheduler_all_of(ctx, promises.clone())? == SchedulerRunResult::DebugPaused {
-R01A	crates/sema-stdlib/src/async_ops.rs:291:                SchedulerTarget::AllOf(promises.clone()),
-R01A	crates/sema-stdlib/src/async_ops.rs:300:            set_yield_signal(YieldReason::AwaitPromise(pending));
-R01A	crates/sema-stdlib/src/async_ops.rs:312:                return Err(SemaError::eval(format!("async/all: task rejected: {e}")));
-R01A	crates/sema-stdlib/src/async_ops.rs:317:                return Err(SemaError::eval("async/all: task was cancelled"));
-R01A	crates/sema-stdlib/src/async_ops.rs:328:                    return Err(SemaError::eval("async/all: task still pending"))
-R01A	crates/sema-stdlib/src/async_ops.rs:32:/// Format a normal task rejection as an `async/await` error, stripping
-R01A	crates/sema-stdlib/src/async_ops.rs:335:    // async/race — run scheduler and return the first resolved promise's value
-R01A	crates/sema-stdlib/src/async_ops.rs:336:    register_fn_ctx(env, "async/race", |ctx, args| {
-R01A	crates/sema-stdlib/src/async_ops.rs:337:        check_arity!(args, "async/race", 1);
-R01A	crates/sema-stdlib/src/async_ops.rs:338:        let items = expect_list_or_vector(&args[0], "async/race")?;
-R01A	crates/sema-stdlib/src/async_ops.rs:33:/// any already-present `async/await: task rejected:` prefix so that
-R01A	crates/sema-stdlib/src/async_ops.rs:341:            return Err(SemaError::eval("async/race: requires at least one promise"));
-R01A	crates/sema-stdlib/src/async_ops.rs:347:            .map(|item| expect_promise(std::slice::from_ref(item), "async/race", 0))
-R01A	crates/sema-stdlib/src/async_ops.rs:359:        if call_run_scheduler_any_of(ctx, promises.clone())? == SchedulerRunResult::DebugPaused {
-R01A	crates/sema-stdlib/src/async_ops.rs:361:                SchedulerTarget::AnyOf(promises.clone()),
-R01A	crates/sema-stdlib/src/async_ops.rs:369:            set_yield_signal(YieldReason::AwaitPromise(pending));
-R01A	crates/sema-stdlib/src/async_ops.rs:37:        .strip_prefix("Eval error: async/await: task rejected: ")
-R01A	crates/sema-stdlib/src/async_ops.rs:383:                return Err(SemaError::eval(format!("async/race: task rejected: {e}")));
-R01A	crates/sema-stdlib/src/async_ops.rs:387:        Err(SemaError::eval("async/race: no promise resolved"))
-R01A	crates/sema-stdlib/src/async_ops.rs:38:        .or_else(|| e.strip_prefix("async/await: task rejected: "))
-R01B	crates/sema-stdlib/src/async_ops.rs:390:    // async/timeout — race a promise against a deadline
-R01B	crates/sema-stdlib/src/async_ops.rs:391:    register_fn_ctx(env, "async/timeout", |ctx, args| {
-R01B	crates/sema-stdlib/src/async_ops.rs:392:        check_arity!(args, "async/timeout", 2);
-R01B	crates/sema-stdlib/src/async_ops.rs:393:        let ms = duration_ms(&args[0], "async/timeout")?;
-R01B	crates/sema-stdlib/src/async_ops.rs:396:                "async/timeout: duration must be non-negative",
-R01B	crates/sema-stdlib/src/async_ops.rs:402:                "async/timeout: duration {ms} ms exceeds maximum {MAX_TIMEOUT_MS} ms (1 day)"
-R01B	crates/sema-stdlib/src/async_ops.rs:406:        let promise = expect_promise(args, "async/timeout", 1)?;
-R01A	crates/sema-stdlib/src/async_ops.rs:40:    SemaError::eval(format!("async/await: task rejected: {core}"))
-R01B	crates/sema-stdlib/src/async_ops.rs:415:                        "async/timeout: task rejected: {e}"
-R01B	crates/sema-stdlib/src/async_ops.rs:419:                    return Err(SemaError::eval("async/timeout: task was cancelled"))
-R01B	crates/sema-stdlib/src/async_ops.rs:426:        match call_run_scheduler_timeout(ctx, promise.clone(), ms as u64)? {
-R01B	crates/sema-stdlib/src/async_ops.rs:427:            SchedulerRunResult::TimedOut => {
-R01B	crates/sema-stdlib/src/async_ops.rs:428:                return Err(SemaError::eval("async/timeout: operation timed out"));
-R01B	crates/sema-stdlib/src/async_ops.rs:430:            SchedulerRunResult::DebugPaused => {
-R01B	crates/sema-stdlib/src/async_ops.rs:433:                    SchedulerTarget::One(promise.clone()),
-R01B	crates/sema-stdlib/src/async_ops.rs:436:                set_yield_signal(YieldReason::AwaitPromise(promise));
-R01B	crates/sema-stdlib/src/async_ops.rs:439:            SchedulerRunResult::Complete => {}
-R01B	crates/sema-stdlib/src/async_ops.rs:449:                        "async/timeout: task rejected: {e}"
-R01B	crates/sema-stdlib/src/async_ops.rs:453:                    return Err(SemaError::eval("async/timeout: task was cancelled"))
-R01B	crates/sema-stdlib/src/async_ops.rs:460:            "async/timeout: operation is still pending after scheduler run",
-R01B	crates/sema-stdlib/src/async_ops.rs:464:    // async/sleep — yield for a duration in milliseconds
-R01B	crates/sema-stdlib/src/async_ops.rs:465:    register_fn(env, "async/sleep", |args| {
-R01B	crates/sema-stdlib/src/async_ops.rs:466:        check_arity!(args, "async/sleep", 1);
-R01B	crates/sema-stdlib/src/async_ops.rs:467:        let ms = duration_ms(&args[0], "async/sleep")?;
-R01B	crates/sema-stdlib/src/async_ops.rs:470:                "async/sleep: duration must be non-negative",
-R01B	crates/sema-stdlib/src/async_ops.rs:473:        // Cap the duration (mirrors async/timeout). The scheduler's virtual
-R01B	crates/sema-stdlib/src/async_ops.rs:475:        // that whole delta in one `thread::sleep`; without a bound an
-R01A	crates/sema-stdlib/src/async_ops.rs:47:    SemaError::eval("async/await: task was cancelled")
-R01B	crates/sema-stdlib/src/async_ops.rs:481:                "async/sleep: duration {ms} ms exceeds maximum {MAX_SLEEP_MS} ms (1 day)"
-R01B	crates/sema-stdlib/src/async_ops.rs:485:        if in_async_context() {
-R01B	crates/sema-stdlib/src/async_ops.rs:486:            if let Some(cached) = take_resume_value() {
-R01B	crates/sema-stdlib/src/async_ops.rs:489:            set_yield_signal(YieldReason::Sleep(ms as u64));
-R01A	crates/sema-stdlib/src/async_ops.rs:48:        .with_hint("the task was cancelled via async/cancel before it produced a value")
-R01B	crates/sema-stdlib/src/async_ops.rs:494:        std::thread::sleep(std::time::Duration::from_millis(ms as u64));
-R01C	crates/sema-stdlib/src/async_ops.rs:523:    // channel/send — send a value to a channel (yields if full in async context)
-R01C	crates/sema-stdlib/src/async_ops.rs:524:    register_fn(env, "channel/send", |args| {
-R01C	crates/sema-stdlib/src/async_ops.rs:525:        check_arity!(args, "channel/send", 2);
-R01C	crates/sema-stdlib/src/async_ops.rs:526:        let ch = expect_channel(args, "channel/send", 0)?;
-R01C	crates/sema-stdlib/src/async_ops.rs:529:                "channel/send: channel is closed; value {} was dropped",
-R01C	crates/sema-stdlib/src/async_ops.rs:533:        if in_async_context() {
-R01C	crates/sema-stdlib/src/async_ops.rs:534:            if let Some(cached) = take_resume_value() {
-R01C	crates/sema-stdlib/src/async_ops.rs:541:            if in_async_context() {
-R01C	crates/sema-stdlib/src/async_ops.rs:542:                set_yield_signal(YieldReason::ChannelSend(ch, args[1].clone()));
-R01C	crates/sema-stdlib/src/async_ops.rs:546:                SemaError::eval("channel/send: channel is full").with_hint(
-R01C	crates/sema-stdlib/src/async_ops.rs:555:    // channel/recv — receive a value from a channel (yields if empty in async context)
-R01C	crates/sema-stdlib/src/async_ops.rs:556:    register_fn(env, "channel/recv", |args| {
-R01C	crates/sema-stdlib/src/async_ops.rs:557:        check_arity!(args, "channel/recv", 1);
-R01C	crates/sema-stdlib/src/async_ops.rs:558:        let ch = expect_channel(args, "channel/recv", 0)?;
-R01C	crates/sema-stdlib/src/async_ops.rs:559:        if in_async_context() {
-R01C	crates/sema-stdlib/src/async_ops.rs:560:            if let Some(cached) = take_resume_value() {
-R01C	crates/sema-stdlib/src/async_ops.rs:572:        if in_async_context() {
-R01C	crates/sema-stdlib/src/async_ops.rs:573:            set_yield_signal(YieldReason::ChannelRecv(ch));
-R01C	crates/sema-stdlib/src/async_ops.rs:576:        Err(SemaError::eval("channel/recv: channel is empty"))
+R01A	crates/sema-stdlib/src/async_ops.rs:164:            // native re-runs on resume via `take_resume_value` above.
+R01A	crates/sema-stdlib/src/async_ops.rs:166:                SchedulerTarget::One(promise.clone()),
+R01A	crates/sema-stdlib/src/async_ops.rs:169:            set_yield_signal(YieldReason::AwaitPromise(promise));
+R01A	crates/sema-stdlib/src/async_ops.rs:178:                "async/await: still pending after scheduler run",
+R01D	crates/sema-stdlib/src/async_ops.rs:183:    // async/run — run all pending tasks to completion
+R01D	crates/sema-stdlib/src/async_ops.rs:184:    register_fn_ctx(env, "async/run", |ctx, args| {
+R01D	crates/sema-stdlib/src/async_ops.rs:185:        check_arity!(args, "async/run", 0);
+R01D	crates/sema-stdlib/src/async_ops.rs:186:        if call_run_scheduler(ctx, None)? == SchedulerRunResult::DebugPaused {
+R01D	crates/sema-stdlib/src/async_ops.rs:187:            set_debug_coop_resume(SchedulerTarget::All, DebugCoopResume::Run);
+R01D	crates/sema-stdlib/src/async_ops.rs:190:            // surrogate. `run_cooperative` re-drives `SchedulerTarget::All`.
+R01D	crates/sema-stdlib/src/async_ops.rs:191:            set_yield_signal(YieldReason::Sleep(0));
+R01D	crates/sema-stdlib/src/async_ops.rs:246:    // async/cancel — request cancellation of a spawned async task.
+R01D	crates/sema-stdlib/src/async_ops.rs:252:    register_fn(env, "async/cancel", |args| {
+R01D	crates/sema-stdlib/src/async_ops.rs:253:        check_arity!(args, "async/cancel", 1);
+R01D	crates/sema-stdlib/src/async_ops.rs:254:        let promise = expect_promise(args, "async/cancel", 0)?;
+R01D	crates/sema-stdlib/src/async_ops.rs:261:        let transitioned = sema_core::call_cancel_callback(task_id)?;
+R01D	crates/sema-stdlib/src/async_ops.rs:265:    // async/cancelled? — true exactly when the promise is in the Cancelled state.
+R01D	crates/sema-stdlib/src/async_ops.rs:270:    register_fn(env, "async/cancelled?", |args| {
+R01D	crates/sema-stdlib/src/async_ops.rs:271:        check_arity!(args, "async/cancelled?", 1);
+R01D	crates/sema-stdlib/src/async_ops.rs:272:        let promise = expect_promise(args, "async/cancelled?", 0)?;
+R01A	crates/sema-stdlib/src/async_ops.rs:277:    // async/all — run scheduler and collect results from all promises
+R01A	crates/sema-stdlib/src/async_ops.rs:278:    register_fn_ctx(env, "async/all", |ctx, args| {
+R01A	crates/sema-stdlib/src/async_ops.rs:279:        check_arity!(args, "async/all", 1);
+R01A	crates/sema-stdlib/src/async_ops.rs:280:        let items = expect_list_or_vector(&args[0], "async/all")?;
+R01A	crates/sema-stdlib/src/async_ops.rs:284:            .map(|item| expect_promise(std::slice::from_ref(item), "async/all", 0))
+R01A	crates/sema-stdlib/src/async_ops.rs:289:        if call_run_scheduler_all_of(ctx, promises.clone())? == SchedulerRunResult::DebugPaused {
+R01A	crates/sema-stdlib/src/async_ops.rs:293:                SchedulerTarget::AllOf(promises.clone()),
+R01A	crates/sema-stdlib/src/async_ops.rs:302:            set_yield_signal(YieldReason::AwaitPromise(pending));
+R01A	crates/sema-stdlib/src/async_ops.rs:314:                return Err(SemaError::eval(format!("async/all: task rejected: {e}")));
+R01A	crates/sema-stdlib/src/async_ops.rs:319:                return Err(SemaError::eval("async/all: task was cancelled"));
+R01A	crates/sema-stdlib/src/async_ops.rs:330:                    return Err(SemaError::eval("async/all: task still pending"))
+R01A	crates/sema-stdlib/src/async_ops.rs:337:    // async/race — run scheduler and return the first resolved promise's value
+R01A	crates/sema-stdlib/src/async_ops.rs:338:    register_fn_ctx(env, "async/race", |ctx, args| {
+R01A	crates/sema-stdlib/src/async_ops.rs:339:        check_arity!(args, "async/race", 1);
+R01A	crates/sema-stdlib/src/async_ops.rs:340:        let items = expect_list_or_vector(&args[0], "async/race")?;
+R01A	crates/sema-stdlib/src/async_ops.rs:343:            return Err(SemaError::eval("async/race: requires at least one promise"));
+R01A	crates/sema-stdlib/src/async_ops.rs:349:            .map(|item| expect_promise(std::slice::from_ref(item), "async/race", 0))
+R01A	crates/sema-stdlib/src/async_ops.rs:34:/// Format a normal task rejection as an `async/await` error, stripping
+R01A	crates/sema-stdlib/src/async_ops.rs:35:/// any already-present `async/await: task rejected:` prefix so that
+R01A	crates/sema-stdlib/src/async_ops.rs:361:        if call_run_scheduler_any_of(ctx, promises.clone())? == SchedulerRunResult::DebugPaused {
+R01A	crates/sema-stdlib/src/async_ops.rs:363:                SchedulerTarget::AnyOf(promises.clone()),
+R01A	crates/sema-stdlib/src/async_ops.rs:371:            set_yield_signal(YieldReason::AwaitPromise(pending));
+R01A	crates/sema-stdlib/src/async_ops.rs:385:                return Err(SemaError::eval(format!("async/race: task rejected: {e}")));
+R01A	crates/sema-stdlib/src/async_ops.rs:389:        Err(SemaError::eval("async/race: no promise resolved"))
+R01B	crates/sema-stdlib/src/async_ops.rs:392:    // async/timeout — race a promise against a deadline
+R01B	crates/sema-stdlib/src/async_ops.rs:393:    register_fn_ctx(env, "async/timeout", |ctx, args| {
+R01B	crates/sema-stdlib/src/async_ops.rs:394:        check_arity!(args, "async/timeout", 2);
+R01B	crates/sema-stdlib/src/async_ops.rs:395:        let ms = duration_ms(&args[0], "async/timeout")?;
+R01B	crates/sema-stdlib/src/async_ops.rs:398:                "async/timeout: duration must be non-negative",
+R01A	crates/sema-stdlib/src/async_ops.rs:39:        .strip_prefix("Eval error: async/await: task rejected: ")
+R01B	crates/sema-stdlib/src/async_ops.rs:404:                "async/timeout: duration {ms} ms exceeds maximum {MAX_TIMEOUT_MS} ms (1 day)"
+R01B	crates/sema-stdlib/src/async_ops.rs:408:        let promise = expect_promise(args, "async/timeout", 1)?;
+R01A	crates/sema-stdlib/src/async_ops.rs:40:        .or_else(|| e.strip_prefix("async/await: task rejected: "))
+R01B	crates/sema-stdlib/src/async_ops.rs:417:                        "async/timeout: task rejected: {e}"
+R01B	crates/sema-stdlib/src/async_ops.rs:421:                    return Err(SemaError::eval("async/timeout: task was cancelled"))
+R01B	crates/sema-stdlib/src/async_ops.rs:428:        match call_run_scheduler_timeout(ctx, promise.clone(), ms as u64)? {
+R01B	crates/sema-stdlib/src/async_ops.rs:429:            SchedulerRunResult::TimedOut => {
+R01A	crates/sema-stdlib/src/async_ops.rs:42:    SemaError::eval(format!("async/await: task rejected: {core}"))
+R01B	crates/sema-stdlib/src/async_ops.rs:430:                return Err(SemaError::eval("async/timeout: operation timed out"));
+R01B	crates/sema-stdlib/src/async_ops.rs:432:            SchedulerRunResult::DebugPaused => {
+R01B	crates/sema-stdlib/src/async_ops.rs:435:                    SchedulerTarget::One(promise.clone()),
+R01B	crates/sema-stdlib/src/async_ops.rs:438:                set_yield_signal(YieldReason::AwaitPromise(promise));
+R01B	crates/sema-stdlib/src/async_ops.rs:441:            SchedulerRunResult::Complete => {}
+R01B	crates/sema-stdlib/src/async_ops.rs:451:                        "async/timeout: task rejected: {e}"
+R01B	crates/sema-stdlib/src/async_ops.rs:455:                    return Err(SemaError::eval("async/timeout: task was cancelled"))
+R01B	crates/sema-stdlib/src/async_ops.rs:462:            "async/timeout: operation is still pending after scheduler run",
+R01B	crates/sema-stdlib/src/async_ops.rs:466:    // async/sleep — yield for a duration in milliseconds
+R01B	crates/sema-stdlib/src/async_ops.rs:467:    register_fn(env, "async/sleep", |args| {
+R01B	crates/sema-stdlib/src/async_ops.rs:468:        check_arity!(args, "async/sleep", 1);
+R01B	crates/sema-stdlib/src/async_ops.rs:469:        let ms = duration_ms(&args[0], "async/sleep")?;
+R01B	crates/sema-stdlib/src/async_ops.rs:472:                "async/sleep: duration must be non-negative",
+R01B	crates/sema-stdlib/src/async_ops.rs:475:        // Cap the duration (mirrors async/timeout). The scheduler's virtual
+R01B	crates/sema-stdlib/src/async_ops.rs:477:        // that whole delta in one `thread::sleep`; without a bound an
+R01B	crates/sema-stdlib/src/async_ops.rs:483:                "async/sleep: duration {ms} ms exceeds maximum {MAX_SLEEP_MS} ms (1 day)"
+R01B	crates/sema-stdlib/src/async_ops.rs:487:        if in_async_context() {
+R01B	crates/sema-stdlib/src/async_ops.rs:488:            if let Some(cached) = take_resume_value() {
+R01B	crates/sema-stdlib/src/async_ops.rs:491:            set_yield_signal(YieldReason::Sleep(ms as u64));
+R01B	crates/sema-stdlib/src/async_ops.rs:496:        std::thread::sleep(std::time::Duration::from_millis(ms as u64));
+R01A	crates/sema-stdlib/src/async_ops.rs:49:    SemaError::eval("async/await: task was cancelled")
+R01A	crates/sema-stdlib/src/async_ops.rs:50:        .with_hint("the task was cancelled via async/cancel before it produced a value")
+R01C	crates/sema-stdlib/src/async_ops.rs:525:    // channel/send — send a value to a channel (yields if full in async context)
+R01C	crates/sema-stdlib/src/async_ops.rs:526:    register_fn(env, "channel/send", |args| {
+R01C	crates/sema-stdlib/src/async_ops.rs:527:        check_arity!(args, "channel/send", 2);
+R01C	crates/sema-stdlib/src/async_ops.rs:528:        let ch = expect_channel(args, "channel/send", 0)?;
+R01C	crates/sema-stdlib/src/async_ops.rs:531:                "channel/send: channel is closed; value {} was dropped",
+R01C	crates/sema-stdlib/src/async_ops.rs:535:        if in_async_context() {
+R01C	crates/sema-stdlib/src/async_ops.rs:536:            if let Some(cached) = take_resume_value() {
+R01C	crates/sema-stdlib/src/async_ops.rs:543:            if in_async_context() {
+R01C	crates/sema-stdlib/src/async_ops.rs:544:                set_yield_signal(YieldReason::ChannelSend(ch, args[1].clone()));
+R01C	crates/sema-stdlib/src/async_ops.rs:548:                SemaError::eval("channel/send: channel is full").with_hint(
+R01C	crates/sema-stdlib/src/async_ops.rs:557:    // channel/recv — receive a value from a channel (yields if empty in async context)
+R01C	crates/sema-stdlib/src/async_ops.rs:558:    register_fn(env, "channel/recv", |args| {
+R01C	crates/sema-stdlib/src/async_ops.rs:559:        check_arity!(args, "channel/recv", 1);
+R01C	crates/sema-stdlib/src/async_ops.rs:560:        let ch = expect_channel(args, "channel/recv", 0)?;
+R01C	crates/sema-stdlib/src/async_ops.rs:561:        if in_async_context() {
+R01C	crates/sema-stdlib/src/async_ops.rs:562:            if let Some(cached) = take_resume_value() {
+R01C	crates/sema-stdlib/src/async_ops.rs:574:        if in_async_context() {
+R01C	crates/sema-stdlib/src/async_ops.rs:575:            set_yield_signal(YieldReason::ChannelRecv(ch));
+R01C	crates/sema-stdlib/src/async_ops.rs:578:        Err(SemaError::eval("channel/recv: channel is empty"))
 R01A	crates/sema-stdlib/src/async_ops.rs:6:    call_run_scheduler, call_run_scheduler_all_of, call_run_scheduler_any_of,
 R01B	crates/sema-stdlib/src/async_ops.rs:7:    call_run_scheduler_timeout, call_spawn_callback, check_arity, in_async_context,
 R01C	crates/sema-stdlib/src/async_ops.rs:8:    set_debug_coop_resume, set_yield_signal, take_resume_value, AsyncPromise, Channel,

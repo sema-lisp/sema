@@ -29,7 +29,9 @@ Higher-level fan-out is built on Task 04 owned scopes and Task 05 I/O jobs.
   lineage.
 - **Exact start state:** Clean worktree; latest commit subject is
   `refactor(runtime): migrate interruptible resources`; Task 01–05 gates are
-  GREEN and the context matrix has no unclassified task-local match.
+  GREEN, and the Task 01 inventory assigns every known task-local match to Task
+  06 or a reviewed synchronous owner. Task 1 creates and reviews the exhaustive
+  context/TLS matrix before production edits.
 - **Parallel work:** After core context/guard tests merge, LLM, OTel, workflow,
   and MCP migrations may proceed in their own crates. One owner controls core
   task context, VM guard installation, stdlib/prelude integration, matrix, and

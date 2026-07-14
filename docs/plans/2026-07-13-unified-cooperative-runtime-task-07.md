@@ -29,7 +29,8 @@ or owns a private scheduler.
   roots, and root-tagged output.
 - **Exact start state:** Clean worktree; latest commit subject is
   `refactor(runtime): make task context explicit`; Task 01–06 gates are GREEN
-  and every host entry/private loop has a host-matrix row.
+  and the Task 01 inventory assigns every known host entry/private loop to Task
+  07. Task 1 creates and reviews the exhaustive host matrix before host edits.
 - **Parallel work:** Common eval/native driver lands first. DAP/LSP and notebook/
   MCP/workflow hosts may then migrate in parallel. WASM driver work may use the
   stable common API in parallel with native service hosts; playground protocol
@@ -67,9 +68,8 @@ or owns a private scheduler.
 - `crates/sema-wasm/src/driver.rs` — browser macrotask driver and Promise table.
 - `crates/sema-wasm/src/output.rs` — root-tagged browser output sinks.
 - `crates/sema/tests/host_runtime_contract_test.rs` — native host contract.
-- `crates/sema-wasm/tests/web/runtime.spec.mjs` — browser multi-root/fetch/stop
-  contract run by `wasm-pack test --headless --chrome` or the repository’s
-  Playwright harness.
+- `playground/tests/unified-runtime.spec.ts` — browser multi-root/fetch/stop and
+  heartbeat contract run by the repository Playwright harness.
 - `docs/plans/evidence/unified-cooperative-runtime/task-07-host-matrix.md` — one
   row per host entry point and old loop.
 - `docs/plans/evidence/unified-cooperative-runtime/task-07.md` — verification.
@@ -337,6 +337,8 @@ cargo test -p sema-eval -p sema-lang -p sema-dap -p sema-lsp \
   -p sema-notebook -p sema-mcp -p sema-wasm
 cargo test -p sema-lang --test host_runtime_contract_test
 cargo test -p sema-lang --test runtime_conformance_test
+jake pg.build
+jake test.playground-e2e
 cargo fmt --all -- --check
 cargo clippy -p sema-eval -p sema-lang -p sema-dap -p sema-lsp \
   -p sema-notebook -p sema-mcp -p sema-wasm --all-targets -- -D warnings

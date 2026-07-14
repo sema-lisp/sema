@@ -129,8 +129,11 @@ pub struct TaskRelations {
 pub enum CancelReason {
     Explicit { message: Option<String> },
     RootCancelled { root: RootId },
+    OwnerCancelled { scope: ScopeId },
     ScopeFailed { scope: ScopeId },
     Timeout { operation: &'static str, duration_ms: u64 },
+    HostStopped { root: RootId },
+    ResourceDisconnected { operation: OperationId },
     InterpreterShutdown,
     HostShutdown,
 }
@@ -158,11 +161,14 @@ language condition happens only at an evaluation boundary.
 ```rust
 pub type SendPayload = Box<dyn Any + Send>;
 
+pub struct CompletionKind(NonZeroU16);
+
 pub struct ExternalCompletion {
     pub runtime_id: RuntimeId,
     pub wait_id: WaitId,
     pub generation: WaitGeneration,
     pub operation_id: OperationId,
+    pub kind: CompletionKind,
     pub result: Result<SendPayload, ExternalFailure>,
 }
 
@@ -192,7 +198,12 @@ pub trait CompletionDecoder {
 
 The envelope cannot contain `Value`, `Env`, `SemaError`, `Rc`, or a VM
 continuation. `ExternalFailure` is a send-safe code/message/source structure,
-not an erased `SemaError`.
+not an erased `SemaError`. `CompletionKind` is a crate-controlled, non-zero,
+send-safe discriminator. The wait registry stores the expected kind and rejects
+a wrong-kind completion before invoking its decoder. A payload that has the
+correct declared kind but fails the decoder's concrete downcast becomes a named
+`Decode` failure for that operation; wrong-kind delivery never changes the
+waiting task's outcome.
 
 ```rust
 pub type NativeResult = Result<NativeOutcome, SemaError>;
@@ -232,6 +243,7 @@ pub enum ChannelWait {
 
 pub struct ExternalWait {
     pub operation_id: OperationId,
+    pub expected_kind: CompletionKind,
     pub decoder: Box<dyn CompletionDecoder>,
     pub resource: ResourceClassDescriptor,
 }
@@ -324,7 +336,8 @@ Construct these exact cases and assert all three axes independently:
 - [ ] **Step 3: Implement the minimum types and run**
 
 ```bash
-cargo test -p sema-core --test runtime_types_test -- ids relationships
+cargo test -p sema-core --test runtime_types_test -- ids
+cargo test -p sema-core --test runtime_types_test -- relationships
 ```
 
 Expected: all selected tests pass; no scheduler or TLS file is needed by the
@@ -348,7 +361,8 @@ sequence numbers in this module; Task 03 owns the runtime counter.
 - [ ] **Step 3: Run**
 
 ```bash
-cargo test -p sema-core --test runtime_types_test -- settlement condition
+cargo test -p sema-core --test runtime_types_test -- settlement
+cargo test -p sema-core --test runtime_types_test -- condition
 ```
 
 Expected: selected tests pass, including structured reason round trips.
@@ -361,9 +375,11 @@ Expected: selected tests pass, including structured reason round trips.
 - [ ] **Step 1: Write failing compile and behavior tests**
 
 Use `static_assertions` already available in the workspace, or a small local
-`fn assert_send<T: Send>()`, to prove `ExternalCompletion: Send`. Test mismatched
-payload downcasts become a named decode error. Test interrupt cancellation twice
-and bounded-resource zero-deadline/zero-work rejection.
+`fn assert_send<T: Send>()`, to prove `ExternalCompletion: Send`. Test that a
+correct-kind payload with the wrong concrete type becomes a named decode error;
+Task 03 tests that a wrong declared kind is discarded before decoding and leaves
+the task unchanged. Test interrupt cancellation twice and bounded-resource
+zero-deadline/zero-work rejection.
 
 - [ ] **Step 2: Implement the envelope and policies**
 
@@ -374,7 +390,8 @@ name every mismatch.
 - [ ] **Step 3: Run**
 
 ```bash
-cargo test -p sema-core --test runtime_types_test -- completion resource
+cargo test -p sema-core --test runtime_types_test -- completion
+cargo test -p sema-core --test runtime_types_test -- resource
 ```
 
 Expected: selected tests pass; `ResourceClass` has exactly two variants.
@@ -428,7 +445,8 @@ coverage.
 
 ```bash
 cargo test -p sema-core --test runtime_types_test -- task_context
-cargo test -p sema-core context cycle
+cargo test -p sema-core context
+cargo test -p sema-core cycle
 ```
 
 Expected: field-by-field table and tracing tests pass.

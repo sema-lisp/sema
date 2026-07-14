@@ -28,7 +28,9 @@ fake servers, deterministic fault injection.
   native blocking wrapper, and complete standard-library resource scope.
 - **Exact start state:** Clean worktree; latest commit subject is
   `feat(runtime): add explicit async ownership semantics`; Task 01–04 gates are
-  GREEN and the resource matrix has no unclassified discovery match.
+  GREEN, and the Task 01 inventory assigns every known resource discovery match
+  to Task 05 or a later named owner. Task 1 creates and reviews the exhaustive
+  Task 05 resource matrix before production edits.
 - **Parallel work:** After the executor seam and matrix review, process/PTY/
   watcher/stream, HTTP/WS/server, and file/database/bounded-library migrations
   may proceed in disjoint modules. One owner integrates core/IO/runtime seams,
@@ -44,8 +46,11 @@ fake servers, deterministic fault injection.
   quarantined operation has a pre-dispatch hard deadline or fixed maximum work
   count and is reaped by `CleanupRegistry`.
 - There is no constructible unbounded non-interruptible operation.
-- No runtime task calls `io_block_on`, `thread::sleep`, synchronous channel recv,
-  or a polling loop that occupies the interpreter thread.
+- No Task 05-owned runtime path calls `io_block_on`, `thread::sleep`, synchronous
+  channel recv, or a polling loop that occupies the interpreter thread. Exact
+  LLM/MCP/task-context adapters owned by Task 06 may remain only when listed by
+  file and symbol in the inventory and scanner allowlist; Task 06 must delete
+  them before its layer is accepted.
 - A late completion contains only send-safe payload and is rejected by full
   runtime/wait/generation/operation identity.
 - Existing top-level return values and errors remain compatible unless the
@@ -110,15 +115,27 @@ pub struct RunningJob {
 }
 
 pub trait IoExecutor: Send + Sync {
-    fn submit(&self, job: Box<dyn IoJob>, sink: CompletionSink) -> RunningJob;
+    fn attach_runtime(&self, runtime_id: RuntimeId) -> ExecutorLease;
     fn snapshot(&self) -> ExecutorSnapshot;
-    fn shutdown(&self, deadline: Instant) -> ExecutorShutdown;
+}
+
+pub struct ExecutorLease { /* private runtime id and shared-pool handle */ }
+
+impl ExecutorLease {
+    pub fn submit(&self, job: Box<dyn IoJob>, sink: CompletionSink) -> RunningJob;
+    pub fn snapshot(&self) -> ExecutorSnapshot;
+    pub fn shutdown(&self, deadline: Instant) -> ExecutorShutdown;
 }
 ```
 
-`Runtime::start_external` allocates and installs the wait registration before it
-calls `submit`, preventing a completion-before-registration race. The executor
-never decodes a Sema value. Panic is caught at the job boundary and delivered as
+Each interpreter runtime owns one `ExecutorLease` over the process-wide pool.
+Lease shutdown rejects new jobs for that runtime, cancels/drains only its jobs,
+and unregisters the lease without stopping jobs belonging to another
+interpreter. The shared pool may stop workers after the final lease closes or an
+explicit process shutdown. `Runtime::start_external` allocates and installs the
+wait registration before it calls the lease's `submit`, preventing a
+completion-before-registration race. The executor never decodes a Sema value.
+Panic is caught at the job boundary and delivered as
 `ExternalFailure::WorkerPanic`; it does not silently drop the wait.
 
 `ExecutorSnapshot` reports queued, running-interruptible,
@@ -310,7 +327,10 @@ runtime wait, cleanup, process, descriptor, and port counts.
 
 Outside `sema-io` implementation and test fixtures, fail on `io_block_on`, raw
 Tokio runtime construction, `in_async_context` behavior branches, legacy
-`IoPoll`/`IoHandle`, and process/resource dispatch without a matrix entry.
+`IoPoll`/`IoHandle`, and process/resource dispatch without a matrix entry. The
+only temporary exceptions are exact file-and-symbol Task 06 adapters recorded
+in the inventory with deletion owners; broad crate/directory exclusions are
+forbidden.
 
 - [ ] **Step 2: Run layer gates**
 

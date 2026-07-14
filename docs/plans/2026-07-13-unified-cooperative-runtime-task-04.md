@@ -248,15 +248,17 @@ For pre-settled inputs choose the lowest stored `SettlementSeq`. For future
 settlements wake on the first sequence assigned by the runtime. Remove all other
 observation registrations when the waiter finishes; do not cancel producers.
 
-- [ ] **Step 3: Correct legacy tests**
+- [ ] **Step 3: Turn the Task 01 observation oracles GREEN**
 
-Delete or rewrite these invalid expectations from Task 01:
+Preserve these corrected Task 01 tests without weakening their expected values:
 
-- `race_with_settled_winner_cancels_owned_pending_loser`;
-- `async_race_cancels_losing_siblings`;
-- `async_all_reject_cancels_pending_sibling`.
+- `race_with_settled_winner_does_not_cancel_supplied_loser`;
+- `async_race_does_not_cancel_supplied_loser`;
+- `async_all_failure_does_not_cancel_supplied_sibling`.
 
-Their replacements must prove supplied work continues and can still be awaited.
+They prove supplied work continues and can still be awaited. The obsolete
+implicit-cancellation names were already removed in Task 01 and must not be
+reintroduced.
 
 - [ ] **Step 4: Run**
 

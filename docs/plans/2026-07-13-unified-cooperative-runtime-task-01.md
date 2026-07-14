@@ -60,6 +60,8 @@ Markdown evidence, Cargo, Jake.
 
 - `crates/sema/tests/vm_async_test.rs` — language-observable finite
   characterization tests.
+- `crates/sema/tests/common/mod.rs` — export the reusable subprocess watchdog
+  harness to sibling integration-test crates.
 - `crates/sema/tests/runtime_conformance_test.rs` — source-boundary and baseline
   manifest checks.
 - `docs/internals/async-runtime-inventory.md` — executable migration ledger.
@@ -68,6 +70,8 @@ Markdown evidence, Cargo, Jake.
 
 **Create**
 
+- `crates/sema/tests/common/watchdog.rs` — shared subprocess timeout harness
+  used by this task and the hostile programs in Task 09.
 - `crates/sema/tests/unified_runtime_watchdog_test.rs` — subprocess-owned
   fairness and hang oracles.
 - `scripts/check-unified-runtime-legacy.sh` — exact legacy-symbol inventory
@@ -270,6 +274,8 @@ scheduler re-entry.
 **Files:**
 
 - Modify: `crates/sema/tests/vm_async_test.rs`
+- Modify: `crates/sema/tests/common/mod.rs`
+- Create: `crates/sema/tests/common/watchdog.rs`
 - Create: `crates/sema/tests/unified_runtime_watchdog_test.rs`
 
 - [ ] **Step 1: Remove the in-process perpetual spinner test**
@@ -280,7 +286,10 @@ without allowing an unfair scheduler to hang the test process.
 
 - [ ] **Step 2: Add the reusable watchdog harness**
 
-Create `crates/sema/tests/unified_runtime_watchdog_test.rs` with this harness:
+Create `crates/sema/tests/common/watchdog.rs` with this harness and export the
+module from `crates/sema/tests/common/mod.rs`. Keeping it in the shared test
+module makes the Task 09 reuse contract executable; a helper private to one
+integration-test crate is not reusable.
 
 ```rust
 use std::process::{Command, ExitStatus, Stdio};
@@ -288,14 +297,14 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 #[derive(Debug)]
-struct TimedRun {
-    status: ExitStatus,
-    stdout: String,
-    stderr: String,
-    timed_out: bool,
+pub struct TimedRun {
+    pub status: ExitStatus,
+    pub stdout: String,
+    pub stderr: String,
+    pub timed_out: bool,
 }
 
-fn run_sema_with_timeout(source: &str, timeout: Duration) -> TimedRun {
+pub fn run_sema_with_timeout(source: &str, timeout: Duration) -> TimedRun {
     let mut child = Command::new(env!("CARGO_BIN_EXE_sema"))
         .args(["--no-llm", "-e", source])
         .stdin(Stdio::null())
@@ -329,6 +338,10 @@ fn run_sema_with_timeout(source: &str, timeout: Duration) -> TimedRun {
     }
 }
 ```
+
+Import `run_sema_with_timeout` into
+`crates/sema/tests/unified_runtime_watchdog_test.rs` through `mod common`; do
+not duplicate the harness in the test crate.
 
 - [ ] **Step 3: Add the ready-storm/timer test**
 
@@ -570,10 +583,23 @@ implementer may not close their own review finding.
 ```bash
 git add \
   crates/sema/tests/vm_async_test.rs \
+  crates/sema/tests/common/mod.rs \
+  crates/sema/tests/common/watchdog.rs \
   crates/sema/tests/unified_runtime_watchdog_test.rs \
   crates/sema/tests/runtime_conformance_test.rs \
   scripts/check-unified-runtime-legacy.sh \
   docs/internals/async-runtime-inventory.md \
+  docs/plans/2026-07-13-unified-cooperative-runtime.md \
+  docs/plans/2026-07-13-unified-cooperative-runtime-task-01.md \
+  docs/plans/2026-07-13-unified-cooperative-runtime-task-02.md \
+  docs/plans/2026-07-13-unified-cooperative-runtime-task-03.md \
+  docs/plans/2026-07-13-unified-cooperative-runtime-task-04.md \
+  docs/plans/2026-07-13-unified-cooperative-runtime-task-05.md \
+  docs/plans/2026-07-13-unified-cooperative-runtime-task-06.md \
+  docs/plans/2026-07-13-unified-cooperative-runtime-task-07.md \
+  docs/plans/2026-07-13-unified-cooperative-runtime-task-08.md \
+  docs/plans/2026-07-13-unified-cooperative-runtime-task-09.md \
+  docs/plans/2026-07-13-unified-cooperative-runtime-task-11.md \
   docs/plans/evidence/unified-cooperative-runtime \
   docs/plans/reviews/unified-cooperative-runtime/task-01.md
 git commit -m "test(runtime): lock unified runtime contracts"

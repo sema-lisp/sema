@@ -385,11 +385,18 @@ seed durability, and every remediated finding’s regression and fix.
 - [ ] **Step 5: Commit the accepted layer**
 
 ```bash
-git add Cargo.toml Cargo.lock crates/sema crates/sema-eval crates/sema-vm \
-  crates/sema-io fuzz scripts jake docs/plans/evidence/unified-cooperative-runtime \
-  docs/plans/reviews/unified-cooperative-runtime
+git status --short
+# Stage every exact Task 09 path listed in evidence, including production fixes
+# in crates not anticipated when this plan was written. Do not use `git add -A`.
+git add <reviewed Task 09 paths from the evidence manifest>
+git diff --cached --name-only
+git diff --exit-code
+test -z "$(git ls-files --others --exclude-standard)"
 git commit -m "test(runtime): add adversarial runtime campaign"
 ```
+
+The staged-path list must cover every Task 09 change and no unrelated user work.
+The clean-diff and untracked-file checks are hard gates for Task 10's clean start.
 
 ## Completion criteria
 

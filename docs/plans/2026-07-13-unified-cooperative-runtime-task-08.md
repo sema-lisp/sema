@@ -27,7 +27,9 @@ wasm-pack, npm, Cargo packaging, Playwright.
   asset invariant from `AGENTS.md`, and no dual-path release policy.
 - **Exact start state:** Clean worktree; latest commit subject is
   `refactor(runtime): unify native and browser hosts`; Tasks 01–07 are GREEN and
-  the deletion checklist accounts for every temporary row/symbol.
+  every temporary row/symbol has Task 08 deletion ownership in the inventory and
+  prior evidence. Task 1 materializes and verifies the exhaustive deletion
+  checklist before deleting adapters.
 - **Parallel work:** Adapter deletion is sequential under one integration owner.
   After source/API names stabilize, builtin/concept docs and examples/notebooks
   may be edited in parallel in disjoint files. Generation/package work starts

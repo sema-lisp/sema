@@ -131,40 +131,7 @@ tool calls, stream output, apply an in-memory patch, run a local command, and
 cancel a superseded preview. Its output/file hashes and provider request log are
 the correctness checksum.
 
-## Task 1: Freeze baseline/candidate and capture environment
-
-- [ ] **Step 1: Read Task 10 handoff and verify SHAs**
-
-```bash
-BASELINE_SHA=3f111e83
-CANDIDATE_SHA=$(git rev-parse HEAD)
-git merge-base --is-ancestor "$BASELINE_SHA" "$CANDIDATE_SHA"
-git status --short
-```
-
-Expected: ancestry check succeeds and candidate worktree is clean. If Task 10
-recorded a replacement baseline, use it consistently and update this task plan
-plus evidence before measuring.
-
-- [ ] **Step 2: Create detached measurement worktrees**
-
-```bash
-git worktree add --detach ../unified-runtime-bench-baseline "$BASELINE_SHA"
-git worktree add --detach ../unified-runtime-bench-candidate "$CANDIDATE_SHA"
-```
-
-Do not reuse development build artifacts. Copy only the committed benchmark
-corpus/harness into the baseline worktree as untracked measurement input and
-record its tree hash; do not modify baseline production files.
-
-- [ ] **Step 3: Record environment before building**
-
-Capture full SHAs, dirty status, benchmark tree/fixture hashes, `rustc -vV`,
-Cargo/LLVM/Node/npm/wasm-pack/Chromium/hyperfine/samply versions, OS/kernel, CPU
-model/core count, RAM, power source/mode, thermal state if available, and active
-background-process policy in `environment.json`.
-
-## Task 2: Implement and validate the benchmark harness
+## Task 1: Implement, validate, and commit the benchmark harness
 
 - [ ] **Step 1: Add correctness-first benchmark tests**
 
@@ -186,14 +153,52 @@ jake bench.runtime-profile
 jake bench.runtime-confirm
 ```
 
-- [ ] **Step 3: Verify harness against candidate before timing**
+- [ ] **Step 3: Verify and commit the harness before timing**
 
 ```bash
 jake bench.runtime-verify
+git add benchmarks scripts jake
+git commit -m "perf(runtime): add verified runtime benchmark harness"
 ```
 
 Expected: every correctness checksum passes; no timing summary is produced by
-verify mode.
+verify mode. This commit changes measurement code only. It becomes the frozen
+candidate SHA so the candidate worktree contains the exact harness being run.
+
+## Task 2: Freeze baseline/candidate and capture environment
+
+- [ ] **Step 1: Read Task 10 handoff and freeze SHAs**
+
+```bash
+BASELINE_SHA=3f111e83
+CANDIDATE_SHA=$(git rev-parse HEAD)
+git merge-base --is-ancestor "$BASELINE_SHA" "$CANDIDATE_SHA"
+git status --short
+```
+
+Expected: ancestry check succeeds, the candidate includes the verified harness
+commit, and the candidate worktree is clean. If Task 10 recorded a replacement
+baseline, use it consistently and update this task plan plus evidence before
+measuring.
+
+- [ ] **Step 2: Create detached measurement worktrees**
+
+```bash
+git worktree add --detach ../unified-runtime-bench-baseline "$BASELINE_SHA"
+git worktree add --detach ../unified-runtime-bench-candidate "$CANDIDATE_SHA"
+```
+
+Do not reuse development build artifacts. The candidate worktree already
+contains the committed benchmark corpus/harness. Copy that exact committed
+corpus/harness into the baseline worktree as untracked measurement input and
+record identical tree hashes; do not modify baseline production files.
+
+- [ ] **Step 3: Record environment before building**
+
+Capture full SHAs, dirty status, benchmark tree/fixture hashes, `rustc -vV`,
+Cargo/LLVM/Node/npm/wasm-pack/Chromium/hyperfine/samply versions, OS/kernel, CPU
+model/core count, RAM, power source/mode, thermal state if available, and active
+background-process policy in `environment.json`.
 
 ## Task 3: Build identical baseline and candidate artifacts
 

@@ -96,7 +96,9 @@ deterministic clocks, Cargo integration tests.
 ## Exact runtime interfaces
 
 ```rust
-pub struct Runtime { /* private interpreter-owned state */ }
+pub struct Runtime {
+    state: Rc<RefCell<RuntimeState>>,
+}
 
 pub struct VmRootOptions {
     pub context: TaskContext,
@@ -110,7 +112,7 @@ pub struct PreparedRoot {
 
 #[derive(Clone)]
 pub struct RootHandle {
-    runtime: Weak<RefCell<Runtime>>,
+    runtime: Weak<RefCell<RuntimeState>>,
     id: RootId,
 }
 
@@ -142,13 +144,13 @@ pub struct ShutdownOptions {
 impl Runtime {
     pub fn new(clock: Rc<dyn RuntimeClock>) -> Self;
     pub fn submit_root(
-        &mut self,
+        &self,
         prepared: PreparedRoot,
         options: VmRootOptions,
     ) -> RootHandle;
-    pub fn drive(&mut self, budget: DriveBudget) -> DriveState;
-    pub fn cancel_root(&mut self, root: RootId, reason: CancelReason) -> bool;
-    pub fn shutdown(&mut self, options: ShutdownOptions) -> ShutdownReport;
+    pub fn drive(&self, budget: DriveBudget) -> DriveState;
+    pub fn cancel_root(&self, root: RootId, reason: CancelReason) -> bool;
+    pub fn shutdown(&self, options: ShutdownOptions) -> ShutdownReport;
 }
 
 impl RootHandle {
@@ -158,6 +160,12 @@ impl RootHandle {
 }
 ```
 
+`RuntimeState` is private. `Runtime` is the interpreter-owned strong handle and
+is not `Clone`; root handles retain only `Weak` access to the same state. This
+internal-handle shape lets `submit_root(&self, ...)` construct a non-owning
+`RootHandle` without requiring an impossible `Weak` conversion from `&mut
+Runtime` or introducing a second runtime owner.
+
 `RootPoll` is `Pending`, `Ready(Result<Value, SemaError>)`, or
 `RuntimeDropped`. Polling never drives the runtime. Result retrieval is
 idempotent and never consumes the stored settlement.
@@ -166,10 +174,11 @@ idempotent and never consumes the stored settlement.
 pub enum TaskState {
     Ready,
     Running,
-    Waiting(WaitId),
+    Waiting {
+        wait_id: WaitId,
+        generation: WaitGeneration,
+    },
     Settled(TaskSettlement),
-    CleaningUp,
-    Reaped,
 }
 
 pub enum VmExecResult {
@@ -186,9 +195,11 @@ pub struct CancellationRequest {
 ```
 
 All state transitions go through named methods that reject illegal edges in
-debug and test builds. `Running -> Running`, `Settled -> Ready`, and any
-transition out of `Reaped` are defects. Each task stores
-`Option<CancellationRequest>` separately from `TaskState`; setting it is
+debug and test builds. `Running -> Running`, `Settled -> Ready`, and any other
+transition out of `Settled` are defects. Cleanup progress is side state on the
+task/cleanup registry rather than a lifecycle variant, and reaping removes a
+settled record from `TaskStore`; neither changes the master lifecycle. Each task
+stores `Option<CancellationRequest>` separately from `TaskState`; setting it is
 idempotent and does not prematurely turn a task awaiting cleanup into settled.
 
 `ReadyRoots` stores one FIFO `VecDeque<TaskId>` per `RootId` plus a rotating
@@ -265,9 +276,13 @@ Expected: exact order assertions pass.
 - [ ] **Step 1: Add a fake monotonic clock and failing tests**
 
 Cover same-deadline insertion order, zero duration, timer cancellation,
-generation reuse, wrong runtime, wrong operation, duplicate completion,
+generation reuse, wrong runtime, wrong operation, wrong completion kind,
+correct-kind payload decode failure, duplicate completion,
 completion-vs-cancellation races, per-turn completion/timer/cleanup/root limits,
-and wall-clock budget expiry measured with an injected clock.
+and wall-clock budget expiry measured with an injected clock. Wrong-kind
+delivery must leave the wait/task outcome unchanged and must not invoke the
+decoder; correct-kind decode failure is delivered as the Task 02 `Decode`
+failure.
 
 - [ ] **Step 2: Implement registration and bounded drains**
 

@@ -194,7 +194,7 @@ This page defines the technical vocabulary used across Sema's documentation — 
 
 **SemaError** — Sema's `thiserror`-derived error enum (variants incl. Reader, Eval, Type, Arity, Unbound, Llm, UserException, plus `WithTrace`/`WithContext` wrappers), constructed via helper methods (`eval`, `type_error`, `arity`), never raw variants. Surfaced to Sema code as a structured error map with `:type`, `:message`, and `:value` (for user exceptions). Caught errors also include `:stack-trace` — a list of `{:name :file :line :col}` frame maps, innermost first.
 
-**Short lambda** — a terse anonymous-function literal `#(...)` whose body is scanned for positional placeholders `%`, `%1`, `%2`…; bare `%` rewrites to `%1`, producing `(lambda (%1 … %N) body)`. Clojure-style; read/desugared by the reader. E.g. `#(* % %)` squares its argument.
+**Short lambda** — a terse anonymous-function literal `#(...)` whose body is scanned for positional placeholders `%`, `%1`, `%2`... and a rest argument `%&`. Bare `%` rewrites to `%1`, producing `(lambda (%1 ... %N) body)`, or `(lambda (%1 ... %N . %&) body)` if `%&` is used. Placeholders within a nested `lambda` or `fn` correctly bind to the enclosing `#()`. Nesting a `#()` directly inside another `#()` is a read-time error. Clojure-style; read/desugared by the reader. E.g. `#(* % %)` squares its argument.
 
 **Slot** — a fixed integer index into the current function's stack frame where a local variable lives. The Resolve pass replaces variable names with slots so a runtime read is an array index, not a hash lookup. Slots 0–3 have dedicated zero-operand opcodes (`LoadLocal0..3`). Contrast with upvalue indices and global Spurs.
 

@@ -16,6 +16,7 @@ struct Parser {
     span_map: SpanMap,
     symbol_spans: Vec<(String, Span)>,
     depth: usize,
+    short_lambda_depth: usize,
 }
 
 impl Parser {
@@ -26,6 +27,7 @@ impl Parser {
             span_map: SpanMap::new(),
             symbol_spans: Vec::new(),
             depth: 0,
+            short_lambda_depth: 0,
         }
     }
 
@@ -357,18 +359,34 @@ impl Parser {
 
     fn parse_short_lambda(&mut self) -> Result<Value, SemaError> {
         let open_span = self.span();
+        if self.short_lambda_depth > 0 {
+            return Err(SemaError::Reader {
+                message: "nested short lambdas are not allowed".to_string(),
+                span: open_span,
+            }
+            .with_hint("use a regular `lambda` or `fn` for the inner function"));
+        }
         self.advance(); // consume ShortLambdaStart
+        self.short_lambda_depth += 1;
         let mut body_items = Vec::new();
         while self.peek() != Some(&Token::RParen) {
             if self.peek().is_none() {
+                self.short_lambda_depth -= 1;
                 return Err(SemaError::Reader {
                     message: "unterminated short lambda #(...)".to_string(),
                     span: open_span,
                 }
                 .with_hint("add a closing `)`"));
             }
-            body_items.push(self.parse_expr()?);
+            match self.parse_expr() {
+                Ok(expr) => body_items.push(expr),
+                Err(e) => {
+                    self.short_lambda_depth -= 1;
+                    return Err(e);
+                }
+            }
         }
+        self.short_lambda_depth -= 1;
         self.expect(&Token::RParen)?;
 
         // Build the body as a single list form: (fn-name arg1 arg2 ...)
@@ -376,16 +394,22 @@ impl Parser {
 
         // Scan body for % / %1 / %2 etc., rewrite % → %1
         let mut max_arg: usize = 0;
-        let body = rewrite_percent_args(&body, &mut max_arg);
+        let mut has_rest = false;
+        let body = rewrite_percent_args(&body, &mut max_arg, &mut has_rest);
 
         // Build parameter list
-        let params: Vec<Value> = if max_arg == 0 {
+        let mut params: Vec<Value> = if max_arg == 0 {
             vec![]
         } else {
             (1..=max_arg)
                 .map(|n| Value::symbol(&format!("%{}", n)))
                 .collect()
         };
+
+        if has_rest {
+            params.push(Value::symbol("."));
+            params.push(Value::symbol("%&"));
+        }
 
         Ok(Value::list(vec![
             Value::symbol("lambda"),
@@ -614,14 +638,17 @@ fn token_display(tok: &Token) -> &'static str {
 
 /// Recursively scan a Value AST for `%`, `%1`, `%2`, etc. symbols.
 /// Rewrites bare `%` to `%1`. Tracks the highest numbered arg in `max_arg`.
-/// Skips recursion into nested `(lambda ...)` / `(fn ...)` forms.
-fn rewrite_percent_args(expr: &Value, max_arg: &mut usize) -> Value {
+/// Recurses into nested `(lambda ...)` / `(fn ...)` bodies so their placeholders bind to the enclosing `#()`. Sets `has_rest` when `%&` appears.
+fn rewrite_percent_args(expr: &Value, max_arg: &mut usize, has_rest: &mut bool) -> Value {
     match expr.view() {
         ValueView::Symbol(spur) => {
             let name = resolve(spur);
             if name == "%" {
                 *max_arg = (*max_arg).max(1);
                 Value::symbol("%1")
+            } else if name == "%&" {
+                *has_rest = true;
+                expr.clone()
             } else if let Some(rest) = name.strip_prefix('%') {
                 if let Ok(n) = rest.parse::<usize>() {
                     if n > 0 {
@@ -634,25 +661,16 @@ fn rewrite_percent_args(expr: &Value, max_arg: &mut usize) -> Value {
             }
         }
         ValueView::List(items) => {
-            // Skip nested (lambda ...) / (fn ...) forms — their % args are their own
-            if let Some(first) = items.first() {
-                if let ValueView::Symbol(s) = first.view() {
-                    let name = resolve(s);
-                    if name == "lambda" || name == "fn" {
-                        return expr.clone();
-                    }
-                }
-            }
             let new_items: Vec<Value> = items
                 .iter()
-                .map(|item| rewrite_percent_args(item, max_arg))
+                .map(|item| rewrite_percent_args(item, max_arg, has_rest))
                 .collect();
             Value::list(new_items)
         }
         ValueView::Vector(items) => {
             let new_items: Vec<Value> = items
                 .iter()
-                .map(|item| rewrite_percent_args(item, max_arg))
+                .map(|item| rewrite_percent_args(item, max_arg, has_rest))
                 .collect();
             Value::vector(new_items)
         }
@@ -1877,6 +1895,53 @@ mod tests {
                     Value::list(vec![Value::symbol("string-length"), Value::symbol("%1"),]),
                     Value::int(3),
                 ]),
+            ])
+        );
+    }
+
+    #[test]
+    fn test_read_short_lambda_nested_lambda() {
+        // #(map (lambda (y) (+ y %)) (list 10))
+        let result = read("#(map (lambda (y) (+ y %)) (list 10))").unwrap();
+        assert_eq!(
+            result,
+            Value::list(vec![
+                Value::symbol("lambda"),
+                Value::list(vec![Value::symbol("%1")]),
+                Value::list(vec![
+                    Value::symbol("map"),
+                    Value::list(vec![
+                        Value::symbol("lambda"),
+                        Value::list(vec![Value::symbol("y")]),
+                        Value::list(vec![
+                            Value::symbol("+"),
+                            Value::symbol("y"),
+                            Value::symbol("%1"), // The % was correctly rewritten to %1 from the outer #()
+                        ]),
+                    ]),
+                    Value::list(vec![Value::symbol("list"), Value::int(10)]),
+                ]),
+            ])
+        );
+    }
+
+    #[test]
+    fn test_read_short_lambda_nested_short_lambda_error() {
+        // #(#(+ % 1)) should be a read error
+        let err = read("#(#(+ % 1))").unwrap_err();
+        assert!(err.to_string().contains("nested short lambdas are not allowed"));
+    }
+
+    #[test]
+    fn test_read_short_lambda_rest_arg() {
+        // #(apply + %&) → (lambda (. %&) (apply + %&))
+        let result = read("#(apply + %&)").unwrap();
+        assert_eq!(
+            result,
+            Value::list(vec![
+                Value::symbol("lambda"),
+                Value::list(vec![Value::symbol("."), Value::symbol("%&")]),
+                Value::list(vec![Value::symbol("apply"), Value::symbol("+"), Value::symbol("%&")]),
             ])
         );
     }

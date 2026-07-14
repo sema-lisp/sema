@@ -15,7 +15,6 @@ use sema_core::runtime::{
     RuntimeResponse, RuntimeScopedIdCounter, SettlementSeq, TaskContextHandle, TaskId, TaskOutcome,
     TaskSettlement, Trace, WaitKind,
 };
-#[cfg(test)]
 use sema_core::runtime::{CancellationParent, LifetimeOwner, TaskRelations};
 use sema_core::EvalContext;
 #[cfg(test)]
@@ -100,6 +99,9 @@ struct RuntimeTask {
 // Task 4 replaces this placeholder with the VM-backed PreparedRoot payload.
 #[cfg_attr(not(test), allow(dead_code))]
 enum TaskPayload {
+    /// A real VM-backed root: `vm_call` drives execution and this payload is
+    /// never invoked (the VM-quantum arm in `visit_ready` takes precedence).
+    Vm,
     #[cfg(not(test))]
     UnavailableUntilTask4,
     #[cfg(test)]
@@ -202,6 +204,7 @@ impl Trace for TaskPayload {
         #[cfg(not(test))]
         let _ = sink;
         match self {
+            Self::Vm => true,
             #[cfg(not(test))]
             Self::UnavailableUntilTask4 => true,
             #[cfg(test)]
@@ -320,19 +323,14 @@ impl Runtime {
     }
 
     /// Submit a real VM-backed root: the task runs its pre-seeded VM through
-    /// `run_quantum` and settles with the VM result. The `Test` payload is inert
-    /// here — `vm_call` takes precedence in `visit_ready`, so it is never invoked.
-    #[cfg(test)]
-    pub(super) fn submit_vm_root(&self, vm: VM) -> Result<RootHandle, SubmitRootError> {
+    /// `run_quantum` and settles with the VM result. `vm_call` takes precedence
+    /// in `visit_ready`, so the `Vm` payload is never invoked.
+    pub fn submit_root(&self, vm: VM) -> Result<RootHandle, SubmitRootError> {
         let mut state = self.state.borrow_mut();
         if state.shutting_down || state.terminal_fault.is_some() {
             return Err(SubmitRootError::ShuttingDown);
         }
-        if state.force_root_exhaustion
-            || state.force_task_exhaustion
-            || state.root_ids.is_exhausted()
-            || state.task_ids.is_exhausted()
-        {
+        if state.root_ids.is_exhausted() || state.task_ids.is_exhausted() {
             return Err(SubmitRootError::IdExhausted);
         }
         let root = state
@@ -353,7 +351,7 @@ impl Runtime {
             task,
             RuntimeTask {
                 record: TaskRecord::new(task, relations),
-                payload: TaskPayload::Test(TestPreparedTask::returned(Value::NIL)),
+                payload: TaskPayload::Vm,
                 pending_resume: None,
                 suspended_owner: None,
                 vm_call: Some(vm),
@@ -1083,6 +1081,11 @@ impl Runtime {
             }
         } else {
             match &mut task.payload {
+                TaskPayload::Vm => {
+                    return Err(RuntimeFault::Invariant {
+                        message: "VM-backed root reached the payload arm without a vm_call".into(),
+                    });
+                }
                 #[cfg(not(test))]
                 TaskPayload::UnavailableUntilTask4 => {
                     return Err(RuntimeFault::Invariant {

@@ -606,7 +606,7 @@ fn submit_vm_expr(runtime: &Runtime, src: &str) -> RootHandle {
         Rc::new(Vec::new()),
     );
     vm.seed_main_frame(prog.closure);
-    runtime.submit_vm_root(vm).expect("root admitted")
+    runtime.submit_root(vm).expect("root admitted")
 }
 
 fn drive_root_to_int(runtime: &Runtime, handle: &RootHandle) -> i64 {

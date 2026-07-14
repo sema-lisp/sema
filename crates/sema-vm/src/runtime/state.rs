@@ -615,6 +615,13 @@ impl Runtime {
                         }
                     }
                     ProtocolWaitKind::Channel { channel, .. } => {
+                        // TODO(UCR-3): if cancel_wait returns None the receiver/sender
+                        // was already rendezvous-matched (its wake is in flight), so
+                        // cancel-and-drop here can lose a committed value. Fix is to
+                        // skip selecting such a wait (ChannelRegistry::has_wait) and let
+                        // the wake deliver. Currently guarded by the
+                        // dropped_protocol_completions diagnostic; not yet reproducible
+                        // by hand. See docs/bugs/ucr-3-channel-rendezvous-cancel-drop.md.
                         let _ = state.channels.cancel_wait(*channel, key);
                     }
                 }

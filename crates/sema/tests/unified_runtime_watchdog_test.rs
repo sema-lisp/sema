@@ -3,8 +3,10 @@ mod common;
 #[cfg(any(unix, windows))]
 use common::watchdog::run_command_with_timeout;
 use common::watchdog::run_sema_with_timeout;
+#[cfg(any(unix, windows))]
+use std::process::Command;
 #[cfg(windows)]
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::time::Duration;
 #[cfg(any(unix, windows))]
 use std::time::Instant;
@@ -211,6 +213,40 @@ fn escaped_session_pipe_writers_do_not_block_drain_join() {
 }
 
 #[cfg(unix)]
+fn unix_process_state(pid: libc::pid_t) -> Option<String> {
+    let pid = pid.to_string();
+    let output = Command::new("ps")
+        .args(["-o", "state=", "-p", &pid])
+        .output()
+        .expect("inspect watchdog descendant state with ps");
+    if !output.status.success() {
+        return None;
+    }
+    output
+        .stdout
+        .split(|byte| byte.is_ascii_whitespace())
+        .find(|state| !state.is_empty())
+        .map(|state| String::from_utf8_lossy(state).into_owned())
+}
+
+#[cfg(unix)]
+fn assert_process_absent_or_zombie(pid: libc::pid_t) {
+    let deadline = Instant::now() + Duration::from_secs(1);
+    loop {
+        match unix_process_state(pid) {
+            None => return,
+            Some(state) if state.starts_with('Z') => return,
+            Some(state) if Instant::now() >= deadline => {
+                panic!(
+                    "watchdog process-group cleanup left descendant {pid} running in state {state}"
+                )
+            }
+            Some(_) => std::thread::sleep(Duration::from_millis(10)),
+        }
+    }
+}
+
+#[cfg(unix)]
 #[test]
 fn inherited_pipe_writer_does_not_extend_parent_watchdog() {
     let started = Instant::now();
@@ -233,21 +269,7 @@ fn inherited_pipe_writer_does_not_extend_parent_watchdog() {
         .trim()
         .parse::<libc::pid_t>()
         .expect("shell must report its background descendant pid");
-    let reap_deadline = Instant::now() + Duration::from_secs(1);
-    while unsafe { libc::kill(descendant, 0) } == 0 && Instant::now() < reap_deadline {
-        std::thread::sleep(Duration::from_millis(10));
-    }
-    let descendant_lookup = unsafe { libc::kill(descendant, 0) };
-    let descendant_lookup_error = std::io::Error::last_os_error();
-    assert_eq!(
-        descendant_lookup, -1,
-        "watchdog process-group cleanup left descendant {descendant} alive"
-    );
-    assert_eq!(
-        descendant_lookup_error.raw_os_error(),
-        Some(libc::ESRCH),
-        "descendant lookup should fail because process-group cleanup reaped it"
-    );
+    assert_process_absent_or_zombie(descendant);
 }
 
 #[cfg(windows)]

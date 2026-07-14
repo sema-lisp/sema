@@ -377,7 +377,10 @@ Add `noisy_child_is_drained_without_hanging_and_capture_is_bounded`,
 `windows_inherited_pipe_writer_does_not_block_drain_join`. The noisy child must
 fill both stdout and stderr beyond pipe capacity while retained output stays at
 64 KiB per stream. The ordinary inherited writer proves best-effort process
-group cleanup. The escaped-session helper uses a pipe handshake to prove
+group cleanup. Its termination oracle accepts either an absent process or a
+`ps` state beginning with `Z`; orphan reaping belongs to the host init process
+and is not required to happen within the test deadline. The escaped-session
+helper uses a pipe handshake to prove
 `setsid` completed before its direct parent exits, then holds both diagnostic
 pipes open; the outer test proves drain joins still return before that writer
 exits. The Windows helper spawns a two-second PowerShell child inheriting both

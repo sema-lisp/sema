@@ -55,7 +55,7 @@ already satisfies the approved observation contract.
 | `runtime_conformance_test unified_runtime_scanner_detects_raw_blocking_recv_fixture` | Exit 101: scanner rejected unsupported `--scan-path`; after adding the option it still omitted the filename until `--with-filename` was required. | PASS, 0.02s; exact fixture `path:line:text` observed. |
 | `runtime_conformance_test unified_runtime_inventory_mapping_covers_exact_current_matches` | Exit 101: inventory checker did not exist. | PASS, 0.25s; checker covers 1,257 exact production matches. |
 | `unified_runtime_watchdog_test noisy_child_is_drained_without_hanging_and_capture_is_bounded` | Exit 101 after 5.00s: pipe backpressure misclassified the noisy child as hung. | PASS, 1.32s; both streams drain concurrently and retained diagnostics are capped at 64 KiB. |
-| `unified_runtime_watchdog_test inherited_pipe_writer_does_not_extend_parent_watchdog` | Exit 101 compile error: `run_command_with_timeout` was absent. | PASS, 0.01s; Unix process-group cleanup closes inherited writers, joins drains, and leaves no descendant. |
+| `unified_runtime_watchdog_test inherited_pipe_writer_does_not_extend_parent_watchdog` | Exit 101 compile error: `run_command_with_timeout` was absent. | PASS, 0.01s; Unix process-group cleanup terminates the inherited writer and joins drains. The oracle accepts absent or zombie state rather than requiring prompt orphan reaping. |
 | `vm_async_test async_all_surfaces_first_settled_rejection` | Review found an invalid implicit sibling-cancellation claim. | PASS, 0.02s; the test now asserts only first-settlement error selection. |
 | `embed_timeout_reap_test` | Review found timeout observation used as a cancellation owner. | 3 passed in 0.32s using explicit `async/cancel`; normal control uses plain await. |
 | `true_cancel_test` | Review found timeout observation used to prove resource abort. | 6 passed in 10.95s using explicit `async/cancel`; process/LLM abort and normal controls remain exact. |
@@ -156,6 +156,13 @@ The three native watchdog passes are noisy stdout/stderr draining, ordinary
 Unix process-group cleanup, and escaped-session no-EOF drain liveness. The
 Windows inherited-writer regression is target-gated and compile-locked here;
 native Windows execution remains a Task 07/CI gate.
+
+Post-commit robustness correction: the ordinary Unix descendant oracle polls
+`ps -o state= -p PID` and accepts either absence or a state beginning with `Z`.
+It still rejects a running descendant, but no longer assumes PID 1 reaps an
+orphaned zombie within one second. The full watchdog target rerun produced 3
+harness passes, the same single approved fairness RED, and 1 ignored helper in
+4.07s.
 
 ## Inventory and source guard
 

@@ -7,16 +7,32 @@ use std::time::{Duration, Instant};
 
 use sema_core::{
     runtime::{
-        CancelReason, CancellationParent, CompletionDecoder, CompletionKind, ExecutorAttachError,
-        ExecutorDispatch, ExecutorLease, ExecutorShutdown, ExecutorSnapshot, IdCounter,
+        CancelReason, CancellationParent, CompletionDecoder, CompletionDelivery, CompletionKind,
+        CompletionRegistrar, CompletionSender, ExecutorAttachError, ExecutorDispatch,
+        ExecutorLease, ExecutorShutdown, ExecutorSnapshot, ExternalCompletion, IdCounter,
         InterruptibleResource, IoExecutor, LifetimeOwner, NativeCall, NativeCallContext,
         NativeContinuation, NativeOutcome, NativeResult, NativeSuspend, PreparedExternalOperation,
-        ResumeInput, RootId, RunningSubmission, RuntimeId, RuntimeScopedIdCounter, ScopeId,
-        SettlementSeq, SubmissionRejected, SubmitErrorKind, TaskContextHandle, TaskId, TaskOutcome,
-        TaskRelations, Trace, WaitGeneration, WaitId, WaitKind,
+        ResumeInput, RootId, RunningSubmission, RuntimeId, RuntimeScopedIdCounter,
+        RuntimeScopedIdIssuers, ScopeId, SettlementSeq, SubmissionRejected, SubmitErrorKind,
+        TaskContextHandle, TaskId, TaskOutcome, TaskRelations, Trace, WaitGeneration, WaitId,
+        WaitKind,
     },
     SemaError, Value,
 };
+
+struct ClosedCompletionInbox;
+
+impl CompletionSender for ClosedCompletionInbox {
+    fn send(&self, _: ExternalCompletion) -> CompletionDelivery {
+        CompletionDelivery::InboxClosed
+    }
+}
+
+fn runtime_issuers() -> (RuntimeId, RuntimeScopedIdIssuers) {
+    let (runtime, _registrar, issuers) =
+        CompletionRegistrar::register(Arc::new(ClosedCompletionInbox)).unwrap();
+    (runtime, issuers)
+}
 
 use super::{
     drive::{BoundedDriver, DriveBudget, RuntimeClock},
@@ -34,11 +50,13 @@ use super::{
 #[test]
 fn protocol_registries_reject_foreign_ids_and_preserve_canonical_settlements() {
     use super::{PromiseRegistry, PromiseState};
-    let first_runtime = RuntimeId::allocate().unwrap();
-    let second_runtime = RuntimeId::allocate().unwrap();
-    let mut promises = PromiseRegistry::new(first_runtime);
+    let (first_runtime, first_issuers) = runtime_issuers();
+    let (_, first_promises, _) = first_issuers.into_parts();
+    let (second_runtime, second_issuers) = runtime_issuers();
+    let (_, second_promises, _) = second_issuers.into_parts();
+    let mut promises = PromiseRegistry::new(first_runtime, first_promises);
     let id = promises.allocate_pending(None).unwrap();
-    let foreign = super::PromiseRegistry::new(second_runtime)
+    let foreign = super::PromiseRegistry::new(second_runtime, second_promises)
         .allocate_pending(None)
         .unwrap();
     assert!(matches!(
@@ -59,8 +77,9 @@ fn protocol_registries_reject_foreign_ids_and_preserve_canonical_settlements() {
 #[test]
 fn channel_registry_is_fifo_and_cancellation_is_exact() {
     use super::{ChannelRegistry, ChannelResult};
-    let runtime = RuntimeId::allocate().unwrap();
-    let mut channels = ChannelRegistry::new(runtime);
+    let (runtime, issuers) = runtime_issuers();
+    let (_, _, channel_ids) = issuers.into_parts();
+    let mut channels = ChannelRegistry::new(runtime, channel_ids);
     let channel = channels.allocate(0).unwrap();
     let waits = WaitRuntime::new(Arc::new(FakeExecutor {
         mode: FakeSubmit::Inline,
@@ -97,8 +116,9 @@ fn channel_registry_is_fifo_and_cancellation_is_exact() {
 #[test]
 fn channel_try_receive_rendezvous_and_promotes_blocked_senders() {
     use super::{ChannelRegistry, ChannelResult};
-    let runtime = RuntimeId::allocate().unwrap();
-    let mut channels = ChannelRegistry::new(runtime);
+    let (runtime, issuers) = runtime_issuers();
+    let (_, _, channel_ids) = issuers.into_parts();
+    let mut channels = ChannelRegistry::new(runtime, channel_ids);
     let waits = WaitRuntime::new(Arc::new(FakeExecutor {
         mode: FakeSubmit::Inline,
         failure: None,
@@ -171,8 +191,9 @@ fn channel_try_receive_rendezvous_and_promotes_blocked_senders() {
 
 #[test]
 fn promise_observers_preserve_registration_order_and_reject_duplicates() {
-    let runtime = RuntimeId::allocate().unwrap();
-    let mut promises = super::PromiseRegistry::new(runtime);
+    let (runtime, issuers) = runtime_issuers();
+    let (_, promise_ids, _) = issuers.into_parts();
+    let mut promises = super::PromiseRegistry::new(runtime, promise_ids);
     let promise = promises.allocate_pending(None).unwrap();
     let waits = WaitRuntime::new(Arc::new(FakeExecutor {
         mode: FakeSubmit::Inline,
@@ -202,7 +223,11 @@ fn promise_observers_preserve_registration_order_and_reject_duplicates() {
         outcome: TaskOutcome::Returned(Value::int(1)),
     });
     assert_eq!(
-        promises.settle(promise, Rc::clone(&settlement)).unwrap(),
+        promises
+            .settle(promise, Rc::clone(&settlement))
+            .unwrap()
+            .into_iter()
+            .collect::<Vec<_>>(),
         vec![(keys[0], tasks[0]), (keys[2], tasks[2])]
     );
     assert!(matches!(
@@ -215,8 +240,9 @@ fn promise_observers_preserve_registration_order_and_reject_duplicates() {
 fn dormant_protocol_wait_fails_through_continuation() {
     let runtime = runtime_with_inline_executor(Rc::new(FakeClock::new()));
     let events = Arc::new(Mutex::new(Vec::new()));
-    let foreign_runtime = RuntimeId::allocate().unwrap();
-    let promise = super::PromiseRegistry::new(foreign_runtime)
+    let (foreign_runtime, issuers) = runtime_issuers();
+    let (_, promise_ids, _) = issuers.into_parts();
+    let promise = super::PromiseRegistry::new(foreign_runtime, promise_ids)
         .allocate_pending(None)
         .unwrap();
     let handle = runtime
@@ -237,6 +263,33 @@ struct RuntimeResponseContinuation(Arc<Mutex<Vec<&'static str>>>);
 impl Trace for RuntimeResponseContinuation {
     fn trace(&self, _: &mut dyn FnMut(sema_core::cycle::GcEdge<'_>)) -> bool {
         true
+    }
+}
+
+struct FateContinuation {
+    events: Arc<Mutex<Vec<&'static str>>>,
+    resumed: bool,
+}
+
+impl Drop for FateContinuation {
+    fn drop(&mut self) {
+        if !self.resumed {
+            self.events.lock().unwrap().push("dropped");
+        }
+    }
+}
+
+impl Trace for FateContinuation {
+    fn trace(&self, _: &mut dyn FnMut(sema_core::cycle::GcEdge<'_>)) -> bool {
+        true
+    }
+}
+
+impl NativeContinuation for FateContinuation {
+    fn resume(mut self: Box<Self>, _: &mut NativeCallContext<'_>, _: ResumeInput) -> NativeResult {
+        self.resumed = true;
+        self.events.lock().unwrap().push("resumed");
+        Ok(NativeOutcome::Return(Value::NIL))
     }
 }
 impl NativeContinuation for RuntimeResponseContinuation {
@@ -272,16 +325,90 @@ fn runtime_request_dispatch_and_response_application_are_separately_charged() {
         assert!(turns < 10);
     }
     assert_eq!(*events.lock().unwrap(), vec!["apply-response"]);
-    assert!(
-        turns >= 6,
-        "visit, action, native apply, dispatch, response apply, final apply are distinct"
+    assert_eq!(
+        turns, 6,
+        "visit -> action -> dispatch -> response/resume -> apply -> settle"
     );
 }
 
 #[test]
+fn synthetic_settlement_exhaustion_is_terminal_and_keeps_one_continuation_fate() {
+    let clock = Rc::new(FakeClock::new());
+    let runtime = runtime_with_inline_executor(clock.clone());
+    let fates = Arc::new(Mutex::new(Vec::new()));
+    let _handle = runtime
+        .submit_test_root(TestPreparedTask::native(Ok(NativeOutcome::Runtime(
+            sema_core::runtime::RuntimeRequest::CreateSettledPromise {
+                outcome: TaskOutcome::Returned(Value::int(1)),
+                continuation: Box::new(FateContinuation {
+                    events: Arc::clone(&fates),
+                    resumed: false,
+                }),
+            },
+        ))))
+        .unwrap();
+    runtime.force_settlement_exhaustion_for_test();
+
+    assert_eq!(
+        runtime.drive(&drive_budget(8)),
+        Err(super::RuntimeFault::IdExhausted { kind: "settlement" })
+    );
+    assert!(
+        fates.lock().unwrap().is_empty(),
+        "terminal cleanup retains fate"
+    );
+    assert_eq!(runtime.registry_counts_for_test().0, 0);
+    assert!(matches!(
+        runtime.submit_test_root(TestPreparedTask::returned(Value::NIL)),
+        Err(super::SubmitRootError::ShuttingDown)
+    ));
+    assert_eq!(
+        runtime.shutdown(&super::ShutdownOptions {
+            deadline: clock.now() + Duration::from_secs(1),
+            drive_budget: drive_budget(8),
+        }),
+        Err(super::RuntimeFault::IdExhausted { kind: "settlement" })
+    );
+    assert_eq!(fates.lock().unwrap().len(), 1, "one continuation fate");
+}
+
+#[test]
+fn promise_and_channel_allocator_exhaustion_leave_no_registry_record() {
+    for kind in ["promise", "channel"] {
+        let runtime = runtime_with_inline_executor(Rc::new(FakeClock::new()));
+        runtime.force_registry_exhaustion_for_test(kind);
+        let request = if kind == "promise" {
+            sema_core::runtime::RuntimeRequest::CreateSettledPromise {
+                outcome: TaskOutcome::Returned(Value::NIL),
+                continuation: Box::new(RuntimeResponseContinuation(Arc::new(Mutex::new(
+                    Vec::new(),
+                )))),
+            }
+        } else {
+            sema_core::runtime::RuntimeRequest::CreateChannel {
+                capacity: 1,
+                continuation: Box::new(RuntimeResponseContinuation(Arc::new(Mutex::new(
+                    Vec::new(),
+                )))),
+            }
+        };
+        let handle = runtime
+            .submit_test_root(TestPreparedTask::native(Ok(NativeOutcome::Runtime(
+                request,
+            ))))
+            .unwrap();
+        while matches!(handle.poll_result(), RootPoll::Pending) {
+            runtime.drive(&drive_budget(1)).unwrap();
+        }
+        assert_eq!(runtime.registry_counts_for_test(), (0, 0), "{kind}");
+    }
+}
+
+#[test]
 fn promise_observer_cancellation_does_not_cancel_supplied_promise() {
-    let runtime = RuntimeId::allocate().unwrap();
-    let mut promises = super::PromiseRegistry::new(runtime);
+    let (runtime, issuers) = runtime_issuers();
+    let (_, promise_ids, _) = issuers.into_parts();
+    let mut promises = super::PromiseRegistry::new(runtime, promise_ids);
     let promise = promises
         .allocate_pending(Some(TaskId::try_from_raw(9).unwrap()))
         .unwrap();
@@ -308,8 +435,9 @@ fn promise_observer_cancellation_does_not_cancel_supplied_promise() {
 
 #[test]
 fn channel_buffer_fifo_close_and_exact_waiter_cleanup() {
-    let runtime = RuntimeId::allocate().unwrap();
-    let mut channels = super::ChannelRegistry::new(runtime);
+    let (runtime, issuers) = runtime_issuers();
+    let (_, _, channel_ids) = issuers.into_parts();
+    let mut channels = super::ChannelRegistry::new(runtime, channel_ids);
     let channel = channels.allocate(2).unwrap();
     let waits = WaitRuntime::new(Arc::new(FakeExecutor {
         mode: FakeSubmit::Inline,
@@ -357,13 +485,75 @@ fn channel_buffer_fifo_close_and_exact_waiter_cleanup() {
             .unwrap(),
         super::ChannelResult::Received(Value::int(2))
     );
-    assert!(channels.close(channel).unwrap());
+    assert!(channels.close(channel).unwrap().is_some());
     assert_eq!(
         channels
             .receive(channel, keys[3], TaskId::try_from_raw(4).unwrap())
             .unwrap(),
         super::ChannelResult::Closed
     );
+}
+
+#[test]
+fn channel_close_detaches_long_fanout_and_emits_one_wake_at_a_time() {
+    let (runtime, issuers) = runtime_issuers();
+    let (_, _, channel_ids) = issuers.into_parts();
+    let mut channels = super::ChannelRegistry::new(runtime, channel_ids);
+    let channel = channels.allocate(0).unwrap();
+    let waits = WaitRuntime::new(Arc::new(FakeExecutor {
+        mode: FakeSubmit::Inline,
+        failure: None,
+    }))
+    .unwrap();
+    for raw in 1..=257 {
+        let mut key = waits.issue_internal_wait().unwrap();
+        key.runtime = runtime;
+        assert_eq!(
+            channels
+                .send(
+                    channel,
+                    key,
+                    TaskId::try_from_raw(raw).unwrap(),
+                    Value::int(raw as i64),
+                )
+                .unwrap(),
+            super::ChannelResult::Waiting
+        );
+    }
+
+    let mut close = channels.close(channel).unwrap().unwrap();
+    for expected in 1..=257 {
+        let wake = close.next_wake().expect("one pending wake");
+        assert_eq!(wake.task.get(), expected);
+        assert_eq!(wake.result, super::ChannelResult::Closed);
+    }
+    assert!(close.next_wake().is_none());
+}
+
+#[test]
+fn unsupported_spawn_drops_callable_outside_runtime_state_borrow() {
+    let runtime = runtime_with_inline_executor(Rc::new(FakeClock::new()));
+    let polled = runtime
+        .submit_test_root(TestPreparedTask::yield_forever())
+        .unwrap();
+    let owner = PollHandleOnDrop(polled.clone());
+    let callable = Value::native_fn(sema_core::NativeFn::simple("spawn-drop", move |_| {
+        let _owner = &owner;
+        Ok(Value::NIL)
+    }));
+    let handle = runtime
+        .submit_test_root(TestPreparedTask::native(Ok(NativeOutcome::Runtime(
+            sema_core::runtime::RuntimeRequest::Spawn {
+                callable,
+                continuation: Box::new(RuntimeResponseContinuation(Arc::new(Mutex::new(
+                    Vec::new(),
+                )))),
+            },
+        ))))
+        .unwrap();
+    while matches!(handle.poll_result(), RootPoll::Pending) {
+        runtime.drive(&drive_budget(1)).unwrap();
+    }
 }
 
 fn runtime_with_inline_executor(clock: Rc<dyn RuntimeClock>) -> Runtime {
@@ -1220,7 +1410,7 @@ fn runtime_rejects_forged_completion_identity_before_decode() {
     }
     assert_eq!(runtime.active_wait_count_for_test(), 1);
 
-    let wrong_runtime = RuntimeId::allocate().unwrap();
+    let (wrong_runtime, _) = runtime_issuers();
     let wrong_operation = IdCounter::<sema_core::runtime::OperationId>::new()
         .allocate()
         .unwrap();
@@ -2719,11 +2909,12 @@ struct Ids {
 
 impl Ids {
     fn new() -> Self {
-        let runtime = RuntimeId::allocate().expect("runtime ID available");
+        let (runtime, issuers) = runtime_issuers();
+        let (root_ids, _, _) = issuers.into_parts();
         Self {
             runtime,
             tasks: IdCounter::new(),
-            roots: RuntimeScopedIdCounter::new(runtime),
+            roots: root_ids,
             scopes: IdCounter::new(),
             waits: IdCounter::new(),
             generations: IdCounter::new(),

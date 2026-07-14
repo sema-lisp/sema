@@ -203,7 +203,9 @@ pub struct CompletionRegistrar {
 
 impl CompletionRegistrar {
     #[doc(hidden)]
-    pub fn register(sender: Arc<dyn CompletionSender>) -> Result<(RuntimeId, Self), IdExhausted> {
+    pub fn register(
+        sender: Arc<dyn CompletionSender>,
+    ) -> Result<(RuntimeId, Self, super::RuntimeScopedIdIssuers), IdExhausted> {
         let runtime_id = RuntimeId::allocate()?;
         Ok((
             runtime_id,
@@ -215,6 +217,7 @@ impl CompletionRegistrar {
                 generations: RefCell::new(IdCounter::new()),
                 operations: RefCell::new(IdCounter::new()),
             },
+            super::RuntimeScopedIdIssuers::new(runtime_id),
         ))
     }
 
@@ -1067,7 +1070,7 @@ mod tests {
         CompletionIdentity,
     ) {
         let sender = RecordingSender::new(delivery);
-        let (_, registrar) = CompletionRegistrar::register(sender.clone()).unwrap();
+        let (_, registrar, _) = CompletionRegistrar::register(sender.clone()).unwrap();
         let identity = registrar.issue_identity(selected_kind).unwrap();
         let descriptor = CompletionIdentity {
             runtime_id: identity.runtime_id(),
@@ -1211,8 +1214,8 @@ mod tests {
     #[test]
     fn fresh_registrars_reject_foreign_identity() {
         let sender = RecordingSender::new(CompletionDelivery::Delivered);
-        let (first_id, first) = CompletionRegistrar::register(sender.clone()).unwrap();
-        let (second_id, second) = CompletionRegistrar::register(sender).unwrap();
+        let (first_id, first, _) = CompletionRegistrar::register(sender.clone()).unwrap();
+        let (second_id, second, _) = CompletionRegistrar::register(sender).unwrap();
         assert_ne!(first_id, second_id);
         let identity = first.issue_identity(kind(1)).unwrap();
         assert!(second.bind(identity, blocking(Ok(Box::new(1_u8)))).is_err());
@@ -1221,7 +1224,7 @@ mod tests {
     #[test]
     fn external_and_internal_wait_identities_share_the_registrar_allocator() {
         let sender = RecordingSender::new(CompletionDelivery::Delivered);
-        let (_, registrar) = CompletionRegistrar::register(sender).unwrap();
+        let (_, registrar, _) = CompletionRegistrar::register(sender).unwrap();
 
         let internal = registrar.issue_wait_identity().unwrap();
         let external = registrar.issue_identity(kind(1)).unwrap();
@@ -1233,7 +1236,7 @@ mod tests {
     #[test]
     fn registrar_rejects_identity_kind_mismatch() {
         let sender = RecordingSender::new(CompletionDelivery::Delivered);
-        let (_, registrar) = CompletionRegistrar::register(sender.clone()).unwrap();
+        let (_, registrar, _) = CompletionRegistrar::register(sender.clone()).unwrap();
         let identity = registrar.issue_identity(kind(7)).unwrap();
         let error = match registrar.bind(identity, blocking(Ok(Box::new(1_u8)))) {
             Err(error) => error,
@@ -1275,7 +1278,7 @@ mod tests {
         }
 
         let sender = RecordingSender::new(CompletionDelivery::Delivered);
-        let (_, registrar) = CompletionRegistrar::register(sender).unwrap();
+        let (_, registrar, _) = CompletionRegistrar::register(sender).unwrap();
         bind_once(
             &registrar,
             registrar.issue_identity(kind(1)).unwrap(),
@@ -1350,7 +1353,7 @@ mod tests {
         drop(runtime);
 
         let sender = RecordingSender::new(CompletionDelivery::Delivered);
-        let (_, registrar) = CompletionRegistrar::register(sender.clone()).unwrap();
+        let (_, registrar, _) = CompletionRegistrar::register(sender.clone()).unwrap();
         let identity = registrar.issue_identity(kind(1)).unwrap();
         let binding = registrar.bind(identity, hostile_prepared()).unwrap();
         assert!(catch_unwind(AssertUnwindSafe(|| drop(binding))).is_ok());
@@ -1417,7 +1420,7 @@ mod tests {
         }
 
         let sender = RecordingSender::new(CompletionDelivery::Delivered);
-        let (_, registrar) = CompletionRegistrar::register(sender.clone()).unwrap();
+        let (_, registrar, _) = CompletionRegistrar::register(sender.clone()).unwrap();
         let result = catch_unwind(AssertUnwindSafe(|| {
             let identity = registrar.issue_identity(kind(1)).unwrap();
             let binding = registrar.bind(identity, hostile_prepared()).unwrap();

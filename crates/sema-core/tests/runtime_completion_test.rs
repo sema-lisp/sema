@@ -153,7 +153,7 @@ fn executor_attachment_contract_is_implementable_cross_crate() {
     assert_executor(&FakeExecutor);
 
     let make_submission = |sender: Arc<Sender>| {
-        let (_, registrar) = CompletionRegistrar::register(sender).unwrap();
+        let (_, registrar, _) = CompletionRegistrar::register(sender).unwrap();
         let kind = CompletionKind::try_from_raw(1).unwrap();
         let identity = registrar.issue_identity(kind).unwrap();
         let prepared = PreparedExternalOperation::quarantined_blocking(

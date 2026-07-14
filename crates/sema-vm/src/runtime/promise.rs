@@ -40,10 +40,14 @@ pub struct PromiseRegistry {
 }
 
 impl PromiseRegistry {
-    pub fn new(runtime: RuntimeId) -> Self {
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.records.len()
+    }
+    pub fn new(runtime: RuntimeId, ids: RuntimeScopedIdCounter<PromiseId>) -> Self {
         Self {
             runtime,
-            ids: RuntimeScopedIdCounter::new(runtime),
+            ids,
             records: HashMap::new(),
         }
     }
@@ -82,7 +86,7 @@ impl PromiseRegistry {
         &mut self,
         id: PromiseId,
         settlement: Rc<TaskSettlement>,
-    ) -> Result<Vec<(WaitKey, TaskId)>, RegistryError> {
+    ) -> Result<VecDeque<(WaitKey, TaskId)>, RegistryError> {
         let waiters = {
             let record = self.record_mut(id)?;
             if record.settlement.is_some() {
@@ -91,7 +95,7 @@ impl PromiseRegistry {
             record.settlement = Some(settlement);
             std::mem::take(&mut record.waiters)
         };
-        Ok(waiters.into())
+        Ok(waiters)
     }
     pub fn observe(
         &mut self,

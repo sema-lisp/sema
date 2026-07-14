@@ -185,29 +185,39 @@ impl Trace for WaitRuntime {
 
 impl WaitRuntime {
     pub fn new(executor: Arc<dyn IoExecutor>) -> Result<Self, RuntimeCreateError> {
+        Self::new_with_issuers(executor).map(|(runtime, _)| runtime)
+    }
+
+    pub(crate) fn new_with_issuers(
+        executor: Arc<dyn IoExecutor>,
+    ) -> Result<(Self, sema_core::runtime::RuntimeScopedIdIssuers), RuntimeCreateError> {
         let (sender, inbox) = mpsc::channel();
-        let (runtime_id, registrar) = CompletionRegistrar::register(Arc::new(InboxSender(sender)))
-            .map_err(|_| RuntimeCreateError::IdExhausted)?;
+        let (runtime_id, registrar, issuers) =
+            CompletionRegistrar::register(Arc::new(InboxSender(sender)))
+                .map_err(|_| RuntimeCreateError::IdExhausted)?;
         let lease = executor
             .attach_runtime(runtime_id)
             .map_err(RuntimeCreateError::ExecutorAttach)?;
-        Ok(Self {
-            runtime_id,
-            registrar: Some(registrar),
-            lease: Some(lease),
-            inbox: Some(inbox),
-            deferred: VecDeque::new(),
-            active: HashMap::new(),
-            cleanup: HashMap::new(),
-            cleanup_order: VecDeque::new(),
-            cleanup_tombstones: 0,
-            late_completions: 0,
-            quarantine_reaped: 0,
-            #[cfg(test)]
-            force_wait_exhaustion: false,
-            #[cfg(test)]
-            force_operation_exhaustion: false,
-        })
+        Ok((
+            Self {
+                runtime_id,
+                registrar: Some(registrar),
+                lease: Some(lease),
+                inbox: Some(inbox),
+                deferred: VecDeque::new(),
+                active: HashMap::new(),
+                cleanup: HashMap::new(),
+                cleanup_order: VecDeque::new(),
+                cleanup_tombstones: 0,
+                late_completions: 0,
+                quarantine_reaped: 0,
+                #[cfg(test)]
+                force_wait_exhaustion: false,
+                #[cfg(test)]
+                force_operation_exhaustion: false,
+            },
+            issuers,
+        ))
     }
 
     pub fn runtime_id(&self) -> RuntimeId {

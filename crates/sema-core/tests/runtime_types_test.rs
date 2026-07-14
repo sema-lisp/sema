@@ -1,11 +1,27 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 use sema_core::runtime::{
-    CancelReason, CancellationParent, ChannelId, CompletionKind, IdCounter, LifetimeOwner,
-    OperationId, PromiseId, RootId, RuntimeId, RuntimeScopedIdCounter, ScopeId, SettlementSeq,
+    CancelReason, CancellationParent, ChannelId, CompletionDelivery, CompletionKind,
+    CompletionRegistrar, CompletionSender, ExternalCompletion, IdCounter, LifetimeOwner,
+    OperationId, PromiseId, RootId, RuntimeId, RuntimeScopedIdIssuers, ScopeId, SettlementSeq,
     TaskId, TaskOutcome, TaskRelations, TaskSettlement, WaitGeneration, WaitId,
 };
 use sema_core::{SemaError, Value};
+
+struct ClosedInbox;
+
+impl CompletionSender for ClosedInbox {
+    fn send(&self, _: ExternalCompletion) -> CompletionDelivery {
+        CompletionDelivery::InboxClosed
+    }
+}
+
+fn runtime_issuers() -> (RuntimeId, RuntimeScopedIdIssuers) {
+    let (runtime, _registrar, issuers) = CompletionRegistrar::register(Arc::new(ClosedInbox))
+        .expect("runtime authority should be available");
+    (runtime, issuers)
+}
 
 #[test]
 fn ids_reject_zero_and_expose_nonzero_raw_values() {
@@ -44,12 +60,13 @@ fn ids_support_value_traits() {
 
 #[test]
 fn scoped_ids_expose_runtime_and_local_identity_publicly() {
-    let runtime = RuntimeId::allocate().expect("runtime ID should be available");
+    let (runtime, issuers) = runtime_issuers();
+    let (roots, promises, channels) = issuers.into_parts();
     assert_ne!(runtime.get(), 0);
 
     macro_rules! assert_scoped_accessors {
-        ($id_type:ty) => {{
-            let mut counter = RuntimeScopedIdCounter::<$id_type>::new(runtime);
+        ($id_type:ty, $counter:expr) => {{
+            let mut counter = $counter;
             let id = counter.allocate().expect("scoped ID should be available");
             assert_eq!(id.runtime(), runtime);
             assert_eq!(id.local(), 1);
@@ -57,17 +74,17 @@ fn scoped_ids_expose_runtime_and_local_identity_publicly() {
         }};
     }
 
-    assert_scoped_accessors!(RootId);
-    assert_scoped_accessors!(PromiseId);
-    assert_scoped_accessors!(ChannelId);
+    assert_scoped_accessors!(RootId, roots);
+    assert_scoped_accessors!(PromiseId, promises);
+    assert_scoped_accessors!(ChannelId, channels);
 }
 
 #[test]
 fn relationships_keep_origin_cancellation_and_lifetime_separate() {
     let root_task = TaskId::try_from_raw(1).expect("valid ID");
     let child_task = TaskId::try_from_raw(2).expect("valid ID");
-    let runtime = RuntimeId::allocate().expect("runtime ID should be available");
-    let mut roots = RuntimeScopedIdCounter::<RootId>::new(runtime);
+    let (_runtime, issuers) = runtime_issuers();
+    let (mut roots, _, _) = issuers.into_parts();
     let origin_root = roots.allocate().expect("root ID should be available");
     let relations = TaskRelations {
         origin_root,
@@ -114,10 +131,9 @@ fn settlement_outcomes_preserve_return_failure_and_cancellation() {
 
 #[test]
 fn condition_constructors_produce_exact_stable_maps() {
-    let runtime = RuntimeId::allocate().expect("runtime ID");
-    let root_id = RuntimeScopedIdCounter::<RootId>::new(runtime)
-        .allocate()
-        .expect("root ID");
+    let (_runtime, issuers) = runtime_issuers();
+    let (mut roots, _, _) = issuers.into_parts();
+    let root_id = roots.allocate().expect("root ID");
     let scope_id = IdCounter::<ScopeId>::new().allocate().expect("scope ID");
     let operation_id = IdCounter::<OperationId>::new()
         .allocate()

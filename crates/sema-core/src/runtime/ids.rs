@@ -55,7 +55,7 @@ impl CompletionKind {
 pub struct RuntimeId(NonZeroU64);
 
 impl RuntimeId {
-    pub fn allocate() -> Result<Self, IdExhausted> {
+    pub(crate) fn allocate() -> Result<Self, IdExhausted> {
         allocate_atomic(&NEXT_RUNTIME_ID).map(Self)
     }
 
@@ -197,7 +197,7 @@ impl private::Sealed for NonZeroU64 {
 }
 
 impl<I: RuntimeScopedIdType> RuntimeScopedIdCounter<I> {
-    pub fn new(runtime: RuntimeId) -> Self {
+    pub(crate) fn new(runtime: RuntimeId) -> Self {
         Self {
             runtime,
             local: IdCounter::new(),
@@ -213,6 +213,38 @@ impl<I: RuntimeScopedIdType> RuntimeScopedIdCounter<I> {
 
     pub fn is_exhausted(&self) -> bool {
         self.local.is_exhausted()
+    }
+}
+
+/// The complete, single-owner set of scoped ID allocators for one runtime.
+///
+/// This value is issued together with the completion registrar and is neither
+/// cloneable nor constructible by runtime consumers.
+#[doc(hidden)]
+pub struct RuntimeScopedIdIssuers {
+    root: RuntimeScopedIdCounter<RootId>,
+    promise: RuntimeScopedIdCounter<PromiseId>,
+    channel: RuntimeScopedIdCounter<ChannelId>,
+}
+
+impl RuntimeScopedIdIssuers {
+    pub(crate) fn new(runtime: RuntimeId) -> Self {
+        Self {
+            root: RuntimeScopedIdCounter::new(runtime),
+            promise: RuntimeScopedIdCounter::new(runtime),
+            channel: RuntimeScopedIdCounter::new(runtime),
+        }
+    }
+
+    #[doc(hidden)]
+    pub fn into_parts(
+        self,
+    ) -> (
+        RuntimeScopedIdCounter<RootId>,
+        RuntimeScopedIdCounter<PromiseId>,
+        RuntimeScopedIdCounter<ChannelId>,
+    ) {
+        (self.root, self.promise, self.channel)
     }
 }
 

@@ -21,6 +21,7 @@ use sema_core::EvalContext;
 #[cfg(test)]
 use sema_core::Value;
 
+use super::channel::ChannelClose;
 use super::{
     ChannelRegistry, ContinuationFrame, DriveBudget, DriveState, PendingResume, PromiseRegistry,
     PromiseState, ReadyScheduler, RegisterExternalError, RootRecord, RootState, RuntimeClock,
@@ -132,6 +133,10 @@ struct RuntimeState {
     #[cfg(test)]
     force_settlement_exhaustion: bool,
     #[cfg(test)]
+    force_promise_exhaustion: bool,
+    #[cfg(test)]
+    force_channel_exhaustion: bool,
+    #[cfg(test)]
     force_root_exhaustion: bool,
     #[cfg(test)]
     force_task_exhaustion: bool,
@@ -187,9 +192,9 @@ impl Runtime {
         clock: Rc<dyn RuntimeClock>,
         executor: Arc<dyn IoExecutor>,
     ) -> Result<Self, RuntimeCreateError> {
-        let waits = WaitRuntime::new(executor)?;
-        let root_ids = RuntimeScopedIdCounter::new(waits.runtime_id());
+        let (waits, issuers) = WaitRuntime::new_with_issuers(executor)?;
         let runtime_id = waits.runtime_id();
+        let (root_ids, promise_ids, channel_ids) = issuers.into_parts();
         Ok(Self {
             state: Rc::new(RefCell::new(RuntimeState {
                 _context: context,
@@ -198,8 +203,8 @@ impl Runtime {
                 root_ids,
                 task_ids: IdCounter::new(),
                 settlement_ids: IdCounter::new(),
-                promises: PromiseRegistry::new(runtime_id),
-                channels: ChannelRegistry::new(runtime_id),
+                promises: PromiseRegistry::new(runtime_id, promise_ids),
+                channels: ChannelRegistry::new(runtime_id, channel_ids),
                 roots: HashMap::new(),
                 tasks: HashMap::new(),
                 ready: ReadyScheduler::new(),
@@ -214,6 +219,10 @@ impl Runtime {
                 terminal_fault: None,
                 #[cfg(test)]
                 force_settlement_exhaustion: false,
+                #[cfg(test)]
+                force_promise_exhaustion: false,
+                #[cfg(test)]
+                force_channel_exhaustion: false,
                 #[cfg(test)]
                 force_root_exhaustion: false,
                 #[cfg(test)]
@@ -654,6 +663,28 @@ impl Runtime {
                 )?;
                 return Ok(true);
             }
+            PendingStage::PromiseWakes(mut wakes) => {
+                wakes.pop_front();
+                if !wakes.is_empty() {
+                    self.state
+                        .borrow_mut()
+                        .pending
+                        .push_back(PendingStage::PromiseWakes(wakes));
+                }
+                return Ok(true);
+            }
+            PendingStage::ChannelClose(mut close) => {
+                if let Some(wake) = close.next_wake() {
+                    self.state.borrow_mut().channels.emit_wake(wake);
+                }
+                if !close.is_empty() {
+                    self.state
+                        .borrow_mut()
+                        .pending
+                        .push_back(PendingStage::ChannelClose(close));
+                }
+                return Ok(true);
+            }
         };
         self.state.borrow_mut().pending.push_back(next);
         Ok(true)
@@ -992,22 +1023,44 @@ impl Runtime {
         owner: ReturnOwner,
         request: RuntimeRequest,
     ) -> Result<(), RuntimeFault> {
+        if let RuntimeRequest::Spawn {
+            callable,
+            continuation,
+        } = request
+        {
+            let response = Err(sema_core::SemaError::eval(
+                "runtime spawn admission is unavailable",
+            ));
+            drop(callable);
+            self.state
+                .borrow_mut()
+                .pending
+                .push_back(PendingStage::ApplyRuntimeResponse(
+                    task_id,
+                    owner,
+                    ContinuationFrame::native(continuation),
+                    response,
+                ));
+            return Ok(());
+        }
         let (continuation, response) = {
             let mut state = self.state.borrow_mut();
             match request {
-                RuntimeRequest::Spawn { continuation, .. } => (
-                    continuation,
-                    Err(sema_core::SemaError::eval(
-                        "runtime spawn admission is unavailable",
-                    )),
-                ),
+                RuntimeRequest::Spawn { .. } => unreachable!("spawn extracted before borrow"),
                 RuntimeRequest::CreateChannel {
                     capacity,
                     continuation,
                 } => {
-                    let response = state
-                        .channels
-                        .allocate(capacity)
+                    #[cfg(test)]
+                    let exhausted = state.force_channel_exhaustion;
+                    #[cfg(not(test))]
+                    let exhausted = false;
+                    let response = (!exhausted)
+                        .then(|| state.channels.allocate(capacity))
+                        .transpose()
+                        .ok()
+                        .flatten()
+                        .ok_or(sema_core::runtime::IdExhausted)
                         .map(RuntimeResponse::Channel)
                         .map_err(|_| {
                             sema_core::SemaError::eval("runtime channel identity exhausted")
@@ -1019,18 +1072,39 @@ impl Runtime {
                     continuation,
                 } => {
                     let response = (|| {
+                        #[cfg(test)]
+                        if state.force_promise_exhaustion {
+                            return Err(sema_core::SemaError::eval(
+                                "runtime promise identity exhausted",
+                            ));
+                        }
                         let promise = state.promises.reserve_id().map_err(|_| {
                             sema_core::SemaError::eval("runtime promise identity exhausted")
                         })?;
-                        let sequence = state.settlement_ids.allocate().map_err(|_| {
-                            sema_core::SemaError::eval("runtime settlement identity exhausted")
-                        })?;
+                        #[cfg(test)]
+                        let settlement_exhausted = state.force_settlement_exhaustion;
+                        #[cfg(not(test))]
+                        let settlement_exhausted = false;
+                        let sequence = (!settlement_exhausted)
+                            .then(|| state.settlement_ids.allocate())
+                            .transpose()
+                            .ok()
+                            .flatten()
+                            .ok_or_else(|| {
+                                let fault = RuntimeFault::IdExhausted { kind: "settlement" };
+                                state.shutting_down = true;
+                                state.terminal_fault = Some(fault);
+                                sema_core::SemaError::eval("runtime settlement identity exhausted")
+                            })?;
                         let settlement = Rc::new(TaskSettlement { sequence, outcome });
                         state.promises.insert_pending(promise, None);
-                        state
+                        let wakes = state
                             .promises
                             .settle(promise, settlement)
                             .map_err(registry_error)?;
+                        if !wakes.is_empty() {
+                            state.pending.push_back(PendingStage::PromiseWakes(wakes));
+                        }
                         Ok(RuntimeResponse::Promise(promise))
                     })();
                     (continuation, response)
@@ -1079,10 +1153,14 @@ impl Runtime {
                 } => {
                     use sema_core::runtime::ChannelOperation;
                     let response = match operation {
-                        ChannelOperation::Close => state
-                            .channels
-                            .close(channel)
-                            .map(|closed| RuntimeResponse::Value(sema_core::Value::bool(closed))),
+                        ChannelOperation::Close => state.channels.close(channel).map(|close| {
+                            if let Some(close) = close {
+                                state.pending.push_back(PendingStage::ChannelClose(close));
+                                RuntimeResponse::Value(sema_core::Value::TRUE)
+                            } else {
+                                RuntimeResponse::Value(sema_core::Value::FALSE)
+                            }
+                        }),
                         ChannelOperation::TryReceive => {
                             state.channels.try_receive(channel).map(|result| {
                                 RuntimeResponse::Receive(match result {
@@ -1119,7 +1197,11 @@ impl Runtime {
                 ContinuationFrame::native(continuation),
                 response,
             ));
-        Ok(())
+        self.state
+            .borrow()
+            .terminal_fault
+            .clone()
+            .map_or(Ok(()), Err)
     }
 
     fn invoke_callable(
@@ -1587,6 +1669,22 @@ impl Runtime {
     }
 
     #[cfg(test)]
+    pub(super) fn force_registry_exhaustion_for_test(&self, kind: &'static str) {
+        let mut state = self.state.borrow_mut();
+        match kind {
+            "promise" => state.force_promise_exhaustion = true,
+            "channel" => state.force_channel_exhaustion = true,
+            _ => panic!("unknown registry allocator: {kind}"),
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn registry_counts_for_test(&self) -> (usize, usize) {
+        let state = self.state.borrow();
+        (state.promises.len(), state.channels.len())
+    }
+
+    #[cfg(test)]
     pub(super) fn force_timer_failure_for_test(&self, kind: &str) {
         let mut state = self.state.borrow_mut();
         match kind {
@@ -1768,6 +1866,8 @@ enum PendingStage {
         ContinuationFrame,
         Result<RuntimeResponse, sema_core::SemaError>,
     ),
+    PromiseWakes(VecDeque<(super::WaitKey, TaskId)>),
+    ChannelClose(ChannelClose),
 }
 
 enum ReturnOwner {
@@ -1800,6 +1900,8 @@ impl Trace for PendingStage {
                         Err(error) => error.trace(sink),
                     }
             }
+            Self::PromiseWakes(_) => true,
+            Self::ChannelClose(close) => close.trace(sink),
         }
     }
 }

@@ -31,6 +31,31 @@ struct Receiver {
     key: WaitKey,
     task: TaskId,
 }
+pub(crate) struct ChannelClose {
+    senders: VecDeque<Sender>,
+    receivers: VecDeque<Receiver>,
+}
+
+impl ChannelClose {
+    pub(crate) fn next_wake(&mut self) -> Option<ChannelWake> {
+        if let Some(sender) = self.senders.pop_front() {
+            return Some(ChannelWake {
+                key: sender.key,
+                task: sender.task,
+                result: ChannelResult::Closed,
+            });
+        }
+        self.receivers.pop_front().map(|receiver| ChannelWake {
+            key: receiver.key,
+            task: receiver.task,
+            result: ChannelResult::Closed,
+        })
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.senders.is_empty() && self.receivers.is_empty()
+    }
+}
 struct Channel {
     capacity: usize,
     closed: bool,
@@ -46,10 +71,14 @@ pub struct ChannelRegistry {
 }
 
 impl ChannelRegistry {
-    pub fn new(runtime: RuntimeId) -> Self {
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.channels.len()
+    }
+    pub fn new(runtime: RuntimeId, ids: RuntimeScopedIdCounter<ChannelId>) -> Self {
         Self {
             runtime,
-            ids: RuntimeScopedIdCounter::new(runtime),
+            ids,
             channels: HashMap::new(),
             wakes: VecDeque::new(),
         }
@@ -113,11 +142,11 @@ impl ChannelRegistry {
         channel.receivers.push_back(Receiver { key, task });
         Ok(ChannelResult::Waiting)
     }
-    pub fn close(&mut self, id: ChannelId) -> Result<bool, RegistryError> {
+    pub(crate) fn close(&mut self, id: ChannelId) -> Result<Option<ChannelClose>, RegistryError> {
         let (senders, receivers) = {
             let channel = self.channel_mut(id)?;
             if channel.closed {
-                return Ok(false);
+                return Ok(None);
             }
             channel.closed = true;
             (
@@ -125,18 +154,10 @@ impl ChannelRegistry {
                 std::mem::take(&mut channel.receivers),
             )
         };
-        self.wakes.extend(senders.into_iter().map(|w| ChannelWake {
-            key: w.key,
-            task: w.task,
-            result: ChannelResult::Closed,
-        }));
-        self.wakes
-            .extend(receivers.into_iter().map(|w| ChannelWake {
-                key: w.key,
-                task: w.task,
-                result: ChannelResult::Closed,
-            }));
-        Ok(true)
+        Ok(Some(ChannelClose { senders, receivers }))
+    }
+    pub(crate) fn emit_wake(&mut self, wake: ChannelWake) {
+        self.wakes.push_back(wake);
     }
     pub fn inspect(
         &mut self,
@@ -220,6 +241,15 @@ impl Trace for ChannelRegistry {
             if let ChannelResult::Received(value) = &wake.result {
                 sink(sema_core::cycle::GcEdge::Value(value));
             }
+        }
+        true
+    }
+}
+
+impl Trace for ChannelClose {
+    fn trace(&self, sink: &mut dyn FnMut(sema_core::cycle::GcEdge<'_>)) -> bool {
+        for sender in &self.senders {
+            sink(sema_core::cycle::GcEdge::Value(&sender.value));
         }
         true
     }

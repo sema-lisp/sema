@@ -31,9 +31,9 @@ enum PreparedJob {
 
 pub struct PreparedExternalOperation {
     kind: CompletionKind,
-    decoder: Box<dyn CompletionDecoder>,
-    resource: ResourceClass,
-    job: PreparedJob,
+    decoder: Option<Box<dyn CompletionDecoder>>,
+    resource: Option<ResourceClass>,
+    job: Option<PreparedJob>,
 }
 
 impl PreparedExternalOperation {
@@ -54,9 +54,9 @@ impl PreparedExternalOperation {
         let (resource_kind, hook) = resource.into_parts();
         Self {
             kind,
-            decoder,
-            resource: ResourceClass::interruptible(resource_kind, hook),
-            job: PreparedJob::Async(Box::new(move || Box::pin(job()))),
+            decoder: Some(decoder),
+            resource: Some(ResourceClass::interruptible(resource_kind, hook)),
+            job: Some(PreparedJob::Async(Box::new(move || Box::pin(job())))),
         }
     }
 
@@ -72,12 +72,12 @@ impl PreparedExternalOperation {
         let (resource_kind, hook) = resource.into_parts();
         Self {
             kind,
-            decoder,
-            resource: ResourceClass::interruptible(resource_kind, hook),
-            job: PreparedJob::Blocking {
+            decoder: Some(decoder),
+            resource: Some(ResourceClass::interruptible(resource_kind, hook)),
+            job: Some(PreparedJob::Blocking {
                 class: BlockingDispatchClass::Interruptible,
                 job: Box::new(job),
-            },
+            }),
         }
     }
 
@@ -92,19 +92,33 @@ impl PreparedExternalOperation {
     {
         Self {
             kind,
-            decoder,
-            resource: ResourceClass::quarantined(bound),
-            job: PreparedJob::Blocking {
+            decoder: Some(decoder),
+            resource: Some(ResourceClass::quarantined(bound)),
+            job: Some(PreparedJob::Blocking {
                 class: BlockingDispatchClass::QuarantinedBounded,
                 job: Box::new(job),
-            },
+            }),
         }
     }
 }
 
 impl Trace for PreparedExternalOperation {
     fn trace(&self, sink: &mut dyn FnMut(GcEdge<'_>)) -> bool {
-        self.decoder.trace(sink) && self.resource.trace(sink)
+        self.decoder
+            .as_ref()
+            .is_none_or(|decoder| decoder.trace(sink))
+            && self
+                .resource
+                .as_ref()
+                .is_none_or(|resource| resource.trace(sink))
+    }
+}
+
+impl Drop for PreparedExternalOperation {
+    fn drop(&mut self) {
+        contained_drop_option(&mut self.decoder);
+        contained_drop_option(&mut self.resource);
+        contained_drop_option(&mut self.job);
     }
 }
 
@@ -223,7 +237,7 @@ impl CompletionRegistrar {
     pub fn bind(
         &self,
         identity: RuntimeIssuedCompletionIdentity,
-        prepared: PreparedExternalOperation,
+        mut prepared: PreparedExternalOperation,
     ) -> Result<ExternalOperationBinding, BindCompletionError> {
         if identity.runtime_id != self.runtime_id || identity.authority != self.authority {
             destroy_prepared(prepared);
@@ -244,63 +258,91 @@ impl CompletionRegistrar {
             operation_id: identity.operation_id,
             kind: identity.kind,
         };
-        let PreparedExternalOperation {
-            kind: _declared_kind,
-            decoder,
-            resource,
-            job,
-        } = prepared;
+        let decoder = prepared
+            .decoder
+            .take()
+            .expect("prepared operation owns decoder");
+        let resource = prepared
+            .resource
+            .take()
+            .expect("prepared operation owns resource");
+        let job = prepared.job.take().expect("prepared operation owns job");
         let control = Arc::new(AtomicU8::new(QUEUED));
         let sink = CompletionSink {
             sender: Arc::clone(&self.sender),
             identity,
         };
         Ok(ExternalOperationBinding {
-            runtime: RuntimeOperationBinding {
-                decoder,
-                resource,
-                queue_cancel: ExecutorCancelHandle {
+            runtime: Some(RuntimeOperationBinding {
+                decoder: Some(decoder),
+                resource: Some(resource),
+                queue_cancel: Some(ExecutorCancelHandle {
                     state: Arc::clone(&control),
-                },
-            },
-            submission: ExecutorSubmission {
+                }),
+            }),
+            submission: Some(ExecutorSubmission {
                 identity,
                 sink: Some(sink),
-                start: ExecutorStartToken { state: control },
+                start: Some(ExecutorStartToken { state: control }),
                 job: Some(job),
-            },
+            }),
         })
     }
 }
 
 pub struct ExternalOperationBinding {
-    runtime: RuntimeOperationBinding,
-    submission: ExecutorSubmission,
+    runtime: Option<RuntimeOperationBinding>,
+    submission: Option<ExecutorSubmission>,
 }
 
 impl ExternalOperationBinding {
     #[doc(hidden)]
-    pub fn split(self) -> (RuntimeOperationBinding, ExecutorSubmission) {
-        (self.runtime, self.submission)
+    pub fn split(mut self) -> (RuntimeOperationBinding, ExecutorSubmission) {
+        (
+            self.runtime.take().expect("binding owns runtime half"),
+            self.submission
+                .take()
+                .expect("binding owns submission half"),
+        )
+    }
+}
+
+impl Drop for ExternalOperationBinding {
+    fn drop(&mut self) {
+        contained_drop_option(&mut self.runtime);
+        contained_drop_option(&mut self.submission);
     }
 }
 
 pub struct RuntimeOperationBinding {
-    decoder: Box<dyn CompletionDecoder>,
-    resource: ResourceClass,
-    queue_cancel: ExecutorCancelHandle,
+    decoder: Option<Box<dyn CompletionDecoder>>,
+    resource: Option<ResourceClass>,
+    queue_cancel: Option<ExecutorCancelHandle>,
 }
 
 impl RuntimeOperationBinding {
     #[doc(hidden)]
     pub fn into_parts(
-        self,
+        mut self,
     ) -> (
         Box<dyn CompletionDecoder>,
         ResourceClass,
         ExecutorCancelHandle,
     ) {
-        (self.decoder, self.resource, self.queue_cancel)
+        (
+            self.decoder.take().expect("runtime binding owns decoder"),
+            self.resource.take().expect("runtime binding owns resource"),
+            self.queue_cancel
+                .take()
+                .expect("runtime binding owns cancel handle"),
+        )
+    }
+}
+
+impl Drop for RuntimeOperationBinding {
+    fn drop(&mut self) {
+        contained_drop_option(&mut self.decoder);
+        contained_drop_option(&mut self.resource);
     }
 }
 
@@ -377,7 +419,7 @@ impl CompletionSink {
 pub struct ExecutorSubmission {
     identity: CompletionIdentity,
     sink: Option<CompletionSink>,
-    start: ExecutorStartToken,
+    start: Option<ExecutorStartToken>,
     job: Option<PreparedJob>,
 }
 
@@ -394,7 +436,7 @@ impl ExecutorSubmission {
             PreparedJob::Async(job) => ExecutorDispatch::Async(AsyncExecutorDispatch {
                 identity,
                 sink: Some(sink),
-                start: Some(self.start),
+                start: self.start.take(),
                 job: Some(job),
             }),
             PreparedJob::Blocking { class, job } => {
@@ -402,7 +444,7 @@ impl ExecutorSubmission {
                     identity,
                     class,
                     sink: Some(sink),
-                    start: Some(self.start),
+                    start: self.start.take(),
                     job: Some(job),
                 })
             }
@@ -412,8 +454,16 @@ impl ExecutorSubmission {
     pub fn reject(self, kind: SubmitErrorKind) -> SubmissionRejected {
         SubmissionRejected {
             kind,
-            submission: Box::new(self),
+            submission: Some(Box::new(self)),
         }
+    }
+}
+
+impl Drop for ExecutorSubmission {
+    fn drop(&mut self) {
+        contained_drop_option(&mut self.sink);
+        contained_drop_option(&mut self.job);
+        contained_drop_option(&mut self.start);
     }
 }
 
@@ -686,7 +736,7 @@ pub enum SubmitErrorKind {
 
 pub struct SubmissionRejected {
     kind: SubmitErrorKind,
-    submission: Box<ExecutorSubmission>,
+    submission: Option<Box<ExecutorSubmission>>,
 }
 
 impl SubmissionRejected {
@@ -695,20 +745,25 @@ impl SubmissionRejected {
     }
 
     pub fn operation_id(&self) -> OperationId {
-        self.submission.operation_id()
+        self.submission
+            .as_ref()
+            .expect("rejection owns submission")
+            .operation_id()
     }
 
-    pub fn rollback(self) -> SubmitErrorKind {
-        let SubmissionRejected { kind, submission } = self;
-        let mut submission = *submission;
-        if let Some(sink) = submission.sink.take() {
-            contained_drop(sink);
+    pub fn rollback(mut self) -> SubmitErrorKind {
+        if let Some(submission) = self.submission.take() {
+            contained_drop(submission);
         }
-        if let Some(job) = submission.job.take() {
-            contained_drop(job);
+        self.kind
+    }
+}
+
+impl Drop for SubmissionRejected {
+    fn drop(&mut self) {
+        if let Some(submission) = self.submission.take() {
+            contained_drop(submission);
         }
-        contained_drop(submission.start);
-        kind
     }
 }
 
@@ -730,16 +785,14 @@ fn contained_drop<T>(value: T) {
     }
 }
 
+fn contained_drop_option<T>(option: &mut Option<T>) {
+    if let Some(value) = option.take() {
+        contained_drop(value);
+    }
+}
+
 fn destroy_prepared(prepared: PreparedExternalOperation) {
-    let PreparedExternalOperation {
-        decoder,
-        resource,
-        job,
-        ..
-    } = prepared;
-    contained_drop(decoder);
-    contained_drop(resource);
-    contained_drop(job);
+    drop(prepared);
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -1235,6 +1288,144 @@ mod tests {
         assert_eq!(rejection.rollback(), SubmitErrorKind::Capacity);
         assert_eq!(sender.attempts.load(Ordering::Relaxed), 0);
         assert_eq!(dropped.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    #[cfg(panic = "unwind")]
+    fn unadmitted_owner_abandonment_contains_hostile_destructors() {
+        struct HostileDrop;
+        impl Drop for HostileDrop {
+            fn drop(&mut self) {
+                panic!("hostile unadmitted owner drop");
+            }
+        }
+
+        fn hostile_prepared() -> PreparedExternalOperation {
+            let hostile = HostileDrop;
+            PreparedExternalOperation::interruptible_blocking(
+                kind(1),
+                decoder(),
+                interruptible(),
+                move || {
+                    drop(hostile);
+                    Ok(Box::new(1_u8))
+                },
+            )
+        }
+
+        assert!(catch_unwind(AssertUnwindSafe(|| drop(hostile_prepared()))).is_ok());
+
+        let (sender, runtime, submission, _) =
+            registration(hostile_prepared(), kind(1), CompletionDelivery::Delivered);
+        assert!(catch_unwind(AssertUnwindSafe(|| drop(submission))).is_ok());
+        assert_eq!(sender.attempts.load(Ordering::Relaxed), 0);
+        drop(runtime);
+
+        let (sender, runtime, submission, _) =
+            registration(hostile_prepared(), kind(1), CompletionDelivery::Delivered);
+        let rejection = submission.reject(SubmitErrorKind::Capacity);
+        assert!(catch_unwind(AssertUnwindSafe(|| drop(rejection))).is_ok());
+        assert_eq!(sender.attempts.load(Ordering::Relaxed), 0);
+        drop(runtime);
+
+        let sender = RecordingSender::new(CompletionDelivery::Delivered);
+        let (_, registrar) = CompletionRegistrar::register(sender.clone()).unwrap();
+        let identity = registrar.issue_identity(kind(1)).unwrap();
+        let binding = registrar.bind(identity, hostile_prepared()).unwrap();
+        assert!(catch_unwind(AssertUnwindSafe(|| drop(binding))).is_ok());
+        assert_eq!(sender.attempts.load(Ordering::Relaxed), 0);
+
+        struct HostileDecoder;
+        impl Trace for HostileDecoder {
+            fn trace(&self, _sink: &mut dyn FnMut(GcEdge<'_>)) -> bool {
+                true
+            }
+        }
+        impl CompletionDecoder for HostileDecoder {
+            fn decode(
+                self: Box<Self>,
+                _context: &mut NativeCallContext<'_>,
+                _result: JobResult,
+            ) -> Result<Value, crate::SemaError> {
+                Ok(Value::NIL)
+            }
+        }
+        impl Drop for HostileDecoder {
+            fn drop(&mut self) {
+                panic!("hostile runtime decoder drop");
+            }
+        }
+        let prepared = PreparedExternalOperation::interruptible_blocking(
+            kind(1),
+            Box::new(HostileDecoder),
+            interruptible(),
+            || Ok(Box::new(1_u8)),
+        );
+        let (_sender, runtime, submission, _) =
+            registration(prepared, kind(1), CompletionDelivery::Delivered);
+        assert!(catch_unwind(AssertUnwindSafe(|| drop(runtime))).is_ok());
+        drop(submission.reject(SubmitErrorKind::Capacity));
+    }
+
+    #[test]
+    #[cfg(panic = "unwind")]
+    fn unadmitted_owner_abandonment_during_unwind_leaks_opaque_owners() {
+        struct HostileDrop;
+        impl Drop for HostileDrop {
+            fn drop(&mut self) {
+                panic!("hostile nested drop");
+            }
+        }
+        struct DropDuringUnwind<T>(Option<T>);
+        impl<T> Drop for DropDuringUnwind<T> {
+            fn drop(&mut self) {
+                drop(self.0.take());
+            }
+        }
+        fn hostile_prepared() -> PreparedExternalOperation {
+            let hostile = HostileDrop;
+            PreparedExternalOperation::interruptible_blocking(
+                kind(1),
+                decoder(),
+                interruptible(),
+                move || {
+                    drop(hostile);
+                    Ok(Box::new(1_u8))
+                },
+            )
+        }
+
+        let sender = RecordingSender::new(CompletionDelivery::Delivered);
+        let (_, registrar) = CompletionRegistrar::register(sender.clone()).unwrap();
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            let identity = registrar.issue_identity(kind(1)).unwrap();
+            let binding = registrar.bind(identity, hostile_prepared()).unwrap();
+            let (runtime, submission) = binding.split();
+            let identity = registrar.issue_identity(kind(1)).unwrap();
+            let rejection = registrar
+                .bind(identity, hostile_prepared())
+                .unwrap()
+                .split()
+                .1
+                .reject(SubmitErrorKind::Capacity);
+            let identity = registrar.issue_identity(kind(1)).unwrap();
+            let direct_submission = registrar
+                .bind(identity, hostile_prepared())
+                .unwrap()
+                .split()
+                .1;
+            let _prepared_guard = DropDuringUnwind(Some(hostile_prepared()));
+            let _runtime_guard = DropDuringUnwind(Some(runtime));
+            let _submission_guard = DropDuringUnwind(Some(submission));
+            let _rejection_guard = DropDuringUnwind(Some(rejection));
+            let identity = registrar.issue_identity(kind(1)).unwrap();
+            let binding = registrar.bind(identity, hostile_prepared()).unwrap();
+            let _binding_guard = DropDuringUnwind(Some(binding));
+            let _direct_submission_guard = DropDuringUnwind(Some(direct_submission));
+            panic!("outer unwind");
+        }));
+        assert!(result.is_err());
+        assert_eq!(sender.attempts.load(Ordering::Relaxed), 0);
     }
 
     #[test]

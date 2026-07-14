@@ -177,12 +177,16 @@ lease unregisters or an explicit process shutdown. `Runtime::apply_native_suspen
 boxed prepared request to private `start_external`, which destructures that
 bundle once. Before calling the lease's `submit`, it installs the task's
 `Running -> Waiting` state, `RegisteredExternalWait` with traced decoder and
-continuation, and concrete cleanup/resource entry, then creates the sink from
-that registration. An inline completion can only enqueue; the driver processes
-it after this transition returns and therefore observes the registered waiting
-task. If `submit` returns `SubmissionRejected`, the runtime takes back and drops
-the job, sink, and start token, removes the wait, processes/transfers resource
-cleanup once, drops the queue-cancel half, changes `Waiting -> Running`, and
+continuation, and concrete cleanup/resource entry, then uses the
+`pub(in crate::runtime)` factory to create the opaque submission from that
+registration. `sema-io` receives only that submission and invokes its sealed
+driver; it never receives the sink. An inline completion can only enqueue; the
+driver processes it after this transition returns and therefore observes the
+registered waiting task. If `submit` returns `SubmissionRejected`, the runtime
+takes back and drops the job and start token returned by `into_rollback`; that
+method destroys the private sink inside `sema-core` and returns the rejection
+kind. The runtime then removes the wait, processes/transfers resource cleanup
+once, drops the queue-cancel half, changes `Waiting -> Running`, and
 routes `ExternalFailureCode::Rejected` through the same consuming decoder and
 then the same consuming continuation used by worker completion. No task remains
 parked and rejection cannot enqueue a completion. For each
@@ -350,7 +354,7 @@ First use fake jobs/executors to pin the interface itself:
   and makes the task ready through its stored continuation;
 - `submit_rejection_resumes_registered_continuation` — the same path returns
   `SubmissionRejected`; `into_rollback` drops the private sink and returns only
-  job/start-token ownership, rollback
+  job/start-token ownership and the rejection kind, rollback
   removes wait/control state, and the structured failure consumes the decoder
   then continuation once without a parked task or enqueued completion;
 - `submit_rejection_rolls_back_wait_and_resource` — successful rollback leaves

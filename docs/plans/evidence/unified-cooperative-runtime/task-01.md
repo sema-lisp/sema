@@ -305,3 +305,11 @@ executor submission contract in the synchronized master and Tasks 02/03/05;
 the only `sink: CompletionSink` occurrence is the private field in
 `ExecutorSubmission`. `git diff --check` passed. `jake docs-check` passed with 1
 selected docs test.
+
+## Executor submission construction seal
+
+Task 02 restricts `ExecutorSubmission::for_registered_wait` to
+`pub(in crate::runtime)`. Task 03 runtime registration constructs the opaque
+submission, and `sema-io` receives only that submission plus access to its
+sealed driver. `SubmissionRejected::into_rollback` destroys the private sink
+inside `sema-core` and returns only the job, start token, and rejection kind.

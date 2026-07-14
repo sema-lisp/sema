@@ -324,8 +324,9 @@ interpreter.
 
 Before submission, the runtime registers the exact wait generation, decoder,
 runtime-selected completion kind, and concrete resource/cancel hook. It gives
-the executor a send-only job and a private identity/kind-bearing completion
-sink, but the executor never exposes that sink to the job. Preparation also
+the executor an opaque submission whose core-owned driver contains a send-only
+job and private identity/kind-bearing completion sink; `sema-io` cannot access
+the sink, and the driver never exposes it to the job. Preparation also
 creates a shared atomic queue-control pair before wait registration: the runtime
 stores the cancel handle and submits the non-cloneable start token with the job.
 `Queued -> Cancelled` versus `Queued -> Running` is the sole cancel/dequeue
@@ -360,8 +361,9 @@ opaque owning queue item. Its sealed public driver lets `sema-io` ask the
 private `CompletionSink` across the crate boundary.
 `ExecutorJobControl` creates the `ExecutorCancelHandle` and non-cloneable token;
 `CancelBeforeStart` and `ExecutorStartDecision` name the CAS outcomes.
-`SubmissionRejected::into_rollback` destroys the private sink and returns its
-kind, job, and start token for rollback, so rejection cannot forge delivery.
+`SubmissionRejected::into_rollback` destroys the private sink inside `sema-core`
+and returns only the rejection kind, job, and start token for rollback, so
+rejection cannot forge delivery.
 `PreparedExternalOperation` owns the runtime decoder/resource plus exactly one
 job and token. Registration allocates operation/wait/generation/completion
 identity; producers and executors allocate no runtime IDs.

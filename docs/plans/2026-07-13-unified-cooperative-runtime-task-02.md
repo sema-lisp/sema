@@ -268,7 +268,7 @@ result into exactly one `DecodedCompletion`, which the runtime converts to
 `ResumeInput::Returned`/`Failed` before consuming the continuation.
 
 The interpreter runtime selects `CompletionKind` while registering the wait and
-copies it into the private `CompletionSink` defined in Task 05. The executor,
+copies it into the private `CompletionSink` defined in this task. The executor,
 not the worker job, owns that sink. A worker job can only return its send-safe
 result; it cannot omit or duplicate delivery, select a kind, forge identity
 fields, or return a runtime-side decoder/resource hook. The executor converts a
@@ -558,7 +558,7 @@ pub struct ExecutorSubmission {
 }
 
 impl ExecutorSubmission {
-    pub fn for_registered_wait(
+    pub(in crate::runtime) fn for_registered_wait(
         sender: Arc<dyn CompletionSender>,
         runtime_id: RuntimeId,
         wait_id: WaitId,
@@ -697,7 +697,8 @@ pub trait IoExecutor: Send + Sync {
 `CompletionSink` belongs to `sema-core::runtime::completion`; both its
 constructor and consuming `complete` method are `pub(in crate::runtime)`. Rust
 privacy cannot privilege the separate `sema-io` crate, so `sema-io` never names
-or receives a sink. Runtime registration calls the public, checked
+or receives a sink. Runtime registration calls the checked,
+`pub(in crate::runtime)`
 `ExecutorSubmission::for_registered_wait` factory, which delegates sink
 construction to `completion.rs` after validating the registered identities and
 bundles the sink with the job and start token. The resulting queue item has

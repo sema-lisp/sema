@@ -274,7 +274,8 @@ safe.
 `WaitId`, `WaitGeneration`, and completion identity, and installs `RegisteredExternalWait`, the concrete
 `ResourceClass` cleanup entry, and the task's `Running -> Waiting` state before
 it constructs the opaque `ExecutorSubmission` through the checked `sema-core`
-factory (which privately constructs the sink) and calls Task 05 submission. The
+`pub(in crate::runtime)` factory (which privately constructs the sink) and calls
+Task 05 submission. The
 driver cannot drain the completion inbox reentrantly during this transition, so
 an executor that completes inline during `submit` sees fully registered waiting
 state; its completion is processed only after `apply_native_suspend` returns.

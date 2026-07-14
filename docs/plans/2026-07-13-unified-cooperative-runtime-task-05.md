@@ -100,7 +100,8 @@ fake servers, deterministic fault injection.
 
 ## Exact executor interface
 
-Task 02 defines the exact `CompletionSender`, private `CompletionSink`, opaque
+Task 02 defines the exact `CompletionSender`, private unnameable
+`CompletionSink`, capability-safe `CompletionRegistrar`, opaque
 `ExecutorSubmission`, `ExecutorDispatch` wrappers, `ExecutorJob`,
 `PreparedExternalOperation`, `RunningSubmission`, owning `SubmissionRejected`,
 `ExecutorLease`, and `IoExecutor` interfaces in `sema-core`. Task 03 consumes
@@ -157,17 +158,19 @@ Task 02 defines `ExecutorJob` and the sole unregistered
 `PreparedExternalOperation` with its three compatibility-enforcing constructors;
 Task 03 defines the distinct
 `RegisteredExternalWait`. Task 05 implements their executor boundary but MUST
-NOT introduce a second prepared/external-wait owner. The executor owns the
-opaque submission after admission and never passes it to the job's consuming
-`run`. The job only returns a
+NOT introduce a second prepared/external-wait owner. The executor reserves
+capacity while it owns an unarmed submission, calls `into_dispatch` as the
+admission linearization point, and enqueues only the armed dispatch. It never
+passes either wrapper to the job's consuming `run`. The job only returns a
 send-safe result. Worker code therefore cannot omit or duplicate completion
 delivery, select the completion kind, return a resource/cancel hook, or move
 VM-side cleanup state across the thread boundary. `RunningSubmission` is only an
-immediate admission receipt. On rejection, `SubmissionRejected` proves no
+immediate admission receipt. On pre-arm rejection, `SubmissionRejected` proves no
 admission or sink delivery occurred. It owns the rejected submission, exposes
-read-only kind and operation identity, and consumes itself for rollback; the
-private sink is destroyed in `sema-core` and rejected callers never receive a
-delivery capability.
+read-only kind and operation identity, and consumes itself for rollback; core
+destroys the private sink, job, and start token and returns only the rejection
+kind. If enqueue fails after arming, dispatch drop attempts cancellation; this
+is admitted cancellation, never `SubmissionRejected`.
 
 Each interpreter runtime owns one `ExecutorLease` over the process-wide pool.
 Lease shutdown rejects new jobs for that runtime, cancels/drains only its jobs,
@@ -178,16 +181,16 @@ lease unregisters or an explicit process shutdown. `Runtime::apply_native_suspen
 boxed prepared request to private `start_external`, which destructures that
 bundle once. Before calling the lease's `submit`, it installs the task's
 `Running -> Waiting` state, `RegisteredExternalWait` with traced decoder and
-continuation, and concrete cleanup/resource entry, then asks the core runtime
-registration helper to create the opaque submission. That runtime-private
-helper is not callable from `sema-io`. `sema-io` receives only the submission
-and calls its inherent `into_dispatch()`; it never receives the sink. An inline
+continuation, and concrete cleanup/resource entry, then uses its privately owned
+registrar to bind the runtime-issued identity and prepared operation. The split
+keeps decoder/resource state runtime-local and gives `sema-io` only the
+submission; it never receives or can name the sink. After capacity reservation,
+`sema-io` calls `into_dispatch()` before enqueue. An inline
 completion can only enqueue; the dispatch wrapper processes it after this
 transition returns and therefore observes the
-registered waiting task. If `submit` returns `SubmissionRejected`, the runtime
-takes back and drops the job and start token returned by `into_rollback`; that
-method destroys the private sink inside `sema-core` and returns the rejection
-kind. The runtime then removes the wait, processes/transfers resource cleanup
+registered waiting task. If `submit` returns `SubmissionRejected`, its consuming
+rollback destroys the unarmed sink/job/start token internally and returns the
+rejection kind. The runtime then removes the wait, processes/transfers resource cleanup
 once, drops the queue-cancel half, changes `Waiting -> Running`, and
 routes `ExternalFailureCode::Rejected` through the same consuming decoder and
 then the same consuming continuation used by worker completion. No task remains
@@ -220,14 +223,15 @@ blocking use; a racing request then causes immediate attach-and-abort. If an API
 exposes its handle only after a potentially unbounded acquisition and cannot
 select/poll cancellation, split acquisition into its own interruptible wait,
 prove `QuarantinedBounded`, or mark the operation `PROHIBITED`. After dequeue,
-`sema-io` calls `ExecutorSubmission::into_dispatch()`. It polls an async
+`sema-io` polls an already armed async
 wrapper's consuming future or calls a blocking wrapper's consuming `run`; the
-wrappers claim the token, catch construction/poll/run panic, map panic to
-`ExternalFailureCode::WorkerPanic`, and privately consume
-`CompletionSink::complete` exactly once. Dropping an admitted wrapper or async
-future emits terminal cancellation. `InboxClosed` in the returned dispatch
-report increments the executor's
-undeliverable counter rather than silently discarding a send failure. An
+wrappers claim the token, catch construction/poll/run panic under
+`panic = "unwind"`, map panic to `ExternalFailureCode::WorkerPanic`, and make
+exactly one terminal delivery attempt through the private sink. `panic =
+"abort"` terminates the process. Dropping an admitted wrapper or async future
+attempts terminal cancellation. Because `Drop` returns no report, bounded
+non-panicking `CompletionSender::send` (or its explicit reporter) increments the
+undeliverable counter on `InboxClosed`. An
 enqueued completion rejected by `WaitRegistry` as stale, cancelled, duplicate,
 or wrong-identity normally increments the runtime's `late_completions` counter.
 The exception is an exact full-identity match in quarantine cleanup after its
@@ -308,15 +312,21 @@ First use fake jobs/executors to pin the interface itself:
   tagged completion with the runtime-selected kind;
 - `executor_completes_returned_failure_exactly_once` — a returned
   `ExternalFailure` follows the same one-shot path;
-- `executor_converts_job_panic_to_completion` — a panic before a job can return
-  is converted to `WorkerPanic` and cannot strand the wait;
+- `executor_converts_job_panic_to_completion` — under `panic = "unwind"`, a
+  panic before a job can return is converted to `WorkerPanic` and cannot strand
+  the wait; document that abort mode terminates instead;
 - `io_job_cannot_control_completion_delivery` — the fake job is `Send`, its
   consuming `run` returns only a send-safe result, and the type/API gives it no
   sink with which to omit, duplicate, or forge a completion;
 - `only_send_work_crosses` — a deliberately non-`Send` decoder and runtime
   cancel hook remain in the prepared operation/registry;
-- `closed_completion_inbox_is_accounted` — a send failure produces
-  `InboxClosed` and increments the executor's undeliverable counter;
+- `closed_completion_inbox_is_accounted` — a bounded non-panicking send failure
+  produces `InboxClosed` and sender-side accounting increments the executor's
+  undeliverable counter, including delivery attempted from drop;
+- `admission_arms_before_enqueue` — capacity rejection leaves an unarmed
+  submission and sends no completion; accepted queues contain only dispatches;
+  faulted enqueue after arming drops the dispatch, attempts cancellation, and
+  is not reported as `SubmissionRejected`;
 - `late_enqueued_completion_is_accounted` — cancellation followed by an
   enqueued completion increments the runtime's late-completion counter without
   changing the task outcome;
@@ -356,8 +366,8 @@ First use fake jobs/executors to pin the interface itself:
   + Waiting -> inline completion` path; the inbox is processed only afterward
   and makes the task ready through its stored continuation;
 - `submit_rejection_resumes_registered_continuation` — the same path returns
-  `SubmissionRejected`; `into_rollback` drops the private sink and returns only
-  job/start-token ownership and the rejection kind, rollback
+  `SubmissionRejected`; rollback destroys the private sink/job/start token
+  internally and returns only the rejection kind, then runtime rollback
   removes wait/control state, and the structured failure consumes the decoder
   then continuation once without a parked task or enqueued completion;
 - `submit_rejection_rolls_back_wait_and_resource` — successful rollback leaves
@@ -377,7 +387,8 @@ inbox/fault-injection case because the public `ExecutorJob` API cannot produce i
 Preserve the process-wide pool identity and blocking-tier admission headroom.
 Keep `CompletionSink`, submission construction, and result delivery private to
 `sema-core::runtime`; `sema-io` must only queue the opaque
-`ExecutorSubmission` and consume its `Async`/`Blocking` dispatch wrapper. Construct the
+`ExecutorSubmission` until capacity is reserved, arm it with `into_dispatch`,
+and queue only its `Async`/`Blocking` dispatch wrapper. Construct the
 queue-cancel/start-token pair before wait
 registration, store the runtime handle beside `ResourceClass`, and submit the
 non-cloneable token with the job. Implement the exact atomic

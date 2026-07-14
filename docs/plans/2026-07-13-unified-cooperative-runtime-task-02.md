@@ -121,6 +121,14 @@ defines IDs only.
 
 ## Completion and decoding boundary
 
+Task 3 below first adds the compile prerequisite shared by completion and
+prepared operations: `Trace`, an opaque `TaskContext` declaration,
+`CancellationView`/`NativeCallContext`, `DecodedCompletion`, and
+`CompletionDecoder`. This order is required:
+the decoder is traceable and names both native types, while
+`PreparedExternalOperation` owns a decoder. It does not add native outcomes,
+continuations, the `NativeFn` dual ABI, or tracing behavior; those remain Task 4.
+
 ```rust
 pub type SendPayload = Box<dyn Any + Send>;
 
@@ -153,6 +161,12 @@ and the expected Rust type when downcast fails. The envelope cannot contain
 `Value`, `Env`, `SemaError`, `Rc`, a continuation, or other runtime-thread state.
 Wrong-kind rejection before decode is Task 03 behavior.
 
+`DecodedCompletion` is the decoder's native-independent terminal value:
+
+```rust
+pub type DecodedCompletion = Result<Value, SemaError>;
+```
+
 `CompletionDecoder` consumes one correctly routed result and runs on the
 runtime thread:
 
@@ -168,14 +182,38 @@ pub trait CompletionDecoder: Trace {
 
 ## Executor seam
 
-The new seam is `sema_core::runtime::executor`. `CompletionSink`, submission
-construction, and their fields are runtime-private with visibility legal from
-their declaration site (plain private methods or `pub(in crate::runtime)` only
-inside `crate::runtime` descendants).
+The new seam is `sema_core::runtime::executor`. Rust has no friend-crate
+visibility. `CompletionSink`, its constructor, `complete`, submission
+construction, and their fields therefore remain plain private inside
+`sema_core::runtime`; downstream crates cannot name the sink.
 
 ```rust
 pub trait CompletionSender: Send + Sync + 'static {
+    // Bounded and non-panicking; it never waits for inbox capacity.
     fn send(&self, completion: ExternalCompletion) -> CompletionDelivery;
+}
+
+#[doc(hidden)]
+pub struct CompletionRegistrar { /* private runtime id + sender capability */ }
+
+impl CompletionRegistrar {
+    /// Allocates a fresh RuntimeId; it cannot target an existing runtime.
+    #[doc(hidden)]
+    pub fn register(sender: Arc<dyn CompletionSender>) -> (RuntimeId, Self);
+
+    #[doc(hidden)]
+    pub fn bind(
+        &self,
+        identity: RuntimeIssuedCompletionIdentity,
+        prepared: PreparedExternalOperation,
+    ) -> ExternalOperationBinding;
+}
+
+pub struct ExternalOperationBinding { /* private runtime-local + dispatch halves */ }
+
+impl ExternalOperationBinding {
+    #[doc(hidden)]
+    pub fn split(self) -> (RuntimeOperationBinding, ExecutorSubmission);
 }
 
 pub struct ExecutorSubmission { /* private sink, token, job, identity */ }
@@ -207,7 +245,7 @@ pub struct SubmissionRejected { /* rejection kind + rejected submission */ }
 impl SubmissionRejected {
     pub fn kind(&self) -> SubmitErrorKind;
     pub fn operation_id(&self) -> OperationId;
-    pub fn into_rollback(self) -> RejectedSubmissionRollback;
+    pub fn rollback(self) -> SubmitErrorKind;
 }
 
 pub enum ExecutorAttachError {
@@ -216,21 +254,28 @@ pub enum ExecutorAttachError {
 }
 ```
 
-No additional executor trait is required. `sema-io` dequeues an opaque submission,
-calls `into_dispatch()`, then dispatches the resulting public wrapper. Each
-wrapper privately owns the sink, start token, and job. It guarantees one
-terminal completion for success, returned error, queued cancellation, panic,
-and abandonment. Dropping an admitted dispatch or the future returned by
-`into_future()` delivers terminal cancellation instead of dropping the sink.
-The async wrapper catches both future-construction panic and polling panic. This
+No additional executor trait is required. After reserving capacity,
+`ExecutorSubmission::into_dispatch` is the admission linearization point and
+the executor enqueues only the armed `ExecutorDispatch`. An unarmed submission
+may be rejected; `SubmissionRejected::rollback` destroys its sink, job, and
+start token inside core and returns only the rejection kind. If enqueue fails
+after arming, dropping the dispatch makes one cancellation delivery attempt;
+that path is admitted cancellation, not `SubmissionRejected`.
+
+Each wrapper privately owns the sink, start token, and job. It makes exactly one
+terminal delivery attempt for success, returned error, queued cancellation,
+panic, or abandonment. Panic conversion is guaranteed only with
+`panic = "unwind"`; `panic = "abort"` terminates the process. Dropping an
+admitted dispatch or its future attempts terminal cancellation. The async
+wrapper catches both future-construction and polling panic under unwind. This
 can be implemented without Tokio in `sema-core`; add workspace `futures` only
 if the implementation explicitly selects and documents it.
 
-`SubmissionRejected` keeps ownership of the rejected submission. Its consuming
-rollback destroys the sink and returns only the rejection kind and owners needed
-by Task 03 to undo registration; it never exposes completion authority. Task 02
-defines this ownership shape, but actual registration and rejection rollback are
-Task 03.
+`CompletionSender::send` is bounded and non-panicking. A terminal attempt may
+report `InboxClosed`; sender-side accounting (or an explicitly deferred
+reporter owned by the sender) records that failure. `Drop` cannot return a
+delivery report. Task 02 defines this ownership shape; Task 03 owns registration
+and rejection rollback.
 
 `PreparedExternalOperation` has private fields and exactly three constructors:
 
@@ -249,6 +294,14 @@ only declared completion kind, decoder, resource, and job inputs appropriate to
 the selected constructor. The runtime allocates `RuntimeId` (at runtime
 construction) and all operation/wait/generation identity during registration;
 producers do not supply identities, sinks, or start tokens.
+
+`sema-vm::Runtime` privately owns its `CompletionRegistrar`. The registrar
+accepts only identities issued by that runtime and consumes the prepared
+operation into a split binding: the VM keeps the decoder/resource/registration
+half on the runtime thread, while only the opaque submission and its later
+dispatch/future/envelope cross threads. No API reconstructs a registrar for an
+existing `RuntimeId`, so another crate cannot inject completion authority into
+an existing runtime.
 
 `ExecutorDispatch` has only `Async` and `Blocking`; do not add parallel job or
 dispatch abstractions. `RunningSubmission` may remain the admission
@@ -305,7 +358,8 @@ pub enum NativeOutcome {
 }
 ```
 
-`NativeCallContext` contains only `&mut TaskContext` and an owned cancellation
+The shell above is introduced as the first prerequisite of Task 3 so
+`CompletionDecoder` compiles. `NativeCallContext` contains only `&mut TaskContext` and an owned cancellation
 snapshot. It contains no concrete interpreter, output capability, evaluator callback, or generic
 call capability. Native code requests Sema execution only through
 `NativeOutcome::Call`; Task 03 adds runtime mechanics and Task 06 owns output
@@ -342,7 +396,8 @@ reason. Rust tests assert exact maps. Language predicates are Task 04.
 
 ## Task context shell
 
-Task 02 implements only the typed extension shell:
+Task 3 declares `TaskContext` with private storage so `NativeCallContext` can
+name it. Task 5 implements only its typed extension behavior:
 
 ```rust
 pub trait TaskLocalValue: Trace {
@@ -433,18 +488,28 @@ output routing, migration of existing `EvalContext` fields, production
   `CONDITION_TYPES`; add no error variants or predicates.
 - [ ] Run the `settlement` and `condition` test filters.
 
-## Task 3: Implement completion, resources, and executor wrappers
+## Task 3: Implement the completion compile prerequisite, resources, and executor wrappers
 
-- [ ] Test `ExternalCompletion: Send`, typed decode failure, prepared-operation
-  constructor compatibility, quarantine descriptors, attachment errors, and
-  rejection rollback ownership.
+- [ ] In this exact order, add the minimal `Trace` signature, declare the
+  private `TaskContext` shell, add `CancellationView`/`NativeCallContext`,
+  `DecodedCompletion`, and `CompletionDecoder`; then add completion envelopes, resources,
+  `PreparedExternalOperation`, registrar binding, and executor wrappers.
+  Do not implement tracing or native outcomes/continuations/ABI changes yet.
+- [ ] Test `ExternalCompletion: Send`, while a deliberately non-`Send` decoder,
+  prepared binding, and resource remain runtime-local; test typed decode
+  failure, constructor compatibility, quarantine descriptors, attachment
+  errors, capability-safe registration, and internal rejection destruction.
 - [ ] Test each dispatch terminal path: return, error, queued cancellation,
-  construction panic, poll/run panic, dispatch drop, and future drop. Assert one
-  completion and no exposed sink.
+  construction panic, poll/run panic (under unwind), dispatch drop, and future
+  drop. Assert one bounded terminal delivery attempt and no nameable sink.
+- [ ] Test reserve -> arm (`into_dispatch`) -> enqueue ordering: rejected work
+  remains unarmed; admitted queues contain only dispatches; post-arm enqueue
+  failure attempts cancellation and is not `SubmissionRejected`. Test closed
+  inbox accounting in the sender/reporter rather than as a `Drop` return.
 - [ ] Implement under `runtime::{completion,resource,executor}` without touching
   `io_backend.rs`; run the `completion`, `resource`, and `executor` filters.
 
-## Task 4: Implement native dual path and tracing
+## Task 4: Complete native protocol, dual path, and tracing
 
 - [ ] Test return/call/suspend requests, each `ResumeInput`, consuming
   continuation behavior, legacy constructor compatibility, runtime-aware legacy
@@ -493,8 +558,9 @@ git diff --check
 
 - Checked IDs cannot wrap; public raw construction is limited and fallible.
 - Conditions use exact `SemaError::Condition` maps and preserve all `u64`s.
-- Executor wrappers own private completion authority and complete every admitted
-  path exactly once, including panic and abandonment.
+- Executor wrappers own private completion authority and make exactly one
+  terminal delivery attempt on every admitted path, including unwind panic and
+  abandonment; abort panic terminates the process.
 - Prepared operations cannot pair an incompatible resource and job.
 - Native runtime context has only task context and cancellation snapshot; legacy
   ABI and constructors remain source-compatible.

@@ -174,8 +174,9 @@ Settlement remains pollable while that count is nonzero. Final-handle drop is
 queued as cleanup, and the root is reaped only after settlement and after all
 descendant, debugger, output, and tracing retention reaches zero.
 
-`Runtime::new` allocates its `RuntimeId` and thread-safe completion inbox,
-wraps the inbox sender as `Arc<dyn CompletionSender>`, and calls
+`Runtime::new` creates its thread-safe completion inbox, calls
+`CompletionRegistrar::register` to receive a fresh `RuntimeId` plus the
+capability-safe registrar, stores the registrar privately, and calls
 `executor.attach_runtime(runtime_id)` once and propagates attachment failure.
 Duplicate IDs and attachment after executor shutdown are errors. Runtime state owns the returned
 `Arc<dyn ExecutorLease>` and inbox receiver. Tests inject a Task 02 fake
@@ -273,10 +274,11 @@ safe.
 `WaitKind::External`, it destructures the sole
 `Box<PreparedExternalOperation>` exactly once, allocates `OperationId`,
 `WaitId`, `WaitGeneration`, and completion identity, and installs `RegisteredExternalWait`, the concrete
-`ResourceClass` cleanup entry, and the task's `Running -> Waiting` state before
-it asks the `sema-core::runtime` registration helper to construct the opaque
-`ExecutorSubmission` and private sink, then calls the lease. Runtime-private
-construction is not callable by `sema-io`. The executor cannot drain the
+`ResourceClass` cleanup entry, and the task's `Running -> Waiting` state. Its
+private registrar binds that runtime-issued identity and prepared operation,
+then splits the binding: the VM retains the non-`Send` decoder/resource half and
+submits only the opaque `ExecutorSubmission`. `sema-io` cannot name the sink or
+obtain a registrar for this runtime. The executor cannot drain the
 completion inbox reentrantly during this transition, so
 an executor that completes inline during `submit` sees fully registered waiting
 state; its completion is processed only after `apply_native_suspend` returns.
@@ -296,11 +298,11 @@ through one continuation, a callback that enqueues a completion while running,
 and nested native-to-Sema-to-native suspension; none may panic from a nested
 `RefCell` borrow or process the enqueued completion reentrantly.
 
-Submission rejection returns an opaque owning error. Its `into_rollback` method
-destroys the sink in `sema-core` and returns only the unadmitted job, start
-token, and rejection kind. The same transaction removes the wait, takes the
+Submission rejection returns an opaque owning error. Its consuming `rollback`
+destroys the unarmed sink, job, and start token inside `sema-core` and returns
+only the rejection kind. The same transaction removes the wait, takes the
 wait-owned resource entry, performs its one-shot cancellation, drops both
-queue-control halves and the rejected job, transitions `Waiting -> Running`, and consumes the
+queue-control halves, transitions `Waiting -> Running`, and consumes the
 registered decoder with `Err(ExternalFailure { code: Rejected, ... })`. It maps
 that `DecodedCompletion` to `ResumeInput::Returned`/`Failed` and then consumes
 the already-registered continuation.

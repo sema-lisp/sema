@@ -45,6 +45,7 @@ pub struct EvalContext {
     pub call_owned_fn: Cell<Option<CallOwnedCallbackFn>>,
     pub interactive: Cell<bool>,
     task_context: RefCell<Option<TaskContextHandle>>,
+    runtime_quantum_active: Cell<bool>,
 }
 
 /// RAII guard for a module-load scope: pops the load stack when dropped, so the
@@ -53,6 +54,17 @@ pub struct EvalContext {
 pub struct ModuleLoadGuard<'a> {
     ctx: &'a EvalContext,
     path: PathBuf,
+}
+
+pub struct TaskContextGuard<'a> {
+    ctx: &'a EvalContext,
+    previous: Option<TaskContextHandle>,
+}
+
+impl Drop for TaskContextGuard<'_> {
+    fn drop(&mut self) {
+        self.ctx.task_context.replace(self.previous.take());
+    }
 }
 
 impl Drop for ModuleLoadGuard<'_> {
@@ -85,6 +97,7 @@ impl EvalContext {
             call_owned_fn: Cell::new(None),
             interactive: Cell::new(false),
             task_context: RefCell::new(None),
+            runtime_quantum_active: Cell::new(false),
         }
     }
 
@@ -111,6 +124,7 @@ impl EvalContext {
             call_owned_fn: Cell::new(None),
             interactive: Cell::new(false),
             task_context: RefCell::new(None),
+            runtime_quantum_active: Cell::new(false),
         }
     }
 
@@ -120,6 +134,26 @@ impl EvalContext {
 
     pub fn install_task_context(&self, handle: TaskContextHandle) -> Option<TaskContextHandle> {
         self.task_context.replace(Some(handle))
+    }
+
+    pub fn scope_task_context(&self, handle: TaskContextHandle) -> TaskContextGuard<'_> {
+        TaskContextGuard {
+            ctx: self,
+            previous: self.task_context.replace(Some(handle)),
+        }
+    }
+
+    pub fn enter_runtime_quantum(&self) -> Result<RuntimeQuantumGuard<'_>, SemaError> {
+        if self.runtime_quantum_active.replace(true) {
+            return Err(SemaError::eval(
+                "internal error: runtime VM quantum is already active",
+            ));
+        }
+        Ok(RuntimeQuantumGuard { ctx: self })
+    }
+
+    pub fn runtime_quantum_active(&self) -> bool {
+        self.runtime_quantum_active.get()
     }
 
     pub fn take_task_context(&self) -> Option<TaskContextHandle> {
@@ -448,6 +482,16 @@ impl EvalContext {
     }
 }
 
+pub struct RuntimeQuantumGuard<'a> {
+    ctx: &'a EvalContext,
+}
+
+impl Drop for RuntimeQuantumGuard<'_> {
+    fn drop(&mut self) {
+        self.ctx.runtime_quantum_active.set(false);
+    }
+}
+
 impl Default for EvalContext {
     fn default() -> Self {
         Self::new()
@@ -484,6 +528,47 @@ mod tests {
         assert_eq!(handle.borrow().get::<TestTaskLocal>().unwrap().0, 4);
         assert!(context.take_task_context().is_some());
         assert!(context.task_context().is_none());
+    }
+
+    #[test]
+    fn scoped_task_context_restores_the_exact_handle_after_panic() {
+        let context = EvalContext::new();
+        let outer = crate::runtime::TaskContextHandle::default();
+        let inner = crate::runtime::TaskContextHandle::default();
+        outer
+            .borrow_mut()
+            .insert(std::rc::Rc::new(TestTaskLocal(1)));
+        inner
+            .borrow_mut()
+            .insert(std::rc::Rc::new(TestTaskLocal(2)));
+        context.install_task_context(outer);
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _scope = context.scope_task_context(inner.clone());
+            assert_eq!(
+                context
+                    .task_context()
+                    .unwrap()
+                    .borrow()
+                    .get::<TestTaskLocal>()
+                    .unwrap()
+                    .0,
+                2
+            );
+            panic!("test unwind");
+        }));
+
+        assert!(result.is_err());
+        assert_eq!(
+            context
+                .task_context()
+                .unwrap()
+                .borrow()
+                .get::<TestTaskLocal>()
+                .unwrap()
+                .0,
+            1
+        );
     }
 
     struct TestTaskLocal(u32);

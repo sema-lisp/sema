@@ -386,6 +386,85 @@ fn native_call_into_sema_closure_and_back_to_native_uses_task_vm() {
 }
 
 #[test]
+fn extracted_runtime_closure_preserves_call_native_table() {
+    let forms = sema_reader::read_many("(lambda () (identity 42))").unwrap();
+    let globals = Rc::new(sema_core::Env::new());
+    globals.set(
+        sema_core::intern("identity"),
+        Value::native_fn(sema_core::NativeFn::simple("identity", |args| {
+            Ok(args[0].clone())
+        })),
+    );
+    let known = [sema_core::intern("identity")].into_iter().collect();
+    let program = crate::compile_program(&forms, Some(known)).unwrap();
+    let context = sema_core::EvalContext::new();
+    let mut vm = crate::VM::new(
+        globals,
+        program.functions,
+        &program.native_table,
+        program.main_cache_slots,
+    )
+    .unwrap();
+    let callable = vm.execute(program.closure, &context).unwrap();
+    let runtime = runtime_with_inline_executor(Rc::new(FakeClock::new()));
+    let handle = runtime
+        .submit_test_root(TestPreparedTask::native(Ok(NativeOutcome::Call(
+            NativeCall {
+                callable,
+                args: Vec::new(),
+                continuation: Box::new(ChainContinuation { remaining: 0 }),
+            },
+        ))))
+        .unwrap();
+
+    while matches!(handle.poll_result(), RootPoll::Pending) {
+        runtime.drive(&drive_budget(8)).unwrap();
+    }
+    assert!(matches!(
+        handle.poll_result(),
+        RootPoll::Ready(settlement)
+            if matches!(settlement.outcome, TaskOutcome::Returned(ref value) if value.as_int() == Some(42))
+    ));
+}
+
+#[test]
+fn cancellation_after_vm_quantum_expiry_resumes_installed_continuation() {
+    let forms =
+        sema_reader::read_many("(lambda () (let loop ((n 1000)) (if (= n 0) n (loop (- n 1)))))")
+            .unwrap();
+    let program = crate::compile_program(&forms, None).unwrap();
+    let context = sema_core::EvalContext::new();
+    let mut vm = crate::VM::new(
+        Rc::new(sema_core::Env::new()),
+        program.functions,
+        &program.native_table,
+        program.main_cache_slots,
+    )
+    .unwrap();
+    let callable = vm.execute(program.closure, &context).unwrap();
+    let runtime = runtime_with_inline_executor(Rc::new(FakeClock::new()));
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let handle = runtime
+        .submit_test_root(TestPreparedTask::native(Ok(NativeOutcome::Call(
+            NativeCall {
+                callable,
+                args: Vec::new(),
+                continuation: Box::new(RecordingContinuation(Arc::clone(&events))),
+            },
+        ))))
+        .unwrap();
+
+    for _ in 0..8 {
+        runtime.drive(&drive_budget(1)).unwrap();
+    }
+    assert!(handle.cancel(CancelReason::Explicit));
+    while matches!(handle.poll_result(), RootPoll::Pending) {
+        runtime.drive(&drive_budget(8)).unwrap();
+    }
+    assert_eq!(*events.lock().unwrap(), vec!["resume-cancelled"]);
+}
+
+#[test]
 fn runtime_forced_trace_keeps_values_in_root_settlement_and_every_pending_stage() {
     let runtime = runtime_with_inline_executor(Rc::new(FakeClock::new()));
     let handle = runtime
@@ -507,6 +586,28 @@ fn runtime_native_quantum_may_poll_and_cancel_root_reentrantly() {
     assert!(!handle.cancel(CancelReason::Timeout));
 
     REENTRANT_HANDLE.with(|slot| slot.borrow_mut().take());
+}
+
+#[test]
+fn nested_runtime_drive_fails_without_resetting_outer_instruction_accounting() {
+    let runtime = runtime_with_inline_executor(Rc::new(FakeClock::new()));
+    let nested = runtime.clone_for_test();
+    let handle = runtime
+        .submit_test_root(TestPreparedTask::native_call(move || {
+            assert!(matches!(
+                nested.drive(&drive_budget(1)),
+                Err(super::RuntimeFault::Invariant { ref message })
+                    if message.contains("already active")
+            ));
+            Ok(NativeOutcome::Return(Value::int(7)))
+        }))
+        .unwrap();
+
+    let report = runtime.drive(&drive_budget(8)).unwrap();
+    assert!(matches!(report, super::DriveState::Progress { .. }));
+    while matches!(handle.poll_result(), RootPoll::Pending) {
+        runtime.drive(&drive_budget(8)).unwrap();
+    }
 }
 
 #[test]

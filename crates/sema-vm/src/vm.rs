@@ -106,6 +106,7 @@ pub struct Closure {
 struct VmClosurePayload {
     closure: Rc<Closure>,
     functions: Rc<Vec<Rc<Function>>>,
+    native_fns: Rc<Vec<Rc<NativeFn>>>,
 }
 
 /// A decoded global binding held in an inline-cache slot. `LoadGlobal` slots
@@ -233,6 +234,10 @@ fn trace_vm_closure_payload(
         sever: sever_nothing,
     });
     sink(function_table_edge(&payload.functions));
+    for native in payload.native_fns.iter() {
+        let value = Value::native_fn_from_rc(Rc::clone(native));
+        sink(sema_core::GcEdge::Value(&value));
+    }
     true
 }
 
@@ -369,14 +374,18 @@ fn sever_nothing(_: sema_core::NodePtr) -> Option<Value> {
 }
 
 /// Extracted VM closure: the closure itself and the function table from its compilation context.
-pub type VmClosureInfo = (Rc<Closure>, Rc<Vec<Rc<Function>>>);
+pub type VmClosureInfo = (Rc<Closure>, Rc<Vec<Rc<Function>>>, Rc<Vec<Rc<NativeFn>>>);
 
 /// Extract a VM closure from a Value, if it wraps a VmClosurePayload.
 /// Returns the closure and the function table needed to create a task VM.
 pub fn extract_vm_closure(val: &Value) -> Option<VmClosureInfo> {
     let nf = val.as_native_fn_ref()?;
     let payload = nf.payload.as_ref()?.downcast_ref::<VmClosurePayload>()?;
-    Some((payload.closure.clone(), payload.functions.clone()))
+    Some((
+        payload.closure.clone(),
+        payload.functions.clone(),
+        payload.native_fns.clone(),
+    ))
 }
 
 /// Build an `Unbound` error decorated with a "Did you mean ...?" hint
@@ -428,7 +437,7 @@ pub struct VM {
     inline_cache: Vec<(u32, u64, CachedGlobal)>,
     /// Resolved native function table: native_id → (NativeFn Rc, name).
     /// Populated at VM creation from the compiler's native_table + global env.
-    native_fns: Vec<Rc<NativeFn>>,
+    native_fns: Rc<Vec<Rc<NativeFn>>>,
     debug_values: HashMap<u64, Value>,
     next_debug_value_ref: u64,
     /// Frame-count floor at which the dispatch loop treats a RETURN as
@@ -455,6 +464,35 @@ impl sema_core::runtime::Trace for VM {
         }
         for frame in &self.frames {
             sink(vm_closure_edge(&frame.closure));
+            if let Some(open) = &frame.open_upvalues {
+                for cell in open.iter().flatten() {
+                    sink(sema_core::GcEdge::Opaque {
+                        ptr: sema_core::NodePtr::of_rc(cell),
+                        strong_count: Rc::strong_count(cell),
+                        trace: trace_upvalue_cell,
+                        sever: sever_upvalue_cell,
+                    });
+                }
+            }
+        }
+        for (_, _, cached) in &self.inline_cache {
+            sink(sema_core::GcEdge::Value(cached.value()));
+            match cached {
+                CachedGlobal::Plain(_) => {}
+                CachedGlobal::VmClosure {
+                    closure, functions, ..
+                } => {
+                    sink(vm_closure_edge(closure));
+                    sink(function_table_edge(functions));
+                }
+                CachedGlobal::Native { .. } => {
+                    sink(sema_core::GcEdge::Value(cached.value()));
+                }
+            }
+        }
+        for native in self.native_fns.iter() {
+            let value = Value::native_fn_from_rc(Rc::clone(native));
+            sink(sema_core::GcEdge::Value(&value));
         }
         for value in self.debug_values.values() {
             sink(sema_core::GcEdge::Value(value));
@@ -603,7 +641,7 @@ pub fn call_closure_owned(
     ctx: &EvalContext,
     args: &mut [Value],
 ) -> Option<Result<Value, SemaError>> {
-    let (closure, functions) = extract_vm_closure(func)?;
+    let (closure, functions, native_fns) = extract_vm_closure(func)?;
     // The top-level main closure never travels as a callback value; if it
     // somehow does (globals is None), let the generic borrowed path handle it.
     let globals = closure.globals.as_ref()?.clone();
@@ -611,7 +649,7 @@ pub fn call_closure_owned(
         // The task VM clones args while setting up regardless; ownership is
         // moot here. See the fallback wrapper for why yields need this route.
         return Some(crate::scheduler::run_closure_as_inline_task(
-            ctx, closure, functions, &*args,
+            ctx, closure, functions, native_fns, &*args,
         ));
     }
     if let Some(result) = try_run_on_current_vm_args(&closure, &globals, CallArgs::Owned(args), ctx)
@@ -621,7 +659,7 @@ pub fn call_closure_owned(
     // Foreign fresh VM: snapshot open upvalues against the owning VM (if any)
     // before running on a different stack.
     close_closure_upvalues_for_foreign_run(&closure);
-    let mut vm = VM::new_with_rc_functions(globals, functions);
+    let mut vm = VM::new_with_rc_functions(globals, functions, native_fns);
     if let Err(e) = vm.setup_for_call_args(closure, CallArgs::Owned(args)) {
         return Some(Err(e));
     }
@@ -651,14 +689,14 @@ pub fn run_closure_foreign_sync(
     ctx: &EvalContext,
     args: &[Value],
 ) -> Result<Value, SemaError> {
-    let Some((closure, functions)) = extract_vm_closure(func) else {
+    let Some((closure, functions, native_fns)) = extract_vm_closure(func) else {
         return sema_core::call_callback(ctx, func, args);
     };
     let Some(globals) = closure.globals.as_ref().map(|g| g.clone()) else {
         return sema_core::call_callback(ctx, func, args);
     };
     close_closure_upvalues_for_foreign_run(&closure);
-    let mut vm = VM::new_with_rc_functions(globals, functions);
+    let mut vm = VM::new_with_rc_functions(globals, functions, native_fns);
     vm.setup_for_call_args(closure, CallArgs::Borrowed(args))?;
     vm.run(ctx)
 }
@@ -891,7 +929,7 @@ pub fn with_active_debug<R>(f: impl FnOnce(&mut crate::debug::DebugState) -> R) 
 /// the owning VM is still current, exactly like `async/spawn` at spawn time)
 /// captures the values up front. No-op for non-closures / already-detached cells.
 pub fn snapshot_escaping_closure(func: &Value) {
-    if let Some((closure, _functions)) = extract_vm_closure(func) {
+    if let Some((closure, _functions, _native_fns)) = extract_vm_closure(func) {
         close_closure_upvalues_for_foreign_run(&closure);
     }
 }
@@ -923,7 +961,7 @@ pub fn close_closure_upvalues_for_foreign_run(closure: &Closure) {
                 // frame that will be inactive when it is later invoked on the
                 // foreign stack — e.g. a path-builder or callback closure passed
                 // as DATA into an async task. Snapshot it transitively.
-                let nested = extract_vm_closure(&value).map(|(c, _)| c);
+                let nested = extract_vm_closure(&value).map(|(c, _, _)| c);
                 // Tracked, not Closed: keep the cell bound to the still-live
                 // defining frame so post-spawn `StoreLocal`/`StoreUpvalue`
                 // writes keep flowing into it (issue #104). The frame's
@@ -1055,7 +1093,7 @@ impl VM {
             globals,
             functions: Rc::new(functions),
             inline_cache: vec![(u32::MAX, 0, CachedGlobal::Plain(Value::nil())); total_cache_slots],
-            native_fns,
+            native_fns: Rc::new(native_fns),
             debug_values: HashMap::new(),
             next_debug_value_ref: DEBUG_VALUE_REF_BASE,
             frame_floor: 0,
@@ -1098,7 +1136,11 @@ impl VM {
         }
     }
 
-    fn new_with_rc_functions(globals: Rc<Env>, functions: Rc<Vec<Rc<Function>>>) -> Self {
+    fn new_with_rc_functions(
+        globals: Rc<Env>,
+        functions: Rc<Vec<Rc<Function>>>,
+        native_fns: Rc<Vec<Rc<NativeFn>>>,
+    ) -> Self {
         let total_cache_slots: usize = functions
             .iter()
             .map(|f| f.chunk.n_global_cache_slots as usize)
@@ -1110,7 +1152,7 @@ impl VM {
             globals,
             functions,
             inline_cache: vec![(u32::MAX, 0, CachedGlobal::Plain(Value::nil())); total_cache_slots],
-            native_fns: Vec::new(),
+            native_fns,
             debug_values: HashMap::new(),
             next_debug_value_ref: DEBUG_VALUE_REF_BASE,
             frame_floor: 0,
@@ -1138,7 +1180,7 @@ impl VM {
             globals,
             functions,
             inline_cache: vec![(u32::MAX, 0, CachedGlobal::Plain(Value::nil())); total_cache_slots],
-            native_fns,
+            native_fns: Rc::new(native_fns),
             debug_values: HashMap::new(),
             next_debug_value_ref: DEBUG_VALUE_REF_BASE,
             frame_floor: 0,
@@ -1146,6 +1188,14 @@ impl VM {
             instruction_budget: None,
             instructions_executed: 0,
         })
+    }
+
+    pub fn new_for_task_with_native_fns(
+        globals: Rc<Env>,
+        functions: Rc<Vec<Rc<Function>>>,
+        native_fns: Rc<Vec<Rc<NativeFn>>>,
+    ) -> Self {
+        Self::new_with_rc_functions(globals, functions, native_fns)
     }
 
     pub fn execute(&mut self, closure: Rc<Closure>, ctx: &EvalContext) -> Result<Value, SemaError> {
@@ -1559,6 +1609,11 @@ impl VM {
         args: CallArgs,
         ctx: &EvalContext,
     ) -> Result<Value, SemaError> {
+        if ctx.runtime_quantum_active() {
+            return Err(SemaError::eval(
+                "internal error: legacy native callback cannot re-enter a VM during an active runtime quantum",
+            ));
+        }
         // Floor = the parent's current frame depth. After setup_for_call pushes
         // the callee frame, the loop must stop unwinding once it pops back to
         // this depth (rather than emptying the whole call stack).
@@ -3974,6 +4029,7 @@ impl VM {
         let payload = Rc::new(VmClosurePayload {
             closure,
             functions: self.functions.clone(),
+            native_fns: self.native_fns.clone(),
         });
         // The fallback box captures ONLY this payload Rc (invariant I2): the
         // wrapper's strong edges into the closure graph are exactly payload ×2
@@ -4022,6 +4078,7 @@ impl VM {
                         ctx,
                         closure.clone(),
                         functions.clone(),
+                        payload_for_box.native_fns.clone(),
                         args,
                     );
                 }
@@ -4040,7 +4097,11 @@ impl VM {
                 // Foreign fresh VM: snapshot open upvalues against the owning
                 // VM (if any) before running on a different stack.
                 close_closure_upvalues_for_foreign_run(closure);
-                let mut vm = VM::new_with_rc_functions(globals.clone(), functions.clone());
+                let mut vm = VM::new_with_rc_functions(
+                    globals.clone(),
+                    functions.clone(),
+                    payload_for_box.native_fns.clone(),
+                );
                 vm.setup_for_call(closure.clone(), args)?;
                 vm.run(ctx)
             },

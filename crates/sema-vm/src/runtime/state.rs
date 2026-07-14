@@ -121,6 +121,7 @@ struct RuntimeState {
     handle_cleanup: VecDeque<RootId>,
     pending: VecDeque<PendingStage>,
     drive_cursor: usize,
+    drive_active: bool,
     active_instruction_limit: usize,
     turn_instructions: usize,
     shutting_down: bool,
@@ -198,6 +199,7 @@ impl Runtime {
                 handle_cleanup: VecDeque::new(),
                 pending: VecDeque::new(),
                 drive_cursor: 0,
+                drive_active: false,
                 active_instruction_limit: usize::MAX,
                 turn_instructions: 0,
                 shutting_down: false,
@@ -277,9 +279,16 @@ impl Runtime {
     pub fn drive(&self, budget: &DriveBudget) -> Result<DriveState, RuntimeFault> {
         {
             let mut state = self.state.borrow_mut();
+            if state.drive_active {
+                return Err(RuntimeFault::Invariant {
+                    message: "runtime drive is already active".into(),
+                });
+            }
+            state.drive_active = true;
             state.active_instruction_limit = budget.instruction_limit_per_task.get();
             state.turn_instructions = 0;
         }
+        let _drive = ActiveDriveGuard(Rc::clone(&self.state));
         let start = self.state.borrow().clock.now();
         let mut work_items = 0;
         let mut root_visits = 0;
@@ -608,7 +617,9 @@ impl Runtime {
                     .tasks
                     .get_mut(&task)
                     .and_then(|task| task.suspended_owner.take())
-                    .unwrap_or(ReturnOwner::Root);
+                    .ok_or_else(|| RuntimeFault::Invariant {
+                        message: "resumed task has no installed return owner".into(),
+                    })?;
                 PendingStage::Apply(task, owner, pending.invoke_continuation())
             }
             PendingStage::Invoke(task, owner, call) => {
@@ -654,13 +665,25 @@ impl Runtime {
         let action = if let Some(pending) = task.pending_resume.take() {
             TaskAction::Resume(pending)
         } else if let Some(cancel) = task.record.cancellation() {
-            TaskAction::Settle(root, task_id, TaskOutcome::Cancelled(cancel.reason))
+            task.vm_call.take();
+            match task.vm_owner.take() {
+                Some(owner) => TaskAction::Cancel(task_id, owner, cancel.reason),
+                None => TaskAction::Settle(root, task_id, TaskOutcome::Cancelled(cancel.reason)),
+            }
         } else if let Some(mut vm) = task.vm_call.take() {
             let (context, instruction_limit) = {
                 let state = self.state.borrow();
                 (Rc::clone(&state._context), state.active_instruction_limit)
             };
+            let _task_context = context.scope_task_context(task.context.clone());
+            let quantum_guard =
+                context
+                    .enter_runtime_quantum()
+                    .map_err(|error| RuntimeFault::Invariant {
+                        message: error.to_string(),
+                    })?;
             let quantum = vm.run_quantum(&context, instruction_limit);
+            drop(quantum_guard);
             self.state.borrow_mut().turn_instructions += quantum.instructions;
             match quantum.outcome {
                 Ok(VmExecResult::QuantumExpired { .. }) => {
@@ -731,6 +754,30 @@ impl Runtime {
                 state.ready.enqueue(root, task_id);
             }
             TaskAction::Settle(root, task_id, outcome) => self.settle(root, task_id, outcome)?,
+            TaskAction::Cancel(task_id, owner, reason) => match owner {
+                ReturnOwner::Root => {
+                    let root = self
+                        .state
+                        .borrow()
+                        .tasks
+                        .get(&task_id)
+                        .map(|task| task.record.relations().origin_root)
+                        .ok_or_else(|| RuntimeFault::Invariant {
+                            message: "cancelled task disappeared".into(),
+                        })?;
+                    self.settle(root, task_id, TaskOutcome::Cancelled(reason))?
+                }
+                ReturnOwner::Continuation(parent, frame) => self
+                    .state
+                    .borrow_mut()
+                    .pending
+                    .push_back(PendingStage::Resume(
+                        task_id,
+                        *parent,
+                        frame,
+                        ResumeInput::Cancelled(reason),
+                    )),
+            },
             TaskAction::Native(task_id, result) => {
                 self.state
                     .borrow_mut()
@@ -873,7 +920,9 @@ impl Runtime {
                             .tasks
                             .get_mut(&task_id)
                             .and_then(|task| task.suspended_owner.take())
-                            .unwrap_or(ReturnOwner::Root);
+                            .ok_or_else(|| RuntimeFault::Invariant {
+                                message: "rejected suspend has no installed return owner".into(),
+                            })?;
                         state.pending.push_back(PendingStage::Resume(
                             task_id,
                             owner,
@@ -934,18 +983,14 @@ impl Runtime {
             return Ok(());
         }
         let (frame, result) =
-            if let Some((closure, functions)) = extract_vm_closure(&call.callable) {
+            if let Some((closure, functions, native_fns)) = extract_vm_closure(&call.callable) {
                 let globals = closure
                     .globals
                     .clone()
                     .ok_or_else(|| RuntimeFault::Invariant {
                         message: "VM closure has no home environment".into(),
                     })?;
-                let mut vm = VM::new_for_task(globals, functions, &[]).map_err(|error| {
-                    RuntimeFault::Invariant {
-                        message: format!("failed to create task VM: {error}"),
-                    }
-                })?;
+                let mut vm = VM::new_for_task_with_native_fns(globals, functions, native_fns);
                 let frame = ContinuationFrame::vm_native(call.continuation);
                 match vm.setup_for_call(closure, &call.args) {
                     Ok(()) => {
@@ -969,6 +1014,7 @@ impl Runtime {
                     Err(error) => (frame, Err(error)),
                 }
             } else if let Some(native) = call.callable.as_native_fn_rc() {
+                let _installed = eval_context.scope_task_context(context.clone());
                 let mut task_context = context.borrow_mut();
                 let mut native_context = NativeCallContext {
                     task_context: &mut task_context,
@@ -1411,6 +1457,23 @@ impl Runtime {
             message: "test terminal abort".into(),
         });
     }
+
+    #[cfg(test)]
+    pub(super) fn clone_for_test(&self) -> Self {
+        Self {
+            state: Rc::clone(&self.state),
+        }
+    }
+}
+
+struct ActiveDriveGuard(Rc<RefCell<RuntimeState>>);
+
+impl Drop for ActiveDriveGuard {
+    fn drop(&mut self) {
+        if let Ok(mut state) = self.0.try_borrow_mut() {
+            state.drive_active = false;
+        }
+    }
 }
 
 impl Drop for Runtime {
@@ -1494,6 +1557,7 @@ impl Drop for RootHandle {
 enum TaskAction {
     Yield(RootId, TaskId),
     Settle(RootId, TaskId, TaskOutcome),
+    Cancel(TaskId, ReturnOwner, CancelReason),
     Native(TaskId, NativeResult),
     VmResult(TaskId, ReturnOwner, NativeResult),
     #[cfg(test)]
@@ -1550,6 +1614,7 @@ impl Trace for TaskAction {
     fn trace(&self, sink: &mut dyn FnMut(sema_core::cycle::GcEdge<'_>)) -> bool {
         match self {
             Self::Settle(_, _, outcome) => outcome.trace(sink),
+            Self::Cancel(_, owner, _) => owner.trace(sink),
             Self::Native(_, result) => match result {
                 Ok(outcome) => outcome.trace(sink),
                 Err(error) => error.trace(sink),

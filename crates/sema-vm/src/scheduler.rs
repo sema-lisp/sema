@@ -129,7 +129,7 @@ impl Scheduler {
         thunk: Value,
         _ctx: &EvalContext,
     ) -> Result<Rc<AsyncPromise>, SemaError> {
-        let (closure, functions) = vm::extract_vm_closure(&thunk).ok_or_else(|| {
+        let (closure, functions, native_fns) = vm::extract_vm_closure(&thunk).ok_or_else(|| {
             SemaError::eval("async/spawn: argument must be a function (compiled VM closure)")
         })?;
 
@@ -154,7 +154,7 @@ impl Scheduler {
 
         // Use the function table from the thunk's own compilation context,
         // not the scheduler's — each eval_str_compiled produces different functions.
-        let vm = VM::new_for_task(self.globals.clone(), functions, &self.native_spurs)?;
+        let vm = VM::new_for_task_with_native_fns(self.globals.clone(), functions, native_fns);
 
         self.tasks.push(Task {
             id,
@@ -534,6 +534,7 @@ pub(crate) fn run_closure_as_inline_task(
     ctx: &EvalContext,
     closure: Rc<crate::vm::Closure>,
     functions: Rc<Vec<Rc<crate::chunk::Function>>>,
+    native_fns: Rc<Vec<Rc<sema_core::NativeFn>>>,
     args: &[Value],
 ) -> Result<Value, SemaError> {
     // The closure runs on a dedicated task VM; snapshot any still-open upvalue
@@ -553,13 +554,7 @@ pub(crate) fn run_closure_as_inline_task(
     // `async_promise_from_rc` on resolution paths — register here.
     sema_core::register_candidate(sema_core::GcNode::Promise(Rc::downgrade(&promise)));
 
-    let mut vm = match VM::new_for_task(sched.globals.clone(), functions, &sched.native_spurs) {
-        Ok(vm) => vm,
-        Err(e) => {
-            put_scheduler(sched);
-            return Err(e);
-        }
-    };
+    let mut vm = VM::new_for_task_with_native_fns(sched.globals.clone(), functions, native_fns);
     if let Err(e) = vm.setup_for_call(closure.clone(), args) {
         put_scheduler(sched);
         return Err(e);

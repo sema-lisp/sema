@@ -1,6 +1,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::Arc;
+use std::time::Instant;
 
 use sema_core::runtime::{
     CancellationView, CompletionDecoder, CompletionDelivery, CompletionKind, CompletionRegistrar,
@@ -77,6 +78,7 @@ struct CleanupEntry {
     reap_attempts: usize,
     last_error: Option<String>,
     quarantine: bool,
+    transferred_at: Instant,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -85,6 +87,7 @@ pub struct CleanupDiagnostic {
     pub reap_attempts: usize,
     pub last_error: Option<String>,
     pub quarantine: bool,
+    pub bound_expired: bool,
 }
 
 pub struct PendingResume {
@@ -297,7 +300,7 @@ impl WaitRuntime {
 
     fn finish_rejection(&mut self, key: WaitKey, wait: RegisteredExternalWait) -> PendingResume {
         let _ = wait.queue_cancel.cancel_before_start();
-        self.cancel_or_transfer_resource(key, &wait.identity, wait.resource, false);
+        self.cancel_or_transfer_resource(key, &wait.identity, wait.resource, false, Instant::now());
         PendingResume {
             key,
             task_id: wait.task_id,
@@ -414,7 +417,12 @@ impl WaitRuntime {
         true
     }
 
-    pub fn cancel(&mut self, task: &mut TaskRecord, key: WaitKey) -> Option<PendingResume> {
+    pub fn cancel(
+        &mut self,
+        task: &mut TaskRecord,
+        key: WaitKey,
+        now: Instant,
+    ) -> Option<PendingResume> {
         let wait = self.active.get(&key)?;
         if wait.task_id != task.id() || task.wait_key() != Some(key) {
             return None;
@@ -423,7 +431,7 @@ impl WaitRuntime {
         task.wake(key).ok()?;
         let wait = self.active.remove(&key).expect("validated active wait");
         let _ = wait.queue_cancel.cancel_before_start();
-        self.cancel_or_transfer_resource(key, &wait.identity, wait.resource, true);
+        self.cancel_or_transfer_resource(key, &wait.identity, wait.resource, true, now);
         drop(wait.decoder);
         Some(PendingResume {
             key,
@@ -443,6 +451,7 @@ impl WaitRuntime {
         identity: &RetainedIdentity,
         mut resource: ResourceClass,
         admitted: bool,
+        now: Instant,
     ) {
         let cancellation = resource.cancel();
         let quarantine = resource.bound().is_some();
@@ -455,7 +464,7 @@ impl WaitRuntime {
             let last_error = cancellation
                 .and_then(Result::err)
                 .map(|error| error.to_string());
-            self.insert_cleanup(key, identity, resource, quarantine, last_error);
+            self.insert_cleanup(key, identity, resource, quarantine, last_error, now);
         }
     }
 
@@ -466,6 +475,7 @@ impl WaitRuntime {
         resource: ResourceClass,
         quarantine: bool,
         last_error: Option<String>,
+        transferred_at: Instant,
     ) {
         self.cleanup.insert(
             key,
@@ -477,6 +487,7 @@ impl WaitRuntime {
                 reap_attempts: 0,
                 last_error,
                 quarantine,
+                transferred_at,
             },
         );
         self.cleanup_order.push_back(key);
@@ -542,6 +553,10 @@ impl WaitRuntime {
         self.quarantine_reaped
     }
     pub fn cleanup_diagnostics(&self) -> Vec<CleanupDiagnostic> {
+        self.cleanup_diagnostics_at(Instant::now())
+    }
+
+    pub fn cleanup_diagnostics_at(&self, now: Instant) -> Vec<CleanupDiagnostic> {
         let mut diagnostics = self
             .cleanup
             .iter()
@@ -550,10 +565,17 @@ impl WaitRuntime {
                 reap_attempts: entry.reap_attempts,
                 last_error: entry.last_error.clone(),
                 quarantine: entry.quarantine,
+                bound_expired: cleanup_bound_expired(entry, now),
             })
             .collect::<Vec<_>>();
         diagnostics.sort_by_key(|item| (item.wait.id, item.wait.generation));
         diagnostics
+    }
+
+    pub fn expired_quarantine(&self, now: Instant) -> Option<WaitKey> {
+        self.cleanup
+            .iter()
+            .find_map(|(key, entry)| cleanup_bound_expired(entry, now).then_some(*key))
     }
     #[cfg(test)]
     pub fn cleanup_tombstones(&self) -> usize {
@@ -630,4 +652,16 @@ fn identity_matches(identity: &RetainedIdentity, completion: &ExternalCompletion
         && identity.generation == completion.generation
         && identity.operation_id == completion.operation_id
         && identity.kind == completion.kind
+}
+
+fn cleanup_bound_expired(entry: &CleanupEntry, now: Instant) -> bool {
+    match entry.resource.bound() {
+        Some(sema_core::runtime::QuarantineBoundDescriptor::HardDeadline(duration)) => {
+            now.saturating_duration_since(entry.transferred_at) >= duration
+        }
+        Some(sema_core::runtime::QuarantineBoundDescriptor::FiniteWork {
+            maximum_units, ..
+        }) => entry.reap_attempts as u64 >= maximum_units.get(),
+        None => false,
+    }
 }

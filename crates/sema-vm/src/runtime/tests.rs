@@ -613,6 +613,164 @@ fn runtime_decode_failure_settles_once_and_duplicate_completion_is_late() {
 }
 
 #[test]
+fn runtime_generation_reuse_rejects_stale_generation_without_consuming_live_wait() {
+    let runtime = runtime_with_inline_executor(Rc::new(FakeClock::new()));
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let handle = runtime
+        .submit_test_root(TestPreparedTask::native(Ok(NativeOutcome::Suspend(
+            external_suspend(events.clone()),
+        ))))
+        .unwrap();
+    while runtime.active_wait_count_for_test() == 0 {
+        runtime.drive(&drive_budget(1)).unwrap();
+    }
+    let live_generation = runtime.active_wait_key_for_test().generation;
+    let mut generations = IdCounter::<WaitGeneration>::new();
+    let stale_generation = loop {
+        let candidate = generations.allocate().unwrap();
+        if candidate != live_generation {
+            break candidate;
+        }
+    };
+    runtime.forge_completion_for_test(
+        ForgedCompletionMutation::Generation(stale_generation),
+        Ok(Box::new(())),
+    );
+
+    runtime.drive(&drive_budget(1)).unwrap();
+    assert_eq!(runtime.active_wait_count_for_test(), 1);
+    assert_eq!(runtime.late_completion_count_for_test(), 1);
+    assert!(events.lock().unwrap().is_empty());
+    assert!(matches!(handle.poll_result(), RootPoll::Pending));
+}
+
+#[test]
+fn runtime_quarantine_completion_first_and_cancel_first_have_one_winner() {
+    let completion_first = runtime_with_inline_executor(Rc::new(FakeClock::new()));
+    let completed = completion_first
+        .submit_test_root(TestPreparedTask::native(Ok(NativeOutcome::Suspend(
+            external_suspend(Arc::new(Mutex::new(Vec::new()))),
+        ))))
+        .unwrap();
+    while completion_first.active_wait_count_for_test() == 0 {
+        completion_first.drive(&drive_budget(1)).unwrap();
+    }
+    while completion_first.active_wait_count_for_test() != 0 {
+        completion_first.drive(&drive_budget(1)).unwrap();
+    }
+    while matches!(completed.poll_result(), RootPoll::Pending) {
+        completion_first.drive(&drive_budget(1)).unwrap();
+    }
+    assert!(!completed.cancel(CancelReason::Explicit));
+    assert_eq!(completion_first.cleanup_count_for_test(), 0);
+
+    let cancel_first = runtime_with_inline_executor(Rc::new(FakeClock::new()));
+    let cancelled = cancel_first
+        .submit_test_root(TestPreparedTask::native(Ok(NativeOutcome::Suspend(
+            external_suspend(Arc::new(Mutex::new(Vec::new()))),
+        ))))
+        .unwrap();
+    while cancel_first.active_wait_count_for_test() == 0 {
+        cancel_first.drive(&drive_budget(1)).unwrap();
+    }
+    assert!(cancelled.cancel(CancelReason::Explicit));
+    cancel_first.set_drive_cursor_for_test(2);
+    while cancel_first.cleanup_count_for_test() == 0 {
+        cancel_first.drive(&drive_budget(1)).unwrap();
+    }
+    while cancel_first.cleanup_count_for_test() != 0 {
+        cancel_first.drive(&drive_budget(1)).unwrap();
+    }
+    assert_eq!(cancel_first.quarantine_reaped_count_for_test(), 1);
+    assert_eq!(cancel_first.late_completion_count_for_test(), 0);
+}
+
+#[test]
+fn runtime_wrong_kind_cleanup_completion_leaves_quarantine_live() {
+    let runtime = runtime_with_inline_executor(Rc::new(FakeClock::new()));
+    let handle = runtime
+        .submit_test_root(TestPreparedTask::native(Ok(NativeOutcome::Suspend(
+            external_suspend(Arc::new(Mutex::new(Vec::new()))),
+        ))))
+        .unwrap();
+    while runtime.active_wait_count_for_test() == 0 {
+        runtime.drive(&drive_budget(1)).unwrap();
+    }
+    runtime.forge_completion_for_test(
+        ForgedCompletionMutation::Kind(CompletionKind::try_from_raw(99).unwrap()),
+        Ok(Box::new(())),
+    );
+    assert!(handle.cancel(CancelReason::Explicit));
+    runtime.set_drive_cursor_for_test(2);
+    while runtime.cleanup_count_for_test() == 0 {
+        runtime.drive(&drive_budget(1)).unwrap();
+    }
+    while runtime.late_completion_count_for_test() == 0 {
+        runtime.drive(&drive_budget(1)).unwrap();
+    }
+    assert_eq!(runtime.cleanup_count_for_test(), 1);
+    assert_eq!(runtime.quarantine_reaped_count_for_test(), 0);
+}
+
+#[test]
+fn runtime_duplicate_after_quarantine_reap_is_late() {
+    let runtime = runtime_with_inline_executor(Rc::new(FakeClock::new()));
+    let handle = runtime
+        .submit_test_root(TestPreparedTask::native(Ok(NativeOutcome::Suspend(
+            external_suspend(Arc::new(Mutex::new(Vec::new()))),
+        ))))
+        .unwrap();
+    while runtime.active_wait_count_for_test() == 0 {
+        runtime.drive(&drive_budget(1)).unwrap();
+    }
+    runtime.forge_completion_for_test(ForgedCompletionMutation::None, Ok(Box::new(())));
+    runtime.forge_completion_for_test(ForgedCompletionMutation::None, Ok(Box::new(())));
+    assert!(handle.cancel(CancelReason::Explicit));
+    runtime.set_drive_cursor_for_test(2);
+    for _ in 0..24 {
+        runtime.drive(&drive_budget(1)).unwrap();
+    }
+    assert_eq!(runtime.cleanup_count_for_test(), 0);
+    assert_eq!(runtime.quarantine_reaped_count_for_test(), 1);
+    assert_eq!(runtime.late_completion_count_for_test(), 2);
+}
+
+#[test]
+fn runtime_expired_quarantine_bound_reports_invariant_and_retains_non_clean_owner() {
+    let clock = Rc::new(FakeClock::new());
+    let runtime = runtime_with_inline_executor(clock.clone());
+    let handle = runtime
+        .submit_test_root(TestPreparedTask::native(Ok(NativeOutcome::Suspend(
+            edge_suspend(),
+        ))))
+        .unwrap();
+    while runtime.active_wait_count_for_test() == 0 {
+        runtime.drive(&drive_budget(1)).unwrap();
+    }
+    assert!(handle.cancel(CancelReason::Explicit));
+    runtime.set_drive_cursor_for_test(2);
+    while runtime.cleanup_count_for_test() == 0 {
+        runtime.drive(&drive_budget(1)).unwrap();
+    }
+    clock.advance(Duration::from_secs(2));
+
+    let error = runtime.drive(&drive_budget(8)).unwrap_err();
+    assert!(matches!(
+        &error,
+        super::RuntimeFault::Invariant { message } if message.contains("quarantine bound expired")
+    ));
+    assert_eq!(runtime.cleanup_count_for_test(), 1);
+    assert!(runtime.cleanup_diagnostics_for_test()[0].bound_expired);
+    assert!(runtime
+        .shutdown(&super::ShutdownOptions {
+            deadline: clock.now(),
+            drive_budget: drive_budget(8),
+        })
+        .is_err());
+    assert_eq!(runtime.cleanup_count_for_test(), 1);
+}
+
+#[test]
 fn runtime_two_handles_repeat_every_terminal_outcome_and_reap_in_both_drop_orders() {
     for index in 0..3 {
         for drop_original_first in [false, true] {
@@ -1347,7 +1505,7 @@ fn wait_trace_includes_cleanup_resource_edges_and_short_circuits() {
         )
         .unwrap();
     task.request_cancellation(CancelReason::Explicit);
-    runtime.cancel(&mut task, key).unwrap();
+    runtime.cancel(&mut task, key, Instant::now()).unwrap();
 
     let mut edges = 0;
     assert!(runtime.trace(&mut |_| edges += 1));
@@ -1380,7 +1538,7 @@ fn wait_trace_propagates_cleanup_resource_trace_failure() {
         )
         .unwrap();
     task.request_cancellation(CancelReason::Explicit);
-    runtime.cancel(&mut task, key).unwrap();
+    runtime.cancel(&mut task, key, Instant::now()).unwrap();
 
     let mut edges = 0;
     assert!(!runtime.trace(&mut |_| edges += 1));
@@ -1480,14 +1638,14 @@ fn wait_cancel_requires_canonical_request_and_exact_owner_key() {
     let _ = ids.wait_key();
     let stale = ids.wait_key();
 
-    assert!(runtime.cancel(&mut owner, key).is_none());
+    assert!(runtime.cancel(&mut owner, key, Instant::now()).is_none());
     stranger.request_cancellation(CancelReason::Explicit);
-    assert!(runtime.cancel(&mut stranger, key).is_none());
+    assert!(runtime.cancel(&mut stranger, key, Instant::now()).is_none());
     owner.request_cancellation(CancelReason::Timeout);
-    assert!(runtime.cancel(&mut owner, stale).is_none());
+    assert!(runtime.cancel(&mut owner, stale, Instant::now()).is_none());
     assert_eq!(runtime.active_len(), 1);
     assert_eq!(owner.state_name(), StateName::Waiting);
-    assert!(runtime.cancel(&mut owner, key).is_some());
+    assert!(runtime.cancel(&mut owner, key, Instant::now()).is_some());
     assert_eq!(runtime.active_len(), 0);
     assert_eq!(owner.state_name(), StateName::Ready);
 }
@@ -1526,7 +1684,9 @@ fn wait_cancel_uses_first_task_reason_and_only_quarantine_completion_reaps_clean
     };
     assert!(quarantine_task.request_cancellation(CancelReason::Timeout));
     assert!(!quarantine_task.request_cancellation(CancelReason::Explicit));
-    let pending = quarantine.cancel(&mut quarantine_task, key).unwrap();
+    let pending = quarantine
+        .cancel(&mut quarantine_task, key, Instant::now())
+        .unwrap();
     assert_eq!(quarantine_task.state_name(), StateName::Ready);
     assert!(matches!(
         pending.invoke_continuation(),
@@ -1553,7 +1713,9 @@ fn wait_cancel_uses_first_task_reason_and_only_quarantine_completion_reaps_clean
         panic!("registration accepted")
     };
     interruptible_task.request_cancellation(CancelReason::Owner);
-    interruptible.cancel(&mut interruptible_task, key).unwrap();
+    interruptible
+        .cancel(&mut interruptible_task, key, Instant::now())
+        .unwrap();
     assert_eq!(
         interruptible
             .drain_one(&mut interruptible_task)
@@ -1585,7 +1747,7 @@ fn exact_quarantine_removal_leaves_one_charged_tombstone_without_scanning_predec
             )
             .unwrap();
         task.request_cancellation(CancelReason::Explicit);
-        runtime.cancel(&mut task, key).unwrap();
+        runtime.cancel(&mut task, key, Instant::now()).unwrap();
         last_key = Some(key);
     }
 

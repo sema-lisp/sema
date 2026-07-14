@@ -261,6 +261,21 @@ impl Runtime {
             .min(budget.root_visit_limit.get());
 
         while work_items < budget.work_item_limit.get() {
+            let expired = {
+                let state = self.state.borrow();
+                state
+                    .waits
+                    .as_ref()
+                    .and_then(|waits| waits.expired_quarantine(state.clock.now()))
+            };
+            if let Some(wait) = expired {
+                return Err(RuntimeFault::Invariant {
+                    message: format!(
+                        "quarantine bound expired for wait {:?}/{:?}",
+                        wait.id, wait.generation
+                    ),
+                });
+            }
             if self
                 .state
                 .borrow()
@@ -463,14 +478,14 @@ impl Runtime {
             let waits = state.waits.take().ok_or_else(|| RuntimeFault::Invariant {
                 message: "wait runtime already extracted".into(),
             })?;
-            (task_id, task, waits)
+            (task_id, task, waits, state.clock.now())
         };
-        let (task_id, mut task, mut waits) = extracted;
+        let (task_id, mut task, mut waits, now) = extracted;
         let key = task
             .record
             .wait_key()
             .expect("selected waiting task has key");
-        let pending = waits.cancel(&mut task.record, key);
+        let pending = waits.cancel(&mut task.record, key, now);
         let root = task.record.relations().origin_root;
         let mut state = self.state.borrow_mut();
         state.waits = Some(waits);
@@ -968,6 +983,16 @@ impl Runtime {
     }
 
     #[cfg(test)]
+    pub(super) fn active_wait_key_for_test(&self) -> super::WaitKey {
+        self.state
+            .borrow()
+            .waits
+            .as_ref()
+            .expect("wait runtime")
+            .first_active_key_for_test()
+    }
+
+    #[cfg(test)]
     pub(super) fn late_completion_count_for_test(&self) -> usize {
         self.state
             .borrow()
@@ -977,12 +1002,29 @@ impl Runtime {
     }
 
     #[cfg(test)]
-    pub(super) fn cleanup_diagnostics_for_test(&self) -> Vec<super::CleanupDiagnostic> {
+    pub(super) fn cleanup_count_for_test(&self) -> usize {
         self.state
             .borrow()
             .waits
             .as_ref()
-            .map_or_else(Vec::new, WaitRuntime::cleanup_diagnostics)
+            .map_or(0, WaitRuntime::cleanup_len)
+    }
+
+    #[cfg(test)]
+    pub(super) fn quarantine_reaped_count_for_test(&self) -> usize {
+        self.state
+            .borrow()
+            .waits
+            .as_ref()
+            .map_or(0, WaitRuntime::quarantine_reaped)
+    }
+
+    #[cfg(test)]
+    pub(super) fn cleanup_diagnostics_for_test(&self) -> Vec<super::CleanupDiagnostic> {
+        let state = self.state.borrow();
+        state.waits.as_ref().map_or_else(Vec::new, |waits| {
+            waits.cleanup_diagnostics_at(state.clock.now())
+        })
     }
 
     #[cfg(test)]

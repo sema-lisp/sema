@@ -342,6 +342,40 @@ Expected: all selected tests pass without wall-clock sleeps.
 **Files:** `async_ops.rs`, `runtime/promise.rs`, `runtime/wait.rs`,
 `vm_async_test.rs`, `async_contract_test.rs`
 
+> **PROGRESS (2026-07-15) — `async/all`, `async/race`, `async/timeout` are GREEN
+> end-to-end through the unified runtime (`eval_str_via_runtime`).** Wired on the
+> spawned `Rc<AsyncPromise>` seam (the same seam `async/spawn`/`async/await` use),
+> NOT the `PromiseId` `promise_set_response` path — that registry has no entries
+> for VM-spawned promises and explicitly rejects `Timeout`
+> (`install_promise_wait`). Design:
+> - New `YieldReason::AwaitPromiseSet { promises, mode }` +
+>   `sema_core::PromiseSetKind::{All,Race,Timeout(ms)}` (`async_signal.rs`). Each
+>   combinator native, when `in_runtime_quantum()`, maps its Sema promise args and
+>   yields this instead of driving the legacy scheduler (`async_ops.rs`).
+> - The VM surfaces it as `AsyncYield`; `run_parked_quantum` maps it to
+>   `TaskAction::VmAwaitSet`; `await_promise_set` parks the frame in a new
+>   `promise_set_waits` map (and, for `Timeout`, arms a deadline timer on the same
+>   wait key). `settle_spawned` calls `wake_promise_set_waiters` on every settle;
+>   `evaluate_promise_set` computes the input-order `All` list / fail-fast /
+>   first-settled `Race` winner and resumes via `replace_stack_top` (value) or
+>   `resume_with_error` (failure/cancel/timeout). `fire_timer` delivers the
+>   `:timeout` error when the deadline key belongs to a set-wait. Supplied
+>   promises are only OBSERVED — never cancelled (verified: siblings/losers/
+>   producers still settle and are awaitable afterward).
+> - Un-ignored gate tests in `sema-eval` `mod runtime_eval_tests`:
+>   `runtime_async_all_returns_values_in_input_order`,
+>   `runtime_async_all_empty_input_is_empty_list`,
+>   `runtime_async_all_failure_does_not_cancel_sibling`,
+>   `runtime_async_race_returns_fast_and_loser_continues`,
+>   `runtime_async_timeout_settled_wins`,
+>   `runtime_async_timeout_pending_raises_and_producer_continues`.
+> - NOT YET DONE (legacy-path RED, unchanged): the `vm_async_test` oracles in
+>   Step 3 (`async_all_failure_does_not_cancel_supplied_sibling`,
+>   `async_race_does_not_cancel_supplied_loser`) run through the LEGACY scheduler
+>   via `eval`, which still cancels siblings on short-circuit. Turning those GREEN
+>   requires routing the legacy `async`/`eval` path (or the whole test harness)
+>   through the runtime — out of scope for this observational slice.
+
 - [ ] **Step 1: Write exact failing observation tests**
 
 Include empty all, ordered all results, fail/cancel short-circuit with surviving

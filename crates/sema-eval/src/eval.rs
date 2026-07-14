@@ -2256,4 +2256,93 @@ mod runtime_eval_tests {
             "uncaught rejection must carry the real error, got: {err}"
         );
     }
+
+    // ── OBSERVATIONAL COMBINATORS (Task 04) ──────────────────────────
+
+    /// Evaluate a Sema literal on a fresh interpreter to build an expected value.
+    fn lit(program: &str) -> Value {
+        Interpreter::new()
+            .eval_str(program)
+            .unwrap_or_else(|e| panic!("literal eval failed for {program:?}: {e:?}"))
+    }
+
+    #[test]
+    fn runtime_async_all_returns_values_in_input_order() {
+        let interp = Interpreter::new();
+        let result = interp
+            .eval_str_via_runtime(
+                "(async/all (list (async/spawn (fn () 1)) \
+                                  (async/spawn (fn () 2)) \
+                                  (async/spawn (fn () 3))))",
+            )
+            .expect("async/all resolves through the runtime");
+        assert_eq!(result, lit("(list 1 2 3)"));
+    }
+
+    #[test]
+    fn runtime_async_all_empty_input_is_empty_list() {
+        let interp = Interpreter::new();
+        let result = interp
+            .eval_str_via_runtime("(async/all (list))")
+            .expect("async/all of empty input");
+        assert_eq!(result, Value::list(vec![]));
+    }
+
+    // A failing member raises, but a supplied sibling STILL runs to completion:
+    // it records its side effect into a channel, observable after the failure.
+    #[test]
+    fn runtime_async_all_failure_does_not_cancel_sibling() {
+        let interp = Interpreter::new();
+        let result = interp
+            .eval_str_via_runtime(
+                "(begin \
+                   (define ch (channel/new 1)) \
+                   (define sib (async/spawn (fn () (async/sleep 4) (channel/send ch 77) 1))) \
+                   (define bad (async/spawn (fn () (error \"boom\")))) \
+                   (define outcome (try (async/all (list bad sib)) (catch e :caught))) \
+                   (list outcome (await sib) (channel/recv ch)))",
+            )
+            .expect("failure surfaces but sibling completes");
+        assert_eq!(result, lit("(list :caught 1 77)"));
+    }
+
+    #[test]
+    fn runtime_async_race_returns_fast_and_loser_continues() {
+        let interp = Interpreter::new();
+        let result = interp
+            .eval_str_via_runtime(
+                "(begin \
+                   (define ch (channel/new 1)) \
+                   (define fast (async/spawn (fn () 10))) \
+                   (define slow (async/spawn (fn () (async/sleep 5) (channel/send ch 88) 20))) \
+                   (define winner (async/race (list fast slow))) \
+                   (list winner (await slow) (channel/recv ch)))",
+            )
+            .expect("race returns the fast value and the loser continues");
+        assert_eq!(result, lit("(list 10 20 88)"));
+    }
+
+    #[test]
+    fn runtime_async_timeout_settled_wins() {
+        let interp = Interpreter::new();
+        let result = interp
+            .eval_str_via_runtime("(async/timeout 10000 (async/spawn (fn () (async/sleep 1) 5)))")
+            .expect("a promise that settles before the deadline wins");
+        assert_eq!(result, Value::int(5));
+    }
+
+    #[test]
+    fn runtime_async_timeout_pending_raises_and_producer_continues() {
+        let interp = Interpreter::new();
+        let result = interp
+            .eval_str_via_runtime(
+                "(begin \
+                   (define ch (channel/new 1)) \
+                   (define slow (async/spawn (fn () (async/sleep 20) (channel/send ch 55) 9))) \
+                   (define outcome (try (async/timeout 1 slow) (catch e :timeout))) \
+                   (list outcome (await slow) (channel/recv ch)))",
+            )
+            .expect("timeout raises but the producer keeps running");
+        assert_eq!(result, lit("(list :timeout 9 55)"));
+    }
 }

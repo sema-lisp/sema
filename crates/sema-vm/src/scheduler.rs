@@ -273,6 +273,13 @@ impl Scheduler {
                         "internal error: async/spawn yield reached the legacy scheduler"
                             .to_string(),
                     ),
+                    // `AwaitPromiseSet` is a unified-runtime-only yield: the
+                    // observational combinators drive the legacy scheduler
+                    // inline (`call_run_scheduler_*`) and never park a task on it.
+                    YieldReason::AwaitPromiseSet { .. } => WakeAction::Fail(
+                        "internal error: observational combinator yield reached the legacy scheduler"
+                            .to_string(),
+                    ),
                 };
 
                 match action {

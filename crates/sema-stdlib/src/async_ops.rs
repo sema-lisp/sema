@@ -6,8 +6,8 @@ use sema_core::{
     call_run_scheduler, call_run_scheduler_all_of, call_run_scheduler_any_of,
     call_run_scheduler_timeout, call_spawn_callback, check_arity, in_async_context,
     in_runtime_quantum, set_debug_coop_resume, set_yield_signal, take_resume_value, AsyncPromise,
-    Channel, DebugCoopResume, Env, EvalContext, NativeFn, PromiseState, SchedulerRunResult,
-    SchedulerTarget, SemaError, Value, ValueView, YieldReason,
+    Channel, DebugCoopResume, Env, EvalContext, NativeFn, PromiseSetKind, PromiseState,
+    SchedulerRunResult, SchedulerTarget, SemaError, Value, ValueView, YieldReason,
 };
 
 use crate::register_fn;
@@ -294,6 +294,18 @@ fn register_promise_ops(env: &Env) {
             .map(|item| expect_promise(std::slice::from_ref(item), "async/all", 0))
             .collect::<Result<_, _>>()?;
 
+        // Under the unified runtime, OBSERVE the supplied promises via a
+        // set-wait: the runtime parks this frame on every promise and resumes it
+        // with the input-ordered value list (or raises the lowest-settlement
+        // failure) WITHOUT ever cancelling the supplied producers.
+        if in_runtime_quantum() {
+            set_yield_signal(YieldReason::AwaitPromiseSet {
+                promises,
+                mode: PromiseSetKind::All,
+            });
+            return Ok(Value::nil());
+        }
+
         // Run scheduler until the requested promises settle. Unrelated
         // background tasks must not make this combinator report deadlock.
         if call_run_scheduler_all_of(ctx, promises.clone())? == SchedulerRunResult::DebugPaused {
@@ -359,6 +371,17 @@ fn register_promise_ops(env: &Env) {
             .map(|item| expect_promise(std::slice::from_ref(item), "async/race", 0))
             .collect::<Result<_, _>>()?;
 
+        // Under the unified runtime, OBSERVE the supplied promises via a
+        // set-wait: the runtime resumes this frame with the lowest-settlement
+        // winner (returned/failed/cancelled alike) WITHOUT cancelling the losers.
+        if in_runtime_quantum() {
+            set_yield_signal(YieldReason::AwaitPromiseSet {
+                promises,
+                mode: PromiseSetKind::Race,
+            });
+            return Ok(Value::nil());
+        }
+
         // Check if any already resolved
         for p in &promises {
             if let PromiseState::Resolved(v) = &*p.state.borrow() {
@@ -416,6 +439,18 @@ fn register_promise_ops(env: &Env) {
             .with_hint("split into smaller timeouts or remove the timeout entirely"));
         }
         let promise = expect_promise(args, "async/timeout", 1)?;
+
+        // Under the unified runtime, OBSERVE the single supplied promise via a
+        // set-wait bounded by a deadline timer: an already-settled promise wins
+        // (even at ms=0); a promise still pending at the deadline raises
+        // `:timeout` while the supplied producer CONTINUES (never cancelled).
+        if in_runtime_quantum() {
+            set_yield_signal(YieldReason::AwaitPromiseSet {
+                promises: vec![promise],
+                mode: PromiseSetKind::Timeout(ms as u64),
+            });
+            return Ok(Value::nil());
+        }
 
         // If already resolved/rejected, return immediately
         {

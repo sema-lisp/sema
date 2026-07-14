@@ -178,6 +178,12 @@ struct RuntimeState {
     /// VM-quantum tasks parked on `async/await`, mapped to their internal wait
     /// key and the promise they wait on. Woken when that promise settles.
     promise_waits: HashMap<TaskId, (super::WaitKey, Rc<sema_core::AsyncPromise>)>,
+    /// VM-quantum tasks parked on an OBSERVATIONAL combinator (`async/all`,
+    /// `async/race`, `async/timeout`) over a set of spawned promises. Woken when
+    /// the combinator's condition is met (a settlement of any observed promise,
+    /// or — for `Timeout` — the deadline timer). The runtime OBSERVES these
+    /// promises and NEVER cancels them.
+    promise_set_waits: HashMap<TaskId, PromiseSetWaitState>,
     drive_cursor: usize,
     drive_active: bool,
     active_instruction_limit: usize,
@@ -199,6 +205,18 @@ struct RuntimeState {
     force_task_exhaustion: bool,
     #[cfg(test)]
     ready_visit_count: usize,
+}
+
+/// A VM task parked on an observational promise-set combinator. The task record
+/// holds `key`; for `Timeout` that same key is also enqueued in the timer queue
+/// (a deadline), so whichever fires first wakes the one task.
+struct PromiseSetWaitState {
+    key: super::WaitKey,
+    promises: Vec<Rc<sema_core::AsyncPromise>>,
+    mode: sema_core::PromiseSetKind,
+    /// True when a deadline timer for `key` is enqueued (`Timeout` mode). On a
+    /// promise-settlement wake we cancel that timer so it never fires stale.
+    has_timer: bool,
 }
 
 enum ProtocolWaitKind {
@@ -235,6 +253,11 @@ impl Trace for RuntimeState {
                 .promise_waits
                 .values()
                 .all(|(_, promise)| trace_promise(promise, sink))
+            && self.promise_set_waits.values().all(|wait| {
+                wait.promises
+                    .iter()
+                    .all(|promise| trace_promise(promise, sink))
+            })
             && self.pending.iter().all(|stage| stage.trace(sink))
     }
 }
@@ -304,6 +327,7 @@ impl Runtime {
                 task_promises: HashMap::new(),
                 spawned_promises: HashMap::new(),
                 promise_waits: HashMap::new(),
+                promise_set_waits: HashMap::new(),
                 drive_cursor: 0,
                 drive_active: false,
                 active_instruction_limit: usize::MAX,
@@ -665,6 +689,13 @@ impl Runtime {
                 message: "timer referenced missing waiting task".into(),
             })?;
         let root = state.tasks[&task_id].record.relations().origin_root;
+        // An `async/timeout` deadline: the observed promise was still pending, so
+        // raise the timeout at the `async/timeout` call site (catchable). The
+        // supplied promise is left untouched — its producer CONTINUES.
+        let timed_out = state
+            .promise_set_waits
+            .get(&task_id)
+            .is_some_and(|wait| wait.key == key);
         state
             .tasks
             .get_mut(&task_id)
@@ -674,6 +705,14 @@ impl Runtime {
             .map_err(|error| RuntimeFault::Invariant {
                 message: format!("timer task failed to wake: {error:?}"),
             })?;
+        if timed_out {
+            state.promise_set_waits.remove(&task_id);
+            state
+                .tasks
+                .get_mut(&task_id)
+                .expect("timed-out task was selected")
+                .vm_resume = Some(VmResume::Fail(timeout_expired_error()));
+        }
         state.ready.enqueue(root, task_id);
         Ok(true)
     }
@@ -736,6 +775,37 @@ impl Runtime {
                     .wake(key)
                     .map_err(|error| RuntimeFault::Invariant {
                         message: format!("cancelled awaiting task failed to wake: {error:?}"),
+                    })?;
+                let root = task.record.relations().origin_root;
+                state.ready.enqueue(root, task_id);
+                return Ok(true);
+            }
+        }
+        {
+            // A VM task parked on an observational combinator (`async/all` /
+            // `async/race` / `async/timeout`): drop its set-wait (and any deadline
+            // timer) and wake it so the cancellation is applied on its next visit.
+            let mut state = self.state.borrow_mut();
+            let selected = state.tasks.iter().find_map(|(id, task)| {
+                let key = task.record.wait_key()?;
+                (task.record.cancellation().is_some()
+                    && state.promise_set_waits.get(id).map(|w| w.key) == Some(key))
+                .then_some((*id, key))
+            });
+            if let Some((task_id, key)) = selected {
+                if let Some(wait) = state.promise_set_waits.remove(&task_id) {
+                    if wait.has_timer {
+                        state.timers.cancel(key);
+                    }
+                }
+                let task = state
+                    .tasks
+                    .get_mut(&task_id)
+                    .expect("selected set-awaiting task exists");
+                task.record
+                    .wake(key)
+                    .map_err(|error| RuntimeFault::Invariant {
+                        message: format!("cancelled set-awaiting task failed to wake: {error:?}"),
                     })?;
                 let root = task.record.relations().origin_root;
                 state.ready.enqueue(root, task_id);
@@ -1162,6 +1232,14 @@ impl Runtime {
                     task.vm_call = Some(vm);
                     TaskAction::VmAwait(task_id, promise)
                 }
+                // `async/all` / `async/race` / `async/timeout`: park this frame
+                // on the SET of observed promises (and, for Timeout, a deadline
+                // timer). The runtime resumes it once the combinator's condition
+                // is met, without ever cancelling the supplied promises.
+                YieldReason::AwaitPromiseSet { promises, mode } => {
+                    task.vm_call = Some(vm);
+                    TaskAction::VmAwaitSet(task_id, promises, mode)
+                }
                 other => TaskAction::VmResult(
                     task_id,
                     task.vm_owner.take().expect("VM call has a return owner"),
@@ -1368,6 +1446,9 @@ impl Runtime {
             }
             TaskAction::VmSpawn(task_id, thunk) => self.spawn_detached(task_id, thunk)?,
             TaskAction::VmAwait(task_id, promise) => self.await_promise(task_id, promise)?,
+            TaskAction::VmAwaitSet(task_id, promises, mode) => {
+                self.await_promise_set(task_id, promises, mode)?
+            }
             #[cfg(test)]
             TaskAction::Timer(task_id, deadline) => {
                 let mut state = self.state.borrow_mut();
@@ -2136,6 +2217,103 @@ impl Runtime {
         Ok(())
     }
 
+    /// Park a VM task on a SET of observed promises for an observational
+    /// combinator (`async/all` / `async/race` / `async/timeout`). If the
+    /// combinator's condition is already met (some promises settled between the
+    /// native's check and here) the task resumes immediately; otherwise it is
+    /// registered in `promise_set_waits` (and, for `Timeout`, a deadline timer
+    /// is armed on the same wait key). The supplied promises are only OBSERVED —
+    /// never cancelled.
+    fn await_promise_set(
+        &self,
+        task_id: TaskId,
+        promises: Vec<Rc<sema_core::AsyncPromise>>,
+        mode: sema_core::PromiseSetKind,
+    ) -> Result<(), RuntimeFault> {
+        if let Some(resume) = evaluate_promise_set(&promises, &mode) {
+            return self.resume_running_vm(task_id, resume);
+        }
+        let mut state = self.state.borrow_mut();
+        let key = state
+            .waits
+            .as_ref()
+            .expect("wait runtime installed")
+            .issue_internal_wait()
+            .map_err(|_| RuntimeFault::IdExhausted { kind: "wait" })?;
+        state
+            .tasks
+            .get_mut(&task_id)
+            .ok_or_else(|| RuntimeFault::Invariant {
+                message: "promise-set awaiting VM task disappeared".into(),
+            })?
+            .record
+            .wait(key)
+            .map_err(|error| RuntimeFault::Invariant {
+                message: format!("promise-set awaiting VM task failed to wait: {error:?}"),
+            })?;
+        let has_timer = if let sema_core::PromiseSetKind::Timeout(ms) = &mode {
+            let deadline = state.clock.now() + Duration::from_millis(*ms);
+            if !state.timers.insert(deadline, key) {
+                return Err(RuntimeFault::IdExhausted { kind: "timer" });
+            }
+            true
+        } else {
+            false
+        };
+        state.promise_set_waits.insert(
+            task_id,
+            PromiseSetWaitState {
+                key,
+                promises,
+                mode,
+                has_timer,
+            },
+        );
+        Ok(())
+    }
+
+    /// Wake any promise-set waiter (`async/all` / `async/race` / `async/timeout`)
+    /// whose combinator condition is now satisfied by the settlement of
+    /// `promise`. Called from `settle_spawned` after single-promise awaiters are
+    /// woken. Delivers the combinator's resume value/error, drops the wait entry,
+    /// and cancels any pending deadline timer.
+    fn wake_promise_set_waiters(
+        &self,
+        state: &mut RuntimeState,
+        promise: &Rc<sema_core::AsyncPromise>,
+    ) -> Result<(), RuntimeFault> {
+        let ready: Vec<(TaskId, super::WaitKey, bool, VmResume)> = state
+            .promise_set_waits
+            .iter()
+            .filter(|(_, wait)| wait.promises.iter().any(|p| Rc::ptr_eq(p, promise)))
+            .filter_map(|(waiter, wait)| {
+                evaluate_promise_set(&wait.promises, &wait.mode)
+                    .map(|resume| (*waiter, wait.key, wait.has_timer, resume))
+            })
+            .collect();
+        for (waiter, key, has_timer, resume) in ready {
+            state.promise_set_waits.remove(&waiter);
+            if has_timer {
+                state.timers.cancel(key);
+            }
+            let task = state
+                .tasks
+                .get_mut(&waiter)
+                .ok_or_else(|| RuntimeFault::Invariant {
+                    message: "promise-set waiter disappeared before wake".into(),
+                })?;
+            task.record
+                .wake(key)
+                .map_err(|error| RuntimeFault::Invariant {
+                    message: format!("promise-set waiter failed to wake: {error:?}"),
+                })?;
+            task.vm_resume = Some(resume);
+            let root = task.record.relations().origin_root;
+            state.ready.enqueue(root, waiter);
+        }
+        Ok(())
+    }
+
     /// Move a Running VM task back to Ready, stamping the resume to apply on its
     /// next visit (a stack-top value injection, or a failure that settles it).
     fn resume_running_vm(&self, task_id: TaskId, resume: VmResume) -> Result<(), RuntimeFault> {
@@ -2223,6 +2401,9 @@ impl Runtime {
             let root = task.record.relations().origin_root;
             state.ready.enqueue(root, waiter);
         }
+        // Wake observational combinator waiters (async/all / race / timeout)
+        // whose condition this settlement now satisfies.
+        self.wake_promise_set_waiters(&mut state, &promise)?;
         Ok(())
     }
 
@@ -2662,6 +2843,107 @@ fn await_cancelled_error() -> sema_core::SemaError {
     sema_core::SemaError::eval("async/await: task was cancelled")
 }
 
+/// Strip any nested `async/await: task rejected:` prefix off a promise rejection
+/// message so combinator errors carry the bare cause under their own prefix.
+fn strip_rejection_prefix(message: &str) -> &str {
+    message
+        .strip_prefix("Eval error: async/await: task rejected: ")
+        .or_else(|| message.strip_prefix("async/await: task rejected: "))
+        .unwrap_or(message)
+}
+
+/// Evaluate an observational combinator over its (ordered) observed promises,
+/// returning `Some(resume)` when its condition is met or `None` while it must
+/// keep waiting. Only INSPECTS promise state — never mutates or cancels.
+///
+/// - `All`: raise the first (input-order) failure/cancellation immediately;
+///   otherwise, once every promise resolves, return the values in INPUT order
+///   (empty input → empty list).
+/// - `Race`: the first settled promise wins (returned/failed/cancelled alike).
+///   Incremental wakes fire in settlement order, so the first wake is the
+///   lowest-settlement winner; among already-settled promises at the initial
+///   check, input order is the tie-break.
+/// - `Timeout`: the single observed promise, if already settled, wins; the
+///   deadline itself is delivered by the timer path (`fire_timer`), not here.
+fn evaluate_promise_set(
+    promises: &[Rc<sema_core::AsyncPromise>],
+    mode: &sema_core::PromiseSetKind,
+) -> Option<VmResume> {
+    use sema_core::PromiseState;
+    match mode {
+        sema_core::PromiseSetKind::All => {
+            for promise in promises {
+                match &*promise.state.borrow() {
+                    PromiseState::Rejected(error) => {
+                        return Some(VmResume::Fail(sema_core::SemaError::eval(format!(
+                            "async/all: task rejected: {}",
+                            strip_rejection_prefix(error)
+                        ))));
+                    }
+                    PromiseState::Cancelled => {
+                        return Some(VmResume::Fail(sema_core::SemaError::eval(
+                            "async/all: task was cancelled",
+                        )));
+                    }
+                    PromiseState::Pending | PromiseState::Resolved(_) => {}
+                }
+            }
+            if promises
+                .iter()
+                .all(|p| matches!(&*p.state.borrow(), PromiseState::Resolved(_)))
+            {
+                let values = promises
+                    .iter()
+                    .map(|p| match &*p.state.borrow() {
+                        PromiseState::Resolved(value) => value.clone(),
+                        _ => unreachable!("all promises verified resolved above"),
+                    })
+                    .collect();
+                return Some(VmResume::Value(sema_core::Value::list(values)));
+            }
+            None
+        }
+        sema_core::PromiseSetKind::Race | sema_core::PromiseSetKind::Timeout(_) => {
+            for promise in promises {
+                match &*promise.state.borrow() {
+                    PromiseState::Resolved(value) => {
+                        return Some(VmResume::Value(value.clone()));
+                    }
+                    PromiseState::Rejected(error) => {
+                        let who = if matches!(mode, sema_core::PromiseSetKind::Timeout(_)) {
+                            "async/timeout"
+                        } else {
+                            "async/race"
+                        };
+                        return Some(VmResume::Fail(sema_core::SemaError::eval(format!(
+                            "{who}: task rejected: {}",
+                            strip_rejection_prefix(error)
+                        ))));
+                    }
+                    PromiseState::Cancelled => {
+                        let who = if matches!(mode, sema_core::PromiseSetKind::Timeout(_)) {
+                            "async/timeout"
+                        } else {
+                            "async/race"
+                        };
+                        return Some(VmResume::Fail(sema_core::SemaError::eval(format!(
+                            "{who}: task was cancelled"
+                        ))));
+                    }
+                    PromiseState::Pending => {}
+                }
+            }
+            None
+        }
+    }
+}
+
+/// The `async/timeout` deadline-elapsed error (the observed promise was still
+/// pending when the timer fired). Catchable at the `async/timeout` call site.
+fn timeout_expired_error() -> sema_core::SemaError {
+    sema_core::SemaError::eval("async/timeout: operation timed out")
+}
+
 fn registry_error(error: super::RegistryError) -> sema_core::SemaError {
     sema_core::SemaError::eval(match error {
         super::RegistryError::WrongRuntime => "runtime handle belongs to another runtime",
@@ -2978,6 +3260,13 @@ enum TaskAction {
     VmSpawn(TaskId, sema_core::Value),
     /// `async/await`: park the task (`TaskId`) on the promise until it settles.
     VmAwait(TaskId, Rc<sema_core::AsyncPromise>),
+    /// `async/all` / `async/race` / `async/timeout`: park the task (`TaskId`) on
+    /// the SET of observed promises with the given combinator mode.
+    VmAwaitSet(
+        TaskId,
+        Vec<Rc<sema_core::AsyncPromise>>,
+        sema_core::PromiseSetKind,
+    ),
     #[cfg(test)]
     Timer(TaskId, Instant),
     #[cfg(test)]
@@ -3072,6 +3361,9 @@ impl Trace for TaskAction {
                 true
             }
             Self::VmAwait(_, promise) => trace_promise(promise, sink),
+            Self::VmAwaitSet(_, promises, _) => {
+                promises.iter().all(|promise| trace_promise(promise, sink))
+            }
             #[cfg(test)]
             Self::NativeCall(_, _) => true,
             #[cfg(test)]

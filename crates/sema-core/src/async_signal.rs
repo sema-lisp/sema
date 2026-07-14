@@ -129,11 +129,40 @@ impl std::fmt::Debug for IoHandle {
     }
 }
 
+/// Which observational combinator a [`YieldReason::AwaitPromiseSet`] carries.
+///
+/// Observational: the runtime OBSERVES the supplied promises and MUST NEVER
+/// cancel them. See the master contract in
+/// `docs/plans/2026-07-13-unified-cooperative-runtime.md` (§"Observational
+/// operations").
+#[derive(Debug, Clone)]
+pub enum PromiseSetKind {
+    /// `async/all`: values in INPUT order once every promise resolves; the
+    /// first (lowest-settlement) failure/cancellation is raised immediately.
+    All,
+    /// `async/race`: the first (lowest-settlement) settlement wins —
+    /// returned, failed, or cancelled alike. Losers CONTINUE.
+    Race,
+    /// `async/timeout`: bound one observation of a single promise by `ms`
+    /// milliseconds. A pending promise at the deadline raises `:timeout`; the
+    /// supplied producer CONTINUES.
+    Timeout(u64),
+}
+
 /// Reason a task is yielding control back to the scheduler.
 #[derive(Debug, Clone)]
 pub enum YieldReason {
     /// Waiting for a promise to resolve.
     AwaitPromise(Rc<AsyncPromise>),
+    /// Observing a SET of promises via an observational combinator
+    /// (`async/all` / `async/race` / `async/timeout`). The unified runtime parks
+    /// the frame on every supplied promise (and, for `Timeout`, a deadline
+    /// timer) and resumes it once the combinator's condition is met — WITHOUT
+    /// ever cancelling the supplied promises.
+    AwaitPromiseSet {
+        promises: Vec<Rc<AsyncPromise>>,
+        mode: PromiseSetKind,
+    },
     /// Waiting to receive from an empty channel.
     ChannelRecv(Rc<Channel>),
     /// Waiting to send to a full channel (carries the value to send).

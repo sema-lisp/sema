@@ -1,0 +1,275 @@
+use std::marker::PhantomData;
+use std::num::NonZeroU64;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static NEXT_RUNTIME_ID: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+#[error("runtime identity space is exhausted")]
+pub struct IdExhausted;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+#[error("runtime identity must be nonzero")]
+pub struct InvalidRuntimeId;
+
+macro_rules! scalar_id {
+    ($name:ident) => {
+        #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+        pub struct $name(NonZeroU64);
+
+        impl $name {
+            pub fn get(self) -> u64 {
+                self.0.get()
+            }
+        }
+
+        impl private::Sealed for $name {
+            fn from_nonzero(value: NonZeroU64) -> Self {
+                Self(value)
+            }
+        }
+    };
+}
+
+scalar_id!(TaskId);
+scalar_id!(ScopeId);
+scalar_id!(WaitId);
+scalar_id!(WaitGeneration);
+scalar_id!(OperationId);
+scalar_id!(SettlementSeq);
+scalar_id!(CompletionKind);
+
+impl TaskId {
+    pub fn try_from_raw(raw: u64) -> Result<Self, InvalidRuntimeId> {
+        NonZeroU64::new(raw).map(Self).ok_or(InvalidRuntimeId)
+    }
+}
+
+impl CompletionKind {
+    pub fn try_from_raw(raw: u64) -> Result<Self, InvalidRuntimeId> {
+        NonZeroU64::new(raw).map(Self).ok_or(InvalidRuntimeId)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct RuntimeId(NonZeroU64);
+
+impl RuntimeId {
+    pub fn allocate() -> Result<Self, IdExhausted> {
+        allocate_atomic(&NEXT_RUNTIME_ID).map(Self)
+    }
+
+    pub fn get(self) -> u64 {
+        self.0.get()
+    }
+}
+
+fn allocate_atomic(counter: &AtomicU64) -> Result<NonZeroU64, IdExhausted> {
+    let raw = counter
+        .fetch_update(
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+            |current| match current {
+                0 => None,
+                u64::MAX => Some(0),
+                value => Some(value + 1),
+            },
+        )
+        .map_err(|_| IdExhausted)?;
+    NonZeroU64::new(raw).ok_or(IdExhausted)
+}
+
+mod private {
+    use super::RuntimeId;
+    use std::num::NonZeroU64;
+
+    pub trait Sealed: Sized {
+        fn from_nonzero(value: NonZeroU64) -> Self;
+    }
+
+    pub trait ScopedSealed: Sized {
+        fn from_parts(runtime: RuntimeId, local: NonZeroU64) -> Self;
+    }
+}
+
+#[doc(hidden)]
+pub trait RuntimeIdType: private::Sealed {}
+
+impl<T: private::Sealed> RuntimeIdType for T {}
+
+#[derive(Clone, Debug)]
+pub struct IdCounter<I> {
+    next: Option<NonZeroU64>,
+    marker: PhantomData<fn() -> I>,
+}
+
+impl<I: RuntimeIdType> Default for IdCounter<I> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<I: RuntimeIdType> IdCounter<I> {
+    pub fn new() -> Self {
+        Self {
+            next: NonZeroU64::new(1),
+            marker: PhantomData,
+        }
+    }
+
+    pub fn allocate(&mut self) -> Result<I, IdExhausted> {
+        let current = self.next.ok_or(IdExhausted)?;
+        self.next = current.get().checked_add(1).and_then(NonZeroU64::new);
+        Ok(I::from_nonzero(current))
+    }
+
+    #[cfg(test)]
+    fn starting_at(next: u64) -> Self {
+        Self {
+            next: NonZeroU64::new(next),
+            marker: PhantomData,
+        }
+    }
+}
+
+macro_rules! scoped_id {
+    ($name:ident) => {
+        #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+        pub struct $name {
+            runtime: RuntimeId,
+            local: NonZeroU64,
+        }
+
+        impl $name {
+            pub fn runtime(self) -> RuntimeId {
+                self.runtime
+            }
+
+            pub fn local(self) -> u64 {
+                self.local.get()
+            }
+
+            pub fn get(self) -> u64 {
+                self.local.get()
+            }
+        }
+    };
+}
+
+scoped_id!(RootId);
+scoped_id!(PromiseId);
+scoped_id!(ChannelId);
+
+#[doc(hidden)]
+pub trait RuntimeScopedIdType: private::ScopedSealed {}
+
+impl<T: private::ScopedSealed> RuntimeScopedIdType for T {}
+
+macro_rules! scoped_id_type {
+    ($name:ident) => {
+        impl private::ScopedSealed for $name {
+            fn from_parts(runtime: RuntimeId, local: NonZeroU64) -> Self {
+                Self { runtime, local }
+            }
+        }
+    };
+}
+
+scoped_id_type!(RootId);
+scoped_id_type!(PromiseId);
+scoped_id_type!(ChannelId);
+
+#[derive(Clone, Debug)]
+pub struct RuntimeScopedIdCounter<I> {
+    runtime: RuntimeId,
+    local: IdCounter<NonZeroU64>,
+    marker: PhantomData<fn() -> I>,
+}
+
+impl private::Sealed for NonZeroU64 {
+    fn from_nonzero(value: NonZeroU64) -> Self {
+        value
+    }
+}
+
+impl<I: RuntimeScopedIdType> RuntimeScopedIdCounter<I> {
+    pub fn new(runtime: RuntimeId) -> Self {
+        Self {
+            runtime,
+            local: IdCounter::new(),
+            marker: PhantomData,
+        }
+    }
+
+    pub fn allocate(&mut self) -> Result<I, IdExhausted> {
+        self.local
+            .allocate()
+            .map(|local| <I as private::ScopedSealed>::from_parts(self.runtime, local))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn counter_starts_at_one() {
+        let mut counter = IdCounter::<TaskId>::new();
+        assert_eq!(counter.allocate().expect("ID available").get(), 1);
+    }
+
+    #[test]
+    fn counter_issues_max_once_then_stays_exhausted() {
+        let mut counter = IdCounter::<TaskId>::starting_at(u64::MAX);
+        assert_eq!(
+            counter.allocate().expect("last ID available").get(),
+            u64::MAX
+        );
+        assert_eq!(counter.allocate(), Err(IdExhausted));
+        assert_eq!(counter.allocate(), Err(IdExhausted));
+    }
+
+    #[test]
+    fn atomic_allocator_issues_max_once_then_stays_exhausted() {
+        let counter = AtomicU64::new(u64::MAX);
+        assert_eq!(
+            allocate_atomic(&counter).expect("last ID available").get(),
+            u64::MAX
+        );
+        assert_eq!(allocate_atomic(&counter), Err(IdExhausted));
+        assert_eq!(allocate_atomic(&counter), Err(IdExhausted));
+    }
+
+    #[test]
+    fn runtime_ids_are_process_global_and_unique() {
+        let first = RuntimeId::allocate().expect("runtime ID available");
+        let second = RuntimeId::allocate().expect("runtime ID available");
+        assert!(first < second);
+    }
+
+    #[test]
+    fn scoped_ids_include_runtime_and_local_identity() {
+        let runtime = RuntimeId::allocate().expect("runtime ID available");
+        let mut counter = RuntimeScopedIdCounter::<PromiseId>::new(runtime);
+        let id = counter.allocate().expect("promise ID available");
+        assert_eq!(id.runtime(), runtime);
+        assert_eq!(id.local(), 1);
+    }
+
+    #[test]
+    fn every_identity_has_the_required_value_traits() {
+        fn assert_traits<T: Copy + Clone + std::fmt::Debug + Eq + Ord + std::hash::Hash>() {}
+
+        assert_traits::<RuntimeId>();
+        assert_traits::<RootId>();
+        assert_traits::<TaskId>();
+        assert_traits::<ScopeId>();
+        assert_traits::<PromiseId>();
+        assert_traits::<ChannelId>();
+        assert_traits::<WaitId>();
+        assert_traits::<WaitGeneration>();
+        assert_traits::<OperationId>();
+        assert_traits::<SettlementSeq>();
+        assert_traits::<CompletionKind>();
+    }
+}

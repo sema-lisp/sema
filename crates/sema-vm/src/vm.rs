@@ -234,10 +234,7 @@ fn trace_vm_closure_payload(
         sever: sever_nothing,
     });
     sink(function_table_edge(&payload.functions));
-    for native in payload.native_fns.iter() {
-        let value = Value::native_fn_from_rc(Rc::clone(native));
-        sink(sema_core::GcEdge::Value(&value));
-    }
+    sink(native_table_edge(&payload.native_fns));
     true
 }
 
@@ -310,6 +307,29 @@ fn trace_function_table(ptr: sema_core::NodePtr, sink: &mut dyn FnMut(sema_core:
     true
 }
 
+/// Edge into the immutable native-function table shared by a VM and every
+/// closure payload it creates. Owners report the table allocation itself;
+/// the table reports each contained `NativeFn` exactly once.
+fn native_table_edge(table: &Rc<Vec<Rc<NativeFn>>>) -> sema_core::GcEdge<'static> {
+    sema_core::GcEdge::Opaque {
+        ptr: sema_core::NodePtr::of_rc(table),
+        strong_count: Rc::strong_count(table),
+        trace: trace_native_table,
+        sever: sever_nothing,
+    }
+}
+
+fn trace_native_table(ptr: sema_core::NodePtr, sink: &mut dyn FnMut(sema_core::GcEdge)) -> bool {
+    // SAFETY: live `Rc<Vec<Rc<NativeFn>>>` data pointer — see
+    // trace_vm_closure_payload.
+    let table = unsafe { &*(ptr.raw() as *const Vec<Rc<NativeFn>>) };
+    for native in table {
+        let value = Value::native_fn_from_rc(Rc::clone(native));
+        sink(sema_core::GcEdge::Value(&value));
+    }
+    true
+}
+
 /// Edges of a `Function` template: one strong ref per chunk const.
 fn trace_function(ptr: sema_core::NodePtr, sink: &mut dyn FnMut(sema_core::GcEdge)) -> bool {
     // SAFETY: live `Rc<Function>` data pointer — see trace_vm_closure_payload.
@@ -371,6 +391,12 @@ fn sever_upvalue_cell(ptr: sema_core::NodePtr) -> Option<Value> {
 /// cells/envs are cleared.
 fn sever_nothing(_: sema_core::NodePtr) -> Option<Value> {
     None
+}
+
+fn legacy_vm_entry_during_quantum_error() -> SemaError {
+    SemaError::eval(
+        "internal error: legacy native callback cannot re-enter a VM during an active runtime quantum",
+    )
 }
 
 /// Extracted VM closure: the closure itself and the function table from its compilation context.
@@ -485,15 +511,10 @@ impl sema_core::runtime::Trace for VM {
                     sink(vm_closure_edge(closure));
                     sink(function_table_edge(functions));
                 }
-                CachedGlobal::Native { .. } => {
-                    sink(sema_core::GcEdge::Value(cached.value()));
-                }
+                CachedGlobal::Native { .. } => {}
             }
         }
-        for native in self.native_fns.iter() {
-            let value = Value::native_fn_from_rc(Rc::clone(native));
-            sink(sema_core::GcEdge::Value(&value));
-        }
+        sink(native_table_edge(&self.native_fns));
         for value in self.debug_values.values() {
             sink(sema_core::GcEdge::Value(value));
         }
@@ -1577,6 +1598,9 @@ impl VM {
     }
 
     fn run(&mut self, ctx: &EvalContext) -> Result<Value, SemaError> {
+        if ctx.runtime_quantum_active() {
+            return Err(legacy_vm_entry_during_quantum_error());
+        }
         match self.run_inner::<false>(ctx, None)? {
             crate::debug::VmExecResult::Finished(v) => Ok(v),
             crate::debug::VmExecResult::Stopped(_) | crate::debug::VmExecResult::Yielded => {
@@ -1610,9 +1634,7 @@ impl VM {
         ctx: &EvalContext,
     ) -> Result<Value, SemaError> {
         if ctx.runtime_quantum_active() {
-            return Err(SemaError::eval(
-                "internal error: legacy native callback cannot re-enter a VM during an active runtime quantum",
-            ));
+            return Err(legacy_vm_entry_during_quantum_error());
         }
         // Floor = the parent's current frame depth. After setup_for_call pushes
         // the callee frame, the loop must stop unwinding once it pops back to
@@ -5441,6 +5463,90 @@ mod tests {
     use super::*;
     use crate::chunk::{Chunk, Function};
     use sema_core::{intern, NativeFn};
+
+    #[test]
+    fn native_table_is_traced_as_one_shared_opaque_node() {
+        let globals = make_test_env();
+        let native = Rc::new(NativeFn::simple("gc-probe", |_| Ok(Value::nil())));
+        let native_table = Rc::new(vec![native]);
+        let vm = VM::new_for_task_with_native_fns(
+            globals,
+            Rc::new(Vec::new()),
+            Rc::clone(&native_table),
+        );
+        let table_ptr = sema_core::NodePtr::of_rc(&native_table);
+        let mut table_edges = 0;
+
+        sema_core::runtime::Trace::trace(&vm, &mut |edge| {
+            if matches!(edge, sema_core::GcEdge::Opaque { ptr, .. } if ptr == table_ptr) {
+                table_edges += 1;
+            }
+        });
+
+        assert_eq!(table_edges, 1, "VM must own one edge to the shared table");
+    }
+
+    #[test]
+    fn forced_collection_preserves_native_table_shared_by_suspended_vm_and_payloads() {
+        let globals = make_test_env();
+        let ctx = EvalContext::new();
+        let callbacks = eval_str(
+            "((lambda (captured) (list (lambda () captured) (lambda () captured))) 7)",
+            &globals,
+            &ctx,
+        )
+        .unwrap();
+        let callbacks = callbacks.as_list().expect("callback list");
+        let (first, second) = (&callbacks[0], &callbacks[1]);
+        let (first_closure, functions, native_table) =
+            extract_vm_closure(first).expect("first VM closure");
+        let (_, _, second_native_table) = extract_vm_closure(second).expect("second VM closure");
+        assert!(Rc::ptr_eq(&native_table, &second_native_table));
+
+        let mut suspended = VM::new_for_task_with_native_fns(
+            Rc::clone(first_closure.globals.as_ref().expect("closure home")),
+            functions,
+            Rc::clone(&native_table),
+        );
+        suspended.setup_for_call(first_closure, &[]).unwrap();
+        let pins = sema_core::gc_env_chain_pins(&globals);
+        sema_core::gc_collect(&pins, sema_core::GcTrigger::Explicit);
+
+        assert_eq!(
+            (second.as_native_fn_ref().unwrap().func)(&ctx, &[]).unwrap(),
+            Value::int(7)
+        );
+        assert!(Rc::strong_count(&native_table) >= 3);
+        assert_eq!(suspended.frame_count(), 1);
+    }
+
+    #[test]
+    fn closure_fallback_rejects_vm_entry_during_runtime_quantum() {
+        let globals = make_test_env();
+        let calls = Rc::new(std::cell::Cell::new(0));
+        let calls_for_native = Rc::clone(&calls);
+        globals.set(
+            intern("quantum-probe"),
+            Value::native_fn(NativeFn::simple("quantum-probe", move |_| {
+                calls_for_native.set(calls_for_native.get() + 1);
+                Ok(Value::nil())
+            })),
+        );
+        let ctx = EvalContext::new();
+        let callback = eval_str("(lambda () (quantum-probe))", &globals, &ctx).unwrap();
+        let native = callback.as_native_fn_ref().expect("VM closure wrapper");
+        let _quantum = ctx.enter_runtime_quantum().unwrap();
+
+        let error = (native.func)(&ctx, &[]).unwrap_err();
+
+        assert_eq!(calls.get(), 0, "callback bytecode must not execute");
+        assert!(
+            error
+                .to_string()
+                .contains("cannot re-enter a VM during an active runtime quantum"),
+            "unexpected guard error: {error}"
+        );
+    }
 
     /// The cooperative-stop guard: surfacing a task stop with NO pending
     /// `DebugCoopResume` is an internal error (a scheduler-driving combinator

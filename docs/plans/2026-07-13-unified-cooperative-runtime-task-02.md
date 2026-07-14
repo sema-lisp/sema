@@ -430,9 +430,13 @@ Preserve the public `NativeFn.func` ABI exactly as
 `Fn(&EvalContext, &[Value]) -> Result<Value, SemaError>` and preserve every
 legacy constructor, including `with_payload`. Add a private optional
 `runtime_func`; do not expose it or add `is_runtime_aware`. Add public
-`simple_result` and `with_context_result` constructors. They install the
-runtime-aware function in `runtime_func` and install a named internal-error
-function in the public legacy `func` slot.
+`simple_result`, `with_context_result`, and `with_payload_result` constructors.
+The payload-backed constructor accepts a function pointer, stores exactly one
+strong payload edge in `NativeFn.payload`, and lets `runtime_func` capture only
+a `Weak` payload handle. Payload types that reach `Value` or `Env` require a
+registered payload tracer. Runtime-aware constructors install the runtime
+function in `runtime_func` and a named internal-error function in the public
+legacy `func` slot.
 
 Cross-crate VM dispatch uses only this adapter:
 
@@ -612,8 +616,8 @@ output routing, migration of existing `EvalContext` fields, production
   behavior, and the absence of `Clone`/a second wait-request type.
 - [ ] Test every legacy constructor through `invoke_runtime` adapts success to
   `Return`; test `simple_result`/`with_context_result`, their named internal
-  error through public `func`, private runtime metadata, and `with_payload`
-  preservation.
+  error through public `func`, private runtime metadata, `with_payload`
+  preservation, and `with_payload_result`'s typed one-strong-edge contract.
 - [ ] Test exact duplicate-edge multiplicity and a failed borrow after partial
   sink emission. Pin direct trace edges for call, suspend, every wait/resume
   variant, prepared decoder/resource (never job), and interruptible hook only.

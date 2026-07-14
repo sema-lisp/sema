@@ -1517,25 +1517,42 @@ mod tests {
             true
         }
 
+        fn invoke_registered_payload(
+            _: &RegisteredTracePayload,
+            _: &mut crate::runtime::NativeCallContext<'_>,
+            _: &[Value],
+        ) -> crate::runtime::NativeResult {
+            Ok(crate::runtime::NativeOutcome::Return(Value::NIL))
+        }
+
         register_payload_tracer(
             TypeId::of::<RegisteredTracePayload>(),
             registered_trace_payload_tracer,
         );
         let env = Env::new();
-        let native = Value::native_fn(NativeFn::with_payload(
+        let native = Value::native_fn(NativeFn::with_payload_result(
             "registered-trace",
             Rc::new(RegisteredTracePayload { env: Rc::new(env) }),
-            |_, _| Ok(Value::NIL),
+            invoke_registered_payload,
         ));
         let mut opaque_count = 0;
         let mut opaque = None;
+        let mut payload_strong_count = None;
         assert!(trace_value(&native, &mut |edge| {
             opaque_count += 1;
-            if let GcEdge::Opaque { ptr, trace, .. } = edge {
+            if let GcEdge::Opaque {
+                ptr,
+                strong_count,
+                trace,
+                ..
+            } = edge
+            {
                 opaque = Some((ptr, trace));
+                payload_strong_count = Some(strong_count);
             }
         }));
         assert_eq!(opaque_count, 1, "one registered payload allocation");
+        assert_eq!(payload_strong_count, Some(1), "payload field is sole owner");
         let (ptr, trace) = opaque.expect("registered tracer emitted opaque edge");
         let mut delegated_count = 0;
         let mut delegated_env = false;

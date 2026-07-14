@@ -378,4 +378,49 @@ mod tests {
             .to_string()
             .contains("contextual"));
     }
+
+    #[test]
+    fn payload_runtime_native_uses_one_typed_payload_owner() {
+        struct Payload {
+            value: RefCell<Value>,
+        }
+
+        fn invoke(
+            payload: &Payload,
+            runtime: &mut NativeCallContext<'_>,
+            args: &[Value],
+        ) -> NativeResult {
+            assert!(!runtime.cancellation.is_requested());
+            let previous = payload.value.replace(args[0].clone());
+            Ok(NativeOutcome::Return(previous))
+        }
+
+        let payload = Rc::new(Payload {
+            value: RefCell::new(Value::int(10)),
+        });
+        let native = NativeFn::with_payload_result("payload-runtime", Rc::clone(&payload), invoke);
+        assert_eq!(Rc::strong_count(&payload), 2, "caller plus payload field");
+        assert!(native
+            .payload
+            .as_ref()
+            .unwrap()
+            .downcast_ref::<Payload>()
+            .is_some());
+
+        let eval = EvalContext::new();
+        let mut task_context = TaskContext::default();
+        let mut runtime = NativeCallContext {
+            task_context: &mut task_context,
+            cancellation: CancellationView::default(),
+        };
+        assert!(matches!(
+            native.invoke_runtime(&eval, &mut runtime, &[Value::int(11)]),
+            Ok(NativeOutcome::Return(value)) if value == Value::int(10)
+        ));
+        assert_eq!(*payload.value.borrow(), Value::int(11));
+        assert!((native.func)(&eval, &[])
+            .unwrap_err()
+            .to_string()
+            .contains("payload-runtime"));
+    }
 }

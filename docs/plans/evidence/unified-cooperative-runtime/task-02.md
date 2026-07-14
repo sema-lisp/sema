@@ -23,7 +23,10 @@ final review document remain pending and were not performed here.
   exactly-one terminal delivery attempts for admitted work.
 - Native return/call/suspend vocabulary, consuming continuations, wait and
   resume variants, fallible exact-multiplicity tracing, and the private
-  runtime-aware `NativeFn` path while retaining the legacy ABI.
+  runtime-aware `NativeFn` path while retaining the legacy ABI. Final review
+  finding `UR-T02-R201` added `NativeFn::with_payload_result`, whose typed
+  function-pointer callback holds only a `Weak` handle while the public payload
+  field owns the single strong, registered-tracer-visible payload edge.
 - Typed task-local extensions and optional `EvalContext` task-context handles.
 - A named, fallible `LegacyRuntimeBridge` for the still-raw task-ID seams.
   Production scheduling, I/O behavior, and legacy callback signatures remain

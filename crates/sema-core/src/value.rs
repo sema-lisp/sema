@@ -261,6 +261,41 @@ impl NativeFn {
         }
     }
 
+    /// Constructs a runtime-aware callback with typed, collector-traceable state.
+    ///
+    /// The payload type must have a tracer registered with
+    /// [`crate::register_payload_tracer`] when it can reach a [`Value`] or
+    /// [`crate::Env`]. The payload field owns the sole strong callback-state
+    /// edge; the runtime callback captures only a `Weak<T>` and the function
+    /// pointer, then temporarily upgrades the weak handle for each invocation.
+    pub fn with_payload_result<T: Any + 'static>(
+        name: impl Into<String>,
+        payload: Rc<T>,
+        f: for<'a> fn(&T, &mut NativeCallContext<'a>, &[Value]) -> NativeResult,
+    ) -> Self {
+        let name = name.into();
+        let error_name = name.clone();
+        let weak_payload = Rc::downgrade(&payload);
+        let payload: Rc<dyn Any> = payload;
+        Self {
+            name,
+            func: Box::new(move |_, _| {
+                Err(SemaError::eval(format!(
+                    "internal error: runtime native function '{error_name}' requires runtime invocation"
+                )))
+            }),
+            payload: Some(payload),
+            param_names: None,
+            is_closure: false,
+            runtime_func: Some(Box::new(move |context, args| {
+                let payload = weak_payload.upgrade().ok_or_else(|| {
+                    SemaError::eval("internal error: runtime native payload is unavailable")
+                })?;
+                f(&payload, context, args)
+            })),
+        }
+    }
+
     #[doc(hidden)]
     /// Invokes the runtime ABI, using `eval_context` only for the legacy
     /// callback fallback when no runtime-aware callback exists.

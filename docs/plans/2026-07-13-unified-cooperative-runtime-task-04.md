@@ -377,6 +377,45 @@ cargo test -p sema-lang --test async_contract_test -- duration
 
 Expected: all selected tests pass without wall-clock sleeps.
 
+> **PROGRESS (2026-07-15) — `async/cancel` is GREEN end-to-end through the
+> unified runtime (`eval_str_via_runtime`).** Wired on the same
+> spawned-`Rc<AsyncPromise>` seam as `async/spawn`/`async/await`.
+> - New `YieldReason::Cancel(Rc<AsyncPromise>)` (`sema-core/async_signal.rs`).
+>   `async/cancel` (sema-stdlib `async_ops.rs`) yields it when
+>   `in_runtime_quantum()` instead of driving the legacy cancel callback; the
+>   legacy scheduler gains an exhaustive `Cancel` arm (unreachable in-runtime).
+> - The VM surfaces it as `AsyncYield`; `visit_ready` maps it to
+>   `TaskAction::VmCancel`; `cancel_promise` (sema-vm `runtime/state.rs`)
+>   resolves promise → runtime `TaskId` (via the promise's `task_id` cell) and
+>   calls `TaskRecord::request_cancellation(CancelReason::Explicit)`, returning
+>   `#t` ONLY for the FIRST request of a still-pending spawned task; `#f` for a
+>   synthetic promise (`task_id == 0`), an already-terminal promise, an
+>   already-requested task, or a reaped task. Idempotent. The requester frame
+>   resumes with the boolean via `replace_stack_top`.
+> - No new interruption code was needed: the drive loop's existing
+>   `cancel_waiting` pass (source 2, run every drive turn — not just at shutdown)
+>   already deregisters a cancelled task's active wait. A task blocked on a long
+>   `async/sleep` has its far-future timer CANCELLED and is woken, then
+>   `visit_ready`'s cancellation arm settles it `Cancelled` via
+>   `settle_task`→`settle_spawned` — so it stops PROMPTLY at the next cooperative
+>   boundary, never after the full sleep. A Ready (not-yet-parked) cancelled child
+>   is settled directly by `visit_ready`.
+> - **Awaiting a cancelled promise raises a STRUCTURED catchable `:cancelled`
+>   condition.** `await_cancelled_error` (state.rs) and `cancelled_error`
+>   (async_ops.rs) now return `SemaError::cancelled_condition(..)` (a
+>   `SemaError::Condition` map with `:type :cancelled`), so a `(catch e …)` binds
+>   the condition map and `(:type e)` is `:cancelled`. The Sema `PromiseState::
+>   Cancelled` variant carries no `CancelReason`, so a generic `Explicit` reason
+>   is used (NOTE: to surface the real root/owner/timeout reason on the condition,
+>   `PromiseState::Cancelled` would need to carry the reason — deferred).
+> - Un-ignored gate tests in `sema-eval` `mod runtime_eval_tests`:
+>   `runtime_async_cancel_first_request_true_second_false` (gate 1),
+>   `runtime_async_cancel_synthetic_promise_is_false` (gate 1b),
+>   `runtime_await_cancelled_promise_raises_cancelled_condition` (gate 2,
+>   `(:type e)` → `:cancelled`), `runtime_await_cancelled_uncaught_settles_errored`
+>   (gate 2b), `runtime_cancel_sleeping_task_stops_promptly` (gate 3, wall-clock
+>   bounded well under the 100s sleep).
+
 ## Task 3: Implement observational `all`, `race`, and `timeout`
 
 **Files:** `async_ops.rs`, `runtime/promise.rs`, `runtime/wait.rs`,

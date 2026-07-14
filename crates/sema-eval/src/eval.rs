@@ -2466,4 +2466,103 @@ mod runtime_eval_tests {
             Value::keyword("bad-capacity"),
         );
     }
+
+    // ── CANCELLATION (Task 04) ───────────────────────────────────────
+
+    // GATE 1: `async/cancel` returns `#t` ONLY for the FIRST cancellation request
+    // of a pending spawned task; a second request on the same task returns `#f`
+    // (already requested / terminal). Idempotent.
+    #[test]
+    fn runtime_async_cancel_first_request_true_second_false() {
+        let interp = Interpreter::new();
+        let result = interp
+            .eval_str_via_runtime(
+                "(let ((p (async/spawn (fn () (async/sleep 100000) 42)))) \
+                   (list (async/cancel p) (async/cancel p)))",
+            )
+            .expect("async/cancel of a sleeping spawned task drives through the runtime");
+        assert_eq!(
+            result,
+            Value::list(vec![Value::bool(true), Value::bool(false)]),
+            "first cancel is the newly-requested #t; the second is #f",
+        );
+    }
+
+    // GATE 1b: `async/cancel` returns `#f` for a synthetic promise (no backing
+    // spawned task) — there is nothing to cancel, and it never errors.
+    #[test]
+    fn runtime_async_cancel_synthetic_promise_is_false() {
+        let interp = Interpreter::new();
+        let result = interp
+            .eval_str_via_runtime("(async/cancel (async/resolved 5))")
+            .expect("cancelling a synthetic promise is a no-op boolean, not an error");
+        assert_eq!(result, Value::bool(false));
+    }
+
+    // GATE 2: awaiting a cancelled promise raises a STRUCTURED, catchable
+    // `:cancelled` condition (not a plain error, not a value). `(:type e)` on the
+    // caught condition is `:cancelled`.
+    #[test]
+    fn runtime_await_cancelled_promise_raises_cancelled_condition() {
+        let interp = Interpreter::new();
+        let result = interp
+            .eval_str_via_runtime(
+                "(let ((p (async/spawn (fn () (async/sleep 100000) 42)))) \
+                   (async/cancel p) \
+                   (try (await p) (catch e (:type e))))",
+            )
+            .expect("awaiting a cancelled promise raises a catchable condition");
+        assert_eq!(
+            result,
+            Value::keyword("cancelled"),
+            "the caught condition's :type must be :cancelled",
+        );
+    }
+
+    // GATE 2b: an UNCAUGHT `(await <cancelled>)` settles the root errored (Failed
+    // with the cancellation), never Returned.
+    #[test]
+    fn runtime_await_cancelled_uncaught_settles_errored() {
+        let interp = Interpreter::new();
+        let result = interp.eval_str_via_runtime(
+            "(let ((p (async/spawn (fn () (async/sleep 100000) 42)))) \
+               (async/cancel p) \
+               (await p))",
+        );
+        let err =
+            result.expect_err("uncaught await of a cancelled promise must not return a value");
+        assert!(
+            err.to_string().contains("cancelled"),
+            "uncaught cancellation must surface as a cancellation error, got: {err}",
+        );
+    }
+
+    // GATE 3: a task blocked on a LONG `async/sleep`, when cancelled, actually
+    // stops at the next cooperative boundary and settles Cancelled PROMPTLY —
+    // NOT after the full (100s) sleep. The promise reports `async/cancelled?`
+    // and the whole evaluation completes well under the sleep duration.
+    #[test]
+    fn runtime_cancel_sleeping_task_stops_promptly() {
+        let interp = Interpreter::new();
+        let start = std::time::Instant::now();
+        let result = interp
+            .eval_str_via_runtime(
+                "(let ((p (async/spawn (fn () (async/sleep 100000) 42)))) \
+                   (async/cancel p) \
+                   (try (await p) (catch e :cancelled)) \
+                   (async/cancelled? p))",
+            )
+            .expect("a cancelled sleeping task settles through the runtime");
+        let elapsed = start.elapsed();
+        assert_eq!(
+            result,
+            Value::bool(true),
+            "the cancelled task's promise must be in the Cancelled state",
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "cancellation must be observed at the next cooperative boundary, \
+             not after the full 100s sleep (took {elapsed:?})",
+        );
+    }
 }

@@ -1,78 +1,192 @@
 # Async Runtime Migration Inventory
 
-This inventory tracks the hard-cut move to the interpreter-owned cooperative
-runtime. A checked item means the production path uses runtime task suspension
-or has been verified to be strictly synchronous and unable to call Sema.
+This ledger is the review boundary for the hard cut to one interpreter-owned
+cooperative runtime. Every production match from the Task 01 discovery scans is
+mapped below. Later tasks update rows; they do not delete unexplained rows.
 
-## Runtime foundation
+## Ledger rules
 
-- [ ] Core task, wait, completion, cancellation, and task-local types
-- [ ] VM task frames and 10,000-instruction quantum
-- [ ] Interpreter root submission and host drive API
-- [ ] FIFO ready queue, timer heap, completion inbox, shutdown/reaping
-- [ ] Native `Return` / `Call` / `Suspend` outcomes and continuation frames
-- [ ] Shared captured cells across task boundaries
+A row becomes `MIGRATED` only when its target wait family, cancellation class,
+context policy, owning layer, tests, and legacy removal are evidenced. Use only
+these status values:
 
-## Language concurrency
+- `LEGACY` — current split scheduler, blocking, polling, callback, TLS, or replay path.
+- `ADAPTER` — temporary bridge with a named deletion task.
+- `MIGRATED` — unified runtime path with passing contract tests and removed legacy symbols.
+- `SYNCHRONOUS-PROOF` — reviewed proof that the path cannot call or suspend Sema.
+- `REMOVED` — symbol/path deleted and protected by a source guard.
 
-- [ ] `async`, `await`, `async/spawn`, `async/run`, `async/await`
-- [ ] `async/all`, `async/spawn-all`, `race`, `parallel`
-- [ ] `async/map`, `async/pool-map`, higher-order async callbacks
-- [ ] cancellation, cancellation observation, aggregate owned-child cleanup
-- [ ] timers/sleep and virtual-clock tests
-- [ ] channel create/send/receive/try/close/introspection
+Cancellation classes are `INTERRUPTIBLE`, `QUARANTINED-BOUNDED`, and
+`PROHIBITED`. Context policies are `INTERPRETER-SHARED`, `ROOT-SHARED`,
+`TASK-SNAPSHOT`, `TASK-PRIVATE`, `SCOPE-SHARED`, `RESOURCE-OWNED`, and
+`HOST-ADAPTER-ONLY`.
 
-## Callback and context paths
+## Core, evaluator, VM, and executor
 
-- [ ] eval/call callback replacement in sema-core and sema-eval
-- [ ] list/map/string/typed-array higher-order functions
-- [ ] context, system, meta, workflow, OTel callbacks
-- [ ] explicit module/file, sandbox, trace, usage, LLM, debugger task locals
+| Area | Path and symbol | Current mechanism | Target wait family | Cancellation class | Context policy | Owning layer | Existing tests | Status |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| F01 core I/O | `crates/sema-core/src/async_signal.rs`: `IoPoll`, `IoHandle::{new,with_abort,poll,abort}` | VM-thread closure polling with optional one-shot abort closure | External operation wait plus cleanup registration | `INTERRUPTIBLE` when hook exists; otherwise `QUARANTINED-BOUNDED` only with a recorded bound | `RESOURCE-OWNED` | Task 02 model; Task 05 migration/removal | `sema-core` `io_handle_*`; `io_pool_identity_test`; Task 05 `resource_contract_test` | LEGACY |
+| F02 yield | `async_signal.rs`: `YieldReason`, `YIELD_SIGNAL`, `set_yield_signal`, `take_yield_signal` | Thread-local side channel from native to VM | Typed `NativeOutcome::Suspend` | Wait-specific; unbounded native blocking is `PROHIBITED` | `TASK-PRIVATE` continuation frame | Tasks 02–04 | `vm_async_test`; `async_awaitio_test` | LEGACY |
+| F03 scheduler target | `async_signal.rs`: `SchedulerTarget`, `SchedulerRunResult`, `RUN_SCHEDULER_CALLBACK`, `set_run_scheduler_callback`, `call_run_scheduler*` | Re-entrant global scheduler callback and aggregate targets | Promise settlement/deadline observation in `WaitRegistry` | `INTERRUPTIBLE` observation deregistration; supplied tasks remain live | `TASK-PRIVATE` observer registration | Tasks 02–04; delete Task 08 | `vm_async_test`; `runtime_conformance_test` | LEGACY |
+| F04 spawn/cancel seams | `async_signal.rs`: `SPAWN_CALLBACK`, `CANCEL_CALLBACK`, `set_*_callback`, `call_*_callback` | Thread-local evaluator/scheduler callbacks | Runtime spawn command and cancellation request | `INTERRUPTIBLE`; request is sticky/idempotent | `INTERPRETER-SHARED` runtime command seam | Tasks 02–04; delete Task 08 | `true_cancel_test`; `vm_async_test` | LEGACY |
+| F05 resume/debug side channels | `async_signal.rs`: `RESUME_VALUE`, `DEBUG_COOP_RESUME`, `set/take_resume_value`, `set/take_debug_coop_resume` | VM restart consumes TLS-delivered value/resume mode | Exact wait-generation completion into one-shot continuation | `INTERRUPTIBLE`; stale generations rejected | `TASK-PRIVATE` | Tasks 02–03; delete Task 08 | `dap_async_breakpoint_test`; `vm_async_test` | LEGACY |
+| F06 task identity/reap | `async_signal.rs`: `CURRENT_TASK_ID`, `TASK_REAPED_CALLBACK`, accessors | Ambient task ID and LLM cleanup callback | Stable `TaskId`, settlement, lifetime owner, reaping | `INTERRUPTIBLE`; cleanup hook one-shot | `TASK-PRIVATE` identity; `RESOURCE-OWNED` cleanup | Tasks 02, 03, 06 | `agent_async_test`; `gc_stress_test` | LEGACY |
+| F07 context callback families | `async_signal.rs`: OTel, usage, and LLM capture/take/install callback families | Type-erased TLS snapshots swapped around task steps | Explicit typed `TaskContext` extensions | No suspension in adapter guard; attempted wait is `PROHIBITED` | `HOST-ADAPTER-ONLY`; task record canonical | Tasks 02, 03, 06; delete Task 08 | `async_span_nesting_test`; `embed_async_otel_test`; `workflow_budget_test` | LEGACY |
+| F08 host interrupt/time/inbox | `async_signal.rs`: interrupt callback, blocking-sleep callback, `blocking_sleep_ms`, `IO_SIGNAL`, `notify_io_complete`, `io_park` | Global interrupt hook, OS-thread sleep, condvar poll/wake | Runtime command inbox, timers, completion inbox | Timer/inbox `INTERRUPTIBLE`; direct sleep in runtime task `PROHIBITED` | `HOST-ADAPTER-ONLY` | Tasks 02, 03, 07 | `unified_runtime_watchdog_test`; `wasm_async_debug_test` | LEGACY |
+| F09 executor seam | `crates/sema-core/src/io_backend.rs`: `IoBackend`, `AbortHook`, `io_spawn`, `io_spawn_blocking`, `io_block_on` | Process/TLS backend and block-on API | `IoJob` submission with generation-tagged completion | Declared per job; unbounded non-interruptible work `PROHIBITED` | `INTERPRETER-SHARED` executor; `RESOURCE-OWNED` job | Task 05; delete old seam Task 08 | `sema-io` tests; `io_pool_identity_test`; `runtime_conformance_test` | LEGACY |
+| F10 evaluator callbacks | `crates/sema-core/src/context.rs`: `EvalCallbackFn`, `CallCallbackFn`, `CallOwnedCallbackFn`, setters and callers | Function pointers on `EvalContext`; stdlib synchronously re-enters evaluator | `NativeOutcome::Call` on active task | Nested drive/blocking callback `PROHIBITED` | `TASK-PRIVATE` native continuation | Task 03; delete callbacks Task 08 | `vm_async_test` callback cases; eval suites | LEGACY |
+| F11 module/global context | `context.rs`: `current_file`, module stack/cache/exports, embedded files | Shared `EvalContext` interior mutability | No wait; installed task context at boundaries | No cancellation action | file/module stack `TASK-SNAPSHOT`; cache/global `INTERPRETER-SHARED` | Tasks 02, 03, 06 | `vm_module_test`; Task 06 `task_context_async_test` | LEGACY |
+| F12 dynamic context | `context.rs`: user frames, hidden frames, context stacks | Shared mutable stacks on `EvalContext` | No wait; task-owned snapshots | No cancellation action | `TASK-SNAPSHOT`, then task-private mutation | Tasks 02, 03, 06 | context tests; Task 06 `task_context_async_test` | LEGACY |
+| F13 limits/traces | `context.rs`: call stack, span table, eval deadline/step limit, sandbox | Ambient evaluator state | Task frame stack, runtime deadline, root capability set | Runtime deadline/cancel `INTERRUPTIBLE` | frames `TASK-PRIVATE`; sandbox `ROOT-SHARED`/narrower; span table `INTERPRETER-SHARED` | Tasks 02, 03, 06 | stack/debug/sandbox suites | LEGACY |
+| F14 fallback stdlib context | `context.rs`: `STDLIB_CTX`, `with_stdlib_ctx` | Thread-local fallback `EvalContext` | No runtime fallback inside a task | Runtime-task fallback `PROHIBITED` | `HOST-ADAPTER-ONLY` | Tasks 03, 06; delete Task 08 | `runtime_conformance_test` | LEGACY |
+| F15 promise representation | `crates/sema-core/src/value.rs`: `PromiseState`, `AsyncPromise`, async-promise tag/accessors | Promise contains terminal value/error/cancel plus legacy task ID | Task settlement record observed through promise | Observation `INTERRUPTIBLE`; cancellation distinct from failure | `INTERPRETER-SHARED` settlement handle | Tasks 02, 04 | `vm_async_test`; `gc_stress_test` | LEGACY |
+| F16 channel representation | `value.rs`: `Channel`, channel tag/accessors | `Rc<RefCell>` buffer plus sender/receiver waiter state elsewhere | Channel send/receive/close waits | `INTERRUPTIBLE`; cancel one waiter; close idempotent | `INTERPRETER-SHARED` resource | Tasks 02, 04 | `vm_async_test`; Task 04 channel model tests | LEGACY |
+| F17 captured cells | `value.rs`: `MutableCell`, lambda/upvalue representations | Spawn snapshots can clone VM state instead of retaining one cell graph | Shared traced lexical cell | No independent cancellation | Explicit shared cell; referenced from `TASK-PRIVATE` frames | Tasks 02–03 | `awaited_child_mutation_is_visible_to_parent`; VM closure tests | LEGACY |
+| F18 native ABI | `value.rs`: `NativeFnInner`, `NativeFn`, payload | Native returns `Result<Value, SemaError>` and signals suspension out-of-band | `Result<NativeOutcome,SemaError>` and traceable continuation payload | Blocking/re-entry `PROHIBITED` | `TASK-PRIVATE`; host infrastructure weak-only | Tasks 02–03 | CORE-2 payload/cycle tests; callback tests | LEGACY |
+| F19 stream trait | `value.rs`: `SemaStream::{read,write,flush,close}` and `StreamBox` | Synchronous trait methods can block VM thread | Resource operation waits with explicit close | `INTERRUPTIBLE`; exclusively owned close hook | `RESOURCE-OWNED` | Tasks 02, 05 | `stream_async_test`; `stream_file_async_test` | LEGACY |
+| F20 cycle roots | `crates/sema-core/src/cycle.rs`: `GcNode::{Promise,Channel,MutableCell}`, `trace_value`, `sever_node`, payload tracers | Traces current promise values/channel buffers/cells; no task/continuation registry roots | Trace all live runtime frames, continuations, settlements, channels, roots | Cleanup/reaping must remove dead roots | Runtime registry `INTERPRETER-SHARED`; frames `TASK-PRIVATE` | Tasks 02–04, 09 | `gc_stress_test`; `gc_otel_test`; cycle unit tests | LEGACY |
+| F21 MCP cassette seam | `crates/sema-core/src/mcp_cassette.rs`: `HOOK`, set/clear/decide/record | Thread-local function-pointer cassette with `Value` recording | Explicit MCP task-context extension and cancellable request wait | Request `INTERRUPTIBLE`; cassette record synchronous | cassette `SCOPE-SHARED`; active request `TASK-PRIVATE` | Task 06 | `mcp_cassette_test`; `llm_cassette_test` | LEGACY |
+| F22 output hooks | `crates/sema-core/src/output_hook.rs`: stdout/stderr TLS hooks | Thread-local untagged callbacks | Root-tagged `OutputEvent` sink | No suspension in sink; blocking sink `PROHIBITED` | `ROOT-SHARED`; callback guard `HOST-ADAPTER-ONLY` | Tasks 06–07 | output/integration/notebook tests | LEGACY |
+| F23 scheduler store | `crates/sema-vm/src/scheduler.rs`: `TaskState`, `Task`, `Scheduler`, scheduler TLS | One TLS task vector, virtual clock, linear ready scans | `TaskStore`, root-fair `ReadyScheduler`, timers, waits | Wait-specific, sticky cancellation | runtime `INTERPRETER-SHARED`; task record `TASK-PRIVATE` | Tasks 02–03 | `vm_async_test`; Task 03 model/fairness tests | LEGACY |
+| F24 task creation/callback | `scheduler.rs`: `spawn_callback`, `run_closure_as_inline_task` | Nested callbacks create/re-enter scheduler tasks | Spawn/direct `Call` on active runtime task | Owned scope cancels children; detached task explicit | child inherits exact `TaskContext` policy | Tasks 03–04 | nested callback oracle; async HOF tests | LEGACY |
+| F25 scheduler drive | `scheduler.rs`: `run_scheduler_callback`, `run_until_reentrant`, `RunGoal` | Scheduler removed from TLS/reinstalled; one-million tick ceiling | Bounded host `drive` turns; no global ceiling | Pending waits `INTERRUPTIBLE` | `INTERPRETER-SHARED` runtime | Task 03; delete Task 08 | finite-ceiling oracle; watchdog | LEGACY |
+| F26 reinstall guard | `scheduler.rs`: `ReinstallGuard`, `sched.tasks.remove(idx)` | Temporarily removes running task and swaps OTel/usage/LLM TLS | Stable running task remains in `TaskStore`; context guard around one quantum | Panic/cancel restores guard without nested drive | canonical `TASK-PRIVATE`; adapter `HOST-ADAPTER-ONLY` | Tasks 03, 06; delete Task 08 | scheduler panic guard; task-context tests | LEGACY |
+| F27 scheduler cancellation | `scheduler.rs`: `cancel_callback`, abandoned-sibling cancellation, task reaping | Promise possession implies aggregate sibling cancellation | Separate observation, ownership, cancellation ancestry | Wait hook `INTERRUPTIBLE`; supplied promises not cancelled | `RESOURCE-OWNED` only for owned scope children | Tasks 03–04 | corrected observational tests; `true_cancel_test` | LEGACY |
+| F28 VM async execution | `crates/sema-vm/src/vm.rs`: `run_async*`, `execute_async*`, yield-signal checks, `run_cooperative` | VM exits with `VmExecResult` and later resumes through TLS/stack placeholder | Reduction-bounded task quantum and native continuation frame | Quantum cancellation `INTERRUPTIBLE` | `TASK-PRIVATE` frames | Task 03 | VM tests; `vm_async_test` | LEGACY |
+| F29 VM closures/current VM | `vm.rs`: upvalue cells, `CURRENT_VM`, foreign sync closure helpers | Pointer-stack TLS enables synchronous callback execution | Shared traceable cells and `NativeOutcome::Call` | Foreign nested evaluator/drive `PROHIBITED` | closure cells shared; frames `TASK-PRIVATE`; TLS adapter removed | Task 03 | VM closure/captured mutation tests | LEGACY |
+| F30 VM debugger | `vm.rs`: active-debug/coop-stop TLS; `crates/sema-vm/src/debug.rs`: `DebugState`, `VmExecResult`, stop/resume types | Per-VM and TLS cooperative pause state | Runtime-wide `DebugCoordinator` barrier | User task delivery paused; completions queue | `INTERPRETER-SHARED` coordinator; selected frames `TASK-PRIVATE` | Tasks 03, 07 | DAP/VM debug tests | LEGACY |
+| F31 interpreter host | `crates/sema-eval/src/eval.rs`: `Interpreter`, eval wrappers, drop/reset | Each eval directly compiles/runs and resets global scheduler on drop | `submit_root`, `RootHandle`, bounded `drive`, explicit shutdown | Root cancellation `INTERRUPTIBLE`; shutdown bounded | runtime/global `INTERPRETER-SHARED`; root options `ROOT-SHARED` | Tasks 03, 07 | embedding/integration tests; Task 07 host contract | LEGACY |
+| F32 evaluator call bridge | `eval.rs`: `eval_value_vm`, `call_value*`, `register_vm_delegates` | Core callbacks and fresh/foreign VM fallback | `NativeOutcome::Call` on active task | Nested scheduler/evaluator `PROHIBITED` | `TASK-PRIVATE` | Task 03 | HOF callback/nested aggregate tests | LEGACY |
+| F33 debug session adapter | `crates/sema-eval/src/debug_session.rs`: `DEBUG_SESSION_ACTIVE`, `WARNED_LOAD_BYPASS` | Thread-local session/warning state | Debug coordinator plus host metadata | No wait | coordinator `INTERPRETER-SHARED`; warning cursor `TASK-PRIVATE` or host-owned | Tasks 06–07 | debug session unit tests; DAP tests | LEGACY |
+| F34 prelude concurrency | `crates/sema-eval/src/prelude.rs`: `async/pool-map`, fan-out, `parallel*`, `pipeline*`, retry, async agent/stream drivers, `async/spawn-all`, `async/map` | Detached spawn plus observational `async/all`; async-context branches | Owned scope operations and runtime timers/calls | Owned children `INTERRUPTIBLE`; supplied promises observed | scope `SCOPE-SHARED`; cursors `TASK-PRIVATE` | Tasks 04, 06 | `pool_map_test`; agent/stream/workflow suites | LEGACY |
+| F35 I/O pool | `crates/sema-io/src/lib.rs`: process-wide Tokio runtime, permits, `SemaIoBackend`, `io_spawn*`, `io_block_on` | One pool but closures/callback channels carry completion state | `IoExecutor`/`IoJob`, typed send-only payload, shutdown snapshot | Per-job declared class; unbounded job `PROHIBITED` | `INTERPRETER-SHARED` executor; `RESOURCE-OWNED` job | Task 05 | `sema-io` tests; `io_pool_identity_test` | LEGACY |
+| F36 public legacy exports | `crates/sema-core/src/lib.rs`, `crates/sema-vm/src/lib.rs`: re-exports of rows F01–F08/F23–F27 | Public compatibility surface | Unified runtime types only | Inherits source row | Inherits source row | Tasks 02–08 | `runtime_conformance_test` scanner | LEGACY |
 
-## Async leaves and resources
+## Standard-library waits, callbacks, and resources
 
-- [ ] archive and PDF
-- [ ] diff and git
-- [ ] file I/O and shared I/O backend
-- [ ] HTTP and WebSocket
-- [ ] KV and SQLite
-- [ ] process and PTY
-- [ ] serial, secret, terminal, event
-- [ ] streams, copy, close, and resource teardown
-- [ ] HTTP server request dispatch and disconnect cancellation
+The cancellation column states the required Task 05 mechanism. A finite-work
+claim is not accepted until Task 05 records and tests the cap before dispatch.
 
-## LLM and MCP
+| Area | Path and symbol | Current mechanism | Target wait family | Cancellation class | Context policy | Owning layer | Existing tests | Status |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| R01 async API | `crates/sema-stdlib/src/async_ops.rs`: spawn/await/run/all/race/timeout/sleep/cancel and channels | Yield TLS and re-entrant scheduler callbacks | Promise, timer, channel, cancellation waits | Timer/channel/observation `INTERRUPTIBLE`; supplied tasks never adopted | task `TASK-PRIVATE`; channels `INTERPRETER-SHARED` | Task 04 | `vm_async_test`; `true_cancel_test`; watchdog | LEGACY |
+| R02 archive | `archive.rs`: gzip/zip/tar work, async branch, temp-dir `Drop` | Blocking worker plus `IoHandle` polling and sleep | Bounded worker job | `QUARANTINED-BOUNDED`: byte/entry/output caps fixed before dispatch; temp resources cleanup registry | `RESOURCE-OWNED` | Task 05 | `archive_pdf_patch_async_test`; future resource contract/shutdown | LEGACY |
+| R03 diff | `diff.rs`: unified/stat/hunks/parse/apply callback work | Synchronous CPU/library calls reachable from tasks | Bounded worker job | `QUARANTINED-BOUNDED`: input bytes/hunks cap | `TASK-SNAPSHOT` input; job `RESOURCE-OWNED` | Task 05 | `archive_pdf_patch_async_test`; future resource contract | LEGACY |
+| R04 event | `event.rs`: `time/tick`, `event/select`, polling sleep | VM-thread scans and worker sleep loop | Timer and event-source wait | `INTERRUPTIBLE`: deregister waiter/subscription and close wake source | `RESOURCE-OWNED` subscription | Task 05 | `vm_async_test` event select; `true_cancel_test` | LEGACY |
+| R05 file watcher | `fs_watch.rs`: `WATCHERS`, `fs/watch-events`, `fs/unwatch`, stop receiver | Thread-local watcher registry and blocking receiver | External watcher event wait | `INTERRUPTIBLE`: stop watcher, close receiver, remove registry entry; idempotent unwatch | registry `INTERPRETER-SHARED`; watcher `RESOURCE-OWNED` | Tasks 05–06 | future resource contract/shutdown | LEGACY |
+| R06 git | `git.rs`: subprocess offload, `git_stdout_async`, abort hook | Tokio child plus `IoHandle` | Process completion wait | `INTERRUPTIBLE`: kill process/group then asynchronously reap | `RESOURCE-OWNED` | Task 05 | `git_async_test`; `proc_pty_async_test` | LEGACY |
+| R07 HTTP client | `http.rs`: sync `io_block_on`, `http_request_async`, abort handle | Reqwest future offload; sync top-level fallback | HTTP connect/headers/body waits | `INTERRUPTIBLE`: abort future and close owned transport/body; stop local delivery | `RESOURCE-OWNED`; request config `TASK-SNAPSHOT` | Task 05 | `http_concurrent_test`; `true_cancel_test` | LEGACY |
+| R08 file/stdin I/O | `io.rs`: file/read/write/list/stat async helpers, line/byte streams, cursor/key waits, async guards | Blocking jobs, poll closures without abort, VM-thread polling sleeps | File, directory, stdin, terminal waits | Async OS wait `INTERRUPTIBLE`; finite file/list job `QUARANTINED-BOUNDED` after metadata/entry cap; unbounded read `PROHIBITED` | handles `RESOURCE-OWNED`; TTY state `INTERPRETER-SHARED`; EOF/query cursors `TASK-PRIVATE` | Tasks 05–06 | `file_async_test`; `stream_file_async_test`; `async_awaitio_test` | LEGACY |
+| R09 KV | `kv.rs`: `KV_STORES`, worker checkout/poll/abort and close | TLS registry; blocking JSON store job | Database/file job wait | Interrupt handle if available; otherwise `QUARANTINED-BOUNDED` hard busy/deadline and file-size cap | store `RESOURCE-OWNED`; registry `INTERPRETER-SHARED` | Tasks 05–06 | `kv_async_test`; future resource contract | LEGACY |
+| R10 PDF | `pdf.rs`: load/extract/render/metadata async branches | Blocking library work via worker/poller | Bounded worker job | `QUARANTINED-BOUNDED`: input bytes/page/output caps | `RESOURCE-OWNED` job | Task 05 | `archive_pdf_patch_async_test` | LEGACY |
+| R11 process | `proc.rs`: `PROCS`, pumps, wait/write/close async phases and abort hooks | TLS registry; blocking child operations; polling sleeps | Child process, pipe write, close/reap waits | `INTERRUPTIBLE`: terminate owned process group/job object, grace timer, kill, `waitpid`/handle reap | process `RESOURCE-OWNED`; registry `INTERPRETER-SHARED` | Tasks 05–06 | `proc_pty_async_test`; `shell_concurrent_test`; `true_cancel_test` | LEGACY |
+| R12 PTY | `pty.rs`: `PTYS`, pumps, wait/write/close async phases | TLS registry; blocking PTY worker and poll sleeps | PTY read/write/child/close waits | `INTERRUPTIBLE`: close PTY master, terminate/reap child; idempotent close | PTY `RESOURCE-OWNED`; registry `INTERPRETER-SHARED` | Tasks 05–06 | `proc_pty_async_test`; `true_cancel_test` | LEGACY |
+| R13 secret/PII | `secret.rs`: detect/redact/hash async branch and guard | Blocking library work with worker poll sleeps | Bounded worker job | `QUARANTINED-BOUNDED`: input byte/span caps | `TASK-SNAPSHOT` input; job `RESOURCE-OWNED` | Task 05 | `archive_pdf_patch_async_test`; future resource contract | LEGACY |
+| R14 serial | `serial.rs`: `PORTS`, open/read/write/send/close checkout worker | TLS registry, blocking serial I/O, poll sleeps | Serial descriptor read/write/close waits | `INTERRUPTIBLE`: close descriptor/wake source and tombstone registry slot | port `RESOURCE-OWNED`; registry `INTERPRETER-SHARED` | Tasks 05–06 | future resource contract/shutdown | LEGACY |
+| R15 server | `server.rs`: listener future, handler callback dispatch, WebSocket/SSE channels, `blocking_recv`, shutdown/drop | Axum task plus evaluator-thread blocking request loop and callback re-entry | Accept, request, disconnect, handler-task, response waits | `INTERRUPTIBLE`: abort listener/connection, close owned socket/body, cancel/reap owned handlers | server `RESOURCE-OWNED`; handler/root `ROOT-SHARED`; callbacks `TASK-PRIVATE` | Tasks 03, 05, 07 | `server_async_test`; `server_test`; integration server cases | LEGACY |
+| R16 SQLite | `sqlite.rs`: `DB_CONNECTIONS`, open/exec/query/close checkout worker | TLS connection registry and blocking jobs | Database operation wait | SQLite interrupt handle `INTERRUPTIBLE`; otherwise hard busy/deadline `QUARANTINED-BOUNDED`; rollback on cancellation | connection `RESOURCE-OWNED`; registry `INTERPRETER-SHARED` | Tasks 05–06 | `db_async_test`; future resource contract | LEGACY |
+| R17 streams | `stream.rs`: synchronous stream builtins, file-in/out worker branches, copy/close/drop | Synchronous `SemaStream` methods plus blocking workers and polling sleeps | Stream open/read/write/flush/close waits | `INTERRUPTIBLE` OS waits; captured bounded memory conversion may be `QUARANTINED-BOUNDED`; unbounded read-all `PROHIBITED` | stream `RESOURCE-OWNED` | Task 05 | `stream_async_test`; `stream_file_async_test` | LEGACY |
+| R18 system/shell | `system.rs`: `shell_async`, signal callback registry, `sleep` | Child future/`IoHandle`, direct worker-thread sleep, TLS callback values | Process, runtime timer, signal event waits | process/timer `INTERRUPTIBLE`; worker-thread sleep in runtime task `PROHIBITED` | process `RESOURCE-OWNED`; signal callbacks `INTERPRETER-SHARED` with traced `Value`s | Tasks 05–06 | `shell_concurrent_test`; `vm_async_test`; `true_cancel_test` | LEGACY |
+| R19 terminal | `terminal.rs`: spinner registry/thread, stop/update and async guards | TLS handles, dedicated sleeping thread, poll sleeps | Terminal/spinner event and join waits | `INTERRUPTIBLE`: stop flag plus wake/join; descriptor operations close wake source | spinner `RESOURCE-OWNED`; registry `INTERPRETER-SHARED` | Tasks 05–06 | future resource contract/shutdown | LEGACY |
+| R20 WebSocket client | `ws.rs`: connect pump, `ws_recv_async`, timeout poller, sync `io_block_on`/`blocking_recv`, close | Tokio pump plus TLS-adjacent receiver and mixed blocking/async branches | Connect/send/receive/deadline/close waits | `INTERRUPTIBLE`: abort pump, close transport, deregister one receiver; close idempotent | connection `RESOURCE-OWNED` | Task 05 | integration `ws_`; `http_concurrent_test`; future resource shutdown | LEGACY |
+| R21 bounded library work | `crypto.rs`, `csv_ops.rs`, `markup.rs`: parse/encode/hash/select operations | Synchronous CPU/library work reachable from runtime tasks | Bounded worker job | `QUARANTINED-BOUNDED`: byte/item/node caps fixed before dispatch | `TASK-SNAPSHOT` input; job `RESOURCE-OWNED` | Task 05 | eval suites; future resource contract | LEGACY |
+| R22 higher-order callbacks | `list.rs`, `map.rs`, `meta.rs`, `string.rs`, typed arrays: `call_callback*` users | Rust loops synchronously invoke evaluator callback; string intern TLS | `NativeOutcome::Call` continuation | Callback re-entry/blocking `PROHIBITED` | callback `TASK-PRIVATE`; intern table `INTERPRETER-SHARED` | Tasks 03, 06 | eval collection/string/meta tests; async HOF tests | LEGACY |
+| R23 context/OTel/workflow callbacks | `context.rs`, `otel.rs`, `workflow.rs`, `workflow_mcp.rs`: thunk/tool/resolver callbacks | `call_callback`, dynamic TLS workflow/MCP state | Native call plus owned scope/external request waits | owned children/request `INTERRUPTIBLE`; synchronous callback re-entry `PROHIBITED` | run/resolver `SCOPE-SHARED`; active guard/request `TASK-PRIVATE` | Tasks 03, 06 | workflow/OTel/MCP suites | LEGACY |
 
-- [ ] completion/chat/compare/summarize/send/conversation async calls
-- [ ] streaming, timeout, retry, cache, budget, usage, and tracing
-- [ ] agent/tool callback loop
-- [ ] MCP connect/list/call and per-connection queueing
-- [ ] cancellation and late-result cleanup for every request family
+## Task-local and integration state
 
-## Hosts
+| Area | Path and symbol | Current mechanism | Target wait family | Cancellation class | Context policy | Owning layer | Existing tests | Status |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| C01 global/module/VFS | `EvalContext` globals/module cache; `crates/sema-core/src/vfs.rs` VFS | Shared interpreter structures/TLS | No wait except module file job | No cancellation for atomic access | `INTERPRETER-SHARED` | Tasks 02, 06 | module/VFS tests | LEGACY |
+| C02 file/module stacks | `EvalContext.current_file`, loading set, exports | Shared mutable stacks | No wait | No cancellation | `TASK-SNAPSHOT`, task-private mutation | Tasks 02, 06 | module tests; Task 06 context matrix | LEGACY |
+| C03 user/hidden/parameter context | user frames, hidden frames, context stacks | Shared `RefCell` stacks | No wait | No cancellation | `TASK-SNAPSHOT`, task-private mutation | Tasks 02, 06 | context eval tests; Task 06 context matrix | LEGACY |
+| C04 sandbox | `EvalContext.sandbox`, MCP registration sandbox | Captured ambient capability object | No wait | Root cancel unaffected | `ROOT-SHARED`, child same or narrower | Tasks 02, 06, 07 | sandbox/MCP allowed-tools tests | LEGACY |
+| C05 output | stdout/stderr hook TLS and notebook/host buffers | Ambient untagged hook | Output event delivery | Blocking hook `PROHIBITED` | `ROOT-SHARED`, root/task/sequence tagged | Tasks 06–07 | notebook/embedding/output tests | LEGACY |
+| C06 tracing | `crates/sema-otel/src/imp.rs`: `STACK`, conversation/session/user IDs, provider | TLS stack/IDs; callback capture/install | OTel export external wait only; span mutation synchronous | export declared Task 05 class; no suspension inside guard | lineage `TASK-SNAPSHOT`; stack `TASK-PRIVATE`; provider `INTERPRETER-SHARED`; adapter `HOST-ADAPTER-ONLY` | Task 06 | OTel test matrix; async span tests | LEGACY |
+| C07 LLM provider/config | `crates/sema-llm/src/builtins.rs`: provider registry, Lisp providers, fallback, cache config/tags; provider modules | Thread-local registry/config and mixed block-on/async branches | Provider HTTP/stream/embedding/rerank waits | request `INTERRUPTIBLE`; retry uses runtime timer | immutable config `TASK-SNAPSHOT`; provider registry `INTERPRETER-SHARED` | Task 06 | `llm_fake_test`; simple/chat/batch/embed tests | LEGACY |
+| C08 LLM accounting | session usage, `LAST_USAGE`, active leaf usage, budget frame | TLS slots plus type-erased capture/install | No wait; charged on completion delivery | Late discarded completion must not charge | budget/usage `SCOPE-SHARED`; last usage `TASK-PRIVATE` | Task 06 | workflow budget; LLM fake/accounting tests | LEGACY |
+| C09 LLM cache/cassette/compat | cache memory/counters/cassette; OpenAI compatibility sets; pricing overrides | Thread-local mutable maps | Provider request observation | Request cancel `INTERRUPTIBLE`; cache hit has no job | cache/provider compat `INTERPRETER-SHARED`; active cassette `SCOPE-SHARED` | Task 06 | cache/cassette/provider serializer tests | LEGACY |
+| C10 LLM call/retry cursors | call tags/meta; retry base/max; retry and stream cursors | TLS dynamic values and worker sleeps | Runtime retry timer and stream completion waits | timer/stream `INTERRUPTIBLE` | config `TASK-SNAPSHOT`; call/retry/stream cursors `TASK-PRIVATE` | Task 06 | LLM fake retry/stream tests | LEGACY |
+| C11 agent/stream slabs | `AGENT_RUNS`, `STREAM_RUNS`, next IDs | TLS slabs keyed by ambient scheduler task ID; reaped callback cleanup | Native continuation/task-owned orchestration state | provider/tool/stream waits `INTERRUPTIBLE`; slab cleanup one-shot | `TASK-PRIVATE`; owned fan-out `SCOPE-SHARED` | Task 06 | agent/stream async tests | LEGACY |
+| C12 workflow | `crates/sema-workflow/src/context.rs`: `WORKFLOW`, `WorkflowCtx`; stdlib workflow scopes | Thread-local live run `Rc` | Workflow step/leaf/MCP waits | owned leaves `INTERRUPTIBLE` | run/accounting `SCOPE-SHARED`; active step/request `TASK-PRIVATE` | Task 06 | workflow cookbook/resume/budget/tools | LEGACY |
+| C13 MCP | `crates/sema-mcp/src/builtins.rs`: `CONNECTIONS`, sandbox; cassette hook and request queue | TLS connection map and per-connection serialization | Connect/auth/list/call/reconnect waits | request/connection `INTERRUPTIBLE`; close transport and reject late result | handles/cassette `SCOPE-SHARED`; active request `TASK-PRIVATE`; connection `RESOURCE-OWNED` | Task 06 | MCP async/e2e/builtin/cassette tests | LEGACY |
+| C14 resource registries | watcher, KV, process, PTY, serial, SQLite, terminal, TTY TLS registries | Ambient per-thread maps with checked-out/tombstone states | Resource-specific waits in R05/R08–R19 | Exact close/abort mechanism from corresponding R row | registry `INTERPRETER-SHARED`; handle `RESOURCE-OWNED`; operation cursor `TASK-PRIVATE` | Tasks 05–06 | resource-specific suites | LEGACY |
+| C15 debugger state | VM active-debug TLS, eval debug-session TLS, DAP service state | Ambient pointers/flags and per-service channels | Debug barrier/command wait | Root/task cancel `INTERRUPTIBLE`; completion delivery paused | coordinator `INTERPRETER-SHARED`; selected task frames `TASK-PRIVATE` | Tasks 03, 06, 07 | DAP/VM debug suites | LEGACY |
+| C16 compiler-only TLS | `crates/sema-vm/src/lower.rs`: lower depth/span map/special-form cache | Used only during synchronous lowering and cannot execute a Sema callback | None | No wait | `HOST-ADAPTER-ONLY` | Tasks 02, 07 retain the proof while moving runtime state | compiler/lower tests | SYNCHRONOUS-PROOF |
+| C17 core interner and cycle state | Core string interner and cycle-collector TLS | Ambient process-thread state shared by interpreters | No wait; explicit interpreter-owned service | Collection/reaping must not retain dead task roots | `INTERPRETER-SHARED` | Tasks 02, 03, 09 | interner and cycle tests; `gc_stress_test` | LEGACY |
 
-- [ ] CLI expression/file/build and REPL
-- [ ] embedded Rust API
-- [ ] DAP and LSP evaluation
-- [ ] notebook cells
-- [ ] MCP server eval/build/notebook tools
-- [ ] WASM Promise eval and playground worker/client
+## Hosts and shipped browser boundary
+
+| Area | Path and symbol | Current mechanism | Target wait family | Cancellation class | Context policy | Owning layer | Existing tests | Status |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| H01 native wrappers | `crates/sema-eval/src/eval.rs`: `eval*`; `crates/sema/src/lib.rs` embedding API | One synchronous evaluation drives global scheduler | Root handle and native host park/wakeup | root cancel/shutdown `INTERRUPTIBLE` and bounded | root options `ROOT-SHARED`; runtime `INTERPRETER-SHARED` | Task 07 | embedding API/OTel/timeout tests; host contract future | LEGACY |
+| H02 CLI/file/build | `crates/sema/src/main.rs`: expression, file, build, service subcommands | Ad hoc eval/block-on/sleep entry paths | Root submission plus common native driver | signal/root cancellation `INTERRUPTIBLE` | CLI invocation `ROOT-SHARED` | Task 07 | integration CLI tests | LEGACY |
+| H03 REPL | `crates/sema/src/repl/*`, including completer interpreter access | Long-lived interpreter with synchronous eval and auxiliary interpreter reads | One root per command; shared runtime/global env | foreground root `INTERRUPTIBLE` | REPL session `INTERPRETER-SHARED`; command `ROOT-SHARED` | Task 07 | integration REPL tests | LEGACY |
+| H04 DAP | `crates/sema-dap/src/server.rs`, VM/eval debug seams | Service channels plus blocking receivers and cooperative resume callback | Debug command/event and root waits | request/root `INTERRUPTIBLE`; disconnect shutdown bounded | coordinator `INTERPRETER-SHARED`; request `ROOT-SHARED` | Task 07 | `dap_async_breakpoint_test`; sema-dap tests | LEGACY |
+| H05 LSP | `crates/sema-lsp/src/server.rs`, `handlers/command.rs` | Backend channel with blocking bridge; command eval owns private drive | Root result/request cancellation | request/root `INTERRUPTIBLE` | service `INTERPRETER-SHARED`; request `ROOT-SHARED` | Task 07 | sema-lsp/jake LSP tests | LEGACY |
+| H06 notebook | `crates/sema-notebook/src/engine.rs`, `bridge.rs`, server | Shared cell interpreter plus Tokio `block_on` bridge and untagged output | Cell roots, output events, reset/shutdown | cell/reset `INTERRUPTIBLE`; shutdown bounded | notebook `INTERPRETER-SHARED`; cell `ROOT-SHARED` | Task 07 | sema-notebook; `otel_notebook_test`; notebook E2E | LEGACY |
+| H07 MCP server/tools | `crates/sema-mcp/src/tools.rs`, server/notebook modules | Tool handler calls synchronous interpreter API | Request root and disconnect wait | request/disconnect `INTERRUPTIBLE` | service `INTERPRETER-SHARED`; request `ROOT-SHARED` | Task 07 | MCP server/e2e tests | LEGACY |
+| H08 workflow services | `crates/sema/src/workflow_mcp.rs`, workflow view/CLI | Host loops, callback resolver, block-on/sleeps | Workflow/request roots and service events | client/root/service `INTERRUPTIBLE`; shutdown bounded | run/request `ROOT-SHARED`; service `INTERPRETER-SHARED` | Task 07 | workflow MCP/view E2E tests | LEGACY |
+| H09 WASM evaluator | `crates/sema-wasm/src/lib.rs`: eval/evalAsync/evalVM/evalGlobal, debugger | Synchronous evaluator plus whole-program replay and host-side loops | JS Promise per `RootId`; macrotask `drive` turns | exact-root cancel/shutdown `INTERRUPTIBLE` | interpreter `INTERPRETER-SHARED`; eval `ROOT-SHARED` | Task 07 | sema-wasm; `wasm_async_debug_test`; browser runtime future | LEGACY |
+| H10 WASM HTTP/replay | `sema-wasm/src/lib.rs`: `HTTP_AWAIT_MARKER`, cache replay, `MAX_REPLAYS`, sync XHR, Atomics sleep | Evaluation replay, synchronous request/sleep in worker | JS fetch/timer external completion waits | fetch/timer `INTERRUPTIBLE`; replay/sync XHR/Atomics wait `PROHIBITED` | completion tagged to `ROOT-SHARED` identity | Task 07; generated assets Task 08 | playground HTTP/cancel/browser tests | LEGACY |
+| H11 playground worker | `playground/src/sema-worker.js`, `worker-client.js` | One request at a time; SharedArrayBuffer/Atomics stop/sleep | Root-aware concurrent worker protocol and macrotask drive | exact root `INTERRUPTIBLE`; worker shutdown bounded | request/output `ROOT-SHARED` | Task 07 | `playground/tests/async-debugger.spec.ts`; playground specs | LEGACY |
+| H12 playground UI | `playground/src/app.js` | Run/Stop owns worker request without runtime root identity | Root ID table and tagged output | exact root `INTERRUPTIBLE` | request `ROOT-SHARED` | Task 07 | playground Playwright suite | LEGACY |
+| H13 vendored/generated web runtime | `crates/sema/src/web/assets/{sema_wasm.js,sema/index.js}` and generated playground examples/assets | Generated glue still contains sync XHR/Atomics/replay APIs | Regenerated Promise/root API | forbidden paths removed from generated output | `HOST-ADAPTER-ONLY` | Task 08 after Task 07 source migration | packaged web test; generated-asset checks | LEGACY |
+
+## Discovery coverage map
+
+The two Task 01 discovery commands produced 868 legacy/runtime-mechanism matches
+and 1,074 language/callback matches before Task 01 edits. Every production path
+in their union maps to ledger rows here; tests and examples map to the verification
+surface below.
+
+| Production path(s) | Ledger row(s) |
+| --- | --- |
+| `crates/sema-core/src/{async_signal,io_backend,context,value,cycle,mcp_cassette,output_hook,lib}.rs` | F01–F22, F36; C01–C05, C13 |
+| `crates/sema-vm/src/{scheduler,vm,debug,lower}.rs` | F23–F30; C15–C16 |
+| `crates/sema-eval/src/{eval,debug_session,prelude}.rs` | F31–F34; C15; H01 |
+| `crates/sema-io/src/lib.rs` | F35 |
+| `crates/sema-stdlib/src/async_ops.rs` | R01 |
+| `crates/sema-stdlib/src/{archive,diff,event,fs_watch,git,http,io,kv,pdf,proc,pty,secret,serial,server,sqlite,stream,system,terminal,ws}.rs` | R02–R20; C14 |
+| `crates/sema-stdlib/src/{context,list,map,meta,string,workflow,workflow_mcp,otel}.rs` | R22–R23; C03, C06, C12 |
+| `crates/sema-llm/src/{anthropic,builtins,embeddings,gemini,ollama,openai,pricing}.rs` | C07–C11 |
+| `crates/sema-workflow/src/context.rs` | C12 |
+| `crates/sema-mcp/src/{builtins,client_auth,tools}.rs` | C04, C13; H07 |
+| `crates/sema-otel/src/imp.rs` | C06 |
+| `crates/sema-dap/src/server.rs` | H04 |
+| `crates/sema-lsp/src/{server.rs,handlers/command.rs}` | H05 |
+| `crates/sema-notebook/src/{bridge,engine}.rs` | H06 |
+| `crates/sema/src/{lib,main,workflow_mcp}.rs`, `crates/sema/src/repl/completer.rs` | H01–H03, H08 |
+| `crates/sema-wasm/src/lib.rs` | H09–H10 |
+| `playground/src/{app,sema-worker,worker-client}.js` | H11–H12 |
+
+The broader legacy scanner additionally covers synchronous/blocking production
+matches in `sema-llm/src/fake.rs`, `sema-mcp/src/oauth/loopback.rs`,
+`sema/src/{pkg.rs,web/mod.rs}`, and every path above. Those four paths are host or
+test infrastructure: fake-provider delays are `SYNCHRONOUS-PROOF` test support;
+OAuth loopback is H07/C13; package retry and web-server polling are H02/H08 and
+must be reviewed as host-only waits in Task 07.
+
+## Verification, examples, docs, and generated surfaces
+
+| Area | Path and symbol | Current mechanism | Target wait family | Cancellation class | Context policy | Owning layer | Existing tests | Status |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| V01 core async tests | `crates/sema/tests/{vm_async_test,true_cancel_test,async_awaitio_test,complete_async_test,pool_map_test,gc_stress_test}.rs` | Current behavioral and GC oracles | All core wait families | All classes by case | All policies by case | Tasks 01, 03, 04, 09 | Paths are the tests | LEGACY |
+| V02 resource tests | `crates/sema/tests/{archive_pdf_patch_async_test,db_async_test,file_async_test,git_async_test,http_concurrent_test,io_pool_identity_test,kv_async_test,proc_pty_async_test,server_async_test,shell_concurrent_test,stream_async_test,stream_file_async_test}.rs` | Current integration coverage; cancellation matrix incomplete | External resource waits | Resource row class | Resource ownership | Tasks 05, 09 | Paths are the tests | LEGACY |
+| V03 LLM/agent tests | `crates/sema/tests/{agent_async_breaker_test,agent_async_test,batch_rerank_async_test,embed_async_otel_test,llm_chat_tools_async_test,llm_fake_test,llm_simple_async_test}.rs` | Fake/live async characterization | Provider, retry, stream, tool waits | Request/timer/tool `INTERRUPTIBLE` | C06–C11 | Tasks 06, 09 | Paths are the tests | LEGACY |
+| V04 workflow/MCP tests | `crates/sema/tests/{mcp_async_test,mcp_builtin_test,mcp_cassette_test,mcp_e2e_test,workflow_budget_test,workflow_cookbook_test,workflow_mcp_*,workflow_resume_test,workflow_tools_test,workflow_view_connect_test}.rs` | Current orchestration/service coverage | Workflow, request, host waits | Owned request/leaf `INTERRUPTIBLE` | C12–C13; H07–H08 | Tasks 06–07, 09 | Paths are the tests | LEGACY |
+| V05 tracing/debug/WASM tests | `crates/sema/tests/{async_span_nesting_test,dap_async_breakpoint_test,otel_*,wasm_async_debug_test}.rs`; crate-local VM/DAP/WASM tests | Current TLS/debug/replay characterization | Debug/root/browser waits | Root/debug/fetch/timer `INTERRUPTIBLE` | C06, C15; H04, H09–H12 | Tasks 06–07, 09 | Paths are the tests | LEGACY |
+| V06 conformance/watchdog | `crates/sema/tests/{runtime_conformance_test,unified_runtime_watchdog_test}.rs`; `common/watchdog.rs`; legacy scanner/baseline | Static source and out-of-process hang guards | Host process timeout | Host kill is watchdog boundary | `HOST-ADAPTER-ONLY` | Task 01; extended Tasks 02–09 | Paths are the tests | LEGACY |
+| V07 playground examples | `playground/examples/concurrency/{channels,fan-in,parallel-tasks,pipeline,real-sleep,timeout,worker-pool}.sema` | Documents current scheduler/replay behavior | Language concurrency waits | By operation | Root/task by operation | Task 08 after implementation | playground specs | LEGACY |
+| V08 builtin/generated docs | `crates/sema-docs/entries` async/channel/resource/LLM/MCP/workflow entries; generated docs index | Documents current APIs and ownership claims | Documentation only | Must match implemented class | Must match implemented policy | Task 08 | docs entry tests; `jake docs-check` | LEGACY |
+| V09 shipped browser assets | playground generated examples and `crates/sema/src/web/assets` | Generated from pre-rewrite WASM/JS sources | Browser root/fetch/timer waits | Replay/blocking paths `PROHIBITED` | `HOST-ADAPTER-ONLY` | Task 08 | packaged web and Playwright gates | LEGACY |
+| V10 test-owned interpreters | Every `Interpreter::{new,new_with_sandbox,builder}` site in `crates/sema/tests`, plus crate-local LSP and MCP tests | Each test host constructs and drops an interpreter; multi-interpreter cases currently share process/TLS runtime seams | Root submission, exact-root cancellation, interpreter shutdown/drop | Root waits `INTERRUPTIBLE`; drop must be bounded and must not affect another interpreter | interpreter `INTERPRETER-SHARED`; test eval `ROOT-SHARED`; harness `HOST-ADAPTER-ONLY` | Tasks 07 and 09 enumerate creation sites and prove isolation/drop | `embedding_api_test`; `embed_timeout_reap_test`; `gc_stress_test`; `leak_test`; LSP/MCP crate tests | LEGACY |
 
 ## Removal gates
 
-- [ ] `IoHandle` / `IoPoll`
-- [ ] `YieldReason` / scheduler target/run-result signals
-- [ ] scheduler/evaluator thread-local callbacks
-- [ ] `run_until_reentrant` and temporary running-task removal
-- [ ] WASM replay marker, replay limit, synchronous XHR, and `Atomics.wait`
-- [ ] subsystem-specific scheduler loops and blocking polls
-
-## Verification
-
-- [ ] scheduler characterization suite
-- [ ] deterministic seeded scheduler stress suite
-- [ ] native real-clock and I/O stress suite
-- [ ] WASM browser async/debugger suite
-- [ ] cancellation/leak/interpreter-drop suite
-- [ ] static legacy-symbol inventory gate
-- [ ] complete CI-equivalent release suite
+`scripts/check-unified-runtime-legacy.sh` records the exact current production
+matches in `docs/plans/evidence/unified-cooperative-runtime/legacy-symbols.baseline`.
+Tasks 02–08 update the baseline only when a reviewed row becomes `MIGRATED`,
+`SYNCHRONOUS-PROOF`, or `REMOVED`. Task 08 requires an empty production baseline
+apart from exact permanent synchronous-proof allowlist entries carrying file,
+reason, owner, and decision.

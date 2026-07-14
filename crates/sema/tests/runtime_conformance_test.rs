@@ -15,6 +15,7 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 /// Forbidden tokens (post comment-stripping). Path-free so imports can't evade.
 const RUNTIME_TOKENS: &[&str] = &[
@@ -184,5 +185,23 @@ fn no_adhoc_tokio_runtimes_outside_allowlist() {
         "ad-hoc tokio runtimes (or raw-seam bypasses) outside the ADR #69 allowlist \
          — route through sema-io, or add an allowlist entry WITH a reason:\n\n{}",
         violations.join("\n\n")
+    );
+}
+
+#[test]
+fn unified_runtime_legacy_symbols_match_baseline() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let output = Command::new(root.join("scripts/check-unified-runtime-legacy.sh"))
+        .arg("--check")
+        .current_dir(&root)
+        .output()
+        .expect("run unified runtime legacy scanner");
+
+    assert!(
+        output.status.success(),
+        "legacy scanner failed with {}\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
     );
 }

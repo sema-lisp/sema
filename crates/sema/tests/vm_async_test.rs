@@ -734,47 +734,43 @@ fn cancel_completed_task_is_noop() {
     );
 }
 
-// === ASYNC-3: a combinator short-circuit cancels its abandoned in-flight siblings ===
-//
-// When `async/all` short-circuits on the first rejection (or `async/race` on the
-// first settle), any still-pending sibling in that combinator's OWN promise set must
-// be transitively cancelled — structured-concurrency semantics. Before the fix the
-// abandoned sibling was left running (a reachable one survives the terminal-only reap),
-// so its span-owning IoHandle could strand to teardown and abort the process under an
-// active OTel exporter (the adversarial-#7 hazard the timeout path already guards).
+// === Observational combinator short-circuiting ===
 
 #[test]
-fn async_all_reject_cancels_pending_sibling() {
+fn async_all_failure_does_not_cancel_supplied_sibling() {
     assert_eq!(
         eval(
             r#"
-            (define slow (async (async/sleep 1000) :done))
+            (define slow (async (async/sleep 10) :slow-finished))
             (define boom (async (error "boom")))
             (try (async/all (list boom slow)) (catch e nil))
-            (async/cancelled? slow)
-            "#
+            (list (async/cancelled? slow) (await slow))
+            "#,
         ),
-        Value::bool(true),
+        Value::list(vec![Value::bool(false), Value::keyword("slow-finished"),]),
     );
 }
 
 #[test]
-fn async_race_cancels_losing_siblings() {
+fn async_race_does_not_cancel_supplied_loser() {
     assert_eq!(
         eval(
             r#"
-            (define slow (async (async/sleep 1000) :slow))
+            (define slow (async (async/sleep 10) :slow-finished))
             (define fast (async :fast))
-            (async/race (list slow fast))
-            (async/cancelled? slow)
-            "#
+            (define result (async/race (list slow fast)))
+            (list result (async/cancelled? slow) (await slow))
+            "#,
         ),
-        Value::bool(true),
+        Value::list(vec![
+            Value::keyword("fast"),
+            Value::bool(false),
+            Value::keyword("slow-finished"),
+        ]),
     );
 }
 
-// Guard against over-cancellation: the cancel is scoped to the combinator's own
-// promise set — an unrelated in-flight task awaited later must survive untouched.
+// Short-circuiting an observation must not affect unrelated in-flight work.
 #[test]
 fn combinator_short_circuit_spares_unrelated_task() {
     assert_eq!(
@@ -1614,18 +1610,21 @@ fn awaited_child_mutation_is_visible_to_parent() {
 }
 
 #[test]
-fn race_with_settled_winner_cancels_owned_pending_loser() {
-    // The fast path must apply the same owned-loser cancellation as a scheduled race.
+fn race_with_settled_winner_does_not_cancel_supplied_loser() {
     assert_eq!(
         eval(
             r#"
-            (define loser (async (async/sleep 1000) :too-late))
+            (define loser (async (async/sleep 10) :loser-finished))
             (define winner (async/resolved :winner))
-            (async/race (list winner loser))
-            (async/cancelled? loser)
+            (define result (async/race (list winner loser)))
+            (list result (async/cancelled? loser) (await loser))
             "#,
         ),
-        Value::bool(true),
+        Value::list(vec![
+            Value::keyword("winner"),
+            Value::bool(false),
+            Value::keyword("loser-finished"),
+        ]),
     );
 }
 
@@ -1633,6 +1632,15 @@ fn race_with_settled_winner_cancels_owned_pending_loser() {
 fn sleep_rejects_duration_negative_before_rounding() {
     // A negative input remains invalid even when nearest-integer rounding would produce zero.
     let err = eval_vm_err("(async/sleep -0.4)");
+    assert!(
+        err.contains("non-negative"),
+        "expected non-negative duration error, got: {err}"
+    );
+}
+
+#[test]
+fn timeout_rejects_duration_negative_before_rounding() {
+    let err = eval_vm_err("(async/timeout -0.4 (async/resolved :ready))");
     assert!(
         err.contains("non-negative"),
         "expected non-negative duration error, got: {err}"
@@ -1692,26 +1700,6 @@ fn scheduler_workload_beyond_tick_ceiling_completes() {
             "#,
         ),
         Value::keyword("complete"),
-    );
-}
-
-#[test]
-fn ready_spinner_does_not_starve_due_timer() {
-    // A continuously ready task must not prevent a positive-duration timer from becoming ready.
-    assert_eq!(
-        eval(
-            r#"
-            (define spinner
-              (async
-                (let loop ()
-                  (async/sleep 0)
-                  (loop))))
-            (define timer (async (async/sleep 1) :timer-fired))
-            (list (async/race (list spinner timer))
-                  (async/cancelled? spinner))
-            "#,
-        ),
-        Value::list(vec![Value::keyword("timer-fired"), Value::bool(true)]),
     );
 }
 

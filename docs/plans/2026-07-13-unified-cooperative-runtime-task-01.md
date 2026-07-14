@@ -25,10 +25,10 @@ Markdown evidence, Cargo, Jake.
 - **Dependencies:** Architecture commit `8acca1de` and the master specification.
 - **Immutable inputs:** The approved observation/ownership, multiple-root,
   cancellation, fairness, resource, host, and final-profiling contracts.
-- **Exact amendment start state:** Commit `d8737a28`
-  (`docs(runtime): repair execution contracts`) follows provisional Task 01
-  implementation commit `6d46d4c6`; production runtime behavior still matches
-  the state at `8acca1de`.
+- **Exact amendment start state:** The second acceptance amendment starts at
+  provisional commit `38ad2660` (`test(runtime): amend task 01 execution
+  contracts`); production runtime behavior still matches the state at
+  `8acca1de`.
 - **Parallel work:** Inventory discovery and independent oracle review may run in
   parallel. One implementer owns all test/scanner edits so test names and RED/
   GREEN evidence cannot diverge; the reviewer does not edit implementation.
@@ -65,6 +65,8 @@ Markdown evidence, Cargo, Jake.
   race, and all remain observation-only.
 - `crates/sema/tests/common/mod.rs` — export the reusable subprocess watchdog
   harness to sibling integration-test crates.
+- `crates/sema/Cargo.toml` and `Cargo.lock` — add the Windows-only test-harness
+  pipe API dependency; no production dependency or behavior changes.
 - `crates/sema/tests/runtime_conformance_test.rs` — source-boundary and baseline
   manifest checks, raw-receiver scanner fixture, and exact inventory mapping gate.
 - `docs/internals/async-runtime-inventory.md` — executable migration ledger.
@@ -110,7 +112,7 @@ Markdown evidence, Cargo, Jake.
   diffable against `legacy-symbols.baseline`.
 - An exact production discovery union whose committed TSV mapping is rejected
   for any missing/stale match, duplicate payload, malformed row, failed scan, or
-  ledger row ID that no longer exists.
+  `UNREVIEWED` assignment, or ledger row ID that no longer exists.
 - An inventory table with one row per production symbol/path and these columns:
 
 ```text
@@ -345,26 +347,44 @@ The harness must:
 - retain at most 64 KiB per stream while continuing to drain/discard excess, so
   a noisy child cannot fill a pipe or allocate unbounded diagnostics;
 - poll the direct child against the host deadline and close the kill/wait race;
-- on Unix, create a fresh process group for every watched command, terminate
-  remaining group members after normal direct-child exit or timeout, and join
-  both drain threads; an inherited pipe writer must not hang the join or leak a
-  drain thread/descendant;
-- on non-Unix, retain a documented direct-child kill fallback until Task 07 host
-  hardening supplies platform-specific tree termination;
-- expose `run_sema_with_timeout` and a Unix-only generic
-  `run_command_with_timeout` used by the inherited-pipe regression.
+- on Unix and Windows, put diagnostic pipes in nonblocking mode and give each
+  drain thread a cancellation flag. After direct-child wait/termination, signal
+  both drains, perform only a bounded final read, and join them. EOF from every
+  inherited writer is not a precondition for returning;
+- on Unix, create a fresh process group for every watched command and terminate
+  remaining members after normal direct-child exit or timeout. This is
+  best-effort containment: a descendant can escape with `setsid`, so bounded
+  drain cancellation—not inherited-pipe closure—must guarantee the join;
+- on Windows, terminate and wait for the direct child. Do not claim descendant
+  containment until Task 07 supplies a Job Object host boundary; inherited
+  writers still cannot extend the drain join;
+- document the blocking-drain limitation on exotic non-Unix/non-Windows
+  targets rather than generalizing the supported-platform guarantee;
+- expose `run_sema_with_timeout` and a Unix/Windows generic
+  `run_command_with_timeout` used by watchdog regressions.
 
 Import `run_sema_with_timeout` into
 `crates/sema/tests/unified_runtime_watchdog_test.rs` through `mod common`; do
-not duplicate the harness in the test crate.
+not duplicate the harness in the test crate. This is a test-process watchdog,
+not the interpreter shutdown implementation; Task 07 owns production host
+shutdown and Windows descendant containment.
 
 - [ ] **Step 3: Add watchdog self-regressions first**
 
-Add `noisy_child_is_drained_without_hanging_and_capture_is_bounded` and
-`inherited_pipe_writer_does_not_extend_parent_watchdog`. The latter starts a
-background descendant that inherits the pipes, prints its PID, and asserts the
-helper returns promptly and leaves no surviving descendant. Record each RED
-before implementing its corresponding harness change.
+Add `noisy_child_is_drained_without_hanging_and_capture_is_bounded`,
+`inherited_pipe_writer_does_not_extend_parent_watchdog`, the Unix-only
+`escaped_session_pipe_writers_do_not_block_drain_join`, and the Windows-only
+`windows_inherited_pipe_writer_does_not_block_drain_join`. The noisy child must
+fill both stdout and stderr beyond pipe capacity while retained output stays at
+64 KiB per stream. The ordinary inherited writer proves best-effort process
+group cleanup. The escaped-session helper uses a pipe handshake to prove
+`setsid` completed before its direct parent exits, then holds both diagnostic
+pipes open; the outer test proves drain joins still return before that writer
+exits. The Windows helper spawns a two-second PowerShell child inheriting both
+pipes and exits, so the native platform gate proves the same no-EOF liveness
+contract. Record the Unix escaped-writer RED against a blocking drain before
+adding cancellation; cross-compile the Windows-only regression in Task 01 and
+execute it on the native Windows Task 07/CI gate.
 
 - [ ] **Step 4: Add the ready-storm/timer test**
 
@@ -411,6 +431,8 @@ cargo test -p sema-lang --test unified_runtime_watchdog_test \
   noisy_child_is_drained_without_hanging_and_capture_is_bounded -- --exact --nocapture
 cargo test -p sema-lang --test unified_runtime_watchdog_test \
   inherited_pipe_writer_does_not_extend_parent_watchdog -- --exact --nocapture
+cargo test -p sema-lang --test unified_runtime_watchdog_test \
+  escaped_session_pipe_writers_do_not_block_drain_join -- --exact --nocapture
 cargo test -p sema-lang --test unified_runtime_watchdog_test \
   ready_spinner_does_not_starve_due_timer -- --exact --nocapture
 ```
@@ -498,11 +520,22 @@ sorted `path:line:text` output with `--scan-production`. Store one reviewed,
 stable ledger row ID beside every exact union member in
 `runtime-match-map.tsv`; path-family or wildcard mappings are not evidence.
 
-The checker must run all three scans without swallowing `rg` errors, reject an
-empty union, validate literal tab-separated fields portably, require sorted
-unique payloads, diff the current union against the TSV payloads, and verify
-every row ID still exists in the ledger. `--write-mapping` may bootstrap new
-matches, but semantic assignments in mixed files require review.
+The checker must run all three scans without swallowing any individual `rg`
+error, reject an empty union, validate literal tab-separated fields portably,
+require sorted unique payloads, reject `UNREVIEWED`, diff the current union
+against the TSV payloads, and verify every row ID against the first column of
+the Markdown ledger table. `--write-mapping` is mechanical only: preserve the
+row ID of every surviving payload, remove vanished payloads, assign
+`UNREVIEWED` to every new payload, and never infer a row from path/text
+heuristics. It may write an unreviewed bootstrap file, but `--check` must fail
+until a human assigns every new match.
+
+Add fixture regressions for empty/missing, stale, duplicate, malformed,
+`UNREVIEWED`, and nonexistent-row mappings. A nonexistent row ID mentioned
+outside the ledger's first table column must still fail. Add scanner-failure
+regressions for a missing `rg` binary and for the first discovery scan failing
+while a later scan succeeds; exercise both `--check` and `--write-mapping` and
+prove neither masks the error or writes a map.
 
 - [ ] **Step 7: Run the exact coverage gates**
 
@@ -634,8 +667,9 @@ The reviewer checks only:
 
 - no test asserts implicit ownership of a supplied promise;
 - every perpetual workload has an external watchdog;
-- watchdog output draining is concurrent and bounded, and descendants cannot
-  retain inherited diagnostic pipes or survive Unix process-group cleanup;
+- watchdog output draining is concurrent, bounded, and cancellable on Unix and
+  Windows; ordinary Unix descendants receive best-effort process-group cleanup,
+  while an escaped-session pipe writer cannot block drain joins;
 - RED tests fail for the intended public behavior;
 - the inventory semantically splits mixed policies and covers every exact
   production discovery/scanner match;
@@ -655,6 +689,8 @@ implementer may not close their own review finding.
 ```bash
 git add \
   crates/sema/tests/vm_async_test.rs \
+  crates/sema/Cargo.toml \
+  Cargo.lock \
   crates/sema/tests/common/mod.rs \
   crates/sema/tests/common/watchdog.rs \
   crates/sema/tests/unified_runtime_watchdog_test.rs \
@@ -678,7 +714,7 @@ git add \
   docs/plans/evidence/unified-cooperative-runtime/runtime-match-map.tsv \
   docs/plans/evidence/unified-cooperative-runtime/task-01-discovery.txt \
   docs/plans/evidence/unified-cooperative-runtime/task-01.md
-git commit -m "test(runtime): amend task 01 execution contracts"
+git commit -m "test(runtime): complete second task 01 amendment"
 ```
 
 This is a provisional amendment commit, not controller acceptance of Task 01.
@@ -692,14 +728,19 @@ This is a provisional amendment commit, not controller acceptance of Task 01.
 - Observational loser/sibling tests are enabled and RED for the intended legacy
   behavior.
 - No in-process test can spin forever after the tick ceiling is removed; noisy
-  output is bounded/drained and Unix descendants cannot retain pipes or survive.
+  stdout/stderr are bounded while fully drained, supported-platform drain joins
+  are cancellable without EOF, ordinary Unix descendants receive best-effort
+  process-group cleanup, and escaped-session writers cannot extend the join.
 - The raw `.recv()` fixture is detected and the production baseline is sorted,
   nonempty, and GREEN.
 - The exact TSV maps every current production discovery/scanner match to an
-  existing semantically specific row; the checker is GREEN and fails scan errors,
-  malformed/duplicate/stale/missing mappings, and missing row IDs.
-- Task 05's compile-ready API keeps completion kind, decoder, resource class, and
-  cancellation hook runtime-side; only send work and a one-shot sink cross.
+  existing semantically specific row; the checker is GREEN, writes no heuristic
+  assignments, and fails individual scan errors, `UNREVIEWED`, malformed/
+  duplicate/stale/missing mappings, and missing row IDs.
+- Task 05's compile-ready API keeps completion kind, decoder, resource class,
+  cancellation hook, and one-shot sink control outside `IoJob`; the executor
+  catches job panic and accounts for exactly one completion attempt per admitted
+  job.
 - Task 01 evidence/report chronology says after Task 01 harness edits and before
   production behavior changes; no implementer-owned review artifact is created.
 - No production behavior changed.

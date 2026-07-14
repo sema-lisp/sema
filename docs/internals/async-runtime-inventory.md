@@ -182,8 +182,13 @@ and R08C stdin/terminal waits—and callback matches map to their callback rows.
 
 `scripts/check-unified-runtime-inventory.sh --check` regenerates all three
 production scans without swallowing `rg` errors, requires a nonempty union,
-checks a portable tab-separated schema, rejects duplicate/stale/missing payloads,
-and verifies that every referenced stable row ID exists in this ledger. A source
+checks a portable tab-separated schema, rejects `UNREVIEWED` and duplicate/
+stale/missing payloads, and verifies each referenced stable row ID against the
+first column of this ledger's Markdown tables. `--write-mapping` preserves
+reviewed assignments for surviving payloads, removes vanished payloads, and
+marks new payloads `UNREVIEWED`; it contains no path/text classification
+heuristics. Fixture tests prove that a failed individual discovery scan cannot
+be masked by a later successful scan in either write or check mode. A source
 line change therefore requires an explicit mapping review; there is no wildcard
 or unlisted-path fallback.
 
@@ -196,7 +201,7 @@ or unlisted-path fallback.
 | V03 LLM/agent tests | `crates/sema/tests/{agent_async_breaker_test,agent_async_test,batch_rerank_async_test,embed_async_otel_test,llm_chat_tools_async_test,llm_fake_test,llm_simple_async_test}.rs` | Fake/live async characterization | Provider, retry, stream, tool waits | Request/timer/tool `INTERRUPTIBLE` | C06–C11 | Tasks 06, 09 | Paths are the tests | LEGACY |
 | V04 workflow/MCP tests | `crates/sema/tests/{mcp_async_test,mcp_builtin_test,mcp_cassette_test,mcp_e2e_test,workflow_budget_test,workflow_cookbook_test,workflow_mcp_*,workflow_resume_test,workflow_tools_test,workflow_view_connect_test}.rs` | Current orchestration/service coverage | Workflow, request, host waits | Owned request/leaf `INTERRUPTIBLE` | C12–C13; H07–H08 | Tasks 06–07, 09 | Paths are the tests | LEGACY |
 | V05 tracing/debug/WASM tests | `crates/sema/tests/{async_span_nesting_test,dap_async_breakpoint_test,otel_*,wasm_async_debug_test}.rs`; crate-local VM/DAP/WASM tests | Current TLS/debug/replay characterization | Debug/root/browser waits | Root/debug/fetch/timer `INTERRUPTIBLE` | C06, C15; H04, H09–H12 | Tasks 06–07, 09 | Paths are the tests | LEGACY |
-| V06 conformance/watchdog | `crates/sema/tests/{runtime_conformance_test,unified_runtime_watchdog_test}.rs`; `common/watchdog.rs`; legacy scanner/baseline | Static source and out-of-process hang guards | Host process timeout | Host kill is watchdog boundary | `HOST-ADAPTER-ONLY` | Task 01; extended Tasks 02–09 | Paths are the tests | LEGACY |
+| V06 conformance/watchdog | `crates/sema/tests/{runtime_conformance_test,unified_runtime_watchdog_test}.rs`; `common/watchdog.rs`; legacy scanner/baseline | Static source and out-of-process hang guards | Host process timeout | Unix/Windows drains are cancellable without inherited-pipe EOF; Unix process-group cleanup is best effort and Windows kills only the direct child here; Task 07 owns production host shutdown/containment | `HOST-ADAPTER-ONLY` | Task 01; extended Tasks 02–09 | noisy stdout/stderr, ordinary Unix descendant, escaped-session writer, scanner failure, and mapping fixtures | LEGACY |
 | V07 playground examples | `playground/examples/concurrency/{channels,fan-in,parallel-tasks,pipeline,real-sleep,timeout,worker-pool}.sema` | Documents current scheduler/replay behavior | Language concurrency waits | By operation | Root/task by operation | Task 08 after implementation | playground specs | LEGACY |
 | V08 builtin/generated docs | `crates/sema-docs/entries` async/channel/resource/LLM/MCP/workflow entries; generated docs index | Documents current APIs and ownership claims | Documentation only | Must match implemented class | Must match implemented policy | Task 08 | docs entry tests; `jake docs-check` | LEGACY |
 | V09 shipped browser assets | playground generated examples and `crates/sema/src/web/assets` | Generated from pre-rewrite WASM/JS sources | Browser root/fetch/timer waits | Replay/blocking paths `PROHIBITED` | `HOST-ADAPTER-ONLY` | Task 08 | packaged web and Playwright gates | LEGACY |

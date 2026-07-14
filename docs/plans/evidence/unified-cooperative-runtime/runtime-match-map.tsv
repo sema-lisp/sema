@@ -1,53 +1,53 @@
-F02	crates/sema-core/src/async_signal.rs:100:// A manual `Debug` impl keeps the `#[derive(Debug, Clone)]` on `YieldReason`
+F01A	crates/sema-core/src/async_signal.rs:100:// A manual `Debug` impl keeps the `#[derive(Debug, Clone)]` on `YieldReason`
 F01A	crates/sema-core/src/async_signal.rs:102:impl std::fmt::Debug for IoHandle {
 F01A	crates/sema-core/src/async_signal.rs:104:        f.write_str("IoHandle")
 F02	crates/sema-core/src/async_signal.rs:110:pub enum YieldReason {
-F01A	crates/sema-core/src/async_signal.rs:122:    AwaitIo(Rc<IoHandle>),
+F02	crates/sema-core/src/async_signal.rs:122:    AwaitIo(Rc<IoHandle>),
 F03	crates/sema-core/src/async_signal.rs:127:pub enum SchedulerTarget {
 F03	crates/sema-core/src/async_signal.rs:142:pub enum SchedulerRunResult {
-F07	crates/sema-core/src/async_signal.rs:148:    /// scheduler re-entry. The driving native (`async/await`, `async/all`,
-F07	crates/sema-core/src/async_signal.rs:149:    /// `async/timeout`, `async/race`) must NOT inspect the still-pending target
+F03	crates/sema-core/src/async_signal.rs:148:    /// scheduler re-entry. The driving native (`async/await`, `async/all`,
+F03	crates/sema-core/src/async_signal.rs:149:    /// `async/timeout`, `async/race`) must NOT inspect the still-pending target
 F03	crates/sema-core/src/async_signal.rs:160:/// [`SchedulerRunResult::DebugPaused`]; consumed by `run_cooperative` in
 F05	crates/sema-core/src/async_signal.rs:162:/// the reconstructed value (`set_resume_value`).
-F07	crates/sema-core/src/async_signal.rs:165:    /// `async/await` / `async/timeout`: resume with the single target promise's
-F07	crates/sema-core/src/async_signal.rs:169:    /// `async/all`: resume with the list of all resolved values.
-F07	crates/sema-core/src/async_signal.rs:171:    /// `async/race` / `async/any`: resume with the first settled promise's value.
-F07	crates/sema-core/src/async_signal.rs:173:    /// `async/run`: no value to reconstruct (returns nil).
-F07	crates/sema-core/src/async_signal.rs:177:thread_local! {
+F05	crates/sema-core/src/async_signal.rs:165:    /// `async/await` / `async/timeout`: resume with the single target promise's
+F05	crates/sema-core/src/async_signal.rs:169:    /// `async/all`: resume with the list of all resolved values.
+F05	crates/sema-core/src/async_signal.rs:171:    /// `async/race` / `async/any`: resume with the first settled promise's value.
+F05	crates/sema-core/src/async_signal.rs:173:    /// `async/run`: no value to reconstruct (returns nil).
+F02	crates/sema-core/src/async_signal.rs:177:thread_local! {
 F02	crates/sema-core/src/async_signal.rs:180:    static YIELD_SIGNAL: RefCell<Option<YieldReason>> = const { RefCell::new(None) };
-F03	crates/sema-core/src/async_signal.rs:183:    /// for a debug breakpoint inside a task. Carries the `SchedulerTarget` to
-F03	crates/sema-core/src/async_signal.rs:185:    /// `run_cooperative` (sema-vm). See [`SchedulerRunResult::DebugPaused`].
-F03	crates/sema-core/src/async_signal.rs:186:    static DEBUG_COOP_RESUME: RefCell<Option<(SchedulerTarget, DebugCoopResume)>> =
+F05	crates/sema-core/src/async_signal.rs:183:    /// for a debug breakpoint inside a task. Carries the `SchedulerTarget` to
+F05	crates/sema-core/src/async_signal.rs:185:    /// `run_cooperative` (sema-vm). See [`SchedulerRunResult::DebugPaused`].
+F05	crates/sema-core/src/async_signal.rs:186:    static DEBUG_COOP_RESUME: RefCell<Option<(SchedulerTarget, DebugCoopResume)>> =
 F02	crates/sema-core/src/async_signal.rs:202:pub fn set_yield_signal(reason: YieldReason) {
 F02	crates/sema-core/src/async_signal.rs:207:pub fn take_yield_signal() -> Option<YieldReason> {
-F03	crates/sema-core/src/async_signal.rs:215:pub fn set_debug_coop_resume(target: SchedulerTarget, how: DebugCoopResume) {
-F03	crates/sema-core/src/async_signal.rs:221:pub fn take_debug_coop_resume() -> Option<(SchedulerTarget, DebugCoopResume)> {
+F05	crates/sema-core/src/async_signal.rs:215:pub fn set_debug_coop_resume(target: SchedulerTarget, how: DebugCoopResume) {
+F05	crates/sema-core/src/async_signal.rs:221:pub fn take_debug_coop_resume() -> Option<(SchedulerTarget, DebugCoopResume)> {
 F05	crates/sema-core/src/async_signal.rs:235:pub fn set_resume_value(val: Value) {
 F05	crates/sema-core/src/async_signal.rs:241:pub fn take_resume_value() -> Option<Value> {
-F07	crates/sema-core/src/async_signal.rs:248:pub fn in_async_context() -> bool {
+F02	crates/sema-core/src/async_signal.rs:248:pub fn in_async_context() -> bool {
 F01B	crates/sema-core/src/async_signal.rs:25:pub enum IoPoll {
-F07	crates/sema-core/src/async_signal.rs:264:thread_local! {
+F04	crates/sema-core/src/async_signal.rs:264:thread_local! {
 F04	crates/sema-core/src/async_signal.rs:269:pub fn set_spawn_callback(f: SpawnCallbackFn) {
 F04	crates/sema-core/src/async_signal.rs:275:pub fn call_spawn_callback(ctx: &EvalContext, thunk: Value) -> Result<Value, SemaError> {
-F07	crates/sema-core/src/async_signal.rs:278:            "async/spawn: no async scheduler registered (async requires the VM backend)"
+F04	crates/sema-core/src/async_signal.rs:278:            "async/spawn: no async scheduler registered (async requires the VM backend)"
 F03	crates/sema-core/src/async_signal.rs:290:    fn(&EvalContext, SchedulerTarget) -> Result<SchedulerRunResult, SemaError>;
-F07	crates/sema-core/src/async_signal.rs:292:thread_local! {
+F03	crates/sema-core/src/async_signal.rs:292:thread_local! {
 F03	crates/sema-core/src/async_signal.rs:297:pub fn set_run_scheduler_callback(f: RunSchedulerCallbackFn) {
-F07	crates/sema-core/src/async_signal.rs:311:thread_local! {
+F04	crates/sema-core/src/async_signal.rs:311:thread_local! {
 F04	crates/sema-core/src/async_signal.rs:316:pub fn set_cancel_callback(f: CancelCallbackFn) {
 F04	crates/sema-core/src/async_signal.rs:322:pub fn call_cancel_callback(task_id: u64) -> Result<bool, SemaError> {
-F07	crates/sema-core/src/async_signal.rs:324:        SemaError::eval("async/cancel: no async scheduler registered".to_string())
-F07	crates/sema-core/src/async_signal.rs:332:/// will NEVER resume from (cancellation via `async/cancel`, `async/timeout`
-F07	crates/sema-core/src/async_signal.rs:345:thread_local! {
-F07	crates/sema-core/src/async_signal.rs:366:thread_local! {
-F02	crates/sema-core/src/async_signal.rs:37:/// [`YieldReason::AwaitIo`]; it never crosses a thread boundary (the scheduler
-F07	crates/sema-core/src/async_signal.rs:391:/// milliseconds (already bounded by the `async/sleep`/`async/timeout` caps).
-F07	crates/sema-core/src/async_signal.rs:394:thread_local! {
-F07	crates/sema-core/src/async_signal.rs:399:/// real `Atomics.wait` on a `SharedArrayBuffer`, so `async/sleep` paces in real
+F04	crates/sema-core/src/async_signal.rs:324:        SemaError::eval("async/cancel: no async scheduler registered".to_string())
+F06	crates/sema-core/src/async_signal.rs:332:/// will NEVER resume from (cancellation via `async/cancel`, `async/timeout`
+F06	crates/sema-core/src/async_signal.rs:345:thread_local! {
+F06	crates/sema-core/src/async_signal.rs:366:thread_local! {
+F01A	crates/sema-core/src/async_signal.rs:37:/// [`YieldReason::AwaitIo`]; it never crosses a thread boundary (the scheduler
+F08B	crates/sema-core/src/async_signal.rs:391:/// milliseconds (already bounded by the `async/sleep`/`async/timeout` caps).
+F08B	crates/sema-core/src/async_signal.rs:394:thread_local! {
+F08B	crates/sema-core/src/async_signal.rs:399:/// real `Atomics.wait` on a `SharedArrayBuffer`, so `async/sleep` paces in real
 F01A	crates/sema-core/src/async_signal.rs:39:pub struct IoHandle {
 F08B	crates/sema-core/src/async_signal.rs:402:/// `std::thread::sleep` default below.
 F01B	crates/sema-core/src/async_signal.rs:40:    poll: RefCell<Box<dyn FnMut() -> IoPoll>>,
-F08A	crates/sema-core/src/async_signal.rs:42:    /// this handle (`async/cancel`, `async/timeout` expiry, or an interrupt) — NEVER
+F01A	crates/sema-core/src/async_signal.rs:42:    /// this handle (`async/cancel`, `async/timeout` expiry, or an interrupt) — NEVER
 F07	crates/sema-core/src/async_signal.rs:435:thread_local! {
 F07	crates/sema-core/src/async_signal.rs:497:thread_local! {
 F02	crates/sema-core/src/async_signal.rs:4://! (channel/recv, async/await, etc.) set `YIELD_SIGNAL` when they need to
@@ -55,11 +55,11 @@ F01A	crates/sema-core/src/async_signal.rs:53:    /// [`with_abort`]: IoHandle::w
 F01B	crates/sema-core/src/async_signal.rs:54:    /// [`new`]: IoHandle::new
 F07	crates/sema-core/src/async_signal.rs:563:thread_local! {
 F01A	crates/sema-core/src/async_signal.rs:58:impl IoHandle {
-F07	crates/sema-core/src/async_signal.rs:610:/// program — including one blocked in a real `Atomics.wait` sleep.
-F07	crates/sema-core/src/async_signal.rs:613:thread_local! {
+F08A	crates/sema-core/src/async_signal.rs:610:/// program — including one blocked in a real `Atomics.wait` sleep.
+F08A	crates/sema-core/src/async_signal.rs:613:thread_local! {
 F01B	crates/sema-core/src/async_signal.rs:62:    pub fn new(f: impl FnMut() -> IoPoll + 'static) -> Self {
 F08B	crates/sema-core/src/async_signal.rs:645:    std::thread::sleep(std::time::Duration::from_millis(ms));
-F01A	crates/sema-core/src/async_signal.rs:655:/// (the scheduler) loop and re-poll their `IoHandle`s, so correctness never
+F08A	crates/sema-core/src/async_signal.rs:655:/// (the scheduler) loop and re-poll their `IoHandle`s, so correctness never
 F03	crates/sema-core/src/async_signal.rs:688:/// ([`SchedulerRunResult::DebugPaused`]).
 F03	crates/sema-core/src/async_signal.rs:689:pub fn call_run_scheduler(
 F03	crates/sema-core/src/async_signal.rs:692:) -> Result<SchedulerRunResult, SemaError> {
@@ -71,7 +71,7 @@ F03	crates/sema-core/src/async_signal.rs:715:    f(ctx, SchedulerTarget::AllOf(t
 F03	crates/sema-core/src/async_signal.rs:719:pub fn call_run_scheduler_any_of(
 F03	crates/sema-core/src/async_signal.rs:722:) -> Result<SchedulerRunResult, SemaError> {
 F03	crates/sema-core/src/async_signal.rs:728:    f(ctx, SchedulerTarget::AnyOf(targets))
-F01B	crates/sema-core/src/async_signal.rs:72:    pub fn with_abort(f: impl FnMut() -> IoPoll + 'static, abort: impl FnOnce() + 'static) -> Self {
+F01A	crates/sema-core/src/async_signal.rs:72:    pub fn with_abort(f: impl FnMut() -> IoPoll + 'static, abort: impl FnOnce() + 'static) -> Self {
 F03	crates/sema-core/src/async_signal.rs:731:/// Run the scheduler with an explicit `SchedulerTarget`. Used by the cooperative
 F03	crates/sema-core/src/async_signal.rs:736:pub fn call_run_scheduler_target(
 F03	crates/sema-core/src/async_signal.rs:738:    target: SchedulerTarget,
@@ -79,23 +79,23 @@ F03	crates/sema-core/src/async_signal.rs:739:) -> Result<SchedulerRunResult, Sem
 F03	crates/sema-core/src/async_signal.rs:749:pub fn call_run_scheduler_timeout(
 F03	crates/sema-core/src/async_signal.rs:753:) -> Result<SchedulerRunResult, SemaError> {
 F03	crates/sema-core/src/async_signal.rs:759:    f(ctx, SchedulerTarget::Timeout(target, timeout_ms))
-F01B	crates/sema-core/src/async_signal.rs:771:        let h = IoHandle::with_abort(|| IoPoll::Pending, move || c.set(c.get() + 1));
+F01A	crates/sema-core/src/async_signal.rs:771:        let h = IoHandle::with_abort(|| IoPoll::Pending, move || c.set(c.get() + 1));
 F01B	crates/sema-core/src/async_signal.rs:783:        let h = IoHandle::new(|| IoPoll::Ready(Ok(Value::nil())));
 F01B	crates/sema-core/src/async_signal.rs:786:        assert!(matches!(h.poll(), IoPoll::Ready(Ok(_))));
-F01B	crates/sema-core/src/async_signal.rs:791:        let h = IoHandle::with_abort(|| IoPoll::Ready(Ok(Value::int(7))), || {});
-F01B	crates/sema-core/src/async_signal.rs:794:            IoPoll::Ready(Ok(v)) => assert_eq!(v, Value::int(7)),
-F01B	crates/sema-core/src/async_signal.rs:80:    pub fn poll(&self) -> IoPoll {
-F01B	crates/sema-core/src/async_signal.rs:88:    /// [`new`]: IoHandle::new
+F01A	crates/sema-core/src/async_signal.rs:791:        let h = IoHandle::with_abort(|| IoPoll::Ready(Ok(Value::int(7))), || {});
+F01A	crates/sema-core/src/async_signal.rs:794:            IoPoll::Ready(Ok(v)) => assert_eq!(v, Value::int(7)),
+F01A	crates/sema-core/src/async_signal.rs:80:    pub fn poll(&self) -> IoPoll {
+F01A	crates/sema-core/src/async_signal.rs:88:    /// [`new`]: IoHandle::new
 F01A	crates/sema-core/src/async_signal.rs:99:// `IoHandle` holds a `Box<dyn FnMut>`, which is neither `Debug` nor `Clone`.
-F07	crates/sema-core/src/async_signal.rs:9://! depending on sema-vm. Follows the same pattern as `set_eval_callback`.
+F02	crates/sema-core/src/async_signal.rs:9://! depending on sema-vm. Follows the same pattern as `set_eval_callback`.
 F10	crates/sema-core/src/context.rs:18:/// values out of it (leaving nil behind). See [`call_callback_owned`].
-F12	crates/sema-core/src/context.rs:610:thread_local! {
+F14	crates/sema-core/src/context.rs:610:thread_local! {
 F10	crates/sema-core/src/context.rs:626:pub fn set_eval_callback(ctx: &EvalContext, f: EvalCallbackFn) {
 F10	crates/sema-core/src/context.rs:633:pub fn set_call_callback(ctx: &EvalContext, f: CallCallbackFn) {
 F10	crates/sema-core/src/context.rs:640:pub fn eval_callback(ctx: &EvalContext, expr: &Value, env: &Env) -> Result<Value, SemaError> {
 F10	crates/sema-core/src/context.rs:649:pub fn call_callback(ctx: &EvalContext, func: &Value, args: &[Value]) -> Result<Value, SemaError> {
 F10	crates/sema-core/src/context.rs:657:/// interpreter init, alongside [`set_call_callback`].
-F12	crates/sema-core/src/context.rs:658:pub fn set_call_owned_callback(ctx: &EvalContext, f: CallOwnedCallbackFn) {
+F10	crates/sema-core/src/context.rs:658:pub fn set_call_owned_callback(ctx: &EvalContext, f: CallOwnedCallbackFn) {
 F10	crates/sema-core/src/context.rs:665:/// behind). This is the refcount-shedding variant of [`call_callback`] — a
 F10	crates/sema-core/src/context.rs:670:pub fn call_callback_owned(
 F10	crates/sema-core/src/context.rs:678:    call_callback(ctx, func, args)
@@ -105,7 +105,7 @@ F09B	crates/sema-core/src/io_backend.rs:141:/// [`IoBackend::block_on_boxed`]: t
 F09B	crates/sema-core/src/io_backend.rs:144:/// `sema_io::io_block_on`. NATIVE-ONLY semantics — see the trait method.
 F09B	crates/sema-core/src/io_backend.rs:145:pub fn io_block_on<F: Future>(fut: F) -> F::Output {
 F09B	crates/sema-core/src/io_backend.rs:148:    backend.block_on_boxed(Box::pin(async {
-F09B	crates/sema-core/src/io_backend.rs:14://! go through `sema_io::{io_spawn, io_spawn_blocking, io_block_on}` — the raw
+F09A	crates/sema-core/src/io_backend.rs:14://! go through `sema_io::{io_spawn, io_spawn_blocking, io_block_on}` — the raw
 F09B	crates/sema-core/src/io_backend.rs:151:    slot.expect("io_block_on: block_on_boxed returned without completing the future")
 F09B	crates/sema-core/src/io_backend.rs:21://! `io_block_on` is legal from the VM thread, plain OS threads, and
 F09B	crates/sema-core/src/io_backend.rs:23://! async-driver thread ("cannot block_on from within a runtime worker"). A
@@ -132,14 +132,14 @@ F36	crates/sema-core/src/lib.rs:42:    call_callback, call_callback_owned, eval_
 F36	crates/sema-core/src/lib.rs:43:    set_eval_callback, with_stdlib_ctx, CallCallbackFn, CallOwnedCallbackFn, EvalCallbackFn,
 F36	crates/sema-core/src/lib.rs:57:    io_backend, io_block_on, io_spawn, io_spawn_blocking, set_io_backend, AbortHook, BoxIoFuture,
 F21A	crates/sema-core/src/mcp_cassette.rs:27:thread_local! {
-F21A	crates/sema-core/src/mcp_cassette.rs:63:    thread_local! {
+F21B	crates/sema-core/src/mcp_cassette.rs:63:    thread_local! {
 F21A	crates/sema-core/src/mcp_cassette.rs:6://! pointers into its thread-local cassette, exactly like `set_eval_callback`);
 F22	crates/sema-core/src/output_hook.rs:8:thread_local! {
-F15	crates/sema-core/src/value.rs:2313:thread_local! {
+C17	crates/sema-core/src/value.rs:2313:thread_local! {
 F15	crates/sema-core/src/value.rs:256:/// the user explicitly cancels via `async/cancel` is *not* a normal rejection
 F15	crates/sema-core/src/value.rs:258:/// `async/cancelled?` be precise without string-matching, and lets
-F15	crates/sema-core/src/value.rs:27:thread_local! {
-F15	crates/sema-core/src/value.rs:93:thread_local! {
+C17	crates/sema-core/src/value.rs:27:thread_local! {
+C17	crates/sema-core/src/value.rs:93:thread_local! {
 H04	crates/sema-dap/src/server.rs:1033:                    while let Ok(cmd) = ds.command_rx.recv() {
 H04	crates/sema-dap/src/server.rs:263:                reply_rx.recv().await.unwrap_or_default()
 H04	crates/sema-dap/src/server.rs:694:    tokio::task::spawn_blocking(move || reply_rx.recv().unwrap_or_default())
@@ -158,7 +158,7 @@ F32	crates/sema-eval/src/eval.rs:98:        sema_core::set_eval_callback(&ctx, e
 F32	crates/sema-eval/src/eval.rs:99:        sema_core::set_call_callback(&ctx, call_value);
 F34D	crates/sema-eval/src/prelude.rs:137:;; (async/await (ws/listen sock {:on-message (fn (c m) (println m))}))
 F34A	crates/sema-eval/src/prelude.rs:146:       (async/spawn
-F34A	crates/sema-eval/src/prelude.rs:500:;; builtins.rs) that branches internally on `in_async_context()`: synchronous
+C07B	crates/sema-eval/src/prelude.rs:500:;; builtins.rs) that branches internally on `in_async_context()`: synchronous
 F34A	crates/sema-eval/src/prelude.rs:516:;; pre-filled with `n` tokens: each spawned task first `(channel/recv sem)`
 F34D	crates/sema-eval/src/prelude.rs:520:;; deadlocks). Errors are re-raised so a failing item surfaces. `async/all`
 F34A	crates/sema-eval/src/prelude.rs:527:     (for-range (i# 0 ,n) (channel/send pool-sem# #t))
@@ -183,8 +183,8 @@ F34A	crates/sema-eval/src/prelude.rs:737:(defmacro async/spawn-all (thunks)
 F34D	crates/sema-eval/src/prelude.rs:738:  `(async/all (map (fn (thunk#) (async/spawn thunk#)) ,thunks)))
 F34D	crates/sema-eval/src/prelude.rs:747:     (async/all
 F34A	crates/sema-eval/src/prelude.rs:748:       (map (fn (item#) (async/spawn (fn () (amap-f# item#)))) ,items))))
-F34B	crates/sema-eval/src/prelude.rs:753:;; so sibling tasks overlap during the conversation, and `async/timeout`/`async/cancel`
-F34B	crates/sema-eval/src/prelude.rs:834:;; CONTEXT — a callback that itself yields (async/sleep, channel ops, await) is
+F34C	crates/sema-eval/src/prelude.rs:753:;; so sibling tasks overlap during the conversation, and `async/timeout`/`async/cancel`
+F34C	crates/sema-eval/src/prelude.rs:834:;; CONTEXT — a callback that itself yields (async/sleep, channel ops, await) is
 F35B	crates/sema-io/src/lib.rs:121:    fn block_on_boxed(&self, fut: Pin<Box<dyn Future<Output = ()> + '_>>) {
 F35B	crates/sema-io/src/lib.rs:122:        pool().block_on(fut);
 F35B	crates/sema-io/src/lib.rs:191:pub fn io_block_on<F: Future>(fut: F) -> F::Output {
@@ -197,57 +197,57 @@ F35B	crates/sema-io/src/lib.rs:44://! tokio upgrade that changes the rules fails
 F35B	crates/sema-io/src/lib.rs:46://! `spawn_blocking` closures — `block_on` drives the future on the CALLING
 F35B	crates/sema-io/src/lib.rs:65:/// `block_on`'d future may transiently need (GaiResolver DNS) — see the module
 F35B	crates/sema-io/src/lib.rs:77:/// Seam-entry counter for the `block_on` tier. `block_on` drives the future on
-F35B	crates/sema-io/src/lib.rs:7://! / [`io_block_on`] wrappers below, which install the backend on first use —
+F35A	crates/sema-io/src/lib.rs:7://! / [`io_block_on`] wrappers below, which install the backend on first use —
 C07D	crates/sema-llm/src/anthropic.rs:511:        sema_io::io_block_on(self.complete_async(request))
 C07D	crates/sema-llm/src/anthropic.rs:527:        // io_block_on drives ON THIS thread: `on_chunk` may touch non-Send Sema
 C07D	crates/sema-llm/src/anthropic.rs:529:        sema_io::io_block_on(self.stream_complete_async(request, on_chunk))
 C07D	crates/sema-llm/src/anthropic.rs:533:        sema_io::io_block_on(async {
 C07C	crates/sema-llm/src/builtins.rs:1014:                sema_core::call_callback(ctx, &complete_fn, &[request_map])
-C07A	crates/sema-llm/src/builtins.rs:2050:        if sema_core::in_async_context() {
-C07A	crates/sema-llm/src/builtins.rs:2069:    // (its own `in_async_context()` branch below already offloads the no-tools
-C07A	crates/sema-llm/src/builtins.rs:2143:                if sema_core::in_async_context() {
+C07B	crates/sema-llm/src/builtins.rs:2050:        if sema_core::in_async_context() {
+C07B	crates/sema-llm/src/builtins.rs:2069:    // (its own `in_async_context()` branch below already offloads the no-tools
+C07B	crates/sema-llm/src/builtins.rs:2143:                if sema_core::in_async_context() {
 C07C	crates/sema-llm/src/builtins.rs:2238:                sema_core::call_callback(ctx, cb, &[Value::string(chunk)])
-C07A	crates/sema-llm/src/builtins.rs:2306:        if sema_core::in_async_context() {
-C07B	crates/sema-llm/src/builtins.rs:241:// can defer past the reset. The scheduler captures this scope at `async/spawn` and
-C07A	crates/sema-llm/src/builtins.rs:2487:        if sema_core::in_async_context() {
-C07A	crates/sema-llm/src/builtins.rs:2593:        if sema_core::in_async_context() {
+C07B	crates/sema-llm/src/builtins.rs:2306:        if sema_core::in_async_context() {
+C08	crates/sema-llm/src/builtins.rs:241:// can defer past the reset. The scheduler captures this scope at `async/spawn` and
+C07B	crates/sema-llm/src/builtins.rs:2487:        if sema_core::in_async_context() {
+C07B	crates/sema-llm/src/builtins.rs:2593:        if sema_core::in_async_context() {
 C08	crates/sema-llm/src/builtins.rs:26:thread_local! {
-C07A	crates/sema-llm/src/builtins.rs:3017:        Ok(Value::bool(sema_core::in_async_context()))
+C11	crates/sema-llm/src/builtins.rs:3017:        Ok(Value::bool(sema_core::in_async_context()))
 C07C	crates/sema-llm/src/builtins.rs:3134:            let result = sema_core::call_callback(ctx, func, &[item.clone()])?;
-C07A	crates/sema-llm/src/builtins.rs:3184:        if let Some(v) = sema_core::take_resume_value() {
+C07D	crates/sema-llm/src/builtins.rs:3184:        if let Some(v) = sema_core::take_resume_value() {
 C07D	crates/sema-llm/src/builtins.rs:3228:        // their own concurrency internally via `sema_io::io_block_on(join_all(..))`
-C07A	crates/sema-llm/src/builtins.rs:3236:        if sema_core::in_async_context() {
+C07D	crates/sema-llm/src/builtins.rs:3236:        if sema_core::in_async_context() {
 C07D	crates/sema-llm/src/builtins.rs:3273:            let handle = Rc::new(sema_core::IoHandle::new(move || {
-C07A	crates/sema-llm/src/builtins.rs:3276:                    Err(TryRecvError::Empty) => sema_core::IoPoll::Pending,
-C07A	crates/sema-llm/src/builtins.rs:3282:                                Err(e) => return sema_core::IoPoll::Ready(Err(e.to_string())),
-C07A	crates/sema-llm/src/builtins.rs:3309:                                return sema_core::IoPoll::Ready(Err(e.to_string()));
-C07A	crates/sema-llm/src/builtins.rs:3313:                        sema_core::IoPoll::Ready(Ok(Value::list(results)))
-C07A	crates/sema-llm/src/builtins.rs:3316:                        sema_core::IoPoll::Ready(Err("batch: worker dropped".to_string()))
-C07A	crates/sema-llm/src/builtins.rs:3320:            sema_core::set_yield_signal(sema_core::YieldReason::AwaitIo(handle));
-C07A	crates/sema-llm/src/builtins.rs:3452:    // on `sema_core::in_async_context()`:
+C07D	crates/sema-llm/src/builtins.rs:3276:                    Err(TryRecvError::Empty) => sema_core::IoPoll::Pending,
+C07D	crates/sema-llm/src/builtins.rs:3282:                                Err(e) => return sema_core::IoPoll::Ready(Err(e.to_string())),
+C07D	crates/sema-llm/src/builtins.rs:3309:                                return sema_core::IoPoll::Ready(Err(e.to_string()));
+C07D	crates/sema-llm/src/builtins.rs:3313:                        sema_core::IoPoll::Ready(Ok(Value::list(results)))
+C07D	crates/sema-llm/src/builtins.rs:3316:                        sema_core::IoPoll::Ready(Err("batch: worker dropped".to_string()))
+C07D	crates/sema-llm/src/builtins.rs:3320:            sema_core::set_yield_signal(sema_core::YieldReason::AwaitIo(handle));
+C07B	crates/sema-llm/src/builtins.rs:3452:    // on `sema_core::in_async_context()`:
 C07B	crates/sema-llm/src/builtins.rs:3460:    // yields `AwaitIo` so sibling tasks overlap; the IoHandle poller (which runs
-C07A	crates/sema-llm/src/builtins.rs:3475:        if let Some(v) = sema_core::take_resume_value() {
+C07B	crates/sema-llm/src/builtins.rs:3475:        if let Some(v) = sema_core::take_resume_value() {
 C07A	crates/sema-llm/src/builtins.rs:348:thread_local! {
-C07A	crates/sema-llm/src/builtins.rs:3517:        if sema_core::in_async_context() {
+C07B	crates/sema-llm/src/builtins.rs:3517:        if sema_core::in_async_context() {
 C07B	crates/sema-llm/src/builtins.rs:3604:            let handle = Rc::new(sema_core::IoHandle::with_abort(
-C07A	crates/sema-llm/src/builtins.rs:3608:                        Err(TryRecvError::Empty) => sema_core::IoPoll::Pending,
-C07A	crates/sema-llm/src/builtins.rs:3666:                                Ok(()) => sema_core::IoPoll::Ready(Ok(value)),
-C07A	crates/sema-llm/src/builtins.rs:3667:                                Err(e) => sema_core::IoPoll::Ready(Err(e.to_string())),
-C07A	crates/sema-llm/src/builtins.rs:3674:                            sema_core::IoPoll::Ready(Err(e.to_string()))
-C07A	crates/sema-llm/src/builtins.rs:3678:                            sema_core::IoPoll::Ready(Err("embed: io worker dropped".to_string()))
-C07A	crates/sema-llm/src/builtins.rs:3684:            sema_core::set_yield_signal(sema_core::YieldReason::AwaitIo(handle));
-C07A	crates/sema-llm/src/builtins.rs:3764:        if let Some(v) = sema_core::take_resume_value() {
+C07B	crates/sema-llm/src/builtins.rs:3608:                        Err(TryRecvError::Empty) => sema_core::IoPoll::Pending,
+C07B	crates/sema-llm/src/builtins.rs:3666:                                Ok(()) => sema_core::IoPoll::Ready(Ok(value)),
+C07B	crates/sema-llm/src/builtins.rs:3667:                                Err(e) => sema_core::IoPoll::Ready(Err(e.to_string())),
+C07B	crates/sema-llm/src/builtins.rs:3674:                            sema_core::IoPoll::Ready(Err(e.to_string()))
+C07B	crates/sema-llm/src/builtins.rs:3678:                            sema_core::IoPoll::Ready(Err("embed: io worker dropped".to_string()))
+C07B	crates/sema-llm/src/builtins.rs:3684:            sema_core::set_yield_signal(sema_core::YieldReason::AwaitIo(handle));
+C07B	crates/sema-llm/src/builtins.rs:3764:        if let Some(v) = sema_core::take_resume_value() {
 C07B	crates/sema-llm/src/builtins.rs:379:// `async/timeout` or a pool error-path) still runs to completion and decrements the
-C07A	crates/sema-llm/src/builtins.rs:3811:        if sema_core::in_async_context() {
+C07B	crates/sema-llm/src/builtins.rs:3811:        if sema_core::in_async_context() {
 C07B	crates/sema-llm/src/builtins.rs:3866:            let handle = Rc::new(sema_core::IoHandle::with_abort(
-C07A	crates/sema-llm/src/builtins.rs:3870:                        Err(TryRecvError::Empty) => sema_core::IoPoll::Pending,
-C07A	crates/sema-llm/src/builtins.rs:3886:                            sema_core::IoPoll::Ready(Ok(value))
-C07A	crates/sema-llm/src/builtins.rs:3892:                            sema_core::IoPoll::Ready(Err(e.to_string()))
-C07A	crates/sema-llm/src/builtins.rs:3896:                            sema_core::IoPoll::Ready(Err("rerank: io worker dropped".to_string()))
-C07A	crates/sema-llm/src/builtins.rs:3902:            sema_core::set_yield_signal(sema_core::YieldReason::AwaitIo(handle));
+C07B	crates/sema-llm/src/builtins.rs:3870:                        Err(TryRecvError::Empty) => sema_core::IoPoll::Pending,
+C07B	crates/sema-llm/src/builtins.rs:3886:                            sema_core::IoPoll::Ready(Ok(value))
+C07B	crates/sema-llm/src/builtins.rs:3892:                            sema_core::IoPoll::Ready(Err(e.to_string()))
+C07B	crates/sema-llm/src/builtins.rs:3896:                            sema_core::IoPoll::Ready(Err("rerank: io worker dropped".to_string()))
+C07B	crates/sema-llm/src/builtins.rs:3902:            sema_core::set_yield_signal(sema_core::YieldReason::AwaitIo(handle));
 C07C	crates/sema-llm/src/builtins.rs:4439:            let result = sema_core::call_callback(ctx, pred, &[msg_val])?;
 C07C	crates/sema-llm/src/builtins.rs:4463:            let result = sema_core::call_callback(ctx, func, &[msg_val])?;
-C07A	crates/sema-llm/src/builtins.rs:4553:        if sema_core::in_async_context() {
+C07B	crates/sema-llm/src/builtins.rs:4553:        if sema_core::in_async_context() {
 C07C	crates/sema-llm/src/builtins.rs:4864:                let result = sema_core::call_callback(ctx, func, &[Value::message(msg.clone())])?;
 C07C	crates/sema-llm/src/builtins.rs:4919:            if sema_core::call_callback(ctx, pred, std::slice::from_ref(&msg_val))?.is_truthy() {
 C07C	crates/sema-llm/src/builtins.rs:5176:        let result = sema_core::call_callback(ctx, body_fn, &[]);
@@ -255,36 +255,36 @@ C07C	crates/sema-llm/src/builtins.rs:5264:        let result = sema_core::call_c
 C07C	crates/sema-llm/src/builtins.rs:5299:        let result = sema_core::call_callback(ctx, body_fn, &[]);
 C07C	crates/sema-llm/src/builtins.rs:5372:        let result = sema_core::call_callback(ctx, body_fn, &[]);
 C07C	crates/sema-llm/src/builtins.rs:5691:        let result = sema_core::call_callback(ctx, body_fn, &[]);
-C07A	crates/sema-llm/src/builtins.rs:5738:        if sema_core::in_async_context() {
-C07A	crates/sema-llm/src/builtins.rs:5803:        if sema_core::in_async_context() {
-C07B	crates/sema-llm/src/builtins.rs:5824:        // with the shipped `async/await` pattern.
-C07A	crates/sema-llm/src/builtins.rs:5825:        if let Some(v) = sema_core::take_resume_value() {
+C07B	crates/sema-llm/src/builtins.rs:5738:        if sema_core::in_async_context() {
+C07B	crates/sema-llm/src/builtins.rs:5803:        if sema_core::in_async_context() {
+C07D	crates/sema-llm/src/builtins.rs:5824:        // with the shipped `async/await` pattern.
+C07D	crates/sema-llm/src/builtins.rs:5825:        if let Some(v) = sema_core::take_resume_value() {
 C07D	crates/sema-llm/src/builtins.rs:5851:        let handle = Rc::new(sema_core::IoHandle::new(move || {
-C07A	crates/sema-llm/src/builtins.rs:5854:                Err(TryRecvError::Empty) => sema_core::IoPoll::Pending,
-C07A	crates/sema-llm/src/builtins.rs:5855:                Ok(v) => sema_core::IoPoll::Ready(Ok(Value::int(v))),
-C07A	crates/sema-llm/src/builtins.rs:5857:                    sema_core::IoPoll::Ready(Err("io-sleep-once: worker dropped".to_string()))
-C07A	crates/sema-llm/src/builtins.rs:5861:        sema_core::set_yield_signal(sema_core::YieldReason::AwaitIo(handle));
-C07A	crates/sema-llm/src/builtins.rs:5937:    if sema_core::in_async_context() {
+C07D	crates/sema-llm/src/builtins.rs:5854:                Err(TryRecvError::Empty) => sema_core::IoPoll::Pending,
+C07D	crates/sema-llm/src/builtins.rs:5855:                Ok(v) => sema_core::IoPoll::Ready(Ok(Value::int(v))),
+C07D	crates/sema-llm/src/builtins.rs:5857:                    sema_core::IoPoll::Ready(Err("io-sleep-once: worker dropped".to_string()))
+C07D	crates/sema-llm/src/builtins.rs:5861:        sema_core::set_yield_signal(sema_core::YieldReason::AwaitIo(handle));
+C07B	crates/sema-llm/src/builtins.rs:5937:    if sema_core::in_async_context() {
 C07C	crates/sema-llm/src/builtins.rs:6089:                            sema_core::call_callback(ctx, validate_fn, std::slice::from_ref(val))
 C06	crates/sema-llm/src/builtins.rs:6299:thread_local! {
 C07C	crates/sema-llm/src/builtins.rs:6494:        sema_core::call_callback(ctx, on_text, &[Value::string(chunk)])
-C07A	crates/sema-llm/src/builtins.rs:6531:    if let Some(v) = sema_core::take_resume_value() {
+C07B	crates/sema-llm/src/builtins.rs:6531:    if let Some(v) = sema_core::take_resume_value() {
 C07B	crates/sema-llm/src/builtins.rs:6760:    let handle = Rc::new(sema_core::IoHandle::with_abort(
-C07A	crates/sema-llm/src/builtins.rs:6764:                Err(TryRecvError::Empty) => sema_core::IoPoll::Pending,
-C08	crates/sema-llm/src/builtins.rs:67:/// so they satisfy the `'static` bound required by `thread_local!`.
-C07A	crates/sema-llm/src/builtins.rs:6835:                        return sema_core::IoPoll::Ready(Err(e.to_string()));
-C07A	crates/sema-llm/src/builtins.rs:6839:                        Ok(value) => sema_core::IoPoll::Ready(Ok(value)),
-C07A	crates/sema-llm/src/builtins.rs:6840:                        Err(e) => sema_core::IoPoll::Ready(Err(e.to_string())),
-C07A	crates/sema-llm/src/builtins.rs:6847:                    sema_core::IoPoll::Ready(Err(e.to_string()))
-C07A	crates/sema-llm/src/builtins.rs:6851:                    sema_core::IoPoll::Ready(Err("complete: io worker dropped".to_string()))
-C07A	crates/sema-llm/src/builtins.rs:6857:    sema_core::set_yield_signal(sema_core::YieldReason::AwaitIo(handle));
+C07B	crates/sema-llm/src/builtins.rs:6764:                Err(TryRecvError::Empty) => sema_core::IoPoll::Pending,
+C11	crates/sema-llm/src/builtins.rs:67:/// so they satisfy the `'static` bound required by `thread_local!`.
+C07B	crates/sema-llm/src/builtins.rs:6835:                        return sema_core::IoPoll::Ready(Err(e.to_string()));
+C07B	crates/sema-llm/src/builtins.rs:6839:                        Ok(value) => sema_core::IoPoll::Ready(Ok(value)),
+C07B	crates/sema-llm/src/builtins.rs:6840:                        Err(e) => sema_core::IoPoll::Ready(Err(e.to_string())),
+C07B	crates/sema-llm/src/builtins.rs:6847:                    sema_core::IoPoll::Ready(Err(e.to_string()))
+C07B	crates/sema-llm/src/builtins.rs:6851:                    sema_core::IoPoll::Ready(Err("complete: io worker dropped".to_string()))
+C07B	crates/sema-llm/src/builtins.rs:6857:    sema_core::set_yield_signal(sema_core::YieldReason::AwaitIo(handle));
 C10	crates/sema-llm/src/builtins.rs:7190:thread_local! {
 C07D	crates/sema-llm/src/builtins.rs:7270:/// Synchronous-path loop (the VM thread; provider `block_on` already returned
 C10	crates/sema-llm/src/builtins.rs:7271:/// before the backoff `thread::sleep`); the async wire stage uses the twin
 C10	crates/sema-llm/src/builtins.rs:7294:                        std::thread::sleep(std::time::Duration::from_millis(wait));
 C07D	crates/sema-llm/src/builtins.rs:7714:        // synchronous caller thread (the provider's own block_on has already
-C07A	crates/sema-llm/src/builtins.rs:7719:            std::thread::sleep(std::time::Duration::from_millis(sleep_ms));
-C07A	crates/sema-llm/src/builtins.rs:7735:/// offloaded future, or a `std::thread::sleep` on a pool worker) so sibling
+C10	crates/sema-llm/src/builtins.rs:7719:            std::thread::sleep(std::time::Duration::from_millis(sleep_ms));
+C10	crates/sema-llm/src/builtins.rs:7735:/// offloaded future, or a `std::thread::sleep` on a pool worker) so sibling
 C11	crates/sema-llm/src/builtins.rs:8071:thread_local! {
 C11	crates/sema-llm/src/builtins.rs:8527:    if let Some(v) = sema_core::take_resume_value() {
 C11	crates/sema-llm/src/builtins.rs:8571:    if sema_core::in_async_context() {
@@ -432,13 +432,13 @@ R01A	crates/sema-stdlib/src/async_ops.rs:162:            // native re-runs on re
 R01A	crates/sema-stdlib/src/async_ops.rs:164:                SchedulerTarget::One(promise.clone()),
 R01A	crates/sema-stdlib/src/async_ops.rs:167:            set_yield_signal(YieldReason::AwaitPromise(promise));
 R01A	crates/sema-stdlib/src/async_ops.rs:176:                "async/await: still pending after scheduler run",
-R01A	crates/sema-stdlib/src/async_ops.rs:181:    // async/run — run all pending tasks to completion
-R01A	crates/sema-stdlib/src/async_ops.rs:182:    register_fn_ctx(env, "async/run", |ctx, args| {
-R01A	crates/sema-stdlib/src/async_ops.rs:183:        check_arity!(args, "async/run", 0);
-R01A	crates/sema-stdlib/src/async_ops.rs:184:        if call_run_scheduler(ctx, None)? == SchedulerRunResult::DebugPaused {
-R01A	crates/sema-stdlib/src/async_ops.rs:185:            set_debug_coop_resume(SchedulerTarget::All, DebugCoopResume::Run);
-R01A	crates/sema-stdlib/src/async_ops.rs:188:            // surrogate. `run_cooperative` re-drives `SchedulerTarget::All`.
-R01A	crates/sema-stdlib/src/async_ops.rs:189:            set_yield_signal(YieldReason::Sleep(0));
+R01D	crates/sema-stdlib/src/async_ops.rs:181:    // async/run — run all pending tasks to completion
+R01D	crates/sema-stdlib/src/async_ops.rs:182:    register_fn_ctx(env, "async/run", |ctx, args| {
+R01D	crates/sema-stdlib/src/async_ops.rs:183:        check_arity!(args, "async/run", 0);
+R01D	crates/sema-stdlib/src/async_ops.rs:184:        if call_run_scheduler(ctx, None)? == SchedulerRunResult::DebugPaused {
+R01D	crates/sema-stdlib/src/async_ops.rs:185:            set_debug_coop_resume(SchedulerTarget::All, DebugCoopResume::Run);
+R01D	crates/sema-stdlib/src/async_ops.rs:188:            // surrogate. `run_cooperative` re-drives `SchedulerTarget::All`.
+R01D	crates/sema-stdlib/src/async_ops.rs:189:            set_yield_signal(YieldReason::Sleep(0));
 R01D	crates/sema-stdlib/src/async_ops.rs:244:    // async/cancel — request cancellation of a spawned async task.
 R01D	crates/sema-stdlib/src/async_ops.rs:250:    register_fn(env, "async/cancel", |args| {
 R01D	crates/sema-stdlib/src/async_ops.rs:251:        check_arity!(args, "async/cancel", 1);
@@ -457,7 +457,7 @@ R01A	crates/sema-stdlib/src/async_ops.rs:287:        if call_run_scheduler_all_o
 R01A	crates/sema-stdlib/src/async_ops.rs:291:                SchedulerTarget::AllOf(promises.clone()),
 R01A	crates/sema-stdlib/src/async_ops.rs:300:            set_yield_signal(YieldReason::AwaitPromise(pending));
 R01A	crates/sema-stdlib/src/async_ops.rs:312:                return Err(SemaError::eval(format!("async/all: task rejected: {e}")));
-R01D	crates/sema-stdlib/src/async_ops.rs:317:                return Err(SemaError::eval("async/all: task was cancelled"));
+R01A	crates/sema-stdlib/src/async_ops.rs:317:                return Err(SemaError::eval("async/all: task was cancelled"));
 R01A	crates/sema-stdlib/src/async_ops.rs:328:                    return Err(SemaError::eval("async/all: task still pending"))
 R01A	crates/sema-stdlib/src/async_ops.rs:32:/// Format a normal task rejection as an `async/await` error, stripping
 R01A	crates/sema-stdlib/src/async_ops.rs:335:    // async/race — run scheduler and return the first resolved promise's value
@@ -485,12 +485,12 @@ R01A	crates/sema-stdlib/src/async_ops.rs:40:    SemaError::eval(format!("async/a
 R01B	crates/sema-stdlib/src/async_ops.rs:415:                        "async/timeout: task rejected: {e}"
 R01B	crates/sema-stdlib/src/async_ops.rs:419:                    return Err(SemaError::eval("async/timeout: task was cancelled"))
 R01B	crates/sema-stdlib/src/async_ops.rs:426:        match call_run_scheduler_timeout(ctx, promise.clone(), ms as u64)? {
-R01A	crates/sema-stdlib/src/async_ops.rs:427:            SchedulerRunResult::TimedOut => {
+R01B	crates/sema-stdlib/src/async_ops.rs:427:            SchedulerRunResult::TimedOut => {
 R01B	crates/sema-stdlib/src/async_ops.rs:428:                return Err(SemaError::eval("async/timeout: operation timed out"));
-R01A	crates/sema-stdlib/src/async_ops.rs:430:            SchedulerRunResult::DebugPaused => {
-R01A	crates/sema-stdlib/src/async_ops.rs:433:                    SchedulerTarget::One(promise.clone()),
-R01A	crates/sema-stdlib/src/async_ops.rs:436:                set_yield_signal(YieldReason::AwaitPromise(promise));
-R01A	crates/sema-stdlib/src/async_ops.rs:439:            SchedulerRunResult::Complete => {}
+R01B	crates/sema-stdlib/src/async_ops.rs:430:            SchedulerRunResult::DebugPaused => {
+R01B	crates/sema-stdlib/src/async_ops.rs:433:                    SchedulerTarget::One(promise.clone()),
+R01B	crates/sema-stdlib/src/async_ops.rs:436:                set_yield_signal(YieldReason::AwaitPromise(promise));
+R01B	crates/sema-stdlib/src/async_ops.rs:439:            SchedulerRunResult::Complete => {}
 R01B	crates/sema-stdlib/src/async_ops.rs:449:                        "async/timeout: task rejected: {e}"
 R01B	crates/sema-stdlib/src/async_ops.rs:453:                    return Err(SemaError::eval("async/timeout: task was cancelled"))
 R01B	crates/sema-stdlib/src/async_ops.rs:460:            "async/timeout: operation is still pending after scheduler run",
@@ -501,30 +501,30 @@ R01B	crates/sema-stdlib/src/async_ops.rs:467:        let ms = duration_ms(&args[
 R01B	crates/sema-stdlib/src/async_ops.rs:470:                "async/sleep: duration must be non-negative",
 R01B	crates/sema-stdlib/src/async_ops.rs:473:        // Cap the duration (mirrors async/timeout). The scheduler's virtual
 R01B	crates/sema-stdlib/src/async_ops.rs:475:        // that whole delta in one `thread::sleep`; without a bound an
-R01D	crates/sema-stdlib/src/async_ops.rs:47:    SemaError::eval("async/await: task was cancelled")
+R01A	crates/sema-stdlib/src/async_ops.rs:47:    SemaError::eval("async/await: task was cancelled")
 R01B	crates/sema-stdlib/src/async_ops.rs:481:                "async/sleep: duration {ms} ms exceeds maximum {MAX_SLEEP_MS} ms (1 day)"
-R01A	crates/sema-stdlib/src/async_ops.rs:485:        if in_async_context() {
-R01A	crates/sema-stdlib/src/async_ops.rs:486:            if let Some(cached) = take_resume_value() {
-R01A	crates/sema-stdlib/src/async_ops.rs:489:            set_yield_signal(YieldReason::Sleep(ms as u64));
-R01D	crates/sema-stdlib/src/async_ops.rs:48:        .with_hint("the task was cancelled via async/cancel before it produced a value")
+R01B	crates/sema-stdlib/src/async_ops.rs:485:        if in_async_context() {
+R01B	crates/sema-stdlib/src/async_ops.rs:486:            if let Some(cached) = take_resume_value() {
+R01B	crates/sema-stdlib/src/async_ops.rs:489:            set_yield_signal(YieldReason::Sleep(ms as u64));
+R01A	crates/sema-stdlib/src/async_ops.rs:48:        .with_hint("the task was cancelled via async/cancel before it produced a value")
 R01B	crates/sema-stdlib/src/async_ops.rs:494:        std::thread::sleep(std::time::Duration::from_millis(ms as u64));
 R01C	crates/sema-stdlib/src/async_ops.rs:523:    // channel/send — send a value to a channel (yields if full in async context)
 R01C	crates/sema-stdlib/src/async_ops.rs:524:    register_fn(env, "channel/send", |args| {
 R01C	crates/sema-stdlib/src/async_ops.rs:525:        check_arity!(args, "channel/send", 2);
 R01C	crates/sema-stdlib/src/async_ops.rs:526:        let ch = expect_channel(args, "channel/send", 0)?;
 R01C	crates/sema-stdlib/src/async_ops.rs:529:                "channel/send: channel is closed; value {} was dropped",
-R01A	crates/sema-stdlib/src/async_ops.rs:533:        if in_async_context() {
-R01A	crates/sema-stdlib/src/async_ops.rs:534:            if let Some(cached) = take_resume_value() {
-R01A	crates/sema-stdlib/src/async_ops.rs:541:            if in_async_context() {
+R01C	crates/sema-stdlib/src/async_ops.rs:533:        if in_async_context() {
+R01C	crates/sema-stdlib/src/async_ops.rs:534:            if let Some(cached) = take_resume_value() {
+R01C	crates/sema-stdlib/src/async_ops.rs:541:            if in_async_context() {
 R01C	crates/sema-stdlib/src/async_ops.rs:542:                set_yield_signal(YieldReason::ChannelSend(ch, args[1].clone()));
 R01C	crates/sema-stdlib/src/async_ops.rs:546:                SemaError::eval("channel/send: channel is full").with_hint(
 R01C	crates/sema-stdlib/src/async_ops.rs:555:    // channel/recv — receive a value from a channel (yields if empty in async context)
 R01C	crates/sema-stdlib/src/async_ops.rs:556:    register_fn(env, "channel/recv", |args| {
 R01C	crates/sema-stdlib/src/async_ops.rs:557:        check_arity!(args, "channel/recv", 1);
 R01C	crates/sema-stdlib/src/async_ops.rs:558:        let ch = expect_channel(args, "channel/recv", 0)?;
-R01A	crates/sema-stdlib/src/async_ops.rs:559:        if in_async_context() {
-R01A	crates/sema-stdlib/src/async_ops.rs:560:            if let Some(cached) = take_resume_value() {
-R01A	crates/sema-stdlib/src/async_ops.rs:572:        if in_async_context() {
+R01C	crates/sema-stdlib/src/async_ops.rs:559:        if in_async_context() {
+R01C	crates/sema-stdlib/src/async_ops.rs:560:            if let Some(cached) = take_resume_value() {
+R01C	crates/sema-stdlib/src/async_ops.rs:572:        if in_async_context() {
 R01C	crates/sema-stdlib/src/async_ops.rs:573:            set_yield_signal(YieldReason::ChannelRecv(ch));
 R01C	crates/sema-stdlib/src/async_ops.rs:576:        Err(SemaError::eval("channel/recv: channel is empty"))
 R01A	crates/sema-stdlib/src/async_ops.rs:6:    call_run_scheduler, call_run_scheduler_all_of, call_run_scheduler_any_of,
@@ -579,7 +579,7 @@ R07A	crates/sema-stdlib/src/http.rs:335:            Ok(Ok(raw)) => sema_core::Io
 R07A	crates/sema-stdlib/src/http.rs:340:            Ok(Err(msg)) => sema_core::IoPoll::Ready(Err(msg)),
 R07A	crates/sema-stdlib/src/http.rs:342:                sema_core::IoPoll::Ready(Err("http: request worker dropped".to_string()))
 R07A	crates/sema-stdlib/src/http.rs:347:    sema_core::set_yield_signal(sema_core::YieldReason::AwaitIo(handle));
-R07B	crates/sema-stdlib/src/http.rs:98:/// `reqwest::RequestBuilder`. Shared by both the synchronous `block_on` path and
+R07A	crates/sema-stdlib/src/http.rs:98:/// `reqwest::RequestBuilder`. Shared by both the synchronous `block_on` path and
 R08A	crates/sema-stdlib/src/io.rs:1037:/// Used by the `file/*` builtins when running inside an `async/spawn`'d task,
 R08A	crates/sema-stdlib/src/io.rs:1047:/// No abort hook (`IoHandle::new`): unlike a subprocess or an HTTP round-trip
 R08A	crates/sema-stdlib/src/io.rs:1064:    // symmetry with the shipped `async/await` yield pattern.
@@ -598,7 +598,7 @@ R08A	crates/sema-stdlib/src/io.rs:1125:            Err(e) => sema_core::IoPoll::
 R08A	crates/sema-stdlib/src/io.rs:1127:        Ok(Err(msg)) => sema_core::IoPoll::Ready(Err(msg)),
 R08A	crates/sema-stdlib/src/io.rs:1129:            sema_core::IoPoll::Ready(Err("file: worker dropped".to_string()))
 R08A	crates/sema-stdlib/src/io.rs:1132:    sema_core::set_yield_signal(sema_core::YieldReason::AwaitIo(handle));
-R08A	crates/sema-stdlib/src/io.rs:1145:// chunk is offloaded — repeating via a hand-rolled `IoHandle` poll closure
+R08B	crates/sema-stdlib/src/io.rs:1145:// chunk is offloaded — repeating via a hand-rolled `IoHandle` poll closure
 R08C	crates/sema-stdlib/src/io.rs:11:thread_local! {
 R08B	crates/sema-stdlib/src/io.rs:1290:    if let Some(v) = sema_core::take_resume_value() {
 R08B	crates/sema-stdlib/src/io.rs:1297:    let poll = move || -> sema_core::IoPoll {
@@ -683,7 +683,7 @@ R09B	crates/sema-stdlib/src/kv.rs:29://! own flush — all under the one `IoHand
 R09B	crates/sema-stdlib/src/kv.rs:302:                                IoPoll::Ready(Ok(decode_fn(r)))
 R09B	crates/sema-stdlib/src/kv.rs:304:                            Err(msg) => IoPoll::Ready(Err(msg)),
 R09B	crates/sema-stdlib/src/kv.rs:317:                        IoPoll::Ready(Err(format!("{op_name}: flush worker dropped")))
-R09A	crates/sema-stdlib/src/kv.rs:326:    let io_handle = Rc::new(IoHandle::with_abort(poll, move || {
+R09B	crates/sema-stdlib/src/kv.rs:326:    let io_handle = Rc::new(IoHandle::with_abort(poll, move || {
 R09B	crates/sema-stdlib/src/kv.rs:342:    sema_core::set_yield_signal(sema_core::YieldReason::AwaitIo(io_handle));
 R09B	crates/sema-stdlib/src/kv.rs:364:            if in_async_context() {
 R09B	crates/sema-stdlib/src/kv.rs:42:use sema_core::{check_arity, in_async_context, IoHandle, IoPoll, SemaError, Value};
@@ -844,23 +844,23 @@ R14	crates/sema-stdlib/src/serial.rs:637:                IoPoll::Pending => {
 R14	crates/sema-stdlib/src/serial.rs:642:                    std::thread::sleep(std::time::Duration::from_millis(2));
 R14	crates/sema-stdlib/src/serial.rs:78:thread_local! {
 R14	crates/sema-stdlib/src/serial.rs:8://! VM thread for the operation's whole duration. Inside an `async/spawn`'d
-R15B	crates/sema-stdlib/src/server.rs:1184:        while let Some(msg) = outgoing_rx.recv().await {
+R15A	crates/sema-stdlib/src/server.rs:1184:        while let Some(msg) = outgoing_rx.recv().await {
 R15A	crates/sema-stdlib/src/server.rs:1261:/// `block_on`) that panicked when the channel was bounded + `blocking_send`.
 R15B	crates/sema-stdlib/src/server.rs:1285:    use sema_core::call_callback;
-R15A	crates/sema-stdlib/src/server.rs:1294:    // evaluator thread and may `send` from inside a provider's block_on (e.g.
+R15B	crates/sema-stdlib/src/server.rs:1294:    // evaluator thread and may `send` from inside a provider's block_on (e.g.
 R15B	crates/sema-stdlib/src/server.rs:1308:    match call_callback(ctx, &stream_handler, &[send_fn]) {
 R15B	crates/sema-stdlib/src/server.rs:1323:    use sema_core::{call_callback, NativeFn};
 R15B	crates/sema-stdlib/src/server.rs:1347:    // NOTE: `ws/send`/`ws/recv` below use bounded blocking_send/blocking_recv,
-R15A	crates/sema-stdlib/src/server.rs:1350:    // callback fires inside the provider's block_on) would hit the same "block
+R15B	crates/sema-stdlib/src/server.rs:1350:    // callback fires inside the provider's block_on) would hit the same "block
 R15B	crates/sema-stdlib/src/server.rs:1384:            match rx.blocking_recv() {
 R15B	crates/sema-stdlib/src/server.rs:1419:    match call_callback(ctx, &ws_handler, &[conn]) {
 R15B	crates/sema-stdlib/src/server.rs:1454:    use sema_core::call_callback;
 R15B	crates/sema-stdlib/src/server.rs:1457:    // (`rx.blocking_recv()` in the dispatch loop) for the life of the server —
-R15A	crates/sema-stdlib/src/server.rs:1459:    // do again. Inside `async/spawn` that thread IS the VM thread the
-R15A	crates/sema-stdlib/src/server.rs:1467:    if sema_core::in_async_context() {
-R15A	crates/sema-stdlib/src/server.rs:1472:        // (no async/spawn) — the CLI's error reporter prints `.hint()`
-R15A	crates/sema-stdlib/src/server.rs:1473:        // separately. `async/await`ing a rejected task only sees this message.
-R15A	crates/sema-stdlib/src/server.rs:1475:            "http/serve runs a blocking accept loop; it cannot be started inside async/spawn or \
+R15B	crates/sema-stdlib/src/server.rs:1459:    // do again. Inside `async/spawn` that thread IS the VM thread the
+R15B	crates/sema-stdlib/src/server.rs:1467:    if sema_core::in_async_context() {
+R15B	crates/sema-stdlib/src/server.rs:1472:        // (no async/spawn) — the CLI's error reporter prints `.hint()`
+R15B	crates/sema-stdlib/src/server.rs:1473:        // separately. `async/await`ing a rejected task only sees this message.
+R15B	crates/sema-stdlib/src/server.rs:1475:            "http/serve runs a blocking accept loop; it cannot be started inside async/spawn or \
 R15B	crates/sema-stdlib/src/server.rs:1585:    let actual_port = match ready_rx.recv() {
 R15B	crates/sema-stdlib/src/server.rs:1610:        if let Err(e) = call_callback(ctx, cb, &[Value::map(info)]) {
 R15B	crates/sema-stdlib/src/server.rs:1619:    // at a time on the evaluator thread before looping back to `blocking_recv`
@@ -928,13 +928,13 @@ R16A	crates/sema-stdlib/src/sqlite.rs:574:            if in_async_context() {
 R16A	crates/sema-stdlib/src/sqlite.rs:609:        if in_async_context() {
 R16A	crates/sema-stdlib/src/sqlite.rs:647:            if in_async_context() {
 R16A	crates/sema-stdlib/src/sqlite.rs:69:thread_local! {
-R16A	crates/sema-stdlib/src/sqlite.rs:702:            if in_async_context() {
+R16B	crates/sema-stdlib/src/sqlite.rs:702:            if in_async_context() {
 R16A	crates/sema-stdlib/src/sqlite.rs:8://! thread for the operation's whole duration. Inside an `async/spawn`'d task
 R17A	crates/sema-stdlib/src/stream.rs:1044:        if !in_async_context() {
 R17A	crates/sema-stdlib/src/stream.rs:1139:        if !in_async_context() || stream.stream_type() != "file-output" {
 R17A	crates/sema-stdlib/src/stream.rs:1165:        if !in_async_context() || stream.stream_type() != "file-output" {
 R17A	crates/sema-stdlib/src/stream.rs:1190:        if !in_async_context() || stream.stream_type() != "file-output" {
-R17A	crates/sema-stdlib/src/stream.rs:1231:        if !in_async_context() {
+R17B	crates/sema-stdlib/src/stream.rs:1231:        if !in_async_context() {
 R17A	crates/sema-stdlib/src/stream.rs:1361:        if in_async_context() {
 R17A	crates/sema-stdlib/src/stream.rs:1377:        if in_async_context() {
 R17A	crates/sema-stdlib/src/stream.rs:1536:/// force `sema_core::in_async_context()` on, call the native, then poll the
@@ -955,7 +955,7 @@ R17A	crates/sema-stdlib/src/stream.rs:735:                        Ok(None) => re
 R17A	crates/sema-stdlib/src/stream.rs:736:                        Err(msg) => return IoPoll::Ready(Err(msg)),
 R17A	crates/sema-stdlib/src/stream.rs:760:                        Err(TryRecvError::Empty) => IoPoll::Pending,
 R17A	crates/sema-stdlib/src/stream.rs:772:                                    Ok(v) => IoPoll::Ready(Ok(v)),
-R17B	crates/sema-stdlib/src/stream.rs:773:                                    Err(e) => IoPoll::Ready(Err(e.to_string())),
+R17A	crates/sema-stdlib/src/stream.rs:773:                                    Err(e) => IoPoll::Ready(Err(e.to_string())),
 R17A	crates/sema-stdlib/src/stream.rs:775:                                Err(msg) => IoPoll::Ready(Err(msg)),
 R17A	crates/sema-stdlib/src/stream.rs:781:                            IoPoll::Ready(Err(format!("{op_name}: I/O worker dropped")))
 R17A	crates/sema-stdlib/src/stream.rs:789:        let io_handle = Rc::new(IoHandle::with_abort(poll, move || {
@@ -963,7 +963,7 @@ R17A	crates/sema-stdlib/src/stream.rs:793:            // `IoHandle::with_abort`'
 R17A	crates/sema-stdlib/src/stream.rs:804:        sema_core::set_yield_signal(sema_core::YieldReason::AwaitIo(io_handle));
 R17A	crates/sema-stdlib/src/stream.rs:8://! stream they were handed is file-backed AND `in_async_context()` before
 R17A	crates/sema-stdlib/src/stream.rs:931:        if !in_async_context() {
-R17A	crates/sema-stdlib/src/stream.rs:985:        if !in_async_context() {
+R17C	crates/sema-stdlib/src/stream.rs:985:        if !in_async_context() {
 R22B	crates/sema-stdlib/src/string.rs:140:thread_local! {
 R18A	crates/sema-stdlib/src/system.rs:180:    // symmetry with the shipped `async/await` yield pattern.
 R18A	crates/sema-stdlib/src/system.rs:181:    if let Some(v) = sema_core::take_resume_value() {
@@ -972,18 +972,18 @@ R18A	crates/sema-stdlib/src/system.rs:254:            Err(TryRecvError::Empty) =
 R18A	crates/sema-stdlib/src/system.rs:257:                sema_core::IoPoll::Ready(Ok(shell_output_value(
 R18A	crates/sema-stdlib/src/system.rs:265:                sema_core::IoPoll::Ready(Err(msg))
 R18A	crates/sema-stdlib/src/system.rs:269:                sema_core::IoPoll::Ready(Err("shell: subprocess worker dropped".to_string()))
-R18B	crates/sema-stdlib/src/system.rs:290:    sema_core::set_yield_signal(sema_core::YieldReason::AwaitIo(handle));
+R18A	crates/sema-stdlib/src/system.rs:290:    sema_core::set_yield_signal(sema_core::YieldReason::AwaitIo(handle));
 R18A	crates/sema-stdlib/src/system.rs:341:        // Inside an `async/spawn`'d task: offload the subprocess onto the
 R18A	crates/sema-stdlib/src/system.rs:345:        if sema_core::in_async_context() {
 R18C	crates/sema-stdlib/src/system.rs:416:        // every sibling task. Yield exactly like `async/sleep` (async_ops.rs)
-R18A	crates/sema-stdlib/src/system.rs:419:        if in_async_context() {
-R18A	crates/sema-stdlib/src/system.rs:420:            if let Some(cached) = take_resume_value() {
-R18B	crates/sema-stdlib/src/system.rs:423:            set_yield_signal(YieldReason::Sleep(ms as u64));
+R18C	crates/sema-stdlib/src/system.rs:419:        if in_async_context() {
+R18C	crates/sema-stdlib/src/system.rs:420:            if let Some(cached) = take_resume_value() {
+R18C	crates/sema-stdlib/src/system.rs:423:            set_yield_signal(YieldReason::Sleep(ms as u64));
 R18C	crates/sema-stdlib/src/system.rs:427:        std::thread::sleep(std::time::Duration::from_millis(ms as u64));
-R18A	crates/sema-stdlib/src/system.rs:48:thread_local! {
-R18A	crates/sema-stdlib/src/system.rs:750:                        sema_core::call_callback(ctx, cb, &[])?;
-R18B	crates/sema-stdlib/src/system.rs:7:    check_arity, in_async_context, set_yield_signal, take_resume_value, Caps, SemaError, Value,
-R18A	crates/sema-stdlib/src/system.rs:8:    YieldReason,
+R18B	crates/sema-stdlib/src/system.rs:48:thread_local! {
+R18B	crates/sema-stdlib/src/system.rs:750:                        sema_core::call_callback(ctx, cb, &[])?;
+R18C	crates/sema-stdlib/src/system.rs:7:    check_arity, in_async_context, set_yield_signal, take_resume_value, Caps, SemaError, Value,
+R18C	crates/sema-stdlib/src/system.rs:8:    YieldReason,
 R19	crates/sema-stdlib/src/terminal.rs:186:                std::thread::sleep(std::time::Duration::from_millis(SPINNER_INTERVAL_MS));
 R19	crates/sema-stdlib/src/terminal.rs:240:        if in_async_context() {
 R19	crates/sema-stdlib/src/terminal.rs:37:thread_local! {
@@ -1002,7 +1002,7 @@ R19	crates/sema-stdlib/src/terminal.rs:8:use sema_core::{check_arity, in_async_c
 R23B	crates/sema-stdlib/src/workflow_mcp.rs:473:thread_local! {
 R20A	crates/sema-stdlib/src/ws.rs:11://! channel. Top-level ops block the VM thread; ops inside an `async/spawn` task
 R20A	crates/sema-stdlib/src/ws.rs:24:use sema_core::{check_arity, Caps, IoHandle, IoPoll, SemaError, SemaStream, StreamBox, Value};
-R20B	crates/sema-stdlib/src/ws.rs:328:            cmd = cmd_rx.recv() => match cmd {
+R20A	crates/sema-stdlib/src/ws.rs:328:            cmd = cmd_rx.recv() => match cmd {
 R20A	crates/sema-stdlib/src/ws.rs:389:    if let Some(v) = sema_core::take_resume_value() {
 R20A	crates/sema-stdlib/src/ws.rs:410:    if sema_core::in_async_context() {
 R20A	crates/sema-stdlib/src/ws.rs:413:        let handle = Rc::new(IoHandle::with_abort(
@@ -1044,28 +1044,28 @@ C16	crates/sema-vm/src/lower.rs:13:thread_local! {
 C16	crates/sema-vm/src/lower.rs:298:thread_local! {
 C16	crates/sema-vm/src/lower.rs:301:    /// `Spur` ids are only meaningful within the `thread_local!` interner that
 C16	crates/sema-vm/src/lower.rs:364:    thread_local! {
-F23	crates/sema-vm/src/scheduler.rs:1014:                // `async/timeout` deadline, B3). We re-check Ready each pass
-F23	crates/sema-vm/src/scheduler.rs:1021:                    .any(|t| matches!(t.state, TaskState::Blocked(YieldReason::AwaitIo(_))));
-F23	crates/sema-vm/src/scheduler.rs:1033:                    // this and starved any concurrent `async/sleep` sleeper
-F23	crates/sema-vm/src/scheduler.rs:1034:                    // (#2) and disabled `async/timeout` (#3) for the duration of
-F23	crates/sema-vm/src/scheduler.rs:1044:                        .filter(|t| matches!(t.state, TaskState::Blocked(YieldReason::Sleep(_))))
-F23	crates/sema-vm/src/scheduler.rs:1067:                    // reached the `async/timeout` deadline with the target still
-F23	crates/sema-vm/src/scheduler.rs:1070:                        if let SchedulerTarget::Timeout(p, _) = target {
-F23	crates/sema-vm/src/scheduler.rs:1073:                        return Ok(SchedulerRunResult::TimedOut);
-F23	crates/sema-vm/src/scheduler.rs:1080:                // wake time, clamped by any `async/timeout` deadline. Jumping to
-F23	crates/sema-vm/src/scheduler.rs:1088:                    .filter(|t| matches!(t.state, TaskState::Blocked(YieldReason::Sleep(_))))
+F25	crates/sema-vm/src/scheduler.rs:1014:                // `async/timeout` deadline, B3). We re-check Ready each pass
+F25	crates/sema-vm/src/scheduler.rs:1021:                    .any(|t| matches!(t.state, TaskState::Blocked(YieldReason::AwaitIo(_))));
+F25	crates/sema-vm/src/scheduler.rs:1033:                    // this and starved any concurrent `async/sleep` sleeper
+F25	crates/sema-vm/src/scheduler.rs:1034:                    // (#2) and disabled `async/timeout` (#3) for the duration of
+F25	crates/sema-vm/src/scheduler.rs:1044:                        .filter(|t| matches!(t.state, TaskState::Blocked(YieldReason::Sleep(_))))
+F25	crates/sema-vm/src/scheduler.rs:1067:                    // reached the `async/timeout` deadline with the target still
+F25	crates/sema-vm/src/scheduler.rs:1070:                        if let SchedulerTarget::Timeout(p, _) = target {
+F25	crates/sema-vm/src/scheduler.rs:1073:                        return Ok(SchedulerRunResult::TimedOut);
+F25	crates/sema-vm/src/scheduler.rs:1080:                // wake time, clamped by any `async/timeout` deadline. Jumping to
+F25	crates/sema-vm/src/scheduler.rs:1088:                    .filter(|t| matches!(t.state, TaskState::Blocked(YieldReason::Sleep(_))))
 F23	crates/sema-vm/src/scheduler.rs:10://! and return `Ok(Value::nil())`. The VM checks `take_yield_signal()` after
-F26	crates/sema-vm/src/scheduler.rs:1101:                    // Worker installs a blocking-sleep callback (Atomics.wait on
-F23	crates/sema-vm/src/scheduler.rs:1103:                    // `delta` is bounded ≤ ~1 day by the async/sleep +
-F23	crates/sema-vm/src/scheduler.rs:1104:                    // async/timeout caps, so it can never wedge for years.
-F23	crates/sema-vm/src/scheduler.rs:1116:                        if let SchedulerTarget::Timeout(p, _) = target {
-F23	crates/sema-vm/src/scheduler.rs:1119:                        return Ok(SchedulerRunResult::TimedOut);
-F23	crates/sema-vm/src/scheduler.rs:1129:            return Ok(SchedulerRunResult::Complete);
-F23	crates/sema-vm/src/scheduler.rs:1134:        // async/spawn and async/await inside the task VM to access the
+F25	crates/sema-vm/src/scheduler.rs:1101:                    // Worker installs a blocking-sleep callback (Atomics.wait on
+F25	crates/sema-vm/src/scheduler.rs:1103:                    // `delta` is bounded ≤ ~1 day by the async/sleep +
+F25	crates/sema-vm/src/scheduler.rs:1104:                    // async/timeout caps, so it can never wedge for years.
+F25	crates/sema-vm/src/scheduler.rs:1116:                        if let SchedulerTarget::Timeout(p, _) = target {
+F25	crates/sema-vm/src/scheduler.rs:1119:                        return Ok(SchedulerRunResult::TimedOut);
+F25	crates/sema-vm/src/scheduler.rs:1129:            return Ok(SchedulerRunResult::Complete);
+F26	crates/sema-vm/src/scheduler.rs:1134:        // async/spawn and async/await inside the task VM to access the
 F26	crates/sema-vm/src/scheduler.rs:1144:        let mut task = sched.tasks.remove(idx);
-F23	crates/sema-vm/src/scheduler.rs:1159:        // that nested async/spawn etc. reach it through `take_scheduler`. A
-F23	crates/sema-vm/src/scheduler.rs:1205:        let prev_async = in_async_context();
-F23	crates/sema-vm/src/scheduler.rs:1256:            return Ok(SchedulerRunResult::DebugPaused);
+F26	crates/sema-vm/src/scheduler.rs:1159:        // that nested async/spawn etc. reach it through `take_scheduler`. A
+F26	crates/sema-vm/src/scheduler.rs:1205:        let prev_async = in_async_context();
+F25	crates/sema-vm/src/scheduler.rs:1256:            return Ok(SchedulerRunResult::DebugPaused);
 F27	crates/sema-vm/src/scheduler.rs:1265:/// Cancel callback registered via `sema_core::set_cancel_callback`.
 F27	crates/sema-vm/src/scheduler.rs:1267:/// Called by the `async/cancel` stdlib function. Takes the scheduler
 F24	crates/sema-vm/src/scheduler.rs:1293:    set_spawn_callback(spawn_callback);
@@ -1082,73 +1082,73 @@ F23	crates/sema-vm/src/scheduler.rs:222:                    YieldReason::Channel
 F23	crates/sema-vm/src/scheduler.rs:232:                    YieldReason::ChannelSend(ch, val) => {
 F23	crates/sema-vm/src/scheduler.rs:235:                                "channel/send: closed while sending {val}; value dropped (send was pending)"
 F23	crates/sema-vm/src/scheduler.rs:247:                    YieldReason::Sleep(ms) => {
-F25	crates/sema-vm/src/scheduler.rs:251:                        // `run_until_reentrant`), so a shorter sleep always
+F23	crates/sema-vm/src/scheduler.rs:251:                        // `run_until_reentrant`), so a shorter sleep always
 F23	crates/sema-vm/src/scheduler.rs:261:                    YieldReason::AwaitIo(h) => match h.poll() {
-F25	crates/sema-vm/src/scheduler.rs:264:                        // `run_until_reentrant` (on `io_park`), never here.
+F23	crates/sema-vm/src/scheduler.rs:264:                        // `run_until_reentrant` (on `io_park`), never here.
 F23	crates/sema-vm/src/scheduler.rs:265:                        sema_core::IoPoll::Pending => WakeAction::Pending,
 F23	crates/sema-vm/src/scheduler.rs:266:                        sema_core::IoPoll::Ready(Ok(v)) => WakeAction::Resume(v),
 F23	crates/sema-vm/src/scheduler.rs:267:                        sema_core::IoPoll::Ready(Err(msg)) => WakeAction::Fail(msg),
-F23	crates/sema-vm/src/scheduler.rs:291:    /// spawned before an `(async/all …)` of the other stages, then `(await
-F23	crates/sema-vm/src/scheduler.rs:293:    /// those programs with "async/await: still pending after scheduler run".
-F23	crates/sema-vm/src/scheduler.rs:296:    /// thread-locals are still alive — is what prevents a span-owning `IoHandle`
-F23	crates/sema-vm/src/scheduler.rs:297:    /// (e.g. an `llm/embed` abandoned by `async/timeout`) from surviving to
-F23	crates/sema-vm/src/scheduler.rs:302:    /// (dropping its span-owning `IoHandle` right then) so this prune can collect
-F23	crates/sema-vm/src/scheduler.rs:315:    /// span-owning `IoHandle` before teardown (adversarial #7).
-F23	crates/sema-vm/src/scheduler.rs:322:            TaskState::Blocked(YieldReason::AwaitIo(h)) => {
-F23	crates/sema-vm/src/scheduler.rs:328:            TaskState::Blocked(YieldReason::AwaitPromise(p)) => Some(p.clone()),
-F23	crates/sema-vm/src/scheduler.rs:345:    /// indirection — `(async/await (async/spawn (fn () (http/get …))))` — would leave
+F27	crates/sema-vm/src/scheduler.rs:291:    /// spawned before an `(async/all …)` of the other stages, then `(await
+F27	crates/sema-vm/src/scheduler.rs:293:    /// those programs with "async/await: still pending after scheduler run".
+F27	crates/sema-vm/src/scheduler.rs:296:    /// thread-locals are still alive — is what prevents a span-owning `IoHandle`
+F27	crates/sema-vm/src/scheduler.rs:297:    /// (e.g. an `llm/embed` abandoned by `async/timeout`) from surviving to
+F27	crates/sema-vm/src/scheduler.rs:302:    /// (dropping its span-owning `IoHandle` right then) so this prune can collect
+F27	crates/sema-vm/src/scheduler.rs:315:    /// span-owning `IoHandle` before teardown (adversarial #7).
+F27	crates/sema-vm/src/scheduler.rs:322:            TaskState::Blocked(YieldReason::AwaitIo(h)) => {
+F27	crates/sema-vm/src/scheduler.rs:328:            TaskState::Blocked(YieldReason::AwaitPromise(p)) => Some(p.clone()),
+F27	crates/sema-vm/src/scheduler.rs:345:    /// indirection — `(async/await (async/spawn (fn () (http/get …))))` — would leave
 F27	crates/sema-vm/src/scheduler.rs:349:    /// transitioned (for `async/cancel`'s bool result).
 F23	crates/sema-vm/src/scheduler.rs:34:    Blocked(YieldReason),
-F23	crates/sema-vm/src/scheduler.rs:379:    /// Cancel the task whose promise is `target` — the victim of an `async/timeout`
+F27	crates/sema-vm/src/scheduler.rs:379:    /// Cancel the task whose promise is `target` — the victim of an `async/timeout`
 F27	crates/sema-vm/src/scheduler.rs:387:    /// On an `async/all`/`async/race` short-circuit, transitively cancel the
-F23	crates/sema-vm/src/scheduler.rs:388:    /// combinator's OWN still-pending siblings. When `async/all` rejects (or
-F23	crates/sema-vm/src/scheduler.rs:389:    /// `async/race` settles) the remaining in-flight members are abandoned: without
-F23	crates/sema-vm/src/scheduler.rs:391:    /// span-owning `IoHandle` can strand to teardown and abort the process
+F27	crates/sema-vm/src/scheduler.rs:388:    /// combinator's OWN still-pending siblings. When `async/all` rejects (or
+F27	crates/sema-vm/src/scheduler.rs:389:    /// `async/race` settles) the remaining in-flight members are abandoned: without
+F27	crates/sema-vm/src/scheduler.rs:391:    /// span-owning `IoHandle` can strand to teardown and abort the process
 F27	crates/sema-vm/src/scheduler.rs:394:    fn cancel_abandoned_combinator_siblings(&mut self, target: &SchedulerTarget) {
-F23	crates/sema-vm/src/scheduler.rs:395:        let (SchedulerTarget::AllOf(promises) | SchedulerTarget::AnyOf(promises)) = target else {
+F27	crates/sema-vm/src/scheduler.rs:395:        let (SchedulerTarget::AllOf(promises) | SchedulerTarget::AnyOf(promises)) = target else {
 F23	crates/sema-vm/src/scheduler.rs:430:thread_local! {
 F27	crates/sema-vm/src/scheduler.rs:437:/// stranded `AwaitIo` task (e.g. an embed abandoned by `async/timeout`) was reaped
 F23	crates/sema-vm/src/scheduler.rs:4://! cooperatively via the `YieldReason` signal mechanism defined in `sema_core::async_signal`.
 F24	crates/sema-vm/src/scheduler.rs:511:/// Spawn callback registered via `sema_core::set_spawn_callback`.
-F23	crates/sema-vm/src/scheduler.rs:513:/// Called by the `async/spawn` stdlib function. Takes the scheduler
-F23	crates/sema-vm/src/scheduler.rs:529:/// yield points (channel/send, channel/recv, await, sleep) can suspend
-F23	crates/sema-vm/src/scheduler.rs:606:    let target = sema_core::SchedulerTarget::One(promise.clone());
-F25	crates/sema-vm/src/scheduler.rs:607:    let mut run_result = run_until_reentrant(&mut sched, ctx, &target);
-F23	crates/sema-vm/src/scheduler.rs:609:    while matches!(run_result, Ok(SchedulerRunResult::DebugPaused)) {
-F25	crates/sema-vm/src/scheduler.rs:622:        run_result = run_until_reentrant(&mut sched, ctx, &target);
+F24	crates/sema-vm/src/scheduler.rs:513:/// Called by the `async/spawn` stdlib function. Takes the scheduler
+F24	crates/sema-vm/src/scheduler.rs:529:/// yield points (channel/send, channel/recv, await, sleep) can suspend
+F24	crates/sema-vm/src/scheduler.rs:606:    let target = sema_core::SchedulerTarget::One(promise.clone());
+F24	crates/sema-vm/src/scheduler.rs:607:    let mut run_result = run_until_reentrant(&mut sched, ctx, &target);
+F24	crates/sema-vm/src/scheduler.rs:609:    while matches!(run_result, Ok(SchedulerRunResult::DebugPaused)) {
+F24	crates/sema-vm/src/scheduler.rs:622:        run_result = run_until_reentrant(&mut sched, ctx, &target);
 F25	crates/sema-vm/src/scheduler.rs:641:/// Run-scheduler callback registered via `sema_core::set_run_scheduler_callback`.
-F23	crates/sema-vm/src/scheduler.rs:645:/// re-entrant calls (nested async/spawn) can access it.
-F23	crates/sema-vm/src/scheduler.rs:648:    target: SchedulerTarget,
-F23	crates/sema-vm/src/scheduler.rs:649:) -> Result<SchedulerRunResult, SemaError> {
+F25	crates/sema-vm/src/scheduler.rs:645:/// re-entrant calls (nested async/spawn) can access it.
+F25	crates/sema-vm/src/scheduler.rs:648:    target: SchedulerTarget,
+F25	crates/sema-vm/src/scheduler.rs:649:) -> Result<SchedulerRunResult, SemaError> {
 F25	crates/sema-vm/src/scheduler.rs:651:    let result = run_until_reentrant(&mut sched, ctx, &target);
-F23	crates/sema-vm/src/scheduler.rs:653:    // This callback is the registered top-level entry for `async/await`,
-F23	crates/sema-vm/src/scheduler.rs:654:    // `async/all`, `async/any`, `async/run` and `async/timeout` — all of which
-F23	crates/sema-vm/src/scheduler.rs:656:    // `set_yield_signal` and let the running scheduler resume them). So reaching
-F23	crates/sema-vm/src/scheduler.rs:659:    // still alive — so a span-owning `IoHandle` left by a timed-out task (which
-F23	crates/sema-vm/src/scheduler.rs:666:    // path and is gated by `in_async_context()` being true, so it is untouched.
-F23	crates/sema-vm/src/scheduler.rs:667:    if !sema_core::in_async_context() {
-F23	crates/sema-vm/src/scheduler.rs:686:    target: &'a SchedulerTarget,
-F23	crates/sema-vm/src/scheduler.rs:695:    fn new(target: &'a SchedulerTarget, start: u64) -> Self {
-F23	crates/sema-vm/src/scheduler.rs:697:            SchedulerTarget::Timeout(_, ms) => Some(start.saturating_add(*ms)),
-F23	crates/sema-vm/src/scheduler.rs:705:    fn status(&self) -> Option<SchedulerRunResult> {
-F23	crates/sema-vm/src/scheduler.rs:707:            SchedulerTarget::All => None,
-F23	crates/sema-vm/src/scheduler.rs:708:            SchedulerTarget::One(promise) => {
-F23	crates/sema-vm/src/scheduler.rs:710:                    .then_some(SchedulerRunResult::Complete)
-F23	crates/sema-vm/src/scheduler.rs:712:            SchedulerTarget::AllOf(promises) => {
-F23	crates/sema-vm/src/scheduler.rs:719:                (any_rejected || all_done).then_some(SchedulerRunResult::Complete)
-F23	crates/sema-vm/src/scheduler.rs:721:            SchedulerTarget::AnyOf(promises) => promises
-F23	crates/sema-vm/src/scheduler.rs:724:                .then_some(SchedulerRunResult::Complete),
-F23	crates/sema-vm/src/scheduler.rs:725:            SchedulerTarget::Timeout(promise, _) => {
-F23	crates/sema-vm/src/scheduler.rs:732:                    .then_some(SchedulerRunResult::Complete)
-F25	crates/sema-vm/src/scheduler.rs:911:                // and return `Stopped` so `run_until_reentrant` unwinds and the
+F25	crates/sema-vm/src/scheduler.rs:653:    // This callback is the registered top-level entry for `async/await`,
+F25	crates/sema-vm/src/scheduler.rs:654:    // `async/all`, `async/any`, `async/run` and `async/timeout` — all of which
+F25	crates/sema-vm/src/scheduler.rs:656:    // `set_yield_signal` and let the running scheduler resume them). So reaching
+F25	crates/sema-vm/src/scheduler.rs:659:    // still alive — so a span-owning `IoHandle` left by a timed-out task (which
+F25	crates/sema-vm/src/scheduler.rs:666:    // path and is gated by `in_async_context()` being true, so it is untouched.
+F25	crates/sema-vm/src/scheduler.rs:667:    if !sema_core::in_async_context() {
+F25	crates/sema-vm/src/scheduler.rs:686:    target: &'a SchedulerTarget,
+F25	crates/sema-vm/src/scheduler.rs:695:    fn new(target: &'a SchedulerTarget, start: u64) -> Self {
+F25	crates/sema-vm/src/scheduler.rs:697:            SchedulerTarget::Timeout(_, ms) => Some(start.saturating_add(*ms)),
+F25	crates/sema-vm/src/scheduler.rs:705:    fn status(&self) -> Option<SchedulerRunResult> {
+F25	crates/sema-vm/src/scheduler.rs:707:            SchedulerTarget::All => None,
+F25	crates/sema-vm/src/scheduler.rs:708:            SchedulerTarget::One(promise) => {
+F25	crates/sema-vm/src/scheduler.rs:710:                    .then_some(SchedulerRunResult::Complete)
+F25	crates/sema-vm/src/scheduler.rs:712:            SchedulerTarget::AllOf(promises) => {
+F25	crates/sema-vm/src/scheduler.rs:719:                (any_rejected || all_done).then_some(SchedulerRunResult::Complete)
+F25	crates/sema-vm/src/scheduler.rs:721:            SchedulerTarget::AnyOf(promises) => promises
+F25	crates/sema-vm/src/scheduler.rs:724:                .then_some(SchedulerRunResult::Complete),
+F25	crates/sema-vm/src/scheduler.rs:725:            SchedulerTarget::Timeout(promise, _) => {
+F25	crates/sema-vm/src/scheduler.rs:732:                    .then_some(SchedulerRunResult::Complete)
+F30	crates/sema-vm/src/scheduler.rs:911:                // and return `Stopped` so `run_until_reentrant` unwinds and the
 F23	crates/sema-vm/src/scheduler.rs:94:    /// Virtual clock in milliseconds (see the module-level note). `async/sleep`
-F23	crates/sema-vm/src/scheduler.rs:951:/// so that nested `async/spawn` and `async/await` calls from within
+F25	crates/sema-vm/src/scheduler.rs:951:/// so that nested `async/spawn` and `async/await` calls from within
 F25	crates/sema-vm/src/scheduler.rs:954:fn run_until_reentrant(
-F23	crates/sema-vm/src/scheduler.rs:957:    target: &SchedulerTarget,
-F23	crates/sema-vm/src/scheduler.rs:958:) -> Result<SchedulerRunResult, SemaError> {
+F25	crates/sema-vm/src/scheduler.rs:957:    target: &SchedulerTarget,
+F25	crates/sema-vm/src/scheduler.rs:958:) -> Result<SchedulerRunResult, SemaError> {
 F23	crates/sema-vm/src/scheduler.rs:95:    /// and `async/timeout` are measured against this logical clock, not the
-F23	crates/sema-vm/src/scheduler.rs:964:        // wait (e.g. a real `Atomics.wait` sleep that was woken early) aborts
-F23	crates/sema-vm/src/scheduler.rs:975:                if let TaskState::Blocked(YieldReason::AwaitIo(h)) = &task.state {
+F25	crates/sema-vm/src/scheduler.rs:964:        // wait (e.g. a real `Atomics.wait` sleep that was woken early) aborts
+F25	crates/sema-vm/src/scheduler.rs:975:                if let TaskState::Blocked(YieldReason::AwaitIo(h)) = &task.state {
 F23	crates/sema-vm/src/scheduler.rs:9://! with the parent. Native functions signal yield via `set_yield_signal(reason)`
 F29	crates/sema-vm/src/vm.rs:120:    /// callee is not a native fn (keywords, callables routed via `call_callback`).
 F30	crates/sema-vm/src/vm.rs:1230:            match debug.command_rx.recv() {
@@ -1156,8 +1156,8 @@ F30	crates/sema-vm/src/vm.rs:1327:            match debug.command_rx.recv() {
 F28	crates/sema-vm/src/vm.rs:1392:        // VM via the stack-top placeholder it left (`set_resume_value` semantics).
 F28	crates/sema-vm/src/vm.rs:1400:            match sema_core::call_run_scheduler_target(ctx, target.clone()) {
 F28	crates/sema-vm/src/vm.rs:1401:                Ok(sema_core::SchedulerRunResult::DebugPaused) => {
-F28	crates/sema-vm/src/vm.rs:180:thread_local! {
-F28	crates/sema-vm/src/vm.rs:1962:                                    // spawn_blocking thread on `reply_rx.recv()`, so
+C17	crates/sema-vm/src/vm.rs:180:thread_local! {
+F30	crates/sema-vm/src/vm.rs:1962:                                    // spawn_blocking thread on `reply_rx.recv()`, so
 F28	crates/sema-vm/src/vm.rs:2321:                            drop(sema_core::take_yield_signal());
 F28	crates/sema-vm/src/vm.rs:2329:                        if let Some(reason) = sema_core::take_yield_signal() {
 F28	crates/sema-vm/src/vm.rs:2344:                            drop(sema_core::take_yield_signal());
@@ -1170,31 +1170,31 @@ F28	crates/sema-vm/src/vm.rs:2938:                                    drop(sema_
 F28	crates/sema-vm/src/vm.rs:2945:                                if let Some(reason) = sema_core::take_yield_signal() {
 F29	crates/sema-vm/src/vm.rs:3399:                sema_core::call_callback(ctx, &func_val, &call_args)
 F29	crates/sema-vm/src/vm.rs:3484:                sema_core::call_callback(ctx, &func_val, &call_args)
-F28	crates/sema-vm/src/vm.rs:3791:    /// foreign stack (an `async/spawn` task, a fresh fallback VM, an inline-task
-F28	crates/sema-vm/src/vm.rs:3943:                // yield in the inner closure (channel/send, channel/recv,
-F28	crates/sema-vm/src/vm.rs:3947:                if sema_core::in_async_context() {
+F29	crates/sema-vm/src/vm.rs:3791:    /// foreign stack (an `async/spawn` task, a fresh fallback VM, an inline-task
+F29	crates/sema-vm/src/vm.rs:3943:                // yield in the inner closure (channel/send, channel/recv,
+F29	crates/sema-vm/src/vm.rs:3947:                if sema_core::in_async_context() {
 F28	crates/sema-vm/src/vm.rs:438:thread_local! {
 F28	crates/sema-vm/src/vm.rs:43:    /// (an `async/spawn` task VM, a fresh fallback VM, an inline-task HOF)
 F29	crates/sema-vm/src/vm.rs:441:    /// via `call_callback`, the closure's fallback consults this stack so it can
-F29	crates/sema-vm/src/vm.rs:4435:        match sema_core::eval_callback(ctx, expr, &env) {
-F28	crates/sema-vm/src/vm.rs:5344:            sema_core::SchedulerTarget::One(promise.clone()),
-F28	crates/sema-vm/src/vm.rs:582:    if sema_core::in_async_context() {
+F30	crates/sema-vm/src/vm.rs:4435:        match sema_core::eval_callback(ctx, expr, &env) {
+F30	crates/sema-vm/src/vm.rs:5344:            sema_core::SchedulerTarget::One(promise.clone()),
+F29	crates/sema-vm/src/vm.rs:582:    if sema_core::in_async_context() {
 F29	crates/sema-vm/src/vm.rs:610:/// `call_callback` → `run_closure_as_inline_task` path would `take_scheduler()`
-F28	crates/sema-vm/src/vm.rs:612:/// poll), and a *nested* `async/all` on a sibling task makes it reproducible.
+F29	crates/sema-vm/src/vm.rs:612:/// poll), and a *nested* `async/all` on a sibling task makes it reproducible.
 F29	crates/sema-vm/src/vm.rs:627:        return sema_core::call_callback(ctx, func, args);
 F29	crates/sema-vm/src/vm.rs:630:        return sema_core::call_callback(ctx, func, args);
-F28	crates/sema-vm/src/vm.rs:656:thread_local! {
-F28	crates/sema-vm/src/vm.rs:674:thread_local! {
-F28	crates/sema-vm/src/vm.rs:719:/// a scheduler-driving combinator (`async/await`/`all`/`race`/`run`/`timeout`),
-F28	crates/sema-vm/src/vm.rs:751:                Err(SemaError::eval(format!("async/await: task rejected: {e}")))
-F28	crates/sema-vm/src/vm.rs:753:            PromiseState::Cancelled => Err(SemaError::eval("async/await: task was cancelled")),
-F28	crates/sema-vm/src/vm.rs:755:                "async/await: still pending after scheduler run",
-F28	crates/sema-vm/src/vm.rs:764:                        return Err(SemaError::eval(format!("async/all: task rejected: {e}")))
-F28	crates/sema-vm/src/vm.rs:767:                        return Err(SemaError::eval("async/all: task was cancelled"))
-F28	crates/sema-vm/src/vm.rs:770:                        return Err(SemaError::eval("async/all: task still pending"))
-F28	crates/sema-vm/src/vm.rs:784:                    return Err(SemaError::eval(format!("async/race: task rejected: {e}")));
-F28	crates/sema-vm/src/vm.rs:787:            Err(SemaError::eval("async/race: no promise resolved"))
-F28	crates/sema-vm/src/vm.rs:863:/// the owning VM is still current, exactly like `async/spawn` at spawn time)
+F30	crates/sema-vm/src/vm.rs:656:thread_local! {
+F30	crates/sema-vm/src/vm.rs:674:thread_local! {
+F30	crates/sema-vm/src/vm.rs:719:/// a scheduler-driving combinator (`async/await`/`all`/`race`/`run`/`timeout`),
+F30	crates/sema-vm/src/vm.rs:751:                Err(SemaError::eval(format!("async/await: task rejected: {e}")))
+F30	crates/sema-vm/src/vm.rs:753:            PromiseState::Cancelled => Err(SemaError::eval("async/await: task was cancelled")),
+F30	crates/sema-vm/src/vm.rs:755:                "async/await: still pending after scheduler run",
+F30	crates/sema-vm/src/vm.rs:764:                        return Err(SemaError::eval(format!("async/all: task rejected: {e}")))
+F30	crates/sema-vm/src/vm.rs:767:                        return Err(SemaError::eval("async/all: task was cancelled"))
+F30	crates/sema-vm/src/vm.rs:770:                        return Err(SemaError::eval("async/all: task still pending"))
+F30	crates/sema-vm/src/vm.rs:784:                    return Err(SemaError::eval(format!("async/race: task rejected: {e}")));
+F30	crates/sema-vm/src/vm.rs:787:            Err(SemaError::eval("async/race: no promise resolved"))
+F29	crates/sema-vm/src/vm.rs:863:/// the owning VM is still current, exactly like `async/spawn` at spawn time)
 H09	crates/sema-wasm/src/lib.rs:10:thread_local! {
 H10B	crates/sema-wasm/src/lib.rs:1866:        for _ in 0..MAX_REPLAYS {
 H10B	crates/sema-wasm/src/lib.rs:188:const HTTP_AWAIT_MARKER: &str = "__SEMA_WASM_HTTP__";

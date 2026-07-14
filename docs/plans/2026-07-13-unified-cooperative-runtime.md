@@ -316,11 +316,18 @@ completion payloads. They MUST NOT receive or return `Value`, `Env`,
 interpreter.
 
 Before submission, the runtime registers the exact wait generation, decoder,
-runtime-selected completion kind, and concrete resource/cancel hook. Only the
-send-only job and a private identity/kind-bearing completion sink cross to the
-worker. The job reports a result through that sink and returns no resource or
-runtime state; submission rejection rolls back the registered wait/resource
-exactly once.
+runtime-selected completion kind, and concrete resource/cancel hook. It gives
+the executor a send-only job and a private identity/kind-bearing completion
+sink, but the executor never exposes that sink to the job. The job has one
+consuming method that returns `Result<SendPayload, ExternalFailure>`. The
+executor catches a panic at that boundary, converts it to `WorkerPanic`, and
+owns one terminal sink delivery for every admitted job, including cancellation
+before the job starts. A job therefore cannot omit or duplicate its own
+completion, forge identity/kind, or carry runtime state. Closed-inbox delivery
+is explicitly accounted as undeliverable; an enqueued completion rejected by
+wait identity/lifecycle validation is accounted as late. Submission rejection
+rolls back the registered wait/resource exactly once and does not deliver
+through the sink or enqueue a completion.
 
 All conversion to and from Sema values, continuation execution, promise
 settlement, tracing, and GC interaction occurs on the interpreter thread.

@@ -4020,6 +4020,7 @@ dependencies = [
  "toml",
  "toml_edit",
  "tungstenite 0.28.0",
+ "windows-sys 0.61.2",
  "xz2",
  "zip 8.6.0",
 ]

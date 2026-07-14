@@ -105,8 +105,34 @@ pub struct CompletionSink {
     kind: CompletionKind,
 }
 
+pub(crate) enum CompletionDelivery {
+    Enqueued,
+    InboxClosed,
+}
+
 impl CompletionSink {
-    pub fn complete(self, result: Result<SendPayload, ExternalFailure>) {
+    pub fn for_registered_wait(
+        sender: Sender<ExternalCompletion>,
+        runtime_id: RuntimeId,
+        wait_id: WaitId,
+        generation: WaitGeneration,
+        operation_id: OperationId,
+        kind: CompletionKind,
+    ) -> Self {
+        Self {
+            sender,
+            runtime_id,
+            wait_id,
+            generation,
+            operation_id,
+            kind,
+        }
+    }
+
+    pub(crate) fn complete(
+        self,
+        result: Result<SendPayload, ExternalFailure>,
+    ) -> CompletionDelivery {
         let Self {
             sender,
             runtime_id,
@@ -115,19 +141,22 @@ impl CompletionSink {
             operation_id,
             kind,
         } = self;
-        let _ = sender.send(ExternalCompletion {
+        match sender.send(ExternalCompletion {
             runtime_id,
             wait_id,
             generation,
             operation_id,
             kind,
             result,
-        });
+        }) {
+            Ok(()) => CompletionDelivery::Enqueued,
+            Err(_) => CompletionDelivery::InboxClosed,
+        }
     }
 }
 
 pub trait IoJob: Send + 'static {
-    fn run(self: Box<Self>, sink: CompletionSink);
+    fn run(self: Box<Self>) -> Result<SendPayload, ExternalFailure>;
 }
 
 /// Constructed and consumed only on the interpreter thread.
@@ -172,11 +201,13 @@ impl ExecutorLease {
 `PreparedExternalOperation` is a runtime-side bundle, not a worker message. The
 runtime destructures it, installs the decoder and `ResourceClass` (including the
 cancel hook) in `WaitRegistry`/`CleanupRegistry`, creates a `CompletionSink` with
-the runtime-selected `CompletionKind`, and only then sends the `Box<dyn IoJob>`
-to the executor. `IoJob::run` reports through its sink and returns `()`; worker
-code cannot select the completion kind, return a resource/cancel hook, or move
-VM-side cleanup state across the thread boundary. `RunningJob` is only an
-immediate admission receipt.
+the runtime-selected `CompletionKind` via `for_registered_wait`, and only then
+submits the `Box<dyn IoJob>` and sink to the executor. Its fields and consuming
+`complete` method remain crate-private to `sema-io`; the executor owns the sink
+and never passes it to `IoJob::run`. The job only returns a send-safe result.
+Worker code therefore cannot omit or duplicate completion delivery, select the
+completion kind, return a resource/cancel hook, or move VM-side cleanup state
+across the thread boundary. `RunningJob` is only an immediate admission receipt.
 
 Each interpreter runtime owns one `ExecutorLease` over the process-wide pool.
 Lease shutdown rejects new jobs for that runtime, cancels/drains only its jobs,
@@ -186,14 +217,23 @@ explicit process shutdown. `Runtime::start_external` allocates and installs the
 wait/resource registration before it calls the lease's `submit`, preventing a
 completion-before-registration race. If `submit` returns `Err`, the runtime
 deterministically unregisters that wait, invokes or transfers cleanup exactly
-once, and records the rejected operation; no task remains parked. The executor
-never decodes a Sema value.
-Panic is caught at the job boundary and delivered as
-`ExternalFailure::WorkerPanic`; it does not silently drop the wait.
+once, and records the rejected operation; no task remains parked. For each
+admitted job, the executor owns one terminal delivery. A queued job cancelled
+before start completes with `ExternalFailureCode::Cancelled` without invoking
+the job. Otherwise the executor invokes `IoJob::run` inside
+`catch_unwind(AssertUnwindSafe(...))`, maps a panic to an `ExternalFailure` with
+code `ExternalFailureCode::WorkerPanic`, and calls
+`CompletionSink::complete` exactly once. `InboxClosed` increments the executor's
+undeliverable counter rather than silently discarding a send failure. An
+enqueued completion rejected by `WaitRegistry` as stale, cancelled, duplicate,
+or wrong-identity increments the runtime's `late_completions` counter. The
+executor never decodes a Sema value.
 
 `ExecutorSnapshot` reports queued, running-interruptible,
-running-quarantined, completed, cancelled, panicked, and late-delivery counts.
-Task/review evidence records snapshots before cancellation and after reaping.
+running-quarantined, completed, cancelled, panicked, and undeliverable counts.
+The runtime snapshot separately reports late completions after inbox validation.
+Task/review evidence records both snapshots before cancellation and after
+reaping.
 
 ## Required resource classification
 
@@ -246,11 +286,22 @@ code that enforces it before dispatch.
 
 First use fake jobs/executors to pin the interface itself:
 
-- `completion_sink_carries_runtime_selected_kind` — a worker can submit a result
-  but cannot choose or overwrite the private kind;
-- `io_job_returns_unit_and_only_send_work_crosses` — the fake job is `Send`, its
-  `run` result is `()`, and a deliberately non-`Send` runtime cancel hook remains
-  in the prepared operation/registry;
+- `executor_completes_normal_job_exactly_once` — a returned payload produces one
+  tagged completion with the runtime-selected kind;
+- `executor_completes_returned_failure_exactly_once` — a returned
+  `ExternalFailure` follows the same one-shot path;
+- `executor_converts_job_panic_to_completion` — a panic before a job can return
+  is converted to `WorkerPanic` and cannot strand the wait;
+- `io_job_cannot_control_completion_delivery` — the fake job is `Send`, its
+  consuming `run` returns only a send-safe result, and the type/API gives it no
+  sink with which to omit, duplicate, or forge a completion;
+- `only_send_work_crosses` — a deliberately non-`Send` decoder and runtime
+  cancel hook remain in the prepared operation/registry;
+- `closed_completion_inbox_is_accounted` — a send failure produces
+  `InboxClosed` and increments the executor's undeliverable counter;
+- `late_enqueued_completion_is_accounted` — cancellation followed by an
+  enqueued completion increments the runtime's late-completion counter without
+  changing the task outcome;
 - `completion_before_submit_returns_is_safe` — registration exists before the
   executor runs the job inline and returns its receipt;
 - `submit_rejection_rolls_back_wait_and_resource` — every `SubmitError` leaves
@@ -259,16 +310,18 @@ First use fake jobs/executors to pin the interface itself:
   over the runtime cancel hook.
 
 Then cover cancellation before job starts, cancellation during job, cancel
-twice, job panic, wrong runtime/generation/operation/kind, duplicate completion,
-quarantine completion after observer cancellation, and shutdown with one job in
-each state.
+twice, wrong runtime/generation/operation/kind, a fault-injected duplicate
+completion at the inbox boundary, quarantine completion after observer
+cancellation, and shutdown with one job in each state. Duplicate delivery is an
+inbox/fault-injection case because the public `IoJob` API cannot produce it.
 
 - [ ] **Step 2: Implement prepared operations, `IoJob`, admission, and counters**
 
 Preserve the process-wide pool identity and blocking-tier admission headroom.
-Keep `CompletionSink` fields private and expose one result-delivery method so a
-job cannot forge identity or kind. Store the runtime `ResourceClass` before
-submission and implement rejection rollback before migrating any builtin.
+Keep `CompletionSink` fields and its consuming result-delivery method private to
+the executor. Store the runtime `ResourceClass` before submission, wrap every
+admitted job in the one-shot panic-to-result delivery path, account for
+`InboxClosed`, and implement rejection rollback before migrating any builtin.
 Remove public `io_block_on` once all callers in this layer are migrated; until
 then its inventory row must list the exact remaining caller and deletion step.
 

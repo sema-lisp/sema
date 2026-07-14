@@ -68,6 +68,53 @@ Unix, owns a process group so drain joins cannot be held forever by descendants.
 The inventory uses match-level evidence because path-family tables cannot prove
 that mixed cancellation/context policies received distinct migration rows.
 
+## Second acceptance amendment results
+
+The second amendment addresses checker trust, semantic map assignments,
+completion liveness, and inherited-pipe behavior without changing production
+runtime behavior.
+
+| Contract | RED/limitation first | Corrected result |
+| --- | --- | --- |
+| Inventory fixture validation | A nonexistent `R99` was accepted when that text appeared outside the ledger table's ID column. | `unified_runtime_inventory_checker_rejects_invalid_fixture_states` passes all valid, empty/missing, stale, duplicate, malformed, `UNREVIEWED`, and nonexistent-row cases; row membership is anchored to the first table column. |
+| Mapping regeneration | The writer reclassified every match through path/text heuristics, so a source edit could silently receive the wrong semantic row. | `unified_runtime_inventory_writer_preserves_reviews_and_marks_only_new_matches` proves surviving assignments are preserved, vanished payloads are removed, and new payloads remain `UNREVIEWED`. |
+| Partial discovery failure | A failing first discovery `rg` could be masked by a later successful scan. | `unified_runtime_inventory_checker_rejects_partial_discovery_scan_failure` passes for both `--check` and `--write-mapping`; neither writes a map after failure. The missing-binary regression also requires the named diagnostic. |
+| Escaped inherited writer | The Unix `setsid` helper held both pipes open and the blocking drain join returned after about 2.00s instead of the direct parent's prompt exit. | `escaped_session_pipe_writers_do_not_block_drain_join` passes in about 0.02s. Unix/Windows drains are nonblocking and cancellable; Unix process-group cleanup remains best effort. |
+| Windows inherited writer | Native Windows execution is unavailable in this macOS worktree. | A `cfg(windows)` regression now spawns a two-second PowerShell writer through a promptly exiting helper. The exact watchdog and Windows test code pass an isolated `x86_64-pc-windows-gnu` `cargo check`; Task 07/Windows CI must execute it natively. |
+| Completion liveness | Passing `CompletionSink` into `IoJob::run` let a job omit delivery, duplicate it, or panic before consuming the sink. | Master, Task 02, and Task 05 now make `IoJob::run(self)` return a send-safe result. The executor privately owns one terminal sink delivery, maps panic to `WorkerPanic`, handles queued cancellation, and accounts for closed-inbox/late delivery. |
+
+The full Sema Windows cross-check was attempted with:
+
+```bash
+cargo check --target x86_64-pc-windows-gnu -p sema-lang \
+  --test unified_runtime_watchdog_test
+```
+
+It stops in the unrelated `aws-lc-sys` build script before compiling Sema
+because `x86_64-w64-mingw32-gcc` is not installed. To compile-lock the changed
+platform branch, a temporary dependency-only crate included the exact
+`common/watchdog.rs` plus the exact Windows helper/test code and passed:
+
+```text
+CARGO_BIN_EXE_sema=sema cargo check --tests --target x86_64-pc-windows-gnu
+Finished `dev` profile
+```
+
+The temporary crate was removed and is not evidence or a committed artifact.
+
+The audited 1,257-row match map is assigned by logical operation/source span,
+not path/text heuristics. Representative corrections include core abortable
+I/O (`async_signal.rs:72` → F01A), prelude agent orchestration
+(`prelude.rs:753` → F34C), LLM async dispatch (`builtins.rs:2050` → C07B),
+`async/run` (`async_ops.rs:181` → R01D), channel operations
+(`async_ops.rs:524` → R01C), server receive (`server.rs:1184` → R15A), system
+shell-await/sleep (`system.rs:290` → R18A and `system.rs:419` → R18C), and
+WebSocket receive (`ws.rs:328` → R20A). `--write-mapping` now preserves reviewed
+assignments, removes vanished payloads, marks only new payloads `UNREVIEWED`, and
+contains no semantic classifier. Its post-audit SHA-256 remained
+`ba893a85b70635a0eb5071a6ef59115d81895ab44365ba23213a68064a90b204`
+before and after regeneration.
+
 ## Complete affected targets
 
 | Command | Result | Elapsed | Classification |
@@ -98,6 +145,18 @@ The seven VM RED cases remain exactly: scheduled supplied-promise survival for
 sleep/timeout validation, and the finite tick ceiling. The watchdog RED remains
 exactly the ready-storm/timer fairness case; both harness self-regressions pass.
 
+Second-amendment affected targets:
+
+| Command target | Result | Elapsed |
+| --- | --- | ---: |
+| `runtime_conformance_test` | 8 passed | 0.17s |
+| `unified_runtime_watchdog_test` | 3 passed, 1 approved fairness RED, 1 helper ignored | 4.08s |
+
+The three native watchdog passes are noisy stdout/stderr draining, ordinary
+Unix process-group cleanup, and escaped-session no-EOF drain liveness. The
+Windows inherited-writer regression is target-gated and compile-locked here;
+native Windows execution remains a Task 07/CI gate.
+
 ## Inventory and source guard
 
 The original broad discovery commands returned 868 and 1,074 sorted matches;
@@ -112,7 +171,10 @@ matches, and 1,257 sorted unique union records. Every exact `path:line:text`
 record has a stable row ID in
 [`runtime-match-map.tsv`](runtime-match-map.tsv), and
 `scripts/check-unified-runtime-inventory.sh --check` rejects scan failures,
-malformed/duplicate/stale/missing mappings, or missing ledger rows.
+malformed/duplicate/stale/missing or `UNREVIEWED` mappings, or missing ledger
+rows. Ledger membership comes only from the first Markdown-table column. Its
+fixture suite also proves that an early failed scan cannot be hidden by a later
+successful scan.
 
 `scripts/check-unified-runtime-legacy.sh` scans every `crates/*/src` and
 `playground/src` Rust/JavaScript/TypeScript source for the master plan's legacy
@@ -131,6 +193,7 @@ Verification:
 | `wc -l docs/plans/evidence/unified-cooperative-runtime/legacy-symbols.baseline` | 971 lines. |
 | `LC_ALL=C sort -c -u docs/plans/evidence/unified-cooperative-runtime/legacy-symbols.baseline` | PASS. |
 | `scripts/check-unified-runtime-inventory.sh --check` | PASS; 1,257 exact production matches mapped. |
+| `scripts/check-unified-runtime-inventory.sh --write-mapping` plus before/after SHA-256 | PASS; audited map preserved byte-for-byte. |
 
 ## Formatting and diff checks
 
@@ -140,6 +203,19 @@ Verification:
 | `git diff --check` | PASS. |
 | `cargo fmt --all -- --check` | Baseline RED only in untouched `crates/sema/tests/stream_file_async_test.rs` and `crates/sema-stdlib/src/async_ops.rs`. Task 01 files are clean under the targeted `rustfmt` check. |
 | `jake docs-check` | PASS; 1 selected docs test passed. |
+
+Second-amendment verification:
+
+| Command | Result |
+| --- | --- |
+| `bash -n scripts/check-unified-runtime-inventory.sh` | PASS. |
+| `rustfmt --edition 2021 --check` on the three modified Rust test/helper files | PASS. |
+| `scripts/check-unified-runtime-inventory.sh --check` | PASS; 1,257 exact matches. |
+| mapping payload `LC_ALL=C sort -c -u` | PASS. |
+| `scripts/check-unified-runtime-legacy.sh --check` | PASS. |
+| `git diff --check` | PASS. |
+| `jake docs-check` | PASS; 1 selected docs test passed. |
+| `cargo fmt --all -- --check` | Same baseline RED only in untouched `crates/sema/tests/stream_file_async_test.rs` and `crates/sema-stdlib/src/async_ops.rs`; no amended file appears. |
 
 ## RED handoff
 

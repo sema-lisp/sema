@@ -104,7 +104,8 @@ Task 02 defines the exact `CompletionSender`, private unnameable
 `CompletionSink`, capability-safe `CompletionRegistrar`, opaque
 `ExecutorSubmission`, `ExecutorDispatch` wrappers, `ExecutorJob`,
 `PreparedExternalOperation`, `RunningSubmission`, owning `SubmissionRejected`,
-`ExecutorLease`, and `IoExecutor` interfaces in `sema-core`. Task 03 consumes
+`ExecutorDriveReport`/`ExecutorTerminal`, `ExecutorLease`, and `IoExecutor`
+interfaces in `sema-core`. Task 03 consumes
 those interfaces with a fake lease. Task 05 implements them in `sema-io` over
 the one process-wide pool; it does not redeclare or wrap them in a second public
 seam.
@@ -199,7 +200,10 @@ admitted job, the executor owns one terminal delivery. On dequeue it consumes
 `start_token.claim_for_run()`. `CompleteCancelled` drops the job without invoking
 it and completes the sink once with `ExternalFailureCode::Cancelled`. `Run`
 claims the operation before the runtime can classify it as queued. In either
-case, cancellation consumes/deregisters the runtime resource entry exactly
+case the dispatch drive report updates `cancelled`, `panicked`, or `completed`;
+all non-cancellation/non-worker-panic producer results use `completed`, because
+the snapshot has no failed bucket, and its delivery updates `undeliverable`.
+Cancellation consumes/deregisters the runtime resource entry exactly
 once. For `Interruptible`, it invokes the hook exactly once even when
 `CancelledQueued` won: the pre-armed hook records sticky cancellation and
 closes/releases any existing prepared child, stream, or resource. Repeated

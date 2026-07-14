@@ -234,10 +234,20 @@ impl AsyncExecutorDispatch {
     pub fn into_future(self) -> AsyncDispatchFuture;
 }
 
+impl Future for AsyncDispatchFuture {
+    type Output = ExecutorDriveReport;
+}
+
 impl BlockingExecutorDispatch {
     pub fn operation_id(&self) -> OperationId;
     pub fn class(&self) -> BlockingDispatchClass;
-    pub fn run(self) -> CompletionDelivery;
+    pub fn run(self) -> ExecutorDriveReport;
+}
+
+pub enum ExecutorTerminal { Completed, Cancelled, WorkerPanic }
+pub struct ExecutorDriveReport {
+    pub terminal: ExecutorTerminal,
+    pub delivery: CompletionDelivery,
 }
 
 pub struct SubmissionRejected { /* rejection kind + rejected submission */ }
@@ -267,7 +277,13 @@ terminal delivery attempt for success, returned error, queued cancellation,
 panic, or abandonment. Panic conversion is guaranteed only with
 `panic = "unwind"`; `panic = "abort"` terminates the process. Dropping an
 admitted dispatch or its future attempts terminal cancellation. The async
-wrapper catches both future-construction and polling panic under unwind. This
+wrapper catches both future-construction and polling panic under unwind. Drive
+returns classify cancellation and worker panic for executor counters; payload
+success and every other returned producer failure classify as completed. The
+private payload, sink, and identity are not exposed. Ordinary single destructor
+panics are contained under unwind. Opaque destructors are leaked during an
+already-active unwind to avoid inducing a second panic; arbitrary double-panic
+inside a destructor remains process-fatal and is not promised. This
 can be implemented without Tokio in `sema-core`; add workspace `futures` only
 if the implementation explicitly selects and documents it.
 

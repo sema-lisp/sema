@@ -16,10 +16,10 @@ pub use completion::{
 pub use executor::{
     AsyncDispatchFuture, AsyncExecutorDispatch, BindCompletionError, BlockingDispatchClass,
     BlockingExecutorDispatch, CancelBeforeStart, CompletionRegistrar, ExecutorAttachError,
-    ExecutorCancelHandle, ExecutorDispatch, ExecutorLease, ExecutorShutdown, ExecutorSnapshot,
-    ExecutorStartDecision, ExecutorSubmission, ExternalOperationBinding, IoExecutor,
-    PreparedExternalOperation, RunningSubmission, RuntimeIssuedCompletionIdentity,
-    RuntimeOperationBinding, SubmissionRejected, SubmitErrorKind,
+    ExecutorCancelHandle, ExecutorDispatch, ExecutorDriveReport, ExecutorLease, ExecutorShutdown,
+    ExecutorSnapshot, ExecutorStartDecision, ExecutorSubmission, ExecutorTerminal,
+    ExternalOperationBinding, IoExecutor, PreparedExternalOperation, RunningSubmission,
+    RuntimeIssuedCompletionIdentity, RuntimeOperationBinding, SubmissionRejected, SubmitErrorKind,
 };
 pub use ids::{
     ChannelId, CompletionKind, IdCounter, IdExhausted, InvalidRuntimeId, OperationId, PromiseId,

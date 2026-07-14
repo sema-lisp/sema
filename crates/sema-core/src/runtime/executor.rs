@@ -9,8 +9,8 @@ use std::time::Instant;
 
 use super::{
     CompletionDecoder, CompletionDelivery, CompletionKind, CompletionSender, ExternalCompletion,
-    ExternalFailure, IdCounter, IdExhausted, InterruptibleResource, OperationId, QuarantineBound,
-    ResourceClass, RuntimeId, SendPayload, WaitGeneration, WaitId,
+    ExternalFailure, ExternalFailureCode, IdCounter, IdExhausted, InterruptibleResource,
+    OperationId, QuarantineBound, ResourceClass, RuntimeId, SendPayload, WaitGeneration, WaitId,
 };
 
 type JobResult = Result<SendPayload, ExternalFailure>;
@@ -415,6 +415,33 @@ pub enum BlockingDispatchClass {
     QuarantinedBounded,
 }
 
+/// Terminal executor accounting, intentionally independent of payload details.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ExecutorTerminal {
+    Completed,
+    Cancelled,
+    WorkerPanic,
+}
+
+/// The terminal class and whether its private completion reached the runtime inbox.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ExecutorDriveReport {
+    pub terminal: ExecutorTerminal,
+    pub delivery: CompletionDelivery,
+}
+
+fn terminal_for(result: &JobResult) -> ExecutorTerminal {
+    match result {
+        Err(failure) if failure.code() == ExternalFailureCode::Cancelled => {
+            ExecutorTerminal::Cancelled
+        }
+        Err(failure) if failure.code() == ExternalFailureCode::WorkerPanic => {
+            ExecutorTerminal::WorkerPanic
+        }
+        Ok(_) | Err(_) => ExecutorTerminal::Completed,
+    }
+}
+
 pub struct BlockingExecutorDispatch {
     identity: CompletionIdentity,
     class: BlockingDispatchClass,
@@ -432,32 +459,34 @@ impl BlockingExecutorDispatch {
         self.class
     }
 
-    pub fn run(mut self) -> CompletionDelivery {
-        let decision = self
-            .start
-            .take()
-            .expect("dispatch owns start token")
-            .claim_for_run();
+    pub fn run(mut self) -> ExecutorDriveReport {
+        let start = self.start.take().expect("dispatch owns start token");
+        let decision = start.claim_for_run();
+        contained_drop(start);
         if decision == ExecutorStartDecision::CompleteCancelled {
+            let result = Err(ExternalFailure::cancelled());
+            let terminal = terminal_for(&result);
             let delivery = self
                 .sink
                 .take()
                 .expect("dispatch owns sink")
-                .deliver(Err(ExternalFailure::cancelled()));
+                .deliver(result);
             if let Some(job) = self.job.take() {
                 contained_drop(job);
             }
-            return delivery;
+            return ExecutorDriveReport { terminal, delivery };
         }
         let result = match decision {
             ExecutorStartDecision::CompleteCancelled => unreachable!(),
             ExecutorStartDecision::Run => run_blocking(self.job.take().expect("dispatch owns job")),
         };
-        self.job.take();
-        self.sink
+        let terminal = terminal_for(&result);
+        let delivery = self
+            .sink
             .take()
             .expect("dispatch owns sink")
-            .deliver(result)
+            .deliver(result);
+        ExecutorDriveReport { terminal, delivery }
     }
 }
 
@@ -465,6 +494,12 @@ impl Drop for BlockingExecutorDispatch {
     fn drop(&mut self) {
         if let Some(sink) = self.sink.take() {
             let _ = sink.deliver(Err(ExternalFailure::cancelled()));
+        }
+        if let Some(job) = self.job.take() {
+            contained_drop(job);
+        }
+        if let Some(start) = self.start.take() {
+            contained_drop(start);
         }
     }
 }
@@ -493,15 +528,14 @@ impl AsyncExecutorDispatch {
     }
 
     pub fn into_future(mut self) -> AsyncDispatchFuture {
-        let decision = self
-            .start
-            .take()
-            .expect("dispatch owns start token")
-            .claim_for_run();
+        let start = self.start.take().expect("dispatch owns start token");
+        let decision = start.claim_for_run();
+        contained_drop(start);
         let future = match decision {
-            ExecutorStartDecision::CompleteCancelled => {
-                AsyncFutureState::Immediate(Some(Err(ExternalFailure::cancelled())))
-            }
+            ExecutorStartDecision::CompleteCancelled => AsyncFutureState::Immediate {
+                result: Some(Err(ExternalFailure::cancelled())),
+                unstarted_job: self.job.take(),
+            },
             ExecutorStartDecision::Run => {
                 construct_async(self.job.take().expect("dispatch owns job"))
             }
@@ -519,12 +553,21 @@ impl Drop for AsyncExecutorDispatch {
         if let Some(sink) = self.sink.take() {
             let _ = sink.deliver(Err(ExternalFailure::cancelled()));
         }
+        if let Some(job) = self.job.take() {
+            contained_drop(job);
+        }
+        if let Some(start) = self.start.take() {
+            contained_drop(start);
+        }
     }
 }
 
 enum AsyncFutureState {
     Running(AsyncJobFuture),
-    Immediate(Option<JobResult>),
+    Immediate {
+        result: Option<JobResult>,
+        unstarted_job: Option<AsyncJob>,
+    },
     Done,
 }
 
@@ -533,7 +576,10 @@ fn construct_async(job: AsyncJob) -> AsyncFutureState {
     {
         match catch_unwind(AssertUnwindSafe(job)) {
             Ok(future) => AsyncFutureState::Running(future),
-            Err(_) => AsyncFutureState::Immediate(Some(Err(ExternalFailure::worker_panic()))),
+            Err(_) => AsyncFutureState::Immediate {
+                result: Some(Err(ExternalFailure::worker_panic())),
+                unstarted_job: None,
+            },
         }
     }
     #[cfg(panic = "abort")]
@@ -555,7 +601,7 @@ impl AsyncDispatchFuture {
 }
 
 impl Future for AsyncDispatchFuture {
-    type Output = CompletionDelivery;
+    type Output = ExecutorDriveReport;
 
     fn poll(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
         let result = match &mut self.future {
@@ -574,15 +620,16 @@ impl Future for AsyncDispatchFuture {
                     Poll::Ready(result) => result,
                 }
             }
-            AsyncFutureState::Immediate(result) => {
+            AsyncFutureState::Immediate { result, .. } => {
                 result.take().expect("immediate result is polled once")
             }
             AsyncFutureState::Done => panic!("completed dispatch future polled again"),
         };
+        let terminal = terminal_for(&result);
         let delivery = self.sink.take().expect("future owns sink").deliver(result);
         let old = std::mem::replace(&mut self.future, AsyncFutureState::Done);
-        contained_drop(old);
-        Poll::Ready(delivery)
+        contained_drop_async_state(old);
+        Poll::Ready(ExecutorDriveReport { terminal, delivery })
     }
 }
 
@@ -592,7 +639,28 @@ impl Drop for AsyncDispatchFuture {
             let _ = sink.deliver(Err(ExternalFailure::cancelled()));
         }
         let old = std::mem::replace(&mut self.future, AsyncFutureState::Done);
-        contained_drop(old);
+        contained_drop_async_state(old);
+    }
+}
+
+fn contained_drop_async_state(state: AsyncFutureState) {
+    #[cfg(panic = "unwind")]
+    if std::thread::panicking() {
+        std::mem::forget(state);
+        return;
+    }
+    match state {
+        AsyncFutureState::Running(future) => contained_drop(future),
+        AsyncFutureState::Immediate {
+            result,
+            unstarted_job,
+        } => {
+            contained_drop(result);
+            if let Some(job) = unstarted_job {
+                contained_drop(job);
+            }
+        }
+        AsyncFutureState::Done => {}
     }
 }
 
@@ -634,6 +702,13 @@ impl SubmissionRejected {
 fn contained_drop<T>(value: T) {
     #[cfg(panic = "unwind")]
     {
+        // Starting an opaque destructor during an active unwind could abort on a
+        // second panic. Leak it instead. A single destructor panic outside an
+        // unwind is caught; a destructor that double-panics internally is fatal.
+        if std::thread::panicking() {
+            std::mem::forget(value);
+            return;
+        }
         let _ = catch_unwind(AssertUnwindSafe(|| drop(value)));
     }
     #[cfg(panic = "abort")]
@@ -832,7 +907,7 @@ mod tests {
         )
     }
 
-    fn poll_once(future: &mut AsyncDispatchFuture) -> Poll<CompletionDelivery> {
+    fn poll_once(future: &mut AsyncDispatchFuture) -> Poll<ExecutorDriveReport> {
         let mut context = Context::from_waker(Waker::noop());
         Pin::new(future).poll(&mut context)
     }
@@ -1079,7 +1154,7 @@ mod tests {
         let ExecutorDispatch::Blocking(dispatch) = submission.into_dispatch() else {
             unreachable!()
         };
-        assert_eq!(dispatch.run(), CompletionDelivery::Delivered);
+        assert_eq!(dispatch.run().delivery, CompletionDelivery::Delivered);
         assert_eq!(
             cancel.cancel_before_start(),
             CancelBeforeStart::AlreadyRunning
@@ -1171,10 +1246,10 @@ mod tests {
                 unreachable!()
             };
             let mut future = dispatch.into_future();
-            assert!(matches!(
-                poll_once(&mut future),
-                Poll::Ready(CompletionDelivery::Delivered)
-            ));
+            let Poll::Ready(report) = poll_once(&mut future) else {
+                panic!("fixture is immediately ready")
+            };
+            assert_eq!(report.delivery, CompletionDelivery::Delivered);
             assert_eq!(sender.attempts.load(Ordering::Relaxed), 1);
         }
     }
@@ -1288,7 +1363,7 @@ mod tests {
         let ExecutorDispatch::Blocking(dispatch) = submission.into_dispatch() else {
             unreachable!()
         };
-        assert_eq!(dispatch.run(), CompletionDelivery::InboxClosed);
+        assert_eq!(dispatch.run().delivery, CompletionDelivery::InboxClosed);
         assert_eq!(sender.attempts.load(Ordering::Relaxed), 1);
     }
 
@@ -1528,5 +1603,144 @@ mod tests {
         }));
         assert_eq!(result.unwrap(), SubmitErrorKind::Capacity);
         assert_eq!(sender.attempts.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    #[cfg(panic = "unwind")]
+    fn queued_async_cancellation_delivers_before_containing_job_drop_panic() {
+        struct HostileDrop;
+        impl Drop for HostileDrop {
+            fn drop(&mut self) {
+                panic!("hostile queued async job drop");
+            }
+        }
+        let hostile = HostileDrop;
+        let prepared = PreparedExternalOperation::interruptible_async(
+            kind(1),
+            decoder(),
+            interruptible(),
+            move || {
+                drop(hostile);
+                std::future::ready(Ok(Box::new(1_u8) as SendPayload))
+            },
+        );
+        let (sender, runtime, submission, _) =
+            registration(prepared, kind(1), CompletionDelivery::Delivered);
+        let (_, _, cancel) = runtime.into_parts();
+        assert_eq!(
+            cancel.cancel_before_start(),
+            CancelBeforeStart::CancelledQueued
+        );
+        let ExecutorDispatch::Async(dispatch) = submission.into_dispatch() else {
+            unreachable!()
+        };
+        let mut future = dispatch.into_future();
+        let report = catch_unwind(AssertUnwindSafe(|| poll_once(&mut future)))
+            .expect("single destructor panic is contained");
+        assert_eq!(
+            report,
+            Poll::Ready(ExecutorDriveReport {
+                terminal: ExecutorTerminal::Cancelled,
+                delivery: CompletionDelivery::Delivered,
+            })
+        );
+        assert_eq!(sender.attempts.load(Ordering::Relaxed), 1);
+
+        let hostile = HostileDrop;
+        let prepared = PreparedExternalOperation::interruptible_async(
+            kind(1),
+            decoder(),
+            interruptible(),
+            move || {
+                drop(hostile);
+                std::future::ready(Ok(Box::new(1_u8) as SendPayload))
+            },
+        );
+        let (sender, runtime, submission, _) =
+            registration(prepared, kind(1), CompletionDelivery::Delivered);
+        let (_, _, cancel) = runtime.into_parts();
+        assert_eq!(
+            cancel.cancel_before_start(),
+            CancelBeforeStart::CancelledQueued
+        );
+        let ExecutorDispatch::Async(dispatch) = submission.into_dispatch() else {
+            unreachable!()
+        };
+        let future = dispatch.into_future();
+        assert!(catch_unwind(AssertUnwindSafe(|| drop(future))).is_ok());
+        assert_eq!(sender.attempts.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            sender.take().result.unwrap_err().code(),
+            ExternalFailureCode::Cancelled
+        );
+    }
+
+    #[test]
+    #[cfg(panic = "unwind")]
+    fn armed_dispatch_drop_delivers_before_containing_job_drop_panic() {
+        struct HostileDrop;
+        impl Drop for HostileDrop {
+            fn drop(&mut self) {
+                panic!("hostile armed job drop");
+            }
+        }
+        for asynchronous in [false, true] {
+            let hostile = HostileDrop;
+            let prepared = if asynchronous {
+                PreparedExternalOperation::interruptible_async(
+                    kind(1),
+                    decoder(),
+                    interruptible(),
+                    move || {
+                        drop(hostile);
+                        std::future::ready(Ok(Box::new(1_u8) as SendPayload))
+                    },
+                )
+            } else {
+                PreparedExternalOperation::interruptible_blocking(
+                    kind(1),
+                    decoder(),
+                    interruptible(),
+                    move || {
+                        drop(hostile);
+                        Ok(Box::new(1_u8))
+                    },
+                )
+            };
+            let (sender, _runtime, submission, _) =
+                registration(prepared, kind(1), CompletionDelivery::Delivered);
+            assert!(catch_unwind(AssertUnwindSafe(|| drop(submission.into_dispatch()))).is_ok());
+            assert_eq!(sender.attempts.load(Ordering::Relaxed), 1);
+            assert_eq!(
+                sender.take().result.unwrap_err().code(),
+                ExternalFailureCode::Cancelled
+            );
+        }
+    }
+
+    #[test]
+    fn terminal_report_classifies_worker_results_without_exposing_payload() {
+        let cases = [
+            (blocking(Ok(Box::new(1_u8))), ExecutorTerminal::Completed),
+            (
+                blocking(Err(ExternalFailure::bound_exceeded("bound"))),
+                ExecutorTerminal::Completed,
+            ),
+            (blocking_panic(), ExecutorTerminal::WorkerPanic),
+        ];
+        for (prepared, terminal) in cases {
+            let (_sender, _runtime, submission, _) =
+                registration(prepared, kind(1), CompletionDelivery::Delivered);
+            let ExecutorDispatch::Blocking(dispatch) = submission.into_dispatch() else {
+                unreachable!()
+            };
+            assert_eq!(
+                dispatch.run(),
+                ExecutorDriveReport {
+                    terminal,
+                    delivery: CompletionDelivery::Delivered,
+                }
+            );
+        }
     }
 }

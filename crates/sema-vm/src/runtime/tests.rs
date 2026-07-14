@@ -44,7 +44,7 @@ use super::{
         CompletionRoute, ForgedCompletionMutation, RegisterExternalError, RuntimeCreateError,
         WaitRuntime,
     },
-    RootPoll, Runtime, TestPreparedTask,
+    RootHandle, RootPoll, Runtime, TestPreparedTask,
 };
 
 #[test]
@@ -596,11 +596,9 @@ impl NativeContinuation for CaptureFailureContinuation {
     }
 }
 
-#[test]
-fn runtime_executes_a_real_vm_root_to_a_returned_value() {
-    // The unified runtime drives a real compiled Sema root via run_quantum and
-    // settles with its value — the first end-to-end evaluation through the runtime.
-    let vals = sema_reader::read_many("(+ 1 2)").expect("parse");
+/// Compile a Sema source expression and submit it as a real VM-backed root.
+fn submit_vm_expr(runtime: &Runtime, src: &str) -> RootHandle {
+    let vals = sema_reader::read_many(src).expect("parse");
     let prog = crate::compile_program(&vals, None).expect("compile");
     let mut vm = crate::VM::new_for_task_with_native_fns(
         Rc::new(sema_core::Env::new()),
@@ -608,9 +606,10 @@ fn runtime_executes_a_real_vm_root_to_a_returned_value() {
         Rc::new(Vec::new()),
     );
     vm.seed_main_frame(prog.closure);
+    runtime.submit_vm_root(vm).expect("root admitted")
+}
 
-    let runtime = runtime_with_inline_executor(Rc::new(FakeClock::new()));
-    let handle = runtime.submit_vm_root(vm).expect("root admitted");
+fn drive_root_to_int(runtime: &Runtime, handle: &RootHandle) -> i64 {
     let mut guard = 0;
     while matches!(handle.poll_result(), RootPoll::Pending) {
         runtime.drive(&drive_budget(64)).unwrap();
@@ -620,11 +619,35 @@ fn runtime_executes_a_real_vm_root_to_a_returned_value() {
     let RootPoll::Ready(settlement) = handle.poll_result() else {
         panic!("real vm root settles");
     };
-    assert!(
-        matches!(&settlement.outcome, TaskOutcome::Returned(v) if *v == Value::int(3)),
-        "expected Returned(3), got {:?}",
-        settlement.outcome
-    );
+    match &settlement.outcome {
+        TaskOutcome::Returned(v) => v.as_int().expect("integer result"),
+        other => panic!("expected Returned, got {other:?}"),
+    }
+}
+
+#[test]
+fn runtime_executes_a_real_vm_root_to_a_returned_value() {
+    // The unified runtime drives a real compiled Sema root via run_quantum and
+    // settles with its value — the first end-to-end evaluation through the runtime.
+    let runtime = runtime_with_inline_executor(Rc::new(FakeClock::new()));
+    let handle = submit_vm_expr(&runtime, "(+ 1 2)");
+    assert_eq!(drive_root_to_int(&runtime, &handle), 3);
+}
+
+#[test]
+fn runtime_interleaves_two_real_vm_roots_independently() {
+    // Two real roots submitted before driving settle independently with their
+    // own values — the runtime evaluates multiple concurrent roots.
+    let runtime = runtime_with_inline_executor(Rc::new(FakeClock::new()));
+    let a = submit_vm_expr(&runtime, "(+ 1 2)");
+    let b = submit_vm_expr(&runtime, "(+ 20 22)");
+    while matches!(a.poll_result(), RootPoll::Pending)
+        || matches!(b.poll_result(), RootPoll::Pending)
+    {
+        runtime.drive(&drive_budget(64)).unwrap();
+    }
+    assert_eq!(drive_root_to_int(&runtime, &a), 3);
+    assert_eq!(drive_root_to_int(&runtime, &b), 42);
 }
 
 #[test]

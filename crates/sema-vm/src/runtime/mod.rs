@@ -19,7 +19,8 @@ pub use task::{
 };
 pub use timer::TimerQueue;
 pub use wait::{
-    CompletionRoute, PendingResume, RegisterExternalError, RuntimeCreateError, WaitRuntime,
+    CleanupDiagnostic, CompletionRoute, PendingResume, RegisterExternalError, RuntimeCreateError,
+    WaitRuntime,
 };
 
 #[cfg(test)]

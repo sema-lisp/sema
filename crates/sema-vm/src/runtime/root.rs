@@ -66,6 +66,14 @@ impl RootRecord {
         Self::checked_decrement(&mut self.live_descendants, "root descendant count");
     }
 
+    pub fn retain_descendant(&mut self) -> bool {
+        let Some(count) = self.live_descendants.checked_add(1) else {
+            return false;
+        };
+        self.live_descendants = count;
+        true
+    }
+
     pub fn is_reap_eligible(&self) -> bool {
         matches!(self.state, RootState::Settled(_) | RootState::Aborted)
             && self.handle_count == 0

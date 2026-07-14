@@ -968,6 +968,45 @@ impl Runtime {
     }
 
     #[cfg(test)]
+    pub(super) fn late_completion_count_for_test(&self) -> usize {
+        self.state
+            .borrow()
+            .waits
+            .as_ref()
+            .map_or(0, WaitRuntime::late_completions)
+    }
+
+    #[cfg(test)]
+    pub(super) fn cleanup_diagnostics_for_test(&self) -> Vec<super::CleanupDiagnostic> {
+        self.state
+            .borrow()
+            .waits
+            .as_ref()
+            .map_or_else(Vec::new, WaitRuntime::cleanup_diagnostics)
+    }
+
+    #[cfg(test)]
+    pub(super) fn retain_descendant_for_test(&self, root: RootId) {
+        assert!(self
+            .state
+            .borrow_mut()
+            .roots
+            .get_mut(&root)
+            .expect("root")
+            .retain_descendant());
+    }
+
+    #[cfg(test)]
+    pub(super) fn release_descendant_for_test(&self, root: RootId) {
+        let mut state = self.state.borrow_mut();
+        let record = state.roots.get_mut(&root).expect("root");
+        record.release_descendant();
+        if record.is_reap_eligible() {
+            state.handle_cleanup.push_back(root);
+        }
+    }
+
+    #[cfg(test)]
     pub(super) fn force_settlement_exhaustion_for_test(&self) {
         self.state.borrow_mut().force_settlement_exhaustion = true;
     }

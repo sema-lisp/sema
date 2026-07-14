@@ -79,6 +79,14 @@ struct CleanupEntry {
     quarantine: bool,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CleanupDiagnostic {
+    pub wait: WaitKey,
+    pub reap_attempts: usize,
+    pub last_error: Option<String>,
+    pub quarantine: bool,
+}
+
 pub struct PendingResume {
     key: WaitKey,
     task_id: TaskId,
@@ -532,6 +540,20 @@ impl WaitRuntime {
     }
     pub fn quarantine_reaped(&self) -> usize {
         self.quarantine_reaped
+    }
+    pub fn cleanup_diagnostics(&self) -> Vec<CleanupDiagnostic> {
+        let mut diagnostics = self
+            .cleanup
+            .iter()
+            .map(|(wait, entry)| CleanupDiagnostic {
+                wait: *wait,
+                reap_attempts: entry.reap_attempts,
+                last_error: entry.last_error.clone(),
+                quarantine: entry.quarantine,
+            })
+            .collect::<Vec<_>>();
+        diagnostics.sort_by_key(|item| (item.wait.id, item.wait.generation));
+        diagnostics
     }
     #[cfg(test)]
     pub fn cleanup_tombstones(&self) -> usize {

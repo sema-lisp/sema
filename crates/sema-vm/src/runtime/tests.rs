@@ -569,8 +569,156 @@ fn runtime_rejects_forged_completion_identity_before_decode() {
         assert!(events.lock().unwrap().is_empty());
         assert!(matches!(handle.poll_result(), RootPoll::Pending));
     }
-    runtime.drive(&drive_budget(16)).unwrap();
+    for _ in 0..32 {
+        runtime.drive(&drive_budget(4)).unwrap();
+        if matches!(handle.poll_result(), RootPoll::Ready(_)) {
+            break;
+        }
+    }
     assert_eq!(&*events.lock().unwrap(), &["decode", "returned"]);
+}
+
+#[test]
+fn runtime_decode_failure_settles_once_and_duplicate_completion_is_late() {
+    let runtime = runtime_with_inline_executor(Rc::new(FakeClock::new()));
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let handle = runtime
+        .submit_test_root(TestPreparedTask::native(Ok(NativeOutcome::Suspend(
+            decode_failure_suspend(events.clone()),
+        ))))
+        .unwrap();
+    while runtime.active_wait_count_for_test() == 0 {
+        runtime.drive(&drive_budget(1)).unwrap();
+    }
+    runtime.forge_completion_for_test(
+        ForgedCompletionMutation::None,
+        Ok(Box::new("wrong payload type")),
+    );
+    runtime.forge_completion_for_test(ForgedCompletionMutation::None, Ok(Box::new(())));
+    for _ in 0..32 {
+        runtime.drive(&drive_budget(4)).unwrap();
+        if matches!(handle.poll_result(), RootPoll::Ready(_)) {
+            break;
+        }
+    }
+
+    let RootPoll::Ready(first) = handle.poll_result() else {
+        panic!("decode failure settles root")
+    };
+    let RootPoll::Ready(second) = handle.poll_result() else {
+        panic!("settlement remains pollable")
+    };
+    assert!(Rc::ptr_eq(&first, &second));
+    assert_eq!(runtime.late_completion_count_for_test(), 2);
+}
+
+#[test]
+fn runtime_two_handles_repeat_every_terminal_outcome_and_reap_in_both_drop_orders() {
+    for index in 0..3 {
+        for drop_original_first in [false, true] {
+            let runtime = runtime_with_inline_executor(Rc::new(FakeClock::new()));
+            let first = runtime.submit_test_root(prepared_for_case(index)).unwrap();
+            let second = first.clone();
+            if index == 2 {
+                assert!(first.cancel(CancelReason::Explicit));
+            }
+            runtime.drive(&drive_budget(16)).unwrap();
+            for _ in 0..3 {
+                let RootPoll::Ready(a) = first.poll_result() else {
+                    panic!("first terminal poll")
+                };
+                let RootPoll::Ready(b) = second.poll_result() else {
+                    panic!("second terminal poll")
+                };
+                assert!(Rc::ptr_eq(&a, &b));
+            }
+            if drop_original_first {
+                drop(first);
+                runtime.drive(&drive_budget(2)).unwrap();
+                assert_eq!(runtime.root_count(), 1);
+                drop(second);
+            } else {
+                drop(second);
+                runtime.drive(&drive_budget(2)).unwrap();
+                assert_eq!(runtime.root_count(), 1);
+                drop(first);
+            }
+            runtime.drive(&drive_budget(2)).unwrap();
+            assert_eq!(runtime.root_count(), 0);
+        }
+    }
+}
+
+fn prepared_for_case(index: usize) -> TestPreparedTask {
+    match index {
+        0 => TestPreparedTask::returned(Value::int(1)),
+        1 => TestPreparedTask::native(Err(SemaError::eval("failed"))),
+        _ => TestPreparedTask::yield_forever(),
+    }
+}
+
+#[test]
+fn runtime_settled_root_waits_for_retained_descendant_then_reaps() {
+    let runtime = runtime_with_inline_executor(Rc::new(FakeClock::new()));
+    let handle = runtime
+        .submit_test_root(TestPreparedTask::returned(Value::NIL))
+        .unwrap();
+    let root = handle.id();
+    runtime.retain_descendant_for_test(root);
+    runtime.drive(&drive_budget(8)).unwrap();
+    drop(handle);
+    runtime.drive(&drive_budget(8)).unwrap();
+    assert_eq!(runtime.root_count(), 1);
+    runtime.release_descendant_for_test(root);
+    runtime.drive(&drive_budget(8)).unwrap();
+    assert_eq!(runtime.root_count(), 0);
+}
+
+#[test]
+fn runtime_persistent_reap_diagnostic_survives_and_shutdown_is_not_clean() {
+    let clock = Rc::new(FakeClock::new());
+    let runtime = runtime_with_inline_executor(clock.clone());
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let handle = runtime
+        .submit_test_root(TestPreparedTask::native(Ok(NativeOutcome::Suspend(
+            interruptible_suspend_with_hook(
+                Arc::new(Mutex::new(Vec::new())),
+                RecordingHook {
+                    result: CancelResult::Error,
+                    calls: calls.clone(),
+                    edge: None,
+                    trace_ok: true,
+                },
+            ),
+        ))))
+        .unwrap();
+    while runtime.active_wait_count_for_test() == 0 {
+        runtime.drive(&drive_budget(1)).unwrap();
+    }
+    runtime.forge_completion_for_test(
+        ForgedCompletionMutation::Kind(CompletionKind::try_from_raw(99).unwrap()),
+        Ok(Box::new(())),
+    );
+    assert!(handle.cancel(CancelReason::Explicit));
+    runtime.drive(&drive_budget(8)).unwrap();
+    let diagnostics = runtime.cleanup_diagnostics_for_test();
+    assert_eq!(diagnostics.len(), 1);
+    assert!(diagnostics[0].reap_attempts > 0);
+    assert_eq!(
+        diagnostics[0].last_error.as_deref(),
+        Some("resource cancellation hook failed: cancel failed")
+    );
+
+    clock.advance(Duration::from_secs(2));
+    let report = runtime
+        .shutdown(&super::ShutdownOptions {
+            deadline: clock.now(),
+            drive_budget: drive_budget(8),
+        })
+        .unwrap();
+    assert!(!report.clean);
+    assert_eq!(report.retained_cleanup, 1);
+    assert!(calls.lock().unwrap().starts_with(&["cancel", "reap"]));
 }
 
 #[test]
@@ -775,6 +923,23 @@ impl Trace for CountingDecoder {
         true
     }
 }
+
+struct DecodeFailureDecoder(Arc<Mutex<Vec<&'static str>>>);
+impl Trace for DecodeFailureDecoder {
+    fn trace(&self, _sink: &mut dyn FnMut(sema_core::cycle::GcEdge<'_>)) -> bool {
+        true
+    }
+}
+impl CompletionDecoder for DecodeFailureDecoder {
+    fn decode(
+        self: Box<Self>,
+        _context: &mut NativeCallContext<'_>,
+        _result: Result<sema_core::runtime::SendPayload, sema_core::runtime::ExternalFailure>,
+    ) -> Result<Value, SemaError> {
+        self.0.lock().unwrap().push("decode");
+        Err(SemaError::eval("decode failed"))
+    }
+}
 impl CompletionDecoder for CountingDecoder {
     fn decode(
         self: Box<Self>,
@@ -895,6 +1060,18 @@ fn external_suspend(events: Arc<Mutex<Vec<&'static str>>>) -> NativeSuspend {
             Box::new(CountingDecoder(Arc::clone(&events))),
             sema_core::runtime::QuarantineBound::hard_deadline(Duration::from_secs(1)).unwrap(),
             || Ok(Box::new(7_i32)),
+        ))),
+        continuation: Box::new(CountingContinuation(events)),
+    }
+}
+
+fn decode_failure_suspend(events: Arc<Mutex<Vec<&'static str>>>) -> NativeSuspend {
+    NativeSuspend {
+        wait: WaitKind::External(Box::new(PreparedExternalOperation::quarantined_blocking(
+            CompletionKind::try_from_raw(1).unwrap(),
+            Box::new(DecodeFailureDecoder(Arc::clone(&events))),
+            sema_core::runtime::QuarantineBound::hard_deadline(Duration::from_secs(1)).unwrap(),
+            || Ok(Box::new(())),
         ))),
         continuation: Box::new(CountingContinuation(events)),
     }

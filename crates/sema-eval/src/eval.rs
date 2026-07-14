@@ -152,11 +152,32 @@ impl Interpreter {
     /// interpreter-owned, shared-context runtime (`ctx: Rc<EvalContext>` with
     /// proper drop ordering, constructed once) is the next integration slice.
     pub fn eval_via_runtime(&self, expr: &Value) -> EvalResult {
+        self.run_exprs_via_runtime(std::slice::from_ref(expr))
+    }
+
+    /// Parse a whole program (one or more top-level forms) and evaluate it as a
+    /// single VM-backed root on the unified runtime. Mirrors
+    /// [`eval_str_in_global`](Self::eval_str_in_global) but drives through the
+    /// runtime; `define`s land in and persist across this interpreter's globals.
+    ///
+    /// Like [`eval_via_runtime`](Self::eval_via_runtime), only synchronous
+    /// programs are supported (the runtime uses a `NullExecutor`).
+    pub fn eval_str_via_runtime(&self, input: &str) -> EvalResult {
+        let (exprs, spans) = sema_reader::read_many_with_spans(input)?;
+        self.ctx.merge_span_table(spans);
+        if exprs.is_empty() {
+            return Ok(Value::nil());
+        }
+        self.run_exprs_via_runtime(&exprs)
+    }
+
+    /// Macro-expand, compile, and drive a sequence of top-level forms as one
+    /// root on the unified runtime. Shared by the runtime eval entry points.
+    fn run_exprs_via_runtime(&self, exprs: &[Value]) -> EvalResult {
         use sema_vm::runtime::{
             DriveBudget, DriveState, MonotonicClock, NullExecutor, RootPoll, Runtime,
         };
 
-        let exprs = std::slice::from_ref(expr);
         let expanded = expand_for_vm_batch(&self.ctx, &self.global_env, exprs)?;
         let known_natives = collect_native_names(&self.global_env);
         let span_map = self.ctx.span_table.borrow().clone();
@@ -1945,5 +1966,112 @@ mod runtime_eval_tests {
         let (exprs, _spans) = sema_reader::read_many_with_spans("(double 21)").expect("parse");
         let result = interp.eval_via_runtime(&exprs[0]).expect("eval");
         assert_eq!(result, Value::int(42));
+    }
+
+    /// Assert the runtime path returns exactly what the normal `eval_str`
+    /// evaluator produces for the same program on a fresh interpreter. The
+    /// `eval_str` result is the correctness oracle.
+    fn assert_runtime_matches_oracle(program: &str) {
+        let oracle_interp = Interpreter::new();
+        let expected = oracle_interp
+            .eval_str(program)
+            .unwrap_or_else(|e| panic!("oracle eval_str failed for {program:?}: {e:?}"));
+        let interp = Interpreter::new();
+        let got = interp
+            .eval_str_via_runtime(program)
+            .unwrap_or_else(|e| panic!("eval_str_via_runtime failed for {program:?}: {e:?}"));
+        assert_eq!(got, expected, "runtime != oracle for {program:?}");
+    }
+
+    // Higher-order stdlib functions re-enter the evaluator through the
+    // `call_value` callback for each element; each gate asserts parity with the
+    // normal evaluator.
+    #[test]
+    fn eval_via_runtime_map() {
+        assert_runtime_matches_oracle("(map (fn (x) (* x 2)) (list 1 2 3))");
+    }
+
+    #[test]
+    fn eval_via_runtime_filter() {
+        assert_runtime_matches_oracle("(filter odd? (list 1 2 3 4))");
+    }
+
+    #[test]
+    fn eval_via_runtime_foldl() {
+        assert_runtime_matches_oracle("(foldl + 0 (list 1 2 3 4))");
+    }
+
+    // A recursive user `define` created via the normal evaluator is callable
+    // through the runtime, and the recursion (a self tail/non-tail call) runs
+    // to completion.
+    #[test]
+    fn eval_via_runtime_recursion() {
+        let interp = Interpreter::new();
+        interp
+            .eval_str("(define (fact n) (if (< n 2) 1 (* n (fact (- n 1)))))")
+            .expect("define");
+        let result = interp.eval_str_via_runtime("(fact 5)").expect("eval");
+        assert_eq!(result, Value::int(120));
+    }
+
+    // A raising program returns `Err(..)` — not a panic and not a wrong `Ok`.
+    #[test]
+    fn eval_via_runtime_propagates_error_from_error_call() {
+        let interp = Interpreter::new();
+        let result = interp.eval_str_via_runtime("(error \"boom\")");
+        assert!(result.is_err(), "expected Err, got {result:?}");
+        let msg = format!("{}", result.unwrap_err());
+        assert!(msg.contains("boom"), "error message missing 'boom': {msg}");
+    }
+
+    #[test]
+    fn eval_via_runtime_propagates_division_by_zero() {
+        let interp = Interpreter::new();
+        let result = interp.eval_str_via_runtime("(/ 1 0)");
+        assert!(result.is_err(), "expected Err, got {result:?}");
+    }
+
+    // Multiple top-level forms in one program evaluate as a single root; the
+    // last form's value is returned and an intervening `define` is visible.
+    #[test]
+    fn eval_via_runtime_multiple_top_level_forms() {
+        let interp = Interpreter::new();
+        let result = interp
+            .eval_str_via_runtime("(define x 10) (+ x 5)")
+            .expect("eval");
+        assert_eq!(result, Value::int(15));
+    }
+
+    // A `define` issued through the runtime persists on the interpreter and is
+    // visible to a later runtime eval on the same interpreter.
+    #[test]
+    fn eval_via_runtime_defines_persist_across_calls() {
+        let interp = Interpreter::new();
+        interp
+            .eval_str_via_runtime("(define counter 41)")
+            .expect("define");
+        let result = interp.eval_str_via_runtime("(+ counter 1)").expect("eval");
+        assert_eq!(result, Value::int(42));
+    }
+
+    // BOUNDARY (next slice): the runtime eval path deliberately does NOT wire up
+    // the legacy yield-signal async scheduler (`init_scheduler`) that
+    // `run_exprs_on_vm` installs — the whole point of the unified runtime is to
+    // replace it with a real executor, which this synchronous `NullExecutor`
+    // path does not yet provide. So any true async primitive fails fast rather
+    // than silently running on the legacy scheduler. `async/spawn` hits it with
+    // the exact error below. Ignored + documented so the async-executor slice
+    // has a concrete target; run with `--ignored` to observe the boundary.
+    #[test]
+    #[ignore = "async needs the real executor; runtime path has no scheduler yet"]
+    fn eval_via_runtime_async_spawn_is_unsupported_boundary() {
+        let interp = Interpreter::new();
+        let result = interp.eval_str_via_runtime("(async/spawn (fn () 1))");
+        let err = result.expect_err("async/spawn must not settle without an executor");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("no async scheduler registered"),
+            "unexpected boundary error: {msg}"
+        );
     }
 }

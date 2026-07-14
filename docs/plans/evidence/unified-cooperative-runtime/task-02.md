@@ -68,7 +68,7 @@ refreshed without changing semantic row assignments.
 | `native` / `cycle` | PASS: 8 native tests and 34 cycle tests. |
 | `task_context` / `context` | PASS: 7 task-context tests and 21 context tests. |
 | runtime conformance `legacy` / `scanner` / `inventory` filters | PASS; the complete target's 8 tests pass. |
-| `cargo check -p sema-vm` | PASS. | 
+| `cargo check -p sema-vm` | PASS. |
 | `scripts/check-unified-runtime-legacy.sh --check` | PASS: 970 exact matches. |
 | `scripts/check-unified-runtime-inventory.sh --check` | PASS: 1,256 exact mapped matches; no `UNREVIEWED` row. |
 
@@ -129,3 +129,24 @@ the WASM local host, language predicates, and deletion of every legacy bridge.
 The seven VM REDs remain assigned to Tasks 03/04, and watchdog fairness remains
 Task 03. Independent Task 02 review with stable `UR-T02-R###` IDs and its final
 review document remain deliberately outstanding.
+
+## Review pending
+
+The final Task 02 acceptance document is not created yet. Stable review findings
+are tracked here until that review closes:
+
+- `UR-T02-R100` — resolved by the documentation reconciliation commit: removed
+  trailing whitespace and reran range/current `git diff --check`.
+- `UR-T02-R201` — resolved in `8d3f7abb`: payload-backed runtime native callbacks
+  retain traceable state without a strong closure capture.
+- `UR-T02-R202` — resolved by the documentation reconciliation commit: Task 03
+  now binds and splits before atomically installing the registered wait,
+  resource, and `Waiting` state, and submits only after registration is complete.
+- `UR-T02-R301` — resolved in `5f9510e7`: unadmitted owner destruction is
+  contained.
+- `UR-T02-R302` — resolved by the documentation reconciliation commit: Task 03
+  specifies `RuntimeCreateError::IdExhausted` separately from
+  `RuntimeCreateError::ExecutorAttach(ExecutorAttachError)`.
+- `UR-T02-R303` — resolved by the documentation reconciliation commit: Task 05
+  uses private prepared-operation jobs carried through opaque submission and
+  dispatch wrappers, with no second public job seam.

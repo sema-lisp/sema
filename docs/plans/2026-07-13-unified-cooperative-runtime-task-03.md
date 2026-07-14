@@ -143,11 +143,16 @@ pub struct ShutdownOptions {
     pub drive_budget: DriveBudget,
 }
 
+pub enum RuntimeCreateError {
+    IdExhausted,
+    ExecutorAttach(ExecutorAttachError),
+}
+
 impl Runtime {
     pub fn new(
         clock: Rc<dyn RuntimeClock>,
         executor: Arc<dyn IoExecutor>,
-    ) -> Result<Self, ExecutorAttachError>;
+    ) -> Result<Self, RuntimeCreateError>;
     pub fn submit_root(
         &self,
         prepared: PreparedRoot,
@@ -177,11 +182,16 @@ descendant, debugger, output, and tracing retention reaches zero.
 `Runtime::new` creates its thread-safe completion inbox, calls
 `CompletionRegistrar::register` to receive a fresh `RuntimeId` plus the
 capability-safe registrar, stores the registrar privately, and calls
-`executor.attach_runtime(runtime_id)` once and propagates attachment failure.
-Duplicate IDs and attachment after executor shutdown are errors. Runtime state owns the returned
+`executor.attach_runtime(runtime_id)` once. Registrar exhaustion returns
+`RuntimeCreateError::IdExhausted`; attachment failure returns
+`RuntimeCreateError::ExecutorAttach(error)` without misclassifying it as ID
+exhaustion. Duplicate IDs and attachment after executor shutdown are attachment
+errors. Runtime state owns the returned
 `Arc<dyn ExecutorLease>` and inbox receiver. Tests inject a Task 02 fake
 executor/lease; Task 03 has no dependency on `sema-io`. Task 05 wires the
-production `sema-io` implementation at host construction sites.
+production `sema-io` implementation at host construction sites. Constructor
+tests force registrar exhaustion and each executor attachment failure and assert
+the exact `RuntimeCreateError` variant.
 
 `RootPoll` is `Pending`, `Ready(Result<Value, SemaError>)`, or
 `RuntimeDropped`. Polling never drives the runtime. Result retrieval is
@@ -277,13 +287,16 @@ safe.
 `Runtime::apply_native_suspend` owns one external-registration transaction. It
 reads `NativeSuspend.wait`; for `WaitKind::External`, it reads
 `prepared.completion_kind()` to issue the complete identity before moving the
-sole `Box<PreparedExternalOperation>` into registrar binding. It allocates `OperationId`,
-`WaitId`, `WaitGeneration`, and completion identity, and installs `RegisteredExternalWait`, the concrete
-`ResourceClass` cleanup entry, and the task's `Running -> Waiting` state. Its
-private registrar binds that runtime-issued identity and prepared operation,
-then splits the binding: the VM retains the non-`Send` decoder/resource half and
-submits only the opaque `ExecutorSubmission`. `sema-io` cannot name the sink or
-obtain a registrar for this runtime. The executor cannot drain the
+sole `Box<PreparedExternalOperation>` into registrar binding. It allocates
+`OperationId`, `WaitId`, `WaitGeneration`, and completion identity. Its private
+registrar then binds that runtime-issued identity and prepared operation and
+splits the binding: the runtime receives the decoder, resource, and queue-control
+half, while the executor-facing half is one opaque `ExecutorSubmission`. In one
+atomic state transition, the runtime installs those runtime-local pieces in
+`RegisteredExternalWait`, installs the concrete `ResourceClass` cleanup entry,
+and changes the task from `Running` to `Waiting`. Only after that transition
+commits does it submit the opaque `ExecutorSubmission`. `sema-io` cannot name the
+sink or obtain a registrar for this runtime. The executor cannot drain the
 completion inbox reentrantly during this transition, so
 an executor that completes inline during `submit` sees fully registered waiting
 state; its completion is processed only after `apply_native_suspend` returns.
@@ -395,7 +408,11 @@ Cover same-deadline insertion order, zero duration, timer cancellation,
 generation reuse, wrong runtime, wrong operation, wrong completion kind,
 correct-kind payload decode failure, duplicate completion,
 completion-vs-cancellation races, per-turn completion/timer/cleanup/root limits,
-and wall-clock budget expiry measured with an injected clock. Wrong-kind
+and wall-clock budget expiry measured with an injected clock. Cover
+`Runtime::new` registrar exhaustion as `RuntimeCreateError::IdExhausted` and
+duplicate-runtime/shutdown attachment failures as
+`RuntimeCreateError::ExecutorAttach` carrying the exact `ExecutorAttachError`.
+Wrong-kind
 delivery must leave the wait/task outcome unchanged and must not invoke the
 decoder; correct-kind decode failure is delivered as the Task 02 `Decode`
 failure. Add fake hooks whose one-shot `cancel` returns `PendingReap` and `Err`:
@@ -407,7 +424,9 @@ Use counted consuming decoder/continuation fakes to prove exactly one fate for
 each on success, worker failure, decode error, explicit cancellation, and submit
 rejection. Cancellation drops (does not invoke) the decoder once and invokes the
 continuation once with `Cancelled`; rejection traverses decoder then
-continuation.
+continuation. The inline-completion and rejection tests must exercise the exact
+order: inspect completion kind and issue identity; bind and split; atomically
+install the registered wait, resource, and `Waiting` state; then submit.
 Add quarantine routing tests for both completion-vs-cancel orders, exact
 cleanup-only completion, wrong-kind cleanup completion, duplicate after reap,
 bound expiry, and shutdown returning zero live cleanup after an in-bound

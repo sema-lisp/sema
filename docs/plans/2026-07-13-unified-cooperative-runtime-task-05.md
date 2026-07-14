@@ -10,8 +10,9 @@ an explicit interruptible or quarantined-bounded cancellation contract, and
 eliminate blocking/polling branches from runtime tasks.
 
 **Architecture:** `sema-io` remains the one process-wide native executor, but it
-executes send-only `ExecutorJob`s and reports tagged `ExternalCompletion`s. The
-interpreter runtime owns waits, decoders, cancellation, and cleanup. Resource
+executes private send-only jobs owned by `PreparedExternalOperation` and reports
+tagged `ExternalCompletion`s through opaque executor wrappers. The interpreter
+runtime owns waits, decoders, cancellation, and cleanup. Resource
 builtins return `NativeOutcome` regardless of whether called at a root or nested
 inside a task; synchronous host APIs obtain blocking behavior by driving roots,
 not by calling `io_block_on` from a VM task.
@@ -102,7 +103,7 @@ fake servers, deterministic fault injection.
 
 Task 02 defines the exact `CompletionSender`, private unnameable
 `CompletionSink`, capability-safe `CompletionRegistrar`, opaque
-`ExecutorSubmission`, `ExecutorDispatch` wrappers, `ExecutorJob`,
+`ExecutorSubmission` and `ExecutorDispatch` wrappers,
 `PreparedExternalOperation`, `RunningSubmission`, owning `SubmissionRejected`,
 `ExecutorDriveReport`/`ExecutorTerminal`, `ExecutorLease`, and `IoExecutor`
 interfaces in `sema-core`. Task 03 consumes
@@ -155,14 +156,15 @@ impl ExecutorLease for ProcessExecutorLease {
 }
 ```
 
-Task 02 defines `ExecutorJob` and the sole unregistered
-`PreparedExternalOperation` with its three compatibility-enforcing constructors;
-Task 03 defines the distinct
+Task 02 defines the sole unregistered `PreparedExternalOperation` with three
+compatibility-enforcing constructors. Each prepared operation privately owns
+exactly one async or blocking job; no public nominal job type crosses the core
+boundary. Task 03 defines the distinct
 `RegisteredExternalWait`. Task 05 implements their executor boundary but MUST
 NOT introduce a second prepared/external-wait owner. The executor reserves
 capacity while it owns an unarmed submission, calls `into_dispatch` as the
 admission linearization point, and enqueues only the armed dispatch. It never
-passes either wrapper to the job's consuming `run`. The job only returns a
+passes either wrapper to the private job's consuming run path. The job returns a
 send-safe result. Worker code therefore cannot omit or duplicate completion
 delivery, select the completion kind, return a resource/cancel hook, or move
 VM-side cleanup state across the thread boundary. `RunningSubmission` is only an
@@ -180,12 +182,14 @@ another interpreter. Duplicate attachment and attachment after pool shutdown
 return `ExecutorAttachError`. The shared pool may stop workers after the final
 lease unregisters or an explicit process shutdown. `Runtime::apply_native_suspend` dispatches its sole
 boxed prepared request to private `start_external`, which destructures that
-bundle once. Before calling the lease's `submit`, it installs the task's
-`Running -> Waiting` state, `RegisteredExternalWait` with traced decoder and
-continuation, and concrete cleanup/resource entry, then uses its privately owned
-registrar to bind the runtime-issued identity and prepared operation. The split
-keeps decoder/resource state runtime-local and gives `sema-io` only the
-submission; it never receives or can name the sink. After capacity reservation,
+bundle once. It first reads the prepared completion kind and issues the complete
+runtime identity, then uses its private registrar to bind and split the prepared
+operation. The split yields runtime-local decoder/resource/queue-control state
+and one opaque `ExecutorSubmission`. In one atomic transition, the runtime
+installs `RegisteredExternalWait` with its traced decoder and continuation, the
+concrete cleanup/resource entry, and the task's `Running -> Waiting` state. Only
+then does it call the lease's `submit` with the opaque submission; `sema-io`
+never receives or can name the sink or private job. After capacity reservation,
 `sema-io` calls `into_dispatch()` before enqueue. An inline
 completion can only enqueue; the dispatch wrapper processes it after this
 transition returns and therefore observes the
@@ -384,18 +388,21 @@ Then cover cancellation before job starts, cancellation during job, cancel
 twice, wrong runtime/generation/operation/kind, a fault-injected duplicate
 completion at the inbox boundary, quarantine completion after observer
 cancellation, and shutdown with one job in each state. Duplicate delivery is an
-inbox/fault-injection case because the public `ExecutorJob` API cannot produce it.
+inbox/fault-injection case because opaque dispatch wrappers own terminal
+delivery and private jobs cannot access the sink.
 
-- [ ] **Step 2: Implement prepared operations, `ExecutorJob`, admission, and counters**
+- [ ] **Step 2: Implement prepared operations, opaque dispatch, admission, and counters**
 
 Preserve the process-wide pool identity and blocking-tier admission headroom.
 Keep `CompletionSink`, submission construction, and result delivery private to
 `sema-core::runtime`; `sema-io` must only queue the opaque
 `ExecutorSubmission` until capacity is reserved, arm it with `into_dispatch`,
 and queue only its `Async`/`Blocking` dispatch wrapper. Construct the
-queue-cancel/start-token pair before wait
-registration, store the runtime handle beside `ResourceClass`, and submit the
-non-cloneable token with the job. Implement the exact atomic
+queue-cancel/start-token pair before binding, store the runtime handle beside
+`ResourceClass`, and carry the private job and non-cloneable token only through
+`ExecutorSubmission` and `ExecutorDispatch`. `sema-io` implements admission and
+dispatch wrappers around those opaque core types; it never declares a second
+public nominal job seam. Implement the exact atomic
 cancel-versus-dequeue transition and rejection rollback before migrating any
 builtin. For every interruptible row, construct and test a pre-armed sticky
 runtime-hook/job-token pair whose wake participates in potentially blocking

@@ -199,7 +199,9 @@ pub struct CompletionRegistrar { /* private runtime id + sender capability */ }
 impl CompletionRegistrar {
     /// Allocates a fresh RuntimeId; it cannot target an existing runtime.
     #[doc(hidden)]
-    pub fn register(sender: Arc<dyn CompletionSender>) -> (RuntimeId, Self);
+    pub fn register(
+        sender: Arc<dyn CompletionSender>,
+    ) -> Result<(RuntimeId, Self), IdExhausted>;
 
     #[doc(hidden)]
     pub fn bind(

@@ -2138,4 +2138,109 @@ mod runtime_eval_tests {
             .expect("a spawned task that sleeps resolves through the runtime");
         assert_eq!(result, Value::int(7));
     }
+
+    // ── ADVERSARIAL VERIFICATION (spawn/await seam) ──────────────────
+
+    // Awaiting a spawned task that raises settles the awaiting root Failed with
+    // the real rejection error (not a panic, hang, or wrong Ok value).
+    #[test]
+    fn runtime_await_rejected_spawn_settles_failed() {
+        let interp = Interpreter::new();
+        let result =
+            interp.eval_str_via_runtime("(await (async/spawn (fn () (error \"boom\"))))");
+        let msg = format!("{}", result.expect_err("await of a raising task must fail"));
+        assert!(msg.contains("boom"), "missing cause: {msg}");
+    }
+
+    // Await of an ALREADY-settled promise resumes with the value: spawn, let the
+    // child settle during a sleep, then await -> returns the resolved value with
+    // no double-settle or hang.
+    #[test]
+    fn runtime_await_already_settled_promise() {
+        let interp = Interpreter::new();
+        let result = interp
+            .eval_str_via_runtime("(let ((p (async/spawn (fn () 5)))) (async/sleep 5) (await p))")
+            .expect("await of a settled promise resolves");
+        assert_eq!(result, Value::int(5));
+    }
+
+    // Two distinct tasks awaiting the SAME spawned promise both get the value
+    // exactly once (no lost/duplicate wake).
+    #[test]
+    fn runtime_multiple_awaiters_same_promise() {
+        let interp = Interpreter::new();
+        let result = interp
+            .eval_str_via_runtime(
+                "(begin \
+                   (define p (async/spawn (fn () 99))) \
+                   (define a (async/spawn (fn () (await p)))) \
+                   (define b (async/spawn (fn () (await p)))) \
+                   (+ (await a) (await b)))",
+            )
+            .expect("both awaiters resolve");
+        assert_eq!(result, Value::int(198));
+    }
+
+    // A spawned task that itself spawns and awaits a nested detached task.
+    #[test]
+    fn runtime_nested_spawn_await() {
+        let interp = Interpreter::new();
+        let result = interp
+            .eval_str_via_runtime("(await (async/spawn (fn () (await (async/spawn (fn () 42))))))")
+            .expect("nested spawn/await resolves");
+        assert_eq!(result, Value::int(42));
+    }
+
+    // A spawned task that is never awaited does not corrupt the root result: the
+    // root settles with its own value regardless of the detached child.
+    #[test]
+    fn runtime_fire_and_forget_spawn() {
+        let interp = Interpreter::new();
+        let result = interp
+            .eval_str_via_runtime("(begin (async/spawn (fn () 1)) 99)")
+            .expect("root settles regardless of the detached child");
+        assert_eq!(result, Value::int(99));
+    }
+
+    // DEADLOCK SAFETY (scenario 5): a task parked on its own never-settling
+    // promise (and the root parked on it too) must make the drive loop TERMINATE
+    // with an error, never hang. Child sleeps first so the self-await genuinely
+    // parks on a pending promise.
+    #[test]
+    fn runtime_self_await_deadlock_terminates_not_hangs() {
+        let interp = Interpreter::new();
+        let result = interp.eval_str_via_runtime(
+            "(begin (define p nil) \
+                    (set! p (async/spawn (fn () (async/sleep 1) (await p)))) \
+                    (await p))",
+        );
+        // The exact error text is not load-bearing; the point is it RETURNS.
+        assert!(result.is_err(), "deadlock must surface as Err, got {result:?}");
+    }
+
+    // BUG (verifier finding): catchability of an await rejection is
+    // TIMING-DEPENDENT. When the awaited promise is still Pending at the moment
+    // `async/await` runs, the root parks and is resumed via `VmResume::Fail`
+    // (state.rs visit_ready), which SETTLES the whole task Failed instead of
+    // injecting a catchable Sema error into the parked frame — so an enclosing
+    // `try`/`catch` is bypassed. (The same program IS catchable when the child
+    // happens to settle before the await runs, hitting the native's
+    // already-Rejected fast path.) A rejected await should be catchable
+    // regardless of scheduling order.
+    #[test]
+    #[ignore = "BUG: pending-then-rejected await is uncatchable (VmResume::Fail settles the task, bypassing try/catch)"]
+    fn runtime_await_pending_rejection_is_catchable() {
+        let interp = Interpreter::new();
+        let result = interp
+            .eval_str_via_runtime(
+                "(try (await (async/spawn (fn () (async/sleep 2) (error \"x\")))) \
+                      (catch e \"caught\"))",
+            )
+            .expect("try/catch should catch a rejected await");
+        assert_eq!(
+            result,
+            Value::string("caught"),
+            "a rejected await must be catchable regardless of timing"
+        );
+    }
 }

@@ -1421,6 +1421,24 @@ fn drive_limits_reserve_root_visit_under_completion_and_timer_backlogs() {
 }
 
 #[test]
+fn drive_reserves_two_roots_while_completion_backlog_remains() {
+    let clock = FakeClock::new();
+    let mut driver = BoundedDriver::new(Rc::new(clock));
+    driver.add_completions(10);
+    driver.add_timers(1);
+    driver.add_cleanup(1);
+    driver.add_ready_roots(3);
+    let budget = drive_budget(5);
+
+    let report = driver.drive(&budget);
+
+    assert_eq!(report.work_items, 5);
+    assert_eq!(report.root_visits, 2);
+    assert!(report.completions < 10, "completion backlog must remain");
+    assert_eq!(driver.pending_ready_roots(), 1);
+}
+
+#[test]
 fn drive_limits_wall_clock_is_checked_between_items() {
     let clock = FakeClock::new();
     let mut driver = BoundedDriver::new(Rc::new(clock.clone()));

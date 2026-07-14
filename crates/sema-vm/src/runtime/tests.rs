@@ -10,6 +10,7 @@ use sema_core::{
 };
 
 use super::{
+    ready::ReadyScheduler,
     root::{RootRecord, RootState, RootTransitionError},
     task::{CancellationRequest, StateName, TaskRecord, TaskTransitionError, WaitKey},
 };
@@ -60,6 +61,109 @@ fn task(ids: &mut Ids) -> TaskRecord {
             lifetime_owner: LifetimeOwner::Scope(scope),
         },
     )
+}
+
+fn ready_ids(ids: &mut Ids, task_count: usize) -> (RootId, Vec<TaskId>) {
+    let root = ids.roots.allocate().expect("root ID available");
+    let tasks = (0..task_count)
+        .map(|_| ids.tasks.allocate().expect("task ID available"))
+        .collect();
+    (root, tasks)
+}
+
+#[test]
+fn ready_round_robins_perpetually_requeued_roots() {
+    let mut ids = Ids::new();
+    let [(a, a_tasks), (b, b_tasks), (c, c_tasks)] = [
+        ready_ids(&mut ids, 1),
+        ready_ids(&mut ids, 1),
+        ready_ids(&mut ids, 1),
+    ];
+    let [a1] = a_tasks.as_slice() else {
+        unreachable!()
+    };
+    let [b1] = b_tasks.as_slice() else {
+        unreachable!()
+    };
+    let [c1] = c_tasks.as_slice() else {
+        unreachable!()
+    };
+    let mut ready = ReadyScheduler::new();
+    for (root, task) in [(a, *a1), (b, *b1), (c, *c1)] {
+        assert!(ready.enqueue(root, task));
+    }
+
+    let mut actual = Vec::new();
+    for _ in 0..6 {
+        let (root, task) = ready.dequeue().expect("a task remains ready");
+        actual.push(root);
+        assert!(ready.enqueue(root, task));
+    }
+    assert_eq!(actual, [a, b, c, a, b, c]);
+}
+
+#[test]
+fn ready_is_fifo_within_each_root_and_fair_across_roots() {
+    let mut ids = Ids::new();
+    let (a, a_tasks) = ready_ids(&mut ids, 3);
+    let (b, b_tasks) = ready_ids(&mut ids, 1);
+    let [a1, a2, a3] = a_tasks.as_slice() else {
+        unreachable!()
+    };
+    let [b1] = b_tasks.as_slice() else {
+        unreachable!()
+    };
+    let mut ready = ReadyScheduler::new();
+    for task in [*a1, *a2, *a3] {
+        assert!(ready.enqueue(a, task));
+    }
+    assert!(ready.enqueue(b, *b1));
+
+    let mut actual = Vec::new();
+    for _ in 0..6 {
+        let (root, task) = ready.dequeue().expect("a task remains ready");
+        actual.push(task);
+        if root == b {
+            assert!(ready.enqueue(root, task));
+        }
+    }
+    assert_eq!(actual, [*a1, *b1, *a2, *b1, *a3, *b1]);
+}
+
+#[test]
+fn ready_removing_settled_root_preserves_remaining_rotation() {
+    let mut ids = Ids::new();
+    let [(a, a_tasks), (b, b_tasks), (c, c_tasks)] = [
+        ready_ids(&mut ids, 1),
+        ready_ids(&mut ids, 1),
+        ready_ids(&mut ids, 1),
+    ];
+    let mut ready = ReadyScheduler::new();
+    for (root, task) in [(a, a_tasks[0]), (b, b_tasks[0]), (c, c_tasks[0])] {
+        assert!(ready.enqueue(root, task));
+    }
+    assert_eq!(ready.dequeue(), Some((a, a_tasks[0])));
+    assert!(ready.enqueue(a, a_tasks[0]));
+
+    assert_eq!(ready.remove_root(b), vec![b_tasks[0]]);
+    assert_eq!(ready.dequeue(), Some((c, c_tasks[0])));
+    assert_eq!(ready.dequeue(), Some((a, a_tasks[0])));
+    assert_eq!(ready.dequeue(), None);
+}
+
+#[test]
+fn ready_duplicate_task_wakes_and_root_membership_are_idempotent() {
+    let mut ids = Ids::new();
+    let (root, tasks) = ready_ids(&mut ids, 2);
+    let mut ready = ReadyScheduler::new();
+
+    assert!(ready.enqueue(root, tasks[0]));
+    assert!(!ready.enqueue(root, tasks[0]));
+    assert!(ready.enqueue(root, tasks[1]));
+    assert!(!ready.enqueue(root, tasks[1]));
+    assert_eq!(ready.dequeue(), Some((root, tasks[0])));
+    assert_eq!(ready.dequeue(), Some((root, tasks[1])));
+    assert_eq!(ready.dequeue(), None);
 }
 
 #[test]

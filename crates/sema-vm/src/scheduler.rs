@@ -266,6 +266,13 @@ impl Scheduler {
                         sema_core::IoPoll::Ready(Ok(v)) => WakeAction::Resume(v),
                         sema_core::IoPoll::Ready(Err(msg)) => WakeAction::Fail(msg),
                     },
+                    // `Spawn` is a unified-runtime-only yield: this legacy
+                    // scheduler spawns via the spawn callback and never parks a
+                    // task on it.
+                    YieldReason::Spawn(_) => WakeAction::Fail(
+                        "internal error: async/spawn yield reached the legacy scheduler"
+                            .to_string(),
+                    ),
                 };
 
                 match action {

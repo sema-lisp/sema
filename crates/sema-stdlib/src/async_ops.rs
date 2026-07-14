@@ -125,6 +125,14 @@ fn register_promise_ops(env: &Env) {
     // async/spawn — spawn a thunk as an async task, returns a promise
     register_fn_ctx(env, "async/spawn", |ctx, args| {
         check_arity!(args, "async/spawn", 1);
+        // Under the unified runtime, surface a Spawn yield: the runtime creates
+        // a detached task from the thunk, allocates its promise, and resumes
+        // this frame with the promise value (via `replace_stack_top`). The
+        // legacy scheduler path uses the spawn callback instead.
+        if in_runtime_quantum() {
+            set_yield_signal(YieldReason::Spawn(args[0].clone()));
+            return Ok(Value::nil()); // placeholder; runtime substitutes the promise
+        }
         call_spawn_callback(ctx, args[0].clone())
     });
 
@@ -149,8 +157,10 @@ fn register_promise_ops(env: &Env) {
             }
         }
 
-        // If in async context, yield
-        if in_async_context() {
+        // If in async context (legacy scheduler) or a unified-runtime quantum,
+        // yield: the VM parks the frame and the scheduler/runtime resumes it
+        // with the settled value once the promise resolves.
+        if in_async_context() || in_runtime_quantum() {
             set_yield_signal(YieldReason::AwaitPromise(promise));
             return Ok(Value::nil()); // placeholder, VM catches the signal
         }

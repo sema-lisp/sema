@@ -1,11 +1,12 @@
 //! Interpreter-owned runtime state and root lifecycle.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, VecDeque};
 use std::rc::{Rc, Weak};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crate::vm::close_closure_upvalues_for_foreign_run;
 use crate::{extract_vm_closure, VmExecResult, VM};
 #[cfg(test)]
 use sema_core::runtime::ExternalFailure;
@@ -95,6 +96,45 @@ struct RuntimeTask {
     vm_call: Option<VM>,
     vm_owner: Option<ReturnOwner>,
     context: TaskContextHandle,
+    /// Pending resume for a VM-quantum task woken from an `async/await` (or
+    /// `async/spawn`) park: the value to inject onto the parked frame's stack
+    /// top before the next `run_quantum`, or a failure to settle the task with.
+    vm_resume: Option<VmResume>,
+}
+
+/// How a parked VM-quantum task should be resumed once its awaited promise
+/// settles (or a spawn admission is decided).
+enum VmResume {
+    /// Replace the parked frame's stack-top placeholder with this value and
+    /// re-run the quantum (a resolved await / the spawned promise value).
+    Value(sema_core::Value),
+    /// The await target rejected/was cancelled, or spawn admission failed:
+    /// settle the parked task with this error instead of resuming it.
+    Fail(sema_core::SemaError),
+}
+
+impl Trace for VmResume {
+    fn trace(&self, sink: &mut dyn FnMut(sema_core::cycle::GcEdge<'_>)) -> bool {
+        match self {
+            Self::Value(value) => {
+                sink(sema_core::cycle::GcEdge::Value(value));
+                true
+            }
+            Self::Fail(error) => error.trace(sink),
+        }
+    }
+}
+
+/// Trace a held `Rc<AsyncPromise>` for the incremental cycle collector by
+/// wrapping it in a transient `Value` edge (the promise is also a registered
+/// GC candidate; this keeps it reachable while pending or resolved).
+fn trace_promise(
+    promise: &Rc<sema_core::AsyncPromise>,
+    sink: &mut dyn FnMut(sema_core::cycle::GcEdge<'_>),
+) -> bool {
+    let value = sema_core::Value::async_promise_from_rc(Rc::clone(promise));
+    sink(sema_core::cycle::GcEdge::Value(&value));
+    true
 }
 
 // Task 4 replaces this placeholder with the VM-backed PreparedRoot payload.
@@ -129,6 +169,15 @@ struct RuntimeState {
     pending: VecDeque<PendingStage>,
     protocol_waits: HashMap<super::WaitKey, ProtocolWait>,
     task_promises: HashMap<TaskId, sema_core::runtime::PromiseId>,
+    /// Detached tasks spawned via `async/spawn` under the VM-quantum path,
+    /// mapped to the Sema promise their completion settles (Resolved/Rejected/
+    /// Cancelled). Distinct from `task_promises` (the continuation-model
+    /// `PromiseId` registry) — these hold the `AsyncPromise` value the Sema
+    /// program awaits directly.
+    spawned_promises: HashMap<TaskId, Rc<sema_core::AsyncPromise>>,
+    /// VM-quantum tasks parked on `async/await`, mapped to their internal wait
+    /// key and the promise they wait on. Woken when that promise settles.
+    promise_waits: HashMap<TaskId, (super::WaitKey, Rc<sema_core::AsyncPromise>)>,
     drive_cursor: usize,
     drive_active: bool,
     active_instruction_limit: usize,
@@ -178,6 +227,14 @@ impl Trace for RuntimeState {
                 .protocol_waits
                 .values()
                 .all(|wait| wait.owner.trace(sink) && wait.continuation.trace(sink))
+            && self
+                .spawned_promises
+                .values()
+                .all(|promise| trace_promise(promise, sink))
+            && self
+                .promise_waits
+                .values()
+                .all(|(_, promise)| trace_promise(promise, sink))
             && self.pending.iter().all(|stage| stage.trace(sink))
     }
 }
@@ -197,6 +254,10 @@ impl Trace for RuntimeTask {
             && self.vm_call.as_ref().is_none_or(|vm| vm.trace(sink))
             && self.vm_owner.as_ref().is_none_or(|owner| owner.trace(sink))
             && self.context.trace(sink)
+            && self
+                .vm_resume
+                .as_ref()
+                .is_none_or(|resume| resume.trace(sink))
     }
 }
 
@@ -241,6 +302,8 @@ impl Runtime {
                 pending: VecDeque::new(),
                 protocol_waits: HashMap::new(),
                 task_promises: HashMap::new(),
+                spawned_promises: HashMap::new(),
+                promise_waits: HashMap::new(),
                 drive_cursor: 0,
                 drive_active: false,
                 active_instruction_limit: usize::MAX,
@@ -314,6 +377,7 @@ impl Runtime {
                 vm_call: None,
                 vm_owner: None,
                 context: TaskContextHandle::default(),
+                vm_resume: None,
             },
         );
         state.ready.enqueue(root, task);
@@ -358,6 +422,7 @@ impl Runtime {
                 vm_call: Some(vm),
                 vm_owner: Some(ReturnOwner::Root),
                 context: TaskContextHandle::default(),
+                vm_resume: None,
             },
         );
         state.ready.enqueue(root, task);
@@ -648,6 +713,35 @@ impl Runtime {
     }
 
     fn cancel_waiting(&self) -> Result<bool, RuntimeFault> {
+        {
+            // A VM task parked on `async/await` (an internal promise wait): drop
+            // its promise-wait entry and wake it so the cancellation is applied
+            // when it is next visited. Without this it would never leave Waiting
+            // (its key is not registered with the wait runtime), spinning
+            // shutdown's cancel loop forever.
+            let mut state = self.state.borrow_mut();
+            let selected = state.tasks.iter().find_map(|(id, task)| {
+                let key = task.record.wait_key()?;
+                (task.record.cancellation().is_some()
+                    && state.promise_waits.get(id).map(|(k, _)| *k) == Some(key))
+                .then_some((*id, key))
+            });
+            if let Some((task_id, key)) = selected {
+                state.promise_waits.remove(&task_id);
+                let task = state
+                    .tasks
+                    .get_mut(&task_id)
+                    .expect("selected awaiting task exists");
+                task.record
+                    .wake(key)
+                    .map_err(|error| RuntimeFault::Invariant {
+                        message: format!("cancelled awaiting task failed to wake: {error:?}"),
+                    })?;
+                let root = task.record.relations().origin_root;
+                state.ready.enqueue(root, task_id);
+                return Ok(true);
+            }
+        }
         {
             let mut state = self.state.borrow_mut();
             let selected = state.tasks.iter().find_map(|(id, task)| {
@@ -1034,7 +1128,20 @@ impl Runtime {
             .map_err(|error| RuntimeFault::Invariant {
                 message: format!("ready task failed to start: {error:?}"),
             })?;
-        let action = if let Some(pending) = task.pending_resume.take() {
+        // A promise this VM task awaited (or a spawn admission) has settled: a
+        // failure settles the parked task; a value is injected onto its stack
+        // top just before the quantum re-runs (in the vm_call arm below).
+        let resume = task.vm_resume.take();
+        let action = if let Some(VmResume::Fail(error)) = resume {
+            task.vm_call.take();
+            TaskAction::VmResult(
+                task_id,
+                task.vm_owner
+                    .take()
+                    .expect("awaited VM task has a return owner"),
+                Err(error),
+            )
+        } else if let Some(pending) = task.pending_resume.take() {
             TaskAction::Resume(pending)
         } else if let Some(cancel) = task.record.cancellation() {
             task.vm_call.take();
@@ -1043,6 +1150,9 @@ impl Runtime {
                 None => TaskAction::Settle(root, task_id, TaskOutcome::Cancelled(cancel.reason)),
             }
         } else if let Some(mut vm) = task.vm_call.take() {
+            if let Some(VmResume::Value(value)) = resume {
+                vm.replace_stack_top(value);
+            }
             let (context, instruction_limit) = {
                 let state = self.state.borrow();
                 (Rc::clone(&state._context), state.active_instruction_limit)
@@ -1072,6 +1182,20 @@ impl Runtime {
                     YieldReason::Sleep(ms) => {
                         task.vm_call = Some(vm);
                         TaskAction::VmSleep(task_id, ms)
+                    }
+                    // `async/spawn`: the frame parked with a nil placeholder on
+                    // its stack top; the runtime creates a detached task from
+                    // the thunk and resumes this frame with the promise value.
+                    YieldReason::Spawn(thunk) => {
+                        task.vm_call = Some(vm);
+                        TaskAction::VmSpawn(task_id, thunk)
+                    }
+                    // `async/await`: park this frame on the promise; the runtime
+                    // resumes it (via `replace_stack_top`) when the promise
+                    // settles, or settles it with the rejection/cancellation.
+                    YieldReason::AwaitPromise(promise) => {
+                        task.vm_call = Some(vm);
+                        TaskAction::VmAwait(task_id, promise)
                     }
                     other => TaskAction::VmResult(
                         task_id,
@@ -1161,7 +1285,7 @@ impl Runtime {
                         .ok_or_else(|| RuntimeFault::Invariant {
                             message: "cancelled task disappeared".into(),
                         })?;
-                    self.settle(root, task_id, TaskOutcome::Cancelled(reason))?
+                    self.settle_task(root, task_id, TaskOutcome::Cancelled(reason))?
                 }
                 ReturnOwner::Continuation(parent, frame) => self
                     .state
@@ -1213,6 +1337,8 @@ impl Runtime {
                     });
                 }
             }
+            TaskAction::VmSpawn(task_id, thunk) => self.spawn_detached(task_id, thunk)?,
+            TaskAction::VmAwait(task_id, promise) => self.await_promise(task_id, promise)?,
             #[cfg(test)]
             TaskAction::Timer(task_id, deadline) => {
                 let mut state = self.state.borrow_mut();
@@ -1315,18 +1441,18 @@ impl Runtime {
                 debug_assert!(matches!(owner, ReturnOwner::Root));
                 match cancellation {
                     Some(request) => {
-                        self.settle(root, task_id, TaskOutcome::Cancelled(request.reason))
+                        self.settle_task(root, task_id, TaskOutcome::Cancelled(request.reason))
                     }
-                    None => self.settle(root, task_id, TaskOutcome::Returned(value)),
+                    None => self.settle_task(root, task_id, TaskOutcome::Returned(value)),
                 }
             }
             Err(error) => {
                 debug_assert!(matches!(owner, ReturnOwner::Root));
                 match cancellation {
                     Some(request) => {
-                        self.settle(root, task_id, TaskOutcome::Cancelled(request.reason))
+                        self.settle_task(root, task_id, TaskOutcome::Cancelled(request.reason))
                     }
-                    None => self.settle(root, task_id, TaskOutcome::Failed(error)),
+                    None => self.settle_task(root, task_id, TaskOutcome::Failed(error)),
                 }
             }
             Ok(NativeOutcome::Suspend(suspend)) => {
@@ -1851,6 +1977,226 @@ impl Runtime {
         Ok(())
     }
 
+    /// Create a detached task from a spawned thunk, allocate its promise, and
+    /// resume the spawning task with the promise value. Any admission failure
+    /// (non-callable thunk, missing home env, id exhaustion, arity) resumes the
+    /// spawner with a `Fail` instead of settling — the error surfaces where the
+    /// Sema program called `async/spawn`.
+    fn spawn_detached(&self, spawner: TaskId, thunk: sema_core::Value) -> Result<(), RuntimeFault> {
+        let Some((closure, functions, native_fns)) = extract_vm_closure(&thunk) else {
+            return self.resume_running_vm(
+                spawner,
+                VmResume::Fail(sema_core::SemaError::eval(
+                    "async/spawn: argument must be a function (compiled VM closure)",
+                )),
+            );
+        };
+        // The task VM runs the thunk on its own stack; snapshot any still-open
+        // upvalue cells against the (paused) spawning VM so they don't dangle.
+        close_closure_upvalues_for_foreign_run(&closure);
+        let Some(globals) = closure.globals.clone() else {
+            return self.resume_running_vm(
+                spawner,
+                VmResume::Fail(sema_core::SemaError::eval(
+                    "async/spawn: thunk closure has no home environment",
+                )),
+            );
+        };
+        let mut vm = VM::new_for_task_with_native_fns(globals, functions, native_fns);
+        if let Err(error) = vm.setup_for_call(closure, &[]) {
+            return self.resume_running_vm(spawner, VmResume::Fail(error));
+        }
+
+        let promise_value = {
+            let mut state = self.state.borrow_mut();
+            if state.task_ids.is_exhausted() {
+                drop(state);
+                return self.resume_running_vm(
+                    spawner,
+                    VmResume::Fail(sema_core::SemaError::eval(
+                        "async/spawn: task identity exhausted",
+                    )),
+                );
+            }
+            let child = state
+                .task_ids
+                .allocate()
+                .map_err(|_| RuntimeFault::IdExhausted { kind: "task" })?;
+            let root = state
+                .tasks
+                .get(&spawner)
+                .ok_or_else(|| RuntimeFault::Invariant {
+                    message: "spawning task disappeared".into(),
+                })?
+                .record
+                .relations()
+                .origin_root;
+            let promise = Rc::new(sema_core::AsyncPromise {
+                state: RefCell::new(sema_core::PromiseState::Pending),
+                task_id: Cell::new(child.get()),
+            });
+            // Cold data-cycle constructor (CORE-2): wrapped via
+            // `async_promise_from_rc` (which registers nothing), so register the
+            // candidate here at the allocation — mirrors the legacy scheduler.
+            sema_core::register_candidate(sema_core::GcNode::Promise(Rc::downgrade(&promise)));
+            let value = sema_core::Value::async_promise_from_rc(Rc::clone(&promise));
+            // A detached task settles its own promise, never the root, so it is
+            // an origin-root child but not the root's main task.
+            let relations = TaskRelations {
+                origin_root: root,
+                cancellation_parent: CancellationParent::Root(root),
+                lifetime_owner: LifetimeOwner::Root(root),
+            };
+            state.tasks.insert(
+                child,
+                RuntimeTask {
+                    record: TaskRecord::new(child, relations),
+                    payload: TaskPayload::Vm,
+                    pending_resume: None,
+                    suspended_owner: None,
+                    vm_call: Some(vm),
+                    vm_owner: Some(ReturnOwner::Root),
+                    context: TaskContextHandle::default(),
+                    vm_resume: None,
+                },
+            );
+            state.spawned_promises.insert(child, promise);
+            state.ready.enqueue(root, child);
+            value
+        };
+        self.resume_running_vm(spawner, VmResume::Value(promise_value))
+    }
+
+    /// Park a VM task on `promise` until it settles. If it already settled
+    /// (between the native's check and here) the task resumes immediately.
+    fn await_promise(
+        &self,
+        task_id: TaskId,
+        promise: Rc<sema_core::AsyncPromise>,
+    ) -> Result<(), RuntimeFault> {
+        let settled = match &*promise.state.borrow() {
+            sema_core::PromiseState::Pending => None,
+            sema_core::PromiseState::Resolved(value) => Some(VmResume::Value(value.clone())),
+            sema_core::PromiseState::Rejected(error) => {
+                Some(VmResume::Fail(await_rejected_error(error)))
+            }
+            sema_core::PromiseState::Cancelled => Some(VmResume::Fail(await_cancelled_error())),
+        };
+        if let Some(resume) = settled {
+            return self.resume_running_vm(task_id, resume);
+        }
+        let mut state = self.state.borrow_mut();
+        let key = state
+            .waits
+            .as_ref()
+            .expect("wait runtime installed")
+            .issue_internal_wait()
+            .map_err(|_| RuntimeFault::IdExhausted { kind: "wait" })?;
+        state
+            .tasks
+            .get_mut(&task_id)
+            .ok_or_else(|| RuntimeFault::Invariant {
+                message: "awaiting VM task disappeared".into(),
+            })?
+            .record
+            .wait(key)
+            .map_err(|error| RuntimeFault::Invariant {
+                message: format!("awaiting VM task failed to wait: {error:?}"),
+            })?;
+        state.promise_waits.insert(task_id, (key, promise));
+        Ok(())
+    }
+
+    /// Move a Running VM task back to Ready, stamping the resume to apply on its
+    /// next visit (a stack-top value injection, or a failure that settles it).
+    fn resume_running_vm(&self, task_id: TaskId, resume: VmResume) -> Result<(), RuntimeFault> {
+        let mut state = self.state.borrow_mut();
+        let task = state
+            .tasks
+            .get_mut(&task_id)
+            .ok_or_else(|| RuntimeFault::Invariant {
+                message: "resuming VM task disappeared".into(),
+            })?;
+        task.vm_resume = Some(resume);
+        let root = task.record.relations().origin_root;
+        task.record
+            .yield_ready()
+            .map_err(|error| RuntimeFault::Invariant {
+                message: format!("resuming VM task failed to yield ready: {error:?}"),
+            })?;
+        state.ready.enqueue(root, task_id);
+        Ok(())
+    }
+
+    /// Settle a task by identity: a detached spawned task settles its Sema
+    /// promise (waking any awaiters), a root task settles its root.
+    fn settle_task(
+        &self,
+        root: RootId,
+        task_id: TaskId,
+        outcome: TaskOutcome,
+    ) -> Result<(), RuntimeFault> {
+        if self.state.borrow().spawned_promises.contains_key(&task_id) {
+            self.settle_spawned(task_id, outcome)
+        } else {
+            self.settle(root, task_id, outcome)
+        }
+    }
+
+    /// Settle a detached spawned task: fill its Sema promise state, drop the
+    /// task, and wake every VM task awaiting that promise with the settled
+    /// value (or the rejection/cancellation).
+    fn settle_spawned(&self, task_id: TaskId, outcome: TaskOutcome) -> Result<(), RuntimeFault> {
+        let mut state = self.state.borrow_mut();
+        let promise =
+            state
+                .spawned_promises
+                .remove(&task_id)
+                .ok_or_else(|| RuntimeFault::Invariant {
+                    message: "settling spawned task without a promise".into(),
+                })?;
+        *promise.state.borrow_mut() = match &outcome {
+            TaskOutcome::Returned(value) => sema_core::PromiseState::Resolved(value.clone()),
+            TaskOutcome::Failed(error) => sema_core::PromiseState::Rejected(error.to_string()),
+            TaskOutcome::Cancelled(_) => sema_core::PromiseState::Cancelled,
+        };
+        state.tasks.remove(&task_id);
+        let woken: Vec<(TaskId, super::WaitKey)> = state
+            .promise_waits
+            .iter()
+            .filter(|(_, (_, waited))| Rc::ptr_eq(waited, &promise))
+            .map(|(waiter, (key, _))| (*waiter, *key))
+            .collect();
+        for (waiter, key) in woken {
+            state.promise_waits.remove(&waiter);
+            let resume = match &*promise.state.borrow() {
+                sema_core::PromiseState::Resolved(value) => VmResume::Value(value.clone()),
+                sema_core::PromiseState::Rejected(error) => {
+                    VmResume::Fail(await_rejected_error(error))
+                }
+                sema_core::PromiseState::Cancelled => VmResume::Fail(await_cancelled_error()),
+                sema_core::PromiseState::Pending => {
+                    unreachable!("promise was just settled above")
+                }
+            };
+            let task = state
+                .tasks
+                .get_mut(&waiter)
+                .ok_or_else(|| RuntimeFault::Invariant {
+                    message: "awaiting task disappeared before wake".into(),
+                })?;
+            task.record
+                .wake(key)
+                .map_err(|error| RuntimeFault::Invariant {
+                    message: format!("awaiting task failed to wake: {error:?}"),
+                })?;
+            task.vm_resume = Some(resume);
+            let root = task.record.relations().origin_root;
+            state.ready.enqueue(root, waiter);
+        }
+        Ok(())
+    }
+
     fn settle(
         &self,
         root: RootId,
@@ -2271,6 +2617,22 @@ impl Runtime {
     }
 }
 
+/// Format a spawned-task rejection as an `async/await` error, stripping any
+/// already-present prefix so chained awaits don't nest it. Mirrors the
+/// stdlib `async/await` rejection formatting.
+fn await_rejected_error(message: &str) -> sema_core::SemaError {
+    let core = message
+        .strip_prefix("Eval error: async/await: task rejected: ")
+        .or_else(|| message.strip_prefix("async/await: task rejected: "))
+        .unwrap_or(message);
+    sema_core::SemaError::eval(format!("async/await: task rejected: {core}"))
+}
+
+/// The `await`-on-cancelled-promise error, distinct from a normal rejection.
+fn await_cancelled_error() -> sema_core::SemaError {
+    sema_core::SemaError::eval("async/await: task was cancelled")
+}
+
 fn registry_error(error: super::RegistryError) -> sema_core::SemaError {
     sema_core::SemaError::eval(match error {
         super::RegistryError::WrongRuntime => "runtime handle belongs to another runtime",
@@ -2582,6 +2944,11 @@ enum TaskAction {
     /// A VM root/child parked on `async/sleep`: arm a runtime timer for `ms`
     /// milliseconds and leave the VM in `vm_call` so `fire_timer` re-runs it.
     VmSleep(TaskId, u64),
+    /// `async/spawn`: create a detached task from the thunk and resume the
+    /// spawning task (`TaskId`) with the new promise value.
+    VmSpawn(TaskId, sema_core::Value),
+    /// `async/await`: park the task (`TaskId`) on the promise until it settles.
+    VmAwait(TaskId, Rc<sema_core::AsyncPromise>),
     #[cfg(test)]
     Timer(TaskId, Instant),
     #[cfg(test)]
@@ -2671,6 +3038,11 @@ impl Trace for TaskAction {
                     }
             }
             Self::VmSleep(_, _) => true,
+            Self::VmSpawn(_, thunk) => {
+                sink(sema_core::cycle::GcEdge::Value(thunk));
+                true
+            }
+            Self::VmAwait(_, promise) => trace_promise(promise, sink),
             #[cfg(test)]
             Self::NativeCall(_, _) => true,
             #[cfg(test)]

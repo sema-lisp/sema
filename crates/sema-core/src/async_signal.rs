@@ -140,6 +140,11 @@ pub enum YieldReason {
     ChannelSend(Rc<Channel>, Value),
     /// Sleeping for a duration in milliseconds.
     Sleep(u64),
+    /// Spawning a detached task from a thunk (zero-arg function). The unified
+    /// runtime creates the task, allocates its promise, and resumes the
+    /// spawning frame with the promise value; the legacy scheduler never sees
+    /// this variant (it spawns via the spawn callback instead).
+    Spawn(Value),
     /// Waiting for an offloaded I/O future (e.g. an HTTP round-trip running on a
     /// background runtime) to complete. The scheduler polls the handle and parks
     /// the VM thread on the process-global IO-completion signal while in flight.

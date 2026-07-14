@@ -48,6 +48,10 @@ impl ReadyScheduler {
         Some((root, task))
     }
 
+    pub fn root_count(&self) -> usize {
+        self.roots.len()
+    }
+
     pub fn remove_root(&mut self, root: RootId) -> Vec<TaskId> {
         let removed = self.tasks_by_root.remove(&root).unwrap_or_default();
         for task in &removed {

@@ -220,6 +220,12 @@ impl Runtime {
         let mut cleanup = 0;
         let mut completions = 0;
         let mut no_progress = 0;
+        let reserved_roots = self
+            .state
+            .borrow()
+            .ready
+            .root_count()
+            .min(budget.root_visit_limit.get());
 
         while work_items < budget.work_item_limit.get() {
             if self
@@ -237,9 +243,11 @@ impl Runtime {
                 no_progress = 0;
                 continue;
             }
+            let unvisited_reserved = reserved_roots - root_visits;
+            let remaining_credits = budget.work_item_limit.get() - work_items;
             let reserve_root = budget.work_item_limit.get() > 1
-                && root_visits == 0
-                && work_items + 1 == budget.work_item_limit.get();
+                && unvisited_reserved > 0
+                && remaining_credits <= unvisited_reserved;
             let source = if reserve_root {
                 4
             } else {
@@ -261,7 +269,7 @@ impl Runtime {
                 }
                 2 => self.cancel_waiting()?,
                 3 => self.advance_pending()?,
-                4 if root_visits < budget.root_visit_limit.get() && self.visit_ready()? => {
+                4 if root_visits < reserved_roots && self.visit_ready()? => {
                     root_visits += 1;
                     true
                 }
@@ -539,7 +547,13 @@ impl Runtime {
             TaskAction::Settle(root, task_id, outcome) => self.settle(root, task_id, outcome)?,
             TaskAction::Native(task_id, result) => self.apply_native_result(task_id, result)?,
             #[cfg(test)]
-            TaskAction::NativeCall(task_id, call) => self.apply_native_result(task_id, call())?,
+            TaskAction::NativeCall(task_id, call) => {
+                let result = call();
+                self.state
+                    .borrow_mut()
+                    .pending
+                    .push_back(PendingStage::Apply(task_id, result));
+            }
             TaskAction::Resume(pending) => {
                 self.state
                     .borrow_mut()
@@ -772,17 +786,22 @@ impl Runtime {
     }
 
     fn abort_terminal_state(&self, fault: &RuntimeFault) {
-        let removed = {
+        let (pending, tasks) = {
             let mut state = self.state.borrow_mut();
             state.terminal_fault = Some(fault.clone());
-            state.pending.clear();
+            let pending = std::mem::take(&mut state.pending);
             state.ready = ReadyScheduler::new();
-            for root in state.roots.values_mut() {
-                root.abort();
+            let mut newly_eligible = Vec::new();
+            for (id, root) in &mut state.roots {
+                if root.abort_running() && root.is_reap_eligible() {
+                    newly_eligible.push(*id);
+                }
             }
-            std::mem::take(&mut state.tasks)
+            state.handle_cleanup.extend(newly_eligible);
+            (pending, std::mem::take(&mut state.tasks))
         };
-        drop(removed);
+        drop(pending);
+        drop(tasks);
     }
 
     pub fn close_for_interpreter_drop(&self) {
@@ -824,6 +843,13 @@ impl Runtime {
     #[cfg(test)]
     pub(super) fn force_settlement_exhaustion_for_test(&self) {
         self.state.borrow_mut().force_settlement_exhaustion = true;
+    }
+
+    #[cfg(test)]
+    pub(super) fn abort_terminal_for_test(&self) {
+        self.abort_terminal_state(&RuntimeFault::Invariant {
+            message: "test terminal abort".into(),
+        });
     }
 }
 

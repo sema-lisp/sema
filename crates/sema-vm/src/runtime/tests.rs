@@ -44,6 +44,14 @@ thread_local! {
     static REENTRANT_HANDLE: RefCell<Option<super::RootHandle>> = const { RefCell::new(None) };
 }
 
+struct PollHandleOnDrop(super::RootHandle);
+
+impl Drop for PollHandleOnDrop {
+    fn drop(&mut self) {
+        let _ = self.0.poll_result();
+    }
+}
+
 fn poll_reentrant_handle() {
     REENTRANT_HANDLE.with(|slot| {
         if let Some(handle) = slot.borrow().as_ref() {
@@ -264,6 +272,27 @@ fn runtime_native_quantum_may_poll_and_cancel_root_reentrantly() {
 }
 
 #[test]
+fn runtime_native_call_invocation_and_application_use_separate_credits() {
+    let runtime = runtime_with_inline_executor(Rc::new(FakeClock::new()));
+    let invoked = Rc::new(Cell::new(false));
+    let observed = Rc::clone(&invoked);
+    let handle = runtime
+        .submit_test_root(TestPreparedTask::native_call(move || {
+            observed.set(true);
+            Ok(NativeOutcome::Return(Value::int(7)))
+        }))
+        .unwrap();
+
+    runtime.drive(&drive_budget(1)).unwrap();
+    assert!(!invoked.get());
+    runtime.drive(&drive_budget(1)).unwrap();
+    assert!(invoked.get());
+    assert!(matches!(handle.poll_result(), RootPoll::Pending));
+    runtime.drive(&drive_budget(1)).unwrap();
+    assert!(matches!(handle.poll_result(), RootPoll::Ready(_)));
+}
+
+#[test]
 fn runtime_drive_rotates_past_completion_backlog_to_visit_root() {
     let runtime = runtime_with_inline_executor(Rc::new(FakeClock::new()));
     let mut backlog_handles = Vec::new();
@@ -479,6 +508,77 @@ fn runtime_shutdown_finalizes_fault_first_raised_during_shutdown() {
     drop(handle);
     runtime.drive(&drive_budget(8)).unwrap_err();
     assert_eq!(runtime.root_count(), 0);
+}
+
+#[test]
+fn runtime_terminal_abort_drops_pending_owners_outside_state_borrow() {
+    let runtime = runtime_with_inline_executor(Rc::new(FakeClock::new()));
+    let owner_handle = runtime
+        .submit_test_root(TestPreparedTask::yield_forever())
+        .unwrap();
+    let owner = PollHandleOnDrop(owner_handle.clone());
+    let _pending_handle = runtime
+        .submit_test_root(TestPreparedTask::native_call(move || {
+            let _owner = owner;
+            Ok(NativeOutcome::Return(Value::NIL))
+        }))
+        .unwrap();
+    runtime.drive(&drive_budget(2)).unwrap();
+
+    runtime.abort_terminal_for_test();
+}
+
+#[test]
+fn runtime_terminal_abort_preserves_settled_roots_and_reaps_unhandled_aborts() {
+    let clock = Rc::new(FakeClock::new());
+    let runtime = runtime_with_inline_executor(clock.clone());
+    let settled = runtime
+        .submit_test_root(TestPreparedTask::returned(Value::int(3)))
+        .unwrap();
+    runtime.drive(&drive_budget(8)).unwrap();
+    let abandoned = runtime
+        .submit_test_root(TestPreparedTask::returned(Value::int(4)))
+        .unwrap();
+    drop(abandoned);
+    runtime.force_settlement_exhaustion_for_test();
+
+    assert!(runtime
+        .shutdown(&super::ShutdownOptions {
+            deadline: clock.now() + Duration::from_secs(1),
+            drive_budget: drive_budget(8),
+        })
+        .is_err());
+    assert!(matches!(settled.poll_result(), RootPoll::Ready(_)));
+    runtime.drive(&drive_budget(8)).unwrap_err();
+    assert_eq!(
+        runtime.root_count(),
+        1,
+        "aborted root without handles is reaped"
+    );
+}
+
+#[test]
+fn runtime_drive_reserves_every_eligible_root_visit_credit() {
+    let runtime = runtime_with_inline_executor(Rc::new(FakeClock::new()));
+    let first = runtime
+        .submit_test_root(TestPreparedTask::returned(Value::int(1)))
+        .unwrap();
+    let second = runtime
+        .submit_test_root(TestPreparedTask::returned(Value::int(2)))
+        .unwrap();
+    let mut budget = drive_budget(2);
+    budget.root_visit_limit = std::num::NonZeroUsize::new(2).unwrap();
+
+    assert_eq!(
+        runtime.drive(&budget).unwrap(),
+        super::DriveState::Progress {
+            work_items: 2,
+            instructions: 0,
+            ready_remaining: false,
+        }
+    );
+    assert!(matches!(first.poll_result(), RootPoll::Pending));
+    assert!(matches!(second.poll_result(), RootPoll::Pending));
 }
 
 #[test]

@@ -72,9 +72,13 @@ impl RootRecord {
             && self.live_descendants == 0
     }
 
-    pub fn abort(&mut self) {
+    pub fn abort_running(&mut self) -> bool {
+        if !matches!(self.state, RootState::Running { .. }) {
+            return false;
+        }
         self.state = RootState::Aborted;
         self.live_descendants = 0;
+        true
     }
 
     pub fn settle(

@@ -332,6 +332,21 @@ and output buffers not keyed/tagged by root.
 
 - [ ] **Step 2: Run layer gates**
 
+The repository must have a Windows-native CI job (for example, a
+`windows-latest` matrix leg in `.github/workflows/verify.yml`) that checks out
+the commit and runs this exact command in a native Windows process:
+
+```powershell
+cargo test -p sema-lang --test unified_runtime_watchdog_test -- --nocapture
+```
+
+That job must execute and pass the `cfg(windows)` inherited-writer,
+immediate-marker, and multi-chunk head/tail marker regressions before Task 07
+acceptance. Cross-compiling or `cargo check --target ...windows...` does not
+exercise `CancelSynchronousIo` and is not acceptance evidence. Task 07 may not
+be accepted without the successful native Windows workflow URL/run ID and test
+output in Task 07 evidence.
+
 ```bash
 cargo test -p sema-eval -p sema-lang -p sema-dap -p sema-lsp \
   -p sema-notebook -p sema-mcp -p sema-wasm
@@ -384,3 +399,6 @@ git commit -m "refactor(runtime): unify native and browser hosts"
 - Playground messages and Stop actions carry exact root identity.
 - Shutdown settles/reaps all roots, tasks, and host resources.
 - Independent review and durable evidence are clean.
+- A Windows-native CI run executes the complete watchdog target successfully,
+  including all three `cfg(windows)` drain regressions; cross-compilation alone
+  cannot satisfy this criterion.

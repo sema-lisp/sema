@@ -273,7 +273,8 @@ safe.
 `Box<PreparedExternalOperation>` exactly once, allocates `OperationId`,
 `WaitId`, `WaitGeneration`, and completion identity, and installs `RegisteredExternalWait`, the concrete
 `ResourceClass` cleanup entry, and the task's `Running -> Waiting` state before
-it constructs the private completion sink and calls Task 05 submission. The
+it constructs the opaque `ExecutorSubmission` through the checked `sema-core`
+factory (which privately constructs the sink) and calls Task 05 submission. The
 driver cannot drain the completion inbox reentrantly during this transition, so
 an executor that completes inline during `submit` sees fully registered waiting
 state; its completion is processed only after `apply_native_suspend` returns.
@@ -291,10 +292,11 @@ through one continuation, a callback that enqueues a completion while running,
 and nested native-to-Sema-to-native suspension; none may panic from a nested
 `RefCell` borrow or process the enqueued completion reentrantly.
 
-Submission rejection returns ownership of the unadmitted job, sink, and start
-token. The same transaction removes the wait, takes the wait-owned resource
-entry, performs its one-shot cancellation, drops both queue-control halves and
-the rejected job/sink, transitions `Waiting -> Running`, and consumes the
+Submission rejection returns an opaque owning error. Its `into_rollback` method
+destroys the sink in `sema-core` and returns only the unadmitted job, start
+token, and rejection kind. The same transaction removes the wait, takes the
+wait-owned resource entry, performs its one-shot cancellation, drops both
+queue-control halves and the rejected job, transitions `Waiting -> Running`, and consumes the
 registered decoder with `Err(ExternalFailure { code: Rejected, ... })`. It maps
 that `DecodedCompletion` to `ResumeInput::Returned`/`Failed` and then consumes
 the already-registered continuation.

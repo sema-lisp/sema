@@ -398,8 +398,12 @@ pipes open; the outer test proves drain joins still return before that writer
 exits. The Windows helper spawns a two-second PowerShell child inheriting both
 pipes and exits, so the native platform gate proves the same no-EOF liveness
 contract. Record the Unix escaped-writer RED against a blocking drain before
-adding cancellation; cross-compile the Windows-only regression in Task 01 and
-execute it on the native Windows Task 07/CI gate.
+adding cancellation; cross-compile the Windows-only regression in Task 01. Task
+07 must add a Windows-native workflow job and successfully run
+`cargo test -p sema-lang --test unified_runtime_watchdog_test -- --nocapture`,
+including the inherited-writer, immediate-marker, and multi-chunk marker
+regressions. Cross-compilation is insufficient, and Task 07 cannot be accepted
+without that native Windows evidence.
 
 - [ ] **Step 4: Add the ready-storm/timer test**
 

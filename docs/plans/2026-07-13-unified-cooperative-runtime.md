@@ -353,11 +353,15 @@ lifecycle validation is accounted as late. Submission rejection rolls back the
 registered wait/resource and both control halves exactly once and does not
 deliver through the sink or enqueue a completion.
 
-The one core seam is `ExecutorLease::submit(ExecutorJob, CompletionSink,
-ExecutorStartToken) -> Result<RunningSubmission, SubmissionRejected>`.
+The one core seam is `ExecutorLease::submit(ExecutorSubmission) ->
+Result<RunningSubmission, SubmissionRejected>`. `ExecutorSubmission` is an
+opaque owning queue item. Its sealed public driver lets `sema-io` ask the
+`sema-core` adapter to claim/run/cancel and deliver, but never exposes the
+private `CompletionSink` across the crate boundary.
 `ExecutorJobControl` creates the `ExecutorCancelHandle` and non-cloneable token;
 `CancelBeforeStart` and `ExecutorStartDecision` name the CAS outcomes.
-`SubmissionRejected` returns its kind, job, sink, and start token for rollback.
+`SubmissionRejected::into_rollback` destroys the private sink and returns its
+kind, job, and start token for rollback, so rejection cannot forge delivery.
 `PreparedExternalOperation` owns the runtime decoder/resource plus exactly one
 job and token. Registration allocates operation/wait/generation/completion
 identity; producers and executors allocate no runtime IDs.

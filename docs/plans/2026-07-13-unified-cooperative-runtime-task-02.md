@@ -497,7 +497,8 @@ pub enum CompletionDelivery {
     InboxClosed,
 }
 
-pub struct CompletionSink {
+// crates/sema-core/src/runtime/completion.rs
+pub(in crate::runtime) struct CompletionSink {
     sender: Arc<dyn CompletionSender>,
     runtime_id: RuntimeId,
     wait_id: WaitId,
@@ -507,7 +508,7 @@ pub struct CompletionSink {
 }
 
 impl CompletionSink {
-    pub fn for_registered_wait(
+    pub(in crate::runtime) fn for_registered_wait(
         sender: Arc<dyn CompletionSender>,
         runtime_id: RuntimeId,
         wait_id: WaitId,
@@ -526,7 +527,7 @@ impl CompletionSink {
     }
 
     /// Consumes the only delivery capability for this admitted job.
-    pub fn complete(
+    pub(in crate::runtime) fn complete(
         self,
         result: Result<SendPayload, ExternalFailure>,
     ) -> CompletionDelivery {
@@ -546,6 +547,53 @@ impl CompletionSink {
             kind,
             result,
         })
+    }
+}
+
+/// Opaque, owning queue item. Its fields are private and it is not `Clone`.
+pub struct ExecutorSubmission {
+    job: ExecutorJob,
+    sink: CompletionSink,
+    start_token: ExecutorStartToken,
+}
+
+impl ExecutorSubmission {
+    pub fn for_registered_wait(
+        sender: Arc<dyn CompletionSender>,
+        runtime_id: RuntimeId,
+        wait_id: WaitId,
+        generation: WaitGeneration,
+        operation_id: OperationId,
+        kind: CompletionKind,
+        job: ExecutorJob,
+        start_token: ExecutorStartToken,
+    ) -> Self {
+        /* validate identities, then call private CompletionSink constructor */
+    }
+}
+
+pub enum ExecutorDriveReport {
+    Delivered(CompletionDelivery),
+}
+
+mod executor_submission_sealed {
+    pub trait Sealed {}
+}
+
+/// The only cross-crate executor capability. `sema-io` may invoke these
+/// methods but cannot implement the trait or obtain the private sink.
+pub trait ExecutorSubmissionDriver: executor_submission_sealed::Sealed + Send {
+    fn operation_id(&self) -> OperationId;
+    fn drive(self: Box<Self>) -> ExecutorDriveReport;
+}
+
+impl executor_submission_sealed::Sealed for ExecutorSubmission {}
+
+impl ExecutorSubmissionDriver for ExecutorSubmission {
+    fn operation_id(&self) -> OperationId { /* private-field projection */ }
+
+    fn drive(self: Box<Self>) -> ExecutorDriveReport {
+        /* claim start token; run/catch panic or cancel; consume sink once */
     }
 }
 
@@ -586,15 +634,20 @@ pub enum SubmitErrorKind {
 }
 
 pub struct SubmissionRejected {
+    kind: SubmitErrorKind,
+    submission: ExecutorSubmission,
+}
+
+pub struct RejectedSubmissionRollback {
     pub kind: SubmitErrorKind,
     pub job: ExecutorJob,
-    pub sink: CompletionSink,
     pub start_token: ExecutorStartToken,
 }
 
 impl SubmissionRejected {
-    pub fn into_parts(self) -> (SubmitErrorKind, ExecutorJob, CompletionSink, ExecutorStartToken) {
-        (self.kind, self.job, self.sink, self.start_token)
+    /// Consumes and destroys the terminal sink before returning rollback owners.
+    pub fn into_rollback(self) -> RejectedSubmissionRollback {
+        /* destructure privately, drop sink, return kind/job/start token */
     }
 }
 
@@ -626,9 +679,7 @@ pub struct ExecutorShutdown {
 pub trait ExecutorLease: Send + Sync {
     fn submit(
         &self,
-        job: ExecutorJob,
-        sink: CompletionSink,
-        start_token: ExecutorStartToken,
+        submission: ExecutorSubmission,
     ) -> Result<RunningSubmission, SubmissionRejected>;
     fn snapshot(&self) -> ExecutorSnapshot;
     fn shutdown(&self, deadline: Instant) -> ExecutorShutdown;
@@ -642,6 +693,26 @@ pub trait IoExecutor: Send + Sync {
     fn snapshot(&self) -> ExecutorSnapshot;
 }
 ```
+
+`CompletionSink` belongs to `sema-core::runtime::completion`; both its
+constructor and consuming `complete` method are `pub(in crate::runtime)`. Rust
+privacy cannot privilege the separate `sema-io` crate, so `sema-io` never names
+or receives a sink. Runtime registration calls the public, checked
+`ExecutorSubmission::for_registered_wait` factory, which delegates sink
+construction to `completion.rs` after validating the registered identities and
+bundles the sink with the job and start token. The resulting queue item has
+private fields and no extraction or clone API.
+
+`ExecutorSubmissionDriver` is public only so the separate `sema-io` crate can
+dequeue and invoke it; its private supertrait seals implementation to
+`sema-core`. The core implementation claims the start token, invokes the job,
+catches panic, maps queued cancellation/panic/return, and consumes the private
+sink exactly once. Worker jobs receive no submission or delivery capability.
+The lease has exclusive custody after admission. On rejection it returns an
+opaque `SubmissionRejected`; `into_rollback` destroys the sink inside
+`sema-core` and returns only the job, start token, and rejection kind needed to
+undo registration. Rejected callers therefore retain owning rollback without a
+sink or executable terminal capability they could use to forge delivery.
 
 `attach_runtime` rejects duplicate `RuntimeId`s and shutdown pools. Runtime
 construction therefore returns `Result<Runtime, ExecutorAttachError>`. Lease

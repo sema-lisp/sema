@@ -80,7 +80,7 @@ runtime behavior.
 | Mapping regeneration | The writer reclassified every match through path/text heuristics, so a source edit could silently receive the wrong semantic row. | `unified_runtime_inventory_writer_preserves_reviews_and_marks_only_new_matches` proves surviving assignments are preserved, vanished payloads are removed, and new payloads remain `UNREVIEWED`. |
 | Partial discovery failure | A failing first discovery `rg` could be masked by a later successful scan. | `unified_runtime_inventory_checker_rejects_partial_discovery_scan_failure` passes for both `--check` and `--write-mapping`; neither writes a map after failure. The missing-binary regression also requires the named diagnostic. |
 | Escaped inherited writer | The Unix `setsid` helper held both pipes open and the blocking drain join returned after about 2.00s instead of the direct parent's prompt exit. | `escaped_session_pipe_writers_do_not_block_drain_join` passes in about 0.02s. Unix uses nonblocking reads; Windows uses a dedicated blocking reader and repeatedly targets that reader thread with `CancelSynchronousIo` during shutdown. Unix process-group cleanup remains best effort. |
-| Windows inherited writer | Native Windows execution is unavailable in this macOS worktree. | A `cfg(windows)` regression now spawns a two-second PowerShell writer through a promptly exiting helper. The exact watchdog and Windows test code pass an isolated `x86_64-pc-windows-gnu` `cargo check`; Task 07/Windows CI must execute it natively. |
+| Windows inherited writer | Native Windows execution is unavailable in this macOS worktree. | A `cfg(windows)` regression now spawns a two-second PowerShell writer through a promptly exiting helper. The exact watchdog and Windows test code pass an isolated `x86_64-pc-windows-gnu` `cargo check`; Task 07 must run the complete watchdog command in Windows-native CI and retain its run evidence. |
 | Completion liveness | Passing `CompletionSink` into a job let it omit delivery, duplicate it, or panic before consuming the sink. | Master and Tasks 02/03/05 use `ExecutorJob`; the executor privately owns one terminal sink delivery, maps panic to `WorkerPanic`, handles queued cancellation, and accounts for closed-inbox/late delivery. |
 
 The full Sema Windows cross-check was attempted with:
@@ -155,7 +155,8 @@ Second-amendment affected targets:
 The three native watchdog passes are noisy stdout/stderr draining, ordinary
 Unix process-group cleanup, and escaped-session no-EOF drain liveness. The
 Windows inherited-writer regression is target-gated and compile-locked here;
-native Windows execution remains a Task 07/CI gate.
+native Windows execution remains Task 07's explicit Windows-native
+full-watchdog command and evidence gate.
 
 Post-commit robustness correction: the ordinary Unix descendant oracle polls
 `ps -o state= -p PID` and accepts either absence or a state beginning with `Z`.
@@ -273,3 +274,34 @@ The exact intentional RED set is unchanged: supplied `async/all` sibling and
 scheduled `async/race` loser observation, captured mutation, negative
 sleep/timeout validation, unrepresentable channel capacity, finite tick ceiling,
 and watchdog fairness. Independent acceptance remains pending.
+
+## Important acceptance findings correction
+
+Task 07 acceptance now requires native Windows evidence from a repository CI
+job (for example, `windows-latest` in `.github/workflows/verify.yml`) running:
+
+```powershell
+cargo test -p sema-lang --test unified_runtime_watchdog_test -- --nocapture
+```
+
+The run must execute and pass the `cfg(windows)` inherited-writer,
+immediate-marker, and multi-chunk head/tail marker regressions. A Windows target
+cross-check does not execute `CancelSynchronousIo`, cannot replace this gate,
+and cannot support Task 07 acceptance. Task 07 evidence must retain the native
+workflow URL/run ID and output.
+
+Task 02 now keeps `CompletionSink`, its registered-wait constructor, and its
+consuming completion method `pub(in crate::runtime)` in `sema-core`. A checked
+factory wraps it in opaque `ExecutorSubmission`; the separate `sema-io` crate
+queues that owner and invokes a public sealed driver implemented by the
+core-controlled adapter. Worker jobs cannot access delivery. Rejection's
+`into_rollback` consumes the opaque submission, destroys the sink privately,
+and returns only job/start-token/rejection ownership. This preserves exact
+rollback while preventing a rejected caller from delivering.
+
+Validation after the correction: targeted `rg` inspection found no public
+`CompletionSink` constructor/completion method and no old three-argument
+executor submission contract in the synchronized master and Tasks 02/03/05;
+the only `sink: CompletionSink` occurrence is the private field in
+`ExecutorSubmission`. `git diff --check` passed. `jake docs-check` passed with 1
+selected docs test.

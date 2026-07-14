@@ -100,7 +100,8 @@ fake servers, deterministic fault injection.
 
 ## Exact executor interface
 
-Task 02 defines the exact `CompletionSender`, `CompletionSink`, `ExecutorJob`,
+Task 02 defines the exact `CompletionSender`, private `CompletionSink`, opaque
+`ExecutorSubmission`, sealed `ExecutorSubmissionDriver`, `ExecutorJob`,
 `PreparedExternalOperation`, `RunningSubmission`, owning `SubmissionRejected`,
 `ExecutorLease`, and `IoExecutor` interfaces in `sema-core`. Task 03 consumes
 those interfaces with a fake lease. Task 05 implements them in `sema-io` over
@@ -137,12 +138,9 @@ impl IoExecutor for ProcessIoExecutor {
 impl ExecutorLease for ProcessExecutorLease {
     fn submit(
         &self,
-        job: ExecutorJob,
-        sink: CompletionSink,
-        start_token: ExecutorStartToken,
+        submission: ExecutorSubmission,
     ) -> Result<RunningSubmission, SubmissionRejected> {
-        self.pool
-            .submit(self.runtime_id, job, sink, start_token)
+        self.pool.submit(self.runtime_id, submission)
     }
 
     fn snapshot(&self) -> ExecutorSnapshot {
@@ -158,14 +156,17 @@ impl ExecutorLease for ProcessExecutorLease {
 Task 02 defines `ExecutorJob` and the sole unregistered
 `PreparedExternalOperation`; Task 03 defines the distinct
 `RegisteredExternalWait`. Task 05 implements their executor boundary but MUST
-NOT introduce a second prepared/external-wait owner. The executor owns the sink
-after admission and never passes it to the job's consuming `run`. The job only returns a
+NOT introduce a second prepared/external-wait owner. The executor owns the
+opaque submission after admission and never passes it to the job's consuming
+`run`. The job only returns a
 send-safe result. Worker code therefore cannot omit or duplicate completion
 delivery, select the completion kind, return a resource/cancel hook, or move
 VM-side cleanup state across the thread boundary. `RunningSubmission` is only an
 immediate admission receipt. On rejection, `SubmissionRejected` proves no
-admission or sink delivery occurred and returns the job, sink, and start token
-to the runtime transaction for one rollback/drop path.
+admission or sink delivery occurred. Its consuming `into_rollback` destroys the
+private sink in `sema-core` and returns the job, start token, and rejection kind
+to the runtime transaction for one rollback/drop path; rejected callers never
+receive a delivery capability.
 
 Each interpreter runtime owns one `ExecutorLease` over the process-wide pool.
 Lease shutdown rejects new jobs for that runtime, cancels/drains only its jobs,
@@ -212,11 +213,13 @@ nonblocking construction, through the synchronized shared state, before first
 blocking use; a racing request then causes immediate attach-and-abort. If an API
 exposes its handle only after a potentially unbounded acquisition and cannot
 select/poll cancellation, split acquisition into its own interruptible wait,
-prove `QuarantinedBounded`, or mark the operation `PROHIBITED`. The executor
-invokes a claimed `ExecutorJob` body inside
+prove `QuarantinedBounded`, or mark the operation `PROHIBITED`. After dequeue,
+`sema-io` invokes the sealed `ExecutorSubmissionDriver::drive`; the `sema-core`
+adapter claims the token and invokes a claimed `ExecutorJob` body inside
 `catch_unwind(AssertUnwindSafe(...))`, maps a panic to an `ExternalFailure` with
-code `ExternalFailureCode::WorkerPanic`, and calls
-`CompletionSink::complete` exactly once. `InboxClosed` increments the executor's
+code `ExternalFailureCode::WorkerPanic`, and privately consumes
+`CompletionSink::complete` exactly once. `InboxClosed` in the returned drive
+report increments the executor's
 undeliverable counter rather than silently discarding a send failure. An
 enqueued completion rejected by `WaitRegistry` as stale, cancelled, duplicate,
 or wrong-identity normally increments the runtime's `late_completions` counter.
@@ -346,7 +349,8 @@ First use fake jobs/executors to pin the interface itself:
   + Waiting -> inline completion` path; the inbox is processed only afterward
   and makes the task ready through its stored continuation;
 - `submit_rejection_resumes_registered_continuation` — the same path returns
-  `SubmissionRejected`; its owning error returns job/sink/start token, rollback
+  `SubmissionRejected`; `into_rollback` drops the private sink and returns only
+  job/start-token ownership, rollback
   removes wait/control state, and the structured failure consumes the decoder
   then continuation once without a parked task or enqueued completion;
 - `submit_rejection_rolls_back_wait_and_resource` — successful rollback leaves
@@ -364,8 +368,10 @@ inbox/fault-injection case because the public `ExecutorJob` API cannot produce i
 - [ ] **Step 2: Implement prepared operations, `ExecutorJob`, admission, and counters**
 
 Preserve the process-wide pool identity and blocking-tier admission headroom.
-Keep `CompletionSink` fields and its consuming result-delivery method private to
-the executor. Construct the queue-cancel/start-token pair before wait
+Keep `CompletionSink`, its constructor, and its consuming result-delivery method
+`pub(in crate::runtime)` in `sema-core`; `sema-io` must only queue the opaque
+`ExecutorSubmission` and invoke the sealed core driver. Construct the
+queue-cancel/start-token pair before wait
 registration, store the runtime handle beside `ResourceClass`, and submit the
 non-cloneable token with the job. Implement the exact atomic
 cancel-versus-dequeue transition and rejection rollback before migrating any

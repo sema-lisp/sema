@@ -345,6 +345,51 @@ impl WaitRuntime {
         Some((CompletionRoute::Late, None))
     }
 
+    pub fn next_completion_task_id(&mut self) -> Option<TaskId> {
+        if self.deferred.is_empty() {
+            if let Ok(completion) = self
+                .inbox
+                .as_ref()
+                .map_or(Err(TryRecvError::Disconnected), Receiver::try_recv)
+            {
+                self.deferred.push_back(completion);
+            }
+        }
+        let completion = self.deferred.front();
+        completion.and_then(|completion| {
+            let key = WaitKey {
+                id: completion.wait_id,
+                generation: completion.generation,
+            };
+            self.active.get(&key).map(|wait| wait.task_id)
+        })
+    }
+
+    pub fn drain_unowned_one(&mut self) -> bool {
+        if self.next_completion_task_id().is_some() {
+            return false;
+        }
+        let Some(completion) = self.deferred.pop_front() else {
+            return false;
+        };
+        let key = WaitKey {
+            id: completion.wait_id,
+            generation: completion.generation,
+        };
+        if self.cleanup.get(&key).is_some_and(|entry| {
+            entry.quarantine
+                && entry.runtime_id == completion.runtime_id
+                && entry.operation_id == completion.operation_id
+                && entry.kind == completion.kind
+        }) {
+            self.remove_cleanup(key);
+            self.quarantine_reaped += 1;
+        } else {
+            self.late_completions += 1;
+        }
+        true
+    }
+
     pub fn cancel(&mut self, task: &mut TaskRecord, key: WaitKey) -> Option<PendingResume> {
         let wait = self.active.get(&key)?;
         if wait.task_id != task.id() || task.wait_key() != Some(key) {
@@ -455,10 +500,13 @@ impl WaitRuntime {
         self.cleanup.len()
     }
 
-    pub fn close(&mut self) -> Option<Arc<dyn ExecutorLease>> {
-        self.inbox.take();
+    pub fn take_lease(&mut self) -> Option<Arc<dyn ExecutorLease>> {
         self.registrar.take();
         self.lease.take()
+    }
+
+    pub fn close_inbox(&mut self) {
+        self.inbox.take();
     }
     pub fn is_closed(&self) -> bool {
         self.lease.is_none()

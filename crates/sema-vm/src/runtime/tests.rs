@@ -121,13 +121,13 @@ fn runtime_drive_charges_external_extract_decode_resume_and_apply_stages() {
         .expect("root admitted");
 
     let one = drive_budget(1);
-    for expected_work in 1..=6 {
+    for expected_work in 1..=8 {
         let state = runtime.drive(&one).expect("bounded stage");
         assert!(matches!(
             state,
             super::DriveState::Progress { work_items: 1, .. }
         ));
-        if expected_work < 6 {
+        if expected_work < 8 {
             assert!(matches!(handle.poll_result(), RootPoll::Pending));
         }
     }
@@ -159,10 +159,68 @@ fn runtime_forced_trace_keeps_values_in_root_settlement_and_every_pending_stage(
     runtime.drive(&drive_budget(1)).unwrap();
     assert_eq!(edge_count(&runtime), 2, "continuation stage owners");
     runtime.drive(&drive_budget(1)).unwrap();
-    assert_eq!(edge_count(&runtime), 1, "apply stage outcome");
+    assert_eq!(edge_count(&runtime), 2, "apply stage outcome");
+    runtime.drive(&drive_budget(1)).unwrap();
+    assert_eq!(edge_count(&runtime), 2, "settlement action outcome");
     runtime.drive(&drive_budget(1)).unwrap();
     assert_eq!(edge_count(&runtime), 1, "root settlement outcome");
+    runtime.drive(&drive_budget(1)).unwrap();
     assert!(matches!(handle.poll_result(), RootPoll::Ready(_)));
+}
+
+fn cyclic_cell() -> (Value, std::rc::Weak<sema_core::MutableCell>) {
+    let value = Value::mutable_cell(Value::NIL);
+    let cell = value.as_mutable_cell_rc().unwrap();
+    *cell.value.borrow_mut() = value.clone();
+    let weak = Rc::downgrade(&cell);
+    drop(cell);
+    (value, weak)
+}
+
+#[test]
+fn runtime_settlement_keeps_cycle_through_forced_collection_until_reaped() {
+    let runtime = runtime_with_inline_executor(Rc::new(FakeClock::new()));
+    let (value, weak) = cyclic_cell();
+    let handle = runtime
+        .submit_test_root(TestPreparedTask::returned(value))
+        .unwrap();
+    runtime.drive(&drive_budget(8)).unwrap();
+
+    sema_core::cycle::collect(&[], sema_core::cycle::GcTrigger::Explicit);
+    assert!(weak.upgrade().is_some(), "settlement is a runtime GC root");
+
+    drop(handle);
+    runtime.drive(&drive_budget(8)).unwrap();
+    sema_core::cycle::collect(&[], sema_core::cycle::GcTrigger::Explicit);
+    assert!(
+        weak.upgrade().is_none(),
+        "reaping releases the runtime root"
+    );
+}
+
+#[test]
+fn runtime_pending_apply_keeps_cycle_through_forced_collection_until_settlement_release() {
+    let runtime = runtime_with_inline_executor(Rc::new(FakeClock::new()));
+    let (value, weak) = cyclic_cell();
+    let handle = runtime
+        .submit_test_root(TestPreparedTask::native(Ok(NativeOutcome::Return(value))))
+        .unwrap();
+    runtime.drive(&drive_budget(2)).unwrap();
+
+    sema_core::cycle::collect(&[], sema_core::cycle::GcTrigger::Explicit);
+    assert!(
+        weak.upgrade().is_some(),
+        "pending apply is a runtime GC root"
+    );
+
+    runtime.drive(&drive_budget(8)).unwrap();
+    drop(handle);
+    runtime.drive(&drive_budget(8)).unwrap();
+    sema_core::cycle::collect(&[], sema_core::cycle::GcTrigger::Explicit);
+    assert!(
+        weak.upgrade().is_none(),
+        "settlement release permits collection"
+    );
 }
 
 #[test]
@@ -224,7 +282,7 @@ fn runtime_shutdown_rejects_admission_cancels_roots_and_reports_clean() {
             drive_budget: drive_budget(8),
         })
         .expect("bounded shutdown");
-    assert!(report.clean);
+    assert!(report.clean, "{report:?}");
     assert_eq!(report.live_tasks, 0);
     assert!(matches!(handle.poll_result(), RootPoll::Ready(_)));
     assert!(matches!(
@@ -243,7 +301,7 @@ fn runtime_shutdown_cancels_waiting_task_and_reaps_quarantine_completion() {
             external_suspend(Arc::clone(&events)),
         ))))
         .expect("root admitted");
-    runtime.drive(&drive_budget(1)).expect("register wait");
+    runtime.drive(&drive_budget(2)).expect("register wait");
 
     let report = runtime
         .shutdown(&super::ShutdownOptions {
@@ -251,7 +309,7 @@ fn runtime_shutdown_cancels_waiting_task_and_reaps_quarantine_completion() {
             drive_budget: drive_budget(8),
         })
         .expect("bounded shutdown");
-    assert!(report.clean);
+    assert!(report.clean, "{report:?}");
     assert_eq!(*events.lock().unwrap(), vec!["cancelled"]);
     let RootPoll::Ready(settlement) = handle.poll_result() else {
         panic!("waiting root settles during shutdown");
@@ -313,15 +371,36 @@ fn runtime_settlement_exhaustion_preserves_owner_until_terminal_shutdown() {
         "failed allocation keeps task owner"
     );
     assert!(matches!(handle.poll_result(), RootPoll::Pending));
-    runtime.clear_terminal_fault_for_test();
+    let result = runtime.shutdown(&super::ShutdownOptions {
+        deadline: clock.now() + Duration::from_secs(1),
+        drive_budget: drive_budget(8),
+    });
+    assert_eq!(
+        result,
+        Err(super::RuntimeFault::IdExhausted { kind: "settlement" })
+    );
+    assert_eq!(
+        runtime.task_count(),
+        0,
+        "terminal cleanup cancels every task"
+    );
+    assert!(matches!(handle.poll_result(), RootPoll::Pending));
+}
+
+#[test]
+fn runtime_shutdown_reports_executor_result() {
+    let clock = Rc::new(FakeClock::new());
+    let runtime = runtime_with_inline_executor(clock.clone());
     let report = runtime
         .shutdown(&super::ShutdownOptions {
             deadline: clock.now() + Duration::from_secs(1),
             drive_budget: drive_budget(8),
         })
-        .expect("terminal cleanup remains drivable");
-    assert!(report.clean);
-    assert!(matches!(handle.poll_result(), RootPoll::Ready(_)));
+        .unwrap();
+    assert!(matches!(
+        report.executor,
+        Some(ExecutorShutdown::Drained(_))
+    ));
 }
 
 #[derive(Clone, Copy)]

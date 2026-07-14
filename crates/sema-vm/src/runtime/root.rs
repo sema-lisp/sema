@@ -51,12 +51,18 @@ impl RootRecord {
         true
     }
 
+    fn checked_decrement(value: &mut usize, what: &'static str) {
+        *value = value
+            .checked_sub(1)
+            .unwrap_or_else(|| panic!("{what} underflow"));
+    }
+
     pub fn release_handle(&mut self) {
-        self.handle_count = self.handle_count.saturating_sub(1);
+        Self::checked_decrement(&mut self.handle_count, "root handle count");
     }
 
     pub fn release_descendant(&mut self) {
-        self.live_descendants = self.live_descendants.saturating_sub(1);
+        Self::checked_decrement(&mut self.live_descendants, "root descendant count");
     }
 
     pub fn is_reap_eligible(&self) -> bool {
@@ -70,6 +76,12 @@ impl RootRecord {
         task: TaskId,
         settlement: Rc<TaskSettlement>,
     ) -> Result<(), RootTransitionError> {
+        self.validate_settlement(task)?;
+        self.state = RootState::Settled(settlement);
+        Ok(())
+    }
+
+    pub(crate) fn validate_settlement(&self, task: TaskId) -> Result<(), RootTransitionError> {
         let RootState::Running { main_task } = &self.state else {
             return Err(RootTransitionError::AlreadySettled);
         };
@@ -79,7 +91,6 @@ impl RootRecord {
                 actual: task,
             });
         }
-        self.state = RootState::Settled(settlement);
         Ok(())
     }
 }

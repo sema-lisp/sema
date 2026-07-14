@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use sema_core::runtime::{
-    CancelReason, IdCounter, IoExecutor, NativeOutcome, NativeResult, RootId,
+    CancelReason, ExecutorShutdown, IdCounter, IoExecutor, NativeOutcome, NativeResult, RootId,
     RuntimeScopedIdCounter, SettlementSeq, TaskContextHandle, TaskId, TaskOutcome, TaskSettlement,
     Trace,
 };
@@ -54,6 +54,7 @@ pub struct ShutdownReport {
     pub live_tasks: usize,
     pub active_waits: usize,
     pub retained_cleanup: usize,
+    pub executor: Option<ExecutorShutdown>,
 }
 
 pub struct Runtime {
@@ -231,20 +232,20 @@ impl Runtime {
                 work_items += 1;
                 continue;
             }
+            if self.cancel_waiting()? {
+                work_items += 1;
+                continue;
+            }
+            if self.drain_completion() {
+                work_items += 1;
+                continue;
+            }
             if cleanup < budget.cleanup_limit.get() && self.reap_one() {
                 cleanup += 1;
                 work_items += 1;
                 continue;
             }
-            if self.cancel_waiting()? {
-                work_items += 1;
-                continue;
-            }
             if self.advance_pending()? {
-                work_items += 1;
-                continue;
-            }
-            if self.drain_completion() {
                 work_items += 1;
                 continue;
             }
@@ -299,17 +300,19 @@ impl Runtime {
     }
 
     fn cleanup_one(&self) -> bool {
-        let mut state = self.state.borrow_mut();
-        let Some(root) = state.handle_cleanup.pop_front() else {
-            return false;
+        let removed = {
+            let mut state = self.state.borrow_mut();
+            let Some(root) = state.handle_cleanup.pop_front() else {
+                return false;
+            };
+            state
+                .roots
+                .get(&root)
+                .is_some_and(RootRecord::is_reap_eligible)
+                .then(|| state.roots.remove(&root))
+                .flatten()
         };
-        if state
-            .roots
-            .get(&root)
-            .is_some_and(RootRecord::is_reap_eligible)
-        {
-            state.roots.remove(&root);
-        }
+        drop(removed);
         true
     }
 
@@ -368,19 +371,27 @@ impl Runtime {
     }
 
     fn drain_completion(&self) -> bool {
-        let task_ids = self
+        if self
             .state
-            .borrow()
-            .tasks
-            .keys()
-            .copied()
-            .collect::<Vec<_>>();
-        for task_id in task_ids {
+            .borrow_mut()
+            .waits
+            .as_mut()
+            .is_some_and(WaitRuntime::drain_unowned_one)
+        {
+            return true;
+        }
+        let task_id = self
+            .state
+            .borrow_mut()
+            .waits
+            .as_mut()
+            .and_then(WaitRuntime::next_completion_task_id);
+        if let Some(task_id) = task_id {
             let extracted = {
                 let mut state = self.state.borrow_mut();
                 let (Some(task), Some(waits)) = (state.tasks.remove(&task_id), state.waits.take())
                 else {
-                    continue;
+                    return false;
                 };
                 (task, waits)
             };
@@ -418,6 +429,10 @@ impl Runtime {
             return Ok(false);
         };
         let next = match stage {
+            PendingStage::Action(action) => {
+                self.apply_action(action)?;
+                return Ok(true);
+            }
             PendingStage::Decode(pending) => PendingStage::Continue(pending.invoke_decoder()),
             PendingStage::Continue(pending) => {
                 let task = pending.task_id();
@@ -475,7 +490,11 @@ impl Runtime {
                 });
             }
         }
-        self.apply_action(action)
+        self.state
+            .borrow_mut()
+            .pending
+            .push_back(PendingStage::Action(action));
+        Ok(true)
     }
 
     fn apply_action(&self, action: TaskAction) -> Result<bool, RuntimeFault> {
@@ -580,6 +599,22 @@ impl Runtime {
         outcome: TaskOutcome,
     ) -> Result<(), RuntimeFault> {
         let mut state = self.state.borrow_mut();
+        state
+            .tasks
+            .get(&task_id)
+            .ok_or_else(|| RuntimeFault::Invariant {
+                message: "settling task disappeared".into(),
+            })?;
+        state
+            .roots
+            .get(&root)
+            .ok_or_else(|| RuntimeFault::Invariant {
+                message: "settling task root disappeared".into(),
+            })?
+            .validate_settlement(task_id)
+            .map_err(|error| RuntimeFault::Invariant {
+                message: format!("root settlement transition failed: {error:?}"),
+            })?;
         #[cfg(test)]
         let exhausted = state.force_settlement_exhaustion;
         #[cfg(not(test))]
@@ -606,33 +641,21 @@ impl Runtime {
                 return Err(fault);
             }
         };
-        let mut task = state
-            .tasks
-            .remove(&task_id)
-            .ok_or_else(|| RuntimeFault::Invariant {
-                message: "settling task disappeared".into(),
-            })?;
-        let settlement =
-            task.record
-                .settle(sequence, outcome)
-                .map_err(|error| RuntimeFault::Invariant {
-                    message: format!("task settlement transition failed: {error:?}"),
-                })?;
-        let root_record = state
-            .roots
-            .get_mut(&root)
-            .ok_or_else(|| RuntimeFault::Invariant {
-                message: "settling task root disappeared".into(),
-            })?;
+        let mut task = state.tasks.remove(&task_id).expect("task prevalidated");
+        let settlement = task
+            .record
+            .settle(sequence, outcome)
+            .expect("live task settlement is infallible");
+        let root_record = state.roots.get_mut(&root).expect("root prevalidated");
         root_record
             .settle(task_id, settlement)
-            .map_err(|error| RuntimeFault::Invariant {
-                message: format!("root settlement transition failed: {error:?}"),
-            })?;
+            .expect("root settlement was prevalidated");
         root_record.release_descendant();
         if root_record.is_reap_eligible() {
             state.handle_cleanup.push_back(root);
         }
+        drop(state);
+        drop(task);
         Ok(())
     }
 
@@ -659,6 +682,7 @@ impl Runtime {
     }
 
     pub fn shutdown(&self, options: &ShutdownOptions) -> Result<ShutdownReport, RuntimeFault> {
+        let original_fault = self.state.borrow().terminal_fault.clone();
         {
             let mut state = self.state.borrow_mut();
             state.shutting_down = true;
@@ -668,9 +692,28 @@ impl Runtime {
             }
         }
         loop {
-            let state = self.drive(&options.drive_budget)?;
+            let state = match self.drive(&options.drive_budget) {
+                Ok(state) => state,
+                Err(fault) if original_fault.as_ref() == Some(&fault) => {
+                    self.discard_one_terminal_task();
+                    DriveState::Progress {
+                        work_items: 1,
+                        instructions: 0,
+                        ready_remaining: false,
+                    }
+                }
+                Err(fault) => return Err(fault),
+            };
             let now = self.state.borrow().clock.now();
-            if self.state.borrow().tasks.is_empty()
+            let cleanup_complete = {
+                let state = self.state.borrow();
+                state.tasks.is_empty()
+                    && state
+                        .waits
+                        .as_ref()
+                        .is_none_or(|waits| waits.active_len() == 0 && waits.cleanup_len() == 0)
+            };
+            if cleanup_complete
                 || now >= options.deadline
                 || !matches!(state, DriveState::Progress { .. })
             {
@@ -681,12 +724,13 @@ impl Runtime {
         let active_waits = state.waits.as_ref().map_or(0, WaitRuntime::active_len);
         let retained_cleanup = state.waits.as_ref().map_or(0, WaitRuntime::cleanup_len);
         let live_tasks = state.tasks.len();
-        let report = ShutdownReport {
+        let mut report = ShutdownReport {
             clean: live_tasks == 0 && active_waits == 0 && retained_cleanup == 0,
             live_roots: state.roots.len(),
             live_tasks,
             active_waits,
             retained_cleanup,
+            executor: None,
         };
         drop(state);
         let lease = self
@@ -694,26 +738,53 @@ impl Runtime {
             .borrow_mut()
             .waits
             .as_mut()
-            .and_then(WaitRuntime::close);
+            .and_then(WaitRuntime::take_lease);
         if let Some(lease) = lease {
-            lease.shutdown(options.deadline);
+            report.executor = Some(lease.shutdown(options.deadline));
         }
-        Ok(report)
+        if matches!(report.executor, Some(ExecutorShutdown::DeadlineExceeded(_))) {
+            report.clean = false;
+        }
+        if let Some(waits) = self.state.borrow_mut().waits.as_mut() {
+            waits.close_inbox();
+        }
+        original_fault.map_or(Ok(report), Err)
+    }
+
+    fn discard_one_terminal_task(&self) {
+        let removed = {
+            let mut state = self.state.borrow_mut();
+            let Some(task_id) = state.tasks.keys().next().copied() else {
+                return;
+            };
+            state.tasks.remove(&task_id)
+        };
+        drop(removed);
     }
 
     pub fn close_for_interpreter_drop(&self) {
-        let (lease, deadline) = {
+        {
             let mut state = self.state.borrow_mut();
             state.shutting_down = true;
             for task in state.tasks.values_mut() {
                 task.record
                     .request_cancellation(CancelReason::InterpreterShutdown);
             }
+        }
+        while matches!(self.cancel_waiting(), Ok(true)) {}
+        let (lease, deadline) = {
+            let mut state = self.state.borrow_mut();
             let deadline = state.clock.now();
-            (state.waits.as_mut().and_then(WaitRuntime::close), deadline)
+            (
+                state.waits.as_mut().and_then(WaitRuntime::take_lease),
+                deadline,
+            )
         };
         if let Some(lease) = lease {
             lease.shutdown(deadline);
+        }
+        if let Some(waits) = self.state.borrow_mut().waits.as_mut() {
+            waits.close_inbox();
         }
     }
 
@@ -731,12 +802,11 @@ impl Runtime {
     pub(super) fn force_settlement_exhaustion_for_test(&self) {
         self.state.borrow_mut().force_settlement_exhaustion = true;
     }
+}
 
-    #[cfg(test)]
-    pub(super) fn clear_terminal_fault_for_test(&self) {
-        let mut state = self.state.borrow_mut();
-        state.force_settlement_exhaustion = false;
-        state.terminal_fault = None;
+impl Drop for Runtime {
+    fn drop(&mut self) {
+        self.close_for_interpreter_drop();
     }
 }
 
@@ -816,6 +886,7 @@ enum TaskAction {
 }
 
 enum PendingStage {
+    Action(TaskAction),
     Decode(PendingResume),
     Continue(PendingResume),
     Apply(TaskId, NativeResult),
@@ -824,11 +895,26 @@ enum PendingStage {
 impl Trace for PendingStage {
     fn trace(&self, sink: &mut dyn FnMut(sema_core::cycle::GcEdge<'_>)) -> bool {
         match self {
+            Self::Action(action) => action.trace(sink),
             Self::Decode(pending) | Self::Continue(pending) => pending.trace(sink),
             Self::Apply(_, result) => match result {
                 Ok(outcome) => outcome.trace(sink),
                 Err(error) => error.trace(sink),
             },
+        }
+    }
+}
+
+impl Trace for TaskAction {
+    fn trace(&self, sink: &mut dyn FnMut(sema_core::cycle::GcEdge<'_>)) -> bool {
+        match self {
+            Self::Settle(_, _, outcome) => outcome.trace(sink),
+            Self::Native(_, result) => match result {
+                Ok(outcome) => outcome.trace(sink),
+                Err(error) => error.trace(sink),
+            },
+            Self::Resume(pending) => pending.trace(sink),
+            Self::Yield(_, _) => true,
         }
     }
 }

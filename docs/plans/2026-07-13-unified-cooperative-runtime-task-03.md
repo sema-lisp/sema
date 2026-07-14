@@ -583,7 +583,7 @@ replacing a temporary state model.
 **Files:** `runtime/mod.rs`, `runtime/root.rs`, `runtime/task.rs`,
 `runtime/tests.rs`, `crates/sema-vm/src/lib.rs`
 
-- [ ] **Step 1: Write failing transition-table tests**
+- [x] **Step 1: Write failing transition-table tests**
 
 Test every legal edge and representative illegal edges. Include returned,
 failed, and cancelled settlements and prove one canonical
@@ -593,7 +593,7 @@ slice tests pure records only; root-handle retention, submission exhaustion,
 terminal runtime faults, and reaping are tested in Task 3 after runtime state,
 drive, and cleanup exist.
 
-- [ ] **Step 2: Implement the records and transition methods**
+- [x] **Step 2: Implement the records and transition methods**
 
 Use checked IDs from Task 02. Do not expose mutable task/root fields outside the
 runtime module. Task 1 owns initial module scaffolding and the private test
@@ -602,7 +602,7 @@ The pure root record contains identity and state only; Task 3 adds checked
 retention counters with handle/reaping tests, and Task 6 adds initial context and
 output ownership when root submission is composed.
 
-- [ ] **Step 3: Run**
+- [x] **Step 3: Run**
 
 ```bash
 cargo test -p sema-vm runtime::tests::state
@@ -615,7 +615,7 @@ states.
 
 **Files:** `runtime/ready.rs`, `runtime/tests.rs`
 
-- [ ] **Step 1: Write failing sequence tests**
+- [x] **Step 1: Write failing sequence tests**
 
 Assert exact dequeue sequences for:
 
@@ -624,12 +624,12 @@ Assert exact dequeue sequences for:
 - removal of a settled root without disturbing remaining order;
 - duplicate wake attempts for one task.
 
-- [ ] **Step 2: Implement queue invariants and duplicate protection**
+- [x] **Step 2: Implement queue invariants and duplicate protection**
 
 Keep membership sets private and assert queue/set agreement after mutations in
 test builds.
 
-- [ ] **Step 3: Run**
+- [x] **Step 3: Run**
 
 ```bash
 cargo test -p sema-vm runtime::tests::ready
@@ -642,7 +642,7 @@ Expected: exact order assertions pass.
 **Files:** `runtime/timer.rs`, `runtime/wait.rs`, `runtime/drive.rs`,
 `runtime/tests.rs`
 
-- [ ] **Step 1: Add a fake monotonic clock and failing tests**
+- [x] **Step 1: Add a fake monotonic clock and failing tests**
 
 Cover same-deadline insertion order, zero duration, timer cancellation,
 generation reuse, wrong runtime, wrong operation, wrong completion kind,
@@ -683,12 +683,12 @@ Force root, task, wait/operation, and settlement-sequence exhaustion and assert
 the exact submission/operation or terminal runtime-fault path without an
 unsequenced settlement or leaked extracted owner.
 
-- [ ] **Step 2: Implement registration and bounded drains**
+- [x] **Step 2: Implement registration and bounded drains**
 
 Do not sleep in `Runtime::drive`. Return `Idle { next_deadline }`; native hosts
 may wait outside the runtime and browser hosts may schedule a macrotask.
 
-- [ ] **Step 3: Run**
+- [x] **Step 3: Run**
 
 ```bash
 cargo test -p sema-vm runtime::tests::timer

@@ -575,78 +575,78 @@ output routing, migration of existing `EvalContext` fields, production
 
 ## Task 1: Implement checked IDs and relations
 
-- [ ] Add crate-private allocator tests for one, max, permanent exhaustion, and
+- [x] Add crate-private allocator tests for one, max, permanent exhaustion, and
   process-global `RuntimeId` uniqueness.
-- [ ] Add public tests for `TaskId::try_from_raw`,
+- [x] Add public tests for `TaskId::try_from_raw`,
   `CompletionKind::try_from_raw`, accessors, traits, and relationship axes.
-- [ ] Implement the minimum types and run `cargo test -p sema-core runtime::ids`
+- [x] Implement the minimum types and run `cargo test -p sema-core runtime::ids`
   plus the public `ids`/`relationships` filters.
 
 ## Task 2: Implement settlements and conditions
 
-- [ ] Test distinct outcomes and exact cancellation/timeout condition maps,
+- [x] Test distinct outcomes and exact cancellation/timeout condition maps,
   including lossless maximum-ID and duration strings.
-- [ ] Implement `SemaError::Condition(Value)` constructors and extend
+- [x] Implement `SemaError::Condition(Value)` constructors and extend
   `CONDITION_TYPES`; add no error variants or predicates.
-- [ ] Run the `settlement` and `condition` test filters.
+- [x] Run the `settlement` and `condition` test filters.
 
 ## Task 3: Implement the completion compile prerequisite, resources, and executor wrappers
 
-- [ ] In this exact order, add the minimal `Trace` signature, declare the
+- [x] In this exact order, add the minimal `Trace` signature, declare the
   private `TaskContext` shell, add `CancellationView`/`NativeCallContext`,
   `DecodedCompletion`, and `CompletionDecoder`; then add completion envelopes, resources,
   `PreparedExternalOperation`, registrar binding, and executor wrappers.
   Do not implement tracing or native outcomes/continuations/ABI changes yet.
-- [ ] Test `ExternalCompletion: Send`, while a deliberately non-`Send` decoder,
+- [x] Test `ExternalCompletion: Send`, while a deliberately non-`Send` decoder,
   prepared binding, and resource remain runtime-local; test typed decode
   failure, constructor compatibility, quarantine descriptors, attachment
   errors, capability-safe registration, and internal rejection destruction.
-- [ ] Test each dispatch terminal path: return, error, queued cancellation,
+- [x] Test each dispatch terminal path: return, error, queued cancellation,
   construction panic, poll/run panic (under unwind), dispatch drop, and future
   drop. Assert one bounded terminal delivery attempt and no nameable sink.
-- [ ] Test reserve -> arm (`into_dispatch`) -> enqueue ordering: rejected work
+- [x] Test reserve -> arm (`into_dispatch`) -> enqueue ordering: rejected work
   remains unarmed; admitted queues contain only dispatches; post-arm enqueue
   failure attempts cancellation and is not `SubmissionRejected`. Test closed
   inbox accounting in the sender/reporter rather than as a `Drop` return.
-- [ ] Implement under `runtime::{completion,resource,executor}` without touching
+- [x] Implement under `runtime::{completion,resource,executor}` without touching
   `io_backend.rs`; run the `completion`, `resource`, and `executor` filters.
 
 ## Task 4: Complete native protocol, dual path, and tracing
 
-- [ ] Test exact return/call/suspend shapes, all four `WaitKind` variants and
+- [x] Test exact return/call/suspend shapes, all four `WaitKind` variants and
   both `ChannelWait` variants, each `ResumeInput`, consuming continuation
   behavior, and the absence of `Clone`/a second wait-request type.
-- [ ] Test every legacy constructor through `invoke_runtime` adapts success to
+- [x] Test every legacy constructor through `invoke_runtime` adapts success to
   `Return`; test `simple_result`/`with_context_result`, their named internal
   error through public `func`, private runtime metadata, `with_payload`
   preservation, and `with_payload_result`'s typed one-strong-edge contract.
-- [ ] Test exact duplicate-edge multiplicity and a failed borrow after partial
+- [x] Test exact duplicate-edge multiplicity and a failed borrow after partial
   sink emission. Pin direct trace edges for call, suspend, every wait/resume
   variant, prepared decoder/resource (never job), and interruptible hook only.
   Test payload delegation only for an actual opaque payload and prove traced
   external records remain external roots.
-- [ ] Implement and run the `native` filter plus `cargo test -p sema-core cycle`.
+- [x] Implement and run the `native` filter plus `cargo test -p sema-core cycle`.
 
 ## Task 5: Implement the task-context extension shell
 
-- [ ] Test typed insert/get/remove and child inheritance with two extension
+- [x] Test typed insert/get/remove and child inheritance with two extension
   types; do not write a named EvalContext-field migration table here.
-- [ ] Add `TaskContextHandle` to every `EvalContext` constructor and test absent,
+- [x] Add `TaskContextHandle` to every `EvalContext` constructor and test absent,
   installed, cloned-handle, and inherited-child behavior.
-- [ ] Run the `task_context` filter and `cargo test -p sema-core context`.
+- [x] Run the `task_context` filter and `cargo test -p sema-core context`.
 
 ## Task 6: Add legacy conversions and source guards
 
-- [ ] Add named fallible bridge conversions while preserving raw callback and
+- [x] Add named fallible bridge conversions while preserving raw callback and
   promise signatures and existing failure text.
-- [ ] Update inventory rows and inspect intentional baseline changes with
+- [x] Update inventory rows and inspect intentional baseline changes with
   `scripts/check-unified-runtime-legacy.sh`.
-- [ ] Run `vm_async_test` and `runtime_conformance_test`; record unchanged RED
+- [x] Run `vm_async_test` and `runtime_conformance_test`; record unchanged RED
   characterization cases exactly rather than claiming them GREEN.
 
 ## Task 7: Verify, evidence, review, and commit
 
-- [ ] Run:
+- [x] Run:
 
 ```bash
 cargo test -p sema-core
@@ -657,10 +657,10 @@ jake docs-check
 git diff --check
 ```
 
-- [ ] Record commands, statuses, baseline changes, and remaining RED tests in
+- [x] Record commands, statuses, baseline changes, and remaining RED tests in
   Task 02 evidence. Obtain independent review with stable `UR-T02-R###` IDs.
-- [ ] Fix each valid finding test-first and rerun affected and full gates.
-- [ ] Commit only the accepted implementation/evidence with
+- [x] Fix each valid finding test-first and rerun affected and full gates.
+- [x] Commit only the accepted implementation/evidence with
   `refactor(runtime): define core runtime contracts`.
 
 ## Completion criteria

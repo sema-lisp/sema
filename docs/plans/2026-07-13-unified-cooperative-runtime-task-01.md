@@ -124,13 +124,13 @@ Cancellation class | Context policy | Owning layer | Existing tests | Status
 
 ## Entry criteria
 
-- [ ] Confirm `git status --short --branch` shows only expected local work.
-- [ ] Confirm `git rev-parse --short HEAD` includes architecture commit
+- [x] Confirm `git status --short --branch` shows only expected local work.
+- [x] Confirm `git rev-parse --short HEAD` includes architecture commit
   `8acca1de` in its ancestry.
-- [ ] Read the current Task 01 implementation report if it still exists at
+- [x] Read the current Task 01 implementation report if it still exists at
   `/tmp/unified-runtime-task-01-implementer-report.md`; treat it as discovery,
   not evidence.
-- [ ] Record the current names around the characterization section:
+- [x] Record the current names around the characterization section:
 
 ```bash
 rg -n "awaited_child_mutation|cancels_owned|negative_before_rounding|tick_ceiling|ready_spinner|nested_aggregate" \
@@ -145,7 +145,7 @@ Expected: all provisional tests from `52293e61` are present.
 
 - Modify: `crates/sema/tests/vm_async_test.rs`
 
-- [ ] **Step 1: Replace the pre-settled race cancellation oracle**
+- [x] **Step 1: Replace the pre-settled race cancellation oracle**
 
 Replace `race_with_settled_winner_cancels_owned_pending_loser` with this
 language-observable contract:
@@ -171,7 +171,7 @@ fn race_with_settled_winner_does_not_cancel_supplied_loser() {
 }
 ```
 
-- [ ] **Step 2: Replace the scheduled race sibling-cancellation oracle**
+- [x] **Step 2: Replace the scheduled race sibling-cancellation oracle**
 
 Replace `async_race_cancels_losing_siblings` with:
 
@@ -196,7 +196,7 @@ fn async_race_does_not_cancel_supplied_loser() {
 }
 ```
 
-- [ ] **Step 3: Replace the `async/all` sibling-cancellation oracle**
+- [x] **Step 3: Replace the `async/all` sibling-cancellation oracle**
 
 Replace `async_all_reject_cancels_pending_sibling` with:
 
@@ -220,14 +220,14 @@ fn async_all_failure_does_not_cancel_supplied_sibling() {
 }
 ```
 
-- [ ] **Step 4: Rename the over-cancellation guard to describe observation**
+- [x] **Step 4: Rename the over-cancellation guard to describe observation**
 
 Keep `combinator_short_circuit_spares_unrelated_task` if it still adds coverage,
 but update its comment so it does not claim that supplied promise sets are
 owned. It proves unrelated work survives; the three tests above prove supplied
 work survives.
 
-- [ ] **Step 5: Audit every existing ownership oracle**
+- [x] **Step 5: Audit every existing ownership oracle**
 
 Search every test occurrence of `async/timeout`, `async/all`, and `async/race`.
 Timeout and aggregate observation must never prove cancellation, resource abort,
@@ -252,7 +252,7 @@ Rename `async_all_reports_rejection_over_cancelled_sibling` to a
 first-settlement rejection test that makes no sibling-cancellation claim. Do
 not add `async/with-timeout` tests in Task 01; Task 04 owns that new API.
 
-- [ ] **Step 6: Run the corrected tests individually**
+- [x] **Step 6: Run the corrected tests individually**
 
 ```bash
 cargo test -p sema-lang --test vm_async_test \
@@ -280,12 +280,12 @@ supplied siblings. Expected after Task 04: PASS.
 
 - Modify: `crates/sema/tests/vm_async_test.rs`
 
-- [ ] **Step 1: Keep the captured-cell test exact**
+- [x] **Step 1: Keep the captured-cell test exact**
 
 `awaited_child_mutation_is_visible_to_parent` must continue to expect `42`. Do
 not replace it with an implementation-state assertion.
 
-- [ ] **Step 2: Keep duration validation split by failure class**
+- [x] **Step 2: Keep duration validation split by failure class**
 
 Retain the tests for negative-before-rounding, non-finite input, and finite
 overflow. Add the same negative-before-rounding oracle for observational
@@ -302,19 +302,19 @@ fn timeout_rejects_duration_negative_before_rounding() {
 }
 ```
 
-- [ ] **Step 3: Keep the capacity test panic-sensitive**
+- [x] **Step 3: Keep the capacity test panic-sensitive**
 
 Retain `channel_rejects_unrepresentable_capacity_without_panicking`. The helper
 must return the language error; do not wrap the evaluation in `catch_unwind`,
 which would turn a Rust panic into an accepted result.
 
-- [ ] **Step 4: Keep the finite tick-ceiling test separate from fairness**
+- [x] **Step 4: Keep the finite tick-ceiling test separate from fairness**
 
 Retain `scheduler_workload_beyond_tick_ceiling_completes` as a finite workload.
 It may remain in-process because its Sema recursion terminates independently of
 timer fairness.
 
-- [ ] **Step 5: Keep the nested callback oracle exact**
+- [x] **Step 5: Keep the nested callback oracle exact**
 
 Retain `nested_aggregate_callback_can_spawn_await_and_resume_parent` and its
 expected `(5 23 203)` result. Task 03 will make it GREEN without nested
@@ -329,13 +329,13 @@ scheduler re-entry.
 - Create: `crates/sema/tests/common/watchdog.rs`
 - Create: `crates/sema/tests/unified_runtime_watchdog_test.rs`
 
-- [ ] **Step 1: Remove the in-process perpetual spinner test**
+- [x] **Step 1: Remove the in-process perpetual spinner test**
 
 Delete `ready_spinner_does_not_starve_due_timer` from
 `vm_async_test.rs`. Its replacement below exercises the same public behavior
 without allowing an unfair scheduler to hang the test process.
 
-- [ ] **Step 2: Add the reusable watchdog harness**
+- [x] **Step 2: Add the reusable watchdog harness**
 
 Create `crates/sema/tests/common/watchdog.rs` with this harness and export the
 module from `crates/sema/tests/common/mod.rs`. Keeping it in the shared test
@@ -381,7 +381,7 @@ not duplicate the harness in the test crate. This is a test-process watchdog,
 not the interpreter shutdown implementation; Task 07 owns production host
 shutdown and Windows descendant containment.
 
-- [ ] **Step 3: Add watchdog self-regressions first**
+- [x] **Step 3: Add watchdog self-regressions first**
 
 Add `noisy_child_is_drained_without_hanging_and_capture_is_bounded`,
 `inherited_pipe_writer_does_not_extend_parent_watchdog`, the Unix-only
@@ -406,7 +406,7 @@ including the inherited-writer, immediate-marker, and multi-chunk marker
 regressions. Cross-compilation is insufficient, and Task 07 cannot be accepted
 without that native Windows evidence.
 
-- [ ] **Step 4: Add the ready-storm/timer test**
+- [x] **Step 4: Add the ready-storm/timer test**
 
 Append:
 
@@ -444,7 +444,7 @@ fn ready_spinner_does_not_starve_due_timer() {
 }
 ```
 
-- [ ] **Step 5: Run watchdog regressions individually**
+- [x] **Step 5: Run watchdog regressions individually**
 
 ```bash
 cargo test -p sema-lang --test unified_runtime_watchdog_test \
@@ -470,7 +470,7 @@ after Tasks 03–04: PASS.
 - Create: `scripts/check-unified-runtime-inventory.sh`
 - Modify: `crates/sema/tests/runtime_conformance_test.rs`
 
-- [ ] **Step 1: Add ledger rules at the top**
+- [x] **Step 1: Add ledger rules at the top**
 
 State that a row may be marked complete only when its target path, cancellation
 class, context policy, tests, and removal status are all evidenced. Use these
@@ -480,7 +480,7 @@ status values exactly:
 LEGACY | ADAPTER | MIGRATED | SYNCHRONOUS-PROOF | REMOVED
 ```
 
-- [ ] **Step 2: Inventory core and VM symbols**
+- [x] **Step 2: Inventory core and VM symbols**
 
 Create one row per relevant symbol in:
 
@@ -505,7 +505,7 @@ context policies. Audit at least F01, F08, F09, F21, F34, R01, R07–R09, R15–
 R20, R22–R23, C07, and H10 for mixed wait/class/context/owner/deletion policy;
 split any row whose fields cannot all receive one migration disposition.
 
-- [ ] **Step 3: Inventory standard-library waits and resources**
+- [x] **Step 3: Inventory standard-library waits and resources**
 
 For each async branch, blocking call, resource close/drop path, and callback in
 the stdlib modules named by the master specification, record:
@@ -515,7 +515,7 @@ the stdlib modules named by the master specification, record:
 - the concrete abort/close/kill/deadline mechanism;
 - the Task 05 test file that proves it.
 
-- [ ] **Step 4: Inventory task-local and integration state**
+- [x] **Step 4: Inventory task-local and integration state**
 
 Record every relevant `thread_local!`, task capture/install callback, agent/stream
 slab, workflow scope, MCP cassette/hook, output hook, OTel span stack, usage,
@@ -526,13 +526,13 @@ INTERPRETER-SHARED | ROOT-SHARED | TASK-SNAPSHOT | TASK-PRIVATE |
 SCOPE-SHARED | RESOURCE-OWNED | HOST-ADAPTER-ONLY
 ```
 
-- [ ] **Step 5: Inventory every host and shipped asset**
+- [x] **Step 5: Inventory every host and shipped asset**
 
 Include CLI, REPL, embedding, DAP, LSP, notebook, workflow, MCP server,
 `sema-wasm`, playground worker/client, vendored web runtime assets, and every
 host-owned interpreter in tests.
 
-- [ ] **Step 6: Create the exact match-level mapping and checker**
+- [x] **Step 6: Create the exact match-level mapping and checker**
 
 Scope both discovery commands to `crates/*/src` and `playground/src`, with only
 the exact generated-source exclusions used by the legacy scanner. Union their
@@ -557,7 +557,7 @@ regressions for a missing `rg` binary and for the first discovery scan failing
 while a later scan succeeds; exercise both `--check` and `--write-mapping` and
 prove neither masks the error or writes a map.
 
-- [ ] **Step 7: Run the exact coverage gates**
+- [x] **Step 7: Run the exact coverage gates**
 
 ```bash
 chmod +x scripts/check-unified-runtime-inventory.sh
@@ -578,7 +578,7 @@ Expected: checker reports the exact union count and the conformance test passes.
 - Create: `crates/sema/tests/fixtures/unified_runtime_legacy/raw_blocking_recv.rs`
 - Modify: `crates/sema/tests/runtime_conformance_test.rs`
 
-- [ ] **Step 1: Write the scanner**
+- [x] **Step 1: Write the scanner**
 
 The script must use `rg`, normalize paths relative to the repository root,
 sort uniquely, exclude `target`, `.git`, plan/evidence prose, and generated
@@ -590,14 +590,14 @@ Include raw synchronous receiver `.recv()` in addition to `blocking_recv` and
 and `--scan-production` for the mapping checker; both reject an unexpectedly
 empty scan.
 
-- [ ] **Step 2: Add the raw-receiver fixture test RED-first**
+- [x] **Step 2: Add the raw-receiver fixture test RED-first**
 
 The fixture contains a direct `std::sync::mpsc::Receiver::recv()` call. Its
 conformance test invokes `--scan-path` and requires the exact fixture
 `path:line:text` in stdout. Record the unsupported-option/missed-match RED before
 adding the scanner support.
 
-- [ ] **Step 3: Generate the initial baseline**
+- [x] **Step 3: Generate the initial baseline**
 
 ```bash
 chmod +x scripts/check-unified-runtime-legacy.sh
@@ -608,14 +608,14 @@ scripts/check-unified-runtime-legacy.sh
 Expected: the first command writes a nonempty sorted baseline; the second exits
 zero with no diff.
 
-- [ ] **Step 4: Add conformance tests for the script**
+- [x] **Step 4: Add conformance tests for the script**
 
 Add a test that invokes the script from `CARGO_MANIFEST_DIR/../..` and asserts
 successful status. Include stdout/stderr in the assertion message. Keep the raw
 receiver and exact inventory mapping regressions enabled; do not copy scanner
 logic into Rust.
 
-- [ ] **Step 5: Run the conformance target**
+- [x] **Step 5: Run the conformance target**
 
 ```bash
 cargo test -p sema-lang --test runtime_conformance_test -- --nocapture
@@ -633,12 +633,12 @@ requires the production baseline to become empty.
 - Modify: `docs/plans/evidence/unified-cooperative-runtime/task-01.md`
 - Modify: `docs/plans/evidence/unified-cooperative-runtime/task-01-discovery.txt`
 
-- [ ] **Step 1: Run every new test individually**
+- [x] **Step 1: Run every new test individually**
 
 Record command, status, elapsed time, and the exact language-level mismatch for
 each test. Classify it `RED-EXPECTED` or `GREEN-BASELINE`.
 
-- [ ] **Step 2: Run the complete affected targets**
+- [x] **Step 2: Run the complete affected targets**
 
 ```bash
 cargo test -p sema-lang --test vm_async_test -- --nocapture
@@ -658,7 +658,7 @@ scripts/check-unified-runtime-inventory.sh --check
 Expected: characterization targets may be RED only for enumerated approved
 runtime defects. The conformance target must be GREEN. No hang is acceptable.
 
-- [ ] **Step 3: Run formatting and diff checks**
+- [x] **Step 3: Run formatting and diff checks**
 
 ```bash
 cargo fmt --all -- --check
@@ -668,7 +668,7 @@ git diff --check
 If workspace formatting is RED before this task, record the exact unrelated
 paths and run `rustfmt --edition 2021 --check` on both modified Rust test files.
 
-- [ ] **Step 4: Write the handoff table**
+- [x] **Step 4: Write the handoff table**
 
 The evidence file must list every RED test and the task expected to turn it
 GREEN:
@@ -683,7 +683,7 @@ legacy source matches -> Tasks 02–08
 
 ## Task 7: Independent review response and provisional commit
 
-- [ ] **Step 1: Consume the controller-owned independent review**
+- [x] **Step 1: Consume the controller-owned independent review**
 
 The reviewer checks only:
 
@@ -701,12 +701,12 @@ Do not write an implementer-owned independent-review artifact. Append commands,
 results, and each fix rationale to `.superpowers/sdd/task-01-report.md`; preserve
 all controller-owned `.superpowers` files unmodified except for that append.
 
-- [ ] **Step 2: Fix every finding and rerun affected commands**
+- [x] **Step 2: Fix every finding and rerun affected commands**
 
 Add a regression oracle before fixing any discovered test-harness bug. The
 implementer may not close their own review finding.
 
-- [ ] **Step 3: Commit the provisional amendment layer**
+- [x] **Step 3: Commit the provisional amendment layer**
 
 ```bash
 git add \

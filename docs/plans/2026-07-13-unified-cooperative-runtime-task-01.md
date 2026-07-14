@@ -70,8 +70,9 @@ Markdown evidence, Cargo, Jake.
 - `crates/sema/tests/runtime_conformance_test.rs` — source-boundary and baseline
   manifest checks, raw-receiver scanner fixture, and exact inventory mapping gate.
 - `docs/internals/async-runtime-inventory.md` — executable migration ledger.
-- `docs/plans/2026-07-13-unified-cooperative-runtime{,-task-01,-task-02,-task-05}.md`
-  — synchronize worker-boundary, Task 01 execution, and Task 05 executor contracts.
+- `docs/plans/2026-07-13-unified-cooperative-runtime{,-task-01,-task-02,-task-03,-task-05}.md`
+  — synchronize worker-boundary, Task 01 execution, runtime ownership, and
+  executor contracts.
 - `docs/plans/evidence/unified-cooperative-runtime/{task-01.md,task-01-discovery.txt}`
   — corrected chronology, commands, counts, and amendment results.
 
@@ -347,10 +348,20 @@ The harness must:
 - retain at most 64 KiB per stream while continuing to drain/discard excess, so
   a noisy child cannot fill a pipe or allocate unbounded diagnostics;
 - poll the direct child against the host deadline and close the kill/wait race;
-- on Unix and Windows, put diagnostic pipes in nonblocking mode and give each
-  drain thread a cancellation flag. After direct-child wait/termination, signal
-  both drains, perform only a bounded final read, and join them. EOF from every
-  inherited writer is not a precondition for returning;
+- on Unix, put diagnostic pipes in nonblocking mode; after direct-child
+  wait/termination, signal each drain, perform only a bounded final read, and
+  join it. On Windows, keep each anonymous read handle in its original mode and
+  give it one dedicated blocking reader thread. The reader checks its stop flag
+  before every read and uses a 64 KiB buffer so one read can retain the complete
+  diagnostic window. Shutdown waits only for the reader-start handshake, sets
+  the flag, and, until the join handle reports
+  finished, repeatedly calls `CancelSynchronousIo` on that exact reader thread
+  handle; tolerate `ERROR_NOT_FOUND` because cancellation can race before a read
+  becomes pending, and treat `ERROR_OPERATION_ABORTED` with stop set as clean
+  exit. No post-stop read is needed on Windows. This covers stop-before-check,
+  check-before-read/cancel-too-early, pending-read, and continuously-readable
+  pipe races without a timing/quiet-period heuristic. Both platforms continuously drain/discard beyond the capture cap,
+  and EOF from every inherited writer is not a precondition for returning;
 - on Unix, create a fresh process group for every watched command and terminate
   remaining members after normal direct-child exit or timeout. This is
   best-effort containment: a descendant can escape with `setsid`, so bounded
@@ -374,7 +385,8 @@ shutdown and Windows descendant containment.
 Add `noisy_child_is_drained_without_hanging_and_capture_is_bounded`,
 `inherited_pipe_writer_does_not_extend_parent_watchdog`, the Unix-only
 `escaped_session_pipe_writers_do_not_block_drain_join`, and the Windows-only
-`windows_inherited_pipe_writer_does_not_block_drain_join`. The noisy child must
+`windows_inherited_pipe_writer_does_not_block_drain_join`, plus immediate-marker
+and multi-chunk marker regressions on Windows. The noisy child must
 fill both stdout and stderr beyond pipe capacity while retained output stays at
 64 KiB per stream. The ordinary inherited writer proves best-effort process
 group cleanup. Its termination oracle accepts either an absent process or a
@@ -604,8 +616,10 @@ logic into Rust.
 cargo test -p sema-lang --test runtime_conformance_test -- --nocapture
 ```
 
-Expected: PASS. Later tasks update the baseline only when a reviewed legacy
-match disappears; Task 08 requires the production baseline to become empty.
+Expected: PASS. This baseline is an exact reviewed snapshot/change detector,
+not a monotonic ratchet that independently prevents additions. Later tasks
+review every diff and update it for intentional additions or removals; Task 08
+requires the production baseline to become empty.
 
 ## Task 6: Record durable characterization evidence
 
@@ -712,6 +726,7 @@ git add \
   docs/plans/2026-07-13-unified-cooperative-runtime.md \
   docs/plans/2026-07-13-unified-cooperative-runtime-task-01.md \
   docs/plans/2026-07-13-unified-cooperative-runtime-task-02.md \
+  docs/plans/2026-07-13-unified-cooperative-runtime-task-03.md \
   docs/plans/2026-07-13-unified-cooperative-runtime-task-05.md \
   docs/plans/evidence/unified-cooperative-runtime/legacy-symbols.baseline \
   docs/plans/evidence/unified-cooperative-runtime/runtime-match-map.tsv \
@@ -740,10 +755,13 @@ This is a provisional amendment commit, not controller acceptance of Task 01.
   existing semantically specific row; the checker is GREEN, writes no heuristic
   assignments, and fails individual scan errors, `UNREVIEWED`, malformed/
   duplicate/stale/missing mappings, and missing row IDs.
-- Task 05's compile-ready API keeps completion kind, decoder, resource class,
-  cancellation hook, and one-shot sink control outside `IoJob`; the executor
+- Tasks 02, 03, and 05 share one compile-ready core API using `ExecutorJob`,
+  `RunningSubmission`, and owning `SubmissionRejected`. Completion kind,
+  decoder, resource class, cancellation hook, and one-shot sink control stay
+  outside the job; the executor
   catches job panic and accounts for exactly one completion attempt per admitted
-  job.
+  job. A pre-registered atomic cancel-handle/start-token pair linearizes queued
+  cancellation against dequeue without relying on a private job ID.
 - Task 01 evidence/report chronology says after Task 01 harness edits and before
   production behavior changes; no implementer-owned review artifact is created.
 - No production behavior changed.

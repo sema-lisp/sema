@@ -121,7 +121,9 @@ task registry, timer loop, or completion poller may remain.
 
 ### Roots
 
-`submit_root` creates a monotonic `RootId`, a root task, and a `RootHandle`.
+`submit_root` creates a runtime-scoped `RootId { RuntimeId, local_id }`, a root
+task, and a `RootHandle`. Promise and channel IDs use the same runtime-plus-local
+shape, so cross-runtime handles are rejected before lookup.
 Roots share the runtime and global environment but have separate:
 
 - result handles;
@@ -134,6 +136,11 @@ A root's result may settle while detached tasks originating from that root are
 still pending. Normal root settlement does not cancel those tasks. The root
 record remains alive while a result handle, descendant task, output sink, or
 debug/tracing record still requires it.
+`RootHandle` clones hold explicit counted leases; final-handle drop decrements
+the last lease and queues cleanup. Settled root/promise state is retained while
+any handle or observer exists, then reaped. Channel state is retained while an
+endpoint, buffered value, or waiter exists and reaped only after close and final
+release.
 
 An explicit root cancellation propagates to every pending task in that root's
 cancellation ancestry, including detached tasks whose originating root already
@@ -318,19 +325,63 @@ interpreter.
 Before submission, the runtime registers the exact wait generation, decoder,
 runtime-selected completion kind, and concrete resource/cancel hook. It gives
 the executor a send-only job and a private identity/kind-bearing completion
-sink, but the executor never exposes that sink to the job. The job has one
-consuming method that returns `Result<SendPayload, ExternalFailure>`. The
-executor catches a panic at that boundary, converts it to `WorkerPanic`, and
-owns one terminal sink delivery for every admitted job, including cancellation
-before the job starts. A job therefore cannot omit or duplicate its own
-completion, forge identity/kind, or carry runtime state. Closed-inbox delivery
-is explicitly accounted as undeliverable; an enqueued completion rejected by
-wait identity/lifecycle validation is accounted as late. Submission rejection
-rolls back the registered wait/resource exactly once and does not deliver
-through the sink or enqueue a completion.
+sink, but the executor never exposes that sink to the job. Preparation also
+creates a shared atomic queue-control pair before wait registration: the runtime
+stores the cancel handle and submits the non-cloneable start token with the job.
+`Queued -> Cancelled` versus `Queued -> Running` is the sole cancel/dequeue
+linearization point and governs only whether the job body runs and which path
+consumes the sink. Cancellation/deregistration always consumes the resource
+entry once. For an interruptible operation it invokes the hook exactly once,
+even when cancel wins while queued: the hook records the sticky request and
+closes/releases any existing prepared resource. A repeated cancel cannot invoke
+it again. If cancel wins, the executor drops the job without invoking it and
+consumes the sink once with `Cancelled`. Interruptible jobs share a pre-armed
+sticky cancellation state with that hook. Its token/wake primitive
+participates in any potentially blocking acquisition, or its abort handle is
+installed before the first potentially blocking poll; a pre-acquisition check
+alone is insufficient. Post-construction attachment is valid only when
+construction is nonblocking and attachment occurs before first blocking use.
+Otherwise acquisition is a separate interruptible wait, has a proven
+`QUARANTINED-BOUNDED` policy, or is `PROHIBITED`. The job has one consuming
+method that returns
+`Result<SendPayload, ExternalFailure>`. The executor catches a panic at that
+boundary, converts it to `WorkerPanic`, and owns one terminal sink delivery for
+every admitted job. A job therefore cannot omit or duplicate its own completion,
+forge identity/kind, or carry runtime state. Closed-inbox delivery is explicitly
+accounted as undeliverable; an enqueued completion rejected by wait identity/
+lifecycle validation is accounted as late. Submission rejection rolls back the
+registered wait/resource and both control halves exactly once and does not
+deliver through the sink or enqueue a completion.
+
+The one core seam is `ExecutorLease::submit(ExecutorJob, CompletionSink,
+ExecutorStartToken) -> Result<RunningSubmission, SubmissionRejected>`.
+`ExecutorJobControl` creates the `ExecutorCancelHandle` and non-cloneable token;
+`CancelBeforeStart` and `ExecutorStartDecision` name the CAS outcomes.
+`SubmissionRejected` returns its kind, job, sink, and start token for rollback.
+`PreparedExternalOperation` owns the runtime decoder/resource plus exactly one
+job and token. Registration allocates operation/wait/generation/completion
+identity; producers and executors allocate no runtime IDs.
+
+Completion routing checks full runtime/wait/generation/operation/kind identity
+against the active wait first, then a quarantine-cleanup entry. After
+cancellation transfers a running `QUARANTINED-BOUNDED` job, its exact completion
+is cleanup-only: discard payload, remove/decrement the entry once, and account
+`quarantine_reaped`; it is not late and cannot change the cancelled task.
+Wrong-identity/kind, duplicate-after-reap, and interruptible stale completions
+are late/fault deliveries and never release cleanup ownership.
+
+A queued `QUARANTINED-BOUNDED` job contains only an immutable owned `Send` input
+snapshot. It acquires no resource, starts no work, and performs no external
+mutation before the `Run` claim, so cancel-winning drop is safe. Any operation
+with a pre-run effect is `INTERRUPTIBLE` with an exactly-once cleanup hook, or is
+`PROHIBITED`.
 
 All conversion to and from Sema values, continuation execution, promise
 settlement, tracing, and GC interaction occurs on the interpreter thread.
+Runtime bookkeeping is extracted under its `RefCell` borrow, the borrow is
+dropped before any native/decoder/continuation/output/cancel callback receives
+`NativeCallContext`, and state is reborrowed only to apply the returned
+transition.
 Compile-time types should make the boundary difficult to violate; source scans
 and focused compile-fail or trait tests guard it.
 
@@ -414,9 +465,13 @@ hosts and tests use explicit shutdown whenever full cleanup is required.
 
 The runtime does not replace Sema's `Rc` plus CORE-2 cycle-collection model.
 Live task frames, continuations, promises, channels, shared cells, root context,
-and other runtime-held Sema values are collector roots and expose their traced
-edges. Settled values remain reachable through promises/result handles but dead
-task execution state does not.
+and other runtime-held Sema values remain ownership-visible external strong
+counts; CORE-2 does not enumerate them through a shadow root stack or subtract
+their edges as internal. `Trace` delegation is required only when runtime state
+is embedded in an actual collector-traversed opaque payload registered through
+CORE-2's existing payload-tracer seam. Runtime entries drop their strong edges
+exactly once when removed. Settled values remain reachable through
+promises/result handles but dead task execution state does not.
 
 Worker payloads are outside the Sema object graph by construction. Stress tests
 must prove collection across task/promise/channel/continuation cycles and heavy
@@ -590,7 +645,10 @@ workflow entry points must use this contract rather than private scheduler loops
 
 WASM `eval()` returns a JavaScript `Promise`; `evalAsync()` MAY remain as an
 alias. Multiple eval promises may be pending simultaneously. Host callbacks
-enqueue completion data and schedule bounded future drive turns.
+enqueue completion data through the cfg-neutral admission boundary and
+coalescingly schedule a bounded future drive turn. Browser/local-host Promise
+work remains separate from the native `Send` executor pool; Task 07 owns its
+concrete single-threaded execution.
 
 Sustained work must yield through a macrotask/event-loop mechanism that permits
 rendering, input, timers, fetch, and cancellation to progress. A self-perpetuating

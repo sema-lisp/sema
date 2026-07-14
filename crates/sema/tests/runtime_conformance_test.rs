@@ -402,24 +402,40 @@ fn unified_runtime_inventory_writer_preserves_reviews_and_marks_only_new_matches
 #[test]
 fn unified_runtime_inventory_checker_rejects_discovery_scan_failure() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    let output = Command::new(root.join("scripts/check-unified-runtime-inventory.sh"))
-        .arg("--check")
-        .env("UNIFIED_RUNTIME_RG_BIN", "/definitely/missing/rg")
-        .current_dir(&root)
-        .output()
-        .expect("run inventory checker with missing discovery scanner");
+    let fixture_dir =
+        std::env::temp_dir().join(format!("sema-runtime-missing-rg-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&fixture_dir);
+    fs::create_dir_all(&fixture_dir).expect("create missing rg fixture directory");
+    let mapping = fixture_dir.join("mapping.tsv");
 
-    assert!(
-        !output.status.success(),
-        "inventory checker swallowed discovery scan failure\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert!(
-        String::from_utf8_lossy(&output.stderr).contains("runtime inventory discovery scan failed"),
-        "inventory checker did not report the discovery failure\nstderr:\n{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    for mode in ["--check", "--write-mapping"] {
+        let output = Command::new(root.join("scripts/check-unified-runtime-inventory.sh"))
+            .arg(mode)
+            .env("UNIFIED_RUNTIME_RG_BIN", "/definitely/missing/rg")
+            .env("UNIFIED_RUNTIME_MAPPING_FILE", &mapping)
+            .current_dir(&root)
+            .output()
+            .expect("run inventory checker with missing discovery scanner");
+
+        assert!(
+            !output.status.success(),
+            "inventory {mode} swallowed discovery scan failure\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stderr)
+                .contains("runtime inventory discovery scan failed"),
+            "inventory {mode} did not report the discovery failure\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            !mapping.exists(),
+            "inventory {mode} wrote a mapping after a missing scanner failure"
+        );
+    }
+
+    fs::remove_dir_all(&fixture_dir).expect("remove missing rg fixture directory");
 }
 
 #[cfg(unix)]

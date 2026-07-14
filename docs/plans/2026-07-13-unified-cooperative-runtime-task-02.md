@@ -35,7 +35,7 @@ constructed.
 ## Global constraints
 
 - Read `AGENTS.md`, the master runtime specification, Task 01 evidence, and
-  `docs/plans/2026-07-02-core2-gc.md` before editing.
+  `docs/plans/archive/2026-07-02-core2-gc.md` before editing.
 - Run Task 01 first. Its legacy scanner and characterization suite are hard
   gates throughout this task.
 - Change types and adapters only. Do not add ready queues, timers, root driving,
@@ -58,6 +58,8 @@ constructed.
 - `crates/sema-core/src/runtime/completion.rs` — send-only completion envelope.
 - `crates/sema-core/src/runtime/task_context.rs` — explicit inherited context.
 - `crates/sema-core/src/runtime/native.rs` — return/call/suspend continuations.
+- `crates/sema-core/src/runtime/trace.rs` — object-safe CORE-2 edge tracing for
+  runtime-owned trait objects and composites.
 - `crates/sema-core/src/runtime/resource.rs` — constructible resource policies.
 - `crates/sema-core/tests/runtime_types_test.rs` — public contract tests.
 - `docs/plans/evidence/unified-cooperative-runtime/task-02.md` — verification
@@ -68,6 +70,10 @@ constructed.
 **Modify**
 
 - `crates/sema-core/src/lib.rs` — export `runtime`.
+- `crates/sema-core/src/io_backend.rs` — add the abstract executor lease,
+  completion sender/sink, one-shot job, and owning rejection seam used by Task
+  03 fakes and the Task 05 production implementation; retain legacy methods only
+  as inventoried adapters until Task 05 deletes them.
 - `crates/sema-core/src/error.rs` — structured timeout/cancellation conditions.
 - `crates/sema-core/src/context.rs` — expose a task-context handle through the
   evaluation context without duplicating ambient state.
@@ -87,12 +93,32 @@ Implement these names and meanings. A reviewer must reject aliases whose fields
 erase one of the identities or ownership axes.
 
 ```rust
+pub trait Trace {
+    fn trace(&self, sink: &mut dyn FnMut(GcEdge<'_>)) -> bool;
+}
+```
+
+`Trace` is object-safe and mirrors CORE-2's `OpaqueTraceFn`/`PayloadTracer`
+contract. Implementations emit each directly held strong edge exactly once;
+two fields holding the same allocation emit two edges because trial-deletion
+arithmetic requires multiplicity. Boxed trait objects and composites delegate
+recursively. If any required `RefCell` borrow is unavailable, return `false`
+and abort that collection pass cleanly; never skip an edge or partially claim a
+successful trace. `cycle.rs` delegates to this trait only when such an object is
+embedded in an actual CORE-2 opaque heap
+node through the existing `register_payload_tracer` seam. Runtime-owned
+suspended state, wait-registry entries, cleanup hooks, and task contexts are
+external roots: their strong counts must remain unsubtracted, or CORE-2 could
+over-subtract and collect live data. The next safe-point collection may retry
+after a borrow conflict ends.
+
+```rust
 pub struct RuntimeId(NonZeroU64);
-pub struct RootId(NonZeroU64);
+pub struct RootId { runtime: RuntimeId, local: NonZeroU64 }
 pub struct TaskId(NonZeroU64);
 pub struct ScopeId(NonZeroU64);
-pub struct PromiseId(NonZeroU64);
-pub struct ChannelId(NonZeroU64);
+pub struct PromiseId { runtime: RuntimeId, local: NonZeroU64 }
+pub struct ChannelId { runtime: RuntimeId, local: NonZeroU64 }
 pub struct WaitId(NonZeroU64);
 pub struct WaitGeneration(NonZeroU64);
 pub struct OperationId(NonZeroU64);
@@ -107,6 +133,15 @@ impl<I> IdCounter<I> {
 All identity types implement `Copy`, `Clone`, `Debug`, `Eq`, `Ord`, and `Hash`.
 Construction is crate-controlled. Allocation starts at one, uses checked
 increment, never wraps, and permanently reports `IdExhausted` after exhaustion.
+Language-visible root, promise, and channel handles carry the composite identity
+and reject cross-runtime use before lookup. A promise settlement is retained
+while any language handle or registered observer exists, then reaped after final
+handle/observer release. Channel state is retained while any endpoint handle,
+buffered value, or waiter exists and is reaped after close plus final release.
+Root records retain settlement while the explicit root-handle lease count is
+nonzero or descendants/debug/tracing references remain; cloning a `RootHandle`
+increments that count and each drop decrements it, making final-handle drop an
+observable cleanup event rather than relying on `Weak` liveness.
 
 ```rust
 pub enum CancellationParent {
@@ -187,14 +222,32 @@ pub struct ExternalFailure {
     pub source: Option<String>,
 }
 
-pub trait CompletionDecoder {
+pub enum DecodedCompletion {
+    Returned(Value),
+    Failed(SemaError),
+}
+
+pub trait CompletionDecoder: Trace {
     fn decode(
         self: Box<Self>,
         context: &mut NativeCallContext<'_>,
         result: Result<SendPayload, ExternalFailure>,
-    ) -> NativeResult;
+    ) -> DecodedCompletion;
+}
+
+pub struct NativeCallContext<'a> {
+    pub vm: &'a mut VM,
+    pub task_context: &'a mut TaskContext,
+    pub output: &'a dyn OutputSink,
+    pub cancellation: &'a CancellationView,
 }
 ```
+
+`NativeCallContext` is assembled only after runtime bookkeeping has been
+extracted and every `RuntimeState` `RefCell` borrow has been dropped. Native
+functions, decoders, continuations, output hooks, and cancellation callbacks
+therefore run with no outstanding runtime-state borrow; Task 03 applies their
+returned transition only after reacquiring state.
 
 The envelope cannot contain `Value`, `Env`, `SemaError`, `Rc`, or a VM
 continuation. `ExternalFailure` is a send-safe code/message/source structure,
@@ -204,6 +257,15 @@ a wrong-kind completion before invoking its decoder. A payload that has the
 correct declared kind but fails the decoder's concrete downcast becomes a named
 `Decode` failure for that operation; wrong-kind delivery never changes the
 waiting task's outcome.
+
+`CompletionDecoder: Trace` is mandatory because a decoder may remain in the
+wait registry across CORE-2 collection and may retain Sema values needed to
+decode/resume. Its `Trace` implementation visits every such value. A decoder
+must not hide `Value`, `Env`, or another traceable object in an opaque host
+closure; required roots live in the decoder or continuation and are traced. A
+decoder cannot suspend or bypass the continuation: it consumes the raw worker
+result into exactly one `DecodedCompletion`, which the runtime converts to
+`ResumeInput::Returned`/`Failed` before consuming the continuation.
 
 The interpreter runtime selects `CompletionKind` while registering the wait and
 copies it into the private `CompletionSink` defined in Task 05. The executor,
@@ -241,7 +303,7 @@ pub enum WaitKind {
     Timer(Duration),
     Promise(PromiseId),
     Channel(ChannelWait),
-    External(ExternalWait),
+    External(Box<PreparedExternalOperation>),
 }
 
 pub enum ChannelWait {
@@ -249,18 +311,10 @@ pub enum ChannelWait {
     Receive { channel: ChannelId },
 }
 
-pub struct ExternalWait {
-    pub operation_id: OperationId,
-    pub expected_kind: CompletionKind,
-    pub decoder: Box<dyn CompletionDecoder>,
-    pub resource: ResourceClassDescriptor,
-}
-
 pub enum ResumeInput {
     Returned(Value),
     Failed(SemaError),
     Cancelled(CancelReason),
-    Completion(Result<SendPayload, ExternalFailure>),
 }
 
 pub trait NativeContinuation: Trace {
@@ -273,8 +327,13 @@ pub trait NativeContinuation: Trace {
 ```
 
 Continuation consumption enforces exactly-once resumption. `Trace` must visit
-every stored `Value`; host-only state must obey CORE-2 and may not strongly
-capture an `Env` or traceable object through an opaque closure.
+every stored `Value`. Implement `Trace` for `NativeSuspend`, `WaitRequest`,
+`WaitKind`, `PreparedExternalOperation`, and `ResourceClass`. The chain visits
+the continuation, decoder, and `CancelHook: Trace`; a host-only hook implements
+an empty trace. `PreparedExternalOperation` ignores only the send-only `ExecutorJob`
+and atomic queue token, which cannot contain runtime-thread state. Opaque host
+closures may not hide a `Value`, `Env`, or traceable object. Required Sema roots
+live in the traced continuation, decoder, or hook.
 
 ```rust
 pub enum ResourceClassDescriptor {
@@ -287,20 +346,385 @@ pub enum ResourceClass {
     QuarantinedBounded { bound: QuarantineBound },
 }
 
-pub enum QuarantineBound {
+#[derive(Clone, Copy)]
+pub struct QuarantineBound {
+    kind: QuarantineBoundKind,
+}
+
+#[derive(Clone, Copy)]
+enum QuarantineBoundKind {
     HardDeadline(Duration),
     FiniteWork { kind: &'static str, maximum_units: NonZeroU64 },
 }
 
-pub trait CancelHook {
-    fn cancel(&mut self) -> Result<(), CancelHookError>;
+pub enum QuarantineBoundError {
+    ZeroDeadline,
+}
+
+impl QuarantineBound {
+    pub fn hard_deadline(duration: Duration) -> Result<Self, QuarantineBoundError> {
+        if duration.is_zero() {
+            return Err(QuarantineBoundError::ZeroDeadline);
+        }
+        Ok(Self {
+            kind: QuarantineBoundKind::HardDeadline(duration),
+        })
+    }
+
+    pub fn finite_work(kind: &'static str, maximum_units: NonZeroU64) -> Self {
+        Self {
+            kind: QuarantineBoundKind::FiniteWork {
+                kind,
+                maximum_units,
+            },
+        }
+    }
+}
+
+pub trait CancelHook: Trace {
+    /// Called exactly once for the cancellation request.
+    fn cancel(&mut self) -> Result<CancelDisposition, CancelHookError>;
+
+    /// Bounded/nonblocking recovery; called only by `CleanupRegistry` after
+    /// `PendingReap` or `CancelHookError`, and may be polled repeatedly.
+    fn reap(&mut self) -> Result<ReapDisposition, CancelHookError>;
+}
+
+pub enum CancelDisposition {
+    Reaped,
+    PendingReap,
+}
+
+pub enum ReapDisposition {
+    Reaped,
+    Pending,
+}
+
+pub enum CancelHookErrorCode {
+    AbortFailed,
+    CloseFailed,
+    KillFailed,
+    WakeFailed,
+    ReapFailed,
+}
+
+pub struct CancelHookError {
+    pub code: CancelHookErrorCode,
+    pub operation_id: OperationId,
+    pub resource_kind: &'static str,
+    pub resource_id: String,
+    pub message: String,
+    pub source: Option<String>,
+}
+
+const DISPATCH_QUEUED: u8 = 0;
+const DISPATCH_RUNNING: u8 = 1;
+const DISPATCH_CANCELLED: u8 = 2;
+
+pub struct ExecutorJobControl;
+
+pub struct ExecutorCancelHandle {
+    state: Arc<AtomicU8>,
+}
+
+/// Non-cloneable proof consumed by the executor's dequeue decision.
+pub struct ExecutorStartToken {
+    state: Arc<AtomicU8>,
+}
+
+pub enum CancelBeforeStart {
+    CancelledQueued,
+    AlreadyCancelled,
+    AlreadyRunning,
+}
+
+pub enum ExecutorStartDecision {
+    Run,
+    CompleteCancelled,
+}
+
+impl ExecutorJobControl {
+    pub fn new() -> (ExecutorCancelHandle, ExecutorStartToken) {
+        let state = Arc::new(AtomicU8::new(DISPATCH_QUEUED));
+        (
+            ExecutorCancelHandle {
+                state: Arc::clone(&state),
+            },
+            ExecutorStartToken { state },
+        )
+    }
+}
+
+impl ExecutorCancelHandle {
+    pub fn cancel_before_start(&self) -> CancelBeforeStart {
+        match self.state.compare_exchange(
+            DISPATCH_QUEUED,
+            DISPATCH_CANCELLED,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => CancelBeforeStart::CancelledQueued,
+            Err(DISPATCH_CANCELLED) => CancelBeforeStart::AlreadyCancelled,
+            Err(DISPATCH_RUNNING) => CancelBeforeStart::AlreadyRunning,
+            Err(state) => unreachable!("invalid executor job state {state}"),
+        }
+    }
+}
+
+impl ExecutorStartToken {
+    pub fn claim_for_run(self) -> ExecutorStartDecision {
+        match self.state.compare_exchange(
+            DISPATCH_QUEUED,
+            DISPATCH_RUNNING,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => ExecutorStartDecision::Run,
+            Err(DISPATCH_CANCELLED) => ExecutorStartDecision::CompleteCancelled,
+            Err(state) => unreachable!("invalid executor job start state {state}"),
+        }
+    }
+}
+
+/// cfg-neutral admission boundary. `send` enqueues and coalescingly requests a
+/// host drive turn when the runtime is not already scheduled.
+pub trait CompletionSender: Send + Sync + 'static {
+    fn send(&self, completion: ExternalCompletion) -> CompletionDelivery;
+}
+
+pub enum CompletionDelivery {
+    Enqueued,
+    InboxClosed,
+}
+
+pub struct CompletionSink {
+    sender: Arc<dyn CompletionSender>,
+    runtime_id: RuntimeId,
+    wait_id: WaitId,
+    generation: WaitGeneration,
+    operation_id: OperationId,
+    kind: CompletionKind,
+}
+
+impl CompletionSink {
+    pub fn for_registered_wait(
+        sender: Arc<dyn CompletionSender>,
+        runtime_id: RuntimeId,
+        wait_id: WaitId,
+        generation: WaitGeneration,
+        operation_id: OperationId,
+        kind: CompletionKind,
+    ) -> Self {
+        Self {
+            sender,
+            runtime_id,
+            wait_id,
+            generation,
+            operation_id,
+            kind,
+        }
+    }
+
+    /// Consumes the only delivery capability for this admitted job.
+    pub fn complete(
+        self,
+        result: Result<SendPayload, ExternalFailure>,
+    ) -> CompletionDelivery {
+        let Self {
+            sender,
+            runtime_id,
+            wait_id,
+            generation,
+            operation_id,
+            kind,
+        } = self;
+        sender.send(ExternalCompletion {
+            runtime_id,
+            wait_id,
+            generation,
+            operation_id,
+            kind,
+            result,
+        })
+    }
+}
+
+pub type AsyncJobFuture = Pin<
+    Box<dyn Future<Output = Result<SendPayload, ExternalFailure>> + Send + 'static>,
+>;
+
+pub trait InterruptibleAsyncJob: Send + 'static {
+    fn run(self: Box<Self>) -> AsyncJobFuture;
+}
+
+pub trait BlockingBoundedJob: Send + 'static {
+    fn run(self: Box<Self>) -> Result<SendPayload, ExternalFailure>;
+}
+
+pub trait InterruptibleBlockingJob: Send + 'static {
+    fn run(self: Box<Self>) -> Result<SendPayload, ExternalFailure>;
+}
+
+pub enum ExecutorJob {
+    InterruptibleAsync(Box<dyn InterruptibleAsyncJob>),
+    InterruptibleBlocking(Box<dyn InterruptibleBlockingJob>),
+    QuarantinedBlocking {
+        bound: QuarantineBound,
+        job: Box<dyn BlockingBoundedJob>,
+    },
+}
+
+pub struct RunningSubmission {
+    pub operation_id: OperationId,
+}
+
+pub enum SubmitErrorKind {
+    LeaseShuttingDown,
+    QueueClosed,
+    AdmissionRejected,
+    HostStartRejected,
+}
+
+pub struct SubmissionRejected {
+    pub kind: SubmitErrorKind,
+    pub job: ExecutorJob,
+    pub sink: CompletionSink,
+    pub start_token: ExecutorStartToken,
+}
+
+impl SubmissionRejected {
+    pub fn into_parts(self) -> (SubmitErrorKind, ExecutorJob, CompletionSink, ExecutorStartToken) {
+        (self.kind, self.job, self.sink, self.start_token)
+    }
+}
+
+/// The sole unregistered external-wait request.
+pub struct PreparedExternalOperation {
+    pub completion_kind: CompletionKind,
+    pub decoder: Box<dyn CompletionDecoder>,
+    pub resource: ResourceClass,
+    pub cancel: ExecutorCancelHandle,
+    pub job: ExecutorJob,
+    pub start_token: ExecutorStartToken,
+}
+
+pub struct ExecutorSnapshot {
+    pub queued: usize,
+    pub running_interruptible: usize,
+    pub running_quarantined: usize,
+    pub completed: u64,
+    pub cancelled: u64,
+    pub panicked: u64,
+    pub undeliverable: u64,
+}
+
+pub struct ExecutorShutdown {
+    pub snapshot: ExecutorSnapshot,
+    pub deadline_exceeded: bool,
+}
+
+pub trait ExecutorLease: Send + Sync {
+    fn submit(
+        &self,
+        job: ExecutorJob,
+        sink: CompletionSink,
+        start_token: ExecutorStartToken,
+    ) -> Result<RunningSubmission, SubmissionRejected>;
+    fn snapshot(&self) -> ExecutorSnapshot;
+    fn shutdown(&self, deadline: Instant) -> ExecutorShutdown;
+}
+
+pub trait IoExecutor: Send + Sync {
+    fn attach_runtime(
+        &self,
+        runtime_id: RuntimeId,
+    ) -> Result<Arc<dyn ExecutorLease>, ExecutorAttachError>;
+    fn snapshot(&self) -> ExecutorSnapshot;
 }
 ```
 
+`attach_runtime` rejects duplicate `RuntimeId`s and shutdown pools. Runtime
+construction therefore returns `Result<Runtime, ExecutorAttachError>`. Lease
+shutdown first rejects submissions, then cancels/drains that runtime's jobs,
+then unregisters the `RuntimeId`; only final process-executor shutdown may stop
+shared workers. Browser/local-host Promise work does not implement
+`ExecutorJob` and never enters this `Send` pool. Task 07 owns its concrete
+single-threaded execution while using the same completion-admission/wake
+boundary.
+
 Construction rejects a zero deadline or zero work bound. A finite-work producer
 must prove its unit count before dispatch and must not expand the bound while it
-runs. Cancellation hooks are idempotent by contract and are tested with repeated
-calls. The type has no third variant.
+runs. `CancelHook::cancel` is one-shot; `reap` is bounded/nonblocking and
+idempotent under repeated cleanup polling. Tests distinguish their call counts.
+The resource class has no third variant.
+
+`PreparedExternalOperation::new` calls `ExecutorJobControl::new` before wait
+registration. `WaitKind::External(Box<PreparedExternalOperation>)` is the sole
+unregistered request; there is no second `ExternalWait` that could duplicate or
+double-move its fields. When Task 03 applies `NativeSuspend`, the runtime
+destructures the box exactly once, stores the runtime-side
+`ExecutorCancelHandle` in its distinct `RegisteredExternalWait`, and Task 05
+submits the non-cloneable executor-side token with the job. Cancellation first
+calls `cancel_before_start`, then detaches the wait-owned resource association
+exactly once regardless of which CAS result it observed. For an
+`Interruptible` operation, that path always invokes `CancelHook::cancel` exactly
+once: the hook records sticky cancellation for a not-yet-created handle and
+also closes/releases any existing child, stream, or resource named by the
+prepared operation. `Reaped` removes the entry; `PendingReap`/error atomically
+transfers that same owned entry into cleanup-retry state. Repeated cancellation
+finds no wait-attached cancellable entry and does not call `cancel` again, even
+though cleanup may remain live. If the CAS returns `CancelledQueued`, the
+executor later observes `CompleteCancelled`, drops the job without running it,
+and owns the one terminal completion. If dequeue wins and returns `Run`, the
+same hook reaches the acquisition/running operation. The atomic transition
+governs only whether the job body runs and which executor path consumes the
+sink; it never suppresses resource cleanup. No private executor job ID is
+needed.
+
+`CancelHookError` is runtime-safe and contains no `Value`, `Env`, `SemaError`,
+`Rc`, or VM state. An underlying already-gone/not-found result maps to successful
+`CancelDisposition::Reaped` or `ReapDisposition::Reaped` and MUST NOT be returned
+as `CancelHookError`. `cancel` is the one-shot request: `Reaped` removes the
+resource entry, while `PendingReap` or a real error leaves sticky cancellation
+set and transfers/retains the still-owned resource/hook in `CleanupRegistry`.
+The runtime records a deduplicated suppressed cleanup diagnostic and does not
+decrement live-resource accounting. Neither repeated user cancellation nor the
+registry invokes `cancel` again; bounded cleanup turns call only `reap`, which
+may return `Pending` or a new retained error until it succeeds. Explicit
+shutdown is non-clean while the entry remains: later `Reaped` removes it;
+deadline expiry reports its operation/resource identity and last error as an
+invariant failure.
+
+`AlreadyRunning` does not imply that the worker has acquired an OS resource yet.
+Every interruptible prepared operation MUST therefore create a pre-armed,
+sticky cancellation hook/token pair before submission. The runtime-side
+`CancelHook::cancel` records cancellation in the shared state even when no abort
+handle is attached. The job-side token MUST make acquisition itself
+interruptible: either the acquisition future/syscall selects or polls against a
+cancellation token plus wake primitive from that pre-submission state, or the
+concrete abort handle is installed before the resource's first potentially
+blocking poll. A check immediately before a potentially unbounded acquisition
+is insufficient because cancellation can arrive while acquisition is blocked.
+
+Post-acquisition attachment is allowed only when resource construction is
+nonblocking and attachment completes through the synchronized shared state
+before the resource's first potentially blocking use. If cancellation won
+before construction, the job skips construction and returns `Cancelled`; if it
+races with construction/attachment, attachment invokes the idempotent abort
+immediately. If attachment wins, a later cancel invokes the attached abort. An
+API whose cancel handle appears only after a potentially unbounded acquisition,
+and whose acquisition cannot select/poll a cancellation wake, is not
+`Interruptible`: model that acquisition as a separate interruptible wait, prove
+a `QuarantinedBounded` deadline/work bound, or classify the operation
+`PROHIBITED`. A hook that merely looks up a not-yet-created handle, or a token
+that only checks before entering a blocking acquisition, is invalid.
+
+A `QuarantinedBounded` job MUST have only an immutable, owned `Send` input
+snapshot before `claim_for_run` returns `Run`. Preparation and queue residency
+must not acquire a resource, start work, mutate external state, or create cleanup
+that dropping the queued job would strand. If an operation needs any such
+pre-run effect, classify it `Interruptible` with an exactly-once hook that
+releases the effect, or `PROHIBITED`; it is not a valid quarantined job.
 
 `TaskContext` contains named core fields for output routing, sandbox/VFS policy,
 current file/module state, user-visible call-stack metadata, tracing, and usage
@@ -389,8 +813,18 @@ Task 03 tests that a wrong declared kind is discarded before decoding and leaves
 the task unchanged. Test interrupt cancellation twice and bounded-resource
 zero-deadline/zero-work rejection. Also prove the decoder and concrete
 `ResourceClass` remain runtime-side; Task 05 separately proves only the
-`Box<dyn IoJob>` and an executor-private completion sink cross to the pool, and
-that the job never receives that sink.
+`ExecutorJob` and an executor-private completion sink cross to the pool, and
+that the job never receives that sink. Add deterministic control-pair tests for
+`Queued -> Cancelled`, `Queued -> Running`, repeated cancel, and the impossible
+second start claim. With a fake pre-armed interruptible hook/token, cancel once
+before acquisition, once while a barrier has paused inside acquisition, and
+once between nonblocking construction and abort attachment. Prove respectively
+that acquisition is skipped, the cancellation wake unblocks acquisition, and
+attachment aborts exactly once before first blocking use. The queued case must
+also prove one hook call, no second call after repeated cancellation, and release
+of an existing fake resource. A quarantined fixture must prove preparation and
+queue residency contain only immutable input and perform no acquisition,
+mutation, or work before `Run`.
 
 - [ ] **Step 2: Implement the envelope and policies**
 
@@ -416,7 +850,16 @@ Expected: selected tests pass; `ResourceClass` has exactly two variants.
 
 Cover return, tail call request, suspension request, each `ResumeInput`, a
 continuation that stores a `Value`, and exactly-once consumption. Add a CORE-2
-test proving stored values are visited by tracing.
+test proving stored values are visited by tracing. Add nested boxed-trait and
+composite tests that preserve duplicate-edge multiplicity, plus a deliberately
+held `RefCell` borrow proving `trace` returns `false` and the collection pass
+aborts without treating a partial edge set as complete. Exercise
+`NativeSuspend -> WaitRequest -> PreparedExternalOperation -> decoder/resource
+hook` traversal as one object graph.
+Add a lifetime regression where a cycle strongly retained by a suspended
+continuation/decoder/context survives collection as an external root; after the
+runtime owner removes/drops it, the next safe point collects it. This guards
+against incorrectly registering runtime roots as internal CORE-2 edges.
 
 - [ ] **Step 2: Implement outcomes and compatibility constructors**
 

@@ -288,8 +288,8 @@ C10	crates/sema-llm/src/builtins.rs:7735:/// offloaded future, or a `std::thread
 C11	crates/sema-llm/src/builtins.rs:8071:thread_local! {
 C11	crates/sema-llm/src/builtins.rs:8527:    if let Some(v) = sema_core::take_resume_value() {
 C11	crates/sema-llm/src/builtins.rs:8571:    if sema_core::in_async_context() {
-C11	crates/sema-llm/src/builtins.rs:8632:            let _ = sema_core::call_callback(ctx, callback, &[Value::map(event_map)]);
-C11	crates/sema-llm/src/builtins.rs:8668:            let _ = sema_core::call_callback(ctx, callback, &[Value::map(event_map)]);
+C07C	crates/sema-llm/src/builtins.rs:8632:            let _ = sema_core::call_callback(ctx, callback, &[Value::map(event_map)]);
+C07C	crates/sema-llm/src/builtins.rs:8668:            let _ = sema_core::call_callback(ctx, callback, &[Value::map(event_map)]);
 C11	crates/sema-llm/src/builtins.rs:8858:thread_local! {
 C11	crates/sema-llm/src/builtins.rs:9045:                    std::thread::sleep(std::time::Duration::from_millis(rate_limit_wait_ms));
 C11	crates/sema-llm/src/builtins.rs:9175:/// A failure is NEVER surfaced through the poller (an `IoPoll::Ready(Err)`
@@ -301,9 +301,9 @@ C11	crates/sema-llm/src/builtins.rs:9348:            Ok(Some(v)) => sema_core::I
 C11	crates/sema-llm/src/builtins.rs:9349:            Ok(None) => sema_core::IoPoll::Pending,
 C11	crates/sema-llm/src/builtins.rs:9350:            Err(e) => sema_core::IoPoll::Ready(Err(e.to_string())),
 C11	crates/sema-llm/src/builtins.rs:9353:    sema_core::set_yield_signal(sema_core::YieldReason::AwaitIo(handle));
-C11	crates/sema-llm/src/builtins.rs:9496:                let _ = sema_core::call_callback(ctx, callback, &[Value::map(event_map)]);
-C11	crates/sema-llm/src/builtins.rs:9549:                let _ = sema_core::call_callback(ctx, callback, &[Value::map(event_map)]);
-C11	crates/sema-llm/src/builtins.rs:9622:    let result = sema_core::call_callback(ctx, &tool_def.handler, &sema_args)?;
+C07C	crates/sema-llm/src/builtins.rs:9496:                let _ = sema_core::call_callback(ctx, callback, &[Value::map(event_map)]);
+C07C	crates/sema-llm/src/builtins.rs:9549:                let _ = sema_core::call_callback(ctx, callback, &[Value::map(event_map)]);
+C07C	crates/sema-llm/src/builtins.rs:9622:    let result = sema_core::call_callback(ctx, &tool_def.handler, &sema_args)?;
 C07D	crates/sema-llm/src/embeddings.rs:237:        sema_io::io_block_on(self.embed_async(request))
 C07D	crates/sema-llm/src/embeddings.rs:247:            Some(dialect) => sema_io::io_block_on(self.rerank_async(request, dialect)),
 C07D	crates/sema-llm/src/embeddings.rs:392:        sema_io::io_block_on(self.embed_async(request))
@@ -934,7 +934,7 @@ R17A	crates/sema-stdlib/src/stream.rs:1044:        if !in_async_context() {
 R17A	crates/sema-stdlib/src/stream.rs:1139:        if !in_async_context() || stream.stream_type() != "file-output" {
 R17A	crates/sema-stdlib/src/stream.rs:1165:        if !in_async_context() || stream.stream_type() != "file-output" {
 R17A	crates/sema-stdlib/src/stream.rs:1190:        if !in_async_context() || stream.stream_type() != "file-output" {
-R17B	crates/sema-stdlib/src/stream.rs:1231:        if !in_async_context() {
+R17C	crates/sema-stdlib/src/stream.rs:1231:        if !in_async_context() {
 R17A	crates/sema-stdlib/src/stream.rs:1361:        if in_async_context() {
 R17A	crates/sema-stdlib/src/stream.rs:1377:        if in_async_context() {
 R17A	crates/sema-stdlib/src/stream.rs:1536:/// force `sema_core::in_async_context()` on, call the native, then poll the

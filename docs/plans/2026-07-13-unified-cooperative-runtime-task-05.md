@@ -10,7 +10,7 @@ an explicit interruptible or quarantined-bounded cancellation contract, and
 eliminate blocking/polling branches from runtime tasks.
 
 **Architecture:** `sema-io` remains the one process-wide native executor, but it
-executes send-only `IoJob`s and reports tagged `ExternalCompletion`s. The
+executes send-only `ExecutorJob`s and reports tagged `ExternalCompletion`s. The
 interpreter runtime owns waits, decoders, cancellation, and cleanup. Resource
 builtins return `NativeOutcome` regardless of whether called at a root or nested
 inside a task; synchronous host APIs obtain blocking behavior by driving roots,
@@ -51,6 +51,10 @@ fake servers, deterministic fault injection.
   LLM/MCP/task-context adapters owned by Task 06 may remain only when listed by
   file and symbol in the inventory and scanner allowlist; Task 06 must delete
   them before its layer is accepted.
+- Every still-unmigrated `AwaitIo`, resource, LLM, or MCP producer routes through
+  the single named `LegacyRuntimeBridge`. Its inventory row assigns deletion to
+  Task 05 (resources), Task 06 (LLM), Task 07 (host adapters), or Task 08 (final
+  removal); no anonymous compatibility path survives Task 03.
 - A late completion contains only send-safe payload and is rejected by full
   runtime/wait/generation/operation identity.
 - Existing top-level return values and errors remain compatible unless the
@@ -65,7 +69,8 @@ fake servers, deterministic fault injection.
 
 **Create**
 
-- `crates/sema-io/src/job.rs` — send-only job and completion sink interfaces.
+- `crates/sema-io/src/job.rs` — production one-shot runner and panic/delivery
+  wrapper implementing the Task 02 core seam; no duplicate nominal interfaces.
 - `crates/sema-io/src/pool.rs` — one-pool execution and shutdown accounting.
 - `crates/sema-io/src/fault.rs` — test-only completion/cancel fault injection.
 - `crates/sema/tests/resource_contract_test.rs` — cancellation-class matrix.
@@ -79,10 +84,10 @@ fake servers, deterministic fault injection.
 
 **Modify**
 
-- `crates/sema-core/src/io_backend.rs` — replace block-on-oriented seam with job
-  submission and lifecycle reporting.
 - `crates/sema-io/src/lib.rs` and `crates/sema-io/tests/tokio_pin_test.rs` —
-  export jobs, preserve one-pool identity, verify abort/quarantine accounting.
+  implement/re-export the core executor seam, delete the inventoried legacy
+  block-on adapters, preserve one-pool identity, and verify abort/quarantine
+  accounting.
 - `crates/sema-vm/src/runtime/{wait.rs,drive.rs,cleanup.rs}` — register before
   dispatch, consume completions, and reap resources during shutdown.
 - `crates/sema-stdlib/src/{archive,diff,event,fs_watch,git,http,io,kv,pdf,proc,pty,secret,serial,server,sqlite,stream,system,terminal,ws}.rs` — migrate all
@@ -95,139 +100,131 @@ fake servers, deterministic fault injection.
 
 ## Exact executor interface
 
+Task 02 defines the exact `CompletionSender`, `CompletionSink`, `ExecutorJob`,
+`PreparedExternalOperation`, `RunningSubmission`, owning `SubmissionRejected`,
+`ExecutorLease`, and `IoExecutor` interfaces in `sema-core`. Task 03 consumes
+those interfaces with a fake lease. Task 05 implements them in `sema-io` over
+the one process-wide pool; it does not redeclare or wrap them in a second public
+seam.
+
 ```rust
-pub struct CompletionSink {
-    sender: Sender<ExternalCompletion>,
+pub struct ProcessIoExecutor {
+    pool: Arc<ProcessPool>,
+}
+
+struct ProcessExecutorLease {
     runtime_id: RuntimeId,
-    wait_id: WaitId,
-    generation: WaitGeneration,
-    operation_id: OperationId,
-    kind: CompletionKind,
+    pool: Arc<ProcessPool>,
 }
 
-pub(crate) enum CompletionDelivery {
-    Enqueued,
-    InboxClosed,
-}
-
-impl CompletionSink {
-    pub fn for_registered_wait(
-        sender: Sender<ExternalCompletion>,
-        runtime_id: RuntimeId,
-        wait_id: WaitId,
-        generation: WaitGeneration,
-        operation_id: OperationId,
-        kind: CompletionKind,
-    ) -> Self {
-        Self {
-            sender,
-            runtime_id,
-            wait_id,
-            generation,
-            operation_id,
-            kind,
-        }
-    }
-
-    pub(crate) fn complete(
-        self,
-        result: Result<SendPayload, ExternalFailure>,
-    ) -> CompletionDelivery {
-        let Self {
-            sender,
-            runtime_id,
-            wait_id,
-            generation,
-            operation_id,
-            kind,
-        } = self;
-        match sender.send(ExternalCompletion {
-            runtime_id,
-            wait_id,
-            generation,
-            operation_id,
-            kind,
-            result,
-        }) {
-            Ok(()) => CompletionDelivery::Enqueued,
-            Err(_) => CompletionDelivery::InboxClosed,
-        }
-    }
-}
-
-pub trait IoJob: Send + 'static {
-    fn run(self: Box<Self>) -> Result<SendPayload, ExternalFailure>;
-}
-
-/// Constructed and consumed only on the interpreter thread.
-pub struct PreparedExternalOperation {
-    pub operation_id: OperationId,
-    pub completion_kind: CompletionKind,
-    pub decoder: Box<dyn CompletionDecoder>,
-    pub resource: ResourceClass,
-    pub job: Box<dyn IoJob>,
-}
-
-/// Immediate pool-admission receipt; never owns runtime cleanup state.
-pub struct RunningJob {
-    operation_id: OperationId,
-    executor_job_id: u64,
-}
-
-pub enum SubmitError {
-    LeaseShuttingDown,
-    QueueClosed,
-    AdmissionRejected,
-}
-
-pub trait IoExecutor: Send + Sync {
-    fn attach_runtime(&self, runtime_id: RuntimeId) -> ExecutorLease;
-    fn snapshot(&self) -> ExecutorSnapshot;
-}
-
-pub struct ExecutorLease { /* private runtime id and shared-pool handle */ }
-
-impl ExecutorLease {
-    pub fn submit(
+impl IoExecutor for ProcessIoExecutor {
+    fn attach_runtime(
         &self,
-        job: Box<dyn IoJob>,
+        runtime_id: RuntimeId,
+    ) -> Result<Arc<dyn ExecutorLease>, ExecutorAttachError> {
+        self.pool.register_runtime(runtime_id)?;
+        Ok(Arc::new(ProcessExecutorLease {
+            runtime_id,
+            pool: Arc::clone(&self.pool),
+        }))
+    }
+
+    fn snapshot(&self) -> ExecutorSnapshot {
+        self.pool.snapshot()
+    }
+}
+
+impl ExecutorLease for ProcessExecutorLease {
+    fn submit(
+        &self,
+        job: ExecutorJob,
         sink: CompletionSink,
-    ) -> Result<RunningJob, SubmitError>;
-    pub fn snapshot(&self) -> ExecutorSnapshot;
-    pub fn shutdown(&self, deadline: Instant) -> ExecutorShutdown;
+        start_token: ExecutorStartToken,
+    ) -> Result<RunningSubmission, SubmissionRejected> {
+        self.pool
+            .submit(self.runtime_id, job, sink, start_token)
+    }
+
+    fn snapshot(&self) -> ExecutorSnapshot {
+        self.pool.snapshot_runtime(self.runtime_id)
+    }
+
+    fn shutdown(&self, deadline: Instant) -> ExecutorShutdown {
+        self.pool.shutdown_runtime(self.runtime_id, deadline)
+    }
 }
 ```
 
-`PreparedExternalOperation` is a runtime-side bundle, not a worker message. The
-runtime destructures it, installs the decoder and `ResourceClass` (including the
-cancel hook) in `WaitRegistry`/`CleanupRegistry`, creates a `CompletionSink` with
-the runtime-selected `CompletionKind` via `for_registered_wait`, and only then
-submits the `Box<dyn IoJob>` and sink to the executor. Its fields and consuming
-`complete` method remain crate-private to `sema-io`; the executor owns the sink
-and never passes it to `IoJob::run`. The job only returns a send-safe result.
-Worker code therefore cannot omit or duplicate completion delivery, select the
-completion kind, return a resource/cancel hook, or move VM-side cleanup state
-across the thread boundary. `RunningJob` is only an immediate admission receipt.
+Task 02 defines `ExecutorJob` and the sole unregistered
+`PreparedExternalOperation`; Task 03 defines the distinct
+`RegisteredExternalWait`. Task 05 implements their executor boundary but MUST
+NOT introduce a second prepared/external-wait owner. The executor owns the sink
+after admission and never passes it to the job's consuming `run`. The job only returns a
+send-safe result. Worker code therefore cannot omit or duplicate completion
+delivery, select the completion kind, return a resource/cancel hook, or move
+VM-side cleanup state across the thread boundary. `RunningSubmission` is only an
+immediate admission receipt. On rejection, `SubmissionRejected` proves no
+admission or sink delivery occurred and returns the job, sink, and start token
+to the runtime transaction for one rollback/drop path.
 
 Each interpreter runtime owns one `ExecutorLease` over the process-wide pool.
 Lease shutdown rejects new jobs for that runtime, cancels/drains only its jobs,
-and unregisters the lease without stopping jobs belonging to another
-interpreter. The shared pool may stop workers after the final lease closes or an
-explicit process shutdown. `Runtime::start_external` allocates and installs the
-wait/resource registration before it calls the lease's `submit`, preventing a
-completion-before-registration race. If `submit` returns `Err`, the runtime
-deterministically unregisters that wait, invokes or transfers cleanup exactly
-once, and records the rejected operation; no task remains parked. For each
-admitted job, the executor owns one terminal delivery. A queued job cancelled
-before start completes with `ExternalFailureCode::Cancelled` without invoking
-the job. Otherwise the executor invokes `IoJob::run` inside
+and only then unregisters its `RuntimeId`, without stopping jobs belonging to
+another interpreter. Duplicate attachment and attachment after pool shutdown
+return `ExecutorAttachError`. The shared pool may stop workers after the final
+lease unregisters or an explicit process shutdown. `Runtime::apply_native_suspend` dispatches its sole
+boxed prepared request to private `start_external`, which destructures that
+bundle once. Before calling the lease's `submit`, it installs the task's
+`Running -> Waiting` state, `RegisteredExternalWait` with traced decoder and
+continuation, and concrete cleanup/resource entry, then creates the sink from
+that registration. An inline completion can only enqueue; the driver processes
+it after this transition returns and therefore observes the registered waiting
+task. If `submit` returns `SubmissionRejected`, the runtime takes back and drops
+the job, sink, and start token, removes the wait, processes/transfers resource
+cleanup once, drops the queue-cancel half, changes `Waiting -> Running`, and
+routes `ExternalFailureCode::Rejected` through the same consuming decoder and
+then the same consuming continuation used by worker completion. No task remains
+parked and rejection cannot enqueue a completion. For each
+admitted job, the executor owns one terminal delivery. On dequeue it consumes
+`start_token.claim_for_run()`. `CompleteCancelled` drops the job without invoking
+it and completes the sink once with `ExternalFailureCode::Cancelled`. `Run`
+claims the operation before the runtime can classify it as queued. In either
+case, cancellation consumes/deregisters the runtime resource entry exactly
+once. For `Interruptible`, it invokes the hook exactly once even when
+`CancelledQueued` won: the pre-armed hook records sticky cancellation and
+closes/releases any existing prepared child, stream, or resource. Repeated
+cancellation cannot call it again. `CancelDisposition::Reaped` releases the
+cleanup entry immediately. `PendingReap` or `CancelHookError` transfers the
+still-owned hook/resource to `CleanupRegistry`, retains live accounting, and
+records/deduplicates a suppressed diagnostic; task cancellation may settle only
+after that ownership transfer is recorded. Cleanup turns invoke only `reap`,
+never `cancel` again. Late job completion remains stale while cleanup ownership
+is retained. The queue CAS controls only body invocation and sink ownership; it
+never suppresses the hook. Every interruptible job and
+its runtime hook share a
+pre-armed sticky cancellation state created before submission. That state
+includes a cancellation token/wake primitive selected or polled by any
+potentially blocking acquisition, unless the concrete abort handle is installed
+before the resource's first potentially blocking poll. A one-time check before
+acquisition is not enough: cancellation while acquisition is blocked MUST wake
+it and produce `Cancelled`. Post-construction attachment is allowed only for
+nonblocking construction, through the synchronized shared state, before first
+blocking use; a racing request then causes immediate attach-and-abort. If an API
+exposes its handle only after a potentially unbounded acquisition and cannot
+select/poll cancellation, split acquisition into its own interruptible wait,
+prove `QuarantinedBounded`, or mark the operation `PROHIBITED`. The executor
+invokes a claimed `ExecutorJob` body inside
 `catch_unwind(AssertUnwindSafe(...))`, maps a panic to an `ExternalFailure` with
 code `ExternalFailureCode::WorkerPanic`, and calls
 `CompletionSink::complete` exactly once. `InboxClosed` increments the executor's
 undeliverable counter rather than silently discarding a send failure. An
 enqueued completion rejected by `WaitRegistry` as stale, cancelled, duplicate,
-or wrong-identity increments the runtime's `late_completions` counter. The
-executor never decodes a Sema value.
+or wrong-identity normally increments the runtime's `late_completions` counter.
+The exception is an exact full-identity match in quarantine cleanup after its
+active wait was cancelled: that completion discards its payload, removes the
+quarantine entry once, and increments `quarantine_reaped`. Wrong-kind/identity,
+duplicate-after-reap, and interruptible stale completion remain late and cannot
+release cleanup ownership. The executor never decodes a Sema value.
 
 `ExecutorSnapshot` reports queued, running-interruptible,
 running-quarantined, completed, cancelled, panicked, and undeliverable counts.
@@ -247,10 +244,17 @@ mandatory; the implementer expands them to one row per registered builtin:
 | `proc`, `pty`, `git` | Interruptible: kill process/process-group or close PTY master, then asynchronously wait/reap child. |
 | `fs_watch`, `event`, `serial`, `terminal` | Interruptible: deregister watcher/subscription/file descriptor and close wake source. |
 | `stream` | Interruptible for open/read/write waits: cancel registered OS future; close operation remains idempotent. |
-| `sqlite`, `kv` | Interruptible where library interrupt handle exists; otherwise hard busy/deadline limit plus quarantine. |
-| `io` file operations | Interruptible async filesystem request where supported; finite-work quarantine only after size/entry count is captured and capped before dispatch. |
-| `archive`, `pdf`, `diff`, `secret`, `crypto`, `csv_ops`, `markup` | Finite-work quarantine with validated byte/page/entry/item maximum fixed before dispatch. |
+| `sqlite`, `kv` | Feasibility spike first: prove an interrupt handle wakes the representative blocked call, prove killable process isolation, or classify it `PROHIBITED`. |
+| `io` file operations | Feasibility spike first: prove the representative filesystem syscall is interruptible/wakeable, isolate it in a killable process, or classify it `PROHIBITED`. |
+| `archive`, `pdf`, `diff`, `secret`, `crypto`, `csv_ops`, `markup` | Bounds may constrain CPU/input expansion, but do not enforce a deadline around a sync-only blocking call. Each sync-only provider representative needs proven interrupt/wake, killable process isolation, or `PROHIBITED`. |
 | `system` sleeps/process queries | Runtime timer or interruptible OS job; no worker-thread sleep. |
+
+Before a `QuarantinedBounded` job wins `Run`, it MUST consist only of an
+immutable owned `Send` input snapshot. Preparation and queue residency acquire
+no resource, start no work, perform no external mutation, and create no cleanup
+that a queue-cancel drop could strand. An operation with any such pre-run effect
+is `Interruptible` with an exactly-once hook that releases it, or
+`PROHIBITED`.
 
 If an existing builtin cannot satisfy its row, make it return a structured
 unsupported-in-cooperative-runtime condition when invoked from any root, record
@@ -276,7 +280,11 @@ one row or explicitly marked non-runtime test/infrastructure with evidence.
 - [ ] **Step 3: Review classification before production edits**
 
 Reviewer rejects finite-work claims that do not identify the input cap and the
-code that enforces it before dispatch.
+code that enforces it before dispatch. Before approving any filesystem, SQLite,
+subprocess/PTY, or sync-only provider row, run a feasibility spike that blocks a
+representative operation and proves either actual interrupt+wake, killable
+process isolation and reap, or `PROHIBITED`. A byte/page/item cap or deadline on
+an uninterruptible same-process syscall is not enforcement.
 
 ## Task 2: Replace the executor seam test-first
 
@@ -302,10 +310,48 @@ First use fake jobs/executors to pin the interface itself:
 - `late_enqueued_completion_is_accounted` — cancellation followed by an
   enqueued completion increments the runtime's late-completion counter without
   changing the task outcome;
-- `completion_before_submit_returns_is_safe` — registration exists before the
-  executor runs the job inline and returns its receipt;
-- `submit_rejection_rolls_back_wait_and_resource` — every `SubmitError` leaves
-  zero waits/resources and runs cleanup once;
+- `queued_cancel_prevents_job_invocation_and_completes_once` — cancellation wins
+  `Queued -> Cancelled`, the job body is never entered, and the executor consumes
+  its sink once with `Cancelled`; the registered interruptible hook runs exactly
+  once and releases an existing fake resource;
+- `cancel_vs_dequeue_has_one_linearized_winner` — a barrier-controlled race
+  repeatedly proves either cancel wins and the body does not run, or dequeue
+  wins and the body reaches its interruptible wait; both outcomes invoke the
+  resource hook once, have one terminal sink attempt, and leak no registration.
+  Its running branch pauses after the
+  `Queued -> Running` CAS but before resource acquisition, cancels, and proves
+  the sticky token prevents acquisition; a second barrier pauses inside the
+  fake acquisition and proves cancellation wakes/unblocks it; a third phase
+  cancels between nonblocking construction and abort-handle attachment and
+  proves immediate one-shot abort before first blocking use;
+- `cancel_before_start_is_idempotent` — repeated cancellation reports
+  `AlreadyCancelled` without another sink delivery or hook/cleanup call;
+- `cancel_hook_reaped_releases_once` — one `cancel` call returning `Reaped`
+  removes the entry and decrements the live-resource count once;
+- `cancel_hook_pending_reaps_later` — one `cancel` call returning `PendingReap`
+  transfers ownership, later cleanup polls only `reap`, and `Reaped` removes the
+  entry once;
+- `cancel_hook_error_retains_owned_cleanup` — one `cancel` error keeps the live
+  entry, repeated task cancel does not call `cancel` again, identical suppressed
+  diagnostics deduplicate, a late job completion is stale, and bounded `reap`
+  polls either recover or leave a named snapshot entry;
+- `cancel_hook_error_fails_clean_shutdown_at_deadline` — a persistent reap error
+  produces a non-clean shutdown report naming operation/resource identity, last
+  error, and attempt count;
+- `queued_quarantined_job_has_no_pre_run_effects` — preparation and queue
+  residency retain only an immutable owned `Send` snapshot and counters prove no
+  acquisition, work, mutation, or cleanup exists before `Run`;
+- `completion_before_submit_returns_is_safe` — a fake executor drives the exact
+  `Running -> Native(Suspend) -> apply_native_suspend -> RegisteredExternalWait
+  + Waiting -> inline completion` path; the inbox is processed only afterward
+  and makes the task ready through its stored continuation;
+- `submit_rejection_resumes_registered_continuation` — the same path returns
+  `SubmissionRejected`; its owning error returns job/sink/start token, rollback
+  removes wait/control state, and the structured failure consumes the decoder
+  then continuation once without a parked task or enqueued completion;
+- `submit_rejection_rolls_back_wait_and_resource` — successful rollback leaves
+  zero waits/resources and calls one-shot resource cancellation once; an error
+  variant leaves zero waits but retains named cleanup/live-resource ownership;
 - `running_job_receipt_does_not_own_resource` — executor accounting cannot take
   over the runtime cancel hook.
 
@@ -313,15 +359,23 @@ Then cover cancellation before job starts, cancellation during job, cancel
 twice, wrong runtime/generation/operation/kind, a fault-injected duplicate
 completion at the inbox boundary, quarantine completion after observer
 cancellation, and shutdown with one job in each state. Duplicate delivery is an
-inbox/fault-injection case because the public `IoJob` API cannot produce it.
+inbox/fault-injection case because the public `ExecutorJob` API cannot produce it.
 
-- [ ] **Step 2: Implement prepared operations, `IoJob`, admission, and counters**
+- [ ] **Step 2: Implement prepared operations, `ExecutorJob`, admission, and counters**
 
 Preserve the process-wide pool identity and blocking-tier admission headroom.
 Keep `CompletionSink` fields and its consuming result-delivery method private to
-the executor. Store the runtime `ResourceClass` before submission, wrap every
-admitted job in the one-shot panic-to-result delivery path, account for
-`InboxClosed`, and implement rejection rollback before migrating any builtin.
+the executor. Construct the queue-cancel/start-token pair before wait
+registration, store the runtime handle beside `ResourceClass`, and submit the
+non-cloneable token with the job. Implement the exact atomic
+cancel-versus-dequeue transition and rejection rollback before migrating any
+builtin. For every interruptible row, construct and test a pre-armed sticky
+runtime-hook/job-token pair whose wake participates in potentially blocking
+acquisition, or install the abort handle before first blocking poll. Direct
+handle lookup and check-then-block acquisition are prohibited. Reclassify APIs
+that cannot meet this contract as separate interruptible acquisition waits,
+`QuarantinedBounded`, or `PROHIBITED`. Wrap every running job in the one-shot
+panic-to-result delivery path and account for `InboxClosed`.
 Remove public `io_block_on` once all callers in this layer are migrated; until
 then its inventory row must list the exact remaining caller and deletion step.
 
@@ -401,6 +455,9 @@ Expected: fake-server matrix passes without network access or lingering ports.
 For every finite-work row test just below cap, at cap, above cap, cancellation
 after dispatch, worker panic, and cleanup registry reaping. For databases test
 busy lock, query interruption, transaction rollback, and dropped connection.
+These tests prove bounded input/work only; separate feasibility tests prove that
+a blocked filesystem/SQLite/subprocess/PTY/sync-provider operation is actually
+interrupted and woken or that its isolated process is killed and reaped.
 
 - [ ] **Step 2: Enforce bounds before submission**
 

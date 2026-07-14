@@ -79,9 +79,9 @@ runtime behavior.
 | Inventory fixture validation | A nonexistent `R99` was accepted when that text appeared outside the ledger table's ID column. | `unified_runtime_inventory_checker_rejects_invalid_fixture_states` passes all valid, empty/missing, stale, duplicate, malformed, `UNREVIEWED`, and nonexistent-row cases; row membership is anchored to the first table column. |
 | Mapping regeneration | The writer reclassified every match through path/text heuristics, so a source edit could silently receive the wrong semantic row. | `unified_runtime_inventory_writer_preserves_reviews_and_marks_only_new_matches` proves surviving assignments are preserved, vanished payloads are removed, and new payloads remain `UNREVIEWED`. |
 | Partial discovery failure | A failing first discovery `rg` could be masked by a later successful scan. | `unified_runtime_inventory_checker_rejects_partial_discovery_scan_failure` passes for both `--check` and `--write-mapping`; neither writes a map after failure. The missing-binary regression also requires the named diagnostic. |
-| Escaped inherited writer | The Unix `setsid` helper held both pipes open and the blocking drain join returned after about 2.00s instead of the direct parent's prompt exit. | `escaped_session_pipe_writers_do_not_block_drain_join` passes in about 0.02s. Unix/Windows drains are nonblocking and cancellable; Unix process-group cleanup remains best effort. |
+| Escaped inherited writer | The Unix `setsid` helper held both pipes open and the blocking drain join returned after about 2.00s instead of the direct parent's prompt exit. | `escaped_session_pipe_writers_do_not_block_drain_join` passes in about 0.02s. Unix uses nonblocking reads; Windows uses a dedicated blocking reader and repeatedly targets that reader thread with `CancelSynchronousIo` during shutdown. Unix process-group cleanup remains best effort. |
 | Windows inherited writer | Native Windows execution is unavailable in this macOS worktree. | A `cfg(windows)` regression now spawns a two-second PowerShell writer through a promptly exiting helper. The exact watchdog and Windows test code pass an isolated `x86_64-pc-windows-gnu` `cargo check`; Task 07/Windows CI must execute it natively. |
-| Completion liveness | Passing `CompletionSink` into `IoJob::run` let a job omit delivery, duplicate it, or panic before consuming the sink. | Master, Task 02, and Task 05 now make `IoJob::run(self)` return a send-safe result. The executor privately owns one terminal sink delivery, maps panic to `WorkerPanic`, handles queued cancellation, and accounts for closed-inbox/late delivery. |
+| Completion liveness | Passing `CompletionSink` into a job let it omit delivery, duplicate it, or panic before consuming the sink. | Master and Tasks 02/03/05 use `ExecutorJob`; the executor privately owns one terminal sink delivery, maps panic to `WorkerPanic`, handles queued cancellation, and accounts for closed-inbox/late delivery. |
 
 The full Sema Windows cross-check was attempted with:
 
@@ -237,3 +237,39 @@ Second-amendment verification:
 
 Independent acceptance review is controller-owned and remains pending. This
 evidence does not claim that review.
+
+## Third acceptance amendment
+
+Windows drain shutdown now relies only on its reader-start handshake, the stop
+flag checked before every blocking read, and repeated `CancelSynchronousIo` on
+the exact reader thread. It removes the byte-count/10 ms quiet heuristic and
+uses a 64 KiB read buffer so one read can retain the complete capture window;
+excess is still drained and discarded while the direct child runs. Windows-only
+tests cover immediate markers and multi-chunk head/tail markers. They are
+compile-ready, but native execution remains assigned to Windows CI because this
+macOS host cannot execute the Windows cancellation path.
+
+The synchronized architecture text now has one canonical executor seam across
+the master and Tasks 02/03/05, explicit runtime-owned IDs and callback borrow
+discipline, counted handle retention/reaping, attach/shutdown ordering, a
+cfg-neutral coalescing completion wake boundary, Task 07 local-host separation,
+named legacy bridges, and Task 05 blocking-call feasibility spikes. The legacy
+baseline is an exact reviewed snapshot/change detector; it reports additions and
+removals for review but does not independently prohibit all additions.
+
+| Command | Third-amendment result |
+| --- | --- |
+| targeted `rustfmt --edition 2021 --check` | PASS on `watchdog.rs`, `runtime_conformance_test.rs`, and `unified_runtime_watchdog_test.rs`. |
+| `cargo test -p sema-lang --test runtime_conformance_test -- --nocapture` | PASS: 8 passed. |
+| `cargo test -p sema-lang --test unified_runtime_watchdog_test -- --nocapture` | Expected exit 101: 3 passed, 1 helper ignored, only fairness RED; completed in 4.23s without hanging. |
+| `scripts/check-unified-runtime-inventory.sh --check` | PASS: 1,257 exact matches. |
+| temporary mapping `--write-mapping` and `cmp` | PASS: reviewed map preserved byte-for-byte, including R17C stream-copy and C07C LLM callback remappings. |
+| `scripts/check-unified-runtime-legacy.sh --check` | PASS. |
+| `jake docs-check` | PASS. |
+| `git diff --check` | PASS. |
+| `cargo fmt --all -- --check` | Expected baseline-only failure in untouched `stream_file_async_test.rs` and `async_ops.rs`; no Task 01-owned Rust file differed. |
+
+The exact intentional RED set is unchanged: supplied `async/all` sibling and
+scheduled `async/race` loser observation, captured mutation, negative
+sleep/timeout validation, unrepresentable channel capacity, finite tick ceiling,
+and watchdog fairness. Independent acceptance remains pending.

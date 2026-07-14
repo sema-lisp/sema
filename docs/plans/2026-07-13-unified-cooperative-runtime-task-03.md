@@ -114,6 +114,7 @@ pub struct PreparedRoot {
 pub struct RootHandle {
     runtime: Weak<RefCell<RuntimeState>>,
     id: RootId,
+    lease: RootHandleLease,
 }
 
 pub struct DriveBudget {
@@ -142,7 +143,10 @@ pub struct ShutdownOptions {
 }
 
 impl Runtime {
-    pub fn new(clock: Rc<dyn RuntimeClock>) -> Self;
+    pub fn new(
+        clock: Rc<dyn RuntimeClock>,
+        executor: Arc<dyn IoExecutor>,
+    ) -> Result<Self, ExecutorAttachError>;
     pub fn submit_root(
         &self,
         prepared: PreparedRoot,
@@ -163,8 +167,19 @@ impl RootHandle {
 `RuntimeState` is private. `Runtime` is the interpreter-owned strong handle and
 is not `Clone`; root handles retain only `Weak` access to the same state. This
 internal-handle shape lets `submit_root(&self, ...)` construct a non-owning
-`RootHandle` without requiring an impossible `Weak` conversion from `&mut
-Runtime` or introducing a second runtime owner.
+`RootHandle` without introducing a second runtime owner. Its cloneable lease
+increments an explicit runtime-side handle count; every drop decrements it.
+Settlement remains pollable while that count is nonzero. Final-handle drop is
+queued as cleanup, and the root is reaped only after settlement and after all
+descendant, debugger, output, and tracing retention reaches zero.
+
+`Runtime::new` allocates its `RuntimeId` and thread-safe completion inbox,
+wraps the inbox sender as `Arc<dyn CompletionSender>`, and calls
+`executor.attach_runtime(runtime_id)` once and propagates attachment failure.
+Duplicate IDs and attachment after executor shutdown are errors. Runtime state owns the returned
+`Arc<dyn ExecutorLease>` and inbox receiver. Tests inject a Task 02 fake
+executor/lease; Task 03 has no dependency on `sema-io`. Task 05 wires the
+production `sema-io` implementation at host construction sites.
 
 `RootPoll` is `Pending`, `Ready(Result<Value, SemaError>)`, or
 `RuntimeDropped`. Polling never drives the runtime. Result retrieval is
@@ -192,6 +207,16 @@ pub enum VmExecResult {
 pub struct CancellationRequest {
     pub reason: CancelReason,
 }
+
+/// Exists only after `Runtime::apply_native_suspend` registers an external
+/// request; it is never a second unregistered request type.
+pub struct RegisteredExternalWait {
+    pub operation_id: OperationId,
+    pub expected_kind: CompletionKind,
+    pub decoder: Box<dyn CompletionDecoder>,
+    pub queue_cancel: ExecutorCancelHandle,
+    pub continuation: Box<dyn NativeContinuation>,
+}
 ```
 
 All state transitions go through named methods that reject illegal edges in
@@ -209,9 +234,86 @@ moves to the back. Within that root, a yielded task moves behind tasks already
 ready there.
 
 Wait lookup uses `(WaitId, WaitGeneration)`. Each registration also stores its
-`OperationId`, decoder, cancellation policy, and waiting task. Cancellation or
-completion removes the registration before invoking callbacks. A late or
-duplicate completion is counted and discarded; it never resumes another wait.
+`OperationId`, decoder, cancellation policy, and waiting task.
+`RegisteredExternalWait` is the only registered external shape and is traced:
+its decoder and continuation visit every retained Sema value. Cleanup/resource
+hooks remain host-only and must not capture untraced `Value`/`Env` state.
+Cancellation or completion removes the wait registration before invoking
+callbacks. A late or duplicate completion is counted and discarded; it never
+resumes another wait.
+
+For a valid completion, removal yields one decoder and one continuation. The
+runtime consumes the decoder with the raw send-safe result, maps its sole
+`DecodedCompletion` to `ResumeInput::Returned`/`Failed`, then consumes the
+continuation and applies its `NativeResult`. Worker failure and decode failure
+use that same sequence. Explicit task cancellation removes the registration,
+drops the decoder exactly once without invoking it, and consumes the continuation
+with `ResumeInput::Cancelled(reason)`. No path can orphan, duplicate, or bypass
+either object.
+
+Completion routing checks the full
+`(RuntimeId, WaitId, WaitGeneration, OperationId, CompletionKind)` identity in
+this order: active wait, then quarantine-cleanup entry. Cancelling a running
+`QuarantinedBounded` wait removes/drops its decoder and continuation as above,
+but atomically transfers job/resource accounting plus the exact identity and
+bound to `CleanupRegistry`. A later exact completion is cleanup-only: discard
+its payload, remove/decrement that entry once, and increment
+`quarantine_reaped`, without changing a task outcome or `late_completions`.
+Wrong identity/kind leaves the cleanup entry live and counts late/fault; a
+duplicate after reap is late. Interruptible stale completion remains late even
+when failed-hook cleanup is retained, because only `reap` may release that
+resource. Completion-versus-cancellation uses the active-wait removal as its
+linearization point: completion-first runs decoder/continuation; cancel-first
+transfers quarantine ownership before the task may settle. Bound expiry names
+an invariant failure and keeps ownership until completion/reap makes accounting
+safe.
+
+`Runtime::apply_native_suspend` owns one external-registration transaction. For
+`WaitKind::External`, it destructures the sole
+`Box<PreparedExternalOperation>` exactly once, allocates `OperationId`,
+`WaitId`, `WaitGeneration`, and completion identity, and installs `RegisteredExternalWait`, the concrete
+`ResourceClass` cleanup entry, and the task's `Running -> Waiting` state before
+it constructs the private completion sink and calls Task 05 submission. The
+driver cannot drain the completion inbox reentrantly during this transition, so
+an executor that completes inline during `submit` sees fully registered waiting
+state; its completion is processed only after `apply_native_suspend` returns.
+There is no second `ExternalWait`, double registration, or clone/move of the
+decoder, resource, queue handle, continuation, job, or start token.
+No producer or executor allocates a runtime identity.
+
+Every callback transition follows extract/invoke/apply: under one short
+`RuntimeState` borrow, remove the registration and extract decoder,
+continuation, VM/task bookkeeping, and pending transition; drop that borrow;
+construct `NativeCallContext` and invoke decoder/callback/continuation; then
+reborrow state only to validate and apply the returned transition. Output and
+cancellation callbacks obey the same rule. Tests cover suspend/resume/suspend
+through one continuation, a callback that enqueues a completion while running,
+and nested native-to-Sema-to-native suspension; none may panic from a nested
+`RefCell` borrow or process the enqueued completion reentrantly.
+
+Submission rejection returns ownership of the unadmitted job, sink, and start
+token. The same transaction removes the wait, takes the wait-owned resource
+entry, performs its one-shot cancellation, drops both queue-control halves and
+the rejected job/sink, transitions `Waiting -> Running`, and consumes the
+registered decoder with `Err(ExternalFailure { code: Rejected, ... })`. It maps
+that `DecodedCompletion` to `ResumeInput::Returned`/`Failed` and then consumes
+the already-registered continuation.
+`Reaped` removes the resource; `PendingReap`/error atomically transfers it to
+retained cleanup before resumption. The returned `NativeResult` is applied
+through the ordinary native-result path. Rollback cannot enqueue a completion
+or leave a parked task.
+
+If an interruptible cancel hook returns `CancelHookError`, cancellation remains
+sticky and the task's primary cancelled outcome is unchanged. The runtime moves
+the hook/resource entry to cleanup retry state with its operation/resource
+identity, reap-attempt count, and deduplicated suppressed diagnostic.
+Live-resource accounting is unchanged. Repeated task cancellation and the
+registry never call `cancel` again; bounded cleanup turns invoke only the hook's
+nonblocking `reap` method. A successful `Reaped` removes/decrements the entry
+exactly once. Task cancellation may settle only after the transfer into cleanup
+ownership is recorded. At shutdown deadline, any retained entry makes the
+report non-clean and emits a named invariant failure with its last error and
+attempts.
 
 The runtime assigns `SettlementSeq` at the single transition into `Settled`.
 Sequence assignment occurs before waking observers, so pre-settled promise races
@@ -282,7 +384,21 @@ completion-vs-cancellation races, per-turn completion/timer/cleanup/root limits,
 and wall-clock budget expiry measured with an injected clock. Wrong-kind
 delivery must leave the wait/task outcome unchanged and must not invoke the
 decoder; correct-kind decode failure is delivered as the Task 02 `Decode`
-failure.
+failure. Add fake hooks whose one-shot `cancel` returns `PendingReap` and `Err`:
+cleanup retains ownership and live-resource count, repeated task cancellation
+does not invoke `cancel` again, later cleanup turns invoke only `reap`, and
+`Reaped` decrements once. A persistent reap error remains named in snapshots and
+suppressed diagnostics, and makes shutdown non-clean at its deadline.
+Use counted consuming decoder/continuation fakes to prove exactly one fate for
+each on success, worker failure, decode error, explicit cancellation, and submit
+rejection. Cancellation drops (does not invoke) the decoder once and invokes the
+continuation once with `Cancelled`; rejection traverses decoder then
+continuation.
+Add quarantine routing tests for both completion-vs-cancel orders, exact
+cleanup-only completion, wrong-kind cleanup completion, duplicate after reap,
+bound expiry, and shutdown returning zero live cleanup after an in-bound
+completion. A cancelled observer/task outcome never changes when cleanup-only
+completion arrives.
 
 - [ ] **Step 2: Implement registration and bounded drains**
 
@@ -394,8 +510,11 @@ cargo test -p sema-lang --test vm_async_test -- scheduler
 cargo test -p sema-lang --test unified_runtime_watchdog_test
 ```
 
-Expected: root/fairness/watchdog cases pass; language-combinator cases assigned
-to Task 04 may remain RED and are listed by exact name in evidence.
+Expected: root/fairness/watchdog cases pass. Exact Task 04 language-combinator
+RED cases may remain. Unmigrated resource, LLM, and MCP producers still run
+through the named `LegacyRuntimeBridge` and remain listed with deletion owners
+in Tasks 05, 06, and 07/08 as applicable; they are not silently treated as Task
+04 RED cases.
 
 ## Task 7: Integrate debugger stop-the-world behavior
 

@@ -27,11 +27,34 @@ struct BoundedDrain {
     handle: JoinHandle<io::Result<Vec<u8>>>,
     #[cfg(any(unix, windows))]
     stop: Arc<AtomicBool>,
+    #[cfg(windows)]
+    started: Arc<AtomicBool>,
 }
 
 impl BoundedDrain {
     fn finish(self) -> Vec<u8> {
-        #[cfg(any(unix, windows))]
+        #[cfg(windows)]
+        {
+            use std::os::windows::io::AsRawHandle;
+            use windows_sys::Win32::Foundation::ERROR_NOT_FOUND;
+            use windows_sys::Win32::System::IO::CancelSynchronousIo;
+
+            while !self.started.load(Ordering::Acquire) && !self.handle.is_finished() {
+                thread::yield_now();
+            }
+            self.stop.store(true, Ordering::Release);
+            while !self.handle.is_finished() {
+                let cancelled = unsafe { CancelSynchronousIo(self.handle.as_raw_handle()) };
+                if cancelled == 0 {
+                    let error = io::Error::last_os_error();
+                    if error.raw_os_error() != Some(ERROR_NOT_FOUND as i32) {
+                        panic!("cancel watchdog diagnostic read: {error}");
+                    }
+                }
+                thread::sleep(Duration::from_millis(1));
+            }
+        }
+        #[cfg(unix)]
         self.stop.store(true, Ordering::Release);
         self.handle
             .join()
@@ -52,16 +75,12 @@ where
 #[cfg(windows)]
 fn drain_bounded<R>(reader: R) -> BoundedDrain
 where
-    R: std::os::windows::io::AsRawHandle + Read + Send + 'static,
+    R: Read + Send + 'static,
 {
-    set_nonblocking(&reader).expect("configure watchdog diagnostic pipe as nonblocking");
-    spawn_cancellable_drain(reader, |error| {
-        error.kind() == io::ErrorKind::WouldBlock
-            || error.raw_os_error() == Some(windows_sys::Win32::Foundation::ERROR_NO_DATA as i32)
-    })
+    spawn_windows_pipe_drain(reader)
 }
 
-#[cfg(any(unix, windows))]
+#[cfg(unix)]
 fn spawn_cancellable_drain<R>(mut reader: R, is_would_block: fn(&io::Error) -> bool) -> BoundedDrain
 where
     R: Read + Send + 'static,
@@ -101,6 +120,59 @@ where
     BoundedDrain { handle, stop }
 }
 
+#[cfg(windows)]
+fn spawn_windows_pipe_drain<R>(mut reader: R) -> BoundedDrain
+where
+    R: Read + Send + 'static,
+{
+    let stop = Arc::new(AtomicBool::new(false));
+    let drain_stop = Arc::clone(&stop);
+    let started = Arc::new(AtomicBool::new(false));
+    let drain_started = Arc::clone(&started);
+    let handle = thread::spawn(move || {
+        let mut captured = Vec::with_capacity(DIAGNOSTIC_CAPTURE_LIMIT);
+        // A single completed Windows read can retain the entire diagnostic
+        // window before shutdown prevents another read.
+        let mut buffer = [0_u8; DIAGNOSTIC_CAPTURE_LIMIT];
+        loop {
+            if drain_stop.load(Ordering::Acquire) {
+                break;
+            }
+            // Once `started` is visible, this iteration has passed its stop
+            // check and will enter `read`; finish can safely target that read.
+            drain_started.store(true, Ordering::Release);
+            match reader.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(read) => {
+                    let remaining = DIAGNOSTIC_CAPTURE_LIMIT.saturating_sub(captured.len());
+                    captured.extend_from_slice(&buffer[..read.min(remaining)]);
+                }
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error)
+                    if error.raw_os_error()
+                        == Some(windows_sys::Win32::Foundation::ERROR_BROKEN_PIPE as i32) =>
+                {
+                    break;
+                }
+                Err(error)
+                    if error.raw_os_error()
+                        == Some(windows_sys::Win32::Foundation::ERROR_OPERATION_ABORTED as i32)
+                        && drain_stop.load(Ordering::Acquire) =>
+                {
+                    break;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(captured)
+    });
+    BoundedDrain {
+        handle,
+        stop,
+        started,
+    }
+}
+
 #[cfg(unix)]
 fn set_nonblocking(reader: &impl AsRawFd) -> io::Result<()> {
     let fd = reader.as_raw_fd();
@@ -109,25 +181,6 @@ fn set_nonblocking(reader: &impl AsRawFd) -> io::Result<()> {
         return Err(io::Error::last_os_error());
     }
     if unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } == -1 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
-}
-
-#[cfg(windows)]
-fn set_nonblocking(reader: &impl std::os::windows::io::AsRawHandle) -> io::Result<()> {
-    use windows_sys::Win32::System::Pipes::{SetNamedPipeHandleState, PIPE_NOWAIT};
-
-    let mut mode = PIPE_NOWAIT;
-    let result = unsafe {
-        SetNamedPipeHandleState(
-            reader.as_raw_handle(),
-            &mut mode,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-        )
-    };
-    if result == 0 {
         return Err(io::Error::last_os_error());
     }
     Ok(())
@@ -230,8 +283,8 @@ fn run_with_timeout(command: &mut Command, timeout: Duration) -> TimedRun {
 
     // Best-effort Unix process-group cleanup terminates descendants that did not
     // escape into another session. It cannot close writers held by a `setsid`
-    // descendant; cancellable nonblocking drains guarantee bounded joins even
-    // when such an escaped writer remains open.
+    // descendant; cancellable drains guarantee bounded joins even when such an
+    // escaped writer remains open.
     #[cfg(unix)]
     terminate_process_group(child.id());
 

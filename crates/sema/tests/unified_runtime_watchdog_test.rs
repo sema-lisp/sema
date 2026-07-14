@@ -344,3 +344,105 @@ fn windows_inherited_pipe_writer_does_not_block_drain_join() {
         "a Windows inherited pipe writer blocked drain joins for {elapsed:?}"
     );
 }
+
+#[cfg(windows)]
+#[test]
+#[ignore = "subprocess helper for Windows immediate-marker watchdog regression"]
+fn windows_immediate_marker_helper() {
+    use std::io::Write;
+
+    println!("IMMEDIATE_STDOUT_MARKER");
+    eprintln!("IMMEDIATE_STDERR_MARKER");
+    std::io::stdout().flush().expect("flush immediate stdout");
+    std::io::stderr().flush().expect("flush immediate stderr");
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_immediate_child_markers_are_not_lost() {
+    let executable = std::env::current_exe().expect("resolve watchdog test executable");
+    let executable = executable.to_str().expect("test executable path is UTF-8");
+
+    for iteration in 0..32 {
+        let run = run_command_with_timeout(
+            executable,
+            &[
+                "--ignored",
+                "--exact",
+                "windows_immediate_marker_helper",
+                "--nocapture",
+            ],
+            Duration::from_secs(1),
+        );
+        assert!(!run.timed_out, "immediate helper {iteration} timed out");
+        assert!(run.status.success(), "immediate helper {iteration} failed");
+        assert!(
+            run.stdout.contains("IMMEDIATE_STDOUT_MARKER"),
+            "lost immediate stdout marker on iteration {iteration}: {:?}",
+            run.stdout
+        );
+        assert!(
+            run.stderr.contains("IMMEDIATE_STDERR_MARKER"),
+            "lost immediate stderr marker on iteration {iteration}: {:?}",
+            run.stderr
+        );
+    }
+}
+
+#[cfg(windows)]
+#[test]
+#[ignore = "subprocess helper for Windows multi-chunk watchdog regression"]
+fn windows_multichunk_helper() {
+    use std::io::Write;
+
+    let chunk = vec![b'x'; 8 * 1024];
+    println!("MULTICHUNK_STDOUT_HEAD_MARKER");
+    eprintln!("MULTICHUNK_STDERR_HEAD_MARKER");
+    for _ in 0..4 {
+        std::io::stdout()
+            .write_all(&chunk)
+            .expect("write stdout chunk");
+        std::io::stderr()
+            .write_all(&chunk)
+            .expect("write stderr chunk");
+    }
+    println!("MULTICHUNK_STDOUT_TAIL_MARKER");
+    eprintln!("MULTICHUNK_STDERR_TAIL_MARKER");
+    std::io::stdout().flush().expect("flush multi-chunk stdout");
+    std::io::stderr().flush().expect("flush multi-chunk stderr");
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_multichunk_markers_are_not_lost() {
+    let executable = std::env::current_exe().expect("resolve watchdog test executable");
+    let executable = executable.to_str().expect("test executable path is UTF-8");
+
+    for iteration in 0..8 {
+        let run = run_command_with_timeout(
+            executable,
+            &[
+                "--ignored",
+                "--exact",
+                "windows_multichunk_helper",
+                "--nocapture",
+            ],
+            Duration::from_secs(1),
+        );
+        assert!(!run.timed_out, "multi-chunk helper {iteration} timed out");
+        assert!(
+            run.status.success(),
+            "multi-chunk helper {iteration} failed"
+        );
+        assert!(
+            run.stdout.contains("MULTICHUNK_STDOUT_HEAD_MARKER")
+                && run.stdout.contains("MULTICHUNK_STDOUT_TAIL_MARKER"),
+            "lost multi-chunk stdout marker on iteration {iteration}"
+        );
+        assert!(
+            run.stderr.contains("MULTICHUNK_STDERR_HEAD_MARKER")
+                && run.stderr.contains("MULTICHUNK_STDERR_TAIL_MARKER"),
+            "lost multi-chunk stderr marker on iteration {iteration}"
+        );
+    }
+}

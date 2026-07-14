@@ -280,6 +280,13 @@ impl Scheduler {
                         "internal error: observational combinator yield reached the legacy scheduler"
                             .to_string(),
                     ),
+                    // `ChannelClose` is a unified-runtime-only yield: the legacy
+                    // scheduler's `channel/close` mutates the Sema buffer's
+                    // `closed` flag synchronously and never parks a task on it.
+                    YieldReason::ChannelClose(_) => WakeAction::Fail(
+                        "internal error: channel/close yield reached the legacy scheduler"
+                            .to_string(),
+                    ),
                 };
 
                 match action {

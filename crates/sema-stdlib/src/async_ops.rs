@@ -581,6 +581,15 @@ fn register_channel_ops(env: &Env) {
                 args[1]
             )));
         }
+        // Unified runtime: the ChannelRegistry is the single source of truth for
+        // buffering + rendezvous. Surface a ChannelSend yield; the runtime buffers
+        // (or parks until a receiver takes the value) and resumes this frame with
+        // nil. `channel/close` sets `ch.closed` above, so a send-to-closed still
+        // errors here without a yield (parity with the legacy path).
+        if in_runtime_quantum() {
+            set_yield_signal(YieldReason::ChannelSend(ch, args[1].clone()));
+            return Ok(Value::nil());
+        }
         if in_async_context() {
             if let Some(cached) = take_resume_value() {
                 return Ok(cached);
@@ -607,6 +616,14 @@ fn register_channel_ops(env: &Env) {
     register_fn(env, "channel/recv", |args| {
         check_arity!(args, "channel/recv", 1);
         let ch = expect_channel(args, "channel/recv", 0)?;
+        // Unified runtime: route through the ChannelRegistry. Surface a
+        // ChannelRecv yield; the runtime resumes this frame with the received
+        // value, or with nil when the channel is closed and empty (the documented
+        // closed sentinel).
+        if in_runtime_quantum() {
+            set_yield_signal(YieldReason::ChannelRecv(ch));
+            return Ok(Value::nil());
+        }
         if in_async_context() {
             if let Some(cached) = take_resume_value() {
                 return Ok(cached);
@@ -639,7 +656,15 @@ fn register_channel_ops(env: &Env) {
     register_fn(env, "channel/close", |args| {
         check_arity!(args, "channel/close", 1);
         let ch = expect_channel(args, "channel/close", 0)?;
+        // Mark closed synchronously so subsequent `channel/send`/`channel/recv`
+        // fast-path checks observe it (both legacy and runtime paths).
         ch.closed.set(true);
+        // Unified runtime: also close the backing registry channel so parked
+        // senders/receivers wake with the closed result; resume with nil.
+        if in_runtime_quantum() {
+            set_yield_signal(YieldReason::ChannelClose(ch));
+            return Ok(Value::nil());
+        }
         Ok(Value::nil())
     });
 

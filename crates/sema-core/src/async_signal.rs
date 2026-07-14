@@ -167,6 +167,12 @@ pub enum YieldReason {
     ChannelRecv(Rc<Channel>),
     /// Waiting to send to a full channel (carries the value to send).
     ChannelSend(Rc<Channel>, Value),
+    /// Closing a channel from inside a runtime quantum: the unified runtime
+    /// closes the backing registry channel (waking any parked senders/receivers
+    /// with the closed result) and resumes this frame with nil. The legacy
+    /// scheduler never sees this variant (its `channel/close` mutates the Sema
+    /// buffer's `closed` flag synchronously).
+    ChannelClose(Rc<Channel>),
     /// Sleeping for a duration in milliseconds.
     Sleep(u64),
     /// Spawning a detached task from a thunk (zero-arg function). The unified

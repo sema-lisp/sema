@@ -307,6 +307,46 @@ Expected: promise partition and GC tests pass.
 > behavior unchanged). Gate: `runtime_await_pending_rejection_is_catchable` in
 > `sema-eval` `mod runtime_eval_tests` (asserts both catchable and uncaught-Failed).
 
+> **PROGRESS (2026-07-15) — channels are GREEN end-to-end through the unified
+> runtime, backed by the canonical `ChannelRegistry`.** `channel/new`,
+> `channel/send`, `channel/recv`, and `channel/close` run through
+> `Interpreter::eval_str_via_runtime` with cross-task rendezvous, buffered FIFO,
+> blocking send/recv, and close. Sema API names used: `channel/new` (capacity),
+> `channel/send`, `channel/recv`, `channel/close` (+ the closed sentinel: recv
+> from closed+empty returns `nil`; send-to-closed raises a catchable condition).
+> Gate tests (un-ignored) in `sema-eval` `mod runtime_eval_tests`:
+> `runtime_channel_rendezvous_across_tasks`, `runtime_channel_buffered_fifo_order`,
+> `runtime_channel_blocking_send_parks_until_received`,
+> `runtime_channel_blocking_recv_parks_until_sent`,
+> `runtime_channel_recv_after_close_drains_then_sentinel`,
+> `runtime_channel_send_to_closed_errors`, `runtime_channel_rejects_invalid_capacity`.
+>
+> **Seam (mirrors the `async/spawn`/`async/await` VM-resumes-itself template).**
+> Three `YieldReason`s surface from inside a `run_quantum`: the existing
+> `ChannelSend(ch, value)` / `ChannelRecv(ch)` and a new `ChannelClose(ch)`
+> (sema-core `async_signal.rs`). The channel natives (sema-stdlib `async_ops.rs`)
+> yield these when `in_runtime_quantum()` instead of touching the Sema `Channel`
+> buffer — so the runtime `ChannelRegistry` is the SINGLE source of truth for
+> buffering + rendezvous in-runtime. `channel/send`'s eager `ch.closed` check and
+> `channel/close`'s `ch.closed.set(true)` still run synchronously so a
+> send-to-closed keeps the legacy "value … was dropped" message without a yield.
+> `visit_ready`'s AsyncYield arm (sema-vm `runtime/state.rs`) maps them to
+> `TaskAction::VmChannelSend`/`VmChannelRecv`/`VmChannelClose`, handled by
+> `channel_send`/`channel_receive`/`channel_close`:
+> - The Sema channel `Value` carries no `ChannelId`, so `resolve_channel` bridges
+>   `Rc<Channel>` pointer-identity → a runtime `ChannelId` (`channel_bridge` map,
+>   allocated lazily with the Sema channel's capacity on first op; the `Rc` clone
+>   pins the address). This is the smallest bridge — no new channel store; the
+>   canonical `ChannelRegistry`/`ChannelResult` back everything.
+> - Immediate results resume the frame in place (`resume_running_vm`): `Sent`→nil,
+>   `Received(v)`→v, `Closed`→nil (recv sentinel) or a closed-send error.
+> - A full-send / empty-recv parks on an `issue_internal_wait` key tracked in
+>   `channel_waits`; a counterpart's `ChannelWake` (drained via `pop_wake` after
+>   every send/recv/close) resumes it. `consume_channel_wake` now routes VM-quantum
+>   waiters (`consume_vm_channel_wake`) before the continuation-model protocol path.
+> Capacity validation (`channel/new`, zero/negative → condition) already runs in
+> the native before any allocation, so it surfaces as `Err` with no runtime change.
+
 - [ ] **Step 1: Write failing detached-lifetime tests**
 
 Assert a detached task can outlive normal root settlement and be awaited from a

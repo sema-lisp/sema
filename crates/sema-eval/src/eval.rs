@@ -2345,4 +2345,125 @@ mod runtime_eval_tests {
             .expect("timeout raises but the producer keeps running");
         assert_eq!(result, lit("(list :timeout 9 55)"));
     }
+
+    // ── Channel gates (Task 04): channel ops routed through the runtime's
+    // canonical ChannelRegistry via the ChannelSend/ChannelRecv/ChannelClose
+    // yield seam. Unlike the earlier async/all|race|timeout channel uses (which
+    // never blocked — the Sema buffer served them synchronously), these gates
+    // exercise cross-task rendezvous, blocking send/recv, and close.
+
+    // GATE 1 — unbuffered rendezvous: a spawned producer sends across tasks and
+    // the main task receives the value.
+    #[test]
+    fn runtime_channel_rendezvous_across_tasks() {
+        let interp = Interpreter::new();
+        let result = interp
+            .eval_str_via_runtime(
+                "(begin \
+                   (define ch (channel/new 1)) \
+                   (async/spawn (fn () (channel/send ch 42))) \
+                   (channel/recv ch))",
+            )
+            .expect("value sent from a spawned task arrives at the receiver");
+        assert_eq!(result, Value::int(42));
+    }
+
+    // GATE 2 — buffered channel: sends up to capacity don't block and receive
+    // preserves FIFO order.
+    #[test]
+    fn runtime_channel_buffered_fifo_order() {
+        let interp = Interpreter::new();
+        let result = interp
+            .eval_str_via_runtime(
+                "(begin \
+                   (define ch (channel/new 3)) \
+                   (channel/send ch 1) (channel/send ch 2) (channel/send ch 3) \
+                   (list (channel/recv ch) (channel/recv ch) (channel/recv ch)))",
+            )
+            .expect("buffered sends receive in FIFO order");
+        assert_eq!(result, lit("(list 1 2 3)"));
+    }
+
+    // GATE 3 — blocking send on a full channel parks the sender until a receiver
+    // takes the value. A capacity-1 channel fed 3 values REQUIRES the sender to
+    // park twice; without parking, values would be lost or error. All three
+    // arrive in order, proving the sender blocked and resumed.
+    #[test]
+    fn runtime_channel_blocking_send_parks_until_received() {
+        let interp = Interpreter::new();
+        let result = interp
+            .eval_str_via_runtime(
+                "(begin \
+                   (define ch (channel/new 1)) \
+                   (define p (async/spawn (fn () \
+                       (channel/send ch 1) (channel/send ch 2) (channel/send ch 3) :done))) \
+                   (define out (list (channel/recv ch) (channel/recv ch) (channel/recv ch))) \
+                   (list out (await p)))",
+            )
+            .expect("a full-channel send parks until the receiver drains it");
+        assert_eq!(result, lit("(list (list 1 2 3) :done)"));
+    }
+
+    // GATE 4 — blocking receive on an empty channel parks the receiver until a
+    // value is sent (the producer sleeps first, so the receiver must park).
+    #[test]
+    fn runtime_channel_blocking_recv_parks_until_sent() {
+        let interp = Interpreter::new();
+        let result = interp
+            .eval_str_via_runtime(
+                "(begin \
+                   (define ch (channel/new 1)) \
+                   (async/spawn (fn () (async/sleep 2) (channel/send ch 77))) \
+                   (channel/recv ch))",
+            )
+            .expect("an empty-channel receive parks until a value is sent");
+        assert_eq!(result, Value::int(77));
+    }
+
+    // GATE 5a — receiving from a closed+empty channel returns the closed sentinel
+    // (nil), after draining any buffered values first. Parity with `eval_str`.
+    #[test]
+    fn runtime_channel_recv_after_close_drains_then_sentinel() {
+        assert_runtime_matches_oracle(
+            "(begin \
+               (define ch (channel/new 2)) \
+               (channel/send ch 1) \
+               (channel/close ch) \
+               (list (channel/recv ch) (channel/recv ch)))",
+        );
+    }
+
+    // GATE 5b — sending to a closed channel raises a catchable condition.
+    #[test]
+    fn runtime_channel_send_to_closed_errors() {
+        let interp = Interpreter::new();
+        let result = interp
+            .eval_str_via_runtime(
+                "(begin \
+                   (define ch (channel/new 1)) \
+                   (channel/close ch) \
+                   (try (channel/send ch 9) (catch e :send-failed)))",
+            )
+            .expect("send to a closed channel raises, caught by try");
+        assert_eq!(result, Value::keyword("send-failed"));
+    }
+
+    // GATE 6 — capacity is validated before allocation: a zero/negative capacity
+    // returns a Sema condition (catchable), never a panic.
+    #[test]
+    fn runtime_channel_rejects_invalid_capacity() {
+        let interp = Interpreter::new();
+        assert_eq!(
+            interp
+                .eval_str_via_runtime("(try (channel/new 0) (catch e :bad-capacity))")
+                .expect("zero capacity is a condition, not a panic"),
+            Value::keyword("bad-capacity"),
+        );
+        assert_eq!(
+            interp
+                .eval_str_via_runtime("(try (channel/new -1) (catch e :bad-capacity))")
+                .expect("negative capacity is a condition, not a panic"),
+            Value::keyword("bad-capacity"),
+        );
+    }
 }

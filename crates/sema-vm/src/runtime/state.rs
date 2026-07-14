@@ -184,6 +184,16 @@ struct RuntimeState {
     /// or — for `Timeout` — the deadline timer). The runtime OBSERVES these
     /// promises and NEVER cancels them.
     promise_set_waits: HashMap<TaskId, PromiseSetWaitState>,
+    /// Bridge from a Sema `Channel` value (by `Rc` pointer identity) to its
+    /// canonical runtime `ChannelId` in `channels`. The Sema channel `Value`
+    /// carries no runtime id, so the first VM-quantum channel op on it allocates
+    /// a registry channel with the Sema channel's capacity and records it here.
+    /// The `Rc` clone pins the address so it is never reused while mapped.
+    channel_bridge: HashMap<usize, (Rc<sema_core::Channel>, sema_core::runtime::ChannelId)>,
+    /// VM-quantum tasks parked on a channel send/receive, mapped to their wait
+    /// key, the backing channel, and whether they are receiving. Woken by a
+    /// `ChannelWake` when a counterpart rendezvous-matches or the channel closes.
+    channel_waits: HashMap<TaskId, (super::WaitKey, sema_core::runtime::ChannelId, bool)>,
     drive_cursor: usize,
     drive_active: bool,
     active_instruction_limit: usize,
@@ -258,6 +268,11 @@ impl Trace for RuntimeState {
                     .iter()
                     .all(|promise| trace_promise(promise, sink))
             })
+            && self.channel_bridge.values().all(|(channel, _)| {
+                let value = sema_core::Value::channel_from_rc(Rc::clone(channel));
+                sink(sema_core::cycle::GcEdge::Value(&value));
+                true
+            })
             && self.pending.iter().all(|stage| stage.trace(sink))
     }
 }
@@ -328,6 +343,8 @@ impl Runtime {
                 spawned_promises: HashMap::new(),
                 promise_waits: HashMap::new(),
                 promise_set_waits: HashMap::new(),
+                channel_bridge: HashMap::new(),
+                channel_waits: HashMap::new(),
                 drive_cursor: 0,
                 drive_active: false,
                 active_instruction_limit: usize::MAX,
@@ -1094,6 +1111,11 @@ impl Runtime {
     }
 
     fn consume_channel_wake(&self, wake: ChannelWake) -> Result<(), RuntimeFault> {
+        // A VM-quantum task parked on `channel/send`/`channel/recv` resumes its VM
+        // frame directly; only the continuation model uses the protocol-wait path.
+        if self.consume_vm_channel_wake(&wake)? {
+            return Ok(());
+        }
         let response = match wake.result {
             super::ChannelResult::Sent => {
                 RuntimeResponse::Send(sema_core::runtime::ChannelSend::Sent)
@@ -1239,6 +1261,22 @@ impl Runtime {
                 YieldReason::AwaitPromiseSet { promises, mode } => {
                     task.vm_call = Some(vm);
                     TaskAction::VmAwaitSet(task_id, promises, mode)
+                }
+                // `channel/send` / `channel/recv` / `channel/close`: park this
+                // frame with a nil placeholder on its stack top; the runtime
+                // routes the op through the canonical ChannelRegistry and resumes
+                // the frame with the received value / send-ack (nil) / close-ack.
+                YieldReason::ChannelSend(channel, value) => {
+                    task.vm_call = Some(vm);
+                    TaskAction::VmChannelSend(task_id, channel, value)
+                }
+                YieldReason::ChannelRecv(channel) => {
+                    task.vm_call = Some(vm);
+                    TaskAction::VmChannelRecv(task_id, channel)
+                }
+                YieldReason::ChannelClose(channel) => {
+                    task.vm_call = Some(vm);
+                    TaskAction::VmChannelClose(task_id, channel)
                 }
                 other => TaskAction::VmResult(
                     task_id,
@@ -1449,6 +1487,13 @@ impl Runtime {
             TaskAction::VmAwaitSet(task_id, promises, mode) => {
                 self.await_promise_set(task_id, promises, mode)?
             }
+            TaskAction::VmChannelSend(task_id, channel, value) => {
+                self.channel_send(task_id, channel, value)?
+            }
+            TaskAction::VmChannelRecv(task_id, channel) => {
+                self.channel_receive(task_id, channel)?
+            }
+            TaskAction::VmChannelClose(task_id, channel) => self.channel_close(task_id, channel)?,
             #[cfg(test)]
             TaskAction::Timer(task_id, deadline) => {
                 let mut state = self.state.borrow_mut();
@@ -2272,6 +2317,226 @@ impl Runtime {
         Ok(())
     }
 
+    /// Resolve a Sema channel value to its canonical runtime `ChannelId`,
+    /// allocating a registry channel (with the Sema channel's capacity) the first
+    /// time a VM-quantum op touches it. The `Rc` is retained in the bridge so its
+    /// pointer identity stays stable and unique for the runtime's lifetime.
+    fn resolve_channel(
+        state: &mut RuntimeState,
+        channel: &Rc<sema_core::Channel>,
+    ) -> Result<sema_core::runtime::ChannelId, RuntimeFault> {
+        let ptr = Rc::as_ptr(channel) as usize;
+        if let Some((_, id)) = state.channel_bridge.get(&ptr) {
+            return Ok(*id);
+        }
+        let id = state
+            .channels
+            .allocate(channel.capacity)
+            .map_err(|_| RuntimeFault::IdExhausted { kind: "channel" })?;
+        state.channel_bridge.insert(ptr, (Rc::clone(channel), id));
+        Ok(id)
+    }
+
+    /// Route a VM-quantum `channel/send` through the ChannelRegistry. Resumes the
+    /// task with nil once the value is buffered/handed to a receiver, or parks it
+    /// until a receiver takes the value when the channel is full.
+    fn channel_send(
+        &self,
+        task_id: TaskId,
+        channel: Rc<sema_core::Channel>,
+        value: sema_core::Value,
+    ) -> Result<(), RuntimeFault> {
+        enum Outcome {
+            Parked,
+            Sent,
+            Closed,
+        }
+        let outcome = {
+            let mut state = self.state.borrow_mut();
+            let id = Self::resolve_channel(&mut state, &channel)?;
+            let key = state
+                .waits
+                .as_ref()
+                .expect("wait runtime installed")
+                .issue_internal_wait()
+                .map_err(|_| RuntimeFault::IdExhausted { kind: "wait" })?;
+            let result = state
+                .channels
+                .send(id, key, task_id, value)
+                .map_err(|error| RuntimeFault::Invariant {
+                    message: format!("channel send failed: {error:?}"),
+                })?;
+            while let Some(wake) = state.channels.pop_wake() {
+                state.pending.push_back(PendingStage::ChannelWake(wake));
+            }
+            match result {
+                super::ChannelResult::Waiting => {
+                    state
+                        .tasks
+                        .get_mut(&task_id)
+                        .ok_or_else(|| RuntimeFault::Invariant {
+                            message: "sending VM task disappeared".into(),
+                        })?
+                        .record
+                        .wait(key)
+                        .map_err(|error| RuntimeFault::Invariant {
+                            message: format!("sending VM task failed to wait: {error:?}"),
+                        })?;
+                    state.channel_waits.insert(task_id, (key, id, false));
+                    Outcome::Parked
+                }
+                super::ChannelResult::Sent => Outcome::Sent,
+                super::ChannelResult::Closed => Outcome::Closed,
+                super::ChannelResult::Received(_) => {
+                    return Err(RuntimeFault::Invariant {
+                        message: "channel send produced a received result".into(),
+                    });
+                }
+            }
+        };
+        match outcome {
+            Outcome::Parked => Ok(()),
+            Outcome::Sent => {
+                self.resume_running_vm(task_id, VmResume::Value(sema_core::Value::nil()))
+            }
+            Outcome::Closed => {
+                self.resume_running_vm(task_id, VmResume::Fail(channel_send_closed_error()))
+            }
+        }
+    }
+
+    /// Route a VM-quantum `channel/recv` through the ChannelRegistry. Resumes the
+    /// task with the received value, with nil when the channel is closed and
+    /// empty (the documented closed sentinel), or parks it until a value arrives.
+    fn channel_receive(
+        &self,
+        task_id: TaskId,
+        channel: Rc<sema_core::Channel>,
+    ) -> Result<(), RuntimeFault> {
+        enum Outcome {
+            Parked,
+            Received(sema_core::Value),
+            Closed,
+        }
+        let outcome = {
+            let mut state = self.state.borrow_mut();
+            let id = Self::resolve_channel(&mut state, &channel)?;
+            let key = state
+                .waits
+                .as_ref()
+                .expect("wait runtime installed")
+                .issue_internal_wait()
+                .map_err(|_| RuntimeFault::IdExhausted { kind: "wait" })?;
+            let result = state.channels.receive(id, key, task_id).map_err(|error| {
+                RuntimeFault::Invariant {
+                    message: format!("channel receive failed: {error:?}"),
+                }
+            })?;
+            while let Some(wake) = state.channels.pop_wake() {
+                state.pending.push_back(PendingStage::ChannelWake(wake));
+            }
+            match result {
+                super::ChannelResult::Waiting => {
+                    state
+                        .tasks
+                        .get_mut(&task_id)
+                        .ok_or_else(|| RuntimeFault::Invariant {
+                            message: "receiving VM task disappeared".into(),
+                        })?
+                        .record
+                        .wait(key)
+                        .map_err(|error| RuntimeFault::Invariant {
+                            message: format!("receiving VM task failed to wait: {error:?}"),
+                        })?;
+                    state.channel_waits.insert(task_id, (key, id, true));
+                    Outcome::Parked
+                }
+                super::ChannelResult::Received(value) => Outcome::Received(value),
+                super::ChannelResult::Closed => Outcome::Closed,
+                super::ChannelResult::Sent => {
+                    return Err(RuntimeFault::Invariant {
+                        message: "channel receive produced a sent result".into(),
+                    });
+                }
+            }
+        };
+        match outcome {
+            Outcome::Parked => Ok(()),
+            Outcome::Received(value) => self.resume_running_vm(task_id, VmResume::Value(value)),
+            Outcome::Closed => {
+                self.resume_running_vm(task_id, VmResume::Value(sema_core::Value::nil()))
+            }
+        }
+    }
+
+    /// Route a VM-quantum `channel/close` through the ChannelRegistry, enqueuing
+    /// wakes for every parked sender/receiver, then resume the task with nil.
+    fn channel_close(
+        &self,
+        task_id: TaskId,
+        channel: Rc<sema_core::Channel>,
+    ) -> Result<(), RuntimeFault> {
+        {
+            let mut state = self.state.borrow_mut();
+            let id = Self::resolve_channel(&mut state, &channel)?;
+            match state.channels.close(id) {
+                Ok(Some(close)) => state.pending.push_back(PendingStage::ChannelClose(close)),
+                Ok(None) => {}
+                Err(error) => {
+                    return Err(RuntimeFault::Invariant {
+                        message: format!("channel close failed: {error:?}"),
+                    });
+                }
+            }
+            while let Some(wake) = state.channels.pop_wake() {
+                state.pending.push_back(PendingStage::ChannelWake(wake));
+            }
+        }
+        self.resume_running_vm(task_id, VmResume::Value(sema_core::Value::nil()))
+    }
+
+    /// Resume a VM-quantum task parked on a channel op with a rendezvous wake. A
+    /// `Sent` ack resumes with nil, a `Received` with the value, and a `Closed`
+    /// with nil (receiver — closed sentinel) or a closed-send error (sender).
+    /// Returns whether the wake targeted a VM-quantum waiter.
+    fn consume_vm_channel_wake(&self, wake: &ChannelWake) -> Result<bool, RuntimeFault> {
+        let mut state = self.state.borrow_mut();
+        let Some((key, _, receive)) = state.channel_waits.get(&wake.task).copied() else {
+            return Ok(false);
+        };
+        if key != wake.key {
+            return Ok(false);
+        }
+        let resume = match &wake.result {
+            super::ChannelResult::Sent => VmResume::Value(sema_core::Value::nil()),
+            super::ChannelResult::Received(value) => VmResume::Value(value.clone()),
+            super::ChannelResult::Closed => {
+                if receive {
+                    VmResume::Value(sema_core::Value::nil())
+                } else {
+                    VmResume::Fail(channel_send_closed_error())
+                }
+            }
+            super::ChannelResult::Waiting => return Ok(true),
+        };
+        state.channel_waits.remove(&wake.task);
+        let task = state
+            .tasks
+            .get_mut(&wake.task)
+            .ok_or_else(|| RuntimeFault::Invariant {
+                message: "channel wake task disappeared".into(),
+            })?;
+        task.record
+            .wake(key)
+            .map_err(|error| RuntimeFault::Invariant {
+                message: format!("channel wake transition failed: {error:?}"),
+            })?;
+        task.vm_resume = Some(resume);
+        let root = task.record.relations().origin_root;
+        state.ready.enqueue(root, wake.task);
+        Ok(true)
+    }
+
     /// Wake any promise-set waiter (`async/all` / `async/race` / `async/timeout`)
     /// whose combinator condition is now satisfied by the settlement of
     /// `promise`. Called from `settle_spawned` after single-promise awaiters are
@@ -2944,6 +3209,13 @@ fn timeout_expired_error() -> sema_core::SemaError {
     sema_core::SemaError::eval("async/timeout: operation timed out")
 }
 
+/// Raised into a parked `channel/send` frame when the channel closes while the
+/// sender is blocked (its value is dropped). The eager `ch.closed` fast-path in
+/// the native handles the already-closed case with the full value message.
+fn channel_send_closed_error() -> sema_core::SemaError {
+    sema_core::SemaError::eval("channel/send: channel is closed")
+}
+
 fn registry_error(error: super::RegistryError) -> sema_core::SemaError {
     sema_core::SemaError::eval(match error {
         super::RegistryError::WrongRuntime => "runtime handle belongs to another runtime",
@@ -3267,6 +3539,15 @@ enum TaskAction {
         Vec<Rc<sema_core::AsyncPromise>>,
         sema_core::PromiseSetKind,
     ),
+    /// `channel/send`: route the send through the ChannelRegistry, parking the
+    /// task (`TaskId`) until a receiver takes the value if the channel is full.
+    VmChannelSend(TaskId, Rc<sema_core::Channel>, sema_core::Value),
+    /// `channel/recv`: route the receive through the ChannelRegistry, parking the
+    /// task (`TaskId`) until a value is available (or the channel closes).
+    VmChannelRecv(TaskId, Rc<sema_core::Channel>),
+    /// `channel/close`: close the backing registry channel, waking parked
+    /// senders/receivers, and resume the task (`TaskId`) with nil.
+    VmChannelClose(TaskId, Rc<sema_core::Channel>),
     #[cfg(test)]
     Timer(TaskId, Instant),
     #[cfg(test)]
@@ -3363,6 +3644,17 @@ impl Trace for TaskAction {
             Self::VmAwait(_, promise) => trace_promise(promise, sink),
             Self::VmAwaitSet(_, promises, _) => {
                 promises.iter().all(|promise| trace_promise(promise, sink))
+            }
+            Self::VmChannelSend(_, channel, value) => {
+                let handle = sema_core::Value::channel_from_rc(Rc::clone(channel));
+                sink(sema_core::cycle::GcEdge::Value(&handle));
+                sink(sema_core::cycle::GcEdge::Value(value));
+                true
+            }
+            Self::VmChannelRecv(_, channel) | Self::VmChannelClose(_, channel) => {
+                let handle = sema_core::Value::channel_from_rc(Rc::clone(channel));
+                sink(sema_core::cycle::GcEdge::Value(&handle));
+                true
             }
             #[cfg(test)]
             Self::NativeCall(_, _) => true,

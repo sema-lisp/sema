@@ -177,7 +177,7 @@ fn handler_shape(params: &Value, handler: &Value) -> Option<HandlerShape> {
         });
     }
 
-    if let Some((closure, _)) = sema_vm::extract_vm_closure(handler) {
+    if let Some((closure, _, _)) = sema_vm::extract_vm_closure(handler) {
         let arity = closure.func.arity as usize;
         // Reconstruct positional names from (slot, name) pairs.
         let mut names: Vec<Option<String>> = vec![None; arity];

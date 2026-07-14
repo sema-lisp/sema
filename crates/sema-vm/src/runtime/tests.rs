@@ -1,19 +1,312 @@
+use std::cell::Cell;
 use std::rc::Rc;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use sema_core::{
     runtime::{
-        CancelReason, CancellationParent, IdCounter, LifetimeOwner, RootId, RuntimeId,
-        RuntimeScopedIdCounter, ScopeId, SettlementSeq, TaskId, TaskOutcome, TaskRelations,
-        WaitGeneration, WaitId,
+        CancelReason, CancellationParent, CompletionDecoder, CompletionKind, ExecutorAttachError,
+        ExecutorDispatch, ExecutorLease, ExecutorShutdown, ExecutorSnapshot, IdCounter, IoExecutor,
+        LifetimeOwner, NativeCallContext, NativeContinuation, NativeOutcome, NativeResult,
+        NativeSuspend, PreparedExternalOperation, ResumeInput, RootId, RunningSubmission,
+        RuntimeId, RuntimeScopedIdCounter, ScopeId, SettlementSeq, SubmissionRejected,
+        SubmitErrorKind, TaskContextHandle, TaskId, TaskOutcome, TaskRelations, Trace,
+        WaitGeneration, WaitId, WaitKind,
     },
     SemaError, Value,
 };
 
 use super::{
+    drive::{BoundedDriver, DriveBudget, RuntimeClock},
     ready::ReadyScheduler,
     root::{RootRecord, RootState, RootTransitionError},
     task::{CancellationRequest, StateName, TaskRecord, TaskTransitionError, WaitKey},
+    timer::TimerQueue,
+    wait::{CompletionRoute, RuntimeCreateError, WaitRuntime},
 };
+
+#[derive(Clone, Copy)]
+enum FakeSubmit {
+    Inline,
+    Reject,
+}
+
+struct FakeLease {
+    mode: FakeSubmit,
+}
+impl ExecutorLease for FakeLease {
+    fn submit(
+        &self,
+        submission: sema_core::runtime::ExecutorSubmission,
+    ) -> Result<RunningSubmission, SubmissionRejected> {
+        let operation = submission.operation_id();
+        if matches!(self.mode, FakeSubmit::Reject) {
+            return Err(submission.reject(SubmitErrorKind::Capacity));
+        }
+        match submission.into_dispatch() {
+            ExecutorDispatch::Blocking(dispatch) => {
+                dispatch.run();
+            }
+            ExecutorDispatch::Async(_) => panic!("test operation is blocking"),
+        }
+        Ok(RunningSubmission::new(operation))
+    }
+    fn snapshot(&self) -> ExecutorSnapshot {
+        ExecutorSnapshot::default()
+    }
+    fn shutdown(&self, _deadline: Instant) -> ExecutorShutdown {
+        ExecutorShutdown::Drained(self.snapshot())
+    }
+}
+
+struct FakeExecutor {
+    mode: FakeSubmit,
+    failure: Option<ExecutorAttachError>,
+}
+impl IoExecutor for FakeExecutor {
+    fn attach_runtime(
+        &self,
+        _runtime_id: RuntimeId,
+    ) -> Result<Arc<dyn ExecutorLease>, ExecutorAttachError> {
+        self.failure.map_or_else(
+            || Ok(Arc::new(FakeLease { mode: self.mode }) as Arc<dyn ExecutorLease>),
+            Err,
+        )
+    }
+    fn snapshot(&self) -> ExecutorSnapshot {
+        ExecutorSnapshot::default()
+    }
+}
+
+struct CountingDecoder(Arc<Mutex<Vec<&'static str>>>);
+impl Trace for CountingDecoder {
+    fn trace(&self, _sink: &mut dyn FnMut(sema_core::cycle::GcEdge<'_>)) -> bool {
+        true
+    }
+}
+impl CompletionDecoder for CountingDecoder {
+    fn decode(
+        self: Box<Self>,
+        _context: &mut NativeCallContext<'_>,
+        result: Result<sema_core::runtime::SendPayload, sema_core::runtime::ExternalFailure>,
+    ) -> Result<Value, SemaError> {
+        self.0.lock().unwrap().push("decode");
+        result
+            .map(|_| Value::int(7))
+            .map_err(|failure| SemaError::eval(failure.message()))
+    }
+}
+struct CountingContinuation(Arc<Mutex<Vec<&'static str>>>);
+impl Trace for CountingContinuation {
+    fn trace(&self, _sink: &mut dyn FnMut(sema_core::cycle::GcEdge<'_>)) -> bool {
+        true
+    }
+}
+impl NativeContinuation for CountingContinuation {
+    fn resume(
+        self: Box<Self>,
+        _context: &mut NativeCallContext<'_>,
+        input: ResumeInput,
+    ) -> NativeResult {
+        self.0.lock().unwrap().push(match input {
+            ResumeInput::Returned(_) => "returned",
+            ResumeInput::Failed(_) => "failed",
+            ResumeInput::Cancelled(_) => "cancelled",
+        });
+        Ok(NativeOutcome::Return(Value::NIL))
+    }
+}
+
+fn external_suspend(events: Arc<Mutex<Vec<&'static str>>>) -> NativeSuspend {
+    let kind = CompletionKind::try_from_raw(1).unwrap();
+    NativeSuspend {
+        wait: WaitKind::External(Box::new(PreparedExternalOperation::quarantined_blocking(
+            kind,
+            Box::new(CountingDecoder(Arc::clone(&events))),
+            sema_core::runtime::QuarantineBound::hard_deadline(Duration::from_secs(1)).unwrap(),
+            || Ok(Box::new(7_i32)),
+        ))),
+        continuation: Box::new(CountingContinuation(events)),
+    }
+}
+
+#[test]
+fn wait_inline_completion_observes_registered_state_then_consumes_owners_once() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let executor = Arc::new(FakeExecutor {
+        mode: FakeSubmit::Inline,
+        failure: None,
+    });
+    let mut runtime = WaitRuntime::new(executor).unwrap();
+    let mut ids = Ids::new();
+    let mut task = task(&mut ids);
+    task.start().unwrap();
+    assert!(runtime
+        .register_external(
+            &mut task,
+            external_suspend(Arc::clone(&events)),
+            TaskContextHandle::default(),
+        )
+        .is_ok());
+    assert_eq!(task.state_name(), StateName::Waiting);
+    assert_eq!(runtime.active_len(), 1);
+
+    assert!(matches!(
+        runtime.drain_one(),
+        Some((CompletionRoute::Active, Some(Ok(NativeOutcome::Return(_)))))
+    ));
+    assert_eq!(&*events.lock().unwrap(), &["decode", "returned"]);
+    assert_eq!(runtime.active_len(), 0);
+    assert!(runtime.drain_one().is_none());
+}
+
+#[test]
+fn wait_submit_rejection_traverses_decoder_then_continuation() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let executor = Arc::new(FakeExecutor {
+        mode: FakeSubmit::Reject,
+        failure: None,
+    });
+    let mut runtime = WaitRuntime::new(executor).unwrap();
+    let mut ids = Ids::new();
+    let mut task = task(&mut ids);
+    task.start().unwrap();
+    let result = runtime.register_external(
+        &mut task,
+        external_suspend(Arc::clone(&events)),
+        TaskContextHandle::default(),
+    );
+    assert!(matches!(result, Err(Ok(NativeOutcome::Return(_)))));
+    assert_eq!(&*events.lock().unwrap(), &["decode", "failed"]);
+    assert_eq!(runtime.active_len(), 0);
+}
+
+#[test]
+fn wait_constructor_preserves_executor_attach_error() {
+    let error = ExecutorAttachError::ShuttingDown;
+    let executor = Arc::new(FakeExecutor {
+        mode: FakeSubmit::Inline,
+        failure: Some(error),
+    });
+    assert_eq!(
+        WaitRuntime::new(executor).err(),
+        Some(RuntimeCreateError::ExecutorAttach(error))
+    );
+}
+
+#[derive(Clone)]
+struct FakeClock {
+    origin: Instant,
+    elapsed: Rc<Cell<Duration>>,
+}
+
+impl FakeClock {
+    fn new() -> Self {
+        Self {
+            origin: Instant::now(),
+            elapsed: Rc::new(Cell::new(Duration::ZERO)),
+        }
+    }
+
+    fn advance(&self, duration: Duration) {
+        self.elapsed.set(self.elapsed.get() + duration);
+    }
+}
+
+impl RuntimeClock for FakeClock {
+    fn now(&self) -> Instant {
+        self.origin + self.elapsed.get()
+    }
+}
+
+#[test]
+fn timer_same_deadline_is_fifo_and_zero_duration_is_immediately_due() {
+    let clock = FakeClock::new();
+    let mut ids = Ids::new();
+    let mut timers = TimerQueue::new();
+    let first = ids.wait_key();
+    let second = ids.wait_key();
+    let zero = ids.wait_key();
+    timers.insert(clock.now() + Duration::from_millis(5), first);
+    timers.insert(clock.now() + Duration::from_millis(5), second);
+    timers.insert(clock.now(), zero);
+
+    assert_eq!(timers.pop_due(clock.now()), Some(zero));
+    clock.advance(Duration::from_millis(5));
+    assert_eq!(timers.pop_due(clock.now()), Some(first));
+    assert_eq!(timers.pop_due(clock.now()), Some(second));
+    assert_eq!(timers.pop_due(clock.now()), None);
+}
+
+#[test]
+fn timer_cancel_removes_only_exact_generation_and_updates_deadline() {
+    let clock = FakeClock::new();
+    let mut ids = Ids::new();
+    let mut timers = TimerQueue::new();
+    let old = ids.wait_key();
+    let replacement = WaitKey {
+        id: old.id,
+        generation: ids.generations.allocate().expect("generation available"),
+    };
+    let absent_generation = ids.generations.allocate().expect("generation available");
+    timers.insert(clock.now() + Duration::from_secs(1), old);
+    timers.insert(clock.now() + Duration::from_secs(2), replacement);
+
+    assert!(!timers.cancel(WaitKey {
+        id: old.id,
+        generation: absent_generation,
+    }));
+    assert!(timers.cancel(old));
+    assert_eq!(
+        timers.next_deadline(),
+        Some(clock.now() + Duration::from_secs(2))
+    );
+    clock.advance(Duration::from_secs(2));
+    assert_eq!(timers.pop_due(clock.now()), Some(replacement));
+}
+
+fn drive_budget(limit: usize) -> DriveBudget {
+    DriveBudget {
+        work_item_limit: std::num::NonZeroUsize::new(limit).unwrap(),
+        completion_limit: std::num::NonZeroUsize::new(3).unwrap(),
+        timer_limit: std::num::NonZeroUsize::new(3).unwrap(),
+        root_visit_limit: std::num::NonZeroUsize::new(2).unwrap(),
+        cleanup_limit: std::num::NonZeroUsize::new(2).unwrap(),
+        instruction_limit_per_task: std::num::NonZeroUsize::new(5).unwrap(),
+        wall_clock_limit: Duration::from_secs(1),
+    }
+}
+
+#[test]
+fn drive_limits_reserve_root_visit_under_completion_and_timer_backlogs() {
+    let clock = FakeClock::new();
+    let mut driver = BoundedDriver::new(Rc::new(clock));
+    driver.add_completions(10);
+    driver.add_timers(10);
+    driver.add_cleanup(10);
+    driver.add_ready_roots(3);
+
+    let report = driver.drive(&drive_budget(5));
+    assert!(report.work_items <= 5);
+    assert_eq!(report.root_visits, 2);
+    assert_eq!(report.completions, 1);
+    assert_eq!(report.timers, 1);
+    assert_eq!(report.cleanup, 1);
+    assert!(report.ready_remaining);
+}
+
+#[test]
+fn drive_limits_wall_clock_is_checked_between_items() {
+    let clock = FakeClock::new();
+    let mut driver = BoundedDriver::new(Rc::new(clock.clone()));
+    driver.add_completions(10);
+    driver.set_after_item(move || clock.advance(Duration::from_millis(2)));
+    let mut budget = drive_budget(10);
+    budget.wall_clock_limit = Duration::from_millis(1);
+
+    let report = driver.drive(&budget);
+    assert_eq!(report.work_items, 1);
+}
 
 struct Ids {
     tasks: IdCounter<TaskId>,

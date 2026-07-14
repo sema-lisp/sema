@@ -78,8 +78,8 @@ impl ExternalFailure {
         Self::new(ExternalFailureCode::BoundExceeded, message)
     }
 
-    #[allow(dead_code)] // Task 03 owns the rejection-to-decoder path.
-    pub(crate) fn rejected() -> Self {
+    /// The runtime-side failure used after an executor rejects an unadmitted submission.
+    pub fn rejected() -> Self {
         Self::new(ExternalFailureCode::Rejected, "external operation rejected")
     }
 

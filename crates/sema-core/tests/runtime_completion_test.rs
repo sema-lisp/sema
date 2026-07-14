@@ -67,7 +67,7 @@ fn delivery_and_attachment_failures_are_structured() {
 }
 
 #[test]
-fn producer_failures_are_limited_to_deadline_and_bound() {
+fn cross_crate_failures_cover_jobs_and_runtime_rejection() {
     assert_eq!(
         ExternalFailure::deadline_exceeded("deadline").code(),
         ExternalFailureCode::DeadlineExceeded
@@ -75,6 +75,12 @@ fn producer_failures_are_limited_to_deadline_and_bound() {
     assert_eq!(
         ExternalFailure::bound_exceeded("bound").code(),
         ExternalFailureCode::BoundExceeded
+    );
+
+    // A downstream runtime synthesizes this only after silent submission rollback.
+    assert_eq!(
+        ExternalFailure::rejected().code(),
+        ExternalFailureCode::Rejected
     );
 }
 

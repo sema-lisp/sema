@@ -1,7 +1,10 @@
+//! Interpreter-owned runtime state and root lifecycle.
+
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::rc::{Rc, Weak};
 use std::sync::Arc;
+use std::time::Instant;
 
 use sema_core::runtime::{
     CancelReason, IdCounter, IoExecutor, NativeOutcome, NativeResult, RootId,
@@ -34,6 +37,21 @@ pub enum RootPoll {
     Pending,
     Ready(Rc<TaskSettlement>),
     RuntimeDropped,
+}
+
+#[derive(Clone, Debug)]
+pub struct ShutdownOptions {
+    pub deadline: Instant,
+    pub drive_budget: DriveBudget,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ShutdownReport {
+    pub clean: bool,
+    pub live_roots: usize,
+    pub live_tasks: usize,
+    pub active_waits: usize,
+    pub retained_cleanup: usize,
 }
 
 pub struct Runtime {
@@ -435,6 +453,47 @@ impl Runtime {
             return false;
         };
         task.record.request_cancellation(reason)
+    }
+
+    pub fn shutdown(&self, options: &ShutdownOptions) -> Result<ShutdownReport, RuntimeFault> {
+        {
+            let mut state = self.state.borrow_mut();
+            state.shutting_down = true;
+            for task in state.tasks.values_mut() {
+                task.record
+                    .request_cancellation(CancelReason::InterpreterShutdown);
+            }
+        }
+        loop {
+            let state = self.drive(&options.drive_budget)?;
+            let now = self.state.borrow().clock.now();
+            if self.state.borrow().tasks.is_empty()
+                || now >= options.deadline
+                || !matches!(state, DriveState::Progress { .. })
+            {
+                break;
+            }
+        }
+        let state = self.state.borrow();
+        let active_waits = state.waits.active_len();
+        let retained_cleanup = state.waits.cleanup_len();
+        let live_tasks = state.tasks.len();
+        Ok(ShutdownReport {
+            clean: live_tasks == 0 && active_waits == 0 && retained_cleanup == 0,
+            live_roots: state.roots.len(),
+            live_tasks,
+            active_waits,
+            retained_cleanup,
+        })
+    }
+
+    pub fn close_for_interpreter_drop(&self) {
+        let mut state = self.state.borrow_mut();
+        state.shutting_down = true;
+        for task in state.tasks.values_mut() {
+            task.record
+                .request_cancellation(CancelReason::InterpreterShutdown);
+        }
     }
 
     #[cfg(test)]

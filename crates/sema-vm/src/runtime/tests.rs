@@ -122,6 +122,28 @@ fn runtime_drive_charges_external_extract_decode_resume_and_apply_stages() {
     assert!(matches!(handle.poll_result(), RootPoll::Ready(_)));
 }
 
+#[test]
+fn runtime_shutdown_rejects_admission_cancels_roots_and_reports_clean() {
+    let clock = Rc::new(FakeClock::new());
+    let runtime = runtime_with_inline_executor(clock.clone());
+    let handle = runtime
+        .submit_test_root(TestPreparedTask::yield_forever())
+        .expect("root admitted");
+    let report = runtime
+        .shutdown(&super::ShutdownOptions {
+            deadline: clock.now() + Duration::from_secs(1),
+            drive_budget: drive_budget(8),
+        })
+        .expect("bounded shutdown");
+    assert!(report.clean);
+    assert_eq!(report.live_tasks, 0);
+    assert!(matches!(handle.poll_result(), RootPoll::Ready(_)));
+    assert!(matches!(
+        runtime.submit_test_root(TestPreparedTask::returned(Value::NIL)),
+        Err(super::SubmitRootError::ShuttingDown)
+    ));
+}
+
 #[derive(Clone, Copy)]
 enum FakeSubmit {
     Inline,

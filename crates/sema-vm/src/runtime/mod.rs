@@ -1,7 +1,7 @@
 mod drive;
 mod ready;
 mod root;
-mod runtime;
+mod state;
 mod task;
 mod timer;
 mod wait;
@@ -10,8 +10,10 @@ pub use drive::{BoundedDriver, DriveBudget, DriveReport, DriveState, RuntimeCloc
 pub use ready::ReadyScheduler;
 pub use root::{RootRecord, RootState, RootTransitionError};
 #[cfg(test)]
-use runtime::TestPreparedTask;
-pub use runtime::{RootHandle, RootPoll, Runtime, RuntimeFault, SubmitRootError};
+use state::TestPreparedTask;
+pub use state::{
+    RootHandle, RootPoll, Runtime, RuntimeFault, ShutdownOptions, ShutdownReport, SubmitRootError,
+};
 pub use task::{
     CancellationRequest, StateName, TaskRecord, TaskState, TaskTransitionError, WaitKey,
 };

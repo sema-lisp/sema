@@ -212,6 +212,51 @@ Expected: promise partition and GC tests pass.
 **Files:** `async_ops.rs`, runtime task/wait/timer files,
 `async_contract_test.rs`
 
+> **PROGRESS (2026-07-14) — `async/sleep` is GREEN end-to-end through the unified
+> runtime.** The first async op runs as a real root through `Runtime`:
+> `(async/sleep ms)` (and `(begin (async/sleep ms) …)`) evaluate via
+> `Interpreter::eval_str_via_runtime` and settle only after the runtime's own
+> timer fires. Gate tests (un-ignored) in `sema-eval` `mod runtime_eval_tests`:
+> `eval_via_runtime_async_sleep_settles_after_timer_fires` and
+> `eval_via_runtime_async_sleep_resumes_and_continues`.
+>
+> **VM suspend seam used.** A native yields from inside a `run_quantum` via the
+> existing TLS yield signal, which the VM already surfaces as
+> `VmExecResult::AsyncYield(YieldReason)` (vm.rs native-dispatch arms; the frame
+> is parked with pc past the call and a nil placeholder on the stack top). The
+> runtime's `visit_ready` VM-quantum arm (state.rs) now handles
+> `AsyncYield(Sleep(ms))`: it keeps the VM parked in `vm_call`, and a new
+> `TaskAction::VmSleep` arms a runtime timer (`TimerQueue` + `issue_internal_wait`
+> + `TaskRecord::wait`). When `fire_timer` wakes the task, the same VM frame
+> resumes in place (the nil placeholder is the resume value). This is the
+> **VM-resumes-itself** model (mirrors the legacy scheduler's
+> `replace_stack_top` + re-run), which is the correct shape for a mid-VM
+> suspension — unlike the native-continuation `NativeOutcome::Suspend` path,
+> whose `Box<dyn NativeContinuation>` would settle the root early rather than
+> continue the program.
+>
+> A ctx-less yielding native detects the runtime via a new thread-local
+> `IN_RUNTIME_QUANTUM` (sema-core `async_signal.rs`), set by
+> `RuntimeQuantumGuard`; `async/sleep` yields when
+> `in_async_context() || in_runtime_quantum()`. Legacy behavior is unchanged
+> (the flag is false off-runtime; `vm_async_test` shows 0 new failures).
+> `eval_str_via_runtime`'s drive loop now waits out `DriveState::Idle`
+> deadlines on the real clock before re-driving.
+>
+> **REMAINING for full Task 2 through the runtime (ordered sub-slices):**
+> 1. `async/sleep` duration-validation RED cases (`sleep_rejects_*`) — reject
+>    negative-before-rounding etc.; gate: `vm_async_test -- sleep_rejects`.
+> 2. `async/spawn` detached task + returned promise on the runtime (needs the
+>    Task 1 four-state promise store threaded into `eval_*_via_runtime`); gate:
+>    un-ignore `eval_via_runtime_async_spawn_is_unsupported_boundary` and replace
+>    it with a spawn/await round-trip.
+> 3. `async/await` as a runtime promise observation (`WaitKind::Promise`), and
+>    `async/cancel` through the cancellation-parent graph.
+> The `NativeOutcome::Suspend(WaitKind::{Promise,PromiseSet,Channel,Timer})` path
+> in `apply_native_outcome` is for natively-implemented suspending ops (async/all
+> etc.); `Timer` there is still routed to the "wait protocol not active" error and
+> is a separate future slice from VM-level sleep.
+
 - [ ] **Step 1: Write failing detached-lifetime tests**
 
 Assert a detached task can outlive normal root settlement and be awaited from a

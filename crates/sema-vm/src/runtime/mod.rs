@@ -1,5 +1,6 @@
 mod channel;
 mod drive;
+mod host;
 mod promise;
 mod ready;
 mod root;
@@ -9,6 +10,7 @@ mod timer;
 mod wait;
 
 pub use drive::{BoundedDriver, DriveBudget, DriveReport, DriveState, RuntimeClock};
+pub use host::{MonotonicClock, NullExecutor};
 pub use ready::ReadyScheduler;
 pub use root::{RootRecord, RootState, RootTransitionError};
 #[cfg(test)]

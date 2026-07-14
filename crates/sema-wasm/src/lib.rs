@@ -2161,6 +2161,9 @@ impl WasmInterpreter {
                 attach_bp_info(self.debug_finished_result(&v))
             }
             Ok(sema_vm::VmExecResult::AsyncYield(_)) => attach_bp_info(self.debug_yielded_result()),
+            Ok(sema_vm::VmExecResult::QuantumExpired { .. }) => {
+                unreachable!("debug execution does not install a runtime quantum")
+            }
             Err(e) => self.debug_maybe_http_error(&e),
         }
     }
@@ -2215,6 +2218,9 @@ impl WasmInterpreter {
                 Ok(sema_vm::VmExecResult::Stopped(info)) => self.debug_stopped_result(&info),
                 Ok(sema_vm::VmExecResult::Yielded) => self.debug_yielded_result(),
                 Ok(sema_vm::VmExecResult::AsyncYield(_)) => self.debug_yielded_result(),
+                Ok(sema_vm::VmExecResult::QuantumExpired { .. }) => {
+                    unreachable!("debug execution does not install a runtime quantum")
+                }
                 Ok(sema_vm::VmExecResult::Finished(v)) => {
                     let result = self.debug_finished_result(&v);
                     *session = None;
@@ -3142,6 +3148,9 @@ impl WasmInterpreter {
                 Ok(sema_vm::VmExecResult::Stopped(info)) => self.debug_stopped_result(&info),
                 Ok(sema_vm::VmExecResult::Yielded) => self.debug_yielded_result(),
                 Ok(sema_vm::VmExecResult::AsyncYield(_)) => self.debug_yielded_result(),
+                Ok(sema_vm::VmExecResult::QuantumExpired { .. }) => {
+                    unreachable!("debug execution does not install a runtime quantum")
+                }
                 Ok(sema_vm::VmExecResult::Finished(v)) => {
                     let result = self.debug_finished_result(&v);
                     *session = None;

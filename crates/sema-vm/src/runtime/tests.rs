@@ -357,6 +357,14 @@ fn synthetic_settlement_exhaustion_is_terminal_and_keeps_one_continuation_fate()
         fates.lock().unwrap().is_empty(),
         "terminal cleanup retains fate"
     );
+    assert_eq!(
+        runtime.drive(&drive_budget(8)),
+        Err(super::RuntimeFault::IdExhausted { kind: "settlement" })
+    );
+    assert!(
+        fates.lock().unwrap().is_empty(),
+        "terminal drive must not resume or drop queued continuation"
+    );
     assert_eq!(runtime.registry_counts_for_test().0, 0);
     assert!(matches!(
         runtime.submit_test_root(TestPreparedTask::returned(Value::NIL)),
@@ -369,7 +377,16 @@ fn synthetic_settlement_exhaustion_is_terminal_and_keeps_one_continuation_fate()
         }),
         Err(super::RuntimeFault::IdExhausted { kind: "settlement" })
     );
-    assert_eq!(fates.lock().unwrap().len(), 1, "one continuation fate");
+    assert_eq!(
+        *fates.lock().unwrap(),
+        vec!["dropped"],
+        "terminal abort drops the continuation exactly once without resuming it"
+    );
+    assert_eq!(
+        runtime.drive(&drive_budget(8)),
+        Err(super::RuntimeFault::IdExhausted { kind: "settlement" })
+    );
+    assert_eq!(*fates.lock().unwrap(), vec!["dropped"]);
 }
 
 #[test]
@@ -401,6 +418,66 @@ fn promise_and_channel_allocator_exhaustion_leave_no_registry_record() {
             runtime.drive(&drive_budget(1)).unwrap();
         }
         assert_eq!(runtime.registry_counts_for_test(), (0, 0), "{kind}");
+    }
+}
+
+#[test]
+fn settled_promise_identity_exhaustion_drops_outcome_outside_state_borrow() {
+    for kind in ["promise", "settlement"] {
+        let clock = Rc::new(FakeClock::new());
+        let runtime = runtime_with_inline_executor(clock.clone());
+        let observed = runtime
+            .submit_test_root(TestPreparedTask::yield_forever())
+            .unwrap();
+        let owner = PollHandleOnDrop(observed.clone());
+        let value = Value::native_fn(sema_core::NativeFn::simple("outcome-drop", move |_| {
+            let _owner = &owner;
+            Ok(Value::NIL)
+        }));
+        let request = sema_core::runtime::RuntimeRequest::CreateSettledPromise {
+            outcome: TaskOutcome::Returned(value),
+            continuation: Box::new(RuntimeResponseContinuation(Arc::new(
+                Mutex::new(Vec::new()),
+            ))),
+        };
+        let request_handle = runtime
+            .submit_test_root(TestPreparedTask::native(Ok(NativeOutcome::Runtime(
+                request,
+            ))))
+            .unwrap();
+        if kind == "settlement" {
+            runtime.force_settlement_exhaustion_for_test();
+        } else {
+            runtime.force_registry_exhaustion_for_test(kind);
+        }
+
+        let drive = runtime.drive(&drive_budget(8));
+        if kind == "settlement" {
+            assert_eq!(
+                drive,
+                Err(super::RuntimeFault::IdExhausted { kind: "settlement" })
+            );
+            assert!(matches!(request_handle.poll_result(), RootPoll::Pending));
+        } else {
+            drive.unwrap();
+            assert!(!matches!(request_handle.poll_result(), RootPoll::Pending));
+        }
+        assert!(matches!(observed.poll_result(), RootPoll::Pending));
+        assert!(observed.cancel(CancelReason::Explicit));
+
+        let shutdown = runtime.shutdown(&super::ShutdownOptions {
+            deadline: clock.now() + Duration::from_secs(1),
+            drive_budget: drive_budget(8),
+        });
+        if kind == "settlement" {
+            assert_eq!(
+                shutdown,
+                Err(super::RuntimeFault::IdExhausted { kind: "settlement" })
+            );
+        } else {
+            shutdown.unwrap();
+        }
+        assert!(!matches!(observed.poll_result(), RootPoll::Pending));
     }
 }
 

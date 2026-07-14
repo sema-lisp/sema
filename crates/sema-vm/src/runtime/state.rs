@@ -293,6 +293,11 @@ impl Runtime {
     }
 
     pub fn drive(&self, budget: &DriveBudget) -> Result<DriveState, RuntimeFault> {
+        let terminal_fault = self.state.borrow().terminal_fault.clone();
+        if let Some(fault) = terminal_fault {
+            while self.cleanup_one() {}
+            return Err(fault);
+        }
         {
             let mut state = self.state.borrow_mut();
             if state.drive_active {
@@ -1043,6 +1048,80 @@ impl Runtime {
                 ));
             return Ok(());
         }
+        if let RuntimeRequest::CreateSettledPromise {
+            outcome,
+            continuation,
+        } = request
+        {
+            let (response, rejected_outcome, terminal_fault) = {
+                let mut state = self.state.borrow_mut();
+                #[cfg(test)]
+                let promise_exhausted = state.force_promise_exhaustion;
+                #[cfg(not(test))]
+                let promise_exhausted = false;
+                if promise_exhausted {
+                    (
+                        Err(sema_core::SemaError::eval(
+                            "runtime promise identity exhausted",
+                        )),
+                        Some(outcome),
+                        None,
+                    )
+                } else if let Ok(promise) = state.promises.reserve_id() {
+                    #[cfg(test)]
+                    let settlement_exhausted = state.force_settlement_exhaustion;
+                    #[cfg(not(test))]
+                    let settlement_exhausted = false;
+                    if let Some(sequence) = (!settlement_exhausted)
+                        .then(|| state.settlement_ids.allocate())
+                        .transpose()
+                        .ok()
+                        .flatten()
+                    {
+                        let settlement = Rc::new(TaskSettlement { sequence, outcome });
+                        state.promises.insert_pending(promise, None);
+                        let wakes = state
+                            .promises
+                            .settle(promise, settlement)
+                            .expect("reserved promise was inserted pending");
+                        if !wakes.is_empty() {
+                            state.pending.push_back(PendingStage::PromiseWakes(wakes));
+                        }
+                        (Ok(RuntimeResponse::Promise(promise)), None, None)
+                    } else {
+                        let fault = RuntimeFault::IdExhausted { kind: "settlement" };
+                        state.shutting_down = true;
+                        state.terminal_fault = Some(fault.clone());
+                        (
+                            Err(sema_core::SemaError::eval(
+                                "runtime settlement identity exhausted",
+                            )),
+                            Some(outcome),
+                            Some(fault),
+                        )
+                    }
+                } else {
+                    (
+                        Err(sema_core::SemaError::eval(
+                            "runtime promise identity exhausted",
+                        )),
+                        Some(outcome),
+                        None,
+                    )
+                }
+            };
+            drop(rejected_outcome);
+            self.state
+                .borrow_mut()
+                .pending
+                .push_back(PendingStage::ApplyRuntimeResponse(
+                    task_id,
+                    owner,
+                    ContinuationFrame::native(continuation),
+                    response,
+                ));
+            return terminal_fault.map_or(Ok(()), Err);
+        }
         let (continuation, response) = {
             let mut state = self.state.borrow_mut();
             match request {
@@ -1067,47 +1146,8 @@ impl Runtime {
                         });
                     (continuation, response)
                 }
-                RuntimeRequest::CreateSettledPromise {
-                    outcome,
-                    continuation,
-                } => {
-                    let response = (|| {
-                        #[cfg(test)]
-                        if state.force_promise_exhaustion {
-                            return Err(sema_core::SemaError::eval(
-                                "runtime promise identity exhausted",
-                            ));
-                        }
-                        let promise = state.promises.reserve_id().map_err(|_| {
-                            sema_core::SemaError::eval("runtime promise identity exhausted")
-                        })?;
-                        #[cfg(test)]
-                        let settlement_exhausted = state.force_settlement_exhaustion;
-                        #[cfg(not(test))]
-                        let settlement_exhausted = false;
-                        let sequence = (!settlement_exhausted)
-                            .then(|| state.settlement_ids.allocate())
-                            .transpose()
-                            .ok()
-                            .flatten()
-                            .ok_or_else(|| {
-                                let fault = RuntimeFault::IdExhausted { kind: "settlement" };
-                                state.shutting_down = true;
-                                state.terminal_fault = Some(fault);
-                                sema_core::SemaError::eval("runtime settlement identity exhausted")
-                            })?;
-                        let settlement = Rc::new(TaskSettlement { sequence, outcome });
-                        state.promises.insert_pending(promise, None);
-                        let wakes = state
-                            .promises
-                            .settle(promise, settlement)
-                            .map_err(registry_error)?;
-                        if !wakes.is_empty() {
-                            state.pending.push_back(PendingStage::PromiseWakes(wakes));
-                        }
-                        Ok(RuntimeResponse::Promise(promise))
-                    })();
-                    (continuation, response)
+                RuntimeRequest::CreateSettledPromise { .. } => {
+                    unreachable!("settled promise extracted before borrow")
                 }
                 RuntimeRequest::InspectPromise {
                     promise,

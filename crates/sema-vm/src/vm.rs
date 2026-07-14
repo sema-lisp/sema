@@ -433,6 +433,8 @@ pub struct VM {
     /// `Weak` guards address reuse — a dead entry (strong count 0) never
     /// matches, even if a fresh env landed on the same address.
     gc_adopted_home: std::cell::RefCell<Weak<Env>>,
+    instruction_budget: Option<usize>,
+    instructions_executed: usize,
 }
 
 thread_local! {
@@ -1032,6 +1034,8 @@ impl VM {
             next_debug_value_ref: DEBUG_VALUE_REF_BASE,
             frame_floor: 0,
             gc_adopted_home: std::cell::RefCell::new(Weak::new()),
+            instruction_budget: None,
+            instructions_executed: 0,
         })
     }
 
@@ -1085,6 +1089,8 @@ impl VM {
             next_debug_value_ref: DEBUG_VALUE_REF_BASE,
             frame_floor: 0,
             gc_adopted_home: std::cell::RefCell::new(Weak::new()),
+            instruction_budget: None,
+            instructions_executed: 0,
         }
     }
 
@@ -1111,6 +1117,8 @@ impl VM {
             next_debug_value_ref: DEBUG_VALUE_REF_BASE,
             frame_floor: 0,
             gc_adopted_home: std::cell::RefCell::new(Weak::new()),
+            instruction_budget: None,
+            instructions_executed: 0,
         })
     }
 
@@ -1183,6 +1191,9 @@ impl VM {
             match step {
                 crate::debug::VmExecResult::Finished(v) => return Ok(v),
                 crate::debug::VmExecResult::Yielded => continue,
+                crate::debug::VmExecResult::QuantumExpired { .. } => {
+                    unreachable!("debug execution does not install a runtime quantum")
+                }
                 crate::debug::VmExecResult::AsyncYield(_) => {
                     return Err(SemaError::eval(
                         "async yield outside of scheduler context".to_string(),
@@ -1495,6 +1506,9 @@ impl VM {
             crate::debug::VmExecResult::Stopped(_) | crate::debug::VmExecResult::Yielded => {
                 unreachable!("Stopped/Yielded without debug state")
             }
+            crate::debug::VmExecResult::QuantumExpired { .. } => {
+                unreachable!("unbounded VM execution cannot exhaust a quantum")
+            }
             crate::debug::VmExecResult::AsyncYield(_) => Err(SemaError::eval(
                 "async yield outside of scheduler context".to_string(),
             )),
@@ -1547,6 +1561,9 @@ impl VM {
             | Ok(crate::debug::VmExecResult::Yielded) => {
                 unreachable!("Stopped/Yielded without debug state")
             }
+            Ok(crate::debug::VmExecResult::QuantumExpired { .. }) => {
+                unreachable!("nested synchronous execution does not install a runtime quantum")
+            }
             Ok(crate::debug::VmExecResult::AsyncYield(_)) => {
                 // Re-entrant HOF callbacks are synchronous; a yield here cannot
                 // be resumed. Roll back the partial nested frames/stack so the
@@ -1577,6 +1594,19 @@ impl VM {
         ctx: &EvalContext,
     ) -> Result<crate::debug::VmExecResult, SemaError> {
         self.run_inner::<false>(ctx, None)
+    }
+
+    /// Resume execution for at most `instruction_limit` bytecode instructions.
+    pub fn run_quantum(
+        &mut self,
+        ctx: &EvalContext,
+        instruction_limit: usize,
+    ) -> Result<crate::debug::VmExecResult, SemaError> {
+        self.instruction_budget = Some(instruction_limit);
+        self.instructions_executed = 0;
+        let result = self.run_inner::<false>(ctx, None);
+        self.instruction_budget = None;
+        result
     }
 
     /// Debug-aware resume of an async task step: like [`run_async`] but with the
@@ -1921,6 +1951,13 @@ impl VM {
                         "VM: program counter out of bounds (pc={pc}, len={code_len})"
                     )));
                 }
+                if self.instruction_budget == Some(self.instructions_executed) {
+                    self.frames[fi].pc = pc;
+                    return Ok(crate::debug::VmExecResult::QuantumExpired {
+                        instructions: self.instructions_executed,
+                    });
+                }
+                self.instructions_executed += 1;
                 let op = unsafe { *code.add(pc) };
                 pc += 1;
 
@@ -5560,6 +5597,39 @@ mod tests {
         vm.setup_for_call(closure, &[Value::int(5)]).unwrap();
         let result = vm.run(&ctx).unwrap();
         assert_eq!(result, Value::int(0));
+    }
+
+    #[test]
+    fn quantum_expiry_preserves_vm_state_across_repeated_resumes() {
+        let env = make_test_env();
+        let ctx = EvalContext::new();
+        let forms = sema_reader::read_many("(let loop ((n 100)) (if (= n 0) n (loop (- n 1))))")
+            .expect("read");
+        let program = compile_program(&forms, None).expect("compile");
+        let mut vm = VM::new(
+            env,
+            program.functions,
+            &program.native_table,
+            program.main_cache_slots,
+        )
+        .expect("vm");
+        vm.setup_for_call(program.closure, &[]).expect("prepare");
+
+        let mut expiries = 0;
+        loop {
+            match vm.run_quantum(&ctx, 7).expect("quantum") {
+                crate::debug::VmExecResult::QuantumExpired { instructions } => {
+                    assert_eq!(instructions, 7);
+                    expiries += 1;
+                }
+                crate::debug::VmExecResult::Finished(value) => {
+                    assert_eq!(value.as_int(), Some(0));
+                    break;
+                }
+                other => panic!("unexpected quantum result: {other:?}"),
+            }
+        }
+        assert!(expiries > 1);
     }
 
     #[test]

@@ -9,11 +9,11 @@ use sema_core::{
     runtime::{
         CancelReason, CancellationParent, CompletionDecoder, CompletionKind, ExecutorAttachError,
         ExecutorDispatch, ExecutorLease, ExecutorShutdown, ExecutorSnapshot, IdCounter,
-        InterruptibleResource, IoExecutor, LifetimeOwner, NativeCallContext, NativeContinuation,
-        NativeOutcome, NativeResult, NativeSuspend, PreparedExternalOperation, ResumeInput, RootId,
-        RunningSubmission, RuntimeId, RuntimeScopedIdCounter, ScopeId, SettlementSeq,
-        SubmissionRejected, SubmitErrorKind, TaskContextHandle, TaskId, TaskOutcome, TaskRelations,
-        Trace, WaitGeneration, WaitId, WaitKind,
+        InterruptibleResource, IoExecutor, LifetimeOwner, NativeCall, NativeCallContext,
+        NativeContinuation, NativeOutcome, NativeResult, NativeSuspend, PreparedExternalOperation,
+        ResumeInput, RootId, RunningSubmission, RuntimeId, RuntimeScopedIdCounter, ScopeId,
+        SettlementSeq, SubmissionRejected, SubmitErrorKind, TaskContextHandle, TaskId, TaskOutcome,
+        TaskRelations, Trace, WaitGeneration, WaitId, WaitKind,
     },
     SemaError, Value,
 };
@@ -150,6 +150,72 @@ fn runtime_drive_charges_external_extract_decode_resume_and_apply_stages() {
     }
     assert_eq!(*events.lock().unwrap(), vec!["decode", "returned"]);
     assert!(matches!(handle.poll_result(), RootPoll::Ready(_)));
+}
+
+struct ChainContinuation {
+    remaining: usize,
+}
+
+impl Trace for ChainContinuation {
+    fn trace(&self, _sink: &mut dyn FnMut(sema_core::cycle::GcEdge<'_>)) -> bool {
+        true
+    }
+}
+
+impl NativeContinuation for ChainContinuation {
+    fn resume(
+        self: Box<Self>,
+        _context: &mut NativeCallContext<'_>,
+        input: ResumeInput,
+    ) -> NativeResult {
+        let ResumeInput::Returned(value) = input else {
+            return Err(SemaError::eval("chain call failed"));
+        };
+        if self.remaining == 0 {
+            return Ok(NativeOutcome::Return(value));
+        }
+        Ok(chain_call(self.remaining - 1))
+    }
+}
+
+fn chain_call(remaining: usize) -> NativeOutcome {
+    NativeOutcome::Call(NativeCall {
+        callable: Value::native_fn(sema_core::NativeFn::simple_result("chain-step", |_args| {
+            Ok(NativeOutcome::Return(Value::int(42)))
+        })),
+        args: Vec::new(),
+        continuation: Box::new(ChainContinuation { remaining }),
+    })
+}
+
+#[test]
+fn continuation_chain_is_traceable_and_bounded_by_drive_work_items() {
+    let runtime = runtime_with_inline_executor(Rc::new(FakeClock::new()));
+    let handle = runtime
+        .submit_test_root(TestPreparedTask::native(Ok(chain_call(12))))
+        .expect("root admitted");
+    let budget = drive_budget(1);
+    let mut turns = 0;
+    while matches!(handle.poll_result(), RootPoll::Pending) {
+        let state = runtime.drive(&budget).expect("bounded continuation turn");
+        assert!(matches!(
+            state,
+            super::DriveState::Progress { work_items: 1, .. }
+        ));
+        assert!(runtime.trace(&mut |_| {}));
+        turns += 1;
+        assert!(turns < 100, "continuation chain must converge");
+    }
+    let RootPoll::Ready(settlement) = handle.poll_result() else {
+        panic!("chain should settle");
+    };
+    assert!(
+        matches!(settlement.outcome, TaskOutcome::Returned(ref value) if value.as_int() == Some(42))
+    );
+    assert!(
+        turns > 12,
+        "each call and continuation transition is charged"
+    );
 }
 
 #[test]

@@ -1,9 +1,34 @@
 use std::rc::Rc;
 
 use sema_core::runtime::{
-    CancelReason, SettlementSeq, TaskId, TaskOutcome, TaskRelations, TaskSettlement, Trace,
-    WaitGeneration, WaitId,
+    CancelReason, NativeContinuation, ResumeInput, SettlementSeq, TaskId, TaskOutcome,
+    TaskRelations, TaskSettlement, Trace, WaitGeneration, WaitId,
 };
+
+/// A suspended native-to-call return edge owned by the task rather than the Rust stack.
+pub struct ContinuationFrame {
+    continuation: Box<dyn NativeContinuation>,
+}
+
+impl ContinuationFrame {
+    pub fn new(continuation: Box<dyn NativeContinuation>) -> Self {
+        Self { continuation }
+    }
+
+    pub fn resume(
+        self,
+        context: &mut sema_core::runtime::NativeCallContext<'_>,
+        input: ResumeInput,
+    ) -> sema_core::runtime::NativeResult {
+        self.continuation.resume(context, input)
+    }
+}
+
+impl Trace for ContinuationFrame {
+    fn trace(&self, sink: &mut dyn FnMut(sema_core::cycle::GcEdge<'_>)) -> bool {
+        self.continuation.trace(sink)
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct WaitKey {

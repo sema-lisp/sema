@@ -404,6 +404,8 @@ pub enum VmExecResult {
     /// Execution yielded after exhausting the instruction budget.
     /// Call `run_cooperative` again to continue.
     Yielded,
+    /// Execution stopped at an opcode boundary after consuming its instruction quantum.
+    QuantumExpired { instructions: usize },
     /// Execution suspended for async yield (channel op, await, sleep).
     AsyncYield(sema_core::YieldReason),
 }

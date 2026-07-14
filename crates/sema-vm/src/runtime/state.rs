@@ -9,9 +9,9 @@ use std::time::Instant;
 #[cfg(test)]
 use sema_core::runtime::ExternalFailure;
 use sema_core::runtime::{
-    CancelReason, ExecutorShutdown, IdCounter, IoExecutor, NativeOutcome, NativeResult, RootId,
-    RuntimeScopedIdCounter, SettlementSeq, TaskContextHandle, TaskId, TaskOutcome, TaskSettlement,
-    Trace,
+    CancelReason, CancellationView, ExecutorShutdown, IdCounter, IoExecutor, NativeCallContext,
+    NativeOutcome, NativeResult, ResumeInput, RootId, RuntimeScopedIdCounter, SettlementSeq,
+    TaskContextHandle, TaskId, TaskOutcome, TaskSettlement, Trace,
 };
 #[cfg(test)]
 use sema_core::runtime::{CancellationParent, LifetimeOwner, TaskRelations};
@@ -20,8 +20,9 @@ use sema_core::EvalContext;
 use sema_core::Value;
 
 use super::{
-    DriveBudget, DriveState, PendingResume, ReadyScheduler, RegisterExternalError, RootRecord,
-    RootState, RuntimeClock, RuntimeCreateError, TaskRecord, TimerQueue, WaitRuntime,
+    ContinuationFrame, DriveBudget, DriveState, PendingResume, ReadyScheduler,
+    RegisterExternalError, RootRecord, RootState, RuntimeClock, RuntimeCreateError, TaskRecord,
+    TimerQueue, WaitRuntime,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -87,6 +88,8 @@ struct RuntimeTask {
     record: TaskRecord,
     payload: TaskPayload,
     pending_resume: Option<PendingResume>,
+    continuations: Vec<ContinuationFrame>,
+    context: TaskContextHandle,
 }
 
 // Task 4 replaces this placeholder with the VM-backed PreparedRoot payload.
@@ -144,6 +147,8 @@ impl Trace for RuntimeTask {
                 .as_ref()
                 .is_none_or(|pending| pending.trace(sink))
             && self.payload.trace(sink)
+            && self.continuations.iter().all(|frame| frame.trace(sink))
+            && self.context.trace(sink)
     }
 }
 
@@ -244,6 +249,8 @@ impl Runtime {
                 record: TaskRecord::new(task, relations),
                 payload: TaskPayload::Test(prepared),
                 pending_resume: None,
+                continuations: Vec::new(),
+                context: TaskContextHandle::default(),
             },
         );
         state.ready.enqueue(root, task);
@@ -708,6 +715,31 @@ impl Runtime {
         task_id: TaskId,
         result: NativeResult,
     ) -> Result<(), RuntimeFault> {
+        let has_continuation = self
+            .state
+            .borrow()
+            .tasks
+            .get(&task_id)
+            .is_some_and(|task| !task.continuations.is_empty());
+        if has_continuation {
+            match result {
+                Ok(NativeOutcome::Return(value)) => {
+                    return self.resume_continuation(task_id, ResumeInput::Returned(value));
+                }
+                Err(error) => {
+                    return self.resume_continuation(task_id, ResumeInput::Failed(error));
+                }
+                other => return self.apply_native_outcome(task_id, other),
+            }
+        }
+        self.apply_native_outcome(task_id, result)
+    }
+
+    fn apply_native_outcome(
+        &self,
+        task_id: TaskId,
+        result: NativeResult,
+    ) -> Result<(), RuntimeFault> {
         let root = self
             .state
             .borrow()
@@ -762,10 +794,68 @@ impl Runtime {
                     }
                 }
             }
-            Ok(NativeOutcome::Call(_)) => Err(RuntimeFault::Invariant {
-                message: "native-to-Sema calls belong to Task 4".into(),
-            }),
+            Ok(NativeOutcome::Call(call)) => {
+                let mut state = self.state.borrow_mut();
+                let eval_context = Rc::clone(&state._context);
+                let task =
+                    state
+                        .tasks
+                        .get_mut(&task_id)
+                        .ok_or_else(|| RuntimeFault::Invariant {
+                            message: "calling task disappeared".into(),
+                        })?;
+                task.continuations
+                    .push(ContinuationFrame::new(call.continuation));
+                let native =
+                    call.callable
+                        .as_native_fn_rc()
+                        .ok_or_else(|| RuntimeFault::Invariant {
+                            message:
+                                "Sema closure continuation execution is deferred to Task 4 Step 4"
+                                    .into(),
+                        })?;
+                let mut task_context = task.context.borrow_mut();
+                let mut context = NativeCallContext {
+                    task_context: &mut task_context,
+                    cancellation: CancellationView::new(false, None),
+                };
+                let result = native.invoke_runtime(&eval_context, &mut context, &call.args);
+                drop(task_context);
+                state
+                    .pending
+                    .push_back(PendingStage::Apply(task_id, result));
+                Ok(())
+            }
         }
+    }
+
+    fn resume_continuation(&self, task_id: TaskId, input: ResumeInput) -> Result<(), RuntimeFault> {
+        let mut state = self.state.borrow_mut();
+        let Some(task) = state.tasks.get_mut(&task_id) else {
+            return Err(RuntimeFault::Invariant {
+                message: "continuation task disappeared".into(),
+            });
+        };
+        let Some(frame) = task.continuations.pop() else {
+            return Err(RuntimeFault::Invariant {
+                message: "continuation frame disappeared".into(),
+            });
+        };
+        let mut task_context = task.context.borrow_mut();
+        let cancellation = task.record.cancellation();
+        let mut context = NativeCallContext {
+            task_context: &mut task_context,
+            cancellation: CancellationView::new(
+                cancellation.is_some(),
+                cancellation.map(|c| c.reason),
+            ),
+        };
+        let resumed = frame.resume(&mut context, input);
+        drop(task_context);
+        state
+            .pending
+            .push_back(PendingStage::Apply(task_id, resumed));
+        Ok(())
     }
 
     fn settle(

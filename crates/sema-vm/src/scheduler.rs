@@ -1236,6 +1236,9 @@ fn run_until_reentrant(
                 debug_paused = true;
             }
             Ok(VmExecResult::Yielded) => {}
+            Ok(VmExecResult::QuantumExpired { .. }) => {
+                task.state = TaskState::Ready;
+            }
             Err(e) => {
                 *task.promise.state.borrow_mut() = PromiseState::Rejected(format!("{e}"));
                 task.state = TaskState::Failed;

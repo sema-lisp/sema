@@ -16,7 +16,8 @@ pub use state::{
     ShutdownReport, SubmitRootError,
 };
 pub use task::{
-    CancellationRequest, StateName, TaskRecord, TaskState, TaskTransitionError, WaitKey,
+    CancellationRequest, ContinuationFrame, StateName, TaskRecord, TaskState, TaskTransitionError,
+    WaitKey,
 };
 pub use timer::TimerQueue;
 pub use wait::{

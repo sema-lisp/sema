@@ -218,6 +218,15 @@ thread_local! {
     /// Whether we are currently executing inside an async task.
     /// Native functions check this to decide between yielding and erroring.
     static IN_ASYNC_CONTEXT: Cell<bool> = const { Cell::new(false) };
+
+    /// Whether a unified-runtime VM quantum is currently executing on this
+    /// thread. Set for the lifetime of one `run_quantum` by the runtime's
+    /// `RuntimeQuantumGuard`. Native functions that yield via the TLS yield
+    /// signal (e.g. `async/sleep`) check this to decide between yielding to the
+    /// runtime and running synchronously — the runtime path installs no legacy
+    /// scheduler, but the VM still surfaces the yield signal as `AsyncYield`,
+    /// which the runtime turns into a native wait (timer/…).
+    static IN_RUNTIME_QUANTUM: Cell<bool> = const { Cell::new(false) };
 }
 
 // ── Yield signal ────────────────────────────────────────────────
@@ -276,6 +285,20 @@ pub fn in_async_context() -> bool {
 /// Set whether we are inside an async task.
 pub fn set_async_context(val: bool) {
     IN_ASYNC_CONTEXT.with(|c| c.set(val));
+}
+
+/// True while a unified-runtime VM quantum is executing on this thread. A
+/// yielding native (`async/sleep`, …) treats this like [`in_async_context`]:
+/// it surfaces the yield signal so the runtime can register a native wait,
+/// rather than running synchronously.
+pub fn in_runtime_quantum() -> bool {
+    IN_RUNTIME_QUANTUM.with(|c| c.get())
+}
+
+/// Set whether a unified-runtime VM quantum is executing on this thread.
+/// Called only by the runtime's `RuntimeQuantumGuard` (enter/drop).
+pub fn set_runtime_quantum(val: bool) {
+    IN_RUNTIME_QUANTUM.with(|c| c.set(val));
 }
 
 // ── Spawn callback ──────────────────────────────────────────────

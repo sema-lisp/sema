@@ -149,6 +149,11 @@ impl EvalContext {
                 "internal error: runtime VM quantum is already active",
             ));
         }
+        // Mirror the per-ctx flag into a thread-local so ctx-less yielding
+        // natives (e.g. `async/sleep`, registered via the value-only ABI) can
+        // detect that they run under the unified runtime and should surface a
+        // yield the runtime will turn into a native wait.
+        crate::set_runtime_quantum(true);
         Ok(RuntimeQuantumGuard { ctx: self })
     }
 
@@ -512,6 +517,7 @@ pub struct RuntimeQuantumGuard<'a> {
 impl Drop for RuntimeQuantumGuard<'_> {
     fn drop(&mut self) {
         self.ctx.runtime_quantum_active.set(false);
+        crate::set_runtime_quantum(false);
     }
 }
 

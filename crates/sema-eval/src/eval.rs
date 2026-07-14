@@ -141,6 +141,83 @@ impl Interpreter {
         self.eval_in_global(expr)
     }
 
+    /// Evaluate a synchronous expression through the unified cooperative runtime
+    /// — the Task 03/04 integration toe-hold. Compiles against this
+    /// interpreter's globals, submits a real VM-backed root, and drives it to
+    /// settlement.
+    ///
+    /// Only synchronous programs are supported here: the runtime is built with a
+    /// `NullExecutor`, so a program that suspends on I/O cannot progress and is
+    /// reported as an error. Async programs still use `eval`. A single
+    /// interpreter-owned, shared-context runtime (`ctx: Rc<EvalContext>` with
+    /// proper drop ordering, constructed once) is the next integration slice.
+    pub fn eval_via_runtime(&self, expr: &Value) -> EvalResult {
+        use sema_vm::runtime::{
+            DriveBudget, DriveState, MonotonicClock, NullExecutor, RootPoll, Runtime,
+        };
+
+        let exprs = std::slice::from_ref(expr);
+        let expanded = expand_for_vm_batch(&self.ctx, &self.global_env, exprs)?;
+        let known_natives = collect_native_names(&self.global_env);
+        let span_map = self.ctx.span_table.borrow().clone();
+        let prog = sema_vm::compile_program_with_spans_and_natives(
+            &expanded,
+            &span_map,
+            None,
+            Some(known_natives),
+        )?;
+        let mut vm = sema_vm::VM::new(
+            self.global_env.clone(),
+            prog.functions,
+            &prog.native_table,
+            prog.main_cache_slots,
+        )?;
+        vm.seed_main_frame(prog.closure);
+
+        let runtime = Runtime::new(
+            Rc::new(EvalContext::new()),
+            Rc::new(MonotonicClock),
+            std::sync::Arc::new(NullExecutor),
+        )
+        .map_err(|e| SemaError::eval(format!("runtime init failed: {e:?}")))?;
+        let handle = runtime
+            .submit_root(vm)
+            .map_err(|e| SemaError::eval(format!("root submission failed: {e:?}")))?;
+
+        let budget = DriveBudget::host_default();
+        loop {
+            match handle.poll_result() {
+                RootPoll::Ready(settlement) => {
+                    return match &settlement.outcome {
+                        sema_core::runtime::TaskOutcome::Returned(value) => Ok(value.clone()),
+                        sema_core::runtime::TaskOutcome::Failed(error) => Err(error.clone()),
+                        sema_core::runtime::TaskOutcome::Cancelled(reason) => {
+                            Err(SemaError::eval(format!("evaluation cancelled: {reason:?}")))
+                        }
+                    };
+                }
+                RootPoll::Pending => {}
+                RootPoll::Aborted(fault) => {
+                    return Err(SemaError::eval(format!("root aborted: {fault:?}")));
+                }
+                RootPoll::RuntimeDropped | RootPoll::InvariantViolation => {
+                    return Err(SemaError::eval("runtime invariant violation"));
+                }
+            }
+            match runtime
+                .drive(&budget)
+                .map_err(|e| SemaError::eval(format!("runtime fault: {e:?}")))?
+            {
+                DriveState::Progress { .. } => {}
+                _ => {
+                    return Err(SemaError::eval(
+                        "eval_via_runtime: root did not settle (async/IO is not supported on the synchronous runtime path)",
+                    ));
+                }
+            }
+        }
+    }
+
     /// Parse and evaluate on the VM (global env; `define`s persist — see `eval`).
     pub fn eval_str(&self, input: &str) -> EvalResult {
         self.eval_str_in_global(input)
@@ -1838,4 +1915,37 @@ fn gc_stats_btree(stats: &sema_core::GcStats) -> BTreeMap<Value, Value> {
 
 fn gc_stats_map(stats: &sema_core::GcStats) -> Value {
     Value::map(gc_stats_btree(stats))
+}
+
+#[cfg(test)]
+mod runtime_eval_tests {
+    use super::*;
+
+    #[test]
+    fn eval_via_runtime_evaluates_a_synchronous_expression() {
+        // Acceptance gate: a real interpreter routes a synchronous eval through
+        // the unified runtime and returns the correct value.
+        let interp = Interpreter::new();
+        let (exprs, _spans) = sema_reader::read_many_with_spans("(+ 1 2)").expect("parse");
+        let result = interp.eval_via_runtime(&exprs[0]).expect("eval");
+        assert_eq!(result, Value::int(3));
+    }
+
+    // Pending the Task 04 native-ABI migration: calling a user function whose
+    // body invokes a native (`*`) re-enters the evaluator through the legacy
+    // `call_value` callback, which the runtime correctly REJECTS inside a
+    // quantum ("legacy native callback cannot re-enter a VM during an active
+    // runtime quantum"). Native/higher-order calls must move to
+    // `NativeOutcome::Call` before this passes — that is the next slice.
+    #[test]
+    #[ignore = "blocked on Task 04 NativeOutcome::Call migration of legacy native callbacks"]
+    fn eval_via_runtime_shares_interpreter_globals() {
+        let interp = Interpreter::new();
+        interp
+            .eval_str("(define (double x) (* x 2))")
+            .expect("define");
+        let (exprs, _spans) = sema_reader::read_many_with_spans("(double 21)").expect("parse");
+        let result = interp.eval_via_runtime(&exprs[0]).expect("eval");
+        assert_eq!(result, Value::int(42));
+    }
 }

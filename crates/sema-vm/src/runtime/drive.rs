@@ -18,6 +18,24 @@ pub struct DriveBudget {
     pub wall_clock_limit: Duration,
 }
 
+impl DriveBudget {
+    /// A generous per-turn budget for a host that drives one interpreter root to
+    /// settlement in a loop (root_visit_limit stays well below work_item_limit so
+    /// other sources are never starved).
+    pub fn host_default() -> Self {
+        let n = |v: usize| NonZeroUsize::new(v).expect("nonzero budget");
+        Self {
+            work_item_limit: n(4096),
+            completion_limit: n(256),
+            timer_limit: n(256),
+            root_visit_limit: n(64),
+            cleanup_limit: n(64),
+            instruction_limit_per_task: n(1_000_000),
+            wall_clock_limit: Duration::from_secs(10),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DriveState {
     Progress {

@@ -859,14 +859,6 @@ fn runtime_persistent_reap_diagnostic_survives_and_shutdown_is_not_clean() {
     );
     assert!(handle.cancel(CancelReason::Explicit));
     runtime.drive(&drive_budget(8)).unwrap();
-    let diagnostics = runtime.cleanup_diagnostics_for_test();
-    assert_eq!(diagnostics.len(), 1);
-    assert!(diagnostics[0].reap_attempts > 0);
-    assert_eq!(
-        diagnostics[0].last_error.as_deref(),
-        Some("resource cancellation hook failed: cancel failed")
-    );
-
     clock.advance(Duration::from_secs(2));
     let report = runtime
         .shutdown(&super::ShutdownOptions {
@@ -876,7 +868,59 @@ fn runtime_persistent_reap_diagnostic_survives_and_shutdown_is_not_clean() {
         .unwrap();
     assert!(!report.clean);
     assert_eq!(report.retained_cleanup, 1);
+    assert_eq!(report.cleanup_diagnostics.len(), 1);
+    let diagnostic = &report.cleanup_diagnostics[0];
+    assert!(diagnostic.reap_attempts > 0);
+    assert_eq!(diagnostic.operation.get(), 1);
+    assert_eq!(diagnostic.resource, "recording");
+    assert_eq!(
+        diagnostic.suppressed_hook_error.as_deref(),
+        Some("resource cancellation hook failed: cancel failed")
+    );
+    assert_eq!(report.invariant_failures.len(), 1);
+    assert_eq!(report.invariant_failures[0].name, "retained-cleanup");
+    assert_eq!(report.invariant_failures[0].diagnostic, *diagnostic);
     assert!(calls.lock().unwrap().starts_with(&["cancel", "reap"]));
+}
+
+#[test]
+fn runtime_timer_sequence_exhaustion_leaves_task_running_and_no_timer() {
+    let clock = Rc::new(FakeClock::new());
+    let runtime = runtime_with_inline_executor(clock.clone());
+    runtime
+        .submit_test_root(TestPreparedTask::timer_returned(
+            clock.now() + Duration::from_secs(1),
+            Value::NIL,
+        ))
+        .unwrap();
+    runtime.force_timer_failure_for_test("sequence");
+
+    assert_eq!(
+        runtime.drive(&drive_budget(8)),
+        Err(super::RuntimeFault::IdExhausted { kind: "timer" })
+    );
+    assert_eq!(runtime.only_task_state_for_test(), StateName::Running);
+    assert_eq!(runtime.timer_count_for_test(), 0);
+}
+
+#[test]
+fn runtime_duplicate_timer_key_leaves_task_running_and_no_timer() {
+    let clock = Rc::new(FakeClock::new());
+    let runtime = runtime_with_inline_executor(clock.clone());
+    runtime
+        .submit_test_root(TestPreparedTask::timer_returned(
+            clock.now() + Duration::from_secs(1),
+            Value::NIL,
+        ))
+        .unwrap();
+    runtime.force_timer_failure_for_test("duplicate");
+
+    assert_eq!(
+        runtime.drive(&drive_budget(8)),
+        Err(super::RuntimeFault::IdExhausted { kind: "timer" })
+    );
+    assert_eq!(runtime.only_task_state_for_test(), StateName::Running);
+    assert_eq!(runtime.timer_count_for_test(), 0);
 }
 
 #[test]

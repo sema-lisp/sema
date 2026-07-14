@@ -50,7 +50,7 @@ pub struct ShutdownOptions {
     pub drive_budget: DriveBudget,
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ShutdownReport {
     pub clean: bool,
     pub live_roots: usize,
@@ -58,6 +58,14 @@ pub struct ShutdownReport {
     pub active_waits: usize,
     pub retained_cleanup: usize,
     pub executor: Option<ExecutorShutdown>,
+    pub cleanup_diagnostics: Vec<super::CleanupDiagnostic>,
+    pub invariant_failures: Vec<ShutdownInvariantFailure>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ShutdownInvariantFailure {
+    pub name: &'static str,
+    pub diagnostic: super::CleanupDiagnostic,
 }
 
 pub struct Runtime {
@@ -661,17 +669,20 @@ impl Runtime {
                     .expect("wait runtime installed")
                     .issue_internal_wait()
                     .map_err(|_| RuntimeFault::IdExhausted { kind: "wait" })?;
-                state
+                if !state.timers.insert(deadline, key) {
+                    return Err(RuntimeFault::IdExhausted { kind: "timer" });
+                }
+                if let Err(error) = state
                     .tasks
                     .get_mut(&task_id)
                     .expect("timer task exists")
                     .record
                     .wait(key)
-                    .map_err(|error| RuntimeFault::Invariant {
+                {
+                    state.timers.cancel(key);
+                    return Err(RuntimeFault::Invariant {
                         message: format!("timer task failed to wait: {error:?}"),
-                    })?;
-                if !state.timers.insert(deadline, key) {
-                    return Err(RuntimeFault::IdExhausted { kind: "timer" });
+                    });
                 }
             }
             #[cfg(test)]
@@ -885,6 +896,17 @@ impl Runtime {
         let state = self.state.borrow();
         let active_waits = state.waits.as_ref().map_or(0, WaitRuntime::active_len);
         let retained_cleanup = state.waits.as_ref().map_or(0, WaitRuntime::cleanup_len);
+        let cleanup_diagnostics = state.waits.as_ref().map_or_else(Vec::new, |waits| {
+            waits.cleanup_diagnostics_at(state.clock.now())
+        });
+        let invariant_failures = cleanup_diagnostics
+            .iter()
+            .cloned()
+            .map(|diagnostic| ShutdownInvariantFailure {
+                name: "retained-cleanup",
+                diagnostic,
+            })
+            .collect();
         let live_tasks = state.tasks.len();
         let mut report = ShutdownReport {
             clean: live_tasks == 0 && active_waits == 0 && retained_cleanup == 0,
@@ -893,6 +915,8 @@ impl Runtime {
             active_waits,
             retained_cleanup,
             executor: None,
+            cleanup_diagnostics,
+            invariant_failures,
         };
         drop(state);
         let lease = self
@@ -966,6 +990,18 @@ impl Runtime {
     #[cfg(test)]
     pub(super) fn task_count(&self) -> usize {
         self.state.borrow().tasks.len()
+    }
+
+    #[cfg(test)]
+    pub(super) fn only_task_state_for_test(&self) -> super::StateName {
+        let state = self.state.borrow();
+        state
+            .tasks
+            .values()
+            .next()
+            .expect("one task")
+            .record
+            .state_name()
     }
 
     #[cfg(test)]
@@ -1051,6 +1087,16 @@ impl Runtime {
     #[cfg(test)]
     pub(super) fn force_settlement_exhaustion_for_test(&self) {
         self.state.borrow_mut().force_settlement_exhaustion = true;
+    }
+
+    #[cfg(test)]
+    pub(super) fn force_timer_failure_for_test(&self, kind: &str) {
+        let mut state = self.state.borrow_mut();
+        match kind {
+            "sequence" => state.timers.force_sequence_exhaustion_for_test(),
+            "duplicate" => state.timers.force_duplicate_for_test(),
+            _ => panic!("unknown timer failure kind: {kind}"),
+        }
     }
 
     #[cfg(test)]

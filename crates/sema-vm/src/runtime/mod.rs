@@ -12,7 +12,8 @@ pub use root::{RootRecord, RootState, RootTransitionError};
 #[cfg(test)]
 use state::TestPreparedTask;
 pub use state::{
-    RootHandle, RootPoll, Runtime, RuntimeFault, ShutdownOptions, ShutdownReport, SubmitRootError,
+    RootHandle, RootPoll, Runtime, RuntimeFault, ShutdownInvariantFailure, ShutdownOptions,
+    ShutdownReport, SubmitRootError,
 };
 pub use task::{
     CancellationRequest, StateName, TaskRecord, TaskState, TaskTransitionError, WaitKey,

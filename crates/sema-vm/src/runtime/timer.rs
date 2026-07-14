@@ -8,6 +8,8 @@ pub struct TimerQueue {
     deadlines: BTreeMap<(Instant, u64), WaitKey>,
     reverse: HashMap<WaitKey, (Instant, u64)>,
     next_sequence: u64,
+    #[cfg(test)]
+    reject_next_insert_as_duplicate: bool,
 }
 
 impl TimerQueue {
@@ -16,6 +18,10 @@ impl TimerQueue {
     }
 
     pub fn insert(&mut self, deadline: Instant, key: WaitKey) -> bool {
+        #[cfg(test)]
+        if std::mem::take(&mut self.reject_next_insert_as_duplicate) {
+            return false;
+        }
         if self.reverse.contains_key(&key) {
             return false;
         }
@@ -61,5 +67,15 @@ impl TimerQueue {
 
     pub fn scheduled_len(&self) -> usize {
         self.reverse.len()
+    }
+
+    #[cfg(test)]
+    pub fn force_sequence_exhaustion_for_test(&mut self) {
+        self.next_sequence = u64::MAX;
+    }
+
+    #[cfg(test)]
+    pub fn force_duplicate_for_test(&mut self) {
+        self.reject_next_insert_as_duplicate = true;
     }
 }

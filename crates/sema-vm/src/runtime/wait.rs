@@ -84,8 +84,11 @@ struct CleanupEntry {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CleanupDiagnostic {
     pub wait: WaitKey,
+    pub operation: OperationId,
+    pub resource: String,
     pub reap_attempts: usize,
     pub last_error: Option<String>,
+    pub suppressed_hook_error: Option<String>,
     pub quarantine: bool,
     pub bound_expired: bool,
 }
@@ -562,8 +565,11 @@ impl WaitRuntime {
             .iter()
             .map(|(wait, entry)| CleanupDiagnostic {
                 wait: *wait,
+                operation: entry.operation_id,
+                resource: entry.resource.kind().to_owned(),
                 reap_attempts: entry.reap_attempts,
                 last_error: entry.last_error.clone(),
+                suppressed_hook_error: entry.last_error.clone(),
                 quarantine: entry.quarantine,
                 bound_expired: cleanup_bound_expired(entry, now),
             })

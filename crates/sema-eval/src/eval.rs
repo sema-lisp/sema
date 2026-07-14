@@ -2146,8 +2146,7 @@ mod runtime_eval_tests {
     #[test]
     fn runtime_await_rejected_spawn_settles_failed() {
         let interp = Interpreter::new();
-        let result =
-            interp.eval_str_via_runtime("(await (async/spawn (fn () (error \"boom\"))))");
+        let result = interp.eval_str_via_runtime("(await (async/spawn (fn () (error \"boom\"))))");
         let msg = format!("{}", result.expect_err("await of a raising task must fail"));
         assert!(msg.contains("boom"), "missing cause: {msg}");
     }
@@ -2215,22 +2214,26 @@ mod runtime_eval_tests {
                     (await p))",
         );
         // The exact error text is not load-bearing; the point is it RETURNS.
-        assert!(result.is_err(), "deadlock must surface as Err, got {result:?}");
+        assert!(
+            result.is_err(),
+            "deadlock must surface as Err, got {result:?}"
+        );
     }
 
-    // BUG (verifier finding): catchability of an await rejection is
-    // TIMING-DEPENDENT. When the awaited promise is still Pending at the moment
-    // `async/await` runs, the root parks and is resumed via `VmResume::Fail`
-    // (state.rs visit_ready), which SETTLES the whole task Failed instead of
-    // injecting a catchable Sema error into the parked frame — so an enclosing
-    // `try`/`catch` is bypassed. (The same program IS catchable when the child
-    // happens to settle before the await runs, hitting the native's
-    // already-Rejected fast path.) A rejected await should be catchable
-    // regardless of scheduling order.
+    // Catchability of an await rejection must NOT be timing-dependent. When the
+    // awaited promise is still Pending at the moment `async/await` runs, the
+    // root parks and is later resumed via `VmResume::Fail` (state.rs
+    // visit_ready). That resume now RAISES the error at the parked call site (as
+    // if the awaiting native returned `Err`) rather than settling the whole task
+    // Failed — so an enclosing `try`/`catch` catches it, identical to the
+    // already-settled fast path (native's Rejected branch in async_ops.rs). Both
+    // scheduling orders (child sleeps first, so the await genuinely parks on a
+    // pending promise) must behave the same. An UNCAUGHT rejection still settles
+    // the root Failed with the real error.
     #[test]
-    #[ignore = "BUG: pending-then-rejected await is uncatchable (VmResume::Fail settles the task, bypassing try/catch)"]
     fn runtime_await_pending_rejection_is_catchable() {
         let interp = Interpreter::new();
+        // Pending-then-rejected await, wrapped in try/catch → catchable.
         let result = interp
             .eval_str_via_runtime(
                 "(try (await (async/spawn (fn () (async/sleep 2) (error \"x\")))) \
@@ -2241,6 +2244,16 @@ mod runtime_eval_tests {
             result,
             Value::string("caught"),
             "a rejected await must be catchable regardless of timing"
+        );
+
+        // Uncaught pending-then-rejected await → still settles Failed with the
+        // real error (the fix must not swallow uncaught rejections).
+        let uncaught = interp
+            .eval_str_via_runtime("(await (async/spawn (fn () (async/sleep 2) (error \"boom\"))))");
+        let err = uncaught.expect_err("an uncaught rejected await must settle Failed");
+        assert!(
+            err.to_string().contains("boom"),
+            "uncaught rejection must carry the real error, got: {err}"
         );
     }
 }

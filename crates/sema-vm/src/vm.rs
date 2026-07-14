@@ -479,6 +479,17 @@ pub struct VM {
     gc_adopted_home: std::cell::RefCell<Weak<Env>>,
     instruction_budget: Option<usize>,
     instructions_executed: usize,
+    /// Pending error to raise into a parked frame on the next `run_inner`.
+    ///
+    /// The value-resume path (`replace_stack_top`) resumes a frame parked on an
+    /// `AsyncYield` by injecting the awaited value onto its stack top. This is
+    /// the rejection counterpart: when the awaited promise settled Failed, the
+    /// runtime arms this so the next dispatch entry raises the error at the
+    /// parked call site — exactly as if the yielding native had returned
+    /// `Err(error)` — routing it through the normal exception machinery so an
+    /// enclosing `try`/`catch` can handle it (and, if uncaught, it propagates
+    /// out of `run_quantum` as an ordinary `Err`).
+    pending_resume_error: Option<SemaError>,
 }
 
 impl sema_core::runtime::Trace for VM {
@@ -1135,6 +1146,7 @@ impl VM {
             gc_adopted_home: std::cell::RefCell::new(Weak::new()),
             instruction_budget: None,
             instructions_executed: 0,
+            pending_resume_error: None,
         })
     }
 
@@ -1194,6 +1206,7 @@ impl VM {
             gc_adopted_home: std::cell::RefCell::new(Weak::new()),
             instruction_budget: None,
             instructions_executed: 0,
+            pending_resume_error: None,
         }
     }
 
@@ -1222,6 +1235,7 @@ impl VM {
             gc_adopted_home: std::cell::RefCell::new(Weak::new()),
             instruction_budget: None,
             instructions_executed: 0,
+            pending_resume_error: None,
         })
     }
 
@@ -1762,6 +1776,18 @@ impl VM {
         }
     }
 
+    /// Arm a rejection resume for a frame parked on an `AsyncYield`.
+    ///
+    /// Rejection counterpart to [`replace_stack_top`]: instead of injecting a
+    /// value onto the parked frame's stack top, the next `run_inner` raises
+    /// `err` at the parked call site — as if the yielding native had returned
+    /// `Err(err)` — so the VM's exception machinery (try/catch, exception
+    /// tables) runs. Handled → the frame resumes in its catch handler; uncaught
+    /// → the error propagates out of `run_quantum` as an ordinary `Err`.
+    pub fn resume_with_error(&mut self, err: SemaError) {
+        self.pending_resume_error = Some(err);
+    }
+
     /// Execute a closure and return the raw VmExecResult (for async scheduler).
     pub fn execute_async(
         &mut self,
@@ -2011,6 +2037,32 @@ impl VM {
         // is kept pointing at the running frame's home env (below); this
         // immutable snapshot is the fallback for `None` closures (M1).
         let base_globals = self.globals.clone();
+
+        // Rejection resume: a frame parked on an `AsyncYield` is being re-run
+        // because its awaited promise settled Failed. The park left a nil
+        // placeholder on the stack top (the awaited value's slot) and advanced
+        // pc past the yielding call. Discard that placeholder and raise the
+        // error at the parked call site, mirroring the native-`Err` path
+        // (`handle_err!` → `handle_exception`): if a handler catches it the
+        // frame resumes in its `catch`; otherwise it propagates out as `Err`.
+        // `failing_pc` is `pc - 1` so the exception-table lookup lands inside
+        // the (half-open) call instruction interval rather than at the resume
+        // pc just past it — the same adjustment `handle_exception` applies when
+        // unwinding into a parent frame.
+        if let Some(err) = self.pending_resume_error.take() {
+            if !self.stack.is_empty() {
+                self.stack.pop();
+            }
+            let failing_pc = self
+                .frames
+                .last()
+                .map(|f| f.pc.saturating_sub(1))
+                .unwrap_or(0);
+            match self.handle_exception(err, failing_pc)? {
+                ExceptionAction::Handled => {}
+                ExceptionAction::Propagate(e) => return Err(e),
+            }
+        }
 
         // Two-level dispatch: outer loop caches frame locals, inner loop dispatches opcodes.
         // We only break to the outer loop when frames change (Call/TailCall/Return/exceptions).

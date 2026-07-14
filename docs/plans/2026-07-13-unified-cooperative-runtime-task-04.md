@@ -246,11 +246,9 @@ Expected: promise partition and GC tests pass.
 > **REMAINING for full Task 2 through the runtime (ordered sub-slices):**
 > 1. `async/sleep` duration-validation RED cases (`sleep_rejects_*`) — reject
 >    negative-before-rounding etc.; gate: `vm_async_test -- sleep_rejects`.
-> 3. `async/cancel` through the cancellation-parent graph; try/catch *around* an
->    `await` of a rejected spawned promise (an uncaught rejection currently
->    settles the awaiting root Failed — correct for propagation, but the error is
->    injected by settling the task rather than raised inside the parked frame, so
->    a Sema `try` wrapping the `await` cannot yet catch it).
+> 3. `async/cancel` through the cancellation-parent graph. **(DONE 2026-07-15:
+>    try/catch *around* an `await` of a rejected spawned promise is now catchable
+>    regardless of scheduling order — see the rejected-await note below.)**
 > The `NativeOutcome::Suspend(WaitKind::{Promise,PromiseSet,Channel,Timer})` path
 > in `apply_native_outcome` is for natively-implemented suspending ops (async/all
 > etc.); `Timer` there is still routed to the "wait protocol not active" error and
@@ -284,10 +282,30 @@ Expected: promise partition and GC tests pass.
 > - A detached task's completion routes through `settle_task` → `settle_spawned`
 >   (fills the Sema promise state, wakes every awaiter with the value or the
 >   rejection/cancellation), instead of settling a root. Await failures are
->   applied as `VmResume::Fail` (settling the parked task).
+>   applied as `VmResume::Fail`, which now RAISES the error inside the parked
+>   frame (see the rejected-await note below) rather than settling the task.
 > No new drive-loop work source is needed: a pending promise always has a
 > live Ready/Waiting settler task (or is already settled), so the existing
 > timer-idle handling in `eval_str_via_runtime`'s drive loop covers gate 3.
+>
+> **REJECTED-AWAIT IS UNIFORMLY CATCHABLE (2026-07-15).** A rejected `await` now
+> raises an ORDINARY catchable Sema error inside the parked frame, regardless of
+> whether the awaited promise was still Pending or already-settled when `await`
+> ran. Previously the `VmResume::Fail` arm in `visit_ready` (`runtime/state.rs`)
+> dropped the parked `vm_call` and settled the task Failed, tearing down the VM
+> stack WITHOUT running its exception machinery — so a `try`/`catch` around the
+> `await` was bypassed only when the promise happened to still be pending (the
+> already-settled case hit the native's `Rejected` fast path in `async_ops.rs`
+> and returned a normal VM error). The fix: `VM::resume_with_error` (sema-vm
+> `vm.rs`) arms a `pending_resume_error`; the next `run_inner` discards the parked
+> nil placeholder and calls `handle_exception` at the parked call site — the exact
+> behavior of the native-`Err` path (`handle_err!`). The `VmResume::Fail` arm now
+> re-runs the parked frame via the shared `run_parked_quantum` helper with the
+> error armed, instead of settling directly. Handled → the frame resumes in its
+> `catch`; uncaught → the error surfaces as `Err` out of `run_quantum` and the
+> normal `TaskAction::VmResult(Err)` path settles the task Failed (uncaught
+> behavior unchanged). Gate: `runtime_await_pending_rejection_is_catchable` in
+> `sema-eval` `mod runtime_eval_tests` (asserts both catchable and uncaught-Failed).
 
 - [ ] **Step 1: Write failing detached-lifetime tests**
 

@@ -1105,6 +1105,92 @@ impl Runtime {
         Ok(())
     }
 
+    /// Run one quantum of a parked VM frame and map its outcome to a
+    /// `TaskAction`. The caller has already applied any resume (a stack-top
+    /// value via `replace_stack_top`, or a rejection armed via
+    /// `resume_with_error`) to `vm`. On a cooperative stop (quantum expiry or an
+    /// async yield) the VM is stashed back into `task.vm_call`; on completion or
+    /// error the task's return owner is settled with the value/error.
+    fn run_parked_quantum(
+        &self,
+        root: RootId,
+        task_id: TaskId,
+        task: &mut RuntimeTask,
+        mut vm: VM,
+    ) -> Result<TaskAction, RuntimeFault> {
+        let (context, instruction_limit) = {
+            let state = self.state.borrow();
+            (Rc::clone(&state._context), state.active_instruction_limit)
+        };
+        let _task_context = context.scope_task_context(task.context.clone());
+        let quantum_guard =
+            context
+                .enter_runtime_quantum()
+                .map_err(|error| RuntimeFault::Invariant {
+                    message: error.to_string(),
+                })?;
+        let quantum = vm.run_quantum(&context, instruction_limit);
+        drop(quantum_guard);
+        self.state.borrow_mut().turn_instructions += quantum.instructions;
+        let action = match quantum.outcome {
+            Ok(VmExecResult::QuantumExpired { .. }) => {
+                task.vm_call = Some(vm);
+                TaskAction::Yield(root, task_id)
+            }
+            // A native yielded the VM through the TLS yield signal (surfaced as
+            // `AsyncYield`). The VM has already parked its frame (pc past the
+            // call, a nil placeholder on the stack top) and stays in `vm_call`;
+            // the runtime registers a native wait and, when it fires, re-runs
+            // `run_quantum` — the frame resumes in place with the placeholder as
+            // the resume value.
+            Ok(VmExecResult::AsyncYield(reason)) => match reason {
+                YieldReason::Sleep(ms) => {
+                    task.vm_call = Some(vm);
+                    TaskAction::VmSleep(task_id, ms)
+                }
+                // `async/spawn`: the frame parked with a nil placeholder on its
+                // stack top; the runtime creates a detached task from the thunk
+                // and resumes this frame with the promise value.
+                YieldReason::Spawn(thunk) => {
+                    task.vm_call = Some(vm);
+                    TaskAction::VmSpawn(task_id, thunk)
+                }
+                // `async/await`: park this frame on the promise; the runtime
+                // resumes it (via `replace_stack_top`) when the promise settles,
+                // or raises the rejection into it (via `resume_with_error`).
+                YieldReason::AwaitPromise(promise) => {
+                    task.vm_call = Some(vm);
+                    TaskAction::VmAwait(task_id, promise)
+                }
+                other => TaskAction::VmResult(
+                    task_id,
+                    task.vm_owner.take().expect("VM call has a return owner"),
+                    Err(sema_core::SemaError::eval(format!(
+                        "unsupported runtime VM async yield: {other:?}"
+                    ))),
+                ),
+            },
+            Ok(VmExecResult::Finished(value)) => TaskAction::VmResult(
+                task_id,
+                task.vm_owner.take().expect("VM call has a return owner"),
+                Ok(NativeOutcome::Return(value)),
+            ),
+            Err(error) => TaskAction::VmResult(
+                task_id,
+                task.vm_owner.take().expect("VM call has a return owner"),
+                Err(error),
+            ),
+            Ok(other) => TaskAction::VmResult(
+                task_id,
+                task.vm_owner.take().expect("VM call has a return owner"),
+                Err(sema_core::SemaError::eval(format!(
+                    "unsupported runtime VM stop: {other:?}"
+                ))),
+            ),
+        };
+        Ok(action)
+    }
+
     fn visit_ready(&self) -> Result<bool, RuntimeFault> {
         let (root, task_id, mut task) = {
             let mut state = self.state.borrow_mut();
@@ -1128,19 +1214,31 @@ impl Runtime {
             .map_err(|error| RuntimeFault::Invariant {
                 message: format!("ready task failed to start: {error:?}"),
             })?;
-        // A promise this VM task awaited (or a spawn admission) has settled: a
-        // failure settles the parked task; a value is injected onto its stack
-        // top just before the quantum re-runs (in the vm_call arm below).
+        // A promise this VM task awaited (or a spawn admission) has settled. A
+        // resolved value is injected onto the parked frame's stack top; a
+        // rejection is RAISED at the parked call site (as if the awaiting native
+        // had returned `Err`) so an enclosing try/catch can catch it. Both
+        // re-run the frame's quantum in place — identical to the native's
+        // already-settled fast path in `async_ops.rs`, regardless of whether the
+        // promise was pending or settled when `await` ran. A rejection with NO
+        // parked frame settles the task Failed directly.
         let resume = task.vm_resume.take();
         let action = if let Some(VmResume::Fail(error)) = resume {
-            task.vm_call.take();
-            TaskAction::VmResult(
-                task_id,
-                task.vm_owner
-                    .take()
-                    .expect("awaited VM task has a return owner"),
-                Err(error),
-            )
+            if let Some(mut vm) = task.vm_call.take() {
+                // Re-run raising the rejection in-frame; uncaught, it surfaces
+                // as `Err` out of `run_quantum` and settles the task Failed —
+                // preserving the prior uncaught behavior.
+                vm.resume_with_error(error);
+                self.run_parked_quantum(root, task_id, &mut task, vm)?
+            } else {
+                TaskAction::VmResult(
+                    task_id,
+                    task.vm_owner
+                        .take()
+                        .expect("awaited VM task has a return owner"),
+                    Err(error),
+                )
+            }
         } else if let Some(pending) = task.pending_resume.take() {
             TaskAction::Resume(pending)
         } else if let Some(cancel) = task.record.cancellation() {
@@ -1153,76 +1251,7 @@ impl Runtime {
             if let Some(VmResume::Value(value)) = resume {
                 vm.replace_stack_top(value);
             }
-            let (context, instruction_limit) = {
-                let state = self.state.borrow();
-                (Rc::clone(&state._context), state.active_instruction_limit)
-            };
-            let _task_context = context.scope_task_context(task.context.clone());
-            let quantum_guard =
-                context
-                    .enter_runtime_quantum()
-                    .map_err(|error| RuntimeFault::Invariant {
-                        message: error.to_string(),
-                    })?;
-            let quantum = vm.run_quantum(&context, instruction_limit);
-            drop(quantum_guard);
-            self.state.borrow_mut().turn_instructions += quantum.instructions;
-            match quantum.outcome {
-                Ok(VmExecResult::QuantumExpired { .. }) => {
-                    task.vm_call = Some(vm);
-                    TaskAction::Yield(root, task_id)
-                }
-                // A native yielded the VM through the TLS yield signal
-                // (surfaced as `AsyncYield`). The VM has already parked its
-                // frame (pc past the call, a nil placeholder on the stack top)
-                // and stays in `vm_call`; the runtime registers a native wait
-                // and, when it fires, re-runs `run_quantum` — the frame resumes
-                // in place with the placeholder as the resume value.
-                Ok(VmExecResult::AsyncYield(reason)) => match reason {
-                    YieldReason::Sleep(ms) => {
-                        task.vm_call = Some(vm);
-                        TaskAction::VmSleep(task_id, ms)
-                    }
-                    // `async/spawn`: the frame parked with a nil placeholder on
-                    // its stack top; the runtime creates a detached task from
-                    // the thunk and resumes this frame with the promise value.
-                    YieldReason::Spawn(thunk) => {
-                        task.vm_call = Some(vm);
-                        TaskAction::VmSpawn(task_id, thunk)
-                    }
-                    // `async/await`: park this frame on the promise; the runtime
-                    // resumes it (via `replace_stack_top`) when the promise
-                    // settles, or settles it with the rejection/cancellation.
-                    YieldReason::AwaitPromise(promise) => {
-                        task.vm_call = Some(vm);
-                        TaskAction::VmAwait(task_id, promise)
-                    }
-                    other => TaskAction::VmResult(
-                        task_id,
-                        task.vm_owner.take().expect("VM call has a return owner"),
-                        Err(sema_core::SemaError::eval(format!(
-                            "unsupported runtime VM async yield: {other:?}"
-                        ))),
-                    ),
-                },
-                Ok(VmExecResult::Finished(value)) => TaskAction::VmResult(
-                    task_id,
-                    task.vm_owner.take().expect("VM call has a return owner"),
-                    Ok(NativeOutcome::Return(value)),
-                ),
-                Err(error) => TaskAction::VmResult(
-                    task_id,
-                    task.vm_owner.take().expect("VM call has a return owner"),
-                    Err(error),
-                ),
-                Ok(other) => TaskAction::VmResult(
-                    task_id,
-                    task.vm_owner.take().expect("VM call has a return owner"),
-                    Err(sema_core::SemaError::eval(format!(
-                        "unsupported runtime VM stop: {other:?}"
-                    ))),
-                ),
-            }
+            self.run_parked_quantum(root, task_id, &mut task, vm)?
         } else {
             match &mut task.payload {
                 TaskPayload::Vm => {

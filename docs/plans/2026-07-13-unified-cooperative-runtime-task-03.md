@@ -862,14 +862,26 @@ named owner files enough to compile and route host-executable user code through
 A or E, adds their focused compile/tests to the gate, and records every
 occurrence and classification in evidence.
 
-  - _Progress (2026-07-14, `04e090fa`): VM-root execution seam proven at the
-    runtime level — `VM::seed_main_frame` + `Runtime::submit_vm_root` drive a
-    real compiled root through the existing `run_quantum` arm to `Returned`
-    (test `runtime_executes_a_real_vm_root_to_a_returned_value`, gate = `(+ 1 2)`
-    → `Returned(3)`). This is the prerequisite for `eval*`. Still pending for
-    Step 2: `Interpreter` storing `runtime: Option<Runtime>`, `eval*`
-    prepare/submit/drive, `try_new*`/parts constructors, and the `sema`/
-    `sema-wasm` struct-literal updates. Box stays unchecked until those land._
+  - _Progress (2026-07-14): VM-root execution seam proven and a synchronous
+    `eval` path routed through the runtime:_
+    - _`04e090fa` `VM::seed_main_frame` + `Runtime::submit_vm_root` drive a real
+      compiled root through `run_quantum` to `Returned` (`(+ 1 2)` → `3`);
+      `c0a8057d` promotes `submit_root` to real API with a `TaskPayload::Vm`;
+      `ed7c2208` interleaves two real roots independently._
+    - _`9854376a` adds `MonotonicClock`/`NullExecutor` host adapters; `3003aacd`
+      adds `Interpreter::eval_via_runtime` — GATE GREEN: an interpreter routes a
+      synchronous eval through the runtime (`(+ 1 2)` → `3`)._
+    - _BLOCKER for real user code (next slice = Task 04 native-ABI migration):
+      a user function whose body calls a native re-enters the evaluator via the
+      legacy `call_value`/`run_closure_foreign_sync` path, which the runtime
+      correctly rejects inside a quantum (`VM::run` guard, vm.rs:1601). The
+      `NativeOutcome::Call` dispatch machinery exists (state.rs:1351 →
+      `invoke_callable`); the migration must route those calls through it.
+      Ignored test `eval_via_runtime_shares_interpreter_globals` pins this._
+    - _Still pending for Step 2: `ctx: Rc<EvalContext>`, interpreter-owned
+      single shared-context `runtime: Option<Runtime>` with drop ordering,
+      `try_new*`/parts constructors, real executor, and `sema`/`sema-wasm`
+      struct-literal updates. Box stays unchecked until those land._
 
 - [ ] **Step 3: Remove TLS scheduler ownership**
 

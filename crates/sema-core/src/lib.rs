@@ -33,10 +33,10 @@ pub use async_signal::{
     set_task_reaped_callback, set_usage_scope_task_callbacks, set_yield_signal,
     take_debug_coop_resume, take_resume_value, take_task_llm_scope, take_task_otel,
     take_task_usage_scope, take_yield_signal, BlockingSleepFn, CancelCallbackFn, DebugCoopResume,
-    InterruptCallbackFn, IoHandle, IoPoll, LlmScopeCaptureFn, LlmScopeInstallFn, LlmScopeTakeFn,
-    OtelInstallFn, OtelScopeFn, OtelTakeFn, RunSchedulerCallbackFn, SchedulerRunResult,
-    SchedulerTarget, SpawnCallbackFn, TaskReapedFn, UsageScopeCaptureFn, UsageScopeInstallFn,
-    UsageScopeTakeFn, YieldReason,
+    InterruptCallbackFn, IoHandle, IoPoll, LegacyRuntimeBridge, LlmScopeCaptureFn,
+    LlmScopeInstallFn, LlmScopeTakeFn, OtelInstallFn, OtelScopeFn, OtelTakeFn,
+    RunSchedulerCallbackFn, SchedulerRunResult, SchedulerTarget, SpawnCallbackFn, TaskReapedFn,
+    UsageScopeCaptureFn, UsageScopeInstallFn, UsageScopeTakeFn, YieldReason,
 };
 pub use context::{
     call_callback, call_callback_owned, eval_callback, set_call_callback, set_call_owned_callback,

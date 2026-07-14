@@ -13,8 +13,32 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::{Condvar, Mutex};
 
+use crate::runtime::{InvalidRuntimeId, TaskId};
 use crate::value::{AsyncPromise, Channel, Value};
 use crate::{EvalContext, SemaError};
+
+/// Conversion boundary between checked runtime task IDs and legacy raw IDs.
+///
+/// Raw zero means that no task is assigned. Every nonzero value is a checked
+/// [`TaskId`]. The conversion is intentionally lossy: raw IDs carry no runtime
+/// provenance and must not be used as runtime-scoped identity.
+pub struct LegacyRuntimeBridge;
+
+impl LegacyRuntimeBridge {
+    /// Converts a legacy raw task ID into its checked representation.
+    pub fn task_id_from_raw(raw: u64) -> Result<Option<TaskId>, InvalidRuntimeId> {
+        if raw == 0 {
+            Ok(None)
+        } else {
+            TaskId::try_from_raw(raw).map(Some)
+        }
+    }
+
+    /// Converts a checked optional task ID to the legacy raw representation.
+    pub fn task_id_to_raw(task_id: Option<TaskId>) -> u64 {
+        task_id.map_or(0, TaskId::get)
+    }
+}
 
 /// Result of polling an offloaded I/O future from the VM thread.
 ///
@@ -762,7 +786,43 @@ pub fn call_run_scheduler_timeout(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runtime::{InvalidRuntimeId, TaskId};
     use std::rc::Rc;
+
+    #[test]
+    fn legacy_runtime_bridge_maps_zero_to_unassigned() {
+        assert_eq!(LegacyRuntimeBridge::task_id_from_raw(0), Ok(None));
+        assert_eq!(LegacyRuntimeBridge::task_id_to_raw(None), 0);
+    }
+
+    #[test]
+    fn legacy_runtime_bridge_maps_nonzero_boundaries_to_checked_ids() {
+        let one = LegacyRuntimeBridge::task_id_from_raw(1)
+            .expect("one is a valid task ID")
+            .expect("nonzero IDs are assigned");
+        let maximum = LegacyRuntimeBridge::task_id_from_raw(u64::MAX)
+            .expect("maximum is a valid task ID")
+            .expect("nonzero IDs are assigned");
+
+        assert_eq!(one, TaskId::try_from_raw(1).expect("valid task ID"));
+        assert_eq!(maximum.get(), u64::MAX);
+    }
+
+    #[test]
+    fn legacy_runtime_bridge_round_trips_every_representable_legacy_state() {
+        for raw in [0, 1, u64::MAX] {
+            let checked = LegacyRuntimeBridge::task_id_from_raw(raw)
+                .expect("legacy task ID domain is representable");
+            assert_eq!(LegacyRuntimeBridge::task_id_to_raw(checked), raw);
+        }
+    }
+
+    #[test]
+    fn legacy_runtime_bridge_has_no_invalid_raw_value_beyond_unassigned_zero() {
+        assert_eq!(TaskId::try_from_raw(0), Err(InvalidRuntimeId));
+        assert_eq!(LegacyRuntimeBridge::task_id_from_raw(0), Ok(None));
+        assert!(LegacyRuntimeBridge::task_id_from_raw(u64::MAX).is_ok());
+    }
 
     #[test]
     fn io_handle_abort_runs_once() {

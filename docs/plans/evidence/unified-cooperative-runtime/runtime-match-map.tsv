@@ -1,104 +1,104 @@
-F01A	crates/sema-core/src/async_signal.rs:100:// A manual `Debug` impl keeps the `#[derive(Debug, Clone)]` on `YieldReason`
-F01A	crates/sema-core/src/async_signal.rs:102:impl std::fmt::Debug for IoHandle {
-F01A	crates/sema-core/src/async_signal.rs:104:        f.write_str("IoHandle")
-F02	crates/sema-core/src/async_signal.rs:110:pub enum YieldReason {
-F02	crates/sema-core/src/async_signal.rs:122:    AwaitIo(Rc<IoHandle>),
-F03	crates/sema-core/src/async_signal.rs:127:pub enum SchedulerTarget {
-F03	crates/sema-core/src/async_signal.rs:142:pub enum SchedulerRunResult {
-F03	crates/sema-core/src/async_signal.rs:148:    /// scheduler re-entry. The driving native (`async/await`, `async/all`,
-F03	crates/sema-core/src/async_signal.rs:149:    /// `async/timeout`, `async/race`) must NOT inspect the still-pending target
-F03	crates/sema-core/src/async_signal.rs:160:/// [`SchedulerRunResult::DebugPaused`]; consumed by `run_cooperative` in
-F05	crates/sema-core/src/async_signal.rs:162:/// the reconstructed value (`set_resume_value`).
-F05	crates/sema-core/src/async_signal.rs:165:    /// `async/await` / `async/timeout`: resume with the single target promise's
-F05	crates/sema-core/src/async_signal.rs:169:    /// `async/all`: resume with the list of all resolved values.
-F05	crates/sema-core/src/async_signal.rs:171:    /// `async/race` / `async/any`: resume with the first settled promise's value.
-F05	crates/sema-core/src/async_signal.rs:173:    /// `async/run`: no value to reconstruct (returns nil).
-F02	crates/sema-core/src/async_signal.rs:177:thread_local! {
-F02	crates/sema-core/src/async_signal.rs:180:    static YIELD_SIGNAL: RefCell<Option<YieldReason>> = const { RefCell::new(None) };
-F05	crates/sema-core/src/async_signal.rs:183:    /// for a debug breakpoint inside a task. Carries the `SchedulerTarget` to
-F05	crates/sema-core/src/async_signal.rs:185:    /// `run_cooperative` (sema-vm). See [`SchedulerRunResult::DebugPaused`].
-F05	crates/sema-core/src/async_signal.rs:186:    static DEBUG_COOP_RESUME: RefCell<Option<(SchedulerTarget, DebugCoopResume)>> =
-F02	crates/sema-core/src/async_signal.rs:202:pub fn set_yield_signal(reason: YieldReason) {
-F02	crates/sema-core/src/async_signal.rs:207:pub fn take_yield_signal() -> Option<YieldReason> {
-F05	crates/sema-core/src/async_signal.rs:215:pub fn set_debug_coop_resume(target: SchedulerTarget, how: DebugCoopResume) {
-F05	crates/sema-core/src/async_signal.rs:221:pub fn take_debug_coop_resume() -> Option<(SchedulerTarget, DebugCoopResume)> {
-F05	crates/sema-core/src/async_signal.rs:235:pub fn set_resume_value(val: Value) {
-F05	crates/sema-core/src/async_signal.rs:241:pub fn take_resume_value() -> Option<Value> {
-F02	crates/sema-core/src/async_signal.rs:248:pub fn in_async_context() -> bool {
-F01B	crates/sema-core/src/async_signal.rs:25:pub enum IoPoll {
-F04	crates/sema-core/src/async_signal.rs:264:thread_local! {
-F04	crates/sema-core/src/async_signal.rs:269:pub fn set_spawn_callback(f: SpawnCallbackFn) {
-F04	crates/sema-core/src/async_signal.rs:275:pub fn call_spawn_callback(ctx: &EvalContext, thunk: Value) -> Result<Value, SemaError> {
-F04	crates/sema-core/src/async_signal.rs:278:            "async/spawn: no async scheduler registered (async requires the VM backend)"
-F03	crates/sema-core/src/async_signal.rs:290:    fn(&EvalContext, SchedulerTarget) -> Result<SchedulerRunResult, SemaError>;
-F03	crates/sema-core/src/async_signal.rs:292:thread_local! {
-F03	crates/sema-core/src/async_signal.rs:297:pub fn set_run_scheduler_callback(f: RunSchedulerCallbackFn) {
-F04	crates/sema-core/src/async_signal.rs:311:thread_local! {
-F04	crates/sema-core/src/async_signal.rs:316:pub fn set_cancel_callback(f: CancelCallbackFn) {
-F04	crates/sema-core/src/async_signal.rs:322:pub fn call_cancel_callback(task_id: u64) -> Result<bool, SemaError> {
-F04	crates/sema-core/src/async_signal.rs:324:        SemaError::eval("async/cancel: no async scheduler registered".to_string())
-F06	crates/sema-core/src/async_signal.rs:332:/// will NEVER resume from (cancellation via `async/cancel`, `async/timeout`
-F06	crates/sema-core/src/async_signal.rs:345:thread_local! {
-F06	crates/sema-core/src/async_signal.rs:366:thread_local! {
-F01A	crates/sema-core/src/async_signal.rs:37:/// [`YieldReason::AwaitIo`]; it never crosses a thread boundary (the scheduler
-F08B	crates/sema-core/src/async_signal.rs:391:/// milliseconds (already bounded by the `async/sleep`/`async/timeout` caps).
-F08B	crates/sema-core/src/async_signal.rs:394:thread_local! {
-F08B	crates/sema-core/src/async_signal.rs:399:/// real `Atomics.wait` on a `SharedArrayBuffer`, so `async/sleep` paces in real
-F01A	crates/sema-core/src/async_signal.rs:39:pub struct IoHandle {
-F08B	crates/sema-core/src/async_signal.rs:402:/// `std::thread::sleep` default below.
-F01B	crates/sema-core/src/async_signal.rs:40:    poll: RefCell<Box<dyn FnMut() -> IoPoll>>,
-F01A	crates/sema-core/src/async_signal.rs:42:    /// this handle (`async/cancel`, `async/timeout` expiry, or an interrupt) — NEVER
-F07	crates/sema-core/src/async_signal.rs:435:thread_local! {
-F07	crates/sema-core/src/async_signal.rs:497:thread_local! {
+F01A	crates/sema-core/src/async_signal.rs:104:    pub fn poll(&self) -> IoPoll {
+F01A	crates/sema-core/src/async_signal.rs:112:    /// [`new`]: IoHandle::new
+F01A	crates/sema-core/src/async_signal.rs:123:// `IoHandle` holds a `Box<dyn FnMut>`, which is neither `Debug` nor `Clone`.
+F01A	crates/sema-core/src/async_signal.rs:124:// A manual `Debug` impl keeps the `#[derive(Debug, Clone)]` on `YieldReason`
+F01A	crates/sema-core/src/async_signal.rs:126:impl std::fmt::Debug for IoHandle {
+F01A	crates/sema-core/src/async_signal.rs:128:        f.write_str("IoHandle")
+F02	crates/sema-core/src/async_signal.rs:134:pub enum YieldReason {
+F02	crates/sema-core/src/async_signal.rs:146:    AwaitIo(Rc<IoHandle>),
+F03	crates/sema-core/src/async_signal.rs:151:pub enum SchedulerTarget {
+F03	crates/sema-core/src/async_signal.rs:166:pub enum SchedulerRunResult {
+F03	crates/sema-core/src/async_signal.rs:172:    /// scheduler re-entry. The driving native (`async/await`, `async/all`,
+F03	crates/sema-core/src/async_signal.rs:173:    /// `async/timeout`, `async/race`) must NOT inspect the still-pending target
+F03	crates/sema-core/src/async_signal.rs:184:/// [`SchedulerRunResult::DebugPaused`]; consumed by `run_cooperative` in
+F05	crates/sema-core/src/async_signal.rs:186:/// the reconstructed value (`set_resume_value`).
+F05	crates/sema-core/src/async_signal.rs:189:    /// `async/await` / `async/timeout`: resume with the single target promise's
+F05	crates/sema-core/src/async_signal.rs:193:    /// `async/all`: resume with the list of all resolved values.
+F05	crates/sema-core/src/async_signal.rs:195:    /// `async/race` / `async/any`: resume with the first settled promise's value.
+F05	crates/sema-core/src/async_signal.rs:197:    /// `async/run`: no value to reconstruct (returns nil).
+F02	crates/sema-core/src/async_signal.rs:201:thread_local! {
+F02	crates/sema-core/src/async_signal.rs:204:    static YIELD_SIGNAL: RefCell<Option<YieldReason>> = const { RefCell::new(None) };
+F05	crates/sema-core/src/async_signal.rs:207:    /// for a debug breakpoint inside a task. Carries the `SchedulerTarget` to
+F05	crates/sema-core/src/async_signal.rs:209:    /// `run_cooperative` (sema-vm). See [`SchedulerRunResult::DebugPaused`].
+F05	crates/sema-core/src/async_signal.rs:210:    static DEBUG_COOP_RESUME: RefCell<Option<(SchedulerTarget, DebugCoopResume)>> =
+F02	crates/sema-core/src/async_signal.rs:226:pub fn set_yield_signal(reason: YieldReason) {
+F02	crates/sema-core/src/async_signal.rs:231:pub fn take_yield_signal() -> Option<YieldReason> {
+F05	crates/sema-core/src/async_signal.rs:239:pub fn set_debug_coop_resume(target: SchedulerTarget, how: DebugCoopResume) {
+F05	crates/sema-core/src/async_signal.rs:245:pub fn take_debug_coop_resume() -> Option<(SchedulerTarget, DebugCoopResume)> {
+F05	crates/sema-core/src/async_signal.rs:259:pub fn set_resume_value(val: Value) {
+F05	crates/sema-core/src/async_signal.rs:265:pub fn take_resume_value() -> Option<Value> {
+F02	crates/sema-core/src/async_signal.rs:272:pub fn in_async_context() -> bool {
+F04	crates/sema-core/src/async_signal.rs:288:thread_local! {
+F04	crates/sema-core/src/async_signal.rs:293:pub fn set_spawn_callback(f: SpawnCallbackFn) {
+F04	crates/sema-core/src/async_signal.rs:299:pub fn call_spawn_callback(ctx: &EvalContext, thunk: Value) -> Result<Value, SemaError> {
+F04	crates/sema-core/src/async_signal.rs:302:            "async/spawn: no async scheduler registered (async requires the VM backend)"
+F03	crates/sema-core/src/async_signal.rs:314:    fn(&EvalContext, SchedulerTarget) -> Result<SchedulerRunResult, SemaError>;
+F03	crates/sema-core/src/async_signal.rs:316:thread_local! {
+F03	crates/sema-core/src/async_signal.rs:321:pub fn set_run_scheduler_callback(f: RunSchedulerCallbackFn) {
+F04	crates/sema-core/src/async_signal.rs:335:thread_local! {
+F04	crates/sema-core/src/async_signal.rs:340:pub fn set_cancel_callback(f: CancelCallbackFn) {
+F04	crates/sema-core/src/async_signal.rs:346:pub fn call_cancel_callback(task_id: u64) -> Result<bool, SemaError> {
+F04	crates/sema-core/src/async_signal.rs:348:        SemaError::eval("async/cancel: no async scheduler registered".to_string())
+F06	crates/sema-core/src/async_signal.rs:356:/// will NEVER resume from (cancellation via `async/cancel`, `async/timeout`
+F06	crates/sema-core/src/async_signal.rs:369:thread_local! {
+F06	crates/sema-core/src/async_signal.rs:390:thread_local! {
+F08B	crates/sema-core/src/async_signal.rs:415:/// milliseconds (already bounded by the `async/sleep`/`async/timeout` caps).
+F08B	crates/sema-core/src/async_signal.rs:418:thread_local! {
+F08B	crates/sema-core/src/async_signal.rs:423:/// real `Atomics.wait` on a `SharedArrayBuffer`, so `async/sleep` paces in real
+F08B	crates/sema-core/src/async_signal.rs:426:/// `std::thread::sleep` default below.
+F07	crates/sema-core/src/async_signal.rs:459:thread_local! {
+F01B	crates/sema-core/src/async_signal.rs:49:pub enum IoPoll {
 F02	crates/sema-core/src/async_signal.rs:4://! (channel/recv, async/await, etc.) set `YIELD_SIGNAL` when they need to
-F01A	crates/sema-core/src/async_signal.rs:53:    /// [`with_abort`]: IoHandle::with_abort
-F01B	crates/sema-core/src/async_signal.rs:54:    /// [`new`]: IoHandle::new
-F07	crates/sema-core/src/async_signal.rs:563:thread_local! {
-F01A	crates/sema-core/src/async_signal.rs:58:impl IoHandle {
-F08A	crates/sema-core/src/async_signal.rs:610:/// program — including one blocked in a real `Atomics.wait` sleep.
-F08A	crates/sema-core/src/async_signal.rs:613:thread_local! {
-F01B	crates/sema-core/src/async_signal.rs:62:    pub fn new(f: impl FnMut() -> IoPoll + 'static) -> Self {
-F08B	crates/sema-core/src/async_signal.rs:645:    std::thread::sleep(std::time::Duration::from_millis(ms));
-F08A	crates/sema-core/src/async_signal.rs:655:/// (the scheduler) loop and re-poll their `IoHandle`s, so correctness never
-F03	crates/sema-core/src/async_signal.rs:688:/// ([`SchedulerRunResult::DebugPaused`]).
-F03	crates/sema-core/src/async_signal.rs:689:pub fn call_run_scheduler(
-F03	crates/sema-core/src/async_signal.rs:692:) -> Result<SchedulerRunResult, SemaError> {
-F03	crates/sema-core/src/async_signal.rs:699:        Some(promise) => SchedulerTarget::One(promise),
-F03	crates/sema-core/src/async_signal.rs:700:        None => SchedulerTarget::All,
-F03	crates/sema-core/src/async_signal.rs:706:pub fn call_run_scheduler_all_of(
-F03	crates/sema-core/src/async_signal.rs:709:) -> Result<SchedulerRunResult, SemaError> {
-F03	crates/sema-core/src/async_signal.rs:715:    f(ctx, SchedulerTarget::AllOf(targets))
-F03	crates/sema-core/src/async_signal.rs:719:pub fn call_run_scheduler_any_of(
-F03	crates/sema-core/src/async_signal.rs:722:) -> Result<SchedulerRunResult, SemaError> {
-F03	crates/sema-core/src/async_signal.rs:728:    f(ctx, SchedulerTarget::AnyOf(targets))
-F01A	crates/sema-core/src/async_signal.rs:72:    pub fn with_abort(f: impl FnMut() -> IoPoll + 'static, abort: impl FnOnce() + 'static) -> Self {
-F03	crates/sema-core/src/async_signal.rs:731:/// Run the scheduler with an explicit `SchedulerTarget`. Used by the cooperative
-F03	crates/sema-core/src/async_signal.rs:736:pub fn call_run_scheduler_target(
-F03	crates/sema-core/src/async_signal.rs:738:    target: SchedulerTarget,
-F03	crates/sema-core/src/async_signal.rs:739:) -> Result<SchedulerRunResult, SemaError> {
-F03	crates/sema-core/src/async_signal.rs:749:pub fn call_run_scheduler_timeout(
-F03	crates/sema-core/src/async_signal.rs:753:) -> Result<SchedulerRunResult, SemaError> {
-F03	crates/sema-core/src/async_signal.rs:759:    f(ctx, SchedulerTarget::Timeout(target, timeout_ms))
-F01A	crates/sema-core/src/async_signal.rs:771:        let h = IoHandle::with_abort(|| IoPoll::Pending, move || c.set(c.get() + 1));
-F01B	crates/sema-core/src/async_signal.rs:783:        let h = IoHandle::new(|| IoPoll::Ready(Ok(Value::nil())));
-F01B	crates/sema-core/src/async_signal.rs:786:        assert!(matches!(h.poll(), IoPoll::Ready(Ok(_))));
-F01A	crates/sema-core/src/async_signal.rs:791:        let h = IoHandle::with_abort(|| IoPoll::Ready(Ok(Value::int(7))), || {});
-F01A	crates/sema-core/src/async_signal.rs:794:            IoPoll::Ready(Ok(v)) => assert_eq!(v, Value::int(7)),
-F01A	crates/sema-core/src/async_signal.rs:80:    pub fn poll(&self) -> IoPoll {
-F01A	crates/sema-core/src/async_signal.rs:88:    /// [`new`]: IoHandle::new
-F01A	crates/sema-core/src/async_signal.rs:99:// `IoHandle` holds a `Box<dyn FnMut>`, which is neither `Debug` nor `Clone`.
+F07	crates/sema-core/src/async_signal.rs:521:thread_local! {
+F07	crates/sema-core/src/async_signal.rs:587:thread_local! {
+F01A	crates/sema-core/src/async_signal.rs:61:/// [`YieldReason::AwaitIo`]; it never crosses a thread boundary (the scheduler
+F08A	crates/sema-core/src/async_signal.rs:634:/// program — including one blocked in a real `Atomics.wait` sleep.
+F08A	crates/sema-core/src/async_signal.rs:637:thread_local! {
+F01A	crates/sema-core/src/async_signal.rs:63:pub struct IoHandle {
+F01B	crates/sema-core/src/async_signal.rs:64:    poll: RefCell<Box<dyn FnMut() -> IoPoll>>,
+F08B	crates/sema-core/src/async_signal.rs:669:    std::thread::sleep(std::time::Duration::from_millis(ms));
+F01A	crates/sema-core/src/async_signal.rs:66:    /// this handle (`async/cancel`, `async/timeout` expiry, or an interrupt) — NEVER
+F08A	crates/sema-core/src/async_signal.rs:679:/// (the scheduler) loop and re-poll their `IoHandle`s, so correctness never
+F03	crates/sema-core/src/async_signal.rs:712:/// ([`SchedulerRunResult::DebugPaused`]).
+F03	crates/sema-core/src/async_signal.rs:713:pub fn call_run_scheduler(
+F03	crates/sema-core/src/async_signal.rs:716:) -> Result<SchedulerRunResult, SemaError> {
+F03	crates/sema-core/src/async_signal.rs:723:        Some(promise) => SchedulerTarget::One(promise),
+F03	crates/sema-core/src/async_signal.rs:724:        None => SchedulerTarget::All,
+F03	crates/sema-core/src/async_signal.rs:730:pub fn call_run_scheduler_all_of(
+F03	crates/sema-core/src/async_signal.rs:733:) -> Result<SchedulerRunResult, SemaError> {
+F03	crates/sema-core/src/async_signal.rs:739:    f(ctx, SchedulerTarget::AllOf(targets))
+F03	crates/sema-core/src/async_signal.rs:743:pub fn call_run_scheduler_any_of(
+F03	crates/sema-core/src/async_signal.rs:746:) -> Result<SchedulerRunResult, SemaError> {
+F03	crates/sema-core/src/async_signal.rs:752:    f(ctx, SchedulerTarget::AnyOf(targets))
+F03	crates/sema-core/src/async_signal.rs:755:/// Run the scheduler with an explicit `SchedulerTarget`. Used by the cooperative
+F03	crates/sema-core/src/async_signal.rs:760:pub fn call_run_scheduler_target(
+F03	crates/sema-core/src/async_signal.rs:762:    target: SchedulerTarget,
+F03	crates/sema-core/src/async_signal.rs:763:) -> Result<SchedulerRunResult, SemaError> {
+F03	crates/sema-core/src/async_signal.rs:773:pub fn call_run_scheduler_timeout(
+F03	crates/sema-core/src/async_signal.rs:777:) -> Result<SchedulerRunResult, SemaError> {
+F01A	crates/sema-core/src/async_signal.rs:77:    /// [`with_abort`]: IoHandle::with_abort
+F03	crates/sema-core/src/async_signal.rs:783:    f(ctx, SchedulerTarget::Timeout(target, timeout_ms))
+F01A	crates/sema-core/src/async_signal.rs:78:    /// [`new`]: IoHandle::new
+F01A	crates/sema-core/src/async_signal.rs:82:impl IoHandle {
+F01A	crates/sema-core/src/async_signal.rs:831:        let h = IoHandle::with_abort(|| IoPoll::Pending, move || c.set(c.get() + 1));
+F01B	crates/sema-core/src/async_signal.rs:843:        let h = IoHandle::new(|| IoPoll::Ready(Ok(Value::nil())));
+F01B	crates/sema-core/src/async_signal.rs:846:        assert!(matches!(h.poll(), IoPoll::Ready(Ok(_))));
+F01A	crates/sema-core/src/async_signal.rs:851:        let h = IoHandle::with_abort(|| IoPoll::Ready(Ok(Value::int(7))), || {});
+F01A	crates/sema-core/src/async_signal.rs:854:            IoPoll::Ready(Ok(v)) => assert_eq!(v, Value::int(7)),
+F01B	crates/sema-core/src/async_signal.rs:86:    pub fn new(f: impl FnMut() -> IoPoll + 'static) -> Self {
+F01A	crates/sema-core/src/async_signal.rs:96:    pub fn with_abort(f: impl FnMut() -> IoPoll + 'static, abort: impl FnOnce() + 'static) -> Self {
 F02	crates/sema-core/src/async_signal.rs:9://! depending on sema-vm. Follows the same pattern as `set_eval_callback`.
-F10	crates/sema-core/src/context.rs:18:/// values out of it (leaving nil behind). See [`call_callback_owned`].
-F14	crates/sema-core/src/context.rs:610:thread_local! {
-F10	crates/sema-core/src/context.rs:626:pub fn set_eval_callback(ctx: &EvalContext, f: EvalCallbackFn) {
-F10	crates/sema-core/src/context.rs:633:pub fn set_call_callback(ctx: &EvalContext, f: CallCallbackFn) {
-F10	crates/sema-core/src/context.rs:640:pub fn eval_callback(ctx: &EvalContext, expr: &Value, env: &Env) -> Result<Value, SemaError> {
-F10	crates/sema-core/src/context.rs:649:pub fn call_callback(ctx: &EvalContext, func: &Value, args: &[Value]) -> Result<Value, SemaError> {
-F10	crates/sema-core/src/context.rs:657:/// interpreter init, alongside [`set_call_callback`].
-F10	crates/sema-core/src/context.rs:658:pub fn set_call_owned_callback(ctx: &EvalContext, f: CallOwnedCallbackFn) {
-F10	crates/sema-core/src/context.rs:665:/// behind). This is the refcount-shedding variant of [`call_callback`] — a
-F10	crates/sema-core/src/context.rs:670:pub fn call_callback_owned(
-F10	crates/sema-core/src/context.rs:678:    call_callback(ctx, func, args)
+F10	crates/sema-core/src/context.rs:19:/// values out of it (leaving nil behind). See [`call_callback_owned`].
+F14	crates/sema-core/src/context.rs:668:thread_local! {
+F10	crates/sema-core/src/context.rs:684:pub fn set_eval_callback(ctx: &EvalContext, f: EvalCallbackFn) {
+F10	crates/sema-core/src/context.rs:691:pub fn set_call_callback(ctx: &EvalContext, f: CallCallbackFn) {
+F10	crates/sema-core/src/context.rs:698:pub fn eval_callback(ctx: &EvalContext, expr: &Value, env: &Env) -> Result<Value, SemaError> {
+F10	crates/sema-core/src/context.rs:707:pub fn call_callback(ctx: &EvalContext, func: &Value, args: &[Value]) -> Result<Value, SemaError> {
+F10	crates/sema-core/src/context.rs:715:/// interpreter init, alongside [`set_call_callback`].
+F10	crates/sema-core/src/context.rs:716:pub fn set_call_owned_callback(ctx: &EvalContext, f: CallOwnedCallbackFn) {
+F10	crates/sema-core/src/context.rs:723:/// behind). This is the refcount-shedding variant of [`call_callback`] — a
+F10	crates/sema-core/src/context.rs:728:pub fn call_callback_owned(
+F10	crates/sema-core/src/context.rs:736:    call_callback(ctx, func, args)
 F20	crates/sema-core/src/cycle.rs:248:/// Registered by sema-vm at startup (same pattern as `set_eval_callback`,
 F20	crates/sema-core/src/cycle.rs:447:thread_local! {
 F09B	crates/sema-core/src/io_backend.rs:141:/// [`IoBackend::block_on_boxed`]: the output travels through a stack slot, so
@@ -124,10 +124,9 @@ F36	crates/sema-core/src/lib.rs:32:    set_otel_task_callbacks, set_resume_value
 F36	crates/sema-core/src/lib.rs:33:    set_task_reaped_callback, set_usage_scope_task_callbacks, set_yield_signal,
 F36	crates/sema-core/src/lib.rs:34:    take_debug_coop_resume, take_resume_value, take_task_llm_scope, take_task_otel,
 F36	crates/sema-core/src/lib.rs:35:    take_task_usage_scope, take_yield_signal, BlockingSleepFn, CancelCallbackFn, DebugCoopResume,
-F36	crates/sema-core/src/lib.rs:36:    InterruptCallbackFn, IoHandle, IoPoll, LlmScopeCaptureFn, LlmScopeInstallFn, LlmScopeTakeFn,
-F36	crates/sema-core/src/lib.rs:37:    OtelInstallFn, OtelScopeFn, OtelTakeFn, RunSchedulerCallbackFn, SchedulerRunResult,
-F36	crates/sema-core/src/lib.rs:38:    SchedulerTarget, SpawnCallbackFn, TaskReapedFn, UsageScopeCaptureFn, UsageScopeInstallFn,
-F36	crates/sema-core/src/lib.rs:39:    UsageScopeTakeFn, YieldReason,
+F36	crates/sema-core/src/lib.rs:36:    InterruptCallbackFn, IoHandle, IoPoll, LegacyRuntimeBridge, LlmScopeCaptureFn,
+F36	crates/sema-core/src/lib.rs:38:    RunSchedulerCallbackFn, SchedulerRunResult, SchedulerTarget, SpawnCallbackFn, TaskReapedFn,
+F36	crates/sema-core/src/lib.rs:39:    UsageScopeCaptureFn, UsageScopeInstallFn, UsageScopeTakeFn, YieldReason,
 F36	crates/sema-core/src/lib.rs:42:    call_callback, call_callback_owned, eval_callback, set_call_callback, set_call_owned_callback,
 F36	crates/sema-core/src/lib.rs:43:    set_eval_callback, with_stdlib_ctx, CallCallbackFn, CallOwnedCallbackFn, EvalCallbackFn,
 F36	crates/sema-core/src/lib.rs:57:    io_backend, io_block_on, io_spawn, io_spawn_blocking, set_io_backend, AbortHook, BoxIoFuture,
@@ -135,11 +134,11 @@ F21A	crates/sema-core/src/mcp_cassette.rs:27:thread_local! {
 F21B	crates/sema-core/src/mcp_cassette.rs:63:    thread_local! {
 F21A	crates/sema-core/src/mcp_cassette.rs:6://! pointers into its thread-local cassette, exactly like `set_eval_callback`);
 F22	crates/sema-core/src/output_hook.rs:8:thread_local! {
-C17	crates/sema-core/src/value.rs:2313:thread_local! {
-F15	crates/sema-core/src/value.rs:256:/// the user explicitly cancels via `async/cancel` is *not* a normal rejection
-F15	crates/sema-core/src/value.rs:258:/// `async/cancelled?` be precise without string-matching, and lets
-C17	crates/sema-core/src/value.rs:27:thread_local! {
-C17	crates/sema-core/src/value.rs:93:thread_local! {
+C17	crates/sema-core/src/value.rs:2410:thread_local! {
+C17	crates/sema-core/src/value.rs:28:thread_local! {
+F15	crates/sema-core/src/value.rs:353:/// the user explicitly cancels via `async/cancel` is *not* a normal rejection
+F15	crates/sema-core/src/value.rs:355:/// `async/cancelled?` be precise without string-matching, and lets
+C17	crates/sema-core/src/value.rs:94:thread_local! {
 H04	crates/sema-dap/src/server.rs:1033:                    while let Ok(cmd) = ds.command_rx.recv() {
 H04	crates/sema-dap/src/server.rs:263:                reply_rx.recv().await.unwrap_or_default()
 H04	crates/sema-dap/src/server.rs:694:    tokio::task::spawn_blocking(move || reply_rx.recv().unwrap_or_default())

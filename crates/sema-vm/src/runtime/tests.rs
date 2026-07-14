@@ -24,7 +24,10 @@ use super::{
     root::{RootRecord, RootState, RootTransitionError},
     task::{CancellationRequest, StateName, TaskRecord, TaskTransitionError, WaitKey},
     timer::TimerQueue,
-    wait::{CompletionRoute, RegisterExternalError, RuntimeCreateError, WaitRuntime},
+    wait::{
+        CompletionRoute, ForgedCompletionMutation, RegisterExternalError, RuntimeCreateError,
+        WaitRuntime,
+    },
     RootPoll, Runtime, TestPreparedTask,
 };
 
@@ -499,6 +502,75 @@ fn runtime_root_and_task_exhaustion_reject_transactionally() {
         assert_eq!(runtime.root_count(), 0, "{kind} exhaustion leaked root");
         assert_eq!(runtime.task_count(), 0, "{kind} exhaustion leaked task");
     }
+}
+
+#[test]
+fn runtime_wait_and_operation_exhaustion_are_separate_transactional_seams() {
+    for kind in ["wait", "operation"] {
+        let runtime = runtime_with_inline_executor(Rc::new(FakeClock::new()));
+        runtime.force_completion_identity_exhaustion_for_test(kind);
+        let handle = runtime
+            .submit_test_root(TestPreparedTask::native(Ok(NativeOutcome::Suspend(
+                external_suspend(Arc::new(Mutex::new(Vec::new()))),
+            ))))
+            .unwrap();
+        assert!(matches!(
+            runtime.drive(&drive_budget(8)),
+            Ok(super::DriveState::Progress { .. })
+        ));
+        assert_eq!(runtime.active_wait_count_for_test(), 0, "{kind}");
+        let RootPoll::Ready(settlement) = handle.poll_result() else {
+            panic!("identity exhaustion settles the root")
+        };
+        let TaskOutcome::Failed(error) = &settlement.outcome else {
+            panic!("identity exhaustion is a task failure")
+        };
+        assert!(error.to_string().contains(kind));
+    }
+}
+
+#[test]
+fn runtime_rejects_forged_completion_identity_before_decode() {
+    let runtime = runtime_with_inline_executor(Rc::new(FakeClock::new()));
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let handle = runtime
+        .submit_test_root(TestPreparedTask::native(Ok(NativeOutcome::Suspend(
+            external_suspend(events.clone()),
+        ))))
+        .unwrap();
+    let mut one = drive_budget(1);
+    one.root_visit_limit = std::num::NonZeroUsize::new(1).unwrap();
+    one.completion_limit = std::num::NonZeroUsize::new(1).unwrap();
+    for _ in 0..3 {
+        runtime.drive(&one).unwrap();
+        if runtime.active_wait_count_for_test() == 1 {
+            break;
+        }
+    }
+    assert_eq!(runtime.active_wait_count_for_test(), 1);
+
+    let wrong_runtime = RuntimeId::allocate().unwrap();
+    let wrong_operation = IdCounter::<sema_core::runtime::OperationId>::new()
+        .allocate()
+        .unwrap();
+    let wrong_kind = CompletionKind::try_from_raw(99).unwrap();
+    let wrong_generation = IdCounter::<WaitGeneration>::new().allocate().unwrap();
+    let mutations = [
+        ForgedCompletionMutation::Runtime(wrong_runtime),
+        ForgedCompletionMutation::Operation(wrong_operation),
+        ForgedCompletionMutation::Kind(wrong_kind),
+        ForgedCompletionMutation::Generation(wrong_generation),
+    ];
+    for mutation in mutations.into_iter().rev() {
+        runtime.forge_completion_for_test(mutation, Ok(Box::new(())));
+    }
+    for _ in 0..4 {
+        runtime.drive(&one).unwrap();
+        assert!(events.lock().unwrap().is_empty());
+        assert!(matches!(handle.poll_result(), RootPoll::Pending));
+    }
+    runtime.drive(&drive_budget(16)).unwrap();
+    assert_eq!(&*events.lock().unwrap(), &["decode", "returned"]);
 }
 
 #[test]

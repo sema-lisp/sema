@@ -26,14 +26,14 @@ pub enum CompletionRoute {
 }
 
 pub enum RegisterExternalError {
-    IdExhausted(NativeSuspend),
+    IdExhausted(&'static str, NativeSuspend),
     Rejected(Box<PendingResume>),
 }
 
 impl std::fmt::Debug for RegisterExternalError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(match self {
-            Self::IdExhausted(_) => "IdExhausted(..)",
+            Self::IdExhausted(_, _) => "IdExhausted(..)",
             Self::Rejected(_) => "Rejected(..)",
         })
     }
@@ -153,6 +153,10 @@ pub struct WaitRuntime {
     cleanup_tombstones: usize,
     late_completions: usize,
     quarantine_reaped: usize,
+    #[cfg(test)]
+    force_wait_exhaustion: bool,
+    #[cfg(test)]
+    force_operation_exhaustion: bool,
 }
 
 impl Trace for WaitRuntime {
@@ -185,6 +189,10 @@ impl WaitRuntime {
             cleanup_tombstones: 0,
             late_completions: 0,
             quarantine_reaped: 0,
+            #[cfg(test)]
+            force_wait_exhaustion: false,
+            #[cfg(test)]
+            force_operation_exhaustion: false,
         })
     }
 
@@ -210,6 +218,14 @@ impl WaitRuntime {
             panic!("external wait required");
         };
         let kind = prepared.completion_kind();
+        #[cfg(test)]
+        if self.force_wait_exhaustion {
+            return Err(RegisterExternalError::IdExhausted("wait", suspend));
+        }
+        #[cfg(test)]
+        if self.force_operation_exhaustion {
+            return Err(RegisterExternalError::IdExhausted("operation", suspend));
+        }
         let identity = match self
             .registrar
             .as_ref()
@@ -217,7 +233,7 @@ impl WaitRuntime {
             .issue_identity(kind)
         {
             Ok(identity) => identity,
-            Err(_) => return Err(RegisterExternalError::IdExhausted(suspend)),
+            Err(_) => return Err(RegisterExternalError::IdExhausted("wait", suspend)),
         };
         let WaitKind::External(prepared) = suspend.wait else {
             unreachable!("wait kind checked before identity issuance")
@@ -525,6 +541,57 @@ impl WaitRuntime {
     pub fn remove_cleanup_exact_for_test(&mut self, key: WaitKey) -> bool {
         self.remove_cleanup(key).is_some()
     }
+
+    #[cfg(test)]
+    pub fn force_identity_exhaustion_for_test(&mut self, kind: &str) {
+        match kind {
+            "wait" => self.force_wait_exhaustion = true,
+            "operation" => self.force_operation_exhaustion = true,
+            _ => panic!("unknown completion identity kind: {kind}"),
+        }
+    }
+
+    #[cfg(test)]
+    pub fn forge_active_completion_for_test(
+        &mut self,
+        key: WaitKey,
+        mutation: ForgedCompletionMutation,
+        result: Result<sema_core::runtime::SendPayload, ExternalFailure>,
+    ) {
+        let identity = self.active.get(&key).expect("active wait identity");
+        let mut completion = ExternalCompletion {
+            runtime_id: identity.identity.runtime_id,
+            wait_id: identity.identity.wait_id,
+            generation: identity.identity.generation,
+            operation_id: identity.identity.operation_id,
+            kind: identity.identity.kind,
+            result,
+        };
+        match mutation {
+            ForgedCompletionMutation::None => {}
+            ForgedCompletionMutation::Runtime(id) => completion.runtime_id = id,
+            ForgedCompletionMutation::Operation(id) => completion.operation_id = id,
+            ForgedCompletionMutation::Kind(kind) => completion.kind = kind,
+            ForgedCompletionMutation::Generation(generation) => {
+                completion.generation = generation;
+            }
+        }
+        self.deferred.push_front(completion);
+    }
+
+    #[cfg(test)]
+    pub fn first_active_key_for_test(&self) -> WaitKey {
+        *self.active.keys().next().expect("active wait")
+    }
+}
+
+#[cfg(test)]
+pub enum ForgedCompletionMutation {
+    None,
+    Runtime(RuntimeId),
+    Operation(OperationId),
+    Kind(CompletionKind),
+    Generation(WaitGeneration),
 }
 
 struct RetainedIdentity {

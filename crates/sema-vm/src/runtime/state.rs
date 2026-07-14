@@ -6,6 +6,8 @@ use std::rc::{Rc, Weak};
 use std::sync::Arc;
 use std::time::Instant;
 
+#[cfg(test)]
+use sema_core::runtime::ExternalFailure;
 use sema_core::runtime::{
     CancelReason, ExecutorShutdown, IdCounter, IoExecutor, NativeOutcome, NativeResult, RootId,
     RuntimeScopedIdCounter, SettlementSeq, TaskContextHandle, TaskId, TaskOutcome, TaskSettlement,
@@ -722,14 +724,14 @@ impl Runtime {
                         state.pending.push_back(PendingStage::Decode(*pending));
                         Ok(())
                     }
-                    Err(RegisterExternalError::IdExhausted(_)) => {
+                    Err(RegisterExternalError::IdExhausted(kind, _)) => {
                         drop(state);
                         self.settle(
                             root,
                             task_id,
-                            TaskOutcome::Failed(sema_core::SemaError::eval(
-                                "runtime wait identity exhausted",
-                            )),
+                            TaskOutcome::Failed(sema_core::SemaError::eval(format!(
+                                "runtime {kind} identity exhausted"
+                            ))),
                         )
                     }
                 }
@@ -957,6 +959,15 @@ impl Runtime {
     }
 
     #[cfg(test)]
+    pub(super) fn active_wait_count_for_test(&self) -> usize {
+        self.state
+            .borrow()
+            .waits
+            .as_ref()
+            .map_or(0, WaitRuntime::active_len)
+    }
+
+    #[cfg(test)]
     pub(super) fn force_settlement_exhaustion_for_test(&self) {
         self.state.borrow_mut().force_settlement_exhaustion = true;
     }
@@ -969,6 +980,28 @@ impl Runtime {
             "task" => state.force_task_exhaustion = true,
             _ => panic!("unknown admission identity kind: {kind}"),
         }
+    }
+
+    #[cfg(test)]
+    pub(super) fn force_completion_identity_exhaustion_for_test(&self, kind: &str) {
+        self.state
+            .borrow_mut()
+            .waits
+            .as_mut()
+            .expect("wait runtime")
+            .force_identity_exhaustion_for_test(kind);
+    }
+
+    #[cfg(test)]
+    pub(super) fn forge_completion_for_test(
+        &self,
+        mutation: super::wait::ForgedCompletionMutation,
+        result: Result<sema_core::runtime::SendPayload, ExternalFailure>,
+    ) {
+        let mut state = self.state.borrow_mut();
+        let waits = state.waits.as_mut().expect("wait runtime");
+        let key = waits.first_active_key_for_test();
+        waits.forge_active_completion_for_test(key, mutation, result);
     }
 
     #[cfg(test)]

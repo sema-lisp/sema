@@ -302,6 +302,11 @@ impl PreparedExternalOperation {
     pub fn quarantined_blocking(
         /* kind, decoder, QuarantineBound, bounded blocking job */
     ) -> Self;
+
+    /// Read-only inspection needed to issue the runtime identity before bind
+    /// consumes this prepared operation.
+    #[doc(hidden)]
+    pub fn completion_kind(&self) -> CompletionKind;
 }
 ```
 
@@ -344,7 +349,10 @@ impl QuarantineBound {
 }
 ```
 
-Keep the one-shot `CancelHook::cancel` and bounded, repeatable `reap` contract.
+`CancelHook` extends `Trace`. Keep its one-shot `cancel` and bounded, repeatable
+`reap` contract. `PreparedExternalOperation` traces exactly its decoder and
+resource; it never traces its `Send` job. `ResourceClass` traces only the
+interruptible hook; quarantined bounds contain no Sema edge.
 Pre-armed cancellation/acquisition behavior is tested in Task 05 where concrete
 jobs exist. Task 02 tests constructor compatibility and wrapper terminality.
 
@@ -372,6 +380,43 @@ pub enum NativeOutcome {
     Call(NativeCall),
     Suspend(NativeSuspend),
 }
+
+pub struct NativeCall {
+    pub callable: Value,
+    pub args: Vec<Value>,
+    pub continuation: Box<dyn NativeContinuation>,
+}
+
+pub struct NativeSuspend {
+    pub wait: WaitKind,
+    pub continuation: Box<dyn NativeContinuation>,
+}
+
+pub enum WaitKind {
+    Timer(Duration),
+    Promise(PromiseId),
+    Channel(ChannelWait),
+    External(Box<PreparedExternalOperation>),
+}
+
+pub enum ChannelWait {
+    Send { channel: ChannelId, value: Value },
+    Receive { channel: ChannelId },
+}
+
+pub enum ResumeInput {
+    Returned(Value),
+    Failed(SemaError),
+    Cancelled(CancelReason),
+}
+
+pub trait NativeContinuation: Trace {
+    fn resume(
+        self: Box<Self>,
+        context: &mut NativeCallContext<'_>,
+        input: ResumeInput,
+    ) -> NativeResult;
+}
 ```
 
 The shell above is introduced as the first prerequisite of Task 3 so
@@ -382,15 +427,36 @@ call capability. Native code requests Sema execution only through
 routing.
 
 Preserve the public `NativeFn.func` ABI exactly as
-`Fn(&EvalContext, &[Value]) -> Result<Value, SemaError>` and preserve all current
-constructors, including `with_payload`. Add a private optional `runtime_func`,
-an internal `invoke_runtime`, and public `simple_result` and
-`with_context_result` constructors for runtime-aware implementations. Calling a
-runtime-aware native through legacy `func` returns a clear internal error. Task
-02 does not migrate call sites or reinterpret legacy constructors.
+`Fn(&EvalContext, &[Value]) -> Result<Value, SemaError>` and preserve every
+legacy constructor, including `with_payload`. Add a private optional
+`runtime_func`; do not expose it or add `is_runtime_aware`. Add public
+`simple_result` and `with_context_result` constructors. They install the
+runtime-aware function in `runtime_func` and install a named internal-error
+function in the public legacy `func` slot.
+
+Cross-crate VM dispatch uses only this adapter:
+
+```rust
+impl NativeFn {
+    #[doc(hidden)]
+    pub fn invoke_runtime(
+        &self,
+        eval_context: &EvalContext,
+        runtime_context: &mut NativeCallContext<'_>,
+        args: &[Value],
+    ) -> NativeResult;
+}
+```
+
+`invoke_runtime` calls `runtime_func` when present; otherwise it invokes the
+unchanged legacy `func` and adapts its successful value to
+`NativeOutcome::Return`. It is public only because `sema-vm` is a separate
+crate. Task 02 does not migrate call sites or reinterpret legacy constructors.
 
 Continuation types remain consuming and traceable. `NativeCall`,
-`NativeSuspend`, waits, and `ResumeInput` define requests only. Timer queues,
+`NativeSuspend`, `WaitKind`, and `ResumeInput` are the complete protocol; there
+is no redundant `WaitRequest`. These linear types do not implement `Clone`.
+Timer queues,
 promise/channel lookup, actual suspension, and `NativeOutcome::Call` execution
 are deferred.
 
@@ -458,6 +524,20 @@ or subtracted merely because their types implement `Trace`. `cycle.rs` delegates
 only when a runtime object is an actual opaque collector payload registered via
 the existing payload tracer. Opaque payloads must delegate all real Sema edges;
 host-only payloads emit none.
+
+Protocol tracing is structural with exact direct multiplicity. `NativeCall`
+traces `callable`, each argument, and its continuation. `NativeSuspend` traces
+its wait and continuation. `WaitKind` traces only the selected variant's direct
+edges: timer, promise ID, and channel receive emit none; channel send traces its
+value; external delegates to the prepared operation. `ResumeInput` traces its
+contained runtime value or error as applicable. Do not add blanket `Trace`
+implementations for `Rc<T>` or `Box<T>`; each protocol owner delegates
+explicitly. `CancelHook`, decoder, resource, and continuation delegation follows
+the ownership rules above.
+
+The existing `NativeFn` payload-tracer registration remains the only actual
+opaque collector delegation. Implementing `Trace` does not make an external
+root a collector candidate.
 
 ## Legacy bridge and deletion schedule
 
@@ -527,11 +607,18 @@ output routing, migration of existing `EvalContext` fields, production
 
 ## Task 4: Complete native protocol, dual path, and tracing
 
-- [ ] Test return/call/suspend requests, each `ResumeInput`, consuming
-  continuation behavior, legacy constructor compatibility, runtime-aware legacy
-  invocation error, and `with_payload` preservation.
+- [ ] Test exact return/call/suspend shapes, all four `WaitKind` variants and
+  both `ChannelWait` variants, each `ResumeInput`, consuming continuation
+  behavior, and the absence of `Clone`/a second wait-request type.
+- [ ] Test every legacy constructor through `invoke_runtime` adapts success to
+  `Return`; test `simple_result`/`with_context_result`, their named internal
+  error through public `func`, private runtime metadata, and `with_payload`
+  preservation.
 - [ ] Test exact duplicate-edge multiplicity and a failed borrow after partial
-  sink emission. Test payload delegation only for an actual opaque payload.
+  sink emission. Pin direct trace edges for call, suspend, every wait/resume
+  variant, prepared decoder/resource (never job), and interruptible hook only.
+  Test payload delegation only for an actual opaque payload and prove traced
+  external records remain external roots.
 - [ ] Implement and run the `native` filter plus `cargo test -p sema-core cycle`.
 
 ## Task 5: Implement the task-context extension shell

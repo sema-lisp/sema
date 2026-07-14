@@ -237,9 +237,13 @@ ready there.
 
 Wait lookup uses `(WaitId, WaitGeneration)`. Each registration also stores its
 `OperationId`, decoder, cancellation policy, and waiting task.
-`RegisteredExternalWait` is the only registered external shape and is traced:
-its decoder and continuation visit every retained Sema value. Cleanup/resource
-hooks remain host-only and must not capture untraced `Value`/`Env` state.
+`RegisteredExternalWait` is the only registered external shape. Its `Trace`
+implementation delegates to its decoder and continuation with exact direct
+multiplicity. The record remains an external root despite implementing `Trace`;
+it is not a collector candidate unless separately installed as an opaque
+payload through the existing payload-tracer registration. Cleanup/resource
+hooks follow the Task 02 trace contract and must not capture untraced
+`Value`/`Env` state.
 Cancellation or completion removes the wait registration before invoking
 callbacks. A late or duplicate completion is counted and discarded; it never
 resumes another wait.
@@ -270,9 +274,10 @@ transfers quarantine ownership before the task may settle. Bound expiry names
 an invariant failure and keeps ownership until completion/reap makes accounting
 safe.
 
-`Runtime::apply_native_suspend` owns one external-registration transaction. For
-`WaitKind::External`, it destructures the sole
-`Box<PreparedExternalOperation>` exactly once, allocates `OperationId`,
+`Runtime::apply_native_suspend` owns one external-registration transaction. It
+reads `NativeSuspend.wait`; for `WaitKind::External`, it reads
+`prepared.completion_kind()` to issue the complete identity before moving the
+sole `Box<PreparedExternalOperation>` into registrar binding. It allocates `OperationId`,
 `WaitId`, `WaitGeneration`, and completion identity, and installs `RegisteredExternalWait`, the concrete
 `ResourceClass` cleanup entry, and the task's `Running -> Waiting` state. Its
 private registrar binds that runtime-issued identity and prepared operation,
@@ -292,8 +297,9 @@ continuation, VM/task bookkeeping, and pending transition; drop that borrow;
 construct `NativeCallContext` from mutable task context and a cancellation
 snapshot and invoke decoder/callback/continuation; then reborrow state only to
 validate and apply the returned transition. VM execution of
-`NativeOutcome::Call` remains explicit runtime work, not a capability on the
-context. Tests cover suspend/resume/suspend
+`NativeOutcome::Call` invokes the callable's doc-hidden
+`NativeFn::invoke_runtime` cross-crate and remains explicit runtime work, not a
+capability on the context. Tests cover suspend/resume/suspend
 through one continuation, a callback that enqueues a completion while running,
 and nested native-to-Sema-to-native suspension; none may panic from a nested
 `RefCell` borrow or process the enqueued completion reentrantly.

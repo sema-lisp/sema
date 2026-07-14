@@ -102,16 +102,53 @@ pub struct CompletionSink {
     wait_id: WaitId,
     generation: WaitGeneration,
     operation_id: OperationId,
+    kind: CompletionKind,
+}
+
+impl CompletionSink {
+    pub fn complete(self, result: Result<SendPayload, ExternalFailure>) {
+        let Self {
+            sender,
+            runtime_id,
+            wait_id,
+            generation,
+            operation_id,
+            kind,
+        } = self;
+        let _ = sender.send(ExternalCompletion {
+            runtime_id,
+            wait_id,
+            generation,
+            operation_id,
+            kind,
+            result,
+        });
+    }
 }
 
 pub trait IoJob: Send + 'static {
-    fn resource_class(&self) -> ResourceClassDescriptor;
-    fn run(self: Box<Self>, sink: CompletionSink) -> RunningJob;
+    fn run(self: Box<Self>, sink: CompletionSink);
 }
 
-pub struct RunningJob {
+/// Constructed and consumed only on the interpreter thread.
+pub struct PreparedExternalOperation {
     pub operation_id: OperationId,
+    pub completion_kind: CompletionKind,
+    pub decoder: Box<dyn CompletionDecoder>,
     pub resource: ResourceClass,
+    pub job: Box<dyn IoJob>,
+}
+
+/// Immediate pool-admission receipt; never owns runtime cleanup state.
+pub struct RunningJob {
+    operation_id: OperationId,
+    executor_job_id: u64,
+}
+
+pub enum SubmitError {
+    LeaseShuttingDown,
+    QueueClosed,
+    AdmissionRejected,
 }
 
 pub trait IoExecutor: Send + Sync {
@@ -122,19 +159,35 @@ pub trait IoExecutor: Send + Sync {
 pub struct ExecutorLease { /* private runtime id and shared-pool handle */ }
 
 impl ExecutorLease {
-    pub fn submit(&self, job: Box<dyn IoJob>, sink: CompletionSink) -> RunningJob;
+    pub fn submit(
+        &self,
+        job: Box<dyn IoJob>,
+        sink: CompletionSink,
+    ) -> Result<RunningJob, SubmitError>;
     pub fn snapshot(&self) -> ExecutorSnapshot;
     pub fn shutdown(&self, deadline: Instant) -> ExecutorShutdown;
 }
 ```
+
+`PreparedExternalOperation` is a runtime-side bundle, not a worker message. The
+runtime destructures it, installs the decoder and `ResourceClass` (including the
+cancel hook) in `WaitRegistry`/`CleanupRegistry`, creates a `CompletionSink` with
+the runtime-selected `CompletionKind`, and only then sends the `Box<dyn IoJob>`
+to the executor. `IoJob::run` reports through its sink and returns `()`; worker
+code cannot select the completion kind, return a resource/cancel hook, or move
+VM-side cleanup state across the thread boundary. `RunningJob` is only an
+immediate admission receipt.
 
 Each interpreter runtime owns one `ExecutorLease` over the process-wide pool.
 Lease shutdown rejects new jobs for that runtime, cancels/drains only its jobs,
 and unregisters the lease without stopping jobs belonging to another
 interpreter. The shared pool may stop workers after the final lease closes or an
 explicit process shutdown. `Runtime::start_external` allocates and installs the
-wait registration before it calls the lease's `submit`, preventing a
-completion-before-registration race. The executor never decodes a Sema value.
+wait/resource registration before it calls the lease's `submit`, preventing a
+completion-before-registration race. If `submit` returns `Err`, the runtime
+deterministically unregisters that wait, invokes or transfers cleanup exactly
+once, and records the rejected operation; no task remains parked. The executor
+never decodes a Sema value.
 Panic is caught at the job boundary and delivered as
 `ExternalFailure::WorkerPanic`; it does not silently drop the wait.
 
@@ -191,14 +244,31 @@ code that enforces it before dispatch.
 
 - [ ] **Step 1: Write failing seam tests**
 
-Cover completion before `submit` returns, cancellation before job starts,
-cancellation during job, cancel twice, job panic, executor rejection, wrong
-runtime/generation/operation, duplicate completion, quarantine completion after
-observer cancellation, and shutdown with one job in each state.
+First use fake jobs/executors to pin the interface itself:
 
-- [ ] **Step 2: Implement `IoJob`, one-pool submission, and counters**
+- `completion_sink_carries_runtime_selected_kind` — a worker can submit a result
+  but cannot choose or overwrite the private kind;
+- `io_job_returns_unit_and_only_send_work_crosses` — the fake job is `Send`, its
+  `run` result is `()`, and a deliberately non-`Send` runtime cancel hook remains
+  in the prepared operation/registry;
+- `completion_before_submit_returns_is_safe` — registration exists before the
+  executor runs the job inline and returns its receipt;
+- `submit_rejection_rolls_back_wait_and_resource` — every `SubmitError` leaves
+  zero waits/resources and runs cleanup once;
+- `running_job_receipt_does_not_own_resource` — executor accounting cannot take
+  over the runtime cancel hook.
+
+Then cover cancellation before job starts, cancellation during job, cancel
+twice, job panic, wrong runtime/generation/operation/kind, duplicate completion,
+quarantine completion after observer cancellation, and shutdown with one job in
+each state.
+
+- [ ] **Step 2: Implement prepared operations, `IoJob`, admission, and counters**
 
 Preserve the process-wide pool identity and blocking-tier admission headroom.
+Keep `CompletionSink` fields private and expose one result-delivery method so a
+job cannot forge identity or kind. Store the runtime `ResourceClass` before
+submission and implement rejection rollback before migrating any builtin.
 Remove public `io_block_on` once all callers in this layer are migrated; until
 then its inventory row must list the exact remaining caller and deletion step.
 

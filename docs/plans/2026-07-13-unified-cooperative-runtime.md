@@ -315,6 +315,13 @@ completion payloads. They MUST NOT receive or return `Value`, `Env`,
 `EvalContext`, VM/native frames, task-local guards, `Rc`, or pointers into the
 interpreter.
 
+Before submission, the runtime registers the exact wait generation, decoder,
+runtime-selected completion kind, and concrete resource/cancel hook. Only the
+send-only job and a private identity/kind-bearing completion sink cross to the
+worker. The job reports a result through that sink and returns no resource or
+runtime state; submission rejection rolls back the registered wait/resource
+exactly once.
+
 All conversion to and from Sema values, continuation execution, promise
 settlement, tracing, and GC interaction occurs on the interpreter thread.
 Compile-time types should make the boundary difficult to violate; source scans

@@ -205,3 +205,49 @@ fn unified_runtime_legacy_symbols_match_baseline() {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+#[test]
+fn unified_runtime_scanner_detects_raw_blocking_recv_fixture() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let fixture =
+        root.join("crates/sema/tests/fixtures/unified_runtime_legacy/raw_blocking_recv.rs");
+    let output = Command::new(root.join("scripts/check-unified-runtime-legacy.sh"))
+        .args([
+            "--scan-path",
+            fixture.to_str().expect("fixture path is UTF-8"),
+        ])
+        .current_dir(&root)
+        .output()
+        .expect("scan raw blocking recv fixture");
+
+    assert!(
+        output.status.success(),
+        "fixture scan failed with {}\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("raw_blocking_recv.rs:4:    let _ = receiver.recv();"),
+        "raw blocking recv was not reported; stdout:\n{stdout}"
+    );
+}
+
+#[test]
+fn unified_runtime_inventory_mapping_covers_exact_current_matches() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let output = Command::new(root.join("scripts/check-unified-runtime-inventory.sh"))
+        .arg("--check")
+        .current_dir(&root)
+        .output()
+        .expect("run unified runtime inventory checker");
+
+    assert!(
+        output.status.success(),
+        "inventory checker failed with {}\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}

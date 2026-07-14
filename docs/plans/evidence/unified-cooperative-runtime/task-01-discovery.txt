@@ -1,5 +1,5 @@
 Task 01 discovery output
-Generated from the unified runtime worktree before production changes.
+Generated after Task 01 test/harness edits and before production runtime behavior changes.
 
 COMMAND 1
 rg -n "IoHandle|IoPoll|YieldReason|Scheduler(Target|RunResult)|run_until_reentrant|call_run_scheduler|set_yield_signal|take_resume_value|in_async_context|io_block_on|block_on|thread_local!" crates playground -g '*.rs' -g '*.js' -g '*.ts' | LC_ALL=C sort

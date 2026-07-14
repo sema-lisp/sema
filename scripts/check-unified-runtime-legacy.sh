@@ -3,35 +3,62 @@ set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 baseline="$repo_root/docs/plans/evidence/unified-cooperative-runtime/legacy-symbols.baseline"
-current="$(mktemp)"
-trap 'rm -f "$current"' EXIT
+legacy_pattern='IoHandle|IoPoll|YieldReason|SchedulerTarget|SchedulerRunResult|set_yield_signal|take_yield_signal|set_resume_value|take_resume_value|set_(eval|call|call_owned|spawn|cancel|run_scheduler)_callback|eval_callback|call_callback(_owned)?|call_(spawn|cancel|run_scheduler)|run_until_reentrant|tasks\.remove\(|in_async_context|io_block_on|\bblock_on\b|thread::sleep|std::thread::sleep|blocking_recv|recv_timeout|\.recv\(\)|HTTP_AWAIT_MARKER|MAX_REPLAYS|XmlHttpRequest|XMLHttpRequest|Atomics::wait|Atomics\.wait|installAtomicsSleep'
 
 scan_legacy_symbols() {
   cd "$repo_root"
-  rg -n --no-heading --color never \
+  rg -n --with-filename --no-heading --color never \
     -g '*.rs' \
     -g '*.js' \
     -g '*.ts' \
     -g '!crates/sema/src/web/assets/**' \
     -g '!playground/src/examples.js' \
-    'IoHandle|IoPoll|YieldReason|SchedulerTarget|SchedulerRunResult|set_yield_signal|take_yield_signal|set_resume_value|take_resume_value|set_(eval|call|call_owned|spawn|cancel|run_scheduler)_callback|eval_callback|call_callback(_owned)?|call_(spawn|cancel|run_scheduler)|run_until_reentrant|tasks\.remove\(|in_async_context|io_block_on|\bblock_on\b|thread::sleep|std::thread::sleep|blocking_recv|recv_timeout|HTTP_AWAIT_MARKER|MAX_REPLAYS|XmlHttpRequest|XMLHttpRequest|Atomics::wait|Atomics\.wait|installAtomicsSleep' \
-    crates/*/src playground/src \
+    "$legacy_pattern" \
+    "$@" \
     | LC_ALL=C sort -u
 }
 
-scan_legacy_symbols >"$current"
+require_nonempty_scan() {
+  local scan_file="$1"
+  if [[ ! -s "$scan_file" ]]; then
+    echo "legacy scan returned no matches; scanner coverage is broken" >&2
+    exit 2
+  fi
+}
 
-if [[ ! -s "$current" ]]; then
-  echo "legacy scan returned no matches; scanner coverage is broken" >&2
-  exit 2
-fi
+scan_production() {
+  cd "$repo_root"
+  scan_legacy_symbols crates/*/src playground/src
+}
 
 case "${1:-}" in
+  --scan-path)
+    if [[ $# -ne 2 ]]; then
+      echo "usage: $0 --scan-path PATH" >&2
+      exit 2
+    fi
+    current="$(mktemp)"
+    trap 'rm -f "$current"' EXIT
+    scan_legacy_symbols "$2" >"$current"
+    require_nonempty_scan "$current"
+    cat "$current"
+    ;;
+  --scan-production)
+    scan_production
+    ;;
   --write-baseline)
+    current="$(mktemp)"
+    trap 'rm -f "$current"' EXIT
+    scan_production >"$current"
+    require_nonempty_scan "$current"
     mkdir -p "$(dirname "$baseline")"
     cp "$current" "$baseline"
     ;;
   ""|--check)
+    current="$(mktemp)"
+    trap 'rm -f "$current"' EXIT
+    scan_production >"$current"
+    require_nonempty_scan "$current"
     if [[ ! -f "$baseline" ]]; then
       echo "legacy baseline is missing; run $0 --write-baseline" >&2
       exit 2
@@ -43,7 +70,7 @@ case "${1:-}" in
     fi
     ;;
   *)
-    echo "usage: $0 [--check|--write-baseline]" >&2
+    echo "usage: $0 [--check|--write-baseline|--scan-production|--scan-path PATH]" >&2
     exit 2
     ;;
 esac

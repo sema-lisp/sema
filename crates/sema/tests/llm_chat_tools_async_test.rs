@@ -232,7 +232,8 @@ fn tools_async_cancel_leaves_no_slab_entry_and_next_call_works() {
         (let ((p (async/spawn (fn ()
                     (llm/chat (list (message :user "go"))
                       {:model "fake-model" :tools [ping] :max-tool-rounds 12})))))
-          (try (async/timeout 250 p) (catch e nil)))
+          (async/spawn (fn () (async/sleep 250) (async/cancel p)))
+          (try (async/await p) (catch e nil)))
     "#;
     let _ = interp.eval_str_compiled(cancel_src);
     assert_eq!(

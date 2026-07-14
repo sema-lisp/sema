@@ -322,12 +322,12 @@ fn async_stream_mid_stream_error_after_partial_deltas() {
     );
 }
 
-/// Cancelling a task parked mid-stream (via `async/timeout`) abandons the run
+/// Explicitly cancelling a task parked mid-stream abandons the run
 /// (best-effort: the wire worker streams to completion into a dead channel,
 /// discarded) and leaves the runtime healthy — a fresh stream completes.
 #[test]
 fn cancelled_stream_is_cut_short_and_runtime_stays_healthy() {
-    // 40 chunks x 50 ms ≈ 2 s stream against a 150 ms timeout.
+    // 40 chunks x 50 ms ≈ 2 s stream, cancelled after 150 ms.
     let chunks: Vec<String> = (0..40).map(|i| format!("s{i}")).collect();
     let refs: Vec<&str> = chunks.iter().map(|s| s.as_str()).collect();
     let fake = FakeProvider::builder("fake")
@@ -339,10 +339,11 @@ fn cancelled_stream_is_cut_short_and_runtime_stays_healthy() {
 
     let program = r#"
         (define got 0)
-        (try (async/timeout 150
-               (async/spawn (fn ()
-                 (llm/stream "slow" (fn (c) (set! got (+ got 1)))))))
-             (catch e nil))
+        (define stream-p
+          (async/spawn (fn ()
+            (llm/stream "slow" (fn (c) (set! got (+ got 1)))))))
+        (async/spawn (fn () (async/sleep 150) (async/cancel stream-p)))
+        (try (async/await stream-p) (catch e nil))
         (define out "")
         (async/await (async/spawn (fn ()
           (llm/stream "again" (fn (c) (set! out (string-append out c)))))))
@@ -354,7 +355,7 @@ fn cancelled_stream_is_cut_short_and_runtime_stays_healthy() {
     let got = items[0].as_int().unwrap_or(-1);
     assert!(
         got < 40,
-        "timeout must cut the stream short (saw {got} of 40 deltas)"
+        "explicit cancellation must cut the stream short (saw {got} of 40 deltas)"
     );
     assert_eq!(
         items[1].as_str(),
@@ -387,15 +388,17 @@ fn cancelled_stream_slab_entries_are_reaped() {
     // Shape 2: an :on-text agent round, cancelled mid-stream — the agent slab
     // entry AND its in-flight stream entry must both be gone.
     let program = r#"
-        (try (async/timeout 150
-               (async/spawn (fn ()
-                 (llm/stream "slow" (fn (c) nil)))))
-             (catch e nil))
+        (define stream-p
+          (async/spawn (fn ()
+            (llm/stream "slow" (fn (c) nil)))))
+        (async/spawn (fn () (async/sleep 150) (async/cancel stream-p)))
+        (try (async/await stream-p) (catch e nil))
         (defagent bot {:model "fake-model" :max-turns 4})
-        (try (async/timeout 150
-               (async/spawn (fn ()
-                 (agent/run bot "go" {:on-text (fn (c) nil)}))))
-             (catch e nil))
+        (define agent-p
+          (async/spawn (fn ()
+            (agent/run bot "go" {:on-text (fn (c) nil)}))))
+        (async/spawn (fn () (async/sleep 150) (async/cancel agent-p)))
+        (try (async/await agent-p) (catch e nil))
         nil
     "#;
     let (result, _) = eval_with_fake(program, fake);

@@ -205,6 +205,11 @@ correct declared kind but fails the decoder's concrete downcast becomes a named
 `Decode` failure for that operation; wrong-kind delivery never changes the
 waiting task's outcome.
 
+The interpreter runtime selects `CompletionKind` while registering the wait and
+copies it into the private `CompletionSink` defined in Task 05. A worker job can
+deliver only its send-safe result through that sink; it cannot select a kind,
+forge identity fields, or return a runtime-side decoder/resource hook.
+
 ```rust
 pub type NativeResult = Result<NativeOutcome, SemaError>;
 
@@ -379,7 +384,9 @@ Use `static_assertions` already available in the workspace, or a small local
 correct-kind payload with the wrong concrete type becomes a named decode error;
 Task 03 tests that a wrong declared kind is discarded before decoding and leaves
 the task unchanged. Test interrupt cancellation twice and bounded-resource
-zero-deadline/zero-work rejection.
+zero-deadline/zero-work rejection. Also prove the decoder and concrete
+`ResourceClass` remain runtime-side; Task 05 separately proves only the
+`Box<dyn IoJob>` and private completion sink cross to the pool.
 
 - [ ] **Step 2: Implement the envelope and policies**
 

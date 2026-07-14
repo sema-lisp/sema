@@ -15,6 +15,8 @@ Start commit: `b19e5cad` (`docs: expand unified runtime implementation plan`)
   `.superpowers/` directory.
 - This layer changes tests, a test helper, source guards, and planning evidence.
   It does not change production behavior.
+- Discovery/evidence chronology is after Task 01 test/harness edits and before
+  production runtime behavior changes.
 - The perpetual fairness program was removed from the in-process test crate and
   placed behind a ten-second subprocess watchdog.
 - Execution-plan correction: the watchdog must be reusable by sibling
@@ -46,6 +48,26 @@ The pre-settled race result differs from the plan's provisional RED prediction.
 That is a baseline capability, not a weakened oracle: the language-level result
 already satisfies the approved observation contract.
 
+## Independent-review amendment results
+
+| Test/command | RED first | Corrected result |
+| --- | --- | --- |
+| `runtime_conformance_test unified_runtime_scanner_detects_raw_blocking_recv_fixture` | Exit 101: scanner rejected unsupported `--scan-path`; after adding the option it still omitted the filename until `--with-filename` was required. | PASS, 0.02s; exact fixture `path:line:text` observed. |
+| `runtime_conformance_test unified_runtime_inventory_mapping_covers_exact_current_matches` | Exit 101: inventory checker did not exist. | PASS, 0.25s; checker covers 1,257 exact production matches. |
+| `unified_runtime_watchdog_test noisy_child_is_drained_without_hanging_and_capture_is_bounded` | Exit 101 after 5.00s: pipe backpressure misclassified the noisy child as hung. | PASS, 1.32s; both streams drain concurrently and retained diagnostics are capped at 64 KiB. |
+| `unified_runtime_watchdog_test inherited_pipe_writer_does_not_extend_parent_watchdog` | Exit 101 compile error: `run_command_with_timeout` was absent. | PASS, 0.01s; Unix process-group cleanup closes inherited writers, joins drains, and leaves no descendant. |
+| `vm_async_test async_all_surfaces_first_settled_rejection` | Review found an invalid implicit sibling-cancellation claim. | PASS, 0.02s; the test now asserts only first-settlement error selection. |
+| `embed_timeout_reap_test` | Review found timeout observation used as a cancellation owner. | 3 passed in 0.32s using explicit `async/cancel`; normal control uses plain await. |
+| `true_cancel_test` | Review found timeout observation used to prove resource abort. | 6 passed in 10.95s using explicit `async/cancel`; process/LLM abort and normal controls remain exact. |
+| Agent/stream/MCP cancellation companions | Review found timeout observation used to prove slab/resource cleanup. | Three agent cases, two stream cases, two breaker cases, chat-tools, and MCP all passed individually with explicit cancellation. |
+
+Fix rationale: `async/all`, `async/race`, and `async/timeout` only observe
+supplied promises, so cleanup/abort ownership must be expressed by
+`async/cancel`. The watchdog drains while polling to avoid pipe deadlock and, on
+Unix, owns a process group so drain joins cannot be held forever by descendants.
+The inventory uses match-level evidence because path-family tables cannot prove
+that mixed cancellation/context policies received distinct migration rows.
+
 ## Complete affected targets
 
 | Command | Result | Elapsed | Classification |
@@ -56,19 +78,45 @@ already satisfies the approved observation contract.
 
 No affected target hung.
 
+Amendment full-target regression sweep:
+
+| Command target | Result | Elapsed |
+| --- | --- | ---: |
+| `vm_async_test` | 111 passed, 7 approved RED | 3.08s |
+| `unified_runtime_watchdog_test` | 2 passed, 1 approved fairness RED | 4.10s |
+| `runtime_conformance_test` | 4 passed | 0.24s |
+| `true_cancel_test` | 6 passed | 10.96s |
+| `embed_timeout_reap_test` | 3 passed | 0.31s |
+| `agent_async_test` | 7 passed | 2.66s |
+| `stream_async_test` | 10 passed | 0.60s |
+| `agent_async_breaker_test` | 10 passed | 2.26s |
+| `llm_chat_tools_async_test` | 7 passed | 1.23s |
+| `mcp_async_test` | 8 passed | 0.44s |
+
+The seven VM RED cases remain exactly: scheduled supplied-promise survival for
+`all`/`race`, captured-cell mutation, channel capacity panic, negative
+sleep/timeout validation, and the finite tick ceiling. The watchdog RED remains
+exactly the ready-storm/timer fairness case; both harness self-regressions pass.
+
 ## Inventory and source guard
 
-The two required discovery commands returned 868 and 1,074 sorted matches.
-Their verbatim sorted output, including the exact commands, is committed in
-[`task-01-discovery.txt`](task-01-discovery.txt). Every production path in the
-union maps to a ledger row in
-[`async-runtime-inventory.md`](../../../internals/async-runtime-inventory.md).
-Tests, examples, documentation, generated assets, and host-owned test
-interpreters map to verification rows V01–V10.
+The original broad discovery commands returned 868 and 1,074 sorted matches;
+their verbatim output remains in
+[`task-01-discovery.txt`](task-01-discovery.txt) as historical discovery captured
+after Task 01 harness edits and before production behavior changes.
+
+The executable coverage gate scopes both discovery scans to `crates/*/src` and
+`playground/src`, then unions them with the legacy production scan. The current
+counts are 807 mechanism matches, 302 language/callback matches, 971 legacy
+matches, and 1,257 sorted unique union records. Every exact `path:line:text`
+record has a stable row ID in
+[`runtime-match-map.tsv`](runtime-match-map.tsv), and
+`scripts/check-unified-runtime-inventory.sh --check` rejects scan failures,
+malformed/duplicate/stale/missing mappings, or missing ledger rows.
 
 `scripts/check-unified-runtime-legacy.sh` scans every `crates/*/src` and
 `playground/src` Rust/JavaScript/TypeScript source for the master plan's legacy
-runtime tokens. Its only source exclusions are the exact generated paths
+runtime tokens, including raw synchronous `.recv()`. Its only source exclusions are the exact generated paths
 `crates/sema/src/web/assets/**` and `playground/src/examples.js`; it cannot
 exclude an unlisted production crate directory.
 It rejects an empty scan, prints current matches on stdout, emits a unified diff
@@ -80,16 +128,18 @@ Verification:
 | --- | --- |
 | `scripts/check-unified-runtime-legacy.sh --write-baseline` | Wrote a nonempty baseline. |
 | `scripts/check-unified-runtime-legacy.sh --check` | PASS; current scan equals baseline. |
-| `wc -l docs/plans/evidence/unified-cooperative-runtime/legacy-symbols.baseline` | 956 lines. |
+| `wc -l docs/plans/evidence/unified-cooperative-runtime/legacy-symbols.baseline` | 971 lines. |
 | `LC_ALL=C sort -c -u docs/plans/evidence/unified-cooperative-runtime/legacy-symbols.baseline` | PASS. |
+| `scripts/check-unified-runtime-inventory.sh --check` | PASS; 1,257 exact production matches mapped. |
 
 ## Formatting and diff checks
 
 | Command | Result |
 | --- | --- |
-| `rustfmt --edition 2021 --check crates/sema/tests/common/mod.rs crates/sema/tests/common/watchdog.rs crates/sema/tests/runtime_conformance_test.rs crates/sema/tests/unified_runtime_watchdog_test.rs crates/sema/tests/vm_async_test.rs` | PASS. |
+| `rustfmt --edition 2021 --check` on all 11 modified Rust test/helper files | PASS. |
 | `git diff --check` | PASS. |
 | `cargo fmt --all -- --check` | Baseline RED only in untouched `crates/sema/tests/stream_file_async_test.rs` and `crates/sema-stdlib/src/async_ops.rs`. Task 01 files are clean under the targeted `rustfmt` check. |
+| `jake docs-check` | PASS; 1 selected docs test passed. |
 
 ## RED handoff
 

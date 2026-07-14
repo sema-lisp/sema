@@ -357,7 +357,7 @@ fn queue_wakeup_five_queued_calls_all_complete() {
 // ── Scenario 5: cancellation tombstones the connection ──────────────────────
 //
 // The mock server sleeps a few real seconds before answering (long enough
-// that a short `async/timeout` always wins the race, short enough the
+// that explicit cancellation always stops the awaiting task first, short enough the
 // orphaned child process exits on its own soon after — no indefinite zombie).
 
 const SLEEPY_SERVER: &str = r#"
@@ -401,17 +401,17 @@ fn cancellation_tombstones_connection_and_interpreter_stays_healthy() {
         .expect("connect");
 
     let program = r#"
-        (try
-          (async/timeout 200 (async/spawn (fn () (mcp/call h "hang" {}))))
-          (catch e :caught))
+        (define p (async/spawn (fn () (mcp/call h "hang" {}))))
+        (async/spawn (fn () (async/sleep 200) (async/cancel p)))
+        (try (async/await p) (catch e :caught))
     "#;
     let result = interp
         .eval_str(program)
-        .expect("timeout-abandoned mcp/call evaluated");
+        .expect("explicitly cancelled mcp/call evaluated");
     assert_eq!(
         result,
         Value::keyword("caught"),
-        "async/timeout must win the race against the slow server"
+        "explicit cancellation must stop the slow call"
     );
 
     // A follow-up call on the now-tombstoned handle must fail fast with the
@@ -733,8 +733,8 @@ fn async_context_mid_call_401_noninteractive_reauth_fails_cleanly() {
     // `scheduler.rs` — it never resumes the task's own Sema code with a
     // catchable in-task exception). So `try`/`catch` must wrap the COMBINATOR
     // awaiting that task's promise (`async/all`, same idiom as the existing
-    // `cancellation_tombstones_connection...` scenario's `(try (async/timeout
-    // ...) (catch e ...))`), not the `mcp/call` expression itself — a `try`
+    // `cancellation_tombstones_connection...` scenario's `(try (async/await p)
+    // (catch e ...))`), not the `mcp/call` expression itself — a `try`
     // placed directly around `mcp/call` inside the failing task would never
     // run its `catch` arm.
     let interp = Interpreter::new();

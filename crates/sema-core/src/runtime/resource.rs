@@ -71,6 +71,10 @@ impl CancelHookError {
             message: message.into(),
         }
     }
+
+    pub fn message(&self) -> &str {
+        &self.message
+    }
 }
 
 pub trait CancelHook {
@@ -97,10 +101,65 @@ impl InterruptibleResource {
     }
 }
 
-pub enum ResourceClass {
+enum ResourceClassInner {
     Interruptible {
         kind: &'static str,
         hook: Box<dyn CancelHook>,
+        cancel_attempted: bool,
     },
     QuarantinedBounded(QuarantineBound),
+}
+
+pub struct ResourceClass(ResourceClassInner);
+
+impl ResourceClass {
+    pub(crate) fn interruptible(kind: &'static str, hook: Box<dyn CancelHook>) -> Self {
+        Self(ResourceClassInner::Interruptible {
+            kind,
+            hook,
+            cancel_attempted: false,
+        })
+    }
+
+    pub(crate) fn quarantined(bound: QuarantineBound) -> Self {
+        Self(ResourceClassInner::QuarantinedBounded(bound))
+    }
+
+    pub fn kind(&self) -> &'static str {
+        match &self.0 {
+            ResourceClassInner::Interruptible { kind, .. } => kind,
+            ResourceClassInner::QuarantinedBounded(_) => "quarantined-bounded",
+        }
+    }
+
+    pub fn bound(&self) -> Option<QuarantineBoundDescriptor> {
+        match &self.0 {
+            ResourceClassInner::Interruptible { .. } => None,
+            ResourceClassInner::QuarantinedBounded(bound) => Some(bound.descriptor()),
+        }
+    }
+
+    pub fn cancel(&mut self) -> Option<Result<CancelDisposition, CancelHookError>> {
+        match &mut self.0 {
+            ResourceClassInner::Interruptible {
+                hook,
+                cancel_attempted,
+                ..
+            } => {
+                if *cancel_attempted {
+                    return None;
+                }
+                *cancel_attempted = true;
+                Some(hook.cancel())
+            }
+            ResourceClassInner::QuarantinedBounded(_) => None,
+        }
+    }
+
+    pub fn reap(&mut self) -> Option<Result<CancelDisposition, CancelHookError>> {
+        match &mut self.0 {
+            ResourceClassInner::Interruptible { hook, .. } => Some(hook.reap()),
+            ResourceClassInner::QuarantinedBounded(_) => None,
+        }
+    }
 }

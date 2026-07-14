@@ -5,6 +5,7 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
+use std::time::Instant;
 
 use super::{
     CompletionDecoder, CompletionDelivery, CompletionKind, CompletionSender, ExternalCompletion,
@@ -47,10 +48,7 @@ impl PreparedExternalOperation {
         Self {
             kind,
             decoder,
-            resource: ResourceClass::Interruptible {
-                kind: resource_kind,
-                hook,
-            },
+            resource: ResourceClass::interruptible(resource_kind, hook),
             job: PreparedJob::Async(Box::new(move || Box::pin(job()))),
         }
     }
@@ -68,10 +66,7 @@ impl PreparedExternalOperation {
         Self {
             kind,
             decoder,
-            resource: ResourceClass::Interruptible {
-                kind: resource_kind,
-                hook,
-            },
+            resource: ResourceClass::interruptible(resource_kind, hook),
             job: PreparedJob::Blocking {
                 class: BlockingDispatchClass::Interruptible,
                 job: Box::new(job),
@@ -91,7 +86,7 @@ impl PreparedExternalOperation {
         Self {
             kind,
             decoder,
-            resource: ResourceClass::QuarantinedBounded(bound),
+            resource: ResourceClass::quarantined(bound),
             job: PreparedJob::Blocking {
                 class: BlockingDispatchClass::QuarantinedBounded,
                 job: Box::new(job),
@@ -100,7 +95,7 @@ impl PreparedExternalOperation {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
 pub struct RuntimeIssuedCompletionIdentity {
     runtime_id: RuntimeId,
     wait_id: WaitId,
@@ -111,30 +106,63 @@ pub struct RuntimeIssuedCompletionIdentity {
 }
 
 impl RuntimeIssuedCompletionIdentity {
-    pub fn runtime_id(self) -> RuntimeId {
+    pub fn runtime_id(&self) -> RuntimeId {
         self.runtime_id
     }
 
-    pub fn wait_id(self) -> WaitId {
+    pub fn wait_id(&self) -> WaitId {
         self.wait_id
     }
 
-    pub fn generation(self) -> WaitGeneration {
+    pub fn generation(&self) -> WaitGeneration {
         self.generation
     }
 
-    pub fn operation_id(self) -> OperationId {
+    pub fn operation_id(&self) -> OperationId {
         self.operation_id
     }
 
-    pub fn kind(self) -> CompletionKind {
+    pub fn kind(&self) -> CompletionKind {
         self.kind
     }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
-#[error("completion identity was issued by a different registrar")]
-pub struct ForeignCompletionIdentity;
+pub enum BindCompletionError {
+    #[error("completion identity was issued by a different registrar")]
+    ForeignIdentity,
+    #[error(
+        "completion kind mismatch: identity expects {expected:?}, operation declares {declared:?}"
+    )]
+    KindMismatch {
+        expected: CompletionKind,
+        declared: CompletionKind,
+    },
+}
+
+impl BindCompletionError {
+    pub fn expected(&self) -> CompletionKind {
+        match self {
+            Self::KindMismatch { expected, .. } => *expected,
+            Self::ForeignIdentity => panic!("foreign identity has no expected kind"),
+        }
+    }
+    pub fn declared(&self) -> CompletionKind {
+        match self {
+            Self::KindMismatch { declared, .. } => *declared,
+            Self::ForeignIdentity => panic!("foreign identity has no declared kind"),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct CompletionIdentity {
+    runtime_id: RuntimeId,
+    wait_id: WaitId,
+    generation: WaitGeneration,
+    operation_id: OperationId,
+    kind: CompletionKind,
+}
 
 #[doc(hidden)]
 pub struct CompletionRegistrar {
@@ -183,10 +211,26 @@ impl CompletionRegistrar {
         &self,
         identity: RuntimeIssuedCompletionIdentity,
         prepared: PreparedExternalOperation,
-    ) -> Result<ExternalOperationBinding, ForeignCompletionIdentity> {
+    ) -> Result<ExternalOperationBinding, BindCompletionError> {
         if identity.runtime_id != self.runtime_id || identity.authority != self.authority {
-            return Err(ForeignCompletionIdentity);
+            destroy_prepared(prepared);
+            return Err(BindCompletionError::ForeignIdentity);
         }
+        if identity.kind != prepared.kind {
+            let error = BindCompletionError::KindMismatch {
+                expected: identity.kind,
+                declared: prepared.kind,
+            };
+            destroy_prepared(prepared);
+            return Err(error);
+        }
+        let identity = CompletionIdentity {
+            runtime_id: identity.runtime_id,
+            wait_id: identity.wait_id,
+            generation: identity.generation,
+            operation_id: identity.operation_id,
+            kind: identity.kind,
+        };
         let PreparedExternalOperation {
             kind: _declared_kind,
             decoder,
@@ -301,7 +345,7 @@ pub enum ExecutorStartDecision {
 
 struct CompletionSink {
     sender: Arc<dyn CompletionSender>,
-    identity: RuntimeIssuedCompletionIdentity,
+    identity: CompletionIdentity,
 }
 
 impl CompletionSink {
@@ -318,7 +362,7 @@ impl CompletionSink {
 }
 
 pub struct ExecutorSubmission {
-    identity: RuntimeIssuedCompletionIdentity,
+    identity: CompletionIdentity,
     sink: Option<CompletionSink>,
     start: ExecutorStartToken,
     job: Option<PreparedJob>,
@@ -355,7 +399,7 @@ impl ExecutorSubmission {
     pub fn reject(self, kind: SubmitErrorKind) -> SubmissionRejected {
         SubmissionRejected {
             kind,
-            submission: self,
+            submission: Box::new(self),
         }
     }
 }
@@ -372,7 +416,7 @@ pub enum BlockingDispatchClass {
 }
 
 pub struct BlockingExecutorDispatch {
-    identity: RuntimeIssuedCompletionIdentity,
+    identity: CompletionIdentity,
     class: BlockingDispatchClass,
     sink: Option<CompletionSink>,
     start: Option<ExecutorStartToken>,
@@ -394,8 +438,19 @@ impl BlockingExecutorDispatch {
             .take()
             .expect("dispatch owns start token")
             .claim_for_run();
+        if decision == ExecutorStartDecision::CompleteCancelled {
+            let delivery = self
+                .sink
+                .take()
+                .expect("dispatch owns sink")
+                .deliver(Err(ExternalFailure::cancelled()));
+            if let Some(job) = self.job.take() {
+                contained_drop(job);
+            }
+            return delivery;
+        }
         let result = match decision {
-            ExecutorStartDecision::CompleteCancelled => Err(ExternalFailure::cancelled()),
+            ExecutorStartDecision::CompleteCancelled => unreachable!(),
             ExecutorStartDecision::Run => run_blocking(self.job.take().expect("dispatch owns job")),
         };
         self.job.take();
@@ -426,7 +481,7 @@ fn run_blocking(job: BlockingJob) -> JobResult {
 }
 
 pub struct AsyncExecutorDispatch {
-    identity: RuntimeIssuedCompletionIdentity,
+    identity: CompletionIdentity,
     sink: Option<CompletionSink>,
     start: Option<ExecutorStartToken>,
     job: Option<AsyncJob>,
@@ -488,7 +543,7 @@ fn construct_async(job: AsyncJob) -> AsyncFutureState {
 }
 
 pub struct AsyncDispatchFuture {
-    identity: RuntimeIssuedCompletionIdentity,
+    identity: CompletionIdentity,
     sink: Option<CompletionSink>,
     future: AsyncFutureState,
 }
@@ -524,8 +579,9 @@ impl Future for AsyncDispatchFuture {
             }
             AsyncFutureState::Done => panic!("completed dispatch future polled again"),
         };
-        self.future = AsyncFutureState::Done;
         let delivery = self.sink.take().expect("future owns sink").deliver(result);
+        let old = std::mem::replace(&mut self.future, AsyncFutureState::Done);
+        contained_drop(old);
         Poll::Ready(delivery)
     }
 }
@@ -535,6 +591,8 @@ impl Drop for AsyncDispatchFuture {
         if let Some(sink) = self.sink.take() {
             let _ = sink.deliver(Err(ExternalFailure::cancelled()));
         }
+        let old = std::mem::replace(&mut self.future, AsyncFutureState::Done);
+        contained_drop(old);
     }
 }
 
@@ -547,7 +605,7 @@ pub enum SubmitErrorKind {
 
 pub struct SubmissionRejected {
     kind: SubmitErrorKind,
-    submission: ExecutorSubmission,
+    submission: Box<ExecutorSubmission>,
 }
 
 impl SubmissionRejected {
@@ -560,8 +618,88 @@ impl SubmissionRejected {
     }
 
     pub fn rollback(self) -> SubmitErrorKind {
-        self.kind
+        let SubmissionRejected { kind, submission } = self;
+        let mut submission = *submission;
+        if let Some(sink) = submission.sink.take() {
+            contained_drop(sink);
+        }
+        if let Some(job) = submission.job.take() {
+            contained_drop(job);
+        }
+        contained_drop(submission.start);
+        kind
     }
+}
+
+fn contained_drop<T>(value: T) {
+    #[cfg(panic = "unwind")]
+    {
+        let _ = catch_unwind(AssertUnwindSafe(|| drop(value)));
+    }
+    #[cfg(panic = "abort")]
+    {
+        drop(value);
+    }
+}
+
+fn destroy_prepared(prepared: PreparedExternalOperation) {
+    let PreparedExternalOperation {
+        decoder,
+        resource,
+        job,
+        ..
+    } = prepared;
+    contained_drop(decoder);
+    contained_drop(resource);
+    contained_drop(job);
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ExecutorSnapshot {
+    pub queued: usize,
+    pub running_interruptible: usize,
+    pub running_quarantined: usize,
+    pub completed: usize,
+    pub cancelled: usize,
+    pub panicked: usize,
+    pub undeliverable: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ExecutorShutdown {
+    Drained(ExecutorSnapshot),
+    DeadlineExceeded(ExecutorSnapshot),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RunningSubmission {
+    operation_id: OperationId,
+}
+impl RunningSubmission {
+    pub fn new(operation_id: OperationId) -> Self {
+        Self { operation_id }
+    }
+    pub fn operation_id(&self) -> OperationId {
+        self.operation_id
+    }
+}
+
+pub trait ExecutorLease: Send + Sync + 'static {
+    /// Reserve capacity before arming with `into_dispatch`; enqueue only the armed dispatch.
+    fn submit(
+        &self,
+        submission: ExecutorSubmission,
+    ) -> Result<RunningSubmission, SubmissionRejected>;
+    fn snapshot(&self) -> ExecutorSnapshot;
+    fn shutdown(&self, deadline: Instant) -> ExecutorShutdown;
+}
+
+pub trait IoExecutor: Send + Sync + 'static {
+    fn attach_runtime(
+        &self,
+        runtime_id: RuntimeId,
+    ) -> Result<Arc<dyn ExecutorLease>, ExecutorAttachError>;
+    fn snapshot(&self) -> ExecutorSnapshot;
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -669,18 +807,25 @@ mod tests {
         Arc<RecordingSender>,
         RuntimeOperationBinding,
         ExecutorSubmission,
-        RuntimeIssuedCompletionIdentity,
+        CompletionIdentity,
     ) {
         let sender = RecordingSender::new(delivery);
         let (_, registrar) = CompletionRegistrar::register(sender.clone()).unwrap();
         let identity = registrar.issue_identity(selected_kind).unwrap();
+        let descriptor = CompletionIdentity {
+            runtime_id: identity.runtime_id(),
+            wait_id: identity.wait_id(),
+            generation: identity.generation(),
+            operation_id: identity.operation_id(),
+            kind: identity.kind(),
+        };
         let (runtime, submission) = registrar.bind(identity, prepared).unwrap().split();
-        (sender, runtime, submission, identity)
+        (sender, runtime, submission, descriptor)
     }
 
     fn blocking(result: JobResult) -> PreparedExternalOperation {
         PreparedExternalOperation::interruptible_blocking(
-            kind(91),
+            kind(1),
             decoder(),
             interruptible(),
             move || result,
@@ -712,6 +857,48 @@ mod tests {
         let (_sender, runtime, _submission, _) =
             registration(prepared, kind(1), CompletionDelivery::Delivered);
         drop(runtime);
+    }
+
+    #[test]
+    fn resource_wrapper_cancels_once_and_reaps_repeatedly() {
+        struct CountingHook {
+            cancel: Rc<Cell<usize>>,
+            reap: Rc<Cell<usize>>,
+        }
+        impl CancelHook for CountingHook {
+            fn cancel(&mut self) -> Result<CancelDisposition, CancelHookError> {
+                self.cancel.set(self.cancel.get() + 1);
+                Ok(CancelDisposition::PendingReap)
+            }
+            fn reap(&mut self) -> Result<CancelDisposition, CancelHookError> {
+                self.reap.set(self.reap.get() + 1);
+                Ok(CancelDisposition::PendingReap)
+            }
+        }
+        let cancel = Rc::new(Cell::new(0));
+        let reap = Rc::new(Cell::new(0));
+        let mut resource = ResourceClass::interruptible(
+            "socket",
+            Box::new(CountingHook {
+                cancel: Rc::clone(&cancel),
+                reap: Rc::clone(&reap),
+            }),
+        );
+        assert_eq!(resource.kind(), "socket");
+        assert_eq!(resource.bound(), None);
+        assert!(resource.cancel().unwrap().is_ok());
+        assert!(resource.cancel().is_none());
+        assert!(resource.reap().unwrap().is_ok());
+        assert!(resource.reap().unwrap().is_ok());
+        assert_eq!(cancel.get(), 1);
+        assert_eq!(reap.get(), 2);
+
+        let bound = QuarantineBound::finite_work("items", std::num::NonZeroU64::new(2).unwrap());
+        let descriptor = bound.descriptor();
+        let mut quarantined = ResourceClass::quarantined(bound);
+        assert_eq!(quarantined.bound(), Some(descriptor));
+        assert!(quarantined.cancel().is_none());
+        assert!(quarantined.reap().is_none());
     }
 
     #[test]
@@ -751,13 +938,11 @@ mod tests {
             }),
         ];
         for operation in prepared {
+            let declared_kind = operation.kind;
             let (_sender, runtime, _submission, _) =
-                registration(operation, kind(2), CompletionDelivery::Delivered);
+                registration(operation, declared_kind, CompletionDelivery::Delivered);
             let (_, resource, _) = runtime.into_parts();
-            assert!(matches!(
-                resource,
-                ResourceClass::Interruptible { .. } | ResourceClass::QuarantinedBounded(_)
-            ));
+            assert!(resource.kind() == "test" || resource.bound().is_some());
         }
     }
 
@@ -772,10 +957,24 @@ mod tests {
     }
 
     #[test]
-    fn registrar_identity_and_kind_override_job_declaration() {
+    fn registrar_rejects_identity_kind_mismatch() {
+        let sender = RecordingSender::new(CompletionDelivery::Delivered);
+        let (_, registrar) = CompletionRegistrar::register(sender.clone()).unwrap();
+        let identity = registrar.issue_identity(kind(7)).unwrap();
+        let error = match registrar.bind(identity, blocking(Ok(Box::new(1_u8)))) {
+            Err(error) => error,
+            Ok(_) => panic!("mismatched completion kinds must be rejected"),
+        };
+        assert_eq!(error.expected(), kind(7));
+        assert_eq!(error.declared(), kind(1));
+        assert_eq!(sender.attempts.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn matching_identity_kind_delivers_declared_kind() {
         let (sender, _runtime, submission, identity) = registration(
             blocking(Ok(Box::new(1_u8))),
-            kind(7),
+            kind(1),
             CompletionDelivery::Delivered,
         );
         let ExecutorDispatch::Blocking(dispatch) = submission.into_dispatch() else {
@@ -783,11 +982,31 @@ mod tests {
         };
         dispatch.run();
         let completion = sender.take();
-        assert_eq!(completion.runtime_id, identity.runtime_id());
-        assert_eq!(completion.wait_id, identity.wait_id());
-        assert_eq!(completion.generation, identity.generation());
-        assert_eq!(completion.operation_id, identity.operation_id());
-        assert_eq!(completion.kind, kind(7));
+        assert_eq!(completion.runtime_id, identity.runtime_id);
+        assert_eq!(completion.wait_id, identity.wait_id);
+        assert_eq!(completion.generation, identity.generation);
+        assert_eq!(completion.operation_id, identity.operation_id);
+        assert_eq!(completion.kind, kind(1));
+    }
+
+    #[test]
+    fn identity_is_consumed_by_bind() {
+        fn bind_once(
+            registrar: &CompletionRegistrar,
+            identity: RuntimeIssuedCompletionIdentity,
+            prepared: PreparedExternalOperation,
+        ) {
+            let _ = registrar.bind(identity, prepared);
+            // A second bind cannot be expressed because `identity` has moved.
+        }
+
+        let sender = RecordingSender::new(CompletionDelivery::Delivered);
+        let (_, registrar) = CompletionRegistrar::register(sender).unwrap();
+        bind_once(
+            &registrar,
+            registrar.issue_identity(kind(1)).unwrap(),
+            blocking(Ok(Box::new(1_u8))),
+        );
     }
 
     #[test]
@@ -812,7 +1031,7 @@ mod tests {
         let (sender, _runtime, submission, identity) =
             registration(prepared, kind(1), CompletionDelivery::Delivered);
         let rejection = submission.reject(SubmitErrorKind::Capacity);
-        assert_eq!(rejection.operation_id(), identity.operation_id());
+        assert_eq!(rejection.operation_id(), identity.operation_id);
         assert_eq!(rejection.rollback(), SubmitErrorKind::Capacity);
         assert_eq!(sender.attempts.load(Ordering::Relaxed), 0);
         assert_eq!(dropped.load(Ordering::Relaxed), 1);
@@ -872,10 +1091,7 @@ mod tests {
     fn blocking_return_error_and_panic_each_deliver_once() {
         let cases = [
             blocking(Ok(Box::new(1_u8))),
-            blocking(Err(ExternalFailure::new(
-                ExternalFailureCode::BoundExceeded,
-                "bound",
-            ))),
+            blocking(Err(ExternalFailure::bound_exceeded("bound"))),
             blocking_panic(),
         ];
         for (index, prepared) in cases.into_iter().enumerate() {
@@ -901,10 +1117,7 @@ mod tests {
 
     #[cfg(panic = "abort")]
     fn blocking_panic() -> PreparedExternalOperation {
-        blocking(Err(ExternalFailure::new(
-            ExternalFailureCode::WorkerPanic,
-            "abort build fixture",
-        )))
+        blocking(Err(ExternalFailure::worker_panic()))
     }
 
     #[test]
@@ -934,12 +1147,7 @@ mod tests {
             kind(1),
             decoder(),
             interruptible(),
-            || async {
-                Err(ExternalFailure::new(
-                    ExternalFailureCode::DeadlineExceeded,
-                    "deadline",
-                ))
-            },
+            || async { Err(ExternalFailure::deadline_exceeded("deadline")) },
         );
         #[cfg(panic = "unwind")]
         let panics = PreparedExternalOperation::interruptible_async(
@@ -953,12 +1161,7 @@ mod tests {
             kind(1),
             decoder(),
             interruptible(),
-            || {
-                std::future::ready(Err(ExternalFailure::new(
-                    ExternalFailureCode::WorkerPanic,
-                    "abort build fixture",
-                )))
-            },
+            || std::future::ready(Err(ExternalFailure::worker_panic())),
         );
 
         for prepared in [normal, returned_error, panics] {
@@ -1155,5 +1358,175 @@ mod tests {
         assert!(poll_once(&mut future).is_ready());
         drop(future);
         assert_eq!(sender.attempts.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    #[cfg(panic = "unwind")]
+    fn ready_result_is_delivered_before_panicking_future_drop() {
+        struct HostileFuture;
+        impl Future for HostileFuture {
+            type Output = JobResult;
+            fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
+                Poll::Ready(Ok(Box::new(1_u8)))
+            }
+        }
+        impl Drop for HostileFuture {
+            fn drop(&mut self) {
+                panic!("hostile future drop");
+            }
+        }
+
+        let prepared = PreparedExternalOperation::interruptible_async(
+            kind(1),
+            decoder(),
+            interruptible(),
+            || HostileFuture,
+        );
+        let (sender, _runtime, submission, _) =
+            registration(prepared, kind(1), CompletionDelivery::Delivered);
+        let ExecutorDispatch::Async(dispatch) = submission.into_dispatch() else {
+            unreachable!()
+        };
+        let mut future = dispatch.into_future();
+        assert!(catch_unwind(AssertUnwindSafe(|| poll_once(&mut future))).is_ok());
+        assert_eq!(sender.attempts.load(Ordering::Relaxed), 1);
+        assert!(sender.take().result.is_ok());
+    }
+
+    #[test]
+    #[cfg(panic = "unwind")]
+    fn poll_panic_is_delivered_before_panicking_future_drop() {
+        struct HostileFuture;
+        impl Future for HostileFuture {
+            type Output = JobResult;
+            fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
+                panic!("hostile poll");
+            }
+        }
+        impl Drop for HostileFuture {
+            fn drop(&mut self) {
+                panic!("hostile future drop");
+            }
+        }
+
+        let prepared = PreparedExternalOperation::interruptible_async(
+            kind(1),
+            decoder(),
+            interruptible(),
+            || HostileFuture,
+        );
+        let (sender, _runtime, submission, _) =
+            registration(prepared, kind(1), CompletionDelivery::Delivered);
+        let ExecutorDispatch::Async(dispatch) = submission.into_dispatch() else {
+            unreachable!()
+        };
+        let mut future = dispatch.into_future();
+        assert!(catch_unwind(AssertUnwindSafe(|| poll_once(&mut future))).is_ok());
+        assert_eq!(sender.attempts.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            sender.take().result.unwrap_err().code(),
+            ExternalFailureCode::WorkerPanic
+        );
+    }
+
+    #[test]
+    #[cfg(panic = "unwind")]
+    fn pending_abandonment_delivers_before_containing_future_drop_panic() {
+        struct HostilePending;
+        impl Future for HostilePending {
+            type Output = JobResult;
+            fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
+                Poll::Pending
+            }
+        }
+        impl Drop for HostilePending {
+            fn drop(&mut self) {
+                panic!("hostile pending drop");
+            }
+        }
+        let prepared = PreparedExternalOperation::interruptible_async(
+            kind(1),
+            decoder(),
+            interruptible(),
+            || HostilePending,
+        );
+        let (sender, _runtime, submission, _) =
+            registration(prepared, kind(1), CompletionDelivery::Delivered);
+        let ExecutorDispatch::Async(dispatch) = submission.into_dispatch() else {
+            unreachable!()
+        };
+        let mut future = dispatch.into_future();
+        assert!(poll_once(&mut future).is_pending());
+        assert!(catch_unwind(AssertUnwindSafe(|| drop(future))).is_ok());
+        assert_eq!(sender.attempts.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            sender.take().result.unwrap_err().code(),
+            ExternalFailureCode::Cancelled
+        );
+    }
+
+    #[test]
+    #[cfg(panic = "unwind")]
+    fn queued_blocking_cancellation_contains_job_drop_panic() {
+        struct HostileDrop;
+        impl Drop for HostileDrop {
+            fn drop(&mut self) {
+                panic!("hostile job drop");
+            }
+        }
+        let hostile = HostileDrop;
+        let prepared = PreparedExternalOperation::interruptible_blocking(
+            kind(1),
+            decoder(),
+            interruptible(),
+            move || {
+                drop(hostile);
+                Ok(Box::new(1_u8))
+            },
+        );
+        let (sender, runtime, submission, _) =
+            registration(prepared, kind(1), CompletionDelivery::Delivered);
+        let (_, _, cancel) = runtime.into_parts();
+        assert_eq!(
+            cancel.cancel_before_start(),
+            CancelBeforeStart::CancelledQueued
+        );
+        let ExecutorDispatch::Blocking(dispatch) = submission.into_dispatch() else {
+            unreachable!()
+        };
+        assert!(catch_unwind(AssertUnwindSafe(|| dispatch.run())).is_ok());
+        assert_eq!(sender.attempts.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            sender.take().result.unwrap_err().code(),
+            ExternalFailureCode::Cancelled
+        );
+    }
+
+    #[test]
+    #[cfg(panic = "unwind")]
+    fn rejection_rollback_contains_owned_destructor_panic() {
+        struct HostileDrop;
+        impl Drop for HostileDrop {
+            fn drop(&mut self) {
+                panic!("hostile rollback drop");
+            }
+        }
+        let hostile = HostileDrop;
+        let prepared = PreparedExternalOperation::interruptible_blocking(
+            kind(1),
+            decoder(),
+            interruptible(),
+            move || {
+                drop(hostile);
+                Ok(Box::new(1_u8))
+            },
+        );
+        let (sender, _runtime, submission, _) =
+            registration(prepared, kind(1), CompletionDelivery::Delivered);
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            submission.reject(SubmitErrorKind::Capacity).rollback()
+        }));
+        assert_eq!(result.unwrap(), SubmitErrorKind::Capacity);
+        assert_eq!(sender.attempts.load(Ordering::Relaxed), 0);
     }
 }

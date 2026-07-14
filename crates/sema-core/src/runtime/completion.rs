@@ -45,7 +45,7 @@ pub struct ExternalFailure {
 }
 
 impl ExternalFailure {
-    pub fn new(code: ExternalFailureCode, message: impl Into<String>) -> Self {
+    fn new(code: ExternalFailureCode, message: impl Into<String>) -> Self {
         Self {
             code,
             message: message.into(),
@@ -70,6 +70,32 @@ impl ExternalFailure {
         self.expected_type
     }
 
+    pub fn deadline_exceeded(message: impl Into<String>) -> Self {
+        Self::new(ExternalFailureCode::DeadlineExceeded, message)
+    }
+
+    pub fn bound_exceeded(message: impl Into<String>) -> Self {
+        Self::new(ExternalFailureCode::BoundExceeded, message)
+    }
+
+    #[allow(dead_code)] // Task 03 owns the rejection-to-decoder path.
+    pub(crate) fn rejected() -> Self {
+        Self::new(ExternalFailureCode::Rejected, "external operation rejected")
+    }
+
+    pub(crate) fn decode(
+        message: String,
+        operation: &'static str,
+        expected_type: &'static str,
+    ) -> Self {
+        Self {
+            code: ExternalFailureCode::Decode,
+            message,
+            operation: Some(operation),
+            expected_type: Some(expected_type),
+        }
+    }
+
     pub(crate) fn cancelled() -> Self {
         Self::new(
             ExternalFailureCode::Cancelled,
@@ -88,12 +114,11 @@ pub fn downcast_send_payload<T: Any + Send>(
 ) -> Result<T, ExternalFailure> {
     payload.downcast::<T>().map(|value| *value).map_err(|_| {
         let expected = type_name::<T>();
-        ExternalFailure {
-            code: ExternalFailureCode::Decode,
-            message: format!("{operation} returned an unexpected payload; expected {expected}"),
-            operation: Some(operation),
-            expected_type: Some(expected),
-        }
+        ExternalFailure::decode(
+            format!("{operation} returned an unexpected payload; expected {expected}"),
+            operation,
+            expected,
+        )
     })
 }
 

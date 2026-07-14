@@ -3,8 +3,9 @@ use std::num::NonZeroU64;
 use std::time::Duration;
 
 use sema_core::runtime::{
-    downcast_send_payload, CompletionDelivery, ExecutorAttachError, ExternalCompletion,
-    ExternalFailureCode, QuarantineBound, QuarantineBoundDescriptor,
+    downcast_send_payload, CompletionDelivery, ExecutorAttachError, ExecutorLease,
+    ExecutorShutdown, ExecutorSnapshot, ExternalCompletion, ExternalFailure, ExternalFailureCode,
+    IoExecutor, QuarantineBound, QuarantineBoundDescriptor,
 };
 
 fn assert_send<T: Send>() {}
@@ -58,4 +59,52 @@ fn delivery_and_attachment_failures_are_structured() {
         ExecutorAttachError::ShuttingDown,
         ExecutorAttachError::ShuttingDown
     ));
+}
+
+#[test]
+fn producer_failures_are_limited_to_deadline_and_bound() {
+    assert_eq!(
+        ExternalFailure::deadline_exceeded("deadline").code(),
+        ExternalFailureCode::DeadlineExceeded
+    );
+    assert_eq!(
+        ExternalFailure::bound_exceeded("bound").code(),
+        ExternalFailureCode::BoundExceeded
+    );
+}
+
+#[test]
+fn executor_attachment_contract_is_implementable_cross_crate() {
+    struct FakeExecutor;
+    struct FakeLease;
+    impl IoExecutor for FakeExecutor {
+        fn attach_runtime(
+            &self,
+            _runtime_id: sema_core::runtime::RuntimeId,
+        ) -> Result<std::sync::Arc<dyn ExecutorLease>, ExecutorAttachError> {
+            Ok(std::sync::Arc::new(FakeLease))
+        }
+        fn snapshot(&self) -> ExecutorSnapshot {
+            ExecutorSnapshot::default()
+        }
+    }
+    impl ExecutorLease for FakeLease {
+        fn submit(
+            &self,
+            submission: sema_core::runtime::ExecutorSubmission,
+        ) -> Result<sema_core::runtime::RunningSubmission, sema_core::runtime::SubmissionRejected>
+        {
+            let operation_id = submission.operation_id();
+            drop(submission.into_dispatch());
+            Ok(sema_core::runtime::RunningSubmission::new(operation_id))
+        }
+        fn snapshot(&self) -> ExecutorSnapshot {
+            ExecutorSnapshot::default()
+        }
+        fn shutdown(&self, _deadline: std::time::Instant) -> ExecutorShutdown {
+            ExecutorShutdown::Drained(ExecutorSnapshot::default())
+        }
+    }
+    fn assert_executor(_: &dyn IoExecutor) {}
+    assert_executor(&FakeExecutor);
 }

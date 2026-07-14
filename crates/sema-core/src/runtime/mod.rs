@@ -14,10 +14,11 @@ pub use completion::{
     DecodedCompletion, ExternalCompletion, ExternalFailure, ExternalFailureCode, SendPayload,
 };
 pub use executor::{
-    AsyncDispatchFuture, AsyncExecutorDispatch, BlockingDispatchClass, BlockingExecutorDispatch,
-    CancelBeforeStart, CompletionRegistrar, ExecutorAttachError, ExecutorCancelHandle,
-    ExecutorDispatch, ExecutorStartDecision, ExecutorSubmission, ExternalOperationBinding,
-    ForeignCompletionIdentity, PreparedExternalOperation, RuntimeIssuedCompletionIdentity,
+    AsyncDispatchFuture, AsyncExecutorDispatch, BindCompletionError, BlockingDispatchClass,
+    BlockingExecutorDispatch, CancelBeforeStart, CompletionRegistrar, ExecutorAttachError,
+    ExecutorCancelHandle, ExecutorDispatch, ExecutorLease, ExecutorShutdown, ExecutorSnapshot,
+    ExecutorStartDecision, ExecutorSubmission, ExternalOperationBinding, IoExecutor,
+    PreparedExternalOperation, RunningSubmission, RuntimeIssuedCompletionIdentity,
     RuntimeOperationBinding, SubmissionRejected, SubmitErrorKind,
 };
 pub use ids::{

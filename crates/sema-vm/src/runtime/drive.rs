@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::num::NonZeroUsize;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
@@ -44,80 +45,96 @@ pub struct DriveReport {
 
 pub struct BoundedDriver {
     clock: Rc<dyn RuntimeClock>,
-    completions: usize,
-    timers: usize,
-    cleanup: usize,
-    ready_roots: usize,
+    completions: VecDeque<()>,
+    timers: VecDeque<()>,
+    cleanup: VecDeque<()>,
+    ready_roots: VecDeque<()>,
     after_item: Option<Box<dyn FnMut()>>,
+    source_cursor: usize,
 }
 
 impl BoundedDriver {
     pub fn new(clock: Rc<dyn RuntimeClock>) -> Self {
         Self {
             clock,
-            completions: 0,
-            timers: 0,
-            cleanup: 0,
-            ready_roots: 0,
+            completions: VecDeque::new(),
+            timers: VecDeque::new(),
+            cleanup: VecDeque::new(),
+            ready_roots: VecDeque::new(),
             after_item: None,
+            source_cursor: 0,
         }
     }
 
     pub fn add_completions(&mut self, count: usize) {
-        self.completions += count;
+        self.completions.extend(std::iter::repeat_n((), count));
     }
     pub fn add_timers(&mut self, count: usize) {
-        self.timers += count;
+        self.timers.extend(std::iter::repeat_n((), count));
     }
     pub fn add_cleanup(&mut self, count: usize) {
-        self.cleanup += count;
+        self.cleanup.extend(std::iter::repeat_n((), count));
     }
     pub fn add_ready_roots(&mut self, count: usize) {
-        self.ready_roots += count;
+        self.ready_roots.extend(std::iter::repeat_n((), count));
     }
     pub fn set_after_item(&mut self, callback: impl FnMut() + 'static) {
         self.after_item = Some(Box::new(callback));
+    }
+
+    pub fn pending_ready_roots(&self) -> usize {
+        self.ready_roots.len()
     }
 
     pub fn drive(&mut self, budget: &DriveBudget) -> DriveReport {
         let start = self.clock.now();
         let limit = budget.work_item_limit.get();
         let mut report = DriveReport::default();
-        let reserved_roots = self
-            .ready_roots
-            .min(budget.root_visit_limit.get())
-            .min(limit);
-        self.ready_roots -= reserved_roots;
-        report.root_visits = reserved_roots;
-        report.work_items = reserved_roots;
-
-        let mut source = 0;
+        let reserved_roots = self.ready_roots.len().min(budget.root_visit_limit.get());
+        let mut no_progress = 0;
         while report.work_items < limit {
-            let progressed = match source % 3 {
-                0 if report.completions < budget.completion_limit.get() && self.completions > 0 => {
-                    self.completions -= 1;
+            let unvisited_reserved = reserved_roots - report.root_visits;
+            let remaining_credits = limit - report.work_items;
+            let source = if unvisited_reserved > 0 && remaining_credits <= unvisited_reserved {
+                3
+            } else {
+                let source = self.source_cursor % 4;
+                self.source_cursor = (self.source_cursor + 1) % 4;
+                source
+            };
+            let progressed = match source {
+                0 if report.completions < budget.completion_limit.get()
+                    && !self.completions.is_empty() =>
+                {
+                    self.completions.pop_front();
                     report.completions += 1;
                     true
                 }
-                1 if report.timers < budget.timer_limit.get() && self.timers > 0 => {
-                    self.timers -= 1;
+                1 if report.timers < budget.timer_limit.get() && !self.timers.is_empty() => {
+                    self.timers.pop_front();
                     report.timers += 1;
                     true
                 }
-                2 if report.cleanup < budget.cleanup_limit.get() && self.cleanup > 0 => {
-                    self.cleanup -= 1;
+                2 if report.cleanup < budget.cleanup_limit.get() && !self.cleanup.is_empty() => {
+                    self.cleanup.pop_front();
                     report.cleanup += 1;
+                    true
+                }
+                3 if report.root_visits < reserved_roots && !self.ready_roots.is_empty() => {
+                    self.ready_roots.pop_front();
+                    report.root_visits += 1;
                     true
                 }
                 _ => false,
             };
-            source += 1;
             if !progressed {
-                if source >= 6 {
+                no_progress += 1;
+                if no_progress == 4 {
                     break;
                 }
                 continue;
             }
+            no_progress = 0;
             report.work_items += 1;
             if let Some(callback) = &mut self.after_item {
                 callback();
@@ -126,7 +143,7 @@ impl BoundedDriver {
                 break;
             }
         }
-        report.ready_remaining = self.ready_roots > 0;
+        report.ready_remaining = !self.ready_roots.is_empty();
         report
     }
 }

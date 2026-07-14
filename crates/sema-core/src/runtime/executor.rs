@@ -219,14 +219,23 @@ impl CompletionRegistrar {
     }
 
     #[doc(hidden)]
+    pub fn issue_wait_identity(&self) -> Result<(WaitId, WaitGeneration), IdExhausted> {
+        Ok((
+            self.waits.borrow_mut().allocate()?,
+            self.generations.borrow_mut().allocate()?,
+        ))
+    }
+
+    #[doc(hidden)]
     pub fn issue_identity(
         &self,
         kind: CompletionKind,
     ) -> Result<RuntimeIssuedCompletionIdentity, IdExhausted> {
+        let (wait_id, generation) = self.issue_wait_identity()?;
         Ok(RuntimeIssuedCompletionIdentity {
             runtime_id: self.runtime_id,
-            wait_id: self.waits.borrow_mut().allocate()?,
-            generation: self.generations.borrow_mut().allocate()?,
+            wait_id,
+            generation,
             operation_id: self.operations.borrow_mut().allocate()?,
             kind,
             authority: self.authority,
@@ -1207,6 +1216,18 @@ mod tests {
         assert_ne!(first_id, second_id);
         let identity = first.issue_identity(kind(1)).unwrap();
         assert!(second.bind(identity, blocking(Ok(Box::new(1_u8)))).is_err());
+    }
+
+    #[test]
+    fn external_and_internal_wait_identities_share_the_registrar_allocator() {
+        let sender = RecordingSender::new(CompletionDelivery::Delivered);
+        let (_, registrar) = CompletionRegistrar::register(sender).unwrap();
+
+        let internal = registrar.issue_wait_identity().unwrap();
+        let external = registrar.issue_identity(kind(1)).unwrap();
+
+        assert_ne!(internal.0, external.wait_id());
+        assert_ne!(internal.1, external.generation());
     }
 
     #[test]

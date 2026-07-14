@@ -6,12 +6,12 @@ use std::time::{Duration, Instant};
 use sema_core::{
     runtime::{
         CancelReason, CancellationParent, CompletionDecoder, CompletionKind, ExecutorAttachError,
-        ExecutorDispatch, ExecutorLease, ExecutorShutdown, ExecutorSnapshot, IdCounter, IoExecutor,
-        LifetimeOwner, NativeCallContext, NativeContinuation, NativeOutcome, NativeResult,
-        NativeSuspend, PreparedExternalOperation, ResumeInput, RootId, RunningSubmission,
-        RuntimeId, RuntimeScopedIdCounter, ScopeId, SettlementSeq, SubmissionRejected,
-        SubmitErrorKind, TaskContextHandle, TaskId, TaskOutcome, TaskRelations, Trace,
-        WaitGeneration, WaitId, WaitKind,
+        ExecutorDispatch, ExecutorLease, ExecutorShutdown, ExecutorSnapshot, IdCounter,
+        InterruptibleResource, IoExecutor, LifetimeOwner, NativeCallContext, NativeContinuation,
+        NativeOutcome, NativeResult, NativeSuspend, PreparedExternalOperation, ResumeInput, RootId,
+        RunningSubmission, RuntimeId, RuntimeScopedIdCounter, ScopeId, SettlementSeq,
+        SubmissionRejected, SubmitErrorKind, TaskContextHandle, TaskId, TaskOutcome, TaskRelations,
+        Trace, WaitGeneration, WaitId, WaitKind,
     },
     SemaError, Value,
 };
@@ -130,6 +130,38 @@ fn external_suspend(events: Arc<Mutex<Vec<&'static str>>>) -> NativeSuspend {
     }
 }
 
+struct PendingHook;
+impl Trace for PendingHook {
+    fn trace(&self, _sink: &mut dyn FnMut(sema_core::cycle::GcEdge<'_>)) -> bool {
+        true
+    }
+}
+impl sema_core::runtime::CancelHook for PendingHook {
+    fn cancel(
+        &mut self,
+    ) -> Result<sema_core::runtime::CancelDisposition, sema_core::runtime::CancelHookError> {
+        Ok(sema_core::runtime::CancelDisposition::PendingReap)
+    }
+    fn reap(
+        &mut self,
+    ) -> Result<sema_core::runtime::CancelDisposition, sema_core::runtime::CancelHookError> {
+        Ok(sema_core::runtime::CancelDisposition::PendingReap)
+    }
+}
+
+fn interruptible_suspend(events: Arc<Mutex<Vec<&'static str>>>) -> NativeSuspend {
+    let kind = CompletionKind::try_from_raw(2).unwrap();
+    NativeSuspend {
+        wait: WaitKind::External(Box::new(PreparedExternalOperation::interruptible_blocking(
+            kind,
+            Box::new(CountingDecoder(Arc::clone(&events))),
+            InterruptibleResource::new("pending", Box::new(PendingHook)),
+            || Ok(Box::new(7_i32)),
+        ))),
+        continuation: Box::new(CountingContinuation(events)),
+    }
+}
+
 #[test]
 fn wait_inline_completion_observes_registered_state_then_consumes_owners_once() {
     let events = Arc::new(Mutex::new(Vec::new()));
@@ -151,9 +183,15 @@ fn wait_inline_completion_observes_registered_state_then_consumes_owners_once() 
     assert_eq!(task.state_name(), StateName::Waiting);
     assert_eq!(runtime.active_len(), 1);
 
+    let Some((CompletionRoute::Active, Some(pending))) = runtime.drain_one() else {
+        panic!("completion must extract a pending resume");
+    };
+    assert_eq!(pending.task_id(), task.id());
+    let pending = pending.invoke_decoder();
+    assert_eq!(&*events.lock().unwrap(), &["decode"]);
     assert!(matches!(
-        runtime.drain_one(),
-        Some((CompletionRoute::Active, Some(Ok(NativeOutcome::Return(_)))))
+        pending.invoke_continuation(),
+        Ok(NativeOutcome::Return(_))
     ));
     assert_eq!(&*events.lock().unwrap(), &["decode", "returned"]);
     assert_eq!(runtime.active_len(), 0);
@@ -176,7 +214,14 @@ fn wait_submit_rejection_traverses_decoder_then_continuation() {
         external_suspend(Arc::clone(&events)),
         TaskContextHandle::default(),
     );
-    assert!(matches!(result, Err(Ok(NativeOutcome::Return(_)))));
+    let pending = result.expect_err("submission must be rejected");
+    assert_eq!(task.state_name(), StateName::Running);
+    let pending = pending.invoke_decoder();
+    assert_eq!(&*events.lock().unwrap(), &["decode"]);
+    assert!(matches!(
+        pending.invoke_continuation(),
+        Ok(NativeOutcome::Return(_))
+    ));
     assert_eq!(&*events.lock().unwrap(), &["decode", "failed"]);
     assert_eq!(runtime.active_len(), 0);
 }
@@ -192,6 +237,60 @@ fn wait_constructor_preserves_executor_attach_error() {
         WaitRuntime::new(executor).err(),
         Some(RuntimeCreateError::ExecutorAttach(error))
     );
+}
+
+#[test]
+fn wait_cancel_uses_first_task_reason_and_only_quarantine_completion_reaps_cleanup() {
+    let executor = Arc::new(FakeExecutor {
+        mode: FakeSubmit::Inline,
+        failure: None,
+    });
+    let mut ids = Ids::new();
+
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let mut quarantine = WaitRuntime::new(executor.clone()).unwrap();
+    let mut quarantine_task = task(&mut ids);
+    quarantine_task.start().unwrap();
+    let Ok(key) = quarantine.register_external(
+        &mut quarantine_task,
+        external_suspend(events.clone()),
+        TaskContextHandle::default(),
+    ) else {
+        panic!("registration accepted")
+    };
+    assert!(quarantine_task.request_cancellation(CancelReason::Timeout));
+    assert!(!quarantine_task.request_cancellation(CancelReason::Explicit));
+    let pending = quarantine.cancel(&quarantine_task, key).unwrap();
+    assert!(matches!(
+        pending.invoke_continuation(),
+        Ok(NativeOutcome::Return(_))
+    ));
+    assert_eq!(
+        quarantine.drain_one().map(|item| item.0),
+        Some(CompletionRoute::Cleanup)
+    );
+    assert_eq!(quarantine.quarantine_reaped(), 1);
+    assert_eq!(quarantine.late_completions(), 0);
+
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let mut interruptible = WaitRuntime::new(executor).unwrap();
+    let mut interruptible_task = task(&mut ids);
+    interruptible_task.start().unwrap();
+    let Ok(key) = interruptible.register_external(
+        &mut interruptible_task,
+        interruptible_suspend(events),
+        TaskContextHandle::default(),
+    ) else {
+        panic!("registration accepted")
+    };
+    interruptible_task.request_cancellation(CancelReason::Owner);
+    interruptible.cancel(&interruptible_task, key).unwrap();
+    assert_eq!(
+        interruptible.drain_one().map(|item| item.0),
+        Some(CompletionRoute::Late)
+    );
+    assert_eq!(interruptible.cleanup_len(), 1);
+    assert_eq!(interruptible.quarantine_reaped(), 0);
 }
 
 #[derive(Clone)]
@@ -265,6 +364,19 @@ fn timer_cancel_removes_only_exact_generation_and_updates_deadline() {
     assert_eq!(timers.pop_due(clock.now()), Some(replacement));
 }
 
+#[test]
+fn timer_cancel_physically_removes_entry_without_tombstones() {
+    let clock = FakeClock::new();
+    let mut ids = Ids::new();
+    let mut timers = TimerQueue::new();
+    let key = ids.wait_key();
+    timers.insert(clock.now() + Duration::from_secs(1), key);
+
+    assert!(timers.cancel(key));
+    assert_eq!(timers.scheduled_len(), 0);
+    assert_eq!(timers.next_deadline(), None);
+}
+
 fn drive_budget(limit: usize) -> DriveBudget {
     DriveBudget {
         work_item_limit: std::num::NonZeroUsize::new(limit).unwrap(),
@@ -306,6 +418,24 @@ fn drive_limits_wall_clock_is_checked_between_items() {
 
     let report = driver.drive(&budget);
     assert_eq!(report.work_items, 1);
+}
+
+#[test]
+fn drive_does_not_consume_unvisited_reserved_roots() {
+    let clock = FakeClock::new();
+    let mut driver = BoundedDriver::new(Rc::new(clock));
+    driver.add_completions(2);
+    driver.add_ready_roots(3);
+    let mut budget = drive_budget(1);
+    budget.root_visit_limit = std::num::NonZeroUsize::new(3).unwrap();
+
+    let first = driver.drive(&budget);
+    let second = driver.drive(&budget);
+
+    assert_eq!(first.work_items, 1);
+    assert_eq!(second.work_items, 1);
+    assert!(first.ready_remaining || second.ready_remaining);
+    assert_eq!(driver.pending_ready_roots(), 1);
 }
 
 struct Ids {

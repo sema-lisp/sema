@@ -118,6 +118,18 @@ impl TaskRecord {
         })
     }
 
+    pub(crate) fn reject_wait(&mut self, actual: WaitKey) -> Result<(), TaskTransitionError> {
+        if let TaskState::Waiting(expected) = self.state {
+            if expected != actual {
+                return Err(TaskTransitionError::WaitMismatch { expected, actual });
+            }
+        }
+        self.transition(StateName::Running, |state| match state {
+            TaskState::Waiting(_) => Some(TaskState::Running),
+            _ => None,
+        })
+    }
+
     pub fn settle(
         &mut self,
         sequence: SettlementSeq,

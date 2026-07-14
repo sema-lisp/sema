@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::time::Instant;
 
 use super::WaitKey;
@@ -6,7 +6,7 @@ use super::WaitKey;
 #[derive(Default)]
 pub struct TimerQueue {
     deadlines: BTreeMap<Instant, VecDeque<WaitKey>>,
-    active: HashSet<WaitKey>,
+    reverse: HashMap<WaitKey, Instant>,
 }
 
 impl TimerQueue {
@@ -15,46 +15,58 @@ impl TimerQueue {
     }
 
     pub fn insert(&mut self, deadline: Instant, key: WaitKey) -> bool {
-        if !self.active.insert(key) {
+        if self.reverse.contains_key(&key) {
             return false;
         }
+        self.reverse.insert(key, deadline);
         self.deadlines.entry(deadline).or_default().push_back(key);
         true
     }
 
     pub fn cancel(&mut self, key: WaitKey) -> bool {
-        self.active.remove(&key)
+        let Some(deadline) = self.reverse.remove(&key) else {
+            return false;
+        };
+        let queue = self
+            .deadlines
+            .get_mut(&deadline)
+            .expect("reverse timer entry has deadline bucket");
+        let position = queue
+            .iter()
+            .position(|candidate| *candidate == key)
+            .expect("reverse timer entry is present in deadline bucket");
+        queue.remove(position);
+        if queue.is_empty() {
+            self.deadlines.remove(&deadline);
+        }
+        true
     }
 
     pub fn pop_due(&mut self, now: Instant) -> Option<WaitKey> {
-        loop {
-            let deadline = self.deadlines.first_key_value()?.0;
-            if *deadline > now {
-                return None;
-            }
-            let deadline = *deadline;
-            let queue = self.deadlines.get_mut(&deadline)?;
-            let key = queue.pop_front();
-            if queue.is_empty() {
-                self.deadlines.remove(&deadline);
-            }
-            if key.is_some_and(|key| self.active.remove(&key)) {
-                return key;
-            }
+        let deadline = *self.deadlines.first_key_value()?.0;
+        if deadline > now {
+            return None;
         }
+        let queue = self.deadlines.get_mut(&deadline)?;
+        let key = queue.pop_front().expect("non-empty timer bucket");
+        if queue.is_empty() {
+            self.deadlines.remove(&deadline);
+        }
+        self.reverse.remove(&key);
+        Some(key)
     }
 
     pub fn next_deadline(&mut self) -> Option<Instant> {
-        loop {
-            let (&deadline, queue) = self.deadlines.first_key_value()?;
-            if queue.iter().any(|key| self.active.contains(key)) {
-                return Some(deadline);
-            }
-            self.deadlines.remove(&deadline);
-        }
+        self.deadlines
+            .first_key_value()
+            .map(|(&deadline, _)| deadline)
     }
 
     pub fn is_empty(&self) -> bool {
-        self.active.is_empty()
+        self.reverse.is_empty()
+    }
+
+    pub fn scheduled_len(&self) -> usize {
+        self.reverse.len()
     }
 }

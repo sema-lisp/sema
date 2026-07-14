@@ -14,6 +14,7 @@ use num_traits::ToPrimitive;
 use crate::error::SemaError;
 use crate::number::Complex as SemaComplex;
 use crate::number::SemaNumber;
+use crate::runtime::{NativeCallContext, NativeOutcome, NativeResult};
 use crate::EvalContext;
 
 // Compile-time check: NaN-boxing requires 64-bit pointers that fit in 48-bit VA space.
@@ -120,6 +121,8 @@ pub fn compare_spurs(a: Spur, b: Spur) -> std::cmp::Ordering {
 
 /// A native function callable from Sema.
 pub type NativeFnInner = dyn Fn(&EvalContext, &[Value]) -> Result<Value, SemaError>;
+type RuntimeNativeFnInner =
+    dyn for<'a> Fn(&EvalContext, &mut NativeCallContext<'a>, &[Value]) -> NativeResult;
 
 pub struct NativeFn {
     pub name: String,
@@ -136,6 +139,7 @@ pub struct NativeFn {
     /// flag lets `type`/`type_name` report `:lambda` instead of `:native-fn`
     /// without sema-core/sema-stdlib needing to know the VM's payload type.
     pub is_closure: bool,
+    runtime_func: Option<Box<RuntimeNativeFnInner>>,
 }
 
 impl NativeFn {
@@ -149,6 +153,7 @@ impl NativeFn {
             payload: None,
             param_names: None,
             is_closure: false,
+            runtime_func: None,
         }
     }
 
@@ -162,6 +167,7 @@ impl NativeFn {
             payload: None,
             param_names: None,
             is_closure: false,
+            runtime_func: None,
         }
     }
 
@@ -176,6 +182,60 @@ impl NativeFn {
             payload: Some(payload),
             param_names: None,
             is_closure: false,
+            runtime_func: None,
+        }
+    }
+
+    pub fn simple_result(
+        name: impl Into<String>,
+        f: impl Fn(&[Value]) -> NativeResult + 'static,
+    ) -> Self {
+        let name = name.into();
+        let error_name = name.clone();
+        Self {
+            name,
+            func: Box::new(move |_, _| {
+                Err(SemaError::eval(format!(
+                    "internal error: runtime native function '{error_name}' requires runtime invocation"
+                )))
+            }),
+            runtime_func: Some(Box::new(move |_, _, args| f(args))),
+            payload: None,
+            param_names: None,
+            is_closure: false,
+        }
+    }
+
+    pub fn with_context_result(
+        name: impl Into<String>,
+        f: impl for<'a> Fn(&EvalContext, &mut NativeCallContext<'a>, &[Value]) -> NativeResult + 'static,
+    ) -> Self {
+        let name = name.into();
+        let error_name = name.clone();
+        Self {
+            name,
+            func: Box::new(move |_, _| {
+                Err(SemaError::eval(format!(
+                    "internal error: runtime native function '{error_name}' requires runtime invocation"
+                )))
+            }),
+            runtime_func: Some(Box::new(f)),
+            payload: None,
+            param_names: None,
+            is_closure: false,
+        }
+    }
+
+    #[doc(hidden)]
+    pub fn invoke_runtime(
+        &self,
+        eval_context: &EvalContext,
+        runtime_context: &mut NativeCallContext<'_>,
+        args: &[Value],
+    ) -> NativeResult {
+        match &self.runtime_func {
+            Some(f) => f(eval_context, runtime_context, args),
+            None => (self.func)(eval_context, args).map(NativeOutcome::Return),
         }
     }
 }

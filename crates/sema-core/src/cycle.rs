@@ -1490,6 +1490,40 @@ mod tests {
         None
     }
 
+    #[test]
+    fn registered_payload_emits_opaque_allocation_and_delegates_trace() {
+        let env = Env::new();
+        let payload: Rc<dyn Any> = Rc::new(EnvPayload { env: Rc::new(env) });
+        let mut opaque = None;
+        assert!(env_payload_tracer(&payload, &mut |edge| {
+            if let GcEdge::Opaque { ptr, trace, .. } = edge {
+                opaque = Some((ptr, trace));
+            }
+        }));
+        let (ptr, trace) = opaque.expect("payload allocation edge");
+        let mut delegated = 0;
+        assert!(trace(ptr, &mut |edge| {
+            if matches!(edge, GcEdge::Env(_)) {
+                delegated += 1;
+            }
+        }));
+        assert_eq!(delegated, 1);
+    }
+
+    #[test]
+    fn unregistered_payload_is_conservatively_pinned() {
+        struct UnknownPayload;
+        let native = Value::native_fn(NativeFn::with_payload(
+            "unknown",
+            Rc::new(UnknownPayload),
+            |_, _| Ok(Value::NIL),
+        ));
+        let mut edges = 0;
+        assert!(trace_value(&native, &mut |_| edges += 1));
+        assert_eq!(edges, 0);
+        assert!(has_unknown_payload(&native));
+    }
+
     /// A mutable cell node (UpvalueCell stand-in), participating via Opaque.
     struct TestCell {
         slot: RefCell<Value>,

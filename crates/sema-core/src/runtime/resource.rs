@@ -1,6 +1,10 @@
 use std::num::NonZeroU64;
 use std::time::Duration;
 
+use crate::cycle::GcEdge;
+
+use super::Trace;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
 #[error("quarantine hard deadline must be nonzero")]
 pub struct InvalidQuarantineBound;
@@ -77,9 +81,18 @@ impl CancelHookError {
     }
 }
 
-pub trait CancelHook {
+pub trait CancelHook: Trace {
     fn cancel(&mut self) -> Result<CancelDisposition, CancelHookError>;
     fn reap(&mut self) -> Result<CancelDisposition, CancelHookError>;
+}
+
+impl Trace for ResourceClass {
+    fn trace(&self, sink: &mut dyn FnMut(GcEdge<'_>)) -> bool {
+        match &self.0 {
+            ResourceClassInner::Interruptible { hook, .. } => hook.trace(sink),
+            ResourceClassInner::QuarantinedBounded(_) => true,
+        }
+    }
 }
 
 pub struct InterruptibleResource {

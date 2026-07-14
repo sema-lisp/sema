@@ -7,10 +7,13 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Instant;
 
+use crate::cycle::GcEdge;
+
 use super::{
     CompletionDecoder, CompletionDelivery, CompletionKind, CompletionSender, ExternalCompletion,
     ExternalFailure, ExternalFailureCode, IdCounter, IdExhausted, InterruptibleResource,
-    OperationId, QuarantineBound, ResourceClass, RuntimeId, SendPayload, WaitGeneration, WaitId,
+    OperationId, QuarantineBound, ResourceClass, RuntimeId, SendPayload, Trace, WaitGeneration,
+    WaitId,
 };
 
 type JobResult = Result<SendPayload, ExternalFailure>;
@@ -34,6 +37,10 @@ pub struct PreparedExternalOperation {
 }
 
 impl PreparedExternalOperation {
+    #[doc(hidden)]
+    pub fn completion_kind(&self) -> CompletionKind {
+        self.kind
+    }
     pub fn interruptible_async<F, Fut>(
         kind: CompletionKind,
         decoder: Box<dyn CompletionDecoder>,
@@ -92,6 +99,12 @@ impl PreparedExternalOperation {
                 job: Box::new(job),
             },
         }
+    }
+}
+
+impl Trace for PreparedExternalOperation {
+    fn trace(&self, sink: &mut dyn FnMut(GcEdge<'_>)) -> bool {
+        self.decoder.trace(sink) && self.resource.trace(sink)
     }
 }
 
@@ -785,7 +798,8 @@ pub enum ExecutorAttachError {
 
 #[cfg(test)]
 mod tests {
-    use std::cell::Cell;
+    use std::cell::{Cell, RefCell};
+    use std::num::NonZeroU64;
     use std::rc::Rc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
@@ -851,6 +865,12 @@ mod tests {
 
     struct LocalHook(Rc<Cell<usize>>);
 
+    impl Trace for LocalHook {
+        fn trace(&self, _sink: &mut dyn FnMut(GcEdge<'_>)) -> bool {
+            true
+        }
+    }
+
     impl CancelHook for LocalHook {
         fn cancel(&mut self) -> Result<CancelDisposition, CancelHookError> {
             self.0.set(self.0.get() + 1);
@@ -860,6 +880,106 @@ mod tests {
         fn reap(&mut self) -> Result<CancelDisposition, CancelHookError> {
             Ok(CancelDisposition::Reaped)
         }
+    }
+
+    #[test]
+    fn prepared_operation_traces_decoder_then_interruptible_hook_never_job() {
+        struct EdgeDecoder(Value);
+        impl Trace for EdgeDecoder {
+            fn trace(&self, sink: &mut dyn FnMut(GcEdge<'_>)) -> bool {
+                sink(GcEdge::Value(&self.0));
+                true
+            }
+        }
+        impl CompletionDecoder for EdgeDecoder {
+            fn decode(
+                self: Box<Self>,
+                _context: &mut NativeCallContext<'_>,
+                _result: JobResult,
+            ) -> Result<Value, crate::SemaError> {
+                Ok(self.0)
+            }
+        }
+        struct EdgeHook(Value);
+        impl Trace for EdgeHook {
+            fn trace(&self, sink: &mut dyn FnMut(GcEdge<'_>)) -> bool {
+                sink(GcEdge::Value(&self.0));
+                true
+            }
+        }
+        impl CancelHook for EdgeHook {
+            fn cancel(&mut self) -> Result<CancelDisposition, CancelHookError> {
+                Ok(CancelDisposition::Reaped)
+            }
+            fn reap(&mut self) -> Result<CancelDisposition, CancelHookError> {
+                Ok(CancelDisposition::Reaped)
+            }
+        }
+
+        let value = Value::string("duplicate");
+        let prepared = PreparedExternalOperation::interruptible_blocking(
+            kind(7),
+            Box::new(EdgeDecoder(value.clone())),
+            InterruptibleResource::new("edge", Box::new(EdgeHook(value))),
+            || Ok(Box::new(1_u8)),
+        );
+        assert_eq!(prepared.completion_kind(), kind(7));
+        let mut edges = 0;
+        assert!(prepared.trace(&mut |_| edges += 1));
+        assert_eq!(edges, 2, "decoder and hook each own one duplicate edge");
+
+        let quarantined = PreparedExternalOperation::quarantined_blocking(
+            kind(8),
+            Box::new(EdgeDecoder(Value::NIL)),
+            QuarantineBound::finite_work("unit", NonZeroU64::new(1).unwrap()),
+            || Ok(Box::new(1_u8)),
+        );
+        let mut edges = 0;
+        assert!(quarantined.trace(&mut |_| edges += 1));
+        assert_eq!(edges, 1, "quarantined resources have no edges");
+
+        struct BorrowingHook {
+            first: Value,
+            second: Rc<RefCell<Value>>,
+        }
+        impl Trace for BorrowingHook {
+            fn trace(&self, sink: &mut dyn FnMut(GcEdge<'_>)) -> bool {
+                sink(GcEdge::Value(&self.first));
+                match self.second.try_borrow() {
+                    Ok(second) => {
+                        sink(GcEdge::Value(&second));
+                        true
+                    }
+                    Err(_) => false,
+                }
+            }
+        }
+        impl CancelHook for BorrowingHook {
+            fn cancel(&mut self) -> Result<CancelDisposition, CancelHookError> {
+                Ok(CancelDisposition::Reaped)
+            }
+            fn reap(&mut self) -> Result<CancelDisposition, CancelHookError> {
+                Ok(CancelDisposition::Reaped)
+            }
+        }
+        let second = Rc::new(RefCell::new(Value::NIL));
+        let borrow = second.borrow_mut();
+        let failing = PreparedExternalOperation::interruptible_blocking(
+            kind(9),
+            Box::new(EdgeDecoder(Value::NIL)),
+            InterruptibleResource::new(
+                "borrowed",
+                Box::new(BorrowingHook {
+                    first: Value::NIL,
+                    second: Rc::clone(&second),
+                }),
+            ),
+            || Ok(Box::new(1_u8)),
+        );
+        let mut edges = 0;
+        assert!(!failing.trace(&mut |_| edges += 1));
+        assert_eq!(edges, 2, "decoder and hook output remains before failure");
+        drop(borrow);
     }
 
     fn interruptible() -> InterruptibleResource {
@@ -939,6 +1059,11 @@ mod tests {
         struct CountingHook {
             cancel: Rc<Cell<usize>>,
             reap: Rc<Cell<usize>>,
+        }
+        impl Trace for CountingHook {
+            fn trace(&self, _sink: &mut dyn FnMut(GcEdge<'_>)) -> bool {
+                true
+            }
         }
         impl CancelHook for CountingHook {
             fn cancel(&mut self) -> Result<CancelDisposition, CancelHookError> {

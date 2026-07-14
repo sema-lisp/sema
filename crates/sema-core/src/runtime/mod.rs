@@ -26,7 +26,10 @@ pub use ids::{
     RootId, RuntimeId, RuntimeScopedIdCounter, ScopeId, SettlementSeq, TaskId, WaitGeneration,
     WaitId,
 };
-pub use native::{CancellationView, NativeCallContext};
+pub use native::{
+    CancellationView, ChannelWait, NativeCall, NativeCallContext, NativeContinuation,
+    NativeOutcome, NativeResult, NativeSuspend, ResumeInput, WaitKind,
+};
 pub use resource::{
     CancelDisposition, CancelHook, CancelHookError, InterruptibleResource, InvalidQuarantineBound,
     QuarantineBound, QuarantineBoundDescriptor, ResourceClass,

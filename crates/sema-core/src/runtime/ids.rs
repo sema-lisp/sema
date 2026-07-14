@@ -257,6 +257,29 @@ mod tests {
     }
 
     #[test]
+    fn scoped_ids_with_equal_locals_are_distinct_across_runtimes() {
+        let first_runtime = RuntimeId::allocate().expect("runtime ID available");
+        let second_runtime = RuntimeId::allocate().expect("runtime ID available");
+
+        macro_rules! assert_scoped_identity {
+            ($id_type:ty) => {{
+                let mut first = RuntimeScopedIdCounter::<$id_type>::new(first_runtime);
+                let mut second = RuntimeScopedIdCounter::<$id_type>::new(second_runtime);
+                let first_id = first.allocate().expect("scoped ID available");
+                let second_id = second.allocate().expect("scoped ID available");
+
+                assert_eq!(first_id.local(), 1);
+                assert_eq!(second_id.local(), 1);
+                assert_ne!(first_id, second_id);
+            }};
+        }
+
+        assert_scoped_identity!(RootId);
+        assert_scoped_identity!(PromiseId);
+        assert_scoped_identity!(ChannelId);
+    }
+
+    #[test]
     fn every_identity_has_the_required_value_traits() {
         fn assert_traits<T: Copy + Clone + std::fmt::Debug + Eq + Ord + std::hash::Hash>() {}
 

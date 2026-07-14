@@ -703,7 +703,7 @@ Expected: deterministic tests pass without wall-clock delays.
 **Files:** `vm.rs`, `debug.rs`, `runtime/task.rs`, `runtime/tests.rs`,
 `async_signal.rs`, `scheduler.rs`, `async_ops.rs`, `system.rs`, `io.rs`
 
-- [ ] **Step 1: Write failing VM continuation tests**
+- [x] **Step 1: Write failing VM continuation tests**
 
 Test native return, native call into a Sema closure, suspend/resume with each
 outcome, nested native-to-Sema-to-native calls, exception propagation across a
@@ -711,7 +711,7 @@ continuation, cancellation at a safe point, and repeated quantum expiry.
 Add an immediate native call/continuation chain longer than `work_item_limit`
 and a zero-duration suspend chain; each drive turn must stop at the exact cap.
 
-- [ ] **Step 2: Add explicit continuation frames**
+- [x] **Step 2: Add explicit continuation frames**
 
 Store them in traceable VM/task state. Remove the `set_yield_signal` plus dummy
 `nil` protocol from the VM dispatch path only after Step 4 migrates every
@@ -719,7 +719,7 @@ reachable suspending builtin. A native call returns
 `VmExecResult::Native`; the runtime executes or registers it, then resumes the
 same VM through an explicit frame.
 
-- [ ] **Step 3: Add instruction budgeting**
+- [x] **Step 3: Add instruction budgeting**
 
 Check the budget at dispatch safe points and return `QuantumExpired` without
 losing stack, open-upvalue, handler, or debug state. Zero-work spinning inside a

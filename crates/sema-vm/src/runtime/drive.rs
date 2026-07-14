@@ -92,9 +92,12 @@ impl BoundedDriver {
         let limit = budget.work_item_limit.get();
         let mut report = DriveReport::default();
         let reserved_roots = self.ready_roots.len().min(budget.root_visit_limit.get());
+        // Reserve credits for at most work_item_limit - 1 roots so a ready-root
+        // storm always leaves at least one work item for the other sources.
+        let reserve_floor = reserved_roots.min(limit.saturating_sub(1));
         let mut no_progress = 0;
         while report.work_items < limit {
-            let unvisited_reserved = reserved_roots - report.root_visits;
+            let unvisited_reserved = reserve_floor.saturating_sub(report.root_visits);
             let remaining_credits = limit - report.work_items;
             let source =
                 if limit > 1 && unvisited_reserved > 0 && remaining_credits <= unvisited_reserved {

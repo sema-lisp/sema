@@ -3383,6 +3383,25 @@ fn drive_does_not_consume_unvisited_reserved_roots() {
 }
 
 #[test]
+fn drive_reservation_leaves_a_credit_for_other_sources() {
+    // A ready-root storm must not starve completions/timers/cleanup: even when
+    // root_visit_limit >= work_item_limit, root reservation must leave at least
+    // one work item per turn for the other drive sources (spec 223-226).
+    let clock = FakeClock::new();
+    let mut driver = BoundedDriver::new(Rc::new(clock));
+    driver.add_ready_roots(4);
+    driver.add_completions(4);
+    let mut budget = drive_budget(4);
+    budget.root_visit_limit = std::num::NonZeroUsize::new(4).unwrap();
+
+    let report = driver.drive(&budget);
+    assert!(
+        report.completions >= 1,
+        "root reservation starved the completion source: {report:?}"
+    );
+}
+
+#[test]
 fn drive_rotation_persists_for_repeated_one_credit_calls() {
     let clock = FakeClock::new();
     let mut driver = BoundedDriver::new(Rc::new(clock));

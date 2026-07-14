@@ -412,6 +412,10 @@ impl Runtime {
             .ready
             .root_count()
             .min(budget.root_visit_limit.get());
+        // Reserve credits for at most work_item_limit - 1 roots so a ready-root
+        // storm always leaves at least one work item for completions, timers,
+        // cleanup, and pending stages (spec: each storm leaves progress room).
+        let reserve_floor = reserved_roots.min(budget.work_item_limit.get().saturating_sub(1));
 
         while work_items < budget.work_item_limit.get() {
             let expired = {
@@ -444,7 +448,7 @@ impl Runtime {
                 no_progress = 0;
                 continue;
             }
-            let unvisited_reserved = reserved_roots - root_visits;
+            let unvisited_reserved = reserve_floor.saturating_sub(root_visits);
             let remaining_credits = budget.work_item_limit.get() - work_items;
             let reserve_root = budget.work_item_limit.get() > 1
                 && unvisited_reserved > 0

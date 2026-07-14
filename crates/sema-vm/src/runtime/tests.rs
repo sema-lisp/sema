@@ -1,5 +1,6 @@
 use std::any::Any;
 use std::cell::Cell;
+use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -37,6 +38,18 @@ fn runtime_with_inline_executor(clock: Rc<dyn RuntimeClock>) -> Runtime {
         }),
     )
     .expect("runtime")
+}
+
+thread_local! {
+    static REENTRANT_HANDLE: RefCell<Option<super::RootHandle>> = const { RefCell::new(None) };
+}
+
+fn poll_reentrant_handle() {
+    REENTRANT_HANDLE.with(|slot| {
+        if let Some(handle) = slot.borrow().as_ref() {
+            assert!(matches!(handle.poll_result(), RootPoll::Pending));
+        }
+    });
 }
 
 #[test]
@@ -123,6 +136,82 @@ fn runtime_drive_charges_external_extract_decode_resume_and_apply_stages() {
 }
 
 #[test]
+fn runtime_forced_trace_keeps_values_in_root_settlement_and_every_pending_stage() {
+    let runtime = runtime_with_inline_executor(Rc::new(FakeClock::new()));
+    let handle = runtime
+        .submit_test_root(TestPreparedTask::native(Ok(NativeOutcome::Suspend(
+            edge_suspend(),
+        ))))
+        .unwrap();
+    let edge_count = |runtime: &Runtime| {
+        let mut edges = 0;
+        assert!(runtime.trace(&mut |_| edges += 1));
+        edges
+    };
+
+    assert_eq!(edge_count(&runtime), 2, "prepared suspend owners");
+    runtime.drive(&drive_budget(1)).unwrap();
+    assert_eq!(edge_count(&runtime), 2, "registered wait owners");
+    runtime.drive(&drive_budget(1)).unwrap();
+    assert_eq!(edge_count(&runtime), 2, "task pending resume owners");
+    runtime.drive(&drive_budget(1)).unwrap();
+    assert_eq!(edge_count(&runtime), 2, "decode stage owners");
+    runtime.drive(&drive_budget(1)).unwrap();
+    assert_eq!(edge_count(&runtime), 2, "continuation stage owners");
+    runtime.drive(&drive_budget(1)).unwrap();
+    assert_eq!(edge_count(&runtime), 1, "apply stage outcome");
+    runtime.drive(&drive_budget(1)).unwrap();
+    assert_eq!(edge_count(&runtime), 1, "root settlement outcome");
+    assert!(matches!(handle.poll_result(), RootPoll::Ready(_)));
+}
+
+#[test]
+fn runtime_continuation_may_suspend_again_without_nested_state_borrow() {
+    let runtime = runtime_with_inline_executor(Rc::new(FakeClock::new()));
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let first = NativeSuspend {
+        wait: external_suspend(Arc::clone(&events)).wait,
+        continuation: Box::new(SecondSuspendContinuation(Arc::clone(&events))),
+    };
+    let handle = runtime
+        .submit_test_root(TestPreparedTask::native(Ok(NativeOutcome::Suspend(first))))
+        .expect("root admitted");
+
+    for _ in 0..16 {
+        runtime.drive(&drive_budget(1)).expect("staged drive");
+        if matches!(handle.poll_result(), RootPoll::Ready(_)) {
+            break;
+        }
+    }
+    assert!(matches!(handle.poll_result(), RootPoll::Ready(_)));
+    assert_eq!(
+        *events.lock().unwrap(),
+        vec!["decode", "decode", "returned"]
+    );
+}
+
+#[test]
+fn runtime_submit_executor_may_poll_root_handle_reentrantly() {
+    let runtime = Runtime::new(
+        Rc::new(sema_core::EvalContext::new()),
+        Rc::new(FakeClock::new()),
+        Arc::new(FakeExecutor {
+            mode: FakeSubmit::Reenter,
+            failure: None,
+        }),
+    )
+    .unwrap();
+    let handle = runtime
+        .submit_test_root(TestPreparedTask::native(Ok(NativeOutcome::Suspend(
+            external_suspend(Arc::new(Mutex::new(Vec::new()))),
+        ))))
+        .unwrap();
+    REENTRANT_HANDLE.with(|slot| *slot.borrow_mut() = Some(handle.clone()));
+    runtime.drive(&drive_budget(1)).unwrap();
+    REENTRANT_HANDLE.with(|slot| slot.borrow_mut().take());
+}
+
+#[test]
 fn runtime_shutdown_rejects_admission_cancels_roots_and_reports_clean() {
     let clock = Rc::new(FakeClock::new());
     let runtime = runtime_with_inline_executor(clock.clone());
@@ -144,10 +233,102 @@ fn runtime_shutdown_rejects_admission_cancels_roots_and_reports_clean() {
     ));
 }
 
+#[test]
+fn runtime_shutdown_cancels_waiting_task_and_reaps_quarantine_completion() {
+    let clock = Rc::new(FakeClock::new());
+    let runtime = runtime_with_inline_executor(clock.clone());
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let handle = runtime
+        .submit_test_root(TestPreparedTask::native(Ok(NativeOutcome::Suspend(
+            external_suspend(Arc::clone(&events)),
+        ))))
+        .expect("root admitted");
+    runtime.drive(&drive_budget(1)).expect("register wait");
+
+    let report = runtime
+        .shutdown(&super::ShutdownOptions {
+            deadline: clock.now() + Duration::from_secs(1),
+            drive_budget: drive_budget(8),
+        })
+        .expect("bounded shutdown");
+    assert!(report.clean);
+    assert_eq!(*events.lock().unwrap(), vec!["cancelled"]);
+    let RootPoll::Ready(settlement) = handle.poll_result() else {
+        panic!("waiting root settles during shutdown");
+    };
+    assert!(matches!(
+        &settlement.outcome,
+        TaskOutcome::Returned(value) if *value == Value::NIL
+    ));
+}
+
+#[test]
+fn runtime_cancel_and_reap_hooks_may_poll_root_handle_reentrantly() {
+    let clock = Rc::new(FakeClock::new());
+    let runtime = runtime_with_inline_executor(clock.clone());
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let suspend = NativeSuspend {
+        wait: WaitKind::External(Box::new(PreparedExternalOperation::interruptible_blocking(
+            CompletionKind::try_from_raw(7).unwrap(),
+            Box::new(CountingDecoder(Arc::clone(&events))),
+            InterruptibleResource::new("reentrant", Box::new(ReentrantHook)),
+            || Ok(Box::new(7_i32)),
+        ))),
+        continuation: Box::new(CountingContinuation(events)),
+    };
+    let handle = runtime
+        .submit_test_root(TestPreparedTask::native(Ok(NativeOutcome::Suspend(
+            suspend,
+        ))))
+        .unwrap();
+    runtime.drive(&drive_budget(1)).unwrap();
+    REENTRANT_HANDLE.with(|slot| *slot.borrow_mut() = Some(handle.clone()));
+    handle.cancel(CancelReason::Explicit);
+    let report = runtime
+        .shutdown(&super::ShutdownOptions {
+            deadline: clock.now() + Duration::from_secs(1),
+            drive_budget: drive_budget(8),
+        })
+        .unwrap();
+    REENTRANT_HANDLE.with(|slot| slot.borrow_mut().take());
+    assert!(report.clean);
+}
+
+#[test]
+fn runtime_settlement_exhaustion_preserves_owner_until_terminal_shutdown() {
+    let clock = Rc::new(FakeClock::new());
+    let runtime = runtime_with_inline_executor(clock.clone());
+    let handle = runtime
+        .submit_test_root(TestPreparedTask::returned(Value::int(9)))
+        .expect("root admitted");
+    runtime.force_settlement_exhaustion_for_test();
+
+    assert_eq!(
+        runtime.drive(&drive_budget(8)),
+        Err(super::RuntimeFault::IdExhausted { kind: "settlement" })
+    );
+    assert_eq!(
+        runtime.task_count(),
+        1,
+        "failed allocation keeps task owner"
+    );
+    assert!(matches!(handle.poll_result(), RootPoll::Pending));
+    runtime.clear_terminal_fault_for_test();
+    let report = runtime
+        .shutdown(&super::ShutdownOptions {
+            deadline: clock.now() + Duration::from_secs(1),
+            drive_budget: drive_budget(8),
+        })
+        .expect("terminal cleanup remains drivable");
+    assert!(report.clean);
+    assert!(matches!(handle.poll_result(), RootPoll::Ready(_)));
+}
+
 #[derive(Clone, Copy)]
 enum FakeSubmit {
     Inline,
     Reject,
+    Reenter,
 }
 
 struct FakeLease {
@@ -161,6 +342,9 @@ impl ExecutorLease for FakeLease {
         let operation = submission.operation_id();
         if matches!(self.mode, FakeSubmit::Reject) {
             return Err(submission.reject(SubmitErrorKind::Capacity));
+        }
+        if matches!(self.mode, FakeSubmit::Reenter) {
+            poll_reentrant_handle();
         }
         match submission.into_dispatch() {
             ExecutorDispatch::Blocking(dispatch) => {
@@ -219,6 +403,23 @@ struct CountingContinuation(Arc<Mutex<Vec<&'static str>>>);
 impl Trace for CountingContinuation {
     fn trace(&self, _sink: &mut dyn FnMut(sema_core::cycle::GcEdge<'_>)) -> bool {
         true
+    }
+}
+
+struct SecondSuspendContinuation(Arc<Mutex<Vec<&'static str>>>);
+impl Trace for SecondSuspendContinuation {
+    fn trace(&self, _sink: &mut dyn FnMut(sema_core::cycle::GcEdge<'_>)) -> bool {
+        true
+    }
+}
+impl NativeContinuation for SecondSuspendContinuation {
+    fn resume(
+        self: Box<Self>,
+        _context: &mut NativeCallContext<'_>,
+        input: ResumeInput,
+    ) -> NativeResult {
+        assert!(matches!(input, ResumeInput::Returned(_)));
+        Ok(NativeOutcome::Suspend(external_suspend(self.0)))
     }
 }
 
@@ -315,6 +516,28 @@ struct PendingHook;
 impl Trace for PendingHook {
     fn trace(&self, _sink: &mut dyn FnMut(sema_core::cycle::GcEdge<'_>)) -> bool {
         true
+    }
+}
+
+struct ReentrantHook;
+impl Trace for ReentrantHook {
+    fn trace(&self, _sink: &mut dyn FnMut(sema_core::cycle::GcEdge<'_>)) -> bool {
+        true
+    }
+}
+impl sema_core::runtime::CancelHook for ReentrantHook {
+    fn cancel(
+        &mut self,
+    ) -> Result<sema_core::runtime::CancelDisposition, sema_core::runtime::CancelHookError> {
+        poll_reentrant_handle();
+        Ok(sema_core::runtime::CancelDisposition::PendingReap)
+    }
+
+    fn reap(
+        &mut self,
+    ) -> Result<sema_core::runtime::CancelDisposition, sema_core::runtime::CancelHookError> {
+        poll_reentrant_handle();
+        Ok(sema_core::runtime::CancelDisposition::Reaped)
     }
 }
 

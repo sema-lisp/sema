@@ -89,7 +89,7 @@ enum TaskPayload {
 struct RuntimeState {
     _context: Rc<EvalContext>,
     clock: Rc<dyn RuntimeClock>,
-    waits: WaitRuntime,
+    waits: Option<WaitRuntime>,
     // Root admission is intentionally test-only until Task 4 supplies PreparedRoot.
     #[cfg_attr(not(test), allow(dead_code))]
     root_ids: RuntimeScopedIdCounter<RootId>,
@@ -103,11 +103,13 @@ struct RuntimeState {
     pending: VecDeque<PendingStage>,
     shutting_down: bool,
     terminal_fault: Option<RuntimeFault>,
+    #[cfg(test)]
+    force_settlement_exhaustion: bool,
 }
 
 impl Trace for RuntimeState {
     fn trace(&self, sink: &mut dyn FnMut(sema_core::cycle::GcEdge<'_>)) -> bool {
-        self.waits.trace(sink)
+        self.waits.as_ref().is_none_or(|waits| waits.trace(sink))
             && self.roots.values().all(|root| root.trace(sink))
             && self.tasks.values().all(|task| task.trace(sink))
             && self.pending.iter().all(|stage| stage.trace(sink))
@@ -150,7 +152,7 @@ impl Runtime {
             state: Rc::new(RefCell::new(RuntimeState {
                 _context: context,
                 clock,
-                waits,
+                waits: Some(waits),
                 root_ids,
                 task_ids: IdCounter::new(),
                 settlement_ids: IdCounter::new(),
@@ -161,6 +163,8 @@ impl Runtime {
                 pending: VecDeque::new(),
                 shutting_down: false,
                 terminal_fault: None,
+                #[cfg(test)]
+                force_settlement_exhaustion: false,
             })),
         })
     }
@@ -227,6 +231,15 @@ impl Runtime {
                 work_items += 1;
                 continue;
             }
+            if cleanup < budget.cleanup_limit.get() && self.reap_one() {
+                cleanup += 1;
+                work_items += 1;
+                continue;
+            }
+            if self.cancel_waiting()? {
+                work_items += 1;
+                continue;
+            }
             if self.advance_pending()? {
                 work_items += 1;
                 continue;
@@ -258,17 +271,28 @@ impl Runtime {
                 ready_remaining,
             })
         } else if state.shutting_down
-            && state.waits.is_closed()
+            && state.waits.as_ref().is_none_or(WaitRuntime::is_closed)
             && state.tasks.is_empty()
-            && state.waits.active_len() == 0
+            && state
+                .waits
+                .as_ref()
+                .is_none_or(|waits| waits.active_len() == 0)
         {
             Ok(DriveState::ShutdownComplete)
-        } else if state.roots.is_empty() && state.waits.active_len() == 0 {
+        } else if state.roots.is_empty()
+            && state
+                .waits
+                .as_ref()
+                .is_none_or(|waits| waits.active_len() == 0)
+        {
             Ok(DriveState::Quiescent)
         } else {
             Ok(DriveState::Idle {
                 next_deadline: None,
-                inbox_wakeup_required: state.waits.active_len() > 0,
+                inbox_wakeup_required: state
+                    .waits
+                    .as_ref()
+                    .is_some_and(|waits| waits.active_len() > 0),
                 legacy_io_wakeup_required: false,
             })
         }
@@ -289,14 +313,81 @@ impl Runtime {
         true
     }
 
-    fn drain_completion(&self) -> bool {
-        let mut state = self.state.borrow_mut();
-        let task_ids = state.tasks.keys().copied().collect::<Vec<_>>();
-        for task_id in task_ids {
-            let Some(mut task) = state.tasks.remove(&task_id) else {
-                continue;
+    fn reap_one(&self) -> bool {
+        let mut waits = {
+            let mut state = self.state.borrow_mut();
+            let Some(waits) = state.waits.take() else {
+                return false;
             };
-            let drained = state.waits.drain_one(&mut task.record);
+            if waits.cleanup_len() == 0 {
+                state.waits = Some(waits);
+                return false;
+            }
+            waits
+        };
+        waits.reap_cleanup(1);
+        self.state.borrow_mut().waits = Some(waits);
+        true
+    }
+
+    fn cancel_waiting(&self) -> Result<bool, RuntimeFault> {
+        let extracted = {
+            let mut state = self.state.borrow_mut();
+            let Some(task_id) = state.tasks.iter().find_map(|(id, task)| {
+                (task.record.state_name() == super::StateName::Waiting
+                    && task.record.cancellation().is_some())
+                .then_some(*id)
+            }) else {
+                return Ok(false);
+            };
+            let task = state.tasks.remove(&task_id).expect("selected task exists");
+            let waits = state.waits.take().ok_or_else(|| RuntimeFault::Invariant {
+                message: "wait runtime already extracted".into(),
+            })?;
+            (task_id, task, waits)
+        };
+        let (task_id, mut task, mut waits) = extracted;
+        let key = task
+            .record
+            .wait_key()
+            .expect("selected waiting task has key");
+        let pending = waits.cancel(&mut task.record, key);
+        let root = task.record.relations().origin_root;
+        let mut state = self.state.borrow_mut();
+        state.waits = Some(waits);
+        state.tasks.insert(task_id, task);
+        if let Some(pending) = pending {
+            state
+                .tasks
+                .get_mut(&task_id)
+                .expect("cancelled task restored")
+                .pending_resume = Some(pending);
+            state.ready.enqueue(root, task_id);
+        }
+        Ok(true)
+    }
+
+    fn drain_completion(&self) -> bool {
+        let task_ids = self
+            .state
+            .borrow()
+            .tasks
+            .keys()
+            .copied()
+            .collect::<Vec<_>>();
+        for task_id in task_ids {
+            let extracted = {
+                let mut state = self.state.borrow_mut();
+                let (Some(task), Some(waits)) = (state.tasks.remove(&task_id), state.waits.take())
+                else {
+                    continue;
+                };
+                (task, waits)
+            };
+            let (mut task, mut waits) = extracted;
+            let drained = waits.drain_one(&mut task.record);
+            let mut state = self.state.borrow_mut();
+            state.waits = Some(waits);
             state.tasks.insert(task_id, task);
             if let Some((_route, pending)) = drained {
                 if let Some(pending) = pending {
@@ -437,19 +528,26 @@ impl Runtime {
             }
             Err(error) => self.settle(root, task_id, TaskOutcome::Failed(error)),
             Ok(NativeOutcome::Suspend(suspend)) => {
-                let mut state = self.state.borrow_mut();
-                let mut task =
-                    state
-                        .tasks
-                        .remove(&task_id)
-                        .ok_or_else(|| RuntimeFault::Invariant {
-                            message: "suspending task disappeared".into(),
+                let (mut task, mut waits) =
+                    {
+                        let mut state = self.state.borrow_mut();
+                        let task = state.tasks.remove(&task_id).ok_or_else(|| {
+                            RuntimeFault::Invariant {
+                                message: "suspending task disappeared".into(),
+                            }
                         })?;
-                let registration = state.waits.register_external(
+                        let waits = state.waits.take().ok_or_else(|| RuntimeFault::Invariant {
+                            message: "wait runtime already extracted".into(),
+                        })?;
+                        (task, waits)
+                    };
+                let registration = waits.register_external(
                     &mut task.record,
                     suspend,
                     TaskContextHandle::default(),
                 );
+                let mut state = self.state.borrow_mut();
+                state.waits = Some(waits);
                 state.tasks.insert(task_id, task);
                 match registration {
                     Ok(_) => Ok(()),
@@ -482,12 +580,29 @@ impl Runtime {
         outcome: TaskOutcome,
     ) -> Result<(), RuntimeFault> {
         let mut state = self.state.borrow_mut();
-        let sequence = match state.settlement_ids.allocate() {
-            Ok(sequence) => sequence,
-            Err(_) => {
+        #[cfg(test)]
+        let exhausted = state.force_settlement_exhaustion;
+        #[cfg(not(test))]
+        let exhausted = false;
+        let sequence = match (!exhausted)
+            .then(|| state.settlement_ids.allocate())
+            .transpose()
+            .ok()
+            .flatten()
+        {
+            Some(sequence) => sequence,
+            None => {
                 let fault = RuntimeFault::IdExhausted { kind: "settlement" };
                 state.shutting_down = true;
                 state.terminal_fault = Some(fault.clone());
+                if let Some(task) = state.tasks.get_mut(&task_id) {
+                    task.record
+                        .yield_ready()
+                        .map_err(|error| RuntimeFault::Invariant {
+                            message: format!("terminal task failed to yield: {error:?}"),
+                        })?;
+                    state.ready.enqueue(root, task_id);
+                }
                 return Err(fault);
             }
         };
@@ -523,7 +638,14 @@ impl Runtime {
 
     pub fn cancel_root(&self, root: RootId, reason: CancelReason) -> bool {
         let mut state = self.state.borrow_mut();
-        if root.runtime() != state.waits.runtime_id() || !state.roots.contains_key(&root) {
+        if root.runtime()
+            != state
+                .waits
+                .as_ref()
+                .expect("runtime wait owner is installed")
+                .runtime_id()
+            || !state.roots.contains_key(&root)
+        {
             return false;
         }
         let task_id = match state.roots.get(&root).map(RootRecord::state) {
@@ -556,8 +678,8 @@ impl Runtime {
             }
         }
         let state = self.state.borrow();
-        let active_waits = state.waits.active_len();
-        let retained_cleanup = state.waits.cleanup_len();
+        let active_waits = state.waits.as_ref().map_or(0, WaitRuntime::active_len);
+        let retained_cleanup = state.waits.as_ref().map_or(0, WaitRuntime::cleanup_len);
         let live_tasks = state.tasks.len();
         let report = ShutdownReport {
             clean: live_tasks == 0 && active_waits == 0 && retained_cleanup == 0,
@@ -567,7 +689,12 @@ impl Runtime {
             retained_cleanup,
         };
         drop(state);
-        let lease = self.state.borrow_mut().waits.close();
+        let lease = self
+            .state
+            .borrow_mut()
+            .waits
+            .as_mut()
+            .and_then(WaitRuntime::close);
         if let Some(lease) = lease {
             lease.shutdown(options.deadline);
         }
@@ -583,7 +710,7 @@ impl Runtime {
                     .request_cancellation(CancelReason::InterpreterShutdown);
             }
             let deadline = state.clock.now();
-            (state.waits.close(), deadline)
+            (state.waits.as_mut().and_then(WaitRuntime::close), deadline)
         };
         if let Some(lease) = lease {
             lease.shutdown(deadline);
@@ -598,6 +725,18 @@ impl Runtime {
     #[cfg(test)]
     pub(super) fn task_count(&self) -> usize {
         self.state.borrow().tasks.len()
+    }
+
+    #[cfg(test)]
+    pub(super) fn force_settlement_exhaustion_for_test(&self) {
+        self.state.borrow_mut().force_settlement_exhaustion = true;
+    }
+
+    #[cfg(test)]
+    pub(super) fn clear_terminal_fault_for_test(&self) {
+        let mut state = self.state.borrow_mut();
+        state.force_settlement_exhaustion = false;
+        state.terminal_fault = None;
     }
 }
 

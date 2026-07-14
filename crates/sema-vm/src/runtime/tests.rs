@@ -588,16 +588,26 @@ fn runtime_drive_reserves_every_eligible_root_visit_credit() {
         .unwrap();
     let mut budget = drive_budget(5);
     budget.root_visit_limit = std::num::NonZeroUsize::new(2).unwrap();
+    runtime.set_drive_cursor_for_test(0);
+    let visits_before = runtime.ready_visit_count_for_test();
 
     assert!(matches!(
         runtime.drive(&budget).unwrap(),
         super::DriveState::Progress { work_items: 5, .. }
     ));
+    assert_eq!(
+        runtime.ready_visit_count_for_test() - visits_before,
+        2,
+        "the old single-reservation algorithm visits only one ready root"
+    );
     assert!(matches!(first.poll_result(), RootPoll::Pending));
     assert!(matches!(second.poll_result(), RootPoll::Pending));
-    assert!(backlog_handles
-        .iter()
-        .any(|handle| matches!(handle.poll_result(), RootPoll::Pending)));
+    assert!(
+        backlog_handles
+            .iter()
+            .any(|handle| matches!(handle.poll_result(), RootPoll::Pending)),
+        "completion backlog must remain"
+    );
 }
 
 #[test]

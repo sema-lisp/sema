@@ -108,6 +108,8 @@ struct RuntimeState {
     terminal_fault: Option<RuntimeFault>,
     #[cfg(test)]
     force_settlement_exhaustion: bool,
+    #[cfg(test)]
+    ready_visit_count: usize,
 }
 
 impl Trace for RuntimeState {
@@ -169,8 +171,20 @@ impl Runtime {
                 terminal_fault: None,
                 #[cfg(test)]
                 force_settlement_exhaustion: false,
+                #[cfg(test)]
+                ready_visit_count: 0,
             })),
         })
+    }
+
+    #[cfg(test)]
+    pub(super) fn set_drive_cursor_for_test(&self, cursor: usize) {
+        self.state.borrow_mut().drive_cursor = cursor;
+    }
+
+    #[cfg(test)]
+    pub(super) fn ready_visit_count_for_test(&self) -> usize {
+        self.state.borrow().ready_visit_count
     }
 
     #[cfg(test)]
@@ -482,6 +496,10 @@ impl Runtime {
             let Some((root, task_id)) = state.ready.dequeue() else {
                 return Ok(false);
             };
+            #[cfg(test)]
+            {
+                state.ready_visit_count += 1;
+            }
             let task = state
                 .tasks
                 .remove(&task_id)

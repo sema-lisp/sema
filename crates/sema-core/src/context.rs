@@ -3,6 +3,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::time::Instant;
 
+use crate::runtime::TaskContextHandle;
 use crate::{CallFrame, Env, Sandbox, SemaError, Span, SpanMap, StackTrace, Value};
 
 const MAX_SPAN_TABLE_ENTRIES: usize = 200_000;
@@ -43,6 +44,7 @@ pub struct EvalContext {
     pub call_fn: Cell<Option<CallCallbackFn>>,
     pub call_owned_fn: Cell<Option<CallOwnedCallbackFn>>,
     pub interactive: Cell<bool>,
+    task_context: RefCell<Option<TaskContextHandle>>,
 }
 
 /// RAII guard for a module-load scope: pops the load stack when dropped, so the
@@ -82,6 +84,7 @@ impl EvalContext {
             call_fn: Cell::new(None),
             call_owned_fn: Cell::new(None),
             interactive: Cell::new(false),
+            task_context: RefCell::new(None),
         }
     }
 
@@ -107,7 +110,20 @@ impl EvalContext {
             call_fn: Cell::new(None),
             call_owned_fn: Cell::new(None),
             interactive: Cell::new(false),
+            task_context: RefCell::new(None),
         }
+    }
+
+    pub fn task_context(&self) -> Option<TaskContextHandle> {
+        self.task_context.borrow().clone()
+    }
+
+    pub fn install_task_context(&self, handle: TaskContextHandle) -> Option<TaskContextHandle> {
+        self.task_context.replace(Some(handle))
+    }
+
+    pub fn take_task_context(&self) -> Option<TaskContextHandle> {
+        self.task_context.borrow_mut().take()
     }
 
     pub fn push_file_path(&self, path: PathBuf) {
@@ -445,6 +461,48 @@ mod tests {
     use std::path::PathBuf;
 
     use crate::{Caps, Sandbox, Value};
+
+    #[test]
+    fn task_context_handle_lifecycle_and_child_inheritance() {
+        let context = EvalContext::new();
+        assert!(context.task_context().is_none());
+        assert!(EvalContext::default().task_context().is_none());
+        assert!(EvalContext::new_with_sandbox(Sandbox::deny(Caps::FS_READ))
+            .task_context()
+            .is_none());
+
+        let handle = crate::runtime::TaskContextHandle::default();
+        context.install_task_context(handle.clone());
+        let clone = context.task_context().unwrap();
+        clone
+            .borrow_mut()
+            .insert(std::rc::Rc::new(TestTaskLocal(4)));
+        assert_eq!(handle.borrow().get::<TestTaskLocal>().unwrap().0, 4);
+
+        let child = handle.inherit_for_child();
+        assert_eq!(child.borrow().get::<TestTaskLocal>().unwrap().0, 0);
+        assert_eq!(handle.borrow().get::<TestTaskLocal>().unwrap().0, 4);
+        assert!(context.take_task_context().is_some());
+        assert!(context.task_context().is_none());
+    }
+
+    struct TestTaskLocal(u32);
+
+    impl crate::runtime::Trace for TestTaskLocal {
+        fn trace(&self, _sink: &mut dyn FnMut(crate::cycle::GcEdge<'_>)) -> bool {
+            true
+        }
+    }
+
+    impl crate::runtime::TaskLocalValue for TestTaskLocal {
+        fn inherit(&self) -> std::rc::Rc<dyn crate::runtime::TaskLocalValue> {
+            std::rc::Rc::new(Self(0))
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
 
     // --- File path tracking ---
 

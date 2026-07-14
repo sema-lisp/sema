@@ -35,5 +35,5 @@ pub use resource::{
     QuarantineBound, QuarantineBoundDescriptor, ResourceClass,
 };
 pub use settlement::{TaskOutcome, TaskSettlement};
-pub use task_context::TaskContext;
+pub use task_context::{TaskContext, TaskContextHandle, TaskLocalValue};
 pub use trace::Trace;

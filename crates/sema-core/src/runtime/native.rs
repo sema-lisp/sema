@@ -1,9 +1,13 @@
+use std::rc::Rc;
 use std::time::Duration;
 
 use crate::cycle::GcEdge;
 use crate::{SemaError, Value};
 
-use super::{CancelReason, ChannelId, PreparedExternalOperation, PromiseId, TaskContext, Trace};
+use super::{
+    CancelReason, ChannelId, PreparedExternalOperation, PromiseId, TaskContext, TaskOutcome,
+    TaskSettlement, Trace,
+};
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct CancellationView {
@@ -37,6 +41,69 @@ pub enum NativeOutcome {
     Return(Value),
     Call(NativeCall),
     Suspend(NativeSuspend),
+    Runtime(RuntimeRequest),
+}
+
+pub enum RuntimeRequest {
+    Spawn {
+        callable: Value,
+        continuation: Box<dyn NativeContinuation>,
+    },
+    CancelPromise {
+        promise: PromiseId,
+        continuation: Box<dyn NativeContinuation>,
+    },
+    CreateChannel {
+        capacity: usize,
+        continuation: Box<dyn NativeContinuation>,
+    },
+    ChannelOp {
+        channel: ChannelId,
+        operation: ChannelOperation,
+        continuation: Box<dyn NativeContinuation>,
+    },
+    CreateSettledPromise {
+        outcome: TaskOutcome,
+        continuation: Box<dyn NativeContinuation>,
+    },
+    InspectPromise {
+        promise: PromiseId,
+        continuation: Box<dyn NativeContinuation>,
+    },
+    OriginBarrier {
+        continuation: Box<dyn NativeContinuation>,
+    },
+}
+
+pub enum ChannelOperation {
+    Close,
+    TryReceive,
+    Inspect(ChannelQuery),
+}
+pub enum ChannelQuery {
+    Closed,
+    Count,
+    Empty,
+    Full,
+}
+
+pub enum PromiseSetMode {
+    All,
+    Race,
+    Timeout(Duration),
+}
+pub struct PromiseSetWait {
+    pub promises: Vec<PromiseId>,
+    pub mode: PromiseSetMode,
+}
+
+#[derive(Clone, Debug)]
+pub enum RuntimeResponse {
+    Promise(PromiseId),
+    Channel(ChannelId),
+    Value(Value),
+    Cancelled(bool),
+    Settlement(Option<Rc<TaskSettlement>>),
 }
 
 pub struct NativeCall {
@@ -53,6 +120,7 @@ pub struct NativeSuspend {
 pub enum WaitKind {
     Timer(Duration),
     Promise(PromiseId),
+    PromiseSet(PromiseSetWait),
     Channel(ChannelWait),
     External(Box<PreparedExternalOperation>),
 }
@@ -66,6 +134,7 @@ pub enum ResumeInput {
     Returned(Value),
     Failed(SemaError),
     Cancelled(CancelReason),
+    Runtime(RuntimeResponse),
 }
 
 pub trait NativeContinuation: Trace {
@@ -98,7 +167,42 @@ impl Trace for NativeOutcome {
             }
             Self::Call(call) => call.trace(sink),
             Self::Suspend(suspend) => suspend.trace(sink),
+            Self::Runtime(request) => request.trace(sink),
         }
+    }
+}
+
+impl Trace for RuntimeRequest {
+    fn trace(&self, sink: &mut dyn FnMut(GcEdge<'_>)) -> bool {
+        match self {
+            Self::Spawn {
+                callable,
+                continuation,
+            } => {
+                sink(GcEdge::Value(callable));
+                continuation.trace(sink)
+            }
+            Self::CreateSettledPromise {
+                outcome,
+                continuation,
+            } => outcome.trace(sink) && continuation.trace(sink),
+            Self::CancelPromise { continuation, .. }
+            | Self::CreateChannel { continuation, .. }
+            | Self::ChannelOp { continuation, .. }
+            | Self::InspectPromise { continuation, .. } => continuation.trace(sink),
+            Self::OriginBarrier { continuation } => continuation.trace(sink),
+        }
+    }
+}
+
+impl Trace for RuntimeResponse {
+    fn trace(&self, sink: &mut dyn FnMut(GcEdge<'_>)) -> bool {
+        match self {
+            Self::Value(value) => sink(GcEdge::Value(value)),
+            Self::Settlement(Some(settlement)) => return settlement.trace(sink),
+            _ => {}
+        }
+        true
     }
 }
 
@@ -121,7 +225,7 @@ impl Trace for NativeSuspend {
 impl Trace for WaitKind {
     fn trace(&self, sink: &mut dyn FnMut(GcEdge<'_>)) -> bool {
         match self {
-            Self::Timer(_) | Self::Promise(_) => true,
+            Self::Timer(_) | Self::Promise(_) | Self::PromiseSet(_) => true,
             Self::Channel(wait) => wait.trace(sink),
             Self::External(operation) => operation.trace(sink),
         }
@@ -147,6 +251,7 @@ impl Trace for ResumeInput {
             }
             Self::Failed(error) => trace_error(error, sink),
             Self::Cancelled(_) => true,
+            Self::Runtime(response) => response.trace(sink),
         }
     }
 }
@@ -185,6 +290,7 @@ mod tests {
                 ResumeInput::Returned(_) => "returned",
                 ResumeInput::Failed(_) => "failed",
                 ResumeInput::Cancelled(_) => "cancelled",
+                ResumeInput::Runtime(_) => "runtime",
             });
             Ok(NativeOutcome::Return(self.edge))
         }

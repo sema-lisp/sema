@@ -1,4 +1,6 @@
+mod channel;
 mod drive;
+mod promise;
 mod ready;
 mod root;
 mod state;
@@ -27,3 +29,5 @@ pub use wait::{
 
 #[cfg(test)]
 mod tests;
+pub use channel::{ChannelRegistry, ChannelResult, ChannelWake};
+pub use promise::{PromiseRegistry, PromiseState, RegistryError};

@@ -31,6 +31,193 @@ use super::{
     RootPoll, Runtime, TestPreparedTask,
 };
 
+#[test]
+fn protocol_registries_reject_foreign_ids_and_preserve_canonical_settlements() {
+    use super::{PromiseRegistry, PromiseState};
+    let first_runtime = RuntimeId::allocate().unwrap();
+    let second_runtime = RuntimeId::allocate().unwrap();
+    let mut promises = PromiseRegistry::new(first_runtime);
+    let id = promises.allocate_pending(None).unwrap();
+    let foreign = super::PromiseRegistry::new(second_runtime)
+        .allocate_pending(None)
+        .unwrap();
+    assert!(matches!(
+        promises.state(foreign),
+        Err(super::RegistryError::WrongRuntime)
+    ));
+    let settlement = Rc::new(sema_core::runtime::TaskSettlement {
+        sequence: IdCounter::<SettlementSeq>::new().allocate().unwrap(),
+        outcome: TaskOutcome::Returned(Value::int(7)),
+    });
+    promises.settle(id, Rc::clone(&settlement)).unwrap();
+    let PromiseState::Returned(observed) = promises.state(id).unwrap() else {
+        panic!()
+    };
+    assert!(Rc::ptr_eq(&settlement, &observed));
+}
+
+#[test]
+fn channel_registry_is_fifo_and_cancellation_is_exact() {
+    use super::{ChannelRegistry, ChannelResult};
+    let runtime = RuntimeId::allocate().unwrap();
+    let mut channels = ChannelRegistry::new(runtime);
+    let channel = channels.allocate(0).unwrap();
+    let waits = WaitRuntime::new(Arc::new(FakeExecutor {
+        mode: FakeSubmit::Inline,
+        failure: None,
+    }))
+    .unwrap();
+    let send_key = waits.issue_internal_wait().unwrap();
+    let receive_key = waits.issue_internal_wait().unwrap();
+    assert_eq!(
+        channels
+            .send(
+                channel,
+                send_key,
+                TaskId::try_from_raw(1).unwrap(),
+                Value::int(4)
+            )
+            .unwrap(),
+        ChannelResult::Waiting
+    );
+    assert_eq!(
+        channels
+            .receive(channel, receive_key, TaskId::try_from_raw(2).unwrap())
+            .unwrap(),
+        ChannelResult::Received(Value::int(4))
+    );
+    assert_eq!(channels.take_wake(send_key).unwrap().key, send_key);
+    assert!(!channels.cancel_wait(channel, receive_key).unwrap());
+}
+
+struct RuntimeResponseContinuation(Arc<Mutex<Vec<&'static str>>>);
+impl Trace for RuntimeResponseContinuation {
+    fn trace(&self, _: &mut dyn FnMut(sema_core::cycle::GcEdge<'_>)) -> bool {
+        true
+    }
+}
+impl NativeContinuation for RuntimeResponseContinuation {
+    fn resume(self: Box<Self>, _: &mut NativeCallContext<'_>, input: ResumeInput) -> NativeResult {
+        self.0.lock().unwrap().push(match input {
+            ResumeInput::Runtime(_) => "apply-response",
+            _ => "wrong-response",
+        });
+        Ok(NativeOutcome::Return(Value::int(3)))
+    }
+}
+
+#[test]
+fn runtime_request_dispatch_and_response_application_are_separately_charged() {
+    let runtime = runtime_with_inline_executor(Rc::new(FakeClock::new()));
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let handle = runtime
+        .submit_test_root(TestPreparedTask::native(Ok(NativeOutcome::Runtime(
+            sema_core::runtime::RuntimeRequest::CreateChannel {
+                capacity: 1,
+                continuation: Box::new(RuntimeResponseContinuation(Arc::clone(&events))),
+            },
+        ))))
+        .unwrap();
+    let one = drive_budget(1);
+    let mut turns = 0;
+    while matches!(handle.poll_result(), RootPoll::Pending) {
+        assert!(matches!(
+            runtime.drive(&one).unwrap(),
+            super::DriveState::Progress { work_items: 1, .. }
+        ));
+        turns += 1;
+        assert!(turns < 10);
+    }
+    assert_eq!(*events.lock().unwrap(), vec!["apply-response"]);
+    assert!(
+        turns >= 6,
+        "visit, action, native apply, dispatch, response apply, final apply are distinct"
+    );
+}
+
+#[test]
+fn promise_observer_cancellation_does_not_cancel_supplied_promise() {
+    let runtime = RuntimeId::allocate().unwrap();
+    let mut promises = super::PromiseRegistry::new(runtime);
+    let promise = promises
+        .allocate_pending(Some(TaskId::try_from_raw(9).unwrap()))
+        .unwrap();
+    let waits = WaitRuntime::new(Arc::new(FakeExecutor {
+        mode: FakeSubmit::Inline,
+        failure: None,
+    }))
+    .unwrap();
+    let key = waits.issue_internal_wait().unwrap();
+    assert!(promises
+        .observe(promise, key, TaskId::try_from_raw(10).unwrap())
+        .unwrap());
+    assert!(promises.cancel_observation(promise, key).unwrap());
+    assert_eq!(
+        promises.task(promise).unwrap(),
+        Some(TaskId::try_from_raw(9).unwrap())
+    );
+    assert!(matches!(
+        promises.state(promise).unwrap(),
+        super::PromiseState::Pending
+    ));
+}
+
+#[test]
+fn channel_buffer_fifo_close_and_exact_waiter_cleanup() {
+    let runtime = RuntimeId::allocate().unwrap();
+    let mut channels = super::ChannelRegistry::new(runtime);
+    let channel = channels.allocate(2).unwrap();
+    let waits = WaitRuntime::new(Arc::new(FakeExecutor {
+        mode: FakeSubmit::Inline,
+        failure: None,
+    }))
+    .unwrap();
+    let keys: Vec<_> = (0..4)
+        .map(|_| waits.issue_internal_wait().unwrap())
+        .collect();
+    assert_eq!(
+        channels
+            .send(
+                channel,
+                keys[0],
+                TaskId::try_from_raw(1).unwrap(),
+                Value::int(1)
+            )
+            .unwrap(),
+        super::ChannelResult::Sent
+    );
+    assert_eq!(
+        channels
+            .send(
+                channel,
+                keys[1],
+                TaskId::try_from_raw(2).unwrap(),
+                Value::int(2)
+            )
+            .unwrap(),
+        super::ChannelResult::Sent
+    );
+    assert_eq!(
+        channels
+            .receive(channel, keys[2], TaskId::try_from_raw(3).unwrap())
+            .unwrap(),
+        super::ChannelResult::Received(Value::int(1))
+    );
+    assert_eq!(
+        channels
+            .receive(channel, keys[3], TaskId::try_from_raw(4).unwrap())
+            .unwrap(),
+        super::ChannelResult::Received(Value::int(2))
+    );
+    assert!(channels.close(channel).unwrap());
+    assert_eq!(
+        channels
+            .receive(channel, keys[3], TaskId::try_from_raw(4).unwrap())
+            .unwrap(),
+        super::ChannelResult::Closed
+    );
+}
+
 fn runtime_with_inline_executor(clock: Rc<dyn RuntimeClock>) -> Runtime {
     Runtime::new(
         Rc::new(sema_core::EvalContext::new()),
@@ -236,6 +423,7 @@ impl NativeContinuation for RecordingContinuation {
             ResumeInput::Returned(_) => "resume-returned",
             ResumeInput::Failed(_) => "resume-failed",
             ResumeInput::Cancelled(_) => "resume-cancelled",
+            ResumeInput::Runtime(_) => "resume-runtime",
         });
         Ok(NativeOutcome::Return(Value::int(9)))
     }
@@ -1584,6 +1772,7 @@ impl NativeContinuation for CountingContinuation {
             ResumeInput::Returned(_) => "returned",
             ResumeInput::Failed(_) => "failed",
             ResumeInput::Cancelled(_) => "cancelled",
+            ResumeInput::Runtime(_) => "runtime",
         });
         Ok(NativeOutcome::Return(Value::NIL))
     }

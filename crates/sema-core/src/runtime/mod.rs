@@ -27,8 +27,9 @@ pub use ids::{
     WaitId,
 };
 pub use native::{
-    CancellationView, ChannelWait, NativeCall, NativeCallContext, NativeContinuation,
-    NativeOutcome, NativeResult, NativeSuspend, ResumeInput, WaitKind,
+    CancellationView, ChannelOperation, ChannelQuery, ChannelWait, NativeCall, NativeCallContext,
+    NativeContinuation, NativeOutcome, NativeResult, NativeSuspend, PromiseSetMode, PromiseSetWait,
+    ResumeInput, RuntimeRequest, RuntimeResponse, WaitKind,
 };
 pub use resource::{
     CancelDisposition, CancelHook, CancelHookError, InterruptibleResource, InvalidQuarantineBound,

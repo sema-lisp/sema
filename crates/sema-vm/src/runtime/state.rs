@@ -11,8 +11,9 @@ use crate::{extract_vm_closure, VmExecResult, VM};
 use sema_core::runtime::ExternalFailure;
 use sema_core::runtime::{
     CancelReason, CancellationView, ExecutorShutdown, IdCounter, IoExecutor, NativeCall,
-    NativeCallContext, NativeOutcome, NativeResult, ResumeInput, RootId, RuntimeScopedIdCounter,
-    SettlementSeq, TaskContextHandle, TaskId, TaskOutcome, TaskSettlement, Trace,
+    NativeCallContext, NativeOutcome, NativeResult, ResumeInput, RootId, RuntimeRequest,
+    RuntimeResponse, RuntimeScopedIdCounter, SettlementSeq, TaskContextHandle, TaskId, TaskOutcome,
+    TaskSettlement, Trace,
 };
 #[cfg(test)]
 use sema_core::runtime::{CancellationParent, LifetimeOwner, TaskRelations};
@@ -21,9 +22,9 @@ use sema_core::EvalContext;
 use sema_core::Value;
 
 use super::{
-    ContinuationFrame, DriveBudget, DriveState, PendingResume, ReadyScheduler,
-    RegisterExternalError, RootRecord, RootState, RuntimeClock, RuntimeCreateError, TaskRecord,
-    TimerQueue, WaitRuntime,
+    ChannelRegistry, ContinuationFrame, DriveBudget, DriveState, PendingResume, PromiseRegistry,
+    PromiseState, ReadyScheduler, RegisterExternalError, RootRecord, RootState, RuntimeClock,
+    RuntimeCreateError, TaskRecord, TimerQueue, WaitRuntime,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -114,6 +115,8 @@ struct RuntimeState {
     #[cfg_attr(not(test), allow(dead_code))]
     task_ids: IdCounter<TaskId>,
     settlement_ids: IdCounter<SettlementSeq>,
+    promises: PromiseRegistry,
+    channels: ChannelRegistry,
     roots: HashMap<RootId, RootRecord>,
     tasks: HashMap<TaskId, RuntimeTask>,
     ready: ReadyScheduler,
@@ -141,6 +144,8 @@ impl Trace for RuntimeState {
         self.waits.as_ref().is_none_or(|waits| waits.trace(sink))
             && self.roots.values().all(|root| root.trace(sink))
             && self.tasks.values().all(|task| task.trace(sink))
+            && self.promises.trace(sink)
+            && self.channels.trace(sink)
             && self.pending.iter().all(|stage| stage.trace(sink))
     }
 }
@@ -184,6 +189,7 @@ impl Runtime {
     ) -> Result<Self, RuntimeCreateError> {
         let waits = WaitRuntime::new(executor)?;
         let root_ids = RuntimeScopedIdCounter::new(waits.runtime_id());
+        let runtime_id = waits.runtime_id();
         Ok(Self {
             state: Rc::new(RefCell::new(RuntimeState {
                 _context: context,
@@ -192,6 +198,8 @@ impl Runtime {
                 root_ids,
                 task_ids: IdCounter::new(),
                 settlement_ids: IdCounter::new(),
+                promises: PromiseRegistry::new(runtime_id),
+                channels: ChannelRegistry::new(runtime_id),
                 roots: HashMap::new(),
                 tasks: HashMap::new(),
                 ready: ReadyScheduler::new(),
@@ -634,6 +642,19 @@ impl Runtime {
                 self.apply_native_result(task, owner, result)?;
                 return Ok(true);
             }
+            PendingStage::DispatchRuntime(task, owner, request) => {
+                self.dispatch_runtime(task, owner, request)?;
+                return Ok(true);
+            }
+            PendingStage::ApplyRuntimeResponse(task, owner, frame, response) => {
+                self.resume_continuation(
+                    task,
+                    owner,
+                    frame,
+                    response.map_or_else(ResumeInput::Failed, ResumeInput::Runtime),
+                )?;
+                return Ok(true);
+            }
         };
         self.state.borrow_mut().pending.push_back(next);
         Ok(true)
@@ -942,7 +963,144 @@ impl Runtime {
                     .push_back(PendingStage::Invoke(task_id, owner, call));
                 Ok(())
             }
+            Ok(NativeOutcome::Runtime(request)) => {
+                self.state
+                    .borrow_mut()
+                    .pending
+                    .push_back(PendingStage::DispatchRuntime(task_id, owner, request));
+                Ok(())
+            }
         }
+    }
+
+    fn dispatch_runtime(
+        &self,
+        task_id: TaskId,
+        owner: ReturnOwner,
+        request: RuntimeRequest,
+    ) -> Result<(), RuntimeFault> {
+        let (continuation, response) = {
+            let mut state = self.state.borrow_mut();
+            match request {
+                RuntimeRequest::Spawn { continuation, .. } => (
+                    continuation,
+                    Err(sema_core::SemaError::eval(
+                        "runtime spawn admission is unavailable",
+                    )),
+                ),
+                RuntimeRequest::CreateChannel {
+                    capacity,
+                    continuation,
+                } => {
+                    let response = state
+                        .channels
+                        .allocate(capacity)
+                        .map(RuntimeResponse::Channel)
+                        .map_err(|_| {
+                            sema_core::SemaError::eval("runtime channel identity exhausted")
+                        });
+                    (continuation, response)
+                }
+                RuntimeRequest::CreateSettledPromise {
+                    outcome,
+                    continuation,
+                } => {
+                    let response = (|| {
+                        let sequence = state.settlement_ids.allocate().map_err(|_| {
+                            sema_core::SemaError::eval("runtime settlement identity exhausted")
+                        })?;
+                        let settlement = Rc::new(TaskSettlement { sequence, outcome });
+                        let promise = state.promises.allocate_pending(None).map_err(|_| {
+                            sema_core::SemaError::eval("runtime promise identity exhausted")
+                        })?;
+                        state
+                            .promises
+                            .settle(promise, settlement)
+                            .map_err(registry_error)?;
+                        Ok(RuntimeResponse::Promise(promise))
+                    })();
+                    (continuation, response)
+                }
+                RuntimeRequest::InspectPromise {
+                    promise,
+                    continuation,
+                } => {
+                    let response = state
+                        .promises
+                        .state(promise)
+                        .map(|promise| {
+                            RuntimeResponse::Settlement(match promise {
+                                PromiseState::Pending => None,
+                                PromiseState::Returned(s)
+                                | PromiseState::Failed(s)
+                                | PromiseState::Cancelled(s) => Some(s),
+                            })
+                        })
+                        .map_err(registry_error);
+                    (continuation, response)
+                }
+                RuntimeRequest::CancelPromise {
+                    promise,
+                    continuation,
+                } => {
+                    let response = state
+                        .promises
+                        .task(promise)
+                        .map(|target| {
+                            RuntimeResponse::Cancelled(
+                                target
+                                    .and_then(|target| state.tasks.get_mut(&target))
+                                    .is_some_and(|task| {
+                                        task.record.request_cancellation(CancelReason::Explicit)
+                                    }),
+                            )
+                        })
+                        .map_err(registry_error);
+                    (continuation, response)
+                }
+                RuntimeRequest::ChannelOp {
+                    channel,
+                    operation,
+                    continuation,
+                } => {
+                    use sema_core::runtime::ChannelOperation;
+                    let response = match operation {
+                        ChannelOperation::Close => state
+                            .channels
+                            .close(channel)
+                            .map(|closed| RuntimeResponse::Value(sema_core::Value::bool(closed))),
+                        ChannelOperation::TryReceive => {
+                            state.channels.try_receive(channel).map(|result| {
+                                RuntimeResponse::Value(match result {
+                                    super::ChannelResult::Received(value) => value,
+                                    _ => sema_core::Value::FALSE,
+                                })
+                            })
+                        }
+                        ChannelOperation::Inspect(query) => state
+                            .channels
+                            .inspect(channel, query)
+                            .map(RuntimeResponse::Value),
+                    }
+                    .map_err(registry_error);
+                    (continuation, response)
+                }
+                RuntimeRequest::OriginBarrier { continuation } => (
+                    continuation,
+                    Ok(RuntimeResponse::Value(sema_core::Value::NIL)),
+                ),
+            }
+        };
+        self.state
+            .borrow_mut()
+            .pending
+            .push_back(PendingStage::ApplyRuntimeResponse(
+                task_id,
+                owner,
+                ContinuationFrame::native(continuation),
+                response,
+            ));
+        Ok(())
     }
 
     fn invoke_callable(
@@ -1466,6 +1624,18 @@ impl Runtime {
     }
 }
 
+fn registry_error(error: super::RegistryError) -> sema_core::SemaError {
+    sema_core::SemaError::eval(match error {
+        super::RegistryError::WrongRuntime => "runtime handle belongs to another runtime",
+        super::RegistryError::Unknown => "runtime handle is stale or unknown",
+        super::RegistryError::AlreadySettled => "promise is already settled",
+        super::RegistryError::IdExhausted => "runtime identity exhausted",
+        super::RegistryError::NonMonotonicSettlement => {
+            "promise settlement sequence is not monotonic"
+        }
+    })
+}
+
 struct ActiveDriveGuard(Rc<RefCell<RuntimeState>>);
 
 impl Drop for ActiveDriveGuard {
@@ -1574,6 +1744,13 @@ enum PendingStage {
     Invoke(TaskId, ReturnOwner, NativeCall),
     Resume(TaskId, ReturnOwner, ContinuationFrame, ResumeInput),
     Apply(TaskId, ReturnOwner, NativeResult),
+    DispatchRuntime(TaskId, ReturnOwner, RuntimeRequest),
+    ApplyRuntimeResponse(
+        TaskId,
+        ReturnOwner,
+        ContinuationFrame,
+        Result<RuntimeResponse, sema_core::SemaError>,
+    ),
 }
 
 enum ReturnOwner {
@@ -1594,6 +1771,15 @@ impl Trace for PendingStage {
                 owner.trace(sink)
                     && match result {
                         Ok(outcome) => outcome.trace(sink),
+                        Err(error) => error.trace(sink),
+                    }
+            }
+            Self::DispatchRuntime(_, owner, request) => owner.trace(sink) && request.trace(sink),
+            Self::ApplyRuntimeResponse(_, owner, frame, response) => {
+                owner.trace(sink)
+                    && frame.trace(sink)
+                    && match response {
+                        Ok(response) => response.trace(sink),
                         Err(error) => error.trace(sink),
                     }
             }

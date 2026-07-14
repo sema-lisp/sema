@@ -199,6 +199,64 @@ impl Trace for PendingHook {
         true
     }
 }
+
+#[derive(Clone, Copy)]
+enum CancelResult {
+    Reaped,
+    PendingReap,
+    Error,
+}
+
+struct RecordingHook {
+    result: CancelResult,
+    calls: Arc<Mutex<Vec<&'static str>>>,
+    edge: Option<Value>,
+    trace_ok: bool,
+}
+
+impl Trace for RecordingHook {
+    fn trace(&self, sink: &mut dyn FnMut(sema_core::cycle::GcEdge<'_>)) -> bool {
+        if let Some(value) = &self.edge {
+            sink(sema_core::cycle::GcEdge::Value(value));
+        }
+        self.trace_ok
+    }
+}
+
+impl sema_core::runtime::CancelHook for RecordingHook {
+    fn cancel(
+        &mut self,
+    ) -> Result<sema_core::runtime::CancelDisposition, sema_core::runtime::CancelHookError> {
+        self.calls.lock().unwrap().push("cancel");
+        match self.result {
+            CancelResult::Reaped => Ok(sema_core::runtime::CancelDisposition::Reaped),
+            CancelResult::PendingReap => Ok(sema_core::runtime::CancelDisposition::PendingReap),
+            CancelResult::Error => Err(sema_core::runtime::CancelHookError::new("cancel failed")),
+        }
+    }
+
+    fn reap(
+        &mut self,
+    ) -> Result<sema_core::runtime::CancelDisposition, sema_core::runtime::CancelHookError> {
+        self.calls.lock().unwrap().push("reap");
+        Ok(sema_core::runtime::CancelDisposition::PendingReap)
+    }
+}
+
+fn interruptible_suspend_with_hook(
+    events: Arc<Mutex<Vec<&'static str>>>,
+    hook: RecordingHook,
+) -> NativeSuspend {
+    NativeSuspend {
+        wait: WaitKind::External(Box::new(PreparedExternalOperation::interruptible_blocking(
+            CompletionKind::try_from_raw(2).unwrap(),
+            Box::new(CountingDecoder(Arc::clone(&events))),
+            InterruptibleResource::new("recording", Box::new(hook)),
+            || Ok(Box::new(7_i32)),
+        ))),
+        continuation: Box::new(CountingContinuation(events)),
+    }
+}
 impl sema_core::runtime::CancelHook for PendingHook {
     fn cancel(
         &mut self,
@@ -295,6 +353,132 @@ fn wait_submit_rejection_traverses_decoder_then_continuation() {
     ));
     assert_eq!(&*events.lock().unwrap(), &["decode", "failed"]);
     assert_eq!(runtime.active_len(), 0);
+}
+
+#[test]
+fn wait_submit_rejection_cancels_interruptible_resource_before_resume() {
+    for (result, expected_cleanup) in [
+        (CancelResult::Reaped, 0),
+        (CancelResult::PendingReap, 1),
+        (CancelResult::Error, 1),
+    ] {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let executor = Arc::new(FakeExecutor {
+            mode: FakeSubmit::Reject,
+            failure: None,
+        });
+        let mut runtime = WaitRuntime::new(executor).unwrap();
+        let mut ids = Ids::new();
+        let mut task = task(&mut ids);
+        task.start().unwrap();
+        let result = runtime.register_external(
+            &mut task,
+            interruptible_suspend_with_hook(
+                Arc::clone(&events),
+                RecordingHook {
+                    result,
+                    calls: Arc::clone(&calls),
+                    edge: None,
+                    trace_ok: true,
+                },
+            ),
+            TaskContextHandle::default(),
+        );
+        let Err(RegisterExternalError::Rejected(pending)) = result else {
+            panic!("submission rejection expected")
+        };
+
+        assert_eq!(&*calls.lock().unwrap(), &["cancel"]);
+        assert_eq!(runtime.cleanup_len(), expected_cleanup);
+        pending.invoke_decoder().invoke_continuation().unwrap();
+    }
+}
+
+#[test]
+fn wait_submit_rejection_drops_unadmitted_quarantine() {
+    let executor = Arc::new(FakeExecutor {
+        mode: FakeSubmit::Reject,
+        failure: None,
+    });
+    let mut runtime = WaitRuntime::new(executor).unwrap();
+    let mut ids = Ids::new();
+    let mut task = task(&mut ids);
+    task.start().unwrap();
+    let result = runtime.register_external(
+        &mut task,
+        external_suspend(Arc::new(Mutex::new(Vec::new()))),
+        TaskContextHandle::default(),
+    );
+    assert!(matches!(result, Err(RegisterExternalError::Rejected(_))));
+    assert_eq!(runtime.cleanup_len(), 0);
+}
+
+#[test]
+fn wait_trace_includes_cleanup_resource_edges_and_short_circuits() {
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let executor = Arc::new(FakeExecutor {
+        mode: FakeSubmit::Inline,
+        failure: None,
+    });
+    let mut runtime = WaitRuntime::new(executor).unwrap();
+    let mut ids = Ids::new();
+    let mut task = task(&mut ids);
+    task.start().unwrap();
+    let key = runtime
+        .register_external(
+            &mut task,
+            interruptible_suspend_with_hook(
+                Arc::new(Mutex::new(Vec::new())),
+                RecordingHook {
+                    result: CancelResult::PendingReap,
+                    calls,
+                    edge: Some(Value::string("cleanup edge")),
+                    trace_ok: true,
+                },
+            ),
+            TaskContextHandle::default(),
+        )
+        .unwrap();
+    task.request_cancellation(CancelReason::Explicit);
+    runtime.cancel(&mut task, key).unwrap();
+
+    let mut edges = 0;
+    assert!(runtime.trace(&mut |_| edges += 1));
+    assert_eq!(edges, 1);
+}
+
+#[test]
+fn wait_trace_propagates_cleanup_resource_trace_failure() {
+    let executor = Arc::new(FakeExecutor {
+        mode: FakeSubmit::Inline,
+        failure: None,
+    });
+    let mut runtime = WaitRuntime::new(executor).unwrap();
+    let mut ids = Ids::new();
+    let mut task = task(&mut ids);
+    task.start().unwrap();
+    let key = runtime
+        .register_external(
+            &mut task,
+            interruptible_suspend_with_hook(
+                Arc::new(Mutex::new(Vec::new())),
+                RecordingHook {
+                    result: CancelResult::PendingReap,
+                    calls: Arc::new(Mutex::new(Vec::new())),
+                    edge: Some(Value::string("cleanup edge")),
+                    trace_ok: false,
+                },
+            ),
+            TaskContextHandle::default(),
+        )
+        .unwrap();
+    task.request_cancellation(CancelReason::Explicit);
+    runtime.cancel(&mut task, key).unwrap();
+
+    let mut edges = 0;
+    assert!(!runtime.trace(&mut |_| edges += 1));
+    assert_eq!(edges, 1);
 }
 
 #[test]
@@ -472,6 +656,36 @@ fn wait_cancel_uses_first_task_reason_and_only_quarantine_completion_reaps_clean
     );
     assert_eq!(interruptible.cleanup_len(), 1);
     assert_eq!(interruptible.quarantine_reaped(), 0);
+}
+
+#[test]
+fn exact_quarantine_removal_leaves_one_charged_tombstone_without_scanning_predecessors() {
+    let executor = Arc::new(FakeExecutor {
+        mode: FakeSubmit::Inline,
+        failure: None,
+    });
+    let mut runtime = WaitRuntime::new(executor).unwrap();
+    let mut ids = Ids::new();
+    let mut last_key = None;
+
+    for _ in 0..1_024 {
+        let mut task = task(&mut ids);
+        task.start().unwrap();
+        let key = runtime
+            .register_external(
+                &mut task,
+                external_suspend(Arc::new(Mutex::new(Vec::new()))),
+                TaskContextHandle::default(),
+            )
+            .unwrap();
+        task.request_cancellation(CancelReason::Explicit);
+        runtime.cancel(&mut task, key).unwrap();
+        last_key = Some(key);
+    }
+
+    assert!(runtime.remove_cleanup_exact_for_test(last_key.unwrap()));
+    assert_eq!(runtime.cleanup_len(), 1_023);
+    assert_eq!(runtime.cleanup_tombstones(), 1);
 }
 
 #[derive(Clone)]

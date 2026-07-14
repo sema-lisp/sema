@@ -150,6 +150,7 @@ pub struct WaitRuntime {
     active: HashMap<WaitKey, RegisteredExternalWait>,
     cleanup: HashMap<WaitKey, CleanupEntry>,
     cleanup_order: VecDeque<WaitKey>,
+    cleanup_tombstones: usize,
     late_completions: usize,
     quarantine_reaped: usize,
 }
@@ -157,6 +158,10 @@ pub struct WaitRuntime {
 impl Trace for WaitRuntime {
     fn trace(&self, sink: &mut dyn FnMut(sema_core::cycle::GcEdge<'_>)) -> bool {
         self.active.values().all(|wait| wait.trace(sink))
+            && self
+                .cleanup
+                .values()
+                .all(|entry| entry.resource.trace(sink))
     }
 }
 
@@ -177,6 +182,7 @@ impl WaitRuntime {
             active: HashMap::new(),
             cleanup: HashMap::new(),
             cleanup_order: VecDeque::new(),
+            cleanup_tombstones: 0,
             late_completions: 0,
             quarantine_reaped: 0,
         })
@@ -253,7 +259,7 @@ impl WaitRuntime {
 
     fn finish_rejection(&mut self, key: WaitKey, wait: RegisteredExternalWait) -> PendingResume {
         let _ = wait.queue_cancel.cancel_before_start();
-        drop(wait.resource);
+        self.cancel_or_transfer_resource(key, &wait.identity, wait.resource, false);
         PendingResume {
             key,
             task_id: wait.task_id,
@@ -329,21 +335,9 @@ impl WaitRuntime {
         }
         let reason = task.cancellation()?.reason;
         task.wake(key).ok()?;
-        let mut wait = self.active.remove(&key).expect("validated active wait");
+        let wait = self.active.remove(&key).expect("validated active wait");
         let _ = wait.queue_cancel.cancel_before_start();
-        let cancellation = wait.resource.cancel();
-        let quarantine = wait.resource.bound().is_some();
-        let retain = match &cancellation {
-            Some(Ok(sema_core::runtime::CancelDisposition::Reaped)) => false,
-            Some(Ok(sema_core::runtime::CancelDisposition::PendingReap) | Err(_)) => true,
-            None => wait.resource.bound().is_some(),
-        };
-        if retain {
-            let last_error = cancellation
-                .and_then(Result::err)
-                .map(|error| error.to_string());
-            self.insert_cleanup(key, &wait.identity, wait.resource, quarantine, last_error);
-        }
+        self.cancel_or_transfer_resource(key, &wait.identity, wait.resource, true);
         drop(wait.decoder);
         Some(PendingResume {
             key,
@@ -355,6 +349,28 @@ impl WaitRuntime {
             input: Some(ResumeInput::Cancelled(reason)),
             cancellation: CancellationView::new(true, Some(reason)),
         })
+    }
+
+    fn cancel_or_transfer_resource(
+        &mut self,
+        key: WaitKey,
+        identity: &RetainedIdentity,
+        mut resource: ResourceClass,
+        admitted: bool,
+    ) {
+        let cancellation = resource.cancel();
+        let quarantine = resource.bound().is_some();
+        let retain = match &cancellation {
+            Some(Ok(sema_core::runtime::CancelDisposition::Reaped)) => false,
+            Some(Ok(sema_core::runtime::CancelDisposition::PendingReap) | Err(_)) => true,
+            None => quarantine && admitted,
+        };
+        if retain {
+            let last_error = cancellation
+                .and_then(Result::err)
+                .map(|error| error.to_string());
+            self.insert_cleanup(key, identity, resource, quarantine, last_error);
+        }
     }
 
     fn insert_cleanup(
@@ -382,13 +398,9 @@ impl WaitRuntime {
 
     fn remove_cleanup(&mut self, key: WaitKey) -> Option<CleanupEntry> {
         let entry = self.cleanup.remove(&key)?;
-        if let Some(position) = self
-            .cleanup_order
-            .iter()
-            .position(|candidate| *candidate == key)
-        {
-            self.cleanup_order.remove(position);
-        }
+        // Exact completions leave a charged tombstone so their hot path never
+        // scans unrelated cleanup entries. A later bounded reap turn consumes it.
+        self.cleanup_tombstones += 1;
         Some(entry)
     }
 
@@ -400,6 +412,7 @@ impl WaitRuntime {
                 .pop_front()
                 .expect("bounded by queue length");
             let Some(entry) = self.cleanup.get_mut(&key) else {
+                self.cleanup_tombstones = self.cleanup_tombstones.saturating_sub(1);
                 continue;
             };
             entry.reap_attempts += 1;
@@ -429,6 +442,14 @@ impl WaitRuntime {
     }
     pub fn quarantine_reaped(&self) -> usize {
         self.quarantine_reaped
+    }
+    #[cfg(test)]
+    pub fn cleanup_tombstones(&self) -> usize {
+        self.cleanup_tombstones
+    }
+    #[cfg(test)]
+    pub fn remove_cleanup_exact_for_test(&mut self, key: WaitKey) -> bool {
+        self.remove_cleanup(key).is_some()
     }
 }
 

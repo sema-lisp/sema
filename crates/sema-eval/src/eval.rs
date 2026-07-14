@@ -2097,22 +2097,45 @@ mod runtime_eval_tests {
         assert_eq!(result, Value::int(42));
     }
 
-    // BOUNDARY (next slice): `async/spawn` still needs the promise/detached-task
-    // machinery (Task 04 Task 2), which the runtime eval path does not yet wire.
-    // Unlike `async/sleep` (a pure timer wait resumed in place), spawn creates an
-    // interpreter-owned task and returns a promise — no VM-resume seam covers it.
-    // Ignored + documented so that slice has a concrete target; run with
-    // `--ignored` to observe the boundary.
+    // `async/spawn` + `async/await` round-trip through the runtime: spawn a
+    // detached task, await its promise, and get the value. The runtime creates
+    // the task from the thunk (a VM closure), settles its promise on
+    // completion, and resumes the awaiting frame in place with the value.
     #[test]
-    #[ignore = "async/spawn needs the detached-task/promise slice (Task 04 Task 2)"]
-    fn eval_via_runtime_async_spawn_is_unsupported_boundary() {
+    fn eval_via_runtime_await_spawn_returns_value() {
         let interp = Interpreter::new();
-        let result = interp.eval_str_via_runtime("(async/spawn (fn () 1))");
-        let err = result.expect_err("async/spawn must not settle without an executor");
-        let msg = format!("{err}");
-        assert!(
-            msg.contains("no async scheduler registered"),
-            "unexpected boundary error: {msg}"
-        );
+        let result = interp
+            .eval_str_via_runtime("(await (async/spawn (fn () (+ 40 2))))")
+            .expect("await of a spawned task resolves through the runtime");
+        assert_eq!(result, Value::int(42));
+    }
+
+    // Two spawned tasks run concurrently on the one runtime; awaiting both (as
+    // separate awaits) yields both results — proving detached tasks are
+    // scheduled fairly and each settles its own promise.
+    #[test]
+    fn eval_via_runtime_await_two_spawned_tasks() {
+        let interp = Interpreter::new();
+        let result = interp
+            .eval_str_via_runtime(
+                "(begin \
+                   (define a (async/spawn (fn () (+ 1 2)))) \
+                   (define b (async/spawn (fn () (* 4 5)))) \
+                   (+ (await a) (await b)))",
+            )
+            .expect("both spawned tasks resolve through the runtime");
+        assert_eq!(result, Value::int(23));
+    }
+
+    // A spawned task that itself parks on a timer (`async/sleep`) and resumes:
+    // the detached task suspends on the runtime timer, `fire_timer` wakes it,
+    // it finishes, its promise settles, and the awaiting root resumes.
+    #[test]
+    fn eval_via_runtime_await_spawn_that_sleeps() {
+        let interp = Interpreter::new();
+        let result = interp
+            .eval_str_via_runtime("(await (async/spawn (fn () (async/sleep 2) 7)))")
+            .expect("a spawned task that sleeps resolves through the runtime");
+        assert_eq!(result, Value::int(7));
     }
 }

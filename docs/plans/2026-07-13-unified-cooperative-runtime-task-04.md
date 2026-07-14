@@ -246,16 +246,48 @@ Expected: promise partition and GC tests pass.
 > **REMAINING for full Task 2 through the runtime (ordered sub-slices):**
 > 1. `async/sleep` duration-validation RED cases (`sleep_rejects_*`) — reject
 >    negative-before-rounding etc.; gate: `vm_async_test -- sleep_rejects`.
-> 2. `async/spawn` detached task + returned promise on the runtime (needs the
->    Task 1 four-state promise store threaded into `eval_*_via_runtime`); gate:
->    un-ignore `eval_via_runtime_async_spawn_is_unsupported_boundary` and replace
->    it with a spawn/await round-trip.
-> 3. `async/await` as a runtime promise observation (`WaitKind::Promise`), and
->    `async/cancel` through the cancellation-parent graph.
+> 3. `async/cancel` through the cancellation-parent graph; try/catch *around* an
+>    `await` of a rejected spawned promise (an uncaught rejection currently
+>    settles the awaiting root Failed — correct for propagation, but the error is
+>    injected by settling the task rather than raised inside the parked frame, so
+>    a Sema `try` wrapping the `await` cannot yet catch it).
 > The `NativeOutcome::Suspend(WaitKind::{Promise,PromiseSet,Channel,Timer})` path
 > in `apply_native_outcome` is for natively-implemented suspending ops (async/all
 > etc.); `Timer` there is still routed to the "wait protocol not active" error and
 > is a separate future slice from VM-level sleep.
+
+> **PROGRESS (2026-07-15) — `async/spawn` + `async/await` are GREEN end-to-end
+> through the unified runtime.** A detached task spawned via `(async/spawn thunk)`
+> runs as a runtime-owned VM task, settles its own Sema `AsyncPromise`, and
+> `(await promise)` parks the awaiting frame until it settles — all through
+> `Interpreter::eval_str_via_runtime`. Gate tests (un-ignored) in `sema-eval`
+> `mod runtime_eval_tests`: `eval_via_runtime_await_spawn_returns_value`,
+> `eval_via_runtime_await_two_spawned_tasks` (concurrent detached tasks), and
+> `eval_via_runtime_await_spawn_that_sleeps` (the detached task itself parks on a
+> timer and resumes). The prior `..._async_spawn_is_unsupported_boundary` ignore
+> is gone.
+>
+> **Seam (mirrors the `async/sleep` VM-resumes-itself template).** Two new
+> `YieldReason`s surface from inside a `run_quantum`: `Spawn(thunk)` (new variant
+> in sema-core `async_signal.rs`) and the existing `AwaitPromise(promise)`. Both
+> `async/spawn` and `async/await` (sema-stdlib `async_ops.rs`) yield when
+> `in_runtime_quantum()`. The runtime's `visit_ready` AsyncYield arm (sema-vm
+> `runtime/state.rs`) maps them to `TaskAction::VmSpawn`/`VmAwait`:
+> - `VmSpawn` (`spawn_detached`): builds a task VM from the thunk closure
+>   (`extract_vm_closure` + `setup_for_call`, `close_closure_upvalues_for_foreign_run`),
+>   allocates a Pending `AsyncPromise` (registered as a GC candidate), inserts a
+>   detached origin-root child task (`spawned_promises` map — NOT the root's main
+>   task), enqueues it Ready, and resumes the spawner with the promise value via
+>   `replace_stack_top` (`resume_running_vm` stamps `RuntimeTask.vm_resume`).
+> - `VmAwait` (`await_promise`): if the promise already settled, resumes in place;
+>   else parks the frame on an `issue_internal_wait` key tracked in `promise_waits`.
+> - A detached task's completion routes through `settle_task` → `settle_spawned`
+>   (fills the Sema promise state, wakes every awaiter with the value or the
+>   rejection/cancellation), instead of settling a root. Await failures are
+>   applied as `VmResume::Fail` (settling the parked task).
+> No new drive-loop work source is needed: a pending promise always has a
+> live Ready/Waiting settler task (or is already settled), so the existing
+> timer-idle handling in `eval_str_via_runtime`'s drive loop covers gate 3.
 
 - [ ] **Step 1: Write failing detached-lifetime tests**
 

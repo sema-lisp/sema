@@ -9,6 +9,7 @@ mod lower;
 mod opcodes;
 mod optimize;
 mod resolve;
+pub mod runtime;
 mod scheduler;
 mod serialize;
 mod takelocal;

@@ -5,9 +5,9 @@ use std::rc::Rc;
 use sema_core::{
     call_run_scheduler, call_run_scheduler_all_of, call_run_scheduler_any_of,
     call_run_scheduler_timeout, call_spawn_callback, check_arity, in_async_context,
-    set_debug_coop_resume, set_yield_signal, take_resume_value, AsyncPromise, Channel,
-    DebugCoopResume, Env, EvalContext, NativeFn, PromiseState, SchedulerRunResult, SchedulerTarget,
-    SemaError, Value, ValueView, YieldReason,
+    in_runtime_quantum, set_debug_coop_resume, set_yield_signal, take_resume_value, AsyncPromise,
+    Channel, DebugCoopResume, Env, EvalContext, NativeFn, PromiseState, SchedulerRunResult,
+    SchedulerTarget, SemaError, Value, ValueView, YieldReason,
 };
 
 use crate::register_fn;
@@ -484,10 +484,14 @@ fn register_promise_ops(env: &Env) {
             ))
             .with_hint("use a shorter sleep, or loop with smaller sleeps"));
         }
-        if in_async_context() {
+        if in_async_context() || in_runtime_quantum() {
             if let Some(cached) = take_resume_value() {
                 return Ok(cached);
             }
+            // Under the unified runtime, the VM surfaces this yield as an
+            // `AsyncYield(Sleep)` that the runtime registers as a timer wait;
+            // when the timer fires it resumes this frame with nil. Under the
+            // legacy scheduler the resume value is fed via `take_resume_value`.
             set_yield_signal(YieldReason::Sleep(ms as u64));
             return Ok(Value::nil());
         }

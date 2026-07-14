@@ -153,7 +153,7 @@ impl Trace for ResumeInput {
 
 #[cfg(test)]
 mod tests {
-    use std::cell::RefCell;
+    use std::cell::{Cell, RefCell};
     use std::rc::Rc;
     use std::time::Duration;
 
@@ -326,6 +326,7 @@ mod tests {
     #[test]
     fn native_fn_dual_abi_preserves_legacy_and_runtime_paths() {
         let eval = EvalContext::new();
+        let seen_eval = Rc::new(Cell::new(std::ptr::null::<EvalContext>()));
         let mut task_context = TaskContext::default();
         let mut runtime = NativeCallContext {
             task_context: &mut task_context,
@@ -336,10 +337,15 @@ mod tests {
         assert!(
             matches!(legacy.invoke_runtime(&eval, &mut runtime, &[]), Ok(NativeOutcome::Return(v)) if v == Value::int(7))
         );
-        let with_ctx = NativeFn::with_ctx("with-ctx", |_, _| Ok(Value::int(6)));
+        let seen_eval_from_callback = Rc::clone(&seen_eval);
+        let with_ctx = NativeFn::with_ctx("with-ctx", move |ctx, _| {
+            seen_eval_from_callback.set(ctx);
+            Ok(Value::int(6))
+        });
         assert!(
             matches!(with_ctx.invoke_runtime(&eval, &mut runtime, &[]), Ok(NativeOutcome::Return(v)) if v == Value::int(6))
         );
+        assert_eq!(seen_eval.get(), &eval as *const EvalContext);
         let payload: Rc<dyn std::any::Any> = Rc::new(Value::int(5));
         let with_payload = NativeFn::with_payload("with-payload", Rc::clone(&payload), |_, _| {
             Ok(Value::int(5))
@@ -359,11 +365,13 @@ mod tests {
             .to_string()
             .contains("runtime"));
 
-        let contextual = NativeFn::with_context_result("contextual", |_eval, _runtime, _| {
-            Ok(NativeOutcome::Return(Value::int(9)))
+        let contextual = NativeFn::with_context_result("contextual", |runtime, args| {
+            assert!(!runtime.cancellation.is_requested());
+            let _task_context = &mut runtime.task_context;
+            Ok(NativeOutcome::Return(args[0].clone()))
         });
         assert!(
-            matches!(contextual.invoke_runtime(&eval, &mut runtime, &[]), Ok(NativeOutcome::Return(v)) if v == Value::int(9))
+            matches!(contextual.invoke_runtime(&eval, &mut runtime, &[Value::int(9)]), Ok(NativeOutcome::Return(v)) if v == Value::int(9))
         );
         assert!((contextual.func)(&eval, &[])
             .unwrap_err()

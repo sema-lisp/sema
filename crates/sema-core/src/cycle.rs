@@ -1492,22 +1492,59 @@ mod tests {
 
     #[test]
     fn registered_payload_emits_opaque_allocation_and_delegates_trace() {
+        struct RegisteredTracePayload {
+            env: Rc<Env>,
+        }
+
+        fn registered_trace_payload_trace(ptr: NodePtr, sink: &mut dyn FnMut(GcEdge)) -> bool {
+            // SAFETY: `ptr` identifies the live `RegisteredTracePayload`
+            // allocation retained by the NativeFn during tracing.
+            let payload = unsafe { &*(ptr.raw() as *const RegisteredTracePayload) };
+            sink(GcEdge::Env(&payload.env));
+            true
+        }
+
+        fn registered_trace_payload_tracer(
+            payload: &Rc<dyn Any>,
+            sink: &mut dyn FnMut(GcEdge),
+        ) -> bool {
+            sink(GcEdge::Opaque {
+                ptr: NodePtr::of_rc(payload),
+                strong_count: Rc::strong_count(payload),
+                trace: registered_trace_payload_trace,
+                sever: no_sever,
+            });
+            true
+        }
+
+        register_payload_tracer(
+            TypeId::of::<RegisteredTracePayload>(),
+            registered_trace_payload_tracer,
+        );
         let env = Env::new();
-        let payload: Rc<dyn Any> = Rc::new(EnvPayload { env: Rc::new(env) });
+        let native = Value::native_fn(NativeFn::with_payload(
+            "registered-trace",
+            Rc::new(RegisteredTracePayload { env: Rc::new(env) }),
+            |_, _| Ok(Value::NIL),
+        ));
+        let mut opaque_count = 0;
         let mut opaque = None;
-        assert!(env_payload_tracer(&payload, &mut |edge| {
+        assert!(trace_value(&native, &mut |edge| {
+            opaque_count += 1;
             if let GcEdge::Opaque { ptr, trace, .. } = edge {
                 opaque = Some((ptr, trace));
             }
         }));
-        let (ptr, trace) = opaque.expect("payload allocation edge");
-        let mut delegated = 0;
+        assert_eq!(opaque_count, 1, "one registered payload allocation");
+        let (ptr, trace) = opaque.expect("registered tracer emitted opaque edge");
+        let mut delegated_count = 0;
+        let mut delegated_env = false;
         assert!(trace(ptr, &mut |edge| {
-            if matches!(edge, GcEdge::Env(_)) {
-                delegated += 1;
-            }
+            delegated_count += 1;
+            delegated_env = matches!(edge, GcEdge::Env(_));
         }));
-        assert_eq!(delegated, 1);
+        assert_eq!(delegated_count, 1, "one delegated environment edge");
+        assert!(delegated_env);
     }
 
     #[test]

@@ -121,11 +121,15 @@ pub fn compare_spurs(a: Spur, b: Spur) -> std::cmp::Ordering {
 
 /// A native function callable from Sema.
 pub type NativeFnInner = dyn Fn(&EvalContext, &[Value]) -> Result<Value, SemaError>;
-type RuntimeNativeFnInner =
-    dyn for<'a> Fn(&EvalContext, &mut NativeCallContext<'a>, &[Value]) -> NativeResult;
+type RuntimeNativeFnInner = dyn for<'a> Fn(&mut NativeCallContext<'a>, &[Value]) -> NativeResult;
 
 pub struct NativeFn {
     pub name: String,
+    /// Legacy callback ABI.
+    ///
+    /// Invariant I2: this boxed callback must not strongly capture a `Value`,
+    /// `Env`, or anything that transitively owns either. Traceable state belongs
+    /// in a registered `payload`; host infrastructure may capture `Weak` handles.
     pub func: Box<NativeFnInner>,
     pub payload: Option<Rc<dyn Any>>,
     /// Fixed parameter names, in declaration order, for VM-compiled closures
@@ -139,10 +143,20 @@ pub struct NativeFn {
     /// flag lets `type`/`type_name` report `:lambda` instead of `:native-fn`
     /// without sema-core/sema-stdlib needing to know the VM's payload type.
     pub is_closure: bool,
+    /// Runtime-aware callback ABI.
+    ///
+    /// Invariant I2: this boxed callback must not strongly capture a `Value`,
+    /// `Env`, or anything that transitively owns either. Traceable state belongs
+    /// in a registered `payload`; host infrastructure may capture `Weak` handles.
     runtime_func: Option<Box<RuntimeNativeFnInner>>,
 }
 
 impl NativeFn {
+    /// Constructs a context-free legacy native callback.
+    ///
+    /// Invariant I2 applies to `f`: do not strongly capture a `Value`, `Env`, or
+    /// a transitive owner. Put traceable state in a registered payload; host
+    /// infrastructure may capture `Weak` handles.
     pub fn simple(
         name: impl Into<String>,
         f: impl Fn(&[Value]) -> Result<Value, SemaError> + 'static,
@@ -157,6 +171,11 @@ impl NativeFn {
         }
     }
 
+    /// Constructs a legacy native callback receiving the evaluator context.
+    ///
+    /// Invariant I2 applies to `f`: do not strongly capture a `Value`, `Env`, or
+    /// a transitive owner. Put traceable state in a registered payload; host
+    /// infrastructure may capture `Weak` handles.
     pub fn with_ctx(
         name: impl Into<String>,
         f: impl Fn(&EvalContext, &[Value]) -> Result<Value, SemaError> + 'static,
@@ -171,6 +190,11 @@ impl NativeFn {
         }
     }
 
+    /// Constructs a legacy native callback with collector-traceable payload.
+    ///
+    /// Invariant I2 applies to `f`: do not strongly capture a `Value`, `Env`, or
+    /// a transitive owner. Traceable state belongs in `payload`, whose type must
+    /// have a registered tracer; host infrastructure may capture `Weak` handles.
     pub fn with_payload(
         name: impl Into<String>,
         payload: Rc<dyn Any>,
@@ -186,6 +210,11 @@ impl NativeFn {
         }
     }
 
+    /// Constructs a context-free runtime-aware native callback.
+    ///
+    /// Invariant I2 applies to `f`: do not strongly capture a `Value`, `Env`, or
+    /// a transitive owner. Put traceable state in a registered payload; host
+    /// infrastructure may capture `Weak` handles.
     pub fn simple_result(
         name: impl Into<String>,
         f: impl Fn(&[Value]) -> NativeResult + 'static,
@@ -199,16 +228,22 @@ impl NativeFn {
                     "internal error: runtime native function '{error_name}' requires runtime invocation"
                 )))
             }),
-            runtime_func: Some(Box::new(move |_, _, args| f(args))),
+            runtime_func: Some(Box::new(move |_, args| f(args))),
             payload: None,
             param_names: None,
             is_closure: false,
         }
     }
 
+    /// Constructs a runtime-aware callback receiving only its native call
+    /// context and arguments. The evaluator context is not passed to `f`.
+    ///
+    /// Invariant I2 applies to `f`: do not strongly capture a `Value`, `Env`, or
+    /// a transitive owner. Put traceable state in a registered payload; host
+    /// infrastructure may capture `Weak` handles.
     pub fn with_context_result(
         name: impl Into<String>,
-        f: impl for<'a> Fn(&EvalContext, &mut NativeCallContext<'a>, &[Value]) -> NativeResult + 'static,
+        f: impl for<'a> Fn(&mut NativeCallContext<'a>, &[Value]) -> NativeResult + 'static,
     ) -> Self {
         let name = name.into();
         let error_name = name.clone();
@@ -227,6 +262,8 @@ impl NativeFn {
     }
 
     #[doc(hidden)]
+    /// Invokes the runtime ABI, using `eval_context` only for the legacy
+    /// callback fallback when no runtime-aware callback exists.
     pub fn invoke_runtime(
         &self,
         eval_context: &EvalContext,
@@ -234,7 +271,7 @@ impl NativeFn {
         args: &[Value],
     ) -> NativeResult {
         match &self.runtime_func {
-            Some(f) => f(eval_context, runtime_context, args),
+            Some(f) => f(runtime_context, args),
             None => (self.func)(eval_context, args).map(NativeOutcome::Return),
         }
     }

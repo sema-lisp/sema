@@ -4,7 +4,7 @@ use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::rc::{Rc, Weak};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::{extract_vm_closure, VmExecResult, VM};
 #[cfg(test)]
@@ -19,6 +19,7 @@ use sema_core::runtime::{CancellationParent, LifetimeOwner, TaskRelations};
 use sema_core::EvalContext;
 #[cfg(test)]
 use sema_core::Value;
+use sema_core::YieldReason;
 
 use super::channel::{ChannelClose, ChannelWake};
 use super::{
@@ -1061,6 +1062,25 @@ impl Runtime {
                     task.vm_call = Some(vm);
                     TaskAction::Yield(root, task_id)
                 }
+                // A native yielded the VM through the TLS yield signal
+                // (surfaced as `AsyncYield`). The VM has already parked its
+                // frame (pc past the call, a nil placeholder on the stack top)
+                // and stays in `vm_call`; the runtime registers a native wait
+                // and, when it fires, re-runs `run_quantum` — the frame resumes
+                // in place with the placeholder as the resume value.
+                Ok(VmExecResult::AsyncYield(reason)) => match reason {
+                    YieldReason::Sleep(ms) => {
+                        task.vm_call = Some(vm);
+                        TaskAction::VmSleep(task_id, ms)
+                    }
+                    other => TaskAction::VmResult(
+                        task_id,
+                        task.vm_owner.take().expect("VM call has a return owner"),
+                        Err(sema_core::SemaError::eval(format!(
+                            "unsupported runtime VM async yield: {other:?}"
+                        ))),
+                    ),
+                },
                 Ok(VmExecResult::Finished(value)) => TaskAction::VmResult(
                     task_id,
                     task.vm_owner.take().expect("VM call has a return owner"),
@@ -1165,6 +1185,33 @@ impl Runtime {
                     .borrow_mut()
                     .pending
                     .push_back(PendingStage::Apply(task_id, owner, result));
+            }
+            TaskAction::VmSleep(task_id, ms) => {
+                let mut state = self.state.borrow_mut();
+                let deadline = state.clock.now() + Duration::from_millis(ms);
+                let key = state
+                    .waits
+                    .as_ref()
+                    .expect("wait runtime installed")
+                    .issue_internal_wait()
+                    .map_err(|_| RuntimeFault::IdExhausted { kind: "wait" })?;
+                if !state.timers.insert(deadline, key) {
+                    return Err(RuntimeFault::IdExhausted { kind: "timer" });
+                }
+                if let Err(error) = state
+                    .tasks
+                    .get_mut(&task_id)
+                    .ok_or_else(|| RuntimeFault::Invariant {
+                        message: "sleeping VM task disappeared".into(),
+                    })?
+                    .record
+                    .wait(key)
+                {
+                    state.timers.cancel(key);
+                    return Err(RuntimeFault::Invariant {
+                        message: format!("sleeping VM task failed to wait: {error:?}"),
+                    });
+                }
             }
             #[cfg(test)]
             TaskAction::Timer(task_id, deadline) => {
@@ -2532,6 +2579,9 @@ enum TaskAction {
     Cancel(TaskId, ReturnOwner, CancelReason),
     Native(TaskId, NativeResult),
     VmResult(TaskId, ReturnOwner, NativeResult),
+    /// A VM root/child parked on `async/sleep`: arm a runtime timer for `ms`
+    /// milliseconds and leave the VM in `vm_call` so `fire_timer` re-runs it.
+    VmSleep(TaskId, u64),
     #[cfg(test)]
     Timer(TaskId, Instant),
     #[cfg(test)]
@@ -2620,6 +2670,7 @@ impl Trace for TaskAction {
                         Err(error) => error.trace(sink),
                     }
             }
+            Self::VmSleep(_, _) => true,
             #[cfg(test)]
             Self::NativeCall(_, _) => true,
             #[cfg(test)]

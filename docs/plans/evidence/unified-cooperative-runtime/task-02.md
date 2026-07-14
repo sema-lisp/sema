@@ -6,11 +6,11 @@ Worktree: `sema/.worktrees/unified-async-runtime`
 
 Start commit: `3509bb25`
 
-Implementation range verified: `3509bb25..3e858c54` (16 commits, from
+Implementation and acceptance-fix range verified: `3509bb25..87040f27`, from
 `9cc1ac83 refactor(runtime): add checked runtime identities` through
-`3e858c54 feat(runtime): add legacy task ID bridge`). This evidence commit is
-intentionally outside that implementation range. Independent review and the
-final review document remain pending and were not performed here.
+`87040f27 docs(runtime): reconcile task 02 acceptance findings`. The final
+evidence closure refreshes exact inventory coordinates shifted by the accepted
+payload-native constructor.
 
 ## Implemented contracts
 
@@ -35,7 +35,9 @@ final review document remain pending and were not performed here.
 The implementation is spread across the commits named above. The hardening
 commits `633e59ab`, `8182032e`, `fe6b2dba`, `dc4e26cb`, `ced12412`,
 `b831626e`, `34d5a3d3`, and `9f1a2a9d` pin allocator, condition, executor,
-native-context, and concrete task-local invariants.
+native-context, and concrete task-local invariants. Acceptance fixes
+`5f9510e7` and `8d3f7abb` contain unadmitted opaque-owner destruction and add
+the legal payload-backed runtime-native path.
 
 ## Required gates
 
@@ -44,7 +46,7 @@ focused filters completed in less than one second each.
 
 | Command | Result | Elapsed |
 | --- | --- | ---: |
-| `cargo test -p sema-core` | PASS: 314 unit, 23 integration/property, and 1 doc test passed; 1 doc test ignored. | 0.82s |
+| `cargo test -p sema-core` | PASS: 317 unit, 23 integration/property, and 1 doc test passed; 1 doc test ignored. | final acceptance rerun |
 | `cargo test -p sema-lang --test runtime_conformance_test` | PASS: 8 passed. | 0.62s |
 | `cargo fmt --all -- --check` | Initial expected baseline-only failure in `stream_file_async_test.rs` and `sema-stdlib/src/async_ops.rs`; after `cargo fmt` and scanner-coordinate refresh, PASS. | 1.11s final |
 | `cargo clippy -p sema-core --all-targets -- -D warnings` | PASS. | 0.34s |
@@ -64,8 +66,8 @@ refreshed without changing semantic row assignments.
 | --- | --- |
 | `cargo test -p sema-core ids` / `relationships` | PASS: ID unit/public tests and the relationship public test. |
 | `settlement` / `condition` | PASS: settlement public test; 1 condition unit and 3 condition public tests. |
-| `completion` / `resource` / `executor` | PASS: 2 completion integration tests, 2 resource unit tests, 30 executor unit tests plus 1 executor integration test. |
-| `native` / `cycle` | PASS: 8 native tests and 34 cycle tests. |
+| `completion` / `resource` / `executor` | PASS: 2 completion integration tests, 2 resource unit tests, 32 executor unit tests plus 1 executor integration test. |
+| `native` / `cycle` | PASS: 9 native tests and 34 cycle tests. |
 | `task_context` / `context` | PASS: 7 task-context tests and 21 context tests. |
 | runtime conformance `legacy` / `scanner` / `inventory` filters | PASS; the complete target's 8 tests pass. |
 | `cargo check -p sema-vm` | PASS. |
@@ -127,13 +129,12 @@ rollback, retention/reaping, execution of native call continuations, output
 routing, migration of ambient `EvalContext`/TLS fields, production `sema-io`,
 the WASM local host, language predicates, and deletion of every legacy bridge.
 The seven VM REDs remain assigned to Tasks 03/04, and watchdog fairness remains
-Task 03. Independent Task 02 review with stable `UR-T02-R###` IDs and its final
-review document remain deliberately outstanding.
+Task 03. Independent Task 02 review is recorded in
+[`../../reviews/unified-cooperative-runtime/task-02.md`](../../reviews/unified-cooperative-runtime/task-02.md).
 
-## Review pending
+## Acceptance review findings
 
-The final Task 02 acceptance document is not created yet. Stable review findings
-are tracked here until that review closes:
+Independent correctness, architecture, and Oracle reviews assigned stable IDs:
 
 - `UR-T02-R100` — resolved by the documentation reconciliation commit: removed
   trailing whitespace and reran range/current `git diff --check`.
@@ -150,3 +151,7 @@ are tracked here until that review closes:
 - `UR-T02-R303` — resolved by the documentation reconciliation commit: Task 05
   uses private prepared-operation jobs carried through opaque submission and
   dispatch wrappers, with no second public job seam.
+- `UR-T02-R101` / `UR-T02-R304` — resolved in the final evidence closure: the
+  exact inventory coordinates shifted by `with_payload_result` were refreshed,
+  retained their reviewed `C17`/`F15` assignments, and both inventory and full
+  runtime-conformance gates passed.

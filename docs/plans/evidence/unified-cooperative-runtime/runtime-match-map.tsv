@@ -134,10 +134,10 @@ F21A	crates/sema-core/src/mcp_cassette.rs:27:thread_local! {
 F21B	crates/sema-core/src/mcp_cassette.rs:63:    thread_local! {
 F21A	crates/sema-core/src/mcp_cassette.rs:6://! pointers into its thread-local cassette, exactly like `set_eval_callback`);
 F22	crates/sema-core/src/output_hook.rs:8:thread_local! {
-C17	crates/sema-core/src/value.rs:2410:thread_local! {
+C17	crates/sema-core/src/value.rs:2445:thread_local! {
 C17	crates/sema-core/src/value.rs:28:thread_local! {
-F15	crates/sema-core/src/value.rs:353:/// the user explicitly cancels via `async/cancel` is *not* a normal rejection
-F15	crates/sema-core/src/value.rs:355:/// `async/cancelled?` be precise without string-matching, and lets
+F15	crates/sema-core/src/value.rs:388:/// the user explicitly cancels via `async/cancel` is *not* a normal rejection
+F15	crates/sema-core/src/value.rs:390:/// `async/cancelled?` be precise without string-matching, and lets
 C17	crates/sema-core/src/value.rs:94:thread_local! {
 H04	crates/sema-dap/src/server.rs:1033:                    while let Ok(cmd) = ds.command_rx.recv() {
 H04	crates/sema-dap/src/server.rs:263:                reply_rx.recv().await.unwrap_or_default()

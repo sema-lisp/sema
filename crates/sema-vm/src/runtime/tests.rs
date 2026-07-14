@@ -488,6 +488,20 @@ fn runtime_settlement_exhaustion_preserves_owner_until_terminal_shutdown() {
 }
 
 #[test]
+fn runtime_root_and_task_exhaustion_reject_transactionally() {
+    for kind in ["root", "task"] {
+        let runtime = runtime_with_inline_executor(Rc::new(FakeClock::new()));
+        runtime.force_admission_exhaustion_for_test(kind);
+        assert!(matches!(
+            runtime.submit_test_root(TestPreparedTask::returned(Value::NIL)),
+            Err(super::SubmitRootError::IdExhausted)
+        ));
+        assert_eq!(runtime.root_count(), 0, "{kind} exhaustion leaked root");
+        assert_eq!(runtime.task_count(), 0, "{kind} exhaustion leaked task");
+    }
+}
+
+#[test]
 fn runtime_shutdown_finalizes_fault_first_raised_during_shutdown() {
     let clock = Rc::new(FakeClock::new());
     let runtime = runtime_with_inline_executor(clock.clone());
@@ -1417,6 +1431,73 @@ fn timer_cancel_physically_removes_entry_without_tombstones() {
     assert!(timers.cancel(key));
     assert_eq!(timers.scheduled_len(), 0);
     assert_eq!(timers.next_deadline(), None);
+}
+
+#[test]
+fn runtime_registers_and_fires_timers_with_source_cap_and_idle_deadline() {
+    let clock = Rc::new(FakeClock::new());
+    let runtime = runtime_with_inline_executor(clock.clone());
+    let deadline = clock.now() + Duration::from_millis(5);
+    let first = runtime
+        .submit_test_root(TestPreparedTask::timer_returned(deadline, Value::int(1)))
+        .unwrap();
+    let second = runtime
+        .submit_test_root(TestPreparedTask::timer_returned(deadline, Value::int(2)))
+        .unwrap();
+    runtime.drive(&drive_budget(8)).unwrap();
+
+    assert_eq!(runtime.timer_count_for_test(), 2);
+    assert!(matches!(
+        runtime.drive(&drive_budget(8)).unwrap(),
+        super::DriveState::Idle { next_deadline: Some(next), .. } if next == deadline
+    ));
+
+    clock.advance(Duration::from_millis(5));
+    let mut budget = drive_budget(8);
+    budget.timer_limit = std::num::NonZeroUsize::new(1).unwrap();
+    runtime.drive(&budget).unwrap();
+    assert_eq!(
+        runtime.timer_count_for_test(),
+        1,
+        "one timer source item per turn"
+    );
+    assert!(matches!(first.poll_result(), RootPoll::Pending));
+    assert!(matches!(second.poll_result(), RootPoll::Pending));
+
+    for _ in 0..4 {
+        runtime.drive(&budget).unwrap();
+    }
+    assert!(matches!(first.poll_result(), RootPoll::Ready(_)));
+    assert!(matches!(second.poll_result(), RootPoll::Ready(_)));
+}
+
+#[test]
+fn runtime_cancellation_removes_registered_timer_and_settles_once() {
+    let clock = Rc::new(FakeClock::new());
+    let runtime = runtime_with_inline_executor(clock.clone());
+    let handle = runtime
+        .submit_test_root(TestPreparedTask::timer_returned(
+            clock.now() + Duration::from_secs(1),
+            Value::int(1),
+        ))
+        .unwrap();
+    runtime.drive(&drive_budget(8)).unwrap();
+    assert_eq!(runtime.timer_count_for_test(), 1);
+
+    assert!(handle.cancel(CancelReason::Explicit));
+    runtime.drive(&drive_budget(8)).unwrap();
+    assert_eq!(runtime.timer_count_for_test(), 0);
+    runtime.drive(&drive_budget(8)).unwrap();
+    let RootPoll::Ready(settlement) = handle.poll_result() else {
+        panic!("cancelled timer settles root")
+    };
+    assert!(matches!(
+        settlement.outcome,
+        TaskOutcome::Cancelled(CancelReason::Explicit)
+    ));
+    clock.advance(Duration::from_secs(1));
+    runtime.drive(&drive_budget(8)).unwrap();
+    assert!(matches!(handle.poll_result(), RootPoll::Ready(_)));
 }
 
 fn drive_budget(limit: usize) -> DriveBudget {

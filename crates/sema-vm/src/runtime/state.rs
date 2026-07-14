@@ -19,7 +19,7 @@ use sema_core::Value;
 
 use super::{
     DriveBudget, DriveState, PendingResume, ReadyScheduler, RegisterExternalError, RootRecord,
-    RootState, RuntimeClock, RuntimeCreateError, TaskRecord, WaitRuntime,
+    RootState, RuntimeClock, RuntimeCreateError, TaskRecord, TimerQueue, WaitRuntime,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -101,6 +101,7 @@ struct RuntimeState {
     roots: HashMap<RootId, RootRecord>,
     tasks: HashMap<TaskId, RuntimeTask>,
     ready: ReadyScheduler,
+    timers: TimerQueue,
     handle_cleanup: VecDeque<RootId>,
     pending: VecDeque<PendingStage>,
     drive_cursor: usize,
@@ -108,6 +109,10 @@ struct RuntimeState {
     terminal_fault: Option<RuntimeFault>,
     #[cfg(test)]
     force_settlement_exhaustion: bool,
+    #[cfg(test)]
+    force_root_exhaustion: bool,
+    #[cfg(test)]
+    force_task_exhaustion: bool,
     #[cfg(test)]
     ready_visit_count: usize,
 }
@@ -164,6 +169,7 @@ impl Runtime {
                 roots: HashMap::new(),
                 tasks: HashMap::new(),
                 ready: ReadyScheduler::new(),
+                timers: TimerQueue::new(),
                 handle_cleanup: VecDeque::new(),
                 pending: VecDeque::new(),
                 drive_cursor: 0,
@@ -171,6 +177,10 @@ impl Runtime {
                 terminal_fault: None,
                 #[cfg(test)]
                 force_settlement_exhaustion: false,
+                #[cfg(test)]
+                force_root_exhaustion: false,
+                #[cfg(test)]
+                force_task_exhaustion: false,
                 #[cfg(test)]
                 ready_visit_count: 0,
             })),
@@ -198,12 +208,18 @@ impl Runtime {
         }
         let mut root_ids = state.root_ids.clone();
         let mut task_ids = state.task_ids.clone();
-        let root = root_ids
-            .allocate()
-            .map_err(|_| SubmitRootError::IdExhausted)?;
-        let task = task_ids
-            .allocate()
-            .map_err(|_| SubmitRootError::IdExhausted)?;
+        let root = (!state.force_root_exhaustion)
+            .then(|| root_ids.allocate())
+            .transpose()
+            .ok()
+            .flatten()
+            .ok_or(SubmitRootError::IdExhausted)?;
+        let task = (!state.force_task_exhaustion)
+            .then(|| task_ids.allocate())
+            .transpose()
+            .ok()
+            .flatten()
+            .ok_or(SubmitRootError::IdExhausted)?;
         state.root_ids = root_ids;
         state.task_ids = task_ids;
         let relations = TaskRelations {
@@ -233,6 +249,7 @@ impl Runtime {
         let mut root_visits = 0;
         let mut cleanup = 0;
         let mut completions = 0;
+        let mut timers = 0;
         let mut no_progress = 0;
         let reserved_roots = self
             .state
@@ -263,11 +280,11 @@ impl Runtime {
                 && unvisited_reserved > 0
                 && remaining_credits <= unvisited_reserved;
             let source = if reserve_root {
-                4
+                5
             } else {
                 let mut state = self.state.borrow_mut();
                 let source = state.drive_cursor;
-                state.drive_cursor = (state.drive_cursor + 1) % 5;
+                state.drive_cursor = (state.drive_cursor + 1) % 6;
                 source
             };
             let progressed = match source {
@@ -283,7 +300,11 @@ impl Runtime {
                 }
                 2 => self.cancel_waiting()?,
                 3 => self.advance_pending()?,
-                4 if root_visits < reserved_roots && self.visit_ready()? => {
+                4 if timers < budget.timer_limit.get() && self.fire_timer()? => {
+                    timers += 1;
+                    true
+                }
+                5 if root_visits < reserved_roots && self.visit_ready()? => {
                     root_visits += 1;
                     true
                 }
@@ -294,7 +315,7 @@ impl Runtime {
                 no_progress = 0;
             } else {
                 no_progress += 1;
-                if no_progress == 5 {
+                if no_progress == 6 {
                     break;
                 }
             }
@@ -332,7 +353,7 @@ impl Runtime {
             Ok(DriveState::Quiescent)
         } else {
             Ok(DriveState::Idle {
-                next_deadline: None,
+                next_deadline: state.timers.next_deadline(),
                 inbox_wakeup_required: state
                     .waits
                     .as_ref()
@@ -340,6 +361,33 @@ impl Runtime {
                 legacy_io_wakeup_required: false,
             })
         }
+    }
+
+    fn fire_timer(&self) -> Result<bool, RuntimeFault> {
+        let mut state = self.state.borrow_mut();
+        let now = state.clock.now();
+        let Some(key) = state.timers.pop_due(now) else {
+            return Ok(false);
+        };
+        let task_id = state
+            .tasks
+            .iter()
+            .find_map(|(id, task)| (task.record.wait_key() == Some(key)).then_some(*id))
+            .ok_or_else(|| RuntimeFault::Invariant {
+                message: "timer referenced missing waiting task".into(),
+            })?;
+        let root = state.tasks[&task_id].record.relations().origin_root;
+        state
+            .tasks
+            .get_mut(&task_id)
+            .expect("timer task was selected")
+            .record
+            .wake(key)
+            .map_err(|error| RuntimeFault::Invariant {
+                message: format!("timer task failed to wake: {error:?}"),
+            })?;
+        state.ready.enqueue(root, task_id);
+        Ok(true)
     }
 
     fn cleanup_one(&self) -> bool {
@@ -377,6 +425,29 @@ impl Runtime {
     }
 
     fn cancel_waiting(&self) -> Result<bool, RuntimeFault> {
+        {
+            let mut state = self.state.borrow_mut();
+            let timer_task = state.tasks.iter().find_map(|(id, task)| {
+                (task.record.state_name() == super::StateName::Waiting
+                    && task.record.cancellation().is_some())
+                .then(|| task.record.wait_key().map(|key| (*id, key)))
+                .flatten()
+            });
+            if let Some((task_id, key)) = timer_task.filter(|(_, key)| state.timers.cancel(*key)) {
+                let root = state.tasks[&task_id].record.relations().origin_root;
+                state
+                    .tasks
+                    .get_mut(&task_id)
+                    .expect("timer task was selected")
+                    .record
+                    .wake(key)
+                    .map_err(|error| RuntimeFault::Invariant {
+                        message: format!("cancelled timer failed to wake: {error:?}"),
+                    })?;
+                state.ready.enqueue(root, task_id);
+                return Ok(true);
+            }
+        }
         let extracted = {
             let mut state = self.state.borrow_mut();
             let Some(task_id) = state.tasks.iter().find_map(|(id, task)| {
@@ -564,6 +635,28 @@ impl Runtime {
             }
             TaskAction::Settle(root, task_id, outcome) => self.settle(root, task_id, outcome)?,
             TaskAction::Native(task_id, result) => self.apply_native_result(task_id, result)?,
+            #[cfg(test)]
+            TaskAction::Timer(task_id, deadline) => {
+                let mut state = self.state.borrow_mut();
+                let key = state
+                    .waits
+                    .as_ref()
+                    .expect("wait runtime installed")
+                    .issue_internal_wait()
+                    .map_err(|_| RuntimeFault::IdExhausted { kind: "wait" })?;
+                state
+                    .tasks
+                    .get_mut(&task_id)
+                    .expect("timer task exists")
+                    .record
+                    .wait(key)
+                    .map_err(|error| RuntimeFault::Invariant {
+                        message: format!("timer task failed to wait: {error:?}"),
+                    })?;
+                if !state.timers.insert(deadline, key) {
+                    return Err(RuntimeFault::IdExhausted { kind: "timer" });
+                }
+            }
             #[cfg(test)]
             TaskAction::NativeCall(task_id, call) => {
                 let result = call();
@@ -859,8 +952,23 @@ impl Runtime {
     }
 
     #[cfg(test)]
+    pub(super) fn timer_count_for_test(&self) -> usize {
+        self.state.borrow().timers.scheduled_len()
+    }
+
+    #[cfg(test)]
     pub(super) fn force_settlement_exhaustion_for_test(&self) {
         self.state.borrow_mut().force_settlement_exhaustion = true;
+    }
+
+    #[cfg(test)]
+    pub(super) fn force_admission_exhaustion_for_test(&self, kind: &str) {
+        let mut state = self.state.borrow_mut();
+        match kind {
+            "root" => state.force_root_exhaustion = true,
+            "task" => state.force_task_exhaustion = true,
+            _ => panic!("unknown admission identity kind: {kind}"),
+        }
     }
 
     #[cfg(test)]
@@ -954,6 +1062,8 @@ enum TaskAction {
     Settle(RootId, TaskId, TaskOutcome),
     Native(TaskId, NativeResult),
     #[cfg(test)]
+    Timer(TaskId, Instant),
+    #[cfg(test)]
     NativeCall(TaskId, Box<dyn FnOnce() -> NativeResult>),
     Resume(PendingResume),
 }
@@ -988,6 +1098,8 @@ impl Trace for TaskAction {
             },
             #[cfg(test)]
             Self::NativeCall(_, _) => true,
+            #[cfg(test)]
+            Self::Timer(_, _) => true,
             Self::Resume(pending) => pending.trace(sink),
             Self::Yield(_, _) => true,
         }
@@ -1000,6 +1112,10 @@ pub(super) enum TestPreparedTask {
     YieldForever,
     Native(Option<NativeResult>),
     NativeCall(Option<Box<dyn FnOnce() -> NativeResult>>),
+    TimerReturn {
+        deadline: Option<Instant>,
+        value: Option<Value>,
+    },
 }
 
 #[cfg(test)]
@@ -1020,6 +1136,13 @@ impl TestPreparedTask {
         Self::NativeCall(Some(Box::new(call)))
     }
 
+    pub(super) fn timer_returned(deadline: Instant, value: Value) -> Self {
+        Self::TimerReturn {
+            deadline: Some(deadline),
+            value: Some(value),
+        }
+    }
+
     fn next(&mut self, root: RootId, task: TaskId) -> TaskAction {
         match self {
             Self::Return(value) => TaskAction::Settle(
@@ -1037,6 +1160,16 @@ impl TestPreparedTask {
             Self::NativeCall(call) => TaskAction::NativeCall(
                 task,
                 call.take().expect("test native callable executes once"),
+            ),
+            Self::TimerReturn { deadline, value } => deadline.take().map_or_else(
+                || {
+                    TaskAction::Settle(
+                        root,
+                        task,
+                        TaskOutcome::Returned(value.take().unwrap_or(Value::NIL)),
+                    )
+                },
+                |deadline| TaskAction::Timer(task, deadline),
             ),
         }
     }

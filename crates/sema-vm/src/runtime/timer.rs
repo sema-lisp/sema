@@ -49,7 +49,7 @@ impl TimerQueue {
         Some(key)
     }
 
-    pub fn next_deadline(&mut self) -> Option<Instant> {
+    pub fn next_deadline(&self) -> Option<Instant> {
         self.deadlines
             .first_key_value()
             .map(|(&(deadline, _), _)| deadline)

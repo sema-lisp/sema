@@ -834,6 +834,67 @@ fn runtime_blocked_channel_receive_preserves_false_rendezvous_value() {
 }
 
 #[test]
+fn rendezvous_wake_survives_receiver_shutdown_cancellation() {
+    // A committed channel rendezvous delivers its value even when the receiver is
+    // then cancelled by shutdown: the value is delivered, nothing is dropped, and
+    // shutdown reports clean. Guards the dropped_protocol_completions invariant on
+    // the rendezvous+cancellation path (see docs/bugs for the UCR-3 race this
+    // diagnostic is designed to catch under seeded interleavings).
+    let clock = Rc::new(FakeClock::new());
+    let runtime = runtime_with_inline_executor(clock.clone());
+    let channel = runtime.create_channel_for_test(0);
+    let received = Arc::new(Mutex::new(Vec::new()));
+    let _receiver = runtime
+        .submit_test_root(TestPreparedTask::native(Ok(NativeOutcome::Suspend(
+            NativeSuspend {
+                wait: WaitKind::Channel(sema_core::runtime::ChannelWait::Receive { channel }),
+                continuation: Box::new(CountingContinuation(Arc::clone(&received))),
+            },
+        ))))
+        .unwrap();
+    runtime.drive(&drive_budget(8)).unwrap();
+
+    let sender = runtime
+        .submit_test_root(TestPreparedTask::native(Ok(NativeOutcome::Suspend(
+            NativeSuspend {
+                wait: WaitKind::Channel(sema_core::runtime::ChannelWait::Send {
+                    channel,
+                    value: Value::int(42),
+                }),
+                continuation: Box::new(CountingContinuation(Arc::new(Mutex::new(Vec::new())))),
+            },
+        ))))
+        .unwrap();
+    // Drive until the sender settles: that proves the rendezvous committed (the
+    // receiver was matched and told Sent) and leaves the receiver's wake queued.
+    let mut guard = 0;
+    while matches!(sender.poll_result(), RootPoll::Pending) {
+        runtime.drive(&drive_budget(1)).unwrap();
+        guard += 1;
+        assert!(guard < 200, "sender never matched the receiver");
+    }
+    // Shutdown requests cancellation on the (already-matched) receiver and drives
+    // to quiescence.
+    let report = runtime
+        .shutdown(&super::ShutdownOptions {
+            deadline: clock.now() + Duration::from_secs(1),
+            drive_budget: drive_budget(8),
+        })
+        .expect("bounded shutdown");
+    assert!(report.clean, "{report:?}");
+    assert_eq!(
+        runtime.dropped_protocol_completions_for_test(),
+        0,
+        "a committed rendezvous value was dropped"
+    );
+    assert_eq!(
+        received.lock().unwrap().len(),
+        1,
+        "receiver did not observe its committed rendezvous value"
+    );
+}
+
+#[test]
 fn channel_buffer_fifo_close_and_exact_waiter_cleanup() {
     let (runtime, issuers) = runtime_issuers();
     let (_, _, channel_ids) = issuers.into_parts();

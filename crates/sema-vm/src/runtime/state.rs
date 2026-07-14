@@ -132,6 +132,9 @@ struct RuntimeState {
     turn_instructions: usize,
     shutting_down: bool,
     terminal_fault: Option<RuntimeFault>,
+    // Diagnostic: protocol completions that carried an undelivered value but
+    // arrived after their wait was gone. A nonzero count is a lost-message bug.
+    dropped_protocol_completions: usize,
     #[cfg(test)]
     force_settlement_exhaustion: bool,
     #[cfg(test)]
@@ -240,6 +243,7 @@ impl Runtime {
                 turn_instructions: 0,
                 shutting_down: false,
                 terminal_fault: None,
+                dropped_protocol_completions: 0,
                 #[cfg(test)]
                 force_settlement_exhaustion: false,
                 #[cfg(test)]
@@ -903,6 +907,16 @@ impl Runtime {
         let extracted = {
             let mut state = self.state.borrow_mut();
             let Some(wait) = state.protocol_waits.remove(&key) else {
+                // The wait is gone (e.g. the task was cancelled). A rendezvous
+                // value that arrives here would be silently lost, so record it.
+                if matches!(
+                    &response,
+                    Ok(RuntimeResponse::Receive(
+                        sema_core::runtime::ChannelReceive::Received(_)
+                    ))
+                ) {
+                    state.dropped_protocol_completions += 1;
+                }
                 return Ok(());
             };
             if wait.task != task_id {
@@ -2083,6 +2097,11 @@ impl Runtime {
     #[cfg(test)]
     pub(super) fn protocol_wait_count_for_test(&self) -> usize {
         self.state.borrow().protocol_waits.len()
+    }
+
+    #[cfg(test)]
+    pub(super) fn dropped_protocol_completions_for_test(&self) -> usize {
+        self.state.borrow().dropped_protocol_completions
     }
 
     #[cfg(test)]

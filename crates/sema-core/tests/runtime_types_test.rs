@@ -1,10 +1,11 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use sema_core::runtime::{
-    CancellationParent, ChannelId, CompletionKind, LifetimeOwner, OperationId, PromiseId, RootId,
-    RuntimeId, RuntimeScopedIdCounter, ScopeId, SettlementSeq, TaskId, TaskRelations,
-    WaitGeneration, WaitId,
+    CancelReason, CancellationParent, ChannelId, CompletionKind, IdCounter, LifetimeOwner,
+    OperationId, PromiseId, RootId, RuntimeId, RuntimeScopedIdCounter, ScopeId, SettlementSeq,
+    TaskId, TaskOutcome, TaskRelations, TaskSettlement, WaitGeneration, WaitId,
 };
+use sema_core::{SemaError, Value};
 
 #[test]
 fn ids_reject_zero_and_expose_nonzero_raw_values() {
@@ -81,4 +82,140 @@ fn relationships_keep_origin_cancellation_and_lifetime_separate() {
     );
     assert_eq!(relations.lifetime_owner, LifetimeOwner::Task(child_task));
     assert_ne!(relations.cancellation_parent, CancellationParent::None);
+}
+
+#[test]
+fn settlement_outcomes_preserve_return_failure_and_cancellation() {
+    let mut sequences = IdCounter::<SettlementSeq>::new();
+    let returned = TaskSettlement {
+        sequence: sequences.allocate().expect("settlement sequence"),
+        outcome: TaskOutcome::Returned(Value::int(42)),
+    };
+    let failed = TaskSettlement {
+        sequence: sequences.allocate().expect("settlement sequence"),
+        outcome: TaskOutcome::Failed(SemaError::eval("broken")),
+    };
+    let cancelled = TaskSettlement {
+        sequence: sequences.allocate().expect("settlement sequence"),
+        outcome: TaskOutcome::Cancelled(CancelReason::Explicit),
+    };
+
+    assert!(matches!(returned.outcome, TaskOutcome::Returned(value) if value == Value::int(42)));
+    assert!(
+        matches!(failed.outcome, TaskOutcome::Failed(SemaError::Eval(message)) if message == "broken")
+    );
+    assert!(matches!(
+        cancelled.outcome,
+        TaskOutcome::Cancelled(CancelReason::Explicit)
+    ));
+    assert_ne!(returned.sequence, failed.sequence);
+    assert_ne!(failed.sequence, cancelled.sequence);
+}
+
+#[test]
+fn condition_constructors_produce_exact_stable_maps() {
+    let runtime = RuntimeId::allocate().expect("runtime ID");
+    let root_id = RuntimeScopedIdCounter::<RootId>::new(runtime)
+        .allocate()
+        .expect("root ID");
+    let scope_id = IdCounter::<ScopeId>::new().allocate().expect("scope ID");
+    let operation_id = IdCounter::<OperationId>::new()
+        .allocate()
+        .expect("operation ID");
+
+    let cancelled = SemaError::cancelled_condition(
+        "request cancelled",
+        CancelReason::ResourceDisconnect,
+        Some(root_id),
+        Some(scope_id),
+        Some(operation_id),
+        Some("http/get"),
+        Some(u64::MAX),
+        Some("socket"),
+    );
+    let expected_cancelled = BTreeMap::from([
+        (Value::keyword("type"), Value::keyword("cancelled")),
+        (
+            Value::keyword("message"),
+            Value::string("request cancelled"),
+        ),
+        (
+            Value::keyword("reason"),
+            Value::keyword("resource-disconnect"),
+        ),
+        (Value::keyword("root-id"), Value::string("1")),
+        (Value::keyword("scope-id"), Value::string("1")),
+        (Value::keyword("operation-id"), Value::string("1")),
+        (Value::keyword("operation"), Value::string("http/get")),
+        (
+            Value::keyword("duration-ms"),
+            Value::string(&u64::MAX.to_string()),
+        ),
+        (Value::keyword("resource-kind"), Value::string("socket")),
+    ]);
+    assert!(
+        matches!(cancelled, SemaError::Condition(value) if value == Value::map(expected_cancelled))
+    );
+
+    let timeout = SemaError::timeout_condition(
+        "operation timed out",
+        "http/get",
+        u64::MAX,
+        Some(operation_id),
+    );
+    let expected_timeout = BTreeMap::from([
+        (Value::keyword("type"), Value::keyword("timeout")),
+        (
+            Value::keyword("message"),
+            Value::string("operation timed out"),
+        ),
+        (Value::keyword("operation"), Value::string("http/get")),
+        (
+            Value::keyword("duration-ms"),
+            Value::string(&u64::MAX.to_string()),
+        ),
+        (Value::keyword("operation-id"), Value::string("1")),
+    ]);
+    assert!(
+        matches!(timeout, SemaError::Condition(value) if value == Value::map(expected_timeout))
+    );
+}
+
+#[test]
+fn condition_cancellation_reasons_are_stable_keywords_and_optional_fields_are_omitted() {
+    let cases = [
+        (CancelReason::Root, "root"),
+        (CancelReason::Owner, "owner"),
+        (CancelReason::Explicit, "explicit"),
+        (CancelReason::Timeout, "timeout"),
+        (CancelReason::HostStop, "host-stop"),
+        (CancelReason::ResourceDisconnect, "resource-disconnect"),
+        (CancelReason::InterpreterShutdown, "interpreter-shutdown"),
+    ];
+
+    for (reason, keyword) in cases {
+        let condition =
+            SemaError::cancelled_condition("cancelled", reason, None, None, None, None, None, None);
+        let expected = BTreeMap::from([
+            (Value::keyword("type"), Value::keyword("cancelled")),
+            (Value::keyword("message"), Value::string("cancelled")),
+            (Value::keyword("reason"), Value::keyword(keyword)),
+        ]);
+        assert!(matches!(condition, SemaError::Condition(value) if value == Value::map(expected)));
+    }
+}
+
+#[test]
+fn condition_maps_for_cancellation_and_timeout_reraise_verbatim() {
+    for condition_type in ["cancelled", "timeout"] {
+        let value = Value::map(BTreeMap::from([
+            (Value::keyword("type"), Value::keyword(condition_type)),
+            (Value::keyword("message"), Value::string("stopped")),
+        ]));
+
+        assert!(matches!(
+            SemaError::from_thrown(value),
+            SemaError::Condition(_)
+        ));
+    }
 }

@@ -211,6 +211,8 @@ impl<I: RuntimeScopedIdType> RuntimeScopedIdCounter<I> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{SemaError, Value};
+    use std::collections::BTreeMap;
 
     #[test]
     fn counter_starts_at_one() {
@@ -227,6 +229,25 @@ mod tests {
         );
         assert_eq!(counter.allocate(), Err(IdExhausted));
         assert_eq!(counter.allocate(), Err(IdExhausted));
+    }
+
+    #[test]
+    fn condition_ids_preserve_the_maximum_value_as_decimal_text() {
+        let operation_id = IdCounter::<OperationId>::starting_at(u64::MAX)
+            .allocate()
+            .expect("maximum operation ID");
+        let condition =
+            SemaError::timeout_condition("timed out", "runtime/wait", u64::MAX, Some(operation_id));
+        let maximum = u64::MAX.to_string();
+        let expected = BTreeMap::from([
+            (Value::keyword("type"), Value::keyword("timeout")),
+            (Value::keyword("message"), Value::string("timed out")),
+            (Value::keyword("operation"), Value::string("runtime/wait")),
+            (Value::keyword("duration-ms"), Value::string(&maximum)),
+            (Value::keyword("operation-id"), Value::string(&maximum)),
+        ]);
+
+        assert!(matches!(condition, SemaError::Condition(value) if value == Value::map(expected)));
     }
 
     #[test]

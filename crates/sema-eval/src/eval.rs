@@ -56,7 +56,13 @@ fn collect_native_names(env: &Env) -> HashSet<Spur> {
 /// The interpreter holds the global environment and state.
 pub struct Interpreter {
     pub global_env: Rc<Env>,
-    pub ctx: EvalContext,
+    /// Shared evaluation context. Held behind an `Rc` so the unified runtime can
+    /// share the *same* context the interpreter registered its eval/call
+    /// callbacks and module cache onto (see `run_exprs_via_runtime`); a fresh
+    /// context would route the VM's `call_callback` through unregistered
+    /// callbacks and an empty module cache. All fields are interior-mutable
+    /// (`RefCell`/`Cell`), so shared `&` access is sufficient for mutation.
+    pub ctx: Rc<EvalContext>,
 }
 
 impl Default for Interpreter {
@@ -121,6 +127,7 @@ impl Interpreter {
         }
         let global_env = Rc::new(env);
         register_vm_delegates(&global_env);
+        let ctx = Rc::new(ctx);
         load_prelude(&ctx, &global_env);
         Interpreter { global_env, ctx }
     }
@@ -139,6 +146,7 @@ impl Interpreter {
         }
         let global_env = Rc::new(env);
         register_vm_delegates(&global_env);
+        let ctx = Rc::new(ctx);
         load_prelude(&ctx, &global_env);
         Interpreter { global_env, ctx }
     }
@@ -208,8 +216,13 @@ impl Interpreter {
         )?;
         vm.seed_main_frame(prog.closure);
 
+        // Share THIS interpreter's context — not a fresh one — so the VM's
+        // `call_value`/`eval_value` re-entry (which dispatches through
+        // `sema_core::call_callback(ctx, …)`) resolves the callbacks the
+        // interpreter registered, and so the live module cache / current-file /
+        // dynamic context persist across runtime evals.
         let runtime = Runtime::new(
-            Rc::new(EvalContext::new()),
+            Rc::clone(&self.ctx),
             Rc::new(MonotonicClock),
             std::sync::Arc::new(NullExecutor),
         )
@@ -2080,6 +2093,70 @@ mod runtime_eval_tests {
             .expect("define");
         let result = interp.eval_str_via_runtime("(+ counter 1)").expect("eval");
         assert_eq!(result, Value::int(42));
+    }
+
+    // ACCEPTANCE GATE (Task 03 Step 2 shared context): a multimethod dispatch
+    // re-enters the evaluator through the `call_value` callback from inside a
+    // runtime quantum. With the runtime sharing the interpreter's context (whose
+    // callbacks are registered) this resolves; a fresh context would error with
+    // "call callback not registered". The result must equal the `eval_str`
+    // oracle (12).
+    #[test]
+    fn eval_via_runtime_multimethod_dispatch_matches_oracle() {
+        assert_runtime_matches_oracle(
+            "(defmulti area (fn (s) (:kind s))) \
+             (defmethod area :circle (fn (s) (* 3 (:r s) (:r s)))) \
+             (area {:kind :circle :r 2})",
+        );
+    }
+
+    // A user closure dispatched dynamically via `apply` re-enters through the
+    // owned-call callback from a runtime quantum.
+    #[test]
+    fn eval_via_runtime_apply_user_closure_matches_oracle() {
+        assert_runtime_matches_oracle("(apply (fn (a b c) (+ a b c)) (list 10 20 12))");
+    }
+
+    // ACCEPTANCE GATE (Task 03 Step 2 shared context): a multimethod defined in
+    // one runtime eval is dispatchable in a *second* runtime eval on the same
+    // interpreter — the shared context's module/global state persists across
+    // runtime evals, not just the global env.
+    #[test]
+    fn eval_via_runtime_multimethod_persists_across_calls() {
+        let interp = Interpreter::new();
+        interp
+            .eval_str_via_runtime(
+                "(defmulti area (fn (s) (:kind s))) \
+                 (defmethod area :circle (fn (s) (* 3 (:r s) (:r s)))) \
+                 (defmethod area :square (fn (s) (* (:side s) (:side s))))",
+            )
+            .expect("define multimethod");
+        let circle = interp
+            .eval_str_via_runtime("(area {:kind :circle :r 2})")
+            .expect("dispatch circle");
+        assert_eq!(circle, Value::int(12));
+        let square = interp
+            .eval_str_via_runtime("(area {:kind :square :side 5})")
+            .expect("dispatch square");
+        assert_eq!(square, Value::int(25));
+    }
+
+    // A dynamic parameter (`make-parameter`) created in one runtime eval is read
+    // and `parameterize`d in a *second* runtime eval on the same interpreter —
+    // dynamic context reads/writes go through the shared context that persists
+    // across runtime evals.
+    #[test]
+    fn eval_via_runtime_parameterize_reads_context_across_calls() {
+        let interp = Interpreter::new();
+        interp
+            .eval_str_via_runtime("(define p (make-parameter 1))")
+            .expect("define parameter");
+        let base = interp.eval_str_via_runtime("(p)").expect("read parameter");
+        assert_eq!(base, Value::int(1));
+        let dyn_bound = interp
+            .eval_str_via_runtime("(parameterize ((p 2)) (+ (p) 100))")
+            .expect("parameterize");
+        assert_eq!(dyn_bound, Value::int(102));
     }
 
     // ACCEPTANCE GATE (Task 04 native-suspend ABI, first async op): `async/sleep`

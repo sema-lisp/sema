@@ -152,6 +152,7 @@ impl InterpreterBuilder {
         // sema_eval::Interpreter::new does. Without this, an embedder built via
         // this builder would lose import/load and all prelude macros on the VM.
         sema_eval::register_vm_delegates(&global_env);
+        let ctx = Rc::new(ctx);
         sema_eval::load_prelude(&ctx, &global_env);
 
         Interpreter {

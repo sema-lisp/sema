@@ -889,10 +889,35 @@ occurrence and classification in evidence.
       `NativeOutcome::Call` (state.rs:1351 → `invoke_callable`) instead of a
       nested/fresh VM under a suspended quantum. Deleting `suspend_runtime_quantum`
       and its call sites is the Task 04 deletion owner._
-    - _Still pending for Step 2: `ctx: Rc<EvalContext>`, interpreter-owned
-      single shared-context `runtime: Option<Runtime>` with drop ordering,
-      `try_new*`/parts constructors, real executor, and `sema`/`sema-wasm`
-      struct-literal updates. Box stays unchecked until those land._
+    - _Progress (2026-07-15): SHARED-CONTEXT GAP CLOSED. `Interpreter.ctx` is
+      now `Rc<EvalContext>` and `run_exprs_via_runtime` builds the per-call
+      `Runtime` with `Rc::clone(&self.ctx)` instead of a fresh
+      `EvalContext::new()`. The runtime stores that ctx as `state._context` and
+      uses it as the VM's `eval_context` when driving (state.rs ~1269, ~2089),
+      so the VM's `call_value`/`eval_value` re-entry now dispatches through the
+      interpreter's REGISTERED callbacks and its LIVE module cache / current-file
+      / dynamic context — closing the "call callback not registered" class of
+      bug. Refactor was mechanical: only 3 direct `Interpreter { .. ctx }` struct
+      literals needed wrapping (`Interpreter::new`/`new_with_sandbox` in eval.rs,
+      `sema/src/lib.rs` builder, `sema-wasm` `new_with_options`); every other
+      `&interp.ctx` / `interp.ctx.method()` site (~20 across sema, sema-wasm,
+      sema-dap, sema-lsp, sema-notebook, sema-mcp) works unchanged via `Rc`
+      Deref. GATES GREEN (un-ignored, `mod runtime_eval_tests`): multimethod
+      dispatch matches oracle (→ 12), `apply`-dispatched user closure matches
+      oracle, multimethod persists across two runtime evals (→ 12, 25),
+      `make-parameter`/`parameterize` dynamic context persists across evals.
+      Full suites unchanged: eval_test 1072/0, integration_test 1055/0,
+      vm_async_test 4 pre-existing RED, sema-vm 0 failed, sema-eval 89 passed.
+      The flip of `eval`/`eval_str` onto the runtime is now unblocked by this._
+    - _Still pending for Step 2 (box stays unchecked): interpreter-owned SINGLE
+      shared-context `runtime: Option<Runtime>` constructed once in
+      `Interpreter::new*` (with drop ordering that destroys runtime execution
+      edges before context/env collection) rather than the current per-call
+      Runtime; `try_new*`/parts constructors; a real executor; and the full flip
+      of `eval`/`eval_str` (not just the `*_via_runtime` entry points) onto the
+      runtime. The per-call Runtime shares the ctx correctly but rebuilds runtime
+      state each eval — fine for synchronous evals, but the persistent runtime is
+      required before detached cross-eval tasks can survive._
 
 - [ ] **Step 3: Remove TLS scheduler ownership**
 

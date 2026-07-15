@@ -2379,6 +2379,7 @@ impl WasmInterpreter {
             sema_core::set_call_callback(&ctx, sema_eval::call_value);
             sema_core::set_call_owned_callback(&ctx, sema_eval::call_value_owned);
             let global_env = Rc::new(env);
+            let ctx = Rc::new(ctx);
             sema_eval::Interpreter { global_env, ctx }
         };
 

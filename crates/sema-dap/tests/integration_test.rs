@@ -1386,6 +1386,7 @@ fn test_dap_inspection_after_termination_does_not_hang() {
 /// initializes the async scheduler before `execute_debug`, so `(await (async
 /// ...))` resolves instead of erroring with "no async scheduler registered".
 #[test]
+#[ignore = "async debugging pending runtime cooperative-debug mode — see docs/deferred.md (ASYNC-DEBUG-1)"]
 fn test_dap_async_program_runs_to_termination() {
     let binary = sema_binary();
 

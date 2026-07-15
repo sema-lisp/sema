@@ -632,6 +632,55 @@ match the requested bound.
 > new `mod runtime_eval_tests` gates assert parity with the `eval_str` oracle for
 > parallel/pipeline/parallel-settled/pipeline-settled (85 passed, was 80).
 
+> **Follow-up (2026-07-15, cooperative-HOF slice — extend the `NativeOutcome::Call`
+> ABI to more higher-order natives):** commit `51e0356a` made single-list `map`
+> drive its callback COOPERATIVELY under a runtime quantum (a `MapContinuation`
+> emitting `NativeOutcome::Call` per element, so an async op inside the callback
+> parks/resumes instead of erroring "async yield outside of scheduler context").
+> That pattern is now applied to the most common remaining HOFs in
+> `crates/sema-stdlib/src/list.rs`, each gated behind `in_runtime_quantum()` (the
+> legacy synchronous `call_function`/`call_function_owned` path is UNCHANGED):
+> - `filter` — `FilterContinuation`: tests the predicate per element as a fresh
+>   cooperative Call, keeps the truthy ones in input order (short-circuit-free,
+>   same as legacy).
+> - `foldl` / `reduce` — a shared `FoldContinuation` threads the accumulator
+>   left-to-right (each `(f acc item)` a cooperative Call). Empty `foldl` returns
+>   `init`; single-element `reduce` returns that element; both with NO callback.
+>   The legacy owned-handoff in-place fast path is preserved (runtime branch clones
+>   the accumulator across the callback boundary — correctness over the fast path
+>   only when actually suspending).
+> - `for-each` — `ForEachContinuation`: runs the callback per element for effect,
+>   discards results, returns nil.
+> - `sort-by` — `SortByContinuation`: collects the key for EVERY element via
+>   cooperative Calls BEFORE sorting synchronously by key (sort comparisons can't
+>   interleave with async work), preserving the legacy stable-by-key order.
+>
+> Shared helpers `resume_value` (decode a resume; error/cancel aborts the whole
+> HOF fail-fast, matching legacy) and `yield_cooperative_call` (stash the pending
+> `NativeOutcome::Call` + raise `NativeYield`). The runtime seam
+> (`run_parked_quantum` `NativeYield` arm → `apply_native_outcome` →
+> `PendingStage::Invoke`) was reused UNCHANGED. New un-ignored gates in `sema-eval`
+> `mod runtime_eval_tests` (12 added, 87→ green) prove for each HOF both the
+> async-callback case (`(async/await (async/spawn …))` inside the callback works
+> through `eval_str_via_runtime`) and the plain-sync case (parity with the
+> `eval_str` oracle). `eval_test`/`integration_test` (which exercise these HOFs
+> heavily) stay 1072/1055; `vm_async_test` stays exactly 4 RED.
+>
+> **Still on the legacy `call_function` path (not yet cooperative):** multi-list
+> `map` (lockstep over N sequences — needs an N-arg continuation), 2-arg `sort`
+> with a comparator (comparisons must interleave DURING the sort, which the
+> collect-then-sort shape can't model), `foldr` (right fold), and the long tail of
+> predicate/search HOFs (`any`/`every`/`partition`/`take-while`/`drop-while`/
+> `flat-map`/`map-indexed`/`list/find`/`list/group-by`/`list/key-by`/`list/times`/
+> `list/sole`/`list/reject`/`tap`/`sort` comparator/…). These remain synchronous
+> re-entry — an async op inside their callback still errors under the runtime.
+> `suspend_runtime_quantum` is NOT yet retirable: legacy callback re-entry
+> (`call_value` → foreign VM via the temporary bridge) is still the mechanism for
+> (a) every non-migrated HOF above, and (b) any user closure invoked from a
+> runtime quantum through `call_value`. Retiring it requires migrating the
+> remaining callback sites (or the `call_value` re-entry itself) to the
+> `NativeOutcome::Call` ABI.
+
 ## Task 6: Implement origin-root `async/run`
 
 **Files:** runtime task/scope files, `async_ops.rs`, `async_contract_test.rs`

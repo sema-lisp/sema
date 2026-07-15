@@ -101,6 +101,267 @@ fn map_cooperative(callback: &Value, items: &[Value]) -> Option<Value> {
     Some(Value::nil())
 }
 
+/// Cooperative continuation for `filter` (Task 04). Runs the predicate on each
+/// element as a fresh runtime Call so an async op inside it parks/resumes; keeps
+/// only the elements whose predicate result is truthy, preserving input order —
+/// identical semantics to the legacy synchronous path.
+struct FilterContinuation {
+    predicate: Value,
+    /// The element whose predicate result the next `resume` carries.
+    current: Value,
+    remaining: VecDeque<Value>,
+    results: Vec<Value>,
+}
+
+impl Trace for FilterContinuation {
+    fn trace(&self, sink: &mut dyn FnMut(GcEdge<'_>)) -> bool {
+        sink(GcEdge::Value(&self.predicate));
+        sink(GcEdge::Value(&self.current));
+        for item in &self.remaining {
+            sink(GcEdge::Value(item));
+        }
+        for result in &self.results {
+            sink(GcEdge::Value(result));
+        }
+        true
+    }
+}
+
+impl NativeContinuation for FilterContinuation {
+    fn resume(
+        mut self: Box<Self>,
+        _context: &mut NativeCallContext<'_>,
+        input: ResumeInput,
+    ) -> NativeResult {
+        let keep = resume_value(input, "filter")?;
+        if keep.is_truthy() {
+            self.results.push(self.current.clone());
+        }
+        match self.remaining.pop_front() {
+            Some(next) => {
+                self.current = next.clone();
+                Ok(NativeOutcome::Call(NativeCall {
+                    callable: self.predicate.clone(),
+                    args: vec![next],
+                    continuation: self,
+                }))
+            }
+            None => Ok(NativeOutcome::Return(Value::list(std::mem::take(
+                &mut self.results,
+            )))),
+        }
+    }
+}
+
+fn filter_cooperative(predicate: &Value, items: &[Value]) -> Option<Value> {
+    let (first, rest) = items.split_first()?;
+    let continuation = Box::new(FilterContinuation {
+        predicate: predicate.clone(),
+        current: first.clone(),
+        remaining: rest.iter().cloned().collect(),
+        results: Vec::new(),
+    });
+    yield_cooperative_call(predicate.clone(), vec![first.clone()], continuation)
+}
+
+/// Cooperative continuation for `foldl`/`reduce` (Task 04). Threads the
+/// accumulator through a fresh runtime Call per element so an async op inside the
+/// combiner parks/resumes. The accumulator is cloned across the callback boundary
+/// (the legacy path keeps its owned-handoff in-place fast path).
+struct FoldContinuation {
+    combiner: Value,
+    remaining: VecDeque<Value>,
+}
+
+impl Trace for FoldContinuation {
+    fn trace(&self, sink: &mut dyn FnMut(GcEdge<'_>)) -> bool {
+        sink(GcEdge::Value(&self.combiner));
+        for item in &self.remaining {
+            sink(GcEdge::Value(item));
+        }
+        true
+    }
+}
+
+impl NativeContinuation for FoldContinuation {
+    fn resume(
+        mut self: Box<Self>,
+        _context: &mut NativeCallContext<'_>,
+        input: ResumeInput,
+    ) -> NativeResult {
+        // The returned value is the new accumulator.
+        let acc = resume_value(input, "fold")?;
+        match self.remaining.pop_front() {
+            Some(next) => Ok(NativeOutcome::Call(NativeCall {
+                callable: self.combiner.clone(),
+                args: vec![acc, next],
+                continuation: self,
+            })),
+            None => Ok(NativeOutcome::Return(acc)),
+        }
+    }
+}
+
+/// Drive `(combiner acc item)` left-to-right cooperatively, starting from `init`.
+/// Empty `items` has no combiner call, so it returns `init` directly (`None`).
+fn fold_cooperative(combiner: &Value, init: Value, items: &[Value]) -> Option<Value> {
+    let (first, rest) = items.split_first()?;
+    let continuation = Box::new(FoldContinuation {
+        combiner: combiner.clone(),
+        remaining: rest.iter().cloned().collect(),
+    });
+    yield_cooperative_call(combiner.clone(), vec![init, first.clone()], continuation)
+}
+
+/// Cooperative continuation for `for-each` (Task 04). Runs the callback for each
+/// element as a fresh runtime Call for its side effects and discards the result,
+/// returning nil once every element has been visited.
+struct ForEachContinuation {
+    callback: Value,
+    remaining: VecDeque<Value>,
+}
+
+impl Trace for ForEachContinuation {
+    fn trace(&self, sink: &mut dyn FnMut(GcEdge<'_>)) -> bool {
+        sink(GcEdge::Value(&self.callback));
+        for item in &self.remaining {
+            sink(GcEdge::Value(item));
+        }
+        true
+    }
+}
+
+impl NativeContinuation for ForEachContinuation {
+    fn resume(
+        mut self: Box<Self>,
+        _context: &mut NativeCallContext<'_>,
+        input: ResumeInput,
+    ) -> NativeResult {
+        // Discard the callback's value; for-each is run for effect.
+        resume_value(input, "for-each")?;
+        match self.remaining.pop_front() {
+            Some(next) => Ok(NativeOutcome::Call(NativeCall {
+                callable: self.callback.clone(),
+                args: vec![next],
+                continuation: self,
+            })),
+            None => Ok(NativeOutcome::Return(Value::nil())),
+        }
+    }
+}
+
+fn for_each_cooperative(callback: &Value, items: &[Value]) -> Option<Value> {
+    let (first, rest) = items.split_first()?;
+    let continuation = Box::new(ForEachContinuation {
+        callback: callback.clone(),
+        remaining: rest.iter().cloned().collect(),
+    });
+    yield_cooperative_call(callback.clone(), vec![first.clone()], continuation)
+}
+
+/// Cooperative continuation for `sort-by` (Task 04). Sorting can't interleave
+/// with async work per comparison, so the key function is what runs
+/// cooperatively: this collects the key for every element (each via a fresh
+/// runtime Call that may park/resume) BEFORE sorting synchronously by key,
+/// preserving the legacy stable-by-key order.
+struct SortByContinuation {
+    key_fn: Value,
+    /// The element whose key the next `resume` carries.
+    current: Value,
+    remaining: VecDeque<Value>,
+    keyed: Vec<(Value, Value)>,
+}
+
+impl Trace for SortByContinuation {
+    fn trace(&self, sink: &mut dyn FnMut(GcEdge<'_>)) -> bool {
+        sink(GcEdge::Value(&self.key_fn));
+        sink(GcEdge::Value(&self.current));
+        for item in &self.remaining {
+            sink(GcEdge::Value(item));
+        }
+        for (key, item) in &self.keyed {
+            sink(GcEdge::Value(key));
+            sink(GcEdge::Value(item));
+        }
+        true
+    }
+}
+
+impl NativeContinuation for SortByContinuation {
+    fn resume(
+        mut self: Box<Self>,
+        _context: &mut NativeCallContext<'_>,
+        input: ResumeInput,
+    ) -> NativeResult {
+        let key = resume_value(input, "sort-by")?;
+        let item = std::mem::replace(&mut self.current, Value::nil());
+        self.keyed.push((key, item));
+        match self.remaining.pop_front() {
+            Some(next) => {
+                self.current = next.clone();
+                Ok(NativeOutcome::Call(NativeCall {
+                    callable: self.key_fn.clone(),
+                    args: vec![next],
+                    continuation: self,
+                }))
+            }
+            None => {
+                let mut keyed = std::mem::take(&mut self.keyed);
+                keyed.sort_by(|(ka, _), (kb, _)| ka.cmp(kb));
+                let result: Vec<Value> = keyed.into_iter().map(|(_, v)| v).collect();
+                Ok(NativeOutcome::Return(Value::list(result)))
+            }
+        }
+    }
+}
+
+fn sort_by_cooperative(key_fn: &Value, items: &[Value]) -> Option<Value> {
+    let (first, rest) = items.split_first()?;
+    let continuation = Box::new(SortByContinuation {
+        key_fn: key_fn.clone(),
+        current: first.clone(),
+        remaining: rest.iter().cloned().collect(),
+        keyed: Vec::with_capacity(items.len()),
+    });
+    yield_cooperative_call(key_fn.clone(), vec![first.clone()], continuation)
+}
+
+/// Shared decode of a cooperative callback resume for the HOF continuations: a
+/// returned value flows on; an error / cancellation aborts the whole HOF by
+/// propagating so the runtime resumes the parked parent VM with the raised error
+/// (catchable by an enclosing try/catch), matching the legacy path's fail-fast.
+fn resume_value(input: ResumeInput, hof: &str) -> Result<Value, SemaError> {
+    match input {
+        ResumeInput::Returned(value) => Ok(value),
+        ResumeInput::Failed(error) => Err(error),
+        ResumeInput::Cancelled(reason) => Err(SemaError::eval(format!(
+            "{hof} callback was cancelled ({reason:?})"
+        ))),
+        ResumeInput::Runtime(_) => Err(SemaError::eval(format!(
+            "{hof} continuation received an unexpected runtime response"
+        ))),
+    }
+}
+
+/// Stash a cooperative `NativeOutcome::Call` on the pending-outcome TLS and raise
+/// the `NativeYield` signal the VM surfaces as an `AsyncYield`, returning the nil
+/// placeholder the runtime overwrites once the continuation completes. Mirrors
+/// `map_cooperative`'s tail for the other HOFs.
+fn yield_cooperative_call(
+    callable: Value,
+    args: Vec<Value>,
+    continuation: Box<dyn NativeContinuation>,
+) -> Option<Value> {
+    let call = NativeOutcome::Call(NativeCall {
+        callable,
+        args,
+        continuation,
+    });
+    sema_core::set_pending_native_outcome(call);
+    sema_core::set_yield_signal(YieldReason::NativeYield);
+    Some(Value::nil())
+}
+
 /// Record `type_tag` used to bundle zero-or-multiple values produced by `values`
 /// and unpacked by `call-with-values`. Chosen to be unlikely to collide with a
 /// user `define-record-type` tag; R7RS leaves "multiple values leaking into a
@@ -327,6 +588,14 @@ pub fn register(env: &sema_core::Env) {
     register_fn(env, "filter", |args| {
         check_arity!(args, "filter", 2);
         let items = get_sequence(&args[1], "filter")?;
+        // Drive the predicate COOPERATIVELY under the unified runtime so an async
+        // op inside it parks/resumes (see `map`). Empty input has nothing to test.
+        if sema_core::in_runtime_quantum() {
+            return match filter_cooperative(&args[0], &items) {
+                Some(placeholder) => Ok(placeholder),
+                None => Ok(Value::list(Vec::new())),
+            };
+        }
         let mut result = Vec::new();
         for item in items.iter() {
             let owned = item.clone();
@@ -341,6 +610,15 @@ pub fn register(env: &sema_core::Env) {
     register_fn(env, "foldl", |args| {
         check_arity!(args, "foldl", 3);
         let items = get_sequence(&args[2], "foldl")?;
+        // Thread the accumulator COOPERATIVELY under the unified runtime so an
+        // async op inside the combiner parks/resumes (see `map`). Empty input
+        // yields the initial accumulator with no combiner call.
+        if sema_core::in_runtime_quantum() {
+            return match fold_cooperative(&args[0], args[1].clone(), &items) {
+                Some(placeholder) => Ok(placeholder),
+                None => Ok(args[1].clone()),
+            };
+        }
         let mut acc = args[1].clone();
         for item in items.iter() {
             // Owned handoff: the accumulator moves into the callback frame so
@@ -354,6 +632,14 @@ pub fn register(env: &sema_core::Env) {
     register_fn(env, "for-each", |args| {
         check_arity!(args, "for-each", 2);
         let items = get_sequence(&args[1], "for-each")?;
+        // Run the callback COOPERATIVELY under the unified runtime so an async
+        // side effect inside it parks/resumes (see `map`). Empty input is a no-op.
+        if sema_core::in_runtime_quantum() {
+            return match for_each_cooperative(&args[0], &items) {
+                Some(placeholder) => Ok(placeholder),
+                None => Ok(Value::nil()),
+            };
+        }
         for item in items.iter() {
             call_function(&args[0], &[item.clone()])?;
         }
@@ -542,6 +828,15 @@ pub fn register(env: &sema_core::Env) {
         let items = get_sequence(&args[1], "reduce")?;
         if items.is_empty() {
             return Err(SemaError::eval("reduce: empty list"));
+        }
+        // Thread the accumulator COOPERATIVELY under the unified runtime (see
+        // `foldl`): seed with the first element and fold the rest. A single
+        // element has no combiner call, so it returns that element directly.
+        if sema_core::in_runtime_quantum() {
+            return match fold_cooperative(&args[0], items[0].clone(), &items[1..]) {
+                Some(placeholder) => Ok(placeholder),
+                None => Ok(items[0].clone()),
+            };
         }
         let mut acc = items[0].clone();
         for item in &items[1..] {
@@ -756,6 +1051,15 @@ pub fn register(env: &sema_core::Env) {
     register_fn(env, "sort-by", |args| {
         check_arity!(args, "sort-by", 2);
         let items = get_sequence(&args[1], "sort-by")?;
+        // Compute the sort key for every element COOPERATIVELY under the unified
+        // runtime (each key call may park/resume on an async op) BEFORE sorting;
+        // the sort itself stays synchronous. Empty input needs no keys.
+        if sema_core::in_runtime_quantum() {
+            return match sort_by_cooperative(&args[0], &items) {
+                Some(placeholder) => Ok(placeholder),
+                None => Ok(Value::list(Vec::new())),
+            };
+        }
         // Extract keys for each element
         let mut keyed: Vec<(Value, Value)> = Vec::with_capacity(items.len());
         for item in items.iter() {

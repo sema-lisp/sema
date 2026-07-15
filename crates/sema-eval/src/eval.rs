@@ -3262,6 +3262,134 @@ mod runtime_eval_tests {
         );
     }
 
+    // Task 04 acceptance gates: `filter`/`foldl`/`reduce`/`for-each`/`sort-by`
+    // drive their callback COOPERATIVELY under the runtime (a continuation state
+    // machine emitting `NativeOutcome::Call`), so an async op inside the callback
+    // genuinely parks and resumes instead of surfacing "async yield outside of
+    // scheduler context". Each gate proves the async-callback case works AND that
+    // the plain sync case stays parity with the `eval_str` oracle.
+
+    #[test]
+    fn runtime_filter_callback_awaits_spawned_child() {
+        let interp = Interpreter::new();
+        let result = interp
+            .eval_str_via_runtime(
+                "(filter (fn (x) (async/await (async/spawn (fn () (> x 1))))) (list 1 2 3))",
+            )
+            .expect("filter with an async predicate resolves through the runtime");
+        assert_eq!(result, common_list(&[Value::int(2), Value::int(3)]));
+    }
+
+    #[test]
+    fn runtime_filter_sync_matches_oracle() {
+        assert_runtime_matches_oracle("(filter (fn (x) (> x 1)) (list 1 2 3))");
+    }
+
+    #[test]
+    fn runtime_foldl_callback_awaits_spawned_child() {
+        let interp = Interpreter::new();
+        let result = interp
+            .eval_str_via_runtime(
+                "(foldl (fn (acc x) (async/await (async/spawn (fn () (+ acc x))))) 0 \
+                 (list 1 2 3))",
+            )
+            .expect("foldl with an async combiner resolves through the runtime");
+        assert_eq!(result, Value::int(6));
+    }
+
+    #[test]
+    fn runtime_foldl_sync_matches_oracle() {
+        assert_runtime_matches_oracle("(foldl (fn (acc x) (+ acc x)) 0 (list 1 2 3))");
+    }
+
+    #[test]
+    fn runtime_foldl_empty_returns_init() {
+        let interp = Interpreter::new();
+        let result = interp
+            .eval_str_via_runtime(
+                "(foldl (fn (acc x) (async/await (async/spawn (fn () (+ acc x))))) 99 (list))",
+            )
+            .expect("foldl over empty returns init through the runtime");
+        assert_eq!(result, Value::int(99));
+    }
+
+    #[test]
+    fn runtime_reduce_callback_awaits_spawned_child() {
+        let interp = Interpreter::new();
+        let result = interp
+            .eval_str_via_runtime(
+                "(reduce (fn (acc x) (async/await (async/spawn (fn () (+ acc x))))) \
+                 (list 1 2 3 4))",
+            )
+            .expect("reduce with an async combiner resolves through the runtime");
+        assert_eq!(result, Value::int(10));
+    }
+
+    #[test]
+    fn runtime_reduce_sync_matches_oracle() {
+        assert_runtime_matches_oracle("(reduce (fn (acc x) (+ acc x)) (list 1 2 3 4))");
+    }
+
+    #[test]
+    fn runtime_reduce_single_element_no_callback() {
+        let interp = Interpreter::new();
+        let result = interp
+            .eval_str_via_runtime(
+                "(reduce (fn (acc x) (async/await (async/spawn (fn () (+ acc x))))) (list 42))",
+            )
+            .expect("reduce over a single element returns it through the runtime");
+        assert_eq!(result, Value::int(42));
+    }
+
+    #[test]
+    fn runtime_sort_by_callback_awaits_spawned_child() {
+        let interp = Interpreter::new();
+        // Sort descending by keying on the negation, computed asynchronously.
+        let result = interp
+            .eval_str_via_runtime(
+                "(sort-by (fn (x) (async/await (async/spawn (fn () (- x))))) (list 3 1 2))",
+            )
+            .expect("sort-by with an async key fn resolves through the runtime");
+        assert_eq!(
+            result,
+            common_list(&[Value::int(3), Value::int(2), Value::int(1)]),
+        );
+    }
+
+    #[test]
+    fn runtime_sort_by_sync_matches_oracle() {
+        assert_runtime_matches_oracle("(sort-by (fn (x) (- x)) (list 3 1 2))");
+    }
+
+    // `for-each` runs a callback for its side effects; the async side effect must
+    // be serviced cooperatively. Assert via a channel the callback sends into.
+    #[test]
+    fn runtime_for_each_callback_awaits_spawned_child() {
+        let interp = Interpreter::new();
+        let result = interp
+            .eval_str_via_runtime(
+                "(define ch (channel/new 8)) \
+                 (for-each (fn (x) (async/await (async/spawn (fn () (channel/send ch (* x 10)))))) \
+                   (list 1 2 3)) \
+                 (channel/close ch) \
+                 (list (channel/recv ch) (channel/recv ch) (channel/recv ch))",
+            )
+            .expect("for-each with an async side effect resolves through the runtime");
+        assert_eq!(
+            result,
+            common_list(&[Value::int(10), Value::int(20), Value::int(30)]),
+        );
+    }
+
+    #[test]
+    fn runtime_for_each_sync_returns_nil() {
+        let interp = Interpreter::new();
+        let result = interp
+            .eval_str_via_runtime("(for-each (fn (x) (+ x 1)) (list 1 2 3))")
+            .expect("for-each returns nil through the runtime");
+        assert_eq!(result, Value::nil());
+    }
+
     fn common_list(items: &[Value]) -> Value {
         Value::list(items.to_vec())
     }

@@ -819,6 +819,17 @@
       "body": "```sema\n(async/race promises) → value\n```\n\nReturn the value of the **first promise to resolve**, ignoring the rest. Takes a list or vector of promises. The losing tasks are *not* cancelled — they keep running in the background; pair with `async/cancel` if you need to stop them. Contrast with `async/all`, which waits for *every* promise and returns all results.\n\n```sema\n;; First reply wins; the slow one is abandoned.\n(async/race (list (async (async/sleep 100) :slow)\n                  (async (async/sleep 10)  :fast)))  ; => :fast\n```"
     },
     {
+      "name": "async/race-owned",
+      "module": "concurrency",
+      "section": "Promises",
+      "summary": "Run a list (or vector) of zero-argument **thunks** concurrently and return the value of the **first one to settle** — then **cancel every loser**. This is the *owned* (structured-concurrency) counterpart to `async/race`: where `async/race` observes already-spawned promises and leaves the losers running, `async/race-owned` owns the tasks it starts and tears the losers down as soon as the winner settles. If the first settlement is an error, that error is re-raised (and the others are still cancelled). An empty input list is an argument error.",
+      "examples": [
+        "(async/race-owned thunks) → value",
+        ";; The fast thunk wins; the slow one is cancelled, not left running.\n(async/race-owned (list (fn () (async/sleep 100) :slow)\n                        (fn () (async/sleep 10)  :fast)))  ; => :fast"
+      ],
+      "body": "```sema\n(async/race-owned thunks) → value\n```\n\nRun a list (or vector) of zero-argument **thunks** concurrently and return the value of the **first one to settle** — then **cancel every loser**. This is the *owned* (structured-concurrency) counterpart to `async/race`: where `async/race` observes already-spawned promises and leaves the losers running, `async/race-owned` owns the tasks it starts and tears the losers down as soon as the winner settles. If the first settlement is an error, that error is re-raised (and the others are still cancelled). An empty input list is an argument error.\n\n```sema\n;; The fast thunk wins; the slow one is cancelled, not left running.\n(async/race-owned (list (fn () (async/sleep 100) :slow)\n                        (fn () (async/sleep 10)  :fast)))  ; => :fast\n```\n\nUse `async/race-owned` when the losing work has side effects or holds resources you want stopped promptly; use `async/race` when you deliberately want the other promises to keep running."
+    },
+    {
       "name": "async/rejected",
       "module": "concurrency",
       "section": "Promises",
@@ -935,6 +946,17 @@
         "(async/timeout 100 (async (do-slow-work)))\n;; raises: async/timeout: operation timed out"
       ],
       "body": "```sema\n(async/timeout ms promise) → value\n```\n\nWait for `promise` to resolve, but raise an error if it takes longer than `ms` milliseconds. The underlying task is **not** automatically cancelled; pair with `async/cancel` if you need to free its resources.\n\n```sema\n(async/timeout 100 (async (do-slow-work)))\n;; raises: async/timeout: operation timed out\n```\n\nA `ms = 0` (or very short) timeout still lets synchronously-ready work finish — it only fires once the virtual clock reaches the deadline with the task still pending. Durations are capped at `86_400_000` ms (1 day)."
+    },
+    {
+      "name": "async/with-timeout",
+      "module": "concurrency",
+      "section": "Promises",
+      "summary": "Run a zero-argument **thunk** with a deadline: return its value if it settles within `ms` milliseconds, otherwise **cancel it** and raise a timeout condition. This is the *owned* (structured-concurrency) counterpart to `async/timeout`: where `async/timeout` observes an existing promise and leaves it running past the deadline, `async/with-timeout` owns the task it starts and tears it down when the deadline fires. A thunk that settles first has its value preserved.",
+      "examples": [
+        "(async/with-timeout ms thunk) → value",
+        "(async/with-timeout 20 (fn () (async/sleep 1000) :never))\n;; deadline wins: the child is cancelled and a :timeout condition is raised\n\n(async/with-timeout 10000 (fn () (async/sleep 1) 42))  ; => 42"
+      ],
+      "body": "```sema\n(async/with-timeout ms thunk) → value\n```\n\nRun a zero-argument **thunk** with a deadline: return its value if it settles within `ms` milliseconds, otherwise **cancel it** and raise a timeout condition. This is the *owned* (structured-concurrency) counterpart to `async/timeout`: where `async/timeout` observes an existing promise and leaves it running past the deadline, `async/with-timeout` owns the task it starts and tears it down when the deadline fires. A thunk that settles first has its value preserved.\n\n```sema\n(async/with-timeout 20 (fn () (async/sleep 1000) :never))\n;; deadline wins: the child is cancelled and a :timeout condition is raised\n\n(async/with-timeout 10000 (fn () (async/sleep 1) 42))  ; => 42\n```\n\nDurations are capped at `86_400_000` ms (1 day). Use `async/with-timeout` when you want the timed-out work stopped; use `async/timeout` when you only want to stop *waiting* but let the task continue."
     },
     {
       "name": "channel/close",

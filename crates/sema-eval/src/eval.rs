@@ -3856,24 +3856,22 @@ mod runtime_eval_tests {
         );
     }
 
-    // A yielding native (`channel/recv`) passed DIRECTLY as a HOF callback cannot
-    // suspend in the runtime's continuation loop — surface the lambda-wrap hint,
-    // not a bare "channel is empty".
+    // A yielding native (`channel/recv`) passed DIRECTLY as a HOF callback now
+    // suspends cooperatively through the structural NativeOutcome::Call
+    // continuation ABI (the tool-loop/HOF migration): `(map channel/recv …)`
+    // receives each value instead of raising the old lambda-wrap hint.
     #[test]
-    fn runtime_yielding_native_as_hof_callback_raises_lambda_wrap_hint() {
+    fn runtime_yielding_native_as_hof_callback_suspends_cooperatively() {
         let interp = Interpreter::new();
-        let err = interp
+        let result = interp
             .eval_str_via_runtime(
                 "(let ((ch (channel/new 1))) \
                    (let ((producer (async (channel/send ch 1) (channel/close ch))) \
                          (consumer (async (map channel/recv (list ch))))) \
                      (await consumer)))",
             )
-            .expect_err("directly-passed yielding native must error");
-        assert!(
-            err.to_string().contains("wrap it in a lambda"),
-            "expected lambda-wrap hint, got: {err}"
-        );
+            .expect("directly-passed yielding native suspends and receives");
+        assert_eq!(result, Value::list(vec![Value::int(1)]));
     }
 
     // `async/run` inside an async task is a cooperative yield under the runtime

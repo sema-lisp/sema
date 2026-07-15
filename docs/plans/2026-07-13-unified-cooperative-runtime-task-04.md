@@ -615,6 +615,22 @@ match the requested bound.
 >    closure's open upvalues against the (parked) spawning VM in `spawn_detached`
 >    (`close_closure_upvalues_with_owner`) — the native-call guard is gone by the
 >    time the runtime services the Spawn yield.
+>
+> **Follow-up (2026-07-15, fan-out slice — adversarial verification):** the public
+> fan-out combinators `parallel`/`pipeline`/`parallel-settled`/`pipeline-settled`
+> (and `defworkflow` fan-out, which builds on them) still expanded through
+> `__fanout-tagged` using the very `(map async/spawn …)` shape the owned engine
+> forbids. Under `eval_str_via_runtime` the outer VM runs in a runtime quantum
+> (not the top-level async-context flag), so the nested-closure yield-rescue
+> (`in_async_context()`) never fired: the `map` callback ran synchronously via
+> `run_nested_closure_args`, the inner `async/spawn` yielded, and that yield was
+> converted to a hard `Err("async yield outside of scheduler context")` — so
+> `(parallel …)` HARD-ERRORED under the runtime. Fixed at the prelude level:
+> `__fanout-tagged` now builds its per-item worker at top level and spawns via the
+> bytecode-level `__spawn-apply` (mirroring `async/pool-map`), preserving exact
+> semantics (input order, `{:ok}`/`{:err}` tagging, settled-vs-fail-fast). Five
+> new `mod runtime_eval_tests` gates assert parity with the `eval_str` oracle for
+> parallel/pipeline/parallel-settled/pipeline-settled (85 passed, was 80).
 
 ## Task 6: Implement origin-root `async/run`
 

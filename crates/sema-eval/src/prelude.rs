@@ -622,21 +622,28 @@ pub const PRELUDE: &str = r#"
 ;; policy — a throwing worker never aborts the batch. Internal (the `#`-suffixed
 ;; bindings and the `__` name mark it as not-for-direct-use); `parallel`/`pipeline` are
 ;; the public surface.
+;; Children are spawned at bytecode level via `__spawn-apply` (NOT `(map
+;; async/spawn …)`): `async/spawn` is a yield primitive whose signal the runtime
+;; must observe at the enclosing task's bytecode boundary, and inside a `map`
+;; lambda that yield escapes no scheduler ("async yield outside of scheduler
+;; context"). This matters specifically under `eval_str_via_runtime`, where the
+;; outer VM runs in a runtime quantum (not the top-level async-context flag) so
+;; the nested-closure yield-rescue does not fire. The per-item worker `fo-worker#`
+;; is built HERE at top level (like `async/pool-map`'s `pool-worker#`) and handed
+;; to `__spawn-apply`, which wraps and spawns each `(fo-worker# item)` directly.
 (defmacro __fanout-tagged (wf items n)
   `(let ((fo-f# ,wf)
          (fo-items# ,items)
          (fo-sem# (channel/new ,n)))
      (for-range (i# 0 ,n) (channel/send fo-sem# #t))   ; n concurrency tokens
-     (async/all
-       (map (fn (item#)
-              (async/spawn
-                (fn ()
-                  (channel/recv fo-sem#)                 ; acquire (parks when full)
-                  (let ((r# (try {:ok (fo-f# item#)}
-                                 (catch e# {:err e#}))))
-                    (channel/send fo-sem# #t)            ; release on BOTH paths
-                    r#))))                                ; tagged; caller decides policy
-            fo-items#))))
+     (let ((fo-worker#
+             (fn (item#)
+               (channel/recv fo-sem#)                   ; acquire (parks when full)
+               (let ((r# (try {:ok (fo-f# item#)}
+                              (catch e# {:err e#}))))
+                 (channel/send fo-sem# #t)              ; release on BOTH paths
+                 r#))))                                  ; tagged; caller decides policy
+       (async/all (__spawn-apply fo-worker# fo-items#)))))
 
 ;; parallel: run a list of zero-arg thunks concurrently (bounded), awaiting them ALL
 ;; before returning — a BARRIER. Results come back in input order; a thunk that throws

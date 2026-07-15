@@ -2991,4 +2991,51 @@ mod runtime_eval_tests {
             .expect("a fast child error is preserved");
         assert_eq!(result, Value::keyword("caught"));
     }
+
+    // Fan-out combinators (`parallel`/`pipeline`/`parallel-settled`/
+    // `pipeline-settled`) expand through `__fanout-tagged`, which spawns children
+    // at bytecode level via `__spawn-apply` rather than `(map async/spawn …)`.
+    // Under `eval_str_via_runtime` the outer VM runs in a runtime quantum, where a
+    // `(map async/spawn …)` shape would raise "async yield outside of scheduler
+    // context". Each gate asserts parity with the `eval_str` oracle.
+    #[test]
+    fn runtime_parallel_returns_thunk_results_in_order() {
+        assert_runtime_matches_oracle("(parallel (list (fn () 1) (fn () 2) (fn () 3)))");
+    }
+
+    #[test]
+    fn runtime_parallel_drops_failures_to_nil() {
+        assert_runtime_matches_oracle(
+            "(parallel (list (fn () 1) (fn () (throw \"boom\")) (fn () 3)))",
+        );
+    }
+
+    #[test]
+    fn runtime_pipeline_flows_items_through_stages() {
+        assert_runtime_matches_oracle(
+            "(pipeline (list 1 2 3) \
+                (fn (x) (+ x 10)) \
+                (fn (x) (* x 2)))",
+        );
+    }
+
+    #[test]
+    fn runtime_parallel_settled_preserves_ok_and_err_slots() {
+        // Compare the settled shape structurally: {:ok v} slots survive verbatim,
+        // {:err …} slots carry an opaque error value, so map them to :err first.
+        assert_runtime_matches_oracle(
+            "(map (fn (r) (if (contains? r :err) :err (:ok r))) \
+                (parallel-settled (list (fn () 1) (fn () (throw \"boom\")) (fn () 3))))",
+        );
+    }
+
+    #[test]
+    fn runtime_pipeline_settled_preserves_ok_and_err_slots() {
+        assert_runtime_matches_oracle(
+            "(map (fn (r) (if (contains? r :err) :err (:ok r))) \
+                (pipeline-settled (list 0 1 2) \
+                  (fn (i) (if (= i 1) (throw \"boom\") i)) \
+                  (fn (x) (* x 10))))",
+        );
+    }
 }

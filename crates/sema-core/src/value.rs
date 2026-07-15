@@ -2334,6 +2334,79 @@ unsafe fn rc_strong_cell<'a>(ptr: *const u8) -> &'a Cell<usize> {
 /// better judgment about its layout.
 #[inline(never)]
 unsafe fn drop_last_heap_ref(tag: u64, ptr: *const u8) {
+    // Deeply nested immutable collections (a 5000-deep nested list, a tree of
+    // maps) would otherwise free recursively: dropping the outer `Vec<Value>`
+    // drops each child `Value`, whose last-ref free drops *its* `Vec<Value>`,
+    // one native frame per level. On the unified-runtime drive path that
+    // recursion starts from a deep native baseline and overflows the OS stack
+    // (an uncatchable SIGABRT) well before any Sema guard can fire. Flatten it:
+    // move each collection's children onto an explicit heap worklist and free
+    // them iteratively, so teardown depth is O(1) native frames regardless of
+    // structure depth. Only the cycle-free immutable collections are unrolled
+    // here; every other payload drops through `drop_leaf_heap_ref` (its own
+    // recursion is bounded by nesting of *distinct* types, not element count —
+    // e.g. a record field holding a deep list re-enters this iterative path).
+    let mut worklist: Vec<Value> = Vec::new();
+    free_heap_payload(tag, ptr, &mut worklist);
+    while let Some(value) = worklist.pop() {
+        // Replicate `Value::drop`'s refcount step, but redirect the last-ref
+        // free back through the worklist instead of recursing. `mem::forget`
+        // keeps `Value`'s own `Drop` from running the recursive path we are
+        // deliberately replacing.
+        if is_boxed(value.0) {
+            let tag = get_tag(value.0);
+            match tag {
+                TAG_NIL | TAG_FALSE | TAG_TRUE | TAG_INT_SMALL | TAG_CHAR | TAG_SYMBOL
+                | TAG_KEYWORD => {}
+                _ => {
+                    let ptr = payload_to_ptr(get_payload(value.0));
+                    let strong = rc_strong_cell(ptr);
+                    match strong.get() {
+                        1 => free_heap_payload(tag, ptr, &mut worklist),
+                        n => strong.set(n - 1),
+                    }
+                }
+            }
+        }
+        std::mem::forget(value);
+    }
+}
+
+/// Free ONE heap allocation whose last strong reference is going away. For the
+/// immutable collection types, move the owned child `Value`s onto `worklist`
+/// (so they are freed iteratively by [`drop_last_heap_ref`]) and free only the
+/// container's own allocation here; every other payload is dropped normally.
+unsafe fn free_heap_payload(tag: u64, ptr: *const u8, worklist: &mut Vec<Value>) {
+    match tag {
+        TAG_LIST | TAG_VECTOR => {
+            let items = Rc::into_inner(Rc::from_raw(ptr as *const Vec<Value>))
+                .expect("caller guarantees the last strong reference");
+            worklist.extend(items);
+        }
+        TAG_MAP => {
+            let map = Rc::into_inner(Rc::from_raw(ptr as *const BTreeMap<Value, Value>))
+                .expect("caller guarantees the last strong reference");
+            for (k, v) in map {
+                worklist.push(k);
+                worklist.push(v);
+            }
+        }
+        TAG_HASHMAP => {
+            let map = Rc::into_inner(Rc::from_raw(ptr as *const hashbrown::HashMap<Value, Value>))
+                .expect("caller guarantees the last strong reference");
+            for (k, v) in map {
+                worklist.push(k);
+                worklist.push(v);
+            }
+        }
+        _ => drop_leaf_heap_ref(tag, ptr),
+    }
+}
+
+/// Drop a single heap payload's last reference via Rust's normal drop glue.
+/// The immutable collection tags are intercepted before this by
+/// [`free_heap_payload`]; they remain here only as a total fallback.
+unsafe fn drop_leaf_heap_ref(tag: u64, ptr: *const u8) {
     match tag {
         TAG_INT_BIG => drop(Rc::from_raw(ptr as *const i64)),
         TAG_BIGINT => drop(Rc::from_raw(ptr as *const BigInt)),

@@ -1251,6 +1251,42 @@ occurrence and classification in evidence.
       re-baselined against the unified runtime. The two temporary bridges above
       (VM::execute quantum-suspend, and the whole `suspend_runtime_quantum`
       mechanism) are deleted at that point._
+    - _Progress (2026-07-15): FULL-FLIP BLOCKER 1 — NATIVE-STACK BUDGET FOR DEEP
+      NATIVE RECURSION — FIXED. The earlier "FLIP BLOCKER (3) stack-parity" note
+      covered only VM-FRAME recursion (`MAX_FRAMES` graceful error); it did NOT
+      cover NATIVE-recursive teardown of deep data. Reproduced the residual
+      SIGABRT on the runtime path (`eval_str_via_runtime`) with
+      `(begin (foldl (fn (acc _) (list acc)) (list 1) (range 5000)) 0)` — legacy
+      `eval_str_compiled` returns `0`, the runtime path ABORTED ("fatal runtime
+      error: stack overflow", signal 6). ROOT CAUSE (not formatting):
+      `str`/`display` of a deep structure is already stack-guarded via
+      `stack::maybe_grow`; the real overflow was the RECURSIVE Rc FREE of the
+      ~5000-deep nested list — dropping the outer `Vec<Value>` drops each child
+      `Value`, whose last-ref free drops its `Vec<Value>`, one native frame per
+      level. On the runtime drive path that recursion starts from a deep native
+      baseline (`drive`→`visit_ready`→`run_quantum`→native) and overflows before
+      any guard can fire; legacy `VM::execute` has enough headroom to survive.
+      FIX (`crates/sema-core/src/value.rs`, `drop_last_heap_ref` +
+      `free_heap_payload`): flatten the teardown of the cycle-free immutable
+      collections (List/Vector/Map/HashMap) onto an explicit heap worklist and
+      free them iteratively — teardown is now O(1) native frames regardless of
+      structure depth. Every other payload still drops through
+      `drop_leaf_heap_ref`, whose recursion re-enters this iterative path for any
+      nested collection (bounded by distinct-type nesting, not element count).
+      This removes the SIGABRT on BOTH eval paths at the source. GATE (un-ignored,
+      `mod runtime_eval_tests`, `crates/sema-eval/src/eval.rs`):
+      `eval_via_runtime_deep_structure_str_no_abort` — asserts the full
+      `(string-length (str …))` program AND a build-then-discard variant match the
+      `eval_str` oracle (both → `10003` / `0`, no abort). Temp-flipped
+      `eval_str_compiled` onto `run_exprs_via_runtime` locally: `integration_test`
+      `deep_structure_str_no_abort` PASSED through the runtime (no SIGABRT); temp
+      flip REVERTED (not committed). VERIFIED: sema-eval 118/0, sema-vm 486/0,
+      eval_test 1072/0, integration_test 1055/0, vm_async_test STILL 114/4 (same
+      pre-existing RED — legacy path unchanged), `cargo check --workspace --tests`
+      exit 0, clippy (`-p sema-vm -p sema-eval -p sema-stdlib -p sema-core --tests
+      -D warnings`) + fmt clean. REMAINING full-flip blockers: family A (spawned-
+      task parity ×6) and family B (virtual-clock/yield ×3) — the 4 documented
+      `vm_async_test` RED + the `runtime_conformance`/`watchdog` drift._
 
 - [ ] **Step 3: Remove TLS scheduler ownership**
 

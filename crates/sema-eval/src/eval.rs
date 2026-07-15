@@ -2089,6 +2089,31 @@ fn gc_stats_map(stats: &sema_core::GcStats) -> Value {
 mod runtime_eval_tests {
     use super::*;
 
+    // Full-flip blocker (native-stack): routing eval through the runtime
+    // (`drive` → `visit_ready` → `run_quantum`) adds native frames below every
+    // VM native call, so freeing a pathologically deep, cycle-free collection
+    // used to overflow the OS stack and SIGABRT — an uncatchable abort the VM's
+    // frame guard can't turn into a Sema error. `str`/`display` of the same
+    // structure is already stack-guarded (`stack::maybe_grow`); the residual
+    // overflow was the *iterative* teardown of the nested list, now flattened
+    // in `Value`'s drop (`sema-core/src/value.rs`, `drop_last_heap_ref`). The
+    // contract is "no abort on either eval path", matching legacy `str`, which
+    // returns a value at this depth (integration_test `deep_structure_str_no_abort`).
+    #[test]
+    fn eval_via_runtime_deep_structure_str_no_abort() {
+        // A ~5000-deep nested list, stringified then measured. Builds, displays,
+        // and (critically) frees the deep structure entirely on the runtime
+        // drive path. Parity with the normal evaluator is the oracle.
+        assert_runtime_matches_oracle(
+            "(string-length (str (foldl (fn (acc _) (list acc)) (list 1) (range 5000))))",
+        );
+        // Isolate the teardown path: build and then discard the deep list
+        // without ever displaying it, so only the recursive free is exercised.
+        assert_runtime_matches_oracle(
+            "(begin (foldl (fn (acc _) (list acc)) (list 1) (range 5000)) 0)",
+        );
+    }
+
     #[test]
     fn eval_via_runtime_evaluates_a_synchronous_expression() {
         // Acceptance gate: a real interpreter routes a synchronous eval through

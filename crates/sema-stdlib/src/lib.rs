@@ -50,6 +50,10 @@ mod proc;
 mod pty;
 mod reflect;
 mod regex_ops;
+/// Shared reference glue for offloading an I/O op onto the unified-runtime
+/// executor as a structural `NativeOutcome::Suspend` (http, git, sqlite, …).
+#[cfg(not(target_arch = "wasm32"))]
+mod runtime_offload;
 mod secret;
 #[cfg(not(target_arch = "wasm32"))]
 mod serial;

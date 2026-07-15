@@ -25,7 +25,13 @@
 
 use std::collections::BTreeMap;
 
-use sema_core::{check_arity, in_async_context, Caps, SemaError, Value};
+use sema_core::runtime::{CompletionKind, NativeOutcome, NativeResult};
+use sema_core::{check_arity, in_async_context, in_runtime_quantum, Caps, SemaError, Value};
+
+/// Completion tag for an offloaded `git` subprocess. Consistent between the
+/// issued identity and the prepared op (not a uniqueness key), so one shared
+/// value for every `git/*` op is correct.
+const GIT_COMPLETION_KIND: u64 = 0x6769_7400; // "git\0"
 
 /// Run `git` with `args`, returning raw (untrimmed) stdout on a zero exit. On a
 /// non-zero exit, surface git's stderr. If the `git` binary can't be launched at
@@ -271,39 +277,153 @@ fn git_stdout_async(
     })
 }
 
+/// The `Send` future that runs one `git` invocation off the VM thread on the
+/// executor's blocking worker (via `io_block_on` inside `runtime_offload`). The
+/// direct child is `kill_on_drop`, so a cancel that drops this future kills it —
+/// best-effort, matching every other non-shell offload's cancellation policy.
+async fn git_run_future(full_args: Vec<String>) -> Result<RawGitOutput, String> {
+    let mut cmd = tokio::process::Command::new("git");
+    cmd.args(&full_args)
+        .kill_on_drop(true)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let output = cmd.output().await.map_err(|e| {
+        format!("git: failed to run `git` (is it installed and on PATH?): {e}")
+    })?;
+    Ok(RawGitOutput {
+        status_code: output.status.code(),
+        stdout: output.stdout,
+        stderr: output.stderr,
+    })
+}
+
+/// Unified-runtime counterpart to [`git_stdout_async`]: SUSPEND on an
+/// interruptible External wait whose job runs `git` off the VM thread and, on a
+/// zero exit, resumes with `decode(stdout)`; a non-zero exit / spawn failure
+/// raises the SAME error text `git()` renders (so runtime and sync can't drift).
+/// Cancellation drops the child (`kill_on_drop`). Cancellation class:
+/// interruptible, best-effort kill (single direct child, no process group).
+fn git_stdout_runtime(
+    args: Vec<String>,
+    decode: impl FnOnce(String) -> Value + 'static,
+) -> NativeResult {
+    if let Some(v) = sema_core::take_resume_value() {
+        return Ok(NativeOutcome::Return(v));
+    }
+    let args_joined = args.join(" ");
+    let mut full_args = vec!["-c".to_string(), "core.quotepath=false".to_string()];
+    full_args.extend(args);
+    let kind =
+        CompletionKind::try_from_raw(GIT_COMPLETION_KIND).expect("git completion kind is nonzero");
+    crate::runtime_offload::external_io_interruptible_try(
+        "git",
+        kind,
+        "git",
+        move |raw: RawGitOutput| -> Result<Value, SemaError> {
+            if raw.status_code == Some(0) {
+                Ok(decode(String::from_utf8_lossy(&raw.stdout).to_string()))
+            } else {
+                let stderr = String::from_utf8_lossy(&raw.stderr).trim().to_string();
+                Err(SemaError::eval(format!("git {args_joined}: {stderr}")))
+            }
+        },
+        move || git_run_future(full_args),
+    )
+}
+
+/// Unified-runtime counterpart to `git/ignore-matches?`'s `git_offload` use:
+/// needs the RAW exit code (0 = ignored, 1 = not, >1 = error), so it bypasses
+/// `git_stdout_runtime`'s zero-exit-only helper exactly like the sync/legacy
+/// paths bypass `git()`.
+fn git_ignore_matches_runtime(path: String) -> NativeResult {
+    if let Some(v) = sema_core::take_resume_value() {
+        return Ok(NativeOutcome::Return(v));
+    }
+    let path_for_msg = path.clone();
+    let full_args = vec!["check-ignore".to_string(), "-q".to_string(), path];
+    let kind =
+        CompletionKind::try_from_raw(GIT_COMPLETION_KIND).expect("git completion kind is nonzero");
+    crate::runtime_offload::external_io_interruptible_try(
+        "git",
+        kind,
+        "git",
+        move |raw: RawGitOutput| -> Result<Value, SemaError> {
+            match raw.status_code {
+                Some(0) => Ok(Value::bool(true)),
+                Some(1) => Ok(Value::bool(false)),
+                other => {
+                    let stderr = String::from_utf8_lossy(&raw.stderr).trim().to_string();
+                    Err(SemaError::eval(format!(
+                        "git check-ignore {path_for_msg}: exit {}: {stderr}",
+                        other
+                            .map(|c| c.to_string())
+                            .unwrap_or_else(|| "signal".into())
+                    )))
+                }
+            }
+        },
+        move || git_run_future(full_args),
+    )
+}
+
 pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
-    crate::register_fn_gated(env, sandbox, Caps::PROCESS, "git/root", |args| {
+    crate::register_runtime_fn_path_gated(env, sandbox, Caps::PROCESS, "git/root", &[], |args| {
         check_arity!(args, "git/root", 0);
-        if in_async_context() {
-            return git_stdout_async(
+        if in_runtime_quantum() {
+            return git_stdout_runtime(
                 vec!["rev-parse".to_string(), "--show-toplevel".to_string()],
                 |out| Value::string(out.trim()),
             );
         }
-        let out = git(&["rev-parse", "--show-toplevel"])?;
-        Ok(Value::string(out.trim()))
-    });
-
-    crate::register_fn_gated(env, sandbox, Caps::PROCESS, "git/current-branch", |args| {
-        check_arity!(args, "git/current-branch", 0);
         if in_async_context() {
             return git_stdout_async(
-                vec![
-                    "rev-parse".to_string(),
-                    "--abbrev-ref".to_string(),
-                    "HEAD".to_string(),
-                ],
+                vec!["rev-parse".to_string(), "--show-toplevel".to_string()],
                 |out| Value::string(out.trim()),
-            );
+            )
+            .map(NativeOutcome::Return);
         }
-        let out = git(&["rev-parse", "--abbrev-ref", "HEAD"])?;
-        Ok(Value::string(out.trim()))
+        let out = git(&["rev-parse", "--show-toplevel"])?;
+        Ok(NativeOutcome::Return(Value::string(out.trim())))
     });
 
-    crate::register_fn_gated(env, sandbox, Caps::PROCESS, "git/status", |args| {
+    crate::register_runtime_fn_path_gated(
+        env,
+        sandbox,
+        Caps::PROCESS,
+        "git/current-branch",
+        &[],
+        |args| {
+            check_arity!(args, "git/current-branch", 0);
+            if in_runtime_quantum() {
+                return git_stdout_runtime(
+                    vec![
+                        "rev-parse".to_string(),
+                        "--abbrev-ref".to_string(),
+                        "HEAD".to_string(),
+                    ],
+                    |out| Value::string(out.trim()),
+                );
+            }
+            if in_async_context() {
+                return git_stdout_async(
+                    vec![
+                        "rev-parse".to_string(),
+                        "--abbrev-ref".to_string(),
+                        "HEAD".to_string(),
+                    ],
+                    |out| Value::string(out.trim()),
+                )
+                .map(NativeOutcome::Return);
+            }
+            let out = git(&["rev-parse", "--abbrev-ref", "HEAD"])?;
+            Ok(NativeOutcome::Return(Value::string(out.trim())))
+        },
+    );
+
+    crate::register_runtime_fn_path_gated(env, sandbox, Caps::PROCESS, "git/status", &[], |args| {
         check_arity!(args, "git/status", 0);
-        if in_async_context() {
-            return git_stdout_async(
+        if in_runtime_quantum() {
+            return git_stdout_runtime(
                 vec![
                     "status".to_string(),
                     "--porcelain=v1".to_string(),
@@ -312,11 +432,6 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
                 |out| status_entries_value(parse_status_entries(&out)),
             );
         }
-        Ok(status_entries_value(status_entries()?))
-    });
-
-    crate::register_fn_gated(env, sandbox, Caps::PROCESS, "git/changed-files", |args| {
-        check_arity!(args, "git/changed-files", 0);
         if in_async_context() {
             return git_stdout_async(
                 vec![
@@ -324,13 +439,47 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
                     "--porcelain=v1".to_string(),
                     "-z".to_string(),
                 ],
-                |out| changed_files_value(parse_status_entries(&out)),
-            );
+                |out| status_entries_value(parse_status_entries(&out)),
+            )
+            .map(NativeOutcome::Return);
         }
-        Ok(changed_files_value(status_entries()?))
+        Ok(NativeOutcome::Return(status_entries_value(status_entries()?)))
     });
 
-    crate::register_fn_gated(env, sandbox, Caps::PROCESS, "git/diff", |args| {
+    crate::register_runtime_fn_path_gated(
+        env,
+        sandbox,
+        Caps::PROCESS,
+        "git/changed-files",
+        &[],
+        |args| {
+            check_arity!(args, "git/changed-files", 0);
+            if in_runtime_quantum() {
+                return git_stdout_runtime(
+                    vec![
+                        "status".to_string(),
+                        "--porcelain=v1".to_string(),
+                        "-z".to_string(),
+                    ],
+                    |out| changed_files_value(parse_status_entries(&out)),
+                );
+            }
+            if in_async_context() {
+                return git_stdout_async(
+                    vec![
+                        "status".to_string(),
+                        "--porcelain=v1".to_string(),
+                        "-z".to_string(),
+                    ],
+                    |out| changed_files_value(parse_status_entries(&out)),
+                )
+                .map(NativeOutcome::Return);
+            }
+            Ok(NativeOutcome::Return(changed_files_value(status_entries()?)))
+        },
+    );
+
+    crate::register_runtime_fn_path_gated(env, sandbox, Caps::PROCESS, "git/diff", &[], |args| {
         check_arity!(args, "git/diff", 0..=1);
         let path = if args.is_empty() {
             None
@@ -342,32 +491,57 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
                     .to_string(),
             )
         };
+        let diff_args = || match &path {
+            None => vec!["diff".to_string()],
+            Some(p) => vec!["diff".to_string(), "--".to_string(), p.clone()],
+        };
+        if in_runtime_quantum() {
+            return git_stdout_runtime(diff_args(), |out| Value::string(&out));
+        }
         if in_async_context() {
-            let diff_args = match &path {
-                None => vec!["diff".to_string()],
-                Some(p) => vec!["diff".to_string(), "--".to_string(), p.clone()],
-            };
-            return git_stdout_async(diff_args, |out| Value::string(&out));
+            return git_stdout_async(diff_args(), |out| Value::string(&out))
+                .map(NativeOutcome::Return);
         }
         let out = match &path {
             None => git(&["diff"])?,
             Some(p) => git(&["diff", "--", p])?,
         };
-        Ok(Value::string(&out))
+        Ok(NativeOutcome::Return(Value::string(&out)))
     });
 
-    crate::register_fn_gated(env, sandbox, Caps::PROCESS, "git/diff-files", |args| {
-        check_arity!(args, "git/diff-files", 0);
-        if in_async_context() {
-            return git_stdout_async(vec!["diff".to_string(), "--name-only".to_string()], |out| {
-                diff_files_value(&out)
-            });
-        }
-        let out = git(&["diff", "--name-only"])?;
-        Ok(diff_files_value(&out))
-    });
+    crate::register_runtime_fn_path_gated(
+        env,
+        sandbox,
+        Caps::PROCESS,
+        "git/diff-files",
+        &[],
+        |args| {
+            check_arity!(args, "git/diff-files", 0);
+            if in_runtime_quantum() {
+                return git_stdout_runtime(
+                    vec!["diff".to_string(), "--name-only".to_string()],
+                    |out| diff_files_value(&out),
+                );
+            }
+            if in_async_context() {
+                return git_stdout_async(
+                    vec!["diff".to_string(), "--name-only".to_string()],
+                    |out| diff_files_value(&out),
+                )
+                .map(NativeOutcome::Return);
+            }
+            let out = git(&["diff", "--name-only"])?;
+            Ok(NativeOutcome::Return(diff_files_value(&out)))
+        },
+    );
 
-    crate::register_fn_gated(env, sandbox, Caps::PROCESS, "git/recent-files", |args| {
+    crate::register_runtime_fn_path_gated(
+        env,
+        sandbox,
+        Caps::PROCESS,
+        "git/recent-files",
+        &[],
+        |args| {
         check_arity!(args, "git/recent-files", 0..=1);
         let n = if args.is_empty() {
             20
@@ -377,23 +551,33 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
                 .ok_or_else(|| SemaError::type_error("int", args[0].type_name()))?
         };
         let n_str = n.to_string();
+        let log_args = || {
+            vec![
+                "log".to_string(),
+                "--name-only".to_string(),
+                "--pretty=format:".to_string(),
+                "-n".to_string(),
+                n_str.clone(),
+            ]
+        };
+        if in_runtime_quantum() {
+            return git_stdout_runtime(log_args(), |out| recent_files_value(&out));
+        }
         if in_async_context() {
-            return git_stdout_async(
-                vec![
-                    "log".to_string(),
-                    "--name-only".to_string(),
-                    "--pretty=format:".to_string(),
-                    "-n".to_string(),
-                    n_str.clone(),
-                ],
-                |out| recent_files_value(&out),
-            );
+            return git_stdout_async(log_args(), |out| recent_files_value(&out))
+                .map(NativeOutcome::Return);
         }
         let out = git(&["log", "--name-only", "--pretty=format:", "-n", &n_str])?;
-        Ok(recent_files_value(&out))
+        Ok(NativeOutcome::Return(recent_files_value(&out)))
     });
 
-    crate::register_fn_gated(env, sandbox, Caps::PROCESS, "git/ignore-matches?", |args| {
+    crate::register_runtime_fn_path_gated(
+        env,
+        sandbox,
+        Caps::PROCESS,
+        "git/ignore-matches?",
+        &[],
+        |args| {
         check_arity!(args, "git/ignore-matches?", 1);
         let path = args[0]
             .as_str()
@@ -402,7 +586,10 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
         // `git check-ignore -q` exits 0 if the path is ignored, 1 if not, and
         // >1 on a real error. We need the raw exit code, so bypass the
         // helpers above (`git()`/`git_stdout_async`, which treat any non-zero
-        // exit as failure) on BOTH paths.
+        // exit as failure) on ALL paths.
+        if in_runtime_quantum() {
+            return git_ignore_matches_runtime(path);
+        }
         if in_async_context() {
             let path_for_msg = path.clone();
             return git_offload(
@@ -423,7 +610,8 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
                         }
                     },
                 },
-            );
+            )
+            .map(NativeOutcome::Return);
         }
         let output = std::process::Command::new("git")
             .args(["check-ignore", "-q", &path])
@@ -434,8 +622,8 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
                 ))
             })?;
         match output.status.code() {
-            Some(0) => Ok(Value::bool(true)),
-            Some(1) => Ok(Value::bool(false)),
+            Some(0) => Ok(NativeOutcome::Return(Value::bool(true))),
+            Some(1) => Ok(NativeOutcome::Return(Value::bool(false))),
             other => {
                 let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
                 Err(SemaError::eval(format!(
@@ -446,7 +634,8 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
                 )))
             }
         }
-    });
+        },
+    );
 }
 
 #[cfg(test)]

@@ -11,8 +11,8 @@ use sema_core::runtime::{
     ResumeInput, SendPayload, Trace, WaitKind,
 };
 use sema_core::{
-    check_arity, in_async_context, set_yield_signal, take_resume_value, Caps, SemaError, Value,
-    YieldReason,
+    check_arity, in_async_context, in_runtime_quantum, set_yield_signal, take_resume_value, Caps,
+    SemaError, Value, YieldReason,
 };
 
 use crate::register_fn;
@@ -404,6 +404,139 @@ fn shell_async(
     Ok(Value::nil())
 }
 
+/// Completion tag for an offloaded `shell` subprocess. Consistent between the
+/// issued identity and the prepared op (not a uniqueness key).
+const SHELL_COMPLETION_KIND: u64 = 0x7368_656c; // "shel"
+
+/// The `Send` future that runs the shell subprocess off the VM thread on the
+/// executor's blocking worker (via `io_block_on` inside `runtime_offload`). It
+/// publishes the child's OS pid into `pid_slot` (its own process group, so the
+/// abort hook can `SIGKILL` the whole group), then clears it once the child is
+/// reaped so a late cancel never signals a reused pid. `kill_on_drop` kills the
+/// direct child if the future is dropped on cancel.
+#[cfg(not(target_arch = "wasm32"))]
+async fn shell_run_future(
+    program: String,
+    child_args: Vec<String>,
+    cwd: Option<String>,
+    env_vars: Vec<(String, String)>,
+    pid_slot: std::sync::Arc<std::sync::atomic::AtomicU32>,
+) -> Result<RawShellOutput, String> {
+    use std::sync::atomic::Ordering;
+    let mut cmd = tokio::process::Command::new(&program);
+    cmd.args(&child_args)
+        .kill_on_drop(true)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    if let Some(dir) = &cwd {
+        cmd.current_dir(dir);
+    }
+    for (k, v) in &env_vars {
+        cmd.env(k, v);
+    }
+    // Own process group so a compound/pipelined command (`sh -c "a; b"`) can be
+    // torn down as a GROUP on abort, not just the `sh` leader.
+    #[cfg(unix)]
+    cmd.process_group(0);
+    let child = cmd.spawn().map_err(|e| format!("shell: {e}"))?;
+    if let Some(id) = child.id() {
+        pid_slot.store(id, Ordering::SeqCst);
+    }
+    let output = child.wait_with_output().await;
+    // Child reaped (or the wait errored): clear the pid so a cancel that races
+    // completion never `SIGKILL`s a reaped (possibly reused) pid.
+    pid_slot.store(0, Ordering::SeqCst);
+    let output = output.map_err(|e| format!("shell: {e}"))?;
+    Ok(RawShellOutput {
+        status_code: output.status.code(),
+        stdout: output.stdout,
+        stderr: output.stderr,
+    })
+}
+
+/// Cancel hook for the runtime `shell` op. On `async/cancel`/`async/timeout` it
+/// (a) issues a SYNCHRONOUS `SIGKILL` to the child's PROCESS GROUP — reliable
+/// even when the program exits immediately after the timeout (a one-shot
+/// `sema -e`), where the worker may be gone before it can drop the future, and
+/// killing the GROUP reaps a compound command's grandchildren — and (b) fires the
+/// select signal so the job drops the future (`kill_on_drop` the direct child).
+/// Mirrors `shell_async`'s abort hook exactly.
+#[cfg(not(target_arch = "wasm32"))]
+struct ShellCancelHook {
+    signal: Option<crate::runtime_offload::CancelSignal>,
+    pid_slot: std::sync::Arc<std::sync::atomic::AtomicU32>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl Trace for ShellCancelHook {
+    fn trace(&self, _sink: &mut dyn FnMut(GcEdge<'_>)) -> bool {
+        true
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl CancelHook for ShellCancelHook {
+    fn cancel(&mut self) -> Result<CancelDisposition, CancelHookError> {
+        #[cfg(unix)]
+        {
+            let pid = self.pid_slot.load(std::sync::atomic::Ordering::SeqCst);
+            if pid != 0 {
+                // SAFETY: killpg of the child's own process group (process_group(0)
+                // set pgid == pid). The negative pid targets the GROUP. The pid is
+                // reset to 0 by the worker once the child is reaped, so a
+                // reaped/reused pid is never targeted.
+                unsafe {
+                    libc::kill(-(pid as libc::pid_t), libc::SIGKILL);
+                }
+            }
+        }
+        if let Some(signal) = self.signal.take() {
+            let _ = signal.send(());
+        }
+        Ok(CancelDisposition::Reaped)
+    }
+    fn reap(&mut self) -> Result<CancelDisposition, CancelHookError> {
+        Ok(CancelDisposition::Reaped)
+    }
+}
+
+/// The unified-runtime `shell` path: SUSPEND on an interruptible External wait
+/// whose job runs the subprocess off the VM thread; on resume the decoder builds
+/// the identical `shell_output_value`. Cancellation class: interruptible with a
+/// synchronous process-group `SIGKILL` (see [`ShellCancelHook`]).
+#[cfg(not(target_arch = "wasm32"))]
+fn shell_runtime(
+    program: String,
+    child_args: Vec<String>,
+    cwd: Option<String>,
+    env_vars: Vec<(String, String)>,
+) -> NativeResult {
+    if let Some(v) = take_resume_value() {
+        return Ok(NativeOutcome::Return(v));
+    }
+    let (cancel_tx, cancel_rx) = crate::runtime_offload::cancel_channel();
+    let pid_slot = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let resource = InterruptibleResource::new(
+        "shell",
+        Box::new(ShellCancelHook {
+            signal: Some(cancel_tx),
+            pid_slot: pid_slot.clone(),
+        }),
+    );
+    let kind = CompletionKind::try_from_raw(SHELL_COMPLETION_KIND)
+        .expect("shell completion kind is nonzero");
+    crate::runtime_offload::suspend_external_interruptible_try(
+        "shell",
+        kind,
+        resource,
+        cancel_rx,
+        move |raw: RawShellOutput| -> Result<Value, SemaError> {
+            Ok(shell_output_value(raw.status_code, &raw.stdout, &raw.stderr))
+        },
+        move || shell_run_future(program, child_args, cwd, env_vars, pid_slot),
+    )
+}
+
 pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
     // Anchor the sys/elapsed clock at startup rather than at its first call.
     process_start();
@@ -423,7 +556,7 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
     // process). Gate on SHELL via the helper, and check PROCESS inline so either
     // denial blocks the call.
     let shell_sandbox = sandbox.clone();
-    crate::register_fn_gated(env, sandbox, Caps::SHELL, "shell", move |args| {
+    crate::register_runtime_fn_path_gated(env, sandbox, Caps::SHELL, "shell", &[], move |args| {
         shell_sandbox.check(Caps::PROCESS, "shell")?;
         check_arity!(args, "shell", 1..);
         let cmd = args[0]
@@ -451,15 +584,19 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
         // launch byte-identical commands.
         let (program, child_args) = shell_program_args(cmd, &cmd_args);
 
-        // Inside an `async/spawn`'d task: offload the subprocess onto the
-        // process-wide I/O pool and yield `AwaitIo` so the scheduler can run
-        // sibling tasks while the child runs. Args are resolved and the result
-        // `Value` decoded on the VM thread; only `Send` facts cross the boundary.
-        if sema_core::in_async_context() {
-            return shell_async(program, child_args, cwd, env_vars);
+        // Inside a unified-runtime VM quantum: SUSPEND on a structural External
+        // wait so the subprocess runs off the VM thread while sibling tasks run.
+        if in_runtime_quantum() {
+            return shell_runtime(program, child_args, cwd, env_vars);
         }
 
-        // Top-level (not in a scheduler task): the original synchronous path,
+        // Legacy scheduler task: the retired `AwaitIo` offload, kept for the
+        // non-unified-runtime path.
+        if in_async_context() {
+            return shell_async(program, child_args, cwd, env_vars).map(NativeOutcome::Return);
+        }
+
+        // Top-level (not in any task): the original synchronous path,
         // byte-identical in observable behavior to the pre-async implementation.
         let mut command = std::process::Command::new(&program);
         command.args(&child_args);
@@ -473,11 +610,11 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
             .output()
             .map_err(|e| SemaError::Io(format!("shell: {e}")))?;
 
-        Ok(shell_output_value(
+        Ok(NativeOutcome::Return(shell_output_value(
             output.status.code(),
             &output.stdout,
             &output.stderr,
-        ))
+        )))
     });
 
     // shell/quote — POSIX-quote a string for safe interpolation into a POSIX `sh -c`

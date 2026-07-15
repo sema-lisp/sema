@@ -1071,6 +1071,280 @@ fn unsupported_spawn_drops_callable_outside_runtime_state_borrow() {
     }
 }
 
+/// A continuation that records the shape of the resume input it observes and
+/// then returns `value`, so the parked task settles with `value`. Used to assert
+/// that a Timer suspension resumes with `ResumeInput::Returned(nil)`.
+struct TimerResumeContinuation {
+    observed: Rc<RefCell<Vec<&'static str>>>,
+    value: Value,
+}
+
+impl Trace for TimerResumeContinuation {
+    fn trace(&self, sink: &mut dyn FnMut(sema_core::cycle::GcEdge<'_>)) -> bool {
+        sink(sema_core::cycle::GcEdge::Value(&self.value));
+        true
+    }
+}
+
+impl NativeContinuation for TimerResumeContinuation {
+    fn resume(self: Box<Self>, _: &mut NativeCallContext<'_>, input: ResumeInput) -> NativeResult {
+        self.observed.borrow_mut().push(match &input {
+            ResumeInput::Returned(v) if *v == Value::NIL => "returned-nil",
+            ResumeInput::Returned(_) => "returned-other",
+            ResumeInput::Failed(_) => "failed",
+            ResumeInput::Cancelled(_) => "cancelled",
+            ResumeInput::Runtime(_) => "runtime",
+        });
+        Ok(NativeOutcome::Return(self.value))
+    }
+}
+
+#[test]
+fn runtime_timer_suspension_resumes_continuation_with_nil_after_deadline() {
+    // A native returning `Suspend { wait: Timer(d) }` parks its continuation on a
+    // runtime timer; when the deadline elapses the continuation resumes with
+    // `Returned(nil)` and its own return value settles the task.
+    let clock = Rc::new(FakeClock::new());
+    let runtime = runtime_with_inline_executor(clock.clone());
+    let observed = Rc::new(RefCell::new(Vec::new()));
+    let handle = runtime
+        .submit_test_root(TestPreparedTask::native(Ok(NativeOutcome::Suspend(NativeSuspend {
+            wait: WaitKind::Timer(Duration::from_millis(5)),
+            continuation: Box::new(TimerResumeContinuation {
+                observed: Rc::clone(&observed),
+                value: Value::int(7),
+            }),
+        }))))
+        .unwrap();
+
+    runtime.drive(&drive_budget(8)).unwrap();
+    assert_eq!(
+        runtime.timer_count_for_test(),
+        1,
+        "timer suspension arms one runtime timer"
+    );
+    assert!(matches!(handle.poll_result(), RootPoll::Pending));
+    assert!(
+        observed.borrow().is_empty(),
+        "continuation must not resume before the deadline"
+    );
+
+    clock.advance(Duration::from_millis(5));
+    let mut guard = 0;
+    while matches!(handle.poll_result(), RootPoll::Pending) {
+        runtime.drive(&drive_budget(8)).unwrap();
+        guard += 1;
+        assert!(guard < 100, "timer task settles after the deadline");
+    }
+    assert_eq!(*observed.borrow(), vec!["returned-nil"]);
+    let RootPoll::Ready(settlement) = handle.poll_result() else {
+        panic!("timer task settles");
+    };
+    assert!(matches!(&settlement.outcome, TaskOutcome::Returned(v) if v.as_int() == Some(7)));
+    assert_eq!(runtime.timer_count_for_test(), 0);
+}
+
+/// Drives a real compiled Sema source to settlement and returns the value it
+/// returned — used to obtain a spawn-able VM closure thunk for the Spawn test.
+fn settle_vm_value(runtime: &Runtime, src: &str) -> Value {
+    let handle = submit_vm_expr(runtime, src);
+    let mut guard = 0;
+    while matches!(handle.poll_result(), RootPoll::Pending) {
+        runtime.drive(&drive_budget(64)).unwrap();
+        guard += 1;
+        assert!(guard < 100, "value root settles");
+    }
+    let RootPoll::Ready(settlement) = handle.poll_result() else {
+        panic!("value root settles");
+    };
+    match &settlement.outcome {
+        TaskOutcome::Returned(value) => value.clone(),
+        other => panic!("expected Returned, got {other:?}"),
+    }
+}
+
+/// Spawn continuation: records the promise the runtime allocated and then awaits
+/// it, so the parked task settles with the child's returned value.
+struct SpawnAwaitContinuation(Rc<Cell<Option<sema_core::runtime::PromiseId>>>);
+
+impl Trace for SpawnAwaitContinuation {
+    fn trace(&self, _: &mut dyn FnMut(sema_core::cycle::GcEdge<'_>)) -> bool {
+        true
+    }
+}
+
+impl NativeContinuation for SpawnAwaitContinuation {
+    fn resume(self: Box<Self>, _: &mut NativeCallContext<'_>, input: ResumeInput) -> NativeResult {
+        let ResumeInput::Runtime(sema_core::runtime::RuntimeResponse::Promise(promise)) = input
+        else {
+            panic!("spawn resumes with a canonical promise");
+        };
+        self.0.set(Some(promise));
+        Ok(NativeOutcome::Suspend(NativeSuspend {
+            wait: WaitKind::Promise(promise),
+            continuation: Box::new(SettlementValueContinuation),
+        }))
+    }
+}
+
+struct SettlementValueContinuation;
+
+impl Trace for SettlementValueContinuation {
+    fn trace(&self, _: &mut dyn FnMut(sema_core::cycle::GcEdge<'_>)) -> bool {
+        true
+    }
+}
+
+impl NativeContinuation for SettlementValueContinuation {
+    fn resume(self: Box<Self>, _: &mut NativeCallContext<'_>, input: ResumeInput) -> NativeResult {
+        let ResumeInput::Runtime(sema_core::runtime::RuntimeResponse::Settlement(Some(settlement))) =
+            input
+        else {
+            panic!("await resumes with the child settlement");
+        };
+        match &settlement.outcome {
+            TaskOutcome::Returned(value) => Ok(NativeOutcome::Return(value.clone())),
+            other => panic!("child returned, got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn runtime_spawn_request_yields_promise_that_settles_with_child_result() {
+    // A native returning `Runtime(Spawn { .. })` admits a detached child through
+    // the canonical PromiseRegistry and resumes with `Promise(id)`. Awaiting that
+    // promise yields the child's returned value once the child task settles.
+    let runtime = runtime_with_inline_executor(Rc::new(FakeClock::new()));
+    let thunk = settle_vm_value(&runtime, "(fn () 42)");
+    let promise = Rc::new(Cell::new(None));
+    let handle = runtime
+        .submit_test_root(TestPreparedTask::native(Ok(NativeOutcome::Runtime(
+            sema_core::runtime::RuntimeRequest::Spawn {
+                callable: thunk,
+                continuation: Box::new(SpawnAwaitContinuation(Rc::clone(&promise))),
+            },
+        ))))
+        .unwrap();
+
+    let mut guard = 0;
+    while matches!(handle.poll_result(), RootPoll::Pending) {
+        runtime.drive(&drive_budget(8)).unwrap();
+        guard += 1;
+        assert!(guard < 100, "spawn root settles");
+    }
+    assert!(
+        promise.get().is_some(),
+        "spawn allocated a canonical registry promise"
+    );
+    let RootPoll::Ready(settlement) = handle.poll_result() else {
+        panic!("spawn root settles");
+    };
+    assert!(matches!(&settlement.outcome, TaskOutcome::Returned(v) if v.as_int() == Some(42)));
+}
+
+/// Timeout continuation: asserts it resumes with a failure and records the
+/// structured condition's `:type` keyword.
+struct CaptureTimeoutContinuation(Rc<RefCell<Option<String>>>);
+
+impl Trace for CaptureTimeoutContinuation {
+    fn trace(&self, _: &mut dyn FnMut(sema_core::cycle::GcEdge<'_>)) -> bool {
+        true
+    }
+}
+
+impl NativeContinuation for CaptureTimeoutContinuation {
+    fn resume(self: Box<Self>, _: &mut NativeCallContext<'_>, input: ResumeInput) -> NativeResult {
+        let ResumeInput::Failed(error) = input else {
+            panic!("timeout deadline resumes with a failure");
+        };
+        let kind = match &error {
+            SemaError::Condition(value) => value
+                .as_map_ref()
+                .and_then(|map| map.get(&Value::keyword("type")))
+                .and_then(Value::as_keyword),
+            _ => None,
+        };
+        *self.0.borrow_mut() = kind;
+        Ok(NativeOutcome::Return(Value::NIL))
+    }
+}
+
+#[test]
+fn runtime_promise_timeout_resolves_to_settlement_when_promise_wins() {
+    // A settled promise wins the timeout race; the deadline timer is deregistered
+    // and the observed settlement is delivered.
+    let runtime = runtime_with_inline_executor(Rc::new(FakeClock::new()));
+    let promise = runtime.create_pending_promise_for_test();
+    let responses = Rc::new(RefCell::new(Vec::new()));
+    let handle = runtime
+        .submit_test_root(TestPreparedTask::native(Ok(NativeOutcome::Runtime(
+            sema_core::runtime::RuntimeRequest::PromiseSetWait {
+                wait: sema_core::runtime::PromiseSetWait {
+                    promises: vec![promise],
+                    mode: sema_core::runtime::PromiseSetMode::Timeout(Duration::from_millis(5)),
+                },
+                continuation: Box::new(CaptureRuntimeContinuation(Rc::clone(&responses))),
+            },
+        ))))
+        .unwrap();
+    runtime.drive(&drive_budget(8)).unwrap();
+    assert!(matches!(handle.poll_result(), RootPoll::Pending));
+    assert_eq!(
+        runtime.timer_count_for_test(),
+        1,
+        "timeout arms a deadline timer while the promise is pending"
+    );
+    let settlement = runtime.settle_promise_for_test(promise, TaskOutcome::Returned(Value::int(3)));
+    while matches!(handle.poll_result(), RootPoll::Pending) {
+        runtime.drive(&drive_budget(1)).unwrap();
+    }
+    assert_eq!(
+        runtime.timer_count_for_test(),
+        0,
+        "the winning promise deregisters the deadline timer"
+    );
+    let sema_core::runtime::RuntimeResponse::Settlement(Some(observed)) = &responses.borrow()[0]
+    else {
+        panic!("timeout returns the winning settlement");
+    };
+    assert!(Rc::ptr_eq(observed, &settlement));
+}
+
+#[test]
+fn runtime_promise_timeout_raises_structured_condition_when_deadline_wins() {
+    // A pending promise at the deadline raises a structured `:timeout` condition
+    // and leaves the supplied promise untouched (still settleable afterward).
+    let clock = Rc::new(FakeClock::new());
+    let runtime = runtime_with_inline_executor(clock.clone());
+    let promise = runtime.create_pending_promise_for_test();
+    let kind = Rc::new(RefCell::new(None));
+    let handle = runtime
+        .submit_test_root(TestPreparedTask::native(Ok(NativeOutcome::Runtime(
+            sema_core::runtime::RuntimeRequest::PromiseSetWait {
+                wait: sema_core::runtime::PromiseSetWait {
+                    promises: vec![promise],
+                    mode: sema_core::runtime::PromiseSetMode::Timeout(Duration::from_millis(5)),
+                },
+                continuation: Box::new(CaptureTimeoutContinuation(Rc::clone(&kind))),
+            },
+        ))))
+        .unwrap();
+    runtime.drive(&drive_budget(8)).unwrap();
+    assert!(matches!(handle.poll_result(), RootPoll::Pending));
+
+    clock.advance(Duration::from_millis(5));
+    let mut guard = 0;
+    while matches!(handle.poll_result(), RootPoll::Pending) {
+        runtime.drive(&drive_budget(8)).unwrap();
+        guard += 1;
+        assert!(guard < 100, "timeout task settles after the deadline");
+    }
+    assert_eq!(kind.borrow().as_deref(), Some("timeout"));
+    assert_eq!(runtime.timer_count_for_test(), 0);
+    // The observed promise is left untouched — it is still pending and settleable.
+    runtime.settle_promise_for_test(promise, TaskOutcome::Returned(Value::int(9)));
+}
+
 fn runtime_with_inline_executor(clock: Rc<dyn RuntimeClock>) -> Runtime {
     Runtime::new(
         Rc::new(sema_core::EvalContext::new()),

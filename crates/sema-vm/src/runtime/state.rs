@@ -249,6 +249,9 @@ enum ProtocolWaitKind {
         channel: sema_core::runtime::ChannelId,
         receive: bool,
     },
+    /// A bare `Timer(d)` suspension: the task's wait key is armed in the timer
+    /// queue and the continuation resumes with `Returned(nil)` when it fires.
+    Timer,
 }
 
 struct ProtocolWait {
@@ -756,6 +759,50 @@ impl Runtime {
         let Some(key) = state.timers.pop_due(now) else {
             return Ok(false);
         };
+        // A continuation parked on a bare `Timer(d)` suspension, or an
+        // observational `Timeout` whose deadline beat every observed promise:
+        // resume its continuation rather than a parked VM. A `Timer` resumes with
+        // `Returned(nil)`; a `Timeout` deadline raises a structured `:timeout`
+        // condition (the observed promises are left untouched — their producers
+        // continue).
+        if let Some(input) = match state.protocol_waits.get(&key).map(|wait| &wait.kind) {
+            Some(ProtocolWaitKind::Timer) => Some(ResumeInput::Returned(sema_core::Value::nil())),
+            Some(ProtocolWaitKind::Promises(set)) => match set.mode {
+                sema_core::runtime::PromiseSetMode::Timeout(duration) => Some(
+                    ResumeInput::Failed(timeout_expired_condition(duration)),
+                ),
+                _ => None,
+            },
+            Some(ProtocolWaitKind::Channel { .. }) | None => None,
+        } {
+            let wait = state
+                .protocol_waits
+                .remove(&key)
+                .expect("protocol timer wait was just observed");
+            if let ProtocolWaitKind::Promises(set) = &wait.kind {
+                for promise in &set.promises {
+                    let _ = state.promises.cancel_observation(*promise, key);
+                }
+            }
+            state
+                .tasks
+                .get_mut(&wait.task)
+                .ok_or_else(|| RuntimeFault::Invariant {
+                    message: "timer protocol task disappeared".into(),
+                })?
+                .record
+                .reject_wait(key)
+                .map_err(|error| RuntimeFault::Invariant {
+                    message: format!("timer protocol wake transition failed: {error:?}"),
+                })?;
+            state.pending.push_back(PendingStage::Resume(
+                wait.task,
+                wait.owner,
+                wait.continuation,
+                input,
+            ));
+            return Ok(true);
+        }
         let task_id = state
             .tasks
             .iter()
@@ -904,6 +951,12 @@ impl Runtime {
                         for promise in &set.promises {
                             let _ = state.promises.cancel_observation(*promise, key);
                         }
+                        if matches!(set.mode, sema_core::runtime::PromiseSetMode::Timeout(_)) {
+                            state.timers.cancel(key);
+                        }
+                    }
+                    ProtocolWaitKind::Timer => {
+                        state.timers.cancel(key);
                     }
                     ProtocolWaitKind::Channel { channel, .. } => {
                         // TODO(UCR-3): if cancel_wait returns None the receiver/sender
@@ -1317,6 +1370,11 @@ impl Runtime {
             if let ProtocolWaitKind::Promises(set) = &wait.kind {
                 for promise in &set.promises {
                     let _ = state.promises.cancel_observation(*promise, key);
+                }
+                // A `Timeout` armed a deadline timer under this key; the observed
+                // promise won, so deregister the timer before it fires stale.
+                if matches!(set.mode, sema_core::runtime::PromiseSetMode::Timeout(_)) {
+                    state.timers.cancel(key);
                 }
             }
             let task = state
@@ -1880,7 +1938,10 @@ impl Runtime {
             Ok(NativeOutcome::Suspend(suspend)) => {
                 if matches!(
                     &suspend.wait,
-                    WaitKind::Promise(_) | WaitKind::PromiseSet(_) | WaitKind::Channel(_)
+                    WaitKind::Promise(_)
+                        | WaitKind::PromiseSet(_)
+                        | WaitKind::Channel(_)
+                        | WaitKind::Timer(_)
                 ) {
                     return self.install_protocol_suspend(task_id, owner, suspend);
                 }
@@ -2005,7 +2066,10 @@ impl Runtime {
             WaitKind::Channel(wait) => {
                 install_channel_wait(&mut state, task_id, key, wait, owner, frame)
             }
-            WaitKind::Timer(_) | WaitKind::External(_) => unreachable!("filtered protocol wait"),
+            WaitKind::Timer(duration) => {
+                install_timer_wait(&mut state, task_id, key, duration, owner, frame)
+            }
+            WaitKind::External(_) => unreachable!("filtered protocol wait"),
         };
         if let Err(error) = result {
             let (owner, frame, error) = *error;
@@ -2040,20 +2104,7 @@ impl Runtime {
             continuation,
         } = request
         {
-            let response = Err(sema_core::SemaError::eval(
-                "runtime spawn admission is unavailable",
-            ));
-            drop(callable);
-            self.state
-                .borrow_mut()
-                .pending
-                .push_back(PendingStage::ApplyRuntimeResponse(
-                    task_id,
-                    owner,
-                    ContinuationFrame::native(continuation),
-                    response,
-                ));
-            return Ok(());
+            return self.spawn_via_registry(task_id, owner, callable, continuation);
         }
         if let RuntimeRequest::CreateSettledPromise {
             outcome,
@@ -2553,6 +2604,140 @@ impl Runtime {
         // scheduler did (it never ran the child before the top-level form
         // returned). Only then enqueue the child, behind the spawner.
         self.resume_running_vm(spawner, VmResume::Value(promise_value))?;
+        self.state.borrow_mut().ready.enqueue(root, child);
+        Ok(())
+    }
+
+    /// Admit a detached child for a `RuntimeRequest::Spawn` and resume the
+    /// spawner's continuation with the child's canonical registry promise. Unlike
+    /// [`spawn_detached`] (the legacy `YieldReason::VmSpawn` path, which mirrors
+    /// the child into `spawned_promises` and resumes a parked VM directly), this
+    /// allocates a `PromiseRegistry` promise bound to the child task, so the
+    /// child settles through the checked `settle`/`task_promises` path and its
+    /// `TaskSettlement` (preserving the real outcome) reaches the continuation as
+    /// `RuntimeResponse::Promise(id)`. Both paths coexist during the migration.
+    ///
+    /// [`spawn_detached`]: Self::spawn_detached
+    fn spawn_via_registry(
+        &self,
+        spawner: TaskId,
+        mut owner: ReturnOwner,
+        thunk: sema_core::Value,
+        continuation: Box<dyn sema_core::runtime::NativeContinuation>,
+    ) -> Result<(), RuntimeFault> {
+        let frame = ContinuationFrame::native(continuation);
+        let respond_err = |owner: ReturnOwner,
+                           frame: ContinuationFrame,
+                           error: sema_core::SemaError|
+         -> Result<(), RuntimeFault> {
+            self.state
+                .borrow_mut()
+                .pending
+                .push_back(PendingStage::ApplyRuntimeResponse(
+                    spawner,
+                    owner,
+                    frame,
+                    Err(error),
+                ));
+            Ok(())
+        };
+        let Some((closure, functions, native_fns)) = extract_vm_closure(&thunk) else {
+            return respond_err(
+                owner,
+                frame,
+                sema_core::SemaError::eval(
+                    "async/spawn: argument must be a function (compiled VM closure)",
+                ),
+            );
+        };
+        // The native that yielded `Spawn` is running inside a VM quantum whose VM
+        // is parked in `owner`; snapshot any still-open upvalue cells the thunk
+        // captures against it. Fall back to the guard-free snapshot when there is
+        // no parked VM (e.g. a runtime-native spawner in tests).
+        match owner.parked_parent_vm_mut() {
+            Some(spawning_vm) => close_closure_upvalues_with_owner(spawning_vm, &closure),
+            None => close_closure_upvalues_for_foreign_run(&closure),
+        }
+        let Some(globals) = closure.globals.clone() else {
+            return respond_err(
+                owner,
+                frame,
+                sema_core::SemaError::eval("async/spawn: thunk closure has no home environment"),
+            );
+        };
+        let mut vm = VM::new_for_task_with_native_fns(globals, functions, native_fns);
+        if let Err(error) = vm.setup_for_call(closure, &[]) {
+            return respond_err(owner, frame, error);
+        }
+        let (root, child, promise) = {
+            let mut state = self.state.borrow_mut();
+            if state.task_ids.is_exhausted() {
+                drop(state);
+                return respond_err(
+                    owner,
+                    frame,
+                    sema_core::SemaError::eval("async/spawn: task identity exhausted"),
+                );
+            }
+            let child = state
+                .task_ids
+                .allocate()
+                .map_err(|_| RuntimeFault::IdExhausted { kind: "task" })?;
+            let root = state
+                .tasks
+                .get(&spawner)
+                .ok_or_else(|| RuntimeFault::Invariant {
+                    message: "spawning task disappeared".into(),
+                })?
+                .record
+                .relations()
+                .origin_root;
+            let promise = match state.promises.allocate_pending(Some(child)) {
+                Ok(promise) => promise,
+                Err(_) => {
+                    drop(state);
+                    return respond_err(
+                        owner,
+                        frame,
+                        sema_core::SemaError::eval("async/spawn: promise identity exhausted"),
+                    );
+                }
+            };
+            // A detached task is an origin-root child owned by the root, but not
+            // the root's main task; it settles its own promise.
+            let relations = TaskRelations {
+                origin_root: root,
+                cancellation_parent: CancellationParent::Root(root),
+                lifetime_owner: LifetimeOwner::Root(root),
+            };
+            state.tasks.insert(
+                child,
+                RuntimeTask {
+                    record: TaskRecord::new(child, relations),
+                    payload: TaskPayload::Vm,
+                    pending_resume: None,
+                    suspended_owner: None,
+                    vm_call: Some(vm),
+                    vm_owner: Some(ReturnOwner::Root),
+                    context: TaskContextHandle::default(),
+                    vm_resume: None,
+                },
+            );
+            state.task_promises.insert(child, promise);
+            (root, child, promise)
+        };
+        // Resume the spawner's continuation with the child's promise FIRST, then
+        // enqueue the child behind it — a same-quantum observation of the promise
+        // sees it Pending until the spawner suspends (matching `spawn_detached`).
+        self.state
+            .borrow_mut()
+            .pending
+            .push_back(PendingStage::ApplyRuntimeResponse(
+                spawner,
+                owner,
+                frame,
+                Ok(RuntimeResponse::Promise(promise)),
+            ));
         self.state.borrow_mut().ready.enqueue(root, child);
         Ok(())
     }
@@ -3153,18 +3338,93 @@ impl Runtime {
     }
 
     /// Settle a task by identity: a detached spawned task settles its Sema
-    /// promise (waking any awaiters), a root task settles its root.
+    /// promise (waking any awaiters), a root main task settles its root, and a
+    /// detached registry child (`spawn_via_registry`) settles its canonical
+    /// registry promise.
     fn settle_task(
         &self,
         root: RootId,
         task_id: TaskId,
         outcome: TaskOutcome,
     ) -> Result<(), RuntimeFault> {
-        if self.state.borrow().spawned_promises.contains_key(&task_id) {
+        let (is_spawned, is_root_main) = {
+            let state = self.state.borrow();
+            let is_root_main = matches!(
+                state.roots.get(&root).map(RootRecord::state),
+                Some(RootState::Running { main_task }) if *main_task == task_id
+            );
+            (state.spawned_promises.contains_key(&task_id), is_root_main)
+        };
+        if is_spawned {
             self.settle_spawned(task_id, outcome)
-        } else {
+        } else if is_root_main {
             self.settle(root, task_id, outcome)
+        } else {
+            self.settle_registry_child(task_id, outcome)
         }
+    }
+
+    /// Settle a detached registry child: allocate its settlement sequence, drop
+    /// the task, and settle its canonical `PromiseRegistry` promise (waking every
+    /// registered observer). A detached child is not its root's main task, so it
+    /// never transitions the root — the root settles on its own main task.
+    fn settle_registry_child(
+        &self,
+        task_id: TaskId,
+        outcome: TaskOutcome,
+    ) -> Result<(), RuntimeFault> {
+        let mut state = self.state.borrow_mut();
+        #[cfg(test)]
+        let exhausted = state.force_settlement_exhaustion;
+        #[cfg(not(test))]
+        let exhausted = false;
+        let sequence = match (!exhausted)
+            .then(|| state.settlement_ids.allocate())
+            .transpose()
+            .ok()
+            .flatten()
+        {
+            Some(sequence) => sequence,
+            None => {
+                let fault = RuntimeFault::IdExhausted { kind: "settlement" };
+                state.shutting_down = true;
+                state.terminal_fault = Some(fault.clone());
+                if let Some(task) = state.tasks.get_mut(&task_id) {
+                    task.record
+                        .yield_ready()
+                        .map_err(|error| RuntimeFault::Invariant {
+                            message: format!("terminal detached child failed to yield: {error:?}"),
+                        })?;
+                    let root = task.record.relations().origin_root;
+                    state.ready.enqueue(root, task_id);
+                }
+                return Err(fault);
+            }
+        };
+        let mut task = state
+            .tasks
+            .remove(&task_id)
+            .ok_or_else(|| RuntimeFault::Invariant {
+                message: "settling detached child disappeared".into(),
+            })?;
+        let settlement = task
+            .record
+            .settle(sequence, outcome)
+            .expect("live detached child settlement is infallible");
+        if let Some(promise) = state.task_promises.remove(&task_id) {
+            let wakes = state
+                .promises
+                .settle(promise, Rc::clone(&settlement))
+                .map_err(|error| RuntimeFault::Invariant {
+                    message: format!("detached child promise settlement failed: {error:?}"),
+                })?;
+            if !wakes.is_empty() {
+                state.pending.push_back(PendingStage::PromiseWakes(wakes));
+            }
+        }
+        drop(state);
+        drop(task);
+        Ok(())
     }
 
     /// Settle a detached spawned task: fill its Sema promise state, drop the
@@ -3849,6 +4109,20 @@ fn timeout_expired_error() -> sema_core::SemaError {
     sema_core::SemaError::eval("async/timeout: operation timed out")
 }
 
+/// The structured `:timeout` condition raised into a continuation parked on an
+/// observational `Timeout` promise-set wait whose deadline elapsed first. Unlike
+/// the legacy VM-quantum path's plain `timeout_expired_error`, this carries the
+/// stable `{:type :timeout :duration-ms …}` fields the plan mandates.
+fn timeout_expired_condition(duration: Duration) -> sema_core::SemaError {
+    let duration_ms = duration.as_millis().min(u64::MAX as u128) as u64;
+    sema_core::SemaError::timeout_condition(
+        &format!("operation exceeded {duration_ms} ms"),
+        "async/timeout",
+        duration_ms,
+        None,
+    )
+}
+
 /// Raised into a parked `channel/send` frame when the channel closes while the
 /// sender is blocked (its value is dropped). The eager `ch.closed` fast-path in
 /// the native handles the already-closed case with the full value message.
@@ -3889,7 +4163,11 @@ fn promise_set_response(
         }
     }
     Ok(match wait.mode {
-        sema_core::runtime::PromiseSetMode::Race => settled
+        // A `Timeout` observes like a single-winner race: the lowest-sequence
+        // settled promise wins (deterministically, even at `ms == 0`); the
+        // deadline itself is delivered by the timer path, not here.
+        sema_core::runtime::PromiseSetMode::Race
+        | sema_core::runtime::PromiseSetMode::Timeout(_) => settled
             .into_iter()
             .flatten()
             .min_by_key(|settlement| settlement.sequence)
@@ -3902,7 +4180,6 @@ fn promise_set_response(
             RuntimeResponse::Settlements(settled.into_iter().flatten().collect()),
         ),
         sema_core::runtime::PromiseSetMode::All => None,
-        sema_core::runtime::PromiseSetMode::Timeout(_) => None,
     })
 }
 
@@ -3919,13 +4196,6 @@ fn install_promise_wait(
             owner,
             frame,
             sema_core::SemaError::eval("promise race requires at least one promise"),
-        )));
-    }
-    if matches!(wait.mode, sema_core::runtime::PromiseSetMode::Timeout(_)) {
-        return Err(Box::new((
-            owner,
-            frame,
-            sema_core::SemaError::eval("promise timeout waits require the timer barrier slice"),
         )));
     }
     let response = match promise_set_response(&state.promises, &wait) {
@@ -3964,6 +4234,22 @@ fn install_promise_wait(
             }
         }
     }
+    // A `Timeout` arms a deadline timer under the SAME wait key: whichever of the
+    // observed promise or the deadline fires first wakes the one task and
+    // deregisters the other (`finish_protocol_wait`/`fire_timer`).
+    if let sema_core::runtime::PromiseSetMode::Timeout(duration) = wait.mode {
+        let deadline = state.clock.now() + duration;
+        if !state.timers.insert(deadline, key) {
+            for promise in observed {
+                let _ = state.promises.cancel_observation(promise, key);
+            }
+            return Err(Box::new((
+                owner,
+                frame,
+                sema_core::SemaError::eval("runtime timer identity exhausted"),
+            )));
+        }
+    }
     if let Err(error) = state
         .tasks
         .get_mut(&task_id)
@@ -3971,6 +4257,9 @@ fn install_promise_wait(
         .record
         .wait(key)
     {
+        if matches!(wait.mode, sema_core::runtime::PromiseSetMode::Timeout(_)) {
+            state.timers.cancel(key);
+        }
         for promise in observed {
             let _ = state.promises.cancel_observation(promise, key);
         }
@@ -3985,6 +4274,53 @@ fn install_promise_wait(
         ProtocolWait {
             task: task_id,
             kind: ProtocolWaitKind::Promises(wait),
+            owner,
+            continuation: frame,
+        },
+    );
+    Ok(())
+}
+
+/// Register a `Timer(duration)` suspension: arm the task's wait key in the timer
+/// queue and stash its continuation so `fire_timer` resumes it with
+/// `Returned(nil)` once the deadline elapses. Mirrors the `VmSleep` timer
+/// registration, but delivers through a `NativeContinuation` rather than a
+/// parked VM.
+fn install_timer_wait(
+    state: &mut RuntimeState,
+    task_id: TaskId,
+    key: super::WaitKey,
+    duration: Duration,
+    owner: ReturnOwner,
+    frame: ContinuationFrame,
+) -> Result<(), ProtocolInstallError> {
+    let deadline = state.clock.now() + duration;
+    if !state.timers.insert(deadline, key) {
+        return Err(Box::new((
+            owner,
+            frame,
+            sema_core::SemaError::eval("runtime timer identity exhausted"),
+        )));
+    }
+    if let Err(error) = state
+        .tasks
+        .get_mut(&task_id)
+        .expect("protocol task exists")
+        .record
+        .wait(key)
+    {
+        state.timers.cancel(key);
+        return Err(Box::new((
+            owner,
+            frame,
+            sema_core::SemaError::eval(format!("timer wait transition failed: {error:?}")),
+        )));
+    }
+    state.protocol_waits.insert(
+        key,
+        ProtocolWait {
+            task: task_id,
+            kind: ProtocolWaitKind::Timer,
             owner,
             continuation: frame,
         },

@@ -502,6 +502,76 @@ pub const PRELUDE: &str = r#"
 ;; native (not a router macro) is what makes `(procedure? llm/embed)` true and lets
 ;; it be used as a value — `(map llm/embed …)`, `(async/pool-map llm/embed …)`.
 
+;; ── Owned-concurrency engine (Task 04) ───────────────────────────────────────
+;; The OWNED combinators (`async/spawn-all`, `async/map`, `async/pool-map`,
+;; `async/race-owned`, `async/with-timeout`) OWN the tasks they create: on a
+;; fail-fast settlement (first failure / race winner / timeout) they CANCEL and
+;; reap every unfinished child before propagating. This is the opposite of the
+;; observational `async/all`/`async/race`/`async/timeout`, which never cancel the
+;; promises a caller supplied — the owned forms are built ON those observational
+;; combinators (which fail-fast on the FIRST child settlement and work under both
+;; the top-level scheduler and the unified runtime) plus an explicit cancel sweep.
+;;
+;; A hard constraint drives the helper shape: `async/spawn`/`async/cancel` are
+;; yield primitives whose signal the runtime must observe at the enclosing task's
+;; bytecode boundary. Invoked from INSIDE a higher-order native (`map` — which
+;; re-enters the evaluator on a nested foreign VM) the yield escapes no scheduler
+;; and raises "async yield outside of scheduler context". So every spawn/cancel
+;; step here runs at bytecode level via explicit recursion, never `(map
+;; async/spawn …)`. Pure list ops (length, etc.) stay fine.
+
+;; __spawn-thunks: spawn each zero-arg thunk into its own task, returning the
+;; promises in INPUT order. Bytecode-level recursion (async/spawn yields).
+(define (__spawn-thunks thunks)
+  (if (null? thunks)
+      (list)
+      (let ((p (async/spawn (car thunks))))
+        (cons p (__spawn-thunks (cdr thunks))))))
+
+;; __spawn-apply: spawn one task per item that computes `(wf item)`, returning
+;; the promises in INPUT order. Bytecode-level recursion — the per-item worker
+;; closure `(fn () (wf item))` is built HERE (not inside a `map` lambda), since a
+;; closure created during a higher-order native's re-entrant nested call would
+;; index the wrong function table.
+(define (__spawn-apply wf items)
+  (if (null? items)
+      (list)
+      (let ((item (car items)))
+        (let ((p (async/spawn (fn () (wf item)))))
+          (cons p (__spawn-apply wf (cdr items)))))))
+
+;; __cancel-all: request cancellation of every promise in a list (best-effort
+;; reap of owned children on a fail-fast path). Bytecode-level (async/cancel
+;; yields); a synthetic/settled promise cancel is a harmless no-op.
+(define (__cancel-all promises)
+  (if (null? promises)
+      nil
+      (begin (async/cancel (car promises))
+             (__cancel-all (cdr promises)))))
+
+;; __owned-all: await every already-spawned child, returning values in INPUT
+;; order. Fail-fast + OWNED: `async/all` raises on the FIRST child failure/
+;; cancellation (while later children may still be pending); we then CANCEL and
+;; reap every child before re-raising, so a still-running sibling is stopped
+;; before its side effects — the ownership property the observational `async/all`
+;; deliberately lacks. Empty input → empty list. The single engine behind
+;; spawn-all / map / pool-map (each differs only in how it produces the children).
+(define (__owned-all children)
+  (if (null? children)
+      (list)
+      (try (async/all children)
+           (catch e
+             (__cancel-all children)
+             (throw e)))))
+
+;; __prefill-sem: seed a semaphore channel with `k` availability tokens
+;; (bytecode-level channel/send — capacity is exactly k so none block).
+(define (__prefill-sem sem k)
+  (if (<= k 0)
+      nil
+      (begin (channel/send sem #t)
+             (__prefill-sem sem (- k 1)))))
+
 ;; async/pool-map: bounded-concurrency fan-out. Applies `f` to each item with at
 ;; most `n` tasks running concurrently, returning results in INPUT order.
 ;;
@@ -512,31 +582,38 @@ pub const PRELUDE: &str = r#"
 ;; top-level defines. The args are spliced verbatim into a `let` (each is bound
 ;; once, so they evaluate exactly once and in argument order).
 ;;
+;; `n <= 0` is an argument error (a positive concurrency is required).
+;;
 ;; Concurrency is bounded by a semaphore built from a capacity-`n` channel
 ;; pre-filled with `n` tokens: each spawned task first `(channel/recv sem)`
 ;; (acquire — yields/parks when the pool is full, which is what caps concurrency),
 ;; runs `(pool-f item)`, then releases its token on BOTH the success and error
 ;; paths (via try/catch — a throwing `f` must still release, or the pool
-;; deadlocks). Errors are re-raised so a failing item surfaces. `async/all`
-;; preserves spawn (i.e. input) order, so results line up with `items`.
+;; deadlocks). Owned fan-out: `__owned-all` awaits the workers in INPUT order and,
+;; on the first failure, CANCELS and reaps every unfinished worker (parked on the
+;; semaphore or mid-`f`) before re-raising — unlike the observational `async/all`.
 (defmacro async/pool-map (f items n)
   `(let ((pool-f# ,f)
          (pool-items# ,items)
-         (pool-sem# (channel/new ,n)))
-     ;; Pre-fill the semaphore with n tokens (the available concurrency slots).
-     (for-range (i# 0 ,n) (channel/send pool-sem# #t))
-     (async/all
-       (map (fn (item#)
-              (async/spawn
-                (fn ()
-                  (channel/recv pool-sem#)            ; acquire a slot (parks if full)
-                  (let ((result# (try {:ok (pool-f# item#)}
-                                      (catch e# {:err e#}))))
-                    (channel/send pool-sem# #t)        ; release on BOTH paths
-                    (if (contains? result# :err)
-                      (throw (:err result#))           ; re-raise so failures surface
-                      (:ok result#))))))
-            pool-items#))))
+         (pool-n# ,n))
+     (if (<= pool-n# 0)
+         (error "async/pool-map: concurrency must be a positive integer")
+         (let ((pool-sem# (channel/new pool-n#)))
+           ;; Pre-fill the semaphore with n tokens (the available concurrency slots).
+           (__prefill-sem pool-sem# pool-n#)
+           ;; Per-item worker: acquire a slot (parks if the pool is full — this is
+           ;; what caps concurrency), run `f`, release on BOTH the success and error
+           ;; paths, and re-raise a failure so __owned-all's fail-fast cleanup fires.
+           (let ((pool-worker#
+                   (fn (item#)
+                     (channel/recv pool-sem#)             ; acquire a slot (parks if full)
+                     (let ((result# (try {:ok (pool-f# item#)}
+                                         (catch e# {:err e#}))))
+                       (channel/send pool-sem# #t)         ; release on BOTH paths
+                       (if (contains? result# :err)
+                         (throw (:err result#))            ; re-raise so failures surface
+                         (:ok result#))))))
+             (__owned-all (__spawn-apply pool-worker# pool-items#)))))))
 
 ;; __fanout-tagged: the single bounded-concurrency fan-out engine shared by `parallel`
 ;; and `pipeline`. Applies worker `wf` to each item with at most `n` tasks running at
@@ -729,23 +806,67 @@ pub const PRELUDE: &str = r#"
      (fn () ,@body)))
 
 ;; async/spawn-all: spawn a list of zero-arg thunks as concurrent tasks and await
-;; them all, returning results in INPUT order. The ergonomic form of the very common
-;; `(async/all (map (fn (th) (async/spawn th)) thunks))`. Unbounded — every thunk gets
-;; its own task at once; use `async/pool-map` to cap how many run concurrently.
+;; them all, returning results in INPUT order. Unbounded — every thunk gets its own
+;; task at once; use `async/pool-map` to cap how many run concurrently. OWNED: the
+;; first child failure/cancellation CANCELS and reaps the still-running siblings
+;; before propagating (fail-fast), unlike the observational `async/all`. Empty
+;; input → empty list.
 ;;
 ;;   (async/spawn-all (list (fn () (http/get a)) (fn () (http/get b))))  ; both at once
 (defmacro async/spawn-all (thunks)
-  `(async/all (map (fn (thunk#) (async/spawn thunk#)) ,thunks)))
+  `(__owned-all (__spawn-thunks ,thunks)))
 
 ;; async/map: concurrent map — apply `f` to each item in its OWN task, results in
-;; INPUT order. The unbounded sibling of `async/pool-map` (no concurrency cap).
+;; INPUT order. The unbounded sibling of `async/pool-map` (no concurrency cap) and
+;; OWNED: same fail-fast cancel-and-reap of the outstanding children as spawn-all.
 ;;
 ;;   (async/map fetch urls)            ; fetch every url concurrently
 ;;   (async/map (fn (q) (llm/complete q)) prompts)
 (defmacro async/map (f items)
-  `(let ((amap-f# ,f))
-     (async/all
-       (map (fn (item#) (async/spawn (fn () (amap-f# item#)))) ,items))))
+  `(__owned-all (__spawn-apply ,f ,items)))
+
+;; async/race-owned: run a list of zero-arg thunks concurrently and settle on the
+;; FIRST to finish, returning its value (or re-raising its error). OWNED: every
+;; losing child is CANCELLED and reaped before returning — the fail-fast dual of
+;; the observational `async/race` (which leaves losers running). Requires ≥1 thunk.
+;;
+;;   (async/race-owned (list (fn () (http/get mirror-a)) (fn () (http/get mirror-b))))
+(define (async/race-owned thunks)
+  (if (null? thunks)
+      (error "async/race-owned: requires at least one thunk")
+      (let ((children (__spawn-thunks thunks)))
+        ;; `async/race` settles on the FIRST child (value or error); either way we
+        ;; then CANCEL and reap every child, so losers are stopped before their
+        ;; side effects (the winner cancel is a no-op — it already settled).
+        (try (let ((winner (async/race children)))
+               (__cancel-all children)
+               winner)
+             (catch e
+               (__cancel-all children)
+               (throw e))))))
+
+;; async/with-timeout: run one owned child (`thunk`) with a deadline of `ms`
+;; milliseconds. If the child settles first, its outcome is preserved (value
+;; returned, error re-raised). If the deadline wins, the child is CANCELLED and
+;; reaped, then a structured `{:type :timeout}` condition is raised.
+;;
+;;   (async/with-timeout 30000 (fn () (llm/complete prompt)))
+(define (async/with-timeout ms thunk)
+  (let ((child (async/spawn thunk))
+        ;; A deadline task resolving to a distinct sentinel; racing it against the
+        ;; child tells the two apart without relying on `async/timeout` (which
+        ;; can't distinguish a timeout from a child rejection from its catch).
+        (timer (async/spawn (fn () (async/sleep ms) :__with-timeout-elapsed))))
+    (let ((outcome (try {:v (async/race (list child timer))}
+                        (catch e {:e e}))))       ; child errored before the deadline
+      ;; Owned cleanup: cancel BOTH — the child on a timeout, the timer on settle.
+      (async/cancel child)
+      (async/cancel timer)
+      (cond
+        ((contains? outcome :e) (throw (:e outcome)))          ; preserve child error
+        ((eq? (:v outcome) :__with-timeout-elapsed)
+         (throw {:type :timeout :message (str "operation exceeded " ms " ms")}))
+        (else (:v outcome))))))                                 ; child value
 
 ;; ── Non-blocking multi-round agent loop (issue #61 §3a, ADR #68) ──────────────
 ;; In an async scheduler task, drive the agent conversation from bytecode: each

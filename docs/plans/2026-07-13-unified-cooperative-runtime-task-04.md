@@ -552,6 +552,49 @@ cargo test -p sema-lang --test vm_async_test -- pool_map
 Expected: all owned-operation cases pass and active-task high-water assertions
 match the requested bound.
 
+> **Progress (2026-07-15, owned-combinator slice — DONE through `eval_str_via_runtime`):**
+> The five thunk-taking combinators are wired through the unified runtime with
+> un-ignored gates in `sema-eval` `mod runtime_eval_tests` (14 new, all green):
+> - `async/spawn-all thunks` — input-order values; empty → `()`; a failing child
+>   CANCELS the still-running sibling before its side effect
+>   (`runtime_owned_spawn_all_failure_cancels_sibling`, flag stays 0 — the OWNED
+>   dual of the observational `runtime_async_all_failure_does_not_cancel_sibling`).
+> - `async/map f items` — one owned child per item, input-order, same fail-fast.
+> - `async/pool-map f items n` — at most `n` workers active (shared max-counter
+>   proves exactly 2 for n=2/6 items), input-order, `n <= 0` is an arg error,
+>   fail-fast cancels the pending sibling.
+> - `async/race-owned thunks` — ≥1 required; first settlement wins; losers are
+>   cancelled before their side effects; a failing winner re-raises.
+> - `async/with-timeout ms thunk` — deadline cancels the slow child (structured
+>   `:timeout`); a fast child's value/error is preserved.
+>
+> Ownership is realized by COMPOSITION over the observational combinators plus an
+> explicit cancel-and-reap, NOT a full Rust `runtime/scope.rs` state machine:
+> `__owned-all` = `(try (async/all children) (catch e (__cancel-all children)
+> (throw e)))`; race-owned/with-timeout wrap `async/race` the same way. This
+> keeps the combinators working on BOTH the top-level scheduler and the runtime
+> (pool_map_test + vm_async_test unchanged). Children are spawned at bytecode
+> level (`__spawn-thunks`/`__spawn-apply`), never `(map async/spawn …)` — that
+> yields "async yield outside of scheduler context". Full zero-leak reaping,
+> simultaneous-failure sequencing, and quarantine transfer (Task 4's Rust scope
+> machine) remain a later slice.
+>
+> Two runtime/dispatch bugs blocked this and were fixed (`crates/sema-vm/src/vm.rs`,
+> `crates/sema-eval/src/eval.rs`):
+> 1. `collect_native_names` classified prelude functions (VM closures *wrapped* in
+>    a `NativeFn`) as "known natives", so the compiler emitted a native-call that
+>    ran them through the wrapper's synchronous nested path — suspending the
+>    quantum and breaking any spawn/await/channel yield inside. Now excludes VM
+>    closures so they dispatch in-VM.
+> 2. `run_inner` captured `base_functions` from the *current* `self.functions` at
+>    entry. When a quantum yielded mid-call (e.g. `channel/send` inside a prelude
+>    helper), the next quantum adopted the callee's table as the main's, so a
+>    later `MakeClosure` indexed a too-short table (out-of-bounds). Added a stable
+>    `VM::base_functions` field set at construction. Also snapshot a spawned
+>    closure's open upvalues against the (parked) spawning VM in `spawn_detached`
+>    (`close_closure_upvalues_with_owner`) — the native-call guard is gone by the
+>    time the runtime services the Spawn yield.
+
 ## Task 6: Implement origin-root `async/run`
 
 **Files:** runtime task/scope files, `async_ops.rs`, `async_contract_test.rs`

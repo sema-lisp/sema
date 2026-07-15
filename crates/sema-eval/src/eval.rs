@@ -34,9 +34,22 @@ pub fn create_module_env(env: &Env) -> Env {
 /// Collect the names of all native functions in an environment.
 /// Used to tell the bytecode compiler which globals can use CallNative.
 fn collect_native_names(env: &Env) -> HashSet<Spur> {
+    // A "known native" tells the compiler it may emit a direct native-call for
+    // that global. Prelude functions are VM closures *wrapped* in a `NativeFn`
+    // (a `VmClosurePayload`), so `is_native_fn()` is true for them too — but they
+    // must be CALLED IN-VM (as a bytecode frame), not through the `NativeFn`
+    // wrapper: the wrapper's synchronous nested-run path suspends the runtime
+    // quantum and turns any `async/spawn`/`await`/channel yield inside the
+    // closure into "async yield outside of scheduler context". Exclude VM
+    // closures so a call to a prelude function (e.g. the owned-concurrency
+    // helpers `__spawn-thunks`/`__owned-all`) dispatches through the ordinary
+    // VM-closure path, keeping its yields on the scheduler.
     env.all_names()
         .into_iter()
-        .filter(|&spur| env.get(spur).is_some_and(|v| v.is_native_fn()))
+        .filter(|&spur| {
+            env.get(spur)
+                .is_some_and(|v| v.is_native_fn() && sema_vm::extract_vm_closure(&v).is_none())
+        })
         .collect()
 }
 
@@ -2564,5 +2577,261 @@ mod runtime_eval_tests {
             "cancellation must be observed at the next cooperative boundary, \
              not after the full 100s sleep (took {elapsed:?})",
         );
+    }
+
+    // ── OWNED CONCURRENCY (Task 04) ───────────────────────────────────
+    // Thunk-taking combinators OWN the tasks they create: on a fail-fast
+    // settlement they CANCEL and reap every unfinished child before propagating.
+    // Each fail-fast gate PROVES ownership by asserting a slow sibling/loser did
+    // NOT run its post-sleep side effect (`set!`) — the exact opposite of the
+    // observational `async/all`/`race`/`timeout` gates above, where the supplied
+    // sibling always completes.
+
+    // async/spawn-all GATE 1 — happy path: values in INPUT order.
+    #[test]
+    fn runtime_owned_spawn_all_returns_input_order() {
+        let interp = Interpreter::new();
+        let result = interp
+            .eval_str_via_runtime("(async/spawn-all (list (fn () 1) (fn () 2) (fn () 3)))")
+            .expect("spawn-all returns input-order values");
+        assert_eq!(result, lit("(list 1 2 3)"));
+    }
+
+    // async/spawn-all GATE 1b — empty input → empty list.
+    #[test]
+    fn runtime_owned_spawn_all_empty_is_empty_list() {
+        let interp = Interpreter::new();
+        let result = interp
+            .eval_str_via_runtime("(async/spawn-all (list))")
+            .expect("spawn-all of empty input");
+        assert_eq!(result, Value::list(vec![]));
+    }
+
+    // async/spawn-all GATE 2 — fail-fast OWNERSHIP: one child errors immediately;
+    // the slow sibling is CANCELLED before it can run its post-sleep `set!` side
+    // effect. `flag` stays 0 even after we wait past the sibling's sleep, proving
+    // the sibling was reaped (contrast `runtime_async_all_failure_does_not_cancel_sibling`).
+    #[test]
+    fn runtime_owned_spawn_all_failure_cancels_sibling() {
+        let interp = Interpreter::new();
+        let result = interp
+            .eval_str_via_runtime(
+                "(begin \
+                   (define flag 0) \
+                   (define outcome \
+                     (try (async/spawn-all \
+                            (list (fn () (async/sleep 60) (set! flag 77) 1) \
+                                  (fn () (error \"boom\")))) \
+                          (catch e :caught))) \
+                   (async/sleep 200) \
+                   (list outcome flag))",
+            )
+            .expect("failure cancels the owned sibling");
+        assert_eq!(
+            result,
+            lit("(list :caught 0)"),
+            "the slow sibling must be cancelled before its side effect (flag stays 0)",
+        );
+    }
+
+    // async/map GATE 1 — happy path: one owned child per item, input-order results.
+    #[test]
+    fn runtime_owned_map_returns_input_order() {
+        let interp = Interpreter::new();
+        let result = interp
+            .eval_str_via_runtime("(async/map (fn (x) (* x 10)) (list 1 2 3))")
+            .expect("async/map returns input-order results");
+        assert_eq!(result, lit("(list 10 20 30)"));
+    }
+
+    // async/map GATE 2 — fail-fast OWNERSHIP: a failing item cancels the slow one.
+    #[test]
+    fn runtime_owned_map_failure_cancels_sibling() {
+        let interp = Interpreter::new();
+        let result = interp
+            .eval_str_via_runtime(
+                "(begin \
+                   (define flag 0) \
+                   (define outcome \
+                     (try (async/map \
+                            (fn (x) (if (= x 2) (error \"boom\") \
+                                        (begin (async/sleep 60) (set! flag x) x))) \
+                            (list 1 2)) \
+                          (catch e :caught))) \
+                   (async/sleep 200) \
+                   (list outcome flag))",
+            )
+            .expect("a failing item cancels the owned sibling");
+        assert_eq!(result, lit("(list :caught 0)"));
+    }
+
+    // async/pool-map GATE 1 — bounded concurrency: at most `n` calls to `f` are
+    // active at once. A shared max-observed counter over 6 items with n=2 must
+    // top out at exactly 2, and results stay in INPUT order.
+    #[test]
+    fn runtime_owned_pool_map_bounds_concurrency_and_orders() {
+        let interp = Interpreter::new();
+        let result = interp
+            .eval_str_via_runtime(
+                "(begin \
+                   (define active 0) \
+                   (define maxseen 0) \
+                   (define (work x) \
+                     (set! active (+ active 1)) \
+                     (set! maxseen (max maxseen active)) \
+                     (async/sleep 15) \
+                     (set! active (- active 1)) \
+                     (* x 10)) \
+                   (define result (async/pool-map work (list 1 2 3 4 5 6) 2)) \
+                   (list result maxseen))",
+            )
+            .expect("pool-map bounds concurrency and preserves order");
+        assert_eq!(
+            result,
+            lit("(list (list 10 20 30 40 50 60) 2)"),
+            "results in input order; at most 2 workers active at once",
+        );
+    }
+
+    // async/pool-map GATE 2 — n <= 0 is an argument error (catchable condition).
+    #[test]
+    fn runtime_owned_pool_map_rejects_nonpositive_n() {
+        let interp = Interpreter::new();
+        assert_eq!(
+            interp
+                .eval_str_via_runtime(
+                    "(try (async/pool-map (fn (x) x) (list 1 2) 0) (catch e :bad-n))",
+                )
+                .expect("zero concurrency is a condition, not a panic"),
+            Value::keyword("bad-n"),
+        );
+        assert_eq!(
+            interp
+                .eval_str_via_runtime(
+                    "(try (async/pool-map (fn (x) x) (list 1 2) -3) (catch e :bad-n))",
+                )
+                .expect("negative concurrency is a condition, not a panic"),
+            Value::keyword("bad-n"),
+        );
+    }
+
+    // async/pool-map GATE 3 — fail-fast OWNERSHIP under a bound: a failing item
+    // cancels a not-yet-started (parked-on-semaphore) sibling.
+    #[test]
+    fn runtime_owned_pool_map_failure_cancels_pending() {
+        let interp = Interpreter::new();
+        let result = interp
+            .eval_str_via_runtime(
+                "(begin \
+                   (define flag 0) \
+                   (define (work x) \
+                     (if (= x 1) (begin (async/sleep 5) (error \"boom\")) \
+                         (begin (async/sleep 60) (set! flag x) x))) \
+                   (define outcome \
+                     (try (async/pool-map work (list 1 2) 1) (catch e :caught))) \
+                   (async/sleep 200) \
+                   (list outcome flag))",
+            )
+            .expect("a failing worker cancels the pending owned sibling");
+        assert_eq!(result, lit("(list :caught 0)"));
+    }
+
+    // async/race-owned GATE 1 — first settlement wins AND the loser is CANCELLED
+    // (its post-sleep side effect never runs), contrast the observational
+    // `runtime_async_race_returns_fast_and_loser_continues` where the loser does.
+    #[test]
+    fn runtime_owned_race_returns_winner_and_cancels_loser() {
+        let interp = Interpreter::new();
+        let result = interp
+            .eval_str_via_runtime(
+                "(begin \
+                   (define flag 0) \
+                   (define winner \
+                     (async/race-owned \
+                       (list (fn () 10) \
+                             (fn () (async/sleep 60) (set! flag 99) 20)))) \
+                   (async/sleep 200) \
+                   (list winner flag))",
+            )
+            .expect("race-owned returns the fast winner and cancels the loser");
+        assert_eq!(
+            result,
+            lit("(list 10 0)"),
+            "winner is 10; the slow loser is cancelled before its side effect",
+        );
+    }
+
+    // async/race-owned GATE 2 — empty input is an argument error.
+    #[test]
+    fn runtime_owned_race_rejects_empty() {
+        let interp = Interpreter::new();
+        assert_eq!(
+            interp
+                .eval_str_via_runtime("(try (async/race-owned (list)) (catch e :empty))",)
+                .expect("empty race is a condition, not a panic"),
+            Value::keyword("empty"),
+        );
+    }
+
+    // async/race-owned GATE 3 — the first settlement being an error re-raises it.
+    #[test]
+    fn runtime_owned_race_winner_error_propagates() {
+        let interp = Interpreter::new();
+        let result = interp
+            .eval_str_via_runtime(
+                "(try (async/race-owned (list (fn () (error \"boom\")) \
+                                              (fn () (async/sleep 100) 2))) \
+                      (catch e :caught))",
+            )
+            .expect("a failing winner re-raises");
+        assert_eq!(result, Value::keyword("caught"));
+    }
+
+    // async/with-timeout GATE 1 — the deadline wins: the slow child is CANCELLED
+    // (side effect never runs) and a structured `:timeout` condition is raised.
+    #[test]
+    fn runtime_owned_with_timeout_cancels_slow_child() {
+        let interp = Interpreter::new();
+        let result = interp
+            .eval_str_via_runtime(
+                "(begin \
+                   (define flag 0) \
+                   (define outcome \
+                     (try (async/with-timeout 20 \
+                            (fn () (async/sleep 200) (set! flag 5) :done)) \
+                          (catch e (:type e)))) \
+                   (async/sleep 300) \
+                   (list outcome flag))",
+            )
+            .expect("with-timeout cancels the slow child on deadline");
+        assert_eq!(
+            result,
+            lit("(list :timeout 0)"),
+            "deadline raises :timeout and the child is cancelled before its side effect",
+        );
+    }
+
+    // async/with-timeout GATE 2 — a fast child settles first: its value is preserved.
+    #[test]
+    fn runtime_owned_with_timeout_fast_child_returns_value() {
+        let interp = Interpreter::new();
+        let result = interp
+            .eval_str_via_runtime("(async/with-timeout 10000 (fn () (async/sleep 1) 42))")
+            .expect("a child that settles before the deadline preserves its value");
+        assert_eq!(result, Value::int(42));
+    }
+
+    // async/with-timeout GATE 3 — a child that errors before the deadline has its
+    // failure preserved (re-raised), not masked by the timeout.
+    #[test]
+    fn runtime_owned_with_timeout_child_error_preserved() {
+        let interp = Interpreter::new();
+        let result = interp
+            .eval_str_via_runtime(
+                "(try (async/with-timeout 10000 (fn () (error \"boom\"))) \
+                      (catch e :caught))",
+            )
+            .expect("a fast child error is preserved");
+        assert_eq!(result, Value::keyword("caught"));
     }
 }

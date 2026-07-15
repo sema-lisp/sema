@@ -62,7 +62,17 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use sema_core::{check_arity, Caps, Env, NativeFn, Sandbox, SemaError, ToolDefinition, Value};
+use sema_core::cycle::GcEdge;
+use sema_core::runtime::{
+    downcast_send_payload, CancelDisposition, CancelHook, CancelHookError, CompletionDecoder,
+    CompletionKind, DecodedCompletion, ExternalFailure, InterruptibleResource, NativeCallContext,
+    NativeContinuation, NativeOutcome, NativeResult, NativeSuspend, PreparedExternalOperation,
+    ResumeInput, SendPayload, Trace, WaitKind,
+};
+use sema_core::{
+    check_arity, in_runtime_quantum, set_pending_native_outcome, set_yield_signal, Caps, Env,
+    NativeFn, Sandbox, SemaError, ToolDefinition, Value, YieldReason,
+};
 use tokio::sync::oneshot;
 
 use crate::client::{McpClient, McpClientConfig, McpHttpConfig};
@@ -1201,6 +1211,29 @@ fn call_tool(
         _ => {}
     }
 
+    // Unified-runtime path: a spawned task runs in a "runtime quantum", not the
+    // legacy cooperative scheduler. Route the blocking JSON-RPC round trip
+    // through the runtime's thread-pool executor as an external wait (the same
+    // `NativeOutcome::Suspend` mechanism `sleep` uses) so two `mcp/call`s to
+    // DIFFERENT connections overlap on separate workers instead of serializing
+    // on the VM thread. Checked before the legacy `in_async_context` path.
+    if in_runtime_quantum() {
+        let interactive_auth = entry.meta.interactive_auth;
+        let browser_allowed = browser_open_allowed();
+        let outcome = mcp_call_runtime_outcome(
+            entry,
+            key,
+            tool_name.to_string(),
+            arguments_json,
+            Box::new(materialize),
+            interactive_auth,
+            browser_allowed,
+        )?;
+        set_pending_native_outcome(outcome);
+        set_yield_signal(YieldReason::NativeYield);
+        return Ok(Value::nil());
+    }
+
     if sema_core::in_async_context() {
         return call_tool_offload(
             entry,
@@ -1270,6 +1303,338 @@ fn call_tool_offload(
     let handle = checkout_offload(entry, start, finish)?;
     sema_core::set_yield_signal(sema_core::YieldReason::AwaitIo(handle));
     Ok(Value::nil())
+}
+
+// ── `mcp/call` unified-runtime (in_runtime_quantum) path ────────────────────
+//
+// Under the unified async runtime a spawned task runs in a "runtime quantum",
+// driven by the runtime's own thread-pool executor, rather than the legacy
+// cooperative scheduler + `sema-io` pool. The blocking JSON-RPC round trip is
+// submitted to that executor as a `PreparedExternalOperation` (an external
+// wait) and the parked frame resumes when the worker completes — mirroring the
+// `sleep` template in `sema-stdlib/src/system.rs`. Calls to DIFFERENT
+// connections overlap on separate workers; calls to the SAME connection
+// serialize, because the connection is checked out on the VM thread before the
+// `Send` job is submitted (the job OWNS the `McpConnection` for its lifetime)
+// and a second call that finds the slot `CheckedOut` parks on a short executor
+// "poll" wait and retries its checkout on resume.
+
+/// Completion tags for the two runtime external ops (real call vs. queue poll).
+/// A tag only needs to be consistent between issue and prepared op; collisions
+/// with other external ops are harmless (it is not a uniqueness key).
+const MCP_CALL_COMPLETION_KIND: u64 = 0x6d63_7031; // "mcp1"
+const MCP_POLL_COMPLETION_KIND: u64 = 0x6d63_7032; // "mcp2"
+/// How long a queued call waits on the executor before re-attempting its
+/// checkout when the connection is busy with a sibling's in-flight call. Short
+/// enough to keep the per-connection queue responsive; the wait runs OFF the VM
+/// thread so it never stalls sibling tasks on other connections.
+const MCP_QUEUE_POLL_MS: u64 = 2;
+
+/// Turns the raw JSON-RPC result into the native's return value. **Must not
+/// capture a Sema `Value`** — both call sites (`mcp/call` and the
+/// `mcp/tools->sema` handlers) close over only plain data, so the decoder /
+/// acquire continuation that hold one can report a complete (empty) GC trace.
+type Materialize = Box<dyn FnOnce(serde_json::Value) -> Result<Value, String>>;
+
+/// The `Send` payload the blocking `mcp/call` job hands back to the VM thread:
+/// the connection (so it can be checked back in) plus the raw JSON-RPC result.
+/// Only `Send` data — `McpConnection` is `Send` (see
+/// `_assert_mcp_connection_is_send`) and `serde_json::Value`/`String` are plain.
+struct McpCallPayload {
+    conn: McpConnection,
+    result: Result<serde_json::Value, String>,
+}
+
+/// Tombstones a connection whose in-flight `mcp/call` is cancelled mid-flight:
+/// the blocking job keeps running on its worker and its eventual result is
+/// discarded (a late completion), so the `McpConnection` it owns drops
+/// off-thread and the slot must never return to `Available`. The wait runtime
+/// invokes `cancel`/`reap` on the VM thread, so holding an `Rc<ConnEntry>` is
+/// sound; a checked-out slot owns no connection, so `trace` is trivially
+/// complete.
+struct McpCallCancelHook {
+    entry: Rc<ConnEntry>,
+}
+
+impl Trace for McpCallCancelHook {
+    fn trace(&self, _sink: &mut dyn FnMut(GcEdge<'_>)) -> bool {
+        true
+    }
+}
+
+impl CancelHook for McpCallCancelHook {
+    fn cancel(&mut self) -> Result<CancelDisposition, CancelHookError> {
+        tombstone_slot(&self.entry, "cancelled mid-call");
+        Ok(CancelDisposition::Reaped)
+    }
+    fn reap(&mut self) -> Result<CancelDisposition, CancelHookError> {
+        Ok(CancelDisposition::Reaped)
+    }
+}
+
+/// Cancel hook for a QUEUED call's poll wait: cancelling a task that never held
+/// the checkout leaves the connection untouched (a documented no-op), so a
+/// sibling holding or queued on the slot is unaffected.
+struct McpNoopCancelHook;
+
+impl Trace for McpNoopCancelHook {
+    fn trace(&self, _sink: &mut dyn FnMut(GcEdge<'_>)) -> bool {
+        true
+    }
+}
+
+impl CancelHook for McpNoopCancelHook {
+    fn cancel(&mut self) -> Result<CancelDisposition, CancelHookError> {
+        Ok(CancelDisposition::Reaped)
+    }
+    fn reap(&mut self) -> Result<CancelDisposition, CancelHookError> {
+        Ok(CancelDisposition::Reaped)
+    }
+}
+
+/// Decodes the worker's completion for a real `mcp/call` on the VM thread:
+/// checks the connection back in, records the cassette, and materializes the
+/// result. A worker panic / undeliverable payload tombstones the slot (the
+/// connection is lost) and surfaces as an evaluation error.
+struct McpCallDecoder {
+    entry: Rc<ConnEntry>,
+    cassette_key: String,
+    materialize: Materialize,
+}
+
+impl Trace for McpCallDecoder {
+    fn trace(&self, _sink: &mut dyn FnMut(GcEdge<'_>)) -> bool {
+        // `entry` (a checked-out slot) owns no connection and `materialize`
+        // captures no `Value` (see [`Materialize`]) — nothing to trace.
+        true
+    }
+}
+
+impl CompletionDecoder for McpCallDecoder {
+    fn decode(
+        self: Box<Self>,
+        _context: &mut NativeCallContext<'_>,
+        result: Result<SendPayload, ExternalFailure>,
+    ) -> DecodedCompletion {
+        let McpCallDecoder {
+            entry,
+            cassette_key,
+            materialize,
+        } = *self;
+        let payload = match result {
+            Ok(payload) => payload,
+            Err(failure) => {
+                // Worker panic (or an undeliverable payload): the connection
+                // dropped off-thread — tombstone so a later use fails cleanly.
+                tombstone_slot(&entry, "mcp/call worker failed");
+                return Err(SemaError::eval(format!("mcp/call: {}", failure.message())));
+            }
+        };
+        let McpCallPayload { conn, result } =
+            match downcast_send_payload::<McpCallPayload>(payload, "mcp/call") {
+                Ok(payload) => payload,
+                Err(failure) => {
+                    tombstone_slot(&entry, "mcp/call payload decode failed");
+                    return Err(SemaError::eval(format!("mcp/call: {}", failure.message())));
+                }
+            };
+        checkin(&entry, conn);
+        let raw = result.map_err(|e| SemaError::eval(format!("mcp/call: {e}")))?;
+        sema_core::mcp_cassette_record(&cassette_key, &raw);
+        materialize(raw).map_err(|e| SemaError::eval(format!("mcp/call: {e}")))
+    }
+}
+
+/// Nil decoder for the queue poll wait — the retry logic lives in the
+/// [`McpAcquireContinuation`]; the poll itself carries no result.
+struct McpPollDecoder;
+
+impl Trace for McpPollDecoder {
+    fn trace(&self, _sink: &mut dyn FnMut(GcEdge<'_>)) -> bool {
+        true
+    }
+}
+
+impl CompletionDecoder for McpPollDecoder {
+    fn decode(
+        self: Box<Self>,
+        _context: &mut NativeCallContext<'_>,
+        _result: Result<SendPayload, ExternalFailure>,
+    ) -> DecodedCompletion {
+        Ok(Value::nil())
+    }
+}
+
+/// Resumes the parked `mcp/call` frame once its worker completes: the decoder
+/// already produced the final value/error, so this just forwards it (or raises
+/// a cancellation at the call site, catchable by an enclosing try/catch).
+struct McpForwardContinuation;
+
+impl Trace for McpForwardContinuation {
+    fn trace(&self, _sink: &mut dyn FnMut(GcEdge<'_>)) -> bool {
+        true
+    }
+}
+
+impl NativeContinuation for McpForwardContinuation {
+    fn resume(
+        self: Box<Self>,
+        _context: &mut NativeCallContext<'_>,
+        input: ResumeInput,
+    ) -> NativeResult {
+        match input {
+            ResumeInput::Returned(value) => Ok(NativeOutcome::Return(value)),
+            ResumeInput::Failed(error) => Err(error),
+            ResumeInput::Cancelled(reason) => Err(SemaError::eval(format!(
+                "mcp/call was cancelled ({reason:?})"
+            ))),
+            ResumeInput::Runtime(_) => Err(SemaError::eval(
+                "mcp/call continuation received an unexpected runtime response",
+            )),
+        }
+    }
+}
+
+/// Resumes a QUEUED `mcp/call` after its poll wait elapses: re-attempt the
+/// checkout, either starting the real call now (slot freed) or re-arming
+/// another poll (still busy). A tombstoned slot surfaces its error here.
+struct McpAcquireContinuation {
+    entry: Rc<ConnEntry>,
+    cassette_key: String,
+    tool_name: String,
+    arguments_json: serde_json::Value,
+    materialize: Materialize,
+    interactive_auth: bool,
+    browser_allowed: bool,
+}
+
+impl Trace for McpAcquireContinuation {
+    fn trace(&self, _sink: &mut dyn FnMut(GcEdge<'_>)) -> bool {
+        // `entry` (busy slot) owns no connection; `arguments_json` is plain
+        // JSON; `materialize` captures no `Value` (see [`Materialize`]).
+        true
+    }
+}
+
+impl NativeContinuation for McpAcquireContinuation {
+    fn resume(
+        self: Box<Self>,
+        _context: &mut NativeCallContext<'_>,
+        input: ResumeInput,
+    ) -> NativeResult {
+        match input {
+            ResumeInput::Returned(_) => {
+                let McpAcquireContinuation {
+                    entry,
+                    cassette_key,
+                    tool_name,
+                    arguments_json,
+                    materialize,
+                    interactive_auth,
+                    browser_allowed,
+                } = *self;
+                mcp_call_runtime_outcome(
+                    entry,
+                    cassette_key,
+                    tool_name,
+                    arguments_json,
+                    materialize,
+                    interactive_auth,
+                    browser_allowed,
+                )
+            }
+            // A queued task cancelled before it ever acquired the checkout: the
+            // connection is untouched (its `McpNoopCancelHook` was a no-op).
+            ResumeInput::Cancelled(reason) => Err(SemaError::eval(format!(
+                "mcp/call was cancelled while queued ({reason:?})"
+            ))),
+            ResumeInput::Failed(error) => Err(error),
+            ResumeInput::Runtime(_) => Err(SemaError::eval(
+                "mcp/call queue continuation received an unexpected runtime response",
+            )),
+        }
+    }
+}
+
+/// Build the `NativeOutcome::Suspend` for one `mcp/call` under the unified
+/// runtime. Checks the connection out on the VM thread: if `Available`, arms
+/// the real blocking call as an external wait; if `CheckedOut` (a sibling holds
+/// it), arms a short poll wait that retries the checkout on resume; if
+/// `Tombstone`d, returns the tombstone error (no wait is armed).
+fn mcp_call_runtime_outcome(
+    entry: Rc<ConnEntry>,
+    cassette_key: String,
+    tool_name: String,
+    arguments_json: serde_json::Value,
+    materialize: Materialize,
+    interactive_auth: bool,
+    browser_allowed: bool,
+) -> NativeResult {
+    match try_checkout(&entry)? {
+        Some(conn) => {
+            let kind = CompletionKind::try_from_raw(MCP_CALL_COMPLETION_KIND)
+                .expect("mcp/call completion kind is nonzero");
+            let decoder = Box::new(McpCallDecoder {
+                entry: entry.clone(),
+                cassette_key,
+                materialize,
+            });
+            let resource =
+                InterruptibleResource::new("mcp/call", Box::new(McpCallCancelHook { entry }));
+            let prepared = PreparedExternalOperation::interruptible_blocking(
+                kind,
+                decoder,
+                resource,
+                move || {
+                    let mut conn = conn;
+                    let result = sema_io::io_block_on(call_tool_async(
+                        &mut conn,
+                        &tool_name,
+                        arguments_json,
+                        interactive_auth,
+                        OpenerSource::Resolved(browser_allowed),
+                    ));
+                    Ok(Box::new(McpCallPayload { conn, result }) as SendPayload)
+                },
+            );
+            Ok(NativeOutcome::Suspend(NativeSuspend {
+                wait: WaitKind::External(Box::new(prepared)),
+                continuation: Box::new(McpForwardContinuation),
+            }))
+        }
+        None => {
+            // Busy: a sibling holds this connection's checkout. Park on a short
+            // executor poll wait (off the VM thread) and retry the checkout when
+            // it resumes — serializing this connection's calls while leaving
+            // other connections free to run concurrently.
+            let kind = CompletionKind::try_from_raw(MCP_POLL_COMPLETION_KIND)
+                .expect("mcp/call poll completion kind is nonzero");
+            let resource =
+                InterruptibleResource::new("mcp/call-queue", Box::new(McpNoopCancelHook));
+            let prepared = PreparedExternalOperation::interruptible_blocking(
+                kind,
+                Box::new(McpPollDecoder),
+                resource,
+                move || {
+                    std::thread::sleep(std::time::Duration::from_millis(MCP_QUEUE_POLL_MS));
+                    Ok(Box::new(()) as SendPayload)
+                },
+            );
+            let continuation = McpAcquireContinuation {
+                entry,
+                cassette_key,
+                tool_name,
+                arguments_json,
+                materialize,
+                interactive_auth,
+                browser_allowed,
+            };
+            Ok(NativeOutcome::Suspend(NativeSuspend {
+                wait: WaitKind::External(Box::new(prepared)),
+                continuation: Box::new(continuation),
+            }))
+        }
+    }
 }
 
 // ── `mcp/tools` / `mcp/tools->sema`: shared listing entry point ────────────

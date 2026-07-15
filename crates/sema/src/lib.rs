@@ -204,6 +204,16 @@ impl Interpreter {
         self.inner.eval_str_in_global(input)
     }
 
+    /// Parse and evaluate a string through the unified async runtime (rather
+    /// than the legacy cooperative scheduler). Definitions and connections
+    /// persist across calls on the interpreter, exactly like [`eval_str`]. Used
+    /// by the runtime-path integration tests.
+    ///
+    /// [`eval_str`]: Self::eval_str
+    pub fn eval_str_via_runtime(&self, input: &str) -> EvalResult {
+        self.inner.eval_str_via_runtime(input)
+    }
+
     /// Register a native function that can be called from Sema code.
     ///
     /// # Example

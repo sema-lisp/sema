@@ -661,9 +661,36 @@ untouched. `runtime_conformance_test` (3) and `unified_runtime_watchdog_test` (1
 were already RED on this branch before this slice (verified by stash) and are not
 regressions.
 
-**mcp_async_test concurrency gap**: still open. `mcp/call` runs on the VM thread
-and `mcp_async_test` drives via the legacy `eval` path, so it does not yet
-exercise the executor. It becomes closable once (a) the eval flip routes MCP
-through the runtime and (b) `mcp/call` is migrated to an external wait
-(decomposition item 6) — the executor + inbox-wakeup foundation this slice lands
-is the prerequisite, now in place.
+**mcp_async_test concurrency gap**: CLOSED for the runtime path. `mcp/call` (and
+every `mcp/tools->sema` handler, which routes through the same `call_tool` core)
+now has an `in_runtime_quantum()` branch that submits its blocking JSON-RPC round
+trip to the runtime's thread-pool executor as a `PreparedExternalOperation`
+external wait (mirroring the `sleep` template), so two `async/spawn`ed `mcp/call`s
+overlap on separate workers instead of serializing on the VM thread.
+`crates/sema-mcp/src/builtins.rs`: `mcp_call_runtime_outcome` (+ `McpCallDecoder`
+/ `McpForwardContinuation` / `McpCallCancelHook`). `McpConnection` is already
+`Send` (asserted by `_assert_mcp_connection_is_send`), so the connection is
+checked out on the VM thread and moved into the `Send` job for its lifetime;
+the decoder checks it back in and records the cassette on the VM thread.
+
+- **Per-connection serialization**: preserved. A second call to the SAME
+  connection that finds the slot `CheckedOut` parks on a short executor "poll"
+  wait (`McpAcquireContinuation` + `McpNoopCancelHook`) and retries the checkout
+  on resume — different connections overlap, one connection's calls queue.
+- **Cancellation**: `McpCallCancelHook` tombstones the slot on cancel (the
+  in-flight worker's late completion is discarded, the connection drops
+  off-thread); a merely-queued call's poll wait cancels as a no-op, leaving the
+  slot untouched.
+- **Gate**: `crates/sema/tests/mcp_runtime_test.rs` —
+  `spawned_mcp_calls_overlap_through_runtime` (cross-connection overlap, the
+  acceptance gate) and `same_connection_mcp_calls_serialize_through_runtime`,
+  both driven through `eval_str_via_runtime` (added as a passthrough on
+  `sema::Interpreter`). Legacy `mcp_async_test` stays 8/8 (the `in_async_context`
+  path is untouched).
+
+**Remaining decomposition (Task 06)**: `mcp/tools` and `mcp/close` still take the
+synchronous `block_on` path under the runtime (they briefly block the VM thread,
+but do not corrupt state); migrating them to the same external-wait pattern is a
+Task 06 follow-up. The full cancellation/tombstone scenario is exercised by the
+legacy `mcp_async_test`; a runtime-driven `async/cancel`/`async/timeout` MCP test
+belongs with the Task 06 orchestration cancellation surface.

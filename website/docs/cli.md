@@ -300,7 +300,8 @@ sema fmt [OPTIONS] [FILES...]
 | `--diff` | Print diff of changes |
 | `--width <N>` | Max line width (default: `80`) |
 | `--indent <N>` | Indentation width (default: `2`) |
-| `--align` | Align consecutive similar forms |
+| `--align` | Column-align consecutive similar forms |
+| `--max-blank-lines <N>` | Max consecutive blank lines to keep (default: `1`) |
 | `--json` | Output result as JSON (useful for editor integrations) |
 
 ```bash

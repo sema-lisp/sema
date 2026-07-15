@@ -22,7 +22,7 @@ With no arguments, `sema fmt` formats all `.sema` files in the current directory
 | `--diff` | Print diff of formatting changes |
 | `--width <N>` | Max line width (default: `80`) |
 | `--indent <N>` | Indentation width for body forms (default: `2`) |
-| `--align` | Align consecutive similar forms (defines, cond clauses, let bindings) |
+| `--align` | Column-align consecutive similar forms (defines, let bindings, cond clauses, map values) |
 | `--max-blank-lines <N>` | Max consecutive blank lines to keep (default: `1`) |
 
 ### Examples
@@ -68,7 +68,7 @@ max-blank-lines = 1
 | --- | --- | --- | --- |
 | `width` | integer | `80` | Maximum line width |
 | `indent` | integer | `2` | Number of spaces for body indentation |
-| `align` | boolean | `false` | Enable decorative column alignment |
+| `align` | boolean | `false` | Column-align consecutive similar forms (defines, let bindings, cond clauses, map values) |
 | `max-blank-lines` | integer | `1` | Longest run of consecutive blank lines to preserve; longer runs are collapsed. `0` removes all blank lines |
 
 ### Precedence
@@ -150,13 +150,18 @@ The formatter recognizes Sema's special forms and applies context-appropriate in
   (+ x y z))
 ```
 
-**Clause forms** (`cond`, `case`, `match`) indent each clause:
+**Clause forms** (`cond`, `case`, `match`, `match*`) indent each clause. `case`/`match` keep their subject on the head line:
 
 ```scheme
 (cond
   ((= x 1) "one")
   ((= x 2) "two")
   (else "other"))
+
+(case status
+  (200 "ok")
+  (404 "missing")
+  (else "error"))
 ```
 
 **Threading macros** (`->`, `->>`, `as->`, `some->`) indent each step:
@@ -178,35 +183,65 @@ The formatter recognizes Sema's special forms and applies context-appropriate in
 
 ### Comment Preservation
 
-All comments are preserved in their original positions — inline, trailing, and standalone:
+All comments are preserved. A trailing comment stays on the line of the form it annotates; a standalone comment keeps its own line, above the form it documents:
 
 ```scheme
 ;; Module header comment
-(define x 42) ; inline comment
+(define x 42) ; stays on this line
 
-;; Between forms
+;; Documents the next form
 (define y 10)
+```
+
+### Bytevector Literals
+
+A multi-line `#u8(...)` literal keeps the row breaks you wrote (with spacing normalized), so a hand-arranged grid keeps its shape. A single-line literal that exceeds the width wraps at the width:
+
+```scheme
+;; Hand-arranged rows are kept
+#u8(1 2 3 4
+    5 6 7 8)
+
+;; A too-long single line wraps
+(define png-header
+  #u8(137 80 78 71 13 10 26 10 137 80 78 71 13 10 26 10 137 80 78 71 13 10 26 10
+      137 80))
 ```
 
 ### Decorative Alignment
 
 When `--align` is enabled (or `align = true` in `sema.toml`), the formatter column-aligns consecutive similar forms for visual clarity. This is opt-in because it can cause noisier git diffs.
 
-**Aligned defines:**
+**Defines** — consecutive one-liner defines (`define`, `def`, `defn`, `defun`, `defmacro`) align their values, and trailing comments share a column past the widest value:
 
 ```scheme
-(define x         1)
-(define longer-y  2)
-(define z         3)
+(define *rows*    24)
+(define *cols*    80)
+(define *cursor*  0)   ;; caret index
+(define *scroll*  0)   ;; lines scrolled
 ```
 
-**Aligned cond clauses:**
+**Map literals** — the values of a multi-line map align to the widest key:
 
 ```scheme
+(define default-keymap
+  {:mcp        "ctrl-o"
+   :resume     "ctrl-r"
+   :palette    "ctrl-k"
+   :interrupt  "ctrl-c"})
+```
+
+**Let bindings and cond/case clauses:**
+
+```scheme
+(let ((x       1)
+      (longer  2))
+  (+ x longer))
+
 (cond
   ((= x 1)    "one")
   ((= x 100)  "hundred")
   (else       "other"))
 ```
 
-Alignment groups are broken by blank lines, so you can control which forms get aligned together.
+Alignment is conservative: it applies only where a shared column fits the line width and there is a width difference worth aligning. A member that is too wide, contains comments, or spans multiple lines is formatted normally and splits the alignment run; blank lines also break a run, so you control which forms align together. Alignment never rewrites structure — a `[..]` binding pair keeps its brackets, and multi-line function bodies are never joined onto one line.

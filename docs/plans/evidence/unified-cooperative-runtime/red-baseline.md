@@ -182,3 +182,35 @@ edits). `cargo check --workspace --tests` exit 0.
    `common::eval` and the CLI `-e` path), which should also resolve the 4
    `vm_async_test` RED (scheduling/fairness/cancellation semantics owned by the
    runtime).
+
+## Task 03 Step 2 — eval flip RE-MEASURE post HOF-migration: MEASURED → REVERTED (2026-07-15)
+
+Re-ran the SAME flip (`eval_in_global`/`eval_str_in_global` → `run_exprs_via_runtime`
++ the `VM::execute` `suspend_runtime_quantum()` bridge) AFTER the
+map/filter/foldl/reduce/for-each/sort-by `NativeOutcome::Call` migration
+(commits `51e0356a`, `65721842`), to test whether that migration closed gap (A).
+
+### Result: the migration MOVED the gap, did not fully close it
+
+| Gap | Status | Suite | Root cause |
+| --- | --- | --- | --- |
+| (A) HOF-callback async | **CLOSED** | embedding_api_test **14/0** (`embedding_async_all_and_channels ... ok`) | `NativeOutcome::Call` ABI now yields the callback's `async` cooperatively |
+| (B) concurrent blocking I/O | **UNCHANGED (RED)** | mcp_async_test **5 passed / 3 failed** (`cross_connection_overlap_proves_no_serialization`, `scheduler_not_stalled_sibling_completes_before_slow_call`, `cancellation_tombstones_connection_and_interpreter_stays_healthy`) | NullExecutor sync-drive: `async/spawn`ed blocking `mcp/call`s don't overlap → needs real executor (Task 05/06) |
+| (C) module-imported HOF open-upvalue escape | **NEW (RED)** | integration_test **1051 passed / 4 failed** (`test_hof_dispatch_open_upvalue_shallow_write_back`, `test_hof_dispatch_open_upvalue_deep_nesting_no_panic`, `test_imported_hof_wrapper_set_write_back`, `test_imported_hof_transitive_closure_no_slot_clobber`) | `Eval error: captured variable's stack slot is not on this VM (a closure with open upvalues escaped its owning VM)`. Imported module's `for-each`-based HOF dispatch, driven through the runtime, runs the handler callback on a VM that doesn't own the handler's open-upvalue cell. Callback-site CORRECTNESS gap in the new ABI (was 1055/0 pre-migration) |
+
+Oracles/other suites under the flip: eval_test **1072/0**; vm_async_test **114/4**
+(same 4 pre-existing RED — `eval_str_compiled` still unflipped); llm_fake_test
+**29/0**, agent_async_test **7/0**, workflow_cookbook_test **6/0**,
+stream_async_test **10/0**, http_concurrent_test **3/0** — all green.
+
+### Post-revert state (exact green baseline)
+No code changed. integration_test **1055/0**, embedding_api_test **14/0**,
+mcp_async_test **8/0**, eval_test **1072/0**, vm_async_test 114/4 (documented RED).
+`cargo check --workspace --tests` exit 0; fmt + clippy clean.
+
+### Assessment
+The flip blocker is no longer a single category. Gap (A) is retired by the HOF
+migration. Two blockers remain: (B) the real executor / concurrent blocking I/O
+(Task 05/06), and (C) an open-upvalue-escape correctness bug in the
+module-imported HOF `NativeOutcome::Call` dispatch path under the runtime — a
+Task-04-adjacent callback-re-entry fix, independent of the executor.

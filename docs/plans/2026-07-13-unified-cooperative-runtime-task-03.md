@@ -993,6 +993,47 @@ occurrence and classification in evidence.
       Task 04 (callback re-entry ABI) and Task 05/06 (real executor for blocking
       leaf I/O + concurrent scheduling) land; the `*_via_runtime` entry points
       remain available for incremental validation._
+    - _Re-measure (2026-07-15, after the map/filter/foldl/reduce/for-each/sort-by
+      `NativeOutcome::Call` migration — commits 51e0356a, 65721842): SAME flip
+      re-applied (`eval_in_global`/`eval_str_in_global` → `run_exprs_via_runtime`
+      + the `VM::execute` quantum-suspend bridge), measured, REVERTED again. The
+      HOF-migration MOVED the gap, it did not fully close it:_
+        1. _GAP (A) HOF-callback async is now CLOSED. `embedding_api_test`
+           **14/0** — `embedding_async_all_and_channels` PASSES
+           (`(foldl + 0 (async/all (map (fn (x) (async (* x x))) …)))` now yields
+           cooperatively via the `NativeOutcome::Call` ABI). Verbatim:
+           `test embedding_async_all_and_channels ... ok`._
+        2. _GAP (B) concurrent external blocking I/O UNCHANGED — `mcp_async_test`
+           **5 passed / 3 failed** (`cross_connection_overlap_proves_no_serialization`,
+           `scheduler_not_stalled_sibling_completes_before_slow_call`,
+           `cancellation_tombstones_connection_and_interpreter_stays_healthy`).
+           Still the `NullExecutor` sync-drive path: `async/spawn`ed blocking
+           `mcp/call`s don't overlap. Needs the real executor (Task 05/06)._
+        3. _NEW GAP (C): the migrated HOF ABI, when the HOF lives in an IMPORTED
+           module and is driven through the runtime, escapes the callback's open
+           upvalue — `integration_test` **1051 passed / 4 failed**
+           (`test_hof_dispatch_open_upvalue_{shallow_write_back,deep_nesting_no_panic}`,
+           `test_imported_hof_{wrapper_set_write_back,transitive_closure_no_slot_clobber}`)
+           fail with `Eval error: captured variable's stack slot is not on this
+           VM (a closure with open upvalues escaped its owning VM)`. Fixture:
+           imported `registry` module whose `reg/emit` does `for-each` over
+           handler closures that `set!` a caller-frame local via an open upvalue.
+           Under the runtime, the module's `for-each` callback runs on a VM that
+           does not own the handler's upvalue cell → escape error. This is a
+           callback-site / continuation CORRECTNESS gap in the new ABI (the
+           `import` re-enter via `VM::execute` + runtime-driven HOF dispatch),
+           NOT the executor gap — it was 1055/0 in the pre-migration measurement._
+      _Other async suites all GREEN through the flip: vm_async_test 114/4 (the
+      SAME 4 pre-existing RED, `eval_str_compiled` still unflipped), llm_fake_test
+      29/0, agent_async_test 7/0, workflow_cookbook_test 6/0, stream_async_test
+      10/0, http_concurrent_test 3/0. eval_test 1072/0 held. DECISION: REVERTED to
+      exact green baseline (integration_test 1055/0, embedding_api_test 14/0,
+      mcp_async_test 8/0; no code changed, `cargo check --workspace --tests` exit
+      0, fmt+clippy clean). ASSESSMENT: the flip blocker is NO LONGER a single
+      category — it is now (B) the real executor/concurrent-blocking-I/O (Task
+      05/06) AND (C) an open-upvalue-escape correctness bug in the module-imported
+      HOF `NativeOutcome::Call` dispatch path under the runtime (a Task-04-adjacent
+      callback-re-entry fix). Gap (A) is retired._
 
 - [ ] **Step 3: Remove TLS scheduler ownership**
 

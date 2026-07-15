@@ -1418,3 +1418,28 @@ git commit -m "refactor(runtime): install interpreter-owned scheduler"
 - Debug stops the interpreter, not an arbitrary subset of roots.
 - The legacy scheduler owns no task or clock state.
 - Independent review and durable evidence are clean.
+
+---
+
+## Annotation (2026-07-15) — full-flip parity slice: family A + retry landed
+
+Closed the bulk of the `eval_str_compiled` full-flip parity gap on the runtime
+path. The 4 documented `vm_async` RED all resolve through the runtime; under a
+temporary full flip the regression measured **109/9 → 116/2**. Landed (KEPT on the
+runtime path, exercised by the PRIMARY `eval`/`eval_str` flip + gated by 8 new
+`runtime_eval_tests`):
+
+- **Family A (all 6):** spawner resumes ahead of a freshly-spawned child
+  (`spawn_detached`) so `async/pending?` / cancel+`async/cancelled?` observe a
+  not-yet-run child; `fire_timer` never fires while a task is Ready or a
+  settlement is pending (0 ms timeout lets ready work finish); a directly-passed
+  yielding native surfaces the lambda-wrap hint while a driveable `NativeYield`
+  (agent tools) is still driven; `async/run` is a cooperative `Sleep(0)` yield.
+- **Family B (retry):** prelude `retry` takes the cooperative `async/sleep` loop
+  under `(__runtime-quantum?)`, so a shorter-sleeping sibling wins the wake race.
+
+Two family-B tests remain RESIDUAL (`event_select` needs runtime `AwaitIo`
+support; `blocking_sleep_hook` needs a virtual/injectable clock), and the flip is
+DEFERRED because it regresses `agent_async_test` (7/0 → 3/4): native `agent/run`
+loop concurrency (Task 04, widened). Full detail + verbatim results in
+`docs/plans/evidence/unified-cooperative-runtime/red-baseline.md`.

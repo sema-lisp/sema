@@ -308,3 +308,25 @@ task intentionally includes reviewed deletions and generated files.
 - Generated docs, example index, WASM/JS, and embedded web assets are current.
 - Browser, shipped `.crate`, examples, smoke, lint, docs, and workspace gates pass.
 - Independent review and durable evidence are clean.
+
+---
+
+## Annotation (2026-07-15) — remaining work to delete the legacy scheduler
+
+The `eval_str_compiled` full flip (the last legacy-VM eval entry) is still
+DEFERRED; family A + `retry` parity are DONE (see task-03 annotation and
+`docs/plans/evidence/unified-cooperative-runtime/red-baseline.md`). To flip
+`eval_str_compiled` → `run_exprs_via_runtime`, then delete `init_scheduler` + the
+`SCHEDULER` TLS and re-baseline the 4 `vm_async` RED GREEN, THREE blockers remain:
+
+1. **Native agent-loop cooperative re-entry (Task 04, widened).** `run_tool_loop`
+   / `__agent-drive` must drive provider/tool rounds cooperatively under the
+   runtime so agents overlap and cancellation interrupts the loop
+   (`agent_async_test` is 7/0 on legacy, 3/4 under the flip).
+2. **Runtime `AwaitIo` support** for `event/select` / `io/read-key-timeout`
+   cooperative yielding (family-B `event_select`).
+3. **Injectable/virtual `RuntimeClock`** so `set_blocking_sleep_callback` advances
+   logical time deterministically (family-B `blocking_sleep_hook`).
+
+Once (1)–(3) land: route `run_exprs_on_vm` through `run_exprs_via_runtime`, delete
+`init_scheduler`/`SCHEDULER` TLS, and re-baseline the 4 `vm_async_test` RED GREEN.

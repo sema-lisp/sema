@@ -714,6 +714,18 @@ impl Runtime {
 
     fn fire_timer(&self) -> Result<bool, RuntimeFault> {
         let mut state = self.state.borrow_mut();
+        // Virtual-clock cooperative semantics: never fire a timer while any task
+        // is still runnable. A cooperative scheduler drains all ready work to a
+        // quiescent point before advancing the clock to the nearest deadline.
+        // This is what makes `(async/timeout 0 (async 42))` return 42 (the ready
+        // child settles the observed promise before the already-due 0ms deadline
+        // trips) and what lets a shorter-sleeping sibling run/complete before a
+        // longer sleeper's — or a select/retry backoff's — timer fires. Deferring
+        // here is bounded: the drive loop still makes progress via `visit_ready`,
+        // and once ready work quiesces this fires on the next turn.
+        if state.ready.root_count() > 0 || !state.pending.is_empty() {
+            return Ok(false);
+        }
         let now = state.clock.now();
         let Some(key) = state.timers.pop_due(now) else {
             return Ok(false);
@@ -2273,10 +2285,38 @@ impl Runtime {
                         cancellation.map(|request| request.reason),
                     ),
                 };
-                (
-                    ContinuationFrame::native(call.continuation),
-                    native.invoke_runtime(&eval_context, &mut native_context, &call.args),
-                )
+                // Dispatch the native with the runtime-quantum flag active so a
+                // callback native takes its cooperative path: a genuinely
+                // driveable native (e.g. an agent tool that offloads I/O) stashes
+                // a `NativeOutcome` and raises `NativeYield`, which we drive here;
+                // a *parking* native passed DIRECTLY as a HOF callback
+                // (`(map channel/recv …)`) leaves a channel/promise/sleep park
+                // yield that CANNOT suspend inside this Rust continuation, so it
+                // is converted into the lambda-wrap guidance — parity with the
+                // legacy `check_hof_yield`.
+                let prev_q = sema_core::in_runtime_quantum();
+                sema_core::set_runtime_quantum(true);
+                let native_result =
+                    native.invoke_runtime(&eval_context, &mut native_context, &call.args);
+                sema_core::set_runtime_quantum(prev_q);
+                let native_result = match sema_core::take_yield_signal() {
+                    Some(sema_core::YieldReason::NativeYield) => {
+                        sema_core::take_pending_native_outcome()
+                            .map(Ok)
+                            .unwrap_or(native_result)
+                    }
+                    Some(_park) => {
+                        sema_core::take_pending_native_outcome();
+                        Err(sema_core::SemaError::eval(
+                            "yielding native passed directly to a higher-order function — \
+                             wrap it in a lambda so the yield can suspend cleanly. \
+                             For example, `(map (fn (x) (channel/recv x)) ...)` instead of \
+                             `(map channel/recv ...)`.",
+                        ))
+                    }
+                    None => native_result,
+                };
+                (ContinuationFrame::native(call.continuation), native_result)
             } else {
                 (
                     ContinuationFrame::vm_native(call.continuation),
@@ -2384,7 +2424,7 @@ impl Runtime {
             return self.resume_running_vm(spawner, VmResume::Fail(error));
         }
 
-        let promise_value = {
+        let (root, child, promise_value) = {
             let mut state = self.state.borrow_mut();
             if state.task_ids.is_exhausted() {
                 drop(state);
@@ -2438,10 +2478,19 @@ impl Runtime {
                 },
             );
             state.spawned_promises.insert(child, promise);
-            state.ready.enqueue(root, child);
-            value
+            (root, child, value)
         };
-        self.resume_running_vm(spawner, VmResume::Value(promise_value))
+        // Cooperative-scheduling parity with the legacy scheduler: a freshly
+        // spawned task does NOT run until the spawner suspends at a genuine
+        // yield point (await / sleep / channel). Resume the spawner FIRST (it
+        // re-enters the ready queue ahead of the child) so a same-quantum
+        // observation of the child promise — `async/pending?`, `async/cancel`
+        // + `async/cancelled?` — sees it still Pending, exactly as the legacy
+        // scheduler did (it never ran the child before the top-level form
+        // returned). Only then enqueue the child, behind the spawner.
+        self.resume_running_vm(spawner, VmResume::Value(promise_value))?;
+        self.state.borrow_mut().ready.enqueue(root, child);
+        Ok(())
     }
 
     /// Request cancellation of the spawned task behind `promise` on behalf of a

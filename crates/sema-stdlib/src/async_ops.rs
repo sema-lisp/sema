@@ -215,6 +215,16 @@ fn register_promise_ops(env: &Env) {
     // async/run — run all pending tasks to completion
     register_fn_ctx(env, "async/run", |ctx, args| {
         check_arity!(args, "async/run", 0);
+        // Under the unified runtime there is no separate legacy scheduler to
+        // "run": every task is already driven fairly. Yield a cooperative
+        // `Sleep(0)` so the runtime drains the currently-ready siblings before
+        // resuming this frame (the timer only fires once ready work quiesces),
+        // preserving the async context across the boundary. The legacy path
+        // below drives the standalone scheduler instead.
+        if in_runtime_quantum() {
+            set_yield_signal(YieldReason::Sleep(0));
+            return Ok(Value::nil());
+        }
         if call_run_scheduler(ctx, None)? == SchedulerRunResult::DebugPaused {
             set_debug_coop_resume(SchedulerTarget::All, DebugCoopResume::Run);
             // No specific promise to await: park on the scheduler re-drive via a

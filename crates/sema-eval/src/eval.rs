@@ -293,13 +293,31 @@ impl Interpreter {
         loop {
             match handle.poll_result() {
                 RootPoll::Ready(settlement) => {
-                    return match &settlement.outcome {
+                    let result = match &settlement.outcome {
                         sema_core::runtime::TaskOutcome::Returned(value) => Ok(value.clone()),
                         sema_core::runtime::TaskOutcome::Failed(error) => Err(error.clone()),
                         sema_core::runtime::TaskOutcome::Cancelled(reason) => {
                             Err(SemaError::eval(format!("evaluation cancelled: {reason:?}")))
                         }
                     };
+                    // Drain any READY detached work before returning (legacy
+                    // "top-level (async …) drains the scheduler at exit"): a
+                    // cooperative child spawned by this program does not run until
+                    // its spawner suspends/returns, so at this point a fire-and-
+                    // forget `(async (println …))` is still Ready. Run all such
+                    // ready work to a quiescent point, but never block on a timer
+                    // or an external inbox — genuinely-parked detached tasks
+                    // persist to later evals, exactly as before the flip. Bounded:
+                    // stops as soon as the runtime stops making ready progress.
+                    while let DriveState::Progress {
+                        ready_remaining: true,
+                        ..
+                    } = runtime
+                        .drive(&budget)
+                        .map_err(|e| SemaError::eval(format!("runtime fault: {e:?}")))?
+                    {
+                    }
+                    return result;
                 }
                 RootPoll::Pending => {}
                 RootPoll::Aborted(fault) => {
@@ -3770,5 +3788,157 @@ mod runtime_eval_tests {
 
     fn common_list(items: &[Value]) -> Value {
         Value::list(items.to_vec())
+    }
+
+    // ── SPAWNED-TASK OBSERVATION PARITY (full-flip family A) ──────────────────
+    //
+    // These gate the cooperative-scheduling parity fixes that let a parent
+    // observe a JUST-spawned child synchronously through the unified runtime,
+    // matching the legacy scheduler. They run on `eval_str_via_runtime` so they
+    // hold regardless of whether `eval_str_compiled` is flipped onto the runtime.
+
+    // A freshly spawned task is Pending until the spawner suspends: the runtime
+    // resumes the spawner AHEAD of the child (`spawn_detached`), so a same-quantum
+    // `async/pending?` sees Pending — not a child the runtime eagerly ran first.
+    #[test]
+    fn runtime_freshly_spawned_task_is_pending() {
+        let interp = Interpreter::new();
+        let result = interp
+            .eval_str_via_runtime("(async/pending? (async (+ 1 2)))")
+            .expect("eval");
+        assert_eq!(result, Value::bool(true));
+    }
+
+    // Cancelling a channel-parked child BEFORE it runs settles it Cancelled (the
+    // deadlock detector must not misfire on a task with a pending cancellation),
+    // observable synchronously via `async/cancelled?`.
+    #[test]
+    fn runtime_cancel_pending_channel_task_classifies_cancelled() {
+        let interp = Interpreter::new();
+        let result = interp
+            .eval_str_via_runtime(
+                "(let ((ch (channel/new 1))) \
+                   (let ((p (async (channel/recv ch)))) \
+                     (async/cancel p) \
+                     (async/cancelled? p)))",
+            )
+            .expect("eval");
+        assert_eq!(result, Value::bool(true));
+    }
+
+    // Cancelled is neither resolved/rejected/pending — the predicates partition.
+    #[test]
+    fn runtime_cancelled_promise_classifies_correctly() {
+        let interp = Interpreter::new();
+        let result = interp
+            .eval_str_via_runtime(
+                "(let ((p (async (async/sleep 100)))) \
+                   (async/cancel p) \
+                   (list (async/cancelled? p) (async/rejected? p) \
+                         (async/resolved? p) (async/pending? p)))",
+            )
+            .expect("eval");
+        assert_eq!(
+            result,
+            common_list(&[
+                Value::bool(true),
+                Value::bool(false),
+                Value::bool(false),
+                Value::bool(false),
+            ])
+        );
+    }
+
+    // A yielding native (`channel/recv`) passed DIRECTLY as a HOF callback cannot
+    // suspend in the runtime's continuation loop — surface the lambda-wrap hint,
+    // not a bare "channel is empty".
+    #[test]
+    fn runtime_yielding_native_as_hof_callback_raises_lambda_wrap_hint() {
+        let interp = Interpreter::new();
+        let err = interp
+            .eval_str_via_runtime(
+                "(let ((ch (channel/new 1))) \
+                   (let ((producer (async (channel/send ch 1) (channel/close ch))) \
+                         (consumer (async (map channel/recv (list ch))))) \
+                     (await consumer)))",
+            )
+            .expect_err("directly-passed yielding native must error");
+        assert!(
+            err.to_string().contains("wrap it in a lambda"),
+            "expected lambda-wrap hint, got: {err}"
+        );
+    }
+
+    // `async/run` inside an async task is a cooperative yield under the runtime
+    // (no legacy scheduler to invoke) and preserves the async context across it.
+    #[test]
+    fn runtime_async_run_yields_and_preserves_context() {
+        let interp = Interpreter::new();
+        let result = interp
+            .eval_str_via_runtime(
+                "(let ((ch (channel/new 1))) \
+                   (await (async (async/run) (channel/send ch 42) (channel/recv ch))))",
+            )
+            .expect("eval");
+        assert_eq!(result, Value::int(42));
+    }
+
+    // ── VIRTUAL-CLOCK / COOPERATIVE-YIELD ORDERING (full-flip family B) ───────
+
+    // A 0 ms `async/timeout` must still let synchronously-ready work finish: the
+    // runtime fires the (already-due) deadline timer only once ready work AND
+    // pending settlements quiesce (`fire_timer` guard), so the ready child wins.
+    #[test]
+    fn runtime_timeout_zero_lets_ready_work_complete() {
+        let interp = Interpreter::new();
+        let result = interp
+            .eval_str_via_runtime("(async/timeout 0 (async 42))")
+            .expect("eval");
+        assert_eq!(result, Value::int(42));
+    }
+
+    // `retry` backoff in a runtime quantum yields cooperatively (via `async/sleep`)
+    // so a sibling sleeping LESS than the backoff wakes first — the shorter timer
+    // fires first because timers only advance when no task is runnable.
+    #[test]
+    fn runtime_retry_backoff_yields_to_shorter_sleeping_sibling() {
+        let interp = Interpreter::new();
+        let result = interp
+            .eval_str_via_runtime(
+                "(let ((out (channel/new 8)) (counter 0)) \
+                   (async/all \
+                     (list (async/spawn (fn () \
+                             (retry (fn () (set! counter (+ counter 1)) \
+                                            (if (< counter 2) (error \"not yet\") counter)) \
+                                    {:max-attempts 5 :base-delay-ms 40}) \
+                             (channel/send out :slow))) \
+                           (async/spawn (fn () (async/sleep 10) (channel/send out :fast))))) \
+                   (list (channel/recv out) (channel/recv out)))",
+            )
+            .expect("eval");
+        assert_eq!(
+            result,
+            common_list(&[Value::keyword("fast"), Value::keyword("slow")])
+        );
+    }
+
+    // A fire-and-forget top-level `(async …)` side effect runs before the eval
+    // returns (ready detached work is drained at exit), even though the spawner
+    // resumes ahead of the child.
+    #[test]
+    fn runtime_top_level_async_side_effect_drains_at_exit() {
+        let interp = Interpreter::new();
+        let result = interp
+            .eval_str_via_runtime(
+                "(define ch (channel/new 1)) \
+                 (begin (async (channel/send ch :ran)) :end)",
+            )
+            .expect("eval");
+        assert_eq!(result, Value::keyword("end"));
+        // The detached sender ran at exit, so the value is buffered and readable.
+        let drained = interp
+            .eval_str_via_runtime("(channel/recv ch)")
+            .expect("eval");
+        assert_eq!(drained, Value::keyword("ran"));
     }
 }

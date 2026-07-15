@@ -470,3 +470,82 @@ flip are DONE. To flip `eval_str_compiled` and delete `init_scheduler` + the
 Once (1)–(3) land, route `run_exprs_on_vm` through `run_exprs_via_runtime`, delete
 `init_scheduler`/`SCHEDULER` TLS, and re-baseline the (now-resolved) 4
 `vm_async_test` cases GREEN.
+
+## Task 03/08 — full-flip parity slice: family A + retry FIXED, flip DEFERRED (2026-07-15)
+
+Closed the bulk of the `eval_str_compiled` full-flip parity gap. Under a temporary
+full flip (`eval_str_compiled` → `run_exprs_via_runtime`) the measured `vm_async`
+regression went **109/9 → 116/2** and the 4 documented baseline RED all resolved
+through the runtime. Blocker 1 (the `deep_structure_str` SIGABRT) is already gone
+(fixed by `eb7ee47d` deep-collection teardown flatten — `eval_test` 1072/0 under
+the flip). A **NEW** blocker surfaced (native agent-loop concurrency), so the flip
+is **DEFERRED** and the parity fixes are **KEPT** (they harden the runtime path the
+PRIMARY `eval`/`eval_str` flip already uses; gated by new `runtime_eval_tests`).
+
+### Family A — spawned-task observation/cancel/error parity: ALL 6 FIXED
+| Fix | Site | What changed |
+| --- | --- | --- |
+| Freshly-spawned task is Pending until spawner suspends | `runtime/state.rs` `spawn_detached` | Resume the spawner AHEAD of the child in the ready queue (cooperative parity), so `async/pending?` / `async/cancel`+`async/cancelled?` observe a not-yet-run child. Cascade-fixed `cancel_pending_task`, `cancelled_promise_classifies_correctly`, `channel_close_with_blocked_sender_reports_lost_value` (the cancelled/closed classification now precedes the child's first run, so the deadlock detector never misfires). |
+| 0 ms timeout / ready-vs-timer ordering | `runtime/state.rs` `fire_timer` | Virtual-clock cooperative rule: never fire a timer while any task is Ready OR a pending settlement is queued. Fixes the `timeout_zero_lets_ready_work_complete` regression the spawn reorder exposed. |
+| Yielding native passed directly to a HOF | `runtime/state.rs` `invoke_callable` (native branch) + `stdlib/list.rs` `check_hof_yield` | Dispatch native callbacks with the runtime-quantum flag active; a leftover PARK yield (channel/promise/sleep) → the lambda-wrap hint, while a driveable `NativeYield` (agent tools that offload I/O) is driven via its stashed `NativeOutcome` — so `native_callback_passed_directly_raises_clear_error` passes WITHOUT regressing `mcp_builtin`/`agent/run`. |
+| `async/run` inside async | `stdlib/async_ops.rs` | Under a runtime quantum `async/run` is a cooperative `Sleep(0)` yield (no legacy scheduler to invoke), preserving async context — fixes `async_context_preserved_after_nested_run`. |
+
+### Family B — virtual-clock hook + cooperative-yield ordering: 1 FIXED, 2 RESIDUAL
+| Test | Status | Note |
+| --- | --- | --- |
+| `retry_backoff_yields_lets_sibling_complete_first` | **FIXED** | Prelude `retry` now takes the cooperative async loop under `(__runtime-quantum?)` too (was `(__async-context?)`-only), backing off via `async/sleep` timers the `fire_timer` guard orders correctly. |
+| `event_select_yields_to_sibling_in_async_context` | **RESIDUAL** | `event/select`'s async path yields `AwaitIo` (IoHandle polling), which the runtime's VM-yield dispatch does not host yet; under the runtime it takes the blocking sync poll-loop, so it returns the correct value but does not cooperatively yield → ordering diverges. Needs runtime `AwaitIo` support (a new wait kind polled each drive turn, GC-sensitive: the handle may hold `Value`s). |
+| `blocking_sleep_hook_receives_clock_advances` | **RESIDUAL** | Requires a VIRTUAL runtime clock: the hook, when installed, must advance logical time WITHOUT real sleep and make `pop_due` fire — the runtime's `MonotonicClock` is real, so `deltas.sum() == 30` (total virtual time) is unreachable. Needs an injectable/advanceable `RuntimeClock`. |
+
+### The NEW flip blocker (why DEFERRED, not KEPT)
+`agent_async_test` uses `common::eval` → `eval_str_compiled`. It is **7/0 on the
+legacy path** but **3/4 under the full flip**: the native `agent/run` tool loop
+(`run_tool_loop` / `__agent-drive`) does not drive cooperatively when entered
+through `eval_str_compiled`→runtime, so agents don't overlap, a sibling ticker
+freezes during rounds, and explicit cancellation can't interrupt the blocking
+loop. This is the "callback-re-entry ABI for NATIVE synchronous loops (Task 04,
+widened)" the prior revert already named — NOT a `vm_async` family-A/B item, and
+out of scope for this parity slice. Keeping the flip would regress a green suite,
+so per the revert rule the flip is reverted (`eval_str_compiled` back on
+`run_exprs_on_vm`, `crates/sema-eval/src/eval.rs`).
+
+### DECISION: fixes LANDED on the runtime path, `eval_str_compiled` flip DEFERRED
+The family-A + retry fixes are exercised on the always-runtime `eval_str_via_runtime`
+gate and by the KEPT primary `eval`/`eval_str` flip. Eight new `runtime_eval_tests`
+prove them: `runtime_freshly_spawned_task_is_pending`,
+`runtime_cancel_pending_channel_task_classifies_cancelled`,
+`runtime_cancelled_promise_classifies_correctly`,
+`runtime_yielding_native_as_hof_callback_raises_lambda_wrap_hint`,
+`runtime_async_run_yields_and_preserves_context`,
+`runtime_timeout_zero_lets_ready_work_complete`,
+`runtime_retry_backoff_yields_to_shorter_sleeping_sibling`,
+`runtime_top_level_async_side_effect_drains_at_exit`.
+
+### Verified (flip REVERTED — final state, verbatim `test result:` lines)
+- vm_async_test **114 passed; 4 failed** (the SAME documented RED:
+  `async_all_failure_does_not_cancel_supplied_sibling`,
+  `async_race_does_not_cancel_supplied_loser`,
+  `awaited_child_mutation_is_visible_to_parent`,
+  `scheduler_workload_beyond_tick_ceiling_completes`)
+- eval_test **1072 passed; 0 failed**; integration_test **1055 passed; 0 failed**
+- sema-eval **126 passed; 0 failed** (118 + 8 new gates); sema-vm **486/0**;
+  sema-core **319/0**; sema-stdlib **196/0**
+- mcp_builtin **6/0**, mcp_runtime **2/0**, mcp_async **8/0**, embedding_api **14/0**,
+  llm_fake **29/0**, agent_async **7/0**, workflow_cookbook **6/0**,
+  workflow_mcp_e2e **5/0**, workflow_mcp_interactive **5/0**, stream_async **10/0**,
+  http_concurrent **3/0**, leak **7/0**, gc_stress **48/0**
+- `cargo check --workspace --tests` exit 0; clippy `--workspace --tests -D warnings`
+  clean (only the pre-existing proc-macro-error2 note); fmt clean.
+
+### Precise residual to flip `eval_str_compiled` + delete the legacy scheduler
+1. **Native agent-loop cooperative re-entry (Task 04, widened).** `run_tool_loop` /
+   `__agent-drive` must drive its provider/tool rounds cooperatively when entered
+   through the runtime, so agents overlap and cancellation interrupts the loop
+   (`agent_async_test` 7/0 under the flip).
+2. **Runtime `AwaitIo` support** for `event/select` / `io/read-key-timeout`
+   cooperative yielding (family-B `event_select`).
+3. **Injectable/virtual `RuntimeClock`** so the `set_blocking_sleep_callback`
+   hook advances logical time deterministically (family-B `blocking_sleep_hook`).
+Family A + `retry` are DONE. Once (1)–(3) land, route `run_exprs_on_vm` through
+`run_exprs_via_runtime`, delete `init_scheduler`/`SCHEDULER` TLS, and re-baseline
+the 4 `vm_async_test` RED GREEN.

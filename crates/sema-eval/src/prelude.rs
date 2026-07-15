@@ -750,7 +750,7 @@ pub const PRELUDE: &str = r#"
 ;; the byte-identical blocking native runs (real `thread::sleep`, no
 ;; scheduler involved).
 (define (retry thunk . __retry-rest)
-  (if (__async-context?)
+  (if (or (__async-context?) (__runtime-quantum?))
       (let ((__retry-opts (apply __retry-setup thunk __retry-rest)))
         (letrec ((__retry-go (fn (__retry-n __retry-delay)
                     (try (thunk)

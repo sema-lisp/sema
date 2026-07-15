@@ -508,7 +508,7 @@ Expected: fake-server matrix passes without network access or lingering ports.
 `secret.rs`, `crypto.rs`, `csv_ops.rs`, `markup.rs`, resource tests
 
 - [x] **R08A — finite file jobs migrated to the canonical external-wait path
-  (`QuarantinedBounded`)** (commit 875f45c1; `cargo test -p sema-lang --test
+  (`QuarantinedBounded`)** (commit b99b396f; `cargo test -p sema-lang --test
   file_runtime_test` → 5 passed). Under `in_runtime_quantum()` the finite `file/*`
   ops — `file/read`, `file/read-bytes`, `file/write`, `file/write-bytes`,
   `file/exists?`, `file/list`, `file/info` (size/stat) — now build a

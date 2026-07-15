@@ -3,12 +3,128 @@ use std::collections::HashMap;
 use std::io::IsTerminal;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use sema_core::cycle::GcEdge;
+use sema_core::runtime::{
+    CancelDisposition, CancelHook, CancelHookError, CompletionDecoder, CompletionKind,
+    DecodedCompletion, ExternalFailure, InterruptibleResource, NativeCallContext,
+    NativeContinuation, NativeOutcome, NativeResult, NativeSuspend, PreparedExternalOperation,
+    ResumeInput, SendPayload, Trace, WaitKind,
+};
 use sema_core::{
-    check_arity, in_async_context, set_yield_signal, take_resume_value, Caps, SemaError, Value,
-    YieldReason,
+    check_arity, in_async_context, in_runtime_quantum, set_pending_native_outcome,
+    set_yield_signal, take_resume_value, Caps, SemaError, Value, YieldReason,
 };
 
 use crate::register_fn;
+
+/// Completion tag for the blocking `sleep` external operation. A tag only needs
+/// to be consistent between the issued identity and the prepared op; collisions
+/// with other external ops are harmless (it is not a uniqueness key).
+const SLEEP_COMPLETION_KIND: u64 = 1;
+/// Clamp for a blocking sleep routed to a worker thread (mirrors `async/sleep`):
+/// keeps an out-of-range duration from wedging a worker for years.
+const MAX_SLEEP_MS: u64 = 86_400_000; // 1 day
+
+/// Cancel hook for the blocking `sleep` worker. A `thread::sleep` cannot be
+/// interrupted mid-flight, so cancellation reports the resource reaped: the
+/// runtime drops it immediately and the worker's eventual (now unowned)
+/// completion is discarded as a late completion.
+struct SleepCancelHook;
+
+impl Trace for SleepCancelHook {
+    fn trace(&self, _sink: &mut dyn FnMut(GcEdge<'_>)) -> bool {
+        true
+    }
+}
+
+impl CancelHook for SleepCancelHook {
+    fn cancel(&mut self) -> Result<CancelDisposition, CancelHookError> {
+        Ok(CancelDisposition::Reaped)
+    }
+    fn reap(&mut self) -> Result<CancelDisposition, CancelHookError> {
+        Ok(CancelDisposition::Reaped)
+    }
+}
+
+/// Decodes the worker's completion for a blocking `sleep`: success yields nil; a
+/// worker failure (e.g. panic) surfaces as an evaluation error.
+struct SleepDecoder;
+
+impl Trace for SleepDecoder {
+    fn trace(&self, _sink: &mut dyn FnMut(GcEdge<'_>)) -> bool {
+        true
+    }
+}
+
+impl CompletionDecoder for SleepDecoder {
+    fn decode(
+        self: Box<Self>,
+        _context: &mut NativeCallContext<'_>,
+        result: Result<SendPayload, ExternalFailure>,
+    ) -> DecodedCompletion {
+        result
+            .map(|_| Value::nil())
+            .map_err(|failure| SemaError::eval(format!("sleep failed: {}", failure.message())))
+    }
+}
+
+/// Resumes the parked `sleep` frame once the worker completes: the decoded nil is
+/// injected onto its stack top; a failure or cancellation is raised at the call
+/// site (catchable by an enclosing try/catch).
+struct SleepContinuation;
+
+impl Trace for SleepContinuation {
+    fn trace(&self, _sink: &mut dyn FnMut(GcEdge<'_>)) -> bool {
+        true
+    }
+}
+
+impl NativeContinuation for SleepContinuation {
+    fn resume(
+        self: Box<Self>,
+        _context: &mut NativeCallContext<'_>,
+        input: ResumeInput,
+    ) -> NativeResult {
+        match input {
+            ResumeInput::Returned(value) => Ok(NativeOutcome::Return(value)),
+            ResumeInput::Failed(error) => Err(error),
+            ResumeInput::Cancelled(reason) => {
+                Err(SemaError::eval(format!("sleep was cancelled ({reason:?})")))
+            }
+            ResumeInput::Runtime(_) => Err(SemaError::eval(
+                "sleep continuation received an unexpected runtime response",
+            )),
+        }
+    }
+}
+
+/// Build the external-wait `NativeOutcome::Suspend` for a blocking `sleep` under
+/// the unified runtime, stash it on the pending-outcome thread-local, and raise
+/// the `NativeYield` signal the VM surfaces as an async yield. The runtime
+/// submits the job to the thread-pool executor (so it runs off the VM thread and
+/// overlaps sibling work) and, when the worker completes, resumes this frame with
+/// nil. Returns the nil placeholder the runtime overwrites on resume.
+fn sleep_via_executor(ms: u64) -> Value {
+    let ms = ms.min(MAX_SLEEP_MS);
+    let kind = CompletionKind::try_from_raw(SLEEP_COMPLETION_KIND)
+        .expect("sleep completion kind is nonzero");
+    let prepared = PreparedExternalOperation::interruptible_blocking(
+        kind,
+        Box::new(SleepDecoder),
+        InterruptibleResource::new("sleep", Box::new(SleepCancelHook)),
+        move || {
+            std::thread::sleep(std::time::Duration::from_millis(ms));
+            Ok(Box::new(()) as SendPayload)
+        },
+    );
+    let suspend = NativeSuspend {
+        wait: WaitKind::External(Box::new(prepared)),
+        continuation: Box::new(SleepContinuation),
+    };
+    set_pending_native_outcome(NativeOutcome::Suspend(suspend));
+    set_yield_signal(YieldReason::NativeYield);
+    Value::nil()
+}
 
 /// Monotonic clock captured the first time it is needed — forced during
 /// `register()` so it reflects interpreter/process startup, not the first call
@@ -412,7 +528,15 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
         let ms = args[0]
             .as_int()
             .ok_or_else(|| SemaError::type_error("int", args[0].type_name()))?;
-        // In an async scheduler task, blocking the VM thread would freeze
+        // Under the unified runtime, `sleep` is a genuinely-blocking operation:
+        // submit it to the thread-pool executor and SUSPEND so the worker runs it
+        // off the VM thread. Two `async/spawn`ed sleeps then overlap instead of
+        // serializing on the VM thread (unlike `async/sleep`, which is a virtual
+        // timer). Checked before the legacy `in_async_context` timer path.
+        if in_runtime_quantum() {
+            return Ok(sleep_via_executor(ms.max(0) as u64));
+        }
+        // In a legacy async scheduler task, blocking the VM thread would freeze
         // every sibling task. Yield exactly like `async/sleep` (async_ops.rs)
         // so the scheduler parks this task and drives siblings while the
         // sleep elapses.

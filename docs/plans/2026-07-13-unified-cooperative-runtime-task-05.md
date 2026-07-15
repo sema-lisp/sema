@@ -597,3 +597,73 @@ git commit -m "refactor(runtime): migrate interruptible resources"
   observable and returns to baseline.
 - Static guards reject reintroduction of old seams and ad hoc runtimes.
 - Independent review and durable evidence are clean.
+
+## Foundation slice landed (2026-07-15)
+
+The first vertical slice of Task 05 — a real executor + inbox-wakeup drive + one
+op proving true concurrency — is implemented and green. This does NOT complete
+Task 05 (the full resource-matrix migration remains); it establishes the
+executor + drive foundation the rest of the migration builds on.
+
+**Delivered:**
+
+- **Real thread-pool executor** (`sema-vm/src/runtime/host.rs`,
+  `ThreadPoolExecutor`): a fixed pool (clamped `[2,8]`) of `std::thread` workers
+  fed an unbounded `mpsc` channel. Each `ExecutorSubmission` is armed with
+  `into_dispatch()` and run to completion on a worker (`BlockingExecutorDispatch::run`
+  / a minimal thread-parking `block_on` for async dispatches). The send-only
+  boundary is upheld by the runtime (dispatches carry no `Rc`/`Value`; the worker
+  delivers the raw `ExternalCompletion` into the inbox and the VM thread decodes).
+  `shutdown(deadline)` stops accepting, disconnects idle workers, and bounded-waits
+  (Condvar + `wait_timeout`) on the in-flight count → `Drained`/`DeadlineExceeded`;
+  `PoolInner::Drop` disconnects + joins. No tokio dependency added to
+  sema-vm/sema-eval.
+- **Wired into the interpreter runtime**: `build_runtime` (`sema-eval/src/eval.rs`)
+  now constructs the persistent `Runtime` with `ThreadPoolExecutor` instead of
+  `NullExecutor`.
+- **Inbox-wakeup drive**: `Runtime::block_on_inbox` /
+  `WaitRuntime::block_on_inbox` block-wait on the completion inbox (bounded by the
+  timer deadline if any), buffering the completion for the next drive turn.
+  `run_exprs_via_runtime` services `DriveState::Idle { inbox_wakeup_required:
+  true, .. }` by block-waiting instead of erroring. Wakeable, bounded, no busy-spin.
+- **One op migrated to a true external wait**: `sleep` (`sema-stdlib/src/system.rs`),
+  under `in_runtime_quantum()`, submits a `PreparedExternalOperation::interruptible_blocking`
+  (`thread::sleep` on a worker) and SUSPENDs (`WaitKind::External`); the runtime
+  resumes the frame with nil when the worker completes. Distinct from `async/sleep`
+  (a virtual timer). Legacy paths (`in_async_context` timer yield, top-level real
+  sleep) are unchanged.
+
+**Concurrency gate GREEN**: `crates/sema/tests/runtime_external_io_test.rs` —
+two `async/spawn`ed `(sleep 200)` overlap on separate workers, total wall-time
+~200ms (asserted `< 350ms`), driven through `eval_str_via_runtime`. Internal
+executor coverage in `host.rs` (`thread_pool_tests`) proves overlap + bounded
+shutdown.
+
+**Remaining Task 05 I/O migration (ordered decomposition):**
+
+1. Resource-matrix classification (interruptible vs quarantined-bounded) for the
+   full stdlib resource set — the plan's Step 1.
+2. Pure-compute + simple blocking ops (crypto/hash, `shell`/`system`) → external
+   waits with concrete cancel hooks / bounds.
+3. Files + streams + database (blocking handles) → interruptible external ops.
+4. Process / PTY / watcher (spawn + kill cancel hooks).
+5. Sockets / HTTP / WS / servers (needs an async executor tier or `sema-io`
+   integration; the current pool runs async dispatches via `block_on` but a
+   real reactor belongs behind the ADR #69 seam).
+6. `mcp/call` and LLM adapters (Task 06 boundary).
+
+**Red baseline unchanged**: `vm_async_test` still exactly 4 RED
+(`async_all_failure_does_not_cancel_supplied_sibling`,
+`async_race_does_not_cancel_supplied_loser`,
+`awaited_child_mutation_is_visible_to_parent`,
+`scheduler_workload_beyond_tick_ceiling_completes`) — all legacy-scheduler,
+untouched. `runtime_conformance_test` (3) and `unified_runtime_watchdog_test` (1)
+were already RED on this branch before this slice (verified by stash) and are not
+regressions.
+
+**mcp_async_test concurrency gap**: still open. `mcp/call` runs on the VM thread
+and `mcp_async_test` drives via the legacy `eval` path, so it does not yet
+exercise the executor. It becomes closable once (a) the eval flip routes MCP
+through the runtime and (b) `mcp/call` is migrated to an external wait
+(decomposition item 6) — the executor + inbox-wakeup foundation this slice lands
+is the prerequisite, now in place.

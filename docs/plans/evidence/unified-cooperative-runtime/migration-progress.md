@@ -1,5 +1,31 @@
 # Structural-ABI migration — progress log
 
+## REGRESSION RECOVERY (2026-07-15, after an inadequate first verification)
+
+The initial "migration complete, full suite green" claim was WRONG: verification ran a subset of
+test binaries + `jake examples`/`smoke-bytecode`, not an exhaustive per-binary `cargo test
+--workspace` sweep, so ~19 binaries / ~35 tests (all green at the pre-session baseline ee3a7aa9)
+were regressed and undetected. Recovered across five root-cause clusters, each committed:
+- **async overlap**: llm/chat/complete/embed/batch/rerank, archive/pdf/diff, stream/file, http/serve
+  gated offload on the dead `in_async_context()` → ran synchronously; extended the guard fix.
+- **callback re-entry**: `otel/span`(+variants), `workflow/run`/`step` → NativeOutcome::Call.
+- **GC leak (real memory bug)**: a cycle routed through a channel-registry buffer OR a
+  settled-promise value was invisible to the CORE-2 residual collector → never reclaimed;
+  reintroduced GcNode::Channel/Promise with I2-preserving registry-interior hooks + dead-handle
+  eviction. Promises had the identical latent leak — fixed symmetrically.
+- **cooperative agent/chat tool loop**: ran only synchronously at the root (a prior shortcut);
+  now cooperative at all levels with journaling ported into the continuation + a detached tool span.
+- **cancellation**: transitive `async/cancel` via the cancellation-parent graph + eager subprocess
+  abort + a runtime-accurate `live_task_count()` oracle + cancelled-agent span export.
+Plus stragglers: rewrote a retired lambda-wrap-hint test, documented the owned combinators
+(`async/race-owned`/`async/with-timeout`), reconciled the legacy-symbols conformance baseline.
+
+**STANDING GATE (corrected discipline):** every phase now ends with an exhaustive
+`cargo test --workspace --no-fail-fast` per-binary sweep + `jake examples`/`smoke-bytecode`/`lint`,
+not a hand-picked subset. Re-established green baseline: full workspace green except the single
+documented deferral (`unified_runtime_inventory_mapping` — the ~1000-site disposition re-review).
+
+
 ## FINAL STATE (2026-07-15): language async 100% migrated, full suite green
 
 The thread-local suspension bridge is DELETED for all language-level async. Every unit of

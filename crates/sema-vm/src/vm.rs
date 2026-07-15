@@ -457,6 +457,16 @@ pub struct VM {
     frames: Vec<CallFrame>,
     globals: Rc<Env>,
     functions: Rc<Vec<Rc<Function>>>,
+    /// The VM's *base* (top-level main) function table, fixed at construction.
+    /// `self.functions` swaps to a callee's table on every cross-unit VM-closure
+    /// call and is restored on return, so it is NOT a stable "main" reference:
+    /// when a quantum yields mid-call, `run_quantum` returns with `self.functions`
+    /// still pointing at the callee's table. `run_inner` must resolve a `None`
+    /// (top-level main) closure's table from THIS stable field, not from whatever
+    /// `self.functions` happens to be at re-entry — otherwise the next quantum
+    /// adopts the callee's table as the main's and a later `MakeClosure` indexes
+    /// the wrong (too-short) table.
+    base_functions: Rc<Vec<Rc<Function>>>,
     /// Per-instruction inline cache for global lookups:
     /// (spur_bits, env_version, decoded binding).
     /// spur_bits distinguishes globals sharing the same slot (cross-VM closures).
@@ -1032,6 +1042,25 @@ pub fn close_closure_upvalues_for_foreign_run(closure: &Closure) {
     }
 }
 
+/// Snapshot `closure`'s still-open upvalue cells with `owner_vm` temporarily
+/// registered as the current VM, so `close_closure_upvalues_for_foreign_run` can
+/// find the (paused) owning stack the cells point into.
+///
+/// The synchronous native-call paths register the running VM via a
+/// `CurrentVmGuard` *before* invoking the native, so an `async/spawn` handled
+/// inline (legacy scheduler) snapshots against a live `CURRENT_VM`. The unified
+/// runtime instead defers the spawn to `spawn_detached`, which runs *after*
+/// `run_quantum` returned and dropped that guard — leaving `CURRENT_VM` empty.
+/// Without this, a spawned closure that captures an enclosing frame's locals
+/// keeps Open cells that later dereference the wrong (task-VM) stack: a silent
+/// wrong-slot read (deadlock) or an escaped inner closure re-run synchronously
+/// off the scheduler ("async yield outside of scheduler context"). Re-register
+/// the spawning VM for the duration of the snapshot to restore the invariant.
+pub fn close_closure_upvalues_with_owner(owner_vm: &mut VM, closure: &Closure) {
+    let _guard = CurrentVmGuard::enter(owner_vm);
+    close_closure_upvalues_for_foreign_run(closure);
+}
+
 /// Error for dereferencing an Open upvalue cell whose stack slot is not on the
 /// executing VM's stack — a closure with open upvalues escaped its owning VM
 /// without being snapshotted (see `close_closure_upvalues_for_foreign_run`).
@@ -1133,11 +1162,13 @@ impl VM {
             total_cache_slots += func.chunk.n_global_cache_slots as usize;
         }
         ensure_cycle_gc_wired();
+        let functions = Rc::new(functions);
         Ok(VM {
             stack: Vec::with_capacity(256),
             frames: Vec::with_capacity(64),
             globals,
-            functions: Rc::new(functions),
+            functions: functions.clone(),
+            base_functions: functions,
             inline_cache: vec![(u32::MAX, 0, CachedGlobal::Plain(Value::nil())); total_cache_slots],
             native_fns: Rc::new(native_fns),
             debug_values: HashMap::new(),
@@ -1197,6 +1228,7 @@ impl VM {
             stack: Vec::with_capacity(256),
             frames: Vec::with_capacity(64),
             globals,
+            base_functions: functions.clone(),
             functions,
             inline_cache: vec![(u32::MAX, 0, CachedGlobal::Plain(Value::nil())); total_cache_slots],
             native_fns,
@@ -1226,6 +1258,7 @@ impl VM {
             stack: Vec::with_capacity(256),
             frames: Vec::with_capacity(64),
             globals,
+            base_functions: functions.clone(),
             functions,
             inline_cache: vec![(u32::MAX, 0, CachedGlobal::Plain(Value::nil())); total_cache_slots],
             native_fns: Rc::new(native_fns),
@@ -2031,7 +2064,7 @@ impl VM {
         // activation; this immutable snapshot is the fallback for `None`
         // closures so it never observes a cross-module callee's swapped table
         // (M4: import on the VM).
-        let base_functions = self.functions.clone();
+        let base_functions = self.base_functions.clone();
         // Snapshot the VM's base globals — the env the top-level main closure
         // (which carries no explicit home env) resolves against. `self.globals`
         // is kept pointing at the running frame's home env (below); this

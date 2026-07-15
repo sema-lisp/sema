@@ -6,7 +6,7 @@ use std::rc::{Rc, Weak};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crate::vm::close_closure_upvalues_for_foreign_run;
+use crate::vm::{close_closure_upvalues_for_foreign_run, close_closure_upvalues_with_owner};
 use crate::{extract_vm_closure, VmExecResult, VM};
 #[cfg(test)]
 use sema_core::runtime::ExternalFailure;
@@ -2157,7 +2157,23 @@ impl Runtime {
         };
         // The task VM runs the thunk on its own stack; snapshot any still-open
         // upvalue cells against the (paused) spawning VM so they don't dangle.
-        close_closure_upvalues_for_foreign_run(&closure);
+        // The spawning VM is parked in `vm_call` and NOT on `CURRENT_VM` (the
+        // native-call guard was dropped when `run_quantum` returned the Spawn
+        // yield), so re-register it for the snapshot — otherwise a thunk that
+        // captures enclosing locals keeps Open cells pointing into the wrong
+        // stack. Fall back to the guard-free snapshot if the spawner has no live
+        // VM (defensive; a real spawner always parks its VM here).
+        {
+            let mut state = self.state.borrow_mut();
+            match state
+                .tasks
+                .get_mut(&spawner)
+                .and_then(|t| t.vm_call.as_mut())
+            {
+                Some(spawning_vm) => close_closure_upvalues_with_owner(spawning_vm, &closure),
+                None => close_closure_upvalues_for_foreign_run(&closure),
+            }
+        }
         let Some(globals) = closure.globals.clone() else {
             return self.resume_running_vm(
                 spawner,

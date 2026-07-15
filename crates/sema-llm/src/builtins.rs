@@ -1023,6 +1023,12 @@ impl LlmProvider for LispProvider {
         &self.default_model
     }
 
+    // A Lisp provider's `:complete` closure runs on the VM thread via the
+    // callback context, so it must never be offloaded to a pool worker.
+    fn runs_on_vm_thread(&self) -> bool {
+        true
+    }
+
     fn complete(&self, request: ChatRequest) -> Result<ChatResponse, LlmError> {
         let name = self.name.clone();
         LISP_PROVIDERS.with(|providers| {
@@ -2070,11 +2076,14 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
         request.reasoning_effort = reasoning_effort;
         request.timeout_ms = opt_timeout_ms(args.get(1));
 
-        // Inside a scheduler task: offload + yield so siblings overlap. The poller
-        // accounts (no post-call `track_usage` here) and shapes the value. The sync
-        // branch below is byte-identical to before.
+        // Inside a scheduler task OR a unified-runtime VM quantum: offload + yield
+        // so siblings overlap (the runtime services the `AwaitIo` yield via the
+        // LegacyAwaitIoBridge). The poller accounts (no post-call `track_usage`
+        // here) and shapes the value. The sync branch below is byte-identical.
         #[cfg(not(target_arch = "wasm32"))]
-        if sema_core::in_async_context() {
+        if (sema_core::in_async_context() || sema_core::in_runtime_quantum())
+            && completion_chain_offloadable()
+        {
             return do_complete_async_yield(
                 request,
                 Box::new(|resp| Ok(Value::string(&resp.content))),
@@ -6575,6 +6584,29 @@ struct CompleteOffloadPlan {
 /// byte the front half of the old `do_complete_async_yield`; shared so the runtime
 /// External-wait path stays in lockstep with the async path (cache/cassette/retry).
 #[cfg(not(target_arch = "wasm32"))]
+/// Whether the resolved default completion chain can be OFFLOADED to the IO pool
+/// (every target is a native/Send provider) vs. contains a `LispProvider` that
+/// must run on the VM thread. The async/runtime `llm/complete` path yields
+/// `AwaitIo` (offload) only when this holds; otherwise it runs synchronously so a
+/// user-defined `:complete` closure keeps its VM-thread callback context. A
+/// missing/unconfigured provider is treated as offloadable so the offload path
+/// surfaces the usual "no provider configured" error unchanged.
+#[cfg(not(target_arch = "wasm32"))]
+fn completion_chain_offloadable() -> bool {
+    PROVIDER_REGISTRY.with(|reg| {
+        let reg = reg.borrow();
+        let fallback = FALLBACK_CHAIN.with(|c| c.borrow().clone());
+        match fallback {
+            Some(entries) if !entries.is_empty() => entries
+                .iter()
+                .all(|e| reg.get(&e.provider).is_none_or(|p| !p.runs_on_vm_thread())),
+            _ => reg
+                .default_provider()
+                .is_none_or(|p| !p.runs_on_vm_thread()),
+        }
+    })
+}
+
 fn complete_offload_prep(request: ChatRequest) -> Result<CompletePrep, SemaError> {
     // Standalone completions get their own conversation scope (so the chat span
     // carries gen_ai.conversation.id); agent-nested ones inherit. The detached span

@@ -694,3 +694,65 @@ but do not corrupt state); migrating them to the same external-wait pattern is a
 Task 06 follow-up. The full cancellation/tombstone scenario is exercised by the
 legacy `mcp_async_test`; a runtime-driven `async/cancel`/`async/timeout` MCP test
 belongs with the Task 06 orchestration cancellation surface.
+
+---
+
+## LegacyAwaitIoBridge — legacy `AwaitIo(IoHandle)` ops made cooperative (2026-07-15)
+
+**Full-flip blocker 2 landed.** The unified runtime now services a task that
+yields `YieldReason::AwaitIo(Rc<IoHandle>)` instead of rejecting it. This is a
+GENERAL bridge (not a per-op rewrite): any offloaded-I/O async op that arms an
+`IoHandle` and yields `AwaitIo` now parks on the runtime and is polled to
+completion on the VM thread, without migrating each op to `WaitKind::External`.
+
+**Park/poll/resume seam** (`crates/sema-vm/src/runtime/state.rs`):
+- `run_parked_quantum` maps `AsyncYield(AwaitIo(handle))` → new
+  `TaskAction::VmAwaitIo(task_id, handle)` (parks the VM in `vm_call`).
+- `apply_action` → `await_io`: polls the handle ONCE (may already be done — cache
+  hit/fast checkout); if `Pending`, mints an `issue_internal_wait` key (never in
+  `WaitRuntime::active`, like `channel_waits`), `record.wait(key)`, and records
+  the handle in the new `io_waits: HashMap<TaskId, (WaitKey, Rc<IoHandle>)>`.
+- `poll_io_waits` (called each `drive` loop iteration) snapshots the parked
+  handles (cloning the `Rc`s and DROPPING the state borrow first, since a poller
+  may allocate GC values whose tracing re-borrows state), polls each ON THE VM
+  THREAD (the handle is not `Send`), and on `Ready` wakes the task
+  (`record.wake` + `vm_resume` + enqueue ready). `Ready(Ok)` resumes the frame
+  via the stack-top placeholder; `Ready(Err)` raises the error in-frame so
+  try/catch works — matching the op's synchronous `Err` return.
+- Idle detection: `drive` reports `DriveState::Idle { legacy_io_wakeup_required:
+  !io_waits.is_empty(), .. }`. The interpreter host loop
+  (`sema-eval/src/eval.rs::run_exprs_via_runtime`) parks the VM thread on the
+  process-global IO-completion signal (`sema_core::io_park`, capped at 50 ms so a
+  nearer timer deadline / mixed inbox wait is re-checked and a missed notify is
+  bounded) then re-drives — wakeable via `notify_io_complete`, never busy-spins.
+- Cancellation: `cancel_waiting` gained an `io_waits` branch mirroring the
+  channel branch — it runs the handle's abort hook (`IoHandle::with_abort`,
+  aborting the in-flight offloaded future where the runtime supports it), drops
+  the entry, and wakes the task so it settles Cancelled. GC-safe: an `IoHandle`
+  is a boxed `FnMut` poller holding no live Sema `Value`, so `VmAwaitIo` traces
+  nothing (mirroring the legacy scheduler's `Blocked(AwaitIo)` handling).
+
+**Enabled for `llm/complete`** by flipping its offload gate from
+`in_async_context()` to `in_async_context() || in_runtime_quantum()`
+(`sema-llm/src/builtins.rs`), so a top-level or `async/spawn`ed completion under
+the runtime offloads + yields `AwaitIo` and the bridge services it. Guarded by
+`completion_chain_offloadable()` + the new `LlmProvider::runs_on_vm_thread()`
+(overridden `true` by `LispProvider`): a user's `llm/define-provider` `:complete`
+closure re-enters the VM on the VM thread and MUST NOT be offloaded to a worker,
+so it keeps the synchronous path (fixes the 12 `test_define_provider_*` cases).
+
+**Now cooperative via the bridge**: `llm/complete` (top-level AND spawned) —
+gates 1–3. The bridge itself is general, so any other op that yields `AwaitIo`
+would be serviced too; enabling each is a one-line gate flip (add
+`in_runtime_quantum()`, guard non-offloadable providers).
+
+**Gate**: `crates/sema/tests/legacy_awaitio_bridge_test.rs` (FakeProvider,
+keyless, via `eval_str_via_runtime`) — `standalone_complete_through_runtime_returns_answer`,
+`two_spawned_completes_overlap_through_runtime` (peak in-flight >= 2, wall < 550 ms
+vs ~600 ms serial floor), `cancel_of_parked_awaitio_task_settles_cancelled`.
+
+**Remaining (still sync-blocking under the runtime; flip the same way)**:
+`llm/chat` no-tools, `llm/extract`, `llm/classify`, `llm/embed` (needs an
+embed-provider offloadable guard), `llm/rerank`, `llm/stream`, `event/select`,
+`io/read-key-timeout`, and legacy async file/http. Other full-flip blockers:
+agent streaming/OTel residuals, virtual clock.

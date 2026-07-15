@@ -332,6 +332,30 @@ impl Interpreter {
                 .map_err(|e| SemaError::eval(format!("runtime fault: {e:?}")))?
             {
                 DriveState::Progress { .. } => {}
+                // A task is parked on a legacy `AwaitIo(IoHandle)`: its offloaded
+                // job (llm/complete, embed, http, file, event/select, io) runs on
+                // the IO pool. Park the VM thread on the process-global
+                // IO-completion signal — bounded (wakes on `notify_io_complete`,
+                // caps at 50 ms so a nearer timer deadline or a mixed inbox wait is
+                // re-checked, and a missed notify is bounded) — then drive again so
+                // `poll_io_waits` lands the result and resumes the task. Placed
+                // FIRST so it wins over the `..` inbox arm when both are pending.
+                DriveState::Idle {
+                    next_deadline,
+                    legacy_io_wakeup_required: true,
+                    ..
+                } => {
+                    let cap_ms = 50u64;
+                    let park_ms = match next_deadline {
+                        Some(deadline) => {
+                            let now = std::time::Instant::now();
+                            (deadline.saturating_duration_since(now).as_millis() as u64)
+                                .clamp(1, cap_ms)
+                        }
+                        None => cap_ms,
+                    };
+                    sema_core::io_park(park_ms);
+                }
                 // A task is parked on an external operation running on a worker
                 // thread (a blocking op submitted to the executor). Block-wait on
                 // the completion inbox — bounded by the earliest timer deadline if

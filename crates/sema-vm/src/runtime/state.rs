@@ -197,6 +197,17 @@ struct RuntimeState {
     /// key, the backing channel, and whether they are receiving. Woken by a
     /// `ChannelWake` when a counterpart rendezvous-matches or the channel closes.
     channel_waits: HashMap<TaskId, (super::WaitKey, sema_core::runtime::ChannelId, bool)>,
+    /// VM-quantum tasks parked on a LEGACY `AwaitIo(IoHandle)` yield, mapped to
+    /// their internal wait key and the poll handle. This is the
+    /// `LegacyAwaitIoBridge`: every offloaded-I/O async op (llm/complete, embed,
+    /// http, file, event/select, io) that arms an `IoHandle` and yields
+    /// `AwaitIo` parks HERE instead of blocking the VM thread. The handle is
+    /// NOT `Send` (it polls VM-thread completion state), so `poll_io_waits`
+    /// drives it ON THE VM THREAD during drive turns; the offloaded job itself
+    /// already runs on the IO pool. The key is minted by `issue_internal_wait`
+    /// and — like `channel_waits` — is NEVER inserted into `WaitRuntime::active`
+    /// (it is polled, not delivered via the completion inbox).
+    io_waits: HashMap<TaskId, (super::WaitKey, Rc<sema_core::IoHandle>)>,
     drive_cursor: usize,
     drive_active: bool,
     active_instruction_limit: usize,
@@ -348,6 +359,7 @@ impl Runtime {
                 promise_set_waits: HashMap::new(),
                 channel_bridge: HashMap::new(),
                 channel_waits: HashMap::new(),
+                io_waits: HashMap::new(),
                 drive_cursor: 0,
                 drive_active: false,
                 active_instruction_limit: usize::MAX,
@@ -605,6 +617,14 @@ impl Runtime {
                 no_progress = 0;
                 continue;
             }
+            // Drive parked legacy-`AwaitIo` handles to completion ON THE VM
+            // THREAD (they are not `Send`). A handle that lands wakes its task
+            // (enqueued to `ready`, resumed via the source rotation below).
+            if self.poll_io_waits()? {
+                work_items += 1;
+                no_progress = 0;
+                continue;
+            }
             let unvisited_reserved = reserve_floor.saturating_sub(root_visits);
             let remaining_credits = budget.work_item_limit.get() - work_items;
             let reserve_root = budget.work_item_limit.get() > 1
@@ -677,6 +697,7 @@ impl Runtime {
         {
             Ok(DriveState::ShutdownComplete)
         } else if state.roots.is_empty()
+            && state.io_waits.is_empty()
             && state
                 .waits
                 .as_ref()
@@ -690,7 +711,12 @@ impl Runtime {
                     .waits
                     .as_ref()
                     .is_some_and(|waits| waits.active_len() > 0),
-                legacy_io_wakeup_required: false,
+                // A task is parked on a legacy `AwaitIo` handle whose offloaded
+                // job runs on the IO pool: the host must park the VM thread on
+                // the IO-completion signal and re-drive so `poll_io_waits` lands
+                // the result. Its key is not in `active`, so `inbox_wakeup` alone
+                // never covers it.
+                legacy_io_wakeup_required: !state.io_waits.is_empty(),
             })
         }
     }
@@ -968,6 +994,40 @@ impl Runtime {
                     .wake(key)
                     .map_err(|error| RuntimeFault::Invariant {
                         message: format!("cancelled channel task failed to wake: {error:?}"),
+                    })?;
+                let root = task.record.relations().origin_root;
+                state.ready.enqueue(root, task_id);
+                return Ok(true);
+            }
+        }
+        {
+            // A VM task parked on a legacy `AwaitIo` handle. Like `channel_waits`,
+            // it is tracked ONLY in `io_waits` with an internal key never in
+            // `WaitRuntime::active`, so the generic fallback would spin without
+            // waking it. Handle it here: run the handle's abort hook (aborting the
+            // offloaded future so an in-flight request/child is torn down where the
+            // runtime supports it — see `IoHandle::with_abort`), drop the entry,
+            // and wake it so the cancellation settles it Cancelled on its next
+            // visit.
+            let mut state = self.state.borrow_mut();
+            let selected = state.tasks.iter().find_map(|(id, task)| {
+                let key = task.record.wait_key()?;
+                (task.record.cancellation().is_some()
+                    && state.io_waits.get(id).map(|(k, _)| *k) == Some(key))
+                .then_some((*id, key))
+            });
+            if let Some((task_id, key)) = selected {
+                if let Some((_, handle)) = state.io_waits.remove(&task_id) {
+                    handle.abort();
+                }
+                let task = state
+                    .tasks
+                    .get_mut(&task_id)
+                    .expect("selected io-waiting task exists");
+                task.record
+                    .wake(key)
+                    .map_err(|error| RuntimeFault::Invariant {
+                        message: format!("cancelled io-wait task failed to wake: {error:?}"),
                     })?;
                 let root = task.record.relations().origin_root;
                 state.ready.enqueue(root, task_id);
@@ -1392,6 +1452,16 @@ impl Runtime {
                     task.vm_call = Some(vm);
                     TaskAction::VmChannelTryRecv(task_id, channel)
                 }
+                // Legacy offloaded I/O (`AwaitIo`): an async op (llm/complete,
+                // embed, http, file, event/select, io) offloaded its work to the
+                // IO pool and armed a poll handle. Park this frame with a nil
+                // placeholder on its stack top; the runtime drives the handle to
+                // completion ON THE VM THREAD (`poll_io_waits`) and resumes the
+                // frame with the decoded value (or raises the error in-frame).
+                YieldReason::AwaitIo(handle) => {
+                    task.vm_call = Some(vm);
+                    TaskAction::VmAwaitIo(task_id, handle)
+                }
                 // A runtime-quantum HOF (`map`) wants the runtime to drive its
                 // Sema callback cooperatively via the `NativeOutcome::Call`
                 // continuation ABI. The actual outcome rode the pending-outcome
@@ -1417,13 +1487,6 @@ impl Runtime {
                         ),
                     }
                 }
-                other => TaskAction::VmResult(
-                    task_id,
-                    task.vm_owner.take().expect("VM call has a return owner"),
-                    Err(sema_core::SemaError::eval(format!(
-                        "unsupported runtime VM async yield: {other:?}"
-                    ))),
-                ),
             },
             Ok(VmExecResult::Finished(value)) => TaskAction::VmResult(
                 task_id,
@@ -1655,6 +1718,7 @@ impl Runtime {
             TaskAction::VmChannelTryRecv(task_id, channel) => {
                 self.channel_try_receive(task_id, channel)?
             }
+            TaskAction::VmAwaitIo(task_id, handle) => self.await_io(task_id, handle)?,
             #[cfg(test)]
             TaskAction::Timer(task_id, deadline) => {
                 let mut state = self.state.borrow_mut();
@@ -2876,6 +2940,113 @@ impl Runtime {
         self.resume_running_vm(task_id, VmResume::Value(value))
     }
 
+    /// Park a VM task on a legacy `AwaitIo` handle (the `LegacyAwaitIoBridge`).
+    /// The offloaded job already runs on the IO pool; here we poll the handle
+    /// ONCE (it may already be done — a cached completion, a fast checkout) and,
+    /// if still pending, register an internal wait and record the handle so
+    /// `poll_io_waits` drives it to completion on the VM thread. A ready result
+    /// resumes the frame in place with the decoded value, or raises the error at
+    /// the parked call site (so an enclosing try/catch can catch it — matching
+    /// the op's synchronous `Err` return).
+    fn await_io(
+        &self,
+        task_id: TaskId,
+        handle: Rc<sema_core::IoHandle>,
+    ) -> Result<(), RuntimeFault> {
+        // Poll OUTSIDE any `state` borrow: the poller closure runs post-call work
+        // (decode, cache write, usage accounting) that may allocate GC values,
+        // and GC tracing re-borrows the runtime state.
+        match handle.poll() {
+            sema_core::IoPoll::Ready(Ok(value)) => {
+                return self.resume_running_vm(task_id, VmResume::Value(value));
+            }
+            sema_core::IoPoll::Ready(Err(msg)) => {
+                return self.resume_running_vm(task_id, VmResume::Fail(await_io_error(msg)));
+            }
+            sema_core::IoPoll::Pending => {}
+        }
+        let mut state = self.state.borrow_mut();
+        let key = state
+            .waits
+            .as_ref()
+            .expect("wait runtime installed")
+            .issue_internal_wait()
+            .map_err(|_| RuntimeFault::IdExhausted { kind: "wait" })?;
+        state
+            .tasks
+            .get_mut(&task_id)
+            .ok_or_else(|| RuntimeFault::Invariant {
+                message: "awaiting-io VM task disappeared".into(),
+            })?
+            .record
+            .wait(key)
+            .map_err(|error| RuntimeFault::Invariant {
+                message: format!("awaiting-io VM task failed to wait: {error:?}"),
+            })?;
+        state.io_waits.insert(task_id, (key, handle));
+        Ok(())
+    }
+
+    /// Drive every parked `AwaitIo` handle ON THE VM THREAD (the handles are not
+    /// `Send`, so they cannot be polled on a worker). A handle that reports
+    /// `Ready` wakes its task and injects the decoded value (or raises the error
+    /// in-frame). Returns whether any task was woken. Bounded by the number of
+    /// parked handles; the poll closures are non-blocking (`try_recv`).
+    fn poll_io_waits(&self) -> Result<bool, RuntimeFault> {
+        // Snapshot the parked handles (cloning the `Rc`s) and DROP the borrow
+        // before polling: a poller may allocate GC values whose tracing
+        // re-borrows the runtime state.
+        let parked: Vec<(TaskId, super::WaitKey, Rc<sema_core::IoHandle>)> = {
+            let state = self.state.borrow();
+            if state.io_waits.is_empty() {
+                return Ok(false);
+            }
+            state
+                .io_waits
+                .iter()
+                .map(|(task_id, (key, handle))| (*task_id, *key, Rc::clone(handle)))
+                .collect()
+        };
+        let mut ready: Vec<(TaskId, super::WaitKey, VmResume)> = Vec::new();
+        for (task_id, key, handle) in parked {
+            match handle.poll() {
+                sema_core::IoPoll::Pending => {}
+                sema_core::IoPoll::Ready(Ok(value)) => {
+                    ready.push((task_id, key, VmResume::Value(value)));
+                }
+                sema_core::IoPoll::Ready(Err(msg)) => {
+                    ready.push((task_id, key, VmResume::Fail(await_io_error(msg))));
+                }
+            }
+        }
+        if ready.is_empty() {
+            return Ok(false);
+        }
+        let mut state = self.state.borrow_mut();
+        for (task_id, key, resume) in ready {
+            // The task may have been cancelled (and its io_wait aborted+dropped)
+            // between the snapshot poll and here — skip it if the entry is gone.
+            if state.io_waits.remove(&task_id).is_none() {
+                continue;
+            }
+            let task = state
+                .tasks
+                .get_mut(&task_id)
+                .ok_or_else(|| RuntimeFault::Invariant {
+                    message: "io-wait task disappeared before wake".into(),
+                })?;
+            task.record
+                .wake(key)
+                .map_err(|error| RuntimeFault::Invariant {
+                    message: format!("io-wait task failed to wake: {error:?}"),
+                })?;
+            task.vm_resume = Some(resume);
+            let root = task.record.relations().origin_root;
+            state.ready.enqueue(root, task_id);
+        }
+        Ok(true)
+    }
+
     /// Resume a VM-quantum task parked on a channel op with a rendezvous wake. A
     /// `Sent` ack resumes with nil, a `Received` with the value, and a `Closed`
     /// with nil (receiver — closed sentinel) or a closed-send error (sender).
@@ -3543,6 +3714,15 @@ impl Runtime {
 /// Format a spawned-task rejection as an `async/await` error, stripping any
 /// already-present prefix so chained awaits don't nest it. Mirrors the
 /// stdlib `async/await` rejection formatting.
+/// The error raised in-frame when a legacy `AwaitIo` poll reports `Ready(Err)`.
+/// The offloaded op's poller already formatted the failure into a message
+/// (identical to what the op's SYNCHRONOUS path stringifies), so surface it as a
+/// plain catchable eval error — mirroring the legacy scheduler, which rejects the
+/// task's promise with this same message string.
+fn await_io_error(message: String) -> sema_core::SemaError {
+    sema_core::SemaError::eval(message)
+}
+
 fn await_rejected_error(message: &str) -> sema_core::SemaError {
     let core = message
         .strip_prefix("Eval error: async/await: task rejected: ")
@@ -4023,6 +4203,10 @@ enum TaskAction {
     /// `channel/try-recv`: drain one value from the ChannelRegistry non-blocking
     /// and resume the task (`TaskId`) in place with the value or nil sentinel.
     VmChannelTryRecv(TaskId, Rc<sema_core::Channel>),
+    /// Legacy `AwaitIo(IoHandle)`: park the task (`TaskId`) on the offloaded-I/O
+    /// poll handle until it reports Ready, then resume the frame with the decoded
+    /// value (or raise the error in-frame). The `LegacyAwaitIoBridge`.
+    VmAwaitIo(TaskId, Rc<sema_core::IoHandle>),
     #[cfg(test)]
     Timer(TaskId, Instant),
     #[cfg(test)]
@@ -4164,6 +4348,12 @@ impl Trace for TaskAction {
                 sink(sema_core::cycle::GcEdge::Value(&handle));
                 true
             }
+            // An `IoHandle` is a boxed `FnMut` poller; it is not a GC candidate
+            // and holds no live Sema `Value` (the result Value does not exist
+            // until the offloaded job completes and the poller decodes it), so
+            // there is no edge to trace — mirroring the legacy scheduler, which
+            // also never traces a `Blocked(AwaitIo)` handle's internals.
+            Self::VmAwaitIo(_, _) => true,
             #[cfg(test)]
             Self::NativeCall(_, _) => true,
             #[cfg(test)]

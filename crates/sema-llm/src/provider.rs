@@ -32,6 +32,18 @@ pub trait LlmProvider: Send + Sync {
     fn complete(&self, request: ChatRequest) -> Result<ChatResponse, LlmError>;
     fn default_model(&self) -> &str;
 
+    /// True when this provider's `complete`/`embed` re-enters the Sema VM on the
+    /// CALLING (VM) thread — i.e. a `LispProvider` built by
+    /// `llm/define-provider`, whose `:complete` closure is dispatched through the
+    /// VM-thread callback context. Such a provider CANNOT be offloaded to a pool
+    /// worker (the worker has no VM/callback context), so the cooperative
+    /// async/runtime path must run it SYNCHRONOUSLY on the VM thread instead of
+    /// offloading + yielding `AwaitIo`. Native (HTTP/SDK) providers return
+    /// `false` and are offloaded.
+    fn runs_on_vm_thread(&self) -> bool {
+        false
+    }
+
     /// Async completion hook for the cancellable offload path.
     ///
     /// `Some(fut)`: the provider exposes its native async implementation; the

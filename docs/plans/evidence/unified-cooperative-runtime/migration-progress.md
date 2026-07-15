@@ -56,9 +56,54 @@ async ops + runtime + cycle.rs. DAP/wasm async-DEBUG (which can't run runtime-on
 deferred via #[ignore] + a runtime cooperative-debug-mode future item; sync debugging is
 unaffected.
 
+## Committed gates (continued)
+
+- **D2** `feat: migrate promises to canonical PromiseRegistry` — AsyncPromise→{id}, all 12
+  promise ops structural, legacy promise bridge deleted (−622 lines), LegacyPromise split.
+  Verified by 3 independent adversarial passes (combinators/cancellation, await/GC, async/run/
+  stress); the supplied-promise-not-cancelled contract holds; 5000-item churn stable; all
+  stress examples pass. Two findings fixed/documented (below).
+- **fix**: structured-condition numeric fields (`:duration-ms`/`:root-id`/…) emitted as integers
+  (were strings, violating the plan contract). ASYNC-RUN-BARRIER-1 documented: `async/run` is a
+  ready-drain not the plan's transitive settle-barrier; a naive barrier reintroduces
+  self-await/channel-rendezvous deadlocks, so the safe drain stays (plan-owner decision).
+- **D3** `feat: migrate channels to canonical ChannelRegistry` — Channel→{id}, 9 channel ops
+  structural, channel bridge deleted, LegacyChannel split (scheduler.rs needed no edits). Full
+  channel now BLOCKS when full (plan-conformant). Bonus: `(map channel/recv ...)` now works
+  (yielding natives as direct HOF callbacks). Green + stress examples pass.
+- **E** `feat(stdlib): HOFs emit cooperative Call via structural ABI` — map/filter/foldl/reduce/
+  for-each/sort-by dual-ABI runtime_func returning Call directly (continuation state machines
+  unchanged). NativeYield kept (I/O still used it).
+- **F1** `feat(stdlib): external-I/O ops return Suspend structurally; delete NativeYield bridge`
+  — the 12 io/system/llm/mcp ops already on WaitKind::External moved off the NativeYield bridge
+  to structural returns; **NativeYield + PENDING_NATIVE_OUTCOME fully DELETED** (grep empty).
+- **F2 reference** `feat(stdlib): convert http I/O to structural WaitKind::External` — http ops
+  off the AwaitIo(IoHandle) bridge to runtime_offload::external_io_interruptible. **Foundation
+  finding:** the executor async tier is reactor-less (sema-vm carries no tokio runtime), so
+  `interruptible_async` panics on a real reqwest future; offload uses `interruptible_blocking` +
+  `io_block_on` + a `tokio::select!` cancel race (preserves abort-on-cancel). Latent same bug in
+  sema-llm's interruptible_async path (never run with real network — only FakeProvider).
+
+## Known pre-existing red (fix in Step I)
+`llm_fake_test::agent_turn_boundary_collects_between_tool_turns` fails on a GC `:pruned >= 900`
+heuristic — CONFIRMED pre-existing (fails identically at the parent commit before F1). Most
+likely the threshold shifted when D2/D3 removed the promise/channel GC candidates (fewer objects
+to prune). Update the threshold to the new GC behaviour in Step I.
+
 ## Remaining sequence
 
-- **D2** (in progress): LegacyPromise split + AsyncPromise{id} reshape + convert 12 promise
+- **F2 fan-out (in progress)**: direct-fit modules (proc/git/sqlite/kv/serial/system) →
+  runtime_offload helper (interruptible_blocking for sync git2/rusqlite; io_block_on for async).
+- **F2 streaming**: ws/pty/serial/stream operate on a shared VM-thread-held connection; each
+  recv/send/connect is one-shot at the AwaitIo level but the connection must be worker-accessible
+  — assess tractability vs. documented deferral.
+- **F2 sema-llm/mcp**: convert their AwaitIo sites + fix the latent interruptible_async bug (or
+  route through the blocking helper).
+- **F2 finalize**: delete AwaitIo/IoHandle/io_waits/poll_io_waits/io_park/notify_io_complete +
+  the legacy_io_wakeup arm in run_exprs_via_runtime — only once ALL I/O is converted.
+- **Historical (superseded)**: the original D2 line below is kept for the record.
+
+- **D2** (done — see above): LegacyPromise split + AsyncPromise{id} reshape + convert 12 promise
   ops to structural + delete runtime legacy promise bridge (spawned_promises etc.) +
   OriginBarrier (async/run) + cycle.rs simplification + rewrite "task rejected" string tests
   to behaviour + #[ignore] DAP/wasm async-debug.

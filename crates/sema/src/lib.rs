@@ -156,7 +156,7 @@ impl InterpreterBuilder {
         sema_eval::load_prelude(&ctx, &global_env);
 
         Interpreter {
-            inner: sema_eval::Interpreter { global_env, ctx },
+            inner: sema_eval::Interpreter::from_parts(global_env, ctx),
             _otel_guard: guard,
         }
     }

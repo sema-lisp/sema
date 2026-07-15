@@ -918,6 +918,32 @@ occurrence and classification in evidence.
       runtime. The per-call Runtime shares the ctx correctly but rebuilds runtime
       state each eval — fine for synchronous evals, but the persistent runtime is
       required before detached cross-eval tasks can survive._
+    - _Progress (2026-07-15): PERSISTENT INTERPRETER-OWNED RUNTIME LANDED.
+      `Interpreter` now holds `runtime: Option<Runtime>`, constructed ONCE in
+      `Interpreter::new`/`new_with_sandbox` via a new `Interpreter::from_parts`
+      parts constructor (`build_runtime` shares `Rc::clone(&ctx)` +
+      `MonotonicClock` + `NullExecutor`); the three external struct literals
+      (`sema/src/lib.rs` builder, `sema-wasm` `new_with_options`) route through
+      `from_parts`. `run_exprs_via_runtime` no longer builds a per-call
+      `Runtime` — it `submit_root`s a fresh ROOT to the shared runtime and
+      drives that root to settlement while detached tasks from prior evals
+      advance fairly alongside (`poll_result` settles on the requested root
+      only). Drop ordering (eval.rs ~90): a BOUNDED `runtime.shutdown`
+      (finite 2s deadline + `DriveBudget::host_default`) cancels+reaps all
+      tasks and the runtime is dropped BEFORE the `EvalContext` value-store
+      clear + `global_env` release + `InterpreterDrop` collection, so runtime
+      task/promise/channel edges cannot pin the env past teardown; while
+      unwinding the field is left to its own bounded `close_for_interpreter_drop`
+      (no VM driving). GATES GREEN (un-ignored, `mod runtime_eval_tests`):
+      `runtime_detached_spawn_survives_across_evals` (spawn+define p in one
+      eval, `await p` → 42 in a SECOND eval — cross-eval detached survival) and
+      `runtime_drop_with_detached_timer_parked_task_does_not_hang` (drop with a
+      100000ms-sleep-parked detached task is bounded <2s). Full suites: sema-eval
+      91/0, sema-vm 0 failed, eval_test 1072/0, integration_test 1055/0,
+      vm_async_test 4 pre-existing RED, leak_test 7/0, gc_stress_test 48/0,
+      clippy+fmt clean. REMAINING Step-2 item: the actual flip of `eval`/`eval_str`
+      (not just the `*_via_runtime` entry points) onto the runtime + a real
+      executor / async-I/O (`NullExecutor` still rejects real I/O)._
 
 - [ ] **Step 3: Remove TLS scheduler ownership**
 

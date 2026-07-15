@@ -63,6 +63,33 @@ pub struct Interpreter {
     /// callbacks and an empty module cache. All fields are interior-mutable
     /// (`RefCell`/`Cell`), so shared `&` access is sufficient for mutation.
     pub ctx: Rc<EvalContext>,
+    /// Single, persistent unified runtime, constructed once and shared across
+    /// every runtime-backed eval (`eval_via_runtime`/`eval_str_via_runtime`).
+    /// Each call submits a fresh ROOT to this same runtime, so detached
+    /// `async/spawn` tasks, timers, promises and channels survive *between*
+    /// top-level evals (a per-call runtime rebuilt that state every time and
+    /// silently dropped anything not settled within one call). `Option` so
+    /// `Drop` can `take()` and shut it down BEFORE the global-env teardown
+    /// collection (see `Drop`); it is always `Some` outside of `Drop`.
+    runtime: Option<Runtime>,
+}
+
+use sema_vm::runtime::Runtime;
+
+/// Build the interpreter-owned persistent runtime that shares `ctx`. Uses the
+/// same host adapters as the former per-call construction (`MonotonicClock` +
+/// `NullExecutor`); the synchronous runtime path never submits I/O. Fresh
+/// runtime construction does not fail in practice, so this is infallible —
+/// a failure would mean the wait-runtime could not allocate identity, which
+/// only happens under a corrupt/exhausted global counter.
+fn build_runtime(ctx: &Rc<EvalContext>) -> Runtime {
+    use sema_vm::runtime::{MonotonicClock, NullExecutor};
+    Runtime::new(
+        Rc::clone(ctx),
+        Rc::new(MonotonicClock),
+        std::sync::Arc::new(NullExecutor),
+    )
+    .expect("fresh unified runtime construction cannot fail")
 }
 
 impl Default for Interpreter {
@@ -83,9 +110,28 @@ impl Drop for Interpreter {
         // the collector would be a panic-in-destructor-during-cleanup, which
         // aborts the whole process instead of unwinding. Nothing is lost —
         // the candidates stay registered, so the next safe point on this
-        // thread reclaims the env.
+        // thread reclaims the env. The persistent runtime field is left in
+        // place; its own `Drop` (`close_for_interpreter_drop`) cancels every
+        // task and closes the inbox WITHOUT driving any VM quantum, so it is
+        // bounded and panic-safe (no re-entrant evaluation while unwinding).
         if std::thread::panicking() {
             return;
+        }
+        // Tear down the persistent unified runtime BEFORE the global-env
+        // teardown collection below. Its task VMs / promises / channels hold
+        // `Rc<Env>` and `Value` edges (a still-parked/detached `async/spawn`
+        // task keeps a whole VM alive); if those outlive the collect, the env
+        // stays externally referenced and trial deletion frees nothing. A
+        // BOUNDED `shutdown` (finite deadline + host drive budget) cancels and
+        // reaps all tasks — it can never hang — and dropping the runtime then
+        // releases its state so the collection reclaims the env.
+        if let Some(runtime) = self.runtime.take() {
+            let options = sema_vm::runtime::ShutdownOptions {
+                deadline: std::time::Instant::now() + std::time::Duration::from_secs(2),
+                drive_budget: sema_vm::runtime::DriveBudget::host_default(),
+            };
+            let _ = runtime.shutdown(&options);
+            drop(runtime);
         }
         // `self.ctx` outlives this Drop body (fields drop after it), and its
         // caches hold Values: module-cache export closures keep their module
@@ -129,7 +175,7 @@ impl Interpreter {
         register_vm_delegates(&global_env);
         let ctx = Rc::new(ctx);
         load_prelude(&ctx, &global_env);
-        Interpreter { global_env, ctx }
+        Self::from_parts(global_env, ctx)
     }
 
     pub fn new_with_sandbox(sandbox: &sema_core::Sandbox) -> Self {
@@ -148,7 +194,20 @@ impl Interpreter {
         register_vm_delegates(&global_env);
         let ctx = Rc::new(ctx);
         load_prelude(&ctx, &global_env);
-        Interpreter { global_env, ctx }
+        Self::from_parts(global_env, ctx)
+    }
+
+    /// Assemble an interpreter from an already-populated global env + context,
+    /// constructing the persistent runtime once. Embedders that build the env
+    /// and context by hand (the `sema` crate's builder, the wasm bindings) MUST
+    /// go through here rather than the struct literal so they get the runtime.
+    pub fn from_parts(global_env: Rc<Env>, ctx: Rc<EvalContext>) -> Self {
+        let runtime = build_runtime(&ctx);
+        Interpreter {
+            global_env,
+            ctx,
+            runtime: Some(runtime),
+        }
     }
 
     /// Evaluate a single expression on the VM. M6: the VM is the sole evaluator.
@@ -195,9 +254,7 @@ impl Interpreter {
     /// Macro-expand, compile, and drive a sequence of top-level forms as one
     /// root on the unified runtime. Shared by the runtime eval entry points.
     fn run_exprs_via_runtime(&self, exprs: &[Value]) -> EvalResult {
-        use sema_vm::runtime::{
-            DriveBudget, DriveState, MonotonicClock, NullExecutor, RootPoll, Runtime,
-        };
+        use sema_vm::runtime::{DriveBudget, DriveState, RootPoll};
 
         let expanded = expand_for_vm_batch(&self.ctx, &self.global_env, exprs)?;
         let known_natives = collect_native_names(&self.global_env);
@@ -216,17 +273,17 @@ impl Interpreter {
         )?;
         vm.seed_main_frame(prog.closure);
 
-        // Share THIS interpreter's context — not a fresh one — so the VM's
-        // `call_value`/`eval_value` re-entry (which dispatches through
-        // `sema_core::call_callback(ctx, …)`) resolves the callbacks the
-        // interpreter registered, and so the live module cache / current-file /
-        // dynamic context persist across runtime evals.
-        let runtime = Runtime::new(
-            Rc::clone(&self.ctx),
-            Rc::new(MonotonicClock),
-            std::sync::Arc::new(NullExecutor),
-        )
-        .map_err(|e| SemaError::eval(format!("runtime init failed: {e:?}")))?;
+        // Submit as a fresh ROOT to the interpreter's single persistent runtime
+        // (constructed once over THIS interpreter's context, so the VM's
+        // `call_value`/`eval_value` re-entry resolves the registered callbacks
+        // and the live module cache / current-file / dynamic context persist).
+        // Detached tasks from prior evals remain in this runtime and are driven
+        // fairly alongside the new root; `poll_result` only settles when the
+        // requested root itself settles, not when every detached task does.
+        let runtime = self
+            .runtime
+            .as_ref()
+            .expect("runtime is present outside of Drop");
         let handle = runtime
             .submit_root(vm)
             .map_err(|e| SemaError::eval(format!("root submission failed: {e:?}")))?;
@@ -2227,6 +2284,59 @@ mod runtime_eval_tests {
             .eval_str_via_runtime("(await (async/spawn (fn () (async/sleep 2) 7)))")
             .expect("a spawned task that sleeps resolves through the runtime");
         assert_eq!(result, Value::int(7));
+    }
+
+    // ── PERSISTENT INTERPRETER-OWNED RUNTIME (Task 03 Step 2) ─────────
+
+    // GATE (cross-eval detached survival): a task spawned and PERSISTED (via a
+    // global `define`) in ONE `eval_str_via_runtime` call must still exist and
+    // be drivable in a SECOND, SEPARATE call that awaits it. With a per-call
+    // runtime the spawned task's registry/timer/promise state was rebuilt every
+    // call, so the promise `p` referenced in the second call pointed at nothing
+    // and `await` could not resolve. With a single interpreter-owned runtime the
+    // detached task (parked on its `async/sleep` timer at the end of call one)
+    // survives and its timer fires while the second root drives, resolving `p`.
+    #[test]
+    fn runtime_detached_spawn_survives_across_evals() {
+        let interp = Interpreter::new();
+        // Call 1: spawn a task that sleeps then yields 42, persist its promise.
+        // The root of call 1 settles immediately (it only `define`s p); the
+        // spawned task is detached and still parked on its timer afterward.
+        interp
+            .eval_str_via_runtime("(define p (async/spawn (fn () (async/sleep 2) 42)))")
+            .expect("call 1 defines the persisted spawn promise");
+        // Call 2: a fresh root on the SAME runtime awaits the promise from call
+        // 1. Only survives if the detached task lived on between evals.
+        let result = interp
+            .eval_str_via_runtime("(await p)")
+            .expect("the detached task from call 1 is still drivable in call 2");
+        assert_eq!(result, Value::int(42));
+    }
+
+    // GATE (clean drop with a detached timer-parked task): an interpreter whose
+    // persistent runtime still holds a detached task parked on a timer must drop
+    // WITHOUT hanging. `Drop` runs a BOUNDED `shutdown` (finite deadline) that
+    // cancels + reaps the task before the global-env teardown collection. If the
+    // shutdown could hang this test would hang the process; the wall-clock
+    // assertion turns a partial regression into a failure rather than a timeout.
+    #[test]
+    fn runtime_drop_with_detached_timer_parked_task_does_not_hang() {
+        let start = std::time::Instant::now();
+        {
+            let interp = Interpreter::new();
+            // Detach a long-sleeping task and return before it can fire, so the
+            // interpreter is dropped with the task still parked on its timer.
+            let result = interp
+                .eval_str_via_runtime("(async/spawn (fn () (async/sleep 100000) 1)) 7")
+                .expect("root returns with a detached timer-parked task still live");
+            assert_eq!(result, Value::int(7));
+        } // interp dropped here — bounded shutdown must not wait out the 100s timer
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "dropping an interpreter with a detached timer-parked task must be \
+             bounded, not block on the sleep deadline (took {elapsed:?})",
+        );
     }
 
     // ── ADVERSARIAL VERIFICATION (spawn/await seam) ──────────────────

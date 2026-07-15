@@ -896,6 +896,52 @@ impl Runtime {
                 return Ok(true);
             }
         }
+        {
+            // A VM task parked on `channel/send` / `channel/recv`. It is tracked
+            // ONLY in `channel_waits`, with a key minted by `issue_internal_wait`
+            // that is NEVER inserted into `WaitRuntime::active` — so the generic
+            // fallback below (`waits.cancel`) would return None without waking it,
+            // yet still claim progress, spinning shutdown's cancel loop forever
+            // (the `close_for_interpreter_drop` / channel-parked-task hang). Handle
+            // it here: deregister from the channel queue, drop the entry, and wake
+            // it so the cancellation settles it Cancelled on its next visit.
+            let mut state = self.state.borrow_mut();
+            let selected = state.tasks.iter().find_map(|(id, task)| {
+                let key = task.record.wait_key()?;
+                (task.record.cancellation().is_some()
+                    && state.channel_waits.get(id).map(|(k, _, _)| *k) == Some(key))
+                .then_some((*id, key))
+            });
+            if let Some((task_id, key)) = selected {
+                if let Some((_, channel, _)) = state.channel_waits.remove(&task_id) {
+                    // A cancelled blocked SENDER's unsent value is returned here and
+                    // dropped: it was never delivered to any receiver, so discarding
+                    // it (rather than buffering or re-queuing) is the correct channel
+                    // semantics and leaks nothing — the sender is removed from the
+                    // channel's queue so it is neither double-counted nor traced as
+                    // live. A receiver cancel returns nothing to drop.
+                    if let Err(error) = state.channels.cancel_wait(channel, key) {
+                        return Err(RuntimeFault::Invariant {
+                            message: format!(
+                                "cancelled channel wait failed to deregister: {error:?}"
+                            ),
+                        });
+                    }
+                }
+                let task = state
+                    .tasks
+                    .get_mut(&task_id)
+                    .expect("selected channel-waiting task exists");
+                task.record
+                    .wake(key)
+                    .map_err(|error| RuntimeFault::Invariant {
+                        message: format!("cancelled channel task failed to wake: {error:?}"),
+                    })?;
+                let root = task.record.relations().origin_root;
+                state.ready.enqueue(root, task_id);
+                return Ok(true);
+            }
+        }
         let extracted = {
             let mut state = self.state.borrow_mut();
             let Some(task_id) = state.tasks.iter().find_map(|(id, task)| {
@@ -928,8 +974,16 @@ impl Runtime {
                 .expect("cancelled task restored")
                 .pending_resume = Some(pending);
             state.ready.enqueue(root, task_id);
+            return Ok(true);
         }
-        Ok(true)
+        // `waits.cancel` found no matching `WaitRuntime::active` entry and nothing
+        // was woken, so this turn made no real progress on the task — it is still
+        // Waiting. Every internal-wait kind that parks a task off `active`
+        // (promise / promise-set / protocol / timer / channel) is drained by a
+        // dedicated branch above; reaching here means an unhandled wait kind.
+        // Report no progress rather than a false `Ok(true)`, which would spin the
+        // shutdown cancel loop forever (the class of bug the channel branch fixes).
+        Ok(false)
     }
 
     fn drain_completion(&self) -> bool {

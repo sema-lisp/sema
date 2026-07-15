@@ -85,3 +85,39 @@ Task 03: reconciling these baseline snapshots and the ADR #69 allowlist is part
 of finishing the runtime-module seam. Per the compile-restoration mandate ("Do
 NOT alter test oracles"), the baselines were left untouched and the drift is
 recorded here rather than silenced.
+
+## Critical channel-cancel hang (found by adversarial verification, FIXED)
+
+Three independent adversarial reviewers confirmed an infinite-hang bug in
+`RuntimeState::cancel_waiting` (`crates/sema-vm/src/runtime/state.rs`). It had
+dedicated branches for `promise_waits`, `promise_set_waits`, `protocol_waits`,
+and `timers`, but **none for `channel_waits`**. A VM task parked on
+`channel/send` / `channel/recv` is tracked only in `channel_waits`, with a key
+minted by `WaitRuntime::issue_internal_wait` that is never inserted into
+`WaitRuntime::active`. A sticky cancellation on such a task fell through to the
+generic fallback, whose `waits.cancel(key)` returned `None` without waking the
+task, yet the fallback still returned `Ok(true)` unconditionally — so the task
+stayed `Waiting` forever and `cancel_waiting` re-selected it and spun.
+
+Reachable both ways:
+- `close_for_interpreter_drop` / `shutdown` run
+  `while matches!(self.cancel_waiting(), Ok(true)) {}` → infinite loop / process
+  hang on `Runtime` drop (e.g. a detached `(async/spawn (fn () (channel/recv …)))`).
+- `(async/cancel <channel-parked-task>)` never settled; `async/cancelled?`
+  stayed `#f`; a parent `async/await` hung. Also hit by `async/spawn-all` /
+  `async/pool-map` owned fail-fast cancelling channel-parked workers.
+
+**Fix:** added a `channel_waits` branch to `cancel_waiting` that deregisters the
+task from the `ChannelRegistry` (`channels.cancel_wait`, dropping a cancelled
+blocked sender's unsent value), removes the `channel_waits` entry, and wakes the
+task so it settles Cancelled on its next visit — mirroring the `promise_waits`
+branch. The generic fallback was hardened to return `Ok(false)` (no progress)
+instead of `Ok(true)` when `waits.cancel` matched nothing and nothing was woken,
+so any future off-`active` wait kind can never reintroduce the spin.
+
+**Regression tests** (bounded, in `sema-eval` `mod runtime_eval_tests`; a wrong
+fix fails a wall-clock assertion or CI timeout rather than hanging):
+`runtime_cancel_channel_recv_parked_task_settles_cancelled`,
+`runtime_drop_with_channel_parked_task_does_not_hang` (the hang proof),
+`runtime_drop_with_channel_send_parked_task_does_not_hang` (sender path),
+`runtime_owned_fail_fast_cancels_channel_parked_worker`.

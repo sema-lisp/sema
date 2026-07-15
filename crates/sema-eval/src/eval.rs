@@ -2579,6 +2579,111 @@ mod runtime_eval_tests {
         );
     }
 
+    // REGRESSION (critical channel-cancel hang): a spawned task parked on
+    // `channel/recv` is tracked ONLY in `channel_waits`, with a wait key that is
+    // never registered in `WaitRuntime::active`. Before the fix, `cancel_waiting`
+    // had no `channel_waits` branch, so such a task fell through to the generic
+    // fallback which returned `Ok(true)` WITHOUT waking it — leaving it Waiting
+    // forever and spinning the cancel loop (an infinite hang on cancel/drop).
+    // These tests are BOUNDED: a regression fails via a wall-clock assertion or a
+    // CI timeout, never a silent pass.
+
+    // GATE A: cancelling a channel-recv-parked spawned task settles it Cancelled
+    // PROMPTLY; `async/cancelled?` is #t and `await` raises a catchable
+    // `:cancelled` condition. Completes well under a second (no hang).
+    #[test]
+    fn runtime_cancel_channel_recv_parked_task_settles_cancelled() {
+        let interp = Interpreter::new();
+        let start = std::time::Instant::now();
+        let result = interp
+            .eval_str_via_runtime(
+                "(let ((p (async/spawn (fn () (channel/recv (channel/new 1)))))) \
+                   (async/cancel p) \
+                   (list (try (await p) (catch e (:type e))) (async/cancelled? p)))",
+            )
+            .expect("a cancelled channel-recv-parked task settles through the runtime");
+        let elapsed = start.elapsed();
+        assert_eq!(
+            result,
+            Value::list(vec![Value::keyword("cancelled"), Value::bool(true)]),
+            "await raises :cancelled and the promise is Cancelled",
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "cancellation of a channel-parked task must be prompt, not a hang (took {elapsed:?})",
+        );
+    }
+
+    // GATE B: THE HANG PROOF. A detached task left parked on `channel/recv` when
+    // the root returns means the `Runtime` (created inside `run_exprs_via_runtime`)
+    // drops with a channel-parked task still live — running
+    // `close_for_interpreter_drop`'s `while cancel_waiting() == Ok(true) {}` loop.
+    // Before the fix that loop never terminates, so `eval_str_via_runtime` would
+    // NEVER RETURN. If this test returns at all, the drop completed cleanly. The
+    // wall-clock assertion makes a partial regression fail rather than merely
+    // relying on the CI timeout.
+    #[test]
+    fn runtime_drop_with_channel_parked_task_does_not_hang() {
+        let interp = Interpreter::new();
+        let start = std::time::Instant::now();
+        let result = interp
+            .eval_str_via_runtime("(async/spawn (fn () (channel/recv (channel/new 1)))) 42")
+            .expect("root returns even though a detached task is parked on a channel");
+        let elapsed = start.elapsed();
+        assert_eq!(result, Value::int(42));
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "the Runtime must drop cleanly with a channel-parked task, not hang \
+             in the cancel loop (took {elapsed:?})",
+        );
+    }
+
+    // GATE C: a channel-SEND-parked detached task (capacity-0 channel, no
+    // receiver) also cancels cleanly on drop — exercises the cancelled-blocked-
+    // SENDER path (its unsent value is dropped, not leaked or double-counted).
+    #[test]
+    fn runtime_drop_with_channel_send_parked_task_does_not_hang() {
+        let interp = Interpreter::new();
+        let start = std::time::Instant::now();
+        let result = interp
+            .eval_str_via_runtime(
+                "(async/spawn (fn () (let ((c (channel/new 1))) (channel/send c 1) (channel/send c 99)))) 7",
+            )
+            .expect("root returns even though a detached task is parked sending on a channel");
+        let elapsed = start.elapsed();
+        assert_eq!(result, Value::int(7));
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "a channel-send-parked task must cancel cleanly on drop (took {elapsed:?})",
+        );
+    }
+
+    // GATE D: owned fail-fast that cancels a worker parked on `channel/recv`
+    // (the semaphore is a channel) completes with the correct result and no hang.
+    #[test]
+    fn runtime_owned_fail_fast_cancels_channel_parked_worker() {
+        let interp = Interpreter::new();
+        let start = std::time::Instant::now();
+        let result = interp
+            .eval_str_via_runtime(
+                "(begin \
+                   (define ch (channel/new 1)) \
+                   (define outcome \
+                     (try (async/spawn-all \
+                            (list (fn () (error \"boom\")) \
+                                  (fn () (channel/recv ch)))) \
+                          (catch e :caught))) \
+                   outcome)",
+            )
+            .expect("owned fail-fast cancels a channel-parked sibling and settles");
+        let elapsed = start.elapsed();
+        assert_eq!(result, Value::keyword("caught"));
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "owned fail-fast over a channel-parked worker must not hang (took {elapsed:?})",
+        );
+    }
+
     // ── OWNED CONCURRENCY (Task 04) ───────────────────────────────────
     // Thunk-taking combinators OWN the tasks they create: on a fail-fast
     // settlement they CANCEL and reap every unfinished child before propagating.

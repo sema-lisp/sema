@@ -1,16 +1,13 @@
-use std::cell::{Cell, RefCell};
-use std::collections::VecDeque;
-use std::rc::Rc;
-
 use sema_core::cycle::GcEdge;
 use sema_core::runtime::{
-    ChannelQuery, NativeCallContext, NativeContinuation, NativeOutcome, NativeResult, NativeSuspend,
-    PromiseId, PromiseSetMode, PromiseSetWait, ResumeInput, RuntimeRequest, RuntimeResponse,
-    TaskOutcome, TaskSettlement, Trace, WaitKind,
+    ChannelId, ChannelOperation, ChannelQuery, ChannelReceive, ChannelSend, ChannelWait,
+    NativeCallContext, NativeContinuation, NativeOutcome, NativeResult, NativeSuspend, PromiseId,
+    PromiseSetMode, PromiseSetWait, ResumeInput, RuntimeRequest, RuntimeResponse, TaskOutcome,
+    TaskSettlement, Trace, WaitKind,
 };
 use sema_core::{
-    check_arity, in_async_context, in_runtime_quantum, set_yield_signal, take_resume_value, Channel,
-    Env, NativeFn, SemaError, Value, ValueView, YieldReason,
+    check_arity, in_async_context, in_runtime_quantum, set_yield_signal, take_resume_value, Env,
+    NativeFn, SemaError, Value, ValueView, YieldReason,
 };
 
 use crate::register_fn;
@@ -125,9 +122,12 @@ fn expect_promise(args: &[Value], _name: &str, idx: usize) -> Result<PromiseId, 
     }
 }
 
-fn expect_channel(args: &[Value], _name: &str, idx: usize) -> Result<Rc<Channel>, SemaError> {
+/// Extract the runtime `ChannelId` from a `Channel` handle value. The registry
+/// (not the handle) owns the buffer/state; every channel op threads this id to
+/// the runtime.
+fn expect_channel(args: &[Value], _name: &str, idx: usize) -> Result<ChannelId, SemaError> {
     match args[idx].view() {
-        ValueView::Channel(c) => Ok(c),
+        ValueView::Channel(c) => Ok(c.id),
         _ => Err(SemaError::type_error_with_value(
             "channel",
             args[idx].type_name(),
@@ -620,13 +620,209 @@ fn register_promise_ops(env: &Env) {
 
 // ── Channel operations ───────────────────────────────────────────
 
+/// The error raised when `channel/send` finds the channel closed (eagerly or
+/// while a blocked sender is woken by a close). Names the dropped value so a
+/// caller can see which send was lost.
+fn channel_send_closed_error(value: &Value) -> SemaError {
+    SemaError::eval(format!(
+        "channel/send: channel is closed; value {value} was dropped"
+    ))
+}
+
+/// Continuation turning a runtime-allocated `ChannelId` (from `CreateChannel`)
+/// into the language-facing channel handle. Holds no `Value`.
+struct ChannelHandleCont;
+
+impl Trace for ChannelHandleCont {
+    fn trace(&self, _sink: &mut dyn FnMut(GcEdge<'_>)) -> bool {
+        true
+    }
+}
+
+impl NativeContinuation for ChannelHandleCont {
+    fn resume(
+        self: Box<Self>,
+        _context: &mut NativeCallContext<'_>,
+        input: ResumeInput,
+    ) -> NativeResult {
+        match input {
+            ResumeInput::Runtime(RuntimeResponse::Channel(id)) => {
+                Ok(NativeOutcome::Return(Value::channel_id(id)))
+            }
+            ResumeInput::Failed(error) => Err(error),
+            _ => Err(SemaError::eval(
+                "channel/new: unexpected runtime response",
+            )),
+        }
+    }
+}
+
+/// `channel/send` continuation: `Sent` → nil; `Closed` → the closed-send error
+/// naming the dropped value (carried here for the message — the runtime consumed
+/// the sent copy).
+struct SendCont {
+    value: Value,
+}
+
+impl Trace for SendCont {
+    fn trace(&self, sink: &mut dyn FnMut(GcEdge<'_>)) -> bool {
+        sink(GcEdge::Value(&self.value));
+        true
+    }
+}
+
+impl NativeContinuation for SendCont {
+    fn resume(
+        self: Box<Self>,
+        _context: &mut NativeCallContext<'_>,
+        input: ResumeInput,
+    ) -> NativeResult {
+        match input {
+            ResumeInput::Runtime(RuntimeResponse::Send(ChannelSend::Sent)) => {
+                Ok(NativeOutcome::Return(Value::nil()))
+            }
+            ResumeInput::Runtime(RuntimeResponse::Send(ChannelSend::Closed)) => {
+                Err(channel_send_closed_error(&self.value))
+            }
+            ResumeInput::Failed(error) => Err(error),
+            ResumeInput::Cancelled(_) => Err(cancelled_error()),
+            _ => Err(SemaError::eval("channel/send: unexpected runtime response")),
+        }
+    }
+}
+
+/// `channel/recv` continuation: `Received(v)` → v; `Closed` → nil (the documented
+/// closed-and-empty sentinel).
+struct RecvCont;
+
+impl Trace for RecvCont {
+    fn trace(&self, _sink: &mut dyn FnMut(GcEdge<'_>)) -> bool {
+        true
+    }
+}
+
+impl NativeContinuation for RecvCont {
+    fn resume(
+        self: Box<Self>,
+        _context: &mut NativeCallContext<'_>,
+        input: ResumeInput,
+    ) -> NativeResult {
+        match input {
+            ResumeInput::Runtime(RuntimeResponse::Receive(ChannelReceive::Received(value))) => {
+                Ok(NativeOutcome::Return(value))
+            }
+            ResumeInput::Runtime(RuntimeResponse::Receive(ChannelReceive::Closed))
+            | ResumeInput::Runtime(RuntimeResponse::Receive(ChannelReceive::Empty)) => {
+                Ok(NativeOutcome::Return(Value::nil()))
+            }
+            ResumeInput::Failed(error) => Err(error),
+            ResumeInput::Cancelled(_) => Err(cancelled_error()),
+            _ => Err(SemaError::eval("channel/recv: unexpected runtime response")),
+        }
+    }
+}
+
+/// `channel/try-recv` continuation: `Received(v)` → v; `Empty`/`Closed` → nil.
+struct TryRecvCont;
+
+impl Trace for TryRecvCont {
+    fn trace(&self, _sink: &mut dyn FnMut(GcEdge<'_>)) -> bool {
+        true
+    }
+}
+
+impl NativeContinuation for TryRecvCont {
+    fn resume(
+        self: Box<Self>,
+        _context: &mut NativeCallContext<'_>,
+        input: ResumeInput,
+    ) -> NativeResult {
+        match input {
+            ResumeInput::Runtime(RuntimeResponse::Receive(ChannelReceive::Received(value))) => {
+                Ok(NativeOutcome::Return(value))
+            }
+            ResumeInput::Runtime(RuntimeResponse::Receive(_)) => {
+                Ok(NativeOutcome::Return(Value::nil()))
+            }
+            ResumeInput::Failed(error) => Err(error),
+            _ => Err(SemaError::eval(
+                "channel/try-recv: unexpected runtime response",
+            )),
+        }
+    }
+}
+
+/// `channel/close` continuation: resume with nil regardless of whether this call
+/// transitioned the channel (the boolean is internal).
+struct CloseCont;
+
+impl Trace for CloseCont {
+    fn trace(&self, _sink: &mut dyn FnMut(GcEdge<'_>)) -> bool {
+        true
+    }
+}
+
+impl NativeContinuation for CloseCont {
+    fn resume(
+        self: Box<Self>,
+        _context: &mut NativeCallContext<'_>,
+        input: ResumeInput,
+    ) -> NativeResult {
+        match input {
+            ResumeInput::Runtime(RuntimeResponse::Value(_)) => {
+                Ok(NativeOutcome::Return(Value::nil()))
+            }
+            ResumeInput::Failed(error) => Err(error),
+            _ => Err(SemaError::eval("channel/close: unexpected runtime response")),
+        }
+    }
+}
+
+/// Continuation for the observational channel ops (`count`/`empty?`/`full?`/
+/// `closed?`): the runtime answers synchronously with the int/bool `Value`.
+struct ChannelValueCont;
+
+impl Trace for ChannelValueCont {
+    fn trace(&self, _sink: &mut dyn FnMut(GcEdge<'_>)) -> bool {
+        true
+    }
+}
+
+impl NativeContinuation for ChannelValueCont {
+    fn resume(
+        self: Box<Self>,
+        _context: &mut NativeCallContext<'_>,
+        input: ResumeInput,
+    ) -> NativeResult {
+        match input {
+            ResumeInput::Runtime(RuntimeResponse::Value(value)) => {
+                Ok(NativeOutcome::Return(value))
+            }
+            ResumeInput::Failed(error) => Err(error),
+            _ => Err(SemaError::eval("channel: unexpected runtime response")),
+        }
+    }
+}
+
+/// Build the `ChannelOp{Inspect(query)}` request for an observational channel op.
+fn inspect_channel(args: &[Value], name: &str, query: ChannelQuery) -> NativeResult {
+    check_arity!(args, name, 1);
+    let channel = expect_channel(args, name, 0)?;
+    Ok(NativeOutcome::Runtime(RuntimeRequest::ChannelOp {
+        channel,
+        operation: ChannelOperation::Inspect(query),
+        continuation: Box::new(ChannelValueCont),
+    }))
+}
+
 fn register_channel_ops(env: &Env) {
-    // channel/new — create a bounded channel
-    register_fn(env, "channel/new", |args| {
+    // channel/new — create a bounded channel in the registry, resume with its
+    // handle. Capacity validation stays here (the registry only allocates).
+    register_runtime_fn(env, "channel/new", |args| {
         check_arity!(args, "channel/new", 0..=1);
         // An upper bound keeps an unrepresentable/allocation-impossible request
-        // (e.g. `i64::MAX`) from reaching `VecDeque::with_capacity`, which would
-        // panic on the capacity-overflow rather than returning a Sema condition.
+        // (e.g. `i64::MAX`) from reaching the registry's buffer, which would panic
+        // on the capacity-overflow rather than returning a Sema condition.
         const MAX_CHANNEL_CAPACITY: usize = 1 << 24; // ~16M slots
         let capacity = if args.is_empty() {
             1
@@ -646,172 +842,74 @@ fn register_channel_ops(env: &Env) {
             }
             cap
         };
-        // Pre-reserve only a small prefix: the buffer is bounded by `capacity`
-        // via the send path, so a large declared capacity need not force an
-        // enormous up-front allocation.
-        let prealloc = capacity.min(4096);
-        Ok(Value::channel(Channel {
-            buffer: RefCell::new(VecDeque::with_capacity(prealloc)),
+        Ok(NativeOutcome::Runtime(RuntimeRequest::CreateChannel {
             capacity,
-            closed: Cell::new(false),
+            continuation: Box::new(ChannelHandleCont),
         }))
     });
 
-    // channel/send — send a value to a channel (yields if full in async context)
-    register_fn(env, "channel/send", |args| {
+    // channel/send — send a value; suspend until buffered/handed to a receiver.
+    // A full channel BLOCKS until space (the runtime parks the frame); a
+    // send-to-closed raises the closed error naming the dropped value.
+    register_runtime_fn(env, "channel/send", |args| {
         check_arity!(args, "channel/send", 2);
-        let ch = expect_channel(args, "channel/send", 0)?;
-        if ch.closed.get() {
-            return Err(SemaError::eval(format!(
-                "channel/send: channel is closed; value {} was dropped",
-                args[1]
-            )));
-        }
-        // Unified runtime: the ChannelRegistry is the single source of truth for
-        // buffering + rendezvous. Surface a ChannelSend yield; the runtime buffers
-        // (or parks until a receiver takes the value) and resumes this frame with
-        // nil. `channel/close` sets `ch.closed` above, so a send-to-closed still
-        // errors here without a yield (parity with the legacy path).
-        if in_runtime_quantum() {
-            set_yield_signal(YieldReason::ChannelSend(ch, args[1].clone()));
-            return Ok(Value::nil());
-        }
-        if in_async_context() {
-            if let Some(cached) = take_resume_value() {
-                return Ok(cached);
-            }
-        }
-        let mut buf = ch.buffer.borrow_mut();
-        if buf.len() >= ch.capacity {
-            drop(buf);
-            if in_async_context() {
-                set_yield_signal(YieldReason::ChannelSend(ch, args[1].clone()));
-                return Ok(Value::nil());
-            }
-            return Err(
-                SemaError::eval("channel/send: channel is full").with_hint(
-                    "Use async to run in an async context where send will yield until space is available",
-                ),
-            );
-        }
-        buf.push_back(args[1].clone());
-        Ok(Value::nil())
+        let channel = expect_channel(args, "channel/send", 0)?;
+        Ok(NativeOutcome::Suspend(NativeSuspend {
+            wait: WaitKind::Channel(ChannelWait::Send {
+                channel,
+                value: args[1].clone(),
+            }),
+            continuation: Box::new(SendCont {
+                value: args[1].clone(),
+            }),
+        }))
     });
 
-    // channel/recv — receive a value from a channel (yields if empty in async context)
-    register_fn(env, "channel/recv", |args| {
+    // channel/recv — receive a value; suspend until one is available. A closed +
+    // empty channel resumes with nil (the documented closed sentinel).
+    register_runtime_fn(env, "channel/recv", |args| {
         check_arity!(args, "channel/recv", 1);
-        let ch = expect_channel(args, "channel/recv", 0)?;
-        // Unified runtime: route through the ChannelRegistry. Surface a
-        // ChannelRecv yield; the runtime resumes this frame with the received
-        // value, or with nil when the channel is closed and empty (the documented
-        // closed sentinel).
-        if in_runtime_quantum() {
-            set_yield_signal(YieldReason::ChannelRecv(ch));
-            return Ok(Value::nil());
-        }
-        if in_async_context() {
-            if let Some(cached) = take_resume_value() {
-                return Ok(cached);
-            }
-        }
-        let mut buf = ch.buffer.borrow_mut();
-        if let Some(v) = buf.pop_front() {
-            return Ok(v);
-        }
-        drop(buf);
-        if ch.closed.get() {
-            return Ok(Value::nil());
-        }
-        if in_async_context() {
-            set_yield_signal(YieldReason::ChannelRecv(ch));
-            return Ok(Value::nil());
-        }
-        Err(SemaError::eval("channel/recv: channel is empty"))
+        let channel = expect_channel(args, "channel/recv", 0)?;
+        Ok(NativeOutcome::Suspend(NativeSuspend {
+            wait: WaitKind::Channel(ChannelWait::Receive { channel }),
+            continuation: Box::new(RecvCont),
+        }))
     });
 
-    // channel/try-recv — non-blocking receive (returns nil if empty)
-    register_fn(env, "channel/try-recv", |args| {
+    // channel/try-recv — non-blocking receive: drain one value or nil sentinel.
+    register_runtime_fn(env, "channel/try-recv", |args| {
         check_arity!(args, "channel/try-recv", 1);
-        let ch = expect_channel(args, "channel/try-recv", 0)?;
-        // Unified runtime: the ChannelRegistry is the single source of truth, so
-        // the Sema buffer is empty here. Yield a non-blocking ChannelTryRecv; the
-        // runtime drains one value (or the empty sentinel nil) from the registry
-        // and resumes this frame immediately — it never parks.
-        if in_runtime_quantum() {
-            set_yield_signal(YieldReason::ChannelTryRecv(ch));
-            return Ok(Value::nil());
-        }
-        let val = ch.buffer.borrow_mut().pop_front().unwrap_or(Value::nil());
-        Ok(val)
+        let channel = expect_channel(args, "channel/try-recv", 0)?;
+        Ok(NativeOutcome::Runtime(RuntimeRequest::ChannelOp {
+            channel,
+            operation: ChannelOperation::TryReceive,
+            continuation: Box::new(TryRecvCont),
+        }))
     });
 
-    // channel/close — close a channel
-    register_fn(env, "channel/close", |args| {
+    // channel/close — close the channel, waking parked senders/receivers; nil.
+    register_runtime_fn(env, "channel/close", |args| {
         check_arity!(args, "channel/close", 1);
-        let ch = expect_channel(args, "channel/close", 0)?;
-        // Mark closed synchronously so subsequent `channel/send`/`channel/recv`
-        // fast-path checks observe it (both legacy and runtime paths).
-        ch.closed.set(true);
-        // Unified runtime: also close the backing registry channel so parked
-        // senders/receivers wake with the closed result; resume with nil.
-        if in_runtime_quantum() {
-            set_yield_signal(YieldReason::ChannelClose(ch));
-            return Ok(Value::nil());
-        }
-        Ok(Value::nil())
+        let channel = expect_channel(args, "channel/close", 0)?;
+        Ok(NativeOutcome::Runtime(RuntimeRequest::ChannelOp {
+            channel,
+            operation: ChannelOperation::Close,
+            continuation: Box::new(CloseCont),
+        }))
     });
 
-    // channel/closed? — check if a channel is closed
-    register_fn(env, "channel/closed?", |args| {
-        check_arity!(args, "channel/closed?", 1);
-        let ch = expect_channel(args, "channel/closed?", 0)?;
-        Ok(Value::bool(ch.closed.get()))
+    // Observational channel ops — answered synchronously by the runtime.
+    register_runtime_fn(env, "channel/closed?", |args| {
+        inspect_channel(args, "channel/closed?", ChannelQuery::Closed)
     });
-
-    // channel/count — number of items currently in the buffer
-    register_fn(env, "channel/count", |args| {
-        check_arity!(args, "channel/count", 1);
-        let ch = expect_channel(args, "channel/count", 0)?;
-        // Unified runtime: the buffered items live in the ChannelRegistry, not the
-        // Sema buffer. Yield a non-blocking ChannelInspect; the runtime reads the
-        // registry count and resumes this frame immediately — it never parks.
-        if in_runtime_quantum() {
-            set_yield_signal(YieldReason::ChannelInspect(ch, ChannelQuery::Count));
-            return Ok(Value::nil());
-        }
-        let len = ch.buffer.borrow().len();
-        Ok(Value::int(len as i64))
+    register_runtime_fn(env, "channel/count", |args| {
+        inspect_channel(args, "channel/count", ChannelQuery::Count)
     });
-
-    // channel/empty? — check if the channel buffer is empty
-    register_fn(env, "channel/empty?", |args| {
-        check_arity!(args, "channel/empty?", 1);
-        let ch = expect_channel(args, "channel/empty?", 0)?;
-        // Unified runtime: buffered items live in the ChannelRegistry. Yield a
-        // non-blocking ChannelInspect; the runtime reads the registry and resumes
-        // this frame immediately — it never parks.
-        if in_runtime_quantum() {
-            set_yield_signal(YieldReason::ChannelInspect(ch, ChannelQuery::Empty));
-            return Ok(Value::nil());
-        }
-        let empty = ch.buffer.borrow().is_empty();
-        Ok(Value::bool(empty))
+    register_runtime_fn(env, "channel/empty?", |args| {
+        inspect_channel(args, "channel/empty?", ChannelQuery::Empty)
     });
-
-    // channel/full? — check if the channel buffer is at capacity
-    register_fn(env, "channel/full?", |args| {
-        check_arity!(args, "channel/full?", 1);
-        let ch = expect_channel(args, "channel/full?", 0)?;
-        // Unified runtime: buffered items live in the ChannelRegistry. Yield a
-        // non-blocking ChannelInspect; the runtime reads the registry and resumes
-        // this frame immediately — it never parks.
-        if in_runtime_quantum() {
-            set_yield_signal(YieldReason::ChannelInspect(ch, ChannelQuery::Full));
-            return Ok(Value::nil());
-        }
-        let buf = ch.buffer.borrow();
-        Ok(Value::bool(buf.len() >= ch.capacity))
+    register_runtime_fn(env, "channel/full?", |args| {
+        inspect_channel(args, "channel/full?", ChannelQuery::Full)
     });
 }
 
@@ -858,6 +956,24 @@ mod continuation_trace_tests {
                 predicate: Predicate::Resolved
             }),
             0
+        );
+    }
+
+    /// The channel continuations are likewise edge-free EXCEPT `SendCont`, which
+    /// carries the sent `Value` purely to name it in the closed-send error. That
+    /// one `Value` must be a traced edge (CORE-2); the rest emit none.
+    #[test]
+    fn channel_continuations_trace_expected_edges() {
+        assert_eq!(edge_count(&ChannelHandleCont), 0);
+        assert_eq!(edge_count(&RecvCont), 0);
+        assert_eq!(edge_count(&TryRecvCont), 0);
+        assert_eq!(edge_count(&CloseCont), 0);
+        assert_eq!(edge_count(&ChannelValueCont), 0);
+        assert_eq!(
+            edge_count(&SendCont {
+                value: Value::int(7)
+            }),
+            1
         );
     }
 }

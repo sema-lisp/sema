@@ -13,8 +13,10 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::{Condvar, Mutex};
 
+use std::collections::VecDeque;
+
 use crate::runtime::{InvalidRuntimeId, TaskId};
-use crate::value::{Channel, PromiseState, Value};
+use crate::value::{PromiseState, Value};
 use crate::{EvalContext, SemaError};
 
 /// The legacy cooperative scheduler's completion cell.
@@ -34,6 +36,27 @@ pub struct LegacyPromise {
 impl std::fmt::Debug for LegacyPromise {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("<legacy-promise>")
+    }
+}
+
+/// The legacy cooperative scheduler's channel cell.
+///
+/// This is the mutable channel `scheduler.rs` drives directly: a bounded buffer,
+/// a capacity, and a closed flag. Like [`LegacyPromise`], it is deliberately NOT
+/// a Sema `Value` — the language-facing channel is now the thin
+/// [`Channel`](crate::value::Channel) handle over the unified runtime's
+/// `ChannelRegistry`. Only the legacy scheduler subsystem constructs or reads
+/// this; the runtime never touches it. Retired wholesale in a later step.
+pub struct LegacyChannel {
+    pub buffer: RefCell<VecDeque<Value>>,
+    pub capacity: usize,
+    pub closed: Cell<bool>,
+}
+
+impl std::fmt::Debug for LegacyChannel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let len = self.buffer.borrow().len();
+        write!(f, "<legacy-channel {len}/{}>", self.capacity)
     }
 }
 
@@ -184,28 +207,28 @@ pub enum YieldReason {
         mode: PromiseSetKind,
     },
     /// Waiting to receive from an empty channel.
-    ChannelRecv(Rc<Channel>),
+    ChannelRecv(Rc<LegacyChannel>),
     /// Waiting to send to a full channel (carries the value to send).
-    ChannelSend(Rc<Channel>, Value),
+    ChannelSend(Rc<LegacyChannel>, Value),
     /// Closing a channel from inside a runtime quantum: the unified runtime
     /// closes the backing registry channel (waking any parked senders/receivers
     /// with the closed result) and resumes this frame with nil. The legacy
     /// scheduler never sees this variant (its `channel/close` mutates the Sema
     /// buffer's `closed` flag synchronously).
-    ChannelClose(Rc<Channel>),
+    ChannelClose(Rc<LegacyChannel>),
     /// Non-blocking observational channel op from inside a runtime quantum
     /// (`channel/count` / `channel/empty?` / `channel/full?` / `channel/closed?`).
     /// The unified runtime queries the canonical ChannelRegistry synchronously
     /// and resumes this frame IMMEDIATELY with the int/boolean result — the frame
     /// never parks (no wait is registered). The legacy scheduler never sees this
     /// variant (its observational ops read the Sema buffer directly).
-    ChannelInspect(Rc<Channel>, crate::runtime::ChannelQuery),
+    ChannelInspect(Rc<LegacyChannel>, crate::runtime::ChannelQuery),
     /// Non-blocking `channel/try-recv` from inside a runtime quantum: the unified
     /// runtime drains one value from the canonical ChannelRegistry (or the empty
     /// sentinel `nil`) and resumes this frame IMMEDIATELY — the frame never parks.
     /// The legacy scheduler never sees this variant (its `channel/try-recv` pops
     /// the Sema buffer directly).
-    ChannelTryRecv(Rc<Channel>),
+    ChannelTryRecv(Rc<LegacyChannel>),
     /// Sleeping for a duration in milliseconds.
     Sleep(u64),
     /// Spawning a detached task from a thunk (zero-arg function). The unified

@@ -160,16 +160,6 @@ struct RuntimeState {
     pending: VecDeque<PendingStage>,
     protocol_waits: HashMap<super::WaitKey, ProtocolWait>,
     task_promises: HashMap<TaskId, sema_core::runtime::PromiseId>,
-    /// Bridge from a Sema `Channel` value (by `Rc` pointer identity) to its
-    /// canonical runtime `ChannelId` in `channels`. The Sema channel `Value`
-    /// carries no runtime id, so the first VM-quantum channel op on it allocates
-    /// a registry channel with the Sema channel's capacity and records it here.
-    /// The `Rc` clone pins the address so it is never reused while mapped.
-    channel_bridge: HashMap<usize, (Rc<sema_core::Channel>, sema_core::runtime::ChannelId)>,
-    /// VM-quantum tasks parked on a channel send/receive, mapped to their wait
-    /// key, the backing channel, and whether they are receiving. Woken by a
-    /// `ChannelWake` when a counterpart rendezvous-matches or the channel closes.
-    channel_waits: HashMap<TaskId, (super::WaitKey, sema_core::runtime::ChannelId, bool)>,
     /// VM-quantum tasks parked on a LEGACY `AwaitIo(IoHandle)` yield, mapped to
     /// their internal wait key and the poll handle. This is the
     /// `LegacyAwaitIoBridge`: every offloaded-I/O async op (llm/complete, embed,
@@ -178,8 +168,8 @@ struct RuntimeState {
     /// NOT `Send` (it polls VM-thread completion state), so `poll_io_waits`
     /// drives it ON THE VM THREAD during drive turns; the offloaded job itself
     /// already runs on the IO pool. The key is minted by `issue_internal_wait`
-    /// and — like `channel_waits` — is NEVER inserted into `WaitRuntime::active`
-    /// (it is polled, not delivered via the completion inbox).
+    /// and is NEVER inserted into `WaitRuntime::active` (it is polled, not
+    /// delivered via the completion inbox).
     io_waits: HashMap<TaskId, (super::WaitKey, Rc<sema_core::IoHandle>)>,
     drive_cursor: usize,
     drive_active: bool,
@@ -233,11 +223,6 @@ impl Trace for RuntimeState {
                 .protocol_waits
                 .values()
                 .all(|wait| wait.owner.trace(sink) && wait.continuation.trace(sink))
-            && self.channel_bridge.values().all(|(channel, _)| {
-                let value = sema_core::Value::channel_from_rc(Rc::clone(channel));
-                sink(sema_core::cycle::GcEdge::Value(&value));
-                true
-            })
             && self.pending.iter().all(|stage| stage.trace(sink))
     }
 }
@@ -305,8 +290,6 @@ impl Runtime {
                 pending: VecDeque::new(),
                 protocol_waits: HashMap::new(),
                 task_promises: HashMap::new(),
-                channel_bridge: HashMap::new(),
-                channel_waits: HashMap::new(),
                 io_waits: HashMap::new(),
                 drive_cursor: 0,
                 drive_active: false,
@@ -881,54 +864,8 @@ impl Runtime {
             }
         }
         {
-            // A VM task parked on `channel/send` / `channel/recv`. It is tracked
-            // ONLY in `channel_waits`, with a key minted by `issue_internal_wait`
-            // that is NEVER inserted into `WaitRuntime::active` — so the generic
-            // fallback below (`waits.cancel`) would return None without waking it,
-            // yet still claim progress, spinning shutdown's cancel loop forever
-            // (the `close_for_interpreter_drop` / channel-parked-task hang). Handle
-            // it here: deregister from the channel queue, drop the entry, and wake
-            // it so the cancellation settles it Cancelled on its next visit.
-            let mut state = self.state.borrow_mut();
-            let selected = state.tasks.iter().find_map(|(id, task)| {
-                let key = task.record.wait_key()?;
-                (task.record.cancellation().is_some()
-                    && state.channel_waits.get(id).map(|(k, _, _)| *k) == Some(key))
-                .then_some((*id, key))
-            });
-            if let Some((task_id, key)) = selected {
-                if let Some((_, channel, _)) = state.channel_waits.remove(&task_id) {
-                    // A cancelled blocked SENDER's unsent value is returned here and
-                    // dropped: it was never delivered to any receiver, so discarding
-                    // it (rather than buffering or re-queuing) is the correct channel
-                    // semantics and leaks nothing — the sender is removed from the
-                    // channel's queue so it is neither double-counted nor traced as
-                    // live. A receiver cancel returns nothing to drop.
-                    if let Err(error) = state.channels.cancel_wait(channel, key) {
-                        return Err(RuntimeFault::Invariant {
-                            message: format!(
-                                "cancelled channel wait failed to deregister: {error:?}"
-                            ),
-                        });
-                    }
-                }
-                let task = state
-                    .tasks
-                    .get_mut(&task_id)
-                    .expect("selected channel-waiting task exists");
-                task.record
-                    .wake(key)
-                    .map_err(|error| RuntimeFault::Invariant {
-                        message: format!("cancelled channel task failed to wake: {error:?}"),
-                    })?;
-                let root = task.record.relations().origin_root;
-                state.ready.enqueue(root, task_id);
-                return Ok(true);
-            }
-        }
-        {
-            // A VM task parked on a legacy `AwaitIo` handle. Like `channel_waits`,
-            // it is tracked ONLY in `io_waits` with an internal key never in
+            // A VM task parked on a legacy `AwaitIo` handle. It is tracked ONLY in
+            // `io_waits` with an internal key never in
             // `WaitRuntime::active`, so the generic fallback would spin without
             // waking it. Handle it here: run the handle's abort hook (aborting the
             // offloaded future so an in-flight request/child is torn down where the
@@ -1183,11 +1120,8 @@ impl Runtime {
     }
 
     fn consume_channel_wake(&self, wake: ChannelWake) -> Result<(), RuntimeFault> {
-        // A VM-quantum task parked on `channel/send`/`channel/recv` resumes its VM
-        // frame directly; only the continuation model uses the protocol-wait path.
-        if self.consume_vm_channel_wake(&wake)? {
-            return Ok(());
-        }
+        // Every channel waiter is a structural `protocol_waits` entry now; deliver
+        // the rendezvous result to its continuation via `finish_protocol_wait`.
         let response = match wake.result {
             super::ChannelResult::Sent => {
                 RuntimeResponse::Send(sema_core::runtime::ChannelSend::Sent)
@@ -1332,51 +1266,29 @@ impl Runtime {
                     TaskAction::VmSleep(task_id, ms)
                 }
                 // The promise ops (`async/spawn`, `async/await`, `async/cancel`,
-                // `async/all`, `async/race`, `async/timeout`, the predicates, and
-                // `async/run`) no longer use the TLS yield signal — they suspend
-                // structurally through the `NativeOutcome` ABI (`Suspend`/`Runtime`),
-                // handled by the `Pending` arm below. Reaching here with a legacy
-                // promise yield would be a routing bug: surface it as an error
-                // rather than driving the retired bridge.
+                // `async/all`, `async/race`, `async/timeout`, the predicates,
+                // `async/run`) and the channel ops (`channel/new`, `send`, `recv`,
+                // `try-recv`, `close`, `closed?`, `count`, `empty?`, `full?`) no
+                // longer use the TLS yield signal — they suspend structurally
+                // through the `NativeOutcome` ABI (`Suspend`/`Runtime`), handled by
+                // the `Pending` arm below. Reaching here with a legacy
+                // promise/channel yield would be a routing bug: surface it as an
+                // error rather than driving the retired bridge.
                 YieldReason::Spawn(_)
                 | YieldReason::Cancel(_)
                 | YieldReason::AwaitPromise(_)
-                | YieldReason::AwaitPromiseSet { .. } => TaskAction::VmResult(
+                | YieldReason::AwaitPromiseSet { .. }
+                | YieldReason::ChannelSend(_, _)
+                | YieldReason::ChannelRecv(_)
+                | YieldReason::ChannelClose(_)
+                | YieldReason::ChannelInspect(_, _)
+                | YieldReason::ChannelTryRecv(_) => TaskAction::VmResult(
                     task_id,
                     task.vm_owner.take().expect("VM call has a return owner"),
                     Err(sema_core::SemaError::eval(
-                        "legacy promise yield reached the unified runtime (promise ops are structural)",
+                        "legacy promise/channel yield reached the unified runtime (async ops are structural)",
                     )),
                 ),
-                // `channel/send` / `channel/recv` / `channel/close`: park this
-                // frame with a nil placeholder on its stack top; the runtime
-                // routes the op through the canonical ChannelRegistry and resumes
-                // the frame with the received value / send-ack (nil) / close-ack.
-                YieldReason::ChannelSend(channel, value) => {
-                    task.vm_call = Some(vm);
-                    TaskAction::VmChannelSend(task_id, channel, value)
-                }
-                YieldReason::ChannelRecv(channel) => {
-                    task.vm_call = Some(vm);
-                    TaskAction::VmChannelRecv(task_id, channel)
-                }
-                YieldReason::ChannelClose(channel) => {
-                    task.vm_call = Some(vm);
-                    TaskAction::VmChannelClose(task_id, channel)
-                }
-                // `channel/count` / `channel/empty?` / `channel/full?` and
-                // `channel/try-recv`: non-blocking observational ops. The frame
-                // parked with a nil placeholder on its stack top; the runtime
-                // queries/drains the canonical ChannelRegistry SYNCHRONOUSLY and
-                // resumes this frame immediately (no wait registered).
-                YieldReason::ChannelInspect(channel, query) => {
-                    task.vm_call = Some(vm);
-                    TaskAction::VmChannelInspect(task_id, channel, query)
-                }
-                YieldReason::ChannelTryRecv(channel) => {
-                    task.vm_call = Some(vm);
-                    TaskAction::VmChannelTryRecv(task_id, channel)
-                }
                 // Legacy offloaded I/O (`AwaitIo`): an async op (llm/complete,
                 // embed, http, file, event/select, io) offloaded its work to the
                 // IO pool and armed a poll handle. Park this frame with a nil
@@ -1638,19 +1550,6 @@ impl Runtime {
                         message: format!("sleeping VM task failed to wait: {error:?}"),
                     });
                 }
-            }
-            TaskAction::VmChannelSend(task_id, channel, value) => {
-                self.channel_send(task_id, channel, value)?
-            }
-            TaskAction::VmChannelRecv(task_id, channel) => {
-                self.channel_receive(task_id, channel)?
-            }
-            TaskAction::VmChannelClose(task_id, channel) => self.channel_close(task_id, channel)?,
-            TaskAction::VmChannelInspect(task_id, channel, query) => {
-                self.channel_inspect(task_id, channel, query)?
-            }
-            TaskAction::VmChannelTryRecv(task_id, channel) => {
-                self.channel_try_receive(task_id, channel)?
             }
             TaskAction::VmAwaitIo(task_id, handle) => self.await_io(task_id, handle)?,
             #[cfg(test)]
@@ -2540,248 +2439,6 @@ impl Runtime {
     }
 
 
-    /// Resolve a Sema channel value to its canonical runtime `ChannelId`,
-    /// allocating a registry channel (with the Sema channel's capacity) the first
-    /// time a VM-quantum op touches it. The `Rc` is retained in the bridge so its
-    /// pointer identity stays stable and unique for the runtime's lifetime.
-    fn resolve_channel(
-        state: &mut RuntimeState,
-        channel: &Rc<sema_core::Channel>,
-    ) -> Result<sema_core::runtime::ChannelId, RuntimeFault> {
-        let ptr = Rc::as_ptr(channel) as usize;
-        if let Some((_, id)) = state.channel_bridge.get(&ptr) {
-            return Ok(*id);
-        }
-        let id = state
-            .channels
-            .allocate(channel.capacity)
-            .map_err(|_| RuntimeFault::IdExhausted { kind: "channel" })?;
-        state.channel_bridge.insert(ptr, (Rc::clone(channel), id));
-        Ok(id)
-    }
-
-    /// Route a VM-quantum `channel/send` through the ChannelRegistry. Resumes the
-    /// task with nil once the value is buffered/handed to a receiver, or parks it
-    /// until a receiver takes the value when the channel is full.
-    fn channel_send(
-        &self,
-        task_id: TaskId,
-        channel: Rc<sema_core::Channel>,
-        value: sema_core::Value,
-    ) -> Result<(), RuntimeFault> {
-        enum Outcome {
-            Parked,
-            Sent,
-            Closed,
-        }
-        let outcome = {
-            let mut state = self.state.borrow_mut();
-            let id = Self::resolve_channel(&mut state, &channel)?;
-            let key = state
-                .waits
-                .as_ref()
-                .expect("wait runtime installed")
-                .issue_internal_wait()
-                .map_err(|_| RuntimeFault::IdExhausted { kind: "wait" })?;
-            let result = state
-                .channels
-                .send(id, key, task_id, value)
-                .map_err(|error| RuntimeFault::Invariant {
-                    message: format!("channel send failed: {error:?}"),
-                })?;
-            while let Some(wake) = state.channels.pop_wake() {
-                state.pending.push_back(PendingStage::ChannelWake(wake));
-            }
-            match result {
-                super::ChannelResult::Waiting => {
-                    state
-                        .tasks
-                        .get_mut(&task_id)
-                        .ok_or_else(|| RuntimeFault::Invariant {
-                            message: "sending VM task disappeared".into(),
-                        })?
-                        .record
-                        .wait(key)
-                        .map_err(|error| RuntimeFault::Invariant {
-                            message: format!("sending VM task failed to wait: {error:?}"),
-                        })?;
-                    state.channel_waits.insert(task_id, (key, id, false));
-                    Outcome::Parked
-                }
-                super::ChannelResult::Sent => Outcome::Sent,
-                super::ChannelResult::Closed => Outcome::Closed,
-                super::ChannelResult::Received(_) => {
-                    return Err(RuntimeFault::Invariant {
-                        message: "channel send produced a received result".into(),
-                    });
-                }
-            }
-        };
-        match outcome {
-            Outcome::Parked => Ok(()),
-            Outcome::Sent => {
-                self.resume_running_vm(task_id, VmResume::Value(sema_core::Value::nil()))
-            }
-            Outcome::Closed => {
-                self.resume_running_vm(task_id, VmResume::Fail(channel_send_closed_error()))
-            }
-        }
-    }
-
-    /// Route a VM-quantum `channel/recv` through the ChannelRegistry. Resumes the
-    /// task with the received value, with nil when the channel is closed and
-    /// empty (the documented closed sentinel), or parks it until a value arrives.
-    fn channel_receive(
-        &self,
-        task_id: TaskId,
-        channel: Rc<sema_core::Channel>,
-    ) -> Result<(), RuntimeFault> {
-        enum Outcome {
-            Parked,
-            Received(sema_core::Value),
-            Closed,
-        }
-        let outcome = {
-            let mut state = self.state.borrow_mut();
-            let id = Self::resolve_channel(&mut state, &channel)?;
-            let key = state
-                .waits
-                .as_ref()
-                .expect("wait runtime installed")
-                .issue_internal_wait()
-                .map_err(|_| RuntimeFault::IdExhausted { kind: "wait" })?;
-            let result = state.channels.receive(id, key, task_id).map_err(|error| {
-                RuntimeFault::Invariant {
-                    message: format!("channel receive failed: {error:?}"),
-                }
-            })?;
-            while let Some(wake) = state.channels.pop_wake() {
-                state.pending.push_back(PendingStage::ChannelWake(wake));
-            }
-            match result {
-                super::ChannelResult::Waiting => {
-                    state
-                        .tasks
-                        .get_mut(&task_id)
-                        .ok_or_else(|| RuntimeFault::Invariant {
-                            message: "receiving VM task disappeared".into(),
-                        })?
-                        .record
-                        .wait(key)
-                        .map_err(|error| RuntimeFault::Invariant {
-                            message: format!("receiving VM task failed to wait: {error:?}"),
-                        })?;
-                    state.channel_waits.insert(task_id, (key, id, true));
-                    Outcome::Parked
-                }
-                super::ChannelResult::Received(value) => Outcome::Received(value),
-                super::ChannelResult::Closed => Outcome::Closed,
-                super::ChannelResult::Sent => {
-                    return Err(RuntimeFault::Invariant {
-                        message: "channel receive produced a sent result".into(),
-                    });
-                }
-            }
-        };
-        match outcome {
-            Outcome::Parked => Ok(()),
-            Outcome::Received(value) => self.resume_running_vm(task_id, VmResume::Value(value)),
-            Outcome::Closed => {
-                self.resume_running_vm(task_id, VmResume::Value(sema_core::Value::nil()))
-            }
-        }
-    }
-
-    /// Route a VM-quantum `channel/close` through the ChannelRegistry, enqueuing
-    /// wakes for every parked sender/receiver, then resume the task with nil.
-    fn channel_close(
-        &self,
-        task_id: TaskId,
-        channel: Rc<sema_core::Channel>,
-    ) -> Result<(), RuntimeFault> {
-        {
-            let mut state = self.state.borrow_mut();
-            let id = Self::resolve_channel(&mut state, &channel)?;
-            match state.channels.close(id) {
-                Ok(Some(close)) => state.pending.push_back(PendingStage::ChannelClose(close)),
-                Ok(None) => {}
-                Err(error) => {
-                    return Err(RuntimeFault::Invariant {
-                        message: format!("channel close failed: {error:?}"),
-                    });
-                }
-            }
-            while let Some(wake) = state.channels.pop_wake() {
-                state.pending.push_back(PendingStage::ChannelWake(wake));
-            }
-        }
-        self.resume_running_vm(task_id, VmResume::Value(sema_core::Value::nil()))
-    }
-
-    /// Route a VM-quantum observational channel op (`channel/count` /
-    /// `channel/empty?` / `channel/full?`) through the ChannelRegistry. This is
-    /// NON-BLOCKING: it reads the registry state and resumes the frame in place
-    /// with the int/boolean result — no wait is registered and the frame never
-    /// parks.
-    fn channel_inspect(
-        &self,
-        task_id: TaskId,
-        channel: Rc<sema_core::Channel>,
-        query: sema_core::runtime::ChannelQuery,
-    ) -> Result<(), RuntimeFault> {
-        let value = {
-            let mut state = self.state.borrow_mut();
-            let id = Self::resolve_channel(&mut state, &channel)?;
-            state
-                .channels
-                .inspect(id, query)
-                .map_err(|error| RuntimeFault::Invariant {
-                    message: format!("channel inspect failed: {error:?}"),
-                })?
-        };
-        self.resume_running_vm(task_id, VmResume::Value(value))
-    }
-
-    /// Route a VM-quantum `channel/try-recv` through the ChannelRegistry. This is
-    /// NON-BLOCKING: it drains at most one buffered/rendezvous value from the
-    /// registry (waking any parked sender it unblocks) and resumes the frame in
-    /// place with that value, or with nil (the empty/closed sentinel) — no wait is
-    /// registered and the frame never parks.
-    fn channel_try_receive(
-        &self,
-        task_id: TaskId,
-        channel: Rc<sema_core::Channel>,
-    ) -> Result<(), RuntimeFault> {
-        let value = {
-            let mut state = self.state.borrow_mut();
-            let id = Self::resolve_channel(&mut state, &channel)?;
-            let result =
-                state
-                    .channels
-                    .try_receive(id)
-                    .map_err(|error| RuntimeFault::Invariant {
-                        message: format!("channel try-receive failed: {error:?}"),
-                    })?;
-            // Draining a full channel can unblock a parked sender; drain any wakes
-            // the registry queued so the woken sender is scheduled.
-            while let Some(wake) = state.channels.pop_wake() {
-                state.pending.push_back(PendingStage::ChannelWake(wake));
-            }
-            match result {
-                super::ChannelResult::Received(value) => value,
-                super::ChannelResult::Waiting | super::ChannelResult::Closed => {
-                    sema_core::Value::nil()
-                }
-                super::ChannelResult::Sent => {
-                    return Err(RuntimeFault::Invariant {
-                        message: "channel try-receive produced a sent result".into(),
-                    });
-                }
-            }
-        };
-        self.resume_running_vm(task_id, VmResume::Value(value))
-    }
-
     /// Park a VM task on a legacy `AwaitIo` handle (the `LegacyAwaitIoBridge`).
     /// The offloaded job already runs on the IO pool; here we poll the handle
     /// ONCE (it may already be done — a cached completion, a fast checkout) and,
@@ -2886,48 +2543,6 @@ impl Runtime {
             let root = task.record.relations().origin_root;
             state.ready.enqueue(root, task_id);
         }
-        Ok(true)
-    }
-
-    /// Resume a VM-quantum task parked on a channel op with a rendezvous wake. A
-    /// `Sent` ack resumes with nil, a `Received` with the value, and a `Closed`
-    /// with nil (receiver — closed sentinel) or a closed-send error (sender).
-    /// Returns whether the wake targeted a VM-quantum waiter.
-    fn consume_vm_channel_wake(&self, wake: &ChannelWake) -> Result<bool, RuntimeFault> {
-        let mut state = self.state.borrow_mut();
-        let Some((key, _, receive)) = state.channel_waits.get(&wake.task).copied() else {
-            return Ok(false);
-        };
-        if key != wake.key {
-            return Ok(false);
-        }
-        let resume = match &wake.result {
-            super::ChannelResult::Sent => VmResume::Value(sema_core::Value::nil()),
-            super::ChannelResult::Received(value) => VmResume::Value(value.clone()),
-            super::ChannelResult::Closed => {
-                if receive {
-                    VmResume::Value(sema_core::Value::nil())
-                } else {
-                    VmResume::Fail(channel_send_closed_error())
-                }
-            }
-            super::ChannelResult::Waiting => return Ok(true),
-        };
-        state.channel_waits.remove(&wake.task);
-        let task = state
-            .tasks
-            .get_mut(&wake.task)
-            .ok_or_else(|| RuntimeFault::Invariant {
-                message: "channel wake task disappeared".into(),
-            })?;
-        task.record
-            .wake(key)
-            .map_err(|error| RuntimeFault::Invariant {
-                message: format!("channel wake transition failed: {error:?}"),
-            })?;
-        task.vm_resume = Some(resume);
-        let root = task.record.relations().origin_root;
-        state.ready.enqueue(root, wake.task);
         Ok(true)
     }
 
@@ -3158,10 +2773,26 @@ impl Runtime {
                 // a deadlock this method can name. Let the caller decide.
                 _ => return Ok(false),
             }
-            if let Some((key, channel, receive)) = state.channel_waits.remove(&main_task) {
-                // Deregister from the channel queue so no stale wait remains once
-                // the task is removed by `settle` below.
+            // The root main task parked directly on a `channel/recv`/`channel/send`
+            // is a `protocol_waits` Channel entry keyed by its wait key. Name the
+            // deadlock with the legacy synchronous message (empty/full) so
+            // `eval_str_via_runtime` matches the `eval_str` oracle.
+            let channel_wait = state
+                .tasks
+                .get(&main_task)
+                .and_then(|task| task.record.wait_key())
+                .and_then(|key| match state.protocol_waits.get(&key) {
+                    Some(ProtocolWait {
+                        kind: ProtocolWaitKind::Channel { channel, receive },
+                        ..
+                    }) => Some((key, *channel, *receive)),
+                    _ => None,
+                });
+            if let Some((key, channel, receive)) = channel_wait {
+                // Deregister from the channel queue and drop the protocol wait so no
+                // stale wait remains once the task is removed by `settle` below.
                 let _ = state.channels.cancel_wait(channel, key);
+                state.protocol_waits.remove(&key);
                 if receive {
                     sema_core::SemaError::eval("channel/recv: channel is empty")
                 } else {
@@ -3549,13 +3180,6 @@ fn timeout_expired_condition(duration: Duration) -> sema_core::SemaError {
     )
 }
 
-/// Raised into a parked `channel/send` frame when the channel closes while the
-/// sender is blocked (its value is dropped). The eager `ch.closed` fast-path in
-/// the native handles the already-closed case with the full value message.
-fn channel_send_closed_error() -> sema_core::SemaError {
-    sema_core::SemaError::eval("channel/send: channel is closed")
-}
-
 fn registry_error(error: super::RegistryError) -> sema_core::SemaError {
     sema_core::SemaError::eval(match error {
         super::RegistryError::WrongRuntime => "runtime handle belongs to another runtime",
@@ -3929,26 +3553,6 @@ enum TaskAction {
     /// A VM root/child parked on `async/sleep`: arm a runtime timer for `ms`
     /// milliseconds and leave the VM in `vm_call` so `fire_timer` re-runs it.
     VmSleep(TaskId, u64),
-    /// `channel/send`: route the send through the ChannelRegistry, parking the
-    /// task (`TaskId`) until a receiver takes the value if the channel is full.
-    VmChannelSend(TaskId, Rc<sema_core::Channel>, sema_core::Value),
-    /// `channel/recv`: route the receive through the ChannelRegistry, parking the
-    /// task (`TaskId`) until a value is available (or the channel closes).
-    VmChannelRecv(TaskId, Rc<sema_core::Channel>),
-    /// `channel/close`: close the backing registry channel, waking parked
-    /// senders/receivers, and resume the task (`TaskId`) with nil.
-    VmChannelClose(TaskId, Rc<sema_core::Channel>),
-    /// `channel/count` / `channel/empty?` / `channel/full?`: query the
-    /// ChannelRegistry non-blocking and resume the task (`TaskId`) in place with
-    /// the result.
-    VmChannelInspect(
-        TaskId,
-        Rc<sema_core::Channel>,
-        sema_core::runtime::ChannelQuery,
-    ),
-    /// `channel/try-recv`: drain one value from the ChannelRegistry non-blocking
-    /// and resume the task (`TaskId`) in place with the value or nil sentinel.
-    VmChannelTryRecv(TaskId, Rc<sema_core::Channel>),
     /// Legacy `AwaitIo(IoHandle)`: park the task (`TaskId`) on the offloaded-I/O
     /// poll handle until it reports Ready, then resume the frame with the decoded
     /// value (or raise the error in-frame). The `LegacyAwaitIoBridge`.
@@ -4071,20 +3675,6 @@ impl Trace for TaskAction {
                     }
             }
             Self::VmSleep(_, _) => true,
-            Self::VmChannelSend(_, channel, value) => {
-                let handle = sema_core::Value::channel_from_rc(Rc::clone(channel));
-                sink(sema_core::cycle::GcEdge::Value(&handle));
-                sink(sema_core::cycle::GcEdge::Value(value));
-                true
-            }
-            Self::VmChannelRecv(_, channel)
-            | Self::VmChannelClose(_, channel)
-            | Self::VmChannelInspect(_, channel, _)
-            | Self::VmChannelTryRecv(_, channel) => {
-                let handle = sema_core::Value::channel_from_rc(Rc::clone(channel));
-                sink(sema_core::cycle::GcEdge::Value(&handle));
-                true
-            }
             // An `IoHandle` is a boxed `FnMut` poller; it is not a GC candidate
             // and holds no live Sema `Value` (the result Value does not exist
             // until the offloaded job completes and the poller decodes it), so

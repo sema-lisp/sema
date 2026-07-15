@@ -25,7 +25,7 @@ use std::rc::{Rc, Weak};
 use hashbrown::{hash_map, HashMap, HashSet};
 use lasso::Spur;
 
-use crate::value::{Channel, MultiMethod, MutableArray, MutableCell, Thunk};
+use crate::value::{MultiMethod, MutableArray, MutableCell, Thunk};
 use crate::value::{Env, NativeFn, Value, ValueViewRef};
 
 /// The shared bindings allocation of an [`Env`] — the env's *node identity*
@@ -137,8 +137,6 @@ pub enum GcNode {
     EnvBindings(Weak<EnvBindings>),
     /// `delay` thunk (data-only cycles via `forced`).
     Thunk(Weak<Thunk>),
-    /// Channel (data-only cycles via the buffer).
-    Channel(Weak<Channel>),
     /// Multimethod (data-only cycles via the method table).
     MultiMethod(Weak<MultiMethod>),
     /// Mutable array (data-only cycles via the element vector).
@@ -155,7 +153,6 @@ impl GcNode {
             GcNode::EnvWrapper(w) => w.strong_count(),
             GcNode::EnvBindings(w) => w.strong_count(),
             GcNode::Thunk(w) => w.strong_count(),
-            GcNode::Channel(w) => w.strong_count(),
             GcNode::MultiMethod(w) => w.strong_count(),
             GcNode::MutableArray(w) => w.strong_count(),
             GcNode::MutableCell(w) => w.strong_count(),
@@ -180,10 +177,6 @@ impl GcNode {
             GcNode::Thunk(w) => w.upgrade().map(|rc| {
                 let ptr = NodePtr::of_rc(&rc);
                 (ptr, NodeHandle::Value(Value::thunk_from_rc(rc)))
-            }),
-            GcNode::Channel(w) => w.upgrade().map(|rc| {
-                let ptr = NodePtr::of_rc(&rc);
-                (ptr, NodeHandle::Value(Value::channel_from_rc(rc)))
             }),
             GcNode::MultiMethod(w) => w.upgrade().map(|rc| {
                 let ptr = NodePtr::of_rc(&rc);
@@ -598,15 +591,9 @@ pub fn trace_value(v: &Value, sink: &mut dyn FnMut(GcEdge)) -> bool {
         // A promise handle carries only a runtime `PromiseId` — no `Value`
         // edges. Its settled value lives in the runtime's `PromiseRegistry`.
         ValueViewRef::AsyncPromise(_) => true,
-        ValueViewRef::Channel(c) => match c.buffer.try_borrow() {
-            Ok(buffer) => {
-                for item in buffer.iter() {
-                    sink(GcEdge::Value(item));
-                }
-                true
-            }
-            Err(_) => false,
-        },
+        // A channel handle carries only a runtime `ChannelId` — no `Value` edges.
+        // Its buffered values live in the runtime's `ChannelRegistry`.
+        ValueViewRef::Channel(_) => true,
         ValueViewRef::MutableArray(a) => match a.items.try_borrow() {
             Ok(items) => {
                 for item in items.iter() {
@@ -1351,10 +1338,6 @@ fn sever_node(ptr: NodePtr, handle: &NodeHandle, severed: &mut Vec<Value>) {
                 Ok(mut forced) => severed.extend(forced.take()),
                 Err(_) => debug_assert!(false, "white thunk borrowed during severing"),
             },
-            ValueViewRef::Channel(c) => match c.buffer.try_borrow_mut() {
-                Ok(mut buffer) => severed.extend(buffer.drain(..)),
-                Err(_) => debug_assert!(false, "white channel borrowed during severing"),
-            },
             ValueViewRef::MutableArray(a) => match a.items.try_borrow_mut() {
                 Ok(mut items) => severed.extend(items.drain(..)),
                 Err(_) => debug_assert!(false, "white mutable array borrowed during severing"),
@@ -1413,7 +1396,6 @@ fn value_node_ptr(v: &Value) -> Option<NodePtr> {
         | ValueViewRef::Agent(_)
         | ValueViewRef::Thunk(_)
         | ValueViewRef::MultiMethod(_)
-        | ValueViewRef::Channel(_)
         | ValueViewRef::MutableArray(_)
         | ValueViewRef::MutableCell(_)
         | ValueViewRef::Macro(_)
@@ -1429,7 +1411,7 @@ fn value_node_ptr(v: &Value) -> Option<NodePtr> {
 mod tests {
     use super::*;
     use crate::value::intern;
-    use std::collections::{BTreeMap, VecDeque};
+    use std::collections::BTreeMap;
 
     // -- Test payload types (stand-ins for sema-vm's VmClosurePayload /
     //    UpvalueCell, exercising the payload-tracer and Opaque paths without
@@ -1789,27 +1771,10 @@ mod tests {
         assert_eq!(t.body, body, "body untouched");
     }
 
-    // 4. channel containing itself (via a Value wrapping it).
-    #[test]
-    fn channel_containing_itself_collected() {
-        let ch = Rc::new(Channel {
-            buffer: RefCell::new(VecDeque::new()),
-            capacity: 4,
-            closed: Cell::new(false),
-        });
-        ch.buffer
-            .borrow_mut()
-            .push_back(Value::channel_from_rc(ch.clone()));
-        let weak = Rc::downgrade(&ch);
-        register_candidate(GcNode::Channel(Rc::downgrade(&ch)));
-        drop(ch);
-
-        let stats = collect(&[], GcTrigger::Explicit);
-
-        assert!(!stats.aborted);
-        assert_eq!(stats.collected, 1);
-        assert_eq!(weak.strong_count(), 0, "channel reclaimed");
-    }
+    // (Retired) A channel containing itself is no longer representable: a
+    // `Channel` carries only a runtime `ChannelId`, never a `Value`, so it
+    // cannot close a data cycle and is not a GC candidate. Its buffered values
+    // live in the runtime's `ChannelRegistry`.
 
     // 5. multimethod whose method value reaches back to it.
     #[test]

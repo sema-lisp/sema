@@ -1037,13 +1037,18 @@ fn for_each_callback_can_yield_on_full_channel() {
 }
 
 #[test]
-fn native_callback_passed_directly_raises_clear_error() {
-    // A yielding native fn (channel/recv) passed directly as a HOF callback
-    // can't propagate its yield through the HOF's Rust loop. Instead of
-    // silently dropping yields and producing wrong results, surface a clear
-    // error that tells the user to wrap in a lambda.
-    let err = eval_vm_err(
-        r#"
+fn native_callback_passed_directly_suspends_cooperatively() {
+    // A suspending native fn (channel/recv) passed DIRECTLY as a HOF callback
+    // now suspends structurally through the `NativeOutcome` ABI — the runtime
+    // drives the map's callback cooperatively, so each `channel/recv` parks and
+    // resumes correctly instead of dropping the yield. Draining a 1/2/closed
+    // channel across three recvs yields the two values then the closed sentinel
+    // (nil). (This retires the old "wrap it in a lambda" limitation, which was a
+    // consequence of the legacy yield-signal not propagating through the HOF's
+    // Rust loop.)
+    assert_eq!(
+        eval(
+            r#"
         (let ((ch (channel/new 1)))
           (let ((producer (async
                             (channel/send ch 1)
@@ -1052,10 +1057,8 @@ fn native_callback_passed_directly_raises_clear_error() {
                 (consumer (async (map channel/recv (list ch ch ch)))))
             (await consumer)))
         "#,
-    );
-    assert!(
-        err.contains("wrap it in a lambda") || err.contains("wrap in a lambda"),
-        "expected lambda-wrap hint, got: {err}"
+        ),
+        Value::list(vec![Value::int(1), Value::int(2), Value::nil()]),
     );
 }
 

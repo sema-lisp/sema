@@ -440,26 +440,19 @@ impl fmt::Debug for AsyncPromise {
 }
 
 /// A bounded async channel for communication between coroutines.
+/// A bounded async channel: a thin handle to a channel in the unified runtime's
+/// `ChannelRegistry`, which owns the buffer, capacity, closed flag, and the
+/// parked sender/receiver queues. The handle carries only the checked
+/// `ChannelId` (Copy, runtime-scoped), so it holds no GC edges — the buffered
+/// values live in the registry, not on this handle.
+#[derive(Clone, Copy)]
 pub struct Channel {
-    pub buffer: RefCell<std::collections::VecDeque<Value>>,
-    pub capacity: usize,
-    pub closed: Cell<bool>,
+    pub id: crate::runtime::ChannelId,
 }
 
 impl fmt::Debug for Channel {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let len = self.buffer.borrow().len();
-        write!(f, "<channel {len}/{}>", self.capacity)
-    }
-}
-
-impl Clone for Channel {
-    fn clone(&self) -> Self {
-        Channel {
-            buffer: RefCell::new(self.buffer.borrow().clone()),
-            capacity: self.capacity,
-            closed: Cell::new(self.closed.get()),
-        }
+        f.write_str("<channel>")
     }
 }
 
@@ -1252,14 +1245,14 @@ impl Value {
         Value::async_promise(AsyncPromise { id })
     }
     pub fn channel(ch: Channel) -> Value {
-        let rc = Rc::new(ch);
-        // Cold data-cycle constructor (CORE-2): the buffer can hold values
-        // that reach back to the channel with no closure on the cycle.
-        crate::cycle::register_candidate(crate::cycle::GcNode::Channel(Rc::downgrade(&rc)));
-        Value::from_rc_ptr(TAG_CHANNEL, rc)
+        // The handle holds only a `ChannelId` (no `Value` edges), so it closes no
+        // data cycle — no GC candidate registration is needed.
+        Value::from_rc_ptr(TAG_CHANNEL, Rc::new(ch))
     }
-    pub fn channel_from_rc(rc: Rc<Channel>) -> Value {
-        Value::from_rc_ptr(TAG_CHANNEL, rc)
+    /// Build a channel `Value` from a runtime `ChannelId`. The registry owns the
+    /// channel's buffer/state; this is just the language-facing handle to it.
+    pub fn channel_id(id: crate::runtime::ChannelId) -> Value {
+        Value::channel(Channel { id })
     }
     pub fn mutable_array(items: Vec<Value>) -> Value {
         let rc = Rc::new(MutableArray {
@@ -3022,14 +3015,7 @@ impl fmt::Display for Value {
             }
             ValueViewRef::Stream(s) => write!(f, "<stream:{}>", s.stream_type()),
             ValueViewRef::AsyncPromise(_) => write!(f, "<async-promise>"),
-            ValueViewRef::Channel(c) => {
-                let len = c.buffer.borrow().len();
-                if c.closed.get() {
-                    write!(f, "<channel {len}/{} closed>", c.capacity)
-                } else {
-                    write!(f, "<channel {len}/{}>", c.capacity)
-                }
-            }
+            ValueViewRef::Channel(_) => write!(f, "<channel>"),
             // Length/opaque only: a mutable array or cell can contain itself,
             // so printing contents could recurse forever. Freeze with
             // `mutable-array/->vector` (or `mutable-cell/get`) to inspect.

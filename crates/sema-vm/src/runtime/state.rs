@@ -6,7 +6,10 @@ use std::rc::{Rc, Weak};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crate::vm::{close_closure_upvalues_for_foreign_run, close_closure_upvalues_with_owner};
+use crate::vm::{
+    close_closure_upvalues_for_foreign_run, close_closure_upvalues_with_owner,
+    snapshot_escaping_call_with_owner,
+};
 use crate::{extract_vm_closure, VmExecResult, VM};
 #[cfg(test)]
 use sema_core::runtime::ExternalFailure;
@@ -1275,6 +1278,13 @@ impl Runtime {
                 .map_err(|error| RuntimeFault::Invariant {
                     message: error.to_string(),
                 })?;
+        // A resuming parent VM may own `Tracked` upvalue cells whose captured
+        // locals were mutated on a foreign callback VM (the cooperative HOF ABI)
+        // while it was parked. Those writes live in the cell, not the parent's
+        // stack slot the defining frame reads via `LOAD_LOCAL`. Refresh the
+        // stack slots from the cells before running so the resumed frame observes
+        // the callback's `set!` write-backs.
+        vm.sync_tracked_upvalues_to_stack();
         let quantum = vm.run_quantum(&context, instruction_limit);
         drop(quantum_guard);
         self.state.borrow_mut().turn_instructions += quantum.instructions;
@@ -2156,7 +2166,7 @@ impl Runtime {
     fn invoke_callable(
         &self,
         task_id: TaskId,
-        owner: ReturnOwner,
+        mut owner: ReturnOwner,
         call: NativeCall,
     ) -> Result<(), RuntimeFault> {
         let (eval_context, context, cancellation) = {
@@ -2192,6 +2202,21 @@ impl Runtime {
         }
         let (frame, result) =
             if let Some((closure, functions, native_fns)) = extract_vm_closure(&call.callable) {
+                // A cooperative HOF (`map`/`for-each`/`foldl`/…) dispatches its
+                // Sema callback on the FRESH callback VM created below. Any open
+                // upvalues the callback captured — or that ride in its argument
+                // data (e.g. a handler pulled from a map it iterates) — point
+                // into the parked parent (HOF-invoking) VM's stack, not this
+                // callback VM's. Close them to shared, still-live `Tracked` cells
+                // against that parent VM first, mirroring `async/spawn`, so the
+                // callback reads/writes the real cell (its `set!` write-back stays
+                // visible to the defining frame) instead of dereferencing — or
+                // silently clobbering — a foreign stack slot. This runs for EVERY
+                // element dispatch (continuation-driven ones bypass the
+                // `NativeYield` seam), which is why it lives here.
+                if let Some(parent_vm) = owner.parked_parent_vm_mut() {
+                    snapshot_escaping_call_with_owner(parent_vm, &call.callable, &call.args);
+                }
                 let globals = closure
                     .globals
                     .clone()
@@ -3906,6 +3931,22 @@ enum ReturnOwner {
         vm: Box<VM>,
         parent: Box<ReturnOwner>,
     },
+}
+
+impl ReturnOwner {
+    /// The parked parent (HOF-invoking) VM this owner carries, if any. A
+    /// cooperative HOF parks its VM in a `VmResume` (possibly under
+    /// `Continuation` frames while its callback continuation is driven); that VM
+    /// still owns the stack slots any escaping callback upvalue points into, so
+    /// `invoke_callable` closes those upvalues against it before running the
+    /// callback on a foreign VM.
+    fn parked_parent_vm_mut(&mut self) -> Option<&mut VM> {
+        match self {
+            ReturnOwner::VmResume { vm, .. } => Some(vm),
+            ReturnOwner::Continuation(parent, _) => parent.parked_parent_vm_mut(),
+            ReturnOwner::Root => None,
+        }
+    }
 }
 
 impl Trace for PendingStage {

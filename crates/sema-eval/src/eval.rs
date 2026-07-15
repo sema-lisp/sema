@@ -3390,6 +3390,113 @@ mod runtime_eval_tests {
         assert_eq!(result, Value::nil());
     }
 
+    // ---- Open-upvalue escape across the cooperative HOF callback ABI ----
+    //
+    // A runtime-quantum HOF (`for-each`/`map`) dispatches its Sema callback via
+    // `NativeOutcome::Call` → `invoke_callable`, which runs the callback on a
+    // FRESH callback VM. If the callback (or a closure reachable through it or
+    // its arguments) captured OPEN upvalues — locals of an enclosing frame still
+    // live on the HOF-invoking (parent) VM's stack — those cells point into a
+    // stack that is not the callback VM's. Deref then either panics
+    // ("captured variable's stack slot is not on this VM") or, worse, silently
+    // reads/writes a foreign slot. The fix snapshots (closes to a SHARED,
+    // still-live `Tracked` cell, mirroring `async/spawn`) every escaping open
+    // upvalue against the parent VM before the callback runs, so `set!`
+    // write-backs remain visible to the defining frame.
+
+    // Shape 1: HOF callback closes over a mutable local and `set!`s it — the
+    // write-back must be visible after the HOF returns.
+    #[test]
+    fn runtime_hof_callback_open_upvalue_shallow_write_back() {
+        let program = "(let ((n 0)) (for-each (fn (x) (set! n (+ n 1))) (list 1 2 3)) n)";
+        assert_runtime_matches_oracle(program);
+        let interp = Interpreter::new();
+        let got = interp.eval_str_via_runtime(program).expect("eval");
+        assert_eq!(
+            got,
+            Value::int(3),
+            "set! write-back must reach the captured local"
+        );
+    }
+
+    // Shape 2: a callback capturing an open upvalue several frames up, plus a
+    // handler that arrives as DATA (through a global map) and itself writes
+    // through an open upvalue into a still-live frame. No panic; correct value.
+    #[test]
+    fn runtime_hof_callback_open_upvalue_deep_nesting_no_panic() {
+        let program = r#"
+            (begin
+              (define handlers {})
+              (defun reg-set! (m) (set! handlers m))
+              (defun reg-emit (ev)
+                (for-each (fn (entry) ((cadr entry) ev)) (map/entries handlers)))
+              (define captured (list))
+              (defun capture (ev) (set! captured (append captured (list ev))))
+              (defun t ()
+                (define local-events (list))
+                (define (local-handler ev)
+                  (set! local-events (append local-events (list ev))))
+                (reg-set! {:a capture :b local-handler})
+                (reg-emit {:msg 1})
+                (set! captured captured)
+                (list (length local-events) (length captured)))
+              (t))
+        "#;
+        assert_runtime_matches_oracle(program);
+        let interp = Interpreter::new();
+        let got = interp.eval_str_via_runtime(program).expect("eval");
+        assert_eq!(
+            got,
+            common_list(&[Value::int(1), Value::int(1)]),
+            "both the data-carried handler and the direct capture must write back"
+        );
+    }
+
+    // Shape 3: a caller-supplied closure dispatched through a HOF *wrapper* (a
+    // second closure passing the callback to `for-each`). The `set!` through the
+    // callback's open upvalue must flow back to the caller's local.
+    #[test]
+    fn runtime_hof_wrapper_open_upvalue_set_write_back() {
+        let program = r#"
+            (begin
+              (defun hof-each (f xs) (for-each f xs))
+              (let ((n 0))
+                (hof-each (fn (x) (set! n (+ n 1))) (list 1 2 3))
+                n))
+        "#;
+        assert_runtime_matches_oracle(program);
+        let interp = Interpreter::new();
+        let got = interp.eval_str_via_runtime(program).expect("eval");
+        assert_eq!(
+            got,
+            Value::int(3),
+            "write-back through a HOF wrapper must reach the caller's local"
+        );
+    }
+
+    // Shape 4: a closure reached TRANSITIVELY by the dispatched callback (not the
+    // callback itself) writes through its open upvalue. Its write must reach its
+    // own slot (222) and clobber no bystander local (a/b/c stay :a/:b/:c).
+    #[test]
+    fn runtime_hof_transitive_closure_open_upvalue_no_slot_clobber() {
+        let program = r#"
+            (begin
+              (defun hof-each (f xs) (for-each f xs))
+              (define observed nil)
+              (define (outer)
+                (let ((secret 111))
+                  (let ((writer (fn () (set! secret 222))))
+                    (hof-each (fn (x)
+                                (let ((a :a) (b :b) (c :c))
+                                  (writer)
+                                  (set! observed (list a b c))))
+                              (list 0))
+                    secret)))
+              (list (outer) observed))
+        "#;
+        assert_runtime_matches_oracle(program);
+    }
+
     fn common_list(items: &[Value]) -> Value {
         Value::list(items.to_vec())
     }

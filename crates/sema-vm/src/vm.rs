@@ -990,6 +990,53 @@ pub fn snapshot_escaping_closure(func: &Value) {
     }
 }
 
+/// Deep-walk `value`, snapshotting the open upvalues of every VM closure
+/// reachable through it — the value itself, or closures nested in immutable
+/// list/vector/map containers. This is the value-level counterpart of
+/// [`snapshot_escaping_closure`]: the cooperative HOF-callback ABI runs a
+/// callback on a FOREIGN callback VM, and closures with open upvalues reach it
+/// not only as the callable but also as its ARGUMENT DATA (e.g. a handler pulled
+/// out of a map the callback iterates). Every such closure's cells must be
+/// closed against the still-live parent VM up front, or dereferencing them on
+/// the callback VM panics ("stack slot is not on this VM") or reads a foreign
+/// slot. Immutable Sema containers are acyclic, so the walk terminates; the
+/// caller must have the owning VM registered on `CURRENT_VM` (see
+/// [`snapshot_escaping_call_with_owner`]).
+pub fn snapshot_escaping_value(value: &Value) {
+    snapshot_escaping_closure(value);
+    if let Some(items) = value.as_list() {
+        for item in items {
+            snapshot_escaping_value(item);
+        }
+    } else if let Some(items) = value.as_vector() {
+        for item in items {
+            snapshot_escaping_value(item);
+        }
+    } else if let Some(map) = value.as_map_ref() {
+        for (key, val) in map {
+            snapshot_escaping_value(key);
+            snapshot_escaping_value(val);
+        }
+    }
+}
+
+/// Snapshot the open upvalues of a cooperative HOF callback (and any closures
+/// carried in its `args`) against `owner_vm` — the parent (HOF-invoking) VM
+/// whose stack those cells point into — before the callback runs on a foreign
+/// callback VM. Mirrors [`close_closure_upvalues_with_owner`] but for the whole
+/// call: it registers `owner_vm` as current so [`snapshot_escaping_value`] can
+/// find the (paused) owning stack, then closes each escaping cell to a SHARED,
+/// still-live `Tracked` cell — so a `set!` write-back performed on the callback
+/// VM remains visible to the defining frame (mutation visibility), exactly as
+/// `async/spawn` preserves it.
+pub fn snapshot_escaping_call_with_owner(owner_vm: &mut VM, callable: &Value, args: &[Value]) {
+    let _guard = CurrentVmGuard::enter(owner_vm);
+    snapshot_escaping_value(callable);
+    for arg in args {
+        snapshot_escaping_value(arg);
+    }
+}
+
 pub fn close_closure_upvalues_for_foreign_run(closure: &Closure) {
     // Snapshot the registered VM pointers, then operate through them. The
     // pointers are valid for the duration of this call (see CURRENT_VM docs).
@@ -1806,6 +1853,40 @@ impl VM {
     pub fn replace_stack_top(&mut self, val: Value) {
         if let Some(top) = self.stack.last_mut() {
             *top = val;
+        }
+    }
+
+    /// Refresh this VM's live-frame stack slots from any `Tracked` upvalue cells
+    /// that captured them.
+    ///
+    /// A `Tracked` cell (a captured local closed for a FOREIGN run — an
+    /// `async/spawn` task or a cooperative HOF callback VM) owns its value out of
+    /// band while its defining frame stays live. Writes performed on the foreign
+    /// VM land in `cell.value`, but the defining frame reads the local through
+    /// `LOAD_LOCAL` (its stack slot), which the foreign write never touched. When
+    /// the parked parent VM resumes it must observe those writes, so copy each
+    /// live frame's `Tracked` cell value back into its stack slot. The cell stays
+    /// `Tracked` (a later foreign run may write again; `propagate_local_store_to_
+    /// tracked` keeps them in step on subsequent owner writes), and frame exit
+    /// still finalizes with the authoritative tracked value.
+    pub fn sync_tracked_upvalues_to_stack(&mut self) {
+        let mut updates: Vec<(usize, Value)> = Vec::new();
+        for frame in &self.frames {
+            let base = frame.base;
+            let Some(open) = &frame.open_upvalues else {
+                continue;
+            };
+            for (slot, cell) in open.iter().enumerate() {
+                let Some(cell) = cell else { continue };
+                if let UpvalueState::Tracked { value, .. } = &*cell.state.borrow() {
+                    updates.push((base + slot, value.clone()));
+                }
+            }
+        }
+        for (idx, value) in updates {
+            if let Some(dst) = self.stack.get_mut(idx) {
+                *dst = value;
+            }
         }
     }
 

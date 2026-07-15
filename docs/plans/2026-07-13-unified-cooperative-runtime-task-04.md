@@ -681,6 +681,36 @@ match the requested bound.
 > remaining callback sites (or the `call_value` re-entry itself) to the
 > `NativeOutcome::Call` ABI.
 
+> **Follow-up (2026-07-15, cooperative-HOF slice — open-upvalue escape fix):** the
+> `NativeOutcome::Call` migration above surfaced a latent correctness bug in the
+> cooperative HOF callback ABI. `invoke_callable` runs a callback closure on a
+> FRESH callback VM, but a callback (or a closure carried in its ARGUMENT DATA —
+> e.g. a handler pulled from a map the callback iterates) can capture OPEN
+> upvalues that index the parked parent (HOF-invoking) VM's stack. Dereferencing
+> them on the callback VM panicked ("captured variable's stack slot is not on this
+> VM") or, worse, silently read/wrote a foreign slot. Fixed by mirroring
+> `async/spawn`'s treatment:
+> - New `snapshot_escaping_value` / `snapshot_escaping_call_with_owner`
+>   (`crates/sema-vm/src/vm.rs`) deep-walk the callable AND its args (list/vector/
+>   map containers) and close every escaping open upvalue to a SHARED, still-live
+>   `Tracked` cell against the parent VM (found via `ReturnOwner::parked_parent_vm_
+>   mut`). Called from `invoke_callable` (`runtime/state.rs`) so it fires for
+>   EVERY element dispatch — continuation-driven dispatches bypass the `NativeYield`
+>   seam, so snapshotting there alone missed all but the first element.
+> - `VM::sync_tracked_upvalues_to_stack`, called at the top of `run_parked_quantum`,
+>   copies each live frame's `Tracked` cell value back into its stack slot on
+>   resume — the defining frame reads captured locals via `LOAD_LOCAL` (the stack
+>   slot), which a foreign `set!` write-back (landing in the cell) would otherwise
+>   never reach. This is what makes the `set!` write-back VISIBLE to the parent.
+>
+> Four new gates in `sema-eval` `mod runtime_eval_tests` reproduce the exact shapes
+> of the four `integration_test` `*_hof_*open_upvalue*` tests via `eval_str_via_
+> runtime` (same-file analogs — the imported-module variants can't run through the
+> runtime yet, blocked on the still-legacy `call_value` module-import re-entry) and
+> assert parity with the `eval_str` oracle plus explicit `set!` write-back
+> visibility. `sema-eval` 105→109, `sema-vm` 482/0, `eval_test` 1072, `integration_
+> test` 1055 (legacy baseline unchanged), `vm_async_test` still exactly 4 RED.
+
 ## Task 6: Implement origin-root `async/run`
 
 **Files:** runtime task/scope files, `async_ops.rs`, `async_contract_test.rs`

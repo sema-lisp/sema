@@ -928,7 +928,7 @@ mod io_streams {
         n: usize,
         decode: impl Fn(Vec<u8>) -> Value + 'static,
     ) -> Result<Option<Value>, SemaError> {
-        if !in_async_context() {
+        if !in_async_context() && !sema_core::in_runtime_quantum() {
             return Ok(None);
         }
         // *stdin* does real, potentially-blocking I/O (unlike in-memory byte
@@ -982,7 +982,7 @@ mod io_streams {
     /// closure until EOF, accumulating everything into one buffer, so a
     /// multi-chunk read-to-EOF never re-enters the scheduler per chunk.
     pub(super) fn maybe_async_read_all(stream: &Rc<StreamBox>) -> Result<Option<Value>, SemaError> {
-        if !in_async_context() {
+        if !in_async_context() && !sema_core::in_runtime_quantum() {
             return Ok(None);
         }
         if stream.stream_type() == "stdin" {
@@ -1041,7 +1041,7 @@ mod io_streams {
     pub(super) fn maybe_async_read_line(
         stream: &Rc<StreamBox>,
     ) -> Result<Option<Value>, SemaError> {
-        if !in_async_context() {
+        if !in_async_context() && !sema_core::in_runtime_quantum() {
             return Ok(None);
         }
         // *stdin* — see maybe_async_read: offload the blocking line read.
@@ -1136,7 +1136,7 @@ mod io_streams {
         data: &[u8],
         decode: impl Fn(usize) -> Result<Value, SemaError> + 'static,
     ) -> Result<Option<Value>, SemaError> {
-        if !in_async_context() || stream.stream_type() != "file-output" {
+        if (!in_async_context() && !sema_core::in_runtime_quantum()) || stream.stream_type() != "file-output" {
             return Ok(None);
         }
         if stream.is_closed() {
@@ -1162,7 +1162,7 @@ mod io_streams {
     }
 
     pub(super) fn maybe_async_flush(stream: &Rc<StreamBox>) -> Result<Option<Value>, SemaError> {
-        if !in_async_context() || stream.stream_type() != "file-output" {
+        if (!in_async_context() && !sema_core::in_runtime_quantum()) || stream.stream_type() != "file-output" {
             return Ok(None);
         }
         if stream.is_closed() {
@@ -1187,7 +1187,7 @@ mod io_streams {
     }
 
     pub(super) fn maybe_async_close(stream: &Rc<StreamBox>) -> Result<Option<Value>, SemaError> {
-        if !in_async_context() || stream.stream_type() != "file-output" {
+        if (!in_async_context() && !sema_core::in_runtime_quantum()) || stream.stream_type() != "file-output" {
             return Ok(None);
         }
         if stream.is_closed() {
@@ -1228,7 +1228,7 @@ mod io_streams {
         src: &Rc<StreamBox>,
         dst: &Rc<StreamBox>,
     ) -> Result<Option<Value>, SemaError> {
-        if !in_async_context() {
+        if !in_async_context() && !sema_core::in_runtime_quantum() {
             return Ok(None);
         }
         let src_file = src.stream_type() == "file-input";
@@ -1358,7 +1358,7 @@ mod io_streams {
     /// `File::open` via `fs_offload` (`io.rs`) — mirrors `db/open`, there is
     /// no existing stream to contend over. Sync stays today's shape.
     pub(super) fn open_input(path: &str) -> Result<Value, SemaError> {
-        if in_async_context() {
+        if in_async_context() || sema_core::in_runtime_quantum() {
             let path = path.to_string();
             return crate::io::fs_offload(
                 move || {
@@ -1374,7 +1374,7 @@ mod io_streams {
 
     /// `stream/open-output`'s dispatch — see `open_input`.
     pub(super) fn open_output(path: &str) -> Result<Value, SemaError> {
-        if in_async_context() {
+        if in_async_context() || sema_core::in_runtime_quantum() {
             let path = path.to_string();
             return crate::io::fs_offload(
                 move || {

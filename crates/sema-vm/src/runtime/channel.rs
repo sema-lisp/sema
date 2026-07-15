@@ -243,6 +243,45 @@ impl ChannelRegistry {
         }
         self.channels.get_mut(&id).ok_or(RegistryError::Unknown)
     }
+
+    /// GC interior: emit one `GcEdge::Value` per buffered value (exact
+    /// multiplicity — each is one strong `Rc` this registry owns). Senders'
+    /// in-flight values are held by their (separately reachable) parked tasks,
+    /// so they are NOT emitted here — mirroring the pre-migration inline
+    /// `Channel` buffer, whose GC node only traced the buffer. An unknown id is
+    /// a no-op (the channel was already evicted).
+    pub(crate) fn gc_trace_buffer(
+        &self,
+        id: ChannelId,
+        sink: &mut dyn FnMut(sema_core::cycle::GcEdge<'_>),
+    ) {
+        if let Some(channel) = self.channels.get(&id) {
+            for value in &channel.buffer {
+                sink(sema_core::cycle::GcEdge::Value(value));
+            }
+        }
+    }
+
+    /// GC sever: drain a white channel's buffer, returning its contents for the
+    /// collector to drop after all severing has completed.
+    pub(crate) fn gc_sever_buffer(&mut self, id: ChannelId) -> Vec<Value> {
+        match self.channels.get_mut(&id) {
+            Some(channel) => channel.buffer.drain(..).collect(),
+            None => Vec::new(),
+        }
+    }
+
+    /// GC eviction: a channel whose handle is gone is unreachable. Remove its
+    /// record so the registry stays O(live handles) — but only if no task is
+    /// parked sending or receiving on it (a waiter keeps the record alive until
+    /// it is reaped/cancelled, so its wake still finds the channel).
+    pub(crate) fn gc_evict(&mut self, id: ChannelId) {
+        if let Some(channel) = self.channels.get(&id) {
+            if channel.senders.is_empty() && channel.receivers.is_empty() {
+                self.channels.remove(&id);
+            }
+        }
+    }
 }
 
 impl Trace for ChannelRegistry {

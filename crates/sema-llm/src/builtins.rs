@@ -562,6 +562,20 @@ fn register_fn_ctx(
 /// stdlib `EvalContext` for any callback dispatch. Outside the runtime (bare eval
 /// / legacy scheduler) the legacy callback runs the same body with the real
 /// evaluator context and unwraps the plain `Return` it produces there.
+/// True when a blocking provider call should offload+yield so siblings overlap: inside
+/// a legacy scheduler task, OR a unified-runtime SPAWNED task (a real `async/spawn` /
+/// `async/pool-map` child). Deliberately FALSE for the root/top-level quantum
+/// (`current_task_id() == None`): top-level code — including a cooperative
+/// `(map llm/embed …)` whose HOF driver cannot suspend a directly-invoked native's
+/// offload yield — must run the synchronous provider path, exactly as before the runtime
+/// (a plain `in_runtime_quantum()` gate would wrongly offload it and hit the
+/// "wrap it in a lambda" HOF-yield stub).
+#[cfg(not(target_arch = "wasm32"))]
+fn in_async_offload_context() -> bool {
+    sema_core::in_async_context()
+        || (sema_core::in_runtime_quantum() && sema_core::current_task_id().is_some())
+}
+
 fn register_runtime_fn_ctx(
     env: &Env,
     name: &str,
@@ -2204,9 +2218,7 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
         // LegacyAwaitIoBridge). The poller accounts (no post-call `track_usage`
         // here) and shapes the value. The sync branch below is byte-identical.
         #[cfg(not(target_arch = "wasm32"))]
-        if (sema_core::in_async_context() || sema_core::in_runtime_quantum())
-            && completion_chain_offloadable()
-        {
+        if in_async_offload_context() && completion_chain_offloadable() {
             return do_complete_async_yield(
                 request,
                 Box::new(|resp| Ok(Value::string(&resp.content))),
@@ -2299,7 +2311,7 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
                 // poller accounts and shapes the value. Sync branch below is
                 // byte-identical to before. Mirrors `llm/complete`.
                 #[cfg(not(target_arch = "wasm32"))]
-                if sema_core::in_async_context() {
+                if in_async_offload_context() {
                     return do_complete_async_yield(
                         request,
                         Box::new(|resp| Ok(Value::string(&resp.content))),
@@ -2751,7 +2763,7 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
         // Inside a scheduler task: offload + yield so siblings overlap. Sync
         // branch below is byte-identical to before. Mirrors `llm/complete`.
         #[cfg(not(target_arch = "wasm32"))]
-        if sema_core::in_async_context() {
+        if in_async_offload_context() {
             return do_complete_async_yield(request, Box::new(finalize));
         }
 
@@ -3175,17 +3187,25 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
     // yields `AwaitIo` and sibling scheduler tasks overlap during the conversation.
     // See docs/plans/2026-07-02-nonblocking-agent-run.md (ADR #68).
     register_fn_ctx(env, "__async-context?", |_ctx, _args| {
-        Ok(Value::bool(sema_core::in_async_context()))
+        Ok(Value::bool(in_async_offload_context()))
     });
-    // True while a unified-runtime VM quantum is executing. The prelude
-    // `agent/run` / `llm/chat` dispatchers also select the Sema-driven
-    // `__agent-drive` loop in this case, so the tool round (`__agent-exec-tools`)
-    // runs each tool handler COOPERATIVELY via `NativeOutcome::Call` — a handler
-    // that suspends (e.g. `mcp/call`'s runtime external wait) parks/resumes on the
-    // active task instead of being forced synchronous by the legacy re-entry
-    // bridge. See Task 04 (`docs/plans/2026-07-13-unified-cooperative-runtime.md`).
+    // True while a unified-runtime VM quantum is executing IN A SPAWNED TASK (a
+    // real `async/spawn` / `async/pool-map` child — `current_task_id()` is `Some`;
+    // the root/top-level quantum publishes `None`). The prelude `agent/run` /
+    // `llm/chat` dispatchers select the Sema-driven `__agent-drive` loop in this
+    // case, so each provider round offloads + suspends and the tool round
+    // (`__agent-exec-tools`) runs each handler COOPERATIVELY via `NativeOutcome::Call`
+    // — a handler that suspends (e.g. `mcp/call`'s runtime external wait) parks on the
+    // active task. At the TOP LEVEL there is no sibling to overlap with, so the
+    // dispatchers fall through to the SYNCHRONOUS in-native tool loop
+    // (`run_tool_loop`) exactly as before the runtime — the root quantum being "in a
+    // quantum" must not force the cooperative multi-round path, which only settles
+    // correctly when driven as a genuine spawned task. See Task 04
+    // (`docs/plans/2026-07-13-unified-cooperative-runtime.md`).
     register_fn_ctx(env, "__runtime-quantum?", |_ctx, _args| {
-        Ok(Value::bool(sema_core::in_runtime_quantum()))
+        Ok(Value::bool(
+            sema_core::in_runtime_quantum() && sema_core::current_task_id().is_some(),
+        ))
     });
     register_fn_ctx(env, "__agent-begin", |_ctx, args| agent_begin(args));
     register_runtime_fn_ctx(env, "__agent-step", |ctx, args| {
@@ -3404,7 +3424,7 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
         // admission-control permit for its entire duration (by design, same as a
         // long retry backoff — see the sema-io module docs).
         #[cfg(not(target_arch = "wasm32"))]
-        if sema_core::in_async_context() {
+        if in_async_offload_context() {
             let provider = PROVIDER_REGISTRY.with(|reg| reg.borrow().default_provider());
             let Some(provider) = provider else {
                 return Err(SemaError::Llm(
@@ -3685,7 +3705,7 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
         // The concurrent embed path is native-only (no shared tokio runtime on
         // wasm), so wasm always falls through to the synchronous path below.
         #[cfg(not(target_arch = "wasm32"))]
-        if sema_core::in_async_context() {
+        if in_async_offload_context() {
             // DETACHED embeddings span: parent captured now, finalized in the
             // poller after the yield (where the active-span stack may hold a
             // sibling task's span, so the span must not pop the stack on drop).
@@ -3979,7 +3999,7 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
         // The concurrent rerank path is native-only (no shared tokio runtime on
         // wasm), so wasm always falls through to the synchronous path below.
         #[cfg(not(target_arch = "wasm32"))]
-        if sema_core::in_async_context() {
+        if in_async_offload_context() {
             // DETACHED reranker span: parent captured now, finalized in the
             // poller after the yield (where the active-span stack may hold a
             // sibling task's span, so the span must not pop the stack on drop).
@@ -4721,7 +4741,7 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
         // Inside a scheduler task: offload + yield so siblings overlap. Sync
         // branch below is byte-identical to before. Mirrors `llm/complete`.
         #[cfg(not(target_arch = "wasm32"))]
-        if sema_core::in_async_context() {
+        if in_async_offload_context() {
             return do_complete_async_yield(request, Box::new(finalize));
         }
 
@@ -5925,7 +5945,7 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
         // Inside a scheduler task: offload + yield so siblings overlap. Sync
         // branch below is byte-identical to before. Mirrors `llm/complete`.
         #[cfg(not(target_arch = "wasm32"))]
-        if sema_core::in_async_context() {
+        if in_async_offload_context() {
             return do_complete_async_yield(
                 request,
                 Box::new(|resp| Ok(Value::string(&resp.content))),
@@ -5990,7 +6010,7 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
         // Inside a scheduler task: offload + yield so siblings overlap. Sync
         // branch below is byte-identical to before. Mirrors `llm/complete`.
         #[cfg(not(target_arch = "wasm32"))]
-        if sema_core::in_async_context() {
+        if in_async_offload_context() {
             return do_complete_async_yield(request, Box::new(parse_comparison));
         }
 
@@ -6124,7 +6144,7 @@ fn complete_with_prompt(prompt: &Prompt, opts: Option<&Value>) -> Result<Value, 
     // `llm/send` and the Prompt-arg branch of `llm/complete`). Sync branch below
     // is byte-identical to before. Mirrors `llm/complete`.
     #[cfg(not(target_arch = "wasm32"))]
-    if sema_core::in_async_context() {
+    if in_async_offload_context() {
         return do_complete_async_yield(request, Box::new(|resp| Ok(Value::string(&resp.content))));
     }
 

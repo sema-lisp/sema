@@ -150,6 +150,45 @@ impl PromiseRegistry {
         }
         self.records.get_mut(&id).ok_or(RegistryError::Unknown)
     }
+
+    /// GC interior: emit the promise's settled value (if any) as `GcEdge::Value`
+    /// edges, so a cycle routed through a settled promise (a promise resolving
+    /// to a structure that reaches the promise handle) is discovered. A pending
+    /// promise, or an unknown id, emits nothing.
+    pub(crate) fn gc_trace_settlement(
+        &self,
+        id: PromiseId,
+        sink: &mut dyn FnMut(sema_core::cycle::GcEdge<'_>),
+    ) {
+        if let Some(record) = self.records.get(&id) {
+            if let Some(settlement) = &record.settlement {
+                settlement.trace(sink);
+            }
+        }
+    }
+
+    /// GC sever: clear a white promise's settled value, breaking its edge to
+    /// the settled value so the cycle's `Rc` cascade can run. The settled
+    /// `Value` stays pinned by the collector's side-map handle until the pass
+    /// completes, so dropping the settlement `Rc` here frees nothing early.
+    pub(crate) fn gc_sever_settlement(&mut self, id: PromiseId) -> Vec<sema_core::Value> {
+        if let Some(record) = self.records.get_mut(&id) {
+            record.settlement = None;
+        }
+        Vec::new()
+    }
+
+    /// GC eviction: a settled promise whose handle is gone is unreachable —
+    /// remove its record so the registry stays O(live handles). A pending
+    /// promise is kept (a live task may still settle it), as is one with
+    /// waiters.
+    pub(crate) fn gc_evict(&mut self, id: PromiseId) {
+        if let Some(record) = self.records.get(&id) {
+            if record.settlement.is_some() && record.waiters.is_empty() {
+                self.records.remove(&id);
+            }
+        }
+    }
 }
 
 impl Trace for PromiseRegistry {

@@ -922,6 +922,47 @@ fn data_only_promise_channel_cycle_live_round_trips() {
 }
 
 #[test]
+fn promise_settled_value_cell_cycle_collected() {
+    // Promise-only cycle (no channel): a promise resolves to a mutable cell that
+    // is then set back to the promise. The cycle passes through the promise's
+    // SETTLED value, which lives in the runtime's `PromiseRegistry` — the exact
+    // registry-invisible shape the channel-buffer fix also covers. Once `mk`
+    // returns nothing outside the cycle references either handle; the settled
+    // value (and the cell) must be reclaimed via the promise interior hook.
+    let v = eval_ok(
+        "(begin
+           (gc/collect)
+           (define (mk)
+             (define box (mutable-cell/new nil))
+             (define p (async/resolved box))
+             (mutable-cell/set! box p)
+             nil)
+           (mk)
+           (> (:collected (gc/collect)) 0))",
+    );
+    assert_eq!(v, Value::bool(true));
+}
+
+#[test]
+fn promise_settled_value_cell_cycle_live_round_trips() {
+    // Same promise↔cell cycle, still reachable (global bindings): the collection
+    // must keep the whole cycle. Awaiting the promise yields the cell back, and
+    // the cell still holds the promise that awaits back to the cell — proving
+    // neither the settled value nor the cell slot was severed. Walked twice
+    // around the cycle via identity to pin every edge.
+    let v = eval_ok(
+        "(begin
+           (define box (mutable-cell/new nil))
+           (define p (async/resolved box))
+           (mutable-cell/set! box p)
+           (gc/collect)
+           (list (eq? box (await p))
+                 (eq? box (await (mutable-cell/get (await p))))))",
+    );
+    assert_eq!(v, Value::list(vec![Value::bool(true), Value::bool(true)]));
+}
+
+#[test]
 fn data_only_multimethod_self_cycle_collected() {
     // mm.methods[:self] = mm with a builtin dispatch fn: no closure anywhere
     // on the cycle. After the global rebind the MultiMethod candidate is the

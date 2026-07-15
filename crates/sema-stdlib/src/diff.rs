@@ -478,7 +478,7 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
             .ok_or_else(|| SemaError::type_error("string", args[1].type_name()))?
             .to_string();
 
-        if sema_core::in_async_context() {
+        if sema_core::in_async_context() || sema_core::in_runtime_quantum() {
             return crate::io::fs_offload(
                 move || patch_apply_file_work(&path, &patch).map_err(|e| e.to_string()),
                 Value::int,

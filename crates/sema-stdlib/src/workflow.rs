@@ -20,6 +20,11 @@
 //! The macros `defworkflow`/`phase`/`agent` (prelude) expand to these — see
 //! `crates/sema-eval/src/prelude.rs`.
 
+use sema_core::cycle::GcEdge;
+use sema_core::runtime::{
+    NativeCall, NativeCallContext, NativeContinuation, NativeOutcome, NativeResult, ResumeInput,
+    Trace,
+};
 use sema_core::{SemaError, Value};
 use sema_workflow::context;
 use sema_workflow::event::WorkflowEvent;
@@ -203,233 +208,517 @@ fn end_run_before_body(
     envelope
 }
 
+/// Post-thunk teardown for a `register_thunk_fn` native: given the teardown state and
+/// the thunk's result, journal/close and return the builtin's value.
+type FinishFn<T> = fn(T, Result<Value, SemaError>) -> Result<Value, SemaError>;
+/// Trace the `Value` edges a teardown state carries (a run's open MCP handles; none for
+/// a step).
+type TraceTeardownFn<T> = fn(&T, &mut dyn FnMut(GcEdge<'_>));
+
+/// Register a thunk-taking workflow builtin (`workflow/run`, `workflow/step`) as a
+/// DUAL-ABI native. `plan` runs the synchronous PRE-thunk work (scope setup, budget
+/// gate, resume short-circuit) and decides whether a thunk needs to run. Under a
+/// runtime quantum the runtime callback drives that thunk as a cooperative
+/// `NativeOutcome::Call`, so an async op inside it (a `parallel`/`pipeline` fan-out's
+/// `async/spawn`, an offloaded `llm/chat` tool loop, `channel/*`) parks on the active
+/// task instead of hitting the runtime-only error stub a synchronous `call_function`
+/// re-entry would. Everywhere else the legacy callback runs the thunk inline. The
+/// post-thunk teardown (journaling the result, budget accounting, memoization, closing
+/// the scope) is `finish`, run identically by the legacy path and the continuation.
+fn register_thunk_fn<T: 'static>(
+    env: &sema_core::Env,
+    name: &'static str,
+    plan: impl Fn(&[Value]) -> Result<ThunkPlan<T>, SemaError> + 'static,
+    finish: FinishFn<T>,
+    trace_teardown: TraceTeardownFn<T>,
+) {
+    let plan = Rc::new(plan);
+    let for_legacy = plan.clone();
+    let for_runtime = plan;
+    env.set(
+        sema_core::intern(name),
+        Value::native_fn(sema_core::NativeFn::simple_with_runtime(
+            name,
+            move |args| match for_legacy(args)? {
+                ThunkPlan::Immediate(value) => Ok(value),
+                ThunkPlan::Run { thunk, teardown } => {
+                    let result = crate::list::call_function(&thunk, &[]);
+                    finish(teardown, result)
+                }
+            },
+            move |_ctx, args| match for_runtime(args)? {
+                ThunkPlan::Immediate(value) => Ok(NativeOutcome::Return(value)),
+                ThunkPlan::Run { thunk, teardown } => Ok(NativeOutcome::Call(NativeCall {
+                    callable: thunk,
+                    args: Vec::new(),
+                    continuation: Box::new(ThunkContinuation {
+                        teardown: Some(teardown),
+                        finish,
+                        trace_teardown,
+                        name,
+                    }),
+                })),
+            },
+        )),
+    );
+}
+
+/// A workflow builtin's pre-thunk decision: either an immediate value (nothing to run —
+/// a resume replay, a budget-tripped skip, or a pre-body `:mcp` gate exit) or a thunk to
+/// run with the `teardown` state its `finish` needs afterward.
+enum ThunkPlan<T> {
+    Immediate(Value),
+    Run { thunk: Value, teardown: T },
+}
+
+/// Cooperative teardown for a `register_thunk_fn` native: the runtime drives the thunk
+/// and resumes here with its result; `finish` runs the same post-thunk work the legacy
+/// synchronous path runs. Any `Value` the teardown state carries (e.g. a run's open MCP
+/// handles) is traced via `trace_teardown`.
+struct ThunkContinuation<T> {
+    teardown: Option<T>,
+    finish: FinishFn<T>,
+    trace_teardown: TraceTeardownFn<T>,
+    name: &'static str,
+}
+
+impl<T> Trace for ThunkContinuation<T> {
+    fn trace(&self, sink: &mut dyn FnMut(GcEdge<'_>)) -> bool {
+        if let Some(teardown) = &self.teardown {
+            (self.trace_teardown)(teardown, sink);
+        }
+        true
+    }
+}
+
+impl<T: 'static> NativeContinuation for ThunkContinuation<T> {
+    fn resume(
+        mut self: Box<Self>,
+        _context: &mut NativeCallContext<'_>,
+        input: ResumeInput,
+    ) -> NativeResult {
+        let result = match input {
+            ResumeInput::Returned(value) => Ok(value),
+            ResumeInput::Failed(error) => Err(error),
+            ResumeInput::Cancelled(reason) => Err(SemaError::eval(format!(
+                "{} thunk was cancelled ({reason:?})",
+                self.name
+            ))),
+            ResumeInput::Runtime(_) => Err(SemaError::eval(format!(
+                "{} teardown received an unexpected runtime response",
+                self.name
+            ))),
+        };
+        let teardown = self
+            .teardown
+            .take()
+            .expect("thunk continuation resumed once");
+        (self.finish)(teardown, result).map(NativeOutcome::Return)
+    }
+}
+
+/// Post-thunk teardown state for `workflow/step` (`None` = a run-less transparent call,
+/// which just returns the thunk's result). Carries no `Value`.
+struct StepTeardown {
+    agent_id: String,
+    content_key: String,
+    start: Instant,
+    usage_scope: sema_llm::builtins::UsageScope,
+}
+
+/// Journal a `workflow/step` leaf's result: emit `agent.result`, attribute usage via a
+/// `budget` event + charge the run, and memoize the value for `--resume`. Re-fetches the
+/// live scope (still installed by the enclosing `workflow/run` guard) rather than
+/// capturing it. Shared by the legacy and cooperative paths.
+fn finish_step(
+    teardown: Option<StepTeardown>,
+    result: Result<Value, SemaError>,
+) -> Result<Value, SemaError> {
+    let Some(td) = teardown else {
+        // Transparent (outside a run): nothing to journal.
+        return result;
+    };
+    let Some(ctx) = context::current() else {
+        return result;
+    };
+    ctx.set_cur_agent(None);
+    let dur_ms = if ctx.deterministic() {
+        0
+    } else {
+        td.start.elapsed().as_millis() as u64
+    };
+    let usage = td.usage_scope.usage();
+    let model = usage.model.clone();
+    let output = match &result {
+        Ok(v) => capped_render(v),
+        Err(e) => format!("error: {e}"),
+    };
+    let status = if result.is_ok() { "ok" } else { "failed" };
+    ctx.emit(WorkflowEvent::AgentResult {
+        seq: ctx.next_seq(),
+        ts: ctx.ts(),
+        agent_id: td.agent_id.clone(),
+        status: status.into(),
+        output,
+        dur_ms,
+        model,
+    });
+    if usage.calls > 0 {
+        ctx.emit(WorkflowEvent::Budget {
+            seq: ctx.next_seq(),
+            ts: ctx.ts(),
+            agent_id: Some(td.agent_id),
+            phase_seq: ctx.phase_seq(),
+            input_tokens: usage.input_tokens,
+            output_tokens: usage.output_tokens,
+            cost_usd: usage.cost_usd,
+            budget_limit: ctx.budget_limit_for_event(),
+        });
+        // Charge AFTER the Budget event is journaled, so the leaf that tips the cap is
+        // itself fully recorded; the sticky latch then refuses the NEXT leaf.
+        ctx.charge(usage.cost_usd, usage.input_tokens + usage.output_tokens);
+    }
+    if let Ok(ref v) = result {
+        ctx.memo_store(&td.content_key, v);
+    }
+    result
+}
+
+/// Pre-thunk work for `workflow/step` — see the original inline documentation preserved
+/// in `finish_step` and the event emissions below.
+fn step_plan(args: &[Value]) -> Result<ThunkPlan<Option<StepTeardown>>, SemaError> {
+    if args.len() != 2 {
+        return Err(SemaError::arity("workflow/step", "2", args.len()));
+    }
+    // First arg is the agent role: an opts map `{:name "scout" …}` (the `agent` macro
+    // form), or a bare keyword/string label. Default role is "agent".
+    let label = agent_role(&args[0]);
+    let thunk = args[1].clone();
+    let Some(ctx) = context::current() else {
+        // Outside a run: transparent — just call the thunk (still cooperatively, so an
+        // async op inside it works), with no journaling teardown.
+        return Ok(ThunkPlan::Run {
+            thunk,
+            teardown: None,
+        });
+    };
+    // Resume short-circuit FIRST (before the budget latch): a memoized leaf replays for
+    // FREE. This MUST precede the budget check: a replay makes no provider call, so a
+    // tripped cap must not refuse it. The key is computed on EVERY leaf so its occurrence
+    // ordinal advances in body order either way.
+    let prompt = {
+        let injected = opt_str(&args[0], "__prompt");
+        if injected.is_empty() {
+            opt_str(&args[0], "prompt")
+        } else {
+            injected
+        }
+    };
+    let content_key = ctx.agent_content_key(
+        &prompt,
+        &opt_str(&args[0], "__schema-repr"),
+        &label,
+        &ctx.cur_phase_label(),
+    );
+    if ctx.resuming() {
+        if let Some(v) = ctx.memo_lookup(&content_key) {
+            return Ok(ThunkPlan::Immediate(v));
+        }
+    }
+    // Budget latch: once a cap is tripped, refuse to LAUNCH further (non-replayed) leaves.
+    if ctx.over_budget() {
+        return Ok(ThunkPlan::Immediate(Value::nil()));
+    }
+    // Unique per-invocation id (the dashboard correlates started→result→budget by it).
+    let agent_id = ctx.next_agent_id(&label);
+    ctx.emit(WorkflowEvent::AgentStarted {
+        seq: ctx.next_seq(),
+        ts: ctx.ts(),
+        agent_id: agent_id.clone(),
+        agent_name: label.clone(),
+        model: String::new(),
+        prompt: cap_text(&prompt),
+    });
+    let start = Instant::now();
+    // Open a per-leaf usage accumulator for the duration of this thunk; the async path
+    // captures the frame's Rc into its poller so a sibling leaf under parallel/pipeline
+    // fan-out can't clobber the tally. The guard pops the frame when the teardown drops it.
+    let usage_scope = sema_llm::builtins::open_usage_scope();
+    // Mark this as the current agent so `workflow/tool-call` inside the thunk attributes
+    // to it; cleared in `finish_step`. `cur_agent` is a single shared slot — under a
+    // CONCURRENT `:tools` fan-out attribution is best-effort (same single-slot caveat as
+    // the per-agent budget).
+    ctx.set_cur_agent(Some(agent_id.clone()));
+    Ok(ThunkPlan::Run {
+        thunk,
+        teardown: Some(StepTeardown {
+            agent_id,
+            content_key,
+            start,
+            usage_scope,
+        }),
+    })
+}
+
+/// Post-thunk teardown state for `workflow/run`. Holds the scope guard (dropped last,
+/// after `run.ended` + `result.json`) and any open MCP handles to close (the handles are
+/// `Value`s — traced).
+struct RunTeardown {
+    guard: context::WorkflowGuard,
+    mcp_resolver: Option<Rc<dyn WorkflowMcpResolver>>,
+    mcp_handles: Vec<Value>,
+}
+
+/// Derive the run envelope from the body's result, journal `run.ended`, write
+/// `result.json`, close any MCP handles, then drop the scope guard. Shared by the legacy
+/// and cooperative paths; always returns an envelope (a body error becomes a failed one).
+fn finish_run(
+    teardown: RunTeardown,
+    result: Result<Value, SemaError>,
+) -> Result<Value, SemaError> {
+    let RunTeardown {
+        guard,
+        mcp_resolver,
+        mcp_handles,
+    } = teardown;
+    let (mut status, mut envelope, mut reason) = match &result {
+        Ok(v) => ("success", success_envelope(v.clone()), None),
+        Err(e) => (
+            "failed",
+            failed_envelope(&e.to_string()),
+            Some("workflow body returned an error".to_string()),
+        ),
+    };
+    // Close any resolved MCP handles exactly once, regardless of how the body exited.
+    if let Some(resolver) = mcp_resolver {
+        resolver.close(&mcp_handles);
+    }
+    if let Some(ctx) = context::current() {
+        // A tripped budget cap fails the run regardless of the body's own outcome.
+        if ctx.over_budget() {
+            status = "failed";
+            envelope = budget_failed_envelope();
+            reason = Some("budget exceeded".to_string());
+        }
+        close_open_phase(&ctx, status);
+        ctx.emit(WorkflowEvent::RunEnded {
+            seq: ctx.next_seq(),
+            ts: ctx.ts(),
+            status: status.into(),
+            reason,
+            dur_ms: ctx.dur_ms(),
+        });
+        ctx.write_result(&envelope);
+    }
+    drop(guard);
+    Ok(envelope)
+}
+
+/// Pre-thunk work for `workflow/run`: open the run scope, journal `run.started`, resolve
+/// any declared `:mcp` servers (a pre-body gate that can end the run before the body ever
+/// runs), and hand back the body thunk plus the teardown state. Mirrors the original
+/// inline builtin; the post-body work moved to `finish_run`.
+fn run_plan(args: &[Value]) -> Result<ThunkPlan<RunTeardown>, SemaError> {
+    if args.len() != 4 {
+        return Err(SemaError::arity("workflow/run", "4", args.len()));
+    }
+    let name = args[0]
+        .as_str()
+        .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?
+        .to_string();
+    // doc (args[1]) and meta (args[2]) are recorded into the journal/metadata.json;
+    // tolerate any shape.
+    let doc = args[1].as_str().unwrap_or("").to_string();
+    let meta = args[2].clone();
+    let thunk = args[3].clone();
+
+    // Open the run scope: sets up the journal sink under ./.sema/runs/<run-id>/, installs
+    // the thread-local WorkflowCtx, and returns a panic-safe Drop guard that reaps the
+    // previous scope. `set_workflow_scope` reads the SEMA_WORKFLOW_RUN_ID /
+    // SEMA_WORKFLOW_FIXED_TS test seam internally.
+    let guard = context::set_workflow_scope(&name, &doc, &meta)
+        .map_err(|e| SemaError::eval(format!("workflow/run: {e}")))?;
+
+    // run.started — emitted inside the live scope so seq starts at 0.
+    {
+        let ctx = context::current()
+            .ok_or_else(|| SemaError::eval("workflow/run: scope not established"))?;
+        ctx.emit(WorkflowEvent::RunStarted {
+            seq: ctx.next_seq(),
+            ts: ctx.ts(),
+            workflow: name.clone(),
+            run_id: ctx.run_id(),
+            code_version: String::new(),
+            args_json: ctx.args_json().to_string(),
+            phases: declared_phases(&meta),
+        });
+    }
+
+    // ── Implicit :mcp auth-resolution step, before the body thunk ─────────
+    // A workflow with no :mcp meta key parses to an empty Vec here (O(1) on the absent
+    // key), so every branch below is skipped and the body runs exactly as it did before
+    // this feature — byte-identical for the no-:mcp case.
+    let decls = match workflow_mcp::declared_mcp(&meta) {
+        Ok(d) => d,
+        Err(e) => {
+            let ctx = context::current()
+                .ok_or_else(|| SemaError::eval("workflow/run: scope not established"))?;
+            let envelope = failed_envelope(&e.to_string());
+            return Ok(ThunkPlan::Immediate(end_run_before_body(
+                &ctx,
+                guard,
+                "failed",
+                "mcp declaration invalid".to_string(),
+                envelope,
+            )));
+        }
+    };
+
+    // Handles resolved below (if any), closed exactly once after the body exits.
+    let mut mcp_resolver: Option<Rc<dyn WorkflowMcpResolver>> = None;
+    let mut mcp_handles: Vec<Value> = Vec::new();
+
+    if !decls.is_empty() {
+        let ctx = context::current()
+            .ok_or_else(|| SemaError::eval("workflow/run: scope not established"))?;
+        ctx.set_mcp_declared(decls.iter().map(|d| d.alias.clone()).collect());
+
+        let Some(resolver) = workflow_mcp::workflow_mcp_resolver() else {
+            let envelope = failed_envelope(
+                "workflow declares :mcp servers but this build has no MCP resolver \
+                 registered",
+            );
+            return Ok(ThunkPlan::Immediate(end_run_before_body(
+                &ctx,
+                guard,
+                "failed",
+                "mcp resolution failed".to_string(),
+                envelope,
+            )));
+        };
+
+        let resolutions = resolver.resolve(&decls, &name, &ctx.run_id());
+
+        let mut connected: BTreeMap<String, Value> = BTreeMap::new();
+        let mut connected_handles: Vec<Value> = Vec::new();
+        let mut needs_auth: Vec<(String, String, String)> = Vec::new();
+        let mut failures: Vec<(String, String)> = Vec::new();
+
+        // Emit events per resolution IN THE GIVEN (alias-sorted) order — the resolver
+        // returns them in the same order as `decls`.
+        for resolution in &resolutions {
+            match resolution {
+                ServerResolution::Connected {
+                    alias,
+                    handle,
+                    auth,
+                } => {
+                    connected.insert(alias.clone(), handle.clone());
+                    connected_handles.push(handle.clone());
+                    if let Some(grant) = auth {
+                        ctx.emit(WorkflowEvent::AuthGranted {
+                            seq: ctx.next_seq(),
+                            ts: ctx.ts(),
+                            server: alias.clone(),
+                            scopes: grant.scopes.clone(),
+                            expires_at: grant.expires_at,
+                            source: grant.source.clone(),
+                        });
+                    }
+                }
+                ServerResolution::NeedsAuth {
+                    alias,
+                    url,
+                    scopes,
+                    tools,
+                    persist,
+                } => {
+                    ctx.emit(WorkflowEvent::AuthRequired {
+                        seq: ctx.next_seq(),
+                        ts: ctx.ts(),
+                        server: alias.clone(),
+                        scopes: scopes.clone(),
+                        tools: tools.clone(),
+                        persist: persist.clone(),
+                    });
+                    needs_auth.push((alias.clone(), url.clone(), persist.clone()));
+                }
+                ServerResolution::Failed { alias, reason } => {
+                    ctx.emit(WorkflowEvent::AuthFailed {
+                        seq: ctx.next_seq(),
+                        ts: ctx.ts(),
+                        server: alias.clone(),
+                        reason: reason.clone(),
+                    });
+                    failures.push((alias.clone(), reason.clone()));
+                }
+            }
+        }
+
+        // Outcome precedence: any Failed wins over any NeedsAuth. Both close whatever DID
+        // connect before ending the run — the body NEVER runs.
+        if !failures.is_empty() {
+            resolver.close(&connected_handles);
+            let msg = failures
+                .iter()
+                .map(|(alias, reason)| format!("{alias}: {reason}"))
+                .collect::<Vec<_>>()
+                .join("; ");
+            let envelope = failed_envelope(&msg);
+            return Ok(ThunkPlan::Immediate(end_run_before_body(
+                &ctx,
+                guard,
+                "failed",
+                "mcp resolution failed".to_string(),
+                envelope,
+            )));
+        }
+        if !needs_auth.is_empty() {
+            resolver.close(&connected_handles);
+            let envelope = needs_auth_envelope(&needs_auth);
+            return Ok(ThunkPlan::Immediate(end_run_before_body(
+                &ctx,
+                guard,
+                "needs-auth",
+                "authentication required".to_string(),
+                envelope,
+            )));
+        }
+
+        // Every declared server connected: publish handles for workflow/mcp-handle, and
+        // remember (resolver, handles) so `finish_run` closes them EXACTLY once.
+        ctx.set_mcp_handles(connected);
+        mcp_resolver = Some(resolver);
+        mcp_handles = connected_handles;
+    }
+
+    Ok(ThunkPlan::Run {
+        thunk,
+        teardown: RunTeardown {
+            guard,
+            mcp_resolver,
+            mcp_handles,
+        },
+    })
+}
+
 pub fn register(env: &sema_core::Env) {
     // (workflow/run name doc meta thunk) — open a run scope, journal start/end, return
     // the {:status ...} envelope. `name`/`doc` are strings; `meta` is the workflow's
     // metadata map ({:args ... :budget ... :permissions ...}); `thunk` is the (lambda () ...)
     // wrapping the workflow body.
-    crate::register_fn(env, "workflow/run", |args| {
-        if args.len() != 4 {
-            return Err(SemaError::arity("workflow/run", "4", args.len()));
-        }
-        let name = args[0]
-            .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?
-            .to_string();
-        // doc (args[1]) and meta (args[2]) are carried for the journal/metadata.json but
-        // recorded into the journal/metadata.json; tolerate any shape.
-        let doc = args[1].as_str().unwrap_or("").to_string();
-        let meta = args[2].clone();
-        let thunk = &args[3];
-
-        // Open the run scope: sets up the journal sink under ./.sema/runs/<run-id>/,
-        // installs the thread-local WorkflowCtx, and returns a panic-safe Drop guard
-        // that reaps the previous scope. `set_workflow_scope` reads the
-        // SEMA_WORKFLOW_RUN_ID / SEMA_WORKFLOW_FIXED_TS test seam internally.
-        let guard = context::set_workflow_scope(&name, &doc, &meta)
-            .map_err(|e| SemaError::eval(format!("workflow/run: {e}")))?;
-
-        // run.started — emitted inside the live scope so seq starts at 0.
-        {
-            let ctx = context::current()
-                .ok_or_else(|| SemaError::eval("workflow/run: scope not established"))?;
-            ctx.emit(WorkflowEvent::RunStarted {
-                seq: ctx.next_seq(),
-                ts: ctx.ts(),
-                workflow: name.clone(),
-                run_id: ctx.run_id(),
-                code_version: String::new(),
-                args_json: ctx.args_json().to_string(),
-                phases: declared_phases(&meta),
-            });
-        }
-
-        // ── Implicit :mcp auth-resolution step, before the body thunk ─────────
-        // (docs/plans/2026-06-24-workflow-mcp-auth.md §3). A workflow with no
-        // :mcp meta key parses to an empty Vec here (O(1) on the absent key), so
-        // every branch below is skipped and the body runs exactly as it did
-        // before this feature — byte-identical for the no-:mcp case.
-        let decls = match workflow_mcp::declared_mcp(&meta) {
-            Ok(d) => d,
-            Err(e) => {
-                let ctx = context::current()
-                    .ok_or_else(|| SemaError::eval("workflow/run: scope not established"))?;
-                let envelope = failed_envelope(&e.to_string());
-                return Ok(end_run_before_body(
-                    &ctx,
-                    guard,
-                    "failed",
-                    "mcp declaration invalid".to_string(),
-                    envelope,
-                ));
+    register_thunk_fn(
+        env,
+        "workflow/run",
+        run_plan,
+        finish_run,
+        |teardown: &RunTeardown, sink: &mut dyn FnMut(GcEdge<'_>)| {
+            // The only GC-visible state a pending run holds is its open MCP handles.
+            for handle in &teardown.mcp_handles {
+                sink(GcEdge::Value(handle));
             }
-        };
-
-        // Handles resolved below (if any), closed exactly once after the body
-        // exits (success, error, or budget-fail) further down.
-        let mut mcp_close: Option<(Rc<dyn WorkflowMcpResolver>, Vec<Value>)> = None;
-
-        if !decls.is_empty() {
-            let ctx = context::current()
-                .ok_or_else(|| SemaError::eval("workflow/run: scope not established"))?;
-            ctx.set_mcp_declared(decls.iter().map(|d| d.alias.clone()).collect());
-
-            let Some(resolver) = workflow_mcp::workflow_mcp_resolver() else {
-                let envelope = failed_envelope(
-                    "workflow declares :mcp servers but this build has no MCP resolver \
-                     registered",
-                );
-                return Ok(end_run_before_body(
-                    &ctx,
-                    guard,
-                    "failed",
-                    "mcp resolution failed".to_string(),
-                    envelope,
-                ));
-            };
-
-            let resolutions = resolver.resolve(&decls, &name, &ctx.run_id());
-
-            let mut connected: BTreeMap<String, Value> = BTreeMap::new();
-            let mut connected_handles: Vec<Value> = Vec::new();
-            let mut needs_auth: Vec<(String, String, String)> = Vec::new();
-            let mut failures: Vec<(String, String)> = Vec::new();
-
-            // Emit events per resolution IN THE GIVEN (alias-sorted) order — the
-            // resolver returns them in the same order as `decls`.
-            for resolution in &resolutions {
-                match resolution {
-                    ServerResolution::Connected {
-                        alias,
-                        handle,
-                        auth,
-                    } => {
-                        connected.insert(alias.clone(), handle.clone());
-                        connected_handles.push(handle.clone());
-                        if let Some(grant) = auth {
-                            ctx.emit(WorkflowEvent::AuthGranted {
-                                seq: ctx.next_seq(),
-                                ts: ctx.ts(),
-                                server: alias.clone(),
-                                scopes: grant.scopes.clone(),
-                                expires_at: grant.expires_at,
-                                source: grant.source.clone(),
-                            });
-                        }
-                    }
-                    ServerResolution::NeedsAuth {
-                        alias,
-                        url,
-                        scopes,
-                        tools,
-                        persist,
-                    } => {
-                        ctx.emit(WorkflowEvent::AuthRequired {
-                            seq: ctx.next_seq(),
-                            ts: ctx.ts(),
-                            server: alias.clone(),
-                            scopes: scopes.clone(),
-                            tools: tools.clone(),
-                            persist: persist.clone(),
-                        });
-                        needs_auth.push((alias.clone(), url.clone(), persist.clone()));
-                    }
-                    ServerResolution::Failed { alias, reason } => {
-                        ctx.emit(WorkflowEvent::AuthFailed {
-                            seq: ctx.next_seq(),
-                            ts: ctx.ts(),
-                            server: alias.clone(),
-                            reason: reason.clone(),
-                        });
-                        failures.push((alias.clone(), reason.clone()));
-                    }
-                }
-            }
-
-            // Outcome precedence: any Failed wins over any NeedsAuth. Both close
-            // whatever DID connect before ending the run — the body NEVER runs.
-            if !failures.is_empty() {
-                resolver.close(&connected_handles);
-                let msg = failures
-                    .iter()
-                    .map(|(alias, reason)| format!("{alias}: {reason}"))
-                    .collect::<Vec<_>>()
-                    .join("; ");
-                let envelope = failed_envelope(&msg);
-                return Ok(end_run_before_body(
-                    &ctx,
-                    guard,
-                    "failed",
-                    "mcp resolution failed".to_string(),
-                    envelope,
-                ));
-            }
-            if !needs_auth.is_empty() {
-                resolver.close(&connected_handles);
-                let envelope = needs_auth_envelope(&needs_auth);
-                return Ok(end_run_before_body(
-                    &ctx,
-                    guard,
-                    "needs-auth",
-                    "authentication required".to_string(),
-                    envelope,
-                ));
-            }
-
-            // Every declared server connected: publish handles for
-            // workflow/mcp-handle, and remember (resolver, handles) so the tail
-            // below closes them EXACTLY once on every subsequent exit.
-            ctx.set_mcp_handles(connected);
-            mcp_close = Some((resolver, connected_handles));
-        }
-
-        // Run the body thunk in the same VM.
-        let result = crate::list::call_function(thunk, &[]);
-
-        // Derive the envelope + status, then journal run.ended and write result.json
-        // BEFORE the guard drops (so the sink is still open).
-        let (mut status, mut envelope, mut reason) = match &result {
-            Ok(v) => ("success", success_envelope(v.clone()), None),
-            Err(e) => (
-                "failed",
-                failed_envelope(&e.to_string()),
-                Some("workflow body returned an error".to_string()),
-            ),
-        };
-
-        // Close any resolved MCP handles exactly once, regardless of how the body
-        // exited (success, error, or the budget-fail decided just below). A no-op
-        // (mcp_close stays None) for a workflow with no :mcp — byte-identical.
-        if let Some((resolver, handles)) = mcp_close.take() {
-            resolver.close(&handles);
-        }
-
-        if let Some(ctx) = context::current() {
-            // A tripped budget cap fails the run regardless of the body's own outcome
-            // (the latch, not an Err, is the source of truth — see workflow/step).
-            if ctx.over_budget() {
-                status = "failed";
-                envelope = budget_failed_envelope();
-                reason = Some("budget exceeded".to_string());
-            }
-            // Close the last open marker phase before run.ended (its status mirrors the
-            // run: a phase still open when the body errored is itself "failed").
-            close_open_phase(&ctx, status);
-            ctx.emit(WorkflowEvent::RunEnded {
-                seq: ctx.next_seq(),
-                ts: ctx.ts(),
-                status: status.into(),
-                reason,
-                dur_ms: ctx.dur_ms(),
-            });
-            // result.json — the final envelope. Lossy/best-effort; swallow write errors
-            // the same way the journal writer does.
-            ctx.write_result(&envelope);
-        }
-
-        drop(guard);
-        Ok(envelope)
-    });
+        },
+    );
 
     // (workflow/phase label) — a MARKER (workflow.js semantics), not a wrapper. Closes
     // the previously-open phase (emitting its phase.ended) then opens `label`. The
@@ -467,135 +756,9 @@ pub fn register(env: &sema_core::Env) {
     // the step rename and stay), so the dashboard renders it as a row under the
     // current phase. Returns the thunk's value (or propagates its error, after
     // journaling a result). A no-op wrapper (just runs the thunk) when called
-    // outside a workflow run.
-    crate::register_fn(env, "workflow/step", |args| {
-        if args.len() != 2 {
-            return Err(SemaError::arity("workflow/step", "2", args.len()));
-        }
-        // First arg is the agent role: an opts map `{:name "scout" …}` (the `agent`
-        // macro form), or a bare keyword/string label. Default role is "agent".
-        let label = agent_role(&args[0]);
-        let thunk = &args[1];
-        let Some(ctx) = context::current() else {
-            // Outside a run: transparent — just call the thunk.
-            return crate::list::call_function(thunk, &[]);
-        };
-        // Resume short-circuit FIRST (before the budget latch): compute this leaf's
-        // content-key from its inputs (the `step` macro injects :__prompt and
-        // :__schema-repr). On a resumed run a memoized leaf replays for FREE — return it
-        // WITHOUT running the model or emitting events. This MUST precede the budget
-        // check: a replay makes no provider call, so a tripped cap must not refuse it
-        // (refusing would return nil for a value that's on disk). The key is computed on
-        // EVERY leaf so its occurrence ordinal advances in body order either way.
-        // The resolved user prompt, used both for the resume content-key and, capped,
-        // captured on the agent.started event so the viewer can show it. The `step` macro
-        // injects `:__prompt`; a hand-wrapped `workflow/step` can opt in by passing an
-        // explicit `:prompt` in its opts map. Prefer the macro key, fall back to `:prompt`.
-        let prompt = {
-            let injected = opt_str(&args[0], "__prompt");
-            if injected.is_empty() {
-                opt_str(&args[0], "prompt")
-            } else {
-                injected
-            }
-        };
-        let content_key = ctx.agent_content_key(
-            &prompt,
-            &opt_str(&args[0], "__schema-repr"),
-            &label,
-            &ctx.cur_phase_label(),
-        );
-        if ctx.resuming() {
-            if let Some(v) = ctx.memo_lookup(&content_key) {
-                return Ok(v);
-            }
-        }
-        // Budget latch: once a cap is tripped, refuse to LAUNCH further (non-replayed)
-        // leaves. No events are emitted for a skipped agent — the journal shows only the
-        // leaves that actually ran (the run is forced to :failed by workflow/run).
-        // Checking at ENTRY (not via Err) is what makes the cap hold through
-        // `__fanout-tagged`, which would otherwise swallow a leaf Err into nil.
-        if ctx.over_budget() {
-            return Ok(Value::nil());
-        }
-        // Unique per-invocation id (the dashboard correlates started→result→budget
-        // by it); the label is the agent_name (role).
-        let agent_id = ctx.next_agent_id(&label);
-        ctx.emit(WorkflowEvent::AgentStarted {
-            seq: ctx.next_seq(),
-            ts: ctx.ts(),
-            agent_id: agent_id.clone(),
-            agent_name: label.clone(),
-            model: String::new(), // unknown until the call completes (filled below)
-            prompt: cap_text(&prompt), // empty for a hand-wrapped agent ⇒ skipped on the wire
-        });
-        let start = Instant::now();
-        // Open a per-leaf usage accumulator for the duration of this thunk. Each
-        // completion the leaf makes folds into THIS scope's frame (summing multi-round
-        // tool loops); the async path captures the frame's Rc into its poller so a
-        // sibling leaf under parallel/pipeline fan-out can't clobber the tally. The
-        // RAII guard pops the frame on drop at the end of this fn.
-        let usage_scope = sema_llm::builtins::open_usage_scope();
-        // Mark this as the current agent so `workflow/tool-call` inside the thunk
-        // attributes to it; clear afterwards. NOTE: `cur_agent` is a single shared slot,
-        // so under a CONCURRENT `:tools` fan-out (tool loops yield between rounds) two
-        // in-flight tool-agents can clobber each other's attribution — tool-call
-        // attribution is best-effort under fan-out, the same single-slot-thread-local
-        // root as the per-agent budget caveat. The real fix is per-task scoping in the
-        // scheduler (out of scope); a sequential body is exact.
-        ctx.set_cur_agent(Some(agent_id.clone()));
-        let result = crate::list::call_function(thunk, &[]);
-        ctx.set_cur_agent(None);
-        let dur_ms = if ctx.deterministic() {
-            0
-        } else {
-            start.elapsed().as_millis() as u64
-        };
-        // Per-agent usage: the tokens + cost summed across every completion this leaf
-        // made (all rounds of a tool loop), accumulated into the leaf's own scope frame.
-        // `calls == 0` means the leaf made no (non-cache-hit) provider call.
-        let usage = usage_scope.usage();
-        let model = usage.model.clone();
-        // The agent's actual output, captured in the journal so the dashboard can
-        // show it (not a hash). Length-capped to bound the journal line.
-        let output = match &result {
-            Ok(v) => capped_render(v),
-            Err(e) => format!("error: {e}"),
-        };
-        let status = if result.is_ok() { "ok" } else { "failed" };
-        ctx.emit(WorkflowEvent::AgentResult {
-            seq: ctx.next_seq(),
-            ts: ctx.ts(),
-            agent_id: agent_id.clone(),
-            status: status.into(),
-            output,
-            dur_ms,
-            model,
-        });
-        // Attribute token usage + cost to this agent via a budget event (only when a
-        // completion actually ran — `calls > 0`. A leaf that made no call, or only a
-        // cache hit, stays honestly absent: no phantom zero Budget event, no charge).
-        if usage.calls > 0 {
-            ctx.emit(WorkflowEvent::Budget {
-                seq: ctx.next_seq(),
-                ts: ctx.ts(),
-                agent_id: Some(agent_id),
-                phase_seq: ctx.phase_seq(),
-                input_tokens: usage.input_tokens,
-                output_tokens: usage.output_tokens,
-                cost_usd: usage.cost_usd,
-                budget_limit: ctx.budget_limit_for_event(),
-            });
-            // Charge AFTER the Budget event is journaled, so the leaf that tips the cap
-            // is itself fully recorded; the sticky latch then refuses the NEXT leaf.
-            ctx.charge(usage.cost_usd, usage.input_tokens + usage.output_tokens);
-        }
-        // Memoize the leaf's value for a future --resume (round-trip-guarded inside
-        // memo_store; called outside any held journal borrow).
-        if let Ok(ref v) = result {
-            ctx.memo_store(&content_key, v);
-        }
-        result
+    // outside a workflow run. See `step_plan` / `finish_step`.
+    register_thunk_fn(env, "workflow/step", step_plan, finish_step, |_teardown, _sink| {
+        // `StepTeardown` carries only scalar/`Rc<RefCell<LeafUsage>>` state — no `Value`.
     });
 
     // (workflow/tool-call tool-name [args]) — journal a tool call by the current
@@ -776,4 +939,42 @@ pub fn register(env: &sema_core::Env) {
             .collect();
         Ok(Value::list(items))
     });
+}
+
+#[cfg(test)]
+mod continuation_tests {
+    use super::*;
+
+    /// A `ThunkContinuation` must expose exactly the GC edges its teardown state carries
+    /// (a run's open MCP handles are the only `Value`s any workflow teardown holds; a
+    /// step's teardown holds none), and none once the teardown has been taken.
+    #[test]
+    fn thunk_continuation_traces_teardown_value_edges() {
+        use sema_core::runtime::Trace;
+        // Stand-in teardown that carries two `Value` handles, traced like `RunTeardown`.
+        let cont = ThunkContinuation::<Vec<Value>> {
+            teardown: Some(vec![Value::int(1), Value::int(2)]),
+            finish: |_t, r| r,
+            trace_teardown: |t: &Vec<Value>, sink: &mut dyn FnMut(GcEdge<'_>)| {
+                for v in t {
+                    sink(GcEdge::Value(v));
+                }
+            },
+            name: "workflow/test",
+        };
+        let mut edges = 0usize;
+        assert!(cont.trace(&mut |_| edges += 1));
+        assert_eq!(edges, 2, "must expose one edge per teardown-held handle");
+
+        // A step-shaped teardown (no `Value`) exposes zero edges.
+        let empty = ThunkContinuation::<()> {
+            teardown: Some(()),
+            finish: |_t, r| r,
+            trace_teardown: |_t, _sink| {},
+            name: "workflow/test",
+        };
+        let mut edges = 0usize;
+        assert!(empty.trace(&mut |_| edges += 1));
+        assert_eq!(edges, 0, "a teardown with no Value must expose no edges");
+    }
 }

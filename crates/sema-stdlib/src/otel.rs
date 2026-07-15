@@ -10,6 +10,11 @@
 //! Typed spans also emit the `SEMA_OTEL_COMPAT` span-kind, so user-built pipelines render
 //! first-class in Phoenix/Traceloop/Langfuse exactly like the built-in `llm/*` spans.
 
+use sema_core::cycle::GcEdge;
+use sema_core::runtime::{
+    NativeCall, NativeCallContext, NativeContinuation, NativeOutcome, NativeResult, ResumeInput,
+    Trace,
+};
 use sema_core::{Env, SemaError, Value};
 use sema_otel::AttrValue;
 
@@ -63,7 +68,8 @@ fn as_name(v: &Value) -> Option<String> {
 }
 
 /// Run `thunk` inside `span`, setting Error status if it returns an error, then end the
-/// span (on drop). Shared by every typed-span builtin.
+/// span (on drop). Shared by every typed-span builtin's LEGACY (bare top-level / legacy
+/// scheduler) path.
 fn run_in_span(span: sema_otel::VmSpan, thunk: &Value) -> Result<Value, SemaError> {
     let result = crate::list::call_function(thunk, &[]);
     if let Err(e) = &result {
@@ -73,9 +79,98 @@ fn run_in_span(span: sema_otel::VmSpan, thunk: &Value) -> Result<Value, SemaErro
     result
 }
 
+/// Cooperative teardown for a typed-span builtin (`otel/span`, `otel/llm-span`,
+/// `otel/tool-span`, `otel/retrieval-span`) under the unified runtime. The builtin
+/// opens the span (pushing it onto the TL span stack) and hands this continuation
+/// the guard; the runtime drives the wrapped thunk as a `NativeOutcome::Call`, so an
+/// async op inside it (`async/spawn`, `channel/*`, …) parks on the active task
+/// instead of hitting the runtime-only error stub a synchronous `call_function`
+/// re-entry would. When the thunk settles the span is still the innermost active
+/// span, so a failure sets Error status on it exactly like `run_in_span`; the span is
+/// then ended (dropped) on return, failure, AND cancellation, and the original
+/// outcome is re-propagated so an enclosing try/catch sees the same value/error as the
+/// synchronous path. `VmSpan` owns only OTel context state (no `Value`), so this
+/// continuation exposes no GC edges.
+struct SpanGuardContinuation {
+    span: Option<sema_otel::VmSpan>,
+}
+
+impl Trace for SpanGuardContinuation {
+    fn trace(&self, _sink: &mut dyn FnMut(GcEdge<'_>)) -> bool {
+        true
+    }
+}
+
+impl NativeContinuation for SpanGuardContinuation {
+    fn resume(
+        mut self: Box<Self>,
+        _context: &mut NativeCallContext<'_>,
+        input: ResumeInput,
+    ) -> NativeResult {
+        let span = self.span.take();
+        match input {
+            ResumeInput::Returned(value) => {
+                drop(span);
+                Ok(NativeOutcome::Return(value))
+            }
+            ResumeInput::Failed(error) => {
+                sema_otel::set_current_status(Some(&error.to_string()));
+                drop(span);
+                Err(error)
+            }
+            ResumeInput::Cancelled(reason) => {
+                sema_otel::set_current_status(Some(&format!("cancelled ({reason:?})")));
+                drop(span);
+                Err(SemaError::eval(format!(
+                    "otel span thunk was cancelled ({reason:?})"
+                )))
+            }
+            ResumeInput::Runtime(_) => {
+                drop(span);
+                Err(SemaError::eval(
+                    "otel span teardown received an unexpected runtime response",
+                ))
+            }
+        }
+    }
+}
+
+/// Register a typed-span builtin as a DUAL-ABI native. `setup` validates the args and
+/// OPENS the span (returning it plus the body thunk). Under a runtime quantum the VM
+/// invokes the runtime callback, which drives the thunk as a cooperative
+/// `NativeOutcome::Call` with `SpanGuardContinuation` closing the span when it settles;
+/// everywhere else the legacy callback runs the thunk synchronously inside `run_in_span`.
+fn register_span_fn(
+    env: &Env,
+    name: &'static str,
+    setup: impl Fn(&[Value]) -> Result<(sema_otel::VmSpan, Value), SemaError> + 'static,
+) {
+    let setup = std::rc::Rc::new(setup);
+    let for_legacy = setup.clone();
+    let for_runtime = setup;
+    env.set(
+        sema_core::intern(name),
+        Value::native_fn(sema_core::NativeFn::simple_with_runtime(
+            name,
+            move |args| {
+                let (span, thunk) = for_legacy(args)?;
+                run_in_span(span, &thunk)
+            },
+            move |_ctx, args| {
+                let (span, thunk) = for_runtime(args)?;
+                Ok(NativeOutcome::Call(NativeCall {
+                    callable: thunk,
+                    args: Vec::new(),
+                    continuation: Box::new(SpanGuardContinuation { span: Some(span) }),
+                }))
+            },
+        )),
+    );
+}
+
 pub fn register(env: &Env) {
     // (otel/span name thunk) / (otel/span name thunk attrs) — generic INTERNAL span.
-    crate::register_fn(env, "otel/span", |args| {
+    register_span_fn(env, "otel/span", |args| {
         if args.len() < 2 || args.len() > 3 {
             return Err(SemaError::arity("otel/span", "2-3", args.len()));
         }
@@ -87,12 +182,12 @@ pub fn register(env: &Env) {
             sema_otel::SemaSpanKind::Internal,
             parse_attrs(args.get(2)),
         );
-        run_in_span(span, &args[1])
+        Ok((span, args[1].clone()))
     });
 
     // (otel/llm-span config-map thunk) — typed LLM/generation span. config: :model
     // :provider :operation (+ any extra attrs, passed through).
-    crate::register_fn(env, "otel/llm-span", |args| {
+    register_span_fn(env, "otel/llm-span", |args| {
         if args.len() != 2 {
             return Err(SemaError::arity("otel/llm-span", "2", args.len()));
         }
@@ -108,27 +203,23 @@ pub fn register(env: &Env) {
             }
         }
         let span = sema_otel::user_llm_span(&model, &provider, &operation, attrs);
-        run_in_span(span, &args[1])
+        Ok((span, args[1].clone()))
     });
 
     // (otel/tool-span name thunk) / (... attrs) — typed TOOL span.
-    crate::register_fn(env, "otel/tool-span", |args| {
+    register_span_fn(env, "otel/tool-span", |args| {
         if args.len() < 2 || args.len() > 3 {
             return Err(SemaError::arity("otel/tool-span", "2-3", args.len()));
         }
         let name = args[0]
             .as_str()
             .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
-        let span = sema_otel::user_span(
-            name,
-            sema_otel::SemaSpanKind::Tool,
-            parse_attrs(args.get(2)),
-        );
-        run_in_span(span, &args[1])
+        let span = sema_otel::user_span(name, sema_otel::SemaSpanKind::Tool, parse_attrs(args.get(2)));
+        Ok((span, args[1].clone()))
     });
 
     // (otel/retrieval-span name thunk) / (... attrs) — typed RETRIEVER span.
-    crate::register_fn(env, "otel/retrieval-span", |args| {
+    register_span_fn(env, "otel/retrieval-span", |args| {
         if args.len() < 2 || args.len() > 3 {
             return Err(SemaError::arity("otel/retrieval-span", "2-3", args.len()));
         }
@@ -140,7 +231,7 @@ pub fn register(env: &Env) {
             sema_otel::SemaSpanKind::Retrieval,
             parse_attrs(args.get(2)),
         );
-        run_in_span(span, &args[1])
+        Ok((span, args[1].clone()))
     });
 
     // (otel/set-attribute key value) — set one attribute on the innermost active span.
@@ -318,4 +409,20 @@ pub fn register(env: &Env) {
 
         Ok(Value::bool(sema_otel::configure(&cfg)))
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The typed-span teardown continuation holds only a `VmSpan` (OTel context
+    /// state — no `Value`), so it exposes ZERO GC edges: the runtime traces it
+    /// without visiting any `Value`.
+    #[test]
+    fn span_guard_continuation_holds_no_gc_edges() {
+        let cont = SpanGuardContinuation { span: None };
+        let mut edges = 0usize;
+        assert!(cont.trace(&mut |_| edges += 1));
+        assert_eq!(edges, 0, "span teardown continuation must expose no Value edges");
+    }
 }

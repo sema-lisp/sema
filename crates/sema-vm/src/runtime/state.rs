@@ -363,6 +363,135 @@ impl Trace for TaskPayload {
     }
 }
 
+// ── Cycle-collector interior hooks ────────────────────────────────
+//
+// A channel/promise HANDLE `Value` carries only an id; its mutable state (the
+// channel buffer, the settled promise value) lives in this runtime's
+// registries, not inline in the handle. The CORE-2 cycle collector must be able
+// to see those buffered values as collector-internal edges (and sever them) or
+// a cycle routed through a channel buffer — a closure captured into a channel
+// that reaches the channel again — is pinned by the registry and never
+// reclaimed. sema-core exposes a hook seam ([`sema_core::set_runtime_interior_hooks`]);
+// the hooks below reach the currently-driving runtime through a thread-local so
+// they can stay non-capturing `fn`s (invariant I2).
+
+thread_local! {
+    /// Stack of runtimes whose `drive` is on the call stack, innermost last.
+    /// The collector's interior hooks resolve the buffered values of a
+    /// channel/promise id against the innermost driving runtime. Empty when no
+    /// drive is active (e.g. the interpreter-teardown collect, after the runtime
+    /// is shut down) — the hooks then report no interior, which is safe.
+    static CURRENT_RUNTIME: RefCell<Vec<Weak<RefCell<RuntimeState>>>> =
+        const { RefCell::new(Vec::new()) };
+}
+
+/// The innermost driving runtime's state, if any is on the stack and still live.
+fn current_runtime_state() -> Option<Rc<RefCell<RuntimeState>>> {
+    CURRENT_RUNTIME.with(|stack| stack.borrow().last().and_then(Weak::upgrade))
+}
+
+/// Publishes `state` as the innermost driving runtime for the lifetime of the
+/// guard, so interior hooks fired by a collection inside a driven VM quantum
+/// resolve channel/promise ids against the right registries. Popped on every
+/// exit path (RAII), including early returns and unwinds.
+struct CurrentRuntimeGuard;
+
+impl CurrentRuntimeGuard {
+    fn install(state: &Rc<RefCell<RuntimeState>>) -> Self {
+        CURRENT_RUNTIME.with(|stack| stack.borrow_mut().push(Rc::downgrade(state)));
+        CurrentRuntimeGuard
+    }
+}
+
+impl Drop for CurrentRuntimeGuard {
+    fn drop(&mut self) {
+        CURRENT_RUNTIME.with(|stack| {
+            stack.borrow_mut().pop();
+        });
+    }
+}
+
+fn interior_trace_channel(
+    id: sema_core::runtime::ChannelId,
+    sink: &mut dyn FnMut(sema_core::cycle::GcEdge<'_>),
+) -> bool {
+    let Some(state) = current_runtime_state() else {
+        return true;
+    };
+    // A borrow held here would mean a collection ran while the runtime state was
+    // mutably borrowed — impossible at the drive safe points (the VM quantum
+    // holds no state borrow). Abort cleanly (leak-safe) rather than risk it.
+    let Ok(state) = state.try_borrow() else {
+        return false;
+    };
+    state.channels.gc_trace_buffer(id, sink);
+    true
+}
+
+fn interior_sever_channel(id: sema_core::runtime::ChannelId) -> Vec<sema_core::Value> {
+    let Some(state) = current_runtime_state() else {
+        return Vec::new();
+    };
+    let Ok(mut state) = state.try_borrow_mut() else {
+        return Vec::new();
+    };
+    state.channels.gc_sever_buffer(id)
+}
+
+fn interior_evict_channel(id: sema_core::runtime::ChannelId) {
+    if let Some(state) = current_runtime_state() {
+        if let Ok(mut state) = state.try_borrow_mut() {
+            state.channels.gc_evict(id);
+        }
+    }
+}
+
+fn interior_trace_promise(
+    id: sema_core::runtime::PromiseId,
+    sink: &mut dyn FnMut(sema_core::cycle::GcEdge<'_>),
+) -> bool {
+    let Some(state) = current_runtime_state() else {
+        return true;
+    };
+    let Ok(state) = state.try_borrow() else {
+        return false;
+    };
+    state.promises.gc_trace_settlement(id, sink);
+    true
+}
+
+fn interior_sever_promise(id: sema_core::runtime::PromiseId) -> Vec<sema_core::Value> {
+    let Some(state) = current_runtime_state() else {
+        return Vec::new();
+    };
+    let Ok(mut state) = state.try_borrow_mut() else {
+        return Vec::new();
+    };
+    state.promises.gc_sever_settlement(id)
+}
+
+fn interior_evict_promise(id: sema_core::runtime::PromiseId) {
+    if let Some(state) = current_runtime_state() {
+        if let Ok(mut state) = state.try_borrow_mut() {
+            state.promises.gc_evict(id);
+        }
+    }
+}
+
+/// Install the channel/promise interior hooks into the cycle collector. Wired
+/// once per `Runtime::new`; the table is a set of non-capturing `fn`s, so
+/// re-registering is idempotent and cheap.
+fn register_runtime_interior_hooks() {
+    sema_core::set_runtime_interior_hooks(Some(sema_core::RuntimeInteriorHooks {
+        trace_channel: interior_trace_channel,
+        sever_channel: interior_sever_channel,
+        evict_channel: interior_evict_channel,
+        trace_promise: interior_trace_promise,
+        sever_promise: interior_sever_promise,
+        evict_promise: interior_evict_promise,
+    }));
+}
+
 impl Runtime {
     pub fn new(
         context: Rc<EvalContext>,
@@ -372,6 +501,10 @@ impl Runtime {
         let (waits, issuers) = WaitRuntime::new_with_issuers(executor)?;
         let runtime_id = waits.runtime_id();
         let (root_ids, promise_ids, channel_ids) = issuers.into_parts();
+        // Wire the cycle collector's channel/promise interior hooks so a
+        // collection during a driven quantum can trace/sever the registry-held
+        // buffer and settled values (idempotent — a set of `fn` pointers).
+        register_runtime_interior_hooks();
         Ok(Self {
             state: Rc::new(RefCell::new(RuntimeState {
                 _context: context,
@@ -588,6 +721,11 @@ impl Runtime {
     }
 
     pub fn drive(&self, budget: &DriveBudget) -> Result<DriveState, RuntimeFault> {
+        // Publish this runtime for the whole drive so a cycle collection fired
+        // inside a driven VM quantum (an explicit `(gc/collect)`, a `make_closure`
+        // threshold, or the scheduler-idle safe point) can resolve channel/promise
+        // interior against these registries. Popped on every exit path.
+        let _current = CurrentRuntimeGuard::install(&self.state);
         let terminal_fault = self.state.borrow().terminal_fault.clone();
         if let Some(fault) = terminal_fault {
             while self.cleanup_one() {}
@@ -1368,8 +1506,25 @@ impl Runtime {
         // Publish the running task's identity so natives that open a per-task slab
         // entry (`llm/stream`, `agent/run`) record the owning task, letting the
         // task-reaped sweep reclaim the entry (and its detached span) when the task
-        // is cancelled mid-flight.
-        let prev_task_id = sema_core::set_current_task_id(Some(task_id.get()));
+        // is cancelled mid-flight. The ROOT MAIN task runs the user's top-level
+        // program — semantically "top-level (non-task) code" — so it publishes `None`
+        // (matching `current_task_id`'s contract): its slab entries aren't tied to a
+        // cancellable task (top level can't be `async/cancel`led), and a native that
+        // must reject a cooperative-scheduler-hostile op inside a SPAWNED task
+        // (`http/serve`'s blocking accept loop) can tell it apart from the root.
+        let is_root_main = {
+            let state = self.state.borrow();
+            matches!(
+                state.roots.get(&root).map(RootRecord::state),
+                Some(RootState::Running { main_task }) if *main_task == task_id
+            )
+        };
+        let published_task_id = if is_root_main {
+            None
+        } else {
+            Some(task_id.get())
+        };
+        let prev_task_id = sema_core::set_current_task_id(published_task_id);
         let quantum = vm.run_quantum(&context, instruction_limit, cancellation);
         let _ = sema_core::set_current_task_id(prev_task_id);
         scopes.restore(task);

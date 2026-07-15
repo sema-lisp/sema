@@ -1261,24 +1261,58 @@ impl Value {
     }
 
     pub fn async_promise(promise: AsyncPromise) -> Value {
-        // The handle holds only a `PromiseId` (no `Value` edges), so it closes no
-        // data cycle — no GC candidate registration is needed.
-        Value::from_rc_ptr(TAG_ASYNC_PROMISE, Rc::new(promise))
+        // Cold data-cycle constructor (CORE-2): the handle carries only a
+        // `PromiseId`, but the promise's SETTLED value lives in the runtime's
+        // `PromiseRegistry` and can reach back to this handle (a promise that
+        // resolves to a structure holding the promise). Register the handle as a
+        // candidate — carrying the id so a dead-handle prune can also evict the
+        // registry record — so the collector traces that interior (via the
+        // runtime interior hooks) and severs the cycle. No hook = no interior
+        // edge (leaf), which is safe.
+        let rc = Rc::new(promise);
+        crate::cycle::register_candidate(crate::cycle::GcNode::Promise {
+            weak: Rc::downgrade(&rc),
+            id: rc.id,
+        });
+        Value::from_rc_ptr(TAG_ASYNC_PROMISE, rc)
     }
     /// Build a promise `Value` from a runtime `PromiseId`. The registry owns the
     /// promise's state; this is just the language-facing handle to it.
     pub fn async_promise_id(id: crate::runtime::PromiseId) -> Value {
         Value::async_promise(AsyncPromise { id })
     }
+    /// Rebuild a promise handle `Value` from an existing `Rc` WITHOUT re-registering
+    /// a GC candidate — used by the collector to upgrade a candidate `Weak` into a
+    /// snapshot handle for the duration of a pass.
+    pub fn async_promise_from_rc(rc: Rc<AsyncPromise>) -> Value {
+        Value::from_rc_ptr(TAG_ASYNC_PROMISE, rc)
+    }
     pub fn channel(ch: Channel) -> Value {
-        // The handle holds only a `ChannelId` (no `Value` edges), so it closes no
-        // data cycle — no GC candidate registration is needed.
-        Value::from_rc_ptr(TAG_CHANNEL, Rc::new(ch))
+        // Cold data-cycle constructor (CORE-2): the handle carries only a
+        // `ChannelId`, but the channel's BUFFER lives in the runtime's
+        // `ChannelRegistry` and can hold values that reach back to this handle
+        // (a channel that buffers itself, or a closure captured into its
+        // buffer). Register the handle as a candidate — carrying the id so a
+        // dead-handle prune can also evict the registry record — so the
+        // collector traces the buffer (via the runtime interior hooks) and
+        // severs the cycle. No hook = no interior edge (leaf), which is safe.
+        let rc = Rc::new(ch);
+        crate::cycle::register_candidate(crate::cycle::GcNode::Channel {
+            weak: Rc::downgrade(&rc),
+            id: rc.id,
+        });
+        Value::from_rc_ptr(TAG_CHANNEL, rc)
     }
     /// Build a channel `Value` from a runtime `ChannelId`. The registry owns the
     /// channel's buffer/state; this is just the language-facing handle to it.
     pub fn channel_id(id: crate::runtime::ChannelId) -> Value {
         Value::channel(Channel { id })
+    }
+    /// Rebuild a channel handle `Value` from an existing `Rc` WITHOUT re-registering
+    /// a GC candidate — used by the collector to upgrade a candidate `Weak` into a
+    /// snapshot handle for the duration of a pass.
+    pub fn channel_from_rc(rc: Rc<Channel>) -> Value {
+        Value::from_rc_ptr(TAG_CHANNEL, rc)
     }
     pub fn mutable_array(items: Vec<Value>) -> Value {
         let rc = Rc::new(MutableArray {

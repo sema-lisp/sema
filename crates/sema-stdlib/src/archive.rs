@@ -352,7 +352,7 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
     register_fn(env, "gzip/compress", |args| {
         check_arity!(args, "gzip/compress", 1);
         let data = arg_bytes(&args[0], "gzip/compress")?;
-        if in_async_context() {
+        if in_async_context() || sema_core::in_runtime_quantum() {
             return crate::io::fs_offload(
                 move || gzip_compress_work(&data).map_err(|e| e.to_string()),
                 Value::bytevector,
@@ -366,7 +366,7 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
     register_fn(env, "gzip/decompress", |args| {
         check_arity!(args, "gzip/decompress", 1);
         let data = arg_bytes(&args[0], "gzip/decompress")?;
-        if in_async_context() {
+        if in_async_context() || sema_core::in_runtime_quantum() {
             return crate::io::fs_offload(
                 move || gzip_decompress_work(&data).map_err(|e| e.to_string()),
                 Value::bytevector,
@@ -389,7 +389,7 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
             "zip/create",
         )?;
 
-        if in_async_context() {
+        if in_async_context() || sema_core::in_runtime_quantum() {
             return crate::io::fs_offload(
                 move || zip_create_work(&out_path, &files).map_err(|e| e.to_string()),
                 Value::int,
@@ -411,7 +411,7 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
             .ok_or_else(|| SemaError::type_error("string", args[1].type_name()))?
             .to_string();
 
-        if in_async_context() {
+        if in_async_context() || sema_core::in_runtime_quantum() {
             return crate::io::fs_offload(
                 move || zip_extract_work(&zip_path, &dest_dir).map_err(|e| e.to_string()),
                 Value::int,
@@ -429,7 +429,7 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
             .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?
             .to_string();
 
-        if in_async_context() {
+        if in_async_context() || sema_core::in_runtime_quantum() {
             return crate::io::fs_offload(
                 move || zip_list_work(&zip_path).map_err(|e| e.to_string()),
                 |names: Vec<String>| Value::list(names.iter().map(|s| Value::string(s)).collect()),
@@ -456,7 +456,7 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
             "tar/create",
         )?;
 
-        if in_async_context() {
+        if in_async_context() || sema_core::in_runtime_quantum() {
             return crate::io::fs_offload(
                 move || tar_create_work(&out_path, &files).map_err(|e| e.to_string()),
                 Value::int,
@@ -479,7 +479,7 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
             .ok_or_else(|| SemaError::type_error("string", args[1].type_name()))?
             .to_string();
 
-        if in_async_context() {
+        if in_async_context() || sema_core::in_runtime_quantum() {
             return crate::io::fs_offload(
                 move || tar_extract_work(&tar_path, &dest_dir).map_err(|e| e.to_string()),
                 Value::int,

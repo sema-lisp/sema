@@ -129,7 +129,7 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
                 .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?
                 .to_string();
 
-            if in_async_context() {
+            if in_async_context() || sema_core::in_runtime_quantum() {
                 return crate::io::fs_offload(
                     move || extract_text_work(&path).map_err(|e| e.to_string()),
                     Value::string_owned,
@@ -153,7 +153,7 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
                 .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?
                 .to_string();
 
-            if in_async_context() {
+            if in_async_context() || sema_core::in_runtime_quantum() {
                 return crate::io::fs_offload(
                     move || extract_text_pages_work(&path).map_err(|e| e.to_string()),
                     |pages: Vec<String>| {
@@ -180,7 +180,7 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
                 .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?
                 .to_string();
 
-            if in_async_context() {
+            if in_async_context() || sema_core::in_runtime_quantum() {
                 return crate::io::fs_offload(
                     move || page_count_work(&path).map_err(|e| e.to_string()),
                     Value::int,
@@ -198,7 +198,7 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
             .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?
             .to_string();
 
-        if in_async_context() {
+        if in_async_context() || sema_core::in_runtime_quantum() {
             return crate::io::fs_offload(
                 move || metadata_work(&path).map_err(|e| e.to_string()),
                 metadata_to_value,

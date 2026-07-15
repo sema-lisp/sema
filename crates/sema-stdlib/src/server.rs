@@ -211,7 +211,7 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
             // computations over owned paths/strings — no `Value`/`Rc` crosses
             // the thread boundary; `decode` rebuilds the identical `__file`
             // marker map on the VM thread once the worker resolves.
-            if sema_core::in_async_context() {
+            if sema_core::in_async_context() || sema_core::in_runtime_quantum() {
                 let abs_path_for_err = abs_path.clone();
                 return crate::io::fs_offload(
                     move || {
@@ -526,7 +526,7 @@ fn register_router(env: &sema_core::Env) {
             // Sema (no `continue`-across-a-suspend problem) — every route is
             // still validated, in order, on the VM thread; only the blocking
             // syscall is deferred.
-            let async_ctx = sema_core::in_async_context();
+            let async_ctx = sema_core::in_async_context() || sema_core::in_runtime_quantum();
 
             let mut routes: Vec<(String, String, Value)> = Vec::new();
             let mut pending: Vec<(usize, String)> = Vec::new();
@@ -731,7 +731,7 @@ fn build_router_dispatch_fn(routes: std::rc::Rc<Vec<(String, String, Value)>>) -
                         // inside `async/spawn`, instead of stalling the single
                         // cooperative VM thread on `canonicalize()`'s
                         // symlink-resolving stat chain.
-                        if sema_core::in_async_context() {
+                        if sema_core::in_async_context() || sema_core::in_runtime_quantum() {
                             let dir_path_owned = dir_path.to_string();
                             let file_path_owned = file_path.clone();
                             return crate::io::fs_offload(
@@ -1464,7 +1464,7 @@ fn http_serve_impl(ctx: &sema_core::EvalContext, args: &[Value]) -> Result<Value
     // per-connection handler tasks) is real design work, deliberately
     // deferred (see docs/deferred.md); until then, fail fast and loud instead
     // of hanging silently.
-    if sema_core::in_async_context() {
+    if sema_core::in_async_context() || (sema_core::in_runtime_quantum() && sema_core::current_task_id().is_some()) {
         // The core message alone must carry enough to explain the failure: a
         // task's rejection is flattened to a plain string when it crosses the
         // promise boundary (`format!("{e}")` in the scheduler), so the hint

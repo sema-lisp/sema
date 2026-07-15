@@ -280,6 +280,18 @@ impl Interpreter {
     /// ([`run_exprs_via_runtime`](Self::run_exprs_via_runtime)) and pre-compiled
     /// `.semac` bytecode runners. The VM must already have its main frame seeded
     /// (`seed_main_frame`).
+    /// The number of tasks the interpreter's persistent cooperative runtime is
+    /// currently holding (live + settled-not-yet-reaped). A test/observability
+    /// oracle: after a program that cancels a task, `0` proves the cancelled task
+    /// and every descendant it transitively cancelled were settled + reaped, not
+    /// orphaned. The unified-runtime analogue of the retired legacy
+    /// `sema_vm::scheduler_task_count()`.
+    pub fn runtime_live_task_count(&self) -> usize {
+        self.runtime
+            .as_ref()
+            .map_or(0, sema_vm::runtime::Runtime::live_task_count)
+    }
+
     pub fn drive_vm_on_runtime(&self, vm: sema_vm::VM) -> EvalResult {
         use sema_vm::runtime::{DriveBudget, DriveState, RootPoll};
 

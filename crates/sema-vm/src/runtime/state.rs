@@ -720,6 +720,16 @@ impl Runtime {
             .expect("test channel identity")
     }
 
+    /// The number of tasks the runtime is currently holding (Ready / Running /
+    /// Waiting / settled-but-not-yet-reaped). Used as a cancellation/reap oracle:
+    /// after a program that cancels a task, a live-task count of 0 proves the
+    /// cancelled task — and any descendant it transitively cancelled — settled
+    /// terminal and was reaped, not orphaned. This is the unified runtime's
+    /// analogue of the retired legacy `scheduler_task_count()`.
+    pub fn live_task_count(&self) -> usize {
+        self.state.borrow().tasks.len()
+    }
+
     pub fn drive(&self, budget: &DriveBudget) -> Result<DriveState, RuntimeFault> {
         // Publish this runtime for the whole drive so a cycle collection fired
         // inside a driven VM quantum (an explicit `(gc/collect)`, a `make_closure`
@@ -2287,13 +2297,22 @@ impl Runtime {
                         .promises
                         .task(promise)
                         .map(|target| {
-                            RuntimeResponse::Cancelled(
-                                target
-                                    .and_then(|target| state.tasks.get_mut(&target))
-                                    .is_some_and(|task| {
-                                        task.record.request_cancellation(CancelReason::Explicit)
-                                    }),
-                            )
+                            let newly = target
+                                .and_then(|target| state.tasks.get_mut(&target))
+                                .is_some_and(|task| {
+                                    task.record.request_cancellation(CancelReason::Explicit)
+                                });
+                            // Structured transitive cancel: propagate to every task
+                            // (transitively) spawned by the cancelled target via the
+                            // cancellation-parent graph, so a subprocess/IO awaited
+                            // one `async/spawn` layer deeper is not orphaned running
+                            // to completion. Descendants carry `CancelReason::Owner`
+                            // (cancelled because their owner was). No-op when the
+                            // target has no children (the common direct-cancel case).
+                            if let Some(target) = target {
+                                cancel_descendants(&mut state, target);
+                            }
+                            RuntimeResponse::Cancelled(newly)
                         })
                         .map_err(registry_error);
                     (continuation, response)
@@ -2626,11 +2645,20 @@ impl Runtime {
                     );
                 }
             };
-            // A detached task is an origin-root child owned by the root, but not
-            // the root's main task; it settles its own promise.
+            // A detached task is an origin-root child owned by the root (normal
+            // root settlement does not cancel it), but its CANCELLATION parent is
+            // the spawning TASK, not the root. This is the structured-concurrency
+            // cancel edge the plan's "async/cancel through the cancellation-parent
+            // graph" relies on: explicitly cancelling a task transitively cancels
+            // the tasks it spawned (e.g. a task parked on `async/await` of a child
+            // it spawned — the child must not be orphaned running its subprocess).
+            // It does NOT make `async/await`/`all`/`race`/`timeout` cancel SUPPLIED
+            // promises: those observe producers spawned elsewhere (a different
+            // cancellation parent), so an observer's cancellation never reaches
+            // them. See docs/plans/2026-07-13-unified-cooperative-runtime-task-04.md.
             let relations = TaskRelations {
                 origin_root: root,
-                cancellation_parent: CancellationParent::Root(root),
+                cancellation_parent: CancellationParent::Task(spawner),
                 lifetime_owner: LifetimeOwner::Root(root),
             };
             state.tasks.insert(
@@ -3439,6 +3467,39 @@ impl Runtime {
 /// task's promise with this same message string.
 fn await_io_error(message: String) -> sema_core::SemaError {
     sema_core::SemaError::eval(message)
+}
+
+/// Transitively request cancellation of every live task whose cancellation-parent
+/// chain leads back to `parent` (its spawned descendants), marking each with
+/// `CancelReason::Owner`. The drive loop's `cancel_waiting` then delivers the
+/// cancellation to each — aborting a descendant parked on a legacy `AwaitIo`
+/// handle (killing its in-flight subprocess/request) and settling it Cancelled +
+/// reaped, so a subprocess awaited indirectly is not left running. `parent`
+/// itself is cancelled by the caller; this only reaches its children. BFS over an
+/// immutable snapshot of the parent→child edges, so it terminates even if a
+/// (malformed) cycle existed: a task already marked cancelled is not revisited.
+fn cancel_descendants(state: &mut RuntimeState, parent: TaskId) {
+    let mut frontier = vec![parent];
+    while let Some(current) = frontier.pop() {
+        let children: Vec<TaskId> = state
+            .tasks
+            .iter()
+            .filter_map(|(id, task)| {
+                (task.record.relations().cancellation_parent == CancellationParent::Task(current))
+                    .then_some(*id)
+            })
+            .collect();
+        for child in children {
+            if let Some(task) = state.tasks.get_mut(&child) {
+                // Only descend into a child we actually newly-cancelled; a child
+                // already cancelled was already walked (or is being walked),
+                // which bounds the traversal even under a malformed cycle.
+                if task.record.request_cancellation(CancelReason::Owner) {
+                    frontier.push(child);
+                }
+            }
+        }
+    }
 }
 
 /// The structured `:timeout` condition raised into a continuation parked on an

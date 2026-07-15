@@ -904,8 +904,11 @@ pub const PRELUDE: &str = r#"
 (define (agent/run __agent __input . __rest)
   (if (or (__async-context?) (__runtime-quantum?))
       (let ((__h (apply __agent-begin __agent __input __rest)))
+        ;; Pass the unwinding error to finish so the agent span is closed carrying
+        ;; the failure status (notably a cancellation, whose bytecode now runs this
+        ;; catch), not ended "unset".
         (try (__agent-drive __h)
-             (catch __e (begin (__agent-finish __h) (throw __e)))))
+             (catch __e (begin (__agent-finish __h __e) (throw __e)))))
       (apply __agent-run-blocking __agent __input __rest)))
 
 ;; llm/chat: a thin dispatcher, exactly like `agent/run` above (closes the drift
@@ -940,7 +943,7 @@ pub const PRELUDE: &str = r#"
         (if (nil? __h)
             (__chat-call-blocking __chat-args)
             (try (__agent-drive __h)
-                 (catch __e (begin (__agent-finish __h) (throw __e))))))
+                 (catch __e (begin (__agent-finish __h __e) (throw __e))))))
       (__chat-call-blocking __chat-args)))
 
 ;; Direct-call dispatch for `__llm-chat-blocking`'s 1-or-2-arg contract (see the

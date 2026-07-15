@@ -96,8 +96,12 @@ fn indirectly_awaited_subprocess_is_killed_after_explicit_cancel() {
     assert_eq!(result, sema_core::Value::keyword("caught"));
     // No orphaned inner task left behind (would also be a #7 span-at-teardown hazard
     // for the LLM tier): transitive cancel transitioned it to terminal → reaped.
+    // Under the unified cooperative runtime the legacy thread-local scheduler is
+    // unused (its count is trivially 0), so the reap oracle is the interpreter's
+    // persistent runtime live-task count: 0 proves the outer task, the sleeper, AND
+    // the transitively-cancelled inner shell task all settled terminal and reaped.
     assert_eq!(
-        sema_vm::scheduler_task_count(),
+        interp.runtime_live_task_count(),
         0,
         "the indirectly-awaited inner task must be cancelled + reaped, not orphaned"
     );

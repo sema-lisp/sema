@@ -3218,8 +3218,18 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
         agent_exec_tools(ctx, token)
     });
     register_fn_ctx(env, "__agent-finish", |_ctx, args| {
-        let token = agent_token_arg(args, "__agent-finish")?;
-        agent_finish(token)
+        // `(__agent-finish token)` on the normal-done path; `(__agent-finish token
+        // err)` from the driver's `catch` when the loop unwound on an error —
+        // notably a cancellation, whose bytecode NOW runs the catch (the unified
+        // runtime resumes a cancelled parked task to unwind cleanly), so the
+        // `invoke_agent` span must be closed carrying the failure status rather
+        // than a bare (unset) end.
+        if args.is_empty() || args.len() > 2 {
+            return Err(SemaError::arity("__agent-finish", "1-2", args.len()));
+        }
+        let token = agent_token_arg(&args[..1], "__agent-finish")?;
+        let finish_error = args.get(1).map(|e| e.to_string());
+        agent_finish(token, finish_error)
     });
 
     // `llm/chat`'s `:tools` twin of `__agent-begin`: builds an ordinary agent-loop
@@ -9587,7 +9597,7 @@ fn exec_tools_cooperative_start(
 /// `__agent-finish(token) → result`. Idempotent: appends the final assistant turn,
 /// records trace I/O, ends the agent span, writes back to memory, and builds the
 /// return value (`{:response :messages :session}` map with opts, else the string).
-fn agent_finish(token: u64) -> Result<Value, SemaError> {
+fn agent_finish(token: u64, finish_error: Option<String>) -> Result<Value, SemaError> {
     // Take the state OUT of the slab so the span/scope guards drop (balanced pop+end,
     // agent-task otel installed) once we're done building the result.
     let mut st = match AGENT_RUNS.with(|r| r.borrow_mut().remove(&token)) {
@@ -9596,6 +9606,23 @@ fn agent_finish(token: u64) -> Result<Value, SemaError> {
         // may both call finish.
         None => return Ok(Value::nil()),
     };
+
+    // The driver's `catch` passed the unwinding error: close the `invoke_agent`
+    // span with the failure status before it ends (on `st` drop below). This is
+    // the cancellation path — the unified runtime resumes a cancelled parked task
+    // so the driver's `catch → __agent-finish → throw` runs, ending the span here
+    // (balanced pop) rather than leaving it for the task-reaped sweep. Without
+    // this the span would end "unset", losing the cancellation telemetry.
+    if let Some(err) = &finish_error {
+        if let Some(span) = st.agent_span.as_ref() {
+            let kind = if err.to_ascii_lowercase().contains("cancel") {
+                "cancelled"
+            } else {
+                "agent_error"
+            };
+            span.record_error(kind, err);
+        }
+    }
 
     // Append the final assistant message (mirrors run_tool_loop's terminal push).
     if !st.final_pushed && !st.last_content.is_empty() {

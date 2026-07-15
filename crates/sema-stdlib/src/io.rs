@@ -1093,6 +1093,231 @@ fn fs_io_msg(msg: String) -> String {
     SemaError::Io(msg).to_string()
 }
 
+// ─── Canonical quarantined-bounded external file operations (Task 05 R08A) ───
+//
+// Under the unified runtime (`in_runtime_quantum()`) the finite file ops route
+// through the CANONICAL external-wait path: a `PreparedExternalOperation`
+// submitted to the real thread-pool executor, exactly like `sleep`/`mcp/call`.
+// Each is classified `QuarantinedBounded` — a hard byte/entry cap is fixed on
+// the VM thread BEFORE dispatch, the job carries only an owned `Send` input
+// snapshot (a `String`/`Vec<u8>`, never an `Rc`/`Value`), computes off-thread,
+// and its send-safe payload is decoded back into a `Value` on the VM thread.
+// This is distinct from (and does NOT use) the legacy `LegacyAwaitIoBridge`
+// (`fs_offload`, gated on `in_async_context()`), which stays for the legacy
+// cooperative scheduler.
+
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering as AtomicOrdering};
+use std::time::Duration;
+
+use sema_core::cycle::GcEdge;
+use sema_core::runtime::{
+    downcast_send_payload, CompletionDecoder, CompletionKind, DecodedCompletion, ExternalFailure,
+    NativeCallContext, NativeContinuation, NativeOutcome, NativeResult, NativeSuspend,
+    PreparedExternalOperation, QuarantineBound, ResumeInput, SendPayload, Trace, WaitKind,
+};
+
+/// Completion tag for a quarantined file operation. A tag only needs to be
+/// consistent between the issued identity and the prepared op; it is not a
+/// uniqueness key, so one shared value for all file ops is correct.
+const FS_COMPLETION_KIND: u64 = 1;
+
+/// Default hard byte cap for a single finite file read/write routed to a worker.
+/// Fixed BEFORE dispatch (via `stat`/in-memory length), it bounds the worst-case
+/// allocation the quarantined job can produce.
+pub const FS_BYTE_CAP_DEFAULT: u64 = 256 * 1024 * 1024; // 256 MiB
+/// Default hard entry cap for a single finite `file/list`. The cap is fixed
+/// before dispatch and stored in the job; the worker aborts if it discovers more.
+pub const FS_LIST_CAP_DEFAULT: u64 = 5_000_000;
+
+static FS_BYTE_CAP: AtomicU64 = AtomicU64::new(FS_BYTE_CAP_DEFAULT);
+static FS_LIST_CAP: AtomicU64 = AtomicU64::new(FS_LIST_CAP_DEFAULT);
+
+/// Live count of quarantined file jobs executing on a worker, and the peak that
+/// count has reached. The peak proves genuine off-thread OVERLAP (two spawned
+/// file ops in flight at once → peak >= 2) without depending on wall-clock
+/// timing. Process-global; a test resets it before observing.
+static FS_INFLIGHT: AtomicUsize = AtomicUsize::new(0);
+static FS_PEAK_INFLIGHT: AtomicUsize = AtomicUsize::new(0);
+
+/// Test-only artificial delay (ms) held inside every quarantined file job while
+/// it occupies its in-flight slot. Defaults to 0 (a single relaxed atomic load
+/// in production, no behavior change); a test raises it to make two concurrent
+/// jobs demonstrably overlap or to keep a job parked long enough to cancel it.
+static FS_TEST_DELAY_MS: AtomicU64 = AtomicU64::new(0);
+
+/// A cancelled quarantined file job is detached and reaped when its (now unowned)
+/// completion lands. This deadline is the CleanupRegistry watchdog: a bounded
+/// file job completes in well under this, so its cleanup entry is always reaped
+/// in time; a wedged worker past it faults the runtime rather than leaking.
+const FS_CLEANUP_DEADLINE: Duration = Duration::from_secs(120);
+
+/// Peak simultaneous in-flight quarantined file jobs since the last reset.
+pub fn fs_peak_inflight() -> usize {
+    FS_PEAK_INFLIGHT.load(AtomicOrdering::SeqCst)
+}
+
+/// Reset the in-flight peak gauge (call before observing overlap in a test).
+pub fn reset_fs_inflight() {
+    FS_PEAK_INFLIGHT.store(0, AtomicOrdering::SeqCst);
+}
+
+/// Override the finite-file byte cap (test hook for the pre-dispatch cap gate).
+pub fn set_fs_byte_cap(bytes: u64) {
+    FS_BYTE_CAP.store(bytes.max(1), AtomicOrdering::SeqCst);
+}
+
+/// Override the `file/list` entry cap (test hook for the pre-dispatch cap gate).
+pub fn set_fs_list_cap(entries: u64) {
+    FS_LIST_CAP.store(entries.max(1), AtomicOrdering::SeqCst);
+}
+
+/// Set the test-only per-job delay (ms). Pass 0 to disable.
+pub fn set_fs_test_delay_ms(ms: u64) {
+    FS_TEST_DELAY_MS.store(ms, AtomicOrdering::SeqCst);
+}
+
+/// Decodes a quarantined file job's send-safe payload back into a `Value` on the
+/// VM thread. The payload is a `Result<T, String>`: `Ok(T)` maps through
+/// `to_value`; `Err(message)` is a domain I/O error rendered exactly like the
+/// synchronous path (`SemaError::Io(message)`). A worker-level `ExternalFailure`
+/// (panic / cancellation / bound-exceeded) surfaces as an evaluation error.
+struct FsDecoder<T: Send + 'static> {
+    op: &'static str,
+    to_value: fn(T) -> Value,
+}
+
+impl<T: Send + 'static> Trace for FsDecoder<T> {
+    fn trace(&self, _sink: &mut dyn FnMut(GcEdge<'_>)) -> bool {
+        true
+    }
+}
+
+impl<T: Send + 'static> CompletionDecoder for FsDecoder<T> {
+    fn decode(
+        self: Box<Self>,
+        _context: &mut NativeCallContext<'_>,
+        result: Result<SendPayload, ExternalFailure>,
+    ) -> DecodedCompletion {
+        match result {
+            Ok(payload) => match downcast_send_payload::<Result<T, String>>(payload, self.op) {
+                Ok(Ok(value)) => Ok((self.to_value)(value)),
+                Ok(Err(message)) => Err(SemaError::Io(message)),
+                Err(failure) => Err(SemaError::eval(failure.message().to_string())),
+            },
+            Err(failure) => Err(SemaError::eval(format!(
+                "{}: {}",
+                self.op,
+                failure.message()
+            ))),
+        }
+    }
+}
+
+/// Resumes the parked file-op frame once the worker completes: the decoded value
+/// is injected onto its stack top; a failure or cancellation is raised at the
+/// call site (catchable by an enclosing try/catch).
+struct FsContinuation {
+    op: &'static str,
+}
+
+impl Trace for FsContinuation {
+    fn trace(&self, _sink: &mut dyn FnMut(GcEdge<'_>)) -> bool {
+        true
+    }
+}
+
+impl NativeContinuation for FsContinuation {
+    fn resume(
+        self: Box<Self>,
+        _context: &mut NativeCallContext<'_>,
+        input: ResumeInput,
+    ) -> NativeResult {
+        match input {
+            ResumeInput::Returned(value) => Ok(NativeOutcome::Return(value)),
+            ResumeInput::Failed(error) => Err(error),
+            ResumeInput::Cancelled(reason) => Err(SemaError::eval(format!(
+                "{} was cancelled ({reason:?})",
+                self.op
+            ))),
+            ResumeInput::Runtime(_) => Err(SemaError::eval(format!(
+                "{} continuation received an unexpected runtime response",
+                self.op
+            ))),
+        }
+    }
+}
+
+/// Build and arm a quarantined-bounded external file operation: stash its
+/// `NativeOutcome::Suspend` on the pending-outcome thread-local and raise the
+/// `NativeYield` signal the VM surfaces as an async yield. The runtime submits
+/// `job` to the thread-pool executor (so it runs off the VM thread and overlaps
+/// sibling work) and, when the worker completes, resumes this frame with the
+/// decoded value. `job` is `Send` and returns `Result<T, String>` (Ok payload /
+/// domain I/O error). Returns the nil placeholder the runtime overwrites.
+fn fs_quarantined<T, F>(op: &'static str, to_value: fn(T) -> Value, job: F) -> Value
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, String> + Send + 'static,
+{
+    let kind =
+        CompletionKind::try_from_raw(FS_COMPLETION_KIND).expect("file completion kind is nonzero");
+    let bound = QuarantineBound::hard_deadline(FS_CLEANUP_DEADLINE)
+        .expect("file cleanup deadline is nonzero");
+    let prepared = PreparedExternalOperation::quarantined_blocking(
+        kind,
+        Box::new(FsDecoder { op, to_value }),
+        bound,
+        move || {
+            let inflight = FS_INFLIGHT.fetch_add(1, AtomicOrdering::SeqCst) + 1;
+            FS_PEAK_INFLIGHT.fetch_max(inflight, AtomicOrdering::SeqCst);
+            let delay = FS_TEST_DELAY_MS.load(AtomicOrdering::Relaxed);
+            if delay > 0 {
+                std::thread::sleep(Duration::from_millis(delay));
+            }
+            let result = job();
+            FS_INFLIGHT.fetch_sub(1, AtomicOrdering::SeqCst);
+            Ok(Box::new(result) as SendPayload)
+        },
+    );
+    let suspend = NativeSuspend {
+        wait: WaitKind::External(Box::new(prepared)),
+        continuation: Box::new(FsContinuation { op }),
+    };
+    sema_core::set_pending_native_outcome(NativeOutcome::Suspend(suspend));
+    sema_core::set_yield_signal(sema_core::YieldReason::NativeYield);
+    Value::nil()
+}
+
+/// Enforce the finite-file byte cap on the VM thread BEFORE dispatch. `stat`s the
+/// path and rejects an oversized file with a Sema condition (never an unbounded
+/// worker allocation). A missing/unstattable path is NOT rejected here — the job
+/// surfaces the real I/O error, matching the synchronous path's behavior.
+fn fs_byte_cap_check(op: &str, path: &str) -> Result<(), SemaError> {
+    let cap = FS_BYTE_CAP.load(AtomicOrdering::SeqCst);
+    if let Ok(meta) = std::fs::metadata(path) {
+        let len = meta.len();
+        if len > cap {
+            return Err(SemaError::eval(format!(
+                "{op} {path}: file size {len} bytes exceeds the {cap}-byte quarantined read cap"
+            ))
+            .with_hint("read the file in bounded chunks or raise the quarantined byte cap"));
+        }
+    }
+    Ok(())
+}
+
+/// Enforce the finite-file byte cap on an in-memory write payload before dispatch.
+fn fs_write_cap_check(op: &str, len: usize) -> Result<(), SemaError> {
+    let cap = FS_BYTE_CAP.load(AtomicOrdering::SeqCst);
+    if len as u64 > cap {
+        return Err(SemaError::eval(format!(
+            "{op}: payload {len} bytes exceeds the {cap}-byte quarantined write cap"
+        ))
+        .with_hint("write the file in bounded chunks or raise the quarantined byte cap"));
+    }
+    Ok(())
+}
+
 /// Like [`fs_offload`], but `decode` may itself fail. Needed where the fetched
 /// `T` requires further VM-thread-only processing that can reject — e.g.
 /// `load`'s `sema_reader::read_many`, which interns symbols (not `Send`, so it
@@ -1450,6 +1675,17 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
                     SemaError::Io(format!("file/read {path}: invalid UTF-8 in VFS: {e}"))
                 });
         }
+        if sema_core::in_runtime_quantum() {
+            fs_byte_cap_check("file/read", path)?;
+            let path = path.to_string();
+            return Ok(fs_quarantined(
+                "file/read",
+                Value::string_owned,
+                move || {
+                    std::fs::read_to_string(&path).map_err(|e| format!("file/read {path}: {e}"))
+                },
+            ));
+        }
         if sema_core::in_async_context() {
             let path = path.to_string();
             return fs_offload(
@@ -1473,6 +1709,18 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
         let content = args[1]
             .as_str()
             .ok_or_else(|| SemaError::type_error("string", args[1].type_name()))?;
+        if sema_core::in_runtime_quantum() {
+            fs_write_cap_check("file/write", content.len())?;
+            let path = path.to_string();
+            let content = content.to_string();
+            return Ok(fs_quarantined(
+                "file/write",
+                |()| Value::nil(),
+                move || {
+                    std::fs::write(&path, &content).map_err(|e| format!("file/write {path}: {e}"))
+                },
+            ));
+        }
         if sema_core::in_async_context() {
             let path = path.to_string();
             let content = content.to_string();
@@ -1502,6 +1750,17 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
                 .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
             if let Some(data) = sema_core::vfs::vfs_read(path) {
                 return Ok(Value::bytevector(data));
+            }
+            if sema_core::in_runtime_quantum() {
+                fs_byte_cap_check("file/read-bytes", path)?;
+                let path = path.to_string();
+                return Ok(fs_quarantined(
+                    "file/read-bytes",
+                    Value::bytevector,
+                    move || {
+                        std::fs::read(&path).map_err(|e| format!("file/read-bytes {path}: {e}"))
+                    },
+                ));
             }
             if sema_core::in_async_context() {
                 let path = path.to_string();
@@ -1533,6 +1792,19 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
             let bv = args[1]
                 .as_bytevector()
                 .ok_or_else(|| SemaError::type_error("bytevector", args[1].type_name()))?;
+            if sema_core::in_runtime_quantum() {
+                fs_write_cap_check("file/write-bytes", bv.len())?;
+                let path = path.to_string();
+                let bv = bv.to_vec();
+                return Ok(fs_quarantined(
+                    "file/write-bytes",
+                    |()| Value::nil(),
+                    move || {
+                        std::fs::write(&path, &bv)
+                            .map_err(|e| format!("file/write-bytes {path}: {e}"))
+                    },
+                ));
+            }
             if sema_core::in_async_context() {
                 let path = path.to_string();
                 let bv = bv.to_vec();
@@ -1559,6 +1831,12 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
             if exists {
                 return Ok(Value::bool(true));
             }
+        }
+        if sema_core::in_runtime_quantum() {
+            let path = path.to_string();
+            return Ok(fs_quarantined("file/exists?", Value::bool, move || {
+                Ok(std::path::Path::new(&path).exists())
+            }));
         }
         if sema_core::in_async_context() {
             let path = path.to_string();
@@ -1724,14 +2002,34 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
             }
             Ok(entries)
         }
+        fn list_to_value(entries: Vec<String>) -> Value {
+            Value::list(entries.into_iter().map(|s| Value::string(&s)).collect())
+        }
+        if sema_core::in_runtime_quantum() {
+            // The entry cap is fixed BEFORE dispatch and stored in the job; the
+            // worker aborts with a named bound-exceeded error if the directory
+            // holds more, so the quarantined job never allocates unboundedly.
+            let cap = FS_LIST_CAP.load(AtomicOrdering::SeqCst);
+            let path = path.to_string();
+            return Ok(fs_quarantined("file/list", list_to_value, move || {
+                let mut entries = Vec::new();
+                for entry in
+                    std::fs::read_dir(&path).map_err(|e| format!("file/list {path}: {e}"))?
+                {
+                    let entry = entry.map_err(|e| format!("file/list {path}: {e}"))?;
+                    if entries.len() as u64 >= cap {
+                        return Err(format!(
+                            "file/list {path}: directory exceeds the {cap}-entry quarantined list cap"
+                        ));
+                    }
+                    entries.push(entry.file_name().to_string_lossy().into_owned());
+                }
+                Ok(entries)
+            }));
+        }
         if sema_core::in_async_context() {
             let path = path.to_string();
-            return fs_offload(
-                move || list_impl(&path).map_err(fs_io_msg),
-                |entries: Vec<String>| {
-                    Value::list(entries.into_iter().map(|s| Value::string(&s)).collect())
-                },
-            );
+            return fs_offload(move || list_impl(&path).map_err(fs_io_msg), list_to_value);
         }
         let entries = list_impl(path).map_err(SemaError::Io)?;
         Ok(Value::list(
@@ -1846,6 +2144,12 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
                 map.insert(Value::keyword("modified"), Value::int(modified));
             }
             Value::map(map)
+        }
+        if sema_core::in_runtime_quantum() {
+            let path = path.to_string();
+            return Ok(fs_quarantined("file/info", info_to_value, move || {
+                info_impl(&path)
+            }));
         }
         if sema_core::in_async_context() {
             let path = path.to_string();

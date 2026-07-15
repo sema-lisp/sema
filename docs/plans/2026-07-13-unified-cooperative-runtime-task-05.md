@@ -507,6 +507,28 @@ Expected: fake-server matrix passes without network access or lingering ports.
 **Files:** `io.rs`, `sqlite.rs`, `kv.rs`, `archive.rs`, `pdf.rs`, `diff.rs`,
 `secret.rs`, `crypto.rs`, `csv_ops.rs`, `markup.rs`, resource tests
 
+- [x] **R08A — finite file jobs migrated to the canonical external-wait path
+  (`QuarantinedBounded`)** (commit 875f45c1; `cargo test -p sema-lang --test
+  file_runtime_test` → 5 passed). Under `in_runtime_quantum()` the finite `file/*`
+  ops — `file/read`, `file/read-bytes`, `file/write`, `file/write-bytes`,
+  `file/exists?`, `file/list`, `file/info` (size/stat) — now build a
+  `PreparedExternalOperation::quarantined_blocking` submitted to the real
+  `ThreadPoolExecutor` and SUSPEND on `WaitKind::External` (mirroring `sleep`),
+  NOT the legacy `LegacyAwaitIo` bridge (`fs_offload`, still used for the legacy
+  `in_async_context` scheduler). Seam: `crates/sema-stdlib/src/io.rs`
+  `fs_quarantined` (op → `PreparedExternalOperation::quarantined_blocking` →
+  executor → `FsDecoder` on the VM thread → `FsContinuation`); a hard byte cap
+  (`fs_byte_cap_check`, via `stat`) / entry cap (`FS_LIST_CAP`, in-job abort) is
+  fixed BEFORE dispatch. Gates: round-trip vs `eval_str` oracle; two spawned
+  reads overlap off-thread (peak in-flight >= 2, `fs_peak_inflight`); over-cap
+  read rejected before dispatch (never dispatched); `async/cancel` of a parked
+  file read settles Cancelled (quarantined job detached + reaped, no hang).
+  _status R08B (descriptor STREAMS: open handles, line/byte streaming, close) and
+  R08C (stdin/terminal) are INTERRUPTIBLE (a harder, different class) and remain
+  UNMIGRATED — deferred to a follow-up; `stream_file_async_test` (legacy) stays
+  green. Databases (`sqlite`/`kv`) and bounded library work (`archive`/`pdf`/
+  `diff`/`crypto`/`csv_ops`/`markup`) are likewise not yet migrated._
+
 - [ ] **Step 1: Write cap and cleanup tests**
 
 For every finite-work row test just below cap, at cap, above cap, cancellation

@@ -21,6 +21,14 @@ mod git;
 mod http;
 #[cfg(not(target_arch = "wasm32"))]
 mod io;
+/// Test/observation hooks for the canonical quarantined-bounded file operations
+/// (Task 05 R08A): the in-flight overlap gauge and the pre-dispatch cap/delay
+/// knobs used by the resource-contract tests.
+#[cfg(not(target_arch = "wasm32"))]
+pub use io::{
+    fs_peak_inflight, reset_fs_inflight, set_fs_byte_cap, set_fs_list_cap, set_fs_test_delay_ms,
+    FS_BYTE_CAP_DEFAULT, FS_LIST_CAP_DEFAULT,
+};
 pub(crate) mod json;
 #[cfg(not(target_arch = "wasm32"))]
 mod kv;

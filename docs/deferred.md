@@ -533,6 +533,43 @@ rearchitecture:
   conversion, which makes the op yield to siblings before it parks. Restore this
   test there.
 
+### ASYNC-RUN-BARRIER-1 — `async/run` is a ready-drain, not a transitive settle-barrier
+
+**Found 2026-07-15 by adversarial verification of the Step D2 promise migration.**
+The plan (`docs/plans/2026-07-13-unified-cooperative-runtime.md` §`async/run`) specifies
+that `(async/run)` suspends the caller until every other pending task of that origin root —
+*including transitively spawned descendants* — settles. The implementation
+(`crates/sema-vm/src/runtime/state.rs`, `RuntimeRequest::OriginBarrier`) instead drains only
+the currently-**ready** work of the origin root to a quiescent point, realized as a
+zero-duration timer suspension. This is user-observable and violates the written contract:
+
+- A descendant parked on a real timer (`async/sleep`) or otherwise not-yet-ready when the
+  barrier drains is left pending; its side effects land AFTER `async/run` returns (or never,
+  if the program then exits). Repro: `(async/spawn (fn () (async/sleep 30) (println "bg")))`
+  then `(async/run)` — "bg" is not printed before `async/run` returns.
+- A descendant parked on its own nested `async/run` resumes only after the outer barrier has
+  already returned (FIFO zero-duration timers).
+
+**Why it is deferred rather than fixed.** A naive transitive settle-barrier reintroduces a
+*worse* failure mode than dropped side effects: **scheduler deadlock/hang**. Two real hazards:
+(a) the self-await case — the caller's parent task may be `await`ing the very task that calls
+`async/run` (see `async_context_preserved_after_nested_run`), so a barrier that waits for
+"all origin-root tasks" waits on a task that is waiting on it; (b) the channel-rendezvous case
+— a detached child blocked sending on a channel that only the barrier-caller would drain
+deadlocks under a true barrier (caller waits for child, child waits for caller to receive).
+Case (a) is handled by excluding tasks transitively blocked on the caller; case (b) is NOT
+covered by that exclusion and has no obvious safe rule. A correct transitive barrier therefore
+needs a rendezvous-deadlock-aware wake predicate that is genuinely subtle to specify — and the
+current drain is safe (no hangs), passes every existing `async/run` test, and passes all six
+shipped async stress examples.
+
+**Resolution is a plan-owner decision:** either (1) amend the plan's `async/run` contract to
+"drains the ready work of the origin root to quiescence" (matching the safe implementation),
+or (2) design a deadlock-free transitive barrier (wake when every origin-root task is settled
+OR transitively blocked on the caller, with an explicit rule for rendezvous cycles). Until then
+the drain stays, documented here, to preserve runtime liveness. The code comment on
+`RuntimeRequest::OriginBarrier` points here.
+
 **DAP + wasm async debugging remain on the legacy scheduler.** The unified
 `Runtime` has no cooperative-debug / step mode yet, so async breakpoints and
 cooperative stepping (`crates/sema-dap`, `crates/sema-wasm`) still call

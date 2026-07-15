@@ -1987,8 +1987,11 @@ impl Runtime {
         // as a zero-duration timer suspension: the virtual-clock rule in
         // `fire_timer` only fires the deadline once no task is Ready and nothing
         // is pending, so every ready sibling runs first. This is the CLOSEST safe
-        // behaviour, not a full transitive settle-barrier — see the note on
-        // `RuntimeRequest::OriginBarrier` handling below.
+        // behaviour, not the plan's full transitive settle-barrier: a naive
+        // barrier can deadlock on self-await and channel-rendezvous cycles, which
+        // is worse than deferring a timer-blocked descendant's side effects. The
+        // contract-vs-implementation gap and the deadlock hazards are documented
+        // as ASYNC-RUN-BARRIER-1 in docs/deferred.md (a plan-owner decision).
         if let RuntimeRequest::OriginBarrier { continuation } = request {
             return self.install_protocol_suspend(
                 task_id,

@@ -3645,6 +3645,72 @@ mod runtime_eval_tests {
         assert_runtime_matches_oracle(program);
     }
 
+    // ── ROBUSTNESS GATE 3a: deep-recursion parity (native stack) ─────────────
+    //
+    // A deeply-recursive program routed through the unified runtime
+    // (`eval_str_via_runtime` → `run_quantum`) must NOT consume more native
+    // (Rust) stack per Sema recursion level than the legacy `eval_str`
+    // (`VM::execute`) entry — otherwise a program that legacy handles gracefully
+    // would SIGABRT (native stack overflow) on the runtime path. The VM's
+    // `MAX_FRAMES` guard raises a graceful "stack overflow: maximum call depth
+    // exceeded" before the native stack is exhausted; both entry points drive the
+    // same iterative `run_inner` loop, so the runtime path must hit the SAME
+    // graceful error, never a SIGABRT. These gates run on the default (small)
+    // test-thread stack, so a per-level native-stack regression on the runtime
+    // path surfaces as an abort here, not a silent pass on a fat main stack.
+
+    /// Assert the runtime path produces the SAME `Result` projection as the
+    /// legacy `eval_str` oracle (value on success, error string on failure) for a
+    /// recursion-heavy program — proving native-stack + recursion-limit parity.
+    fn assert_runtime_recursion_parity(program: &str) {
+        let legacy = Interpreter::new()
+            .eval_str(program)
+            .map(|v| format!("{v:?}"))
+            .map_err(|e| e.to_string());
+        let runtime = Interpreter::new()
+            .eval_str_via_runtime(program)
+            .map(|v| format!("{v:?}"))
+            .map_err(|e| e.to_string());
+        assert_eq!(
+            runtime, legacy,
+            "runtime recursion result must match the legacy oracle for {program:?}"
+        );
+    }
+
+    // Unbounded non-tail self recursion: the legacy path hits the graceful
+    // `MAX_FRAMES` guard ("stack overflow: maximum call depth exceeded"). The
+    // runtime path MUST hit the SAME graceful error, never SIGABRT.
+    #[test]
+    fn runtime_deep_recursion_matches_legacy_overflow_error() {
+        let program = "(define (f x) (+ 1 (f x))) (f 0)";
+        assert_runtime_recursion_parity(program);
+        let err = Interpreter::new()
+            .eval_str_via_runtime(program)
+            .expect_err("unbounded non-tail recursion must fail gracefully");
+        assert!(
+            err.to_string().contains("maximum call depth"),
+            "runtime must hit the graceful frame-limit error, got: {err}"
+        );
+    }
+
+    // Deep-but-finite non-tail recursion, comfortably under the frame limit,
+    // computes the same value through both entry points (no premature overflow on
+    // the runtime path from extra native frames per level).
+    #[test]
+    fn runtime_deep_finite_recursion_matches_legacy() {
+        assert_runtime_recursion_parity("(define (f n) (if (= n 0) 0 (+ 1 (f (- n 1))))) (f 1500)");
+    }
+
+    // Recursion that re-enters the evaluator through a native callback (`map`
+    // dispatches `call_value` each level) — the path most likely to nest native
+    // frames — still matches legacy exactly.
+    #[test]
+    fn runtime_native_reentry_recursion_matches_legacy() {
+        assert_runtime_recursion_parity(
+            "(define (build n) (if (= n 0) :done (map (fn (x) (build (- n 1))) (list 1)))) (build 300)",
+        );
+    }
+
     // ── ROBUSTNESS GATE 3b: bounded executor drop-join ───────────────────────
     //
     // Dropping an `Interpreter` (hence its `Runtime` + real `ThreadPoolExecutor`)

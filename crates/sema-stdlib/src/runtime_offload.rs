@@ -36,12 +36,14 @@
 
 use std::future::Future;
 
+use std::rc::Rc;
+
 use sema_core::cycle::GcEdge;
 use sema_core::runtime::{
     downcast_send_payload, CancelDisposition, CancelHook, CancelHookError, CompletionDecoder,
     CompletionKind, DecodedCompletion, ExternalFailure, InterruptibleResource, NativeCallContext,
     NativeContinuation, NativeOutcome, NativeResult, NativeSuspend, PreparedExternalOperation,
-    ResumeInput, SendPayload, Trace, WaitKind,
+    ResourceGateId, ResumeInput, RuntimeRequest, RuntimeResponse, SendPayload, Trace, WaitKind,
 };
 use sema_core::{SemaError, Value};
 
@@ -387,4 +389,481 @@ where
     Fut: Future<Output = Result<T, String>> + Send + 'static,
 {
     suspend_with_resource(op, kind, resource, cancel_rx, Box::new(decode), make_future)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Checkout-external: gate-guarded offload of a per-handle non-Send-resource op.
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// Six stdlib modules (sqlite, kv, proc, pty, serial, stream) own one resource per
+// open handle that at most one offloaded op may hold at a time (a `rusqlite`
+// connection, a sled db, a child process, a pty, a serial port, a stream). The
+// legacy design open-coded an `Available/CheckedOut/Tombstone` slot + an
+// `Acquire`-phase poll loop that re-attempted the checkout on every `AwaitIo`
+// poll. `checkout_external` replaces that with two first-class runtime waits:
+//
+//   1. `WaitKind::ResourceSlot(gate)` — a per-handle [`ResourceGate`] provides
+//      FIFO mutual exclusion. A free gate grants immediately; a busy one parks
+//      the acquirer FIFO (no polling). `close`/`release` are runtime requests.
+//   2. `WaitKind::External` — once the gate is owned, the `Send` resource is
+//      taken out of the module's thread-local slot and moved onto the executor's
+//      blocking tier with the op; the decoder checks it back in on the VM thread
+//      and the continuation releases the gate.
+//
+// Lifecycle across a single call:
+//   * (optional) `Runtime(CreateResourceGate)` if the handle has no gate yet;
+//     the returned id is stored via `store_gate` and reused for later ops.
+//   * `Suspend(ResourceSlot(gate))` → on grant, `take` the resource from the slot.
+//   * `Suspend(External)` → job runs `op(&mut res)` off the VM thread and returns
+//     `(res, Result<T, String>)`; the decoder `reinstall`s `res` and decodes `T`.
+//   * `Runtime(ReleaseResourceGate)` → wake the FIFO head, then return / raise.
+//
+// Cancellation:
+//   * cancelled while QUEUED behind a busy gate → the runtime's `ResourceSlot`
+//     cancel arm removes the waiter from the FIFO; no resource was taken, the
+//     gate is untouched, `AcquireCont` just propagates the cancellation.
+//   * cancelled mid-op (after the gate is owned) → the External wait's cancel
+//     hook `tombstone`s the slot (the resource is stuck in the blocking worker
+//     and cannot be reclaimed — best-effort, matching the retired `IoHandle`
+//     policy) and runs the optional `abort` (e.g. proc process-group SIGKILL);
+//     `ReleaseReturnCont` then releases the gate so queued acquirers wake and
+//     fail fast on the tombstone.
+//
+// KNOWN NARROW RACE (documented, same class as UCR-3 for channel rendezvous):
+// a cancellation recorded in the exact window between a `release` granting this
+// task the slot and its `AcquireCont` running is delivered as `Cancelled`, which
+// `AcquireCont` treats as a queued-cancel (no release) — leaking the gate busy.
+// Reaching it requires another task to cancel this one in the same drive tick the
+// prior owner releases. C2's eager-cancellation delivery closes this window.
+//
+// GC: none of the continuations capture a live `Value`/`Env` (the `decode`
+// closure builds a `Value` but must not capture one, same rule the file/http
+// decoders follow); `FinalCont` alone carries the resolved `Value`/`SemaError`
+// across the gate-release round-trip and traces it. Every other continuation and
+// the decoder emit zero edges (asserted in the module tests).
+
+/// The blocking checkout op: runs off the VM thread on the executor's blocking
+/// tier, mutating the `Send` resource and returning a `Send` payload / error.
+type CheckoutJob<Res, T> = Box<dyn FnOnce(&mut Res) -> Result<T, String> + Send>;
+
+/// The VM-thread decode step: turns the op's payload into a `Value` (or a domain
+/// error). MUST NOT capture a `Value`/`Env` (it is not traced).
+type CheckoutDecode<T> = Box<dyn FnOnce(T) -> Result<Value, SemaError>>;
+
+/// The module-supplied pieces of one checkout offload. `Res` is the `Send`
+/// resource; `T` is the op's `Send` result payload.
+pub(crate) struct CheckoutOp<Res: Send + 'static, T: Send + 'static> {
+    /// Op name for error text (matches the sync path's `op:` prefix).
+    pub op_name: &'static str,
+    /// Completion kind tag for the External wait.
+    pub kind: CompletionKind,
+    /// The handle's gate, or `None` to create one first and store it.
+    pub gate: Option<ResourceGateId>,
+    /// Records a freshly-created gate id against the handle (VM thread).
+    pub store_gate: Box<dyn FnOnce(ResourceGateId)>,
+    /// Take the resource out of the slot once the gate is owned (VM thread).
+    /// Returns a clear domain error for a tombstoned/missing slot.
+    pub take: Box<dyn FnOnce() -> Result<Res, SemaError>>,
+    /// The blocking op, run off the VM thread on the executor's blocking tier.
+    pub op: CheckoutJob<Res, T>,
+    /// Reinstall the resource into the slot on completion (VM thread).
+    pub reinstall: Box<dyn FnOnce(Res)>,
+    /// Decode the op payload into a `Value` (VM thread). MUST NOT capture a
+    /// `Value`/`Env` (it is not traced). When `success_value` is `Some`, that
+    /// value is returned on op success INSTEAD of calling `decode` (and `decode`
+    /// is never invoked) — used by ops that return a caller-supplied `Value`
+    /// (e.g. `kv/set` returns the value it stored).
+    pub decode: CheckoutDecode<T>,
+    /// A caller-supplied `Value` to return on op success, carried as a TRACED
+    /// edge across the offload (unlike a `Value` captured in `decode`, which the
+    /// GC cannot see). `None` for ops that build their result from the payload.
+    pub success_value: Option<Value>,
+    /// Mark the slot tombstoned when the resource cannot be reclaimed
+    /// (cancel / worker loss). Called at most once (VM thread).
+    pub tombstone: Rc<dyn Fn(String)>,
+    /// Extra teardown to run on cancel besides the tombstone (e.g. a
+    /// process-group SIGKILL). Runs on the VM thread.
+    pub abort: Option<Box<dyn FnOnce()>>,
+}
+
+/// Entry point: build the gate-acquire suspension (creating the gate first if the
+/// handle has none yet). See the module comment for the full lifecycle.
+pub(crate) fn checkout_external<Res: Send + 'static, T: Send + 'static>(
+    op: CheckoutOp<Res, T>,
+) -> NativeResult {
+    match op.gate {
+        Some(gate) => Ok(NativeOutcome::Suspend(NativeSuspend {
+            wait: WaitKind::ResourceSlot(gate),
+            continuation: Box::new(AcquireCont { op: Some(op) }),
+        })),
+        None => Ok(NativeOutcome::Runtime(RuntimeRequest::CreateResourceGate {
+            continuation: Box::new(CreateGateCont { op: Some(op) }),
+        })),
+    }
+}
+
+/// Stage 0: a freshly-created gate arrives; store it against the handle, then
+/// suspend on it. Holds no `Value`.
+struct CreateGateCont<Res: Send + 'static, T: Send + 'static> {
+    op: Option<CheckoutOp<Res, T>>,
+}
+
+impl<Res: Send + 'static, T: Send + 'static> Trace for CreateGateCont<Res, T> {
+    fn trace(&self, _sink: &mut dyn FnMut(GcEdge<'_>)) -> bool {
+        true
+    }
+}
+
+impl<Res: Send + 'static, T: Send + 'static> NativeContinuation for CreateGateCont<Res, T> {
+    fn resume(
+        self: Box<Self>,
+        _context: &mut NativeCallContext<'_>,
+        input: ResumeInput,
+    ) -> NativeResult {
+        let mut op = self
+            .op
+            .expect("checkout gate-create continuation is resumed exactly once");
+        match input {
+            ResumeInput::Runtime(RuntimeResponse::ResourceGate(gate)) => {
+                (op.store_gate)(gate);
+                op.store_gate = Box::new(|_| {});
+                op.gate = Some(gate);
+                Ok(NativeOutcome::Suspend(NativeSuspend {
+                    wait: WaitKind::ResourceSlot(gate),
+                    continuation: Box::new(AcquireCont { op: Some(op) }),
+                }))
+            }
+            ResumeInput::Failed(error) => Err(error),
+            ResumeInput::Cancelled(_) => Err(SemaError::eval(format!(
+                "{} was cancelled before its resource gate was created",
+                op.op_name
+            ))),
+            ResumeInput::Returned(_) | ResumeInput::Runtime(_) => Err(SemaError::eval(format!(
+                "{}: unexpected runtime response creating resource gate",
+                op.op_name
+            ))),
+        }
+    }
+}
+
+/// Stage 1: the gate slot is granted; check out the resource and offload the op.
+/// Holds no `Value`.
+struct AcquireCont<Res: Send + 'static, T: Send + 'static> {
+    op: Option<CheckoutOp<Res, T>>,
+}
+
+impl<Res: Send + 'static, T: Send + 'static> Trace for AcquireCont<Res, T> {
+    fn trace(&self, _sink: &mut dyn FnMut(GcEdge<'_>)) -> bool {
+        true
+    }
+}
+
+impl<Res: Send + 'static, T: Send + 'static> NativeContinuation for AcquireCont<Res, T> {
+    fn resume(
+        self: Box<Self>,
+        _context: &mut NativeCallContext<'_>,
+        input: ResumeInput,
+    ) -> NativeResult {
+        let op = self
+            .op
+            .expect("checkout acquire continuation is resumed exactly once");
+        let gate = op.gate.expect("gate is known once acquired");
+        match input {
+            // Slot granted: we now own `gate`.
+            ResumeInput::Runtime(RuntimeResponse::Value(_)) => {
+                let CheckoutOp {
+                    op_name,
+                    kind,
+                    take,
+                    op: job,
+                    reinstall,
+                    decode,
+                    tombstone,
+                    abort,
+                    success_value,
+                    ..
+                } = op;
+                match take() {
+                    Ok(mut resource) => {
+                        // Blocking-tier job: run the op off the VM thread and carry
+                        // the resource back with the result. A mid-op cancel cannot
+                        // interrupt the sync op (best-effort) — the cancel hook
+                        // tombstones the slot; the completion is then discarded.
+                        let decoder = Box::new(CheckoutDecoder::<Res, T> {
+                            op_name,
+                            reinstall: Some(reinstall),
+                            decode: Some(decode),
+                            success_value,
+                            tombstone: tombstone.clone(),
+                        });
+                        let resource_handle = InterruptibleResource::new(
+                            op_name,
+                            Box::new(CheckoutCancelHook {
+                                tombstone,
+                                abort,
+                                op_name,
+                            }),
+                        );
+                        let prepared = PreparedExternalOperation::interruptible_blocking(
+                            kind,
+                            decoder,
+                            resource_handle,
+                            move || {
+                                let result = job(&mut resource);
+                                Ok(Box::new((resource, result)) as SendPayload)
+                            },
+                        );
+                        Ok(NativeOutcome::Suspend(NativeSuspend {
+                            wait: WaitKind::External(Box::new(prepared)),
+                            continuation: Box::new(ReleaseReturnCont { op_name, gate }),
+                        }))
+                    }
+                    // Slot is tombstoned/missing: we own the gate, so release it
+                    // (waking the next acquirer, who also fails fast) then raise.
+                    Err(error) => Ok(NativeOutcome::Runtime(
+                        RuntimeRequest::ReleaseResourceGate {
+                            gate,
+                            continuation: Box::new(FinalCont::Fail(error)),
+                        },
+                    )),
+                }
+            }
+            // Gate closed while we were queued: never owned it, just raise.
+            ResumeInput::Failed(error) => Err(error),
+            // Cancelled while queued: the runtime's ResourceSlot cancel arm already
+            // removed us from the FIFO; we never owned the gate.
+            ResumeInput::Cancelled(_) => Err(SemaError::eval(format!(
+                "{} was cancelled while waiting for its resource slot",
+                op.op_name
+            ))),
+            ResumeInput::Returned(_) | ResumeInput::Runtime(_) => {
+                Err(SemaError::eval("checkout: unexpected runtime response"))
+            }
+        }
+    }
+}
+
+/// The External-wait decoder: reinstall the resource, then decode the payload or
+/// render the job's error. On a worker-level failure the resource never came
+/// back, so the slot is tombstoned. Holds no `Value`.
+struct CheckoutDecoder<Res: Send + 'static, T: Send + 'static> {
+    op_name: &'static str,
+    reinstall: Option<Box<dyn FnOnce(Res)>>,
+    decode: Option<CheckoutDecode<T>>,
+    success_value: Option<Value>,
+    tombstone: Rc<dyn Fn(String)>,
+}
+
+impl<Res: Send + 'static, T: Send + 'static> Trace for CheckoutDecoder<Res, T> {
+    fn trace(&self, sink: &mut dyn FnMut(GcEdge<'_>)) -> bool {
+        // The caller-supplied success value is a live edge; everything else is a
+        // plain-data closure that captures no `Value`.
+        if let Some(value) = &self.success_value {
+            sink(GcEdge::Value(value));
+        }
+        true
+    }
+}
+
+impl<Res: Send + 'static, T: Send + 'static> CompletionDecoder for CheckoutDecoder<Res, T> {
+    fn decode(
+        mut self: Box<Self>,
+        _context: &mut NativeCallContext<'_>,
+        result: Result<SendPayload, ExternalFailure>,
+    ) -> DecodedCompletion {
+        let op_name = self.op_name;
+        match result {
+            Ok(payload) => {
+                match downcast_send_payload::<(Res, Result<T, String>)>(payload, op_name) {
+                    Ok((resource, op_result)) => {
+                        (self.reinstall.take().expect("reinstall once"))(resource);
+                        match op_result {
+                            Ok(value) => match self.success_value.take() {
+                                Some(literal) => Ok(literal),
+                                None => (self.decode.take().expect("decode once"))(value),
+                            },
+                            Err(message) => Err(SemaError::Io(message)),
+                        }
+                    }
+                    Err(failure) => {
+                        (self.tombstone)(format!(
+                            "{op_name} lost its resource: {}",
+                            failure.message()
+                        ));
+                        Err(SemaError::eval(failure.message().to_string()))
+                    }
+                }
+            }
+            Err(failure) => {
+                (self.tombstone)(format!("{op_name} worker failed: {}", failure.message()));
+                Err(SemaError::eval(format!("{op_name}: {}", failure.message())))
+            }
+        }
+    }
+}
+
+/// The External-wait cancel hook: tombstone the slot (the resource is stuck in
+/// the blocking worker) and run any extra abort (process-group SIGKILL). Runs on
+/// the VM thread; holds no `Value`.
+struct CheckoutCancelHook {
+    op_name: &'static str,
+    tombstone: Rc<dyn Fn(String)>,
+    abort: Option<Box<dyn FnOnce()>>,
+}
+
+impl Trace for CheckoutCancelHook {
+    fn trace(&self, _sink: &mut dyn FnMut(GcEdge<'_>)) -> bool {
+        true
+    }
+}
+
+impl CancelHook for CheckoutCancelHook {
+    fn cancel(&mut self) -> Result<CancelDisposition, CancelHookError> {
+        (self.tombstone)(format!(
+            "{} was cancelled while in flight; the resource cannot be reclaimed",
+            self.op_name
+        ));
+        if let Some(abort) = self.abort.take() {
+            abort();
+        }
+        Ok(CancelDisposition::Reaped)
+    }
+    fn reap(&mut self) -> Result<CancelDisposition, CancelHookError> {
+        Ok(CancelDisposition::Reaped)
+    }
+}
+
+/// Stage 2: the op completed / failed / was cancelled — release the gate (waking
+/// the FIFO head), then deliver the resolved value or raise. Holds no `Value`.
+struct ReleaseReturnCont {
+    op_name: &'static str,
+    gate: ResourceGateId,
+}
+
+impl Trace for ReleaseReturnCont {
+    fn trace(&self, _sink: &mut dyn FnMut(GcEdge<'_>)) -> bool {
+        true
+    }
+}
+
+impl NativeContinuation for ReleaseReturnCont {
+    fn resume(
+        self: Box<Self>,
+        _context: &mut NativeCallContext<'_>,
+        input: ResumeInput,
+    ) -> NativeResult {
+        let final_cont: Box<dyn NativeContinuation> = match input {
+            ResumeInput::Returned(value) => Box::new(FinalCont::Value(value)),
+            ResumeInput::Failed(error) => Box::new(FinalCont::Fail(error)),
+            ResumeInput::Cancelled(_) => Box::new(FinalCont::Cancelled {
+                op_name: self.op_name,
+            }),
+            ResumeInput::Runtime(_) => Box::new(FinalCont::Fail(SemaError::eval(format!(
+                "{}: unexpected runtime response after offload",
+                self.op_name
+            )))),
+        };
+        Ok(NativeOutcome::Runtime(
+            RuntimeRequest::ReleaseResourceGate {
+                gate: self.gate,
+                continuation: final_cont,
+            },
+        ))
+    }
+}
+
+/// Stage 3: the gate is released; deliver the resolved outcome to the caller.
+enum FinalCont {
+    Value(Value),
+    Fail(SemaError),
+    Cancelled { op_name: &'static str },
+}
+
+impl Trace for FinalCont {
+    fn trace(&self, sink: &mut dyn FnMut(GcEdge<'_>)) -> bool {
+        match self {
+            Self::Value(value) => {
+                sink(GcEdge::Value(value));
+                true
+            }
+            Self::Fail(error) => error.trace(sink),
+            Self::Cancelled { .. } => true,
+        }
+    }
+}
+
+impl NativeContinuation for FinalCont {
+    fn resume(
+        self: Box<Self>,
+        _context: &mut NativeCallContext<'_>,
+        _input: ResumeInput,
+    ) -> NativeResult {
+        // The gate release always succeeds; deliver the stored outcome. (If the
+        // task carries a sticky cancellation, the runtime settles it Cancelled
+        // regardless of what we return here.)
+        match *self {
+            FinalCont::Value(value) => Ok(NativeOutcome::Return(value)),
+            FinalCont::Fail(error) => Err(error),
+            FinalCont::Cancelled { op_name } => {
+                Err(SemaError::eval(format!("{op_name} was cancelled")))
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod checkout_trace_tests {
+    use super::*;
+
+    fn edge_count(trace: &dyn Trace) -> usize {
+        let mut count = 0;
+        assert!(trace.trace(&mut |_| count += 1));
+        count
+    }
+
+    /// The checkout continuations that carry NO `Value` must emit zero GC edges
+    /// (the CORE-2 rule that keeps continuation state cycle-free). `FinalCont`
+    /// alone carries the resolved value/error across the gate-release round-trip
+    /// and must trace exactly it. The generic stages hold only boxed `FnOnce`
+    /// closures (which must not capture a `Value`) — their trace is edge-free.
+    /// (`ReleaseReturnCont` holds only `Copy` fields — an op name + gate id — so
+    /// it is edge-free by construction and needs no runtime to mint an id.)
+    #[test]
+    fn checkout_continuations_trace_expected_edges() {
+        assert_eq!(
+            edge_count(&CheckoutCancelHook {
+                op_name: "t",
+                tombstone: Rc::new(|_| {}),
+                abort: None,
+            }),
+            0
+        );
+        // FinalCont: the sole Value-carrying continuation.
+        assert_eq!(edge_count(&FinalCont::Value(Value::int(7))), 1);
+        assert_eq!(edge_count(&FinalCont::Fail(SemaError::eval("boom"))), 0);
+        assert_eq!(edge_count(&FinalCont::Cancelled { op_name: "t" }), 0);
+        // A UserException error carries a Value edge that must be traced.
+        assert_eq!(
+            edge_count(&FinalCont::Fail(SemaError::UserException(Value::int(3)))),
+            1
+        );
+        // The generic acquire/create stages and the decoder hold no Value.
+        let decoder: CheckoutDecoder<(), ()> = CheckoutDecoder {
+            op_name: "t",
+            reinstall: Some(Box::new(|_| {})),
+            decode: Some(Box::new(|_| Ok(Value::nil()))),
+            success_value: None,
+            tombstone: Rc::new(|_| {}),
+        };
+        assert_eq!(edge_count(&decoder), 0);
+        // A carried success value is a traced edge (kv/set's return value).
+        let decoder_with_value: CheckoutDecoder<(), ()> = CheckoutDecoder {
+            op_name: "t",
+            reinstall: Some(Box::new(|_| {})),
+            decode: Some(Box::new(|_| Ok(Value::nil()))),
+            success_value: Some(Value::int(9)),
+            tombstone: Rc::new(|_| {}),
+        };
+        assert_eq!(edge_count(&decoder_with_value), 1);
+    }
 }

@@ -277,3 +277,75 @@ fn kv_async_concurrent_writers_on_one_store_all_succeed() {
         "the on-disk file must reflect every queued write, got {on_disk:?}"
     );
 }
+
+// === Cancellation through the ResourceGate + checkout_external path ===
+//
+// Cancelling a spawned kv chain must settle Cancelled (never hang or panic) and
+// leave the registry usable: a fresh store opened afterwards works normally.
+#[test]
+fn kv_cancelled_chain_settles_and_registry_stays_usable() {
+    let dir = std::env::temp_dir();
+    let p1 = dir.join(format!("sema-kv-cancel-a-{}.json", std::process::id()));
+    let p2 = dir.join(format!("sema-kv-cancel-b-{}.json", std::process::id()));
+    let _ = std::fs::remove_file(&p1);
+    let _ = std::fs::remove_file(&p2);
+    let interp = Interpreter::new();
+    let program = format!(
+        r#"
+        (let ((p (async/spawn (fn ()
+                    (kv/open "cancelme" "{a}")
+                    (kv/set "cancelme" "k" "v")))))
+          (async/cancel p)
+          (let ((caught (try (async/await p) (catch e :caught))))
+            (kv/open "after" "{b}")
+            (kv/set "after" "x" "ok")
+            (let ((got (kv/get "after" "x")))
+              (kv/close "after")
+              (list caught got))))
+        "#,
+        a = p1.display(),
+        b = p2.display(),
+    );
+    let result = interp
+        .eval_str_compiled(&program)
+        .expect("cancelled kv chain evaluates without wedging the runtime");
+    let parts: Vec<Value> = result.as_list().expect("list").to_vec();
+    assert_eq!(parts[0], Value::keyword("caught"));
+    assert_eq!(parts[1], Value::string("ok"));
+    let _ = std::fs::remove_file(&p1);
+    let _ = std::fs::remove_file(&p2);
+}
+
+// A cancelled sibling (settled Cancelled pre-run) must not corrupt a shared
+// store: the other two writers still acquire the gate FIFO and both writes land.
+#[test]
+fn kv_cancelled_sibling_does_not_corrupt_shared_store() {
+    let dir = std::env::temp_dir();
+    let path = dir.join(format!("sema-kv-contend-{}.json", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let interp = Interpreter::new();
+    let program = format!(
+        r#"
+        (kv/open "contend" "{p}")
+        (let ((mid (async/spawn (fn () (kv/set "contend" "mid" 0)))))
+          (async/cancel mid)
+          (let ((pa (async/spawn (fn () (kv/set "contend" "a" 1))))
+                (pc (async/spawn (fn () (kv/set "contend" "c" 3)))))
+            (async/await pa)
+            (async/await pc)
+            (let ((keys (kv/keys "contend")))
+              (kv/close "contend")
+              (length keys))))
+        "#,
+        p = path.display(),
+    );
+    let result = interp
+        .eval_str_compiled(&program)
+        .expect("cancelled sibling evaluates without hanging or corrupting the store");
+    assert_eq!(
+        result.as_int(),
+        Some(2),
+        "both non-cancelled writers must land; the cancelled one must not"
+    );
+    let _ = std::fs::remove_file(&path);
+}

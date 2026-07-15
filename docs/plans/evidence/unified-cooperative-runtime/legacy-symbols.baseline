@@ -468,24 +468,6 @@ crates/sema-stdlib/src/io.rs:3483:        assert!(matches!(reason, sema_core::Yi
 crates/sema-stdlib/src/io.rs:3538:        sema_core::set_call_callback(&cb_ctx, invoke_native_value);
 crates/sema-stdlib/src/io.rs:3574:        sema_core::set_call_callback(&cb_ctx, invoke_native_value);
 crates/sema-stdlib/src/io.rs:3603:        sema_core::set_call_callback(&cb_ctx, invoke_native_value);
-crates/sema-stdlib/src/kv.rs:159:/// The two phases a `kv/set`/`kv/delete` `IoHandle` cycles through — same
-crates/sema-stdlib/src/kv.rs:183:/// `IoHandle::with_abort`'s doc comment): the caller marks the registry slot
-crates/sema-stdlib/src/kv.rs:218:    if let Some(v) = sema_core::take_resume_value() {
-crates/sema-stdlib/src/kv.rs:234:    let poll = move || -> IoPoll {
-crates/sema-stdlib/src/kv.rs:268:                    None => return IoPoll::Pending,
-crates/sema-stdlib/src/kv.rs:269:                    Some(Err(msg)) => return IoPoll::Ready(Err(msg)),
-crates/sema-stdlib/src/kv.rs:27://! checked out queues: its `IoHandle` re-attempts the checkout on every poll
-crates/sema-stdlib/src/kv.rs:282:                    Err(TryRecvError::Empty) => IoPoll::Pending,
-crates/sema-stdlib/src/kv.rs:29://! own flush — all under the one `IoHandle` the yield armed.
-crates/sema-stdlib/src/kv.rs:302:                                IoPoll::Ready(Ok(decode_fn(r)))
-crates/sema-stdlib/src/kv.rs:304:                            Err(msg) => IoPoll::Ready(Err(msg)),
-crates/sema-stdlib/src/kv.rs:317:                        IoPoll::Ready(Err(format!("{op_name}: flush worker dropped")))
-crates/sema-stdlib/src/kv.rs:326:    let io_handle = Rc::new(IoHandle::with_abort(poll, move || {
-crates/sema-stdlib/src/kv.rs:342:    sema_core::set_yield_signal(sema_core::YieldReason::AwaitIo(io_handle));
-crates/sema-stdlib/src/kv.rs:364:            if in_async_context() || sema_core::in_runtime_quantum() {
-crates/sema-stdlib/src/kv.rs:42:use sema_core::{check_arity, in_async_context, IoHandle, IoPoll, SemaError, Value};
-crates/sema-stdlib/src/kv.rs:432:        if in_async_context() || sema_core::in_runtime_quantum() {
-crates/sema-stdlib/src/kv.rs:467:            if in_async_context() || sema_core::in_runtime_quantum() {
 crates/sema-stdlib/src/list.rs:1886:        sema_core::with_stdlib_ctx(|ctx| sema_core::call_callback(ctx, func, args))
 crates/sema-stdlib/src/list.rs:1897:    let result = sema_core::with_stdlib_ctx(|ctx| sema_core::call_callback_owned(ctx, func, args));
 crates/sema-stdlib/src/list.rs:1904:    if (sema_core::in_async_context() || sema_core::in_runtime_quantum())
@@ -588,16 +570,17 @@ crates/sema-stdlib/src/pty.rs:887:                sema_core::IoPoll::Ready(Ok(v)
 crates/sema-stdlib/src/pty.rs:888:                sema_core::IoPoll::Ready(Err(e)) => panic!("offload rejected: {e}"),
 crates/sema-stdlib/src/pty.rs:889:                sema_core::IoPoll::Pending => {
 crates/sema-stdlib/src/pty.rs:894:                    std::thread::sleep(Duration::from_millis(2));
-crates/sema-stdlib/src/runtime_offload.rs:138:/// a `kill_on_drop` child) — the retired `IoHandle::with_abort` teardown. Lives on
-crates/sema-stdlib/src/runtime_offload.rs:197:            // On a plain executor worker thread `io_block_on` is legal and enters
-crates/sema-stdlib/src/runtime_offload.rs:202:            let out: Result<T, String> = sema_io::io_block_on(async move {
-crates/sema-stdlib/src/runtime_offload.rs:224:/// same teardown the blocking tier gives, without an `io_block_on` worker.
+crates/sema-stdlib/src/runtime_offload.rs:140:/// a `kill_on_drop` child) — the retired `IoHandle::with_abort` teardown. Lives on
+crates/sema-stdlib/src/runtime_offload.rs:199:            // On a plain executor worker thread `io_block_on` is legal and enters
+crates/sema-stdlib/src/runtime_offload.rs:204:            let out: Result<T, String> = sema_io::io_block_on(async move {
+crates/sema-stdlib/src/runtime_offload.rs:226:/// same teardown the blocking tier gives, without an `io_block_on` worker.
 crates/sema-stdlib/src/runtime_offload.rs:22://! dispatches with a bare thread-parking `block_on` and NO tokio reactor
 crates/sema-stdlib/src/runtime_offload.rs:25://! future off the VM thread is [`sema_io::io_block_on`] on the executor's (plain
 crates/sema-stdlib/src/runtime_offload.rs:28://! [`PreparedExternalOperation::interruptible_blocking`] + `io_block_on`, and
 crates/sema-stdlib/src/runtime_offload.rs:29://! preserve the retired `IoHandle::with_abort` teardown by racing the work
-crates/sema-stdlib/src/runtime_offload.rs:312:/// running its future via [`sema_io::io_block_on`] and mapping the domain
-crates/sema-stdlib/src/runtime_offload.rs:320:/// async reactor (a synchronous library call under `io_block_on`) pick this;
+crates/sema-stdlib/src/runtime_offload.rs:314:/// running its future via [`sema_io::io_block_on`] and mapping the domain
+crates/sema-stdlib/src/runtime_offload.rs:322:/// async reactor (a synchronous library call under `io_block_on`) pick this;
+crates/sema-stdlib/src/runtime_offload.rs:427://     and cannot be reclaimed — best-effort, matching the retired `IoHandle`
 crates/sema-stdlib/src/secret.rs:14://! (`in_async_context()`) — offload the scan onto the process-wide I/O pool
 crates/sema-stdlib/src/secret.rs:238:        if sema_core::in_async_context() {
 crates/sema-stdlib/src/secret.rs:257:        if sema_core::in_async_context() {
@@ -689,27 +672,7 @@ crates/sema-stdlib/src/server.rs:529:            let async_ctx = sema_core::in_a
 crates/sema-stdlib/src/server.rs:640:    use sema_core::{call_callback, EvalContext, NativeFn};
 crates/sema-stdlib/src/server.rs:734:                        if sema_core::in_async_context() || sema_core::in_runtime_quantum() {
 crates/sema-stdlib/src/server.rs:863:                    return call_callback(ctx, handler, &[new_req_val]);
-crates/sema-stdlib/src/sqlite.rs:158:/// The two phases a checkout offload's `IoHandle` cycles through — identical
-crates/sema-stdlib/src/sqlite.rs:177:/// `IoHandle::with_abort`'s doc comment): the caller marks the registry slot
-crates/sema-stdlib/src/sqlite.rs:213:    if let Some(v) = sema_core::take_resume_value() {
-crates/sema-stdlib/src/sqlite.rs:222:    let poll = move || -> IoPoll {
 crates/sema-stdlib/src/sqlite.rs:23://! queues (an async caller's `IoHandle` re-attempts the checkout every poll —
-crates/sema-stdlib/src/sqlite.rs:253:                    None => return IoPoll::Pending,
-crates/sema-stdlib/src/sqlite.rs:254:                    Some(Err(msg)) => return IoPoll::Ready(Err(msg)),
-crates/sema-stdlib/src/sqlite.rs:270:                    Err(TryRecvError::Empty) => IoPoll::Pending,
-crates/sema-stdlib/src/sqlite.rs:283:                            Ok(t) => IoPoll::Ready(Ok(decode(t))),
-crates/sema-stdlib/src/sqlite.rs:284:                            Err(msg) => IoPoll::Ready(Err(msg)),
-crates/sema-stdlib/src/sqlite.rs:297:                        IoPoll::Ready(Err(format!("{op_name}: query worker dropped")))
-crates/sema-stdlib/src/sqlite.rs:306:    let io_handle = Rc::new(IoHandle::with_abort(poll, move || {
-crates/sema-stdlib/src/sqlite.rs:322:    sema_core::set_yield_signal(sema_core::YieldReason::AwaitIo(io_handle));
-crates/sema-stdlib/src/sqlite.rs:445:            if in_async_context() || sema_core::in_runtime_quantum() {
-crates/sema-stdlib/src/sqlite.rs:45:use sema_core::{check_arity, in_async_context, IoHandle, IoPoll, SemaError, Value};
-crates/sema-stdlib/src/sqlite.rs:491:            if in_async_context() || sema_core::in_runtime_quantum() {
-crates/sema-stdlib/src/sqlite.rs:535:        if in_async_context() || sema_core::in_runtime_quantum() {
-crates/sema-stdlib/src/sqlite.rs:574:            if in_async_context() || sema_core::in_runtime_quantum() {
-crates/sema-stdlib/src/sqlite.rs:609:        if in_async_context() || sema_core::in_runtime_quantum() {
-crates/sema-stdlib/src/sqlite.rs:647:            if in_async_context() || sema_core::in_runtime_quantum() {
-crates/sema-stdlib/src/sqlite.rs:702:            if in_async_context() || sema_core::in_runtime_quantum() {
 crates/sema-stdlib/src/stream.rs:1044:        if !in_async_context() && !sema_core::in_runtime_quantum() {
 crates/sema-stdlib/src/stream.rs:1139:        if (!in_async_context() && !sema_core::in_runtime_quantum())
 crates/sema-stdlib/src/stream.rs:1167:        if (!in_async_context() && !sema_core::in_runtime_quantum())
@@ -818,38 +781,38 @@ crates/sema-vm/src/runtime/host.rs:479:        rx.recv_timeout(Duration::from_se
 crates/sema-vm/src/runtime/host.rs:481:        rx.recv_timeout(Duration::from_secs(2))
 crates/sema-vm/src/runtime/host.rs:534:        std::thread::sleep(Duration::from_millis(200));
 crates/sema-vm/src/runtime/host.rs:569:        rx.recv_timeout(Duration::from_secs(2))
-crates/sema-vm/src/runtime/state.rs:1157:            // runtime supports it — see `IoHandle::with_abort`), drop the entry,
-crates/sema-vm/src/runtime/state.rs:1194:            let task = state.tasks.remove(&task_id).expect("selected task exists");
-crates/sema-vm/src/runtime/state.rs:1248:                let (Some(task), Some(waits)) = (state.tasks.remove(&task_id), state.waits.take())
-crates/sema-vm/src/runtime/state.rs:1624:                YieldReason::Sleep(ms) => {
-crates/sema-vm/src/runtime/state.rs:1637:                YieldReason::Spawn(_)
-crates/sema-vm/src/runtime/state.rs:1638:                | YieldReason::Cancel(_)
-crates/sema-vm/src/runtime/state.rs:1639:                | YieldReason::AwaitPromise(_)
-crates/sema-vm/src/runtime/state.rs:1640:                | YieldReason::AwaitPromiseSet { .. }
-crates/sema-vm/src/runtime/state.rs:1641:                | YieldReason::ChannelSend(_, _)
-crates/sema-vm/src/runtime/state.rs:1642:                | YieldReason::ChannelRecv(_)
-crates/sema-vm/src/runtime/state.rs:1643:                | YieldReason::ChannelClose(_)
-crates/sema-vm/src/runtime/state.rs:1644:                | YieldReason::ChannelInspect(_, _)
-crates/sema-vm/src/runtime/state.rs:1645:                | YieldReason::ChannelTryRecv(_) => TaskAction::VmResult(
-crates/sema-vm/src/runtime/state.rs:1658:                YieldReason::AwaitIo(handle) => {
-crates/sema-vm/src/runtime/state.rs:2076:                        let task = state.tasks.remove(&task_id).ok_or_else(|| {
-crates/sema-vm/src/runtime/state.rs:2639:                let native_result = match sema_core::take_yield_signal() {
+crates/sema-vm/src/runtime/state.rs:1159:            // runtime supports it — see `IoHandle::with_abort`), drop the entry,
+crates/sema-vm/src/runtime/state.rs:1196:            let task = state.tasks.remove(&task_id).expect("selected task exists");
+crates/sema-vm/src/runtime/state.rs:1250:                let (Some(task), Some(waits)) = (state.tasks.remove(&task_id), state.waits.take())
+crates/sema-vm/src/runtime/state.rs:1626:                YieldReason::Sleep(ms) => {
+crates/sema-vm/src/runtime/state.rs:1639:                YieldReason::Spawn(_)
+crates/sema-vm/src/runtime/state.rs:1640:                | YieldReason::Cancel(_)
+crates/sema-vm/src/runtime/state.rs:1641:                | YieldReason::AwaitPromise(_)
+crates/sema-vm/src/runtime/state.rs:1642:                | YieldReason::AwaitPromiseSet { .. }
+crates/sema-vm/src/runtime/state.rs:1643:                | YieldReason::ChannelSend(_, _)
+crates/sema-vm/src/runtime/state.rs:1644:                | YieldReason::ChannelRecv(_)
+crates/sema-vm/src/runtime/state.rs:1645:                | YieldReason::ChannelClose(_)
+crates/sema-vm/src/runtime/state.rs:1646:                | YieldReason::ChannelInspect(_, _)
+crates/sema-vm/src/runtime/state.rs:1647:                | YieldReason::ChannelTryRecv(_) => TaskAction::VmResult(
+crates/sema-vm/src/runtime/state.rs:1660:                YieldReason::AwaitIo(handle) => {
+crates/sema-vm/src/runtime/state.rs:2078:                        let task = state.tasks.remove(&task_id).ok_or_else(|| {
+crates/sema-vm/src/runtime/state.rs:2641:                let native_result = match sema_core::take_yield_signal() {
 crates/sema-vm/src/runtime/state.rs:265:    /// VM-quantum tasks parked on a LEGACY `AwaitIo(IoHandle)` yield, mapped to
 crates/sema-vm/src/runtime/state.rs:268:    /// http, file, event/select, io) that arms an `IoHandle` and yields
 crates/sema-vm/src/runtime/state.rs:26:use sema_core::YieldReason;
 crates/sema-vm/src/runtime/state.rs:275:    io_waits: HashMap<TaskId, (super::WaitKey, Rc<sema_core::IoHandle>)>,
-crates/sema-vm/src/runtime/state.rs:2901:        handle: Rc<sema_core::IoHandle>,
-crates/sema-vm/src/runtime/state.rs:2907:            sema_core::IoPoll::Ready(Ok(value)) => {
-crates/sema-vm/src/runtime/state.rs:2910:            sema_core::IoPoll::Ready(Err(msg)) => {
-crates/sema-vm/src/runtime/state.rs:2913:            sema_core::IoPoll::Pending => {}
-crates/sema-vm/src/runtime/state.rs:2946:        let parked: Vec<(TaskId, super::WaitKey, Rc<sema_core::IoHandle>)> = {
-crates/sema-vm/src/runtime/state.rs:2960:                sema_core::IoPoll::Pending => {}
-crates/sema-vm/src/runtime/state.rs:2961:                sema_core::IoPoll::Ready(Ok(value)) => {
-crates/sema-vm/src/runtime/state.rs:2964:                sema_core::IoPoll::Ready(Err(msg)) => {
-crates/sema-vm/src/runtime/state.rs:3160:        let mut task = state.tasks.remove(&task_id).expect("task prevalidated");
-crates/sema-vm/src/runtime/state.rs:4099:    /// Legacy `AwaitIo(IoHandle)`: park the task (`TaskId`) on the offloaded-I/O
-crates/sema-vm/src/runtime/state.rs:4102:    VmAwaitIo(TaskId, Rc<sema_core::IoHandle>),
-crates/sema-vm/src/runtime/state.rs:4223:            // An `IoHandle` is a boxed `FnMut` poller; it is not a GC candidate
+crates/sema-vm/src/runtime/state.rs:2903:        handle: Rc<sema_core::IoHandle>,
+crates/sema-vm/src/runtime/state.rs:2909:            sema_core::IoPoll::Ready(Ok(value)) => {
+crates/sema-vm/src/runtime/state.rs:2912:            sema_core::IoPoll::Ready(Err(msg)) => {
+crates/sema-vm/src/runtime/state.rs:2915:            sema_core::IoPoll::Pending => {}
+crates/sema-vm/src/runtime/state.rs:2948:        let parked: Vec<(TaskId, super::WaitKey, Rc<sema_core::IoHandle>)> = {
+crates/sema-vm/src/runtime/state.rs:2962:                sema_core::IoPoll::Pending => {}
+crates/sema-vm/src/runtime/state.rs:2963:                sema_core::IoPoll::Ready(Ok(value)) => {
+crates/sema-vm/src/runtime/state.rs:2966:                sema_core::IoPoll::Ready(Err(msg)) => {
+crates/sema-vm/src/runtime/state.rs:3162:        let mut task = state.tasks.remove(&task_id).expect("task prevalidated");
+crates/sema-vm/src/runtime/state.rs:4101:    /// Legacy `AwaitIo(IoHandle)`: park the task (`TaskId`) on the offloaded-I/O
+crates/sema-vm/src/runtime/state.rs:4104:    VmAwaitIo(TaskId, Rc<sema_core::IoHandle>),
+crates/sema-vm/src/runtime/state.rs:4225:            // An `IoHandle` is a boxed `FnMut` poller; it is not a GC candidate
 crates/sema-vm/src/runtime/wait.rs:421:                inbox.recv_timeout(timeout).ok()
 crates/sema-vm/src/runtime/wait.rs:423:            None => inbox.recv().ok(),
 crates/sema-vm/src/scheduler.rs:1003:                if let TaskState::Blocked(YieldReason::AwaitIo(h)) = &task.state {

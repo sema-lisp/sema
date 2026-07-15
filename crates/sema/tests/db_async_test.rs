@@ -245,3 +245,85 @@ fn db_async_concurrent_writers_on_one_handle_all_succeed() {
         "all three inserts must land — the checkout must serialize, not drop, queued writers"
     );
 }
+
+// === Cancellation through the ResourceGate + checkout_external path ===
+//
+// Cancelling a spawned db chain must settle the task Cancelled (never hang or
+// panic) AND leave the thread-local registry + runtime usable: a fresh handle
+// opened afterwards works normally. This exercises the checkout continuations'
+// Cancelled arms (AcquireCont / ReleaseReturnCont / FinalCont) and proves a
+// cancelled op releases its resource gate rather than wedging the handle.
+#[test]
+fn db_cancelled_chain_settles_cancelled_and_registry_stays_usable() {
+    let interp = Interpreter::new();
+    let program = r#"
+        (let ((p (async/spawn (fn ()
+                    (db/open-memory "cancelme")
+                    (db/exec "cancelme" "CREATE TABLE t (v TEXT)")
+                    (db/exec "cancelme" "INSERT INTO t (v) VALUES (?)" "x")
+                    (db/query "cancelme" "SELECT v FROM t")))))
+          (async/cancel p)
+          (let ((caught (try (async/await p) (catch e :caught))))
+            (db/open-memory "after")
+            (db/exec "after" "CREATE TABLE t (v TEXT)")
+            (db/exec "after" "INSERT INTO t (v) VALUES (?)" "ok")
+            (let ((rows (db/query "after" "SELECT v FROM t")))
+              (db/close "after")
+              (list caught (length rows)))))
+    "#;
+    let result = interp
+        .eval_str_compiled(program)
+        .expect("cancelled db chain evaluates without wedging the runtime");
+    let parts: Vec<Value> = result.as_list().expect("result list").to_vec();
+    assert_eq!(
+        parts[0],
+        Value::keyword("caught"),
+        "awaiting the cancelled task must raise the :cancelled condition, got {:?}",
+        parts[0]
+    );
+    assert_eq!(
+        parts[1].as_int(),
+        Some(1),
+        "a fresh handle must work after the cancellation (registry not wedged)"
+    );
+}
+
+// A cancelled sibling must not corrupt a shared handle for the others. `mid` is
+// cancelled before it ever runs (settled Cancelled pre-quantum), so it never
+// touches the "contend" connection; `a` and `c` still acquire the gate FIFO and
+// both inserts land. Proves a cancelled acquirer neither strands the gate nor
+// tombstones the shared resource out from under its siblings.
+#[test]
+fn db_cancelled_sibling_does_not_corrupt_shared_handle() {
+    let interp = Interpreter::new();
+    let program = r#"
+        (db/open-memory "contend")
+        (db/exec "contend" "CREATE TABLE t (v TEXT)")
+        (let ((mid (async/spawn (fn ()
+                     (db/exec "contend" "INSERT INTO t (v) VALUES (?)" "mid")))))
+          (async/cancel mid)
+          (let ((pa (async/spawn (fn ()
+                       (db/exec "contend" "INSERT INTO t (v) VALUES (?)" "a"))))
+                (pc (async/spawn (fn ()
+                       (db/exec "contend" "INSERT INTO t (v) VALUES (?)" "c")))))
+            (async/await pa)
+            (async/await pc)
+            (let ((rows (db/query "contend" "SELECT v FROM t ORDER BY v")))
+              (db/close "contend")
+              (map (fn (r) (:v r)) rows))))
+    "#;
+    let result = interp
+        .eval_str_compiled(program)
+        .expect("cancelled sibling evaluates without hanging or corrupting the handle");
+    let got: Vec<String> = result
+        .as_list()
+        .expect("list")
+        .iter()
+        .map(|v| v.as_str().expect("string").to_string())
+        .collect();
+    assert_eq!(
+        got,
+        vec!["a".to_string(), "c".to_string()],
+        "both non-cancelled writers must land and the cancelled one must not, got {got:?}"
+    );
+}

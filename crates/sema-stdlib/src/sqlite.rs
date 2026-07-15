@@ -40,9 +40,16 @@
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
+use std::rc::Rc;
 
 use rusqlite::{params_from_iter, types::Value as SqlValue, Connection};
-use sema_core::{check_arity, in_async_context, IoHandle, IoPoll, SemaError, Value};
+use sema_core::runtime::{CompletionKind, NativeOutcome, NativeResult, ResourceGateId};
+use sema_core::{check_arity, in_runtime_quantum, SemaError, Value};
+
+use crate::runtime_offload::{checkout_external, CheckoutOp};
+
+/// Completion-kind tag for `db/*` external waits ("db\0\0").
+const DB_COMPLETION_KIND: u64 = 0x6462_0000;
 
 // `Connection` moves across the offload boundary (open + every checkout op).
 // This compiles only if it stays `Send`; a future rusqlite upgrade that
@@ -68,6 +75,10 @@ enum DbSlot {
 
 thread_local! {
     static DB_CONNECTIONS: RefCell<HashMap<String, DbSlot>> = RefCell::new(HashMap::new());
+    /// Per-handle [`ResourceGateId`], created lazily on the first offloaded op on
+    /// a handle and reused for its later ops (dropped on `db/close`). The gate
+    /// provides FIFO mutual exclusion for the checkout slot.
+    static DB_GATES: RefCell<HashMap<String, ResourceGateId>> = RefCell::new(HashMap::new());
 }
 
 fn sema_to_sql(v: &Value) -> SqlValue {
@@ -147,180 +158,73 @@ fn with_conn<R>(
     })
 }
 
-/// What crosses the thread boundary from an offloaded connection op back to
-/// the poller: the reinstalled `Connection` plus the op's owned `Send`
-/// result. Mirrors `proc.rs`'s `WaitOutcome`.
-struct ConnOpOutcome<T> {
-    conn: Connection,
-    result: Result<T, String>,
-}
-
-/// The two phases a checkout offload's `IoHandle` cycles through — identical
-/// shape to `proc.rs`'s `WaitPhase`. A caller that finds the slot immediately
-/// `Available` still starts in `Acquire`; it succeeds on the very first poll
-/// and falls through into `Running` in the same tick, so there is exactly one
-/// code path for both the uncontended and the queued case.
-enum ConnPhase<T> {
-    /// Waiting for the slot to become `Available`. Re-checked every poll;
-    /// never mutates anything beyond that check, so aborting here is a true
-    /// no-op — nothing was ever taken out.
-    Acquire,
-    /// Holding the checkout; `op` is running on the I/O pool. Resolves with
-    /// the reinstalled `Connection` plus the op's result.
-    Running(tokio::sync::oneshot::Receiver<ConnOpOutcome<T>>),
-}
-
-/// Move `op` on `conn` onto the I/O pool's blocking tier. Cancellation past
-/// this point is best-effort by construction (the `Connection` is inside a
-/// `spawn_blocking` closure with no abort hook — the same tradeoff every
-/// other `spawn_blocking`-based offload in this codebase accepts, see
-/// `IoHandle::with_abort`'s doc comment): the caller marks the registry slot
-/// `Tombstone` on abort so a later access errors clearly instead of the slot
-/// staying `CheckedOut` forever with no one left to reinstall it, but the
-/// blocking statement itself keeps running unattended on the worker.
-fn spawn_conn_op<T: Send + 'static>(
-    mut conn: Connection,
-    op: impl FnOnce(&mut Connection) -> Result<T, String> + Send + 'static,
-) -> tokio::sync::oneshot::Receiver<ConnOpOutcome<T>> {
-    let (tx, rx) = tokio::sync::oneshot::channel();
-    sema_io::io_spawn_blocking(move || {
-        let result = op(&mut conn);
-        let _ = tx.send(ConnOpOutcome { conn, result });
-        // Wake the parked VM thread so it re-polls promptly.
-        sema_core::notify_io_complete();
-    });
-    rx
+/// Take `handle`'s connection out of its slot once its gate is owned. A
+/// tombstoned/missing slot (a prior op cancelled mid-flight) fails clearly.
+fn take_conn(op_name: &'static str, handle: &str) -> Result<Connection, SemaError> {
+    DB_CONNECTIONS.with(|c| {
+        let mut conns = c.borrow_mut();
+        match conns.get_mut(handle) {
+            Some(slot @ DbSlot::Available(_)) => {
+                let DbSlot::Available(conn) = std::mem::replace(slot, DbSlot::CheckedOut) else {
+                    unreachable!("just matched Available")
+                };
+                Ok(conn)
+            }
+            Some(DbSlot::CheckedOut) => Err(busy_err(op_name, handle)),
+            Some(DbSlot::Tombstone(msg)) => Err(tombstone_err(op_name, handle, msg)),
+            None => Err(missing_err(op_name, handle)),
+        }
+    })
 }
 
 /// Offload one blocking rusqlite operation on the connection named `handle`
-/// through the CHECKOUT pattern (see the module doc comment). `op` runs on
-/// the I/O pool; `decode` turns its owned `Send` result into the final
-/// `Value` on the VM thread when the scheduler polls the completed offload —
-/// mirrors `proc.rs`'s `proc_wait_async`/`poll_wait`. Returns `Ok(nil)` after
-/// arming the yield signal; the scheduler delivers the real value on resume.
-fn checkout_offload<T: Send + 'static>(
+/// through the CHECKOUT pattern (see the module doc comment) under the unified
+/// runtime: acquire the handle's [`ResourceGate`] (creating it on first use),
+/// take the `Connection` out of the slot, run `op` off the VM thread on the
+/// executor's blocking tier, reinstall the `Connection` and decode the result on
+/// the VM thread, then release the gate. `op` runs on the blocking worker;
+/// `decode` builds the final `Value`. A mid-op cancel tombstones the slot
+/// (best-effort — the blocking statement keeps running unattended) and releases
+/// the gate so a queued sibling fails fast.
+fn checkout_runtime<T: Send + 'static>(
     op_name: &'static str,
     handle: String,
     op: impl FnOnce(&mut Connection) -> Result<T, String> + Send + 'static,
-    decode: impl Fn(T) -> Value + 'static,
-) -> Result<Value, SemaError> {
-    use std::rc::Rc;
-    use tokio::sync::oneshot::error::TryRecvError;
-
-    // Vestigial under CALL_NATIVE (the scheduler delivers the resume value via
-    // `replace_stack_top`, not by re-invoking this native), but kept for
-    // symmetry with the shipped `async/await` yield pattern.
-    if let Some(v) = sema_core::take_resume_value() {
-        return Ok(v);
-    }
-
-    let phase = Rc::new(RefCell::new(ConnPhase::<T>::Acquire));
-    let phase_for_poll = phase.clone();
-    let mut op_holder = Some(op);
-    let handle_for_poll = handle.clone();
-
-    let poll = move || -> IoPoll {
-        loop {
-            let is_acquire = matches!(&*phase_for_poll.borrow(), ConnPhase::Acquire);
-            if is_acquire {
-                // Owned Result so the DB_CONNECTIONS borrow doesn't outlive
-                // the match — the `Running` transition below needs its own
-                // (non-overlapping) borrow of the same thread-local.
-                let mut taken: Option<Result<Connection, String>> = None;
-                DB_CONNECTIONS.with(|c| {
-                    let mut conns = c.borrow_mut();
-                    match conns.get_mut(&handle_for_poll) {
-                        Some(slot @ DbSlot::Available(_)) => {
-                            let DbSlot::Available(conn) =
-                                std::mem::replace(slot, DbSlot::CheckedOut)
-                            else {
-                                unreachable!("just matched Available")
-                            };
-                            taken = Some(Ok(conn));
-                        }
-                        Some(DbSlot::CheckedOut) => {}
-                        Some(DbSlot::Tombstone(msg)) => {
-                            taken = Some(Err(
-                                tombstone_err(op_name, &handle_for_poll, msg).to_string()
-                            ));
-                        }
-                        None => {
-                            taken = Some(Err(missing_err(op_name, &handle_for_poll).to_string()));
-                        }
-                    }
-                });
-                match taken {
-                    None => return IoPoll::Pending,
-                    Some(Err(msg)) => return IoPoll::Ready(Err(msg)),
-                    Some(Ok(conn)) => {
-                        let op = op_holder
-                            .take()
-                            .expect("checkout_offload's op is consumed exactly once");
-                        *phase_for_poll.borrow_mut() = ConnPhase::Running(spawn_conn_op(conn, op));
-                        // Fall through: poll the freshly spawned receiver
-                        // immediately instead of wasting a scheduler tick.
-                    }
-                }
-            } else {
-                let mut phase_ref = phase_for_poll.borrow_mut();
-                let ConnPhase::Running(rx) = &mut *phase_ref else {
-                    unreachable!("Acquire handled above")
-                };
-                return match rx.try_recv() {
-                    Err(TryRecvError::Empty) => IoPoll::Pending,
-                    Ok(outcome) => {
-                        drop(phase_ref);
-                        DB_CONNECTIONS.with(|c| {
-                            c.borrow_mut()
-                                .insert(handle_for_poll.clone(), DbSlot::Available(outcome.conn))
-                        });
-                        // MANDATORY lost-wakeup guard: a sibling queued on this
-                        // same handle (still in `Acquire`) may have polled
-                        // Pending earlier in this scheduler sweep — without
-                        // this it would park until an unrelated wakeup.
-                        sema_core::notify_io_complete();
-                        match outcome.result {
-                            Ok(t) => IoPoll::Ready(Ok(decode(t))),
-                            Err(msg) => IoPoll::Ready(Err(msg)),
-                        }
-                    }
-                    Err(TryRecvError::Closed) => {
-                        drop(phase_ref);
-                        DB_CONNECTIONS.with(|c| {
-                            c.borrow_mut().insert(
-                                handle_for_poll.clone(),
-                                DbSlot::Tombstone(
-                                    "the query worker terminated unexpectedly".to_string(),
-                                ),
-                            )
-                        });
-                        IoPoll::Ready(Err(format!("{op_name}: query worker dropped")))
-                    }
-                };
-            }
-        }
-    };
-
-    let phase_for_abort = phase.clone();
-    let handle_for_abort = handle;
-    let io_handle = Rc::new(IoHandle::with_abort(poll, move || {
-        // Acquire-phase abort: no-op — nothing was ever checked out, the
-        // registry slot is exactly as another caller left it. Running-phase
-        // abort: best-effort — see `spawn_conn_op`'s doc comment.
-        if matches!(*phase_for_abort.borrow(), ConnPhase::Running(_)) {
-            DB_CONNECTIONS.with(|c| {
-                c.borrow_mut().insert(
-                    handle_for_abort.clone(),
-                    DbSlot::Tombstone(format!(
-                        "{op_name} was cancelled while in flight; the connection cannot be \
-                         reclaimed — db/close frees the handle"
-                    )),
-                );
+    decode: impl FnOnce(T) -> Value + 'static,
+) -> NativeResult {
+    let kind =
+        CompletionKind::try_from_raw(DB_COMPLETION_KIND).expect("db completion kind is nonzero");
+    let gate = DB_GATES.with(|g| g.borrow().get(&handle).copied());
+    let h_take = handle.clone();
+    let h_reinstall = handle.clone();
+    let h_tomb = handle.clone();
+    let h_store = handle;
+    checkout_external(CheckoutOp {
+        op_name,
+        kind,
+        gate,
+        store_gate: Box::new(move |id| {
+            DB_GATES.with(|g| {
+                g.borrow_mut().insert(h_store, id);
             });
-        }
-    }));
-    sema_core::set_yield_signal(sema_core::YieldReason::AwaitIo(io_handle));
-    Ok(Value::nil())
+        }),
+        take: Box::new(move || take_conn(op_name, &h_take)),
+        op: Box::new(op),
+        reinstall: Box::new(move |conn| {
+            DB_CONNECTIONS.with(|c| {
+                c.borrow_mut().insert(h_reinstall, DbSlot::Available(conn));
+            });
+        }),
+        decode: Box::new(move |t| Ok(decode(t))),
+        success_value: None,
+        tombstone: Rc::new(move |msg| {
+            DB_CONNECTIONS.with(|c| {
+                c.borrow_mut()
+                    .insert(h_tomb.clone(), DbSlot::Tombstone(msg));
+            });
+        }),
+        abort: None,
+    })
 }
 
 /// Run `sql` against `conn` with `params`, collecting every row into owned
@@ -416,7 +320,7 @@ fn tables_to_value(names: Vec<String>) -> Value {
 
 pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
     // (db/open path) or (db/open name path)
-    crate::register_fn_path_gated(
+    crate::register_runtime_fn_path_gated(
         env,
         sandbox,
         sema_core::Caps::FS_WRITE,
@@ -442,21 +346,26 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
                 _ => return Err(SemaError::arity("db/open", "1 or 2", args.len())),
             };
 
-            if in_async_context() || sema_core::in_runtime_quantum() {
-                let key_for_decode = key.clone();
-                return crate::io::fs_offload(
-                    move || {
-                        let conn = Connection::open(&path).map_err(|e| eval_msg("db/open", e))?;
-                        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")
-                            .map_err(|e| eval_msg("db/open", e))?;
-                        Ok(conn)
-                    },
-                    move |conn| {
+            if in_runtime_quantum() {
+                let kind = CompletionKind::try_from_raw(DB_COMPLETION_KIND)
+                    .expect("db completion kind is nonzero");
+                let key_for_decode = key;
+                return crate::runtime_offload::external_io_interruptible_try(
+                    "db/open",
+                    kind,
+                    "db/open",
+                    move |conn: Connection| {
                         DB_CONNECTIONS.with(|c| {
                             c.borrow_mut()
                                 .insert(key_for_decode.clone(), DbSlot::Available(conn))
                         });
-                        Value::string(&key_for_decode)
+                        Ok(Value::string(&key_for_decode))
+                    },
+                    move || async move {
+                        let conn = Connection::open(&path).map_err(|e| eval_msg("db/open", e))?;
+                        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")
+                            .map_err(|e| eval_msg("db/open", e))?;
+                        Ok(conn)
                     },
                 );
             }
@@ -466,16 +375,17 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
             conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")
                 .map_err(|e| SemaError::eval(format!("db/open: {e}")))?;
             DB_CONNECTIONS.with(|c| c.borrow_mut().insert(key.clone(), DbSlot::Available(conn)));
-            Ok(Value::string(&key))
+            Ok(NativeOutcome::Return(Value::string(&key)))
         },
     );
 
     // (db/open-memory) or (db/open-memory name)
-    crate::register_fn_gated(
+    crate::register_runtime_fn_path_gated(
         env,
         sandbox,
         sema_core::Caps::FS_WRITE,
         "db/open-memory",
+        &[],
         |args| {
             let name = if args.is_empty() {
                 ":memory:".to_string()
@@ -488,22 +398,27 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
                 return Err(SemaError::arity("db/open-memory", "0 or 1", args.len()));
             };
 
-            if in_async_context() || sema_core::in_runtime_quantum() {
-                let name_for_decode = name.clone();
-                return crate::io::fs_offload(
-                    move || {
+            if in_runtime_quantum() {
+                let kind = CompletionKind::try_from_raw(DB_COMPLETION_KIND)
+                    .expect("db completion kind is nonzero");
+                let name_for_decode = name;
+                return crate::runtime_offload::external_io_interruptible_try(
+                    "db/open-memory",
+                    kind,
+                    "db/open-memory",
+                    move |conn: Connection| {
+                        DB_CONNECTIONS.with(|c| {
+                            c.borrow_mut()
+                                .insert(name_for_decode.clone(), DbSlot::Available(conn))
+                        });
+                        Ok(Value::string(&name_for_decode))
+                    },
+                    move || async move {
                         let conn = Connection::open_in_memory()
                             .map_err(|e| eval_msg("db/open-memory", e))?;
                         conn.execute_batch("PRAGMA foreign_keys=ON;")
                             .map_err(|e| eval_msg("db/open-memory", e))?;
                         Ok(conn)
-                    },
-                    move |conn| {
-                        DB_CONNECTIONS.with(|c| {
-                            c.borrow_mut()
-                                .insert(name_for_decode.clone(), DbSlot::Available(conn))
-                        });
-                        Value::string(&name_for_decode)
                     },
                 );
             }
@@ -513,53 +428,62 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
             conn.execute_batch("PRAGMA foreign_keys=ON;")
                 .map_err(|e| SemaError::eval(format!("db/open-memory: {e}")))?;
             DB_CONNECTIONS.with(|c| c.borrow_mut().insert(name.clone(), DbSlot::Available(conn)));
-            Ok(Value::string(&name))
+            Ok(NativeOutcome::Return(Value::string(&name)))
         },
     );
 
     // (db/exec handle sql ...params) -> int (affected rows)
-    crate::register_fn_gated(env, sandbox, sema_core::Caps::FS_WRITE, "db/exec", |args| {
-        if args.len() < 2 {
-            return Err(SemaError::arity("db/exec", "2+", args.len()));
-        }
-        let handle = args[0]
-            .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?
-            .to_string();
-        let sql = args[1]
-            .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[1].type_name()))?
-            .to_string();
-        let params: Vec<SqlValue> = args[2..].iter().map(sema_to_sql).collect();
+    crate::register_runtime_fn_path_gated(
+        env,
+        sandbox,
+        sema_core::Caps::FS_WRITE,
+        "db/exec",
+        &[],
+        |args| {
+            if args.len() < 2 {
+                return Err(SemaError::arity("db/exec", "2+", args.len()));
+            }
+            let handle = args[0]
+                .as_str()
+                .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?
+                .to_string();
+            let sql = args[1]
+                .as_str()
+                .ok_or_else(|| SemaError::type_error("string", args[1].type_name()))?
+                .to_string();
+            let params: Vec<SqlValue> = args[2..].iter().map(sema_to_sql).collect();
 
-        if in_async_context() || sema_core::in_runtime_quantum() {
-            return checkout_offload(
-                "db/exec",
-                handle,
-                move |conn| {
-                    conn.execute(&sql, params_from_iter(params.iter()))
-                        .map(|n| n as i64)
-                        .map_err(|e| eval_msg("db/exec", e))
-                },
-                Value::int,
-            );
-        }
+            if in_runtime_quantum() {
+                return checkout_runtime(
+                    "db/exec",
+                    handle,
+                    move |conn| {
+                        conn.execute(&sql, params_from_iter(params.iter()))
+                            .map(|n| n as i64)
+                            .map_err(|e| eval_msg("db/exec", e))
+                    },
+                    Value::int,
+                );
+            }
 
-        with_conn("db/exec", &handle, |conn| {
-            conn.execute(&sql, params_from_iter(params.iter()))
-                .map(|n| Value::int(n as i64))
-                .map_err(|e| SemaError::eval(format!("db/exec: {e}")))
-        })
-    });
+            with_conn("db/exec", &handle, |conn| {
+                conn.execute(&sql, params_from_iter(params.iter()))
+                    .map(|n| Value::int(n as i64))
+                    .map_err(|e| SemaError::eval(format!("db/exec: {e}")))
+            })
+            .map(NativeOutcome::Return)
+        },
+    );
 
     // (db/exec-batch handle sql) -> nil (execute multiple statements)
     // STATIC SQL ONLY: no parameter binding — the string is run verbatim.
     // Never interpolate user-controlled input; use parameterized db/exec for that.
-    crate::register_fn_gated(
+    crate::register_runtime_fn_path_gated(
         env,
         sandbox,
         sema_core::Caps::FS_WRITE,
         "db/exec-batch",
+        &[],
         |args| {
             check_arity!(args, "db/exec-batch", 2);
             let handle = args[0]
@@ -571,8 +495,8 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
                 .ok_or_else(|| SemaError::type_error("string", args[1].type_name()))?
                 .to_string();
 
-            if in_async_context() || sema_core::in_runtime_quantum() {
-                return checkout_offload(
+            if in_runtime_quantum() {
+                return checkout_runtime(
                     "db/exec-batch",
                     handle,
                     move |conn| {
@@ -588,48 +512,58 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
                     .map(|()| Value::nil())
                     .map_err(|e| SemaError::eval(format!("db/exec-batch: {e}")))
             })
+            .map(NativeOutcome::Return)
         },
     );
 
     // (db/query handle sql ...params) -> list of maps
-    crate::register_fn_gated(env, sandbox, sema_core::Caps::FS_READ, "db/query", |args| {
-        if args.len() < 2 {
-            return Err(SemaError::arity("db/query", "2+", args.len()));
-        }
-        let handle = args[0]
-            .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?
-            .to_string();
-        let sql = args[1]
-            .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[1].type_name()))?
-            .to_string();
-        let params: Vec<SqlValue> = args[2..].iter().map(sema_to_sql).collect();
+    crate::register_runtime_fn_path_gated(
+        env,
+        sandbox,
+        sema_core::Caps::FS_READ,
+        "db/query",
+        &[],
+        |args| {
+            if args.len() < 2 {
+                return Err(SemaError::arity("db/query", "2+", args.len()));
+            }
+            let handle = args[0]
+                .as_str()
+                .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?
+                .to_string();
+            let sql = args[1]
+                .as_str()
+                .ok_or_else(|| SemaError::type_error("string", args[1].type_name()))?
+                .to_string();
+            let params: Vec<SqlValue> = args[2..].iter().map(sema_to_sql).collect();
 
-        if in_async_context() || sema_core::in_runtime_quantum() {
-            return checkout_offload(
-                "db/query",
-                handle,
-                move |conn| {
-                    collect_query_rows(conn, &sql, &params).map_err(|e| eval_msg("db/query", e))
-                },
-                rows_to_value,
-            );
-        }
+            if in_runtime_quantum() {
+                return checkout_runtime(
+                    "db/query",
+                    handle,
+                    move |conn| {
+                        collect_query_rows(conn, &sql, &params).map_err(|e| eval_msg("db/query", e))
+                    },
+                    rows_to_value,
+                );
+            }
 
-        with_conn("db/query", &handle, |conn| {
-            collect_query_rows(conn, &sql, &params)
-                .map(rows_to_value)
-                .map_err(|e| SemaError::eval(format!("db/query: {e}")))
-        })
-    });
+            with_conn("db/query", &handle, |conn| {
+                collect_query_rows(conn, &sql, &params)
+                    .map(rows_to_value)
+                    .map_err(|e| SemaError::eval(format!("db/query: {e}")))
+            })
+            .map(NativeOutcome::Return)
+        },
+    );
 
     // (db/query-one handle sql ...params) -> map or nil
-    crate::register_fn_gated(
+    crate::register_runtime_fn_path_gated(
         env,
         sandbox,
         sema_core::Caps::FS_READ,
         "db/query-one",
+        &[],
         |args| {
             if args.len() < 2 {
                 return Err(SemaError::arity("db/query-one", "2+", args.len()));
@@ -644,8 +578,8 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
                 .to_string();
             let params: Vec<SqlValue> = args[2..].iter().map(sema_to_sql).collect();
 
-            if in_async_context() || sema_core::in_runtime_quantum() {
-                return checkout_offload(
+            if in_runtime_quantum() {
+                return checkout_runtime(
                     "db/query-one",
                     handle,
                     move |conn| {
@@ -661,6 +595,7 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
                     .map(row_to_value)
                     .map_err(|e| SemaError::eval(format!("db/query-one: {e}")))
             })
+            .map(NativeOutcome::Return)
         },
     );
 
@@ -687,11 +622,12 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
     );
 
     // (db/tables handle) -> list of strings
-    crate::register_fn_gated(
+    crate::register_runtime_fn_path_gated(
         env,
         sandbox,
         sema_core::Caps::FS_READ,
         "db/tables",
+        &[],
         |args| {
             check_arity!(args, "db/tables", 1);
             let handle = args[0]
@@ -699,8 +635,8 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
                 .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?
                 .to_string();
 
-            if in_async_context() || sema_core::in_runtime_quantum() {
-                return checkout_offload(
+            if in_runtime_quantum() {
+                return checkout_runtime(
                     "db/tables",
                     handle,
                     move |conn| collect_tables(conn).map_err(|e| eval_msg("db/tables", e)),
@@ -713,6 +649,7 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
                     .map(tables_to_value)
                     .map_err(|e| SemaError::eval(format!("db/tables: {e}")))
             })
+            .map(NativeOutcome::Return)
         },
     );
 
@@ -721,7 +658,9 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
     // A handle checked out by an in-flight offload errors instead of racing
     // the background op for the same `Connection` (matches `proc/close`); a
     // missing or already-tombstoned handle is a silent no-op — `db/close`
-    // remains the documented way to free either.
+    // remains the documented way to free either. The handle's resource gate is
+    // dropped here too; when `db/close` succeeds the gate is idle (a busy gate
+    // means CheckedOut, which errors above), so no waiter can be stranded.
     crate::register_fn(env, "db/close", |args| {
         check_arity!(args, "db/close", 1);
         let handle = args[0]
@@ -733,7 +672,11 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
                 return Err(busy_err("db/close", handle));
             }
             conns.remove(handle);
-            Ok(Value::nil())
-        })
+            Ok(())
+        })?;
+        DB_GATES.with(|g| {
+            g.borrow_mut().remove(handle);
+        });
+        Ok(Value::nil())
     });
 }

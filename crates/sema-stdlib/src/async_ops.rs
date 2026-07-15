@@ -18,11 +18,23 @@ use crate::register_fn;
 /// `(round …)`, `(math/random)` and ordinary arithmetic routinely yield floats.
 fn duration_ms(value: &Value, who: &str) -> Result<i64, SemaError> {
     if let Some(i) = value.as_int() {
+        if i < 0 {
+            return Err(SemaError::eval(format!(
+                "{who}: duration must be non-negative"
+            )));
+        }
         Ok(i)
     } else if let Some(f) = value.as_float() {
         if !f.is_finite() {
             return Err(SemaError::eval(format!(
                 "{who}: duration must be a finite number"
+            )));
+        }
+        // Reject negatives BEFORE rounding: `round(-0.4)` is `-0.0`, so a
+        // rounded-then-checked path would silently accept a negative duration.
+        if f < 0.0 {
+            return Err(SemaError::eval(format!(
+                "{who}: duration must be non-negative"
             )));
         }
         Ok(f.round() as i64)
@@ -571,6 +583,10 @@ fn register_channel_ops(env: &Env) {
     // channel/new — create a bounded channel
     register_fn(env, "channel/new", |args| {
         check_arity!(args, "channel/new", 0..=1);
+        // An upper bound keeps an unrepresentable/allocation-impossible request
+        // (e.g. `i64::MAX`) from reaching `VecDeque::with_capacity`, which would
+        // panic on the capacity-overflow rather than returning a Sema condition.
+        const MAX_CHANNEL_CAPACITY: usize = 1 << 24; // ~16M slots
         let capacity = if args.is_empty() {
             1
         } else {
@@ -580,10 +596,21 @@ fn register_channel_ops(env: &Env) {
             if n <= 0 {
                 return Err(SemaError::eval("channel/new: capacity must be at least 1"));
             }
-            n as usize
+            let cap = n as usize;
+            if cap > MAX_CHANNEL_CAPACITY {
+                return Err(SemaError::eval(format!(
+                    "channel/new: capacity {n} exceeds maximum {MAX_CHANNEL_CAPACITY}"
+                ))
+                .with_hint("use a smaller bounded capacity"));
+            }
+            cap
         };
+        // Pre-reserve only a small prefix: the buffer is bounded by `capacity`
+        // via the send path, so a large declared capacity need not force an
+        // enormous up-front allocation.
+        let prealloc = capacity.min(4096);
         Ok(Value::channel(Channel {
-            buffer: RefCell::new(VecDeque::with_capacity(capacity)),
+            buffer: RefCell::new(VecDeque::with_capacity(prealloc)),
             capacity,
             closed: Cell::new(false),
         }))

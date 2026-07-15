@@ -29,17 +29,33 @@ never install a bounded quantum.
 
 ## `cargo test --workspace --no-fail-fast` — failing tests
 
-11 failing tests across 3 binaries. All other suites pass.
+8 failing tests across 3 binaries (down from 11 after the Task 04
+duration/capacity validation slice landed 3 GREEN). All other suites pass.
 
 | Test | Binary | Classification | Justification (file:line) |
 | --- | --- | --- | --- |
 | `async_all_failure_does_not_cancel_supplied_sibling` | `vm_async_test` | EXPECTED-RED (Task 03/04) | evidence `task-02.md` §Intentional RED baseline (task prompt list) |
 | `async_race_does_not_cancel_supplied_loser` | `vm_async_test` | EXPECTED-RED (Task 03/04) | evidence `task-02.md` §Intentional RED baseline |
 | `awaited_child_mutation_is_visible_to_parent` | `vm_async_test` | EXPECTED-RED (Task 03/04) | evidence `task-02.md` §Intentional RED baseline |
-| `channel_rejects_unrepresentable_capacity_without_panicking` | `vm_async_test` | EXPECTED-RED (Task 03/04) | evidence `task-02.md:95` (`capacity overflow`) |
 | `scheduler_workload_beyond_tick_ceiling_completes` | `vm_async_test` | EXPECTED-RED (Task 03/04) | evidence `task-02.md:96` |
-| `sleep_rejects_duration_negative_before_rounding` | `vm_async_test` | EXPECTED-RED (Task 03/04) | evidence `task-02.md:98` |
-| `timeout_rejects_duration_negative_before_rounding` | `vm_async_test` | EXPECTED-RED (Task 03/04) | evidence `task-02.md:100` |
+
+### Task 04 "Duration and capacity validation" — now GREEN
+
+The three duration/capacity validation tests moved from EXPECTED-RED to GREEN in
+the Task 04 slice (commit `202739e4`). They exercise the shared native parsing
+helpers, so both the legacy and runtime paths benefit.
+
+| Test | Binary | Classification | Fix |
+| --- | --- | --- | --- |
+| `sleep_rejects_duration_negative_before_rounding` | `vm_async_test` | GREEN (Task 04) | `duration_ms` rejects `f < 0.0` before rounding (`crates/sema-stdlib/src/async_ops.rs`) |
+| `timeout_rejects_duration_negative_before_rounding` | `vm_async_test` | GREEN (Task 04) | shared `duration_ms` negative-before-rounding guard |
+| `channel_rejects_unrepresentable_capacity_without_panicking` | `vm_async_test` | GREEN (Task 04) | `channel/new` bounds capacity by `MAX_CHANNEL_CAPACITY` before `VecDeque::with_capacity` |
+
+After this slice `cargo test -p sema-lang --test vm_async_test` reports
+`114 passed; 4 failed` (down from 7 failed). The remaining 4 (`async_all_failure_does_not_cancel_supplied_sibling`,
+`async_race_does_not_cancel_supplied_loser`, `awaited_child_mutation_is_visible_to_parent`,
+`scheduler_workload_beyond_tick_ceiling_completes`) stay EXPECTED-RED, owned by
+the runtime scheduling work.
 | `ready_spinner_does_not_starve_due_timer` | `unified_runtime_watchdog_test` | EXPECTED-RED (Task 03 fairness) | evidence `task-02.md:107`; main plan `2026-07-13-unified-cooperative-runtime.md:971` ("watchdog fairness remains Task 03") |
 | `no_adhoc_tokio_runtimes_outside_allowlist` | `runtime_conformance_test` | IN-PROGRESS TASK-03 DRIFT (see note) | not enumerated as RED; conformance target was 8/8 GREEN at Task 02 (`task-02.md:50`) |
 | `unified_runtime_inventory_mapping_covers_exact_current_matches` | `runtime_conformance_test` | IN-PROGRESS TASK-03 DRIFT (see note) | not enumerated as RED; GREEN at Task 02 (`task-02.md:50`) |

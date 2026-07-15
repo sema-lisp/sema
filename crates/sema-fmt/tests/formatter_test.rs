@@ -1319,3 +1319,165 @@ fn test_trailing_space_before_cr_in_string_preserved() {
         "space before CRLF inside string must be preserved, got {result:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Comment preservation in "distinguished first line" regions: a comment
+// between a form's head and the elements a layout would flatten onto the
+// first line must never be deleted.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_comment_after_cond_clause_test_kept() {
+    // Real-world case (sema-coder): comment after a clause's test.
+    let input = "(cond\n  ((nil? x) ;; EOF\n   (a)\n   (b))\n  (else 2))";
+    let result = fmt(input);
+    assert!(result.contains(";; EOF"), "comment deleted:\n{result}");
+    assert_eq!(fmt(&result), result, "should be idempotent");
+}
+
+#[test]
+fn test_comment_after_unknown_head_kept() {
+    // Real-world case (async-everything.sema): comment after a call head.
+    let input = "(async ; fast\n  (sleep 10)\n  (send ch))";
+    let result = fmt(input);
+    assert_eq!(result, "(async ; fast\n  (sleep 10)\n  (send ch))\n");
+}
+
+#[test]
+fn test_comment_positions_never_dropped() {
+    // One probe per specialized layout's first-line region.
+    let cases = [
+        "( ;; before-head\n foo bar baz-long-enough-to-not-fit-the-line-with-all-of-this-here)",
+        "(let ;; c\n  ((x 1))\n  (body))",
+        "(define x ;; c\n  (some-value))",
+        "(if ;; c\n  (pred?)\n  1\n  2)",
+        "(-> ;; c\n  x\n  (f)\n  (g))",
+        "(hash-map ;; c\n  :a 1\n  :b 2)",
+        "(hash-map :a 1 ;; note\n  :b 2)",
+        "(assoc m ;; c\n  :a 1)",
+        "'( ;; c\n a b)",
+    ];
+    for input in cases {
+        for (name, out) in [("fmt", fmt(input)), ("fmt_aligned", fmt_aligned(input))] {
+            assert_eq!(
+                input.matches(';').count(),
+                out.matches(';').count(),
+                "{name} dropped a comment for {input:?}:\n{out}"
+            );
+            assert!(
+                format_source(&out, &FormatOptions::default()).is_ok(),
+                "{name} output unparseable for {input:?}:\n{out}"
+            );
+        }
+    }
+}
+
+#[test]
+fn test_aligned_clause_with_inner_comment_falls_back() {
+    // The aligned cond path flattens clauses — a comment INSIDE one must
+    // force the fallback, not vanish.
+    let input = "(cond\n  ((= x 1) ;; one\n   \"one\")\n  ((= x 100) \"hundred\"))";
+    let result = fmt_aligned(input);
+    assert!(result.contains(";; one"), "comment deleted:\n{result}");
+}
+
+#[test]
+fn test_aligned_define_with_inner_comment_not_grouped() {
+    let input = "(define a 1)\n(define x ;; why\n  2)\n(define ccc 3)";
+    let result = fmt_aligned(input);
+    assert!(result.contains(";; why"), "comment deleted:\n{result}");
+    assert_eq!(fmt_aligned(&result), result, "should be idempotent");
+}
+
+// ---------------------------------------------------------------------------
+// --align idempotency and layout preservation
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_blank_line_after_unaligned_define_group_kept() {
+    // Equal-width defines don't align; the batch path must still terminate
+    // its last line before the following blank line is emitted.
+    let input = "(define a 1)\n(define b 2)\n\n(define (f x)\n  (g x))";
+    let result = fmt_aligned(input);
+    assert_eq!(
+        result,
+        "(define a 1)\n(define b 2)\n\n(define (f x)\n  (g x))\n"
+    );
+    assert_eq!(fmt_aligned(&result), result, "should be idempotent");
+}
+
+#[test]
+fn test_align_does_not_collapse_multiline_fn_define() {
+    // A function define with its body on its own line keeps that layout.
+    let input = "(define a 1)\n(define bb 2)\n(define (f x)\n  (g x))";
+    let result = fmt_aligned(input);
+    assert_eq!(
+        result,
+        "(define a   1)\n(define bb  2)\n(define (f x)\n  (g x))\n"
+    );
+    assert_eq!(fmt_aligned(&result), result, "should be idempotent");
+}
+
+#[test]
+fn test_align_joins_multiline_value_define_once() {
+    // format_body joins (define name value) onto one line when it fits, so
+    // alignment must treat it as eligible on the FIRST pass.
+    let input = "(define hub (channel/new 64))\n(define senders\n  (map f (range 1 201)))";
+    let result = fmt_aligned(input);
+    assert_eq!(
+        result,
+        "(define hub      (channel/new 64))\n(define senders  (map f (range 1 201)))\n"
+    );
+    assert_eq!(fmt_aligned(&result), result, "should be idempotent");
+}
+
+#[test]
+fn test_aligned_define_subruns_split_at_wide_member() {
+    // A member too wide for the shared column is formatted normally and
+    // splits the alignment run instead of failing the whole group.
+    let input = "(define (gen/int lo hi) (fn () (rand lo hi)))\n(define (gen/nat) (gen/int 0 1000))\n(define (gen/char) (fn () (very-long-call-that-makes-this-line-exceed-eighty-columns 32 126)))\n(define (gen/bool) (fn () (rand 0 1)))\n(define (g) (h))";
+    let result = fmt_aligned(input);
+    let second = fmt_aligned(&result);
+    assert_eq!(result, second, "sub-run alignment should be idempotent");
+    // The two defines before the wide member align with each other...
+    assert!(
+        result.contains("(define (gen/int lo hi)  (fn () (rand lo hi)))"),
+        "first sub-run not aligned:\n{result}"
+    );
+    // ...and the two after it align with each other.
+    assert!(
+        result.contains("(define (gen/bool)  (fn () (rand 0 1)))"),
+        "second sub-run not aligned:\n{result}"
+    );
+}
+
+#[test]
+fn test_def_family_aligns() {
+    // `def` is part of the define family.
+    let input = "(def x 1)\n(def longer 2)";
+    assert_eq!(fmt_aligned(input), "(def x       1)\n(def longer  2)\n");
+    let input2 = "(defn f (x) (+ x 1))\n(defn gg (x) (* x 2))";
+    assert_eq!(
+        fmt_aligned(input2),
+        "(defn f (x)   (+ x 1))\n(defn gg (x)  (* x 2))\n"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Robustness
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_deep_nesting_errors_gracefully() {
+    // Must return an error, not overflow the stack.
+    let deep = format!("{}1{}", "(list ".repeat(2000), ")".repeat(2000));
+    let err = format_source(&deep, &FormatOptions::default()).unwrap_err();
+    assert!(err.to_string().contains("nested too deeply"), "{err}");
+}
+
+#[test]
+fn test_moderately_deep_nesting_formats() {
+    let deep = format!("{}1{}", "(list ".repeat(100), ")".repeat(100));
+    let result = fmt(&deep);
+    assert_eq!(fmt(&result), result, "should be idempotent");
+}

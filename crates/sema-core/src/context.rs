@@ -178,10 +178,20 @@ impl EvalContext {
     /// migration of legacy callback re-entry, which replaces fresh-VM re-entry
     /// with a scheduler-native call and removes the need to suspend the flag.
     pub fn suspend_runtime_quantum(&self) -> QuantumSuspendGuard<'_> {
+        // Suspend BOTH flags `enter_runtime_quantum` set: the per-ctx flag (read
+        // by the VM `run` entry guard) AND the thread-local mirror (read by
+        // ctx-less yielding natives via `in_runtime_quantum` — `async/sleep`,
+        // `mcp/call`, the channel ops). A synchronous nested re-entry must see a
+        // FULLY suspended quantum: if only the ctx flag were cleared, a yielding
+        // native running on the nested VM would still observe the thread-local as
+        // active, surface a runtime yield, and crash the synchronous run with
+        // "async yield outside of scheduler context".
         QuantumSuspendGuard {
             ctx: self,
-            previous: self.runtime_quantum_active.replace(false),
+            previous_ctx: self.runtime_quantum_active.replace(false),
+            previous_thread_local: crate::in_runtime_quantum(),
         }
+        .with_thread_local_suspended()
     }
 
     pub fn take_task_context(&self) -> Option<TaskContextHandle> {
@@ -526,12 +536,21 @@ impl Drop for RuntimeQuantumGuard<'_> {
 /// the Task 04 `NativeOutcome::Call` migration (see `suspend_runtime_quantum`).
 pub struct QuantumSuspendGuard<'a> {
     ctx: &'a EvalContext,
-    previous: bool,
+    previous_ctx: bool,
+    previous_thread_local: bool,
+}
+
+impl QuantumSuspendGuard<'_> {
+    fn with_thread_local_suspended(self) -> Self {
+        crate::set_runtime_quantum(false);
+        self
+    }
 }
 
 impl Drop for QuantumSuspendGuard<'_> {
     fn drop(&mut self) {
-        self.ctx.runtime_quantum_active.set(self.previous);
+        self.ctx.runtime_quantum_active.set(self.previous_ctx);
+        crate::set_runtime_quantum(self.previous_thread_local);
     }
 }
 

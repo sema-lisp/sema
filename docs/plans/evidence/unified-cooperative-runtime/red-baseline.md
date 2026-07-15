@@ -309,3 +309,73 @@ Gap (B)'s executor is IN PLACE; the remaining blockers are:
 Until (1)–(3) land, `eval_str_compiled`/`common::eval` cannot flip, and even the
 primary `eval`/`eval_str` flip breaks the native agent loop. The `*_via_runtime`
 entry points remain available for incremental validation.
+
+## Task 03 Step 2 — PRIMARY eval flip: LANDED — MILESTONE (2026-07-15)
+
+All three blockers named in the prior revert are now closed on this branch
+(native agent-loop cooperative re-entry `e9c1a2b6`, deadlock detection `5791e45a`,
+stack-parity + bounded drop-join `3d91dee3`, executor sender-lifecycle
+`ac78f7ac`). Re-applied the **PRIMARY flip only** and it is GREEN — **KEPT.**
+
+**The unified cooperative runtime is now THE evaluator for `Interpreter::eval` /
+`eval_str`.**
+
+### The flip
+`eval_in_global` / `eval_str_in_global` (backing `Interpreter::eval` / `eval_str`)
+now call `run_exprs_via_runtime` instead of the legacy `run_exprs_on_vm`
+(`crates/sema-eval/src/eval.rs:387,392`). `eval_str_compiled` (backing
+`common::eval` / CLI `-e` / `vm_async_test`) deliberately stays on the legacy VM
+path — that flip + legacy-scheduler deletion is Task 08.
+
+### Two fixes needed to keep it green (both temporary bridges, deleted with Task 04)
+1. **`VM::execute` quantum-suspend** (`crates/sema-vm/src/vm.rs:1345`). `execute`
+   now wraps its `run` in `ctx.suspend_runtime_quantum()`. Nested SYNCHRONOUS
+   module-body eval for `import`/`load`/eval-callback (`eval_module_body_vm` /
+   `eval_value_vm`), fired from a native inside a root VM holding a quantum, was
+   rejected by the legacy-VM-entry guard → **18** import/load/module/eval-special-
+   form integration_test failures. At the top level (no active quantum) it is a
+   no-op. Fixed → integration_test 1055/0.
+2. **`suspend_runtime_quantum` must suspend BOTH quantum flags**
+   (`crates/sema-core/src/context.rs`). `enter_runtime_quantum` sets the per-ctx
+   `runtime_quantum_active` flag AND the thread-local `IN_RUNTIME_QUANTUM` mirror
+   (read by ctx-less yielding natives via `in_runtime_quantum` — `mcp/call`,
+   `async/*`). The suspend guard only cleared the ctx flag, so a nested
+   synchronous re-entry (a `defworkflow` body thunk run via `call_function`) still
+   saw `in_runtime_quantum() == true`, made `mcp/call` surface a runtime yield
+   into a synchronous run, and crashed with "async yield outside of scheduler
+   context" → regressed `workflow_mcp_e2e_test` (2) + `workflow_mcp_interactive_test`
+   (2). Now the guard saves/restores both. Fixed → both suites 5/0; sema-core
+   319/0 confirms no legacy-path regression.
+
+### Verified (final KEPT state — verbatim `test result:` lines)
+- eval_test **1072 passed; 0 failed**
+- integration_test **1055 passed; 0 failed** (5 ignored)
+- mcp_builtin_test **6/0**, mcp_runtime_test **2/0**, mcp_async_test **8/0**
+- embedding_api_test **14/0**, llm_fake_test **29/0**, agent_async_test **7/0**
+- workflow_cookbook_test **6/0**, workflow_mcp_e2e_test **5/0**,
+  workflow_mcp_interactive_test **5/0**, stream_async_test **10/0**,
+  http_concurrent_test **3/0**
+- leak_test **7/0**, gc_stress_test **48/0** (drop safety — no hang/leak/abort)
+- sema-eval **117/0**, sema-vm **486/0**, sema-core **319/0**
+- `cargo check --workspace --tests` exit 0; clippy `--workspace --tests -D
+  warnings` clean (only the pre-existing proc-macro-error2 note); fmt clean.
+
+### UNCHANGED baseline RED (all on the legacy/unflipped path — NOT touched by the flip)
+- vm_async_test **114 passed; 4 failed** — the same 4 `eval_str_compiled` cases
+  (`async_all_failure_does_not_cancel_supplied_sibling`,
+  `async_race_does_not_cancel_supplied_loser`,
+  `awaited_child_mutation_is_visible_to_parent`,
+  `scheduler_workload_beyond_tick_ceiling_completes`).
+- runtime_conformance_test **5/3** + unified_runtime_watchdog_test **3/1** —
+  pre-existing Task-03 gate drift (documented above).
+- sema-lsp lib `builtin_doc_coverage` **212/1** — pre-existing, confirmed RED on
+  the pristine baseline (verified by stashing the flip); unrelated to eval.
+
+### What remains to flip `eval_str_compiled` too + delete the legacy scheduler (Task 08)
+The residual synchronous native re-entry loops still rely on the legacy
+thread-local scheduler (`init_scheduler` in `run_exprs_on_vm`). To finish:
+(a) migrate those remaining loops onto the runtime; (b) delete
+`init_scheduler`/the legacy `SCHEDULER` TLS and route `run_exprs_on_vm` (i.e.
+`eval_str_compiled`) through `run_exprs_via_runtime`; (c) re-baseline the 4
+`vm_async_test` RED + `runtime_conformance`/`watchdog` drift against the unified
+runtime. The two temporary bridges above are deleted at that point.

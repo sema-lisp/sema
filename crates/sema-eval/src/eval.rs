@@ -384,18 +384,26 @@ impl Interpreter {
     }
 
     /// Evaluate in the global environment so that `define` persists across calls.
+    ///
+    /// PRIMARY eval flip (Task 03 Step 2): routes through the unified cooperative
+    /// runtime (`run_exprs_via_runtime`) — the interpreter's single persistent
+    /// runtime IS the evaluator for `Interpreter::eval`. `eval_str_compiled`
+    /// (backing `common::eval` / CLI `-e`) stays on the legacy VM path.
     pub fn eval_in_global(&self, expr: &Value) -> EvalResult {
-        self.run_exprs_on_vm(std::slice::from_ref(expr), &self.global_env)
+        self.run_exprs_via_runtime(std::slice::from_ref(expr))
     }
 
     /// Parse and evaluate in the global environment so that `define` persists across calls.
+    ///
+    /// PRIMARY eval flip (Task 03 Step 2): routes through the unified cooperative
+    /// runtime — see [`eval_in_global`](Self::eval_in_global).
     pub fn eval_str_in_global(&self, input: &str) -> EvalResult {
         let (exprs, spans) = sema_reader::read_many_with_spans(input)?;
         self.ctx.merge_span_table(spans);
         if exprs.is_empty() {
             return Ok(Value::nil());
         }
-        self.run_exprs_on_vm(&exprs, &self.global_env)
+        self.run_exprs_via_runtime(&exprs)
     }
 
     /// Parse, compile to bytecode, and execute via the VM (global env, persists).

@@ -1340,6 +1340,18 @@ impl VM {
             base,
             open_upvalues: None,
         });
+        // TEMPORARY BRIDGE: `execute` is the SYNCHRONOUS whole-program entry —
+        // it is used both at the top level (no active quantum) and, crucially,
+        // for nested module-body evaluation (`eval_module_body_vm` /
+        // `eval_value_vm` for `import` / `load` / eval-callback re-entry) fired
+        // from a native running *inside* a root VM that holds an active runtime
+        // quantum. That nested run is synchronous (module bodies do not
+        // yield/await/spawn to the scheduler), so suspend the quantum flag for
+        // the duration of `run` so the entry guard doesn't reject it. At the top
+        // level there is no active quantum and this is a no-op. Deleted with the
+        // Task 04 migration of legacy synchronous re-entry to
+        // `NativeOutcome::Call` (see `EvalContext::suspend_runtime_quantum`).
+        let _q = ctx.suspend_runtime_quantum();
         self.run(ctx)
     }
 

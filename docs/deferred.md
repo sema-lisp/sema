@@ -575,3 +575,77 @@ the drain stays, documented here, to preserve runtime liveness. The code comment
 cooperative stepping (`crates/sema-dap`, `crates/sema-wasm`) still call
 `init_scheduler` + `VM::execute`. This is a known deferral to address when a
 runtime debug/step API exists; SYNC debugging is unaffected by the eval flip.
+
+### F2-RESIDUAL — external I/O still on the AwaitIo bridge (needs new runtime primitives)
+
+**Found 2026-07-15, Step F2.** The one-shot request/response I/O ops (file, http, git,
+shell, sleep) are migrated to the canonical `WaitKind::External` on the ThreadPoolExecutor.
+The remaining I/O subsystems still offload via the legacy `YieldReason::AwaitIo(IoHandle)`
+thread-local (a VM-thread-polled tokio handle), because they do NOT fit the plan's one-shot
+`WaitKind::External` primitive. Their async branch was re-gated to fire under the runtime
+quantum (`in_async_context() || in_runtime_quantum()`), so async overlap works correctly under
+the unified runtime today — only the *transport* is still the AwaitIo bridge. Three sub-gaps,
+each needing a runtime primitive the plan does not define:
+
+- **F2-RESIDUAL-1 (stateful checkout ops): proc, sqlite, kv, serial.** These keep a
+  thread-local resource registry (`PROCS`/`DB_CONNECTIONS`/`PORTS`, non-`Send`) with a
+  per-handle **checkout + Acquire-queue** (an async wait-for-availability under contention).
+  `WaitKind::External` has no per-handle-availability primitive; dropping the queue would
+  regress concurrent same-handle serialization. Needs a per-handle async mutex/availability
+  wait, or a retry-in-continuation (a `NativeContinuation` may itself return `Suspend`).
+- **F2-RESIDUAL-2 (streaming ops): ws, pty, stream.** Persistent connections / repeated reads
+  with backpressure. A single `Result<T, String>` completion does not model a stream; needs a
+  streaming External-wait shape (or per-read one-shot suspensions over an `Arc<Mutex<conn>>`).
+- **F2-RESIDUAL-3 (sema-llm real-network + the executor async tier):** the executor's
+  `ExecutorDispatch::Async` arm is reactor-less (sema-vm carries no tokio runtime by design), so
+  `PreparedExternalOperation::interruptible_async` panics on a real future. The migrated ops use
+  `interruptible_blocking` + `sema_io::io_block_on` (one worker per in-flight op — a concurrency
+  ceiling). sema-llm's existing `interruptible_async` path has the SAME latent bug (only ever run
+  with the keyless `FakeProvider`). Foundation fix: teach the Async tier to spawn on the shared
+  io runtime (`io_spawn`) with drop-on-cancel; then all async I/O gets full concurrency + the true
+  interruptible-async abort, and `runtime_offload` gains an `external_io_async` variant.
+
+Until these land, `AwaitIo`/`IoHandle`/`poll_io_waits`/`io_park`/`notify_io_complete` and the
+`run_exprs_via_runtime` `legacy_io_wakeup` arm stay — they are the runtime's I/O-offload
+transport for the residual ops, driven by the runtime (NOT the legacy scheduler).
+
+### ASYNC-TIMEOUT-CANCEL-1 — `async/timeout` does not promptly abort a spawned child's running External job
+
+**Found 2026-07-15.** `(async/timeout ms (async/spawn thunk))` where the thunk runs an External
+I/O op: the timeout fires and returns the `:timeout` condition, but the child's in-flight
+executor job's cancel/abort hook runs only at runtime-shutdown drain (and a one-shot `-e` leaks
+the child by exiting first). The abort MECHANISM is correct — explicit `(async/cancel p)`
+promptly reaps the child (killpg/AbortHandle fires within ~50ms) — the gap is that a SIBLING
+timeout's cancellation is not delivered to the External-parked task promptly. This is inherent
+to how the runtime delivers cancellation to a task parked on an External/IO wait (the legacy
+AwaitIo path had the same `cancellation.is_some()` precondition); it is not introduced by the
+F2 conversion. Fix: deliver a task's cancellation to its registered External/IO wait's
+abort hook promptly when the task is cancelled by a sibling, not only at drain.
+
+### LEGACY-SCHEDULER retained (scheduler.rs, LegacyPromise/LegacyChannel, IN_ASYNC_CONTEXT, VmExecResult::AsyncYield)
+
+The full purge in the plan's Step H is BLOCKED by the two deferrals above. `scheduler.rs` is the
+DEBUG backend (see the DAP/wasm note) and consumes the `LegacyPromise`/`LegacyChannel`
+completion cells; `IN_ASYNC_CONTEXT`, `VmExecResult::AsyncYield`, `take_yield_signal`, and the
+`YieldReason` channel/IO variants remain the transport for the residual AwaitIo I/O
+(F2-RESIDUAL). What IS fully deleted and guarded against reintroduction (see the static-scan
+test): the thread-local suspension transport for LANGUAGE async —
+`YieldReason::NativeYield`, `PENDING_NATIVE_OUTCOME`, `set/take_pending_native_outcome`, the
+ad-hoc `spawned_promises`/`promise_waits`/`channel_bridge` stores, and the runtime's
+consumption of the promise/channel `YieldReason` variants (now structural `NativeOutcome`).
+Promises, channels, and cooperative HOFs go 100% through the canonical registries + the
+structural ABI with no thread-local suspension hop.
+
+**Inventory reconciliation deferred.** `runtime_conformance_test`'s
+`unified_runtime_inventory_mapping_covers_exact_current_matches` (mapping in
+`docs/plans/evidence/unified-cooperative-runtime/runtime-match-map.tsv`) was already RED at
+this session's baseline (migration-in-progress drift; GREEN at Task 02). The migration moved
+~1000 legacy-runtime code sites (line shifts + the LegacyPromise/LegacyChannel split + the
+NativeYield/spawned_promises deletions), so the per-site disposition mapping no longer matches
+the current source and needs a dedicated review pass to re-classify every drifted entry. The
+other two conformance guards ARE reconciled and green: `unified_runtime_legacy_symbols_match_
+baseline` (baseline regenerated to the post-migration surface — confirms NativeYield/
+PENDING_NATIVE_OUTCOME/spawned_promises/channel_bridge are gone and LegacyPromise/LegacyChannel
+are the only new legacy cells) and `no_adhoc_tokio_runtimes_outside_allowlist` (the
+interpreter's cooperative `Runtime::new` is allowlisted; in-src `tests.rs` modules are exempt
+like `tests/**`).

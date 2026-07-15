@@ -66,6 +66,13 @@ const ALLOWLIST: &[(&str, usize, &str)] = &[
         2,
         "in-file #[cfg(test)] fixtures asserting inside-runtime behavior",
     ),
+    (
+        "sema-eval/src/eval.rs",
+        1,
+        "the interpreter's persistent cooperative unified Runtime \
+         (sema_vm::runtime::Runtime), NOT a tokio runtime — this is the canonical \
+         async engine the unified-runtime migration is built on",
+    ),
 ];
 
 /// Strip `//` line comments, tracking double-quote string state per line so a
@@ -140,6 +147,12 @@ fn no_adhoc_tokio_runtimes_outside_allowlist() {
             .unwrap_or(file)
             .to_string_lossy()
             .replace('\\', "/");
+        // Test code is exempt (same as the `crates/*/tests/**` exemption): an
+        // in-src `#[cfg(test)] mod tests` lives in `tests.rs` and legitimately
+        // constructs the cooperative `Runtime` (and tokio fixtures) many times.
+        if rel.ends_with("tests.rs") {
+            continue;
+        }
         let Ok(src) = fs::read_to_string(file) else {
             continue;
         };

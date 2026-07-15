@@ -691,7 +691,7 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
         let text = args[1]
             .as_str()
             .ok_or_else(|| SemaError::type_error("string", args[1].type_name()))?;
-        if in_async_context() {
+        if in_async_context() || sema_core::in_runtime_quantum() {
             return proc_write_stdin_async(id, text.as_bytes().to_vec());
         }
         with_proc("proc/write-stdin", id, |pr| match pr.stdin.as_mut() {
@@ -729,7 +729,7 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
     crate::register_fn_gated(env, sandbox, Caps::PROCESS, "proc/wait", |args| {
         check_arity!(args, "proc/wait", 1);
         let id = handle(args, 0)?;
-        if in_async_context() {
+        if in_async_context() || sema_core::in_runtime_quantum() {
             return proc_wait_async(id);
         }
         let mut pr = PROCS.with(|p| {
@@ -809,7 +809,7 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
     crate::register_fn_gated(env, sandbox, Caps::PROCESS, "proc/close", |args| {
         check_arity!(args, "proc/close", 1);
         let id = handle(args, 0)?;
-        if in_async_context() {
+        if in_async_context() || sema_core::in_runtime_quantum() {
             return proc_close_async(id);
         }
         PROCS.with(|p| {

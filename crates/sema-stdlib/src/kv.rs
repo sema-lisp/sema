@@ -361,7 +361,7 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
                 .ok_or_else(|| SemaError::type_error("string", args[1].type_name()))?
                 .to_string();
 
-            if in_async_context() {
+            if in_async_context() || sema_core::in_runtime_quantum() {
                 let path_for_read = path.clone();
                 let path_for_store = path.clone();
                 let name_for_decode = name.clone();
@@ -429,7 +429,7 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
             .to_string();
         let val = sema_core::value_to_json_lossy(&args[2]);
 
-        if in_async_context() {
+        if in_async_context() || sema_core::in_runtime_quantum() {
             let ret_val = args[2].clone();
             return checkout_flush(
                 "kv/set",
@@ -464,7 +464,7 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
                 .ok_or_else(|| SemaError::type_error("string", args[1].type_name()))?
                 .to_string();
 
-            if in_async_context() {
+            if in_async_context() || sema_core::in_runtime_quantum() {
                 return checkout_flush(
                     "kv/delete",
                     name,

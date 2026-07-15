@@ -407,7 +407,7 @@ fn ws_connect(url: &str, opts: ConnectOpts) -> Result<Value, SemaError> {
         evt_rx: Rc::new(RefCell::new(evt_rx)),
     });
 
-    if sema_core::in_async_context() {
+    if sema_core::in_async_context() || sema_core::in_runtime_quantum() {
         // Park until the handshake completes; the pump's per-event notify wakes us.
         let conn_for_poll = conn_val.clone();
         let handle = Rc::new(IoHandle::with_abort(
@@ -473,7 +473,7 @@ fn ws_recv(args: &[Value]) -> Result<Value, SemaError> {
     let sb = ws_conn(args, "ws/recv", 0)?;
     let (_, evt_rx) = handles_of(&sb);
 
-    if sema_core::in_async_context() {
+    if sema_core::in_async_context() || sema_core::in_runtime_quantum() {
         if let Some(v) = sema_core::take_resume_value() {
             return Ok(v);
         }
@@ -523,7 +523,7 @@ fn ws_recv_timeout(args: &[Value]) -> Result<Value, SemaError> {
         .max(0) as u64;
     let (_, evt_rx) = handles_of(&sb);
 
-    if sema_core::in_async_context() {
+    if sema_core::in_async_context() || sema_core::in_runtime_quantum() {
         if let Some(v) = sema_core::take_resume_value() {
             return Ok(v);
         }

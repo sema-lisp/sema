@@ -442,7 +442,7 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
                 _ => return Err(SemaError::arity("db/open", "1 or 2", args.len())),
             };
 
-            if in_async_context() {
+            if in_async_context() || sema_core::in_runtime_quantum() {
                 let key_for_decode = key.clone();
                 return crate::io::fs_offload(
                     move || {
@@ -488,7 +488,7 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
                 return Err(SemaError::arity("db/open-memory", "0 or 1", args.len()));
             };
 
-            if in_async_context() {
+            if in_async_context() || sema_core::in_runtime_quantum() {
                 let name_for_decode = name.clone();
                 return crate::io::fs_offload(
                     move || {
@@ -532,7 +532,7 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
             .to_string();
         let params: Vec<SqlValue> = args[2..].iter().map(sema_to_sql).collect();
 
-        if in_async_context() {
+        if in_async_context() || sema_core::in_runtime_quantum() {
             return checkout_offload(
                 "db/exec",
                 handle,
@@ -571,7 +571,7 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
                 .ok_or_else(|| SemaError::type_error("string", args[1].type_name()))?
                 .to_string();
 
-            if in_async_context() {
+            if in_async_context() || sema_core::in_runtime_quantum() {
                 return checkout_offload(
                     "db/exec-batch",
                     handle,
@@ -606,7 +606,7 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
             .to_string();
         let params: Vec<SqlValue> = args[2..].iter().map(sema_to_sql).collect();
 
-        if in_async_context() {
+        if in_async_context() || sema_core::in_runtime_quantum() {
             return checkout_offload(
                 "db/query",
                 handle,
@@ -644,7 +644,7 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
                 .to_string();
             let params: Vec<SqlValue> = args[2..].iter().map(sema_to_sql).collect();
 
-            if in_async_context() {
+            if in_async_context() || sema_core::in_runtime_quantum() {
                 return checkout_offload(
                     "db/query-one",
                     handle,
@@ -699,7 +699,7 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
                 .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?
                 .to_string();
 
-            if in_async_context() {
+            if in_async_context() || sema_core::in_runtime_quantum() {
                 return checkout_offload(
                     "db/tables",
                     handle,

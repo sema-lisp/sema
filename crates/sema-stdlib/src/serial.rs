@@ -346,7 +346,7 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
             2000
         };
 
-        if in_async_context() {
+        if in_async_context() || sema_core::in_runtime_quantum() {
             let path_for_open = path.clone();
             return crate::io::fs_offload(
                 move || {
@@ -430,7 +430,7 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
             .ok_or_else(|| SemaError::type_error("string", args[1].type_name()))?
             .to_string();
 
-        if in_async_context() {
+        if in_async_context() || sema_core::in_runtime_quantum() {
             return checkout_offload(
                 "serial/write",
                 handle,
@@ -464,7 +464,7 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
             .ok_or_else(|| SemaError::type_error("int", args[0].type_name()))?
             as u64;
 
-        if in_async_context() {
+        if in_async_context() || sema_core::in_runtime_quantum() {
             return checkout_offload(
                 "serial/read-line",
                 handle,
@@ -508,7 +508,7 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
             .ok_or_else(|| SemaError::type_error("string", args[1].type_name()))?
             .to_string();
 
-        if in_async_context() {
+        if in_async_context() || sema_core::in_runtime_quantum() {
             return checkout_offload(
                 "serial/send",
                 handle,

@@ -618,7 +618,7 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
         let text = args[1]
             .as_str()
             .ok_or_else(|| SemaError::type_error("string", args[1].type_name()))?;
-        if in_async_context() {
+        if in_async_context() || sema_core::in_runtime_quantum() {
             return pty_write_async(id, text.as_bytes().to_vec());
         }
         with_pty("pty/write", id, |pt| {
@@ -660,7 +660,7 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
     crate::register_fn_gated(env, sandbox, Caps::PROCESS, "pty/wait", |args| {
         check_arity!(args, "pty/wait", 1);
         let id = handle(args, 0)?;
-        if in_async_context() {
+        if in_async_context() || sema_core::in_runtime_quantum() {
             return pty_wait_async(id);
         }
         let mut pt = PTYS.with(|p| {
@@ -727,7 +727,7 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
     crate::register_fn_gated(env, sandbox, Caps::PROCESS, "pty/close", |args| {
         check_arity!(args, "pty/close", 1);
         let id = handle(args, 0)?;
-        if in_async_context() {
+        if in_async_context() || sema_core::in_runtime_quantum() {
             return pty_close_async(id);
         }
         PTYS.with(|p| {

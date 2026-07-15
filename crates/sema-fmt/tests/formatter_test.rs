@@ -1691,9 +1691,8 @@ fn test_special_forms_all_idempotent_and_comment_safe() {
 }
 
 #[test]
-fn test_bytevector_grid_right_aligned() {
-    // A multi-line #u8 literal fills each line to the width, every byte
-    // right-aligned in a uniform column (hexdump-style).
+fn test_bytevector_wraps_at_width() {
+    // A single-line literal too long for the width wraps greedily.
     let input = format!(
         "#u8({})",
         (0..32).map(|i| i.to_string()).collect::<Vec<_>>().join(" ")
@@ -1701,25 +1700,19 @@ fn test_bytevector_grid_right_aligned() {
     let result = fmt(&input);
     assert_eq!(
         result,
-        "#u8( 0  1  2  3  4  5  6  7  8  9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24\n    25 26 27 28 29 30 31)\n"
+        "#u8(0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28\n    29 30 31)\n"
     );
-    assert_eq!(fmt(&result), result, "grid should be idempotent");
+    assert_eq!(fmt(&result), result, "wrapping should be idempotent");
 }
 
 #[test]
-fn test_bytevector_grid_nested_indent() {
-    let input = format!(
-        "(define header #u8({}))",
-        (0..40)
-            .map(|i| ((i * 7) % 256).to_string())
-            .collect::<Vec<_>>()
-            .join(" ")
-    );
-    let result = fmt(&input);
-    // Column width follows the widest byte (3 digits) at the nested indent.
-    assert!(
-        result.contains("  #u8(  0   7  14"),
-        "expected right-aligned 3-wide columns:\n{result}"
+fn test_bytevector_preserves_user_rows() {
+    // A hand-arranged grid keeps its row structure; spacing is normalized.
+    let input = "#u8( 1  2  3  4\n     5  6  7  8\n     9 10 11 12\n    13 14 15 16)";
+    let result = fmt(input);
+    assert_eq!(
+        result,
+        "#u8(1 2 3 4\n    5 6 7 8\n    9 10 11 12\n    13 14 15 16)\n"
     );
     assert_eq!(fmt(&result), result, "should be idempotent");
 }

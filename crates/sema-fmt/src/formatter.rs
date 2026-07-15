@@ -1583,8 +1583,9 @@ impl Formatter {
             }
         }
 
-        // Multi-line bytevector: hexdump-style grid — as many bytes per line
-        // as fit the width, each right-aligned in a uniform column.
+        // Multi-line bytevector: preserve the user's own row breaks (a
+        // hand-arranged grid is often meaningful); wrap at the width only
+        // when the formatter itself has to break a single-line literal.
         let elem_indent = indent + open.len();
         if open == "#u8("
             && !has_comments
@@ -1592,7 +1593,14 @@ impl Formatter {
                 .iter()
                 .all(|n| matches!(n, Node::Atom(_) | Node::StringAtom(_)))
         {
-            self.format_byte_grid(&semantic, elem_indent, open, close);
+            self.format_byte_rows(
+                children,
+                &semantic,
+                elem_indent,
+                open,
+                close,
+                originally_multiline,
+            );
             return;
         }
 
@@ -1629,30 +1637,60 @@ impl Formatter {
         self.output.push_str(close);
     }
 
-    /// Grid layout for a multi-line `#u8(...)` literal: fill each line to the
-    /// configured width, right-aligning every byte in a uniform column (width
-    /// of the widest element) so the values line up hexdump-style.
-    fn format_byte_grid(&mut self, semantic: &[&Node], indent: usize, open: &str, close: &str) {
-        let cells: Vec<String> = semantic.iter().map(|n| node_to_flat_string(n)).collect();
-        let cell_width = cells.iter().map(|c| display_width(c)).max().unwrap_or(1);
-        // line length = indent + n*cell_width + (n-1) separators (+ close on
-        // the last line); keep at least one cell per line
-        let per_line =
-            ((self.width + 1).saturating_sub(indent + close.len()) / (cell_width + 1)).max(1);
-
-        self.output.push_str(open);
-        for (idx, cell) in cells.iter().enumerate() {
-            if idx > 0 {
-                if idx % per_line == 0 {
-                    self.output.push('\n');
-                    self.push_indent(indent);
-                } else {
-                    self.output.push(' ');
+    /// Multi-line `#u8(...)` layout. Rows the user wrote are preserved with
+    /// spacing normalized (single spaces between bytes) — a hand-arranged
+    /// grid, e.g. 4×4, keeps its shape. A literal the formatter itself must
+    /// break (single-line but over the width) wraps greedily at the width.
+    fn format_byte_rows(
+        &mut self,
+        children: &[Node],
+        semantic: &[&Node],
+        indent: usize,
+        open: &str,
+        close: &str,
+        originally_multiline: bool,
+    ) {
+        let mut rows: Vec<Vec<String>> = vec![Vec::new()];
+        if originally_multiline {
+            // Preserve the user's row breaks
+            for child in children {
+                match child {
+                    Node::Newline => {
+                        if !rows.last().is_some_and(|r| r.is_empty()) {
+                            rows.push(Vec::new());
+                        }
+                    }
+                    _ if is_trivia(child) => {}
+                    n => rows.last_mut().unwrap().push(node_to_flat_string(n)),
                 }
             }
-            self.output
-                .extend(std::iter::repeat_n(' ', cell_width - display_width(cell)));
-            self.output.push_str(cell);
+        } else {
+            // Greedy wrap: as many bytes per line as fit the width
+            let mut col = indent;
+            for n in semantic {
+                let cell = node_to_flat_string(n);
+                let w = display_width(&cell);
+                if !rows.last().is_some_and(|r| r.is_empty()) && col + 1 + w > self.width {
+                    rows.push(Vec::new());
+                    col = indent;
+                }
+                let row = rows.last_mut().unwrap();
+                if !row.is_empty() {
+                    col += 1;
+                }
+                col += w;
+                row.push(cell);
+            }
+        }
+        rows.retain(|r| !r.is_empty());
+
+        self.output.push_str(open);
+        for (i, row) in rows.iter().enumerate() {
+            if i > 0 {
+                self.output.push('\n');
+                self.push_indent(indent);
+            }
+            self.output.push_str(&row.join(" "));
         }
         self.output.push_str(close);
     }

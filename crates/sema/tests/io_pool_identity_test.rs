@@ -2,15 +2,16 @@
 //!
 //! Drives every offload kind — async http + shell (the `io_spawn` tier), async
 //! `llm/complete` via FakeProvider (the `io_spawn_blocking` tier), sync
-//! `llm/complete`, and sync `http/get` (the `io_block_on` tier) — then asserts
-//! they were all served by THE one `sema-io` pool:
+//! `llm/complete`, and a direct `io_block_on` closure (the `io_block_on` tier) —
+//! then asserts they were all served by THE one `sema-io` pool:
 //!
 //! - `sema_io::pools_built() == 1`: the pool builder ran exactly once for the
 //!   whole battery (a second builder path sneaking into sema-io would trip it).
-//! - `sema_io::block_on_ops()` advanced across the sync http call: the
-//!   `block_on` tier drives futures ON THE CALLING THREAD (pool thread names
-//!   can never observe it — empirical probe d), so the oracle counts seam
-//!   entries instead.
+//! - `sema_io::block_on_ops()` advanced across a `block_on` call: the tier
+//!   drives futures ON THE CALLING THREAD (pool thread names can never observe
+//!   it), so the oracle counts seam entries instead. (http's runtime path moved
+//!   to the reactor-native `io_spawn` async tier, so http no longer probes this
+//!   tier — a direct closure does.)
 //! - Direct `io_spawn` / `io_spawn_blocking` probes (closures we control)
 //!   observe their work running on a `sema-io-*`-named thread — proving the
 //!   spawn tiers actually land on the named pool.
@@ -129,20 +130,24 @@ fn one_pool_serves_every_offload_kind() {
         .expect("sync llm/complete");
     assert_eq!(v.as_str(), Some("sync-echo"));
 
-    // ── sync http/get: the io_block_on tier. Thread names cannot observe
-    //    block_on (it drives on the calling thread), so assert the seam
-    //    counter advanced instead. ───────────────────────────────────────────
+    // ── block_on tier probe (a closure we control): the seam drives the future
+    //    ON THE CALLING THREAD using the pool's reactor, so thread names can
+    //    never observe it — assert the seam counter advanced AND the future's
+    //    reactor-dependent timer actually fired (proving THE pool supplied the
+    //    reactor). This tier is exercised by ops that cannot run reactor-native
+    //    (git offloads, sync LLM providers, the top-level http fallback); http's
+    //    runtime path now uses the io_spawn async tier instead. ────────────────
     let ops_before = sema_io::block_on_ops();
-    let v = interp
-        .eval_str_compiled(&format!(
-            r#"(:status (http/get "http://127.0.0.1:{port}/"))"#
-        ))
-        .expect("sync http/get");
-    assert_eq!(v.as_int(), Some(200));
+    sema_io::io_block_on(async {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    });
     assert!(
         sema_io::block_on_ops() > ops_before,
-        "sync http/get must enter the seam's block_on tier (ops stayed at {ops_before})"
+        "block_on tier must advance the seam counter (stayed at {ops_before})"
     );
+    // The http fixture is still driven above (async tier); keep it warm so the
+    // port variable is used and the server stays referenced.
+    let _ = port;
 
     // ── identity: exactly ONE pool served all of the above ─────────────────
     assert_eq!(

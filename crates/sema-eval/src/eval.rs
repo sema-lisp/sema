@@ -84,13 +84,19 @@ use sema_vm::runtime::Runtime;
 /// this is infallible — a failure would mean the wait-runtime could not allocate
 /// identity, which only happens under a corrupt/exhausted global counter.
 fn build_runtime(ctx: &Rc<EvalContext>) -> Runtime {
-    use sema_vm::runtime::{MonotonicClock, ThreadPoolExecutor};
-    Runtime::new(
-        Rc::clone(ctx),
-        Rc::new(MonotonicClock),
-        std::sync::Arc::new(ThreadPoolExecutor::new()),
-    )
-    .expect("fresh unified runtime construction cannot fail")
+    use sema_vm::runtime::MonotonicClock;
+    // Native builds attach to THE process-wide tokio pool (via sema-io, which
+    // hides the tokio edge): its async tier runs `reqwest`/`tokio::process`
+    // futures on a real reactor and its blocking tier is admission-controlled, so
+    // concurrent external ops overlap without a per-op worker ceiling. wasm/no-io
+    // builds have no tokio pool and keep the thread-parking `ThreadPoolExecutor`.
+    #[cfg(not(target_arch = "wasm32"))]
+    let executor = sema_io::process_executor();
+    #[cfg(target_arch = "wasm32")]
+    let executor: std::sync::Arc<dyn sema_core::runtime::IoExecutor> =
+        std::sync::Arc::new(sema_vm::runtime::ThreadPoolExecutor::new());
+    Runtime::new(Rc::clone(ctx), Rc::new(MonotonicClock), executor)
+        .expect("fresh unified runtime construction cannot fail")
 }
 
 impl Default for Interpreter {

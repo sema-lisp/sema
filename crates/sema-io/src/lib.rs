@@ -56,6 +56,9 @@ use sema_core::{AbortHook, BoxIoFuture, IoBackend};
 use tokio::runtime::Runtime;
 use tokio::sync::Semaphore;
 
+mod executor;
+pub use executor::{process_executor, ProcessIoExecutor};
+
 /// Cap on the pool's blocking-thread tier.
 const MAX_BLOCKING_THREADS: usize = 512;
 

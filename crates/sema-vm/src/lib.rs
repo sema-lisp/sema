@@ -41,5 +41,6 @@ pub use vm::{
     compile_program_with_spans_and_natives, current_vm_globals, extract_vm_closure,
     is_debug_session_active, run_closure_foreign_sync, snap_breakpoint_line,
     snapshot_escaping_closure, valid_breakpoint_lines, valid_breakpoint_lines_by_file,
-    with_active_debug, Closure, CompiledProgram, DebugStopResume, UpvalueCell, UpvalueState, VM,
+    with_active_debug, ActiveDebugGuard, Closure, CompiledProgram, DebugStopResume, UpvalueCell,
+    UpvalueState, VM,
 };

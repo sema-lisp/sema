@@ -286,15 +286,14 @@ fn raw_http_to_value(raw: RawHttpResponse) -> Value {
 }
 
 /// The unified-runtime path: build the request on the VM thread, then SUSPEND on
-/// an interruptible External wait whose job runs the send+read off the VM thread
-/// on the executor's blocking worker (via `io_block_on`, which supplies the
-/// reactor a `reqwest` future needs). The shared `external_io_interruptible`
-/// decoder rebuilds the identical response `Value` on resume; cancellation
-/// (`async/cancel`/`async/timeout`) fires the wait's cancel signal, the job's
-/// `select!` drops the in-flight request future, and the connection is torn down
-/// (no wasted round-trip) — exactly the retired `IoHandle::with_abort` semantics.
-/// See `runtime_offload` for why the blocking tier is used rather than
-/// `interruptible_async`.
+/// an interruptible External wait whose `reqwest` future runs off the VM thread
+/// on the executor's ASYNC tier (a real tokio reactor, no per-op blocking
+/// worker), so N concurrent `http/get`s overlap without a worker ceiling. The
+/// shared `external_io_async` decoder rebuilds the identical response `Value` on
+/// resume; cancellation (`async/cancel`/`async/timeout`) fires the wait's cancel
+/// signal, the job's `select!` drops the in-flight request future, and the
+/// connection is torn down (no wasted round-trip) — exactly the retired
+/// `IoHandle::with_abort` semantics.
 #[cfg(not(target_arch = "wasm32"))]
 fn http_request_runtime(
     method: &str,
@@ -321,7 +320,7 @@ fn http_request_runtime(
 
     let kind = CompletionKind::try_from_raw(HTTP_COMPLETION_KIND)
         .expect("http completion kind is nonzero");
-    crate::runtime_offload::external_io_interruptible(
+    crate::runtime_offload::external_io_async(
         "http",
         kind,
         "http",

@@ -1535,7 +1535,29 @@ impl Runtime {
             Some(task_id.get())
         };
         let prev_task_id = sema_core::set_current_task_id(published_task_id);
-        let quantum = vm.run_quantum(&context, instruction_limit, cancellation);
+        // Regression insurance for the crux invariant (verified on the audited
+        // path): no `RuntimeState` borrow is held across the quantum. The debug
+        // variant may BLOCK inside the quantum (`handle_debug_stop` parks the
+        // thread serving DAP inspection); if a borrow were live here the blocking
+        // stop would deadlock the state cell. Per the review this can never fire.
+        debug_assert!(
+            self.state.try_borrow_mut().is_ok(),
+            "RuntimeState borrowed at quantum entry — a blocking debug stop would deadlock the state cell"
+        );
+        // When a native DAP session is registered on this thread (`ACTIVE_DEBUG`),
+        // run the debug-aware quantum so breakpoints/steps inside this task — and
+        // inside cooperative HOF callbacks, which also flow through
+        // `run_parked_quantum` as enqueued callback-VM quanta — stop and serve
+        // inspection against the stopped task's own VM. Otherwise the byte-
+        // identical non-debug quantum.
+        let quantum = if crate::vm::is_debug_session_active() {
+            crate::vm::with_active_debug(|debug| {
+                vm.run_quantum_debug(&context, instruction_limit, cancellation, debug)
+            })
+            .expect("debug session active but no DebugState registered")
+        } else {
+            vm.run_quantum(&context, instruction_limit, cancellation)
+        };
         let _ = sema_core::set_current_task_id(prev_task_id);
         scopes.restore(task);
         drop(quantum_guard);

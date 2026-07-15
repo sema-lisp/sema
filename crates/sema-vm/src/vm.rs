@@ -956,10 +956,15 @@ fn reconstruct_coop_resume_value(how: &sema_core::DebugCoopResume) -> Result<Val
 
 /// RAII guard registering a `DebugState` as the active debug session for the
 /// duration of a debug run, unregistering it on drop (including panic unwind).
-struct ActiveDebugGuard;
+///
+/// Public so a host (the native DAP backend) can register its `DebugState`
+/// around a runtime drive: the runtime's `run_parked_quantum` observes the
+/// session via [`is_debug_session_active`] and reaches the state through
+/// [`with_active_debug`] to run the debug-aware quantum.
+pub struct ActiveDebugGuard;
 
 impl ActiveDebugGuard {
-    fn enter(debug: &mut crate::debug::DebugState) -> Self {
+    pub fn enter(debug: &mut crate::debug::DebugState) -> Self {
         let ptr = debug as *mut crate::debug::DebugState;
         ACTIVE_DEBUG.with(|stack| stack.borrow_mut().push(ptr));
         ActiveDebugGuard
@@ -1600,7 +1605,11 @@ impl VM {
     /// normal stop loop, the program cannot continue past an uncaught error, so
     /// any resume command simply releases the park and the caller propagates the
     /// error to terminate the session.
-    fn debug_exception_park(&mut self, ctx: &EvalContext, debug: &mut crate::debug::DebugState) {
+    pub fn debug_exception_park(
+        &mut self,
+        ctx: &EvalContext,
+        debug: &mut crate::debug::DebugState,
+    ) {
         loop {
             match debug.command_rx.recv() {
                 Ok(crate::debug::DebugCommand::SetBreakpoints {
@@ -1898,6 +1907,56 @@ impl VM {
         self.instructions_executed = 0;
         self.quantum_cancellation = cancellation;
         let outcome = self.run_inner::<false>(ctx, None);
+        let instructions = self.instructions_executed;
+        self.instruction_budget = None;
+        self.quantum_cancellation = CancellationView::default();
+        crate::debug::VmQuantumResult {
+            outcome,
+            instructions,
+        }
+    }
+
+    /// Debug-aware sibling of [`run_quantum`]: identical instruction-budgeted
+    /// quantum, but running the debug interpreter (`run_inner::<true>`) with the
+    /// breakpoint / condition / step-mode / exception machinery live.
+    ///
+    /// A breakpoint (or step) stop is served RIGHT HERE, inside the quantum, via
+    /// [`handle_debug_stop`]: the driving thread parks on `debug.command_rx`
+    /// answering GetStackTrace/GetScopes/GetVariables/Evaluate/SetVariable
+    /// against `self` — the stopped task's own VM — and resumes back into
+    /// `run_inner::<true>` on a Continue/step command. This is the native-DAP
+    /// stop-the-world barrier: nothing else on the interpreter thread runs while
+    /// parked (`run_parked_quantum` holds NO `RuntimeState` borrow across the
+    /// quantum, so blocking here cannot deadlock the state cell). A Disconnect
+    /// ends the task's quantum with nil (the DAP backend tears the session down).
+    ///
+    /// `break_on_uncaught` is intentionally NOT handled here: an `Err` from the
+    /// debug interpreter is uncaught only within THIS task's frames — a parent
+    /// awaiting the task may still catch the rejection — so the uncaught-exception
+    /// park is done by the host once the ROOT settles Failed (see the DAP backend).
+    pub fn run_quantum_debug(
+        &mut self,
+        ctx: &EvalContext,
+        instruction_limit: usize,
+        cancellation: CancellationView,
+        debug: &mut crate::debug::DebugState,
+    ) -> crate::debug::VmQuantumResult {
+        self.instruction_budget = Some(instruction_limit);
+        self.instructions_executed = 0;
+        self.quantum_cancellation = cancellation;
+        let outcome = loop {
+            match self.run_inner::<true>(ctx, Some(debug)) {
+                Ok(crate::debug::VmExecResult::Stopped(info)) => {
+                    match self.handle_debug_stop(ctx, debug, info) {
+                        DebugStopResume::Resume => continue,
+                        DebugStopResume::Disconnect => {
+                            break Ok(crate::debug::VmExecResult::Finished(Value::nil()));
+                        }
+                    }
+                }
+                other => break other,
+            }
+        };
         let instructions = self.instructions_executed;
         self.instruction_budget = None;
         self.quantum_cancellation = CancellationView::default();

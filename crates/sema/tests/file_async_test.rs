@@ -270,31 +270,15 @@ fn concurrent_big_reads_overlap() {
     write_big_file(&b, 64);
 
     let interp = Interpreter::new();
-    let task =
-        |p: &str| format!(r#"(fn () (file/read "{p}") (file/read "{p}") (file/read "{p}"))"#);
+    let task = |p: &str| format!(r#"(fn () (file/read "{p}"))"#);
 
-    // Warm-up: pull both files into the page cache on the async path.
-    interp
-        .eval_str_compiled(&format!(
-            r#"(async/all (list (async/spawn {}) (async/spawn {})))"#,
-            task(&a),
-            task(&b)
-        ))
-        .expect("warmup reads");
-
-    let t0 = std::time::Instant::now();
-    interp
-        .eval_str_compiled(&format!(
-            r#"(begin
-                 (await (async/spawn {}))
-                 (await (async/spawn {})))"#,
-            task(&a),
-            task(&b)
-        ))
-        .expect("sequential awaited reads");
-    let sequential = t0.elapsed();
-
-    let t1 = std::time::Instant::now();
+    // Prove genuine overlap DETERMINISTICALLY via the FS in-flight counter,
+    // not a wall-time ratio: since the ProcessIoExecutor's blocking pool is now
+    // shared process-wide, a timing comparison flakes under parallel-test load.
+    // A per-read test delay keeps both offloaded reads in flight long enough
+    // that the peak observed concurrency is a stable signal.
+    sema_stdlib::reset_fs_inflight();
+    sema_stdlib::set_fs_test_delay_ms(40);
     interp
         .eval_str_compiled(&format!(
             r#"(async/all (list (async/spawn {}) (async/spawn {})))"#,
@@ -302,12 +286,12 @@ fn concurrent_big_reads_overlap() {
             task(&b)
         ))
         .expect("concurrent reads");
-    let concurrent = t1.elapsed();
+    sema_stdlib::set_fs_test_delay_ms(0);
 
-    println!("big-read overlap: sequential={sequential:?} concurrent={concurrent:?}");
+    let peak = sema_stdlib::fs_peak_inflight();
     assert!(
-        concurrent.as_secs_f64() < sequential.as_secs_f64() * 0.85,
-        "two tasks' offloaded big reads should overlap: concurrent={concurrent:?} sequential={sequential:?}"
+        peak >= 2,
+        "two tasks' offloaded big reads must overlap on the executor; peak in-flight was {peak}"
     );
 }
 

@@ -214,14 +214,112 @@ where
     }))
 }
 
+/// Core assembler for the ASYNC tier: build the interruptible-async External
+/// suspend from an already-constructed `resource` (owning the cancel hook) + its
+/// `cancel_rx`. The job future runs directly on the executor's async reactor (via
+/// [`PreparedExternalOperation::interruptible_async`] → `tokio::spawn`), so it
+/// pins no blocking worker while suspended and N concurrent ops overlap. A
+/// mid-flight cancel fires the hook's one-shot signal; the `biased` `select!`
+/// drops the request future (socket closed / `kill_on_drop` child killed) — the
+/// same teardown the blocking tier gives, without an `io_block_on` worker.
+fn suspend_with_resource_async<T, F, Fut>(
+    op: &'static str,
+    kind: CompletionKind,
+    resource: InterruptibleResource,
+    cancel_rx: CancelWaiter,
+    decode: DecodeFn<T>,
+    make_future: F,
+) -> NativeResult
+where
+    T: Send + 'static,
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: Future<Output = Result<T, String>> + Send + 'static,
+{
+    let decoder = Box::new(IoDecoder { op, decode });
+    let continuation = Box::new(IoOffloadContinuation { op });
+    let prepared = PreparedExternalOperation::interruptible_async(
+        kind,
+        decoder,
+        resource,
+        move || async move {
+            let out: Result<T, String> = tokio::select! {
+                biased;
+                _ = cancel_rx => Err("cancelled".to_string()),
+                result = make_future() => result,
+            };
+            Ok(Box::new(out) as SendPayload)
+        },
+    );
+    Ok(NativeOutcome::Suspend(NativeSuspend {
+        wait: WaitKind::External(Box::new(prepared)),
+        continuation,
+    }))
+}
+
+/// Offload an interruptible async I/O op onto the executor's ASYNC tier (real
+/// reactor, no per-op blocking worker), mapping the domain `Result<T, String>`
+/// to a `Value` on resume via an INFALLIBLE `to_value`. Cancellation drops the
+/// in-flight future and tears the resource down. This is the reference async
+/// path (http); its blocking-tier sibling is [`external_io_interruptible`].
+pub(crate) fn external_io_async<T, F, Fut>(
+    op: &'static str,
+    kind: CompletionKind,
+    resource_label: &'static str,
+    to_value: fn(T) -> Value,
+    make_future: F,
+) -> NativeResult
+where
+    T: Send + 'static,
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: Future<Output = Result<T, String>> + Send + 'static,
+{
+    external_io_async_try(
+        op,
+        kind,
+        resource_label,
+        move |value| Ok(to_value(value)),
+        make_future,
+    )
+}
+
+/// Like [`external_io_async`], but the VM-thread `decode` may fail — for ops that
+/// inspect the raw result and raise a domain error. Uses the generic
+/// drop-on-cancel hook.
+pub(crate) fn external_io_async_try<T, F, Fut, D>(
+    op: &'static str,
+    kind: CompletionKind,
+    resource_label: &'static str,
+    decode: D,
+    make_future: F,
+) -> NativeResult
+where
+    T: Send + 'static,
+    D: FnOnce(T) -> Result<Value, SemaError> + 'static,
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: Future<Output = Result<T, String>> + Send + 'static,
+{
+    let (cancel_tx, cancel_rx) = cancel_channel();
+    let resource = InterruptibleResource::new(
+        resource_label,
+        Box::new(SelectCancelHook {
+            signal: Some(cancel_tx),
+        }),
+    );
+    suspend_with_resource_async(op, kind, resource, cancel_rx, Box::new(decode), make_future)
+}
+
 /// Offload an interruptible async I/O op onto the executor's blocking tier,
 /// running its future via [`sema_io::io_block_on`] and mapping the domain
 /// `Result<T, String>` to a `Value` on resume via an INFALLIBLE `to_value`.
 /// Cancellation drops the in-flight future and tears the resource down.
 ///
 /// This is the one-call reference path for a cancellable I/O op whose success
-/// payload always decodes to a value (e.g. http). Ops whose decode may itself
-/// fail (a subprocess non-zero exit) use [`external_io_interruptible_try`].
+/// payload always decodes to a value. Ops whose decode may itself fail (a
+/// subprocess non-zero exit) use [`external_io_interruptible_try`]. Retained as
+/// the blocking-tier sibling of [`external_io_async`]: ops that cannot run on the
+/// async reactor (a synchronous library call under `io_block_on`) pick this;
+/// reactor-native ops (http) use the async tier.
+#[allow(dead_code)]
 pub(crate) fn external_io_interruptible<T, F, Fut>(
     op: &'static str,
     kind: CompletionKind,

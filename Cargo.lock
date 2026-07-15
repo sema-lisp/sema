@@ -3949,6 +3949,7 @@ name = "sema-eval"
 version = "1.30.0"
 dependencies = [
  "sema-core",
+ "sema-io",
  "sema-llm",
  "sema-reader",
  "sema-stdlib",

@@ -111,6 +111,22 @@ struct RuntimeTask {
     /// carries only scalar state + a shared budget `Rc` (no GC-traceable `Value`),
     /// so it needs no trace edge.
     llm_scope: Option<Box<dyn std::any::Any>>,
+    /// The per-task OTel context (span stack + conversation/session/user ids),
+    /// captured from the spawner's thread-locals at `async/spawn` and installed
+    /// around each of this task's quanta (restored after) so two interleaving
+    /// tasks never share — and corrupt — the one thread-local span stack, and a
+    /// spawned task parents to its own trace rather than a sibling's. `None` for
+    /// the root task, which runs directly against the process thread-locals. The
+    /// context is a type-erased `sema-otel` struct reached through the registered
+    /// otel seam; it holds no GC-traceable `Value`, so it needs no trace edge.
+    otel: Option<Box<dyn std::any::Any>>,
+    /// The per-task leaf-usage accumulator scope, captured from the spawner's
+    /// thread-locals at `async/spawn` and installed around each of this task's
+    /// quanta (restored after) so a concurrent fan-out attributes each leaf's LLM
+    /// usage to its OWN `workflow/step` scope rather than merging siblings' tallies.
+    /// `None` for the root task. A shared `Rc` slot from `sema-llm` reached through
+    /// the registered usage-scope seam; it holds no GC-traceable `Value`.
+    usage_scope: Option<Box<dyn std::any::Any>>,
 }
 
 /// How a parked VM-quantum task should be resumed once its awaited promise
@@ -132,6 +148,82 @@ impl Trace for VmResume {
                 true
             }
             Self::Fail(error) => error.trace(sink),
+        }
+    }
+}
+
+/// Panic-safe swap of a task's per-quantum dynamic contexts (LLM scope, OTel
+/// context, leaf-usage scope) into and out of the process thread-locals.
+///
+/// `install` moves each captured context out of the task and into the
+/// thread-locals, stashing the context it displaced. `restore` takes the task's
+/// (possibly step-modified) contexts back onto the task and reinstalls the
+/// displaced ones, in lockstep across all three. If the quantum unwinds before
+/// `restore` runs, `Drop` still reinstalls the displaced contexts so a
+/// parent/sibling task's span stack and usage tally are never corrupted (the
+/// faulting task's own mid-step contexts are discarded — it will not resume).
+struct TaskScopeSwap {
+    displaced_llm: Option<Box<dyn std::any::Any>>,
+    displaced_otel: Option<Box<dyn std::any::Any>>,
+    displaced_usage: Option<Box<dyn std::any::Any>>,
+    restored: bool,
+}
+
+impl TaskScopeSwap {
+    fn install(task: &mut RuntimeTask) -> Self {
+        Self {
+            displaced_llm: task.llm_scope.take().map(sema_core::install_task_llm_scope),
+            displaced_otel: task.otel.take().map(sema_core::install_task_otel),
+            displaced_usage: task
+                .usage_scope
+                .take()
+                .map(sema_core::install_task_usage_scope),
+            restored: false,
+        }
+    }
+
+    /// Normal-path unwind: capture the task's step-modified contexts back onto the
+    /// task, then reinstall the displaced (spawner/global) contexts. Idempotent —
+    /// a subsequent `Drop` is a no-op.
+    fn restore(&mut self, task: &mut RuntimeTask) {
+        if self.restored {
+            return;
+        }
+        self.restored = true;
+        if let Some(prev) = self.displaced_llm.take() {
+            task.llm_scope = Some(sema_core::take_task_llm_scope());
+            let _ = sema_core::install_task_llm_scope(prev);
+        }
+        if let Some(prev) = self.displaced_otel.take() {
+            task.otel = Some(sema_core::take_task_otel());
+            let _ = sema_core::install_task_otel(prev);
+        }
+        if let Some(prev) = self.displaced_usage.take() {
+            task.usage_scope = Some(sema_core::take_task_usage_scope());
+            let _ = sema_core::install_task_usage_scope(prev);
+        }
+    }
+}
+
+impl Drop for TaskScopeSwap {
+    fn drop(&mut self) {
+        if self.restored {
+            return;
+        }
+        // Unwind path: `restore` never ran, so we cannot reach `task`. Reinstall the
+        // displaced contexts into the thread-locals so the parent/sibling context is
+        // uncorrupted; the faulting task's own contexts are dropped with it.
+        if let Some(prev) = self.displaced_llm.take() {
+            let _ = sema_core::take_task_llm_scope();
+            let _ = sema_core::install_task_llm_scope(prev);
+        }
+        if let Some(prev) = self.displaced_otel.take() {
+            let _ = sema_core::take_task_otel();
+            let _ = sema_core::install_task_otel(prev);
+        }
+        if let Some(prev) = self.displaced_usage.take() {
+            let _ = sema_core::take_task_usage_scope();
+            let _ = sema_core::install_task_usage_scope(prev);
         }
     }
 }
@@ -374,6 +466,8 @@ impl Runtime {
                 context: TaskContextHandle::default(),
                 vm_resume: None,
                 llm_scope: None,
+                otel: None,
+                usage_scope: None,
             },
         );
         state.ready.enqueue(root, task);
@@ -420,6 +514,8 @@ impl Runtime {
                 context: TaskContextHandle::default(),
                 vm_resume: None,
                 llm_scope: None,
+                otel: None,
+                usage_scope: None,
             },
         );
         state.ready.enqueue(root, task);
@@ -1256,13 +1352,19 @@ impl Runtime {
             let cancel = task.record.cancellation();
             CancellationView::new(cancel.is_some(), cancel.map(|request| request.reason))
         };
-        // Install this task's captured LLM dynamic scope (cache/budget/…) around the
-        // quantum so a completion or fan-out spawned inside a `with-cache`/`with-budget`
-        // extent sees it even after the wrapper's thunk (and its thread-local scope)
-        // has ended. The quantum's own mutations persist back onto the task; the prior
-        // (spawner/global) scope is restored afterwards. The root task carries no
-        // captured scope and runs directly against the process thread-locals.
-        let displaced_scope = task.llm_scope.take().map(sema_core::install_task_llm_scope);
+        // Install this task's captured per-task dynamic contexts around the quantum:
+        // the LLM dynamic scope (cache/budget/…), the OTel context (span stack + ids),
+        // and the leaf-usage accumulator scope. Two interleaving tasks otherwise share
+        // — and corrupt — the one thread-local span stack / usage frame, and a fan-out
+        // spawned inside a `with-cache`/`with-budget`/`workflow/step` extent must see
+        // it even after the wrapper's thunk has ended. The quantum's own mutations
+        // (spans opened this step, cache flips) persist back onto the task; the prior
+        // (spawner/global) contexts are restored afterwards. The root task carries no
+        // captured contexts and runs directly against the process thread-locals. The
+        // swap is panic-safe: `TaskScopeSwap`'s `Drop` restores the displaced contexts
+        // to the thread-locals even if the quantum unwinds, so a parent/sibling's span
+        // stack and usage tally are never left corrupted.
+        let mut scopes = TaskScopeSwap::install(task);
         // Publish the running task's identity so natives that open a per-task slab
         // entry (`llm/stream`, `agent/run`) record the owning task, letting the
         // task-reaped sweep reclaim the entry (and its detached span) when the task
@@ -1270,10 +1372,7 @@ impl Runtime {
         let prev_task_id = sema_core::set_current_task_id(Some(task_id.get()));
         let quantum = vm.run_quantum(&context, instruction_limit, cancellation);
         let _ = sema_core::set_current_task_id(prev_task_id);
-        if let Some(displaced) = displaced_scope {
-            task.llm_scope = Some(sema_core::take_task_llm_scope());
-            let _ = sema_core::install_task_llm_scope(displaced);
-        }
+        scopes.restore(task);
         drop(quantum_guard);
         self.state.borrow_mut().turn_instructions += quantum.instructions;
         let action = match quantum.outcome {
@@ -2399,6 +2498,17 @@ impl Runtime {
                     // still sees the cache enabled — the scope rides the task, not
                     // the (already-restored) global.
                     llm_scope: Some(sema_core::current_llm_scope_boxed()),
+                    // Seed the child with the spawner's OTel identity (conversation/
+                    // session/user ids) and an EMPTY span stack, so the child's spans
+                    // parent to its own trace root — not whatever span a sibling
+                    // happens to have open on the shared thread-local stack when the
+                    // child is scheduled.
+                    otel: Some(sema_core::current_conversation_scope_boxed()),
+                    // Seed the child with the leaf-usage scope its `workflow/step`
+                    // opened, so a concurrent fan-out's LLM usage is attributed to
+                    // the step that spawned it rather than lost or cross-charged to a
+                    // sibling.
+                    usage_scope: Some(sema_core::current_usage_scope_boxed()),
                 },
             );
             state.task_promises.insert(child, promise);
@@ -3782,5 +3892,160 @@ impl Trace for TestPreparedTask {
             Self::NativeCall(_) => true,
             _ => true,
         }
+    }
+}
+
+#[cfg(test)]
+mod scope_swap_tests {
+    use super::*;
+    use sema_core::runtime::{
+        CompletionDelivery, CompletionRegistrar, CompletionSender, ExternalCompletion,
+    };
+    use std::any::Any;
+    use std::cell::{Cell, RefCell};
+
+    struct ClosedInbox;
+    impl CompletionSender for ClosedInbox {
+        fn send(&self, _: ExternalCompletion) -> CompletionDelivery {
+            CompletionDelivery::InboxClosed
+        }
+    }
+
+    // ── Modeled otel span stack ──────────────────────────────────────
+    // A raw thread-local `Vec<u64>` standing in for the real `sema-otel`
+    // span stack: pushing an id models opening a span. Two interleaving
+    // tasks that shared this one stack would see each other's ids.
+    thread_local! {
+        static STACK: RefCell<Vec<u64>> = const { RefCell::new(Vec::new()) };
+        static ACTIVE_USAGE: Cell<u64> = const { Cell::new(0) };
+    }
+
+    fn otel_take() -> Box<dyn Any> {
+        Box::new(STACK.with(|s| std::mem::take(&mut *s.borrow_mut())))
+    }
+    fn otel_install(ctx: Box<dyn Any>) -> Box<dyn Any> {
+        let incoming = ctx.downcast::<Vec<u64>>().map(|b| *b).unwrap_or_default();
+        Box::new(STACK.with(|s| std::mem::replace(&mut *s.borrow_mut(), incoming)))
+    }
+    fn otel_scope() -> Box<dyn Any> {
+        Box::new(Vec::<u64>::new())
+    }
+
+    fn usage_take() -> Box<dyn Any> {
+        Box::new(ACTIVE_USAGE.with(|a| a.replace(0)))
+    }
+    fn usage_install(ctx: Box<dyn Any>) -> Box<dyn Any> {
+        let incoming = ctx.downcast::<u64>().map(|b| *b).unwrap_or(0);
+        Box::new(ACTIVE_USAGE.with(|a| a.replace(incoming)))
+    }
+    fn usage_capture() -> Box<dyn Any> {
+        Box::new(ACTIVE_USAGE.with(|a| a.get()))
+    }
+
+    fn make_task(seed_span: u64, seed_usage: u64) -> RuntimeTask {
+        let (_runtime, _registrar, issuers) =
+            CompletionRegistrar::register(Arc::new(ClosedInbox)).unwrap();
+        let (mut root_ids, _, _) = issuers.into_parts();
+        let mut tasks = IdCounter::<TaskId>::new();
+        let root = root_ids.allocate().unwrap();
+        let id = tasks.allocate().unwrap();
+        let relations = TaskRelations {
+            origin_root: root,
+            cancellation_parent: CancellationParent::Root(root),
+            lifetime_owner: LifetimeOwner::Root(root),
+        };
+        RuntimeTask {
+            record: TaskRecord::new(id, relations),
+            payload: TaskPayload::Test(TestPreparedTask::yield_forever()),
+            pending_resume: None,
+            suspended_owner: None,
+            vm_call: None,
+            vm_owner: None,
+            context: TaskContextHandle::default(),
+            vm_resume: None,
+            llm_scope: None,
+            otel: Some(Box::new(vec![seed_span])),
+            usage_scope: Some(Box::new(seed_usage)),
+        }
+    }
+
+    /// Two interleaving tasks must not share the thread-local otel span stack or
+    /// the active leaf-usage scope: each `install`/`restore` round-trip installs
+    /// ONLY that task's context, and a span opened during a task's quantum stays on
+    /// that task (never leaks onto a sibling). Without `TaskScopeSwap` handling otel
+    /// + usage, both tasks would push onto one shared stack and cross-attribute.
+    #[test]
+    fn interleaved_quanta_keep_otel_and_usage_isolated() {
+        sema_core::set_otel_task_callbacks(otel_take, otel_install, otel_scope);
+        sema_core::set_usage_scope_task_callbacks(usage_capture, usage_take, usage_install);
+        // Start from a clean thread-local state (other tests on this thread may have
+        // left the modeled stack populated).
+        STACK.with(|s| s.borrow_mut().clear());
+        ACTIVE_USAGE.with(|a| a.set(0));
+
+        let mut a = make_task(10, 1);
+        let mut b = make_task(20, 2);
+
+        // Task A quantum: sees its own span stack [10] + usage 1, opens a child span.
+        {
+            let mut swap = TaskScopeSwap::install(&mut a);
+            STACK.with(|s| assert_eq!(*s.borrow(), vec![10]));
+            ACTIVE_USAGE.with(|u| assert_eq!(u.get(), 1));
+            STACK.with(|s| s.borrow_mut().push(11)); // open span during the quantum
+            swap.restore(&mut a);
+        }
+        // Restored to the empty (spawner/global) context; A carries its opened span.
+        STACK.with(|s| assert!(s.borrow().is_empty()));
+        ACTIVE_USAGE.with(|u| assert_eq!(u.get(), 0));
+
+        // Task B quantum interleaves: it must see ITS OWN [20] + usage 2, never A's.
+        {
+            let mut swap = TaskScopeSwap::install(&mut b);
+            STACK.with(|s| assert_eq!(*s.borrow(), vec![20]));
+            ACTIVE_USAGE.with(|u| assert_eq!(u.get(), 2));
+            STACK.with(|s| s.borrow_mut().push(21));
+            swap.restore(&mut b);
+        }
+
+        // Task A resumes: it must observe only its own carried stack [10, 11] and
+        // usage 1 — B's span 21 and usage 2 are absent (no cross-task leak).
+        {
+            let mut swap = TaskScopeSwap::install(&mut a);
+            STACK.with(|s| assert_eq!(*s.borrow(), vec![10, 11]));
+            ACTIVE_USAGE.with(|u| assert_eq!(u.get(), 1));
+            swap.restore(&mut a);
+        }
+
+        // Both tasks retain their own accumulated context across the interleave.
+        let a_stack = a.otel.unwrap().downcast::<Vec<u64>>().unwrap();
+        let b_stack = b.otel.unwrap().downcast::<Vec<u64>>().unwrap();
+        assert_eq!(*a_stack, vec![10, 11]);
+        assert_eq!(*b_stack, vec![20, 21]);
+    }
+
+    /// `TaskScopeSwap::Drop` reinstalls the displaced contexts even if the quantum
+    /// unwinds before `restore` runs, so a parent/sibling's stack is never left
+    /// corrupted by a faulting task.
+    #[test]
+    fn drop_restores_displaced_contexts_on_unwind() {
+        sema_core::set_otel_task_callbacks(otel_take, otel_install, otel_scope);
+        sema_core::set_usage_scope_task_callbacks(usage_capture, usage_take, usage_install);
+        STACK.with(|s| {
+            let mut s = s.borrow_mut();
+            s.clear();
+            s.push(99); // a parent span active before the task ran
+        });
+        ACTIVE_USAGE.with(|a| a.set(7));
+
+        let mut task = make_task(30, 3);
+        {
+            let _swap = TaskScopeSwap::install(&mut task);
+            STACK.with(|s| assert_eq!(*s.borrow(), vec![30]));
+            ACTIVE_USAGE.with(|u| assert_eq!(u.get(), 3));
+            // Drop without calling restore (models a panic mid-quantum).
+        }
+        // The parent's context is back in the thread-locals, uncorrupted.
+        STACK.with(|s| assert_eq!(*s.borrow(), vec![99]));
+        ACTIVE_USAGE.with(|u| assert_eq!(u.get(), 7));
     }
 }

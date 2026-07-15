@@ -7,7 +7,7 @@ use sema_core::runtime::{
     NativeCall, NativeCallContext, NativeContinuation, NativeOutcome, NativeResult, ResumeInput,
     Trace,
 };
-use sema_core::{check_arity, intern, Record, SemaError, Value, ValueViewRef, YieldReason};
+use sema_core::{check_arity, intern, Record, SemaError, Value, ValueViewRef};
 
 use crate::register_fn;
 
@@ -78,27 +78,41 @@ impl NativeContinuation for MapContinuation {
     }
 }
 
-/// Build the cooperative `NativeOutcome::Call` for a single-list `map` running
-/// inside a runtime quantum, stash it on the pending-outcome thread-local, and
-/// raise the `NativeYield` signal the VM surfaces as an `AsyncYield`. Returns a
-/// nil placeholder the runtime overwrites with the mapped list once the
-/// continuation completes. `None` when there is no cooperative work to do (empty
-/// input), so the caller falls back to returning the empty list directly.
-fn map_cooperative(callback: &Value, items: &[Value]) -> Option<Value> {
-    let (first, rest) = items.split_first()?;
+/// Build the initial cooperative `NativeOutcome::Call` for a single-list `map`
+/// running inside a runtime quantum: run `callback(item0)` as real Sema work on
+/// the active task, with `MapContinuation` driving the rest. Empty input has no
+/// callback to run, so it returns the empty list directly.
+fn map_call(callback: &Value, items: &[Value]) -> NativeOutcome {
+    let Some((first, rest)) = items.split_first() else {
+        return NativeOutcome::Return(Value::list(Vec::new()));
+    };
     let continuation = Box::new(MapContinuation {
         callback: callback.clone(),
         remaining: rest.iter().cloned().collect(),
         results: Vec::with_capacity(items.len()),
     });
-    let call = NativeOutcome::Call(NativeCall {
+    NativeOutcome::Call(NativeCall {
         callable: callback.clone(),
         args: vec![first.clone()],
         continuation,
-    });
-    sema_core::set_pending_native_outcome(call);
-    sema_core::set_yield_signal(YieldReason::NativeYield);
-    Some(Value::nil())
+    })
+}
+
+/// Multi-list `map`: iterate the lists in lockstep (shortest wins), calling the
+/// callback synchronously on each column. There is no cooperative continuation
+/// for the multi-list shape, so a yielding callback here can't suspend.
+fn map_multi(args: &[Value]) -> Result<Value, SemaError> {
+    let lists: Vec<Cow<[Value]>> = args[1..]
+        .iter()
+        .map(|a| get_sequence(a, "map"))
+        .collect::<Result<_, _>>()?;
+    let min_len = lists.iter().map(|l| l.len()).min().unwrap_or(0);
+    let mut result = Vec::with_capacity(min_len);
+    for i in 0..min_len {
+        let call_args: Vec<Value> = lists.iter().map(|l| l[i].clone()).collect();
+        result.push(call_function(&args[0], &call_args)?);
+    }
+    Ok(Value::list(result))
 }
 
 /// Cooperative continuation for `filter` (Task 04). Runs the predicate on each
@@ -153,15 +167,23 @@ impl NativeContinuation for FilterContinuation {
     }
 }
 
-fn filter_cooperative(predicate: &Value, items: &[Value]) -> Option<Value> {
-    let (first, rest) = items.split_first()?;
+/// Initial cooperative `NativeOutcome::Call` for `filter`. Empty input has
+/// nothing to test, so it returns the empty list directly.
+fn filter_call(predicate: &Value, items: &[Value]) -> NativeOutcome {
+    let Some((first, rest)) = items.split_first() else {
+        return NativeOutcome::Return(Value::list(Vec::new()));
+    };
     let continuation = Box::new(FilterContinuation {
         predicate: predicate.clone(),
         current: first.clone(),
         remaining: rest.iter().cloned().collect(),
         results: Vec::new(),
     });
-    yield_cooperative_call(predicate.clone(), vec![first.clone()], continuation)
+    NativeOutcome::Call(NativeCall {
+        callable: predicate.clone(),
+        args: vec![first.clone()],
+        continuation,
+    })
 }
 
 /// Cooperative continuation for `foldl`/`reduce` (Task 04). Threads the
@@ -202,15 +224,22 @@ impl NativeContinuation for FoldContinuation {
     }
 }
 
-/// Drive `(combiner acc item)` left-to-right cooperatively, starting from `init`.
-/// Empty `items` has no combiner call, so it returns `init` directly (`None`).
-fn fold_cooperative(combiner: &Value, init: Value, items: &[Value]) -> Option<Value> {
-    let (first, rest) = items.split_first()?;
+/// Initial cooperative `NativeOutcome::Call` for a left fold `(combiner acc
+/// item)` starting from `init`. Empty `items` has no combiner call, so it
+/// returns `init` directly.
+fn fold_call(combiner: &Value, init: Value, items: &[Value]) -> NativeOutcome {
+    let Some((first, rest)) = items.split_first() else {
+        return NativeOutcome::Return(init);
+    };
     let continuation = Box::new(FoldContinuation {
         combiner: combiner.clone(),
         remaining: rest.iter().cloned().collect(),
     });
-    yield_cooperative_call(combiner.clone(), vec![init, first.clone()], continuation)
+    NativeOutcome::Call(NativeCall {
+        callable: combiner.clone(),
+        args: vec![init, first.clone()],
+        continuation,
+    })
 }
 
 /// Cooperative continuation for `for-each` (Task 04). Runs the callback for each
@@ -250,13 +279,21 @@ impl NativeContinuation for ForEachContinuation {
     }
 }
 
-fn for_each_cooperative(callback: &Value, items: &[Value]) -> Option<Value> {
-    let (first, rest) = items.split_first()?;
+/// Initial cooperative `NativeOutcome::Call` for `for-each`. Empty input is a
+/// no-op, so it returns nil directly.
+fn for_each_call(callback: &Value, items: &[Value]) -> NativeOutcome {
+    let Some((first, rest)) = items.split_first() else {
+        return NativeOutcome::Return(Value::nil());
+    };
     let continuation = Box::new(ForEachContinuation {
         callback: callback.clone(),
         remaining: rest.iter().cloned().collect(),
     });
-    yield_cooperative_call(callback.clone(), vec![first.clone()], continuation)
+    NativeOutcome::Call(NativeCall {
+        callable: callback.clone(),
+        args: vec![first.clone()],
+        continuation,
+    })
 }
 
 /// Cooperative continuation for `sort-by` (Task 04). Sorting can't interleave
@@ -315,15 +352,24 @@ impl NativeContinuation for SortByContinuation {
     }
 }
 
-fn sort_by_cooperative(key_fn: &Value, items: &[Value]) -> Option<Value> {
-    let (first, rest) = items.split_first()?;
+/// Initial cooperative `NativeOutcome::Call` for `sort-by`: compute the sort key
+/// for each element cooperatively before sorting. Empty input needs no keys, so
+/// it returns the empty list directly.
+fn sort_by_call(key_fn: &Value, items: &[Value]) -> NativeOutcome {
+    let Some((first, rest)) = items.split_first() else {
+        return NativeOutcome::Return(Value::list(Vec::new()));
+    };
     let continuation = Box::new(SortByContinuation {
         key_fn: key_fn.clone(),
         current: first.clone(),
         remaining: rest.iter().cloned().collect(),
         keyed: Vec::with_capacity(items.len()),
     });
-    yield_cooperative_call(key_fn.clone(), vec![first.clone()], continuation)
+    NativeOutcome::Call(NativeCall {
+        callable: key_fn.clone(),
+        args: vec![first.clone()],
+        continuation,
+    })
 }
 
 /// Shared decode of a cooperative callback resume for the HOF continuations: a
@@ -341,25 +387,6 @@ fn resume_value(input: ResumeInput, hof: &str) -> Result<Value, SemaError> {
             "{hof} continuation received an unexpected runtime response"
         ))),
     }
-}
-
-/// Stash a cooperative `NativeOutcome::Call` on the pending-outcome TLS and raise
-/// the `NativeYield` signal the VM surfaces as an `AsyncYield`, returning the nil
-/// placeholder the runtime overwrites once the continuation completes. Mirrors
-/// `map_cooperative`'s tail for the other HOFs.
-fn yield_cooperative_call(
-    callable: Value,
-    args: Vec<Value>,
-    continuation: Box<dyn NativeContinuation>,
-) -> Option<Value> {
-    let call = NativeOutcome::Call(NativeCall {
-        callable,
-        args,
-        continuation,
-    });
-    sema_core::set_pending_native_outcome(call);
-    sema_core::set_yield_signal(YieldReason::NativeYield);
-    Some(Value::nil())
 }
 
 /// Record `type_tag` used to bundle zero-or-multiple values produced by `values`
@@ -397,6 +424,28 @@ fn repeat_impl(args: &[Value]) -> Result<Value, SemaError> {
     let n = args[0].as_index("list/repeat")?;
     let val = args[1].clone();
     Ok(Value::list(vec![val; n]))
+}
+
+/// Register a higher-order function whose callback may suspend as a DUAL-ABI
+/// native. Under a runtime quantum the VM invokes `runtime`, which returns the
+/// initial `NativeOutcome::Call` so the runtime drives the callback cooperatively
+/// (an async op inside it parks/resumes). Everywhere else (a bare top-level eval
+/// or nested/sync re-entry) the VM runs `legacy`, the synchronous per-element
+/// path.
+fn register_hof(
+    env: &sema_core::Env,
+    name: &'static str,
+    legacy: impl Fn(&[Value]) -> Result<Value, SemaError> + 'static,
+    runtime: impl Fn(&[Value]) -> NativeResult + 'static,
+) {
+    env.set(
+        sema_core::intern(name),
+        Value::native_fn(sema_core::NativeFn::simple_with_runtime(
+            name,
+            legacy,
+            move |_ctx, args| runtime(args),
+        )),
+    );
 }
 
 pub fn register(env: &sema_core::Env) {
@@ -524,43 +573,37 @@ pub fn register(env: &sema_core::Env) {
         }
     });
 
-    register_fn(env, "map", |args| {
-        check_arity!(args, "map", 2..);
-        if args.len() == 2 {
-            let items = get_sequence(&args[1], "map")?;
-            // Under the unified runtime, drive each callback COOPERATIVELY via the
-            // NativeOutcome::Call continuation ABI so an async op inside the
-            // callback (spawn/await/channel) parks and resumes correctly, instead
-            // of re-entering the evaluator synchronously (which surfaces "async
-            // yield outside of scheduler context"). Empty input has no callback to
-            // run, so it returns the empty list directly. Multi-list `map` keeps
-            // the legacy synchronous path (Task 04 follow-up).
-            if sema_core::in_runtime_quantum() {
-                return match map_cooperative(&args[0], &items) {
-                    Some(placeholder) => Ok(placeholder),
-                    None => Ok(Value::list(Vec::new())),
-                };
+    // `map` drives its callback COOPERATIVELY under the runtime (its `runtime`
+    // ABI returns the initial `NativeOutcome::Call`) so an async op inside the
+    // callback (spawn/await/channel) parks and resumes correctly. Multi-list
+    // `map` has no cooperative continuation, so it runs synchronously on both
+    // paths (Task 04 follow-up).
+    register_hof(
+        env,
+        "map",
+        |args| {
+            check_arity!(args, "map", 2..);
+            if args.len() == 2 {
+                let items = get_sequence(&args[1], "map")?;
+                let mut result = Vec::with_capacity(items.len());
+                for item in items.iter() {
+                    result.push(call_function(&args[0], &[item.clone()])?);
+                }
+                Ok(Value::list(result))
+            } else {
+                map_multi(args)
             }
-            let mut result = Vec::with_capacity(items.len());
-            for item in items.iter() {
-                result.push(call_function(&args[0], &[item.clone()])?);
+        },
+        |args| {
+            check_arity!(args, "map", 2..);
+            if args.len() == 2 {
+                let items = get_sequence(&args[1], "map")?;
+                Ok(map_call(&args[0], &items))
+            } else {
+                map_multi(args).map(NativeOutcome::Return)
             }
-            Ok(Value::list(result))
-        } else {
-            // Multi-list map: iterate in lockstep (shortest wins)
-            let lists: Vec<Cow<[Value]>> = args[1..]
-                .iter()
-                .map(|a| get_sequence(a, "map"))
-                .collect::<Result<_, _>>()?;
-            let min_len = lists.iter().map(|l| l.len()).min().unwrap_or(0);
-            let mut result = Vec::with_capacity(min_len);
-            for i in 0..min_len {
-                let call_args: Vec<Value> = lists.iter().map(|l| l[i].clone()).collect();
-                result.push(call_function(&args[0], &call_args)?);
-            }
-            Ok(Value::list(result))
-        }
-    });
+        },
+    );
 
     register_fn(env, "map-indexed", |args| {
         check_arity!(args, "map-indexed", 2);
@@ -585,66 +628,71 @@ pub fn register(env: &sema_core::Env) {
         Ok(Value::list(result))
     });
 
-    register_fn(env, "filter", |args| {
-        check_arity!(args, "filter", 2);
-        let items = get_sequence(&args[1], "filter")?;
-        // Drive the predicate COOPERATIVELY under the unified runtime so an async
-        // op inside it parks/resumes (see `map`). Empty input has nothing to test.
-        if sema_core::in_runtime_quantum() {
-            return match filter_cooperative(&args[0], &items) {
-                Some(placeholder) => Ok(placeholder),
-                None => Ok(Value::list(Vec::new())),
-            };
-        }
-        let mut result = Vec::new();
-        for item in items.iter() {
-            let owned = item.clone();
-            let keep = call_function(&args[0], std::slice::from_ref(&owned))?;
-            if keep.is_truthy() {
-                result.push(owned);
+    // `filter` drives its predicate COOPERATIVELY under the runtime (see `map`).
+    register_hof(
+        env,
+        "filter",
+        |args| {
+            check_arity!(args, "filter", 2);
+            let items = get_sequence(&args[1], "filter")?;
+            let mut result = Vec::new();
+            for item in items.iter() {
+                let owned = item.clone();
+                let keep = call_function(&args[0], std::slice::from_ref(&owned))?;
+                if keep.is_truthy() {
+                    result.push(owned);
+                }
             }
-        }
-        Ok(Value::list(result))
-    });
+            Ok(Value::list(result))
+        },
+        |args| {
+            check_arity!(args, "filter", 2);
+            let items = get_sequence(&args[1], "filter")?;
+            Ok(filter_call(&args[0], &items))
+        },
+    );
 
-    register_fn(env, "foldl", |args| {
-        check_arity!(args, "foldl", 3);
-        let items = get_sequence(&args[2], "foldl")?;
-        // Thread the accumulator COOPERATIVELY under the unified runtime so an
-        // async op inside the combiner parks/resumes (see `map`). Empty input
-        // yields the initial accumulator with no combiner call.
-        if sema_core::in_runtime_quantum() {
-            return match fold_cooperative(&args[0], args[1].clone(), &items) {
-                Some(placeholder) => Ok(placeholder),
-                None => Ok(args[1].clone()),
-            };
-        }
-        let mut acc = args[1].clone();
-        for item in items.iter() {
-            // Owned handoff: the accumulator moves into the callback frame so
-            // uniqueness-gated in-place updates (assoc & co.) can fire.
-            let mut cb_args = [std::mem::replace(&mut acc, Value::nil()), item.clone()];
-            acc = call_function_owned(&args[0], &mut cb_args)?;
-        }
-        Ok(acc)
-    });
+    // `foldl` threads its accumulator COOPERATIVELY under the runtime (see `map`).
+    register_hof(
+        env,
+        "foldl",
+        |args| {
+            check_arity!(args, "foldl", 3);
+            let items = get_sequence(&args[2], "foldl")?;
+            let mut acc = args[1].clone();
+            for item in items.iter() {
+                // Owned handoff: the accumulator moves into the callback frame so
+                // uniqueness-gated in-place updates (assoc & co.) can fire.
+                let mut cb_args = [std::mem::replace(&mut acc, Value::nil()), item.clone()];
+                acc = call_function_owned(&args[0], &mut cb_args)?;
+            }
+            Ok(acc)
+        },
+        |args| {
+            check_arity!(args, "foldl", 3);
+            let items = get_sequence(&args[2], "foldl")?;
+            Ok(fold_call(&args[0], args[1].clone(), &items))
+        },
+    );
 
-    register_fn(env, "for-each", |args| {
-        check_arity!(args, "for-each", 2);
-        let items = get_sequence(&args[1], "for-each")?;
-        // Run the callback COOPERATIVELY under the unified runtime so an async
-        // side effect inside it parks/resumes (see `map`). Empty input is a no-op.
-        if sema_core::in_runtime_quantum() {
-            return match for_each_cooperative(&args[0], &items) {
-                Some(placeholder) => Ok(placeholder),
-                None => Ok(Value::nil()),
-            };
-        }
-        for item in items.iter() {
-            call_function(&args[0], &[item.clone()])?;
-        }
-        Ok(Value::nil())
-    });
+    // `for-each` runs its callback COOPERATIVELY under the runtime (see `map`).
+    register_hof(
+        env,
+        "for-each",
+        |args| {
+            check_arity!(args, "for-each", 2);
+            let items = get_sequence(&args[1], "for-each")?;
+            for item in items.iter() {
+                call_function(&args[0], &[item.clone()])?;
+            }
+            Ok(Value::nil())
+        },
+        |args| {
+            check_arity!(args, "for-each", 2);
+            let items = get_sequence(&args[1], "for-each")?;
+            Ok(for_each_call(&args[0], &items))
+        },
+    );
 
     register_fn(env, "range", |args| {
         check_arity!(args, "range", 1..=3);
@@ -823,29 +871,34 @@ pub fn register(env: &sema_core::Env) {
     // Note: canonical predicate-? aliases (`any?`, `every?`) are registered
     // at the end of this fn (see below).
 
-    register_fn(env, "reduce", |args| {
-        check_arity!(args, "reduce", 2);
-        let items = get_sequence(&args[1], "reduce")?;
-        if items.is_empty() {
-            return Err(SemaError::eval("reduce: empty list"));
-        }
-        // Thread the accumulator COOPERATIVELY under the unified runtime (see
-        // `foldl`): seed with the first element and fold the rest. A single
-        // element has no combiner call, so it returns that element directly.
-        if sema_core::in_runtime_quantum() {
-            return match fold_cooperative(&args[0], items[0].clone(), &items[1..]) {
-                Some(placeholder) => Ok(placeholder),
-                None => Ok(items[0].clone()),
-            };
-        }
-        let mut acc = items[0].clone();
-        for item in &items[1..] {
-            // Owned handoff — see foldl.
-            let mut cb_args = [std::mem::replace(&mut acc, Value::nil()), item.clone()];
-            acc = call_function_owned(&args[0], &mut cb_args)?;
-        }
-        Ok(acc)
-    });
+    // `reduce` threads its accumulator COOPERATIVELY under the runtime (see
+    // `foldl`): seed with the first element and fold the rest.
+    register_hof(
+        env,
+        "reduce",
+        |args| {
+            check_arity!(args, "reduce", 2);
+            let items = get_sequence(&args[1], "reduce")?;
+            if items.is_empty() {
+                return Err(SemaError::eval("reduce: empty list"));
+            }
+            let mut acc = items[0].clone();
+            for item in &items[1..] {
+                // Owned handoff — see foldl.
+                let mut cb_args = [std::mem::replace(&mut acc, Value::nil()), item.clone()];
+                acc = call_function_owned(&args[0], &mut cb_args)?;
+            }
+            Ok(acc)
+        },
+        |args| {
+            check_arity!(args, "reduce", 2);
+            let items = get_sequence(&args[1], "reduce")?;
+            if items.is_empty() {
+                return Err(SemaError::eval("reduce: empty list"));
+            }
+            Ok(fold_call(&args[0], items[0].clone(), &items[1..]))
+        },
+    );
 
     register_fn(env, "partition", |args| {
         check_arity!(args, "partition", 2);
@@ -1048,28 +1101,29 @@ pub fn register(env: &sema_core::Env) {
         Ok(Value::list(result))
     });
 
-    register_fn(env, "sort-by", |args| {
-        check_arity!(args, "sort-by", 2);
-        let items = get_sequence(&args[1], "sort-by")?;
-        // Compute the sort key for every element COOPERATIVELY under the unified
-        // runtime (each key call may park/resume on an async op) BEFORE sorting;
-        // the sort itself stays synchronous. Empty input needs no keys.
-        if sema_core::in_runtime_quantum() {
-            return match sort_by_cooperative(&args[0], &items) {
-                Some(placeholder) => Ok(placeholder),
-                None => Ok(Value::list(Vec::new())),
-            };
-        }
-        // Extract keys for each element
-        let mut keyed: Vec<(Value, Value)> = Vec::with_capacity(items.len());
-        for item in items.iter() {
-            let key = call_function(&args[0], &[item.clone()])?;
-            keyed.push((key, item.clone()));
-        }
-        keyed.sort_by(|(ka, _), (kb, _)| ka.cmp(kb));
-        let result: Vec<Value> = keyed.into_iter().map(|(_, v)| v).collect();
-        Ok(Value::list(result))
-    });
+    // `sort-by` computes each element's sort key COOPERATIVELY under the runtime
+    // (each key call may park/resume) BEFORE sorting; the sort stays synchronous.
+    register_hof(
+        env,
+        "sort-by",
+        |args| {
+            check_arity!(args, "sort-by", 2);
+            let items = get_sequence(&args[1], "sort-by")?;
+            let mut keyed: Vec<(Value, Value)> = Vec::with_capacity(items.len());
+            for item in items.iter() {
+                let key = call_function(&args[0], &[item.clone()])?;
+                keyed.push((key, item.clone()));
+            }
+            keyed.sort_by(|(ka, _), (kb, _)| ka.cmp(kb));
+            let result: Vec<Value> = keyed.into_iter().map(|(_, v)| v).collect();
+            Ok(Value::list(result))
+        },
+        |args| {
+            check_arity!(args, "sort-by", 2);
+            let items = get_sequence(&args[1], "sort-by")?;
+            Ok(sort_by_call(&args[0], &items))
+        },
+    );
 
     register_fn(env, "flatten-deep", |args| {
         check_arity!(args, "flatten-deep", 1);

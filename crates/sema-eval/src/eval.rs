@@ -427,18 +427,18 @@ impl Interpreter {
 
     /// Evaluate in the global environment so that `define` persists across calls.
     ///
-    /// PRIMARY eval flip (Task 03 Step 2): routes through the unified cooperative
-    /// runtime (`run_exprs_via_runtime`) — the interpreter's single persistent
-    /// runtime IS the evaluator for `Interpreter::eval`. `eval_str_compiled`
-    /// (backing `common::eval` / CLI `-e`) stays on the legacy VM path.
+    /// Routes through the unified cooperative runtime (`run_exprs_via_runtime`):
+    /// the interpreter's single persistent runtime IS the sole evaluator for
+    /// every real eval entry point (this, `eval_str_in_global`, and
+    /// `eval_str_compiled` all share it).
     pub fn eval_in_global(&self, expr: &Value) -> EvalResult {
         self.run_exprs_via_runtime(std::slice::from_ref(expr))
     }
 
     /// Parse and evaluate in the global environment so that `define` persists across calls.
     ///
-    /// PRIMARY eval flip (Task 03 Step 2): routes through the unified cooperative
-    /// runtime — see [`eval_in_global`](Self::eval_in_global).
+    /// Routes through the unified cooperative runtime — see
+    /// [`eval_in_global`](Self::eval_in_global).
     pub fn eval_str_in_global(&self, input: &str) -> EvalResult {
         let (exprs, spans) = sema_reader::read_many_with_spans(input)?;
         self.ctx.merge_span_table(spans);
@@ -448,55 +448,17 @@ impl Interpreter {
         self.run_exprs_via_runtime(&exprs)
     }
 
-    /// Parse, compile to bytecode, and execute via the VM (global env, persists).
+    /// Parse a program and evaluate it in the global env (`define`s persist),
+    /// driven through the unified cooperative runtime. Backs `common::eval` and
+    /// the CLI `-e` path; behaves identically to
+    /// [`eval_str_in_global`](Self::eval_str_in_global).
     pub fn eval_str_compiled(&self, input: &str) -> EvalResult {
         let (exprs, spans) = sema_reader::read_many_with_spans(input)?;
         self.ctx.merge_span_table(spans);
         if exprs.is_empty() {
             return Ok(Value::nil());
         }
-        self.run_exprs_on_vm(&exprs, &self.global_env)
-    }
-
-    /// Macro-expand, compile, and run a sequence of top-level forms on the VM,
-    /// rooted at `globals`. Shared by every eval entry point (M6: single
-    /// evaluator). `define`s land in `globals`.
-    fn run_exprs_on_vm(&self, exprs: &[Value], globals: &Rc<Env>) -> EvalResult {
-        // Batch expansion: a top-level define in ANY form shadows a same-named
-        // macro in EVERY form of this program (all forms expand before any
-        // executes, so the env can't provide that shadowing naturally).
-        let expanded = expand_for_vm_batch(&self.ctx, globals, exprs)?;
-        let known_natives = collect_native_names(globals);
-        let span_map = self.ctx.span_table.borrow().clone();
-        let prog = sema_vm::compile_program_with_spans_and_natives(
-            &expanded,
-            &span_map,
-            None,
-            Some(known_natives),
-        )?;
-        let mut vm = sema_vm::VM::new(
-            globals.clone(),
-            prog.functions,
-            &prog.native_table,
-            prog.main_cache_slots,
-        )?;
-        sema_vm::init_scheduler(self.global_env.clone(), prog.native_table.clone());
-        // Reset the loop-guard step counter so the limit (if any) is per top-level
-        // eval, not cumulative across calls on a reused interpreter.
-        self.ctx.eval_steps.set(0);
-        let result = vm.execute(prog.closure, &self.ctx);
-        // Cycle-collector safe point (CORE-2): a top-level form just finished
-        // (REPL line, notebook cell, script form, embedded eval), so no VM
-        // frames or env borrows are live. Pins skip descent into this
-        // interpreter's global namespace; the scheduler's globals are the same
-        // env (init_scheduler above), so the one chain covers both.
-        if sema_core::gc_should_collect() {
-            sema_core::gc_threshold_collect(
-                &sema_core::gc_env_chain_pins(&self.global_env),
-                sema_core::GcTrigger::EvalReturn,
-            );
-        }
-        result
+        self.run_exprs_via_runtime(&exprs)
     }
 
     /// Compile source code to bytecode without executing.

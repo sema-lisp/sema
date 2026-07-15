@@ -493,3 +493,40 @@ tracked as bugs to fix later — the audit checked them and closed them):
   with a `Value`" shape here — offloading only the file read would still leave
   the (usually larger) compile step blocking. Not worth the complexity for a
   one-shot, per-module cost.
+
+## Unified runtime migration — deferred
+
+**Context (2026-07-15, Step D0 — the universal eval flip).** Every real eval
+entry point (`eval_str_compiled`, `eval_str_in_global`, `eval_in_global`) now
+drives the unified cooperative `Runtime` — it is the sole async engine for CLI,
+MCP, notebook, REPL, and tests. The legacy thread-local scheduler
+(`init_scheduler` + `VM::execute`) remains only in code paths not yet migrated
+(see below). Two async tests are `#[ignore]`d pending later steps of this
+rearchitecture:
+
+- **`vm_eval_is_vm_native_runs_async`** (`crates/sema/tests/vm_integration_test.rs`).
+  `(eval '(await (async (+ 40 2))))` fails with "no async scheduler registered".
+  Root cause: the nested-`eval` callback (`eval_value_vm` in
+  `crates/sema-eval/src/eval.rs`) runs the eval'd form on a FRESH `VM::execute`
+  without a runtime quantum, so an async op inside it looks for the legacy
+  scheduler (no longer initialized on the main path) instead of the unified
+  runtime. Making nested `eval` run its forms re-entrantly under the SAME
+  runtime requires the parent-VM parking / callback re-entry machinery
+  (`NativeOutcome::Call` for eval) — that is **Step G (legacy callback re-entry
+  migration)**. Restore this test there.
+
+- **`event_select_yields_to_sibling_in_async_context`**
+  (`crates/sema/tests/vm_async_test.rs`). Under the runtime, `event/select`
+  resolves its own marker before a co-scheduled sibling runs (observed order
+  `[select-done, sibling-ran]`, expected `[sibling-ran, select-done]`). Root
+  cause: `event/select` is an I/O op still on the legacy `AwaitIo(IoHandle)`
+  bridge, which does not yield cooperatively BEFORE parking under the runtime.
+  The fix is the **Step F (external I/O sites → `WaitKind::External`)**
+  conversion, which makes the op yield to siblings before it parks. Restore this
+  test there.
+
+**DAP + wasm async debugging remain on the legacy scheduler.** The unified
+`Runtime` has no cooperative-debug / step mode yet, so async breakpoints and
+cooperative stepping (`crates/sema-dap`, `crates/sema-wasm`) still call
+`init_scheduler` + `VM::execute`. This is a known deferral to address when a
+runtime debug/step API exists; SYNC debugging is unaffected by the eval flip.

@@ -270,7 +270,7 @@ fn coop_async_step_over_and_out_use_task_depth() {
                 "StepOut must not stop INSIDE the async task body (lines 2-4), got {info:?}"
             ),
             VmExecResult::Finished(_) | VmExecResult::Yielded | VmExecResult::AsyncYield(_) => {}
-            VmExecResult::QuantumExpired { .. } => {
+            VmExecResult::QuantumExpired { .. } | VmExecResult::Pending(_) => {
                 unreachable!("debug stepping does not install a runtime quantum")
             }
         }

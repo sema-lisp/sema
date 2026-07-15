@@ -146,9 +146,11 @@ fn condition_constructors_produce_exact_stable_maps() {
         Some(scope_id),
         Some(operation_id),
         Some("http/get"),
-        Some(u64::MAX),
+        Some(30_000),
         Some("socket"),
     );
+    // Numeric condition fields are integers per the plan's language-facing
+    // contract (a caller does arithmetic on :duration-ms / :root-id).
     let expected_cancelled = BTreeMap::from([
         (Value::keyword("type"), Value::keyword("cancelled")),
         (
@@ -159,14 +161,11 @@ fn condition_constructors_produce_exact_stable_maps() {
             Value::keyword("reason"),
             Value::keyword("resource-disconnect"),
         ),
-        (Value::keyword("root-id"), Value::string("1")),
-        (Value::keyword("scope-id"), Value::string("1")),
-        (Value::keyword("operation-id"), Value::string("1")),
+        (Value::keyword("root-id"), Value::int(1)),
+        (Value::keyword("scope-id"), Value::int(1)),
+        (Value::keyword("operation-id"), Value::int(1)),
         (Value::keyword("operation"), Value::string("http/get")),
-        (
-            Value::keyword("duration-ms"),
-            Value::string(&u64::MAX.to_string()),
-        ),
+        (Value::keyword("duration-ms"), Value::int(30_000)),
         (Value::keyword("resource-kind"), Value::string("socket")),
     ]);
     assert!(
@@ -176,7 +175,7 @@ fn condition_constructors_produce_exact_stable_maps() {
     let timeout = SemaError::timeout_condition(
         "operation timed out",
         "http/get",
-        u64::MAX,
+        30_000,
         Some(operation_id),
     );
     let expected_timeout = BTreeMap::from([
@@ -186,11 +185,8 @@ fn condition_constructors_produce_exact_stable_maps() {
             Value::string("operation timed out"),
         ),
         (Value::keyword("operation"), Value::string("http/get")),
-        (
-            Value::keyword("duration-ms"),
-            Value::string(&u64::MAX.to_string()),
-        ),
-        (Value::keyword("operation-id"), Value::string("1")),
+        (Value::keyword("duration-ms"), Value::int(30_000)),
+        (Value::keyword("operation-id"), Value::int(1)),
     ]);
     assert!(
         matches!(timeout, SemaError::Condition(value) if value == Value::map(expected_timeout))

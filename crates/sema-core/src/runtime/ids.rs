@@ -272,19 +272,23 @@ mod tests {
     }
 
     #[test]
-    fn condition_ids_preserve_the_maximum_value_as_decimal_text() {
-        let operation_id = IdCounter::<OperationId>::starting_at(u64::MAX)
+    fn condition_ids_are_emitted_as_integers() {
+        // Numeric condition fields are integers per the plan's language-facing
+        // contract (callers do arithmetic on :duration-ms / :operation-id).
+        // Ids are monotonic counters and durations are bounded, so every real
+        // value fits an i64; a large-but-representable id round-trips losslessly.
+        let big: u64 = 1_000_000_000_000;
+        let operation_id = IdCounter::<OperationId>::starting_at(big)
             .allocate()
-            .expect("maximum operation ID");
+            .expect("large operation ID");
         let condition =
-            SemaError::timeout_condition("timed out", "runtime/wait", u64::MAX, Some(operation_id));
-        let maximum = u64::MAX.to_string();
+            SemaError::timeout_condition("timed out", "runtime/wait", big, Some(operation_id));
         let expected = BTreeMap::from([
             (Value::keyword("type"), Value::keyword("timeout")),
             (Value::keyword("message"), Value::string("timed out")),
             (Value::keyword("operation"), Value::string("runtime/wait")),
-            (Value::keyword("duration-ms"), Value::string(&maximum)),
-            (Value::keyword("operation-id"), Value::string(&maximum)),
+            (Value::keyword("duration-ms"), Value::int(big as i64)),
+            (Value::keyword("operation-id"), Value::int(big as i64)),
         ]);
 
         assert!(matches!(condition, SemaError::Condition(value) if value == Value::map(expected)));

@@ -372,7 +372,7 @@ fn cancel_reason_keyword(reason: CancelReason) -> &'static str {
 
 fn insert_decimal(condition: &mut BTreeMap<Value, Value>, key: &str, value: Option<u64>) {
     if let Some(value) = value {
-        condition.insert(Value::keyword(key), Value::string(&value.to_string()));
+        condition.insert(Value::keyword(key), Value::int(value as i64));
     }
 }
 
@@ -431,7 +431,7 @@ impl SemaError {
             (Value::keyword("operation"), Value::string(operation)),
             (
                 Value::keyword("duration-ms"),
-                Value::string(&duration_ms.to_string()),
+                Value::int(duration_ms as i64),
             ),
         ]);
         insert_decimal(

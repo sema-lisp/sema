@@ -296,6 +296,32 @@ impl NativeFn {
         }
     }
 
+    /// Constructs a native carrying BOTH the legacy value ABI and the runtime
+    /// ABI. The runtime callback drives the native under the unified cooperative
+    /// runtime (where a [`TaskContext`](crate::runtime::TaskContext) is
+    /// installed); the legacy `func` runs it everywhere else (a bare top-level
+    /// eval and the legacy scheduler). `async/sleep` uses this so it suspends
+    /// structurally under the runtime yet still sleeps synchronously — or yields
+    /// the legacy signal — outside it.
+    ///
+    /// Invariant I2 applies to both callbacks: do not strongly capture a
+    /// `Value`, `Env`, or a transitive owner. Put traceable state in a registered
+    /// payload; host infrastructure may capture `Weak` handles.
+    pub fn simple_with_runtime(
+        name: impl Into<String>,
+        func: impl Fn(&[Value]) -> Result<Value, SemaError> + 'static,
+        runtime: impl for<'a> Fn(&mut NativeCallContext<'a>, &[Value]) -> NativeResult + 'static,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            func: Box::new(move |_ctx, args| func(args)),
+            runtime_func: Some(Box::new(runtime)),
+            payload: None,
+            param_names: None,
+            is_closure: false,
+        }
+    }
+
     #[doc(hidden)]
     /// Invokes the runtime ABI, using `eval_context` only for the legacy
     /// callback fallback when no runtime-aware callback exists.

@@ -1432,7 +1432,14 @@ impl Runtime {
         // stack slots from the cells before running so the resumed frame observes
         // the callback's `set!` write-backs.
         vm.sync_tracked_upvalues_to_stack();
-        let quantum = vm.run_quantum(&context, instruction_limit);
+        // Snapshot the task's cancellation for this quantum: every native driven
+        // through the runtime ABI reads it via `NativeCallContext`. Mirrors
+        // `invoke_callable`'s `CancellationView` construction.
+        let cancellation = {
+            let cancel = task.record.cancellation();
+            CancellationView::new(cancel.is_some(), cancel.map(|request| request.reason))
+        };
+        let quantum = vm.run_quantum(&context, instruction_limit, cancellation);
         drop(quantum_guard);
         self.state.borrow_mut().turn_instructions += quantum.instructions;
         let action = match quantum.outcome {
@@ -1546,6 +1553,21 @@ impl Runtime {
                     }
                 }
             },
+            // A native suspended structurally through the runtime ABI (the VM
+            // parked its frame — pc past the call, a nil placeholder on its stack
+            // top — exactly as the `NativeYield` arm above). Move the parent VM OUT
+            // of `vm_call` into the return owner so the continuation machine can
+            // reuse `vm_call` for any callback VMs, then dispatch the carried
+            // `NativeOutcome`; the parent VM is reinstalled and resumed with the
+            // value once the outcome finishes driving (see `reinstall_parent_vm`).
+            Ok(VmExecResult::Pending(pending)) => {
+                let parent = task.vm_owner.take().expect("VM call has a return owner");
+                let owner = ReturnOwner::VmResume {
+                    vm: Box::new(vm),
+                    parent: Box::new(parent),
+                };
+                TaskAction::VmResult(task_id, owner, Ok(pending.into_outcome()))
+            }
             Ok(VmExecResult::Finished(value)) => TaskAction::VmResult(
                 task_id,
                 task.vm_owner.take().expect("VM call has a return owner"),

@@ -1269,6 +1269,17 @@ fn run_until_reentrant(
             Ok(VmExecResult::AsyncYield(reason)) => {
                 task.state = TaskState::Blocked(reason);
             }
+            // The legacy scheduler installs no `TaskContext`, so its natives take
+            // the legacy value ABI and never surface a structural suspension; a
+            // `Pending` here would be a routing bug, so fail the task rather than
+            // silently stalling it.
+            Ok(VmExecResult::Pending(_)) => {
+                *task.promise.state.borrow_mut() = PromiseState::Rejected(
+                    "internal error: structural native suspension on the legacy scheduler"
+                        .to_string(),
+                );
+                task.state = TaskState::Failed;
+            }
             Ok(VmExecResult::Stopped(_)) => {
                 // Cooperative debug pause (see `step_task_debug`): keep the task
                 // Ready/paused so the next scheduler re-drive continues it.

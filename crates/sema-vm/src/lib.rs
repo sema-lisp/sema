@@ -23,7 +23,7 @@ pub use core_expr::{
 pub use debug::{
     decode_scope_ref, scope_locals_ref, scope_upvalues_ref, DapBreakpoint, DebugCommand,
     DebugEvent, DebugState, ScopeKind, SourceBreakpoint, StepMode, StopInfo, StopReason,
-    VmExecResult, VmQuantumResult,
+    VmExecResult, VmPendingOutcome, VmQuantumResult,
 };
 pub use disasm::disassemble;
 pub use emit::Emitter;

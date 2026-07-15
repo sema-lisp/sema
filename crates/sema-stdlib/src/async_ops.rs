@@ -2,7 +2,11 @@ use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::rc::Rc;
 
-use sema_core::runtime::ChannelQuery;
+use sema_core::cycle::GcEdge;
+use sema_core::runtime::{
+    ChannelQuery, NativeCallContext, NativeContinuation, NativeOutcome, NativeResult, NativeSuspend,
+    ResumeInput, Trace, WaitKind,
+};
 use sema_core::{
     call_run_scheduler, call_run_scheduler_all_of, call_run_scheduler_any_of,
     call_run_scheduler_timeout, call_spawn_callback, check_arity, in_async_context,
@@ -70,6 +74,52 @@ fn cancelled_error() -> SemaError {
         None,
         None,
     )
+}
+
+/// Validate and cap `async/sleep`'s duration argument, returning the sleep in
+/// whole milliseconds. Shared by the legacy and runtime dispatch paths.
+fn sleep_duration_ms(args: &[Value]) -> Result<u64, SemaError> {
+    check_arity!(args, "async/sleep", 1);
+    let ms = duration_ms(&args[0], "async/sleep")?;
+    // Cap the duration (mirrors async/timeout). The runtime/scheduler virtual
+    // clock jumps straight to a sleeper's wake time and, on native, waits that
+    // whole delta in one `thread::sleep`; without a bound an out-of-range
+    // duration would wedge the thread for years and could overflow the clock.
+    const MAX_SLEEP_MS: i64 = 86_400_000; // 1 day
+    if ms > MAX_SLEEP_MS {
+        return Err(SemaError::eval(format!(
+            "async/sleep: duration {ms} ms exceeds maximum {MAX_SLEEP_MS} ms (1 day)"
+        ))
+        .with_hint("use a shorter sleep, or loop with smaller sleeps"));
+    }
+    Ok(ms as u64)
+}
+
+/// Continuation for `async/sleep` under the unified runtime. A timer wait carries
+/// no value, so a normal fire resumes the parked frame with nil; a cancellation
+/// or failure while sleeping propagates the corresponding error. Holds no state.
+struct SleepCont;
+
+impl Trace for SleepCont {
+    fn trace(&self, _sink: &mut dyn FnMut(GcEdge<'_>)) -> bool {
+        true
+    }
+}
+
+impl NativeContinuation for SleepCont {
+    fn resume(
+        self: Box<Self>,
+        _context: &mut NativeCallContext<'_>,
+        input: ResumeInput,
+    ) -> NativeResult {
+        match input {
+            ResumeInput::Failed(error) => Err(error),
+            ResumeInput::Cancelled(_) => Err(cancelled_error()),
+            ResumeInput::Returned(_) | ResumeInput::Runtime(_) => {
+                Ok(NativeOutcome::Return(Value::nil()))
+            }
+        }
+    }
 }
 
 // ── Helpers ──────────────────────────────────────────────────────
@@ -549,43 +599,40 @@ fn register_promise_ops(env: &Env) {
         ))
     });
 
-    // async/sleep — yield for a duration in milliseconds
-    register_fn(env, "async/sleep", |args| {
-        check_arity!(args, "async/sleep", 1);
-        let ms = duration_ms(&args[0], "async/sleep")?;
-        if ms < 0 {
-            return Err(SemaError::eval(
-                "async/sleep: duration must be non-negative",
-            ));
-        }
-        // Cap the duration (mirrors async/timeout). The scheduler's virtual
-        // clock jumps straight to a sleeper's wake time and, on native, waits
-        // that whole delta in one `thread::sleep`; without a bound an
-        // out-of-range duration would wedge the thread for years and could
-        // overflow the virtual clock.
-        const MAX_SLEEP_MS: i64 = 86_400_000; // 1 day
-        if ms > MAX_SLEEP_MS {
-            return Err(SemaError::eval(format!(
-                "async/sleep: duration {ms} ms exceeds maximum {MAX_SLEEP_MS} ms (1 day)"
-            ))
-            .with_hint("use a shorter sleep, or loop with smaller sleeps"));
-        }
-        if in_async_context() || in_runtime_quantum() {
-            if let Some(cached) = take_resume_value() {
-                return Ok(cached);
-            }
-            // Under the unified runtime, the VM surfaces this yield as an
-            // `AsyncYield(Sleep)` that the runtime registers as a timer wait;
-            // when the timer fires it resumes this frame with nil. Under the
-            // legacy scheduler the resume value is fed via `take_resume_value`.
-            set_yield_signal(YieldReason::Sleep(ms as u64));
-            return Ok(Value::nil());
-        }
-        // Outside async, actually sleep
-        #[cfg(not(target_arch = "wasm32"))]
-        std::thread::sleep(std::time::Duration::from_millis(ms as u64));
-        Ok(Value::nil())
-    });
+    // async/sleep — suspend for a duration in milliseconds.
+    //
+    // Under the unified cooperative runtime (a `TaskContext` is installed) the
+    // native suspends structurally on a timer wait; `SleepCont` resumes the
+    // parked frame with nil when it fires. Outside the runtime — a bare top-level
+    // eval or the legacy scheduler — the legacy value ABI runs: it sleeps
+    // synchronously, or yields the `Sleep` signal to the legacy scheduler.
+    env.set(
+        sema_core::intern("async/sleep"),
+        Value::native_fn(NativeFn::simple_with_runtime(
+            "async/sleep",
+            |args| {
+                let ms = sleep_duration_ms(args)?;
+                if in_async_context() || in_runtime_quantum() {
+                    if let Some(cached) = take_resume_value() {
+                        return Ok(cached);
+                    }
+                    set_yield_signal(YieldReason::Sleep(ms));
+                    return Ok(Value::nil());
+                }
+                // Outside async, actually sleep.
+                #[cfg(not(target_arch = "wasm32"))]
+                std::thread::sleep(std::time::Duration::from_millis(ms));
+                Ok(Value::nil())
+            },
+            |_ctx, args| {
+                let ms = sleep_duration_ms(args)?;
+                Ok(NativeOutcome::Suspend(NativeSuspend {
+                    wait: WaitKind::Timer(std::time::Duration::from_millis(ms)),
+                    continuation: Box::new(SleepCont),
+                }))
+            },
+        )),
+    );
 }
 
 // ── Channel operations ───────────────────────────────────────────

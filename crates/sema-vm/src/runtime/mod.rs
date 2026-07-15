@@ -10,7 +10,7 @@ mod timer;
 mod wait;
 
 pub use drive::{BoundedDriver, DriveBudget, DriveReport, DriveState, RuntimeClock};
-pub use host::{MonotonicClock, NullExecutor};
+pub use host::{MonotonicClock, NullExecutor, ThreadPoolExecutor};
 pub use ready::ReadyScheduler;
 pub use root::{RootRecord, RootState, RootTransitionError};
 #[cfg(test)]

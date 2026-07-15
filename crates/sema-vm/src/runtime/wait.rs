@@ -402,6 +402,35 @@ impl WaitRuntime {
         Some((CompletionRoute::Late, None))
     }
 
+    /// Block the calling (VM) thread until a completion is available on the
+    /// inbox or `deadline` elapses, buffering any received completion so the next
+    /// drive turn delivers it. Returns `true` if a completion is now buffered.
+    /// A `None` deadline blocks until a completion arrives or the inbox is
+    /// closed — used when a task is parked on an external op with no timer bound,
+    /// where a worker completion is guaranteed to arrive. Never busy-spins.
+    pub fn block_on_inbox(&mut self, deadline: Option<Instant>) -> bool {
+        if !self.deferred.is_empty() {
+            return true;
+        }
+        let Some(inbox) = self.inbox.as_ref() else {
+            return false;
+        };
+        let received = match deadline {
+            Some(deadline) => {
+                let timeout = deadline.saturating_duration_since(Instant::now());
+                inbox.recv_timeout(timeout).ok()
+            }
+            None => inbox.recv().ok(),
+        };
+        match received {
+            Some(completion) => {
+                self.deferred.push_back(completion);
+                true
+            }
+            None => false,
+        }
+    }
+
     pub fn next_completion_task_id(&mut self) -> Option<TaskId> {
         if self.deferred.is_empty() {
             if let Ok(completion) = self

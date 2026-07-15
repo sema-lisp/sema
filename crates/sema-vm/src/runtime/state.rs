@@ -695,6 +695,23 @@ impl Runtime {
         }
     }
 
+    /// Block the driving (VM) thread until an external completion lands on the
+    /// inbox or `deadline` elapses, buffering it for the next [`drive`] turn.
+    /// Called by a host drive loop when [`DriveState::Idle`] reports
+    /// `inbox_wakeup_required`: a task is parked on an external operation running
+    /// on a worker thread, so the VM thread has no work until that worker
+    /// delivers. Returns `true` if a completion is now buffered. Bounded and
+    /// wakeable (an arriving completion returns immediately); never busy-spins.
+    ///
+    /// [`drive`]: Self::drive
+    pub fn block_on_inbox(&self, deadline: Option<Instant>) -> bool {
+        self.state
+            .borrow_mut()
+            .waits
+            .as_mut()
+            .is_some_and(|waits| waits.block_on_inbox(deadline))
+    }
+
     fn fire_timer(&self) -> Result<bool, RuntimeFault> {
         let mut state = self.state.borrow_mut();
         let now = state.clock.now();

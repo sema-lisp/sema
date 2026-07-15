@@ -1154,6 +1154,43 @@ occurrence and classification in evidence.
       Remaining flip blockers (unchanged by this): (1) native synchronous
       call_callback loops (`agent/run`) re-entry ABI, and (3) native-stack budget
       of the runtime drive (deep-recursion parity) + bounded interpreter-drop join._
+    - _Progress (2026-07-15): FLIP BLOCKER (3) — ROBUSTNESS: STACK-PARITY +
+      BOUNDED DROP-JOIN — LANDED (independent of the flip; the `*_via_runtime`
+      entry points already exercise both). (3a) DEEP-RECURSION PARITY: verified
+      the runtime drive (`run_quantum` chain) uses NO more native stack PER SEMA
+      LEVEL than legacy `VM::execute` — both drive the same iterative `run_inner`
+      loop and the VM's `MAX_FRAMES` guard raises a graceful "stack overflow:
+      maximum call depth exceeded" before native overflow, so a deeply-recursive
+      program that legacy handles hits the SAME graceful error through the runtime
+      (no SIGABRT), and a deep-but-finite recursion returns the same value. No VM
+      refactor was needed — parity already holds. Locked in with un-ignored gates
+      in `mod runtime_eval_tests` (`crates/sema-eval/src/eval.rs`):
+      `runtime_deep_recursion_matches_legacy_overflow_error`,
+      `runtime_deep_finite_recursion_matches_legacy`,
+      `runtime_native_reentry_recursion_matches_legacy` (all run on the small
+      default test-thread stack so a per-level native-stack regression aborts
+      there, not silently on a fat main stack). (3b) BOUNDED EXECUTOR DROP-JOIN:
+      fixed a `"Resource deadlock avoided"` (EDEADLK) self-join that fired on
+      EVERY interpreter drop — the `ThreadPoolExecutor`'s `PoolInner` owns each
+      worker's `JoinHandle` while each worker holds an `Arc<PoolInner>`, so the
+      last worker to release its `Arc` ran `PoolInner::Drop` on its own thread and
+      joined itself. `PoolInner::Drop` now skips the current thread's handle
+      (detaches the exiting self-worker), and a new `ThreadPoolExecutor::Drop`
+      backstop disconnects the sender so idle workers always exit even without an
+      explicit `shutdown` (host.rs). Interpreter drop with an in-flight
+      external-wait executor job (`sleep`) is now bounded by the 2s shutdown
+      deadline — no deadlock, hang, or panic. Gates:
+      `runtime_drop_with_inflight_executor_job_is_bounded`
+      (`crates/sema-eval/src/eval.rs`) and `drop_without_shutdown_is_bounded`
+      (`crates/sema-vm/src/runtime/host.rs`). Verified: sema-eval 117/0, sema-vm
+      485/0, eval_test 1072/0, integration_test 1055/0, vm_async_test STILL 114/4
+      (same 4 pre-existing RED), leak_test 48/0 + gc_stress_test 7/0 (drop safety
+      — no hang/leak/abort), `cargo check --workspace --tests` exit 0, clippy
+      (`-p sema-vm -p sema-eval --tests -D warnings`) + fmt clean. REMAINING FLIP
+      BLOCKER is now the SINGLE native-callback-loop ABI: synchronous
+      `call_callback` re-entry (`agent/run` / LLM streaming) cannot re-enter a VM
+      during an active runtime quantum. Blockers (2) deadlock-detection and (3)
+      robustness are closed._
 
 - [ ] **Step 3: Remove TLS scheduler ownership**
 

@@ -76,8 +76,21 @@ impl ExecutorLease for NullLease {
 /// worker delivers the raw completion into the runtime inbox and the VM thread
 /// decodes it. Concurrency is genuine: two blocking jobs land on two workers and
 /// overlap, so `async/spawn`ed blocking operations no longer serialize.
+///
+/// Worker liveness is tied to the channel's senders via RAII, not to this
+/// struct's `Drop`. The executor and every lease it hands out each hold their
+/// OWN `Sender` clone; the workers hold the shared `Receiver`. The channel
+/// disconnects — and idle workers exit — exactly when the executor AND all of
+/// its leases have dropped (every `Sender` clone gone), never merely because the
+/// top-level `ThreadPoolExecutor` struct was dropped while a lease is still
+/// alive. That is what lets `Runtime::new` retain only the lease (dropping the
+/// executor struct immediately) and keep submitting successfully.
 pub struct ThreadPoolExecutor {
     inner: Arc<PoolInner>,
+    /// The executor's own `Sender` clone. Held only to keep the worker channel
+    /// connected for as long as the executor lives; leases carry their own
+    /// clones for actual submission.
+    tx: Sender<ExecutorDispatch>,
 }
 
 impl ThreadPoolExecutor {
@@ -96,7 +109,6 @@ impl ThreadPoolExecutor {
         let workers = workers.max(1);
         let (tx, rx) = mpsc::channel::<ExecutorDispatch>();
         let inner = Arc::new(PoolInner {
-            tx: Mutex::new(Some(tx)),
             handles: Mutex::new(Vec::with_capacity(workers)),
             running: Mutex::new(0),
             idle_signal: Condvar::new(),
@@ -110,25 +122,13 @@ impl ThreadPoolExecutor {
             handles.push(std::thread::spawn(move || worker_loop(&rx, &inner)));
         }
         drop(handles);
-        Self { inner }
+        Self { inner, tx }
     }
 }
 
 impl Default for ThreadPoolExecutor {
     fn default() -> Self {
         Self::new()
-    }
-}
-
-impl Drop for ThreadPoolExecutor {
-    fn drop(&mut self) {
-        // Liveness backstop: disconnect the sender so idle workers observe the
-        // channel close and exit even if `shutdown` was never called. Without
-        // this, workers block on `recv` forever (the tx lives inside the
-        // `Arc<PoolInner>` they themselves keep alive), so `PoolInner::Drop`
-        // would never run and the threads would leak. Idempotent with
-        // `PoolInner::shutdown`, which also takes the sender.
-        self.inner.tx.lock().expect("pool sender lock").take();
     }
 }
 
@@ -139,9 +139,12 @@ impl IoExecutor for ThreadPoolExecutor {
     ) -> Result<Arc<dyn ExecutorLease>, ExecutorAttachError> {
         // The pool is stateless per runtime — each dispatch already carries the
         // runtime-scoped completion sink — so a fresh lease sharing the same
-        // workers serves every attached runtime.
+        // workers serves every attached runtime. The lease gets its OWN `Sender`
+        // clone so it keeps the worker channel connected independently of the
+        // executor struct's lifetime.
         Ok(Arc::new(ThreadPoolLease {
             inner: Arc::clone(&self.inner),
+            tx: Mutex::new(Some(self.tx.clone())),
         }))
     }
 
@@ -152,6 +155,11 @@ impl IoExecutor for ThreadPoolExecutor {
 
 struct ThreadPoolLease {
     inner: Arc<PoolInner>,
+    /// This lease's own `Sender` clone, routing into the shared worker pool.
+    /// `None` once this lease's `shutdown` was called: further submissions on
+    /// this lease are rejected, but sibling leases (and the executor) keep their
+    /// own senders — so the pool stays up for them.
+    tx: Mutex<Option<Sender<ExecutorDispatch>>>,
 }
 
 impl ExecutorLease for ThreadPoolLease {
@@ -159,7 +167,18 @@ impl ExecutorLease for ThreadPoolLease {
         &self,
         submission: ExecutorSubmission,
     ) -> Result<RunningSubmission, SubmissionRejected> {
-        self.inner.submit(submission)
+        let operation_id = submission.operation_id();
+        let guard = self.tx.lock().expect("pool sender lock");
+        let Some(tx) = guard.as_ref() else {
+            return Err(submission.reject(SubmitErrorKind::ShuttingDown));
+        };
+        // The channel is unbounded and the workers hold the receiver as long as
+        // any sender is alive; this lease holds one under the lock, so the armed
+        // `Send` dispatch cannot be refused.
+        self.inner.metrics.queued.fetch_add(1, Ordering::Relaxed);
+        tx.send(submission.into_dispatch())
+            .expect("worker receiver alive while sender held");
+        Ok(RunningSubmission::new(operation_id))
     }
 
     fn snapshot(&self) -> ExecutorSnapshot {
@@ -167,7 +186,12 @@ impl ExecutorLease for ThreadPoolLease {
     }
 
     fn shutdown(&self, deadline: Instant) -> ExecutorShutdown {
-        self.inner.shutdown(deadline)
+        // Close only THIS lease's sender (stop accepting work on this lease) and
+        // then wait, bounded by the deadline, for in-flight jobs to drain. Sibling
+        // leases and the executor keep their own senders, so the pool is not torn
+        // down out from under them.
+        self.tx.lock().expect("pool sender lock").take();
+        self.inner.drain(deadline)
     }
 }
 
@@ -183,36 +207,15 @@ struct Metrics {
 }
 
 struct PoolInner {
-    /// `None` once shutdown has begun: submissions are rejected and idle workers
-    /// observe the channel disconnect and exit.
-    tx: Mutex<Option<Sender<ExecutorDispatch>>>,
     handles: Mutex<Vec<JoinHandle<()>>>,
-    /// Count of dispatches currently executing on a worker; shutdown blocks on
-    /// this reaching zero (bounded by the deadline).
+    /// Count of dispatches currently executing on a worker; a lease `shutdown`
+    /// blocks on this reaching zero (bounded by the deadline).
     running: Mutex<usize>,
     idle_signal: Condvar,
     metrics: Metrics,
 }
 
 impl PoolInner {
-    fn submit(
-        &self,
-        submission: ExecutorSubmission,
-    ) -> Result<RunningSubmission, SubmissionRejected> {
-        let operation_id = submission.operation_id();
-        let guard = self.tx.lock().expect("pool sender lock");
-        let Some(tx) = guard.as_ref() else {
-            return Err(submission.reject(SubmitErrorKind::ShuttingDown));
-        };
-        // Capacity is secured (the channel is unbounded) and the workers still
-        // hold the receiver while the sender is present under this lock, so the
-        // armed `Send` dispatch cannot be refused.
-        self.metrics.queued.fetch_add(1, Ordering::Relaxed);
-        tx.send(submission.into_dispatch())
-            .expect("worker receiver alive while sender held");
-        Ok(RunningSubmission::new(operation_id))
-    }
-
     fn snapshot(&self) -> ExecutorSnapshot {
         let m = &self.metrics;
         ExecutorSnapshot {
@@ -226,9 +229,11 @@ impl PoolInner {
         }
     }
 
-    fn shutdown(&self, deadline: Instant) -> ExecutorShutdown {
-        // Stop accepting work and disconnect idle workers.
-        self.tx.lock().expect("pool sender lock").take();
+    /// Bounded drain: wait for in-flight jobs to finish, capped by `deadline`.
+    /// The caller (a lease's `shutdown`) has already closed its own sender; this
+    /// does NOT disconnect the channel (sibling leases / the executor may still
+    /// hold senders), it only waits out the currently-running jobs.
+    fn drain(&self, deadline: Instant) -> ExecutorShutdown {
         let mut running = self.running.lock().expect("pool running lock");
         while *running > 0 {
             let now = Instant::now();
@@ -257,10 +262,13 @@ impl PoolInner {
 
 impl Drop for PoolInner {
     fn drop(&mut self) {
-        // Disconnect (idempotent) and join every worker. Idle workers have
-        // already exited once the sender dropped; a worker still inside a job
-        // exits as soon as that finite job returns, so the join is bounded.
-        self.tx.lock().expect("pool sender lock").take();
+        // `PoolInner` only drops once its last `Arc` ref is released. Every
+        // sender clone lives outside `PoolInner` (in the executor + its leases),
+        // and each worker holds an `Arc<PoolInner>` — so this `Drop` cannot run
+        // until all senders are gone, the channel has disconnected, and the
+        // workers have begun exiting. Idle workers have already left `recv`; a
+        // worker still inside a job exits as soon as that finite job returns, so
+        // the join below is bounded.
         let handles = std::mem::take(&mut *self.handles.lock().expect("pool handles lock"));
         // A worker holds its own `Arc<PoolInner>`, and `PoolInner` owns that
         // worker's `JoinHandle` — so once the tx drops and the workers exit,
@@ -524,6 +532,43 @@ mod thread_pool_tests {
         // Give the detached worker time to finish its job and self-drop the pool;
         // a self-join regression would panic/abort on that worker thread.
         std::thread::sleep(Duration::from_millis(200));
+    }
+
+    /// Regression: the `Runtime` construction path retains only the executor's
+    /// LEASE (`Runtime::new` drops the `ThreadPoolExecutor` struct right after
+    /// attaching). Dropping the executor struct while a lease is still alive must
+    /// keep the worker pool up so later submissions on that lease still run —
+    /// otherwise every `mcp/call` (and any executor-backed external wait) is
+    /// rejected with "external operation rejected". This is the exact shape of the
+    /// `mcp_runtime_test` regression.
+    #[test]
+    fn executor_struct_dropped_before_lease_still_accepts() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let registrar_sender = Arc::new(ChannelSender(Mutex::new(tx)));
+        let (runtime_id, registrar, _issuers) =
+            CompletionRegistrar::register(registrar_sender).unwrap();
+
+        let executor = ThreadPoolExecutor::with_workers(2);
+        let lease = executor.attach_runtime(runtime_id).unwrap();
+        // Drop the top-level executor struct BEFORE submitting anything. The
+        // lease holds its own sender clone, so the workers stay up.
+        drop(executor);
+
+        let identity = registrar
+            .issue_identity(CompletionKind::try_from_raw(1).unwrap())
+            .unwrap();
+        let (_runtime, submission) = registrar
+            .bind(identity, blocking_sleep_op(10))
+            .unwrap()
+            .split();
+        assert!(
+            lease.submit(submission).is_ok(),
+            "submission on a live lease must succeed after the executor struct dropped"
+        );
+        // The job actually runs and its completion is delivered.
+        rx.recv_timeout(Duration::from_secs(2))
+            .expect("completion delivered after executor struct dropped");
+        drop(lease);
     }
 
     /// Shutdown while a job is in flight is bounded and never hangs.

@@ -14,7 +14,9 @@
 use std::sync::Arc;
 
 use sema::{Interpreter, Value};
-use sema_llm::builtins::{register_test_provider, reset_runtime_state};
+use sema_llm::builtins::{
+    io_peak_inflight, register_test_provider, reset_io_inflight, reset_runtime_state,
+};
 use sema_llm::fake::{FakeProvider, FakeRecorder};
 use serial_test::serial;
 
@@ -148,5 +150,90 @@ fn agent_run_tool_error_recovers_via_runtime() {
             .contains("kaboom"),
         "the tool error detail should reach the model, got: {:?}",
         tool_msg.content.as_text()
+    );
+}
+
+// GATE (full-flip blocker 1): two `agent/run`s spawned concurrently through the
+// UNIFIED RUNTIME must OVERLAP across their provider rounds — not serialize. Each
+// round now offloads the provider call to the executor IO pool and suspends the
+// task on an External wait, so sibling agents run during every inter-round park.
+// Proven two ways: peak offloaded futures in flight >= 2 AND a max-not-sum wall
+// clock (3 agents × 3 rounds × 120 ms ⇒ serial floor ~1080 ms, overlapped ~360 ms).
+#[test]
+#[serial]
+fn concurrent_agents_overlap_via_runtime() {
+    reset_io_inflight();
+
+    let fake = FakeProvider::builder("fake")
+        .model("fake-model")
+        .chat_delay(120)
+        .tool_loop(2, "ping", serde_json::json!({ "n": 1 }), "done")
+        .build();
+
+    let interp = Interpreter::new();
+    reset_runtime_state();
+    register_test_provider(Box::new(fake));
+
+    let program = r#"
+        (deftool ping "ping" {:n {:type :number}} (fn (n) "pong"))
+        (defagent bot {:model "fake-model" :tools [ping] :max-turns 6})
+        (let ((t0 (sys/elapsed)))
+          (async/all
+            (map (fn (i) (async/spawn (fn () (agent/run bot "go"))))
+                 (list 1 2 3)))
+          (floor (/ (- (sys/elapsed) t0) 1000000)))
+    "#;
+    let wall = interp
+        .eval_str_via_runtime(program)
+        .expect("3 concurrent agents evaluated through the runtime");
+    let wall_ms = wall.as_int().expect("wall ms");
+
+    assert!(
+        io_peak_inflight() >= 2,
+        "expected peak offloaded futures in flight >= 2 (agents overlapping across \
+         rounds), got {} — the runtime agent round still blocks the VM thread",
+        io_peak_inflight()
+    );
+    assert!(
+        wall_ms < 700,
+        "expected overlapped wall < 700 ms (serial floor ~1080 ms), got {wall_ms} ms"
+    );
+}
+
+// GATE (full-flip blocker 1): an `async/cancel` on a running `agent/run` driven
+// through the UNIFIED RUNTIME must interrupt the loop promptly — no NEW provider
+// round dispatches after the cutoff. Blocking today serialized all 9 rounds; the
+// cooperative round parks between/inside rounds, so cancellation cuts it short.
+#[test]
+#[serial]
+fn cancelling_agent_run_cuts_the_loop_short_via_runtime() {
+    reset_io_inflight();
+
+    // 8 tool rounds (9 calls) at 100 ms each ⇒ ~900 ms full; cancel at 250 ms.
+    let fake = FakeProvider::builder("fake")
+        .model("fake-model")
+        .chat_delay(100)
+        .tool_loop(8, "ping", serde_json::json!({ "n": 1 }), "done")
+        .build();
+
+    let interp = Interpreter::new();
+    reset_runtime_state();
+    let recorder = fake.recorder();
+    register_test_provider(Box::new(fake));
+
+    let program = r#"
+        (deftool ping "ping" {:n {:type :number}} (fn (n) "pong"))
+        (defagent bot {:model "fake-model" :tools [ping] :max-turns 12})
+        (let ((p (async/spawn (fn () (agent/run bot "go")))))
+          (async/spawn (fn () (async/sleep 250) (async/cancel p)))
+          (try (async/await p) (catch e nil)))
+    "#;
+    let _ = interp.eval_str_via_runtime(program);
+
+    let calls = recorder.call_count();
+    assert!(
+        calls > 0 && calls < 9,
+        "expected the cancelled runtime agent to stop short of all 9 provider rounds, \
+         but it made {calls} — cancellation could not interrupt the cooperative loop"
     );
 }

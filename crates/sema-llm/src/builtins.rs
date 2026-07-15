@@ -400,6 +400,33 @@ pub fn reset_io_inflight() {
     IO_PEAK.store(0, std::sync::atomic::Ordering::SeqCst);
 }
 
+/// RAII gauge for one offloaded completion future: bumps `IO_INFLIGHT` + `IO_PEAK`
+/// on construction and decrements (clamped at 0) on drop, so an abort that drops
+/// the future before or during its first poll can't strand the gauge at +1. Shared
+/// by the `AwaitIo` async yield and the runtime External-wait paths so both prove
+/// simultaneity the same way (`io_peak_inflight() >= 2`).
+#[cfg(not(target_arch = "wasm32"))]
+struct InflightGuard;
+
+#[cfg(not(target_arch = "wasm32"))]
+impl InflightGuard {
+    fn new() -> Self {
+        use std::sync::atomic::Ordering;
+        let prev = IO_INFLIGHT.fetch_add(1, Ordering::SeqCst) + 1;
+        IO_PEAK.fetch_max(prev, Ordering::SeqCst);
+        InflightGuard
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl Drop for InflightGuard {
+    fn drop(&mut self) {
+        use std::sync::atomic::Ordering;
+        let _ =
+            IO_INFLIGHT.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| Some((v - 1).max(0)));
+    }
+}
+
 fn set_serving_provider(name: &str) {
     LAST_SERVING_PROVIDER.with(|p| *p.borrow_mut() = Some(name.to_string()));
 }
@@ -6508,40 +6535,47 @@ fn do_complete_streaming(
     stream_with_dispatch(request, &mut chunk_cb, &span)
 }
 
-/// Concurrent counterpart to [`do_complete`] + the native's post-call accounting,
-/// for the async-scheduler-task path. Mirrors the concurrent `llm/embed` flow,
-/// scaled to a completion: it runs the on-VM-thread stage (conv scope, detached
-/// `chat` span, request attrs, cache lookup, cassette decision, fallback-chain
-/// resolution into `Arc` clones) SYNCHRONOUSLY, then SPAWNS the wire unit
-/// (`run_fallback_retry_async`) as an abortable pool future and YIELDS `AwaitIo`
-/// so sibling tasks overlap — cancel/timeout runs the handle's abort hook, which
-/// drops the in-flight request. All post-call work (span finalize, retry spans,
-/// cache store, cassette record, `track_usage`, content→Value) runs in the
-/// poller, on the VM thread, when the future lands — because the native is NOT
-/// re-invoked on resume.
-///
-/// `finalize` shapes the per-native return value from the `ChatResponse` (e.g.
-/// `Value::string(&resp.content)` for `llm/complete`). It runs in the poller on the
-/// VM thread, AFTER `track_usage`, so it may itself do further VM-thread work
-/// (e.g. `llm/extract`'s re-ask loop).
-///
-/// On a cache hit or cassette replay (no provider call) it finalizes the span,
-/// accounts ZERO usage, calls `finalize`, and returns WITHOUT yielding (nothing to
-/// overlap) — preserving the zero-usage cache-hit accounting invariant.
+/// Shapes a completed `ChatResponse` into a per-native return value on the VM
+/// thread, after `track_usage` — e.g. `Value::string(&resp.content)` for
+/// `llm/complete`, or `agent_apply_step_response` for an agent round.
 #[cfg(not(target_arch = "wasm32"))]
-fn do_complete_async_yield(
+type CompleteFinalize = Box<dyn FnOnce(ChatResponse) -> Result<Value, SemaError>>;
+
+/// On-VM-thread prep result shared by the `AwaitIo` (async scheduler) and External
+/// (unified runtime) completion-offload yields. `Inline` = a cache hit or cassette
+/// replay that made NO provider call (span already finalized); the caller accounts
+/// zero usage + finalizes without yielding. `Offload` = the wire stage must run.
+#[cfg(not(target_arch = "wasm32"))]
+enum CompletePrep {
+    Inline(ChatResponse),
+    Offload(Box<CompleteOffloadPlan>),
+}
+
+/// Everything the offloaded completion wire stage + its VM-thread finalize need,
+/// resolved on the VM thread before the offload so the pool worker touches no
+/// thread-locals. `request` is the wire request (moved into the future);
+/// `request_for_messages` is a clone kept for the span's I/O attributes.
+#[cfg(not(target_arch = "wasm32"))]
+struct CompleteOffloadPlan {
+    chain: Vec<ResolvedProvider>,
     request: ChatRequest,
-    finalize: Box<dyn FnOnce(ChatResponse) -> Result<Value, SemaError>>,
-) -> Result<Value, SemaError> {
-    use std::sync::atomic::Ordering;
+    max_retries: u32,
+    retry_base_ms: u64,
+    rate_limit_wait_ms: u64,
+    span: sema_otel::LlmSpan,
+    cache_key: Option<String>,
+    cassette_record_key: Option<String>,
+    request_for_messages: ChatRequest,
+}
 
-    // Defensive resume-value drain: the scheduler resumes the bytecode after the
-    // CALL via `replace_stack_top`, so this native is not re-invoked — but mirror
-    // `llm/embed`/`io-sleep-once` and drain any stray resume value.
-    if let Some(v) = sema_core::take_resume_value() {
-        return Ok(v);
-    }
-
+/// The on-VM-thread prep stage of an offloaded completion: open the conversation
+/// scope, start the DETACHED `chat` span, consult the response cache and cassette
+/// (either can short-circuit to `Inline`), then resolve the fallback chain +
+/// rate-limit/retry parameters into `Arc` clones the pool worker can own. Byte-for-
+/// byte the front half of the old `do_complete_async_yield`; shared so the runtime
+/// External-wait path stays in lockstep with the async path (cache/cassette/retry).
+#[cfg(not(target_arch = "wasm32"))]
+fn complete_offload_prep(request: ChatRequest) -> Result<CompletePrep, SemaError> {
     // Standalone completions get their own conversation scope (so the chat span
     // carries gen_ai.conversation.id); agent-nested ones inherit. The detached span
     // captures the conversation id at creation, so the guard need only live across
@@ -6556,9 +6590,9 @@ fn do_complete_async_yield(
         None
     };
 
-    // DETACHED chat span: parent captured now, finalized in the poller after the
-    // yield (when the active-span stack may hold a sibling task's span, so the span
-    // must not pop the stack on drop).
+    // DETACHED chat span: parent captured now, finalized when the offload lands
+    // (when the active-span stack may hold a sibling task's span, so the span must
+    // not pop the stack on drop).
     let span = sema_otel::llm_span_detached("chat");
     span.set_request(
         request.temperature,
@@ -6581,7 +6615,7 @@ fn do_complete_async_yield(
     }
     apply_call_telemetry_llm(&span);
 
-    // ── Cache lookup (hit → finalize inline, zero usage, NO yield) ────────
+    // ── Cache lookup (hit → Inline, zero usage) ──────────────────────────
     let cache_enabled = CACHE_ENABLED.with(|c| c.get());
     let cache_key = if cache_enabled {
         let key_model = if request.model.is_empty() {
@@ -6613,8 +6647,7 @@ fn do_complete_async_yield(
                 span.set_dispatch("", &resp.model);
                 span.set_response(&response_facts("", &resp));
                 drop(span);
-                track_usage(&resp.usage)?;
-                return finalize(resp);
+                return Ok(CompletePrep::Inline(resp));
             }
         }
         // Cache miss (no entry, or entry present but invalid) — mirror the sync
@@ -6625,7 +6658,7 @@ fn do_complete_async_yield(
         None
     };
 
-    // ── Cassette decision (replay → inline, no yield; miss → Err) ─────────
+    // ── Cassette decision (replay → Inline; miss → Err) ──────────────────
     // Keyed by the request as-is (no default-model resolution), matching
     // `run_completion`'s key so record/replay agree with the sync path.
     let cassette_decision = CASSETTE.with(|c| {
@@ -6640,8 +6673,7 @@ fn do_complete_async_yield(
             span.set_dispatch("cassette", &resp.model);
             span.set_response(&response_facts("cassette", &resp));
             drop(span);
-            track_usage(&resp.usage)?;
-            return finalize(resp);
+            return Ok(CompletePrep::Inline(resp));
         }
         Some((k, crate::cassette::Decision::Miss(_))) => return Err(cassette_miss_error(&k)),
         _ => {}
@@ -6655,7 +6687,7 @@ fn do_complete_async_yield(
     // Done on the VM thread so the offloaded worker touches no thread-locals.
     // Reserve this call's rate-limit slot HERE, synchronously, before the
     // offload starts (see `reserve_rate_limit_wait_ms`); the wait itself (if
-    // any) is spent inside the spawned future below, never on the VM thread.
+    // any) is spent inside the offloaded future, never on the VM thread.
     let rate_limit_wait_ms = reserve_rate_limit_wait_ms();
     let max_retries = NETWORK_MAX_RETRIES.with(|c| c.get());
     // Capture the retry-backoff base on the VM thread so the offloaded wire
@@ -6698,10 +6730,161 @@ fn do_complete_async_yield(
         }
     })?;
 
+    let request_for_messages = request.clone();
+    Ok(CompletePrep::Offload(Box::new(CompleteOffloadPlan {
+        chain,
+        request,
+        max_retries,
+        retry_base_ms,
+        rate_limit_wait_ms,
+        span,
+        cache_key,
+        cassette_record_key,
+        request_for_messages,
+    })))
+}
+
+/// VM-thread finalize for a SUCCESSFUL offloaded completion, shared by the async
+/// poller and the runtime External-wait decoder: finalize the span (retry spans,
+/// dispatch/response/messages facts), store the cache entry, record the cassette,
+/// fold the leaf usage accumulator, then `track_usage` under the captured budget
+/// frame (a budget overrun fails the task, exactly as the sync path's `?`) and
+/// finally `finalize` the response into the per-native return value. `span`,
+/// `finalize`, and the captured `Rc` slots are all consumed exactly once here.
+#[cfg(not(target_arch = "wasm32"))]
+#[allow(clippy::too_many_arguments)]
+fn finalize_complete_success(
+    outcome: CompleteOutcome,
+    span: sema_otel::LlmSpan,
+    cache_key: Option<String>,
+    cassette_record_key: Option<String>,
+    usage_accum_slot: Option<Rc<RefCell<LeafUsage>>>,
+    budget_slot: Option<Rc<RefCell<BudgetFrame>>>,
+    request_for_messages: &ChatRequest,
+    finalize: CompleteFinalize,
+) -> Result<Value, SemaError> {
+    let CompleteOutcome {
+        resp,
+        serving_provider,
+        serving_model,
+        retry_events,
+    } = outcome;
+    // Emit retry spans + set the response facts UNDER this span so children parent
+    // correctly (the detached span is not on the stack). `entered` installs it as
+    // the active parent for the closure, then restores.
+    span.entered(|| {
+        emit_retry_spans(&retry_events);
+    });
+    span.set_dispatch(&serving_provider, &serving_model);
+    span.set_response(&response_facts(&serving_provider, &resp));
+    span.set_messages(
+        &messages_json(&request_for_messages.messages),
+        &content_json("assistant", &resp.content),
+        request_for_messages
+            .system
+            .as_deref()
+            .map(|s| content_json("system", s))
+            .as_deref(),
+    );
+    drop(span); // ends the span
+    set_serving_provider(&serving_provider);
+    if let Some(key) = &cache_key {
+        store_cached(key, &resp);
+    }
+    if let Some(key) = &cassette_record_key {
+        CASSETTE.with(|c| {
+            if let Some(cass) = c.borrow_mut().as_mut() {
+                cass.record_entry(crate::cassette::TapeEntry::from_response(key, &resp));
+            }
+        });
+    }
+    // Fold this completion into the LEAF'S OWN captured accumulator frame — the
+    // `Rc` snapshotted at yield time, not whatever scope is active when the offload
+    // lands (the finalize runs outside the per-task install boundary). Price it the
+    // same way `track_usage` does, then suppress `track_usage`'s own active-frame
+    // fold so this completion is counted exactly once.
+    if let Some(slot) = &usage_accum_slot {
+        let cost = pricing::calculate_cost_for(&serving_provider, &resp.usage);
+        accumulate_into(slot, &resp.usage, cost);
+    }
+    // Account on the VM thread, then shape the value. Install THIS completion's
+    // captured budget frame as active around `track_usage` so the charge + limit
+    // check land on the dispatch-time frame (shared by `Rc` across the fan-out),
+    // then restore whatever was active.
+    let track_result = {
+        let prev_budget =
+            ACTIVE_BUDGET.with(|b| std::mem::replace(&mut *b.borrow_mut(), budget_slot.clone()));
+        let r = USAGE_ACCUM_SUPPRESS.with(|s| {
+            s.set(true);
+            let r = track_usage(&resp.usage);
+            s.set(false);
+            r
+        });
+        ACTIVE_BUDGET.with(|b| *b.borrow_mut() = prev_budget);
+        r
+    };
+    track_result?;
+    finalize(resp)
+}
+
+/// Concurrent counterpart to [`do_complete`] + the native's post-call accounting,
+/// for the async-scheduler-task path. Mirrors the concurrent `llm/embed` flow,
+/// scaled to a completion: it runs the on-VM-thread stage (conv scope, detached
+/// `chat` span, request attrs, cache lookup, cassette decision, fallback-chain
+/// resolution into `Arc` clones) SYNCHRONOUSLY, then SPAWNS the wire unit
+/// (`run_fallback_retry_async`) as an abortable pool future and YIELDS `AwaitIo`
+/// so sibling tasks overlap — cancel/timeout runs the handle's abort hook, which
+/// drops the in-flight request. All post-call work (span finalize, retry spans,
+/// cache store, cassette record, `track_usage`, content→Value) runs in the
+/// poller, on the VM thread, when the future lands — because the native is NOT
+/// re-invoked on resume.
+///
+/// `finalize` shapes the per-native return value from the `ChatResponse` (e.g.
+/// `Value::string(&resp.content)` for `llm/complete`). It runs in the poller on the
+/// VM thread, AFTER `track_usage`, so it may itself do further VM-thread work
+/// (e.g. `llm/extract`'s re-ask loop).
+///
+/// On a cache hit or cassette replay (no provider call) it finalizes the span,
+/// accounts ZERO usage, calls `finalize`, and returns WITHOUT yielding (nothing to
+/// overlap) — preserving the zero-usage cache-hit accounting invariant.
+#[cfg(not(target_arch = "wasm32"))]
+fn do_complete_async_yield(
+    request: ChatRequest,
+    finalize: CompleteFinalize,
+) -> Result<Value, SemaError> {
+    // Defensive resume-value drain: the scheduler resumes the bytecode after the
+    // CALL via `replace_stack_top`, so this native is not re-invoked — but mirror
+    // `llm/embed`/`io-sleep-once` and drain any stray resume value.
+    if let Some(v) = sema_core::take_resume_value() {
+        return Ok(v);
+    }
+
+    // On-VM-thread prep (conv scope, span, cache, cassette, chain resolution) is
+    // shared with the runtime External-wait path (`do_complete_runtime_suspend`).
+    let plan = match complete_offload_prep(request)? {
+        // Cache hit / cassette replay: no provider call. Account zero (hit) usage on
+        // the VM thread and finalize inline — no yield (nothing to overlap).
+        CompletePrep::Inline(resp) => {
+            track_usage(&resp.usage)?;
+            return finalize(resp);
+        }
+        CompletePrep::Offload(plan) => *plan,
+    };
+    let CompleteOffloadPlan {
+        chain,
+        request,
+        max_retries,
+        retry_base_ms,
+        rate_limit_wait_ms,
+        span,
+        cache_key,
+        cassette_record_key,
+        request_for_messages,
+    } = plan;
+
     // ── Offload the wire unit + yield ────────────────────────────────────
     let (tx, mut rx) =
         tokio::sync::oneshot::channel::<Result<CompleteOutcome, crate::types::LlmError>>();
-    let req2 = request.clone();
     // NOTE (async-path compat nuance): the wire stage runs on pool workers, so
     // OpenAI's `DROP_TEMPERATURE` self-heal LEARNS into a worker's TLS, not the
     // VM thread's. The WITHIN-call self-heal (400 → drop temperature → retry
@@ -6711,21 +6894,9 @@ fn do_complete_async_yield(
     // on later calls) is not shared across the VM thread — each async call may
     // pay one extra 400+retry on temperature-rejecting models. Correctness
     // holds; documented as a minor async-path divergence.
-    // Bump in-flight + peak on spawn so a test can prove simultaneity (mirrors the
-    // io-sleep-once spike instrumentation). The balancing guard is constructed
-    // HERE and moved into the future: an abort that lands before the future's
-    // first poll still drops the future — and the captured guard with it — so
-    // the gauge cannot strand at +1.
-    struct InflightGuard;
-    impl Drop for InflightGuard {
-        fn drop(&mut self) {
-            let _ = IO_INFLIGHT
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| Some((v - 1).max(0)));
-        }
-    }
-    let prev = IO_INFLIGHT.fetch_add(1, Ordering::SeqCst) + 1;
-    IO_PEAK.fetch_max(prev, Ordering::SeqCst);
-    let inflight = InflightGuard;
+    // The in-flight gauge (bumped now, dropped with the future) lets a test prove
+    // simultaneity even if an abort lands before the future's first poll.
+    let inflight = InflightGuard::new();
     // Offloaded as a SPAWNED POOL FUTURE (the http/shell abort tier), not
     // spawn_blocking: native-async providers are dropped mid-flight on abort —
     // the in-flight request's connection is torn down, no wasted round-trip.
@@ -6741,29 +6912,18 @@ fn do_complete_async_yield(
         if rate_limit_wait_ms > 0 {
             tokio::time::sleep(std::time::Duration::from_millis(rate_limit_wait_ms)).await;
         }
-        let r = run_fallback_retry_async(chain, req2, max_retries, retry_base_ms).await;
+        let r = run_fallback_retry_async(chain, request, max_retries, retry_base_ms).await;
         let _ = tx.send(r);
         sema_core::notify_io_complete();
     });
 
     // Move the span + cassette/cache context INTO the poller closure so all
-    // post-call work runs on the VM thread when the future lands.
+    // post-call work runs on the VM thread when the future lands. Capture THIS
+    // leaf's usage-accumulator + budget frames (see `finalize_complete_success`).
     let mut span_slot = Some(span);
     let mut finalize_slot = Some(finalize);
-    // Capture THIS leaf's per-leaf usage accumulator frame (if a workflow scope is
-    // open) the same way the otel span crosses the yield via `span_slot`. Folding into
-    // this captured Rc — not whatever frame is on top when the future lands — is what
-    // makes async fan-out correct: a sibling leaf opening its own scope can't clobber
-    // this in-flight leaf's tally.
     let usage_accum_slot = current_usage_accum();
-    // Capture the active BUDGET frame `Rc` the same way (ASYNC-1). The poller runs
-    // OUTSIDE the per-task install boundary (during `wake_blocked_tasks`), so the
-    // thread-local budget is whatever is active when the future lands — not the frame
-    // that was in force when this completion was dispatched. Re-installing THIS captured
-    // frame around `track_usage` below is what lets a concurrent `with-budget` fan-out
-    // charge one shared aggregate and gate correctly.
     let budget_slot = active_budget();
-    let request_for_messages = request;
     // True cancellation: on cancel/timeout the scheduler runs the abort hook,
     // which aborts the spawned wire future → the in-flight provider request is
     // dropped (connection torn down). Never called on normal completion.
@@ -6773,79 +6933,18 @@ fn do_complete_async_yield(
             match rx.try_recv() {
                 Err(TryRecvError::Empty) => sema_core::IoPoll::Pending,
                 Ok(Ok(outcome)) => {
-                    let CompleteOutcome {
-                        resp,
-                        serving_provider,
-                        serving_model,
-                        retry_events,
-                    } = outcome;
-                    if let Some(span) = span_slot.take() {
-                        // Emit retry spans + set the response facts UNDER this span so
-                        // children parent correctly (the detached span is not on the
-                        // stack). `entered` installs it as the active parent for the
-                        // closure, then restores.
-                        span.entered(|| {
-                            emit_retry_spans(&retry_events);
-                        });
-                        span.set_dispatch(&serving_provider, &serving_model);
-                        span.set_response(&response_facts(&serving_provider, &resp));
-                        span.set_messages(
-                            &messages_json(&request_for_messages.messages),
-                            &content_json("assistant", &resp.content),
-                            request_for_messages
-                                .system
-                                .as_deref()
-                                .map(|s| content_json("system", s))
-                                .as_deref(),
-                        );
-                        // span drops here → ends the span.
-                    }
-                    set_serving_provider(&serving_provider);
-                    if let Some(key) = &cache_key {
-                        store_cached(key, &resp);
-                    }
-                    if let Some(key) = &cassette_record_key {
-                        CASSETTE.with(|c| {
-                            if let Some(cass) = c.borrow_mut().as_mut() {
-                                cass.record_entry(crate::cassette::TapeEntry::from_response(
-                                    key, &resp,
-                                ));
-                            }
-                        });
-                    }
-                    // Fold this completion into the LEAF'S OWN captured accumulator frame —
-                    // the `Rc` snapshotted at yield time, not whatever scope is active when
-                    // the future lands (the poller runs outside the per-task install
-                    // boundary, so the thread-local may now hold a sibling's scope). Price
-                    // it the same way `track_usage` does — by the serving provider — then
-                    // suppress `track_usage`'s own active-frame fold so this completion is
-                    // counted exactly once.
-                    if let Some(slot) = &usage_accum_slot {
-                        let cost = pricing::calculate_cost_for(&serving_provider, &resp.usage);
-                        accumulate_into(slot, &resp.usage, cost);
-                    }
-                    // Account on the VM thread, then shape the value. A budget overrun
-                    // fails the task, exactly as the sync path's `?`. Install THIS
-                    // completion's captured budget frame as active around `track_usage` so
-                    // the charge + limit check land on the dispatch-time frame (shared by
-                    // `Rc` across the fan-out), then restore whatever was active.
-                    let track_result = {
-                        let prev_budget = ACTIVE_BUDGET
-                            .with(|b| std::mem::replace(&mut *b.borrow_mut(), budget_slot.clone()));
-                        let r = USAGE_ACCUM_SUPPRESS.with(|s| {
-                            s.set(true);
-                            let r = track_usage(&resp.usage);
-                            s.set(false);
-                            r
-                        });
-                        ACTIVE_BUDGET.with(|b| *b.borrow_mut() = prev_budget);
-                        r
-                    };
-                    if let Err(e) = track_result {
-                        return sema_core::IoPoll::Ready(Err(e.to_string()));
-                    }
+                    let span = span_slot.take().expect("span used once");
                     let finalize = finalize_slot.take().expect("finalize used once");
-                    match finalize(resp) {
+                    match finalize_complete_success(
+                        outcome,
+                        span,
+                        cache_key.clone(),
+                        cassette_record_key.clone(),
+                        usage_accum_slot.clone(),
+                        budget_slot.clone(),
+                        &request_for_messages,
+                        finalize,
+                    ) {
                         Ok(value) => sema_core::IoPoll::Ready(Ok(value)),
                         Err(e) => sema_core::IoPoll::Ready(Err(e.to_string())),
                     }
@@ -6866,6 +6965,246 @@ fn do_complete_async_yield(
     ));
     sema_core::set_yield_signal(sema_core::YieldReason::AwaitIo(handle));
     Ok(Value::nil())
+}
+
+/// Completion-kind tag for an agent/chat provider round offloaded through the
+/// unified runtime's External-wait machinery (distinct from mcp's kinds).
+#[cfg(not(target_arch = "wasm32"))]
+const AGENT_COMPLETE_COMPLETION_KIND: u64 = 0x6c6c_6d63; // "llmc"
+
+/// Cooperative provider-complete round under the UNIFIED RUNTIME. Shares the exact
+/// on-VM-thread prep + finalize with `do_complete_async_yield` (cache/cassette/
+/// retry/usage/budget parity), but instead of the legacy `AwaitIo` yield it
+/// suspends the active runtime task on an External wait: the wire stage runs off
+/// the VM thread on the executor's IO pool so sibling tasks (other agents) overlap,
+/// and an `async/cancel` runs the wait's abort (dropping the in-flight request). On
+/// a cache hit / cassette replay it finalizes inline (no suspend). Bridged onto the
+/// `NativeYield` seam (like the cooperative tool round) since `__agent-step` is a
+/// legacy-ABI native.
+#[cfg(not(target_arch = "wasm32"))]
+fn do_complete_runtime_suspend(
+    request: ChatRequest,
+    finalize: CompleteFinalize,
+) -> Result<Value, SemaError> {
+    use sema_core::runtime::{
+        CompletionKind, InterruptibleResource, NativeOutcome, NativeSuspend,
+        PreparedExternalOperation, SendPayload, WaitKind,
+    };
+
+    // Defensive resume-value drain (the runtime resumes the parked frame in place;
+    // this native is not re-invoked). Mirrors the async path.
+    if let Some(v) = sema_core::take_resume_value() {
+        return Ok(v);
+    }
+
+    let plan = match complete_offload_prep(request)? {
+        CompletePrep::Inline(resp) => {
+            track_usage(&resp.usage)?;
+            return finalize(resp);
+        }
+        CompletePrep::Offload(plan) => *plan,
+    };
+    let CompleteOffloadPlan {
+        chain,
+        request,
+        max_retries,
+        retry_base_ms,
+        rate_limit_wait_ms,
+        span,
+        cache_key,
+        cassette_record_key,
+        request_for_messages,
+    } = plan;
+
+    // Capture the leaf usage-accumulator + budget frames on the VM thread; the
+    // decoder (which runs off the task's install boundary) reinstalls them.
+    let decoder = Box::new(AgentCompleteDecoder {
+        span: Some(span),
+        cache_key,
+        cassette_record_key,
+        usage_accum_slot: current_usage_accum(),
+        budget_slot: active_budget(),
+        request_for_messages,
+        finalize: Some(finalize),
+    });
+    let kind = CompletionKind::try_from_raw(AGENT_COMPLETE_COMPLETION_KIND)
+        .expect("agent completion kind is nonzero");
+    let resource = InterruptibleResource::new("agent/complete", Box::new(CompleteNoopCancelHook));
+    let prepared = PreparedExternalOperation::interruptible_async(
+        kind,
+        decoder,
+        resource,
+        move || async move {
+            // Gauge simultaneity the same way the async path does; dropped with the
+            // future so an abort can't strand it.
+            let _inflight = InflightGuard::new();
+            if rate_limit_wait_ms > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(rate_limit_wait_ms)).await;
+            }
+            let r = run_fallback_retry_async(chain, request, max_retries, retry_base_ms).await;
+            Ok(Box::new(r) as SendPayload)
+        },
+    );
+    let suspend = NativeSuspend {
+        wait: WaitKind::External(Box::new(prepared)),
+        continuation: Box::new(AgentCompleteContinuation),
+    };
+    sema_core::set_pending_native_outcome(NativeOutcome::Suspend(suspend));
+    sema_core::set_yield_signal(sema_core::YieldReason::NativeYield);
+    Ok(Value::nil())
+}
+
+/// Decodes an offloaded agent/chat completion on the VM thread once its wire future
+/// lands: unwraps the provider result and runs the SHARED `finalize_complete_success`
+/// (span/cache/cassette/usage/budget), or records the provider error on the span and
+/// surfaces it. Feeds the produced value/error to [`AgentCompleteContinuation`].
+#[cfg(not(target_arch = "wasm32"))]
+struct AgentCompleteDecoder {
+    span: Option<sema_otel::LlmSpan>,
+    cache_key: Option<String>,
+    cassette_record_key: Option<String>,
+    usage_accum_slot: Option<Rc<RefCell<LeafUsage>>>,
+    budget_slot: Option<Rc<RefCell<BudgetFrame>>>,
+    request_for_messages: ChatRequest,
+    finalize: Option<CompleteFinalize>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl sema_core::runtime::Trace for AgentCompleteDecoder {
+    fn trace(&self, _sink: &mut dyn FnMut(sema_core::cycle::GcEdge<'_>)) -> bool {
+        // Holds no live `Value`/`Env` (span, request messages, and the boxed
+        // finalize capture only a slab token) — nothing to trace.
+        true
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl sema_core::runtime::CompletionDecoder for AgentCompleteDecoder {
+    fn decode(
+        self: Box<Self>,
+        _context: &mut sema_core::runtime::NativeCallContext<'_>,
+        result: Result<sema_core::runtime::SendPayload, sema_core::runtime::ExternalFailure>,
+    ) -> sema_core::runtime::DecodedCompletion {
+        let AgentCompleteDecoder {
+            span,
+            cache_key,
+            cassette_record_key,
+            usage_accum_slot,
+            budget_slot,
+            request_for_messages,
+            finalize,
+        } = *self;
+        let payload = match result {
+            Ok(payload) => payload,
+            Err(failure) => {
+                if let Some(span) = span {
+                    span.record_error("io", failure.message());
+                }
+                return Err(SemaError::eval(format!(
+                    "agent completion: {}",
+                    failure.message()
+                )));
+            }
+        };
+        let wire = match sema_core::runtime::downcast_send_payload::<
+            Result<CompleteOutcome, crate::types::LlmError>,
+        >(payload, "agent-complete")
+        {
+            Ok(wire) => wire,
+            Err(failure) => {
+                if let Some(span) = span {
+                    span.record_error("io", failure.message());
+                }
+                return Err(SemaError::eval(format!(
+                    "agent completion: {}",
+                    failure.message()
+                )));
+            }
+        };
+        match wire {
+            Err(e) => {
+                if let Some(span) = span {
+                    span.record_error(llm_error_kind(&e), &e.to_string());
+                }
+                Err(SemaError::Llm(e.to_string()))
+            }
+            Ok(outcome) => {
+                let span = span.expect("offload span present on success");
+                let finalize = finalize.expect("finalize used once");
+                finalize_complete_success(
+                    outcome,
+                    span,
+                    cache_key,
+                    cassette_record_key,
+                    usage_accum_slot,
+                    budget_slot,
+                    &request_for_messages,
+                    finalize,
+                )
+            }
+        }
+    }
+}
+
+/// Resumes the parked `__agent-step` frame once its completion offload decodes: the
+/// decoder already produced the loop-state map / error, so this forwards it (or
+/// raises a cancellation at the call site, catchable by the driver's try/catch).
+#[cfg(not(target_arch = "wasm32"))]
+struct AgentCompleteContinuation;
+
+#[cfg(not(target_arch = "wasm32"))]
+impl sema_core::runtime::Trace for AgentCompleteContinuation {
+    fn trace(&self, _sink: &mut dyn FnMut(sema_core::cycle::GcEdge<'_>)) -> bool {
+        true
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl sema_core::runtime::NativeContinuation for AgentCompleteContinuation {
+    fn resume(
+        self: Box<Self>,
+        _context: &mut sema_core::runtime::NativeCallContext<'_>,
+        input: sema_core::runtime::ResumeInput,
+    ) -> sema_core::runtime::NativeResult {
+        use sema_core::runtime::{NativeOutcome, ResumeInput};
+        match input {
+            ResumeInput::Returned(value) => Ok(NativeOutcome::Return(value)),
+            ResumeInput::Failed(error) => Err(error),
+            ResumeInput::Cancelled(reason) => Err(SemaError::eval(format!(
+                "agent completion was cancelled ({reason:?})"
+            ))),
+            ResumeInput::Runtime(_) => Err(SemaError::eval(
+                "agent completion continuation received an unexpected runtime response",
+            )),
+        }
+    }
+}
+
+/// No-op cancel hook for the completion External wait: the executor aborts the
+/// offloaded future itself (dropping the in-flight request); there is no external
+/// resource to tear down here.
+#[cfg(not(target_arch = "wasm32"))]
+struct CompleteNoopCancelHook;
+
+#[cfg(not(target_arch = "wasm32"))]
+impl sema_core::runtime::Trace for CompleteNoopCancelHook {
+    fn trace(&self, _sink: &mut dyn FnMut(sema_core::cycle::GcEdge<'_>)) -> bool {
+        true
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl sema_core::runtime::CancelHook for CompleteNoopCancelHook {
+    fn cancel(
+        &mut self,
+    ) -> Result<sema_core::runtime::CancelDisposition, sema_core::runtime::CancelHookError> {
+        Ok(sema_core::runtime::CancelDisposition::Reaped)
+    }
+    fn reap(
+        &mut self,
+    ) -> Result<sema_core::runtime::CancelDisposition, sema_core::runtime::CancelHookError> {
+        Ok(sema_core::runtime::CancelDisposition::Reaped)
+    }
 }
 
 /// Cassette interception seam: below the otel span + response cache (set up in
@@ -8600,6 +8939,20 @@ fn agent_step(ctx: &EvalContext, token: u64) -> Result<Value, SemaError> {
             return Ok(Value::map(map));
         }
         return do_complete_async_yield(
+            request,
+            Box::new(move |resp| agent_apply_step_response(token, resp)),
+        );
+    }
+
+    // Unified-runtime quantum: a plain round offloads the provider call to the
+    // executor's IO pool and SUSPENDS the active task on an External wait, so two
+    // spawned `agent/run`s overlap across their rounds and `async/cancel` cuts the
+    // loop at (or during) the in-flight round. Streaming (`:on-text`) rounds are not
+    // yet cooperative under the runtime (deferred — task-06 blocker); they fall
+    // through to the synchronous inline path below.
+    #[cfg(not(target_arch = "wasm32"))]
+    if sema_core::in_runtime_quantum() && on_text.is_none() {
+        return do_complete_runtime_suspend(
             request,
             Box::new(move |resp| agent_apply_step_response(token, resp)),
         );

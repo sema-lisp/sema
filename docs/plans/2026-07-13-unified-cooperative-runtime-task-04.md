@@ -745,6 +745,68 @@ match the requested bound.
 > bridge's synchronous `block_on`. `mcp_builtin_test` stays green on legacy (6/0)
 > because the legacy `eval_str` path is untouched.
 
+> **Follow-up (2026-07-15, agent provider-round slice — full-flip blocker 1
+> CLOSED):** the deferred item #2 above (provider `complete` blocks the VM thread
+> under the runtime) is now cooperative. `__agent-step`'s plain (non-streaming)
+> round gained an `in_runtime_quantum()` branch → `do_complete_runtime_suspend`
+> (`crates/sema-llm/src/builtins.rs`): it runs the SAME on-VM-thread prep
+> (`complete_offload_prep`: conv scope, detached span, response cache, cassette,
+> fallback-chain resolve, rate-limit reserve) and the SAME finalize
+> (`finalize_complete_success`: retry spans, dispatch/response/messages facts, cache
+> store, cassette record, leaf-usage fold, `track_usage` under the captured budget
+> frame) that the async `AwaitIo` path uses — both were extracted from
+> `do_complete_async_yield` so cache/cassette/retry/usage/budget stay in lockstep.
+> Instead of the legacy `AwaitIo` yield (which the runtime does not service), it
+> offloads the wire stage (`run_fallback_retry_async`) to the executor IO pool as a
+> `PreparedExternalOperation::interruptible_async` and SUSPENDS the task on a
+> `WaitKind::External` (`NativeOutcome::Suspend`, bridged onto the `NativeYield`
+> seam like the tool round, since `__agent-step` is a legacy-ABI native). The
+> `AgentCompleteDecoder` runs the finalize on the VM thread when the future lands;
+> `AgentCompleteContinuation` forwards the loop-state map / raises the error/cancel.
+> A cache hit / cassette replay finalizes INLINE (no suspend), preserving the
+> zero-usage cache-hit invariant.
+> - **Effect:** two spawned `agent/run`s now OVERLAP across their rounds (each round
+>   parks the task while the provider call runs off-thread) and an `async/cancel`
+>   INTERRUPTS the loop promptly (the External wait's abort drops the in-flight
+>   future; no new round dispatches). Empirically: 3 agents × 3 rounds × 120 ms went
+>   1154 ms serial / peak-inflight 0 → 392 ms overlapped / peak-inflight 3; an
+>   8-round agent cancelled at 250 ms went 9 provider calls → 3.
+> - **Gate:** `agent_runtime_test.rs` adds `concurrent_agents_overlap_via_runtime`
+>   (peak-inflight ≥ 2 AND wall < 700 ms) and
+>   `cancelling_agent_run_cuts_the_loop_short_via_runtime` (calls < 9), both through
+>   `eval_str_via_runtime` with a FakeProvider (4/0 total). The legacy `AwaitIo`
+>   path (`agent_async_test` 7/0), `mcp_builtin_test` (6/0), and `llm_fake_test`
+>   (29/0) are unchanged.
+>
+> **Full-flip re-measure (temp flip `eval_str_compiled` → `run_exprs_via_runtime`,
+> then REVERTED):** `agent_async_test` went from 3/4 (pre-slice) to **5/7** — the
+> overlap (`concurrent_agents_overlap_and_peak_inflight`,
+> `sibling_ticker`… partially) and cancel-interrupt regressions are closed. The
+> **2 remaining** flip failures are DEFERRED sub-items, not regressions from this
+> slice (both already failed under the flip before it):
+> 1. `sibling_ticker_advances_during_agent_rounds` — needs the `:on-tool-call`
+>    event callback fired on the cooperative runtime tool round (deferred item #1;
+>    the ticker snapshots via `:on-tool-call`).
+> 2. `cancelled_agent_span_is_exported` — the cancelled agent's `invoke_agent` span
+>    is not exported under the runtime (the legacy task-reaped span-end sweep has no
+>    runtime equivalent yet).
+>
+> **Remaining full-flip blockers (updated):**
+> - **Blocker 1 (agent loop cooperative): CLOSED** for overlap + cancel-interrupt.
+>   Residual: `:on-tool-call`/OTel on the runtime tool round, cancelled-agent span
+>   export under the runtime, and streaming (`:on-text`) agent rounds (still fall to
+>   the synchronous inline path — deferred).
+> - **Blocker 2 (AwaitIo event/select):** the runtime still does not service a raw
+>   `YieldReason::AwaitIo(IoHandle)` VM yield, so single `llm/complete`/`llm/extract`
+>   /`llm/embed` and every other `in_async_context()`-gated LLM op still block the VM
+>   thread under the runtime. This slice sidesteps it for the agent round via the
+>   External-wait pattern (the reusable `complete_offload_prep`/
+>   `finalize_complete_success` helpers make porting the standalone ops
+>   straightforward — same prep/finalize, `do_complete_runtime_suspend`-shaped
+>   yield). Assessment: medium; the pattern is proven, the work is mechanical
+>   fan-out across the `in_async_context()` call sites.
+> - **Blocker 3 (virtual clock):** unchanged/out of scope here.
+
 > **Follow-up (2026-07-15, cooperative-HOF slice — open-upvalue escape fix):** the
 > `NativeOutcome::Call` migration above surfaced a latent correctness bug in the
 > cooperative HOF callback ABI. `invoke_callable` runs a callback closure on a

@@ -2,6 +2,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::rc::Rc;
 
+use sema_core::runtime::ChannelQuery;
 use sema_core::{
     call_run_scheduler, call_run_scheduler_all_of, call_run_scheduler_any_of,
     call_run_scheduler_timeout, call_spawn_callback, check_arity, in_async_context,
@@ -693,6 +694,14 @@ fn register_channel_ops(env: &Env) {
     register_fn(env, "channel/try-recv", |args| {
         check_arity!(args, "channel/try-recv", 1);
         let ch = expect_channel(args, "channel/try-recv", 0)?;
+        // Unified runtime: the ChannelRegistry is the single source of truth, so
+        // the Sema buffer is empty here. Yield a non-blocking ChannelTryRecv; the
+        // runtime drains one value (or the empty sentinel nil) from the registry
+        // and resumes this frame immediately — it never parks.
+        if in_runtime_quantum() {
+            set_yield_signal(YieldReason::ChannelTryRecv(ch));
+            return Ok(Value::nil());
+        }
         let val = ch.buffer.borrow_mut().pop_front().unwrap_or(Value::nil());
         Ok(val)
     });
@@ -724,6 +733,13 @@ fn register_channel_ops(env: &Env) {
     register_fn(env, "channel/count", |args| {
         check_arity!(args, "channel/count", 1);
         let ch = expect_channel(args, "channel/count", 0)?;
+        // Unified runtime: the buffered items live in the ChannelRegistry, not the
+        // Sema buffer. Yield a non-blocking ChannelInspect; the runtime reads the
+        // registry count and resumes this frame immediately — it never parks.
+        if in_runtime_quantum() {
+            set_yield_signal(YieldReason::ChannelInspect(ch, ChannelQuery::Count));
+            return Ok(Value::nil());
+        }
         let len = ch.buffer.borrow().len();
         Ok(Value::int(len as i64))
     });
@@ -732,6 +748,13 @@ fn register_channel_ops(env: &Env) {
     register_fn(env, "channel/empty?", |args| {
         check_arity!(args, "channel/empty?", 1);
         let ch = expect_channel(args, "channel/empty?", 0)?;
+        // Unified runtime: buffered items live in the ChannelRegistry. Yield a
+        // non-blocking ChannelInspect; the runtime reads the registry and resumes
+        // this frame immediately — it never parks.
+        if in_runtime_quantum() {
+            set_yield_signal(YieldReason::ChannelInspect(ch, ChannelQuery::Empty));
+            return Ok(Value::nil());
+        }
         let empty = ch.buffer.borrow().is_empty();
         Ok(Value::bool(empty))
     });
@@ -740,6 +763,13 @@ fn register_channel_ops(env: &Env) {
     register_fn(env, "channel/full?", |args| {
         check_arity!(args, "channel/full?", 1);
         let ch = expect_channel(args, "channel/full?", 0)?;
+        // Unified runtime: buffered items live in the ChannelRegistry. Yield a
+        // non-blocking ChannelInspect; the runtime reads the registry and resumes
+        // this frame immediately — it never parks.
+        if in_runtime_quantum() {
+            set_yield_signal(YieldReason::ChannelInspect(ch, ChannelQuery::Full));
+            return Ok(Value::nil());
+        }
         let buf = ch.buffer.borrow();
         Ok(Value::bool(buf.len() >= ch.capacity))
     });

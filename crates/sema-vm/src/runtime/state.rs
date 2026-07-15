@@ -1340,6 +1340,19 @@ impl Runtime {
                     task.vm_call = Some(vm);
                     TaskAction::VmChannelClose(task_id, channel)
                 }
+                // `channel/count` / `channel/empty?` / `channel/full?` and
+                // `channel/try-recv`: non-blocking observational ops. The frame
+                // parked with a nil placeholder on its stack top; the runtime
+                // queries/drains the canonical ChannelRegistry SYNCHRONOUSLY and
+                // resumes this frame immediately (no wait registered).
+                YieldReason::ChannelInspect(channel, query) => {
+                    task.vm_call = Some(vm);
+                    TaskAction::VmChannelInspect(task_id, channel, query)
+                }
+                YieldReason::ChannelTryRecv(channel) => {
+                    task.vm_call = Some(vm);
+                    TaskAction::VmChannelTryRecv(task_id, channel)
+                }
                 other => TaskAction::VmResult(
                     task_id,
                     task.vm_owner.take().expect("VM call has a return owner"),
@@ -1557,6 +1570,12 @@ impl Runtime {
                 self.channel_receive(task_id, channel)?
             }
             TaskAction::VmChannelClose(task_id, channel) => self.channel_close(task_id, channel)?,
+            TaskAction::VmChannelInspect(task_id, channel, query) => {
+                self.channel_inspect(task_id, channel, query)?
+            }
+            TaskAction::VmChannelTryRecv(task_id, channel) => {
+                self.channel_try_receive(task_id, channel)?
+            }
             #[cfg(test)]
             TaskAction::Timer(task_id, deadline) => {
                 let mut state = self.state.borrow_mut();
@@ -2618,6 +2637,70 @@ impl Runtime {
             }
         }
         self.resume_running_vm(task_id, VmResume::Value(sema_core::Value::nil()))
+    }
+
+    /// Route a VM-quantum observational channel op (`channel/count` /
+    /// `channel/empty?` / `channel/full?`) through the ChannelRegistry. This is
+    /// NON-BLOCKING: it reads the registry state and resumes the frame in place
+    /// with the int/boolean result — no wait is registered and the frame never
+    /// parks.
+    fn channel_inspect(
+        &self,
+        task_id: TaskId,
+        channel: Rc<sema_core::Channel>,
+        query: sema_core::runtime::ChannelQuery,
+    ) -> Result<(), RuntimeFault> {
+        let value = {
+            let mut state = self.state.borrow_mut();
+            let id = Self::resolve_channel(&mut state, &channel)?;
+            state
+                .channels
+                .inspect(id, query)
+                .map_err(|error| RuntimeFault::Invariant {
+                    message: format!("channel inspect failed: {error:?}"),
+                })?
+        };
+        self.resume_running_vm(task_id, VmResume::Value(value))
+    }
+
+    /// Route a VM-quantum `channel/try-recv` through the ChannelRegistry. This is
+    /// NON-BLOCKING: it drains at most one buffered/rendezvous value from the
+    /// registry (waking any parked sender it unblocks) and resumes the frame in
+    /// place with that value, or with nil (the empty/closed sentinel) — no wait is
+    /// registered and the frame never parks.
+    fn channel_try_receive(
+        &self,
+        task_id: TaskId,
+        channel: Rc<sema_core::Channel>,
+    ) -> Result<(), RuntimeFault> {
+        let value = {
+            let mut state = self.state.borrow_mut();
+            let id = Self::resolve_channel(&mut state, &channel)?;
+            let result =
+                state
+                    .channels
+                    .try_receive(id)
+                    .map_err(|error| RuntimeFault::Invariant {
+                        message: format!("channel try-receive failed: {error:?}"),
+                    })?;
+            // Draining a full channel can unblock a parked sender; drain any wakes
+            // the registry queued so the woken sender is scheduled.
+            while let Some(wake) = state.channels.pop_wake() {
+                state.pending.push_back(PendingStage::ChannelWake(wake));
+            }
+            match result {
+                super::ChannelResult::Received(value) => value,
+                super::ChannelResult::Waiting | super::ChannelResult::Closed => {
+                    sema_core::Value::nil()
+                }
+                super::ChannelResult::Sent => {
+                    return Err(RuntimeFault::Invariant {
+                        message: "channel try-receive produced a sent result".into(),
+                    });
+                }
+            }
+        };
+        self.resume_running_vm(task_id, VmResume::Value(value))
     }
 
     /// Resume a VM-quantum task parked on a channel op with a rendezvous wake. A
@@ -3689,6 +3772,17 @@ enum TaskAction {
     /// `channel/close`: close the backing registry channel, waking parked
     /// senders/receivers, and resume the task (`TaskId`) with nil.
     VmChannelClose(TaskId, Rc<sema_core::Channel>),
+    /// `channel/count` / `channel/empty?` / `channel/full?`: query the
+    /// ChannelRegistry non-blocking and resume the task (`TaskId`) in place with
+    /// the result.
+    VmChannelInspect(
+        TaskId,
+        Rc<sema_core::Channel>,
+        sema_core::runtime::ChannelQuery,
+    ),
+    /// `channel/try-recv`: drain one value from the ChannelRegistry non-blocking
+    /// and resume the task (`TaskId`) in place with the value or nil sentinel.
+    VmChannelTryRecv(TaskId, Rc<sema_core::Channel>),
     #[cfg(test)]
     Timer(TaskId, Instant),
     #[cfg(test)]
@@ -3793,7 +3887,10 @@ impl Trace for TaskAction {
                 sink(sema_core::cycle::GcEdge::Value(value));
                 true
             }
-            Self::VmChannelRecv(_, channel) | Self::VmChannelClose(_, channel) => {
+            Self::VmChannelRecv(_, channel)
+            | Self::VmChannelClose(_, channel)
+            | Self::VmChannelInspect(_, channel, _)
+            | Self::VmChannelTryRecv(_, channel) => {
                 let handle = sema_core::Value::channel_from_rc(Rc::clone(channel));
                 sink(sema_core::cycle::GcEdge::Value(&handle));
                 true

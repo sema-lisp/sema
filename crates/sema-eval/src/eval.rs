@@ -2480,6 +2480,58 @@ mod runtime_eval_tests {
         );
     }
 
+    // GATE 7 — observational channel ops read the canonical ChannelRegistry
+    // under the unified runtime (regression: they previously read the empty Sema
+    // buffer, so `channel/count` reported 0 and `channel/try-recv` stranded the
+    // value in the registry — silent data loss). Each asserts parity with the
+    // `eval_str` oracle.
+    #[test]
+    fn runtime_channel_count_reflects_buffered_sends() {
+        assert_runtime_matches_oracle(
+            "(begin \
+               (define ch (channel/new 5)) \
+               (channel/send ch 10) \
+               (channel/send ch 20) \
+               (channel/count ch))",
+        );
+    }
+
+    #[test]
+    fn runtime_channel_try_recv_returns_buffered_value() {
+        // The sent value must come back (no silent data loss), and a second
+        // try-recv on the now-empty channel returns the nil sentinel.
+        assert_runtime_matches_oracle(
+            "(begin \
+               (define ch (channel/new 5)) \
+               (channel/send ch 10) \
+               (channel/send ch 20) \
+               (list (channel/try-recv ch) (channel/try-recv ch) (channel/try-recv ch)))",
+        );
+    }
+
+    #[test]
+    fn runtime_channel_empty_and_full_reflect_registry_state() {
+        assert_runtime_matches_oracle(
+            "(begin \
+               (define ch (channel/new 2)) \
+               (define before (list (channel/empty? ch) (channel/full? ch))) \
+               (channel/send ch 1) \
+               (channel/send ch 2) \
+               (list before (channel/empty? ch) (channel/full? ch)))",
+        );
+    }
+
+    #[test]
+    fn runtime_channel_try_recv_after_close_drains_then_sentinel() {
+        assert_runtime_matches_oracle(
+            "(begin \
+               (define ch (channel/new 2)) \
+               (channel/send ch 7) \
+               (channel/close ch) \
+               (list (channel/closed? ch) (channel/try-recv ch) (channel/try-recv ch)))",
+        );
+    }
+
     // ── CANCELLATION (Task 04) ───────────────────────────────────────
 
     // GATE 1: `async/cancel` returns `#t` ONLY for the FIRST cancellation request

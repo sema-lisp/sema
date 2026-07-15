@@ -173,6 +173,19 @@ pub enum YieldReason {
     /// scheduler never sees this variant (its `channel/close` mutates the Sema
     /// buffer's `closed` flag synchronously).
     ChannelClose(Rc<Channel>),
+    /// Non-blocking observational channel op from inside a runtime quantum
+    /// (`channel/count` / `channel/empty?` / `channel/full?` / `channel/closed?`).
+    /// The unified runtime queries the canonical ChannelRegistry synchronously
+    /// and resumes this frame IMMEDIATELY with the int/boolean result — the frame
+    /// never parks (no wait is registered). The legacy scheduler never sees this
+    /// variant (its observational ops read the Sema buffer directly).
+    ChannelInspect(Rc<Channel>, crate::runtime::ChannelQuery),
+    /// Non-blocking `channel/try-recv` from inside a runtime quantum: the unified
+    /// runtime drains one value from the canonical ChannelRegistry (or the empty
+    /// sentinel `nil`) and resumes this frame IMMEDIATELY — the frame never parks.
+    /// The legacy scheduler never sees this variant (its `channel/try-recv` pops
+    /// the Sema buffer directly).
+    ChannelTryRecv(Rc<Channel>),
     /// Sleeping for a duration in milliseconds.
     Sleep(u64),
     /// Spawning a detached task from a thunk (zero-arg function). The unified

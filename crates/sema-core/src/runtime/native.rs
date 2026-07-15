@@ -84,6 +84,7 @@ pub enum ChannelOperation {
     TryReceive,
     Inspect(ChannelQuery),
 }
+#[derive(Clone, Copy, Debug)]
 pub enum ChannelQuery {
     Closed,
     Count,

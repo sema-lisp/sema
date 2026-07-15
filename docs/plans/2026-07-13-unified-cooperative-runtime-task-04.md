@@ -346,6 +346,27 @@ Expected: promise partition and GC tests pass.
 >   waiters (`consume_vm_channel_wake`) before the continuation-model protocol path.
 > Capacity validation (`channel/new`, zero/negative → condition) already runs in
 > the native before any allocation, so it surfaces as `Err` with no runtime change.
+>
+> **FOLLOW-UP (2026-07-15) — observational channel ops now also read the registry
+> (found by adversarial verification).** The non-blocking observers
+> (`channel/count`, `channel/empty?`, `channel/full?`, `channel/try-recv`) still
+> read the Sema `Channel` buffer, which is empty under the unified runtime — so
+> `channel/count` reported 0 and `channel/try-recv` returned nil while stranding
+> the sent value in the registry (silent data loss). Fix mirrors the send/recv
+> seam but is SYNCHRONOUS (no park): two new `YieldReason`s —
+> `ChannelInspect(ch, ChannelQuery)` and `ChannelTryRecv(ch)` — map to
+> `TaskAction::VmChannelInspect`/`VmChannelTryRecv`, handled by `channel_inspect`
+> (registry `inspect`) and `channel_try_receive` (registry `try_receive`, draining
+> any wake it queues for an unblocked sender). Both resolve the channel via the
+> existing `resolve_channel` bridge and resume the frame in place with
+> `resume_running_vm` — NO `issue_internal_wait`, NO `channel_waits` entry. Legacy
+> (non-quantum) paths are unchanged. `channel/closed?` is already correct: its
+> `ch.closed` flag is set synchronously by `channel/close` in both paths, so it
+> stays on the Sema struct. New gates (un-ignored) in `sema-eval`
+> `mod runtime_eval_tests`: `runtime_channel_count_reflects_buffered_sends`,
+> `runtime_channel_try_recv_returns_buffered_value`,
+> `runtime_channel_empty_and_full_reflect_registry_state`,
+> `runtime_channel_try_recv_after_close_drains_then_sentinel`.
 
 - [ ] **Step 1: Write failing detached-lifetime tests**
 

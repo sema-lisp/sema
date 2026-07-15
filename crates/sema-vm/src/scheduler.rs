@@ -294,6 +294,15 @@ impl Scheduler {
                         "internal error: async/cancel yield reached the legacy scheduler"
                             .to_string(),
                     ),
+                    // `ChannelInspect` / `ChannelTryRecv` are unified-runtime-only
+                    // yields: the legacy scheduler's observational channel ops read
+                    // the Sema buffer directly and never park a task on them.
+                    YieldReason::ChannelInspect(..) | YieldReason::ChannelTryRecv(_) => {
+                        WakeAction::Fail(
+                            "internal error: observational channel yield reached the legacy scheduler"
+                                .to_string(),
+                        )
+                    }
                 };
 
                 match action {

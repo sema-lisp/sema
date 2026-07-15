@@ -70,8 +70,7 @@ use sema_core::runtime::{
     ResumeInput, SendPayload, Trace, WaitKind,
 };
 use sema_core::{
-    check_arity, in_runtime_quantum, set_pending_native_outcome, set_yield_signal, Caps, Env,
-    NativeFn, Sandbox, SemaError, ToolDefinition, Value, YieldReason,
+    check_arity, in_runtime_quantum, Caps, Env, NativeFn, Sandbox, SemaError, ToolDefinition, Value,
 };
 use tokio::sync::oneshot;
 
@@ -343,6 +342,30 @@ fn next_handle() -> String {
 
 fn register_fn(env: &Env, name: &str, f: impl Fn(&[Value]) -> Result<Value, SemaError> + 'static) {
     env.set_str(name, Value::native_fn(NativeFn::simple(name, f)));
+}
+
+/// Build a dual-ABI native from an op body that speaks the runtime native ABI
+/// (`NativeResult`). Under the unified runtime the runtime callback returns the
+/// body's `NativeOutcome` (so an `mcp/call` external-wait suspend surfaces
+/// structurally); outside it (bare eval / legacy scheduler) the legacy value
+/// callback unwraps the plain `Return` the body produces there. Shared by
+/// `mcp/call` and each dynamically-built `mcp/tools->sema` handler so both
+/// inherit the offload-aware suspension with one body.
+fn dual_native(name: String, body: impl Fn(&[Value]) -> NativeResult + 'static) -> NativeFn {
+    let body = Rc::new(body);
+    let for_func = body.clone();
+    let for_runtime = body;
+    let err_name = name.clone();
+    NativeFn::simple_with_runtime(
+        name,
+        move |args| match for_func(args)? {
+            NativeOutcome::Return(value) => Ok(value),
+            _ => Err(SemaError::eval(format!(
+                "{err_name}: native suspended outside the cooperative runtime"
+            ))),
+        },
+        move |_ctx, args| for_runtime(args),
+    )
 }
 
 /// Refuse a `mcp/connect` unless `cap` is granted. Unrestricted sandboxes pass.
@@ -1197,14 +1220,16 @@ fn call_tool(
     tool_name: &str,
     arguments_json: serde_json::Value,
     materialize: impl FnOnce(serde_json::Value) -> Result<Value, String> + 'static,
-) -> Result<Value, SemaError> {
+) -> NativeResult {
     let entry = lookup_entry(handle)?;
     check_tool_allowed(&entry.meta.allowed_tools, tool_name)?;
     let key = cassette_key(&entry.meta.identity, tool_name, &arguments_json);
 
     match sema_core::mcp_cassette_decide(&key) {
         Some(sema_core::McpCassetteDecision::Replay(recorded)) => {
-            return materialize(recorded).map_err(|e| SemaError::eval(format!("mcp/call: {e}")));
+            return materialize(recorded)
+                .map(NativeOutcome::Return)
+                .map_err(|e| SemaError::eval(format!("mcp/call: {e}")));
         }
         Some(sema_core::McpCassetteDecision::Miss) => return Err(replay_miss_error()),
         // Record mode or no cassette → perform the real call, then record it.
@@ -1220,7 +1245,7 @@ fn call_tool(
     if in_runtime_quantum() {
         let interactive_auth = entry.meta.interactive_auth;
         let browser_allowed = browser_open_allowed();
-        let outcome = mcp_call_runtime_outcome(
+        return mcp_call_runtime_outcome(
             entry,
             key,
             tool_name.to_string(),
@@ -1228,20 +1253,12 @@ fn call_tool(
             Box::new(materialize),
             interactive_auth,
             browser_allowed,
-        )?;
-        set_pending_native_outcome(outcome);
-        set_yield_signal(YieldReason::NativeYield);
-        return Ok(Value::nil());
+        );
     }
 
     if sema_core::in_async_context() {
-        return call_tool_offload(
-            entry,
-            key,
-            tool_name.to_string(),
-            arguments_json,
-            materialize,
-        );
+        return call_tool_offload(entry, key, tool_name.to_string(), arguments_json, materialize)
+            .map(NativeOutcome::Return);
     }
 
     let mut conn = try_checkout(&entry)?.ok_or_else(|| busy_sync_error(handle, "mcp/call"))?;
@@ -1255,7 +1272,9 @@ fn call_tool(
     checkin(&entry, conn);
     let raw = result.map_err(|e| SemaError::eval(format!("mcp/call: {e}")))?;
     sema_core::mcp_cassette_record(&key, &raw);
-    materialize(raw).map_err(|e| SemaError::eval(format!("mcp/call: {e}")))
+    materialize(raw)
+        .map(NativeOutcome::Return)
+        .map_err(|e| SemaError::eval(format!("mcp/call: {e}")))
 }
 
 /// Cancellation semantics (documented here per the task brief): a task
@@ -1759,7 +1778,7 @@ fn tool_defs_to_value(
         let tool_name = tool.name.clone();
         let connection_handle = connection_handle.to_string();
         let handler_name = format!("mcp/{tool_name}");
-        let handler = Value::native_fn(NativeFn::simple(&handler_name, move |args| {
+        let handler = Value::native_fn(dual_native(handler_name, move |args| {
             // The agent loop passes arguments positionally in `ordered` order
             // (see `json_args_to_sema`); rebuild the named arguments object,
             // dropping the ones the model left unset (nil).
@@ -1951,18 +1970,21 @@ pub fn register_mcp_builtins(env: &Env, sandbox: &Sandbox) {
         })
     });
 
-    register_fn(env, "mcp/call", |args| {
-        check_arity!(args, "mcp/call", 3);
-        let handle = require_handle(args, "mcp/call")?;
-        let tool_name = args[1].as_str().ok_or_else(|| {
-            SemaError::type_error("string", args[1].type_name())
-                .with_hint("mcp/call expects the tool name as a string")
-        })?;
-        let arguments_json = sema_core::value_to_json_lossy(&args[2]);
-        call_tool(handle, tool_name, arguments_json, |raw| {
-            Ok(result_to_value(&raw))
-        })
-    });
+    env.set_str(
+        "mcp/call",
+        Value::native_fn(dual_native("mcp/call".to_string(), |args| {
+            check_arity!(args, "mcp/call", 3);
+            let handle = require_handle(args, "mcp/call")?;
+            let tool_name = args[1].as_str().ok_or_else(|| {
+                SemaError::type_error("string", args[1].type_name())
+                    .with_hint("mcp/call expects the tool name as a string")
+            })?;
+            let arguments_json = sema_core::value_to_json_lossy(&args[2]);
+            call_tool(handle, tool_name, arguments_json, |raw| {
+                Ok(result_to_value(&raw))
+            })
+        })),
+    );
 
     register_fn(env, "mcp/close", |args| {
         check_arity!(args, "mcp/close", 1);

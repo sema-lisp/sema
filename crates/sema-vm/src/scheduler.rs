@@ -300,13 +300,6 @@ impl Scheduler {
                                 .to_string(),
                         )
                     }
-                    // `NativeYield` is a unified-runtime-only cooperative-HOF yield;
-                    // the legacy scheduler's HOFs re-enter synchronously and never
-                    // set it.
-                    YieldReason::NativeYield => WakeAction::Fail(
-                        "internal error: cooperative native yield reached the legacy scheduler"
-                            .to_string(),
-                    ),
                 };
 
                 match action {

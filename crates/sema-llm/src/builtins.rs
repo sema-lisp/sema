@@ -554,6 +554,39 @@ fn register_fn_ctx(
     );
 }
 
+/// Register a dual-ABI native whose body speaks the runtime native ABI
+/// (`NativeResult`) so its `in_runtime_quantum` branch can return a
+/// `NativeOutcome::Suspend`/`Call` directly (an external-wait offload or a
+/// cooperative tool round). Under the unified runtime the runtime callback drives
+/// the body — it has no evaluator context of its own, so it borrows the shared
+/// stdlib `EvalContext` for any callback dispatch. Outside the runtime (bare eval
+/// / legacy scheduler) the legacy callback runs the same body with the real
+/// evaluator context and unwraps the plain `Return` it produces there.
+fn register_runtime_fn_ctx(
+    env: &Env,
+    name: &str,
+    f: impl Fn(&EvalContext, &[Value]) -> sema_core::runtime::NativeResult + 'static,
+) {
+    use sema_core::runtime::NativeOutcome;
+    let f = std::rc::Rc::new(f);
+    let for_func = f.clone();
+    let for_runtime = f;
+    let err_name = name.to_string();
+    env.set(
+        sema_core::intern(name),
+        Value::native_fn(NativeFn::with_ctx_runtime(
+            name,
+            move |ctx, args| match for_func(ctx, args)? {
+                NativeOutcome::Return(value) => Ok(value),
+                _ => Err(SemaError::eval(format!(
+                    "{err_name}: native suspended outside the cooperative runtime"
+                ))),
+            },
+            move |_native_ctx, args| sema_core::with_stdlib_ctx(|ctx| for_runtime(ctx, args)),
+        )),
+    );
+}
+
 fn with_provider<F, R>(f: F) -> Result<R, SemaError>
 where
     F: FnOnce(&dyn LlmProvider) -> Result<R, SemaError>,
@@ -3063,11 +3096,11 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
         Ok(Value::bool(sema_core::in_runtime_quantum()))
     });
     register_fn_ctx(env, "__agent-begin", |_ctx, args| agent_begin(args));
-    register_fn_ctx(env, "__agent-step", |ctx, args| {
+    register_runtime_fn_ctx(env, "__agent-step", |ctx, args| {
         let token = agent_token_arg(args, "__agent-step")?;
         agent_step(ctx, token)
     });
-    register_fn_ctx(env, "__agent-exec-tools", |ctx, args| {
+    register_runtime_fn_ctx(env, "__agent-exec-tools", |ctx, args| {
         let token = agent_token_arg(args, "__agent-exec-tools")?;
         agent_exec_tools(ctx, token)
     });
@@ -7010,14 +7043,14 @@ const AGENT_COMPLETE_COMPLETION_KIND: u64 = 0x6c6c_6d63; // "llmc"
 /// suspends the active runtime task on an External wait: the wire stage runs off
 /// the VM thread on the executor's IO pool so sibling tasks (other agents) overlap,
 /// and an `async/cancel` runs the wait's abort (dropping the in-flight request). On
-/// a cache hit / cassette replay it finalizes inline (no suspend). Bridged onto the
-/// `NativeYield` seam (like the cooperative tool round) since `__agent-step` is a
-/// legacy-ABI native.
+/// a cache hit / cassette replay it finalizes inline (no suspend). Returns the
+/// `NativeOutcome` directly on the runtime native ABI (`__agent-step` drives it
+/// through its runtime callback).
 #[cfg(not(target_arch = "wasm32"))]
 fn do_complete_runtime_suspend(
     request: ChatRequest,
     finalize: CompleteFinalize,
-) -> Result<Value, SemaError> {
+) -> sema_core::runtime::NativeResult {
     use sema_core::runtime::{
         CompletionKind, InterruptibleResource, NativeOutcome, NativeSuspend,
         PreparedExternalOperation, SendPayload, WaitKind,
@@ -7026,13 +7059,13 @@ fn do_complete_runtime_suspend(
     // Defensive resume-value drain (the runtime resumes the parked frame in place;
     // this native is not re-invoked). Mirrors the async path.
     if let Some(v) = sema_core::take_resume_value() {
-        return Ok(v);
+        return Ok(NativeOutcome::Return(v));
     }
 
     let plan = match complete_offload_prep(request)? {
         CompletePrep::Inline(resp) => {
             track_usage(&resp.usage)?;
-            return finalize(resp);
+            return finalize(resp).map(NativeOutcome::Return);
         }
         CompletePrep::Offload(plan) => *plan,
     };
@@ -7081,9 +7114,7 @@ fn do_complete_runtime_suspend(
         wait: WaitKind::External(Box::new(prepared)),
         continuation: Box::new(AgentCompleteContinuation),
     };
-    sema_core::set_pending_native_outcome(NativeOutcome::Suspend(suspend));
-    sema_core::set_yield_signal(sema_core::YieldReason::NativeYield);
-    Ok(Value::nil())
+    Ok(NativeOutcome::Suspend(suspend))
 }
 
 /// Decodes an offloaded agent/chat completion on the VM thread once its wire future
@@ -8901,12 +8932,13 @@ fn agent_apply_step_response(token: u64, resp: ChatResponse) -> Result<Value, Se
 /// finalize closure and becomes the resolved value of the yield); otherwise it runs
 /// `do_complete` synchronously. If the loop is already done (round cap or consec-error
 /// abort set by `__agent-exec-tools`), returns immediately without a provider call.
-fn agent_step(ctx: &EvalContext, token: u64) -> Result<Value, SemaError> {
+fn agent_step(ctx: &EvalContext, token: u64) -> sema_core::runtime::NativeResult {
+    use sema_core::runtime::NativeOutcome;
     // A resumed AwaitIo yield lands here NOT re-invoked (the scheduler resumes the
     // bytecode after the CALL); but drain any stray resume value defensively, as the
     // other yielding natives do.
     if let Some(v) = sema_core::take_resume_value() {
-        return Ok(v);
+        return Ok(NativeOutcome::Return(v));
     }
 
     // Short-borrow: bail out if the loop is already done (round cap / consec-error
@@ -8937,7 +8969,7 @@ fn agent_step(ctx: &EvalContext, token: u64) -> Result<Value, SemaError> {
             let mut map = BTreeMap::new();
             map.insert(Value::keyword("done"), Value::bool(true));
             map.insert(Value::keyword("has-tools"), Value::bool(false));
-            return Ok(Value::map(map));
+            return Ok(NativeOutcome::Return(Value::map(map)));
         }
         StepPrep::Run(req, on_text) => (*req, on_text),
     };
@@ -8968,12 +9000,13 @@ fn agent_step(ctx: &EvalContext, token: u64) -> Result<Value, SemaError> {
             let mut map = BTreeMap::new();
             map.insert(Value::keyword("stream"), stream_token);
             map.insert(Value::keyword("on-text"), cb);
-            return Ok(Value::map(map));
+            return Ok(NativeOutcome::Return(Value::map(map)));
         }
         return do_complete_async_yield(
             request,
             Box::new(move |resp| agent_apply_step_response(token, resp)),
-        );
+        )
+        .map(NativeOutcome::Return);
     }
 
     // Unified-runtime quantum: a plain round offloads the provider call to the
@@ -8998,13 +9031,14 @@ fn agent_step(ctx: &EvalContext, token: u64) -> Result<Value, SemaError> {
         None => do_complete(request)?,
     };
     track_usage(&response.usage)?;
-    agent_apply_step_response(token, response)
+    agent_apply_step_response(token, response).map(NativeOutcome::Return)
 }
 
 /// `__agent-exec-tools(token) → nil`. Runs the pending tool calls in ordinary async
 /// task context (so yielding/async tools suspend correctly), pushing correlated
 /// tool-result messages. Never holds the slab borrow across a callback / tool call.
-fn agent_exec_tools(ctx: &EvalContext, token: u64) -> Result<Value, SemaError> {
+fn agent_exec_tools(ctx: &EvalContext, token: u64) -> sema_core::runtime::NativeResult {
+    use sema_core::runtime::NativeOutcome;
     // Short-borrow: copy out the pending calls + tool set + callback, then drop.
     let (pending, tools, on_tool_call): (Vec<ToolCall>, Vec<Value>, Option<Value>) = AGENT_RUNS
         .with(|r| {
@@ -9080,7 +9114,7 @@ fn agent_exec_tools(ctx: &EvalContext, token: u64) -> Result<Value, SemaError> {
         record_tool_result(token, tc, result, is_error);
     }
 
-    Ok(Value::nil())
+    Ok(NativeOutcome::Return(Value::nil()))
 }
 
 /// Push a correlated `tool_result` message for `tc` into the agent slab and
@@ -9199,22 +9233,21 @@ impl sema_core::runtime::NativeContinuation for ExecToolsContinuation {
 }
 
 /// Begin the cooperative tool round: build the [`ExecToolsContinuation`] and
-/// stash its first `NativeOutcome` on the pending-outcome TLS, raising the
-/// `NativeYield` the VM surfaces as an `AsyncYield` (mirrors `map`'s cooperative
-/// entry). Returns the nil placeholder the runtime overwrites once the round
-/// completes. When no handler call is needed (e.g. every pending call fails to
-/// resolve), the results are recorded synchronously and nil is returned directly.
+/// RETURN its first `NativeOutcome` on the runtime native ABI (mirrors `map`'s
+/// cooperative entry — the runtime drives the resulting `Call`). When no handler
+/// call is needed (e.g. every pending call fails to resolve), the results are
+/// recorded synchronously and a nil value is returned directly.
 fn exec_tools_cooperative_start(
     token: u64,
     tools: Vec<Value>,
     pending: Vec<ToolCall>,
-) -> Result<Value, SemaError> {
+) -> sema_core::runtime::NativeResult {
     use sema_core::runtime::NativeOutcome;
     let remaining: std::collections::VecDeque<ToolCall> = pending.into();
     // `current` is a placeholder overwritten by `advance` before any resume reads
     // it; if `remaining` is empty there is nothing to run.
     let Some(first) = remaining.front().cloned() else {
-        return Ok(Value::nil());
+        return Ok(NativeOutcome::Return(Value::nil()));
     };
     let continuation = Box::new(ExecToolsContinuation {
         token,
@@ -9222,14 +9255,7 @@ fn exec_tools_cooperative_start(
         remaining,
         current: first,
     });
-    match continuation.advance()? {
-        NativeOutcome::Return(value) => Ok(value),
-        outcome => {
-            sema_core::set_pending_native_outcome(outcome);
-            sema_core::set_yield_signal(sema_core::YieldReason::NativeYield);
-            Ok(Value::nil())
-        }
-    }
+    continuation.advance()
 }
 
 /// `__agent-finish(token) → result`. Idempotent: appends the final assistant turn,

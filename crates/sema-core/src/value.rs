@@ -322,6 +322,32 @@ impl NativeFn {
         }
     }
 
+    /// Like [`simple_with_runtime`](Self::simple_with_runtime), but the legacy
+    /// callback receives the evaluator context (parity with
+    /// [`with_ctx`](Self::with_ctx)). The runtime callback drives the native
+    /// under the unified cooperative runtime; the legacy `func` runs it in a bare
+    /// top-level eval and the legacy scheduler — where a converted native's
+    /// suspending branch (gated on `in_runtime_quantum`) is never reached, so the
+    /// legacy callback only ever produces plain values.
+    ///
+    /// Invariant I2 applies to both callbacks: do not strongly capture a
+    /// `Value`, `Env`, or a transitive owner. Put traceable state in a registered
+    /// payload; host infrastructure may capture `Weak` handles.
+    pub fn with_ctx_runtime(
+        name: impl Into<String>,
+        func: impl Fn(&EvalContext, &[Value]) -> Result<Value, SemaError> + 'static,
+        runtime: impl for<'a> Fn(&mut NativeCallContext<'a>, &[Value]) -> NativeResult + 'static,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            func: Box::new(func),
+            runtime_func: Some(Box::new(runtime)),
+            payload: None,
+            param_names: None,
+            is_closure: false,
+        }
+    }
+
     #[doc(hidden)]
     /// Invokes the runtime ABI, using `eval_context` only for the legacy
     /// callback fallback when no runtime-aware callback exists.

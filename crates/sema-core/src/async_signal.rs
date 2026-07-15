@@ -247,17 +247,6 @@ pub enum YieldReason {
     /// background runtime) to complete. The scheduler polls the handle and parks
     /// the VM thread on the process-global IO-completion signal while in flight.
     AwaitIo(Rc<IoHandle>),
-    /// A native (a higher-order stdlib fn like `map`) running inside a runtime
-    /// quantum wants to drive its Sema callback COOPERATIVELY via the
-    /// `NativeOutcome::Call` continuation ABI, instead of re-entering the
-    /// evaluator synchronously. The actual `NativeOutcome` rides the
-    /// [`PENDING_NATIVE_OUTCOME`] thread-local (it holds a boxed continuation, so
-    /// it cannot be `Clone`/`Debug` inside this enum); this variant is just the
-    /// marker the VM surfaces as an `AsyncYield`, which the unified runtime routes
-    /// to `apply_native_outcome` with the parked parent VM saved in the return
-    /// owner. The legacy scheduler never sets this (its HOFs re-enter
-    /// synchronously). See `docs/plans/2026-07-13-unified-cooperative-runtime.md`.
-    NativeYield,
 }
 
 /// What condition the scheduler should run until.
@@ -317,14 +306,6 @@ thread_local! {
     /// each native call. If set, the VM suspends the current task.
     static YIELD_SIGNAL: RefCell<Option<YieldReason>> = const { RefCell::new(None) };
 
-    /// Carries the `NativeOutcome` for a [`YieldReason::NativeYield`]. Set by a
-    /// runtime-quantum HOF (`map`) immediately before it sets the yield signal;
-    /// taken by the unified runtime's `run_parked_quantum` the instant
-    /// `run_quantum` returns the `AsyncYield`. Only ever occupied across that
-    /// single hand-off (no GC safe point intervenes), mirroring `RESUME_VALUE`.
-    static PENDING_NATIVE_OUTCOME: RefCell<Option<crate::runtime::NativeOutcome>> =
-        const { RefCell::new(None) };
-
     /// Set by a scheduler-driving native when the cooperative scheduler paused
     /// for a debug breakpoint inside a task. Carries the `SchedulerTarget` to
     /// re-drive on resume and how to reconstruct the native's value. Consumed by
@@ -361,18 +342,6 @@ pub fn set_yield_signal(reason: YieldReason) {
 /// Take the yield signal (clearing it). Called by the VM after native calls.
 pub fn take_yield_signal() -> Option<YieldReason> {
     YIELD_SIGNAL.with(|s| s.borrow_mut().take())
-}
-
-/// Stash the `NativeOutcome` a runtime-quantum HOF wants the unified runtime to
-/// drive. Paired with `set_yield_signal(YieldReason::NativeYield)`.
-pub fn set_pending_native_outcome(outcome: crate::runtime::NativeOutcome) {
-    PENDING_NATIVE_OUTCOME.with(|s| *s.borrow_mut() = Some(outcome));
-}
-
-/// Take the pending `NativeOutcome` (clearing it). Called by the runtime when it
-/// observes a `YieldReason::NativeYield`.
-pub fn take_pending_native_outcome() -> Option<crate::runtime::NativeOutcome> {
-    PENDING_NATIVE_OUTCOME.with(|s| s.borrow_mut().take())
 }
 
 // ── Cooperative debug-pause resume (WASM) ───────────────────────

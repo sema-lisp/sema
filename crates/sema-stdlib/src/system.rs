@@ -11,8 +11,8 @@ use sema_core::runtime::{
     ResumeInput, SendPayload, Trace, WaitKind,
 };
 use sema_core::{
-    check_arity, in_async_context, in_runtime_quantum, set_pending_native_outcome,
-    set_yield_signal, take_resume_value, Caps, SemaError, Value, YieldReason,
+    check_arity, in_async_context, set_yield_signal, take_resume_value, Caps, SemaError, Value,
+    YieldReason,
 };
 
 use crate::register_fn;
@@ -99,12 +99,11 @@ impl NativeContinuation for SleepContinuation {
 }
 
 /// Build the external-wait `NativeOutcome::Suspend` for a blocking `sleep` under
-/// the unified runtime, stash it on the pending-outcome thread-local, and raise
-/// the `NativeYield` signal the VM surfaces as an async yield. The runtime
+/// the unified runtime and RETURN it on the runtime native ABI. The runtime
 /// submits the job to the thread-pool executor (so it runs off the VM thread and
 /// overlaps sibling work) and, when the worker completes, resumes this frame with
-/// nil. Returns the nil placeholder the runtime overwrites on resume.
-fn sleep_via_executor(ms: u64) -> Value {
+/// nil.
+fn sleep_via_executor(ms: u64) -> NativeResult {
     let ms = ms.min(MAX_SLEEP_MS);
     let kind = CompletionKind::try_from_raw(SLEEP_COMPLETION_KIND)
         .expect("sleep completion kind is nonzero");
@@ -121,9 +120,7 @@ fn sleep_via_executor(ms: u64) -> Value {
         wait: WaitKind::External(Box::new(prepared)),
         continuation: Box::new(SleepContinuation),
     };
-    set_pending_native_outcome(NativeOutcome::Suspend(suspend));
-    set_yield_signal(YieldReason::NativeYield);
-    Value::nil()
+    Ok(NativeOutcome::Suspend(suspend))
 }
 
 /// Monotonic clock captured the first time it is needed — forced during
@@ -523,34 +520,47 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
     // Canonical slash-namespaced alias (Decision #24)
     register_fn(env, "time/now-ms", time_ms_impl);
 
-    register_fn(env, "sleep", |args| {
-        check_arity!(args, "sleep", 1);
-        let ms = args[0]
-            .as_int()
-            .ok_or_else(|| SemaError::type_error("int", args[0].type_name()))?;
-        // Under the unified runtime, `sleep` is a genuinely-blocking operation:
-        // submit it to the thread-pool executor and SUSPEND so the worker runs it
-        // off the VM thread. Two `async/spawn`ed sleeps then overlap instead of
-        // serializing on the VM thread (unlike `async/sleep`, which is a virtual
-        // timer). Checked before the legacy `in_async_context` timer path.
-        if in_runtime_quantum() {
-            return Ok(sleep_via_executor(ms.max(0) as u64));
-        }
-        // In a legacy async scheduler task, blocking the VM thread would freeze
-        // every sibling task. Yield exactly like `async/sleep` (async_ops.rs)
-        // so the scheduler parks this task and drives siblings while the
-        // sleep elapses.
-        if in_async_context() {
-            if let Some(cached) = take_resume_value() {
-                return Ok(cached);
-            }
-            set_yield_signal(YieldReason::Sleep(ms as u64));
-            return Ok(Value::nil());
-        }
-        // Outside async (REPL/scripts/top level): unchanged real sleep.
-        std::thread::sleep(std::time::Duration::from_millis(ms as u64));
-        Ok(Value::nil())
-    });
+    // `sleep` is dual-ABI. Under the unified runtime it is a genuinely-blocking
+    // operation: the runtime callback submits it to the thread-pool executor and
+    // SUSPENDS (returning `NativeOutcome::Suspend`) so the worker runs it off the
+    // VM thread — two `async/spawn`ed sleeps then overlap instead of serializing
+    // on the VM thread (unlike `async/sleep`, which is a virtual timer). Outside
+    // the runtime (bare eval or the legacy scheduler) the legacy `func` runs: it
+    // yields the legacy `Sleep` signal inside an async scheduler task, else sleeps
+    // synchronously.
+    env.set(
+        sema_core::intern("sleep"),
+        Value::native_fn(sema_core::NativeFn::simple_with_runtime(
+            "sleep",
+            |args| {
+                check_arity!(args, "sleep", 1);
+                let ms = args[0]
+                    .as_int()
+                    .ok_or_else(|| SemaError::type_error("int", args[0].type_name()))?;
+                // In a legacy async scheduler task, blocking the VM thread would
+                // freeze every sibling task. Yield exactly like `async/sleep`
+                // (async_ops.rs) so the scheduler parks this task and drives
+                // siblings while the sleep elapses.
+                if in_async_context() {
+                    if let Some(cached) = take_resume_value() {
+                        return Ok(cached);
+                    }
+                    set_yield_signal(YieldReason::Sleep(ms as u64));
+                    return Ok(Value::nil());
+                }
+                // Outside async (REPL/scripts/top level): unchanged real sleep.
+                std::thread::sleep(std::time::Duration::from_millis(ms as u64));
+                Ok(Value::nil())
+            },
+            |_ctx: &mut NativeCallContext<'_>, args: &[Value]| {
+                check_arity!(args, "sleep", 1);
+                let ms = args[0]
+                    .as_int()
+                    .ok_or_else(|| SemaError::type_error("int", args[0].type_name()))?;
+                sleep_via_executor(ms.max(0) as u64)
+            },
+        )),
+    );
 
     crate::register_fn_gated(env, sandbox, Caps::PROCESS, "sys/args", |args| {
         check_arity!(args, "sys/args", 0);

@@ -1299,35 +1299,10 @@ impl Runtime {
                     task.vm_call = Some(vm);
                     TaskAction::VmAwaitIo(task_id, handle)
                 }
-                // A runtime-quantum HOF (`map`) wants the runtime to drive its
-                // Sema callback cooperatively via the `NativeOutcome::Call`
-                // continuation ABI. The actual outcome rode the pending-outcome
-                // thread-local; take it, park the parent VM OUT of `vm_call` (into
-                // the return owner) so the continuation machine can reuse
-                // `vm_call` for each callback VM, and dispatch the outcome. When it
-                // finally returns, the parent VM is reinstalled and resumed with
-                // the value (see `apply_native_result`'s `VmResume` arms).
-                YieldReason::NativeYield => {
-                    let parent = task.vm_owner.take().expect("VM call has a return owner");
-                    let owner = ReturnOwner::VmResume {
-                        vm: Box::new(vm),
-                        parent: Box::new(parent),
-                    };
-                    match sema_core::take_pending_native_outcome() {
-                        Some(outcome) => TaskAction::VmResult(task_id, owner, Ok(outcome)),
-                        None => TaskAction::VmResult(
-                            task_id,
-                            owner,
-                            Err(sema_core::SemaError::eval(
-                                "native yield raised without a pending outcome",
-                            )),
-                        ),
-                    }
-                }
             },
             // A native suspended structurally through the runtime ABI (the VM
             // parked its frame — pc past the call, a nil placeholder on its stack
-            // top — exactly as the `NativeYield` arm above). Move the parent VM OUT
+            // top). Move the parent VM OUT
             // of `vm_call` into the return owner so the continuation machine can
             // reuse `vm_call` for any callback VMs, then dispatch the carried
             // `NativeOutcome`; the parent VM is reinstalled and resumed with the
@@ -1641,7 +1616,7 @@ impl Runtime {
     /// Reinstall a parent VM parked in a [`ReturnOwner::VmResume`] as the task's
     /// running VM and enqueue it Ready, so the next `visit_ready` resumes its
     /// parked frame (value injected via `replace_stack_top`, or an error raised
-    /// via `resume_with_error`) — see `run_parked_quantum`'s `NativeYield` arm.
+    /// via `resume_with_error`) — see `run_parked_quantum`'s `Pending` arm.
     fn reinstall_parent_vm(
         &self,
         task_id: TaskId,
@@ -2151,7 +2126,7 @@ impl Runtime {
                 // visible to the defining frame) instead of dereferencing — or
                 // silently clobbering — a foreign stack slot. This runs for EVERY
                 // element dispatch (continuation-driven ones bypass the
-                // `NativeYield` seam), which is why it lives here.
+                // structural-outcome seam), which is why it lives here.
                 if let Some(parent_vm) = owner.parked_parent_vm_mut() {
                     snapshot_escaping_call_with_owner(parent_vm, &call.callable, &call.args);
                 }
@@ -2196,12 +2171,12 @@ impl Runtime {
                 };
                 // Dispatch the native with the runtime-quantum flag active so a
                 // callback native takes its cooperative path: a genuinely
-                // driveable native (e.g. an agent tool that offloads I/O) stashes
-                // a `NativeOutcome` and raises `NativeYield`, which we drive here;
-                // a *parking* native passed DIRECTLY as a HOF callback
-                // (`(map channel/recv …)`) leaves a channel/promise/sleep park
-                // yield that CANNOT suspend inside this Rust continuation, so it
-                // is converted into the lambda-wrap guidance — parity with the
+                // driveable native (e.g. an agent tool that offloads I/O) RETURNS
+                // its `NativeOutcome` (Suspend/Call) from `invoke_runtime`, which
+                // we drive here; a *parking* native passed DIRECTLY as a HOF
+                // callback (`(map channel/recv …)`) leaves a channel/promise/sleep
+                // park yield that CANNOT suspend inside this Rust continuation, so
+                // it is converted into the lambda-wrap guidance — parity with the
                 // legacy `check_hof_yield`.
                 let prev_q = sema_core::in_runtime_quantum();
                 sema_core::set_runtime_quantum(true);
@@ -2209,20 +2184,12 @@ impl Runtime {
                     native.invoke_runtime(&eval_context, &mut native_context, &call.args);
                 sema_core::set_runtime_quantum(prev_q);
                 let native_result = match sema_core::take_yield_signal() {
-                    Some(sema_core::YieldReason::NativeYield) => {
-                        sema_core::take_pending_native_outcome()
-                            .map(Ok)
-                            .unwrap_or(native_result)
-                    }
-                    Some(_park) => {
-                        sema_core::take_pending_native_outcome();
-                        Err(sema_core::SemaError::eval(
-                            "yielding native passed directly to a higher-order function — \
+                    Some(_park) => Err(sema_core::SemaError::eval(
+                        "yielding native passed directly to a higher-order function — \
                              wrap it in a lambda so the yield can suspend cleanly. \
                              For example, `(map (fn (x) (channel/recv x)) ...)` instead of \
                              `(map channel/recv ...)`.",
-                        ))
-                    }
+                    )),
                     None => native_result,
                 };
                 (ContinuationFrame::native(call.continuation), native_result)
@@ -3586,8 +3553,8 @@ enum PendingStage {
 enum ReturnOwner {
     Root,
     Continuation(Box<ReturnOwner>, ContinuationFrame),
-    /// A parent VM quantum that yielded a `NativeOutcome` (via
-    /// `YieldReason::NativeYield`) and is parked OUT of `task.vm_call` while the
+    /// A parent VM quantum that returned a `NativeOutcome` structurally (surfaced
+    /// as `VmExecResult::Pending`) and is parked OUT of `task.vm_call` while the
     /// runtime drives that outcome's continuation on the same task (Task 04). The
     /// continuation machine reuses `task.vm_call` for each callback VM, so the
     /// parked parent rides here instead. When the driven outcome finally

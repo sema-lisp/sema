@@ -289,6 +289,11 @@ the layer complete. Adding a hidden synchronous fallback is forbidden.
 
 - [ ] **Step 1: Generate discovery input**
 
+_status: not done — no `task-05-resource-matrix.md` (one row per builtin/resource
+op) has been produced. See the "Foundation slice landed" section at the end of this
+file for what IS built (executor + drive + sleep/mcp/llm-complete + the general
+AwaitIo bridge); the full resource inventory/classification is unstarted._
+
 ```bash
 rg -n 'io_block_on|io_spawn|io_spawn_blocking|io_offload_blocking|IoPoll|IoHandle|in_async_context|spawn_blocking|thread::sleep|Command::new|Tcp(Stream|Listener)|UdpSocket|WebSocket|rusqlite|notify::' \
   crates/sema-core crates/sema-io crates/sema-stdlib crates/sema-mcp crates/sema-llm
@@ -313,6 +318,16 @@ an uninterruptible same-process syscall is not enforcement.
 **Files:** core I/O backend, `sema-io` job/pool/fault modules, Tokio tests
 
 - [ ] **Step 1: Write failing seam tests**
+
+_status: partial — a real `ThreadPoolExecutor` (`crates/sema-vm/src/runtime/host.rs`,
+commit `af2d1ceb`, wired into the interpreter runtime by `414877c0`) provides
+concurrent off-thread execution + bounded shutdown (internal `thread_pool_tests`;
+overlap gate `runtime_external_io_test`). But this is NOT the full `sema-io`
+job/pool/fault seam this task specifies — `sema-io/src/{job,pool,fault}.rs` do not
+exist, the opaque-dispatch/admission/counter matrix and the ~20 named seam tests
+(`executor_completes_normal_job_exactly_once`, `cancel_vs_dequeue_has_one_linearized_winner`,
+etc.) are not built, and async dispatches run via a minimal thread-parking
+`block_on` rather than a real reactor behind the ADR #69 seam._
 
 First use fake jobs/executors to pin the interface itself:
 
@@ -430,6 +445,13 @@ Expected: race/fault tests pass and executor snapshot returns to zero live jobs.
 `terminal.rs`, `stream.rs`, resource tests
 
 - [ ] **Step 1: Add failing cancellation tests per resource**
+
+_status: not started — proc/pty/git/fs_watch/event/serial/terminal/stream are NOT
+migrated to the runtime external-wait contract. Only `sleep` (`8862d109`),
+`mcp/call` (`71b6155d`), and `llm/complete` via the general `LegacyAwaitIoBridge`
+(`f9203782`) route through the executor; every other resource still uses the legacy
+blocking/`in_async_context` path. Tasks 4 and 5 (http/ws/server, files/db/library)
+are likewise unstarted._
 
 Use local child processes and pipes. Assert the OS child is gone/reaped, the PTY
 fd is closed, watchers stop emitting, blocked reads/writes wake with

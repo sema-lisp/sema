@@ -728,6 +728,15 @@ drive work item.
 
 - [ ] **Step 4: Move the existing language suspension mechanism onto the runtime**
 
+_status: partial — the async language surface (spawn/await/sleep/channels/cancel/
+all/race/timeout) IS moved onto the runtime, but through the VM-resumes-itself
+`YieldReason` seam (commits `e164b132`, `3ec96cf2`, `c28dbf11`, `21a8a4bf`), NOT a
+`LegacyAsyncAbiAdapter`. The `LegacyAwaitIoBridge` half landed (`f9203782`; gate
+`legacy_awaitio_bridge_test`). NOT DONE: the `LegacyAsyncAbiAdapter` abstraction,
+and legacy-I/O poll closures returning data-only with streaming/file callbacks
+extracted onto `NativeOutcome::Call` (that streaming-callback migration is a
+Task 05 residual)._
+
 Add a temporary `LegacyAsyncAbiAdapter` used only by Task 04-owned language
 semantics. It translates existing `async/spawn`, pending `async/await`, sleep,
 blocked channel operations, `async/cancel`, `async/all`, `async/race`,
@@ -782,6 +791,10 @@ tests prove a callback chain longer than the drive budget is split across turns.
 
 - [ ] **Step 5: Run focused VM suites**
 
+_status: not satisfied — blocked on Step 4. The dummy-`nil` suspension placeholder
+and the legacy scheduler both still exist (they back `eval_str_compiled`), so the
+gate's "no nested scheduler entry or dummy-`nil` suspension remains" clause fails._
+
 ```bash
 cargo test -p sema-vm runtime::tests::continuation
 cargo test -p sema-vm runtime::tests::quantum
@@ -797,6 +810,14 @@ RED cases; no nested scheduler entry or dummy-`nil` suspension remains.
 **Files:** `vm.rs`, `vm_async_test.rs`
 
 - [ ] **Step 1: Preserve the existing failing characterization**
+
+_status: partial — the RUNTIME-path open-upvalue/shared-cell escape was fixed
+(`f297b9ef`: `snapshot_escaping_value` + `sync_tracked_upvalues_to_stack`, gated by
+four `*_open_upvalue*` runtime_eval_tests). But the LEGACY-path characterization
+`awaited_child_mutation_is_visible_to_parent` is still RED (one of the 4 documented
+vm_async_test RED). The specified focused VM captured-cell tests (parent-write/
+child-read, alternating writes, cycle collection) are not built as a dedicated
+suite._
 
 Do not edit its expected Sema value. Add focused VM tests for parent write then
 child read, child write then parent read, alternating writes, frame return, and
@@ -827,6 +848,14 @@ Expected: captured-mutation characterization turns GREEN and GC tests pass.
 `crates/sema-mcp/src/tools.rs`, `runtime_roots_test.rs`
 
 - [ ] **Step 1: Add failing multiple-root integration tests**
+
+_status: partial — multi-root + cross-eval detached survival, independent settlement,
+shared globals, and A-cancel-doesn't-cancel-B are proven at the eval level in
+`mod runtime_eval_tests` (`runtime_detached_spawn_survives_across_evals`,
+`eval_via_runtime_await_two_spawned_tasks`, drop-safety gates; persistent runtime
+`d9562446`). The specified public `crates/sema/tests/runtime_roots_test.rs` with
+explicit submit-A-and-B-before-driving + independent-output/context assertions is
+not built._
 
 Using one `Interpreter`, submit roots A and B before driving. Assert independent
 handles/output/context; shared global definitions; cooperative last-scheduled
@@ -1290,6 +1319,12 @@ occurrence and classification in evidence.
 
 - [ ] **Step 3: Remove TLS scheduler ownership**
 
+_status: not done — deferred to Task 08. The legacy TLS scheduler (`init_scheduler`
+/ `SCHEDULER` TLS, signal/resume TLS, `call_run_scheduler*`) still owns the
+`eval_str_compiled` / `common::eval` / CLI `-e` path; only the PRIMARY
+`eval`/`eval_str` path was flipped onto the runtime (`44ffed3a`). Deleting the TLS
+scheduler requires the full `eval_str_compiled` flip (Task 08)._
+
 Delete task vectors, IDs, virtual clock, and global env ownership from
 `scheduler.rs`. After Task 4's ABI migration, delete signal/resume TLS,
 `call_run_scheduler*`, scheduler target loops, and TLS spawn/cancel callbacks,
@@ -1301,6 +1336,19 @@ scheduler state, is named in the inventory, and carries a Task 04 deletion
 owner.
 
 - [ ] **Step 4: Implement explicit interpreter teardown**
+
+_status: substantially done, left unticked pending the exact counted-order proof.
+LANDED: `Interpreter` owns `runtime: Option<Runtime>` destroyed on drop via a
+bounded `shutdown` (finite deadline + `DriveBudget::host_default`) BEFORE the
+`EvalContext` value-store clear + `global_env` release + `InterpreterDrop`
+collection; unwinding uses `close_for_interpreter_drop` (no VM driving); executor
+self-join fixed (commits `d9562446`, `3d91dee3`, `ac78f7ac`). Drop-safety gates
+GREEN: `runtime_drop_with_channel_parked_task_does_not_hang`,
+`runtime_drop_with_inflight_executor_job_is_bounded`,
+`runtime_drop_with_detached_timer_parked_task_does_not_hang`, plus `leak_test` 7/0
+and `gc_stress_test` 48/0. RESIDUAL: the spec's counted drop tests proving the
+exact edge-release ordering and that no delivery accesses interpreter state after
+drop begins are not built as such._
 
 `Interpreter::drop` first takes `runtime` from its `Option`, calls nonblocking,
 idempotent `close_for_interpreter_drop`, and drops the runtime. That operation

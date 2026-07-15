@@ -186,6 +186,15 @@ that primary outcome.
 
 - [ ] **Step 1: Write failing promise-state tests**
 
+_status: not done as specified — the four-state promise PARTITION
+(`async/promise?`/`pending?`/`resolved?`/`rejected?`/`cancelled?`) works
+end-to-end through the runtime, but backed by the spawned `Rc<AsyncPromise>` seam
+(`spawned_promises` map + `task_id` cell), NOT the canonical `PromiseId`
+`PromiseRegistry` four-state runtime-owned settlement storage this task specifies.
+That promise-seam reconciliation is an explicit remaining item. The specified
+`crates/sema/tests/async_contract_test.rs` is not built (gates live in
+`mod runtime_eval_tests`)._
+
 Cover all four states, repeated polling, multiple observers, duplicate promise
 entries, final-handle drop while pending, unobserved failure diagnostics, and GC
 of resolved and unresolved promise graphs. Create synthetic returned/failed
@@ -370,6 +379,14 @@ Expected: promise partition and GC tests pass.
 
 - [ ] **Step 1: Write failing detached-lifetime tests**
 
+_status: behavior GREEN via the seam, left unticked (spec vehicle/architecture
+differ). Detached spawn/await/cancel + cross-eval survival + origin-root
+cancellation are proven through `eval_str_via_runtime` (commits `e164b132`,
+`3ec96cf2`; gates in `mod runtime_eval_tests` — see the progress blockquotes
+above), but spawn uses the `spawned_promises` seam rather than
+`LifetimeOwner::Interpreter`/`NativeOutcome` (Step 2), and the specified
+`async_contract_test.rs` detached suite is not built._
+
 Assert a detached task can outlive normal root settlement and be awaited from a
 later root; origin-root cancellation cancels descendants; cancelling one waiter
 does not cancel the producer; explicit promise cancellation is idempotent; and
@@ -383,11 +400,22 @@ Spawn creates `LifetimeOwner::Interpreter`. Await registers one observation.
 Sleep registers an interruptible timer. Cancellation propagates through the
 cancellation-parent graph, not observer edges.
 
-- [ ] **Step 3: Test duration validation**
+- [x] **Step 3: Test duration validation** _(commit `98790706`, slice ref
+  `a7a9d4c8`; vm_async_test: `sleep_rejects_duration_negative_before_rounding`,
+  `timeout_rejects_duration_negative_before_rounding`,
+  `sleep_rejects_non_finite_durations_cleanly`,
+  `sleep_rejects_overflowing_finite_duration_cleanly`,
+  `channel_rejects_unrepresentable_capacity_without_panicking`)_
 
 Use zero, sub-millisecond, negative, NaN, positive/negative infinity, maximum,
 maximum plus one, and conversion overflow. Native/WASM rounding policy must be
 one shared function.
+
+_status: done — the shared native `duration_ms` helper
+(`crates/sema-stdlib/src/async_ops.rs`) rejects negative-before-rounding, non-finite
+(NaN/±infinity), and overflow, and `channel/new` bounds capacity by
+`MAX_CHANNEL_CAPACITY` before allocation. Path-independent (validation lives in the
+native), so it holds on both the legacy and runtime paths._
 
 - [ ] **Step 4: Run**
 
@@ -519,6 +547,13 @@ Expected: all selected tests pass with no implicit target cancellation.
 `async_owned_test.rs`
 
 - [ ] **Step 1: Write failing scope transition tests**
+
+_status: not done — no `crates/sema-vm/src/runtime/scope.rs` / `cleanup.rs`
+`OwnedScope` Rust state machine exists. The owned combinators' ownership is
+realized by prelude COMPOSITION over the observational combinators plus an explicit
+cancel-and-reap (`__owned-all` = `(try (async/all …) (catch e (__cancel-all …)))`),
+see the Task 5 progress note below. Full zero-leak reaping, simultaneous-failure
+sequencing, and quarantine transfer (the Rust scope machine) are a later slice._
 
 Cover successful completion, one failure with pending siblings, simultaneous
 failures ordered by sequence, parent cancellation, cancellation-hook failure,

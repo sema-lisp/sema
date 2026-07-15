@@ -3225,4 +3225,44 @@ mod runtime_eval_tests {
                   (fn (x) (* x 10))))",
         );
     }
+
+    // Task 04 acceptance gate: a `map` callback that performs an ASYNC op
+    // (spawn + await) must have its yield SERVICED BY THE RUNTIME — the child
+    // async op genuinely parks and resumes — rather than running synchronously
+    // and surfacing "async yield outside of scheduler context". `map`, when it
+    // runs inside a runtime quantum, drives each callback via the
+    // `NativeOutcome::Call` continuation ABI (a `MapContinuation` state machine)
+    // so every callback is a fresh cooperative call that may suspend.
+    #[test]
+    fn runtime_map_callback_awaits_spawned_child() {
+        let interp = Interpreter::new();
+        let result = interp
+            .eval_str_via_runtime(
+                "(map (fn (x) (async/await (async/spawn (fn () (* x x))))) (list 1 2 3))",
+            )
+            .expect("map with an async callback resolves through the runtime");
+        assert_eq!(
+            result,
+            common_list(&[Value::int(1), Value::int(4), Value::int(9)]),
+        );
+    }
+
+    // The embedding-style shape: each `async` desugars to `(async/spawn (fn ()
+    // …))`, so `map` produces a list of promises which `async/all` then awaits.
+    // The callback's `async/spawn` yield must be serviced cooperatively.
+    #[test]
+    fn runtime_async_all_over_mapped_spawns() {
+        let interp = Interpreter::new();
+        let result = interp
+            .eval_str_via_runtime("(async/all (map (fn (x) (async (* x x))) (list 1 2 3)))")
+            .expect("async/all over a mapped list of spawns resolves");
+        assert_eq!(
+            result,
+            common_list(&[Value::int(1), Value::int(4), Value::int(9)]),
+        );
+    }
+
+    fn common_list(items: &[Value]) -> Value {
+        Value::list(items.to_vec())
+    }
 }

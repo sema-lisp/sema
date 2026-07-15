@@ -1353,6 +1353,31 @@ impl Runtime {
                     task.vm_call = Some(vm);
                     TaskAction::VmChannelTryRecv(task_id, channel)
                 }
+                // A runtime-quantum HOF (`map`) wants the runtime to drive its
+                // Sema callback cooperatively via the `NativeOutcome::Call`
+                // continuation ABI. The actual outcome rode the pending-outcome
+                // thread-local; take it, park the parent VM OUT of `vm_call` (into
+                // the return owner) so the continuation machine can reuse
+                // `vm_call` for each callback VM, and dispatch the outcome. When it
+                // finally returns, the parent VM is reinstalled and resumed with
+                // the value (see `apply_native_result`'s `VmResume` arms).
+                YieldReason::NativeYield => {
+                    let parent = task.vm_owner.take().expect("VM call has a return owner");
+                    let owner = ReturnOwner::VmResume {
+                        vm: Box::new(vm),
+                        parent: Box::new(parent),
+                    };
+                    match sema_core::take_pending_native_outcome() {
+                        Some(outcome) => TaskAction::VmResult(task_id, owner, Ok(outcome)),
+                        None => TaskAction::VmResult(
+                            task_id,
+                            owner,
+                            Err(sema_core::SemaError::eval(
+                                "native yield raised without a pending outcome",
+                            )),
+                        ),
+                    }
+                }
                 other => TaskAction::VmResult(
                     task_id,
                     task.vm_owner.take().expect("VM call has a return owner"),
@@ -1517,6 +1542,21 @@ impl Runtime {
                         frame,
                         ResumeInput::Cancelled(reason),
                     )),
+                // A parent VM parked mid-`NativeOutcome` while its task is
+                // cancelled: drop the parked VM and settle the task Cancelled (the
+                // in-flight cooperative HOF cannot meaningfully resume).
+                ReturnOwner::VmResume { vm: _, parent: _ } => {
+                    let root = self
+                        .state
+                        .borrow()
+                        .tasks
+                        .get(&task_id)
+                        .map(|task| task.record.relations().origin_root)
+                        .ok_or_else(|| RuntimeFault::Invariant {
+                            message: "cancelled task disappeared".into(),
+                        })?;
+                    self.settle_task(root, task_id, TaskOutcome::Cancelled(reason))?
+                }
             },
             TaskAction::Native(task_id, result) => {
                 self.state
@@ -1646,8 +1686,50 @@ impl Runtime {
                     frame,
                     ResumeInput::Failed(error),
                 )),
+            // The runtime finished driving a parent VM's yielded `NativeOutcome`.
+            // Reinstall the parked parent VM as the task's running VM and resume
+            // it: a `Return` injects the value onto its parked stack top; an error
+            // is RAISED at the parked call site (catchable by an enclosing
+            // try/catch), matching the async-await resume contract.
+            (ReturnOwner::VmResume { vm, parent }, Ok(NativeOutcome::Return(value))) => {
+                return self.reinstall_parent_vm(task_id, *vm, *parent, VmResume::Value(value));
+            }
+            (ReturnOwner::VmResume { vm, parent }, Err(error)) => {
+                return self.reinstall_parent_vm(task_id, *vm, *parent, VmResume::Fail(error));
+            }
             (owner, result) => return self.apply_native_outcome(task_id, owner, result),
         }
+        Ok(())
+    }
+
+    /// Reinstall a parent VM parked in a [`ReturnOwner::VmResume`] as the task's
+    /// running VM and enqueue it Ready, so the next `visit_ready` resumes its
+    /// parked frame (value injected via `replace_stack_top`, or an error raised
+    /// via `resume_with_error`) — see `run_parked_quantum`'s `NativeYield` arm.
+    fn reinstall_parent_vm(
+        &self,
+        task_id: TaskId,
+        vm: VM,
+        parent: ReturnOwner,
+        resume: VmResume,
+    ) -> Result<(), RuntimeFault> {
+        let mut state = self.state.borrow_mut();
+        let task = state
+            .tasks
+            .get_mut(&task_id)
+            .ok_or_else(|| RuntimeFault::Invariant {
+                message: "parent VM task disappeared before reinstall".into(),
+            })?;
+        task.vm_call = Some(vm);
+        task.vm_owner = Some(parent);
+        task.vm_resume = Some(resume);
+        task.record
+            .yield_ready()
+            .map_err(|error| RuntimeFault::Invariant {
+                message: format!("reinstalled parent VM failed to yield ready: {error:?}"),
+            })?;
+        let root = task.record.relations().origin_root;
+        state.ready.enqueue(root, task_id);
         Ok(())
     }
 
@@ -3812,6 +3894,18 @@ enum PendingStage {
 enum ReturnOwner {
     Root,
     Continuation(Box<ReturnOwner>, ContinuationFrame),
+    /// A parent VM quantum that yielded a `NativeOutcome` (via
+    /// `YieldReason::NativeYield`) and is parked OUT of `task.vm_call` while the
+    /// runtime drives that outcome's continuation on the same task (Task 04). The
+    /// continuation machine reuses `task.vm_call` for each callback VM, so the
+    /// parked parent rides here instead. When the driven outcome finally
+    /// `Return`s (or errors), the parent VM is reinstalled as the task's running
+    /// VM and resumed with the value (or the raised error). `parent` is the
+    /// owner the parent VM itself settles through (normally `Root`).
+    VmResume {
+        vm: Box<VM>,
+        parent: Box<ReturnOwner>,
+    },
 }
 
 impl Trace for PendingStage {
@@ -3851,6 +3945,7 @@ impl Trace for ReturnOwner {
         match self {
             Self::Root => true,
             Self::Continuation(parent, frame) => parent.trace(sink) && frame.trace(sink),
+            Self::VmResume { vm, parent } => vm.trace(sink) && parent.trace(sink),
         }
     }
 }

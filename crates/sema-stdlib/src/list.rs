@@ -1,9 +1,105 @@
 use std::borrow::Cow;
+use std::collections::VecDeque;
 
+use sema_core::cycle::GcEdge;
 use sema_core::number::SemaNumber;
-use sema_core::{check_arity, intern, Record, SemaError, Value, ValueViewRef};
+use sema_core::runtime::{
+    NativeCall, NativeCallContext, NativeContinuation, NativeOutcome, NativeResult, ResumeInput,
+    Trace,
+};
+use sema_core::{check_arity, intern, Record, SemaError, Value, ValueViewRef, YieldReason};
 
 use crate::register_fn;
+
+/// Continuation state machine that drives a `map` callback COOPERATIVELY under
+/// the unified runtime (Task 04). `map`, when it runs inside a runtime quantum,
+/// returns `NativeOutcome::Call{ callback, [item0], MapContinuation }`; the
+/// runtime runs `callback(item0)` as real Sema work on the active task (so an
+/// async op inside it parks and resumes), then resumes this continuation with the
+/// result. Each resume either issues the next `Call` or, once every item is
+/// mapped, `Return`s the assembled list — one fresh cooperative call per element.
+struct MapContinuation {
+    callback: Value,
+    remaining: VecDeque<Value>,
+    results: Vec<Value>,
+}
+
+impl Trace for MapContinuation {
+    fn trace(&self, sink: &mut dyn FnMut(GcEdge<'_>)) -> bool {
+        sink(GcEdge::Value(&self.callback));
+        for item in &self.remaining {
+            sink(GcEdge::Value(item));
+        }
+        for result in &self.results {
+            sink(GcEdge::Value(result));
+        }
+        true
+    }
+}
+
+impl NativeContinuation for MapContinuation {
+    fn resume(
+        mut self: Box<Self>,
+        _context: &mut NativeCallContext<'_>,
+        input: ResumeInput,
+    ) -> NativeResult {
+        let value = match input {
+            ResumeInput::Returned(value) => value,
+            // A callback error / cancellation aborts the whole `map`: propagate it
+            // so the runtime resumes the parked parent VM with the raised error
+            // (catchable by an enclosing try/catch), matching the legacy path's
+            // fail-fast on the first erroring element.
+            ResumeInput::Failed(error) => return Err(error),
+            ResumeInput::Cancelled(reason) => {
+                return Err(SemaError::eval(format!(
+                    "map callback was cancelled ({reason:?})"
+                )))
+            }
+            ResumeInput::Runtime(_) => {
+                return Err(SemaError::eval(
+                    "map continuation received an unexpected runtime response",
+                ))
+            }
+        };
+        self.results.push(value);
+        match self.remaining.pop_front() {
+            Some(next) => {
+                let callable = self.callback.clone();
+                Ok(NativeOutcome::Call(NativeCall {
+                    callable,
+                    args: vec![next],
+                    continuation: self,
+                }))
+            }
+            None => Ok(NativeOutcome::Return(Value::list(std::mem::take(
+                &mut self.results,
+            )))),
+        }
+    }
+}
+
+/// Build the cooperative `NativeOutcome::Call` for a single-list `map` running
+/// inside a runtime quantum, stash it on the pending-outcome thread-local, and
+/// raise the `NativeYield` signal the VM surfaces as an `AsyncYield`. Returns a
+/// nil placeholder the runtime overwrites with the mapped list once the
+/// continuation completes. `None` when there is no cooperative work to do (empty
+/// input), so the caller falls back to returning the empty list directly.
+fn map_cooperative(callback: &Value, items: &[Value]) -> Option<Value> {
+    let (first, rest) = items.split_first()?;
+    let continuation = Box::new(MapContinuation {
+        callback: callback.clone(),
+        remaining: rest.iter().cloned().collect(),
+        results: Vec::with_capacity(items.len()),
+    });
+    let call = NativeOutcome::Call(NativeCall {
+        callable: callback.clone(),
+        args: vec![first.clone()],
+        continuation,
+    });
+    sema_core::set_pending_native_outcome(call);
+    sema_core::set_yield_signal(YieldReason::NativeYield);
+    Some(Value::nil())
+}
 
 /// Record `type_tag` used to bundle zero-or-multiple values produced by `values`
 /// and unpacked by `call-with-values`. Chosen to be unlikely to collide with a
@@ -171,6 +267,19 @@ pub fn register(env: &sema_core::Env) {
         check_arity!(args, "map", 2..);
         if args.len() == 2 {
             let items = get_sequence(&args[1], "map")?;
+            // Under the unified runtime, drive each callback COOPERATIVELY via the
+            // NativeOutcome::Call continuation ABI so an async op inside the
+            // callback (spawn/await/channel) parks and resumes correctly, instead
+            // of re-entering the evaluator synchronously (which surfaces "async
+            // yield outside of scheduler context"). Empty input has no callback to
+            // run, so it returns the empty list directly. Multi-list `map` keeps
+            // the legacy synchronous path (Task 04 follow-up).
+            if sema_core::in_runtime_quantum() {
+                return match map_cooperative(&args[0], &items) {
+                    Some(placeholder) => Ok(placeholder),
+                    None => Ok(Value::list(Vec::new())),
+                };
+            }
             let mut result = Vec::with_capacity(items.len());
             for item in items.iter() {
                 result.push(call_function(&args[0], &[item.clone()])?);

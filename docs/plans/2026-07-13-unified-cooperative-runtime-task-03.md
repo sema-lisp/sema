@@ -944,6 +944,55 @@ occurrence and classification in evidence.
       clippy+fmt clean. REMAINING Step-2 item: the actual flip of `eval`/`eval_str`
       (not just the `*_via_runtime` entry points) onto the runtime + a real
       executor / async-I/O (`NullExecutor` still rejects real I/O)._
+    - _Progress (2026-07-15): EVAL FLIP MEASURED → REVERTED (not yet landable).
+      Routed `eval`/`eval_str` (`eval_in_global`/`eval_str_in_global`) through
+      `run_exprs_via_runtime`. Two oracles held: eval_test 1072/0,
+      integration_test 1055/0 — but ONLY after fixing a re-entry-guard gap: the
+      `eval`/`load`/`import` builtins re-enter the VM synchronously via
+      `eval_value_vm`/`eval_module_body_vm` → `VM::execute` → `run`, which the
+      runtime-quantum guard (`vm.rs:1662 ctx.runtime_quantum_active()`) rejects
+      with "legacy native callback cannot re-enter a VM during an active runtime
+      quantum" (18 integration_test failures: eval/load/import/module tests).
+      Fix mirrored the existing `run_nested_closure_args` bridge — suspend the
+      quantum for the duration of `VM::execute` (`ctx.suspend_runtime_quantum()`),
+      since `execute` is the legacy synchronous run-to-completion entry the
+      runtime never drives through (it uses `seed_main_frame`+`run_quantum`). That
+      restored integration_test to 1055/0.
+
+      BLOCKING GAP (why reverted): the synchronous runtime-drive loop in
+      `run_exprs_via_runtime` (NullExecutor; idle only services a timer deadline,
+      errors on `inbox_wakeup_required`) cannot service genuine async/concurrent
+      I/O reached through the flipped `eval`/`eval_str`. Two production-async
+      categories go RED (both green at baseline, neither fixable without the
+      real executor / callback-ABI work of Tasks 04–06):
+        1. HOF-callback async (1 test — `embedding_api_test::embedding_async_all_and_channels`):
+           `(foldl + 0 (async/all (map (fn (x) (async (* x x))) …)))` fails with
+           "async yield outside of scheduler context". A stdlib HOF (`map`/`foldl`)
+           whose callback spawns/awaits `async` re-enters synchronously and the
+           async yield escapes the cooperative scheduler. This is exactly the
+           Task 04 `NativeOutcome::Call` callback-re-entry migration target.
+        2. Concurrent external blocking I/O (3 tests — `mcp_async_test`:
+           `cross_connection_overlap_proves_no_serialization`,
+           `scheduler_not_stalled_sibling_completes_before_slow_call`,
+           `cancellation_tombstones_connection_and_interpreter_stays_healthy`):
+           `async/spawn`ed tasks that make blocking `mcp/call`s do NOT truly
+           overlap on the NullExecutor sync-drive path (observed
+           `["a-timed-out-without-marker", "b-done"]` — no in-flight interleave),
+           whereas the legacy `init_scheduler` path achieved real concurrency.
+           Needs a real executor (Task 05/06) to run blocking leaf calls
+           off-thread while siblings progress.
+      Simpler async DOES flip cleanly (`embedding_async_works_on_vm`,
+      `(await (async …))`, sync I/O, timers, multimethods, modules, dynamic
+      context all green through the runtime). The 4 pre-existing vm_async_test RED
+      did NOT resolve — they run through `common::eval` → `eval_str_compiled`,
+      which was deliberately NOT flipped (flipping it broke 14 more async tests
+      that suspend on channels/blocking-sleep/deadlock).
+      DECISION: reverted both changes to the exact green baseline (eval_test
+      1072/0, integration_test 1055/0, vm_async_test 4 pre-existing RED,
+      embedding_api_test 14/0, mcp_async_test 8/0). The flip is unblocked once
+      Task 04 (callback re-entry ABI) and Task 05/06 (real executor for blocking
+      leaf I/O + concurrent scheduling) land; the `*_via_runtime` entry points
+      remain available for incremental validation._
 
 - [ ] **Step 3: Remove TLS scheduler ownership**
 

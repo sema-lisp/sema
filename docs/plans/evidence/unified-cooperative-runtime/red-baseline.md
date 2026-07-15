@@ -121,3 +121,64 @@ fix fails a wall-clock assertion or CI timeout rather than hanging):
 `runtime_drop_with_channel_parked_task_does_not_hang` (the hang proof),
 `runtime_drop_with_channel_send_parked_task_does_not_hang` (sender path),
 `runtime_owned_fail_fast_cancels_channel_parked_worker`.
+
+## Task 03 Step 2 — eval flip: MEASURED → REVERTED (2026-07-15)
+
+Flipped the primary eval entry points (`eval_in_global`/`eval_str_in_global`,
+backing `eval`/`eval_str`) from the legacy `run_exprs_on_vm` (TLS `init_scheduler`
+path) onto `run_exprs_via_runtime` (the interpreter's single persistent unified
+runtime), measured the full workspace, and reverted.
+
+### What routed through the runtime cleanly
+- eval_test **1072/0** and integration_test **1055/0** — the two oracles held.
+- integration_test only stayed green after fixing a re-entry-guard gap: the
+  `eval`/`load`/`import` builtins re-enter the VM synchronously
+  (`eval_value_vm`/`eval_module_body_vm` → `VM::execute` → `run`), which the
+  runtime-quantum guard (`vm.rs:1662`) rejected with *"legacy native callback
+  cannot re-enter a VM during an active runtime quantum"* → 18 integration_test
+  failures (eval/load/import/module/macroexpand). Fix: suspend the quantum for
+  the duration of `VM::execute` (`ctx.suspend_runtime_quantum()`), mirroring the
+  existing `run_nested_closure_args` bridge — `execute` is the legacy synchronous
+  run-to-completion entry the runtime never drives through (it uses
+  `seed_main_frame` + `run_quantum`). Restored integration_test to 1055/0.
+- Simple async flips fine: `(await (async …))`, sync stdlib I/O, timers
+  (`async/sleep`), multimethods, modules, dynamic context — all green.
+
+### Blocking gap categories (why reverted)
+`run_exprs_via_runtime`'s synchronous drive loop (NullExecutor; idle only
+services a timer deadline, errors on `inbox_wakeup_required`) cannot service
+genuine async/concurrent I/O reached through the flipped `eval`/`eval_str`. Both
+categories were GREEN at baseline; neither is fixable without the Task 04–06
+executor / callback-ABI work.
+
+| Category | N | Tests | Root cause | Unblocked by |
+| --- | --- | --- | --- | --- |
+| HOF-callback async | 1 | `embedding_api_test::embedding_async_all_and_channels` | `(foldl + 0 (async/all (map (fn (x) (async (* x x))) …)))` → "async yield outside of scheduler context": a stdlib HOF callback (`map`/`foldl`) that spawns/awaits `async` re-enters synchronously and the async yield escapes the cooperative scheduler | Task 04 `NativeOutcome::Call` callback-re-entry migration |
+| Concurrent external blocking I/O | 3 | `mcp_async_test::{cross_connection_overlap_proves_no_serialization, scheduler_not_stalled_sibling_completes_before_slow_call, cancellation_tombstones_connection_and_interpreter_stays_healthy}` | `async/spawn`ed tasks making blocking `mcp/call`s do not truly overlap on the NullExecutor sync-drive path (observed `["a-timed-out-without-marker","b-done"]` — no in-flight interleave); legacy `init_scheduler` achieved real concurrency | Task 05/06 real executor (run blocking leaf calls off-thread while siblings progress) |
+
+The 4 pre-existing `vm_async_test` RED did **not** resolve: they run through
+`common::eval` → `eval_str_compiled`, deliberately NOT flipped (flipping
+`eval_str_compiled` broke 14 more async tests that suspend on
+channels/blocking-sleep/deadlock — the same executor gap, wider blast radius).
+
+### Post-revert state (exact green baseline)
+eval_test **1072/0**, integration_test **1055/0**, vm_async_test **114 passed;
+4 failed** (documented RED), sema-eval **91/0**, sema-vm **482/0**,
+embedding_api_test **14/0**, mcp_async_test **8/0**. Working tree clean at HEAD;
+no code changed (this evidence + the task-03 Step 2 annotation are the only
+edits). `cargo check --workspace --tests` exit 0.
+
+### What stands between here and "eval fully on the runtime, legacy scheduler deletable"
+1. **Callback-re-entry ABI (Task 04)** — replace the synchronous
+   `eval_value_vm`/HOF-callback `VM::execute` re-entry with a suspend/resume
+   `NativeOutcome::Call` continuation so an `async` inside a `map`/`foldl`
+   callback yields cooperatively instead of escaping the scheduler. This also
+   retires the temporary `suspend_runtime_quantum` bridge.
+2. **Real executor (Task 05/06)** — run blocking leaf I/O (`mcp/call`, HTTP,
+   external I/O) off-thread so `async/spawn`ed siblings truly overlap; the
+   `run_exprs_via_runtime` drive loop must service `inbox_wakeup_required` idle
+   (currently a hard error), not just timer deadlines.
+3. Then flip `eval`/`eval_str` **and** `eval_str_compiled` together (they share
+   `common::eval` and the CLI `-e` path), which should also resolve the 4
+   `vm_async_test` RED (scheduling/fairness/cancellation semantics owned by the
+   runtime).

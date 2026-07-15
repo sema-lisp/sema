@@ -103,6 +103,14 @@ struct RuntimeTask {
     /// `async/spawn`) park: the value to inject onto the parked frame's stack
     /// top before the next `run_quantum`, or a failure to settle the task with.
     vm_resume: Option<VmResume>,
+    /// The per-task LLM dynamic scope (`llm/with-cache` / `with-budget` state),
+    /// captured from the spawner's thread-locals at `async/spawn` and installed
+    /// around each of this task's quanta (restored after). `None` for the root
+    /// task, which runs directly against the process thread-locals. The scope is a
+    /// type-erased `sema-llm` struct reached through the registered scope seam; it
+    /// carries only scalar state + a shared budget `Rc` (no GC-traceable `Value`),
+    /// so it needs no trace edge.
+    llm_scope: Option<Box<dyn std::any::Any>>,
 }
 
 /// How a parked VM-quantum task should be resumed once its awaited promise
@@ -365,6 +373,7 @@ impl Runtime {
                 vm_owner: None,
                 context: TaskContextHandle::default(),
                 vm_resume: None,
+                llm_scope: None,
             },
         );
         state.ready.enqueue(root, task);
@@ -410,6 +419,7 @@ impl Runtime {
                 vm_owner: Some(ReturnOwner::Root),
                 context: TaskContextHandle::default(),
                 vm_resume: None,
+                llm_scope: None,
             },
         );
         state.ready.enqueue(root, task);
@@ -1246,7 +1256,27 @@ impl Runtime {
             let cancel = task.record.cancellation();
             CancellationView::new(cancel.is_some(), cancel.map(|request| request.reason))
         };
+        // Install this task's captured LLM dynamic scope (cache/budget/…) around the
+        // quantum so a completion or fan-out spawned inside a `with-cache`/`with-budget`
+        // extent sees it even after the wrapper's thunk (and its thread-local scope)
+        // has ended. The quantum's own mutations persist back onto the task; the prior
+        // (spawner/global) scope is restored afterwards. The root task carries no
+        // captured scope and runs directly against the process thread-locals.
+        let displaced_scope = task
+            .llm_scope
+            .take()
+            .map(sema_core::install_task_llm_scope);
+        // Publish the running task's identity so natives that open a per-task slab
+        // entry (`llm/stream`, `agent/run`) record the owning task, letting the
+        // task-reaped sweep reclaim the entry (and its detached span) when the task
+        // is cancelled mid-flight.
+        let prev_task_id = sema_core::set_current_task_id(Some(task_id.get()));
         let quantum = vm.run_quantum(&context, instruction_limit, cancellation);
+        let _ = sema_core::set_current_task_id(prev_task_id);
+        if let Some(displaced) = displaced_scope {
+            task.llm_scope = Some(sema_core::take_task_llm_scope());
+            let _ = sema_core::install_task_llm_scope(displaced);
+        }
         drop(quantum_guard);
         self.state.borrow_mut().turn_instructions += quantum.instructions;
         let action = match quantum.outcome {
@@ -2363,6 +2393,15 @@ impl Runtime {
                     vm_owner: Some(ReturnOwner::Root),
                     context: TaskContextHandle::default(),
                     vm_resume: None,
+                    // Seed the child with a snapshot of the spawner's LLM dynamic
+                    // scope (cache/budget/rate-limit/fallback state), read from the
+                    // thread-locals the spawner is still running under. A concurrent
+                    // fan-out spawned inside one `llm/with-budget` therefore captures
+                    // the shared budget `Rc` and charges it as one aggregate, and an
+                    // `llm/with-cache` completion deferred past the thunk's extent
+                    // still sees the cache enabled — the scope rides the task, not
+                    // the (already-restored) global.
+                    llm_scope: Some(sema_core::current_llm_scope_boxed()),
                 },
             );
             state.task_promises.insert(child, promise);
@@ -2543,6 +2582,13 @@ impl Runtime {
         task_id: TaskId,
         outcome: TaskOutcome,
     ) -> Result<(), RuntimeFault> {
+        // A cancelled task's bytecode never runs again, so its `__stream-finish` /
+        // `__agent-finish` cleanup can't run: notify the reap seam so `sema-llm`
+        // reclaims any per-task slab entry (and ends its detached span) this task
+        // owned. Idempotent by absence for a normally-finished task.
+        if matches!(outcome, TaskOutcome::Cancelled(_)) {
+            sema_core::notify_task_reaped(task_id.get());
+        }
         let is_root_main = {
             let state = self.state.borrow();
             matches!(

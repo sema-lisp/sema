@@ -973,7 +973,7 @@ pub const PRELUDE: &str = r#"
 ;; runs. With no callback the deltas print to stdout, trailing newline included —
 ;; matching the blocking native's default display.
 (define (llm/stream . __args)
-  (if (and (__async-context?) (not (null? __args)))
+  (if (and (or (__async-context?) (__runtime-quantum?)) (not (null? __args)))
       (let ((__cbs (filter procedure? (cdr __args)))
             (__tok (apply __stream-begin __args)))
         (let ((__cb (if (null? __cbs) (fn (__c) (display __c)) (car __cbs))))

@@ -77,17 +77,18 @@ pub struct Interpreter {
 use sema_vm::runtime::Runtime;
 
 /// Build the interpreter-owned persistent runtime that shares `ctx`. Uses the
-/// same host adapters as the former per-call construction (`MonotonicClock` +
-/// `NullExecutor`); the synchronous runtime path never submits I/O. Fresh
-/// runtime construction does not fail in practice, so this is infallible —
-/// a failure would mean the wait-runtime could not allocate identity, which
-/// only happens under a corrupt/exhausted global counter.
+/// real thread-pool executor so genuinely-blocking external operations submitted
+/// from within a runtime quantum run off the VM thread and overlap; the drive
+/// loop (`run_exprs_via_runtime`) services their completions by block-waiting on
+/// the runtime inbox. Fresh runtime construction does not fail in practice, so
+/// this is infallible — a failure would mean the wait-runtime could not allocate
+/// identity, which only happens under a corrupt/exhausted global counter.
 fn build_runtime(ctx: &Rc<EvalContext>) -> Runtime {
-    use sema_vm::runtime::{MonotonicClock, NullExecutor};
+    use sema_vm::runtime::{MonotonicClock, ThreadPoolExecutor};
     Runtime::new(
         Rc::clone(ctx),
         Rc::new(MonotonicClock),
-        std::sync::Arc::new(NullExecutor),
+        std::sync::Arc::new(ThreadPoolExecutor::new()),
     )
     .expect("fresh unified runtime construction cannot fail")
 }
@@ -313,11 +314,28 @@ impl Interpreter {
                 .map_err(|e| SemaError::eval(format!("runtime fault: {e:?}")))?
             {
                 DriveState::Progress { .. } => {}
-                // The root is parked on a timer (`async/sleep`): the only pending
-                // work is a future deadline. Wait out the earliest deadline on a
-                // real clock, then drive again so `fire_timer` wakes the VM. Any
-                // other idle shape (no deadline, or an inbox/IO wait this
-                // synchronous path can't service) is an unsupported suspension.
+                // A task is parked on an external operation running on a worker
+                // thread (a blocking op submitted to the executor). Block-wait on
+                // the completion inbox — bounded by the earliest timer deadline if
+                // one exists — then drive again so `drain_completion` delivers the
+                // worker's result and resumes the task. Wakeable and never
+                // busy-spins: an arriving completion returns immediately.
+                DriveState::Idle {
+                    next_deadline,
+                    inbox_wakeup_required: true,
+                    ..
+                } => {
+                    if !runtime.block_on_inbox(next_deadline) && next_deadline.is_none() {
+                        // The inbox closed with no completion and no timer to fall
+                        // back on: the parked task can never be resumed.
+                        return Err(SemaError::eval(
+                            "eval_via_runtime: external wait cannot be completed (executor inbox closed)",
+                        ));
+                    }
+                }
+                // The root is parked purely on a timer (`async/sleep`): the only
+                // pending work is a future deadline. Wait it out on a real clock,
+                // then drive again so `fire_timer` wakes the VM.
                 DriveState::Idle {
                     next_deadline: Some(deadline),
                     inbox_wakeup_required: false,
@@ -330,7 +348,7 @@ impl Interpreter {
                 }
                 _ => {
                     return Err(SemaError::eval(
-                        "eval_via_runtime: root did not settle (async/IO is not supported on the synchronous runtime path)",
+                        "eval_via_runtime: root did not settle (unsupported suspension on the runtime path)",
                     ));
                 }
             }

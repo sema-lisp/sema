@@ -3082,6 +3082,73 @@ impl Runtime {
         Ok(())
     }
 
+    /// Force-settle the requested `root` as `Failed` with a legacy-parity
+    /// deadlock error. Called by the host drive loop when the runtime has gone
+    /// fully idle — `DriveState::Idle { next_deadline: None,
+    /// inbox_wakeup_required: false, legacy_io_wakeup_required: false }` — yet
+    /// the root is still `Running`: no task made progress this turn and there is
+    /// no timer deadline nor pending external completion that could ever change
+    /// that, so the root is parked on an intra-runtime wait (channel/promise)
+    /// that nothing runnable can satisfy. That is a genuine deadlock.
+    ///
+    /// The error text mirrors what the legacy scheduler / synchronous channel
+    /// ops produce, so `eval_str_via_runtime` matches the `eval_str` oracle:
+    /// - root main task parked directly on `channel/recv` (top-level, no sender)
+    ///   → "channel/recv: channel is empty";
+    /// - root main task parked directly on `channel/send` (full, no receiver)
+    ///   → "channel/send: channel is full";
+    /// - otherwise (awaiting a never-settling promise, mutual await, a spawned
+    ///   task that is itself blocked, …) → "async scheduler: all tasks blocked
+    ///   (deadlock detected)". A channel op *inside* a spawn parks a child task,
+    ///   leaving the root main task on a promise wait — so it falls here, exactly
+    ///   like the legacy path where only a top-level (non-async) channel op errors
+    ///   with the channel-specific message.
+    ///
+    /// Returns `Ok(true)` when it settled the root; `Ok(false)` when the root was
+    /// not force-settleable (already settled/aborted, or its main task was not
+    /// parked) so the caller can fall back to its unsupported-suspension error
+    /// rather than inventing a settlement.
+    pub fn settle_deadlocked_root(&self, root: RootId) -> Result<bool, RuntimeFault> {
+        let main_task = {
+            let state = self.state.borrow();
+            match state.roots.get(&root).map(RootRecord::state) {
+                Some(RootState::Running { main_task }) => *main_task,
+                _ => return Ok(false),
+            }
+        };
+        let error = {
+            let mut state = self.state.borrow_mut();
+            match state.tasks.get(&main_task) {
+                Some(task) if task.record.state_name() == super::StateName::Waiting => {}
+                // The root main task is not parked (already resumed/settling): not
+                // a deadlock this method can name. Let the caller decide.
+                _ => return Ok(false),
+            }
+            if let Some((key, channel, receive)) = state.channel_waits.remove(&main_task) {
+                // Deregister from the channel queue so no stale wait remains once
+                // the task is removed by `settle` below.
+                let _ = state.channels.cancel_wait(channel, key);
+                if receive {
+                    sema_core::SemaError::eval("channel/recv: channel is empty")
+                } else {
+                    sema_core::SemaError::eval("channel/send: channel is full").with_hint(
+                        "Use async to run in an async context where send will yield until space is available",
+                    )
+                }
+            } else {
+                // Awaiting a promise (single or set) that can never settle — a
+                // genuine cross-task deadlock. Drop the per-task wait bookkeeping;
+                // any never-settling descendant tasks stay parked but inert (they
+                // are Waiting, never Ready, so they never re-enter the drive loop).
+                state.promise_waits.remove(&main_task);
+                state.promise_set_waits.remove(&main_task);
+                sema_core::SemaError::eval("async scheduler: all tasks blocked (deadlock detected)")
+            }
+        };
+        self.settle(root, main_task, TaskOutcome::Failed(error))?;
+        Ok(true)
+    }
+
     pub fn cancel_root(&self, root: RootId, reason: CancelReason) -> bool {
         let mut state = self.state.borrow_mut();
         if root.runtime()

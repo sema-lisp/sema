@@ -346,6 +346,29 @@ impl Interpreter {
                         std::thread::sleep(deadline - now);
                     }
                 }
+                // Fully idle: no task made progress this turn, no timer deadline,
+                // and no pending external completion — nothing can ever change
+                // the runtime's state. The requested root is parked on an
+                // intra-runtime wait (channel/promise) that no runnable task can
+                // satisfy: a genuine deadlock. Settle the root Failed with the
+                // legacy-parity error (`channel/recv: channel is empty` /
+                // `channel/send: channel is full` for a top-level channel op, or
+                // the generic all-blocked deadlock otherwise) so the next
+                // `poll_result` returns it. Bounded — never hangs.
+                DriveState::Idle {
+                    next_deadline: None,
+                    inbox_wakeup_required: false,
+                    legacy_io_wakeup_required: false,
+                } => {
+                    if !runtime
+                        .settle_deadlocked_root(handle.id())
+                        .map_err(|e| SemaError::eval(format!("runtime fault: {e:?}")))?
+                    {
+                        return Err(SemaError::eval(
+                            "eval_via_runtime: root did not settle (unsupported suspension on the runtime path)",
+                        ));
+                    }
+                }
                 _ => {
                     return Err(SemaError::eval(
                         "eval_via_runtime: root did not settle (unsupported suspension on the runtime path)",
@@ -2436,6 +2459,113 @@ mod runtime_eval_tests {
             result.is_err(),
             "deadlock must surface as Err, got {result:?}"
         );
+    }
+
+    // ── DEADLOCK / ALL-BLOCKED DETECTION (legacy-parity gates) ───────────────
+    //
+    // When the requested root can make no further progress — parked on an
+    // intra-runtime wait (channel/promise) that no runnable task can satisfy,
+    // with no pending timer or external completion — the drive loop settles the
+    // root Failed with the SAME error the legacy evaluator (`eval_str`) produces,
+    // rather than hanging or returning an opaque "root did not settle". Each gate
+    // pins the runtime error string to the `eval_str` oracle.
+
+    /// Run `program` through the runtime on a dedicated thread with a hard wall
+    /// clock, so a detection regression surfaces as a test failure (bounded) and
+    /// never wedges the suite. `Interpreter` is `!Send` (it holds `Rc`s), so the
+    /// interpreter is constructed *inside* the worker; only the `Result`'s string
+    /// projection (which is `Send`) crosses the channel back.
+    fn runtime_eval_bounded(program: &'static str) -> Result<String, String> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let interp = Interpreter::new();
+            let projected = interp
+                .eval_str_via_runtime(program)
+                .map(|v| format!("{v:?}"))
+                .map_err(|e| e.to_string());
+            let _ = tx.send(projected);
+        });
+        match rx.recv_timeout(std::time::Duration::from_secs(30)) {
+            Ok(projected) => {
+                worker.join().expect("runtime worker thread panicked");
+                projected
+            }
+            Err(_) => panic!("eval_str_via_runtime hung (no termination in 30s) for {program:?}"),
+        }
+    }
+
+    /// Assert the runtime path fails with the exact `eval_str` legacy oracle
+    /// error string, within a bounded wall clock (never hangs).
+    fn assert_runtime_deadlock_matches_oracle(program: &'static str) {
+        let oracle = Interpreter::new()
+            .eval_str(program)
+            .err()
+            .unwrap_or_else(|| panic!("legacy oracle unexpectedly succeeded for {program:?}"))
+            .to_string();
+        let got = runtime_eval_bounded(program)
+            .err()
+            .unwrap_or_else(|| panic!("runtime unexpectedly succeeded for {program:?}"));
+        assert_eq!(
+            got, oracle,
+            "runtime deadlock error != legacy oracle for {program:?}"
+        );
+    }
+
+    // GATE — top-level `channel/recv` on an empty channel with no sender parks
+    // the root (everything runs in a runtime quantum), and the drive loop settles
+    // it with the legacy "channel/recv: channel is empty".
+    #[test]
+    fn runtime_deadlock_toplevel_recv_empty_matches_oracle() {
+        assert_runtime_deadlock_matches_oracle("(channel/recv (channel/new 1))");
+    }
+
+    // GATE — top-level `channel/send` on a full channel with no receiver parks
+    // the root; the drive loop settles it with the legacy "channel/send: channel
+    // is full". (`(channel/new 0)` is rejected before it can be sent to — capacity
+    // must be >= 1 — so a genuine full channel is a cap-1 channel fed twice.)
+    #[test]
+    fn runtime_deadlock_toplevel_send_full_matches_oracle() {
+        assert_runtime_deadlock_matches_oracle(
+            "(begin (define ch (channel/new 1)) (channel/send ch 1) (channel/send ch 2))",
+        );
+    }
+
+    // GATE — two spawned tasks mutually awaiting each other (sleep-first so both
+    // promises exist before either await parks) is a genuine cross-task deadlock:
+    // the root settles with the legacy "async scheduler: all tasks blocked
+    // (deadlock detected)" and the drive loop TERMINATES (bounded by the guard).
+    #[test]
+    fn runtime_deadlock_mutual_await_terminates_matches_oracle() {
+        assert_runtime_deadlock_matches_oracle(
+            "(begin \
+               (define pa nil) (define pb nil) \
+               (set! pa (async/spawn (fn () (async/sleep 1) (await pb)))) \
+               (set! pb (async/spawn (fn () (async/sleep 1) (await pa)))) \
+               (await pa))",
+        );
+    }
+
+    // GATE — a detached task legitimately parked on a REAL timer must NOT be
+    // misclassified as a deadlock: while it sleeps the drive loop reports
+    // `Idle { next_deadline: Some, .. }` (not the all-idle deadlock state), so a
+    // new root that completes synchronously in the same runtime returns its value
+    // normally and the sleeping detached task survives to settle later. This
+    // guards that deadlock detection keys on the fully-idle state alone, never on
+    // "some task is parked".
+    #[test]
+    fn runtime_detached_timer_park_is_not_deadlock() {
+        let interp = Interpreter::new();
+        // Detached task parked on a real 5s timer; it does not settle within this
+        // eval, but the runtime persists it (survival gate).
+        interp
+            .eval_str_via_runtime("(async/spawn (fn () (async/sleep 5000) 1))")
+            .expect("spawning a sleeping detached task returns its promise");
+        // A subsequent synchronous root must settle with its own value, NOT be
+        // misreported as deadlocked because a detached task is parked on a timer.
+        let result = interp
+            .eval_str_via_runtime("(+ 1 2)")
+            .expect("a synchronous root settles even while a detached timer is parked");
+        assert_eq!(result, Value::int(3));
     }
 
     // Catchability of an await rejection must NOT be timing-dependent. When the

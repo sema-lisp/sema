@@ -1106,6 +1106,54 @@ occurrence and classification in evidence.
       bounded interpreter-drop join for the real executor. Until these land,
       `eval_str_compiled`/`common::eval` cannot flip, and even the primary
       `eval`/`eval_str` flip breaks the native agent loop._
+    - _Progress (2026-07-15): FLIP BLOCKER (2) — RUNTIME DEADLOCK / ALL-BLOCKED
+      DETECTION — LANDED (independent of the flip itself; the `*_via_runtime`
+      entry points already exercise it). `run_exprs_via_runtime`'s drive loop now
+      handles `DriveState::Idle { next_deadline: None, inbox_wakeup_required:
+      false, legacy_io_wakeup_required: false }` (previously the opaque `_ =>`
+      "root did not settle") by calling a new
+      `Runtime::settle_deadlocked_root(root)` (sema-vm `runtime/state.rs`), which
+      force-settles the requested root `Failed` with the LEGACY-PARITY error and
+      lets the next `poll_result` return it — bounded, never hangs.
+      HOW IT MAPS TO THE LEGACY ORACLE (matched exactly, verified by running each
+      program through `eval_str`): the classification keys on the root's MAIN
+      task's wait bookkeeping —
+        * main task parked directly on `channel/recv` (`channel_waits` receive=true)
+          → "channel/recv: channel is empty";
+        * main task parked directly on `channel/send` (`channel_waits` receive=false)
+          → "channel/send: channel is full" (+ the same async hint as the legacy op);
+        * otherwise (awaiting a never-settling promise / mutual await / a spawned
+          task that is itself blocked; main task in `promise_waits`/`promise_set_waits`)
+          → "async scheduler: all tasks blocked (deadlock detected)".
+      This reproduces the legacy top-level-vs-async split WITHOUT changing the
+      runtime's channel-op semantics (channel ops still park in a quantum — no
+      oracle-weakening): a channel op INSIDE a spawn parks a CHILD task, so the
+      root main task sits on a promise wait and gets the generic deadlock message,
+      exactly as legacy (where only a top-level, non-async channel op raises the
+      channel-specific error). The blame is always the REQUESTED root: when the
+      loop reaches the fully-idle state the root is still `Pending` (checked by
+      `poll_result` first) and the whole runtime made zero progress with no
+      timer/external pending, so the root genuinely cannot settle.
+      DISTINGUISHING DEADLOCK FROM TIMER/EXTERNAL/INBOX (drive loop,
+      `crates/sema-eval/src/eval.rs` `run_exprs_via_runtime`): a detached task
+      parked on a REAL timer yields `Idle { next_deadline: Some, .. }` (timer arm
+      sleeps), an external/blocking op yields `inbox_wakeup_required: true`
+      (block-on-inbox arm), and only the all-idle `Idle { None, false, false }`
+      triggers deadlock settlement — so a detached-parked-on-real-wait task is
+      never misclassified (cross-eval detached survival preserved).
+      GATE TESTS (un-ignored, `mod runtime_eval_tests`): `runtime_deadlock_
+      toplevel_recv_empty_matches_oracle`, `..._send_full_matches_oracle`,
+      `runtime_deadlock_mutual_await_terminates_matches_oracle` (run on a
+      dedicated worker thread with a 30s wall-clock guard proving termination),
+      `runtime_detached_timer_park_is_not_deadlock`. All pin the runtime error
+      string to the `eval_str` oracle. Verified: sema-eval 113/0, sema-vm 484/0,
+      eval_test 1072/0, integration_test 1055/0, vm_async_test STILL 114/4 (the
+      same 4 pre-existing RED — the legacy `eval_str_compiled` path is unchanged),
+      `cargo check --workspace --tests` exit 0, clippy+fmt clean. NO DIVERGENCE
+      ignored — all three blocked/deadlocked cases match the legacy oracle exactly.
+      Remaining flip blockers (unchanged by this): (1) native synchronous
+      call_callback loops (`agent/run`) re-entry ABI, and (3) native-stack budget
+      of the runtime drive (deep-recursion parity) + bounded interpreter-drop join._
 
 - [ ] **Step 3: Remove TLS scheduler ownership**
 

@@ -26,6 +26,10 @@ struct FmtConfig {
     align: bool,
     #[serde(default = "default_max_blank_lines", alias = "max_blank_lines", rename = "max-blank-lines")]
     max_blank_lines: usize,
+    /// Glob patterns (or literal path prefixes) excluded from formatting.
+    /// Explicitly named files bypass this list.
+    #[serde(default)]
+    ignore: Vec<String>,
 }
 
 impl Default for FmtConfig {
@@ -35,6 +39,7 @@ impl Default for FmtConfig {
             indent: 2,
             align: false,
             max_blank_lines: 1,
+            ignore: Vec::new(),
         }
     }
 }
@@ -845,7 +850,7 @@ fn main() {
                     align: align || config.fmt.align,
                     max_blank_lines: max_blank_lines.unwrap_or(config.fmt.max_blank_lines),
                 };
-                run_fmt(&files, check, diff, &opts, json);
+                run_fmt(&files, check, diff, &opts, &config.fmt.ignore, json);
             }
             Commands::Lsp => {
                 eprintln!("Sema LSP server starting on stdio...");
@@ -2986,8 +2991,33 @@ fn run_fmt(
     check: bool,
     show_diff: bool,
     opts: &sema_fmt::FormatOptions,
+    ignore: &[String],
     json: bool,
 ) {
+    // A path is ignored when it matches an `ignore` entry from sema.toml.
+    // An entry with glob characters matches as a glob; anything else is a
+    // literal path prefix (file or directory). Paths are matched relative to
+    // the working directory, `./`-stripped.
+    let is_ignored = |path: &str| -> bool {
+        let normalized = path.strip_prefix("./").unwrap_or(path);
+        ignore.iter().any(|pat| {
+            if pat.contains('*') || pat.contains('?') || pat.contains('[') {
+                glob::Pattern::new(pat)
+                    .map(|g| g.matches(normalized))
+                    .unwrap_or(false)
+            } else {
+                let prefix = pat.trim_end_matches('/');
+                normalized == prefix || normalized.starts_with(&format!("{prefix}/"))
+            }
+        })
+    };
+    // Wildcards don't cross a leading dot: the recursive walk stays out of
+    // hidden directories (.git, .worktrees, ...) unless a pattern names one
+    // literally.
+    let match_opts = glob::MatchOptions {
+        require_literal_leading_dot: true,
+        ..Default::default()
+    };
     // Handle stdin ("-")
     if patterns.len() == 1 && patterns[0] == "-" {
         let mut source = String::new();
@@ -3040,10 +3070,11 @@ fn run_fmt(
     // Determine which files to format
     let files = if patterns.is_empty() {
         // Default: all .sema files in current directory recursively
-        match glob::glob("**/*.sema") {
+        match glob::glob_with("**/*.sema", match_opts) {
             Ok(paths) => paths
                 .filter_map(|p| p.ok())
                 .map(|p| p.to_string_lossy().to_string())
+                .filter(|p| !is_ignored(p))
                 .collect::<Vec<_>>(),
             Err(e) => {
                 eprintln!("Error: invalid glob pattern: {e}");
@@ -3056,10 +3087,13 @@ fn run_fmt(
         for pattern in patterns {
             // If it contains glob characters, expand it
             if pattern.contains('*') || pattern.contains('?') || pattern.contains('[') {
-                match glob::glob(pattern) {
+                match glob::glob_with(pattern, match_opts) {
                     Ok(paths) => {
                         for path in paths.filter_map(|p| p.ok()) {
-                            all_files.push(path.to_string_lossy().to_string());
+                            let path = path.to_string_lossy().to_string();
+                            if !is_ignored(&path) {
+                                all_files.push(path);
+                            }
                         }
                     }
                     Err(e) => {
@@ -3068,7 +3102,7 @@ fn run_fmt(
                     }
                 }
             } else {
-                // Treat as literal file path
+                // An explicitly named file always formats, ignore list or not
                 all_files.push(pattern.clone());
             }
         }

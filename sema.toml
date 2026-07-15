@@ -2,3 +2,5 @@
 # (the formatter walks up from the current directory to the nearest sema.toml).
 [fmt]
 align = true
+# Generated snapshot used by the 1brc benchmark harness — not source to format.
+ignore = ["benchmarks/1brc/sema-src"]

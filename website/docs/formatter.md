@@ -60,6 +60,7 @@ width = 80
 indent = 2
 align = false
 max-blank-lines = 1
+ignore = ["vendor", "gen/**", "*.generated.sema"]
 ```
 
 ### Options
@@ -70,6 +71,7 @@ max-blank-lines = 1
 | `indent` | integer | `2` | Number of spaces for body indentation |
 | `align` | boolean | `false` | Column-align consecutive similar forms (defines, let bindings, cond clauses, map values) |
 | `max-blank-lines` | integer | `1` | Longest run of consecutive blank lines to preserve; longer runs are collapsed. `0` removes all blank lines |
+| `ignore` | array | `[]` | Paths excluded from formatting. An entry with glob characters matches as a glob (`gen/**`, `*.generated.sema`); anything else is a literal path prefix that excludes a file or a whole directory (`vendor`). Matched relative to the working directory |
 
 ### Precedence
 
@@ -82,6 +84,21 @@ Settings are merged in this order (later wins):
 ```bash
 # sema.toml sets width=100, but CLI overrides to 120
 sema fmt --width 120
+```
+
+### Excluded Files
+
+Two rules keep `sema fmt` away from files it shouldn't touch:
+
+- The recursive walk (both the no-argument default and glob patterns you pass) skips **hidden directories** — `.git`, editor state, worktrees — unless a pattern names one literally.
+- Paths matching an `ignore` entry are excluded from discovery. Naming a file **explicitly** always formats it, ignore list or not:
+
+```bash
+# vendor/ is in the ignore list — the recursive walk skips it...
+sema fmt
+
+# ...but an explicit path always formats
+sema fmt vendor/lib.sema
 ```
 
 ## Disabling the Formatter for a Region

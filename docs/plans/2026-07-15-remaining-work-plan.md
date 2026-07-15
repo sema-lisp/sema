@@ -1,7 +1,56 @@
 # Unified Cooperative Runtime — Remaining-Work Implementation Plan
 
 **Branch:** `codex/unified-async-runtime` · **Author:** Fable 5 (senior-architect pass, 2026-07-15)
-**Status:** DRAFT — pending 2 independent Opus verifier sanity-checks before implementation.
+**Status:** VERIFIED (round-0, two independent Opus reviewers) — corrections applied below; ready
+for implementation pending owner go-ahead.
+
+## Verification round-0 outcome (2 independent Opus reviewers) + applied corrections
+
+**Verdicts:** Reviewer 1 (debug + primitives) = SOUND-TO-PROCEED, no fatal flaws. Reviewer 2
+(correctness + sequencing) = SOUND-WITH-CHANGES. Both verified nearly every file:line claim.
+
+**The crux is confirmed safe.** The R2 question — can the VM's blocking stop-server run *inside* a
+runtime debug quantum without deadlocking the state cell — is **NO deadlock, verified**:
+`run_parked_quantum` calls the quantum with `self.state` (and the `WaitRuntime` inside it) fully
+unborrowed (borrows at state.rs:1235-1237 dropped before the quantum at ~1271; re-taken at 1278),
+and `handle_debug_stop` only touches `self` (the paused task's VM), never `RuntimeState`. Callback
+VMs also flow through `run_parked_quantum` (enqueued, not run inline), so the whole P3 approach holds
+and is *easier* than written. This is the design the entire Task-08 purge depends on.
+
+**Corrections applied to this plan (all agreed, none controversial):**
+1. **R1 → a standalone `P-hotfix`, landed FIRST** (before P0). Both reviewers confirmed the
+   OTel/usage per-task isolation gap is a REAL live regression, and Reviewer 2 showed it is *larger*
+   than "the per-quantum swap": `async/spawn` also dropped the spawn-time capture of the otel parent
+   seed (`current_conversation_scope()`) + usage scope, so spawned tasks become disconnected trace
+   roots too. Fix = restore spawn-time capture (state.rs:2391-2401) AND add otel/usage to the
+   per-quantum swap (state.rs:1265-1276), mirroring scheduler.rs:60-90/166-168. Test-first (forced
+   mid-span cross-task interleave + concurrent-usage attribution). ~standalone, isolatable.
+2. **C1's deadlock-freedom taxonomy has a real hole and is corrected below.** The proof is sound for
+   *today's* WaitKind set, but the plan's own P1 introduces `WaitKind::ResourceSlot`, which IS
+   cycle-forming — so C1 must classify ResourceSlot (and any transitional `AwaitIo`, plus `PromiseSet`,
+   with an explicit `Timeout` rule) as cycle-forming, or the barrier can hang. See the corrected C1
+   in §9. C1 stays sequenced after P1 and remains severable to the drain fallback.
+3. **C2 exactly-once teardown is now an explicit invariant** (§9): the request-time delivery path
+   removes the wait registration *before* invoking the abort hook; the drive-scan is a backstop only.
+4. **P3 corrections:** (a) drop the "re-enqueue at FRONT" requirement — `ready.rs` has no `push_front`;
+   back-enqueue is correct because the barrier already gates every sibling (or add a front method if
+   DAP step-order needs it). (b) The `TaskAction::DebugStop` handler must explicitly RE-INSERT the
+   `visit_ready`-removed task into `state.tasks` with `vm_call = Some(vm)`. (c) Do NOT thread the
+   debug variant through `invoke_callable`/`resume_continuation` — callback VMs run through
+   `run_parked_quantum`, so threading it there ALONE covers HOF-callback breakpoints (simpler).
+5. **P1 re-scoped:** "~200 lines" is only the registry; the full surface adds a core `WaitKind`
+   request variant + a `ProtocolWaitKind` park arm + drive-loop `pop_wake` plumbing + a
+   `cancel_waiting` arm (≈ the full ChannelRegistry machinery). Effort framing adjusted.
+6. **P5 purge must also enumerate the sema-core side:** `Interpreter::drop`'s `shutdown_scheduler`
+   (eval.rs:109) and the `async_signal.rs` scheduler seams (`SchedulerRunResult`/`DebugCoopResume`,
+   ~277-882) removed in lockstep with `scheduler.rs`.
+7. **Shipping-invariant gate is an explicit P6 gate, not tail cleanup:** the wasm Promise migration
+   deletes embedded-asset-adjacent replay machinery, so `scripts/test-packaged-sema-web.sh` + wasm
+   asset regeneration (AGENTS.md HARD RULE) gate P6 §3, not just P6 §5.
+8. Sequencing note: Task-07 (P6) intentionally follows Task-08 (P5) — plan-phase order does not track
+   task numbers (DAP host is rebuilt in P3 as the purge dependency).
+
+(Original DRAFT plan follows unchanged except the C1/§9 taxonomy edit.)
 **Scope:** everything after the completed language-async migration (structural `NativeOutcome`
 ABI, `PromiseRegistry`/`ChannelRegistry`, `WaitKind::External` one-shots, agent re-entry — all
 green). Covers phases P0–P8 and resolves the deferred blockers in `docs/deferred.md`
@@ -302,13 +351,20 @@ Delete (verify caller-free first; one subsystem per commit + focused suites):
 **C1 — `async/run` (ASYNC-RUN-BARRIER-1). RECOMMEND: amend to a "self-resolving-waits barrier"** —
 provably deadlock-free and strictly stronger than the drain: `(async/run)` suspends while any other
 origin-root task is Ready/Running/timer-parked/External-parked (all self-resolving), re-evaluated
-continuously; releases when the residual origin-root graph is settled or parked ONLY on intra-runtime
-promise/channel waits (the only cycle-forming kinds). Transitivity is automatic (a settling sleeper's
-awaiter becomes Ready; the barrier keeps waiting). Fixes the repro (`(async/spawn (fn () (async/sleep
-30) (println "bg"))) (async/run)` prints "bg") without touching the two hazard cases (self-awaited
-parent / rendezvous-blocked child are promise/channel-parked → excluded). Implementation: a real
-`OriginBarrier` wait re-checked in `drive` on every origin-root settlement/park transition. ~1 session.
-Fallback: amend the contract to the drain (zero risk).
+continuously; releases when the residual origin-root graph is settled or parked ONLY on
+**cycle-forming** waits. **Cycle-forming wait kinds (the barrier does NOT wait on these): `Promise`,
+`PromiseSet` (async/all/race), `Channel`, `WaitKind::ResourceSlot` (P1's new primitive — a task
+holding a slot another waits on may itself be excluded), and any transitional `AwaitIo` still live
+during the P1→P2 window.** Self-resolving wait kinds (the barrier DOES wait on these): `Timer`,
+`External` (both always complete/fire on their own), and `PromiseSet::Timeout` (bounded by its timer
+→ treat as self-resolving). Transitivity is automatic (a settling sleeper's awaiter becomes Ready; the
+barrier keeps waiting). Fixes the repro (`(async/spawn (fn () (async/sleep 30) (println "bg")))
+(async/run)` prints "bg") without touching the hazard cases (self-awaited parent / rendezvous-blocked
+child / resource-slot-blocked child are all cycle-forming-parked → excluded). **Reviewer-2 hole,
+closed:** classifying `ResourceSlot` as self-resolving would hang the barrier on a resource cycle, so
+it MUST be cycle-forming. Implementation: a real `OriginBarrier` wait re-checked in `drive` on every
+origin-root settlement/park transition; **add a hang-detection test with a ResourceSlot cycle**. ~1
+session. Fallback: amend the contract to the drain (zero risk).
 
 **C2 — eager cancellation delivery to External waits (ASYNC-TIMEOUT-CANCEL-1). RECOMMEND: deliver at
 request time.** When a cancellation is recorded on an External/IO-parked task, synchronously run the

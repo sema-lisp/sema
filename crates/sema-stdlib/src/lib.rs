@@ -265,25 +265,24 @@ fn register_runtime_fn_path_gated(
 ) {
     use sema_core::runtime::NativeOutcome;
     type RuntimeFnBody = dyn Fn(&[Value]) -> sema_core::runtime::NativeResult;
-    let checked: std::rc::Rc<RuntimeFnBody> =
-        if sandbox.is_unrestricted() {
-            std::rc::Rc::new(f)
-        } else {
-            let sandbox = sandbox.clone();
-            let fn_name = name.to_string();
-            let path_indices: Vec<usize> = path_args.to_vec();
-            std::rc::Rc::new(move |args: &[Value]| {
-                sandbox.check(cap, &fn_name)?;
-                for &idx in &path_indices {
-                    if let Some(val) = args.get(idx) {
-                        if let Some(p) = val.as_str() {
-                            sandbox.check_path(p, &fn_name)?;
-                        }
+    let checked: std::rc::Rc<RuntimeFnBody> = if sandbox.is_unrestricted() {
+        std::rc::Rc::new(f)
+    } else {
+        let sandbox = sandbox.clone();
+        let fn_name = name.to_string();
+        let path_indices: Vec<usize> = path_args.to_vec();
+        std::rc::Rc::new(move |args: &[Value]| {
+            sandbox.check(cap, &fn_name)?;
+            for &idx in &path_indices {
+                if let Some(val) = args.get(idx) {
+                    if let Some(p) = val.as_str() {
+                        sandbox.check_path(p, &fn_name)?;
                     }
                 }
-                f(args)
-            })
-        };
+            }
+            f(args)
+        })
+    };
     let for_func = checked.clone();
     let for_runtime = checked;
     let func_name = name.to_string();

@@ -287,9 +287,10 @@ async fn git_run_future(full_args: Vec<String>) -> Result<RawGitOutput, String> 
         .kill_on_drop(true)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
-    let output = cmd.output().await.map_err(|e| {
-        format!("git: failed to run `git` (is it installed and on PATH?): {e}")
-    })?;
+    let output = cmd
+        .output()
+        .await
+        .map_err(|e| format!("git: failed to run `git` (is it installed and on PATH?): {e}"))?;
     Ok(RawGitOutput {
         status_code: output.status.code(),
         stdout: output.stdout,
@@ -443,7 +444,9 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
             )
             .map(NativeOutcome::Return);
         }
-        Ok(NativeOutcome::Return(status_entries_value(status_entries()?)))
+        Ok(NativeOutcome::Return(status_entries_value(
+            status_entries()?
+        )))
     });
 
     crate::register_runtime_fn_path_gated(
@@ -475,7 +478,9 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
                 )
                 .map(NativeOutcome::Return);
             }
-            Ok(NativeOutcome::Return(changed_files_value(status_entries()?)))
+            Ok(NativeOutcome::Return(
+                changed_files_value(status_entries()?),
+            ))
         },
     );
 
@@ -542,34 +547,35 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
         "git/recent-files",
         &[],
         |args| {
-        check_arity!(args, "git/recent-files", 0..=1);
-        let n = if args.is_empty() {
-            20
-        } else {
-            args[0]
-                .as_int()
-                .ok_or_else(|| SemaError::type_error("int", args[0].type_name()))?
-        };
-        let n_str = n.to_string();
-        let log_args = || {
-            vec![
-                "log".to_string(),
-                "--name-only".to_string(),
-                "--pretty=format:".to_string(),
-                "-n".to_string(),
-                n_str.clone(),
-            ]
-        };
-        if in_runtime_quantum() {
-            return git_stdout_runtime(log_args(), |out| recent_files_value(&out));
-        }
-        if in_async_context() {
-            return git_stdout_async(log_args(), |out| recent_files_value(&out))
-                .map(NativeOutcome::Return);
-        }
-        let out = git(&["log", "--name-only", "--pretty=format:", "-n", &n_str])?;
-        Ok(NativeOutcome::Return(recent_files_value(&out)))
-    });
+            check_arity!(args, "git/recent-files", 0..=1);
+            let n = if args.is_empty() {
+                20
+            } else {
+                args[0]
+                    .as_int()
+                    .ok_or_else(|| SemaError::type_error("int", args[0].type_name()))?
+            };
+            let n_str = n.to_string();
+            let log_args = || {
+                vec![
+                    "log".to_string(),
+                    "--name-only".to_string(),
+                    "--pretty=format:".to_string(),
+                    "-n".to_string(),
+                    n_str.clone(),
+                ]
+            };
+            if in_runtime_quantum() {
+                return git_stdout_runtime(log_args(), |out| recent_files_value(&out));
+            }
+            if in_async_context() {
+                return git_stdout_async(log_args(), |out| recent_files_value(&out))
+                    .map(NativeOutcome::Return);
+            }
+            let out = git(&["log", "--name-only", "--pretty=format:", "-n", &n_str])?;
+            Ok(NativeOutcome::Return(recent_files_value(&out)))
+        },
+    );
 
     crate::register_runtime_fn_path_gated(
         env,
@@ -578,62 +584,63 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
         "git/ignore-matches?",
         &[],
         |args| {
-        check_arity!(args, "git/ignore-matches?", 1);
-        let path = args[0]
-            .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?
-            .to_string();
-        // `git check-ignore -q` exits 0 if the path is ignored, 1 if not, and
-        // >1 on a real error. We need the raw exit code, so bypass the
-        // helpers above (`git()`/`git_stdout_async`, which treat any non-zero
-        // exit as failure) on ALL paths.
-        if in_runtime_quantum() {
-            return git_ignore_matches_runtime(path);
-        }
-        if in_async_context() {
-            let path_for_msg = path.clone();
-            return git_offload(
-                vec!["check-ignore".to_string(), "-q".to_string(), path],
-                move |raw| match raw {
-                    Err(msg) => sema_core::IoPoll::Ready(Err(msg)),
-                    Ok(raw) => match raw.status_code {
-                        Some(0) => sema_core::IoPoll::Ready(Ok(Value::bool(true))),
-                        Some(1) => sema_core::IoPoll::Ready(Ok(Value::bool(false))),
-                        other => {
-                            let stderr = String::from_utf8_lossy(&raw.stderr).trim().to_string();
-                            sema_core::IoPoll::Ready(Err(eval_msg(format!(
-                                "git check-ignore {path_for_msg}: exit {}: {stderr}",
-                                other
-                                    .map(|c| c.to_string())
-                                    .unwrap_or_else(|| "signal".into())
-                            ))))
-                        }
-                    },
-                },
-            )
-            .map(NativeOutcome::Return);
-        }
-        let output = std::process::Command::new("git")
-            .args(["check-ignore", "-q", &path])
-            .output()
-            .map_err(|e| {
-                SemaError::Io(format!(
-                    "git: failed to run `git` (is it installed and on PATH?): {e}"
-                ))
-            })?;
-        match output.status.code() {
-            Some(0) => Ok(NativeOutcome::Return(Value::bool(true))),
-            Some(1) => Ok(NativeOutcome::Return(Value::bool(false))),
-            other => {
-                let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-                Err(SemaError::eval(format!(
-                    "git check-ignore {path}: exit {}: {stderr}",
-                    other
-                        .map(|c| c.to_string())
-                        .unwrap_or_else(|| "signal".into())
-                )))
+            check_arity!(args, "git/ignore-matches?", 1);
+            let path = args[0]
+                .as_str()
+                .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?
+                .to_string();
+            // `git check-ignore -q` exits 0 if the path is ignored, 1 if not, and
+            // >1 on a real error. We need the raw exit code, so bypass the
+            // helpers above (`git()`/`git_stdout_async`, which treat any non-zero
+            // exit as failure) on ALL paths.
+            if in_runtime_quantum() {
+                return git_ignore_matches_runtime(path);
             }
-        }
+            if in_async_context() {
+                let path_for_msg = path.clone();
+                return git_offload(
+                    vec!["check-ignore".to_string(), "-q".to_string(), path],
+                    move |raw| match raw {
+                        Err(msg) => sema_core::IoPoll::Ready(Err(msg)),
+                        Ok(raw) => match raw.status_code {
+                            Some(0) => sema_core::IoPoll::Ready(Ok(Value::bool(true))),
+                            Some(1) => sema_core::IoPoll::Ready(Ok(Value::bool(false))),
+                            other => {
+                                let stderr =
+                                    String::from_utf8_lossy(&raw.stderr).trim().to_string();
+                                sema_core::IoPoll::Ready(Err(eval_msg(format!(
+                                    "git check-ignore {path_for_msg}: exit {}: {stderr}",
+                                    other
+                                        .map(|c| c.to_string())
+                                        .unwrap_or_else(|| "signal".into())
+                                ))))
+                            }
+                        },
+                    },
+                )
+                .map(NativeOutcome::Return);
+            }
+            let output = std::process::Command::new("git")
+                .args(["check-ignore", "-q", &path])
+                .output()
+                .map_err(|e| {
+                    SemaError::Io(format!(
+                        "git: failed to run `git` (is it installed and on PATH?): {e}"
+                    ))
+                })?;
+            match output.status.code() {
+                Some(0) => Ok(NativeOutcome::Return(Value::bool(true))),
+                Some(1) => Ok(NativeOutcome::Return(Value::bool(false))),
+                other => {
+                    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+                    Err(SemaError::eval(format!(
+                        "git check-ignore {path}: exit {}: {stderr}",
+                        other
+                            .map(|c| c.to_string())
+                            .unwrap_or_else(|| "signal".into())
+                    )))
+                }
+            }
         },
     );
 }

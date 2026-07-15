@@ -17,7 +17,7 @@ use std::rc::Rc;
 
 use sema_core::{
     in_async_context, set_async_context, set_cancel_callback, set_run_scheduler_callback,
-    set_spawn_callback, LegacyPromise, Env, EvalContext, PromiseState, SchedulerRunResult,
+    set_spawn_callback, Env, EvalContext, LegacyPromise, PromiseState, SchedulerRunResult,
     SchedulerTarget, SemaError, Spur, Value, YieldReason,
 };
 

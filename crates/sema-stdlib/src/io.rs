@@ -1693,38 +1693,50 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
         Ok(NativeOutcome::Return(Value::string_owned(content)))
     });
 
-    crate::register_runtime_fn_path_gated(env, sandbox, Caps::FS_WRITE, "file/write", &[0], |args| {
-        check_arity!(args, "file/write", 2);
-        let path = args[0]
-            .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
-        let content = args[1]
-            .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[1].type_name()))?;
-        if sema_core::in_runtime_quantum() {
-            fs_write_cap_check("file/write", content.len())?;
-            let path = path.to_string();
-            let content = content.to_string();
-            return fs_quarantined("file/write", |()| Value::nil(), move || {
-                std::fs::write(&path, &content).map_err(|e| format!("file/write {path}: {e}"))
-            });
-        }
-        if sema_core::in_async_context() {
-            let path = path.to_string();
-            let content = content.to_string();
-            return fs_offload(
-                move || {
-                    std::fs::write(&path, &content)
-                        .map_err(|e| fs_io_msg(format!("file/write {path}: {e}")))
-                },
-                |()| Value::nil(),
-            )
-            .map(NativeOutcome::Return);
-        }
-        std::fs::write(path, content)
-            .map_err(|e| SemaError::Io(format!("file/write {path}: {e}")))?;
-        Ok(NativeOutcome::Return(Value::nil()))
-    });
+    crate::register_runtime_fn_path_gated(
+        env,
+        sandbox,
+        Caps::FS_WRITE,
+        "file/write",
+        &[0],
+        |args| {
+            check_arity!(args, "file/write", 2);
+            let path = args[0]
+                .as_str()
+                .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
+            let content = args[1]
+                .as_str()
+                .ok_or_else(|| SemaError::type_error("string", args[1].type_name()))?;
+            if sema_core::in_runtime_quantum() {
+                fs_write_cap_check("file/write", content.len())?;
+                let path = path.to_string();
+                let content = content.to_string();
+                return fs_quarantined(
+                    "file/write",
+                    |()| Value::nil(),
+                    move || {
+                        std::fs::write(&path, &content)
+                            .map_err(|e| format!("file/write {path}: {e}"))
+                    },
+                );
+            }
+            if sema_core::in_async_context() {
+                let path = path.to_string();
+                let content = content.to_string();
+                return fs_offload(
+                    move || {
+                        std::fs::write(&path, &content)
+                            .map_err(|e| fs_io_msg(format!("file/write {path}: {e}")))
+                    },
+                    |()| Value::nil(),
+                )
+                .map(NativeOutcome::Return);
+            }
+            std::fs::write(path, content)
+                .map_err(|e| SemaError::Io(format!("file/write {path}: {e}")))?;
+            Ok(NativeOutcome::Return(Value::nil()))
+        },
+    );
 
     crate::register_runtime_fn_path_gated(
         env,
@@ -1782,9 +1794,14 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
                 fs_write_cap_check("file/write-bytes", bv.len())?;
                 let path = path.to_string();
                 let bv = bv.to_vec();
-                return fs_quarantined("file/write-bytes", |()| Value::nil(), move || {
-                    std::fs::write(&path, &bv).map_err(|e| format!("file/write-bytes {path}: {e}"))
-                });
+                return fs_quarantined(
+                    "file/write-bytes",
+                    |()| Value::nil(),
+                    move || {
+                        std::fs::write(&path, &bv)
+                            .map_err(|e| format!("file/write-bytes {path}: {e}"))
+                    },
+                );
             }
             if sema_core::in_async_context() {
                 let path = path.to_string();
@@ -1804,34 +1821,41 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
         },
     );
 
-    crate::register_runtime_fn_path_gated(env, sandbox, Caps::FS_READ, "file/exists?", &[0], |args| {
-        check_arity!(args, "file/exists?", 1);
-        let path = args[0]
-            .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
-        if let Some(exists) = sema_core::vfs::vfs_exists(path) {
-            if exists {
-                return Ok(NativeOutcome::Return(Value::bool(true)));
+    crate::register_runtime_fn_path_gated(
+        env,
+        sandbox,
+        Caps::FS_READ,
+        "file/exists?",
+        &[0],
+        |args| {
+            check_arity!(args, "file/exists?", 1);
+            let path = args[0]
+                .as_str()
+                .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
+            if let Some(exists) = sema_core::vfs::vfs_exists(path) {
+                if exists {
+                    return Ok(NativeOutcome::Return(Value::bool(true)));
+                }
             }
-        }
-        if sema_core::in_runtime_quantum() {
-            let path = path.to_string();
-            return fs_quarantined("file/exists?", Value::bool, move || {
-                Ok(std::path::Path::new(&path).exists())
-            });
-        }
-        if sema_core::in_async_context() {
-            let path = path.to_string();
-            return fs_offload(
-                move || Ok(std::path::Path::new(&path).exists()),
-                Value::bool,
-            )
-            .map(NativeOutcome::Return);
-        }
-        Ok(NativeOutcome::Return(Value::bool(
-            std::path::Path::new(path).exists(),
-        )))
-    });
+            if sema_core::in_runtime_quantum() {
+                let path = path.to_string();
+                return fs_quarantined("file/exists?", Value::bool, move || {
+                    Ok(std::path::Path::new(&path).exists())
+                });
+            }
+            if sema_core::in_async_context() {
+                let path = path.to_string();
+                return fs_offload(
+                    move || Ok(std::path::Path::new(&path).exists()),
+                    Value::bool,
+                )
+                .map(NativeOutcome::Return);
+            }
+            Ok(NativeOutcome::Return(Value::bool(
+                std::path::Path::new(path).exists(),
+            )))
+        },
+    );
 
     register_fn(env, "read-line", |args| {
         check_arity!(args, "read-line", 0);

@@ -476,10 +476,12 @@ fn register_promise_ops(env: &Env) {
     // async/resolved — create an already-resolved promise.
     register_runtime_fn(env, "async/resolved", |args| {
         check_arity!(args, "async/resolved", 1);
-        Ok(NativeOutcome::Runtime(RuntimeRequest::CreateSettledPromise {
-            outcome: TaskOutcome::Returned(args[0].clone()),
-            continuation: Box::new(PromiseHandleCont),
-        }))
+        Ok(NativeOutcome::Runtime(
+            RuntimeRequest::CreateSettledPromise {
+                outcome: TaskOutcome::Returned(args[0].clone()),
+                continuation: Box::new(PromiseHandleCont),
+            },
+        ))
     });
 
     // async/rejected — create an already-rejected promise. The reason string is
@@ -491,10 +493,12 @@ fn register_promise_ops(env: &Env) {
             .as_str()
             .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?
             .to_string();
-        Ok(NativeOutcome::Runtime(RuntimeRequest::CreateSettledPromise {
-            outcome: TaskOutcome::Failed(SemaError::eval(msg)),
-            continuation: Box::new(PromiseHandleCont),
-        }))
+        Ok(NativeOutcome::Runtime(
+            RuntimeRequest::CreateSettledPromise {
+                outcome: TaskOutcome::Failed(SemaError::eval(msg)),
+                continuation: Box::new(PromiseHandleCont),
+            },
+        ))
     });
 
     // Terminal-state predicates — inspect the registry settlement. The states
@@ -650,9 +654,7 @@ impl NativeContinuation for ChannelHandleCont {
                 Ok(NativeOutcome::Return(Value::channel_id(id)))
             }
             ResumeInput::Failed(error) => Err(error),
-            _ => Err(SemaError::eval(
-                "channel/new: unexpected runtime response",
-            )),
+            _ => Err(SemaError::eval("channel/new: unexpected runtime response")),
         }
     }
 }
@@ -773,7 +775,9 @@ impl NativeContinuation for CloseCont {
                 Ok(NativeOutcome::Return(Value::nil()))
             }
             ResumeInput::Failed(error) => Err(error),
-            _ => Err(SemaError::eval("channel/close: unexpected runtime response")),
+            _ => Err(SemaError::eval(
+                "channel/close: unexpected runtime response",
+            )),
         }
     }
 }
@@ -795,9 +799,7 @@ impl NativeContinuation for ChannelValueCont {
         input: ResumeInput,
     ) -> NativeResult {
         match input {
-            ResumeInput::Runtime(RuntimeResponse::Value(value)) => {
-                Ok(NativeOutcome::Return(value))
-            }
+            ResumeInput::Runtime(RuntimeResponse::Value(value)) => Ok(NativeOutcome::Return(value)),
             ResumeInput::Failed(error) => Err(error),
             _ => Err(SemaError::eval("channel: unexpected runtime response")),
         }

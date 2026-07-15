@@ -1257,8 +1257,14 @@ fn call_tool(
     }
 
     if sema_core::in_async_context() {
-        return call_tool_offload(entry, key, tool_name.to_string(), arguments_json, materialize)
-            .map(NativeOutcome::Return);
+        return call_tool_offload(
+            entry,
+            key,
+            tool_name.to_string(),
+            arguments_json,
+            materialize,
+        )
+        .map(NativeOutcome::Return);
     }
 
     let mut conn = try_checkout(&entry)?.ok_or_else(|| busy_sync_error(handle, "mcp/call"))?;

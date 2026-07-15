@@ -1779,10 +1779,11 @@ impl VM {
             crate::debug::VmExecResult::QuantumExpired { .. } => {
                 unreachable!("unbounded VM execution cannot exhaust a quantum")
             }
-            crate::debug::VmExecResult::AsyncYield(_)
-            | crate::debug::VmExecResult::Pending(_) => Err(SemaError::eval(
-                "async yield outside of scheduler context".to_string(),
-            )),
+            crate::debug::VmExecResult::AsyncYield(_) | crate::debug::VmExecResult::Pending(_) => {
+                Err(SemaError::eval(
+                    "async yield outside of scheduler context".to_string(),
+                ))
+            }
         }
     }
 

@@ -25,8 +25,8 @@ use std::rc::{Rc, Weak};
 use hashbrown::{hash_map, HashMap, HashSet};
 use lasso::Spur;
 
-use crate::value::{MultiMethod, MutableArray, MutableCell, Thunk};
 use crate::value::{Env, NativeFn, Value, ValueViewRef};
+use crate::value::{MultiMethod, MutableArray, MutableCell, Thunk};
 
 /// The shared bindings allocation of an [`Env`] — the env's *node identity*
 /// for the collector. `Env` is clone-by-value and multiple `Env` handles (and

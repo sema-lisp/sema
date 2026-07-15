@@ -482,26 +482,40 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
         http_request("QUERY", url, Some(body), opts)
     });
 
-    crate::register_runtime_fn_path_gated(env, sandbox, Caps::NETWORK, "http/delete", &[], |args| {
-        check_arity!(args, "http/delete", 1..=2);
-        let url = args[0]
-            .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
-        let opts = args.get(1);
-        http_request("DELETE", url, None, opts)
-    });
+    crate::register_runtime_fn_path_gated(
+        env,
+        sandbox,
+        Caps::NETWORK,
+        "http/delete",
+        &[],
+        |args| {
+            check_arity!(args, "http/delete", 1..=2);
+            let url = args[0]
+                .as_str()
+                .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
+            let opts = args.get(1);
+            http_request("DELETE", url, None, opts)
+        },
+    );
 
-    crate::register_runtime_fn_path_gated(env, sandbox, Caps::NETWORK, "http/request", &[], |args| {
-        check_arity!(args, "http/request", 2..=4);
-        let method = args[0]
-            .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?
-            .to_uppercase();
-        let url = args[1]
-            .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[1].type_name()))?;
-        let opts = args.get(2);
-        let body = args.get(3);
-        http_request(&method, url, body, opts)
-    });
+    crate::register_runtime_fn_path_gated(
+        env,
+        sandbox,
+        Caps::NETWORK,
+        "http/request",
+        &[],
+        |args| {
+            check_arity!(args, "http/request", 2..=4);
+            let method = args[0]
+                .as_str()
+                .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?
+                .to_uppercase();
+            let url = args[1]
+                .as_str()
+                .ok_or_else(|| SemaError::type_error("string", args[1].type_name()))?;
+            let opts = args.get(2);
+            let body = args.get(3);
+            http_request(&method, url, body, opts)
+        },
+    );
 }

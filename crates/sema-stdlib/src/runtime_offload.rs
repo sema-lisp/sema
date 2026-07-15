@@ -89,7 +89,11 @@ impl<T: Send + 'static> CompletionDecoder for IoDecoder<T> {
                 Ok(Err(message)) => Err(SemaError::Io(message)),
                 Err(failure) => Err(SemaError::eval(failure.message().to_string())),
             },
-            Err(failure) => Err(SemaError::eval(format!("{}: {}", self.op, failure.message()))),
+            Err(failure) => Err(SemaError::eval(format!(
+                "{}: {}",
+                self.op,
+                failure.message()
+            ))),
         }
     }
 }

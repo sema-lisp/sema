@@ -531,7 +531,11 @@ fn shell_runtime(
         resource,
         cancel_rx,
         move |raw: RawShellOutput| -> Result<Value, SemaError> {
-            Ok(shell_output_value(raw.status_code, &raw.stdout, &raw.stderr))
+            Ok(shell_output_value(
+                raw.status_code,
+                &raw.stdout,
+                &raw.stderr,
+            ))
         },
         move || shell_run_future(program, child_args, cwd, env_vars, pid_slot),
     )

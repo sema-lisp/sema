@@ -1108,13 +1108,15 @@ fn runtime_timer_suspension_resumes_continuation_with_nil_after_deadline() {
     let runtime = runtime_with_inline_executor(clock.clone());
     let observed = Rc::new(RefCell::new(Vec::new()));
     let handle = runtime
-        .submit_test_root(TestPreparedTask::native(Ok(NativeOutcome::Suspend(NativeSuspend {
-            wait: WaitKind::Timer(Duration::from_millis(5)),
-            continuation: Box::new(TimerResumeContinuation {
-                observed: Rc::clone(&observed),
-                value: Value::int(7),
-            }),
-        }))))
+        .submit_test_root(TestPreparedTask::native(Ok(NativeOutcome::Suspend(
+            NativeSuspend {
+                wait: WaitKind::Timer(Duration::from_millis(5)),
+                continuation: Box::new(TimerResumeContinuation {
+                    observed: Rc::clone(&observed),
+                    value: Value::int(7),
+                }),
+            },
+        ))))
         .unwrap();
 
     runtime.drive(&drive_budget(8)).unwrap();

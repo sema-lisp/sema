@@ -706,9 +706,9 @@ impl Runtime {
         if let Some(input) = match state.protocol_waits.get(&key).map(|wait| &wait.kind) {
             Some(ProtocolWaitKind::Timer) => Some(ResumeInput::Returned(sema_core::Value::nil())),
             Some(ProtocolWaitKind::Promises(set)) => match set.mode {
-                sema_core::runtime::PromiseSetMode::Timeout(duration) => Some(
-                    ResumeInput::Failed(timeout_expired_condition(duration)),
-                ),
+                sema_core::runtime::PromiseSetMode::Timeout(duration) => {
+                    Some(ResumeInput::Failed(timeout_expired_condition(duration)))
+                }
                 _ => None,
             },
             Some(ProtocolWaitKind::Channel { .. }) | None => None,
@@ -1262,10 +1262,7 @@ impl Runtime {
         // has ended. The quantum's own mutations persist back onto the task; the prior
         // (spawner/global) scope is restored afterwards. The root task carries no
         // captured scope and runs directly against the process thread-locals.
-        let displaced_scope = task
-            .llm_scope
-            .take()
-            .map(sema_core::install_task_llm_scope);
+        let displaced_scope = task.llm_scope.take().map(sema_core::install_task_llm_scope);
         // Publish the running task's identity so natives that open a per-task slab
         // entry (`llm/stream`, `agent/run`) record the owning task, letting the
         // task-reaped sweep reclaim the entry (and its detached span) when the task
@@ -2443,7 +2440,6 @@ impl Runtime {
         }
         Ok(())
     }
-
 
     /// Park a VM task on a legacy `AwaitIo` handle (the `LegacyAwaitIoBridge`).
     /// The offloaded job already runs on the IO pool; here we poll the handle

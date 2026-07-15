@@ -1337,9 +1337,7 @@ pub struct ToolSpan {
     inner: Option<SpanCore>,
 }
 
-/// Start a tool-dispatch span (INTERNAL). v1.41 requires the tool name in the span
-/// name: `execute_tool {name}`.
-pub fn tool_span(name: &str, call_id: &str, description: Option<&str>) -> ToolSpan {
+fn tool_span_attrs(name: &str, call_id: &str, description: Option<&str>) -> Vec<KeyValue> {
     let mut attrs = vec![
         KeyValue::new("gen_ai.operation.name", "execute_tool"),
         KeyValue::new("gen_ai.tool.name", name.to_string()),
@@ -1349,7 +1347,36 @@ pub fn tool_span(name: &str, call_id: &str, description: Option<&str>) -> ToolSp
     if let Some(d) = description {
         attrs.push(KeyValue::new("gen_ai.tool.description", d.to_string()));
     }
-    let inner = start(format!("execute_tool {name}"), SpanKind::Internal, attrs);
+    attrs
+}
+
+/// Start a tool-dispatch span (INTERNAL). v1.41 requires the tool name in the span
+/// name: `execute_tool {name}`.
+pub fn tool_span(name: &str, call_id: &str, description: Option<&str>) -> ToolSpan {
+    let inner = start(
+        format!("execute_tool {name}"),
+        SpanKind::Internal,
+        tool_span_attrs(name, call_id, description),
+    );
+    if let Some(c) = &inner {
+        c.set_attrs(compat::span_kind(compat::Kind::Tool));
+    }
+    ToolSpan { inner }
+}
+
+/// Start a DETACHED tool span: parented to the current TL-stack top (captured now,
+/// i.e. the enclosing agent span) but NOT pushed and NOT popping on drop. The
+/// cooperative agent tool loop opens this while its handler runs as a
+/// `NativeOutcome::Call`: the span (and its `Drop`) then survives the continuation
+/// `resume` — which runs OUTSIDE the task's span-stack scope — without disturbing
+/// that stack, so a following round's `chat` span still parents under the agent, not
+/// a stranded tool span.
+pub fn tool_span_detached(name: &str, call_id: &str, description: Option<&str>) -> ToolSpan {
+    let inner = start_detached(
+        format!("execute_tool {name}"),
+        SpanKind::Internal,
+        tool_span_attrs(name, call_id, description),
+    );
     if let Some(c) = &inner {
         c.set_attrs(compat::span_kind(compat::Kind::Tool));
     }

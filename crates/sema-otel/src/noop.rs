@@ -150,6 +150,10 @@ pub fn tool_span(_name: &str, _call_id: &str, _description: Option<&str>) -> Too
     ToolSpan
 }
 
+pub fn tool_span_detached(_name: &str, _call_id: &str, _description: Option<&str>) -> ToolSpan {
+    ToolSpan
+}
+
 impl ToolSpan {
     pub fn set_conversation_id(&self, _id: &str) {}
     pub fn set_tool_io(&self, _args_json: &str, _result: &str) {}

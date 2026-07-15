@@ -3189,23 +3189,24 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
     register_fn_ctx(env, "__async-context?", |_ctx, _args| {
         Ok(Value::bool(in_async_offload_context()))
     });
-    // True while a unified-runtime VM quantum is executing IN A SPAWNED TASK (a
-    // real `async/spawn` / `async/pool-map` child — `current_task_id()` is `Some`;
-    // the root/top-level quantum publishes `None`). The prelude `agent/run` /
-    // `llm/chat` dispatchers select the Sema-driven `__agent-drive` loop in this
-    // case, so each provider round offloads + suspends and the tool round
-    // (`__agent-exec-tools`) runs each handler COOPERATIVELY via `NativeOutcome::Call`
-    // — a handler that suspends (e.g. `mcp/call`'s runtime external wait) parks on the
-    // active task. At the TOP LEVEL there is no sibling to overlap with, so the
-    // dispatchers fall through to the SYNCHRONOUS in-native tool loop
-    // (`run_tool_loop`) exactly as before the runtime — the root quantum being "in a
-    // quantum" must not force the cooperative multi-round path, which only settles
-    // correctly when driven as a genuine spawned task. See Task 04
+    // True while a unified-runtime VM quantum is executing — at ANY level, the
+    // root/top-level main task INCLUDED (it too is a genuine runtime task that can
+    // park and resume; it merely publishes `current_task_id() == None` because it
+    // is not `async/cancel`-addressable). The prelude `agent/run` / `llm/chat`
+    // dispatchers select the Sema-driven `__agent-drive` loop whenever this is true,
+    // so each provider round offloads + suspends and the tool round
+    // (`__agent-exec-tools`) runs every handler COOPERATIVELY via `NativeOutcome::Call`
+    // — a handler that suspends (e.g. `mcp/call`'s runtime external wait, or an
+    // `async/await` inside it) parks on the active task and resumes through the
+    // scheduler, at the root exactly as in a spawned child. The cooperative tool
+    // round journals the same per-tool OTel span + `:on-tool-call` start/end events
+    // the synchronous `run_tool_loop` does (see `ExecToolsContinuation`), so the flip
+    // is span/journaling-transparent. The synchronous `run_tool_loop` remains only
+    // for the genuinely non-runtime path (bare legacy eval without a quantum), where
+    // no handler can suspend. See Task 04/06
     // (`docs/plans/2026-07-13-unified-cooperative-runtime.md`).
     register_fn_ctx(env, "__runtime-quantum?", |_ctx, _args| {
-        Ok(Value::bool(
-            sema_core::in_runtime_quantum() && sema_core::current_task_id().is_some(),
-        ))
+        Ok(Value::bool(sema_core::in_runtime_quantum()))
     });
     register_fn_ctx(env, "__agent-begin", |_ctx, args| agent_begin(args));
     register_runtime_fn_ctx(env, "__agent-step", |ctx, args| {
@@ -9183,17 +9184,19 @@ fn agent_exec_tools(ctx: &EvalContext, token: u64) -> sema_core::runtime::Native
             Ok::<_, SemaError>((pending, st.tools.clone(), st.on_tool_call.clone()))
         })?;
 
-    // Cooperative runtime path (Task 04): a tool handler may SUSPEND (e.g.
-    // `mcp/call`'s runtime external wait, or an `async/await` inside the handler).
-    // The legacy re-entry bridge would force it synchronous; instead, drive each
-    // handler as a `NativeOutcome::Call` so it runs as real cooperative work on the
-    // active task and parks/resumes through the scheduler. The multi-round loop
-    // above (`__agent-drive`) already runs turn-by-turn in bytecode; this makes the
-    // per-turn tool round cooperative too. The `:on-tool-call` event callback and
-    // per-tool OTel spans are not yet emitted on this path (deferred — see the
-    // task-06 progress notes); tool-result correlation and error recovery are.
+    // Cooperative runtime path (Task 04/06): a tool handler may SUSPEND (e.g.
+    // `mcp/call`'s runtime external wait, or an `async/await` inside the handler),
+    // and the `:on-tool-call` callback may itself run a runtime op (the ticker test
+    // sends on a channel from it). The legacy re-entry bridge would force both
+    // synchronous; instead, drive each handler AND each callback as a
+    // `NativeOutcome::Call` so they run as real cooperative work on the active task
+    // and park/resume through the scheduler. The multi-round loop above
+    // (`__agent-drive`) already runs turn-by-turn in bytecode; this makes the
+    // per-turn tool round cooperative too. `ExecToolsContinuation` journals the same
+    // per-tool OTel span + `:on-tool-call` start/end events + correlated tool
+    // results (with the same error-recovery) the synchronous `run_tool_loop` does.
     if sema_core::in_runtime_quantum() {
-        return exec_tools_cooperative_start(token, tools, pending);
+        return exec_tools_cooperative_start(token, tools, on_tool_call, pending);
     }
 
     for tc in &pending {
@@ -9282,86 +9285,280 @@ fn record_tool_result(token: u64, tc: &ToolCall, result: String, is_error: bool)
     });
 }
 
-/// Cooperative tool-round state machine (Task 04). Drives each pending tool call's
-/// handler as a `NativeOutcome::Call` so a handler that suspends parks/resumes on
-/// the active runtime task; records each correlated result via
-/// [`record_tool_result`]. Resolution/validation failures and handler errors are
-/// fed back as tool-error results (never escaping the loop), mirroring the
-/// synchronous path. `Return(nil)` once every pending call is recorded.
+/// Which cooperative `Call` the next [`ExecToolsContinuation::resume`] is settling.
+enum ToolPhase {
+    /// Resuming from the `:on-tool-call` "start" event callback: its return value is
+    /// ignored; next, dispatch the handler.
+    StartEvent,
+    /// Resuming from the tool handler itself: its `Returned`/`Failed` becomes the
+    /// tool result fed back to the model.
+    Handler,
+    /// Resuming from the `:on-tool-call` "end" event callback: its return is ignored;
+    /// record the (already-computed) result and advance to the next tool.
+    EndEvent { result: String, is_error: bool },
+}
+
+/// Per-call working state carried across the start-event / handler / end-event
+/// `Call`s while one tool call is in flight. The OTel `span` (opened just before the
+/// handler, dropped when it settles) and `started` instant travel with the task's
+/// swapped span stack across any suspension inside the handler.
+struct ActiveCall {
+    tc: ToolCall,
+    /// `(handler, args)` resolved by `prepare_tool_call`, taken when the handler
+    /// `Call` is dispatched.
+    pending_handler: Option<(Value, Vec<Value>)>,
+    /// The call arguments as a Sema value (passed to both `:on-tool-call` events).
+    args_value: Value,
+    /// The call arguments as JSON (for the tool span's content-gated I/O).
+    args_json: String,
+    span: Option<sema_otel::ToolSpan>,
+    started: Option<std::time::Instant>,
+}
+
+/// Cooperative tool-round state machine (Task 04/06). Drives each pending tool call's
+/// `:on-tool-call` "start" event, its handler, and its "end" event as
+/// `NativeOutcome::Call`s so a handler OR a callback that suspends parks/resumes on
+/// the active runtime task; opens the same per-tool OTel span and records each
+/// correlated result via [`record_tool_result`]. Resolution/validation failures and
+/// handler errors are fed back as tool-error results (never escaping the loop),
+/// mirroring `run_tool_loop`. `Return(nil)` once every pending call is recorded.
 struct ExecToolsContinuation {
     token: u64,
     tools: Vec<Value>,
+    /// The `:on-tool-call` callback (workflow journaling / user observer), or `None`.
+    on_tool_call: Option<Value>,
     /// Tool calls not yet dispatched (front = next).
     remaining: std::collections::VecDeque<ToolCall>,
-    /// The tool call whose handler result the next `resume` carries.
-    current: ToolCall,
+    /// The call currently in flight, plus which `Call` the next `resume` settles.
+    active: Option<ActiveCall>,
+    phase: ToolPhase,
 }
 
 impl sema_core::runtime::Trace for ExecToolsContinuation {
     fn trace(&self, sink: &mut dyn FnMut(sema_core::cycle::GcEdge<'_>)) -> bool {
+        use sema_core::cycle::GcEdge;
         for tool in &self.tools {
-            sink(sema_core::cycle::GcEdge::Value(tool));
+            sink(GcEdge::Value(tool));
+        }
+        if let Some(cb) = &self.on_tool_call {
+            sink(GcEdge::Value(cb));
+        }
+        if let Some(active) = &self.active {
+            sink(GcEdge::Value(&active.args_value));
+            if let Some((handler, args)) = &active.pending_handler {
+                sink(GcEdge::Value(handler));
+                for arg in args {
+                    sink(GcEdge::Value(arg));
+                }
+            }
         }
         true
     }
 }
 
+/// Build one `:on-tool-call` event map. `result` (present for the "end" event)
+/// carries the truncated result preview, the error flag, and the handler duration.
+fn tool_event_map(
+    event: &str,
+    tc: &ToolCall,
+    args_value: &Value,
+    result: Option<(&str, bool, i64)>,
+) -> Value {
+    let mut m = BTreeMap::new();
+    m.insert(Value::keyword("event"), Value::string(event));
+    m.insert(Value::keyword("tool"), Value::string(&tc.name));
+    m.insert(Value::keyword("args"), args_value.clone());
+    if let Some((result_str, is_error, duration_ms)) = result {
+        let preview = if result_str.len() > 200 {
+            format!("{}...", sema_core::truncate_chars(result_str, 200))
+        } else {
+            result_str.to_string()
+        };
+        m.insert(Value::keyword("result"), Value::string(&preview));
+        m.insert(Value::keyword("error"), Value::bool(is_error));
+        m.insert(Value::keyword("duration-ms"), Value::int(duration_ms));
+    }
+    Value::map(m)
+}
+
 impl ExecToolsContinuation {
-    /// Advance through `remaining`, recording any resolution/validation failures
-    /// inline, until a handler call is needed (returns that `Call`) or every
-    /// pending call is recorded (returns `Return(nil)`).
-    fn advance(mut self: Box<Self>) -> sema_core::runtime::NativeResult {
+    /// A cooperative `Call` on `callback` with one event map, resuming into `phase`.
+    fn call_event(
+        mut self: Box<Self>,
+        callback: Value,
+        event: Value,
+        phase: ToolPhase,
+    ) -> sema_core::runtime::NativeResult {
         use sema_core::runtime::{NativeCall, NativeOutcome};
+        self.phase = phase;
+        Ok(NativeOutcome::Call(NativeCall {
+            callable: callback,
+            args: vec![event],
+            continuation: self,
+        }))
+    }
+
+    /// Open the tool span (nesting under the active agent span) and dispatch the
+    /// resolved handler as a `NativeOutcome::Call`, resuming into `Handler`.
+    fn dispatch_handler(mut self: Box<Self>) -> sema_core::runtime::NativeResult {
+        use sema_core::runtime::{NativeCall, NativeOutcome};
+        let active = self.active.as_mut().expect("active call while dispatching");
+        let (handler, args) = active
+            .pending_handler
+            .take()
+            .expect("handler resolved before dispatch");
+        // INTERNAL tool span (self-times over the handler, matching run_tool_loop's
+        // execute_tool_call span); v1.41 requires the tool name in the span name. It
+        // parents under the agent span active on this task's otel stack.
+        let tool_desc = self.tools.iter().find_map(|t| {
+            let td = t.as_tool_def_rc()?;
+            (td.name == active.tc.name).then(|| td.description.clone())
+        });
+        let active = self.active.as_mut().expect("active call while dispatching");
+        // DETACHED: the span (and its Drop) survives across the handler `Call` and is
+        // ended in `resume`, which runs OUTSIDE the task's span-stack scope — a
+        // stack-based span would pop the wrong (root) stack there and strand itself on
+        // the task's stack, mis-parenting the next round's chat span. Detached captures
+        // the agent span as parent here (in the native, task scope installed) and drops
+        // cleanly without touching the stack.
+        active.span = Some(sema_otel::tool_span_detached(
+            &active.tc.name,
+            &active.tc.id,
+            tool_desc.as_deref(),
+        ));
+        active.started = Some(std::time::Instant::now());
+        self.phase = ToolPhase::Handler;
+        Ok(NativeOutcome::Call(NativeCall {
+            callable: handler,
+            args,
+            continuation: self,
+        }))
+    }
+
+    /// Pop the next pending call, resolve it, and fire its "start" event (or, with no
+    /// callback, dispatch the handler directly). Records resolution/validation
+    /// failures inline (fed back as tool errors) and skips to the next call. Returns
+    /// `Return(nil)` once every pending call is recorded.
+    fn advance(mut self: Box<Self>) -> sema_core::runtime::NativeResult {
+        use sema_core::runtime::NativeOutcome;
         while let Some(tc) = self.remaining.pop_front() {
+            let args_value = sema_core::json_to_value(&tc.arguments);
             match prepare_tool_call(&self.tools, &tc.name, &tc.arguments) {
                 Ok((handler, args)) => {
-                    self.current = tc;
-                    return Ok(NativeOutcome::Call(NativeCall {
-                        callable: handler,
-                        args,
-                        continuation: self,
-                    }));
+                    let args_json = serde_json::to_string(&tc.arguments).unwrap_or_default();
+                    let start_event = self
+                        .on_tool_call
+                        .as_ref()
+                        .map(|_| tool_event_map("start", &tc, &args_value, None));
+                    self.active = Some(ActiveCall {
+                        tc,
+                        pending_handler: Some((handler, args)),
+                        args_value,
+                        args_json,
+                        span: None,
+                        started: None,
+                    });
+                    // Fire the "start" event cooperatively (it may run a runtime op,
+                    // e.g. channel/send), then dispatch the handler; or dispatch the
+                    // handler straight away when there is no callback.
+                    return match self.on_tool_call.clone() {
+                        Some(cb) => self.call_event(cb, start_event.unwrap(), ToolPhase::StartEvent),
+                        None => self.dispatch_handler(),
+                    };
                 }
                 Err(e) => {
-                    // Resolution / validation failure: feed it back as a tool error
-                    // (identical text to the synchronous path) and keep going.
+                    // Resolution / validation failure: no handler runs, so no span or
+                    // start/end events (matching the fact that no handler executed);
+                    // feed the error back as a tool result (identical text to the
+                    // synchronous path) and keep going.
                     record_tool_result(self.token, &tc, format!("Error: {e}"), true);
                 }
             }
         }
         Ok(NativeOutcome::Return(Value::nil()))
     }
+
+    /// Finalize the tool span for the settled handler (record error / content I/O,
+    /// then drop it) and return `(result, is_error, duration_ms)`.
+    fn finish_span(&mut self, result: &str, is_error: bool) -> i64 {
+        let active = self.active.as_mut().expect("active call at handler settle");
+        if let Some(span) = active.span.take() {
+            if is_error {
+                span.record_error("tool_error", result);
+            }
+            if sema_otel::content_capture_enabled() {
+                span.set_tool_io(&active.args_json, result);
+            }
+            // `span` drops here → the tool span ends and pops the task's otel stack.
+        }
+        active
+            .started
+            .map(|t| t.elapsed().as_millis() as i64)
+            .unwrap_or(0)
+    }
 }
 
 impl sema_core::runtime::NativeContinuation for ExecToolsContinuation {
     fn resume(
-        self: Box<Self>,
+        mut self: Box<Self>,
         _context: &mut sema_core::runtime::NativeCallContext<'_>,
         input: sema_core::runtime::ResumeInput,
     ) -> sema_core::runtime::NativeResult {
         use sema_core::runtime::ResumeInput;
-        let (result, is_error) = match input {
-            ResumeInput::Returned(value) => (stringify_tool_result(value), false),
-            // A handler error is fed BACK to the model as a tool result (the loop
-            // recovers), never propagated — matching the synchronous path's
-            // `Err(e) => (format!("Error: {e}"), true)`.
-            ResumeInput::Failed(error) => (format!("Error: {error}"), true),
-            // Task cancellation aborts the whole run: propagate so the runtime
-            // settles the parked parent task Cancelled.
-            ResumeInput::Cancelled(reason) => {
-                return Err(SemaError::eval(format!(
-                    "agent tool handler was cancelled ({reason:?})"
-                )))
+        // A task cancellation lands on whichever `Call` was in flight; abort the whole
+        // run so the runtime settles the parked parent task Cancelled.
+        if let ResumeInput::Cancelled(reason) = &input {
+            return Err(SemaError::eval(format!(
+                "agent tool round was cancelled ({reason:?})"
+            )));
+        }
+        match std::mem::replace(&mut self.phase, ToolPhase::Handler) {
+            // The "start" event settled (return value ignored, and a callback failure
+            // must not abort the tool round) — now run the handler.
+            ToolPhase::StartEvent => self.dispatch_handler(),
+            // The handler settled: its value/error is the tool result.
+            ToolPhase::Handler => {
+                let (result, is_error) = match input {
+                    ResumeInput::Returned(value) => (stringify_tool_result(value), false),
+                    // A handler error is fed BACK to the model as a tool result (the
+                    // loop recovers), never propagated — matching `run_tool_loop`.
+                    ResumeInput::Failed(error) => (format!("Error: {error}"), true),
+                    ResumeInput::Cancelled(_) => unreachable!("handled above"),
+                    ResumeInput::Runtime(_) => {
+                        return Err(SemaError::eval(
+                            "agent tool continuation received an unexpected runtime response",
+                        ))
+                    }
+                };
+                let duration_ms = self.finish_span(&result, is_error);
+                // Fire the "end" event cooperatively, then record; or record directly
+                // when there is no callback.
+                match self.on_tool_call.clone() {
+                    Some(cb) => {
+                        let tc = self.active.as_ref().expect("active call").tc.clone();
+                        let args_value = self.active.as_ref().expect("active call").args_value.clone();
+                        let end_event = tool_event_map(
+                            "end",
+                            &tc,
+                            &args_value,
+                            Some((&result, is_error, duration_ms)),
+                        );
+                        self.call_event(cb, end_event, ToolPhase::EndEvent { result, is_error })
+                    }
+                    None => {
+                        let tc = self.active.take().expect("active call").tc;
+                        record_tool_result(self.token, &tc, result, is_error);
+                        self.advance()
+                    }
+                }
             }
-            ResumeInput::Runtime(_) => {
-                return Err(SemaError::eval(
-                    "agent tool continuation received an unexpected runtime response",
-                ))
+            // The "end" event settled — record the tool result and move on.
+            ToolPhase::EndEvent { result, is_error } => {
+                let tc = self.active.take().expect("active call at end").tc;
+                record_tool_result(self.token, &tc, result, is_error);
+                self.advance()
             }
-        };
-        let current = self.current.clone();
-        record_tool_result(self.token, &current, result, is_error);
-        self.advance()
+        }
     }
 }
 
@@ -9373,20 +9570,16 @@ impl sema_core::runtime::NativeContinuation for ExecToolsContinuation {
 fn exec_tools_cooperative_start(
     token: u64,
     tools: Vec<Value>,
+    on_tool_call: Option<Value>,
     pending: Vec<ToolCall>,
 ) -> sema_core::runtime::NativeResult {
-    use sema_core::runtime::NativeOutcome;
-    let remaining: std::collections::VecDeque<ToolCall> = pending.into();
-    // `current` is a placeholder overwritten by `advance` before any resume reads
-    // it; if `remaining` is empty there is nothing to run.
-    let Some(first) = remaining.front().cloned() else {
-        return Ok(NativeOutcome::Return(Value::nil()));
-    };
     let continuation = Box::new(ExecToolsContinuation {
         token,
         tools,
-        remaining,
-        current: first,
+        on_tool_call,
+        remaining: pending.into(),
+        active: None,
+        phase: ToolPhase::Handler,
     });
     continuation.advance()
 }
@@ -10463,6 +10656,49 @@ mod tests {
         // Sanity: the captured teardown is a real closure that runs once.
         (cont.teardown.unwrap())();
         assert!(fired.get());
+    }
+
+    /// The cooperative tool-round continuation exposes exactly its live `Value`
+    /// edges: each tool, the `:on-tool-call` callback, and — while a call is in
+    /// flight — its args value plus the pending `(handler, args)`. `ToolCall` and the
+    /// (detached) `ToolSpan` hold no `Value`, so they contribute no edges.
+    #[test]
+    fn exec_tools_continuation_traces_its_value_edges() {
+        use sema_core::runtime::Trace;
+        fn edges(c: &ExecToolsContinuation) -> usize {
+            let mut n = 0usize;
+            assert!(c.trace(&mut |_| n += 1));
+            n
+        }
+        let tc = ToolCall {
+            id: "call_1".into(),
+            name: "t".into(),
+            arguments: json!({"a": 1}),
+            thought_signature: None,
+        };
+        // Idle (no active call): 2 tools + 1 callback = 3 edges.
+        let mut cont = ExecToolsContinuation {
+            token: 1,
+            tools: vec![Value::int(1), Value::int(2)],
+            on_tool_call: Some(Value::int(3)),
+            remaining: std::collections::VecDeque::new(),
+            active: None,
+            phase: ToolPhase::Handler,
+        };
+        assert_eq!(edges(&cont), 3);
+        // With a call in flight: + args_value + handler + 2 handler args = 4 more.
+        cont.active = Some(ActiveCall {
+            tc,
+            pending_handler: Some((Value::int(4), vec![Value::int(5), Value::int(6)])),
+            args_value: Value::int(7),
+            args_json: "{}".into(),
+            span: None,
+            started: None,
+        });
+        assert_eq!(edges(&cont), 7);
+        // No callback → one fewer edge.
+        cont.on_tool_call = None;
+        assert_eq!(edges(&cont), 6);
     }
 
     fn usage(prompt: u32, completion: u32) -> Usage {

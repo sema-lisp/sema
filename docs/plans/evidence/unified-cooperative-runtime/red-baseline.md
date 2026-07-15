@@ -379,3 +379,94 @@ thread-local scheduler (`init_scheduler` in `run_exprs_on_vm`). To finish:
 `eval_str_compiled`) through `run_exprs_via_runtime`; (c) re-baseline the 4
 `vm_async_test` RED + `runtime_conformance`/`watchdog` drift against the unified
 runtime. The two temporary bridges above are deleted at that point.
+
+## Task 03/08 — FULL flip (`eval_str_compiled`) re-measure post stack/deadlock/drop fixes: MEASURED → REVERTED (2026-07-15)
+
+Re-ran the FULL flip — routing `eval_str_compiled` (backs `common::eval` in the
+test suite + CLI `-e`; the last legacy-VM eval entry point) through
+`run_exprs_via_runtime` — now that the three blockers from the previous full-flip
+revert are claimed closed on this branch: native agent-loop cooperative re-entry
+(`e9c1a2b6`), runtime-side deadlock detection (`5791e45a`), stack-parity +
+bounded drop-join (`3d91dee3`), executor sender-lifecycle (`ac78f7ac`). The
+one-line change (`crates/sema-eval/src/eval.rs:416`
+`run_exprs_on_vm(&exprs, &self.global_env)` → `run_exprs_via_runtime(&exprs)`),
+plus the already-landed `VM::execute` quantum-suspend bridge, was measured then
+reverted.
+
+### Progress since the prior full-flip revert, but STILL NON-VIABLE
+The deadlock-detection + drop-join fixes closed causes 1, 2 (partially) and 4
+from the prior measure: `channel_recv_empty_error`, `channel_send_full_error`,
+`deadlock_detected_two_tasks_waiting` now PASS, and the drop-time
+`Resource deadlock avoided` join is gone. vm_async_test moved **106/12 → 109/9**,
+and — new this round — **all 4 pre-existing baseline RED RESOLVE** through the
+runtime (its scheduling/cancellation/fairness semantics are correct):
+`async_all_failure_does_not_cancel_supplied_sibling`,
+`async_race_does_not_cancel_supplied_loser`,
+`awaited_child_mutation_is_visible_to_parent`,
+`scheduler_workload_beyond_tick_ceiling_completes`. Two blockers remain and force
+the revert:
+
+**Blocker 1 — eval_test SIGABRTs (unusable oracle).** `deep_structure_str_no_abort`
+(`(string-length (str (foldl (fn (acc _) (list acc)) (list 1) (range 5000))))`)
+overflows its native stack ("fatal runtime error: stack overflow, aborting",
+signal 6) and aborts the whole binary. The stack-parity fix (`3d91dee3`) guards
+**VM-frame** recursion via `MAX_FRAMES` (its gates in `mod runtime_eval_tests`
+only exercise VM-frame recursion), but this oracle overflows in **native**
+recursion — the `str` builtin formatting a 5000-deep nested list — which no VM
+guard covers. The runtime drive machinery (`drive`→`poll`→`run_quantum`→native
+`str`→recursive format) sits on more native stack than the legacy `vm.execute`
+entry, so the deep native format that legacy handles gracefully aborts under the
+runtime on the default (small) test-thread stack.
+
+**Blocker 2 — vm_async_test 109/9 (9 new failures), two root-cause families.**
+The runtime resolves the 4 baseline RED but breaks 9 others; making them pass on
+this path would require deeper runtime work (family A) or weakening oracles.
+
+| Family | N | Tests | Root cause |
+| --- | --- | --- | --- |
+| A. Spawned-task parking / pending / cancel + error-message parity | 6 | `async_pending_predicate`, `cancel_pending_task`, `cancelled_promise_classifies_correctly`, `channel_close_with_blocked_sender_reports_lost_value`, `native_callback_passed_directly_raises_clear_error`, `async_context_preserved_after_nested_run` | A spawned task that blocks (`channel/recv` on empty, `async/sleep`) is settled/classified differently than the legacy scheduler when observed synchronously by the parent within the same root: `async/pending?`/`cancelled?` mis-report, a channel-parked task cancelled before it runs settles Failed ("channel/recv: channel is empty") instead of Cancelled, and error messages diverge (got "task rejected: … channel is empty" instead of the lambda-wrap hint; the pending-send "lost value 2" text is absent). Runtime callback-re-entry / parked-task-observation parity, Task-04-adjacent. |
+| B. Timer virtual-clock hook + cooperative-yield ordering | 3 | `blocking_sleep_hook_receives_clock_advances`, `event_select_yields_to_sibling_in_async_context`, `retry_backoff_yields_lets_sibling_complete_first` | The runtime services timers on the real clock (`std::thread::sleep` / `block_on_inbox`) and does not invoke the virtual-clock `set_blocking_sleep_callback` hook (hook never fires). `event/select` and `retry` backoff sleep block instead of yielding cooperatively, so a shorter-sleeping sibling that must wake first does not (ordering `[slow,fast]`/`[select-done,sibling-ran]` vs expected `[fast,slow]`/`[sibling-ran,select-done]`). Legacy-scheduler virtual-clock + cooperative-yield behavior not yet mirrored on the runtime timer path. |
+
+### DECISION: REVERTED to the exact green baseline (no code changed)
+Per the flip mandate's revert rule (breakage large/systemic, or an oracle would
+have to be weakened): eval_test SIGABRT is systemic (aborts the correctness
+oracle) and blocker-2 family B's channel/select ordering would need
+virtual-clock+yield parity the runtime timer path lacks. `git checkout --
+crates/sema-eval/src/eval.rs` restored HEAD (`44ffed3a`); working tree clean, no
+code changed. This evidence section is the only edit.
+
+### Verbatim `test result:` lines under the flip (measured, then reverted)
+- eval_test: **SIGABRT** — `thread 'deep_structure_str_no_abort' has overflowed
+  its stack` / `fatal runtime error: stack overflow, aborting` (binary aborts;
+  no `test result:` line — the abort kills the run mid-suite).
+- vm_async_test: `test result: FAILED. 109 passed; 9 failed; 0 ignored` (baseline
+  is `114 passed; 4 failed`; the 4 RED resolved, 9 new failures per families above).
+
+### Post-revert state (exact green baseline, HEAD 44ffed3a)
+Working tree clean. `eval_str_compiled` back on `run_exprs_on_vm`
+(`crates/sema-eval/src/eval.rs:416`). Baseline unchanged: vm_async_test
+`114 passed; 4 failed` (documented RED, verified above via `git stash`).
+
+### What EXACTLY remains to delete the legacy scheduler (Task 08)
+The executor (Blocker B of the earlier round) and the primary `eval`/`eval_str`
+flip are DONE. To flip `eval_str_compiled` and delete `init_scheduler` + the
+`SCHEDULER` TLS:
+1. **Native-stack budget parity for deep NATIVE recursion.** The runtime drive
+   must not consume materially more native stack per Sema level than
+   `vm.execute`, OR deep native-recursive builtins (`str`/display of deeply
+   nested structures) need a guard/iterative rewrite so a legacy-graceful program
+   never SIGABRTs on the runtime. Extend the `runtime_eval_tests` parity gates to
+   cover native-format recursion, not only VM-frame recursion.
+2. **Spawned-task observation/cancel/error-message parity (family A).** A
+   parent observing a just-spawned blocked child synchronously
+   (`async/pending?`/`cancelled?`, cancel-before-run, channel-close-under-blocked-
+   sender lost-value, native-callback lambda-wrap hint) must match the legacy
+   scheduler's classification and error text through the runtime callback-re-entry
+   path — Task-04-adjacent.
+3. **Virtual-clock + cooperative-yield timer parity (family B).** The runtime
+   timer path must invoke the `set_blocking_sleep_callback` virtual-clock hook and
+   let `event/select` / `retry` backoff yield to shorter-sleeping siblings, so
+   ordering + blocking-sleep-hook oracles hold without weakening them.
+Once (1)–(3) land, route `run_exprs_on_vm` through `run_exprs_via_runtime`, delete
+`init_scheduler`/`SCHEDULER` TLS, and re-baseline the (now-resolved) 4
+`vm_async_test` cases GREEN.

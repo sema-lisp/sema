@@ -478,11 +478,11 @@ fn tool_handler_runs_full_evaluator_with_side_effects() {
 
 /// CORE-2 mid-agent-loop reclamation (`docs/plans/2026-07-02-core2-gc.md`
 /// §5.2): a long agent run must reclaim BETWEEN tool turns, not only when
-/// the whole eval returns. Turn 1's handler builds 700 garbage
-/// recursive-closure cycles and then churns 3000 dead channels; the channel
-/// births cross the registry-growth threshold inside the handler, so the
-/// data-birth trigger (`register_candidate`) severs the cycles and prunes
-/// the dead entries mid-turn. The turn-boundary `maybe_collect` stays a
+/// the whole eval returns. Turn 1's handler builds 3700 garbage
+/// recursive-closure cycles; the closure births cross the registry-growth
+/// threshold inside the handler, so the data-birth trigger
+/// (`register_candidate`) severs the cycles and prunes the dead entries
+/// mid-turn. The turn-boundary `maybe_collect` stays a
 /// threshold-gated backstop that the growth policy keeps quiescent here
 /// (registry-at-rest never exceeds the threshold once births self-collect).
 /// Turn 2's handler observes the outcome as its FIRST action: bounded
@@ -508,13 +508,11 @@ fn agent_turn_boundary_collects_between_tool_turns() {
           r)
         (define (spin i)
           (if (<= i 0) nil (begin (mk-cycle i) (spin (- i 1)))))
-        (define (spam-channels i)
-          (if (<= i 0) nil (begin (channel/new 1) (spam-channels (- i 1)))))
         (deftool churn "Churn the heap" {:x {:type :string}}
           (lambda (x)
             (set! turn (+ turn 1))
             (if (= turn 1)
-                (begin (spin 700) (spam-channels 3000) "turn-1 done")
+                (begin (spin 3700) "turn-1 done")
                 (begin (set! probe (gc/stats))
                        (set! leftover (gc/collect))
                        "turn-2 done"))))
@@ -532,8 +530,8 @@ fn agent_turn_boundary_collects_between_tool_turns() {
     // The loop completed correctly across the collections...
     assert_eq!(items[0].as_str(), Some("all done"));
     // ...and turn 2 observed the mid-turn passes: registry bounded well
-    // under the spam count, the last pass really pruned a dead batch, and
-    // the 700 garbage cycles were already severed before turn 2 started
+    // under the churn count, the last pass really pruned a dead batch, and
+    // the 3700 garbage cycles were already severed before turn 2 started
     // (the explicit collect has nothing left to reclaim).
     assert_eq!(
         items[1],

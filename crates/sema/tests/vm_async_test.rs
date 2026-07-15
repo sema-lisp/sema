@@ -100,10 +100,14 @@ fn async_resolved() {
 
 #[test]
 fn async_rejected() {
+    // Awaiting a rejected promise re-raises the PRESERVED failure error verbatim
+    // (the reason string), not a synthetic `task rejected:` wrapper. Plan: the
+    // registry `TaskSettlement` carries the real `SemaError`; `async/await` maps
+    // `Failed(err) -> Err(err)` without string-mangling.
     let err = eval_vm_err(r#"(async/await (async/rejected "oops"))"#);
     assert!(
-        err.contains("rejected"),
-        "expected rejection error, got: {err}"
+        err.contains("oops"),
+        "expected the preserved rejection cause, got: {err}"
     );
 }
 
@@ -547,8 +551,13 @@ fn timeout_task_completes_in_time() {
 
 #[test]
 fn timeout_already_rejected() {
+    // An already-rejected promise wins the timeout race; its PRESERVED failure
+    // cause surfaces (not a `task rejected:` wrapper).
     let err = eval_vm_err(r#"(async/timeout 1000 (async/rejected "oops"))"#);
-    assert!(err.contains("rejected"), "expected rejection, got: {err}");
+    assert!(
+        err.contains("oops"),
+        "expected the preserved rejection cause, got: {err}"
+    );
 }
 
 #[test]
@@ -1066,8 +1075,11 @@ fn map_callback_can_await_promise() {
     );
 }
 
-// Regression: nested await on a rejected promise must not double the
-// "async/await: task rejected: " prefix in the error message (A2).
+// Regression: nested await on a rejected promise re-raises the ORIGINAL cause
+// once, never nesting synthetic wrappers (A2). Under the registry model the
+// failure `SemaError` is preserved through every await hop, so awaiting a
+// promise whose task itself awaited a rejected promise still surfaces the bare
+// "boom" cause — no accumulating `task rejected:` prefixes.
 #[test]
 fn nested_await_rejection_does_not_double_prefix() {
     let err = eval_vm_err(
@@ -1078,12 +1090,12 @@ fn nested_await_rejection_does_not_double_prefix() {
         "#,
     );
     assert!(
-        !err.contains("task rejected: task rejected"),
-        "expected single prefix, got: {err}"
+        err.contains("boom"),
+        "expected the preserved rejection cause, got: {err}"
     );
     assert!(
-        err.contains("task rejected"),
-        "expected rejection message, got: {err}"
+        !err.contains("task rejected"),
+        "the preserved cause must not be re-wrapped as 'task rejected': {err}"
     );
 }
 

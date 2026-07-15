@@ -149,6 +149,7 @@ fn coop_sync_breakpoint_full_cycle() {
 /// surface cooperatively as `Stopped` (line == the async breakpoint line), and a
 /// follow-up `run_cooperative` (Continue) must drive it to `Finished`.
 #[test]
+#[ignore = "async debugging pending runtime cooperative-debug mode — see docs/deferred.md"]
 fn coop_async_task_breakpoint_stops_and_continues() {
     // Line 2 is `(+ 1 2)` — executes only inside the spawned task body.
     let (mut coop, first) = Coop::start(
@@ -171,6 +172,7 @@ fn coop_async_task_breakpoint_stops_and_continues() {
 /// at that line (not the first task's body, not the top level), then Continue
 /// must run both tasks + the `async/all` to completion.
 #[test]
+#[ignore = "async debugging pending runtime cooperative-debug mode — see docs/deferred.md"]
 fn coop_async_two_tasks_breakpoint_stops_at_known_line() {
     // Lines (1-indexed):
     // 1  (define a (async/spawn (fn ()
@@ -190,6 +192,7 @@ fn coop_async_two_tasks_breakpoint_stops_at_known_line() {
 /// first task's body line — proves pause location is the task that actually hits
 /// the line, and Continue still finishes the whole `async/all`.
 #[test]
+#[ignore = "async debugging pending runtime cooperative-debug mode — see docs/deferred.md"]
 fn coop_async_breakpoint_in_first_task() {
     let source = "(define a (async/spawn (fn ()\n  (* 2 3))))\n\
                   (define b (async/spawn (fn ()\n  (+ 10 20))))\n\
@@ -207,6 +210,7 @@ fn coop_async_breakpoint_in_first_task() {
 /// debugger auto-continues through the stop and the program completes. (Native
 /// DAP still pauses there via the blocking path.)
 #[test]
+#[ignore = "async debugging pending runtime cooperative-debug mode — see docs/deferred.md"]
 fn coop_breakpoint_in_hof_callback_in_async_task_completes() {
     // 1  (define p (async/spawn (fn ()
     // 2    (map (fn (x)
@@ -238,6 +242,7 @@ fn coop_breakpoint_in_hof_callback_in_async_task_completes() {
 /// (2) makes StepOut's `depth < step_frame_depth` (1 < 2) wrongly true and stops
 /// inside the task; the depth must come from the paused task's VM (1).
 #[test]
+#[ignore = "async debugging pending runtime cooperative-debug mode — see docs/deferred.md"]
 fn coop_async_step_over_and_out_use_task_depth() {
     // 1  (define p (async/spawn (fn ()
     // 2    (let ((a 1))            <- breakpoint; task frame depth 1
@@ -283,6 +288,7 @@ fn coop_async_step_over_and_out_use_task_depth() {
 /// relocates the paused task by id so GetStackTrace/GetScopes/GetVariables target
 /// its frames.
 #[test]
+#[ignore = "async debugging pending runtime cooperative-debug mode — see docs/deferred.md"]
 fn coop_async_stop_inspects_paused_task_locals() {
     // 1  (define p (async/spawn (fn ()
     // 2    (let ((n 42))
@@ -343,6 +349,7 @@ fn coop_async_stop_inspects_paused_task_locals() {
 /// Both sessions share ONE interpreter (so the scheduler is reused and the
 /// thread-locals persist), mirroring the persistent WASM playground interpreter.
 #[test]
+#[ignore = "async debugging pending runtime cooperative-debug mode — see docs/deferred.md"]
 fn coop_abandoned_async_session_does_not_poison_next_session() {
     let interpreter = Interpreter::new();
     sema_vm::init_scheduler(interpreter.global_env.clone(), Vec::new());

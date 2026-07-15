@@ -5957,7 +5957,7 @@ mod tests {
         );
 
         // With a resume registered → surfaces as Stopped on the same line.
-        let promise = Rc::new(sema_core::AsyncPromise {
+        let promise = Rc::new(sema_core::LegacyPromise {
             state: std::cell::RefCell::new(sema_core::PromiseState::Pending),
             task_id: std::cell::Cell::new(0),
         });

@@ -25,8 +25,8 @@ use std::rc::{Rc, Weak};
 use hashbrown::{hash_map, HashMap, HashSet};
 use lasso::Spur;
 
-use crate::value::{AsyncPromise, Channel, MultiMethod, MutableArray, MutableCell, Thunk};
-use crate::value::{Env, NativeFn, PromiseState, Value, ValueViewRef};
+use crate::value::{Channel, MultiMethod, MutableArray, MutableCell, Thunk};
+use crate::value::{Env, NativeFn, Value, ValueViewRef};
 
 /// The shared bindings allocation of an [`Env`] — the env's *node identity*
 /// for the collector. `Env` is clone-by-value and multiple `Env` handles (and
@@ -137,8 +137,6 @@ pub enum GcNode {
     EnvBindings(Weak<EnvBindings>),
     /// `delay` thunk (data-only cycles via `forced`).
     Thunk(Weak<Thunk>),
-    /// Async promise (data-only cycles via `Resolved`).
-    Promise(Weak<AsyncPromise>),
     /// Channel (data-only cycles via the buffer).
     Channel(Weak<Channel>),
     /// Multimethod (data-only cycles via the method table).
@@ -157,7 +155,6 @@ impl GcNode {
             GcNode::EnvWrapper(w) => w.strong_count(),
             GcNode::EnvBindings(w) => w.strong_count(),
             GcNode::Thunk(w) => w.strong_count(),
-            GcNode::Promise(w) => w.strong_count(),
             GcNode::Channel(w) => w.strong_count(),
             GcNode::MultiMethod(w) => w.strong_count(),
             GcNode::MutableArray(w) => w.strong_count(),
@@ -183,10 +180,6 @@ impl GcNode {
             GcNode::Thunk(w) => w.upgrade().map(|rc| {
                 let ptr = NodePtr::of_rc(&rc);
                 (ptr, NodeHandle::Value(Value::thunk_from_rc(rc)))
-            }),
-            GcNode::Promise(w) => w.upgrade().map(|rc| {
-                let ptr = NodePtr::of_rc(&rc);
-                (ptr, NodeHandle::Value(Value::async_promise_from_rc(rc)))
             }),
             GcNode::Channel(w) => w.upgrade().map(|rc| {
                 let ptr = NodePtr::of_rc(&rc);
@@ -602,15 +595,9 @@ pub fn trace_value(v: &Value, sink: &mut dyn FnMut(GcEdge)) -> bool {
                 Err(_) => false,
             }
         }
-        ValueViewRef::AsyncPromise(p) => match p.state.try_borrow() {
-            Ok(state) => {
-                if let PromiseState::Resolved(rv) = &*state {
-                    sink(GcEdge::Value(rv));
-                }
-                true
-            }
-            Err(_) => false,
-        },
+        // A promise handle carries only a runtime `PromiseId` — no `Value`
+        // edges. Its settled value lives in the runtime's `PromiseRegistry`.
+        ValueViewRef::AsyncPromise(_) => true,
         ValueViewRef::Channel(c) => match c.buffer.try_borrow() {
             Ok(buffer) => {
                 for item in buffer.iter() {
@@ -1364,17 +1351,6 @@ fn sever_node(ptr: NodePtr, handle: &NodeHandle, severed: &mut Vec<Value>) {
                 Ok(mut forced) => severed.extend(forced.take()),
                 Err(_) => debug_assert!(false, "white thunk borrowed during severing"),
             },
-            ValueViewRef::AsyncPromise(p) => match p.state.try_borrow_mut() {
-                Ok(mut state) => {
-                    // An unreachable promise has no observers, so the state
-                    // change is unobservable.
-                    let old = std::mem::replace(&mut *state, PromiseState::Resolved(Value::NIL));
-                    if let PromiseState::Resolved(value) = old {
-                        severed.push(value);
-                    }
-                }
-                Err(_) => debug_assert!(false, "white promise borrowed during severing"),
-            },
             ValueViewRef::Channel(c) => match c.buffer.try_borrow_mut() {
                 Ok(mut buffer) => severed.extend(buffer.drain(..)),
                 Err(_) => debug_assert!(false, "white channel borrowed during severing"),
@@ -1438,7 +1414,6 @@ fn value_node_ptr(v: &Value) -> Option<NodePtr> {
         | ValueViewRef::Thunk(_)
         | ValueViewRef::MultiMethod(_)
         | ValueViewRef::Channel(_)
-        | ValueViewRef::AsyncPromise(_)
         | ValueViewRef::MutableArray(_)
         | ValueViewRef::MutableCell(_)
         | ValueViewRef::Macro(_)
@@ -1859,24 +1834,9 @@ mod tests {
         assert_eq!(weak.strong_count(), 0, "multimethod reclaimed");
     }
 
-    // 5b. promise resolved to itself (data-only cycle via Resolved).
-    #[test]
-    fn promise_resolved_to_itself_collected() {
-        let p = Rc::new(AsyncPromise {
-            state: RefCell::new(PromiseState::Pending),
-            task_id: Cell::new(0),
-        });
-        *p.state.borrow_mut() = PromiseState::Resolved(Value::async_promise_from_rc(p.clone()));
-        let weak = Rc::downgrade(&p);
-        register_candidate(GcNode::Promise(Rc::downgrade(&p)));
-        drop(p);
-
-        let stats = collect(&[], GcTrigger::Explicit);
-
-        assert!(!stats.aborted);
-        assert_eq!(stats.collected, 1);
-        assert_eq!(weak.strong_count(), 0, "promise reclaimed");
-    }
+    // (Retired) A promise resolving to itself is no longer representable: an
+    // `AsyncPromise` carries only a runtime `PromiseId`, never a `Value`, so it
+    // cannot close a data cycle and is not a GC candidate.
 
     // 6. shared subgraph reachable from TWO candidates: traced once, counts
     //    exact, collected exactly once.

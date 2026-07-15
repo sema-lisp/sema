@@ -423,29 +423,19 @@ pub enum PromiseState {
     Cancelled,
 }
 
-/// An async promise: represents a value that will be available in the future.
+/// An async promise: a thin handle to a promise in the unified runtime's
+/// `PromiseRegistry`, which is the single source of truth for its state and its
+/// settled value. The handle carries only the checked `PromiseId` (Copy,
+/// runtime-scoped), so it holds no GC edges — the resolved value lives in the
+/// registry (retained there via `Rc`), not on this handle.
+#[derive(Clone, Copy)]
 pub struct AsyncPromise {
-    pub state: RefCell<PromiseState>,
-    pub task_id: Cell<u64>,
+    pub id: crate::runtime::PromiseId,
 }
 
 impl fmt::Debug for AsyncPromise {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match &*self.state.borrow() {
-            PromiseState::Pending => write!(f, "<async-promise pending>"),
-            PromiseState::Resolved(_) => write!(f, "<async-promise resolved>"),
-            PromiseState::Rejected(e) => write!(f, "<async-promise rejected: {e}>"),
-            PromiseState::Cancelled => write!(f, "<async-promise cancelled>"),
-        }
-    }
-}
-
-impl Clone for AsyncPromise {
-    fn clone(&self) -> Self {
-        AsyncPromise {
-            state: RefCell::new(self.state.borrow().clone()),
-            task_id: Cell::new(self.task_id.get()),
-        }
+        write!(f, "<async-promise>")
     }
 }
 
@@ -1252,17 +1242,14 @@ impl Value {
     }
 
     pub fn async_promise(promise: AsyncPromise) -> Value {
-        let rc = Rc::new(promise);
-        // Cold data-cycle constructor (CORE-2): a resolved promise can close a
-        // closure-free cycle through its state cell (e.g. resolved to a channel
-        // that buffers the promise). The scheduler's raw `Rc::new(AsyncPromise…)`
-        // spawn sites register their own candidates before wrapping via
-        // `async_promise_from_rc`.
-        crate::cycle::register_candidate(crate::cycle::GcNode::Promise(Rc::downgrade(&rc)));
-        Value::from_rc_ptr(TAG_ASYNC_PROMISE, rc)
+        // The handle holds only a `PromiseId` (no `Value` edges), so it closes no
+        // data cycle — no GC candidate registration is needed.
+        Value::from_rc_ptr(TAG_ASYNC_PROMISE, Rc::new(promise))
     }
-    pub fn async_promise_from_rc(rc: Rc<AsyncPromise>) -> Value {
-        Value::from_rc_ptr(TAG_ASYNC_PROMISE, rc)
+    /// Build a promise `Value` from a runtime `PromiseId`. The registry owns the
+    /// promise's state; this is just the language-facing handle to it.
+    pub fn async_promise_id(id: crate::runtime::PromiseId) -> Value {
+        Value::async_promise(AsyncPromise { id })
     }
     pub fn channel(ch: Channel) -> Value {
         let rc = Rc::new(ch);
@@ -3034,12 +3021,7 @@ impl fmt::Display for Value {
                 with_resolved(m.name, |n| write!(f, "<multimethod {n}>"))
             }
             ValueViewRef::Stream(s) => write!(f, "<stream:{}>", s.stream_type()),
-            ValueViewRef::AsyncPromise(p) => match &*p.state.borrow() {
-                PromiseState::Pending => write!(f, "<async-promise pending>"),
-                PromiseState::Resolved(v) => write!(f, "<async-promise resolved: {v}>"),
-                PromiseState::Rejected(e) => write!(f, "<async-promise rejected: {e}>"),
-                PromiseState::Cancelled => write!(f, "<async-promise cancelled>"),
-            },
+            ValueViewRef::AsyncPromise(_) => write!(f, "<async-promise>"),
             ValueViewRef::Channel(c) => {
                 let len = c.buffer.borrow().len();
                 if c.closed.get() {

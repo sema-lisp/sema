@@ -14,8 +14,28 @@ use std::rc::Rc;
 use std::sync::{Condvar, Mutex};
 
 use crate::runtime::{InvalidRuntimeId, TaskId};
-use crate::value::{AsyncPromise, Channel, Value};
+use crate::value::{Channel, PromiseState, Value};
 use crate::{EvalContext, SemaError};
+
+/// The legacy cooperative scheduler's completion cell.
+///
+/// This is the mutable promise the legacy `scheduler.rs` (and the cooperative
+/// WASM/DAP debug path) drives: it holds a `RefCell<PromiseState>` the scheduler
+/// fills on task completion, and a raw `task_id`. It is deliberately NOT a Sema
+/// `Value` (no tag / `ValueView`) — the language-facing promise is now the thin
+/// [`AsyncPromise`](crate::value::AsyncPromise) handle over the unified runtime's
+/// registry. Only the legacy scheduler subsystem constructs or reads this; the
+/// runtime never touches it. Retired wholesale in a later step (Step H).
+pub struct LegacyPromise {
+    pub state: RefCell<PromiseState>,
+    pub task_id: Cell<u64>,
+}
+
+impl std::fmt::Debug for LegacyPromise {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("<legacy-promise>")
+    }
+}
 
 /// Conversion boundary between checked runtime task IDs and legacy raw IDs.
 ///
@@ -153,14 +173,14 @@ pub enum PromiseSetKind {
 #[derive(Debug, Clone)]
 pub enum YieldReason {
     /// Waiting for a promise to resolve.
-    AwaitPromise(Rc<AsyncPromise>),
+    AwaitPromise(Rc<LegacyPromise>),
     /// Observing a SET of promises via an observational combinator
     /// (`async/all` / `async/race` / `async/timeout`). The unified runtime parks
     /// the frame on every supplied promise (and, for `Timeout`, a deadline
     /// timer) and resumes it once the combinator's condition is met — WITHOUT
     /// ever cancelling the supplied promises.
     AwaitPromiseSet {
-        promises: Vec<Rc<AsyncPromise>>,
+        promises: Vec<Rc<LegacyPromise>>,
         mode: PromiseSetKind,
     },
     /// Waiting to receive from an empty channel.
@@ -199,7 +219,7 @@ pub enum YieldReason {
     /// and resumes the requesting frame with the boolean first-request result.
     /// The legacy scheduler never sees this variant (it cancels via the cancel
     /// callback instead).
-    Cancel(Rc<AsyncPromise>),
+    Cancel(Rc<LegacyPromise>),
     /// Waiting for an offloaded I/O future (e.g. an HTTP round-trip running on a
     /// background runtime) to complete. The scheduler polls the handle and parks
     /// the VM thread on the process-global IO-completion signal while in flight.
@@ -223,13 +243,13 @@ pub enum SchedulerTarget {
     /// Run all currently scheduled work until no ready tasks remain.
     All,
     /// Run until one promise is no longer pending.
-    One(Rc<AsyncPromise>),
+    One(Rc<LegacyPromise>),
     /// Run until all promises are complete, or any one rejects.
-    AllOf(Vec<Rc<AsyncPromise>>),
+    AllOf(Vec<Rc<LegacyPromise>>),
     /// Run until any promise completes.
-    AnyOf(Vec<Rc<AsyncPromise>>),
+    AnyOf(Vec<Rc<LegacyPromise>>),
     /// Run until one promise completes or the duration elapses.
-    Timeout(Rc<AsyncPromise>, u64),
+    Timeout(Rc<LegacyPromise>, u64),
 }
 
 /// Result of a scheduler run.
@@ -260,11 +280,11 @@ pub enum DebugCoopResume {
     /// `async/await` / `async/timeout`: resume with the single target promise's
     /// resolved value (rejection/cancel surface as the native's own error after
     /// resume, since the native re-runs and re-inspects the promise).
-    Await(Rc<AsyncPromise>),
+    Await(Rc<LegacyPromise>),
     /// `async/all`: resume with the list of all resolved values.
-    All(Vec<Rc<AsyncPromise>>),
+    All(Vec<Rc<LegacyPromise>>),
     /// `async/race` / `async/any`: resume with the first settled promise's value.
-    Race(Vec<Rc<AsyncPromise>>),
+    Race(Vec<Rc<LegacyPromise>>),
     /// `async/run`: no value to reconstruct (returns nil).
     Run,
 }
@@ -826,7 +846,7 @@ pub fn io_park(timeout_ms: u64) {
 /// ([`SchedulerRunResult::DebugPaused`]).
 pub fn call_run_scheduler(
     ctx: &EvalContext,
-    target: Option<Rc<AsyncPromise>>,
+    target: Option<Rc<LegacyPromise>>,
 ) -> Result<SchedulerRunResult, SemaError> {
     let f = RUN_SCHEDULER_CALLBACK.with(|cb| cb.get()).ok_or_else(|| {
         SemaError::eval(
@@ -843,7 +863,7 @@ pub fn call_run_scheduler(
 /// Run the scheduler until all target promises complete, or any target rejects.
 pub fn call_run_scheduler_all_of(
     ctx: &EvalContext,
-    targets: Vec<Rc<AsyncPromise>>,
+    targets: Vec<Rc<LegacyPromise>>,
 ) -> Result<SchedulerRunResult, SemaError> {
     let f = RUN_SCHEDULER_CALLBACK.with(|cb| cb.get()).ok_or_else(|| {
         SemaError::eval(
@@ -856,7 +876,7 @@ pub fn call_run_scheduler_all_of(
 /// Run the scheduler until any target promise completes.
 pub fn call_run_scheduler_any_of(
     ctx: &EvalContext,
-    targets: Vec<Rc<AsyncPromise>>,
+    targets: Vec<Rc<LegacyPromise>>,
 ) -> Result<SchedulerRunResult, SemaError> {
     let f = RUN_SCHEDULER_CALLBACK.with(|cb| cb.get()).ok_or_else(|| {
         SemaError::eval(
@@ -886,7 +906,7 @@ pub fn call_run_scheduler_target(
 /// Run the scheduler until the target promise completes or the duration elapses.
 pub fn call_run_scheduler_timeout(
     ctx: &EvalContext,
-    target: Rc<AsyncPromise>,
+    target: Rc<LegacyPromise>,
     timeout_ms: u64,
 ) -> Result<SchedulerRunResult, SemaError> {
     let f = RUN_SCHEDULER_CALLBACK.with(|cb| cb.get()).ok_or_else(|| {

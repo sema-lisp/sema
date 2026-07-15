@@ -17,7 +17,7 @@ use std::rc::Rc;
 
 use sema_core::{
     in_async_context, set_async_context, set_cancel_callback, set_run_scheduler_callback,
-    set_spawn_callback, AsyncPromise, Env, EvalContext, PromiseState, SchedulerRunResult,
+    set_spawn_callback, LegacyPromise, Env, EvalContext, PromiseState, SchedulerRunResult,
     SchedulerTarget, SemaError, Spur, Value, YieldReason,
 };
 
@@ -44,7 +44,7 @@ struct Task {
     id: u64,
     vm: VM,
     closure: Rc<Closure>,
-    promise: Rc<AsyncPromise>,
+    promise: Rc<LegacyPromise>,
     state: TaskState,
     /// Whether `execute_async` has been called (false = first run).
     started: bool,
@@ -124,11 +124,12 @@ impl Scheduler {
     /// Extracts the compiled closure from the thunk value, creates a
     /// dedicated VM for the task, and returns a promise that will be
     /// resolved when the task completes.
+    #[allow(dead_code)] // legacy spawn path retired; see `spawn_callback`.
     pub fn spawn(
         &mut self,
         thunk: Value,
         _ctx: &EvalContext,
-    ) -> Result<Rc<AsyncPromise>, SemaError> {
+    ) -> Result<Rc<LegacyPromise>, SemaError> {
         let (closure, functions, native_fns) = vm::extract_vm_closure(&thunk).ok_or_else(|| {
             SemaError::eval("async/spawn: argument must be a function (compiled VM closure)")
         })?;
@@ -143,14 +144,10 @@ impl Scheduler {
         let id = self.next_id;
         self.next_id += 1;
 
-        let promise = Rc::new(AsyncPromise {
+        let promise = Rc::new(LegacyPromise {
             state: RefCell::new(PromiseState::Pending),
             task_id: std::cell::Cell::new(id),
         });
-        // Cold data-cycle constructor (CORE-2): this promise is wrapped via
-        // `async_promise_from_rc` later, which registers nothing — register
-        // the candidate here, at the allocation.
-        sema_core::register_candidate(sema_core::GcNode::Promise(Rc::downgrade(&promise)));
 
         // Use the function table from the thunk's own compilation context,
         // not the scheduler's — each eval_str_compiled produces different functions.
@@ -357,7 +354,7 @@ impl Scheduler {
     /// `AwaitPromise` (the next hop for transitive cancellation), if any. Aborting +
     /// transitioning here (on the VM thread, OTel TLS alive) is what drops a
     /// span-owning `IoHandle` before teardown (adversarial #7).
-    fn cancel_one(task: &mut Task) -> (bool, Option<Rc<AsyncPromise>>) {
+    fn cancel_one(task: &mut Task) -> (bool, Option<Rc<LegacyPromise>>) {
         if matches!(task.state, TaskState::Done | TaskState::Failed) || task.cancelled {
             return (false, None);
         }
@@ -395,7 +392,7 @@ impl Scheduler {
     /// Semantics note: cancelling a task cancels the work it was waiting for, even if
     /// that work is also awaited elsewhere — consistent with "best-effort" cancel and
     /// with timeout meaning "give up on this and free its resources".
-    fn cancel_await_tree(&mut self, root: &Rc<AsyncPromise>) -> bool {
+    fn cancel_await_tree(&mut self, root: &Rc<LegacyPromise>) -> bool {
         let mut root_transitioned = false;
         let mut frontier = vec![root.clone()];
         // Belt-and-suspenders against a pathological await cycle (can't normally form
@@ -424,7 +421,7 @@ impl Scheduler {
     /// that just expired. Transitive (see [`cancel_await_tree`]).
     ///
     /// [`cancel_await_tree`]: Scheduler::cancel_await_tree
-    fn cancel_promise_task(&mut self, target: &Rc<AsyncPromise>) {
+    fn cancel_promise_task(&mut self, target: &Rc<LegacyPromise>) {
         self.cancel_await_tree(target);
     }
 
@@ -441,7 +438,7 @@ impl Scheduler {
         };
         // Snapshot the still-pending members first: `cancel_promise_task` borrows
         // `self.tasks` mutably and transitions promise state as it goes.
-        let pending: Vec<Rc<AsyncPromise>> = promises
+        let pending: Vec<Rc<LegacyPromise>> = promises
             .iter()
             .filter(|p| matches!(&*p.state.borrow(), PromiseState::Pending))
             .cloned()
@@ -552,16 +549,18 @@ pub fn with_coop_paused_task_vm<R>(f: impl FnOnce(&mut VM) -> R) -> Option<R> {
     result
 }
 
-/// Spawn callback registered via `sema_core::set_spawn_callback`.
+/// Spawn callback formerly registered via `sema_core::set_spawn_callback`.
 ///
-/// Called by the `async/spawn` stdlib function. Takes the scheduler
-/// briefly to add the task, then puts it back immediately.
-fn spawn_callback(ctx: &EvalContext, thunk: Value) -> Result<Value, SemaError> {
-    let mut sched = take_scheduler()?;
-    let result = sched.spawn(thunk, ctx);
-    put_scheduler(sched);
-    let promise = result?;
-    Ok(Value::async_promise_from_rc(promise))
+/// `async/spawn` now suspends structurally through the unified runtime
+/// (`RuntimeRequest::Spawn`), so this legacy callback is no longer registered or
+/// reached. It cannot produce a language-facing promise anyway: the legacy
+/// scheduler has no runtime and so cannot mint a registry `PromiseId`. Kept as a
+/// hard-error stub until the legacy scheduler is retired wholesale (Step H).
+#[allow(dead_code)]
+fn spawn_callback(_ctx: &EvalContext, _thunk: Value) -> Result<Value, SemaError> {
+    Err(SemaError::eval(
+        "async/spawn: legacy scheduler spawn is retired; async runs on the unified runtime",
+    ))
 }
 
 /// Spawn `closure` with pre-bound `args` as a scheduled task and run the
@@ -590,13 +589,10 @@ pub(crate) fn run_closure_as_inline_task(
 
     let id = sched.next_id;
     sched.next_id += 1;
-    let promise = Rc::new(AsyncPromise {
+    let promise = Rc::new(LegacyPromise {
         state: RefCell::new(PromiseState::Pending),
         task_id: std::cell::Cell::new(id),
     });
-    // Cold data-cycle constructor (CORE-2): raw allocation, wrapped via
-    // `async_promise_from_rc` on resolution paths — register here.
-    sema_core::register_candidate(sema_core::GcNode::Promise(Rc::downgrade(&promise)));
 
     let mut vm = VM::new_for_task_with_native_fns(sched.globals.clone(), functions, native_fns);
     if let Err(e) = vm.setup_for_call(closure.clone(), args) {

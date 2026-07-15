@@ -1,5 +1,20 @@
 # Structural-ABI migration — progress log
 
+## FINAL STATE (2026-07-15): language async 100% migrated, full suite green
+
+The thread-local suspension bridge is DELETED for all language-level async. Every unit of
+execution runs on the ONE interpreter-owned cooperative `Runtime`; suspension goes through the
+structural `NativeOutcome` ABI. Verified: `jake examples` 81/0, `jake smoke-bytecode` 81/0,
+`jake lint` clean, `cargo test --workspace` green (sema-vm 490/0, sema-core 317/0, eval 1072/0,
+integration 1055/0, complete_async 14/0, stream_async 10/0, llm_fake 29/0, all async/IO suites
+green). The ONLY remaining reds are documented deferrals (`docs/deferred.md`): the
+inventory-mapping governance re-review, and `#[ignore]`d async-under-debugger tests
+(ASYNC-DEBUG-1). Deferred (needs plan-gap primitives, all in deferred.md): F2-RESIDUAL
+(stateful/streaming I/O still on the runtime-driven AwaitIo transport — async overlap works),
+the executor async-tier reactor, the `async/run` transitive barrier, DAP/wasm cooperative-debug
+mode, and ASYNC-TIMEOUT-CANCEL-1.
+
+
 Live log of the async re-architecture (killing the thread-local YieldReason bridge, moving
 100% to the canonical cooperative Runtime + structural NativeOutcome ABI). Sequenced from
 Fable 5's strategy (see fable5-rearchitecture-strategy.md), adjusted as real code forced

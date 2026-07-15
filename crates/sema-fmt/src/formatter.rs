@@ -244,32 +244,55 @@ fn classify_form(children: &[Node]) -> FormKind {
             | "lambda"
             | "do"
             | "begin"
+            | "progn"
+            | "async"
             | "when"
             | "unless"
+            | "guard"
             | "module"
             | "defagent"
             | "deftool"
+            | "defmulti"
+            | "defmethod"
             | "prompt"
             | "message"
             | "export"
             | "for"
             | "for-each"
+            | "for-range"
+            | "for-list"
+            | "for-map"
+            | "for-filter"
+            | "for-fold"
+            | "dotimes"
             | "while"
             | "with-open-file"
             | "with-exception-handler"
+            | "define-values"
             | "define-record-type"
             | "define-syntax"
             | "syntax-rules",
         ) => FormKind::Body,
-        Some("let" | "let*" | "letrec" | "let-values" | "let*-values" | "when-let" | "if-let") => {
-            FormKind::Binding
-        }
-        Some("cond" | "case" | "match") => FormKind::Clause,
+        Some(
+            "let" | "let*" | "letrec" | "let-values" | "let*-values" | "when-let" | "if-let"
+            | "parameterize",
+        ) => FormKind::Binding,
+        Some("cond" | "case" | "match" | "match*") => FormKind::Clause,
         Some("->" | "->>" | "as->" | "some->") => FormKind::Threading,
         Some("try") => FormKind::TryCatch,
         Some("if") => FormKind::Cond,
         Some("import" | "load" | "require") => FormKind::Import,
         _ => FormKind::Call,
+    }
+}
+
+/// How many semantic nodes precede a clause form's clauses: `cond` has none,
+/// `case`/`match`/`match*` scrutinize a subject that belongs on the head line.
+fn clause_subject_count(head_name: &str) -> usize {
+    if head_name == "cond" {
+        0
+    } else {
+        1
     }
 }
 
@@ -328,12 +351,30 @@ fn body_first_line_count(head_name: &str, semantic: &[&Node]) -> usize {
         "define-syntax" => 2.min(semantic.len()),
         // deftool/defagent: only head + name on first line (docstring goes on its own line)
         "deftool" | "defagent" => 2.min(semantic.len()),
+        // (defmulti name dispatch-fn)
+        "defmulti" => 3.min(semantic.len()),
+        // (defmethod name dispatch-val (params) body...)
+        "defmethod" => 4.min(semantic.len()),
+        // (for-fold (accum init) (clause) body...) — both specs on the first line
+        "for-fold" => 3.min(semantic.len()),
         // fn/lambda: head + params
         "fn" | "lambda" if semantic.len() > 1 => 2,
         "fn" | "lambda" => 1,
-        // when/unless/while: head + condition on first line
-        "when" | "unless" | "while" if semantic.len() > 1 => 2,
-        "when" | "unless" | "while" => 1,
+        // head + condition/spec/name on the first line, body below
+        "when"
+        | "unless"
+        | "while"
+        | "guard"
+        | "define-values"
+        | "dotimes"
+        | "for"
+        | "for-range"
+        | "for-list"
+        | "for-map"
+        | "for-filter"
+        | "module"
+        | "with-open-file"
+        | "with-exception-handler" => 2.min(semantic.len()),
         _ => 1,
     }
 }
@@ -1103,12 +1144,29 @@ impl Formatter {
             return;
         }
 
+        // case/match/match* scrutinize a subject that belongs beside the head
+        let head_name = match semantic[0] {
+            Node::Atom(Token::Symbol(s)) => s.as_str(),
+            _ => "",
+        };
+        let subjects = clause_subject_count(head_name).min(semantic.len() - 1);
+
+        // A comment between the head and the subject would be deleted by
+        // flattening them onto one line.
+        if Self::semantics_before_first_comment(children) < 1 + subjects {
+            return self.format_head_body(children, indent, open, close);
+        }
+
         self.output.push_str(open);
         // head
         self.format_node(semantic[0], indent + open.len());
+        for subject in &semantic[1..1 + subjects] {
+            self.output.push(' ');
+            self.format_node(subject, indent + self.indent_size);
+        }
 
         let clause_indent = indent + self.indent_size;
-        let clause_start = Self::index_after_nth_semantic(children, 1);
+        let clause_start = Self::index_after_nth_semantic(children, 1 + subjects);
 
         // Try aligned clause formatting: collect consecutive clause forms
         // (skipping comments/newlines) and try to align their test/result columns
@@ -1135,15 +1193,10 @@ impl Formatter {
 
     /// Try to format cond/case/match clauses with aligned result columns.
     fn try_format_clause_aligned(&mut self, clauses: &[&Node], indent: usize) -> bool {
-        // All clauses must be flat-renderable 2-element lists
+        // All clauses must be flat-renderable 2-element lists/vectors
         let mut splits: Vec<(String, String)> = Vec::new();
         for clause in clauses {
-            let children = match clause {
-                Node::List(c) => c,
-                _ => return false,
-            };
-            let semantic = semantic_children(children);
-            match Self::split_clause(&semantic) {
+            match Self::split_clause(clause) {
                 Some(pair) => {
                     // A raw newline inside a string literal would break the
                     // aligned column — bail to normal formatting.
@@ -1776,7 +1829,7 @@ impl Formatter {
     /// where both are rendered flat and padded to align.
     fn try_format_aligned_group<F>(&mut self, forms: &[&Node], indent: usize, split_fn: F) -> bool
     where
-        F: Fn(&[&Node]) -> Option<(String, String)>,
+        F: Fn(&Node) -> Option<(String, String)>,
     {
         if forms.len() < 2 {
             return false;
@@ -1785,12 +1838,7 @@ impl Formatter {
         // Compute left/right splits for each form
         let mut splits: Vec<(String, String)> = Vec::new();
         for form in forms {
-            let children = match form {
-                Node::List(c) | Node::Vector(c) | Node::ShortLambda(c) => c,
-                _ => return false,
-            };
-            let semantic = semantic_children(children);
-            match split_fn(&semantic) {
+            match split_fn(form) {
                 Some(pair) => {
                     // A string literal can carry a raw newline that would break
                     // the aligned column — bail to normal formatting.
@@ -2076,43 +2124,54 @@ impl Formatter {
     }
 
     /// Split a cond/case clause into left="(test" and right="result)" for alignment.
-    fn split_clause(semantic: &[&Node]) -> Option<(String, String)> {
+    fn split_clause(form: &Node) -> Option<(String, String)> {
+        let (children, open, close) = Self::pair_delims(form)?;
+        let semantic = semantic_children(children);
         if semantic.len() != 2 {
             return None;
         }
-        if has_any_newlines(semantic[0]) || has_any_newlines(semantic[1]) {
+        if semantic
+            .iter()
+            .any(|n| has_any_newlines(n) || has_any_comments(n))
+        {
             return None;
         }
-        if has_any_comments(semantic[0]) || has_any_comments(semantic[1]) {
-            return None;
-        }
-        let test = node_to_flat_string(semantic[0]);
-        let result = node_to_flat_string(semantic[1]);
-        let left = format!("({test}");
-        let right = format!("{result})");
+        let left = format!("{open}{}", node_to_flat_string(semantic[0]));
+        let right = format!("{}{close}", node_to_flat_string(semantic[1]));
         Some((left, right))
     }
 
     /// Split a let binding pair into left="(name" and right="value)" for alignment.
-    fn split_binding(semantic: &[&Node]) -> Option<(String, String)> {
+    /// A pair form's children and its OWN delimiters — a `[…]` pair must be
+    /// re-emitted with brackets; rewriting it as `(…)` would turn a vector
+    /// literal into a call form and change the program.
+    fn pair_delims(form: &Node) -> Option<(&[Node], &'static str, &'static str)> {
+        match form {
+            Node::List(c) => Some((c.as_slice(), "(", ")")),
+            Node::Vector(c) => Some((c.as_slice(), "[", "]")),
+            _ => None,
+        }
+    }
+
+    fn split_binding(form: &Node) -> Option<(String, String)> {
+        let (children, open, close) = Self::pair_delims(form)?;
+        let semantic = semantic_children(children);
         if semantic.len() != 2 {
             return None;
         }
-        if has_any_newlines(semantic[0]) || has_any_newlines(semantic[1]) {
-            return None;
-        }
-        if has_any_comments(semantic[0]) || has_any_comments(semantic[1]) {
-            return None;
-        }
-        let name = node_to_flat_string(semantic[0]);
-        let value = node_to_flat_string(semantic[1]);
         // Only align if the name is a simple atom (not a destructuring pattern)
         match semantic[0] {
             Node::Atom(_) | Node::StringAtom(_) => {}
             _ => return None,
         }
-        let left = format!("({name}");
-        let right = format!("{value})");
+        if semantic
+            .iter()
+            .any(|n| has_any_newlines(n) || has_any_comments(n))
+        {
+            return None;
+        }
+        let left = format!("{open}{}", node_to_flat_string(semantic[0]));
+        let right = format!("{}{close}", node_to_flat_string(semantic[1]));
         Some((left, right))
     }
 

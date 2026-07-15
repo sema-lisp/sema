@@ -1481,3 +1481,211 @@ fn test_moderately_deep_nesting_formats() {
     let result = fmt(&deep);
     assert_eq!(fmt(&result), result, "should be idempotent");
 }
+
+// ---------------------------------------------------------------------------
+// Delimiter preservation in aligned pairs: a [..] pair must never be
+// re-emitted as (..) — that turns a vector literal into a call form.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_aligned_vector_pairs_keep_brackets() {
+    let input = "[[:a 1]\n [:bb 22]\n [:ccc 333]]";
+    let result = fmt_aligned(input);
+    assert_eq!(result, "[[:a    1]\n [:bb   22]\n [:ccc  333]]\n");
+    assert_eq!(fmt_aligned(&result), result, "should be idempotent");
+}
+
+#[test]
+fn test_aligned_let_vector_bindings_keep_brackets() {
+    let input = "(let [[x 1]\n      [longer 22]]\n  x)";
+    let result = fmt_aligned(input);
+    assert_eq!(result, "(let [[x       1]\n      [longer  22]]\n  x)\n");
+}
+
+#[test]
+fn test_aligned_case_vector_clauses_keep_brackets() {
+    let input = "(case x\n  [1 \"one\"]\n  [22 \"twotwo\"])";
+    let result = fmt_aligned(input);
+    assert_eq!(result, "(case x\n  [1   \"one\"]\n  [22  \"twotwo\"])\n");
+}
+
+// ---------------------------------------------------------------------------
+// Special-form coverage: every special form in the canonical list
+// (crates/sema-docs/entries/special-forms/) gets its intended layout.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_case_and_match_subject_on_head_line() {
+    let result =
+        fmt_narrow("(case x (1 \"one\") (2 \"two\") (else \"other\") (more-padding \"xx\"))");
+    assert!(
+        result.starts_with("(case x\n"),
+        "case subject should share the head line:\n{result}"
+    );
+    let result = fmt_narrow("(match value ((list a b) (+ a b)) (_ 0) (long-pattern \"yyy\"))");
+    assert!(
+        result.starts_with("(match value\n"),
+        "match subject should share the head line:\n{result}"
+    );
+}
+
+#[test]
+fn test_case_comment_before_subject_kept() {
+    let input = "(case ;; pick\n  x\n  (1 \"one\")\n  (2 \"two\"))";
+    let result = fmt(input);
+    assert!(result.contains(";; pick"), "comment deleted:\n{result}");
+    assert_eq!(fmt(&result), result, "should be idempotent");
+}
+
+#[test]
+fn test_progn_and_async_format_as_body_forms() {
+    // progn is an alias of begin, async wraps a body — both put every body
+    // expression on its own line instead of pulling the first beside the head.
+    assert_eq!(
+        fmt_narrow("(progn (step-one arg) (step-two arg) (step-three arg))"),
+        "(progn\n  (step-one arg)\n  (step-two arg)\n  (step-three arg))\n"
+    );
+    assert_eq!(
+        fmt_narrow("(async (do-something arg) (do-more arg) (do-even-more arg))"),
+        "(async\n  (do-something arg)\n  (do-more arg)\n  (do-even-more arg))\n"
+    );
+}
+
+#[test]
+fn test_special_form_first_line_shapes() {
+    // Each form keeps its spec/signature on the head line, body below.
+    let cases = [
+        (
+            "(dotimes (i 10) (print-a-thing i) (another-line i))",
+            "(dotimes (i 10)\n",
+        ),
+        (
+            "(for-range (i 0 100) (do-thing-with i) (and-another i))",
+            "(for-range (i 0 100)\n",
+        ),
+        (
+            "(for-fold (acc 0) (x xs) (+ acc (weight-of x)))",
+            "(for-fold (acc 0) (x xs)\n",
+        ),
+        (
+            "(guard (e (else (handle e))) (risky-thing arg) (more-risky arg))",
+            "(guard (e (else (handle e)))\n",
+        ),
+        (
+            "(defmethod area :circle (c) (* 3.14 (sq (radius-of c))))",
+            "(defmethod area :circle (c)\n",
+        ),
+        (
+            "(define-values (q r) (floor/ some-numerator some-denominator))",
+            "(define-values (q r)\n",
+        ),
+        (
+            "(parameterize ((param val)) (body-one arg) (body-two arg))",
+            "(parameterize ((param val))\n",
+        ),
+        (
+            "(with-open-file (f \"path.txt\") (read-line-from f) (another f))",
+            "(with-open-file (f \"path.txt\")\n",
+        ),
+        (
+            "(module my-module (export a b) (define aa 1) (define bb 2))",
+            "(module my-module\n",
+        ),
+    ];
+    for (input, expected_first_line) in cases {
+        let result = fmt_narrow(input);
+        assert!(
+            result.starts_with(expected_first_line),
+            "for {input:?}\nexpected start: {expected_first_line:?}\ngot:\n{result}"
+        );
+        assert_eq!(fmt_narrow(&result), result, "not idempotent: {input:?}");
+    }
+}
+
+#[test]
+fn test_special_forms_all_idempotent_and_comment_safe() {
+    // Canonical special-form list (from crates/sema-docs/entries/special-forms/),
+    // each with a comment in the body to exercise comment preservation.
+    let forms = [
+        "(and a b)",
+        "(or a b)",
+        "(if p 1 2)",
+        "(when p ;; c\n  (a))",
+        "(unless p ;; c\n  (a))",
+        "(cond (p 1) ;; c\n  (else 2))",
+        "(case x (1 \"a\") ;; c\n  (else \"b\"))",
+        "(match v (_ 0) ;; c\n  (p 1))",
+        "(match* (a b) ((1 2) \"x\"))",
+        "(let ((x 1)) ;; c\n  x)",
+        "(let* ((x 1)) x)",
+        "(letrec ((f (fn () 1))) (f))",
+        "(let-values (((a b) (two-values))) a)",
+        "(let*-values (((a b) (two-values))) a)",
+        "(when-let ((x (find))) x)",
+        "(if-let ((x (find))) x 0)",
+        "(define x 1)",
+        "(def x 1)",
+        "(defn f (x) x)",
+        "(defun f (x) x)",
+        "(defmacro m (x) x)",
+        "(defmulti area :shape)",
+        "(defmethod area :circle (c) 3.14)",
+        "(define-values (a b) (vals))",
+        "(fn (x) ;; c\n  x)",
+        "(lambda (x) x)",
+        "(do (a) ;; c\n  (b))",
+        "(begin (a) (b))",
+        "(progn (a) (b))",
+        "(async (a) ;; c\n  (b))",
+        "(await p)",
+        "(delay (compute))",
+        "(force p)",
+        "(while p ;; c\n  (a))",
+        "(dotimes (i 3) (p i))",
+        "(for (x xs) (p x))",
+        "(for-range (i 0 9) (p i))",
+        "(for-list (x xs) (f x))",
+        "(for-map (x xs) (f x))",
+        "(for-filter (x xs) (pred? x))",
+        "(for-fold (acc 0) (x xs) (+ acc x))",
+        "(guard (e (else 0)) (risky))",
+        "(parameterize ((p v)) (body))",
+        "(try (a) ;; c\n  (catch e (h e)))",
+        "(throw (make-error))",
+        "(quote (a b))",
+        "(quasiquote (a (unquote b)))",
+        "(set! x 2)",
+        "(eval '(+ 1 2))",
+        "(macroexpand '(when p 1))",
+        "(import \"mod\")",
+        "(load \"file.sema\")",
+        "(export a b)",
+        "(module m (export a) (define a 1))",
+        "(-> x (f) ;; c\n  (g))",
+        "(->> x (f) (g))",
+        "(as-> x it (f it))",
+        "(some-> x (f))",
+        "(prompt \"hi\")",
+        "(message :user \"hi\")",
+        "(deftool t \"doc\" {:a :string} (body))",
+        "(defagent a \"doc\" :tools [t] (body))",
+    ];
+    for input in forms {
+        for opts in [
+            FormatOptions::default(),
+            opts(80, 2, true),
+            opts(30, 2, false),
+        ] {
+            let first = format_source(input, &opts)
+                .unwrap_or_else(|e| panic!("format failed for {input:?}: {e}"));
+            let second = format_source(&first, &opts)
+                .unwrap_or_else(|e| panic!("reformat failed for {input:?}: {e}\n{first}"));
+            assert_eq!(second, first, "not idempotent for {input:?}");
+            assert_eq!(
+                input.matches(';').count(),
+                first.matches(';').count(),
+                "comment dropped for {input:?}:\n{first}"
+            );
+        }
+    }
+}

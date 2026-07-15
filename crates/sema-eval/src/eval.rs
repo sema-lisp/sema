@@ -255,8 +255,6 @@ impl Interpreter {
     /// Macro-expand, compile, and drive a sequence of top-level forms as one
     /// root on the unified runtime. Shared by the runtime eval entry points.
     fn run_exprs_via_runtime(&self, exprs: &[Value]) -> EvalResult {
-        use sema_vm::runtime::{DriveBudget, DriveState, RootPoll};
-
         let expanded = expand_for_vm_batch(&self.ctx, &self.global_env, exprs)?;
         let known_natives = collect_native_names(&self.global_env);
         let span_map = self.ctx.span_table.borrow().clone();
@@ -273,6 +271,17 @@ impl Interpreter {
             prog.main_cache_slots,
         )?;
         vm.seed_main_frame(prog.closure);
+        self.drive_vm_on_runtime(vm)
+    }
+
+    /// Submit an already-seeded VM as a fresh root on this interpreter's
+    /// persistent runtime and drive it to settlement. Shared by every entry
+    /// point that builds a VM directly — top-level source evaluation
+    /// ([`run_exprs_via_runtime`](Self::run_exprs_via_runtime)) and pre-compiled
+    /// `.semac` bytecode runners. The VM must already have its main frame seeded
+    /// (`seed_main_frame`).
+    pub fn drive_vm_on_runtime(&self, vm: sema_vm::VM) -> EvalResult {
+        use sema_vm::runtime::{DriveBudget, DriveState, RootPoll};
 
         // Submit as a fresh ROOT to the interpreter's single persistent runtime
         // (constructed once over THIS interpreter's context, so the VM's

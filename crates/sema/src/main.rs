@@ -2959,14 +2959,15 @@ fn run_bytecode_bytes(
         &[],
         main_cache_slots,
     )?;
-    // Initialize the async scheduler so async/await and channels work in a
-    // `.semac` program (top-level or inside a `(load ...)`). A `.semac` carries
-    // no native table (the format is process-local), and bytecode compiled with
-    // `known_natives=None` uses CallGlobal rather than CallNative, so task VMs
-    // resolve natives via the shared global env — an empty native table is
-    // correct here.
-    sema_vm::init_scheduler(interpreter.global_env.clone(), Vec::new());
-    vm.execute(closure, &interpreter.ctx)
+    // Drive the `.semac` program on the interpreter's unified cooperative
+    // runtime, the sole async engine, so async/await, channels, and timers work
+    // in compiled bytecode (top-level or inside a `(load ...)`). A `.semac`
+    // carries no native table (the format is process-local), and bytecode
+    // compiled with `known_natives=None` uses CallGlobal rather than CallNative,
+    // so task VMs resolve natives via the shared global env — the empty native
+    // table passed to `VM::new` is correct here.
+    vm.seed_main_frame(closure);
+    interpreter.drive_vm_on_runtime(vm)
 }
 
 fn run_fmt(

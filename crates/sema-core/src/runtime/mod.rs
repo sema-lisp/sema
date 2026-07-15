@@ -23,8 +23,8 @@ pub use executor::{
 };
 pub use ids::{
     ChannelId, CompletionKind, IdCounter, IdExhausted, InvalidRuntimeId, OperationId, PromiseId,
-    RootId, RuntimeId, RuntimeScopedIdCounter, RuntimeScopedIdIssuers, ScopeId, SettlementSeq,
-    TaskId, WaitGeneration, WaitId,
+    ResourceGateId, RootId, RuntimeId, RuntimeScopedIdCounter, RuntimeScopedIdIssuers, ScopeId,
+    SettlementSeq, TaskId, WaitGeneration, WaitId,
 };
 pub use native::{
     CancellationView, ChannelOperation, ChannelQuery, ChannelReceive, ChannelSend, ChannelWait,

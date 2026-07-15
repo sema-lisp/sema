@@ -163,6 +163,7 @@ macro_rules! scoped_id {
 scoped_id!(RootId);
 scoped_id!(PromiseId);
 scoped_id!(ChannelId);
+scoped_id!(ResourceGateId);
 
 #[doc(hidden)]
 pub trait RuntimeScopedIdType: private::ScopedSealed {}
@@ -182,6 +183,7 @@ macro_rules! scoped_id_type {
 scoped_id_type!(RootId);
 scoped_id_type!(PromiseId);
 scoped_id_type!(ChannelId);
+scoped_id_type!(ResourceGateId);
 
 #[derive(Debug)]
 pub struct RuntimeScopedIdCounter<I> {
@@ -197,7 +199,12 @@ impl private::Sealed for NonZeroU64 {
 }
 
 impl<I: RuntimeScopedIdType> RuntimeScopedIdCounter<I> {
-    pub(crate) fn new(runtime: RuntimeId) -> Self {
+    /// Mint a scoped-id counter for `runtime`. Runtime-internal registries
+    /// (channels, promises, resource gates) that live inside one runtime's
+    /// state cell construct their own counter from the runtime identity the
+    /// completion registrar issued, so a scoped id always carries its owning
+    /// runtime for cross-runtime misuse detection.
+    pub fn new(runtime: RuntimeId) -> Self {
         Self {
             runtime,
             local: IdCounter::new(),
@@ -342,6 +349,7 @@ mod tests {
         assert_scoped_identity!(RootId);
         assert_scoped_identity!(PromiseId);
         assert_scoped_identity!(ChannelId);
+        assert_scoped_identity!(ResourceGateId);
     }
 
     #[test]
@@ -354,6 +362,7 @@ mod tests {
         assert_traits::<ScopeId>();
         assert_traits::<PromiseId>();
         assert_traits::<ChannelId>();
+        assert_traits::<ResourceGateId>();
         assert_traits::<WaitId>();
         assert_traits::<WaitGeneration>();
         assert_traits::<OperationId>();

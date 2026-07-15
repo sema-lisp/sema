@@ -15,9 +15,9 @@ use crate::{extract_vm_closure, VmExecResult, VM};
 use sema_core::runtime::ExternalFailure;
 use sema_core::runtime::{
     CancelReason, CancellationView, ExecutorShutdown, IdCounter, IoExecutor, NativeCall,
-    NativeCallContext, NativeOutcome, NativeResult, ResumeInput, RootId, RuntimeRequest,
-    RuntimeResponse, RuntimeScopedIdCounter, SettlementSeq, TaskContextHandle, TaskId, TaskOutcome,
-    TaskSettlement, Trace, WaitKind,
+    NativeCallContext, NativeOutcome, NativeResult, ResourceGateId, ResumeInput, RootId,
+    RuntimeRequest, RuntimeResponse, RuntimeScopedIdCounter, SettlementSeq, TaskContextHandle,
+    TaskId, TaskOutcome, TaskSettlement, Trace, WaitKind,
 };
 use sema_core::runtime::{CancellationParent, LifetimeOwner, TaskRelations};
 use sema_core::EvalContext;
@@ -27,8 +27,9 @@ use sema_core::YieldReason;
 
 use super::channel::{ChannelClose, ChannelWake};
 use super::{
-    ChannelRegistry, ContinuationFrame, DriveBudget, DriveState, PendingResume, PromiseRegistry,
-    PromiseState, ReadyScheduler, RegisterExternalError, RootRecord, RootState, RuntimeClock,
+    AcquireResult, ChannelRegistry, ContinuationFrame, DriveBudget, DriveState, GateResult,
+    PendingResume, PromiseRegistry, PromiseState, ReadyScheduler, RegisterExternalError,
+    ResourceGateRegistry, ResourceGateWake, RootRecord, RootState, RuntimeClock,
     RuntimeCreateError, TaskRecord, TimerQueue, WaitRuntime,
 };
 
@@ -252,6 +253,7 @@ struct RuntimeState {
     settlement_ids: IdCounter<SettlementSeq>,
     promises: PromiseRegistry,
     channels: ChannelRegistry,
+    resource_gates: ResourceGateRegistry,
     roots: HashMap<RootId, RootRecord>,
     tasks: HashMap<TaskId, RuntimeTask>,
     ready: ReadyScheduler,
@@ -303,6 +305,13 @@ enum ProtocolWaitKind {
     /// A bare `Timer(d)` suspension: the task's wait key is armed in the timer
     /// queue and the continuation resumes with `Returned(nil)` when it fires.
     Timer,
+    /// Parked in a resource gate's FIFO queue (`WaitKind::ResourceSlot`): the
+    /// task's wait key sits in the gate's waiter queue and the continuation
+    /// resumes with `RuntimeResponse::Value(nil)` once the slot is granted (or a
+    /// structured error if the gate is closed while parked).
+    ResourceSlot {
+        gate: ResourceGateId,
+    },
 }
 
 struct ProtocolWait {
@@ -319,6 +328,7 @@ impl Trace for RuntimeState {
             && self.tasks.values().all(|task| task.trace(sink))
             && self.promises.trace(sink)
             && self.channels.trace(sink)
+            && self.resource_gates.trace(sink)
             && self
                 .protocol_waits
                 .values()
@@ -515,6 +525,15 @@ impl Runtime {
                 settlement_ids: IdCounter::new(),
                 promises: PromiseRegistry::new(runtime_id, promise_ids),
                 channels: ChannelRegistry::new(runtime_id, channel_ids),
+                // Resource gates share the runtime identity so a gate id carries
+                // its owning runtime; the counter is minted directly from that id
+                // (not issued by the registrar's `RuntimeScopedIdIssuers`, which
+                // predates this primitive) — a gate is a runtime-internal, GC-free
+                // coordination record.
+                resource_gates: ResourceGateRegistry::new(
+                    runtime_id,
+                    RuntimeScopedIdCounter::new(runtime_id),
+                ),
                 roots: HashMap::new(),
                 tasks: HashMap::new(),
                 ready: ReadyScheduler::new(),
@@ -955,7 +974,9 @@ impl Runtime {
                 }
                 _ => None,
             },
-            Some(ProtocolWaitKind::Channel { .. }) | None => None,
+            Some(ProtocolWaitKind::Channel { .. })
+            | Some(ProtocolWaitKind::ResourceSlot { .. })
+            | None => None,
         } {
             let wait = state
                 .protocol_waits
@@ -1048,8 +1069,20 @@ impl Runtime {
             let mut state = self.state.borrow_mut();
             let selected = state.tasks.iter().find_map(|(id, task)| {
                 let key = task.record.wait_key()?;
-                (task.record.cancellation().is_some() && state.protocol_waits.contains_key(&key))
-                    .then_some((*id, key))
+                task.record.cancellation()?;
+                let wait = state.protocol_waits.get(&key)?;
+                // UCR-3: a rendezvous-matched channel waiter is no longer queued
+                // in the channel but still holds a `protocol_waits` entry while
+                // its `ChannelWake` (carrying the committed value) is in flight.
+                // Cancel-dropping it here would silently discard that value. Skip
+                // it: the wake delivers the value and the sticky cancellation makes
+                // settlement observe cancellation (UCR-1), so nothing is lost.
+                if let ProtocolWaitKind::Channel { channel, .. } = &wait.kind {
+                    if !state.channels.has_wait(*channel, key) {
+                        return None;
+                    }
+                }
+                Some((*id, key))
             });
             if let Some((task_id, key)) = selected {
                 let wait = state
@@ -1069,14 +1102,14 @@ impl Runtime {
                         state.timers.cancel(key);
                     }
                     ProtocolWaitKind::Channel { channel, .. } => {
-                        // TODO(UCR-3): if cancel_wait returns None the receiver/sender
-                        // was already rendezvous-matched (its wake is in flight), so
-                        // cancel-and-drop here can lose a committed value. Fix is to
-                        // skip selecting such a wait (ChannelRegistry::has_wait) and let
-                        // the wake deliver. Currently guarded by the
-                        // dropped_protocol_completions diagnostic; not yet reproducible
-                        // by hand. See docs/bugs/ucr-3-channel-rendezvous-cancel-drop.md.
                         let _ = state.channels.cancel_wait(*channel, key);
+                    }
+                    ProtocolWaitKind::ResourceSlot { gate } => {
+                        // A task cancelled while queued behind a busy gate: drop
+                        // it from the FIFO queue so a later `release` skips it.
+                        // (An owner cancelled mid-op releases the gate via its
+                        // module cancel hook, not here.)
+                        let _ = state.resource_gates.cancel_wait(*gate, key);
                     }
                 }
                 let task = state.tasks.get_mut(&task_id).expect("selected task exists");
@@ -1344,6 +1377,10 @@ impl Runtime {
                 self.consume_channel_wake(wake)?;
                 return Ok(true);
             }
+            PendingStage::ResourceGateWake(wake) => {
+                self.consume_resource_gate_wake(wake)?;
+                return Ok(true);
+            }
         };
         self.state.borrow_mut().pending.push_back(next);
         Ok(true)
@@ -1401,6 +1438,18 @@ impl Runtime {
             super::ChannelResult::Waiting => return Ok(()),
         };
         self.finish_protocol_wait(wake.key, wake.task, Ok(response))
+    }
+
+    fn consume_resource_gate_wake(&self, wake: ResourceGateWake) -> Result<(), RuntimeFault> {
+        // A granted slot resumes the parked acquirer with nil; a gate closed
+        // while it was parked raises a structured error at the acquire site.
+        let response = match wake.result {
+            GateResult::Granted => Ok(RuntimeResponse::Value(sema_core::Value::nil())),
+            GateResult::Closed => Err(sema_core::SemaError::eval(
+                "resource gate closed while waiting for its slot",
+            )),
+        };
+        self.finish_protocol_wait(wake.key, wake.task, response)
     }
 
     fn finish_protocol_wait(
@@ -2005,6 +2054,7 @@ impl Runtime {
                         | WaitKind::PromiseSet(_)
                         | WaitKind::Channel(_)
                         | WaitKind::Timer(_)
+                        | WaitKind::ResourceSlot(_)
                 ) {
                     return self.install_protocol_suspend(task_id, owner, suspend);
                 }
@@ -2132,6 +2182,9 @@ impl Runtime {
             WaitKind::Timer(duration) => {
                 install_timer_wait(&mut state, task_id, key, duration, owner, frame)
             }
+            WaitKind::ResourceSlot(gate) => {
+                install_resource_slot_wait(&mut state, task_id, key, gate, owner, frame)
+            }
             WaitKind::External(_) => unreachable!("filtered protocol wait"),
         };
         if let Err(error) = result {
@@ -2188,6 +2241,81 @@ impl Runtime {
                     continuation,
                 },
             );
+        }
+        if let RuntimeRequest::CreateResourceGate { continuation } = request {
+            let response = self
+                .state
+                .borrow_mut()
+                .resource_gates
+                .allocate()
+                .map(RuntimeResponse::ResourceGate)
+                .map_err(|_| {
+                    sema_core::SemaError::eval("runtime resource gate identity exhausted")
+                });
+            self.state
+                .borrow_mut()
+                .pending
+                .push_back(PendingStage::ApplyRuntimeResponse(
+                    task_id,
+                    owner,
+                    ContinuationFrame::native(continuation),
+                    response,
+                ));
+            return Ok(());
+        }
+        if let RuntimeRequest::ReleaseResourceGate { gate, continuation } = request {
+            let response = {
+                let mut state = self.state.borrow_mut();
+                let result = state
+                    .resource_gates
+                    .release(gate)
+                    .map(|()| RuntimeResponse::Value(sema_core::Value::nil()))
+                    .map_err(registry_error);
+                // A release grants the FIFO head (if any) — deliver that wake.
+                while let Some(wake) = state.resource_gates.pop_wake() {
+                    state
+                        .pending
+                        .push_back(PendingStage::ResourceGateWake(wake));
+                }
+                result
+            };
+            self.state
+                .borrow_mut()
+                .pending
+                .push_back(PendingStage::ApplyRuntimeResponse(
+                    task_id,
+                    owner,
+                    ContinuationFrame::native(continuation),
+                    response,
+                ));
+            return Ok(());
+        }
+        if let RuntimeRequest::CloseResourceGate { gate, continuation } = request {
+            let response = {
+                let mut state = self.state.borrow_mut();
+                let result = state
+                    .resource_gates
+                    .close(gate)
+                    .map(|()| RuntimeResponse::Value(sema_core::Value::nil()))
+                    .map_err(registry_error);
+                // Every parked waiter fails `Closed`.
+                while let Some(wake) = state.resource_gates.pop_wake() {
+                    state
+                        .pending
+                        .push_back(PendingStage::ResourceGateWake(wake));
+                }
+                result
+            };
+            self.state
+                .borrow_mut()
+                .pending
+                .push_back(PendingStage::ApplyRuntimeResponse(
+                    task_id,
+                    owner,
+                    ContinuationFrame::native(continuation),
+                    response,
+                ));
+            return Ok(());
         }
         if let RuntimeRequest::CreateSettledPromise {
             outcome,
@@ -2377,6 +2505,11 @@ impl Runtime {
                 }
                 RuntimeRequest::OriginBarrier { .. } => {
                     unreachable!("origin barrier extracted before borrow")
+                }
+                RuntimeRequest::CreateResourceGate { .. }
+                | RuntimeRequest::ReleaseResourceGate { .. }
+                | RuntimeRequest::CloseResourceGate { .. } => {
+                    unreachable!("resource gate request extracted before borrow")
                 }
             }
         };
@@ -3735,6 +3868,61 @@ fn install_timer_wait(
     Ok(())
 }
 
+/// Register a `ResourceSlot(gate)` acquire suspension. A free gate is granted
+/// immediately (resume with nil, no wait recorded); a busy gate parks the task
+/// FIFO in the gate's queue with a `ResourceSlot` protocol wait, resumed by the
+/// owner's later `release` (or failed by `close`). Mirrors `install_channel_wait`'s
+/// immediate-vs-parked split.
+fn install_resource_slot_wait(
+    state: &mut RuntimeState,
+    task_id: TaskId,
+    key: super::WaitKey,
+    gate: ResourceGateId,
+    owner: ReturnOwner,
+    frame: ContinuationFrame,
+) -> Result<(), ProtocolInstallError> {
+    match state.resource_gates.acquire(gate, key, task_id) {
+        Ok(AcquireResult::Acquired) => {
+            state.pending.push_back(PendingStage::ApplyRuntimeResponse(
+                task_id,
+                owner,
+                frame,
+                Ok(RuntimeResponse::Value(sema_core::Value::nil())),
+            ));
+            Ok(())
+        }
+        Ok(AcquireResult::Parked) => {
+            if let Err(error) = state
+                .tasks
+                .get_mut(&task_id)
+                .expect("protocol task exists")
+                .record
+                .wait(key)
+            {
+                let _ = state.resource_gates.cancel_wait(gate, key);
+                return Err(Box::new((
+                    owner,
+                    frame,
+                    sema_core::SemaError::eval(format!(
+                        "resource gate wait transition failed: {error:?}"
+                    )),
+                )));
+            }
+            state.protocol_waits.insert(
+                key,
+                ProtocolWait {
+                    task: task_id,
+                    kind: ProtocolWaitKind::ResourceSlot { gate },
+                    owner,
+                    continuation: frame,
+                },
+            );
+            Ok(())
+        }
+        Err(error) => Err(Box::new((owner, frame, registry_error(error)))),
+    }
+}
+
 fn install_channel_wait(
     state: &mut RuntimeState,
     task_id: TaskId,
@@ -3938,6 +4126,7 @@ enum PendingStage {
     PromiseWakes(VecDeque<(super::WaitKey, TaskId)>),
     ChannelClose(ChannelClose),
     ChannelWake(ChannelWake),
+    ResourceGateWake(ResourceGateWake),
 }
 
 enum ReturnOwner {
@@ -4001,6 +4190,7 @@ impl Trace for PendingStage {
             Self::PromiseWakes(_) => true,
             Self::ChannelClose(close) => close.trace(sink),
             Self::ChannelWake(wake) => wake.trace(sink),
+            Self::ResourceGateWake(wake) => wake.trace(sink),
         }
     }
 }

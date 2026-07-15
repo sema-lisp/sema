@@ -210,6 +210,18 @@ impl ChannelRegistry {
         }
         Ok(None)
     }
+    /// Whether a waiter with `key` is still genuinely queued on this channel
+    /// (as a sender or receiver). Returns `false` once a rendezvous has matched
+    /// and popped it — even while its `ChannelWake` is still in flight. Used by
+    /// `cancel_waiting` to avoid cancel-dropping a receiver whose committed value
+    /// is already on the way (UCR-3): a matched waiter is let through so its wake
+    /// delivers and settlement observes the cancellation.
+    pub fn has_wait(&self, id: ChannelId, key: WaitKey) -> bool {
+        self.channels.get(&id).is_some_and(|channel| {
+            channel.senders.iter().any(|w| w.key == key)
+                || channel.receivers.iter().any(|w| w.key == key)
+        })
+    }
     pub fn take_wake(&mut self, key: WaitKey) -> Option<ChannelWake> {
         let index = self.wakes.iter().position(|wake| wake.key == key)?;
         self.wakes.remove(index)

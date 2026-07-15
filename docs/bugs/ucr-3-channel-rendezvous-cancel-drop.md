@@ -1,9 +1,14 @@
 # UCR-3: cancelling a rendezvous-matched channel receiver can drop the committed value
 
-**Status:** OPEN — confirmed by static analysis (two independent review agents),
-**not yet reproduced dynamically**. A detection diagnostic is in place; a
-deterministic reproduction is deferred to the seeded-interleaving / model-checking
-harness (unified-cooperative-runtime Task 09).
+**Status:** GUARD LANDED (P1, 2026-07-16) — the recommended selection guard is
+now in `cancel_waiting`; a deterministic reproduction remains deferred to the
+seeded-interleaving / model-checking harness (unified-cooperative-runtime Task 09).
+`ChannelRegistry::has_wait(id, key)` now lets `cancel_waiting` skip a
+`ProtocolWaitKind::Channel` waiter that is no longer queued in the channel
+(already rendezvous-matched): its in-flight `ChannelWake` delivers the committed
+value and UCR-1's settlement guard makes the receiver settle `Cancelled`, so the
+value is never cancel-dropped. The `dropped_protocol_completions` diagnostic stays
+in place as the regression oracle for the future seeded-interleaving test.
 **Area:** `sema-vm` runtime — `state.rs` `cancel_waiting` / `finish_protocol_wait`
 vs `channel.rs` rendezvous. Found by the Task-03/04 verification sweep, 2026-07-14.
 **Severity:** medium (internal lost-completion; no observed Sema-level effect at the

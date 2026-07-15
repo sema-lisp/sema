@@ -5,8 +5,8 @@ use crate::cycle::GcEdge;
 use crate::{SemaError, Value};
 
 use super::{
-    CancelReason, ChannelId, PreparedExternalOperation, PromiseId, TaskContext, TaskOutcome,
-    TaskSettlement, Trace,
+    CancelReason, ChannelId, PreparedExternalOperation, PromiseId, ResourceGateId, TaskContext,
+    TaskOutcome, TaskSettlement, Trace,
 };
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -77,6 +77,29 @@ pub enum RuntimeRequest {
     OriginBarrier {
         continuation: Box<dyn NativeContinuation>,
     },
+    /// Allocate a fresh [`ResourceGateId`] — a per-handle mutual-exclusion slot
+    /// with a FIFO waiter queue. A checkout-style stdlib module (sqlite, kv,
+    /// proc, pty, serial, stream) creates one gate per resource handle when the
+    /// handle is opened, then acquires it via [`WaitKind::ResourceSlot`] before
+    /// each offloaded op and releases it via [`RuntimeRequest::ReleaseResourceGate`]
+    /// when the op completes. The continuation receives [`RuntimeResponse::ResourceGate`].
+    CreateResourceGate {
+        continuation: Box<dyn NativeContinuation>,
+    },
+    /// Release ownership of a previously-acquired resource gate, waking the FIFO
+    /// head waiter (if any) so exactly one queued acquirer proceeds. The
+    /// continuation resumes with `RuntimeResponse::Value(nil)`.
+    ReleaseResourceGate {
+        gate: ResourceGateId,
+        continuation: Box<dyn NativeContinuation>,
+    },
+    /// Close a resource gate: fail every parked waiter with a structured
+    /// "gate closed" error and drop the gate record. Used when a handle is
+    /// closed/tombstoned so queued acquirers fail fast rather than hang.
+    CloseResourceGate {
+        gate: ResourceGateId,
+        continuation: Box<dyn NativeContinuation>,
+    },
 }
 
 pub enum ChannelOperation {
@@ -106,6 +129,7 @@ pub struct PromiseSetWait {
 pub enum RuntimeResponse {
     Promise(PromiseId),
     Channel(ChannelId),
+    ResourceGate(ResourceGateId),
     Value(Value),
     Cancelled(bool),
     Settlement(Option<Rc<TaskSettlement>>),
@@ -144,6 +168,10 @@ pub enum WaitKind {
     PromiseSet(PromiseSetWait),
     Channel(ChannelWait),
     External(Box<PreparedExternalOperation>),
+    /// Park until this task owns `gate`'s exclusive slot. Resumes with
+    /// `RuntimeResponse::Value(nil)` once the slot is granted (immediately if
+    /// the gate is free, otherwise FIFO-behind any earlier acquirers).
+    ResourceSlot(ResourceGateId),
 }
 
 pub enum ChannelWait {
@@ -211,7 +239,10 @@ impl Trace for RuntimeRequest {
             | Self::CreateChannel { continuation, .. }
             | Self::ChannelOp { continuation, .. }
             | Self::InspectPromise { continuation, .. }
-            | Self::PromiseSetWait { continuation, .. } => continuation.trace(sink),
+            | Self::PromiseSetWait { continuation, .. }
+            | Self::CreateResourceGate { continuation }
+            | Self::ReleaseResourceGate { continuation, .. }
+            | Self::CloseResourceGate { continuation, .. } => continuation.trace(sink),
             Self::OriginBarrier { continuation } => continuation.trace(sink),
         }
     }
@@ -251,7 +282,7 @@ impl Trace for NativeSuspend {
 impl Trace for WaitKind {
     fn trace(&self, sink: &mut dyn FnMut(GcEdge<'_>)) -> bool {
         match self {
-            Self::Timer(_) | Self::Promise(_) | Self::PromiseSet(_) => true,
+            Self::Timer(_) | Self::Promise(_) | Self::PromiseSet(_) | Self::ResourceSlot(_) => true,
             Self::Channel(wait) => wait.trace(sink),
             Self::External(operation) => operation.trace(sink),
         }

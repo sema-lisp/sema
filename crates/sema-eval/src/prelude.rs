@@ -902,7 +902,7 @@ pub const PRELUDE: &str = r#"
           (__agent-finish __h)))))
 
 (define (agent/run __agent __input . __rest)
-  (if (__async-context?)
+  (if (or (__async-context?) (__runtime-quantum?))
       (let ((__h (apply __agent-begin __agent __input __rest)))
         (try (__agent-drive __h)
              (catch __e (begin (__agent-finish __h) (throw __e)))))
@@ -935,7 +935,7 @@ pub const PRELUDE: &str = r#"
 ;; context (`do_complete_async_yield`, WP-LLM-SIMPLE). `__chat-begin` never
 ;; yields, so `apply`ing it above is fine regardless of arg count.
 (define (llm/chat . __chat-args)
-  (if (__async-context?)
+  (if (or (__async-context?) (__runtime-quantum?))
       (let ((__h (apply __chat-begin __chat-args)))
         (if (nil? __h)
             (__chat-call-blocking __chat-args)

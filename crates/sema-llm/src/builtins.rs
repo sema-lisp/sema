@@ -3016,6 +3016,16 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
     register_fn_ctx(env, "__async-context?", |_ctx, _args| {
         Ok(Value::bool(sema_core::in_async_context()))
     });
+    // True while a unified-runtime VM quantum is executing. The prelude
+    // `agent/run` / `llm/chat` dispatchers also select the Sema-driven
+    // `__agent-drive` loop in this case, so the tool round (`__agent-exec-tools`)
+    // runs each tool handler COOPERATIVELY via `NativeOutcome::Call` — a handler
+    // that suspends (e.g. `mcp/call`'s runtime external wait) parks/resumes on the
+    // active task instead of being forced synchronous by the legacy re-entry
+    // bridge. See Task 04 (`docs/plans/2026-07-13-unified-cooperative-runtime.md`).
+    register_fn_ctx(env, "__runtime-quantum?", |_ctx, _args| {
+        Ok(Value::bool(sema_core::in_runtime_quantum()))
+    });
     register_fn_ctx(env, "__agent-begin", |_ctx, args| agent_begin(args));
     register_fn_ctx(env, "__agent-step", |ctx, args| {
         let token = agent_token_arg(args, "__agent-step")?;
@@ -8621,6 +8631,19 @@ fn agent_exec_tools(ctx: &EvalContext, token: u64) -> Result<Value, SemaError> {
             Ok::<_, SemaError>((pending, st.tools.clone(), st.on_tool_call.clone()))
         })?;
 
+    // Cooperative runtime path (Task 04): a tool handler may SUSPEND (e.g.
+    // `mcp/call`'s runtime external wait, or an `async/await` inside the handler).
+    // The legacy re-entry bridge would force it synchronous; instead, drive each
+    // handler as a `NativeOutcome::Call` so it runs as real cooperative work on the
+    // active task and parks/resumes through the scheduler. The multi-round loop
+    // above (`__agent-drive`) already runs turn-by-turn in bytecode; this makes the
+    // per-turn tool round cooperative too. The `:on-tool-call` event callback and
+    // per-tool OTel spans are not yet emitted on this path (deferred — see the
+    // task-06 progress notes); tool-result correlation and error recovery are.
+    if sema_core::in_runtime_quantum() {
+        return exec_tools_cooperative_start(token, tools, pending);
+    }
+
     for tc in &pending {
         let args_value = sema_core::json_to_value(&tc.arguments);
 
@@ -8669,35 +8692,159 @@ fn agent_exec_tools(ctx: &EvalContext, token: u64) -> Result<Value, SemaError> {
         }
 
         // Re-borrow to push the correlated result + update the error counter.
-        AGENT_RUNS.with(|r| {
-            let mut slab = r.borrow_mut();
-            let st = match slab.get_mut(&token) {
-                Some(st) => st,
-                None => return,
-            };
-            st.messages.push(ChatMessage::tool_result(
-                tc.id.clone(),
-                tc.name.clone(),
-                result,
-            ));
-            if is_error {
-                st.consecutive_errors += 1;
-                if st.consecutive_errors >= MAX_CONSECUTIVE_TOOL_ERRORS {
-                    // Stop the loop; `__agent-finish` raises the abort so the caller
-                    // sees the same failure the blocking path returns via `?`.
-                    st.done = true;
-                    st.abort_error = Some(format!(
-                        "aborting agent run after {} consecutive tool errors",
-                        st.consecutive_errors
-                    ));
-                }
-            } else {
-                st.consecutive_errors = 0;
-            }
-        });
+        record_tool_result(token, tc, result, is_error);
     }
 
     Ok(Value::nil())
+}
+
+/// Push a correlated `tool_result` message for `tc` into the agent slab and
+/// update the consecutive-error counter (aborting the loop past the cap, so
+/// `__agent-finish` raises the same failure the blocking path returns). Shared by
+/// the synchronous tool loop and the cooperative runtime continuation so both keep
+/// identical loop-state semantics.
+fn record_tool_result(token: u64, tc: &ToolCall, result: String, is_error: bool) {
+    AGENT_RUNS.with(|r| {
+        let mut slab = r.borrow_mut();
+        let st = match slab.get_mut(&token) {
+            Some(st) => st,
+            None => return,
+        };
+        st.messages.push(ChatMessage::tool_result(
+            tc.id.clone(),
+            tc.name.clone(),
+            result,
+        ));
+        if is_error {
+            st.consecutive_errors += 1;
+            if st.consecutive_errors >= MAX_CONSECUTIVE_TOOL_ERRORS {
+                st.done = true;
+                st.abort_error = Some(format!(
+                    "aborting agent run after {} consecutive tool errors",
+                    st.consecutive_errors
+                ));
+            }
+        } else {
+            st.consecutive_errors = 0;
+        }
+    });
+}
+
+/// Cooperative tool-round state machine (Task 04). Drives each pending tool call's
+/// handler as a `NativeOutcome::Call` so a handler that suspends parks/resumes on
+/// the active runtime task; records each correlated result via
+/// [`record_tool_result`]. Resolution/validation failures and handler errors are
+/// fed back as tool-error results (never escaping the loop), mirroring the
+/// synchronous path. `Return(nil)` once every pending call is recorded.
+struct ExecToolsContinuation {
+    token: u64,
+    tools: Vec<Value>,
+    /// Tool calls not yet dispatched (front = next).
+    remaining: std::collections::VecDeque<ToolCall>,
+    /// The tool call whose handler result the next `resume` carries.
+    current: ToolCall,
+}
+
+impl sema_core::runtime::Trace for ExecToolsContinuation {
+    fn trace(&self, sink: &mut dyn FnMut(sema_core::cycle::GcEdge<'_>)) -> bool {
+        for tool in &self.tools {
+            sink(sema_core::cycle::GcEdge::Value(tool));
+        }
+        true
+    }
+}
+
+impl ExecToolsContinuation {
+    /// Advance through `remaining`, recording any resolution/validation failures
+    /// inline, until a handler call is needed (returns that `Call`) or every
+    /// pending call is recorded (returns `Return(nil)`).
+    fn advance(mut self: Box<Self>) -> sema_core::runtime::NativeResult {
+        use sema_core::runtime::{NativeCall, NativeOutcome};
+        while let Some(tc) = self.remaining.pop_front() {
+            match prepare_tool_call(&self.tools, &tc.name, &tc.arguments) {
+                Ok((handler, args)) => {
+                    self.current = tc;
+                    return Ok(NativeOutcome::Call(NativeCall {
+                        callable: handler,
+                        args,
+                        continuation: self,
+                    }));
+                }
+                Err(e) => {
+                    // Resolution / validation failure: feed it back as a tool error
+                    // (identical text to the synchronous path) and keep going.
+                    record_tool_result(self.token, &tc, format!("Error: {e}"), true);
+                }
+            }
+        }
+        Ok(NativeOutcome::Return(Value::nil()))
+    }
+}
+
+impl sema_core::runtime::NativeContinuation for ExecToolsContinuation {
+    fn resume(
+        self: Box<Self>,
+        _context: &mut sema_core::runtime::NativeCallContext<'_>,
+        input: sema_core::runtime::ResumeInput,
+    ) -> sema_core::runtime::NativeResult {
+        use sema_core::runtime::ResumeInput;
+        let (result, is_error) = match input {
+            ResumeInput::Returned(value) => (stringify_tool_result(value), false),
+            // A handler error is fed BACK to the model as a tool result (the loop
+            // recovers), never propagated — matching the synchronous path's
+            // `Err(e) => (format!("Error: {e}"), true)`.
+            ResumeInput::Failed(error) => (format!("Error: {error}"), true),
+            // Task cancellation aborts the whole run: propagate so the runtime
+            // settles the parked parent task Cancelled.
+            ResumeInput::Cancelled(reason) => {
+                return Err(SemaError::eval(format!(
+                    "agent tool handler was cancelled ({reason:?})"
+                )))
+            }
+            ResumeInput::Runtime(_) => {
+                return Err(SemaError::eval(
+                    "agent tool continuation received an unexpected runtime response",
+                ))
+            }
+        };
+        let current = self.current.clone();
+        record_tool_result(self.token, &current, result, is_error);
+        self.advance()
+    }
+}
+
+/// Begin the cooperative tool round: build the [`ExecToolsContinuation`] and
+/// stash its first `NativeOutcome` on the pending-outcome TLS, raising the
+/// `NativeYield` the VM surfaces as an `AsyncYield` (mirrors `map`'s cooperative
+/// entry). Returns the nil placeholder the runtime overwrites once the round
+/// completes. When no handler call is needed (e.g. every pending call fails to
+/// resolve), the results are recorded synchronously and nil is returned directly.
+fn exec_tools_cooperative_start(
+    token: u64,
+    tools: Vec<Value>,
+    pending: Vec<ToolCall>,
+) -> Result<Value, SemaError> {
+    use sema_core::runtime::NativeOutcome;
+    let remaining: std::collections::VecDeque<ToolCall> = pending.into();
+    // `current` is a placeholder overwritten by `advance` before any resume reads
+    // it; if `remaining` is empty there is nothing to run.
+    let Some(first) = remaining.front().cloned() else {
+        return Ok(Value::nil());
+    };
+    let continuation = Box::new(ExecToolsContinuation {
+        token,
+        tools,
+        remaining,
+        current: first,
+    });
+    match continuation.advance()? {
+        NativeOutcome::Return(value) => Ok(value),
+        outcome => {
+            sema_core::set_pending_native_outcome(outcome);
+            sema_core::set_yield_signal(sema_core::YieldReason::NativeYield);
+            Ok(Value::nil())
+        }
+    }
 }
 
 /// `__agent-finish(token) → result`. Idempotent: appends the final assistant turn,
@@ -9621,17 +9768,50 @@ fn execute_tool_call(
     let sema_args = json_args_to_sema(&tool_def.parameters, arguments, &tool_def.handler);
     let result = sema_core::call_callback(ctx, &tool_def.handler, &sema_args)?;
 
-    // Convert result to string for sending back to LLM
+    Ok(stringify_tool_result(result))
+}
+
+/// Convert a tool handler's return value to the string sent back to the model.
+/// Strings pass through; maps/sequences are JSON-encoded; everything else uses
+/// its display form. Shared by the synchronous `execute_tool_call` and the
+/// cooperative runtime tool loop so both stringify identically.
+fn stringify_tool_result(result: Value) -> String {
     if let Some(s) = result.as_str() {
-        return Ok(s.to_string());
+        return s.to_string();
     }
     if result.as_map_rc().is_some() || result.as_seq().is_some() {
-        // JSON-encode complex results
         let json = sema_core::value_to_json_lossy(&result);
-        Ok(serde_json::to_string(&json).unwrap_or_else(|_| result.to_string()))
+        serde_json::to_string(&json).unwrap_or_else(|_| result.to_string())
     } else {
-        Ok(result.to_string())
+        result.to_string()
     }
+}
+
+/// The synchronous prefix of `execute_tool_call`: resolve the tool, validate the
+/// model-supplied arguments, and produce the `(handler, args)` to invoke — WITHOUT
+/// running the handler. The cooperative runtime tool loop uses this so it can hand
+/// the handler call to the scheduler (as a `NativeOutcome::Call`) instead of
+/// re-entering the VM synchronously; a resolution/validation failure returns the
+/// same `Err` the synchronous path raises (fed back to the model as a tool error).
+fn prepare_tool_call(
+    tools: &[Value],
+    name: &str,
+    arguments: &serde_json::Value,
+) -> Result<(Value, Vec<Value>), SemaError> {
+    let tool_def = tools
+        .iter()
+        .find_map(|t| t.as_tool_def_rc().filter(|td| td.name == name))
+        .ok_or_else(|| SemaError::Llm(format!("tool not found: {name}")))?;
+
+    let args_map = sema_core::json_to_value(arguments);
+    if let Err(msg) = validate_extraction(&args_map, &tool_def.parameters) {
+        return Err(SemaError::Llm(format!(
+            "invalid arguments for tool '{name}': {msg}"
+        )));
+    }
+
+    let sema_args = json_args_to_sema(&tool_def.parameters, arguments, &tool_def.handler);
+    Ok((tool_def.handler.clone(), sema_args))
 }
 
 /// Convert JSON arguments into a list of Sema values based on handler declaration order.

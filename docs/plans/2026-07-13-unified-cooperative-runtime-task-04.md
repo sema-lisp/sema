@@ -680,6 +680,70 @@ match the requested bound.
 > runtime quantum through `call_value`. Retiring it requires migrating the
 > remaining callback sites (or the `call_value` re-entry itself) to the
 > `NativeOutcome::Call` ABI.
+>
+> **Follow-up (2026-07-15, agent-loop slice — the LAST eval-flip blocker for
+> `agent/run`):** the native `agent/run` / `llm/chat` tool loop now runs its
+> tool-handler callbacks COOPERATIVELY under a runtime quantum, so a handler that
+> suspends (e.g. `mcp/call`'s runtime external wait, or an `async/await` inside the
+> handler) parks/resumes on the active task instead of being forced synchronous by
+> the legacy re-entry bridge. Mechanism (mirrors the HOF slice, extended to a
+> MULTI-STEP state machine):
+> - **Dispatch:** the prelude `agent/run` and `llm/chat` dispatchers now select the
+>   Sema-driven `__agent-drive` loop when `(or (__async-context?)
+>   (__runtime-quantum?))` — a new `__runtime-quantum?` native
+>   (`sema_core::in_runtime_quantum()`). Under the runtime the multi-turn loop thus
+>   runs turn-by-turn in bytecode (already cooperative), not the synchronous
+>   `__agent-run-blocking` `run_tool_loop`.
+> - **Cooperative tool round:** `agent_exec_tools` (`crates/sema-llm/src/builtins.rs`)
+>   gained an `in_runtime_quantum()` branch → `exec_tools_cooperative_start` +
+>   `ExecToolsContinuation`. Each pending tool call is dispatched as a
+>   `NativeOutcome::Call{handler, args, continuation}` (via the `map`-style
+>   pending-outcome + `NativeYield` seam); the continuation stringifies the handler
+>   result (`stringify_tool_result`), feeds a handler ERROR back as a correlated
+>   tool-result message (never escaping — mirrors the sync `Err(e) =>
+>   ("Error: {e}", true)` path), updates the slab / consecutive-error abort via the
+>   extracted `record_tool_result`, then Calls the next tool or `Return(nil)`.
+>   Resolution/validation failures (`prepare_tool_call`) are recorded inline with
+>   the same text as the sync path. The synchronous `run_tool_loop` and
+>   `__agent-run-blocking` legacy paths are UNCHANGED (non-runtime evaluator).
+> - **Gate:** `crates/sema/tests/agent_runtime_test.rs` (2 tests, un-ignored,
+>   green) drive a full multi-turn `agent/run` through `eval_str_via_runtime` with
+>   a FakeProvider and a tool whose handler suspends (`(await (async/spawn …))`):
+>   (a) the loop completes and returns the final answer matching the `eval_str`
+>   oracle, with round-2 carrying the suspended handler's value in a correlated
+>   tool message; (b) a suspending handler that raises is fed back and the loop
+>   recovers. Confirmed empirically (probe) that the cooperative branch — not the
+>   bridge — services the handler.
+>
+> **Deferred on this path (documented, not yet cooperative):**
+> - The `:on-tool-call` event callback and per-tool OTel spans are NOT emitted on
+>   the runtime cooperative tool round (only tool-result correlation + error
+>   recovery are). No current test exercises them under the runtime.
+> - Provider `complete` under the runtime uses the synchronous `do_complete`
+>   (`__agent-step` sees `in_async_context() == false`), so a REAL http provider
+>   blocks the VM thread rather than offloading via `AwaitIo` — fine for the
+>   keyless FakeProvider gate; real-provider offload under the runtime is a later
+>   slice (the runtime does not yet service an `AwaitIo` VM yield).
+> - Streaming agent rounds (`:on-text` / `__stream-drive`) and `llm/map` are not
+>   yet cooperative under the runtime.
+>
+> **Remaining native-callback-loop sites (ordered) toward retiring
+> `suspend_runtime_quantum` / the primary eval flip:**
+> 1. `:on-tool-call` + OTel spans in the cooperative tool round (small — add two
+>    phases to `ExecToolsContinuation`).
+> 2. Provider `complete` offload under the runtime (`__agent-step` → an `AwaitIo`
+>    the runtime services, or an external-op `NativeOutcome::Suspend`).
+> 3. The non-migrated HOF callbacks (multi-list `map`, `sort` comparator, `foldr`,
+>    the predicate/search tail — see the HOF slice note above).
+> 4. Generic `call_value` user-closure re-entry from a runtime quantum (the
+>    catch-all the bridge still carries).
+> 5. Streaming (`__stream-drive`) and `llm/map`.
+>
+> With the agent tool loop cooperative, the `agent/run`-with-mcp-tools case (the
+> named flip blocker) is unblocked in principle: under the runtime the tool
+> handler's `mcp/call` runs as a genuine runtime external wait rather than the
+> bridge's synchronous `block_on`. `mcp_builtin_test` stays green on legacy (6/0)
+> because the legacy `eval_str` path is untouched.
 
 > **Follow-up (2026-07-15, cooperative-HOF slice — open-upvalue escape fix):** the
 > `NativeOutcome::Call` migration above surfaced a latent correctness bug in the

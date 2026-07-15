@@ -3,8 +3,7 @@
 
 ;; Expressions are tagged vectors: [:op args...]
 (define (eval-expr expr)
-  (match
-    expr
+  (match expr
     ([:add a b] (+ (eval-expr a) (eval-expr b)))
     ([:sub a b] (- (eval-expr a) (eval-expr b)))
     ([:mul a b] (* (eval-expr a) (eval-expr b)))
@@ -17,8 +16,7 @@
 
 ;; Pretty-print an expression tree
 (define (show-expr expr)
-  (match
-    expr
+  (match expr
     ([:add a b] f"(${(show-expr a)} + ${(show-expr b)})")
     ([:sub a b] f"(${(show-expr a)} - ${(show-expr b)})")
     ([:mul a b] f"(${(show-expr a)} × ${(show-expr b)})")
@@ -42,8 +40,7 @@
 
 ;; Symbolic simplifier using match
 (define (simplify expr)
-  (match
-    expr
+  (match expr
     ([:add 0 x] (simplify x))
     ([:add x 0] (simplify x))
     ([:mul 0 _] 0)

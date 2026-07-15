@@ -6,8 +6,9 @@
 (println "=== Dad Joke Machine 🤣 ===\n")
 
 (define (get-joke)
-  (let ((resp (http/get "https://icanhazdadjoke.com/"
-                {:headers {:Accept "application/json"}})))
+  (let ((resp
+          (http/get "https://icanhazdadjoke.com/"
+            {:headers {:Accept "application/json"}})))
     (if (= (:status resp) 200)
       (get (json/decode (:body resp)) :joke)
       "(couldn't fetch a joke)")))

@@ -1,4 +1,4 @@
-(def should-error (state false))
+(def should-error (state #f))
 
 (define (maybe-error-view)
   (if @should-error

@@ -9,7 +9,7 @@
 ;; round-robin interleaving.
 
 (define (slow-square n)
-  (async/sleep 50)        ; pretend this is real work
+  (async/sleep 50) ; pretend this is real work
   (* n n))
 
 (define p1 (async (slow-square 7)))
@@ -21,8 +21,9 @@
 (println "sum:    " (+ (await p1) (await p2) (await p3)))
 
 ;; async/all is a convenient combinator for "run all, collect results"
-(define winners (async/all
-                  (list (async (slow-square 10))
-                        (async (slow-square 11))
-                        (async (slow-square 12)))))
+(define winners
+  (async/all
+    (list (async (slow-square 10))
+      (async (slow-square 11))
+      (async (slow-square 12)))))
 (println "all:    " winners)

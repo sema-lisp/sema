@@ -1,12 +1,11 @@
 ;; Quicksort
 (define (qsort lst)
   (if (or (null? lst) (null? (cdr lst)))
-      lst
-      (let ((pivot (car lst))
-            (rest  (cdr lst)))
-        (append
-          (qsort (filter (fn (x) (< x pivot)) rest))
-          (list pivot)
-          (qsort (filter (fn (x) (>= x pivot)) rest))))))
+    lst
+    (let ((pivot (car lst))
+          (rest (cdr lst)))
+      (append (qsort (filter (fn (x) (< x pivot)) rest))
+        (list pivot)
+        (qsort (filter (fn (x) (>= x pivot)) rest))))))
 
 (qsort '(38 27 43 3 9 82 10 1))

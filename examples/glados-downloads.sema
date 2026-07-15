@@ -8,11 +8,11 @@
 ;; Requires: ANTHROPIC_API_KEY or OPENAI_API_KEY environment variable
 
 ;; === Configuration ===
-(define input-dir         "examples/fixtures/glados-downloads/input")
-(define output-dir        "examples/fixtures/glados-downloads/output")
-(define state-file        "/tmp/glados-sema-processed.json")
-(define target-whitelist  '("Liseth Solutions" "Liseth Solutions AS" "Liseth"))
-(define target-label      "Liseth Solutions")
+(define input-dir "examples/fixtures/glados-downloads/input")
+(define output-dir "examples/fixtures/glados-downloads/output")
+(define state-file "/tmp/glados-sema-processed.json")
+(define target-whitelist '("Liseth Solutions" "Liseth Solutions AS" "Liseth"))
+(define target-label "Liseth Solutions")
 
 ;; === GLaDOS personality ===
 (define (glados msg)

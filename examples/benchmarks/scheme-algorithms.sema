@@ -44,10 +44,10 @@
 
 (define (merge xs ys)
   (cond
-    ((null? xs)              ys)
-    ((null? ys)              xs)
-    ((<= (car xs) (car ys))  (cons (car xs) (merge (cdr xs) ys)))
-    (else                    (cons (car ys) (merge xs (cdr ys))))))
+    ((null? xs) ys)
+    ((null? ys) xs)
+    ((<= (car xs) (car ys)) (cons (car xs) (merge (cdr xs) ys)))
+    (else (cons (car ys) (merge xs (cdr ys))))))
 
 (define (split-at lst n)
   (let loop ((i 0) (rest lst) (acc '()))
@@ -58,13 +58,13 @@
 (define (mergesort lst)
   (if (or (null? lst) (null? (cdr lst)))
     lst
-    (let* ((halves  (split-at lst (math/quotient (length lst) 2)))
-           (left    (car halves))
-           (right   (cadr halves)))
+    (let* ((halves (split-at lst (math/quotient (length lst) 2)))
+           (left (car halves))
+           (right (cadr halves)))
       (merge (mergesort left) (mergesort right)))))
 
-(define unsorted       '(38 27 43 3 9 82 10 1 57 24))
-(define sorted-result  (mergesort unsorted))
+(define unsorted '(38 27 43 3 9 82 10 1 57 24))
+(define sorted-result (mergesort unsorted))
 (println (format "  Input:  ~a" unsorted))
 (println (format "  Sorted: ~a" sorted-result))
 
@@ -115,9 +115,9 @@
 
 (define (ackermann m n)
   (cond
-    ((= m 0)  (+ n 1))
-    ((= n 0)  (ackermann (- m 1) 1))
-    (else     (ackermann (- m 1) (ackermann m (- n 1))))))
+    ((= m 0) (+ n 1))
+    ((= n 0) (ackermann (- m 1) 1))
+    (else (ackermann (- m 1) (ackermann m (- n 1))))))
 
 (println "  Ackermann values:")
 (for-each
@@ -166,18 +166,18 @@
 (println "\n=== 6. Church Numerals ===")
 
 ;; Church encoding: a number n is (lambda (f) (lambda (x) (f (f ... (f x)))))
-(define church-zero       (fn (f) (fn (x) x)))
-(define (church-succ n)   (fn (f) (fn (x) (f ((n f) x)))))
-(define (church-add a b)  (fn (f) (fn (x) ((a f) ((b f) x)))))
-(define (church-mul a b)  (fn (f) (a (b f))))
-(define (church->int n)   ((n (fn (x) (+ x 1))) 0))
+(define church-zero (fn (f) (fn (x) x)))
+(define (church-succ n) (fn (f) (fn (x) (f ((n f) x)))))
+(define (church-add a b) (fn (f) (fn (x) ((a f) ((b f) x)))))
+(define (church-mul a b) (fn (f) (a (b f))))
+(define (church->int n) ((n (fn (x) (+ x 1))) 0))
 
-(define one    (church-succ church-zero))
-(define two    (church-succ one))
-(define three  (church-succ two))
-(define five   (church-add two three))
-(define six    (church-mul two three))
-(define ten    (church-add five five))
+(define one (church-succ church-zero))
+(define two (church-succ one))
+(define three (church-succ two))
+(define five (church-add two three))
+(define six (church-mul two three))
+(define ten (church-add five five))
 
 (println (format "  zero  = ~a" (church->int church-zero)))
 (println (format "  one   = ~a" (church->int one)))
@@ -188,10 +188,10 @@
 (println (format "  5 + 5 = ~a" (church->int ten)))
 
 ;; Church booleans
-(define church-true        (fn (a b) a))
-(define church-false       (fn (a b) b))
-(define (church-if c t f)  (c t f))
-(define (church-zero? n)   ((n (fn (_) church-false)) church-true))
+(define church-true (fn (a b) a))
+(define church-false (fn (a b) b))
+(define (church-if c t f) (c t f))
+(define (church-zero? n) ((n (fn (_) church-false)) church-true))
 
 (println
   (format "  zero? zero  = ~a"
@@ -207,10 +207,10 @@
 ;; Trees as (value left right), leaves as (value () ())
 (define (make-leaf v) (list v '() '()))
 (define (make-node v left right) (list v left right))
-(define (tree-value t)  (car t))
-(define (tree-left t)   (cadr t))
-(define (tree-right t)  (caddr t))
-(define (tree-leaf? t)  (and (null? (tree-left t)) (null? (tree-right t))))
+(define (tree-value t) (car t))
+(define (tree-left t) (cadr t))
+(define (tree-right t) (caddr t))
+(define (tree-leaf? t) (and (null? (tree-left t)) (null? (tree-right t))))
 
 ;; Insert into BST
 (define (bst-insert tree val)
@@ -257,9 +257,9 @@
         (tree-depth (tree-right tree))))))
 
 ;; Build BST from list
-(define values       '(5 3 7 1 4 6 8 2 9))
-(define bst          (foldl (fn (tree val) (bst-insert tree val)) '() values))
-(define sorted-vals  (tree-inorder bst))
+(define values '(5 3 7 1 4 6 8 2 9))
+(define bst (foldl (fn (tree val) (bst-insert tree val)) '() values))
+(define sorted-vals (tree-inorder bst))
 
 (println (format "  Input:    ~a" values))
 (println (format "  In-order: ~a" sorted-vals))
@@ -328,8 +328,8 @@
 (define (alist-remove alist key)
   (filter (fn (pair) (not (equal? (car pair) key))) alist))
 
-(define (alist-keys alist)    (map car alist))
-(define (alist-values alist)  (map cadr alist))
+(define (alist-keys alist) (map car alist))
+(define (alist-values alist) (map cadr alist))
 
 (define (alist-merge a b)
   (foldl (fn (acc pair) (alist-set acc (car pair) (cadr pair))) a b))
@@ -355,8 +355,8 @@
 (println (format "  After removing city: ~a" my-alist))
 
 ;; Merge
-(define extra   '((email "alice@example.com") (country "Norway")))
-(define merged  (alist-merge my-alist extra))
+(define extra '((email "alice@example.com") (country "Norway")))
+(define merged (alist-merge my-alist extra))
 (println (format "  Merged: ~a" merged))
 
 ;; assq (identity comparison for symbols)
@@ -368,10 +368,10 @@
 (println "\n=== 10. Lazy Streams ===")
 
 ;; A stream is (value promise-of-rest) — a two-element list
-(define stream-nil        '())
-(define (stream-null? s)  (null? s))
-(define (stream-car s)    (car s))
-(define (stream-cdr s)    (force (cadr s)))
+(define stream-nil '())
+(define (stream-null? s) (null? s))
+(define (stream-car s) (car s))
+(define (stream-cdr s) (force (cadr s)))
 
 (define (stream-cons head tail-thunk)
   (list head (delay (tail-thunk))))

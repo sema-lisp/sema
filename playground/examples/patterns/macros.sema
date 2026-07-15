@@ -8,7 +8,7 @@
 ;; A "when-let" macro
 (defmacro when-let (binding . body)
   `(let ((,(car binding) ,(cadr binding)))
-     (when ,(car binding) ,@body)))
+    (when ,(car binding) ,@body)))
 
 (when-let (x (get {:name "Sema"} :name))
   (println "Found:" x))

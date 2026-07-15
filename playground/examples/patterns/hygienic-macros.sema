@@ -11,28 +11,33 @@
 ;; A new control form: `while`. Impossible as a function — `test` and `body`
 ;; must be re-evaluated each pass, not evaluated once up front.
 (define-syntax while
-  (syntax-rules ()
+  (syntax-rules
+    ()
     ((_ test body ...)
-     (let loop ()
-       (when test
-         body ...
-         (loop))))))
+      (let loop ()
+        (when test
+          body
+          ...
+          (loop))))))
 
 ;; `swap!` introduces a temporary `tmp`. Hygiene guarantees it never captures
 ;; (or is captured by) a `tmp` in your code — try it below.
 (define-syntax swap!
-  (syntax-rules ()
+  (syntax-rules
+    ()
     ((_ a b) (let ((tmp a)) (set! a b) (set! b tmp)))))
 
 ;; Two rules, matched top-to-bottom: `(inc! x)` and `(inc! x n)`.
 (define-syntax inc!
-  (syntax-rules ()
-    ((_ x)   (set! x (+ x 1)))
+  (syntax-rules
+    ()
+    ((_ x) (set! x (+ x 1)))
     ((_ x n) (set! x (+ x n)))))
 
 ;; Ellipsis in action: average of any number of arguments (`x ...` used twice).
 (define-syntax average
-  (syntax-rules ()
+  (syntax-rules
+    ()
     ((_ x ...) (/ (+ x ...) (length (list x ...))))))
 
 ;; ── Use the macros ──
@@ -41,8 +46,8 @@
 (define (fib n)
   (let ((a 0) (b 1) (i 0))
     (while (< i n)
-      (set! b (+ a b))   ; b = a + b
-      (swap! a b)        ; (a, b) = (b, a+b)
+      (set! b (+ a b)) ; b = a + b
+      (swap! a b) ; (a, b) = (b, a+b)
       (inc! i))
     a))
 

@@ -15,39 +15,60 @@
     ((boolean? val) (if val "#t" "#f"))
     ((nil? val) "nil")
     ((list? val)
-     (if (null? val) "()"
-       (let ((flat-repr (flat val)))
-         (if (<= (+ indent (string/length flat-repr)) pp-width)
-           flat-repr (pp-list val indent)))))
+      (if (null? val)
+        "()"
+        (let ((flat-repr (flat val)))
+          (if (<= (+ indent (string/length flat-repr)) pp-width)
+            flat-repr
+            (pp-list val indent)))))
     ((vector? val)
-     (let ((flat-repr (flat val)))
-       (if (<= (+ indent (string/length flat-repr)) pp-width)
-         flat-repr (pp-vector val indent))))
+      (let ((flat-repr (flat val)))
+        (if (<= (+ indent (string/length flat-repr)) pp-width)
+          flat-repr
+          (pp-vector val indent))))
     ((map? val)
-     (let ((flat-repr (flat val)))
-       (if (<= (+ indent (string/length flat-repr)) pp-width)
-         flat-repr (pp-map val indent))))
+      (let ((flat-repr (flat val)))
+        (if (<= (+ indent (string/length flat-repr)) pp-width)
+          flat-repr
+          (pp-map val indent))))
     (else (flat val))))
 
 (define (pp-list lst indent)
   (let* ((head (car lst))
-         (is-special (and (symbol? head)
-                          (let ((s (str head)))
-                            (or (= s "define") (= s "fn") (= s "lambda")
-                                (= s "let") (= s "let*") (= s "if")
-                                (= s "cond") (= s "when") (= s "begin"))))))
+         (is-special
+           (and (symbol? head)
+             (let ((s (str head)))
+               (or (= s "define")
+                 (= s "fn")
+                 (= s "lambda")
+                 (= s "let")
+                 (= s "let*")
+                 (= s "if")
+                 (= s "cond")
+                 (= s "when")
+                 (= s "begin"))))))
     (if is-special (pp-special lst indent) (pp-call lst indent))))
 
 (define (pp-special lst indent)
-  (let* ((head (car lst)) (rest-items (cdr lst))
+  (let* ((head (car lst))
+         (rest-items (cdr lst))
          (child-indent (+ indent pp-indent))
          (pad (string/repeat " " child-indent)))
-    (if (null? rest-items) (str "(" head ")")
-      (let* ((first-arg (car rest-items)) (more (cdr rest-items))
-             (line1 (str "(" head " " (pp first-arg (+ indent (string/length (str head)) 2)))))
-        (if (null? more) (str line1 ")")
-          (string/append line1 "\n"
-            (string/join (map (fn (item) (str pad (pp item child-indent))) more) "\n")
+    (if (null? rest-items)
+      (str "(" head ")")
+      (let* ((first-arg (car rest-items))
+             (more (cdr rest-items))
+             (line1
+               (str "("
+                 head
+                 " "
+                 (pp first-arg (+ indent (string/length (str head)) 2)))))
+        (if (null? more)
+          (str line1 ")")
+          (string/append line1
+            "\n"
+            (string/join (map (fn (item) (str pad (pp item child-indent))) more)
+              "\n")
             ")"))))))
 
 (define (pp-call lst indent)
@@ -57,16 +78,21 @@
     (string/append "(" (string/join items (str "\n" pad)) ")")))
 
 (define (pp-vector vec indent)
-  (let* ((ci (+ indent 1)) (pad (string/repeat " " ci))
+  (let* ((ci (+ indent 1))
+         (pad (string/repeat " " ci))
          (items (map (fn (item) (pp item ci)) (vector->list vec))))
     (string/append "[" (string/join items (str "\n" pad)) "]")))
 
 (define (pp-map m indent)
-  (let* ((ci (+ indent 1)) (pad (string/repeat " " ci))
-         (lines (map (fn (entry)
-           (str (pp (car entry) ci) " "
-                (pp (cadr entry) (+ ci (flat-length (car entry)) 1))))
-           (map/entries m))))
+  (let* ((ci (+ indent 1))
+         (pad (string/repeat " " ci))
+         (lines
+           (map
+             (fn (entry)
+               (str (pp (car entry) ci)
+                 " "
+                 (pp (cadr entry) (+ ci (flat-length (car entry)) 1))))
+             (map/entries m))))
     (string/append "{" (string/join lines (str "\n" pad)) "}")))
 
 (define (pretty-print val) (println (pp val 0)))
@@ -77,19 +103,24 @@
 (pretty-print '(+ 1 2 3))
 
 (println "\n--- Nested expression ---")
-(pretty-print '(define (fibonacci n)
-                 (let loop ((i n) (a 0) (b 1))
-                   (if (= i 0) a (loop (- i 1) b (+ a b))))))
+(pretty-print
+  '(define (fibonacci n)
+    (let loop ((i n) (a 0) (b 1))
+      (if (= i 0) a (loop (- i 1) b (+ a b))))))
 
 (println "\n--- Map ---")
-(pretty-print {:name "Alice" :age 30 :hobbies (list "reading" "hiking" "coding")
-               :address {:street "123 Main St" :city "Wonderland"}})
+(pretty-print
+  {:name "Alice"
+   :age 30
+   :hobbies (list "reading" "hiking" "coding")
+   :address {:street "123 Main St" :city "Wonderland"}})
 
 (println "\n--- Lambda ---")
-(pretty-print '(fn (request)
-                 (let ((method (get request :method))
-                       (path (get request :path)))
-                   (cond
-                     ((= method "GET") (handle-get path))
-                     ((= method "POST") (handle-post path (get request :body)))
-                     (else (error "unsupported method"))))))
+(pretty-print
+  '(fn (request)
+    (let ((method (get request :method))
+          (path (get request :path)))
+      (cond
+        ((= method "GET") (handle-get path))
+        ((= method "POST") (handle-post path (get request :body)))
+        (else (error "unsupported method"))))))

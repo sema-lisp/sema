@@ -5,10 +5,11 @@
 (println "=== Byte Length vs Character Length ===")
 (for-each
   (fn (s)
-    (println (format "  ~a  chars=~a  bytes=~a"
-      (string/pad-right (string/append "\"" s "\"") 12)
-      (string/length s)
-      (string/byte-length s))))
+    (println
+      (format "  ~a  chars=~a  bytes=~a"
+        (string/pad-right (string/append "\"" s "\"") 12)
+        (string/length s)
+        (string/byte-length s))))
   samples)
 
 ;; Codepoints roundtrip
@@ -20,15 +21,18 @@
 (println (format "  Roundtrip:  ~a" (string/from-codepoints cps)))
 
 ;; Build from known codepoints (Greek: Γεια)
-(println (format "  Greek hello: ~a"
-  (string/from-codepoints (list 915 949 953 945))))
+(println
+  (format "  Greek hello: ~a"
+    (string/from-codepoints (list 915 949 953 945))))
 
 ;; Unicode normalization
 (println "\n=== Normalization ===")
 (define decomposed (string/append "e" "\u0301"))
 (define composed (string/normalize decomposed :nfc))
-(println (format "  Decomposed: ~a (length=~a)" decomposed (string/length decomposed)))
-(println (format "  NFC:        ~a (length=~a)" composed (string/length composed)))
+(println
+  (format "  Decomposed: ~a (length=~a)" decomposed (string/length decomposed)))
+(println
+  (format "  NFC:        ~a (length=~a)" composed (string/length composed)))
 (println (format "  NFKC of ﬁ:  ~a" (string/normalize "\uFB01" :nfkc)))
 
 ;; Case folding
@@ -40,6 +44,12 @@
 
 ;; Case-insensitive comparison
 (println "\n=== Case-Insensitive Comparison ===")
-(println (format "  (string-ci=? \"Hello\" \"hello\") => ~a" (string-ci=? "Hello" "hello")))
-(println (format "  (string-ci=? \"CAFÉ\" \"café\")   => ~a" (string-ci=? "CAFÉ" "café")))
-(println (format "  (string-ci=? \"hello\" \"world\") => ~a" (string-ci=? "hello" "world")))
+(println
+  (format "  (string-ci=? \"Hello\" \"hello\") => ~a"
+    (string-ci=? "Hello" "hello")))
+(println
+  (format "  (string-ci=? \"CAFÉ\" \"café\")   => ~a"
+    (string-ci=? "CAFÉ" "café")))
+(println
+  (format "  (string-ci=? \"hello\" \"world\") => ~a"
+    (string-ci=? "hello" "world")))

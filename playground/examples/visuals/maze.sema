@@ -5,7 +5,8 @@
 (define (pos x y) (str x "," y))
 
 (define (shuffle lst)
-  (if (<= (length lst) 1) lst
+  (if (<= (length lst) 1)
+    lst
     (let* ((i (math/random-int 0 (- (length lst) 1)))
            (picked (nth lst i))
            (rest (append (take i lst) (drop (+ i 1) lst))))
@@ -17,25 +18,32 @@
   (filter
     (fn (entry)
       (let ((nx (car entry)) (ny (cadr entry)))
-        (and (>= nx 0) (< nx width)
-             (>= ny 0) (< ny height)
-             (not (get grid (pos (+ (* nx 2) 1) (+ (* ny 2) 1)) #f)))))
-    (map (fn (dir)
-           (list (+ cx (car dir)) (+ cy (cadr dir)) (car dir) (cadr dir)))
-         (shuffle directions))))
+        (and (>= nx 0)
+          (< nx width)
+          (>= ny 0)
+          (< ny height)
+          (not (get grid (pos (+ (* nx 2) 1) (+ (* ny 2) 1)) #f)))))
+    (map
+      (fn (dir)
+        (list (+ cx (car dir)) (+ cy (cadr dir)) (car dir) (cadr dir)))
+      (shuffle directions))))
 
 (define (generate-maze)
   (let loop ((stack (list (list 0 0)))
              (grid (assoc {} (pos 1 1) #t)))
-    (if (null? stack) grid
+    (if (null? stack)
+      grid
       (let* ((cell (car stack))
-             (cx (car cell)) (cy (cadr cell))
+             (cx (car cell))
+             (cy (cadr cell))
              (neighbors (unvisited-neighbors grid cx cy)))
         (if (null? neighbors)
           (loop (cdr stack) grid)
           (let* ((next (car neighbors))
-                 (nx (car next)) (ny (cadr next))
-                 (dx (nth next 2)) (dy (nth next 3))
+                 (nx (car next))
+                 (ny (cadr next))
+                 (dx (nth next 2))
+                 (dy (nth next 3))
                  (grid (assoc grid (pos (+ (* nx 2) 1) (+ (* ny 2) 1)) #t))
                  (grid (assoc grid (pos (+ (* cx 2) 1 dx) (+ (* cy 2) 1 dy)) #t)))
             (loop (cons (list nx ny) stack) grid)))))))
@@ -44,8 +52,11 @@
 (define grid-h (+ (* 2 height) 1))
 
 (define (wall? grid x y)
-  (and (>= x 0) (< x grid-w) (>= y 0) (< y grid-h)
-       (not (get grid (pos x y) #f))))
+  (and (>= x 0)
+    (< x grid-w)
+    (>= y 0)
+    (< y grid-h)
+    (not (get grid (pos x y) #f))))
 
 ;; Double-wide box chars to correct for ~2:1 char aspect ratio
 (define (box-char grid x y)
@@ -55,11 +66,21 @@
          (r (wall? grid (+ x 1) y))
          (bits (+ (if u 1 0) (if d 2 0) (if l 4 0) (if r 8 0))))
     (cond
-      ((= bits 15) "┼─")  ((= bits 14) "┬─")  ((= bits 13) "┴─")
-      ((= bits 11) "├─")  ((= bits  7) "┤ ")  ((= bits  6) "┐ ")
-      ((= bits 10) "┌─")  ((= bits  5) "┘ ")  ((= bits  9) "└─")
-      ((= bits 12) "──")  ((= bits  3) "│ ")  ((= bits  1) "│ ")
-      ((= bits  2) "│ ")  ((= bits  4) "─ ")  ((= bits  8) "──")
+      ((= bits 15) "┼─")
+      ((= bits 14) "┬─")
+      ((= bits 13) "┴─")
+      ((= bits 11) "├─")
+      ((= bits 7) "┤ ")
+      ((= bits 6) "┐ ")
+      ((= bits 10) "┌─")
+      ((= bits 5) "┘ ")
+      ((= bits 9) "└─")
+      ((= bits 12) "──")
+      ((= bits 3) "│ ")
+      ((= bits 1) "│ ")
+      ((= bits 2) "│ ")
+      ((= bits 4) "─ ")
+      ((= bits 8) "──")
       (else "· "))))
 
 (define (render grid)
@@ -67,9 +88,11 @@
     (fn (y)
       (println
         (string/join
-          (map (fn (x)
-                 (if (get grid (pos x y) #f) "  " (box-char grid x y)))
-               (range grid-w)) "")))
+          (map
+            (fn (x)
+              (if (get grid (pos x y) #f) "  " (box-char grid x y)))
+            (range grid-w))
+          "")))
     (range grid-h)))
 
 (render (generate-maze))

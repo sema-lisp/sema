@@ -25,9 +25,9 @@
 (bench "split + parse fields"
   (fn ()
     (let ((fields (string/split csv-line ";")))
-      (let ((city  (car fields))
-            (v1    (string/to-number (cadr fields)))
-            (v2    (string/to-number (caddr fields))))
+      (let ((city (car fields))
+            (v1 (string/to-number (cadr fields)))
+            (v2 (string/to-number (caddr fields))))
         (+ v1 v2))))
   50000)
 
@@ -90,8 +90,8 @@
     (map
       (fn (line)
         (let ((fields (string/split line ";")))
-          (let ((city   (car fields))
-                (temps  (map string/to-number (cdr fields))))
+          (let ((city (car fields))
+                (temps (map string/to-number (cdr fields))))
             (let ((avg (/ (foldl + 0 temps) (length temps))))
               (format "~a: avg=~a" city avg)))))
       sample-lines))

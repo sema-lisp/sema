@@ -20,7 +20,8 @@
 ;; A small, fast model: good enough for short explainers, cheap to run, not garbage.
 ;; Self-configure OpenAI (reads OPENAI_API_KEY from the environment) and make it the
 ;; default provider, so the workflow runs the same way regardless of the launcher.
-(llm/configure :openai {:api-key (env "OPENAI_API_KEY") :default-model "gpt-5.4-mini"})
+(llm/configure :openai
+  {:api-key (env "OPENAI_API_KEY") :default-model "gpt-5.4-mini"})
 
 ;; The inventory — Sema's own features. (Made-up showcase content about the language.)
 (define topics

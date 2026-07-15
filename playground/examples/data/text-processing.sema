@@ -11,19 +11,21 @@
 (println (format "Unique words: ~a" (length (list/unique words))))
 
 (define freq
-  (foldl (fn (acc word)
-    (map/update acc (string/to-keyword word) (fn (v) (if (nil? v) 1 (+ v 1)))))
-    {} words))
+  (foldl
+    (fn (acc word)
+      (map/update acc (string/to-keyword word) (fn (v) (if (nil? v) 1 (+ v 1)))))
+    {}
+    words))
 
-(define sorted-freq
-  (sort (map/entries freq) (fn (a b) (- (nth b 1) (nth a 1)))))
+(define sorted-freq (sort (map/entries freq) (fn (a b) (- (nth b 1) (nth a 1)))))
 
 (println "\nTop 10 most frequent words:")
 (for-each
   (fn (entry)
-    (println (format "  ~a: ~a"
-      (string/pad-right (keyword/to-string (first entry)) 12)
-      (string/repeat "#" (nth entry 1)))))
+    (println
+      (format "  ~a: ~a"
+        (string/pad-right (keyword/to-string (first entry)) 12)
+        (string/repeat "#" (nth entry 1)))))
   (take 10 sorted-freq))
 
 ;; Sentence extraction
@@ -31,17 +33,21 @@
   (filter (fn (s) (> (string/length (string/trim s)) 0))
     (regex/split "[.!?]+" sample-text)))
 (println (format "\n~a sentences found:" (length sentences)))
-(for-each (fn (s) (println (format "  - ~a" (string/trim s)))) sentences)
+(for-each
+  (fn (s) (println (format "  - ~a" (string/trim s))))
+  sentences)
 
 ;; Caesar cipher
 (define (caesar-encrypt text shift)
   (list->string
-    (map (fn (ch)
-      (if (char/alphabetic? ch)
-        (let ((base (if (char/upper-case? ch) 65 97))
-              (code (char/to-integer ch)))
-          (integer/to-char (+ base (math/remainder (- (+ code shift) base) 26))))
-        ch))
+    (map
+      (fn (ch)
+        (if (char/alphabetic? ch)
+          (let ((base (if (char/upper-case? ch) 65 97))
+                (code (char/to-integer ch)))
+            (integer/to-char
+              (+ base (math/remainder (- (+ code shift) base) 26))))
+          ch))
       (string/chars text))))
 
 (define original "Hello World")

@@ -28,8 +28,8 @@
 (println "  ✓ gensym \"my-var\" s4 = " s4)
 
 ;; Prefix appears in generated symbol name
-(define s5      (gensym "test"))
-(define s5-str  (symbol/to-string s5))
+(define s5 (gensym "test"))
+(define s5-str (symbol/to-string s5))
 (assert-eq (string/starts-with? s5-str "test")
   #t
   "gensym prefix appears in symbol name")

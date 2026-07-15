@@ -53,9 +53,9 @@
 (println "=== Real-World: ANSI Terminal Colors ===")
 (println)
 
-(define red    (string/append "\x1B;" "[31m"))
-(define green  (string/append "\x1B;" "[32m"))
-(define reset  (string/append "\x1B;" "[0m"))
+(define red (string/append "\x1B;" "[31m"))
+(define green (string/append "\x1B;" "[32m"))
+(define reset (string/append "\x1B;" "[0m"))
 
 (display (string/append red "Red text" reset " "))
 (display (string/append green "Green text" reset "\n"))

@@ -3,13 +3,12 @@
 (define num-chars (string/length chars))
 
 (define (mandelbrot-iter cx cy max-iter)
-  (do ((i 0 (+ i 1))
-       (zr 0.0 (+ (- (* zr zr) (* zi zi)) cx))
-       (zi 0.0 (+ (* 2.0 old-zr zi) cy))
-       (old-zr 0.0 zr))
+  (do
+    ((i 0 (+ i 1)) (zr 0.0 (+ (- (* zr zr) (* zi zi)) cx))
+      (zi 0.0 (+ (* 2.0 old-zr zi) cy))
+      (old-zr 0.0 zr))
     ((or (>= i max-iter)
-         (> (+ (* zr zr) (* zi zi)) 4.0))
-     i)))
+       (> (+ (* zr zr) (* zi zi)) 4.0)) i)))
 
 (define (iter->char iter max-iter)
   (if (= iter max-iter)
@@ -20,10 +19,12 @@
 (define (render x-min x-max y-min y-max w h max-iter)
   (let ((dx (/ (- x-max x-min) w))
         (dy (/ (- y-max y-min) h)))
-    (do ((row 0 (+ row 1)))
+    (do
+      ((row 0 (+ row 1)))
       ((= row h))
       (let ((cy (+ y-min (* row dy))))
-        (do ((col 0 (+ col 1)))
+        (do
+          ((col 0 (+ col 1)))
           ((= col w))
           (let* ((cx (+ x-min (* col dx)))
                  (iter (mandelbrot-iter cx cy max-iter)))

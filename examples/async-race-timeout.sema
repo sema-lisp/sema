@@ -16,9 +16,9 @@
 (define winner
   (async/race
     (list (replica "us-east" 30)
-          (replica "eu-west" 12)      ; fastest
-          (replica "ap-south" 45))))
-(println "  fastest replica: " winner)   ; eu-west
+      (replica "eu-west" 12) ; fastest
+      (replica "ap-south" 45))))
+(println "  fastest replica: " winner) ; eu-west
 
 ;; --- 2. Deadline with async/timeout ----------------------------------------
 ;; `async/timeout` rejects if the promise doesn't settle within the budget.
@@ -30,10 +30,12 @@
 ;; Fast enough — completes within budget. `async/timeout` takes the budget (ms)
 ;; first, then the promise, and returns the resolved value directly.
 (println "  20ms query, 50ms budget -> "
-  (try (async/timeout 50 (query 20))
-       (catch e (str "timed out: " (:message e)))))
+  (try
+    (async/timeout 50 (query 20))
+    (catch e (str "timed out: " (:message e)))))
 
 ;; Too slow — exceeds the budget, surfaces as a catchable error.
 (println "  80ms query, 30ms budget -> "
-  (try (async/timeout 30 (query 80))
-       (catch e "deadline exceeded (handled gracefully)")))
+  (try
+    (async/timeout 30 (query 80))
+    (catch e "deadline exceeded (handled gracefully)")))

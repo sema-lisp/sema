@@ -297,10 +297,10 @@
 ;; Floats can be written as <mantissa>e<exponent> (the mantissa may be a bare int),
 ;; with an optional sign on the exponent; `e` or `E` both work.
 (println "scientific notation:")
-(println "  6.022e23       => " 6.022e23)      ;; Avogadro  => 6.022e23
-(println "  1e-9           => " 1e-9)           ;; one nano  => 0.000000001
-(println "  -2.5E6         => " -2.5E6)         ;; uppercase E => -2500000.0
-(println "  (* 2 3e2)      => " (* 2 3e2))      ;; usable in expressions => 600.0
+(println "  6.022e23       => " 6.022e23) ;; Avogadro  => 6.022e23
+(println "  1e-9           => " 1e-9) ;; one nano  => 0.000000001
+(println "  -2.5E6         => " -2.5E6) ;; uppercase E => -2500000.0
+(println "  (* 2 3e2)      => " (* 2 3e2)) ;; usable in expressions => 600.0
 (assert-eq (* 1.5e3 2) 3000.0 "(* 1.5e3 2) = 3000.0")
 (assert-eq (int 1e6) 1000000 "(int 1e6) = 1000000")
 (println)

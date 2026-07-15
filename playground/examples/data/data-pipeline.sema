@@ -1,6 +1,7 @@
 ;; CSV processing, data transformation, and analysis
 
-(define csv-data "name,age,score,city
+(define csv-data
+  "name,age,score,city
 Alice,32,95,Berlin
 Bob,28,82,London
 Charlie,35,91,Berlin
@@ -14,15 +15,19 @@ Henry,33,88,London")
 (println (format "Loaded ~a records" (length records)))
 
 (define typed-records
-  (map (fn (r)
-    (assoc r :age (int (get r :age)) :score (int (get r :score))))
+  (map
+    (fn (r)
+      (assoc r :age (int (get r :age)) :score (int (get r :score))))
     records))
 
 ;; Statistics
 (define ages (map (fn (r) (get r :age)) typed-records))
 (define scores (map (fn (r) (get r :score)) typed-records))
-(println (format "Average age: ~a" (round (/ (foldl + 0 ages) (float (length ages))))))
-(println (format "Average score: ~a" (round (/ (foldl + 0 scores) (float (length scores))))))
+(println
+  (format "Average age: ~a" (round (/ (foldl + 0 ages) (float (length ages))))))
+(println
+  (format "Average score: ~a"
+    (round (/ (foldl + 0 scores) (float (length scores))))))
 (println (format "Score range: ~a - ~a" (apply min scores) (apply max scores)))
 
 ;; Group by city
@@ -33,7 +38,11 @@ Henry,33,88,London")
     (let ((city (first entry)) (people (nth entry 1)))
       (let* ((city-scores (map (fn (r) (get r :score)) people))
              (city-avg (/ (foldl + 0 city-scores) (float (length city-scores)))))
-        (println (format "  ~a: ~a people, avg score ~a" city (length people) (round city-avg))))))
+        (println
+          (format "  ~a: ~a people, avg score ~a"
+            city
+            (length people)
+            (round city-avg))))))
   (map/entries by-city))
 
 ;; Ranking
@@ -41,20 +50,26 @@ Henry,33,88,London")
 (println "\nRanking:")
 (for-each
   (fn (r)
-    (println (format "  ~a. ~a — ~a pts"
-      (string/pad-left (str (+ 1 (list/index-of ranked r))) 2)
-      (string/pad-right (get r :name) 8)
-      (get r :score))))
+    (println
+      (format "  ~a. ~a — ~a pts"
+        (string/pad-left (str (+ 1 (list/index-of ranked r))) 2)
+        (string/pad-right (get r :name) 8)
+        (get r :score))))
   ranked)
 
 ;; Export as CSV
 (define export-rows
   (cons '("name" "score" "grade")
-    (map (fn (r)
-      (let ((score (get r :score)))
-        (list (get r :name) (str score)
-              (cond ((>= score 90) "A") ((>= score 80) "B")
-                    ((>= score 70) "C") (else "D")))))
+    (map
+      (fn (r)
+        (let ((score (get r :score)))
+          (list (get r :name)
+            (str score)
+            (cond
+              ((>= score 90) "A")
+              ((>= score 80) "B")
+              ((>= score 70) "C")
+              (else "D")))))
       ranked)))
 (println "\nExported CSV:")
 (println (csv/encode export-rows))

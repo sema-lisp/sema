@@ -1464,7 +1464,9 @@ fn http_serve_impl(ctx: &sema_core::EvalContext, args: &[Value]) -> Result<Value
     // per-connection handler tasks) is real design work, deliberately
     // deferred (see docs/deferred.md); until then, fail fast and loud instead
     // of hanging silently.
-    if sema_core::in_async_context() || (sema_core::in_runtime_quantum() && sema_core::current_task_id().is_some()) {
+    if sema_core::in_async_context()
+        || (sema_core::in_runtime_quantum() && sema_core::current_task_id().is_some())
+    {
         // The core message alone must carry enough to explain the failure: a
         // task's rejection is flattened to a plain string when it crosses the
         // promise boundary (`format!("{e}")` in the scheduler), so the hint

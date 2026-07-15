@@ -4,25 +4,27 @@
 ;; the picture. (Pairs with l-system.sema, which *generates* turtle commands but
 ;; never draws them.)
 
-(define W 64)    ; canvas width  (chars)
-(define H 30)    ; canvas height (chars)
-(define XS 2.0)  ; x scale — text cells are ~half as wide as tall, so stretch x
+(define W 64) ; canvas width  (chars)
+(define H 30) ; canvas height (chars)
+(define XS 2.0) ; x scale — text cells are ~half as wide as tall, so stretch x
 
 ;; --- canvas: a map of grid-index -> char ---
 (define (plot canvas x y ch)
   (let ((ix (int (round (* x XS)))) (iy (int (round y))))
     (if (and (>= ix 0) (< ix W) (>= iy 0) (< iy H))
-        (assoc canvas (+ (* iy W) ix) ch)
-        canvas)))
+      (assoc canvas (+ (* iy W) ix) ch)
+      canvas)))
 
 ;; sample points along the segment (x0,y0)->(x1,y1) so the line has no gaps
 (define (draw-line canvas x0 y0 x1 y1 ch)
-  (let* ((dx (- x1 x0)) (dy (- y1 y0))
+  (let* ((dx (- x1 x0))
+         (dy (- y1 y0))
          (steps (max 1 (int (round (* 2.0 (max (abs (* dx XS)) (abs dy))))))))
     (let loop ((i 0) (c canvas))
-      (if (> i steps) c
-          (let ((tt (/ i (* 1.0 steps))))
-            (loop (+ i 1) (plot c (+ x0 (* tt dx)) (+ y0 (* tt dy)) ch)))))))
+      (if (> i steps)
+        c
+        (let ((tt (/ i (* 1.0 steps))))
+          (loop (+ i 1) (plot c (+ x0 (* tt dx)) (+ y0 (* tt dy)) ch)))))))
 
 ;; --- the turtle: {:x :y :h :c}  (heading in degrees, 0 = east) ---
 (define PI 3.141592653589793)
@@ -33,7 +35,7 @@
          (nx (+ (get t :x) (* n (cos rad))))
          (ny (+ (get t :y) (* n (sin rad)))))
     (assoc (assoc (assoc t :x nx) :y ny)
-           :c (draw-line (get t :c) (get t :x) (get t :y) nx ny "*"))))
+      :c (draw-line (get t :c) (get t :x) (get t :y) nx ny "*"))))
 
 (define (rt t a) (assoc t :h (+ (get t :h) a)))
 (define (lt t a) (rt t (- a)))
@@ -45,11 +47,12 @@
 ;; --- render the canvas to text ---
 (define (render canvas)
   (string/join
-    (map (fn (row)
-           (string/join
-             (map (fn (col) (get canvas (+ (* row W) col) " ")) (range W))
-             ""))
-         (range H))
+    (map
+      (fn (row)
+        (string/join
+          (map (fn (col) (get canvas (+ (* row W) col) " ")) (range W))
+          ""))
+      (range H))
     "\n"))
 
 ;; ============================================================
@@ -58,12 +61,14 @@
 
 ;; Five-pointed star:  repeat 5 [fd 20 rt 144]
 (println "=== star — repeat 5 [fd 20 rt 144] ===\n")
-(println (render (get (repeat 5 (fn (t) (rt (fd t 20) 144)) (turtle 4 22 -72)) :c)))
+(println
+  (render (get (repeat 5 (fn (t) (rt (fd t 20) 144)) (turtle 4 22 -72)) :c)))
 
 ;; Flower: 12 pentagons, each rotated 30° from the last.
 (println "\n=== flower — 12 pentagons, rotated 30 each ===\n")
 (define (pentagon t) (repeat 5 (fn (tt) (rt (fd tt 7) 72)) t))
-(println (render (get (repeat 12 (fn (t) (rt (pentagon t) 30)) (turtle 16 15 0)) :c)))
+(println
+  (render (get (repeat 12 (fn (t) (rt (pentagon t) 30)) (turtle 16 15 0)) :c)))
 
 ;; Square spiral: go forward, turn 90°, go a little farther, repeat.
 (println "\n=== square spiral — fd, rt 90, grow ===\n")

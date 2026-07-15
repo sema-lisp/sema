@@ -5,18 +5,72 @@
   (if (<= n 0) '() (cons (pick-random lst) (pick-n (- n 1) lst))))
 (define (capitalize s)
   (if (> (string/length s) 0)
-    (string/append (string/upper (string/slice s 0 1)) (string/slice s 1)) s))
+    (string/append (string/upper (string/slice s 0 1)) (string/slice s 1))
+    s))
 
 (define lorem-words
-  (list "lorem" "ipsum" "dolor" "sit" "amet" "consectetur" "adipiscing"
-        "elit" "sed" "do" "eiusmod" "tempor" "incididunt" "ut" "labore"
-        "et" "dolore" "magna" "aliqua" "enim" "ad" "minim" "veniam"
-        "quis" "nostrud" "exercitation" "ullamco" "laboris" "nisi"
-        "aliquip" "ex" "ea" "commodo" "consequat" "duis" "aute" "irure"
-        "in" "reprehenderit" "voluptate" "velit" "esse" "cillum"
-        "fugiat" "nulla" "pariatur" "excepteur" "sint" "occaecat"
-        "cupidatat" "non" "proident" "sunt" "culpa" "qui" "officia"
-        "deserunt" "mollit" "anim" "id" "est" "laborum"))
+  (list "lorem"
+    "ipsum"
+    "dolor"
+    "sit"
+    "amet"
+    "consectetur"
+    "adipiscing"
+    "elit"
+    "sed"
+    "do"
+    "eiusmod"
+    "tempor"
+    "incididunt"
+    "ut"
+    "labore"
+    "et"
+    "dolore"
+    "magna"
+    "aliqua"
+    "enim"
+    "ad"
+    "minim"
+    "veniam"
+    "quis"
+    "nostrud"
+    "exercitation"
+    "ullamco"
+    "laboris"
+    "nisi"
+    "aliquip"
+    "ex"
+    "ea"
+    "commodo"
+    "consequat"
+    "duis"
+    "aute"
+    "irure"
+    "in"
+    "reprehenderit"
+    "voluptate"
+    "velit"
+    "esse"
+    "cillum"
+    "fugiat"
+    "nulla"
+    "pariatur"
+    "excepteur"
+    "sint"
+    "occaecat"
+    "cupidatat"
+    "non"
+    "proident"
+    "sunt"
+    "culpa"
+    "qui"
+    "officia"
+    "deserunt"
+    "mollit"
+    "anim"
+    "id"
+    "est"
+    "laborum"))
 
 (define (generate-sentence)
   (let ((words (pick-n (math/random-int 5 15) lorem-words)))
@@ -24,7 +78,8 @@
 
 (define (generate-paragraph)
   (let loop ((i 0) (count (math/random-int 3 6)) (acc '()))
-    (if (>= i count) (string/join (reverse acc) " ")
+    (if (>= i count)
+      (string/join (reverse acc) " ")
       (loop (+ i 1) count (cons (generate-sentence) acc)))))
 
 (println "=== Lorem Ipsum ===\n")
@@ -34,34 +89,71 @@
 
 ;; Random names
 (define first-names
-  (list "James" "Mary" "Robert" "Patricia" "John" "Jennifer" "Emma"
-        "Oliver" "Ava" "Liam" "Sophia" "Noah" "Isabella" "Ethan"))
+  (list "James"
+    "Mary"
+    "Robert"
+    "Patricia"
+    "John"
+    "Jennifer"
+    "Emma"
+    "Oliver"
+    "Ava"
+    "Liam"
+    "Sophia"
+    "Noah"
+    "Isabella"
+    "Ethan"))
 (define last-names
-  (list "Smith" "Johnson" "Williams" "Brown" "Jones" "Garcia" "Miller"
-        "Davis" "Rodriguez" "Martinez" "Wilson" "Anderson" "Thomas"))
+  (list "Smith"
+    "Johnson"
+    "Williams"
+    "Brown"
+    "Jones"
+    "Garcia"
+    "Miller"
+    "Davis"
+    "Rodriguez"
+    "Martinez"
+    "Wilson"
+    "Anderson"
+    "Thomas"))
 
 (println "\n=== Random Names ===\n")
 (let loop ((i 0))
   (when (< i 8)
-    (println (format "  ~a. ~a ~a" (+ i 1) (pick-random first-names) (pick-random last-names)))
+    (println
+      (format "  ~a. ~a ~a"
+        (+ i 1)
+        (pick-random first-names)
+        (pick-random last-names)))
     (loop (+ i 1))))
 
 ;; Random data table
-(define cities (list "New York" "London" "Tokyo" "Paris" "Berlin" "Sydney" "Toronto"))
+(define cities
+  (list "New York" "London" "Tokyo" "Paris" "Berlin" "Sydney" "Toronto"))
 
 (println "\n=== Data Table ===\n")
-(println (format "| ~a | ~a | ~a | ~a |"
-  (string/pad-right "Name" 20) (string/pad-right "Age" 5)
-  (string/pad-right "City" 12) (string/pad-right "Score" 7)))
-(println (format "|~a|~a|~a|~a|"
-  (string/repeat "-" 22) (string/repeat "-" 7)
-  (string/repeat "-" 14) (string/repeat "-" 9)))
+(println
+  (format "| ~a | ~a | ~a | ~a |"
+    (string/pad-right "Name" 20)
+    (string/pad-right "Age" 5)
+    (string/pad-right "City" 12)
+    (string/pad-right "Score" 7)))
+(println
+  (format "|~a|~a|~a|~a|"
+    (string/repeat "-" 22)
+    (string/repeat "-" 7)
+    (string/repeat "-" 14)
+    (string/repeat "-" 9)))
 
 (let loop ((i 0))
   (when (< i 6)
-    (println (format "| ~a | ~a | ~a | ~a |"
-      (string/pad-right (str (pick-random first-names) " " (pick-random last-names)) 20)
-      (string/pad-right (str (math/random-int 22 65)) 5)
-      (string/pad-right (pick-random cities) 12)
-      (string/pad-right (str (math/random-int 50 100)) 7)))
+    (println
+      (format "| ~a | ~a | ~a | ~a |"
+        (string/pad-right
+          (str (pick-random first-names) " " (pick-random last-names))
+          20)
+        (string/pad-right (str (math/random-int 22 65)) 5)
+        (string/pad-right (pick-random cities) 12)
+        (string/pad-right (str (math/random-int 50 100)) 7)))
     (loop (+ i 1))))

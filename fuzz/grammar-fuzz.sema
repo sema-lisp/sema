@@ -65,8 +65,8 @@
   ;; full-period from any state — Hull-Dobell: A=...005 ≡ 1 mod 4, C odd — so no
   ;; odd-state requirement exists in the first place.)
   (set! *rng*
-        (mod (abs (+ (* (+ (abs s) 1) 6364136223846793005) 1442695040888963407))
-             9223372036854775806)))
+    (mod (abs (+ (* (+ (abs s) 1) 6364136223846793005) 1442695040888963407))
+      9223372036854775806)))
 
 (define (rng-next!)
   (set! *rng* (+ (* *rng* 6364136223846793005) 1442695040888963407))
@@ -76,7 +76,7 @@
   ;; uniform-ish in [0, n); uses the high bits of the LCG state
   (if (<= n 1) 0 (mod (abs (bit/shift-right (rng-next!) 17)) n)))
 
-(define (rng-range! lo hi)            ; inclusive [lo, hi]
+(define (rng-range! lo hi) ; inclusive [lo, hi]
   (+ lo (rng-int! (+ 1 (- hi lo)))))
 
 (define (rng-pick! xs) (nth xs (rng-int! (length xs))))
@@ -90,7 +90,7 @@
 ;; identifiers (no reader-special tokens) so the only thing under test is the
 ;; printer/reader, not our choice of names.
 (define *sym-pool* (list 'a 'b 'c 'foo 'bar 'x 'y 'list 'quote 'do-thing))
-(define *kw-pool*  (list :a :b :c :foo :bar :k1 :k2 :k3))
+(define *kw-pool* (list :a :b :c :foo :bar :k1 :k2 :k3))
 (define *char-pool* (list #\a #\Z #\0 #\space #\newline #\tab #\return))
 ;; String alphabet, including the escape-sensitive characters " \ newline tab —
 ;; the readable printer now escapes these and the reader parses them back, so the
@@ -105,8 +105,8 @@
   (let ((len (rng-int! 8)))
     (let loop ((i 0) (acc ""))
       (if (>= i len)
-          acc
-          (loop (+ i 1) (string-append acc (gen-char-from *str-alpha*)))))))
+        acc
+        (loop (+ i 1) (string-append acc (gen-char-from *str-alpha*)))))))
 
 (define (gen-float)
   ;; k/1000 style values exercise float printing + shortest-round-trip parsing
@@ -125,7 +125,7 @@
   ;; integer) so the `a/b` reader/printer path gets real exercise.
   (let* ((d (rng-pick! (list 2 3 5 7 11 13 17 19)))
          (n0 (rng-range! -999 999))
-         (n  (if (= 0 (mod n0 d)) (+ n0 1) n0)))
+         (n (if (= 0 (mod n0 d)) (+ n0 1) n0)))
     (/ n d)))
 
 (define (gen-complex-atom)
@@ -146,14 +146,14 @@
       ((= c 7) (rng-pick! *char-pool*))
       ((= c 8) (gen-bignum))
       ((= c 9) (gen-rational-atom))
-      (else    (gen-complex-atom)))))
+      (else (gen-complex-atom)))))
 
 (define (gen-list depth)
   (let ((k (rng-int! 5)))
     (let loop ((i 0) (acc (list)))
       (if (>= i k)
-          (reverse acc)
-          (loop (+ i 1) (cons (gen-datum (- depth 1)) acc))))))
+        (reverse acc)
+        (loop (+ i 1) (cons (gen-datum (- depth 1)) acc))))))
 
 (define (gen-vector depth)
   (list->vector (gen-list depth)))
@@ -163,18 +163,18 @@
   (let ((k (rng-int! 4)))
     (let loop ((i 0) (m {}))
       (if (>= i k)
-          m
-          (loop (+ i 1) (assoc m (nth *kw-pool* i) (gen-datum (- depth 1))))))))
+        m
+        (loop (+ i 1) (assoc m (nth *kw-pool* i) (gen-datum (- depth 1))))))))
 
 (define (gen-datum depth)
   (if (<= depth 0)
-      (gen-atom)
-      (let ((choice (rng-int! 10)))
-        (cond
-          ((< choice 5) (gen-atom))
-          ((< choice 7) (gen-list depth))
-          ((< choice 9) (gen-vector depth))
-          (else         (gen-map depth))))))
+    (gen-atom)
+    (let ((choice (rng-int! 10)))
+      (cond
+        ((< choice 5) (gen-atom))
+        ((< choice 7) (gen-list depth))
+        ((< choice 9) (gen-vector depth))
+        (else (gen-map depth))))))
 
 ;; ─────────────────────────────────────────────────────────────────────────
 ;; Typed program generator — well-typed, closed int/bool programs (eval oracle)
@@ -188,8 +188,8 @@
 ;; ─────────────────────────────────────────────────────────────────────────
 
 (define (mk form val) (list form val))
-(define (gf p) (nth p 0))            ; the generated form
-(define (gv p) (nth p 1))            ; its expected value
+(define (gf p) (nth p 0)) ; the generated form
+(define (gv p) (nth p 1)) ; its expected value
 
 ;; env entries are (symbol value type), type one of 'int 'bool 'list. Tracking
 ;; the type lets every generated variable reference be well-typed.
@@ -200,23 +200,25 @@
 (define (maybe-ref env t)
   (let ((cands (env-of-type env t)))
     (if (pair? cands)
-        (let ((b (rng-pick! cands))) (mk (nth b 0) (nth b 1)))
-        nil)))
+      (let ((b (rng-pick! cands))) (mk (nth b 0) (nth b 1)))
+      nil)))
 
 ;; The set of value types the program generator understands (LLM/IO/time/random
 ;; are deliberately excluded — no deterministic oracle).
-(define *types* (list 'int 'int 'bool 'list 'float 'string 'vec 'map 'law 'law 'law))
+(define *types*
+  (list 'int 'int 'bool 'list 'float 'string 'vec 'map 'law 'law 'law))
 
 ;; Dispatch generation by type.
 (define (gen-of t env depth)
-  (cond ((= t 'int)    (gen-int    env depth))
-        ((= t 'bool)   (gen-bool   env depth))
-        ((= t 'list)   (gen-ilist  env depth))
-        ((= t 'float)  (gen-flt env depth))
-        ((= t 'string) (gen-str    env depth))
-        ((= t 'vec)    (gen-vec    env depth))
-        ((= t 'law)    (gen-law    env depth))
-        (else          (gen-map-v  env depth))))
+  (cond
+    ((= t 'int) (gen-int env depth))
+    ((= t 'bool) (gen-bool env depth))
+    ((= t 'list) (gen-ilist env depth))
+    ((= t 'float) (gen-flt env depth))
+    ((= t 'string) (gen-str env depth))
+    ((= t 'vec) (gen-vec env depth))
+    ((= t 'law) (gen-law env depth))
+    (else (gen-map-v env depth))))
 
 ;; Nonzero divisor literals for mod (avoids division-by-zero, which raises).
 (define *nz* (list 1 2 3 -1 -2 -3 4 -4 7 -7 11 -11))
@@ -224,41 +226,41 @@
 ;; ── int ──────────────────────────────────────────────────────────────────
 (define (gen-int env depth)
   (if (<= depth 0)
-      (gen-int-leaf env)
-      (let ((choice (rng-int! 26)))
-        (cond
-          ((< choice 3)  (gen-int-leaf env))
-          ((= choice 3)  (gen-int-bin '+ env depth +))
-          ((= choice 4)  (gen-int-bin '- env depth -))
-          ((= choice 5)  (gen-int-bin '* env depth *))
-          ((= choice 6)  (gen-int-vararith env depth))
-          ((= choice 7)  (gen-int-minmax env depth))
-          ((= choice 8)  (gen-int-unary env depth))
-          ((= choice 9)  (gen-int-mod env depth))
-          ((= choice 10) (gen-int-if env depth))
-          ((= choice 11) (gen-int-cond env depth))
-          ((= choice 12) (gen-int-let env depth))
-          ((= choice 13) (gen-int-app env depth))
-          ((= choice 14) (gen-int-fromlist env depth))
-          ((= choice 15) (gen-int-recur env depth))
-          ;; NOTE: set! is deliberately NOT generated. The value oracle computes
-          ;; `expected` bottom-up assuming every sub-expression is referentially
-          ;; transparent (same value however many times / whenever evaluated).
-          ;; set! is the only impurity in the grammar; combined with async tasks
-          ;; or law-style duplication its evaluation count diverges from the
-          ;; model, yielding false positives (a depth-7 program reported a 2x
-          ;; mismatch that was an oracle artifact, not a VM bug). set! correctness
-          ;; is covered by the dual-eval set! tests instead. Slot 16 -> a leaf.
-          ((= choice 16) (gen-int-leaf env))
-          ((= choice 17) (gen-int-try env depth))
-          ((= choice 18) (gen-int-match env depth))
-          ((= choice 19) (gen-int-case env depth))
-          ((= choice 20) (gen-int-apply env depth))
-          ((= choice 21) (gen-int-curry env depth))
-          ((= choice 22) (gen-int-bits env depth))
-          ((= choice 23) (gen-int-asyncsum env depth))
-          ((= choice 24) (gen-int-asyncchan env depth))
-          (else          (gen-int-fromcontainer env depth))))))
+    (gen-int-leaf env)
+    (let ((choice (rng-int! 26)))
+      (cond
+        ((< choice 3) (gen-int-leaf env))
+        ((= choice 3) (gen-int-bin '+ env depth +))
+        ((= choice 4) (gen-int-bin '- env depth -))
+        ((= choice 5) (gen-int-bin '* env depth *))
+        ((= choice 6) (gen-int-vararith env depth))
+        ((= choice 7) (gen-int-minmax env depth))
+        ((= choice 8) (gen-int-unary env depth))
+        ((= choice 9) (gen-int-mod env depth))
+        ((= choice 10) (gen-int-if env depth))
+        ((= choice 11) (gen-int-cond env depth))
+        ((= choice 12) (gen-int-let env depth))
+        ((= choice 13) (gen-int-app env depth))
+        ((= choice 14) (gen-int-fromlist env depth))
+        ((= choice 15) (gen-int-recur env depth))
+        ;; NOTE: set! is deliberately NOT generated. The value oracle computes
+        ;; `expected` bottom-up assuming every sub-expression is referentially
+        ;; transparent (same value however many times / whenever evaluated).
+        ;; set! is the only impurity in the grammar; combined with async tasks
+        ;; or law-style duplication its evaluation count diverges from the
+        ;; model, yielding false positives (a depth-7 program reported a 2x
+        ;; mismatch that was an oracle artifact, not a VM bug). set! correctness
+        ;; is covered by the dual-eval set! tests instead. Slot 16 -> a leaf.
+        ((= choice 16) (gen-int-leaf env))
+        ((= choice 17) (gen-int-try env depth))
+        ((= choice 18) (gen-int-match env depth))
+        ((= choice 19) (gen-int-case env depth))
+        ((= choice 20) (gen-int-apply env depth))
+        ((= choice 21) (gen-int-curry env depth))
+        ((= choice 22) (gen-int-bits env depth))
+        ((= choice 23) (gen-int-asyncsum env depth))
+        ((= choice 24) (gen-int-asyncchan env depth))
+        (else (gen-int-fromcontainer env depth))))))
 
 (define (gen-int-leaf env)
   (let ((r (maybe-ref env 'int)))
@@ -279,20 +281,20 @@
         (b (gen-int env (- depth 1)))
         (c (gen-int env (- depth 1))))
     (if (rng-bool!)
-        (mk (list '+ (gf a) (gf b) (gf c)) (+ (gv a) (gv b) (gv c)))
-        (mk (list '* (gf a) (gf b) (gf c)) (* (gv a) (gv b) (gv c))))))
+      (mk (list '+ (gf a) (gf b) (gf c)) (+ (gv a) (gv b) (gv c)))
+      (mk (list '* (gf a) (gf b) (gf c)) (* (gv a) (gv b) (gv c))))))
 
 (define (gen-int-minmax env depth)
   (let ((a (gen-int env (- depth 1))) (b (gen-int env (- depth 1))))
     (if (rng-bool!)
-        (mk (list 'min (gf a) (gf b)) (min (gv a) (gv b)))
-        (mk (list 'max (gf a) (gf b)) (max (gv a) (gv b))))))
+      (mk (list 'min (gf a) (gf b)) (min (gv a) (gv b)))
+      (mk (list 'max (gf a) (gf b)) (max (gv a) (gv b))))))
 
 (define (gen-int-unary env depth)
   (let ((a (gen-int env (- depth 1))))
     (if (rng-bool!)
-        (mk (list '- (gf a)) (- (gv a)))
-        (mk (list 'abs (gf a)) (abs (gv a))))))
+      (mk (list '- (gf a)) (- (gv a)))
+      (mk (list 'abs (gf a)) (abs (gv a))))))
 
 (define (gen-int-mod env depth)
   (let ((a (gen-int env (- depth 1))) (d (rng-pick! *nz*)))
@@ -305,106 +307,123 @@
     (mk (list 'if (gf c) (gf t) (gf e)) (if (gv c) (gv t) (gv e)))))
 
 (define (gen-int-cond env depth)
-  (let ((c1 (gen-bool env (- depth 1))) (e1 (gen-int env (- depth 1)))
-        (c2 (gen-bool env (- depth 1))) (e2 (gen-int env (- depth 1)))
+  (let ((c1 (gen-bool env (- depth 1)))
+        (e1 (gen-int env (- depth 1)))
+        (c2 (gen-bool env (- depth 1)))
+        (e2 (gen-int env (- depth 1)))
         (ed (gen-int env (- depth 1))))
-    (mk (list 'cond
-              (list (gf c1) (gf e1))
-              (list (gf c2) (gf e2))
-              (list 'else (gf ed)))
-        (cond ((gv c1) (gv e1)) ((gv c2) (gv e2)) (else (gv ed))))))
+    (mk
+      (list 'cond
+        (list (gf c1) (gf e1))
+        (list (gf c2) (gf e2))
+        (list 'else (gf ed)))
+      (cond ((gv c1) (gv e1)) ((gv c2) (gv e2)) (else (gv ed))))))
 
 ;; Multi-binding let where each binding can be any type (so bool/list vars also
 ;; enter scope), body is an int.
 (define (gen-int-let env depth)
-  (let* ((v1 (gensym "v")) (t1 (rng-pick! *types*))
+  (let* ((v1 (gensym "v"))
+         (t1 (rng-pick! *types*))
          (i1 (gen-of t1 env (- depth 1)))
-         (v2 (gensym "v")) (t2 (rng-pick! *types*))
+         (v2 (gensym "v"))
+         (t2 (rng-pick! *types*))
          (i2 (gen-of t2 env (- depth 1)))
          (env2 (cons (list v1 (gv i1) t1) (cons (list v2 (gv i2) t2) env)))
          (body (gen-int env2 (- depth 1))))
     (mk (list 'let (list (list v1 (gf i1)) (list v2 (gf i2))) (gf body))
-        (gv body))))
+      (gv body))))
 
 ;; ((lambda (p1 p2) body) a1 a2) — closures + multi-arg application.
 (define (gen-int-app env depth)
-  (let* ((p1 (gensym "p")) (p2 (gensym "p"))
-         (a1 (gen-int env (- depth 1))) (a2 (gen-int env (- depth 1)))
+  (let* ((p1 (gensym "p"))
+         (p2 (gensym "p"))
+         (a1 (gen-int env (- depth 1)))
+         (a2 (gen-int env (- depth 1)))
          (env2 (cons (list p1 (gv a1) 'int) (cons (list p2 (gv a2) 'int) env)))
          (body (gen-int env2 (- depth 1))))
     (mk (list (list 'lambda (list p1 p2) (gf body)) (gf a1) (gf a2))
-        (gv body))))
+      (gv body))))
 
 ;; Pull an int out of a generated list: length / nth / foldl.
 (define (gen-int-fromlist env depth)
   (let* ((l (gen-ilist env (- depth 1))) (lv (gv l)) (c (rng-int! 3)))
     (cond
       ((= c 0) (mk (list 'length (gf l)) (length lv)))
-      ((= c 1) (if (> (length lv) 0)
-                   (let ((idx (rng-int! (length lv))))
-                     (mk (list 'nth (gf l) idx) (nth lv idx)))
-                   (let ((n (rng-range! -9 9))) (mk n n))))
-      (else (if (rng-bool!)
-                (mk (list 'foldl '+ 0 (gf l)) (foldl + 0 lv))
-                (mk (list 'foldl '* 1 (gf l)) (foldl * 1 lv)))))))
+      ((= c 1)
+        (if (> (length lv) 0)
+          (let ((idx (rng-int! (length lv))))
+            (mk (list 'nth (gf l) idx) (nth lv idx)))
+          (let ((n (rng-range! -9 9))) (mk n n))))
+      (else
+        (if (rng-bool!)
+          (mk (list 'foldl '+ 0 (gf l)) (foldl + 0 lv))
+          (mk (list 'foldl '* 1 (gf l)) (foldl * 1 lv)))))))
 
 ;; Tail-recursive sum 1..N via named let — stresses TCO at large N. If TCO is
 ;; broken this overflows the stack (caught as an eval error / crash).
 (define (sum-to n)
-  (let loop ((i n) (acc 0)) (if (> i 0) (loop (- i 1) (+ acc i)) acc)))
+  (let loop ((i n) (acc 0))
+    (if (> i 0) (loop (- i 1) (+ acc i)) acc)))
 
 (define (gen-int-recur env depth)
-  (let* ((loop (gensym "loop")) (i (gensym "i")) (acc (gensym "acc"))
+  (let* ((loop (gensym "loop"))
+         (i (gensym "i"))
+         (acc (gensym "acc"))
          (n (rng-range! 1 40000)))
-    (mk (list 'let loop
-              (list (list i n) (list acc 0))
-              (list 'if (list '> i 0)
-                    (list loop (list '- i 1) (list '+ acc i))
-                    acc))
-        (sum-to n))))
+    (mk
+      (list 'let
+        loop
+        (list (list i n) (list acc 0))
+        (list 'if
+          (list '> i 0)
+          (list loop (list '- i 1) (list '+ acc i))
+          acc))
+      (sum-to n))))
 
 ;; ── bool ─────────────────────────────────────────────────────────────────
 (define (gen-bool env depth)
   (if (<= depth 0)
-      (gen-bool-leaf env)
-      (let ((choice (rng-int! 17)))
-        (cond
-          ((< choice 2)  (gen-bool-leaf env))
-          ((= choice 2)  (gen-bool-cmp '= env depth =))
-          ((= choice 3)  (gen-bool-cmp '< env depth <))
-          ((= choice 4)  (gen-bool-cmp '> env depth >))
-          ((= choice 5)  (gen-bool-cmp '<= env depth <=))
-          ((= choice 6)  (gen-bool-cmp '>= env depth >=))
-          ((= choice 7)  (gen-bool-logic env depth))
-          ((= choice 8)  (gen-bool-not env depth))
-          ((= choice 9)  (gen-bool-pred env depth))
-          ((= choice 10) (gen-bool-if env depth))
-          ((= choice 11) (gen-bool-floatcmp env depth))
-          ((= choice 12) (gen-bool-mapcontains env depth))
-          ((= choice 13) (gen-bool-typepred env depth))
-          ((= choice 14) (gen-bool-strcontains env depth))
-          ((= choice 15) (gen-law env depth))
-          (else          (gen-bool-let env depth))))))
+    (gen-bool-leaf env)
+    (let ((choice (rng-int! 17)))
+      (cond
+        ((< choice 2) (gen-bool-leaf env))
+        ((= choice 2) (gen-bool-cmp '= env depth =))
+        ((= choice 3) (gen-bool-cmp '< env depth <))
+        ((= choice 4) (gen-bool-cmp '> env depth >))
+        ((= choice 5) (gen-bool-cmp '<= env depth <=))
+        ((= choice 6) (gen-bool-cmp '>= env depth >=))
+        ((= choice 7) (gen-bool-logic env depth))
+        ((= choice 8) (gen-bool-not env depth))
+        ((= choice 9) (gen-bool-pred env depth))
+        ((= choice 10) (gen-bool-if env depth))
+        ((= choice 11) (gen-bool-floatcmp env depth))
+        ((= choice 12) (gen-bool-mapcontains env depth))
+        ((= choice 13) (gen-bool-typepred env depth))
+        ((= choice 14) (gen-bool-strcontains env depth))
+        ((= choice 15) (gen-law env depth))
+        (else (gen-bool-let env depth))))))
 
 (define (gen-bool-leaf env)
   (let ((r (maybe-ref env 'bool)))
     (if (and (not (null? r)) (rng-bool!))
-        r
-        (let ((b (rng-bool!))) (mk b b)))))
+      r
+      (let ((b (rng-bool!))) (mk b b)))))
 
 (define (gen-bool-cmp op env depth f)
   (let ((a (gen-int env (- depth 1))) (b (gen-int env (- depth 1))))
     (mk (list op (gf a) (gf b)) (f (gv a) (gv b)))))
 
 (define (gen-bool-logic env depth)
-  (let ((x (gen-bool env (- depth 1))) (y (gen-bool env (- depth 1)))
+  (let ((x (gen-bool env (- depth 1)))
+        (y (gen-bool env (- depth 1)))
         (c (rng-int! 3)))
     (cond
       ((= c 0) (mk (list 'and (gf x) (gf y)) (and (gv x) (gv y))))
-      ((= c 1) (mk (list 'or  (gf x) (gf y)) (or  (gv x) (gv y))))
-      (else (let ((z (gen-bool env (- depth 1))))
-              (mk (list 'and (gf x) (gf y) (gf z))
-                  (and (gv x) (gv y) (gv z))))))))
+      ((= c 1) (mk (list 'or (gf x) (gf y)) (or (gv x) (gv y))))
+      (else
+        (let ((z (gen-bool env (- depth 1))))
+          (mk (list 'and (gf x) (gf y) (gf z))
+            (and (gv x) (gv y) (gv z))))))))
 
 (define (gen-bool-not env depth)
   (let ((x (gen-bool env (- depth 1))))
@@ -413,11 +432,11 @@
 (define (gen-bool-pred env depth)
   (let ((a (gen-int env (- depth 1))) (c (rng-int! 5)))
     (cond
-      ((= c 0) (mk (list 'even?     (gf a)) (even?     (gv a))))
-      ((= c 1) (mk (list 'odd?      (gf a)) (odd?      (gv a))))
-      ((= c 2) (mk (list 'zero?     (gf a)) (zero?     (gv a))))
+      ((= c 0) (mk (list 'even? (gf a)) (even? (gv a))))
+      ((= c 1) (mk (list 'odd? (gf a)) (odd? (gv a))))
+      ((= c 2) (mk (list 'zero? (gf a)) (zero? (gv a))))
       ((= c 3) (mk (list 'positive? (gf a)) (positive? (gv a))))
-      (else    (mk (list 'negative? (gf a)) (negative? (gv a)))))))
+      (else (mk (list 'negative? (gf a)) (negative? (gv a)))))))
 
 (define (gen-bool-if env depth)
   (let ((c (gen-bool env (- depth 1)))
@@ -426,7 +445,8 @@
     (mk (list 'if (gf c) (gf t) (gf e)) (if (gv c) (gv t) (gv e)))))
 
 (define (gen-bool-let env depth)
-  (let* ((v (gensym "v")) (init (gen-int env (- depth 1)))
+  (let* ((v (gensym "v"))
+         (init (gen-int env (- depth 1)))
          (env2 (cons (list v (gv init) 'int) env))
          (body (gen-bool env2 (- depth 1))))
     (mk (list 'let (list (list v (gf init))) (gf body)) (gv body))))
@@ -434,35 +454,35 @@
 ;; ── list (of ints) ─────────────────────────────────────────────────────────
 (define (gen-ilist env depth)
   (if (<= depth 0)
-      (gen-list-leaf env)
-      (let ((choice (rng-int! 17)))
-        (cond
-          ((< choice 3)  (gen-list-leaf env))
-          ((= choice 3)  (gen-list-cons env depth))
-          ((= choice 4)  (gen-list-reverse env depth))
-          ((= choice 5)  (gen-list-append env depth))
-          ((= choice 6)  (gen-list-map env depth))
-          ((= choice 7)  (gen-list-filter env depth))
-          ((= choice 8)  (gen-list-range env depth))
-          ((= choice 9)  (gen-list-rest env depth))
-          ((= choice 10) (gen-list-take env depth))
-          ((= choice 11) (gen-list-drop env depth))
-          ((= choice 12) (gen-list-sort env depth))
-          ((= choice 13) (gen-list-vals env depth))
-          ((= choice 14) (gen-list-fromvec env depth))
-          ((= choice 15) (gen-list-asyncall env depth))
-          (else          (gen-list-let env depth))))))
+    (gen-list-leaf env)
+    (let ((choice (rng-int! 17)))
+      (cond
+        ((< choice 3) (gen-list-leaf env))
+        ((= choice 3) (gen-list-cons env depth))
+        ((= choice 4) (gen-list-reverse env depth))
+        ((= choice 5) (gen-list-append env depth))
+        ((= choice 6) (gen-list-map env depth))
+        ((= choice 7) (gen-list-filter env depth))
+        ((= choice 8) (gen-list-range env depth))
+        ((= choice 9) (gen-list-rest env depth))
+        ((= choice 10) (gen-list-take env depth))
+        ((= choice 11) (gen-list-drop env depth))
+        ((= choice 12) (gen-list-sort env depth))
+        ((= choice 13) (gen-list-vals env depth))
+        ((= choice 14) (gen-list-fromvec env depth))
+        ((= choice 15) (gen-list-asyncall env depth))
+        (else (gen-list-let env depth))))))
 
 (define (gen-list-leaf env)
   (let ((r (maybe-ref env 'list)))
     (if (and (not (null? r)) (rng-bool!))
-        r
-        (let ((k (rng-int! 5)))
-          (let loop ((i 0) (fs (list)) (vs (list)))
-            (if (>= i k)
-                (mk (cons 'list (reverse fs)) (reverse vs))
-                (let ((n (rng-range! -9 9)))
-                  (loop (+ i 1) (cons n fs) (cons n vs)))))))))
+      r
+      (let ((k (rng-int! 5)))
+        (let loop ((i 0) (fs (list)) (vs (list)))
+          (if (>= i k)
+            (mk (cons 'list (reverse fs)) (reverse vs))
+            (let ((n (rng-range! -9 9)))
+              (loop (+ i 1) (cons n fs) (cons n vs)))))))))
 
 (define (gen-list-cons env depth)
   (let ((x (gen-int env (- depth 1))) (l (gen-ilist env (- depth 1))))
@@ -479,24 +499,30 @@
 ;; map with a closed, simple lambda — expected computed by applying the matching
 ;; real function to the known list value.
 (define (gen-list-map env depth)
-  (let* ((l (gen-ilist env (- depth 1))) (lv (gv l))
-         (k (rng-range! -5 5)) (c (rng-int! 3)))
+  (let* ((l (gen-ilist env (- depth 1)))
+         (lv (gv l))
+         (k (rng-range! -5 5))
+         (c (rng-int! 3)))
     (cond
-      ((= c 0) (mk (list 'map (list 'lambda (list 'x) (list '+ 'x k)) (gf l))
-                   (map (lambda (x) (+ x k)) lv)))
-      ((= c 1) (mk (list 'map (list 'lambda (list 'x) (list '* 'x k)) (gf l))
-                   (map (lambda (x) (* x k)) lv)))
-      (else    (mk (list 'map (list 'lambda (list 'x) (list 'abs 'x)) (gf l))
-                   (map (lambda (x) (abs x)) lv))))))
+      ((= c 0)
+        (mk (list 'map (list 'lambda (list 'x) (list '+ 'x k)) (gf l))
+          (map (lambda (x) (+ x k)) lv)))
+      ((= c 1)
+        (mk (list 'map (list 'lambda (list 'x) (list '* 'x k)) (gf l))
+          (map (lambda (x) (* x k)) lv)))
+      (else
+        (mk (list 'map (list 'lambda (list 'x) (list 'abs 'x)) (gf l))
+          (map (lambda (x) (abs x)) lv))))))
 
 (define (gen-list-filter env depth)
   (let* ((l (gen-ilist env (- depth 1))) (lv (gv l)) (c (rng-int! 3)))
     (cond
       ((= c 0) (mk (list 'filter 'even? (gf l)) (filter even? lv)))
-      ((= c 1) (mk (list 'filter 'odd?  (gf l)) (filter odd?  lv)))
-      (else (let ((k (rng-range! -5 5)))
-              (mk (list 'filter (list 'lambda (list 'x) (list '> 'x k)) (gf l))
-                  (filter (lambda (x) (> x k)) lv)))))))
+      ((= c 1) (mk (list 'filter 'odd? (gf l)) (filter odd? lv)))
+      (else
+        (let ((k (rng-range! -5 5)))
+          (mk (list 'filter (list 'lambda (list 'x) (list '> 'x k)) (gf l))
+            (filter (lambda (x) (> x k)) lv)))))))
 
 (define (gen-list-range env depth)
   (let* ((lo (rng-range! -5 5)) (hi (rng-range! lo (+ lo 8))))
@@ -505,11 +531,12 @@
 (define (gen-list-rest env depth)
   (let* ((l (gen-ilist env (- depth 1))) (lv (gv l)))
     (if (> (length lv) 0)
-        (mk (list 'rest (gf l)) (rest lv))
-        (mk (gf l) lv))))
+      (mk (list 'rest (gf l)) (rest lv))
+      (mk (gf l) lv))))
 
 (define (gen-list-let env depth)
-  (let* ((v (gensym "v")) (init (gen-int env (- depth 1)))
+  (let* ((v (gensym "v"))
+         (init (gen-int env (- depth 1)))
          (env2 (cons (list v (gv init) 'int) env))
          (body (gen-ilist env2 (- depth 1))))
     (mk (list 'let (list (list v (gf init))) (gf body)) (gv body))))
@@ -524,126 +551,162 @@
 (define (gen-int-try env depth)
   (let ((h (gen-int env (- depth 1))) (e (gensym "e")))
     (if (rng-bool!)
-        (let ((thrown (gen-int env (- depth 1))))
-          (mk (list 'try (list 'throw (gf thrown)) (list 'catch e (gf h)))
-              (gv h)))
-        (let ((body (gen-int env (- depth 1))))
-          (mk (list 'try (gf body) (list 'catch e (gf h)))
-              (gv body))))))
+      (let ((thrown (gen-int env (- depth 1))))
+        (mk (list 'try (list 'throw (gf thrown)) (list 'catch e (gf h)))
+          (gv h)))
+      (let ((body (gen-int env (- depth 1))))
+        (mk (list 'try (gf body) (list 'catch e (gf h)))
+          (gv body))))))
 
 ;; (match V (lit r) ... (x BODY))  — V is an int; last clause binds, so total.
 (define (gen-int-match env depth)
   (let* ((scrut (gen-int env (- depth 1)))
          (sv (gv scrut))
-         (k1 (rng-range! -6 6)) (r1 (gen-int env (- depth 1)))
-         (k2 (rng-range! -6 6)) (r2 (gen-int env (- depth 1)))
+         (k1 (rng-range! -6 6))
+         (r1 (gen-int env (- depth 1)))
+         (k2 (rng-range! -6 6))
+         (r2 (gen-int env (- depth 1)))
          (bn (gensym "m"))
          (rb (gen-int (cons (list bn sv 'int) env) (- depth 1))))
-    (mk (list 'match (gf scrut)
-              (list k1 (gf r1))
-              (list k2 (gf r2))
-              (list bn (gf rb)))
-        (cond ((= sv k1) (gv r1))
-              ((= sv k2) (gv r2))
-              (else (gv rb))))))
+    (mk
+      (list 'match
+        (gf scrut)
+        (list k1 (gf r1))
+        (list k2 (gf r2))
+        (list bn (gf rb)))
+      (cond
+        ((= sv k1) (gv r1))
+        ((= sv k2) (gv r2))
+        (else (gv rb))))))
 
 ;; (case V ((k1) r1) ((k2) r2) (else rd))
 (define (gen-int-case env depth)
   (let* ((scrut (gen-int env (- depth 1)))
          (sv (gv scrut))
-         (k1 (rng-range! -6 6)) (r1 (gen-int env (- depth 1)))
-         (k2 (rng-range! -6 6)) (r2 (gen-int env (- depth 1)))
+         (k1 (rng-range! -6 6))
+         (r1 (gen-int env (- depth 1)))
+         (k2 (rng-range! -6 6))
+         (r2 (gen-int env (- depth 1)))
          (rd (gen-int env (- depth 1))))
-    (mk (list 'case (gf scrut)
-              (list (list k1) (gf r1))
-              (list (list k2) (gf r2))
-              (list 'else (gf rd)))
-        (cond ((= sv k1) (gv r1))
-              ((= sv k2) (gv r2))
-              (else (gv rd))))))
+    (mk
+      (list 'case
+        (gf scrut)
+        (list (list k1) (gf r1))
+        (list (list k2) (gf r2))
+        (list 'else (gf rd)))
+      (cond
+        ((= sv k1) (gv r1))
+        ((= sv k2) (gv r2))
+        (else (gv rd))))))
 
 ;; (apply OP list-form) for OP in {+ *} — exercises apply + variadic dispatch.
 (define (gen-int-apply env depth)
   (let* ((l (gen-ilist env (- depth 1))) (lv (gv l)))
     (if (rng-bool!)
-        (mk (list 'apply '+ (gf l)) (apply + lv))
-        (mk (list 'apply '* (gf l)) (apply * lv)))))
+      (mk (list 'apply '+ (gf l)) (apply + lv))
+      (mk (list 'apply '* (gf l)) (apply * lv)))))
 
 ;; (((lambda (a) (lambda (b) (+ a b))) A) B) — curried/nested closures.
 (define (gen-int-curry env depth)
-  (let* ((a1 (gen-int env (- depth 1))) (a2 (gen-int env (- depth 1)))
-         (pa (gensym "a")) (pb (gensym "b")))
-    (mk (list (list (list 'lambda (list pa)
-                          (list 'lambda (list pb) (list '+ pa pb)))
-                    (gf a1))
-              (gf a2))
-        (+ (gv a1) (gv a2)))))
+  (let* ((a1 (gen-int env (- depth 1)))
+         (a2 (gen-int env (- depth 1)))
+         (pa (gensym "a"))
+         (pb (gensym "b")))
+    (mk
+      (list
+        (list
+          (list 'lambda
+            (list pa)
+            (list 'lambda (list pb) (list '+ pa pb)))
+          (gf a1))
+        (gf a2))
+      (+ (gv a1) (gv a2)))))
 
 ;; Pull an int out of a vec / string / map.
 (define (gen-int-fromcontainer env depth)
   (let ((c (rng-int! 6)))
     (cond
-      ((= c 0) (let* ((v (gen-vec env (- depth 1))) (vv (gv v)))
-                 (if (> (count vv) 0)
-                     (let ((i (rng-int! (count vv))))
-                       (mk (list 'nth (gf v) i) (nth vv i)))
-                     (mk (list 'count (gf v)) (count vv)))))
-      ((= c 1) (let ((v (gen-vec env (- depth 1))))
-                 (mk (list 'count (gf v)) (count (gv v)))))
-      ((= c 2) (let ((s (gen-str env (- depth 1))))
-                 (mk (list 'string-length (gf s)) (string-length (gv s)))))
-      ((= c 3) (let ((m (gen-map-v env (- depth 1))))
-                 (mk (list 'count (gf m)) (count (gv m)))))
-      ((= c 4) (let* ((l (gen-ilist env (- depth 1))) (lv (gv l)))
-                 ;; last of a nonempty list; fall back to length when empty
-                 (if (> (length lv) 0)
-                     (mk (list 'last (gf l)) (last lv))
-                     (mk (list 'length (gf l)) (length lv)))))
-      (else (let* ((m (gen-map-v env (- depth 1))) (mv (gv m)) (d (rng-range! -9 9)))
-              ;; get with default: deterministic regardless of key presence
-              (mk (list 'get (gf m) :zzz d) (get mv :zzz d)))))))
+      ((= c 0)
+        (let* ((v (gen-vec env (- depth 1))) (vv (gv v)))
+          (if (> (count vv) 0)
+            (let ((i (rng-int! (count vv))))
+              (mk (list 'nth (gf v) i) (nth vv i)))
+            (mk (list 'count (gf v)) (count vv)))))
+      ((= c 1)
+        (let ((v (gen-vec env (- depth 1))))
+          (mk (list 'count (gf v)) (count (gv v)))))
+      ((= c 2)
+        (let ((s (gen-str env (- depth 1))))
+          (mk (list 'string-length (gf s)) (string-length (gv s)))))
+      ((= c 3)
+        (let ((m (gen-map-v env (- depth 1))))
+          (mk (list 'count (gf m)) (count (gv m)))))
+      ((= c 4)
+        (let* ((l (gen-ilist env (- depth 1))) (lv (gv l)))
+          ;; last of a nonempty list; fall back to length when empty
+          (if (> (length lv) 0)
+            (mk (list 'last (gf l)) (last lv))
+            (mk (list 'length (gf l)) (length lv)))))
+      (else
+        (let* ((m (gen-map-v env (- depth 1)))
+               (mv (gv m))
+               (d (rng-range! -9 9)))
+          ;; get with default: deterministic regardless of key presence
+          (mk (list 'get (gf m) :zzz d) (get mv :zzz d)))))))
 
 ;; ── bit ops + expt (int) ─────────────────────────────────────────────────────
 (define (gen-int-bits env depth)
   (let ((a (gen-int env (- depth 1))) (c (rng-int! 7)))
     (cond
-      ((= c 0) (let ((b (gen-int env (- depth 1))))
-                 (mk (list 'bit/and (gf a) (gf b)) (bit/and (gv a) (gv b)))))
-      ((= c 1) (let ((b (gen-int env (- depth 1))))
-                 (mk (list 'bit/or (gf a) (gf b)) (bit/or (gv a) (gv b)))))
-      ((= c 2) (let ((b (gen-int env (- depth 1))))
-                 (mk (list 'bit/xor (gf a) (gf b)) (bit/xor (gv a) (gv b)))))
-      ((= c 3) (let ((s (rng-int! 16)))
-                 (mk (list 'bit/shift-left (gf a) s) (bit/shift-left (gv a) s))))
-      ((= c 4) (let ((s (rng-int! 16)))
-                 (mk (list 'bit/shift-right (gf a) s) (bit/shift-right (gv a) s))))
+      ((= c 0)
+        (let ((b (gen-int env (- depth 1))))
+          (mk (list 'bit/and (gf a) (gf b)) (bit/and (gv a) (gv b)))))
+      ((= c 1)
+        (let ((b (gen-int env (- depth 1))))
+          (mk (list 'bit/or (gf a) (gf b)) (bit/or (gv a) (gv b)))))
+      ((= c 2)
+        (let ((b (gen-int env (- depth 1))))
+          (mk (list 'bit/xor (gf a) (gf b)) (bit/xor (gv a) (gv b)))))
+      ((= c 3)
+        (let ((s (rng-int! 16)))
+          (mk (list 'bit/shift-left (gf a) s) (bit/shift-left (gv a) s))))
+      ((= c 4)
+        (let ((s (rng-int! 16)))
+          (mk (list 'bit/shift-right (gf a) s) (bit/shift-right (gv a) s))))
       ((= c 5) (mk (list 'bit/not (gf a)) (bit/not (gv a))))
-      (else (let ((base (rng-range! -4 4)) (e (rng-int! 7)))
-              (mk (list 'expt base e) (expt base e)))))))
+      (else
+        (let ((base (rng-range! -4 4)) (e (rng-int! 7)))
+          (mk (list 'expt base e) (expt base e)))))))
 
 ;; ── bool: type predicates over a random-typed value; string membership ───────
 (define (gen-bool-typepred env depth)
-  (let* ((v (gen-of (rng-pick! *types*) env (- depth 1))) (vv (gv v)) (c (rng-int! 6)))
+  (let* ((v (gen-of (rng-pick! *types*) env (- depth 1)))
+         (vv (gv v))
+         (c (rng-int! 6)))
     (cond
       ((= c 0) (mk (list 'string? (gf v)) (string? vv)))
-      ((= c 1) (mk (list 'list?   (gf v)) (list?   vv)))
-      ((= c 2) (mk (list 'map?    (gf v)) (map?    vv)))
+      ((= c 1) (mk (list 'list? (gf v)) (list? vv)))
+      ((= c 2) (mk (list 'map? (gf v)) (map? vv)))
       ((= c 3) (mk (list 'vector? (gf v)) (vector? vv)))
-      ((= c 4) (mk (list 'bool?   (gf v)) (bool?   vv)))
-      (else    (mk (list 'nil?    (gf v)) (nil?    vv))))))
+      ((= c 4) (mk (list 'bool? (gf v)) (bool? vv)))
+      (else (mk (list 'nil? (gf v)) (nil? vv))))))
 
 (define (gen-bool-strcontains env depth)
   (let ((s (gen-str env (- depth 1))) (sub (gen-str env (- depth 1))))
     (mk (list 'string/contains? (gf s) (gf sub))
-        (string/contains? (gv s) (gv sub)))))
+      (string/contains? (gv s) (gv sub)))))
 
 ;; ── list: take / drop / sort / vals(of map) / vector->list ───────────────────
 (define (gen-list-take env depth)
-  (let* ((l (gen-ilist env (- depth 1))) (lv (gv l)) (n (rng-int! (+ 1 (length lv)))))
+  (let* ((l (gen-ilist env (- depth 1)))
+         (lv (gv l))
+         (n (rng-int! (+ 1 (length lv)))))
     (mk (list 'take n (gf l)) (take n lv))))
 
 (define (gen-list-drop env depth)
-  (let* ((l (gen-ilist env (- depth 1))) (lv (gv l)) (n (rng-int! (+ 1 (length lv)))))
+  (let* ((l (gen-ilist env (- depth 1)))
+         (lv (gv l))
+         (n (rng-int! (+ 1 (length lv)))))
     (mk (list 'drop n (gf l)) (drop n lv))))
 
 (define (gen-list-sort env depth)
@@ -685,38 +748,48 @@
   (let ((k (rng-range! 1 4)))
     (let loop ((i 0) (tasks (list)) (sum 0))
       (if (>= i k)
-          (mk (list 'foldl '+ 0 (list 'async/all (cons 'list (reverse tasks)))) sum)
-          (let ((t (gen-int env (- depth 1))))
-            (loop (+ i 1) (cons (list 'async (gf t)) tasks) (+ sum (gv t))))))))
+        (mk (list 'foldl '+ 0 (list 'async/all (cons 'list (reverse tasks))))
+          sum)
+        (let ((t (gen-int env (- depth 1))))
+          (loop (+ i 1) (cons (list 'async (gf t)) tasks) (+ sum (gv t))))))))
 
 ;; Channel fan-in: spawn k senders, drive them with async/all, then drain+sum.
 ;; Order-independent reduction => expected is the sum no matter the recv order.
 (define (gen-int-asyncchan env depth)
   (let ((k (rng-range! 1 5))
-        (ch (gensym "ch")) (lp (gensym "loop")) (kk (gensym "k")) (acc (gensym "acc")))
+        (ch (gensym "ch"))
+        (lp (gensym "loop"))
+        (kk (gensym "k"))
+        (acc (gensym "acc")))
     (let loop ((i 0) (senders (list)) (sum 0))
       (if (>= i k)
-          (mk (list 'let (list (list ch (list 'channel/new 64)))
-                    (list 'async/all (cons 'list (reverse senders)))
-                    (list 'let lp (list (list kk 0) (list acc 0))
-                          (list 'if (list '>= kk k)
-                                acc
-                                (list lp (list '+ kk 1)
-                                      (list '+ acc (list 'channel/recv ch))))))
-              sum)
-          (let ((v (gen-int env (- depth 1))))
-            (loop (+ i 1)
-                  (cons (list 'async (list 'channel/send ch (gf v))) senders)
-                  (+ sum (gv v))))))))
+        (mk
+          (list 'let
+            (list (list ch (list 'channel/new 64)))
+            (list 'async/all (cons 'list (reverse senders)))
+            (list 'let
+              lp
+              (list (list kk 0) (list acc 0))
+              (list 'if
+                (list '>= kk k)
+                acc
+                (list lp
+                  (list '+ kk 1)
+                  (list '+ acc (list 'channel/recv ch))))))
+          sum)
+        (let ((v (gen-int env (- depth 1))))
+          (loop (+ i 1)
+            (cons (list 'async (list 'channel/send ch (gf v))) senders)
+            (+ sum (gv v))))))))
 
 ;; (async/all (list (async T1) (async T2) ...))  => (v1 v2 ...) in spawn order.
 (define (gen-list-asyncall env depth)
   (let ((k (rng-range! 1 4)))
     (let loop ((i 0) (tasks (list)) (vals (list)))
       (if (>= i k)
-          (mk (list 'async/all (cons 'list (reverse tasks))) (reverse vals))
-          (let ((t (gen-int env (- depth 1))))
-            (loop (+ i 1) (cons (list 'async (gf t)) tasks) (cons (gv t) vals)))))))
+        (mk (list 'async/all (cons 'list (reverse tasks))) (reverse vals))
+        (let ((t (gen-int env (- depth 1))))
+          (loop (+ i 1) (cons (list 'async (gf t)) tasks) (cons (gv t) vals)))))))
 
 ;; ── metamorphic / differential laws (independent oracle for native ops) ──────
 ;; The plain value oracle computes `expected` by calling the SAME builtin the
@@ -725,127 +798,169 @@
 ;; whose expected value is the literal #t, cross-checking an op against an
 ;; independent computation. A broken op makes the two sides disagree → the law
 ;; evaluates to #f ≠ #t → caught.
-(define (law form) (mk form #t))     ; a law: must evaluate to #t on a correct VM
+(define (law form) (mk form #t)) ; a law: must evaluate to #t on a correct VM
 
 (define (gen-law env depth)
   (let ((c (rng-int! 17)))
     (cond
       ;; reverse == fold-cons
       ((= c 0)
-       (let ((l (gen-ilist env (- depth 1))))
-         (law (list '= (list 'reverse (gf l))
-                    (list 'foldl (list 'lambda (list 'a 'x) (list 'cons 'x 'a))
-                          (list 'list) (gf l))))))
+        (let ((l (gen-ilist env (- depth 1))))
+          (law
+            (list '=
+              (list 'reverse (gf l))
+              (list 'foldl
+                (list 'lambda (list 'a 'x) (list 'cons 'x 'a))
+                (list 'list)
+                (gf l))))))
       ;; last L == first (reverse L)   [nonempty]
       ((= c 1)
-       (let* ((l (gen-ilist env (- depth 1))) (lv (gv l)))
-         (if (> (length lv) 0)
-             (law (list '= (list 'last (gf l)) (list 'first (list 'reverse (gf l)))))
-             (law #t))))
+        (let* ((l (gen-ilist env (- depth 1))) (lv (gv l)))
+          (if (> (length lv) 0)
+            (law
+              (list '= (list 'last (gf l)) (list 'first (list 'reverse (gf l)))))
+            (law #t))))
       ;; append (take n L) (drop n L) == L
       ((= c 2)
-       (let* ((l (gen-ilist env (- depth 1))) (n (rng-int! (+ 1 (length (gv l))))))
-         (law (list '= (list 'append (list 'take n (gf l)) (list 'drop n (gf l))) (gf l)))))
+        (let* ((l (gen-ilist env (- depth 1)))
+               (n (rng-int! (+ 1 (length (gv l))))))
+          (law
+            (list '=
+              (list 'append (list 'take n (gf l)) (list 'drop n (gf l)))
+              (gf l)))))
       ;; length (append A B) == length A + length B
       ((= c 3)
-       (let ((a (gen-ilist env (- depth 1))) (b (gen-ilist env (- depth 1))))
-         (law (list '= (list 'length (list 'append (gf a) (gf b)))
-                    (list '+ (list 'length (gf a)) (list 'length (gf b)))))))
+        (let ((a (gen-ilist env (- depth 1))) (b (gen-ilist env (- depth 1))))
+          (law
+            (list '=
+              (list 'length (list 'append (gf a) (gf b)))
+              (list '+ (list 'length (gf a)) (list 'length (gf b)))))))
       ;; sort L == sort (reverse L)   (sort is order-independent)
       ((= c 4)
-       (let ((l (gen-ilist env (- depth 1))))
-         (law (list '= (list 'sort (gf l)) (list 'sort (list 'reverse (gf l)))))))
+        (let ((l (gen-ilist env (- depth 1))))
+          (law (list '= (list 'sort (gf l)) (list 'sort (list 'reverse (gf l)))))))
       ;; sum (sort L) == sum L        (sort preserves the multiset)
       ((= c 5)
-       (let ((l (gen-ilist env (- depth 1))))
-         (law (list '= (list 'foldl '+ 0 (list 'sort (gf l))) (list 'foldl '+ 0 (gf l))))))
+        (let ((l (gen-ilist env (- depth 1))))
+          (law
+            (list '=
+              (list 'foldl '+ 0 (list 'sort (gf l)))
+              (list 'foldl '+ 0 (gf l))))))
       ;; length L == #even + #odd
       ((= c 6)
-       (let ((l (gen-ilist env (- depth 1))))
-         (law (list '= (list 'length (gf l))
-                    (list '+ (list 'length (list 'filter 'even? (gf l)))
-                          (list 'length (list 'filter 'odd? (gf l))))))))
+        (let ((l (gen-ilist env (- depth 1))))
+          (law
+            (list '=
+              (list 'length (gf l))
+              (list '+
+                (list 'length (list 'filter 'even? (gf l)))
+                (list 'length (list 'filter 'odd? (gf l))))))))
       ;; map (+ k) L == reverse (fold-cons (+ k) L)
       ((= c 7)
-       (let ((l (gen-ilist env (- depth 1))) (k (rng-range! -5 5)))
-         (law (list '= (list 'map (list 'lambda (list 'x) (list '+ 'x k)) (gf l))
-                    (list 'reverse
-                          (list 'foldl (list 'lambda (list 'a 'x) (list 'cons (list '+ 'x k) 'a))
-                                (list 'list) (gf l)))))))
+        (let ((l (gen-ilist env (- depth 1))) (k (rng-range! -5 5)))
+          (law
+            (list '=
+              (list 'map (list 'lambda (list 'x) (list '+ 'x k)) (gf l))
+              (list 'reverse
+                (list 'foldl
+                  (list 'lambda (list 'a 'x) (list 'cons (list '+ 'x k) 'a))
+                  (list 'list)
+                  (gf l)))))))
       ;; (first (cons X L)) == X  &  length grows by 1
       ((= c 8)
-       (let ((x (gen-int env (- depth 1))) (l (gen-ilist env (- depth 1))))
-         (law (list 'and
-                    (list '= (list 'first (list 'cons (gf x) (gf l))) (gf x))
-                    (list '= (list 'length (list 'cons (gf x) (gf l)))
-                          (list '+ 1 (list 'length (gf l))))))))
+        (let ((x (gen-int env (- depth 1))) (l (gen-ilist env (- depth 1))))
+          (law
+            (list 'and
+              (list '= (list 'first (list 'cons (gf x) (gf l))) (gf x))
+              (list '=
+                (list 'length (list 'cons (gf x) (gf l)))
+                (list '+ 1 (list 'length (gf l))))))))
       ;; string-length (string-append A B) == lenA + lenB
       ((= c 9)
-       (let ((a (gen-str env (- depth 1))) (b (gen-str env (- depth 1))))
-         (law (list '= (list 'string-length (list 'string-append (gf a) (gf b)))
-                    (list '+ (list 'string-length (gf a)) (list 'string-length (gf b)))))))
+        (let ((a (gen-str env (- depth 1))) (b (gen-str env (- depth 1))))
+          (law
+            (list '=
+              (list 'string-length (list 'string-append (gf a) (gf b)))
+              (list '+
+                (list 'string-length (gf a))
+                (list 'string-length (gf b)))))))
       ;; string/reverse involution + length
       ((= c 10)
-       (let ((s (gen-str env (- depth 1))))
-         (law (list 'and
-                    (list '= (list 'string/reverse (list 'string/reverse (gf s))) (gf s))
-                    (list '= (list 'string-length (list 'string/reverse (gf s)))
-                          (list 'string-length (gf s)))))))
+        (let ((s (gen-str env (- depth 1))))
+          (law
+            (list 'and
+              (list '=
+                (list 'string/reverse (list 'string/reverse (gf s)))
+                (gf s))
+              (list '=
+                (list 'string-length (list 'string/reverse (gf s)))
+                (list 'string-length (gf s)))))))
       ;; get (assoc M K V) K == V
       ((= c 11)
-       (let ((m (gen-map-v env (- depth 1))) (k (rng-pick! *map-keys*))
-             (v (gen-int env (- depth 1))))
-         (law (list '= (list 'get (list 'assoc (gf m) k (gf v)) k) (gf v)))))
+        (let ((m (gen-map-v env (- depth 1)))
+              (k (rng-pick! *map-keys*))
+              (v (gen-int env (- depth 1))))
+          (law (list '= (list 'get (list 'assoc (gf m) k (gf v)) k) (gf v)))))
       ;; count (assoc M K V) law
       ((= c 12)
-       (let ((m (gen-map-v env (- depth 1))) (k (rng-pick! *map-keys*))
-             (v (gen-int env (- depth 1))))
-         (law (list '= (list 'count (list 'assoc (gf m) k (gf v)))
-                    (list 'if (list 'contains? (gf m) k)
-                          (list 'count (gf m))
-                          (list '+ 1 (list 'count (gf m))))))))
+        (let ((m (gen-map-v env (- depth 1)))
+              (k (rng-pick! *map-keys*))
+              (v (gen-int env (- depth 1))))
+          (law
+            (list '=
+              (list 'count (list 'assoc (gf m) k (gf v)))
+              (list 'if
+                (list 'contains? (gf m) k)
+                (list 'count (gf m))
+                (list '+ 1 (list 'count (gf m))))))))
       ;; distributivity: a*(b+c) == a*b + a*c
       ((= c 13)
-       (let ((a (gen-int env (- depth 1))) (b (gen-int env (- depth 1)))
-             (cc (gen-int env (- depth 1))))
-         (law (list '= (list '* (gf a) (list '+ (gf b) (gf cc)))
-                    (list '+ (list '* (gf a) (gf b)) (list '* (gf a) (gf cc)))))))
+        (let ((a (gen-int env (- depth 1)))
+              (b (gen-int env (- depth 1)))
+              (cc (gen-int env (- depth 1))))
+          (law
+            (list '=
+              (list '* (gf a) (list '+ (gf b) (gf cc)))
+              (list '+ (list '* (gf a) (gf b)) (list '* (gf a) (gf cc)))))))
       ;; rational literal commutativity — exercises the `a/b` reader literal
       ;; and its arithmetic end-to-end through the compile/VM oracle.
       ((= c 14)
-       (let ((r (gen-rational-atom)))
-         (law (list '= (list '+ r 1) (list '+ 1 r)))))
+        (let ((r (gen-rational-atom)))
+          (law (list '= (list '+ r 1) (list '+ 1 r)))))
       ;; complex literal commutativity — exercises the `a+bi` reader literal
       ;; end-to-end through the compile/VM oracle.
       ((= c 15)
-       (let ((z (gen-complex-atom)))
-         (law (list '= (list '+ z 1) (list '+ 1 z)))))
+        (let ((z (gen-complex-atom)))
+          (law (list '= (list '+ z 1) (list '+ 1 z)))))
       ;; vector->list preserves count
       (else
-       (let ((v (gen-vec env (- depth 1))))
-         (law (list '= (list 'count (list 'vector->list (gf v))) (list 'count (gf v)))))))))
+        (let ((v (gen-vec env (- depth 1))))
+          (law
+            (list '=
+              (list 'count (list 'vector->list (gf v)))
+              (list 'count (gf v)))))))))
 
 ;; ── float ──────────────────────────────────────────────────────────────────
 ;; Magnitudes kept small so +/-/* never overflow to inf and never produce NaN;
 ;; float `=` is exact, and expected is computed with the same ops, so it holds.
 (define (gen-flt env depth)
   (if (<= depth 0)
-      (gen-flt-leaf env)
-      (let ((choice (rng-int! 9)))
-        (cond
-          ((< choice 3) (gen-flt-leaf env))
-          ((= choice 3) (gen-flt-bin '+ env depth +))
-          ((= choice 4) (gen-flt-bin '- env depth -))
-          ((= choice 5) (gen-flt-bin '* env depth *))
-          ((= choice 6) (gen-flt-unary env depth))
-          ((= choice 7) (gen-flt-if env depth))
-          (else         (gen-flt-let env depth))))))
+    (gen-flt-leaf env)
+    (let ((choice (rng-int! 9)))
+      (cond
+        ((< choice 3) (gen-flt-leaf env))
+        ((= choice 3) (gen-flt-bin '+ env depth +))
+        ((= choice 4) (gen-flt-bin '- env depth -))
+        ((= choice 5) (gen-flt-bin '* env depth *))
+        ((= choice 6) (gen-flt-unary env depth))
+        ((= choice 7) (gen-flt-if env depth))
+        (else (gen-flt-let env depth))))))
 
 (define (gen-flt-leaf env)
   (let ((r (maybe-ref env 'float)))
     (if (and (not (null? r)) (rng-bool!))
-        r
-        (let ((f (/ (rng-range! -400 400) 8.0))) (mk f f)))))
+      r
+      (let ((f (/ (rng-range! -400 400) 8.0))) (mk f f)))))
 
 (define (gen-flt-bin op env depth f)
   (let ((a (gen-flt env (- depth 1))) (b (gen-flt env (- depth 1))))
@@ -862,18 +977,20 @@
     (mk (list 'if (gf c) (gf t) (gf e)) (if (gv c) (gv t) (gv e)))))
 
 (define (gen-flt-let env depth)
-  (let* ((v (gensym "f")) (init (gen-flt env (- depth 1)))
+  (let* ((v (gensym "f"))
+         (init (gen-flt env (- depth 1)))
          (env2 (cons (list v (gv init) 'float) env))
          (body (gen-flt env2 (- depth 1))))
     (mk (list 'let (list (list v (gf init))) (gf body)) (gv body))))
 
 (define (gen-bool-floatcmp env depth)
-  (let ((a (gen-flt env (- depth 1))) (b (gen-flt env (- depth 1)))
+  (let ((a (gen-flt env (- depth 1)))
+        (b (gen-flt env (- depth 1)))
         (c (rng-int! 3)))
     (cond
       ((= c 0) (mk (list '< (gf a) (gf b)) (< (gv a) (gv b))))
       ((= c 1) (mk (list '> (gf a) (gf b)) (> (gv a) (gv b))))
-      (else    (mk (list '= (gf a) (gf a)) (= (gv a) (gv a)))))))
+      (else (mk (list '= (gf a) (gf a)) (= (gv a) (gv a)))))))
 
 ;; ── string ──────────────────────────────────────────────────────────────────
 ;; Forms are eval'd directly (not printed→read), so any content is fine; `=` is
@@ -884,30 +1001,30 @@
   (let ((len (rng-int! 6)))
     (let loop ((i 0) (acc ""))
       (if (>= i len)
-          acc
-          (let ((k (rng-int! (string-length *str-chars*))))
-            (loop (+ i 1) (string-append acc (substring *str-chars* k (+ k 1)))))))))
+        acc
+        (let ((k (rng-int! (string-length *str-chars*))))
+          (loop (+ i 1) (string-append acc (substring *str-chars* k (+ k 1)))))))))
 
 (define (gen-str env depth)
   (if (<= depth 0)
-      (gen-str-leaf env)
-      (let ((choice (rng-int! 11)))
-        (cond
-          ((< choice 3) (gen-str-leaf env))
-          ((= choice 3) (gen-str-append env depth))
-          ((= choice 4) (gen-str-sub env depth))
-          ((= choice 5) (gen-str-case env depth #t))
-          ((= choice 6) (gen-str-case env depth #f))
-          ((= choice 7) (gen-str-reverse env depth))
-          ((= choice 8) (gen-str-repeat env depth))
-          ((= choice 9) (gen-str-numstr env depth))
-          (else         (gen-str-let env depth))))))
+    (gen-str-leaf env)
+    (let ((choice (rng-int! 11)))
+      (cond
+        ((< choice 3) (gen-str-leaf env))
+        ((= choice 3) (gen-str-append env depth))
+        ((= choice 4) (gen-str-sub env depth))
+        ((= choice 5) (gen-str-case env depth #t))
+        ((= choice 6) (gen-str-case env depth #f))
+        ((= choice 7) (gen-str-reverse env depth))
+        ((= choice 8) (gen-str-repeat env depth))
+        ((= choice 9) (gen-str-numstr env depth))
+        (else (gen-str-let env depth))))))
 
 (define (gen-str-leaf env)
   (let ((r (maybe-ref env 'string)))
     (if (and (not (null? r)) (rng-bool!))
-        r
-        (let ((s (rand-string))) (mk s s)))))
+      r
+      (let ((s (rand-string))) (mk s s)))))
 
 (define (gen-str-append env depth)
   (let ((a (gen-str env (- depth 1))) (b (gen-str env (- depth 1))))
@@ -916,22 +1033,23 @@
 (define (gen-str-sub env depth)
   (let* ((s (gen-str env (- depth 1))) (sv (gv s)) (n (string-length sv)))
     (if (= n 0)
-        (mk (gf s) sv)
-        (let* ((start (rng-int! n)) (end (rng-range! start n)))
-          (mk (list 'substring (gf s) start end) (substring sv start end))))))
+      (mk (gf s) sv)
+      (let* ((start (rng-int! n)) (end (rng-range! start n)))
+        (mk (list 'substring (gf s) start end) (substring sv start end))))))
 
 (define (gen-str-case env depth up)
   (let ((s (gen-str env (- depth 1))))
     (if up
-        (mk (list 'string-upcase (gf s)) (string-upcase (gv s)))
-        (mk (list 'string-downcase (gf s)) (string-downcase (gv s))))))
+      (mk (list 'string-upcase (gf s)) (string-upcase (gv s)))
+      (mk (list 'string-downcase (gf s)) (string-downcase (gv s))))))
 
 (define (gen-str-reverse env depth)
   (let ((s (gen-str env (- depth 1))))
     (mk (list 'string/reverse (gf s)) (string/reverse (gv s)))))
 
 (define (gen-str-let env depth)
-  (let* ((v (gensym "s")) (init (gen-str env (- depth 1)))
+  (let* ((v (gensym "s"))
+         (init (gen-str env (- depth 1)))
          (env2 (cons (list v (gv init) 'string) env))
          (body (gen-str env2 (- depth 1))))
     (mk (list 'let (list (list v (gf init))) (gf body)) (gv body))))
@@ -940,50 +1058,51 @@
 (define (gen-vec env depth)
   (cond
     ((and (> depth 0) (= 0 (rng-int! 4)))
-     ;; (list->vector <list-expr>) — exercises the conversion
-     (let ((l (gen-ilist env (- depth 1))))
-       (mk (list 'list->vector (gf l)) (list->vector (gv l)))))
+      ;; (list->vector <list-expr>) — exercises the conversion
+      (let ((l (gen-ilist env (- depth 1))))
+        (mk (list 'list->vector (gf l)) (list->vector (gv l)))))
     (else
-     (let ((r (maybe-ref env 'vec)))
-       (if (and (not (null? r)) (rng-bool!))
-           r
-           (let ((k (rng-int! 5)))
-             (let loop ((i 0) (fs (list)) (vs (list)))
-               (if (>= i k)
-                   (mk (cons 'vector (reverse fs)) (list->vector (reverse vs)))
-                   (let ((n (rng-range! -9 9)))
-                     (loop (+ i 1) (cons n fs) (cons n vs)))))))))))
+      (let ((r (maybe-ref env 'vec)))
+        (if (and (not (null? r)) (rng-bool!))
+          r
+          (let ((k (rng-int! 5)))
+            (let loop ((i 0) (fs (list)) (vs (list)))
+              (if (>= i k)
+                (mk (cons 'vector (reverse fs)) (list->vector (reverse vs)))
+                (let ((n (rng-range! -9 9)))
+                  (loop (+ i 1) (cons n fs) (cons n vs)))))))))))
 
 ;; ── map (keyword -> int) ─────────────────────────────────────────────────────
 (define *map-keys* (list :a :b :c :d :e))
 
 (define (gen-map-v env depth)
   (if (<= depth 0)
-      (gen-map-leaf env)
-      (let ((choice (rng-int! 7)))
-        (cond
-          ((< choice 3) (gen-map-leaf env))
-          ((= choice 3) (gen-map-assoc env depth))
-          ((= choice 4) (gen-map-dissoc env depth))
-          ((= choice 5) (gen-map-merge env depth))
-          (else         (gen-map-leaf env))))))
+    (gen-map-leaf env)
+    (let ((choice (rng-int! 7)))
+      (cond
+        ((< choice 3) (gen-map-leaf env))
+        ((= choice 3) (gen-map-assoc env depth))
+        ((= choice 4) (gen-map-dissoc env depth))
+        ((= choice 5) (gen-map-merge env depth))
+        (else (gen-map-leaf env))))))
 
 (define (gen-map-leaf env)
   (let ((r (maybe-ref env 'map)))
     (if (and (not (null? r)) (rng-bool!))
-        r
-        ;; build a literal via an assoc chain over distinct keys
-        (let ((k (rng-int! 4)))
-          (let loop ((i 0) (form {}) (val {}))
-            (if (>= i k)
-                (mk form val)
-                (let ((key (nth *map-keys* i)) (n (rng-range! -9 9)))
-                  (loop (+ i 1)
-                        (list 'assoc form key n)
-                        (assoc val key n)))))))))
+      r
+      ;; build a literal via an assoc chain over distinct keys
+      (let ((k (rng-int! 4)))
+        (let loop ((i 0) (form {}) (val {}))
+          (if (>= i k)
+            (mk form val)
+            (let ((key (nth *map-keys* i)) (n (rng-range! -9 9)))
+              (loop (+ i 1)
+                (list 'assoc form key n)
+                (assoc val key n)))))))))
 
 (define (gen-map-assoc env depth)
-  (let ((m (gen-map-v env (- depth 1))) (k (rng-pick! *map-keys*))
+  (let ((m (gen-map-v env (- depth 1)))
+        (k (rng-pick! *map-keys*))
         (x (gen-int env (- depth 1))))
     (mk (list 'assoc (gf m) k (gf x)) (assoc (gv m) k (gv x)))))
 
@@ -1009,13 +1128,24 @@
 
 (define (report-fail kind form a b)
   (set! *failures* (+ *failures* 1))
-  (display "FAIL [") (display kind) (display "] seed=") (display (number->string *cur-seed*))
+  (display "FAIL [")
+  (display kind)
+  (display "] seed=")
+  (display (number->string *cur-seed*))
   (newline)
-  (display "  form:     ") (display (str form)) (newline)
-  (display "  expected: ") (display (str a)) (newline)
-  (display "  actual:   ") (display (str b)) (newline)
-  (display "  reproduce: SEMA_FUZZ_SEED=") (display (number->string *cur-seed*))
-  (display " SEMA_FUZZ_COUNT=1") (newline)
+  (display "  form:     ")
+  (display (str form))
+  (newline)
+  (display "  expected: ")
+  (display (str a))
+  (newline)
+  (display "  actual:   ")
+  (display (str b))
+  (newline)
+  (display "  reproduce: SEMA_FUZZ_SEED=")
+  (display (number->string *cur-seed*))
+  (display " SEMA_FUZZ_COUNT=1")
+  (newline)
   #f)
 
 (define (check-roundtrip d)
@@ -1029,18 +1159,18 @@
     (try
       (let ((d2 (read s)))
         (if (= wrapped d2)
-            #t
-            (report-fail "roundtrip" wrapped s d2)))
+          #t
+          (report-fail "roundtrip" wrapped s d2)))
       (catch e (report-fail "roundtrip-read-error" wrapped s e)))))
 
 (define (check-oracle pair)
-  (let ((form     (gf pair))
+  (let ((form (gf pair))
         (expected (gv pair)))
     (try
       (let ((got (eval form)))
         (if (= expected got)
-            #t
-            (report-fail "oracle" form expected got)))
+          #t
+          (report-fail "oracle" form expected got)))
       (catch e (report-fail "oracle-eval-error" form expected e)))))
 
 ;; ─────────────────────────────────────────────────────────────────────────
@@ -1055,11 +1185,11 @@
   (let ((v (env name)))
     (if (null? v) default (string->number v))))
 
-(define base-seed  (cfg-int "SEMA_FUZZ_SEED" 0))
+(define base-seed (cfg-int "SEMA_FUZZ_SEED" 0))
 (define iterations (cfg-int "SEMA_FUZZ_COUNT" 200))
-(define max-depth  (cfg-int "SEMA_FUZZ_DEPTH" 4))
-(define mode       (cfg "SEMA_FUZZ_MODE" "check"))
-(define out-file   (env "SEMA_FUZZ_OUT"))
+(define max-depth (cfg-int "SEMA_FUZZ_DEPTH" 4))
+(define mode (cfg "SEMA_FUZZ_MODE" "check"))
+(define out-file (env "SEMA_FUZZ_OUT"))
 (define crash-file (env "SEMA_FUZZ_CRASH_FILE"))
 (set! *verbose* (= "1" (cfg "SEMA_FUZZ_VERBOSE" "0")))
 
@@ -1068,54 +1198,82 @@
 ;; ─────────────────────────────────────────────────────────────────────────
 
 (define (run-check)
-  (display "grammar-fuzz: check  seed=") (display (number->string base-seed))
-  (display " count=") (display (number->string iterations))
-  (display " depth=") (display (number->string max-depth)) (newline)
+  (display "grammar-fuzz: check  seed=")
+  (display (number->string base-seed))
+  (display " count=")
+  (display (number->string iterations))
+  (display " depth=")
+  (display (number->string max-depth))
+  (newline)
   (let loop ((i 0))
     (if (>= i iterations)
-        (finish)
-        (let ((seed (+ base-seed i)))
-          (set! *cur-seed* seed)
-          (when (not (null? crash-file)) (file/write crash-file (number->string seed)))
-          (rng-seed! seed)
-          ;; round-trip property on a random datum
-          (let ((d (gen-datum max-depth)))
-            (let ((ok (check-roundtrip d)))
-              (when (and *verbose* ok)
-                (display "ok roundtrip: ") (display (str d)) (newline))))
-          ;; value oracle on a typed program (same RNG stream continues)
-          (let ((p (gen-typed max-depth)))
-            (let ((ok (check-oracle p)))
-              (when (and *verbose* ok)
-                (display "ok oracle: ") (display (str (gf p)))
-                (display " = ") (display (str (gv p))) (newline))))
-          (loop (+ i 1))))))
+      (finish)
+      (let ((seed (+ base-seed i)))
+        (set! *cur-seed* seed)
+        (when (not (null? crash-file))
+          (file/write crash-file (number->string seed)))
+        (rng-seed! seed)
+        ;; round-trip property on a random datum
+        (let ((d (gen-datum max-depth)))
+          (let ((ok (check-roundtrip d)))
+            (when (and *verbose* ok)
+              (display "ok roundtrip: ")
+              (display (str d))
+              (newline))))
+        ;; value oracle on a typed program (same RNG stream continues)
+        (let ((p (gen-typed max-depth)))
+          (let ((ok (check-oracle p)))
+            (when (and *verbose* ok)
+              (display "ok oracle: ")
+              (display (str (gf p)))
+              (display " = ")
+              (display (str (gv p)))
+              (newline))))
+        (loop (+ i 1))))))
 
 (define (finish)
   ;; success: clear the crash breadcrumb so the driver knows we exited cleanly
   (when (not (null? crash-file)) (file/write crash-file "ok"))
   (newline)
   (if (= *failures* 0)
-      (begin (display "PASS: ") (display (number->string iterations))
-             (display " iterations, 0 failures") (newline) (exit 0))
-      (begin (display "FAILURES: ") (display (number->string *failures*)) (newline)
-             (exit 1))))
+    (begin
+      (display "PASS: ")
+      (display (number->string iterations))
+      (display " iterations, 0 failures")
+      (newline)
+      (exit 0))
+    (begin
+      (display "FAILURES: ")
+      (display (number->string *failures*))
+      (newline)
+      (exit 1))))
 
 (define (run-emit)
   (let loop ((i 0) (acc (list)))
     (if (>= i iterations)
-        (let ((text (string/join (reverse acc) "\n")))
-          (if (null? out-file)
-              (begin (display text) (newline))
-              (begin (file/write out-file (string-append text "\n"))
-                     (display "wrote ") (display (number->string iterations))
-                     (display " programs to ") (display out-file) (newline))))
-        (begin
-          (rng-seed! (+ base-seed i))
-          (let ((p (gen-typed max-depth)))
-            (loop (+ i 1)
-                  (cons (string-append "; seed=" (number->string (+ base-seed i))
-                                       " => " (str (gv p)) "\n" (str (gf p)))
-                        acc)))))))
+      (let ((text (string/join (reverse acc) "\n")))
+        (if (null? out-file)
+          (begin
+            (display text)
+            (newline))
+          (begin
+            (file/write out-file (string-append text "\n"))
+            (display "wrote ")
+            (display (number->string iterations))
+            (display " programs to ")
+            (display out-file)
+            (newline))))
+      (begin
+        (rng-seed! (+ base-seed i))
+        (let ((p (gen-typed max-depth)))
+          (loop (+ i 1)
+            (cons
+              (string-append "; seed="
+                (number->string (+ base-seed i))
+                " => "
+                (str (gv p))
+                "\n"
+                (str (gf p)))
+              acc)))))))
 
 (if (= mode "emit") (run-emit) (run-check))

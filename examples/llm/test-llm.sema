@@ -13,12 +13,13 @@
 (println "\n=== Test 2: llm/chat ===")
 (define reply
   (llm/chat
-    (list (message
-            :system
-            "Reply with exactly the word YES")
-          (message
-            :user
-            "Do you understand?"))
+    (list
+      (message
+        :system
+        "Reply with exactly the word YES")
+      (message
+        :user
+        "Do you understand?"))
     {:max-tokens 10}))
 (println reply)
 
@@ -64,25 +65,26 @@
     ;; Simple eval: parse "a op b" and compute
     (let ((parts (string/split expr " ")))
       (if (= (length parts) 3)
-        (let ((a   (string/to-number (nth parts 0)))
-              (op  (nth parts 1))
-              (b   (string/to-number (nth parts 2))))
+        (let ((a (string/to-number (nth parts 0)))
+              (op (nth parts 1))
+              (b (string/to-number (nth parts 2))))
           (cond
-            ((= op "+")  (number/to-string (+ a b)))
-            ((= op "-")  (number/to-string (- a b)))
-            ((= op "*")  (number/to-string (* a b)))
-            ((= op "/")  (number/to-string (/ a b)))
-            (else        "unknown operator")))
+            ((= op "+") (number/to-string (+ a b)))
+            ((= op "-") (number/to-string (- a b)))
+            ((= op "*") (number/to-string (* a b)))
+            ((= op "/") (number/to-string (/ a b)))
+            (else "unknown operator")))
         expr))))
 
 (define tool-result
   (llm/chat
-    (list (message
-            :system
-            "You are a helpful assistant. Use the calculator tool to answer math questions. After getting the result, tell the user.")
-          (message
-            :user
-            "What is 137 * 42?"))
+    (list
+      (message
+        :system
+        "You are a helpful assistant. Use the calculator tool to answer math questions. After getting the result, tell the user.")
+      (message
+        :user
+        "What is 137 * 42?"))
     {:tools (list calculator)
      :max-tokens 200}))
 (println tool-result)

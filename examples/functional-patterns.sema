@@ -9,13 +9,13 @@
 (define (curry3 f)
   (fn (a) (fn (b) (fn (c) (f a b c)))))
 
-(define add   (curry2 +))
-(define add5  (add 5))
+(define add (curry2 +))
+(define add5 (add 5))
 (println f"Curried add5(3) = ${(add5 3)}")
 
-(define multiply  (curry2 *))
-(define double    (multiply 2))
-(define triple    (multiply 3))
+(define multiply (curry2 *))
+(define double (multiply 2))
+(define triple (multiply 3))
 (println f"double(7) = ${(double 7)}, triple(7) = ${(triple 7)}")
 
 ;; === 2. Function Composition Pipeline ===
@@ -53,18 +53,18 @@
   (fn (n) (if (<= n 1) n (+ (fib-slow (- n 1)) (fib-slow (- n 2))))))
 
 ;; Non-memoized timing
-(define start       (time-ms))
-(define fib-result  (fib-slow 25))
-(define slow-time   (- (time-ms) start))
+(define start (time-ms))
+(define fib-result (fib-slow 25))
+(define slow-time (- (time-ms) start))
 
 ;; TCO fibonacci for comparison
 (define (fib-fast n)
   (let loop ((i n) (a 0) (b 1))
     (if (= i 0) a (loop (- i 1) b (+ a b)))))
 
-(define start2       (time-ms))
-(define fib-result2  (fib-fast 25))
-(define fast-time    (- (time-ms) start2))
+(define start2 (time-ms))
+(define fib-result2 (fib-fast 25))
+(define fast-time (- (time-ms) start2))
 
 (println f"\nfib(25) = ${fib-result}")
 (println f"  Naive recursive: ${slow-time}ms")
@@ -126,17 +126,17 @@
     {}
     lst))
 
-(define words      (list "the" "cat" "sat" "on" "the" "mat" "the" "cat"))
-(define word-freq  (frequencies words))
+(define words (list "the" "cat" "sat" "on" "the" "mat" "the" "cat"))
+(define word-freq (frequencies words))
 (println f"\nWord frequencies: ${word-freq}")
 
 ;; === 7. Recursive Data Structures ===
 
 ;; Tree as nested lists: (value left right)
-(define (make-tree val left right)  (list val left right))
-(define (tree-val t)                (first t))
-(define (tree-left t)               (nth t 1))
-(define (tree-right t)              (nth t 2))
+(define (make-tree val left right) (list val left right))
+(define (tree-val t) (first t))
+(define (tree-left t) (nth t 1))
+(define (tree-right t) (nth t 2))
 
 (define (tree-insert tree val)
   (if (nil? tree)
@@ -195,9 +195,9 @@
 (define (collatz n)
   (let loop ((x n) (steps 0))
     (cond
-      ((= x 1)    steps)
-      ((even? x)  (loop (/ x 2) (+ steps 1)))
-      (else       (loop (+ (* 3 x) 1) (+ steps 1))))))
+      ((= x 1) steps)
+      ((even? x) (loop (/ x 2) (+ steps 1)))
+      (else (loop (+ (* 3 x) 1) (+ steps 1))))))
 
 (println f"\nCollatz sequence lengths:")
 (let loop ((nums (list 1 7 27 97 871 6171)))

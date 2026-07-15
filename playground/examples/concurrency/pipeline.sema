@@ -7,13 +7,15 @@
 ;; "end of stream" downstream: a stage that reads nil closes its own output
 ;; and finishes. This is how you build streaming dataflow out of channels.
 
-(define c1 (channel/new 4))    ; source -> transform
-(define c2 (channel/new 4))    ; transform -> sink
+(define c1 (channel/new 4)) ; source -> transform
+(define c2 (channel/new 4)) ; transform -> sink
 
 ;; Stage 1: emit 1..12 then close.
 (define source
   (async
-    (for-each (fn (n) (channel/send c1 n)) (range 1 13))
+    (for-each
+      (fn (n) (channel/send c1 n))
+      (range 1 13))
     (channel/close c1)))
 
 ;; Stage 2: square each value, forward downstream, propagate close.
@@ -23,7 +25,9 @@
       (let ((n (channel/recv c1)))
         (if (nil? n)
           (channel/close c2)
-          (begin (channel/send c2 (* n n)) (loop)))))))
+          (begin
+            (channel/send c2 (* n n))
+            (loop)))))))
 
 ;; Stage 3: collect results and render each as a scaled bar.
 (define (bar n) (string/repeat "▮" n))
@@ -45,6 +49,7 @@
 (println "n   n² through the pipeline")
 (for-each
   (fn (sq)
-    (println (str "    " (string/pad-left (str sq) 4) " │ " (bar (floor (/ sq 4))))))
+    (println
+      (str "    " (string/pad-left (str sq) 4) " │ " (bar (floor (/ sq 4))))))
   out)
 (println "\nsum of squares 1..12 =" (foldl + 0 out))

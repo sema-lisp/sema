@@ -3,56 +3,68 @@
 ;;; as-> (thread-as), some-> (nil-safe)
 
 (defmacro -> (val . forms)
-  (if (null? forms) val
+  (if (null? forms)
+    val
     (let ((form (car forms)) (rest (cdr forms)))
       (if (list? form)
         `(-> (,(car form) ,val ,@(cdr form)) ,@rest)
         `(-> (,form ,val) ,@rest)))))
 
 (defmacro ->> (val . forms)
-  (if (null? forms) val
+  (if (null? forms)
+    val
     (let ((form (car forms)) (rest (cdr forms)))
       (if (list? form)
         `(->> (,(car form) ,@(cdr form) ,val) ,@rest)
         `(->> (,form ,val) ,@rest)))))
 
 (defmacro as-> (val name . forms)
-  (if (null? forms) val
+  (if (null? forms)
+    val
     (let ((form (car forms)) (rest (cdr forms)))
       `(let ((,name ,val))
-         (as-> ,form ,name ,@rest)))))
+        (as-> ,form ,name ,@rest)))))
 
 (defmacro some-> (val . forms)
-  (if (null? forms) val
+  (if (null? forms)
+    val
     (let ((form (car forms)) (rest (cdr forms)))
       (if (list? form)
         `(let ((__v ,val))
-           (if (nil? __v) nil (some-> (,(car form) __v ,@(cdr form)) ,@rest)))
+          (if (nil? __v) nil (some-> (,(car form) __v ,@(cdr form)) ,@rest)))
         `(let ((__v ,val))
-           (if (nil? __v) nil (some-> (,form __v) ,@rest)))))))
+          (if (nil? __v) nil (some-> (,form __v) ,@rest)))))))
 
 (println "=== Threading Macros ===\n")
 
 (println "--- Thread-first (->) ---")
 (println (format "  (-> 5 (+ 3) (* 2))           = ~a" (-> 5 (+ 3) (* 2))))
-(println (format "  (-> \"hello\" string/length)    = ~a" (-> "hello" string/length)))
+(println
+  (format "  (-> \"hello\" string/length)    = ~a" (-> "hello" string/length)))
 
 (println "\n--- Thread-last (->>) ---")
-(println (format "  (->> (range 10) (filter odd?)) = ~a" (->> (range 10) (filter odd?))))
-(println (format "  (->> (range 1 11) (filter even?) (foldl + 0)) = ~a"
-  (->> (range 1 11) (filter even?) (foldl + 0))))
+(println
+  (format "  (->> (range 10) (filter odd?)) = ~a"
+    (->> (range 10) (filter odd?))))
+(println
+  (format "  (->> (range 1 11) (filter even?) (foldl + 0)) = ~a"
+    (->> (range 1 11) (filter even?) (foldl + 0))))
 
 (println "\n--- Thread-as (as->) ---")
-(println (format "  (as-> 5 x (+ x 3) (* x x) (- x 1)) = ~a"
-  (as-> 5 x (+ x 3) (* x x) (- x 1))))
+(println
+  (format "  (as-> 5 x (+ x 3) (* x x) (- x 1)) = ~a"
+    (as-> 5 x (+ x 3) (* x x) (- x 1))))
 
 (println "\n--- Nil-safe threading (some->) ---")
-(define people {:alice {:age 30 :address {:city "Paris"}}
-                :bob {:age 25 :address nil}})
-(println (format "  alice's city: ~a"
-  (some-> (get people :alice) (get :address) (get :city))))
-(println (format "  bob's city:   ~a"
-  (some-> (get people :bob) (get :address) (get :city))))
+(define people
+  {:alice {:age 30 :address {:city "Paris"}}
+   :bob {:age 25 :address nil}})
+(println
+  (format "  alice's city: ~a"
+    (some-> (get people :alice) (get :address) (get :city))))
+(println
+  (format "  bob's city:   ~a"
+    (some-> (get people :bob) (get :address) (get :city))))
 
 ;; Practical: word frequency pipeline
 (println "\n--- Word frequency pipeline ---")
@@ -60,10 +72,13 @@
 (define top-words
   (sort
     (->> (string/split text " ")
-         (foldl (fn (acc w)
-                  (map/update acc (string/to-keyword w) (fn (v) (if (nil? v) 1 (+ v 1)))))
-                {})
-         (map/entries))
+      (foldl
+        (fn (acc w)
+          (map/update acc
+            (string/to-keyword w)
+            (fn (v) (if (nil? v) 1 (+ v 1)))))
+        {})
+      (map/entries))
     (fn (a b) (- (cadr b) (cadr a)))))
 
 (for-each

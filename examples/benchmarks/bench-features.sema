@@ -92,8 +92,8 @@
 ;; ============ 7. Map operations (hot path in 1BRC) ============
 (println "\n=== Map operations ===")
 
-(define small-map      {:a 1 :b 2 :c 3 :d 4 :e 5})
-(define small-hashmap  (hashmap/new :a 1 :b 2 :c 3 :d 4 :e 5))
+(define small-map {:a 1 :b 2 :c 3 :d 4 :e 5})
+(define small-hashmap (hashmap/new :a 1 :b 2 :c 3 :d 4 :e 5))
 
 (bench "get (BTreeMap)" (fn () (get small-map :c)) 100000)
 (bench "get (HashMap)" (fn () (get small-hashmap :c)) 100000)

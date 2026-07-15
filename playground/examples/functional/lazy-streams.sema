@@ -15,22 +15,24 @@
 
 (define (stream-drop n s)
   (let loop ((i n) (s s))
-    (if (or (= i 0) (stream-empty? s)) s
+    (if (or (= i 0) (stream-empty? s))
+      s
       (loop (- i 1) (stream-cdr s)))))
 
 (define (stream-ref s n) (stream-car (stream-drop n s)))
 
 (define (stream-map f s)
-  (if (stream-empty? s) stream-empty
+  (if (stream-empty? s)
+    stream-empty
     (stream-cons (f (stream-car s))
-                 (fn () (stream-map f (stream-cdr s))))))
+      (fn () (stream-map f (stream-cdr s))))))
 
 (define (stream-filter pred s)
   (cond
     ((stream-empty? s) stream-empty)
     ((pred (stream-car s))
-     (stream-cons (stream-car s)
-                  (fn () (stream-filter pred (stream-cdr s)))))
+      (stream-cons (stream-car s)
+        (fn () (stream-filter pred (stream-cdr s)))))
     (else (stream-filter pred (stream-cdr s)))))
 
 (define (stream-from n)
@@ -65,9 +67,10 @@
 (define (sieve s)
   (let ((p (stream-car s)))
     (stream-cons p
-      (fn () (sieve (stream-filter
-                      (fn (n) (not (= 0 (math/remainder n p))))
-                      (stream-cdr s)))))))
+      (fn ()
+        (sieve
+          (stream-filter (fn (n) (not (= 0 (math/remainder n p))))
+            (stream-cdr s)))))))
 
 (define primes (sieve (stream-from 2)))
 (println (format "\nFirst 25 primes: ~a" (stream-take 25 primes)))
@@ -76,8 +79,10 @@
 ;; Collatz streams
 (define (collatz-stream n)
   (stream-cons n
-    (fn () (if (= n 1) stream-empty
-      (collatz-stream (if (even? n) (/ n 2) (+ (* 3 n) 1)))))))
+    (fn ()
+      (if (= n 1)
+        stream-empty
+        (collatz-stream (if (even? n) (/ n 2) (+ (* 3 n) 1)))))))
 
 (println (format "\nCollatz(27): ~a" (stream-take 30 (collatz-stream 27))))
 

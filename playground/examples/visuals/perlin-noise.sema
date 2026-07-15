@@ -4,8 +4,12 @@
 (define seed (math/random-int 1 999999))
 
 (define (hash x y)
-  (let* ((h (mod (+ (* (abs x) 374761393) (* (abs y) 668265263)
-                    (* seed 1274126177)) 1000000003))
+  (let* ((h
+           (mod
+             (+ (* (abs x) 374761393)
+               (* (abs y) 668265263)
+               (* seed 1274126177))
+             1000000003))
          (h2 (mod (* h h) 1000000007)))
     (/ (mod (abs h2) 1000000) 1000000.0)))
 
@@ -16,27 +20,42 @@
 (define (lerp a b t) (+ a (* (- b a) t)))
 
 (define (value-noise x y)
-  (let* ((ix (floor x)) (iy (floor y))
-         (fx (- x ix)) (fy (- y iy))
-         (u (fade fx)) (v (fade fy)))
+  (let* ((ix (floor x))
+         (iy (floor y))
+         (fx (- x ix))
+         (fy (- y iy))
+         (u (fade fx))
+         (v (fade fy)))
     (lerp (lerp (hash ix iy) (hash (+ ix 1) iy) u)
-          (lerp (hash ix (+ iy 1)) (hash (+ ix 1) (+ iy 1)) u)
-          v)))
+      (lerp (hash ix (+ iy 1)) (hash (+ ix 1) (+ iy 1)) u)
+      v)))
 
 (define (octave-noise x y)
   (let loop ((i 0) (freq 1.0) (amp 1.0) (total 0.0) (max-amp 0.0))
-    (if (= i 3) (/ total max-amp)
-      (loop (+ i 1) (* freq 2.0) (* amp 0.5)
-            (+ total (* amp (value-noise (* x freq 0.08) (* y freq 0.08))))
-            (+ max-amp amp)))))
+    (if (= i 3)
+      (/ total max-amp)
+      (loop (+ i 1)
+        (* freq 2.0)
+        (* amp 0.5)
+        (+ total (* amp (value-noise (* x freq 0.08) (* y freq 0.08))))
+        (+ max-amp amp)))))
 
 (define (terrain-char val)
-  (cond ((< val 0.30) "~") ((< val 0.38) ".") ((< val 0.50) ",")
-        ((< val 0.60) ";") ((< val 0.72) ":") ((< val 0.85) "%")
-        (#t "#")))
+  (cond
+    ((< val 0.30) "~")
+    ((< val 0.38) ".")
+    ((< val 0.50) ",")
+    ((< val 0.60) ";")
+    ((< val 0.72) ":")
+    ((< val 0.85) "%")
+    (#t "#")))
 
-(for-each (fn (y)
-  (println (string/join (map (fn (x) (terrain-char (octave-noise x y))) (range width)) "")))
+(for-each
+  (fn (y)
+    (println
+      (string/join
+        (map (fn (x) (terrain-char (octave-noise x y))) (range width))
+        "")))
   (range height))
 
 (println "")

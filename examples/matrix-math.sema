@@ -80,8 +80,8 @@
 ;; --- Transpose property: (A^T)^T = A ---
 (println "=== Transpose Properties ===\n")
 
-(define At   (matrix-transpose A))
-(define Att  (matrix-transpose At))
+(define At (matrix-transpose A))
+(define Att (matrix-transpose At))
 
 (matrix-print "A" A)
 (matrix-print "Aᵀ" At)
@@ -121,8 +121,8 @@
 (println (format "  det(I₃) = ~a" (matrix-determinant I3)))
 
 ;; det(2A) = 2^n * det(A) for n×n matrix
-(define det-A   (matrix-determinant A))
-(define det-2A  (matrix-determinant (matrix-scalar-multiply 2 A)))
+(define det-A (matrix-determinant A))
+(define det-2A (matrix-determinant (matrix-scalar-multiply 2 A)))
 (println (format "  det(A) = ~a" det-A))
 (println (format "  det(2A) = ~a" det-2A))
 (println (format "  2³ × det(A) = ~a" (* 8 det-A)))

@@ -36,15 +36,15 @@
 
 (defun area (shape)
   (cond
-    ((circle? shape)  (* pi (expt (circle-radius shape) 2)))
-    ((rect? shape)    (* (rect-width shape) (rect-height shape)))
-    (else             (throw "Unknown shape"))))
+    ((circle? shape) (* pi (expt (circle-radius shape) 2)))
+    ((rect? shape) (* (rect-width shape) (rect-height shape)))
+    (else (throw "Unknown shape"))))
 
 (defun perimeter (shape)
   (cond
-    ((circle? shape)  (* 2 pi (circle-radius shape)))
-    ((rect? shape)    (* 2 (+ (rect-width shape) (rect-height shape))))
-    (else             (throw "Unknown shape"))))
+    ((circle? shape) (* 2 pi (circle-radius shape)))
+    ((rect? shape) (* 2 (+ (rect-width shape) (rect-height shape))))
+    (else (throw "Unknown shape"))))
 
 (defun describe-shape (shape)
   (cond

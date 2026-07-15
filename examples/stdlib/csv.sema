@@ -9,18 +9,18 @@
 
 ;; csv/parse
 (assert-eq (csv/parse "a,b\n1,2\n3,4")
-           '(("a" "b") ("1" "2") ("3" "4"))
-           "csv/parse basic")
+  '(("a" "b") ("1" "2") ("3" "4"))
+  "csv/parse basic")
 
 ;; csv/parse with quoted fields
 (assert-eq (csv/parse "name,bio\n\"Ada\",\"Mathematician, writer\"\n")
-           '(("name" "bio") ("Ada" "Mathematician, writer"))
-           "csv/parse quoted fields")
+  '(("name" "bio") ("Ada" "Mathematician, writer"))
+  "csv/parse quoted fields")
 
 ;; csv/parse-maps
 (assert-eq (csv/parse-maps "name,age\nAda,36\nBob,25")
-           '({:age "36" :name "Ada"} {:age "25" :name "Bob"})
-           "csv/parse-maps basic")
+  '({:age "36" :name "Ada"} {:age "25" :name "Bob"})
+  "csv/parse-maps basic")
 
 ;; Access fields by keyword
 (define rows (csv/parse-maps "name,age\nAda,36\nBob,25"))
@@ -28,13 +28,13 @@
 
 ;; csv/encode
 (assert-eq (csv/encode '(("a" "b") ("1" "2")))
-           "a,b\n1,2\n"
-           "csv/encode basic")
+  "a,b\n1,2\n"
+  "csv/encode basic")
 
 ;; csv/encode with numbers
 (assert-eq (csv/encode '(("name" "score") ("Ada" 100)))
-           "name,score\nAda,100\n"
-           "csv/encode numeric")
+  "name,score\nAda,100\n"
+  "csv/encode numeric")
 
 ;; Round-trip
 (define csv-text "name,age\nAda,36\nBob,25\n")
@@ -55,13 +55,19 @@
 (assert-eq (base64/decode "aGVsbG8=") "hello" "base64/decode hello")
 
 ;; base64/encode-bytes
-(assert-eq (base64/encode-bytes #u8(104 101 108 108 111)) "aGVsbG8=" "base64/encode-bytes")
+(assert-eq (base64/encode-bytes #u8(104 101 108 108 111))
+  "aGVsbG8="
+  "base64/encode-bytes")
 
 ;; base64/decode-bytes
-(assert-eq (base64/decode-bytes "aGVsbG8=") #u8(104 101 108 108 111) "base64/decode-bytes")
+(assert-eq (base64/decode-bytes "aGVsbG8=")
+  #u8(104 101 108 108 111)
+  "base64/decode-bytes")
 
 ;; base64 roundtrip
-(assert-eq (base64/decode (base64/encode "roundtrip test")) "roundtrip test" "base64 roundtrip")
+(assert-eq (base64/decode (base64/encode "roundtrip test"))
+  "roundtrip test"
+  "base64 roundtrip")
 
 ;; API auth pattern
 (define username "user")
@@ -72,13 +78,13 @@
 
 ;; hash/sha256
 (assert-eq (hash/sha256 "hello")
-           "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
-           "sha256 hello")
+  "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
+  "sha256 hello")
 
 ;; hash/md5
 (assert-eq (hash/md5 "hello")
-           "5d41402abc4b2a76b9719d911017c592"
-           "md5 hello")
+  "5d41402abc4b2a76b9719d911017c592"
+  "md5 hello")
 
 ;; hash/hmac-sha256
 (define hmac-result (hash/hmac-sha256 "secret-key" "message"))
@@ -90,6 +96,8 @@
   (equal? (hash/hmac-sha256 secret payload) signature))
 (define sig (hash/hmac-sha256 "my-secret" "payload-data"))
 (assert-eq (verify-webhook "payload-data" "my-secret" sig) #t "webhook verify")
-(assert-eq (verify-webhook "payload-data" "wrong-secret" sig) #f "webhook verify wrong key")
+(assert-eq (verify-webhook "payload-data" "wrong-secret" sig)
+  #f
+  "webhook verify wrong key")
 
 (println "=== csv.md: ALL PASSED ===")

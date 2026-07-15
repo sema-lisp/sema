@@ -4,8 +4,7 @@
 ;; Cards are [suit rank] vectors
 (define (card-value card)
   (let (([_ rank] card))
-    (match
-      rank
+    (match rank
       (:ace 11)
       (:king 10)
       (:queen 10)
@@ -16,16 +15,14 @@
 (define (card-name card)
   (let (([suit rank] card))
     (let ((rank-str
-            (match
-              rank
+            (match rank
               (:ace "A")
               (:king "K")
               (:queen "Q")
               (:jack "J")
               (n (str n))))
           (suit-str
-            (match
-              suit
+            (match suit
               (:spades "♠")
               (:hearts "♥")
               (:diamonds "♦")
@@ -51,8 +48,7 @@
 
 (define (classify-hand hand)
   (let ((score (hand-score hand)))
-    (match
-      hand
+    (match hand
       (_ when (flush? hand) f"Flush! (${score} pts)")
       (_ when (has-pair? hand) f"Pair (${score} pts)")
       (_ when (>= score 28) f"High hand (${score} pts)")

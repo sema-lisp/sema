@@ -54,8 +54,8 @@
 ;; --- Combined operations ---
 (println "-- combined operations --")
 ;; Set bit 3: OR with (1 << 3)
-(define val        0)
-(define with-bit3  (bit/or val (bit/shift-left 1 3)))
+(define val 0)
+(define with-bit3 (bit/or val (bit/shift-left 1 3)))
 (assert-eq with-bit3 8 "set bit 3 of 0 = 8")
 
 ;; Clear bit 3: AND with NOT(1 << 3)

@@ -13,10 +13,16 @@
   (async
     (let loop ((k 0))
       (if (< k yields-each)
-        (begin (async/sleep 0) (loop (+ k 1)))
+        (begin
+          (async/sleep 0)
+          (loop (+ k 1)))
         (* id 2)))))
 
-(println "=== Scheduler stress: " n-tasks " tasks x " yields-each " yields each ===")
+(println "=== Scheduler stress: "
+  n-tasks
+  " tasks x "
+  yields-each
+  " yields each ===")
 
 (define start (time-ms))
 (define results (async/all (map spin (range 1 (+ n-tasks 1)))))
@@ -24,7 +30,7 @@
 
 ;; Verify correctness: results must be exactly 2,4,...,2*n-tasks summed.
 (define got (foldl + 0 results))
-(define want (* n-tasks (+ n-tasks 1)))          ; sum(2..2n step 2) = n*(n+1)
+(define want (* n-tasks (+ n-tasks 1))) ; sum(2..2n step 2) = n*(n+1)
 (println "  tasks completed: " (length results))
 (println "  sum of results:  " got " (expected " want ")")
 (println "  correct:         " (= got want))
@@ -34,8 +40,7 @@
 (println "")
 (println "=== Channel fan-in: 200 senders -> 1 channel ===")
 (define hub (channel/new 64))
-(define senders
-  (map (fn (i) (async (channel/send hub i))) (range 1 201)))
+(define senders (map (fn (i) (async (channel/send hub i))) (range 1 201)))
 (define drainer
   (async
     (let loop ((seen 0) (sum 0))
@@ -44,4 +49,4 @@
           (loop (+ seen 1) (+ sum v)))
         sum))))
 (async/all senders)
-(println "  fan-in sum: " (await drainer) " (expected " (/ (* 200 201) 2) ")")  ; 20100
+(println "  fan-in sum: " (await drainer) " (expected " (/ (* 200 201) 2) ")") ; 20100

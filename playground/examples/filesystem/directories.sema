@@ -17,13 +17,17 @@
 
 ;; Check types
 (println (format "project/ is directory? ~a" (file/is-directory? "project")))
-(println (format "project/README.md is file? ~a" (file/is-file? "project/README.md")))
-(println (format "project/src is directory? ~a" (file/is-directory? "project/src")))
+(println
+  (format "project/README.md is file? ~a" (file/is-file? "project/README.md")))
+(println
+  (format "project/src is directory? ~a" (file/is-directory? "project/src")))
 
 ;; List directory contents
 (for-each
   (lambda (dir)
     (let ((items (file/list dir)))
       (println (format "\n~a/ (~a items)" dir (length items)))
-      (for-each (lambda (f) (println (format "  ~a" f))) items)))
+      (for-each
+        (lambda (f) (println (format "  ~a" f)))
+        items)))
   (list "project" "project/src" "project/docs" "project/tests"))

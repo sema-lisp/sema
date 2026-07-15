@@ -27,17 +27,23 @@
 ;; Read + embed every doc, add it to the store, and persist the store to the cache.
 (define (build-index!)
   (let* ((files (file/glob corpus-glob))
-         (docs (map (lambda (path)
-                      {:name (path/stem path) :path path
-                       :text (string/take (file/read path) clip-chars)})
-                    files))
+         (docs
+           (map
+             (lambda (path)
+               {:name (path/stem path)
+                :path path
+                :text (string/take (file/read path) clip-chars)})
+             files))
          ;; Embed in batches (list/chunk), one network call each, flattened to one list.
-         (vectors (flat-map (lambda (batch) (llm/embed batch))
-                            (list/chunk batch-size (map (lambda (d) (:text d)) docs)))))
-    (println f"Indexing ${(length files)} docs (first run; caching to ${cache-path}) ...")
+         (vectors
+           (flat-map (lambda (batch) (llm/embed batch))
+             (list/chunk batch-size (map (lambda (d) (:text d)) docs)))))
+    (println
+      f"Indexing ${(length files)} docs (first run; caching to ${cache-path}) ...")
     ;; map walks docs + vectors in lockstep (Scheme-style multi-list map).
     (map (lambda (doc vec) (vector-store/add "docs" (:name doc) vec doc))
-         docs vectors)
+      docs
+      vectors)
     (vector-store/save "docs")))
 
 ;; ── 1. Index the corpus (cached) ────────────────────────────────────────────
@@ -61,18 +67,20 @@
 (define reranked (llm/rerank question candidate-texts {:top-k 4}))
 
 (println "\nTop matches after reranking (cross-encoder relevance):")
-(for-each (lambda (r)
-            (let ((name  (:id (nth candidates (:index r))))
-                  (score (math/round-to (:score r) 3)))
-              (println f"  ${score}  ${name}")))
-          reranked)
+(for-each
+  (lambda (r)
+    (let ((name (:id (nth candidates (:index r))))
+          (score (math/round-to (:score r) 3)))
+      (println f"  ${score}  ${name}")))
+  reranked)
 
 ;; ── 3. Answer, grounded in the reranked docs ────────────────────────────────
 (define context
   (string/join (map (lambda (r) (nth candidate-texts (:index r))) reranked)
-               "\n\n---\n\n"))
+    "\n\n---\n\n"))
 (define prompt
   f"Using ONLY the Sema documentation below, answer the question and name the exact functions to call.\n\nDOCS:\n${context}\n\nQUESTION: ${question}")
 
-(println "\n── Answer ─────────────────────────────────────────────")
+(println
+  "\n── Answer ─────────────────────────────────────────────")
 (println (llm/complete prompt {:max-tokens 400}))

@@ -6,9 +6,12 @@
 (println "--- Traffic Light ---\n")
 
 (define traffic-fsm
-  (map/new "red" (map/new "next" "green" "dur" 5)
-            "green" (map/new "next" "yellow" "dur" 4)
-            "yellow" (map/new "next" "red" "dur" 1)))
+  (map/new "red"
+    (map/new "next" "green" "dur" 5)
+    "green"
+    (map/new "next" "yellow" "dur" 4)
+    "yellow"
+    (map/new "next" "red" "dur" 1)))
 
 (define traffic-labels
   (map/new "red" "🔴 RED" "green" "🟢 GREEN" "yellow" "🟡 YELLOW"))
@@ -16,7 +19,8 @@
 (define (run-traffic state steps)
   (when (> steps 0)
     (let ((info (get traffic-fsm state)))
-      (println (format "  ~a  (~as)" (get traffic-labels state) (get info "dur")))
+      (println
+        (format "  ~a  (~as)" (get traffic-labels state) (get info "dur")))
       (run-traffic (get info "next") (- steps 1)))))
 
 (run-traffic "red" 9)
@@ -25,18 +29,31 @@
 (println "\n--- Vending Machine ---\n")
 
 (define vending-fsm
-  (map/new "idle" (map/new "coin" "selecting" "msg" "Waiting...")
-            "selecting" (map/new "select" "dispensing" "cancel" "idle" "msg" "Choose item!")
-            "dispensing" (map/new "done" "idle" "msg" "Dispensing...")))
+  (map/new "idle"
+    (map/new "coin" "selecting" "msg" "Waiting...")
+    "selecting"
+    (map/new "select" "dispensing" "cancel" "idle" "msg" "Choose item!")
+    "dispensing"
+    (map/new "done" "idle" "msg" "Dispensing...")))
 
 (define (vend-step state event)
   (let ((next (get (get vending-fsm state) event)))
     (if (null? next)
-      (begin (println (format "  ⚠ No '~a' in ~a" event state)) state)
-      (begin (println (format "  ~a --[~a]--> ~a: ~a" state event next (get (get vending-fsm next) "msg"))) next))))
+      (begin
+        (println (format "  ⚠ No '~a' in ~a" event state))
+        state)
+      (begin
+        (println
+          (format "  ~a --[~a]--> ~a: ~a"
+            state
+            event
+            next
+            (get (get vending-fsm next) "msg")))
+        next))))
 
 (define (vend-run state events)
-  (if (null? events) (println (format "  Final: ~a" state))
+  (if (null? events)
+    (println (format "  Final: ~a" state))
     (vend-run (vend-step state (car events)) (cdr events))))
 
 (println "Buy item:")
@@ -48,15 +65,20 @@
 (println "\n--- Door ---\n")
 
 (define door-fsm
-  (map/new "locked" (map/new "unlock" "closed")
-            "closed" (map/new "open" "open" "lock" "locked")
-            "open" (map/new "close" "closed")))
+  (map/new "locked"
+    (map/new "unlock" "closed")
+    "closed"
+    (map/new "open" "open" "lock" "locked")
+    "open"
+    (map/new "close" "closed")))
 
 (define (fsm-run fsm state events)
-  (if (null? events) state
+  (if (null? events)
+    state
     (let ((next (get (get fsm state) (car events))))
       (println (format "  ~a --[~a]--> ~a" state (car events) next))
       (fsm-run fsm next (cdr events)))))
 
-(println (format "Final: ~a"
-  (fsm-run door-fsm "locked" '("unlock" "open" "close" "lock"))))
+(println
+  (format "Final: ~a"
+    (fsm-run door-fsm "locked" '("unlock" "open" "close" "lock"))))

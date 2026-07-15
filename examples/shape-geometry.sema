@@ -2,8 +2,7 @@
 ;; Demonstrates: match on map patterns, {:keys} destructuring, guards
 
 (define (area shape)
-  (match
-    shape
+  (match shape
     ({:type :circle :radius r} (* pi r r))
     ({:type :rect :w w :h h} (* w h))
     ({:type :triangle :base b :height h} (/ (* b h) 2))
@@ -11,8 +10,7 @@
     (_ (error f"Unknown shape: ${shape}"))))
 
 (define (perimeter shape)
-  (match
-    shape
+  (match shape
     ({:type :circle :radius r} (* 2 pi r))
     ({:type :rect :w w :h h} (* 2 (+ w h)))
     ({:type :triangle :a a :b b :c c} (+ a b c))
@@ -38,8 +36,7 @@
 
 ;; Scale a shape
 (define (scale shape factor)
-  (match
-    shape
+  (match shape
     ({:type :circle :radius r} {:type :circle :radius (* r factor)})
     ({:type :rect :w w :h h} {:type :rect :w (* w factor) :h (* h factor)})
     ({:type :square :side s} {:type :square :side (* s factor)})
@@ -54,8 +51,7 @@
 ;; Classify by area
 (define (classify shape)
   (let ((a (area shape)))
-    (match
-      a
+    (match a
       (a when (> a 50) "large")
       (a when (> a 20) "medium")
       (_ "small"))))

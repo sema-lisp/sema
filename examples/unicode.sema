@@ -15,8 +15,8 @@
 
 ;; --- Codepoints roundtrip ---
 (println "\n=== Codepoints ===")
-(define text  "Café ☕")
-(define cps   (string/codepoints text))
+(define text "Café ☕")
+(define cps (string/codepoints text))
 (println (format "  String:     ~a" text))
 (println (format "  Codepoints: ~a" cps))
 (println (format "  Roundtrip:  ~a" (string/from-codepoints cps)))
@@ -29,8 +29,8 @@
 (println "\n=== Normalization ===")
 
 ;; NFC: combine e + combining acute → é
-(define decomposed  (string/append "e" "\u0301"))
-(define composed    (string/normalize decomposed :nfc))
+(define decomposed (string/append "e" "\u0301"))
+(define composed (string/normalize decomposed :nfc))
 (println
   (format "  Decomposed: ~a  (length=~a)" decomposed (string/length decomposed)))
 (println

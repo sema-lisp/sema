@@ -1,13 +1,15 @@
 ;;; Type-dispatched polymorphism via maps
 
 (defmacro -> (val . forms)
-  (if (null? forms) val
+  (if (null? forms)
+    val
     (let ((form (car forms)) (rest (cdr forms)))
       (if (list? form)
         `(-> (,(car form) ,val ,@(cdr form)) ,@rest)
         `(-> (,form ,val) ,@rest)))))
 
-(define (make-multi dispatch-fn) {:dispatch-fn dispatch-fn :methods {} :default nil})
+(define (make-multi dispatch-fn)
+  {:dispatch-fn dispatch-fn :methods {} :default nil})
 (define (add-method multi dispatch-val impl)
   (assoc multi :methods (assoc (get multi :methods) dispatch-val impl)))
 (define (set-default-method multi impl) (assoc multi :default impl))
@@ -26,31 +28,39 @@
 
 (define area
   (-> (make-multi (fn (shape) (get shape :type)))
-      (add-method :circle (fn (s) (* pi (get s :radius) (get s :radius))))
-      (add-method :rect (fn (s) (* (get s :width) (get s :height))))
-      (add-method :triangle (fn (s) (* 0.5 (get s :base) (get s :height))))))
+    (add-method :circle (fn (s) (* pi (get s :radius) (get s :radius))))
+    (add-method :rect (fn (s) (* (get s :width) (get s :height))))
+    (add-method :triangle (fn (s) (* 0.5 (get s :base) (get s :height))))))
 
 (for-each
-  (fn (s) (println (format "  ~a area = ~a" (get s :type) (round (* 100 (invoke area s))))))
+  (fn (s)
+    (println
+      (format "  ~a area = ~a" (get s :type) (round (* 100 (invoke area s))))))
   (list {:type :circle :radius 5}
-        {:type :rect :width 4 :height 6}
-        {:type :triangle :base 8 :height 3}))
+    {:type :rect :width 4 :height 6}
+    {:type :triangle :base 8 :height 3}))
 
 ;; Open extension — add ellipse without modifying existing code
-(define area (add-method area :ellipse
-  (fn (s) (* pi (get s :a) (get s :b)))))
-(println (format "  ~a area = ~a" :ellipse
-  (round (* 100 (invoke area {:type :ellipse :a 3 :b 5})))))
+(define area
+  (add-method area
+    :ellipse
+    (fn (s) (* pi (get s :a) (get s :b)))))
+(println
+  (format "  ~a area = ~a"
+    :ellipse
+    (round (* 100 (invoke area {:type :ellipse :a 3 :b 5})))))
 
 (println "\n--- Animal sounds ---")
 (define speak
   (-> (make-multi (fn (a) (get a :species)))
-      (add-method :dog (fn (a) (format "~a says: Woof!" (get a :name))))
-      (add-method :cat (fn (a) (format "~a says: Meow!" (get a :name))))
-      (add-method :duck (fn (a) (format "~a says: Quack!" (get a :name))))
-      (set-default-method (fn (a) (format "~a says: ..." (get a :name))))))
+    (add-method :dog (fn (a) (format "~a says: Woof!" (get a :name))))
+    (add-method :cat (fn (a) (format "~a says: Meow!" (get a :name))))
+    (add-method :duck (fn (a) (format "~a says: Quack!" (get a :name))))
+    (set-default-method (fn (a) (format "~a says: ..." (get a :name))))))
 
 (for-each
   (fn (a) (println (format "  ~a" (invoke speak a))))
-  (list {:species :dog :name "Rex"} {:species :cat :name "Whiskers"}
-        {:species :duck :name "Donald"} {:species :fish :name "Nemo"}))
+  (list {:species :dog :name "Rex"}
+    {:species :cat :name "Whiskers"}
+    {:species :duck :name "Donald"}
+    {:species :fish :name "Nemo"}))

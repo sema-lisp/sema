@@ -24,8 +24,8 @@
   (let loop ((n n) (table roman-table) (acc ""))
     (if (or (null? table) (= n 0))
       acc
-      (let ((value   (first (first table)))
-            (symbol  (nth (first table) 1)))
+      (let ((value (first (first table)))
+            (symbol (nth (first table) 1)))
         (if (>= n value)
           (loop (- n value) table (string/append acc symbol))
           (loop n (rest table) acc))))))
@@ -69,8 +69,8 @@
 
 (for-each
   (fn (n)
-    (let* ((roman  (int->roman n))
-           (back   (roman->int roman)))
+    (let* ((roman (int->roman n))
+           (back (roman->int roman)))
       (println
         (format "  ~a  ~a  ~a"
           (string/pad-right (str n) 9)
@@ -82,12 +82,12 @@
 (println "\n=== Roundtrip Validation ===\n")
 
 (define (validate n)
-  (let* ((roman  (int->roman n))
-         (back   (roman->int roman)))
+  (let* ((roman (int->roman n))
+         (back (roman->int roman)))
     (list n roman back (= n back))))
 
-(define results   (map validate test-numbers))
-(define all-pass  (every (fn (r) (nth r 3)) results))
+(define results (map validate test-numbers))
+(define all-pass (every (fn (r) (nth r 3)) results))
 
 (for-each
   (fn (r)

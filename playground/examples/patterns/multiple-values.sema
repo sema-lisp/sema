@@ -15,7 +15,7 @@
 ;; Split a list into (matching, non-matching) — two lists, one call.
 (define (partition pred xs)
   (values (filter pred xs)
-          (filter (fn (x) (not (pred x))) xs)))
+    (filter (fn (x) (not (pred x))) xs)))
 
 ;; Euclidean division: quotient and remainder together.
 (define (divmod a b)
@@ -35,7 +35,7 @@
 
 ;; `call-with-values` wires a producer's values straight into a consumer:
 (println "divmod via call-with-values: "
-         (call-with-values (fn () (divmod 100 7)) list))
+  (call-with-values (fn () (divmod 100 7)) list))
 
 ;; A single value passes through normal contexts with no ceremony:
 (println "1 + (values 41) = " (+ 1 (values 41)))

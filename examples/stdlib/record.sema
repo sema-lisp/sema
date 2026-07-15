@@ -13,9 +13,7 @@
 
 (println "-- Basic Definition --")
 
-(define-record-type point
-  (make-point x y)
-  point?
+(define-record-type point (make-point x y) point?
   (x point-x)
   (y point-y))
 
@@ -32,7 +30,7 @@
 
 (define (move-point p dx dy)
   (make-point (+ (point-x p) dx)
-              (+ (point-y p) dy)))
+    (+ (point-y p) dy)))
 
 (define moved (move-point (make-point 10 20) 5 -2))
 (assert-eq (point-x moved) 15 "move-point x")
@@ -65,22 +63,19 @@
 
 (println "-- Nested Records --")
 
-(define-record-type address
-  (make-address line1 city country)
-  address?
+(define-record-type address (make-address line1 city country) address?
   (line1 address-line1)
   (city address-city)
   (country address-country))
 
-(define-record-type user
-  (make-user id name addr)
-  user?
+(define-record-type user (make-user id name addr) user?
   (id user-id)
   (name user-name)
   (addr user-addr))
 
 (define u
-  (make-user 123 "Ada"
+  (make-user 123
+    "Ada"
     (make-address "12 St James" "London" "UK")))
 
 (assert-eq (user-name u) "Ada" "nested: user-name")
@@ -92,21 +87,20 @@
 
 (define (describe v)
   (match v
-    (p when (point? p)
-       (string/append "point("
-                      (number/to-string (point-x p))
-                      ", "
-                      (number/to-string (point-y p))
-                      ")"))
+    (p when
+      (point? p)
+      (string/append "point("
+        (number/to-string (point-x p))
+        ", "
+        (number/to-string (point-y p))
+        ")"))
     (_ "not a point")))
 
 (assert-eq (describe (make-point 3 4)) "point(3, 4)" "match point with guard")
 (assert-eq (describe {:x 3 :y 4}) "not a point" "match non-point")
 
 ;; match on type
-(define-record-type person
-  (make-person name age)
-  person?
+(define-record-type person (make-person name age) person?
   (name person-name)
   (age person-age))
 
@@ -117,22 +111,22 @@
     (_ "something else")))
 
 (assert-eq (record-type-name (make-point 1 2)) "a point" "match type :point")
-(assert-eq (record-type-name (make-person "Ada" 36)) "a person" "match type :person")
+(assert-eq (record-type-name (make-person "Ada" 36))
+  "a person"
+  "match type :person")
 (assert-eq (record-type-name 42) "something else" "match type other")
 
 ;; --- Domain Modeling ---
 
 (println "-- Domain Modeling --")
 
-(define-record-type email
-  (make-email value)
-  email?
+(define-record-type email (make-email value) email?
   (value email-value))
 
 (define (parse-email s)
   (if (regex/match? #".+@.+\..+" s)
-      (make-email s)
-      (error "invalid email")))
+    (make-email s)
+    (error "invalid email")))
 
 (define e (parse-email "ada@example.com"))
 (assert-eq (email? e) #t "parse-email valid")
@@ -142,9 +136,7 @@
 
 (println "-- Multiple Record Types --")
 
-(define-record-type color
-  (make-color r g b)
-  color?
+(define-record-type color (make-color r g b) color?
   (r color-r)
   (g color-g)
   (b color-b))

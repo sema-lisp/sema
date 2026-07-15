@@ -11,7 +11,7 @@
 ;; scheduler has reason to interleave the in-flight tasks.
 (define (fetch id)
   (async
-    (async/sleep (* id 5))            ; pretend network latency (ms)
+    (async/sleep (* id 5)) ; pretend network latency (ms)
     (str "payload-" id " (" (* id id) " bytes)")))
 
 ;; Kick off 8 fetches at once — all in flight after this `map`.
@@ -19,7 +19,9 @@
 
 ;; `async/all` awaits every promise and returns their results in order.
 (define results (async/all jobs))
-(for-each (fn (r) (println "  got " r)) results)
+(for-each
+  (fn (r) (println "  got " r))
+  results)
 (println "fetched " (length results) " payloads concurrently")
 
 ;; --- Fan-out + reduce: sum of squares 1..20, computed in parallel ----------
@@ -27,4 +29,4 @@
 (println "=== Fan-out + reduce: sum of squares 1..20 ===")
 (define squares (async/all (map (fn (n) (async (* n n))) (range 1 21))))
 (println "  squares: " squares)
-(println "  sum:     " (foldl + 0 squares))   ; 1+4+9+...+400 = 2870
+(println "  sum:     " (foldl + 0 squares)) ; 1+4+9+...+400 = 2870

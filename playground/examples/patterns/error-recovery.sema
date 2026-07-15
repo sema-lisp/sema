@@ -23,31 +23,31 @@
 
 ;; Run one job, recovering with a labelled result based on the error kind.
 (define (run-job label thunk)
-  (guard (err
-           ((eq? err 'divide-by-zero)
-            (list label 'RECOVERED "divided by zero -> 0"))
-           ((and (list? err) (eq? (first err) 'missing-key))
-            (list label 'RECOVERED (string-append "no such key: " (str (second err)))))
-           (else
-            (list label 'FAILED "unexpected error")))
+  (guard
+    (err
+      ((eq? err 'divide-by-zero) (list label 'RECOVERED "divided by zero -> 0"))
+      ((and (list? err) (eq? (first err) 'missing-key))
+        (list label
+          'RECOVERED
+          (string-append "no such key: " (str (second err)))))
+      (else (list label 'FAILED "unexpected error")))
     (list label 'OK (thunk))))
 
 (println "── batch run (each job recovers on its own) ──")
 (for-each
   (fn (r) (println "  " r))
-  (list
-    (run-job 'ratio    (fn () (safe-divide 10 2)))
-    (run-job 'ratio    (fn () (safe-divide 10 0)))
-    (run-job 'lookup   (fn () (config-get config 'width)))
-    (run-job 'lookup   (fn () (config-get config 'depth)))))
+  (list (run-job 'ratio (fn () (safe-divide 10 2)))
+    (run-job 'ratio (fn () (safe-divide 10 0)))
+    (run-job 'lookup (fn () (config-get config 'width)))
+    (run-job 'lookup (fn () (config-get config 'depth)))))
 
 ;; `guard` also catches native runtime errors, not just `raise`:
 (println)
 (println "native error caught: "
-         (guard (e (#t 'caught-a-runtime-error)) (car 5)))
+  (guard (e (#t 'caught-a-runtime-error)) (car 5)))
 
 ;; And a no-matching-clause guard re-raises to the outer handler:
 (println "re-raise reaches outer: "
-         (guard (outer (#t (list 'outer-saw outer)))
-           (guard (inner ((symbol? inner) 'inner-only))
-             (raise (list 'not-a-symbol 42)))))
+  (guard (outer (#t (list 'outer-saw outer)))
+    (guard (inner ((symbol? inner) 'inner-only))
+      (raise (list 'not-a-symbol 42)))))

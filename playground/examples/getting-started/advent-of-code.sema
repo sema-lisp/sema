@@ -4,8 +4,10 @@
 (println "=== Puzzle 1: Calorie Counting ===\n")
 
 (define elf-calories
-  '((1000 2000 3000) (4000) (5000 6000)
-    (7000 8000 9000) (10000)))
+  '((1000 2000 3000) (4000)
+    (5000 6000)
+    (7000 8000 9000)
+    (10000)))
 
 (define totals (map (fn (elf) (foldl + 0 elf)) elf-calories))
 (define sorted-totals (sort totals (fn (a b) (- b a))))
@@ -19,18 +21,18 @@
 
 (define rounds '(("A" "Y") ("B" "X") ("C" "Z") ("A" "X") ("B" "Z") ("C" "Y")))
 (define shape-score {:X 1 :Y 2 :Z 3})
-(define outcome-map
-  {:AX 3 :BY 3 :CZ 3 :AY 6 :BZ 6 :CX 6 :AZ 0 :BX 0 :CY 0})
+(define outcome-map {:AX 3 :BY 3 :CZ 3 :AY 6 :BZ 6 :CX 6 :AZ 0 :BX 0 :CY 0})
 
 (define (score-round round)
   (let ((opp (first round)) (you (nth round 1)))
     (+ (get shape-score (string/to-keyword you))
-       (get outcome-map (string/to-keyword (string/append opp you))))))
+      (get outcome-map (string/to-keyword (string/append opp you))))))
 
 (define round-scores (map score-round rounds))
-(for-each (fn (i)
-  (let ((r (nth rounds i)) (s (nth round-scores i)))
-    (println (format "  ~a vs ~a → ~a pts" (first r) (nth r 1) s))))
+(for-each
+  (fn (i)
+    (let ((r (nth rounds i)) (s (nth round-scores i)))
+      (println (format "  ~a vs ~a → ~a pts" (first r) (nth r 1) s))))
   (range (length rounds)))
 (println (format "Total: ~a" (foldl + 0 round-scores)))
 
@@ -40,24 +42,39 @@
 (define (pangram? text)
   (let ((lower (string/lower text)))
     (every (fn (ch) (string/contains? lower (char/to-string ch)))
-           (string/chars "abcdefghijklmnopqrstuvwxyz"))))
+      (string/chars "abcdefghijklmnopqrstuvwxyz"))))
 
-(for-each (fn (s)
-  (println (format "  ~a → ~a"
-    (if (> (string/length s) 40) (string/append (string/slice s 0 37) "...") s)
-    (if (pangram? s) "✓ pangram" "✗ not"))))
+(for-each
+  (fn (s)
+    (println
+      (format "  ~a → ~a"
+        (if (> (string/length s) 40)
+          (string/append (string/slice s 0 37) "...")
+          s)
+        (if (pangram? s) "✓ pangram" "✗ not"))))
   (list "The quick brown fox jumps over the lazy dog"
-        "Hello World"
-        "Pack my box with five dozen liquor jugs"))
+    "Hello World"
+    "Pack my box with five dozen liquor jugs"))
 
 ;; === Puzzle 4: Number Word Sum ===
 (println "\n=== Puzzle 4: Number Word Sum ===\n")
 
-(define number-words {:one 1 :two 2 :three 3 :four 4 :five 5
-                      :six 6 :seven 7 :eight 8 :nine 9 :ten 10})
-(define words-input '("three" "cats" "ate" "five" "fish" "and" "two" "pies" "plus" "one"))
-(define found (filter (fn (v) (not (nil? v)))
-  (map (fn (w) (get number-words (string/to-keyword w))) words-input)))
+(define number-words
+  {:one 1
+   :two 2
+   :three 3
+   :four 4
+   :five 5
+   :six 6
+   :seven 7
+   :eight 8
+   :nine 9
+   :ten 10})
+(define words-input
+  '("three" "cats" "ate" "five" "fish" "and" "two" "pies" "plus" "one"))
+(define found
+  (filter (fn (v) (not (nil? v)))
+    (map (fn (w) (get number-words (string/to-keyword w))) words-input)))
 
 (println (format "Input: ~a" (string/join words-input " ")))
 (println (format "Found: ~a" found))

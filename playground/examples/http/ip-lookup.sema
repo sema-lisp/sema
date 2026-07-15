@@ -9,7 +9,11 @@
 (if (= (:status resp) 200)
   (let ((info (json/decode (:body resp))))
     (println (format "  IP:       ~a" (get info :ip)))
-    (println (format "  Location: ~a, ~a, ~a" (get info :city) (get info :region) (get info :country)))
+    (println
+      (format "  Location: ~a, ~a, ~a"
+        (get info :city)
+        (get info :region)
+        (get info :country)))
     (println (format "  Timezone: ~a" (get info :timezone)))
     (println (format "  Org:      ~a" (get info :org))))
   (println (format "Request failed with status ~a" (:status resp))))

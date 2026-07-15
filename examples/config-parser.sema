@@ -2,8 +2,7 @@
 ;; Demonstrates: match on literals, guards, threading, let destructuring
 
 (define (parse-value raw)
-  (match
-    raw
+  (match raw
     ("true" #t)
     ("false" #f)
     ("nil" nil)
@@ -51,8 +50,7 @@ timeout = 30
 
 ;; Validate with match
 (define (validate key value)
-  (match
-    (list key value)
+  (match (list key value)
     ([:db_port p] when
       (or (< p 1) (> p 65535))
       (println f"  ✗ ${key}: port ${p} out of range"))

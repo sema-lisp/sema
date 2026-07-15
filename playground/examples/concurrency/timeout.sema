@@ -16,8 +16,9 @@
     (println "timed out:" (:message e))))
 
 ;; race returns whichever promise resolves first.
-(define winner (async/race
-                 (list (slow-task 30 :a)
-                       (slow-task 60 :b)
-                       (slow-task 90 :c))))
+(define winner
+  (async/race
+    (list (slow-task 30 :a)
+      (slow-task 60 :b)
+      (slow-task 90 :c))))
 (println "race winner:" winner)

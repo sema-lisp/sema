@@ -11,9 +11,13 @@
 (assert-eq (string? (term/bold "important")) #t "bold returns string")
 (assert-eq (string? (term/dim "less important")) #t "dim returns string")
 (assert-eq (string? (term/italic "emphasis")) #t "italic returns string")
-(assert-eq (string? (term/underline "click here")) #t "underline returns string")
+(assert-eq (string? (term/underline "click here"))
+  #t
+  "underline returns string")
 (assert-eq (string? (term/inverse "highlighted")) #t "inverse returns string")
-(assert-eq (string? (term/strikethrough "deprecated")) #t "strikethrough returns string")
+(assert-eq (string? (term/strikethrough "deprecated"))
+  #t
+  "strikethrough returns string")
 
 ;; Colors - all return strings
 (assert-eq (string? (term/black "dark text")) #t "black returns string")
@@ -28,11 +32,15 @@
 
 ;; term/style
 (assert-eq (string? (term/style "danger" :bold :red)) #t "style bold red")
-(assert-eq (string? (term/style "notice" :italic :yellow :underline)) #t "style italic yellow underline")
+(assert-eq (string? (term/style "notice" :italic :yellow :underline))
+  #t
+  "style italic yellow underline")
 (assert-eq (string? (term/style "subtle" :dim :gray)) #t "style dim gray")
 
 ;; term/style with no keywords
-(assert-eq (term/style "plain text") "plain text" "style no keywords returns plain")
+(assert-eq (term/style "plain text")
+  "plain text"
+  "style no keywords returns plain")
 
 ;; term/style error on unknown keyword
 (try
@@ -40,10 +48,14 @@
   (catch e (println "  ✓  style :blink error caught")))
 
 ;; Composing styles: term/style
-(assert-eq (string? (term/style "alert" :bold :red :underline)) #t "composed style")
+(assert-eq (string? (term/style "alert" :bold :red :underline))
+  #t
+  "composed style")
 
 ;; Composing styles: nesting
-(assert-eq (string? (term/bold (term/red (term/underline "alert")))) #t "nested composition")
+(assert-eq (string? (term/bold (term/red (term/underline "alert"))))
+  #t
+  "nested composition")
 
 ;; term/rgb
 (assert-eq (string? (term/rgb "orange" 255 165 0)) #t "rgb orange")
@@ -58,10 +70,11 @@
 (assert-eq (term/strip "no codes here") "no codes here" "strip plain")
 
 ;; Colored log levels pattern
-(define (log-error msg)   (println (term/style "✗ ERROR" :bold :red) " " msg))
-(define (log-warn msg)    (println (term/style "⚠ WARN " :bold :yellow) " " msg))
-(define (log-info msg)    (println (term/style "ℹ INFO " :bold :blue) " " msg))
-(define (log-success msg) (println (term/style "✔ OK   " :bold :green) " " msg))
+(define (log-error msg) (println (term/style "✗ ERROR" :bold :red) " " msg))
+(define (log-warn msg) (println (term/style "⚠ WARN " :bold :yellow) " " msg))
+(define (log-info msg) (println (term/style "ℹ INFO " :bold :blue) " " msg))
+(define (log-success msg)
+  (println (term/style "✔ OK   " :bold :green) " " msg))
 ;; Just verify they don't error
 (log-error "Connection refused")
 (log-warn "Retrying in 5s")
@@ -80,7 +93,7 @@
   (cond
     ((< code 300) (term/green (number/to-string code)))
     ((< code 400) (term/yellow (number/to-string code)))
-    (else         (term/red (number/to-string code)))))
+    (else (term/red (number/to-string code)))))
 
 (assert-eq (term/strip (color-status 200)) "200" "color-status 200")
 (assert-eq (term/strip (color-status 301)) "301" "color-status 301")

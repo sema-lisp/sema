@@ -6,15 +6,19 @@
 (println "--- Encoding to JSON ---\n")
 
 (define user
-  (map/new
-    "name" "Alice"
-    "age" 30
-    "email" "alice@example.com"
-    "tags" (list "admin" "verified")
+  (map/new "name"
+    "Alice"
+    "age"
+    30
+    "email"
+    "alice@example.com"
+    "tags"
+    (list "admin" "verified")
     "address"
-      (map/new
-        "city" "Oslo"
-        "country" "Norway")))
+    (map/new "city"
+      "Oslo"
+      "country"
+      "Norway")))
 
 (println "Sema value:")
 (println f"  ${user}\n")
@@ -40,8 +44,8 @@
 (println "\n--- Roundtrip Encode/Decode ---\n")
 
 (define original (map/new "x" 1 "y" (list 2 3) "z" (map/new "nested" #t)))
-(define json-roundtrip  (json/encode original))
-(define roundtripped    (json/decode json-roundtrip))
+(define json-roundtrip (json/encode original))
+(define roundtripped (json/decode json-roundtrip))
 (println f"Original:     ${original}")
 (println f"As JSON:      ${json-roundtrip}")
 (println f"Decoded back: ${roundtripped}")
@@ -69,13 +73,16 @@
 (define price-summary
   (map
     (fn (cat)
-      (let* ((items   (get by-category cat))
-             (prices  (map #(get % :price) items)))
-        (map/new
-          "category" cat
-          "count" (length items)
-          "total" (list/sum prices)
-          "avg" (/ (list/sum prices) (length prices)))))
+      (let* ((items (get by-category cat))
+             (prices (map #(get % :price) items)))
+        (map/new "category"
+          cat
+          "count"
+          (length items)
+          "total"
+          (list/sum prices)
+          "avg"
+          (/ (list/sum prices) (length prices)))))
     (keys by-category)))
 
 (println "\nPrice summary:")
@@ -91,17 +98,21 @@
   (map/new "status" code "ok" #f "error" message))
 
 (defun api-paginated (items page per-page)
-  (let* ((total        (length items))
-         (start        (* (- page 1) per-page))
-         (page-items   (take per-page (drop start items)))
-         (total-pages  (ceil (/ total per-page))))
+  (let* ((total (length items))
+         (start (* (- page 1) per-page))
+         (page-items (take per-page (drop start items)))
+         (total-pages (ceil (/ total per-page))))
     (api-ok
-      (map/new
-        "items" page-items
-        "page" page
-        "per_page" per-page
-        "total" total
-        "total_pages" total-pages))))
+      (map/new "items"
+        page-items
+        "page"
+        page
+        "per_page"
+        per-page
+        "total"
+        total
+        "total_pages"
+        total-pages))))
 
 (println "Success response:")
 (println (json/encode-pretty (api-ok (map/new "user" "Alice" "role" "admin"))))

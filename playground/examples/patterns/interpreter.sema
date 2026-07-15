@@ -3,10 +3,10 @@
 (println "=== Mini-Lisp Interpreter ===\n")
 
 ;; AST constructors
-(define (make-num n)        (map/new :type :number :value n))
-(define (make-var name)     (map/new :type :var :name name))
+(define (make-num n) (map/new :type :number :value n))
+(define (make-var name) (map/new :type :var :name name))
 (define (make-binop op l r) (map/new :type :binop :op op :left l :right r))
-(define (make-if c t f)     (map/new :type :if :cond c :then t :else f))
+(define (make-if c t f) (map/new :type :if :cond c :then t :else f))
 (define (make-let name val body)
   (map/new :type :let :name name :val val :body body))
 (define (make-lam param body)
@@ -20,29 +20,40 @@
     (cond
       ((eq? tag :number) (get node :value))
       ((eq? tag :var)
-       (if (contains? env (get node :name))
-         (get env (get node :name))
-         (throw (format "Unbound: ~a" (get node :name)))))
+        (if (contains? env (get node :name))
+          (get env (get node :name))
+          (throw (format "Unbound: ~a" (get node :name)))))
       ((eq? tag :binop)
-       (let ((op (get node :op))
-             (lv (eval-ast (get node :left) env))
-             (rv (eval-ast (get node :right) env)))
-         (cond ((eq? op :+) (+ lv rv)) ((eq? op :-) (- lv rv))
-               ((eq? op :*) (* lv rv)) ((eq? op :/) (/ lv rv))
-               ((eq? op :>) (> lv rv)) ((eq? op :=) (= lv rv)))))
+        (let ((op (get node :op))
+              (lv (eval-ast (get node :left) env))
+              (rv (eval-ast (get node :right) env)))
+          (cond
+            ((eq? op :+) (+ lv rv))
+            ((eq? op :-) (- lv rv))
+            ((eq? op :*) (* lv rv))
+            ((eq? op :/) (/ lv rv))
+            ((eq? op :>) (> lv rv))
+            ((eq? op :=) (= lv rv)))))
       ((eq? tag :if)
-       (if (eval-ast (get node :cond) env)
-         (eval-ast (get node :then) env)
-         (eval-ast (get node :else) env)))
+        (if (eval-ast (get node :cond) env)
+          (eval-ast (get node :then) env)
+          (eval-ast (get node :else) env)))
       ((eq? tag :let)
-       (eval-ast (get node :body)
-         (assoc env (get node :name) (eval-ast (get node :val) env))))
+        (eval-ast (get node :body)
+          (assoc env (get node :name) (eval-ast (get node :val) env))))
       ((eq? tag :lambda)
-       (map/new :type :closure :param (get node :param) :body (get node :body) :env env))
+        (map/new :type
+          :closure
+          :param
+          (get node :param)
+          :body
+          (get node :body)
+          :env
+          env))
       ((eq? tag :call)
-       (let ((cl (eval-ast (get node :fn) env))
-             (av (eval-ast (get node :arg) env)))
-         (eval-ast (get cl :body) (assoc (get cl :env) (get cl :param) av)))))))
+        (let ((cl (eval-ast (get node :fn) env))
+              (av (eval-ast (get node :arg) env)))
+          (eval-ast (get cl :body) (assoc (get cl :env) (get cl :param) av)))))))
 
 (define E (map/new))
 (define (run label ast)
@@ -50,20 +61,26 @@
 
 (println "--- Arithmetic ---")
 (run "(+ (* 3 4) (- 10 5))"
-  (make-binop :+ (make-binop :* (make-num 3) (make-num 4))
-                 (make-binop :- (make-num 10) (make-num 5))))
+  (make-binop :+
+    (make-binop :* (make-num 3) (make-num 4))
+    (make-binop :- (make-num 10) (make-num 5))))
 
 (println "\n--- Let & If ---")
 (run "(let x 7 (if (= x 7) 100 200))"
-  (make-let :x (make-num 7)
-    (make-if (make-binop := (make-var :x) (make-num 7)) (make-num 100) (make-num 200))))
+  (make-let :x
+    (make-num 7)
+    (make-if (make-binop := (make-var :x) (make-num 7))
+      (make-num 100)
+      (make-num 200))))
 
 (println "\n--- Lambda ---")
 (run "((fn n (+ n 1)) 41)"
-  (make-call (make-lam :n (make-binop :+ (make-var :n) (make-num 1))) (make-num 41)))
+  (make-call (make-lam :n (make-binop :+ (make-var :n) (make-num 1)))
+    (make-num 41)))
 
 (run "(let double (fn x (* x 2)) (double 21))"
-  (make-let :double (make-lam :x (make-binop :* (make-var :x) (make-num 2)))
+  (make-let :double
+    (make-lam :x (make-binop :* (make-var :x) (make-num 2)))
     (make-call (make-var :double) (make-num 21))))
 
 (println "\nAll passed!")

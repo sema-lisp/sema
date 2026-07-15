@@ -1136,7 +1136,9 @@ mod io_streams {
         data: &[u8],
         decode: impl Fn(usize) -> Result<Value, SemaError> + 'static,
     ) -> Result<Option<Value>, SemaError> {
-        if (!in_async_context() && !sema_core::in_runtime_quantum()) || stream.stream_type() != "file-output" {
+        if (!in_async_context() && !sema_core::in_runtime_quantum())
+            || stream.stream_type() != "file-output"
+        {
             return Ok(None);
         }
         if stream.is_closed() {
@@ -1162,7 +1164,9 @@ mod io_streams {
     }
 
     pub(super) fn maybe_async_flush(stream: &Rc<StreamBox>) -> Result<Option<Value>, SemaError> {
-        if (!in_async_context() && !sema_core::in_runtime_quantum()) || stream.stream_type() != "file-output" {
+        if (!in_async_context() && !sema_core::in_runtime_quantum())
+            || stream.stream_type() != "file-output"
+        {
             return Ok(None);
         }
         if stream.is_closed() {
@@ -1187,7 +1191,9 @@ mod io_streams {
     }
 
     pub(super) fn maybe_async_close(stream: &Rc<StreamBox>) -> Result<Option<Value>, SemaError> {
-        if (!in_async_context() && !sema_core::in_runtime_quantum()) || stream.stream_type() != "file-output" {
+        if (!in_async_context() && !sema_core::in_runtime_quantum())
+            || stream.stream_type() != "file-output"
+        {
             return Ok(None);
         }
         if stream.is_closed() {

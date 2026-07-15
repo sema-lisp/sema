@@ -54,9 +54,9 @@
 (println "\n\n🎨 SECTION 2: Skin Tone Modifiers")
 (println "Base emoji + modifier codepoint = toned variant")
 
-(define wave        128075)
-(define skin-tones  (list 127995 127996 127997 127998 127999))
-(define tone-names  (list "Light" "Med-Light" "Medium" "Med-Dark" "Dark"))
+(define wave 128075)
+(define skin-tones (list 127995 127996 127997 127998 127999))
+(define tone-names (list "Light" "Med-Light" "Medium" "Med-Dark" "Dark"))
 
 (println "")
 (for-each
@@ -200,8 +200,8 @@
 
 ;; Skin tones on composed emoji!
 (println "\n  🎨 Skin tones on professions")
-(define tones      (list 127995 127996 127997 127998 127999))
-(define astronaut  (cp->str 128640))
+(define tones (list 127995 127996 127997 127998 127999))
+(define astronaut (cp->str 128640))
 (println "    Woman astronaut in all tones:")
 (define tone-row
   (string/join
@@ -250,8 +250,8 @@
 (for-each
   (fn (entry)
     (let ((glyph (first entry)) (name (nth entry 1)))
-      (let* ((bytes    (string/byte-length glyph))
-             (bar-len  (min bytes 20)))
+      (let* ((bytes (string/byte-length glyph))
+             (bar-len (min bytes 20)))
         (println
           (format "  ~a  ~a  ~a"
             (string/pad-right glyph 4)
@@ -270,9 +270,9 @@
 (println "\n\n🔐 SECTION 7: Emoji Face Cipher")
 (println "Shift face emoji codepoints within U+1F600..U+1F64F\n")
 
-(define faces-start  128512)
-(define faces-end    128591)
-(define faces-count  (+ 1 (- faces-end faces-start)))
+(define faces-start 128512)
+(define faces-end 128591)
+(define faces-count (+ 1 (- faces-end faces-start)))
 
 (define (shift-face cp shift)
   (if (and (>= cp faces-start) (<= cp faces-end))
@@ -283,10 +283,10 @@
   (string/from-codepoints
     (map (fn (cp) (shift-face cp shift)) (string/codepoints s))))
 
-(define message  "😀😃😄😁😆😅😂🤣")
-(define shift    13)
-(define encoded  (emoji-cipher message shift))
-(define decoded  (emoji-cipher encoded (- faces-count shift)))
+(define message "😀😃😄😁😆😅😂🤣")
+(define shift 13)
+(define encoded (emoji-cipher message shift))
+(define decoded (emoji-cipher encoded (- faces-count shift)))
 
 (println (format "  Original:  ~a" message))
 (println (format "  Shift +~a: ~a" shift encoded))

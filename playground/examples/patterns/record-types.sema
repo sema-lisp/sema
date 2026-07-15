@@ -3,9 +3,9 @@
 (println "=== Record Types ===\n")
 
 ;; --- Point ---
-(define-record-type Point
-  (make-point x y) point?
-  (x point-x) (y point-y))
+(define-record-type Point (make-point x y) point?
+  (x point-x)
+  (y point-y))
 
 (define p1 (make-point 3 4))
 (define p2 (make-point 7 1))
@@ -14,48 +14,57 @@
 (println (format "p1 is Point? ~a  42 is Point? ~a" (point? p1) (point? 42)))
 
 (define (distance a b)
-  (sqrt (+ (expt (- (point-x b) (point-x a)) 2)
-           (expt (- (point-y b) (point-y a)) 2))))
+  (sqrt
+    (+ (expt (- (point-x b) (point-x a)) 2)
+      (expt (- (point-y b) (point-y a)) 2))))
 (println (format "Distance: ~a" (distance p1 p2)))
 
 ;; --- Shapes ---
 (println "\n--- Shapes ---")
 
-(define-record-type Circle
-  (make-circle center radius) circle?
-  (center circle-center) (radius circle-radius))
+(define-record-type Circle (make-circle center radius) circle?
+  (center circle-center)
+  (radius circle-radius))
 
-(define-record-type Rect
-  (make-rect origin width height) rect?
-  (origin rect-origin) (width rect-width) (height rect-height))
+(define-record-type Rect (make-rect origin width height) rect?
+  (origin rect-origin)
+  (width rect-width)
+  (height rect-height))
 
 (define (area shape)
-  (cond ((circle? shape) (* pi (expt (circle-radius shape) 2)))
-        ((rect? shape) (* (rect-width shape) (rect-height shape)))))
+  (cond
+    ((circle? shape) (* pi (expt (circle-radius shape) 2)))
+    ((rect? shape) (* (rect-width shape) (rect-height shape)))))
 
 (define c1 (make-circle (make-point 0 0) 5))
 (define r1 (make-rect (make-point 1 2) 10 6))
 
-(for-each (fn (s)
-  (println (format "  ~a  area=~a"
-    (if (circle? s) (format "Circle r=~a" (circle-radius s))
-        (format "Rect ~ax~a" (rect-width s) (rect-height s)))
-    (round (* (area s) 100)))))
+(for-each
+  (fn (s)
+    (println
+      (format "  ~a  area=~a"
+        (if (circle? s)
+          (format "Circle r=~a" (circle-radius s))
+          (format "Rect ~ax~a" (rect-width s) (rect-height s)))
+        (round (* (area s) 100)))))
   (list c1 r1))
 
 ;; --- Linked List via Records ---
 (println "\n--- Linked List via Records ---")
 
-(define-record-type Cell
-  (make-cell head tail) cell?
-  (head cell-head) (tail cell-tail))
+(define-record-type Cell (make-cell head tail) cell?
+  (head cell-head)
+  (tail cell-tail))
 
 (define (cell-from-list items) (foldr make-cell nil items))
 (define (cell-to-list lst)
   (if (null? lst) '() (cons (cell-head lst) (cell-to-list (cell-tail lst)))))
 (define (cell-map f lst)
-  (if (null? lst) nil (make-cell (f (cell-head lst)) (cell-map f (cell-tail lst)))))
+  (if (null? lst)
+    nil
+    (make-cell (f (cell-head lst)) (cell-map f (cell-tail lst)))))
 
 (define my-list (cell-from-list '(10 20 30 40 50)))
 (println (format "\n  As list: ~a" (cell-to-list my-list)))
-(println (format "  Doubled: ~a" (cell-to-list (cell-map (fn (x) (* x 2)) my-list))))
+(println
+  (format "  Doubled: ~a" (cell-to-list (cell-map (fn (x) (* x 2)) my-list))))

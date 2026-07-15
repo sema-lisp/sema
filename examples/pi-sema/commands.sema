@@ -19,12 +19,12 @@
 
 (define (parse-command input)
   "Parse \"/command arg1 arg2\" into {:name \"command\" :args \"arg1 arg2\"}."
-  (let* ((trimmed        (string/trim input))
-         (without-slash  (string/slice trimmed 1 (string/length trimmed)))
-         (parts          (string/split without-slash " "))
-         (name           (car parts))
-         (rest           (cdr parts))
-         (args           (string/trim (string/join rest " "))))
+  (let* ((trimmed (string/trim input))
+         (without-slash (string/slice trimmed 1 (string/length trimmed)))
+         (parts (string/split without-slash " "))
+         (name (car parts))
+         (rest (cdr parts))
+         (args (string/trim (string/join rest " "))))
     {:name name :args args}))
 
 ;; ============================================================
@@ -146,10 +146,10 @@
 ;; ============================================================
 
 (define (cmd-compact state)
-  (let* ((messages      (get state :messages '()))
-         (before-count  (length messages))
-         (compacted     (compact-messages messages))
-         (after-count   (length compacted)))
+  (let* ((messages (get state :messages '()))
+         (before-count (length messages))
+         (compacted (compact-messages messages))
+         (after-count (length compacted)))
     (show-info
       (format "Compacted: ~a messages → ~a messages" before-count after-count))
     (assoc state :messages compacted)))
@@ -215,9 +215,9 @@
 ;; ============================================================
 
 (define (cmd-usage state)
-  (let ((usage       (llm/session-usage))
-        (messages    (get state :messages '()))
-        (est-tokens  (estimate-tokens messages)))
+  (let ((usage (llm/session-usage))
+        (messages (get state :messages '()))
+        (est-tokens (estimate-tokens messages)))
     (show-usage usage)
     (show-info (format "Estimated tokens in conversation: ~a" est-tokens)))
   state)
@@ -227,9 +227,9 @@
 ;; ============================================================
 
 (define (cmd-status state)
-  (let* ((messages    (get state :messages '()))
-         (session     (get state :session {}))
-         (est-tokens  (estimate-tokens messages)))
+  (let* ((messages (get state :messages '()))
+         (session (get state :session {}))
+         (est-tokens (estimate-tokens messages)))
     (io/println-error "")
     (io/println-error (term/style "  Status:" :bold))
     (io/println-error
@@ -242,7 +242,8 @@
           (format "  Plan:           ~a" (truncate-str (get state :plan "") 50)))))
     (io/println-error
       (term/dim (format "  Session ID:     ~a" (get session :id ""))))
-    (io/println-error (term/dim (format "  Messages:       ~a" (length messages))))
+    (io/println-error
+      (term/dim (format "  Messages:       ~a" (length messages))))
     (io/println-error (term/dim (format "  Est. tokens:    ~a" est-tokens)))
     (io/println-error
       (term/dim (format "  Working dir:    ~a" (get state :cwd ""))))
@@ -277,8 +278,8 @@
       (show-info "Investigating codebase with read-only tools...")
       (io/println-error "")
       (try
-        (let* ((result     (run-plan-turn state args))
-               (plan-text  (get result :plan "")))
+        (let* ((result (run-plan-turn state args))
+               (plan-text (get result :plan "")))
           (show-response plan-text)
           (show-info
             "Plan generated. Type /approve to execute, /plan clear to discard.")
@@ -319,10 +320,10 @@
           "Type /next to continue, /plan show to review, /plan clear to abort.")
         (io/println-error "")
         (try
-          (let* ((exec-state  (assoc state :mode :execute))
-                 (result      (run-execute-turn exec-state))
-                 (response    (get result :response ""))
-                 (messages    (get result :messages '())))
+          (let* ((exec-state (assoc state :mode :execute))
+                 (result (run-execute-turn exec-state))
+                 (response (get result :response ""))
+                 (messages (get result :messages '())))
             (show-response response)
             ;; Save to session
             (try
@@ -358,9 +359,9 @@
       (else (show-info "Continuing execution...")
         (io/println-error "")
         (try
-          (let* ((result    (run-execute-turn state))
-                 (response  (get result :response ""))
-                 (messages  (get result :messages '())))
+          (let* ((result (run-execute-turn state))
+                 (response (get result :response ""))
+                 (messages (get result :messages '())))
             (show-response response)
             ;; Save to session
             (try
@@ -403,9 +404,9 @@
 
 (define (consensus-ask-provider cfg question conversation-context)
   "Ask a single provider. Returns {:label ... :response ... :error bool}."
-  (let ((label        (:label cfg))
-        (provider-kw  (:provider cfg))
-        (model        (:model cfg)))
+  (let ((label (:label cfg))
+        (provider-kw (:provider cfg))
+        (model (:model cfg)))
     (io/println-error (term/dim (format "    ⟳ ~a (~a)..." label model)))
     (let ((start (time-ms)))
       (try

@@ -214,7 +214,11 @@ pub fn register(env: &Env) {
         let name = args[0]
             .as_str()
             .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
-        let span = sema_otel::user_span(name, sema_otel::SemaSpanKind::Tool, parse_attrs(args.get(2)));
+        let span = sema_otel::user_span(
+            name,
+            sema_otel::SemaSpanKind::Tool,
+            parse_attrs(args.get(2)),
+        );
         Ok((span, args[1].clone()))
     });
 
@@ -423,6 +427,9 @@ mod tests {
         let cont = SpanGuardContinuation { span: None };
         let mut edges = 0usize;
         assert!(cont.trace(&mut |_| edges += 1));
-        assert_eq!(edges, 0, "span teardown continuation must expose no Value edges");
+        assert_eq!(
+            edges, 0,
+            "span teardown continuation must expose no Value edges"
+        );
     }
 }

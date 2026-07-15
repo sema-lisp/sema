@@ -10,10 +10,10 @@
 
 (define (move-disk towers from to)
   (let* ((from-stack (get towers from))
-         (to-stack   (get towers to))
-         (disk       (car from-stack))
-         (new-from   (cdr from-stack))
-         (new-to     (cons disk to-stack)))
+         (to-stack (get towers to))
+         (disk (car from-stack))
+         (new-from (cdr from-stack))
+         (new-to (cons disk to-stack)))
     (assoc (assoc towers from new-from) to new-to)))
 
 (define (render-disk disk width)
@@ -31,29 +31,42 @@
          (a (get towers :A))
          (b (get towers :B))
          (c (get towers :C))
-         (pad-a (append (map (lambda (_) 0) (range 0 (- num-disks (length a)))) a))
-         (pad-b (append (map (lambda (_) 0) (range 0 (- num-disks (length b)))) b))
-         (pad-c (append (map (lambda (_) 0) (range 0 (- num-disks (length c)))) c)))
-    (for-each (lambda (i)
-      (let ((da (nth pad-a i)) (db (nth pad-b i)) (dc (nth pad-c i)))
-        (println (format "  ~a ~a ~a"
-          (render-disk da col-width) (render-disk db col-width) (render-disk dc col-width)))))
+         (pad-a
+           (append (map (lambda (_) 0) (range 0 (- num-disks (length a)))) a))
+         (pad-b
+           (append (map (lambda (_) 0) (range 0 (- num-disks (length b)))) b))
+         (pad-c
+           (append (map (lambda (_) 0) (range 0 (- num-disks (length c)))) c)))
+    (for-each
+      (lambda (i)
+        (let ((da (nth pad-a i)) (db (nth pad-b i)) (dc (nth pad-c i)))
+          (println
+            (format "  ~a ~a ~a"
+              (render-disk da col-width)
+              (render-disk db col-width)
+              (render-disk dc col-width)))))
       (range 0 num-disks))
-    (println (format "  ~a ~a ~a"
-      (string/pad-right (string/pad-left "A" col-width) total-col)
-      (string/pad-right (string/pad-left "B" col-width) total-col)
-      (string/pad-right (string/pad-left "C" col-width) total-col)))
+    (println
+      (format "  ~a ~a ~a"
+        (string/pad-right (string/pad-left "A" col-width) total-col)
+        (string/pad-right (string/pad-left "B" col-width) total-col)
+        (string/pad-right (string/pad-left "C" col-width) total-col)))
     (println "")))
 
 (define (solve n from to aux towers)
-  (if (= n 0) towers
+  (if (= n 0)
+    towers
     (let* ((towers1 (solve (- n 1) from aux to towers))
-           (disk    (car (get towers1 from)))
+           (disk (car (get towers1 from)))
            (towers2 (move-disk towers1 from to))
            (move-num (+ 1 (car move-counter))))
       (set! move-counter (list move-num))
-      (println (format "--- Move ~a: Disk ~a from ~a → ~a ---"
-        move-num disk (keyword/to-string from) (keyword/to-string to)))
+      (println
+        (format "--- Move ~a: Disk ~a from ~a → ~a ---"
+          move-num
+          disk
+          (keyword/to-string from)
+          (keyword/to-string to)))
       (display-towers towers2)
       (solve (- n 1) aux to from towers2))))
 
@@ -63,4 +76,7 @@
 (display-towers initial)
 (define final-state (solve num-disks :A :C :B initial))
 (println "=== Complete! ===")
-(println (format "Total moves: ~a (optimal = ~a)" (car move-counter) (- (pow 2 num-disks) 1)))
+(println
+  (format "Total moves: ~a (optimal = ~a)"
+    (car move-counter)
+    (- (pow 2 num-disks) 1)))

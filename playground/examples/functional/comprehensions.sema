@@ -13,11 +13,11 @@
             (rest (cdr bs)))
         (if (and (list? clause) (= (car clause) :when))
           `(let ((__result ,(expand rest)))
-             (if ,(cadr clause) __result '()))
+            (if ,(cadr clause) __result '()))
           (let ((var (car clause))
                 (seq (cadr clause)))
             `(apply append
-               (map (fn (,var) ,(expand rest)) ,seq)))))))
+              (map (fn (,var) ,(expand rest)) ,seq)))))))
   (expand bindings))
 
 (defmacro for/sum (bindings body)
@@ -32,33 +32,36 @@
 (println "=== Comprehensions ===\n")
 
 ;; Squares of 1..10
-(println (format "Squares: ~a"
-  (for/list ((x (range 1 11))) (* x x))))
+(println
+  (format "Squares: ~a"
+    (for/list ((x (range 1 11))) (* x x))))
 
 ;; Cartesian product
-(println (format "Pairs: ~a"
-  (for/list ((x (list 1 2 3))
-             (y (list "a" "b")))
-    (list x y))))
+(println
+  (format "Pairs: ~a"
+    (for/list ((x (list 1 2 3)) (y (list "a" "b")))
+      (list x y))))
 
 ;; Even squares with filter
-(println (format "Even squares: ~a"
-  (for/list ((x (range 1 21))
-             (:when (even? x)))
-    (* x x))))
+(println
+  (format "Even squares: ~a"
+    (for/list ((x (range 1 21)) (:when (even? x)))
+      (* x x))))
 
 ;; Pythagorean triples
 (define triples
-  (for/list ((a (range 1 21))
-             (b (range a 21))
-             (:when (let ((c (sqrt (+ (* a a) (* b b)))))
-                      (= c (floor c)))))
+  (for/list
+    ((a (range 1 21)) (b (range a 21))
+      (:when
+        (let ((c (sqrt (+ (* a a) (* b b)))))
+          (= c (floor c)))))
     (list a b (int (sqrt (+ (* a a) (* b b)))))))
 (println (format "\nPythagorean triples: ~a" triples))
 
 ;; Sum of cubes
-(println (format "\nSum of cubes 1..10: ~a"
-  (for/sum ((n (range 1 11))) (* n n n))))
+(println
+  (format "\nSum of cubes 1..10: ~a"
+    (for/sum ((n (range 1 11))) (* n n n))))
 
 ;; Matrix transpose
 (define matrix (list (list 1 2 3) (list 4 5 6) (list 7 8 9)))

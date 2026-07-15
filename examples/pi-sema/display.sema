@@ -31,9 +31,9 @@
 
 ;; ── Tool Call Rendering ─────────────────────────────────────────
 
-(define active-spinner    #f)
-(define active-tool-name  "")
-(define active-tool-args  {})
+(define active-spinner #f)
+(define active-tool-name "")
+(define active-tool-args {})
 
 (define (tool-primary-arg tool args)
   "Extract the most useful arg for compact display."
@@ -42,14 +42,14 @@
     ((equal? tool "write-file") (get args :path ""))
     ((equal? tool "edit-file") (get args :path ""))
     ((equal? tool "grep")
-      (let ((pattern  (get args :pattern ""))
-            (path     (get args :path "")))
+      (let ((pattern (get args :pattern ""))
+            (path (get args :path "")))
         (if (= path "")
           pattern
           (format "~a → ~a" pattern path))))
     ((equal? tool "find-files")
-      (let ((pattern  (get args :pattern ""))
-            (path     (get args :path "")))
+      (let ((pattern (get args :pattern ""))
+            (path (get args :path "")))
         (if (= path "")
           pattern
           (format "~a in ~a" pattern path))))
@@ -94,9 +94,9 @@
     (else "")))
 
 (define (on-tool-call event)
-  (let ((evt   (:event event))
-        (tool  (:tool event))
-        (args  (:args event)))
+  (let ((evt (:event event))
+        (tool (:tool event))
+        (args (:args event)))
     (cond
       ((= evt "start") (set! active-tool-name tool)
         (set! active-tool-args (if (map? args) args {}))

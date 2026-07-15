@@ -472,10 +472,7 @@ struct RunTeardown {
 /// Derive the run envelope from the body's result, journal `run.ended`, write
 /// `result.json`, close any MCP handles, then drop the scope guard. Shared by the legacy
 /// and cooperative paths; always returns an envelope (a body error becomes a failed one).
-fn finish_run(
-    teardown: RunTeardown,
-    result: Result<Value, SemaError>,
-) -> Result<Value, SemaError> {
+fn finish_run(teardown: RunTeardown, result: Result<Value, SemaError>) -> Result<Value, SemaError> {
     let RunTeardown {
         guard,
         mcp_resolver,
@@ -757,9 +754,15 @@ pub fn register(env: &sema_core::Env) {
     // current phase. Returns the thunk's value (or propagates its error, after
     // journaling a result). A no-op wrapper (just runs the thunk) when called
     // outside a workflow run. See `step_plan` / `finish_step`.
-    register_thunk_fn(env, "workflow/step", step_plan, finish_step, |_teardown, _sink| {
-        // `StepTeardown` carries only scalar/`Rc<RefCell<LeafUsage>>` state — no `Value`.
-    });
+    register_thunk_fn(
+        env,
+        "workflow/step",
+        step_plan,
+        finish_step,
+        |_teardown, _sink| {
+            // `StepTeardown` carries only scalar/`Rc<RefCell<LeafUsage>>` state — no `Value`.
+        },
+    );
 
     // (workflow/tool-call tool-name [args]) — journal a tool call by the current
     // agent (the dashboard renders these as tool twigs in the agent's drill-in).

@@ -2,41 +2,60 @@
 
 (println "=== Email Validation ===\n")
 
-(define emails (list "alice@example.com" "bob AT mail" "charlie@dev.org" "not-an-email"))
-(for-each (lambda (e)
-  (if (regex/match? "^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}$" e)
-    (println (format "  ✓ ~a" e))
-    (println (format "  ✗ ~a (invalid)" e))))
+(define emails
+  (list "alice@example.com" "bob AT mail" "charlie@dev.org" "not-an-email"))
+(for-each
+  (lambda (e)
+    (if (regex/match? "^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}$" e)
+      (println (format "  ✓ ~a" e))
+      (println (format "  ✗ ~a (invalid)" e))))
   emails)
 
 (println "\n=== URL Extraction ===\n")
 
 (define text-with-urls
   "Check out https://example.com and http://docs.sema-lang.org for info.")
-(define urls (regex/find-all "https?://[a-zA-Z0-9._~:/?#@!$&'()*+,;=-]+" text-with-urls))
+(define urls
+  (regex/find-all "https?://[a-zA-Z0-9._~:/?#@!$&'()*+,;=-]+" text-with-urls))
 (println (format "Found ~a URL(s):" (length urls)))
-(for-each (lambda (u) (println (format "  → ~a" u))) urls)
+(for-each
+  (lambda (u) (println (format "  → ~a" u)))
+  urls)
 
 (println "\n=== Log Parser ===\n")
 
-(define log-lines (list
-  "2026-02-14 08:23:01 [INFO] Server started on port 3000"
-  "2026-02-14 08:23:05 [WARN] Slow query (1230ms)"
-  "2026-02-14 08:24:12 [ERROR] Connection refused"))
+(define log-lines
+  (list "2026-02-14 08:23:01 [INFO] Server started on port 3000"
+    "2026-02-14 08:23:05 [WARN] Slow query (1230ms)"
+    "2026-02-14 08:24:12 [ERROR] Connection refused"))
 
-(for-each (lambda (line)
-  (let ((m (regex/match "^(\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2}:\\d{2}) \\[(\\w+)\\] (.+)$" line)))
-    (if m
-      (let* ((groups (get m :groups))
-             (level (nth groups 1))
-             (icon (cond ((equal? level "ERROR") "🔴") ((equal? level "WARN") "🟡") (else "🟢"))))
-        (println (format "  ~a ~a | ~a | ~a" icon (nth groups 0) level (nth groups 2))))
-      (println (format "  ?? ~a" line)))))
+(for-each
+  (lambda (line)
+    (let ((m
+            (regex/match
+              "^(\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2}:\\d{2}) \\[(\\w+)\\] (.+)$"
+              line)))
+      (if m
+        (let* ((groups (get m :groups))
+               (level (nth groups 1))
+               (icon
+                 (cond
+                   ((equal? level "ERROR") "🔴")
+                   ((equal? level "WARN") "🟡")
+                   (else "🟢"))))
+          (println
+            (format "  ~a ~a | ~a | ~a"
+              icon
+              (nth groups 0)
+              level
+              (nth groups 2))))
+        (println (format "  ?? ~a" line)))))
   log-lines)
 
 (println "\n=== Markdown Stripper ===\n")
 
-(define md "# Hello\nThis is **bold** and *italic* with `code` and [a link](http://x.com).")
+(define md
+  "# Hello\nThis is **bold** and *italic* with `code` and [a link](http://x.com).")
 (define stripped
   (let* ((s (regex/replace-all "^#{1,6}\\s+" "" md))
          (s (regex/replace-all "\\*{1,3}([^*]+)\\*{1,3}" "$1" s))

@@ -41,9 +41,9 @@
 ;; --- 3. Define an agent whose tools ARE the Asana MCP tools -------------------
 (defagent asana-agent
   {:system (str "You are an Asana assistant. Use the available Asana tools to "
-                "answer the user. When asked about tasks assigned to the user, "
-                "resolve the current user (the Asana 'me' user) and list their "
-                "assigned, incomplete tasks with due dates. Be concise.")
+     "answer the user. When asked about tasks assigned to the user, "
+     "resolve the current user (the Asana 'me' user) and list their "
+     "assigned, incomplete tasks with due dates. Be concise.")
    :model agent-model
    :tools (mcp/tools->sema asana)
    :max-turns 8})
@@ -52,7 +52,7 @@
 (println "Asking the agent to fetch your assigned tasks…\n")
 (define answer
   (agent/run asana-agent
-             "List the tasks currently assigned to me in Asana. Include the task name and due date if there is one."))
+    "List the tasks currently assigned to me in Asana. Include the task name and due date if there is one."))
 
 (println "=== Result ===")
 (println answer)

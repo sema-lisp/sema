@@ -6,9 +6,11 @@
 (println (format "Message: \"~a\"" message))
 
 (define (char-frequencies s)
-  (foldl (fn (acc ch)
-    (map/update acc (char/to-string ch) (fn (v) (if (nil? v) 1 (+ v 1)))))
-    {} (string/chars s)))
+  (foldl
+    (fn (acc ch)
+      (map/update acc (char/to-string ch) (fn (v) (if (nil? v) 1 (+ v 1)))))
+    {}
+    (string/chars s)))
 
 (define freqs (char-frequencies message))
 
@@ -24,46 +26,61 @@
     (fn (a b) (- (node-freq a) (node-freq b)))))
 
 (define (insert-sorted queue node)
-  (if (null? queue) (list node)
+  (if (null? queue)
+    (list node)
     (if (<= (node-freq node) (node-freq (first queue)))
       (cons node queue)
       (cons (first queue) (insert-sorted (rest queue) node)))))
 
 (define (build-tree queue)
-  (if (<= (length queue) 1) (first queue)
-    (let* ((left (first queue)) (right (nth queue 1))
+  (if (<= (length queue) 1)
+    (first queue)
+    (let* ((left (first queue))
+           (right (nth queue 1))
            (branch (make-branch left right)))
       (build-tree (insert-sorted (drop 2 queue) branch)))))
 
 (define tree (build-tree (build-leaves freqs)))
 
 (define (generate-codes node prefix)
-  (if (leaf? node) (list (list (nth node 1) prefix))
+  (if (leaf? node)
+    (list (list (nth node 1) prefix))
     (append (generate-codes (nth node 1) (string/append prefix "0"))
-            (generate-codes (nth node 2) (string/append prefix "1")))))
+      (generate-codes (nth node 2) (string/append prefix "1")))))
 
 (define codes (generate-codes tree ""))
 (define code-map (foldl (fn (acc e) (assoc acc (first e) (nth e 1))) {} codes))
 
 (println "\nCode table:")
-(for-each (fn (e)
-  (let ((ch (first e)) (code (nth e 1)))
-    (println (format "  ~a  ~a" (string/pad-right (if (= ch " ") "SPC" (format "'~a'" ch)) 5) code))))
-  (sort codes (fn (a b) (- (string/length (nth a 1)) (string/length (nth b 1))))))
+(for-each
+  (fn (e)
+    (let ((ch (first e)) (code (nth e 1)))
+      (println
+        (format "  ~a  ~a"
+          (string/pad-right (if (= ch " ") "SPC" (format "'~a'" ch)) 5)
+          code))))
+  (sort codes
+    (fn (a b) (- (string/length (nth a 1)) (string/length (nth b 1))))))
 
 ;; Encode
 (define (encode msg cm)
-  (string/join (map (fn (ch) (get cm (char/to-string ch))) (string/chars msg)) ""))
+  (string/join (map (fn (ch) (get cm (char/to-string ch))) (string/chars msg))
+    ""))
 
 (define encoded (encode message code-map))
-(println (format "\nEncoded: ~a..." (string/slice encoded 0 (min 50 (string/length encoded)))))
+(println
+  (format "\nEncoded: ~a..."
+    (string/slice encoded 0 (min 50 (string/length encoded)))))
 
 ;; Decode
 (define (decode bits tree)
   (let loop ((bits (string/chars bits)) (node tree) (result ""))
     (if (null? bits)
       (if (leaf? node) (string/append result (nth node 1)) result)
-      (let ((next (if (= (char/to-string (first bits)) "0") (nth node 1) (nth node 2))))
+      (let ((next
+              (if (= (char/to-string (first bits)) "0")
+                (nth node 1)
+                (nth node 2))))
         (if (leaf? next)
           (loop (rest bits) tree (string/append result (nth next 1)))
           (loop (rest bits) next result))))))
@@ -72,7 +89,9 @@
 (println (format "Decoded: \"~a\"" decoded))
 
 (define orig-bits (* (string/length message) 8))
-(println (format "\nCompression: ~a → ~a bits (~a% saved)"
-  orig-bits (string/length encoded)
-  (round (* 100 (- 1.0 (/ (float (string/length encoded)) orig-bits))))))
+(println
+  (format "\nCompression: ~a → ~a bits (~a% saved)"
+    orig-bits
+    (string/length encoded)
+    (round (* 100 (- 1.0 (/ (float (string/length encoded)) orig-bits))))))
 (println (format "Roundtrip OK: ~a" (if (= message decoded) "YES ✓" "NO ✗")))

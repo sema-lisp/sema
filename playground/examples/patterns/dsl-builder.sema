@@ -5,16 +5,24 @@
 (define self-closing (list "br" "hr" "img" "input"))
 
 (define (render-attrs attrs)
-  (if (empty? attrs) ""
+  (if (empty? attrs)
+    ""
     (string/append " "
-      (string/join (map (fn (e)
-        (format "~a=\"~a\"" (keyword/to-string (first e)) (nth e 1)))
-        (map/entries attrs)) " "))))
+      (string/join
+        (map
+          (fn (e)
+            (format "~a=\"~a\"" (keyword/to-string (first e)) (nth e 1)))
+          (map/entries attrs))
+        " "))))
 
 (define (tag name attrs . children)
   (if (member name self-closing)
     (format "<~a~a />" name (render-attrs attrs))
-    (format "<~a~a>~a</~a>" name (render-attrs attrs) (string/join children "") name)))
+    (format "<~a~a>~a</~a>"
+      name
+      (render-attrs attrs)
+      (string/join children "")
+      name)))
 
 (define (html . ch) (tag "html" {} (string/join ch "\n")))
 (define (head . ch) (tag "head" {} (string/join ch "\n")))
@@ -25,30 +33,35 @@
 (define (h2 t) (tag "h2" {} t))
 (define (p t) (tag "p" {} t))
 (define (a attrs t) (tag "a" attrs t))
-(define (ul . items) (tag "ul" {} (string/join (map (fn (i) (tag "li" {} i)) items) "\n")))
+(define (ul . items)
+  (tag "ul" {} (string/join (map (fn (i) (tag "li" {} i)) items) "\n")))
 (define (hr) (tag "hr" {}))
 
-(println (div {:class "card"} (h2 "Welcome") (p "Hello world.") (hr) (p "Footer")))
+(println
+  (div {:class "card"} (h2 "Welcome") (p "Hello world.") (hr) (p "Footer")))
 
 (println "\n=== CSS DSL ===\n")
 
 (define (pairs->decls kvs)
-  (if (null? kvs) '()
+  (if (null? kvs)
+    '()
     (cons (format "  ~a: ~a;" (keyword/to-string (first kvs)) (nth kvs 1))
-          (pairs->decls (drop 2 kvs)))))
+      (pairs->decls (drop 2 kvs)))))
 
 (define (css-rule sel . props)
   (format "~a {\n~a\n}" sel (string/join (pairs->decls props) "\n")))
 
 (define style
-  (string/join (list
-    (css-rule "body" :margin "0" :font-family "sans-serif")
-    (css-rule ".card" :border "1px solid #ccc" :padding "1rem"))
+  (string/join
+    (list (css-rule "body" :margin "0" :font-family "sans-serif")
+      (css-rule ".card" :border "1px solid #ccc" :padding "1rem"))
     "\n\n"))
 
 (println style)
 
 (println "\n=== Full Page ===\n")
 
-(println (string/append "<!DOCTYPE html>\n"
-  (html (head (title "Sema DSL")) (body (div {:class "card"} (h1 "Hello") (ul "HTML" "CSS" "DSL"))))))
+(println
+  (string/append "<!DOCTYPE html>\n"
+    (html (head (title "Sema DSL"))
+      (body (div {:class "card"} (h1 "Hello") (ul "HTML" "CSS" "DSL"))))))

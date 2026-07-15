@@ -19,11 +19,12 @@
 
 (define (next-row rule-bits row)
   (let ((len (length row)))
-    (map (fn (i)
-      (apply-rule rule-bits
-        (if (= i 0) 0 (nth row (- i 1)))
-        (nth row i)
-        (if (= i (- len 1)) 0 (nth row (+ i 1)))))
+    (map
+      (fn (i)
+        (apply-rule rule-bits
+          (if (= i 0) 0 (nth row (- i 1)))
+          (nth row i)
+          (if (= i (- len 1)) 0 (nth row (+ i 1)))))
       (range len))))
 
 (define (render-row row)

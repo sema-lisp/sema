@@ -19,10 +19,11 @@
 ;; ── clock + assertions (shared; async tasks are cooperative, so no data race) ─
 (define t0 (/ (sys/elapsed) 1000000.0))
 (defun stamp () (round (- (/ (sys/elapsed) 1000000.0) t0)))
-(defun log (tag msg) (when *verbose* (println (str "  [" (stamp) "ms] " tag "  " msg))))
+(defun log (tag msg)
+  (when *verbose* (println (str "  [" (stamp) "ms] " tag "  " msg))))
 
 (define *checks* (mutable-cell/new 0))
-(define *fails*  (mutable-cell/new 0))
+(define *fails* (mutable-cell/new 0))
 ;; iteration count — set SEMA_ASYNC_EVERYTHING_LOOPS to pound it (default 1, so
 ;; `jake examples` stays fast). With >1 we go QUIET: only ✖ failures + per-iter
 ;; timing print, so 100 loops don't drown the terminal (and printing is slow).
@@ -36,10 +37,11 @@
     (when *verbose* (println (str "  ✔ " label)))
     (begin
       (mutable-cell/set! *fails* (+ (mutable-cell/get *fails*) 1))
-      (println (str "  ✖ " label "  — expected [" expected "] got [" actual "]")))))  ; failures ALWAYS print
+      (println
+        (str "  ✖ " label "  — expected [" expected "] got [" actual "]"))))) ; failures ALWAYS print
 (defun ok! (label v) (check! label (if v #t #f) #t))
 ;; random ms jitter to shuffle interleaving between drivers/iterations
-(defun jitter (max-ms) (async/sleep (* (math/random) max-ms)))  ; async/sleep accepts a float ms
+(defun jitter (max-ms) (async/sleep (* (math/random) max-ms))) ; async/sleep accepts a float ms
 
 ;; ── heartbeat: MUST keep ticking through every blocking op ───────────────────
 (defun heartbeat (id beats)
@@ -56,32 +58,43 @@
 ;; If snapshot_escaping_closure or run_closure_foreign_sync ever regress, the
 ;; cross-level upvalues (l1-tag, l1-base) vanish and these checks go ✖.
 (defun section-deep-nesting (id p)
-  (async                                                   ; ── level 1 ──
+  (async ; ── level 1 ──
     (let ((l1-tag "α") (l1-base 1000))
       (file/write-lines (p "deep.txt") (list "one" "two" "three"))
-      (let ((r (async/all (list                            ; ── level 2 (fan-out) ──
-                 (async                                     ;   L2 task A
-                   (let ((cell (mutable-cell/new 0)))
-                     ;; streaming callback captures l1-base from TWO levels up
-                     (file/for-each-line (p "deep.txt")
-                       (fn (_line) (mutable-cell/set! cell (+ (mutable-cell/get cell) l1-base))))
-                     ;; ── level 3: nested async/all INSIDE the L2 task ──
-                     (let ((deep (async/all (list
-                                   (async                   ;     L3: fold captures l1-tag across 2 levels
-                                     (file/fold-lines (p "deep.txt")
-                                       (fn (acc l) (str acc l1-tag l)) ""))
-                                   (async                   ;     L3: a subprocess, deeply nested
-                                     (let ((h (proc/spawn (list "sh" "-c" "printf L3-ok"))))
-                                       (proc/wait h)
-                                       (string/trim (proc/read-stdout h))))))))
-                       (list (mutable-cell/get cell) (first deep) (nth deep 1)))))
-                 (async                                     ;   L2 task B: plain streaming fold
-                   (file/fold-lines (p "deep.txt") (fn (acc _l) (+ acc 1)) 0))))))
+      (let ((r
+              (async/all
+                (list ; ── level 2 (fan-out) ──
+                  (async ;   L2 task A
+                    (let ((cell (mutable-cell/new 0)))
+                      ;; streaming callback captures l1-base from TWO levels up
+                      (file/for-each-line (p "deep.txt")
+                        (fn (_line)
+                          (mutable-cell/set! cell
+                            (+ (mutable-cell/get cell) l1-base))))
+                      ;; ── level 3: nested async/all INSIDE the L2 task ──
+                      (let ((deep
+                              (async/all
+                                (list
+                                  (async ;     L3: fold captures l1-tag across 2 levels
+                                    (file/fold-lines (p "deep.txt")
+                                      (fn (acc l) (str acc l1-tag l))
+                                      ""))
+                                  (async ;     L3: a subprocess, deeply nested
+                                    (let ((h
+                                            (proc/spawn
+                                              (list "sh" "-c" "printf L3-ok"))))
+                                      (proc/wait h)
+                                      (string/trim (proc/read-stdout h))))))))
+                        (list (mutable-cell/get cell) (first deep) (nth deep 1)))))
+                  (async ;   L2 task B: plain streaming fold
+                    (file/fold-lines (p "deep.txt") (fn (acc _l) (+ acc 1)) 0))))))
         (let ((a (first r)) (b (nth r 1)))
           (check! (str id " L2→L1 upvalue (for-each 3×1000)") (first a) 3000)
-          (check! (str id " L3→L1 upvalue (fold across levels)") (nth a 1) "αoneαtwoαthree")
-          (check! (str id " L3 nested subprocess")             (nth a 2) "L3-ok")
-          (check! (str id " L2 plain fold count")              b 3)
+          (check! (str id " L3→L1 upvalue (fold across levels)")
+            (nth a 1)
+            "αoneαtwoαthree")
+          (check! (str id " L3 nested subprocess") (nth a 2) "L3-ok")
+          (check! (str id " L2 plain fold count") b 3)
           :done)))))
 
 ;; ── SECTION 2: full filesystem coverage (every offloaded file/* + path/*) ────
@@ -89,31 +102,40 @@
   (fn (id p)
     (async
       (let ((d (p "fs")))
-        (file/mkdir d)                                       ; mkdir
-        (file/write (str d "/a.txt") "hello\nfrom\nasync\n")  ; write
+        (file/mkdir d) ; mkdir
+        (file/write (str d "/a.txt") "hello\nfrom\nasync\n") ; write
         (file/write-bytes (str d "/b.bin") (gzip/compress "payload")) ; write-bytes
         (file/write-lines (str d "/c.txt") (list "x" "y" "z" "w")) ; write-lines
-        (file/append (str d "/a.txt") "appended\n")           ; append
+        (file/append (str d "/a.txt") "appended\n") ; append
         (let ((seen (mutable-cell/new 0)))
-          (file/for-each-line (str d "/c.txt") (fn (_l) (mutable-cell/set! seen (+ (mutable-cell/get seen) 1))))
+          (file/for-each-line (str d "/c.txt")
+            (fn (_l) (mutable-cell/set! seen (+ (mutable-cell/get seen) 1))))
           (check! (str id " fs for-each-line count") (mutable-cell/get seen) 4))
         (check! (str id " fs fold-lines-bytes count")
-          (file/fold-lines-bytes (str d "/c.txt") (fn (acc _l) (+ acc 1)) 0) 4)
-        (check! (str id " fs read round-trip") (string/contains? (file/read (str d "/a.txt")) "appended") #t)
+          (file/fold-lines-bytes (str d "/c.txt") (fn (acc _l) (+ acc 1)) 0)
+          4)
+        (check! (str id " fs read round-trip")
+          (string/contains? (file/read (str d "/a.txt")) "appended")
+          #t)
         (check! (str id " fs read-bytes gzip roundtrip")
-          (equal? (gzip/decompress (file/read-bytes (str d "/b.bin"))) (string->bytevector "payload")) #t)
-        (check! (str id " fs read-lines count") (length (file/read-lines (str d "/c.txt"))) 4)
-        (file/copy (str d "/a.txt") (str d "/a-copy.txt"))    ; copy
+          (equal? (gzip/decompress (file/read-bytes (str d "/b.bin")))
+            (string->bytevector "payload"))
+          #t)
+        (check! (str id " fs read-lines count")
+          (length (file/read-lines (str d "/c.txt")))
+          4)
+        (file/copy (str d "/a.txt") (str d "/a-copy.txt")) ; copy
         (file/rename (str d "/a-copy.txt") (str d "/a-renamed.txt")) ; rename
-        (ok! (str id " fs file/info map")   (map? (file/info (str d "/a.txt")))) ; stat
-        (ok! (str id " fs exists?")         (file/exists? (str d "/a.txt")))
-        (ok! (str id " fs is-directory?")   (file/is-directory? d))
-        (ok! (str id " fs canonicalize")    (string? (path/canonicalize d)))    ; canonicalize
-        (ok! (str id " fs absolute")        (string? (path/absolute (str d "/a.txt")))) ; absolute
-        (check! (str id " fs list count")   (length (file/list d)) 4)           ; list
-        (ok! (str id " fs glob *.txt")      (>= (length (file/glob (str d "/*.txt"))) 3)) ; glob
-        (file/delete (str d "/b.bin"))                        ; delete
-        (ok! (str id " fs delete")          (not (file/exists? (str d "/b.bin"))))
+        (ok! (str id " fs file/info map") (map? (file/info (str d "/a.txt")))) ; stat
+        (ok! (str id " fs exists?") (file/exists? (str d "/a.txt")))
+        (ok! (str id " fs is-directory?") (file/is-directory? d))
+        (ok! (str id " fs canonicalize") (string? (path/canonicalize d))) ; canonicalize
+        (ok! (str id " fs absolute") (string? (path/absolute (str d "/a.txt")))) ; absolute
+        (check! (str id " fs list count") (length (file/list d)) 4) ; list
+        (ok! (str id " fs glob *.txt")
+          (>= (length (file/glob (str d "/*.txt"))) 3)) ; glob
+        (file/delete (str d "/b.bin")) ; delete
+        (ok! (str id " fs delete") (not (file/exists? (str d "/b.bin"))))
         (log (str "fs" id) "filesystem family exercised")
         :done))))
 
@@ -122,20 +144,22 @@
   (async
     (let ((src (p "s-src.txt")) (dst (p "s-dst.txt")))
       (let ((o (stream/open-output src)))
-        (stream/write-string o (string/repeat "streamed line\n" 250))   ; write-string
-        (stream/write-byte o 33)                                         ; write-byte
-        (stream/flush o) (stream/close o))                               ; flush + close
+        (stream/write-string o (string/repeat "streamed line\n" 250)) ; write-string
+        (stream/write-byte o 33) ; write-byte
+        (stream/flush o)
+        (stream/close o)) ; flush + close
       (let ((i (stream/open-input src)) (o (stream/open-output dst)))
-        (stream/copy i o)                                                ; copy
-        (stream/close i) (stream/close o))
+        (stream/copy i o) ; copy
+        (stream/close i)
+        (stream/close o))
       (let ((i (stream/open-input dst)))
-        (let ((b0 (stream/read-byte i))                                  ; read-byte
-              (line (stream/read-line i))                                ; read-line
-              (rest (stream/read-all i)))                                ; read-all
+        (let ((b0 (stream/read-byte i)) ; read-byte
+              (line (stream/read-line i)) ; read-line
+              (rest (stream/read-all i))) ; read-all
           (stream/close i)
-          (check! (str id " streams first byte") b0 115)   ; 's'
-          (ok! (str id " streams read-line")  (> (string/length line) 0))
-          (ok! (str id " streams read-all")   (> (bytes/length rest) 0))))
+          (check! (str id " streams first byte") b0 115) ; 's'
+          (ok! (str id " streams read-line") (> (string/length line) 0))
+          (ok! (str id " streams read-all") (> (bytes/length rest) 0))))
       (log (str "stream" id) "stream family exercised")
       :done)))
 
@@ -148,10 +172,15 @@
       (file/write (str d "/two.txt") "second")
       (let ((big (string/repeat "compress me " 500)))
         (check! (str id " gzip roundtrip")
-          (equal? (gzip/decompress (gzip/compress big)) (string->bytevector big)) #t))
-      (zip/create (str d "/bundle.zip") (list (str d "/one.txt") (str d "/two.txt"))) ; zip/create
-      (ok! (str id " zip/list ≥2") (>= (length (zip/list (str d "/bundle.zip"))) 2))  ; zip/list
-      (tar/create (str d "/bundle.tar") (list (str d "/one.txt") (str d "/two.txt"))) ; tar/create
+          (equal? (gzip/decompress (gzip/compress big))
+            (string->bytevector big))
+          #t))
+      (zip/create (str d "/bundle.zip")
+        (list (str d "/one.txt") (str d "/two.txt"))) ; zip/create
+      (ok! (str id " zip/list ≥2")
+        (>= (length (zip/list (str d "/bundle.zip"))) 2)) ; zip/list
+      (tar/create (str d "/bundle.tar")
+        (list (str d "/one.txt") (str d "/two.txt"))) ; tar/create
       (ok! (str id " tar created") (file/exists? (str d "/bundle.tar")))
       (log (str "archive" id) "gzip/zip/tar exercised")
       :done)))
@@ -161,11 +190,14 @@
   (async
     (let ((pdf (path/join "examples" "fixtures" "sample.pdf")))
       (if (not (file/exists? pdf))
-        (begin (log (str "pdf" id) "skipped — fixture not found") :skipped)
         (begin
-          (ok! (str id " pdf page-count ≥1") (>= (pdf/page-count pdf) 1))       ; page-count
-          (ok! (str id " pdf extract-text")  (> (string/length (pdf/extract-text pdf)) 0)) ; extract-text
-          (ok! (str id " pdf metadata map")  (map? (pdf/metadata pdf)))         ; metadata
+          (log (str "pdf" id) "skipped — fixture not found")
+          :skipped)
+        (begin
+          (ok! (str id " pdf page-count ≥1") (>= (pdf/page-count pdf) 1)) ; page-count
+          (ok! (str id " pdf extract-text")
+            (> (string/length (pdf/extract-text pdf)) 0)) ; extract-text
+          (ok! (str id " pdf metadata map") (map? (pdf/metadata pdf))) ; metadata
           (log (str "pdf" id) "pdf family exercised")
           :done)))))
 
@@ -174,19 +206,26 @@
   (async
     (async/all
       (list
-        (async                                                            ; sqlite
+        (async ; sqlite
           (let ((db (str "canary-" id)))
             (db/open-memory db)
             (db/exec db "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
-            (for-each (fn (n) (db/exec db "INSERT INTO t (v) VALUES (?)" (str "row-" n))) (range 1 6))
-            (check! (str id " sqlite row count") (length (db/query db "SELECT v FROM t ORDER BY id")) 5)
+            (for-each
+              (fn (n)
+                (db/exec db "INSERT INTO t (v) VALUES (?)" (str "row-" n)))
+              (range 1 6))
+            (check! (str id " sqlite row count")
+              (length (db/query db "SELECT v FROM t ORDER BY id"))
+              5)
             (db/close db)
             :db-done))
-        (async                                                            ; kv
+        (async ; kv
           (let ((kv (str "kvc-" id)))
             (kv/open kv (p "store.kv"))
-            (for-each (fn (n) (kv/set kv (str "k" n) (str "v" n))) (range 1 4))
-            (check! (str id " kv get")  (kv/get kv "k2") "v2")
+            (for-each
+              (fn (n) (kv/set kv (str "k" n) (str "v" n)))
+              (range 1 4))
+            (check! (str id " kv get") (kv/get kv "k2") "v2")
             (check! (str id " kv keys") (length (kv/keys kv)) 3)
             (kv/close kv)
             :kv-done))))))
@@ -194,23 +233,37 @@
 ;; ── SECTION 7: subprocess + pty — concurrency + overlap timing proof ─────────
 (defun section-proc (id)
   (async
-    (let* ((k 3) (each 250) (start (- (/ (sys/elapsed) 1000000.0) t0))
-           (jobs (map (fn (i) (async
-                                (let ((h (proc/spawn (list "sh" "-c" (str "sleep 0.25; printf done-" i)))))
-                                  (proc/wait h)
-                                  (list (string/trim (proc/read-stdout h)) (proc/exit-code h)))))
-                      (range 1 (+ k 1))))
+    (let* ((k 3)
+           (each 250)
+           (start (- (/ (sys/elapsed) 1000000.0) t0))
+           (jobs
+             (map
+               (fn (i)
+                 (async
+                   (let ((h
+                           (proc/spawn
+                             (list "sh" "-c" (str "sleep 0.25; printf done-" i)))))
+                     (proc/wait h)
+                     (list (string/trim (proc/read-stdout h))
+                       (proc/exit-code h)))))
+               (range 1 (+ k 1))))
            (outs (async/all jobs))
            (wall (round (- (- (/ (sys/elapsed) 1000000.0) t0) start))))
-      (check! (str id " subprocess all exit 0") (every (fn (o) (= (nth o 1) 0)) outs) #t)
+      (check! (str id " subprocess all exit 0")
+        (every (fn (o) (= (nth o 1) 0)) outs)
+        #t)
       ;; timing is informational — 3 concurrent copies contend for the offload
       ;; pool, so overlap shows up in the heartbeat, not a precise wall-clock bound
-      (log (str "proc" id) (str k " subprocesses done in " wall "ms (serial ~" (* k each) "ms)"))
+      (log (str "proc" id)
+        (str k " subprocesses done in " wall "ms (serial ~" (* k each) "ms)"))
       (let ((h (proc/spawn (list "sh" "-c" "cat"))))
-        (proc/write-stdin h "piped\n")                                    ; write-stdin (offloaded)
-        (proc/close-stdin h) (proc/wait h)
-        (check! (str id " proc stdin→stdout") (string/trim (proc/read-stdout h)) "piped"))
-      (try                                                                ; pty (if available)
+        (proc/write-stdin h "piped\n") ; write-stdin (offloaded)
+        (proc/close-stdin h)
+        (proc/wait h)
+        (check! (str id " proc stdin→stdout")
+          (string/trim (proc/read-stdout h))
+          "piped"))
+      (try ; pty (if available)
         (let ((h (pty/spawn (list "sh" "-c" "printf pty-ok"))))
           (pty/wait h)
           (ok! (str id " pty ran") (string/contains? (pty/read h) "pty-ok"))
@@ -221,9 +274,12 @@
 ;; ── SECTION 8: cpu-bound scans (offloaded) ───────────────────────────────────
 (defun section-scans (id)
   (async
-    (let ((blob (string/repeat "user=a@b.com token=sk-live-0123456789abcdef card=4111111111111111\n" 300)))
+    (let ((blob
+            (string/repeat
+              "user=a@b.com token=sk-live-0123456789abcdef card=4111111111111111\n"
+              300)))
       (ok! (str id " secret/detect") (> (length (secret/detect blob)) 0))
-      (ok! (str id " pii/detect")    (> (length (pii/detect blob)) 0))
+      (ok! (str id " pii/detect") (> (length (pii/detect blob)) 0))
       (ok! (str id " secret/redact") (> (string/length (secret/redact blob)) 0))
       (log (str "scan" id) "cpu scans exercised")
       :done)))
@@ -234,23 +290,38 @@
     ;; an instantly-resolved value beats a long sleep regardless of scheduler load
     ;; (instant first + a sleep far longer than any plausible poll delay)
     (check! (str id " async/race instant-wins")
-      (async/race (list (async "instant") (async (async/sleep 30000) "slow"))) "instant")
-    (check! (str id " async/timeout passes fast") (async/timeout 500 (async "quick")) "quick")
-    (ok! (str id " async/timeout fires on slow")   ; (ms promise) — times out on the slow one
-      (try (nil? (async/timeout 20 (async (async/sleep 500) :late))) (catch e #t)))
+      (async/race (list (async "instant") (async (async/sleep 30000) "slow")))
+      "instant")
+    (check! (str id " async/timeout passes fast")
+      (async/timeout 500 (async "quick"))
+      "quick")
+    (ok! (str id " async/timeout fires on slow") ; (ms promise) — times out on the slow one
+      (try
+        (nil? (async/timeout 20 (async (async/sleep 500) :late)))
+        (catch e #t)))
     (let ((ch (channel/new 8)))
-      (async/all (list
-        (async (for-each (fn (n) (channel/send ch n)) (range 1 6)) (channel/close ch))
-        (async (async/sleep 5) :consumer)))
+      (async/all
+        (list
+          (async
+            (for-each
+              (fn (n) (channel/send ch n))
+              (range 1 6))
+            (channel/close ch))
+          (async
+            (async/sleep 5)
+            :consumer)))
       (let loop ((sum 0))
         (let ((v (channel/recv ch)))
           (if (nil? v) (check! (str id " channel sum") sum 15) (loop (+ sum v))))))
-    (let ((handles (map (fn (n)
-                          (async/spawn (fn ()
-                            (let ((f (p (str "spawn-" n ".txt"))))
-                              (file/write f (str "task-" n))
-                              (string/length (file/read f))))))
-                        (range 1 5))))
+    (let ((handles
+            (map
+              (fn (n)
+                (async/spawn
+                  (fn ()
+                    (let ((f (p (str "spawn-" n ".txt"))))
+                      (file/write f (str "task-" n))
+                      (string/length (file/read f))))))
+              (range 1 5))))
       (check! (str id " spawned async I/O") (length (async/all handles)) 4))
     (log (str "combo" id) "race/timeout/channels/spawn exercised")
     :done))
@@ -260,7 +331,7 @@
   (async
     (try
       (let ((root (git/root)))
-        (ok! (str id " git branch") (string? (git/current-branch)))          ; git (offloaded)
+        (ok! (str id " git branch") (string? (git/current-branch))) ; git (offloaded)
         (ok! (str id " git status") (not (nil? (git/status)))))
       (catch e (log (str "git" id) "skipped — not a repo")))
     (if (nil? (env "SEMA_ASYNC_EVERYTHING_LLM"))
@@ -268,13 +339,18 @@
       (try
         (async/all
           (list
-            (async (ok! (str id " http/get") (not (nil? (http/get "https://example.com")))))
+            (async
+              (ok! (str id " http/get")
+                (not (nil? (http/get "https://example.com")))))
             (async
               (begin
                 (llm/auto-configure)
                 (ok! (str id " llm/complete (haiku)")
-                     (> (string/length (llm/complete "reply with exactly: OK"
-                                         {:model "claude-haiku-4-5-20251001"})) 0))))))
+                  (>
+                    (string/length
+                      (llm/complete "reply with exactly: OK"
+                        {:model "claude-haiku-4-5-20251001"}))
+                    0))))))
         (catch e (log (str "llm" id) (str "errored (non-fatal): " e)))))
     :done))
 
@@ -283,12 +359,13 @@
   (fn (id)
     (async
       ;; scratch lives under the OS temp dir (cross-platform; never the repo)
-      (let* ((tmp (path/join (sys/temp-dir) (str "sema-async-everything-" (sys/pid) "-" id)))
-             (p   (fn (name) (path/join tmp name))))
+      (let* ((tmp
+               (path/join (sys/temp-dir)
+                 (str "sema-async-everything-" (sys/pid) "-" id)))
+             (p (fn (name) (path/join tmp name))))
         (file/mkdir tmp)
         (async/all
-          (list
-            (heartbeat id 8)
+          (list (heartbeat id 8)
             (section-deep-nesting id p)
             (section-fs id p)
             (section-streams id p)
@@ -300,8 +377,13 @@
             (section-combinators id p)
             (section-git-net id)))
         ;; cleanup this instance
-        (try (for-each (fn (g) (for-each (fn (x) (try (file/delete x) (catch e nil))) (file/glob g)))
-                       (list (p "fs/*") (p "arc/*") (p "*")))
+        (try
+          (for-each
+            (fn (g)
+              (for-each
+                (fn (x) (try (file/delete x) (catch e nil)))
+                (file/glob g)))
+            (list (p "fs/*") (p "arc/*") (p "*")))
           (catch e nil))
         :suite-done))))
 
@@ -310,30 +392,49 @@
 ;;    collide). Async all the way down: driver → loop → suite → sections' async/all
 ;;    → tasks → their own nested async/all. If this weird mix stays 100% green,
 ;;    the model is robust. ──
-(define run-one suite)   ;; the entire suite, as a value
+(define run-one suite) ;; the entire suite, as a value
 
 ;; strategy 1 — fan every id out at once with async/all (each with a jitter head-start)
 (define drive-all
-  (fn (ids) (async (async/all (map (fn (i) (async (jitter 6) (async/await (run-one i)) i)) ids)) :all)))
+  (fn (ids)
+    (async
+      (async/all
+        (map (fn (i) (async (jitter 6) (async/await (run-one i)) i)) ids))
+      :all)))
 ;; strategy 2 — spawn+await each id, sequentially, inside the loop
 (define drive-spawn
   (fn (ids)
     (async
-      (for-each (fn (i) (async/await (async/spawn (fn () (jitter 6) (async/await (run-one i)))))) ids)
+      (for-each
+        (fn (i)
+          (async/await
+            (async/spawn (fn () (jitter 6) (async/await (run-one i))))))
+        ids)
       :spawn)))
 ;; strategy 3 — race each id against a never-firing timer (the suite always wins).
 ;; async/race already awaits internally and returns the winning VALUE.
 (define drive-race
   (fn (ids)
     (async
-      (for-each (fn (i)
-                  (async/race (list (async (jitter 6) (async/await (run-one i)))
-                                    (async (async/sleep 600000) :never))))
-                ids)
+      (for-each
+        (fn (i)
+          (async/race
+            (list
+              (async
+                (jitter 6)
+                (async/await (run-one i)))
+              (async
+                (async/sleep 600000)
+                :never))))
+        ids)
       :race)))
 
 (println "")
-(println (str "═══ async-everything — 3 driver loops × distinct async strategies, ×" iters " ═══"))
+(println
+  (str
+    "═══ async-everything — 3 driver loops × distinct async strategies, ×"
+    iters
+    " ═══"))
 (println "")
 ;; run the whole fan-out `iters` times; ids namespaced by iteration so nothing
 ;; (scratch dirs, db/kv handles) collides across passes.
@@ -342,13 +443,22 @@
   (when (<= k iters)
     (let ((it0 (/ (sys/elapsed) 1000000.0)))
       (async/all
-        (list
-          (drive-all   (list (str "a" k "_1") (str "a" k "_2")))
+        (list (drive-all (list (str "a" k "_1") (str "a" k "_2")))
           (drive-spawn (list (str "b" k "_1") (str "b" k "_2")))
-          (drive-race  (list (str "c" k "_1") (str "c" k "_2")))))
+          (drive-race (list (str "c" k "_1") (str "c" k "_2")))))
       (when (or (<= iters 1) (= (mod k 10) 0) (= k iters))
-        (println (str "  iter " k "/" iters "  " (round (- (/ (sys/elapsed) 1000000.0) it0)) "ms  ·  "
-                      (mutable-cell/get *checks*) " checks, " (mutable-cell/get *fails*) " fail"))))
+        (println
+          (str "  iter "
+            k
+            "/"
+            iters
+            "  "
+            (round (- (/ (sys/elapsed) 1000000.0) it0))
+            "ms  ·  "
+            (mutable-cell/get *checks*)
+            " checks, "
+            (mutable-cell/get *fails*)
+            " fail"))))
     (loop (+ k 1))))
 (define loop-ms (round (- (/ (sys/elapsed) 1000000.0) loop-t0)))
 
@@ -356,10 +466,27 @@
 (println "")
 (println "═══ verdict ═══")
 (let ((n (mutable-cell/get *checks*)) (f (mutable-cell/get *fails*)))
-  (println (str "  " (- n f) "/" n " checks passed across " iters " iteration(s) — every async family, 6 copies/iter via 3 driver loops, deeply nested"))
-  (println (str "  ⏱  " loop-ms "ms total · " (round (/ (* 1.0 loop-ms) (max iters 1))) "ms/iter · "
-                (round (/ (* 1000.0 n) (max loop-ms 1))) " checks/sec"))
+  (println
+    (str "  "
+      (- n f)
+      "/"
+      n
+      " checks passed across "
+      iters
+      " iteration(s) — every async family, 6 copies/iter via 3 driver loops, deeply nested"))
+  (println
+    (str "  ⏱  "
+      loop-ms
+      "ms total · "
+      (round (/ (* 1.0 loop-ms) (max iters 1)))
+      "ms/iter · "
+      (round (/ (* 1000.0 n) (max loop-ms 1)))
+      " checks/sec"))
   (if (= f 0)
-    (println "  ✅ ASYNC CONFIRMED — nothing blocked the scheduler and no callback lost its captured state.")
-    (begin (println (str "  ❌ " f " CHECK(S) FAILED — an async regression is present.")) (exit 1))))
+    (println
+      "  ✅ ASYNC CONFIRMED — nothing blocked the scheduler and no callback lost its captured state.")
+    (begin
+      (println
+        (str "  ❌ " f " CHECK(S) FAILED — an async regression is present."))
+      (exit 1))))
 (println "")

@@ -22,16 +22,18 @@
 ;;   sema workflow run examples/workflows/sema-docs-pipeline.sema --view
 
 ;; A small, fast model: cheap to run, good enough for short explainers, not garbage.
-(llm/configure :openai {:api-key (env "OPENAI_API_KEY") :default-model "gpt-5.4-mini"})
+(llm/configure :openai
+  {:api-key (env "OPENAI_API_KEY") :default-model "gpt-5.4-mini"})
 
 (define topics
   (list "tail-call optimization"
-        "NaN-boxed values"
-        "the cooperative async scheduler"
-        "pattern matching with match"))
+    "NaN-boxed values"
+    "the cooperative async scheduler"
+    "pattern matching with match"))
 
 (define (ask prompt) (llm/complete prompt))
-(define (slug s) (string/replace (string/replace (string/lower s) "/" "-") " " "-"))
+(define (slug s)
+  (string/replace (string/replace (string/lower s) "/" "-") " " "-"))
 (define (drafted? d) (and (map? d) (contains? d :draft)))
 (define (reviewed? r) (and (map? r) (contains? r :notes)))
 (define (revised? r) (and (map? r) (contains? r :body)))
@@ -43,9 +45,12 @@
     (fn ()
       (workflow/tool-call "recall-spec" topic)
       {:topic topic
-       :draft (ask (str "Write a 90-word first-draft explainer about the Sema language "
-                        "feature \"" topic "\". Sema is a homoiconic Lisp on a bytecode "
-                        "VM. Mention the feature. Plain prose, no headings."))})))
+       :draft (ask
+         (str "Write a 90-word first-draft explainer about the Sema language "
+           "feature \""
+           topic
+           "\". Sema is a homoiconic Lisp on a bytecode "
+           "VM. Mention the feature. Plain prose, no headings."))})))
 
 (define (review-draft d)
   (workflow/agent (str "review: " (:topic d))
@@ -53,16 +58,21 @@
       (workflow/tool-call "read-draft" (:topic d))
       {:topic (:topic d)
        :draft (:draft d)
-       :notes (ask (str "In 30 words, critique this draft for accuracy and clarity and "
-                        "suggest ONE concrete improvement.\n\n" (:draft d)))})))
+       :notes (ask
+         (str "In 30 words, critique this draft for accuracy and clarity and "
+           "suggest ONE concrete improvement.\n\n"
+           (:draft d)))})))
 
 (define (revise r)
   (workflow/agent (str "revise: " (:topic r))
     (fn ()
       {:topic (:topic r)
-       :body (ask (str "Revise the draft using the critique. ~100 words, plain prose, "
-                       "mention the feature.\n\nDRAFT:\n" (:draft r)
-                       "\n\nCRITIQUE:\n" (:notes r)))})))
+       :body (ask
+         (str "Revise the draft using the critique. ~100 words, plain prose, "
+           "mention the feature.\n\nDRAFT:\n"
+           (:draft r)
+           "\n\nCRITIQUE:\n"
+           (:notes r)))})))
 
 (defworkflow sema-docs-pipeline
   "Draft, review, revise, and assemble explainers for Sema's own features."
@@ -87,20 +97,26 @@
   (def index
     (workflow/agent {:name "assembler"}
       (fn ()
-        (for-each (fn (f) (workflow/tool-call "recall-draft" (:topic f))) final)
-        (ask (str "Write a 60-word introduction for a docs page covering these Sema "
-                  "features: "
-                  (string/join (map (fn (f) (:topic f)) final) ", ")
-                  ".")))))
+        (for-each
+          (fn (f) (workflow/tool-call "recall-draft" (:topic f)))
+          final)
+        (ask
+          (str
+            "Write a 60-word introduction for a docs page covering these Sema "
+            "features: "
+            (string/join (map (fn (f) (:topic f)) final) ", ")
+            ".")))))
 
   (phase "Publish")
   (file/mkdir "out")
-  (for-each (fn (f) (file/write (str "out/" (slug (:topic f)) ".md")
-                                (str "# " (:topic f) "\n\n" (:body f) "\n")))
-            final)
+  (for-each
+    (fn (f)
+      (file/write (str "out/" (slug (:topic f)) ".md")
+        (str "# " (:topic f) "\n\n" (:body f) "\n")))
+    final)
   (file/write "out/index.md" (str "# Sema Features\n\n" index "\n"))
 
   {:status :success
-   :topics    (count chosen)
-   :reviewed  (count reviews)
+   :topics (count chosen)
+   :reviewed (count reviews)
    :published (count final)})

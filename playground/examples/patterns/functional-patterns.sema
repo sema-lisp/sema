@@ -6,15 +6,17 @@
 (define add5 (add 5))
 (define double ((curry2 *) 2))
 (define triple ((curry2 *) 3))
-(println (format "add5(3) = ~a, double(7) = ~a, triple(7) = ~a"
-  (add5 3) (double 7) (triple 7)))
+(println
+  (format "add5(3) = ~a, double(7) = ~a, triple(7) = ~a"
+    (add5 3)
+    (double 7)
+    (triple 7)))
 
 ;; === Pipeline ===
 (define (pipe . fns)
   (foldl (fn (acc f) (fn (x) (f (acc x)))) (fn (x) x) fns))
 
-(define process
-  (pipe (fn (x) (* x 2)) (fn (x) (+ x 10)) (fn (x) (* x x))))
+(define process (pipe (fn (x) (* x 2)) (fn (x) (+ x 10)) (fn (x) (* x x))))
 (println (format "pipe(double, +10, square)(5) = ~a" (process 5)))
 
 ;; === Option/Maybe ===
@@ -22,10 +24,13 @@
 (define (maybe-or val default) (if (nil? val) default val))
 
 (define config {:db {:host "localhost" :port 5432} :cache nil})
-(println (format "\ndb host: ~a"
-  (maybe-or (maybe-map (fn (db) (get db :host)) (get config :db)) "unknown")))
-(println (format "cache host: ~a"
-  (maybe-or (maybe-map (fn (c) (get c :host)) (get config :cache)) "not configured")))
+(println
+  (format "\ndb host: ~a"
+    (maybe-or (maybe-map (fn (db) (get db :host)) (get config :db)) "unknown")))
+(println
+  (format "cache host: ~a"
+    (maybe-or (maybe-map (fn (c) (get c :host)) (get config :cache))
+      "not configured")))
 
 ;; === Error handling ===
 (define (safe-divide a b) (try (/ a b) (catch e nil)))
@@ -41,19 +46,25 @@
 (define (tree-right t) (nth t 2))
 
 (define (tree-insert tree val)
-  (if (nil? tree) (make-tree val nil nil)
+  (if (nil? tree)
+    (make-tree val nil nil)
     (cond
       ((< val (tree-val tree))
-       (make-tree (tree-val tree) (tree-insert (tree-left tree) val) (tree-right tree)))
+        (make-tree (tree-val tree)
+          (tree-insert (tree-left tree) val)
+          (tree-right tree)))
       ((> val (tree-val tree))
-       (make-tree (tree-val tree) (tree-left tree) (tree-insert (tree-right tree) val)))
+        (make-tree (tree-val tree)
+          (tree-left tree)
+          (tree-insert (tree-right tree) val)))
       (else tree))))
 
 (define (tree-inorder tree)
-  (if (nil? tree) '()
+  (if (nil? tree)
+    '()
     (append (tree-inorder (tree-left tree))
-            (list (tree-val tree))
-            (tree-inorder (tree-right tree)))))
+      (list (tree-val tree))
+      (tree-inorder (tree-right tree)))))
 
 (define bst (foldl tree-insert nil (list 5 3 7 1 4 6 8 2)))
 (println (format "\nBST inorder: ~a" (tree-inorder bst)))
@@ -61,11 +72,14 @@
 ;; === Collatz ===
 (define (collatz n)
   (let loop ((x n) (steps 0))
-    (cond ((= x 1) steps)
-          ((even? x) (loop (/ x 2) (+ steps 1)))
-          (else (loop (+ (* 3 x) 1) (+ steps 1))))))
+    (cond
+      ((= x 1) steps)
+      ((even? x) (loop (/ x 2) (+ steps 1)))
+      (else (loop (+ (* 3 x) 1) (+ steps 1))))))
 
 (println "\nCollatz sequence lengths:")
-(for-each (fn (n)
-  (println (format "  ~a → ~a steps" (string/pad-left (str n) 4) (collatz n))))
+(for-each
+  (fn (n)
+    (println
+      (format "  ~a → ~a steps" (string/pad-left (str n) 4) (collatz n))))
   (list 1 7 27 97 871 6171))

@@ -21,13 +21,16 @@
   (foldl (fn (acc e) (if (pred e) (assoc acc e #t) acc)) {} (keys s)))
 (define (set/map f s) (list->set (map f (keys s))))
 (define (set/fold f init s) (foldl f init (keys s)))
-(define (set/display s) (str "#{" (string/join (map str (set->list s)) " ") "}"))
+(define (set/display s)
+  (str "#{" (string/join (map str (set->list s)) " ") "}"))
 
 (define (set/power-set s)
   (let ((elems (set->list s)))
-    (foldl (fn (subsets elem)
-             (append subsets (map (fn (sub) (set/add sub elem)) subsets)))
-           (list empty-set) elems)))
+    (foldl
+      (fn (subsets elem)
+        (append subsets (map (fn (sub) (set/add sub elem)) subsets)))
+      (list empty-set)
+      elems)))
 
 (println "=== Sets ===\n")
 
@@ -46,5 +49,6 @@
 (println (format "sum:     ~a" (set/fold + 0 s1)))
 
 (println (format "\nPower set of ~a:" (set/display (set 1 2 3))))
-(for-each (fn (sub) (println (format "  ~a" (set/display sub))))
+(for-each
+  (fn (sub) (println (format "  ~a" (set/display sub))))
   (set/power-set (set 1 2 3)))

@@ -9,29 +9,38 @@
   (nth (nth grid (mod r ROWS)) (mod c COLS)))
 
 (define (grid-set grid r c val)
-  (map (fn (ri)
-    (if (= ri r)
-      (map (fn (ci) (if (= ci c) val (nth (nth grid ri) ci))) (range COLS))
-      (nth grid ri)))
+  (map
+    (fn (ri)
+      (if (= ri r)
+        (map (fn (ci) (if (= ci c) val (nth (nth grid ri) ci))) (range COLS))
+        (nth grid ri)))
     (range ROWS)))
 
 (define (grid-set-cells grid cells)
   (foldl (fn (g cell) (grid-set g (car cell) (cadr cell) 1)) grid cells))
 
 (define (count-neighbors grid r c)
-  (let ((ru (+ r ROWS -1)) (rd (+ r 1))
-        (cl (+ c COLS -1)) (cr (+ c 1)))
-    (+ (grid-get grid ru cl) (grid-get grid ru c) (grid-get grid ru cr)
-       (grid-get grid r cl) (grid-get grid r cr)
-       (grid-get grid rd cl) (grid-get grid rd c) (grid-get grid rd cr))))
+  (let ((ru (+ r ROWS -1))
+        (rd (+ r 1))
+        (cl (+ c COLS -1))
+        (cr (+ c 1)))
+    (+ (grid-get grid ru cl)
+      (grid-get grid ru c)
+      (grid-get grid ru cr)
+      (grid-get grid r cl)
+      (grid-get grid r cr)
+      (grid-get grid rd cl)
+      (grid-get grid rd c)
+      (grid-get grid rd cr))))
 
 (define (next-cell grid r c)
   (let* ((alive (grid-get grid r c))
          (n (count-neighbors grid r c)))
-    (cond ((and (= alive 1) (< n 2)) 0)
-          ((and (= alive 1) (> n 3)) 0)
-          ((and (= alive 0) (= n 3)) 1)
-          (else alive))))
+    (cond
+      ((and (= alive 1) (< n 2)) 0)
+      ((and (= alive 1) (> n 3)) 0)
+      ((and (= alive 0) (= n 3)) 1)
+      (else alive))))
 
 (define (next-gen grid)
   (map (fn (r) (map (fn (c) (next-cell grid r c)) (range COLS))) (range ROWS)))
@@ -44,13 +53,16 @@
         (border (string/repeat "─" COLS)))
     (println (format "Gen ~a | Live: ~a" gen alive))
     (println (str "┌" border "┐"))
-    (for-each (fn (row) (println (str "│" (render-row row) "│"))) grid)
+    (for-each
+      (fn (row) (println (str "│" (render-row row) "│")))
+      grid)
     (println (str "└" border "┘"))
     (println "")))
 
 ;; R-pentomino — chaotic, long-lived
-(define grid (grid-set-cells (make-grid ROWS COLS)
-  (list (list 6 16) (list 6 17) (list 7 15) (list 7 16) (list 8 16))))
+(define grid
+  (grid-set-cells (make-grid ROWS COLS)
+    (list (list 6 16) (list 6 17) (list 7 15) (list 7 16) (list 8 16))))
 
 (define (run grid gen)
   (show grid gen)

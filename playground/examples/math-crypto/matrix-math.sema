@@ -16,8 +16,10 @@
 
 (define (matrix-multiply a b)
   (let ((bt (matrix-transpose b)))
-    (map (fn (row-a)
-      (map (fn (col-b) (foldl + 0 (map * row-a col-b))) bt)) a)))
+    (map
+      (fn (row-a)
+        (map (fn (col-b) (foldl + 0 (map * row-a col-b))) bt))
+      a)))
 
 (define (matrix-identity n)
   (map (fn (i) (map (fn (j) (if (= i j) 1 0)) (range n))) (range n)))
@@ -25,19 +27,23 @@
 (define (matrix-determinant m)
   (let ((n (matrix-rows m)))
     (cond
-      ((= n 2) (- (* (nth (first m) 0) (nth (nth m 1) 1))
-                   (* (nth (first m) 1) (nth (nth m 1) 0))))
+      ((= n 2)
+        (- (* (nth (first m) 0) (nth (nth m 1) 1))
+          (* (nth (first m) 1) (nth (nth m 1) 0))))
       ((= n 3)
-       (let ((a (first m)) (b (nth m 1)) (c (nth m 2)))
-         (- (+ (* (nth a 0) (- (* (nth b 1) (nth c 2)) (* (nth b 2) (nth c 1))))
-               (* (nth a 2) (- (* (nth b 0) (nth c 1)) (* (nth b 1) (nth c 0)))))
+        (let ((a (first m)) (b (nth m 1)) (c (nth m 2)))
+          (-
+            (+ (* (nth a 0) (- (* (nth b 1) (nth c 2)) (* (nth b 2) (nth c 1))))
+              (* (nth a 2) (- (* (nth b 0) (nth c 1)) (* (nth b 1) (nth c 0)))))
             (* (nth a 1) (- (* (nth b 0) (nth c 2)) (* (nth b 2) (nth c 0))))))))))
 
 (define (matrix-print name m)
   (println (format "  ~a =" name))
-  (for-each (fn (row)
-    (println (format "    │ ~a │"
-      (string/join (map (fn (x) (string/pad-left (str x) 5)) row) " "))))
+  (for-each
+    (fn (row)
+      (println
+        (format "    │ ~a │"
+          (string/join (map (fn (x) (string/pad-left (str x) 5)) row) " "))))
     m)
   (println ""))
 
@@ -53,7 +59,9 @@
 (println "=== Properties ===\n")
 (define At (matrix-transpose A))
 (matrix-print "Aᵀ" At)
-(println (format "  (Aᵀ)ᵀ = A? ~a" (if (equal? A (matrix-transpose At)) "YES ✓" "NO ✗")))
+(println
+  (format "  (Aᵀ)ᵀ = A? ~a"
+    (if (equal? A (matrix-transpose At)) "YES ✓" "NO ✗")))
 
 ;; Multiply
 (define P (list (list 1 2) (list 3 4)))
@@ -62,7 +70,9 @@
 
 ;; A × I = A
 (define I3 (matrix-identity 3))
-(println (format "  A×I = A? ~a" (if (equal? (matrix-multiply A I3) A) "YES ✓" "NO ✗")))
+(println
+  (format "  A×I = A? ~a"
+    (if (equal? (matrix-multiply A I3) A) "YES ✓" "NO ✗")))
 
 ;; Determinants
 (println "\n=== Determinants ===\n")

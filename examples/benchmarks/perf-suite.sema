@@ -22,74 +22,94 @@
 
 ;; --- 1. Tight integer loop (sum 1..N) ---
 (println "[1] Integer accumulation (sum 1 to 1,000,000)")
-(bench "do-loop-sum" (lambda ()
-  (do ((i 0 (+ i 1))
-       (acc 0 (+ acc i)))
-    ((= i 1000000) acc))) 5)
+(bench "do-loop-sum"
+  (lambda ()
+    (do
+      ((i 0 (+ i 1)) (acc 0 (+ acc i)))
+      ((= i 1000000) acc)))
+  5)
 
 ;; --- 2. Recursive fibonacci (no memo) ---
 (println "[2] Recursive fibonacci(30)")
 (define (fib n)
-  (if (< n 2) n
+  (if (< n 2)
+    n
     (+ (fib (- n 1)) (fib (- n 2)))))
 (bench "fib-30" (lambda () (fib 30)) 3)
 
 ;; --- 3. Named-let loop (TCO) ---
 (println "[3] Named-let loop (1,000,000 iterations)")
-(bench "named-let-loop" (lambda ()
-  (let loop ((i 0) (acc 0))
-    (if (= i 1000000) acc
-      (loop (+ i 1) (+ acc i))))) 5)
+(bench "named-let-loop"
+  (lambda ()
+    (let loop ((i 0) (acc 0))
+      (if (= i 1000000)
+        acc
+        (loop (+ i 1) (+ acc i)))))
+  5)
 
 ;; --- 4. Vector creation and indexed access ---
 (println "[4] Vector creation + nth access (10,000 elements)")
-(bench "vector-nth" (lambda ()
-  (let ((v (do ((i 0 (+ i 1))
-                (acc (list) (append acc (list i))))
-            ((= i 10000) (list->vector acc)))))
-    (do ((i 0 (+ i 1))
-         (sum 0 (+ sum (nth v i))))
-      ((= i 10000) sum)))) 3)
+(bench "vector-nth"
+  (lambda ()
+    (let ((v
+            (do
+              ((i 0 (+ i 1)) (acc (list) (append acc (list i))))
+              ((= i 10000) (list->vector acc)))))
+      (do
+        ((i 0 (+ i 1)) (sum 0 (+ sum (nth v i))))
+        ((= i 10000) sum))))
+  3)
 
 ;; --- 5. Map/filter pipeline ---
 (println "[5] Map + filter pipeline (10,000 elements)")
 (define (make-list-range n)
-  (do ((i (- n 1) (- i 1))
-       (acc (list) (cons i acc)))
+  (do
+    ((i (- n 1) (- i 1)) (acc (list) (cons i acc)))
     ((< i 0) acc)))
-(bench "map-filter-pipeline" (lambda ()
-  (let ((xs (make-list-range 10000)))
-    (length (filter (lambda (x) (= (mod x 3) 0))
-                    (map (lambda (x) (* x 2)) xs))))) 3)
+(bench "map-filter-pipeline"
+  (lambda ()
+    (let ((xs (make-list-range 10000)))
+      (length
+        (filter (lambda (x) (= (mod x 3) 0))
+          (map (lambda (x) (* x 2)) xs)))))
+  3)
 
 ;; --- 6. Higher-order function overhead (foldl) ---
 (println "[6] foldl over 100,000 element list")
-(bench "foldl-sum" (lambda ()
-  (let ((xs (make-list-range 100000)))
-    (foldl + 0 xs))) 3)
+(bench "foldl-sum"
+  (lambda ()
+    (let ((xs (make-list-range 100000)))
+      (foldl + 0 xs)))
+  3)
 
 ;; --- 7. Nested loop (matrix-style) ---
 (println "[7] Nested do-loop 500x500 multiply-accumulate")
-(bench "nested-loop" (lambda ()
-  (do ((i 0 (+ i 1))
-       (total 0 total))
-    ((= i 500)  total)
-    (set! total
-      (do ((j 0 (+ j 1))
-           (inner total (+ inner (* i j))))
-        ((= j 500) inner))))) 3)
+(bench "nested-loop"
+  (lambda ()
+    (do
+      ((i 0 (+ i 1)) (total 0 total))
+      ((= i 500) total)
+      (set! total
+        (do
+          ((j 0 (+ j 1)) (inner total (+ inner (* i j))))
+          ((= j 500) inner)))))
+  3)
 
 ;; --- 8. Tak benchmark (deep recursion) ---
 (println "[8] TAK(18, 12, 6) x 50")
 (define (tak x y z)
-  (if (not (< y x)) z
+  (if (not (< y x))
+    z
     (tak (tak (- x 1) y z)
-         (tak (- y 1) z x)
-         (tak (- z 1) x y))))
-(bench "tak" (lambda ()
-  (let loop ((n 50) (v 0))
-    (if (= n 0) v
-      (loop (- n 1) (tak 18 12 6))))) 3)
+      (tak (- y 1) z x)
+      (tak (- z 1) x y))))
+(bench "tak"
+  (lambda ()
+    (let loop ((n 50) (v 0))
+      (if (= n 0)
+        v
+        (loop (- n 1) (tak 18 12 6)))))
+  3)
 
 ;; ============================================================
 ;; NEW: Typed array benchmarks (paper-inspired optimizations)
@@ -115,17 +135,21 @@
 ;; --- 11. i64-array indexed access loop ---
 (println "[11] Indexed loop over i64-array (100,000 elements)")
 (let ((arr (i64-array/range 0 100000)))
-  (bench "i64-array/ref-loop" (lambda ()
-    (do ((i 0 (+ i 1))
-         (sum 0 (+ sum (i64-array/ref arr i))))
-      ((= i 100000) sum))) 3))
+  (bench "i64-array/ref-loop"
+    (lambda ()
+      (do
+        ((i 0 (+ i 1)) (sum 0 (+ sum (i64-array/ref arr i))))
+        ((= i 100000) sum)))
+    3))
 
 ;; --- 12. dotimes macro ---
 (println "[12] dotimes macro (1,000,000 iterations)")
-(bench "dotimes" (lambda ()
-  (define acc 0)
-  (dotimes (i 1000000) (set! acc (+ acc i)))
-  acc) 5)
+(bench "dotimes"
+  (lambda ()
+    (define acc 0)
+    (dotimes (i 1000000) (set! acc (+ acc i)))
+    acc)
+  5)
 
 (println "")
 (println "Done.")

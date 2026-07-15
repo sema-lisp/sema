@@ -1,15 +1,16 @@
 ;; Channels are bounded FIFO queues for talking between async tasks.
 ;; A producer fills the channel; a consumer reads until it's closed.
 
-(define ch (channel/new 3))   ; capacity 3 — backpressure once full
+(define ch (channel/new 3)) ; capacity 3 — backpressure once full
 
 (define producer
   (async
     ;; Once the buffer fills, channel/send yields until the consumer reads.
     ;; for-each propagates the yield through the callback, so this works
     ;; transparently even though we're sending more values than fit.
-    (for-each (fn (n) (channel/send ch n))
-              (list 10 20 30 40 50 60 70))
+    (for-each
+      (fn (n) (channel/send ch n))
+      (list 10 20 30 40 50 60 70))
     (channel/close ch)))
 
 (define consumer

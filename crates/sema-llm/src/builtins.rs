@@ -9472,7 +9472,9 @@ impl ExecToolsContinuation {
                     // e.g. channel/send), then dispatch the handler; or dispatch the
                     // handler straight away when there is no callback.
                     return match self.on_tool_call.clone() {
-                        Some(cb) => self.call_event(cb, start_event.unwrap(), ToolPhase::StartEvent),
+                        Some(cb) => {
+                            self.call_event(cb, start_event.unwrap(), ToolPhase::StartEvent)
+                        }
                         None => self.dispatch_handler(),
                     };
                 }
@@ -9546,7 +9548,12 @@ impl sema_core::runtime::NativeContinuation for ExecToolsContinuation {
                 match self.on_tool_call.clone() {
                     Some(cb) => {
                         let tc = self.active.as_ref().expect("active call").tc.clone();
-                        let args_value = self.active.as_ref().expect("active call").args_value.clone();
+                        let args_value = self
+                            .active
+                            .as_ref()
+                            .expect("active call")
+                            .args_value
+                            .clone();
                         let end_event = tool_event_map(
                             "end",
                             &tc,

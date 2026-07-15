@@ -12,8 +12,8 @@
   (exit 1))
 
 ;; ---- Environment context ----
-(define cwd       (sys/cwd))
-(define platform  (sys/platform))
+(define cwd (sys/cwd))
+(define platform (sys/platform))
 
 ;; ---- Banned commands for safety ----
 (define banned-commands
@@ -160,9 +160,9 @@ Workflow: search → read → edit → verify"
 (define active-spinner #f)
 
 (define (on-tool-call event)
-  (let ((evt   (:event event))
-        (tool  (:tool event))
-        (args  (:args event)))
+  (let ((evt (:event event))
+        (tool (:tool event))
+        (args (:args event)))
     (cond
       ((= evt "start")
         ;; Show tool header

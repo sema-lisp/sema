@@ -17,15 +17,15 @@
   (lambda (expr)
     (let ((parts (string/split expr " ")))
       (if (= (length parts) 3)
-        (let ((a  (string/to-number (nth parts 0)))
+        (let ((a (string/to-number (nth parts 0)))
               (op (nth parts 1))
-              (b  (string/to-number (nth parts 2))))
+              (b (string/to-number (nth parts 2))))
           (cond
             ((= op "+") (number/to-string (+ a b)))
             ((= op "-") (number/to-string (- a b)))
             ((= op "*") (number/to-string (* a b)))
             ((= op "/") (number/to-string (/ a b)))
-            (else       (string-append "Unknown operator: " op))))
+            (else (string-append "Unknown operator: " op))))
         (string-append "Expected 'a op b', got: " expr)))))
 
 (deftool word-count

@@ -49,8 +49,8 @@
 
 ;; --- bytevector-u8-set! ---
 (println "-- bytevector-u8-set! --")
-(define bv3           (bytevector 1 2 3))
-(define bv3-modified  (bytevector-u8-set! bv3 1 99))
+(define bv3 (bytevector 1 2 3))
+(define bv3-modified (bytevector-u8-set! bv3 1 99))
 (assert-eq (bytevector/ref bv3-modified 1)
   99
   "bytevector-u8-set! modifies byte")
@@ -91,10 +91,10 @@
 
 ;; --- bytevector/append ---
 (println "-- bytevector/append --")
-(define bva       (bytevector 1 2))
-(define bvb       (bytevector 3 4))
-(define bvc       (bytevector 5))
-(define appended  (bytevector/append bva bvb bvc))
+(define bva (bytevector 1 2))
+(define bvb (bytevector 3 4))
+(define bvc (bytevector 5))
+(define appended (bytevector/append bva bvb bvc))
 (assert-eq (bytevector/length appended) 5 "bytevector/append total length")
 (assert-eq (bytevector/ref appended 0) 1 "bytevector/append byte 0")
 (assert-eq (bytevector/ref appended 2) 3 "bytevector/append byte 2")

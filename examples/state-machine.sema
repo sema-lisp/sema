@@ -6,10 +6,12 @@
 (println "--- Traffic Light ---\n")
 
 (define traffic-fsm
-  (map/new
-    "red" (map/new "next" "green" "duration" 5)
-    "green" (map/new "next" "yellow" "duration" 4)
-    "yellow" (map/new "next" "red" "duration" 1)))
+  (map/new "red"
+    (map/new "next" "green" "duration" 5)
+    "green"
+    (map/new "next" "yellow" "duration" 4)
+    "yellow"
+    (map/new "next" "red" "duration" 1)))
 
 (define traffic-labels
   (map/new "red" "🔴 RED" "green" "🟢 GREEN" "yellow" "🟡 YELLOW"))
@@ -19,8 +21,8 @@
 
 (defun run-traffic (state steps)
   (when (> steps 0)
-    (let ((label     (get traffic-labels state))
-          (duration  (map/get-in traffic-fsm [state "duration"])))
+    (let ((label (get traffic-labels state))
+          (duration (map/get-in traffic-fsm [state "duration"])))
       (println f"  ${label}  (duration: ${duration}s)")
       (run-traffic (traffic-step state) (- steps 1)))))
 
@@ -31,20 +33,23 @@
 (println "\n--- Vending Machine ---\n")
 
 (define vending-fsm
-  (map/new
-    "idle"
-      (map/new
-        "coin" "selecting"
-        "on-enter" "Waiting for coins...")
+  (map/new "idle"
+    (map/new "coin"
+      "selecting"
+      "on-enter"
+      "Waiting for coins...")
     "selecting"
-      (map/new
-        "select" "dispensing"
-        "cancel" "idle"
-        "on-enter" "Choose your item!")
+    (map/new "select"
+      "dispensing"
+      "cancel"
+      "idle"
+      "on-enter"
+      "Choose your item!")
     "dispensing"
-      (map/new
-        "done" "idle"
-        "on-enter" "Dispensing your item...")))
+    (map/new "done"
+      "idle"
+      "on-enter"
+      "Dispensing your item...")))
 
 (defun vending-transition (state event)
   (if-let (next (map/get-in vending-fsm [state event]))
@@ -78,19 +83,21 @@
 (println "\n--- Generic FSM: Door ---\n")
 
 (define door-fsm
-  (map/new
-    "locked" (map/new "unlock" "closed")
+  (map/new "locked"
+    (map/new "unlock" "closed")
     "closed"
-      (map/new
-        "open" "open"
-        "lock" "locked")
-    "open" (map/new "close" "closed")))
+    (map/new "open"
+      "open"
+      "lock"
+      "locked")
+    "open"
+    (map/new "close" "closed")))
 
 (defun fsm-run (fsm state events)
   (if (null? events)
     state
-    (let* ((event  (car events))
-           (next   (map/get-in fsm [state event])))
+    (let* ((event (car events))
+           (next (map/get-in fsm [state event])))
       (if-let (next next)
         (begin
           (println f"  ${state} --[${event}]--> ${next}")

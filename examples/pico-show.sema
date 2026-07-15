@@ -36,17 +36,18 @@
 
 (define (hsv->rgb h)
   ;; h = 0-360, returns (r g b) each 0-255
-  (let ((s 1.0) (v 255.0)
+  (let ((s 1.0)
+        (v 255.0)
         (c (* v s))
         (x (* c (- 1.0 (abs (- (mod (/ h 60.0) 2.0) 1.0)))))
         (m (- v c)))
     (cond
-      ((< h 60)  (list (floor (+ c m)) (floor (+ x m)) (floor m)))
+      ((< h 60) (list (floor (+ c m)) (floor (+ x m)) (floor m)))
       ((< h 120) (list (floor (+ x m)) (floor (+ c m)) (floor m)))
       ((< h 180) (list (floor m) (floor (+ c m)) (floor (+ x m))))
       ((< h 240) (list (floor m) (floor (+ x m)) (floor (+ c m))))
       ((< h 300) (list (floor (+ x m)) (floor m) (floor (+ c m))))
-      (else      (list (floor (+ c m)) (floor m) (floor (+ x m)))))))
+      (else (list (floor (+ c m)) (floor m) (floor (+ x m)))))))
 
 (dotimes (cycle 3)
   (dotimes (i 10)
@@ -106,16 +107,17 @@
   (sleep 100))
 
 ;; Grand finale — rapid ascending scale
-(for-each (fn (f)
-  (all-leds 1)
-  (neo! 0 255 255 255)
-  (neo! 1 255 255 255)
-  (neo! 2 255 255 255)
-  (tone! f 50)
-  (sleep 20)
-  (leds-off)
-  (neos-off)
-  (sleep 20))
+(for-each
+  (fn (f)
+    (all-leds 1)
+    (neo! 0 255 255 255)
+    (neo! 1 255 255 255)
+    (neo! 2 255 255 255)
+    (tone! f 50)
+    (sleep 20)
+    (leds-off)
+    (neos-off)
+    (sleep 20))
   '(262 294 330 349 392 440 494 523 587 659 784 880 988 1047))
 
 ;; Lights out

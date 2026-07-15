@@ -37,16 +37,22 @@
 (define (app-script-tag)
   (cond
     ((equal? app-mode "error")
-     (string-append
-       "<pre style=\"margin:1rem;padding:1rem;background:#7f1d1d;color:#fee2e2;"
-       "border-radius:8px;white-space:pre-wrap;font:13px/1.5 ui-monospace,monospace\">"
-       "Build error:\n" (or app-error "") "</pre>\n"))
+      (string-append
+        "<pre style=\"margin:1rem;padding:1rem;background:#7f1d1d;color:#fee2e2;"
+        "border-radius:8px;white-space:pre-wrap;font:13px/1.5 ui-monospace,monospace\">"
+        "Build error:\n"
+        (or app-error "")
+        "</pre>\n"))
     ((equal? app-mode "archive")
-     (string-append "<script type=\"text/sema\" src=\"/__build/app.vfs?g="
-                    (number->string generation) "\"></script>\n"))
+      (string-append "<script type=\"text/sema\" src=\"/__build/app.vfs?g="
+        (number->string generation)
+        "\"></script>\n"))
     (else
-     (string-append "<script type=\"text/sema\" src=\"/app/" entry "?g="
-                    (number->string generation) "\"></script>\n"))))
+      (string-append "<script type=\"text/sema\" src=\"/app/"
+        entry
+        "?g="
+        (number->string generation)
+        "\"></script>\n"))))
 
 ;; With the proxy enabled, point the browser's llm/* at this same origin — the
 ;; dev server answers /complete, /chat, /stream, ... with server keys.
@@ -60,9 +66,9 @@
 ;; crates/sema/src/web/shell.html.
 (define (shell-html)
   (-> shell-template
-      (string/replace "{{TITLE}}" entry)
-      (string/replace "{{APP}}" (app-script-tag))
-      (string/replace "{{INIT}}" (init-js))))
+    (string/replace "{{TITLE}}" entry)
+    (string/replace "{{APP}}" (app-script-tag))
+    (string/replace "{{INIT}}" (init-js))))
 
 (define (handle-index req)
   (http/html (shell-html)))
@@ -87,7 +93,7 @@
 ;; message values with keyword roles.
 (define (->messages b)
   (map (fn (m) (message (string->keyword (:role m)) (:content m)))
-       (:messages b)))
+    (:messages b)))
 
 (define (handle-complete req)
   (let ((b (:json req)))
@@ -133,23 +139,22 @@
 ;; /app/*       → the app's source directory (raw .sema + any assets).
 ;; /__dev/poll  → hot-reload generation (instant response; never blocks).
 (define base-routes
-  [[:get    "/"           handle-index]
-   [:get    "/__dev/poll" handle-poll]
-   [:static "/__sema"     runtime-dir]
-   [:static "/__build"    build-dir]
-   [:static "/app"        app-dir]])
+  [[:get "/" handle-index]
+   [:get "/__dev/poll" handle-poll]
+   [:static "/__sema" runtime-dir]
+   [:static "/__build" build-dir]
+   [:static "/app" app-dir]])
 
 (define llm-routes
   [[:post "/complete" handle-complete]
-   [:post "/chat"     handle-chat]
-   [:post "/stream"   handle-stream]
-   [:post "/extract"  handle-extract]
+   [:post "/chat" handle-chat]
+   [:post "/stream" handle-stream]
+   [:post "/extract" handle-extract]
    [:post "/classify" handle-classify]
-   [:post "/embed"    handle-embed]
-   [:get  "/models"   handle-models]])
+   [:post "/embed" handle-embed]
+   [:get "/models" handle-models]])
 
-(define routes
-  (if llm-enabled (append base-routes llm-routes) base-routes))
+(define routes (if llm-enabled (append base-routes llm-routes) base-routes))
 
 (define (announce info)
   (println "")
@@ -161,5 +166,5 @@
 (http/serve (http/router routes)
   {:host host
    :port port
-   :port-fallback true
+   :port-fallback #t
    :on-listen announce})

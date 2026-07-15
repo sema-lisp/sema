@@ -21,12 +21,11 @@
   (async
     (for-each
       (fn (i)
-        (async/sleep 0)                         ; yield → interleave
+        (async/sleep 0) ; yield → interleave
         (channel/send readings {:from name :v (+ base i)}))
       (range 0 n-each))))
 
-(define sensors
-  (list (sensor "A" 10) (sensor "B" 20) (sensor "C" 30)))
+(define sensors (list (sensor "A" 10) (sensor "B" 20) (sensor "C" 30)))
 
 ;; Collector: drain exactly (n-each * #sensors) readings, recording arrival
 ;; order and a per-sensor running total.
@@ -37,8 +36,8 @@
         {:order (reverse order) :tally tally}
         (let ((r (channel/recv readings)))
           (loop (- left 1)
-                (cons (:from r) order)
-                (assoc tally (:from r) (+ (get tally (:from r) 0) (:v r)))))))))
+            (cons (:from r) order)
+            (assoc tally (:from r) (+ (get tally (:from r) 0) (:v r)))))))))
 
 ;; Kick off all sensors, then await the collected dashboard.
 (async/all sensors)

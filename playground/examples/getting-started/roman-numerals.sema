@@ -3,22 +3,31 @@
 (println "=== Roman Numeral Converter ===\n")
 
 (define roman-table
-  (list (list 1000 "M")  (list 900 "CM") (list 500 "D")  (list 400 "CD")
-        (list 100  "C")  (list 90  "XC") (list 50  "L")  (list 40  "XL")
-        (list 10   "X")  (list 9   "IX") (list 5   "V")  (list 4   "IV")
-        (list 1    "I")))
+  (list (list 1000 "M")
+    (list 900 "CM")
+    (list 500 "D")
+    (list 400 "CD")
+    (list 100 "C")
+    (list 90 "XC")
+    (list 50 "L")
+    (list 40 "XL")
+    (list 10 "X")
+    (list 9 "IX")
+    (list 5 "V")
+    (list 4 "IV")
+    (list 1 "I")))
 
 (define (int->roman n)
   (let loop ((n n) (table roman-table) (acc ""))
-    (if (or (null? table) (= n 0)) acc
+    (if (or (null? table) (= n 0))
+      acc
       (let ((value (first (first table)))
             (symbol (nth (first table) 1)))
         (if (>= n value)
           (loop (- n value) table (string/append acc symbol))
           (loop n (rest table) acc))))))
 
-(define roman-chars
-  (map/new :I 1 :V 5 :X 10 :L 50 :C 100 :D 500 :M 1000))
+(define roman-chars (map/new :I 1 :V 5 :X 10 :L 50 :C 100 :D 500 :M 1000))
 
 (define (roman-char-value ch)
   (get roman-chars (string/to-keyword (string/upper (char/to-string ch)))))
@@ -26,24 +35,38 @@
 (define (roman->int s)
   (let ((chars (string/chars s)))
     (let loop ((chars chars) (total 0))
-      (if (null? chars) total
+      (if (null? chars)
+        total
         (let ((current (roman-char-value (first chars)))
-              (next (if (null? (rest chars)) 0 (roman-char-value (first (rest chars))))))
+              (next
+                (if (null? (rest chars))
+                  0
+                  (roman-char-value (first (rest chars))))))
           (if (< current next)
             (loop (rest chars) (- total current))
             (loop (rest chars) (+ total current))))))))
 
 (define test-numbers (list 1 4 9 42 99 399 1776 1999 2024 3999))
 
-(println (format "  ~a  ~a  ~a"
-  (string/pad-right "Integer" 9) (string/pad-right "Roman" 16) "Back"))
-(println (format "  ~a  ~a  ~a"
-  (string/repeat "─" 9) (string/repeat "─" 16) (string/repeat "─" 7)))
+(println
+  (format "  ~a  ~a  ~a"
+    (string/pad-right "Integer" 9)
+    (string/pad-right "Roman" 16)
+    "Back"))
+(println
+  (format "  ~a  ~a  ~a"
+    (string/repeat "─" 9)
+    (string/repeat "─" 16)
+    (string/repeat "─" 7)))
 
-(for-each (fn (n)
-  (let* ((roman (int->roman n)) (back (roman->int roman)))
-    (println (format "  ~a  ~a  ~a"
-      (string/pad-right (str n) 9) (string/pad-right roman 16) back))))
+(for-each
+  (fn (n)
+    (let* ((roman (int->roman n)) (back (roman->int roman)))
+      (println
+        (format "  ~a  ~a  ~a"
+          (string/pad-right (str n) 9)
+          (string/pad-right roman 16)
+          back))))
   test-numbers)
 
 (define all-pass (every (fn (n) (= n (roman->int (int->roman n)))) test-numbers))

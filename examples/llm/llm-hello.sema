@@ -17,12 +17,13 @@
 (println "\n--- 2. Chat ---")
 (println
   (llm/chat
-    (list (message
-            :system
-            "You are a helpful assistant. Be very concise.")
-          (message
-            :user
-            "What is Lisp? One sentence."))
+    (list
+      (message
+        :system
+        "You are a helpful assistant. Be very concise.")
+      (message
+        :user
+        "What is Lisp? One sentence."))
     {:max-tokens 100}))
 
 ;; --- 3. Prompts as Data ---
@@ -65,10 +66,10 @@
   {:country {:type :string :description "Country name"}}
   (lambda (country)
     (cond
-      ((= country "Norway")  "Oslo")
-      ((= country "France")  "Paris")
-      ((= country "Japan")   "Tokyo")
-      (else                  (format "Unknown capital for ~a" country)))))
+      ((= country "Norway") "Oslo")
+      ((= country "France") "Paris")
+      ((= country "Japan") "Tokyo")
+      (else (format "Unknown capital for ~a" country)))))
 
 (println
   (llm/chat (list (message :user "What is the capital of Norway?"))

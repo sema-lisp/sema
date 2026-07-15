@@ -18,9 +18,11 @@ the quick fox was too quick for the lazy dog")
       (regex/split "\\s+" text))))
 
 (define counts
-  (foldl (lambda (acc word)
-    (assoc acc word (+ 1 (get acc word 0))))
-    {} words))
+  (foldl
+    (lambda (acc word)
+      (assoc acc word (+ 1 (get acc word 0))))
+    {}
+    words))
 
 ;; Sort by frequency (descending)
 (define sorted

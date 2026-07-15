@@ -9,9 +9,9 @@
 ;; Test harness
 ;; ============================================================
 
-(define tests-passed  0)
-(define tests-failed  0)
-(define tests-total   0)
+(define tests-passed 0)
+(define tests-failed 0)
+(define tests-total 0)
 
 (define (test name expected program)
   (set! tests-total (+ tests-total 1))

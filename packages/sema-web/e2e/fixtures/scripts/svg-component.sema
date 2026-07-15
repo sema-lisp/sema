@@ -1,16 +1,21 @@
-(def toggled (state false))
+(def toggled (state #f))
 
 (define (toggle ev)
   (put! toggled (not @toggled)))
 
-(defcomponent svg-view ()
+(defcomponent svg-view
+  ()
   [:div
-    ["svg" {:id "icon" "viewBox" "0 0 10 10" :on-click "toggle" :data-testid "icon"}
-      ["defs"
-        ["circle" {:id "dot" :cx "5" :cy "5" :r "4"}]]
-      ["use" {:id "use-dot" "xlink:href" "#dot"}]
-      ["foreignObject" {:x "0" :y "0" :width "10" :height "10"}
-        [:div {:id "html-inside"} "html"]]]
-    [:span {:id "toggle-state" :data-testid "toggle-state"} (if @toggled "on" "off")]])
+   ["svg"
+    {:id "icon" "viewBox" "0 0 10 10" :on-click "toggle" :data-testid "icon"}
+    ["defs"
+     ["circle" {:id "dot" :cx "5" :cy "5" :r "4"}]]
+    ["use" {:id "use-dot" "xlink:href" "#dot"}]
+    ["foreignObject"
+     {:x "0" :y "0" :width "10" :height "10"}
+     [:div {:id "html-inside"} "html"]]]
+   [:span
+    {:id "toggle-state" :data-testid "toggle-state"}
+    (if @toggled "on" "off")]])
 
 (mount! "#app" "svg-view")

@@ -113,13 +113,13 @@
     "interdum"))
 
 (define (generate-sentence)
-  (let* ((word-count  (math/random-int 5 15))
-         (words       (pick-n word-count lorem-words)))
+  (let* ((word-count (math/random-int 5 15))
+         (words (pick-n word-count lorem-words)))
     (string/append (capitalize (string/join words " ")) ".")))
 
 (define (generate-first-sentence)
-  (let* ((extra-count  (math/random-int 3 10))
-         (extra        (pick-n extra-count lorem-words)))
+  (let* ((extra-count (math/random-int 3 10))
+         (extra (pick-n extra-count lorem-words)))
     (string/append "Lorem ipsum dolor sit amet, "
       (string/join extra " ")
       ".")))
@@ -296,9 +296,9 @@
              (fn (w)
                (let ((r (math/random-int 0 12)))
                  (cond
-                   ((= r 0)  (string/append "**" w "**"))
-                   ((= r 1)  (string/append "*" w "*"))
-                   (else     w))))
+                   ((= r 0) (string/append "**" w "**"))
+                   ((= r 1) (string/append "*" w "*"))
+                   (else w))))
              words)))
     (string/append (capitalize (string/join styled " ")) ".")))
 
@@ -332,12 +332,12 @@
     (string/append "```\n" snippet "\n```")))
 
 (define (generate-markdown-doc)
-  (let* ((title             (pick-random section-topics))
-         (num-sections      (math/random-int 3 4))
-         (topics            (pick-n num-sections section-topics))
-         (bullet-section    (math/random-int 0 (- num-sections 1)))
-         (code-section      (mod (+ bullet-section 1) num-sections))
-         (numbered-section  (mod (+ bullet-section 2) num-sections)))
+  (let* ((title (pick-random section-topics))
+         (num-sections (math/random-int 3 4))
+         (topics (pick-n num-sections section-topics))
+         (bullet-section (math/random-int 0 (- num-sections 1)))
+         (code-section (mod (+ bullet-section 1) num-sections))
+         (numbered-section (mod (+ bullet-section 2) num-sections)))
     (let loop ((i 0)
                (acc
                  (list (string/append "# " title "\n")
@@ -411,10 +411,10 @@
     "Lisbon"))
 
 (define (generate-table-row)
-  (let* ((name   (generate-name))
-         (age    (format "~a" (math/random-int 22 65)))
-         (city   (pick-random cities))
-         (score  (format "~a" (math/random-int 50 100))))
+  (let* ((name (generate-name))
+         (age (format "~a" (math/random-int 22 65)))
+         (city (pick-random cities))
+         (score (format "~a" (math/random-int 50 100))))
     (format "| ~a | ~a | ~a | ~a |"
       (string/pad-right name 20)
       (string/pad-right age 5)

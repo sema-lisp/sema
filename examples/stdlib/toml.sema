@@ -9,24 +9,28 @@
 
 ;; toml/decode basic
 (assert-eq (toml/decode "[package]\nname = \"my-app\"\nversion = \"1.0.0\"")
-           {:package {:name "my-app" :version "1.0.0"}}
-           "decode basic")
+  {:package {:name "my-app" :version "1.0.0"}}
+  "decode basic")
 
 ;; Nested tables
-(define nested (toml/decode "[server]\nhost = \"localhost\"\nport = 8080\n\n[server.tls]\nenabled = true\ncert = \"/path/to/cert.pem\"\n"))
+(define nested
+  (toml/decode
+    "[server]\nhost = \"localhost\"\nport = 8080\n\n[server.tls]\nenabled = true\ncert = \"/path/to/cert.pem\"\n"))
 (assert-eq (map/get-in nested [:server :host]) "localhost" "nested host")
 (assert-eq (map/get-in nested [:server :port]) 8080 "nested port")
 (assert-eq (map/get-in nested [:server :tls :enabled]) #t "nested tls enabled")
 
 ;; Arrays and arrays of tables
-(define arr-data (toml/decode "colors = [\"red\", \"green\", \"blue\"]\n\n[[fruits]]\nname = \"apple\"\ncolor = \"red\"\n\n[[fruits]]\nname = \"banana\"\ncolor = \"yellow\"\n"))
+(define arr-data
+  (toml/decode
+    "colors = [\"red\", \"green\", \"blue\"]\n\n[[fruits]]\nname = \"apple\"\ncolor = \"red\"\n\n[[fruits]]\nname = \"banana\"\ncolor = \"yellow\"\n"))
 (assert-eq (:colors arr-data) '("red" "green" "blue") "decode array")
 (assert-eq (length (:fruits arr-data)) 2 "decode array of tables count")
 
 ;; Inline tables
 (assert-eq (toml/decode "point = { x = 1, y = 2 }")
-           {:point {:x 1 :y 2}}
-           "decode inline table")
+  {:point {:x 1 :y 2}}
+  "decode inline table")
 
 ;; Datetime handling
 (define dt-result (toml/decode "created = 2024-01-15T10:30:00Z"))
@@ -43,10 +47,12 @@
 (assert-eq (string/contains? encoded "my-app") #t "encode contains name")
 
 ;; Nested maps encode
-(define nested-encoded (toml/encode {:database {:host "localhost"
-                                                :port 5432
-                                                :credentials {:user "admin"
-                                                              :password "secret"}}}))
+(define nested-encoded
+  (toml/encode
+    {:database {:host "localhost"
+      :port 5432
+      :credentials {:user "admin"
+       :password "secret"}}}))
 (assert-eq (string? nested-encoded) #t "encode nested returns string")
 
 ;; Error: non-map top-level
@@ -65,19 +71,27 @@
   (catch e (println "  ✓  encode function error caught")))
 
 ;; Round-trip
-(define config-str "[server]\nhost = \"0.0.0.0\"\nport = 3000\n\n[server.cors]\norigins = [\"https://example.com\"]\n")
+(define config-str
+  "[server]\nhost = \"0.0.0.0\"\nport = 3000\n\n[server.cors]\norigins = [\"https://example.com\"]\n")
 (define config (toml/decode config-str))
 (define new-config (map/assoc-in config [:server :port] 8080))
 (define rt-encoded (toml/encode new-config))
 (assert-eq (string? rt-encoded) #t "roundtrip encode returns string")
 ;; Verify the updated value survives roundtrip
 (define rt-decoded (toml/decode rt-encoded))
-(assert-eq (map/get-in rt-decoded [:server :port]) 8080 "roundtrip port updated")
-(assert-eq (map/get-in rt-decoded [:server :host]) "0.0.0.0" "roundtrip host preserved")
+(assert-eq (map/get-in rt-decoded [:server :port])
+  8080
+  "roundtrip port updated")
+(assert-eq (map/get-in rt-decoded [:server :host])
+  "0.0.0.0"
+  "roundtrip host preserved")
 
 ;; sema.toml pattern (just verify the pattern compiles/runs with a synthetic string)
-(define fake-sema-toml "[package]\nname = \"test-project\"\nversion = \"1.0.0\"\n")
+(define fake-sema-toml
+  "[package]\nname = \"test-project\"\nversion = \"1.0.0\"\n")
 (define project (toml/decode fake-sema-toml))
-(assert-eq (map/get-in project [:package :name]) "test-project" "sema.toml pattern")
+(assert-eq (map/get-in project [:package :name])
+  "test-project"
+  "sema.toml pattern")
 
 (println "=== toml.md: ALL PASSED ===")

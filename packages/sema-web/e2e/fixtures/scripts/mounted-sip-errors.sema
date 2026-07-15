@@ -4,15 +4,18 @@
 (define (inc ev)
   (update! clicks (fn (n) (+ n 1))))
 
-(defcomponent mounted-sip-errors-view ()
+(defcomponent mounted-sip-errors-view
+  ()
   [:div
-    [:span {:id "before" :data-testid "before"} "before"]
-    (if (equal? @mode "bad-tag")
-      ["bad tag" "broken"]
-      [:span {:id "middle" :data-testid "middle"} "ok"])
-    (if (equal? @mode "bad-attr")
-      [:button {"bad attr name" "x" :id "after" :on-click "inc" :data-testid "after"} "after"]
-      [:button {:id "after" :on-click "inc" :data-testid "after"} "after"])
-    [:span {:id "clicks" :data-testid "clicks"} (number->string @clicks)]])
+   [:span {:id "before" :data-testid "before"} "before"]
+   (if (equal? @mode "bad-tag")
+     ["bad tag" "broken"]
+     [:span {:id "middle" :data-testid "middle"} "ok"])
+   (if (equal? @mode "bad-attr")
+     [:button
+      {"bad attr name" "x" :id "after" :on-click "inc" :data-testid "after"}
+      "after"]
+     [:button {:id "after" :on-click "inc" :data-testid "after"} "after"])
+   [:span {:id "clicks" :data-testid "clicks"} (number->string @clicks)]])
 
 (mount! "#app" "mounted-sip-errors-view")

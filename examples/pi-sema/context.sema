@@ -37,9 +37,9 @@
 ;; Returns list ordered root-most first (closest-to-cwd last).
 (define (discover-context-files cwd)
   (let loop ((dir cwd) (acc '()))
-    (let* ((found    (collect-context-in-dir dir))
-           (new-acc  (append found acc))
-           (parent   (path/dirname dir)))
+    (let* ((found (collect-context-in-dir dir))
+           (new-acc (append found acc))
+           (parent (path/dirname dir)))
       (if (equal? parent dir)
         (reverse new-acc)
         (loop parent new-acc)))))

@@ -32,8 +32,8 @@
 (println "\nTop 10 most frequent words:")
 (for-each
   (fn ([word count])
-    (let ((label  (string/pad-right (keyword/to-string word) 12))
-          (bar    (string/repeat "#" count)))
+    (let ((label (string/pad-right (keyword/to-string word) 12))
+          (bar (string/repeat "#" count)))
       (println f"  ${label}${bar}")))
   (take 10 sorted-freq))
 
@@ -79,13 +79,14 @@
         (if (char/alphabetic? ch)
           (let ((base (if (char/upper-case? ch) 65 97))
                 (code (char/to-integer ch)))
-            (integer/to-char (+ base (math/remainder (- (+ code shift) base) 26))))
+            (integer/to-char
+              (+ base (math/remainder (- (+ code shift) base) 26))))
           ch))
       (string/chars text))))
 
-(define original   "Hello World")
-(define encrypted  (caesar-encrypt original 3))
-(define decrypted  (caesar-encrypt encrypted 23))
+(define original "Hello World")
+(define encrypted (caesar-encrypt original 3))
+(define decrypted (caesar-encrypt encrypted 23))
 ;; 26 - 3 = 23
 (println "\nCaesar cipher (shift 3):")
 (println f"  Original:  ${original}")

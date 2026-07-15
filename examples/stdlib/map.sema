@@ -81,7 +81,8 @@
 
 ;; map/map-keys
 (define upper-keys
-  (map/map-keys (fn (k) (string/to-keyword (string/upper (keyword/to-string k))))
+  (map/map-keys
+    (fn (k) (string/to-keyword (string/upper (keyword/to-string k))))
     (map/new :a 1 :b 2)))
 (assert-eq (get upper-keys :A) 1 "map/map-keys A")
 (assert-eq (get upper-keys :B) 2 "map/map-keys B")

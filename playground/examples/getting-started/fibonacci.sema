@@ -1,8 +1,9 @@
 ;; Fibonacci with tail-call optimization
 (define (fib n)
   (define (go a b i)
-    (if (= i 0) a
-        (go b (+ a b) (- i 1))))
+    (if (= i 0)
+      a
+      (go b (+ a b) (- i 1))))
   (go 0 1 n))
 
 (map fib (range 1 16))

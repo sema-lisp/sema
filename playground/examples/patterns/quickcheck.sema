@@ -6,31 +6,39 @@
 ;; Generators
 (define (gen/int lo hi) (fn () (math/random-int lo hi)))
 (define (gen/nat) (gen/int 0 1000))
-(define (gen/char) (fn () (char/to-string (integer/to-char (math/random-int 32 126)))))
+(define (gen/char)
+  (fn () (char/to-string (integer/to-char (math/random-int 32 126)))))
 (define (gen/string-of max-len)
-  (fn () (let ((len (math/random-int 0 max-len)))
-    (string/join (map (fn (_) ((gen/char))) (range len)) ""))))
+  (fn ()
+    (let ((len (math/random-int 0 max-len)))
+      (string/join (map (fn (_) ((gen/char))) (range len)) ""))))
 (define (gen/list-of elem-gen max-len)
-  (fn () (let ((len (math/random-int 0 max-len)))
-    (map (fn (_) (elem-gen)) (range len)))))
+  (fn ()
+    (let ((len (math/random-int 0 max-len)))
+      (map (fn (_) (elem-gen)) (range len)))))
 
 ;; Shrinking
 (define (shrink-int n)
-  (if (= n 0) '()
+  (if (= n 0)
+    '()
     (let ((half (if (> n 0) (floor (/ n 2)) (ceil (/ n 2)))))
       (list 0 half))))
 
 (define (shrink-list lst)
-  (if (null? lst) '()
-    (cons '() (map (fn (i) (append (take i lst) (drop (+ i 1) lst)))
-                   (range (length lst))))))
+  (if (null? lst)
+    '()
+    (cons '()
+      (map (fn (i) (append (take i lst) (drop (+ i 1) lst)))
+        (range (length lst))))))
 
 (define (find-minimal prop val shrinker)
   (let loop ((current val) (fuel 50))
-    (if (= fuel 0) current
+    (if (= fuel 0)
+      current
       (let ((candidates (shrinker current)))
         (let check ((cs candidates))
-          (if (null? cs) current
+          (if (null? cs)
+            current
             (if (not (prop (car cs)))
               (loop (car cs) (- fuel 1))
               (check (cdr cs)))))))))
@@ -41,24 +49,31 @@
     (if (= i qc-num-tests)
       {:status :pass :tests qc-num-tests}
       (let ((val (gen)))
-        (if (prop val) (loop (+ i 1))
+        (if (prop val)
+          (loop (+ i 1))
           (let ((shrunk (if shrinker (find-minimal prop val shrinker) val)))
-            {:status :fail :counterexample val :shrunk shrunk :after-tests (+ i 1)}))))))
+            {:status :fail
+             :counterexample val
+             :shrunk shrunk
+             :after-tests (+ i 1)}))))))
 
 (define (check-property-2 prop gen-a gen-b shrinker-a shrinker-b)
   (let loop ((i 0))
     (if (= i qc-num-tests)
       {:status :pass :tests qc-num-tests}
       (let ((a (gen-a)) (b (gen-b)))
-        (if (prop a b) (loop (+ i 1))
+        (if (prop a b)
+          (loop (+ i 1))
           {:status :fail :counterexample (list a b) :after-tests (+ i 1)})))))
 
 (define (report name result)
   (if (= (get result :status) :pass)
     (println (format "  PASS  ~a (~a tests)" name (get result :tests)))
     (begin
-      (println (format "  FAIL  ~a (after ~a tests)" name (get result :after-tests)))
-      (println (format "        counterexample: ~a" (get result :counterexample)))
+      (println
+        (format "  FAIL  ~a (after ~a tests)" name (get result :after-tests)))
+      (println
+        (format "        counterexample: ~a" (get result :counterexample)))
       (when (not (= (get result :counterexample) (get result :shrunk)))
         (println (format "        shrunk to:      ~a" (get result :shrunk)))))))
 
@@ -67,19 +82,25 @@
 
 (report "add-commutative"
   (check-property-2 (fn (a b) (= (+ a b) (+ b a)))
-    (gen/int -1000 1000) (gen/int -1000 1000) nil nil))
+    (gen/int -1000 1000)
+    (gen/int -1000 1000)
+    nil
+    nil))
 
 (report "reverse-involution"
   (check-property (fn (lst) (equal? lst (reverse (reverse lst))))
-    (gen/list-of (gen/int 0 100) 20) shrink-list))
+    (gen/list-of (gen/int 0 100) 20)
+    shrink-list))
 
 (report "sort-idempotent"
   (check-property (fn (lst) (equal? (sort lst) (sort (sort lst))))
-    (gen/list-of (gen/int -100 100) 20) shrink-list))
+    (gen/list-of (gen/int -100 100) 20)
+    shrink-list))
 
 (report "abs-non-negative"
   (check-property (fn (n) (>= (abs n) 0))
-    (gen/int -10000 10000) shrink-int))
+    (gen/int -10000 10000)
+    shrink-int))
 
 (println "\n--- Should fail (testing shrinking) ---")
 
@@ -88,4 +109,5 @@
 
 (report "sort-is-identity"
   (check-property (fn (lst) (equal? lst (sort lst)))
-    (gen/list-of (gen/int 0 100) 10) shrink-list))
+    (gen/list-of (gen/int 0 100) 10)
+    shrink-list))

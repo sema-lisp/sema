@@ -22,15 +22,25 @@
 (define ts 1736943000.0)
 (assert-eq (time/format ts "%Y-%m-%d") "2025-01-15" "format %Y-%m-%d")
 (assert-eq (time/format ts "%H:%M:%S") "12:10:00" "format %H:%M:%S")
-(assert-eq (time/format ts "%Y-%m-%d %H:%M:%S") "2025-01-15 12:10:00" "format full")
-(assert-eq (time/format ts "%A, %B %d, %Y") "Wednesday, January 15, 2025" "format long date")
+(assert-eq (time/format ts "%Y-%m-%d %H:%M:%S")
+  "2025-01-15 12:10:00"
+  "format full")
+(assert-eq (time/format ts "%A, %B %d, %Y")
+  "Wednesday, January 15, 2025"
+  "format long date")
 (assert-eq (time/format ts "%F") "2025-01-15" "format %F shorthand")
 (assert-eq (time/format ts "%T") "12:10:00" "format %T shorthand")
 
 ;; time/parse
-(assert-eq (time/parse "2025-01-15 12:10:00" "%Y-%m-%d %H:%M:%S") 1736943000.0 "parse full")
-(assert-eq (time/parse "2025-01-15 00:00:00" "%Y-%m-%d %H:%M:%S") 1736899200.0 "parse midnight")
-(assert-eq (time/parse "15/01/2025 14:30:00" "%d/%m/%Y %H:%M:%S") 1736951400.0 "parse custom fmt")
+(assert-eq (time/parse "2025-01-15 12:10:00" "%Y-%m-%d %H:%M:%S")
+  1736943000.0
+  "parse full")
+(assert-eq (time/parse "2025-01-15 00:00:00" "%Y-%m-%d %H:%M:%S")
+  1736899200.0
+  "parse midnight")
+(assert-eq (time/parse "15/01/2025 14:30:00" "%d/%m/%Y %H:%M:%S")
+  1736951400.0
+  "parse custom fmt")
 
 ;; Roundtrip
 (define ts2 1700000000.0)
@@ -65,7 +75,9 @@
 (sleep 0)
 
 ;; Edge: epoch
-(assert-eq (time/format 0.0 "%Y-%m-%d %H:%M:%S") "1970-01-01 00:00:00" "epoch format")
+(assert-eq (time/format 0.0 "%Y-%m-%d %H:%M:%S")
+  "1970-01-01 00:00:00"
+  "epoch format")
 (define epoch-parts (time/date-parts 0.0))
 (assert-eq (get epoch-parts :year) 1970 "epoch year")
 (assert-eq (get epoch-parts :weekday) "Thursday" "epoch weekday")
@@ -79,10 +91,14 @@
 (assert-eq (time/diff ts3 1736943000.0) 0.5 "sub-second diff")
 
 ;; Common patterns: ISO 8601
-(assert-eq (time/format ts "%Y-%m-%dT%H:%M:%SZ") "2025-01-15T12:10:00Z" "ISO 8601")
+(assert-eq (time/format ts "%Y-%m-%dT%H:%M:%SZ")
+  "2025-01-15T12:10:00Z"
+  "ISO 8601")
 
 ;; Common patterns: display formatting
-(assert-eq (time/format ts "%A, %B %d, %Y") "Wednesday, January 15, 2025" "display format")
+(assert-eq (time/format ts "%A, %B %d, %Y")
+  "Wednesday, January 15, 2025"
+  "display format")
 
 ;; Common patterns: computing duration between dates
 ;; (The doc sample uses date-only parse which may fail, let's verify)

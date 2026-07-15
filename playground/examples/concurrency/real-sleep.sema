@@ -17,8 +17,12 @@
   (if (> i 10)
     (begin
       (println "")
-      (println (str "Done — total real time slept: " total " ms (~"
-                    (floor (/ total 1000)) "s).")))
+      (println
+        (str "Done — total real time slept: "
+          total
+          " ms (~"
+          (floor (/ total 1000))
+          "s).")))
     (let ((ms (math/random-int 1000 3000)))
       ;; Wrap in (async ...) so async/sleep goes through the scheduler — that's
       ;; what blocks on Atomics.wait for the real duration on the worker.

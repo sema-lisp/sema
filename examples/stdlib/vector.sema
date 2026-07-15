@@ -71,33 +71,43 @@
 (assert-eq (append [1 2] [3 4]) '(1 2 3 4) "append returns list")
 
 ;; thread-last with conversion
-(assert-eq (->> [1 2 3]
-                (map #(* % 2))
-                (list->vector))
-           [2 4 6] "thread-last map then list->vector")
+(assert-eq
+  (->> [1 2 3]
+    (map #(* % 2))
+    (list->vector))
+  [2 4 6]
+  "thread-last map then list->vector")
 
 ;; --- Destructuring ---
 
 (println "-- Destructuring --")
 
 ;; exact destructuring
-(assert-eq (let (([x y] [10 20]))
-             (+ x y))
-           30 "exact destructuring vector")
+(assert-eq
+  (let (([x y] [10 20]))
+    (+ x y))
+  30
+  "exact destructuring vector")
 
-(assert-eq (let (([x y] '(10 20)))
-             (+ x y))
-           30 "exact destructuring list into vector pattern")
+(assert-eq
+  (let (([x y] '(10 20)))
+    (+ x y))
+  30
+  "exact destructuring list into vector pattern")
 
 ;; rest destructuring with &
-(assert-eq (let (([head second & tail] [1 2 3 4 5]))
-             [head second tail])
-           [1 2 '(3 4 5)] "rest destructuring")
+(assert-eq
+  (let (([head second & tail] [1 2 3 4 5]))
+    [head second tail])
+  [1 2 '(3 4 5)]
+  "rest destructuring")
 
 ;; nested destructuring
-(assert-eq (let (([a [b c] d] [1 [2 3] 4]))
-             (+ a b c d))
-           10 "nested destructuring")
+(assert-eq
+  (let (([a [b c] d] [1 [2 3] 4]))
+    (+ a b c d))
+  10
+  "nested destructuring")
 
 ;; --- Pattern Matching ---
 
@@ -108,13 +118,16 @@
     ([0 0] "origin")
     ([x 0] (string/append "on x-axis at " (number/to-string x)))
     ([0 y] (string/append "on y-axis at " (number/to-string y)))
-    ([x y] (string/append "point " (number/to-string x) ", " (number/to-string y)))))
+    ([x y]
+      (string/append "point " (number/to-string x) ", " (number/to-string y)))))
 
 (assert-eq (describe-point [0 0]) "origin" "match origin")
 (assert-eq (describe-point [5 0]) "on x-axis at 5" "match x-axis")
 (assert-eq (describe-point [0 3]) "on y-axis at 3" "match y-axis")
 (assert-eq (describe-point [2 7]) "point 2, 7" "match general point")
-(assert-eq (describe-point '(5 0)) "on x-axis at 5" "match list against vector pattern")
+(assert-eq (describe-point '(5 0))
+  "on x-axis at 5"
+  "match list against vector pattern")
 
 ;; --- Practical ---
 
@@ -127,10 +140,12 @@
 (assert-eq (min-max '(3 1 4 1 5)) [1 5] "min-max tuple return")
 
 ;; chunking and re-vectorizing
-(assert-eq (->> (range 10)
-                (list/chunk 3)
-                (map list->vector))
-           '([0 1 2] [3 4 5] [6 7 8] [9]) "chunk and re-vectorize")
+(assert-eq
+  (->> (range 10)
+    (list/chunk 3)
+    (map list->vector))
+  '([0 1 2] [3 4 5] [6 7 8] [9])
+  "chunk and re-vectorize")
 
 (println)
 (println "=== All vector tests passed ===")

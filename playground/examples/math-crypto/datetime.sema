@@ -5,27 +5,43 @@
 
 (define parts (time/date-parts now))
 (println (format "\nDate parts:"))
-(println (format "  Year: ~a  Month: ~a  Day: ~a" (get parts :year) (get parts :month) (get parts :day)))
-(println (format "  Hour: ~a  Min: ~a  Sec: ~a" (get parts :hour) (get parts :minute) (get parts :second)))
+(println
+  (format "  Year: ~a  Month: ~a  Day: ~a"
+    (get parts :year)
+    (get parts :month)
+    (get parts :day)))
+(println
+  (format "  Hour: ~a  Min: ~a  Sec: ~a"
+    (get parts :hour)
+    (get parts :minute)
+    (get parts :second)))
 (println (format "  Weekday: ~a" (get parts :weekday)))
 
 ;; Parse and reformat
 (println "\nDate reformatting:")
-(for-each (fn (date-str)
-  (let* ((ts (time/parse date-str "%Y-%m-%d %H:%M:%S"))
-         (parts (time/date-parts ts)))
-    (println (format "  ~a → ~a (~a)"
-      date-str (time/format ts "%B %d, %Y") (get parts :weekday)))))
+(for-each
+  (fn (date-str)
+    (let* ((ts (time/parse date-str "%Y-%m-%d %H:%M:%S"))
+           (parts (time/date-parts ts)))
+      (println
+        (format "  ~a → ~a (~a)"
+          date-str
+          (time/format ts "%B %d, %Y")
+          (get parts :weekday)))))
   (list "2024-01-15 10:30:00" "2024-06-21 14:00:00" "2024-12-25 00:00:00"))
 
 ;; Epoch milestones
 (println "\nEpoch milestones:")
-(for-each (fn (m)
-  (println (format "  ~a: ~a"
-    (string/pad-right (first m) 16)
-    (time/format (nth m 1) "%Y-%m-%d %H:%M:%S"))))
-  (list (list "Unix epoch" 0.0) (list "Y2K" 946684800.0)
-        (list "Unix 1 billion" 1000000000.0) (list "2024-01-01" 1704067200.0)))
+(for-each
+  (fn (m)
+    (println
+      (format "  ~a: ~a"
+        (string/pad-right (first m) 16)
+        (time/format (nth m 1) "%Y-%m-%d %H:%M:%S"))))
+  (list (list "Unix epoch" 0.0)
+    (list "Y2K" 946684800.0)
+    (list "Unix 1 billion" 1000000000.0)
+    (list "2024-01-01" 1704067200.0)))
 
 ;; Date arithmetic
 (println "\nDays between dates:")
@@ -33,17 +49,20 @@
   (let ((ta (time/parse a "%Y-%m-%d %H:%M:%S"))
         (tb (time/parse b "%Y-%m-%d %H:%M:%S")))
     (round (/ (abs (- tb ta)) 86400.0))))
-(println (format "  2024-01-01 to 2024-12-25: ~a days"
-  (days-between "2024-01-01 00:00:00" "2024-12-25 00:00:00")))
+(println
+  (format "  2024-01-01 to 2024-12-25: ~a days"
+    (days-between "2024-01-01 00:00:00" "2024-12-25 00:00:00")))
 
 ;; Timing operations
 (println "\nTiming operations:")
 (define (measure name thunk)
   (let ((start (time-ms)))
     (thunk)
-    (println (format "  ~a took ~ams" (string/pad-right name 30) (- (time-ms) start)))))
+    (println
+      (format "  ~a took ~ams" (string/pad-right name 30) (- (time-ms) start)))))
 
 (measure "Sum 1 to 100000" (fn () (foldl + 0 (range 1 100001))))
-(measure "Generate 1000 random numbers" (fn () (map (fn (_) (math/random)) (range 1000))))
+(measure "Generate 1000 random numbers"
+  (fn () (map (fn (_) (math/random)) (range 1000))))
 (measure "Sort 1000 random ints"
   (fn () (sort (map (fn (_) (math/random-int 1 10000)) (range 1000)))))

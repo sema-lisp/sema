@@ -22,7 +22,7 @@
         (let ((v (channel/try-recv in)))
           (cond
             ((not (nil? v)) (channel/send out (f v)))
-            ((not (channel/closed? in)) (async/sleep 0))   ; wait for more
+            ((not (channel/closed? in)) (async/sleep 0)) ; wait for more
             (else (channel/close out) (set! more #f))))))))
 
 ;; Source stage: emit 1..n, then close.
@@ -32,7 +32,7 @@
     (channel/close ch1)))
 
 (define s-square (stage ch1 ch2 (fn (x) (* x x))))
-(define s-tag    (stage ch2 ch3 (fn (x) (str "item=" x))))
+(define s-tag (stage ch2 ch3 (fn (x) (str "item=" x))))
 
 ;; Collector: drain the final channel until it's closed and empty.
 (define collector
@@ -49,5 +49,7 @@
 (define out (await collector))
 
 (println "=== 3-stage async pipeline (n=" n ") ===")
-(for-each (fn (x) (println "  " x)) out)
+(for-each
+  (fn (x) (println "  " x))
+  out)
 (println "pipeline produced " (length out) " items")

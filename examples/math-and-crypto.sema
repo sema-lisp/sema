@@ -107,12 +107,13 @@
 
 (define chain-result (hash-chain "seed" 3))
 (println
-  (format "\n  3x hash chain of \"seed\": ~a..." (string/slice chain-result 0 16)))
+  (format "\n  3x hash chain of \"seed\": ~a..."
+    (string/slice chain-result 0 16)))
 
 ;; --- Timing ---
-(define start    (time-ms))
-(define _result  (sieve-primes 10000))
-(define elapsed  (- (time-ms) start))
+(define start (time-ms))
+(define _result (sieve-primes 10000))
+(define elapsed (- (time-ms) start))
 (println
   (format "\nPrimes under 10000: ~a primes found in ~ams"
     (length _result)

@@ -18,12 +18,14 @@ Sema runs on all major platforms. The interpreter is implemented in Rust, provid
 (define chunks (text/chunk article {:size 200 :overlap 0}))
 (println (format "Chunks (200 chars, no overlap): ~a chunks" (length chunks)))
 (for-each
-  (lambda (c) (println (format "  [~a chars] ~a" (string/length c) (text/truncate c 60))))
+  (lambda (c)
+    (println (format "  [~a chars] ~a" (string/length c) (text/truncate c 60))))
   chunks)
 
 ;; Chunk with overlap
 (define chunks-ov (text/chunk article {:size 200 :overlap 50}))
-(println (format "\nChunks (200 chars, 50 overlap): ~a chunks" (length chunks-ov)))
+(println
+  (format "\nChunks (200 chars, 50 overlap): ~a chunks" (length chunks-ov)))
 
 ;; Default chunking (1000 chars, 200 overlap)
 (define chunks-default (text/chunk article))
@@ -50,8 +52,10 @@ Sema runs on all major platforms. The interpreter is implemented in Rust, provid
 
 ;; Clean whitespace
 (define messy "  Hello    world   from    Sema  ")
-(println (format "Clean whitespace: '~a' => '~a'"
-  messy (text/clean-whitespace messy)))
+(println
+  (format "Clean whitespace: '~a' => '~a'"
+    messy
+    (text/clean-whitespace messy)))
 
 ;; Strip HTML
 (define html "<h1>Title</h1><p>Hello &amp; welcome to <b>Sema</b>!</p>")
@@ -81,7 +85,8 @@ Sema runs on all major platforms. The interpreter is implemented in Rust, provid
 (println (format "Rendered: ~a" rendered))
 
 ;; Missing variable stays as-is
-(define partial (prompt/render "Hi {{name}}, your score is {{score}}" {:name "Bob"}))
+(define partial
+  (prompt/render "Hi {{name}}, your score is {{score}}" {:name "Bob"}))
 (println (format "Partial: ~a" partial))
 
 ;; Numbers in templates

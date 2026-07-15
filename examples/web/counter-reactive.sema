@@ -23,13 +23,15 @@
 ;; ── View component ─────────────────────────────────────
 
 (define (counter-view)
-  [:div {:class "counter"}
-    [:h2 "Sema Reactive Counter"]
-    [:div {:class "display"} @count]
-    [:div {:class "buttons"}
-      [:button {:on-click "handle-decrement" :class "btn"} "−"]
-      [:button {:on-click "handle-reset" :class "btn btn-secondary"} "Reset"]
-      [:button {:on-click "handle-increment" :class "btn"} "+"]]])
+  [:div
+   {:class "counter"}
+   [:h2 "Sema Reactive Counter"]
+   [:div {:class "display"} @count]
+   [:div
+    {:class "buttons"}
+    [:button {:on-click "handle-decrement" :class "btn"} "−"]
+    [:button {:on-click "handle-reset" :class "btn btn-secondary"} "Reset"]
+    [:button {:on-click "handle-increment" :class "btn"} "+"]]])
 
 ;; ── Mount ──────────────────────────────────────────────
 

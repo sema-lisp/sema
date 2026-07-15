@@ -11,18 +11,24 @@
 
 (define (iterate-lsystem axiom rules n)
   (let loop ((current axiom) (i 0) (history (list axiom)))
-    (if (= i n) history
+    (if (= i n)
+      history
       (let ((next (apply-rules current rules)))
         (loop next (+ i 1) (append history (list next)))))))
 
 (define (show-lsystem name axiom rules n)
   (println (format "--- ~a ---" name))
   (let ((gens (iterate-lsystem axiom rules n)))
-    (for-each (fn (i)
-      (let ((gen (nth gens i)))
-        (if (<= (string/length gen) 55)
-          (println (format "  ~a: ~a" i gen))
-          (println (format "  ~a: [~a chars] ~a..." i (string/length gen) (string/slice gen 0 50))))))
+    (for-each
+      (fn (i)
+        (let ((gen (nth gens i)))
+          (if (<= (string/length gen) 55)
+            (println (format "  ~a: ~a" i gen))
+            (println
+              (format "  ~a: [~a chars] ~a..."
+                i
+                (string/length gen)
+                (string/slice gen 0 50))))))
       (range (+ n 1))))
   (println ""))
 
@@ -43,12 +49,14 @@
 (define (show-growth name axiom rules n)
   (let ((gens (iterate-lsystem axiom rules n)))
     (println (format "~a:" name))
-    (for-each (fn (i)
-      (let ((len (string/length (nth gens i))))
-        (println (format "  Gen ~a: ~a chars ~a"
-          (string/pad-left (str i) 2)
-          (string/pad-left (str len) 6)
-          (string/repeat "█" (min 30 (int (/ len 10))))))))
+    (for-each
+      (fn (i)
+        (let ((len (string/length (nth gens i))))
+          (println
+            (format "  Gen ~a: ~a chars ~a"
+              (string/pad-left (str i) 2)
+              (string/pad-left (str len) 6)
+              (string/repeat "█" (min 30 (int (/ len 10))))))))
       (range (+ n 1)))))
 
 (show-growth "Algae" "A" {:A "AB" :B "A"} 10)

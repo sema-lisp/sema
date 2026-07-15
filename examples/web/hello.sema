@@ -9,7 +9,8 @@
 
   ;; Set content
   (dom/set-text! heading "Hello from Sema!")
-  (dom/set-text! paragraph "This page is powered by Sema running in WebAssembly.")
+  (dom/set-text! paragraph
+    "This page is powered by Sema running in WebAssembly.")
 
   ;; Style the heading
   (dom/set-style! heading "color" "#6366f1")

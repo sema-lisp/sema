@@ -8,174 +8,224 @@
 
 ;; ── Pronoun reflection table ──────────────────────────────────────
 (def reflections
-  {"i"      "you"
-   "me"     "you"
-   "my"     "your"
+  {"i" "you"
+   "me" "you"
+   "my" "your"
    "myself" "yourself"
-   "am"     "are"
-   "was"    "were"
-   "i'd"    "you'd"
-   "i've"   "you've"
-   "i'll"   "you'll"
-   "you"    "i"
-   "your"   "my"
-   "yours"  "mine"
+   "am" "are"
+   "was" "were"
+   "i'd" "you'd"
+   "i've" "you've"
+   "i'll" "you'll"
+   "you" "i"
+   "your" "my"
+   "yours" "mine"
    "yourself" "myself"
-   "are"    "am"
-   "were"   "was"})
+   "are" "am"
+   "were" "was"})
 
 (defn reflect (text)
   "Swap pronouns in captured text so ELIZA's reply reads naturally."
   (let ((words (string/split text " ")))
     (string/join
-      (map (fn (w)
-             (let* ((low (string/lower w))
-                    (refl (or (get reflections low) w)))
-               (if (equal? refl "i") "I" refl)))
-           words)
+      (map
+        (fn (w)
+          (let* ((low (string/lower w))
+                 (refl (or (get reflections low) w)))
+            (if (equal? refl "i") "I" refl)))
+        words)
       " ")))
 
 ;; ── Rule database ─────────────────────────────────────────────────
 (def script
   (list
-    {:keyword "quit"   :rank 100
-     :rules (list {:pattern (list "*" "quit" "*")
-                   :responses (list "Thank you for talking with me."
-                                    "Goodbye. I hope this was helpful.")})}
-    {:keyword "sorry"  :rank 10
-     :rules (list {:pattern (list "*" "sorry" "*")
-                   :responses (list "Please don't apologize."
-                                    "Apologies are not necessary."
-                                    "What feelings does apologizing bring up?")})}
-    {:keyword "remember" :rank 8
-     :rules (list {:pattern (list "*" "i remember" "*")
-                   :responses (list "Do you often think of (2)?"
-                                    "Does thinking of (2) bring anything else to mind?"
-                                    "What else do you remember?"
-                                    "Why do you remember (2) just now?")}
-                  {:pattern (list "*" "do you remember" "*")
-                   :responses (list "Did you think I would forget (2)?"
-                                    "Why do you think I should recall (2) now?"
-                                    "What about (2)?")})}
-    {:keyword "if" :rank 6
-     :rules (list {:pattern (list "*" "if" "*")
-                   :responses (list "Do you think it's likely that (2)?"
-                                    "Do you wish that (2)?"
-                                    "What do you know about (2)?"
-                                    "Really, if (2)?")})}
-    {:keyword "dream" :rank 6
-     :rules (list {:pattern (list "*" "dream" "*")
-                   :responses (list "What does that dream suggest to you?"
-                                    "Do you dream often?"
-                                    "What persons appear in your dreams?"
-                                    "Have you had that dream before?")})}
-    {:keyword "mother" :rank 6
-     :rules (list {:pattern (list "*" "mother" "*")
-                   :responses (list "Tell me more about your mother."
-                                    "What was your relationship with your mother like?"
-                                    "How does your mother make you feel?"
-                                    "How does this relate to your feelings today?")})}
-    {:keyword "father" :rank 6
-     :rules (list {:pattern (list "*" "father" "*")
-                   :responses (list "Tell me more about your father."
-                                    "How did your father make you feel?"
-                                    "Does your relationship with your father relate to your feelings today?")})}
-    {:keyword "family" :rank 5
-     :rules (list {:pattern (list "*" "family" "*")
-                   :responses (list "Tell me more about your family."
-                                    "How do you get along with your family?"
-                                    "Is your family important to you?")})}
-    {:keyword "i want" :rank 5
-     :rules (list {:pattern (list "*" "i want" "*")
-                   :responses (list "What would it mean to you if you got (2)?"
-                                    "Why do you want (2)?"
-                                    "Suppose you got (2) soon — what then?"
-                                    "What if you never got (2)?")})}
-    {:keyword "i need" :rank 5
-     :rules (list {:pattern (list "*" "i need" "*")
-                   :responses (list "Why do you need (2)?"
-                                    "Would it really help you to get (2)?"
-                                    "Are you sure you need (2)?")})}
-    {:keyword "i am" :rank 4
-     :rules (list {:pattern (list "*" "i am" "*")
-                   :responses (list "How long have you been (2)?"
-                                    "Do you enjoy being (2)?"
-                                    "Why do you tell me you're (2)?"
-                                    "How does being (2) make you feel?")})}
-    {:keyword "i feel" :rank 4
-     :rules (list {:pattern (list "*" "i feel" "*")
-                   :responses (list "Do you often feel (2)?"
-                                    "When do you usually feel (2)?"
-                                    "When you feel (2), what do you do?")})}
-    {:keyword "i think" :rank 3
-     :rules (list {:pattern (list "*" "i think" "*")
-                   :responses (list "Do you doubt (2)?"
-                                    "Do you really think so?"
-                                    "But you're not sure (2)?")})}
-    {:keyword "i can't" :rank 3
-     :rules (list {:pattern (list "*" "i can't" "*")
-                   :responses (list "How do you know you can't (2)?"
-                                    "Perhaps you could (2) if you tried."
-                                    "What would it take for you to (2)?")})}
-    {:keyword "you are" :rank 3
-     :rules (list {:pattern (list "*" "you are" "*")
-                   :responses (list "Why do you think I am (2)?"
-                                    "Does it please you to think that I'm (2)?"
-                                    "Perhaps you'd like me to be (2)."
-                                    "Perhaps you're really talking about yourself?")})}
-    {:keyword "you" :rank 2
-     :rules (list {:pattern (list "*" "you" "*" "me" "*")
-                   :responses (list "Why do you think I (2) you?"
-                                    "You like to think I (2) you, don't you?"
-                                    "What makes you think I (2) you?")}
-                  {:pattern (list "*" "you" "*")
-                   :responses (list "We were discussing you, not me."
-                                    "What about your own (2)?")})}
-    {:keyword "yes" :rank 1
-     :rules (list {:pattern (list "*" "yes" "*")
-                   :responses (list "You seem quite sure." "I see." "I understand.")})}
-    {:keyword "no" :rank 1
-     :rules (list {:pattern (list "*" "no" "*")
-                   :responses (list "Why not?"
-                                    "You are being a bit negative."
-                                    "Are you saying no just to be negative?")})}
-    {:keyword "computer" :rank 3
-     :rules (list {:pattern (list "*" "computer" "*")
-                   :responses (list "Do computers worry you?"
-                                    "Why do you mention computers?"
-                                    "What do you think machines have to do with your problem?"
-                                    "Don't you think computers can help people?")})}
-    {:keyword "always" :rank 2
-     :rules (list {:pattern (list "*" "always" "*")
-                   :responses (list "Can you think of a specific example?"
-                                    "When?" "Really, always?")})}
-    {:keyword "because" :rank 2
-     :rules (list {:pattern (list "*" "because" "*")
-                   :responses (list "Is that the real reason?"
-                                    "What other reasons come to mind?"
-                                    "Does that reason apply to anything else?"
-                                    "If (2), what else must be true?")})}
-    {:keyword "hello" :rank 1
-     :rules (list {:pattern (list "*" "hello" "*")
-                   :responses (list "Hello. How are you feeling today?"
-                                    "Hi there. What's on your mind?"
-                                    "Hello. Tell me what's been troubling you.")})}
-    {:keyword "hi" :rank 1
-     :rules (list {:pattern (list "*" "hi" "*")
-                   :responses (list "Hello. How are you feeling today?"
-                                    "Hi. What brings you here?")})}
-    {:keyword "" :rank 0
-     :rules (list {:pattern (list "*")
-                   :responses (list "Please go on."
-                                    "Tell me more about that."
-                                    "Can you elaborate on that?"
-                                    "Why do you say that?"
-                                    "I see."
-                                    "Very interesting."
-                                    "I'm not sure I understand. Can you explain?"
-                                    "What does that suggest to you?"
-                                    "How does that make you feel?"
-                                    "Does that trouble you?")})}))
+    {:keyword "quit"
+     :rank 100
+     :rules (list
+       {:pattern (list "*" "quit" "*")
+        :responses (list "Thank you for talking with me."
+          "Goodbye. I hope this was helpful.")})}
+    {:keyword "sorry"
+     :rank 10
+     :rules (list
+       {:pattern (list "*" "sorry" "*")
+        :responses (list "Please don't apologize."
+          "Apologies are not necessary."
+          "What feelings does apologizing bring up?")})}
+    {:keyword "remember"
+     :rank 8
+     :rules (list
+       {:pattern (list "*" "i remember" "*")
+        :responses (list "Do you often think of (2)?"
+          "Does thinking of (2) bring anything else to mind?"
+          "What else do you remember?"
+          "Why do you remember (2) just now?")}
+       {:pattern (list "*" "do you remember" "*")
+        :responses (list "Did you think I would forget (2)?"
+          "Why do you think I should recall (2) now?"
+          "What about (2)?")})}
+    {:keyword "if"
+     :rank 6
+     :rules (list
+       {:pattern (list "*" "if" "*")
+        :responses (list "Do you think it's likely that (2)?"
+          "Do you wish that (2)?"
+          "What do you know about (2)?"
+          "Really, if (2)?")})}
+    {:keyword "dream"
+     :rank 6
+     :rules (list
+       {:pattern (list "*" "dream" "*")
+        :responses (list "What does that dream suggest to you?"
+          "Do you dream often?"
+          "What persons appear in your dreams?"
+          "Have you had that dream before?")})}
+    {:keyword "mother"
+     :rank 6
+     :rules (list
+       {:pattern (list "*" "mother" "*")
+        :responses (list "Tell me more about your mother."
+          "What was your relationship with your mother like?"
+          "How does your mother make you feel?"
+          "How does this relate to your feelings today?")})}
+    {:keyword "father"
+     :rank 6
+     :rules (list
+       {:pattern (list "*" "father" "*")
+        :responses (list "Tell me more about your father."
+          "How did your father make you feel?"
+          "Does your relationship with your father relate to your feelings today?")})}
+    {:keyword "family"
+     :rank 5
+     :rules (list
+       {:pattern (list "*" "family" "*")
+        :responses (list "Tell me more about your family."
+          "How do you get along with your family?"
+          "Is your family important to you?")})}
+    {:keyword "i want"
+     :rank 5
+     :rules (list
+       {:pattern (list "*" "i want" "*")
+        :responses (list "What would it mean to you if you got (2)?"
+          "Why do you want (2)?"
+          "Suppose you got (2) soon — what then?"
+          "What if you never got (2)?")})}
+    {:keyword "i need"
+     :rank 5
+     :rules (list
+       {:pattern (list "*" "i need" "*")
+        :responses (list "Why do you need (2)?"
+          "Would it really help you to get (2)?"
+          "Are you sure you need (2)?")})}
+    {:keyword "i am"
+     :rank 4
+     :rules (list
+       {:pattern (list "*" "i am" "*")
+        :responses (list "How long have you been (2)?"
+          "Do you enjoy being (2)?"
+          "Why do you tell me you're (2)?"
+          "How does being (2) make you feel?")})}
+    {:keyword "i feel"
+     :rank 4
+     :rules (list
+       {:pattern (list "*" "i feel" "*")
+        :responses (list "Do you often feel (2)?"
+          "When do you usually feel (2)?"
+          "When you feel (2), what do you do?")})}
+    {:keyword "i think"
+     :rank 3
+     :rules (list
+       {:pattern (list "*" "i think" "*")
+        :responses (list "Do you doubt (2)?"
+          "Do you really think so?"
+          "But you're not sure (2)?")})}
+    {:keyword "i can't"
+     :rank 3
+     :rules (list
+       {:pattern (list "*" "i can't" "*")
+        :responses (list "How do you know you can't (2)?"
+          "Perhaps you could (2) if you tried."
+          "What would it take for you to (2)?")})}
+    {:keyword "you are"
+     :rank 3
+     :rules (list
+       {:pattern (list "*" "you are" "*")
+        :responses (list "Why do you think I am (2)?"
+          "Does it please you to think that I'm (2)?"
+          "Perhaps you'd like me to be (2)."
+          "Perhaps you're really talking about yourself?")})}
+    {:keyword "you"
+     :rank 2
+     :rules (list
+       {:pattern (list "*" "you" "*" "me" "*")
+        :responses (list "Why do you think I (2) you?"
+          "You like to think I (2) you, don't you?"
+          "What makes you think I (2) you?")}
+       {:pattern (list "*" "you" "*")
+        :responses (list "We were discussing you, not me."
+          "What about your own (2)?")})}
+    {:keyword "yes"
+     :rank 1
+     :rules (list
+       {:pattern (list "*" "yes" "*")
+        :responses (list "You seem quite sure." "I see." "I understand.")})}
+    {:keyword "no"
+     :rank 1
+     :rules (list
+       {:pattern (list "*" "no" "*")
+        :responses (list "Why not?"
+          "You are being a bit negative."
+          "Are you saying no just to be negative?")})}
+    {:keyword "computer"
+     :rank 3
+     :rules (list
+       {:pattern (list "*" "computer" "*")
+        :responses (list "Do computers worry you?"
+          "Why do you mention computers?"
+          "What do you think machines have to do with your problem?"
+          "Don't you think computers can help people?")})}
+    {:keyword "always"
+     :rank 2
+     :rules (list
+       {:pattern (list "*" "always" "*")
+        :responses (list "Can you think of a specific example?"
+          "When?"
+          "Really, always?")})}
+    {:keyword "because"
+     :rank 2
+     :rules (list
+       {:pattern (list "*" "because" "*")
+        :responses (list "Is that the real reason?"
+          "What other reasons come to mind?"
+          "Does that reason apply to anything else?"
+          "If (2), what else must be true?")})}
+    {:keyword "hello"
+     :rank 1
+     :rules (list
+       {:pattern (list "*" "hello" "*")
+        :responses (list "Hello. How are you feeling today?"
+          "Hi there. What's on your mind?"
+          "Hello. Tell me what's been troubling you.")})}
+    {:keyword "hi"
+     :rank 1
+     :rules (list
+       {:pattern (list "*" "hi" "*")
+        :responses (list "Hello. How are you feeling today?"
+          "Hi. What brings you here?")})}
+    {:keyword ""
+     :rank 0
+     :rules (list
+       {:pattern (list "*")
+        :responses (list "Please go on."
+          "Tell me more about that."
+          "Can you elaborate on that?"
+          "Why do you say that?"
+          "I see."
+          "Very interesting."
+          "I'm not sure I understand. Can you explain?"
+          "What does that suggest to you?"
+          "How does that make you feel?"
+          "Does that trouble you?")})}))
 
 ;; ── Pattern matching engine ───────────────────────────────────────
 
@@ -184,47 +234,48 @@
 
 (defn expand-pattern (pattern)
   (apply append
-    (map (fn (elem)
-           (if (equal? elem "*")
-             (list "*")
-             (string/split elem " ")))
-         pattern)))
+    (map
+      (fn (elem)
+        (if (equal? elem "*")
+          (list "*")
+          (string/split elem " ")))
+      pattern)))
 
 (defn match-pattern (words pattern)
   (let loop ((ws words) (ps pattern) (captures '()))
     (cond
-      ((and (null? ws) (null? ps))
-       (reverse captures))
+      ((and (null? ws) (null? ps)) (reverse captures))
       ((null? ps) nil)
       ((equal? (car ps) "*")
-       (if (null? (cdr ps))
-         (reverse (cons (string/join ws " ") captures))
-         (let attempt ((n (length ws)))
-           (if (< n 0)
-             nil
-             (let* ((captured (string/join (take n ws) " "))
-                    (rest-ws  (drop n ws))
-                    (result   (loop rest-ws (cdr ps) (cons captured captures))))
-               (if result result (attempt (- n 1))))))))
+        (if (null? (cdr ps))
+          (reverse (cons (string/join ws " ") captures))
+          (let attempt ((n (length ws)))
+            (if (< n 0)
+              nil
+              (let* ((captured (string/join (take n ws) " "))
+                     (rest-ws (drop n ws))
+                     (result (loop rest-ws (cdr ps) (cons captured captures))))
+                (if result result (attempt (- n 1))))))))
       ((and (not (null? ws))
-            (equal? (car ps) (car ws)))
-       (loop (cdr ws) (cdr ps) captures))
+         (equal? (car ps) (car ws)))
+        (loop (cdr ws) (cdr ps) captures))
       (else nil))))
 
 ;; ── Response assembly ─────────────────────────────────────────────
 
 (defn substitute-captures (template captures)
-  (foldl (fn (text i)
-           (let ((placeholder (string-append "(" (number->string (+ i 1)) ")"))
-                 (segment     (reflect (nth captures i))))
-             (string/replace text placeholder segment)))
-         template
-         (range 0 (length captures))))
+  (foldl
+    (fn (text i)
+      (let ((placeholder (string-append "(" (number->string (+ i 1)) ")"))
+            (segment (reflect (nth captures i))))
+        (string/replace text placeholder segment)))
+    template
+    (range 0 (length captures))))
 
 (define response-counters {})
 
 (defn pick-response (key responses)
-  (let* ((idx      (or (get response-counters key) 0))
+  (let* ((idx (or (get response-counters key) 0))
          (response (nth responses (modulo idx (length responses)))))
     (set! response-counters (assoc response-counters key (+ idx 1)))
     response))
@@ -234,40 +285,47 @@
 (defn find-keyword-match (words)
   (let* ((matches
            (filter (fn (x) x)
-             (map (fn (entry)
-                    (let ((kw (:keyword entry)))
-                      (when (or (equal? kw "")
-                                (string/contains? (string/join words " ") kw))
-                        (let try-rules ((rules (:rules entry)))
-                          (if (null? rules)
-                            nil
-                            (let ((captures (match-pattern words (expand-pattern (:pattern (car rules))))))
-                              (if captures
-                                {:rank     (:rank entry)
-                                 :keyword  kw
-                                 :rule     (car rules)
-                                 :captures captures}
-                                (try-rules (cdr rules)))))))))
-                  script)))
+             (map
+               (fn (entry)
+                 (let ((kw (:keyword entry)))
+                   (when
+                     (or (equal? kw "")
+                       (string/contains? (string/join words " ") kw))
+                     (let try-rules ((rules (:rules entry)))
+                       (if (null? rules)
+                         nil
+                         (let ((captures
+                                 (match-pattern words
+                                   (expand-pattern (:pattern (car rules))))))
+                           (if captures
+                             {:rank (:rank entry)
+                              :keyword kw
+                              :rule (car rules)
+                              :captures captures}
+                             (try-rules (cdr rules)))))))))
+               script)))
          (sorted (sort-by #(- 0 (:rank %)) matches)))
     (if (null? sorted) nil (car sorted))))
 
 (defn respond (input)
-  (let* ((words  (words->list input))
+  (let* ((words (words->list input))
          (result (find-keyword-match words)))
     (if (not result)
       "I'm not sure I understand you fully."
-      (let* ((rule      (:rule result))
+      (let* ((rule (:rule result))
              (responses (:responses rule))
-             (captures  (:captures result))
-             (key       (string-append (:keyword result) ":"
-                          (string/join (:pattern rule) ",")))
-             (template  (pick-response key responses)))
+             (captures (:captures result))
+             (key
+               (string-append (:keyword result)
+                 ":"
+                 (string/join (:pattern rule) ",")))
+             (template (pick-response key responses)))
         (substitute-captures template captures)))))
 
 ;; ── Web interface ─────────────────────────────────────────────────
 
-(def html-page "<!DOCTYPE html>
+(def html-page
+  "<!DOCTYPE html>
 <html lang='en'>
 <head>
 <meta charset='utf-8'>
@@ -410,13 +468,13 @@ input.addEventListener('keydown', async (e) => {
 ;; ── Server ────────────────────────────────────────────────────────
 
 (define (handle-chat req)
-  (let* ((body  (or (:json req) {}))
-         (msg   (or (get body "message") ""))
+  (let* ((body (or (:json req) {}))
+         (msg (or (get body "message") ""))
          (reply (respond msg)))
     (http/ok {:response reply})))
 
 (define routes
-  [[:get  "/"     (fn (_) (http/html html-page))]
+  [[:get "/" (fn (_) (http/html html-page))]
    [:post "/chat" handle-chat]])
 
 (println "ELIZA is listening on http://localhost:3000")

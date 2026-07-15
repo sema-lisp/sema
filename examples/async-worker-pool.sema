@@ -10,7 +10,7 @@
 (define n-jobs 12)
 (define n-workers 4)
 
-(define jobs (channel/new 4))       ; bounded work queue (backpressure at 4)
+(define jobs (channel/new 4)) ; bounded work queue (backpressure at 4)
 (define results (channel/new n-jobs))
 
 ;; Producer: enqueue n-jobs, then close so workers know when to stop.
@@ -29,9 +29,8 @@
         (let ((job (channel/try-recv jobs)))
           (cond
             ;; got a job
-            ((not (nil? job))
-             (async/sleep 1)
-             (channel/send results {:worker id :job job :result (* job job)}))
+            ((not (nil? job)) (async/sleep 1)
+              (channel/send results {:worker id :job job :result (* job job)}))
             ;; nothing buffered but channel still open — yield and retry
             ((not (channel/closed? jobs)) (async/sleep 0))
             ;; drained and closed — done
@@ -50,8 +49,9 @@
 
 (println "=== Worker pool: " n-workers " workers, " n-jobs " jobs ===")
 (for-each
-  (fn (r) (println "  worker " (:worker r) " did job " (:job r) " -> " (:result r)))
+  (fn (r)
+    (println "  worker " (:worker r) " did job " (:job r) " -> " (:result r)))
   collected)
 
 (define total (foldl (fn (acc r) (+ acc (:result r))) 0 collected))
-(println "processed " (length collected) " jobs; sum of results = " total)  ; 1+4+...+144 = 650
+(println "processed " (length collected) " jobs; sum of results = " total) ; 1+4+...+144 = 650

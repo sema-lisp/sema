@@ -15,7 +15,9 @@
 (assert-eq (json/encode nil) "null" "encode nil")
 (assert-eq (json/encode '(1 2 3)) "[1,2,3]" "encode list")
 (assert-eq (json/encode [1 2 3]) "[1,2,3]" "encode vector")
-(assert-eq (json/encode {:name "Ada" :age 36}) "{\"age\":36,\"name\":\"Ada\"}" "encode map")
+(assert-eq (json/encode {:name "Ada" :age 36})
+  "{\"age\":36,\"name\":\"Ada\"}"
+  "encode map")
 
 ;; json/encode errors
 (try
@@ -50,13 +52,16 @@
   (catch e (println "  ✓  decode non-string error caught")))
 
 ;; Roundtrips
-(assert-eq (json/decode (json/encode [1 2 3])) '(1 2 3) "roundtrip vector->list")
+(assert-eq (json/decode (json/encode [1 2 3]))
+  '(1 2 3)
+  "roundtrip vector->list")
 (assert-eq (json/decode (json/encode {:a 1 :b 2})) {:a 1 :b 2} "roundtrip map")
 
 ;; Nested roundtrip
-(define data {:users [{:name "Ada"} {:name "Bob"}]
-              :count 2
-              :active #t})
+(define data
+  {:users [{:name "Ada"} {:name "Bob"}]
+   :count 2
+   :active #t})
 (define roundtripped (json/decode (json/encode data)))
 (assert-eq (:count roundtripped) 2 "nested roundtrip :count")
 (assert-eq (:active roundtripped) #t "nested roundtrip :active")

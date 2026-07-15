@@ -43,7 +43,9 @@
 (println "-- regex/find-all --")
 
 (assert-eq (regex/find-all #"\d+" "a1b2c3") '("1" "2" "3") "find-all digits")
-(assert-eq (regex/find-all #"[A-Z]" "Hello World") '("H" "W") "find-all uppercase")
+(assert-eq (regex/find-all #"[A-Z]" "Hello World")
+  '("H" "W")
+  "find-all uppercase")
 
 ;; --- regex/replace ---
 
@@ -53,32 +55,43 @@
 
 ;; capture group references in replacement
 (assert-eq (regex/replace #"(\d+)-(\w+)" "$2:$1" "item-42-foo")
-           "item-foo:42" "replace with numbered captures")
+  "item-foo:42"
+  "replace with numbered captures")
 
 ;; named capture groups
-(assert-eq (regex/replace #"(?P<num>\d+)-(?P<word>\w+)" "$word:$num" "item-42-foo")
-           "item-foo:42" "replace with named captures")
+(assert-eq
+  (regex/replace #"(?P<num>\d+)-(?P<word>\w+)" "$word:$num" "item-42-foo")
+  "item-foo:42"
+  "replace with named captures")
 
 ;; --- regex/replace-all ---
 
 (println "-- regex/replace-all --")
 
 (assert-eq (regex/replace-all #"\d" "X" "a1b2") "aXbX" "replace-all digits")
-(assert-eq (regex/replace-all #"\s+" " " "a  b  c") "a b c" "replace-all whitespace")
+(assert-eq (regex/replace-all #"\s+" " " "a  b  c")
+  "a b c"
+  "replace-all whitespace")
 
 ;; --- regex/split ---
 
 (println "-- regex/split --")
 
 (assert-eq (regex/split #"," "a,b,c") '("a" "b" "c") "split by comma")
-(assert-eq (regex/split #"\s+" "hello  world") '("hello" "world") "split by whitespace")
-(assert-eq (regex/split #"[,;]" "a,b;c,d") '("a" "b" "c" "d") "split by comma or semicolon")
+(assert-eq (regex/split #"\s+" "hello  world")
+  '("hello" "world")
+  "split by whitespace")
+(assert-eq (regex/split #"[,;]" "a,b;c,d")
+  '("a" "b" "c" "d")
+  "split by comma or semicolon")
 
 ;; --- Regex literal escaping ---
 
 (println "-- Regex Literals --")
 
-(assert-eq (regex/match? #"\"[^\"]+\"" "say \"hello\"") #t "match literal quotes in regex literal")
+(assert-eq (regex/match? #"\"[^\"]+\"" "say \"hello\"")
+  #t
+  "match literal quotes in regex literal")
 
 ;; --- Practical Examples ---
 
@@ -95,30 +108,34 @@
 (define (extract-first-int s)
   (let ((m (regex/match #"\d+" s)))
     (if (nil? m)
-        nil
-        (:match m))))
+      nil
+      (:match m))))
 
 (assert-eq (extract-first-int "x=42; y=9") "42" "extract-first-int")
 
 ;; normalize whitespace
 (assert-eq (regex/replace-all #"\s+" " " "a   b\n\nc\t\t d")
-           "a b c d" "normalize whitespace")
+  "a b c d"
+  "normalize whitespace")
 
 ;; parse key-value pairs
 (define (parse-kv line)
   (let ((m (regex/match #"^(\w+)\s*=\s*(.+)$" line)))
     (if (nil? m)
-        nil
-        (let ((groups (:groups m)))
-          {:key (first groups) :value (first (rest groups))}))))
+      nil
+      (let ((groups (:groups m)))
+        {:key (first groups) :value (first (rest groups))}))))
 
 (define kv-result (parse-kv "name = Alice"))
 (assert-eq (:key kv-result) "name" "parse-kv key")
 (assert-eq (:value kv-result) "Alice" "parse-kv value")
 
 ;; find all email-like strings
-(assert-eq (regex/find-all #"[\w.+-]+@[\w-]+\.[\w.]+" "Contact ada@example.com or bob@test.org")
-           '("ada@example.com" "bob@test.org") "find-all emails")
+(assert-eq
+  (regex/find-all #"[\w.+-]+@[\w-]+\.[\w.]+"
+    "Contact ada@example.com or bob@test.org")
+  '("ada@example.com" "bob@test.org")
+  "find-all emails")
 
 (println)
 (println "=== All regex tests passed ===")

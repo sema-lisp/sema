@@ -9,8 +9,8 @@
   (exit 1))
 
 ;; Get the staged diff
-(define result  (shell "git" "diff" "--staged"))
-(define diff    (:stdout result))
+(define result (shell "git" "diff" "--staged"))
+(define diff (:stdout result))
 
 (when (= (string/trim diff) "")
   (io/println-error "No staged changes. Stage changes with 'git add' first.")
@@ -21,16 +21,17 @@
 ;; Generate the commit message
 (define msg
   (llm/chat
-    (list (message
-            :system
-            "You are a git commit message generator. Write a concise conventional commit message for the given diff. Follow the format: type(scope): description
+    (list
+      (message
+        :system
+        "You are a git commit message generator. Write a concise conventional commit message for the given diff. Follow the format: type(scope): description
 
 Where type is one of: feat, fix, refactor, docs, test, chore, style, perf, build, ci
 Keep the first line under 72 characters. Add a blank line and brief body only if the change is complex.
 Output ONLY the commit message, nothing else.")
-          (message
-            :user
-            (string/append "Generate a commit message for this diff:\n\n" diff)))
+      (message
+        :user
+        (string/append "Generate a commit message for this diff:\n\n" diff)))
     {:max-tokens 200}))
 
 (define msg (string/trim msg))
@@ -50,6 +51,7 @@ Output ONLY the commit message, nothing else.")
         (begin
           (io/println-error "Commit failed:")
           (io/println-error (:stderr commit-result)))))
-    ((= choice "e") (io/println-error "Copy the message above, edit it, and run:")
+    ((= choice "e")
+      (io/println-error "Copy the message above, edit it, and run:")
       (io/println-error "  git commit -m \"<your message>\""))
     (else (io/println-error "Rejected."))))

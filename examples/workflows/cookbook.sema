@@ -28,18 +28,21 @@
 ;; Returns the final answer text.
 (defmacro react (question tools max-rounds)
   `(let ((rx-tools# ,tools)
-         (rx-q# ,question))
-     (let loop ((round# 1) (scratch# ""))
-       (let ((answer#
-               (step (str "Question: " rx-q# "\n\n"
-                          "Reason step-by-step, call a tool when you need a fact, "
-                          "then give the final answer.\n"
-                          (if (= scratch# "") "" (str "Notes so far:\n" scratch# "\n")))
-                 {:name "react" :tools rx-tools#})))
-         (if (or (>= round# ,max-rounds)
-                 (not (string/contains? (string/lower answer#) "next:")))
-           answer#
-           (loop (+ round# 1) (str scratch# "\n" answer#)))))))
+        (rx-q# ,question))
+    (let loop ((round# 1) (scratch# ""))
+      (let ((answer#
+              (step
+                (str "Question: "
+                  rx-q#
+                  "\n\n"
+                  "Reason step-by-step, call a tool when you need a fact, "
+                  "then give the final answer.\n"
+                  (if (= scratch# "") "" (str "Notes so far:\n" scratch# "\n")))
+                {:name "react" :tools rx-tools#})))
+        (if (or (>= round# ,max-rounds)
+            (not (string/contains? (string/lower answer#) "next:")))
+          answer#
+          (loop (+ round# 1) (str scratch# "\n" answer#)))))))
 
 ;; ---------------------------------------------------------------------------
 ;; reflexion — attempt -> self-critique -> retry-with-critique, bounded.
@@ -49,21 +52,25 @@
 ;;   (reflexion "Write a haiku about NaN-boxing." 3)
 (defmacro reflexion (task max-tries)
   `(let ((rf-task# ,task))
-     (let loop ((try# 1) (note# ""))
-       (let ((attempt#
-               (step (str rf-task#
-                          (if (= note# "") ""
-                            (str "\n\nPrevious critique to address:\n" note#)))
-                 {:name "actor"})))
-         (if (>= try# ,max-tries)
-           attempt#
-           (let ((critique#
-                   (step (str "Critique this attempt. If it is good, reply exactly "
-                              "\"OK\". Otherwise list concrete fixes.\n\n" attempt#)
-                     {:name "critic"})))
-             (if (string/starts-with? (string/trim critique#) "OK")
-               attempt#
-               (loop (+ try# 1) critique#))))))))
+    (let loop ((try# 1) (note# ""))
+      (let ((attempt#
+              (step
+                (str rf-task#
+                  (if (= note# "")
+                    ""
+                    (str "\n\nPrevious critique to address:\n" note#)))
+                {:name "actor"})))
+        (if (>= try# ,max-tries)
+          attempt#
+          (let ((critique#
+                  (step
+                    (str "Critique this attempt. If it is good, reply exactly "
+                      "\"OK\". Otherwise list concrete fixes.\n\n"
+                      attempt#)
+                    {:name "critic"})))
+            (if (string/starts-with? (string/trim critique#) "OK")
+              attempt#
+              (loop (+ try# 1) critique#))))))))
 
 ;; ---------------------------------------------------------------------------
 ;; tree-of-thought — fan out N candidate thoughts, score, pick best.
@@ -72,22 +79,33 @@
 ;; number. We drop failed (nil) candidates, then foldl to argmax.
 ;;   (tree-of-thought "Name this lib." 4 (fn (c) (string-length c)))
 ;; Returns the highest-scoring candidate.
-(defmacro tree-of-thought (prompt n scorer)
+(defmacro tree-of-thought
+  (prompt
+    n
+    scorer)
   `(let ((tot-score# ,scorer)
-         (tot-prompt# ,prompt))
-     (let ((cands# (filter (fn (c#) (not (nil? c#)))
-                     (parallel
-                       (map (fn (i#)
-                              (fn () (step (str tot-prompt#
-                                                "\n(Give one distinct candidate, attempt #" i# ".)")
-                                        {:name "thought"})))
-                            (range ,n))
-                       ,n))))
-       (if (null? cands#)
-         nil
-         (foldl (fn (best# c#)
-                  (if (> (tot-score# c#) (tot-score# best#)) c# best#))
-                (first cands#) (rest cands#))))))
+        (tot-prompt# ,prompt))
+    (let ((cands#
+            (filter (fn (c#) (not (nil? c#)))
+              (parallel
+                (map
+                  (fn (i#)
+                    (fn ()
+                      (step
+                        (str tot-prompt#
+                          "\n(Give one distinct candidate, attempt #"
+                          i#
+                          ".)")
+                        {:name "thought"})))
+                  (range ,n))
+                ,n))))
+      (if (null? cands#)
+        nil
+        (foldl
+          (fn (best# c#)
+            (if (> (tot-score# c#) (tot-score# best#)) c# best#))
+          (first cands#)
+          (rest cands#))))))
 
 ;; ---------------------------------------------------------------------------
 ;; debate — two personas argue R rounds, a judge decides.
@@ -96,16 +114,20 @@
 ;;   (debate "Is dynamic typing good?" "Pro" "Con" 2)
 (defmacro debate (topic persona-a persona-b rounds)
   `(let ((db-topic# ,topic) (db-a# ,persona-a) (db-b# ,persona-b))
-     (let loop ((r# 1) (transcript# (str "TOPIC: " db-topic#)))
-       (let* ((arg-a# (step (str "You are " db-a# ". Argue your side.\n\n" transcript#)
-                        {:name db-a#}))
-              (t1# (str transcript# "\n\n" db-a# ": " arg-a#))
-              (arg-b# (step (str "You are " db-b# ". Rebut.\n\n" t1#)
-                        {:name db-b#}))
-              (t2# (str t1# "\n\n" db-b# ": " arg-b#)))
-         (if (>= r# ,rounds)
-           (step (str "You are the judge. Read the debate and declare a winner with "
-                      "one sentence of reasoning.\n\n" t2#)
-             {:name "judge"})
-           (loop (+ r# 1) t2#))))))
+    (let loop ((r# 1) (transcript# (str "TOPIC: " db-topic#)))
+      (let* ((arg-a#
+               (step (str "You are " db-a# ". Argue your side.\n\n" transcript#)
+                 {:name db-a#}))
+             (t1# (str transcript# "\n\n" db-a# ": " arg-a#))
+             (arg-b#
+               (step (str "You are " db-b# ". Rebut.\n\n" t1#)
+                 {:name db-b#}))
+             (t2# (str t1# "\n\n" db-b# ": " arg-b#)))
+        (if (>= r# ,rounds)
+          (step
+            (str "You are the judge. Read the debate and declare a winner with "
+              "one sentence of reasoning.\n\n"
+              t2#)
+            {:name "judge"})
+          (loop (+ r# 1) t2#))))))
 ;; ============================================================================

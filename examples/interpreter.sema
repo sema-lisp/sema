@@ -11,8 +11,8 @@
 (define (make-if c t f) (map/new :type :if :cond c :then t :else f))
 (define (make-let name val body)
   (map/new :type :let :name name :val val :body body))
-(define (make-lam param body)  (map/new :type :lambda :param param :body body))
-(define (make-call fn arg)     (map/new :type :call :fn fn :arg arg))
+(define (make-lam param body) (map/new :type :lambda :param param :body body))
+(define (make-call fn arg) (map/new :type :call :fn fn :arg arg))
 
 ;; Evaluator — dispatches on :type
 (define (eval-ast node env)
@@ -32,14 +32,14 @@
               (lv (eval-ast (get node :left) env))
               (rv (eval-ast (get node :right) env)))
           (cond
-            ((eq? op :+)  (+ lv rv))
-            ((eq? op :-)  (- lv rv))
-            ((eq? op :*)  (* lv rv))
-            ((eq? op :/)  (/ lv rv))
-            ((eq? op :>)  (> lv rv))
-            ((eq? op :<)  (< lv rv))
-            ((eq? op :=)  (= lv rv))
-            (else         (throw (format "Unknown operator: ~a" op))))))
+            ((eq? op :+) (+ lv rv))
+            ((eq? op :-) (- lv rv))
+            ((eq? op :*) (* lv rv))
+            ((eq? op :/) (/ lv rv))
+            ((eq? op :>) (> lv rv))
+            ((eq? op :<) (< lv rv))
+            ((eq? op :=) (= lv rv))
+            (else (throw (format "Unknown operator: ~a" op))))))
 
       ((eq? tag :if)
         (if (eval-ast (get node :cond) env)
@@ -51,11 +51,14 @@
           (eval-ast (get node :body) (assoc env (get node :name) val))))
 
       ((eq? tag :lambda)
-        (map/new
-          :type :closure
-          :param (get node :param)
-          :body (get node :body)
-          :env env))
+        (map/new :type
+          :closure
+          :param
+          (get node :param)
+          :body
+          (get node :body)
+          :env
+          env))
 
       ((eq? tag :call)
         (let ((closure (eval-ast (get node :fn) env))

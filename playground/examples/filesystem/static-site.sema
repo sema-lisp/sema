@@ -16,13 +16,16 @@
 
 ;; HTML template
 (define (wrap-html title body)
-  (string/append
-    "<!doctype html>\n<html>\n<head><title>" title "</title>\n"
+  (string/append "<!doctype html>\n<html>\n<head><title>"
+    title
+    "</title>\n"
     "<style>body{font:16px/1.6 system-ui;max-width:640px;margin:2rem auto;color:#333}"
     "h1{color:#c8a855}a{color:#7aacb8}nav{margin-bottom:2rem}</style>\n"
     "</head>\n<body>\n"
     "<nav><a href=\"index.html\">Home</a> · <a href=\"about.html\">About</a></nav>\n"
-    "<pre>" body "</pre>\n"
+    "<pre>"
+    body
+    "</pre>\n"
     "</body>\n</html>\n"))
 
 ;; Build pages

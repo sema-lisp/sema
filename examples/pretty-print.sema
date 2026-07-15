@@ -6,8 +6,8 @@
 ;;; Demonstrates: recursive descent, string building, type dispatch,
 ;;;               named let, cond
 
-(define pp-indent  2)
-(define pp-width   60)
+(define pp-indent 2)
+(define pp-width 60)
 
 ;;; --- Core pretty printer ---
 
@@ -86,10 +86,10 @@
 
 ;; Format a special form (define, let, if, etc.)
 (define (pp-special lst indent)
-  (let* ((head          (car lst))
-         (rest-items    (cdr lst))
-         (child-indent  (+ indent pp-indent))
-         (pad           (string/repeat " " child-indent)))
+  (let* ((head (car lst))
+         (rest-items (cdr lst))
+         (child-indent (+ indent pp-indent))
+         (pad (string/repeat " " child-indent)))
     (if (null? rest-items)
       (str "(" head ")")
       ;; Put head + first arg on line 1, rest indented
@@ -110,9 +110,9 @@
 
 ;; Format a regular function call
 (define (pp-call lst indent)
-  (let* ((child-indent  (+ indent pp-indent))
-         (pad           (string/repeat " " child-indent))
-         (items         (map (fn (item) (pp item child-indent)) lst)))
+  (let* ((child-indent (+ indent pp-indent))
+         (pad (string/repeat " " child-indent))
+         (items (map (fn (item) (pp item child-indent)) lst)))
     (string/append "("
       (string/join items (str "\n" pad))
       ")")))
@@ -172,9 +172,9 @@
 (println "\n--- Deep nesting ---")
 (pretty-print
   '(define (process-data items)
-    (let ((filtered     (filter valid? items))
-          (transformed  (map transform filtered))
-          (sorted       (sort transformed)))
+    (let ((filtered (filter valid? items))
+          (transformed (map transform filtered))
+          (sorted (sort transformed)))
       (if (null? sorted)
         (error "no valid items")
         (take 10 sorted)))))
@@ -198,11 +198,11 @@
 (println "\n--- Lambda with body ---")
 (pretty-print
   '(fn (request)
-    (let ((method  (get request :method))
-          (path    (get request :path)))
+    (let ((method (get request :method))
+          (path (get request :path)))
       (cond
-        ((= method "GET")   (handle-get path))
-        ((= method "POST")  (handle-post path (get request :body)))
-        (else               (error "unsupported method"))))))
+        ((= method "GET") (handle-get path))
+        ((= method "POST") (handle-post path (get request :body)))
+        (else (error "unsupported method"))))))
 
 (println "\nDone!")

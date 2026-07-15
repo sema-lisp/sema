@@ -32,7 +32,8 @@
 
 (define provider (llm/auto-configure))
 (when (nil? provider)
-  (println "SKIP: no provider key in env (need ANTHROPIC_API_KEY / OPENAI_API_KEY / GEMINI_API_KEY)")
+  (println
+    "SKIP: no provider key in env (need ANTHROPIC_API_KEY / OPENAI_API_KEY / GEMINI_API_KEY)")
   (exit 1))
 ;; The completion cache is memory + DISK — clear both so a previous run's disk
 ;; entries can't serve tonight's "fresh" calls as hits and fake the timings.
@@ -44,21 +45,21 @@
 (define failures '())
 (define (check name ok detail)
   (if ok
-      (begin
-        (set! pass-count (+ pass-count 1))
-        (println (format "  PASS  ~a  [~a]" name detail)))
-      (begin
-        (set! fail-count (+ fail-count 1))
-        (set! failures (cons name failures))
-        (println (format "  FAIL  ~a  [~a]" name detail)))))
+    (begin
+      (set! pass-count (+ pass-count 1))
+      (println (format "  PASS  ~a  [~a]" name detail)))
+    (begin
+      (set! fail-count (+ fail-count 1))
+      (set! failures (cons name failures))
+      (println (format "  FAIL  ~a  [~a]" name detail)))))
 ;; Soft check: environment-dependent legs (e.g. non-API external http in a
 ;; sandbox) warn instead of failing the run.
 (define (check-soft name ok detail)
   (if ok
-      (begin
-        (set! pass-count (+ pass-count 1))
-        (println (format "  PASS  ~a  [~a]" name detail)))
-      (println (format "  WARN  ~a  [~a]" name detail))))
+    (begin
+      (set! pass-count (+ pass-count 1))
+      (println (format "  PASS  ~a  [~a]" name detail)))
+    (println (format "  WARN  ~a  [~a]" name detail))))
 (define (elapsed-ms t0) (floor (/ (- (sys/elapsed) t0) 1000000)))
 
 ;; Tools + agents (top level; shared by several sections).
@@ -94,13 +95,17 @@
 (define t0b (sys/elapsed))
 (async/all
   (map (fn (p) (async/spawn (fn () (llm/complete p {:max-tokens 10}))))
-       (list "Reply with exactly: one" "Reply with exactly: two"
-             "Reply with exactly: three" "Reply with exactly: four")))
+    (list "Reply with exactly: one"
+      "Reply with exactly: two"
+      "Reply with exactly: three"
+      "Reply with exactly: four")))
 (define t-four (elapsed-ms t0b))
 (check "4 concurrent completes ≈ max not sum"
-       (< t-four (* 3 (+ t-single 1)))
-       (format "single=~ams, 4-concurrent=~ams (serial floor ≈ ~ams)"
-               t-single t-four (* 4 t-single)))
+  (< t-four (* 3 (+ t-single 1)))
+  (format "single=~ams, 4-concurrent=~ams (serial floor ≈ ~ams)"
+    t-single
+    t-four
+    (* 4 t-single)))
 
 ;; ── 2. Non-blocking agent/run: sibling runs DURING the rounds ────────────────
 (println "── 2. sibling task interleaves with a multi-round agent")
@@ -109,63 +114,76 @@
 (define t0c (sys/elapsed))
 (async/all
   (list
-    (async/spawn (fn ()
-      (dotimes (i 400) (async/sleep 10) (channel/send ticks 1))))
-    (async/spawn (fn ()
-      (agent/run stress-bot two-round-msg
-        {:on-tool-call (fn (ev)
-                         (when (= (:event ev) "start")
-                           (channel/send snaps (channel/count ticks))))})))))
+    (async/spawn
+      (fn ()
+        (dotimes (i 400)
+          (async/sleep 10)
+          (channel/send ticks 1))))
+    (async/spawn
+      (fn ()
+        (agent/run stress-bot
+          two-round-msg
+          {:on-tool-call (fn (ev)
+             (when (= (:event ev) "start")
+               (channel/send snaps (channel/count ticks))))})))))
 (define t-agent1 (elapsed-ms t0c))
 (define (drain-max ch acc)
   (let ((v (channel/try-recv ch)))
     (if (nil? v) acc (drain-max ch (max acc v)))))
 (define max-snap (drain-max snaps 0))
 (check "ticker advanced DURING agent tool rounds"
-       (> max-snap 0)
-       (format "ticks observed at a round start: ~a (agent wall ~ams)" max-snap t-agent1))
+  (> max-snap 0)
+  (format "ticks observed at a round start: ~a (agent wall ~ams)"
+    max-snap
+    t-agent1))
 
 ;; ── 3. Two concurrent agents overlap ─────────────────────────────────────────
 (println "── 3. two concurrent multi-round agents")
 (define t0d (sys/elapsed))
 (async/all
   (list (async/spawn (fn () (agent/run stress-bot two-round-msg)))
-        (async/spawn (fn () (agent/run stress-bot two-round-msg)))))
+    (async/spawn (fn () (agent/run stress-bot two-round-msg)))))
 (define t-two (elapsed-ms t0d))
 (check "2 concurrent agents ≈ max not sum (soft: live jitter)"
-       (< t-two (* 2 t-agent1))
-       (format "one agent=~ams, two concurrent=~ams" t-agent1 t-two))
+  (< t-two (* 2 t-agent1))
+  (format "one agent=~ams, two concurrent=~ams" t-agent1 t-two))
 
 ;; ── 4. Cancellation ──────────────────────────────────────────────────────────
 (println "── 4. cancellation cuts work short, runtime stays healthy")
 (define t0e (sys/elapsed))
 (try
   (async/timeout 1500
-    (async/spawn (fn ()
-      (llm/complete "Write a detailed 2000-word essay on the history of lighthouses."
-                    {:max-tokens 4000}))))
+    (async/spawn
+      (fn ()
+        (llm/complete
+          "Write a detailed 2000-word essay on the history of lighthouses."
+          {:max-tokens 4000}))))
   (catch e nil))
 (define t-cancel1 (elapsed-ms t0e))
 (check "slow completion cancelled promptly"
-       (< t-cancel1 6000)
-       (format "timeout 1500ms, returned after ~ams (in-flight round is discarded best-effort)" t-cancel1))
+  (< t-cancel1 6000)
+  (format
+    "timeout 1500ms, returned after ~ams (in-flight round is discarded best-effort)"
+    t-cancel1))
 
 (define t0f (sys/elapsed))
 (try
   (async/timeout 3500
-    (async/spawn (fn ()
-      (agent/run stress-bot
-        "Call the note tool 8 times with text='n1' through 'n8', one call per turn, then reply done."))))
+    (async/spawn
+      (fn ()
+        (agent/run stress-bot
+          "Call the note tool 8 times with text='n1' through 'n8', one call per turn, then reply done."))))
   (catch e nil))
 (define t-cancel2 (elapsed-ms t0f))
 (check "multi-round agent cancelled mid-conversation"
-       (< t-cancel2 10000)
-       (format "timeout 3500ms, returned after ~ams" t-cancel2))
+  (< t-cancel2 10000)
+  (format "timeout 3500ms, returned after ~ams" t-cancel2))
 
-(define post-cancel (llm/complete "Reply with exactly: healthy" {:max-tokens 10}))
+(define post-cancel
+  (llm/complete "Reply with exactly: healthy" {:max-tokens 10}))
 (check "runtime healthy after cancellations"
-       (> (string-length post-cancel) 0)
-       (format "follow-up reply: ~a" post-cancel))
+  (> (string-length post-cancel) 0)
+  (format "follow-up reply: ~a" post-cancel))
 
 ;; ── 5. Streaming ─────────────────────────────────────────────────────────────
 (println "── 5. streaming")
@@ -173,11 +191,11 @@
 ;; anthropic can legitimately deliver a one-liner as a single chunk.
 (define chunk-count 0)
 (llm/stream "Write six short sentences about the sea, one per line."
-            (fn (chunk) (set! chunk-count (+ chunk-count 1)))
-            {:max-tokens 250})
+  (fn (chunk) (set! chunk-count (+ chunk-count 1)))
+  {:max-tokens 250})
 (check "llm/stream delivers progressive chunks"
-       (> chunk-count 1)
-       (format "~a chunks" chunk-count))
+  (> chunk-count 1)
+  (format "~a chunks" chunk-count))
 
 ;; Streaming rounds are non-blocking in async context (ADR #68 streaming
 ;; extension): a ticker runs beside the agent's :on-text round; ticks observed
@@ -189,25 +207,32 @@
 (define stream-pair
   (async/all
     (list
-      (async/spawn (fn ()
-        (dotimes (i 300) (async/sleep 5) (channel/send stream-ticks 1))))
-      (async/spawn (fn ()
-        (agent/run stress-bot "Reply with a two-line haiku about async. Do not call tools."
-          {:on-text (fn (d)
-                      (set! delta-count (+ delta-count 1))
-                      (set! stream-snaps (cons (channel/count stream-ticks) stream-snaps)))}))))))
+      (async/spawn
+        (fn ()
+          (dotimes (i 300)
+            (async/sleep 5)
+            (channel/send stream-ticks 1))))
+      (async/spawn
+        (fn ()
+          (agent/run stress-bot
+            "Reply with a two-line haiku about async. Do not call tools."
+            {:on-text (fn (d)
+               (set! delta-count (+ delta-count 1))
+               (set! stream-snaps
+                 (cons (channel/count stream-ticks) stream-snaps)))}))))))
 (define stream-res (nth stream-pair 1))
 (define ticks-during-stream
   (if (> (length stream-snaps) 1)
-      (- (car stream-snaps) (car (reverse stream-snaps)))
-      0))
+    (- (car stream-snaps) (car (reverse stream-snaps)))
+    0))
 (check "agent/run :on-text streams deltas"
-       (and (> delta-count 0) (> (string-length (:response stream-res)) 0))
-       (format "~a deltas" delta-count))
+  (and (> delta-count 0) (> (string-length (:response stream-res)) 0))
+  (format "~a deltas" delta-count))
 (check-soft "sibling ticker advances BETWEEN :on-text deltas"
-       (> ticks-during-stream 0)
-       (format "~a ticks observed between first and last delta (needs a multi-chunk reply)"
-               ticks-during-stream))
+  (> ticks-during-stream 0)
+  (format
+    "~a ticks observed between first and last delta (needs a multi-chunk reply)"
+    ticks-during-stream))
 
 ;; ── 6. Mixed I/O storm ───────────────────────────────────────────────────────
 (println "── 6. mixed I/O storm (agent + completes + http + shell + ticker)")
@@ -215,31 +240,37 @@
 (define t0g (sys/elapsed))
 (define storm
   (async/all
-    (list
-      (async/spawn (fn () (agent/run stress-bot two-round-msg)))
-      (async/spawn (fn () (llm/complete "Reply with exactly: storm-a" {:max-tokens 10})))
-      (async/spawn (fn () (llm/complete "Reply with exactly: storm-b" {:max-tokens 10})))
+    (list (async/spawn (fn () (agent/run stress-bot two-round-msg)))
+      (async/spawn
+        (fn () (llm/complete "Reply with exactly: storm-a" {:max-tokens 10})))
+      (async/spawn
+        (fn () (llm/complete "Reply with exactly: storm-b" {:max-tokens 10})))
       ;; Non-API external http may be blocked in restricted environments (the
       ;; LLM APIs above prove the network itself is up) — soft-checked below.
-      (async/spawn (fn ()
-        (try (http/get "https://www.gstatic.com/generate_204")
-             (catch e {:status -1 :error (format "~a" e)}))))
+      (async/spawn
+        (fn ()
+          (try
+            (http/get "https://www.gstatic.com/generate_204")
+            (catch e {:status -1 :error (format "~a" e)}))))
       (async/spawn (fn () (shell "sleep 0.4 && echo storm-ok")))
-      (async/spawn (fn ()
-        (dotimes (i 200) (async/sleep 10) (channel/send storm-ticks 1)))))))
+      (async/spawn
+        (fn ()
+          (dotimes (i 200)
+            (async/sleep 10)
+            (channel/send storm-ticks 1)))))))
 (define t-storm (elapsed-ms t0g))
 (define storm-http (nth storm 3))
 (define storm-shell (nth storm 4))
 (check "storm: agent + completes + shell + ticker settled concurrently"
-       (and (> (string-length (:stdout storm-shell)) 0)
-            (> (channel/count storm-ticks) 0))
-       (format "wall ~ams; shell-out ~a chars; ticks ~a"
-               t-storm
-               (string-length (:stdout storm-shell))
-               (channel/count storm-ticks)))
+  (and (> (string-length (:stdout storm-shell)) 0)
+    (> (channel/count storm-ticks) 0))
+  (format "wall ~ams; shell-out ~a chars; ticks ~a"
+    t-storm
+    (string-length (:stdout storm-shell))
+    (channel/count storm-ticks)))
 (check-soft "storm: concurrent external http/get"
-       (and (>= (:status storm-http) 200) (< (:status storm-http) 300))
-       (format "status ~a (blocked-by-environment shows as -1)" (:status storm-http)))
+  (and (>= (:status storm-http) 200) (< (:status storm-http) 300))
+  (format "status ~a (blocked-by-environment shows as -1)" (:status storm-http)))
 
 ;; ── 7. Cache + budget ────────────────────────────────────────────────────────
 (println "── 7. cache-hit fast path + budget enforcement")
@@ -250,8 +281,8 @@
 (llm/with-cache (fn () (llm/complete cache-prompt {:max-tokens 12})))
 (define t-hit (elapsed-ms t0h))
 (check "second identical call is a cache hit (no provider round-trip)"
-       (< t-hit 300)
-       (format "hit served in ~ams" t-hit))
+  (< t-hit 300)
+  (format "hit served in ~ams" t-hit))
 
 (define budget-threw
   (try
@@ -260,19 +291,23 @@
         (fn ()
           (llm/complete "Reply with exactly: over-budget-a" {:max-tokens 30})
           (llm/complete "Reply with exactly: over-budget-b" {:max-tokens 30})))
-      false)
-    (catch e true)))
-(check "budget overrun raises" budget-threw "with-budget {:max-tokens 5} across 2 calls")
+      #f)
+    (catch e #t)))
+(check "budget overrun raises"
+  budget-threw
+  "with-budget {:max-tokens 5} across 2 calls")
 
 ;; ── 8. Sub-LLM inside a tool (yielding tool in task context) ─────────────────
 (println "── 8. tool that itself calls llm/complete")
 (define sub-res
   (async/await
-    (async/spawn (fn ()
-      (agent/run sub-llm-bot "Use your tool to ask: What is 2+2? Reply with the tool's answer.")))))
+    (async/spawn
+      (fn ()
+        (agent/run sub-llm-bot
+          "Use your tool to ask: What is 2+2? Reply with the tool's answer.")))))
 (check "agent tool ran a nested llm/complete inside a spawned task"
-       (> (string-length sub-res) 0)
-       (format "reply: ~a" sub-res))
+  (> (string-length sub-res) 0)
+  (format "reply: ~a" sub-res))
 
 ;; ── 9. Provider matrix (tool-loop correlation on real wire formats) ──────────
 (println "── 9. provider matrix")
@@ -284,13 +319,14 @@
   (define reply
     (try
       (async/await
-        (async/spawn (fn ()
-          (agent/run stress-bot two-round-msg))))
+        (async/spawn
+          (fn ()
+            (agent/run stress-bot two-round-msg))))
       (catch e (format "ERROR: ~a" e))))
   (check (format "~a: live 2-tool-round agent (correlation on real wire)" pname)
-         (and (> (string-length reply) 0)
-              (not (string/starts-with? reply "ERROR:")))
-         (format "model=~a wall=~ams reply=~a" model (elapsed-ms t0m) reply)))
+    (and (> (string-length reply) 0)
+      (not (string/starts-with? reply "ERROR:")))
+    (format "model=~a wall=~ams reply=~a" model (elapsed-ms t0m) reply)))
 
 (when (env "OPENAI_API_KEY") (matrix-run :openai "gpt-5.4-mini"))
 (when (env "GEMINI_API_KEY") (matrix-run :gemini "gemini-2.5-flash"))
@@ -298,11 +334,13 @@
 (llm/set-default provider)
 
 ;; ── Summary ──────────────────────────────────────────────────────────────────
-(println "\n══════════════════════════════════════════")
+(println
+  "\n══════════════════════════════════════════")
 (println (format "  ~a passed, ~a failed" pass-count fail-count))
 (when (> fail-count 0)
   (println (format "  failures: ~a" failures)))
 (println (format "  session usage: ~a" (llm/session-usage)))
-(println "══════════════════════════════════════════")
+(println
+  "══════════════════════════════════════════")
 (when (> fail-count 0) (exit 1))
 (println "ALL GREEN — the async work holds up against live providers.")

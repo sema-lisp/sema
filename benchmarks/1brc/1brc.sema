@@ -21,9 +21,9 @@
 ;; except when the true mean is an exact half-tenth (round's ties-to-even
 ;; can land 0.1 apart) — the benchmark generator's data has no such ties.
 (define (format-station name stats)
-  (let ((mn  (round1 (/ (nth stats 0) 10.0)))
+  (let ((mn (round1 (/ (nth stats 0) 10.0)))
         (avg (round1 (/ (/ (nth stats 2) 10.0) (nth stats 3))))
-        (mx  (round1 (/ (nth stats 1) 10.0))))
+        (mx (round1 (/ (nth stats 1) 10.0))))
     (format "~a=~a/~a/~a" name mn avg mx)))
 
 ;; --- Parse CLI arguments (after "--") ---
@@ -46,26 +46,27 @@
 (define result
   (file/fold-lines-bytes input-file
     (fn (acc line)
-      (let ((semi (bytes/find line 59)))          ; 59 = ';'
+      (let ((semi (bytes/find line 59))) ; 59 = ';'
         (if semi
-            (let* ((name (bytes/->string line 0 semi))
-                   (temp (bytes/parse-int10 line (+ semi 1)))
-                   (stats (get acc name)))
-              (if stats
-                  (begin
-                    (when (< temp (nth stats 0)) (mutable-array/set! stats 0 temp))
-                    (when (> temp (nth stats 1)) (mutable-array/set! stats 1 temp))
-                    (mutable-array/set! stats 2 (+ (nth stats 2) temp))
-                    (mutable-array/set! stats 3 (+ (nth stats 3) 1))
-                    acc)
-                  (let ((e (mutable-array/new 4 temp)))
-                    (mutable-array/set! e 3 1)
-                    (assoc acc name e))))
-            acc)))
+          (let* ((name (bytes/->string line 0 semi))
+                 (temp (bytes/parse-int10 line (+ semi 1)))
+                 (stats (get acc name)))
+            (if stats
+              (begin
+                (when (< temp (nth stats 0)) (mutable-array/set! stats 0 temp))
+                (when (> temp (nth stats 1)) (mutable-array/set! stats 1 temp))
+                (mutable-array/set! stats 2 (+ (nth stats 2) temp))
+                (mutable-array/set! stats 3 (+ (nth stats 3) 1))
+                acc)
+              (let ((e (mutable-array/new 4 temp)))
+                (mutable-array/set! e 3 1)
+                (assoc acc name e))))
+          acc)))
     (hashmap/new)))
 
 (define t1 (time-ms))
-(println (format "Processed ~a stations in ~a ms" (length (keys result)) (- t1 t0)))
+(println
+  (format "Processed ~a stations in ~a ms" (length (keys result)) (- t1 t0)))
 
 ;; --- Phase 3: Format output ---
 (define sorted-result (hashmap/to-map result))
@@ -73,7 +74,7 @@
 
 (define formatted
   (map (fn (name) (format-station name (get result name)))
-       sorted-names))
+    sorted-names))
 
 (define output (string-append "{" (string/join formatted ", ") "}"))
 

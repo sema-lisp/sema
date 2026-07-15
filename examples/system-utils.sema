@@ -11,8 +11,8 @@
 (println (format "CLI args:  ~a" (length args)))
 
 ;; Selected environment variables
-(define env-vars          (sys/env-all))
-(define interesting-keys  (list :HOME :USER :SHELL :TERM :LANG))
+(define env-vars (sys/env-all))
+(define interesting-keys (list :HOME :USER :SHELL :TERM :LANG))
 (println "\nEnvironment:")
 (for-each
   (fn (key)
@@ -61,9 +61,9 @@
 (println (format "\nFiles in ~a:" work-dir))
 (for-each
   (fn (name)
-    (let* ((full-path  (path/join work-dir name))
-           (info       (file/info full-path))
-           (ext        (path/extension name)))
+    (let* ((full-path (path/join work-dir name))
+           (info (file/info full-path))
+           (ext (path/extension name)))
       (println
         (format "  ~a  ~a bytes  ext=~a"
           (string/pad-right name 20)

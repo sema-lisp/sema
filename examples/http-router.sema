@@ -10,8 +10,7 @@
   (list/find #(= (get % :id) id) users))
 
 (define (handle-request req)
-  (match
-    req
+  (match req
     ;; GET /users/:id — specific user (must come before catch-all GET)
     ({:method :GET :path "/users" :id id} when
       (find-user id)

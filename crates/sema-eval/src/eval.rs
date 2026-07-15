@@ -3645,6 +3645,30 @@ mod runtime_eval_tests {
         assert_runtime_matches_oracle(program);
     }
 
+    // ── ROBUSTNESS GATE 3b: bounded executor drop-join ───────────────────────
+    //
+    // Dropping an `Interpreter` (hence its `Runtime` + real `ThreadPoolExecutor`)
+    // while an external-wait executor job is in flight must complete cleanly and
+    // BOUNDED: no `"Resource deadlock avoided"` self-join panic, no hang, no
+    // abort. A detached task blocking-`sleep`s via the executor; the root returns
+    // immediately, so the executor job is genuinely in flight at drop time.
+    #[test]
+    fn runtime_drop_with_inflight_executor_job_is_bounded() {
+        let start = std::time::Instant::now();
+        let interp = Interpreter::new();
+        interp
+            .eval_str_via_runtime("(async/spawn (fn () (sleep 100000) 1)) 7")
+            .expect("root returns while a detached blocking sleep is in flight");
+        drop(interp);
+        let elapsed = start.elapsed();
+        // The interpreter Drop uses a 2s shutdown deadline; drop must return near
+        // that bound, never wait out the 100s sleep and never hang.
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "interpreter drop with an in-flight executor job must be bounded, took {elapsed:?}"
+        );
+    }
+
     fn common_list(items: &[Value]) -> Value {
         Value::list(items.to_vec())
     }

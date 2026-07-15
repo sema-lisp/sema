@@ -120,6 +120,18 @@ impl Default for ThreadPoolExecutor {
     }
 }
 
+impl Drop for ThreadPoolExecutor {
+    fn drop(&mut self) {
+        // Liveness backstop: disconnect the sender so idle workers observe the
+        // channel close and exit even if `shutdown` was never called. Without
+        // this, workers block on `recv` forever (the tx lives inside the
+        // `Arc<PoolInner>` they themselves keep alive), so `PoolInner::Drop`
+        // would never run and the threads would leak. Idempotent with
+        // `PoolInner::shutdown`, which also takes the sender.
+        self.inner.tx.lock().expect("pool sender lock").take();
+    }
+}
+
 impl IoExecutor for ThreadPoolExecutor {
     fn attach_runtime(
         &self,
@@ -250,7 +262,18 @@ impl Drop for PoolInner {
         // exits as soon as that finite job returns, so the join is bounded.
         self.tx.lock().expect("pool sender lock").take();
         let handles = std::mem::take(&mut *self.handles.lock().expect("pool handles lock"));
+        // A worker holds its own `Arc<PoolInner>`, and `PoolInner` owns that
+        // worker's `JoinHandle` — so once the tx drops and the workers exit,
+        // the LAST worker to release its `Arc` runs *this* `Drop` on its own
+        // thread. Joining that thread's own handle would be a self-join
+        // (`EDEADLK` — "Resource deadlock avoided"). Skip the current thread's
+        // handle and detach it; it is already returning from `worker_loop`, so
+        // nothing leaks and the remaining workers still join cleanly.
+        let current = std::thread::current().id();
         for handle in handles {
+            if handle.thread().id() == current {
+                continue;
+            }
             let _ = handle.join();
         }
     }
@@ -461,6 +484,46 @@ mod thread_pool_tests {
         assert!(shutdown_start.elapsed() < Duration::from_millis(200));
         drop(lease);
         drop(executor);
+    }
+
+    /// Dropping the executor and its lease WITHOUT calling `shutdown` — while a
+    /// job is still in flight — must return promptly (bounded) and never deadlock
+    /// or hang. The `ThreadPoolExecutor::Drop` backstop disconnects the sender so
+    /// idle workers exit, and the in-flight worker detaches once its finite job
+    /// returns (delivering its completion to a now-closed inbox). Guards against
+    /// the self-join `EDEADLK` when the last `Arc<PoolInner>` releases on a worker
+    /// thread.
+    #[test]
+    fn drop_without_shutdown_is_bounded() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let registrar_sender = Arc::new(ChannelSender(Mutex::new(tx)));
+        let (runtime_id, registrar, _issuers) =
+            CompletionRegistrar::register(registrar_sender).unwrap();
+        let executor = ThreadPoolExecutor::with_workers(2);
+        let lease = executor.attach_runtime(runtime_id).unwrap();
+        let identity = registrar
+            .issue_identity(CompletionKind::try_from_raw(1).unwrap())
+            .unwrap();
+        let (_runtime, submission) = registrar
+            .bind(identity, blocking_sleep_op(80))
+            .unwrap()
+            .split();
+        assert!(lease.submit(submission).is_ok(), "submission admitted");
+
+        // No `shutdown` call: just drop the lease then the executor. Both must
+        // return promptly without waiting out the job and without a self-join
+        // panic (the in-flight worker keeps `PoolInner` alive until its job ends,
+        // then runs `Drop` on itself — the self-join must be skipped, not aborted).
+        let start = Instant::now();
+        drop(lease);
+        drop(executor);
+        assert!(
+            start.elapsed() < Duration::from_millis(50),
+            "dropping the executor must not block on the in-flight job"
+        );
+        // Give the detached worker time to finish its job and self-drop the pool;
+        // a self-join regression would panic/abort on that worker thread.
+        std::thread::sleep(Duration::from_millis(200));
     }
 
     /// Shutdown while a job is in flight is bounded and never hangs.

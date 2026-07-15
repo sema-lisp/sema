@@ -42,7 +42,7 @@ duration/capacity validation slice landed 3 GREEN). All other suites pass.
 ### Task 04 "Duration and capacity validation" — now GREEN
 
 The three duration/capacity validation tests moved from EXPECTED-RED to GREEN in
-the Task 04 slice (commit `202739e4`). They exercise the shared native parsing
+the Task 04 slice (commit `98790706`). They exercise the shared native parsing
 helpers, so both the legacy and runtime paths benefit.
 
 | Test | Binary | Classification | Fix |

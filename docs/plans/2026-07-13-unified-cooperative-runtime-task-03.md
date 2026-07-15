@@ -1034,6 +1034,78 @@ occurrence and classification in evidence.
       05/06) AND (C) an open-upvalue-escape correctness bug in the module-imported
       HOF `NativeOutcome::Call` dispatch path under the runtime (a Task-04-adjacent
       callback-re-entry fix). Gap (A) is retired._
+    - _MILESTONE re-measure (2026-07-15, after the real `ThreadPoolExecutor`
+      landed in `build_runtime` — commits af2d1ceb/414877c0 — plus the blocking
+      `sleep`/`mcp/call` external-wait migration and the open-upvalue ABI fix
+      f297b9ef, i.e. gaps A/B/C all claimed closed): SAME flip re-applied and
+      the ALSO-flip of `eval_str_compiled` attempted. MEASURED → REVERTED.
+      The interpreter's persistent runtime now uses the real executor
+      (`ThreadPoolExecutor`), and `run_exprs_via_runtime` gained a full idle
+      drive (block-on-inbox for `inbox_wakeup_required`, timer-deadline sleep) —
+      so the executor gap is NO LONGER the blocker. Two NEW, deeper blockers:_
+        1. _PRIMARY flip (`eval`/`eval_str` → runtime) + the `VM::execute`
+           quantum-suspend bridge: eval_test **1072/0**, integration_test
+           **1055/0** held, and the fragile async suites stayed green
+           (embedding_api 14/0, mcp_async 8/0, llm_fake 29/0, agent_async 7/0,
+           workflow_cookbook 6/0, stream_async 10/0, http_concurrent 3/0,
+           leak 7/0, gc_stress 48/0). BUT `mcp_builtin_test` regressed
+           **6/0 → 4/2**: `test_mcp_agent_tool_call_round_trips_arguments`
+           (agent/run returns the raw tool output `"ping"` instead of continuing
+           to the model's final `"all done"` — the multi-turn loop stops after
+           one tool turn) and `test_mcp_tool_error_surfaces_to_agent` (the mcp
+           tool error `kaboom` escapes `agent/run` as a hard `WithTrace` failure
+           instead of being caught + fed back so the model recovers). ROOT CAUSE:
+           the native `agent/run` tool loop (sema-llm `run_tool_loop` /
+           `execute_tool_call` → `call_callback` for both the tool handler AND the
+           `complete` provider call) is synchronous run-to-completion code; when
+           `agent/run` is entered via `eval_str`→runtime, its tools/`mcp/call`
+           become runtime external-waits the native loop cannot cooperatively
+           drive, so turn continuation + tool-error recovery break. A
+           `suspend_runtime_quantum` bridge at the tool-dispatch site did NOT fix
+           it (the provider `complete` callback is on the same re-entry path).
+           This is the Task 04 callback-re-entry ABI surfacing through the native
+           agent loop — same class as gaps A/C, a DIFFERENT re-entry site._
+        2. _FULL flip (ALSO `eval_str_compiled`, which backs `common::eval` — the
+           eval_test oracle — and CLI `-e`): NON-VIABLE. eval_test **SIGABRTs**:
+           `deep_structure_str_no_abort` overflows its native stack
+           ("fatal runtime error: stack overflow, aborting", signal 6) — the
+           runtime's per-quantum drive machinery consumes more native stack than
+           the legacy `vm.execute` entry, tipping a deliberately-deep-recursion
+           oracle over. vm_async_test **114/4 → 106/12** (+8): (i) missing
+           runtime-side deadlock/all-blocked detection — a top-level
+           `(channel/recv (channel/new 1))` / full `channel/send` / two-task
+           mutual wait parks forever; the `run_exprs_via_runtime` drive loop hits
+           an unhandled `DriveState::Idle{next_deadline:None,
+           inbox_wakeup_required:false,legacy_io_wakeup_required:false}` and errors
+           "root did not settle" instead of the legacy synchronous "empty"/"full"/
+           "deadlock detected" (`channel_recv_empty_error`, `channel_send_full_error`,
+           `deadlock_detected_two_tasks_waiting`); (ii) CHANGED top-level
+           synchronous channel-error semantics (in a runtime quantum channel ops
+           always park/yield rather than raising the synchronous "empty"/"full"
+           error — an oracle-weakening change); (iii) runtime cancel/pending
+           correctness (`async_pending_predicate`, `cancel_pending_task`,
+           `cancelled_promise_classifies_correctly` return wrong values) and
+           ordering (`event_select_yields_to_sibling_in_async_context`,
+           `retry_backoff_yields_lets_sibling_complete_first`); (iv) DROP-time
+           `failed to join thread: Resource deadlock avoided (os error 11)` when
+           the interpreter's real-executor runtime drops with parked tasks._
+      _DECISION: REVERTED both to the exact green baseline — no code changed
+      (eval_test 1072/0, integration_test 1055/0, vm_async_test 114/4 documented
+      RED, mcp_builtin_test 6/0, embedding_api 14/0, mcp_async 8/0;
+      `cargo check --workspace --tests` exit 0). Breakage is systemic (native
+      agent-loop re-entry across the pervasive `eval_str` path; eval_test SIGABRT;
+      an oracle-weakening channel-semantics change) — per the flip mandate's
+      revert rule. ASSESSMENT: gap (B)'s executor is now in place, but three
+      NEW/adjacent blockers gate the flip: (1) the callback-re-entry ABI for
+      NATIVE synchronous loops (`agent/run`, `llm/map`, streaming) — the Task 04
+      `NativeOutcome::Call` migration must cover native call_callback loops, not
+      only stdlib HOFs; (2) runtime-side deadlock/all-blocked detection + a host
+      drive-loop policy that settles the root with a legacy-parity error
+      (surfacing "empty"/"full"/"deadlock") when all tasks are permanently blocked;
+      (3) native-stack budget of the runtime drive (deep-recursion parity) and a
+      bounded interpreter-drop join for the real executor. Until these land,
+      `eval_str_compiled`/`common::eval` cannot flip, and even the primary
+      `eval`/`eval_str` flip breaks the native agent loop._
 
 - [ ] **Step 3: Remove TLS scheduler ownership**
 

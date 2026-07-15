@@ -214,3 +214,98 @@ migration. Two blockers remain: (B) the real executor / concurrent blocking I/O
 (Task 05/06), and (C) an open-upvalue-escape correctness bug in the
 module-imported HOF `NativeOutcome::Call` dispatch path under the runtime — a
 Task-04-adjacent callback-re-entry fix, independent of the executor.
+
+## Task 03 Step 2 — eval flip MILESTONE re-measure post real-executor: MEASURED → REVERTED (2026-07-15)
+
+Re-ran the flip AFTER the real `ThreadPoolExecutor` landed in the interpreter's
+persistent runtime (`build_runtime` in eval.rs now uses `ThreadPoolExecutor::new`,
+not `NullExecutor`), `run_exprs_via_runtime` gained a full idle drive
+(`block_on_inbox` for `inbox_wakeup_required`, timer-deadline sleep), and the
+blocking `sleep`/`mcp/call` external-wait migration + open-upvalue ABI fix
+(f297b9ef) landed — i.e. gaps A/B/C all claimed closed. The executor gap is no
+longer the blocker; **two new/deeper blockers surfaced. REVERTED.**
+
+Changes measured (then reverted): (1) `eval_in_global`/`eval_str_in_global` →
+`run_exprs_via_runtime` (primary flip); (2) the `VM::execute`
+`suspend_runtime_quantum()` bridge for `eval`/`load`/`import` synchronous
+re-entry; (3) ALSO `eval_str_compiled` → runtime (full flip); (4) a
+`suspend_runtime_quantum` bridge at the `agent/run` tool-dispatch site
+(`sema-llm execute_tool_call`) — which did NOT fix the agent-loop breakage.
+
+### PRIMARY flip alone (`eval`/`eval_str`) — held the oracles but broke the native agent loop
+- eval_test **1072/0**, integration_test **1055/0** held. Fragile async suites
+  green: embedding_api **14/0**, mcp_async **8/0**, llm_fake **29/0**,
+  agent_async **7/0**, workflow_cookbook **6/0**, stream_async **10/0**,
+  http_concurrent **3/0**, leak **7/0**, gc_stress **48/0**.
+- `mcp_builtin_test` regressed **6/0 → 4/2** (previously green, NOT in any RED
+  baseline):
+  - `test_mcp_agent_tool_call_round_trips_arguments` — `agent/run` returns the
+    raw tool output `"ping"` instead of the model's final `"all done"`; the
+    multi-turn loop stops after one tool turn.
+  - `test_mcp_tool_error_surfaces_to_agent` — the mcp tool error `kaboom` escapes
+    `agent/run` as a hard `WithTrace` failure instead of being caught and fed back
+    for the model to recover with `"recovered"`.
+  - ROOT CAUSE: the native `agent/run` loop (sema-llm `run_tool_loop` /
+    `execute_tool_call` → `call_callback` for the tool handler AND the provider
+    `complete`) is synchronous run-to-completion code. Entered via
+    `eval_str`→runtime, its tools/`mcp/call`/`complete` become runtime
+    external-waits the native loop can't cooperatively drive → turn continuation
+    and tool-error recovery break. This is the Task 04 callback-re-entry ABI
+    surfacing at a NATIVE loop re-entry site (a different site than the stdlib-HOF
+    gap A/C already migrated).
+
+### FULL flip (ALSO `eval_str_compiled`, backing `common::eval` + CLI `-e`) — NON-VIABLE
+- eval_test **SIGABRTs**: `deep_structure_str_no_abort` overflows its native
+  stack ("fatal runtime error: stack overflow, aborting", signal 6). The
+  runtime's per-quantum drive machinery uses more native stack than the legacy
+  `vm.execute` entry, tipping a deliberately-deep-recursion oracle over. This
+  aborts the whole eval_test binary — the correctness oracle is unusable.
+- vm_async_test **114/4 → 106/12** (+8 new failures), spanning FOUR causes:
+  1. **Missing runtime-side deadlock/all-blocked detection.** Top-level
+     `(channel/recv (channel/new 1))`, full `channel/send`, and a two-task mutual
+     wait park forever; the `run_exprs_via_runtime` drive loop hits an unhandled
+     `DriveState::Idle{next_deadline:None, inbox_wakeup_required:false,
+     legacy_io_wakeup_required:false}` and errors "root did not settle" instead of
+     the legacy synchronous "empty"/"full"/"deadlock detected"
+     (`channel_recv_empty_error`, `channel_send_full_error`,
+     `deadlock_detected_two_tasks_waiting`).
+  2. **Changed top-level synchronous channel-error semantics** — under a runtime
+     quantum, `channel/recv`/`channel/send` always park/yield rather than raising
+     the synchronous "empty"/"full" error. Making these pass would WEAKEN the
+     oracle (change the documented top-level error contract).
+  3. **Runtime cancel/pending correctness + ordering** — `async_pending_predicate`,
+     `cancel_pending_task`, `cancelled_promise_classifies_correctly` return wrong
+     values; `event_select_yields_to_sibling_in_async_context`,
+     `retry_backoff_yields_lets_sibling_complete_first`,
+     `blocking_sleep_hook_receives_clock_advances` diverge on ordering/hook use.
+  4. **Drop-time thread-join deadlock** — `failed to join thread: Resource
+     deadlock avoided (os error 11)` when the interpreter's real-executor runtime
+     drops with parked tasks.
+
+### DECISION: REVERTED to the exact green baseline (no code changed)
+eval_test **1072/0**, integration_test **1055/0**, vm_async_test **114/4**
+(documented RED), mcp_builtin_test **6/0**, embedding_api_test **14/0**,
+mcp_async_test **8/0**. `cargo check --workspace --tests` exit 0. Breakage is
+systemic (native agent-loop re-entry across the pervasive `eval_str` path;
+eval_test SIGABRT; an oracle-weakening channel-semantics change) — per the flip
+mandate's revert rule ("revert if breakage is large/systemic or an oracle would
+have to be weakened").
+
+### What now stands between here and "legacy scheduler deletable" (Task 08)
+Gap (B)'s executor is IN PLACE; the remaining blockers are:
+1. **Callback-re-entry ABI for NATIVE synchronous loops (Task 04, widened).** The
+   `NativeOutcome::Call` migration must cover native `call_callback` loops
+   (`agent/run`/`run_tool_loop`, `llm/map`, streaming), not only stdlib HOFs, so
+   an agent tool doing `mcp/call`/HTTP through the runtime cooperatively drives
+   its multi-turn loop and preserves tool-error recovery.
+2. **Runtime-side deadlock/all-blocked detection + host drive-loop policy** that
+   settles the root with a legacy-parity error ("empty"/"full"/"deadlock") when
+   all tasks are permanently blocked — plus a decision on top-level synchronous
+   channel-op semantics (park vs. immediate error) that does NOT weaken the
+   vm_async_test oracles.
+3. **Native-stack budget of the runtime drive** (deep-recursion parity with the
+   legacy `vm.execute` entry) and a **bounded interpreter-drop join** for the real
+   executor (no `Resource deadlock avoided`).
+Until (1)–(3) land, `eval_str_compiled`/`common::eval` cannot flip, and even the
+primary `eval`/`eval_str` flip breaks the native agent loop. The `*_via_runtime`
+entry points remain available for incremental validation.

@@ -927,7 +927,7 @@ impl Runtime {
             // the quarantine/wall-clock checks for skipping the syscall on
             // the other 63 iterations out of every 64.
             iters = iters.wrapping_add(1);
-            if iters % 64 == 0 {
+            if iters.is_multiple_of(64) {
                 clock_now = self.state.borrow().clock.now();
             }
             // The cooperative debug barrier is armed (a task paused at a

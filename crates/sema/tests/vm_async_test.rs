@@ -1956,7 +1956,11 @@ fn nested_async_run_waits_for_inner_barrier() {
                  (println (mutable-cell/get c)))"#,
             std::time::Duration::from_secs(15),
         );
-        assert!(!run.timed_out, "nested async/run hung; stderr:\n{}", run.stderr);
+        assert!(
+            !run.timed_out,
+            "nested async/run hung; stderr:\n{}",
+            run.stderr
+        );
         assert!(run.status.success(), "run failed; stderr:\n{}", run.stderr);
         assert!(
             run.stdout.trim().ends_with('6'),
@@ -2018,7 +2022,11 @@ fn nested_async_run_waits_across_reaped_parent() {
                  (println (mutable-cell/get c)))"#,
             std::time::Duration::from_secs(15),
         );
-        assert!(!run.timed_out, "reaped-parent nested async/run hung; stderr:\n{}", run.stderr);
+        assert!(
+            !run.timed_out,
+            "reaped-parent nested async/run hung; stderr:\n{}",
+            run.stderr
+        );
         assert!(run.status.success(), "run failed; stderr:\n{}", run.stderr);
         assert!(
             run.stdout.trim().ends_with('6'),

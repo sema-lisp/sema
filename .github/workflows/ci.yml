@@ -73,3 +73,28 @@ jobs:
         uses: codecov/codecov-action@v5
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
+
+  # Windows leg (advisory until first green, then drop continue-on-error and
+  # treat as required). The nextest `ci` profile's slow-timeout
+  # (120s x terminate-after 3) is the hang watchdog: a wedged async-runtime
+  # test surfaces as a terminated slow test, not a silent 6h job. Known
+  # platform limitation: subprocess eager-cancel (`group_sigkill_abort`) is a
+  # documented no-op off Unix, so cancel tests that assert child teardown are
+  # expected to need `cfg(unix)` gating in the first fix wave.
+  test-windows:
+    runs-on: windows-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo + target
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
+
+      - name: Run tests
+        run: cargo nextest run --workspace --profile ci

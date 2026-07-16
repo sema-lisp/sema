@@ -23,7 +23,7 @@ use similar::TextDiff;
 
 use crate::register_fn;
 #[cfg(not(target_arch = "wasm32"))]
-use {crate::register_fn_gated, sema_core::Caps};
+use {crate::register_runtime_fn_gated, sema_core::runtime::NativeOutcome, sema_core::Caps};
 
 /// A single parsed hunk header `@@ -old_start,old_count +new_start,new_count @@`
 /// together with the body lines that follow it.
@@ -467,7 +467,7 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
     // (patch/apply-file path patch) -> number of hunks applied (int)
     // Touches the real filesystem (not the VFS), so it's native-only.
     #[cfg(not(target_arch = "wasm32"))]
-    register_fn_gated(env, sandbox, Caps::FS_WRITE, "patch/apply-file", |args| {
+    register_runtime_fn_gated(env, sandbox, Caps::FS_WRITE, "patch/apply-file", |args| {
         check_arity!(args, "patch/apply-file", 2);
         let path = args[0]
             .as_str()
@@ -478,14 +478,21 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
             .ok_or_else(|| SemaError::type_error("string", args[1].type_name()))?
             .to_string();
 
-        if sema_core::in_async_context() || sema_core::in_runtime_quantum() {
+        if sema_core::in_runtime_quantum() {
+            return crate::io::quarantined_compute("patch/apply-file", Value::int, move || {
+                patch_apply_file_work(&path, &patch).map_err(|e| e.to_string())
+            });
+        }
+        if sema_core::in_async_context() {
             return crate::io::fs_offload(
                 move || patch_apply_file_work(&path, &patch).map_err(|e| e.to_string()),
                 Value::int,
-            );
+            )
+            .map(NativeOutcome::Return);
         }
-        let count = patch_apply_file_work(&path, &patch)?;
-        Ok(Value::int(count))
+        Ok(NativeOutcome::Return(Value::int(patch_apply_file_work(
+            &path, &patch,
+        )?)))
     });
 }
 

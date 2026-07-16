@@ -12,7 +12,15 @@
 
 use std::collections::BTreeMap;
 
+use sema_core::runtime::NativeOutcome;
 use sema_core::{check_arity, in_async_context, Caps, SemaError, Value};
+
+/// Decode `pdf/extract-text-pages`'s off-thread result (per-page `String`s) into
+/// a Sema list on the VM thread. A plain `fn` (no captures) so it fits the
+/// `fn(T) -> Value` decoder slots of `fs_offload`/`quarantined_compute`.
+fn pages_to_value(pages: Vec<String>) -> Value {
+    Value::list(pages.iter().map(|s| Value::string(s)).collect())
+}
 
 /// `pdf/extract-text`'s actual work. Shared verbatim by the sync and
 /// offloaded-async paths.
@@ -116,7 +124,7 @@ fn metadata_to_value(m: PdfMetadata) -> Value {
 }
 
 pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
-    crate::register_fn_path_gated(
+    crate::register_runtime_fn_path_gated(
         env,
         sandbox,
         Caps::FS_READ,
@@ -129,18 +137,27 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
                 .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?
                 .to_string();
 
-            if in_async_context() || sema_core::in_runtime_quantum() {
+            if sema_core::in_runtime_quantum() {
+                return crate::io::quarantined_compute(
+                    "pdf/extract-text",
+                    Value::string_owned,
+                    move || extract_text_work(&path).map_err(|e| e.to_string()),
+                );
+            }
+            if in_async_context() {
                 return crate::io::fs_offload(
                     move || extract_text_work(&path).map_err(|e| e.to_string()),
                     Value::string_owned,
-                );
+                )
+                .map(NativeOutcome::Return);
             }
-            let text = extract_text_work(&path)?;
-            Ok(Value::string(&text))
+            Ok(NativeOutcome::Return(Value::string(&extract_text_work(
+                &path,
+            )?)))
         },
     );
 
-    crate::register_fn_path_gated(
+    crate::register_runtime_fn_path_gated(
         env,
         sandbox,
         Caps::FS_READ,
@@ -153,21 +170,27 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
                 .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?
                 .to_string();
 
-            if in_async_context() || sema_core::in_runtime_quantum() {
-                return crate::io::fs_offload(
+            if sema_core::in_runtime_quantum() {
+                return crate::io::quarantined_compute(
+                    "pdf/extract-text-pages",
+                    pages_to_value,
                     move || extract_text_pages_work(&path).map_err(|e| e.to_string()),
-                    |pages: Vec<String>| {
-                        Value::list(pages.iter().map(|s| Value::string(s)).collect())
-                    },
                 );
             }
-            let pages = extract_text_pages_work(&path)?;
-            let values: Vec<Value> = pages.iter().map(|s| Value::string(s)).collect();
-            Ok(Value::list(values))
+            if in_async_context() {
+                return crate::io::fs_offload(
+                    move || extract_text_pages_work(&path).map_err(|e| e.to_string()),
+                    pages_to_value,
+                )
+                .map(NativeOutcome::Return);
+            }
+            Ok(NativeOutcome::Return(pages_to_value(
+                extract_text_pages_work(&path)?,
+            )))
         },
     );
 
-    crate::register_fn_path_gated(
+    crate::register_runtime_fn_path_gated(
         env,
         sandbox,
         Caps::FS_READ,
@@ -180,31 +203,52 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
                 .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?
                 .to_string();
 
-            if in_async_context() || sema_core::in_runtime_quantum() {
+            if sema_core::in_runtime_quantum() {
+                return crate::io::quarantined_compute("pdf/page-count", Value::int, move || {
+                    page_count_work(&path).map_err(|e| e.to_string())
+                });
+            }
+            if in_async_context() {
                 return crate::io::fs_offload(
                     move || page_count_work(&path).map_err(|e| e.to_string()),
                     Value::int,
-                );
+                )
+                .map(NativeOutcome::Return);
             }
-            let count = page_count_work(&path)?;
-            Ok(Value::int(count))
+            Ok(NativeOutcome::Return(Value::int(page_count_work(&path)?)))
         },
     );
 
-    crate::register_fn_path_gated(env, sandbox, Caps::FS_READ, "pdf/metadata", &[0], |args| {
-        check_arity!(args, "pdf/metadata", 1);
-        let path = args[0]
-            .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?
-            .to_string();
+    crate::register_runtime_fn_path_gated(
+        env,
+        sandbox,
+        Caps::FS_READ,
+        "pdf/metadata",
+        &[0],
+        |args| {
+            check_arity!(args, "pdf/metadata", 1);
+            let path = args[0]
+                .as_str()
+                .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?
+                .to_string();
 
-        if in_async_context() || sema_core::in_runtime_quantum() {
-            return crate::io::fs_offload(
-                move || metadata_work(&path).map_err(|e| e.to_string()),
-                metadata_to_value,
-            );
-        }
-        let meta = metadata_work(&path)?;
-        Ok(metadata_to_value(meta))
-    });
+            if sema_core::in_runtime_quantum() {
+                return crate::io::quarantined_compute(
+                    "pdf/metadata",
+                    metadata_to_value,
+                    move || metadata_work(&path).map_err(|e| e.to_string()),
+                );
+            }
+            if in_async_context() {
+                return crate::io::fs_offload(
+                    move || metadata_work(&path).map_err(|e| e.to_string()),
+                    metadata_to_value,
+                )
+                .map(NativeOutcome::Return);
+            }
+            Ok(NativeOutcome::Return(metadata_to_value(metadata_work(
+                &path,
+            )?)))
+        },
+    );
 }

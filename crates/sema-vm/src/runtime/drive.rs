@@ -60,7 +60,6 @@ pub enum DriveState {
     Idle {
         next_deadline: Option<Instant>,
         inbox_wakeup_required: bool,
-        legacy_io_wakeup_required: bool,
     },
     Quiescent,
     ShutdownComplete,

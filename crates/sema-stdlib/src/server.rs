@@ -1,8 +1,49 @@
 use std::collections::BTreeMap;
 
+use sema_core::runtime::NativeOutcome;
 use sema_core::{check_arity, value_to_json_lossy, SemaError, Value};
 
 use crate::register_fn;
+
+/// Decode `http/file`'s off-thread canonicalize+mime result into the `__file`
+/// marker map on the VM thread. A plain `fn` (no captures) so it fits the
+/// `fn(T) -> Value` decoder slot of `quarantined_compute`/`fs_offload`.
+fn http_file_marker(resolved: (String, String)) -> Value {
+    let (path_str, content_type) = resolved;
+    let mut map = BTreeMap::new();
+    map.insert(Value::keyword("__file"), Value::bool(true));
+    map.insert(Value::keyword("__file_path"), Value::string(&path_str));
+    map.insert(
+        Value::keyword("__file_content_type"),
+        Value::string(&content_type),
+    );
+    Value::map(map)
+}
+
+/// Decode a `:static`-route file request's off-thread canonicalize result into
+/// the response the sync path builds: a 403 map on symlink escape, else the
+/// `__file` marker map. Non-capturing `fn` for the `quarantined_compute`/
+/// `fs_offload` decoder slot.
+fn static_file_response(resolved: (bool, String, String)) -> Value {
+    let (escapes, path_str, content_type) = resolved;
+    if escapes {
+        let mut headers = BTreeMap::new();
+        headers.insert(Value::string("content-type"), Value::string("text/plain"));
+        let mut result = BTreeMap::new();
+        result.insert(Value::keyword("status"), Value::int(403));
+        result.insert(Value::keyword("headers"), Value::map(headers));
+        result.insert(Value::keyword("body"), Value::string("Forbidden"));
+        return Value::map(result);
+    }
+    let mut map = BTreeMap::new();
+    map.insert(Value::keyword("__file"), Value::bool(true));
+    map.insert(Value::keyword("__file_path"), Value::string(&path_str));
+    map.insert(
+        Value::keyword("__file_content_type"),
+        Value::string(&content_type),
+    );
+    Value::map(map)
+}
 
 fn value_to_json_lossy_string(val: &Value) -> Result<String, String> {
     serde_json::to_string(&value_to_json_lossy(val)).map_err(|e| e.to_string())
@@ -167,7 +208,7 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
         Ok(Value::map(result))
     });
 
-    crate::register_fn_path_gated(
+    crate::register_runtime_fn_path_gated(
         env,
         sandbox,
         sema_core::Caps::FS_READ,
@@ -204,65 +245,35 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
                 None
             };
 
-            // Inside `async/spawn`: offload the `canonicalize()` (symlink/`..`
-            // resolution, can hit multiple syscalls) and the extension-based
-            // mime guess onto the I/O pool so a slow/cold filesystem doesn't
-            // stall the single cooperative VM thread. Both are pure, Send-safe
-            // computations over owned paths/strings — no `Value`/`Rc` crosses
-            // the thread boundary; `decode` rebuilds the identical `__file`
-            // marker map on the VM thread once the worker resolves.
-            if sema_core::in_async_context() || sema_core::in_runtime_quantum() {
-                let abs_path_for_err = abs_path.clone();
-                return crate::io::fs_offload(
-                    move || {
-                        let real_path = abs_path.canonicalize().map_err(|e| {
-                            format!("http/file: {}: {e}", abs_path_for_err.display())
-                        })?;
-                        let content_type = match content_type_override {
-                            Some(ct) => ct,
-                            None => mime_guess::from_path(&real_path)
-                                .first_or_octet_stream()
-                                .to_string(),
-                        };
-                        Ok((real_path.to_string_lossy().to_string(), content_type))
-                    },
-                    |(path_str, content_type)| {
-                        let mut map = BTreeMap::new();
-                        map.insert(Value::keyword("__file"), Value::bool(true));
-                        map.insert(Value::keyword("__file_path"), Value::string(&path_str));
-                        map.insert(
-                            Value::keyword("__file_content_type"),
-                            Value::string(&content_type),
-                        );
-                        Value::map(map)
-                    },
-                );
-            }
-
-            // Canonicalize to resolve symlinks and ..
-            let abs_path = abs_path
-                .canonicalize()
-                .map_err(|e| SemaError::eval(format!("http/file: {}: {e}", abs_path.display())))?;
-
-            // Determine content type: explicit override or guess from extension
-            let content_type = match content_type_override {
-                Some(ct) => ct,
-                None => mime_guess::from_path(&abs_path)
-                    .first_or_octet_stream()
-                    .to_string(),
+            // Offload the `canonicalize()` (symlink/`..` resolution, can hit
+            // multiple syscalls) and the extension-based mime guess so a
+            // slow/cold filesystem doesn't stall the single cooperative VM
+            // thread. Both are pure, Send-safe computations over owned
+            // paths/strings — no `Value`/`Rc` crosses the thread boundary;
+            // `http_file_marker` rebuilds the identical `__file` marker map on
+            // the VM thread once the worker resolves. Under the unified runtime
+            // this suspends structurally on a quarantined-bounded External wait;
+            // the legacy scheduler still uses the `AwaitIo` bridge.
+            let resolve = move || -> Result<(String, String), String> {
+                let real_path = abs_path
+                    .canonicalize()
+                    .map_err(|e| format!("http/file: {}: {e}", abs_path.display()))?;
+                let content_type = match content_type_override {
+                    Some(ct) => ct,
+                    None => mime_guess::from_path(&real_path)
+                        .first_or_octet_stream()
+                        .to_string(),
+                };
+                Ok((real_path.to_string_lossy().to_string(), content_type))
             };
-
-            let mut map = BTreeMap::new();
-            map.insert(Value::keyword("__file"), Value::bool(true));
-            map.insert(
-                Value::keyword("__file_path"),
-                Value::string(&abs_path.to_string_lossy()),
-            );
-            map.insert(
-                Value::keyword("__file_content_type"),
-                Value::string(&content_type),
-            );
-            Ok(Value::map(map))
+            if sema_core::in_runtime_quantum() {
+                return crate::io::quarantined_compute("http/file", http_file_marker, resolve);
+            }
+            if sema_core::in_async_context() {
+                return crate::io::fs_offload(resolve, http_file_marker).map(NativeOutcome::Return);
+            }
+            let resolved = resolve().map_err(SemaError::eval)?;
+            Ok(NativeOutcome::Return(http_file_marker(resolved)))
         },
     );
 
@@ -500,381 +511,423 @@ pub fn match_path(pattern: &str, path: &str) -> Option<Vec<(String, String)>> {
     Some(params)
 }
 
-fn register_router(env: &sema_core::Env) {
-    use sema_core::{intern, EvalContext, NativeFn};
+/// Resolves a `:static` route's `Vec<(index, absolute-dir)>` off the VM thread,
+/// then rebuilds the dispatch fn on the VM thread. Holds the route table's
+/// handler `Value`s across the External park; its [`Trace`] impl exposes those
+/// as live GC edges so the collector never reclaims a handler while the batch
+/// canonicalize is in flight.
+struct RouterDecoder {
+    routes: Vec<(String, String, Value)>,
+    indices: Vec<usize>,
+}
+
+impl sema_core::runtime::Trace for RouterDecoder {
+    fn trace(&self, sink: &mut dyn FnMut(sema_core::cycle::GcEdge<'_>)) -> bool {
+        for (_, _, handler) in &self.routes {
+            sink(sema_core::cycle::GcEdge::Value(handler));
+        }
+        true
+    }
+}
+
+impl sema_core::runtime::CompletionDecoder for RouterDecoder {
+    fn decode(
+        self: Box<Self>,
+        _context: &mut sema_core::runtime::NativeCallContext<'_>,
+        result: Result<sema_core::runtime::SendPayload, sema_core::runtime::ExternalFailure>,
+    ) -> sema_core::runtime::DecodedCompletion {
+        match result {
+            Ok(payload) => match sema_core::runtime::downcast_send_payload::<
+                Result<Vec<String>, String>,
+            >(payload, "http/router")
+            {
+                Ok(Ok(resolved)) => {
+                    let mut routes = self.routes;
+                    for (idx, path_str) in self.indices.iter().zip(resolved) {
+                        routes[*idx].2 = Value::string(&path_str);
+                    }
+                    Ok(build_router_dispatch_fn(std::rc::Rc::new(routes)))
+                }
+                Ok(Err(message)) => Err(SemaError::eval(message)),
+                Err(failure) => Err(SemaError::eval(failure.message().to_string())),
+            },
+            Err(failure) => Err(SemaError::eval(format!(
+                "http/router: {}",
+                failure.message()
+            ))),
+        }
+    }
+}
+
+/// Parse the route table and build the dispatch fn. Under the unified runtime a
+/// `:static` route's directory canonicalize is offloaded to a
+/// quarantined-bounded External wait (suspending structurally); the legacy
+/// scheduler still uses the `AwaitIo` bridge; a bare/top-level eval canonicalizes
+/// inline. Returns the runtime native ABI so the External suspend can flow out.
+fn router_body(args: &[Value]) -> sema_core::runtime::NativeResult {
     use std::rc::Rc;
+
+    check_arity!(args, "http/router", 1);
+
+    // Parse route table: list of [method pattern handler] vectors
+    let routes_list = args[0]
+        .as_list()
+        .or_else(|| args[0].as_vector())
+        .ok_or_else(|| SemaError::type_error("list or vector", args[0].type_name()))?;
+
+    // Under the runtime (or the legacy scheduler): don't `canonicalize()` a
+    // `:static` route's directory inline (a symlink-resolving stat chain) — it
+    // would run on the single cooperative VM thread. Instead defer it: push a
+    // `nil` placeholder handler and remember (index, absolute-but-not-yet-
+    // canonical dir) in `pending`, then resolve every pending dir in ONE offload
+    // after the loop. This is safe because, unlike the per-request dispatch loop
+    // below, nothing here calls back into Sema (no `continue`-across-a-suspend
+    // problem) — every route is still validated, in order, on the VM thread;
+    // only the blocking syscall is deferred.
+    let async_ctx = sema_core::in_async_context() || sema_core::in_runtime_quantum();
+
+    let mut routes: Vec<(String, String, Value)> = Vec::new();
+    let mut pending: Vec<(usize, String)> = Vec::new();
+    for route in routes_list.iter() {
+        let elems = route
+            .as_vector()
+            .or_else(|| route.as_list())
+            .ok_or_else(|| {
+                SemaError::eval("http/router: each route must be a vector [method path handler]")
+            })?;
+        if elems.len() != 3 {
+            return Err(SemaError::eval(
+                "http/router: each route must have exactly 3 elements [method path handler]",
+            ));
+        }
+        let method = elems[0]
+            .as_keyword()
+            .ok_or_else(|| SemaError::type_error("keyword", elems[0].type_name()))?;
+        let pattern = elems[1]
+            .as_str()
+            .ok_or_else(|| SemaError::type_error("string", elems[1].type_name()))?
+            .to_string();
+
+        // For :static routes, resolve the directory path at definition time
+        // and ensure the pattern ends with /* for wildcard matching
+        if method == "static" {
+            let dir_path = elems[2].as_str().ok_or_else(|| {
+                SemaError::eval("http/router: :static route directory must be a string")
+            })?;
+
+            let dir = std::path::Path::new(dir_path);
+            let abs_dir = if dir.is_absolute() {
+                dir.to_path_buf()
+            } else {
+                std::env::current_dir()
+                    .map_err(|e| SemaError::eval(format!("http/router: {e}")))?
+                    .join(dir)
+            };
+
+            // Ensure the pattern has a wildcard suffix for matching
+            let static_pattern = if pattern.ends_with("/*") || pattern.ends_with("*") {
+                pattern
+            } else {
+                format!("{}/*", pattern.trim_end_matches('/'))
+            };
+
+            if async_ctx {
+                let idx = routes.len();
+                routes.push((method, static_pattern, Value::nil()));
+                pending.push((idx, abs_dir.to_string_lossy().to_string()));
+                continue;
+            }
+
+            let abs_dir = abs_dir.canonicalize().map_err(|e| {
+                SemaError::eval(format!(
+                    "http/router: static directory '{}': {e}",
+                    abs_dir.display()
+                ))
+            })?;
+
+            // Store the resolved absolute directory path as the handler value
+            let handler = Value::string(&abs_dir.to_string_lossy());
+            routes.push((method, static_pattern, handler));
+            continue;
+        }
+
+        let handler = elems[2].clone();
+        routes.push((method, pattern, handler));
+    }
+
+    if pending.is_empty() {
+        return Ok(NativeOutcome::Return(build_router_dispatch_fn(Rc::new(
+            routes,
+        ))));
+    }
+
+    // At least one :static directory still needs canonicalizing, and we deferred
+    // it precisely because `async_ctx` was true — offload the whole batch and
+    // yield, rebuilding the dispatch function (identical shape to the sync path)
+    // once the worker resolves every directory.
+    let dir_paths: Vec<String> = pending.iter().map(|(_, d)| d.clone()).collect();
+    let indices: Vec<usize> = pending.iter().map(|(i, _)| *i).collect();
+    let job = move || -> Result<Vec<String>, String> {
+        let mut resolved = Vec::with_capacity(dir_paths.len());
+        for d in &dir_paths {
+            let real = std::path::Path::new(d)
+                .canonicalize()
+                .map_err(|e| format!("http/router: static directory '{d}': {e}"))?;
+            resolved.push(real.to_string_lossy().to_string());
+        }
+        Ok(resolved)
+    };
+    if sema_core::in_runtime_quantum() {
+        let decoder = Box::new(RouterDecoder { routes, indices });
+        return crate::io::quarantined_compute_with_decoder("http/router", decoder, move || {
+            Ok(Box::new(job()) as sema_core::runtime::SendPayload)
+        });
+    }
+    // Legacy cooperative scheduler: keep the `AwaitIo` bridge.
+    crate::io::fs_offload(job, move |resolved: Vec<String>| {
+        let mut routes = routes.clone();
+        for (idx, path_str) in indices.iter().zip(resolved) {
+            routes[*idx].2 = Value::string(&path_str);
+        }
+        build_router_dispatch_fn(Rc::new(routes))
+    })
+    .map(NativeOutcome::Return)
+}
+
+fn register_router(env: &sema_core::Env) {
+    use sema_core::{intern, NativeFn};
 
     env.set(
         intern("http/router"),
-        Value::native_fn(NativeFn::with_ctx("http/router", |ctx: &EvalContext, args: &[Value]| {
-            check_arity!(args, "http/router", 1);
-            let _ = ctx; // we don't need ctx here, but the dispatch closure does
-
-            // Parse route table: list of [method pattern handler] vectors
-            let routes_list = args[0]
-                .as_list()
-                .or_else(|| args[0].as_vector())
-                .ok_or_else(|| SemaError::type_error("list or vector", args[0].type_name()))?;
-
-            // Inside `async/spawn`: don't `canonicalize()` a `:static` route's
-            // directory inline (a symlink-resolving stat chain) — it would run
-            // on the single cooperative VM thread. Instead defer it: push a
-            // `nil` placeholder handler and remember (index, absolute-but-not-
-            // yet-canonical dir) in `pending`, then resolve every pending dir
-            // in ONE offload after the loop. This is safe because, unlike the
-            // per-request dispatch loop below, nothing here calls back into
-            // Sema (no `continue`-across-a-suspend problem) — every route is
-            // still validated, in order, on the VM thread; only the blocking
-            // syscall is deferred.
-            let async_ctx = sema_core::in_async_context() || sema_core::in_runtime_quantum();
-
-            let mut routes: Vec<(String, String, Value)> = Vec::new();
-            let mut pending: Vec<(usize, String)> = Vec::new();
-            for route in routes_list.iter() {
-                let elems = route
-                    .as_vector()
-                    .or_else(|| route.as_list())
-                    .ok_or_else(|| {
-                        SemaError::eval("http/router: each route must be a vector [method path handler]")
-                    })?;
-                if elems.len() != 3 {
-                    return Err(SemaError::eval(
-                        "http/router: each route must have exactly 3 elements [method path handler]",
-                    ));
-                }
-                let method = elems[0]
-                    .as_keyword()
-                    .ok_or_else(|| SemaError::type_error("keyword", elems[0].type_name()))?;
-                let pattern = elems[1]
-                    .as_str()
-                    .ok_or_else(|| SemaError::type_error("string", elems[1].type_name()))?
-                    .to_string();
-
-                // For :static routes, resolve the directory path at definition time
-                // and ensure the pattern ends with /* for wildcard matching
-                if method == "static" {
-                    let dir_path = elems[2]
-                        .as_str()
-                        .ok_or_else(|| SemaError::eval(
-                            "http/router: :static route directory must be a string"
-                        ))?;
-
-                    let dir = std::path::Path::new(dir_path);
-                    let abs_dir = if dir.is_absolute() {
-                        dir.to_path_buf()
-                    } else {
-                        std::env::current_dir()
-                            .map_err(|e| SemaError::eval(format!("http/router: {e}")))?
-                            .join(dir)
-                    };
-
-                    // Ensure the pattern has a wildcard suffix for matching
-                    let static_pattern = if pattern.ends_with("/*") || pattern.ends_with("*") {
-                        pattern
-                    } else {
-                        format!("{}/*", pattern.trim_end_matches('/'))
-                    };
-
-                    if async_ctx {
-                        let idx = routes.len();
-                        routes.push((method, static_pattern, Value::nil()));
-                        pending.push((idx, abs_dir.to_string_lossy().to_string()));
-                        continue;
-                    }
-
-                    let abs_dir = abs_dir
-                        .canonicalize()
-                        .map_err(|e| SemaError::eval(format!(
-                            "http/router: static directory '{}': {e}", abs_dir.display()
-                        )))?;
-
-                    // Store the resolved absolute directory path as the handler value
-                    let handler = Value::string(&abs_dir.to_string_lossy());
-                    routes.push((method, static_pattern, handler));
-                    continue;
-                }
-
-                let handler = elems[2].clone();
-                routes.push((method, pattern, handler));
-            }
-
-            if pending.is_empty() {
-                return Ok(build_router_dispatch_fn(Rc::new(routes)));
-            }
-
-            // At least one :static directory still needs canonicalizing, and
-            // we deferred it precisely because `async_ctx` was true — offload
-            // the whole batch onto the I/O pool and yield, rebuilding the
-            // dispatch function (identical shape to the sync path) once the
-            // worker resolves every directory.
-            let dir_paths: Vec<String> = pending.iter().map(|(_, d)| d.clone()).collect();
-            let indices: Vec<usize> = pending.iter().map(|(i, _)| *i).collect();
-            crate::io::fs_offload(
-                move || {
-                    let mut resolved = Vec::with_capacity(dir_paths.len());
-                    for d in &dir_paths {
-                        let real = std::path::Path::new(d).canonicalize().map_err(|e| {
-                            format!("http/router: static directory '{d}': {e}")
-                        })?;
-                        resolved.push(real.to_string_lossy().to_string());
-                    }
-                    Ok(resolved)
-                },
-                move |resolved: Vec<String>| {
-                    let mut routes = routes.clone();
-                    for (idx, path_str) in indices.iter().zip(resolved) {
-                        routes[*idx].2 = Value::string(&path_str);
-                    }
-                    build_router_dispatch_fn(Rc::new(routes))
-                },
-            )
-        })),
+        Value::native_fn(NativeFn::with_ctx_runtime(
+            "http/router",
+            |_ctx, args: &[Value]| match router_body(args)? {
+                NativeOutcome::Return(value) => Ok(value),
+                _ => Err(SemaError::eval(
+                    "http/router: native suspended outside the cooperative runtime",
+                )),
+            },
+            |_ctx, args| router_body(args),
+        )),
     );
 }
 
-/// Build the `http/router/dispatch` closure for a fully-resolved route table
-/// (every `:static` directory already canonicalized). Shared by both the sync
-/// and offloaded-async construction paths in `register_router` so they return
-/// byte-identical dispatch behavior regardless of how `routes` was resolved.
-fn build_router_dispatch_fn(routes: std::rc::Rc<Vec<(String, String, Value)>>) -> Value {
-    use sema_core::{call_callback, EvalContext, NativeFn};
+/// Dispatch one request against the resolved route table. Returns the runtime
+/// native ABI so a `:static` file's `canonicalize()` can suspend structurally on
+/// a quarantined-bounded External wait under the unified runtime. `invoke` runs
+/// a matched non-static route's handler (through the evaluator's call callback —
+/// the caller supplies the appropriate `EvalContext`). `can_suspend` is `true`
+/// only when the caller reached this via the runtime ABI (so a structural
+/// suspend can flow out); the legacy value ABI passes `false`, taking either the
+/// `AwaitIo` bridge (legacy scheduler) or the inline sync canonicalize instead —
+/// so it never emits a runtime-path `AwaitIo` nor a suspend the value ABI can't
+/// carry.
+fn dispatch_body(
+    routes: &[(String, String, Value)],
+    args: &[Value],
+    invoke: &dyn Fn(&Value, Value) -> Result<Value, SemaError>,
+    can_suspend: bool,
+) -> sema_core::runtime::NativeResult {
+    check_arity!(args, "http/router/dispatch", 1);
+    let req = &args[0];
 
-    Value::native_fn(NativeFn::with_ctx(
-        "http/router/dispatch",
-        move |ctx: &EvalContext, args: &[Value]| {
-            check_arity!(args, "http/router/dispatch", 1);
-            let req = &args[0];
+    // Extract method from request map
+    let req_map = req
+        .as_map_rc()
+        .ok_or_else(|| SemaError::type_error("map", req.type_name()))?;
 
-            // Extract method from request map
-            let req_map = req
-                .as_map_rc()
-                .ok_or_else(|| SemaError::type_error("map", req.type_name()))?;
+    let req_method = req_map
+        .get(&Value::keyword("method"))
+        .ok_or_else(|| SemaError::eval("http/router: request missing :method"))?
+        .as_keyword()
+        .ok_or_else(|| SemaError::type_error("keyword", "other"))?;
 
-            let req_method = req_map
-                .get(&Value::keyword("method"))
-                .ok_or_else(|| SemaError::eval("http/router: request missing :method"))?
-                .as_keyword()
-                .ok_or_else(|| SemaError::type_error("keyword", "other"))?;
+    let req_path = req_map
+        .get(&Value::keyword("path"))
+        .ok_or_else(|| SemaError::eval("http/router: request missing :path"))?
+        .as_str()
+        .ok_or_else(|| SemaError::type_error("string", "other"))?
+        .to_string();
 
-            let req_path = req_map
-                .get(&Value::keyword("path"))
-                .ok_or_else(|| SemaError::eval("http/router: request missing :path"))?
-                .as_str()
-                .ok_or_else(|| SemaError::type_error("string", "other"))?
-                .to_string();
+    // Try each route
+    for (method, pattern, handler) in routes.iter() {
+        // WebSocket routes match GET requests (WS upgrade starts as GET)
+        let is_ws_route = method == "ws";
+        // Static routes only match GET/HEAD requests
+        let is_static_route = method == "static";
+        if is_ws_route || is_static_route {
+            if req_method != "get" && req_method != "head" {
+                continue;
+            }
+        } else if method != "any" && method != &req_method {
+            continue;
+        }
 
-            // Try each route
-            for (method, pattern, handler) in routes.iter() {
-                // WebSocket routes match GET requests (WS upgrade starts as GET)
-                let is_ws_route = method == "ws";
-                // Static routes only match GET/HEAD requests
-                let is_static_route = method == "static";
-                if is_ws_route || is_static_route {
-                    if req_method != "get" && req_method != "head" {
-                        continue;
-                    }
-                } else if method != "any" && method != &req_method {
+        // Path matching
+        if let Some(params) = match_path(pattern, &req_path) {
+            // For static routes, resolve the file and return a file marker
+            if is_static_route {
+                let dir_path = handler.as_str().unwrap_or("");
+                let rel_path = params
+                    .iter()
+                    .find(|(k, _)| k == "*")
+                    .map(|(_, v)| v.as_str())
+                    .unwrap_or("");
+
+                // Security: reject path traversal
+                if rel_path.contains("..") {
+                    let mut headers = BTreeMap::new();
+                    headers.insert(Value::string("content-type"), Value::string("text/plain"));
+                    let mut result = BTreeMap::new();
+                    result.insert(Value::keyword("status"), Value::int(400));
+                    result.insert(Value::keyword("headers"), Value::map(headers));
+                    result.insert(Value::keyword("body"), Value::string("Bad Request"));
+                    return Ok(NativeOutcome::Return(Value::map(result)));
+                }
+
+                let file_path = std::path::Path::new(dir_path).join(rel_path);
+
+                // If it's a directory, try index.html
+                let file_path = if file_path.is_dir() {
+                    file_path.join("index.html")
+                } else {
+                    file_path
+                };
+
+                if !file_path.exists() {
+                    // Don't match — fall through to other routes (allows SPA
+                    // fallback as a later catch-all). This decision must stay
+                    // synchronous even in async context: `continue`ing this loop
+                    // after an offloaded yield isn't possible — resuming delivers
+                    // the decoded value directly as this whole dispatch call's
+                    // result, bypassing any further routes — so only the
+                    // *terminal* work below (which always ends in a `return`,
+                    // never `continue`) is safe to offload. `exists()`/`is_dir()`
+                    // are also single fast stat syscalls, unlike `canonicalize()`
+                    // below which can walk a full symlink chain.
                     continue;
                 }
 
-                // Path matching
-                if let Some(params) = match_path(pattern, &req_path) {
-                    // For static routes, resolve the file and return a file marker
-                    if is_static_route {
-                        let dir_path = handler.as_str().unwrap_or("");
-                        let rel_path = params
-                            .iter()
-                            .find(|(k, _)| k == "*")
-                            .map(|(_, v)| v.as_str())
-                            .unwrap_or("");
+                // From here on every path returns (403 escape or the `__file`
+                // marker) — no more `continue`s — so it's safe to offload the
+                // rest instead of stalling the single cooperative VM thread on
+                // `canonicalize()`'s symlink-resolving stat chain.
+                let dir_path_owned = dir_path.to_string();
+                let file_path_owned = file_path.clone();
+                let resolve = move || -> Result<(bool, String, String), String> {
+                    // Security (STD-11): confirm the resolved file stays inside
+                    // dir_path. The ".." substring check above can't catch
+                    // symlink/junction escapes; canonicalize() resolves links,
+                    // then we verify the prefix.
+                    let escapes = match (
+                        std::fs::canonicalize(&dir_path_owned),
+                        std::fs::canonicalize(&file_path_owned),
+                    ) {
+                        (Ok(base), Ok(real)) => !real.starts_with(&base),
+                        _ => true,
+                    };
+                    let content_type = mime_guess::from_path(&file_path_owned)
+                        .first_or_octet_stream()
+                        .to_string();
+                    Ok((
+                        escapes,
+                        file_path_owned.to_string_lossy().to_string(),
+                        content_type,
+                    ))
+                };
+                if can_suspend && sema_core::in_runtime_quantum() {
+                    return crate::io::quarantined_compute(
+                        "http/router/dispatch",
+                        static_file_response,
+                        resolve,
+                    );
+                }
+                if sema_core::in_async_context() {
+                    return crate::io::fs_offload(resolve, static_file_response)
+                        .map(NativeOutcome::Return);
+                }
+                // Bare/top-level (and value-ABI-under-runtime): canonicalize
+                // inline. `resolve` never returns `Err`, so this cannot fail.
+                let resolved = resolve().map_err(SemaError::eval)?;
+                return Ok(NativeOutcome::Return(static_file_response(resolved)));
+            }
 
-                        // Security: reject path traversal
-                        if rel_path.contains("..") {
-                            let mut headers = BTreeMap::new();
-                            headers
-                                .insert(Value::string("content-type"), Value::string("text/plain"));
-                            let mut result = BTreeMap::new();
-                            result.insert(Value::keyword("status"), Value::int(400));
-                            result.insert(Value::keyword("headers"), Value::map(headers));
-                            result.insert(Value::keyword("body"), Value::string("Bad Request"));
-                            return Ok(Value::map(result));
-                        }
+            // Build params map (keyword keys)
+            let mut params_map = BTreeMap::new();
+            for (k, v) in &params {
+                params_map.insert(Value::keyword(k), Value::string(v));
+            }
 
-                        let file_path = std::path::Path::new(dir_path).join(rel_path);
+            // Merge params into existing :params in the request
+            let existing_params = req_map
+                .get(&Value::keyword("params"))
+                .and_then(|v| v.as_map_rc());
 
-                        // If it's a directory, try index.html
-                        let file_path = if file_path.is_dir() {
-                            file_path.join("index.html")
-                        } else {
-                            file_path
-                        };
-
-                        if !file_path.exists() {
-                            // Don't match — fall through to other routes
-                            // (allows SPA fallback as a later catch-all). This
-                            // decision must stay synchronous even in async
-                            // context: `continue`ing this loop after an
-                            // offloaded yield isn't possible — resuming an
-                            // `AwaitIo` delivers its decoded value directly as
-                            // this whole dispatch call's result, bypassing any
-                            // further routes — so only the *terminal* work below
-                            // (which always ends in a `return`, never `continue`)
-                            // is safe to offload. `exists()`/`is_dir()` are also
-                            // single fast stat syscalls, unlike `canonicalize()`
-                            // below which can walk a full symlink chain.
-                            continue;
-                        }
-
-                        // From here on every path returns (403 escape or the
-                        // `__file` marker) — no more `continue`s — so it's safe
-                        // to offload the rest onto the I/O pool when running
-                        // inside `async/spawn`, instead of stalling the single
-                        // cooperative VM thread on `canonicalize()`'s
-                        // symlink-resolving stat chain.
-                        if sema_core::in_async_context() || sema_core::in_runtime_quantum() {
-                            let dir_path_owned = dir_path.to_string();
-                            let file_path_owned = file_path.clone();
-                            return crate::io::fs_offload(
-                                move || {
-                                    // Security (STD-11): confirm the resolved file
-                                    // stays inside dir_path. The ".." substring
-                                    // check above can't catch symlink/junction
-                                    // escapes; canonicalize() resolves links, then
-                                    // we verify the prefix.
-                                    let escapes = match (
-                                        std::fs::canonicalize(&dir_path_owned),
-                                        std::fs::canonicalize(&file_path_owned),
-                                    ) {
-                                        (Ok(base), Ok(real)) => !real.starts_with(&base),
-                                        _ => true,
-                                    };
-                                    let content_type = mime_guess::from_path(&file_path_owned)
-                                        .first_or_octet_stream()
-                                        .to_string();
-                                    Ok((
-                                        escapes,
-                                        file_path_owned.to_string_lossy().to_string(),
-                                        content_type,
-                                    ))
-                                },
-                                |(escapes, path_str, content_type)| {
-                                    if escapes {
-                                        let mut headers = BTreeMap::new();
-                                        headers.insert(
-                                            Value::string("content-type"),
-                                            Value::string("text/plain"),
-                                        );
-                                        let mut result = BTreeMap::new();
-                                        result.insert(Value::keyword("status"), Value::int(403));
-                                        result
-                                            .insert(Value::keyword("headers"), Value::map(headers));
-                                        result.insert(
-                                            Value::keyword("body"),
-                                            Value::string("Forbidden"),
-                                        );
-                                        return Value::map(result);
-                                    }
-                                    let mut map = BTreeMap::new();
-                                    map.insert(Value::keyword("__file"), Value::bool(true));
-                                    map.insert(
-                                        Value::keyword("__file_path"),
-                                        Value::string(&path_str),
-                                    );
-                                    map.insert(
-                                        Value::keyword("__file_content_type"),
-                                        Value::string(&content_type),
-                                    );
-                                    Value::map(map)
-                                },
-                            );
-                        }
-
-                        // Security (STD-11): confirm the resolved file stays
-                        // inside dir_path. The ".." substring check above can't
-                        // catch symlink/junction escapes; canonicalize() resolves
-                        // links, then we verify the prefix.
-                        let escapes = match (
-                            std::fs::canonicalize(dir_path),
-                            std::fs::canonicalize(&file_path),
-                        ) {
-                            (Ok(base), Ok(real)) => !real.starts_with(&base),
-                            _ => true,
-                        };
-                        if escapes {
-                            let mut headers = BTreeMap::new();
-                            headers
-                                .insert(Value::string("content-type"), Value::string("text/plain"));
-                            let mut result = BTreeMap::new();
-                            result.insert(Value::keyword("status"), Value::int(403));
-                            result.insert(Value::keyword("headers"), Value::map(headers));
-                            result.insert(Value::keyword("body"), Value::string("Forbidden"));
-                            return Ok(Value::map(result));
-                        }
-
-                        let content_type = mime_guess::from_path(&file_path)
-                            .first_or_octet_stream()
-                            .to_string();
-
-                        let mut map = BTreeMap::new();
-                        map.insert(Value::keyword("__file"), Value::bool(true));
-                        map.insert(
-                            Value::keyword("__file_path"),
-                            Value::string(&file_path.to_string_lossy()),
-                        );
-                        map.insert(
-                            Value::keyword("__file_content_type"),
-                            Value::string(&content_type),
-                        );
-                        return Ok(Value::map(map));
-                    }
-
-                    // Build params map (keyword keys)
-                    let mut params_map = BTreeMap::new();
-                    for (k, v) in &params {
-                        params_map.insert(Value::keyword(k), Value::string(v));
-                    }
-
-                    // Merge params into existing :params in the request
-                    let existing_params = req_map
-                        .get(&Value::keyword("params"))
-                        .and_then(|v| v.as_map_rc());
-
-                    if let Some(existing) = existing_params {
-                        for (k, v) in existing.iter() {
-                            params_map.entry(k.clone()).or_insert_with(|| v.clone());
-                        }
-                    }
-
-                    // Build new request with merged params
-                    let mut new_req = (*req_map).clone();
-                    new_req.insert(Value::keyword("params"), Value::map(params_map));
-                    let new_req_val = Value::map(new_req);
-
-                    // For WebSocket routes, return a marker map instead of calling handler
-                    if is_ws_route {
-                        let mut ws_map = BTreeMap::new();
-                        ws_map.insert(Value::keyword("__websocket"), Value::bool(true));
-                        ws_map.insert(Value::keyword("__ws_handler"), handler.clone());
-                        ws_map.insert(Value::keyword("__ws_request"), new_req_val);
-                        return Ok(Value::map(ws_map));
-                    }
-
-                    // Call handler
-                    return call_callback(ctx, handler, &[new_req_val]);
+            if let Some(existing) = existing_params {
+                for (k, v) in existing.iter() {
+                    params_map.entry(k.clone()).or_insert_with(|| v.clone());
                 }
             }
 
-            // No route matched — return 404
-            let mut headers = BTreeMap::new();
-            headers.insert(
-                Value::string("content-type"),
-                Value::string("application/json"),
-            );
-            let mut result = BTreeMap::new();
-            result.insert(Value::keyword("status"), Value::int(404));
-            result.insert(Value::keyword("headers"), Value::map(headers));
-            result.insert(Value::keyword("body"), Value::string("\"Not Found\""));
-            Ok(Value::map(result))
+            // Build new request with merged params
+            let mut new_req = (*req_map).clone();
+            new_req.insert(Value::keyword("params"), Value::map(params_map));
+            let new_req_val = Value::map(new_req);
+
+            // For WebSocket routes, return a marker map instead of calling handler
+            if is_ws_route {
+                let mut ws_map = BTreeMap::new();
+                ws_map.insert(Value::keyword("__websocket"), Value::bool(true));
+                ws_map.insert(Value::keyword("__ws_handler"), handler.clone());
+                ws_map.insert(Value::keyword("__ws_request"), new_req_val);
+                return Ok(NativeOutcome::Return(Value::map(ws_map)));
+            }
+
+            // Call handler
+            return invoke(handler, new_req_val).map(NativeOutcome::Return);
+        }
+    }
+
+    // No route matched — return 404
+    let mut headers = BTreeMap::new();
+    headers.insert(
+        Value::string("content-type"),
+        Value::string("application/json"),
+    );
+    let mut result = BTreeMap::new();
+    result.insert(Value::keyword("status"), Value::int(404));
+    result.insert(Value::keyword("headers"), Value::map(headers));
+    result.insert(Value::keyword("body"), Value::string("\"Not Found\""));
+    Ok(NativeOutcome::Return(Value::map(result)))
+}
+
+/// Build the `http/router/dispatch` closure for a fully-resolved route table
+/// (every `:static` directory already canonicalized). Dual-ABI: the runtime
+/// callback lets a `:static` file's `canonicalize()` suspend structurally on an
+/// External wait; the legacy value callback runs it via the `AwaitIo` bridge (in
+/// the legacy scheduler) or inline (bare/top-level). Both invoke a matched
+/// non-static handler through `call_callback` — the value ABI with its passed
+/// `EvalContext`, the runtime ABI with the thread-local stdlib context.
+fn build_router_dispatch_fn(routes: std::rc::Rc<Vec<(String, String, Value)>>) -> Value {
+    use sema_core::{call_callback, with_stdlib_ctx, EvalContext, NativeFn};
+
+    let routes_value = std::rc::Rc::clone(&routes);
+    Value::native_fn(NativeFn::with_ctx_runtime(
+        "http/router/dispatch",
+        move |ctx: &EvalContext, args: &[Value]| {
+            let invoke = |handler: &Value, req: Value| call_callback(ctx, handler, &[req]);
+            match dispatch_body(&routes, args, &invoke, false)? {
+                NativeOutcome::Return(value) => Ok(value),
+                _ => Err(SemaError::eval(
+                    "http/router/dispatch: native suspended outside the cooperative runtime",
+                )),
+            }
+        },
+        move |_ctx, args| {
+            let invoke = |handler: &Value, req: Value| {
+                with_stdlib_ctx(|c| call_callback(c, handler, &[req]))
+            };
+            dispatch_body(&routes_value, args, &invoke, true)
         },
     ))
 }
@@ -1673,6 +1726,35 @@ fn http_serve_impl(ctx: &sema_core::EvalContext, args: &[Value]) -> Result<Value
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // `RouterDecoder` holds the route table's handler `Value`s across the
+    // External park while a `:static` directory batch canonicalizes off-thread.
+    // Its `Trace` MUST expose each handler as exactly one GC edge (nothing more,
+    // nothing less) or the collector could reclaim a live handler mid-flight (or
+    // miscount). Count the edges its `trace` emits against the handler `Value`s.
+    #[test]
+    fn router_decoder_traces_exactly_its_handler_values() {
+        use sema_core::runtime::Trace;
+        let h1 = Value::string("handler-one");
+        let h2 = Value::string("handler-two");
+        let decoder = RouterDecoder {
+            routes: vec![
+                ("get".to_string(), "/a/*".to_string(), h1.clone()),
+                ("get".to_string(), "/b/*".to_string(), h2.clone()),
+            ],
+            indices: vec![0, 1],
+        };
+        let mut edges = 0usize;
+        decoder.trace(&mut |edge| {
+            if let sema_core::cycle::GcEdge::Value(_) = edge {
+                edges += 1;
+            }
+        });
+        assert_eq!(
+            edges, 2,
+            "RouterDecoder must trace exactly one edge per route handler"
+        );
+    }
 
     // Regression guard for the real production send path: the actual
     // `http/stream/send` native fn (as built by handle_sse_response) must work

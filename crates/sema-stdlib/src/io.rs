@@ -1285,6 +1285,106 @@ where
     Ok(NativeOutcome::Suspend(suspend))
 }
 
+/// Decodes a quarantined COMPUTE job's send-safe payload back into a `Value`.
+/// Unlike [`FsDecoder`], a domain error (the job's `Err(String)`) is surfaced as
+/// `SemaError::eval` rather than `SemaError::Io`. The CPU-bound archive/pdf/diff/
+/// server-file ops already build their own op-prefixed error strings (often the
+/// full `Display` of a `SemaError`), and the legacy offloaded path
+/// (`fs_offload` → `AwaitIo` → `await_io_error`) surfaced them through
+/// `SemaError::eval` — so eval-wrapping here preserves the exact user-visible
+/// message the runtime-quantum path produced before the External conversion.
+struct ComputeDecoder<T: Send + 'static> {
+    op: &'static str,
+    to_value: fn(T) -> Value,
+}
+
+impl<T: Send + 'static> Trace for ComputeDecoder<T> {
+    fn trace(&self, _sink: &mut dyn FnMut(GcEdge<'_>)) -> bool {
+        true
+    }
+}
+
+impl<T: Send + 'static> CompletionDecoder for ComputeDecoder<T> {
+    fn decode(
+        self: Box<Self>,
+        _context: &mut NativeCallContext<'_>,
+        result: Result<SendPayload, ExternalFailure>,
+    ) -> DecodedCompletion {
+        match result {
+            Ok(payload) => match downcast_send_payload::<Result<T, String>>(payload, self.op) {
+                Ok(Ok(value)) => Ok((self.to_value)(value)),
+                Ok(Err(message)) => Err(SemaError::eval(message)),
+                Err(failure) => Err(SemaError::eval(failure.message().to_string())),
+            },
+            Err(failure) => Err(SemaError::eval(format!(
+                "{}: {}",
+                self.op,
+                failure.message()
+            ))),
+        }
+    }
+}
+
+/// Like [`fs_quarantined`], but for a pure CPU-bound compute (archive/pdf/diff/
+/// server-file) whose domain errors are surfaced through `SemaError::eval` (see
+/// [`ComputeDecoder`]). Under the unified runtime this replaces the legacy
+/// `fs_offload` (`AwaitIo`) offload: the `job` runs quarantined-bounded on the
+/// thread-pool executor (overlapping siblings) and the decoded value resumes the
+/// parked frame. `job` is `Send` and returns `Result<T, String>` (Ok payload /
+/// pre-rendered domain error); `to_value` decodes the `Ok` payload on the VM
+/// thread. Cancellation is best-effort (the bounded job runs to completion and
+/// its result is discarded), matching `fs_offload`'s no-abort-hook policy.
+pub(crate) fn quarantined_compute<T, F>(
+    op: &'static str,
+    to_value: fn(T) -> Value,
+    job: F,
+) -> NativeResult
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, String> + Send + 'static,
+{
+    let kind = CompletionKind::try_from_raw(FS_COMPLETION_KIND)
+        .expect("compute completion kind is nonzero");
+    let bound = QuarantineBound::hard_deadline(FS_CLEANUP_DEADLINE)
+        .expect("compute cleanup deadline is nonzero");
+    let prepared = PreparedExternalOperation::quarantined_blocking(
+        kind,
+        Box::new(ComputeDecoder { op, to_value }),
+        bound,
+        move || Ok(Box::new(job()) as SendPayload),
+    );
+    Ok(NativeOutcome::Suspend(NativeSuspend {
+        wait: WaitKind::External(Box::new(prepared)),
+        continuation: Box::new(FsContinuation { op }),
+    }))
+}
+
+/// Like [`quarantined_compute`], but the result is decoded by a caller-supplied
+/// `decoder` that MAY hold Sema `Value`s across the park (e.g. `http/router`'s
+/// route handlers, which must be rebuilt into the dispatch fn once the static
+/// directories canonicalize off-thread). The decoder implements
+/// [`CompletionDecoder`] (whose `Trace` supertrait exposes those `Value` edges to
+/// the collector, so nothing it holds is reclaimed while the job is in flight)
+/// and turns the job's `Send` payload into the resume `Value`.
+pub(crate) fn quarantined_compute_with_decoder<F>(
+    op: &'static str,
+    decoder: Box<dyn CompletionDecoder>,
+    job: F,
+) -> NativeResult
+where
+    F: FnOnce() -> Result<SendPayload, ExternalFailure> + Send + 'static,
+{
+    let kind = CompletionKind::try_from_raw(FS_COMPLETION_KIND)
+        .expect("compute completion kind is nonzero");
+    let bound = QuarantineBound::hard_deadline(FS_CLEANUP_DEADLINE)
+        .expect("compute cleanup deadline is nonzero");
+    let prepared = PreparedExternalOperation::quarantined_blocking(kind, decoder, bound, job);
+    Ok(NativeOutcome::Suspend(NativeSuspend {
+        wait: WaitKind::External(Box::new(prepared)),
+        continuation: Box::new(FsContinuation { op }),
+    }))
+}
+
 /// Enforce the finite-file byte cap on the VM thread BEFORE dispatch. `stat`s the
 /// path and rejects an oversized file with a Sema condition (never an unbounded
 /// worker allocation). A missing/unstattable path is NOT rejected here — the job

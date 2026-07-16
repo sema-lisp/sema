@@ -24,9 +24,17 @@
 use std::io::{Read as _, Write as _};
 use std::path::{Component, Path, PathBuf};
 
+use sema_core::runtime::NativeOutcome;
 use sema_core::{check_arity, in_async_context, Caps, SemaError, Value};
 
-use crate::{register_fn, register_fn_gated};
+use crate::{register_runtime_fn, register_runtime_fn_gated};
+
+/// Decode `zip/list`'s off-thread result (a `Vec<String>` of entry names) into a
+/// Sema list on the VM thread. A plain `fn` (no captures) so it fits
+/// [`crate::io::quarantined_compute`]'s `fn(T) -> Value` decoder slot.
+fn zip_names_to_value(names: Vec<String>) -> Value {
+    Value::list(names.iter().map(|s| Value::string(s)).collect())
+}
 
 /// Extract the byte payload of an argument: accept either a bytevector or a
 /// string (whose UTF-8 bytes are used). gzip/compress should be usable on
@@ -349,34 +357,52 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
     // (gzip/compress bytes-or-string) -> gzip-compressed bytevector. The
     // DEFLATE pass is CPU-bound; inside async/spawn it's offloaded to the I/O
     // pool (fs_offload) so it doesn't stall the VM thread for a large payload.
-    register_fn(env, "gzip/compress", |args| {
+    register_runtime_fn(env, "gzip/compress", |args| {
         check_arity!(args, "gzip/compress", 1);
         let data = arg_bytes(&args[0], "gzip/compress")?;
-        if in_async_context() || sema_core::in_runtime_quantum() {
+        if sema_core::in_runtime_quantum() {
+            return crate::io::quarantined_compute("gzip/compress", Value::bytevector, move || {
+                gzip_compress_work(&data).map_err(|e| e.to_string())
+            });
+        }
+        if in_async_context() {
             return crate::io::fs_offload(
                 move || gzip_compress_work(&data).map_err(|e| e.to_string()),
                 Value::bytevector,
-            );
+            )
+            .map(NativeOutcome::Return);
         }
-        Ok(Value::bytevector(gzip_compress_work(&data)?))
+        Ok(NativeOutcome::Return(Value::bytevector(
+            gzip_compress_work(&data)?,
+        )))
     });
 
     // (gzip/decompress bytes) -> decompressed bytevector. Same offload gate
     // as gzip/compress.
-    register_fn(env, "gzip/decompress", |args| {
+    register_runtime_fn(env, "gzip/decompress", |args| {
         check_arity!(args, "gzip/decompress", 1);
         let data = arg_bytes(&args[0], "gzip/decompress")?;
-        if in_async_context() || sema_core::in_runtime_quantum() {
+        if sema_core::in_runtime_quantum() {
+            return crate::io::quarantined_compute(
+                "gzip/decompress",
+                Value::bytevector,
+                move || gzip_decompress_work(&data).map_err(|e| e.to_string()),
+            );
+        }
+        if in_async_context() {
             return crate::io::fs_offload(
                 move || gzip_decompress_work(&data).map_err(|e| e.to_string()),
                 Value::bytevector,
-            );
+            )
+            .map(NativeOutcome::Return);
         }
-        Ok(Value::bytevector(gzip_decompress_work(&data)?))
+        Ok(NativeOutcome::Return(Value::bytevector(
+            gzip_decompress_work(&data)?,
+        )))
     });
 
     // (zip/create out-path files) -> entry count. Each file added under its basename.
-    register_fn_gated(env, sandbox, Caps::FS_WRITE, "zip/create", |args| {
+    register_runtime_fn_gated(env, sandbox, Caps::FS_WRITE, "zip/create", |args| {
         check_arity!(args, "zip/create", 2);
         let out_path = args[0]
             .as_str()
@@ -389,18 +415,25 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
             "zip/create",
         )?;
 
-        if in_async_context() || sema_core::in_runtime_quantum() {
+        if sema_core::in_runtime_quantum() {
+            return crate::io::quarantined_compute("zip/create", Value::int, move || {
+                zip_create_work(&out_path, &files).map_err(|e| e.to_string())
+            });
+        }
+        if in_async_context() {
             return crate::io::fs_offload(
                 move || zip_create_work(&out_path, &files).map_err(|e| e.to_string()),
                 Value::int,
-            );
+            )
+            .map(NativeOutcome::Return);
         }
-        let count = zip_create_work(&out_path, &files)?;
-        Ok(Value::int(count))
+        Ok(NativeOutcome::Return(Value::int(zip_create_work(
+            &out_path, &files,
+        )?)))
     });
 
     // (zip/extract zip-path dest-dir) -> count of entries extracted.
-    register_fn_gated(env, sandbox, Caps::FS_WRITE, "zip/extract", |args| {
+    register_runtime_fn_gated(env, sandbox, Caps::FS_WRITE, "zip/extract", |args| {
         check_arity!(args, "zip/extract", 2);
         let zip_path = args[0]
             .as_str()
@@ -411,39 +444,51 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
             .ok_or_else(|| SemaError::type_error("string", args[1].type_name()))?
             .to_string();
 
-        if in_async_context() || sema_core::in_runtime_quantum() {
+        if sema_core::in_runtime_quantum() {
+            return crate::io::quarantined_compute("zip/extract", Value::int, move || {
+                zip_extract_work(&zip_path, &dest_dir).map_err(|e| e.to_string())
+            });
+        }
+        if in_async_context() {
             return crate::io::fs_offload(
                 move || zip_extract_work(&zip_path, &dest_dir).map_err(|e| e.to_string()),
                 Value::int,
-            );
+            )
+            .map(NativeOutcome::Return);
         }
-        let count = zip_extract_work(&zip_path, &dest_dir)?;
-        Ok(Value::int(count))
+        Ok(NativeOutcome::Return(Value::int(zip_extract_work(
+            &zip_path, &dest_dir,
+        )?)))
     });
 
     // (zip/list zip-path) -> list of entry-name strings.
-    register_fn_gated(env, sandbox, Caps::FS_READ, "zip/list", |args| {
+    register_runtime_fn_gated(env, sandbox, Caps::FS_READ, "zip/list", |args| {
         check_arity!(args, "zip/list", 1);
         let zip_path = args[0]
             .as_str()
             .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?
             .to_string();
 
-        if in_async_context() || sema_core::in_runtime_quantum() {
+        if sema_core::in_runtime_quantum() {
+            return crate::io::quarantined_compute("zip/list", zip_names_to_value, move || {
+                zip_list_work(&zip_path).map_err(|e| e.to_string())
+            });
+        }
+        if in_async_context() {
             return crate::io::fs_offload(
                 move || zip_list_work(&zip_path).map_err(|e| e.to_string()),
-                |names: Vec<String>| Value::list(names.iter().map(|s| Value::string(s)).collect()),
-            );
+                zip_names_to_value,
+            )
+            .map(NativeOutcome::Return);
         }
-        let names = zip_list_work(&zip_path)?;
-        Ok(Value::list(
-            names.iter().map(|s| Value::string(s)).collect(),
-        ))
+        Ok(NativeOutcome::Return(zip_names_to_value(zip_list_work(
+            &zip_path,
+        )?)))
     });
 
     // (tar/create out-path files) -> entry count. gzip-compressed if out-path
     // ends in .tar.gz / .tgz, else plain tar. Each file added under its basename.
-    register_fn_gated(env, sandbox, Caps::FS_WRITE, "tar/create", |args| {
+    register_runtime_fn_gated(env, sandbox, Caps::FS_WRITE, "tar/create", |args| {
         check_arity!(args, "tar/create", 2);
         let out_path = args[0]
             .as_str()
@@ -456,19 +501,26 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
             "tar/create",
         )?;
 
-        if in_async_context() || sema_core::in_runtime_quantum() {
+        if sema_core::in_runtime_quantum() {
+            return crate::io::quarantined_compute("tar/create", Value::int, move || {
+                tar_create_work(&out_path, &files).map_err(|e| e.to_string())
+            });
+        }
+        if in_async_context() {
             return crate::io::fs_offload(
                 move || tar_create_work(&out_path, &files).map_err(|e| e.to_string()),
                 Value::int,
-            );
+            )
+            .map(NativeOutcome::Return);
         }
-        let count = tar_create_work(&out_path, &files)?;
-        Ok(Value::int(count))
+        Ok(NativeOutcome::Return(Value::int(tar_create_work(
+            &out_path, &files,
+        )?)))
     });
 
     // (tar/extract tar-path dest-dir) -> entry count. gzip auto-detected by
     // extension or magic bytes. Guards against path traversal.
-    register_fn_gated(env, sandbox, Caps::FS_WRITE, "tar/extract", |args| {
+    register_runtime_fn_gated(env, sandbox, Caps::FS_WRITE, "tar/extract", |args| {
         check_arity!(args, "tar/extract", 2);
         let tar_path = args[0]
             .as_str()
@@ -479,14 +531,21 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
             .ok_or_else(|| SemaError::type_error("string", args[1].type_name()))?
             .to_string();
 
-        if in_async_context() || sema_core::in_runtime_quantum() {
+        if sema_core::in_runtime_quantum() {
+            return crate::io::quarantined_compute("tar/extract", Value::int, move || {
+                tar_extract_work(&tar_path, &dest_dir).map_err(|e| e.to_string())
+            });
+        }
+        if in_async_context() {
             return crate::io::fs_offload(
                 move || tar_extract_work(&tar_path, &dest_dir).map_err(|e| e.to_string()),
                 Value::int,
-            );
+            )
+            .map(NativeOutcome::Return);
         }
-        let count = tar_extract_work(&tar_path, &dest_dir)?;
-        Ok(Value::int(count))
+        Ok(NativeOutcome::Return(Value::int(tar_extract_work(
+            &tar_path, &dest_dir,
+        )?)))
     });
 }
 

@@ -311,3 +311,62 @@ fn register_fn(
         Value::native_fn(sema_core::NativeFn::simple(name, f)),
     );
 }
+
+/// Like [`register_fn`], but the op body speaks the runtime native ABI
+/// (`NativeResult`) so its `in_runtime_quantum` branch can return a
+/// `NativeOutcome::Suspend` (an external-wait offload) directly. The single body
+/// is exposed under BOTH ABIs: the runtime callback returns its `NativeOutcome`
+/// (surfaced structurally by the unified runtime), and the legacy value callback
+/// unwraps a plain `Return` for a bare/top-level or legacy-scheduler eval (where
+/// the body's suspending branch, gated on `in_runtime_quantum`, is never
+/// reached). Mirrors [`register_runtime_fn_path_gated`] without the sandbox
+/// checks — for ungated ops (`gzip/*`).
+#[cfg(not(target_arch = "wasm32"))]
+fn register_runtime_fn(
+    env: &Env,
+    name: &str,
+    f: impl Fn(&[Value]) -> sema_core::runtime::NativeResult + 'static,
+) {
+    use sema_core::runtime::NativeOutcome;
+    let body = std::rc::Rc::new(f);
+    let for_func = body.clone();
+    let for_runtime = body;
+    let func_name = name.to_string();
+    env.set(
+        sema_core::intern(name),
+        Value::native_fn(sema_core::NativeFn::simple_with_runtime(
+            name,
+            move |args| match for_func(args)? {
+                NativeOutcome::Return(value) => Ok(value),
+                _ => Err(sema_core::SemaError::eval(format!(
+                    "{func_name}: native suspended outside the cooperative runtime"
+                ))),
+            },
+            move |_ctx, args| for_runtime(args),
+        )),
+    );
+}
+
+/// Like [`register_runtime_fn`], but cap-gated (no path check) — for ops that
+/// need a single capability check ahead of a runtime-ABI body (`zip/*`,
+/// `tar/*`, `patch/apply-file`). The sandbox check is applied identically under
+/// both ABIs before the body runs.
+#[cfg(not(target_arch = "wasm32"))]
+fn register_runtime_fn_gated(
+    env: &Env,
+    sandbox: &Sandbox,
+    cap: Caps,
+    name: &str,
+    f: impl Fn(&[Value]) -> sema_core::runtime::NativeResult + 'static,
+) {
+    if sandbox.is_unrestricted() {
+        register_runtime_fn(env, name, f);
+    } else {
+        let sandbox = sandbox.clone();
+        let fn_name = name.to_string();
+        register_runtime_fn(env, name, move |args| {
+            sandbox.check(cap, &fn_name)?;
+            f(args)
+        });
+    }
+}

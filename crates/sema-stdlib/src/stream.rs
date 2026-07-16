@@ -21,9 +21,12 @@
 //! the executor's blocking tier, then reinstall it and release the gate. A
 //! sibling op on the SAME stream object parks FIFO on the gate; a mid-flight
 //! cancel tombstones the slot (best-effort). `stream/open-input`/
-//! `stream/open-output` offload the initial `File::open`/`File::create` via
-//! `fs_offload` (`io.rs`) — there is no existing stream to contend over,
-//! mirroring `db/open`.
+//! `stream/open-output` offload the initial `File::open`/`File::create` on a
+//! quarantined-bounded External wait (`crate::io::quarantined_compute`, `io.rs`)
+//! — there is no existing stream to contend over, mirroring `db/open`. *stdin*
+//! reads take the same quarantined-bounded External path (stateless, so no
+//! checkout); the bound is a post-cancel cleanup watchdog, never a running-read
+//! timeout, so an input-blocked read is not faulted.
 //!
 //! `stream/copy` between two FILE-backed streams deliberately does not
 //! implement dual-checkout (it would need a canonical acquire order across
@@ -945,7 +948,7 @@ mod io_streams {
     fn maybe_async_read_decoded(
         stream: &Rc<StreamBox>,
         n: usize,
-        decode: impl Fn(Vec<u8>) -> Value + 'static,
+        decode: fn(Vec<u8>) -> Value,
     ) -> Result<Option<NativeOutcome>, SemaError> {
         if !in_runtime_quantum() {
             return Ok(None);
@@ -954,20 +957,20 @@ mod io_streams {
         // streams): offload the read so a waiting-for-input read can't stall the
         // cooperative scheduler. stdin is process-global and stateless, so we
         // read it directly on the worker instead of checking out the (VM-thread-
-        // bound) stream box.
+        // bound) stream box. Under the unified runtime this suspends structurally
+        // on a quarantined-bounded External wait (the bound is a post-cancel
+        // cleanup watchdog, never a running-read timeout, so a read blocked on
+        // input is not faulted).
         if stream.stream_type() == "stdin" {
-            let v = crate::io::fs_offload(
-                move || {
-                    let mut buf = vec![0u8; n];
-                    let read = std::io::stdin()
-                        .read(&mut buf)
-                        .map_err(|e| render(format!("stream/read: stdin: {e}")))?;
-                    buf.truncate(read);
-                    Ok(buf)
-                },
-                decode,
-            )?;
-            return Ok(Some(NativeOutcome::Return(v)));
+            return crate::io::quarantined_compute("stream/read", decode, move || {
+                let mut buf = vec![0u8; n];
+                let read = std::io::stdin()
+                    .read(&mut buf)
+                    .map_err(|e| render(format!("stream/read: stdin: {e}")))?;
+                buf.truncate(read);
+                Ok(buf)
+            })
+            .map(Some);
         }
         if stream.stream_type() != "file-input" {
             return Ok(None);
@@ -1001,24 +1004,21 @@ mod io_streams {
             return Ok(None);
         }
         if stream.stream_type() == "stdin" {
-            let v = crate::io::fs_offload(
-                move || {
-                    let mut result = Vec::new();
-                    let mut chunk = [0u8; 8192];
-                    loop {
-                        let n = std::io::stdin()
-                            .read(&mut chunk)
-                            .map_err(|e| render(format!("stream/read: stdin: {e}")))?;
-                        if n == 0 {
-                            break;
-                        }
-                        result.extend_from_slice(&chunk[..n]);
+            return crate::io::quarantined_compute("stream/read", Value::bytevector, move || {
+                let mut result = Vec::new();
+                let mut chunk = [0u8; 8192];
+                loop {
+                    let n = std::io::stdin()
+                        .read(&mut chunk)
+                        .map_err(|e| render(format!("stream/read: stdin: {e}")))?;
+                    if n == 0 {
+                        break;
                     }
-                    Ok(result)
-                },
-                |bytes: Vec<u8>| Value::bytevector(bytes),
-            )?;
-            return Ok(Some(NativeOutcome::Return(v)));
+                    result.extend_from_slice(&chunk[..n]);
+                }
+                Ok(result)
+            })
+            .map(Some);
         }
         if stream.stream_type() != "file-input" {
             return Ok(None);
@@ -1055,29 +1055,29 @@ mod io_streams {
         }
         // *stdin* — see maybe_async_read: offload the blocking line read.
         if stream.stream_type() == "stdin" {
-            let v = crate::io::fs_offload(
-                move || {
-                    let mut line = String::new();
-                    let n = std::io::stdin()
-                        .read_line(&mut line)
-                        .map_err(|e| render(format!("stream/read-line: stdin: {e}")))?;
-                    if n == 0 {
-                        return Ok(None); // EOF, nothing read at all
-                    }
-                    if line.ends_with('\n') {
-                        line.pop();
-                        if line.ends_with('\r') {
-                            line.pop();
-                        }
-                    }
-                    Ok(Some(line))
-                },
-                |line: Option<String>| match line {
+            fn decode_line(line: Option<String>) -> Value {
+                match line {
                     None => Value::nil(),
                     Some(s) => Value::string(&s),
-                },
-            )?;
-            return Ok(Some(NativeOutcome::Return(v)));
+                }
+            }
+            return crate::io::quarantined_compute("stream/read-line", decode_line, move || {
+                let mut line = String::new();
+                let n = std::io::stdin()
+                    .read_line(&mut line)
+                    .map_err(|e| render(format!("stream/read-line: stdin: {e}")))?;
+                if n == 0 {
+                    return Ok(None); // EOF, nothing read at all
+                }
+                if line.ends_with('\n') {
+                    line.pop();
+                    if line.ends_with('\r') {
+                        line.pop();
+                    }
+                }
+                Ok(Some(line))
+            })
+            .map(Some);
         }
         if stream.stream_type() != "file-input" {
             return Ok(None);
@@ -1330,38 +1330,56 @@ mod io_streams {
         )?))
     }
 
-    /// `stream/open-input`'s dispatch: async context offloads the blocking
-    /// `File::open` via `fs_offload` (`io.rs`) — mirrors `db/open`, there is
-    /// no existing stream to contend over. Sync stays today's shape.
-    pub(super) fn open_input(path: &str) -> Result<Value, SemaError> {
+    /// Decode a worker-opened `BufReader` into a file-input stream `Value` on the
+    /// VM thread. A plain `fn` for [`crate::io::quarantined_compute`]'s decoder.
+    fn input_stream_value(reader: BufReader<std::fs::File>) -> Value {
+        Value::stream(FileInputStream::from_reader(reader))
+    }
+
+    /// Decode a worker-opened `BufWriter` into a file-output stream `Value`.
+    fn output_stream_value(writer: BufWriter<std::fs::File>) -> Value {
+        Value::stream(FileOutputStream::from_writer(writer))
+    }
+
+    /// `stream/open-input`'s dispatch: under the unified runtime the blocking
+    /// `File::open` suspends structurally on a quarantined-bounded External wait —
+    /// mirrors `db/open`, there is no existing stream to contend over. Sync stays
+    /// today's shape.
+    pub(super) fn open_input(path: &str) -> NativeResult {
         if in_runtime_quantum() {
             let path = path.to_string();
-            return crate::io::fs_offload(
+            return crate::io::quarantined_compute(
+                "stream/open-input",
+                input_stream_value,
                 move || {
                     std::fs::File::open(&path)
                         .map(BufReader::new)
                         .map_err(|e| render(format!("stream/open-input: {path}: {e}")))
                 },
-                |reader| Value::stream(FileInputStream::from_reader(reader)),
             );
         }
-        Ok(Value::stream(FileInputStream::open(path)?))
+        Ok(NativeOutcome::Return(Value::stream(FileInputStream::open(
+            path,
+        )?)))
     }
 
     /// `stream/open-output`'s dispatch — see `open_input`.
-    pub(super) fn open_output(path: &str) -> Result<Value, SemaError> {
+    pub(super) fn open_output(path: &str) -> NativeResult {
         if in_runtime_quantum() {
             let path = path.to_string();
-            return crate::io::fs_offload(
+            return crate::io::quarantined_compute(
+                "stream/open-output",
+                output_stream_value,
                 move || {
                     std::fs::File::create(&path)
                         .map(BufWriter::new)
                         .map_err(|e| render(format!("stream/open-output: {path}: {e}")))
                 },
-                |writer| Value::stream(FileOutputStream::from_writer(writer)),
             );
         }
-        Ok(Value::stream(FileOutputStream::create(path)?))
+        Ok(NativeOutcome::Return(Value::stream(
+            FileOutputStream::create(path)?,
+        )))
     }
 
     /// Stdin stream — readable, close is a no-op.
@@ -1465,7 +1483,7 @@ pub fn register_io(env: &Env, sandbox: &Sandbox) {
 
     // --- file stream constructors (sandbox-gated) ---
 
-    crate::register_fn_path_gated(
+    crate::register_runtime_fn_path_gated(
         env,
         sandbox,
         Caps::FS_READ,
@@ -1480,7 +1498,7 @@ pub fn register_io(env: &Env, sandbox: &Sandbox) {
         },
     );
 
-    crate::register_fn_path_gated(
+    crate::register_runtime_fn_path_gated(
         env,
         sandbox,
         Caps::FS_WRITE,

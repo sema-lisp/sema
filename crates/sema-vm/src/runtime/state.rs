@@ -262,17 +262,6 @@ struct RuntimeState {
     pending: VecDeque<PendingStage>,
     protocol_waits: HashMap<super::WaitKey, ProtocolWait>,
     task_promises: HashMap<TaskId, sema_core::runtime::PromiseId>,
-    /// VM-quantum tasks parked on a LEGACY `AwaitIo(IoHandle)` yield, mapped to
-    /// their internal wait key and the poll handle. This is the
-    /// `LegacyAwaitIoBridge`: every offloaded-I/O async op (llm/complete, embed,
-    /// http, file, event/select, io) that arms an `IoHandle` and yields
-    /// `AwaitIo` parks HERE instead of blocking the VM thread. The handle is
-    /// NOT `Send` (it polls VM-thread completion state), so `poll_io_waits`
-    /// drives it ON THE VM THREAD during drive turns; the offloaded job itself
-    /// already runs on the IO pool. The key is minted by `issue_internal_wait`
-    /// and is NEVER inserted into `WaitRuntime::active` (it is polled, not
-    /// delivered via the completion inbox).
-    io_waits: HashMap<TaskId, (super::WaitKey, Rc<sema_core::IoHandle>)>,
     drive_cursor: usize,
     drive_active: bool,
     active_instruction_limit: usize,
@@ -559,7 +548,6 @@ impl Runtime {
                 pending: VecDeque::new(),
                 protocol_waits: HashMap::new(),
                 task_promises: HashMap::new(),
-                io_waits: HashMap::new(),
                 drive_cursor: 0,
                 drive_active: false,
                 active_instruction_limit: usize::MAX,
@@ -862,14 +850,6 @@ impl Runtime {
                 no_progress = 0;
                 continue;
             }
-            // Drive parked legacy-`AwaitIo` handles to completion ON THE VM
-            // THREAD (they are not `Send`). A handle that lands wakes its task
-            // (enqueued to `ready`, resumed via the source rotation below).
-            if self.poll_io_waits()? {
-                work_items += 1;
-                no_progress = 0;
-                continue;
-            }
             let unvisited_reserved = reserve_floor.saturating_sub(root_visits);
             let remaining_credits = budget.work_item_limit.get() - work_items;
             let reserve_root = budget.work_item_limit.get() > 1
@@ -953,7 +933,6 @@ impl Runtime {
         {
             Ok(DriveState::ShutdownComplete)
         } else if state.roots.is_empty()
-            && state.io_waits.is_empty()
             && state
                 .waits
                 .as_ref()
@@ -967,12 +946,6 @@ impl Runtime {
                     .waits
                     .as_ref()
                     .is_some_and(|waits| waits.active_len() > 0),
-                // A task is parked on a legacy `AwaitIo` handle whose offloaded
-                // job runs on the IO pool: the host must park the VM thread on
-                // the IO-completion signal and re-drive so `poll_io_waits` lands
-                // the result. Its key is not in `active`, so `inbox_wakeup` alone
-                // never covers it.
-                legacy_io_wakeup_required: !state.io_waits.is_empty(),
             })
         }
     }
@@ -1284,40 +1257,6 @@ impl Runtime {
                     .map_err(|error| RuntimeFault::Invariant {
                         message: format!("cancelled timer failed to wake: {error:?}"),
                     })?;
-                state.ready.enqueue(root, task_id);
-                return Ok(true);
-            }
-        }
-        {
-            // A VM task parked on a legacy `AwaitIo` handle. It is tracked ONLY in
-            // `io_waits` with an internal key never in
-            // `WaitRuntime::active`, so the generic fallback would spin without
-            // waking it. Handle it here: run the handle's abort hook (aborting the
-            // offloaded future so an in-flight request/child is torn down where the
-            // runtime supports it — see `IoHandle::with_abort`), drop the entry,
-            // and wake it so the cancellation settles it Cancelled on its next
-            // visit.
-            let mut state = self.state.borrow_mut();
-            let selected = state.tasks.iter().find_map(|(id, task)| {
-                let key = task.record.wait_key()?;
-                (task.record.cancellation().is_some()
-                    && state.io_waits.get(id).map(|(k, _)| *k) == Some(key))
-                .then_some((*id, key))
-            });
-            if let Some((task_id, key)) = selected {
-                if let Some((_, handle)) = state.io_waits.remove(&task_id) {
-                    handle.abort();
-                }
-                let task = state
-                    .tasks
-                    .get_mut(&task_id)
-                    .expect("selected io-waiting task exists");
-                task.record
-                    .wake(key)
-                    .map_err(|error| RuntimeFault::Invariant {
-                        message: format!("cancelled io-wait task failed to wake: {error:?}"),
-                    })?;
-                let root = task.record.relations().origin_root;
                 state.ready.enqueue(root, task_id);
                 return Ok(true);
             }
@@ -1784,6 +1723,14 @@ impl Runtime {
                 // the `Pending` arm below. Reaching here with a legacy
                 // promise/channel yield would be a routing bug: surface it as an
                 // error rather than driving the retired bridge.
+                //
+                // `AwaitIo` joins this arm after the P2 funeral: every
+                // runtime-quantum offloaded-I/O op (llm, ws, http, file, archive,
+                // pdf, diff, server, stream, event/io) now SUSPENDS structurally
+                // (`WaitKind::External` / cooperative poll), so no op arms
+                // `AwaitIo` under the runtime any more. The enum variant survives
+                // only for the legacy cooperative scheduler (`scheduler.rs`, P5);
+                // reaching it here is a routing bug.
                 YieldReason::Spawn(_)
                 | YieldReason::Cancel(_)
                 | YieldReason::AwaitPromise(_)
@@ -1792,33 +1739,14 @@ impl Runtime {
                 | YieldReason::ChannelRecv(_)
                 | YieldReason::ChannelClose(_)
                 | YieldReason::ChannelInspect(_, _)
-                | YieldReason::ChannelTryRecv(_) => TaskAction::VmResult(
+                | YieldReason::ChannelTryRecv(_)
+                | YieldReason::AwaitIo(_) => TaskAction::VmResult(
                     task_id,
                     task.vm_owner.take().expect("VM call has a return owner"),
                     Err(sema_core::SemaError::eval(
-                        "legacy promise/channel yield reached the unified runtime (async ops are structural)",
+                        "legacy promise/channel/io yield reached the unified runtime (async ops are structural)",
                     )),
                 ),
-                // Legacy offloaded I/O (`AwaitIo`): an async op (llm/complete,
-                // embed, http, file, event/select, io) offloaded its work to the
-                // IO pool and armed a poll handle. Park this frame with a nil
-                // placeholder on its stack top; the runtime drives the handle to
-                // completion ON THE VM THREAD (`poll_io_waits`) and resumes the
-                // frame with the decoded value (or raises the error in-frame).
-                //
-                // NOTE (AwaitIo funeral, P2): the llm (complete/send/chat/extract/
-                // classify/summarize/compare/conversation-say/embed/batch/rerank/
-                // stream/io-sleep-once) and ws (connect/recv/recv-timeout) ops now
-                // SUSPEND structurally (`WaitKind::External` / cooperative poll) in
-                // a runtime quantum, so they no longer reach here. This bridge is
-                // still LIVE for the remaining fs_offload-style runtime-quantum
-                // producers not yet converted (archive, pdf, diff, list, server,
-                // async_ops); the funeral (deleting `io_waits`/`poll_io_waits`) is
-                // deferred until those are migrated too.
-                YieldReason::AwaitIo(handle) => {
-                    task.vm_call = Some(vm);
-                    TaskAction::VmAwaitIo(task_id, handle)
-                }
             },
             // A native suspended structurally through the runtime ABI (the VM
             // parked its frame — pc past the call, a nil placeholder on its stack
@@ -2055,7 +1983,6 @@ impl Runtime {
                     });
                 }
             }
-            TaskAction::VmAwaitIo(task_id, handle) => self.await_io(task_id, handle)?,
             TaskAction::DebugStop(root, task_id, info) => {
                 let mut state = self.state.borrow_mut();
                 let task =
@@ -3090,134 +3017,6 @@ impl Runtime {
         Ok(())
     }
 
-    /// Park a VM task on a legacy `AwaitIo` handle (the `LegacyAwaitIoBridge`).
-    /// The offloaded job already runs on the IO pool; here we poll the handle
-    /// ONCE (it may already be done — a cached completion, a fast checkout) and,
-    /// if still pending, register an internal wait and record the handle so
-    /// `poll_io_waits` drives it to completion on the VM thread. A ready result
-    /// resumes the frame in place with the decoded value, or raises the error at
-    /// the parked call site (so an enclosing try/catch can catch it — matching
-    /// the op's synchronous `Err` return).
-    fn await_io(
-        &self,
-        task_id: TaskId,
-        handle: Rc<sema_core::IoHandle>,
-    ) -> Result<(), RuntimeFault> {
-        // Poll OUTSIDE any `state` borrow: the poller closure runs post-call work
-        // (decode, cache write, usage accounting) that may allocate GC values,
-        // and GC tracing re-borrows the runtime state.
-        match handle.poll() {
-            sema_core::IoPoll::Ready(Ok(value)) => {
-                return self.resume_running_vm(task_id, VmResume::Value(value));
-            }
-            sema_core::IoPoll::Ready(Err(msg)) => {
-                return self.resume_running_vm(task_id, VmResume::Fail(await_io_error(msg)));
-            }
-            sema_core::IoPoll::Pending => {}
-        }
-        let mut state = self.state.borrow_mut();
-        let key = state
-            .waits
-            .as_ref()
-            .expect("wait runtime installed")
-            .issue_internal_wait()
-            .map_err(|_| RuntimeFault::IdExhausted { kind: "wait" })?;
-        state
-            .tasks
-            .get_mut(&task_id)
-            .ok_or_else(|| RuntimeFault::Invariant {
-                message: "awaiting-io VM task disappeared".into(),
-            })?
-            .record
-            .wait(key)
-            .map_err(|error| RuntimeFault::Invariant {
-                message: format!("awaiting-io VM task failed to wait: {error:?}"),
-            })?;
-        state.io_waits.insert(task_id, (key, handle));
-        Ok(())
-    }
-
-    /// Drive every parked `AwaitIo` handle ON THE VM THREAD (the handles are not
-    /// `Send`, so they cannot be polled on a worker). A handle that reports
-    /// `Ready` wakes its task and injects the decoded value (or raises the error
-    /// in-frame). Returns whether any task was woken. Bounded by the number of
-    /// parked handles; the poll closures are non-blocking (`try_recv`).
-    fn poll_io_waits(&self) -> Result<bool, RuntimeFault> {
-        // Snapshot the parked handles (cloning the `Rc`s) and DROP the borrow
-        // before polling: a poller may allocate GC values whose tracing
-        // re-borrows the runtime state.
-        let parked: Vec<(TaskId, super::WaitKey, Rc<sema_core::IoHandle>)> = {
-            let state = self.state.borrow();
-            if state.io_waits.is_empty() {
-                return Ok(false);
-            }
-            state
-                .io_waits
-                .iter()
-                .map(|(task_id, (key, handle))| (*task_id, *key, Rc::clone(handle)))
-                .collect()
-        };
-        let mut ready: Vec<(TaskId, super::WaitKey, VmResume)> = Vec::new();
-        for (task_id, key, handle) in parked {
-            match handle.poll() {
-                sema_core::IoPoll::Pending => {}
-                sema_core::IoPoll::Ready(Ok(value)) => {
-                    ready.push((task_id, key, VmResume::Value(value)));
-                }
-                sema_core::IoPoll::Ready(Err(msg)) => {
-                    ready.push((task_id, key, VmResume::Fail(await_io_error(msg))));
-                }
-            }
-        }
-        if ready.is_empty() {
-            return Ok(false);
-        }
-        let mut state = self.state.borrow_mut();
-        for (task_id, key, resume) in ready {
-            // The task may have been cancelled (and its io_wait aborted+dropped)
-            // between the snapshot poll and here — skip it if the entry is gone.
-            if state.io_waits.remove(&task_id).is_none() {
-                continue;
-            }
-            let task = state
-                .tasks
-                .get_mut(&task_id)
-                .ok_or_else(|| RuntimeFault::Invariant {
-                    message: "io-wait task disappeared before wake".into(),
-                })?;
-            task.record
-                .wake(key)
-                .map_err(|error| RuntimeFault::Invariant {
-                    message: format!("io-wait task failed to wake: {error:?}"),
-                })?;
-            task.vm_resume = Some(resume);
-            let root = task.record.relations().origin_root;
-            state.ready.enqueue(root, task_id);
-        }
-        Ok(true)
-    }
-
-    /// Move a Running VM task back to Ready, stamping the resume to apply on its
-    /// next visit (a stack-top value injection, or a failure that settles it).
-    fn resume_running_vm(&self, task_id: TaskId, resume: VmResume) -> Result<(), RuntimeFault> {
-        let mut state = self.state.borrow_mut();
-        let task = state
-            .tasks
-            .get_mut(&task_id)
-            .ok_or_else(|| RuntimeFault::Invariant {
-                message: "resuming VM task disappeared".into(),
-            })?;
-        task.vm_resume = Some(resume);
-        let root = task.record.relations().origin_root;
-        task.record
-            .yield_ready()
-            .map_err(|error| RuntimeFault::Invariant {
-                message: format!("resuming VM task failed to yield ready: {error:?}"),
-            })?;
-        state.ready.enqueue(root, task_id);
-        Ok(())
-    }
-
     /// Settle a task by identity: a root main task settles its root; a detached
     /// child (`spawn_via_registry`) settles its canonical registry promise,
     /// waking every registered observer.
@@ -3392,7 +3191,7 @@ impl Runtime {
     /// Force-settle the requested `root` as `Failed` with a legacy-parity
     /// deadlock error. Called by the host drive loop when the runtime has gone
     /// fully idle — `DriveState::Idle { next_deadline: None,
-    /// inbox_wakeup_required: false, legacy_io_wakeup_required: false }` — yet
+    /// inbox_wakeup_required: false }` — yet
     /// the root is still `Running`: no task made progress this turn and there is
     /// no timer deadline nor pending external completion that could ever change
     /// that, so the root is parked on an intra-runtime wait (channel/promise)
@@ -3833,18 +3632,6 @@ impl Runtime {
     }
 }
 
-/// Format a spawned-task rejection as an `async/await` error, stripping any
-/// already-present prefix so chained awaits don't nest it. Mirrors the
-/// stdlib `async/await` rejection formatting.
-/// The error raised in-frame when a legacy `AwaitIo` poll reports `Ready(Err)`.
-/// The offloaded op's poller already formatted the failure into a message
-/// (identical to what the op's SYNCHRONOUS path stringifies), so surface it as a
-/// plain catchable eval error — mirroring the legacy scheduler, which rejects the
-/// task's promise with this same message string.
-fn await_io_error(message: String) -> sema_core::SemaError {
-    sema_core::SemaError::eval(message)
-}
-
 /// Transitively request cancellation of every live task whose cancellation-parent
 /// chain leads back to `parent` (its spawned descendants), marking each with
 /// `CancelReason::Owner`. Returns the task ids that were NEWLY cancelled by this
@@ -3882,13 +3669,12 @@ fn cancel_descendants(state: &mut RuntimeState, parent: TaskId) -> Vec<TaskId> {
 }
 
 /// Which eager wait teardown a cancelled task needs (DECISION C2). Only the
-/// in-flight kinds — External / legacy-IO / ResourceSlot, plus a
-/// granted-but-not-run resource gate — are delivered eagerly; Promise / bare
-/// Timer / Channel waits carry no offloaded work to abort and are left to the
-/// per-drive-turn `cancel_waiting` scan.
+/// in-flight kinds — External / ResourceSlot, plus a granted-but-not-run
+/// resource gate — are delivered eagerly; Promise / bare Timer / Channel waits
+/// carry no offloaded work to abort and are left to the per-drive-turn
+/// `cancel_waiting` scan.
 enum EagerTeardown {
     ResourceSlot(super::WaitKey, ResourceGateId),
-    Io(super::WaitKey),
     External,
     GrantedGate,
     None,
@@ -3897,16 +3683,16 @@ enum EagerTeardown {
 /// Deliver wait teardown for a task at cancellation-REQUEST time (DECISION C2).
 ///
 /// When a cancellation has just been recorded on a task parked on an External /
-/// legacy-IO / ResourceSlot wait (or holding a granted-but-not-run resource
-/// gate), tear the wait down SYNCHRONOUSLY right now rather than waiting for the
-/// per-drive-turn `cancel_waiting` scan — so a settled root followed by process
-/// exit never leaves an in-flight subprocess/request/gate un-aborted
+/// ResourceSlot wait (or holding a granted-but-not-run resource gate), tear the
+/// wait down SYNCHRONOUSLY right now rather than waiting for the per-drive-turn
+/// `cancel_waiting` scan — so a settled root followed by process exit never
+/// leaves an in-flight subprocess/request/gate un-aborted
 /// (ASYNC-TIMEOUT-CANCEL-1).
 ///
-/// Exactly-once: the wait registration (`io_waits` / `protocol_waits` /
-/// `WaitRuntime::active` / the gate queue-or-ownership) is removed HERE, so the
-/// drive-scan `cancel_waiting` then finds the task no longer Waiting and has
-/// nothing to double-abort. Returns whether teardown ran.
+/// Exactly-once: the wait registration (`protocol_waits` / `WaitRuntime::active`
+/// / the gate queue-or-ownership) is removed HERE, so the drive-scan
+/// `cancel_waiting` then finds the task no longer Waiting and has nothing to
+/// double-abort. Returns whether teardown ran.
 fn deliver_cancel_teardown(
     cell: &RefCell<RuntimeState>,
     task_id: TaskId,
@@ -3928,9 +3714,6 @@ fn deliver_cancel_teardown(
                     }
                     // Promise / bare Timer / Channel waits: nothing to abort.
                     Some(_) => EagerTeardown::None,
-                    None if state.io_waits.get(&task_id).map(|(k, _)| *k) == Some(key) => {
-                        EagerTeardown::Io(key)
-                    }
                     None if state
                         .waits
                         .as_ref()
@@ -3957,7 +3740,6 @@ fn deliver_cancel_teardown(
         EagerTeardown::ResourceSlot(key, gate) => {
             eager_resource_slot_teardown(cell, task_id, key, gate)
         }
-        EagerTeardown::Io(key) => eager_io_teardown(cell, task_id, key),
         EagerTeardown::External => eager_external_teardown(cell, task_id),
         EagerTeardown::GrantedGate => eager_release_granted_gate(cell, task_id),
     }
@@ -4006,32 +3788,6 @@ fn eager_resource_slot_teardown(
         wait.continuation,
         Err(sema_core::SemaError::eval("protocol wait cancelled")),
     ));
-    Ok(true)
-}
-
-/// Eager teardown of a task parked on a legacy `AwaitIo` handle: run the handle's
-/// abort hook (tearing down the offloaded future) and wake the task so its
-/// cancellation settles it on the next visit.
-fn eager_io_teardown(
-    cell: &RefCell<RuntimeState>,
-    task_id: TaskId,
-    key: super::WaitKey,
-) -> Result<bool, RuntimeFault> {
-    let mut state = cell.borrow_mut();
-    if let Some((_, handle)) = state.io_waits.remove(&task_id) {
-        handle.abort();
-    }
-    let task = state
-        .tasks
-        .get_mut(&task_id)
-        .expect("io-waiting task exists");
-    task.record
-        .wake(key)
-        .map_err(|error| RuntimeFault::Invariant {
-            message: format!("cancelled io-wait task failed to wake: {error:?}"),
-        })?;
-    let root = task.record.relations().origin_root;
-    state.ready.enqueue(root, task_id);
     Ok(true)
 }
 
@@ -4572,10 +4328,6 @@ enum TaskAction {
     /// A VM root/child parked on `async/sleep`: arm a runtime timer for `ms`
     /// milliseconds and leave the VM in `vm_call` so `fire_timer` re-runs it.
     VmSleep(TaskId, u64),
-    /// Legacy `AwaitIo(IoHandle)`: park the task (`TaskId`) on the offloaded-I/O
-    /// poll handle until it reports Ready, then resume the frame with the decoded
-    /// value (or raise the error in-frame). The `LegacyAwaitIoBridge`.
-    VmAwaitIo(TaskId, Rc<sema_core::IoHandle>),
     /// A cooperative (headless) debug session hit a breakpoint/step inside this
     /// task. The task's frames are parked in `vm_call`; arm the runtime-wide
     /// debug barrier (`debug_paused`) and hold the task out of the ready queue
@@ -4701,12 +4453,6 @@ impl Trace for TaskAction {
                     }
             }
             Self::VmSleep(_, _) => true,
-            // An `IoHandle` is a boxed `FnMut` poller; it is not a GC candidate
-            // and holds no live Sema `Value` (the result Value does not exist
-            // until the offloaded job completes and the poller decodes it), so
-            // there is no edge to trace — mirroring the legacy scheduler, which
-            // also never traces a `Blocked(AwaitIo)` handle's internals.
-            Self::VmAwaitIo(_, _) => true,
             // A `StopInfo` is a reason + source location; it holds no Sema
             // `Value`, so there is no GC edge to trace.
             Self::DebugStop(_, _, _) => true,

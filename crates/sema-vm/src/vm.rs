@@ -1610,10 +1610,22 @@ impl VM {
         self.setup_for_call_args(closure, args)?;
         let saved_floor = self.frame_floor;
         self.frame_floor = floor;
+        // The nested run is synchronous and outside the parent runtime quantum's
+        // scheduling. Save and clear the quantum budget/cancellation so the
+        // nested callback does not consume the parent's instruction budget or
+        // observe its cancellation snapshot. Without this, a long callback would
+        // return `QuantumExpired`, which this synchronous path treats as
+        // unreachable.
+        let saved_budget = self.instruction_budget.take();
+        let saved_instructions = self.instructions_executed;
+        let saved_cancellation = std::mem::take(&mut self.quantum_cancellation);
         // Each native→VM re-entry nests a fresh dispatch loop on the *Rust*
         // stack; grow it on demand so deep re-entrant recursion hits the VM's
         // catchable frame guard instead of overflowing the OS stack (SIGABRT).
         let result = sema_core::stack::maybe_grow(|| self.run_inner::<false>(ctx, None));
+        self.instruction_budget = saved_budget;
+        self.instructions_executed = saved_instructions;
+        self.quantum_cancellation = saved_cancellation;
         self.frame_floor = saved_floor;
         self.globals = saved_globals;
         self.functions = saved_functions;
@@ -5689,6 +5701,53 @@ mod tests {
         assert!(
             ctx.runtime_quantum_active(),
             "quantum flag restored after the bridged sync run"
+        );
+    }
+
+    /// A synchronous in-VM callback re-entry (e.g. `http/serve` invoking its
+    /// request handler) must not inherit the parent runtime quantum's
+    /// instruction budget. The nested closure runs to completion synchronously;
+    /// if it consumed the parent's budget it could return `QuantumExpired`,
+    /// which `run_nested_closure_args` treats as unreachable.
+    #[test]
+    fn nested_closure_callback_ignores_parent_instruction_budget() {
+        let globals = make_test_env();
+        let ctx = EvalContext::new();
+        globals.set(
+            intern("invoke-callback"),
+            Value::native_fn(NativeFn::with_ctx("invoke-callback", |ctx, args| {
+                let native = args[0].as_native_fn_ref().expect("VM closure wrapper");
+                (native.func)(ctx, &[])
+            })),
+        );
+        let forms = sema_reader::read_many(
+            r#"
+            (define (loop n)
+              (if (= n 0) n (loop (- n 1))))
+            (invoke-callback (lambda () (loop 100)))
+            "#,
+        )
+        .unwrap();
+        let program = compile_program(&forms, None).unwrap();
+        let mut vm = VM::new(
+            globals,
+            program.functions,
+            &program.native_table,
+            program.main_cache_slots,
+        )
+        .unwrap();
+        vm.setup_for_call(program.closure, &[]).unwrap();
+
+        // Budget is large enough for the parent to reach the native call, but
+        // far smaller than the 100-iteration nested callback would consume if
+        // it inherited the parent's instruction budget.
+        let quantum = vm.run_quantum(&ctx, 100, CancellationView::default());
+        assert!(
+            matches!(
+                quantum.outcome.unwrap(),
+                crate::debug::VmExecResult::Finished(_)
+            ),
+            "nested callback must complete without exhausting the parent quantum"
         );
     }
 

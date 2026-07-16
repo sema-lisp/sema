@@ -919,6 +919,9 @@ pub fn register(env: &sema_core::Env) {
         |args| {
             check_arity!(args, "apply", 2..);
             let func = &args[0];
+            if is_runtime_only_native(func) {
+                return Err(runtime_only_sync_apply_err(func, "apply"));
+            }
             // Last arg must be a list, preceding args are prepended
             let last = &args[args.len() - 1];
             let last_items = get_sequence(last, "apply")?;
@@ -970,7 +973,13 @@ pub fn register(env: &sema_core::Env) {
         "call-with-values",
         |args| {
             check_arity!(args, "call-with-values", 2);
+            if is_runtime_only_native(&args[0]) {
+                return Err(runtime_only_sync_apply_err(&args[0], "call-with-values"));
+            }
             let produced = call_function(&args[0], &[])?;
+            if is_runtime_only_native(&args[1]) {
+                return Err(runtime_only_sync_apply_err(&args[1], "call-with-values"));
+            }
             match produced.as_record() {
                 Some(rec) if rec.type_tag == intern(MULTIPLE_VALUES_TAG) => {
                     call_function(&args[1], &rec.fields.clone())
@@ -2091,6 +2100,25 @@ fn num_lt(a: &Value, b: &Value) -> Result<bool, SemaError> {
 fn is_runtime_only_native(v: &Value) -> bool {
     v.as_native_fn_rc()
         .is_some_and(|native| native.is_runtime_only())
+}
+
+/// A runtime-only native (`async/spawn`, `channel/*`, `async/resolved`, …) can
+/// only run on the cooperative `NativeOutcome::Call` path. `apply` /
+/// `call-with-values` reach that path on their runtime ABI, but when they are
+/// invoked SYNCHRONOUSLY (the value ABI — e.g. as the callee of another `apply`,
+/// or at a bare top level with no runtime quantum) there is no way to suspend,
+/// so calling the native would hit its "requires runtime invocation" value-ABI
+/// stub. Raise a clear, actionable error instead of leaking that internal stub.
+fn runtime_only_sync_apply_err(func: &Value, via: &str) -> SemaError {
+    let name = func
+        .as_native_fn_rc()
+        .map(|n| n.name.clone())
+        .unwrap_or_else(|| "<native>".to_string());
+    SemaError::eval(format!(
+        "cannot invoke runtime-only native '{name}' through a synchronous \
+         `{via}` — call it directly (e.g. `({name} …)`) or wrap it in a lambda \
+         so the runtime can drive it",
+    ))
 }
 
 /// True when `v` can be applied as a function — a native fn (including a

@@ -1737,6 +1737,26 @@ fn apply_preserves_synchronous_semantics() {
 }
 
 #[test]
+fn nested_apply_of_runtime_native_is_graceful_error() {
+    // `apply`/`call-with-values` reached through another synchronous `apply`
+    // run on the value ABI, where a runtime-only native cannot suspend. That
+    // must surface a clear, actionable error — never the raw internal
+    // "requires runtime invocation" stub.
+    let a = eval_vm_err(r#"(apply apply (list async/spawn (list (fn () 1))))"#);
+    assert!(
+        a.contains("cannot invoke runtime-only native 'async/spawn'")
+            && !a.contains("internal error"),
+        "expected a graceful error, got: {a}"
+    );
+    let b = eval_vm_err(r#"(apply call-with-values (list (fn () 5) async/resolved))"#);
+    assert!(
+        b.contains("cannot invoke runtime-only native 'async/resolved'")
+            && !b.contains("internal error"),
+        "expected a graceful error, got: {b}"
+    );
+}
+
+#[test]
 fn apply_channel_send_callback_runs() {
     // A runtime-only op applied over a channel runs cooperatively (no stub error).
     assert_eq!(

@@ -1923,6 +1923,36 @@ fn async_run_waits_for_awaiter_of_transitive_sleeper() {
     );
 }
 
+/// A NESTED `(async/run)` (inside a spawned task) shares its spawner's origin
+/// root with the outer `(async/run)`. The outer barrier must WAIT for the inner
+/// one (a descendant sub-graph) rather than race it: if both released at once
+/// the outer could win, settle the root, and drop the inner task's
+/// continuation. Deterministic result `6` (inner task increments after its own
+/// nested drain); a regression showed a nondeterministic `5`.
+#[test]
+fn nested_async_run_waits_for_inner_barrier() {
+    for _ in 0..8 {
+        let run = common::watchdog::run_sema_with_timeout(
+            r#"(let ((c (mutable-cell/new 0)))
+                 (async/spawn
+                   (fn ()
+                     (async/spawn (fn () (async/sleep 20) (mutable-cell/set! c 5)))
+                     (async/run)
+                     (mutable-cell/set! c (+ (mutable-cell/get c) 1))))
+                 (async/run)
+                 (println (mutable-cell/get c)))"#,
+            std::time::Duration::from_secs(15),
+        );
+        assert!(!run.timed_out, "nested async/run hung; stderr:\n{}", run.stderr);
+        assert!(run.status.success(), "run failed; stderr:\n{}", run.stderr);
+        assert!(
+            run.stdout.trim().ends_with('6'),
+            "expected inner continuation to run (6), got stdout:\n{}",
+            run.stdout
+        );
+    }
+}
+
 /// A detached child blocked SENDING on a full channel that only the barrier
 /// caller would drain is a channel-rendezvous cycle: the barrier must NOT wait
 /// on it (Channel is cycle-forming), so `(async/run)` RELEASES and "released"

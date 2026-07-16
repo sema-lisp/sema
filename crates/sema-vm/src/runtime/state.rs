@@ -4247,6 +4247,25 @@ fn install_timer_wait(
     Ok(())
 }
 
+/// Walk `node`'s spawn-parent chain (`CancellationParent::Task`); true if
+/// `ancestor` appears — i.e. `node` was spawned (transitively) by `ancestor`.
+/// The spawn graph is a tree (a child's parent always predates it), so the walk
+/// terminates at a `Root`/`Scope`/`None` parent or a missing task.
+fn is_task_descendant_of(state: &RuntimeState, mut node: TaskId, ancestor: TaskId) -> bool {
+    while let Some(task) = state.tasks.get(&node) {
+        match task.record.relations().cancellation_parent {
+            CancellationParent::Task(parent) => {
+                if parent == ancestor {
+                    return true;
+                }
+                node = parent;
+            }
+            _ => return false,
+        }
+    }
+    false
+}
+
 /// Whether an `async/run` barrier for `caller` (whose origin root is `root`) may
 /// release: true when no OTHER task under `root` is Ready, Running, or parked on
 /// a SELF-RESOLVING wait. See [`Runtime::resolve_origin_barriers`] for the full
@@ -4279,8 +4298,20 @@ fn origin_barrier_released(state: &RuntimeState, root: RootId, caller: TaskId) -
                     }
                     // Cycle-forming — the barrier does NOT wait on these.
                     Some(ProtocolWaitKind::Channel { .. })
-                    | Some(ProtocolWaitKind::ResourceSlot { .. })
-                    | Some(ProtocolWaitKind::OriginBarrier { .. }) => false,
+                    | Some(ProtocolWaitKind::ResourceSlot { .. }) => false,
+                    // A NESTED barrier under a descendant of `caller` is a
+                    // sub-graph that releases on its own, so the ancestor
+                    // barrier must WAIT for it — otherwise both barriers'
+                    // predicates hold at once when the shared descendant work
+                    // settles, `resolve_origin_barriers` picks one by HashMap
+                    // order, and if the ancestor wins its root settles and the
+                    // inner task's continuation is silently dropped. A
+                    // genuinely-independent barrier (neither task descends from
+                    // the other) stays cycle-forming/excluded, so mutually-
+                    // waiting barriers still can't deadlock each other.
+                    Some(ProtocolWaitKind::OriginBarrier { .. }) => {
+                        is_task_descendant_of(state, *id, caller)
+                    }
                     // No protocol entry ⇒ an External wait held in the
                     // `WaitRuntime` (a real in-flight I/O op): self-resolving.
                     None => true,

@@ -210,3 +210,42 @@ to prune). Update the threshold to the new GC behaviour in Step I.
   is where the DAP/wasm cooperative-debug-mode question must be resolved (build it, or make
   the async-debug deferral permanent+documented).
 - **I**: test sweep + full verification (jake examples, jake smoke-bytecode, workspace suite).
+
+---
+
+## Post-purge productionization (2026-07-16)
+
+The core migration (delete legacy scheduler, unify on the Runtime) is DONE and
+adversarially verified. Productionization progress:
+
+- **P7 adversarial verification (2 independent verifiers).** Verifier 1 (cancel +
+  External-I/O + concurrency, ~40 stress programs): NO runtime defects — eager
+  subprocess-kill on cancel, transitive subtree cancel, gate FIFO serialization,
+  50 concurrent http overlap, 2000 spawns / depth-500 / 2M yields, determinism,
+  bounded liveness. Verifier 2 (GC/memory + debug + edges): NO memory defects
+  (20k-cycle / 50k-churn stress, RSS plateaus, registry-size bounded) and NO
+  debug defects (debug fully on the runtime; dap 3/0 + wasm 8/0, no ignores).
+- **Fix (commit d6bf5871):** apply / call-with-values / multi-list map leaked
+  "internal error: requires runtime invocation" for runtime-only natives —
+  routed through the cooperative NativeOutcome::Call ABI, gated on
+  is_runtime_only() so blocking/dual-ABI natives keep their sync path.
+- **C1 (commit b90b296b):** async/run drain → self-resolving-waits OriginBarrier
+  (ASYNC-RUN-BARRIER-1 RESOLVED). Deadlock-free by construction; ResourceSlot
+  correctly cycle-forming.
+- **Perf investigation — NO migration regression.** smoke-bytecode flaked on
+  math-and-crypto's O(n^2) functional sieve (13s debug, borderline vs the 15s
+  bound). Root cause is pre-existing vector-backed lists (List(Rc<Vec>) → cons is
+  O(n)), NOT the runtime: gc/stats shows the collector uninvolved (registry-size
+  1, collected 0), transient alloc is 641ms/1M, primes compute 246ms. Fixed the
+  gate flakiness with a per-example run timeout (commit 8f28721e).
+- **CI-equivalent suite GREEN:** workspace tests (only the inventory-mapping
+  deferral fails), jake examples 81/0, smoke-bytecode, lint, docs-check.
+
+### Remaining (full-scope productionization)
+- P6(1) common host API consolidation (check_interrupt → runtime cancel_root; 1 site).
+- P6(3) wasm Promise-driven roots (delete replay/Atomics shims) — toolchain-gated.
+- P6(4) SRV-1 http/serve handler-task-per-connection (fail-fast guard is the
+  blessed fallback).
+- P6(5) docs/examples/notebooks + package-boundary shipping gate + wasm-asset regen.
+- P7b six review rounds (2 done as plan round 0); P8 profiling vs baseline 3f111e83.
+- Inventory-mapping reconciliation (the one remaining allowed test failure).

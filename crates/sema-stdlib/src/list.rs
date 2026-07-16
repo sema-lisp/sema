@@ -372,6 +372,163 @@ fn sort_by_call(key_fn: &Value, items: &[Value]) -> NativeOutcome {
     })
 }
 
+/// Cooperative multi-list `map`: iterate N lists in lockstep (shortest wins),
+/// driving the callback on each zipped column as a fresh runtime `Call` so an
+/// async op inside it parks/resumes — the multi-arg counterpart to
+/// `MapContinuation`. The columns are snapshotted up front (so a callback that
+/// mutates an input array can't perturb iteration), and results preserve input
+/// order, matching the legacy synchronous `map_multi`.
+struct MapMultiContinuation {
+    callback: Value,
+    remaining: VecDeque<Vec<Value>>,
+    results: Vec<Value>,
+}
+
+impl Trace for MapMultiContinuation {
+    fn trace(&self, sink: &mut dyn FnMut(GcEdge<'_>)) -> bool {
+        sink(GcEdge::Value(&self.callback));
+        for column in &self.remaining {
+            for item in column {
+                sink(GcEdge::Value(item));
+            }
+        }
+        for result in &self.results {
+            sink(GcEdge::Value(result));
+        }
+        true
+    }
+}
+
+impl NativeContinuation for MapMultiContinuation {
+    fn resume(
+        mut self: Box<Self>,
+        _context: &mut NativeCallContext<'_>,
+        input: ResumeInput,
+    ) -> NativeResult {
+        let value = resume_value(input, "map")?;
+        self.results.push(value);
+        match self.remaining.pop_front() {
+            Some(next) => Ok(NativeOutcome::Call(NativeCall {
+                callable: self.callback.clone(),
+                args: next,
+                continuation: self,
+            })),
+            None => Ok(NativeOutcome::Return(Value::list(std::mem::take(
+                &mut self.results,
+            )))),
+        }
+    }
+}
+
+/// Initial cooperative `NativeOutcome::Call` for a multi-list `map`. Zips the
+/// argument lists into per-column arg tuples (shortest list truncates), then
+/// drives the first column's callback with `MapMultiContinuation` handling the
+/// rest. Empty (any list empty) returns the empty list directly.
+fn map_multi_call(args: &[Value]) -> NativeResult {
+    let lists: Vec<Cow<[Value]>> = args[1..]
+        .iter()
+        .map(|a| get_sequence(a, "map"))
+        .collect::<Result<_, _>>()?;
+    let min_len = lists.iter().map(|l| l.len()).min().unwrap_or(0);
+    let mut columns: VecDeque<Vec<Value>> = VecDeque::with_capacity(min_len);
+    for i in 0..min_len {
+        columns.push_back(lists.iter().map(|l| l[i].clone()).collect());
+    }
+    let Some(first) = columns.pop_front() else {
+        return Ok(NativeOutcome::Return(Value::list(Vec::new())));
+    };
+    let continuation = Box::new(MapMultiContinuation {
+        callback: args[0].clone(),
+        remaining: columns,
+        results: Vec::with_capacity(min_len),
+    });
+    Ok(NativeOutcome::Call(NativeCall {
+        callable: args[0].clone(),
+        args: first,
+        continuation,
+    }))
+}
+
+/// Cooperative identity continuation: forwards the callback's result straight
+/// through as the native's return value. `apply` uses it directly (its result
+/// IS the applied call's result); `call-with-values` uses it for the consumer
+/// call. Fail-fast on error/cancellation via `resume_value`.
+struct IdentityContinuation {
+    hof: &'static str,
+}
+
+impl Trace for IdentityContinuation {
+    fn trace(&self, _sink: &mut dyn FnMut(GcEdge<'_>)) -> bool {
+        true
+    }
+}
+
+impl NativeContinuation for IdentityContinuation {
+    fn resume(
+        self: Box<Self>,
+        _context: &mut NativeCallContext<'_>,
+        input: ResumeInput,
+    ) -> NativeResult {
+        Ok(NativeOutcome::Return(resume_value(input, self.hof)?))
+    }
+}
+
+/// Initial cooperative `NativeOutcome::Call` for `apply`: collect the flattened
+/// arg vector (leading fixed args + the final list spread), then drive the
+/// applied function as one runtime Call so a runtime-only op passed as `f`
+/// (`(apply async/spawn …)`) suspends cleanly. `IdentityContinuation` returns
+/// its result unchanged.
+fn apply_call(args: &[Value]) -> NativeResult {
+    let func = args[0].clone();
+    let last = &args[args.len() - 1];
+    let last_items = get_sequence(last, "apply")?;
+    let mut all_args: Vec<Value> = args[1..args.len() - 1].to_vec();
+    all_args.extend(last_items.iter().cloned());
+    Ok(NativeOutcome::Call(NativeCall {
+        callable: func,
+        args: all_args,
+        continuation: Box::new(IdentityContinuation { hof: "apply" }),
+    }))
+}
+
+/// Cooperative continuation for `call-with-values`: after the (callable)
+/// producer settles as the initiating runtime Call, spread its result — a
+/// `values` bundle's fields, or a lone value — as the consumer's arguments and
+/// drive the consumer as a fresh runtime Call. Running BOTH producer and
+/// consumer as cooperative Calls means a runtime op in either (an async closure,
+/// or a runtime-only-native consumer like `async/resolved`) suspends cleanly.
+struct CallWithValuesContinuation {
+    consumer: Value,
+}
+
+impl Trace for CallWithValuesContinuation {
+    fn trace(&self, sink: &mut dyn FnMut(GcEdge<'_>)) -> bool {
+        sink(GcEdge::Value(&self.consumer));
+        true
+    }
+}
+
+impl NativeContinuation for CallWithValuesContinuation {
+    fn resume(
+        self: Box<Self>,
+        _context: &mut NativeCallContext<'_>,
+        input: ResumeInput,
+    ) -> NativeResult {
+        let produced = resume_value(input, "call-with-values")?;
+        let call_args = match produced.as_record() {
+            Some(rec) if rec.type_tag == intern(MULTIPLE_VALUES_TAG) => rec.fields.clone(),
+            _ => vec![produced],
+        };
+        Ok(NativeOutcome::Call(NativeCall {
+            callable: self.consumer.clone(),
+            args: call_args,
+            continuation: Box::new(IdentityContinuation {
+                hof: "call-with-values",
+            }),
+        }))
+    }
+}
+
 /// Shared decode of a cooperative callback resume for the HOF continuations: a
 /// returned value flows on; an error / cancellation aborts the whole HOF by
 /// propagating so the runtime resumes the parked parent VM with the raised error
@@ -575,9 +732,9 @@ pub fn register(env: &sema_core::Env) {
 
     // `map` drives its callback COOPERATIVELY under the runtime (its `runtime`
     // ABI returns the initial `NativeOutcome::Call`) so an async op inside the
-    // callback (spawn/await/channel) parks and resumes correctly. Multi-list
-    // `map` has no cooperative continuation, so it runs synchronously on both
-    // paths (Task 04 follow-up).
+    // callback (spawn/await/channel) parks and resumes correctly. Both the
+    // single-list and multi-list (zipped) shapes are cooperative; the legacy
+    // value ABI keeps the synchronous per-element path for bare/top-level eval.
     register_hof(
         env,
         "map",
@@ -600,7 +757,7 @@ pub fn register(env: &sema_core::Env) {
                 let items = get_sequence(&args[1], "map")?;
                 Ok(map_call(&args[0], &items))
             } else {
-                map_multi(args).map(NativeOutcome::Return)
+                map_multi_call(args)
             }
         },
     );
@@ -745,16 +902,44 @@ pub fn register(env: &sema_core::Env) {
         Ok(Value::list(result))
     });
 
-    register_fn(env, "apply", |args| {
-        check_arity!(args, "apply", 2..);
-        let func = &args[0];
-        // Last arg must be a list, preceding args are prepended
-        let last = &args[args.len() - 1];
-        let last_items = get_sequence(last, "apply")?;
-        let mut all_args: Vec<Value> = args[1..args.len() - 1].to_vec();
-        all_args.extend(last_items.iter().cloned());
-        call_function(func, &all_args)
-    });
+    // `apply` routes the applied function through the cooperative
+    // `NativeOutcome::Call` path ONLY when it is a genuinely runtime-only native
+    // (`async/spawn`, `channel/*`, `async/resolved`, … — whose legacy value ABI
+    // is the "requires runtime invocation" stub); that is the only path on which
+    // such an op can run/suspend, so `(apply async/spawn (list thunk))` works
+    // instead of leaking the stub error. EVERY other callee — user closures
+    // (whose async is already handled by `call_function`'s inline-task routing)
+    // and dual-ABI blocking natives (e.g. `__llm-chat-blocking`, which manages
+    // task-scoped stream/agent slab state and must run on its own value ABI so
+    // cancellation reaping stays correct) — keeps its exact prior synchronous
+    // `call_function` path. The legacy value ABI is likewise fully synchronous.
+    register_hof(
+        env,
+        "apply",
+        |args| {
+            check_arity!(args, "apply", 2..);
+            let func = &args[0];
+            // Last arg must be a list, preceding args are prepended
+            let last = &args[args.len() - 1];
+            let last_items = get_sequence(last, "apply")?;
+            let mut all_args: Vec<Value> = args[1..args.len() - 1].to_vec();
+            all_args.extend(last_items.iter().cloned());
+            call_function(func, &all_args)
+        },
+        |args| {
+            check_arity!(args, "apply", 2..);
+            if is_runtime_only_native(&args[0]) {
+                apply_call(args)
+            } else {
+                let func = &args[0];
+                let last = &args[args.len() - 1];
+                let last_items = get_sequence(last, "apply")?;
+                let mut all_args: Vec<Value> = args[1..args.len() - 1].to_vec();
+                all_args.extend(last_items.iter().cloned());
+                call_function(func, &all_args).map(NativeOutcome::Return)
+            }
+        },
+    );
 
     // R7RS `values`: 1 arg is just that value (so it flows through ordinary
     // single-value contexts like `(+ 1 (values 2))`); 0 or 2+ args bundle into
@@ -772,16 +957,43 @@ pub fn register(env: &sema_core::Env) {
 
     // R7RS `call-with-values`: call `producer` with no args, spread its result
     // (a values-bundle or a single ordinary value) as arguments to `consumer`.
-    register_fn(env, "call-with-values", |args| {
-        check_arity!(args, "call-with-values", 2);
-        let produced = call_function(&args[0], &[])?;
-        match produced.as_record() {
-            Some(rec) if rec.type_tag == intern(MULTIPLE_VALUES_TAG) => {
-                call_function(&args[1], &rec.fields.clone())
+    // COOPERATIVE under the runtime: a CALLABLE producer runs as the initiating
+    // Call and `CallWithValuesContinuation` then drives the consumer as a fresh
+    // Call, so a runtime op in EITHER the producer or the consumer (an async
+    // closure, or a runtime-only-native consumer like `async/resolved`) suspends
+    // cleanly. A NON-callable producer skips the cooperative path and runs
+    // through `call_function`, preserving its exact "not callable" error. The
+    // legacy value ABI keeps the fully synchronous path for a bare / top-level
+    // eval.
+    register_hof(
+        env,
+        "call-with-values",
+        |args| {
+            check_arity!(args, "call-with-values", 2);
+            let produced = call_function(&args[0], &[])?;
+            match produced.as_record() {
+                Some(rec) if rec.type_tag == intern(MULTIPLE_VALUES_TAG) => {
+                    call_function(&args[1], &rec.fields.clone())
+                }
+                _ => call_function(&args[1], &[produced]),
             }
-            _ => call_function(&args[1], &[produced]),
-        }
-    });
+        },
+        |args| {
+            check_arity!(args, "call-with-values", 2);
+            if is_callable(&args[0]) {
+                Ok(NativeOutcome::Call(NativeCall {
+                    callable: args[0].clone(),
+                    args: Vec::new(),
+                    continuation: Box::new(CallWithValuesContinuation {
+                        consumer: args[1].clone(),
+                    }),
+                }))
+            } else {
+                // Non-callable producer: exact legacy "not callable" error.
+                call_function(&args[0], &[]).map(NativeOutcome::Return)
+            }
+        },
+    );
 
     register_fn(env, "take", |args| {
         check_arity!(args, "take", 2);
@@ -1870,6 +2082,26 @@ fn num_lt(a: &Value, b: &Value) -> Result<bool, SemaError> {
     }
 }
 
+/// True when `v` is a genuinely runtime-only native — its legacy value ABI is
+/// the "requires runtime invocation" hard-error stub, so the cooperative
+/// `NativeOutcome::Call` path is its ONLY viable path. Callback-driving builtins
+/// (`apply`, `call-with-values`) use this to route exactly those callees through
+/// the cooperative path while keeping closures and dual-ABI natives on their
+/// exact prior synchronous `call_function` path.
+fn is_runtime_only_native(v: &Value) -> bool {
+    v.as_native_fn_rc()
+        .is_some_and(|native| native.is_runtime_only())
+}
+
+/// True when `v` can be applied as a function — a native fn (including a
+/// VM-closure wrapper), a keyword (keyword-as-getter), or a multimethod. Mirrors
+/// the callable arms of the evaluator's `call_value`. `call-with-values` uses it
+/// to keep a non-callable producer on the exact legacy `call_function` error
+/// path rather than surfacing it through the runtime's callable check.
+fn is_callable(v: &Value) -> bool {
+    v.is_native_fn() || v.is_keyword() || v.as_multimethod_rc().is_some()
+}
+
 /// Call a Sema function (lambda or native) with given args.
 /// Delegates to the real evaluator via the registered callback.
 ///
@@ -1911,4 +2143,48 @@ fn check_hof_yield(result: Result<Value, SemaError>) -> Result<Value, SemaError>
     }
 
     result
+}
+
+#[cfg(test)]
+mod continuation_trace_tests {
+    use super::*;
+    use std::collections::VecDeque;
+
+    fn edge_count(trace: &dyn Trace) -> usize {
+        let mut count = 0;
+        assert!(trace.trace(&mut |_| count += 1));
+        count
+    }
+
+    /// The cooperative callback continuations added for multi-list `map`,
+    /// `apply`, and `call-with-values` carry `Value` state across the callback
+    /// boundary, so their GC trace must emit exactly one edge per retained
+    /// `Value` — otherwise a live value could be collected mid-suspension.
+    #[test]
+    fn map_multi_continuation_emits_one_edge_per_value() {
+        let cont = MapMultiContinuation {
+            callback: Value::string("f"),
+            remaining: VecDeque::from(vec![
+                vec![Value::int(1), Value::int(2)],
+                vec![Value::int(3), Value::int(4)],
+            ]),
+            results: vec![Value::int(5)],
+        };
+        // callback (1) + 4 remaining column items + 1 result = 6.
+        assert_eq!(edge_count(&cont), 6);
+    }
+
+    #[test]
+    fn identity_continuation_holds_no_value_edges() {
+        // Only a `&'static str` tag — no `Value` state.
+        assert_eq!(edge_count(&IdentityContinuation { hof: "apply" }), 0);
+    }
+
+    #[test]
+    fn call_with_values_continuation_emits_one_edge_for_consumer() {
+        let cont = CallWithValuesContinuation {
+            consumer: Value::string("consumer"),
+        };
+        assert_eq!(edge_count(&cont), 1);
+    }
 }

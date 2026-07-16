@@ -2,13 +2,15 @@
 
 Things that came out of the May 2026 quality sweep (Wave 6 audit) but were intentionally not fixed because they're too risky, too design-dependent, or have a cheap workaround. Each entry says *why* it's deferred so a future pass can decide whether to revisit.
 
-## ASYNC-DEBUG-1 — Async debugging under the unified runtime (cooperative-debug mode)
+## ASYNC-DEBUG-1 — Async debugging under the unified runtime (cooperative-debug mode) — RESOLVED
 
-**Found 2026-07-15, during the promise-op structural-ABI migration (Step D2), extended by the channel-op migration (Step D3).** The promise ops (`async/spawn`, `async/await`, `async/all`/`race`/`timeout`, the predicates, `async/cancel`, `async/run`) **and** the channel ops (`channel/new`, `send`, `recv`, `try-recv`, `close`, `closed?`, `count`, `empty?`, `full?`) are now **runtime-only**: they suspend structurally through the `NativeOutcome` ABI (`Suspend`/`Runtime`) and are driven by the unified cooperative runtime. Their legacy value-ABI (`func`) is a hard-error stub. The legacy debug scheduler (native DAP + WASM cooperative debugger), which stepped async tasks via the retired `YieldReason`/`scheduler.rs` path, therefore cannot execute these async ops: a *debugged* program (no runtime quantum installed) that hits `async/spawn`/`async/await`/`channel/*`/… gets the "requires runtime invocation" stub. The affected tests are `#[ignore]`d with reason `"async debugging pending runtime cooperative-debug mode — see docs/deferred.md"`:
+**Found 2026-07-15, during the promise-op structural-ABI migration (Step D2), extended by the channel-op migration (Step D3). RESOLVED by P3-B1/B2 (debug moved onto the unified runtime).** The promise ops (`async/spawn`, `async/await`, `async/all`/`race`/`timeout`, the predicates, `async/cancel`, `async/run`) **and** the channel ops (`channel/new`, `send`, `recv`, `try-recv`, `close`, `closed?`, `count`, `empty?`, `full?`) are **runtime-only**: they suspend structurally through the `NativeOutcome` ABI (`Suspend`/`Runtime`) and are driven by the unified cooperative runtime.
+
+The original deferral was that the legacy debug scheduler (native DAP + WASM cooperative debugger) could not execute these runtime-only async ops, so async breakpoints hit the "requires runtime invocation" stub. That is now fixed: the DAP and WASM debug drivers run *on* the unified runtime — a debugged program drives its VM via `drive_vm_on_runtime` under an `ActiveDebugGuard`, which pauses a runtime task at a breakpoint (`DriveState::DebugStopped` → `Stopped`), inspects its VM frames, and resumes it through the runtime's drive loop. The previously `#[ignore]`d tests are **re-enabled and passing**:
 - `crates/sema/tests/dap_async_breakpoint_test.rs`: `async_task_breakpoint_stops_and_continues`, `async_task_breakpoint_inspects_task_frame_locals`.
 - `crates/sema/tests/wasm_async_debug_test.rs`: `coop_async_task_breakpoint_stops_and_continues`, `coop_async_two_tasks_breakpoint_stops_at_known_line`, `coop_async_breakpoint_in_first_task`, `coop_async_step_over_and_out_use_task_depth`, `coop_async_stop_inspects_paused_task_locals`, `coop_abandoned_async_session_does_not_poison_next_session`, `coop_breakpoint_in_hof_callback_in_async_task_completes`.
 
-**Deferred because** re-enabling async debugging means teaching the DAP/WASM debug drivers to run *on* the unified runtime (a cooperative-debug mode that pauses a runtime task at a breakpoint, inspects its VM frames, and resumes it through the runtime's drive loop) rather than the retired thread-local scheduler. That is a distinct design problem, orthogonal to the promise migration, and belongs with the later steps that delete the legacy scheduler wholesale. **Do NOT** try to keep the legacy-scheduler async execution path alive to satisfy these tests — the whole point of the migration is to retire it.
+**Residual (still deferred):** cross-task/cross-sibling stepping — stepping Into/Over/Out does not follow control *across* the scheduler boundary into sibling tasks or back to the main VM (B3). That distinct gap is tracked under **ASYNC-2** below; the STOP + CONTINUE + inspect slice on the runtime is complete.
 
 ## MCP-1 — Named/aliased MCP servers
 
@@ -523,6 +525,30 @@ rearchitecture:
   (`NativeOutcome::Call` for eval) — that is **Step G (legacy callback re-entry
   migration)**. Restore this test there.
 
+  **Scope narrowed (2026-07-16, callback-re-entry cooperative fix).** The other
+  callback-driving builtins that previously leaked the same value-ABI
+  "internal error: runtime native function 'X' requires runtime invocation"
+  stub when handed a runtime-only op — `apply`, `call-with-values`, and
+  multi-list `map` — now route a runtime-only-native callee through the
+  structural `NativeOutcome::Call` continuation ABI (like single-list `map`/
+  `filter`/`foldl`/`sort-by`/`for-each`), so it SUSPENDS cleanly. `apply` and
+  `call-with-values` gate on `NativeFn::is_runtime_only()`: only a genuinely
+  runtime-only native (whose value ABI is the stub) takes the cooperative Call;
+  every closure (async handled by `call_function`'s inline-task routing) and
+  dual-ABI blocking native (e.g. `__llm-chat-blocking`, which owns task-scoped
+  stream/agent slab state) keeps its exact prior synchronous path, so
+  cancellation slab-reaping is unchanged. Multi-list `map` drives its callback
+  through `MapMultiContinuation`. Verified WORKING: `(apply async/spawn (list
+  (fn () 5)))` yields an awaitable promise; `(async/await (apply async/spawn
+  (list (fn () 42))))` → 42; `(call-with-values (fn () 1) async/resolved)` yields
+  a promise (producer runs synchronously, the runtime-only consumer suspends);
+  `(map channel/send (list c) (list 5))` runs. Gate tests live in
+  `crates/sema/tests/vm_async_test.rs` (`apply_*`, `call_with_values_*`,
+  `map_multi_list_*`). The **remaining** Step-G surface is nested `eval` of an
+  async form — `(eval '(async/await (async (+ 40 2))))` — which still needs the
+  parent-VM parking machinery above; that is the sole case this deferral now
+  covers.
+
 - **`event_select_yields_to_sibling_in_async_context`**
   (`crates/sema/tests/vm_async_test.rs`). Under the runtime, `event/select`
   resolves its own marker before a co-scheduled sibling runs (observed order
@@ -570,11 +596,15 @@ OR transitively blocked on the caller, with an explicit rule for rendezvous cycl
 the drain stays, documented here, to preserve runtime liveness. The code comment on
 `RuntimeRequest::OriginBarrier` points here.
 
-**DAP + wasm async debugging remain on the legacy scheduler.** The unified
-`Runtime` has no cooperative-debug / step mode yet, so async breakpoints and
-cooperative stepping (`crates/sema-dap`, `crates/sema-wasm`) still call
-`init_scheduler` + `VM::execute`. This is a known deferral to address when a
-runtime debug/step API exists; SYNC debugging is unaffected by the eval flip.
+**DAP + wasm async debugging now run ON the unified runtime (P3-B1/B2).** The
+DAP and WASM debug drivers (`crates/sema-dap`, `crates/sema-wasm`) drive a
+debugged program's VM via `drive_vm_on_runtime` under an `ActiveDebugGuard`
+(`DriveState::DebugStopped` → `Stopped`), so async breakpoints, Continue, and
+frame inspection work against the runtime task's own VM frames — the legacy
+`init_scheduler` + `VM::execute` async debug path is retired. See ASYNC-DEBUG-1
+(RESOLVED) above. The one residual is cross-sibling stepping (ASYNC-2, B3):
+stepping does not follow control across the scheduler boundary into sibling
+tasks. SYNC debugging was always unaffected.
 
 ### F2-RESIDUAL — external I/O still on the AwaitIo bridge (needs new runtime primitives)
 

@@ -149,6 +149,15 @@ pub struct NativeFn {
     /// `Env`, or anything that transitively owns either. Traceable state belongs
     /// in a registered `payload`; host infrastructure may capture `Weak` handles.
     runtime_func: Option<Box<RuntimeNativeFnInner>>,
+    /// True when this native has ONLY a runtime ABI — its legacy `func` is the
+    /// "requires runtime invocation" hard-error stub (async/spawn, channel/*,
+    /// async/resolved, …). A dual-ABI native (`simple_with_runtime` /
+    /// `with_ctx_runtime`, e.g. `async/sleep`, `__llm-chat-blocking`) has a real
+    /// `func` and is NOT runtime-only. Callback-driving builtins (`apply`) use
+    /// this to route ONLY genuinely runtime-only callees through the cooperative
+    /// `NativeOutcome::Call` path, keeping every other callee on its exact prior
+    /// synchronous value-ABI path.
+    runtime_only: bool,
 }
 
 impl NativeFn {
@@ -168,6 +177,7 @@ impl NativeFn {
             param_names: None,
             is_closure: false,
             runtime_func: None,
+            runtime_only: false,
         }
     }
 
@@ -187,6 +197,7 @@ impl NativeFn {
             param_names: None,
             is_closure: false,
             runtime_func: None,
+            runtime_only: false,
         }
     }
 
@@ -207,6 +218,7 @@ impl NativeFn {
             param_names: None,
             is_closure: false,
             runtime_func: None,
+            runtime_only: false,
         }
     }
 
@@ -232,6 +244,7 @@ impl NativeFn {
             payload: None,
             param_names: None,
             is_closure: false,
+            runtime_only: true,
         }
     }
 
@@ -258,6 +271,7 @@ impl NativeFn {
             payload: None,
             param_names: None,
             is_closure: false,
+            runtime_only: true,
         }
     }
 
@@ -293,6 +307,7 @@ impl NativeFn {
                 })?;
                 f(&payload, context, args)
             })),
+            runtime_only: true,
         }
     }
 
@@ -319,6 +334,7 @@ impl NativeFn {
             payload: None,
             param_names: None,
             is_closure: false,
+            runtime_only: false,
         }
     }
 
@@ -345,6 +361,7 @@ impl NativeFn {
             payload: None,
             param_names: None,
             is_closure: false,
+            runtime_only: false,
         }
     }
 
@@ -361,6 +378,16 @@ impl NativeFn {
             Some(f) => f(runtime_context, args),
             None => (self.func)(eval_context, args).map(NativeOutcome::Return),
         }
+    }
+
+    /// True when this native can ONLY run through the runtime ABI — its legacy
+    /// value `func` is the "requires runtime invocation" hard-error stub
+    /// (`async/spawn`, `channel/*`, `async/resolved`, …). Callback-driving
+    /// builtins consult this to route a genuinely runtime-only callee through the
+    /// cooperative `NativeOutcome::Call` path (its only viable path) while keeping
+    /// every dual-ABI / legacy callee on its exact prior synchronous path.
+    pub fn is_runtime_only(&self) -> bool {
+        self.runtime_only
     }
 }
 

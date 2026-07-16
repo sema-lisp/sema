@@ -1710,3 +1710,110 @@ fn nested_aggregate_callback_can_spawn_await_and_resume_parent() {
         Value::list(vec![Value::int(5), Value::int(23), Value::int(203)]),
     );
 }
+
+// === Cooperative callback re-entry: apply / call-with-values / multi-list map ===
+//
+// `apply`, `call-with-values`, and multi-list `map` drive their callback through
+// the structural `NativeOutcome::Call` ABI, so a runtime-only native (async/spawn,
+// channel/*, async/resolved) passed as the callback SUSPENDS cleanly instead of
+// hitting the value-ABI "requires runtime invocation" stub. Regression for the
+// callback-re-entry bug.
+
+#[test]
+fn apply_runtime_native_callback_suspends() {
+    // `(apply async/spawn (list thunk))` yields an awaitable promise, not an
+    // "internal error: runtime native function 'async/spawn' requires runtime
+    // invocation".
+    assert_eq!(
+        eval(r#"(async/await (apply async/spawn (list (fn () 42))))"#),
+        Value::int(42)
+    );
+}
+
+#[test]
+fn apply_preserves_synchronous_semantics() {
+    // Leading fixed args + spread final list, applied synchronously.
+    assert_eq!(eval(r#"(apply + 1 2 (list 3 4))"#), Value::int(10));
+}
+
+#[test]
+fn apply_channel_send_callback_runs() {
+    // A runtime-only op applied over a channel runs cooperatively (no stub error).
+    assert_eq!(
+        eval(
+            r#"(let ((c (channel/new 1)))
+                 (apply channel/send (list c 7))
+                 (channel/recv c))"#
+        ),
+        Value::int(7)
+    );
+}
+
+#[test]
+fn call_with_values_consumer_runtime_native_suspends() {
+    // The consumer is a runtime-only op; it suspends cleanly.
+    assert_eq!(
+        eval(r#"(async/await (call-with-values (fn () 7) async/resolved))"#),
+        Value::int(7)
+    );
+}
+
+#[test]
+fn call_with_values_multi_value_spread_preserved() {
+    // A multi-value producer spreads its values as the consumer's args.
+    assert_eq!(
+        eval(r#"(call-with-values (fn () (values 1 2 3)) +)"#),
+        Value::int(6)
+    );
+}
+
+#[test]
+fn call_with_values_producer_runtime_native_suspends() {
+    // The PRODUCER runs a runtime-only op (await inside it) and suspends cleanly;
+    // its result flows to the consumer.
+    assert_eq!(
+        eval(
+            r#"(call-with-values
+                 (fn () (async/await (async/spawn (fn () 40))))
+                 (fn (x) (+ x 2)))"#
+        ),
+        Value::int(42)
+    );
+}
+
+#[test]
+fn map_multi_list_runtime_native_callback_runs() {
+    // Multi-list `map` with a runtime-only callback runs cooperatively; the
+    // channel receives the sent value.
+    assert_eq!(
+        eval(
+            r#"(let ((c (channel/new 1)))
+                 (map channel/send (list c) (list 5))
+                 (channel/recv c))"#
+        ),
+        Value::int(5)
+    );
+}
+
+#[test]
+fn map_multi_list_preserves_zip_semantics() {
+    // Shortest-list truncation + input order, zipped column-wise.
+    assert_eq!(
+        eval(r#"(map (fn (a b) (+ a b)) (list 1 2 3) (list 10 20))"#),
+        Value::list(vec![Value::int(11), Value::int(22)])
+    );
+}
+
+#[test]
+fn map_multi_list_callback_can_await() {
+    // A runtime op inside a multi-list map callback suspends/resumes per column.
+    assert_eq!(
+        eval(
+            r#"(await
+                 (async
+                   (map (fn (a b) (await (async (+ a b))))
+                        (list 1 2 3) (list 100 200 300))))"#
+        ),
+        Value::list(vec![Value::int(101), Value::int(202), Value::int(303)])
+    );
+}

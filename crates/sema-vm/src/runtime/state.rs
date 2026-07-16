@@ -5963,4 +5963,81 @@ mod scope_swap_tests {
         STACK.with(|s| assert!(s.borrow().is_empty()));
         ACTIVE_USAGE.with(|u| assert_eq!(u.get(), 0));
     }
+
+    /// Full interleave with the fast path mixed in: a NON-EMPTY task and an
+    /// EMPTY task run alternating quanta on the same thread, and the empty task
+    /// opens its OWN scope mid-quantum while the empty-skip fast path is active.
+    /// This is the P-hotfix invariant under the fast path: the non-empty task's
+    /// restore must clear the thread-local to empty (so the empty task's install
+    /// legitimately skips), the empty task's mid-quantum scope must be reclaimed
+    /// onto it (never leaking onto the non-empty task), and the non-empty task
+    /// must see ONLY its own step-modified scope when it resumes.
+    #[test]
+    fn interleave_nonempty_then_empty_skip_with_midquantum_open() {
+        setup_empty_seams();
+        STACK.with(|s| s.borrow_mut().clear());
+        ACTIVE_USAGE.with(|a| a.set(0));
+
+        let mut ne = make_task(10, 1); // non-empty: span [10], usage 1
+        let mut e = make_empty_task(); // empty captured: span [], usage 0
+
+        // Quantum 1 — non-empty task: real swap installs its own scope.
+        {
+            let mut swap = TaskScopeSwap::install(&mut ne);
+            assert!(
+                !swap.skipped[1] && !swap.skipped[2],
+                "non-empty must not skip"
+            );
+            STACK.with(|s| assert_eq!(*s.borrow(), vec![10]));
+            ACTIVE_USAGE.with(|u| assert_eq!(u.get(), 1));
+            STACK.with(|s| s.borrow_mut().push(11)); // open a child span this step
+            ACTIVE_USAGE.with(|u| u.set(5)); // accrue usage this step
+            swap.restore(&mut ne);
+        }
+        // Restore must have cleared the thread-local to empty (displaced ambient
+        // was empty) — this is what lets the empty task's install skip below.
+        STACK.with(|s| assert!(s.borrow().is_empty(), "ne restore must clear ambient"));
+        ACTIVE_USAGE.with(|u| assert_eq!(u.get(), 0));
+
+        // Quantum 2 — empty task: fast-path skip fires (ambient is now empty),
+        // and the quantum opens its OWN scope directly against the thread-local.
+        {
+            let mut swap = TaskScopeSwap::install(&mut e);
+            assert!(swap.skipped[1] && swap.skipped[2], "empty task must skip");
+            // The empty task must NOT observe the non-empty task's leftover.
+            STACK.with(|s| assert!(s.borrow().is_empty(), "empty task saw ne's span"));
+            ACTIVE_USAGE.with(|u| assert_eq!(u.get(), 0, "empty task saw ne's usage"));
+            STACK.with(|s| s.borrow_mut().push(99)); // empty task opens its own span
+            ACTIVE_USAGE.with(|u| u.set(7));
+            swap.restore(&mut e);
+        }
+        // Empty task's mid-quantum scope reclaimed onto it; thread-local cleared.
+        STACK.with(|s| assert!(s.borrow().is_empty(), "e restore must clear ambient"));
+        ACTIVE_USAGE.with(|u| assert_eq!(u.get(), 0));
+
+        // Quantum 3 — non-empty task resumes: its captured scope is now the
+        // step-modified [10, 11]/5, and it must see ONLY that — never the empty
+        // task's [99]/7.
+        {
+            let mut swap = TaskScopeSwap::install(&mut ne);
+            assert!(!swap.skipped[1] && !swap.skipped[2]);
+            STACK.with(|s| assert_eq!(*s.borrow(), vec![10, 11], "ne inherited e's span"));
+            ACTIVE_USAGE.with(|u| assert_eq!(u.get(), 5, "ne inherited e's usage"));
+            swap.restore(&mut ne);
+        }
+
+        // The empty task carries its own reclaimed [99]/7, isolated from ne.
+        let e_stack = e.scopes.captured[1]
+            .take()
+            .unwrap()
+            .downcast::<Vec<u64>>()
+            .unwrap();
+        assert_eq!(*e_stack, vec![99]);
+        let e_usage = e.scopes.captured[2]
+            .take()
+            .unwrap()
+            .downcast::<u64>()
+            .unwrap();
+        assert_eq!(*e_usage, 7);
+    }
 }

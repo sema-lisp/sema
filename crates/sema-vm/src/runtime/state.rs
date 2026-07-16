@@ -1805,6 +1805,16 @@ impl Runtime {
                 // placeholder on its stack top; the runtime drives the handle to
                 // completion ON THE VM THREAD (`poll_io_waits`) and resumes the
                 // frame with the decoded value (or raises the error in-frame).
+                //
+                // NOTE (AwaitIo funeral, P2): the llm (complete/send/chat/extract/
+                // classify/summarize/compare/conversation-say/embed/batch/rerank/
+                // stream/io-sleep-once) and ws (connect/recv/recv-timeout) ops now
+                // SUSPEND structurally (`WaitKind::External` / cooperative poll) in
+                // a runtime quantum, so they no longer reach here. This bridge is
+                // still LIVE for the remaining fs_offload-style runtime-quantum
+                // producers not yet converted (archive, pdf, diff, list, server,
+                // async_ops); the funeral (deleting `io_waits`/`poll_io_waits`) is
+                // deferred until those are migrated too.
                 YieldReason::AwaitIo(handle) => {
                     task.vm_call = Some(vm);
                     TaskAction::VmAwaitIo(task_id, handle)

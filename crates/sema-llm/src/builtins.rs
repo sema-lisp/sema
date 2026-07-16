@@ -601,6 +601,47 @@ fn register_runtime_fn_ctx(
     );
 }
 
+/// Like [`register_runtime_fn_ctx`], but capability-gated and value-args (no
+/// `EvalContext` in the body). The gate runs on BOTH ABI callbacks so a sandboxed
+/// caller sees the same `PermissionDenied` whether the native is reached at top
+/// level (legacy callback) or inside a runtime task quantum (runtime callback).
+fn register_runtime_fn_gated(
+    env: &Env,
+    sandbox: &sema_core::Sandbox,
+    cap: sema_core::Caps,
+    name: &str,
+    f: impl Fn(&[Value]) -> sema_core::runtime::NativeResult + 'static,
+) {
+    use sema_core::runtime::NativeOutcome;
+    type RuntimeFnBody = dyn Fn(&[Value]) -> sema_core::runtime::NativeResult;
+    let body: std::rc::Rc<RuntimeFnBody> = if sandbox.is_unrestricted() {
+        std::rc::Rc::new(f)
+    } else {
+        let sandbox = sandbox.clone();
+        let fn_name = name.to_string();
+        std::rc::Rc::new(move |args: &[Value]| {
+            sandbox.check(cap, &fn_name)?;
+            f(args)
+        })
+    };
+    let for_func = body.clone();
+    let for_runtime = body;
+    let err_name = name.to_string();
+    env.set(
+        sema_core::intern(name),
+        Value::native_fn(NativeFn::simple_with_runtime(
+            name,
+            move |args| match for_func(args)? {
+                NativeOutcome::Return(value) => Ok(value),
+                _ => Err(SemaError::eval(format!(
+                    "{err_name}: native suspended outside the cooperative runtime"
+                ))),
+            },
+            move |_native_ctx, args| for_runtime(args),
+        )),
+    );
+}
+
 /// Cooperative teardown for an `llm/with-*` dynamic-scope wrapper. The wrapper's
 /// setup installs the scope's thread-local state and hands this continuation a
 /// `teardown` closure that restores the prior state; the runtime drives the
@@ -1377,25 +1418,6 @@ fn parse_lisp_provider_response(val: &Value, model: &str) -> Result<ChatResponse
     }
 }
 
-fn register_fn_gated(
-    env: &Env,
-    sandbox: &sema_core::Sandbox,
-    cap: sema_core::Caps,
-    name: &str,
-    f: impl Fn(&[Value]) -> Result<Value, SemaError> + 'static,
-) {
-    if sandbox.is_unrestricted() {
-        register_fn(env, name, f);
-    } else {
-        let sandbox = sandbox.clone();
-        let fn_name = name.to_string();
-        register_fn(env, name, move |args| {
-            sandbox.check(cap, &fn_name)?;
-            f(args)
-        });
-    }
-}
-
 fn register_fn_ctx_gated(
     env: &Env,
     sandbox: &sema_core::Sandbox,
@@ -1447,6 +1469,55 @@ fn register_fn_ctx_gated_as(
             })),
         );
     }
+}
+
+/// Runtime-ABI sibling of [`register_fn_ctx_gated_as`]: registers under
+/// `reg_name` a dual-ABI native whose body speaks `NativeResult` (so its
+/// `in_runtime_quantum` branch can `NativeOutcome::Suspend`), gated as
+/// `display_name`. The runtime callback borrows the shared stdlib `EvalContext`
+/// (as [`register_runtime_fn_ctx`] does); the legacy callback runs the same body
+/// with the real evaluator context and unwraps the plain `Return`.
+fn register_runtime_fn_ctx_gated_as(
+    env: &Env,
+    sandbox: &sema_core::Sandbox,
+    cap: sema_core::Caps,
+    reg_name: &str,
+    display_name: &str,
+    f: impl Fn(&EvalContext, &[Value]) -> sema_core::runtime::NativeResult + 'static,
+) {
+    use sema_core::runtime::NativeOutcome;
+    let f = std::rc::Rc::new(f);
+    let for_func = f.clone();
+    let for_runtime = f;
+    let err_name = display_name.to_string();
+    let unrestricted = sandbox.is_unrestricted();
+    let sandbox_func = sandbox.clone();
+    let sandbox_runtime = sandbox.clone();
+    let gate_name_func = display_name.to_string();
+    let gate_name_runtime = display_name.to_string();
+    env.set(
+        sema_core::intern(reg_name),
+        Value::native_fn(NativeFn::with_ctx_runtime(
+            display_name,
+            move |ctx, args| {
+                if !unrestricted {
+                    sandbox_func.check(cap, &gate_name_func)?;
+                }
+                match for_func(ctx, args)? {
+                    NativeOutcome::Return(value) => Ok(value),
+                    _ => Err(SemaError::eval(format!(
+                        "{err_name}: native suspended outside the cooperative runtime"
+                    ))),
+                }
+            },
+            move |_native_ctx, args| {
+                if !unrestricted {
+                    sandbox_runtime.check(cap, &gate_name_runtime)?;
+                }
+                sema_core::with_stdlib_ctx(|ctx| for_runtime(ctx, args))
+            },
+        )),
+    );
 }
 
 /// Extract the host from a provider `base-url`/`host` string without pulling in
@@ -2165,7 +2236,9 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
     });
 
     // (llm/complete "prompt text" {:model "..." :max-tokens 200 :temperature 0.5})
-    register_fn_gated(env, sandbox, sema_core::Caps::LLM, "llm/complete", |args| {
+    register_runtime_fn_gated(env, sandbox, sema_core::Caps::LLM, "llm/complete", |args| {
+        #[allow(unused_imports)]
+        use sema_core::runtime::NativeOutcome;
         if args.is_empty() || args.len() > 2 {
             return Err(SemaError::arity("llm/complete", "1-2", args.len()));
         }
@@ -2213,21 +2286,25 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
         request.reasoning_effort = reasoning_effort;
         request.timeout_ms = opt_timeout_ms(args.get(1));
 
-        // Inside a scheduler task OR a unified-runtime VM quantum: offload + yield
-        // so siblings overlap (the runtime services the `AwaitIo` yield via the
-        // LegacyAwaitIoBridge). The poller accounts (no post-call `track_usage`
-        // here) and shapes the value. The sync branch below is byte-identical.
+        // Inside a unified-runtime spawned task → SUSPEND on an External wait (the
+        // wire call runs off the VM thread on the executor's async tier); inside a
+        // legacy scheduler task → the `AwaitIo` yield; top level / non-offloadable
+        // chain → the synchronous provider call. The poller/decoder account (no
+        // post-call `track_usage` on the offload paths) and shape the value.
         #[cfg(not(target_arch = "wasm32"))]
-        if in_async_offload_context() && completion_chain_offloadable() {
-            return do_complete_async_yield(
+        {
+            dispatch_complete_offload(
                 request,
                 Box::new(|resp| Ok(Value::string(&resp.content))),
-            );
+                completion_chain_offloadable(),
+            )
         }
-
-        let response = do_complete(request)?;
-        track_usage(&response.usage)?;
-        Ok(Value::string(&response.content))
+        #[cfg(target_arch = "wasm32")]
+        {
+            let response = do_complete(request)?;
+            track_usage(&response.usage)?;
+            Ok(NativeOutcome::Return(Value::string(&response.content)))
+        }
     });
 
     // (llm/chat messages {:model "..." :tools [...] :tool-mode :auto ...})
@@ -2241,13 +2318,15 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
     // completion — WP-LLM-SIMPLE). Gated as "llm/chat" (not this native's own
     // registration name) so a sandboxed caller sees the same `PermissionDenied`
     // regardless of which internal entry point actually runs.
-    register_fn_ctx_gated_as(
+    register_runtime_fn_ctx_gated_as(
         env,
         sandbox,
         sema_core::Caps::LLM,
         "__llm-chat-blocking",
         "llm/chat",
         |ctx, args| {
+            #[allow(unused_imports)]
+            use sema_core::runtime::NativeOutcome;
             if args.is_empty() || args.len() > 2 {
                 return Err(SemaError::arity("llm/chat", "1-2", args.len()));
             }
@@ -2307,20 +2386,23 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
                 request.timeout_ms = opt_timeout_ms(args.get(1));
                 let _conv = conv_scope.open();
 
-                // Inside a scheduler task: offload + yield so siblings overlap; the
-                // poller accounts and shapes the value. Sync branch below is
-                // byte-identical to before. Mirrors `llm/complete`.
+                // A unified-runtime spawned task suspends on an External wait; a
+                // legacy scheduler task yields `AwaitIo`; top level runs the
+                // synchronous provider call.
                 #[cfg(not(target_arch = "wasm32"))]
-                if in_async_offload_context() {
-                    return do_complete_async_yield(
+                {
+                    dispatch_complete_offload(
                         request,
                         Box::new(|resp| Ok(Value::string(&resp.content))),
-                    );
+                        true,
+                    )
                 }
-
-                let response = do_complete(request)?;
-                track_usage(&response.usage)?;
-                Ok(Value::string(&response.content))
+                #[cfg(target_arch = "wasm32")]
+                {
+                    let response = do_complete(request)?;
+                    track_usage(&response.usage)?;
+                    Ok(NativeOutcome::Return(Value::string(&response.content)))
+                }
             } else {
                 // Chat with tool execution loop, synchronously — `run_tool_loop` is a
                 // Rust `for` over rounds that blocks the VM thread per round. Reached
@@ -2347,13 +2429,13 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
                     None, // agent_name
                     conv_scope,
                 )?;
-                Ok(Value::string(&result))
+                Ok(NativeOutcome::Return(Value::string(&result)))
             }
         },
     );
 
     // (llm/send prompt {:model "..." ...})
-    register_fn_gated(env, sandbox, sema_core::Caps::LLM, "llm/send", |args| {
+    register_runtime_fn_gated(env, sandbox, sema_core::Caps::LLM, "llm/send", |args| {
         if args.is_empty() || args.len() > 2 {
             return Err(SemaError::arity("llm/send", "1-2", args.len()));
         }
@@ -2428,7 +2510,9 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
     });
 
     // (llm/extract schema text {:model "..." :validate true :retries 2 :reask? true})
-    register_fn(env, "llm/extract", |args| {
+    register_runtime_fn_ctx(env, "llm/extract", |_ctx, args| {
+        #[allow(unused_imports)]
+        use sema_core::runtime::NativeOutcome;
         if args.len() < 2 || args.len() > 3 {
             return Err(SemaError::arity("llm/extract", "2-3", args.len()));
         }
@@ -2468,34 +2552,13 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
         request.json_mode = true;
         request.system = Some(system.clone());
 
-        // Inside a scheduler task OR a unified-runtime VM quantum: ONLY attempt 0 is
-        // offloaded so siblings overlap; the poller accounts attempt 0, then
-        // `finalize` validates and — only if a re-ask is needed — runs the remaining
-        // attempts on the SYNCHRONOUS `do_complete` path (VM thread). A re-asking
-        // extract therefore briefly blocks siblings; the common single-attempt
-        // extract is fully concurrent.
-        #[cfg(not(target_arch = "wasm32"))]
-        if sema_core::in_async_context() || sema_core::in_runtime_quantum() {
-            let cfg = ExtractConfig {
-                schema,
-                schema_desc,
-                system,
-                model,
-                messages,
-                validate,
-                max_retries,
-                reask,
-            };
-            return do_complete_async_yield(
-                request,
-                Box::new(move |first| extract_validate_and_reask(first, &cfg)),
-            );
-        }
-
-        // Sync path (byte-identical to before): attempt 0 through `do_complete` +
-        // `track_usage`, then the shared validate/re-ask loop.
-        let first = do_complete(request)?;
-        track_usage(&first.usage)?;
+        // ONLY attempt 0 is offloaded so siblings overlap; the poller/decoder
+        // accounts attempt 0, then `finalize` validates and — only if a re-ask is
+        // needed — runs the remaining attempts on the SYNCHRONOUS `do_complete`
+        // path (VM thread). A unified-runtime spawned task suspends on an External
+        // wait; a legacy scheduler task yields `AwaitIo`; top level runs
+        // synchronously (attempt 0 through `do_complete` + `track_usage`, then the
+        // shared validate/re-ask loop — byte-identical to before).
         let cfg = ExtractConfig {
             schema,
             schema_desc,
@@ -2506,7 +2569,20 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
             max_retries,
             reask,
         };
-        extract_validate_and_reask(first, &cfg)
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            dispatch_complete_offload(
+                request,
+                Box::new(move |first| extract_validate_and_reask(first, &cfg)),
+                true,
+            )
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            let first = do_complete(request)?;
+            track_usage(&first.usage)?;
+            extract_validate_and_reask(first, &cfg).map(NativeOutcome::Return)
+        }
     });
 
     // (llm/extract-from-image schema source {:model "..."})
@@ -2598,7 +2674,9 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
     );
 
     // (llm/classify categories text {:model "..."})
-    register_fn(env, "llm/classify", |args| {
+    register_runtime_fn_ctx(env, "llm/classify", |_ctx, args| {
+        #[allow(unused_imports)]
+        use sema_core::runtime::NativeOutcome;
         if args.len() < 2 || args.len() > 3 {
             return Err(SemaError::arity("llm/classify", "2-3", args.len()));
         }
@@ -2653,17 +2731,19 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
             }
         };
 
-        // Inside a scheduler task OR a unified-runtime VM quantum: offload + yield so
-        // siblings overlap; the poller accounts and runs `parse_category`. Sync
-        // branch is byte-identical.
+        // A unified-runtime spawned task suspends on an External wait; a legacy
+        // scheduler task yields `AwaitIo`; top level runs the synchronous provider
+        // call. The poller/decoder accounts and runs `parse_category`.
         #[cfg(not(target_arch = "wasm32"))]
-        if sema_core::in_async_context() || sema_core::in_runtime_quantum() {
-            return do_complete_async_yield(request, Box::new(parse_category));
+        {
+            dispatch_complete_offload(request, Box::new(parse_category), true)
         }
-
-        let response = do_complete(request)?;
-        track_usage(&response.usage)?;
-        parse_category(response)
+        #[cfg(target_arch = "wasm32")]
+        {
+            let response = do_complete(request)?;
+            track_usage(&response.usage)?;
+            parse_category(response).map(NativeOutcome::Return)
+        }
     });
 
     // Conversation functions
@@ -2697,7 +2777,9 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
     });
 
     // (conversation/say conv "message" {:temperature 0.5 :max-tokens 2048 :system "..."})
-    register_fn(env, "conversation/say", |args| {
+    register_runtime_fn_ctx(env, "conversation/say", |_ctx, args| {
+        #[allow(unused_imports)]
+        use sema_core::runtime::NativeOutcome;
         if args.len() < 2 || args.len() > 3 {
             return Err(SemaError::arity("conversation/say", "2-3", args.len()));
         }
@@ -2760,16 +2842,18 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
             }))
         };
 
-        // Inside a scheduler task: offload + yield so siblings overlap. Sync
-        // branch below is byte-identical to before. Mirrors `llm/complete`.
+        // A unified-runtime spawned task suspends on an External wait; a legacy
+        // scheduler task yields `AwaitIo`; top level runs the synchronous call.
         #[cfg(not(target_arch = "wasm32"))]
-        if in_async_offload_context() {
-            return do_complete_async_yield(request, Box::new(finalize));
+        {
+            dispatch_complete_offload(request, Box::new(finalize), true)
         }
-
-        let response = do_complete(request)?;
-        track_usage(&response.usage)?;
-        finalize(response)
+        #[cfg(target_arch = "wasm32")]
+        {
+            let response = do_complete(request)?;
+            track_usage(&response.usage)?;
+            finalize(response).map(NativeOutcome::Return)
+        }
     });
 
     // (conversation/messages conv)
@@ -3283,7 +3367,7 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
         }
         stream_run_begin(request, span)
     });
-    register_fn(env, "__stream-next", |args| {
+    register_runtime_fn_ctx(env, "__stream-next", |_ctx, args| {
         if args.len() != 1 {
             return Err(SemaError::arity("__stream-next", "1", args.len()));
         }
@@ -3379,12 +3463,14 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
     });
 
     // (llm/batch ["prompt1" "prompt2" "prompt3"] {:max-tokens 100})
-    register_fn(env, "llm/batch", |args| {
+    register_runtime_fn_ctx(env, "llm/batch", |_ctx, args| {
+        #[allow(unused_imports)]
+        use sema_core::runtime::NativeOutcome;
         // On resume from the async yield the scheduler re-runs the bytecode AFTER
         // this CALL via `replace_stack_top`, so this native is not re-invoked.
         // Drain any stray resume value defensively (mirrors llm/embed).
         if let Some(v) = sema_core::take_resume_value() {
-            return Ok(v);
+            return Ok(NativeOutcome::Return(v));
         }
         if args.is_empty() || args.len() > 2 {
             return Err(SemaError::arity("llm/batch", "1-2", args.len()));
@@ -3460,6 +3546,37 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
             let usage_accum_slot = current_usage_accum();
             let budget_slot = active_budget();
 
+            // A unified-runtime spawned task SUSPENDS on an External wait (the whole
+            // batch runs as ONE unit on the executor's blocking tier, since
+            // `batch_complete` drives its own internal `join_all`); the decoder folds
+            // usage and shapes the list on the VM thread — byte-identical to the
+            // legacy `AwaitIo` poller. A legacy scheduler task falls through below.
+            if in_runtime_offload_task() {
+                use sema_core::runtime::{
+                    CompletionKind, InterruptibleResource, NativeSuspend,
+                    PreparedExternalOperation, SendPayload, WaitKind,
+                };
+                let p_job = provider.clone();
+                let decoder = Box::new(BatchDecoder {
+                    usage_accum_slot: usage_accum_slot.clone(),
+                    budget_slot: budget_slot.clone(),
+                });
+                let kind = CompletionKind::try_from_raw(BATCH_COMPLETION_KIND)
+                    .expect("batch completion kind is nonzero");
+                let resource =
+                    InterruptibleResource::new("llm/batch", Box::new(CompleteNoopCancelHook));
+                let prepared = PreparedExternalOperation::interruptible_blocking(
+                    kind,
+                    decoder,
+                    resource,
+                    move || Ok(Box::new(p_job.batch_complete(reqs)) as SendPayload),
+                );
+                return Ok(NativeOutcome::Suspend(NativeSuspend {
+                    wait: WaitKind::External(Box::new(prepared)),
+                    continuation: Box::new(OffloadValueContinuation { op: "llm/batch" }),
+                }));
+            }
+
             let (tx, mut rx) =
                 tokio::sync::oneshot::channel::<Vec<Result<ChatResponse, LlmError>>>();
             let p2 = provider.clone();
@@ -3520,7 +3637,7 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
                 }
             }));
             sema_core::set_yield_signal(sema_core::YieldReason::AwaitIo(handle));
-            return Ok(Value::nil());
+            return Ok(NativeOutcome::Return(Value::nil()));
         }
 
         // ── SYNC path: inline provider call (byte-identical to before) ─────
@@ -3543,7 +3660,7 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
             track_usage(&resp.usage)?;
             results.push(Value::string(&resp.content));
         }
-        Ok(Value::list(results))
+        Ok(NativeOutcome::Return(Value::list(results)))
     });
 
     // (llm/set-pricing "model-pattern" input-per-million output-per-million)
@@ -3670,12 +3787,14 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
     //
     // Keeping it a native (not a macro) means `(procedure? llm/embed)` is #t and
     // it is usable as a value: `(map llm/embed …)`, `(async/pool-map llm/embed …)`.
-    register_fn(env, "llm/embed", |args| {
+    register_runtime_fn_ctx(env, "llm/embed", |_ctx, args| {
+        #[allow(unused_imports)]
+        use sema_core::runtime::NativeOutcome;
         // On resume from the async yield the scheduler re-runs the bytecode AFTER
         // this CALL via `replace_stack_top`, so this native is not re-invoked.
         // Drain any stray resume value defensively (mirrors io-sleep-once).
         if let Some(v) = sema_core::take_resume_value() {
-            return Ok(v);
+            return Ok(NativeOutcome::Return(v));
         }
         if args.is_empty() || args.len() > 2 {
             return Err(SemaError::arity("llm/embed", "1-2", args.len()));
@@ -3748,7 +3867,9 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
                     });
                     drop(span);
                     track_usage(&resp.usage)?;
-                    return Ok(embed_value_from_response(&resp, single));
+                    return Ok(NativeOutcome::Return(embed_value_from_response(
+                        &resp, single,
+                    )));
                 }
                 Some(crate::cassette::Decision::Miss(k)) => return Err(cassette_miss_error(&k)),
                 _ => {}
@@ -3776,6 +3897,67 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
             // when the future lands. Mirrors do_complete_async_yield.
             let usage_accum_slot = current_usage_accum();
             let budget_slot = active_budget();
+
+            // A unified-runtime spawned task SUSPENDS on an External wait (the wire
+            // call runs off the VM thread on the executor's async tier); the decoder
+            // finalizes the span / cassette / usage on the VM thread when it lands —
+            // byte-identical to the legacy `AwaitIo` poller below. A legacy scheduler
+            // task falls through to that `AwaitIo` path.
+            if in_runtime_offload_task() {
+                use sema_core::runtime::{
+                    CompletionKind, InterruptibleResource, NativeSuspend,
+                    PreparedExternalOperation, SendPayload, WaitKind,
+                };
+                let provider_for_job = provider.clone();
+                let req_for_job = request.clone();
+                let decoder = Box::new(EmbedDecoder {
+                    span: Some(span),
+                    provider_name: provider_name.clone(),
+                    req_model: req_model.clone(),
+                    recording,
+                    key: cassette_key.clone(),
+                    single,
+                    usage_accum_slot: usage_accum_slot.clone(),
+                    budget_slot: budget_slot.clone(),
+                });
+                let kind = CompletionKind::try_from_raw(EMBED_COMPLETION_KIND)
+                    .expect("embed completion kind is nonzero");
+                let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel::<()>();
+                let resource = InterruptibleResource::new(
+                    "llm/embed",
+                    Box::new(LlmSelectCancelHook {
+                        signal: Some(cancel_tx),
+                    }),
+                );
+                let prepared = PreparedExternalOperation::interruptible_async(
+                    kind,
+                    decoder,
+                    resource,
+                    move || async move {
+                        let work = async move {
+                            match provider_for_job.embed_future(req_for_job.clone()) {
+                                Some(fut) => fut.await,
+                                None => {
+                                    let p = provider_for_job.clone();
+                                    sema_io::io_offload_blocking(move || p.embed(req_for_job)).await
+                                }
+                            }
+                        };
+                        // A mid-flight cancel drops the in-flight request future.
+                        let r = tokio::select! {
+                            biased;
+                            _ = cancel_rx => Err(LlmError::Config("cancelled".to_string())),
+                            r = work => r,
+                        };
+                        Ok(Box::new(r) as SendPayload)
+                    },
+                );
+                return Ok(NativeOutcome::Suspend(NativeSuspend {
+                    wait: WaitKind::External(Box::new(prepared)),
+                    continuation: Box::new(OffloadValueContinuation { op: "llm/embed" }),
+                }));
+            }
+
             let (tx, mut rx) = tokio::sync::oneshot::channel::<Result<EmbedResponse, LlmError>>();
             let req2 = request.clone();
             // Spawned pool future (the http/shell abort tier): providers with a
@@ -3884,7 +4066,7 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
                 abort,
             ));
             sema_core::set_yield_signal(sema_core::YieldReason::AwaitIo(handle));
-            return Ok(Value::nil());
+            return Ok(NativeOutcome::Return(Value::nil()));
         }
 
         // ── SYNC path: inline provider call (byte-identical to before) ─────
@@ -3953,18 +4135,22 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
         };
 
         track_usage(&response.usage)?;
-        Ok(embed_value_from_response(&response, single))
+        Ok(NativeOutcome::Return(embed_value_from_response(
+            &response, single,
+        )))
     });
 
     // (llm/rerank query documents {:top-k 5 :model "..." :provider :cohere})
     // Cross-encoder reranking. Returns a list of {:index :score :document}, highest
     // relevance first. `documents` is a list of strings.
-    register_fn(env, "llm/rerank", |args| {
+    register_runtime_fn_ctx(env, "llm/rerank", |_ctx, args| {
+        #[allow(unused_imports)]
+        use sema_core::runtime::NativeOutcome;
         // On resume from the async yield the scheduler re-runs the bytecode AFTER
         // this CALL via `replace_stack_top`, so this native is not re-invoked.
         // Drain any stray resume value defensively (mirrors llm/embed).
         if let Some(v) = sema_core::take_resume_value() {
-            return Ok(v);
+            return Ok(NativeOutcome::Return(v));
         }
         if args.len() < 2 || args.len() > 3 {
             return Err(SemaError::arity("llm/rerank", "2-3", args.len()));
@@ -3984,7 +4170,7 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
             })
             .collect::<Result<_, _>>()?;
         if documents.is_empty() {
-            return Ok(Value::list(vec![]));
+            return Ok(NativeOutcome::Return(Value::list(vec![])));
         }
 
         let mut top_k = None;
@@ -4038,6 +4224,59 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
                         }),
                 }
             })?;
+
+            // A unified-runtime spawned task SUSPENDS on an External wait; the
+            // decoder builds the reordered output on the VM thread when it lands. A
+            // legacy scheduler task falls through to the `AwaitIo` path below.
+            if in_runtime_offload_task() {
+                use sema_core::runtime::{
+                    CompletionKind, InterruptibleResource, NativeSuspend,
+                    PreparedExternalOperation, SendPayload, WaitKind,
+                };
+                let provider_for_job = resolved_provider.clone();
+                let req_for_job = request.clone();
+                let decoder = Box::new(RerankDecoder {
+                    span: Some(span),
+                    documents: documents.clone(),
+                });
+                let kind = CompletionKind::try_from_raw(RERANK_COMPLETION_KIND)
+                    .expect("rerank completion kind is nonzero");
+                let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel::<()>();
+                let resource = InterruptibleResource::new(
+                    "llm/rerank",
+                    Box::new(LlmSelectCancelHook {
+                        signal: Some(cancel_tx),
+                    }),
+                );
+                let prepared = PreparedExternalOperation::interruptible_async(
+                    kind,
+                    decoder,
+                    resource,
+                    move || async move {
+                        let work = async move {
+                            match provider_for_job.rerank_future(req_for_job.clone()) {
+                                Some(fut) => fut.await,
+                                None => {
+                                    let p = provider_for_job.clone();
+                                    sema_io::io_offload_blocking(move || p.rerank(req_for_job))
+                                        .await
+                                }
+                            }
+                        };
+                        // A mid-flight cancel drops the in-flight request future.
+                        let r = tokio::select! {
+                            biased;
+                            _ = cancel_rx => Err(LlmError::Config("cancelled".to_string())),
+                            r = work => r,
+                        };
+                        Ok(Box::new(r) as SendPayload)
+                    },
+                );
+                return Ok(NativeOutcome::Suspend(NativeSuspend {
+                    wait: WaitKind::External(Box::new(prepared)),
+                    continuation: Box::new(OffloadValueContinuation { op: "llm/rerank" }),
+                }));
+            }
 
             let (tx, mut rx) = tokio::sync::oneshot::channel::<Result<RerankResponse, LlmError>>();
             let req2 = request.clone();
@@ -4102,7 +4341,7 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
                 abort,
             ));
             sema_core::set_yield_signal(sema_core::YieldReason::AwaitIo(handle));
-            return Ok(Value::nil());
+            return Ok(NativeOutcome::Return(Value::nil()));
         }
 
         // ── SYNC path: inline provider call (byte-identical to before) ─────
@@ -4125,7 +4364,9 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
             .collect();
         span.set_output(&out_docs);
 
-        Ok(rerank_value_from_response(&resp, &documents))
+        Ok(NativeOutcome::Return(rerank_value_from_response(
+            &resp, &documents,
+        )))
     });
 
     // (llm/similarity vec1 vec2) — cosine similarity
@@ -4669,7 +4910,9 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
     });
 
     // (conversation/say-as conv system-prompt "message" opts?) — say with a different system prompt for one turn
-    register_fn(env, "conversation/say-as", |args| {
+    register_runtime_fn_ctx(env, "conversation/say-as", |_ctx, args| {
+        #[allow(unused_imports)]
+        use sema_core::runtime::NativeOutcome;
         if args.len() < 3 || args.len() > 4 {
             return Err(SemaError::arity("conversation/say-as", "3-4", args.len()));
         }
@@ -4749,16 +4992,18 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
             }))
         };
 
-        // Inside a scheduler task: offload + yield so siblings overlap. Sync
-        // branch below is byte-identical to before. Mirrors `llm/complete`.
+        // A unified-runtime spawned task suspends on an External wait; a legacy
+        // scheduler task yields `AwaitIo`; top level runs the synchronous call.
         #[cfg(not(target_arch = "wasm32"))]
-        if in_async_offload_context() {
-            return do_complete_async_yield(request, Box::new(finalize));
+        {
+            dispatch_complete_offload(request, Box::new(finalize), true)
         }
-
-        let response = do_complete(request)?;
-        track_usage(&response.usage)?;
-        finalize(response)
+        #[cfg(target_arch = "wasm32")]
+        {
+            let response = do_complete(request)?;
+            track_usage(&response.usage)?;
+            finalize(response).map(NativeOutcome::Return)
+        }
     });
 
     // (conversation/token-count conv) — count total tokens in conversation messages
@@ -5916,7 +6161,9 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
 
     // --- Convenience wrappers ---
 
-    register_fn(env, "llm/summarize", |args| {
+    register_runtime_fn_ctx(env, "llm/summarize", |_ctx, args| {
+        #[allow(unused_imports)]
+        use sema_core::runtime::NativeOutcome;
         if args.is_empty() || args.len() > 2 {
             return Err(SemaError::arity("llm/summarize", "1-2", args.len()));
         }
@@ -5953,22 +6200,27 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
         request.system = Some(system);
         request.max_tokens = Some(4096);
 
-        // Inside a scheduler task: offload + yield so siblings overlap. Sync
-        // branch below is byte-identical to before. Mirrors `llm/complete`.
+        // A unified-runtime spawned task suspends on an External wait; a legacy
+        // scheduler task yields `AwaitIo`; top level runs the synchronous call.
         #[cfg(not(target_arch = "wasm32"))]
-        if in_async_offload_context() {
-            return do_complete_async_yield(
+        {
+            dispatch_complete_offload(
                 request,
                 Box::new(|resp| Ok(Value::string(&resp.content))),
-            );
+                true,
+            )
         }
-
-        let response = do_complete(request)?;
-        track_usage(&response.usage)?;
-        Ok(Value::string(&response.content))
+        #[cfg(target_arch = "wasm32")]
+        {
+            let response = do_complete(request)?;
+            track_usage(&response.usage)?;
+            Ok(NativeOutcome::Return(Value::string(&response.content)))
+        }
     });
 
-    register_fn(env, "llm/compare", |args| {
+    register_runtime_fn_ctx(env, "llm/compare", |_ctx, args| {
+        #[allow(unused_imports)]
+        use sema_core::runtime::NativeOutcome;
         if args.len() < 2 || args.len() > 3 {
             return Err(SemaError::arity("llm/compare", "2-3", args.len()));
         }
@@ -6018,16 +6270,18 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
             Ok(sema_core::json_to_value(&json))
         };
 
-        // Inside a scheduler task: offload + yield so siblings overlap. Sync
-        // branch below is byte-identical to before. Mirrors `llm/complete`.
+        // A unified-runtime spawned task suspends on an External wait; a legacy
+        // scheduler task yields `AwaitIo`; top level runs the synchronous call.
         #[cfg(not(target_arch = "wasm32"))]
-        if in_async_offload_context() {
-            return do_complete_async_yield(request, Box::new(parse_comparison));
+        {
+            dispatch_complete_offload(request, Box::new(parse_comparison), true)
         }
-
-        let response = do_complete(request)?;
-        track_usage(&response.usage)?;
-        parse_comparison(response)
+        #[cfg(target_arch = "wasm32")]
+        {
+            let response = do_complete(request)?;
+            track_usage(&response.usage)?;
+            parse_comparison(response).map(NativeOutcome::Return)
+        }
     });
 
     // (llm/io-sleep-once id [ms]) — AwaitIo spike leaf (NOT for production use).
@@ -6037,20 +6291,55 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
     // scheduler parks the task and runs siblings. Proves real overlap across the
     // per-task-VM scheduler before any agent-loop work. Resolves to `id`.
     #[cfg(not(target_arch = "wasm32"))]
-    register_fn_ctx(env, "llm/io-sleep-once", |_ctx, args| {
+    register_runtime_fn_ctx(env, "llm/io-sleep-once", |_ctx, args| {
+        use sema_core::runtime::NativeOutcome;
         use std::sync::atomic::Ordering;
 
         // Vestigial under CALL_NATIVE: the response arrives via the scheduler's
         // `replace_stack_top`, not by re-invoking this native. Kept for symmetry
         // with the shipped `async/await` pattern.
         if let Some(v) = sema_core::take_resume_value() {
-            return Ok(v);
+            return Ok(NativeOutcome::Return(v));
         }
         if args.is_empty() || args.len() > 2 {
             return Err(SemaError::arity("llm/io-sleep-once", "1-2", args.len()));
         }
         let id = args[0].as_int().unwrap_or(0);
         let ms = args.get(1).and_then(|v| v.as_int()).unwrap_or(1000).max(0) as u64;
+
+        // A unified-runtime spawned task SUSPENDS on an External wait (an async-tier
+        // timer); a legacy scheduler task yields `AwaitIo`. The in-flight gauge is
+        // bumped on the VM thread (matching the legacy path) so a test can prove
+        // simultaneity even before the future's first poll; the future decrements it.
+        if in_runtime_offload_task() {
+            use sema_core::runtime::{
+                CompletionKind, InterruptibleResource, NativeSuspend, PreparedExternalOperation,
+                SendPayload, WaitKind,
+            };
+            let prev = IO_INFLIGHT.fetch_add(1, Ordering::SeqCst) + 1;
+            IO_PEAK.fetch_max(prev, Ordering::SeqCst);
+            let kind = CompletionKind::try_from_raw(IO_SLEEP_COMPLETION_KIND)
+                .expect("io-sleep completion kind is nonzero");
+            let resource =
+                InterruptibleResource::new("llm/io-sleep-once", Box::new(CompleteNoopCancelHook));
+            let prepared = PreparedExternalOperation::interruptible_async(
+                kind,
+                Box::new(IoSleepDecoder),
+                resource,
+                move || async move {
+                    tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+                    let _ = IO_INFLIGHT
+                        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| Some((v - 1).max(0)));
+                    Ok(Box::new(id) as SendPayload)
+                },
+            );
+            return Ok(NativeOutcome::Suspend(NativeSuspend {
+                wait: WaitKind::External(Box::new(prepared)),
+                continuation: Box::new(OffloadValueContinuation {
+                    op: "llm/io-sleep-once",
+                }),
+            }));
+        }
 
         let (tx, mut rx) = tokio::sync::oneshot::channel::<i64>();
 
@@ -6080,7 +6369,7 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
             }
         }));
         sema_core::set_yield_signal(sema_core::YieldReason::AwaitIo(handle));
-        Ok(Value::nil())
+        Ok(NativeOutcome::Return(Value::nil()))
     });
 }
 
@@ -6126,7 +6415,9 @@ fn extract_float_vec(val: &Value) -> Result<Vec<f64>, SemaError> {
         .collect()
 }
 
-fn complete_with_prompt(prompt: &Prompt, opts: Option<&Value>) -> Result<Value, SemaError> {
+fn complete_with_prompt(prompt: &Prompt, opts: Option<&Value>) -> sema_core::runtime::NativeResult {
+    #[allow(unused_imports)]
+    use sema_core::runtime::NativeOutcome;
     let messages: Vec<ChatMessage> = prompt
         .messages
         .iter()
@@ -6151,17 +6442,23 @@ fn complete_with_prompt(prompt: &Prompt, opts: Option<&Value>) -> Result<Value, 
     // Per-call observability tags/metadata (read inside do_complete's span).
     let _tele = install_call_telemetry(opts.and_then(|v| v.as_map_rc()).as_ref());
 
-    // Inside a scheduler task: offload + yield so siblings overlap (shared by
-    // `llm/send` and the Prompt-arg branch of `llm/complete`). Sync branch below
-    // is byte-identical to before. Mirrors `llm/complete`.
+    // Shared by `llm/send` and the Prompt-arg branch of `llm/complete`: a
+    // unified-runtime spawned task suspends on an External wait, a legacy
+    // scheduler task yields `AwaitIo`, top level runs synchronously.
     #[cfg(not(target_arch = "wasm32"))]
-    if in_async_offload_context() {
-        return do_complete_async_yield(request, Box::new(|resp| Ok(Value::string(&resp.content))));
+    {
+        dispatch_complete_offload(
+            request,
+            Box::new(|resp| Ok(Value::string(&resp.content))),
+            true,
+        )
     }
-
-    let response = do_complete(request)?;
-    track_usage(&response.usage)?;
-    Ok(Value::string(&response.content))
+    #[cfg(target_arch = "wasm32")]
+    {
+        let response = do_complete(request)?;
+        track_usage(&response.usage)?;
+        Ok(NativeOutcome::Return(Value::string(&response.content)))
+    }
 }
 
 fn message_to_chat_message(m: &Message) -> ChatMessage {
@@ -7179,6 +7476,51 @@ fn do_complete_async_yield(
 #[cfg(not(target_arch = "wasm32"))]
 const AGENT_COMPLETE_COMPLETION_KIND: u64 = 0x6c6c_6d63; // "llmc"
 
+/// True when a blocking provider call should offload+suspend on the UNIFIED
+/// RUNTIME's External wait: inside a genuine spawned task (a real `async/spawn` /
+/// `async/pool-map` child, `current_task_id() == Some`), never the top-level root
+/// quantum (which must run the synchronous provider path — see
+/// [`in_async_offload_context`]).
+#[cfg(not(target_arch = "wasm32"))]
+fn in_runtime_offload_task() -> bool {
+    sema_core::in_runtime_quantum() && sema_core::current_task_id().is_some()
+}
+
+/// Route a prepared completion through the offload appropriate to the current
+/// execution context, returning a `NativeResult`. This is the shared split every
+/// simple completion entry point (`llm/complete`, `llm/send`, `llm/chat` no-tools,
+/// `llm/compare`) uses so the runtime (External-wait) and legacy (`AwaitIo`) and
+/// synchronous paths can never drift:
+///
+/// * a unified-runtime spawned task → [`do_complete_runtime_suspend`] (External);
+/// * a legacy cooperative scheduler task → [`do_complete_async_yield`] (`AwaitIo`);
+/// * top level / a non-offloadable chain → the synchronous provider call.
+///
+/// `offloadable` gates the whole offload (`llm/complete`'s
+/// `completion_chain_offloadable()`); pass `true` where the caller always offloads
+/// in an async context. `finalize` shapes the return value from the `ChatResponse`
+/// and — for the sync path — runs on the VM thread after `track_usage`, so it MUST
+/// be equivalent to the caller's own synchronous shaping.
+#[cfg(not(target_arch = "wasm32"))]
+fn dispatch_complete_offload(
+    request: ChatRequest,
+    finalize: CompleteFinalize,
+    offloadable: bool,
+) -> sema_core::runtime::NativeResult {
+    use sema_core::runtime::NativeOutcome;
+    if offloadable {
+        if in_runtime_offload_task() {
+            return do_complete_runtime_suspend(request, finalize);
+        }
+        if sema_core::in_async_context() {
+            return do_complete_async_yield(request, finalize).map(NativeOutcome::Return);
+        }
+    }
+    let response = do_complete(request)?;
+    track_usage(&response.usage)?;
+    finalize(response).map(NativeOutcome::Return)
+}
+
 /// Cooperative provider-complete round under the UNIFIED RUNTIME. Shares the exact
 /// on-VM-thread prep + finalize with `do_complete_async_yield` (cache/cassette/
 /// retry/usage/budget parity), but instead of the legacy `AwaitIo` yield it
@@ -7236,7 +7578,13 @@ fn do_complete_runtime_suspend(
     });
     let kind = CompletionKind::try_from_raw(AGENT_COMPLETE_COMPLETION_KIND)
         .expect("agent completion kind is nonzero");
-    let resource = InterruptibleResource::new("agent/complete", Box::new(CompleteNoopCancelHook));
+    let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel::<()>();
+    let resource = InterruptibleResource::new(
+        "agent/complete",
+        Box::new(LlmSelectCancelHook {
+            signal: Some(cancel_tx),
+        }),
+    );
     let prepared = PreparedExternalOperation::interruptible_async(
         kind,
         decoder,
@@ -7244,11 +7592,22 @@ fn do_complete_runtime_suspend(
         move || async move {
             // Gauge simultaneity the same way the async path does; dropped with the
             // future so an abort can't strand it.
-            let _inflight = InflightGuard::new();
-            if rate_limit_wait_ms > 0 {
-                tokio::time::sleep(std::time::Duration::from_millis(rate_limit_wait_ms)).await;
-            }
-            let r = run_fallback_retry_async(chain, request, max_retries, retry_base_ms).await;
+            let work = async move {
+                let _inflight = InflightGuard::new();
+                if rate_limit_wait_ms > 0 {
+                    tokio::time::sleep(std::time::Duration::from_millis(rate_limit_wait_ms)).await;
+                }
+                run_fallback_retry_async(chain, request, max_retries, retry_base_ms).await
+            };
+            // A mid-flight `async/cancel`/`async/timeout` fires the hook's one-shot
+            // signal; the `biased` select drops the in-flight request future
+            // (connection torn down), robust even when the executor's async tier
+            // drives the job with a thread-parking `block_on` (no task abort).
+            let r = tokio::select! {
+                biased;
+                _ = cancel_rx => Err(crate::types::LlmError::Config("cancelled".to_string())),
+                r = work => r,
+            };
             Ok(Box::new(r) as SendPayload)
         },
     );
@@ -7409,6 +7768,361 @@ impl sema_core::runtime::CancelHook for CompleteNoopCancelHook {
         &mut self,
     ) -> Result<sema_core::runtime::CancelDisposition, sema_core::runtime::CancelHookError> {
         Ok(sema_core::runtime::CancelDisposition::Reaped)
+    }
+}
+
+/// Cancel hook for an interruptible async LLM offload whose in-flight request is
+/// torn down by firing a one-shot signal that the job's `tokio::select!` awaits.
+/// Firing it drops the in-flight provider future (closing the connection) — the
+/// same drop-on-cancel the http path gives, and robust under an executor whose
+/// async tier drives futures with `block_on` (no task-abort). Lives on the runtime
+/// thread, so it need not be `Send`.
+#[cfg(not(target_arch = "wasm32"))]
+struct LlmSelectCancelHook {
+    signal: Option<tokio::sync::oneshot::Sender<()>>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl sema_core::runtime::Trace for LlmSelectCancelHook {
+    fn trace(&self, _sink: &mut dyn FnMut(sema_core::cycle::GcEdge<'_>)) -> bool {
+        true
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl sema_core::runtime::CancelHook for LlmSelectCancelHook {
+    fn cancel(
+        &mut self,
+    ) -> Result<sema_core::runtime::CancelDisposition, sema_core::runtime::CancelHookError> {
+        if let Some(signal) = self.signal.take() {
+            // Err (receiver already gone) means the job finished first; nothing to
+            // tear down. Either way the resource is reaped.
+            let _ = signal.send(());
+        }
+        Ok(sema_core::runtime::CancelDisposition::Reaped)
+    }
+    fn reap(
+        &mut self,
+    ) -> Result<sema_core::runtime::CancelDisposition, sema_core::runtime::CancelHookError> {
+        Ok(sema_core::runtime::CancelDisposition::Reaped)
+    }
+}
+
+/// Generic pass-through continuation for a value-producing offload whose decoder
+/// already built the final `Value`/error (`llm/embed`, `llm/rerank`, `llm/batch`,
+/// `llm/io-sleep-once`). Holds no `Value`, so it emits no GC edges.
+#[cfg(not(target_arch = "wasm32"))]
+struct OffloadValueContinuation {
+    op: &'static str,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl sema_core::runtime::Trace for OffloadValueContinuation {
+    fn trace(&self, _sink: &mut dyn FnMut(sema_core::cycle::GcEdge<'_>)) -> bool {
+        true
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl sema_core::runtime::NativeContinuation for OffloadValueContinuation {
+    fn resume(
+        self: Box<Self>,
+        _context: &mut sema_core::runtime::NativeCallContext<'_>,
+        input: sema_core::runtime::ResumeInput,
+    ) -> sema_core::runtime::NativeResult {
+        use sema_core::runtime::{NativeOutcome, ResumeInput};
+        match input {
+            ResumeInput::Returned(value) => Ok(NativeOutcome::Return(value)),
+            ResumeInput::Failed(error) => Err(error),
+            ResumeInput::Cancelled(reason) => Err(SemaError::eval(format!(
+                "{} was cancelled ({reason:?})",
+                self.op
+            ))),
+            ResumeInput::Runtime(_) => Err(SemaError::eval(format!(
+                "{} continuation received an unexpected runtime response",
+                self.op
+            ))),
+        }
+    }
+}
+
+/// Completion-kind tag for an `llm/embed` round offloaded through the unified
+/// runtime's External-wait machinery.
+#[cfg(not(target_arch = "wasm32"))]
+const EMBED_COMPLETION_KIND: u64 = 0x656d_6264; // "embd"
+
+/// Decoder for an offloaded `llm/embed`: finalizes the detached span, records the
+/// cassette, decodes the embedding, and accounts usage against the DISPATCH-TIME
+/// leaf/budget frames — byte-identical to the legacy `AwaitIo` poller, run on the
+/// VM thread when the wire future lands. Holds no live `Value` (the span, model
+/// strings, and captured slots are not `Value`s), so it emits no GC edges.
+#[cfg(not(target_arch = "wasm32"))]
+struct EmbedDecoder {
+    span: Option<sema_otel::LlmSpan>,
+    provider_name: String,
+    req_model: String,
+    recording: bool,
+    key: String,
+    single: bool,
+    usage_accum_slot: Option<Rc<RefCell<LeafUsage>>>,
+    budget_slot: Option<Rc<RefCell<BudgetFrame>>>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl sema_core::runtime::Trace for EmbedDecoder {
+    fn trace(&self, _sink: &mut dyn FnMut(sema_core::cycle::GcEdge<'_>)) -> bool {
+        true
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl sema_core::runtime::CompletionDecoder for EmbedDecoder {
+    fn decode(
+        mut self: Box<Self>,
+        _context: &mut sema_core::runtime::NativeCallContext<'_>,
+        result: Result<sema_core::runtime::SendPayload, sema_core::runtime::ExternalFailure>,
+    ) -> sema_core::runtime::DecodedCompletion {
+        let payload = match result {
+            Ok(payload) => payload,
+            Err(failure) => {
+                if let Some(span) = self.span.take() {
+                    span.record_error("io", failure.message());
+                }
+                return Err(SemaError::eval(format!("embed: {}", failure.message())));
+            }
+        };
+        let wire = match sema_core::runtime::downcast_send_payload::<Result<EmbedResponse, LlmError>>(
+            payload, "embed",
+        ) {
+            Ok(wire) => wire,
+            Err(failure) => {
+                if let Some(span) = self.span.take() {
+                    span.record_error("io", failure.message());
+                }
+                return Err(SemaError::eval(format!("embed: {}", failure.message())));
+            }
+        };
+        match wire {
+            Ok(resp) => {
+                if let Some(span) = self.span.take() {
+                    span.set_dispatch(&self.provider_name, &self.req_model);
+                    span.set_response(&sema_otel::ResponseFacts {
+                        input_tokens: resp.usage.prompt_tokens,
+                        output_tokens: 0,
+                        response_model: resp.model.clone(),
+                        cost_usd: pricing::calculate_cost_for(&self.provider_name, &resp.usage),
+                        ..Default::default()
+                    });
+                }
+                if self.recording {
+                    CASSETTE.with(|c| {
+                        if let Some(cass) = c.borrow_mut().as_mut() {
+                            cass.record_entry(crate::cassette::TapeEntry::from_embed(
+                                &self.key,
+                                &resp.model,
+                                &resp.embeddings,
+                                resp.usage.prompt_tokens,
+                            ));
+                        }
+                    });
+                }
+                if let Some(slot) = &self.usage_accum_slot {
+                    let cost = pricing::calculate_cost_for(&self.provider_name, &resp.usage);
+                    accumulate_into(slot, &resp.usage, cost);
+                }
+                let value = embed_value_from_response(&resp, self.single);
+                let prev_budget = ACTIVE_BUDGET
+                    .with(|b| std::mem::replace(&mut *b.borrow_mut(), self.budget_slot.clone()));
+                let track_result = USAGE_ACCUM_SUPPRESS.with(|s| {
+                    s.set(true);
+                    let r = track_usage(&resp.usage);
+                    s.set(false);
+                    r
+                });
+                ACTIVE_BUDGET.with(|b| *b.borrow_mut() = prev_budget);
+                track_result?;
+                Ok(value)
+            }
+            Err(e) => {
+                if let Some(span) = self.span.take() {
+                    span.record_error(llm_error_kind(&e), &e.to_string());
+                }
+                Err(SemaError::Llm(e.to_string()))
+            }
+        }
+    }
+}
+
+/// Completion-kind tag for an `llm/rerank` round offloaded through the unified
+/// runtime's External-wait machinery.
+#[cfg(not(target_arch = "wasm32"))]
+const RERANK_COMPLETION_KIND: u64 = 0x7272_6e6b; // "rrnk"
+
+/// Decoder for an offloaded `llm/rerank`: finalizes the detached reranker span and
+/// builds the reordered result list on the VM thread when the wire future lands —
+/// byte-identical to the legacy `AwaitIo` poller. `documents` is plain `String`
+/// data (not `Value`s), so it emits no GC edges.
+#[cfg(not(target_arch = "wasm32"))]
+struct RerankDecoder {
+    span: Option<sema_otel::RerankerSpan>,
+    documents: Vec<String>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl sema_core::runtime::Trace for RerankDecoder {
+    fn trace(&self, _sink: &mut dyn FnMut(sema_core::cycle::GcEdge<'_>)) -> bool {
+        true
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl sema_core::runtime::CompletionDecoder for RerankDecoder {
+    fn decode(
+        mut self: Box<Self>,
+        _context: &mut sema_core::runtime::NativeCallContext<'_>,
+        result: Result<sema_core::runtime::SendPayload, sema_core::runtime::ExternalFailure>,
+    ) -> sema_core::runtime::DecodedCompletion {
+        let payload = match result {
+            Ok(payload) => payload,
+            Err(failure) => {
+                if let Some(span) = self.span.take() {
+                    span.record_error("io", failure.message());
+                }
+                return Err(SemaError::eval(format!("rerank: {}", failure.message())));
+            }
+        };
+        let wire = match sema_core::runtime::downcast_send_payload::<Result<RerankResponse, LlmError>>(
+            payload, "rerank",
+        ) {
+            Ok(wire) => wire,
+            Err(failure) => {
+                if let Some(span) = self.span.take() {
+                    span.record_error("io", failure.message());
+                }
+                return Err(SemaError::eval(format!("rerank: {}", failure.message())));
+            }
+        };
+        match wire {
+            Ok(resp) => {
+                if let Some(span) = self.span.take() {
+                    let out_docs: Vec<(String, f64)> = resp
+                        .results
+                        .iter()
+                        .filter_map(|r| self.documents.get(r.index).map(|d| (d.clone(), r.score)))
+                        .collect();
+                    span.set_output(&out_docs);
+                }
+                Ok(rerank_value_from_response(&resp, &self.documents))
+            }
+            Err(e) => {
+                if let Some(span) = self.span.take() {
+                    span.record_error(llm_error_kind(&e), &e.to_string());
+                }
+                Err(SemaError::Llm(e.to_string()))
+            }
+        }
+    }
+}
+
+/// Completion-kind tag for an `llm/batch` round offloaded through the unified
+/// runtime's External-wait machinery.
+#[cfg(not(target_arch = "wasm32"))]
+const BATCH_COMPLETION_KIND: u64 = 0x6261_7463; // "batc"
+
+/// Decoder for an offloaded `llm/batch`: folds each response into the
+/// DISPATCH-TIME leaf/budget frames and shapes the result list on the VM thread —
+/// byte-identical to the legacy `AwaitIo` poller. Holds no live `Value`.
+#[cfg(not(target_arch = "wasm32"))]
+struct BatchDecoder {
+    usage_accum_slot: Option<Rc<RefCell<LeafUsage>>>,
+    budget_slot: Option<Rc<RefCell<BudgetFrame>>>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl sema_core::runtime::Trace for BatchDecoder {
+    fn trace(&self, _sink: &mut dyn FnMut(sema_core::cycle::GcEdge<'_>)) -> bool {
+        true
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl sema_core::runtime::CompletionDecoder for BatchDecoder {
+    fn decode(
+        self: Box<Self>,
+        _context: &mut sema_core::runtime::NativeCallContext<'_>,
+        result: Result<sema_core::runtime::SendPayload, sema_core::runtime::ExternalFailure>,
+    ) -> sema_core::runtime::DecodedCompletion {
+        let payload = match result {
+            Ok(payload) => payload,
+            Err(failure) => return Err(SemaError::eval(format!("batch: {}", failure.message()))),
+        };
+        let responses = match sema_core::runtime::downcast_send_payload::<
+            Vec<Result<ChatResponse, LlmError>>,
+        >(payload, "batch")
+        {
+            Ok(responses) => responses,
+            Err(failure) => return Err(SemaError::eval(format!("batch: {}", failure.message()))),
+        };
+        let mut results = Vec::with_capacity(responses.len());
+        for resp_result in responses {
+            let resp = resp_result.map_err(|e| SemaError::Llm(e.to_string()))?;
+            // Priced with an empty provider, matching the sync path (which never
+            // stamps a serving provider for `llm/batch`).
+            if let Some(slot) = &self.usage_accum_slot {
+                let cost = pricing::calculate_cost_for("", &resp.usage);
+                accumulate_into(slot, &resp.usage, cost);
+            }
+            let prev_budget = ACTIVE_BUDGET
+                .with(|b| std::mem::replace(&mut *b.borrow_mut(), self.budget_slot.clone()));
+            let track_result = USAGE_ACCUM_SUPPRESS.with(|s| {
+                s.set(true);
+                let r = track_usage(&resp.usage);
+                s.set(false);
+                r
+            });
+            ACTIVE_BUDGET.with(|b| *b.borrow_mut() = prev_budget);
+            track_result?;
+            results.push(Value::string(&resp.content));
+        }
+        Ok(Value::list(results))
+    }
+}
+
+/// Completion-kind tag for the `llm/io-sleep-once` spike leaf's External wait.
+#[cfg(not(target_arch = "wasm32"))]
+const IO_SLEEP_COMPLETION_KIND: u64 = 0x736c_7031; // "slp1"
+
+/// Decoder for the `llm/io-sleep-once` spike leaf: the offloaded timer resolves to
+/// the `id` (`i64`). Holds no state, emits no GC edges.
+#[cfg(not(target_arch = "wasm32"))]
+struct IoSleepDecoder;
+
+#[cfg(not(target_arch = "wasm32"))]
+impl sema_core::runtime::Trace for IoSleepDecoder {
+    fn trace(&self, _sink: &mut dyn FnMut(sema_core::cycle::GcEdge<'_>)) -> bool {
+        true
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl sema_core::runtime::CompletionDecoder for IoSleepDecoder {
+    fn decode(
+        self: Box<Self>,
+        _context: &mut sema_core::runtime::NativeCallContext<'_>,
+        result: Result<sema_core::runtime::SendPayload, sema_core::runtime::ExternalFailure>,
+    ) -> sema_core::runtime::DecodedCompletion {
+        match result {
+            Ok(payload) => {
+                match sema_core::runtime::downcast_send_payload::<i64>(payload, "io-sleep-once") {
+                    Ok(id) => Ok(Value::int(id)),
+                    Err(failure) => Err(SemaError::eval(failure.message().to_string())),
+                }
+            }
+            Err(failure) => Err(SemaError::eval(format!(
+                "io-sleep-once: {}",
+                failure.message()
+            ))),
+        }
     }
 }
 
@@ -10232,11 +10946,118 @@ fn stream_poll_batch(token: u64, blocking: bool) -> Result<Option<Value>, SemaEr
 /// parks on `AwaitIo`; the poller drains all currently-available deltas per wake
 /// (see `stream_poll_batch`). Pre-filled runs and non-async context drain
 /// blockingly without parking.
-fn stream_next(token: u64) -> Result<Value, SemaError> {
+/// Completion-kind tag for the `__stream-next` cooperative inter-scan sleep.
+#[cfg(not(target_arch = "wasm32"))]
+const STREAM_POLL_COMPLETION_KIND: u64 = 0x7374_726d; // "strm"
+/// Milliseconds slept off the VM thread between stream-batch scans.
+#[cfg(not(target_arch = "wasm32"))]
+const STREAM_POLL_INTERVAL_MS: u64 = 5;
+/// Bounded cleanup deadline for the inter-scan sleep job.
+#[cfg(not(target_arch = "wasm32"))]
+const STREAM_POLL_CLEANUP_DEADLINE: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Nil decoder for the `__stream-next` inter-scan sleep — the batch re-check lives
+/// in [`StreamPollContinuation`]; the sleep itself carries no result.
+#[cfg(not(target_arch = "wasm32"))]
+struct StreamPollDecoder;
+
+#[cfg(not(target_arch = "wasm32"))]
+impl sema_core::runtime::Trace for StreamPollDecoder {
+    fn trace(&self, _sink: &mut dyn FnMut(sema_core::cycle::GcEdge<'_>)) -> bool {
+        true
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl sema_core::runtime::CompletionDecoder for StreamPollDecoder {
+    fn decode(
+        self: Box<Self>,
+        _context: &mut sema_core::runtime::NativeCallContext<'_>,
+        result: Result<sema_core::runtime::SendPayload, sema_core::runtime::ExternalFailure>,
+    ) -> sema_core::runtime::DecodedCompletion {
+        match result {
+            Ok(_) => Ok(Value::nil()),
+            Err(failure) => Err(SemaError::eval(failure.message().to_string())),
+        }
+    }
+}
+
+/// Resumes a parked `__stream-next` after its inter-scan sleep: re-scan the run's
+/// delta batch (start the next scan, or resolve). Holds only the run `token`
+/// (`u64`), so it emits no GC edges.
+#[cfg(not(target_arch = "wasm32"))]
+struct StreamPollContinuation {
+    token: u64,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl sema_core::runtime::Trace for StreamPollContinuation {
+    fn trace(&self, _sink: &mut dyn FnMut(sema_core::cycle::GcEdge<'_>)) -> bool {
+        true
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl sema_core::runtime::NativeContinuation for StreamPollContinuation {
+    fn resume(
+        self: Box<Self>,
+        _context: &mut sema_core::runtime::NativeCallContext<'_>,
+        input: sema_core::runtime::ResumeInput,
+    ) -> sema_core::runtime::NativeResult {
+        use sema_core::runtime::ResumeInput;
+        match input {
+            ResumeInput::Returned(_) => stream_next_runtime_step(self.token),
+            ResumeInput::Failed(error) => Err(error),
+            ResumeInput::Cancelled(reason) => Err(SemaError::eval(format!(
+                "__stream-next was cancelled ({reason:?})"
+            ))),
+            ResumeInput::Runtime(_) => Err(SemaError::eval(
+                "__stream-next continuation received an unexpected runtime response",
+            )),
+        }
+    }
+}
+
+/// One cooperative scan of a stream run under the unified runtime: re-check the
+/// delta batch on the VM thread; resolve if a batch is ready, else re-arm the
+/// short inter-scan sleep so sibling tasks overlap while the provider streams.
+#[cfg(not(target_arch = "wasm32"))]
+fn stream_next_runtime_step(token: u64) -> sema_core::runtime::NativeResult {
+    use sema_core::runtime::{
+        CompletionKind, NativeOutcome, NativeSuspend, PreparedExternalOperation, QuarantineBound,
+        SendPayload, WaitKind,
+    };
+    match stream_poll_batch(token, false) {
+        Ok(Some(v)) => return Ok(NativeOutcome::Return(v)),
+        Ok(None) => {}
+        Err(e) => return Err(e),
+    }
+    let kind = CompletionKind::try_from_raw(STREAM_POLL_COMPLETION_KIND)
+        .expect("stream poll completion kind is nonzero");
+    let bound = QuarantineBound::hard_deadline(STREAM_POLL_CLEANUP_DEADLINE)
+        .expect("stream poll cleanup deadline is nonzero");
+    let prepared = PreparedExternalOperation::quarantined_blocking(
+        kind,
+        Box::new(StreamPollDecoder),
+        bound,
+        move || {
+            std::thread::sleep(std::time::Duration::from_millis(STREAM_POLL_INTERVAL_MS));
+            Ok(Box::new(()) as SendPayload)
+        },
+    );
+    Ok(NativeOutcome::Suspend(NativeSuspend {
+        wait: WaitKind::External(Box::new(prepared)),
+        continuation: Box::new(StreamPollContinuation { token }),
+    }))
+}
+
+fn stream_next(token: u64) -> sema_core::runtime::NativeResult {
+    #[allow(unused_imports)]
+    use sema_core::runtime::NativeOutcome;
     // The scheduler resumes the bytecode after the CALL via `replace_stack_top`
     // (this native is not re-invoked); drain a stray resume value defensively.
     if let Some(v) = sema_core::take_resume_value() {
-        return Ok(v);
+        return Ok(NativeOutcome::Return(v));
     }
 
     enum Pre {
@@ -10265,7 +11086,7 @@ fn stream_next(token: u64) -> Result<Value, SemaError> {
 
     let prefilled = match pre {
         Pre::Err(msg) => return Err(SemaError::Llm(msg)),
-        Pre::Done => return Ok(stream_batch_map(Vec::new(), true)),
+        Pre::Done => return Ok(NativeOutcome::Return(stream_batch_map(Vec::new(), true))),
         Pre::Run { prefilled } => prefilled,
     };
 
@@ -10275,9 +11096,18 @@ fn stream_next(token: u64) -> Result<Value, SemaError> {
     if prefilled || (!sema_core::in_async_context() && !sema_core::in_runtime_quantum()) {
         loop {
             if let Some(v) = stream_poll_batch(token, true)? {
-                return Ok(v);
+                return Ok(NativeOutcome::Return(v));
             }
         }
+    }
+
+    // A unified-runtime quantum re-scans cooperatively via a short off-VM-thread
+    // sleep (a bounded External wait), so sibling tasks overlap between delta
+    // batches; a legacy scheduler task yields `AwaitIo` (its poller re-scans each
+    // scheduler tick).
+    #[cfg(not(target_arch = "wasm32"))]
+    if sema_core::in_runtime_quantum() {
+        return stream_next_runtime_step(token);
     }
 
     let handle = Rc::new(sema_core::IoHandle::new(move || {
@@ -10288,7 +11118,7 @@ fn stream_next(token: u64) -> Result<Value, SemaError> {
         }
     }));
     sema_core::set_yield_signal(sema_core::YieldReason::AwaitIo(handle));
-    Ok(Value::nil())
+    Ok(NativeOutcome::Return(Value::nil()))
 }
 
 /// `__stream-finish(token) → content-string`. Cleans the slab entry and returns

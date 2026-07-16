@@ -21,9 +21,74 @@ use futures::{SinkExt, StreamExt};
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
 
+use sema_core::cycle::GcEdge;
+use sema_core::runtime::{NativeOutcome, NativeResult, Trace};
 use sema_core::{check_arity, Caps, IoHandle, IoPoll, SemaError, SemaStream, StreamBox, Value};
 
+use crate::io::{await_runtime_until, RuntimePoll};
 use crate::register_fn;
+
+/// VM-thread readiness probe for a runtime-path `ws/recv`/`ws/recv-timeout`: scans
+/// the incoming-event channel with `try_recv` (never moving the receiver off the
+/// VM thread, so a cancel can't strand it). A message resolves to its value, a
+/// disconnect to `nil`, and — with a `deadline` — a lapse to the `:timeout`
+/// keyword. Holds no `Value` (the receiver handle isn't one), so it emits no GC
+/// edges. Driven by [`await_runtime_until`], which sleeps briefly off the VM
+/// thread between scans so siblings overlap.
+struct WsRecvProbe {
+    evt_rx: Rc<RefCell<mpsc::Receiver<WsEvent>>>,
+    deadline: Option<std::time::Instant>,
+}
+
+impl Trace for WsRecvProbe {
+    fn trace(&self, _sink: &mut dyn FnMut(GcEdge<'_>)) -> bool {
+        true
+    }
+}
+
+impl RuntimePoll for WsRecvProbe {
+    fn poll(&mut self) -> Option<Result<Value, String>> {
+        use tokio::sync::mpsc::error::TryRecvError;
+        match self.evt_rx.borrow_mut().try_recv() {
+            Ok(ev) => Some(event_to_value(Some(ev)).map_err(|e| e.to_string())),
+            Err(TryRecvError::Disconnected) => Some(Ok(Value::nil())),
+            Err(TryRecvError::Empty) => match self.deadline {
+                Some(d) if std::time::Instant::now() >= d => Some(Ok(Value::keyword("timeout"))),
+                _ => None,
+            },
+        }
+    }
+}
+
+/// VM-thread readiness probe for a runtime-path `ws/connect`: scans the pump's
+/// one-shot handshake signal; on success resolves to the pre-built connection
+/// value (carried here and GC-traced across the park). On cancel the probe (and
+/// thus the connection value) is dropped, which closes `cmd_tx` and stops the pump.
+struct WsConnectProbe {
+    ready_rx: tokio::sync::oneshot::Receiver<Result<(), String>>,
+    conn: Value,
+}
+
+impl Trace for WsConnectProbe {
+    fn trace(&self, sink: &mut dyn FnMut(GcEdge<'_>)) -> bool {
+        sink(GcEdge::Value(&self.conn));
+        true
+    }
+}
+
+impl RuntimePoll for WsConnectProbe {
+    fn poll(&mut self) -> Option<Result<Value, String>> {
+        use tokio::sync::oneshot::error::TryRecvError;
+        match self.ready_rx.try_recv() {
+            Ok(Ok(())) => Some(Ok(self.conn.clone())),
+            Ok(Err(msg)) => Some(Err(msg)),
+            Err(TryRecvError::Empty) => None,
+            Err(TryRecvError::Closed) => Some(Err(
+                "ws/connect: connection worker dropped before handshake".to_string(),
+            )),
+        }
+    }
+}
 
 /// Capacity of the incoming-event channel. Bounded so a slow Sema consumer
 /// applies back-pressure to the network read side instead of buffering without
@@ -381,13 +446,13 @@ async fn pump(
 
 /// `ws/connect`: spawn the pump, then await the handshake (block at top level,
 /// yield `AwaitIo` inside an async task). Returns the connection stream value.
-fn ws_connect(url: &str, opts: ConnectOpts) -> Result<Value, SemaError> {
+fn ws_connect(url: &str, opts: ConnectOpts) -> NativeResult {
     use tokio::sync::oneshot::error::TryRecvError;
 
     // Vestigial under CALL_NATIVE (the scheduler delivers the resume value), kept
     // for symmetry with the shipped async yield pattern.
     if let Some(v) = sema_core::take_resume_value() {
-        return Ok(v);
+        return Ok(NativeOutcome::Return(v));
     }
 
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<WsFrame>();
@@ -407,8 +472,20 @@ fn ws_connect(url: &str, opts: ConnectOpts) -> Result<Value, SemaError> {
         evt_rx: Rc::new(RefCell::new(evt_rx)),
     });
 
-    if sema_core::in_async_context() || sema_core::in_runtime_quantum() {
-        // Park until the handshake completes; the pump's per-event notify wakes us.
+    // Unified-runtime quantum: cooperatively poll the handshake signal off the VM
+    // thread (a short inter-scan sleep between scans) so sibling tasks overlap; the
+    // pump keeps running on io_spawn, and a cancel drops the connection value
+    // (closing `cmd_tx` and stopping the pump).
+    if sema_core::in_runtime_quantum() {
+        let probe = WsConnectProbe {
+            ready_rx,
+            conn: conn_val,
+        };
+        return await_runtime_until(Box::new(probe), std::time::Instant::now(), u64::MAX);
+    }
+
+    // Legacy scheduler task: park on an `AwaitIo` poll of the handshake signal.
+    if sema_core::in_async_context() {
         let conn_for_poll = conn_val.clone();
         let handle = Rc::new(IoHandle::with_abort(
             move || match ready_rx.try_recv() {
@@ -422,12 +499,12 @@ fn ws_connect(url: &str, opts: ConnectOpts) -> Result<Value, SemaError> {
             abort_pump,
         ));
         sema_core::set_yield_signal(sema_core::YieldReason::AwaitIo(handle));
-        return Ok(Value::nil());
+        return Ok(NativeOutcome::Return(Value::nil()));
     }
 
     // Top level: block the VM thread on the handshake (it is not inside a runtime).
     match ready_rx.blocking_recv() {
-        Ok(Ok(())) => Ok(conn_val),
+        Ok(Ok(())) => Ok(NativeOutcome::Return(conn_val)),
         Ok(Err(msg)) => Err(SemaError::Io(msg)),
         Err(_) => Err(SemaError::eval(
             "ws/connect: connection worker dropped before handshake",
@@ -468,21 +545,35 @@ fn ws_send(args: &[Value]) -> Result<Value, SemaError> {
     Ok(Value::nil())
 }
 
-fn ws_recv(args: &[Value]) -> Result<Value, SemaError> {
+fn ws_recv(args: &[Value]) -> NativeResult {
     check_arity!(args, "ws/recv", 1);
     let sb = ws_conn(args, "ws/recv", 0)?;
     let (_, evt_rx) = handles_of(&sb);
 
-    if sema_core::in_async_context() || sema_core::in_runtime_quantum() {
+    // Unified-runtime quantum: cooperatively scan the channel off the VM thread so
+    // siblings overlap while no message is ready.
+    if sema_core::in_runtime_quantum() {
         if let Some(v) = sema_core::take_resume_value() {
-            return Ok(v);
+            return Ok(NativeOutcome::Return(v));
         }
-        return ws_recv_async(evt_rx);
+        let probe = WsRecvProbe {
+            evt_rx,
+            deadline: None,
+        };
+        return await_runtime_until(Box::new(probe), std::time::Instant::now(), u64::MAX);
+    }
+
+    // Legacy scheduler task: park on an `AwaitIo` poll.
+    if sema_core::in_async_context() {
+        if let Some(v) = sema_core::take_resume_value() {
+            return Ok(NativeOutcome::Return(v));
+        }
+        return ws_recv_async(evt_rx).map(NativeOutcome::Return);
     }
 
     // Top level: block until an event arrives or the channel disconnects.
     let ev = evt_rx.borrow_mut().blocking_recv();
-    event_to_value(ev)
+    event_to_value(ev).map(NativeOutcome::Return)
 }
 
 /// The async-context recv-with-deadline path. Polls for an event, returning the
@@ -513,7 +604,7 @@ fn ws_recv_timeout_async(
     Ok(Value::nil())
 }
 
-fn ws_recv_timeout(args: &[Value]) -> Result<Value, SemaError> {
+fn ws_recv_timeout(args: &[Value]) -> NativeResult {
     check_arity!(args, "ws/recv-timeout", 2);
     let sb = ws_conn(args, "ws/recv-timeout", 0)?;
     let ms = args[1]
@@ -523,12 +614,27 @@ fn ws_recv_timeout(args: &[Value]) -> Result<Value, SemaError> {
         .max(0) as u64;
     let (_, evt_rx) = handles_of(&sb);
 
-    if sema_core::in_async_context() || sema_core::in_runtime_quantum() {
+    // Unified-runtime quantum: cooperatively scan with a deadline; a lapse resolves
+    // to `:timeout`, off-VM-thread sleeps between scans let siblings overlap.
+    if sema_core::in_runtime_quantum() {
         if let Some(v) = sema_core::take_resume_value() {
-            return Ok(v);
+            return Ok(NativeOutcome::Return(v));
         }
         let deadline = std::time::Instant::now() + std::time::Duration::from_millis(ms);
-        return ws_recv_timeout_async(evt_rx, deadline);
+        let probe = WsRecvProbe {
+            evt_rx,
+            deadline: Some(deadline),
+        };
+        return await_runtime_until(Box::new(probe), std::time::Instant::now(), u64::MAX);
+    }
+
+    // Legacy scheduler task: park on an `AwaitIo` poll with the deadline.
+    if sema_core::in_async_context() {
+        if let Some(v) = sema_core::take_resume_value() {
+            return Ok(NativeOutcome::Return(v));
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(ms);
+        return ws_recv_timeout_async(evt_rx, deadline).map(NativeOutcome::Return);
     }
 
     // Top level: poll on the shared runtime until an event arrives or the deadline
@@ -562,6 +668,7 @@ fn ws_recv_timeout(args: &[Value]) -> Result<Value, SemaError> {
         Outcome::Closed => Ok(Value::nil()),
         Outcome::Timeout => Ok(Value::keyword("timeout")),
     }
+    .map(NativeOutcome::Return)
 }
 
 fn ws_ping(args: &[Value]) -> Result<Value, SemaError> {
@@ -657,12 +764,31 @@ fn parse_connect_opts(v: Option<&Value>) -> Result<ConnectOpts, SemaError> {
     Ok(opts)
 }
 
+/// Register a non-gated dual-ABI ws native whose body returns `NativeResult` (so
+/// its runtime-quantum branch can `NativeOutcome::Suspend`). The legacy callback
+/// unwraps the plain `Return` it produces outside the runtime.
+fn register_runtime_fn(env: &sema_core::Env, name: &'static str, f: fn(&[Value]) -> NativeResult) {
+    env.set(
+        sema_core::intern(name),
+        Value::native_fn(sema_core::NativeFn::simple_with_runtime(
+            name,
+            move |args| match f(args)? {
+                NativeOutcome::Return(value) => Ok(value),
+                _ => Err(SemaError::eval(format!(
+                    "{name}: native suspended outside the cooperative runtime"
+                ))),
+            },
+            move |_native_ctx, args| f(args),
+        )),
+    );
+}
+
 pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
     // Establishing a connection touches the network → gate on NETWORK. The
     // per-message ops below operate on an already-open connection (which could
     // only be obtained through this gate), so they need no separate gate —
     // matching the server-side ws closures.
-    crate::register_fn_gated(env, sandbox, Caps::NETWORK, "ws/connect", |args| {
+    crate::register_runtime_fn_path_gated(env, sandbox, Caps::NETWORK, "ws/connect", &[], |args| {
         check_arity!(args, "ws/connect", 1..=2);
         let url = args[0]
             .as_str()
@@ -678,8 +804,8 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
     });
 
     register_fn(env, "ws/send", ws_send);
-    register_fn(env, "ws/recv", ws_recv);
-    register_fn(env, "ws/recv-timeout", ws_recv_timeout);
+    register_runtime_fn(env, "ws/recv", ws_recv);
+    register_runtime_fn(env, "ws/recv-timeout", ws_recv_timeout);
     register_fn(env, "ws/ping", ws_ping);
     register_fn(env, "ws/close", ws_close);
     register_fn(env, "ws/connected?", ws_connected);

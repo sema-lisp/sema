@@ -58,6 +58,17 @@ wheel wake batching (sleep-storm). Re-run this exact suite after each fix;
 program exit requires ≤1.10× on every row except where a documented semantic
 trade-off is accepted.
 
+## Post-bisect verification note (same day)
+
+A profiling pass initially measured instruction parity on primes and disputed
+the 2× — traced to a stale binary: the bisect had left a post-flip build in the
+baseline worktree's `target/` (`git bisect reset` restores source, not
+artifacts). With the baseline **rebuilt at `3f111e83` and verified**, the
+regression is instruction-backed: primes 256.8M → 540.0M instructions retired
+(2.10×), pingpong 6.5× wall on re-run. Binary identity is now part of the
+measurement protocol (see the Slice 0b plan). The per-element cost is ~28k
+instructions per HOF callback element.
+
 Benchmark sources: six `.sema` programs (spawn-storm, deep-await, sleep-storm,
 primes, cons-1m, channel-pingpong) — reproduce with
 `hyperfine --warmup 2 --runs 7 '<binary> <prog>.sema'` against a

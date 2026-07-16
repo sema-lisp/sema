@@ -20,10 +20,10 @@ use sema_core::runtime::{
     TaskId, TaskOutcome, TaskSettlement, Trace, WaitKind,
 };
 use sema_core::runtime::{CancellationParent, LifetimeOwner, TaskRelations};
-use sema_core::{Env, EvalContext, NativeFn};
 #[cfg(test)]
 use sema_core::Value;
 use sema_core::YieldReason;
+use sema_core::{Env, EvalContext, NativeFn};
 
 use super::channel::{ChannelClose, ChannelWake};
 use super::{
@@ -2922,7 +2922,8 @@ impl Runtime {
                 // for the full element-chain dispatch (Task C: it runs the whole
                 // non-yielding element chain in place, on one reused scratch VM,
                 // instead of round-tripping the ready queue per element).
-                return self.invoke_vm_callback_loop(task_id, owner, call, closure, functions, native_fns);
+                return self
+                    .invoke_vm_callback_loop(task_id, owner, call, closure, functions, native_fns);
             } else if let Some(native) = call.callable.as_native_fn_rc() {
                 let _installed = eval_context.scope_task_context(context.clone());
                 let mut task_context = context.borrow_mut();
@@ -3116,7 +3117,11 @@ impl Runtime {
                 Some(RootState::Running { main_task }) if *main_task == task_id
             )
         };
-        let published_task_id = if is_root_main { None } else { Some(task_id.get()) };
+        let published_task_id = if is_root_main {
+            None
+        } else {
+            Some(task_id.get())
+        };
         let prev_task_id = sema_core::set_current_task_id(published_task_id);
         let mut scopes = TaskScopeSwap::install(&mut task);
         debug_assert!(
@@ -3134,7 +3139,10 @@ impl Runtime {
             // even though this arm only ever executes once (the loop ends at
             // every `break`) — deferring the move to the single post-loop
             // match arm below sidesteps that false conflict.
-            Suspended(VmQuantumResult, Box<dyn sema_core::runtime::NativeContinuation>),
+            Suspended(
+                VmQuantumResult,
+                Box<dyn sema_core::runtime::NativeContinuation>,
+            ),
         }
 
         let mut current_call = call;

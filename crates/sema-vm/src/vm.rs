@@ -1280,8 +1280,10 @@ impl VM {
             .map(|f| f.chunk.n_global_cache_slots as usize)
             .sum();
         self.inline_cache.clear();
-        self.inline_cache
-            .resize(total_cache_slots, (u32::MAX, 0, CachedGlobal::Plain(Value::nil())));
+        self.inline_cache.resize(
+            total_cache_slots,
+            (u32::MAX, 0, CachedGlobal::Plain(Value::nil())),
+        );
         self.globals = globals;
         self.base_functions = functions.clone();
         self.functions = functions;

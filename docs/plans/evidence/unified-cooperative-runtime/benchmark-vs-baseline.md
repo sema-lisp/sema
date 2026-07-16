@@ -74,3 +74,49 @@ primes, cons-1m, channel-pingpong) — reproduce with
 `hyperfine --warmup 2 --runs 7 '<binary> <prog>.sema'` against a
 `jake wt-new`-built baseline at `3f111e83`. Bisect oracle: primes
 median-of-5 < 38ms.
+
+## Slice 0b close-out (2026-07-16, post Tasks A–E, HEAD ec4c4495)
+
+Final matrix, same protocol, baseline binary identity re-verified:
+
+| benchmark | baseline | after 0b | ratio | was |
+|---|---|---|---|---|
+| spawn-storm | 32.5 ms | **21.8 ms** | **0.67× (faster)** | 1.00× |
+| primes (HOF) | 31.8 ms | **23.6 ms** | **0.74× (faster)** | 1.96× |
+| cons-1m | 79.0 ms | 108.8 ms | 1.38× | 1.35× |
+| sleep-storm | 16.7 ms | 27.7 ms | 1.65× | 2.15× |
+| deep-await | 11.7 ms | 20.6 ms (σ 12.9 — noisy) | ~1.7× | 1.29× |
+| channel-pingpong | 32.4 ms | 91.3 ms | **2.82×** | 7.43× |
+
+Instruction-count oracles (low-noise): primes 540M→280M (baseline 257M);
+pingpong 2.50B→1.18B (baseline ~400M — the earlier 1.23B "baseline" figure was
+stale-binary-contaminated and is corrected here). IPC is equal across binaries;
+wall now tracks instructions.
+
+**What landed:** A drive-loop clock batching (~47% of drive samples were
+Instant::now), B register-local instruction countdown, C in-place HOF callback
+dispatch on a reused scratch VM (the big one — primes now beats baseline),
+D matched-rendezvous inline completion, E empty-scope seam-swap skip. Every
+task adversarially reviewed (Opus); two bugs caught pre-merge (per-element
+upvalue snapshot; continuation resume under a live RuntimeState borrow that
+starved GC).
+
+**Residuals (all >1.10×, per-row explanation):**
+- *pingpong 2.82×* — the remaining ~19k instr/message is the genuine-park half
+  of each capacity-1 rendezvous: quantum park/unpark with `Box<VM>` moves and
+  task-map churn. Closing it needs direct task-to-task handoff (peer's resume
+  value written without parking the sender) — a structural follow-up, not a
+  tweak.
+- *sleep-storm 1.65× / deep-await ~1.7×* — per-task lifecycle overhead
+  (spawn+timer+settle through the drive loop); absolute deltas are ~10 ms per
+  500 tasks. spawn-storm (same machinery, no timers) is FASTER than baseline,
+  so the residual is timer-wheel + park path specific.
+- *cons-1m 1.38×* — NOT explained by any 0b target (budget check removed,
+  no HOF, no channels); suspected allocator/GC-registry interaction under the
+  runtime. Needs its own diagnosis; pre-existing vector-cons O(n) shape makes
+  this benchmark allocation-bound.
+
+**Verdict:** the two workloads users hit most (HOF-heavy compute, task
+fan-out) now beat the pre-migration engine. The ≤1.10× bar is NOT met on
+4 of 6 rows; residuals are characterized with named structural follow-ups.
+Accept-or-continue is an owner decision recorded in the orchestration plan.

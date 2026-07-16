@@ -949,6 +949,105 @@ fn rendezvous_wake_survives_receiver_shutdown_cancellation() {
 }
 
 #[test]
+fn channel_close_staged_wake_survives_receiver_cancellation() {
+    // `rendezvous_wake_survives_receiver_shutdown_cancellation` above now
+    // exercises the INLINE rendezvous fast path (a matched send/receive pair
+    // resumes within one `install_channel_wait` work item, never touching
+    // `PendingStage::ChannelWake`/`ChannelClose`). That leaves the genuinely
+    // STAGED wake path — `PendingStage::ChannelClose` -> `consume_channel_wake`
+    // -> `finish_protocol_wait` -> `finish_protocol_wait_now` — with no test
+    // covering its drop guard: a committed completion delivered to a
+    // cancelled/reaped waiter must not be silently dropped.
+    //
+    // `channel/close`, dispatched via `RuntimeRequest::ChannelOp` (not a
+    // `NativeSuspend`), takes the staged path unconditionally: it moves the
+    // parked receiver out of the channel registry's own waiter queue and into
+    // a `ChannelClose` object pushed onto `state.pending` — a real
+    // pending-queue hop with a genuine window between "wake computed" and
+    // "wake delivered" for a later `drive()` work item to process. Landing a
+    // cancellation in that window is the point of this test:
+    // `deliver_cancel_teardown` leaves a `Channel` wait alone (nothing to
+    // eagerly abort), and the periodic `cancel_waiting` scan also skips it
+    // because it is no longer queued in the channel's own registry (the
+    // UCR-3 `has_wait` guard) — so its `protocol_waits` entry survives for the
+    // staged wake to deliver instead of being cancel-dropped ahead of it.
+    let clock = Rc::new(FakeClock::new());
+    let runtime = runtime_with_inline_executor(clock.clone());
+    let channel = runtime.create_channel_for_test(0);
+    let received = Arc::new(Mutex::new(Vec::new()));
+    let receiver = runtime
+        .submit_test_root(TestPreparedTask::native(Ok(NativeOutcome::Suspend(
+            NativeSuspend {
+                wait: WaitKind::Channel(sema_core::runtime::ChannelWait::Receive { channel }),
+                continuation: Box::new(CountingContinuation(Arc::clone(&received))),
+            },
+        ))))
+        .unwrap();
+    runtime.drive(&drive_budget(8)).unwrap();
+    assert_eq!(
+        runtime.channel_receiver_queue_len_for_test(channel),
+        1,
+        "receiver did not park on the empty channel"
+    );
+
+    let _closer = runtime
+        .submit_test_root(TestPreparedTask::native(Ok(NativeOutcome::Runtime(
+            sema_core::runtime::RuntimeRequest::ChannelOp {
+                channel,
+                operation: sema_core::runtime::ChannelOperation::Close,
+                continuation: Box::new(CountingContinuation(Arc::new(Mutex::new(Vec::new())))),
+            },
+        ))))
+        .unwrap();
+
+    // Drive one work item at a time until `channel/close`'s dispatch runs: it
+    // is the single work item that moves the parked receiver out of the
+    // channel registry's queue (into the `ChannelClose` handed to
+    // `state.pending`) without yet delivering its wake. That transition is
+    // the staged window this test needs to land the cancellation in.
+    let mut guard = 0;
+    while runtime.channel_receiver_queue_len_for_test(channel) > 0 {
+        runtime.drive(&drive_budget(1)).unwrap();
+        guard += 1;
+        assert!(
+            guard < 200,
+            "channel/close never dequeued the parked receiver"
+        );
+    }
+
+    // The receiver's `ChannelWake` (Closed) is queued in `state.pending` but
+    // not yet consumed. Cancel the receiver here, in that window.
+    assert!(receiver.cancel(CancelReason::Explicit));
+
+    let report = runtime
+        .shutdown(&super::ShutdownOptions {
+            deadline: clock.now() + Duration::from_secs(1),
+            drive_budget: drive_budget(8),
+        })
+        .expect("bounded shutdown");
+    assert!(report.clean, "{report:?}");
+    assert_eq!(
+        runtime.dropped_protocol_completions_for_test(),
+        0,
+        "a committed close wake was dropped on the staged path"
+    );
+    // The receiver's continuation must still be resumed exactly once, proving
+    // the staged wake (`consume_channel_wake` -> `finish_protocol_wait`) was
+    // actually delivered rather than silently swallowed once the wait landed
+    // in `state.pending`. A cancelled task always observes its resume as
+    // `Cancelled` regardless of the response that was in flight (the
+    // sticky-cancellation override in `resume_continuation_value`), so this
+    // can't assert on the resume's *content* — only that the resume happened
+    // at all, which a silently-dropped wake would never produce (the receiver
+    // would hang and `shutdown` above would report `clean: false`).
+    assert_eq!(
+        received.lock().unwrap().len(),
+        1,
+        "receiver did not observe its staged close wake despite cancellation"
+    );
+}
+
+#[test]
 fn channel_buffer_fifo_close_and_exact_waiter_cleanup() {
     let (runtime, issuers) = runtime_issuers();
     let (_, _, channel_ids) = issuers.into_parts();

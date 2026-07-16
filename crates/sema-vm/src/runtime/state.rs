@@ -4185,6 +4185,14 @@ impl Runtime {
     }
 
     #[cfg(test)]
+    pub(super) fn channel_receiver_queue_len_for_test(
+        &self,
+        channel: sema_core::runtime::ChannelId,
+    ) -> usize {
+        self.state.borrow().channels.receiver_queue_len(channel)
+    }
+
+    #[cfg(test)]
     pub(super) fn dropped_protocol_completions_for_test(&self) -> usize {
         self.state.borrow().dropped_protocol_completions
     }

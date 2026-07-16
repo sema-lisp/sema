@@ -89,6 +89,17 @@ impl ChannelRegistry {
     pub(crate) fn len(&self) -> usize {
         self.channels.len()
     }
+    /// How many receivers are still genuinely queued (unmatched) on `id`. Lets
+    /// a test detect the instant `close`/`try_receive` moves a waiter out of
+    /// this registry (into a `ChannelClose`, or popped as a wake) — the point
+    /// at which its wake becomes a real staged `PendingStage` item rather than
+    /// something that could still be matched inline.
+    #[cfg(test)]
+    pub(crate) fn receiver_queue_len(&self, id: ChannelId) -> usize {
+        self.channels
+            .get(&id)
+            .map_or(0, |channel| channel.receivers.len())
+    }
     pub fn new(runtime: RuntimeId, ids: RuntimeScopedIdCounter<ChannelId>) -> Self {
         Self {
             runtime,

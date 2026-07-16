@@ -480,6 +480,60 @@ client blocks the loop from picking up any other connection's next request.
 See `docs/limitations.md`. The same rearchitecture that fixes SRV-1 (a handler
 task per connection) would fix this too.
 
+**Status as of 2026-07-16: STILL DEFERRED — fail-fast guard retained.** A pass
+was made to land the concurrent rearchitecture under the unified cooperative
+runtime; the failing acceptance gate was written first and left in the tree
+(`crates/sema/tests/http_serve_concurrent_test.rs`, all four scenarios
+`#[ignore]`d pending this work), but the implementation was NOT landed — a
+subtly-broken server (deadlock / dropped response / leaked task) is strictly
+worse than the shipped guard, so the guard stays exactly as-is and the tree
+stays green.
+
+**Concrete design derived (for whoever lands this):**
+
+- **Accept loop as a cooperative multi-stage runtime native.** Convert
+  `http_serve_impl` from a synchronous `Result<Value>` into a `NativeOutcome`
+  chain. After bind + `on-listen`, replace `while let Some(req) =
+  rx.blocking_recv()` with a loop that `Suspend`s on a `WaitKind::External`
+  fed by an async `rx.recv()`. The tokio `mpsc::Receiver<ServerRequest>` is
+  `Send` and `ServerRequest` (its `RawRequest` + `oneshot::Sender<ServerResponse>`)
+  is `Send`, so the External job can move `rx` in, `await` the next request, and
+  hand `(rx, Option<ServerRequest>)` back as the `SendPayload`. A bespoke
+  decoder/continuation pair (cf. `RouterDecoder`) ping-pongs `rx` across
+  iterations via a shared `Rc<RefCell<..>>` since neither `rx` nor the request
+  is a `Value`. On each request the continuation issues
+  `RuntimeRequest::Spawn { callable, .. }` for the handler task, then loops back
+  to the next External wait. The root task then parks indefinitely on External
+  between requests — this REQUIRES verifying the runtime keeps driving the
+  reactor (and does not declare quiescence/deadlock) while the only outstanding
+  work is an idle External wait. That property is the first thing to prove.
+- **Per-request handler task + response routing.** The spawned callable must run
+  the Sema handler AND perform the Rust-side response routing (raw / file / SSE /
+  WS) so the whole per-connection flow can park. Carry the `respond`
+  `oneshot::Sender` (Send, non-`Value`) into a native wrapper via `payload`; the
+  wrapper `NativeCall`s the handler, and its continuation routes the returned
+  `Value`. Moving SSE/WS routing into the task is what unblocks concurrency.
+- **`ws/recv` / `ws/send` must become cooperative External waits.** This is the
+  crux of scenario 2 (WS idle head-of-line): they currently use
+  `blocking_recv`/`blocking_send`, which pin the single VM thread. There is no
+  way to satisfy the head-of-line acceptance test without converting them to
+  park cooperatively on the per-connection `WsMsg` channels via External waits.
+- **Then the fail-fast guard (`in_runtime_quantum() && current_task_id()`) can be
+  removed** so `http/serve` composes inside `async/spawn` — but ONLY after the
+  idle-External-parked accept loop and the cross-task SSE/WS streaming are shown
+  deadlock-free. Otherwise keep the guard.
+
+**Why not landed this pass:** the above is ~500-700 lines of the most intricate
+runtime code in the tree (custom decoders/continuations ping-ponging non-`Value`
+Send state, a cooperative `ws/recv`/`ws/send` conversion, per-connection
+cancellation on dropped clients, GC `Trace` + edge-count coverage for every new
+`Value`-carrying continuation, and 256-slot `tx` backpressure), each piece with
+its own deadlock/leak failure mode. It could not be brought to a *provably*
+deadlock-free, non-leaking state within this pass, and the plan's blessed
+outcome for that situation is exactly the shipped guard. The acceptance tests
+are in place so the eventual landing is TDD-ready: delete their `#[ignore]`
+lines and drive them green.
+
 ## Consciously-not-converted blocking natives
 
 **Found 2026-07-10, during the scheduler-blocking-natives sweep.** Two more

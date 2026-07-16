@@ -67,6 +67,10 @@ task install-pgo: [build-pgo]
 task uninstall:
     cargo uninstall sema-lang
 
+@group install
+@desc "Uninstall then reinstall sema to ~/.cargo/bin"
+task reinstall: [uninstall, install]
+
 # ── Test ─────────────────────────────────────────────────────────────
 
 @group test

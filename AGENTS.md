@@ -57,6 +57,7 @@ jake lint               # fmt-check + clippy -D warnings
 jake fmt                # cargo fmt
 jake install            # install to ~/.cargo/bin (LTO, no PGO)
 jake install-pgo        # PGO build + install (slower build, faster runtime)
+jake reinstall          # uninstall then install
 jake all                # lint + test + build
 jake run                # start REPL
 jake example-notebook   # run demo notebook headlessly

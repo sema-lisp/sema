@@ -72,6 +72,18 @@ run_test() {
             ;;
     esac
 
+    # Per-example run-timeout overrides: correct but genuinely heavy in a debug
+    # build, so the default bound is too tight (flaky under load) — keep full
+    # compile/disasm/run coverage rather than skipping. math-and-crypto sieves
+    # primes with a functional `cons`-based sieve; lists are vector-backed
+    # (`cons` is O(n)), so the sieve is O(n^2) and takes ~13s debug at n=10000.
+    local run_timeout="$TIMEOUT"
+    case "$name" in
+        math-and-crypto.sema)
+            run_timeout=$((TIMEOUT < 45 ? 45 : TIMEOUT))
+            ;;
+    esac
+
     local semac="${f%.sema}.semac"
 
     # 1. Compile
@@ -92,7 +104,7 @@ run_test() {
     fi
 
     # 3. Run compiled bytecode
-    if ! timeout "$TIMEOUT" "$SEMA" "$semac" >/dev/null 2>&1; then
+    if ! timeout "$run_timeout" "$SEMA" "$semac" >/dev/null 2>&1; then
         failed_run=$((failed_run + 1))
         failures="$failures\n  RUN      $f"
         echo "  FAIL  $f (run)"

@@ -3287,7 +3287,7 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
     // is span/journaling-transparent. The synchronous `run_tool_loop` remains only
     // for the genuinely non-runtime path (bare legacy eval without a quantum), where
     // no handler can suspend. See Task 04/06
-    // (`docs/plans/2026-07-13-unified-cooperative-runtime.md`).
+    // (`docs/plans/archive/2026-07-13-unified-cooperative-runtime.md`).
     register_fn_ctx(env, "__runtime-quantum?", |_ctx, _args| {
         Ok(Value::bool(sema_core::in_runtime_quantum()))
     });

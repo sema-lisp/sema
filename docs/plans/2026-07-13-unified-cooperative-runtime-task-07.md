@@ -21,7 +21,11 @@ or owns a private scheduler.
 
 ## Execution contract
 
-- **Status:** Ready only after Task 06 is accepted and committed.
+- **Status (2026-07-16): PARTIALLY LANDED — kept in place as the live P6 remainder.** The DAP
+  host runs on the unified runtime (P3). The common host API (P6-1: `submit_str`/`drive`/
+  `cancel_root`/`command_handle`, root-tagged `OutputEvent`) and the wasm/services hosts (P6-3,
+  SRV-1) remain; see `docs/plans/2026-07-16-post-migration-doc-reconciliation-and-p6-roadmap.md`
+  Slices A–C for sequencing. Original: Ready only after Task 06 is accepted and committed.
 - **Dependencies:** Final runtime/language/resource/context/orchestration APIs and
   clean Task 01–06 review evidence.
 - **Immutable inputs:** Master common host API, native blocking wrappers,

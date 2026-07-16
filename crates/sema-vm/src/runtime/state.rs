@@ -3112,7 +3112,7 @@ impl Runtime {
             // It does NOT make `async/await`/`all`/`race`/`timeout` cancel SUPPLIED
             // promises: those observe producers spawned elsewhere (a different
             // cancellation parent), so an observer's cancellation never reaches
-            // them. See docs/plans/2026-07-13-unified-cooperative-runtime-task-04.md.
+            // them. See docs/plans/archive/2026-07-13-unified-cooperative-runtime-task-04.md.
             let relations = TaskRelations {
                 origin_root: root,
                 cancellation_parent: CancellationParent::Task(spawner),

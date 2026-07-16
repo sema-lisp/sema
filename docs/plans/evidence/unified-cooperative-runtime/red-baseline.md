@@ -56,7 +56,7 @@ After this slice `cargo test -p sema-lang --test vm_async_test` reports
 `async_race_does_not_cancel_supplied_loser`, `awaited_child_mutation_is_visible_to_parent`,
 `scheduler_workload_beyond_tick_ceiling_completes`) stay EXPECTED-RED, owned by
 the runtime scheduling work.
-| `ready_spinner_does_not_starve_due_timer` | `unified_runtime_watchdog_test` | EXPECTED-RED (Task 03 fairness) | evidence `task-02.md:107`; main plan `2026-07-13-unified-cooperative-runtime.md:971` ("watchdog fairness remains Task 03") |
+| `ready_spinner_does_not_starve_due_timer` | `unified_runtime_watchdog_test` | EXPECTED-RED (Task 03 fairness) | evidence `task-02.md:107`; main plan `archive/2026-07-13-unified-cooperative-runtime.md:971` ("watchdog fairness remains Task 03") |
 | `no_adhoc_tokio_runtimes_outside_allowlist` | `runtime_conformance_test` | IN-PROGRESS TASK-03 DRIFT (see note) | not enumerated as RED; conformance target was 8/8 GREEN at Task 02 (`task-02.md:50`) |
 | `unified_runtime_inventory_mapping_covers_exact_current_matches` | `runtime_conformance_test` | IN-PROGRESS TASK-03 DRIFT (see note) | not enumerated as RED; GREEN at Task 02 (`task-02.md:50`) |
 | `unified_runtime_legacy_symbols_match_baseline` | `runtime_conformance_test` | IN-PROGRESS TASK-03 DRIFT (see note) | not enumerated as RED; GREEN at Task 02 (`task-02.md:50`) |

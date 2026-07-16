@@ -1,8 +1,12 @@
 # Unified Cooperative Runtime — Remaining-Work Implementation Plan
 
 **Branch:** `codex/unified-async-runtime` · **Author:** Fable 5 (senior-architect pass, 2026-07-15)
-**Status:** VERIFIED (round-0, two independent Opus reviewers) — corrections applied below; ready
-for implementation pending owner go-ahead.
+**Status (2026-07-16): EXECUTED** — P-hotfix, P0–P5, P7, P8 complete; C1/C2/C3/C4 decided and
+landed (C1 hardened to convergence over six adversarial review rounds — barriers order by
+TaskId = spawn order). Open remainder: P6-1 (host API), P6-3 (wasm Promise roots), SRV-1, Step-G
+(nested `eval` + multimethod-async dispatch). See
+`docs/plans/2026-07-16-post-migration-doc-reconciliation-and-p6-roadmap.md` for sequencing.
+(Original round-0 status: VERIFIED by two independent Opus reviewers; corrections applied below.)
 
 ## Verification round-0 outcome (2 independent Opus reviewers) + applied corrections
 

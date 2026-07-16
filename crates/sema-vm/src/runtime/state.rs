@@ -334,14 +334,6 @@ struct RuntimeState {
     // (a wasted scan); it is never undercounted (every install increments), so a
     // parked barrier is never missed.
     origin_barrier_waits: usize,
-    // Monotonic sequence stamped on each `OriginBarrier` wait at park time. A
-    // nested (inner) `async/run` always parks AFTER its enclosing outer one, so
-    // a higher seq means "more deeply nested". `origin_barrier_released` uses a
-    // strict seq order — a barrier waits for any same-root barrier with a HIGHER
-    // seq and excludes lower ones — giving deterministic innermost-first release
-    // that is deadlock-free by construction and robust to a reaped intermediate
-    // spawner (unlike a live spawn-graph walk).
-    barrier_seq: u64,
     #[cfg(test)]
     force_settlement_exhaustion: bool,
     #[cfg(test)]
@@ -379,9 +371,6 @@ enum ProtocolWaitKind {
     /// resumes the continuation with `Returned(nil)` once it holds.
     OriginBarrier {
         root: RootId,
-        /// Monotonic park-order stamp; higher = more deeply nested. See
-        /// `RuntimeState::barrier_seq`.
-        seq: u64,
     },
 }
 
@@ -623,7 +612,6 @@ impl Runtime {
                 stepping_task: None,
                 dropped_protocol_completions: 0,
                 origin_barrier_waits: 0,
-                barrier_seq: 0,
                 #[cfg(test)]
                 force_settlement_exhaustion: false,
                 #[cfg(test)]
@@ -1181,18 +1169,18 @@ impl Runtime {
         if !state.pending.is_empty() {
             return Ok(false);
         }
-        let candidates: Vec<(super::WaitKey, RootId, TaskId, u64)> = state
+        let candidates: Vec<(super::WaitKey, RootId, TaskId)> = state
             .protocol_waits
             .iter()
             .filter_map(|(key, wait)| match wait.kind {
-                ProtocolWaitKind::OriginBarrier { root, seq } => Some((*key, root, wait.task, seq)),
+                ProtocolWaitKind::OriginBarrier { root } => Some((*key, root, wait.task)),
                 _ => None,
             })
             .collect();
         let Some(key) = candidates
             .into_iter()
-            .find(|(_, root, caller, seq)| origin_barrier_released(&state, *root, *caller, *seq))
-            .map(|(key, _, _, _)| key)
+            .find(|(_, root, caller)| origin_barrier_released(&state, *root, *caller))
+            .map(|(key, _, _)| key)
         else {
             return Ok(false);
         };
@@ -4260,17 +4248,11 @@ fn install_timer_wait(
 }
 
 /// Whether an `async/run` barrier for `caller` (whose origin root is `root` and
-/// whose park-order stamp is `caller_seq`) may release: true when no OTHER task
-/// under `root` is Ready, Running, or parked on a SELF-RESOLVING wait. See
-/// [`Runtime::resolve_origin_barriers`] for the full classification and
-/// rationale (the Reviewer-2 hole: `ResourceSlot` MUST be cycle-forming, or the
-/// barrier hangs on a resource cycle).
-fn origin_barrier_released(
-    state: &RuntimeState,
-    root: RootId,
-    caller: TaskId,
-    caller_seq: u64,
-) -> bool {
+/// may release: true when no OTHER task under `root` is Ready, Running, or
+/// parked on a SELF-RESOLVING wait. See [`Runtime::resolve_origin_barriers`] for
+/// the full classification and rationale (the Reviewer-2 hole: `ResourceSlot`
+/// MUST be cycle-forming, or the barrier hangs on a resource cycle).
+fn origin_barrier_released(state: &RuntimeState, root: RootId, caller: TaskId) -> bool {
     !state.tasks.iter().any(|(id, task)| {
         if *id == caller {
             return false;
@@ -4298,19 +4280,21 @@ fn origin_barrier_released(
                     // Cycle-forming — the barrier does NOT wait on these.
                     Some(ProtocolWaitKind::Channel { .. })
                     | Some(ProtocolWaitKind::ResourceSlot { .. }) => false,
-                    // Another same-root barrier: a strict park-order rule. A
-                    // barrier with a HIGHER seq parked later — it is nested more
-                    // deeply (or simply started its drain later), so THIS caller
-                    // WAITS for it; a LOWER-seq barrier is outer/earlier and is
-                    // excluded. This total order means the highest-seq eligible
-                    // barrier always releases first (its continuation runs, it
-                    // settles, the next-lower barrier then sees it gone), so a
-                    // nested inner barrier can never be starved by its ancestor
-                    // racing it — and two barriers can never mutually wait, so
-                    // there is no deadlock. Robust to a reaped intermediate
-                    // spawner (the stamp lives on the wait, not a live task
-                    // chain).
-                    Some(ProtocolWaitKind::OriginBarrier { seq, .. }) => *seq > caller_seq,
+                    // Another same-root barrier: order by the barrier task's
+                    // SPAWN order (`TaskId`, allocated monotonically). A
+                    // descendant is always spawned AFTER its ancestor (the
+                    // ancestor must run to spawn it), so a higher `TaskId` means
+                    // "nested deeper / spawned later" — THIS caller WAITS for a
+                    // higher-id barrier and EXCLUDES a lower one. This strict
+                    // total order releases the highest-id eligible barrier first
+                    // (its continuation runs, it settles, the next-lower one then
+                    // proceeds), so a nested inner barrier is never starved by an
+                    // ancestor racing it, two barriers can never mutually wait
+                    // (no deadlock), and it is robust to a reaped intermediate
+                    // spawner. (Park order is NOT usable here: an outer task that
+                    // suspends before its own `async/run` lets a descendant park
+                    // first, inverting park order against nesting order.)
+                    Some(ProtocolWaitKind::OriginBarrier { .. }) => *id > caller,
                     // No protocol entry ⇒ an External wait held in the
                     // `WaitRuntime` (a real in-flight I/O op): self-resolving.
                     None => true,
@@ -4351,13 +4335,11 @@ fn install_origin_barrier_wait(
             sema_core::SemaError::eval(format!("origin barrier wait transition failed: {error:?}")),
         )));
     }
-    let seq = state.barrier_seq;
-    state.barrier_seq += 1;
     state.protocol_waits.insert(
         key,
         ProtocolWait {
             task: task_id,
-            kind: ProtocolWaitKind::OriginBarrier { root, seq },
+            kind: ProtocolWaitKind::OriginBarrier { root },
             owner,
             continuation: frame,
         },

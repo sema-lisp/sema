@@ -1953,6 +1953,37 @@ fn nested_async_run_waits_for_inner_barrier() {
     }
 }
 
+/// Barrier ordering is by spawn order (`TaskId`), not park order. When the OUTER
+/// task suspends (here `async/sleep`) BEFORE reaching its own `(async/run)`, the
+/// inner descendant barrier parks FIRST — so a park-order key would invert the
+/// nesting and let the outer release first, dropping the inner continuation.
+/// TaskId order (a descendant's id always exceeds its ancestor's) keeps the
+/// outer waiting for the inner. Deterministic `6`.
+#[test]
+fn nested_async_run_orders_by_spawn_not_park() {
+    for _ in 0..8 {
+        let run = common::watchdog::run_sema_with_timeout(
+            r#"(let ((c (mutable-cell/new 0)))
+                 (async/spawn
+                   (fn ()
+                     (async/spawn (fn () (async/sleep 50) (mutable-cell/set! c 5)))
+                     (async/run)
+                     (mutable-cell/set! c (+ (mutable-cell/get c) 1))))
+                 (async/sleep 10)
+                 (async/run)
+                 (println (mutable-cell/get c)))"#,
+            std::time::Duration::from_secs(15),
+        );
+        assert!(!run.timed_out, "async/run hung; stderr:\n{}", run.stderr);
+        assert!(run.status.success(), "run failed; stderr:\n{}", run.stderr);
+        assert!(
+            run.stdout.trim().ends_with('6'),
+            "expected inner continuation to run (6) despite the outer suspending first, got:\n{}",
+            run.stdout
+        );
+    }
+}
+
 /// Nested-barrier ordering must survive a REAPED intermediate spawner. Task A
 /// spawns B (which runs its own `(async/run)`) and returns — A settles and is
 /// removed before B's barrier resolves. The outer `(async/run)` must still wait

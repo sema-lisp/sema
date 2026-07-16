@@ -40,8 +40,9 @@ TaskContext generalization — the otel/usage/llm swap is already live; workflow
 scopes remain); P6 (Task-07 hosts: common host API + wasm Promise-driven roots + SRV-1 http/serve
 + docs/examples/wasm-asset regen + package-boundary gate — the largest remaining, and where the
 wasm build is verified); P7 (Task-09 adversarial/fuzz/leak campaign + Task-10 six-round review);
-P8 (Task-11 profiling/benchmark/release-readiness). Plus residuals: YieldReason::Sleep cleanup
-(likely dead), the inventory-mapping per-site reconciliation (436 residual), and P3-B3.
+P8 (Task-11 profiling/benchmark/release-readiness). Plus residuals: YieldReason::Sleep retirement
+(LIVE, not dead — it is async/sleep's ctx-less value ABI; retiring it needs a ctx-full sleep
+native), the inventory-mapping per-site reconciliation (436 residual), and P3-B3.
 
 **Every phase now ends with the exhaustive per-binary sweep** (the corrected discipline after the
 mid-migration regression-recovery episode below).

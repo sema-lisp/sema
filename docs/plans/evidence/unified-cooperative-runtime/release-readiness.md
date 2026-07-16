@@ -56,6 +56,12 @@ Two findings surfaced and were FIXED (not deferred):
 - `async/run` was a ready-drain, not a settle-barrier → replaced with the
   deadlock-free self-resolving-waits `OriginBarrier` (C1, commit b90b296b).
 
+Post-report hardening (P7b rounds 3–6): five `async/run` barrier ordering bugs
+found and fixed to convergence (final rule: barriers order by TaskId = spawn
+order; commits 7dcb8966..a48dacef), plus D1 (`apply` of a suspending lambda
+runs cooperatively, commit caf24f4f). Each carries a regression test in
+`crates/sema/tests/vm_async_test.rs`.
+
 ## 4. Performance — NO migration regression
 
 A regression investigation (triggered by a `smoke-bytecode` timeout flake)
@@ -99,6 +105,19 @@ release blocker.
   and all hosts use it; the ergonomic public surface + routing Ctrl-C through
   `cancel_root` (retiring the `check_interrupt` TLS, 1 remaining call site) is a
   clean follow-up, not a correctness gate.
+- **Step-G callback re-entry (nested `eval` of an async form)** — one migration
+  `#[ignore]` remains: `vm_eval_is_vm_native_runs_async`
+  (`crates/sema/tests/vm_integration_test.rs:1775`); needs the parent-VM
+  parking machinery (`NativeOutcome::Call` for `eval`). See `docs/deferred.md`
+  §Unified runtime migration.
+- **Multimethod dispatch of a suspending method** — a characterized
+  pre-existing Step-G-class limitation (dispatch re-enters the evaluator
+  synchronously); documented in `docs/deferred.md`, not introduced by this
+  migration.
+- **ASYNC-2 (cross-sibling debugger stepping)** — stepping does not follow
+  control across the scheduler boundary into sibling tasks (P3-B3 residual;
+  STOP/CONTINUE/inspect/within-task stepping is complete). Deliberately out of
+  scope per the plan; tracked in `docs/deferred.md` §ASYNC-2.
 
 ## 6. Release-readiness verdict
 

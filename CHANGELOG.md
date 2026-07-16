@@ -106,6 +106,22 @@
   the in-repo copy is removed.
 - **The game-of-life example is a full TUI** — altscreen rendering with mouse
   support, built on the raw-mode/altscreen/mouse guard macros.
+- **Unified cooperative runtime.** All async — language promises/channels,
+  external I/O, timers, resource acquisition, and the debugger — now runs on a
+  single interpreter-owned cooperative scheduler through one structural native
+  ABI; the previous split scheduler and its thread-local suspension bridges are
+  gone. User-visible effects:
+  - **`(async/run)` is a transitive settle-barrier**, not a ready-drain: it now
+    waits for every transitively-spawned descendant that is parked on a
+    self-resolving wait (a real `async/sleep` timer or an in-flight external I/O
+    job) to finish before returning, instead of returning as soon as the ready
+    queue drains. It still does not deadlock on cycle-forming waits (a promise,
+    channel, or resource slot another task holds), so a rendezvous-blocked or
+    self-awaiting child releases the barrier rather than hanging it.
+  - **`apply`, `call-with-values`, and multi-list `map`** now compose with
+    async/channel operations — e.g. `(apply async/spawn …)`,
+    `(call-with-values … async/resolved)`, `(map channel/send …)` — instead of
+    raising an internal "requires runtime invocation" error.
 
 ### Performance
 

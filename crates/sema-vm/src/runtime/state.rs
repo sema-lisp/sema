@@ -10,7 +10,7 @@ use crate::vm::{
     close_closure_upvalues_for_foreign_run, close_closure_upvalues_with_owner,
     snapshot_escaping_call_with_owner,
 };
-use crate::{extract_vm_closure, VmExecResult, VM};
+use crate::{extract_vm_closure, Closure, Function, VmExecResult, VmQuantumResult, VM};
 #[cfg(test)]
 use sema_core::runtime::ExternalFailure;
 use sema_core::runtime::{
@@ -20,7 +20,7 @@ use sema_core::runtime::{
     TaskId, TaskOutcome, TaskSettlement, Trace, WaitKind,
 };
 use sema_core::runtime::{CancellationParent, LifetimeOwner, TaskRelations};
-use sema_core::EvalContext;
+use sema_core::{Env, EvalContext, NativeFn};
 #[cfg(test)]
 use sema_core::Value;
 use sema_core::YieldReason;
@@ -305,6 +305,15 @@ struct RuntimeState {
     drive_active: bool,
     active_instruction_limit: usize,
     turn_instructions: usize,
+    /// One reusable VM for `invoke_vm_callback_loop`'s in-place cooperative-HOF
+    /// callback dispatch (Task C). Checked out (`take`n) for the duration of a
+    /// single `invoke_callable` call and returned once that call's element
+    /// chain settles without needing to park — killing the per-element (and,
+    /// with this cache, the per-HOF-call) `VM::new_for_task_with_native_fns`
+    /// allocation. `None` while checked out; a park path that consumes the VM
+    /// into `task.vm_call` simply leaves this `None` and the next use refills
+    /// it with a fresh allocation (see `take_scratch_callback_vm`).
+    scratch_callback_vm: Option<VM>,
     shutting_down: bool,
     terminal_fault: Option<RuntimeFault>,
     /// Cooperative (headless) debug barrier. `Some((root, task, info))` while a
@@ -394,6 +403,10 @@ impl Trace for RuntimeState {
                 .values()
                 .all(|wait| wait.owner.trace(sink) && wait.continuation.trace(sink))
             && self.pending.iter().all(|stage| stage.trace(sink))
+            && self
+                .scratch_callback_vm
+                .as_ref()
+                .is_none_or(|vm| vm.trace(sink))
     }
 }
 
@@ -606,6 +619,7 @@ impl Runtime {
                 drive_active: false,
                 active_instruction_limit: usize::MAX,
                 turn_instructions: 0,
+                scratch_callback_vm: None,
                 shutting_down: false,
                 terminal_fault: None,
                 debug_paused: None,
@@ -1874,7 +1888,30 @@ impl Runtime {
         scopes.restore(task);
         drop(quantum_guard);
         self.state.borrow_mut().turn_instructions += quantum.instructions;
-        let action = match quantum.outcome {
+        Ok(self.quantum_to_action(root, task_id, task, vm, quantum))
+    }
+
+    /// Map a completed [`VmQuantumResult`] to the [`TaskAction`] that drives it
+    /// forward, mutating `task`'s `vm_call`/`vm_owner` as needed. Factored out of
+    /// `run_parked_quantum` so `invoke_vm_callback_loop`'s in-place fast path
+    /// (Task C) can reuse the EXACT SAME suspend-fallback mapping — for a quantum
+    /// that expires its budget, hits a debug stop, sleeps, or suspends
+    /// structurally (`Pending`) — instead of re-deriving it and risking drift.
+    /// The `Pending`/`Finished`/`Err` arms consume `task.vm_owner` (via `.take()`),
+    /// so the caller must have it populated with the owner this quantum's result
+    /// resumes into before calling this — `run_parked_quantum` always does
+    /// (it is set whenever a VM is parked); `invoke_vm_callback_loop` sets it
+    /// explicitly right before falling back, since its in-place elements never
+    /// otherwise touch `task.vm_owner`.
+    fn quantum_to_action(
+        &self,
+        root: RootId,
+        task_id: TaskId,
+        task: &mut RuntimeTask,
+        vm: VM,
+        quantum: VmQuantumResult,
+    ) -> TaskAction {
+        match quantum.outcome {
             Ok(VmExecResult::QuantumExpired { .. }) => {
                 task.vm_call = Some(vm);
                 TaskAction::Yield(root, task_id)
@@ -1937,8 +1974,7 @@ impl Runtime {
                     "unsupported runtime VM stop: {other:?}"
                 ))),
             ),
-        };
-        Ok(action)
+        }
     }
 
     fn visit_ready(&self) -> Result<bool, RuntimeFault> {
@@ -2845,7 +2881,7 @@ impl Runtime {
     fn invoke_callable(
         &self,
         task_id: TaskId,
-        mut owner: ReturnOwner,
+        owner: ReturnOwner,
         call: NativeCall,
     ) -> Result<(), RuntimeFault> {
         let (eval_context, context, cancellation) = {
@@ -2882,49 +2918,11 @@ impl Runtime {
         let (frame, result) =
             if let Some((closure, functions, native_fns)) = extract_vm_closure(&call.callable) {
                 // A cooperative HOF (`map`/`for-each`/`foldl`/…) dispatches its
-                // Sema callback on the FRESH callback VM created below. Any open
-                // upvalues the callback captured — or that ride in its argument
-                // data (e.g. a handler pulled from a map it iterates) — point
-                // into the parked parent (HOF-invoking) VM's stack, not this
-                // callback VM's. Close them to shared, still-live `Tracked` cells
-                // against that parent VM first, mirroring `async/spawn`, so the
-                // callback reads/writes the real cell (its `set!` write-back stays
-                // visible to the defining frame) instead of dereferencing — or
-                // silently clobbering — a foreign stack slot. This runs for EVERY
-                // element dispatch (continuation-driven ones bypass the
-                // structural-outcome seam), which is why it lives here.
-                if let Some(parent_vm) = owner.parked_parent_vm_mut() {
-                    snapshot_escaping_call_with_owner(parent_vm, &call.callable, &call.args);
-                }
-                let globals = closure
-                    .globals
-                    .clone()
-                    .ok_or_else(|| RuntimeFault::Invariant {
-                        message: "VM closure has no home environment".into(),
-                    })?;
-                let mut vm = VM::new_for_task_with_native_fns(globals, functions, native_fns);
-                let frame = ContinuationFrame::vm_native(call.continuation);
-                match vm.setup_for_call(closure, &call.args) {
-                    Ok(()) => {
-                        let mut state = self.state.borrow_mut();
-                        let task = state.tasks.get_mut(&task_id).ok_or_else(|| {
-                            RuntimeFault::Invariant {
-                                message: "calling task disappeared".into(),
-                            }
-                        })?;
-                        task.vm_call = Some(vm);
-                        task.vm_owner = Some(ReturnOwner::Continuation(Box::new(owner), frame));
-                        task.record
-                            .yield_ready()
-                            .map_err(|error| RuntimeFault::Invariant {
-                                message: format!("VM callable failed to yield ready: {error:?}"),
-                            })?;
-                        let root = task.record.relations().origin_root;
-                        state.ready.enqueue(root, task_id);
-                        return Ok(());
-                    }
-                    Err(error) => (frame, Err(error)),
-                }
+                // Sema callback on a callback VM. See `invoke_vm_callback_loop`
+                // for the full element-chain dispatch (Task C: it runs the whole
+                // non-yielding element chain in place, on one reused scratch VM,
+                // instead of round-tripping the ready queue per element).
+                return self.invoke_vm_callback_loop(task_id, owner, call, closure, functions, native_fns);
             } else if let Some(native) = call.callable.as_native_fn_rc() {
                 let _installed = eval_context.scope_task_context(context.clone());
                 let mut task_context = context.borrow_mut();
@@ -2977,6 +2975,356 @@ impl Runtime {
                 result,
             ));
         Ok(())
+    }
+
+    /// Take the reusable scratch VM (`RuntimeState::scratch_callback_vm`),
+    /// re-targeting it at `globals`/`functions`/`native_fns` via
+    /// [`VM::reset_for_task_with_native_fns`] (reusing its `stack`/`frames`/
+    /// `inline_cache` allocations), or build a fresh one if the slot is empty
+    /// (first use, or a prior in-place chain's VM got consumed into a parked
+    /// task and never returned).
+    fn take_scratch_callback_vm(
+        &self,
+        globals: Rc<Env>,
+        functions: Rc<Vec<Rc<Function>>>,
+        native_fns: Rc<Vec<Rc<NativeFn>>>,
+    ) -> VM {
+        match self.state.borrow_mut().scratch_callback_vm.take() {
+            Some(mut vm) => {
+                vm.reset_for_task_with_native_fns(globals, functions, native_fns);
+                vm
+            }
+            None => VM::new_for_task_with_native_fns(globals, functions, native_fns),
+        }
+    }
+
+    /// Drive a cooperative HOF callback's ENTIRE non-yielding element chain
+    /// in place, inside this one drive work item, instead of round-tripping
+    /// each element through `PendingStage::Invoke` -> ready-queue enqueue ->
+    /// `visit_ready` quantum -> `PendingStage::Apply`/`Resume` (>= 4 drive-loop
+    /// iterations and a fresh `VM::new_for_task_with_native_fns` PER ELEMENT —
+    /// ~28k instructions/element of pure scheduler overhead, the dominant cost
+    /// of `filter`/`map`/`foldl`/`for-each` under the unified runtime; see
+    /// `docs/plans/2026-07-16-runtime-fast-path-recovery.md` Task C).
+    ///
+    /// `call` is the FIRST element's `NativeCall` (already known to target a VM
+    /// closure — `invoke_callable` extracted it before delegating here). The
+    /// upvalue-closing snapshot against the parked parent VM runs for EVERY
+    /// element, exactly as `invoke_callable` used to (it is not safe to hoist
+    /// to a one-time snapshot before the loop): it walks not just the
+    /// callable's captured env but each element's `args`, which can carry
+    /// DIFFERENT closures with their own open upvalues on the parent VM's
+    /// stack from element to element (e.g. `(for-each (fn (entry) ((cadr
+    /// entry) ev)) (map/entries handlers))` — each `entry` embeds a different
+    /// handler closure that must be closed before it can be called from a
+    /// foreign VM).
+    ///
+    /// One scratch VM (`take_scratch_callback_vm`) runs each element's
+    /// `setup_for_call` + `run_quantum` back to back — `NativeContinuation::
+    /// resume` (e.g. `FilterContinuation`/`MapContinuation` in
+    /// `sema-stdlib::list`) is called DIRECTLY on a `Finished` quantum, and if
+    /// it hands back another `NativeOutcome::Call`, the loop continues without
+    /// ever touching `state.tasks` or the ready queue. `task` is held out of
+    /// `state.tasks` for the loop's duration (mirroring `visit_ready`, which
+    /// does the same for a single quantum) and reinserted once the chain
+    /// settles, hands off, or falls back.
+    ///
+    /// Every quantum's instructions are debited from ONE shared budget
+    /// (`remaining_budget`, seeded from `active_instruction_limit` — the SAME
+    /// total a single parked quantum would receive) so a multi-million-element
+    /// chain still yields to sibling roots instead of running unboundedly; on
+    /// exhaustion the in-flight element falls back to exactly today's parked
+    /// path for the rest of the chain (`quantum_to_action`'s `QuantumExpired`
+    /// arm — reached here by simply letting `run_quantum`'s own budget check
+    /// fire at `remaining_budget == 0`, no separate precheck needed).
+    ///
+    /// A callback that suspends for real (channel/promise/sleep/spawn, a
+    /// nested HOF, a debug stop) surfaces as anything other than `Finished`/
+    /// `Err` from the quantum; that element falls back to EXACTLY today's
+    /// parked path via `quantum_to_action` — the shared mapping
+    /// `run_parked_quantum` uses — so the fallback can never drift from the
+    /// slow path's semantics. `check_hof_yield`'s bare-runtime-native error
+    /// surface is untouched: it fires inside `NativeContinuation::resume`
+    /// implementations / the native-fn arm of `invoke_callable`, neither of
+    /// which this function changes.
+    ///
+    /// Cancellation is re-read fresh from `task.record` before EVERY element
+    /// (not just the first): a cancellation recorded against this task before
+    /// its `PendingStage::Invoke` was even popped — the only way it CAN land,
+    /// since nothing else runs on this thread while this loop is executing —
+    /// aborts the chain the same way `visit_ready`'s pre-quantum cancellation
+    /// check does: the about-to-run element's VM frame is discarded UNRUN and
+    /// its continuation is resumed with `ResumeInput::Cancelled` directly
+    /// (mirroring `resume_continuation`'s unconditional cancellation
+    /// override). A cancellation that arrives WHILE this loop is running can
+    /// only do so at a fallback boundary (budget exhaustion or a real
+    /// suspend), where the task is reinserted into `state.tasks` and control
+    /// returns to the drive loop — the same granularity a single-element
+    /// quantum already provided.
+    fn invoke_vm_callback_loop(
+        &self,
+        task_id: TaskId,
+        mut owner: ReturnOwner,
+        call: NativeCall,
+        closure: Rc<Closure>,
+        functions: Rc<Vec<Rc<Function>>>,
+        native_fns: Rc<Vec<Rc<NativeFn>>>,
+    ) -> Result<(), RuntimeFault> {
+        let globals = closure
+            .globals
+            .clone()
+            .ok_or_else(|| RuntimeFault::Invariant {
+                message: "VM closure has no home environment".into(),
+            })?;
+
+        let (eval_context, root, mut remaining_budget, mut task) = {
+            let mut state = self.state.borrow_mut();
+            let task = state
+                .tasks
+                .remove(&task_id)
+                .ok_or_else(|| RuntimeFault::Invariant {
+                    message: "calling task disappeared".into(),
+                })?;
+            let eval_context = Rc::clone(&state._context);
+            let root = task.record.relations().origin_root;
+            let remaining = state.active_instruction_limit;
+            (eval_context, root, remaining, task)
+        };
+
+        let mut vm =
+            self.take_scratch_callback_vm(globals.clone(), functions.clone(), native_fns.clone());
+        let mut loaded_globals = globals;
+        let mut loaded_functions = functions;
+        let mut loaded_native_fns = native_fns;
+
+        let quantum_guard = match eval_context.enter_runtime_quantum() {
+            Ok(guard) => guard,
+            Err(error) => {
+                self.state.borrow_mut().scratch_callback_vm = Some(vm);
+                let mut state = self.state.borrow_mut();
+                state.tasks.insert(task_id, task);
+                return Err(RuntimeFault::Invariant {
+                    message: error.to_string(),
+                });
+            }
+        };
+        let _task_context = eval_context.scope_task_context(task.context.clone());
+        let is_root_main = {
+            let state = self.state.borrow();
+            matches!(
+                state.roots.get(&root).map(RootRecord::state),
+                Some(RootState::Running { main_task }) if *main_task == task_id
+            )
+        };
+        let published_task_id = if is_root_main { None } else { Some(task_id.get()) };
+        let prev_task_id = sema_core::set_current_task_id(published_task_id);
+        let mut scopes = TaskScopeSwap::install(&mut task);
+        debug_assert!(
+            self.state.try_borrow_mut().is_ok(),
+            "RuntimeState borrowed at in-place HOF loop entry — a blocking debug stop would deadlock the state cell"
+        );
+
+        enum ElementOutcome {
+            Handoff(NativeCall),
+            Settled(NativeResult),
+            // Carries the raw quantum result and the not-yet-resumed
+            // continuation rather than a fully-built `TaskAction`: building the
+            // `TaskAction` needs to move `vm`/`owner`, and a move inside a
+            // `loop { .. break ..; }` body is rejected by the borrow checker
+            // even though this arm only ever executes once (the loop ends at
+            // every `break`) — deferring the move to the single post-loop
+            // match arm below sidesteps that false conflict.
+            Suspended(VmQuantumResult, Box<dyn sema_core::runtime::NativeContinuation>),
+        }
+
+        let mut current_call = call;
+        let outcome = loop {
+            if let Some(cancel) = task.record.cancellation() {
+                let mut task_context = task.context.borrow_mut();
+                let mut native_context = NativeCallContext {
+                    task_context: &mut task_context,
+                    cancellation: CancellationView::new(true, Some(cancel.reason)),
+                };
+                let resumed = current_call
+                    .continuation
+                    .resume(&mut native_context, ResumeInput::Cancelled(cancel.reason));
+                break ElementOutcome::Settled(resumed);
+            }
+            let Some((next_closure, next_functions, next_native_fns)) =
+                extract_vm_closure(&current_call.callable)
+            else {
+                break ElementOutcome::Handoff(current_call);
+            };
+            let Some(next_globals) = next_closure.globals.clone() else {
+                let mut task_context = task.context.borrow_mut();
+                let mut native_context = NativeCallContext {
+                    task_context: &mut task_context,
+                    cancellation: CancellationView::default(),
+                };
+                let resumed = current_call.continuation.resume(
+                    &mut native_context,
+                    ResumeInput::Failed(sema_core::SemaError::eval(
+                        "VM closure has no home environment",
+                    )),
+                );
+                break ElementOutcome::Settled(resumed);
+            };
+            if !Rc::ptr_eq(&loaded_globals, &next_globals)
+                || !Rc::ptr_eq(&loaded_functions, &next_functions)
+                || !Rc::ptr_eq(&loaded_native_fns, &next_native_fns)
+            {
+                vm.reset_for_task_with_native_fns(
+                    next_globals.clone(),
+                    next_functions.clone(),
+                    next_native_fns.clone(),
+                );
+                loaded_globals = next_globals;
+                loaded_functions = next_functions;
+                loaded_native_fns = next_native_fns;
+            }
+            // MUST run per element, not once for the chain: it walks not just
+            // the callable but `args`, which can carry a DIFFERENT closure
+            // with its own open upvalues on the parent VM's stack on every
+            // element (see this function's doc comment).
+            if let Some(parent_vm) = owner.parked_parent_vm_mut() {
+                snapshot_escaping_call_with_owner(
+                    parent_vm,
+                    &current_call.callable,
+                    &current_call.args,
+                );
+            }
+            if let Err(error) = vm.setup_for_call(next_closure, &current_call.args) {
+                let mut task_context = task.context.borrow_mut();
+                let mut native_context = NativeCallContext {
+                    task_context: &mut task_context,
+                    cancellation: CancellationView::default(),
+                };
+                let resumed = current_call
+                    .continuation
+                    .resume(&mut native_context, ResumeInput::Failed(error));
+                break ElementOutcome::Settled(resumed);
+            }
+            let cancellation_view = CancellationView::default();
+            let quantum = if crate::vm::is_debug_session_active() {
+                crate::vm::with_active_debug(|debug| {
+                    vm.run_quantum_debug(&eval_context, remaining_budget, cancellation_view, debug)
+                })
+                .expect("debug session active but no DebugState registered")
+            } else {
+                vm.run_quantum(&eval_context, remaining_budget, cancellation_view)
+            };
+            self.state.borrow_mut().turn_instructions += quantum.instructions;
+            remaining_budget = remaining_budget.saturating_sub(quantum.instructions);
+            match quantum.outcome {
+                Ok(VmExecResult::Finished(value)) => {
+                    let mut task_context = task.context.borrow_mut();
+                    let mut native_context = NativeCallContext {
+                        task_context: &mut task_context,
+                        cancellation: CancellationView::default(),
+                    };
+                    let resumed = current_call
+                        .continuation
+                        .resume(&mut native_context, ResumeInput::Returned(value));
+                    match resumed {
+                        Ok(NativeOutcome::Call(next)) => {
+                            current_call = next;
+                            continue;
+                        }
+                        other => break ElementOutcome::Settled(other),
+                    }
+                }
+                Err(error) => {
+                    let mut task_context = task.context.borrow_mut();
+                    let mut native_context = NativeCallContext {
+                        task_context: &mut task_context,
+                        cancellation: CancellationView::default(),
+                    };
+                    let resumed = current_call
+                        .continuation
+                        .resume(&mut native_context, ResumeInput::Failed(error));
+                    match resumed {
+                        Ok(NativeOutcome::Call(next)) => {
+                            current_call = next;
+                            continue;
+                        }
+                        other => break ElementOutcome::Settled(other),
+                    }
+                }
+                _ => {
+                    // Genuine suspend (structural `Pending`, `AsyncYield`,
+                    // `Stopped`) or a budget expiry: fall back to exactly
+                    // today's parked path via the shared mapping (applied
+                    // after the loop, once `vm`/`owner` can be moved safely).
+                    break ElementOutcome::Suspended(quantum, current_call.continuation);
+                }
+            }
+        };
+
+        let _ = sema_core::set_current_task_id(prev_task_id);
+        scopes.restore(&mut task);
+        drop(quantum_guard);
+
+        match outcome {
+            ElementOutcome::Settled(result) => {
+                self.state.borrow_mut().scratch_callback_vm = Some(vm);
+                let mut state = self.state.borrow_mut();
+                if state.tasks.insert(task_id, task).is_some() {
+                    return Err(RuntimeFault::Invariant {
+                        message: "task identity reused during in-place HOF loop".into(),
+                    });
+                }
+                state
+                    .pending
+                    .push_back(PendingStage::Apply(task_id, owner, result));
+                Ok(())
+            }
+            ElementOutcome::Handoff(next_call) => {
+                self.state.borrow_mut().scratch_callback_vm = Some(vm);
+                let mut state = self.state.borrow_mut();
+                if state.tasks.insert(task_id, task).is_some() {
+                    return Err(RuntimeFault::Invariant {
+                        message: "task identity reused during in-place HOF loop".into(),
+                    });
+                }
+                state
+                    .pending
+                    .push_back(PendingStage::Invoke(task_id, owner, next_call));
+                Ok(())
+            }
+            ElementOutcome::Suspended(quantum, continuation) => {
+                // `vm_owner` must be populated before `quantum_to_action` runs —
+                // this loop never sets it, since every element that finishes
+                // cleanly bypasses it entirely — with exactly the
+                // `ReturnOwner::Continuation` shape the old parked-first-call
+                // path used to install.
+                task.vm_owner = Some(ReturnOwner::Continuation(
+                    Box::new(owner),
+                    ContinuationFrame::vm_native(continuation),
+                ));
+                let action = self.quantum_to_action(root, task_id, &mut task, vm, quantum);
+                // `vm` was consumed into `task.vm_call`/`ReturnOwner::VmResume`
+                // by `quantum_to_action` (or is absent when the outcome settled
+                // directly, e.g. an uncaught `Err` from a `Pending` mapping) —
+                // never returned to the scratch slot; it refills on next use.
+                {
+                    let mut state = self.state.borrow_mut();
+                    if state.tasks.insert(task_id, task).is_some() {
+                        return Err(RuntimeFault::Invariant {
+                            message: "task identity reused during in-place HOF loop".into(),
+                        });
+                    }
+                }
+                if matches!(action, TaskAction::DebugStop(..)) {
+                    self.apply_action(action)?;
+                } else {
+                    self.state
+                        .borrow_mut()
+                        .pending
+                        .push_back(PendingStage::Action(action));
+                }
+                Ok(())
+            }
+        }
     }
 
     fn resume_continuation(

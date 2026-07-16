@@ -1256,6 +1256,47 @@ impl VM {
         Self::new_with_rc_functions(globals, functions, native_fns)
     }
 
+    /// Re-target an IDLE VM (no frames — the prior call, if any, already ran to
+    /// completion) at a different closure's home env / function table / native
+    /// table, reusing its `stack`/`frames`/`inline_cache` heap allocations
+    /// instead of building a fresh `VM`. Used by the runtime's in-place HOF
+    /// callback fast path (`invoke_vm_callback_loop`) to keep one scratch VM
+    /// alive across unrelated cooperative-HOF invocations rather than
+    /// allocating one per element (the cost this fast path exists to kill).
+    pub fn reset_for_task_with_native_fns(
+        &mut self,
+        globals: Rc<Env>,
+        functions: Rc<Vec<Rc<Function>>>,
+        native_fns: Rc<Vec<Rc<NativeFn>>>,
+    ) {
+        debug_assert!(
+            self.frames.is_empty() && self.stack.is_empty(),
+            "reset_for_task_with_native_fns called on a VM with an in-flight frame"
+        );
+        self.stack.clear();
+        self.frames.clear();
+        let total_cache_slots: usize = functions
+            .iter()
+            .map(|f| f.chunk.n_global_cache_slots as usize)
+            .sum();
+        self.inline_cache.clear();
+        self.inline_cache
+            .resize(total_cache_slots, (u32::MAX, 0, CachedGlobal::Plain(Value::nil())));
+        self.globals = globals;
+        self.base_functions = functions.clone();
+        self.functions = functions;
+        self.native_fns = native_fns;
+        self.debug_values.clear();
+        self.next_debug_value_ref = DEBUG_VALUE_REF_BASE;
+        self.frame_floor = 0;
+        *self.gc_adopted_home.borrow_mut() = Weak::new();
+        self.instruction_budget = None;
+        self.instructions_executed = 0;
+        self.pending_resume_error = None;
+        self.quantum_cancellation = CancellationView::default();
+        self.native_signal = None;
+    }
+
     pub fn execute(&mut self, closure: Rc<Closure>, ctx: &EvalContext) -> Result<Value, SemaError> {
         self.ensure_cache_space(&closure.func);
         let base = self.stack.len();

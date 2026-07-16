@@ -600,8 +600,18 @@ rearchitecture:
   `crates/sema/tests/vm_async_test.rs` (`apply_*`, `call_with_values_*`,
   `map_multi_list_*`). The **remaining** Step-G surface is nested `eval` of an
   async form — `(eval '(async/await (async (+ 40 2))))` — which still needs the
-  parent-VM parking machinery above; that is the sole case this deferral now
+  parent-VM parking machinery above; that is the primary case this deferral now
   covers.
+
+  A second, independent Step-G-class gap: **multimethod dispatch of a method
+  whose body suspends** leaks the same stub — `(mm x)` where `mm`'s selected
+  method runs an async op fails with "requires runtime invocation" even in a
+  direct call (not just via `apply`). Multimethod dispatch re-enters the
+  evaluator synchronously (`call_callback`), which cannot host a suspend; making
+  it cooperative needs dispatch to return `NativeOutcome::Call` to the method,
+  the same machinery nested `eval` needs. Pre-existing; not apply-specific
+  (`apply` correctly keeps multimethod callees on the synchronous path since the
+  cooperative Call path does not dispatch multimethods anyway).
 
 - **`event_select_yields_to_sibling_in_async_context`**
   (`crates/sema/tests/vm_async_test.rs`). Under the runtime, `event/select`

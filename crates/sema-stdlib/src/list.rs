@@ -939,9 +939,11 @@ pub fn register(env: &sema_core::Env) {
             // synchronous path so its task-scoped slab reaping is unaffected;
             // plain builtins and keyword getters never suspend, so the sync
             // path is correct for them too. (Multimethods are NOT routed here —
-            // the Call path doesn't dispatch them; they stay on `call_function`,
-            // so a multimethod dispatching to a suspending method via `apply`
-            // remains a known, esoteric gap.)
+            // the cooperative Call path doesn't dispatch them; they stay on
+            // `call_function`. A multimethod whose selected method suspends leaks
+            // the stub regardless of `apply` — a separate multimethod-dispatch
+            // limitation tracked in docs/deferred.md, not something `apply` can
+            // fix.)
             let is_closure_callee = args[0]
                 .as_native_fn_rc()
                 .is_some_and(|native| native.is_closure);

@@ -432,7 +432,7 @@ fn cancellation_tombstones_connection_and_interpreter_stays_healthy() {
         .expect("interpreter must remain usable after the cancellation");
     assert_eq!(healthy, Value::int(3));
     assert_eq!(
-        sema_vm::scheduler_task_count(),
+        interp.runtime_live_task_count(),
         0,
         "the cancelled task must be reaped, not left orphaned in the scheduler"
     );
@@ -794,7 +794,7 @@ fn async_context_mid_call_401_noninteractive_reauth_fails_cleanly() {
         .expect("interpreter must remain usable after the failed reauth attempt");
     assert_eq!(healthy, Value::int(3));
     assert_eq!(
-        sema_vm::scheduler_task_count(),
+        interp.runtime_live_task_count(),
         0,
         "no task should be left orphaned in the scheduler after the offloaded \
          401-reauth-refuse-retry sequence completes"

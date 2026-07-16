@@ -269,9 +269,6 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
             if sema_core::in_runtime_quantum() {
                 return crate::io::quarantined_compute("http/file", http_file_marker, resolve);
             }
-            if sema_core::in_async_context() {
-                return crate::io::fs_offload(resolve, http_file_marker).map(NativeOutcome::Return);
-            }
             let resolved = resolve().map_err(SemaError::eval)?;
             Ok(NativeOutcome::Return(http_file_marker(resolved)))
         },
@@ -584,7 +581,7 @@ fn router_body(args: &[Value]) -> sema_core::runtime::NativeResult {
     // below, nothing here calls back into Sema (no `continue`-across-a-suspend
     // problem) — every route is still validated, in order, on the VM thread;
     // only the blocking syscall is deferred.
-    let async_ctx = sema_core::in_async_context() || sema_core::in_runtime_quantum();
+    let async_ctx = sema_core::in_runtime_quantum();
 
     let mut routes: Vec<(String, String, Value)> = Vec::new();
     let mut pending: Vec<(usize, String)> = Vec::new();
@@ -677,21 +674,12 @@ fn router_body(args: &[Value]) -> sema_core::runtime::NativeResult {
         }
         Ok(resolved)
     };
-    if sema_core::in_runtime_quantum() {
-        let decoder = Box::new(RouterDecoder { routes, indices });
-        return crate::io::quarantined_compute_with_decoder("http/router", decoder, move || {
-            Ok(Box::new(job()) as sema_core::runtime::SendPayload)
-        });
-    }
-    // Legacy cooperative scheduler: keep the `AwaitIo` bridge.
-    crate::io::fs_offload(job, move |resolved: Vec<String>| {
-        let mut routes = routes.clone();
-        for (idx, path_str) in indices.iter().zip(resolved) {
-            routes[*idx].2 = Value::string(&path_str);
-        }
-        build_router_dispatch_fn(Rc::new(routes))
+    // This tail is reached only when `async_ctx` (a runtime quantum) deferred the
+    // static-directory canonicalization; resolve it off the VM thread and rebuild.
+    let decoder = Box::new(RouterDecoder { routes, indices });
+    crate::io::quarantined_compute_with_decoder("http/router", decoder, move || {
+        Ok(Box::new(job()) as sema_core::runtime::SendPayload)
     })
-    .map(NativeOutcome::Return)
 }
 
 fn register_router(env: &sema_core::Env) {
@@ -841,10 +829,6 @@ fn dispatch_body(
                         static_file_response,
                         resolve,
                     );
-                }
-                if sema_core::in_async_context() {
-                    return crate::io::fs_offload(resolve, static_file_response)
-                        .map(NativeOutcome::Return);
                 }
                 // Bare/top-level (and value-ABI-under-runtime): canonicalize
                 // inline. `resolve` never returns `Err`, so this cannot fail.
@@ -1517,9 +1501,7 @@ fn http_serve_impl(ctx: &sema_core::EvalContext, args: &[Value]) -> Result<Value
     // per-connection handler tasks) is real design work, deliberately
     // deferred (see docs/deferred.md); until then, fail fast and loud instead
     // of hanging silently.
-    if sema_core::in_async_context()
-        || (sema_core::in_runtime_quantum() && sema_core::current_task_id().is_some())
-    {
+    if sema_core::in_runtime_quantum() && sema_core::current_task_id().is_some() {
         // The core message alone must carry enough to explain the failure: a
         // task's rejection is flattened to a plain string when it crosses the
         // promise boundary (`format!("{e}")` in the scheduler), so the hint
@@ -1796,49 +1778,6 @@ mod tests {
         });
     }
 
-    // WP-SERVE-GUARD: `http/serve` must fail fast — not bind a port, not spawn
-    // the axum future, not touch `rx.blocking_recv()` — the instant it's
-    // called from inside an async context, since that blocking accept loop
-    // would otherwise freeze the cooperative scheduler forever with no error.
-    // Exercises `http_serve_impl` directly under a forced `in_async_context()`
-    // so the returned `SemaError` (and its `.hint()`) can be inspected before
-    // a task's promise rejection flattens it to a plain string (see the
-    // comment at the guard's call site) — a plain `Interpreter::eval` test
-    // going through `async/spawn`/`async/await` could only see the flattened
-    // message, not the hint.
-    #[test]
-    fn http_serve_errors_immediately_in_async_context() {
-        // Thread-local; reset unconditionally (including on panic) so this
-        // test can't leak `in_async_context() == true` into whichever test
-        // the harness runs next on the same worker thread.
-        struct ResetAsyncContext;
-        impl Drop for ResetAsyncContext {
-            fn drop(&mut self) {
-                sema_core::set_async_context(false);
-            }
-        }
-        let _reset = ResetAsyncContext;
-        sema_core::set_async_context(true);
-
-        let ctx = sema_core::EvalContext::new();
-        let result = http_serve_impl(&ctx, &[]);
-
-        let err = result.expect_err(
-            "http/serve must return Err immediately in async context, not attempt to bind/serve",
-        );
-        let msg = err.to_string();
-        assert!(
-            msg.contains("async/spawn") && msg.to_lowercase().contains("top level"),
-            "error message should name async/spawn and point at the top level, got: {msg}"
-        );
-        assert_eq!(
-            err.hint().map(|h| h.contains("deferred.md")),
-            Some(true),
-            "error hint should point at docs/deferred.md, got hint: {:?}",
-            err.hint()
-        );
-    }
-
     #[test]
     fn test_match_exact_path() {
         let params = match_path("/users", "/users");
@@ -1901,329 +1840,5 @@ mod tests {
     #[test]
     fn test_match_trailing_slash_normalized() {
         assert!(match_path("/users", "/users/").is_some());
-    }
-}
-
-/// Async-context coverage for the `http/file` and `http/router` (`:static`)
-/// scheduler-offload gates added to this file. Mirrors the `drive_async`
-/// harness in `io.rs`'s `async_offload_tests`: force `in_async_context()` on,
-/// call the native, then poll the `AwaitIo` handle it arms to completion —
-/// exactly what the scheduler does in production, just single-threaded here.
-#[cfg(test)]
-mod async_offload_tests {
-    use super::*;
-    use std::time::{Duration, Instant};
-
-    /// Forces `in_async_context()` on for the guard's lifetime, resetting it
-    /// (even on panic/early return) so a failure can't leak the flag into
-    /// whichever test the harness runs next on the same worker thread.
-    struct AsyncCtxGuard;
-    impl Drop for AsyncCtxGuard {
-        fn drop(&mut self) {
-            sema_core::set_async_context(false);
-        }
-    }
-
-    fn tmp_dir(tag: &str) -> std::path::PathBuf {
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        std::env::temp_dir().join(format!("sema-server-async-test-{tag}-{nanos}"))
-    }
-
-    fn call_native(f: &Value, args: &[Value]) -> Result<Value, SemaError> {
-        let nf = f.as_native_fn_ref().expect("native fn");
-        let ctx = sema_core::EvalContext::new();
-        (nf.func)(&ctx, args)
-    }
-
-    /// Call a native fn with the async-context gate forced on, then drive the
-    /// `AwaitIo` handle it arms to completion by polling. Panics if the
-    /// native didn't yield at all (e.g. it silently took the sync fallback)
-    /// or the offload rejects.
-    fn drive_async(call: impl FnOnce() -> Result<Value, SemaError>) -> Value {
-        let _guard = AsyncCtxGuard;
-        sema_core::set_async_context(true);
-        let armed = call().expect("native call should arm a yield, not error synchronously");
-        assert_eq!(
-            armed,
-            Value::nil(),
-            "an offloading native returns nil immediately after arming its yield signal"
-        );
-        let reason = sema_core::take_yield_signal()
-            .expect("expected a yield signal to be armed — did the native take the sync path?");
-        let handle = match reason {
-            sema_core::YieldReason::AwaitIo(h) => h,
-            other => panic!("expected an AwaitIo yield, got {other:?}"),
-        };
-        let deadline = Instant::now() + Duration::from_secs(10);
-        loop {
-            match handle.poll() {
-                sema_core::IoPoll::Ready(Ok(v)) => return v,
-                sema_core::IoPoll::Ready(Err(e)) => panic!("offload rejected: {e}"),
-                sema_core::IoPoll::Pending => {
-                    assert!(
-                        Instant::now() < deadline,
-                        "offload never completed within 10s"
-                    );
-                    std::thread::sleep(Duration::from_millis(2));
-                }
-            }
-        }
-    }
-
-    fn make_env() -> sema_core::Env {
-        let env = sema_core::Env::new();
-        register(&env, &sema_core::Sandbox::allow_all());
-        env
-    }
-
-    // ── http/file ───────────────────────────────────────────────────────
-
-    #[test]
-    fn http_file_offloads_and_matches_sync() {
-        let dir = tmp_dir("http-file");
-        std::fs::create_dir_all(&dir).unwrap();
-        let file_path = dir.join("hello.txt");
-        std::fs::write(&file_path, b"hi").unwrap();
-        let file_path_s = file_path.to_string_lossy().to_string();
-
-        let env = make_env();
-        let http_file = env
-            .get(sema_core::intern("http/file"))
-            .expect("http/file registered");
-
-        let sync_result =
-            call_native(&http_file, &[Value::string(&file_path_s)]).expect("sync http/file ok");
-        let async_result = drive_async(|| call_native(&http_file, &[Value::string(&file_path_s)]));
-
-        assert_eq!(
-            sync_result, async_result,
-            "offloaded http/file must match the sync __file marker byte-for-byte"
-        );
-        let map = async_result.as_map_rc().expect("map");
-        assert_eq!(map.get(&Value::keyword("__file")), Some(&Value::bool(true)));
-        assert_eq!(
-            map.get(&Value::keyword("__file_content_type")),
-            Some(&Value::string("text/plain"))
-        );
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// Same native, sync path — confirms the added async gate left the
-    /// default (non-async) behavior untouched.
-    #[test]
-    fn http_file_sync_path_unchanged() {
-        let dir = tmp_dir("http-file-sync");
-        std::fs::create_dir_all(&dir).unwrap();
-        let file_path = dir.join("style.css");
-        std::fs::write(&file_path, b"body{}").unwrap();
-        let file_path_s = file_path.to_string_lossy().to_string();
-
-        let env = make_env();
-        let http_file = env
-            .get(sema_core::intern("http/file"))
-            .expect("http/file registered");
-        let result =
-            call_native(&http_file, &[Value::string(&file_path_s)]).expect("sync http/file ok");
-        let map = result.as_map_rc().expect("map");
-        assert_eq!(
-            map.get(&Value::keyword("__file_content_type")),
-            Some(&Value::string("text/css"))
-        );
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn http_file_missing_path_async_rejects_like_sync() {
-        let env = make_env();
-        let http_file = env
-            .get(sema_core::intern("http/file"))
-            .expect("http/file registered");
-        let missing = "/no/such/path/sema-http-file-test-missing";
-
-        let sync_err = call_native(&http_file, &[Value::string(missing)])
-            .expect_err("sync http/file must error on a missing path");
-
-        let _guard = AsyncCtxGuard;
-        sema_core::set_async_context(true);
-        let armed = call_native(&http_file, &[Value::string(missing)]).expect("arms a yield");
-        assert_eq!(armed, Value::nil());
-        let reason = sema_core::take_yield_signal().expect("yield armed");
-        let handle = match reason {
-            sema_core::YieldReason::AwaitIo(h) => h,
-            other => panic!("expected AwaitIo, got {other:?}"),
-        };
-        let deadline = Instant::now() + Duration::from_secs(10);
-        let async_err_msg = loop {
-            match handle.poll() {
-                sema_core::IoPoll::Ready(Ok(v)) => panic!("expected rejection, got {v:?}"),
-                sema_core::IoPoll::Ready(Err(e)) => break e,
-                sema_core::IoPoll::Pending => {
-                    assert!(Instant::now() < deadline, "offload never completed");
-                    std::thread::sleep(Duration::from_millis(2));
-                }
-            }
-        };
-        // A rejected offload's raw message gets wrapped in `SemaError::eval(...)`
-        // by the scheduler on resume; the sync error IS that same
-        // `SemaError::eval(...)`, so this reconstructs its `Display` exactly.
-        assert_eq!(
-            format!("Eval error: {async_err_msg}"),
-            sync_err.to_string(),
-            "the offloaded rejection's inner message must match the sync error's content"
-        );
-    }
-
-    // ── http/router :static ────────────────────────────────────────────
-
-    fn static_routes(dir: &std::path::Path) -> Value {
-        let dir_s = dir.to_string_lossy().to_string();
-        Value::list(vec![Value::vector(vec![
-            Value::keyword("static"),
-            Value::string("/assets"),
-            Value::string(&dir_s),
-        ])])
-    }
-
-    fn make_request(path: &str) -> Value {
-        let mut map = BTreeMap::new();
-        map.insert(Value::keyword("method"), Value::keyword("get"));
-        map.insert(Value::keyword("path"), Value::string(path));
-        Value::map(map)
-    }
-
-    #[test]
-    fn http_router_construction_offloads_static_canonicalize() {
-        let dir = tmp_dir("http-router-construct");
-        std::fs::create_dir_all(&dir).unwrap();
-
-        let env = make_env();
-        let http_router = env
-            .get(sema_core::intern("http/router"))
-            .expect("http/router registered");
-        let routes = static_routes(&dir);
-        let dispatch = drive_async(|| call_native(&http_router, &[routes]));
-        assert!(
-            dispatch.as_native_fn_ref().is_some(),
-            "offloaded construction must still resolve to a dispatch fn"
-        );
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn http_router_static_dispatch_offloads_and_matches_sync() {
-        let dir = tmp_dir("http-router-static");
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("app.js"), b"console.log(1)").unwrap();
-
-        let sync_env = make_env();
-        let sync_router = sync_env
-            .get(sema_core::intern("http/router"))
-            .expect("http/router registered");
-        let sync_dispatch =
-            call_native(&sync_router, &[static_routes(&dir)]).expect("router construction ok");
-        let sync_result = call_native(&sync_dispatch, &[make_request("/assets/app.js")])
-            .expect("sync dispatch ok");
-
-        let async_env = make_env();
-        let async_router = async_env
-            .get(sema_core::intern("http/router"))
-            .expect("http/router registered");
-        let async_dispatch =
-            call_native(&async_router, &[static_routes(&dir)]).expect("router construction ok");
-        let async_result =
-            drive_async(|| call_native(&async_dispatch, &[make_request("/assets/app.js")]));
-
-        assert_eq!(
-            sync_result, async_result,
-            "offloaded dispatch must match the sync __file marker byte-for-byte"
-        );
-        let map = async_result.as_map_rc().expect("map");
-        assert_eq!(map.get(&Value::keyword("__file")), Some(&Value::bool(true)));
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn http_router_static_not_found_falls_through_in_async_context() {
-        // The `continue`-to-next-route (SPA fallback) decision on a missing
-        // static file must stay synchronous — resuming an offloaded yield
-        // delivers its decoded value directly as the WHOLE dispatch call's
-        // result, so a `continue` can't survive a suspend there. Verifies the
-        // fallback still works when `in_async_context()` is true: only the
-        // terminal canonicalize (once the file is confirmed to exist) is
-        // offloaded, per the comment at the dispatch `:static` branch.
-        let dir = tmp_dir("http-router-fallback");
-        std::fs::create_dir_all(&dir).unwrap();
-
-        let env = make_env();
-        let dir_s = dir.to_string_lossy().to_string();
-        let fallback = Value::native_fn(sema_core::NativeFn::with_ctx(
-            "fallback",
-            |_ctx: &sema_core::EvalContext, _args: &[Value]| {
-                let mut result = BTreeMap::new();
-                result.insert(Value::keyword("status"), Value::int(200));
-                result.insert(Value::keyword("headers"), Value::map(BTreeMap::new()));
-                result.insert(Value::keyword("body"), Value::string("fallback"));
-                Ok(Value::map(result))
-            },
-        ));
-        let routes = Value::list(vec![
-            Value::vector(vec![
-                Value::keyword("static"),
-                Value::string("/assets"),
-                Value::string(&dir_s),
-            ]),
-            Value::vector(vec![
-                Value::keyword("get"),
-                Value::string("/assets/*"),
-                fallback,
-            ]),
-        ]);
-        let http_router = env
-            .get(sema_core::intern("http/router"))
-            .expect("http/router registered");
-        let dispatch = call_native(&http_router, &[routes]).expect("router construction ok");
-
-        // The fallback route is invoked through `call_callback`, which reads
-        // the callback fn off the SAME `EvalContext` instance the dispatch
-        // native is called with — register it there directly rather than
-        // through the generic `call_native` helper (which hands each call a
-        // fresh, uninitialized context).
-        fn invoke_native_value(
-            ctx: &sema_core::EvalContext,
-            func: &Value,
-            args: &[Value],
-        ) -> Result<Value, SemaError> {
-            let nf = func
-                .as_native_fn_ref()
-                .ok_or_else(|| SemaError::eval("test harness: callback must be a native fn"))?;
-            (nf.func)(ctx, args)
-        }
-        let ctx = sema_core::EvalContext::new();
-        sema_core::set_call_callback(&ctx, invoke_native_value);
-        let dispatch_nf = dispatch.as_native_fn_ref().expect("native fn");
-
-        let _guard = AsyncCtxGuard;
-        sema_core::set_async_context(true);
-        let result = (dispatch_nf.func)(&ctx, &[make_request("/assets/missing.js")])
-            .expect("dispatch must not error — it should fall through to the handler route");
-        assert!(
-            sema_core::take_yield_signal().is_none(),
-            "a not-found static file must never yield — it falls through synchronously"
-        );
-        let map = result.as_map_rc().expect("map");
-        assert_eq!(
-            map.get(&Value::keyword("body")),
-            Some(&Value::string("fallback")),
-            "missing static file must fall through to the next matching route, even in async context"
-        );
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -23,7 +23,7 @@ use tokio_tungstenite::tungstenite::Message;
 
 use sema_core::cycle::GcEdge;
 use sema_core::runtime::{NativeOutcome, NativeResult, Trace};
-use sema_core::{check_arity, Caps, IoHandle, IoPoll, SemaError, SemaStream, StreamBox, Value};
+use sema_core::{check_arity, Caps, SemaError, SemaStream, StreamBox, Value};
 
 use crate::io::{await_runtime_until, RuntimePoll};
 use crate::register_fn;
@@ -409,11 +409,9 @@ async fn pump(
             msg = stream.next() => match msg {
                 Some(Ok(Message::Text(t))) => {
                     if evt_tx.send(WsEvent::Text(t.to_string())).await.is_err() { break; }
-                    sema_core::notify_io_complete();
                 }
                 Some(Ok(Message::Binary(b))) => {
                     if evt_tx.send(WsEvent::Binary(b.to_vec())).await.is_err() { break; }
-                    sema_core::notify_io_complete();
                 }
                 Some(Ok(Message::Close(frame))) => {
                     let (code, reason) = match frame {
@@ -421,14 +419,12 @@ async fn pump(
                         None => (1005, String::new()), // 1005: no status present
                     };
                     let _ = evt_tx.send(WsEvent::Close { code, reason }).await;
-                    sema_core::notify_io_complete();
                     break;
                 }
                 // Ping/Pong/raw frames: tungstenite auto-replies to pings.
                 Some(Ok(_)) => {}
                 Some(Err(e)) => {
                     let _ = evt_tx.send(WsEvent::Error(format!("websocket: {e}"))).await;
-                    sema_core::notify_io_complete();
                     break;
                 }
                 // Stream ended with no close frame (abnormal).
@@ -436,7 +432,6 @@ async fn pump(
                     let _ = evt_tx
                         .send(WsEvent::Close { code: 1006, reason: "connection closed".to_string() })
                         .await;
-                    sema_core::notify_io_complete();
                     break;
                 }
             },
@@ -447,8 +442,6 @@ async fn pump(
 /// `ws/connect`: spawn the pump, then await the handshake (block at top level,
 /// yield `AwaitIo` inside an async task). Returns the connection stream value.
 fn ws_connect(url: &str, opts: ConnectOpts) -> NativeResult {
-    use tokio::sync::oneshot::error::TryRecvError;
-
     // Vestigial under CALL_NATIVE (the scheduler delivers the resume value), kept
     // for symmetry with the shipped async yield pattern.
     if let Some(v) = sema_core::take_resume_value() {
@@ -457,9 +450,9 @@ fn ws_connect(url: &str, opts: ConnectOpts) -> NativeResult {
 
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<WsFrame>();
     let (evt_tx, evt_rx) = mpsc::channel::<WsEvent>(EVENT_CAP);
-    let (ready_tx, mut ready_rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
 
-    let abort_pump = sema_io::io_spawn(Box::pin(pump(
+    let _abort_pump = sema_io::io_spawn(Box::pin(pump(
         url.to_string(),
         opts,
         cmd_rx,
@@ -484,24 +477,6 @@ fn ws_connect(url: &str, opts: ConnectOpts) -> NativeResult {
         return await_runtime_until(Box::new(probe), std::time::Instant::now(), u64::MAX);
     }
 
-    // Legacy scheduler task: park on an `AwaitIo` poll of the handshake signal.
-    if sema_core::in_async_context() {
-        let conn_for_poll = conn_val.clone();
-        let handle = Rc::new(IoHandle::with_abort(
-            move || match ready_rx.try_recv() {
-                Err(TryRecvError::Empty) => IoPoll::Pending,
-                Ok(Ok(())) => IoPoll::Ready(Ok(conn_for_poll.clone())),
-                Ok(Err(msg)) => IoPoll::Ready(Err(msg)),
-                Err(TryRecvError::Closed) => {
-                    IoPoll::Ready(Err("ws/connect: connection worker dropped".to_string()))
-                }
-            },
-            abort_pump,
-        ));
-        sema_core::set_yield_signal(sema_core::YieldReason::AwaitIo(handle));
-        return Ok(NativeOutcome::Return(Value::nil()));
-    }
-
     // Top level: block the VM thread on the handshake (it is not inside a runtime).
     match ready_rx.blocking_recv() {
         Ok(Ok(())) => Ok(NativeOutcome::Return(conn_val)),
@@ -510,24 +485,6 @@ fn ws_connect(url: &str, opts: ConnectOpts) -> NativeResult {
             "ws/connect: connection worker dropped before handshake",
         )),
     }
-}
-
-/// The async-context recv path: yield an `AwaitIo` whose poller drains one event.
-fn ws_recv_async(evt_rx: Rc<RefCell<mpsc::Receiver<WsEvent>>>) -> Result<Value, SemaError> {
-    use tokio::sync::mpsc::error::TryRecvError;
-
-    let handle = Rc::new(IoHandle::new(move || {
-        match evt_rx.borrow_mut().try_recv() {
-            Ok(ev) => match event_to_value(Some(ev)) {
-                Ok(v) => IoPoll::Ready(Ok(v)),
-                Err(e) => IoPoll::Ready(Err(e.to_string())),
-            },
-            Err(TryRecvError::Empty) => IoPoll::Pending,
-            Err(TryRecvError::Disconnected) => IoPoll::Ready(Ok(Value::nil())),
-        }
-    }));
-    sema_core::set_yield_signal(sema_core::YieldReason::AwaitIo(handle));
-    Ok(Value::nil())
 }
 
 fn ws_send(args: &[Value]) -> Result<Value, SemaError> {
@@ -564,44 +521,10 @@ fn ws_recv(args: &[Value]) -> NativeResult {
     }
 
     // Legacy scheduler task: park on an `AwaitIo` poll.
-    if sema_core::in_async_context() {
-        if let Some(v) = sema_core::take_resume_value() {
-            return Ok(NativeOutcome::Return(v));
-        }
-        return ws_recv_async(evt_rx).map(NativeOutcome::Return);
-    }
 
     // Top level: block until an event arrives or the channel disconnects.
     let ev = evt_rx.borrow_mut().blocking_recv();
     event_to_value(ev).map(NativeOutcome::Return)
-}
-
-/// The async-context recv-with-deadline path. Polls for an event, returning the
-/// `:timeout` keyword once `deadline` passes with nothing received.
-fn ws_recv_timeout_async(
-    evt_rx: Rc<RefCell<mpsc::Receiver<WsEvent>>>,
-    deadline: std::time::Instant,
-) -> Result<Value, SemaError> {
-    use tokio::sync::mpsc::error::TryRecvError;
-
-    let handle = Rc::new(IoHandle::new(move || {
-        match evt_rx.borrow_mut().try_recv() {
-            Ok(ev) => match event_to_value(Some(ev)) {
-                Ok(v) => IoPoll::Ready(Ok(v)),
-                Err(e) => IoPoll::Ready(Err(e.to_string())),
-            },
-            Err(TryRecvError::Disconnected) => IoPoll::Ready(Ok(Value::nil())),
-            Err(TryRecvError::Empty) => {
-                if std::time::Instant::now() >= deadline {
-                    IoPoll::Ready(Ok(Value::keyword("timeout")))
-                } else {
-                    IoPoll::Pending
-                }
-            }
-        }
-    }));
-    sema_core::set_yield_signal(sema_core::YieldReason::AwaitIo(handle));
-    Ok(Value::nil())
 }
 
 fn ws_recv_timeout(args: &[Value]) -> NativeResult {
@@ -629,13 +552,6 @@ fn ws_recv_timeout(args: &[Value]) -> NativeResult {
     }
 
     // Legacy scheduler task: park on an `AwaitIo` poll with the deadline.
-    if sema_core::in_async_context() {
-        if let Some(v) = sema_core::take_resume_value() {
-            return Ok(NativeOutcome::Return(v));
-        }
-        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(ms);
-        return ws_recv_timeout_async(evt_rx, deadline).map(NativeOutcome::Return);
-    }
 
     // Top level: poll on the shared runtime until an event arrives or the deadline
     // passes. We `try_recv` (dropping the RefCell borrow) and `sleep` between polls

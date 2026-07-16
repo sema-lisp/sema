@@ -26,7 +26,7 @@
 use std::collections::BTreeMap;
 
 use sema_core::runtime::{CompletionKind, NativeOutcome, NativeResult};
-use sema_core::{check_arity, in_async_context, in_runtime_quantum, Caps, SemaError, Value};
+use sema_core::{check_arity, in_runtime_quantum, Caps, SemaError, Value};
 
 /// Completion tag for an offloaded `git` subprocess. Consistent between the
 /// issued identity and the prepared op (not a uniqueness key), so one shared
@@ -162,121 +162,6 @@ struct RawGitOutput {
     stderr: Vec<u8>,
 }
 
-/// Render `msg` exactly like `SemaError::eval(msg)` would display, without
-/// constructing (and immediately dropping) the error — used to pre-render an
-/// async rejection so it's byte-identical to the sync path's error text (the
-/// `async/await: task rejected: {e}` envelope embeds this string verbatim).
-fn eval_msg(msg: String) -> String {
-    SemaError::eval(msg).to_string()
-}
-
-/// Render `msg` exactly like `SemaError::Io(msg)` would display. See
-/// [`eval_msg`].
-fn io_msg(msg: String) -> String {
-    SemaError::Io(msg).to_string()
-}
-
-/// Offload one `git` subprocess invocation onto the process-wide I/O pool and
-/// yield `AwaitIo`, mirroring `shell_async` (system.rs) exactly but scoped to
-/// the fixed `git` binary — so a `git/*` call inside `async/spawn` parks the
-/// task instead of blocking the VM thread (and every sibling task) for the
-/// subprocess's whole duration. `full_args` is the complete argv passed to
-/// `git` (callers decide whether to include the `-c core.quotepath=false`
-/// prefix `git()` forces on the sync path — `git/ignore-matches?` doesn't,
-/// matching its sync bypass of `git()` below). `finish` turns the raw result
-/// into the poller's `IoPoll` on the VM thread — same division of labor as
-/// `fs_offload`'s `decode`: only `Send` facts cross the boundary, the
-/// `Value`/error text is built here, on resume.
-///
-/// No abort-time process-group kill (unlike `shell_async`): `git` runs as a
-/// single direct child, never a `sh -c` pipeline forking grandchildren, so
-/// `kill_on_drop` dropping the child on abort is sufficient — best-effort,
-/// matching every other non-shell offload's cancellation policy.
-///
-/// Returns `Ok(nil)` after arming the yield signal; the scheduler delivers the
-/// real value on resume.
-fn git_offload(
-    full_args: Vec<String>,
-    finish: impl Fn(Result<RawGitOutput, String>) -> sema_core::IoPoll + 'static,
-) -> Result<Value, SemaError> {
-    use std::rc::Rc;
-    use tokio::sync::oneshot::error::TryRecvError;
-
-    // Vestigial under CALL_NATIVE (the scheduler delivers the resume value via
-    // `replace_stack_top`, not by re-invoking this native), but kept for
-    // symmetry with the shipped `async/await` yield pattern.
-    if let Some(v) = sema_core::take_resume_value() {
-        return Ok(v);
-    }
-
-    let (tx, mut rx) = tokio::sync::oneshot::channel::<Result<RawGitOutput, String>>();
-    let abort_task = sema_io::io_spawn(async move {
-        let result = async {
-            let mut cmd = tokio::process::Command::new("git");
-            cmd.args(&full_args)
-                .kill_on_drop(true)
-                .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::piped());
-            let output = cmd.output().await.map_err(|e| {
-                io_msg(format!(
-                    "git: failed to run `git` (is it installed and on PATH?): {e}"
-                ))
-            })?;
-            Ok::<RawGitOutput, String>(RawGitOutput {
-                status_code: output.status.code(),
-                stdout: output.stdout,
-                stderr: output.stderr,
-            })
-        }
-        .await;
-        let _ = tx.send(result);
-        // Wake the parked VM thread so it re-polls promptly.
-        sema_core::notify_io_complete();
-    });
-
-    let handle = Rc::new(sema_core::IoHandle::with_abort(
-        move || match rx.try_recv() {
-            Err(TryRecvError::Empty) => sema_core::IoPoll::Pending,
-            Ok(r) => finish(r),
-            // No sync equivalent for a dropped worker — plain descriptive
-            // string, matching `fs_offload`'s/`shell_async`'s own novel-case
-            // (non-parity) error text.
-            Err(TryRecvError::Closed) => finish(Err("git: subprocess worker dropped".to_string())),
-        },
-        move || {
-            abort_task();
-        },
-    ));
-    sema_core::set_yield_signal(sema_core::YieldReason::AwaitIo(handle));
-    Ok(Value::nil())
-}
-
-/// Offload a git invocation whose Sema-visible result is `decode(stdout)` on a
-/// zero exit, and an error matching `git()`'s exact rendered text (via
-/// [`eval_msg`]) on a non-zero exit or a spawn failure. `args` are the
-/// CALLER-visible args (no `core.quotepath` prefix — `git_offload` adds it to
-/// the real argv), used verbatim in the error text exactly like `git()`'s
-/// `args.join(" ")`, so async and sync error messages can't drift.
-fn git_stdout_async(
-    args: Vec<String>,
-    decode: impl Fn(String) -> Value + 'static,
-) -> Result<Value, SemaError> {
-    let args_joined = args.join(" ");
-    let mut full_args = vec!["-c".to_string(), "core.quotepath=false".to_string()];
-    full_args.extend(args);
-    git_offload(full_args, move |raw| match raw {
-        Err(msg) => sema_core::IoPoll::Ready(Err(msg)),
-        Ok(raw) if raw.status_code == Some(0) => {
-            let out = String::from_utf8_lossy(&raw.stdout).to_string();
-            sema_core::IoPoll::Ready(Ok(decode(out)))
-        }
-        Ok(raw) => {
-            let stderr = String::from_utf8_lossy(&raw.stderr).trim().to_string();
-            sema_core::IoPoll::Ready(Err(eval_msg(format!("git {args_joined}: {stderr}"))))
-        }
-    })
-}
-
 /// The `Send` future that runs one `git` invocation off the VM thread on the
 /// executor's blocking worker (via `io_block_on` inside `runtime_offload`). The
 /// direct child is `kill_on_drop`, so a cancel that drops this future kills it —
@@ -298,7 +183,7 @@ async fn git_run_future(full_args: Vec<String>) -> Result<RawGitOutput, String> 
     })
 }
 
-/// Unified-runtime counterpart to [`git_stdout_async`]: SUSPEND on an
+/// Unified-runtime counterpart to running `git` off the VM thread: SUSPEND on an
 /// interruptible External wait whose job runs `git` off the VM thread and, on a
 /// zero exit, resumes with `decode(stdout)`; a non-zero exit / spawn failure
 /// raises the SAME error text `git()` renders (so runtime and sync can't drift).
@@ -376,13 +261,6 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
                 |out| Value::string(out.trim()),
             );
         }
-        if in_async_context() {
-            return git_stdout_async(
-                vec!["rev-parse".to_string(), "--show-toplevel".to_string()],
-                |out| Value::string(out.trim()),
-            )
-            .map(NativeOutcome::Return);
-        }
         let out = git(&["rev-parse", "--show-toplevel"])?;
         Ok(NativeOutcome::Return(Value::string(out.trim())))
     });
@@ -405,17 +283,6 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
                     |out| Value::string(out.trim()),
                 );
             }
-            if in_async_context() {
-                return git_stdout_async(
-                    vec![
-                        "rev-parse".to_string(),
-                        "--abbrev-ref".to_string(),
-                        "HEAD".to_string(),
-                    ],
-                    |out| Value::string(out.trim()),
-                )
-                .map(NativeOutcome::Return);
-            }
             let out = git(&["rev-parse", "--abbrev-ref", "HEAD"])?;
             Ok(NativeOutcome::Return(Value::string(out.trim())))
         },
@@ -432,17 +299,6 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
                 ],
                 |out| status_entries_value(parse_status_entries(&out)),
             );
-        }
-        if in_async_context() {
-            return git_stdout_async(
-                vec![
-                    "status".to_string(),
-                    "--porcelain=v1".to_string(),
-                    "-z".to_string(),
-                ],
-                |out| status_entries_value(parse_status_entries(&out)),
-            )
-            .map(NativeOutcome::Return);
         }
         Ok(NativeOutcome::Return(status_entries_value(
             status_entries()?
@@ -466,17 +322,6 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
                     ],
                     |out| changed_files_value(parse_status_entries(&out)),
                 );
-            }
-            if in_async_context() {
-                return git_stdout_async(
-                    vec![
-                        "status".to_string(),
-                        "--porcelain=v1".to_string(),
-                        "-z".to_string(),
-                    ],
-                    |out| changed_files_value(parse_status_entries(&out)),
-                )
-                .map(NativeOutcome::Return);
             }
             Ok(NativeOutcome::Return(
                 changed_files_value(status_entries()?),
@@ -503,10 +348,6 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
         if in_runtime_quantum() {
             return git_stdout_runtime(diff_args(), |out| Value::string(&out));
         }
-        if in_async_context() {
-            return git_stdout_async(diff_args(), |out| Value::string(&out))
-                .map(NativeOutcome::Return);
-        }
         let out = match &path {
             None => git(&["diff"])?,
             Some(p) => git(&["diff", "--", p])?,
@@ -527,13 +368,6 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
                     vec!["diff".to_string(), "--name-only".to_string()],
                     |out| diff_files_value(&out),
                 );
-            }
-            if in_async_context() {
-                return git_stdout_async(
-                    vec!["diff".to_string(), "--name-only".to_string()],
-                    |out| diff_files_value(&out),
-                )
-                .map(NativeOutcome::Return);
             }
             let out = git(&["diff", "--name-only"])?;
             Ok(NativeOutcome::Return(diff_files_value(&out)))
@@ -568,10 +402,6 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
             if in_runtime_quantum() {
                 return git_stdout_runtime(log_args(), |out| recent_files_value(&out));
             }
-            if in_async_context() {
-                return git_stdout_async(log_args(), |out| recent_files_value(&out))
-                    .map(NativeOutcome::Return);
-            }
             let out = git(&["log", "--name-only", "--pretty=format:", "-n", &n_str])?;
             Ok(NativeOutcome::Return(recent_files_value(&out)))
         },
@@ -595,30 +425,6 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
             // exit as failure) on ALL paths.
             if in_runtime_quantum() {
                 return git_ignore_matches_runtime(path);
-            }
-            if in_async_context() {
-                let path_for_msg = path.clone();
-                return git_offload(
-                    vec!["check-ignore".to_string(), "-q".to_string(), path],
-                    move |raw| match raw {
-                        Err(msg) => sema_core::IoPoll::Ready(Err(msg)),
-                        Ok(raw) => match raw.status_code {
-                            Some(0) => sema_core::IoPoll::Ready(Ok(Value::bool(true))),
-                            Some(1) => sema_core::IoPoll::Ready(Ok(Value::bool(false))),
-                            other => {
-                                let stderr =
-                                    String::from_utf8_lossy(&raw.stderr).trim().to_string();
-                                sema_core::IoPoll::Ready(Err(eval_msg(format!(
-                                    "git check-ignore {path_for_msg}: exit {}: {stderr}",
-                                    other
-                                        .map(|c| c.to_string())
-                                        .unwrap_or_else(|| "signal".into())
-                                ))))
-                            }
-                        },
-                    },
-                )
-                .map(NativeOutcome::Return);
             }
             let output = std::process::Command::new("git")
                 .args(["check-ignore", "-q", &path])

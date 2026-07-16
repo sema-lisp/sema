@@ -730,13 +730,6 @@ pub fn call_closure_owned(
     // The top-level main closure never travels as a callback value; if it
     // somehow does (globals is None), let the generic borrowed path handle it.
     let globals = closure.globals.as_ref()?.clone();
-    if sema_core::in_async_context() {
-        // The task VM clones args while setting up regardless; ownership is
-        // moot here. See the fallback wrapper for why yields need this route.
-        return Some(crate::scheduler::run_closure_as_inline_task(
-            ctx, closure, functions, native_fns, &*args,
-        ));
-    }
     if let Some(result) = try_run_on_current_vm_args(&closure, &globals, CallArgs::Owned(args), ctx)
     {
         return Some(result);
@@ -834,124 +827,6 @@ thread_local! {
     /// drops the borrow before returning, so no two live `&mut` ever alias.
     static ACTIVE_DEBUG: RefCell<Vec<*mut crate::debug::DebugState>> =
         const { RefCell::new(Vec::new()) };
-}
-
-thread_local! {
-    /// The `StopInfo` of a breakpoint that fired inside an async task during a
-    /// COOPERATIVE (headless) debug session. Set by the scheduler's
-    /// `step_task_debug` when, instead of blocking in `handle_debug_stop`, it
-    /// leaves the task paused and unwinds so the cooperative call can surface the
-    /// stop to JS. Consumed by `start_cooperative`/`run_cooperative`, which
-    /// translate it into `VmExecResult::Stopped(info)`. Cleared on resume.
-    static COOP_TASK_STOP: RefCell<Option<crate::debug::StopInfo>> = const { RefCell::new(None) };
-
-    /// Id of the async task currently paused at a cooperative breakpoint. Set
-    /// alongside `COOP_TASK_STOP` so inspection requests between JS calls
-    /// (`with_coop_paused_task_vm`) can relocate the paused task in the scheduler
-    /// and read ITS frames/locals — the task's own per-task VM, not the main VM
-    /// which is parked at the `await`. Cleared on resume.
-    static COOP_PAUSED_TASK_ID: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
-}
-
-/// Record the location a task stopped at for a cooperative (headless) debug
-/// session, plus the id of the paused task so its VM can be inspected while the
-/// cooperative session is suspended in JS. Called by the scheduler.
-pub fn set_coop_task_stop(task_id: u64, info: crate::debug::StopInfo) {
-    COOP_TASK_STOP.with(|s| *s.borrow_mut() = Some(info));
-    COOP_PAUSED_TASK_ID.with(|c| c.set(Some(task_id)));
-}
-
-/// Take the pending cooperative task-stop location, if any. Called by
-/// `run_cooperative`/`start_cooperative` to surface the stop to JS.
-pub fn take_coop_task_stop() -> Option<crate::debug::StopInfo> {
-    COOP_TASK_STOP.with(|s| s.borrow_mut().take())
-}
-
-/// Id of the async task paused at a cooperative breakpoint, if any.
-pub fn coop_paused_task_id() -> Option<u64> {
-    COOP_PAUSED_TASK_ID.with(|c| c.get())
-}
-
-/// Clear the paused-task id once the cooperative session resumes (the task is
-/// about to be re-driven, so inspecting it as "paused" is no longer meaningful).
-pub fn clear_coop_paused_task_id() {
-    COOP_PAUSED_TASK_ID.with(|c| c.set(None));
-}
-
-/// Surface a cooperative async-task stop to JS as `VmExecResult::Stopped`,
-/// enforcing the invariant that the scheduler-driving native registered HOW to
-/// resume (`set_debug_coop_resume`). Every cooperative task pause is triggered by
-/// a scheduler-driving combinator (`async/await`/`all`/`race`/`run`/`timeout`),
-/// each of which records a [`DebugCoopResume`] before yielding the main VM. If a
-/// stop surfaces with no pending resume, a NEW combinator paused the scheduler
-/// without recording one — `run_cooperative`'s resume path would then take the
-/// non-resume branch and silently wedge (the paused task never re-drives, the
-/// awaited value is never reconstructed). Fail loudly here instead so the gap is
-/// caught the first time that combinator is debugged, not shipped.
-fn surface_coop_task_stop(
-    info: crate::debug::StopInfo,
-) -> Result<crate::debug::VmExecResult, SemaError> {
-    if !sema_core::debug_coop_resume_pending() {
-        return Err(SemaError::eval(
-            "internal: cooperative debug stop surfaced without a registered \
-             DebugCoopResume — a scheduler-driving async combinator paused for a \
-             breakpoint but did not call set_debug_coop_resume",
-        ));
-    }
-    Ok(crate::debug::VmExecResult::Stopped(info))
-}
-
-/// Reconstruct the value a scheduler-driving native (await/all/timeout/race/run)
-/// would have returned, now that its target promise(s) have settled — used by the
-/// cooperative debug-resume path to resume the main VM after a task breakpoint.
-/// A rejected/cancelled target surfaces as the same error the native would have
-/// produced. Mirrors the success/error mapping in `sema-stdlib/src/async_ops.rs`.
-fn reconstruct_coop_resume_value(how: &sema_core::DebugCoopResume) -> Result<Value, SemaError> {
-    use sema_core::{DebugCoopResume, PromiseState};
-    match how {
-        DebugCoopResume::Run => Ok(Value::nil()),
-        DebugCoopResume::Await(p) => match &*p.state.borrow() {
-            PromiseState::Resolved(v) => Ok(v.clone()),
-            PromiseState::Rejected(e) => {
-                Err(SemaError::eval(format!("async/await: task rejected: {e}")))
-            }
-            PromiseState::Cancelled => Err(SemaError::eval("async/await: task was cancelled")),
-            PromiseState::Pending => Err(SemaError::eval(
-                "async/await: still pending after scheduler run",
-            )),
-        },
-        DebugCoopResume::All(promises) => {
-            let mut results = Vec::with_capacity(promises.len());
-            for p in promises {
-                match &*p.state.borrow() {
-                    PromiseState::Resolved(v) => results.push(v.clone()),
-                    PromiseState::Rejected(e) => {
-                        return Err(SemaError::eval(format!("async/all: task rejected: {e}")))
-                    }
-                    PromiseState::Cancelled => {
-                        return Err(SemaError::eval("async/all: task was cancelled"))
-                    }
-                    PromiseState::Pending => {
-                        return Err(SemaError::eval("async/all: task still pending"))
-                    }
-                }
-            }
-            Ok(Value::list(results))
-        }
-        DebugCoopResume::Race(promises) => {
-            for p in promises {
-                if let PromiseState::Resolved(v) = &*p.state.borrow() {
-                    return Ok(v.clone());
-                }
-            }
-            for p in promises {
-                if let PromiseState::Rejected(e) = &*p.state.borrow() {
-                    return Err(SemaError::eval(format!("async/race: task rejected: {e}")));
-                }
-            }
-            Err(SemaError::eval("async/race: no promise resolved"))
-        }
-    }
 }
 
 /// RAII guard registering a `DebugState` as the active debug session for the
@@ -1664,113 +1539,6 @@ impl VM {
         }
     }
 
-    /// Run the VM cooperatively: execute until completion or a debug stop.
-    /// The caller is responsible for managing debug state between calls.
-    pub fn run_cooperative(
-        &mut self,
-        ctx: &EvalContext,
-        debug: &mut crate::debug::DebugState,
-    ) -> Result<crate::debug::VmExecResult, SemaError> {
-        // Resume a cooperative debug pause that occurred inside an async task: a
-        // scheduler-driving native (await/all/timeout/race/run) yielded the main
-        // VM for a task breakpoint. Before resuming the main VM, re-drive the
-        // scheduler so the paused task continues; if it pauses again surface the
-        // new stop, otherwise reconstruct the native's value and resume the main
-        // VM via the stack-top placeholder it left (`set_resume_value` semantics).
-        if let Some((target, how)) = sema_core::take_debug_coop_resume() {
-            // The paused task is about to be re-driven; inspecting it as "paused"
-            // is no longer meaningful (a later stop re-records a fresh id).
-            clear_coop_paused_task_id();
-            // The scheduler runs in debug mode for this re-drive too, so a later
-            // breakpoint in the same or a sibling task stops as well.
-            let _active = ActiveDebugGuard::enter(debug);
-            match sema_core::call_run_scheduler_target(ctx, target.clone()) {
-                Ok(sema_core::SchedulerRunResult::DebugPaused) => {
-                    // Paused again on another breakpoint. Re-arm the resume so the
-                    // NEXT call drives the scheduler once more, and surface the new
-                    // stop. (The native already consumed its yield; we re-store the
-                    // coop resume here since we took it above.)
-                    sema_core::set_debug_coop_resume(target, how);
-                    if let Some(info) = take_coop_task_stop() {
-                        // Resume was just re-armed above, so the guard's invariant
-                        // holds by construction here.
-                        return surface_coop_task_stop(info);
-                    }
-                    // Shouldn't happen, but don't wedge: fall through to a yield.
-                    return Ok(crate::debug::VmExecResult::Yielded);
-                }
-                Ok(_) => {
-                    // Target settled. Reconstruct the value the yielded native
-                    // (await/all/timeout/race/run) would have returned, put it on
-                    // the main VM's stack top (the native left a nil placeholder
-                    // there), and resume the main VM from after that native call.
-                    // A rejected/cancelled target surfaces as an error here — the
-                    // same error the native would have produced had it not paused.
-                    let resume_value = reconstruct_coop_resume_value(&how)?;
-                    self.replace_stack_top(resume_value);
-                    return self.run_inner::<true>(ctx, Some(debug));
-                }
-                Err(e) => return Err(e),
-            }
-        }
-        // Normal cooperative step (no pending debug-pause resume): run with the
-        // session registered so a task breakpoint hit during this step (e.g. the
-        // main VM reaches an await whose task then breaks) surfaces as a stop.
-        let _active = ActiveDebugGuard::enter(debug);
-        let result = self.run_inner::<true>(ctx, Some(debug))?;
-        if let Some(info) = take_coop_task_stop() {
-            return surface_coop_task_stop(info);
-        }
-        Ok(result)
-    }
-
-    /// Start cooperative debug execution: push the initial frame and run.
-    pub fn start_cooperative(
-        &mut self,
-        closure: Rc<Closure>,
-        ctx: &EvalContext,
-        debug: &mut crate::debug::DebugState,
-    ) -> Result<crate::debug::VmExecResult, SemaError> {
-        // Session-boundary hygiene: a fresh cooperative session must not inherit
-        // ANY cooperative-debug state from a prior session that was abandoned
-        // (Stop) while paused at an async breakpoint. Without this, the next
-        // session's first Continue would consume a stale `DEBUG_COOP_RESUME` and
-        // re-drive a dead target — clobbering this program's VM stack — or surface
-        // a stale `COOP_TASK_STOP`, or inspect a leftover task by a reused id, or
-        // silently run an abandoned `Ready` task left in the reused scheduler.
-        // The normal resume path clears these thread-locals; this covers the
-        // Stop-while-paused path, which never resumes.
-        clear_coop_paused_task_id();
-        let _ = take_coop_task_stop();
-        let _ = sema_core::take_debug_coop_resume();
-        crate::scheduler::reset_scheduler_tasks();
-        self.ensure_cache_space(&closure.func);
-        let base = self.stack.len();
-        let n_locals = closure.func.chunk.n_locals as usize;
-        self.stack.resize(base + n_locals, Value::nil());
-        self.frames.push(CallFrame {
-            cache_base: closure.func.cache_offset,
-            closure,
-            pc: 0,
-            base,
-            open_upvalues: None,
-        });
-        // Register this DebugState as the active session so the async scheduler
-        // (reached via the RUN_SCHEDULER_CALLBACK seam during a native call) runs
-        // task steps in debug mode; a mid-task breakpoint then surfaces as a
-        // cooperative stop (see `step_task_debug`). The guard drops when control
-        // returns to JS — correct, since no scheduler runs between JS calls.
-        let _active = ActiveDebugGuard::enter(debug);
-        let result = self.run_inner::<true>(ctx, Some(debug))?;
-        // If a task breakpoint fired during this drive, the scheduler-driving
-        // native yielded the main VM (AsyncYield) and recorded the stop; surface
-        // it to JS as a cooperative Stop instead of the raw AsyncYield.
-        if let Some(info) = take_coop_task_stop() {
-            return surface_coop_task_stop(info);
-        }
-        Ok(result)
-    }
-
     /// Number of active call frames.
     pub fn frame_count(&self) -> usize {
         self.frames.len()
@@ -1880,15 +1648,6 @@ impl VM {
                 Err(e)
             }
         }
-    }
-
-    /// Run the VM without debug state, returning the raw VmExecResult.
-    /// Used by the async scheduler for task execution and resume.
-    pub fn run_async(
-        &mut self,
-        ctx: &EvalContext,
-    ) -> Result<crate::debug::VmExecResult, SemaError> {
-        self.run_inner::<false>(ctx, None)
     }
 
     /// Resume execution for at most `instruction_limit` bytecode instructions.
@@ -2054,19 +1813,6 @@ impl VM {
         }
     }
 
-    /// Debug-aware resume of an async task step: like [`run_async`] but with the
-    /// breakpoint/step machinery live (`run_inner::<true>`). The async
-    /// scheduler uses this for parked-task resumes when a debug session is active,
-    /// so a breakpoint on a line that runs only inside the task can stop. A
-    /// returned `Stopped` is handled by the scheduler via [`handle_debug_stop`].
-    pub fn run_async_debug(
-        &mut self,
-        ctx: &EvalContext,
-        debug: &mut crate::debug::DebugState,
-    ) -> Result<crate::debug::VmExecResult, SemaError> {
-        self.run_inner::<true>(ctx, Some(debug))
-    }
-
     /// Replace the top of the stack with a value.
     /// Used by the scheduler to set the resume value before continuing
     /// a yielded task (the yield left a nil placeholder on the stack).
@@ -2122,26 +1868,6 @@ impl VM {
         self.pending_resume_error = Some(err);
     }
 
-    /// Execute a closure and return the raw VmExecResult (for async scheduler).
-    pub fn execute_async(
-        &mut self,
-        closure: Rc<Closure>,
-        ctx: &EvalContext,
-    ) -> Result<crate::debug::VmExecResult, SemaError> {
-        self.ensure_cache_space(&closure.func);
-        let base = self.stack.len();
-        let n_locals = closure.func.chunk.n_locals as usize;
-        self.stack.resize(base + n_locals, Value::nil());
-        self.frames.push(CallFrame {
-            cache_base: closure.func.cache_offset,
-            closure,
-            pc: 0,
-            base,
-            open_upvalues: None,
-        });
-        self.run_inner::<false>(ctx, None)
-    }
-
     /// Seed the main call frame for `closure` without executing it, so the
     /// unified runtime can drive this VM as a task through `run_quantum`. Mirrors
     /// the frame setup in `execute_async`, but performs no evaluation — the first
@@ -2158,29 +1884,6 @@ impl VM {
             base,
             open_upvalues: None,
         });
-    }
-
-    /// Debug-aware first step of an async task: like [`execute_async`] but with the
-    /// breakpoint/step machinery live. Used by the scheduler to start a task when a
-    /// debug session is active.
-    pub fn execute_async_debug(
-        &mut self,
-        closure: Rc<Closure>,
-        ctx: &EvalContext,
-        debug: &mut crate::debug::DebugState,
-    ) -> Result<crate::debug::VmExecResult, SemaError> {
-        self.ensure_cache_space(&closure.func);
-        let base = self.stack.len();
-        let n_locals = closure.func.chunk.n_locals as usize;
-        self.stack.resize(base + n_locals, Value::nil());
-        self.frames.push(CallFrame {
-            cache_base: closure.func.cache_offset,
-            closure,
-            pc: 0,
-            base,
-            open_upvalues: None,
-        });
-        self.run_inner::<true>(ctx, Some(debug))
     }
 
     /// Prepare the VM to run `closure` with `args` already bound to its
@@ -4526,19 +4229,6 @@ impl VM {
                 // await, sleep) suspends cleanly. Otherwise the inner VM's
                 // AsyncYield would surface as "async yield outside of
                 // scheduler context" and crash the calling HOF.
-                if sema_core::in_async_context() {
-                    // In async context the VM call sites close this closure's
-                    // open upvalues before invoking the HOF (see call_value /
-                    // CALL_NATIVE), so the cells are already snapshotted and safe
-                    // to run on the fresh task VM stack.
-                    return crate::scheduler::run_closure_as_inline_task(
-                        ctx,
-                        closure.clone(),
-                        functions.clone(),
-                        payload_for_box.native_fns.clone(),
-                        args,
-                    );
-                }
 
                 // C1: if this closure belongs to a VM currently running a native
                 // call on this thread (e.g. a stdlib HOF like map/filter/foldl
@@ -6002,46 +5692,6 @@ mod tests {
         );
     }
 
-    /// The cooperative-stop guard: surfacing a task stop with NO pending
-    /// `DebugCoopResume` is an internal error (a scheduler-driving combinator
-    /// forgot `set_debug_coop_resume`), while a stop WITH one surfaces normally.
-    /// This pins the invariant so a future combinator that paginates the
-    /// scheduler without registering a resume fails loudly instead of wedging.
-    #[test]
-    fn surface_coop_task_stop_requires_a_pending_resume() {
-        use crate::debug::{StopInfo, StopReason, VmExecResult};
-
-        let info = || StopInfo {
-            reason: StopReason::Breakpoint,
-            file: None,
-            line: 7,
-        };
-
-        // No resume registered → loud internal error.
-        let _ = sema_core::take_debug_coop_resume(); // ensure clean slate
-        let err = surface_coop_task_stop(info()).unwrap_err();
-        assert!(
-            err.to_string().contains("DebugCoopResume"),
-            "guard error should name the missing resume: {err}"
-        );
-
-        // With a resume registered → surfaces as Stopped on the same line.
-        let promise = Rc::new(sema_core::LegacyPromise {
-            state: std::cell::RefCell::new(sema_core::PromiseState::Pending),
-            task_id: std::cell::Cell::new(0),
-        });
-        sema_core::set_debug_coop_resume(
-            sema_core::SchedulerTarget::One(promise.clone()),
-            sema_core::DebugCoopResume::Await(promise),
-        );
-        let surfaced = surface_coop_task_stop(info());
-        let Ok(VmExecResult::Stopped(got)) = surfaced else {
-            panic!("expected Stopped(line 7), got {surfaced:?}");
-        };
-        assert_eq!(got.line, 7);
-        let _ = sema_core::take_debug_coop_resume(); // leave the thread-local clean
-    }
-
     /// Convenience: compile and run a string expression in the VM.
     fn eval_str(input: &str, globals: &Rc<Env>, ctx: &EvalContext) -> Result<Value, SemaError> {
         let vals = sema_reader::read_many(input)
@@ -6977,56 +6627,6 @@ mod tests {
     }
 
     #[test]
-    fn test_breakpoint_fires_on_each_loop_iteration() {
-        // Issue #2: resume_skip prevents breakpoints from re-triggering in
-        // single-line loops. After stopping at a breakpoint on a loop line,
-        // "Continue" should stop again on the next iteration.
-        use crate::debug::{DebugState, StepMode, VmExecResult};
-        use std::path::PathBuf;
-
-        let globals = make_test_env();
-        let ctx = EvalContext::new();
-
-        // A single-line loop: the loop body stays on line 1
-        let input = "(let loop ((i 0)) (if (< i 5) (loop (+ i 1)) i))";
-        let (vals, span_map) = sema_reader::read_many_with_spans(input).unwrap();
-        let source_file = PathBuf::from("<test>");
-        let prog = compile_program_with_spans(&vals, &span_map, Some(source_file.clone())).unwrap();
-
-        let mut vm = VM::new(globals, prog.functions, &[], prog.main_cache_slots).unwrap();
-        let mut debug = DebugState::new_headless();
-
-        // Set breakpoint on line 1 (the only line)
-        debug.set_breakpoints(&source_file, &[1]);
-        debug.step_mode = StepMode::StepInto; // stop on entry first
-
-        // Start: should stop on entry
-        let result = vm
-            .start_cooperative(prog.closure, &ctx, &mut debug)
-            .unwrap();
-        assert!(
-            matches!(result, VmExecResult::Stopped(_)),
-            "should stop on entry"
-        );
-
-        // Continue: should hit the breakpoint on line 1
-        debug.step_mode = StepMode::Continue;
-        let result = vm.run_cooperative(&ctx, &mut debug).unwrap();
-        assert!(
-            matches!(result, VmExecResult::Stopped(_)),
-            "should stop at breakpoint on first pass"
-        );
-
-        // Continue again: should hit breakpoint again on next iteration
-        debug.step_mode = StepMode::Continue;
-        let result = vm.run_cooperative(&ctx, &mut debug).unwrap();
-        assert!(
-            matches!(result, VmExecResult::Stopped(_)),
-            "should stop at breakpoint on second iteration (resume_skip bug)"
-        );
-    }
-
-    #[test]
     fn test_valid_breakpoint_lines_extraction() {
         // Verify that valid_breakpoint_lines correctly extracts lines with spans
         let code = "(+ 1 2)\n\n; comment\n(+ 3 4)";
@@ -7077,209 +6677,6 @@ mod tests {
         // Snapping: line 1 and 2 should snap to line 3
         assert_eq!(snap_breakpoint_line(1, &valid), Some(3));
         assert_eq!(snap_breakpoint_line(2, &valid), Some(3));
-    }
-
-    #[test]
-    fn test_debug_evaluate_uses_paused_frame_locals_over_globals() {
-        use crate::debug::{DebugState, StepMode, VmExecResult};
-        use std::path::PathBuf;
-
-        let globals = make_test_env();
-        globals.set(sema_core::intern("x"), Value::int(1));
-        let ctx = EvalContext::new();
-
-        let input = "(define (f x)\n  ; body line\n  (+ x 1))\n(f 10)";
-        let (vals, span_map) = sema_reader::read_many_with_spans(input).unwrap();
-        let source_file = PathBuf::from("<debug-eval>");
-        let prog = compile_program_with_spans(&vals, &span_map, Some(source_file.clone())).unwrap();
-
-        let mut vm = VM::new(globals, prog.functions, &[], prog.main_cache_slots).unwrap();
-        let mut debug = DebugState::new_headless();
-        debug.set_breakpoints(&source_file, &[3]);
-        debug.step_mode = StepMode::Continue;
-
-        let result = vm
-            .start_cooperative(prog.closure, &ctx, &mut debug)
-            .unwrap();
-        assert!(matches!(result, VmExecResult::Stopped(_)));
-        let frame_id = vm.debug_stack_trace().first().unwrap().id as usize;
-
-        let expr = sema_reader::read("(+ x 5)").unwrap();
-        let value = vm.debug_evaluate(frame_id, &expr, &ctx, &debug).unwrap();
-        assert_eq!(value, Value::int(15));
-    }
-
-    #[test]
-    fn test_debug_set_local_updates_paused_stack_slot() {
-        use crate::debug::{DebugState, StepMode, VmExecResult};
-        use std::path::PathBuf;
-
-        let globals = make_test_env();
-        let ctx = EvalContext::new();
-
-        let input = "(define (f x)\n  ; body line\n  (+ x 1))\n(f 10)";
-        let (vals, span_map) = sema_reader::read_many_with_spans(input).unwrap();
-        let source_file = PathBuf::from("<debug-set>");
-        let prog = compile_program_with_spans(&vals, &span_map, Some(source_file.clone())).unwrap();
-
-        let mut vm = VM::new(globals, prog.functions, &[], prog.main_cache_slots).unwrap();
-        let mut debug = DebugState::new_headless();
-        debug.set_breakpoints(&source_file, &[3]);
-        debug.step_mode = StepMode::Continue;
-
-        let result = vm
-            .start_cooperative(prog.closure, &ctx, &mut debug)
-            .unwrap();
-        assert!(matches!(result, VmExecResult::Stopped(_)));
-        let frame_id = vm.debug_stack_trace().first().unwrap().id as usize;
-
-        let updated = vm
-            .debug_set_variable(
-                crate::debug::scope_locals_ref(frame_id),
-                "x",
-                Value::int(32),
-            )
-            .unwrap();
-        assert_eq!(updated.value, "32");
-
-        let expr = sema_reader::read("(+ x 5)").unwrap();
-        let value = vm.debug_evaluate(frame_id, &expr, &ctx, &debug).unwrap();
-        assert_eq!(value, Value::int(37));
-    }
-
-    #[test]
-    fn test_debug_upvalues_use_lexical_names_and_support_closed_mutation() {
-        use crate::debug::{DebugState, StepMode, VmExecResult};
-        use std::path::PathBuf;
-
-        let globals = make_test_env();
-        let ctx = EvalContext::new();
-        let input = "(define (make-adder base)\n  (lambda (x)\n    (+ base x)))\n(define add5 (make-adder 5))\n(add5 10)";
-        let (vals, span_map) = sema_reader::read_many_with_spans(input).unwrap();
-        let source_file = PathBuf::from("<debug-closed-upvalue>");
-        let prog = compile_program_with_spans(&vals, &span_map, Some(source_file.clone())).unwrap();
-
-        let mut vm = VM::new(globals, prog.functions, &[], prog.main_cache_slots).unwrap();
-        let mut debug = DebugState::new_headless();
-        debug.set_breakpoints(&source_file, &[3]);
-        debug.step_mode = StepMode::Continue;
-
-        let result = vm
-            .start_cooperative(prog.closure, &ctx, &mut debug)
-            .unwrap();
-        assert!(matches!(result, VmExecResult::Stopped(_)));
-        let frame_id = vm.debug_stack_trace().first().unwrap().id as usize;
-
-        let upvalues = vm.debug_variables(crate::debug::scope_upvalues_ref(frame_id));
-        assert!(
-            upvalues
-                .iter()
-                .any(|var| var.name == "base" && var.value == "5"),
-            "expected lexical upvalue name in debug variables: {upvalues:?}"
-        );
-
-        let expr = sema_reader::read("(+ base x)").unwrap();
-        assert_eq!(
-            vm.debug_evaluate(frame_id, &expr, &ctx, &debug).unwrap(),
-            Value::int(15)
-        );
-
-        let updated = vm
-            .debug_set_variable(
-                crate::debug::scope_upvalues_ref(frame_id),
-                "base",
-                Value::int(20),
-            )
-            .unwrap();
-        assert_eq!(updated.name, "base");
-        assert_eq!(updated.value, "20");
-        assert_eq!(
-            vm.debug_evaluate(frame_id, &expr, &ctx, &debug).unwrap(),
-            Value::int(30)
-        );
-    }
-
-    #[test]
-    fn test_debug_upvalues_support_open_mutation_by_lexical_name() {
-        use crate::debug::{DebugState, StepMode, VmExecResult};
-        use std::path::PathBuf;
-
-        let globals = make_test_env();
-        let ctx = EvalContext::new();
-        let input =
-            "(define (outer base)\n  (define f (lambda (x)\n    (+ base x)))\n  (f 10))\n(outer 5)";
-        let (vals, span_map) = sema_reader::read_many_with_spans(input).unwrap();
-        let source_file = PathBuf::from("<debug-open-upvalue>");
-        let prog = compile_program_with_spans(&vals, &span_map, Some(source_file.clone())).unwrap();
-
-        let mut vm = VM::new(globals, prog.functions, &[], prog.main_cache_slots).unwrap();
-        let mut debug = DebugState::new_headless();
-        debug.set_breakpoints(&source_file, &[3]);
-        debug.step_mode = StepMode::Continue;
-
-        let result = vm
-            .start_cooperative(prog.closure, &ctx, &mut debug)
-            .unwrap();
-        assert!(matches!(result, VmExecResult::Stopped(_)));
-        let frame_id = vm.debug_stack_trace().first().unwrap().id as usize;
-
-        vm.debug_set_variable(
-            crate::debug::scope_upvalues_ref(frame_id),
-            "base",
-            Value::int(40),
-        )
-        .unwrap();
-        let expr = sema_reader::read("(+ base x)").unwrap();
-        assert_eq!(
-            vm.debug_evaluate(frame_id, &expr, &ctx, &debug).unwrap(),
-            Value::int(50)
-        );
-    }
-
-    #[test]
-    fn test_debug_variables_expand_compound_values_lazily() {
-        use crate::debug::{DebugState, StepMode, VmExecResult};
-        use std::path::PathBuf;
-
-        let globals = make_test_env();
-        let ctx = EvalContext::new();
-        let input = "(define (f xs)\n  (list xs))\n(f (list 1 (list 2 3)))";
-        let (vals, span_map) = sema_reader::read_many_with_spans(input).unwrap();
-        let source_file = PathBuf::from("<debug-expand>");
-        let prog = compile_program_with_spans(&vals, &span_map, Some(source_file.clone())).unwrap();
-
-        let mut vm = VM::new(globals, prog.functions, &[], prog.main_cache_slots).unwrap();
-        let mut debug = DebugState::new_headless();
-        debug.set_breakpoints(&source_file, &[2]);
-        debug.step_mode = StepMode::Continue;
-
-        let result = vm
-            .start_cooperative(prog.closure, &ctx, &mut debug)
-            .unwrap();
-        assert!(matches!(result, VmExecResult::Stopped(_)));
-        let frame_id = vm.debug_stack_trace().first().unwrap().id as usize;
-
-        let locals = vm.debug_variables(crate::debug::scope_locals_ref(frame_id));
-        let xs = locals
-            .iter()
-            .find(|var| var.name == "xs")
-            .expect("xs local should be visible");
-        assert!(
-            xs.variables_reference > 0,
-            "xs should be expandable: {xs:?}"
-        );
-
-        let children = vm.debug_variables(xs.variables_reference);
-        assert_eq!(children.len(), 2);
-        assert_eq!(children[0].name, "[0]");
-        assert_eq!(children[0].value, "1");
-        assert_eq!(children[1].name, "[1]");
-        assert!(children[1].variables_reference > 0);
-
-        let nested = vm.debug_variables(children[1].variables_reference);
-        assert_eq!(nested.len(), 2);
-        assert_eq!(nested[0].value, "2");
-        assert_eq!(nested[1].value, "3");
     }
 
     #[test]

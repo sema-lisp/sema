@@ -483,13 +483,6 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
                 patch_apply_file_work(&path, &patch).map_err(|e| e.to_string())
             });
         }
-        if sema_core::in_async_context() {
-            return crate::io::fs_offload(
-                move || patch_apply_file_work(&path, &patch).map_err(|e| e.to_string()),
-                Value::int,
-            )
-            .map(NativeOutcome::Return);
-        }
         Ok(NativeOutcome::Return(Value::int(patch_apply_file_work(
             &path, &patch,
         )?)))

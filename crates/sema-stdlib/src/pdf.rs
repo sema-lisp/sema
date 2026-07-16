@@ -13,7 +13,7 @@
 use std::collections::BTreeMap;
 
 use sema_core::runtime::NativeOutcome;
-use sema_core::{check_arity, in_async_context, Caps, SemaError, Value};
+use sema_core::{check_arity, Caps, SemaError, Value};
 
 /// Decode `pdf/extract-text-pages`'s off-thread result (per-page `String`s) into
 /// a Sema list on the VM thread. A plain `fn` (no captures) so it fits the
@@ -144,13 +144,6 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
                     move || extract_text_work(&path).map_err(|e| e.to_string()),
                 );
             }
-            if in_async_context() {
-                return crate::io::fs_offload(
-                    move || extract_text_work(&path).map_err(|e| e.to_string()),
-                    Value::string_owned,
-                )
-                .map(NativeOutcome::Return);
-            }
             Ok(NativeOutcome::Return(Value::string(&extract_text_work(
                 &path,
             )?)))
@@ -177,13 +170,6 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
                     move || extract_text_pages_work(&path).map_err(|e| e.to_string()),
                 );
             }
-            if in_async_context() {
-                return crate::io::fs_offload(
-                    move || extract_text_pages_work(&path).map_err(|e| e.to_string()),
-                    pages_to_value,
-                )
-                .map(NativeOutcome::Return);
-            }
             Ok(NativeOutcome::Return(pages_to_value(
                 extract_text_pages_work(&path)?,
             )))
@@ -208,13 +194,6 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
                     page_count_work(&path).map_err(|e| e.to_string())
                 });
             }
-            if in_async_context() {
-                return crate::io::fs_offload(
-                    move || page_count_work(&path).map_err(|e| e.to_string()),
-                    Value::int,
-                )
-                .map(NativeOutcome::Return);
-            }
             Ok(NativeOutcome::Return(Value::int(page_count_work(&path)?)))
         },
     );
@@ -238,13 +217,6 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
                     metadata_to_value,
                     move || metadata_work(&path).map_err(|e| e.to_string()),
                 );
-            }
-            if in_async_context() {
-                return crate::io::fs_offload(
-                    move || metadata_work(&path).map_err(|e| e.to_string()),
-                    metadata_to_value,
-                )
-                .map(NativeOutcome::Return);
             }
             Ok(NativeOutcome::Return(metadata_to_value(metadata_work(
                 &path,

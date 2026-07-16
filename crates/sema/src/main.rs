@@ -1440,23 +1440,12 @@ fn open_in_browser(url: &str) {
 
 /// Drain any pending async tasks scheduled by a top-level form.
 ///
-/// Top-level `(async ...)` forms spawn a task but don't implicitly await it,
-/// so their side effects would silently vanish on exit unless we explicitly
-/// run the scheduler. This drains all pending tasks (target = `All`).
-///
-/// The scheduler callback is only registered once an eval has run, so we
-/// silently ignore the "no async scheduler registered" error (nothing async was
-/// scheduled). Other scheduler errors are reported to stderr as warnings but do
-/// not fail the program — the side effects already ran.
-pub(crate) fn drain_async_scheduler(interpreter: &Interpreter) {
-    if let Err(e) = sema_core::call_run_scheduler(&interpreter.ctx, None) {
-        let msg = e.to_string();
-        if msg.contains("no async scheduler registered") {
-            return;
-        }
-        eprintln!("warning: background task error: {msg}");
-    }
-}
+/// Retained as a call-site marker; under the unified cooperative runtime the
+/// evaluator already drives every spawned task to completion during `eval`
+/// (the persistent runtime drains to idle before returning), and any still-
+/// detached task is reaped by the interpreter's bounded shutdown on drop. There
+/// is no separate scheduler to run, so this is a no-op.
+pub(crate) fn drain_async_scheduler(_interpreter: &Interpreter) {}
 
 fn run_notebook_command(command: NotebookCommands) {
     match command {

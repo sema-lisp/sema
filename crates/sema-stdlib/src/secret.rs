@@ -235,16 +235,6 @@ pub fn register(env: &sema_core::Env) {
         // stall the cooperative VM thread. `text` travels through the
         // offload and back so `decode` (which runs on the VM thread) can
         // still slice out each finding's matched substring.
-        if sema_core::in_async_context() {
-            let text = s.to_string();
-            return crate::io::fs_offload(
-                move || {
-                    let findings = detect_secrets(&text);
-                    Ok::<(String, Vec<Finding>), String>((text, findings))
-                },
-                |(text, findings)| findings_to_list(&text, &findings),
-            );
-        }
         let findings = detect_secrets(s);
         Ok(findings_to_list(s, &findings))
     });
@@ -254,16 +244,6 @@ pub fn register(env: &sema_core::Env) {
         let s = args[0]
             .as_str()
             .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
-        if sema_core::in_async_context() {
-            let text = s.to_string();
-            return crate::io::fs_offload(
-                move || {
-                    let findings = detect_secrets(&text);
-                    Ok::<String, String>(redact_findings(&text, &findings))
-                },
-                Value::string_owned,
-            );
-        }
         let findings = detect_secrets(s);
         Ok(Value::string(&redact_findings(s, &findings)))
     });
@@ -273,16 +253,6 @@ pub fn register(env: &sema_core::Env) {
         let s = args[0]
             .as_str()
             .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
-        if sema_core::in_async_context() {
-            let text = s.to_string();
-            return crate::io::fs_offload(
-                move || {
-                    let findings = detect_pii(&text);
-                    Ok::<(String, Vec<Finding>), String>((text, findings))
-                },
-                |(text, findings)| findings_to_list(&text, &findings),
-            );
-        }
         let findings = detect_pii(s);
         Ok(findings_to_list(s, &findings))
     });
@@ -534,137 +504,5 @@ mod tests {
     fn entropy_low_for_repetitive() {
         assert!(shannon_entropy("aaaaaaaa") < 1.0);
         assert!(shannon_entropy("a8Fk3Lm9Zq2Wx7Bv1Nc4Pd6") >= ENTROPY_THRESHOLD);
-    }
-}
-
-/// Async-context coverage for `secret/detect`/`secret/redact`/`pii/detect`'s
-/// `in_async_context()` offload gate. `sema-stdlib` doesn't depend on
-/// `sema-vm`/`sema-eval` (the real scheduler lives there), so this stands in
-/// for the scheduler by hand: force `sema_core::in_async_context()` on, call
-/// the native, then poll the `AwaitIo` handle it arms to completion — same
-/// harness shape as `archive.rs`'s `async_offload_tests`.
-#[cfg(test)]
-mod async_offload_tests {
-    use super::*;
-    use std::time::{Duration, Instant};
-
-    /// Forces `in_async_context()` on for the guard's lifetime, resetting it
-    /// (even on panic/early return) so a failure can't leak the flag into
-    /// whichever test the harness runs next on the same worker thread.
-    struct AsyncCtxGuard;
-    impl Drop for AsyncCtxGuard {
-        fn drop(&mut self) {
-            sema_core::set_async_context(false);
-        }
-    }
-
-    fn make_env() -> sema_core::Env {
-        let env = sema_core::Env::new();
-        register(&env);
-        env
-    }
-
-    fn native(env: &sema_core::Env, name: &str) -> impl Fn(&[Value]) -> Result<Value, SemaError> {
-        let f = env
-            .get(sema_core::intern(name))
-            .unwrap_or_else(|| panic!("{name} not registered"));
-        move |args: &[Value]| {
-            let nf = f.as_native_fn_ref().expect("native fn");
-            let ctx = sema_core::EvalContext::default();
-            (nf.func)(&ctx, args)
-        }
-    }
-
-    /// Call a native fn with the async-context gate forced on, then drive the
-    /// `AwaitIo` handle it arms to completion by polling. Panics if the
-    /// native didn't yield at all (e.g. it silently took the sync fallback)
-    /// or the offload rejects.
-    fn drive_async(call: impl FnOnce() -> Result<Value, SemaError>) -> Value {
-        let _guard = AsyncCtxGuard;
-        sema_core::set_async_context(true);
-        let armed = call().expect("native call should arm a yield, not error synchronously");
-        assert_eq!(
-            armed,
-            Value::nil(),
-            "an offloading native returns nil immediately after arming its yield signal"
-        );
-        let reason = sema_core::take_yield_signal()
-            .expect("expected a yield signal to be armed — did the native take the sync path?");
-        let handle = match reason {
-            sema_core::YieldReason::AwaitIo(h) => h,
-            other => panic!("expected an AwaitIo yield, got {other:?}"),
-        };
-        let deadline = Instant::now() + Duration::from_secs(10);
-        loop {
-            match handle.poll() {
-                sema_core::IoPoll::Ready(Ok(v)) => return v,
-                sema_core::IoPoll::Ready(Err(e)) => panic!("offload rejected: {e}"),
-                sema_core::IoPoll::Pending => {
-                    assert!(
-                        Instant::now() < deadline,
-                        "offload never completed within 10s"
-                    );
-                    std::thread::sleep(Duration::from_millis(2));
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn secret_detect_offloads_async() {
-        let env = make_env();
-        let text = Value::string("AWS key AKIAIOSFODNN7EXAMPLE here");
-        let r = drive_async(|| native(&env, "secret/detect")(&[text.clone()]));
-        let items = r.as_list().expect("list");
-        assert_eq!(items.len(), 1);
-        let m = items[0].as_map_ref().expect("map");
-        assert_eq!(
-            m.get(&Value::keyword("type")).and_then(|t| t.as_str()),
-            Some("aws-access-key")
-        );
-    }
-
-    #[test]
-    fn secret_redact_offloads_async() {
-        let env = make_env();
-        let text = Value::string("key AKIAIOSFODNN7EXAMPLE done");
-        let r = drive_async(|| native(&env, "secret/redact")(&[text.clone()]));
-        let s = r.as_str().unwrap();
-        assert!(!s.contains("AKIAIOSFODNN7EXAMPLE"));
-        assert!(s.contains("\u{ab}redacted:aws-access-key\u{bb}"));
-    }
-
-    #[test]
-    fn pii_detect_offloads_async() {
-        let env = make_env();
-        let text = Value::string("contact me@example.com");
-        let r = drive_async(|| native(&env, "pii/detect")(&[text.clone()]));
-        let items = r.as_list().expect("list");
-        assert_eq!(items.len(), 1);
-        let m = items[0].as_map_ref().expect("map");
-        assert_eq!(
-            m.get(&Value::keyword("type")).and_then(|t| t.as_str()),
-            Some("email")
-        );
-    }
-
-    /// Same natives, sync path — confirms the added async gate left the
-    /// default (non-async) behavior byte-for-byte unchanged.
-    #[test]
-    fn secret_and_pii_sync_path_unchanged() {
-        let env = make_env();
-        let text = Value::string("AWS key AKIAIOSFODNN7EXAMPLE here");
-        let r = native(&env, "secret/detect")(&[text]).expect("sync detect ok");
-        let items = r.as_list().expect("list");
-        assert_eq!(items.len(), 1);
-
-        let text = Value::string("key AKIAIOSFODNN7EXAMPLE done");
-        let r = native(&env, "secret/redact")(&[text]).expect("sync redact ok");
-        let s = r.as_str().unwrap();
-        assert!(!s.contains("AKIAIOSFODNN7EXAMPLE"));
-
-        let text = Value::string("contact me@example.com");
-        let r = native(&env, "pii/detect")(&[text]).expect("sync pii ok");
-        assert_eq!(r.as_list().expect("list").len(), 1);
     }
 }

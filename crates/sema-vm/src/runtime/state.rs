@@ -1709,44 +1709,15 @@ impl Runtime {
             // the runtime registers a native wait and, when it fires, re-runs
             // `run_quantum` — the frame resumes in place with the placeholder as
             // the resume value.
+            // The only TLS yield signal left is `async/sleep`'s ctx-less value ABI:
+            // every promise/channel/offloaded-I/O op suspends structurally through
+            // the `NativeOutcome` ABI (`Suspend`/`Runtime`), handled by the `Pending`
+            // arm below.
             Ok(VmExecResult::AsyncYield(reason)) => match reason {
                 YieldReason::Sleep(ms) => {
                     task.vm_call = Some(vm);
                     TaskAction::VmSleep(task_id, ms)
                 }
-                // The promise ops (`async/spawn`, `async/await`, `async/cancel`,
-                // `async/all`, `async/race`, `async/timeout`, the predicates,
-                // `async/run`) and the channel ops (`channel/new`, `send`, `recv`,
-                // `try-recv`, `close`, `closed?`, `count`, `empty?`, `full?`) no
-                // longer use the TLS yield signal — they suspend structurally
-                // through the `NativeOutcome` ABI (`Suspend`/`Runtime`), handled by
-                // the `Pending` arm below. Reaching here with a legacy
-                // promise/channel yield would be a routing bug: surface it as an
-                // error rather than driving the retired bridge.
-                //
-                // `AwaitIo` joins this arm after the P2 funeral: every
-                // runtime-quantum offloaded-I/O op (llm, ws, http, file, archive,
-                // pdf, diff, server, stream, event/io) now SUSPENDS structurally
-                // (`WaitKind::External` / cooperative poll), so no op arms
-                // `AwaitIo` under the runtime any more. The enum variant survives
-                // only for the legacy cooperative scheduler (`scheduler.rs`, P5);
-                // reaching it here is a routing bug.
-                YieldReason::Spawn(_)
-                | YieldReason::Cancel(_)
-                | YieldReason::AwaitPromise(_)
-                | YieldReason::AwaitPromiseSet { .. }
-                | YieldReason::ChannelSend(_, _)
-                | YieldReason::ChannelRecv(_)
-                | YieldReason::ChannelClose(_)
-                | YieldReason::ChannelInspect(_, _)
-                | YieldReason::ChannelTryRecv(_)
-                | YieldReason::AwaitIo(_) => TaskAction::VmResult(
-                    task_id,
-                    task.vm_owner.take().expect("VM call has a return owner"),
-                    Err(sema_core::SemaError::eval(
-                        "legacy promise/channel/io yield reached the unified runtime (async ops are structural)",
-                    )),
-                ),
             },
             // A native suspended structurally through the runtime ABI (the VM
             // parked its frame — pc past the call, a nil placeholder on its stack

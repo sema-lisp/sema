@@ -10,10 +10,7 @@ use sema_core::runtime::{
     NativeContinuation, NativeOutcome, NativeResult, NativeSuspend, PreparedExternalOperation,
     ResumeInput, SendPayload, Trace, WaitKind,
 };
-use sema_core::{
-    check_arity, in_async_context, in_runtime_quantum, set_yield_signal, take_resume_value, Caps,
-    SemaError, Value, YieldReason,
-};
+use sema_core::{check_arity, in_runtime_quantum, take_resume_value, Caps, SemaError, Value};
 
 use crate::register_fn;
 
@@ -272,138 +269,6 @@ struct RawShellOutput {
     stderr: Vec<u8>,
 }
 
-/// The offloaded (async-context) path: `io_spawn` the subprocess on the process-
-/// wide I/O pool and yield an `AwaitIo` handle whose poll closure decodes the `Send`
-/// output facts into the identical `Value` shape the sync path returns. Returns
-/// `Ok(nil)` after arming the yield signal; the scheduler delivers the real
-/// value on resume.
-fn shell_async(
-    program: String,
-    child_args: Vec<String>,
-    cwd: Option<String>,
-    env_vars: Vec<(String, String)>,
-) -> Result<Value, SemaError> {
-    use std::rc::Rc;
-    use std::sync::atomic::{AtomicU32, Ordering};
-    use std::sync::Arc;
-    use tokio::sync::oneshot::error::TryRecvError;
-
-    // Vestigial under CALL_NATIVE (the scheduler delivers the resume value via
-    // `replace_stack_top`, not by re-invoking this native), but kept for
-    // symmetry with the shipped `async/await` yield pattern.
-    if let Some(v) = sema_core::take_resume_value() {
-        return Ok(v);
-    }
-
-    let (tx, mut rx) = tokio::sync::oneshot::channel::<Result<RawShellOutput, String>>();
-    // The child's OS pid, published by the worker once spawned (0 = not yet). On Unix
-    // the child is its OWN process-group leader (process_group(0) → pgid == pid), so
-    // the abort hook can SIGKILL the whole group. The poll closure resets this to 0 on
-    // completion so a later abort never signals a reaped (possibly reused) pid.
-    let pid_slot = Arc::new(AtomicU32::new(0));
-    let pid_for_worker = pid_slot.clone();
-    let pid_for_poll = pid_slot.clone();
-
-    let abort_task = sema_io::io_spawn(async move {
-        let result = async {
-            // Spawn (not `.output()`) so we can publish the pid before awaiting, then
-            // gather output. `kill_on_drop` kills the direct child if this future is
-            // dropped while the runtime is alive. stdout/stderr piped to match `.output()`.
-            let mut cmd = tokio::process::Command::new(&program);
-            cmd.args(&child_args)
-                .kill_on_drop(true)
-                .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::piped());
-            // Honor the options map's :cwd / :env, matching the sync path.
-            if let Some(dir) = &cwd {
-                cmd.current_dir(dir);
-            }
-            for (k, v) in &env_vars {
-                cmd.env(k, v);
-            }
-            // Put the child in its own process group so a compound/pipelined command
-            // (`sh -c "a; b"`) — where `sh` forks the real workers as grandchildren —
-            // can be torn down as a GROUP on abort, not just the `sh` leader.
-            #[cfg(unix)]
-            cmd.process_group(0);
-            let child = cmd
-                .spawn()
-                // Match the sync path's spawn-error message format exactly.
-                .map_err(|e| format!("shell: {e}"))?;
-            if let Some(id) = child.id() {
-                pid_for_worker.store(id, Ordering::SeqCst);
-            }
-            let output = child
-                .wait_with_output()
-                .await
-                .map_err(|e| format!("shell: {e}"))?;
-            Ok::<RawShellOutput, String>(RawShellOutput {
-                status_code: output.status.code(),
-                stdout: output.stdout,
-                stderr: output.stderr,
-            })
-        }
-        .await;
-        let _ = tx.send(result);
-        // Wake the parked VM thread so it re-polls promptly.
-        sema_core::notify_io_complete();
-    });
-
-    // True cancellation: on cancel/timeout the scheduler runs this hook. It (a) runs
-    // the seam's one-shot AbortHook, aborting the spawned task (→ drops the
-    // kill_on_drop `Child` once the pool processes it) AND (b) issues a SYNCHRONOUS
-    // `SIGKILL` to the child's whole PROCESS GROUP. (b) is what makes the kill
-    // reliable even when the program exits IMMEDIATELY after the timeout (e.g. a
-    // one-shot `sema -e`), where the pool is torn down before it can process the
-    // async abort — and killing the GROUP (not just the `sh` pid) reaps the
-    // grandchildren a compound command forks. Fires only on cancellation; the killpg
-    // layer composes AROUND the seam's hook.
-    #[cfg(unix)]
-    let pid_for_abort = pid_slot;
-    #[cfg(not(unix))]
-    let _ = pid_slot;
-    let handle = Rc::new(sema_core::IoHandle::with_abort(
-        move || match rx.try_recv() {
-            Err(TryRecvError::Empty) => sema_core::IoPoll::Pending,
-            Ok(Ok(raw)) => {
-                pid_for_poll.store(0, Ordering::SeqCst);
-                sema_core::IoPoll::Ready(Ok(shell_output_value(
-                    raw.status_code,
-                    &raw.stdout,
-                    &raw.stderr,
-                )))
-            }
-            Ok(Err(msg)) => {
-                pid_for_poll.store(0, Ordering::SeqCst);
-                sema_core::IoPoll::Ready(Err(msg))
-            }
-            Err(TryRecvError::Closed) => {
-                pid_for_poll.store(0, Ordering::SeqCst);
-                sema_core::IoPoll::Ready(Err("shell: subprocess worker dropped".to_string()))
-            }
-        },
-        move || {
-            abort_task();
-            #[cfg(unix)]
-            {
-                let pid = pid_for_abort.load(Ordering::SeqCst);
-                if pid != 0 {
-                    // SAFETY: killpg of the child's own process group (process_group(0)
-                    // set pgid == pid). The negative pid targets the GROUP, killing the
-                    // `sh` leader AND any grandchildren it forked. The pid is reset to 0
-                    // by the poll closure once the worker observed completion, so a
-                    // reaped/reused pid is never targeted (only a constant signal is sent).
-                    unsafe {
-                        libc::kill(-(pid as libc::pid_t), libc::SIGKILL);
-                    }
-                }
-            }
-        },
-    ));
-    sema_core::set_yield_signal(sema_core::YieldReason::AwaitIo(handle));
-    Ok(Value::nil())
-}
-
 /// Completion tag for an offloaded `shell` subprocess. Consistent between the
 /// issued identity and the prepared op (not a uniqueness key).
 const SHELL_COMPLETION_KIND: u64 = 0x7368_656c; // "shel"
@@ -596,9 +461,6 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
 
         // Legacy scheduler task: the retired `AwaitIo` offload, kept for the
         // non-unified-runtime path.
-        if in_async_context() {
-            return shell_async(program, child_args, cwd, env_vars).map(NativeOutcome::Return);
-        }
 
         // Top-level (not in any task): the original synchronous path,
         // byte-identical in observable behavior to the pre-async implementation.
@@ -682,13 +544,6 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
                 // freeze every sibling task. Yield exactly like `async/sleep`
                 // (async_ops.rs) so the scheduler parks this task and drives
                 // siblings while the sleep elapses.
-                if in_async_context() {
-                    if let Some(cached) = take_resume_value() {
-                        return Ok(cached);
-                    }
-                    set_yield_signal(YieldReason::Sleep(ms as u64));
-                    return Ok(Value::nil());
-                }
                 // Outside async (REPL/scripts/top level): unchanged real sleep.
                 std::thread::sleep(std::time::Duration::from_millis(ms as u64));
                 Ok(Value::nil())

@@ -1901,9 +1901,7 @@ pub fn call_function_owned(func: &Value, args: &mut [Value]) -> Result<Value, Se
 /// Shared post-call guard for HOF callback invocations: a yielding native
 /// passed directly (not wrapped in a lambda) cannot suspend cleanly here.
 fn check_hof_yield(result: Result<Value, SemaError>) -> Result<Value, SemaError> {
-    if (sema_core::in_async_context() || sema_core::in_runtime_quantum())
-        && sema_core::take_yield_signal().is_some()
-    {
+    if sema_core::in_runtime_quantum() && sema_core::take_yield_signal().is_some() {
         return Err(SemaError::eval(
             "yielding native passed directly to a higher-order function — \
              wrap it in a lambda so the yield can suspend cleanly. \

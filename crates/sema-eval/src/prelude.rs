@@ -497,8 +497,8 @@ pub const PRELUDE: &str = r#"
        (eval wrf-form#))))
 
 ;; llm/embed is a SINGLE first-class native function (crates/sema-llm/src/
-;; builtins.rs) that branches internally on `in_async_context()`: synchronous
-;; inline outside a scheduler task, offloaded+overlapping inside one. Keeping it a
+;; builtins.rs) that branches internally on the runtime context: synchronous
+;; inline at top level, offloaded+overlapping inside a spawned task. Keeping it a
 ;; native (not a router macro) is what makes `(procedure? llm/embed)` true and lets
 ;; it be used as a value — `(map llm/embed …)`, `(async/pool-map llm/embed …)`.
 

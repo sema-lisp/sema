@@ -572,8 +572,7 @@ fn register_fn_ctx(
 /// "wrap it in a lambda" HOF-yield stub).
 #[cfg(not(target_arch = "wasm32"))]
 fn in_async_offload_context() -> bool {
-    sema_core::in_async_context()
-        || (sema_core::in_runtime_quantum() && sema_core::current_task_id().is_some())
+    sema_core::in_runtime_quantum() && sema_core::current_task_id().is_some()
 }
 
 fn register_runtime_fn_ctx(
@@ -3531,7 +3530,8 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
                 ));
             };
             let reqs: Vec<ChatRequest> = requests
-                .into_iter()
+                .iter()
+                .cloned()
                 .map(|mut r| {
                     if r.model.is_empty() {
                         r.model = provider.default_model().to_string();
@@ -3576,68 +3576,6 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
                     continuation: Box::new(OffloadValueContinuation { op: "llm/batch" }),
                 }));
             }
-
-            let (tx, mut rx) =
-                tokio::sync::oneshot::channel::<Vec<Result<ChatResponse, LlmError>>>();
-            let p2 = provider.clone();
-            // Blocking-tier offload (no native `spawn`-based future here — see the
-            // comment above): abort is best-effort, the batch call runs to
-            // completion on the worker and its result is simply discarded.
-            sema_io::io_spawn_blocking(move || {
-                let responses = p2.batch_complete(reqs);
-                let _ = tx.send(responses);
-                sema_core::notify_io_complete();
-            });
-
-            let handle = Rc::new(sema_core::IoHandle::new(move || {
-                use tokio::sync::oneshot::error::TryRecvError;
-                match rx.try_recv() {
-                    Err(TryRecvError::Empty) => sema_core::IoPoll::Pending,
-                    Ok(responses) => {
-                        let mut results = Vec::with_capacity(responses.len());
-                        for resp_result in responses {
-                            let resp = match resp_result {
-                                Ok(r) => r,
-                                Err(e) => return sema_core::IoPoll::Ready(Err(e.to_string())),
-                            };
-                            // Fold into THIS call's captured accumulator frame, then
-                            // suppress `track_usage`'s own fold and re-install the
-                            // captured budget frame around it — the poller runs
-                            // outside the per-task install boundary, so the live
-                            // thread-locals may belong to a sibling task. Priced
-                            // with an empty provider, matching the sync path (which
-                            // never stamps a serving provider for `llm/batch`).
-                            if let Some(slot) = &usage_accum_slot {
-                                let cost = pricing::calculate_cost_for("", &resp.usage);
-                                accumulate_into(slot, &resp.usage, cost);
-                            }
-                            let track_result = {
-                                let prev_budget = ACTIVE_BUDGET.with(|b| {
-                                    std::mem::replace(&mut *b.borrow_mut(), budget_slot.clone())
-                                });
-                                let r = USAGE_ACCUM_SUPPRESS.with(|s| {
-                                    s.set(true);
-                                    let r = track_usage(&resp.usage);
-                                    s.set(false);
-                                    r
-                                });
-                                ACTIVE_BUDGET.with(|b| *b.borrow_mut() = prev_budget);
-                                r
-                            };
-                            if let Err(e) = track_result {
-                                return sema_core::IoPoll::Ready(Err(e.to_string()));
-                            }
-                            results.push(Value::string(&resp.content));
-                        }
-                        sema_core::IoPoll::Ready(Ok(Value::list(results)))
-                    }
-                    Err(TryRecvError::Closed) => {
-                        sema_core::IoPoll::Ready(Err("batch: worker dropped".to_string()))
-                    }
-                }
-            }));
-            sema_core::set_yield_signal(sema_core::YieldReason::AwaitIo(handle));
-            return Ok(NativeOutcome::Return(Value::nil()));
         }
 
         // ── SYNC path: inline provider call (byte-identical to before) ─────
@@ -3957,116 +3895,6 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
                     continuation: Box::new(OffloadValueContinuation { op: "llm/embed" }),
                 }));
             }
-
-            let (tx, mut rx) = tokio::sync::oneshot::channel::<Result<EmbedResponse, LlmError>>();
-            let req2 = request.clone();
-            // Spawned pool future (the http/shell abort tier): providers with a
-            // native async embed path (`embed_future`) are dropped mid-flight on
-            // abort — true cancellation; sync-only providers fall back to the
-            // admission-controlled blocking tier, where cancel stays best-effort
-            // (result discarded, call runs to completion).
-            let abort = sema_io::io_spawn(async move {
-                let r = match provider.embed_future(req2.clone()) {
-                    Some(fut) => fut.await,
-                    None => {
-                        let p = provider.clone();
-                        sema_io::io_offload_blocking(move || p.embed(req2)).await
-                    }
-                };
-                let _ = tx.send(r);
-                sema_core::notify_io_complete();
-            });
-
-            // Move the LlmSpan + cassette context INTO the poller closure so the
-            // span is finalized (and the cassette recorded + usage accounted) on
-            // the VM thread when the future lands — never as a native-frame local
-            // (those drop at the yield).
-            let key = cassette_key;
-            let mut span_slot = Some(span);
-            // On cancel/timeout the scheduler runs the abort hook, aborting the
-            // spawned wire future. Never called on normal completion.
-            let handle = Rc::new(sema_core::IoHandle::with_abort(
-                move || {
-                    use tokio::sync::oneshot::error::TryRecvError;
-                    match rx.try_recv() {
-                        Err(TryRecvError::Empty) => sema_core::IoPoll::Pending,
-                        Ok(Ok(resp)) => {
-                            if let Some(span) = span_slot.take() {
-                                span.set_dispatch(&provider_name, &req_model);
-                                span.set_response(&sema_otel::ResponseFacts {
-                                    input_tokens: resp.usage.prompt_tokens,
-                                    output_tokens: 0,
-                                    response_model: resp.model.clone(),
-                                    cost_usd: pricing::calculate_cost_for(
-                                        &provider_name,
-                                        &resp.usage,
-                                    ),
-                                    ..Default::default()
-                                });
-                                // span drops here → ends the span.
-                            }
-                            if recording {
-                                CASSETTE.with(|c| {
-                                    if let Some(cass) = c.borrow_mut().as_mut() {
-                                        cass.record_entry(crate::cassette::TapeEntry::from_embed(
-                                            &key,
-                                            &resp.model,
-                                            &resp.embeddings,
-                                            resp.usage.prompt_tokens,
-                                        ));
-                                    }
-                                });
-                            }
-                            // Decode the embedding (byte-identical to the sync path)
-                            // and account on the VM thread. `track_usage` only mutates
-                            // session-usage / budget thread-locals and reads static
-                            // pricing — it never spawns, yields, or touches the
-                            // scheduler — so it is safe to call here inside
-                            // `wake_blocked_tasks`'s `&mut self.tasks` borrow. Fold into
-                            // the CAPTURED leaf-usage frame and charge the CAPTURED
-                            // budget frame (ASYNC-1, mirroring the completion poller):
-                            // the poller runs outside the per-task install boundary, so
-                            // the live thread-locals may belong to a sibling. A budget
-                            // overrun fails the task, exactly as the sync path's `?`.
-                            if let Some(slot) = &usage_accum_slot {
-                                let cost = pricing::calculate_cost_for(&provider_name, &resp.usage);
-                                accumulate_into(slot, &resp.usage, cost);
-                            }
-                            let value = embed_value_from_response(&resp, single);
-                            let track_result = {
-                                let prev_budget = ACTIVE_BUDGET.with(|b| {
-                                    std::mem::replace(&mut *b.borrow_mut(), budget_slot.clone())
-                                });
-                                let r = USAGE_ACCUM_SUPPRESS.with(|s| {
-                                    s.set(true);
-                                    let r = track_usage(&resp.usage);
-                                    s.set(false);
-                                    r
-                                });
-                                ACTIVE_BUDGET.with(|b| *b.borrow_mut() = prev_budget);
-                                r
-                            };
-                            match track_result {
-                                Ok(()) => sema_core::IoPoll::Ready(Ok(value)),
-                                Err(e) => sema_core::IoPoll::Ready(Err(e.to_string())),
-                            }
-                        }
-                        Ok(Err(e)) => {
-                            if let Some(span) = span_slot.take() {
-                                span.record_error(llm_error_kind(&e), &e.to_string());
-                            }
-                            sema_core::IoPoll::Ready(Err(e.to_string()))
-                        }
-                        Err(TryRecvError::Closed) => {
-                            span_slot.take();
-                            sema_core::IoPoll::Ready(Err("embed: io worker dropped".to_string()))
-                        }
-                    }
-                },
-                abort,
-            ));
-            sema_core::set_yield_signal(sema_core::YieldReason::AwaitIo(handle));
-            return Ok(NativeOutcome::Return(Value::nil()));
         }
 
         // ── SYNC path: inline provider call (byte-identical to before) ─────
@@ -4277,71 +4105,6 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
                     continuation: Box::new(OffloadValueContinuation { op: "llm/rerank" }),
                 }));
             }
-
-            let (tx, mut rx) = tokio::sync::oneshot::channel::<Result<RerankResponse, LlmError>>();
-            let req2 = request.clone();
-            // Spawned pool future (the http/shell abort tier): providers with a
-            // native async rerank path (`rerank_future`) are dropped mid-flight on
-            // abort — true cancellation; sync-only providers fall back to the
-            // admission-controlled blocking tier, where cancel stays best-effort
-            // (result discarded, call runs to completion).
-            let abort = sema_io::io_spawn(async move {
-                let r = match resolved_provider.rerank_future(req2.clone()) {
-                    Some(fut) => fut.await,
-                    None => {
-                        let p = resolved_provider.clone();
-                        sema_io::io_offload_blocking(move || p.rerank(req2)).await
-                    }
-                };
-                let _ = tx.send(r);
-                sema_core::notify_io_complete();
-            });
-
-            // Move the span + documents INTO the poller closure so the reordered
-            // output and the final Value are built on the VM thread when the
-            // future lands — never as a native-frame local (those drop at yield).
-            let mut span_slot = Some(span);
-            let documents_for_poller = documents;
-            // On cancel/timeout the scheduler runs the abort hook, aborting the
-            // spawned wire future. Never called on normal completion.
-            let handle = Rc::new(sema_core::IoHandle::with_abort(
-                move || {
-                    use tokio::sync::oneshot::error::TryRecvError;
-                    match rx.try_recv() {
-                        Err(TryRecvError::Empty) => sema_core::IoPoll::Pending,
-                        Ok(Ok(resp)) => {
-                            if let Some(span) = span_slot.take() {
-                                let out_docs: Vec<(String, f64)> = resp
-                                    .results
-                                    .iter()
-                                    .filter_map(|r| {
-                                        documents_for_poller
-                                            .get(r.index)
-                                            .map(|d| (d.clone(), r.score))
-                                    })
-                                    .collect();
-                                span.set_output(&out_docs);
-                                // span drops here → ends the span.
-                            }
-                            let value = rerank_value_from_response(&resp, &documents_for_poller);
-                            sema_core::IoPoll::Ready(Ok(value))
-                        }
-                        Ok(Err(e)) => {
-                            if let Some(span) = span_slot.take() {
-                                span.record_error(llm_error_kind(&e), &e.to_string());
-                            }
-                            sema_core::IoPoll::Ready(Err(e.to_string()))
-                        }
-                        Err(TryRecvError::Closed) => {
-                            span_slot.take();
-                            sema_core::IoPoll::Ready(Err("rerank: io worker dropped".to_string()))
-                        }
-                    }
-                },
-                abort,
-            ));
-            sema_core::set_yield_signal(sema_core::YieldReason::AwaitIo(handle));
-            return Ok(NativeOutcome::Return(Value::nil()));
         }
 
         // ── SYNC path: inline provider call (byte-identical to before) ─────
@@ -6341,35 +6104,16 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
             }));
         }
 
-        let (tx, mut rx) = tokio::sync::oneshot::channel::<i64>();
-
-        // Bump in-flight + peak on spawn so the test can prove simultaneity.
+        // Top-level (non-runtime-task) fallback: sleep synchronously on the VM
+        // thread and return the id. The in-flight gauge is bumped/decremented
+        // around the blocking sleep so the concurrency test invariants still hold.
         let prev = IO_INFLIGHT.fetch_add(1, Ordering::SeqCst) + 1;
         IO_PEAK.fetch_max(prev, Ordering::SeqCst);
-
-        let _abort = sema_io::io_spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
-            // Clamp at 0: a stray decrement from an abandoned future (timeout/pool
-            // error-path) must not push a later test's live count negative.
-            let _ = IO_INFLIGHT
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| Some((v - 1).max(0)));
-            let _ = tx.send(id);
-            // Wake the parked VM thread so it re-polls promptly.
-            sema_core::notify_io_complete();
-        });
-
-        let handle = Rc::new(sema_core::IoHandle::new(move || {
-            use tokio::sync::oneshot::error::TryRecvError;
-            match rx.try_recv() {
-                Err(TryRecvError::Empty) => sema_core::IoPoll::Pending,
-                Ok(v) => sema_core::IoPoll::Ready(Ok(Value::int(v))),
-                Err(TryRecvError::Closed) => {
-                    sema_core::IoPoll::Ready(Err("io-sleep-once: worker dropped".to_string()))
-                }
-            }
-        }));
-        sema_core::set_yield_signal(sema_core::YieldReason::AwaitIo(handle));
-        Ok(NativeOutcome::Return(Value::nil()))
+        #[cfg(not(target_arch = "wasm32"))]
+        std::thread::sleep(std::time::Duration::from_millis(ms));
+        let _ =
+            IO_INFLIGHT.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| Some((v - 1).max(0)));
+        Ok(NativeOutcome::Return(Value::int(id)))
     });
 }
 
@@ -7331,146 +7075,6 @@ fn finalize_complete_success(
     finalize(resp)
 }
 
-/// Concurrent counterpart to [`do_complete`] + the native's post-call accounting,
-/// for the async-scheduler-task path. Mirrors the concurrent `llm/embed` flow,
-/// scaled to a completion: it runs the on-VM-thread stage (conv scope, detached
-/// `chat` span, request attrs, cache lookup, cassette decision, fallback-chain
-/// resolution into `Arc` clones) SYNCHRONOUSLY, then SPAWNS the wire unit
-/// (`run_fallback_retry_async`) as an abortable pool future and YIELDS `AwaitIo`
-/// so sibling tasks overlap — cancel/timeout runs the handle's abort hook, which
-/// drops the in-flight request. All post-call work (span finalize, retry spans,
-/// cache store, cassette record, `track_usage`, content→Value) runs in the
-/// poller, on the VM thread, when the future lands — because the native is NOT
-/// re-invoked on resume.
-///
-/// `finalize` shapes the per-native return value from the `ChatResponse` (e.g.
-/// `Value::string(&resp.content)` for `llm/complete`). It runs in the poller on the
-/// VM thread, AFTER `track_usage`, so it may itself do further VM-thread work
-/// (e.g. `llm/extract`'s re-ask loop).
-///
-/// On a cache hit or cassette replay (no provider call) it finalizes the span,
-/// accounts ZERO usage, calls `finalize`, and returns WITHOUT yielding (nothing to
-/// overlap) — preserving the zero-usage cache-hit accounting invariant.
-#[cfg(not(target_arch = "wasm32"))]
-fn do_complete_async_yield(
-    request: ChatRequest,
-    finalize: CompleteFinalize,
-) -> Result<Value, SemaError> {
-    // Defensive resume-value drain: the scheduler resumes the bytecode after the
-    // CALL via `replace_stack_top`, so this native is not re-invoked — but mirror
-    // `llm/embed`/`io-sleep-once` and drain any stray resume value.
-    if let Some(v) = sema_core::take_resume_value() {
-        return Ok(v);
-    }
-
-    // On-VM-thread prep (conv scope, span, cache, cassette, chain resolution) is
-    // shared with the runtime External-wait path (`do_complete_runtime_suspend`).
-    let plan = match complete_offload_prep(request)? {
-        // Cache hit / cassette replay: no provider call. Account zero (hit) usage on
-        // the VM thread and finalize inline — no yield (nothing to overlap).
-        CompletePrep::Inline(resp) => {
-            track_usage(&resp.usage)?;
-            return finalize(resp);
-        }
-        CompletePrep::Offload(plan) => *plan,
-    };
-    let CompleteOffloadPlan {
-        chain,
-        request,
-        max_retries,
-        retry_base_ms,
-        rate_limit_wait_ms,
-        span,
-        cache_key,
-        cassette_record_key,
-        request_for_messages,
-    } = plan;
-
-    // ── Offload the wire unit + yield ────────────────────────────────────
-    let (tx, mut rx) =
-        tokio::sync::oneshot::channel::<Result<CompleteOutcome, crate::types::LlmError>>();
-    // NOTE (async-path compat nuance): the wire stage runs on pool workers, so
-    // OpenAI's `DROP_TEMPERATURE` self-heal LEARNS into a worker's TLS, not the
-    // VM thread's. The WITHIN-call self-heal (400 → drop temperature → retry
-    // once) is fully preserved (openai's `complete_future` strips temperature
-    // from the retried request explicitly), so every async completion still
-    // succeeds; only the cross-call optimization (skip the doomed first request
-    // on later calls) is not shared across the VM thread — each async call may
-    // pay one extra 400+retry on temperature-rejecting models. Correctness
-    // holds; documented as a minor async-path divergence.
-    // The in-flight gauge (bumped now, dropped with the future) lets a test prove
-    // simultaneity even if an abort lands before the future's first poll.
-    let inflight = InflightGuard::new();
-    // Offloaded as a SPAWNED POOL FUTURE (the http/shell abort tier), not
-    // spawn_blocking: native-async providers are dropped mid-flight on abort —
-    // the in-flight request's connection is torn down, no wasted round-trip.
-    // Sync-only providers fall back to the admission-controlled blocking tier
-    // inside `complete_once_async`, where cancel stays best-effort.
-    let abort = sema_io::io_spawn(async move {
-        // Balance in-flight on EVERY exit — normal completion or abort-drop.
-        let _inflight = inflight;
-        // Spend the reserved rate-limit pacing gap HERE, on the pool worker —
-        // never on the VM thread — so sibling tasks keep running while it
-        // elapses. An abort during this wait drops the whole future (dropping
-        // the sleep with it), same as an abort mid-request.
-        if rate_limit_wait_ms > 0 {
-            tokio::time::sleep(std::time::Duration::from_millis(rate_limit_wait_ms)).await;
-        }
-        let r = run_fallback_retry_async(chain, request, max_retries, retry_base_ms).await;
-        let _ = tx.send(r);
-        sema_core::notify_io_complete();
-    });
-
-    // Move the span + cassette/cache context INTO the poller closure so all
-    // post-call work runs on the VM thread when the future lands. Capture THIS
-    // leaf's usage-accumulator + budget frames (see `finalize_complete_success`).
-    let mut span_slot = Some(span);
-    let mut finalize_slot = Some(finalize);
-    let usage_accum_slot = current_usage_accum();
-    let budget_slot = active_budget();
-    // True cancellation: on cancel/timeout the scheduler runs the abort hook,
-    // which aborts the spawned wire future → the in-flight provider request is
-    // dropped (connection torn down). Never called on normal completion.
-    let handle = Rc::new(sema_core::IoHandle::with_abort(
-        move || {
-            use tokio::sync::oneshot::error::TryRecvError;
-            match rx.try_recv() {
-                Err(TryRecvError::Empty) => sema_core::IoPoll::Pending,
-                Ok(Ok(outcome)) => {
-                    let span = span_slot.take().expect("span used once");
-                    let finalize = finalize_slot.take().expect("finalize used once");
-                    match finalize_complete_success(
-                        outcome,
-                        span,
-                        cache_key.clone(),
-                        cassette_record_key.clone(),
-                        usage_accum_slot.clone(),
-                        budget_slot.clone(),
-                        &request_for_messages,
-                        finalize,
-                    ) {
-                        Ok(value) => sema_core::IoPoll::Ready(Ok(value)),
-                        Err(e) => sema_core::IoPoll::Ready(Err(e.to_string())),
-                    }
-                }
-                Ok(Err(e)) => {
-                    if let Some(span) = span_slot.take() {
-                        span.record_error(llm_error_kind(&e), &e.to_string());
-                    }
-                    sema_core::IoPoll::Ready(Err(e.to_string()))
-                }
-                Err(TryRecvError::Closed) => {
-                    span_slot.take();
-                    sema_core::IoPoll::Ready(Err("complete: io worker dropped".to_string()))
-                }
-            }
-        },
-        abort,
-    ));
-    sema_core::set_yield_signal(sema_core::YieldReason::AwaitIo(handle));
-    Ok(Value::nil())
-}
-
 /// Completion-kind tag for an agent/chat provider round offloaded through the
 /// unified runtime's External-wait machinery (distinct from mcp's kinds).
 #[cfg(not(target_arch = "wasm32"))]
@@ -7511,9 +7115,6 @@ fn dispatch_complete_offload(
     if offloadable {
         if in_runtime_offload_task() {
             return do_complete_runtime_suspend(request, finalize);
-        }
-        if sema_core::in_async_context() {
-            return do_complete_async_yield(request, finalize).map(NativeOutcome::Return);
         }
     }
     let response = do_complete(request)?;
@@ -9847,7 +9448,7 @@ fn agent_step(ctx: &EvalContext, token: u64) -> sema_core::runtime::NativeResult
     // External wait, so two spawned `agent/run`s overlap across rounds and
     // `async/cancel` cuts the loop at an inter-round park.
     #[cfg(not(target_arch = "wasm32"))]
-    if sema_core::in_async_context() || sema_core::in_runtime_quantum() {
+    if sema_core::in_runtime_quantum() {
         if let Some(cb) = on_text {
             // Mirror `do_complete_streaming`'s scope/span setup, detached (the
             // span is finalized by the stream poller after the last park).
@@ -9867,13 +9468,6 @@ fn agent_step(ctx: &EvalContext, token: u64) -> sema_core::runtime::NativeResult
             map.insert(Value::keyword("stream"), stream_token);
             map.insert(Value::keyword("on-text"), cb);
             return Ok(NativeOutcome::Return(Value::map(map)));
-        }
-        if sema_core::in_async_context() {
-            return do_complete_async_yield(
-                request,
-                Box::new(move |resp| agent_apply_step_response(token, resp)),
-            )
-            .map(NativeOutcome::Return);
         }
         return do_complete_runtime_suspend(
             request,
@@ -10697,7 +10291,6 @@ fn stream_run_begin(request: ChatRequest, span: sema_otel::LlmSpan) -> Result<Va
                 }
                 let mut emit = |ev: StreamEvent| {
                     let _ = tx.send(ev);
-                    sema_core::notify_io_complete();
                 };
                 stream_wire_walk(&chain, &request, &mut emit);
             });
@@ -11093,7 +10686,7 @@ fn stream_next(token: u64) -> sema_core::runtime::NativeResult {
     // Pre-filled runs resolve without parking (nothing to overlap — mirrors the
     // cassette-replay no-yield path of `do_complete_async_yield`); outside a
     // scheduler task OR a unified-runtime quantum fall back to a blocking drain.
-    if prefilled || (!sema_core::in_async_context() && !sema_core::in_runtime_quantum()) {
+    if prefilled || !sema_core::in_runtime_quantum() {
         loop {
             if let Some(v) = stream_poll_batch(token, true)? {
                 return Ok(NativeOutcome::Return(v));
@@ -11103,22 +10696,20 @@ fn stream_next(token: u64) -> sema_core::runtime::NativeResult {
 
     // A unified-runtime quantum re-scans cooperatively via a short off-VM-thread
     // sleep (a bounded External wait), so sibling tasks overlap between delta
-    // batches; a legacy scheduler task yields `AwaitIo` (its poller re-scans each
-    // scheduler tick).
+    // batches. (Wasm has no off-thread executor; the non-runtime blocking drain
+    // above already handled `!in_runtime_quantum`, so drain synchronously here.)
     #[cfg(not(target_arch = "wasm32"))]
-    if sema_core::in_runtime_quantum() {
-        return stream_next_runtime_step(token);
+    {
+        stream_next_runtime_step(token)
     }
-
-    let handle = Rc::new(sema_core::IoHandle::new(move || {
-        match stream_poll_batch(token, false) {
-            Ok(Some(v)) => sema_core::IoPoll::Ready(Ok(v)),
-            Ok(None) => sema_core::IoPoll::Pending,
-            Err(e) => sema_core::IoPoll::Ready(Err(e.to_string())),
+    #[cfg(target_arch = "wasm32")]
+    {
+        loop {
+            if let Some(v) = stream_poll_batch(token, true)? {
+                return Ok(NativeOutcome::Return(v));
+            }
         }
-    }));
-    sema_core::set_yield_signal(sema_core::YieldReason::AwaitIo(handle));
-    Ok(NativeOutcome::Return(Value::nil()))
+    }
 }
 
 /// `__stream-finish(token) → content-string`. Cleans the slab entry and returns

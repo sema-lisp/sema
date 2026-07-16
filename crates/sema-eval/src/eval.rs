@@ -107,12 +107,6 @@ impl Default for Interpreter {
 
 impl Drop for Interpreter {
     fn drop(&mut self) {
-        // The thread-local scheduler holds an Rc clone of this interpreter's
-        // global env (plus any leftover task VMs with their own clones);
-        // release it so teardown actually frees the env. Guarded by ptr_eq
-        // inside shutdown_scheduler — a different interpreter's scheduler on
-        // the same thread is left alone.
-        sema_vm::shutdown_scheduler(&self.global_env);
         // Skip the teardown collection while unwinding: a panic anywhere in
         // the collector would be a panic-in-destructor-during-cleanup, which
         // aborts the whole process instead of unwinding. Nothing is lost —

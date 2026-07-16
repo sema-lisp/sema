@@ -201,8 +201,15 @@ fn no_adhoc_tokio_runtimes_outside_allowlist() {
     );
 }
 
+/// Zero-tolerance removal gate for the legacy async-scheduler purge (P5).
+///
+/// The old change-detector (a committed `legacy-symbols.baseline` the scan was
+/// diffed against) is retired: `scheduler.rs`, the cooperative-debug driver, and
+/// the legacy `async_signal.rs` seams are DELETED, so their identifiers must have
+/// ZERO hits in shipped, comment-stripped code. `--check` fails on any
+/// reintroduction outside the script's exact-file allowlist (currently empty).
 #[test]
-fn unified_runtime_legacy_symbols_match_baseline() {
+fn unified_runtime_purged_legacy_symbols_absent() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let output = Command::new(root.join("scripts/check-unified-runtime-legacy.sh"))
         .arg("--check")
@@ -212,8 +219,7 @@ fn unified_runtime_legacy_symbols_match_baseline() {
 
     assert!(
         output.status.success(),
-        "legacy scanner failed with {}\nstdout:\n{}\nstderr:\n{}",
-        output.status,
+        "purged legacy-scheduler symbols reintroduced\nstdout:\n{}\nstderr:\n{}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );

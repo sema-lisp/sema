@@ -25,7 +25,7 @@ use std::io::{Read as _, Write as _};
 use std::path::{Component, Path, PathBuf};
 
 use sema_core::runtime::NativeOutcome;
-use sema_core::{check_arity, in_async_context, Caps, SemaError, Value};
+use sema_core::{check_arity, Caps, SemaError, Value};
 
 use crate::{register_runtime_fn, register_runtime_fn_gated};
 
@@ -365,13 +365,6 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
                 gzip_compress_work(&data).map_err(|e| e.to_string())
             });
         }
-        if in_async_context() {
-            return crate::io::fs_offload(
-                move || gzip_compress_work(&data).map_err(|e| e.to_string()),
-                Value::bytevector,
-            )
-            .map(NativeOutcome::Return);
-        }
         Ok(NativeOutcome::Return(Value::bytevector(
             gzip_compress_work(&data)?,
         )))
@@ -388,13 +381,6 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
                 Value::bytevector,
                 move || gzip_decompress_work(&data).map_err(|e| e.to_string()),
             );
-        }
-        if in_async_context() {
-            return crate::io::fs_offload(
-                move || gzip_decompress_work(&data).map_err(|e| e.to_string()),
-                Value::bytevector,
-            )
-            .map(NativeOutcome::Return);
         }
         Ok(NativeOutcome::Return(Value::bytevector(
             gzip_decompress_work(&data)?,
@@ -420,13 +406,6 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
                 zip_create_work(&out_path, &files).map_err(|e| e.to_string())
             });
         }
-        if in_async_context() {
-            return crate::io::fs_offload(
-                move || zip_create_work(&out_path, &files).map_err(|e| e.to_string()),
-                Value::int,
-            )
-            .map(NativeOutcome::Return);
-        }
         Ok(NativeOutcome::Return(Value::int(zip_create_work(
             &out_path, &files,
         )?)))
@@ -449,13 +428,6 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
                 zip_extract_work(&zip_path, &dest_dir).map_err(|e| e.to_string())
             });
         }
-        if in_async_context() {
-            return crate::io::fs_offload(
-                move || zip_extract_work(&zip_path, &dest_dir).map_err(|e| e.to_string()),
-                Value::int,
-            )
-            .map(NativeOutcome::Return);
-        }
         Ok(NativeOutcome::Return(Value::int(zip_extract_work(
             &zip_path, &dest_dir,
         )?)))
@@ -473,13 +445,6 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
             return crate::io::quarantined_compute("zip/list", zip_names_to_value, move || {
                 zip_list_work(&zip_path).map_err(|e| e.to_string())
             });
-        }
-        if in_async_context() {
-            return crate::io::fs_offload(
-                move || zip_list_work(&zip_path).map_err(|e| e.to_string()),
-                zip_names_to_value,
-            )
-            .map(NativeOutcome::Return);
         }
         Ok(NativeOutcome::Return(zip_names_to_value(zip_list_work(
             &zip_path,
@@ -506,13 +471,6 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
                 tar_create_work(&out_path, &files).map_err(|e| e.to_string())
             });
         }
-        if in_async_context() {
-            return crate::io::fs_offload(
-                move || tar_create_work(&out_path, &files).map_err(|e| e.to_string()),
-                Value::int,
-            )
-            .map(NativeOutcome::Return);
-        }
         Ok(NativeOutcome::Return(Value::int(tar_create_work(
             &out_path, &files,
         )?)))
@@ -535,13 +493,6 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
             return crate::io::quarantined_compute("tar/extract", Value::int, move || {
                 tar_extract_work(&tar_path, &dest_dir).map_err(|e| e.to_string())
             });
-        }
-        if in_async_context() {
-            return crate::io::fs_offload(
-                move || tar_extract_work(&tar_path, &dest_dir).map_err(|e| e.to_string()),
-                Value::int,
-            )
-            .map(NativeOutcome::Return);
         }
         Ok(NativeOutcome::Return(Value::int(tar_extract_work(
             &tar_path, &dest_dir,
@@ -659,104 +610,5 @@ mod tests {
             .collect();
         names.sort();
         assert_eq!(names, vec!["one.txt".to_string(), "two.txt".to_string()]);
-    }
-}
-
-/// Async-context coverage for `gzip/compress`/`gzip/decompress`'s
-/// `in_async_context()` offload gate. `sema-stdlib` doesn't depend on
-/// `sema-vm`/`sema-eval` (the real scheduler lives there), so this stands in
-/// for the scheduler by hand: force `sema_core::in_async_context()` on, call
-/// the native, then poll the `AwaitIo` handle it arms to completion — same
-/// harness shape as `io.rs`'s `async_offload_tests`.
-#[cfg(test)]
-mod async_offload_tests {
-    use super::*;
-    use std::time::{Duration, Instant};
-
-    /// Forces `in_async_context()` on for the guard's lifetime, resetting it
-    /// (even on panic/early return) so a failure can't leak the flag into
-    /// whichever test the harness runs next on the same worker thread.
-    struct AsyncCtxGuard;
-    impl Drop for AsyncCtxGuard {
-        fn drop(&mut self) {
-            sema_core::set_async_context(false);
-        }
-    }
-
-    fn make_env() -> sema_core::Env {
-        let env = sema_core::Env::new();
-        register(&env, &sema_core::Sandbox::allow_all());
-        env
-    }
-
-    fn native(env: &sema_core::Env, name: &str) -> impl Fn(&[Value]) -> Result<Value, SemaError> {
-        let f = env
-            .get(sema_core::intern(name))
-            .unwrap_or_else(|| panic!("{name} not registered"));
-        move |args: &[Value]| {
-            let nf = f.as_native_fn_ref().expect("native fn");
-            let ctx = sema_core::EvalContext::new();
-            (nf.func)(&ctx, args)
-        }
-    }
-
-    /// Call a native fn with the async-context gate forced on, then drive the
-    /// `AwaitIo` handle it arms to completion by polling. Panics if the
-    /// native didn't yield at all (e.g. it silently took the sync fallback)
-    /// or the offload rejects.
-    fn drive_async(call: impl FnOnce() -> Result<Value, SemaError>) -> Value {
-        let _guard = AsyncCtxGuard;
-        sema_core::set_async_context(true);
-        let armed = call().expect("native call should arm a yield, not error synchronously");
-        assert_eq!(
-            armed,
-            Value::nil(),
-            "an offloading native returns nil immediately after arming its yield signal"
-        );
-        let reason = sema_core::take_yield_signal()
-            .expect("expected a yield signal to be armed — did the native take the sync path?");
-        let handle = match reason {
-            sema_core::YieldReason::AwaitIo(h) => h,
-            other => panic!("expected an AwaitIo yield, got {other:?}"),
-        };
-        let deadline = Instant::now() + Duration::from_secs(10);
-        loop {
-            match handle.poll() {
-                sema_core::IoPoll::Ready(Ok(v)) => return v,
-                sema_core::IoPoll::Ready(Err(e)) => panic!("offload rejected: {e}"),
-                sema_core::IoPoll::Pending => {
-                    assert!(
-                        Instant::now() < deadline,
-                        "offload never completed within 10s"
-                    );
-                    std::thread::sleep(Duration::from_millis(2));
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn gzip_round_trip_offloads_async() {
-        let env = make_env();
-        let original = b"hello, sema gzip async round-trip \x00\x01\x02 payload".to_vec();
-        let compressed =
-            drive_async(|| native(&env, "gzip/compress")(&[Value::bytevector(original.clone())]));
-        assert!(compressed.as_bytevector().is_some());
-        let decompressed = drive_async(|| native(&env, "gzip/decompress")(&[compressed.clone()]));
-        assert_eq!(decompressed.as_bytevector().unwrap(), &original[..]);
-    }
-
-    /// Same natives, sync path — confirms the added async gate left the
-    /// default (non-async) behavior byte-for-byte unchanged.
-    #[test]
-    fn gzip_round_trip_sync_path_unchanged() {
-        let env = make_env();
-        let original = b"hello, sema gzip sync round-trip \x00\x01\x02 payload".to_vec();
-        let compressed = native(&env, "gzip/compress")(&[Value::bytevector(original.clone())])
-            .expect("sync compress ok");
-        assert!(compressed.as_bytevector().is_some());
-        let decompressed =
-            native(&env, "gzip/decompress")(&[compressed]).expect("sync decompress ok");
-        assert_eq!(decompressed.as_bytevector().unwrap(), &original[..]);
     }
 }

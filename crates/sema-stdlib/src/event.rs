@@ -15,7 +15,7 @@
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
-use sema_core::{check_arity, in_async_context, take_resume_value, SemaError, Value};
+use sema_core::{check_arity, SemaError, Value};
 
 use crate::register_fn;
 
@@ -47,14 +47,6 @@ fn event_select_value(args: &[Value]) -> Result<Value, SemaError> {
     // sibling tasks (e.g. an LLM/agent task) make progress while we wait for a
     // source or the timeout. Reuses the same `AwaitIo` yield the file/http/shell
     // async paths use. The sync path below is unchanged.
-    if in_async_context() {
-        if let Some(v) = take_resume_value() {
-            return Ok(v);
-        }
-        return crate::io::await_io_until(started, timeout_ms as u64, move || {
-            sources.iter().find_map(|s| ready(s, started).map(Ok))
-        });
-    }
 
     loop {
         for s in &sources {

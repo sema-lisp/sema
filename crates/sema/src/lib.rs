@@ -214,6 +214,13 @@ impl Interpreter {
         self.inner.eval_str_via_runtime(input)
     }
 
+    /// The number of tasks the persistent cooperative runtime is currently
+    /// holding (live + settled-not-yet-reaped). A test/observability oracle:
+    /// `0` after a run proves every task settled and was reaped, not orphaned.
+    pub fn runtime_live_task_count(&self) -> usize {
+        self.inner.runtime_live_task_count()
+    }
+
     /// Register a native function that can be called from Sema code.
     ///
     /// # Example

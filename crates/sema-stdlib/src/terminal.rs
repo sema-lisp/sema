@@ -5,7 +5,7 @@ use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use sema_core::{check_arity, in_async_context, SemaError, Value, ValueView};
+use sema_core::{check_arity, SemaError, Value, ValueView};
 
 use crate::register_fn;
 
@@ -237,32 +237,11 @@ pub fn register(env: &sema_core::Env) {
         handle.stop_flag.store(true, Ordering::Relaxed);
         let thread = handle.thread.take();
 
-        if in_async_context() {
-            // `thread.join()` blocks the caller up to ~`SPINNER_INTERVAL_MS`
-            // waiting for the spinner loop to notice the stop flag on its
-            // next wake-up. Offload the join so it doesn't stall the single
-            // cooperative VM thread; the final-line write (which touches no
-            // Sema `Value`s) runs back on the VM thread once the join
-            // completes, via `decode`.
-            crate::io::fs_offload(
-                move || {
-                    if let Some(t) = thread {
-                        let _ = t.join();
-                    }
-                    Ok(())
-                },
-                move |()| {
-                    spinner_finish(&symbol, &text);
-                    Value::nil()
-                },
-            )
-        } else {
-            if let Some(t) = thread {
-                let _ = t.join();
-            }
-            spinner_finish(&symbol, &text);
-            Ok(Value::nil())
+        if let Some(t) = thread {
+            let _ = t.join();
         }
+        spinner_finish(&symbol, &text);
+        Ok(Value::nil())
     });
 
     // (term/spinner-update id "new message")
@@ -435,138 +414,4 @@ fn register_screen_control(env: &sema_core::Env) {
             .map_err(|e| SemaError::Io(format!("term/flush: {e}")))?;
         Ok(Value::nil())
     });
-}
-
-/// `term/spinner-stop`'s async-offload coverage, mirroring the pattern in
-/// `proc.rs`'s `async_offload_tests` / `io.rs`'s `async_offload_tests`:
-/// `sema-stdlib` has no scheduler of its own (that's `sema-vm`/`sema-eval`),
-/// so these tests stand in for it by hand — force
-/// `sema_core::in_async_context()` on, call the native, then poll the
-/// `AwaitIo` handle it arms to completion, exactly what the real scheduler
-/// does in production.
-#[cfg(test)]
-mod async_offload_tests {
-    use super::*;
-    use sema_core::EvalContext;
-    use std::time::{Duration, Instant};
-
-    /// Forces `in_async_context()` on for the guard's lifetime, resetting it
-    /// (even on panic/early return) so a failure can't leak the flag into
-    /// whichever test the harness runs next on the same worker thread.
-    struct AsyncCtxGuard;
-    impl Drop for AsyncCtxGuard {
-        fn drop(&mut self) {
-            sema_core::set_async_context(false);
-        }
-    }
-
-    fn env() -> sema_core::Env {
-        let e = sema_core::Env::new();
-        register(&e);
-        e
-    }
-
-    fn call_sync(env: &sema_core::Env, name: &str, args: &[Value]) -> Value {
-        let f = env.get_str(name).expect("fn registered");
-        let nf = f.as_native_fn_ref().expect("native fn");
-        (nf.func)(&EvalContext::default(), args).expect("sync call ok")
-    }
-
-    /// Call a native fn with the async-context gate forced on, then drive
-    /// the `AwaitIo` handle it arms to completion by polling. Panics if the
-    /// native didn't yield at all (e.g. it silently took the sync fallback).
-    fn drive_async(env: &sema_core::Env, name: &str, args: &[Value]) -> Value {
-        let _guard = AsyncCtxGuard;
-        sema_core::set_async_context(true);
-        let f = env.get_str(name).expect("fn registered");
-        let nf = f.as_native_fn_ref().expect("native fn");
-        let armed = (nf.func)(&EvalContext::default(), args)
-            .expect("native call should arm a yield, not error synchronously");
-        assert_eq!(
-            armed,
-            Value::nil(),
-            "an offloading native returns nil immediately after arming its yield signal"
-        );
-        let reason = sema_core::take_yield_signal()
-            .expect("expected a yield signal to be armed — did the native take the sync path?");
-        let handle = match reason {
-            sema_core::YieldReason::AwaitIo(h) => h,
-            other => panic!("expected an AwaitIo yield, got {other:?}"),
-        };
-        let deadline = Instant::now() + Duration::from_secs(10);
-        loop {
-            match handle.poll() {
-                sema_core::IoPoll::Ready(Ok(v)) => return v,
-                sema_core::IoPoll::Ready(Err(e)) => panic!("offload rejected: {e}"),
-                sema_core::IoPoll::Pending => {
-                    assert!(
-                        Instant::now() < deadline,
-                        "offload never completed within 10s"
-                    );
-                    std::thread::sleep(Duration::from_millis(2));
-                }
-            }
-        }
-    }
-
-    /// Sync path (top level, no scheduler): `term/spinner-stop` blocks and
-    /// returns `nil` directly, unchanged from before the offload was added.
-    #[test]
-    fn spinner_stop_sync_roundtrip() {
-        let e = env();
-        let id = call_sync(&e, "term/spinner-start", &[Value::string("working")]);
-        let result = call_sync(&e, "term/spinner-stop", &[id]);
-        assert_eq!(result, Value::nil());
-    }
-
-    /// In async context, `term/spinner-stop` offloads the spinner thread's
-    /// `join()` instead of blocking the VM thread on it: the native must arm
-    /// an `AwaitIo` yield (not resolve synchronously), and once that offload
-    /// completes the result is the same `nil` the sync path returns.
-    #[test]
-    fn spinner_stop_offloads_join_in_async_context() {
-        let e = env();
-        let id = call_sync(&e, "term/spinner-start", &[Value::string("working")]);
-        let result = drive_async(&e, "term/spinner-stop", &[id]);
-        assert_eq!(result, Value::nil());
-    }
-
-    /// The final-status options map (`{:symbol .. :text ..}`) still works
-    /// once its two strings have to survive the trip through the offloaded
-    /// join's `decode` step.
-    #[test]
-    fn spinner_stop_with_final_status_offloads_async() {
-        let e = env();
-        let id = call_sync(&e, "term/spinner-start", &[Value::string("working")]);
-        let opts = Value::map(
-            [
-                (Value::keyword("symbol"), Value::string("✔")),
-                (Value::keyword("text"), Value::string("Done")),
-            ]
-            .into_iter()
-            .collect::<std::collections::BTreeMap<_, _>>(),
-        );
-        let result = drive_async(&e, "term/spinner-stop", &[id, opts]);
-        assert_eq!(result, Value::nil());
-    }
-
-    /// Stopping an unknown/already-stopped spinner id is a harmless no-op on
-    /// both paths — in particular the async path must NOT arm a yield (there
-    /// is nothing to offload), so it should resolve immediately to `nil`
-    /// rather than parking the caller.
-    #[test]
-    fn spinner_stop_unknown_id_is_noop_in_async_context() {
-        let e = env();
-        let _guard = AsyncCtxGuard;
-        sema_core::set_async_context(true);
-        let f = e.get_str("term/spinner-stop").expect("fn registered");
-        let nf = f.as_native_fn_ref().expect("native fn");
-        let result = (nf.func)(&EvalContext::default(), &[Value::int(999_999)])
-            .expect("unknown id is a no-op, not an error");
-        assert_eq!(result, Value::nil());
-        assert!(
-            sema_core::take_yield_signal().is_none(),
-            "no spinner to join means no offload should be armed"
-        );
-    }
 }

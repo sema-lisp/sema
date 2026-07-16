@@ -56,7 +56,7 @@ fn explicitly_cancelled_embed_under_otel_does_not_abort_at_teardown() {
 
         // No span-owning task may survive the run (would abort at teardown).
         assert_eq!(
-            sema_vm::scheduler_task_count(),
+            interp.runtime_live_task_count(),
             0,
             "the stranded embed task must be reaped during the run, not left for teardown"
         );
@@ -83,7 +83,7 @@ fn explicitly_cancelled_io_task_is_reaped() {
     assert_eq!(result, sema_core::Value::keyword("caught"));
 
     assert_eq!(
-        sema_vm::scheduler_task_count(),
+        interp.runtime_live_task_count(),
         0,
         "the stranded io task must be reaped during the run"
     );
@@ -115,5 +115,5 @@ fn completing_embed_under_otel_leaves_no_stranded_task() {
         .eval_str_compiled(program)
         .expect("completing embed program evaluated");
     assert_eq!(result, sema_core::Value::int(3), "embed completes → 3 dims");
-    assert_eq!(sema_vm::scheduler_task_count(), 0, "no stranded task");
+    assert_eq!(interp.runtime_live_task_count(), 0, "no stranded task");
 }

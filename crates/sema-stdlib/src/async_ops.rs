@@ -6,8 +6,8 @@ use sema_core::runtime::{
     TaskSettlement, Trace, WaitKind,
 };
 use sema_core::{
-    check_arity, in_async_context, in_runtime_quantum, set_yield_signal, take_resume_value, Env,
-    NativeFn, SemaError, Value, ValueView, YieldReason,
+    check_arity, in_runtime_quantum, set_yield_signal, take_resume_value, Env, NativeFn, SemaError,
+    Value, ValueView, YieldReason,
 };
 
 use crate::register_fn;
@@ -599,7 +599,7 @@ fn register_promise_ops(env: &Env) {
             "async/sleep",
             |args| {
                 let ms = sleep_duration_ms(args)?;
-                if in_async_context() || in_runtime_quantum() {
+                if in_runtime_quantum() {
                     if let Some(cached) = take_resume_value() {
                         return Ok(cached);
                     }

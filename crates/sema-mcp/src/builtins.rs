@@ -72,7 +72,6 @@ use sema_core::runtime::{
 use sema_core::{
     check_arity, in_runtime_quantum, Caps, Env, NativeFn, Sandbox, SemaError, ToolDefinition, Value,
 };
-use tokio::sync::oneshot;
 
 use crate::client::{McpClient, McpClientConfig, McpHttpConfig};
 use crate::protocol::Tool;
@@ -332,17 +331,6 @@ fn busy_sync_error(handle: &str, label: &str) -> SemaError {
 /// future resolves, exactly like the old private runtime did.
 fn block_on<F: Future>(future: F) -> F::Output {
     sema_io::io_block_on(future)
-}
-
-/// Render `SemaError::eval(msg)`'s exact `Display` text as a plain `String` —
-/// used to hand a poller `finish` step's failure to `IoPoll::Ready(Err(_))`
-/// (which only ever carries `String`, never `SemaError`/`Value`/`Rc`) while
-/// keeping the async rejection's text byte-identical to what the sync path's
-/// `SemaError::eval(msg).to_string()` would show. The throwaway `SemaError` is
-/// constructed and consumed within this one call, on the VM thread — it never
-/// crosses a thread boundary.
-fn sema_err_msg(msg: String) -> String {
-    SemaError::eval(msg).to_string()
 }
 
 fn next_handle() -> String {
@@ -766,47 +754,6 @@ fn connect_with_opts(
     Ok(register_connection(client, identity, opts))
 }
 
-/// Async-context `mcp/connect`: gate synchronously on the VM thread (a denied
-/// sandbox fails fast, no offload spawned), hoist the browser-open decision
-/// (never touch `SANDBOX` from the background thread), then offload the whole
-/// connect+handshake (+ any interactive OAuth — the loopback driver already
-/// runs its own threads for that) onto the `sema-io` pool. No checkout is
-/// involved (there is no existing connection yet); the poller registers the
-/// returned connection as a brand new `Available` slot.
-fn connect_offload(config_json: serde_json::Value, opts: ConnectOpts) -> Result<Value, SemaError> {
-    let sandbox = SANDBOX.with(|s| s.borrow().clone());
-    gate(&sandbox, connect_capability(&config_json))?;
-    let browser_allowed = browser_open_allowed();
-    let opts_for_register = opts.clone();
-
-    let (tx, mut rx) = oneshot::channel::<Result<(McpClient, String), String>>();
-    sema_io::io_spawn_blocking(move || {
-        let outcome = sema_io::io_block_on(connect_dispatch_async(
-            config_json,
-            opts,
-            OpenerSource::Resolved(browser_allowed),
-        ));
-        let sendable = outcome.map_err(connect_outcome_msg);
-        let _ = tx.send(sendable);
-        sema_core::notify_io_complete();
-    });
-
-    let handle = Rc::new(sema_core::IoHandle::new(move || match rx.try_recv() {
-        Err(oneshot::error::TryRecvError::Empty) => sema_core::IoPoll::Pending,
-        Ok(Ok((client, identity))) => sema_core::IoPoll::Ready(Ok(register_connection(
-            client,
-            identity,
-            &opts_for_register,
-        ))),
-        Ok(Err(msg)) => sema_core::IoPoll::Ready(Err(msg)),
-        Err(oneshot::error::TryRecvError::Closed) => sema_core::IoPoll::Ready(Err(
-            "mcp/connect: internal error — connect worker dropped".to_string(),
-        )),
-    }));
-    sema_core::set_yield_signal(sema_core::YieldReason::AwaitIo(handle));
-    Ok(Value::nil())
-}
-
 /// Connect to an MCP server from a config map (the same shape `mcp/connect`
 /// accepts: `{:url ...}` for Streamable HTTP / legacy SSE, `{:command ...}`
 /// for stdio), honoring [`ConnectOpts`]. This is `mcp/connect`'s underlying
@@ -863,15 +810,6 @@ fn connect_outcome_to_sema_error(outcome: ConnectOutcome) -> SemaError {
              connect should have attempted login)"
         )),
     }
-}
-
-/// Render a [`ConnectOutcome`] as a plain `String` (via
-/// [`connect_outcome_to_sema_error`]'s `Display` text) — used at the
-/// async-offload boundary, where only `String` may cross the oneshot channel.
-/// The throwaway `SemaError` is constructed and consumed on the SAME
-/// (background) thread that produced the outcome; it never crosses.
-fn connect_outcome_msg(outcome: ConnectOutcome) -> String {
-    connect_outcome_to_sema_error(outcome).to_string()
 }
 
 fn require_handle<'a>(args: &'a [Value], fn_name: &str) -> Result<&'a str, SemaError> {
@@ -1084,131 +1022,6 @@ async fn close_async(conn: &mut McpConnection) -> Result<(), String> {
 
 // ── Checkout + offload machinery shared by `mcp/call`, `mcp/tools`, `mcp/close` ──
 
-/// Result of the offloaded work: the connection handed back (so it can be
-/// checked in / tombstoned / dropped) plus the operation's own result.
-type CheckoutOpResult<T> = (McpConnection, Result<T, String>);
-
-/// Build the `AwaitIo` handle for one exclusive checkout-then-offload
-/// operation against `entry`'s connection — the machinery shared by
-/// `mcp/call`, `mcp/tools`(`->sema`), and `mcp/close`'s async paths.
-///
-/// Tries the checkout SYNCHRONOUSLY first (on the VM thread, before this
-/// function returns): if the slot is `Available`, checks it out immediately
-/// and starts the offload right away (the "fast path" — the common,
-/// uncontended case starts real I/O without waiting a scheduler tick). If the
-/// slot is `CheckedOut`, returns a handle whose poller retries the checkout on
-/// every subsequent `wake_blocked_tasks` sweep (the "queue path") — this does
-/// NOT arm a second `AwaitIo`; the same handle just transitions phase
-/// internally once it acquires. If the slot is already `Tombstone`d, returns
-/// `Err` synchronously — no handle is ever built, matching the cassette-miss/
-/// tool-not-allowed style of failing fast with no offload spawned.
-///
-/// `start`: called exactly once, the moment the checkout is acquired. Moves
-/// the checked-out connection onto `sema_io::io_spawn_blocking` and returns
-/// the oneshot receiver the Running phase polls. MUST call
-/// `sema_core::notify_io_complete()` after sending, from the background
-/// thread — the lost-wakeup guard: a sibling queued on this same slot may
-/// already have been polled `Pending` earlier in the same scheduler sweep,
-/// and without this poke its next acquisition attempt could miss the wakeup.
-///
-/// `finish`: called once, on the VM thread, when the offloaded op completes.
-/// Decides the connection's fate ([`checkin`], [`tombstone_slot`], or simply
-/// dropping it for `mcp/close`) and converts the raw `Result<T, String>` into
-/// the native's `Value`/error string. **MUST** leave the slot in a terminal
-/// state (`Available` or `Tombstone`) — never `CheckedOut` — or a queued
-/// sibling parks forever.
-fn checkout_offload<T: Send + 'static>(
-    entry: Rc<ConnEntry>,
-    start: impl FnOnce(McpConnection) -> oneshot::Receiver<CheckoutOpResult<T>> + 'static,
-    finish: impl FnOnce(&Rc<ConnEntry>, McpConnection, Result<T, String>) -> Result<Value, String>
-        + 'static,
-) -> Result<Rc<sema_core::IoHandle>, SemaError> {
-    enum Phase<T> {
-        Acquire,
-        Running(oneshot::Receiver<CheckoutOpResult<T>>),
-    }
-
-    let checked_out_ever = Rc::new(Cell::new(false));
-    let mut start = Some(start);
-    let mut finish = Some(finish);
-
-    // Fast path: try the checkout NOW, before any yield.
-    let mut phase = match try_checkout(&entry)? {
-        Some(conn) => {
-            checked_out_ever.set(true);
-            let start_fn = start.take().expect("start not yet used");
-            Phase::Running(start_fn(conn))
-        }
-        None => Phase::Acquire,
-    };
-
-    let poll_entry = entry.clone();
-    let poll_checked_out = checked_out_ever.clone();
-    let poll = move || -> sema_core::IoPoll {
-        loop {
-            match &mut phase {
-                Phase::Acquire => match try_checkout(&poll_entry) {
-                    Err(e) => return sema_core::IoPoll::Ready(Err(e.to_string())),
-                    // Not FIFO, but not starvation-prone either: each scheduler
-                    // sweep polls every Blocked(AwaitIo) poller (this one
-                    // included) BEFORE running any Ready task, so a queued
-                    // sibling gets a fresh checkout attempt every sweep rather
-                    // than being starved by a fast-path caller that keeps
-                    // acquiring the slot ahead of it.
-                    Ok(None) => return sema_core::IoPoll::Pending,
-                    Ok(Some(conn)) => {
-                        poll_checked_out.set(true);
-                        let start_fn = start.take().expect("checkout_offload: start runs once");
-                        phase = Phase::Running(start_fn(conn));
-                        // Loop again immediately: give the just-started Running
-                        // phase one poll this same tick rather than waiting a
-                        // whole scheduler sweep — the poller "transitions phase
-                        // internally," never arming a second `AwaitIo`.
-                    }
-                },
-                Phase::Running(rx) => {
-                    return match rx.try_recv() {
-                        Err(oneshot::error::TryRecvError::Empty) => sema_core::IoPoll::Pending,
-                        Err(oneshot::error::TryRecvError::Closed) => {
-                            // The worker never sent — treat the connection as
-                            // lost rather than leaving the slot `CheckedOut`
-                            // forever (mirrors the cancellation tombstone).
-                            tombstone_slot(&poll_entry, "connection worker dropped");
-                            sema_core::IoPoll::Ready(Err(
-                                "mcp: internal error — offload worker dropped".to_string(),
-                            ))
-                        }
-                        Ok((conn, result)) => {
-                            let finish_fn =
-                                finish.take().expect("checkout_offload: finish runs once");
-                            sema_core::IoPoll::Ready(finish_fn(&poll_entry, conn, result))
-                        }
-                    };
-                }
-            }
-        }
-    };
-
-    Ok(Rc::new(sema_core::IoHandle::with_abort(poll, move || {
-        // Abort hook: fires ONLY on cancellation (async/cancel, async/timeout
-        // expiry, interrupt) — never on normal completion. If this task had
-        // the connection checked out, tombstone the slot: the background
-        // worker's eventual `tx.send` fails harmlessly (the receiver, owned by
-        // the `phase` this closure drops, is gone), and the connection itself
-        // drops on the worker thread (a stdio child is killed by `Drop`).
-        // Acquire-phase abort (never checked out) is a documented no-op — the
-        // slot is untouched, so whoever holds it (or whoever else is queued)
-        // is unaffected.
-        if checked_out_ever.get() {
-            // Just "cancelled mid-call": `tombstone_error` itself prepends
-            // "mcp connection lost: " to whatever reason is stored here — an
-            // extra "connection lost: " prefix on this end would double up
-            // to "mcp connection lost: connection lost: cancelled mid-call".
-            tombstone_slot(&entry, "cancelled mid-call");
-        }
-    })))
-}
-
 // ── `mcp/call` (+ `mcp/tools->sema` handlers): shared entry point ──────────
 
 /// Shared entry point for one `tools/call`, used by BOTH the plain `mcp/call`
@@ -1266,17 +1079,6 @@ fn call_tool(
         );
     }
 
-    if sema_core::in_async_context() {
-        return call_tool_offload(
-            entry,
-            key,
-            tool_name.to_string(),
-            arguments_json,
-            materialize,
-        )
-        .map(NativeOutcome::Return);
-    }
-
     let mut conn = try_checkout(&entry)?.ok_or_else(|| busy_sync_error(handle, "mcp/call"))?;
     let result = block_on(call_tool_async(
         &mut conn,
@@ -1291,53 +1093,6 @@ fn call_tool(
     materialize(raw)
         .map(NativeOutcome::Return)
         .map_err(|e| SemaError::eval(format!("mcp/call: {e}")))
-}
-
-/// Cancellation semantics (documented here per the task brief): a task
-/// cancelled while its `mcp/call` holds the connection tombstones the slot —
-/// see [`checkout_offload`]'s abort hook. A task cancelled while merely
-/// QUEUED (never acquired the checkout) leaves the connection untouched. Any
-/// later use of a tombstoned handle fails with a `SemaError` naming the
-/// reason and a reconnect hint.
-fn call_tool_offload(
-    entry: Rc<ConnEntry>,
-    cassette_key: String,
-    tool_name: String,
-    arguments_json: serde_json::Value,
-    materialize: impl FnOnce(serde_json::Value) -> Result<Value, String> + 'static,
-) -> Result<Value, SemaError> {
-    let interactive_auth = entry.meta.interactive_auth;
-    let browser_allowed = browser_open_allowed();
-
-    let start = move |conn: McpConnection| {
-        let (tx, rx) = oneshot::channel();
-        sema_io::io_spawn_blocking(move || {
-            let mut conn = conn;
-            let out = sema_io::io_block_on(call_tool_async(
-                &mut conn,
-                &tool_name,
-                arguments_json,
-                interactive_auth,
-                OpenerSource::Resolved(browser_allowed),
-            ));
-            let _ = tx.send((conn, out));
-            sema_core::notify_io_complete();
-        });
-        rx
-    };
-    let finish = move |entry: &Rc<ConnEntry>,
-                       conn: McpConnection,
-                       result: Result<serde_json::Value, String>|
-          -> Result<Value, String> {
-        checkin(entry, conn);
-        let raw = result.map_err(|e| sema_err_msg(format!("mcp/call: {e}")))?;
-        sema_core::mcp_cassette_record(&cassette_key, &raw);
-        materialize(raw)
-    };
-
-    let handle = checkout_offload(entry, start, finish)?;
-    sema_core::set_yield_signal(sema_core::YieldReason::AwaitIo(handle));
-    Ok(Value::nil())
 }
 
 // ── `mcp/call` unified-runtime (in_runtime_quantum) path ────────────────────
@@ -1896,43 +1651,11 @@ fn fetch_tools(
     on_ready: impl FnOnce(Vec<Tool>, &ConnMeta) -> Value + 'static,
 ) -> Result<Value, SemaError> {
     let entry = lookup_entry(handle)?;
-    if sema_core::in_async_context() {
-        return fetch_tools_offload(entry, label, on_ready);
-    }
     let mut conn = try_checkout(&entry)?.ok_or_else(|| busy_sync_error(handle, label))?;
     let result = block_on(list_tools_async(&mut conn));
     checkin(&entry, conn);
     let tools = result.map_err(|err| SemaError::eval(format!("{label}: {err}")))?;
     Ok(on_ready(tools, &entry.meta))
-}
-
-fn fetch_tools_offload(
-    entry: Rc<ConnEntry>,
-    label: &'static str,
-    on_ready: impl FnOnce(Vec<Tool>, &ConnMeta) -> Value + 'static,
-) -> Result<Value, SemaError> {
-    let start = move |conn: McpConnection| {
-        let (tx, rx) = oneshot::channel();
-        sema_io::io_spawn_blocking(move || {
-            let mut conn = conn;
-            let out = sema_io::io_block_on(list_tools_async(&mut conn));
-            let _ = tx.send((conn, out));
-            sema_core::notify_io_complete();
-        });
-        rx
-    };
-    let finish = move |entry: &Rc<ConnEntry>,
-                       conn: McpConnection,
-                       result: Result<Vec<Tool>, String>|
-          -> Result<Value, String> {
-        checkin(entry, conn);
-        let tools = result.map_err(|e| sema_err_msg(format!("{label}: {e}")))?;
-        Ok(on_ready(tools, &entry.meta))
-    };
-
-    let handle = checkout_offload(entry, start, finish)?;
-    sema_core::set_yield_signal(sema_core::YieldReason::AwaitIo(handle));
-    Ok(Value::nil())
 }
 
 // ── `mcp/close` ─────────────────────────────────────────────────────────────
@@ -1959,47 +1682,6 @@ pub fn close_handle(handle: &Value) {
     }
 }
 
-fn close_offload(handle: String, entry: Rc<ConnEntry>) -> Result<Value, SemaError> {
-    // Remove from the map immediately (VM thread) — matches the sync path: a
-    // subsequent `mcp/call`/`mcp/tools`/`mcp/close` on this handle fails fast
-    // with "not registered" rather than silently queueing behind this close.
-    // The queue/checkout machinery below still operates correctly for any
-    // call that already captured this exact `Rc<ConnEntry>` before removal.
-    CONNECTIONS.with(|connections| {
-        connections.borrow_mut().remove(&handle);
-    });
-
-    let start = move |conn: McpConnection| {
-        let (tx, rx) = oneshot::channel();
-        sema_io::io_spawn_blocking(move || {
-            let mut conn = conn;
-            let out = sema_io::io_block_on(close_async(&mut conn));
-            let _ = tx.send((conn, out));
-            sema_core::notify_io_complete();
-        });
-        rx
-    };
-    let finish = move |entry: &Rc<ConnEntry>,
-                       conn: McpConnection,
-                       result: Result<(), String>|
-          -> Result<Value, String> {
-        // Never reinstalled — the connection is dropped here regardless of
-        // whether the close protocol call itself succeeded (matches the sync
-        // path's unconditional removal). Tombstone so any straggling
-        // reference (e.g. a call that queued on this slot before the close
-        // was issued) errors cleanly instead of parking forever.
-        drop(conn);
-        tombstone_slot(entry, "connection closed via mcp/close");
-        result
-            .map(|_| Value::nil())
-            .map_err(|e| sema_err_msg(format!("mcp/close: {e}")))
-    };
-
-    let handle_io = checkout_offload(entry, start, finish)?;
-    sema_core::set_yield_signal(sema_core::YieldReason::AwaitIo(handle_io));
-    Ok(Value::nil())
-}
-
 pub fn register_mcp_builtins(env: &Env, sandbox: &Sandbox) {
     // Capture the sandbox so the OAuth browser launch can honor the PROCESS cap.
     SANDBOX.with(|s| *s.borrow_mut() = sandbox.clone());
@@ -2016,9 +1698,6 @@ pub fn register_mcp_builtins(env: &Env, sandbox: &Sandbox) {
             interactive_auth: true,
             allowed_tools: None,
         };
-        if sema_core::in_async_context() {
-            return connect_offload(config_json, opts);
-        }
         connect_with_opts(&config_json, &opts).map_err(connect_outcome_to_sema_error)
     });
 
@@ -2058,10 +1737,6 @@ pub fn register_mcp_builtins(env: &Env, sandbox: &Sandbox) {
     register_fn(env, "mcp/close", |args| {
         check_arity!(args, "mcp/close", 1);
         let handle = require_handle(args, "mcp/close")?;
-        if sema_core::in_async_context() {
-            let entry = lookup_entry(handle)?;
-            return close_offload(handle.to_string(), entry);
-        }
         let entry = CONNECTIONS.with(|connections| connections.borrow_mut().remove(handle));
         let Some(entry) = entry else {
             return Err(SemaError::eval(format!(

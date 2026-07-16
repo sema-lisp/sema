@@ -201,10 +201,20 @@ pub type OtelInstallFn = fn(Box<dyn Any>) -> Box<dyn Any>;
 /// stack — seeded onto a freshly-spawned task.
 pub type OtelScopeFn = fn() -> Box<dyn Any>;
 
+/// Check whether a captured otel task context carries no span/identity state
+/// (fast-path predicate for the runtime's `TaskScopeSwap` — see sema-vm
+/// `state.rs`). `true` when unregistered (nothing to isolate).
+pub type OtelIsEmptyFn = fn(&Box<dyn Any>) -> bool;
+/// Peek (no mutation, no allocation) whether the CURRENT thread's otel context
+/// is empty, without taking or boxing it.
+pub type OtelAmbientEmptyFn = fn() -> bool;
+
 thread_local! {
     static OTEL_TAKE_CALLBACK: Cell<Option<OtelTakeFn>> = const { Cell::new(None) };
     static OTEL_INSTALL_CALLBACK: Cell<Option<OtelInstallFn>> = const { Cell::new(None) };
     static OTEL_SCOPE_CALLBACK: Cell<Option<OtelScopeFn>> = const { Cell::new(None) };
+    static OTEL_IS_EMPTY_CALLBACK: Cell<Option<OtelIsEmptyFn>> = const { Cell::new(None) };
+    static OTEL_AMBIENT_EMPTY_CALLBACK: Cell<Option<OtelAmbientEmptyFn>> = const { Cell::new(None) };
 }
 
 /// Register the per-task otel take/install/scope callbacks. Called once at
@@ -213,6 +223,31 @@ pub fn set_otel_task_callbacks(take: OtelTakeFn, install: OtelInstallFn, scope: 
     OTEL_TAKE_CALLBACK.with(|cb| cb.set(Some(take)));
     OTEL_INSTALL_CALLBACK.with(|cb| cb.set(Some(install)));
     OTEL_SCOPE_CALLBACK.with(|cb| cb.set(Some(scope)));
+}
+
+/// Register the otel empty-scope fast-path predicates. Called once at startup
+/// by `sema_otel::register_task_callbacks()` alongside [`set_otel_task_callbacks`].
+pub fn set_otel_empty_callbacks(is_empty: OtelIsEmptyFn, ambient_empty: OtelAmbientEmptyFn) {
+    OTEL_IS_EMPTY_CALLBACK.with(|cb| cb.set(Some(is_empty)));
+    OTEL_AMBIENT_EMPTY_CALLBACK.with(|cb| cb.set(Some(ambient_empty)));
+}
+
+/// Whether a captured otel task context is empty (no spans, no identity). `true`
+/// when no callback is registered (nothing to isolate).
+pub fn otel_captured_is_empty(ctx: &Box<dyn Any>) -> bool {
+    match OTEL_IS_EMPTY_CALLBACK.with(|cb| cb.get()) {
+        Some(f) => f(ctx),
+        None => true,
+    }
+}
+
+/// Whether the CURRENT thread's otel context is empty. `true` when no callback
+/// is registered.
+pub fn otel_ambient_is_empty() -> bool {
+    match OTEL_AMBIENT_EMPTY_CALLBACK.with(|cb| cb.get()) {
+        Some(f) => f(),
+        None => true,
+    }
 }
 
 /// Capture the current conversation scope (ids only, empty span stack) as a
@@ -263,10 +298,20 @@ pub type UsageScopeTakeFn = fn() -> Box<dyn Any>;
 /// Install a leaf-usage scope into the thread-local, returning the one displaced.
 pub type UsageScopeInstallFn = fn(Box<dyn Any>) -> Box<dyn Any>;
 
+/// Check whether a captured leaf-usage scope carries no active accumulator
+/// (fast-path predicate for the runtime's `TaskScopeSwap`). `true` when
+/// unregistered (nothing to isolate).
+pub type UsageScopeIsEmptyFn = fn(&Box<dyn Any>) -> bool;
+/// Peek (no mutation, no allocation) whether the CURRENT thread's active
+/// leaf-usage scope is empty, without taking or boxing it.
+pub type UsageScopeAmbientEmptyFn = fn() -> bool;
+
 thread_local! {
     static USAGE_SCOPE_CAPTURE_CALLBACK: Cell<Option<UsageScopeCaptureFn>> = const { Cell::new(None) };
     static USAGE_SCOPE_TAKE_CALLBACK: Cell<Option<UsageScopeTakeFn>> = const { Cell::new(None) };
     static USAGE_SCOPE_INSTALL_CALLBACK: Cell<Option<UsageScopeInstallFn>> = const { Cell::new(None) };
+    static USAGE_SCOPE_IS_EMPTY_CALLBACK: Cell<Option<UsageScopeIsEmptyFn>> = const { Cell::new(None) };
+    static USAGE_SCOPE_AMBIENT_EMPTY_CALLBACK: Cell<Option<UsageScopeAmbientEmptyFn>> = const { Cell::new(None) };
 }
 
 /// Register the per-task leaf-usage-scope callbacks. Called once at startup by
@@ -279,6 +324,34 @@ pub fn set_usage_scope_task_callbacks(
     USAGE_SCOPE_CAPTURE_CALLBACK.with(|cb| cb.set(Some(capture)));
     USAGE_SCOPE_TAKE_CALLBACK.with(|cb| cb.set(Some(take)));
     USAGE_SCOPE_INSTALL_CALLBACK.with(|cb| cb.set(Some(install)));
+}
+
+/// Register the usage-scope empty fast-path predicates. Called once at startup
+/// by `sema-llm` alongside [`set_usage_scope_task_callbacks`].
+pub fn set_usage_scope_empty_callbacks(
+    is_empty: UsageScopeIsEmptyFn,
+    ambient_empty: UsageScopeAmbientEmptyFn,
+) {
+    USAGE_SCOPE_IS_EMPTY_CALLBACK.with(|cb| cb.set(Some(is_empty)));
+    USAGE_SCOPE_AMBIENT_EMPTY_CALLBACK.with(|cb| cb.set(Some(ambient_empty)));
+}
+
+/// Whether a captured leaf-usage scope is empty (no active accumulator). `true`
+/// when no callback is registered.
+pub fn usage_scope_captured_is_empty(ctx: &Box<dyn Any>) -> bool {
+    match USAGE_SCOPE_IS_EMPTY_CALLBACK.with(|cb| cb.get()) {
+        Some(f) => f(ctx),
+        None => true,
+    }
+}
+
+/// Whether the CURRENT thread's active leaf-usage scope is empty. `true` when
+/// no callback is registered.
+pub fn usage_scope_ambient_is_empty() -> bool {
+    match USAGE_SCOPE_AMBIENT_EMPTY_CALLBACK.with(|cb| cb.get()) {
+        Some(f) => f(),
+        None => true,
+    }
 }
 
 /// Capture the active leaf-usage scope to seed a spawned task.
@@ -329,10 +402,20 @@ pub type LlmScopeTakeFn = fn() -> Box<dyn Any>;
 /// Install an LLM dynamic scope into the thread-locals, returning the one displaced.
 pub type LlmScopeInstallFn = fn(Box<dyn Any>) -> Box<dyn Any>;
 
+/// Check whether a captured LLM dynamic scope carries no overrides (cache off,
+/// no tags/metadata, no active budget) — fast-path predicate for the runtime's
+/// `TaskScopeSwap`. `true` when unregistered (nothing to isolate).
+pub type LlmScopeIsEmptyFn = fn(&Box<dyn Any>) -> bool;
+/// Peek (no mutation, no allocation) whether the CURRENT thread's LLM dynamic
+/// scope is empty/default, without taking or boxing it.
+pub type LlmScopeAmbientEmptyFn = fn() -> bool;
+
 thread_local! {
     static LLM_SCOPE_CAPTURE_CALLBACK: Cell<Option<LlmScopeCaptureFn>> = const { Cell::new(None) };
     static LLM_SCOPE_TAKE_CALLBACK: Cell<Option<LlmScopeTakeFn>> = const { Cell::new(None) };
     static LLM_SCOPE_INSTALL_CALLBACK: Cell<Option<LlmScopeInstallFn>> = const { Cell::new(None) };
+    static LLM_SCOPE_IS_EMPTY_CALLBACK: Cell<Option<LlmScopeIsEmptyFn>> = const { Cell::new(None) };
+    static LLM_SCOPE_AMBIENT_EMPTY_CALLBACK: Cell<Option<LlmScopeAmbientEmptyFn>> = const { Cell::new(None) };
 }
 
 /// Register the per-task LLM dynamic-scope callbacks. Called once at startup by
@@ -345,6 +428,34 @@ pub fn set_llm_scope_task_callbacks(
     LLM_SCOPE_CAPTURE_CALLBACK.with(|cb| cb.set(Some(capture)));
     LLM_SCOPE_TAKE_CALLBACK.with(|cb| cb.set(Some(take)));
     LLM_SCOPE_INSTALL_CALLBACK.with(|cb| cb.set(Some(install)));
+}
+
+/// Register the LLM-scope empty fast-path predicates. Called once at startup by
+/// `sema-llm` alongside [`set_llm_scope_task_callbacks`].
+pub fn set_llm_scope_empty_callbacks(
+    is_empty: LlmScopeIsEmptyFn,
+    ambient_empty: LlmScopeAmbientEmptyFn,
+) {
+    LLM_SCOPE_IS_EMPTY_CALLBACK.with(|cb| cb.set(Some(is_empty)));
+    LLM_SCOPE_AMBIENT_EMPTY_CALLBACK.with(|cb| cb.set(Some(ambient_empty)));
+}
+
+/// Whether a captured LLM dynamic scope is empty (no cache/budget/tags
+/// overrides). `true` when no callback is registered.
+pub fn llm_scope_captured_is_empty(ctx: &Box<dyn Any>) -> bool {
+    match LLM_SCOPE_IS_EMPTY_CALLBACK.with(|cb| cb.get()) {
+        Some(f) => f(ctx),
+        None => true,
+    }
+}
+
+/// Whether the CURRENT thread's LLM dynamic scope is empty/default. `true`
+/// when no callback is registered.
+pub fn llm_scope_ambient_is_empty() -> bool {
+    match LLM_SCOPE_AMBIENT_EMPTY_CALLBACK.with(|cb| cb.get()) {
+        Some(f) => f(),
+        None => true,
+    }
 }
 
 /// Capture the LLM dynamic scope to seed a spawned task.

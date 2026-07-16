@@ -224,12 +224,29 @@ fn install_usage_scope(ctx: Box<dyn std::any::Any>) -> Box<dyn std::any::Any> {
     Box::new(ACTIVE_LEAF_SCOPE.with(|s| std::mem::replace(&mut *s.borrow_mut(), incoming)))
 }
 
+/// Fast-path predicate (`TaskScopeSwap`, sema-vm `state.rs`): a captured usage
+/// scope is empty when no leaf-usage accumulator is active. No allocation.
+fn usage_scope_captured_is_empty(ctx: &Box<dyn std::any::Any>) -> bool {
+    ctx.downcast_ref::<Option<Rc<RefCell<LeafUsage>>>>()
+        .is_none_or(Option::is_none)
+}
+
+/// Peek (no mutation, no allocation) whether the thread-local active leaf-usage
+/// scope is currently empty.
+fn usage_scope_ambient_is_empty() -> bool {
+    ACTIVE_LEAF_SCOPE.with(|s| s.borrow().is_none())
+}
+
 /// Register the per-task usage-scope callbacks with sema-core. Called once at startup.
 pub fn register_usage_scope_task_callbacks() {
     sema_core::set_usage_scope_task_callbacks(
         capture_usage_scope,
         take_usage_scope,
         install_usage_scope,
+    );
+    sema_core::set_usage_scope_empty_callbacks(
+        usage_scope_captured_is_empty,
+        usage_scope_ambient_is_empty,
     );
 }
 
@@ -311,9 +328,43 @@ fn install_llm_scope(ctx: Box<dyn std::any::Any>) -> Box<dyn std::any::Any> {
     Box::new(write_llm_scope(incoming))
 }
 
+/// Fast-path predicate (`TaskScopeSwap`, sema-vm `state.rs`): a captured LLM
+/// dynamic scope is empty when it carries no cache/budget/tag overrides — i.e.
+/// it is bytewise the same as [`LlmDynScope::default`]. No allocation (field
+/// reads only, no clone).
+fn llm_scope_captured_is_empty(ctx: &Box<dyn std::any::Any>) -> bool {
+    match ctx.downcast_ref::<LlmDynScope>() {
+        Some(s) => llm_dyn_scope_is_default(s),
+        None => true,
+    }
+}
+
+/// Peek (no mutation, no allocation) whether the thread-local LLM dynamic scope
+/// is currently at its default (no cache/budget/tag overrides active).
+fn llm_scope_ambient_is_empty() -> bool {
+    !CACHE_ENABLED.with(Cell::get)
+        && !ACTIVE_BUDGET.with(|b| b.borrow().is_some())
+        && CALL_TAGS.with(|t| t.borrow().is_empty())
+        && CALL_META.with(|m| m.borrow().is_empty())
+}
+
+/// Shared field-by-field default check for [`LlmDynScope`] (avoids requiring
+/// `PartialEq`/cloning just to compare against `Default::default()`). Ignores
+/// `cache_ttl_secs`/`stream_budget_pregate` when the flags they gate are off —
+/// a stray `llm/set-cache-ttl` with caching disabled still counts as empty
+/// (correctness-safe: it means the fast path is skipped slightly less often,
+/// never more).
+fn llm_dyn_scope_is_default(s: &LlmDynScope) -> bool {
+    !s.cache_enabled && s.budget.is_none() && s.call_tags.is_empty() && s.call_meta.is_empty()
+}
+
 /// Register the per-task LLM dynamic-scope callbacks with sema-core. Called once at startup.
 pub fn register_llm_scope_task_callbacks() {
     sema_core::set_llm_scope_task_callbacks(capture_llm_scope, take_llm_scope, install_llm_scope);
+    sema_core::set_llm_scope_empty_callbacks(
+        llm_scope_captured_is_empty,
+        llm_scope_ambient_is_empty,
+    );
 }
 
 #[derive(Clone, Default)]

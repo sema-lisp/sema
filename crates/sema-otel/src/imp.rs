@@ -177,7 +177,30 @@ pub fn register_task_callbacks() {
     fn scope_ctx() -> Box<dyn std::any::Any> {
         Box::new(current_conversation_scope())
     }
+    // Fast-path predicate (`TaskScopeSwap`, sema-vm `state.rs`): a captured otel
+    // context is empty when its span stack is empty and no conversation/session/
+    // user identity is set. No allocation.
+    fn is_empty(ctx: &Box<dyn std::any::Any>) -> bool {
+        match ctx.downcast_ref::<OtelTaskCtx>() {
+            Some(c) => {
+                c.stack.is_empty()
+                    && c.conversation_id.is_none()
+                    && c.session_id.is_none()
+                    && c.user_id.is_none()
+            }
+            None => true,
+        }
+    }
+    // Peek (no mutation, no allocation) whether the thread-local otel context is
+    // currently empty.
+    fn ambient_is_empty() -> bool {
+        STACK.with(|s| s.borrow().is_empty())
+            && CONVERSATION_ID.with(|c| c.borrow().is_none())
+            && SESSION_ID.with(|c| c.borrow().is_none())
+            && USER_ID.with(|c| c.borrow().is_none())
+    }
     sema_core::set_otel_task_callbacks(take, install, scope_ctx);
+    sema_core::set_otel_empty_callbacks(is_empty, ambient_is_empty);
 }
 
 /// How an embedded host wires Sema's telemetry (Decisions #12, #14, #16). The

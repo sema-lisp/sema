@@ -158,6 +158,16 @@ struct ScopeSeam {
     take: fn() -> Box<dyn std::any::Any>,
     /// Install a scope into the thread-local, returning the one it displaced.
     install: fn(Box<dyn std::any::Any>) -> Box<dyn std::any::Any>,
+    /// Fast-path predicate: does this captured scope carry no meaningful
+    /// overrides (no allocation — a field peek, never a clone)? `true` for a
+    /// scope registered by a feature (LLM/OTel/usage) never touched by the
+    /// program. See [`TaskScopeSwap::install`] for how this combines with
+    /// [`Self::ambient_is_empty`] to decide whether the swap can be skipped.
+    captured_is_empty: fn(&Box<dyn std::any::Any>) -> bool,
+    /// Fast-path predicate: is the CURRENT thread-local scope (before any swap)
+    /// empty, without taking or boxing it? Used alongside
+    /// [`Self::captured_is_empty`] — see [`TaskScopeSwap::install`].
+    ambient_is_empty: fn() -> bool,
 }
 
 /// The per-task dynamic scopes swapped around every quantum, in a fixed order. Each
@@ -169,6 +179,8 @@ const TASK_SCOPE_SEAMS: [ScopeSeam; 3] = [
         capture: sema_core::current_llm_scope_boxed,
         take: sema_core::take_task_llm_scope,
         install: sema_core::install_task_llm_scope,
+        captured_is_empty: sema_core::llm_scope_captured_is_empty,
+        ambient_is_empty: sema_core::llm_scope_ambient_is_empty,
     },
     // OTel context (span stack + conversation/session/user ids). Capture seeds an
     // EMPTY span stack (ids only) so the child parents to its own trace root.
@@ -176,12 +188,16 @@ const TASK_SCOPE_SEAMS: [ScopeSeam; 3] = [
         capture: sema_core::current_conversation_scope_boxed,
         take: sema_core::take_task_otel,
         install: sema_core::install_task_otel,
+        captured_is_empty: sema_core::otel_captured_is_empty,
+        ambient_is_empty: sema_core::otel_ambient_is_empty,
     },
     // Leaf-usage accumulator scope (per-`workflow/step` LLM usage attribution).
     ScopeSeam {
         capture: sema_core::current_usage_scope_boxed,
         take: sema_core::take_task_usage_scope,
         install: sema_core::install_task_usage_scope,
+        captured_is_empty: sema_core::usage_scope_captured_is_empty,
+        ambient_is_empty: sema_core::usage_scope_ambient_is_empty,
     },
 ];
 
@@ -217,19 +233,68 @@ impl TaskScopes {
 /// usage tally are never corrupted (the faulting task's own mid-step scopes are
 /// discarded — it will not resume). The seams are independent thread-locals, so the
 /// order across them is immaterial; each is self-contained.
+///
+/// EMPTY-SCOPE FAST PATH: for a program that never touches a given seam's feature
+/// (no LLM cache/budget, no OTel span, no leaf-usage attribution), every spawned
+/// task's captured scope for that seam is a "default" value — and the swap would
+/// box/unbox that default on every single quantum for nothing (malloc/free churn
+/// visible in profiles even when the feature is unused). `install` skips the
+/// take/install round-trip for a seam whose captured value AND the current
+/// thread-local ("ambient") value are BOTH empty: installing an empty scope over
+/// an empty ambient is a no-op by definition, so nothing is lost by leaving both
+/// untouched instead of literally swapping them. This is NOT the same as "captured
+/// is empty" alone — a task whose own scope is empty can still be entering a
+/// thread whose ambient state is live (e.g. it was spawned inside a root-level
+/// `llm/with-budget` that's still on the Rust call stack, or a prior task suspended
+/// mid-scope without unwinding) — that case falls through to the ordinary swap so
+/// the task's quantum genuinely sees ITS OWN (empty) scope rather than silently
+/// inheriting the ambient one.
+///
+/// Skipping the swap for a seam means the quantum runs directly against whatever
+/// is in the thread-local — which is fine AS LONG AS it stays empty for the whole
+/// quantum (both empty scopes are semantically identical, so the quantum's own
+/// spawn-capture / cache reads see the same "nothing" either way). But the
+/// quantum's OWN code can open a fresh dynamic scope this step (e.g. a `with-budget`
+/// entered for the first time) and suspend before it unwinds — leaving the
+/// thread-local non-empty at quantum exit even though it was empty at entry. `restore`
+/// (and `Drop`, for the panic/unwind path) re-checks ambient emptiness for every
+/// skipped seam: if it's STILL empty, truly nothing happened and the task's
+/// (unchanged) empty scope is left as-is; if it went non-empty, the now-live scope
+/// is taken back onto the task (this materializes the swap we deferred, but only in
+/// the rare case where the feature was actually exercised this quantum) so a
+/// sibling task can never observe it.
 struct TaskScopeSwap {
     displaced: [Option<Box<dyn std::any::Any>>; TASK_SCOPE_SEAMS.len()],
+    /// `true` for a seam whose install was skipped (both captured and ambient were
+    /// empty at entry) — no thread-local touched, no allocation made. Distinct from
+    /// `displaced[i] == None`, which also covers the ordinary "nothing captured"
+    /// case (a root task, or a nested swap inside an already-installed quantum) —
+    /// those never ran the emptiness check and never need the exit re-check below.
+    skipped: [bool; TASK_SCOPE_SEAMS.len()],
     restored: bool,
 }
 
 impl TaskScopeSwap {
     fn install(task: &mut RuntimeTask) -> Self {
+        let mut displaced: [Option<Box<dyn std::any::Any>>; TASK_SCOPE_SEAMS.len()] =
+            std::array::from_fn(|_| None);
+        let mut skipped = [false; TASK_SCOPE_SEAMS.len()];
+        for (i, seam) in TASK_SCOPE_SEAMS.iter().enumerate() {
+            // No captured scope at all (root task; or a nested swap re-entering an
+            // already-installed quantum, where the outer swap already took it) —
+            // nothing to do, exactly as before the fast path existed.
+            let Some(captured) = task.scopes.captured[i].as_ref() else {
+                continue;
+            };
+            if (seam.captured_is_empty)(captured) && (seam.ambient_is_empty)() {
+                skipped[i] = true;
+                continue;
+            }
+            displaced[i] = task.scopes.captured[i].take().map(seam.install);
+        }
         Self {
-            displaced: std::array::from_fn(|i| {
-                task.scopes.captured[i]
-                    .take()
-                    .map(TASK_SCOPE_SEAMS[i].install)
-            }),
+            displaced,
+            skipped,
             restored: false,
         }
     }
@@ -242,11 +307,31 @@ impl TaskScopeSwap {
             return;
         }
         self.restored = true;
-        for (i, displaced) in self.displaced.iter_mut().enumerate() {
-            if let Some(prev) = displaced.take() {
-                task.scopes.captured[i] = Some((TASK_SCOPE_SEAMS[i].take)());
-                let _ = (TASK_SCOPE_SEAMS[i].install)(prev);
+        for (i, seam) in TASK_SCOPE_SEAMS.iter().enumerate() {
+            if self.skipped[i] {
+                Self::reclaim_if_no_longer_empty(seam, &mut task.scopes.captured[i]);
+                continue;
             }
+            if let Some(prev) = self.displaced[i].take() {
+                task.scopes.captured[i] = Some((seam.take)());
+                let _ = (seam.install)(prev);
+            }
+        }
+    }
+
+    /// For a seam whose swap was skipped: if the quantum left the thread-local
+    /// non-empty (it opened a fresh dynamic scope this step that hasn't unwound),
+    /// take it back onto the task and reset the thread-local to empty — `take`
+    /// already does the reset, so no `install` call is needed (the ambient value
+    /// we deferred restoring was itself empty, which is exactly what `take` leaves
+    /// behind). If it's still empty, nothing happened; leave the task's own
+    /// (unchanged, still-empty) captured scope as-is.
+    fn reclaim_if_no_longer_empty(
+        seam: &ScopeSeam,
+        captured_slot: &mut Option<Box<dyn std::any::Any>>,
+    ) {
+        if !(seam.ambient_is_empty)() {
+            *captured_slot = Some((seam.take)());
         }
     }
 }
@@ -259,10 +344,19 @@ impl Drop for TaskScopeSwap {
         // Unwind path: `restore` never ran, so we cannot reach `task`. Reinstall the
         // displaced scopes into the thread-locals so the parent/sibling context is
         // uncorrupted; the faulting task's own scopes are dropped with it.
-        for (i, displaced) in self.displaced.iter_mut().enumerate() {
-            if let Some(prev) = displaced.take() {
-                let _ = (TASK_SCOPE_SEAMS[i].take)();
-                let _ = (TASK_SCOPE_SEAMS[i].install)(prev);
+        for (i, seam) in TASK_SCOPE_SEAMS.iter().enumerate() {
+            if self.skipped[i] {
+                // Mirror `reclaim_if_no_longer_empty`, but the faulting task's scope
+                // is discarded (it will not resume) — just clear the thread-local so
+                // it doesn't leak into whichever task runs next.
+                if !(seam.ambient_is_empty)() {
+                    let _ = (seam.take)();
+                }
+                continue;
+            }
+            if let Some(prev) = self.displaced[i].take() {
+                let _ = (seam.take)();
+                let _ = (seam.install)(prev);
             }
         }
     }
@@ -5581,6 +5675,12 @@ mod scope_swap_tests {
     fn otel_scope() -> Box<dyn Any> {
         Box::new(Vec::<u64>::new())
     }
+    fn otel_is_empty(ctx: &Box<dyn Any>) -> bool {
+        ctx.downcast_ref::<Vec<u64>>().is_none_or(Vec::is_empty)
+    }
+    fn otel_ambient_is_empty() -> bool {
+        STACK.with(|s| s.borrow().is_empty())
+    }
 
     fn usage_take() -> Box<dyn Any> {
         Box::new(ACTIVE_USAGE.with(|a| a.replace(0)))
@@ -5591,6 +5691,12 @@ mod scope_swap_tests {
     }
     fn usage_capture() -> Box<dyn Any> {
         Box::new(ACTIVE_USAGE.with(|a| a.get()))
+    }
+    fn usage_is_empty(ctx: &Box<dyn Any>) -> bool {
+        ctx.downcast_ref::<u64>().is_none_or(|v| *v == 0)
+    }
+    fn usage_ambient_is_empty() -> bool {
+        ACTIVE_USAGE.with(|a| a.get() == 0)
     }
 
     fn make_task(seed_span: u64, seed_usage: u64) -> RuntimeTask {
@@ -5634,7 +5740,9 @@ mod scope_swap_tests {
     #[test]
     fn interleaved_quanta_keep_otel_and_usage_isolated() {
         sema_core::set_otel_task_callbacks(otel_take, otel_install, otel_scope);
+        sema_core::set_otel_empty_callbacks(otel_is_empty, otel_ambient_is_empty);
         sema_core::set_usage_scope_task_callbacks(usage_capture, usage_take, usage_install);
+        sema_core::set_usage_scope_empty_callbacks(usage_is_empty, usage_ambient_is_empty);
         // Start from a clean thread-local state (other tests on this thread may have
         // left the modeled stack populated).
         STACK.with(|s| s.borrow_mut().clear());
@@ -5695,7 +5803,9 @@ mod scope_swap_tests {
     #[test]
     fn drop_restores_displaced_contexts_on_unwind() {
         sema_core::set_otel_task_callbacks(otel_take, otel_install, otel_scope);
+        sema_core::set_otel_empty_callbacks(otel_is_empty, otel_ambient_is_empty);
         sema_core::set_usage_scope_task_callbacks(usage_capture, usage_take, usage_install);
+        sema_core::set_usage_scope_empty_callbacks(usage_is_empty, usage_ambient_is_empty);
         STACK.with(|s| {
             let mut s = s.borrow_mut();
             s.clear();
@@ -5713,5 +5823,144 @@ mod scope_swap_tests {
         // The parent's context is back in the thread-locals, uncorrupted.
         STACK.with(|s| assert_eq!(*s.borrow(), vec![99]));
         ACTIVE_USAGE.with(|u| assert_eq!(u.get(), 7));
+    }
+
+    fn setup_empty_seams() {
+        sema_core::set_otel_task_callbacks(otel_take, otel_install, otel_scope);
+        sema_core::set_otel_empty_callbacks(otel_is_empty, otel_ambient_is_empty);
+        sema_core::set_usage_scope_task_callbacks(usage_capture, usage_take, usage_install);
+        sema_core::set_usage_scope_empty_callbacks(usage_is_empty, usage_ambient_is_empty);
+    }
+
+    /// A task whose captured otel/usage scopes are both empty (as they are for
+    /// every spawned task on a program that never touches these features).
+    fn make_empty_task() -> RuntimeTask {
+        let mut task = make_task(0, 0);
+        task.scopes.captured[1] = Some(Box::new(Vec::<u64>::new()));
+        task.scopes.captured[2] = Some(Box::new(0u64));
+        task
+    }
+
+    /// The empty-scope fast path (Task E): when a task's captured scope AND the
+    /// thread-local ambient scope are BOTH empty, `install` must skip the
+    /// take/install round-trip entirely rather than touch the thread-locals.
+    #[test]
+    fn fast_path_skips_swap_when_both_empty() {
+        setup_empty_seams();
+        STACK.with(|s| s.borrow_mut().clear());
+        ACTIVE_USAGE.with(|a| a.set(0));
+
+        let mut task = make_empty_task();
+        let mut swap = TaskScopeSwap::install(&mut task);
+        // Both non-LLM seams took the fast path; nothing was displaced.
+        assert!(swap.skipped[1], "otel seam should take the fast path");
+        assert!(swap.skipped[2], "usage seam should take the fast path");
+        assert!(swap.displaced[1].is_none());
+        assert!(swap.displaced[2].is_none());
+        // The task's own captured slot is left untouched (still present, still
+        // empty) rather than taken into thread-locals.
+        assert!(task.scopes.captured[1].is_some());
+        assert!(task.scopes.captured[2].is_some());
+        // Ambient thread-locals were never disturbed.
+        STACK.with(|s| assert!(s.borrow().is_empty()));
+        ACTIVE_USAGE.with(|u| assert_eq!(u.get(), 0));
+
+        swap.restore(&mut task);
+        STACK.with(|s| assert!(s.borrow().is_empty()));
+        ACTIVE_USAGE.with(|u| assert_eq!(u.get(), 0));
+        assert!(task.scopes.captured[1].is_some());
+        assert!(task.scopes.captured[2].is_some());
+    }
+
+    /// The BOTH-empty condition is required, not just "captured is empty": a task
+    /// with an empty captured scope entering a thread whose ambient scope is
+    /// LIVE (e.g. spawned inside a still-on-the-stack `llm/with-budget`, or a
+    /// prior task's scope wasn't fully unwound) must still swap so the quantum
+    /// sees its OWN empty scope, never the ambient one.
+    #[test]
+    fn ambient_nonempty_forces_real_swap_even_when_captured_is_empty() {
+        setup_empty_seams();
+        // Ambient carries a live "parent" span + usage (models a root-level scope
+        // still on the Rust call stack when this task's quantum runs).
+        STACK.with(|s| {
+            let mut s = s.borrow_mut();
+            s.clear();
+            s.push(99);
+        });
+        ACTIVE_USAGE.with(|a| a.set(7));
+
+        let mut task = make_empty_task();
+        let mut swap = TaskScopeSwap::install(&mut task);
+        assert!(
+            !swap.skipped[1] && !swap.skipped[2],
+            "must not skip when ambient is non-empty"
+        );
+        // The quantum sees ITS OWN empty scope, not the ambient [99]/7.
+        STACK.with(|s| assert!(s.borrow().is_empty()));
+        ACTIVE_USAGE.with(|u| assert_eq!(u.get(), 0));
+
+        swap.restore(&mut task);
+        // Ambient is restored exactly as it was; untouched by the empty task.
+        STACK.with(|s| assert_eq!(*s.borrow(), vec![99]));
+        ACTIVE_USAGE.with(|u| assert_eq!(u.get(), 7));
+    }
+
+    /// A skipped seam whose quantum opens a fresh dynamic scope THIS STEP (and
+    /// doesn't unwind it before the quantum ends) must have that scope reclaimed
+    /// onto the task at `restore` time, and the thread-local reset to empty — or
+    /// it would leak into whichever task runs next.
+    #[test]
+    fn fast_path_reclaims_scope_opened_during_the_quantum() {
+        setup_empty_seams();
+        STACK.with(|s| s.borrow_mut().clear());
+        ACTIVE_USAGE.with(|a| a.set(0));
+
+        let mut task = make_empty_task();
+        let mut swap = TaskScopeSwap::install(&mut task);
+        assert!(swap.skipped[1] && swap.skipped[2]);
+        // The quantum opens its own span and usage this step, directly against
+        // the (skipped-over) thread-local — exactly as it would if the swap had
+        // installed an empty scope and the quantum wrote into it.
+        STACK.with(|s| s.borrow_mut().push(42));
+        ACTIVE_USAGE.with(|a| a.set(5));
+        swap.restore(&mut task);
+
+        // Reclaimed onto the task, and the thread-local reset to empty so a
+        // sibling task never observes it.
+        STACK.with(|s| assert!(s.borrow().is_empty()));
+        ACTIVE_USAGE.with(|u| assert_eq!(u.get(), 0));
+        let stack = task.scopes.captured[1]
+            .take()
+            .unwrap()
+            .downcast::<Vec<u64>>()
+            .unwrap();
+        assert_eq!(*stack, vec![42]);
+        let usage = task.scopes.captured[2]
+            .take()
+            .unwrap()
+            .downcast::<u64>()
+            .unwrap();
+        assert_eq!(*usage, 5);
+    }
+
+    /// Same reclaim behavior on the `Drop` (panic-unwind) path.
+    #[test]
+    fn fast_path_reclaims_on_drop_when_opened_mid_quantum() {
+        setup_empty_seams();
+        STACK.with(|s| s.borrow_mut().clear());
+        ACTIVE_USAGE.with(|a| a.set(0));
+
+        let mut task = make_empty_task();
+        {
+            let swap = TaskScopeSwap::install(&mut task);
+            assert!(swap.skipped[1] && swap.skipped[2]);
+            STACK.with(|s| s.borrow_mut().push(7));
+            ACTIVE_USAGE.with(|a| a.set(9));
+            // Drop without calling restore (models a panic mid-quantum). The
+            // faulting task's own scope is discarded either way, but the
+            // thread-local must not leak the opened span/usage to the next task.
+        }
+        STACK.with(|s| assert!(s.borrow().is_empty()));
+        ACTIVE_USAGE.with(|u| assert_eq!(u.get(), 0));
     }
 }

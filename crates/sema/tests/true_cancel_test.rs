@@ -114,6 +114,53 @@ fn indirectly_awaited_subprocess_is_killed_after_explicit_cancel() {
     let _ = std::fs::remove_file(&m);
 }
 
+/// C2 (ASYNC-TIMEOUT-CANCEL-1): a ONE-SHOT program that cancels an in-flight
+/// subprocess and RETURNS IMMEDIATELY — never awaiting the child — must still
+/// flush the abort before `eval` returns, not defer it to `Interpreter::drop`.
+/// Before eager cancellation delivery, a root that settled right after
+/// `async/cancel` could leave the cancelled child parked on its External wait with
+/// the abort undelivered until the interpreter was dropped. Proof: the interpreter
+/// is still alive after `eval` yet holds ZERO live tasks (the child was cancelled,
+/// aborted, settled, and reaped during the post-settle drain), and the subprocess
+/// group is dead (its survival marker never appears).
+#[test]
+#[serial]
+fn one_shot_cancel_flushes_subprocess_abort_before_returning() {
+    let m = marker("oneshot");
+    let interp = Interpreter::new();
+    let program = format!(
+        r#"(define p
+             (async/spawn (fn () (shell "sh" "-c" "(sleep 3; touch {}) & wait"))))
+           (async/spawn (fn () (async/cancel p)))
+           :done"#,
+        m.display()
+    );
+    let result = interp
+        .eval_str_compiled(&program)
+        .expect("one-shot cancel program evaluated");
+    assert_eq!(
+        result,
+        sema_core::Value::keyword("done"),
+        "the one-shot root returns immediately without awaiting the cancelled child"
+    );
+    // Flushed during the post-settle drain, NOT left for teardown: the interpreter
+    // is still alive here, yet holds zero live tasks.
+    assert_eq!(
+        interp.runtime_live_task_count(),
+        0,
+        "the cancelled in-flight subprocess task must be flushed before return, not orphaned"
+    );
+    // Past the grandchild's 3 s sleep: a surviving process group would touch the
+    // marker around now.
+    std::thread::sleep(Duration::from_millis(4000));
+    assert!(
+        !m.exists(),
+        "the one-shot-cancelled subprocess group must be killed — marker {} should not exist",
+        m.display()
+    );
+    let _ = std::fs::remove_file(&m);
+}
+
 /// CONTROL: without cancellation, the subprocess completes normally and the marker
 /// IS written — proving the kill gate above isn't a false positive
 /// (e.g. the shell never running at all).

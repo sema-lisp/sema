@@ -65,6 +65,13 @@ struct Waiter {
 
 struct Gate {
     busy: bool,
+    /// The task currently holding the slot (granted or acquired), if any. Set on
+    /// an immediate acquire and on a release-transfer to the FIFO head; cleared
+    /// when a release finds no waiter. Lets the runtime release a gate held by a
+    /// task that is cancelled after being GRANTED the slot but before its acquire
+    /// continuation runs (the granted-but-not-run leak): the continuation raises
+    /// on the cancellation without releasing, so the runtime must release for it.
+    owner: Option<TaskId>,
     waiters: VecDeque<Waiter>,
 }
 
@@ -97,6 +104,7 @@ impl ResourceGateRegistry {
             id,
             Gate {
                 busy: false,
+                owner: None,
                 waiters: VecDeque::new(),
             },
         );
@@ -121,6 +129,7 @@ impl ResourceGateRegistry {
             Ok(AcquireResult::Parked)
         } else {
             gate.busy = true;
+            gate.owner = Some(task);
             Ok(AcquireResult::Acquired)
         }
     }
@@ -134,6 +143,7 @@ impl ResourceGateRegistry {
         let gate = self.gate_mut(id)?;
         if let Some(head) = gate.waiters.pop_front() {
             // Ownership transfers to the head waiter; the gate stays busy.
+            gate.owner = Some(head.task);
             self.wakes.push_back(ResourceGateWake {
                 key: head.key,
                 task: head.task,
@@ -141,6 +151,7 @@ impl ResourceGateRegistry {
             });
         } else {
             gate.busy = false;
+            gate.owner = None;
         }
         Ok(())
     }
@@ -177,6 +188,23 @@ impl ResourceGateRegistry {
             return Ok(true);
         }
         Ok(false)
+    }
+
+    /// The gate whose slot `task` currently HOLDS (acquired or granted), if any.
+    /// Used to release a gate held by a task cancelled after being granted the
+    /// slot but before its acquire continuation ran (which would otherwise raise
+    /// on the cancellation without releasing — the granted-but-not-run leak).
+    pub fn owner_gate(&self, task: TaskId) -> Option<ResourceGateId> {
+        self.gates
+            .iter()
+            .find_map(|(id, gate)| (gate.owner == Some(task)).then_some(*id))
+    }
+
+    /// The task currently holding `id`'s slot, if any (test/observability oracle
+    /// for the granted-but-not-run gate-release path).
+    #[cfg(test)]
+    pub(crate) fn owner_of(&self, id: ResourceGateId) -> Option<TaskId> {
+        self.gates.get(&id).and_then(|gate| gate.owner)
     }
 
     pub fn pop_wake(&mut self) -> Option<ResourceGateWake> {

@@ -749,6 +749,21 @@ impl Runtime {
         self.state.borrow().tasks.len()
     }
 
+    /// Whether any task is still parked on a wait with a cancellation recorded —
+    /// i.e. its wait teardown (executor abort / gate release / cancelled
+    /// settlement) has not yet been delivered. A host post-settle drain counts
+    /// this as pending progress so a one-shot program flushes every in-flight
+    /// abort before returning rather than deferring it to `Interpreter::drop`
+    /// (ASYNC-TIMEOUT-CANCEL-1). Request-time delivery (C2) makes this transient;
+    /// it is the belt-and-suspenders backstop for scan-delivered teardown.
+    pub fn has_pending_cancel_teardown(&self) -> bool {
+        let state = self.state.borrow();
+        state.tasks.values().any(|task| {
+            task.record.cancellation().is_some()
+                && task.record.state_name() == super::StateName::Waiting
+        })
+    }
+
     pub fn drive(&self, budget: &DriveBudget) -> Result<DriveState, RuntimeFault> {
         // Publish this runtime for the whole drive so a cycle collection fired
         // inside a driven VM quantum (an explicit `(gc/collect)`, a `make_closure`
@@ -1108,8 +1123,22 @@ impl Runtime {
                         // A task cancelled while queued behind a busy gate: drop
                         // it from the FIFO queue so a later `release` skips it.
                         // (An owner cancelled mid-op releases the gate via its
-                        // module cancel hook, not here.)
-                        let _ = state.resource_gates.cancel_wait(*gate, key);
+                        // module cancel hook, not here.) If it was already GRANTED
+                        // the slot (not in the queue — the gate owner) but never
+                        // ran its acquire continuation, release the gate here so
+                        // the next acquirer proceeds (no leak).
+                        let gate = *gate;
+                        let queued =
+                            state
+                                .resource_gates
+                                .cancel_wait(gate, key)
+                                .map_err(|error| RuntimeFault::Invariant {
+                                    message: format!("resource slot cancel failed: {error:?}"),
+                                })?;
+                        if !queued {
+                            let _ = state.resource_gates.take_wake(key);
+                            release_owned_gate(&mut state, gate)?;
+                        }
                     }
                 }
                 let task = state.tasks.get_mut(&task_id).expect("selected task exists");
@@ -2391,6 +2420,10 @@ impl Runtime {
                 ));
             return terminal_fault.map_or(Ok(()), Err);
         }
+        // Tasks newly cancelled by this request (the direct target + any
+        // transitively-cancelled descendants) whose in-flight wait teardown is
+        // delivered eagerly, once the `state` borrow below is dropped (C2).
+        let mut eager_cancel_targets: Vec<TaskId> = Vec::new();
         let (continuation, response) = {
             let mut state = self.state.borrow_mut();
             match request {
@@ -2452,6 +2485,11 @@ impl Runtime {
                                 .is_some_and(|task| {
                                     task.record.request_cancellation(CancelReason::Explicit)
                                 });
+                            if newly {
+                                if let Some(target) = target {
+                                    eager_cancel_targets.push(target);
+                                }
+                            }
                             // Structured transitive cancel: propagate to every task
                             // (transitively) spawned by the cancelled target via the
                             // cancellation-parent graph, so a subprocess/IO awaited
@@ -2460,7 +2498,7 @@ impl Runtime {
                             // (cancelled because their owner was). No-op when the
                             // target has no children (the common direct-cancel case).
                             if let Some(target) = target {
-                                cancel_descendants(&mut state, target);
+                                eager_cancel_targets.extend(cancel_descendants(&mut state, target));
                             }
                             RuntimeResponse::Cancelled(newly)
                         })
@@ -2524,6 +2562,12 @@ impl Runtime {
             response,
         ));
         drop(state);
+        // Deliver wait teardown for every task this request cancelled, now that the
+        // `state` borrow is dropped (the External abort hook may re-enter the
+        // runtime, so it must run unborrowed). C2 eager delivery.
+        for target in eager_cancel_targets {
+            deliver_cancel_teardown(&self.state, target)?;
+        }
         self.state
             .borrow()
             .terminal_fault
@@ -3271,25 +3315,33 @@ impl Runtime {
     }
 
     pub fn cancel_root(&self, root: RootId, reason: CancelReason) -> bool {
-        let mut state = self.state.borrow_mut();
-        if root.runtime()
-            != state
-                .waits
-                .as_ref()
-                .expect("runtime wait owner is installed")
-                .runtime_id()
-            || !state.roots.contains_key(&root)
-        {
-            return false;
+        let (task_id, newly) = {
+            let mut state = self.state.borrow_mut();
+            if root.runtime()
+                != state
+                    .waits
+                    .as_ref()
+                    .expect("runtime wait owner is installed")
+                    .runtime_id()
+                || !state.roots.contains_key(&root)
+            {
+                return false;
+            }
+            let task_id = match state.roots.get(&root).map(RootRecord::state) {
+                Some(RootState::Running { main_task }) => *main_task,
+                _ => return false,
+            };
+            let Some(task) = state.tasks.get_mut(&task_id) else {
+                return false;
+            };
+            (task_id, task.record.request_cancellation(reason))
+        };
+        // Eagerly tear down an in-flight External/IO/ResourceSlot wait so a
+        // root cancelled between drive turns aborts promptly (C2).
+        if newly {
+            let _ = deliver_cancel_teardown(&self.state, task_id);
         }
-        let task_id = match state.roots.get(&root).map(RootRecord::state) {
-            Some(RootState::Running { main_task }) => *main_task,
-            _ => return false,
-        };
-        let Some(task) = state.tasks.get_mut(&task_id) else {
-            return false;
-        };
-        task.record.request_cancellation(reason)
+        newly
     }
 
     pub fn shutdown(&self, options: &ShutdownOptions) -> Result<ShutdownReport, RuntimeFault> {
@@ -3456,6 +3508,11 @@ impl Runtime {
             .waits
             .as_ref()
             .map_or(0, WaitRuntime::active_len)
+    }
+
+    #[cfg(test)]
+    pub(super) fn resource_gate_owner_for_test(&self, gate: ResourceGateId) -> Option<TaskId> {
+        self.state.borrow().resource_gates.owner_of(gate)
     }
 
     #[cfg(test)]
@@ -3626,14 +3683,15 @@ fn await_io_error(message: String) -> sema_core::SemaError {
 
 /// Transitively request cancellation of every live task whose cancellation-parent
 /// chain leads back to `parent` (its spawned descendants), marking each with
-/// `CancelReason::Owner`. The drive loop's `cancel_waiting` then delivers the
-/// cancellation to each — aborting a descendant parked on a legacy `AwaitIo`
-/// handle (killing its in-flight subprocess/request) and settling it Cancelled +
-/// reaped, so a subprocess awaited indirectly is not left running. `parent`
+/// `CancelReason::Owner`. Returns the task ids that were NEWLY cancelled by this
+/// call so the caller can deliver eager wait teardown (DECISION C2) to each —
+/// aborting a descendant parked on an External/IO wait (killing its in-flight
+/// subprocess/request) rather than waiting for the next drive scan. `parent`
 /// itself is cancelled by the caller; this only reaches its children. BFS over an
 /// immutable snapshot of the parent→child edges, so it terminates even if a
 /// (malformed) cycle existed: a task already marked cancelled is not revisited.
-fn cancel_descendants(state: &mut RuntimeState, parent: TaskId) {
+fn cancel_descendants(state: &mut RuntimeState, parent: TaskId) -> Vec<TaskId> {
+    let mut newly = Vec::new();
     let mut frontier = vec![parent];
     while let Some(current) = frontier.pop() {
         let children: Vec<TaskId> = state
@@ -3650,11 +3708,244 @@ fn cancel_descendants(state: &mut RuntimeState, parent: TaskId) {
                 // already cancelled was already walked (or is being walked),
                 // which bounds the traversal even under a malformed cycle.
                 if task.record.request_cancellation(CancelReason::Owner) {
+                    newly.push(child);
                     frontier.push(child);
                 }
             }
         }
     }
+    newly
+}
+
+/// Which eager wait teardown a cancelled task needs (DECISION C2). Only the
+/// in-flight kinds — External / legacy-IO / ResourceSlot, plus a
+/// granted-but-not-run resource gate — are delivered eagerly; Promise / bare
+/// Timer / Channel waits carry no offloaded work to abort and are left to the
+/// per-drive-turn `cancel_waiting` scan.
+enum EagerTeardown {
+    ResourceSlot(super::WaitKey, ResourceGateId),
+    Io(super::WaitKey),
+    External,
+    GrantedGate,
+    None,
+}
+
+/// Deliver wait teardown for a task at cancellation-REQUEST time (DECISION C2).
+///
+/// When a cancellation has just been recorded on a task parked on an External /
+/// legacy-IO / ResourceSlot wait (or holding a granted-but-not-run resource
+/// gate), tear the wait down SYNCHRONOUSLY right now rather than waiting for the
+/// per-drive-turn `cancel_waiting` scan — so a settled root followed by process
+/// exit never leaves an in-flight subprocess/request/gate un-aborted
+/// (ASYNC-TIMEOUT-CANCEL-1).
+///
+/// Exactly-once: the wait registration (`io_waits` / `protocol_waits` /
+/// `WaitRuntime::active` / the gate queue-or-ownership) is removed HERE, so the
+/// drive-scan `cancel_waiting` then finds the task no longer Waiting and has
+/// nothing to double-abort. Returns whether teardown ran.
+fn deliver_cancel_teardown(
+    cell: &RefCell<RuntimeState>,
+    task_id: TaskId,
+) -> Result<bool, RuntimeFault> {
+    let kind = {
+        let state = cell.borrow();
+        let Some(task) = state.tasks.get(&task_id) else {
+            return Ok(false);
+        };
+        if task.record.cancellation().is_none() {
+            return Ok(false);
+        }
+        match task.record.state_name() {
+            super::StateName::Waiting => {
+                let key = task.record.wait_key().expect("waiting task has a wait key");
+                match state.protocol_waits.get(&key).map(|wait| &wait.kind) {
+                    Some(ProtocolWaitKind::ResourceSlot { gate }) => {
+                        EagerTeardown::ResourceSlot(key, *gate)
+                    }
+                    // Promise / bare Timer / Channel waits: nothing to abort.
+                    Some(_) => EagerTeardown::None,
+                    None if state.io_waits.get(&task_id).map(|(k, _)| *k) == Some(key) => {
+                        EagerTeardown::Io(key)
+                    }
+                    None if state
+                        .waits
+                        .as_ref()
+                        .is_some_and(|waits| waits.is_active(key)) =>
+                    {
+                        EagerTeardown::External
+                    }
+                    // A bare `Timer`/`VmSleep` key (in `timers` only): self-resolving,
+                    // left to the scan.
+                    None => EagerTeardown::None,
+                }
+            }
+            // Granted-but-not-run: the task was handed a gate slot (it is the gate
+            // owner) but its acquire continuation has not run — that continuation
+            // raises on the cancellation WITHOUT releasing, so release for it.
+            super::StateName::Running if state.resource_gates.owner_gate(task_id).is_some() => {
+                EagerTeardown::GrantedGate
+            }
+            _ => EagerTeardown::None,
+        }
+    };
+    match kind {
+        EagerTeardown::None => Ok(false),
+        EagerTeardown::ResourceSlot(key, gate) => {
+            eager_resource_slot_teardown(cell, task_id, key, gate)
+        }
+        EagerTeardown::Io(key) => eager_io_teardown(cell, task_id, key),
+        EagerTeardown::External => eager_external_teardown(cell, task_id),
+        EagerTeardown::GrantedGate => eager_release_granted_gate(cell, task_id),
+    }
+}
+
+/// Eager teardown of a task parked on a `ResourceSlot` wait. If it is still
+/// queued behind a busy gate, drop it from the FIFO queue; if it was already
+/// GRANTED the slot (window A — the gate owner, not in the queue), release the
+/// gate so the next acquirer proceeds. Either way its acquire continuation is
+/// resumed with the cancellation, which raises without further gate work.
+fn eager_resource_slot_teardown(
+    cell: &RefCell<RuntimeState>,
+    task_id: TaskId,
+    key: super::WaitKey,
+    gate: ResourceGateId,
+) -> Result<bool, RuntimeFault> {
+    let mut state = cell.borrow_mut();
+    let Some(wait) = state.protocol_waits.remove(&key) else {
+        return Ok(false);
+    };
+    let queued = state
+        .resource_gates
+        .cancel_wait(gate, key)
+        .map_err(|error| RuntimeFault::Invariant {
+            message: format!("resource slot cancel failed: {error:?}"),
+        })?;
+    if !queued {
+        // Not in the queue: this task was granted the slot (it owns the gate) but
+        // has not run its acquire continuation. Release the gate for it and drop
+        // any buffered grant wake keyed to it.
+        let _ = state.resource_gates.take_wake(key);
+        release_owned_gate(&mut state, gate)?;
+    }
+    state
+        .tasks
+        .get_mut(&task_id)
+        .expect("resource slot task exists")
+        .record
+        .reject_wait(key)
+        .map_err(|error| RuntimeFault::Invariant {
+            message: format!("cancelled resource slot task failed to resume: {error:?}"),
+        })?;
+    state.pending.push_back(PendingStage::ApplyRuntimeResponse(
+        task_id,
+        wait.owner,
+        wait.continuation,
+        Err(sema_core::SemaError::eval("protocol wait cancelled")),
+    ));
+    Ok(true)
+}
+
+/// Eager teardown of a task parked on a legacy `AwaitIo` handle: run the handle's
+/// abort hook (tearing down the offloaded future) and wake the task so its
+/// cancellation settles it on the next visit.
+fn eager_io_teardown(
+    cell: &RefCell<RuntimeState>,
+    task_id: TaskId,
+    key: super::WaitKey,
+) -> Result<bool, RuntimeFault> {
+    let mut state = cell.borrow_mut();
+    if let Some((_, handle)) = state.io_waits.remove(&task_id) {
+        handle.abort();
+    }
+    let task = state
+        .tasks
+        .get_mut(&task_id)
+        .expect("io-waiting task exists");
+    task.record
+        .wake(key)
+        .map_err(|error| RuntimeFault::Invariant {
+            message: format!("cancelled io-wait task failed to wake: {error:?}"),
+        })?;
+    let root = task.record.relations().origin_root;
+    state.ready.enqueue(root, task_id);
+    Ok(true)
+}
+
+/// Eager teardown of a task parked on an External wait: run the executor cancel
+/// path / resource abort hook via `WaitRuntime::cancel` and arm the cancelled
+/// resume. The hook is invoked with NO state borrow held (matching the drive-scan
+/// path), so a hook that re-enters the runtime (e.g. polls its root handle) does
+/// not deadlock the state cell.
+fn eager_external_teardown(
+    cell: &RefCell<RuntimeState>,
+    task_id: TaskId,
+) -> Result<bool, RuntimeFault> {
+    let (mut task, mut waits, now) = {
+        let mut state = cell.borrow_mut();
+        let task = state
+            .tasks
+            .remove(&task_id)
+            .ok_or_else(|| RuntimeFault::Invariant {
+                message: "cancelled external task disappeared".into(),
+            })?;
+        let waits = state.waits.take().ok_or_else(|| RuntimeFault::Invariant {
+            message: "wait runtime already extracted".into(),
+        })?;
+        let now = state.clock.now();
+        (task, waits, now)
+    };
+    let key = task
+        .record
+        .wait_key()
+        .expect("external-waiting task has a wait key");
+    let pending = waits.cancel(&mut task.record, key, now);
+    let root = task.record.relations().origin_root;
+    let mut state = cell.borrow_mut();
+    state.waits = Some(waits);
+    state.tasks.insert(task_id, task);
+    if let Some(pending) = pending {
+        state
+            .tasks
+            .get_mut(&task_id)
+            .expect("external task restored")
+            .pending_resume = Some(pending);
+        state.ready.enqueue(root, task_id);
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+/// Eager release of a gate whose slot a Running task HOLDS after being granted it
+/// but before running its acquire continuation (windows B/C). The task's pending
+/// grant resume will resolve to the cancellation and raise without releasing, so
+/// the runtime releases here to keep the gate from leaking.
+fn eager_release_granted_gate(
+    cell: &RefCell<RuntimeState>,
+    task_id: TaskId,
+) -> Result<bool, RuntimeFault> {
+    let mut state = cell.borrow_mut();
+    let Some(gate) = state.resource_gates.owner_gate(task_id) else {
+        return Ok(false);
+    };
+    release_owned_gate(&mut state, gate)?;
+    Ok(true)
+}
+
+/// Release a gate the runtime holds on behalf of a cancelled owner, forwarding
+/// any resulting grant wake (transfer to the FIFO head) into the pending queue.
+fn release_owned_gate(state: &mut RuntimeState, gate: ResourceGateId) -> Result<(), RuntimeFault> {
+    state
+        .resource_gates
+        .release(gate)
+        .map_err(|error| RuntimeFault::Invariant {
+            message: format!("resource gate release failed: {error:?}"),
+        })?;
+    while let Some(wake) = state.resource_gates.pop_wake() {
+        state
+            .pending
+            .push_back(PendingStage::ResourceGateWake(wake));
+    }
+    Ok(())
 }
 
 /// The structured `:timeout` condition raised into a continuation parked on an
@@ -4038,19 +4329,38 @@ impl RootHandle {
         }
     }
 
+    #[cfg(test)]
+    pub(super) fn main_task_for_test(&self) -> Option<TaskId> {
+        let runtime = self.runtime.upgrade()?;
+        let state = runtime.borrow();
+        match state.roots.get(&self.id).map(RootRecord::state) {
+            Some(RootState::Running { main_task }) => Some(*main_task),
+            _ => None,
+        }
+    }
+
     pub fn cancel(&self, reason: CancelReason) -> bool {
         let Some(runtime) = self.runtime.upgrade() else {
             return false;
         };
-        let mut state = runtime.borrow_mut();
-        let task_id = match state.roots.get(&self.id).map(RootRecord::state) {
-            Some(RootState::Running { main_task }) => *main_task,
-            _ => return false,
+        let (task_id, newly) = {
+            let mut state = runtime.borrow_mut();
+            let task_id = match state.roots.get(&self.id).map(RootRecord::state) {
+                Some(RootState::Running { main_task }) => *main_task,
+                _ => return false,
+            };
+            let newly = state
+                .tasks
+                .get_mut(&task_id)
+                .is_some_and(|task| task.record.request_cancellation(reason));
+            (task_id, newly)
         };
-        state
-            .tasks
-            .get_mut(&task_id)
-            .is_some_and(|task| task.record.request_cancellation(reason))
+        // Eagerly deliver in-flight wait teardown so a root cancelled between
+        // drive turns (e.g. host Ctrl-C) aborts its offloaded op promptly (C2).
+        if newly {
+            let _ = deliver_cancel_teardown(&runtime, task_id);
+        }
+        newly
     }
 }
 

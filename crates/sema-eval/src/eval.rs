@@ -336,13 +336,30 @@ impl Interpreter {
                     // or an external inbox — genuinely-parked detached tasks
                     // persist to later evals, exactly as before the flip. Bounded:
                     // stops as soon as the runtime stops making ready progress.
-                    while let DriveState::Progress {
-                        ready_remaining: true,
-                        ..
-                    } = runtime
-                        .drive(&budget)
-                        .map_err(|e| SemaError::eval(format!("runtime fault: {e:?}")))?
-                    {
+                    //
+                    // Pending-cancellation teardown counts as progress too: a task
+                    // cancelled during this program but still parked on an in-flight
+                    // External/IO/ResourceSlot wait must have its abort flushed
+                    // before returning, not deferred to `Interpreter::drop`
+                    // (ASYNC-TIMEOUT-CANCEL-1). Request-time delivery (C2) makes
+                    // that the common case; this keeps the drain going for any
+                    // teardown the drive scan still owes.
+                    loop {
+                        match runtime
+                            .drive(&budget)
+                            .map_err(|e| SemaError::eval(format!("runtime fault: {e:?}")))?
+                        {
+                            DriveState::Progress {
+                                ready_remaining: true,
+                                ..
+                            } => continue,
+                            DriveState::Progress { .. }
+                                if runtime.has_pending_cancel_teardown() =>
+                            {
+                                continue
+                            }
+                            _ => break,
+                        }
                     }
                     return result;
                 }

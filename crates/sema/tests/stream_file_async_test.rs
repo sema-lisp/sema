@@ -512,3 +512,49 @@ fn cyclic_closures_passed_into_async_task_terminate() {
         .expect("cyclic-closure program evaluated");
     assert_eq!(result.as_list().unwrap()[0].as_str(), Some("ab7"));
 }
+
+// === Cancellation through the ResourceGate + checkout_external path ===
+//
+// Cancelling spawned file-stream ops must settle the tasks (never hang or panic).
+// A queued reader cancelled while parked behind the gate holder settles
+// :cancelled; the gate holder, cancelled while in flight, tombstones ITS stream
+// (best-effort — the resource is stuck in the blocking worker, matching the
+// documented policy). The runtime itself is not wedged: a FRESHLY opened stream
+// afterward reads normally. Exercises the checkout continuations' Cancelled arms
+// + the per-stream ResourceGate release.
+#[test]
+fn stream_file_async_cancel_settles_and_fresh_stream_works() {
+    let f = TempFile::with_contents("cancel-queued", "a\nb\nc\nd\n");
+    let interp = Interpreter::new();
+    let result = interp
+        .eval_str_compiled(&format!(
+            r#"
+            (let ((s (stream/open-input "{path}")))
+              (let ((slow (async/spawn (fn () (stream/read-line s))))
+                    (queued (async/spawn (fn () (stream/read-line s)))))
+                (async/cancel queued)
+                (async/cancel slow)
+                (let ((q (try (async/await queued) (catch e :q-cancelled)))
+                      (sl (try (async/await slow) (catch e :slow-settled))))
+                  ;; the runtime is not wedged: a FRESH stream reads normally
+                  (let ((s2 (stream/open-input "{path}")))
+                    (let ((line (stream/read-line s2)))
+                      (stream/close s2)
+                      (list q sl line))))))
+            "#,
+            path = f.path()
+        ))
+        .expect("cancelled stream chain evaluates without wedging the runtime");
+    let parts: Vec<Value> = result.as_list().expect("result list").to_vec();
+    assert_eq!(
+        parts[0],
+        Value::keyword("q-cancelled"),
+        "the queued-then-cancelled reader must settle :cancelled, got {:?}",
+        parts[0]
+    );
+    assert_eq!(
+        parts[2],
+        Value::string("a"),
+        "a freshly opened stream must read normally after the cancellation (runtime not wedged)"
+    );
+}

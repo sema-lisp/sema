@@ -19,6 +19,84 @@ use sema_core::{check_arity, in_async_context, take_resume_value, SemaError, Val
 
 use crate::register_fn;
 
+/// Compute `(sources, timeout_ms, started)` for one `event/select` call — the
+/// shared setup for the sync, legacy-async, and unified-runtime paths.
+fn select_setup(args: &[Value]) -> Result<(Vec<Value>, u128, Instant), SemaError> {
+    let sources = sources_of(&args[0])?;
+    // Explicit timeout, else the smallest timer among the sources, else 10s.
+    let explicit = args.get(1).and_then(|v| v.as_int());
+    let min_timer = sources
+        .iter()
+        .filter_map(|s| s.as_map_ref())
+        .filter(|m| m.get(&kw("type")) == Some(&kw("timer")))
+        .filter_map(|m| m.get(&kw("ms")).and_then(|v| v.as_int()))
+        .min();
+    let timeout_ms = explicit.or(min_timer).unwrap_or(10_000).max(0) as u128;
+    Ok((sources, timeout_ms, Instant::now()))
+}
+
+/// Value-ABI body for `event/select`: the sync polling loop plus the legacy
+/// cooperative-scheduler `in_async_context()` `AwaitIo` poll. The unified-runtime
+/// cooperative path lives in the runtime ABI (see [`register`]).
+fn event_select_value(args: &[Value]) -> Result<Value, SemaError> {
+    check_arity!(args, "event/select", 1..=2);
+    let (sources, timeout_ms, started) = select_setup(args)?;
+
+    // In a legacy scheduler task, cooperatively poll the sources on the scheduler
+    // thread rather than `std::thread::sleep`-blocking it between scans, so
+    // sibling tasks (e.g. an LLM/agent task) make progress while we wait for a
+    // source or the timeout. Reuses the same `AwaitIo` yield the file/http/shell
+    // async paths use. The sync path below is unchanged.
+    if in_async_context() {
+        if let Some(v) = take_resume_value() {
+            return Ok(v);
+        }
+        return crate::io::await_io_until(started, timeout_ms as u64, move || {
+            sources.iter().find_map(|s| ready(s, started).map(Ok))
+        });
+    }
+
+    loop {
+        for s in &sources {
+            if let Some(ev) = ready(s, started) {
+                return Ok(ev);
+            }
+        }
+        if started.elapsed().as_millis() >= timeout_ms {
+            return Ok(Value::nil());
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// The VM-thread readiness probe for `event/select` under the unified runtime:
+/// the first ready source fires. Holds the source maps (live `Value`s), so it is
+/// GC-traced — unlike the legacy untraced `AwaitIo` closure.
+#[cfg(not(target_arch = "wasm32"))]
+struct SourcesProbe {
+    sources: Vec<Value>,
+    started: Instant,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl sema_core::runtime::Trace for SourcesProbe {
+    fn trace(&self, sink: &mut dyn FnMut(sema_core::cycle::GcEdge<'_>)) -> bool {
+        for s in &self.sources {
+            sink(sema_core::cycle::GcEdge::Value(s));
+        }
+        true
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl crate::io::RuntimePoll for SourcesProbe {
+    fn poll(&mut self) -> Option<Result<Value, String>> {
+        self.sources
+            .iter()
+            .find_map(|s| ready(s, self.started).map(Ok))
+    }
+}
+
 fn kw(s: &str) -> Value {
     Value::keyword(s)
 }
@@ -90,48 +168,41 @@ pub fn register(env: &sema_core::Env) {
         Ok(Value::map(m))
     });
 
-    // event/select — first ready source, or nil on timeout.
-    register_fn(env, "event/select", |args| {
-        check_arity!(args, "event/select", 1..=2);
-        let sources = sources_of(&args[0])?;
-        // Explicit timeout, else the smallest timer among the sources, else 10s.
-        let explicit = args.get(1).and_then(|v| v.as_int());
-        let min_timer = sources
-            .iter()
-            .filter_map(|s| s.as_map_ref())
-            .filter(|m| m.get(&kw("type")) == Some(&kw("timer")))
-            .filter_map(|m| m.get(&kw("ms")).and_then(|v| v.as_int()))
-            .min();
-        let timeout_ms = explicit.or(min_timer).unwrap_or(10_000).max(0) as u128;
+    // event/select — first ready source, or nil on timeout. Registered dual-ABI:
+    // the value body serves the sync + legacy-scheduler paths; under the unified
+    // runtime the runtime body yields a cooperative External-sleep poll so a TUI
+    // "input OR agent progress" loop overlaps siblings without the legacy
+    // `AwaitIo` bridge (crates/sema/tests/vm_async_test.rs asserts the yield).
+    register_event_select(env);
+}
 
-        let started = Instant::now();
-
-        // In an async task, cooperatively poll the sources on the scheduler
-        // thread rather than `std::thread::sleep`-blocking it between scans, so
-        // sibling tasks (e.g. an LLM/agent task) make progress while we wait for
-        // a source or the timeout. Reuses the same `AwaitIo` yield the
-        // file/http/shell async paths use. The sync path below is unchanged.
-        if in_async_context() {
-            if let Some(v) = take_resume_value() {
-                return Ok(v);
-            }
-            return crate::io::await_io_until(started, timeout_ms as u64, move || {
-                sources.iter().find_map(|s| ready(s, started).map(Ok))
-            });
-        }
-
-        loop {
-            for s in &sources {
-                if let Some(ev) = ready(s, started) {
-                    return Ok(ev);
+#[cfg(not(target_arch = "wasm32"))]
+fn register_event_select(env: &sema_core::Env) {
+    use sema_core::runtime::NativeOutcome;
+    env.set(
+        sema_core::intern("event/select"),
+        Value::native_fn(sema_core::NativeFn::simple_with_runtime(
+            "event/select",
+            event_select_value,
+            |_ctx, args| {
+                if sema_core::in_runtime_quantum() {
+                    check_arity!(args, "event/select", 1..=2);
+                    let (sources, timeout_ms, started) = select_setup(args)?;
+                    return crate::io::await_runtime_until(
+                        Box::new(SourcesProbe { sources, started }),
+                        started,
+                        timeout_ms as u64,
+                    );
                 }
-            }
-            if started.elapsed().as_millis() >= timeout_ms {
-                return Ok(Value::nil());
-            }
-            std::thread::sleep(Duration::from_millis(5));
-        }
-    });
+                event_select_value(args).map(NativeOutcome::Return)
+            },
+        )),
+    );
+}
+
+#[cfg(target_arch = "wasm32")]
+fn register_event_select(env: &sema_core::Env) {
+    register_fn(env, "event/select", event_select_value);
 }
 
 #[cfg(test)]

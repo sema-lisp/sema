@@ -114,14 +114,14 @@ crates/sema-dap/src/server.rs:94:            Some(event) = event_bridge_rx.recv(
 crates/sema-eval/src/eval.rs:170:        sema_core::set_eval_callback(&ctx, eval_value_vm);
 crates/sema-eval/src/eval.rs:171:        sema_core::set_call_callback(&ctx, call_value);
 crates/sema-eval/src/eval.rs:172:        sema_core::set_call_owned_callback(&ctx, call_value_owned);
-crates/sema-eval/src/eval.rs:1769:                    sema_core::call_callback(ctx, &thunk.body, &[])?
+crates/sema-eval/src/eval.rs:1786:                    sema_core::call_callback(ctx, &thunk.body, &[])?
 crates/sema-eval/src/eval.rs:191:        sema_core::set_eval_callback(&ctx, eval_value_vm);
 crates/sema-eval/src/eval.rs:192:        sema_core::set_call_callback(&ctx, call_value);
 crates/sema-eval/src/eval.rs:193:        sema_core::set_call_owned_callback(&ctx, call_value_owned);
-crates/sema-eval/src/eval.rs:2552:        match rx.recv_timeout(std::time::Duration::from_secs(30)) {
-crates/sema-eval/src/eval.rs:2822:    fn runtime_channel_blocking_recv_parks_until_sent() {
-crates/sema-eval/src/eval.rs:362:                // A task is parked on a legacy `AwaitIo(IoHandle)`: its offloaded
-crates/sema-eval/src/eval.rs:415:                        std::thread::sleep(deadline - now);
+crates/sema-eval/src/eval.rs:2569:        match rx.recv_timeout(std::time::Duration::from_secs(30)) {
+crates/sema-eval/src/eval.rs:2839:    fn runtime_channel_blocking_recv_parks_until_sent() {
+crates/sema-eval/src/eval.rs:379:                // A task is parked on a legacy `AwaitIo(IoHandle)`: its offloaded
+crates/sema-eval/src/eval.rs:432:                        std::thread::sleep(deadline - now);
 crates/sema-eval/src/eval.rs:62:    /// context would route the VM's `call_callback` through unregistered
 crates/sema-eval/src/prelude.rs:500:;; builtins.rs) that branches internally on `in_async_context()`: synchronous
 crates/sema-eval/src/prelude.rs:750:;; the byte-identical blocking native runs (real `thread::sleep`, no
@@ -257,49 +257,48 @@ crates/sema-lsp/src/handlers/command.rs:209:        handle.block_on(async {
 crates/sema-lsp/src/server.rs:749:            rx.blocking_recv()
 crates/sema-lsp/src/server.rs:840:                    handle.block_on(async {
 crates/sema-lsp/src/server.rs:850:                    handle.block_on(async {
-crates/sema-mcp/src/builtins.rs:1115:) -> Result<Rc<sema_core::IoHandle>, SemaError> {
-crates/sema-mcp/src/builtins.rs:1137:    let poll = move || -> sema_core::IoPoll {
-crates/sema-mcp/src/builtins.rs:1141:                    Err(e) => return sema_core::IoPoll::Ready(Err(e.to_string())),
-crates/sema-mcp/src/builtins.rs:1148:                    Ok(None) => return sema_core::IoPoll::Pending,
-crates/sema-mcp/src/builtins.rs:1161:                        Err(oneshot::error::TryRecvError::Empty) => sema_core::IoPoll::Pending,
-crates/sema-mcp/src/builtins.rs:1167:                            sema_core::IoPoll::Ready(Err(
-crates/sema-mcp/src/builtins.rs:1174:                            sema_core::IoPoll::Ready(finish_fn(&poll_entry, conn, result))
-crates/sema-mcp/src/builtins.rs:1182:    Ok(Rc::new(sema_core::IoHandle::with_abort(poll, move || {
-crates/sema-mcp/src/builtins.rs:1244:    // on the VM thread. Checked before the legacy `in_async_context` path.
-crates/sema-mcp/src/builtins.rs:1259:    if sema_core::in_async_context() {
-crates/sema-mcp/src/builtins.rs:1271:    let result = block_on(call_tool_async(
-crates/sema-mcp/src/builtins.rs:1306:            let out = sema_io::io_block_on(call_tool_async(
-crates/sema-mcp/src/builtins.rs:1329:    sema_core::set_yield_signal(sema_core::YieldReason::AwaitIo(handle));
-crates/sema-mcp/src/builtins.rs:1615:                    let result = sema_io::io_block_on(call_tool_async(
-crates/sema-mcp/src/builtins.rs:1644:                    std::thread::sleep(std::time::Duration::from_millis(MCP_QUEUE_POLL_MS));
-crates/sema-mcp/src/builtins.rs:1836:    if sema_core::in_async_context() {
-crates/sema-mcp/src/builtins.rs:1840:    let result = block_on(list_tools_async(&mut conn));
-crates/sema-mcp/src/builtins.rs:1855:            let out = sema_io::io_block_on(list_tools_async(&mut conn));
-crates/sema-mcp/src/builtins.rs:1871:    sema_core::set_yield_signal(sema_core::YieldReason::AwaitIo(handle));
-crates/sema-mcp/src/builtins.rs:1895:        let _ = block_on(close_async(&mut conn));
-crates/sema-mcp/src/builtins.rs:1913:            let out = sema_io::io_block_on(close_async(&mut conn));
-crates/sema-mcp/src/builtins.rs:1936:    sema_core::set_yield_signal(sema_core::YieldReason::AwaitIo(handle_io));
-crates/sema-mcp/src/builtins.rs:1956:        if sema_core::in_async_context() {
-crates/sema-mcp/src/builtins.rs:1998:        if sema_core::in_async_context() {
-crates/sema-mcp/src/builtins.rs:2009:        let result = block_on(close_async(&mut conn));
+crates/sema-mcp/src/builtins.rs:1125:) -> Result<Rc<sema_core::IoHandle>, SemaError> {
+crates/sema-mcp/src/builtins.rs:1147:    let poll = move || -> sema_core::IoPoll {
+crates/sema-mcp/src/builtins.rs:1151:                    Err(e) => return sema_core::IoPoll::Ready(Err(e.to_string())),
+crates/sema-mcp/src/builtins.rs:1158:                    Ok(None) => return sema_core::IoPoll::Pending,
+crates/sema-mcp/src/builtins.rs:1171:                        Err(oneshot::error::TryRecvError::Empty) => sema_core::IoPoll::Pending,
+crates/sema-mcp/src/builtins.rs:1177:                            sema_core::IoPoll::Ready(Err(
+crates/sema-mcp/src/builtins.rs:1184:                            sema_core::IoPoll::Ready(finish_fn(&poll_entry, conn, result))
+crates/sema-mcp/src/builtins.rs:1192:    Ok(Rc::new(sema_core::IoHandle::with_abort(poll, move || {
+crates/sema-mcp/src/builtins.rs:1254:    // on the VM thread. Checked before the legacy `in_async_context` path.
+crates/sema-mcp/src/builtins.rs:1269:    if sema_core::in_async_context() {
+crates/sema-mcp/src/builtins.rs:1281:    let result = block_on(call_tool_async(
+crates/sema-mcp/src/builtins.rs:1316:            let out = sema_io::io_block_on(call_tool_async(
+crates/sema-mcp/src/builtins.rs:1339:    sema_core::set_yield_signal(sema_core::YieldReason::AwaitIo(handle));
+crates/sema-mcp/src/builtins.rs:1573:                                let result = sema_io::io_block_on(call_tool_async(
+crates/sema-mcp/src/builtins.rs:1899:    if sema_core::in_async_context() {
+crates/sema-mcp/src/builtins.rs:1903:    let result = block_on(list_tools_async(&mut conn));
+crates/sema-mcp/src/builtins.rs:1918:            let out = sema_io::io_block_on(list_tools_async(&mut conn));
+crates/sema-mcp/src/builtins.rs:1934:    sema_core::set_yield_signal(sema_core::YieldReason::AwaitIo(handle));
+crates/sema-mcp/src/builtins.rs:1958:        let _ = block_on(close_async(&mut conn));
+crates/sema-mcp/src/builtins.rs:1976:            let out = sema_io::io_block_on(close_async(&mut conn));
+crates/sema-mcp/src/builtins.rs:1999:    sema_core::set_yield_signal(sema_core::YieldReason::AwaitIo(handle_io));
+crates/sema-mcp/src/builtins.rs:2019:        if sema_core::in_async_context() {
+crates/sema-mcp/src/builtins.rs:2061:        if sema_core::in_async_context() {
+crates/sema-mcp/src/builtins.rs:2072:        let result = block_on(close_async(&mut conn));
 crates/sema-mcp/src/builtins.rs:20://! Inside an `async/spawn`'d task (`sema_core::in_async_context()`), all four
 crates/sema-mcp/src/builtins.rs:26://! see [`block_on`].
-crates/sema-mcp/src/builtins.rs:304:/// non-async-context) path. Routes through `sema_io::io_block_on`, the ADR
-crates/sema-mcp/src/builtins.rs:309:/// offered both: "keep TOKIO_RT/block_on... or route through the sanctioned
-crates/sema-mcp/src/builtins.rs:322:/// behavior is unchanged: `io_block_on` blocks the calling thread until the
-crates/sema-mcp/src/builtins.rs:324:fn block_on<F: Future>(future: F) -> F::Output {
-crates/sema-mcp/src/builtins.rs:325:    sema_io::io_block_on(future)
-crates/sema-mcp/src/builtins.rs:329:/// used to hand a poller `finish` step's failure to `IoPoll::Ready(Err(_))`
-crates/sema-mcp/src/builtins.rs:415:/// access — legal to drive via the sync `block_on` or `sema_io::io_block_on`.
-crates/sema-mcp/src/builtins.rs:742:/// via the blocking [`block_on`]) — shared by `mcp/connect`'s synchronous
-crates/sema-mcp/src/builtins.rs:751:    let (client, identity) = block_on(connect_dispatch_async(
-crates/sema-mcp/src/builtins.rs:774:        let outcome = sema_io::io_block_on(connect_dispatch_async(
-crates/sema-mcp/src/builtins.rs:784:    let handle = Rc::new(sema_core::IoHandle::new(move || match rx.try_recv() {
-crates/sema-mcp/src/builtins.rs:785:        Err(oneshot::error::TryRecvError::Empty) => sema_core::IoPoll::Pending,
-crates/sema-mcp/src/builtins.rs:786:        Ok(Ok((client, identity))) => sema_core::IoPoll::Ready(Ok(register_connection(
-crates/sema-mcp/src/builtins.rs:791:        Ok(Err(msg)) => sema_core::IoPoll::Ready(Err(msg)),
-crates/sema-mcp/src/builtins.rs:792:        Err(oneshot::error::TryRecvError::Closed) => sema_core::IoPoll::Ready(Err(
-crates/sema-mcp/src/builtins.rs:796:    sema_core::set_yield_signal(sema_core::YieldReason::AwaitIo(handle));
+crates/sema-mcp/src/builtins.rs:313:/// non-async-context) path. Routes through `sema_io::io_block_on`, the ADR
+crates/sema-mcp/src/builtins.rs:318:/// offered both: "keep TOKIO_RT/block_on... or route through the sanctioned
+crates/sema-mcp/src/builtins.rs:331:/// behavior is unchanged: `io_block_on` blocks the calling thread until the
+crates/sema-mcp/src/builtins.rs:333:fn block_on<F: Future>(future: F) -> F::Output {
+crates/sema-mcp/src/builtins.rs:334:    sema_io::io_block_on(future)
+crates/sema-mcp/src/builtins.rs:338:/// used to hand a poller `finish` step's failure to `IoPoll::Ready(Err(_))`
+crates/sema-mcp/src/builtins.rs:425:/// access — legal to drive via the sync `block_on` or `sema_io::io_block_on`.
+crates/sema-mcp/src/builtins.rs:752:/// via the blocking [`block_on`]) — shared by `mcp/connect`'s synchronous
+crates/sema-mcp/src/builtins.rs:761:    let (client, identity) = block_on(connect_dispatch_async(
+crates/sema-mcp/src/builtins.rs:784:        let outcome = sema_io::io_block_on(connect_dispatch_async(
+crates/sema-mcp/src/builtins.rs:794:    let handle = Rc::new(sema_core::IoHandle::new(move || match rx.try_recv() {
+crates/sema-mcp/src/builtins.rs:795:        Err(oneshot::error::TryRecvError::Empty) => sema_core::IoPoll::Pending,
+crates/sema-mcp/src/builtins.rs:796:        Ok(Ok((client, identity))) => sema_core::IoPoll::Ready(Ok(register_connection(
+crates/sema-mcp/src/builtins.rs:801:        Ok(Err(msg)) => sema_core::IoPoll::Ready(Err(msg)),
+crates/sema-mcp/src/builtins.rs:802:        Err(oneshot::error::TryRecvError::Closed) => sema_core::IoPoll::Ready(Err(
+crates/sema-mcp/src/builtins.rs:806:    sema_core::set_yield_signal(sema_core::YieldReason::AwaitIo(handle));
 crates/sema-mcp/src/client_auth.rs:35:        rt.block_on(async {
 crates/sema-mcp/src/client_auth.rs:88:/// `block_on` already active on the same thread.
 crates/sema-mcp/src/client_auth.rs:95:    rt.block_on(async {
@@ -336,11 +335,12 @@ crates/sema-stdlib/src/async_ops.rs:9:    check_arity, in_async_context, in_runt
 crates/sema-stdlib/src/context.rs:100:        let result = sema_core::call_callback(ctx, thunk, &[]);
 crates/sema-stdlib/src/diff.rs:14://! `async/spawn` (`in_async_context()`) — offloaded through `fs_offload`
 crates/sema-stdlib/src/diff.rs:481:        if sema_core::in_async_context() || sema_core::in_runtime_quantum() {
-crates/sema-stdlib/src/event.rs:110:        // thread rather than `std::thread::sleep`-blocking it between scans, so
-crates/sema-stdlib/src/event.rs:114:        if in_async_context() {
-crates/sema-stdlib/src/event.rs:115:            if let Some(v) = take_resume_value() {
-crates/sema-stdlib/src/event.rs:132:            std::thread::sleep(Duration::from_millis(5));
 crates/sema-stdlib/src/event.rs:18:use sema_core::{check_arity, in_async_context, take_resume_value, SemaError, Value};
+crates/sema-stdlib/src/event.rs:39:/// cooperative-scheduler `in_async_context()` `AwaitIo` poll. The unified-runtime
+crates/sema-stdlib/src/event.rs:46:    // thread rather than `std::thread::sleep`-blocking it between scans, so
+crates/sema-stdlib/src/event.rs:50:    if in_async_context() {
+crates/sema-stdlib/src/event.rs:51:        if let Some(v) = take_resume_value() {
+crates/sema-stdlib/src/event.rs:68:        std::thread::sleep(Duration::from_millis(5));
 crates/sema-stdlib/src/fs_watch.rs:91:            let _ = stop_rx.recv(); // park until the registry entry is dropped
 crates/sema-stdlib/src/git.rs:187:/// into the poller's `IoPoll` on the VM thread — same division of labor as
 crates/sema-stdlib/src/git.rs:200:    finish: impl Fn(Result<RawGitOutput, String>) -> sema_core::IoPoll + 'static,
@@ -416,58 +416,62 @@ crates/sema-stdlib/src/io.rs:1597:        Some(Err(e)) => sema_core::IoPoll::Rea
 crates/sema-stdlib/src/io.rs:1598:        None if started.elapsed() >= timeout => sema_core::IoPoll::Ready(Ok(Value::nil())),
 crates/sema-stdlib/src/io.rs:1599:        None => sema_core::IoPoll::Pending,
 crates/sema-stdlib/src/io.rs:1601:    sema_core::set_yield_signal(sema_core::YieldReason::AwaitIo(handle));
-crates/sema-stdlib/src/io.rs:1680:        if sema_core::in_async_context() {
-crates/sema-stdlib/src/io.rs:1723:            if sema_core::in_async_context() {
-crates/sema-stdlib/src/io.rs:1762:            if sema_core::in_async_context() {
-crates/sema-stdlib/src/io.rs:1806:            if sema_core::in_async_context() {
-crates/sema-stdlib/src/io.rs:1846:            if sema_core::in_async_context() {
-crates/sema-stdlib/src/io.rs:1938:        if sema_core::in_async_context() {
-crates/sema-stdlib/src/io.rs:1955:        if sema_core::in_async_context() {
-crates/sema-stdlib/src/io.rs:1984:            if sema_core::in_async_context() {
-crates/sema-stdlib/src/io.rs:2039:        if sema_core::in_async_context() {
-crates/sema-stdlib/src/io.rs:2055:        if sema_core::in_async_context() {
-crates/sema-stdlib/src/io.rs:2081:            if sema_core::in_async_context() {
-crates/sema-stdlib/src/io.rs:2097:        if sema_core::in_async_context() {
-crates/sema-stdlib/src/io.rs:2118:            if sema_core::in_async_context() {
-crates/sema-stdlib/src/io.rs:2162:        if sema_core::in_async_context() {
-crates/sema-stdlib/src/io.rs:2192:        if sema_core::in_async_context() {
-crates/sema-stdlib/src/io.rs:2230:        if sema_core::in_async_context() {
-crates/sema-stdlib/src/io.rs:2293:            if sema_core::in_async_context() {
-crates/sema-stdlib/src/io.rs:2373:                if sema_core::in_async_context() {
-crates/sema-stdlib/src/io.rs:2403:            if sema_core::in_async_context() {
-crates/sema-stdlib/src/io.rs:2452:                    sema_core::call_callback(ctx, &func, &[Value::string(&line_buf)])?;
-crates/sema-stdlib/src/io.rs:2472:            if sema_core::in_async_context() {
-crates/sema-stdlib/src/io.rs:2529:                    acc = sema_core::call_callback_owned(ctx, &func, &mut cb_args)?;
-crates/sema-stdlib/src/io.rs:2549:            if sema_core::in_async_context() {
-crates/sema-stdlib/src/io.rs:2613:                    acc = sema_core::call_callback_owned(ctx, &func, &mut cb_args)?;
-crates/sema-stdlib/src/io.rs:2644:            if sema_core::in_async_context() {
-crates/sema-stdlib/src/io.rs:2668:        if sema_core::in_async_context() {
-crates/sema-stdlib/src/io.rs:2815:            if sema_core::in_async_context() {
-crates/sema-stdlib/src/io.rs:2816:                if let Some(v) = sema_core::take_resume_value() {
-crates/sema-stdlib/src/io.rs:2859:            if sema_core::in_async_context() {
-crates/sema-stdlib/src/io.rs:2860:                if let Some(v) = sema_core::take_resume_value() {
-crates/sema-stdlib/src/io.rs:2940:        if sema_core::in_async_context() {
-crates/sema-stdlib/src/io.rs:3147:/// `sema_core::in_async_context()` on, call the native, then poll the
-crates/sema-stdlib/src/io.rs:3157:    /// Forces `in_async_context()` on for the guard's lifetime, resetting it
-crates/sema-stdlib/src/io.rs:3172:    /// `sema_core::call_callback` on the VM thread — has something to call
-crates/sema-stdlib/src/io.rs:3230:        let reason = sema_core::take_yield_signal()
-crates/sema-stdlib/src/io.rs:3233:            sema_core::YieldReason::AwaitIo(h) => h,
-crates/sema-stdlib/src/io.rs:3239:                sema_core::IoPoll::Ready(Ok(v)) => return v,
-crates/sema-stdlib/src/io.rs:3240:                sema_core::IoPoll::Ready(Err(e)) => panic!("offload rejected: {e}"),
-crates/sema-stdlib/src/io.rs:3241:                sema_core::IoPoll::Pending => {
-crates/sema-stdlib/src/io.rs:3246:                    std::thread::sleep(Duration::from_millis(2));
-crates/sema-stdlib/src/io.rs:3445:        let reason = sema_core::take_yield_signal().expect("yield armed");
-crates/sema-stdlib/src/io.rs:3447:            sema_core::YieldReason::AwaitIo(h) => h,
-crates/sema-stdlib/src/io.rs:3453:                sema_core::IoPoll::Ready(Err(msg)) => {
-crates/sema-stdlib/src/io.rs:3457:                sema_core::IoPoll::Ready(Ok(v)) => panic!("expected a rejection, got {v:?}"),
-crates/sema-stdlib/src/io.rs:3458:                sema_core::IoPoll::Pending => {
-crates/sema-stdlib/src/io.rs:3460:                    std::thread::sleep(Duration::from_millis(2));
-crates/sema-stdlib/src/io.rs:3475:    fn io_read_key_arms_await_io_instead_of_blocking_in_async_context() {
-crates/sema-stdlib/src/io.rs:3482:        let reason = sema_core::take_yield_signal().expect("expected an AwaitIo yield to be armed");
-crates/sema-stdlib/src/io.rs:3483:        assert!(matches!(reason, sema_core::YieldReason::AwaitIo(_)));
-crates/sema-stdlib/src/io.rs:3538:        sema_core::set_call_callback(&cb_ctx, invoke_native_value);
-crates/sema-stdlib/src/io.rs:3574:        sema_core::set_call_callback(&cb_ctx, invoke_native_value);
-crates/sema-stdlib/src/io.rs:3603:        sema_core::set_call_callback(&cb_ctx, invoke_native_value);
+crates/sema-stdlib/src/io.rs:1611:// untraced `IoHandle`, the runtime path re-checks the source on the VM thread and
+crates/sema-stdlib/src/io.rs:1630:/// `IoHandle`.
+crates/sema-stdlib/src/io.rs:1677:            std::thread::sleep(Duration::from_millis(RUNTIME_POLL_INTERVAL_MS));
+crates/sema-stdlib/src/io.rs:1790:/// plus the legacy cooperative-scheduler `in_async_context()` `AwaitIo` poll. The
+crates/sema-stdlib/src/io.rs:1803:    if sema_core::in_async_context() {
+crates/sema-stdlib/src/io.rs:1804:        if let Some(v) = sema_core::take_resume_value() {
+crates/sema-stdlib/src/io.rs:1942:        if sema_core::in_async_context() {
+crates/sema-stdlib/src/io.rs:1985:            if sema_core::in_async_context() {
+crates/sema-stdlib/src/io.rs:2024:            if sema_core::in_async_context() {
+crates/sema-stdlib/src/io.rs:2068:            if sema_core::in_async_context() {
+crates/sema-stdlib/src/io.rs:2108:            if sema_core::in_async_context() {
+crates/sema-stdlib/src/io.rs:2200:        if sema_core::in_async_context() {
+crates/sema-stdlib/src/io.rs:2217:        if sema_core::in_async_context() {
+crates/sema-stdlib/src/io.rs:2246:            if sema_core::in_async_context() {
+crates/sema-stdlib/src/io.rs:2301:        if sema_core::in_async_context() {
+crates/sema-stdlib/src/io.rs:2317:        if sema_core::in_async_context() {
+crates/sema-stdlib/src/io.rs:2343:            if sema_core::in_async_context() {
+crates/sema-stdlib/src/io.rs:2359:        if sema_core::in_async_context() {
+crates/sema-stdlib/src/io.rs:2380:            if sema_core::in_async_context() {
+crates/sema-stdlib/src/io.rs:2424:        if sema_core::in_async_context() {
+crates/sema-stdlib/src/io.rs:2454:        if sema_core::in_async_context() {
+crates/sema-stdlib/src/io.rs:2492:        if sema_core::in_async_context() {
+crates/sema-stdlib/src/io.rs:2555:            if sema_core::in_async_context() {
+crates/sema-stdlib/src/io.rs:2635:                if sema_core::in_async_context() {
+crates/sema-stdlib/src/io.rs:2665:            if sema_core::in_async_context() {
+crates/sema-stdlib/src/io.rs:2714:                    sema_core::call_callback(ctx, &func, &[Value::string(&line_buf)])?;
+crates/sema-stdlib/src/io.rs:2734:            if sema_core::in_async_context() {
+crates/sema-stdlib/src/io.rs:2791:                    acc = sema_core::call_callback_owned(ctx, &func, &mut cb_args)?;
+crates/sema-stdlib/src/io.rs:2811:            if sema_core::in_async_context() {
+crates/sema-stdlib/src/io.rs:2875:                    acc = sema_core::call_callback_owned(ctx, &func, &mut cb_args)?;
+crates/sema-stdlib/src/io.rs:2906:            if sema_core::in_async_context() {
+crates/sema-stdlib/src/io.rs:2930:        if sema_core::in_async_context() {
+crates/sema-stdlib/src/io.rs:3077:            if sema_core::in_async_context() {
+crates/sema-stdlib/src/io.rs:3078:                if let Some(v) = sema_core::take_resume_value() {
+crates/sema-stdlib/src/io.rs:3159:        if sema_core::in_async_context() {
+crates/sema-stdlib/src/io.rs:3366:/// `sema_core::in_async_context()` on, call the native, then poll the
+crates/sema-stdlib/src/io.rs:3376:    /// Forces `in_async_context()` on for the guard's lifetime, resetting it
+crates/sema-stdlib/src/io.rs:3391:    /// `sema_core::call_callback` on the VM thread — has something to call
+crates/sema-stdlib/src/io.rs:3449:        let reason = sema_core::take_yield_signal()
+crates/sema-stdlib/src/io.rs:3452:            sema_core::YieldReason::AwaitIo(h) => h,
+crates/sema-stdlib/src/io.rs:3458:                sema_core::IoPoll::Ready(Ok(v)) => return v,
+crates/sema-stdlib/src/io.rs:3459:                sema_core::IoPoll::Ready(Err(e)) => panic!("offload rejected: {e}"),
+crates/sema-stdlib/src/io.rs:3460:                sema_core::IoPoll::Pending => {
+crates/sema-stdlib/src/io.rs:3465:                    std::thread::sleep(Duration::from_millis(2));
+crates/sema-stdlib/src/io.rs:3664:        let reason = sema_core::take_yield_signal().expect("yield armed");
+crates/sema-stdlib/src/io.rs:3666:            sema_core::YieldReason::AwaitIo(h) => h,
+crates/sema-stdlib/src/io.rs:3672:                sema_core::IoPoll::Ready(Err(msg)) => {
+crates/sema-stdlib/src/io.rs:3676:                sema_core::IoPoll::Ready(Ok(v)) => panic!("expected a rejection, got {v:?}"),
+crates/sema-stdlib/src/io.rs:3677:                sema_core::IoPoll::Pending => {
+crates/sema-stdlib/src/io.rs:3679:                    std::thread::sleep(Duration::from_millis(2));
+crates/sema-stdlib/src/io.rs:3694:    fn io_read_key_arms_await_io_instead_of_blocking_in_async_context() {
+crates/sema-stdlib/src/io.rs:3701:        let reason = sema_core::take_yield_signal().expect("expected an AwaitIo yield to be armed");
+crates/sema-stdlib/src/io.rs:3702:        assert!(matches!(reason, sema_core::YieldReason::AwaitIo(_)));
+crates/sema-stdlib/src/io.rs:3757:        sema_core::set_call_callback(&cb_ctx, invoke_native_value);
+crates/sema-stdlib/src/io.rs:3793:        sema_core::set_call_callback(&cb_ctx, invoke_native_value);
+crates/sema-stdlib/src/io.rs:3822:        sema_core::set_call_callback(&cb_ctx, invoke_native_value);
 crates/sema-stdlib/src/list.rs:1886:        sema_core::with_stdlib_ctx(|ctx| sema_core::call_callback(ctx, func, args))
 crates/sema-stdlib/src/list.rs:1897:    let result = sema_core::with_stdlib_ctx(|ctx| sema_core::call_callback_owned(ctx, func, args));
 crates/sema-stdlib/src/list.rs:1904:    if (sema_core::in_async_context() || sema_core::in_runtime_quantum())
@@ -480,96 +484,6 @@ crates/sema-stdlib/src/pdf.rs:15:use sema_core::{check_arity, in_async_context, 
 crates/sema-stdlib/src/pdf.rs:183:            if in_async_context() || sema_core::in_runtime_quantum() {
 crates/sema-stdlib/src/pdf.rs:201:        if in_async_context() || sema_core::in_runtime_quantum() {
 crates/sema-stdlib/src/pdf.rs:7://! `async/spawn` (`in_async_context()`) — offloads it through `fs_offload`
-crates/sema-stdlib/src/proc.rs:1035:        let reason = sema_core::take_yield_signal().expect("yield armed");
-crates/sema-stdlib/src/proc.rs:1037:            sema_core::YieldReason::AwaitIo(h) => h,
-crates/sema-stdlib/src/proc.rs:1043:                sema_core::IoPoll::Ready(Err(e)) => break e,
-crates/sema-stdlib/src/proc.rs:1044:                sema_core::IoPoll::Ready(Ok(v)) => panic!("expected an error, got {v:?}"),
-crates/sema-stdlib/src/proc.rs:1045:                sema_core::IoPoll::Pending => {
-crates/sema-stdlib/src/proc.rs:1047:                    std::thread::sleep(Duration::from_millis(2));
-crates/sema-stdlib/src/proc.rs:20://! `proc/wait` on a handle that's already checked out queues: its `IoHandle`
-crates/sema-stdlib/src/proc.rs:23://! under the one `IoHandle` the yield armed. At top level (no scheduler) the
-crates/sema-stdlib/src/proc.rs:256:/// based offload in this codebase accepts — see `IoHandle::with_abort`'s doc
-crates/sema-stdlib/src/proc.rs:282:/// The two phases a `proc/wait` `IoHandle` cycles through. A caller that finds
-crates/sema-stdlib/src/proc.rs:298:fn poll_wait(id: i64, phase: &mut WaitPhase) -> IoPoll {
-crates/sema-stdlib/src/proc.rs:327:                    Acquired::Not => return IoPoll::Pending,
-crates/sema-stdlib/src/proc.rs:328:                    Acquired::Err(msg) => return IoPoll::Ready(Err(msg)),
-crates/sema-stdlib/src/proc.rs:338:                    Err(TryRecvError::Empty) => IoPoll::Pending,
-crates/sema-stdlib/src/proc.rs:348:                            Ok(code) => IoPoll::Ready(Ok(Value::int(code as i64))),
-crates/sema-stdlib/src/proc.rs:349:                            Err(msg) => IoPoll::Ready(Err(SemaError::Io(msg).to_string())),
-crates/sema-stdlib/src/proc.rs:361:                        IoPoll::Ready(Err("proc/wait: subprocess wait worker dropped".to_string()))
-crates/sema-stdlib/src/proc.rs:376:    if let Some(v) = sema_core::take_resume_value() {
-crates/sema-stdlib/src/proc.rs:382:    let handle = Rc::new(IoHandle::with_abort(
-crates/sema-stdlib/src/proc.rs:404:    sema_core::set_yield_signal(sema_core::YieldReason::AwaitIo(handle));
-crates/sema-stdlib/src/proc.rs:442:/// The two phases a `proc/write-stdin` `IoHandle` cycles through — same
-crates/sema-stdlib/src/proc.rs:453:fn poll_write_stdin(id: i64, phase: &mut WriteStdinPhase) -> IoPoll {
-crates/sema-stdlib/src/proc.rs:46:use sema_core::{check_arity, in_async_context, Caps, IoHandle, IoPoll, SemaError, Value};
-crates/sema-stdlib/src/proc.rs:482:                    Acquired::Not => return IoPoll::Pending,
-crates/sema-stdlib/src/proc.rs:483:                    Acquired::Err(msg) => return IoPoll::Ready(Err(msg)),
-crates/sema-stdlib/src/proc.rs:497:                    Err(TryRecvError::Empty) => IoPoll::Pending,
-crates/sema-stdlib/src/proc.rs:507:                            Ok(()) => IoPoll::Ready(Ok(Value::nil())),
-crates/sema-stdlib/src/proc.rs:508:                            Err(msg) => IoPoll::Ready(Err(SemaError::Io(msg).to_string())),
-crates/sema-stdlib/src/proc.rs:520:                        IoPoll::Ready(Err(
-crates/sema-stdlib/src/proc.rs:534:    if let Some(v) = sema_core::take_resume_value() {
-crates/sema-stdlib/src/proc.rs:540:    let handle = Rc::new(IoHandle::with_abort(
-crates/sema-stdlib/src/proc.rs:563:    sema_core::set_yield_signal(sema_core::YieldReason::AwaitIo(handle));
-crates/sema-stdlib/src/proc.rs:576:fn poll_close(id: i64, phase: &mut ClosePhase) -> IoPoll {
-crates/sema-stdlib/src/proc.rs:579:        Err(TryRecvError::Empty) => IoPoll::Pending,
-crates/sema-stdlib/src/proc.rs:589:            IoPoll::Ready(Ok(Value::nil()))
-crates/sema-stdlib/src/proc.rs:598:            IoPoll::Ready(Err("proc/close: subprocess wait worker dropped".to_string()))
-crates/sema-stdlib/src/proc.rs:611:    if let Some(v) = sema_core::take_resume_value() {
-crates/sema-stdlib/src/proc.rs:644:    let handle = Rc::new(IoHandle::with_abort(
-crates/sema-stdlib/src/proc.rs:665:    sema_core::set_yield_signal(sema_core::YieldReason::AwaitIo(handle));
-crates/sema-stdlib/src/proc.rs:694:        if in_async_context() || sema_core::in_runtime_quantum() {
-crates/sema-stdlib/src/proc.rs:732:        if in_async_context() || sema_core::in_runtime_quantum() {
-crates/sema-stdlib/src/proc.rs:812:        if in_async_context() || sema_core::in_runtime_quantum() {
-crates/sema-stdlib/src/proc.rs:919:/// `sema_core::in_async_context()` on, call the native, then poll the
-crates/sema-stdlib/src/proc.rs:929:    /// Forces `in_async_context()` on for the guard's lifetime, resetting it
-crates/sema-stdlib/src/proc.rs:968:        let reason = sema_core::take_yield_signal()
-crates/sema-stdlib/src/proc.rs:971:            sema_core::YieldReason::AwaitIo(h) => h,
-crates/sema-stdlib/src/proc.rs:977:                sema_core::IoPoll::Ready(Ok(v)) => return v,
-crates/sema-stdlib/src/proc.rs:978:                sema_core::IoPoll::Ready(Err(e)) => panic!("offload rejected: {e}"),
-crates/sema-stdlib/src/proc.rs:979:                sema_core::IoPoll::Pending => {
-crates/sema-stdlib/src/proc.rs:984:                    std::thread::sleep(Duration::from_millis(2));
-crates/sema-stdlib/src/pty.rs:242:/// The two phases a `pty/wait` `IoHandle` cycles through — mirrors `proc.rs`'s
-crates/sema-stdlib/src/pty.rs:249:fn poll_wait(id: i64, phase: &mut WaitPhase) -> IoPoll {
-crates/sema-stdlib/src/pty.rs:278:                    Acquired::Not => return IoPoll::Pending,
-crates/sema-stdlib/src/pty.rs:279:                    Acquired::Err(msg) => return IoPoll::Ready(Err(msg)),
-crates/sema-stdlib/src/pty.rs:287:                    Err(TryRecvError::Empty) => IoPoll::Pending,
-crates/sema-stdlib/src/pty.rs:292:                            Ok(code) => IoPoll::Ready(Ok(Value::int(code as i64))),
-crates/sema-stdlib/src/pty.rs:293:                            Err(msg) => IoPoll::Ready(Err(SemaError::Io(msg).to_string())),
-crates/sema-stdlib/src/pty.rs:305:                        IoPoll::Ready(Err("pty/wait: subprocess wait worker dropped".to_string()))
-crates/sema-stdlib/src/pty.rs:316:    if let Some(v) = sema_core::take_resume_value() {
-crates/sema-stdlib/src/pty.rs:31:use sema_core::{check_arity, in_async_context, Caps, IoHandle, IoPoll, SemaError, Value};
-crates/sema-stdlib/src/pty.rs:322:    let handle = Rc::new(IoHandle::with_abort(
-crates/sema-stdlib/src/pty.rs:341:    sema_core::set_yield_signal(sema_core::YieldReason::AwaitIo(handle));
-crates/sema-stdlib/src/pty.rs:375:/// The two phases a `pty/write` `IoHandle` cycles through — same
-crates/sema-stdlib/src/pty.rs:386:fn poll_write(id: i64, phase: &mut WritePhase) -> IoPoll {
-crates/sema-stdlib/src/pty.rs:415:                    Acquired::Not => return IoPoll::Pending,
-crates/sema-stdlib/src/pty.rs:416:                    Acquired::Err(msg) => return IoPoll::Ready(Err(msg)),
-crates/sema-stdlib/src/pty.rs:430:                    Err(TryRecvError::Empty) => IoPoll::Pending,
-crates/sema-stdlib/src/pty.rs:439:                            Ok(()) => IoPoll::Ready(Ok(Value::nil())),
-crates/sema-stdlib/src/pty.rs:440:                            Err(msg) => IoPoll::Ready(Err(SemaError::Io(msg).to_string())),
-crates/sema-stdlib/src/pty.rs:452:                        IoPoll::Ready(Err("pty/write: write worker dropped".to_string()))
-crates/sema-stdlib/src/pty.rs:465:    if let Some(v) = sema_core::take_resume_value() {
-crates/sema-stdlib/src/pty.rs:471:    let handle = Rc::new(IoHandle::with_abort(
-crates/sema-stdlib/src/pty.rs:494:    sema_core::set_yield_signal(sema_core::YieldReason::AwaitIo(handle));
-crates/sema-stdlib/src/pty.rs:508:fn poll_close(id: i64, phase: &mut ClosePhase) -> IoPoll {
-crates/sema-stdlib/src/pty.rs:511:        Err(TryRecvError::Empty) => IoPoll::Pending,
-crates/sema-stdlib/src/pty.rs:521:            IoPoll::Ready(Ok(Value::nil()))
-crates/sema-stdlib/src/pty.rs:530:            IoPoll::Ready(Err("pty/close: wait worker dropped".to_string()))
-crates/sema-stdlib/src/pty.rs:543:    if let Some(v) = sema_core::take_resume_value() {
-crates/sema-stdlib/src/pty.rs:576:    let handle = Rc::new(IoHandle::with_abort(
-crates/sema-stdlib/src/pty.rs:597:    sema_core::set_yield_signal(sema_core::YieldReason::AwaitIo(handle));
-crates/sema-stdlib/src/pty.rs:621:        if in_async_context() || sema_core::in_runtime_quantum() {
-crates/sema-stdlib/src/pty.rs:663:        if in_async_context() || sema_core::in_runtime_quantum() {
-crates/sema-stdlib/src/pty.rs:730:        if in_async_context() || sema_core::in_runtime_quantum() {
-crates/sema-stdlib/src/pty.rs:839:    /// Forces `in_async_context()` on for the guard's lifetime, resetting it
-crates/sema-stdlib/src/pty.rs:878:        let reason = sema_core::take_yield_signal()
-crates/sema-stdlib/src/pty.rs:881:            sema_core::YieldReason::AwaitIo(h) => h,
-crates/sema-stdlib/src/pty.rs:887:                sema_core::IoPoll::Ready(Ok(v)) => return v,
-crates/sema-stdlib/src/pty.rs:888:                sema_core::IoPoll::Ready(Err(e)) => panic!("offload rejected: {e}"),
-crates/sema-stdlib/src/pty.rs:889:                sema_core::IoPoll::Pending => {
-crates/sema-stdlib/src/pty.rs:894:                    std::thread::sleep(Duration::from_millis(2));
 crates/sema-stdlib/src/runtime_offload.rs:140:/// a `kill_on_drop` child) — the retired `IoHandle::with_abort` teardown. Lives on
 crates/sema-stdlib/src/runtime_offload.rs:199:            // On a plain executor worker thread `io_block_on` is legal and enters
 crates/sema-stdlib/src/runtime_offload.rs:204:            let out: Result<T, String> = sema_io::io_block_on(async move {
@@ -580,7 +494,7 @@ crates/sema-stdlib/src/runtime_offload.rs:28://! [`PreparedExternalOperation::in
 crates/sema-stdlib/src/runtime_offload.rs:29://! preserve the retired `IoHandle::with_abort` teardown by racing the work
 crates/sema-stdlib/src/runtime_offload.rs:314:/// running its future via [`sema_io::io_block_on`] and mapping the domain
 crates/sema-stdlib/src/runtime_offload.rs:322:/// async reactor (a synchronous library call under `io_block_on`) pick this;
-crates/sema-stdlib/src/runtime_offload.rs:427://     and cannot be reclaimed — best-effort, matching the retired `IoHandle`
+crates/sema-stdlib/src/runtime_offload.rs:453://     and cannot be reclaimed — best-effort, matching the retired `IoHandle`
 crates/sema-stdlib/src/secret.rs:14://! (`in_async_context()`) — offload the scan onto the process-wide I/O pool
 crates/sema-stdlib/src/secret.rs:238:        if sema_core::in_async_context() {
 crates/sema-stdlib/src/secret.rs:257:        if sema_core::in_async_context() {
@@ -594,32 +508,6 @@ crates/sema-stdlib/src/secret.rs:600:                sema_core::IoPoll::Ready(Ok
 crates/sema-stdlib/src/secret.rs:601:                sema_core::IoPoll::Ready(Err(e)) => panic!("offload rejected: {e}"),
 crates/sema-stdlib/src/secret.rs:602:                sema_core::IoPoll::Pending => {
 crates/sema-stdlib/src/secret.rs:607:                    std::thread::sleep(Duration::from_millis(2));
-crates/sema-stdlib/src/serial.rs:151:/// The two phases a checkout offload's `IoHandle` cycles through — identical
-crates/sema-stdlib/src/serial.rs:171:/// `IoHandle::with_abort`'s doc comment): the caller marks the registry slot
-crates/sema-stdlib/src/serial.rs:207:    if let Some(v) = sema_core::take_resume_value() {
-crates/sema-stdlib/src/serial.rs:215:    let poll = move || -> IoPoll {
-crates/sema-stdlib/src/serial.rs:244:                    None => return IoPoll::Pending,
-crates/sema-stdlib/src/serial.rs:245:                    Some(Err(msg)) => return IoPoll::Ready(Err(msg)),
-crates/sema-stdlib/src/serial.rs:24://! and `serial/close`) or queues (an async caller's `IoHandle` re-attempts
-crates/sema-stdlib/src/serial.rs:261:                    Err(TryRecvError::Empty) => IoPoll::Pending,
-crates/sema-stdlib/src/serial.rs:274:                            Ok(t) => IoPoll::Ready(Ok(decode(t))),
-crates/sema-stdlib/src/serial.rs:275:                            Err(msg) => IoPoll::Ready(Err(msg)),
-crates/sema-stdlib/src/serial.rs:288:                        IoPoll::Ready(Err(format!("{op_name}: I/O worker dropped")))
-crates/sema-stdlib/src/serial.rs:296:    let io_handle = Rc::new(IoHandle::with_abort(poll, move || {
-crates/sema-stdlib/src/serial.rs:312:    sema_core::set_yield_signal(sema_core::YieldReason::AwaitIo(io_handle));
-crates/sema-stdlib/src/serial.rs:349:        if in_async_context() || sema_core::in_runtime_quantum() {
-crates/sema-stdlib/src/serial.rs:433:        if in_async_context() || sema_core::in_runtime_quantum() {
-crates/sema-stdlib/src/serial.rs:467:        if in_async_context() || sema_core::in_runtime_quantum() {
-crates/sema-stdlib/src/serial.rs:49:use sema_core::{check_arity, in_async_context, Caps, IoHandle, IoPoll, SemaError, Value};
-crates/sema-stdlib/src/serial.rs:511:        if in_async_context() || sema_core::in_runtime_quantum() {
-crates/sema-stdlib/src/serial.rs:597:    /// Forces `in_async_context()` on for the guard's lifetime, resetting it
-crates/sema-stdlib/src/serial.rs:612:    /// `SemaError::eval` — because the string an `IoPoll::Ready(Err(_))`
-crates/sema-stdlib/src/serial.rs:626:        let reason = sema_core::take_yield_signal()
-crates/sema-stdlib/src/serial.rs:629:            sema_core::YieldReason::AwaitIo(h) => h,
-crates/sema-stdlib/src/serial.rs:635:                IoPoll::Ready(Ok(v)) => return Ok(v),
-crates/sema-stdlib/src/serial.rs:636:                IoPoll::Ready(Err(e)) => return Err(e),
-crates/sema-stdlib/src/serial.rs:637:                IoPoll::Pending => {
-crates/sema-stdlib/src/serial.rs:642:                    std::thread::sleep(std::time::Duration::from_millis(2));
 crates/sema-stdlib/src/server.rs:1184:        while let Some(msg) = outgoing_rx.recv().await {
 crates/sema-stdlib/src/server.rs:1261:/// `block_on`) that panicked when the channel was bounded + `blocking_send`.
 crates/sema-stdlib/src/server.rs:1285:    use sema_core::call_callback;
@@ -673,38 +561,6 @@ crates/sema-stdlib/src/server.rs:640:    use sema_core::{call_callback, EvalCont
 crates/sema-stdlib/src/server.rs:734:                        if sema_core::in_async_context() || sema_core::in_runtime_quantum() {
 crates/sema-stdlib/src/server.rs:863:                    return call_callback(ctx, handler, &[new_req_val]);
 crates/sema-stdlib/src/sqlite.rs:23://! queues (an async caller's `IoHandle` re-attempts the checkout every poll —
-crates/sema-stdlib/src/stream.rs:1044:        if !in_async_context() && !sema_core::in_runtime_quantum() {
-crates/sema-stdlib/src/stream.rs:1139:        if (!in_async_context() && !sema_core::in_runtime_quantum())
-crates/sema-stdlib/src/stream.rs:1167:        if (!in_async_context() && !sema_core::in_runtime_quantum())
-crates/sema-stdlib/src/stream.rs:1194:        if (!in_async_context() && !sema_core::in_runtime_quantum())
-crates/sema-stdlib/src/stream.rs:1237:        if !in_async_context() && !sema_core::in_runtime_quantum() {
-crates/sema-stdlib/src/stream.rs:1367:        if in_async_context() || sema_core::in_runtime_quantum() {
-crates/sema-stdlib/src/stream.rs:1383:        if in_async_context() || sema_core::in_runtime_quantum() {
-crates/sema-stdlib/src/stream.rs:1542:/// force `sema_core::in_async_context()` on, call the native, then poll the
-crates/sema-stdlib/src/stream.rs:1552:    /// Forces `in_async_context()` on for the guard's lifetime, resetting it
-crates/sema-stdlib/src/stream.rs:1601:        let reason = sema_core::take_yield_signal()
-crates/sema-stdlib/src/stream.rs:1604:            sema_core::YieldReason::AwaitIo(h) => h,
-crates/sema-stdlib/src/stream.rs:1610:                sema_core::IoPoll::Ready(Ok(v)) => return v,
-crates/sema-stdlib/src/stream.rs:1611:                sema_core::IoPoll::Ready(Err(e)) => panic!("offload rejected: {e}"),
-crates/sema-stdlib/src/stream.rs:1612:                sema_core::IoPoll::Pending => {
-crates/sema-stdlib/src/stream.rs:1617:                    std::thread::sleep(Duration::from_millis(2));
-crates/sema-stdlib/src/stream.rs:464:    use sema_core::{in_async_context, IoHandle, IoPoll, StreamBox};
-crates/sema-stdlib/src/stream.rs:683:    /// The two phases a file-checkout offload's `IoHandle` cycles through —
-crates/sema-stdlib/src/stream.rs:721:        if let Some(v) = sema_core::take_resume_value() {
-crates/sema-stdlib/src/stream.rs:730:        let poll = move || -> IoPoll {
-crates/sema-stdlib/src/stream.rs:735:                        Ok(None) => return IoPoll::Pending,
-crates/sema-stdlib/src/stream.rs:736:                        Err(msg) => return IoPoll::Ready(Err(msg)),
-crates/sema-stdlib/src/stream.rs:760:                        Err(TryRecvError::Empty) => IoPoll::Pending,
-crates/sema-stdlib/src/stream.rs:772:                                    Ok(v) => IoPoll::Ready(Ok(v)),
-crates/sema-stdlib/src/stream.rs:773:                                    Err(e) => IoPoll::Ready(Err(e.to_string())),
-crates/sema-stdlib/src/stream.rs:775:                                Err(msg) => IoPoll::Ready(Err(msg)),
-crates/sema-stdlib/src/stream.rs:781:                            IoPoll::Ready(Err(format!("{op_name}: I/O worker dropped")))
-crates/sema-stdlib/src/stream.rs:789:        let io_handle = Rc::new(IoHandle::with_abort(poll, move || {
-crates/sema-stdlib/src/stream.rs:793:            // `IoHandle::with_abort`'s doc comment) — the blocking op keeps
-crates/sema-stdlib/src/stream.rs:804:        sema_core::set_yield_signal(sema_core::YieldReason::AwaitIo(io_handle));
-crates/sema-stdlib/src/stream.rs:8://! stream they were handed is file-backed AND `in_async_context()` before
-crates/sema-stdlib/src/stream.rs:931:        if !in_async_context() && !sema_core::in_runtime_quantum() {
-crates/sema-stdlib/src/stream.rs:985:        if !in_async_context() && !sema_core::in_runtime_quantum() {
 crates/sema-stdlib/src/system.rs:1025:                        sema_core::call_callback(ctx, cb, &[])?;
 crates/sema-stdlib/src/system.rs:115:            std::thread::sleep(std::time::Duration::from_millis(ms));
 crates/sema-stdlib/src/system.rs:14:    check_arity, in_async_context, in_runtime_quantum, set_yield_signal, take_resume_value, Caps,
@@ -781,38 +637,38 @@ crates/sema-vm/src/runtime/host.rs:479:        rx.recv_timeout(Duration::from_se
 crates/sema-vm/src/runtime/host.rs:481:        rx.recv_timeout(Duration::from_secs(2))
 crates/sema-vm/src/runtime/host.rs:534:        std::thread::sleep(Duration::from_millis(200));
 crates/sema-vm/src/runtime/host.rs:569:        rx.recv_timeout(Duration::from_secs(2))
-crates/sema-vm/src/runtime/state.rs:1159:            // runtime supports it — see `IoHandle::with_abort`), drop the entry,
-crates/sema-vm/src/runtime/state.rs:1196:            let task = state.tasks.remove(&task_id).expect("selected task exists");
-crates/sema-vm/src/runtime/state.rs:1250:                let (Some(task), Some(waits)) = (state.tasks.remove(&task_id), state.waits.take())
-crates/sema-vm/src/runtime/state.rs:1626:                YieldReason::Sleep(ms) => {
-crates/sema-vm/src/runtime/state.rs:1639:                YieldReason::Spawn(_)
-crates/sema-vm/src/runtime/state.rs:1640:                | YieldReason::Cancel(_)
-crates/sema-vm/src/runtime/state.rs:1641:                | YieldReason::AwaitPromise(_)
-crates/sema-vm/src/runtime/state.rs:1642:                | YieldReason::AwaitPromiseSet { .. }
-crates/sema-vm/src/runtime/state.rs:1643:                | YieldReason::ChannelSend(_, _)
-crates/sema-vm/src/runtime/state.rs:1644:                | YieldReason::ChannelRecv(_)
-crates/sema-vm/src/runtime/state.rs:1645:                | YieldReason::ChannelClose(_)
-crates/sema-vm/src/runtime/state.rs:1646:                | YieldReason::ChannelInspect(_, _)
-crates/sema-vm/src/runtime/state.rs:1647:                | YieldReason::ChannelTryRecv(_) => TaskAction::VmResult(
-crates/sema-vm/src/runtime/state.rs:1660:                YieldReason::AwaitIo(handle) => {
-crates/sema-vm/src/runtime/state.rs:2078:                        let task = state.tasks.remove(&task_id).ok_or_else(|| {
-crates/sema-vm/src/runtime/state.rs:2641:                let native_result = match sema_core::take_yield_signal() {
+crates/sema-vm/src/runtime/state.rs:1188:            // runtime supports it — see `IoHandle::with_abort`), drop the entry,
+crates/sema-vm/src/runtime/state.rs:1225:            let task = state.tasks.remove(&task_id).expect("selected task exists");
+crates/sema-vm/src/runtime/state.rs:1279:                let (Some(task), Some(waits)) = (state.tasks.remove(&task_id), state.waits.take())
+crates/sema-vm/src/runtime/state.rs:1655:                YieldReason::Sleep(ms) => {
+crates/sema-vm/src/runtime/state.rs:1668:                YieldReason::Spawn(_)
+crates/sema-vm/src/runtime/state.rs:1669:                | YieldReason::Cancel(_)
+crates/sema-vm/src/runtime/state.rs:1670:                | YieldReason::AwaitPromise(_)
+crates/sema-vm/src/runtime/state.rs:1671:                | YieldReason::AwaitPromiseSet { .. }
+crates/sema-vm/src/runtime/state.rs:1672:                | YieldReason::ChannelSend(_, _)
+crates/sema-vm/src/runtime/state.rs:1673:                | YieldReason::ChannelRecv(_)
+crates/sema-vm/src/runtime/state.rs:1674:                | YieldReason::ChannelClose(_)
+crates/sema-vm/src/runtime/state.rs:1675:                | YieldReason::ChannelInspect(_, _)
+crates/sema-vm/src/runtime/state.rs:1676:                | YieldReason::ChannelTryRecv(_) => TaskAction::VmResult(
+crates/sema-vm/src/runtime/state.rs:1689:                YieldReason::AwaitIo(handle) => {
+crates/sema-vm/src/runtime/state.rs:2107:                        let task = state.tasks.remove(&task_id).ok_or_else(|| {
 crates/sema-vm/src/runtime/state.rs:265:    /// VM-quantum tasks parked on a LEGACY `AwaitIo(IoHandle)` yield, mapped to
+crates/sema-vm/src/runtime/state.rs:2685:                let native_result = match sema_core::take_yield_signal() {
 crates/sema-vm/src/runtime/state.rs:268:    /// http, file, event/select, io) that arms an `IoHandle` and yields
 crates/sema-vm/src/runtime/state.rs:26:use sema_core::YieldReason;
 crates/sema-vm/src/runtime/state.rs:275:    io_waits: HashMap<TaskId, (super::WaitKey, Rc<sema_core::IoHandle>)>,
-crates/sema-vm/src/runtime/state.rs:2903:        handle: Rc<sema_core::IoHandle>,
-crates/sema-vm/src/runtime/state.rs:2909:            sema_core::IoPoll::Ready(Ok(value)) => {
-crates/sema-vm/src/runtime/state.rs:2912:            sema_core::IoPoll::Ready(Err(msg)) => {
-crates/sema-vm/src/runtime/state.rs:2915:            sema_core::IoPoll::Pending => {}
-crates/sema-vm/src/runtime/state.rs:2948:        let parked: Vec<(TaskId, super::WaitKey, Rc<sema_core::IoHandle>)> = {
-crates/sema-vm/src/runtime/state.rs:2962:                sema_core::IoPoll::Pending => {}
-crates/sema-vm/src/runtime/state.rs:2963:                sema_core::IoPoll::Ready(Ok(value)) => {
-crates/sema-vm/src/runtime/state.rs:2966:                sema_core::IoPoll::Ready(Err(msg)) => {
-crates/sema-vm/src/runtime/state.rs:3162:        let mut task = state.tasks.remove(&task_id).expect("task prevalidated");
-crates/sema-vm/src/runtime/state.rs:4101:    /// Legacy `AwaitIo(IoHandle)`: park the task (`TaskId`) on the offloaded-I/O
-crates/sema-vm/src/runtime/state.rs:4104:    VmAwaitIo(TaskId, Rc<sema_core::IoHandle>),
-crates/sema-vm/src/runtime/state.rs:4225:            // An `IoHandle` is a boxed `FnMut` poller; it is not a GC candidate
+crates/sema-vm/src/runtime/state.rs:2947:        handle: Rc<sema_core::IoHandle>,
+crates/sema-vm/src/runtime/state.rs:2953:            sema_core::IoPoll::Ready(Ok(value)) => {
+crates/sema-vm/src/runtime/state.rs:2956:            sema_core::IoPoll::Ready(Err(msg)) => {
+crates/sema-vm/src/runtime/state.rs:2959:            sema_core::IoPoll::Pending => {}
+crates/sema-vm/src/runtime/state.rs:2992:        let parked: Vec<(TaskId, super::WaitKey, Rc<sema_core::IoHandle>)> = {
+crates/sema-vm/src/runtime/state.rs:3006:                sema_core::IoPoll::Pending => {}
+crates/sema-vm/src/runtime/state.rs:3007:                sema_core::IoPoll::Ready(Ok(value)) => {
+crates/sema-vm/src/runtime/state.rs:3010:                sema_core::IoPoll::Ready(Err(msg)) => {
+crates/sema-vm/src/runtime/state.rs:3206:        let mut task = state.tasks.remove(&task_id).expect("task prevalidated");
+crates/sema-vm/src/runtime/state.rs:4411:    /// Legacy `AwaitIo(IoHandle)`: park the task (`TaskId`) on the offloaded-I/O
+crates/sema-vm/src/runtime/state.rs:4414:    VmAwaitIo(TaskId, Rc<sema_core::IoHandle>),
+crates/sema-vm/src/runtime/state.rs:4535:            // An `IoHandle` is a boxed `FnMut` poller; it is not a GC candidate
 crates/sema-vm/src/runtime/wait.rs:421:                inbox.recv_timeout(timeout).ok()
 crates/sema-vm/src/runtime/wait.rs:423:            None => inbox.recv().ok(),
 crates/sema-vm/src/scheduler.rs:1003:                if let TaskState::Blocked(YieldReason::AwaitIo(h)) = &task.state {

@@ -1506,7 +1506,6 @@ fn spawn_observes_post_spawn_heap_value() {
 // finishes immediately once scheduled), which is exactly what distinguishes a
 // cooperative yield from a blocking wait.
 #[test]
-#[ignore = "event/select cooperative yield: pending WaitKind::External migration (Step F) — see docs/deferred.md"]
 fn event_select_yields_to_sibling_in_async_context() {
     let out = eval(
         r#"

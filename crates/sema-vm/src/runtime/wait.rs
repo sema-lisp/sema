@@ -592,6 +592,13 @@ impl WaitRuntime {
     pub fn active_len(&self) -> usize {
         self.active.len()
     }
+
+    /// Whether `key` names a live external wait (an in-flight offloaded op). Used
+    /// to classify a cancelled Waiting task's kind at cancellation-request time so
+    /// its executor abort runs immediately, not at the next drive scan.
+    pub fn is_active(&self, key: WaitKey) -> bool {
+        self.active.contains_key(&key)
+    }
     pub fn cleanup_len(&self) -> usize {
         self.cleanup.len()
     }

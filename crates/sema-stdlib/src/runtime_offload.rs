@@ -391,6 +391,32 @@ where
     suspend_with_resource(op, kind, resource, cancel_rx, Box::new(decode), make_future)
 }
 
+/// Build a checkout `abort` hook that SIGKILLs the process **group** led by
+/// `pid` (Unix). The subprocess modules (`proc`, `pty`, `serial` where a child
+/// is spawned) put their child in its own group (`process_group(0)` → pgid ==
+/// pid), so the negative pid tears down the leader **and** any grandchildren a
+/// compound command (`sh -c "a | b"`) forked — the same teardown shell's
+/// killpg gives. Fires only on cancellation of an in-flight checkout op: the op
+/// is still parked in the blocking worker holding the `Child`, so `pid` is
+/// unreaped and valid when this runs; best-effort past that (a child that
+/// exited in the same instant is a no-op or, extremely rarely, a reused pid —
+/// the documented `spawn_blocking` cancellation tradeoff). No-op on non-Unix.
+pub(crate) fn group_sigkill_abort(pid: u32) -> Box<dyn FnOnce()> {
+    Box::new(move || {
+        #[cfg(unix)]
+        {
+            if pid != 0 {
+                // SAFETY: a plain signal send to the child's own process group.
+                unsafe {
+                    libc::kill(-(pid as libc::pid_t), libc::SIGKILL);
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        let _ = pid;
+    })
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Checkout-external: gate-guarded offload of a per-handle non-Send-resource op.
 // ─────────────────────────────────────────────────────────────────────────────

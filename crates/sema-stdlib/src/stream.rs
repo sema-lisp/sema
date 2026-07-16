@@ -5,21 +5,25 @@
 //! streams (`FileInputStream`/`FileOutputStream`, in `io_streams` below) wrap
 //! real blocking I/O; `stream/read`, `stream/write`, `stream/read-line`,
 //! `stream/copy`, `stream/flush`, and `stream/close` each check whether the
-//! stream they were handed is file-backed AND `in_async_context()` before
+//! stream they were handed is file-backed AND `in_runtime_quantum()` before
 //! deciding to offload — an in-memory stream falls straight through to the
 //! unchanged synchronous path regardless of context.
 //!
 //! Unlike `sqlite.rs`/`proc.rs`, there is no separate keyed thread-local
 //! registry: a stream is already reached through a unique `Rc<StreamBox>`
 //! (the `Value` itself), so the CHECKOUT slot (`Available`/`CheckedOut`/
-//! `Tombstone`, see `sqlite.rs`'s module doc comment for the pattern this
-//! mirrors) lives directly on `FileInputStream`/`FileOutputStream` — the
-//! `BufReader<File>`/`BufWriter<File>` is taken out of that slot for an
-//! offload's duration and reinstalled by the poller, which calls
-//! `notify_io_complete()` so a sibling queued on the SAME stream object can't
-//! miss the wakeup. `stream/open-input`/`stream/open-output` offload the
-//! initial `File::open`/`File::create` via `fs_offload` (`io.rs`) — there is
-//! no existing stream to contend over, mirroring `db/open`.
+//! `Tombstone`) lives directly on `FileInputStream`/`FileOutputStream`, guarded
+//! by a per-object `ResourceGate` (its id cached on the stream) that serializes
+//! concurrent ops FIFO. The offload runs through
+//! `crate::runtime_offload::checkout_external` (see `sqlite.rs`'s module doc
+//! comment for the pattern this mirrors): acquire the gate, take the
+//! `BufReader<File>`/`BufWriter<File>` out of the slot, run the blocking op on
+//! the executor's blocking tier, then reinstall it and release the gate. A
+//! sibling op on the SAME stream object parks FIFO on the gate; a mid-flight
+//! cancel tombstones the slot (best-effort). `stream/open-input`/
+//! `stream/open-output` offload the initial `File::open`/`File::create` via
+//! `fs_offload` (`io.rs`) — there is no existing stream to contend over,
+//! mirroring `db/open`.
 //!
 //! `stream/copy` between two FILE-backed streams deliberately does not
 //! implement dual-checkout (it would need a canonical acquire order across
@@ -37,9 +41,42 @@
 use std::any::Any;
 use std::cell::{Cell, RefCell};
 
+use sema_core::runtime::NativeOutcome;
 use sema_core::{check_arity, SemaError, SemaStream, Value};
 
 use crate::register_fn;
+
+/// Register a builtin whose body speaks the runtime native ABI
+/// (`NativeResult`), so its async branch can return a `NativeOutcome::Suspend`
+/// (a gate-guarded checkout offload) directly. Mirrors
+/// `crate::register_runtime_fn_path_gated` minus the sandbox/path gating (the
+/// `stream/*` builtins are ungated). The body is exposed under BOTH ABIs: the
+/// runtime callback returns the body's `NativeOutcome` structurally, and the
+/// legacy value callback unwraps a plain `Return` (or a legacy `AwaitIo` armed
+/// by an `fs_offload` sub-path, which the VM bridges) for a bare/top-level eval.
+fn register_runtime_fn(
+    env: &sema_core::Env,
+    name: &'static str,
+    f: impl Fn(&[Value]) -> sema_core::runtime::NativeResult + 'static,
+) {
+    use sema_core::runtime::NativeOutcome;
+    let body = std::rc::Rc::new(f);
+    let for_func = body.clone();
+    let for_runtime = body;
+    env.set(
+        sema_core::intern(name),
+        Value::native_fn(sema_core::NativeFn::simple_with_runtime(
+            name,
+            move |args| match for_func(args)? {
+                NativeOutcome::Return(value) => Ok(value),
+                _ => Err(sema_core::SemaError::eval(format!(
+                    "{name}: native suspended outside the cooperative runtime"
+                ))),
+            },
+            move |_ctx, args| for_runtime(args),
+        )),
+    );
+}
 
 #[cfg(not(target_arch = "wasm32"))]
 use sema_core::{Caps, Env, Sandbox};
@@ -176,7 +213,7 @@ pub fn register(env: &sema_core::Env) {
 
     // --- core I/O ---
 
-    register_fn(env, "stream/read", |args| {
+    register_runtime_fn(env, "stream/read", |args| {
         check_arity!(args, "stream/read", 2);
         let s = expect_stream(args, "stream/read", 0)?;
         let n = args[1]
@@ -189,17 +226,17 @@ pub fn register(env: &sema_core::Env) {
         }
 
         #[cfg(not(target_arch = "wasm32"))]
-        if let Some(v) = io_streams::maybe_async_read(&s, n as usize)? {
-            return Ok(v);
+        if let Some(outcome) = io_streams::maybe_async_read(&s, n as usize)? {
+            return Ok(outcome);
         }
 
         let mut buf = vec![0u8; n as usize];
         let bytes_read = s.read(&mut buf)?;
         buf.truncate(bytes_read);
-        Ok(Value::bytevector(buf))
+        Ok(NativeOutcome::Return(Value::bytevector(buf)))
     });
 
-    register_fn(env, "stream/write", |args| {
+    register_runtime_fn(env, "stream/write", |args| {
         check_arity!(args, "stream/write", 2);
         let s = expect_stream(args, "stream/write", 0)?;
         let data = args[1]
@@ -207,33 +244,33 @@ pub fn register(env: &sema_core::Env) {
             .ok_or_else(|| SemaError::type_error("bytevector", args[1].type_name()))?;
 
         #[cfg(not(target_arch = "wasm32"))]
-        if let Some(v) = io_streams::maybe_async_write(&s, data)? {
-            return Ok(v);
+        if let Some(outcome) = io_streams::maybe_async_write(&s, data)? {
+            return Ok(outcome);
         }
 
         let n = s.write(data)?;
-        Ok(Value::int(n as i64))
+        Ok(NativeOutcome::Return(Value::int(n as i64)))
     });
 
-    register_fn(env, "stream/read-byte", |args| {
+    register_runtime_fn(env, "stream/read-byte", |args| {
         check_arity!(args, "stream/read-byte", 1);
         let s = expect_stream(args, "stream/read-byte", 0)?;
 
         #[cfg(not(target_arch = "wasm32"))]
-        if let Some(v) = io_streams::maybe_async_read_byte(&s)? {
-            return Ok(v);
+        if let Some(outcome) = io_streams::maybe_async_read_byte(&s)? {
+            return Ok(outcome);
         }
 
         let mut buf = [0u8; 1];
         let n = s.read(&mut buf)?;
         if n == 0 {
-            Ok(Value::nil())
+            Ok(NativeOutcome::Return(Value::nil()))
         } else {
-            Ok(Value::int(buf[0] as i64))
+            Ok(NativeOutcome::Return(Value::int(buf[0] as i64)))
         }
     });
 
-    register_fn(env, "stream/write-byte", |args| {
+    register_runtime_fn(env, "stream/write-byte", |args| {
         check_arity!(args, "stream/write-byte", 2);
         let s = expect_stream(args, "stream/write-byte", 0)?;
         let b = args[1]
@@ -246,12 +283,12 @@ pub fn register(env: &sema_core::Env) {
         }
 
         #[cfg(not(target_arch = "wasm32"))]
-        if let Some(v) = io_streams::maybe_async_write_byte(&s, b as u8)? {
-            return Ok(v);
+        if let Some(outcome) = io_streams::maybe_async_write_byte(&s, b as u8)? {
+            return Ok(outcome);
         }
 
         s.write(&[b as u8])?;
-        Ok(Value::nil())
+        Ok(NativeOutcome::Return(Value::nil()))
     });
 
     register_fn(env, "stream/available?", |args| {
@@ -260,30 +297,30 @@ pub fn register(env: &sema_core::Env) {
         Ok(Value::bool(s.available()?))
     });
 
-    register_fn(env, "stream/close", |args| {
+    register_runtime_fn(env, "stream/close", |args| {
         check_arity!(args, "stream/close", 1);
         let s = expect_stream(args, "stream/close", 0)?;
 
         #[cfg(not(target_arch = "wasm32"))]
-        if let Some(v) = io_streams::maybe_async_close(&s)? {
-            return Ok(v);
+        if let Some(outcome) = io_streams::maybe_async_close(&s)? {
+            return Ok(outcome);
         }
 
         s.close()?;
-        Ok(Value::nil())
+        Ok(NativeOutcome::Return(Value::nil()))
     });
 
-    register_fn(env, "stream/flush", |args| {
+    register_runtime_fn(env, "stream/flush", |args| {
         check_arity!(args, "stream/flush", 1);
         let s = expect_stream(args, "stream/flush", 0)?;
 
         #[cfg(not(target_arch = "wasm32"))]
-        if let Some(v) = io_streams::maybe_async_flush(&s)? {
-            return Ok(v);
+        if let Some(outcome) = io_streams::maybe_async_flush(&s)? {
+            return Ok(outcome);
         }
 
         s.flush()?;
-        Ok(Value::nil())
+        Ok(NativeOutcome::Return(Value::nil()))
     });
 
     // --- introspection ---
@@ -358,13 +395,13 @@ pub fn register(env: &sema_core::Env) {
 
     // --- convenience (no I/O, always available) ---
 
-    register_fn(env, "stream/read-all", |args| {
+    register_runtime_fn(env, "stream/read-all", |args| {
         check_arity!(args, "stream/read-all", 1);
         let s = expect_stream(args, "stream/read-all", 0)?;
 
         #[cfg(not(target_arch = "wasm32"))]
-        if let Some(v) = io_streams::maybe_async_read_all(&s)? {
-            return Ok(v);
+        if let Some(outcome) = io_streams::maybe_async_read_all(&s)? {
+            return Ok(outcome);
         }
 
         let mut result = Vec::new();
@@ -376,16 +413,16 @@ pub fn register(env: &sema_core::Env) {
             }
             result.extend_from_slice(&buf[..n]);
         }
-        Ok(Value::bytevector(result))
+        Ok(NativeOutcome::Return(Value::bytevector(result)))
     });
 
-    register_fn(env, "stream/read-line", |args| {
+    register_runtime_fn(env, "stream/read-line", |args| {
         check_arity!(args, "stream/read-line", 1);
         let s = expect_stream(args, "stream/read-line", 0)?;
 
         #[cfg(not(target_arch = "wasm32"))]
-        if let Some(v) = io_streams::maybe_async_read_line(&s)? {
-            return Ok(v);
+        if let Some(outcome) = io_streams::maybe_async_read_line(&s)? {
+            return Ok(outcome);
         }
 
         let mut line = Vec::new();
@@ -395,7 +432,7 @@ pub fn register(env: &sema_core::Env) {
             if n == 0 {
                 // EOF
                 if line.is_empty() {
-                    return Ok(Value::nil());
+                    return Ok(NativeOutcome::Return(Value::nil()));
                 }
                 break;
             }
@@ -410,10 +447,10 @@ pub fn register(env: &sema_core::Env) {
         }
         let text = String::from_utf8(line)
             .map_err(|e| SemaError::eval(format!("stream/read-line: invalid UTF-8: {e}")))?;
-        Ok(Value::string(&text))
+        Ok(NativeOutcome::Return(Value::string(&text)))
     });
 
-    register_fn(env, "stream/write-string", |args| {
+    register_runtime_fn(env, "stream/write-string", |args| {
         check_arity!(args, "stream/write-string", 2);
         let s = expect_stream(args, "stream/write-string", 0)?;
         let text = args[1]
@@ -421,22 +458,22 @@ pub fn register(env: &sema_core::Env) {
             .ok_or_else(|| SemaError::type_error("string", args[1].type_name()))?;
 
         #[cfg(not(target_arch = "wasm32"))]
-        if let Some(v) = io_streams::maybe_async_write(&s, text.as_bytes())? {
-            return Ok(v);
+        if let Some(outcome) = io_streams::maybe_async_write(&s, text.as_bytes())? {
+            return Ok(outcome);
         }
 
         let n = s.write(text.as_bytes())?;
-        Ok(Value::int(n as i64))
+        Ok(NativeOutcome::Return(Value::int(n as i64)))
     });
 
-    register_fn(env, "stream/copy", |args| {
+    register_runtime_fn(env, "stream/copy", |args| {
         check_arity!(args, "stream/copy", 2);
         let src = expect_stream(args, "stream/copy", 0)?;
         let dst = expect_stream(args, "stream/copy", 1)?;
 
         #[cfg(not(target_arch = "wasm32"))]
-        if let Some(v) = io_streams::maybe_async_copy(&src, &dst)? {
-            return Ok(v);
+        if let Some(outcome) = io_streams::maybe_async_copy(&src, &dst)? {
+            return Ok(outcome);
         }
 
         let mut total: usize = 0;
@@ -449,7 +486,7 @@ pub fn register(env: &sema_core::Env) {
             dst.write(&buf[..n])?;
             total += n;
         }
-        Ok(Value::int(total as i64))
+        Ok(NativeOutcome::Return(Value::int(total as i64)))
     });
 }
 
@@ -461,7 +498,13 @@ mod io_streams {
     use std::io::{BufRead, BufReader, BufWriter, Read, Write};
     use std::rc::Rc;
 
-    use sema_core::{in_async_context, IoHandle, IoPoll, StreamBox};
+    use sema_core::runtime::{CompletionKind, NativeOutcome, NativeResult, ResourceGateId};
+    use sema_core::{in_runtime_quantum, StreamBox};
+
+    use crate::runtime_offload::{checkout_external, CheckoutOp};
+
+    /// Completion-kind tag for file-stream `stream/*` external waits ("stf\0").
+    const STREAM_COMPLETION_KIND: u64 = 0x7374_6600;
 
     // `File`/`BufReader<File>`/`BufWriter<File>` move across the offload
     // boundary on every checkout. This compiles only if they stay `Send`; a
@@ -509,6 +552,11 @@ mod io_streams {
     #[derive(Debug)]
     pub struct FileInputStream {
         slot: RefCell<FileInSlot>,
+        /// This stream's [`ResourceGateId`], minted on its first offloaded op and
+        /// reused for later ops. The gate provides FIFO mutual exclusion for the
+        /// checkout slot (the `Rc<StreamBox>` is the handle — there is no keyed
+        /// registry, so the gate id lives on the stream object).
+        gate: Cell<Option<ResourceGateId>>,
     }
 
     #[derive(Debug)]
@@ -528,6 +576,7 @@ mod io_streams {
         fn from_reader(reader: BufReader<std::fs::File>) -> Self {
             FileInputStream {
                 slot: RefCell::new(FileInSlot::Available(reader)),
+                gate: Cell::new(None),
             }
         }
     }
@@ -581,6 +630,8 @@ mod io_streams {
     #[derive(Debug)]
     pub struct FileOutputStream {
         slot: RefCell<FileOutSlot>,
+        /// See [`FileInputStream::gate`].
+        gate: Cell<Option<ResourceGateId>>,
     }
 
     #[derive(Debug)]
@@ -601,6 +652,7 @@ mod io_streams {
         fn from_writer(writer: BufWriter<std::fs::File>) -> Self {
             FileOutputStream {
                 slot: RefCell::new(FileOutSlot::Available(writer)),
+                gate: Cell::new(None),
             }
         }
     }
@@ -670,145 +722,117 @@ mod io_streams {
     }
 
     // ── Async offload machinery ───────────────────────────────────
+    //
+    // A file-backed stream owns one resource (a `BufReader`/`BufWriter<File>`)
+    // that at most one offloaded op may hold at a time. Each op runs through the
+    // CHECKOUT pattern under the unified runtime via
+    // `crate::runtime_offload::checkout_external` (see `sqlite.rs`'s module doc
+    // comment for the canonical writeup this mirrors): acquire the stream's
+    // per-object [`ResourceGate`] (creating it on the first offload and caching
+    // the id on the stream), take the resource out of the slot, run the blocking
+    // op on the executor's blocking tier, then reinstall the resource and decode
+    // on the VM thread before releasing the gate. A second `stream/*` op on a
+    // busy stream parks FIFO on the gate; a mid-flight cancel tombstones the slot
+    // (best-effort — the resource cannot be reclaimed). There is no process to
+    // signal, so cancellation runs no abort.
 
-    /// What crosses the thread boundary from an offloaded file op back to
-    /// the poller: the reinstalled resource (`BufReader<File>` or
-    /// `BufWriter<File>`) plus the op's owned `Send` result. Mirrors
-    /// `sqlite.rs`'s `ConnOpOutcome`.
-    struct FileOpOutcome<R, T> {
-        resource: R,
-        result: Result<T, String>,
+    fn input_gate(stream: &Rc<StreamBox>) -> Option<ResourceGateId> {
+        let inner = stream.borrow_inner();
+        inner
+            .as_any()
+            .downcast_ref::<FileInputStream>()
+            .and_then(|fis| fis.gate.get())
     }
 
-    /// The two phases a file-checkout offload's `IoHandle` cycles through —
-    /// identical shape to `sqlite.rs`'s `ConnPhase`/`proc.rs`'s `WaitPhase`.
-    enum FilePhase<R, T> {
-        /// Waiting for the slot to become `Available`. Re-checked every
-        /// poll; never mutates anything beyond that check, so aborting here
-        /// is a true no-op — nothing was ever taken out.
-        Acquire,
-        /// Holding the checkout; `op` is running on the I/O pool. Resolves
-        /// with the reinstalled resource plus the op's result.
-        Running(tokio::sync::oneshot::Receiver<FileOpOutcome<R, T>>),
-    }
-
-    /// Offload one blocking op on a file-backed stream through the CHECKOUT
-    /// pattern (see the module doc comment). `try_take` is the Acquire-phase
-    /// probe: `Ok(None)` = still busy (keep polling), `Ok(Some(resource))` =
-    /// acquired, `Err` = terminal (tombstoned/closed). `op` runs on the I/O
-    /// pool against the acquired resource; `reinstall` puts it back
-    /// `Available` once `op` returns (success or failure — an op error never
-    /// tombstones the stream, only a cancelled-in-flight offload or a
-    /// vanished worker does). `decode` turns the owned `Send` result into
-    /// the final `Value` on the VM thread — fallible, since e.g.
-    /// `stream/copy`'s decode step writes into the OTHER (memory-side)
-    /// stream, which can itself reject the write. Returns `Ok(nil)` after
-    /// arming the yield signal; the scheduler delivers the real value on
-    /// resume.
-    fn checkout_offload<R: Send + 'static, T: Send + 'static>(
-        op_name: &'static str,
-        try_take: impl Fn() -> Result<Option<R>, String> + 'static,
-        reinstall: impl Fn(R) + 'static,
-        tombstone: impl Fn(String) + Clone + 'static,
-        op: impl FnOnce(&mut R) -> Result<T, String> + Send + 'static,
-        decode: impl Fn(T) -> Result<Value, SemaError> + 'static,
-    ) -> Result<Value, SemaError> {
-        use tokio::sync::oneshot::error::TryRecvError;
-
-        // Vestigial under CALL_NATIVE (the scheduler delivers the resume
-        // value via `replace_stack_top`, not by re-invoking this native),
-        // but kept for symmetry with the shipped `async/await` yield pattern.
-        if let Some(v) = sema_core::take_resume_value() {
-            return Ok(v);
+    fn store_input_gate(stream: &Rc<StreamBox>, id: ResourceGateId) {
+        let inner = stream.borrow_inner();
+        if let Some(fis) = inner.as_any().downcast_ref::<FileInputStream>() {
+            fis.gate.set(Some(id));
         }
-
-        let phase = Rc::new(RefCell::new(FilePhase::<R, T>::Acquire));
-        let phase_for_poll = phase.clone();
-        let mut op_holder = Some(op);
-        let tombstone_poll = tombstone.clone();
-
-        let poll = move || -> IoPoll {
-            loop {
-                let is_acquire = matches!(&*phase_for_poll.borrow(), FilePhase::Acquire);
-                if is_acquire {
-                    match try_take() {
-                        Ok(None) => return IoPoll::Pending,
-                        Err(msg) => return IoPoll::Ready(Err(msg)),
-                        Ok(Some(resource)) => {
-                            let op = op_holder
-                                .take()
-                                .expect("checkout_offload's op is consumed exactly once");
-                            let (tx, rx) = tokio::sync::oneshot::channel();
-                            let mut resource = resource;
-                            sema_io::io_spawn_blocking(move || {
-                                let result = op(&mut resource);
-                                let _ = tx.send(FileOpOutcome { resource, result });
-                                // Wake the parked VM thread so it re-polls promptly.
-                                sema_core::notify_io_complete();
-                            });
-                            *phase_for_poll.borrow_mut() = FilePhase::Running(rx);
-                            // Fall through: poll the freshly spawned receiver
-                            // immediately instead of wasting a scheduler tick.
-                        }
-                    }
-                } else {
-                    let mut phase_ref = phase_for_poll.borrow_mut();
-                    let FilePhase::Running(rx) = &mut *phase_ref else {
-                        unreachable!("Acquire handled above")
-                    };
-                    return match rx.try_recv() {
-                        Err(TryRecvError::Empty) => IoPoll::Pending,
-                        Ok(outcome) => {
-                            drop(phase_ref);
-                            reinstall(outcome.resource);
-                            // MANDATORY lost-wakeup guard: a sibling queued
-                            // on this same stream (still in `Acquire`) may
-                            // have polled Pending earlier in this scheduler
-                            // sweep — without this it would park until an
-                            // unrelated wakeup.
-                            sema_core::notify_io_complete();
-                            match outcome.result {
-                                Ok(t) => match decode(t) {
-                                    Ok(v) => IoPoll::Ready(Ok(v)),
-                                    Err(e) => IoPoll::Ready(Err(e.to_string())),
-                                },
-                                Err(msg) => IoPoll::Ready(Err(msg)),
-                            }
-                        }
-                        Err(TryRecvError::Closed) => {
-                            drop(phase_ref);
-                            tombstone_poll("the I/O worker terminated unexpectedly".to_string());
-                            IoPoll::Ready(Err(format!("{op_name}: I/O worker dropped")))
-                        }
-                    };
-                }
-            }
-        };
-
-        let phase_for_abort = phase.clone();
-        let io_handle = Rc::new(IoHandle::with_abort(poll, move || {
-            // Acquire-phase abort: no-op — nothing was ever checked out.
-            // Running-phase abort: best-effort, matching every other
-            // spawn_blocking-based offload in this codebase (see
-            // `IoHandle::with_abort`'s doc comment) — the blocking op keeps
-            // running unattended on the worker; the stream is tombstoned so
-            // a later access errors clearly instead of the slot staying
-            // `CheckedOut` forever with no one left to reinstall it.
-            if matches!(*phase_for_abort.borrow(), FilePhase::Running(_)) {
-                tombstone(format!(
-                    "{op_name} was cancelled while in flight; the stream cannot be reclaimed \
-                     — stream/close frees the handle"
-                ));
-            }
-        }));
-        sema_core::set_yield_signal(sema_core::YieldReason::AwaitIo(io_handle));
-        Ok(Value::nil())
     }
 
-    fn try_checkout_input(
+    fn output_gate(stream: &Rc<StreamBox>) -> Option<ResourceGateId> {
+        let inner = stream.borrow_inner();
+        inner
+            .as_any()
+            .downcast_ref::<FileOutputStream>()
+            .and_then(|fos| fos.gate.get())
+    }
+
+    fn store_output_gate(stream: &Rc<StreamBox>, id: ResourceGateId) {
+        let inner = stream.borrow_inner();
+        if let Some(fos) = inner.as_any().downcast_ref::<FileOutputStream>() {
+            fos.gate.set(Some(id));
+        }
+    }
+
+    /// Offload one blocking op against a file-INPUT stream's `BufReader` through
+    /// the gate-guarded checkout. `op` runs off the VM thread; `decode` builds the
+    /// final `Value` on the VM thread (fallible — e.g. `stream/copy` writes into
+    /// the memory-side dst, which can itself reject).
+    fn checkout_input<T: Send + 'static>(
+        op_name: &'static str,
         stream: &Rc<StreamBox>,
-        op: &str,
-    ) -> Result<Option<BufReader<std::fs::File>>, String> {
+        op: impl FnOnce(&mut BufReader<std::fs::File>) -> Result<T, String> + Send + 'static,
+        decode: impl FnOnce(T) -> Result<Value, SemaError> + 'static,
+    ) -> NativeResult {
+        let kind = CompletionKind::try_from_raw(STREAM_COMPLETION_KIND)
+            .expect("stream completion kind is nonzero");
+        let gate = input_gate(stream);
+        let s_store = stream.clone();
+        let s_take = stream.clone();
+        let s_reinstall = stream.clone();
+        let s_tomb = stream.clone();
+        checkout_external(CheckoutOp {
+            op_name,
+            kind,
+            gate,
+            store_gate: Box::new(move |id| store_input_gate(&s_store, id)),
+            take: Box::new(move || take_input(&s_take, op_name)),
+            op: Box::new(op),
+            reinstall: Box::new(move |r| reinstall_input(&s_reinstall, r)),
+            decode: Box::new(decode),
+            success_value: None,
+            tombstone: Rc::new(move |msg| tombstone_input(&s_tomb, msg)),
+            abort: None,
+        })
+    }
+
+    /// Offload one blocking op against a file-OUTPUT stream's `BufWriter` through
+    /// the gate-guarded checkout. See [`checkout_input`].
+    fn checkout_output<T: Send + 'static>(
+        op_name: &'static str,
+        take_op: &'static str,
+        stream: &Rc<StreamBox>,
+        op: impl FnOnce(&mut BufWriter<std::fs::File>) -> Result<T, String> + Send + 'static,
+        decode: impl FnOnce(T) -> Result<Value, SemaError> + 'static,
+    ) -> NativeResult {
+        let kind = CompletionKind::try_from_raw(STREAM_COMPLETION_KIND)
+            .expect("stream completion kind is nonzero");
+        let gate = output_gate(stream);
+        let s_store = stream.clone();
+        let s_take = stream.clone();
+        let s_reinstall = stream.clone();
+        let s_tomb = stream.clone();
+        checkout_external(CheckoutOp {
+            op_name,
+            kind,
+            gate,
+            store_gate: Box::new(move |id| store_output_gate(&s_store, id)),
+            take: Box::new(move || take_output(&s_take, take_op)),
+            op: Box::new(op),
+            reinstall: Box::new(move |w| reinstall_output(&s_reinstall, w)),
+            decode: Box::new(decode),
+            success_value: None,
+            tombstone: Rc::new(move |msg| tombstone_output(&s_tomb, msg)),
+            abort: None,
+        })
+    }
+
+    /// Take the file reader out of its slot once the gate is owned, marking the
+    /// slot `CheckedOut`. With the gate held the slot must be `Available`; any
+    /// other state (a cancelled prior op) is a clear domain error.
+    fn take_input(stream: &Rc<StreamBox>, op: &str) -> Result<BufReader<std::fs::File>, SemaError> {
         let inner = stream.borrow_inner();
         let fis = inner
             .as_any()
@@ -822,10 +846,10 @@ mod io_streams {
                 else {
                     unreachable!("just matched Available")
                 };
-                Ok(Some(r))
+                Ok(r)
             }
-            FileInSlot::CheckedOut => Ok(None),
-            FileInSlot::Tombstone(msg) => Err(tombstone_err(op, msg).to_string()),
+            FileInSlot::CheckedOut => Err(busy_err(op)),
+            FileInSlot::Tombstone(msg) => Err(tombstone_err(op, msg)),
         }
     }
 
@@ -843,10 +867,13 @@ mod io_streams {
         }
     }
 
-    fn try_checkout_output(
+    /// Take the file writer out of its slot once the gate is owned. A `Closed`
+    /// slot (a copy targeting an already-closed dst, or the narrow concurrent-
+    /// close race) is phrased exactly like `StreamBox::write`'s own message.
+    fn take_output(
         stream: &Rc<StreamBox>,
         op: &str,
-    ) -> Result<Option<BufWriter<std::fs::File>>, String> {
+    ) -> Result<BufWriter<std::fs::File>, SemaError> {
         let inner = stream.borrow_inner();
         let fos = inner
             .as_any()
@@ -860,19 +887,11 @@ mod io_streams {
                 else {
                     unreachable!("just matched Available")
                 };
-                Ok(Some(w))
+                Ok(w)
             }
-            FileOutSlot::CheckedOut => Ok(None),
-            // Reachable when a copy targets an already-closed file stream
-            // (the dst side is never checked with `StreamBox::is_closed()`
-            // up front — see `maybe_async_copy`), or the narrow concurrent-
-            // close race documented on `FileOutSlot`. Phrased exactly like
-            // `StreamBox::write`'s own closed-stream message, since every
-            // caller of this function is either writing or finalizing a
-            // write-adjacent op (`stream/write`/`stream/flush`/`stream/copy`
-            // /`stream/close`).
-            FileOutSlot::Closed => Err(render(format!("{op}: stream is closed"))),
-            FileOutSlot::Tombstone(msg) => Err(tombstone_err(op, msg).to_string()),
+            FileOutSlot::CheckedOut => Err(busy_err(op)),
+            FileOutSlot::Closed => Err(SemaError::eval(format!("{op}: stream is closed"))),
+            FileOutSlot::Tombstone(msg) => Err(tombstone_err(op, msg)),
         }
     }
 
@@ -900,7 +919,7 @@ mod io_streams {
     pub(super) fn maybe_async_read(
         stream: &Rc<StreamBox>,
         n: usize,
-    ) -> Result<Option<Value>, SemaError> {
+    ) -> Result<Option<NativeOutcome>, SemaError> {
         maybe_async_read_decoded(stream, n, Value::bytevector)
     }
 
@@ -912,7 +931,7 @@ mod io_streams {
     /// bytevector one.
     pub(super) fn maybe_async_read_byte(
         stream: &Rc<StreamBox>,
-    ) -> Result<Option<Value>, SemaError> {
+    ) -> Result<Option<NativeOutcome>, SemaError> {
         maybe_async_read_decoded(stream, 1, |bytes| match bytes.first() {
             Some(&b) => Value::int(b as i64),
             None => Value::nil(),
@@ -927,8 +946,8 @@ mod io_streams {
         stream: &Rc<StreamBox>,
         n: usize,
         decode: impl Fn(Vec<u8>) -> Value + 'static,
-    ) -> Result<Option<Value>, SemaError> {
-        if !in_async_context() && !sema_core::in_runtime_quantum() {
+    ) -> Result<Option<NativeOutcome>, SemaError> {
+        if !in_runtime_quantum() {
             return Ok(None);
         }
         // *stdin* does real, potentially-blocking I/O (unlike in-memory byte
@@ -948,7 +967,7 @@ mod io_streams {
                 },
                 decode,
             )?;
-            return Ok(Some(v));
+            return Ok(Some(NativeOutcome::Return(v)));
         }
         if stream.stream_type() != "file-input" {
             return Ok(None);
@@ -956,14 +975,9 @@ mod io_streams {
         if stream.is_closed() {
             return Err(SemaError::eval("stream/read: stream is closed"));
         }
-        let s1 = stream.clone();
-        let s2 = stream.clone();
-        let s3 = stream.clone();
-        let v = checkout_offload(
+        Ok(Some(checkout_input(
             "stream/read",
-            move || try_checkout_input(&s1, "stream/read"),
-            move |r| reinstall_input(&s2, r),
-            move |msg| tombstone_input(&s3, msg),
+            stream,
             move |reader: &mut BufReader<std::fs::File>| -> Result<Vec<u8>, String> {
                 let mut buf = vec![0u8; n];
                 let read = reader
@@ -973,16 +987,17 @@ mod io_streams {
                 Ok(buf)
             },
             move |bytes: Vec<u8>| -> Result<Value, SemaError> { Ok(decode(bytes)) },
-        )?;
-        Ok(Some(v))
+        )?))
     }
 
     /// `stream/read-all`'s async dispatch: loops the same offloaded read
     /// (stdin via `fs_offload`, file-input via CHECKOUT) inside the worker
     /// closure until EOF, accumulating everything into one buffer, so a
     /// multi-chunk read-to-EOF never re-enters the scheduler per chunk.
-    pub(super) fn maybe_async_read_all(stream: &Rc<StreamBox>) -> Result<Option<Value>, SemaError> {
-        if !in_async_context() && !sema_core::in_runtime_quantum() {
+    pub(super) fn maybe_async_read_all(
+        stream: &Rc<StreamBox>,
+    ) -> Result<Option<NativeOutcome>, SemaError> {
+        if !in_runtime_quantum() {
             return Ok(None);
         }
         if stream.stream_type() == "stdin" {
@@ -1003,7 +1018,7 @@ mod io_streams {
                 },
                 |bytes: Vec<u8>| Value::bytevector(bytes),
             )?;
-            return Ok(Some(v));
+            return Ok(Some(NativeOutcome::Return(v)));
         }
         if stream.stream_type() != "file-input" {
             return Ok(None);
@@ -1011,14 +1026,9 @@ mod io_streams {
         if stream.is_closed() {
             return Err(SemaError::eval("stream/read: stream is closed"));
         }
-        let s1 = stream.clone();
-        let s2 = stream.clone();
-        let s3 = stream.clone();
-        let v = checkout_offload(
+        Ok(Some(checkout_input(
             "stream/read-all",
-            move || try_checkout_input(&s1, "stream/read"),
-            move |r| reinstall_input(&s2, r),
-            move |msg| tombstone_input(&s3, msg),
+            stream,
             move |reader: &mut BufReader<std::fs::File>| -> Result<Vec<u8>, String> {
                 let mut result = Vec::new();
                 let mut chunk = [0u8; 8192];
@@ -1034,14 +1044,13 @@ mod io_streams {
                 Ok(result)
             },
             |bytes: Vec<u8>| -> Result<Value, SemaError> { Ok(Value::bytevector(bytes)) },
-        )?;
-        Ok(Some(v))
+        )?))
     }
 
     pub(super) fn maybe_async_read_line(
         stream: &Rc<StreamBox>,
-    ) -> Result<Option<Value>, SemaError> {
-        if !in_async_context() && !sema_core::in_runtime_quantum() {
+    ) -> Result<Option<NativeOutcome>, SemaError> {
+        if !in_runtime_quantum() {
             return Ok(None);
         }
         // *stdin* — see maybe_async_read: offload the blocking line read.
@@ -1068,7 +1077,7 @@ mod io_streams {
                     Some(s) => Value::string(&s),
                 },
             )?;
-            return Ok(Some(v));
+            return Ok(Some(NativeOutcome::Return(v)));
         }
         if stream.stream_type() != "file-input" {
             return Ok(None);
@@ -1076,14 +1085,9 @@ mod io_streams {
         if stream.is_closed() {
             return Err(SemaError::eval("stream/read-line: stream is closed"));
         }
-        let s1 = stream.clone();
-        let s2 = stream.clone();
-        let s3 = stream.clone();
-        let v = checkout_offload(
+        Ok(Some(checkout_input(
             "stream/read-line",
-            move || try_checkout_input(&s1, "stream/read-line"),
-            move |r| reinstall_input(&s2, r),
-            move |msg| tombstone_input(&s3, msg),
+            stream,
             move |reader: &mut BufReader<std::fs::File>| -> Result<Option<String>, String> {
                 let mut line = Vec::new();
                 let n = reader
@@ -1108,14 +1112,13 @@ mod io_streams {
                     Some(s) => Value::string(&s),
                 })
             },
-        )?;
-        Ok(Some(v))
+        )?))
     }
 
     pub(super) fn maybe_async_write(
         stream: &Rc<StreamBox>,
         data: &[u8],
-    ) -> Result<Option<Value>, SemaError> {
+    ) -> Result<Option<NativeOutcome>, SemaError> {
         maybe_async_write_decoded(stream, data, |n| Ok(Value::int(n as i64)))
     }
 
@@ -1126,7 +1129,7 @@ mod io_streams {
     pub(super) fn maybe_async_write_byte(
         stream: &Rc<StreamBox>,
         byte: u8,
-    ) -> Result<Option<Value>, SemaError> {
+    ) -> Result<Option<NativeOutcome>, SemaError> {
         maybe_async_write_decoded(stream, &[byte], |_n| Ok(Value::nil()))
     }
 
@@ -1134,81 +1137,65 @@ mod io_streams {
     fn maybe_async_write_decoded(
         stream: &Rc<StreamBox>,
         data: &[u8],
-        decode: impl Fn(usize) -> Result<Value, SemaError> + 'static,
-    ) -> Result<Option<Value>, SemaError> {
-        if (!in_async_context() && !sema_core::in_runtime_quantum())
-            || stream.stream_type() != "file-output"
-        {
+        decode: impl FnOnce(usize) -> Result<Value, SemaError> + 'static,
+    ) -> Result<Option<NativeOutcome>, SemaError> {
+        if !in_runtime_quantum() || stream.stream_type() != "file-output" {
             return Ok(None);
         }
         if stream.is_closed() {
             return Err(SemaError::eval("stream/write: stream is closed"));
         }
         let data = data.to_vec();
-        let s1 = stream.clone();
-        let s2 = stream.clone();
-        let s3 = stream.clone();
-        let v = checkout_offload(
+        Ok(Some(checkout_output(
             "stream/write",
-            move || try_checkout_output(&s1, "stream/write"),
-            move |w| reinstall_output(&s2, w),
-            move |msg| tombstone_output(&s3, msg),
+            "stream/write",
+            stream,
             move |writer: &mut BufWriter<std::fs::File>| -> Result<usize, String> {
                 writer
                     .write(&data)
                     .map_err(|e| render(format!("stream/write: I/O error: {e}")))
             },
             decode,
-        )?;
-        Ok(Some(v))
+        )?))
     }
 
-    pub(super) fn maybe_async_flush(stream: &Rc<StreamBox>) -> Result<Option<Value>, SemaError> {
-        if (!in_async_context() && !sema_core::in_runtime_quantum())
-            || stream.stream_type() != "file-output"
-        {
+    pub(super) fn maybe_async_flush(
+        stream: &Rc<StreamBox>,
+    ) -> Result<Option<NativeOutcome>, SemaError> {
+        if !in_runtime_quantum() || stream.stream_type() != "file-output" {
             return Ok(None);
         }
         if stream.is_closed() {
             return Err(SemaError::eval("stream/flush: stream is closed"));
         }
-        let s1 = stream.clone();
-        let s2 = stream.clone();
-        let s3 = stream.clone();
-        let v = checkout_offload(
+        Ok(Some(checkout_output(
             "stream/flush",
-            move || try_checkout_output(&s1, "stream/flush"),
-            move |w| reinstall_output(&s2, w),
-            move |msg| tombstone_output(&s3, msg),
+            "stream/flush",
+            stream,
             move |writer: &mut BufWriter<std::fs::File>| -> Result<(), String> {
                 writer
                     .flush()
                     .map_err(|e| render(format!("stream/flush: I/O error: {e}")))
             },
             |()| -> Result<Value, SemaError> { Ok(Value::nil()) },
-        )?;
-        Ok(Some(v))
+        )?))
     }
 
-    pub(super) fn maybe_async_close(stream: &Rc<StreamBox>) -> Result<Option<Value>, SemaError> {
-        if (!in_async_context() && !sema_core::in_runtime_quantum())
-            || stream.stream_type() != "file-output"
-        {
+    pub(super) fn maybe_async_close(
+        stream: &Rc<StreamBox>,
+    ) -> Result<Option<NativeOutcome>, SemaError> {
+        if !in_runtime_quantum() || stream.stream_type() != "file-output" {
             return Ok(None);
         }
         if stream.is_closed() {
             // Matches `StreamBox::close`'s own idempotency.
-            return Ok(Some(Value::nil()));
+            return Ok(Some(NativeOutcome::Return(Value::nil())));
         }
-        let s1 = stream.clone();
-        let s2 = stream.clone();
-        let s3 = stream.clone();
         let stream_for_finish = stream.clone();
-        let v = checkout_offload(
+        Ok(Some(checkout_output(
             "stream/close",
-            move || try_checkout_output(&s1, "stream/close"),
-            move |w| reinstall_output(&s2, w),
-            move |msg| tombstone_output(&s3, msg),
+            "stream/close",
+            stream,
             move |writer: &mut BufWriter<std::fs::File>| -> Result<(), String> {
                 writer
                     .flush()
@@ -1223,8 +1210,7 @@ mod io_streams {
                 stream_for_finish.close()?;
                 Ok(Value::nil())
             },
-        )?;
-        Ok(Some(v))
+        )?))
     }
 
     /// `stream/copy`'s async dispatch. See the module doc comment for the
@@ -1233,8 +1219,8 @@ mod io_streams {
     pub(super) fn maybe_async_copy(
         src: &Rc<StreamBox>,
         dst: &Rc<StreamBox>,
-    ) -> Result<Option<Value>, SemaError> {
-        if !in_async_context() && !sema_core::in_runtime_quantum() {
+    ) -> Result<Option<NativeOutcome>, SemaError> {
+        if !in_runtime_quantum() {
             return Ok(None);
         }
         let src_file = src.stream_type() == "file-input";
@@ -1250,15 +1236,10 @@ mod io_streams {
             if src.is_closed() {
                 return Err(SemaError::eval("stream/read: stream is closed"));
             }
-            let s1 = src.clone();
-            let s2 = src.clone();
-            let s3 = src.clone();
             let dst_for_decode = dst.clone();
-            let v = checkout_offload(
+            return Ok(Some(checkout_input(
                 "stream/copy",
-                move || try_checkout_input(&s1, "stream/copy"),
-                move |r| reinstall_input(&s2, r),
-                move |msg| tombstone_input(&s3, msg),
+                src,
                 move |reader: &mut BufReader<std::fs::File>| -> Result<Vec<u8>, String> {
                     let mut out = Vec::new();
                     let mut chunk = [0u8; 8192];
@@ -1283,8 +1264,7 @@ mod io_streams {
                     }
                     Ok(Value::int(total as i64))
                 },
-            )?;
-            return Ok(Some(v));
+            )?));
         }
 
         // dst_file: src is an in-memory or *stdin* source.
@@ -1294,14 +1274,10 @@ mod io_streams {
         // there. Keeps `(stream/copy *stdin* file-out)` from stalling the
         // cooperative scheduler while it waits on input.
         if src.stream_type() == "stdin" {
-            let s1 = dst.clone();
-            let s2 = dst.clone();
-            let s3 = dst.clone();
-            let v = checkout_offload(
+            return Ok(Some(checkout_output(
                 "stream/copy",
-                move || try_checkout_output(&s1, "stream/write"),
-                move |w| reinstall_output(&s2, w),
-                move |msg| tombstone_output(&s3, msg),
+                "stream/write",
+                dst,
                 move |writer: &mut BufWriter<std::fs::File>| -> Result<usize, String> {
                     let mut stdin = std::io::stdin();
                     let mut chunk = [0u8; 8192];
@@ -1321,8 +1297,7 @@ mod io_streams {
                     Ok(total)
                 },
                 move |total: usize| -> Result<Value, SemaError> { Ok(Value::int(total as i64)) },
-            )?;
-            return Ok(Some(v));
+            )?));
         }
 
         // In-memory source: reading is a fast in-process copy (no real I/O), so
@@ -1339,32 +1314,27 @@ mod io_streams {
         if buf.is_empty() {
             // Nothing read — the sync loop would never have touched dst
             // either, so there's nothing to offload.
-            return Ok(Some(Value::int(0)));
+            return Ok(Some(NativeOutcome::Return(Value::int(0))));
         }
         let total = buf.len();
-        let s1 = dst.clone();
-        let s2 = dst.clone();
-        let s3 = dst.clone();
-        let v = checkout_offload(
+        Ok(Some(checkout_output(
             "stream/copy",
-            move || try_checkout_output(&s1, "stream/write"),
-            move |w| reinstall_output(&s2, w),
-            move |msg| tombstone_output(&s3, msg),
+            "stream/write",
+            dst,
             move |writer: &mut BufWriter<std::fs::File>| -> Result<(), String> {
                 writer
                     .write_all(&buf)
                     .map_err(|e| render(format!("stream/copy: I/O error: {e}")))
             },
             move |()| -> Result<Value, SemaError> { Ok(Value::int(total as i64)) },
-        )?;
-        Ok(Some(v))
+        )?))
     }
 
     /// `stream/open-input`'s dispatch: async context offloads the blocking
     /// `File::open` via `fs_offload` (`io.rs`) — mirrors `db/open`, there is
     /// no existing stream to contend over. Sync stays today's shape.
     pub(super) fn open_input(path: &str) -> Result<Value, SemaError> {
-        if in_async_context() || sema_core::in_runtime_quantum() {
+        if in_runtime_quantum() {
             let path = path.to_string();
             return crate::io::fs_offload(
                 move || {
@@ -1380,7 +1350,7 @@ mod io_streams {
 
     /// `stream/open-output`'s dispatch — see `open_input`.
     pub(super) fn open_output(path: &str) -> Result<Value, SemaError> {
-        if in_async_context() || sema_core::in_runtime_quantum() {
+        if in_runtime_quantum() {
             let path = path.to_string();
             return crate::io::fs_offload(
                 move || {
@@ -1530,215 +1500,4 @@ pub fn register_io(env: &Env, sandbox: &Sandbox) {
     env.set(sema_core::intern("*stdin*"), Value::stream(StdinStream));
     env.set(sema_core::intern("*stdout*"), Value::stream(StdoutStream));
     env.set(sema_core::intern("*stderr*"), Value::stream(StderrStream));
-}
-
-/// Async-context coverage for the `stream/read-byte`, `stream/write-byte`,
-/// `stream/read-all`, and `stream/write-string` offload gates added to this
-/// file (`stream/read`, `stream/write`, `stream/read-line`, `stream/flush`,
-/// `stream/close`, and `stream/copy` already had coverage in
-/// `crates/sema/tests/stream_file_async_test.rs`, which exercises them
-/// through the real interpreter/scheduler). `sema-stdlib` doesn't depend on
-/// `sema-vm`/`sema-eval`, so these tests stand in for the scheduler by hand —
-/// force `sema_core::in_async_context()` on, call the native, then poll the
-/// `AwaitIo` handle it arms to completion — mirroring `io.rs`'s
-/// `async_offload_tests`.
-#[cfg(not(target_arch = "wasm32"))]
-#[cfg(test)]
-mod async_offload_tests {
-    use super::io_streams::{FileInputStream, FileOutputStream};
-    use super::*;
-    use std::time::{Duration, Instant};
-
-    /// Forces `in_async_context()` on for the guard's lifetime, resetting it
-    /// (even on panic/early return) — mirrors `io.rs`'s `AsyncCtxGuard`.
-    struct AsyncCtxGuard;
-    impl Drop for AsyncCtxGuard {
-        fn drop(&mut self) {
-            sema_core::set_async_context(false);
-        }
-    }
-
-    fn make_env() -> sema_core::Env {
-        let env = sema_core::Env::new();
-        register(&env);
-        env
-    }
-
-    fn tmp_path(tag: &str) -> std::path::PathBuf {
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        std::env::temp_dir().join(format!("sema-stream-async-test-{tag}-{nanos}.txt"))
-    }
-
-    /// Look up a registered native by name, returning a callable closure —
-    /// mirrors `io.rs`'s `native`.
-    fn native(env: &sema_core::Env, name: &str) -> impl Fn(&[Value]) -> Result<Value, SemaError> {
-        let f = env
-            .get(sema_core::intern(name))
-            .unwrap_or_else(|| panic!("{name} not registered"));
-        move |args: &[Value]| {
-            let nf = f.as_native_fn_ref().expect("native fn");
-            let ctx = sema_core::EvalContext::new();
-            (nf.func)(&ctx, args)
-        }
-    }
-
-    /// Call a native fn with the async-context gate forced on, then drive the
-    /// `AwaitIo` handle it arms to completion by polling — mirrors `io.rs`'s
-    /// `drive_async`. Panics if the native didn't yield at all (e.g. it
-    /// silently took the sync fallback).
-    fn drive_async(call: impl FnOnce() -> Result<Value, SemaError>) -> Value {
-        let _guard = AsyncCtxGuard;
-        sema_core::set_async_context(true);
-        let armed = call().expect("native call should arm a yield, not error synchronously");
-        assert_eq!(
-            armed,
-            Value::nil(),
-            "an offloading native returns nil immediately after arming its yield signal"
-        );
-        let reason = sema_core::take_yield_signal()
-            .expect("expected a yield signal to be armed — did the native take the sync path?");
-        let handle = match reason {
-            sema_core::YieldReason::AwaitIo(h) => h,
-            other => panic!("expected an AwaitIo yield, got {other:?}"),
-        };
-        let deadline = Instant::now() + Duration::from_secs(10);
-        loop {
-            match handle.poll() {
-                sema_core::IoPoll::Ready(Ok(v)) => return v,
-                sema_core::IoPoll::Ready(Err(e)) => panic!("offload rejected: {e}"),
-                sema_core::IoPoll::Pending => {
-                    assert!(
-                        Instant::now() < deadline,
-                        "offload never completed within 10s"
-                    );
-                    std::thread::sleep(Duration::from_millis(2));
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn stream_read_byte_offloads_and_matches_sync() {
-        let path = tmp_path("read-byte");
-        std::fs::write(&path, b"AB").unwrap();
-        let path_s = path.to_string_lossy().to_string();
-        let env = make_env();
-
-        let sync_stream = Value::stream(FileInputStream::open(&path_s).unwrap());
-        let sync_first = native(&env, "stream/read-byte")(&[sync_stream.clone()])
-            .expect("sync stream/read-byte");
-        assert_eq!(sync_first, Value::int(b'A' as i64));
-
-        let async_stream = Value::stream(FileInputStream::open(&path_s).unwrap());
-        let async_first = drive_async(|| native(&env, "stream/read-byte")(&[async_stream.clone()]));
-        let async_second =
-            drive_async(|| native(&env, "stream/read-byte")(&[async_stream.clone()]));
-        let async_eof = drive_async(|| native(&env, "stream/read-byte")(&[async_stream.clone()]));
-        assert_eq!(async_first, Value::int(b'A' as i64));
-        assert_eq!(async_second, Value::int(b'B' as i64));
-        assert_eq!(
-            async_eof,
-            Value::nil(),
-            "EOF must decode to nil, not an empty bytevector"
-        );
-
-        let _ = std::fs::remove_file(&path);
-    }
-
-    #[test]
-    fn stream_write_byte_offloads_and_matches_sync() {
-        let sync_path = tmp_path("write-byte-sync");
-        let async_path = tmp_path("write-byte-async");
-        let env = make_env();
-
-        let sync_stream =
-            Value::stream(FileOutputStream::create(&sync_path.to_string_lossy()).unwrap());
-        let sync_ret = native(&env, "stream/write-byte")(&[sync_stream.clone(), Value::int(65)])
-            .expect("sync stream/write-byte");
-        native(&env, "stream/flush")(&[sync_stream]).expect("sync flush");
-        assert_eq!(
-            sync_ret,
-            Value::nil(),
-            "stream/write-byte returns nil, unlike stream/write"
-        );
-
-        let async_stream =
-            Value::stream(FileOutputStream::create(&async_path.to_string_lossy()).unwrap());
-        let async_ret = drive_async(|| {
-            native(&env, "stream/write-byte")(&[async_stream.clone(), Value::int(65)])
-        });
-        drive_async(|| native(&env, "stream/flush")(&[async_stream.clone()]));
-        assert_eq!(
-            async_ret,
-            Value::nil(),
-            "offloaded stream/write-byte must also decode to nil, matching sync"
-        );
-
-        assert_eq!(std::fs::read(&sync_path).unwrap(), vec![65u8]);
-        assert_eq!(std::fs::read(&async_path).unwrap(), vec![65u8]);
-        let _ = std::fs::remove_file(&sync_path);
-        let _ = std::fs::remove_file(&async_path);
-    }
-
-    #[test]
-    fn stream_read_all_offloads_and_matches_sync() {
-        let path = tmp_path("read-all");
-        std::fs::write(&path, b"hello streams, read to EOF").unwrap();
-        let path_s = path.to_string_lossy().to_string();
-        let env = make_env();
-
-        let sync_stream = Value::stream(FileInputStream::open(&path_s).unwrap());
-        let sync_v = native(&env, "stream/read-all")(&[sync_stream]).expect("sync stream/read-all");
-
-        let async_stream = Value::stream(FileInputStream::open(&path_s).unwrap());
-        let async_v = drive_async(|| native(&env, "stream/read-all")(&[async_stream.clone()]));
-
-        assert_eq!(sync_v, async_v);
-        assert_eq!(
-            sync_v.as_bytevector().unwrap(),
-            b"hello streams, read to EOF"
-        );
-
-        let _ = std::fs::remove_file(&path);
-    }
-
-    #[test]
-    fn stream_write_string_offloads_and_matches_sync() {
-        let sync_path = tmp_path("write-string-sync");
-        let async_path = tmp_path("write-string-async");
-        let env = make_env();
-
-        let sync_stream =
-            Value::stream(FileOutputStream::create(&sync_path.to_string_lossy()).unwrap());
-        let sync_n = native(&env, "stream/write-string")(&[
-            sync_stream.clone(),
-            Value::string("hello world"),
-        ])
-        .expect("sync stream/write-string");
-        native(&env, "stream/flush")(&[sync_stream]).expect("sync flush");
-        assert_eq!(sync_n, Value::int(11));
-
-        let async_stream =
-            Value::stream(FileOutputStream::create(&async_path.to_string_lossy()).unwrap());
-        let async_n = drive_async(|| {
-            native(&env, "stream/write-string")(&[
-                async_stream.clone(),
-                Value::string("hello world"),
-            ])
-        });
-        drive_async(|| native(&env, "stream/flush")(&[async_stream.clone()]));
-        assert_eq!(
-            async_n,
-            Value::int(11),
-            "offloaded stream/write-string must decode the byte count, matching sync"
-        );
-
-        assert_eq!(std::fs::read_to_string(&sync_path).unwrap(), "hello world");
-        assert_eq!(std::fs::read_to_string(&async_path).unwrap(), "hello world");
-        let _ = std::fs::remove_file(&sync_path);
-        let _ = std::fs::remove_file(&async_path);
-    }
 }

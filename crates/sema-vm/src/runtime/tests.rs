@@ -3085,6 +3085,263 @@ fn interruptible_suspend(events: Arc<Mutex<Vec<&'static str>>>) -> NativeSuspend
     }
 }
 
+// --- DECISION C2: eager cancellation delivery ------------------------------
+
+/// (a) Cancelling a task parked on an External wait must run the offloaded job's
+/// executor/resource abort hook SYNCHRONOUSLY at cancellation-REQUEST time, not
+/// deferred to a later per-drive-turn scan — so a settled root followed by
+/// process exit never leaves an in-flight subprocess/request un-aborted
+/// (ASYNC-TIMEOUT-CANCEL-1). The `RecordingHook` records exactly when the abort
+/// fires; it must be recorded by `handle.cancel` itself, before any further drive.
+#[test]
+fn cancelling_external_parked_task_runs_abort_hook_at_request_time() {
+    let clock = Rc::new(FakeClock::new());
+    let runtime = runtime_with_inline_executor(clock);
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let hook = RecordingHook {
+        result: CancelResult::PendingReap,
+        calls: Arc::clone(&calls),
+        edge: None,
+        trace_ok: true,
+    };
+    let handle = runtime
+        .submit_test_root(TestPreparedTask::native(Ok(NativeOutcome::Suspend(
+            interruptible_suspend_with_hook(Arc::clone(&events), hook),
+        ))))
+        .expect("root admitted");
+    // Drive only until the external wait is registered — the task is now Waiting
+    // on its in-flight offloaded job (do NOT drain the completion yet).
+    while runtime.active_wait_count_for_test() == 0 {
+        runtime.drive(&drive_budget(1)).unwrap();
+    }
+    assert!(
+        calls.lock().unwrap().is_empty(),
+        "the abort hook must not fire before cancellation"
+    );
+    // Request cancellation: the abort hook must fire RIGHT NOW, synchronously.
+    assert!(handle.cancel(CancelReason::Explicit));
+    assert_eq!(
+        *calls.lock().unwrap(),
+        vec!["cancel"],
+        "the in-flight job's abort hook must fire at cancellation-REQUEST time"
+    );
+    assert_eq!(
+        runtime.active_wait_count_for_test(),
+        0,
+        "the external wait is deregistered exactly once at request time"
+    );
+}
+
+struct GateHoldOwner {
+    gate_slot: Rc<Cell<Option<sema_core::runtime::ResourceGateId>>>,
+    events: Arc<Mutex<Vec<String>>>,
+    stage: u8,
+    gate: Option<sema_core::runtime::ResourceGateId>,
+}
+impl Trace for GateHoldOwner {
+    fn trace(&self, _: &mut dyn FnMut(sema_core::cycle::GcEdge<'_>)) -> bool {
+        true
+    }
+}
+impl NativeContinuation for GateHoldOwner {
+    fn resume(
+        mut self: Box<Self>,
+        _: &mut NativeCallContext<'_>,
+        _input: ResumeInput,
+    ) -> NativeResult {
+        match self.stage {
+            // Stage 0: the freshly-created gate arrived — record it, then acquire.
+            0 => {
+                let ResumeInput::Runtime(sema_core::runtime::RuntimeResponse::ResourceGate(gate)) =
+                    _input
+                else {
+                    panic!("gate owner stage 0 expected a ResourceGate response");
+                };
+                self.gate_slot.set(Some(gate));
+                self.gate = Some(gate);
+                self.stage = 1;
+                Ok(NativeOutcome::Suspend(NativeSuspend {
+                    wait: WaitKind::ResourceSlot(gate),
+                    continuation: self,
+                }))
+            }
+            // Stage 1: acquired the free gate — park on a long Timer to HOLD it
+            // while the two waiters queue behind us (a Timer never fires until the
+            // clock is advanced, and produces no completion to accidentally drain,
+            // so we control exactly when the gate is released).
+            1 => {
+                self.stage = 2;
+                Ok(NativeOutcome::Suspend(NativeSuspend {
+                    wait: WaitKind::Timer(Duration::from_secs(3600)),
+                    continuation: self,
+                }))
+            }
+            // Stage 2: the hold timer fired — release the gate (granting the FIFO head).
+            _ => {
+                self.events.lock().unwrap().push("A-released".to_string());
+                Ok(NativeOutcome::Runtime(
+                    sema_core::runtime::RuntimeRequest::ReleaseResourceGate {
+                        gate: self.gate.expect("owner knows its gate"),
+                        continuation: Box::new(GateDone),
+                    },
+                ))
+            }
+        }
+    }
+}
+
+struct GateDone;
+impl Trace for GateDone {
+    fn trace(&self, _: &mut dyn FnMut(sema_core::cycle::GcEdge<'_>)) -> bool {
+        true
+    }
+}
+impl NativeContinuation for GateDone {
+    fn resume(self: Box<Self>, _: &mut NativeCallContext<'_>, _: ResumeInput) -> NativeResult {
+        Ok(NativeOutcome::Return(Value::NIL))
+    }
+}
+
+struct RecordGateGrant {
+    label: &'static str,
+    events: Arc<Mutex<Vec<String>>>,
+}
+impl Trace for RecordGateGrant {
+    fn trace(&self, _: &mut dyn FnMut(sema_core::cycle::GcEdge<'_>)) -> bool {
+        true
+    }
+}
+impl NativeContinuation for RecordGateGrant {
+    fn resume(self: Box<Self>, _: &mut NativeCallContext<'_>, input: ResumeInput) -> NativeResult {
+        let outcome = match input {
+            ResumeInput::Runtime(sema_core::runtime::RuntimeResponse::Value(_)) => "granted",
+            ResumeInput::Cancelled(_) => "cancelled",
+            ResumeInput::Failed(_) => "failed",
+            _ => "other",
+        };
+        self.events
+            .lock()
+            .unwrap()
+            .push(format!("{}-{}", self.label, outcome));
+        Ok(NativeOutcome::Return(Value::NIL))
+    }
+}
+
+/// (c) A resource-gate acquirer that is cancelled AFTER being granted the slot but
+/// BEFORE its acquire continuation runs (the granted-but-not-run window) must
+/// release the gate — its continuation raises on the cancellation without
+/// releasing, so the runtime must release for it. Proof: a THIRD acquirer, queued
+/// behind the cancelled one, proceeds (is granted the slot) rather than deadlocking
+/// on a leaked gate.
+#[test]
+fn cancelling_a_granted_but_not_run_gate_acquirer_releases_the_gate() {
+    let clock = Rc::new(FakeClock::new());
+    let runtime = runtime_with_inline_executor(clock.clone());
+    let events: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let gate_slot = Rc::new(Cell::new(None));
+
+    // Owner A: create a gate, acquire it, and hold it (parked on a long Timer).
+    let owner = runtime
+        .submit_test_root(TestPreparedTask::native(Ok(NativeOutcome::Runtime(
+            sema_core::runtime::RuntimeRequest::CreateResourceGate {
+                continuation: Box::new(GateHoldOwner {
+                    gate_slot: Rc::clone(&gate_slot),
+                    events: Arc::clone(&events),
+                    stage: 0,
+                    gate: None,
+                }),
+            },
+        ))))
+        .expect("owner root admitted");
+    // Drive until A owns the gate and is parked on its hold timer.
+    while gate_slot.get().is_none()
+        || runtime
+            .resource_gate_owner_for_test(gate_slot.get().unwrap())
+            .is_none()
+        || runtime.timer_count_for_test() == 0
+    {
+        runtime.drive(&drive_budget(1)).unwrap();
+    }
+    let gate = gate_slot.get().expect("gate created");
+
+    // Waiter B queues behind A.
+    let waiter_b = runtime
+        .submit_test_root(TestPreparedTask::native(Ok(NativeOutcome::Suspend(
+            NativeSuspend {
+                wait: WaitKind::ResourceSlot(gate),
+                continuation: Box::new(RecordGateGrant {
+                    label: "B",
+                    events: Arc::clone(&events),
+                }),
+            },
+        ))))
+        .expect("waiter B admitted");
+    // Waiter C queues behind B.
+    let waiter_c = runtime
+        .submit_test_root(TestPreparedTask::native(Ok(NativeOutcome::Suspend(
+            NativeSuspend {
+                wait: WaitKind::ResourceSlot(gate),
+                continuation: Box::new(RecordGateGrant {
+                    label: "C",
+                    events: Arc::clone(&events),
+                }),
+            },
+        ))))
+        .expect("waiter C admitted");
+    // Drive until both B and C are parked in the gate's FIFO queue behind A.
+    for _ in 0..24 {
+        runtime.drive(&drive_budget(1)).unwrap();
+    }
+    let b_task = waiter_b.main_task_for_test().expect("B task live");
+    assert_eq!(
+        runtime.resource_gate_owner_for_test(gate),
+        owner.main_task_for_test(),
+        "A still owns the gate while B and C are queued"
+    );
+
+    // Fire A's hold timer so it releases the gate, granting B. Drive one step at a
+    // time until ownership transfers to B — B is now GRANTED but has not yet run
+    // its acquire continuation (the granted-but-not-run window).
+    clock.advance(Duration::from_secs(7200));
+    let mut guard = 0;
+    while runtime.resource_gate_owner_for_test(gate) != Some(b_task) {
+        runtime.drive(&drive_budget(1)).unwrap();
+        guard += 1;
+        assert!(guard < 64, "gate never transferred to B");
+    }
+    assert!(
+        !events.lock().unwrap().iter().any(|e| e.starts_with("B-")),
+        "B must not have run its continuation yet (granted-but-not-run): {:?}",
+        events.lock().unwrap()
+    );
+
+    // Cancel B in the granted-but-not-run window. The runtime must release the
+    // gate on B's behalf so C — queued behind B — proceeds.
+    assert!(waiter_b.cancel(CancelReason::Explicit));
+    for _ in 0..40 {
+        runtime.drive(&drive_budget(4)).unwrap();
+    }
+
+    let log = events.lock().unwrap().clone();
+    assert!(
+        log.iter().any(|e| e == "C-granted"),
+        "C (queued behind the cancelled B) must be granted the released gate: {log:?}"
+    );
+    assert!(
+        !log.iter().any(|e| e == "B-granted"),
+        "the cancelled granted-but-not-run acquirer must not run its grant: {log:?}"
+    );
+    let RootPoll::Ready(c_settle) = waiter_c.poll_result() else {
+        panic!("C settles after acquiring the released gate");
+    };
+    assert!(
+        matches!(c_settle.outcome, TaskOutcome::Returned(_)),
+        "C acquires and returns: {:?}",
+        c_settle.outcome
+    );
+}
+
 #[test]
 fn wait_inline_completion_observes_registered_state_then_consumes_owners_once() {
     let events = Arc::new(Mutex::new(Vec::new()));

@@ -1602,6 +1602,268 @@ pub(crate) fn await_io_until(
     Ok(Value::nil())
 }
 
+// ── Cooperative runtime poll (event/select, io/read-key-timeout) ─────────────
+//
+// The unified-runtime analog of [`await_io_until`]: `io/read-key-timeout` and
+// `event/select` must poll a readiness source that lives ENTIRELY on the VM
+// thread (stdin, a `proc/*` handle registry, elapsed timers) — none of it is
+// `Send`, so it can't move onto a worker like a file read. Instead of the legacy
+// untraced `IoHandle`, the runtime path re-checks the source on the VM thread and
+// yields a SHORT executor sleep between scans (a `WaitKind::External` bounded
+// job, like `sleep`), so sibling tasks run while it waits. The readiness probe
+// (which may hold Sema `Value`s — e.g. `event/select`'s source maps) rides in the
+// resume continuation and is GC-traced, unlike `await_io_until`'s boxed closure.
+
+/// Completion tag for a cooperative runtime poll's inter-scan sleep. Only needs
+/// consistency between issue and prepared op; not a uniqueness key.
+#[cfg(not(target_arch = "wasm32"))]
+const RUNTIME_POLL_COMPLETION_KIND: u64 = 0x696f_706c; // "iopl"
+/// Milliseconds slept off the VM thread between readiness scans — short enough to
+/// keep a TUI/event loop responsive, off-thread so it never stalls siblings.
+#[cfg(not(target_arch = "wasm32"))]
+const RUNTIME_POLL_INTERVAL_MS: u64 = 5;
+
+/// A VM-thread readiness probe for [`await_runtime_until`]. Runs entirely on the
+/// VM thread each scan, so it MAY hold Sema `Value`s (`event/select`'s source
+/// maps); those are live GC edges while the poll is parked and are traced via the
+/// `Trace` supertrait — the runtime can account them, unlike the legacy untraced
+/// `IoHandle`.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) trait RuntimePoll: Trace {
+    /// Poll once: `Some(Ok(v))` ready (resolve to `v`), `Some(Err(e))` reject the
+    /// task with `e`, `None` keep waiting.
+    fn poll(&mut self) -> Option<Result<Value, String>>;
+}
+
+/// Cooperatively poll `probe` under the unified runtime until it yields a value
+/// or `timeout_ms` milliseconds have elapsed since `started` (then nil), yielding
+/// a short off-VM-thread sleep between scans so siblings overlap. Returns on the
+/// runtime native ABI (`NativeOutcome::Suspend`/`Return`). The runtime-native twin
+/// of [`await_io_until`].
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn await_runtime_until(
+    probe: Box<dyn RuntimePoll>,
+    started: std::time::Instant,
+    timeout_ms: u64,
+) -> NativeResult {
+    runtime_poll_step(probe, started, timeout_ms)
+}
+
+/// One scan of the cooperative poll: check the probe on the VM thread; resolve if
+/// ready, resolve to nil if the deadline passed, else re-arm the inter-scan sleep.
+#[cfg(not(target_arch = "wasm32"))]
+fn runtime_poll_step(
+    mut probe: Box<dyn RuntimePoll>,
+    started: std::time::Instant,
+    timeout_ms: u64,
+) -> NativeResult {
+    match probe.poll() {
+        Some(Ok(v)) => return Ok(NativeOutcome::Return(v)),
+        Some(Err(e)) => return Err(SemaError::eval(e)),
+        None => {}
+    }
+    if started.elapsed() >= Duration::from_millis(timeout_ms) {
+        return Ok(NativeOutcome::Return(Value::nil()));
+    }
+    let kind = CompletionKind::try_from_raw(RUNTIME_POLL_COMPLETION_KIND)
+        .expect("runtime poll completion kind is nonzero");
+    let bound = QuarantineBound::hard_deadline(FS_CLEANUP_DEADLINE)
+        .expect("runtime poll cleanup deadline is nonzero");
+    let prepared = PreparedExternalOperation::quarantined_blocking(
+        kind,
+        Box::new(RuntimePollDecoder),
+        bound,
+        move || {
+            std::thread::sleep(Duration::from_millis(RUNTIME_POLL_INTERVAL_MS));
+            Ok(Box::new(()) as SendPayload)
+        },
+    );
+    Ok(NativeOutcome::Suspend(NativeSuspend {
+        wait: WaitKind::External(Box::new(prepared)),
+        continuation: Box::new(RuntimePollContinuation {
+            probe: Some(probe),
+            started,
+            timeout_ms,
+        }),
+    }))
+}
+
+/// Nil decoder for the inter-scan sleep — the readiness re-check lives in
+/// [`RuntimePollContinuation`]; the sleep itself carries no result.
+#[cfg(not(target_arch = "wasm32"))]
+struct RuntimePollDecoder;
+
+#[cfg(not(target_arch = "wasm32"))]
+impl Trace for RuntimePollDecoder {
+    fn trace(&self, _sink: &mut dyn FnMut(GcEdge<'_>)) -> bool {
+        true
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl CompletionDecoder for RuntimePollDecoder {
+    fn decode(
+        self: Box<Self>,
+        _context: &mut NativeCallContext<'_>,
+        result: Result<SendPayload, ExternalFailure>,
+    ) -> DecodedCompletion {
+        match result {
+            Ok(_) => Ok(Value::nil()),
+            Err(failure) => Err(SemaError::eval(failure.message().to_string())),
+        }
+    }
+}
+
+/// Resumes a parked cooperative poll after its inter-scan sleep elapses: re-check
+/// the probe (start the next scan, or resolve). Carries the `RuntimePoll` probe
+/// across the park and traces any `Value` it holds.
+#[cfg(not(target_arch = "wasm32"))]
+struct RuntimePollContinuation {
+    probe: Option<Box<dyn RuntimePoll>>,
+    started: std::time::Instant,
+    timeout_ms: u64,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl Trace for RuntimePollContinuation {
+    fn trace(&self, sink: &mut dyn FnMut(GcEdge<'_>)) -> bool {
+        match &self.probe {
+            Some(probe) => probe.trace(sink),
+            None => true,
+        }
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl NativeContinuation for RuntimePollContinuation {
+    fn resume(
+        mut self: Box<Self>,
+        _context: &mut NativeCallContext<'_>,
+        input: ResumeInput,
+    ) -> NativeResult {
+        match input {
+            ResumeInput::Returned(_) => {
+                let probe = self.probe.take().expect("runtime poll probe resumed once");
+                runtime_poll_step(probe, self.started, self.timeout_ms)
+            }
+            ResumeInput::Failed(error) => Err(error),
+            ResumeInput::Cancelled(reason) => Err(SemaError::eval(format!(
+                "cooperative poll was cancelled ({reason:?})"
+            ))),
+            ResumeInput::Runtime(_) => Err(SemaError::eval(
+                "cooperative poll continuation received an unexpected runtime response",
+            )),
+        }
+    }
+}
+
+/// The VM-thread readiness probe for `io/read-key-timeout`: a keypress is ready
+/// once a byte is available on stdin; EOF resolves to nil. Holds no `Value`.
+#[cfg(not(target_arch = "wasm32"))]
+struct KeyProbe;
+
+#[cfg(not(target_arch = "wasm32"))]
+impl Trace for KeyProbe {
+    fn trace(&self, _sink: &mut dyn FnMut(GcEdge<'_>)) -> bool {
+        true
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl RuntimePoll for KeyProbe {
+    fn poll(&mut self) -> Option<Result<Value, String>> {
+        if !unix_stdin_ready(0) {
+            return None;
+        }
+        match parse_key_input() {
+            Ok(Some(v)) => Some(Ok(v)),
+            Ok(None) => {
+                STDIN_EOF.with(|f| f.set(true));
+                Some(Ok(Value::nil()))
+            }
+            Err(e) => Some(Err(e.to_string())),
+        }
+    }
+}
+
+/// Value-ABI body for `io/read-key-timeout`: the sync (blocking `select(2)`) path,
+/// plus the legacy cooperative-scheduler `in_async_context()` `AwaitIo` poll. The
+/// unified-runtime cooperative path lives in the runtime ABI ([`register_read_key_timeout`]).
+fn read_key_timeout_value(args: &[Value]) -> Result<Value, SemaError> {
+    check_arity!(args, "io/read-key-timeout", 1);
+    let ms = args[0]
+        .as_int()
+        .ok_or_else(|| SemaError::type_error("integer", args[0].type_name()))? as u64;
+
+    // In a legacy scheduler task, park on a cooperative poll instead of blocking
+    // the scheduler thread in `select(2)` for the whole timeout, so a "key OR
+    // agent progress" loop lets sibling tasks run while it waits. The sync path
+    // below is byte-identical to before.
+    #[cfg(not(target_arch = "wasm32"))]
+    if sema_core::in_async_context() {
+        if let Some(v) = sema_core::take_resume_value() {
+            return Ok(v);
+        }
+        let started = std::time::Instant::now();
+        return await_io_until(started, ms, || {
+            if !unix_stdin_ready(0) {
+                return None;
+            }
+            match parse_key_input() {
+                Ok(Some(v)) => Some(Ok(v)),
+                Ok(None) => {
+                    STDIN_EOF.with(|f| f.set(true));
+                    Some(Ok(Value::nil()))
+                }
+                Err(e) => Some(Err(e.to_string())),
+            }
+        });
+    }
+
+    if !unix_stdin_ready(ms) {
+        return Ok(Value::nil());
+    }
+    match parse_key_input()? {
+        None => {
+            STDIN_EOF.with(|f| f.set(true));
+            Ok(Value::nil())
+        }
+        Some(v) => Ok(v),
+    }
+}
+
+/// Register `io/read-key-timeout` dual-ABI: the value body serves the sync +
+/// legacy-scheduler paths; under the unified runtime the runtime body yields a
+/// cooperative External-sleep poll ([`await_runtime_until`]) so a "key OR agent
+/// progress" loop overlaps siblings without the legacy `AwaitIo` bridge.
+#[cfg(not(target_arch = "wasm32"))]
+fn register_read_key_timeout(env: &sema_core::Env) {
+    env.set(
+        sema_core::intern("io/read-key-timeout"),
+        Value::native_fn(sema_core::NativeFn::simple_with_runtime(
+            "io/read-key-timeout",
+            read_key_timeout_value,
+            |_ctx, args| {
+                if sema_core::in_runtime_quantum() {
+                    check_arity!(args, "io/read-key-timeout", 1);
+                    let ms = args[0]
+                        .as_int()
+                        .ok_or_else(|| SemaError::type_error("integer", args[0].type_name()))?
+                        as u64;
+                    let started = std::time::Instant::now();
+                    return await_runtime_until(Box::new(KeyProbe), started, ms);
+                }
+                read_key_timeout_value(args).map(NativeOutcome::Return)
+            },
+        )),
+    );
+}
+
+#[cfg(target_arch = "wasm32")]
+fn register_read_key_timeout(env: &sema_core::Env) {
+    register_fn(env, "io/read-key-timeout", read_key_timeout_value);
+}
+
 pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
     register_fn(env, "display", |args| {
         let mut output = String::new();
@@ -2843,50 +3105,7 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
 
         // io/read-key-timeout — like io/read-key but returns nil if no key arrives within
         // `timeout-ms` milliseconds.
-        register_fn(env, "io/read-key-timeout", |args| {
-            check_arity!(args, "io/read-key-timeout", 1);
-            let ms = args[0]
-                .as_int()
-                .ok_or_else(|| SemaError::type_error("integer", args[0].type_name()))?
-                as u64;
-
-            // In an async task, park on a cooperative poll instead of blocking the
-            // scheduler thread in `select(2)` for the whole timeout, so a "key OR
-            // agent progress" loop lets sibling tasks run while it waits. Once a
-            // first byte is ready `parse_key_input` may briefly block reading a
-            // multi-byte sequence — identical to the sync path — but the idle wait
-            // no longer does. The sync path below is byte-identical to before.
-            if sema_core::in_async_context() {
-                if let Some(v) = sema_core::take_resume_value() {
-                    return Ok(v);
-                }
-                let started = std::time::Instant::now();
-                return await_io_until(started, ms, || {
-                    if !unix_stdin_ready(0) {
-                        return None;
-                    }
-                    match parse_key_input() {
-                        Ok(Some(v)) => Some(Ok(v)),
-                        Ok(None) => {
-                            STDIN_EOF.with(|f| f.set(true));
-                            Some(Ok(Value::nil()))
-                        }
-                        Err(e) => Some(Err(e.to_string())),
-                    }
-                });
-            }
-
-            if !unix_stdin_ready(ms) {
-                return Ok(Value::nil());
-            }
-            match parse_key_input()? {
-                None => {
-                    STDIN_EOF.with(|f| f.set(true));
-                    Ok(Value::nil())
-                }
-                Some(v) => Ok(v),
-            }
-        });
+        register_read_key_timeout(env);
 
         // Capability probes (raw mode required; they round-trip a query + reply).
         // term/supports-kitty-keys? → bool via `CSI ?u` + DSR barrier.

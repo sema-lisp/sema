@@ -2113,6 +2113,67 @@ impl VM {
             }
         }
 
+        // Register-local instruction countdown for the dispatch loop's budget
+        // check. The naive per-opcode check (`if let Some(budget) =
+        // self.instruction_budget { ... self.instructions_executed += 1 }`)
+        // pays an `Option` load plus two `self` field accesses on every single
+        // instruction. `InstrCountdownGuard` hoists that into one `usize`
+        // local (`remaining`) that the hot loop only compares to zero and
+        // decrements; the unbudgeted case sets `remaining` to `usize::MAX` so
+        // the same branch-free code path serves both (reaching zero from
+        // `usize::MAX` would take billions of years, so the budget check is
+        // never actually observed when no budget is installed).
+        //
+        // `self.instructions_executed` is read by `run_quantum`/
+        // `run_quantum_debug` and by the nested-callback save/restore
+        // (`self.instructions_executed` around the synchronous re-entry path)
+        // immediately after `run_inner` returns — including on `Err`. Rather
+        // than hand-editing every `return` in this function (Return/Finished,
+        // every `handle_err!`/`?`-propagated `Err`, every AsyncYield/Pending/
+        // Stopped/Yielded suspend, QuantumExpired itself, and the DEBUG
+        // instantiation's Disconnect/breakpoint-stop exits), the guard's
+        // `Drop` reconciles `self.instructions_executed` from the countdown
+        // on every exit from `run_inner`, however it returns.
+        struct InstrCountdownGuard {
+            // SAFETY: points at `self.instructions_executed`, valid for the
+            // lifetime of this `run_inner` activation — the VM is not moved
+            // while borrowed `&mut` by the caller. A raw pointer (rather than
+            // a `&mut` field borrow) is required because `self` is used
+            // pervasively elsewhere in this function body (`self.frames`,
+            // `self.handle_exception`, …), which a live `&mut` borrow of one
+            // field would conflict with under the borrow checker.
+            target: *mut usize,
+            has_budget: bool,
+            start_executed: usize,
+            start_remaining: usize,
+            remaining: usize,
+        }
+        impl Drop for InstrCountdownGuard {
+            #[inline]
+            fn drop(&mut self) {
+                if self.has_budget {
+                    let consumed = self.start_remaining - self.remaining;
+                    unsafe {
+                        *self.target = self.start_executed + consumed;
+                    }
+                }
+            }
+        }
+        let mut instr_guard = {
+            let start_executed = self.instructions_executed;
+            let (has_budget, start_remaining) = match self.instruction_budget {
+                Some(budget) => (true, budget.saturating_sub(start_executed)),
+                None => (false, usize::MAX),
+            };
+            InstrCountdownGuard {
+                target: &mut self.instructions_executed as *mut usize,
+                has_budget,
+                start_executed,
+                start_remaining,
+                remaining: start_remaining,
+            }
+        };
+
         // Two-level dispatch: outer loop caches frame locals, inner loop dispatches opcodes.
         // We only break to the outer loop when frames change (Call/TailCall/Return/exceptions).
         let mut debug_poll_counter: u32 = 0;
@@ -2201,15 +2262,13 @@ impl VM {
                         "VM: program counter out of bounds (pc={pc}, len={code_len})"
                     )));
                 }
-                if let Some(budget) = self.instruction_budget {
-                    if budget == self.instructions_executed {
-                        self.frames[fi].pc = pc;
-                        return Ok(crate::debug::VmExecResult::QuantumExpired {
-                            instructions: self.instructions_executed,
-                        });
-                    }
-                    self.instructions_executed += 1;
+                if instr_guard.remaining == 0 {
+                    self.frames[fi].pc = pc;
+                    return Ok(crate::debug::VmExecResult::QuantumExpired {
+                        instructions: instr_guard.start_executed + instr_guard.start_remaining,
+                    });
                 }
+                instr_guard.remaining -= 1;
                 let op = unsafe { *code.add(pc) };
                 pc += 1;
 

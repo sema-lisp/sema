@@ -5,30 +5,30 @@
 @group test
 @desc "Run the full workspace test suite"
 task workspace:
-    cargo test --workspace
+    cargo nextest run --workspace
 
 @group test
 @desc "LSP unit + e2e (pytest) tests"
 task lsp: [release]
     @needs uv
-    cargo test -p sema-lsp
+    cargo nextest run -p sema-lsp
     cd crates/sema-lsp/tests/e2e && uv run pytest -v
 
 @group test
 @desc "Embedding benchmark (ignored) test"
 task embedding-bench:
-    cargo test -p sema-lang --test embedding_bench -- --ignored --nocapture
+    cargo nextest run -p sema-lang --test embedding_bench --run-ignored ignored-only --no-capture
 
 @group test
-@desc "HTTP integration tests (requires network)"
+@desc "HTTP client tests (in-process mock server, no network)"
 task http:
-    cargo test -p sema-lang --test http_test -- --ignored --nocapture
+    cargo nextest run -p sema-lang --test http_test --no-capture
 
 @group test
 @desc "LLM integration tests (requires API keys)"
 @require ANTHROPIC_API_KEY OPENAI_API_KEY
 task llm:
-    cargo test -p sema-lang --test llm_test -- --ignored --nocapture
+    cargo nextest run -p sema-lang --test llm_test --run-ignored ignored-only --no-capture
 
 # ── LLM provider smokes (real spend / keys) ──────────────────────────
 

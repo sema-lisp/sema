@@ -15,6 +15,10 @@ pub struct DriveBudget {
     pub root_visit_limit: NonZeroUsize,
     pub cleanup_limit: NonZeroUsize,
     pub instruction_limit_per_task: NonZeroUsize,
+    /// Wall-clock ceiling for a single `Runtime::drive` turn. The drive loop
+    /// only re-reads the clock every 64 iterations (batched to avoid a
+    /// syscall per iteration), so the turn can overshoot this limit by up to
+    /// 64 iterations' worth of work before the check observes the expiry.
     pub wall_clock_limit: Duration,
 }
 

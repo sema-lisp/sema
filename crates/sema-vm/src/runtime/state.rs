@@ -882,6 +882,12 @@ impl Runtime {
         }
         let _drive = ActiveDriveGuard(Rc::clone(&self.state));
         let start = self.state.borrow().clock.now();
+        // The quarantine-expiry and wall-clock-budget checks below read this
+        // cached value rather than the clock directly; it is refreshed every
+        // 64 iterations (see the `iters` counter in the loop), bounding how
+        // stale either check can be against a real `Instant::now()`.
+        let mut clock_now = start;
+        let mut iters: u32 = 0;
         let mut work_items = 0;
         let mut root_visits = 0;
         let mut cleanup = 0;
@@ -900,6 +906,16 @@ impl Runtime {
         let reserve_floor = reserved_roots.min(budget.work_item_limit.get().saturating_sub(1));
 
         while work_items < budget.work_item_limit.get() {
+            // Batch the clock reads that gate the checks below: a real
+            // `Instant::now()` is a syscall, and this loop can spin thousands
+            // of times per turn. Re-reading every 64 iterations (wrapping is
+            // fine — only the low bits matter) trades a bounded overshoot on
+            // the quarantine/wall-clock checks for skipping the syscall on
+            // the other 63 iterations out of every 64.
+            iters = iters.wrapping_add(1);
+            if iters % 64 == 0 {
+                clock_now = self.state.borrow().clock.now();
+            }
             // The cooperative debug barrier is armed (a task paused at a
             // breakpoint/step this turn, applied inline by `visit_ready`): stop
             // driving. No ready task runs and no timer fires until the host
@@ -921,7 +937,7 @@ impl Runtime {
                 state
                     .waits
                     .as_ref()
-                    .and_then(|waits| waits.expired_quarantine(state.clock.now()))
+                    .and_then(|waits| waits.expired_quarantine(clock_now))
             };
             if let Some(wait) = expired {
                 return Err(RuntimeFault::Invariant {
@@ -931,14 +947,7 @@ impl Runtime {
                     ),
                 });
             }
-            if self
-                .state
-                .borrow()
-                .clock
-                .now()
-                .saturating_duration_since(start)
-                >= budget.wall_clock_limit
-            {
+            if clock_now.saturating_duration_since(start) >= budget.wall_clock_limit {
                 break;
             }
             if self.state.borrow().shutting_down && self.cancel_waiting()? {

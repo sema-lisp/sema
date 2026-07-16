@@ -7112,10 +7112,8 @@ fn dispatch_complete_offload(
     offloadable: bool,
 ) -> sema_core::runtime::NativeResult {
     use sema_core::runtime::NativeOutcome;
-    if offloadable {
-        if in_runtime_offload_task() {
-            return do_complete_runtime_suspend(request, finalize);
-        }
+    if offloadable && in_runtime_offload_task() {
+        return do_complete_runtime_suspend(request, finalize);
     }
     let response = do_complete(request)?;
     track_usage(&response.usage)?;

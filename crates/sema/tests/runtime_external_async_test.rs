@@ -21,7 +21,7 @@
 
 #![cfg(not(target_arch = "wasm32"))]
 
-use std::io::{Read, Write};
+use std::io::Read;
 use std::net::TcpListener as StdTcpListener;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;

@@ -2595,7 +2595,7 @@ impl VM {
                         let saved_pc = pc - op::SIZE_OP_U16;
                         if let Err(err) = self.call_value(argc, ctx) {
                             // Drain any stale yield signal set before the error
-                            drop(sema_core::take_yield_signal());
+                            let _ = sema_core::take_yield_signal();
                             match self.handle_exception(err, saved_pc)? {
                                 ExceptionAction::Handled => {}
                                 ExceptionAction::Propagate(e) => return Err(e),
@@ -2627,7 +2627,7 @@ impl VM {
                         let saved_pc = pc - op::SIZE_OP_U16;
                         if let Err(err) = self.tail_call_value(argc, ctx) {
                             // Drain any stale yield signal set before the error
-                            drop(sema_core::take_yield_signal());
+                            let _ = sema_core::take_yield_signal();
                             match self.handle_exception(err, saved_pc)? {
                                 ExceptionAction::Handled => {}
                                 ExceptionAction::Propagate(e) => return Err(e),
@@ -2772,7 +2772,7 @@ impl VM {
                             }
                             Err(err) => {
                                 // Drain any stale yield signal set before the error
-                                drop(sema_core::take_yield_signal());
+                                let _ = sema_core::take_yield_signal();
                                 handle_err!(self, fi, pc, err, saved_pc, 'dispatch);
                             }
                         }
@@ -3215,7 +3215,7 @@ impl VM {
                                         code_len = frame.closure.func.chunk.code.len();
                                     }
                                     Err(err) => {
-                                        drop(sema_core::take_yield_signal());
+                                        let _ = sema_core::take_yield_signal();
                                         handle_err!(self, fi, pc, err, saved_pc, 'dispatch);
                                     }
                                 }
@@ -3224,7 +3224,7 @@ impl VM {
                             CachedGlobal::Plain(value) => {
                                 let func_val = value.clone();
                                 if let Err(err) = self.call_value_with(func_val, argc, ctx) {
-                                    drop(sema_core::take_yield_signal());
+                                    let _ = sema_core::take_yield_signal();
                                     match self.handle_exception(err, saved_pc)? {
                                         ExceptionAction::Handled => {}
                                         ExceptionAction::Propagate(e) => return Err(e),

@@ -11,7 +11,7 @@
 //!
 //! These gates prove: (1) a write→read round-trip matches the synchronous
 //! oracle; (2) two spawned reads run off-thread CONCURRENTLY (peak in-flight
-//! >= 2); (3) the byte/entry cap is enforced before dispatch (oversized →
+//! of 2 or more); (3) the byte/entry cap is enforced before dispatch (oversized →
 //! condition, never dispatched); (4) cancelling a spawned file op settles it
 //! Cancelled without hanging (the quarantined job is detached and reaped).
 //!

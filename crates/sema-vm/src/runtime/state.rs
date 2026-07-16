@@ -3011,7 +3011,7 @@ impl Runtime {
     /// `call` is the FIRST element's `NativeCall` (already known to target a VM
     /// closure — `invoke_callable` extracted it before delegating here). The
     /// upvalue-closing snapshot against the parked parent VM runs for EVERY
-    /// element, exactly as `invoke_callable` used to (it is not safe to hoist
+    /// element (it is not safe to hoist
     /// to a one-time snapshot before the loop): it walks not just the
     /// callable's captured env but each element's `args`, which can carry
     /// DIFFERENT closures with their own open upvalues on the parent VM's
@@ -3303,8 +3303,7 @@ impl Runtime {
                 // `vm_owner` must be populated before `quantum_to_action` runs —
                 // this loop never sets it, since every element that finishes
                 // cleanly bypasses it entirely — with exactly the
-                // `ReturnOwner::Continuation` shape the old parked-first-call
-                // path used to install.
+                // `ReturnOwner::Continuation` shape the parked path expects.
                 task.vm_owner = Some(ReturnOwner::Continuation(
                     Box::new(owner),
                     ContinuationFrame::vm_native(continuation),

@@ -710,40 +710,40 @@ F08B	crates/sema-vm/src/runtime/state.rs:1940:                YieldReason::Sleep
 F24	crates/sema-vm/src/runtime/state.rs:200:    /// child (the `async/spawn` capture that used to read each seam's
 F23	crates/sema-vm/src/runtime/state.rs:2384:                        let task = state.tasks.remove(&task_id).ok_or_else(|| {
 F03	crates/sema-vm/src/runtime/state.rs:2531:        // `async/run` (OriginBarrier): park the caller on a self-resolving-waits
-F23	crates/sema-vm/src/runtime/state.rs:26:use sema_core::YieldReason;
+F23	crates/sema-vm/src/runtime/state.rs:25:use sema_core::YieldReason;
 F24	crates/sema-vm/src/runtime/state.rs:2799:                            // one `async/spawn` layer deeper is not orphaned running
-F23	crates/sema-vm/src/runtime/state.rs:2941:                // callback (`(map channel/recv …)`) leaves a channel/promise/sleep
-F23	crates/sema-vm/src/runtime/state.rs:2950:                let native_result = match sema_core::take_yield_signal() {
-F23	crates/sema-vm/src/runtime/state.rs:2954:                             For example, `(map (fn (x) (channel/recv x)) ...)` instead of \
-F23	crates/sema-vm/src/runtime/state.rs:2955:                             `(map channel/recv ...)`.",
-F24	crates/sema-vm/src/runtime/state.rs:3376:    /// `RuntimeResponse::Promise(id)`. This is the sole `async/spawn` path.
+F23	crates/sema-vm/src/runtime/state.rs:2942:                // callback (`(map channel/recv …)`) leaves a channel/promise/sleep
+F23	crates/sema-vm/src/runtime/state.rs:2951:                let native_result = match sema_core::take_yield_signal() {
+F23	crates/sema-vm/src/runtime/state.rs:2955:                             For example, `(map (fn (x) (channel/recv x)) ...)` instead of \
+F23	crates/sema-vm/src/runtime/state.rs:2956:                             `(map channel/recv ...)`.",
+F24	crates/sema-vm/src/runtime/state.rs:3383:    /// `RuntimeResponse::Promise(id)`. This is the sole `async/spawn` path.
 F03	crates/sema-vm/src/runtime/state.rs:339:    // Count of live `OriginBarrier` (`async/run`) protocol waits. A cheap
-F24	crates/sema-vm/src/runtime/state.rs:3405:                    "async/spawn: argument must be a function (compiled VM closure)",
-F24	crates/sema-vm/src/runtime/state.rs:3421:                sema_core::SemaError::eval("async/spawn: thunk closure has no home environment"),
-F24	crates/sema-vm/src/runtime/state.rs:3435:                    sema_core::SemaError::eval("async/spawn: task identity exhausted"),
-F24	crates/sema-vm/src/runtime/state.rs:3458:                        sema_core::SemaError::eval("async/spawn: promise identity exhausted"),
-F27	crates/sema-vm/src/runtime/state.rs:3465:            // cancel edge the plan's "async/cancel through the cancellation-parent
-F23	crates/sema-vm/src/runtime/state.rs:3467:            // the tasks it spawned (e.g. a task parked on `async/await` of a child
-F27	crates/sema-vm/src/runtime/state.rs:3469:            // It does NOT make `async/await`/`all`/`race`/`timeout` cancel SUPPLIED
-F27	crates/sema-vm/src/runtime/state.rs:3511:        // (`async/pending?`, `async/cancel`) sees it Pending, and a post-spawn op
-F24	crates/sema-vm/src/runtime/state.rs:3513:        // quantum. `async/spawn` always parks its VM, so `owner` is a `VmResume`:
-F23	crates/sema-vm/src/runtime/state.rs:3686:        let mut task = state.tasks.remove(&task_id).expect("task prevalidated");
-F23	crates/sema-vm/src/runtime/state.rs:3726:    /// - root main task parked directly on `channel/recv` (top-level, no sender)
-F23	crates/sema-vm/src/runtime/state.rs:3727:    ///   → "channel/recv: channel is empty";
-F23	crates/sema-vm/src/runtime/state.rs:3728:    /// - root main task parked directly on `channel/send` (full, no receiver)
-F23	crates/sema-vm/src/runtime/state.rs:3729:    ///   → "channel/send: channel is full";
-F23	crates/sema-vm/src/runtime/state.rs:3757:            // The root main task parked directly on a `channel/recv`/`channel/send`
+F24	crates/sema-vm/src/runtime/state.rs:3412:                    "async/spawn: argument must be a function (compiled VM closure)",
+F24	crates/sema-vm/src/runtime/state.rs:3428:                sema_core::SemaError::eval("async/spawn: thunk closure has no home environment"),
+F24	crates/sema-vm/src/runtime/state.rs:3442:                    sema_core::SemaError::eval("async/spawn: task identity exhausted"),
+F24	crates/sema-vm/src/runtime/state.rs:3465:                        sema_core::SemaError::eval("async/spawn: promise identity exhausted"),
+F27	crates/sema-vm/src/runtime/state.rs:3472:            // cancel edge the plan's "async/cancel through the cancellation-parent
+F23	crates/sema-vm/src/runtime/state.rs:3474:            // the tasks it spawned (e.g. a task parked on `async/await` of a child
+F27	crates/sema-vm/src/runtime/state.rs:3476:            // It does NOT make `async/await`/`all`/`race`/`timeout` cancel SUPPLIED
+F27	crates/sema-vm/src/runtime/state.rs:3518:        // (`async/pending?`, `async/cancel`) sees it Pending, and a post-spawn op
+F24	crates/sema-vm/src/runtime/state.rs:3520:        // quantum. `async/spawn` always parks its VM, so `owner` is a `VmResume`:
+F23	crates/sema-vm/src/runtime/state.rs:3693:        let mut task = state.tasks.remove(&task_id).expect("task prevalidated");
+F23	crates/sema-vm/src/runtime/state.rs:3733:    /// - root main task parked directly on `channel/recv` (top-level, no sender)
+F23	crates/sema-vm/src/runtime/state.rs:3734:    ///   → "channel/recv: channel is empty";
+F23	crates/sema-vm/src/runtime/state.rs:3735:    /// - root main task parked directly on `channel/send` (full, no receiver)
+F23	crates/sema-vm/src/runtime/state.rs:3736:    ///   → "channel/send: channel is full";
+F23	crates/sema-vm/src/runtime/state.rs:3764:            // The root main task parked directly on a `channel/recv`/`channel/send`
 F03	crates/sema-vm/src/runtime/state.rs:376:    /// An `async/run` (`OriginBarrier`) suspension: the caller parks until every
-F23	crates/sema-vm/src/runtime/state.rs:3778:                    sema_core::SemaError::eval("channel/recv: channel is empty")
-F23	crates/sema-vm/src/runtime/state.rs:3780:                    sema_core::SemaError::eval("channel/send: channel is full").with_hint(
-F23	crates/sema-vm/src/runtime/state.rs:4402:        &format!("async/timeout: operation timed out after {duration_ms} ms"),
-F23	crates/sema-vm/src/runtime/state.rs:4403:        "async/timeout",
-F03	crates/sema-vm/src/runtime/state.rs:4607:/// Whether an `async/run` barrier for `caller` (whose origin root is `root` and
+F23	crates/sema-vm/src/runtime/state.rs:3785:                    sema_core::SemaError::eval("channel/recv: channel is empty")
+F23	crates/sema-vm/src/runtime/state.rs:3787:                    sema_core::SemaError::eval("channel/send: channel is full").with_hint(
+F23	crates/sema-vm/src/runtime/state.rs:4409:        &format!("async/timeout: operation timed out after {duration_ms} ms"),
+F23	crates/sema-vm/src/runtime/state.rs:4410:        "async/timeout",
+F03	crates/sema-vm/src/runtime/state.rs:4614:/// Whether an `async/run` barrier for `caller` (whose origin root is `root` and
 F23	crates/sema-vm/src/runtime/state.rs:461:thread_local! {
-F03	crates/sema-vm/src/runtime/state.rs:4652:                    // suspends before its own `async/run` lets a descendant park
-F03	crates/sema-vm/src/runtime/state.rs:4664:/// Register an `async/run` (`OriginBarrier`) suspension: park the caller with an
-F08B	crates/sema-vm/src/runtime/state.rs:4954:    /// A VM root/child parked on `async/sleep`: arm a runtime timer for `ms`
-F23	crates/sema-vm/src/runtime/state.rs:5200:    thread_local! {
+F03	crates/sema-vm/src/runtime/state.rs:4659:                    // suspends before its own `async/run` lets a descendant park
+F03	crates/sema-vm/src/runtime/state.rs:4671:/// Register an `async/run` (`OriginBarrier`) suspension: park the caller with an
+F08B	crates/sema-vm/src/runtime/state.rs:4961:    /// A VM root/child parked on `async/sleep`: arm a runtime timer for `ms`
+F23	crates/sema-vm/src/runtime/state.rs:5207:    thread_local! {
 F24	crates/sema-vm/src/runtime/state.rs:754:    /// shape `async/spawn` produces. Used to build multi-task origin-root graphs
 F03	crates/sema-vm/src/runtime/state.rs:755:    /// (e.g. an `async/run` barrier caller with a `ResourceSlot`-parked sibling)
 F03	crates/sema-vm/src/runtime/state.rs:940:            // Re-evaluate parked `async/run` barriers against the current
@@ -759,33 +759,33 @@ F08A	crates/sema-vm/src/runtime/wait.rs:421:                inbox.recv_timeout(t
 F08A	crates/sema-vm/src/runtime/wait.rs:423:            None => inbox.recv().ok(),
 F29	crates/sema-vm/src/vm.rs:1020:/// `CurrentVmGuard` *before* invoking the native, so an `async/spawn` handled
 F28	crates/sema-vm/src/vm.rs:13:    YieldReason, NAN_INT_SMALL_PATTERN, NAN_PAYLOAD_BITS, NAN_PAYLOAD_MASK, NAN_TAG_MASK,
-F30	crates/sema-vm/src/vm.rs:1429:            match debug.command_rx.recv() {
-F30	crates/sema-vm/src/vm.rs:1530:            match debug.command_rx.recv() {
+F30	crates/sema-vm/src/vm.rs:1431:            match debug.command_rx.recv() {
+F30	crates/sema-vm/src/vm.rs:1532:            match debug.command_rx.recv() {
 F29	crates/sema-vm/src/vm.rs:155:    /// callee is not a native fn (keywords, callables routed via `call_callback`).
-F28	crates/sema-vm/src/vm.rs:1833:                    NativeOutcome::Return(value) => match sema_core::take_yield_signal() {
-F28	crates/sema-vm/src/vm.rs:1845:        Ok(match sema_core::take_yield_signal() {
-F29	crates/sema-vm/src/vm.rs:1882:    /// `async/spawn` task or a cooperative HOF callback VM) owns its value out of
+F28	crates/sema-vm/src/vm.rs:1835:                    NativeOutcome::Return(value) => match sema_core::take_yield_signal() {
+F28	crates/sema-vm/src/vm.rs:1847:        Ok(match sema_core::take_yield_signal() {
+F29	crates/sema-vm/src/vm.rs:1884:    /// `async/spawn` task or a cooperative HOF callback VM) owns its value out of
 C17	crates/sema-vm/src/vm.rs:215:thread_local! {
-F30	crates/sema-vm/src/vm.rs:2351:                                    // spawn_blocking thread on `reply_rx.recv()`, so
-F28	crates/sema-vm/src/vm.rs:2710:                            let _ = sema_core::take_yield_signal();
-F29	crates/sema-vm/src/vm.rs:2725:                        // A non-native callable (the call_callback branch) may still
-F28	crates/sema-vm/src/vm.rs:2727:                        if let Some(reason) = sema_core::take_yield_signal() {
-F28	crates/sema-vm/src/vm.rs:2742:                            let _ = sema_core::take_yield_signal();
-F29	crates/sema-vm/src/vm.rs:2757:                        // A non-native callable (the call_callback branch) may still
-F28	crates/sema-vm/src/vm.rs:2759:                        if let Some(reason) = sema_core::take_yield_signal() {
-F28	crates/sema-vm/src/vm.rs:2887:                                let _ = sema_core::take_yield_signal();
+F30	crates/sema-vm/src/vm.rs:2353:                                    // spawn_blocking thread on `reply_rx.recv()`, so
+F28	crates/sema-vm/src/vm.rs:2712:                            let _ = sema_core::take_yield_signal();
+F29	crates/sema-vm/src/vm.rs:2727:                        // A non-native callable (the call_callback branch) may still
+F28	crates/sema-vm/src/vm.rs:2729:                        if let Some(reason) = sema_core::take_yield_signal() {
+F28	crates/sema-vm/src/vm.rs:2744:                            let _ = sema_core::take_yield_signal();
+F29	crates/sema-vm/src/vm.rs:2759:                        // A non-native callable (the call_callback branch) may still
+F28	crates/sema-vm/src/vm.rs:2761:                        if let Some(reason) = sema_core::take_yield_signal() {
+F28	crates/sema-vm/src/vm.rs:2889:                                let _ = sema_core::take_yield_signal();
 F28	crates/sema-vm/src/vm.rs:28:    LegacyYield(YieldReason),
-F28	crates/sema-vm/src/vm.rs:3330:                                        let _ = sema_core::take_yield_signal();
-F28	crates/sema-vm/src/vm.rs:3339:                                    let _ = sema_core::take_yield_signal();
-F29	crates/sema-vm/src/vm.rs:3351:                                // A non-native callable (the call_callback branch) may
-F28	crates/sema-vm/src/vm.rs:3353:                                if let Some(reason) = sema_core::take_yield_signal() {
-F29	crates/sema-vm/src/vm.rs:3801:                sema_core::call_callback(ctx, &func_val, &call_args)
-F29	crates/sema-vm/src/vm.rs:3883:                sema_core::call_callback(ctx, &func_val, &call_args)
+F28	crates/sema-vm/src/vm.rs:3332:                                        let _ = sema_core::take_yield_signal();
+F28	crates/sema-vm/src/vm.rs:3341:                                    let _ = sema_core::take_yield_signal();
+F29	crates/sema-vm/src/vm.rs:3353:                                // A non-native callable (the call_callback branch) may
+F28	crates/sema-vm/src/vm.rs:3355:                                if let Some(reason) = sema_core::take_yield_signal() {
+F29	crates/sema-vm/src/vm.rs:3803:                sema_core::call_callback(ctx, &func_val, &call_args)
+F29	crates/sema-vm/src/vm.rs:3885:                sema_core::call_callback(ctx, &func_val, &call_args)
 F28	crates/sema-vm/src/vm.rs:40:    Legacy(YieldReason),
-F29	crates/sema-vm/src/vm.rs:4187:    /// foreign stack (an `async/spawn` task, a fresh fallback VM, an inline-task
-F29	crates/sema-vm/src/vm.rs:4340:                // yield in the inner closure (channel/send, channel/recv,
-F29	crates/sema-vm/src/vm.rs:4366:                // `call_callback` (e.g. a global `define`d fn called from
-F30	crates/sema-vm/src/vm.rs:4834:        match sema_core::eval_callback(ctx, expr, &env) {
+F29	crates/sema-vm/src/vm.rs:4189:    /// foreign stack (an `async/spawn` task, a fresh fallback VM, an inline-task
+F29	crates/sema-vm/src/vm.rs:4342:                // yield in the inner closure (channel/send, channel/recv,
+F29	crates/sema-vm/src/vm.rs:4368:                // `call_callback` (e.g. a global `define`d fn called from
+F30	crates/sema-vm/src/vm.rs:4836:        match sema_core::eval_callback(ctx, expr, &env) {
 C17	crates/sema-vm/src/vm.rs:589:thread_local! {
 F29	crates/sema-vm/src/vm.rs:592:    /// via `call_callback`, the closure's fallback consults this stack so it can
 F29	crates/sema-vm/src/vm.rs:744:    // TEMPORARY BRIDGE: a legacy user closure re-entered via `call_callback`

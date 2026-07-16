@@ -1953,6 +1953,37 @@ fn nested_async_run_waits_for_inner_barrier() {
     }
 }
 
+/// Nested-barrier ordering must survive a REAPED intermediate spawner. Task A
+/// spawns B (which runs its own `(async/run)`) and returns — A settles and is
+/// removed before B's barrier resolves. The outer `(async/run)` must still wait
+/// for B. A spawn-graph walk would break here (B's parent A is gone); the
+/// park-order seq stamp does not. Deterministic `6`.
+#[test]
+fn nested_async_run_waits_across_reaped_parent() {
+    for _ in 0..8 {
+        let run = common::watchdog::run_sema_with_timeout(
+            r#"(let ((c (mutable-cell/new 0)))
+                 (async/spawn
+                   (fn ()
+                     (async/spawn
+                       (fn ()
+                         (async/spawn (fn () (async/sleep 25) (mutable-cell/set! c 5)))
+                         (async/run)
+                         (mutable-cell/set! c (+ (mutable-cell/get c) 1))))))
+                 (async/run)
+                 (println (mutable-cell/get c)))"#,
+            std::time::Duration::from_secs(15),
+        );
+        assert!(!run.timed_out, "reaped-parent nested async/run hung; stderr:\n{}", run.stderr);
+        assert!(run.status.success(), "run failed; stderr:\n{}", run.stderr);
+        assert!(
+            run.stdout.trim().ends_with('6'),
+            "expected inner continuation to run across reaped parent (6), got stdout:\n{}",
+            run.stdout
+        );
+    }
+}
+
 /// A detached child blocked SENDING on a full channel that only the barrier
 /// caller would drain is a channel-rendezvous cycle: the barrier must NOT wait
 /// on it (Channel is cycle-forming), so `(async/run)` RELEASES and "released"

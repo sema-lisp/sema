@@ -1,5 +1,38 @@
 # Structural-ABI migration — progress log
 
+## MILESTONE (2026-07-16): the legacy scheduler is DELETED (P5 — the purge)
+
+The core goal is achieved at the code level. The unified cooperative `Runtime` is the SOLE
+execution engine; there are no legacy bridges. P0–P5 of the remaining-work plan
+(docs/plans/2026-07-15-remaining-work-plan.md), all committed + verified by an exhaustive
+per-binary `cargo test --workspace` sweep (green except the one inventory-mapping deferral):
+- **P-hotfix**: per-task OTel/usage isolation (a live regression).
+- **P0**: ProcessIoExecutor real reactor — concurrency ceiling gone (16 http/get in 306ms), the
+  latent sema-llm real-network panic fixed.
+- **P1**: ResourceGate primitive + all 6 checkout-I/O modules (sqlite/kv/proc/pty/serial/stream)
+  onto WaitKind::ResourceSlot/External; mcp/call gate; event/select; C2 eager cancel + UCR-3.
+- **P3-B1 + P3-B2**: debug runs on the unified runtime for BOTH native DAP and wasm (the
+  purge-unblocking crux, R2-verified deadlock-free). B3 (cross-sibling step gating) remains as
+  refinement below the shipped feature bar.
+- **P2**: the AwaitIo funeral — the runtime is 100% off the IoHandle thread-local bridge; all
+  I/O flows through WaitKind::External. (sema-llm + ws converted; a real LLM-cancel abort fixed.)
+- **P5 (the purge)**: ~9,500 lines deleted — scheduler.rs, LegacyPromise/LegacyChannel, IoHandle,
+  SchedulerTarget/DebugCoopResume, IN_ASYNC_CONTEXT, the promise/channel/AwaitIo YieldReason
+  variants, and the ~130 dead in_async_context legacy branches. A zero-tolerance static-removal
+  gate prevents reintroduction.
+
+**Remaining (completeness / hosts / verification, NOT the core transformation):** P4 (Task-06
+TaskContext generalization — the otel/usage/llm swap is already live; workflow/tracing/mcp typed
+scopes remain); P6 (Task-07 hosts: common host API + wasm Promise-driven roots + SRV-1 http/serve
++ docs/examples/wasm-asset regen + package-boundary gate — the largest remaining, and where the
+wasm build is verified); P7 (Task-09 adversarial/fuzz/leak campaign + Task-10 six-round review);
+P8 (Task-11 profiling/benchmark/release-readiness). Plus residuals: YieldReason::Sleep cleanup
+(likely dead), the inventory-mapping per-site reconciliation (436 residual), and P3-B3.
+
+**Every phase now ends with the exhaustive per-binary sweep** (the corrected discipline after the
+mid-migration regression-recovery episode below).
+
+
 ## REGRESSION RECOVERY (2026-07-15, after an inadequate first verification)
 
 The initial "migration complete, full suite green" claim was WRONG: verification ran a subset of

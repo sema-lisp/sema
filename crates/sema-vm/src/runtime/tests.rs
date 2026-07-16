@@ -3342,6 +3342,174 @@ fn cancelling_a_granted_but_not_run_gate_acquirer_releases_the_gate() {
     );
 }
 
+/// Gate holder that acquires a resource gate and then parks FOREVER on an empty
+/// channel receive — holding the slot while blocked on a cycle-forming wait. This
+/// is the pathological topology behind the Reviewer-2 hole: a slot holder that is
+/// itself excluded from an `async/run` barrier.
+struct GateHoldOnChannel {
+    gate_slot: Rc<Cell<Option<sema_core::runtime::ResourceGateId>>>,
+    channel: sema_core::runtime::ChannelId,
+    stage: u8,
+    gate: Option<sema_core::runtime::ResourceGateId>,
+}
+impl Trace for GateHoldOnChannel {
+    fn trace(&self, _: &mut dyn FnMut(sema_core::cycle::GcEdge<'_>)) -> bool {
+        true
+    }
+}
+impl NativeContinuation for GateHoldOnChannel {
+    fn resume(
+        mut self: Box<Self>,
+        _: &mut NativeCallContext<'_>,
+        input: ResumeInput,
+    ) -> NativeResult {
+        match self.stage {
+            0 => {
+                let ResumeInput::Runtime(sema_core::runtime::RuntimeResponse::ResourceGate(gate)) =
+                    input
+                else {
+                    panic!("gate holder stage 0 expected a ResourceGate response");
+                };
+                self.gate_slot.set(Some(gate));
+                self.gate = Some(gate);
+                self.stage = 1;
+                Ok(NativeOutcome::Suspend(NativeSuspend {
+                    wait: WaitKind::ResourceSlot(gate),
+                    continuation: self,
+                }))
+            }
+            // Slot granted — park on an empty channel receive that never resolves,
+            // holding the gate forever.
+            _ => Ok(NativeOutcome::Suspend(NativeSuspend {
+                wait: WaitKind::Channel(sema_core::runtime::ChannelWait::Receive {
+                    channel: self.channel,
+                }),
+                continuation: self,
+            })),
+        }
+    }
+}
+
+/// Barrier caller: `async/run`, then record its release and return.
+struct BarrierReleaseCont {
+    events: Arc<Mutex<Vec<String>>>,
+}
+impl Trace for BarrierReleaseCont {
+    fn trace(&self, _: &mut dyn FnMut(sema_core::cycle::GcEdge<'_>)) -> bool {
+        true
+    }
+}
+impl NativeContinuation for BarrierReleaseCont {
+    fn resume(self: Box<Self>, _: &mut NativeCallContext<'_>, input: ResumeInput) -> NativeResult {
+        self.events.lock().unwrap().push(
+            match input {
+                ResumeInput::Returned(_) => "M-released",
+                ResumeInput::Failed(_) => "M-failed",
+                ResumeInput::Cancelled(_) => "M-cancelled",
+                ResumeInput::Runtime(_) => "M-runtime",
+            }
+            .to_string(),
+        );
+        Ok(NativeOutcome::Return(Value::NIL))
+    }
+}
+
+/// Hang-detection (Reviewer-2 hole, closed): `WaitKind::ResourceSlot` MUST be
+/// CYCLE-FORMING for the `async/run` barrier. A same-origin-root sibling parked on
+/// a `ResourceSlot` whose holder never releases (it is blocked forever on a
+/// channel) must NOT keep the barrier waiting — `(async/run)` releases because the
+/// slot waiter is excluded. Bounded by a drive-turn guard: were `ResourceSlot`
+/// classified self-resolving, the barrier would wait on the slot waiter forever
+/// and the guard would trip (a regression surfaces as a hang, not a pass).
+#[test]
+fn async_run_barrier_releases_over_resource_slot_cycle() {
+    let clock = Rc::new(FakeClock::new());
+    let runtime = runtime_with_inline_executor(clock);
+    let events: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let gate_slot = Rc::new(Cell::new(None));
+    // An empty channel the gate holder blocks on forever.
+    let channel = runtime.create_channel_for_test(1);
+
+    // Holder A (its own root): create a gate, acquire it, then block forever on
+    // the empty channel while HOLDING the slot.
+    runtime
+        .submit_test_root(TestPreparedTask::native(Ok(NativeOutcome::Runtime(
+            sema_core::runtime::RuntimeRequest::CreateResourceGate {
+                continuation: Box::new(GateHoldOnChannel {
+                    gate_slot: Rc::clone(&gate_slot),
+                    channel,
+                    stage: 0,
+                    gate: None,
+                }),
+            },
+        ))))
+        .expect("holder root admitted");
+    // Drive until A owns the gate and is parked on the channel.
+    let mut guard = 0;
+    while gate_slot.get().is_none()
+        || runtime
+            .resource_gate_owner_for_test(gate_slot.get().unwrap())
+            .is_none()
+    {
+        runtime.drive(&drive_budget(4)).unwrap();
+        guard += 1;
+        assert!(guard < 64, "holder never acquired the gate");
+    }
+    let gate = gate_slot.get().expect("gate created");
+
+    // Root R: main task M is the `async/run` barrier caller.
+    let barrier_root = runtime
+        .submit_test_root(TestPreparedTask::native(Ok(NativeOutcome::Runtime(
+            sema_core::runtime::RuntimeRequest::OriginBarrier {
+                continuation: Box::new(BarrierReleaseCont {
+                    events: Arc::clone(&events),
+                }),
+            },
+        ))))
+        .expect("barrier root admitted");
+    // Sibling B under R (same origin root) parks on the busy gate's ResourceSlot.
+    runtime.submit_test_child_under_root(
+        barrier_root.id(),
+        TestPreparedTask::native(Ok(NativeOutcome::Suspend(NativeSuspend {
+            wait: WaitKind::ResourceSlot(gate),
+            continuation: Box::new(RecordGateGrant {
+                label: "B",
+                events: Arc::clone(&events),
+            }),
+        }))),
+    );
+
+    // Drive until R settles — the barrier must release despite B being parked on
+    // the never-granted ResourceSlot. Bounded: a hang regression trips the guard.
+    let mut guard = 0;
+    while matches!(barrier_root.poll_result(), RootPoll::Pending) {
+        runtime.drive(&drive_budget(8)).unwrap();
+        guard += 1;
+        assert!(
+            guard < 256,
+            "async/run barrier hung on a ResourceSlot cycle (regression: ResourceSlot must be cycle-forming); events: {:?}",
+            events.lock().unwrap()
+        );
+    }
+    let RootPoll::Ready(settlement) = barrier_root.poll_result() else {
+        panic!("barrier root settles");
+    };
+    assert!(
+        matches!(settlement.outcome, TaskOutcome::Returned(_)),
+        "barrier releases and returns: {:?}",
+        settlement.outcome
+    );
+    let log = events.lock().unwrap().clone();
+    assert!(
+        log.iter().any(|e| e == "M-released"),
+        "the barrier caller resumed with nil: {log:?}"
+    );
+    assert!(
+        !log.iter().any(|e| e == "B-granted"),
+        "B is never granted the slot (its holder blocks forever): {log:?}"
+    );
+}
+
 #[test]
 fn wait_inline_completion_observes_registered_state_then_consumes_owners_once() {
     let events = Arc::new(Mutex::new(Vec::new()));

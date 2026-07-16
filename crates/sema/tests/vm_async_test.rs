@@ -1817,3 +1817,107 @@ fn map_multi_list_callback_can_await() {
         Value::list(vec![Value::int(101), Value::int(202), Value::int(303)])
     );
 }
+
+// === async/run — self-resolving-waits barrier (ASYNC-RUN-BARRIER-1) ===
+//
+// These use the out-of-process watchdog (a real wall-clock kill) so a barrier
+// regression that reintroduces a hang shows as `timed_out`, not a silent pass.
+
+/// `(async/run)` waits for a descendant parked on a REAL timer to fire (a
+/// self-resolving wait) before releasing: "bg" must print before "after-run".
+/// The pre-fix ready-drain printed "after-run" first (or dropped "bg" entirely).
+#[test]
+fn async_run_waits_for_timer_parked_descendant() {
+    let run = common::watchdog::run_sema_with_timeout(
+        r#"(begin
+             (async/spawn (fn () (async/sleep 30) (println "bg")))
+             (async/run)
+             (println "after-run"))"#,
+        std::time::Duration::from_secs(15),
+    );
+    assert!(!run.timed_out, "async/run hung; stderr:\n{}", run.stderr);
+    assert!(run.status.success(), "run failed; stderr:\n{}", run.stderr);
+    let bg = run.stdout.find("bg");
+    let after = run.stdout.find("after-run");
+    assert!(
+        bg.is_some() && after.is_some() && bg < after,
+        "expected `bg` before `after-run`, got stdout:\n{}",
+        run.stdout
+    );
+}
+
+/// Transitivity: a spawned child that itself spawns a sleeping grandchild. The
+/// barrier keeps waiting until the grandchild's self-resolving timer fires, so
+/// "grandchild" prints before "after-run".
+#[test]
+fn async_run_drains_transitively_spawned_sleeper() {
+    let run = common::watchdog::run_sema_with_timeout(
+        r#"(begin
+             (async/spawn
+               (fn ()
+                 (async/spawn (fn () (async/sleep 30) (println "grandchild")))
+                 (println "child")))
+             (async/run)
+             (println "after-run"))"#,
+        std::time::Duration::from_secs(15),
+    );
+    assert!(!run.timed_out, "async/run hung; stderr:\n{}", run.stderr);
+    assert!(run.status.success(), "run failed; stderr:\n{}", run.stderr);
+    let grandchild = run.stdout.find("grandchild");
+    let after = run.stdout.find("after-run");
+    assert!(
+        grandchild.is_some() && after.is_some() && grandchild < after,
+        "expected `grandchild` before `after-run`, got stdout:\n{}",
+        run.stdout
+    );
+}
+
+/// A detached child blocked SENDING on a full channel that only the barrier
+/// caller would drain is a channel-rendezvous cycle: the barrier must NOT wait
+/// on it (Channel is cycle-forming), so `(async/run)` RELEASES and "released"
+/// prints. If Channel were treated self-resolving this would hang → timeout.
+#[test]
+fn async_run_releases_over_channel_rendezvous_blocked_child() {
+    let run = common::watchdog::run_sema_with_timeout(
+        r#"(begin
+             (let ((ch (channel/new 1)))
+               (channel/send ch :fill)
+               (async/spawn (fn () (channel/send ch :blocked)))
+               (async/run)
+               (println "released")))"#,
+        std::time::Duration::from_secs(15),
+    );
+    assert!(
+        !run.timed_out,
+        "async/run hung on a rendezvous-blocked child; stderr:\n{}",
+        run.stderr
+    );
+    assert!(run.status.success(), "run failed; stderr:\n{}", run.stderr);
+    assert!(
+        run.stdout.contains("released"),
+        "expected `released`, got stdout:\n{}",
+        run.stdout
+    );
+}
+
+/// A parent that `await`s the very task calling `(async/run)` is a self-await
+/// cycle (Promise is cycle-forming): the inner `(async/run)` must release rather
+/// than wait on the parent that waits on it. Result flows out as 7.
+#[test]
+fn async_run_releases_under_self_awaiting_parent() {
+    let run = common::watchdog::run_sema_with_timeout(
+        r#"(println (async/await (async/spawn (fn () (async/run) 7))))"#,
+        std::time::Duration::from_secs(15),
+    );
+    assert!(
+        !run.timed_out,
+        "async/run hung on self-await; stderr:\n{}",
+        run.stderr
+    );
+    assert!(run.status.success(), "run failed; stderr:\n{}", run.stderr);
+    assert!(
+        run.stdout.contains('7'),
+        "expected `7`, got stdout:\n{}",
+        run.stdout
+    );
+}

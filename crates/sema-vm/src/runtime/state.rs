@@ -327,6 +327,13 @@ struct RuntimeState {
     // Diagnostic: protocol completions that carried an undelivered value but
     // arrived after their wait was gone. A nonzero count is a lost-message bug.
     dropped_protocol_completions: usize,
+    // Count of live `OriginBarrier` (`async/run`) protocol waits. A cheap
+    // early-out for `resolve_origin_barriers`, which the drive loop calls every
+    // iteration: zero means no barrier to re-evaluate. Incremented on install;
+    // decremented when a barrier releases or is cancelled. Overcount is harmless
+    // (a wasted scan); it is never undercounted (every install increments), so a
+    // parked barrier is never missed.
+    origin_barrier_waits: usize,
     #[cfg(test)]
     force_settlement_exhaustion: bool,
     #[cfg(test)]
@@ -356,6 +363,14 @@ enum ProtocolWaitKind {
     /// structured error if the gate is closed while parked).
     ResourceSlot {
         gate: ResourceGateId,
+    },
+    /// An `async/run` (`OriginBarrier`) suspension: the caller parks until every
+    /// OTHER task under `root` has settled or come to rest on a cycle-forming
+    /// wait (see [`Runtime::resolve_origin_barriers`]). No timer or registry
+    /// wakes it — the drive loop re-evaluates the predicate every iteration and
+    /// resumes the continuation with `Returned(nil)` once it holds.
+    OriginBarrier {
+        root: RootId,
     },
 }
 
@@ -596,6 +611,7 @@ impl Runtime {
                 debug_paused: None,
                 stepping_task: None,
                 dropped_protocol_completions: 0,
+                origin_barrier_waits: 0,
                 #[cfg(test)]
                 force_settlement_exhaustion: false,
                 #[cfg(test)]
@@ -717,6 +733,42 @@ impl Runtime {
             runtime: Rc::downgrade(&self.state),
             id: root,
         })
+    }
+
+    /// Insert an extra task under an EXISTING root (sharing its `origin_root`),
+    /// enqueued Ready — a same-origin-root sibling of the root's main task, the
+    /// shape `async/spawn` produces. Used to build multi-task origin-root graphs
+    /// (e.g. an `async/run` barrier caller with a `ResourceSlot`-parked sibling)
+    /// without a real VM closure.
+    #[cfg(test)]
+    pub(super) fn submit_test_child_under_root(
+        &self,
+        root: RootId,
+        prepared: TestPreparedTask,
+    ) -> TaskId {
+        let mut state = self.state.borrow_mut();
+        let task = state.task_ids.allocate().expect("child task identity");
+        let relations = TaskRelations {
+            origin_root: root,
+            cancellation_parent: CancellationParent::Root(root),
+            lifetime_owner: LifetimeOwner::Root(root),
+        };
+        state.tasks.insert(
+            task,
+            RuntimeTask {
+                record: TaskRecord::new(task, relations),
+                payload: TaskPayload::Test(prepared),
+                pending_resume: None,
+                suspended_owner: None,
+                vm_call: None,
+                vm_owner: None,
+                context: TaskContextHandle::default(),
+                vm_resume: None,
+                scopes: TaskScopes::default(),
+            },
+        );
+        state.ready.enqueue(root, task);
+        task
     }
 
     #[cfg(test)]
@@ -854,6 +906,15 @@ impl Runtime {
             // resumes via `debug_resume`; the turn reports `DebugStopped` below.
             if self.state.borrow().debug_paused.is_some() {
                 break;
+            }
+            // Re-evaluate parked `async/run` barriers against the current
+            // origin-root graph BEFORE the source rotation, so the release
+            // predicate is checked on every settlement/park transition this turn
+            // (ASYNC-RUN-BARRIER-1). A released barrier resumes as one work item.
+            if self.resolve_origin_barriers()? {
+                work_items += 1;
+                no_progress = 0;
+                continue;
             }
             let expired = {
                 let state = self.state.borrow();
@@ -1074,6 +1135,71 @@ impl Runtime {
         true
     }
 
+    /// Re-evaluate every parked `async/run` barrier and resume the first whose
+    /// origin-root graph has come to rest (ASYNC-RUN-BARRIER-1).
+    ///
+    /// A barrier releases (its caller resumes with nil) once NO OTHER task
+    /// sharing the caller's origin root is Ready, Running, or parked on a
+    /// SELF-RESOLVING wait — a `Timer`, an `External` operation, or a
+    /// `Timeout`-mode `PromiseSet`, all of which complete on their own. Tasks
+    /// parked on CYCLE-FORMING waits (`Promise`, all/race `PromiseSet`,
+    /// `Channel`, `ResourceSlot`, or a nested barrier) are excluded: a barrier
+    /// that waited on them could deadlock, because the awaited task may itself be
+    /// excluded (a resource-slot holder blocked on a channel the barrier caller
+    /// would service, a self-awaited parent, a rendezvous-blocked child).
+    /// Transitivity is automatic — a self-resolving sleeper's awaiter becomes
+    /// Ready when it fires, so the re-checked barrier keeps waiting for it.
+    ///
+    /// Called at the top of every `drive` iteration, so the predicate is
+    /// re-evaluated on every origin-root settlement / park transition. Resumes at
+    /// most one barrier per call: its resume marks it Ready, so a sibling barrier
+    /// on the same root then observes it live and keeps waiting (the barriers
+    /// serialize innermost-first rather than releasing en masse).
+    fn resolve_origin_barriers(&self) -> Result<bool, RuntimeFault> {
+        let mut state = self.state.borrow_mut();
+        if state.origin_barrier_waits == 0 {
+            return Ok(false);
+        }
+        let candidates: Vec<(super::WaitKey, RootId, TaskId)> = state
+            .protocol_waits
+            .iter()
+            .filter_map(|(key, wait)| match wait.kind {
+                ProtocolWaitKind::OriginBarrier { root } => Some((*key, root, wait.task)),
+                _ => None,
+            })
+            .collect();
+        let Some(key) = candidates
+            .into_iter()
+            .find(|(_, root, caller)| origin_barrier_released(&state, *root, *caller))
+            .map(|(key, _, _)| key)
+        else {
+            return Ok(false);
+        };
+        let wait = state
+            .protocol_waits
+            .remove(&key)
+            .expect("barrier wait was just observed");
+        state.origin_barrier_waits = state.origin_barrier_waits.saturating_sub(1);
+        state
+            .tasks
+            .get_mut(&wait.task)
+            .ok_or_else(|| RuntimeFault::Invariant {
+                message: "origin barrier task disappeared".into(),
+            })?
+            .record
+            .reject_wait(key)
+            .map_err(|error| RuntimeFault::Invariant {
+                message: format!("origin barrier wake transition failed: {error:?}"),
+            })?;
+        state.pending.push_back(PendingStage::Resume(
+            wait.task,
+            wait.owner,
+            wait.continuation,
+            ResumeInput::Returned(sema_core::Value::nil()),
+        ));
+        Ok(true)
+    }
+
     fn fire_timer(&self) -> Result<bool, RuntimeFault> {
         let mut state = self.state.borrow_mut();
         // Virtual-clock cooperative semantics: never fire a timer while any task
@@ -1108,6 +1234,7 @@ impl Runtime {
             },
             Some(ProtocolWaitKind::Channel { .. })
             | Some(ProtocolWaitKind::ResourceSlot { .. })
+            | Some(ProtocolWaitKind::OriginBarrier { .. })
             | None => None,
         } {
             let wait = state
@@ -1256,6 +1383,12 @@ impl Runtime {
                             let _ = state.resource_gates.take_wake(key);
                             release_owned_gate(&mut state, gate)?;
                         }
+                    }
+                    ProtocolWaitKind::OriginBarrier { .. } => {
+                        // A cancelled `async/run` barrier: nothing external to tear
+                        // down (no timer/registry). Just drop the wait and let the
+                        // continuation raise on the cancellation below.
+                        state.origin_barrier_waits = state.origin_barrier_waits.saturating_sub(1);
                     }
                 }
                 let task = state.tasks.get_mut(&task_id).expect("selected task exists");
@@ -2341,25 +2474,51 @@ impl Runtime {
         {
             return self.spawn_via_registry(task_id, owner, callable, continuation);
         }
-        // `async/run` (OriginBarrier): drain the currently-ready work of this
-        // task's origin-root to a quiescent point, then resume with nil. Realized
-        // as a zero-duration timer suspension: the virtual-clock rule in
-        // `fire_timer` only fires the deadline once no task is Ready and nothing
-        // is pending, so every ready sibling runs first. This is the CLOSEST safe
-        // behaviour, not the plan's full transitive settle-barrier: a naive
-        // barrier can deadlock on self-await and channel-rendezvous cycles, which
-        // is worse than deferring a timer-blocked descendant's side effects. The
-        // contract-vs-implementation gap and the deadlock hazards are documented
-        // as ASYNC-RUN-BARRIER-1 in docs/deferred.md (a plan-owner decision).
+        // `async/run` (OriginBarrier): park the caller on a self-resolving-waits
+        // barrier (ASYNC-RUN-BARRIER-1). The caller suspends while ANY other task
+        // in its origin-root graph is Ready, Running, or parked on a SELF-RESOLVING
+        // wait (Timer / External / a `Timeout`-mode PromiseSet — all of which
+        // complete on their own), and resumes with nil once the residual graph has
+        // settled or every remaining non-caller task is parked ONLY on a
+        // CYCLE-FORMING wait (Promise, all/race PromiseSet, Channel, ResourceSlot,
+        // or a nested barrier — waiting on those could deadlock). The predicate is
+        // re-evaluated in `resolve_origin_barriers` on every drive iteration, so
+        // transitivity is automatic: a self-resolving sleeper's awaiter becomes
+        // Ready when it fires, and the re-checked barrier keeps waiting for it. See
+        // ASYNC-RUN-BARRIER-1 (RESOLVED) in docs/deferred.md.
         if let RuntimeRequest::OriginBarrier { continuation } = request {
-            return self.install_protocol_suspend(
-                task_id,
-                owner,
-                sema_core::runtime::NativeSuspend {
-                    wait: WaitKind::Timer(Duration::ZERO),
-                    continuation,
-                },
-            );
+            let frame = ContinuationFrame::native(continuation);
+            let mut state = self.state.borrow_mut();
+            let key = match state
+                .waits
+                .as_ref()
+                .expect("wait runtime installed")
+                .issue_internal_wait()
+            {
+                Ok(key) => key,
+                Err(_) => {
+                    state.pending.push_back(PendingStage::ApplyRuntimeResponse(
+                        task_id,
+                        owner,
+                        frame,
+                        Err(sema_core::SemaError::eval(
+                            "runtime wait identity exhausted",
+                        )),
+                    ));
+                    return Ok(());
+                }
+            };
+            if let Err(error) = install_origin_barrier_wait(&mut state, task_id, key, owner, frame)
+            {
+                let (owner, frame, error) = *error;
+                state.pending.push_back(PendingStage::ApplyRuntimeResponse(
+                    task_id,
+                    owner,
+                    frame,
+                    Err(error),
+                ));
+            }
+            return Ok(());
         }
         if let RuntimeRequest::CreateResourceGate { continuation } = request {
             let response = self
@@ -3398,6 +3557,7 @@ impl Runtime {
                 }
             }
             state.handle_cleanup.extend(newly_eligible);
+            state.origin_barrier_waits = 0;
             (
                 pending,
                 std::mem::take(&mut state.protocol_waits),
@@ -4075,6 +4235,93 @@ fn install_timer_wait(
             continuation: frame,
         },
     );
+    Ok(())
+}
+
+/// Whether an `async/run` barrier for `caller` (whose origin root is `root`) may
+/// release: true when no OTHER task under `root` is Ready, Running, or parked on
+/// a SELF-RESOLVING wait. See [`Runtime::resolve_origin_barriers`] for the full
+/// classification and rationale (the Reviewer-2 hole: `ResourceSlot` MUST be
+/// cycle-forming, or the barrier hangs on a resource cycle).
+fn origin_barrier_released(state: &RuntimeState, root: RootId, caller: TaskId) -> bool {
+    !state.tasks.iter().any(|(id, task)| {
+        if *id == caller {
+            return false;
+        }
+        if task.record.relations().origin_root != root {
+            return false;
+        }
+        match task.record.state_name() {
+            // Still-live: a runnable sibling can spawn/settle more work.
+            super::StateName::Ready | super::StateName::Running => true,
+            // Done: no longer part of the residual graph.
+            super::StateName::Settled => false,
+            super::StateName::Waiting => {
+                let Some(key) = task.record.wait_key() else {
+                    // A Waiting task always carries a key; treat a missing one as
+                    // still-live rather than silently releasing early.
+                    return true;
+                };
+                match state.protocol_waits.get(&key).map(|wait| &wait.kind) {
+                    // Self-resolving — the barrier WAITS on these.
+                    Some(ProtocolWaitKind::Timer) => true,
+                    Some(ProtocolWaitKind::Promises(set)) => {
+                        matches!(set.mode, sema_core::runtime::PromiseSetMode::Timeout(_))
+                    }
+                    // Cycle-forming — the barrier does NOT wait on these.
+                    Some(ProtocolWaitKind::Channel { .. })
+                    | Some(ProtocolWaitKind::ResourceSlot { .. })
+                    | Some(ProtocolWaitKind::OriginBarrier { .. }) => false,
+                    // No protocol entry ⇒ an External wait held in the
+                    // `WaitRuntime` (a real in-flight I/O op): self-resolving.
+                    None => true,
+                }
+            }
+        }
+    })
+}
+
+/// Register an `async/run` (`OriginBarrier`) suspension: park the caller with an
+/// internal wait key and record its origin root. Nothing arms a timer or a
+/// registry — `resolve_origin_barriers` re-evaluates the release predicate every
+/// drive iteration and resumes the continuation with `Returned(nil)` once it holds.
+fn install_origin_barrier_wait(
+    state: &mut RuntimeState,
+    task_id: TaskId,
+    key: super::WaitKey,
+    owner: ReturnOwner,
+    frame: ContinuationFrame,
+) -> Result<(), ProtocolInstallError> {
+    let root = state
+        .tasks
+        .get(&task_id)
+        .expect("protocol task exists")
+        .record
+        .relations()
+        .origin_root;
+    if let Err(error) = state
+        .tasks
+        .get_mut(&task_id)
+        .expect("protocol task exists")
+        .record
+        .wait(key)
+    {
+        return Err(Box::new((
+            owner,
+            frame,
+            sema_core::SemaError::eval(format!("origin barrier wait transition failed: {error:?}")),
+        )));
+    }
+    state.protocol_waits.insert(
+        key,
+        ProtocolWait {
+            task: task_id,
+            kind: ProtocolWaitKind::OriginBarrier { root },
+            owner,
+            continuation: frame,
+        },
+    );
+    state.origin_barrier_waits += 1;
     Ok(())
 }
 

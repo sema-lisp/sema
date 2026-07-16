@@ -465,7 +465,9 @@ fn register_promise_ops(env: &Env) {
         }
     });
 
-    // async/run — drain this task's origin-root ready work, then resume nil.
+    // async/run — suspend on the self-resolving-waits barrier: wait until every
+    // OTHER task in this task's origin-root graph has settled or come to rest on a
+    // cycle-forming wait (see `Runtime::resolve_origin_barriers`), then resume nil.
     register_runtime_fn(env, "async/run", |args| {
         check_arity!(args, "async/run", 0);
         Ok(NativeOutcome::Runtime(RuntimeRequest::OriginBarrier {

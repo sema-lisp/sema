@@ -1,5 +1,19 @@
 # Structural-ABI migration — progress log
 
+## C1-DONE (2026-07-16): `async/run` self-resolving-waits barrier (ASYNC-RUN-BARRIER-1)
+
+Replaced the `async/run` ready-DRAIN (a zero-duration `Timer` suspension) with a real
+self-resolving-waits barrier. `RuntimeRequest::OriginBarrier` now parks the caller on
+`ProtocolWaitKind::OriginBarrier { root }`; `Runtime::resolve_origin_barriers` (called at the
+top of every drive iteration) resumes it once no OTHER origin-root task is Ready/Running or
+parked on a self-resolving wait (`Timer` / `External` / `Timeout`-mode `PromiseSet`). Cycle-
+forming waits (`Promise`, all·race `PromiseSet`, `Channel`, `ResourceSlot`, nested barrier) are
+excluded — `ResourceSlot` is cycle-forming per the Reviewer-2 hole (a held slot's holder may be
+excluded, so waiting on the waiter would hang). Repro now prints `bg` before `after-run`;
+transitivity is automatic via per-iteration re-check. Tests: 4 out-of-process wall-clock-guarded
+Sema tests in `vm_async_test.rs` + `async_run_barrier_releases_over_resource_slot_cycle`
+(drive-turn-bounded ResourceSlot cycle) in `runtime/tests.rs`. Deferred entry → RESOLVED.
+
 ## MILESTONE (2026-07-16): the legacy scheduler is DELETED (P5 — the purge)
 
 The core goal is achieved at the code level. The unified cooperative `Runtime` is the SOLE

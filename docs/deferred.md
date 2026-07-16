@@ -559,42 +559,52 @@ rearchitecture:
   conversion, which makes the op yield to siblings before it parks. Restore this
   test there.
 
-### ASYNC-RUN-BARRIER-1 — `async/run` is a ready-drain, not a transitive settle-barrier
+### ASYNC-RUN-BARRIER-1 — `async/run` self-resolving-waits barrier (RESOLVED)
 
-**Found 2026-07-15 by adversarial verification of the Step D2 promise migration.**
-The plan (`docs/plans/2026-07-13-unified-cooperative-runtime.md` §`async/run`) specifies
-that `(async/run)` suspends the caller until every other pending task of that origin root —
-*including transitively spawned descendants* — settles. The implementation
-(`crates/sema-vm/src/runtime/state.rs`, `RuntimeRequest::OriginBarrier`) instead drains only
-the currently-**ready** work of the origin root to a quiescent point, realized as a
-zero-duration timer suspension. This is user-observable and violates the written contract:
+**Found 2026-07-15; RESOLVED 2026-07-16 (decision C1).** `(async/run)` was a ready-DRAIN
+(`RuntimeRequest::OriginBarrier` parked the caller on a zero-duration `Timer`, so the
+virtual-clock rule ran every ready sibling then released), NOT the specified transitive
+settle-barrier. A descendant parked on a real timer (`async/sleep`) when the drain quiesced was
+left pending — `(async/spawn (fn () (async/sleep 30) (println "bg"))) (async/run)` returned
+before "bg" printed.
 
-- A descendant parked on a real timer (`async/sleep`) or otherwise not-yet-ready when the
-  barrier drains is left pending; its side effects land AFTER `async/run` returns (or never,
-  if the program then exits). Repro: `(async/spawn (fn () (async/sleep 30) (println "bg")))`
-  then `(async/run)` — "bg" is not printed before `async/run` returns.
-- A descendant parked on its own nested `async/run` resumes only after the outer barrier has
-  already returned (FIFO zero-duration timers).
+**Resolution — a self-resolving-waits barrier** (`Runtime::resolve_origin_barriers` /
+`origin_barrier_released` in `crates/sema-vm/src/runtime/state.rs`). `(async/run)` parks on a
+real `ProtocolWaitKind::OriginBarrier { root }` wait; the drive loop re-evaluates the release
+predicate at the top of EVERY iteration (so on every origin-root settlement/park transition).
+The barrier releases (caller resumes with nil) once no OTHER task sharing the caller's origin
+root is Ready, Running, or parked on a **self-resolving** wait. Classification of the residual
+graph:
 
-**Why it is deferred rather than fixed.** A naive transitive settle-barrier reintroduces a
-*worse* failure mode than dropped side effects: **scheduler deadlock/hang**. Two real hazards:
-(a) the self-await case — the caller's parent task may be `await`ing the very task that calls
-`async/run` (see `async_context_preserved_after_nested_run`), so a barrier that waits for
-"all origin-root tasks" waits on a task that is waiting on it; (b) the channel-rendezvous case
-— a detached child blocked sending on a channel that only the barrier-caller would drain
-deadlocks under a true barrier (caller waits for child, child waits for caller to receive).
-Case (a) is handled by excluding tasks transitively blocked on the caller; case (b) is NOT
-covered by that exclusion and has no obvious safe rule. A correct transitive barrier therefore
-needs a rendezvous-deadlock-aware wake predicate that is genuinely subtle to specify — and the
-current drain is safe (no hangs), passes every existing `async/run` test, and passes all six
-shipped async stress examples.
+| WaitKind (→ ProtocolWaitKind)                | class          | barrier |
+|----------------------------------------------|----------------|---------|
+| `Timer` (`Timer`)                            | self-resolving | WAITS   |
+| `External` (no protocol entry; `WaitRuntime`)| self-resolving | WAITS   |
+| `PromiseSet` **Timeout** (`Promises`)        | self-resolving | WAITS   |
+| `Promise` / `PromiseSet` all·race (`Promises`)| cycle-forming | excludes|
+| `Channel` (`Channel`)                        | cycle-forming  | excludes|
+| `ResourceSlot` (`ResourceSlot`)              | cycle-forming  | excludes|
+| nested `async/run` (`OriginBarrier`)         | cycle-forming  | excludes|
 
-**Resolution is a plan-owner decision:** either (1) amend the plan's `async/run` contract to
-"drains the ready work of the origin root to quiescence" (matching the safe implementation),
-or (2) design a deadlock-free transitive barrier (wake when every origin-root task is settled
-OR transitively blocked on the caller, with an explicit rule for rendezvous cycles). Until then
-the drain stays, documented here, to preserve runtime liveness. The code comment on
-`RuntimeRequest::OriginBarrier` points here.
+Transitivity is automatic: a self-resolving sleeper's awaiter becomes Ready when it fires, so
+the re-checked barrier keeps waiting until that too settles. The repro now prints "bg" then
+"after-run"; a transitively-spawned sleeper drains fully.
+
+**Reviewer-2 hole, closed: `ResourceSlot` MUST be cycle-forming.** A slot holder that another
+origin-root task waits on may itself be excluded (blocked on a channel the barrier caller would
+service, a self-awaited parent). Classifying `ResourceSlot` as self-resolving would make the
+barrier wait on a slot waiter whose grant never comes → hang. The hazard cases —
+self-awaited parent, channel-rendezvous-blocked child, resource-slot-blocked child — are all
+cycle-forming-parked and thus excluded, so the barrier is deadlock-free.
+
+**Tests.** `crates/sema/tests/vm_async_test.rs`: `async_run_waits_for_timer_parked_descendant`
+(the repro), `async_run_drains_transitively_spawned_sleeper`,
+`async_run_releases_over_channel_rendezvous_blocked_child`,
+`async_run_releases_under_self_awaiting_parent` — all out-of-process with a real wall-clock
+kill (a barrier hang surfaces as `timed_out`). `crates/sema-vm/src/runtime/tests.rs`:
+`async_run_barrier_releases_over_resource_slot_cycle` — a `ResourceSlot`-held-forever cycle,
+guarded by a drive-turn bound (were `ResourceSlot` self-resolving the barrier would hang and the
+guard would trip).
 
 **DAP + wasm async debugging now run ON the unified runtime (P3-B1/B2).** The
 DAP and WASM debug drivers (`crates/sema-dap`, `crates/sema-wasm`) drive a

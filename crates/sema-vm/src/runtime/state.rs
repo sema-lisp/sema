@@ -104,30 +104,17 @@ struct RuntimeTask {
     /// `async/spawn`) park: the value to inject onto the parked frame's stack
     /// top before the next `run_quantum`, or a failure to settle the task with.
     vm_resume: Option<VmResume>,
-    /// The per-task LLM dynamic scope (`llm/with-cache` / `with-budget` state),
-    /// captured from the spawner's thread-locals at `async/spawn` and installed
-    /// around each of this task's quanta (restored after). `None` for the root
-    /// task, which runs directly against the process thread-locals. The scope is a
-    /// type-erased `sema-llm` struct reached through the registered scope seam; it
-    /// carries only scalar state + a shared budget `Rc` (no GC-traceable `Value`),
-    /// so it needs no trace edge.
-    llm_scope: Option<Box<dyn std::any::Any>>,
-    /// The per-task OTel context (span stack + conversation/session/user ids),
-    /// captured from the spawner's thread-locals at `async/spawn` and installed
-    /// around each of this task's quanta (restored after) so two interleaving
-    /// tasks never share — and corrupt — the one thread-local span stack, and a
-    /// spawned task parents to its own trace rather than a sibling's. `None` for
-    /// the root task, which runs directly against the process thread-locals. The
-    /// context is a type-erased `sema-otel` struct reached through the registered
-    /// otel seam; it holds no GC-traceable `Value`, so it needs no trace edge.
-    otel: Option<Box<dyn std::any::Any>>,
-    /// The per-task leaf-usage accumulator scope, captured from the spawner's
-    /// thread-locals at `async/spawn` and installed around each of this task's
-    /// quanta (restored after) so a concurrent fan-out attributes each leaf's LLM
-    /// usage to its OWN `workflow/step` scope rather than merging siblings' tallies.
-    /// `None` for the root task. A shared `Rc` slot from `sema-llm` reached through
-    /// the registered usage-scope seam; it holds no GC-traceable `Value`.
-    usage_scope: Option<Box<dyn std::any::Any>>,
+    /// The per-task dynamic scopes (LLM `with-cache`/`with-budget` state, OTel
+    /// span-stack + conversation ids, leaf-usage accumulator), captured from the
+    /// spawner's thread-locals at `async/spawn` and swapped into/out of the process
+    /// thread-locals around each of this task's quanta (see [`TaskScopeSwap`]) so
+    /// two interleaving tasks never share — and corrupt — one thread-local span
+    /// stack / usage tally / dynamic LLM flag, and a spawned task parents to its own
+    /// trace rather than a sibling's. Empty for the root task, which runs directly
+    /// against the process thread-locals. Each scope is a type-erased `sema-llm` /
+    /// `sema-otel` value reached through a registered seam ([`TASK_SCOPE_SEAMS`]);
+    /// none holds a GC-traceable `Value`, so `scopes` needs no trace edge.
+    scopes: TaskScopes,
 }
 
 /// How a parked VM-quantum task should be resumed once its awaited promise
@@ -153,55 +140,113 @@ impl Trace for VmResume {
     }
 }
 
-/// Panic-safe swap of a task's per-quantum dynamic contexts (LLM scope, OTel
-/// context, leaf-usage scope) into and out of the process thread-locals.
+/// One per-quantum swappable dynamic scope: the three `sema-core` seam functions
+/// that capture / take / install a single type-erased thread-local scope. All the
+/// runtime's per-task dynamic contexts (LLM dynamic scope, OTel context, leaf-usage
+/// scope) share this exact shape, so [`TaskScopeSwap`] and [`TaskScopes`] drive them
+/// uniformly from the [`TASK_SCOPE_SEAMS`] table rather than repeating the swap logic
+/// once per scope. Adding a new per-task dynamic thread-local is a one-line table
+/// entry — but only for a scope that a spawned task must ISOLATE from its siblings
+/// (see `docs/plans/evidence/unified-cooperative-runtime/task-06-context-matrix.md`
+/// for why workflow/MCP context is NOT in this table).
+struct ScopeSeam {
+    /// Capture the spawner's live scope (cloning the relevant `Rc`/values) to seed
+    /// a freshly-spawned child task.
+    capture: fn() -> Box<dyn std::any::Any>,
+    /// Take the current thread-local scope out (leaving it empty/default), returning
+    /// the task's step-modified scope to carry across a suspension.
+    take: fn() -> Box<dyn std::any::Any>,
+    /// Install a scope into the thread-local, returning the one it displaced.
+    install: fn(Box<dyn std::any::Any>) -> Box<dyn std::any::Any>,
+}
+
+/// The per-task dynamic scopes swapped around every quantum, in a fixed order. Each
+/// entry's three seams reach a type-erased `sema-llm` / `sema-otel` thread-local; the
+/// registrations are installed at interpreter startup and no-op (empty box) until then.
+const TASK_SCOPE_SEAMS: [ScopeSeam; 3] = [
+    // LLM dynamic scope (`llm/with-cache` / `with-budget` flags + shared budget `Rc`).
+    ScopeSeam {
+        capture: sema_core::current_llm_scope_boxed,
+        take: sema_core::take_task_llm_scope,
+        install: sema_core::install_task_llm_scope,
+    },
+    // OTel context (span stack + conversation/session/user ids). Capture seeds an
+    // EMPTY span stack (ids only) so the child parents to its own trace root.
+    ScopeSeam {
+        capture: sema_core::current_conversation_scope_boxed,
+        take: sema_core::take_task_otel,
+        install: sema_core::install_task_otel,
+    },
+    // Leaf-usage accumulator scope (per-`workflow/step` LLM usage attribution).
+    ScopeSeam {
+        capture: sema_core::current_usage_scope_boxed,
+        take: sema_core::take_task_usage_scope,
+        install: sema_core::install_task_usage_scope,
+    },
+];
+
+/// A task's captured per-quantum dynamic scopes, one slot per [`TASK_SCOPE_SEAMS`]
+/// entry (same order). Empty (all `None`) for a root task, which runs directly
+/// against the process thread-locals. Holds no GC-traceable `Value` — the scopes
+/// carry only scalar snapshots and shared `Rc`s (budget/usage accounts), so this
+/// needs no [`Trace`] edge.
+#[derive(Default)]
+struct TaskScopes {
+    captured: [Option<Box<dyn std::any::Any>>; TASK_SCOPE_SEAMS.len()],
+}
+
+impl TaskScopes {
+    /// Snapshot the spawner's live thread-local scopes to seed a freshly-spawned
+    /// child (the `async/spawn` capture that used to read each seam's
+    /// `current_*_boxed` inline).
+    fn capture_for_spawn() -> Self {
+        Self {
+            captured: std::array::from_fn(|i| Some((TASK_SCOPE_SEAMS[i].capture)())),
+        }
+    }
+}
+
+/// Panic-safe swap of a task's per-quantum dynamic scopes into and out of the
+/// process thread-locals.
 ///
-/// `install` moves each captured context out of the task and into the
-/// thread-locals, stashing the context it displaced. `restore` takes the task's
-/// (possibly step-modified) contexts back onto the task and reinstalls the
-/// displaced ones, in lockstep across all three. If the quantum unwinds before
-/// `restore` runs, `Drop` still reinstalls the displaced contexts so a
-/// parent/sibling task's span stack and usage tally are never corrupted (the
-/// faulting task's own mid-step contexts are discarded — it will not resume).
+/// `install` moves each captured scope out of the task and into its thread-local,
+/// stashing the scope it displaced. `restore` takes the task's (possibly
+/// step-modified) scopes back onto the task and reinstalls the displaced ones, in
+/// lockstep across every seam. If the quantum unwinds before `restore` runs, `Drop`
+/// still reinstalls the displaced scopes so a parent/sibling task's span stack and
+/// usage tally are never corrupted (the faulting task's own mid-step scopes are
+/// discarded — it will not resume). The seams are independent thread-locals, so the
+/// order across them is immaterial; each is self-contained.
 struct TaskScopeSwap {
-    displaced_llm: Option<Box<dyn std::any::Any>>,
-    displaced_otel: Option<Box<dyn std::any::Any>>,
-    displaced_usage: Option<Box<dyn std::any::Any>>,
+    displaced: [Option<Box<dyn std::any::Any>>; TASK_SCOPE_SEAMS.len()],
     restored: bool,
 }
 
 impl TaskScopeSwap {
     fn install(task: &mut RuntimeTask) -> Self {
         Self {
-            displaced_llm: task.llm_scope.take().map(sema_core::install_task_llm_scope),
-            displaced_otel: task.otel.take().map(sema_core::install_task_otel),
-            displaced_usage: task
-                .usage_scope
-                .take()
-                .map(sema_core::install_task_usage_scope),
+            displaced: std::array::from_fn(|i| {
+                task.scopes.captured[i]
+                    .take()
+                    .map(TASK_SCOPE_SEAMS[i].install)
+            }),
             restored: false,
         }
     }
 
-    /// Normal-path unwind: capture the task's step-modified contexts back onto the
-    /// task, then reinstall the displaced (spawner/global) contexts. Idempotent —
+    /// Normal-path unwind: capture the task's step-modified scopes back onto the
+    /// task, then reinstall the displaced (spawner/global) scopes. Idempotent —
     /// a subsequent `Drop` is a no-op.
     fn restore(&mut self, task: &mut RuntimeTask) {
         if self.restored {
             return;
         }
         self.restored = true;
-        if let Some(prev) = self.displaced_llm.take() {
-            task.llm_scope = Some(sema_core::take_task_llm_scope());
-            let _ = sema_core::install_task_llm_scope(prev);
-        }
-        if let Some(prev) = self.displaced_otel.take() {
-            task.otel = Some(sema_core::take_task_otel());
-            let _ = sema_core::install_task_otel(prev);
-        }
-        if let Some(prev) = self.displaced_usage.take() {
-            task.usage_scope = Some(sema_core::take_task_usage_scope());
-            let _ = sema_core::install_task_usage_scope(prev);
+        for (i, displaced) in self.displaced.iter_mut().enumerate() {
+            if let Some(prev) = displaced.take() {
+                task.scopes.captured[i] = Some((TASK_SCOPE_SEAMS[i].take)());
+                let _ = (TASK_SCOPE_SEAMS[i].install)(prev);
+            }
         }
     }
 }
@@ -212,19 +257,13 @@ impl Drop for TaskScopeSwap {
             return;
         }
         // Unwind path: `restore` never ran, so we cannot reach `task`. Reinstall the
-        // displaced contexts into the thread-locals so the parent/sibling context is
-        // uncorrupted; the faulting task's own contexts are dropped with it.
-        if let Some(prev) = self.displaced_llm.take() {
-            let _ = sema_core::take_task_llm_scope();
-            let _ = sema_core::install_task_llm_scope(prev);
-        }
-        if let Some(prev) = self.displaced_otel.take() {
-            let _ = sema_core::take_task_otel();
-            let _ = sema_core::install_task_otel(prev);
-        }
-        if let Some(prev) = self.displaced_usage.take() {
-            let _ = sema_core::take_task_usage_scope();
-            let _ = sema_core::install_task_usage_scope(prev);
+        // displaced scopes into the thread-locals so the parent/sibling context is
+        // uncorrupted; the faulting task's own scopes are dropped with it.
+        for (i, displaced) in self.displaced.iter_mut().enumerate() {
+            if let Some(prev) = displaced.take() {
+                let _ = (TASK_SCOPE_SEAMS[i].take)();
+                let _ = (TASK_SCOPE_SEAMS[i].install)(prev);
+            }
         }
     }
 }
@@ -624,9 +663,7 @@ impl Runtime {
                 vm_owner: None,
                 context: TaskContextHandle::default(),
                 vm_resume: None,
-                llm_scope: None,
-                otel: None,
-                usage_scope: None,
+                scopes: TaskScopes::default(),
             },
         );
         state.ready.enqueue(root, task);
@@ -672,9 +709,7 @@ impl Runtime {
                 vm_owner: Some(ReturnOwner::Root),
                 context: TaskContextHandle::default(),
                 vm_resume: None,
-                llm_scope: None,
-                otel: None,
-                usage_scope: None,
+                scopes: TaskScopes::default(),
             },
         );
         state.ready.enqueue(root, task);
@@ -2926,26 +2961,19 @@ impl Runtime {
                     vm_owner: Some(ReturnOwner::Root),
                     context: TaskContextHandle::default(),
                     vm_resume: None,
-                    // Seed the child with a snapshot of the spawner's LLM dynamic
-                    // scope (cache/budget/rate-limit/fallback state), read from the
-                    // thread-locals the spawner is still running under. A concurrent
-                    // fan-out spawned inside one `llm/with-budget` therefore captures
-                    // the shared budget `Rc` and charges it as one aggregate, and an
-                    // `llm/with-cache` completion deferred past the thunk's extent
-                    // still sees the cache enabled — the scope rides the task, not
-                    // the (already-restored) global.
-                    llm_scope: Some(sema_core::current_llm_scope_boxed()),
-                    // Seed the child with the spawner's OTel identity (conversation/
-                    // session/user ids) and an EMPTY span stack, so the child's spans
-                    // parent to its own trace root — not whatever span a sibling
-                    // happens to have open on the shared thread-local stack when the
-                    // child is scheduled.
-                    otel: Some(sema_core::current_conversation_scope_boxed()),
-                    // Seed the child with the leaf-usage scope its `workflow/step`
-                    // opened, so a concurrent fan-out's LLM usage is attributed to
-                    // the step that spawned it rather than lost or cross-charged to a
-                    // sibling.
-                    usage_scope: Some(sema_core::current_usage_scope_boxed()),
+                    // Seed the child with a snapshot of the spawner's live dynamic
+                    // scopes, read from the thread-locals the spawner is still running
+                    // under. Per seam (`TASK_SCOPE_SEAMS`): the LLM dynamic scope so a
+                    // concurrent fan-out inside one `llm/with-budget` captures the
+                    // shared budget `Rc` (charged as one aggregate) and a deferred
+                    // `with-cache` completion still sees the cache enabled; the OTel
+                    // identity (conversation/session/user ids) with an EMPTY span stack
+                    // so the child parents to its own trace root, not a sibling's open
+                    // span; and the leaf-usage scope its `workflow/step` opened so the
+                    // fan-out's LLM usage attributes to the spawning step. Each scope
+                    // rides the task and is swapped per quantum, not the (already
+                    // restored) global.
+                    scopes: TaskScopes::capture_for_spawn(),
                 },
             );
             state.task_promises.insert(child, promise);
@@ -4590,9 +4618,15 @@ mod scope_swap_tests {
             vm_owner: None,
             context: TaskContextHandle::default(),
             vm_resume: None,
-            llm_scope: None,
-            otel: Some(Box::new(vec![seed_span])),
-            usage_scope: Some(Box::new(seed_usage)),
+            // Slots ordered per `TASK_SCOPE_SEAMS`: [LLM, OTel, usage]. No LLM scope;
+            // seed the modeled OTel span stack and leaf-usage scope.
+            scopes: TaskScopes {
+                captured: [
+                    None,
+                    Some(Box::new(vec![seed_span])),
+                    Some(Box::new(seed_usage)),
+                ],
+            },
         }
     }
 
@@ -4644,8 +4678,17 @@ mod scope_swap_tests {
         }
 
         // Both tasks retain their own accumulated context across the interleave.
-        let a_stack = a.otel.unwrap().downcast::<Vec<u64>>().unwrap();
-        let b_stack = b.otel.unwrap().downcast::<Vec<u64>>().unwrap();
+        // Slot 1 is the OTel span stack (per `TASK_SCOPE_SEAMS` order).
+        let a_stack = a.scopes.captured[1]
+            .take()
+            .unwrap()
+            .downcast::<Vec<u64>>()
+            .unwrap();
+        let b_stack = b.scopes.captured[1]
+            .take()
+            .unwrap()
+            .downcast::<Vec<u64>>()
+            .unwrap();
         assert_eq!(*a_stack, vec![10, 11]);
         assert_eq!(*b_stack, vec![20, 21]);
     }

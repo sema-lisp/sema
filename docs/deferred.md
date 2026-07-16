@@ -730,16 +730,51 @@ consumption of the promise/channel `YieldReason` variants (now structural `Nativ
 Promises, channels, and cooperative HOFs go 100% through the canonical registries + the
 structural ABI with no thread-local suspension hop.
 
-**Inventory reconciliation deferred.** `runtime_conformance_test`'s
+**Inventory reconciliation — RESOLVED (2026-07-16).** `runtime_conformance_test`'s
 `unified_runtime_inventory_mapping_covers_exact_current_matches` (mapping in
-`docs/plans/evidence/unified-cooperative-runtime/runtime-match-map.tsv`) was already RED at
-this session's baseline (migration-in-progress drift; GREEN at Task 02). The migration moved
-~1000 legacy-runtime code sites (line shifts + the LegacyPromise/LegacyChannel split + the
-NativeYield/spawned_promises deletions), so the per-site disposition mapping no longer matches
-the current source and needs a dedicated review pass to re-classify every drifted entry. The
+`docs/plans/evidence/unified-cooperative-runtime/runtime-match-map.tsv`) drifted RED during the
+migration (line shifts + the LegacyPromise/LegacyChannel split + the NativeYield/spawned_promises
+deletions moved ~1000 sites). The map has been reconciled against post-purge source: 856
+production matches, all classified into the ledger taxonomy (371 carried over by symbol-text
+from the prior classification, 485 newly classified by symbol→owning-row), zero UNREVIEWED,
+exact coverage, symbol clusters verified pure. `--check` is green and the test passes — the
+final migration-completeness audit. (Coarse-but-faithful judgment calls flagged for future
+refinement: the new `runtime/` module split across F23-F31, `runtime_offload.rs → F09B`, and
+the crate-local `runtime_eval_tests` module → F31.) The
 other two conformance guards ARE reconciled and green: `unified_runtime_legacy_symbols_match_
 baseline` (baseline regenerated to the post-migration surface — confirms NativeYield/
 PENDING_NATIVE_OUTCOME/spawned_promises/channel_bridge are gone and LegacyPromise/LegacyChannel
 are the only new legacy cells) and `no_adhoc_tokio_runtimes_outside_allowlist` (the
 interpreter's cooperative `Runtime::new` is allowlisted; in-src `tests.rs` modules are exempt
 like `tests/**`).
+
+### P6-3 WASM Promise-driven roots + P6-1 common host API (deferred — needs a browser)
+
+**Attempted 2026-07-16; fell back cleanly (shipped mechanism unchanged).** The wasm host
+(`crates/sema-wasm/src/lib.rs`) still runs the shipped **replay-with-cache** HTTP path
+(`eval_async` re-runs the whole program up to `MAX_REPLAYS=50` on each `HTTP_AWAIT_MARKER`,
+so non-idempotent side effects re-execute) and the `Atomics.wait`/SharedArrayBuffer sleep
+(`installAtomicsSleep`/`worker_atomics_sleep`). The target (P6-3) is a Promise-returning
+`eval()` driven on the unified `Runtime` across macrotask turns, with `fetch`/timers as
+JS-callback-fed `WaitKind::External` completions (program body runs ONCE, no replay), deleting
+the replay+Atomics machinery and routing cancel through `RuntimeCommandHandle::cancel_root`.
+
+**Two coupled blockers:**
+1. **P6-1 (common host API) is unimplemented** — `Interpreter::submit_str`/`submit_value`/
+   `drive`/`cancel_root`/`command_handle`, `RuntimeCommandHandle` (the only `Send` surface),
+   `RootOptions`, root-tagged `OutputEvent`. Only the low-level `Runtime::submit_root`/`drive`/
+   `poll_result`/`cancel_root` and `Interpreter::drive_vm_on_runtime` exist. P6-3 builds on
+   this surface; it must land first. (Note: `check_interrupt`/`set_interrupt_callback` is dead
+   on native — only wasm's SAB-cancel uses it — so retiring that TLS is part of P6-3, not a
+   separable native win.)
+2. **Real-browser verification is the only valid oracle.** A Promise-driven rewrite can only
+   be proven correct in a browser (http side effect fires exactly once; sleep via setTimeout
+   keeps the page responsive; fair concurrent roots; exact-root Stop). Shipping an unverified
+   rewrite of a working mechanism is prohibited. The design and a `test.fixme` Playwright gate
+   are captured in `docs/plans/2026-07-16-wasm-promise-driven-roots.md` and
+   `playground/tests/unified-runtime.spec.ts` for a future landing by someone with a browser.
+
+Pre-landing hard-audit items (flagged in the design doc): the External-HTTP resume binding a
+decoded `Value` must carry a `Trace` impl (GC invariant I2); macrotask fairness between live
+roots; cancel latency for a root suspended in an External wait; the worker-protocol rewrite
+dropping the SAB; `MessageChannel` vs `setTimeout(0)` throttling in background tabs.

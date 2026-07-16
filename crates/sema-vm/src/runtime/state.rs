@@ -1160,6 +1160,15 @@ impl Runtime {
         if state.origin_barrier_waits == 0 {
             return Ok(false);
         }
+        // Only evaluate the release predicate at a fully-quiesced point. A wake
+        // still sitting in `pending` (e.g. a settled sleeper's promise wake that
+        // has not yet transitioned its awaiter to Ready) would make the awaiter
+        // look settled/absent to `origin_barrier_released` and release the
+        // barrier one turn too early. `fire_timer` guards the same deferred-wake
+        // window; drain `pending` first and re-check next turn.
+        if !state.pending.is_empty() {
+            return Ok(false);
+        }
         let candidates: Vec<(super::WaitKey, RootId, TaskId)> = state
             .protocol_waits
             .iter()

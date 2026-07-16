@@ -1872,6 +1872,37 @@ fn async_run_drains_transitively_spawned_sleeper() {
     );
 }
 
+/// The AWAITER of a self-resolving sleeper must also complete before
+/// `(async/run)` returns — not just the sleeper itself. A settled sleeper
+/// removes its task and queues its promise wake in `pending`; the barrier check
+/// must not run at that intermediate point (the awaiter still looks parked on a
+/// cycle-forming Promise) and release early. Regression for the deferred-wake
+/// window: `B-got` (after `(async/await p)` on a spawned sleeper) must print
+/// before `after-run`.
+#[test]
+fn async_run_waits_for_awaiter_of_transitive_sleeper() {
+    let run = common::watchdog::run_sema_with_timeout(
+        r#"(begin
+             (async/spawn
+               (fn ()
+                 (let ((p (async/spawn (fn () (async/sleep 40) 99))))
+                   (async/await p)
+                   (println "B-got"))))
+             (async/run)
+             (println "after-run"))"#,
+        std::time::Duration::from_secs(15),
+    );
+    assert!(!run.timed_out, "async/run hung; stderr:\n{}", run.stderr);
+    assert!(run.status.success(), "run failed; stderr:\n{}", run.stderr);
+    let b_got = run.stdout.find("B-got");
+    let after = run.stdout.find("after-run");
+    assert!(
+        b_got.is_some() && after.is_some() && b_got < after,
+        "expected `B-got` (awaiter of a sleeper) before `after-run`, got stdout:\n{}",
+        run.stdout
+    );
+}
+
 /// A detached child blocked SENDING on a full channel that only the barrier
 /// caller would drain is a channel-rendezvous cycle: the barrier must NOT wait
 /// on it (Channel is cycle-forming), so `(async/run)` RELEASES and "released"

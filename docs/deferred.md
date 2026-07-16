@@ -560,13 +560,12 @@ tracked as bugs to fix later — the audit checked them and closed them):
 
 ## Unified runtime migration — deferred
 
-**Context (2026-07-15, Step D0 — the universal eval flip).** Every real eval
-entry point (`eval_str_compiled`, `eval_str_in_global`, `eval_in_global`) now
-drives the unified cooperative `Runtime` — it is the sole async engine for CLI,
-MCP, notebook, REPL, and tests. The legacy thread-local scheduler
-(`init_scheduler` + `VM::execute`) remains only in code paths not yet migrated
-(see below). Two async tests are `#[ignore]`d pending later steps of this
-rearchitecture:
+**Context (updated 2026-07-16, post-P5 purge).** Every eval entry point drives
+the unified cooperative `Runtime` — the sole async engine for CLI, MCP,
+notebook, REPL, DAP, wasm, and tests. The legacy thread-local scheduler is
+DELETED (P5, commit a1862f67); `scripts/check-unified-runtime-legacy.sh
+--check` enforces zero reintroduction. One async test remains `#[ignore]`d
+pending Step G (below).
 
 - **`vm_eval_is_vm_native_runs_async`** (`crates/sema/tests/vm_integration_test.rs`).
   `(eval '(await (async (+ 40 2))))` fails with "no async scheduler registered".
@@ -613,15 +612,18 @@ rearchitecture:
   (`apply` correctly keeps multimethod callees on the synchronous path since the
   cooperative Call path does not dispatch multimethods anyway).
 
+- **RESOLVED (2026-07-16, Step F / F2 conversion — commits e6b7004b, 1cabd457).**
+  `event_select_yields_to_sibling_in_async_context` is un-ignored and green:
+  `event/select` now suspends via `WaitKind::External` and yields to siblings
+  before parking. Historical description follows.
 - **`event_select_yields_to_sibling_in_async_context`**
   (`crates/sema/tests/vm_async_test.rs`). Under the runtime, `event/select`
-  resolves its own marker before a co-scheduled sibling runs (observed order
+  resolved its own marker before a co-scheduled sibling ran (observed order
   `[select-done, sibling-ran]`, expected `[sibling-ran, select-done]`). Root
-  cause: `event/select` is an I/O op still on the legacy `AwaitIo(IoHandle)`
-  bridge, which does not yield cooperatively BEFORE parking under the runtime.
-  The fix is the **Step F (external I/O sites → `WaitKind::External`)**
-  conversion, which makes the op yield to siblings before it parks. Restore this
-  test there.
+  cause: `event/select` was an I/O op on the legacy `AwaitIo(IoHandle)`
+  bridge, which did not yield cooperatively BEFORE parking under the runtime.
+  The fix was the **Step F (external I/O sites → `WaitKind::External`)**
+  conversion, which makes the op yield to siblings before it parks.
 
 ### ASYNC-RUN-BARRIER-1 — `async/run` self-resolving-waits barrier (RESOLVED)
 
@@ -680,7 +682,20 @@ frame inspection work against the runtime task's own VM frames — the legacy
 stepping does not follow control across the scheduler boundary into sibling
 tasks. SYNC debugging was always unaffected.
 
-### F2-RESIDUAL — external I/O still on the AwaitIo bridge (needs new runtime primitives)
+### F2-RESIDUAL — external I/O on the AwaitIo bridge (RESOLVED 2026-07-16)
+
+**RESOLVED 2026-07-16.** All three sub-gaps closed and the AwaitIo bridge is
+deleted (P2 "AwaitIo funeral", commit 04257fcd):
+- **F2-RESIDUAL-1** — `ResourceGate` runtime primitive (`WaitKind::ResourceSlot`,
+  FIFO acquire-queue) + the shared `checkout_external` helper; all six checkout
+  modules (proc, sqlite, kv, serial, pty, stream) converted (commits e4399de3,
+  0485e486, d385494e).
+- **F2-RESIDUAL-2** — no streaming primitive was needed: `ws` restructured onto
+  checkout + async-tier `recv` (commit 869366cd, per the P2 plan amendment).
+- **F2-RESIDUAL-3** — the executor async tier is a real reactor
+  (`ProcessIoExecutor`, tokio spawn + AbortHandle drop-on-cancel, P0 commit
+  e530fc06); sema-llm's `interruptible_async` path runs on it.
+The historical description below is retained for the record.
 
 **Found 2026-07-15, Step F2.** The one-shot request/response I/O ops (file, http, git,
 shell, sleep) are migrated to the canonical `WaitKind::External` on the ThreadPoolExecutor.
@@ -709,11 +724,18 @@ each needing a runtime primitive the plan does not define:
   io runtime (`io_spawn`) with drop-on-cancel; then all async I/O gets full concurrency + the true
   interruptible-async abort, and `runtime_offload` gains an `external_io_async` variant.
 
-Until these land, `AwaitIo`/`IoHandle`/`poll_io_waits`/`io_park`/`notify_io_complete` and the
-`run_exprs_via_runtime` `legacy_io_wakeup` arm stay — they are the runtime's I/O-offload
-transport for the residual ops, driven by the runtime (NOT the legacy scheduler).
+Until these landed, `AwaitIo`/`IoHandle`/`poll_io_waits`/`io_park`/`notify_io_complete` and the
+`run_exprs_via_runtime` `legacy_io_wakeup` arm stayed — they were the runtime's I/O-offload
+transport for the residual ops, driven by the runtime (NOT the legacy scheduler). P2 deleted them.
 
-### ASYNC-TIMEOUT-CANCEL-1 — `async/timeout` does not promptly abort a spawned child's running External job
+### ASYNC-TIMEOUT-CANCEL-1 — `async/timeout` does not promptly abort a spawned child's running External job (RESOLVED 2026-07-16)
+
+**RESOLVED 2026-07-16 (decision C2, commit d385494e).** Cancellation recorded on
+an External/IO-parked task now runs the wait teardown at request time
+(deregister → abort hook once → cancelled settlement), so a sibling
+`async/timeout` promptly aborts the child's in-flight executor job; the
+drive-scan drain is a backstop only. The UCR-3 rendezvous-cancel value-drop was
+fixed in the same pass.
 
 **Found 2026-07-15.** `(async/timeout ms (async/spawn thunk))` where the thunk runs an External
 I/O op: the timeout fires and returns the `:timeout` condition, but the child's in-flight
@@ -726,13 +748,20 @@ AwaitIo path had the same `cancellation.is_some()` precondition); it is not intr
 F2 conversion. Fix: deliver a task's cancellation to its registered External/IO wait's
 abort hook promptly when the task is cancelled by a sibling, not only at drain.
 
-### LEGACY-SCHEDULER retained (scheduler.rs, LegacyPromise/LegacyChannel, IN_ASYNC_CONTEXT, VmExecResult::AsyncYield)
+### LEGACY-SCHEDULER — purged (RESOLVED 2026-07-16, P5)
 
-The full purge in the plan's Step H is BLOCKED by the two deferrals above. `scheduler.rs` is the
-DEBUG backend (see the DAP/wasm note) and consumes the `LegacyPromise`/`LegacyChannel`
-completion cells; `IN_ASYNC_CONTEXT`, `VmExecResult::AsyncYield`, `take_yield_signal`, and the
-`YieldReason` channel/IO variants remain the transport for the residual AwaitIo I/O
-(F2-RESIDUAL). What IS fully deleted and guarded against reintroduction (see the static-scan
+**RESOLVED 2026-07-16 (P5 purge, commit a1862f67).** `scheduler.rs`,
+`LegacyPromise`/`LegacyChannel`, `IN_ASYNC_CONTEXT`, `SchedulerTarget`/
+`SchedulerRunResult`/`DebugCoopResume`, `COOP_TASK_STOP`, and the scheduler
+callback seams are deleted; `scripts/check-unified-runtime-legacy.sh --check`
+(zero-tolerance, no globs) guards against reintroduction. The sole surviving
+piece of the old TLS yield transport is `YieldReason` — now a single variant
+`Sleep(u64)` (`crates/sema-core/src/async_signal.rs:22`) carried via
+`VmExecResult::AsyncYield` — which is **live, not dead**: it is the ctx-less
+value ABI for `async/sleep`. Retiring it needs a ctx-full sleep native; a
+follow-up, not a correctness gap.
+
+What IS fully deleted and guarded against reintroduction (see the static-scan
 test): the thread-local suspension transport for LANGUAGE async —
 `YieldReason::NativeYield`, `PENDING_NATIVE_OUTCOME`, `set/take_pending_native_outcome`, the
 ad-hoc `spawned_promises`/`promise_waits`/`channel_bridge` stores, and the runtime's

@@ -144,7 +144,7 @@ pub enum DebugEvent {
     },
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StopReason {
     Breakpoint,
     Step,
@@ -473,7 +473,7 @@ pub struct VmQuantumResult {
 }
 
 /// Information about why and where the VM stopped.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StopInfo {
     pub reason: StopReason,
     pub file: Option<PathBuf>,

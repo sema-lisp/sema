@@ -43,6 +43,20 @@ pub enum DriveState {
         instructions: usize,
         ready_remaining: bool,
     },
+    /// A cooperative (headless) debug session hit a breakpoint/step inside a task
+    /// during this drive turn. The runtime-wide debug barrier is armed: the paused
+    /// task is parked with its frames intact and NO other ready task runs and NO
+    /// timer fires until the host calls [`Runtime::debug_resume`]. The host maps
+    /// this to a "stopped" event and inspects the paused task via
+    /// [`Runtime::with_paused_task_vm`].
+    ///
+    /// [`Runtime::debug_resume`]: crate::runtime::Runtime::debug_resume
+    /// [`Runtime::with_paused_task_vm`]: crate::runtime::Runtime::with_paused_task_vm
+    DebugStopped {
+        root: sema_core::runtime::RootId,
+        task: sema_core::runtime::TaskId,
+        info: crate::debug::StopInfo,
+    },
     Idle {
         next_deadline: Option<Instant>,
         inbox_wakeup_required: bool,

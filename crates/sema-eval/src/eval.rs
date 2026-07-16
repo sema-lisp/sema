@@ -298,6 +298,19 @@ impl Interpreter {
             .map_or(0, sema_vm::runtime::Runtime::live_task_count)
     }
 
+    /// The interpreter's single persistent unified runtime. Present outside of
+    /// `Drop`. A host that needs finer control than [`drive_vm_on_runtime`] — the
+    /// cooperative (headless) debugger, which drives bounded turns and maps
+    /// `DriveState::DebugStopped` to a stopped event rather than driving to
+    /// settlement — submits its root and drives here directly.
+    ///
+    /// [`drive_vm_on_runtime`]: Self::drive_vm_on_runtime
+    pub fn runtime(&self) -> &sema_vm::runtime::Runtime {
+        self.runtime
+            .as_ref()
+            .expect("runtime is present outside of Drop")
+    }
+
     pub fn drive_vm_on_runtime(&self, vm: sema_vm::VM) -> EvalResult {
         use sema_vm::runtime::{DriveBudget, DriveState, RootPoll};
 

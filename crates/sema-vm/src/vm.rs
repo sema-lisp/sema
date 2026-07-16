@@ -1947,6 +1947,15 @@ impl VM {
         let outcome = loop {
             match self.run_inner::<true>(ctx, Some(debug)) {
                 Ok(crate::debug::VmExecResult::Stopped(info)) => {
+                    // Cooperative (wasm/headless) session: there is no command
+                    // channel to block on. SURFACE the stop out of the quantum as
+                    // `Stopped(info)` so `run_parked_quantum` parks the task, arms
+                    // the runtime-wide debug barrier, and returns
+                    // `TaskAction::DebugStop`; the host resumes via `debug_resume`.
+                    if debug.is_headless() {
+                        break Ok(crate::debug::VmExecResult::Stopped(info));
+                    }
+                    // Blocking (native DAP) session: serve inspection right here.
                     match self.handle_debug_stop(ctx, debug, info) {
                         DebugStopResume::Resume => continue,
                         DebugStopResume::Disconnect => {

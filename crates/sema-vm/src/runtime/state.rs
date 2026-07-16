@@ -279,6 +279,23 @@ struct RuntimeState {
     turn_instructions: usize,
     shutting_down: bool,
     terminal_fault: Option<RuntimeFault>,
+    /// Cooperative (headless) debug barrier. `Some((root, task, info))` while a
+    /// task is paused at a breakpoint/step: the paused task is parked in `tasks`
+    /// with its frames in `vm_call`, held OUT of the ready queue. While set, the
+    /// drive loop runs no ready task and fires no timer — a runtime-wide
+    /// stop-the-world barrier (external completions may still land in the inbox,
+    /// they are just not delivered until resume). Cleared by
+    /// [`Runtime::debug_resume`], which re-enqueues the paused task.
+    debug_paused: Option<(RootId, TaskId, crate::debug::StopInfo)>,
+    /// The task the DAP frontend is stepping (StepInto/Over/Out), if any. The
+    /// debug quantum applies step-mode stop logic only when running this task, so
+    /// a step that suspends over an `await` lets siblings run (breakpoints only)
+    /// and re-arms when the stepping task next runs. B3 refines the cross-sibling
+    /// semantics; the field is threaded here so the barrier bookkeeping is final.
+    /// Unused until B3 wires the per-task step gating (the current single-runnable
+    /// step tests do not need it, since only the stepping task resumes).
+    #[allow(dead_code)]
+    stepping_task: Option<TaskId>,
     // Diagnostic: protocol completions that carried an undelivered value but
     // arrived after their wait was gone. A nonzero count is a lost-message bug.
     dropped_protocol_completions: usize,
@@ -549,6 +566,8 @@ impl Runtime {
                 turn_instructions: 0,
                 shutting_down: false,
                 terminal_fault: None,
+                debug_paused: None,
+                stepping_task: None,
                 dropped_protocol_completions: 0,
                 #[cfg(test)]
                 force_settlement_exhaustion: false,
@@ -806,6 +825,13 @@ impl Runtime {
         let reserve_floor = reserved_roots.min(budget.work_item_limit.get().saturating_sub(1));
 
         while work_items < budget.work_item_limit.get() {
+            // The cooperative debug barrier is armed (a task paused at a
+            // breakpoint/step this turn, applied inline by `visit_ready`): stop
+            // driving. No ready task runs and no timer fires until the host
+            // resumes via `debug_resume`; the turn reports `DebugStopped` below.
+            if self.state.borrow().debug_paused.is_some() {
+                break;
+            }
             let expired = {
                 let state = self.state.borrow();
                 state
@@ -896,6 +922,17 @@ impl Runtime {
         if let Some(fault) = &state.terminal_fault {
             return Err(fault.clone());
         }
+        // A cooperative debug stop armed the barrier during this turn: report it
+        // so the host raises a stopped event and inspects the paused task. Takes
+        // precedence over `Progress` (the stopping `visit_ready` counted a work
+        // item) — the runtime is frozen, not merely making progress.
+        if let Some((root, task, info)) = &state.debug_paused {
+            return Ok(DriveState::DebugStopped {
+                root: *root,
+                task: *task,
+                info: info.clone(),
+            });
+        }
         let ready_remaining = state
             .tasks
             .values()
@@ -955,6 +992,78 @@ impl Runtime {
             .waits
             .as_mut()
             .is_some_and(|waits| waits.block_on_inbox(deadline))
+    }
+
+    /// Whether a cooperative (headless) debug session is currently paused at a
+    /// breakpoint/step (the runtime-wide barrier is armed).
+    pub fn is_debug_paused(&self) -> bool {
+        self.state.borrow().debug_paused.is_some()
+    }
+
+    /// Clear the cooperative debug barrier and re-enqueue the paused task so the
+    /// next [`drive`] resumes its frame. The host sets the step mode on its
+    /// `DebugState` (reached via `ACTIVE_DEBUG` during the quantum) BEFORE calling
+    /// this. Back-enqueue is correct: the barrier gated every sibling for the
+    /// whole pause, so the paused task's position in the queue is irrelevant.
+    ///
+    /// A no-op (returns `false`) when nothing is paused.
+    ///
+    /// [`drive`]: Self::drive
+    pub fn debug_resume(&self) -> bool {
+        let mut state = self.state.borrow_mut();
+        let Some((root, task_id, _info)) = state.debug_paused.take() else {
+            return false;
+        };
+        // The paused task is `Ready` (parked by the `DebugStop` handler) and holds
+        // its frames in `vm_call`; enqueueing it lets the next `visit_ready`
+        // resume the frame in place (no injected resume value — an ordinary
+        // quantum re-entry that continues past the breakpoint under the step mode
+        // the host just set).
+        state.ready.enqueue(root, task_id);
+        true
+    }
+
+    /// Reach the VM of the task paused at a cooperative debug stop, for
+    /// inspection (stack trace / locals / evaluate). Returns `None` when no task
+    /// is paused or its VM is not parked (should not happen while `debug_paused`
+    /// is set). The paused task's VM never leaves the runtime — this borrows it in
+    /// place, so resume is an ordinary quantum re-entry.
+    pub fn with_paused_task_vm<R>(&self, f: impl FnOnce(&mut VM) -> R) -> Option<R> {
+        let mut state = self.state.borrow_mut();
+        let (_root, task_id, _info) = state.debug_paused.as_ref()?;
+        let task_id = *task_id;
+        let vm = state.tasks.get_mut(&task_id)?.vm_call.as_mut()?;
+        Some(f(vm))
+    }
+
+    /// Abandon a cooperative debug session paused at a breakpoint (the Stop
+    /// button): clear the barrier, request cancellation on the paused task, and
+    /// cancel its root so an awaiting parent and siblings tear down. The paused
+    /// task is re-enqueued so the next [`drive`] settles it Cancelled (dropping
+    /// its parked frames) rather than resuming past the breakpoint. Bounded by the
+    /// caller's subsequent drive; a no-op (`false`) when nothing is paused.
+    ///
+    /// This is what keeps an abandoned session from poisoning the next one on the
+    /// same persistent runtime: without it the barrier would stay armed and freeze
+    /// every future drive.
+    ///
+    /// [`drive`]: Self::drive
+    pub fn debug_cancel_paused(&self) -> bool {
+        let paused = self.state.borrow_mut().debug_paused.take();
+        let Some((root, task_id, _info)) = paused else {
+            return false;
+        };
+        {
+            let mut state = self.state.borrow_mut();
+            if let Some(task) = state.tasks.get_mut(&task_id) {
+                task.record.request_cancellation(CancelReason::HostStop);
+            }
+            state.ready.enqueue(root, task_id);
+        }
+        // Cancel the root's main task too so a parent parked on `await` (and any
+        // siblings) unwind rather than dangling once the paused child is dropped.
+        self.cancel_root(root, CancelReason::HostStop);
+        true
     }
 
     fn fire_timer(&self) -> Result<bool, RuntimeFault> {
@@ -1645,6 +1754,16 @@ impl Runtime {
                 task.vm_call = Some(vm);
                 TaskAction::Yield(root, task_id)
             }
+            // A cooperative (headless) debug session surfaced a breakpoint/step
+            // stop out of the quantum (native DAP served it inline and never
+            // returns `Stopped` here). Park the task with its frames intact —
+            // exactly like `QuantumExpired` — and hand back a `DebugStop` so the
+            // barrier is armed. The frame is mid-execution: `vm_owner` stays put
+            // and the task re-enters this same frame on resume.
+            Ok(VmExecResult::Stopped(info)) => {
+                task.vm_call = Some(vm);
+                TaskAction::DebugStop(root, task_id, info)
+            }
             // A native yielded the VM through the TLS yield signal (surfaced as
             // `AsyncYield`). The VM has already parked its frame (pc past the
             // call, a nil placeholder on the stack top) and stays in `vm_call`;
@@ -1813,10 +1932,19 @@ impl Runtime {
                 });
             }
         }
-        self.state
-            .borrow_mut()
-            .pending
-            .push_back(PendingStage::Action(action));
+        // A cooperative debug stop must arm the runtime-wide barrier THIS turn,
+        // before any sibling `visit_ready`, `fire_timer`, or completion delivery
+        // runs — apply it inline rather than deferring through the pending queue
+        // (which the source rotation would interleave other work ahead of). The
+        // task is already re-inserted above with its `vm_call` set.
+        if matches!(action, TaskAction::DebugStop(..)) {
+            self.apply_action(action)?;
+        } else {
+            self.state
+                .borrow_mut()
+                .pending
+                .push_back(PendingStage::Action(action));
+        }
         Ok(true)
     }
 
@@ -1918,6 +2046,25 @@ impl Runtime {
                 }
             }
             TaskAction::VmAwaitIo(task_id, handle) => self.await_io(task_id, handle)?,
+            TaskAction::DebugStop(root, task_id, info) => {
+                let mut state = self.state.borrow_mut();
+                let task =
+                    state
+                        .tasks
+                        .get_mut(&task_id)
+                        .ok_or_else(|| RuntimeFault::Invariant {
+                            message: "debug-stopped task disappeared".into(),
+                        })?;
+                // Park the task Ready but OUT of the ready queue (the barrier
+                // holds it; `debug_resume` enqueues it). The frames live in
+                // `vm_call`; the record was `Running` after `visit_ready::start`.
+                task.record
+                    .yield_ready()
+                    .map_err(|error| RuntimeFault::Invariant {
+                        message: format!("debug-stopped task failed to park: {error:?}"),
+                    })?;
+                state.debug_paused = Some((root, task_id, info));
+            }
             #[cfg(test)]
             TaskAction::Timer(task_id, deadline) => {
                 let mut state = self.state.borrow_mut();
@@ -3353,6 +3500,12 @@ impl Runtime {
                 task.record
                     .request_cancellation(CancelReason::InterpreterShutdown);
             }
+            // A cooperative debug session abandoned while paused would otherwise
+            // freeze the drive loop (the barrier gates every source). Clear it and
+            // re-enqueue the paused task so its shutdown cancellation settles it.
+            if let Some((root, task_id, _)) = state.debug_paused.take() {
+                state.ready.enqueue(root, task_id);
+            }
         }
         loop {
             let state = match self.drive(&options.drive_budget) {
@@ -3456,6 +3609,7 @@ impl Runtime {
                 task.record
                     .request_cancellation(CancelReason::InterpreterShutdown);
             }
+            state.debug_paused = None;
         }
         while matches!(self.cancel_waiting(), Ok(true)) {}
         let (lease, deadline) = {
@@ -4412,6 +4566,11 @@ enum TaskAction {
     /// poll handle until it reports Ready, then resume the frame with the decoded
     /// value (or raise the error in-frame). The `LegacyAwaitIoBridge`.
     VmAwaitIo(TaskId, Rc<sema_core::IoHandle>),
+    /// A cooperative (headless) debug session hit a breakpoint/step inside this
+    /// task. The task's frames are parked in `vm_call`; arm the runtime-wide
+    /// debug barrier (`debug_paused`) and hold the task out of the ready queue
+    /// until the host resumes it (`debug_resume`).
+    DebugStop(RootId, TaskId, crate::debug::StopInfo),
     #[cfg(test)]
     Timer(TaskId, Instant),
     #[cfg(test)]
@@ -4538,6 +4697,9 @@ impl Trace for TaskAction {
             // there is no edge to trace — mirroring the legacy scheduler, which
             // also never traces a `Blocked(AwaitIo)` handle's internals.
             Self::VmAwaitIo(_, _) => true,
+            // A `StopInfo` is a reason + source location; it holds no Sema
+            // `Value`, so there is no GC edge to trace.
+            Self::DebugStop(_, _, _) => true,
             #[cfg(test)]
             Self::NativeCall(_, _) => true,
             #[cfg(test)]

@@ -66,10 +66,14 @@ fn worker_check_interrupt() -> bool {
     })
 }
 
-/// Active debug session state for cooperative VM execution.
+/// Active debug session state for cooperative execution on the unified runtime.
+/// The program's VM is owned by the runtime (submitted as `handle`'s root); the
+/// session keeps only the headless `DebugState` (registered via an
+/// `ActiveDebugGuard` around each drive so `run_parked_quantum` runs the
+/// debug-aware quantum) and the root handle it polls for settlement.
 struct DebugSession {
-    vm: sema_vm::VM,
     debug: sema_vm::DebugState,
+    handle: sema_vm::runtime::RootHandle,
 }
 
 thread_local! {
@@ -2103,12 +2107,27 @@ impl WasmInterpreter {
             Ok(vm) => vm,
             Err(e) => return JsValue::from_str(&format!("VM init error: {e}")),
         };
+        vm.seed_main_frame(prog.closure);
 
-        // Register the async scheduler, exactly like the normal eval path
-        // (run_exprs_on_vm) and the native DAP server do. Without this, debugging
-        // a program that uses async/await/channels fails with "async/spawn: no
-        // async scheduler registered".
-        sema_vm::init_scheduler(self.inner.global_env.clone(), prog.native_table.clone());
+        // Scrub any state left by an abandoned prior session on this persistent
+        // runtime (Stop while paused): clear the debug barrier + cancel the
+        // orphaned root so its stale `DebugStopped` can never freeze this drive.
+        let runtime = self.inner.runtime();
+        if runtime.is_debug_paused() {
+            runtime.debug_cancel_paused();
+            let budget = sema_vm::runtime::DriveBudget::host_default();
+            for _ in 0..10_000 {
+                if self.inner.runtime_live_task_count() == 0 {
+                    break;
+                }
+                if !matches!(
+                    runtime.drive(&budget),
+                    Ok(sema_vm::runtime::DriveState::Progress { .. })
+                ) {
+                    break;
+                }
+            }
+        }
 
         let mut debug = sema_vm::DebugState::new_headless();
 
@@ -2142,32 +2161,91 @@ impl WasmInterpreter {
             result
         };
 
-        match vm.start_cooperative(prog.closure, &self.inner.ctx, &mut debug) {
-            Ok(sema_vm::VmExecResult::Stopped(info)) => {
-                let result = attach_bp_info(self.debug_stopped_result(&info));
-                DEBUG_SESSION.with(|s| {
-                    *s.borrow_mut() = Some(DebugSession { vm, debug });
-                });
-                result
+        // Submit the seeded VM as a fresh root on the interpreter's persistent
+        // runtime and drive to the first stop/settlement under the debug session.
+        let handle = match runtime.submit_root(vm) {
+            Ok(handle) => handle,
+            Err(e) => return self.debug_error_str(&format!("debug root submission failed: {e:?}")),
+        };
+        DEBUG_SESSION.with(|s| {
+            *s.borrow_mut() = Some(DebugSession { debug, handle });
+        });
+        attach_bp_info(self.debug_drive())
+    }
+
+    /// Drive the interpreter's runtime under the active session's `DebugState`
+    /// until it hits a cooperative debug stop or the root settles. Each turn runs
+    /// under an `ActiveDebugGuard` so `run_parked_quantum` runs the debug-aware
+    /// quantum; `DriveState::DebugStopped` becomes a "stopped" response, root
+    /// settlement a "finished"/"error" response. On finish/error the session is
+    /// cleared. Bounded so a pathological program returns "yielded" rather than
+    /// spinning the browser thread.
+    fn debug_drive(&self) -> JsValue {
+        DEBUG_SESSION.with(|s| {
+            let mut session = s.borrow_mut();
+            let Some(ref mut sess) = *session else {
+                return self.debug_error_str("No active debug session");
+            };
+            let runtime = self.inner.runtime();
+            let budget = sema_vm::runtime::DriveBudget::host_default();
+            for _ in 0..4_096 {
+                match sess.handle.poll_result() {
+                    sema_vm::runtime::RootPoll::Ready(settlement) => {
+                        let result = match &settlement.outcome {
+                            sema_core::runtime::TaskOutcome::Returned(v) => {
+                                self.debug_finished_result(v)
+                            }
+                            sema_core::runtime::TaskOutcome::Failed(e) => {
+                                self.debug_maybe_http_error(e)
+                            }
+                            sema_core::runtime::TaskOutcome::Cancelled(r) => {
+                                self.debug_error_str(&format!("debug run cancelled: {r:?}"))
+                            }
+                        };
+                        *session = None;
+                        return result;
+                    }
+                    sema_vm::runtime::RootPoll::Pending => {}
+                    sema_vm::runtime::RootPoll::Aborted(fault) => {
+                        *session = None;
+                        return self.debug_error_str(&format!("debug root aborted: {fault:?}"));
+                    }
+                    sema_vm::runtime::RootPoll::RuntimeDropped
+                    | sema_vm::runtime::RootPoll::InvariantViolation => {
+                        *session = None;
+                        return self.debug_error_str("debug runtime invariant violation");
+                    }
+                }
+                sess.debug.instructions_remaining = WASM_DEBUG_INSTRUCTION_BUDGET;
+                let state = {
+                    let _guard = sema_vm::ActiveDebugGuard::enter(&mut sess.debug);
+                    match runtime.drive(&budget) {
+                        Ok(state) => state,
+                        Err(fault) => {
+                            drop(_guard);
+                            *session = None;
+                            return self.debug_error_str(&format!("runtime fault: {fault:?}"));
+                        }
+                    }
+                };
+                match state {
+                    sema_vm::runtime::DriveState::DebugStopped { info, .. } => {
+                        return self.debug_stopped_result(&info);
+                    }
+                    sema_vm::runtime::DriveState::Progress { .. }
+                    | sema_vm::runtime::DriveState::Quiescent
+                    | sema_vm::runtime::DriveState::ShutdownComplete => {}
+                    // A task parked on a timer/external inbox: the browser thread
+                    // cannot block, so yield back to JS to re-poll (fetch/timer
+                    // completions land between turns). Full Promise-driven roots
+                    // are P6.
+                    sema_vm::runtime::DriveState::Idle { .. } => {
+                        return self.debug_yielded_result();
+                    }
+                }
             }
-            Ok(sema_vm::VmExecResult::Yielded) => {
-                let result = attach_bp_info(self.debug_yielded_result());
-                DEBUG_SESSION.with(|s| {
-                    *s.borrow_mut() = Some(DebugSession { vm, debug });
-                });
-                result
-            }
-            Ok(sema_vm::VmExecResult::Finished(v)) => {
-                attach_bp_info(self.debug_finished_result(&v))
-            }
-            Ok(sema_vm::VmExecResult::AsyncYield(_)) | Ok(sema_vm::VmExecResult::Pending(_)) => {
-                attach_bp_info(self.debug_yielded_result())
-            }
-            Ok(sema_vm::VmExecResult::QuantumExpired { .. }) => {
-                unreachable!("debug execution does not install a runtime quantum")
-            }
-            Err(e) => self.debug_maybe_http_error(&e),
-        }
+            self.debug_yielded_result()
+        })
     }
 
     /// Perform an HTTP fetch from a debug marker and cache the result.
@@ -2208,38 +2286,21 @@ impl WasmInterpreter {
 
     #[wasm_bindgen(js_name = debugPoll)]
     pub fn debug_poll(&self) -> JsValue {
-        DEBUG_SESSION.with(|s| {
-            let mut session = s.borrow_mut();
-            let Some(ref mut sess) = *session else {
-                return self.debug_error_str("No active debug session");
-            };
-
-            sess.debug.instructions_remaining = WASM_DEBUG_INSTRUCTION_BUDGET;
-
-            match sess.vm.run_cooperative(&self.inner.ctx, &mut sess.debug) {
-                Ok(sema_vm::VmExecResult::Stopped(info)) => self.debug_stopped_result(&info),
-                Ok(sema_vm::VmExecResult::Yielded) => self.debug_yielded_result(),
-                Ok(sema_vm::VmExecResult::AsyncYield(_))
-                | Ok(sema_vm::VmExecResult::Pending(_)) => self.debug_yielded_result(),
-                Ok(sema_vm::VmExecResult::QuantumExpired { .. }) => {
-                    unreachable!("debug execution does not install a runtime quantum")
-                }
-                Ok(sema_vm::VmExecResult::Finished(v)) => {
-                    let result = self.debug_finished_result(&v);
-                    *session = None;
-                    result
-                }
-                Err(e) => {
-                    let result = self.debug_maybe_http_error(&e);
-                    *session = None;
-                    result
-                }
-            }
-        })
+        // Keep driving the runtime under the active session (the program yielded
+        // back to JS on a prior turn); returns the same stopped/finished/yielded
+        // mapping as the initial drive.
+        if DEBUG_SESSION.with(|s| s.borrow().is_none()) {
+            return self.debug_error_str("No active debug session");
+        }
+        self.debug_drive()
     }
 
     #[wasm_bindgen(js_name = debugStop)]
     pub fn debug_stop(&self) {
+        // Clear the runtime-wide debug barrier and cancel the abandoned root so a
+        // Stop while paused cannot freeze a future session's drive, then forget
+        // the session.
+        self.inner.runtime().debug_cancel_paused();
         DEBUG_SESSION.with(|s| {
             *s.borrow_mut() = None;
         });
@@ -2248,22 +2309,20 @@ impl WasmInterpreter {
     #[wasm_bindgen(js_name = debugGetLocals)]
     pub fn debug_get_locals(&self) -> JsValue {
         DEBUG_SESSION.with(|s| {
-            let mut session = s.borrow_mut();
-            let Some(ref mut sess) = *session else {
+            if s.borrow().is_none() {
                 return JsValue::NULL;
-            };
-            // When paused at a breakpoint INSIDE an async task, inspect that
-            // task's per-task VM (its frames hold the task-locals); the main VM
-            // is parked at the `await`. Falls back to the main VM for ordinary
-            // synchronous stops.
-            let locals = sema_vm::with_coop_paused_task_vm(|tvm| {
-                let frame_idx = tvm.frame_count().saturating_sub(1);
-                tvm.debug_locals(frame_idx)
-            })
-            .unwrap_or_else(|| {
-                let frame_idx = sess.vm.frame_count().saturating_sub(1);
-                sess.vm.debug_locals(frame_idx)
-            });
+            }
+            // Inspect the paused task's own VM (its frames hold the task-locals);
+            // it never leaves the runtime, so `with_paused_task_vm` borrows it in
+            // place. Empty when nothing is paused.
+            let locals = self
+                .inner
+                .runtime()
+                .with_paused_task_vm(|tvm| {
+                    let frame_idx = tvm.frame_count().saturating_sub(1);
+                    tvm.debug_locals(frame_idx)
+                })
+                .unwrap_or_default();
             let arr = js_sys::Array::new();
             for var in &locals {
                 let obj = js_sys::Object::new();
@@ -2281,13 +2340,16 @@ impl WasmInterpreter {
     pub fn debug_get_stack_trace(&self) -> JsValue {
         DEBUG_SESSION.with(|s| {
             let session = s.borrow();
-            let Some(ref sess) = *session else {
+            let Some(ref _sess) = *session else {
                 return js_sys::Array::new().into();
             };
             // Mirror debug_get_locals: at an async stop, show the PAUSED TASK's
-            // call stack, not the main VM's (which is parked at the `await`).
-            let frames = sema_vm::with_coop_paused_task_vm(|tvm| tvm.debug_stack_trace())
-                .unwrap_or_else(|| sess.vm.debug_stack_trace());
+            // call stack (its VM is borrowed in place from the runtime).
+            let frames = self
+                .inner
+                .runtime()
+                .with_paused_task_vm(|tvm| tvm.debug_stack_trace())
+                .unwrap_or_default();
             let arr = js_sys::Array::new();
             for frame in &frames {
                 let obj = js_sys::Object::new();
@@ -3129,45 +3191,27 @@ impl WasmInterpreter {
     }
 
     fn debug_resume(&self, mode: sema_vm::StepMode) -> JsValue {
+        if DEBUG_SESSION.with(|s| s.borrow().is_none()) {
+            return self.debug_error_str("No active debug session");
+        }
+        let runtime = self.inner.runtime();
         DEBUG_SESSION.with(|s| {
-            let mut session = s.borrow_mut();
-            let Some(ref mut sess) = *session else {
-                return self.debug_error_str("No active debug session");
-            };
-
-            sess.debug.step_mode = mode;
-            if mode != sema_vm::StepMode::Continue {
-                // Step depth must be measured against the VM that will actually be
-                // stepped. At a stop INSIDE an async task the resume re-drives that
-                // task's per-task VM (not the main VM, which is parked at the
-                // await), so StepOver/StepOut depth comparisons must use the task's
-                // frame count. Falls back to the main VM for ordinary sync stops.
-                sess.debug.step_frame_depth =
-                    sema_vm::with_coop_paused_task_vm(|tvm| tvm.frame_count())
-                        .unwrap_or_else(|| sess.vm.frame_count());
-            }
-            sess.debug.instructions_remaining = WASM_DEBUG_INSTRUCTION_BUDGET;
-
-            match sess.vm.run_cooperative(&self.inner.ctx, &mut sess.debug) {
-                Ok(sema_vm::VmExecResult::Stopped(info)) => self.debug_stopped_result(&info),
-                Ok(sema_vm::VmExecResult::Yielded) => self.debug_yielded_result(),
-                Ok(sema_vm::VmExecResult::AsyncYield(_))
-                | Ok(sema_vm::VmExecResult::Pending(_)) => self.debug_yielded_result(),
-                Ok(sema_vm::VmExecResult::QuantumExpired { .. }) => {
-                    unreachable!("debug execution does not install a runtime quantum")
-                }
-                Ok(sema_vm::VmExecResult::Finished(v)) => {
-                    let result = self.debug_finished_result(&v);
-                    *session = None;
-                    result
-                }
-                Err(e) => {
-                    let result = self.debug_maybe_http_error(&e);
-                    *session = None;
-                    result
+            if let Some(ref mut sess) = *s.borrow_mut() {
+                sess.debug.step_mode = mode;
+                if mode != sema_vm::StepMode::Continue {
+                    // Step depth must be measured against the paused task's own VM
+                    // (the one that resumes), not any parent parked at the await —
+                    // so StepOver/StepOut depth comparisons are task-correct.
+                    if let Some(depth) = runtime.with_paused_task_vm(|tvm| tvm.frame_count()) {
+                        sess.debug.step_frame_depth = depth;
+                    }
                 }
             }
-        })
+        });
+        // Clear the debug barrier (re-enqueue the paused task) with the step mode
+        // now set, then drive to the next stop/settlement.
+        runtime.debug_resume();
+        self.debug_drive()
     }
 
     fn debug_stopped_result(&self, info: &sema_vm::StopInfo) -> JsValue {

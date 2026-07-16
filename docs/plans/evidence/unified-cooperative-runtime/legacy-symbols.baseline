@@ -114,14 +114,14 @@ crates/sema-dap/src/server.rs:94:            Some(event) = event_bridge_rx.recv(
 crates/sema-eval/src/eval.rs:170:        sema_core::set_eval_callback(&ctx, eval_value_vm);
 crates/sema-eval/src/eval.rs:171:        sema_core::set_call_callback(&ctx, call_value);
 crates/sema-eval/src/eval.rs:172:        sema_core::set_call_owned_callback(&ctx, call_value_owned);
-crates/sema-eval/src/eval.rs:1786:                    sema_core::call_callback(ctx, &thunk.body, &[])?
+crates/sema-eval/src/eval.rs:1799:                    sema_core::call_callback(ctx, &thunk.body, &[])?
 crates/sema-eval/src/eval.rs:191:        sema_core::set_eval_callback(&ctx, eval_value_vm);
 crates/sema-eval/src/eval.rs:192:        sema_core::set_call_callback(&ctx, call_value);
 crates/sema-eval/src/eval.rs:193:        sema_core::set_call_owned_callback(&ctx, call_value_owned);
-crates/sema-eval/src/eval.rs:2569:        match rx.recv_timeout(std::time::Duration::from_secs(30)) {
-crates/sema-eval/src/eval.rs:2839:    fn runtime_channel_blocking_recv_parks_until_sent() {
-crates/sema-eval/src/eval.rs:379:                // A task is parked on a legacy `AwaitIo(IoHandle)`: its offloaded
-crates/sema-eval/src/eval.rs:432:                        std::thread::sleep(deadline - now);
+crates/sema-eval/src/eval.rs:2582:        match rx.recv_timeout(std::time::Duration::from_secs(30)) {
+crates/sema-eval/src/eval.rs:2852:    fn runtime_channel_blocking_recv_parks_until_sent() {
+crates/sema-eval/src/eval.rs:392:                // A task is parked on a legacy `AwaitIo(IoHandle)`: its offloaded
+crates/sema-eval/src/eval.rs:445:                        std::thread::sleep(deadline - now);
 crates/sema-eval/src/eval.rs:62:    /// context would route the VM's `call_callback` through unregistered
 crates/sema-eval/src/prelude.rs:500:;; builtins.rs) that branches internally on `in_async_context()`: synchronous
 crates/sema-eval/src/prelude.rs:750:;; the byte-identical blocking native runs (real `thread::sleep`, no
@@ -637,38 +637,38 @@ crates/sema-vm/src/runtime/host.rs:479:        rx.recv_timeout(Duration::from_se
 crates/sema-vm/src/runtime/host.rs:481:        rx.recv_timeout(Duration::from_secs(2))
 crates/sema-vm/src/runtime/host.rs:534:        std::thread::sleep(Duration::from_millis(200));
 crates/sema-vm/src/runtime/host.rs:569:        rx.recv_timeout(Duration::from_secs(2))
-crates/sema-vm/src/runtime/state.rs:1188:            // runtime supports it — see `IoHandle::with_abort`), drop the entry,
-crates/sema-vm/src/runtime/state.rs:1225:            let task = state.tasks.remove(&task_id).expect("selected task exists");
-crates/sema-vm/src/runtime/state.rs:1279:                let (Some(task), Some(waits)) = (state.tasks.remove(&task_id), state.waits.take())
-crates/sema-vm/src/runtime/state.rs:1655:                YieldReason::Sleep(ms) => {
-crates/sema-vm/src/runtime/state.rs:1668:                YieldReason::Spawn(_)
-crates/sema-vm/src/runtime/state.rs:1669:                | YieldReason::Cancel(_)
-crates/sema-vm/src/runtime/state.rs:1670:                | YieldReason::AwaitPromise(_)
-crates/sema-vm/src/runtime/state.rs:1671:                | YieldReason::AwaitPromiseSet { .. }
-crates/sema-vm/src/runtime/state.rs:1672:                | YieldReason::ChannelSend(_, _)
-crates/sema-vm/src/runtime/state.rs:1673:                | YieldReason::ChannelRecv(_)
-crates/sema-vm/src/runtime/state.rs:1674:                | YieldReason::ChannelClose(_)
-crates/sema-vm/src/runtime/state.rs:1675:                | YieldReason::ChannelInspect(_, _)
-crates/sema-vm/src/runtime/state.rs:1676:                | YieldReason::ChannelTryRecv(_) => TaskAction::VmResult(
-crates/sema-vm/src/runtime/state.rs:1689:                YieldReason::AwaitIo(handle) => {
-crates/sema-vm/src/runtime/state.rs:2107:                        let task = state.tasks.remove(&task_id).ok_or_else(|| {
+crates/sema-vm/src/runtime/state.rs:1297:            // runtime supports it — see `IoHandle::with_abort`), drop the entry,
+crates/sema-vm/src/runtime/state.rs:1334:            let task = state.tasks.remove(&task_id).expect("selected task exists");
+crates/sema-vm/src/runtime/state.rs:1388:                let (Some(task), Some(waits)) = (state.tasks.remove(&task_id), state.waits.take())
+crates/sema-vm/src/runtime/state.rs:1774:                YieldReason::Sleep(ms) => {
+crates/sema-vm/src/runtime/state.rs:1787:                YieldReason::Spawn(_)
+crates/sema-vm/src/runtime/state.rs:1788:                | YieldReason::Cancel(_)
+crates/sema-vm/src/runtime/state.rs:1789:                | YieldReason::AwaitPromise(_)
+crates/sema-vm/src/runtime/state.rs:1790:                | YieldReason::AwaitPromiseSet { .. }
+crates/sema-vm/src/runtime/state.rs:1791:                | YieldReason::ChannelSend(_, _)
+crates/sema-vm/src/runtime/state.rs:1792:                | YieldReason::ChannelRecv(_)
+crates/sema-vm/src/runtime/state.rs:1793:                | YieldReason::ChannelClose(_)
+crates/sema-vm/src/runtime/state.rs:1794:                | YieldReason::ChannelInspect(_, _)
+crates/sema-vm/src/runtime/state.rs:1795:                | YieldReason::ChannelTryRecv(_) => TaskAction::VmResult(
+crates/sema-vm/src/runtime/state.rs:1808:                YieldReason::AwaitIo(handle) => {
+crates/sema-vm/src/runtime/state.rs:2254:                        let task = state.tasks.remove(&task_id).ok_or_else(|| {
 crates/sema-vm/src/runtime/state.rs:265:    /// VM-quantum tasks parked on a LEGACY `AwaitIo(IoHandle)` yield, mapped to
-crates/sema-vm/src/runtime/state.rs:2685:                let native_result = match sema_core::take_yield_signal() {
 crates/sema-vm/src/runtime/state.rs:268:    /// http, file, event/select, io) that arms an `IoHandle` and yields
 crates/sema-vm/src/runtime/state.rs:26:use sema_core::YieldReason;
 crates/sema-vm/src/runtime/state.rs:275:    io_waits: HashMap<TaskId, (super::WaitKey, Rc<sema_core::IoHandle>)>,
-crates/sema-vm/src/runtime/state.rs:2947:        handle: Rc<sema_core::IoHandle>,
-crates/sema-vm/src/runtime/state.rs:2953:            sema_core::IoPoll::Ready(Ok(value)) => {
-crates/sema-vm/src/runtime/state.rs:2956:            sema_core::IoPoll::Ready(Err(msg)) => {
-crates/sema-vm/src/runtime/state.rs:2959:            sema_core::IoPoll::Pending => {}
-crates/sema-vm/src/runtime/state.rs:2992:        let parked: Vec<(TaskId, super::WaitKey, Rc<sema_core::IoHandle>)> = {
-crates/sema-vm/src/runtime/state.rs:3006:                sema_core::IoPoll::Pending => {}
-crates/sema-vm/src/runtime/state.rs:3007:                sema_core::IoPoll::Ready(Ok(value)) => {
-crates/sema-vm/src/runtime/state.rs:3010:                sema_core::IoPoll::Ready(Err(msg)) => {
-crates/sema-vm/src/runtime/state.rs:3206:        let mut task = state.tasks.remove(&task_id).expect("task prevalidated");
-crates/sema-vm/src/runtime/state.rs:4411:    /// Legacy `AwaitIo(IoHandle)`: park the task (`TaskId`) on the offloaded-I/O
-crates/sema-vm/src/runtime/state.rs:4414:    VmAwaitIo(TaskId, Rc<sema_core::IoHandle>),
-crates/sema-vm/src/runtime/state.rs:4535:            // An `IoHandle` is a boxed `FnMut` poller; it is not a GC candidate
+crates/sema-vm/src/runtime/state.rs:2832:                let native_result = match sema_core::take_yield_signal() {
+crates/sema-vm/src/runtime/state.rs:3094:        handle: Rc<sema_core::IoHandle>,
+crates/sema-vm/src/runtime/state.rs:3100:            sema_core::IoPoll::Ready(Ok(value)) => {
+crates/sema-vm/src/runtime/state.rs:3103:            sema_core::IoPoll::Ready(Err(msg)) => {
+crates/sema-vm/src/runtime/state.rs:3106:            sema_core::IoPoll::Pending => {}
+crates/sema-vm/src/runtime/state.rs:3139:        let parked: Vec<(TaskId, super::WaitKey, Rc<sema_core::IoHandle>)> = {
+crates/sema-vm/src/runtime/state.rs:3153:                sema_core::IoPoll::Pending => {}
+crates/sema-vm/src/runtime/state.rs:3154:                sema_core::IoPoll::Ready(Ok(value)) => {
+crates/sema-vm/src/runtime/state.rs:3157:                sema_core::IoPoll::Ready(Err(msg)) => {
+crates/sema-vm/src/runtime/state.rs:3353:        let mut task = state.tasks.remove(&task_id).expect("task prevalidated");
+crates/sema-vm/src/runtime/state.rs:4565:    /// Legacy `AwaitIo(IoHandle)`: park the task (`TaskId`) on the offloaded-I/O
+crates/sema-vm/src/runtime/state.rs:4568:    VmAwaitIo(TaskId, Rc<sema_core::IoHandle>),
+crates/sema-vm/src/runtime/state.rs:4694:            // An `IoHandle` is a boxed `FnMut` poller; it is not a GC candidate
 crates/sema-vm/src/runtime/wait.rs:421:                inbox.recv_timeout(timeout).ok()
 crates/sema-vm/src/runtime/wait.rs:423:            None => inbox.recv().ok(),
 crates/sema-vm/src/scheduler.rs:1003:                if let TaskState::Blocked(YieldReason::AwaitIo(h)) = &task.state {
@@ -759,56 +759,56 @@ crates/sema-vm/src/vm.rs:1614:            match debug.command_rx.recv() {
 crates/sema-vm/src/vm.rs:1679:        // VM via the stack-top placeholder it left (`set_resume_value` semantics).
 crates/sema-vm/src/vm.rs:1687:            match sema_core::call_run_scheduler_target(ctx, target.clone()) {
 crates/sema-vm/src/vm.rs:1688:                Ok(sema_core::SchedulerRunResult::DebugPaused) => {
-crates/sema-vm/src/vm.rs:2012:                    NativeOutcome::Return(value) => match sema_core::take_yield_signal() {
-crates/sema-vm/src/vm.rs:2024:        Ok(match sema_core::take_yield_signal() {
-crates/sema-vm/src/vm.rs:2527:                                    // spawn_blocking thread on `reply_rx.recv()`, so
-crates/sema-vm/src/vm.rs:2886:                            drop(sema_core::take_yield_signal());
+crates/sema-vm/src/vm.rs:2021:                    NativeOutcome::Return(value) => match sema_core::take_yield_signal() {
+crates/sema-vm/src/vm.rs:2033:        Ok(match sema_core::take_yield_signal() {
+crates/sema-vm/src/vm.rs:2536:                                    // spawn_blocking thread on `reply_rx.recv()`, so
+crates/sema-vm/src/vm.rs:2895:                            drop(sema_core::take_yield_signal());
 crates/sema-vm/src/vm.rs:28:    LegacyYield(YieldReason),
-crates/sema-vm/src/vm.rs:2901:                        // A non-native callable (the call_callback branch) may still
-crates/sema-vm/src/vm.rs:2903:                        if let Some(reason) = sema_core::take_yield_signal() {
-crates/sema-vm/src/vm.rs:2918:                            drop(sema_core::take_yield_signal());
-crates/sema-vm/src/vm.rs:2933:                        // A non-native callable (the call_callback branch) may still
-crates/sema-vm/src/vm.rs:2935:                        if let Some(reason) = sema_core::take_yield_signal() {
-crates/sema-vm/src/vm.rs:3063:                                drop(sema_core::take_yield_signal());
-crates/sema-vm/src/vm.rs:3506:                                        drop(sema_core::take_yield_signal());
-crates/sema-vm/src/vm.rs:3515:                                    drop(sema_core::take_yield_signal());
-crates/sema-vm/src/vm.rs:3527:                                // A non-native callable (the call_callback branch) may
-crates/sema-vm/src/vm.rs:3529:                                if let Some(reason) = sema_core::take_yield_signal() {
-crates/sema-vm/src/vm.rs:3977:                sema_core::call_callback(ctx, &func_val, &call_args)
-crates/sema-vm/src/vm.rs:4059:                sema_core::call_callback(ctx, &func_val, &call_args)
+crates/sema-vm/src/vm.rs:2910:                        // A non-native callable (the call_callback branch) may still
+crates/sema-vm/src/vm.rs:2912:                        if let Some(reason) = sema_core::take_yield_signal() {
+crates/sema-vm/src/vm.rs:2927:                            drop(sema_core::take_yield_signal());
+crates/sema-vm/src/vm.rs:2942:                        // A non-native callable (the call_callback branch) may still
+crates/sema-vm/src/vm.rs:2944:                        if let Some(reason) = sema_core::take_yield_signal() {
+crates/sema-vm/src/vm.rs:3072:                                drop(sema_core::take_yield_signal());
+crates/sema-vm/src/vm.rs:3515:                                        drop(sema_core::take_yield_signal());
+crates/sema-vm/src/vm.rs:3524:                                    drop(sema_core::take_yield_signal());
+crates/sema-vm/src/vm.rs:3536:                                // A non-native callable (the call_callback branch) may
+crates/sema-vm/src/vm.rs:3538:                                if let Some(reason) = sema_core::take_yield_signal() {
+crates/sema-vm/src/vm.rs:3986:                sema_core::call_callback(ctx, &func_val, &call_args)
+crates/sema-vm/src/vm.rs:4068:                sema_core::call_callback(ctx, &func_val, &call_args)
 crates/sema-vm/src/vm.rs:40:    Legacy(YieldReason),
-crates/sema-vm/src/vm.rs:4520:                if sema_core::in_async_context() {
-crates/sema-vm/src/vm.rs:4555:                // `call_callback` (e.g. a global `define`d fn called from
-crates/sema-vm/src/vm.rs:5023:        match sema_core::eval_callback(ctx, expr, &env) {
+crates/sema-vm/src/vm.rs:4529:                if sema_core::in_async_context() {
+crates/sema-vm/src/vm.rs:4564:                // `call_callback` (e.g. a global `define`d fn called from
+crates/sema-vm/src/vm.rs:5032:        match sema_core::eval_callback(ctx, expr, &env) {
 crates/sema-vm/src/vm.rs:592:    /// via `call_callback`, the closure's fallback consults this stack so it can
-crates/sema-vm/src/vm.rs:6025:            sema_core::SchedulerTarget::One(promise.clone()),
+crates/sema-vm/src/vm.rs:6034:            sema_core::SchedulerTarget::One(promise.clone()),
 crates/sema-vm/src/vm.rs:733:    if sema_core::in_async_context() {
 crates/sema-vm/src/vm.rs:751:    // TEMPORARY BRIDGE: a legacy user closure re-entered via `call_callback`
 crates/sema-vm/src/vm.rs:768:/// `call_callback` → `run_closure_as_inline_task` path would `take_scheduler()`
 crates/sema-vm/src/vm.rs:785:        return sema_core::call_callback(ctx, func, args);
 crates/sema-vm/src/vm.rs:788:        return sema_core::call_callback(ctx, func, args);
-crates/sema-wasm/src/lib.rs:1866:        for _ in 0..MAX_REPLAYS {
-crates/sema-wasm/src/lib.rs:188:const HTTP_AWAIT_MARKER: &str = "__SEMA_WASM_HTTP__";
-crates/sema-wasm/src/lib.rs:189:const MAX_REPLAYS: usize = 50;
-crates/sema-wasm/src/lib.rs:1953:        for _ in 0..MAX_REPLAYS {
-crates/sema-wasm/src/lib.rs:2381:            sema_core::set_eval_callback(&ctx, sema_eval::eval_value_vm);
-crates/sema-wasm/src/lib.rs:2382:            sema_core::set_call_callback(&ctx, sema_eval::call_value);
-crates/sema-wasm/src/lib.rs:2383:            sema_core::set_call_owned_callback(&ctx, sema_eval::call_value_owned);
-crates/sema-wasm/src/lib.rs:243:        HTTP_AWAIT_MARKER,
-crates/sema-wasm/src/lib.rs:257:        SemaError::Eval(msg) => msg.starts_with(HTTP_AWAIT_MARKER),
-crates/sema-wasm/src/lib.rs:265:        SemaError::Eval(msg) if msg.starts_with(HTTP_AWAIT_MARKER) => {
-crates/sema-wasm/src/lib.rs:266:            Some(msg[HTTP_AWAIT_MARKER.len()..].to_string())
-crates/sema-wasm/src/lib.rs:2760:        for _ in 0..MAX_REPLAYS {
-crates/sema-wasm/src/lib.rs:3025:    /// Enable real wall-clock `async/sleep` via `Atomics.wait` on the given
-crates/sema-wasm/src/lib.rs:3030:    /// `Atomics.wait` is illegal there; leaving it uninstalled keeps the
-crates/sema-wasm/src/lib.rs:3032:    #[wasm_bindgen(js_name = installAtomicsSleep)]
+crates/sema-wasm/src/lib.rs:1870:        for _ in 0..MAX_REPLAYS {
+crates/sema-wasm/src/lib.rs:192:const HTTP_AWAIT_MARKER: &str = "__SEMA_WASM_HTTP__";
+crates/sema-wasm/src/lib.rs:193:const MAX_REPLAYS: usize = 50;
+crates/sema-wasm/src/lib.rs:1957:        for _ in 0..MAX_REPLAYS {
+crates/sema-wasm/src/lib.rs:2443:            sema_core::set_eval_callback(&ctx, sema_eval::eval_value_vm);
+crates/sema-wasm/src/lib.rs:2444:            sema_core::set_call_callback(&ctx, sema_eval::call_value);
+crates/sema-wasm/src/lib.rs:2445:            sema_core::set_call_owned_callback(&ctx, sema_eval::call_value_owned);
+crates/sema-wasm/src/lib.rs:247:        HTTP_AWAIT_MARKER,
+crates/sema-wasm/src/lib.rs:261:        SemaError::Eval(msg) => msg.starts_with(HTTP_AWAIT_MARKER),
+crates/sema-wasm/src/lib.rs:269:        SemaError::Eval(msg) if msg.starts_with(HTTP_AWAIT_MARKER) => {
+crates/sema-wasm/src/lib.rs:270:            Some(msg[HTTP_AWAIT_MARKER.len()..].to_string())
+crates/sema-wasm/src/lib.rs:2822:        for _ in 0..MAX_REPLAYS {
+crates/sema-wasm/src/lib.rs:3087:    /// Enable real wall-clock `async/sleep` via `Atomics.wait` on the given
+crates/sema-wasm/src/lib.rs:3092:    /// `Atomics.wait` is illegal there; leaving it uninstalled keeps the
+crates/sema-wasm/src/lib.rs:3094:    #[wasm_bindgen(js_name = installAtomicsSleep)]
 crates/sema-wasm/src/lib.rs:30:    /// `Atomics.wait` sleep when running inside a Web Worker (installed via
 crates/sema-wasm/src/lib.rs:31:    /// `installAtomicsSleep`). `None` on the main thread (sleep stays an
 crates/sema-wasm/src/lib.rs:32:    /// instant virtual-clock advance — `Atomics.wait` is illegal there anyway).
-crates/sema-wasm/src/lib.rs:346:    // correctly with real `Atomics.wait` sleeps (no re-runs). Cross-origin
-crates/sema-wasm/src/lib.rs:366:/// Synchronous HTTP via `XMLHttpRequest` (worker-only — sync XHR is illegal on
-crates/sema-wasm/src/lib.rs:377:    let xhr = web_sys::XmlHttpRequest::new()
-crates/sema-wasm/src/lib.rs:378:        .map_err(|_| SemaError::Io("failed to create XMLHttpRequest".to_string()))?;
+crates/sema-wasm/src/lib.rs:350:    // correctly with real `Atomics.wait` sleeps (no re-runs). Cross-origin
+crates/sema-wasm/src/lib.rs:370:/// Synchronous HTTP via `XMLHttpRequest` (worker-only — sync XHR is illegal on
+crates/sema-wasm/src/lib.rs:381:    let xhr = web_sys::XmlHttpRequest::new()
+crates/sema-wasm/src/lib.rs:382:        .map_err(|_| SemaError::Io("failed to create XMLHttpRequest".to_string()))?;
 crates/sema-wasm/src/lib.rs:43:/// thread for `ms` real milliseconds via `Atomics.wait` on the control SAB. The
 crates/sema-wasm/src/lib.rs:53:            let _ = js_sys::Atomics::wait_with_timeout(arr, 0, 0, ms as f64);
 crates/sema/src/lib.rs:133:        sema_core::set_eval_callback(&ctx, sema_eval::eval_value_vm);

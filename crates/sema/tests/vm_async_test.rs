@@ -1737,6 +1737,19 @@ fn apply_preserves_synchronous_semantics() {
 }
 
 #[test]
+fn apply_of_suspending_lambda_runs_cooperatively() {
+    // `(apply <lambda> …)` where the lambda body performs a runtime-only async
+    // op must suspend + drain like single-list `map`/`foldl`/`call-with-values`,
+    // not leak the value-ABI "requires runtime invocation" stub. This is also
+    // the "wrap it in a lambda" workaround the graceful nested-apply error
+    // suggests, so it must actually work.
+    assert_eq!(
+        eval(r#"(apply (fn (x) (async/await (async/spawn (fn () (* x 2))))) (list 21))"#),
+        Value::int(42)
+    );
+}
+
+#[test]
 fn nested_apply_of_runtime_native_is_graceful_error() {
     // `apply`/`call-with-values` reached through another synchronous `apply`
     // run on the value ABI, where a runtime-only native cannot suspend. That

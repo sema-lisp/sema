@@ -931,7 +931,21 @@ pub fn register(env: &sema_core::Env) {
         },
         |args| {
             check_arity!(args, "apply", 2..);
-            if is_runtime_only_native(&args[0]) {
+            // Route through the cooperative Call path when the callee can
+            // SUSPEND once invoked: a runtime-only native, or a user closure
+            // whose body may run an async op (like single-list `map`/`foldl`
+            // and `call-with-values` do). A dual-ABI blocking native
+            // (`__llm-chat-blocking`, `is_closure` false) stays on the
+            // synchronous path so its task-scoped slab reaping is unaffected;
+            // plain builtins and keyword getters never suspend, so the sync
+            // path is correct for them too. (Multimethods are NOT routed here —
+            // the Call path doesn't dispatch them; they stay on `call_function`,
+            // so a multimethod dispatching to a suspending method via `apply`
+            // remains a known, esoteric gap.)
+            let is_closure_callee = args[0]
+                .as_native_fn_rc()
+                .is_some_and(|native| native.is_closure);
+            if is_runtime_only_native(&args[0]) || is_closure_callee {
                 apply_call(args)
             } else {
                 let func = &args[0];

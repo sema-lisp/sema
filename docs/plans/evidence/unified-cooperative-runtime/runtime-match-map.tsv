@@ -767,26 +767,26 @@ F28	crates/sema-vm/src/vm.rs:1792:                    NativeOutcome::Return(valu
 F28	crates/sema-vm/src/vm.rs:1804:        Ok(match sema_core::take_yield_signal() {
 F29	crates/sema-vm/src/vm.rs:1841:    /// `async/spawn` task or a cooperative HOF callback VM) owns its value out of
 C17	crates/sema-vm/src/vm.rs:215:thread_local! {
-F30	crates/sema-vm/src/vm.rs:2251:                                    // spawn_blocking thread on `reply_rx.recv()`, so
-F28	crates/sema-vm/src/vm.rs:2610:                            let _ = sema_core::take_yield_signal();
-F29	crates/sema-vm/src/vm.rs:2625:                        // A non-native callable (the call_callback branch) may still
-F28	crates/sema-vm/src/vm.rs:2627:                        if let Some(reason) = sema_core::take_yield_signal() {
-F28	crates/sema-vm/src/vm.rs:2642:                            let _ = sema_core::take_yield_signal();
-F29	crates/sema-vm/src/vm.rs:2657:                        // A non-native callable (the call_callback branch) may still
-F28	crates/sema-vm/src/vm.rs:2659:                        if let Some(reason) = sema_core::take_yield_signal() {
-F28	crates/sema-vm/src/vm.rs:2787:                                let _ = sema_core::take_yield_signal();
+F30	crates/sema-vm/src/vm.rs:2310:                                    // spawn_blocking thread on `reply_rx.recv()`, so
+F28	crates/sema-vm/src/vm.rs:2669:                            let _ = sema_core::take_yield_signal();
+F29	crates/sema-vm/src/vm.rs:2684:                        // A non-native callable (the call_callback branch) may still
+F28	crates/sema-vm/src/vm.rs:2686:                        if let Some(reason) = sema_core::take_yield_signal() {
+F28	crates/sema-vm/src/vm.rs:2701:                            let _ = sema_core::take_yield_signal();
+F29	crates/sema-vm/src/vm.rs:2716:                        // A non-native callable (the call_callback branch) may still
+F28	crates/sema-vm/src/vm.rs:2718:                        if let Some(reason) = sema_core::take_yield_signal() {
+F28	crates/sema-vm/src/vm.rs:2846:                                let _ = sema_core::take_yield_signal();
 F28	crates/sema-vm/src/vm.rs:28:    LegacyYield(YieldReason),
-F28	crates/sema-vm/src/vm.rs:3230:                                        let _ = sema_core::take_yield_signal();
-F28	crates/sema-vm/src/vm.rs:3239:                                    let _ = sema_core::take_yield_signal();
-F29	crates/sema-vm/src/vm.rs:3251:                                // A non-native callable (the call_callback branch) may
-F28	crates/sema-vm/src/vm.rs:3253:                                if let Some(reason) = sema_core::take_yield_signal() {
-F29	crates/sema-vm/src/vm.rs:3701:                sema_core::call_callback(ctx, &func_val, &call_args)
-F29	crates/sema-vm/src/vm.rs:3783:                sema_core::call_callback(ctx, &func_val, &call_args)
-F29	crates/sema-vm/src/vm.rs:4087:    /// foreign stack (an `async/spawn` task, a fresh fallback VM, an inline-task
+F28	crates/sema-vm/src/vm.rs:3289:                                        let _ = sema_core::take_yield_signal();
+F28	crates/sema-vm/src/vm.rs:3298:                                    let _ = sema_core::take_yield_signal();
+F29	crates/sema-vm/src/vm.rs:3310:                                // A non-native callable (the call_callback branch) may
+F28	crates/sema-vm/src/vm.rs:3312:                                if let Some(reason) = sema_core::take_yield_signal() {
+F29	crates/sema-vm/src/vm.rs:3760:                sema_core::call_callback(ctx, &func_val, &call_args)
+F29	crates/sema-vm/src/vm.rs:3842:                sema_core::call_callback(ctx, &func_val, &call_args)
 F28	crates/sema-vm/src/vm.rs:40:    Legacy(YieldReason),
-F29	crates/sema-vm/src/vm.rs:4240:                // yield in the inner closure (channel/send, channel/recv,
-F29	crates/sema-vm/src/vm.rs:4266:                // `call_callback` (e.g. a global `define`d fn called from
-F30	crates/sema-vm/src/vm.rs:4734:        match sema_core::eval_callback(ctx, expr, &env) {
+F29	crates/sema-vm/src/vm.rs:4146:    /// foreign stack (an `async/spawn` task, a fresh fallback VM, an inline-task
+F29	crates/sema-vm/src/vm.rs:4299:                // yield in the inner closure (channel/send, channel/recv,
+F29	crates/sema-vm/src/vm.rs:4325:                // `call_callback` (e.g. a global `define`d fn called from
+F30	crates/sema-vm/src/vm.rs:4793:        match sema_core::eval_callback(ctx, expr, &env) {
 C17	crates/sema-vm/src/vm.rs:589:thread_local! {
 F29	crates/sema-vm/src/vm.rs:592:    /// via `call_callback`, the closure's fallback consults this stack so it can
 F29	crates/sema-vm/src/vm.rs:744:    // TEMPORARY BRIDGE: a legacy user closure re-entered via `call_callback`

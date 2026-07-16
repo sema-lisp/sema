@@ -343,6 +343,15 @@ struct RuntimeState {
     // (a wasted scan); it is never undercounted (every install increments), so a
     // parked barrier is never missed.
     origin_barrier_waits: usize,
+    /// Work-item debit owed for pending-stage hops a matched channel
+    /// rendezvous collapsed into the current work item (`install_channel_wait`'s
+    /// immediate-match fast path). Each collapsed hop (`ChannelWake`,
+    /// `ApplyRuntimeResponse`/resume, the final `Apply`) would have cost one
+    /// `work_items` increment under the staged path; `drive()` drains this into
+    /// `work_items` right after the work item that produced it, so a
+    /// channel-heavy pair of tasks cannot out-run `work_item_limit` and starve
+    /// sibling roots just because the hops now run inline.
+    channel_fast_path_credit: usize,
     #[cfg(test)]
     force_settlement_exhaustion: bool,
     #[cfg(test)]
@@ -626,6 +635,7 @@ impl Runtime {
                 stepping_task: None,
                 dropped_protocol_completions: 0,
                 origin_barrier_waits: 0,
+                channel_fast_path_credit: 0,
                 #[cfg(test)]
                 force_settlement_exhaustion: false,
                 #[cfg(test)]
@@ -1008,6 +1018,14 @@ impl Runtime {
             if progressed {
                 work_items += 1;
                 no_progress = 0;
+                // A matched channel rendezvous collapses several pending-stage
+                // hops into this one work item (`install_channel_wait`'s
+                // immediate-match fast path) — debit the hops it would have
+                // cost under the staged path so a channel-heavy pair of tasks
+                // cannot out-run `work_item_limit` and starve sibling roots.
+                let extra_credit =
+                    std::mem::take(&mut self.state.borrow_mut().channel_fast_path_credit);
+                work_items += extra_credit;
             } else {
                 no_progress += 1;
                 if no_progress == 6 {
@@ -1690,31 +1708,14 @@ impl Runtime {
     fn consume_channel_wake(&self, wake: ChannelWake) -> Result<(), RuntimeFault> {
         // Every channel waiter is a structural `protocol_waits` entry now; deliver
         // the rendezvous result to its continuation via `finish_protocol_wait`.
-        let response = match wake.result {
-            super::ChannelResult::Sent => {
-                RuntimeResponse::Send(sema_core::runtime::ChannelSend::Sent)
-            }
-            super::ChannelResult::Received(value) => {
-                RuntimeResponse::Receive(sema_core::runtime::ChannelReceive::Received(value))
-            }
-            super::ChannelResult::Closed => {
-                let receive = self
-                    .state
-                    .borrow()
-                    .protocol_waits
-                    .get(&wake.key)
-                    .is_some_and(|wait| {
-                        matches!(wait.kind, ProtocolWaitKind::Channel { receive: true, .. })
-                    });
-                if receive {
-                    RuntimeResponse::Receive(sema_core::runtime::ChannelReceive::Closed)
-                } else {
-                    RuntimeResponse::Send(sema_core::runtime::ChannelSend::Closed)
-                }
-            }
-            super::ChannelResult::Waiting => return Ok(()),
+        let response = {
+            let state = self.state.borrow();
+            channel_wake_response(&state.protocol_waits, wake.key, wake.result)
         };
-        self.finish_protocol_wait(wake.key, wake.task, Ok(response))
+        let Some(response) = response else {
+            return Ok(());
+        };
+        self.finish_protocol_wait(wake.key, wake.task, response)
     }
 
     fn consume_resource_gate_wake(&self, wake: ResourceGateWake) -> Result<(), RuntimeFault> {
@@ -1735,55 +1736,14 @@ impl Runtime {
         task_id: TaskId,
         response: Result<RuntimeResponse, sema_core::SemaError>,
     ) -> Result<(), RuntimeFault> {
-        let extracted = {
-            let mut state = self.state.borrow_mut();
-            let Some(wait) = state.protocol_waits.remove(&key) else {
-                // The wait is gone (e.g. the task was cancelled). A rendezvous
-                // value that arrives here would be silently lost, so record it.
-                if matches!(
-                    &response,
-                    Ok(RuntimeResponse::Receive(
-                        sema_core::runtime::ChannelReceive::Received(_)
-                    ))
-                ) {
-                    state.dropped_protocol_completions += 1;
-                }
-                return Ok(());
-            };
-            if wait.task != task_id {
-                state.protocol_waits.insert(key, wait);
-                return Ok(());
-            }
-            if let ProtocolWaitKind::Promises(set) = &wait.kind {
-                for promise in &set.promises {
-                    let _ = state.promises.cancel_observation(*promise, key);
-                }
-                // A `Timeout` armed a deadline timer under this key; the observed
-                // promise won, so deregister the timer before it fires stale.
-                if matches!(set.mode, sema_core::runtime::PromiseSetMode::Timeout(_)) {
-                    state.timers.cancel(key);
-                }
-            }
-            let task = state
-                .tasks
-                .get_mut(&task_id)
-                .ok_or_else(|| RuntimeFault::Invariant {
-                    message: "protocol wake task disappeared".into(),
-                })?;
-            task.record
-                .reject_wait(key)
-                .map_err(|error| RuntimeFault::Invariant {
-                    message: format!("protocol wake transition failed: {error:?}"),
-                })?;
-            wait
-        };
-        let wait = extracted;
         let mut state = self.state.borrow_mut();
+        let Some((owner, frame, response)) =
+            finish_protocol_wait_now(&mut state, key, task_id, response)?
+        else {
+            return Ok(());
+        };
         state.pending.push_back(PendingStage::ApplyRuntimeResponse(
-            task_id,
-            wait.owner,
-            wait.continuation,
-            response,
+            task_id, owner, frame, response,
         ));
         Ok(())
     }
@@ -2293,23 +2253,7 @@ impl Runtime {
         resume: VmResume,
     ) -> Result<(), RuntimeFault> {
         let mut state = self.state.borrow_mut();
-        let task = state
-            .tasks
-            .get_mut(&task_id)
-            .ok_or_else(|| RuntimeFault::Invariant {
-                message: "parent VM task disappeared before reinstall".into(),
-            })?;
-        task.vm_call = Some(vm);
-        task.vm_owner = Some(parent);
-        task.vm_resume = Some(resume);
-        task.record
-            .yield_ready()
-            .map_err(|error| RuntimeFault::Invariant {
-                message: format!("reinstalled parent VM failed to yield ready: {error:?}"),
-            })?;
-        let root = task.record.relations().origin_root;
-        state.ready.enqueue(root, task_id);
-        Ok(())
+        reinstall_parent_vm_now(&mut state, task_id, vm, parent, resume)
     }
 
     fn apply_native_outcome(
@@ -2447,6 +2391,18 @@ impl Runtime {
         suspend: sema_core::runtime::NativeSuspend,
     ) -> Result<(), RuntimeFault> {
         let frame = ContinuationFrame::native(suspend.continuation);
+        // Channel waits are dispatched separately, BEFORE taking the shared
+        // `state` borrow below: `install_channel_wait_and_resume`'s
+        // immediate-match fast path (Task D) needs to resume continuations
+        // with no `RuntimeState` borrow outstanding (see
+        // `ChannelRendezvousResume`'s doc) — a borrow this function would
+        // otherwise hold across its entire body, for every `WaitKind`.
+        let wait = match suspend.wait {
+            WaitKind::Channel(wait) => {
+                return self.install_channel_wait_and_resume(task_id, owner, frame, wait)
+            }
+            other => other,
+        };
         let mut state = self.state.borrow_mut();
         let key = match state
             .waits
@@ -2467,7 +2423,7 @@ impl Runtime {
                 return Ok(());
             }
         };
-        let result = match suspend.wait {
+        let result = match wait {
             WaitKind::Promise(promise) => install_promise_wait(
                 &mut state,
                 task_id,
@@ -2482,15 +2438,13 @@ impl Runtime {
             WaitKind::PromiseSet(wait) => {
                 install_promise_wait(&mut state, task_id, key, wait, owner, frame)
             }
-            WaitKind::Channel(wait) => {
-                install_channel_wait(&mut state, task_id, key, wait, owner, frame)
-            }
             WaitKind::Timer(duration) => {
                 install_timer_wait(&mut state, task_id, key, duration, owner, frame)
             }
             WaitKind::ResourceSlot(gate) => {
                 install_resource_slot_wait(&mut state, task_id, key, gate, owner, frame)
             }
+            WaitKind::Channel(_) => unreachable!("handled above"),
             WaitKind::External(_) => unreachable!("filtered protocol wait"),
         };
         if let Err(error) = result {
@@ -2501,6 +2455,112 @@ impl Runtime {
                 frame,
                 Err(error),
             ));
+        }
+        Ok(())
+    }
+
+    /// Install a `Send`/`Receive` channel suspension and, on an immediate
+    /// match, resume the settled continuation(s) inline (Task D) instead of
+    /// queuing `PendingStage`s for a later `advance_pending` work item.
+    ///
+    /// `install_channel_wait` does the registry mutation and task-record
+    /// bookkeeping under a short `RuntimeState` borrow and returns WITHOUT
+    /// resuming anything; this method drops that borrow and only THEN resumes
+    /// (`self`'s own outcome first, then the matched peer, if any) — see
+    /// `ChannelRendezvousResume`'s doc for why `frame.resume` must never run
+    /// under a `RuntimeState` borrow. Resuming `self` before the peer (rather
+    /// than push order) preserves the staged path's observable settlement
+    /// order — see the comment on that call below.
+    fn install_channel_wait_and_resume(
+        &self,
+        task_id: TaskId,
+        owner: ReturnOwner,
+        frame: ContinuationFrame,
+        wait: sema_core::runtime::ChannelWait,
+    ) -> Result<(), RuntimeFault> {
+        let key = {
+            let mut state = self.state.borrow_mut();
+            match state
+                .waits
+                .as_ref()
+                .expect("wait runtime installed")
+                .issue_internal_wait()
+            {
+                Ok(key) => key,
+                Err(_) => {
+                    state.pending.push_back(PendingStage::ApplyRuntimeResponse(
+                        task_id,
+                        owner,
+                        frame,
+                        Err(sema_core::SemaError::eval(
+                            "runtime wait identity exhausted",
+                        )),
+                    ));
+                    return Ok(());
+                }
+            }
+        };
+        let outcome = {
+            let mut state = self.state.borrow_mut();
+            install_channel_wait(&mut state, task_id, key, wait, owner, frame)
+        };
+        match outcome {
+            Ok(ChannelWaitOutcome::Parked) => Ok(()),
+            Ok(ChannelWaitOutcome::Matched { this, peer }) => {
+                // No `RuntimeState` borrow is held here (the block above
+                // dropped it) — safe to resume Sema-level continuations.
+                //
+                // `this` (the task whose op just resolved, e.g. the sender in
+                // a send/recv rendezvous) is resumed BEFORE `peer` (the
+                // matched waiter, e.g. the receiver). Under the staged path a
+                // matched peer's `ChannelWake` was queued ahead of this
+                // task's `ApplyRuntimeResponse`, but the peer's extra
+                // `ChannelWake` hop meant this task's shorter pending chain
+                // reached its final `Apply` — and so `ready`-enqueued —
+                // first regardless (e.g. `channel/send` settles the sender's
+                // task before the matched receiver's task resumes and
+                // settles: `async_race_returns_first_resolved_in_list_order`).
+                // Resuming `this` first here reproduces that order exactly.
+                self.complete_channel_rendezvous(this)?;
+                if let Some(peer) = peer {
+                    self.complete_channel_rendezvous(*peer)?;
+                }
+                Ok(())
+            }
+            Err(ChannelWaitError::Protocol(error)) => {
+                let (owner, frame, error) = *error;
+                self.state
+                    .borrow_mut()
+                    .pending
+                    .push_back(PendingStage::ApplyRuntimeResponse(
+                        task_id,
+                        owner,
+                        frame,
+                        Err(error),
+                    ));
+                Ok(())
+            }
+            Err(ChannelWaitError::Fault(fault)) => Err(fault),
+        }
+    }
+
+    /// Resume one `ChannelRendezvousResume` and apply its result, crediting
+    /// `channel_fast_path_credit` for every pending-stage hop this replaces
+    /// (`ApplyRuntimeResponse`/`ChannelWake` -> `resume_continuation`, and
+    /// `Apply` -> `apply_native_result` when it resolves fully inline) so
+    /// `drive()` debits `work_items` honestly for the collapsed work.
+    fn complete_channel_rendezvous(
+        &self,
+        resume: ChannelRendezvousResume,
+    ) -> Result<(), RuntimeFault> {
+        self.state.borrow_mut().channel_fast_path_credit += 1;
+        let input = resume
+            .response
+            .map_or_else(ResumeInput::Failed, ResumeInput::Runtime);
+        let resumed = self.resume_continuation_value(resume.task_id, resume.frame, input)?;
+        let mut state = self.state.borrow_mut();
+        if apply_native_result_now(&mut state, resume.task_id, resume.owner, resumed)? {
+            state.channel_fast_path_credit += 1;
         }
         Ok(())
     }
@@ -3341,6 +3401,32 @@ impl Runtime {
         frame: ContinuationFrame,
         input: ResumeInput,
     ) -> Result<(), RuntimeFault> {
+        let resumed = self.resume_continuation_value(task_id, frame, input)?;
+        self.state
+            .borrow_mut()
+            .pending
+            .push_back(PendingStage::Apply(task_id, owner, resumed));
+        Ok(())
+    }
+
+    /// Resume a continuation with `input` and return the `NativeResult`,
+    /// without queuing anything. Factored out of `resume_continuation` so
+    /// `install_channel_wait_and_resume`'s inline fast path (Task D) can
+    /// apply the result immediately instead of via `PendingStage::Apply`.
+    ///
+    /// Scopes its `self.state` borrows exactly as `resume_continuation`
+    /// always has: `frame.resume` — which may run arbitrary Sema-level
+    /// evaluation — is called with NO borrow of `self.state` held (see
+    /// `ChannelRendezvousResume`'s doc for why that matters: a collection
+    /// pass triggered inside `frame.resume` needs to `try_borrow()` the same
+    /// `RefCell` to trace channel buffers, and silently skips tracing them if
+    /// it's already held).
+    fn resume_continuation_value(
+        &self,
+        task_id: TaskId,
+        frame: ContinuationFrame,
+        input: ResumeInput,
+    ) -> Result<NativeResult, RuntimeFault> {
         let (context, cancellation) = {
             let state = self.state.borrow();
             let Some(task) = state.tasks.get(&task_id) else {
@@ -3367,12 +3453,8 @@ impl Runtime {
             return Err(RuntimeFault::Invariant {
                 message: "continuation task disappeared".into(),
             });
-        };
-        self.state
-            .borrow_mut()
-            .pending
-            .push_back(PendingStage::Apply(task_id, owner, resumed));
-        Ok(())
+        }
+        Ok(resumed)
     }
 
     /// Admit a detached child for a `RuntimeRequest::Spawn` and resume the
@@ -4425,6 +4507,221 @@ fn registry_error(error: super::RegistryError) -> sema_core::SemaError {
 
 type ProtocolInstallError = Box<(ReturnOwner, ContinuationFrame, sema_core::SemaError)>;
 
+/// `install_channel_wait`'s error channel: it can fail exactly like the other
+/// `install_*_wait` helpers (`ProtocolInstallError`, delivered to the caller's
+/// continuation as a catchable Sema-level error) OR, on its immediate-match
+/// fast path, hit one of the same "task disappeared" invariant faults that
+/// `resume_continuation`/`finish_protocol_wait` guard against elsewhere. Those
+/// two error classes are not interchangeable — a `RuntimeFault` is an
+/// unrecoverable runtime-invariant violation, never a per-task catchable
+/// error — so this carries both variants distinctly. `From<RuntimeFault>` lets
+/// the fast path use `?` for the fault variant.
+enum ChannelWaitError {
+    Protocol(ProtocolInstallError),
+    Fault(RuntimeFault),
+}
+
+impl From<RuntimeFault> for ChannelWaitError {
+    fn from(fault: RuntimeFault) -> Self {
+        Self::Fault(fault)
+    }
+}
+
+/// Compute the `RuntimeResponse` a channel wake resumes its waiter with.
+/// Shared by the staged path (`consume_channel_wake`, reached via a queued
+/// `ChannelWake`/`ChannelClose` pending stage) and `install_channel_wait`'s
+/// immediate-match fast path (Task D), which resumes the matched peer inline
+/// instead of queuing its wake. `None` for `ChannelResult::Waiting`, which
+/// `ChannelWake` never actually carries (every wake is pushed with a settled
+/// result) — kept as a defensive no-op mirroring the staged path's own arm.
+fn channel_wake_response(
+    protocol_waits: &HashMap<super::WaitKey, ProtocolWait>,
+    key: super::WaitKey,
+    result: super::ChannelResult,
+) -> Option<ChannelResponse> {
+    Some(Ok(match result {
+        super::ChannelResult::Sent => RuntimeResponse::Send(sema_core::runtime::ChannelSend::Sent),
+        super::ChannelResult::Received(value) => {
+            RuntimeResponse::Receive(sema_core::runtime::ChannelReceive::Received(value))
+        }
+        super::ChannelResult::Closed => {
+            let receive = protocol_waits.get(&key).is_some_and(|wait| {
+                matches!(wait.kind, ProtocolWaitKind::Channel { receive: true, .. })
+            });
+            if receive {
+                RuntimeResponse::Receive(sema_core::runtime::ChannelReceive::Closed)
+            } else {
+                RuntimeResponse::Send(sema_core::runtime::ChannelSend::Closed)
+            }
+        }
+        super::ChannelResult::Waiting => return None,
+    }))
+}
+
+/// Core of `Runtime::reinstall_parent_vm`, factored out for reuse by the
+/// ordinary `&self` method and `install_channel_wait_and_resume`'s inline fast
+/// path.
+fn reinstall_parent_vm_now(
+    state: &mut RuntimeState,
+    task_id: TaskId,
+    vm: VM,
+    parent: ReturnOwner,
+    resume: VmResume,
+) -> Result<(), RuntimeFault> {
+    let task = state
+        .tasks
+        .get_mut(&task_id)
+        .ok_or_else(|| RuntimeFault::Invariant {
+            message: "parent VM task disappeared before reinstall".into(),
+        })?;
+    task.vm_call = Some(vm);
+    task.vm_owner = Some(parent);
+    task.vm_resume = Some(resume);
+    task.record
+        .yield_ready()
+        .map_err(|error| RuntimeFault::Invariant {
+            message: format!("reinstalled parent VM failed to yield ready: {error:?}"),
+        })?;
+    let root = task.record.relations().origin_root;
+    state.ready.enqueue(root, task_id);
+    Ok(())
+}
+
+/// Apply a resumed continuation's `NativeResult` inline, mirroring
+/// `Runtime::apply_native_result`'s two hot branches — a parked parent VM
+/// (`ReturnOwner::VmResume`) resuming with a plain `Return`/error, the shape a
+/// channel op's continuation produces — without the `PendingStage::Apply`
+/// round-trip. Anything else (chained `ReturnOwner::Continuation` composition,
+/// or a resumed continuation that itself yields `NativeOutcome::Call`/`Suspend`)
+/// falls back to queuing exactly the `PendingStage::Apply` the staged path
+/// would have produced, so `advance_pending` replays it through the unmodified
+/// `apply_native_result`/`apply_native_outcome` — single-step inline, no
+/// unbounded in-place looping. Returns `true` when it resolved fully inline
+/// (the caller owes one fewer collapsed-hop credit).
+fn apply_native_result_now(
+    state: &mut RuntimeState,
+    task_id: TaskId,
+    owner: ReturnOwner,
+    result: NativeResult,
+) -> Result<bool, RuntimeFault> {
+    match (owner, result) {
+        (ReturnOwner::VmResume { vm, parent }, Ok(NativeOutcome::Return(value))) => {
+            reinstall_parent_vm_now(state, task_id, *vm, *parent, VmResume::Value(value))?;
+            Ok(true)
+        }
+        (ReturnOwner::VmResume { vm, parent }, Err(error)) => {
+            reinstall_parent_vm_now(state, task_id, *vm, *parent, VmResume::Fail(error))?;
+            Ok(true)
+        }
+        (owner, result) => {
+            state
+                .pending
+                .push_back(PendingStage::Apply(task_id, owner, result));
+            Ok(false)
+        }
+    }
+}
+
+/// A channel/protocol response still awaiting delivery to a continuation.
+type ChannelResponse = Result<RuntimeResponse, sema_core::SemaError>;
+
+/// What `finish_protocol_wait_now` hands back for the caller to resume: the
+/// wait's owner/continuation plus the response to resume it with.
+type ProtocolWaitResume = (ReturnOwner, ContinuationFrame, ChannelResponse);
+
+/// Core of `Runtime::finish_protocol_wait`, factored out for `install_channel_wait`'s
+/// inline fast path. Returns `Some((owner, frame, response))` when the wait was
+/// genuinely live and owned by `task_id` (mirroring the staged path's single
+/// `PendingStage::ApplyRuntimeResponse` push); `None` for the two silent-drop
+/// cases the staged path also has (wait already gone, or owned by a different
+/// task) — the `dropped_protocol_completions` bookkeeping is preserved.
+fn finish_protocol_wait_now(
+    state: &mut RuntimeState,
+    key: super::WaitKey,
+    task_id: TaskId,
+    response: ChannelResponse,
+) -> Result<Option<ProtocolWaitResume>, RuntimeFault> {
+    let Some(wait) = state.protocol_waits.remove(&key) else {
+        // The wait is gone (e.g. the task was cancelled). A rendezvous value
+        // that arrives here would be silently lost, so record it.
+        if matches!(
+            &response,
+            Ok(RuntimeResponse::Receive(
+                sema_core::runtime::ChannelReceive::Received(_)
+            ))
+        ) {
+            state.dropped_protocol_completions += 1;
+        }
+        return Ok(None);
+    };
+    if wait.task != task_id {
+        state.protocol_waits.insert(key, wait);
+        return Ok(None);
+    }
+    if let ProtocolWaitKind::Promises(set) = &wait.kind {
+        for promise in &set.promises {
+            let _ = state.promises.cancel_observation(*promise, key);
+        }
+        // A `Timeout` armed a deadline timer under this key; the observed
+        // promise won, so deregister the timer before it fires stale.
+        if matches!(set.mode, sema_core::runtime::PromiseSetMode::Timeout(_)) {
+            state.timers.cancel(key);
+        }
+    }
+    let task = state
+        .tasks
+        .get_mut(&task_id)
+        .ok_or_else(|| RuntimeFault::Invariant {
+            message: "protocol wake task disappeared".into(),
+        })?;
+    task.record
+        .reject_wait(key)
+        .map_err(|error| RuntimeFault::Invariant {
+            message: format!("protocol wake transition failed: {error:?}"),
+        })?;
+    Ok(Some((wait.owner, wait.continuation, response)))
+}
+
+/// Resume one settled channel waiter (self or the matched peer) inline within
+/// `install_channel_wait`'s immediate-match fast path, crediting
+/// `channel_fast_path_credit` for every pending-stage hop this replaces so
+/// `drive()` debits `work_items` honestly for the collapsed work.
+///
+/// One waiter (self or the matched peer) whose continuation
+/// `install_channel_wait_and_resume` still owes a resume+apply pass. Carried
+/// OUT of `install_channel_wait` rather than resumed inline there: that
+/// function runs under a live `RuntimeState` borrow (registry/task-record
+/// bookkeeping needs it), and `ContinuationFrame::resume` must never run
+/// under one — it can invoke arbitrary Sema-level evaluation, and a
+/// collection pass it triggers needs to trace the SAME `RuntimeState` (e.g.
+/// `interior_trace_channel` tracing channel buffers). A collection that finds
+/// the state already borrowed just `try_borrow()`s, fails, and silently skips
+/// tracing those roots this pass — not a soundness bug, but it starves the
+/// collector exactly like `cyclic_data_churn_collected_mid_eval` catches.
+/// `install_channel_wait_and_resume` drops its borrow before resuming any of
+/// these, matching `resume_continuation`'s own long-standing discipline of
+/// never holding `self.state` across a `frame.resume` call.
+struct ChannelRendezvousResume {
+    task_id: TaskId,
+    owner: ReturnOwner,
+    frame: ContinuationFrame,
+    response: ChannelResponse,
+}
+
+/// `install_channel_wait`'s result: either the task parked (unchanged from
+/// the staged path), or its op matched immediately and one or two waiters
+/// (this task, and the peer it matched with, if any) are ready to resume —
+/// see `ChannelRendezvousResume` for why that resume happens outside this
+/// function. `peer` is boxed so the common `Parked`/no-peer variants stay
+/// cheap to move — a matched rendezvous is the less frequent shape.
+enum ChannelWaitOutcome {
+    Parked,
+    Matched {
+        this: ChannelRendezvousResume,
+        peer: Option<Box<ChannelRendezvousResume>>,
+    },
+}
+
 fn promise_set_response(
     promises: &PromiseRegistry,
     wait: &sema_core::runtime::PromiseSetWait,
@@ -4767,6 +5064,29 @@ fn install_resource_slot_wait(
     }
 }
 
+/// Register a `Send`/`Receive` channel suspension. A genuine park (no ready
+/// peer) is unchanged from the staged path: the task is parked FIFO in the
+/// channel's queue with a `Channel` protocol wait, resumed by a later matching
+/// op or `close`.
+///
+/// An IMMEDIATE MATCH (a ready peer, or spare buffer capacity) is Task D's
+/// fast path: instead of queuing a `ChannelWake` for the matched peer and an
+/// `ApplyRuntimeResponse` for this task — each a separate `advance_pending`
+/// work item under the staged path, ~10 drive iterations end to end for one
+/// rendezvous — both settled waiters are returned as `ChannelRendezvousResume`s
+/// for `install_channel_wait_and_resume` to resume inline. This function itself
+/// never resumes a continuation (it runs under a live `RuntimeState` borrow;
+/// see `ChannelRendezvousResume`'s doc for why that must stay borrow-only).
+/// The peer's `finish_protocol_wait` bookkeeping (`protocol_waits` removal +
+/// its task's wait->ready transition) IS done here, inline — unlike resuming
+/// a continuation, it never runs Sema-level code, so it's safe under this
+/// borrow, and it credits `channel_fast_path_credit` for the `ChannelWake`
+/// hop it replaces (`drive()` folds the credit into `work_items` after this
+/// work item, so a matched rendezvous cannot look "free" and starve sibling
+/// roots). Cancellation is not bypassed: `resume_continuation_value` (called
+/// later, by the caller) re-checks the task's cancellation and resumes as
+/// `Cancelled` if it landed in the meantime (UCR-3), exactly like the staged
+/// path.
 fn install_channel_wait(
     state: &mut RuntimeState,
     task_id: TaskId,
@@ -4774,7 +5094,7 @@ fn install_channel_wait(
     wait: sema_core::runtime::ChannelWait,
     owner: ReturnOwner,
     frame: ContinuationFrame,
-) -> Result<(), ProtocolInstallError> {
+) -> Result<ChannelWaitOutcome, ChannelWaitError> {
     let (channel, receive, result) = match wait {
         sema_core::runtime::ChannelWait::Send { channel, value } => (
             channel,
@@ -4787,11 +5107,18 @@ fn install_channel_wait(
     };
     let result = match result {
         Ok(result) => result,
-        Err(error) => return Err(Box::new((owner, frame, registry_error(error)))),
+        Err(error) => {
+            return Err(ChannelWaitError::Protocol(Box::new((
+                owner,
+                frame,
+                registry_error(error),
+            ))))
+        }
     };
-    if let Some(wake) = state.channels.pop_wake() {
-        state.pending.push_back(PendingStage::ChannelWake(wake));
-    }
+    // A wake can only be present here when `result != Waiting` (this task's
+    // own op is what resolved the peer), so it is always `None` on the park
+    // path below.
+    let wake = state.channels.pop_wake();
     if result == super::ChannelResult::Waiting {
         if let Err(error) = state
             .tasks
@@ -4801,11 +5128,11 @@ fn install_channel_wait(
             .wait(key)
         {
             let _ = state.channels.cancel_wait(channel, key);
-            return Err(Box::new((
+            return Err(ChannelWaitError::Protocol(Box::new((
                 owner,
                 frame,
                 sema_core::SemaError::eval(format!("channel wait transition failed: {error:?}")),
-            )));
+            ))));
         }
         state.protocol_waits.insert(
             key,
@@ -4816,7 +5143,8 @@ fn install_channel_wait(
                 continuation: frame,
             },
         );
-        return Ok(());
+        debug_assert!(wake.is_none(), "a wake implies an immediate match");
+        return Ok(ChannelWaitOutcome::Parked);
     }
     let response = match (receive, result) {
         (true, super::ChannelResult::Received(value)) => {
@@ -4836,13 +5164,39 @@ fn install_channel_wait(
             unreachable!("channel result matches operation")
         }
     };
-    state.pending.push_back(PendingStage::ApplyRuntimeResponse(
+    let this = ChannelRendezvousResume {
         task_id,
         owner,
         frame,
-        Ok(response),
-    ));
-    Ok(())
+        response: Ok(response),
+    };
+    // This task was never installed as a protocol wait (it matched
+    // immediately), so unlike the peer below there is no `finish_protocol_wait`
+    // bookkeeping to fold in.
+    let peer = match wake {
+        Some(wake) => {
+            match channel_wake_response(&state.protocol_waits, wake.key, wake.result) {
+                Some(peer_response) => {
+                    // Replaces the `PendingStage::ChannelWake` ->
+                    // `consume_channel_wake` hop.
+                    state.channel_fast_path_credit += 1;
+                    finish_protocol_wait_now(state, wake.key, wake.task, peer_response)?.map(
+                        |(owner, frame, response)| {
+                            Box::new(ChannelRendezvousResume {
+                                task_id: wake.task,
+                                owner,
+                                frame,
+                                response,
+                            })
+                        },
+                    )
+                }
+                None => None,
+            }
+        }
+        None => None,
+    };
+    Ok(ChannelWaitOutcome::Matched { this, peer })
 }
 
 struct ActiveDriveGuard(Rc<RefCell<RuntimeState>>);

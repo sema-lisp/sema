@@ -27,3 +27,26 @@ Profile baseline binary on cons-10m (`sample`, same protocol) and diff top-of-st
 
 ### Task 0c-6: close-out
 Re-run the six-benchmark matrix + divan suite; update `benchmark-vs-baseline.md` final table + PERF-RESIDUAL-1 (resolve rows that reach ≤1.10×, keep honest residuals); ledger + CHANGELOG.
+
+### Task 0c-7: direct task-to-task rendezvous handoff (added after close-out; owner go-ahead)
+Close the last residual (pingpong 1.97×, ~12k instr/message): a channel op whose
+match is immediately available must complete WITHOUT parking its own task.
+Preferred design (b) — no new VM↔runtime seam: in the drive path where a task's
+quantum returns the channel-suspend (visit_ready → run_parked_quantum →
+quantum_to_action), consult the registry BEFORE boxing/parking the VM; on
+immediate availability, write the response onto the still-unboxed VM's stack
+(the same value-application `reinstall_parent_vm_now` performs) and loop
+straight back into `run_quantum` on the same VM object — no `Box<VM>`, no
+task-map churn, no extra drive items for the matched side. Peer delivery reuses
+the Task-D inline machinery unchanged. Alternative design (a) — a VM-level
+fast-resolve hook pre-suspend — only if (b) proves unworkable; justify.
+Constraints: quantum instruction budget continues across the handoff loop
+(bounds a send/recv-spinning pair exactly like Task C's in-place loop);
+work-item credit debited per handoff; FIFO via registry queues untouched;
+genuine-block path byte-identical; UCR-3/cancellation windows preserved
+(cancellation re-checked per handoff iteration); `async/run` barrier
+re-evaluation unaffected (handoffs happen within one work item, barriers
+re-check next iteration as with Task C/D).
+Oracle: pingpong ≤1.10× instructions vs ~400M baseline (stretch; report honest
+number); full channel battery + barrier + cancellation + watchdog suites;
+divan channel_rendezvous bench delta.

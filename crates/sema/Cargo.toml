@@ -61,6 +61,7 @@ zip = { version = "8", default-features = false, features = ["deflate"] }
 rust-embed = { version = "8", features = ["debug-embed"] }
 self-replace.workspace = true
 indicatif.workspace = true
+ctrlc = "3.5.2"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

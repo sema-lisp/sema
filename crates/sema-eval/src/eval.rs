@@ -548,17 +548,23 @@ impl Interpreter {
                     }
                 }
                 // The root is parked purely on a timer (`async/sleep`): the only
-                // pending work is a future deadline. Wait it out on a real clock,
-                // then drive again so `fire_timer` wakes the VM.
+                // pending work is a future deadline. Block on the same inbox a
+                // parked external wait would (bounded by that deadline) rather
+                // than a raw `thread::sleep` — no external op is registered, so
+                // no completion can arrive, but a cross-thread
+                // `RuntimeCommandHandle::cancel_root`/`cancel_all` (a host's
+                // Ctrl-C handler, a watchdog) rides the SAME inbox and must wake
+                // this thread promptly instead of waiting out the full timer.
+                // Times out and returns `false` at `deadline` in the ordinary
+                // no-command case — equivalent to the sleep it replaces — then
+                // drives again so `fire_timer` wakes the VM (or the drained
+                // command cancels it first).
                 DriveState::Idle {
                     next_deadline: Some(deadline),
                     inbox_wakeup_required: false,
                     ..
                 } => {
-                    let now = std::time::Instant::now();
-                    if deadline > now {
-                        std::thread::sleep(deadline - now);
-                    }
+                    runtime.block_on_inbox(Some(deadline));
                 }
                 // Fully idle: no task made progress this turn, no timer deadline,
                 // and no pending external completion — nothing can ever change

@@ -1,10 +1,13 @@
 # MCP Bundle (.mcpb) — single cross-platform bundle from the release
 
-**Status:** archived — implemented. Manifest, Linux shim, pack script, jake
-recipes, and the release-time workflow (`.github/workflows/mcpb.yml`) are all
-committed and locally verified. Untried on a real release: first live run is
-planned for the release after the unified-scheduler work lands. The one-time
-registry publish (below) is still pending.
+**Status:** archived — implemented and verified against real release assets.
+Manifest, Linux shim, pack script, jake recipes, and the release-time workflow
+(`.github/workflows/mcpb.yml`) are committed. `jake mcpb.pack` was run against
+the live v1.30.0 release: downloaded all 5 target archives, lipo'd a genuine
+universal macOS binary (`x86_64 arm64`), and packed `dist/sema.mcpb`
+(55 MB / 135 MB unpacked). Untried only inside the workflow itself — first live
+CI run is planned for the release after the unified-scheduler work lands. The
+one-time registry publish (below) is still pending.
 
 ## Decision
 
@@ -113,9 +116,9 @@ registry is versioned). Could be a later step in the same `mcpb.yml` job.
 
 ## Follow-ups / open questions
 
-- Confirm cargo-dist asset archive names match the script's
-  `sema-<triple>.tar.*` / `.zip` assumption on the first real run
-  (`gh release view <tag>`); adjust the `find`/extract globs if not.
+- ~~Confirm cargo-dist asset archive names~~ — done: assets are
+  `sema-lang-<triple>.tar.xz` / `.zip` (crate name, not binary name); the script
+  matches these.
 - Optionally sign the bundle (`mcpb sign`) once we have a key.
 - Optionally add cargo and/or an npm shim as extra `packages[]` later — they can
   coexist with the mcpb entry in one `server.json`.

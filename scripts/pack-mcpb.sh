@@ -58,14 +58,15 @@ else
   VERSION="${TAG#v}"
   DL="$WORK/dl"; mkdir -p "$DL"
   echo "== downloading $TAG release assets =="
+  # cargo-dist names assets by the crate (sema-lang), not the binary (sema).
   gh release download "$TAG" --repo sema-lisp/sema --dir "$DL" \
-    --pattern 'sema-*.tar.*' --pattern 'sema-*.zip'
-  # Extract each archive and lift out its sema binary, named by triple.
+    --pattern 'sema-lang-*.tar.xz' --pattern 'sema-lang-*.zip'
+  # Extract each archive and lift out its `sema` binary, named by triple.
   for t in "$MAC_ARM" "$MAC_X64" "$LNX_ARM" "$LNX_X64"; do
-    tar -xf "$DL/sema-$t".tar.* -C "$WORK"
+    tar -xf "$DL/sema-lang-$t.tar.xz" -C "$WORK"
     cp "$(find "$WORK" -type f -name sema -path "*$t*" | head -1)" "$BINS/sema-$t"
   done
-  unzip -oq "$DL/sema-$WIN_X64.zip" -d "$WORK/win"
+  unzip -oq "$DL/sema-lang-$WIN_X64.zip" -d "$WORK/win"
   cp "$(find "$WORK/win" -type f -name 'sema.exe' | head -1)" "$BINS/sema-$WIN_X64.exe"
 fi
 

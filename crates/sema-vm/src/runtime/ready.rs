@@ -54,6 +54,14 @@ impl ReadyScheduler {
         self.roots.len()
     }
 
+    /// Whether any task is queued. O(1); equivalent to "some task's record is
+    /// `Ready`" at drive-turn boundaries, where every `Ready` task is enqueued
+    /// (a dequeued task runs to park/settle/re-enqueue within the same turn,
+    /// and a debug-paused task's record leaves `Ready`).
+    pub fn has_queued(&self) -> bool {
+        !self.task_membership.is_empty()
+    }
+
     pub fn remove_root(&mut self, root: RootId) -> Vec<TaskId> {
         let removed = self.tasks_by_root.remove(&root).unwrap_or_default();
         for task in &removed {

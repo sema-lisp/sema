@@ -1161,10 +1161,15 @@ impl Runtime {
                 info: info.clone(),
             });
         }
-        let ready_remaining = state
-            .tasks
-            .values()
-            .any(|task| task.record.state_name() == super::StateName::Ready);
+        let ready_remaining = state.ready.has_queued();
+        debug_assert_eq!(
+            ready_remaining,
+            state
+                .tasks
+                .values()
+                .any(|task| task.record.state_name() == super::StateName::Ready),
+            "ready-queue membership must mirror Ready task records at turn boundaries"
+        );
         if work_items > 0 {
             Ok(DriveState::Progress {
                 work_items,

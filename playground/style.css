@@ -235,8 +235,8 @@
   .output-error {
     color: var(--error);
     background: var(--error-bg);
+    margin-top: 0.75rem;
     padding: 0.5rem 0.75rem;
-    border-radius: 4px;
     border-left: 2px solid var(--error);
     white-space: pre-wrap;
   }

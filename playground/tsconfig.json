@@ -1,7 +1,12 @@
 {
   "compilerOptions": {
-    "target": "ES2015",
+    "target": "ES2022",
     "module": "ESNext",
-    "moduleResolution": "node"
-  }
+    "moduleResolution": "bundler",
+    "types": ["node"],
+    "strict": false,
+    "allowJs": true,
+    "noEmit": true
+  },
+  "include": ["tests/**/*.ts", "src/**/*.js"]
 }

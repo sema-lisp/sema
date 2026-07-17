@@ -32,12 +32,18 @@ PROFILE_ONLY=0
 # llvm-profdata ships with the `llvm-tools` component; it lives in the rustlib
 # bin dir, not on PATH.
 find_profdata() {
-  if command -v llvm-profdata >/dev/null 2>&1; then command -v llvm-profdata; return; fi
+  if command -v llvm-profdata >/dev/null 2>&1; then
+    command -v llvm-profdata
+    return
+  fi
   local sysroot host cand
   sysroot="$(rustc --print sysroot)"
   host="$(rustc -vV | sed -n 's/host: //p')"
   cand="$sysroot/lib/rustlib/$host/bin/llvm-profdata"
-  if [[ -x "$cand" ]]; then echo "$cand"; return; fi
+  if [[ -x "$cand" ]]; then
+    echo "$cand"
+    return
+  fi
   echo "ERROR: llvm-profdata not found. Run: rustup component add llvm-tools-preview" >&2
   exit 1
 }
@@ -50,6 +56,7 @@ rm -rf "$PROFRAW_DIR" "$PROFDATA"
 mkdir -p "$PROFRAW_DIR"
 
 echo "==> [1/4] instrumented build ($PROFILE)"
+# shellcheck disable=SC2046 # profile_flag emits multiple words on purpose
 RUSTFLAGS="-Cprofile-generate=$PROFRAW_DIR" cargo build $(profile_flag) --bin sema
 
 echo "==> [2/4] training"
@@ -70,7 +77,7 @@ if [[ -f "$TRAIN_DATA" ]]; then
 fi
 # Compute / closure / string / data / exception workloads exercise the dispatch loop.
 for b in tak nqueens deriv upvalue-counter closure-storm higher-order-fold \
-         hashmap-bench bench-features string-pipeline mandelbrot throw-catch; do
+  hashmap-bench bench-features string-pipeline mandelbrot throw-catch; do
   [[ -f "$BENCH_DIR/$b.sema" ]] && "$BIN" "$BENCH_DIR/$b.sema" >/dev/null 2>&1 || true
 done
 
@@ -85,5 +92,6 @@ if [[ "$PROFILE_ONLY" == "1" ]]; then
 fi
 
 echo "==> [4/4] optimized build (profile-use)"
+# shellcheck disable=SC2046 # profile_flag emits multiple words on purpose
 RUSTFLAGS="-Cprofile-use=$PROFDATA -Cllvm-args=-pgo-warn-missing-function" cargo build $(profile_flag) --bin sema
 echo "PGO build complete: $BIN"

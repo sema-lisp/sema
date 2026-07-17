@@ -1,9 +1,13 @@
-#!/bin/bash
+#!/usr/bin/env bash
+#
+# Generate the small PDF fixtures the PDF-stdlib tests read from
+# crates/sema/tests/fixtures, via a self-contained Python heredoc (no external
+# PDF libraries).
 set -euo pipefail
 FIXTURE_DIR="crates/sema/tests/fixtures"
 mkdir -p "$FIXTURE_DIR"
 
-python3 << 'PYEOF'
+python3 <<'PYEOF'
 import sys
 
 def make_pdf(text, path, title="Test Document", author="Sema Test Suite"):

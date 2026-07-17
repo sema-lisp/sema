@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+#
+# Benchmark runner for the `sema` binary: hyperfine-driven, grouped suites
+# (core/closure/data/…). Driven by `jake bench.*`; see jake/bench.jake.
 set -euo pipefail
 
 SEMA_BIN="${SEMA_BIN:-./target/release/sema}"
@@ -7,19 +10,19 @@ BENCH_DIR="examples/benchmarks"
 # ── Suite definitions ──────────────────────────────────────────────
 suite_benchmarks() {
   case "$1" in
-    core)      echo "tak nqueens deriv" ;;
-    closure)   echo "upvalue-counter closure-storm higher-order-fold recursive-closure-churn" ;;
-    data)      echo "hashmap-bench bench-features" ;;
-    string)    echo "string-pipeline" ;;
-    numeric)   echo "tak nqueens deriv mandelbrot" ;;
+    core) echo "tak nqueens deriv" ;;
+    closure) echo "upvalue-counter closure-storm higher-order-fold recursive-closure-churn" ;;
+    data) echo "hashmap-bench bench-features" ;;
+    string) echo "string-pipeline" ;;
+    numeric) echo "tak nqueens deriv mandelbrot" ;;
     exception) echo "throw-catch" ;;
-    all)       echo "tak nqueens deriv upvalue-counter closure-storm higher-order-fold recursive-closure-churn hashmap-bench bench-features string-pipeline mandelbrot throw-catch" ;;
-    *)         return 1 ;;
+    all) echo "tak nqueens deriv upvalue-counter closure-storm higher-order-fold recursive-closure-churn hashmap-bench bench-features string-pipeline mandelbrot throw-catch" ;;
+    *) return 1 ;;
   esac
 }
 
 # ── Defaults ───────────────────────────────────────────────────────
-MODE="vm"  # the bytecode VM is the sole evaluator
+MODE="vm" # the bytecode VM is the sole evaluator
 RUNS=10
 WARMUP=3
 EXPORT=""
@@ -64,14 +67,35 @@ EOF
 # ── Argument parsing ───────────────────────────────────────────────
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --suite)   SUITE="$2"; shift 2 ;;
-    --bench)   BENCH_LIST="$2"; shift 2 ;;
-    --runs)    RUNS="$2"; shift 2 ;;
-    --warmup)  WARMUP="$2"; shift 2 ;;
-    --export)  EXPORT="$2"; shift 2 ;;
-    --compare) COMPARE="$2"; shift 2 ;;
-    -h|--help) usage ;;
-    *) echo "Unknown option: $1"; usage ;;
+    --suite)
+      SUITE="$2"
+      shift 2
+      ;;
+    --bench)
+      BENCH_LIST="$2"
+      shift 2
+      ;;
+    --runs)
+      RUNS="$2"
+      shift 2
+      ;;
+    --warmup)
+      WARMUP="$2"
+      shift 2
+      ;;
+    --export)
+      EXPORT="$2"
+      shift 2
+      ;;
+    --compare)
+      COMPARE="$2"
+      shift 2
+      ;;
+    -h | --help) usage ;;
+    *)
+      echo "Unknown option: $1"
+      usage
+      ;;
   esac
 done
 
@@ -98,9 +122,9 @@ fi
 
 # ── Resolve benchmark list ────────────────────────────────────────
 if [[ -n "$BENCH_LIST" ]]; then
-  IFS=',' read -ra BENCHMARKS <<< "$BENCH_LIST"
+  IFS=',' read -ra BENCHMARKS <<<"$BENCH_LIST"
 else
-  read -ra BENCHMARKS <<< "$(suite_benchmarks "$SUITE")"
+  read -ra BENCHMARKS <<<"$(suite_benchmarks "$SUITE")"
 fi
 
 # Deduplicate while preserving order
@@ -163,13 +187,13 @@ done
 build_unified_json() {
   local output="$1"
 
-  printf '{\n' > "$output"
-  printf '  "git_sha": "%s",\n' "$GIT_SHA" >> "$output"
-  printf '  "timestamp": "%s",\n' "$TIMESTAMP" >> "$output"
-  printf '  "mode": "%s",\n' "$MODE" >> "$output"
-  printf '  "runs": %d,\n' "$RUNS" >> "$output"
-  printf '  "warmup": %d,\n' "$WARMUP" >> "$output"
-  printf '  "benchmarks": {\n' >> "$output"
+  printf '{\n' >"$output"
+  printf '  "git_sha": "%s",\n' "$GIT_SHA" >>"$output"
+  printf '  "timestamp": "%s",\n' "$TIMESTAMP" >>"$output"
+  printf '  "mode": "%s",\n' "$MODE" >>"$output"
+  printf '  "runs": %d,\n' "$RUNS" >>"$output"
+  printf '  "warmup": %d,\n' "$WARMUP" >>"$output"
+  printf '  "benchmarks": {\n' >>"$output"
 
   local first=true
   for name in "${BENCHMARKS[@]}"; do
@@ -186,13 +210,13 @@ build_unified_json() {
     if [[ "$first" == "true" ]]; then
       first=false
     else
-      printf ',\n' >> "$output"
+      printf ',\n' >>"$output"
     fi
     printf '    "%s": {"mean": %s, "stddev": %s, "min": %s, "max": %s}' \
-      "$name" "$mean" "$stddev" "$min" "$max" >> "$output"
+      "$name" "$mean" "$stddev" "$min" "$max" >>"$output"
   done
 
-  printf '\n  }\n}\n' >> "$output"
+  printf '\n  }\n}\n' >>"$output"
 }
 
 if [[ -n "$EXPORT" ]]; then

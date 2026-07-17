@@ -18,13 +18,19 @@ set -u
 TIMEOUT="${EXAMPLE_TIMEOUT:-30}"
 while [ $# -gt 0 ]; do
   case "$1" in
-    --timeout) TIMEOUT="$2"; shift 2 ;;
-    *) echo "unknown arg: $1" >&2; exit 2 ;;
+    --timeout)
+      TIMEOUT="$2"
+      shift 2
+      ;;
+    *)
+      echo "unknown arg: $1" >&2
+      exit 2
+      ;;
   esac
 done
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-cd "$ROOT"
+cd "$ROOT" || exit 1
 
 BIN="target/release/sema"
 if [ ! -x "$BIN" ]; then
@@ -34,30 +40,30 @@ fi
 
 # Per-file blacklist (interactive / server / hardware). Matched by path suffix.
 SKIP_FILES=(
-  "examples/web-server.sema"      # http/serve — never exits
-  "examples/eliza-web.sema"       # http/serve — never exits
-  "examples/eliza.sema"           # interactive read-line chatbot
-  "examples/game-of-life.sema"    # full-screen TUI — reads keys in a loop,
-                                  # no natural exit without a 'q' keypress
-  "examples/pico-blink.sema"      # Raspberry Pi Pico hardware
+  "examples/web-server.sema"   # http/serve — never exits
+  "examples/eliza-web.sema"    # http/serve — never exits
+  "examples/eliza.sema"        # interactive read-line chatbot
+  "examples/game-of-life.sema" # full-screen TUI — reads keys in a loop,
+  # no natural exit without a 'q' keypress
+  "examples/pico-blink.sema" # Raspberry Pi Pico hardware
   "examples/pico-jukebox.sema"
   "examples/pico-midi.sema"
   "examples/pico-piano.sema"
   "examples/pico-show.sema"
-  "examples/stdlib/io.sema"       # reads stdin
-  "examples/stdlib/http.sema"     # real network requests — non-deterministic
-                                  # (a flaky endpoint / 503 must not fail the
-                                  # smoke run). Same rationale as
-                                  # build-examples.sh. HTTP is covered by the
-                                  # ignored integration suite (jake test.http).
+  "examples/stdlib/io.sema"   # reads stdin
+  "examples/stdlib/http.sema" # real network requests — non-deterministic
+  # (a flaky endpoint / 503 must not fail the
+  # smoke run). Same rationale as
+  # build-examples.sh. HTTP is covered by the
+  # ignored integration suite (jake test.http).
   "examples/glados-downloads.sema" # LLM demo: calls llm/extract + llm/auto-
-                                  # configure, which hit a provider (e.g. Ollama
-                                  # at localhost:11434). Passes only where a
-                                  # provider is reachable; must not gate CI.
+  # configure, which hit a provider (e.g. Ollama
+  # at localhost:11434). Passes only where a
+  # provider is reachable; must not gate CI.
   "examples/llm/async-stress-live.sema" # LIVE async/streaming stress against
-                                  # real provider APIs (real spend, minutes of
-                                  # network). Manual verification gate for the
-                                  # true-async work — run via `jake llm-stress`.
+  # real provider APIs (real spend, minutes of
+  # network). Manual verification gate for the
+  # true-async work — run via `jake llm-stress`.
 )
 
 is_skipped() {
@@ -69,26 +75,29 @@ is_skipped() {
 # Directories of runnable examples. (ai-tools/llm/providers need network+keys,
 # pi-sema is hardware, benchmarks need a generated data file, fixtures/
 # sema-web-app/notebook are not standalone programs — all excluded by omission.)
-GLOBS=( examples/*.sema examples/stdlib/*.sema )
+GLOBS=(examples/*.sema examples/stdlib/*.sema)
 
-passed=0; skipped=0; failed=0; failures=()
+passed=0
+skipped=0
+failed=0
+failures=()
 for f in "${GLOBS[@]}"; do
   [ -e "$f" ] || continue
   if is_skipped "$f"; then
     echo "  SKIP $f"
-    skipped=$((skipped+1))
+    skipped=$((skipped + 1))
     continue
   fi
   printf '  RUN  %-45s ' "$f"
   if out=$(timeout "$TIMEOUT" "$BIN" --no-llm "$f" 2>&1); then
     echo "ok"
-    passed=$((passed+1))
+    passed=$((passed + 1))
   else
     code=$?
     if [ "$code" = "124" ]; then echo "TIMEOUT (${TIMEOUT}s)"; else echo "FAIL (exit $code)"; fi
     echo "$out" | tail -5 | sed 's/^/        | /'
     failures+=("$f")
-    failed=$((failed+1))
+    failed=$((failed + 1))
   fi
 done
 

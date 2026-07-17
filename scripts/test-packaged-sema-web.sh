@@ -78,7 +78,7 @@ while IFS= read -r tracked; do
     echo "packaged web smoke: missing src/web/assets/$rel in $(basename "$CRATE")" >&2
     exit 1
   fi
-done <<< "$TRACKED_ASSETS"
+done <<<"$TRACKED_ASSETS"
 
 # Package manifests correctly replace workspace paths with registry versions.
 # Patch those packages back to this checkout so the smoke remains runnable on
@@ -105,7 +105,8 @@ BUILD_TARGET="$TMP/build-target"
 rm -rf "$PACKAGE_DIR/src/web/assets"
 
 printf '(display "packaged web runtime")\n' >"$TMP/app.sema"
-PORT="$(python3 - <<'PY'
+PORT="$(
+  python3 - <<'PY'
 import socket
 
 with socket.socket() as sock:
@@ -154,14 +155,14 @@ while IFS= read -r tracked; do
     cat "$TMP/server.stderr" >&2
     exit 1
   fi
-done <<< "$TRACKED_ASSETS"
+done <<<"$TRACKED_ASSETS"
 
 # The wasm must be served as `application/wasm` (browsers reject
 # WebAssembly.instantiateStreaming otherwise) and be a real, non-truncated
 # module. Use GET (-D -) rather than HEAD so it works regardless of HEAD support.
 WASM_URL="http://127.0.0.1:$PORT/__sema/sema_wasm_bg.wasm"
-CTYPE="$(curl -fsS -D - -o /dev/null "$WASM_URL" | tr -d '\r' \
-  | awk -F': ' 'tolower($1)=="content-type"{print tolower($2)}')"
+CTYPE="$(curl -fsS -D - -o /dev/null "$WASM_URL" | tr -d '\r' |
+  awk -F': ' 'tolower($1)=="content-type"{print tolower($2)}')"
 if [[ "$CTYPE" != application/wasm* ]]; then
   echo "packaged web smoke: wasm served with wrong content-type: '${CTYPE:-<none>}'" >&2
   exit 1

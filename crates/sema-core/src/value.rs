@@ -1606,11 +1606,10 @@ impl Value {
         if !is_boxed(self.0) {
             return None;
         }
-        match get_tag(self.0) {
-            TAG_NIL | TAG_FALSE | TAG_TRUE | TAG_INT_SMALL | TAG_CHAR | TAG_SYMBOL
-            | TAG_KEYWORD => None,
-            _ => Some(payload_to_ptr(get_payload(self.0))),
+        if is_immediate_tag(get_tag(self.0)) {
+            return None;
         }
+        Some(payload_to_ptr(get_payload(self.0)))
     }
 
     /// `Rc::strong_count` of the heap allocation behind this value, read
@@ -2494,32 +2493,56 @@ unsafe fn free_heap_value(tag: u64, ptr: *const u8, depth: u32) {
         drain_drop_worklist(worklist);
         return;
     }
+    if !take_owned_children(tag, ptr, |child| drop_child_value(child, depth + 1)) {
+        drop_leaf_heap_ref(tag, ptr);
+    }
+}
+
+/// For the three child-bearing immutable collection tags
+/// (`TAG_LIST`/`TAG_VECTOR` → `Vec<Value>`, `TAG_MAP` → `BTreeMap`,
+/// `TAG_HASHMAP` → `hashbrown::HashMap`), reconstruct the container's `Rc`
+/// (strong count 1) and drop it — freeing the container's own allocation
+/// exactly once via `Rc::into_inner` — then feed every owned child `Value` to
+/// `sink` (for maps, key then value, preserving iteration order), and return
+/// `true`. For any other tag, return `false` WITHOUT touching `ptr`, leaving
+/// the caller to free that leaf allocation itself.
+///
+/// This is the single source of truth for which tags own child `Value`s and
+/// how they are extracted; the direct-recursion (`free_heap_value`) and
+/// worklist-spill (`free_heap_payload`) paths differ only in the `sink` they
+/// pass (recurse vs push), so they share this enumeration.
+///
+/// # Safety
+/// `ptr` came from `Rc::into_raw` for the payload type `tag` denotes, and the
+/// strong count is exactly 1 — a `true` return consumes that last reference.
+unsafe fn take_owned_children(tag: u64, ptr: *const u8, mut sink: impl FnMut(Value)) -> bool {
     match tag {
         TAG_LIST | TAG_VECTOR => {
             let items = Rc::into_inner(Rc::from_raw(ptr as *const Vec<Value>))
                 .expect("caller guarantees the last strong reference");
             for value in items {
-                drop_child_value(value, depth + 1);
+                sink(value);
             }
         }
         TAG_MAP => {
             let map = Rc::into_inner(Rc::from_raw(ptr as *const BTreeMap<Value, Value>))
                 .expect("caller guarantees the last strong reference");
             for (k, v) in map {
-                drop_child_value(k, depth + 1);
-                drop_child_value(v, depth + 1);
+                sink(k);
+                sink(v);
             }
         }
         TAG_HASHMAP => {
             let map = Rc::into_inner(Rc::from_raw(ptr as *const hashbrown::HashMap<Value, Value>))
                 .expect("caller guarantees the last strong reference");
             for (k, v) in map {
-                drop_child_value(k, depth + 1);
-                drop_child_value(v, depth + 1);
+                sink(k);
+                sink(v);
             }
         }
-        _ => drop_leaf_heap_ref(tag, ptr),
+        _ => return false,
     }
+    true
 }
 
 /// Drop one child `Value` reached while freeing a collection's contents at
@@ -2529,18 +2552,42 @@ unsafe fn free_heap_value(tag: u64, ptr: *const u8, depth: u32) {
 /// path this replaces.
 #[inline]
 unsafe fn drop_child_value(value: Value, depth: u32) {
+    drop_value_ref(value, |tag, ptr| free_heap_value(tag, ptr, depth));
+}
+
+/// True for the seven immediate (non-heap) tags — values that carry no
+/// refcounted allocation and so need no clone/drop bookkeeping. `TAG_NIL..=
+/// TAG_KEYWORD` are the contiguous range `0..=6` and `TAG_INT_BIG` (the first
+/// heap tag) is `7`, so this single comparison is exactly the set
+/// `{TAG_NIL, TAG_FALSE, TAG_TRUE, TAG_INT_SMALL, TAG_CHAR, TAG_SYMBOL,
+/// TAG_KEYWORD}`.
+#[inline]
+fn is_immediate_tag(tag: u64) -> bool {
+    tag < TAG_INT_BIG
+}
+
+/// Shared refcount-decrement tail for a `Value` being released off a teardown
+/// path (a collection child or a worklist entry): skip immediates, otherwise
+/// decrement the strong count and, on the last reference, run `on_last(tag,
+/// ptr)` — the caller-supplied free (direct-recursive `free_heap_value` for the
+/// child path, worklist-spilling `free_heap_payload` for the drain path).
+/// `mem::forget` keeps `Value`'s own `Drop` from re-entering the recursive path
+/// this replaces.
+///
+/// # Safety
+/// A boxed non-immediate `value` carries a live `Rc::into_raw` pointer (the
+/// `rc_strong_cell` contract); on a strong count of 1 `on_last` receives the
+/// last reference and must consume it.
+#[inline]
+unsafe fn drop_value_ref(value: Value, on_last: impl FnOnce(u64, *const u8)) {
     if is_boxed(value.0) {
         let tag = get_tag(value.0);
-        match tag {
-            TAG_NIL | TAG_FALSE | TAG_TRUE | TAG_INT_SMALL | TAG_CHAR | TAG_SYMBOL
-            | TAG_KEYWORD => {}
-            _ => {
-                let ptr = payload_to_ptr(get_payload(value.0));
-                let strong = rc_strong_cell(ptr);
-                match strong.get() {
-                    1 => free_heap_value(tag, ptr, depth),
-                    n => strong.set(n - 1),
-                }
+        if !is_immediate_tag(tag) {
+            let ptr = payload_to_ptr(get_payload(value.0));
+            let strong = rc_strong_cell(ptr);
+            match strong.get() {
+                1 => on_last(tag, ptr),
+                n => strong.set(n - 1),
             }
         }
     }
@@ -2555,22 +2602,7 @@ unsafe fn drop_child_value(value: Value, depth: u32) {
 /// deep structures.
 unsafe fn drain_drop_worklist(mut worklist: Vec<Value>) {
     while let Some(value) = worklist.pop() {
-        if is_boxed(value.0) {
-            let tag = get_tag(value.0);
-            match tag {
-                TAG_NIL | TAG_FALSE | TAG_TRUE | TAG_INT_SMALL | TAG_CHAR | TAG_SYMBOL
-                | TAG_KEYWORD => {}
-                _ => {
-                    let ptr = payload_to_ptr(get_payload(value.0));
-                    let strong = rc_strong_cell(ptr);
-                    match strong.get() {
-                        1 => free_heap_payload(tag, ptr, &mut worklist),
-                        n => strong.set(n - 1),
-                    }
-                }
-            }
-        }
-        std::mem::forget(value);
+        drop_value_ref(value, |tag, ptr| free_heap_payload(tag, ptr, &mut worklist));
     }
 }
 
@@ -2579,29 +2611,8 @@ unsafe fn drain_drop_worklist(mut worklist: Vec<Value>) {
 /// (so they are freed iteratively by [`drop_last_heap_ref`]) and free only the
 /// container's own allocation here; every other payload is dropped normally.
 unsafe fn free_heap_payload(tag: u64, ptr: *const u8, worklist: &mut Vec<Value>) {
-    match tag {
-        TAG_LIST | TAG_VECTOR => {
-            let items = Rc::into_inner(Rc::from_raw(ptr as *const Vec<Value>))
-                .expect("caller guarantees the last strong reference");
-            worklist.extend(items);
-        }
-        TAG_MAP => {
-            let map = Rc::into_inner(Rc::from_raw(ptr as *const BTreeMap<Value, Value>))
-                .expect("caller guarantees the last strong reference");
-            for (k, v) in map {
-                worklist.push(k);
-                worklist.push(v);
-            }
-        }
-        TAG_HASHMAP => {
-            let map = Rc::into_inner(Rc::from_raw(ptr as *const hashbrown::HashMap<Value, Value>))
-                .expect("caller guarantees the last strong reference");
-            for (k, v) in map {
-                worklist.push(k);
-                worklist.push(v);
-            }
-        }
-        _ => drop_leaf_heap_ref(tag, ptr),
+    if !take_owned_children(tag, ptr, |child| worklist.push(child)) {
+        drop_leaf_heap_ref(tag, ptr);
     }
 }
 
@@ -2649,33 +2660,30 @@ impl Clone for Value {
             return Value(self.0);
         }
         let tag = get_tag(self.0);
-        match tag {
-            // Immediates: trivial copy
-            TAG_NIL | TAG_FALSE | TAG_TRUE | TAG_INT_SMALL | TAG_CHAR | TAG_SYMBOL
-            | TAG_KEYWORD => Value(self.0),
-            // Heap pointers: one uniform strong-count bump — the RcBox header
-            // sits at the same offset for every heap payload (see RC_HEADER),
-            // so no per-tag dispatch is needed.
-            _ => {
-                debug_assert!(
-                    (TAG_INT_BIG..=TAG_MUTABLE_CELL).contains(&tag),
-                    "invalid heap tag in clone: {tag}"
-                );
-                let ptr = payload_to_ptr(get_payload(self.0));
-                // SAFETY: every boxed non-immediate tag carries a live
-                // `Rc::into_raw` pointer (the `rc_strong_cell` contract).
-                unsafe {
-                    let strong = rc_strong_cell(ptr);
-                    let n = strong.get().wrapping_add(1);
-                    if n == 0 {
-                        // Refcount overflow — abort, as `Rc::clone` would.
-                        std::process::abort();
-                    }
-                    strong.set(n);
-                }
-                Value(self.0)
-            }
+        // Immediates: trivial copy
+        if is_immediate_tag(tag) {
+            return Value(self.0);
         }
+        // Heap pointers: one uniform strong-count bump — the RcBox header
+        // sits at the same offset for every heap payload (see RC_HEADER),
+        // so no per-tag dispatch is needed.
+        debug_assert!(
+            (TAG_INT_BIG..=TAG_MUTABLE_CELL).contains(&tag),
+            "invalid heap tag in clone: {tag}"
+        );
+        let ptr = payload_to_ptr(get_payload(self.0));
+        // SAFETY: every boxed non-immediate tag carries a live
+        // `Rc::into_raw` pointer (the `rc_strong_cell` contract).
+        unsafe {
+            let strong = rc_strong_cell(ptr);
+            let n = strong.get().wrapping_add(1);
+            if n == 0 {
+                // Refcount overflow — abort, as `Rc::clone` would.
+                std::process::abort();
+            }
+            strong.set(n);
+        }
+        Value(self.0)
     }
 }
 
@@ -2688,28 +2696,25 @@ impl Drop for Value {
             return; // Float
         }
         let tag = get_tag(self.0);
-        match tag {
-            // Immediates: nothing to free
-            TAG_NIL | TAG_FALSE | TAG_TRUE | TAG_INT_SMALL | TAG_CHAR | TAG_SYMBOL
-            | TAG_KEYWORD => {}
-            // Heap pointers: uniform decrement; the per-tag typed free runs
-            // only when the last reference goes away (cold, out of line).
-            _ => {
-                debug_assert!(
-                    (TAG_INT_BIG..=TAG_MUTABLE_CELL).contains(&tag),
-                    "invalid heap tag in drop: {tag}"
-                );
-                let ptr = payload_to_ptr(get_payload(self.0));
-                // SAFETY: same RcBox-header contract as `Clone`; at count 1
-                // this value owns the final reference, which the typed free
-                // consumes.
-                unsafe {
-                    let strong = rc_strong_cell(ptr);
-                    match strong.get() {
-                        1 => drop_last_heap_ref(tag, ptr),
-                        n => strong.set(n - 1),
-                    }
-                }
+        // Immediates: nothing to free
+        if is_immediate_tag(tag) {
+            return;
+        }
+        // Heap pointers: uniform decrement; the per-tag typed free runs
+        // only when the last reference goes away (cold, out of line).
+        debug_assert!(
+            (TAG_INT_BIG..=TAG_MUTABLE_CELL).contains(&tag),
+            "invalid heap tag in drop: {tag}"
+        );
+        let ptr = payload_to_ptr(get_payload(self.0));
+        // SAFETY: same RcBox-header contract as `Clone`; at count 1
+        // this value owns the final reference, which the typed free
+        // consumes.
+        unsafe {
+            let strong = rc_strong_cell(ptr);
+            match strong.get() {
+                1 => drop_last_heap_ref(tag, ptr),
+                n => strong.set(n - 1),
             }
         }
     }

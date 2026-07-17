@@ -861,3 +861,18 @@ Reproduction protocol, corrected baselines, and per-task measurements:
 Benchmark binary-identity rule: rebuild and verify the baseline worktree binary
 (`git log` + mtime) before measuring — a stale bisect-era binary contaminated
 one investigation.
+
+## PG-E2E-1 — playground debugger e2e subset long-red (pre-existing, not CI-gated)
+
+**Recorded 2026-07-17 (P6-3 step-2 verification).** ~20 playground Playwright
+specs (breakpoint snapping ×4, continue-past-breakpoint, infinite-loop step
+limit, the async-debugger suite, one HTTP-debug exchange, the `?no-worker`
+instant-virtual-clock sleep) fail identically at the migration-close commit
+`e72f8109` and at current HEAD — verified by running the suite at both refs.
+They predate the recent slices; `jake test.playground-e2e` is not in any CI
+workflow, so the red set went unnoticed. The Rust-level wasm debug tests
+(`wasm_async_debug_test.rs`) are green — the gap is in the playground JS debug
+harness/UX layer, not the runtime protocol. Needs its own diagnosis pass;
+candidates: harness drift vs the P3-B2 cooperative-debug rewiring, and the
+absent virtual clock for `?no-worker` sleep. Consider adding the playground
+e2e (or a stable subset) to CI once green.

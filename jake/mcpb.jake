@@ -34,3 +34,9 @@ task publish tag="":
     @else
         ./scripts/pack-mcpb.sh --tag {{tag}} --upload
     @end
+
+@group mcpb
+@desc "Remove locally built .mcpb artifacts (dist/)"
+task clean:
+    rm -rf dist
+    echo "mcpb: removed dist/"

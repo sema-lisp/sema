@@ -286,17 +286,24 @@ impl Engine {
                     .lock()
                     .unwrap_or_else(|poison| poison.into_inner()) = None;
 
-                // Only this root's own stdout belongs to this cell — a
+                // Only this root's own output belongs to this cell — a
                 // detached task left over from an earlier cell that happens
                 // to print while this root drives is captured too (never
                 // leaked to the real stdout), but attributed to its own
-                // root, not this cell.
+                // root, not this cell. Stderr (`println-error` etc.) is
+                // folded into the same text stream as stdout, in the order
+                // events were emitted, since the `.sema-nb` format has a
+                // single text output per cell (`OutputType::Stdout`) rather
+                // than a distinct stderr channel — the sink preserves
+                // per-root FIFO/execution order, so simple interleaving here
+                // reproduces the order the cell actually printed in.
                 let captured: String = self
                     .interpreter
                     .take_output()
                     .into_iter()
                     .filter_map(|event| match event {
                         OutputEvent::Stdout { root, text } if root == handle.id() => Some(text),
+                        OutputEvent::Stderr { root, text } if root == handle.id() => Some(text),
                         _ => None,
                     })
                     .collect();
@@ -863,6 +870,28 @@ mod tests {
             lines,
             vec!["one", "two", "three"],
             "expected the three prints in order, got: {:?}",
+            result.stdout
+        );
+    }
+
+    /// `println-error` output (stderr) must not be dropped — it belongs in
+    /// the cell's captured output alongside stdout, interleaved in the
+    /// order the events were emitted. The `.sema-nb` format has a single
+    /// text stream per cell (`OutputType::Stdout`), so stderr lines are
+    /// folded into that same stream rather than inventing a new output
+    /// variant.
+    #[test]
+    fn stderr_output_is_not_dropped() {
+        let mut engine = test_engine();
+        let (_, result) = engine
+            .create_and_eval(r#"(println "out1") (println-error "err1") (println "out2")"#)
+            .unwrap();
+
+        let lines: Vec<&str> = result.stdout.lines().collect();
+        assert_eq!(
+            lines,
+            vec!["out1", "err1", "out2"],
+            "expected stdout/stderr interleaved in emission order, got: {:?}",
             result.stdout
         );
     }

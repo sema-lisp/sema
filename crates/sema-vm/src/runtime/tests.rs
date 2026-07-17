@@ -4902,3 +4902,389 @@ fn state_root_settles_only_from_its_main_task_and_only_once() {
         Err(RootTransitionError::AlreadySettled)
     );
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SRV-1 liveness spike — the re-arming External wait is deadlock-free.
+//
+// Proves the runtime primitive the concurrent `http/serve` accept loop needs
+// (docs/deferred.md §SRV-1, "the first thing to prove"): a task may park on a
+// `WaitKind::External` that stays idle indefinitely, re-arm onto a fresh
+// External each time one completes (the accept-loop ping-pong), coexist with a
+// second independently-parked task, and be torn down cleanly by shutdown — all
+// without a false Quiescent/deadlock, a busy-spin, a panic, or an orphaned wait
+// left in `active_len`.
+//
+// Uses SYNTHETIC externals: a `HoldExecutor` that accepts a submission and holds
+// it un-run (modelling a real `rx.recv()` that has not yet produced a request),
+// plus `deliver_oldest_held` which runs a held submission on demand (modelling a
+// request arriving). No HTTP/tokio machinery — this proves the RUNTIME
+// primitive, not the HTTP feature.
+
+type HeldSubmissions = Arc<Mutex<Vec<sema_core::runtime::ExecutorSubmission>>>;
+
+struct HoldLease {
+    held: HeldSubmissions,
+}
+impl ExecutorLease for HoldLease {
+    fn submit(
+        &self,
+        submission: sema_core::runtime::ExecutorSubmission,
+    ) -> Result<RunningSubmission, SubmissionRejected> {
+        let operation = submission.operation_id();
+        // Hold the submission un-dispatched: the external stays "in flight" (its
+        // job never runs, no completion is delivered) so the owning task parks
+        // idle, exactly like an accept loop awaiting the next request.
+        self.held.lock().unwrap().push(submission);
+        Ok(RunningSubmission::new(operation))
+    }
+    fn snapshot(&self) -> ExecutorSnapshot {
+        ExecutorSnapshot::default()
+    }
+    fn shutdown(&self, _deadline: Instant) -> ExecutorShutdown {
+        // Drop every held submission: each delivers a Cancelled completion to the
+        // (closing) inbox, discarded by the runtime — clean teardown.
+        self.held.lock().unwrap().clear();
+        ExecutorShutdown::Drained(ExecutorSnapshot::default())
+    }
+}
+
+struct HoldExecutor {
+    held: HeldSubmissions,
+}
+impl IoExecutor for HoldExecutor {
+    fn attach_runtime(
+        &self,
+        _runtime_id: RuntimeId,
+    ) -> Result<Arc<dyn ExecutorLease>, ExecutorAttachError> {
+        Ok(Arc::new(HoldLease {
+            held: Arc::clone(&self.held),
+        }))
+    }
+    fn snapshot(&self) -> ExecutorSnapshot {
+        ExecutorSnapshot::default()
+    }
+}
+
+fn hold_runtime_with_clock(clock: Rc<dyn RuntimeClock>) -> (Runtime, HeldSubmissions) {
+    let held: HeldSubmissions = Arc::new(Mutex::new(Vec::new()));
+    let runtime = Runtime::new(
+        Rc::new(sema_core::EvalContext::new()),
+        clock,
+        Arc::new(HoldExecutor {
+            held: Arc::clone(&held),
+        }),
+    )
+    .expect("hold runtime");
+    (runtime, held)
+}
+
+fn hold_runtime() -> (Runtime, HeldSubmissions) {
+    hold_runtime_with_clock(Rc::new(FakeClock::new()))
+}
+
+/// Run the OLDEST held submission's blocking dispatch, delivering its completion
+/// to the runtime inbox — models one request arriving on the accept channel.
+/// Returns false if nothing is held.
+fn deliver_oldest_held(held: &HeldSubmissions) -> bool {
+    let submission = {
+        let mut guard = held.lock().unwrap();
+        if guard.is_empty() {
+            None
+        } else {
+            Some(guard.remove(0))
+        }
+    };
+    match submission {
+        Some(submission) => {
+            match submission.into_dispatch() {
+                ExecutorDispatch::Blocking(dispatch) => {
+                    dispatch.run();
+                }
+                ExecutorDispatch::Async(_) => panic!("spike externals are blocking"),
+            }
+            true
+        }
+        None => false,
+    }
+}
+
+/// A cancel hook that reaps immediately (models a client-disconnect teardown
+/// that fully releases the parked accept/recv wait) and counts its firings.
+struct SpikeReapHook {
+    cancelled: Arc<Mutex<usize>>,
+}
+impl Trace for SpikeReapHook {
+    fn trace(&self, _sink: &mut dyn FnMut(sema_core::cycle::GcEdge<'_>)) -> bool {
+        true
+    }
+}
+impl sema_core::runtime::CancelHook for SpikeReapHook {
+    fn cancel(
+        &mut self,
+    ) -> Result<sema_core::runtime::CancelDisposition, sema_core::runtime::CancelHookError> {
+        *self.cancelled.lock().unwrap() += 1;
+        Ok(sema_core::runtime::CancelDisposition::Reaped)
+    }
+    fn reap(
+        &mut self,
+    ) -> Result<sema_core::runtime::CancelDisposition, sema_core::runtime::CancelHookError> {
+        Ok(sema_core::runtime::CancelDisposition::Reaped)
+    }
+}
+
+/// Build one interruptible External wait (models a single `rx.recv()`), whose
+/// cancel hook shares `cancelled` so a test can assert teardown fired.
+fn spike_external_wait(
+    events: Arc<Mutex<Vec<&'static str>>>,
+    cancelled: Arc<Mutex<usize>>,
+) -> WaitKind {
+    WaitKind::External(Box::new(PreparedExternalOperation::interruptible_blocking(
+        CompletionKind::try_from_raw(2).unwrap(),
+        Box::new(CountingDecoder(events)),
+        InterruptibleResource::new("spike-accept", Box::new(SpikeReapHook { cancelled })),
+        || Ok(Box::new(7_i32)),
+    )))
+}
+
+/// Accept-loop continuation: on each External completion, re-arm onto a fresh
+/// External (the ping-pong) up to `remaining` more times, then settle. Records
+/// each re-arm so a test can assert every intermediate park was idle.
+struct AcceptLoopSpikeCont {
+    remaining: usize,
+    parks: Arc<Mutex<usize>>,
+    events: Arc<Mutex<Vec<&'static str>>>,
+    cancelled: Arc<Mutex<usize>>,
+}
+impl Trace for AcceptLoopSpikeCont {
+    fn trace(&self, _sink: &mut dyn FnMut(sema_core::cycle::GcEdge<'_>)) -> bool {
+        true
+    }
+}
+impl NativeContinuation for AcceptLoopSpikeCont {
+    fn resume(
+        self: Box<Self>,
+        _context: &mut NativeCallContext<'_>,
+        input: ResumeInput,
+    ) -> NativeResult {
+        match input {
+            ResumeInput::Returned(_) => {
+                if self.remaining == 0 {
+                    Ok(NativeOutcome::Return(Value::int(99)))
+                } else {
+                    *self.parks.lock().unwrap() += 1;
+                    Ok(NativeOutcome::Suspend(NativeSuspend {
+                        wait: spike_external_wait(
+                            Arc::clone(&self.events),
+                            Arc::clone(&self.cancelled),
+                        ),
+                        continuation: Box::new(AcceptLoopSpikeCont {
+                            remaining: self.remaining - 1,
+                            parks: self.parks,
+                            events: self.events,
+                            cancelled: self.cancelled,
+                        }),
+                    }))
+                }
+            }
+            _ => Err(SemaError::eval("spike accept loop resumed unexpectedly")),
+        }
+    }
+}
+
+fn spike_accept_root(remaining: usize) -> (NativeOutcome, Arc<Mutex<usize>>, Arc<Mutex<usize>>) {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let cancelled = Arc::new(Mutex::new(0));
+    let parks = Arc::new(Mutex::new(0));
+    let outcome = NativeOutcome::Suspend(NativeSuspend {
+        wait: spike_external_wait(Arc::clone(&events), Arc::clone(&cancelled)),
+        continuation: Box::new(AcceptLoopSpikeCont {
+            remaining,
+            parks: Arc::clone(&parks),
+            events,
+            cancelled: Arc::clone(&cancelled),
+        }),
+    });
+    (outcome, parks, cancelled)
+}
+
+/// (a) An idle External wait — zero completions arriving — must let the runtime
+/// report `Idle { inbox_wakeup_required: true }` (never Quiescent, never a false
+/// deadlock), make no progress, and never panic across many drive turns.
+#[test]
+fn srv1_spike_idle_external_wait_reports_idle_without_busy_spin() {
+    let (runtime, held) = hold_runtime();
+    let (outcome, _parks, _cancelled) = spike_accept_root(0);
+    let handle = runtime
+        .submit_test_root(TestPreparedTask::native(Ok(outcome)))
+        .expect("root admitted");
+
+    // First drive parks the root on its External.
+    runtime.drive(&drive_budget(8)).unwrap();
+    assert_eq!(runtime.active_wait_count_for_test(), 1);
+    assert!(matches!(handle.poll_result(), RootPoll::Pending));
+    assert_eq!(held.lock().unwrap().len(), 1, "the External is in flight");
+
+    // No completion ever arrives: repeated drives must all report Idle, make no
+    // progress, and leave the parked wait untouched — no busy-spin, no panic.
+    for _ in 0..32 {
+        let state = runtime.drive(&drive_budget(8)).unwrap();
+        assert!(
+            matches!(
+                state,
+                super::DriveState::Idle {
+                    inbox_wakeup_required: true,
+                    ..
+                }
+            ),
+            "an idle External must keep the runtime awaiting its inbox, got {state:?}"
+        );
+        assert!(matches!(handle.poll_result(), RootPoll::Pending));
+        assert_eq!(runtime.active_wait_count_for_test(), 1);
+    }
+}
+
+/// (b) Two tasks each parked on their own External wait must coexist: completing
+/// one settles only its owner and leaves the other parked and idle.
+#[test]
+fn srv1_spike_two_parked_tasks_coexist_and_complete_independently() {
+    let (runtime, held) = hold_runtime();
+    let (outcome_a, _pa, _ca) = spike_accept_root(0);
+    let (outcome_b, _pb, _cb) = spike_accept_root(0);
+    let root_a = runtime
+        .submit_test_root(TestPreparedTask::native(Ok(outcome_a)))
+        .expect("root a admitted");
+    let root_b = runtime
+        .submit_test_root(TestPreparedTask::native(Ok(outcome_b)))
+        .expect("root b admitted");
+
+    // Park both (two root visits per drive; drive twice to be safe).
+    runtime.drive(&drive_budget(8)).unwrap();
+    runtime.drive(&drive_budget(8)).unwrap();
+    assert_eq!(runtime.active_wait_count_for_test(), 2);
+    assert!(matches!(root_a.poll_result(), RootPoll::Pending));
+    assert!(matches!(root_b.poll_result(), RootPoll::Pending));
+
+    // A single request arrives: exactly one owner settles, the other stays parked.
+    assert!(deliver_oldest_held(&held));
+    let mut guard = 0;
+    while !(matches!(root_a.poll_result(), RootPoll::Ready(_))
+        || matches!(root_b.poll_result(), RootPoll::Ready(_)))
+    {
+        runtime.drive(&drive_budget(8)).unwrap();
+        guard += 1;
+        assert!(guard < 64, "the completed root settles");
+    }
+    let a_ready = matches!(root_a.poll_result(), RootPoll::Ready(_));
+    let b_ready = matches!(root_b.poll_result(), RootPoll::Ready(_));
+    assert!(a_ready ^ b_ready, "exactly one root settled, not both");
+    assert_eq!(
+        runtime.active_wait_count_for_test(),
+        1,
+        "the other task is still parked, undisturbed"
+    );
+    let state = runtime.drive(&drive_budget(8)).unwrap();
+    assert!(matches!(
+        state,
+        super::DriveState::Idle {
+            inbox_wakeup_required: true,
+            ..
+        }
+    ));
+}
+
+/// The genuinely-novel bit: a continuation whose `resume` returns another
+/// `Suspend(External)` re-arms indefinitely (the accept-loop ping-pong). Each
+/// iteration parks idle on exactly one External; delivering a request re-arms
+/// onto a fresh one; after the last, the root settles. No deadlock, no leak.
+#[test]
+fn srv1_spike_external_wait_rearms_across_multiple_idle_parks() {
+    let (runtime, held) = hold_runtime();
+    let (outcome, parks, _cancelled) = spike_accept_root(3);
+    let handle = runtime
+        .submit_test_root(TestPreparedTask::native(Ok(outcome)))
+        .expect("root admitted");
+
+    // Park on the first External.
+    runtime.drive(&drive_budget(8)).unwrap();
+
+    let mut guard = 0;
+    while matches!(handle.poll_result(), RootPoll::Pending) {
+        // Parked idle on exactly one External between requests.
+        assert_eq!(runtime.active_wait_count_for_test(), 1);
+        let state = runtime.drive(&drive_budget(8)).unwrap();
+        assert!(
+            matches!(
+                state,
+                super::DriveState::Idle {
+                    inbox_wakeup_required: true,
+                    ..
+                }
+            ),
+            "each intermediate park must be idle, got {state:?}"
+        );
+        // A request arrives → deliver → the continuation re-arms (or settles).
+        assert!(
+            deliver_oldest_held(&held),
+            "an External must be in flight to complete"
+        );
+        // Drain the completion + run the continuation's re-arm/settle.
+        for _ in 0..6 {
+            runtime.drive(&drive_budget(8)).unwrap();
+        }
+        guard += 1;
+        assert!(guard < 16, "re-arm loop must terminate");
+    }
+
+    assert!(matches!(handle.poll_result(), RootPoll::Ready(_)));
+    assert_eq!(
+        *parks.lock().unwrap(),
+        3,
+        "the continuation re-armed exactly 3 times before settling"
+    );
+    assert_eq!(
+        runtime.active_wait_count_for_test(),
+        0,
+        "no wait is left after the accept loop settles"
+    );
+}
+
+/// (c) Shutdown while two tasks are parked on External waits must tear down
+/// cleanly: cancel hooks fire, no wait is orphaned in `active_len`, and the
+/// report is clean — no panic, no hang.
+#[test]
+fn srv1_spike_shutdown_tears_down_parked_waits_cleanly() {
+    let clock = Rc::new(FakeClock::new());
+    let (runtime, _held) = hold_runtime_with_clock(clock.clone());
+    let (outcome_a, _pa, cancelled_a) = spike_accept_root(0);
+    let (outcome_b, _pb, cancelled_b) = spike_accept_root(0);
+    let root_a = runtime
+        .submit_test_root(TestPreparedTask::native(Ok(outcome_a)))
+        .expect("root a admitted");
+    let root_b = runtime
+        .submit_test_root(TestPreparedTask::native(Ok(outcome_b)))
+        .expect("root b admitted");
+
+    // Park both.
+    runtime.drive(&drive_budget(8)).unwrap();
+    runtime.drive(&drive_budget(8)).unwrap();
+    assert_eq!(runtime.active_wait_count_for_test(), 2);
+
+    // Shut down while both are parked.
+    let report = runtime
+        .shutdown(&super::ShutdownOptions {
+            deadline: clock.now() + Duration::from_secs(1),
+            drive_budget: drive_budget(16),
+        })
+        .expect("bounded shutdown");
+
+    assert!(report.clean, "shutdown must be clean: {report:?}");
+    assert_eq!(report.active_waits, 0, "no External wait left orphaned");
+    assert_eq!(report.live_tasks, 0, "no task left live");
+    assert_eq!(
+        *cancelled_a.lock().unwrap() + *cancelled_b.lock().unwrap(),
+        2,
+        "each parked wait's cancel hook fired exactly once"
+    );
+    assert!(matches!(root_a.poll_result(), RootPoll::Ready(_)));
+    assert!(matches!(root_b.poll_result(), RootPoll::Ready(_)));
+}

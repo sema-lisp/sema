@@ -20,7 +20,7 @@ legacy_pattern='IoHandle|IoPoll|YieldReason|SchedulerTarget|SchedulerRunResult|s
 # `execute_debug` (the VM-level debug test driver), `in_runtime_quantum`.
 #
 # Also deliberately NOT here (P6-3 step 5 — see
-# `docs/plans/2026-07-16-wasm-promise-driven-roots.md` §3 and the P6-3 entry
+# `docs/plans/archive/2026-07-16-wasm-promise-driven-roots.md` §3 and the P6-3 entry
 # in `docs/deferred.md`): `HTTP_AWAIT_MARKER`/`is_http_await_marker`/
 # `parse_http_marker`/`HTTP_CACHE`/`clear_http_cache`/`perform_fetch_from_marker`
 # stay live — narrowed to the wasm DEBUGGER's own `http_needed`/

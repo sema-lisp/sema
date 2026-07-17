@@ -15,7 +15,7 @@
 //   main -> { type:'cancel', id }   Stop: cancels root `id`'s in-flight eval
 //
 // The control `SharedArrayBuffer`/`installAtomicsSleep`/`Atomics.wait` replay
-// path is gone (P6-3 step 5 — `docs/plans/2026-07-16-wasm-promise-driven-roots.md`):
+// path is gone (P6-3 step 5 — `docs/plans/archive/2026-07-16-wasm-promise-driven-roots.md`):
 // this worker never allocates a SAB and cancellation routes exclusively
 // through `cancelRoot`.
 import init, { SemaInterpreter } from '../pkg/sema_wasm.js';

@@ -1,5 +1,5 @@
 //! Macrotask-driven Promise seam for the unified runtime (P6-3 step 2 —
-//! `docs/plans/2026-07-16-wasm-promise-driven-roots.md`).
+//! `docs/plans/archive/2026-07-16-wasm-promise-driven-roots.md`).
 //!
 //! This is a SECOND, additive way to evaluate Sema in the wasm build, exposed
 //! as `WasmInterpreter::evalPromise`. It shares the same `sema_eval::Interpreter`

@@ -796,7 +796,7 @@ acceptance gate — transcript at
 Deleted: the three HTTP-replay loops in `evalAsync`/`evalVMAsync`/`runEntryAsync`
 (now thin Promise-returning wrappers over `evalPromise`, preserving their JSON
 shape and JS-visible signatures — see
-`docs/plans/2026-07-16-wasm-promise-driven-roots.md` §2.1); `MAX_REPLAYS`; and
+`docs/plans/archive/2026-07-16-wasm-promise-driven-roots.md` §2.1); `MAX_REPLAYS`; and
 the JS worker's dormant `legacySab`/control-`SharedArrayBuffer` fallback branch
 (`playground/src/sema-worker.js`) entirely.
 
@@ -873,7 +873,7 @@ the replay+Atomics machinery and routing cancel through `RuntimeCommandHandle::c
    be proven correct in a browser (http side effect fires exactly once; sleep via setTimeout
    keeps the page responsive; fair concurrent roots; exact-root Stop). Shipping an unverified
    rewrite of a working mechanism is prohibited. The design and a `test.fixme` Playwright gate
-   are captured in `docs/plans/2026-07-16-wasm-promise-driven-roots.md` and
+   are captured in `docs/plans/archive/2026-07-16-wasm-promise-driven-roots.md` and
    `playground/tests/unified-runtime.spec.ts` for a future landing by someone with a browser.
 
 Pre-landing hard-audit items (flagged in the design doc): the External-HTTP resume binding a

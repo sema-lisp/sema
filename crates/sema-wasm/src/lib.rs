@@ -8,7 +8,7 @@ use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::JsFuture;
 
-// P6-3 step 2 (`docs/plans/2026-07-16-wasm-promise-driven-roots.md`): the
+// P6-3 step 2 (`docs/plans/archive/2026-07-16-wasm-promise-driven-roots.md`): the
 // macrotask-driven Promise seam (`evalPromise`) and its root-tagged output
 // pump. Additive — nothing below this point in the file changes except the
 // http registration (dual-ABI'd so its runtime-suspend variant is reachable
@@ -1760,7 +1760,7 @@ fn register_wasm_io(env: &Env) {
 
 /// Bridges one [`WasmInterpreter::eval_promise`] call back into the OLD
 /// `{"value":...,"output":[...],"error":...}` JSON shape (P6-3 step 5,
-/// `docs/plans/2026-07-16-wasm-promise-driven-roots.md` §2.1) — shared by
+/// `docs/plans/archive/2026-07-16-wasm-promise-driven-roots.md` §2.1) — shared by
 /// `evalAsync`/`evalVMAsync`/`runEntryAsync`'s wrapper methods.
 ///
 /// Installs a private `Closure`-backed `setPromiseOutputSink` for the
@@ -2022,7 +2022,7 @@ impl WasmInterpreter {
 
     /// Shared body for the OLD `evalAsync`/`evalVMAsync`/`runEntryAsync`
     /// entry points (P6-3 step 5,
-    /// `docs/plans/2026-07-16-wasm-promise-driven-roots.md` §2.1): submits
+    /// `docs/plans/archive/2026-07-16-wasm-promise-driven-roots.md` §2.1): submits
     /// `src` as ONE root via [`Self::eval_promise`] and awaits it, so
     /// `http/get`/`async/sleep` inside it get the real, single-execution
     /// runtime-ABI suspend (no HTTP replay, no `Atomics.wait`) — but rebuilds

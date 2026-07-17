@@ -1,5 +1,10 @@
 # Slice 0c: Scheduler Squeeze — profile-directed micro-optimization pass
 
+**Status: EXECUTED** — Tasks 0c-1 through 0c-6 complete, plus 0c-7
+(direct task-to-task rendezvous handoff, added after close-out) also landed.
+See `docs/plans/evidence/unified-cooperative-runtime/benchmark-vs-baseline.md`
+close-out section for final numbers.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development or superpowers:executing-plans. Continuation of the 0b pass (see `2026-07-16-runtime-fast-path-recovery.md`); same Global Constraints, measurement protocol, and inventory/lint discipline apply verbatim.
 
 **Goal:** Close the PERF-RESIDUAL-1 rows using symbolized-profile evidence (`scratchpad/prof/*-0c.sample.txt`, release-with-debug build). Squeeze order = measured leverage.

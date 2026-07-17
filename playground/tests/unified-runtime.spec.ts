@@ -1,7 +1,7 @@
 // P6-3: WASM Promise-driven roots — acceptance gate.
 //
 // These tests pin the real-browser oracle for the unified async runtime landing
-// described in docs/plans/2026-07-16-wasm-promise-driven-roots.md §5. They run
+// described in docs/plans/archive/2026-07-16-wasm-promise-driven-roots.md §5. They run
 // against the real `wasm-pack`-built bundle (`jake pg.build`) in headless
 // Chromium — the only valid oracle per the design doc.
 //
@@ -28,7 +28,7 @@
 //
 // (e), P6-3 step 5 update: the three replay loops and the JS-side
 // SAB/`legacySab` fallback are DELETED (see
-// `docs/plans/2026-07-16-wasm-promise-driven-roots.md` §3), so this now
+// `docs/plans/archive/2026-07-16-wasm-promise-driven-roots.md` §3), so this now
 // scans the full sources (`crates/**`, `playground/src/**`) for `MAX_REPLAYS`
 // and the SAB/`legacySab` machinery, not just `driver.rs`/the shipped
 // bundle's default branch as step 4 scoped it.
@@ -275,7 +275,7 @@ test('cancelRoot cancels the exact RootId via RuntimeCommandHandle::cancel_root,
 });
 
 // ── Gate (e), un-scoped (P6-3 step 5 —
-// `docs/plans/2026-07-16-wasm-promise-driven-roots.md`): the replay loops and
+// `docs/plans/archive/2026-07-16-wasm-promise-driven-roots.md`): the replay loops and
 // the JS-side SAB/`legacySab` fallback are now actually deleted, so this
 // scans the FULL sources, not just `driver.rs`/the shipped bundle's default
 // branch as step 4 scoped it. It is NOT a claim that `HTTP_AWAIT_MARKER`/

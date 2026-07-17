@@ -3511,7 +3511,7 @@ impl Runtime {
     /// iterations and a fresh `VM::new_for_task_with_native_fns` PER ELEMENT —
     /// ~28k instructions/element of pure scheduler overhead, the dominant cost
     /// of `filter`/`map`/`foldl`/`for-each` under the unified runtime; see
-    /// `docs/plans/2026-07-16-runtime-fast-path-recovery.md` Task C).
+    /// `docs/plans/archive/2026-07-16-runtime-fast-path-recovery.md` Task C).
     ///
     /// `call` is the FIRST element's `NativeCall` (already known to target a VM
     /// closure — `invoke_callable` extracted it before delegating here). The

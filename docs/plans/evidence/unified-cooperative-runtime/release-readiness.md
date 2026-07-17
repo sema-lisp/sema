@@ -93,18 +93,35 @@ release blocker.
   deadlock-freedom) was NOT landed. The shipped **fail-fast guard** (the plan's
   blessed fallback) is retained; four wall-clock-bounded `#[ignore]`d acceptance
   tests capture the gate for a future TDD landing (commit 46f7f542).
-- **wasm Promise-driven roots** — attempt in progress under an ironclad
-  real-browser-verification-or-fallback rule (the replay/Atomics mechanism ships
-  and works; it will not be replaced unverified).
+- **wasm Promise-driven roots — LANDED 2026-07-17** (commits `7e93f603..b7882702`).
+  `evalPromise` is the live default seam: the HTTP-replay loops
+  (`evalAsync`/`evalVMAsync`/`runEntryAsync` re-running the whole program up to
+  `MAX_REPLAYS=50`) and the worker's `SharedArrayBuffer`/`Atomics.wait` sleep
+  fallback are deleted; the three async entry points are thin Promise-returning
+  wrappers submitted as ONE root, never replayed, with real single-execution
+  `http/get`/`async/sleep`; concurrent evaluations are individually
+  cancellable via `RuntimeCommandHandle::cancel_root`. Verified against a real
+  browser (transcript at
+  `docs/plans/evidence/unified-cooperative-runtime/p63-browser-gate-transcript.txt`);
+  full record at `.superpowers/sdd/p63-step5-report.md`. Two narrowly-scoped
+  survivors kept per the "if something still reads it, STOP and report" rule:
+  the wasm debugger's own HTTP marker flow, and interruptible-sleep busy-poll
+  for the still-synchronous entry points (`eval`/`evalGlobal`/`evalVM`); see
+  `docs/deferred.md`'s P6-3 entry.
 - **Inventory ledger judgment calls** — the new `runtime/` module split
   (F23-F31), `runtime_offload.rs -> F09B`, and the crate-local
   `runtime_eval_tests -> F31` are coarse-but-faithful classifications flagged
   for future refinement; coverage is exact and clusters are pure.
-- **P6(1) common host API consolidation** — the private host drive
-  (`drive_vm_on_runtime`, `submit_root`, `ShutdownOptions/Report`) is complete
-  and all hosts use it; the ergonomic public surface + routing Ctrl-C through
-  `cancel_root` (retiring the `check_interrupt` TLS, 1 remaining call site) is a
-  clean follow-up, not a correctness gate.
+- **P6(1) common host API consolidation — LANDED 2026-07-17** (commits
+  `0b54e961..519fdc50`). The public, ergonomic surface —
+  `Interpreter::{submit_str, submit_value, drive_until_settled, drive_turn,
+  take_output, command_handle, shutdown}`, `RootOptions`, root-tagged
+  `OutputEvent`, and `RuntimeCommandHandle` as the sole `Send + Sync` control
+  surface — wraps the private host drive (`drive_vm_on_runtime`,
+  `submit_root`, `ShutdownOptions/Report`). Proving consumers: CLI Ctrl-C
+  (graceful cancel, double-press hard-exit) and the notebook engine (per-cell
+  output capture + cross-thread cell cancellation). See
+  `docs/plans/archive/2026-07-16-p6-1-host-api.md`.
 - **Step-G callback re-entry (nested `eval` of an async form)** — one migration
   `#[ignore]` remains: `vm_eval_is_vm_native_runs_async`
   (`crates/sema/tests/vm_integration_test.rs:1775`); needs the parent-VM
@@ -123,7 +140,8 @@ release blocker.
 
 The core migration is **release-ready**: fully green CI-equivalent suite, a
 passing package-boundary shipping gate, no adversarially-found runtime defects,
-and no performance regression. The outstanding items are either blessed
-fallbacks (SRV-1), a working-mechanism replacement under strict verification
-(wasm Promise), or non-blocking ergonomic follow-ups (host API). None block
-shipping the unified runtime.
+and no performance regression. The wasm Promise-driven-roots replacement and
+the public host API have both since landed under strict real-browser/proving-
+consumer verification. The remaining outstanding item is the blessed fallback
+for SRV-1 (concurrent `http/serve`); it does not block shipping the unified
+runtime.

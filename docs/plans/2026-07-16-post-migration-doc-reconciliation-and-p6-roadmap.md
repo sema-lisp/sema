@@ -190,10 +190,10 @@ git commit -m "docs(runtime): YieldReason::Sleep is live (async/sleep value ABI)
 
 **Files:**
 - Move: `docs/plans/2026-07-13-unified-cooperative-runtime.md` and `docs/plans/2026-07-13-unified-cooperative-runtime-task-{01..06,08..11}.md` → `docs/plans/archive/`
-- Modify: `docs/plans/2026-07-15-remaining-work-plan.md` (status header), `docs/plans/2026-07-13-unified-cooperative-runtime-task-07.md` (status header; stays in place — P6 is its live remainder)
+- Modify: `docs/plans/2026-07-15-remaining-work-plan.md` (status header), `docs/plans/2026-07-13-unified-cooperative-runtime-task-07.md` (status header; originally stayed in place as the live P6 remainder — since archived 2026-07-17 now that P6-1 and P6-3 have both landed, see `docs/plans/archive/2026-07-13-unified-cooperative-runtime-task-07.md`)
 
 **Interfaces:**
-- Produces: `docs/plans/` contains only live plans: `2026-07-15-remaining-work-plan.md` (annotated), `task-07` (annotated), `2026-07-16-wasm-promise-driven-roots.md`, and this file.
+- Produces: `docs/plans/` contains only live plans: `2026-07-15-remaining-work-plan.md` (annotated), and this file. `task-07`, `2026-07-16-wasm-promise-driven-roots.md`, `2026-07-16-p6-1-host-api.md`, `2026-07-16-runtime-fast-path-recovery.md`, and `2026-07-17-runtime-fast-path-0c.md` are now all EXECUTED/LANDED and archived (`docs/plans/archive/`).
 
 - [ ] **Step 1: Find inbound references before moving** (evidence docs and deferred.md link to these files):
 
@@ -250,29 +250,33 @@ Run `jake sweep days=3` from the workspace root if the preview shows meaningful 
 
 These are **not** specified here; each has an authoritative design already. Sequencing and entry gates only.
 
-### Slice A — P6-1 common host API (NEXT; unblocking prerequisite)
-- **Design:** `docs/plans/2026-07-15-remaining-work-plan.md` §7.1 + `docs/deferred.md` §P6-3/P6-1 blocker 1.
-- **Scope:** public `Interpreter::submit_str/submit_value/drive/cancel_root/command_handle/shutdown`, `RootOptions`, root-tagged `OutputEvent`, `RuntimeCommandHandle` as the only `Send` surface. Most machinery exists privately (`drive_vm_on_runtime`, `Runtime::submit_root`, `ShutdownOptions/Report`).
-- **Note:** `check_interrupt` TLS retirement belongs to P6-3 (wasm SAB-cancel is its only consumer), not this slice.
-- **Effort:** 1–2 sessions. No browser needed.
+### Slice A — P6-1 common host API — DONE
+- **Design:** `docs/plans/archive/2026-07-16-p6-1-host-api.md` (all 6 tasks landed) + `docs/deferred.md` §P6-3/P6-1 blocker 1.
+- **Scope:** public `Interpreter::submit_str/submit_value/drive/cancel_root/command_handle/shutdown`, `RootOptions`, root-tagged `OutputEvent`, `RuntimeCommandHandle` as the only `Send` surface. Landed on top of the existing private machinery (`drive_vm_on_runtime`, `Runtime::submit_root`, `ShutdownOptions/Report`); CLI Ctrl-C and the notebook engine are the proving consumers.
+- **Note:** `check_interrupt` TLS retirement belonged to P6-3 (wasm SAB-cancel was its only consumer) — also done (the SAB path is deleted).
 
-### Slice B — P6-3 wasm Promise-driven roots (after Slice A; needs a real browser)
-- **Design:** `docs/plans/2026-07-16-wasm-promise-driven-roots.md` (includes the pre-landing hard-audit list: Trace impl for decoded External values / GC invariant I2, macrotask fairness, cancel latency, SAB-drop worker protocol, background-tab throttling).
-- **Oracle:** un-fixme `playground/tests/unified-runtime.spec.ts` (Playwright, real browser). **Hard rule:** the shipped replay+Atomics mechanism is not replaced unverified; shipping gate `scripts/test-packaged-sema-web.sh` + wasm asset regen per AGENTS.md.
+### Slice B — P6-3 wasm Promise-driven roots — DONE
+- **Design:** `docs/plans/archive/2026-07-16-wasm-promise-driven-roots.md` (design record + acceptance gate, both kept verbatim). Landed 2026-07-17: `evalPromise` is the live default seam, the replay/Atomics machinery is deleted, playground programs execute once, concurrent evaluations are individually cancellable via `cancel_root`. Two narrowly-scoped survivors documented in `docs/deferred.md`'s P6-3 entry (debugger HTTP marker flow; synchronous-entry-point sleep busy-poll).
+- **Oracle:** `playground/tests/unified-runtime.spec.ts` real-browser acceptance gate is green (transcript committed at `docs/plans/evidence/unified-cooperative-runtime/p63-browser-gate-transcript.txt`); `scripts/test-packaged-sema-web.sh` + wasm asset regen pass per AGENTS.md.
 
-### Slice C — SRV-1 concurrent `http/serve` (independent; can run parallel to A/B)
+### Benchmark vs pinned baseline `3f111e83` — DONE
+- Outcome: primes/spawn-storm now beat the pre-unification baseline (0.7×); the remaining PERF-RESIDUAL-1 rows were closed by Slices 0b/0c (channel rendezvous 7.4×→~1.4×, O(1) cancel-waiting/ready-remaining, depth-bounded value drop). See `docs/plans/evidence/unified-cooperative-runtime/benchmark-vs-baseline.md` close-out section.
+
+### Windows CI leg — committed, advisory
+- `ci.yml`'s `test-windows` job (`continue-on-error: true`) runs `cargo nextest run --workspace` on `windows-latest`. Advisory until first green, per its own header comment; not yet promoted to required.
+
+### Slice C — SRV-1 concurrent `http/serve` (independent; remains open)
 - **Design:** remaining-work plan §7.4; handler-task-per-connection, ~500–700 lines.
 - **Oracle:** the four `#[ignore]`d wall-clock acceptance tests in `crates/sema/tests/http_serve_concurrent_test.rs` (137/186/231/265) — strict TDD: un-ignore, watch fail, implement.
 - **Risk to prove out first:** accept-loop deadlock-freedom while idle-External-parked.
 
-### Slice D — Step-G callback re-entry (nested `eval` + multimethod dispatch)
+### Slice D — Step-G callback re-entry (nested `eval` + multimethod dispatch) — remains open
 - **Design:** `docs/deferred.md` §Unified runtime migration (both sub-entries). One machinery serves both: dispatch/nested-eval returns `NativeOutcome::Call` instead of synchronous `call_callback` re-entry.
 - **Oracle:** un-ignore `vm_integration_test.rs:1775`; add a multimethod-suspending-method test.
 
-### Slice E — optional, before merging to main
-- **Confirming benchmark vs pinned baseline `3f111e83`** (the P8 report's own recommended follow-up; needs a separate baseline build + disk headroom — run `jake sweep` first).
-- **Stale-comment sweep:** ~40 comment lines still name `in_async_context()`/`IoHandle`; clean opportunistically in files touched by Slices A–D (per the AGENTS.md comment rule), not as a standalone churn commit.
+### Remaining, before merging to main
+- **Stale-comment sweep:** ~40 comment lines still name `in_async_context()`/`IoHandle`; clean opportunistically in files touched by Slices C–D (per the AGENTS.md comment rule), not as a standalone churn commit.
 - **ASYNC-2** stays deferred by design — do not schedule.
 
 ### Merge recommendation
-After Phase 0 + Slice E's benchmark: **merge the runtime to main**. Slices A–D are additive follow-ups with working fallbacks and committed TDD gates; holding a 190+-commit branch open for them adds rebase risk with no safety benefit.
+After Phase 0 + the benchmark: **merge the runtime to main**. Slices A and B are done; C (SRV-1) and D (Step-G) are additive follow-ups with working fallbacks and committed TDD gates; holding a 190+-commit branch open for them adds rebase risk with no safety benefit.

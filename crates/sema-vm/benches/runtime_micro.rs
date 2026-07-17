@@ -1,5 +1,5 @@
 //! Divan micro-benchmarks for the unified cooperative runtime's hot scheduler
-//! primitives (Task 0c-3, `docs/plans/2026-07-17-runtime-fast-path-0c.md`).
+//! primitives (Task 0c-3, `docs/plans/archive/2026-07-17-runtime-fast-path-0c.md`).
 //!
 //! Every Sema source form is read + compiled ONCE per benchmark, outside the
 //! timed closure (`compile_once`/`spawn_and_park`), matching the "no source

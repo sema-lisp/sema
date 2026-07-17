@@ -17,7 +17,7 @@ committed at
 `docs/plans/evidence/unified-cooperative-runtime/p63-browser-gate-transcript.txt`.
 
 This is the WASM slice of Task 07
-(`docs/plans/2026-07-13-unified-cooperative-runtime-task-07.md`, Task 5) and the
+(`docs/plans/archive/2026-07-13-unified-cooperative-runtime-task-07.md`, Task 5) and the
 inventory rows **H10B** (WASM evaluation replay) and **H10C** (WASM synchronous
 worker waits) in `docs/internals/async-runtime-inventory.md`.
 

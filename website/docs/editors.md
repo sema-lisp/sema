@@ -4,7 +4,7 @@ outline: [2, 2]
 
 # Editor Support
 
-Sema has editor plugins for **VS Code, Zed, IntelliJ IDEA, Neovim, Vim, Emacs, Helix, and Sublime Text**. Each plugin lives in its own repository under the [`sema-lisp`](https://github.com/sema-lisp) GitHub org and is published to that editor's registry.
+Sema has editor plugins for **VS Code, Zed, IntelliJ IDEA, Neovim, Vim, Emacs, Helix, and Sublime Text**, plus a plugin for the **OpenCode** AI coding agent. Each lives in its own repository under the [`sema-lisp`](https://github.com/sema-lisp) GitHub org and is published to that editor's registry.
 
 Every plugin provides syntax highlighting for the full standard library, special forms, keyword and character literals, strings, numbers, comments, and LLM primitives. Most also wire up Sema's built-in developer tooling, which ships inside the `sema` binary:
 
@@ -22,6 +22,7 @@ Every plugin provides syntax highlighting for the full standard library, special
 | Emacs | [`emacs-sema`](https://github.com/sema-lisp/emacs-sema) | ✓ | — | — | font-lock |
 | Helix | [`helix-sema`](https://github.com/sema-lisp/helix-sema) | ✓ | ✓ | — | tree-sitter |
 | Sublime Text | [`sublime-sema`](https://github.com/sema-lisp/sublime-sema) | ✓† | — | — | native syntax |
+| OpenCode | [`opencode-sema`](https://github.com/sema-lisp/opencode-sema) | ✓ | — | ✓ | LSP semantic tokens |
 
 <small>\* Neovim DAP requires [`nvim-dap`](https://github.com/mfussenegger/nvim-dap). † Sublime LSP requires the [LSP](https://packagecontrol.io/packages/LSP) package.</small>
 
@@ -255,3 +256,73 @@ Via [Package Control](https://packagecontrol.io/installation): open the command 
 - Symbol navigation (<kbd>Cmd</kbd>+<kbd>R</kbd>) for `define`, `defun`, `defmacro`, `defagent`, `deftool`, …
 - Build systems for **running** (`sema`), **formatting** (`sema fmt`), and **compiling** (`sema compile`)
 - **Language server** (`sema lsp`) via the [LSP](https://packagecontrol.io/packages/LSP) package — completions, hover, go-to-definition, references, rename, signature help, and diagnostics
+
+## OpenCode
+
+[OpenCode](https://opencode.ai) is a terminal AI coding agent. The [`opencode-sema`](https://github.com/sema-lisp/opencode-sema) plugin wires Sema's language server, MCP tools, formatter, and theme into it in one line — so the agent can navigate, evaluate, and build `.sema` code, and writes idiomatic Sema out of the box.
+
+### Install
+
+Add the plugin to your `opencode.json`; OpenCode auto-installs it from npm on next startup:
+
+```jsonc
+// opencode.json — either location works:
+//   ./opencode.json                    (project)
+//   ~/.config/opencode/opencode.json   (global)
+{
+  "$schema": "https://opencode.ai/config.json",
+  "plugin": ["@sema-lang/opencode-sema"]
+}
+```
+
+To pin or vendor it explicitly, add it as a dev dependency (`npm i -D @sema-lang/opencode-sema`). The plugin shells out to the `sema` binary, so it must be on your `PATH` (or point the plugin at one with the `path` option / `SEMA_PATH`).
+
+### Features
+
+- **Language server** (`sema lsp`) — completions, hover docs, go-to-definition, references, rename, semantic tokens, and formatting for `.sema` files
+- **MCP server** (`sema mcp`) — exposes Sema's eval, build, compile, docs, and notebook tools to the agent
+- **Auto-formatting** — every `.sema` file the agent writes or edits is run through `sema fmt` (opt out with the `formatter: false` option or `SEMA_DISABLE_FORMATTER=1`)
+- **Agent guidance** — injects the [Sema for LLM agents](/docs/for-agents) cheat sheet into every session so the agent uses slash-namespaced builtins, LLM primitives, and the semantics that bite (opt out with `instructions: false` or `SEMA_DISABLE_INSTRUCTIONS=1`)
+- **Theme** — an optional dark, gold-accented Sema theme (skip the copy with `OPENCODE_NO_THEME_COPY=1`)
+
+### Configure
+
+Pass options with the tuple form of the `plugin` array; environment variables take precedence for per-machine or CI overrides:
+
+```jsonc
+// opencode.json — either location works:
+//   ./opencode.json                    (project)
+//   ~/.config/opencode/opencode.json   (global)
+{
+  "$schema": "https://opencode.ai/config.json",
+  "plugin": [
+    [
+      "@sema-lang/opencode-sema",
+      {
+        // Path to the `sema` binary. `~` is expanded; a bare
+        // name is resolved on `PATH`. Overridden by SEMA_PATH.
+        // Default: "sema"
+        "path": "~/bin/sema",
+
+        // Register `sema fmt` as the `.sema` formatter.
+        // Set false to opt out. Default: true
+        "formatter": true,
+
+        // Inject the "Sema for LLM agents" cheat sheet into
+        // every session. Set false to opt out. Default: true
+        "instructions": true
+      }
+    ]
+  ]
+}
+```
+
+| Option | Env override | Effect |
+| --- | --- | --- |
+| `path` | `SEMA_PATH` | Path to the `sema` binary (`~` expanded; bare name resolved on `PATH`) |
+| `formatter` | `SEMA_DISABLE_FORMATTER=1` | Register `sema fmt` as the `.sema` formatter (default on) |
+| `instructions` | `SEMA_DISABLE_INSTRUCTIONS=1` | Inject the Sema agent cheat sheet (default on) |
+
+::: tip MCP-only setup
+If you only want Sema's tools in OpenCode without the plugin, register `sema mcp` by hand in `opencode.json` — see [MCP → OpenCode](/docs/mcp#opencode).
+:::

@@ -128,7 +128,10 @@ Add to Zed's `settings.json` (also reachable via Settings → AI → MCP Servers
 
 Add to the project's `opencode.json`:
 
-```json
+```jsonc
+// opencode.json — either location works:
+//   ./opencode.json                    (project)
+//   ~/.config/opencode/opencode.json   (global)
 {
   "$schema": "https://opencode.ai/config.json",
   "mcp": {
@@ -140,6 +143,8 @@ Add to the project's `opencode.json`:
   }
 }
 ```
+
+For a one-line setup that also wires in the language server, formatter, and theme, use the [`opencode-sema` plugin](/docs/editors#opencode) instead.
 
 ### Pi
 

@@ -37,6 +37,16 @@ task compare runs="10" warmup="3": [release]
 task brc rows="1m": [release]
     time ./target/release/sema examples/benchmarks/1brc.sema -- bench-{{rows}}.txt
 
+# divan micro-benchmarks for the unified cooperative runtime's scheduler
+# primitives (channel rendezvous, spawn/settle, timer arm+fire, HOF callback
+# dispatch, idle drive turns, cancel_waiting sweeps). Separate from the
+# hyperfine end-to-end suite above: `harness = false` on the `[[bench]]`
+# target means `cargo bench` drives it directly (divan prints its own table).
+@group bench
+@desc "Run the divan scheduler micro-benchmark suite (sema-vm/benches/runtime_micro.rs)"
+task micro:
+    cargo bench -p sema-vm --bench runtime_micro
+
 # ── Profiling (samply) ───────────────────────────────────────────────
 
 # Record a CPU profile of one benchmark: `jake bench.profile bench=tak`

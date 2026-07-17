@@ -127,3 +127,46 @@ rendezvous handoff, timer/park lifecycle, cons-1m allocator diagnosis) are
 initially parked, then (same day) redirected into an immediate deeper pass:
 Slice 0c — symbolized profiling, divan/criterion scheduler micro-benchmarks,
 targeted squeezes. Tracked as PERF-RESIDUAL-1 in docs/deferred.md.
+
+## Micro-benchmark reference (0c-3)
+
+Date: 2026-07-17. Branch: `codex/unified-async-runtime`. New divan suite,
+`crates/sema-vm/benches/runtime_micro.rs`, isolating the scheduler's hot
+primitives at native-op granularity (µs–ns, vs. the hyperfine suite's
+whole-program ms). Every Sema source form is read + compiled once, outside
+the timed closure; each iteration drives a fresh `VM` (or, for the shutdown
+sweep, a fresh `Interpreter`) through the real `Runtime` — `sema-vm`'s public
+API only, nothing under `crates/sema-vm/src/` was touched to build it.
+Reproduce with:
+
+```
+cargo bench -p sema-vm --bench runtime_micro
+# or: jake bench.micro
+```
+
+| benchmark | fastest | slowest | median | mean | samples | iters |
+|---|---|---|---|---|---|---|
+| idle_drive_turn | 81.73 ns | 89.54 ns | 83.68 ns | 83.91 ns | 100 | 6400 |
+| spawn_settle | 744.5 ns | 853.9 ns | 780.9 ns | 785.9 ns | 100 | 800 |
+| timer_arm_and_fire | 1.624 µs | 6.124 µs | 1.687 µs | 1.74 µs | 100 | 100 |
+| channel_rendezvous | 4.999 µs | 12.2 µs | 5.208 µs | 5.353 µs | 100 | 100 |
+| hof_map_100 (100 elements) | 9.958 µs | 68.24 µs | 10.12 µs | 10.85 µs | 100 | 100 |
+| cancel_waiting_sweep(n=0) | 209.4 µs | 978.2 µs | 213.2 µs | 234.8 µs | 100 | 100 |
+| cancel_waiting_sweep(n=64) | 332.1 µs | 62.29 ms | 340.7 µs | 1.383 ms | 100 | 100 |
+
+Notes:
+- `hof_map_100` ≈ 100 ns/element for the cooperative `NativeOutcome::Call`
+  dispatch path (`map` over a 100-element list, trivial `(fn (x) (+ x 1))`),
+  consistent with the ~2.7 µs/element figure quoted in the bisect section
+  above being dominated by allocation/GC-adjacent costs at whole-program
+  scale rather than the dispatch primitive itself.
+- `cancel_waiting_sweep`'s n=0 vs n=64 median delta (~127 µs) is the marginal
+  cost of the `cancel_waiting` scan over 64 parked tasks reached through
+  `Runtime::shutdown` (the only publicly reachable path to that private scan);
+  n=0's ~213 µs floor is `Interpreter::new()` + `Runtime::shutdown` overhead
+  common to both. Both rows show a long tail (max 978 µs / 62.29 ms) — shared
+  with a machine under load during this run; the median/mean-of-100 figures
+  are the load-bearing numbers, not the single worst sample.
+- This suite is a µs/ns-granularity *regression reference* for the scheduler
+  primitives in isolation; it complements, and does not replace, the
+  whole-program hyperfine matrix above.

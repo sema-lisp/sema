@@ -124,5 +124,6 @@ Accept-or-continue is an owner decision recorded in the orchestration plan.
 **Owner decision (Helge, 2026-07-17): residuals ACCEPTED.** Slice 0b closes;
 the program proceeds to P6-1. The three structural follow-ups (direct
 rendezvous handoff, timer/park lifecycle, cons-1m allocator diagnosis) are
-parked as a deliberate later optimization pass — tracked as PERF-RESIDUAL-1 in
-docs/deferred.md.
+initially parked, then (same day) redirected into an immediate deeper pass:
+Slice 0c — symbolized profiling, divan/criterion scheduler micro-benchmarks,
+targeted squeezes. Tracked as PERF-RESIDUAL-1 in docs/deferred.md.

@@ -820,7 +820,7 @@ dropping the SAB; `MessageChannel` vs `setTimeout(0)` throttling in background t
 
 ## PERF-RESIDUAL-1 — accepted post-flip runtime overhead on three benchmark shapes
 
-**Recorded 2026-07-17 (Slice 0b close-out; owner-accepted).** The fast-path
+**Recorded 2026-07-17 (Slice 0b close-out). Status update, same day: acceptance rescinded — owner redirected the program to a deeper optimization pass (Slice 0c) before P6-1: samply/sample profiling with full symbols, then divan/criterion micro-benchmarks instrumenting the cooperative scheduler, then targeted squeezes. This entry becomes the work list for that pass.** The fast-path
 recovery pass (clock batching, register-local instruction countdown, in-place
 HOF dispatch, inline matched rendezvous, empty-scope seam-swap skip — commits
 097f76e0..f165a767) brought HOF compute and spawn fan-out FASTER than the

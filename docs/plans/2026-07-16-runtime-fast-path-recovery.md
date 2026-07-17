@@ -5,8 +5,10 @@
 **Status (2026-07-17): EXECUTED — Tasks A–F complete, every task Opus-reviewed.
 Outcome: primes 0.74×/spawn-storm 0.67× (beat baseline); pingpong 2.82×,
 sleep-storm 1.65×, deep-await ~1.7×, cons-1m 1.38× accepted as PERF-RESIDUAL-1
-(docs/deferred.md) per owner decision. See the close-out section of
-docs/plans/evidence/unified-cooperative-runtime/benchmark-vs-baseline.md.**
+(docs/deferred.md). Same-day owner redirect: residuals NOT parked — a deeper
+optimization pass (Slice 0c: symbolized profiling + divan/criterion scheduler
+micro-benchmarks + targeted squeezes) continues before P6-1. See the close-out
+section of docs/plans/evidence/unified-cooperative-runtime/benchmark-vs-baseline.md.**
 
 **Goal:** Recover the universal-flip performance regression (see `docs/plans/evidence/unified-cooperative-runtime/benchmark-vs-baseline.md`): channel rendezvous 6.5–7.4×, HOF callback dispatch ~28k instructions/element (primes 2.1× instructions), dispatch-loop accounting ~13%, drive-loop clock reads ~47% of drive time on channel-heavy workloads. Exit bar: **≤1.10× vs baseline `3f111e83` on all six benchmarks** (wall, hyperfine `--warmup 3 --runs 10`, plus `/usr/bin/time -l` instruction counts for primes/pingpong as the low-noise oracle).
 

@@ -397,6 +397,20 @@ struct RuntimeState {
     pending: VecDeque<PendingStage>,
     protocol_waits: HashMap<super::WaitKey, ProtocolWait>,
     task_promises: HashMap<TaskId, sema_core::runtime::PromiseId>,
+    /// Dirty queue of tasks that had a cancellation recorded
+    /// (`TaskRecord::request_cancellation` returned `true`). `cancel_waiting`
+    /// pops candidates from here instead of scanning `tasks` — every site that
+    /// records a cancellation pushes onto this queue (see call sites of
+    /// `request_cancellation`). Popped ids are re-validated at pop time (task
+    /// still exists, still `Waiting`, still holds the recorded cancellation)
+    /// since a task can settle/reap between being queued and being popped;
+    /// invalid ids are just dropped as transient. A candidate that IS a valid
+    /// wait but not yet ready to tear down (UCR-3 channel-wake-in-flight skip,
+    /// or `waits.cancel` finding no active entry yet) is either provably
+    /// self-resolving (UCR-3: the in-flight wake finishes the protocol wait
+    /// and settlement observes the sticky cancellation, UCR-1) or re-pushed so
+    /// a later call retries it.
+    pending_cancel_waits: VecDeque<TaskId>,
     drive_cursor: usize,
     drive_active: bool,
     active_instruction_limit: usize,
@@ -720,6 +734,7 @@ impl Runtime {
                 pending: VecDeque::new(),
                 protocol_waits: HashMap::new(),
                 task_promises: HashMap::new(),
+                pending_cancel_waits: VecDeque::new(),
                 drive_cursor: 0,
                 drive_active: false,
                 active_instruction_limit: usize::MAX,
@@ -1262,7 +1277,9 @@ impl Runtime {
         {
             let mut state = self.state.borrow_mut();
             if let Some(task) = state.tasks.get_mut(&task_id) {
-                task.record.request_cancellation(CancelReason::HostStop);
+                if task.record.request_cancellation(CancelReason::HostStop) {
+                    state.pending_cancel_waits.push_back(task_id);
+                }
             }
             state.ready.enqueue(root, task_id);
         }
@@ -1469,27 +1486,67 @@ impl Runtime {
         true
     }
 
+    /// Tear down exactly one cancelled-while-waiting task, or report `Ok(false)`
+    /// if none is currently actionable. Candidates come from
+    /// `RuntimeState::pending_cancel_waits`, a dirty queue every
+    /// `request_cancellation` call site pushes onto — not a scan of `tasks`.
+    /// Each popped id is re-validated (still present, still `Waiting`, still
+    /// carries the recorded cancellation) since a task can settle/reap or a
+    /// wait can resolve between being queued and being popped; ids that fail
+    /// validation are simply dropped (they were transient) rather than
+    /// treated as "no progress".
+    ///
+    /// A cancellation can be requested against a task BEFORE it parks (e.g. a
+    /// shutdown fan-out cancels every task, including ones still `Running` or
+    /// `Ready`), so a popped id whose task is not yet `Waiting` is not
+    /// necessarily transient — it may still park later. Such an id is pushed
+    /// back onto the tail of the queue for a later call to retry, rather than
+    /// dropped. To keep a single call from looping forever re-visiting the
+    /// same not-yet-parked id, this scan is bounded to the queue's length at
+    /// entry: each id gets at most one look this call, mirroring how the old
+    /// full-`tasks`-table scan tried every task once per call.
     fn cancel_waiting(&self) -> Result<bool, RuntimeFault> {
-        {
+        let mut attempts = self.state.borrow().pending_cancel_waits.len();
+        loop {
+            if attempts == 0 {
+                return Ok(false);
+            }
+            attempts -= 1;
             let mut state = self.state.borrow_mut();
-            let selected = state.tasks.iter().find_map(|(id, task)| {
-                let key = task.record.wait_key()?;
-                task.record.cancellation()?;
-                let wait = state.protocol_waits.get(&key)?;
+            let Some(task_id) = state.pending_cancel_waits.pop_front() else {
+                return Ok(false);
+            };
+            let Some(task) = state.tasks.get(&task_id) else {
+                continue;
+            };
+            let Some(key) = task.record.wait_key() else {
+                // Not parked (yet, or ever again) but the cancellation may
+                // still be pending delivery once it does park — give it
+                // another rotation instead of dropping it outright.
+                if task.record.cancellation().is_some() {
+                    state.pending_cancel_waits.push_back(task_id);
+                }
+                continue;
+            };
+            if task.record.cancellation().is_none() {
+                continue;
+            }
+
+            if let Some(wait) = state.protocol_waits.get(&key) {
                 // UCR-3: a rendezvous-matched channel waiter is no longer queued
                 // in the channel but still holds a `protocol_waits` entry while
                 // its `ChannelWake` (carrying the committed value) is in flight.
                 // Cancel-dropping it here would silently discard that value. Skip
-                // it: the wake delivers the value and the sticky cancellation makes
-                // settlement observe cancellation (UCR-1), so nothing is lost.
+                // it: `consume_channel_wake` -> `finish_protocol_wait` delivers
+                // the wake, removes this same `protocol_waits` entry, and
+                // transitions the task off `Waiting` on its own; settlement then
+                // observes the sticky cancellation (UCR-1). Nothing is lost, and
+                // nothing more to track here — do not re-push.
                 if let ProtocolWaitKind::Channel { channel, .. } = &wait.kind {
                     if !state.channels.has_wait(*channel, key) {
-                        return None;
+                        continue;
                     }
                 }
-                Some((*id, key))
-            });
-            if let Some((task_id, key)) = selected {
                 let wait = state
                     .protocol_waits
                     .remove(&key)
@@ -1551,16 +1608,8 @@ impl Runtime {
                 ));
                 return Ok(true);
             }
-        }
-        {
-            let mut state = self.state.borrow_mut();
-            let timer_task = state.tasks.iter().find_map(|(id, task)| {
-                (task.record.state_name() == super::StateName::Waiting
-                    && task.record.cancellation().is_some())
-                .then(|| task.record.wait_key().map(|key| (*id, key)))
-                .flatten()
-            });
-            if let Some((task_id, key)) = timer_task.filter(|(_, key)| state.timers.cancel(*key)) {
+
+            if state.timers.cancel(key) {
                 let root = state.tasks[&task_id].record.relations().origin_root;
                 state
                     .tasks
@@ -1574,49 +1623,40 @@ impl Runtime {
                 state.ready.enqueue(root, task_id);
                 return Ok(true);
             }
-        }
-        let extracted = {
-            let mut state = self.state.borrow_mut();
-            let Some(task_id) = state.tasks.iter().find_map(|(id, task)| {
-                (task.record.state_name() == super::StateName::Waiting
-                    && task.record.cancellation().is_some())
-                .then_some(*id)
-            }) else {
-                return Ok(false);
-            };
-            let task = state.tasks.remove(&task_id).expect("selected task exists");
-            let waits = state.waits.take().ok_or_else(|| RuntimeFault::Invariant {
+
+            // Neither a protocol wait nor a bare timer: fall back to the
+            // generic `WaitRuntime` (external/promise/other) cancel path.
+            let mut task = state.tasks.remove(&task_id).expect("selected task exists");
+            let mut waits = state.waits.take().ok_or_else(|| RuntimeFault::Invariant {
                 message: "wait runtime already extracted".into(),
             })?;
-            (task_id, task, waits, state.clock.now())
-        };
-        let (task_id, mut task, mut waits, now) = extracted;
-        let key = task
-            .record
-            .wait_key()
-            .expect("selected waiting task has key");
-        let pending = waits.cancel(&mut task.record, key, now);
-        let root = task.record.relations().origin_root;
-        let mut state = self.state.borrow_mut();
-        state.waits = Some(waits);
-        state.tasks.insert(task_id, task);
-        if let Some(pending) = pending {
-            state
-                .tasks
-                .get_mut(&task_id)
-                .expect("cancelled task restored")
-                .pending_resume = Some(pending);
-            state.ready.enqueue(root, task_id);
-            return Ok(true);
+            let now = state.clock.now();
+            drop(state);
+
+            let pending = waits.cancel(&mut task.record, key, now);
+            let root = task.record.relations().origin_root;
+            let mut state = self.state.borrow_mut();
+            state.waits = Some(waits);
+            state.tasks.insert(task_id, task);
+            if let Some(pending) = pending {
+                state
+                    .tasks
+                    .get_mut(&task_id)
+                    .expect("cancelled task restored")
+                    .pending_resume = Some(pending);
+                state.ready.enqueue(root, task_id);
+                return Ok(true);
+            }
+            // `waits.cancel` found no matching `WaitRuntime::active` entry and
+            // nothing was woken, so this turn made no real progress on the task
+            // — it is still Waiting, still cancelled, and none of the dedicated
+            // branches above claimed it. Re-queue it (the active entry may
+            // appear on a later drive turn) and report no progress rather than
+            // a false `Ok(true)`, which would spin the shutdown cancel loop
+            // forever (the class of bug the channel branch fixes).
+            state.pending_cancel_waits.push_back(task_id);
+            return Ok(false);
         }
-        // `waits.cancel` found no matching `WaitRuntime::active` entry and nothing
-        // was woken, so this turn made no real progress on the task — it is still
-        // Waiting. Every internal-wait kind that parks a task off `active`
-        // (promise / promise-set / protocol / timer / channel) is drained by a
-        // dedicated branch above; reaching here means an unhandled wait kind.
-        // Report no progress rather than a false `Ok(true)`, which would spin the
-        // shutdown cancel loop forever (the class of bug the channel branch fixes).
-        Ok(false)
     }
 
     fn drain_completion(&self) -> bool {
@@ -2947,6 +2987,7 @@ impl Runtime {
                             if newly {
                                 if let Some(target) = target {
                                     eager_cancel_targets.push(target);
+                                    state.pending_cancel_waits.push_back(target);
                                 }
                             }
                             // Structured transitive cancel: propagate to every task
@@ -3999,7 +4040,11 @@ impl Runtime {
             let Some(task) = state.tasks.get_mut(&task_id) else {
                 return false;
             };
-            (task_id, task.record.request_cancellation(reason))
+            let newly = task.record.request_cancellation(reason);
+            if newly {
+                state.pending_cancel_waits.push_back(task_id);
+            }
+            (task_id, newly)
         };
         // Eagerly tear down an in-flight External/IO/ResourceSlot wait so a
         // root cancelled between drive turns aborts promptly (C2).
@@ -4014,10 +4059,16 @@ impl Runtime {
         {
             let mut state = self.state.borrow_mut();
             state.shutting_down = true;
+            // Shutdown drains via `cancel_waiting`'s dirty queue below, so every
+            // task cancelled here (whether or not it is currently `Waiting`) must
+            // be seeded onto the queue — `cancel_waiting` re-validates at pop
+            // time and drops anything that isn't actually a waiting candidate.
             for task in state.tasks.values_mut() {
                 task.record
                     .request_cancellation(CancelReason::InterpreterShutdown);
             }
+            let all_task_ids: Vec<TaskId> = state.tasks.keys().copied().collect();
+            state.pending_cancel_waits.extend(all_task_ids);
             // A cooperative debug session abandoned while paused would otherwise
             // freeze the drive loop (the barrier gates every source). Clear it and
             // re-enqueue the paused task so its shutdown cancellation settles it.
@@ -4128,6 +4179,8 @@ impl Runtime {
                 task.record
                     .request_cancellation(CancelReason::InterpreterShutdown);
             }
+            let all_task_ids: Vec<TaskId> = state.tasks.keys().copied().collect();
+            state.pending_cancel_waits.extend(all_task_ids);
             state.debug_paused = None;
         }
         while matches!(self.cancel_waiting(), Ok(true)) {}
@@ -4379,6 +4432,7 @@ fn cancel_descendants(state: &mut RuntimeState, parent: TaskId) -> Vec<TaskId> {
                 if task.record.request_cancellation(CancelReason::Owner) {
                     newly.push(child);
                     frontier.push(child);
+                    state.pending_cancel_waits.push_back(child);
                 }
             }
         }
@@ -5364,6 +5418,9 @@ impl RootHandle {
                 .tasks
                 .get_mut(&task_id)
                 .is_some_and(|task| task.record.request_cancellation(reason));
+            if newly {
+                state.pending_cancel_waits.push_back(task_id);
+            }
             (task_id, newly)
         };
         // Eagerly deliver in-flight wait teardown so a root cancelled between

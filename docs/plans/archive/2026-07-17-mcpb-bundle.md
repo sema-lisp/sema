@@ -7,7 +7,7 @@ the live v1.30.0 release: downloaded all 5 target archives, lipo'd a genuine
 universal macOS binary (`x86_64 arm64`), and packed `dist/sema.mcpb`
 (55 MB / 135 MB unpacked). Untried only inside the workflow itself — first live
 CI run is planned for the release after the unified-scheduler work lands. The
-one-time registry publish (below) is still pending.
+registry entry is **live**: `com.sema-lang/sema` v1.30.0, DNS-verified (below).
 
 ## Decision
 
@@ -103,16 +103,26 @@ creating the release, so the target-triple assets are present to download. (If a
 race shows up, switch to `workflow_run` keyed on the Release workflow, or add a
 short retry to the `gh release download` in the script.)
 
-## Registry publish (one-time, after the first bundle exists)
+## Registry publish — DONE (2026-07-17)
 
-1. `mcp-publisher login github` (auth as the `sema-lisp` org).
-2. `server.json` with an `mcpb` package whose `identifier` is the release asset:
-   `https://github.com/sema-lisp/sema/releases/download/vX.Y.Z/sema.mcpb`,
-   `transport: { type: stdio }`, name `io.github.sema-lisp/sema`.
-3. `mcp-publisher publish`.
+**Live: `com.sema-lang/sema` v1.30.0, active.** Committed manifest:
+`mcpb/server.json` (mcpb package → the v1.30.0 release asset, `fileSha256`
+pinned, stdio transport).
 
-Bump the `server.json` version + asset URL each release you want reflected (the
-registry is versioned). Could be a later step in the same `mcpb.yml` job.
+Namespace note: `io.github.sema-lisp/*` was **not** grantable — the `sema-lisp`
+org restricts third-party OAuth apps, so the registry's device-flow token can't
+see admin membership and falls back to the personal namespace. We used the
+DNS-verified **`com.sema-lang`** namespace instead (apex TXT on sema-lang.com,
+added via Vercel), which sidesteps GitHub org OAuth entirely.
+
+Re-publishing a new release:
+1. Bump `version` + the asset URL/`fileSha256` in `mcpb/server.json`.
+2. `mcp-publisher login dns --domain sema-lang.com --private-key <hex>` — needs
+   the ed25519 key that matches the live apex TXT record. **That key is not in
+   the repo.** Either preserve it (a GitHub Actions secret `MCP_PRIVATE_KEY` for
+   an automated publish step in `mcpb.yml`), or regenerate a key + update the TXT
+   record each time (the whole flow is scriptable).
+3. `mcp-publisher publish` from `mcpb/`.
 
 ## Follow-ups / open questions
 

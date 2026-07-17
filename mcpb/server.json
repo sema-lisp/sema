@@ -1,0 +1,22 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "com.sema-lang/sema",
+  "title": "Sema",
+  "description": "MCP tools for Sema — eval, compile, build, format, and docs for a Lisp with LLM primitives.",
+  "repository": {
+    "url": "https://github.com/sema-lisp/sema",
+    "source": "github"
+  },
+  "version": "1.30.0",
+  "packages": [
+    {
+      "registryType": "mcpb",
+      "identifier": "https://github.com/sema-lisp/sema/releases/download/v1.30.0/sema.mcpb",
+      "version": "1.30.0",
+      "fileSha256": "4816ec6881f0acfc24131f05ffa9fc62c97200066c2c0d7423673cfb0b6e893e",
+      "transport": {
+        "type": "stdio"
+      }
+    }
+  ]
+}

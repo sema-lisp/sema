@@ -231,3 +231,33 @@ setup-dominated (n=0 ≈ 207 µs vs 84 ns for `idle_drive_turn`) and cannot yet
 prove per-turn flatness in parked-task count; the `ready_remaining` fix is
 instead pinned by its debug_assert. Rework the bench when the suite is next
 touched.
+
+## Task 0c-7 close-out — direct rendezvous handoff (2026-07-17, HEAD e3285778)
+
+A channel op whose match is immediately available now completes without parking
+its own task: the registry is consulted before the VM is boxed; the response is
+applied to the still-unboxed VM which re-enters `run_quantum` with the
+remaining budget; the peer rides the pre-existing inline delivery. Adversarial
+Opus review: SAFE on all seven surfaces (FIFO — the mixed queue state was
+proven unreachable from registry invariants; budget continuation; three
+cancellation windows; applied-value/park boundary; barrier/fairness; GC/borrow
+discipline). Both pinned tests carry demonstrated teeth (each fails when its
+property is deliberately broken; the budget test measures drive-turn chunking
+of a 50k-send spinning loop). `ChannelHandoffOutcome::Deferred` proven
+unreachable from Sema source (production channel continuations never compose
+further); pinned via a synthetic continuation unit test.
+
+| benchmark | ratio (wall) | note |
+|---|---|---|
+| channel-pingpong | **~1.36–1.4×** (565M vs ~400M instr) | was 1.97× pre-handoff, 7.43× at flip |
+| spawn-storm | 0.58× (faster) | |
+| sleep-storm | 0.89× (faster) | |
+| primes / cons-1m / deep-await | 1.1–1.2× band | run-to-run ratio wobble ±0.1; instruction oracles unchanged |
+
+divan `channel_rendezvous`: 5.25 µs → 4.50 µs median.
+
+**Remaining pingpong residual (~4k instr/message over baseline)** is per-quantum
+overhead on the genuinely-parked half (TaskScopeSwap probes, task-id publish,
+quantum guard) — diffuse, no single lever left. The squeeze pass ends here;
+0.58×–1.4× across the matrix vs the pre-migration engine is the recorded
+end-state.

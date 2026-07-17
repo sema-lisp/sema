@@ -822,8 +822,10 @@ dropping the SAB; `MessageChannel` vs `setTimeout(0)` throttling in background t
 
 **Recorded 2026-07-17 (Slice 0b close-out). Status update, same day: acceptance rescinded — owner redirected the program to a deeper optimization pass (Slice 0c) before P6-1: samply/sample profiling with full symbols, then divan/criterion micro-benchmarks instrumenting the cooperative scheduler, then targeted squeezes. This entry became the 0c work list; outcome: sleep-storm/deep-await/cons-1m
 RESOLVED (0.88×/1.11×/1.03×), spawn-storm/primes faster-than-baseline.
-The single remaining row is **channel-pingpong 1.97×** — follow-up: direct
-task-to-task rendezvous handoff (no park/Box<VM> for the matched sender).
+The direct-handoff follow-up landed (0c-7, commit ffae33c1): channel-pingpong
+is now ~1.4× (565M vs ~400M instructions) — the residual is diffuse per-quantum
+overhead on the genuinely-parked half, with no single lever left. Recorded as
+the accepted end-state of the squeeze pass.
 Final tables + micro-benchmark reference: benchmark-vs-baseline.md.** The fast-path
 recovery pass (clock batching, register-local instruction countdown, in-place
 HOF dispatch, inline matched rendezvous, empty-scope seam-swap skip — commits

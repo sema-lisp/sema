@@ -787,7 +787,18 @@ are the only new legacy cells) and `no_adhoc_tokio_runtimes_outside_allowlist` (
 interpreter's cooperative `Runtime::new` is allowlisted; in-src `tests.rs` modules are exempt
 like `tests/**`).
 
-### P6-3 WASM Promise-driven roots + P6-1 common host API (deferred — needs a browser)
+### P6-3 WASM Promise-driven roots (deferred — needs a browser); P6-1 RESOLVED
+
+**P6-1 common host API — RESOLVED 2026-07-17** (commits 0b54e961..519fdc50):
+public `Interpreter::{submit_str, submit_value, drive_until_settled, drive_turn,
+take_output, command_handle, shutdown}`, `RootOptions` (`capture_output`;
+`name` is a documented no-op extension point), root-tagged `OutputEvent`, and
+`RuntimeCommandHandle` as the sole `Send + Sync` control surface (commands ride
+the completion inbox; delivery at drive-turn start). Proving consumers: CLI
+Ctrl-C (`cancel_all`, double-press hard-exit — see docs/limitations.md for the
+long-synchronous-native caveat) and the notebook engine (per-cell capture +
+cross-thread cell cancel via `CancelToken`). Blocker 1 below is closed; P6-3
+remains gated only on real-browser verification.
 
 **Attempted 2026-07-16; fell back cleanly (shipped mechanism unchanged).** The wasm host
 (`crates/sema-wasm/src/lib.rs`) still runs the shipped **replay-with-cache** HTTP path

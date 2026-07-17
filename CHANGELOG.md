@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+- **Public host API (P6-1):** `Interpreter` gains `submit_str`/`submit_value`/
+  `drive_until_settled`/`drive_turn`/`take_output`/`command_handle`/`shutdown`,
+  with `RootOptions{capture_output}`, root-tagged `OutputEvent`, and
+  `RuntimeCommandHandle` — a `Send + Sync` handle for cross-thread cancellation.
+  The CLI now cancels gracefully on Ctrl-C (double-press hard-exits, 130); the
+  notebook engine drives cells through the API with per-cell output capture,
+  in-order stderr, and cross-thread cell cancellation.
+- **Runtime fast-path recovery (0b/0c):** HOF-heavy compute and task fan-out now
+  beat the pre-unification engine (primes/spawn-storm 0.7×); channel rendezvous
+  7.4×→~1.4× via inline completion + direct task-to-task handoff; O(1)
+  cancel-waiting and ready-remaining; depth-bounded value drop; divan scheduler
+  micro-benchmarks (`jake bench.micro`).
+
 ### Added
 
 - **Authenticated MCP servers in workflow runs — headless precursor** (per

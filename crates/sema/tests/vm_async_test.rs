@@ -1004,6 +1004,28 @@ fn channel_two_senders_one_receiver() {
     );
 }
 
+/// Task 0c-7: two senders queue (in that order) on a full capacity-1 channel
+/// before any receiver exists; a receiver then drains twice. The in-place
+/// handoff must still ask the channel registry — which enforces FIFO via its
+/// own sender queue — rather than resolving whichever sender happens to be
+/// nearest: a send while ANOTHER sender is already queued must queue BEHIND
+/// it, never hand off ahead of it, even once a receiver is waiting.
+#[test]
+fn channel_fifo_preserved_under_immediate_handoff() {
+    assert_eq!(
+        eval(
+            r#"
+            (let ((ch (channel/new 1)))
+              (let ((s1 (async (channel/send ch :first)))
+                    (s2 (async (channel/send ch :second)))
+                    (r  (async (list (channel/recv ch) (channel/recv ch)))))
+                (await r)))
+        "#
+        ),
+        Value::list(vec![Value::keyword("first"), Value::keyword("second")]),
+    );
+}
+
 // === Async ops inside higher-order stdlib callbacks ===
 //
 // HOFs (for-each, map, filter, foldl, sort-by, ...) invoke VM closures
@@ -2083,5 +2105,105 @@ fn async_run_releases_under_self_awaiting_parent() {
         run.stdout.contains('7'),
         "expected `7`, got stdout:\n{}",
         run.stdout
+    );
+}
+
+// === Task 0c-7: in-place channel-rendezvous handoff ===
+
+/// A `channel/send`/`recv` pair that resolves immediately loops in place on
+/// the SAME `vm` object instead of parking through the pending queue (Task
+/// 0c-7). Guard against that in-place loop becoming unbounded and starving a
+/// sibling root: drive a tight two-task ping-pong under a TINY per-quantum
+/// instruction budget alongside an unrelated sibling root, and confirm the
+/// sibling settles within a handful of `drive()` turns while the ping-pong is
+/// still mid-flight — proving the handoff loop is bounded by
+/// `remaining_budget` (mirroring Task C's `invoke_vm_callback_loop` budget
+/// continuation) exactly like a single ordinary quantum always was, not that
+/// the sibling merely happened to finish first.
+///
+/// Needs direct `Runtime`/`DriveBudget` control the `eval()` helper doesn't
+/// expose, so it drives `sema_eval::Interpreter`'s runtime by hand rather
+/// than going through a `.sema` source string + the CLI.
+#[test]
+fn channel_pingpong_handoff_respects_instruction_budget_and_lets_sibling_progress() {
+    use sema_vm::runtime::{DriveBudget, RootPoll};
+
+    let interp = sema_eval::Interpreter::new();
+    let runtime = interp.runtime();
+
+    let ping = sema_reader::read_many(
+        r#"
+        (let ((c1 (channel/new 1)) (c2 (channel/new 1)))
+          (let ((p1 (async (let loop ((n 0))
+                              (if (< n 20000)
+                                  (begin (channel/send c1 n) (channel/recv c2) (loop (+ n 1)))
+                                  n))))
+                (p2 (async (let loop ((n 0))
+                              (if (< n 20000)
+                                  (begin (channel/recv c1) (channel/send c2 n) (loop (+ n 1)))
+                                  n)))))
+            (+ (await p1) (await p2))))
+        "#,
+    )
+    .expect("pingpong source parses");
+    let prog = sema_vm::compile_program(&ping, None).expect("pingpong compiles");
+    let mut vm = sema_vm::VM::new(
+        interp.global_env.clone(),
+        prog.functions,
+        &prog.native_table,
+        prog.main_cache_slots,
+    )
+    .expect("pingpong VM builds against stdlib globals");
+    vm.seed_main_frame(prog.closure);
+    let pingpong = runtime.submit_root(vm).expect("pingpong root admitted");
+
+    let sibling_form = sema_reader::read_many("(+ 1 2)").expect("sibling source parses");
+    let sibling_prog = sema_vm::compile_program(&sibling_form, None).expect("sibling compiles");
+    let mut sibling_vm = sema_vm::VM::new(
+        interp.global_env.clone(),
+        sibling_prog.functions,
+        &sibling_prog.native_table,
+        sibling_prog.main_cache_slots,
+    )
+    .expect("sibling VM builds");
+    sibling_vm.seed_main_frame(sibling_prog.closure);
+    let sibling = runtime
+        .submit_root(sibling_vm)
+        .expect("sibling root admitted");
+
+    let budget = DriveBudget {
+        work_item_limit: std::num::NonZeroUsize::new(4096).unwrap(),
+        completion_limit: std::num::NonZeroUsize::new(64).unwrap(),
+        timer_limit: std::num::NonZeroUsize::new(64).unwrap(),
+        root_visit_limit: std::num::NonZeroUsize::new(64).unwrap(),
+        cleanup_limit: std::num::NonZeroUsize::new(64).unwrap(),
+        // Tiny on purpose: a handful of channel round trips' worth, so a
+        // handoff loop that ignored the budget would run away for many, many
+        // drive() turns before this test's bound catches it.
+        instruction_limit_per_task: std::num::NonZeroUsize::new(200).unwrap(),
+        wall_clock_limit: std::time::Duration::from_secs(10),
+    };
+
+    let mut turns = 0;
+    while matches!(sibling.poll_result(), RootPoll::Pending) {
+        runtime.drive(&budget).expect("drive turn succeeds");
+        turns += 1;
+        assert!(
+            turns < 200,
+            "sibling root starved by the ping-pong handoff loop after {turns} drive() turns"
+        );
+    }
+    assert!(
+        matches!(pingpong.poll_result(), RootPoll::Pending),
+        "pingpong should still be mid-flight when the sibling settles — proves the sibling was \
+         genuinely interleaved in, not that it merely happened to finish first"
+    );
+    let RootPoll::Ready(settlement) = sibling.poll_result() else {
+        panic!("sibling settles")
+    };
+    assert!(
+        matches!(&settlement.outcome, sema_core::runtime::TaskOutcome::Returned(v) if v.as_int() == Some(3)),
+        "sibling settlement: {:?}",
+        settlement.outcome
     );
 }

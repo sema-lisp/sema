@@ -12,7 +12,9 @@ use crate::vm::{
     close_closure_upvalues_for_foreign_run, close_closure_upvalues_with_owner,
     snapshot_escaping_call_with_owner,
 };
-use crate::{extract_vm_closure, Closure, Function, VmExecResult, VmQuantumResult, VM};
+use crate::{
+    extract_vm_closure, Closure, Function, VmExecResult, VmPendingOutcome, VmQuantumResult, VM,
+};
 #[cfg(test)]
 use sema_core::runtime::ExternalFailure;
 use sema_core::runtime::{
@@ -139,6 +141,19 @@ impl Trace for VmResume {
             }
             Self::Fail(error) => error.trace(sink),
         }
+    }
+}
+
+/// Apply a settled [`VmResume`] to a still-live VM's parked frame: inject a
+/// resolved value onto its stack-top placeholder, or arm a rejection at the
+/// parked call site. Shared by `visit_ready` (a task's `vm_call` resuming on
+/// its next turn) and `run_parked_quantum`'s in-place channel handoff loop
+/// (Task 0c-7) — the same application `reinstall_parent_vm_now` defers to a
+/// later turn, applied here immediately because the VM was never parked.
+fn apply_vm_resume(vm: &mut VM, resume: VmResume) {
+    match resume {
+        VmResume::Value(value) => vm.replace_stack_top(value),
+        VmResume::Fail(error) => vm.resume_with_error(error),
     }
 }
 
@@ -1926,13 +1941,6 @@ impl Runtime {
         // stack slots from the cells before running so the resumed frame observes
         // the callback's `set!` write-backs.
         vm.sync_tracked_upvalues_to_stack();
-        // Snapshot the task's cancellation for this quantum: every native driven
-        // through the runtime ABI reads it via `NativeCallContext`. Mirrors
-        // `invoke_callable`'s `CancellationView` construction.
-        let cancellation = {
-            let cancel = task.record.cancellation();
-            CancellationView::new(cancel.is_some(), cancel.map(|request| request.reason))
-        };
         // Install this task's captured per-task dynamic contexts around the quantum:
         // the LLM dynamic scope (cache/budget/…), the OTel context (span stack + ids),
         // and the leaf-usage accumulator scope. Two interleaving tasks otherwise share
@@ -1977,25 +1985,154 @@ impl Runtime {
             self.state.try_borrow_mut().is_ok(),
             "RuntimeState borrowed at quantum entry — a blocking debug stop would deadlock the state cell"
         );
-        // When a native DAP session is registered on this thread (`ACTIVE_DEBUG`),
-        // run the debug-aware quantum so breakpoints/steps inside this task — and
-        // inside cooperative HOF callbacks, which also flow through
-        // `run_parked_quantum` as enqueued callback-VM quanta — stop and serve
-        // inspection against the stopped task's own VM. Otherwise the byte-
-        // identical non-debug quantum.
-        let quantum = if crate::vm::is_debug_session_active() {
-            crate::vm::with_active_debug(|debug| {
-                vm.run_quantum_debug(&context, instruction_limit, cancellation, debug)
-            })
-            .expect("debug session active but no DebugState registered")
-        } else {
-            vm.run_quantum(&context, instruction_limit, cancellation)
+        // Task 0c-7: the loop below lets an in-place task-to-task channel
+        // rendezvous handoff (below) feed its response straight back into
+        // `vm` and re-run `run_quantum` on the SAME VM object, instead of
+        // boxing/parking it and round-tripping through the pending queue.
+        // `remaining_budget` is seeded once from the same total a single
+        // (pre-0c7) quantum would receive, then debited per iteration — this
+        // is Task C's `invoke_vm_callback_loop` budget-continuation pattern,
+        // mirrored so a tight send/recv-spinning pair is still preempted at
+        // the same total instruction count a single quantum always was.
+        let mut remaining_budget = instruction_limit;
+        let action = loop {
+            let cancellation = {
+                let cancel = task.record.cancellation();
+                CancellationView::new(cancel.is_some(), cancel.map(|request| request.reason))
+            };
+            // When a native DAP session is registered on this thread (`ACTIVE_DEBUG`),
+            // run the debug-aware quantum so breakpoints/steps inside this task — and
+            // inside cooperative HOF callbacks, which also flow through
+            // `run_parked_quantum` as enqueued callback-VM quanta — stop and serve
+            // inspection against the stopped task's own VM. Otherwise the byte-
+            // identical non-debug quantum.
+            let quantum = if crate::vm::is_debug_session_active() {
+                crate::vm::with_active_debug(|debug| {
+                    vm.run_quantum_debug(&context, remaining_budget, cancellation, debug)
+                })
+                .expect("debug session active but no DebugState registered")
+            } else {
+                vm.run_quantum(&context, remaining_budget, cancellation)
+            };
+            self.state.borrow_mut().turn_instructions += quantum.instructions;
+            remaining_budget = remaining_budget.saturating_sub(quantum.instructions);
+
+            // Only a channel suspend with no cancellation landed is eligible for
+            // the in-place handoff (item 4: a cancelled task takes the normal
+            // path below instead of handing off). Anything else — a genuine
+            // suspend of another kind, a budget expiry, completion, or error —
+            // falls through to the UNMODIFIED `quantum_to_action` mapping,
+            // reconstructing the exact `VmQuantumResult` this loop consumed
+            // (its `instructions` were already folded into `turn_instructions`
+            // above, so `quantum_to_action`, which never reads that field, gets
+            // a harmless placeholder).
+            let (wait, continuation) = match quantum.outcome {
+                Ok(VmExecResult::Pending(VmPendingOutcome::Suspend(
+                    sema_core::runtime::NativeSuspend {
+                        wait: WaitKind::Channel(wait),
+                        continuation,
+                    },
+                ))) if task.record.cancellation().is_none() => (wait, continuation),
+                other_outcome => {
+                    break self.quantum_to_action(
+                        root,
+                        task_id,
+                        task,
+                        vm,
+                        VmQuantumResult {
+                            outcome: other_outcome,
+                            instructions: 0,
+                        },
+                    );
+                }
+            };
+            let (channel, receive) = match &wait {
+                sema_core::runtime::ChannelWait::Send { channel, .. } => (*channel, false),
+                sema_core::runtime::ChannelWait::Receive { channel } => (*channel, true),
+            };
+            // A non-mutating registry predicate (see its doc for the FIFO
+            // argument): only attempt the handoff when it is certain to
+            // resolve without parking. A "no" here means NO registry
+            // mutation has happened yet — the genuine-block case reaches
+            // `install_channel_wait` exactly as it always has, byte-
+            // identical to the pre-0c7 path (item 5).
+            let immediate = self
+                .state
+                .borrow()
+                .channels
+                .would_resolve_immediately(channel, receive);
+            if !immediate {
+                break self.quantum_to_action(
+                    root,
+                    task_id,
+                    task,
+                    vm,
+                    VmQuantumResult {
+                        outcome: Ok(VmExecResult::Pending(VmPendingOutcome::Suspend(
+                            sema_core::runtime::NativeSuspend {
+                                wait: WaitKind::Channel(wait),
+                                continuation,
+                            },
+                        ))),
+                        instructions: 0,
+                    },
+                );
+            }
+            match self.try_channel_handoff(task_id, task, wait, continuation)? {
+                ChannelHandoffOutcome::Applied(resume) => {
+                    apply_vm_resume(&mut vm, resume);
+                    // Credits mirror `complete_channel_rendezvous`'s exact
+                    // pattern (item 6): +1 for the resume hop this replaces,
+                    // +1 more because it resolved fully inline (no fallback
+                    // queuing) — `drive()` folds this into `work_items` so a
+                    // channel-heavy pair of tasks cannot look "free" and
+                    // starve sibling roots of their turn.
+                    self.state.borrow_mut().channel_fast_path_credit += 2;
+                    continue;
+                }
+                ChannelHandoffOutcome::Deferred(result) => {
+                    // The resumed continuation composed further (a chained
+                    // `Call`/`Suspend`/`Runtime`, not a plain value/error) —
+                    // the same rare case `apply_native_result_now`'s fallback
+                    // arm handles. Box `vm` now (only on this cold path) and
+                    // settle via the ordinary `VmResult` mapping, which
+                    // `apply_action` queues as exactly the `PendingStage::Apply`
+                    // the staged path would have produced (item 6's
+                    // "single-step inline, no unbounded looping").
+                    let owner = ReturnOwner::VmResume {
+                        vm: Box::new(vm),
+                        parent: Box::new(task.vm_owner.take().expect("VM call has a return owner")),
+                    };
+                    self.state.borrow_mut().channel_fast_path_credit += 1;
+                    break TaskAction::VmResult(task_id, owner, result);
+                }
+                ChannelHandoffOutcome::GiveUp(wait, continuation) => {
+                    // Wait-key identity exhausted before any registry mutation
+                    // happened — give up on the fast path and let the ordinary
+                    // (staged) path hit and handle the same exhaustion.
+                    break self.quantum_to_action(
+                        root,
+                        task_id,
+                        task,
+                        vm,
+                        VmQuantumResult {
+                            outcome: Ok(VmExecResult::Pending(VmPendingOutcome::Suspend(
+                                sema_core::runtime::NativeSuspend {
+                                    wait: WaitKind::Channel(wait),
+                                    continuation,
+                                },
+                            ))),
+                            instructions: 0,
+                        },
+                    );
+                }
+            }
         };
+
         let _ = sema_core::set_current_task_id(prev_task_id);
         scopes.restore(task);
         drop(quantum_guard);
-        self.state.borrow_mut().turn_instructions += quantum.instructions;
-        Ok(self.quantum_to_action(root, task_id, task, vm, quantum))
+        Ok(action)
     }
 
     /// Map a completed [`VmQuantumResult`] to the [`TaskAction`] that drives it
@@ -2121,7 +2258,7 @@ impl Runtime {
                 // Re-run raising the rejection in-frame; uncaught, it surfaces
                 // as `Err` out of `run_quantum` and settles the task Failed —
                 // preserving the prior uncaught behavior.
-                vm.resume_with_error(error);
+                apply_vm_resume(&mut vm, VmResume::Fail(error));
                 self.run_parked_quantum(root, task_id, &mut task, vm)?
             } else {
                 TaskAction::VmResult(
@@ -2141,8 +2278,8 @@ impl Runtime {
                 None => TaskAction::Settle(root, task_id, TaskOutcome::Cancelled(cancel.reason)),
             }
         } else if let Some(mut vm) = task.vm_call.take() {
-            if let Some(VmResume::Value(value)) = resume {
-                vm.replace_stack_top(value);
+            if let Some(resume @ VmResume::Value(_)) = resume {
+                apply_vm_resume(&mut vm, resume);
             }
             self.run_parked_quantum(root, task_id, &mut task, vm)?
         } else {
@@ -2710,6 +2847,157 @@ impl Runtime {
             state.channel_fast_path_credit += 1;
         }
         Ok(())
+    }
+
+    /// Attempt Task 0c-7's in-place task-to-task rendezvous handoff for a
+    /// channel op the caller has already confirmed (via
+    /// `ChannelRegistry::would_resolve_immediately`) will resolve without
+    /// parking. Does the ONE mutating registry call (`send`/`receive` —
+    /// exactly what `install_channel_wait` would have called; this function
+    /// is only ever reached when that call is about to match, so there is no
+    /// double-mutation and the genuine-block path in `install_channel_wait`
+    /// is never touched by this one) and resumes `this` task's own
+    /// continuation directly against `task`'s LOCAL `context`/`cancellation`
+    /// — mirroring `invoke_vm_callback_loop`'s per-element resume (Task C),
+    /// not `resume_continuation_value`, because `task_id` has not been
+    /// reinserted into `state.tasks` yet at this point (the caller,
+    /// `run_parked_quantum`, still owns it as `&mut RuntimeTask`).
+    ///
+    /// The matched peer (if any) is delivered via the EXISTING, unchanged
+    /// Task-D machinery (`complete_channel_rendezvous`), which owns its own
+    /// short borrows and is safe to call with none held here.
+    fn try_channel_handoff(
+        &self,
+        task_id: TaskId,
+        task: &mut RuntimeTask,
+        wait: sema_core::runtime::ChannelWait,
+        continuation: Box<dyn sema_core::runtime::NativeContinuation>,
+    ) -> Result<ChannelHandoffOutcome, RuntimeFault> {
+        let key = {
+            let state = self.state.borrow();
+            match state
+                .waits
+                .as_ref()
+                .expect("wait runtime installed")
+                .issue_internal_wait()
+            {
+                Ok(key) => key,
+                // No registry mutation has happened yet — safe to bail out
+                // entirely and let the ordinary (staged) path hit and handle
+                // the identical exhaustion.
+                Err(_) => return Ok(ChannelHandoffOutcome::GiveUp(wait, continuation)),
+            }
+        };
+        let (receive, result) = {
+            let mut state = self.state.borrow_mut();
+            match &wait {
+                sema_core::runtime::ChannelWait::Send { channel, value } => (
+                    false,
+                    state.channels.send(*channel, key, task_id, value.clone()),
+                ),
+                sema_core::runtime::ChannelWait::Receive { channel } => {
+                    (true, state.channels.receive(*channel, key, task_id))
+                }
+            }
+        };
+        let result = match result {
+            Ok(result) => result,
+            Err(error) => {
+                return self.resume_this_inline(task, continuation, Err(registry_error(error)))
+            }
+        };
+        // The caller only reaches here after `would_resolve_immediately` said
+        // yes, and nothing else runs between that check and this mutation
+        // (single-threaded, no reentrancy) — so this can never actually be
+        // `Waiting`. Treat a desync as the invariant violation it would be
+        // rather than silently mis-parking the task (no `owner` is available
+        // here to install a genuine park, unlike `install_channel_wait`).
+        if result == super::ChannelResult::Waiting {
+            return Err(RuntimeFault::Invariant {
+                message: "channel handoff: would_resolve_immediately predicate desynced from registry result".into(),
+            });
+        }
+        let wake = { self.state.borrow_mut().channels.pop_wake() };
+        let response = match (receive, result) {
+            (true, super::ChannelResult::Received(value)) => {
+                RuntimeResponse::Receive(sema_core::runtime::ChannelReceive::Received(value))
+            }
+            (true, super::ChannelResult::Closed) => {
+                RuntimeResponse::Receive(sema_core::runtime::ChannelReceive::Closed)
+            }
+            (false, super::ChannelResult::Sent) => {
+                RuntimeResponse::Send(sema_core::runtime::ChannelSend::Sent)
+            }
+            (false, super::ChannelResult::Closed) => {
+                RuntimeResponse::Send(sema_core::runtime::ChannelSend::Closed)
+            }
+            (_, super::ChannelResult::Waiting) => unreachable!("handled above"),
+            (true, super::ChannelResult::Sent) | (false, super::ChannelResult::Received(_)) => {
+                unreachable!("channel result matches operation")
+            }
+        };
+        // Deliver the matched peer's wake via the EXISTING Task-D inline
+        // machinery, unchanged (item 1) — `complete_channel_rendezvous` owns
+        // its own borrows and credits its own hops.
+        if let Some(wake) = wake {
+            let peer_response = {
+                let state = self.state.borrow();
+                channel_wake_response(&state.protocol_waits, wake.key, wake.result)
+            };
+            if let Some(peer_response) = peer_response {
+                let resume = {
+                    let mut state = self.state.borrow_mut();
+                    // Replaces the `PendingStage::ChannelWake` ->
+                    // `consume_channel_wake` hop, exactly like
+                    // `install_channel_wait`'s own wake-consuming branch.
+                    state.channel_fast_path_credit += 1;
+                    finish_protocol_wait_now(&mut state, wake.key, wake.task, peer_response)?
+                };
+                if let Some((owner, frame, response)) = resume {
+                    self.complete_channel_rendezvous(ChannelRendezvousResume {
+                        task_id: wake.task,
+                        owner,
+                        frame,
+                        response,
+                    })?;
+                }
+            }
+        }
+        self.resume_this_inline(task, continuation, Ok(response))
+    }
+
+    /// Resume `this` task's own channel continuation with `response` against
+    /// `task`'s LOCAL context, without going through `resume_continuation_value`
+    /// (see `try_channel_handoff`'s doc for why). Re-checks cancellation
+    /// immediately before resuming — mirroring `resume_continuation_value`'s
+    /// own recheck (UCR-3 / item 4): a cancellation landing between the
+    /// registry match and this resume must still be observed by the
+    /// continuation, not silently overridden by the stale channel response.
+    fn resume_this_inline(
+        &self,
+        task: &mut RuntimeTask,
+        continuation: Box<dyn sema_core::runtime::NativeContinuation>,
+        response: ChannelResponse,
+    ) -> Result<ChannelHandoffOutcome, RuntimeFault> {
+        let cancel = task.record.cancellation();
+        let input = match cancel {
+            Some(cancel) => ResumeInput::Cancelled(cancel.reason),
+            None => response.map_or_else(ResumeInput::Failed, ResumeInput::Runtime),
+        };
+        let mut task_context = task.context.borrow_mut();
+        let mut native_context = NativeCallContext {
+            task_context: &mut task_context,
+            cancellation: CancellationView::new(cancel.is_some(), cancel.map(|c| c.reason)),
+        };
+        let resumed = continuation.resume(&mut native_context, input);
+        drop(task_context);
+        Ok(match resumed {
+            Ok(NativeOutcome::Return(value)) => {
+                ChannelHandoffOutcome::Applied(VmResume::Value(value))
+            }
+            Err(error) => ChannelHandoffOutcome::Applied(VmResume::Fail(error)),
+            other => ChannelHandoffOutcome::Deferred(other),
+        })
     }
 
     fn dispatch_runtime(
@@ -4889,6 +5177,29 @@ enum ChannelWaitOutcome {
         this: ChannelRendezvousResume,
         peer: Option<Box<ChannelRendezvousResume>>,
     },
+}
+
+/// `try_channel_handoff`'s result: `this` task's own resume, or a reason it
+/// could not be applied in place.
+enum ChannelHandoffOutcome {
+    /// The op resolved immediately and the resumed continuation settled as a
+    /// plain value/error — apply directly to the still-unboxed `vm`'s stack
+    /// via `apply_vm_resume` and loop.
+    Applied(VmResume),
+    /// The op resolved immediately, but the resumed continuation composed
+    /// further (a chained `Call`/`Suspend`/`Runtime`, not a plain value/
+    /// error) — the same rare case `apply_native_result_now`'s fallback arm
+    /// handles. The caller boxes `vm` and settles via the ordinary
+    /// `TaskAction::VmResult` mapping.
+    Deferred(NativeResult),
+    /// Wait-key identity was exhausted before any registry mutation
+    /// happened — hands the wait/continuation back so the caller can fall
+    /// through to the ordinary (staged) path, which hits and handles the
+    /// identical exhaustion.
+    GiveUp(
+        sema_core::runtime::ChannelWait,
+        Box<dyn sema_core::runtime::NativeContinuation>,
+    ),
 }
 
 fn promise_set_response(

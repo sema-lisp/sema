@@ -235,6 +235,36 @@ impl ChannelRegistry {
                 || channel.receivers.iter().any(|w| w.key == key)
         })
     }
+    /// Whether a `send`/`receive` on `id` would resolve WITHOUT parking,
+    /// without mutating anything — used by the runtime's in-place
+    /// task-to-task rendezvous handoff (Task 0c-7) to decide whether it is
+    /// safe to skip boxing/parking the calling VM before even attempting the
+    /// op. Safe from a FIFO perspective: `send`/`receive` maintain the
+    /// invariant that `senders` and `receivers` are never simultaneously
+    /// non-empty (either op immediately drains the opposite queue), and a
+    /// non-empty `senders` queue always implies a full buffer (a send only
+    /// parks once the buffer has no spare capacity). So whenever a
+    /// same-direction queue is non-empty, the corresponding capacity/opposite-
+    /// queue checks below already correctly evaluate to "would park" — a
+    /// queued sender ahead of a prospective new sender can never be
+    /// masked by spare buffer capacity or a waiting receiver, because
+    /// neither can coexist with a non-empty `senders` queue. An unknown
+    /// channel id is "not immediate" (the mutating call will surface the
+    /// registry error).
+    pub fn would_resolve_immediately(&self, id: ChannelId, receive: bool) -> bool {
+        let Some(channel) = self.channels.get(&id) else {
+            return false;
+        };
+        if channel.closed {
+            return true;
+        }
+        if receive {
+            !channel.buffer.is_empty() || !channel.senders.is_empty()
+        } else {
+            !channel.receivers.is_empty() || channel.buffer.len() < channel.capacity
+        }
+    }
+
     pub fn take_wake(&mut self, key: WaitKey) -> Option<ChannelWake> {
         let index = self.wakes.iter().position(|wake| wake.key == key)?;
         self.wakes.remove(index)

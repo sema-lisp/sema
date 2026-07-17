@@ -1,6 +1,8 @@
 #![cfg_attr(not(test), allow(dead_code))]
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
+
+use hashbrown::HashMap;
 use std::rc::Rc;
 
 use sema_core::runtime::{

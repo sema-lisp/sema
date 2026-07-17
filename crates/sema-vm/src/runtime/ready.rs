@@ -1,4 +1,6 @@
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::VecDeque;
+
+use hashbrown::{HashMap, HashSet};
 
 use sema_core::runtime::{RootId, TaskId};
 

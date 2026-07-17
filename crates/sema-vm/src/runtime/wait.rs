@@ -1,4 +1,6 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
+
+use hashbrown::HashMap;
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::Arc;
 use std::time::Instant;

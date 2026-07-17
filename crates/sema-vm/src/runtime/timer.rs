@@ -1,5 +1,7 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::time::Instant;
+
+use hashbrown::HashMap;
 
 use super::WaitKey;
 

@@ -17,7 +17,9 @@
 //! thread-local resource the registry never sees), so it is GC-trivial: its
 //! `Trace` emits no edges and it needs no interior sever/evict hooks.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
+
+use hashbrown::HashMap;
 
 use sema_core::runtime::{
     IdExhausted, ResourceGateId, RuntimeId, RuntimeScopedIdCounter, TaskId, Trace,

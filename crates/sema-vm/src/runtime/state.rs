@@ -1,7 +1,9 @@
 //! Interpreter-owned runtime state and root lifecycle.
 
 use std::cell::RefCell;
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
+
+use hashbrown::HashMap;
 use std::rc::{Rc, Weak};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -4900,7 +4902,7 @@ fn install_promise_wait(
         return Ok(());
     }
     let mut observed = Vec::new();
-    let mut unique = std::collections::HashSet::new();
+    let mut unique = hashbrown::HashSet::new();
     for promise in &wait.promises {
         if !unique.insert(*promise) {
             continue;

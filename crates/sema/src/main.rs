@@ -710,6 +710,11 @@ fn install_ctrlc_handler(interpreter: &Interpreter) {
     let handle = interpreter.command_handle();
     let start = std::time::Instant::now();
     let last_sigint_ms = std::sync::atomic::AtomicU64::new(0);
+    // A second interpreter in the same process would hit MultipleHandlers here,
+    // leaving Ctrl-C pinned to the FIRST interpreter's (possibly dead) handle —
+    // single-press would then no-op (double-press still hard-exits). Every
+    // current build_interpreter call site is a mutually exclusive subcommand
+    // path, so the install runs once per process.
     let _ = ctrlc::set_handler(move || {
         let now_ms = start.elapsed().as_millis() as u64;
         let previous_ms = last_sigint_ms.swap(now_ms, std::sync::atomic::Ordering::SeqCst);

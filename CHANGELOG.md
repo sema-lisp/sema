@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+- **SRV-1 (concurrent `http/serve`) — liveness primitive proven (spike only,
+  feature still deferred):** added four focused runtime tests
+  (`crates/sema-vm/src/runtime/tests.rs`, `srv1_spike_*`) that prove, with
+  synthetic fake-externals at the real `Runtime` API level, that the re-arming
+  `WaitKind::External` shape the concurrent accept loop needs is deadlock-free:
+  an idle External keeps the runtime in `DriveState::Idle` (never a false
+  `Quiescent`/deadlock, no busy-spin), two parked tasks coexist and complete
+  independently, a continuation re-arms onto a fresh External indefinitely (the
+  accept-loop ping-pong), and shutdown while parked tears down cleanly with no
+  orphaned wait. This confirms the runtime has no missing primitive for SRV-1.
+  The full `http/serve` rearchitecture (cooperative accept loop + handler task
+  per connection + cooperative `ws/recv`/`ws/send`) is NOT landed — the
+  fail-fast guard and the four `#[ignore]`d acceptance scenarios in
+  `crates/sema/tests/http_serve_concurrent_test.rs` stay as-is (a subtly-broken
+  server is worse than the guard). See `docs/deferred.md` §SRV-1.
 - **Unified runtime — Step G callback re-entry (nested `eval` and multimethod
   dispatch):** the last two gaps where a synchronous evaluator re-entry could
   not host a suspension are fixed. `(eval '(async/await (async ...)))` now

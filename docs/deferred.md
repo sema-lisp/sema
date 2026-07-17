@@ -489,6 +489,49 @@ subtly-broken server (deadlock / dropped response / leaked task) is strictly
 worse than the shipped guard, so the guard stays exactly as-is and the tree
 stays green.
 
+**Update 2026-07-17 — liveness primitive PROVEN; full landing still deferred.**
+A third pass landed the Phase-1 liveness spike (commit `db3f1d74`,
+`crates/sema-vm/src/runtime/tests.rs`, `srv1_spike_*`): four focused runtime
+tests that prove the re-arming External-wait shape the accept loop needs is
+deadlock-free using synthetic (fake-external) machinery, at the real `Runtime`
+API level. They confirm, by construction, the three properties "the first thing
+to prove":
+  1. a task parked on an idle `WaitKind::External` with zero completions makes
+     the runtime report `DriveState::Idle { inbox_wakeup_required: true }` —
+     never `Quiescent`, never a false deadlock — across many drive turns with no
+     busy-spin and no panic (the `active_len() > 0` invariant in `drive()`'s
+     epilogue holds);
+  2. two independently-spawned tasks parked on their own External waits coexist,
+     and completing one settles only its owner, leaving the other parked;
+  3. a continuation whose `resume()` returns another `Suspend(External)` re-arms
+     indefinitely (the accept-loop ping-pong), each iteration parking idle, and
+     shutdown while parked tears down cleanly — cancel hooks fire, `active_len`
+     reaches 0, the shutdown report is clean, no orphaned wait, no panic.
+So the runtime has NO missing primitive: the verdict "EXISTS + NOVEL-but-
+buildable" is confirmed. The full production landing is still deferred (same
+risk-tolerance rationale as before — a subtly-broken server is worse than the
+guard), and one concrete design wrinkle was found that the plan below under-
+specifies:
+
+  * **`RuntimeRequest::Spawn`'s `callable` MUST be a compiled VM closure, not a
+    hand-built native.** `spawn_via_registry` (`state.rs`) runs the callable
+    through `extract_vm_closure` (`vm.rs`), which requires a `VmClosurePayload`
+    (a `Value` produced by the VM's `make_closure`); a `Value::native_fn`
+    wrapper is rejected ("argument must be a function (compiled VM closure)").
+    So the design bullet "the spawned callable must … perform the Rust-side
+    response routing … carry the `respond` `oneshot::Sender` into a native
+    wrapper via `payload`" cannot spawn that native wrapper directly. The
+    workable shape is: spawn a **zero-arg Sema closure** that closes over the
+    user handler `Value`, the request `Value`, and a per-request *responder*
+    native (payload = the `oneshot::Sender` + WS/SSE channel setup), e.g. a
+    prelude factory `(defn __http-make-handler-task (handler req responder)
+    (fn () (responder (handler req))))` — the accept-loop continuation
+    `NativeOutcome::Call`s that factory to mint the zero-arg closure, then
+    `Spawn`s it. The responder native does raw/file routing synchronously and
+    returns `NativeOutcome::Call` into the SSE/WS sub-handler for streaming.
+    This adds a prelude function + a Call→Spawn hop per request beyond the
+    plan's sketch.
+
 **Concrete design derived (for whoever lands this):**
 
 - **Accept loop as a cooperative multi-stage runtime native.** Convert

@@ -684,6 +684,10 @@ DELETED (P5, commit a1862f67); `scripts/check-unified-runtime-legacy.sh
   the same machinery nested `eval` needs. Pre-existing; not apply-specific
   (`apply` correctly keeps multimethod callees on the synchronous path since the
   cooperative Call path does not dispatch multimethods anyway).
+  One ungraceful sub-case remains: `(apply mm …)` where the SELECTED METHOD's
+  body suspends leaks the raw "requires runtime invocation" stub (pre-existing;
+  the graceful error covers only a runtime-only native as apply's direct
+  callee).
 
 - **RESOLVED (2026-07-16, Step F / F2 conversion — commits e6b7004b, 1cabd457).**
   `event_select_yields_to_sibling_in_async_context` is un-ignored and green:

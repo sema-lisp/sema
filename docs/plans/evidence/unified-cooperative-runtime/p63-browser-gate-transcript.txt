@@ -1,0 +1,641 @@
+=== jake pg.build ===
+    | -------------------- associated function in this implementation
+...
+106 |     pub(crate) fn worker_panic() -> Self {
+    |                   ^^^^^^^^^^^^
+
+
+    Finished `release` profile [optimized] target(s) in 0.20s
+[INFO]: ⬇️  Installing wasm-bindgen...
+[INFO]: Optimizing wasm binaries with `wasm-opt`...
+[INFO]: ✨   Done in 6.22s
+[INFO]: 📦   Your wasm pkg is ready to publish at /Users/helge/code/sema/sema/.worktrees/unified-async-runtime/playground/pkg.
+Generated src/examples.js (9 categories, 72 files)
+Bundled dist/app.js + dist/sema-worker.js
+Vendored dist/sema-ui.js from @sema-lang/ui
+Vendored dist/tokens.css from @sema-lang/ui
+
+   ✓ pg.build     7.52s
+
+   Successfully ran 1 task
+   Total time: 7.52s
+
+=== npx playwright test tests/unified-runtime.spec.ts (P6-3 §5 acceptance gate) ===
+(node:29695) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+
+Running 6 tests using 1 worker
+
+(node:29697) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+  ✓  1 tests/unified-runtime.spec.ts:69:5 › http/get resolves via Promise with the body executing once (no replay) (1.2s)
+  ✓  2 tests/unified-runtime.spec.ts:103:5 › async/sleep completes via setTimeout without blocking the page (930ms)
+  ✓  3 tests/unified-runtime.spec.ts:152:5 › two concurrent eval roots stay pending and settle fairly with distinct root ids (547ms)
+  ✓  4 tests/unified-runtime.spec.ts:208:5 › cancelRoot cancels the exact RootId via RuntimeCommandHandle::cancel_root, leaving the other root to complete (538ms)
+  ✓  5 tests/unified-runtime.spec.ts:274:5 › promise-driven driver.rs is free of the legacy replay/Atomics markers (2ms)
+  ✓  6 tests/unified-runtime.spec.ts:284:5 › the shipped default worker protocol never reaches the legacy Atomics/replay code (11ms)
+
+  6 passed (4.2s)
+
+=== npx playwright test (full suite — regression check vs PG-E2E-1 known-red) ===
+(node:29738) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+
+Running 83 tests using 6 workers
+
+(node:29747) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+(node:29749) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+(node:29751) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+(node:29748) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+(node:29752) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+(node:29750) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+  ✓   3 tests/perlin_debug.spec.ts:34:5 › single tree-walker octave-noise call succeeds on a fresh interpreter (1.5s)
+Stopped at line: null
+  ✓   5 tests/unified-runtime.spec.ts:69:5 › http/get resolves via Promise with the body executing once (no replay) (1.6s)
+Status after debug + HTTP: Paused at line 12
+Stopped at line: [1mnull[22m
+  ✓   2 tests/playground.spec.ts:96:7 › example: hello.sema (1.7s)
+  ✘   4 tests/debugger.spec.ts:69:7 › Debugger › debug button starts and stops on first line (1.6s)
+Final status: Ready
+  ✘   1 tests/async-debugger.spec.ts:91:7 › Async debugger (cooperative WASM) › breakpoint inside an async task: stops on the task line, then Continue finishes (1.7s)
+  ✓   7 tests/perlin_debug.spec.ts:53:5 › repeated perlin helper evaluation is stable on the VM path (645ms)
+  -  10 tests/perlin_debug.spec.ts:87:6 › repeated tree-walker octave-noise calls crash the browser renderer
+(node:29800) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+(node:29803) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+  ✓   9 tests/playground.spec.ts:96:7 › example: fibonacci.sema (772ms)
+  ✓   8 tests/unified-runtime.spec.ts:103:5 › async/sleep completes via setTimeout without blocking the page (1.0s)
+  ✓  11 tests/vfs-demo.spec.ts:13:5 › VFS: run file-creating script and check file tree (729ms)
+  ✘  12 tests/debugger.spec.ts:85:7 › Debugger › breakpoint toggles in gutter (822ms)
+  ✓  14 tests/playground.spec.ts:96:7 › example: fizzbuzz.sema (853ms)
+  ✓  15 tests/unified-runtime.spec.ts:152:5 › two concurrent eval roots stay pending and settle fairly with distinct root ids (728ms)
+  ✘  13 tests/async-debugger.spec.ts:114:7 › Async debugger (cooperative WASM) › breakpoint inside the second of two async tasks: pauses at the known line (938ms)
+  ✓  16 tests/vfs-demo.spec.ts:34:5 › VFS: clicking a file shows content in preview pane (802ms)
+(node:29822) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+(node:29827) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+  ✓  18 tests/unified-runtime.spec.ts:208:5 › cancelRoot cancels the exact RootId via RuntimeCommandHandle::cancel_root, leaving the other root to complete (640ms)
+  ✓  22 tests/unified-runtime.spec.ts:274:5 › promise-driven driver.rs is free of the legacy replay/Atomics markers (6ms)
+  ✓  17 tests/playground.spec.ts:96:7 › example: quicksort.sema (686ms)
+  ✓  23 tests/unified-runtime.spec.ts:284:5 › the shipped default worker protocol never reaches the legacy Atomics/replay code (7ms)
+  ✓  19 tests/vfs-demo.spec.ts:54:5 › VFS: backend toggle and files panel are visible (498ms)
+Breakpoint stop at line: null
+  ✘  20 tests/debugger.spec.ts:99:7 › Debugger › breakpoint: stops at correct line (672ms)
+  ✓  24 tests/playground.spec.ts:96:7 › example: closures.sema (674ms)
+multi-bp Continue stops: []
+  ✘  21 tests/async-debugger.spec.ts:144:7 › Async debugger (cooperative WASM) › multiple breakpoints (main + inside a task): Continue hits each in order (791ms)
+(node:29842) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+(node:29845) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+  ✓  25 tests/playground.spec.ts:96:7 › example: map-filter.sema (651ms)
+  ✓  26 tests/debugger.spec.ts:120:7 › Debugger › debugging an async program does not error (scheduler is registered) (641ms)
+  ✓  27 tests/playground.spec.ts:96:7 › example: strings.sema (637ms)
+step-into lines: []
+  ✘  28 tests/async-debugger.spec.ts:179:7 › Async debugger (cooperative WASM) › step into: descends into a (sync) function call (797ms)
+Entry stop at line: null
+  ✘  29 tests/debugger.spec.ts:146:7 › Debugger › no breakpoints: stops on entry (539ms)
+  ✓  30 tests/playground.spec.ts:96:7 › example: macros.sema (598ms)
+(node:29862) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+(node:29863) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+  ✓  31 tests/playground.spec.ts:96:7 › example: maze.sema (719ms)
+step-over lines: []
+  ✘  32 tests/async-debugger.spec.ts:194:7 › Async debugger (cooperative WASM) › step over: does NOT descend into a function call (703ms)
+Step-into lines visited: [ [1mnull[22m ]
+  ✓  33 tests/debugger.spec.ts:163:7 › Debugger › step into: walks line by line (619ms)
+(node:29878) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+Step-over lines visited: [ [1mnull[22m ]
+  ✓  35 tests/debugger.spec.ts:205:7 › Debugger › step over: does not descend into function calls (529ms)
+  ✓  34 tests/playground.spec.ts:96:7 › example: mandelbrot.sema (1.2s)
+  ✘  36 tests/async-debugger.spec.ts:210:7 › Async debugger (cooperative WASM) › step out: leaves the function frame (returns to caller or finishes) (615ms)
+First breakpoint stop: line null
+  ✘  37 tests/debugger.spec.ts:238:7 › Debugger › continue past breakpoint does not re-trigger on same line (525ms)
+(node:29890) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+(node:29891) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+  ✓  38 tests/playground.spec.ts:96:7 › example: perlin-noise.sema (539ms)
+  ✘  39 tests/async-debugger.spec.ts:234:7 › Async debugger (cooperative WASM) › step into advances line-by-line WITHIN an async task body (558ms)
+First loop hit: line null
+Second loop hit: line null
+  ✓  41 tests/playground.spec.ts:96:7 › example: game-of-life.sema (668ms)
+  ✓  40 tests/debugger.spec.ts:263:7 › Debugger › continue past breakpoint in loop re-triggers on next iteration (597ms)
+(node:29905) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+Variables: []
+Variable names: []
+  ✓  42 tests/playground.spec.ts:96:7 › example: ascii-art.sema (639ms)
+  ✓  43 tests/debugger.spec.ts:290:7 › Debugger › variables panel shows locals (636ms)
+  ✘  44 tests/async-debugger.spec.ts:267:7 › Async debugger (cooperative WASM) › variant: channel pipeline with a breakpoint resumes and produces output (605ms)
+  ✓  46 tests/debugger.spec.ts:318:7 › Debugger › debug stop resets UI completely (490ms)
+  ✓  45 tests/playground.spec.ts:96:7 › example: channels.sema (523ms)
+Errors: [
+  [32m'Eval error: division by zero\n'[39m +
+    [32m'  at / (<playground>:2:1)\n'[39m +
+    [32m'  at <lambda> (<playground>:2:1)\n'[39m +
+    [32m'\n'[39m +
+    [32m'  hint: /: guard with (if (zero? d) ... (/ n d))'[39m
+]
+  ✓  47 tests/debugger.spec.ts:347:7 › Debugger › error during debug shows error and resets (477ms)
+  ✓  48 tests/playground.spec.ts:96:7 › example: parallel-tasks.sema (671ms)
+  ✓  50 tests/playground.spec.ts:96:7 › example: timeout.sema (632ms)
+  ✓  51 tests/playground.spec.ts:96:7 › example: worker-pool.sema (487ms)
+  ✓  52 tests/playground.spec.ts:96:7 › example: pipeline.sema (496ms)
+  ✓  53 tests/playground.spec.ts:96:7 › example: fan-in.sema (492ms)
+  ✓  54 tests/playground.spec.ts:96:7 › example: error-recovery.sema (503ms)
+  ✓  55 tests/playground.spec.ts:96:7 › example: dynamic-parameters.sema (498ms)
+  ✓  56 tests/playground.spec.ts:96:7 › example: multiple-values.sema (499ms)
+  ✓  57 tests/playground.spec.ts:96:7 › example: hygienic-macros.sema (509ms)
+  ✓  58 tests/playground.spec.ts:129:5 › whitespace preserved in output (533ms)
+  ✓  59 tests/playground.spec.ts:148:5 › ?example= auto-opens the example by bare filename (495ms)
+  ✘  49 tests/debugger.spec.ts:375:7 › Debugger › infinite loop in the debugger self-terminates via the step limit (5.5s)
+(node:30002) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+  ✓  60 tests/playground.spec.ts:165:5 › ?example= accepts the full id too (493ms)
+Stopped at line: null
+  ✓  62 tests/playground.spec.ts:173:5 › unknown ?example= falls back without breaking the editor (553ms)
+  ✓  61 tests/debugger.spec.ts:393:7 › Debugger › stack trace shows frames (533ms)
+  ✓  63 tests/playground.spec.ts:186:5 › runs code with the bytecode VM (442ms)
+Output values: [ [32m'=> 12'[39m ]
+  ✓  64 tests/debugger.spec.ts:422:7 › Debugger › multiple debug sessions work sequentially (544ms)
+  ✓  65 tests/playground.spec.ts:199:5 › async/sleep ordering works in WASM (virtual clock) (529ms)
+After first step: line null
+Inside function body: line null
+After step-out: line null, status: Ready
+  ✓  66 tests/debugger.spec.ts:443:7 › Debugger › step out returns to caller or finishes (565ms)
+WASM API result: {"status":"stopped","validLines":[1,4],"breakpoints":[1,4],"line":1}
+  ✓  68 tests/debugger.spec.ts:500:7 › Debugger › breakpoint snapping: WASM API returns validLines and snapped breakpoints (367ms)
+Bare literal snap: {"validLines":[3],"breakpoints":[3]}
+  ✓  69 tests/debugger.spec.ts:538:7 › Debugger › breakpoint snapping: bare literal line snaps to nearest expression (359ms)
+Breakpoints after clicking empty line 2: []
+  ✘  70 tests/debugger.spec.ts:568:7 › Debugger › breakpoint snapping: clicking empty line immediately snaps dot to valid line (468ms)
+(node:30076) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+Breakpoints after clicking comment line 2: []
+  ✘  71 tests/debugger.spec.ts:583:7 › Debugger › breakpoint snapping: clicking comment line immediately snaps (490ms)
+(node:30082) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+  ✘  67 tests/playground.spec.ts:215:5 › ?no-worker forces the main-thread fallback (instant virtual-clock sleep) (2.6s)
+(node:30084) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+  ✘  72 tests/debugger.spec.ts:597:7 › Debugger › breakpoint snapping: clicking valid line stays put (499ms)
+(node:30094) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+  ✘  74 tests/debugger.spec.ts:613:7 › Debugger › breakpoint snapping: snapped breakpoint actually fires (495ms)
+  ✓  73 tests/playground.spec.ts:233:5 › worker path: async/sleep paces in real wall-clock while the UI stays responsive (1.3s)
+  ✓  75 tests/playground.spec.ts:281:5 › worker path: upload a file and read it from a script (VFS upload + mirror) (616ms)
+  ✓  76 tests/playground.spec.ts:310:5 › worker path: a file written during eval shows up in the file tree (VFS mirror) (497ms)
+  ✓  77 tests/playground.spec.ts:329:5 › worker path: http/get works via synchronous XHR (no replay) (501ms)
+  ✓  78 tests/playground.spec.ts:347:5 › worker path: output streams live (incrementally), not all at the end (1.4s)
+  ✓  79 tests/playground.spec.ts:379:5 › worker path: Stop cancels a running program and the worker survives (913ms)
+  ✓  80 tests/playground.spec.ts:423:5 › evaluates a recursive fib correctly (710ms)
+  ✓  81 tests/playground.spec.ts:436:5 › hello.sema runs (591ms)
+  ✓  82 tests/playground.spec.ts:448:5 › clear button clears output (859ms)
+  ✘   6 tests/debug_exchange.spec.ts:4:5 › debug exchange-rates via UI with HTTP fetch (1.0m)
+(node:30310) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+Code loaded, lines: [33m41[39m
+
+=== Debug trace with breakpoint at line 18 ===
+  start: status=http_needed line=undefined reason=undefined
+  continue: status=error line=undefined reason=undefined error=No active debug session
+
+=== Step-into trace (first 50 steps) ===
+  start: status=stopped line=5 reason=step
+  step: status=stopped line=7 reason=step
+  step: status=stopped line=8 reason=step
+  step: status=stopped line=10 reason=step
+  step: status=http_needed line=undefined reason=undefined
+  step: status=error line=undefined reason=undefined error=No active debug session
+
+=== Browser logs ===
+[error] Failed to load resource: net::ERR_BLOCKED_BY_RESPONSE.NotSameOriginAfterDefaultedToSameOriginByCoep
+  ✓  83 tests/debug_exchange.spec.ts:68:5 › debug exchange-rates.sema with breakpoint at line 18 (723ms)
+
+
+  1) tests/async-debugger.spec.ts:91:7 › Async debugger (cooperative WASM) › breakpoint inside an async task: stops on the task line, then Continue finishes 
+
+    Error: [2mexpect([22m[31mreceived[39m[2m).[22mtoBe[2m([22m[32mexpected[39m[2m) // Object.is equality[22m
+
+    Expected: [32m2[39m
+    Received: [31mnull[39m
+
+      103 |     // Must pause INSIDE the task, on line 2.
+      104 |     await waitForPaused(page);
+    > 105 |     expect(await getCurrentDebugLine(page)).toBe(2);
+          |                                             ^
+      106 |
+      107 |     // Continue → the task + the await must run to completion.
+      108 |     await page.getByTestId('dbg-continue').click();
+        at /Users/helge/code/sema/sema/.worktrees/unified-async-runtime/playground/tests/async-debugger.spec.ts:105:45
+
+    Error Context: test-results/async-debugger-Async-debug-507c2-line-then-Continue-finishes/error-context.md
+
+  2) tests/async-debugger.spec.ts:114:7 › Async debugger (cooperative WASM) › breakpoint inside the second of two async tasks: pauses at the known line 
+
+    Error: [2mexpect([22m[31mreceived[39m[2m).[22mtoBe[2m([22m[32mexpected[39m[2m) // Object.is equality[22m
+
+    Expected: [32m4[39m
+    Received: [31mnull[39m
+
+      132 |     // The stop must be on line 4 (task b's body), not line 2 (task a) or the
+      133 |     // top-level async/all.
+    > 134 |     expect(await getCurrentDebugLine(page)).toBe(4);
+          |                                             ^
+      135 |
+      136 |     await page.getByTestId('dbg-continue').click();
+      137 |     await waitForIdle(page);
+        at /Users/helge/code/sema/sema/.worktrees/unified-async-runtime/playground/tests/async-debugger.spec.ts:134:45
+
+    Error Context: test-results/async-debugger-Async-debug-12221-ks-pauses-at-the-known-line/error-context.md
+
+  3) tests/async-debugger.spec.ts:144:7 › Async debugger (cooperative WASM) › multiple breakpoints (main + inside a task): Continue hits each in order 
+
+    Error: [2mexpect([22m[31mreceived[39m[2m).[22mtoEqual[2m([22m[32mexpected[39m[2m) // deep equality[22m
+
+    [32m- Expected  - 5[39m
+    [31m+ Received  + 1[39m
+
+    [32m- Array [[39m
+    [32m-   1,[39m
+    [32m-   4,[39m
+    [32m-   7,[39m
+    [32m- ][39m
+    [31m+ Array [][39m
+
+      171 |     console.log('multi-bp Continue stops:', stops);
+      172 |     // Each breakpoint is hit, in source order: main(1) → task body(4) → main(7).
+    > 173 |     expect(stops).toEqual([1, 4, 7]);
+          |                   ^
+      174 |     await waitForIdle(page);
+      175 |     expect(await getOutputLines(page)).toContain('13');
+      176 |     expect((await getErrors(page)).join('\n')).not.toContain('scheduler');
+        at /Users/helge/code/sema/sema/.worktrees/unified-async-runtime/playground/tests/async-debugger.spec.ts:173:19
+
+    Error Context: test-results/async-debugger-Async-debug-3d419-Continue-hits-each-in-order/error-context.md
+
+  4) tests/async-debugger.spec.ts:179:7 › Async debugger (cooperative WASM) › step into: descends into a (sync) function call 
+
+    Error: [2mexpect([22m[31mreceived[39m[2m).[22mtoBeGreaterThanOrEqual[2m([22m[32mexpected[39m[2m)[22m
+
+    Expected: >= [32m2[39m
+    Received:    [31m0[39m
+
+      187 |     // Step-into must DESCEND into add's body (which lives on line 1), so line 1 is
+      188 |     // visited more than once (as the definition AND as the body during the call).
+    > 189 |     expect(lines.filter(l => l === 1).length).toBeGreaterThanOrEqual(2);
+          |                                               ^
+      190 |     await waitForIdle(page);
+      191 |     expect(await getOutputLines(page)).toContain('7');
+      192 |   });
+        at /Users/helge/code/sema/sema/.worktrees/unified-async-runtime/playground/tests/async-debugger.spec.ts:189:47
+
+    Error Context: test-results/async-debugger-Async-debug-ad31a-s-into-a-sync-function-call/error-context.md
+
+  5) tests/async-debugger.spec.ts:194:7 › Async debugger (cooperative WASM) › step over: does NOT descend into a function call 
+
+    Error: [2mexpect([22m[31mreceived[39m[2m).[22mtoBe[2m([22m[32mexpected[39m[2m) // Object.is equality[22m
+
+    Expected: [32m1[39m
+    Received: [31m0[39m
+
+      202 |     // Stays at the top level — line 1 is visited exactly once (the definition);
+      203 |     // the call on line 2 is stepped OVER, never descending back into line 1.
+    > 204 |     expect(lines.filter(l => l === 1).length).toBe(1);
+          |                                               ^
+      205 |     expect(lines[lines.length - 1]).toBe(3);
+      206 |     await waitForIdle(page);
+      207 |     expect(await getOutputLines(page)).toContain('7');
+        at /Users/helge/code/sema/sema/.worktrees/unified-async-runtime/playground/tests/async-debugger.spec.ts:204:47
+
+    Error Context: test-results/async-debugger-Async-debug-205b6-escend-into-a-function-call/error-context.md
+
+  6) tests/async-debugger.spec.ts:210:7 › Async debugger (cooperative WASM) › step out: leaves the function frame (returns to caller or finishes) 
+
+    Error: [2mexpect([22m[31mreceived[39m[2m).[22mtoBe[2m([22m[32mexpected[39m[2m) // Object.is equality[22m
+
+    Expected: [32m2[39m
+    Received: [31mnull[39m
+
+      219 |     await page.getByTestId('debug-btn').click();
+      220 |     await waitForPaused(page);
+    > 221 |     expect(await getCurrentDebugLine(page)).toBe(2);
+          |                                             ^
+      222 |
+      223 |     await clickAndSettle(page, 'dbg-step-out');
+      224 |     const after = await getCurrentDebugLine(page);
+        at /Users/helge/code/sema/sema/.worktrees/unified-async-runtime/playground/tests/async-debugger.spec.ts:221:45
+
+    Error Context: test-results/async-debugger-Async-debug-c3262-urns-to-caller-or-finishes-/error-context.md
+
+  7) tests/async-debugger.spec.ts:234:7 › Async debugger (cooperative WASM) › step into advances line-by-line WITHIN an async task body 
+
+    Error: [2mexpect([22m[31mreceived[39m[2m).[22mtoBe[2m([22m[32mexpected[39m[2m) // Object.is equality[22m
+
+    Expected: [32m2[39m
+    Received: [31mnull[39m
+
+      248 |     await page.getByTestId('debug-btn').click();
+      249 |     await waitForPaused(page);
+    > 250 |     expect(await getCurrentDebugLine(page)).toBe(2);
+          |                                             ^
+      251 |
+      252 |     // Stepping inside the stopped task advances within the task (2 → 3 → 4).
+      253 |     await clickAndSettle(page, 'dbg-step-into');
+        at /Users/helge/code/sema/sema/.worktrees/unified-async-runtime/playground/tests/async-debugger.spec.ts:250:45
+
+    Error Context: test-results/async-debugger-Async-debug-d0dd0-e-WITHIN-an-async-task-body/error-context.md
+
+  8) tests/async-debugger.spec.ts:267:7 › Async debugger (cooperative WASM) › variant: channel pipeline with a breakpoint resumes and produces output 
+
+    Error: [2mexpect([22m[31mreceived[39m[2m).[22mtoBe[2m([22m[32mexpected[39m[2m) // Object.is equality[22m
+
+    Expected: [32m6[39m
+    Received: [31mnull[39m
+
+      290 |     await page.getByTestId('debug-btn').click();
+      291 |     await waitForPaused(page);
+    > 292 |     expect(await getCurrentDebugLine(page)).toBe(6);
+          |                                             ^
+      293 |
+      294 |     // The breakpoint sits inside the worker's recv loop, so it re-triggers each
+      295 |     // iteration — Continue through all of them until the run finishes.
+        at /Users/helge/code/sema/sema/.worktrees/unified-async-runtime/playground/tests/async-debugger.spec.ts:292:45
+
+    Error Context: test-results/async-debugger-Async-debug-912f8-resumes-and-produces-output/error-context.md
+
+  9) tests/debug_exchange.spec.ts:4:5 › debug exchange-rates via UI with HTTP fetch ────────────────
+
+    [31mTest timeout of 60000ms exceeded.[39m
+
+    Error: locator.click: Test timeout of 60000ms exceeded.
+    Call log:
+    [2m  - waiting for getByTestId('dbg-stop')[22m
+    [2m    - locator resolved to <sema-button danger="" size="md" id="dbg-stop" variant="debug" aria-label="Stop" data-testid="dbg-stop" aria-description="Stop (Esc)">⬛</sema-button>[22m
+    [2m  - attempting click action[22m
+    [2m    2 × waiting for element to be visible, enabled and stable[22m
+    [2m      - element is not visible[22m
+    [2m    - retrying click action[22m
+    [2m    - waiting 20ms[22m
+    [2m    2 × waiting for element to be visible, enabled and stable[22m
+    [2m      - element is not visible[22m
+    [2m    - retrying click action[22m
+    [2m      - waiting 100ms[22m
+    [2m    114 × waiting for element to be visible, enabled and stable[22m
+    [2m        - element is not visible[22m
+    [2m      - retrying click action[22m
+    [2m        - waiting 500ms[22m
+
+
+      56 |
+      57 |   // Stop
+    > 58 |   await page.getByTestId('dbg-stop').click();
+         |                                      ^
+      59 |   await page.waitForFunction(
+      60 |     () => document.getElementById('status')?.textContent === 'Ready',
+      61 |     { timeout: 5000 }
+        at /Users/helge/code/sema/sema/.worktrees/unified-async-runtime/playground/tests/debug_exchange.spec.ts:58:38
+
+    Error Context: test-results/debug_exchange-debug-exchange-rates-via-UI-with-HTTP-fetch/error-context.md
+
+  10) tests/debugger.spec.ts:69:7 › Debugger › debug button starts and stops on first line ─────────
+
+    Error: [2mexpect([22m[31mreceived[39m[2m).[22mtoBe[2m([22m[32mexpected[39m[2m) // Object.is equality[22m
+
+    Expected: [32m1[39m
+    Received: [31mnull[39m
+
+      76 |     const line = await getCurrentDebugLine(page);
+      77 |     console.log(`Stopped at line: ${line}`);
+    > 78 |     expect(line).toBe(1);
+         |                  ^
+      79 |     
+      80 |     // Stop debugging
+      81 |     await page.getByTestId('dbg-stop').click();
+        at /Users/helge/code/sema/sema/.worktrees/unified-async-runtime/playground/tests/debugger.spec.ts:78:18
+
+    Error Context: test-results/debugger-Debugger-debug-bu-13915-rts-and-stops-on-first-line/error-context.md
+
+  11) tests/debugger.spec.ts:85:7 › Debugger › breakpoint toggles in gutter ────────────────────────
+
+    Error: [2mexpect([22m[31mreceived[39m[2m).[22mtoContain[2m([22m[32mexpected[39m[2m) // indexOf[22m
+
+    Expected value: [32m2[39m
+    Received array: [31m[][39m
+
+      89 |     await toggleBreakpoint(page, 2);
+      90 |     let bps = await getBreakpointLines(page);
+    > 91 |     expect(bps).toContain(2);
+         |                 ^
+      92 |     
+      93 |     // Toggle off
+      94 |     await toggleBreakpoint(page, 2);
+        at /Users/helge/code/sema/sema/.worktrees/unified-async-runtime/playground/tests/debugger.spec.ts:91:17
+
+    Error Context: test-results/debugger-Debugger-breakpoint-toggles-in-gutter/error-context.md
+
+  12) tests/debugger.spec.ts:99:7 › Debugger › breakpoint: stops at correct line ───────────────────
+
+    Error: [2mexpect([22m[31mreceived[39m[2m).[22mtoBe[2m([22m[32mexpected[39m[2m) // Object.is equality[22m
+
+    Expected: [32m3[39m
+    Received: [31mnull[39m
+
+      111 |     const bpLine = await getCurrentDebugLine(page);
+      112 |     console.log(`Breakpoint stop at line: ${bpLine}`);
+    > 113 |     expect(bpLine).toBe(3);
+          |                    ^
+      114 |
+      115 |     // Continue to end
+      116 |     await page.getByTestId('dbg-continue').click();
+        at /Users/helge/code/sema/sema/.worktrees/unified-async-runtime/playground/tests/debugger.spec.ts:113:20
+
+    Error Context: test-results/debugger-Debugger-breakpoint-stops-at-correct-line/error-context.md
+
+  13) tests/debugger.spec.ts:146:7 › Debugger › no breakpoints: stops on entry ─────────────────────
+
+    Error: [2mexpect([22m[31mreceived[39m[2m).[22mtoBe[2m([22m[32mexpected[39m[2m) // Object.is equality[22m
+
+    Expected: [32m1[39m
+    Received: [31mnull[39m
+
+      154 |     const entryLine = await getCurrentDebugLine(page);
+      155 |     console.log(`Entry stop at line: ${entryLine}`);
+    > 156 |     expect(entryLine).toBe(1);
+          |                       ^
+      157 |
+      158 |     // Continue to end
+      159 |     await page.getByTestId('dbg-continue').click();
+        at /Users/helge/code/sema/sema/.worktrees/unified-async-runtime/playground/tests/debugger.spec.ts:156:23
+
+    Error Context: test-results/debugger-Debugger-no-breakpoints-stops-on-entry/error-context.md
+
+  14) tests/debugger.spec.ts:238:7 › Debugger › continue past breakpoint does not re-trigger on same line 
+
+    Error: [2mexpect([22m[31mreceived[39m[2m).[22mtoBe[2m([22m[32mexpected[39m[2m) // Object.is equality[22m
+
+    Expected: [32m2[39m
+    Received: [31mnull[39m
+
+      250 |     const firstStop = await getCurrentDebugLine(page);
+      251 |     console.log(`First breakpoint stop: line ${firstStop}`);
+    > 252 |     expect(firstStop).toBe(2);
+          |                       ^
+      253 |     
+      254 |     // Continue past the breakpoint - should NOT stop on line 2 again
+      255 |     await page.getByTestId('dbg-continue').click();
+        at /Users/helge/code/sema/sema/.worktrees/unified-async-runtime/playground/tests/debugger.spec.ts:252:23
+
+    Error Context: test-results/debugger-Debugger-continue-d6660-not-re-trigger-on-same-line/error-context.md
+
+  15) tests/debugger.spec.ts:375:7 › Debugger › infinite loop in the debugger self-terminates via the step limit 
+
+    Error: [2mexpect([22m[31mlocator[39m[2m).[22mtoContainText[2m([22m[32mexpected[39m[2m)[22m failed
+
+    Locator: getByTestId('output')
+    Expected pattern: [32m/step limit/[39m
+    Received string:  [31m"Eval error: unsupported runtime VM stop: Yielded"[39m
+    Timeout: 5000ms
+
+    Call log:
+    [2m  - Expect "toContainText" with timeout 5000ms[22m
+    [2m  - waiting for getByTestId('output')[22m
+    [2m    14 × locator resolved to <div id="output" data-testid="output">…</div>[22m
+    [2m       - unexpected value "Eval error: unsupported runtime VM stop: Yielded"[22m
+
+
+      388 |     const status = await getStatus(page);
+      389 |     expect(status).toBe('Ready');
+    > 390 |     await expect(page.getByTestId('output')).toContainText(/step limit/);
+          |                                              ^
+      391 |   });
+      392 |
+      393 |   test('stack trace shows frames', async ({ page }) => {
+        at /Users/helge/code/sema/sema/.worktrees/unified-async-runtime/playground/tests/debugger.spec.ts:390:46
+
+    Error Context: test-results/debugger-Debugger-infinite-41f73-rminates-via-the-step-limit/error-context.md
+
+  16) tests/debugger.spec.ts:568:7 › Debugger › breakpoint snapping: clicking empty line immediately snaps dot to valid line 
+
+    Error: [2mexpect([22m[31mreceived[39m[2m).[22mtoBe[2m([22m[32mexpected[39m[2m) // Object.is equality[22m
+
+    Expected: [32mtrue[39m
+    Received: [31mfalse[39m
+
+      578 |     // Should NOT show on line 2, should have snapped
+      579 |     expect(bps).not.toContain(2);
+    > 580 |     expect(bps.some(l => l === 1 || l === 3)).toBe(true);
+          |                                               ^
+      581 |   });
+      582 |
+      583 |   test('breakpoint snapping: clicking comment line immediately snaps', async ({ page }) => {
+        at /Users/helge/code/sema/sema/.worktrees/unified-async-runtime/playground/tests/debugger.spec.ts:580:47
+
+    Error Context: test-results/debugger-Debugger-breakpoi-7aba0-ely-snaps-dot-to-valid-line/error-context.md
+
+  17) tests/debugger.spec.ts:583:7 › Debugger › breakpoint snapping: clicking comment line immediately snaps 
+
+    Error: [2mexpect([22m[31mreceived[39m[2m).[22mtoBe[2m([22m[32mexpected[39m[2m) // Object.is equality[22m
+
+    Expected: [32mtrue[39m
+    Received: [31mfalse[39m
+
+      592 |
+      593 |     expect(bps).not.toContain(2);
+    > 594 |     expect(bps.some(l => l === 1 || l === 3)).toBe(true);
+          |                                               ^
+      595 |   });
+      596 |
+      597 |   test('breakpoint snapping: clicking valid line stays put', async ({ page }) => {
+        at /Users/helge/code/sema/sema/.worktrees/unified-async-runtime/playground/tests/debugger.spec.ts:594:47
+
+    Error Context: test-results/debugger-Debugger-breakpoi-09844-ment-line-immediately-snaps/error-context.md
+
+  18) tests/debugger.spec.ts:597:7 › Debugger › breakpoint snapping: clicking valid line stays put ─
+
+    Error: [2mexpect([22m[31mreceived[39m[2m).[22mtoContain[2m([22m[32mexpected[39m[2m) // indexOf[22m
+
+    Expected value: [32m1[39m
+    Received array: [31m[][39m
+
+      603 |
+      604 |     const bps = await getBreakpointLines(page);
+    > 605 |     expect(bps).toContain(1);
+          |                 ^
+      606 |
+      607 |     // Toggle off
+      608 |     await toggleBreakpoint(page, 1);
+        at /Users/helge/code/sema/sema/.worktrees/unified-async-runtime/playground/tests/debugger.spec.ts:605:17
+
+    Error Context: test-results/debugger-Debugger-breakpoi-56a7e-icking-valid-line-stays-put/error-context.md
+
+  19) tests/debugger.spec.ts:613:7 › Debugger › breakpoint snapping: snapped breakpoint actually fires 
+
+    Error: [2mexpect([22m[31mreceived[39m[2m).[22mtoBe[2m([22m[32mexpected[39m[2m) // Object.is equality[22m
+
+    Expected: [32m1[39m
+    Received: [31mnull[39m
+
+      624 |     // Entry stop at line 1
+      625 |     const entryLine = await getCurrentDebugLine(page);
+    > 626 |     expect(entryLine).toBe(1);
+          |                       ^
+      627 |
+      628 |     // Continue — should hit the snapped breakpoint
+      629 |     await page.getByTestId('dbg-continue').click();
+        at /Users/helge/code/sema/sema/.worktrees/unified-async-runtime/playground/tests/debugger.spec.ts:626:23
+
+    Error Context: test-results/debugger-Debugger-breakpoi-3ff70-d-breakpoint-actually-fires/error-context.md
+
+  20) tests/playground.spec.ts:215:5 › ?no-worker forces the main-thread fallback (instant virtual-clock sleep) 
+
+    Error: [2mexpect([22m[31mreceived[39m[2m).[22mtoBeLessThan[2m([22m[32mexpected[39m[2m)[22m
+
+    Expected: < [32m1000[39m
+    Received:   [31m2051[39m
+
+      226 |   const elapsed = Date.now() - t0;
+      227 |
+    > 228 |   expect(elapsed).toBeLessThan(1000); // instant on the main-thread path (not real-slept)
+          |                   ^
+      229 |   const value = await page.$eval('#output .output-value', (el) => el.textContent || '');
+      230 |   expect(value).toContain('42');
+      231 | });
+        at /Users/helge/code/sema/sema/.worktrees/unified-async-runtime/playground/tests/playground.spec.ts:228:19
+
+    Error Context: test-results/playground--no-worker-forc-4ac25-nstant-virtual-clock-sleep-/error-context.md
+
+  20 failed
+    tests/async-debugger.spec.ts:91:7 › Async debugger (cooperative WASM) › breakpoint inside an async task: stops on the task line, then Continue finishes 
+    tests/async-debugger.spec.ts:114:7 › Async debugger (cooperative WASM) › breakpoint inside the second of two async tasks: pauses at the known line 
+    tests/async-debugger.spec.ts:144:7 › Async debugger (cooperative WASM) › multiple breakpoints (main + inside a task): Continue hits each in order 
+    tests/async-debugger.spec.ts:179:7 › Async debugger (cooperative WASM) › step into: descends into a (sync) function call 
+    tests/async-debugger.spec.ts:194:7 › Async debugger (cooperative WASM) › step over: does NOT descend into a function call 
+    tests/async-debugger.spec.ts:210:7 › Async debugger (cooperative WASM) › step out: leaves the function frame (returns to caller or finishes) 
+    tests/async-debugger.spec.ts:234:7 › Async debugger (cooperative WASM) › step into advances line-by-line WITHIN an async task body 
+    tests/async-debugger.spec.ts:267:7 › Async debugger (cooperative WASM) › variant: channel pipeline with a breakpoint resumes and produces output 
+    tests/debug_exchange.spec.ts:4:5 › debug exchange-rates via UI with HTTP fetch ─────────────────
+    tests/debugger.spec.ts:69:7 › Debugger › debug button starts and stops on first line ───────────
+    tests/debugger.spec.ts:85:7 › Debugger › breakpoint toggles in gutter ──────────────────────────
+    tests/debugger.spec.ts:99:7 › Debugger › breakpoint: stops at correct line ─────────────────────
+    tests/debugger.spec.ts:146:7 › Debugger › no breakpoints: stops on entry ───────────────────────
+    tests/debugger.spec.ts:238:7 › Debugger › continue past breakpoint does not re-trigger on same line 
+    tests/debugger.spec.ts:375:7 › Debugger › infinite loop in the debugger self-terminates via the step limit 
+    tests/debugger.spec.ts:568:7 › Debugger › breakpoint snapping: clicking empty line immediately snaps dot to valid line 
+    tests/debugger.spec.ts:583:7 › Debugger › breakpoint snapping: clicking comment line immediately snaps 
+    tests/debugger.spec.ts:597:7 › Debugger › breakpoint snapping: clicking valid line stays put ───
+    tests/debugger.spec.ts:613:7 › Debugger › breakpoint snapping: snapped breakpoint actually fires 
+    tests/playground.spec.ts:215:5 › ?no-worker forces the main-thread fallback (instant virtual-clock sleep) 
+  1 skipped
+  62 passed (1.0m)

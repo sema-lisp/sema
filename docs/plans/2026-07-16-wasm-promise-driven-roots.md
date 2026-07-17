@@ -171,9 +171,28 @@ root ids; Stop cancels one exact root while the other completes; the source scan
 finds no `HTTP_AWAIT_MARKER` / `MAX_REPLAYS` / `installAtomicsSleep` /
 `Atomics.wait`.
 
-The scaffolded harness for this gate is `playground/tests/unified-runtime.spec.ts`
-(currently `test.fixme` — it documents and pins the assertions but does not run
-until the Promise API lands).
+**Step 4 scoping note (source-scan clause):** the old replay/Atomics machinery
+is deliberately NOT deleted until step 5 — it still exists in
+`crates/sema-wasm/src/lib.rs` (the three replay loops, `HTTP_AWAIT_MARKER`,
+`MAX_REPLAYS`, `installAtomicsSleep`) and in `playground/src/sema-worker.js`'s
+dormant `legacySab` fallback branch. A literal whole-repo grep for those
+markers would therefore fail today by design, not by defect. Step 4 scopes the
+source-scan clause to what it can honestly assert without step 5's deletion:
+the NEW promise-driven path's own code (`crates/sema-wasm/src/driver.rs`)
+contains zero occurrences of any of the four markers, and in the shipped
+`dist/sema-worker.js`/`dist/app.js`, `HTTP_AWAIT_MARKER`/`MAX_REPLAYS` never
+appear at all, no literal `Atomics.wait(` call exists, and the one legacy call
+that does still exist (`installAtomicsSleep(`) is gated behind
+`if (msg.legacySab)` — a flag nothing in the shipped bundle ever sets. The
+full-repo "these strings are gone entirely" scan is step 5's job, once the
+replay/Atomics machinery is actually deleted. See the file-level comment in
+`playground/tests/unified-runtime.spec.ts` for the same scoping, kept in sync.
+
+The harness for this gate is `playground/tests/unified-runtime.spec.ts` — as of
+step 4 (`.superpowers/sdd/p63-step4-report.md`) all six tests are un-`fixme`d
+and green against a real `wasm-pack`-built bundle in headless Chromium; a
+passing transcript is committed at
+`docs/plans/evidence/unified-cooperative-runtime/p63-browser-gate-transcript.txt`.
 
 ## 6. Why this session hard-fell-back (what blocked verification)
 

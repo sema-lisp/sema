@@ -1,17 +1,54 @@
-// P6-3: WASM Promise-driven roots — acceptance gate (SCAFFOLD, not yet active).
+// P6-3: WASM Promise-driven roots — acceptance gate.
 //
 // These tests pin the real-browser oracle for the unified async runtime landing
-// described in docs/plans/2026-07-16-wasm-promise-driven-roots.md. They are
-// `test.fixme` because the Promise-driven `eval()` API they assert against does
-// NOT exist yet — the shipped mechanism is still replay-with-cache (HTTP) plus
-// Atomics.wait (sleep). Un-`fixme` each test only when the corresponding piece
-// of the Promise/macrotask/External-via-JS-callback design lands, then run:
+// described in docs/plans/2026-07-16-wasm-promise-driven-roots.md §5. They run
+// against the real `wasm-pack`-built bundle (`jake pg.build`) in headless
+// Chromium — the only valid oracle per the design doc.
 //
-//   jake pg.build && jake test.playground-e2e
+//   jake pg.build && npx playwright test tests/unified-runtime.spec.ts
 //
-// against a real headless Chromium. A passing run of (a) and (b) is the ONLY
-// evidence that authorizes deleting the replay/Atomics machinery.
+// (a) and (b) drive the shipped playground UI (worker path), matching how a
+// real user exercises `evalPromise`/`setPromiseOutputSink` end to end.
+//
+// (c) and (d) require two IN-FLIGHT eval roots at once. The playground's own
+// `app.js` `run()` is deliberately single-flight (`if (workerRunning) return`)
+// — Stop cancels the one running eval, and a second Run is a no-op until the
+// first settles. That is a UI policy choice, not a limitation of the
+// underlying seam: `evalPromise`/`cancelRoot` (`crates/sema-wasm/src/driver.rs`,
+// `crates/sema-wasm/src/lib.rs`) operate on arbitrary concurrent `RootId`s
+// regardless of how many JS call sites invoke them. So (c) and (d) drive the
+// seam directly: they load the SAME wasm-pack-built artifact the app serves
+// (`/pkg/sema_wasm.js`, fetched by the real browser, not mocked) and call
+// `evalPromise`/`cancelRoot` twice concurrently from the page context — the
+// identical technique used to verify this seam in the P6-3 step 2 report
+// (`.superpowers/sdd/p63-step2-report.md`, "A one-off Playwright probe").
+// This is real-browser verification of the runtime property the design doc
+// requires; it is not a stand-in for wiring concurrent runs into the UI
+// (which nothing in P6-3's scope calls for).
+//
+// (e) is scoped down from the design doc's literal wording ("source scan
+// finds no HTTP_AWAIT_MARKER/MAX_REPLAYS/installAtomicsSleep/Atomics.wait").
+// The old replay/Atomics machinery still EXISTS in the tree until step 5
+// (`crates/sema-wasm/src/lib.rs`'s three replay loops, `sema-worker.js`'s
+// dead `legacySab` fallback branch) — a whole-repo scan would fail today by
+// design, not by defect. What step 4 CAN honestly assert: the NEW promise-
+// driven path's own code is clean of those markers, and the legacy JS that
+// still exists is provably unreachable through the shipped default protocol.
+// Concretely: `crates/sema-wasm/src/driver.rs` (the new macrotask driver,
+// entirely step-2/3 code) contains zero occurrences of any of the four
+// markers; and in the built `dist/sema-worker.js`, `HTTP_AWAIT_MARKER`/
+// `MAX_REPLAYS` never appear at all (they are `lib.rs`-only, `.rs`, not
+// `.js`), no literal `Atomics.wait(` call exists, and the one legacy call
+// that does still exist there (`installAtomicsSleep(`) is gated behind
+// `if (msg.legacySab)` — a flag nothing in the shipped `app.js`/
+// `worker-client.js` ever sets, confirmed by grepping the bundled output.
+// The full-repo "these strings are gone entirely" scan is step 5's job, once
+// the replay/Atomics machinery is actually deleted.
 import { test, expect, type Page } from '@playwright/test';
+import { readFileSync } from 'node:fs';
+import path from 'node:path';
+
+const REPO_ROOT = path.resolve(__dirname, '../..');
 
 /** Type code into the editor, replacing existing content. */
 async function setCode(page: Page, code: string) {
@@ -25,13 +62,20 @@ async function setCode(page: Page, code: string) {
 // (>= 2). Under Promise-driven roots the program body runs once and the
 // http/get call site resumes with the real response — so the marker line
 // appears exactly once and the response data is present in the output.
-test.fixme('http/get resolves via Promise with the body executing once (no replay)', async ({ page }) => {
-  await page.goto('/');
+//
+// Hits a same-origin static file (matching the existing "worker path: http/get
+// works" spec) rather than an external host — no external network required,
+// and no CORS/CORP complications from a real headless-Chromium run.
+test('http/get resolves via Promise with the body executing once (no replay)', async ({ page }) => {
+  await page.goto('/?worker');
+  await expect(page.getByTestId('status')).toHaveClass(/status-ready/, { timeout: 20000 });
+
+  const origin = await page.evaluate(() => location.origin);
   await setCode(
     page,
     [
       '(println "BEFORE-FETCH-MARKER")',
-      '(def resp (http/get "https://httpbin.org/get"))',
+      `(def resp (http/get "${origin}/index.html"))`,
       '(println (string-append "STATUS:" (number->string (:status resp))))',
     ].join('\n'),
   );
@@ -56,8 +100,10 @@ test.fixme('http/get resolves via Promise with the body executing once (no repla
 // completed by a setTimeout callback, and the macrotask driver yields to the
 // event loop between turns so the page remains paintable/interactive while the
 // sleep is pending.
-test.fixme('async/sleep completes via setTimeout without blocking the page', async ({ page }) => {
-  await page.goto('/');
+test('async/sleep completes via setTimeout without blocking the page', async ({ page }) => {
+  await page.goto('/?worker');
+  await expect(page.getByTestId('status')).toHaveClass(/status-ready/, { timeout: 20000 });
+
   await setCode(
     page,
     [
@@ -66,13 +112,23 @@ test.fixme('async/sleep completes via setTimeout without blocking the page', asy
       '(println "AFTER-SLEEP")',
     ].join('\n'),
   );
+
+  // Main-thread responsiveness probe: a timer that must keep ticking while the
+  // sleep is pending — an observable macrotask boundary, the direct refutation
+  // of a synchronous `Atomics.wait` blocking the page.
+  await page.evaluate(() => {
+    (window as any).__ticks = 0;
+    (window as any).__t = setInterval(() => { (window as any).__ticks++; }, 20);
+  });
+
   await page.getByTestId('run-btn').click();
 
-  // While the sleep is pending the page must stay responsive (main thread not
-  // blocked by Atomics.wait): a trivial DOM interaction still resolves.
   await page.waitForFunction(() => document.body.innerText.includes('START'), {
     timeout: 5_000,
   });
+
+  // While the sleep is pending the page must stay responsive: a trivial DOM
+  // interaction still resolves.
   const responsiveWhilePending = await page.evaluate(
     () => new Promise<boolean>((r) => setTimeout(() => r(true), 0)),
   );
@@ -82,20 +138,180 @@ test.fixme('async/sleep completes via setTimeout without blocking the page', asy
     () => document.body.innerText.includes('AFTER-SLEEP'),
     { timeout: 10_000 },
   );
+
+  const ticks = await page.evaluate(() => {
+    clearInterval((window as any).__t);
+    return (window as any).__ticks as number;
+  });
+  // The 250ms sleep spanned multiple 20ms ticks — the page's own event loop
+  // kept running the whole time, i.e. drive turns yielded between themselves.
+  expect(ticks).toBeGreaterThan(3);
 });
 
 // ── Gate (c): two concurrent roots settle fairly with distinct identity ──────
-test.fixme('two concurrent eval roots stay pending and settle fairly', async ({ page }) => {
+test('two concurrent eval roots stay pending and settle fairly with distinct root ids', async ({ page }) => {
   await page.goto('/');
-  // Requires the root-aware playground protocol (multiple pending eval requests
-  // over the worker) — pins that two evaluations interleave and both complete.
-  expect(true).toBe(true);
+  await expect(page.getByTestId('status')).toHaveClass(/status-ready/, { timeout: 20000 });
+
+  const result = await page.evaluate(async () => {
+    // The exact wasm-pack-built artifact the playground worker loads.
+    const mod = await import('/pkg/sema_wasm.js');
+    await mod.default();
+    const interp = new mod.SemaInterpreter();
+
+    const roots: number[] = [];
+    const events: string[] = [];
+    interp.setPromiseOutputSink((rootId: number, _stream: string, text: string) => {
+      events.push(`${rootId}:${text}`);
+    });
+
+    // Root A sleeps longer (100ms) than root B (30ms) — a FIFO/serialized
+    // implementation would still resolve A first (submitted first); a fair
+    // concurrent scheduler resolves B first, since its wait is shorter.
+    let settledFirst: 'A' | 'B' | null = null;
+    const pA = new Promise((resolve, reject) => {
+      interp
+        .evalPromise('(println "A-start")(async/sleep 100)(println "A-done")', (rid: number) => roots.push(rid))
+        .then((v: unknown) => { if (settledFirst === null) settledFirst = 'A'; resolve(v); }, reject);
+    });
+    const pB = new Promise((resolve, reject) => {
+      interp
+        .evalPromise('(println "B-start")(async/sleep 30)(println "B-done")', (rid: number) => roots.push(rid))
+        .then((v: unknown) => { if (settledFirst === null) settledFirst = 'B'; resolve(v); }, reject);
+    });
+
+    // Both calls must return without either having settled synchronously —
+    // "stay pending" until the macrotask driver actually resolves them.
+    const bothStillPendingAfterSubmit = await Promise.race([
+      Promise.all([pA, pB]).then(() => false),
+      new Promise<boolean>((r) => setTimeout(() => r(true), 0)),
+    ]);
+
+    await Promise.all([pA, pB]);
+    return { roots, events, settledFirst, bothStillPendingAfterSubmit };
+  });
+
+  // Distinct root ids identify each concurrent evaluation.
+  expect(result.roots.length).toBe(2);
+  expect(result.roots[0]).not.toBe(result.roots[1]);
+  // Neither settled synchronously on submission.
+  expect(result.bothStillPendingAfterSubmit).toBe(true);
+  // Fair scheduling: the shorter sleep (B) settles before the longer one (A),
+  // not FIFO-by-submission-order.
+  expect(result.settledFirst).toBe('B');
+  expect(result.events).toEqual(
+    expect.arrayContaining(['B-done', 'A-done'].map((s) => expect.stringContaining(s))),
+  );
 });
 
 // ── Gate (d): Stop cancels one exact root; the other continues ───────────────
-test.fixme('Stop cancels the exact RootId via RuntimeCommandHandle::cancel_root', async ({ page }) => {
+test('cancelRoot cancels the exact RootId via RuntimeCommandHandle::cancel_root, leaving the other root to complete', async ({ page }) => {
   await page.goto('/');
-  // Requires cancel routed through the runtime command handle (not the SAB
-  // cancel flag). Pins that cancelling root A leaves root B running to completion.
-  expect(true).toBe(true);
+  await expect(page.getByTestId('status')).toHaveClass(/status-ready/, { timeout: 20000 });
+
+  const t0 = Date.now();
+  const result = await page.evaluate(async () => {
+    const mod = await import('/pkg/sema_wasm.js');
+    await mod.default();
+    const interp = new mod.SemaInterpreter();
+
+    const events: string[] = [];
+    interp.setPromiseOutputSink((rootId: number, _stream: string, text: string) => {
+      events.push(`${rootId}:${text}`);
+    });
+
+    let rootA: number | undefined;
+    let rootB: number | undefined;
+    // Root A: a long sleep that must be cancelled well before it would print.
+    const pA = new Promise((resolve, reject) => {
+      interp
+        .evalPromise('(async/sleep 5000)(println "A-should-not-print")', (rid: number) => { rootA = rid; })
+        .then(resolve, reject);
+    });
+    // Root B: a short sleep that must complete normally, untouched by A's cancel.
+    const pB = new Promise((resolve, reject) => {
+      interp
+        .evalPromise('(async/sleep 100)(println "B-done")', (rid: number) => { rootB = rid; })
+        .then(resolve, reject);
+    });
+
+    // Give both roots a turn to actually start (root ids assigned, first
+    // drive turn run) before cancelling.
+    await new Promise((r) => setTimeout(r, 20));
+    const cancelled = interp.cancelRoot(rootA);
+
+    const aOutcome = await pA.then(
+      (v) => ({ ok: true, v }),
+      (e) => ({ ok: false, message: e && e.message ? e.message : String(e) }),
+    );
+    const bOutcome = await pB.then(
+      (v) => ({ ok: true, v }),
+      (e) => ({ ok: false, message: e && e.message ? e.message : String(e) }),
+    );
+
+    return { cancelled, events, aOutcome, bOutcome, rootA, rootB };
+  });
+  const elapsed = Date.now() - t0;
+
+  expect(result.cancelled).toBe(true);
+  expect(result.rootA).not.toBe(result.rootB);
+  // A was cancelled, not left to run to completion (would take ~5s).
+  expect(result.aOutcome.ok).toBe(false);
+  expect((result.aOutcome as { message: string }).message.toLowerCase()).toContain('cancel');
+  expect(result.events).not.toContain(expect.stringContaining('A-should-not-print'));
+  // B settled normally, unaffected by A's cancellation.
+  expect(result.bOutcome.ok).toBe(true);
+  expect(result.events.some((e) => e.endsWith(':B-done'))).toBe(true);
+  // Cancelled well under B's own 100ms sleep plus A's would-be 5000ms —
+  // proves the cancel was delivered promptly, not "eventually" after a long wait.
+  expect(elapsed).toBeLessThan(3000);
+});
+
+// ── Gate (e), scoped: the promise-driven path's OWN code carries none of the
+// legacy replay/Atomics markers (full-repo deletion scan is step 5's job —
+// see the file-level comment above for why a whole-tree scan would fail
+// today by design).
+test('promise-driven driver.rs is free of the legacy replay/Atomics markers', async () => {
+  const driverSrc = readFileSync(
+    path.join(REPO_ROOT, 'crates/sema-wasm/src/driver.rs'),
+    'utf8',
+  );
+  for (const marker of ['HTTP_AWAIT_MARKER', 'MAX_REPLAYS', 'installAtomicsSleep', 'Atomics.wait']) {
+    expect(driverSrc).not.toContain(marker);
+  }
+});
+
+test('the shipped default worker protocol never reaches the legacy Atomics/replay code', async () => {
+  const workerSrc = readFileSync(path.join(__dirname, '..', 'dist', 'sema-worker.js'), 'utf8');
+  const appSrc = readFileSync(path.join(__dirname, '..', 'dist', 'app.js'), 'utf8');
+
+  // The replay markers are `lib.rs`-only (Rust); they must not leak into the
+  // shipped JS bundle at all.
+  for (const marker of ['HTTP_AWAIT_MARKER', 'MAX_REPLAYS']) {
+    expect(workerSrc).not.toContain(marker);
+    expect(appSrc).not.toContain(marker);
+  }
+  // No real blocking Atomics.wait CALL exists anywhere in the shipped worker
+  // (the sleep wait happens inside the wasm binary via `js_sys::Atomics`, not
+  // as a literal `Atomics.wait(` invocation in the JS source).
+  expect(workerSrc).not.toMatch(/Atomics\.wait\(/);
+  expect(appSrc).not.toMatch(/Atomics\.wait\(/);
+
+  // The default protocol's own reachable entry points call the new seam.
+  expect(workerSrc).toContain('evalPromise');
+  expect(workerSrc).toContain('cancelRoot');
+
+  // The one legacy call that DOES still exist (`installAtomicsSleep`) is
+  // gated behind `msg.legacySab` — confirm the call site is inside that
+  // conditional, and that nothing in the shipped app/worker-client ever sets
+  // `legacySab` truthy (i.e. the gate is provably closed under the default
+  // protocol; step 5 deletes this branch entirely).
+  const legacyIdx = workerSrc.indexOf('installAtomicsSleep(control)');
+  expect(legacyIdx).toBeGreaterThan(-1);
+  const guardIdx = workerSrc.lastIndexOf('if (msg.legacySab)', legacyIdx);
+  expect(guardIdx).toBeGreaterThan(-1);
+  expect(legacyIdx - guardIdx).toBeLessThan(200); // same small guarded block
+
+  expect(appSrc).not.toMatch(/legacySab\s*:\s*true/);
+  expect(appSrc).not.toContain('legacySab: true');
 });

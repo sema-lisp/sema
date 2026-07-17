@@ -229,16 +229,11 @@ fn spawn_and_park(n: usize) -> Interpreter {
     // benchmark that times a single subsequent `drive` call measures a
     // genuinely idle/quiescent turn rather than this eval's own teardown.
     let drain_budget = DriveBudget::host_default();
-    loop {
-        match interp
-            .runtime()
-            .drive(&drain_budget)
-            .expect("draining settled-root bookkeeping cannot fault")
-        {
-            DriveState::Progress { .. } => continue,
-            _ => break,
-        }
-    }
+    while let DriveState::Progress { .. } = interp
+        .runtime()
+        .drive(&drain_budget)
+        .expect("draining settled-root bookkeeping cannot fault")
+    {}
     interp
 }
 

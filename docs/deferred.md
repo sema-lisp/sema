@@ -818,9 +818,13 @@ decoded `Value` must carry a `Trace` impl (GC invariant I2); macrotask fairness 
 roots; cancel latency for a root suspended in an External wait; the worker-protocol rewrite
 dropping the SAB; `MessageChannel` vs `setTimeout(0)` throttling in background tabs.
 
-## PERF-RESIDUAL-1 — accepted post-flip runtime overhead on three benchmark shapes
+## PERF-RESIDUAL-1 — post-flip runtime overhead (MOSTLY RESOLVED 2026-07-17, Slice 0c; one row remains)
 
-**Recorded 2026-07-17 (Slice 0b close-out). Status update, same day: acceptance rescinded — owner redirected the program to a deeper optimization pass (Slice 0c) before P6-1: samply/sample profiling with full symbols, then divan/criterion micro-benchmarks instrumenting the cooperative scheduler, then targeted squeezes. This entry becomes the work list for that pass.** The fast-path
+**Recorded 2026-07-17 (Slice 0b close-out). Status update, same day: acceptance rescinded — owner redirected the program to a deeper optimization pass (Slice 0c) before P6-1: samply/sample profiling with full symbols, then divan/criterion micro-benchmarks instrumenting the cooperative scheduler, then targeted squeezes. This entry became the 0c work list; outcome: sleep-storm/deep-await/cons-1m
+RESOLVED (0.88×/1.11×/1.03×), spawn-storm/primes faster-than-baseline.
+The single remaining row is **channel-pingpong 1.97×** — follow-up: direct
+task-to-task rendezvous handoff (no park/Box<VM> for the matched sender).
+Final tables + micro-benchmark reference: benchmark-vs-baseline.md.** The fast-path
 recovery pass (clock batching, register-local instruction countdown, in-place
 HOF dispatch, inline matched rendezvous, empty-scope seam-swap skip — commits
 097f76e0..f165a767) brought HOF compute and spawn fan-out FASTER than the

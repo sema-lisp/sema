@@ -194,3 +194,40 @@ Notes:
 - This suite is a µs/ns-granularity *regression reference* for the scheduler
   primitives in isolation; it complements, and does not replace, the
   whole-program hyperfine matrix above.
+
+## Slice 0c close-out (2026-07-17, HEAD 1a997d46)
+
+Final matrix (same protocol; baseline binary identity verified):
+
+| benchmark | baseline | after 0c | ratio | 0b ratio | flip-era |
+|---|---|---|---|---|---|
+| spawn-storm | 40.7 ms | **27.2 ms** | **0.67× (faster)** | 0.67× | 1.00× |
+| sleep-storm | 16.9 ms | **14.8 ms** | **0.88× (faster)** | 1.65× | 2.15× |
+| primes | 22.4 ms | 24.4 ms | 1.09× ✅ | 0.74× | 1.96× |
+| cons-1m | 78.3 ms | 80.8 ms | 1.03× ✅ | 1.38× | 1.35× |
+| deep-await | 11.4 ms | 12.6 ms | 1.11× ✅(σ) | ~1.7× | 1.29× |
+| channel-pingpong | 33.9 ms | 66.6 ms | **1.97×** | 2.82× | 7.43× |
+
+Instructions retired: primes 277M (baseline 257M), pingpong 880M (baseline
+~400M), cons-1m 1.41B.
+
+**What landed in 0c:** hashbrown for id-keyed runtime maps (SipHash was ~25%
+of pingpong); O(1) `cancel_waiting` via a pending-cancellation queue (was a
+per-rotation full-task scan — top sema fn in deep-await); divan micro-benchmark
+suite (`jake bench.micro`) as the go-forward regression reference; completion-
+inbox polling gated behind an atomic dirty flag (lost-wakeup-safe: the blocking
+inbox path is an ungated correctness floor); fire_timer clock consolidation;
+depth-bounded recursive drop with worklist spill (cons-1m 1.38×→1.03×);
+O(1) `ready_remaining` from ready-queue membership (debug_assert-pinned
+turn-boundary equivalence). All Opus-reviewed; drop path Miri-clean.
+
+**Remaining residual: channel-pingpong 1.97× (~12k instr/message).** The
+genuine-park half of each capacity-1 rendezvous still pays quantum park/unpark
+(`Box<VM>` + memmove visible in the profile). The named follow-up stands:
+direct task-to-task handoff. All other PERF-RESIDUAL-1 rows are RESOLVED.
+
+**Known bench-quality gap:** `idle_turn_with_parked_tasks` (divan) is
+setup-dominated (n=0 ≈ 207 µs vs 84 ns for `idle_drive_turn`) and cannot yet
+prove per-turn flatness in parked-task count; the `ready_remaining` fix is
+instead pinned by its debug_assert. Rework the bench when the suite is next
+touched.

@@ -443,6 +443,14 @@ pub(super) struct RuntimeState {
     /// channel-heavy pair of tasks cannot out-run `work_item_limit` and starve
     /// sibling roots just because the hops now run inline.
     channel_fast_path_credit: usize,
+    /// Shared buffer for output captured from roots submitted with
+    /// `capture_output: true` (see `sema_core::output_hook`). The SAME `Rc`
+    /// is installed into this thread's `sema_core` output-capture sink at
+    /// construction (`Runtime::new`) — `write_stdout`/`write_stderr` push
+    /// into it directly from inside a driven quantum, keyed by the root
+    /// published via `sema_core::set_current_root`. Drained by
+    /// `Runtime::take_captured_output`.
+    pub(super) output_sink: Rc<RefCell<Vec<sema_core::CapturedOutput>>>,
     #[cfg(test)]
     force_settlement_exhaustion: bool,
     #[cfg(test)]
@@ -688,6 +696,11 @@ impl Runtime {
         // collection during a driven quantum can trace/sever the registry-held
         // buffer and settled values (idempotent — a set of `fn` pointers).
         register_runtime_interior_hooks();
+        let output_sink: Rc<RefCell<Vec<sema_core::CapturedOutput>>> =
+            Rc::new(RefCell::new(Vec::new()));
+        // Idempotent: re-registering on a thread that already had a (now
+        // dropped) runtime just points capture at the new runtime's sink.
+        sema_core::install_output_capture_sink(Rc::clone(&output_sink));
         Ok(Self {
             state: Rc::new(RefCell::new(RuntimeState {
                 _context: context,
@@ -728,6 +741,7 @@ impl Runtime {
                 dropped_protocol_completions: 0,
                 origin_barrier_waits: 0,
                 channel_fast_path_credit: 0,
+                output_sink,
                 #[cfg(test)]
                 force_settlement_exhaustion: false,
                 #[cfg(test)]
@@ -1409,12 +1423,19 @@ impl Runtime {
             let Some(root) = state.handle_cleanup.pop_front() else {
                 return false;
             };
-            state
+            let removed = state
                 .roots
                 .get(&root)
                 .is_some_and(RootRecord::is_reap_eligible)
                 .then(|| state.roots.remove(&root))
-                .flatten()
+                .flatten();
+            if removed.is_some() {
+                // Drop this root out of the capture set so a long-running host
+                // (REPL, notebook server) submitting many capturing roots over
+                // its lifetime doesn't leak entries in the thread-local set.
+                sema_core::unmark_root_capturing(root);
+            }
+            removed
         };
         drop(removed);
         true
@@ -1901,6 +1922,11 @@ impl Runtime {
             Some(task_id.get())
         };
         let prev_task_id = sema_core::set_current_task_id(published_task_id);
+        // Publish the running quantum's root (unlike task id, this is set for
+        // the root main task too — its `println`s must tag correctly for a
+        // capturing root) so `write_stdout`/`write_stderr` can route output
+        // captured for this root instead of process stdout/stderr.
+        let prev_root_id = sema_core::set_current_root(Some(root));
         // Regression insurance for the crux invariant (verified on the audited
         // path): no `RuntimeState` borrow is held across the quantum. The debug
         // variant may BLOCK inside the quantum (`handle_debug_stop` parks the
@@ -2055,6 +2081,7 @@ impl Runtime {
         };
 
         let _ = sema_core::set_current_task_id(prev_task_id);
+        let _ = sema_core::set_current_root(prev_root_id);
         scopes.restore(task);
         drop(quantum_guard);
         Ok(action)
@@ -3544,6 +3571,7 @@ impl Runtime {
             Some(task_id.get())
         };
         let prev_task_id = sema_core::set_current_task_id(published_task_id);
+        let prev_root_id = sema_core::set_current_root(Some(root));
         let mut scopes = TaskScopeSwap::install(&mut task);
         debug_assert!(
             self.state.try_borrow_mut().is_ok(),
@@ -3690,6 +3718,7 @@ impl Runtime {
         };
 
         let _ = sema_core::set_current_task_id(prev_task_id);
+        let _ = sema_core::set_current_root(prev_root_id);
         scopes.restore(&mut task);
         drop(quantum_guard);
 

@@ -255,6 +255,16 @@ impl Interpreter {
     /// Macro-expand, compile, and drive a sequence of top-level forms as one
     /// root on the unified runtime. Shared by the runtime eval entry points.
     fn run_exprs_via_runtime(&self, exprs: &[Value]) -> EvalResult {
+        let vm = self.build_vm_for_exprs(exprs)?;
+        self.drive_vm_on_runtime(vm)
+    }
+
+    /// Macro-expand and compile a sequence of top-level forms into a
+    /// seeded-but-not-yet-submitted VM. Shared by every entry point that
+    /// builds a root from source/data forms — [`run_exprs_via_runtime`],
+    /// [`submit_str`](Self::submit_str), and
+    /// [`submit_value`](Self::submit_value).
+    fn build_vm_for_exprs(&self, exprs: &[Value]) -> Result<sema_vm::VM, SemaError> {
         let expanded = expand_for_vm_batch(&self.ctx, &self.global_env, exprs)?;
         let known_natives = collect_native_names(&self.global_env);
         let span_map = self.ctx.span_table.borrow().clone();
@@ -271,7 +281,113 @@ impl Interpreter {
             prog.main_cache_slots,
         )?;
         vm.seed_main_frame(prog.closure);
-        self.drive_vm_on_runtime(vm)
+        Ok(vm)
+    }
+
+    /// Parse `src` (one or more top-level forms), compile it against this
+    /// interpreter's globals, and submit it as a fresh root on the
+    /// interpreter's persistent runtime — WITHOUT driving it. Pair with
+    /// [`drive_until_settled`](Self::drive_until_settled) or repeated
+    /// [`drive_turn`](Self::drive_turn) calls to run it. `define`s land in
+    /// the global env only once the root actually runs (driving is what
+    /// executes the program), exactly as for [`eval_str`](Self::eval_str).
+    pub fn submit_str(
+        &self,
+        src: &str,
+        opts: sema_vm::runtime::RootOptions,
+    ) -> Result<sema_vm::runtime::RootHandle, SemaError> {
+        let (exprs, spans) = sema_reader::read_many_with_spans(src)?;
+        self.ctx.merge_span_table(spans);
+        self.submit_exprs(&exprs, opts)
+    }
+
+    /// Compile an already-parsed expression against this interpreter's
+    /// globals and submit it as a fresh root — WITHOUT driving it. See
+    /// [`submit_str`](Self::submit_str).
+    pub fn submit_value(
+        &self,
+        expr: Value,
+        opts: sema_vm::runtime::RootOptions,
+    ) -> Result<sema_vm::runtime::RootHandle, SemaError> {
+        self.submit_exprs(std::slice::from_ref(&expr), opts)
+    }
+
+    fn submit_exprs(
+        &self,
+        exprs: &[Value],
+        opts: sema_vm::runtime::RootOptions,
+    ) -> Result<sema_vm::runtime::RootHandle, SemaError> {
+        let nil_placeholder = [Value::nil()];
+        let exprs = if exprs.is_empty() {
+            &nil_placeholder[..]
+        } else {
+            exprs
+        };
+        let vm = self.build_vm_for_exprs(exprs)?;
+        let runtime = self
+            .runtime
+            .as_ref()
+            .expect("runtime is present outside of Drop");
+        runtime
+            .submit_root_with_options(vm, &opts)
+            .map_err(|e| SemaError::eval(format!("root submission failed: {e:?}")))
+    }
+
+    /// Drive an already-submitted root (from [`submit_str`](Self::submit_str)
+    /// / [`submit_value`](Self::submit_value)) to settlement. Shares the
+    /// exact drive-loop semantics of [`drive_vm_on_runtime`](Self::drive_vm_on_runtime)
+    /// (block-wait on external completions, sleep out a bare timer, drain
+    /// ready detached work at exit, settle a genuine deadlock) — that
+    /// function is now a thin wrapper: submit, then call this.
+    pub fn drive_until_settled(&self, root: &sema_vm::runtime::RootHandle) -> EvalResult {
+        self.drive_handle_to_settlement(root)
+    }
+
+    /// Drive the interpreter's persistent runtime for exactly one bounded
+    /// turn (the wasm/notebook/debugger shape — a host that wants to observe
+    /// progress between quanta rather than block to settlement). Never
+    /// blocks on a timer or the external-completion inbox; a caller that
+    /// needs to wait for those should inspect the returned
+    /// [`DriveState::Idle`](sema_vm::runtime::DriveState::Idle) itself.
+    pub fn drive_turn(&self) -> Result<sema_vm::runtime::DriveState, SemaError> {
+        let runtime = self
+            .runtime
+            .as_ref()
+            .expect("runtime is present outside of Drop");
+        let budget = sema_vm::runtime::DriveBudget::host_default();
+        runtime
+            .drive(&budget)
+            .map_err(|e| SemaError::eval(format!("runtime fault: {e:?}")))
+    }
+
+    /// Drain every [`OutputEvent`](sema_vm::runtime::OutputEvent) captured so
+    /// far from roots submitted with `capture_output: true`. A root that
+    /// didn't opt in still writes straight to process stdout/stderr, exactly
+    /// as before this API existed — this only ever returns output from
+    /// capturing roots.
+    pub fn take_output(&self) -> Vec<sema_vm::runtime::OutputEvent> {
+        let runtime = self
+            .runtime
+            .as_ref()
+            .expect("runtime is present outside of Drop");
+        runtime.take_captured_output()
+    }
+
+    /// Shut down the interpreter's persistent runtime: cancel every live
+    /// root/task and drain teardown until quiescent or `opts.deadline`.
+    /// Wraps [`sema_vm::runtime::Runtime::shutdown`], surfacing a runtime
+    /// fault as a `SemaError` instead of a bare `RuntimeFault` — every other
+    /// `Interpreter` entry point already reports failure this way, and a
+    /// fault mid-shutdown (id-space exhaustion, an invariant violation) is
+    /// exactly the kind of thing a host must not silently swallow into an
+    /// always-`Ok` report.
+    pub fn shutdown(
+        &self,
+        opts: sema_vm::runtime::ShutdownOptions,
+    ) -> Result<sema_vm::runtime::ShutdownReport, SemaError> {
+        self.runtime()
+            .shutdown(&opts)
+            .map_err(|fault| SemaError::eval(format!("runtime fault during shutdown: {fault:?}")))
     }
 
     /// Submit an already-seeded VM as a fresh root on this interpreter's
@@ -314,8 +430,6 @@ impl Interpreter {
     }
 
     pub fn drive_vm_on_runtime(&self, vm: sema_vm::VM) -> EvalResult {
-        use sema_vm::runtime::{DriveBudget, DriveState, RootPoll};
-
         // Submit as a fresh ROOT to the interpreter's single persistent runtime
         // (constructed once over THIS interpreter's context, so the VM's
         // `call_value`/`eval_value` re-entry resolves the registered callbacks
@@ -330,7 +444,20 @@ impl Interpreter {
         let handle = runtime
             .submit_root(vm)
             .map_err(|e| SemaError::eval(format!("root submission failed: {e:?}")))?;
+        self.drive_handle_to_settlement(&handle)
+    }
 
+    /// The drive loop shared by [`drive_vm_on_runtime`](Self::drive_vm_on_runtime)
+    /// (which submits then drives) and the public
+    /// [`drive_until_settled`](Self::drive_until_settled) (which drives an
+    /// already-submitted [`RootHandle`](sema_vm::runtime::RootHandle)).
+    fn drive_handle_to_settlement(&self, handle: &sema_vm::runtime::RootHandle) -> EvalResult {
+        use sema_vm::runtime::{DriveBudget, DriveState, RootPoll};
+
+        let runtime = self
+            .runtime
+            .as_ref()
+            .expect("runtime is present outside of Drop");
         let budget = DriveBudget::host_default();
         loop {
             match handle.poll_result() {

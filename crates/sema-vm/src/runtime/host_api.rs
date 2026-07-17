@@ -31,6 +31,53 @@ pub enum RootPoll {
     InvariantViolation,
 }
 
+/// Options for a root submitted through [`Interpreter::submit_str`]/
+/// [`Interpreter::submit_value`] (`sema-eval`).
+///
+/// [`Interpreter::submit_str`]: ../../sema_eval/struct.Interpreter.html#method.submit_str
+/// [`Interpreter::submit_value`]: ../../sema_eval/struct.Interpreter.html#method.submit_value
+#[derive(Clone, Debug, Default)]
+pub struct RootOptions {
+    /// A host-chosen label for this root (a cell id, a request id, …).
+    /// Reserved for host-side observability (logs, future debug tooling) —
+    /// not currently threaded into any runtime diagnostic, so it is accepted
+    /// and otherwise unused today.
+    pub name: Option<String>,
+    /// When `true`, this root's `println`/`print-err`/stream writes are
+    /// captured into [`OutputEvent`]s (drained via
+    /// [`Interpreter::take_output`]) instead of going to process
+    /// stdout/stderr. Defaults to `false`: inherit process stdout, exactly
+    /// like every existing eval entry point.
+    ///
+    /// [`Interpreter::take_output`]: ../../sema_eval/struct.Interpreter.html#method.take_output
+    pub capture_output: bool,
+}
+
+/// One piece of program output captured for a root submitted with
+/// [`RootOptions::capture_output`]. Drained (not peeked) by
+/// `Interpreter::take_output`.
+#[derive(Clone, Debug)]
+pub enum OutputEvent {
+    Stdout { root: RootId, text: String },
+    Stderr { root: RootId, text: String },
+}
+
+impl From<sema_core::CapturedOutput> for OutputEvent {
+    fn from(c: sema_core::CapturedOutput) -> Self {
+        if c.is_stderr {
+            OutputEvent::Stderr {
+                root: c.root,
+                text: c.text,
+            }
+        } else {
+            OutputEvent::Stdout {
+                root: c.root,
+                text: c.text,
+            }
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct ShutdownOptions {
     pub deadline: Instant,
@@ -117,6 +164,35 @@ impl Runtime {
     /// `run_quantum` and settles with the VM result. `vm_call` takes precedence
     /// in `visit_ready`, so the `Vm` payload is never invoked.
     pub fn submit_root(&self, vm: VM) -> Result<RootHandle, SubmitRootError> {
+        self.submit_root_inner(vm)
+    }
+
+    /// Submit a root with [`RootOptions`] — currently only `capture_output`
+    /// has runtime effect (see `output_hook` in `sema-core`); `name` is
+    /// accepted for host-side observability only (see [`RootOptions::name`]).
+    pub fn submit_root_with_options(
+        &self,
+        vm: VM,
+        opts: &RootOptions,
+    ) -> Result<RootHandle, SubmitRootError> {
+        let handle = self.submit_root_inner(vm)?;
+        if opts.capture_output {
+            sema_core::mark_root_capturing(handle.id);
+        }
+        Ok(handle)
+    }
+
+    /// Drain every [`OutputEvent`] captured so far from roots submitted with
+    /// `capture_output: true`. Empty when no such root exists (or none has
+    /// printed since the last drain) — cheap to call speculatively every
+    /// turn.
+    pub fn take_captured_output(&self) -> Vec<OutputEvent> {
+        let sink = self.state.borrow().output_sink.clone();
+        let raw = std::mem::take(&mut *sink.borrow_mut());
+        raw.into_iter().map(OutputEvent::from).collect()
+    }
+
+    fn submit_root_inner(&self, vm: VM) -> Result<RootHandle, SubmitRootError> {
         let mut state = self.state.borrow_mut();
         if state.shutting_down || state.terminal_fault.is_some() {
             return Err(SubmitRootError::ShuttingDown);

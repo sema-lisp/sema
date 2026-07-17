@@ -749,12 +749,13 @@ F23	crates/sema-vm/src/runtime/state.rs:6044:    thread_local! {
 F24	crates/sema-vm/src/runtime/state.rs:890:    /// shape `async/spawn` produces. Used to build multi-task origin-root graphs
 F03	crates/sema-vm/src/runtime/state.rs:891:    /// (e.g. an `async/run` barrier caller with a `ResourceSlot`-parked sibling)
 F23	crates/sema-vm/src/runtime/tests.rs:1461:thread_local! {
-F23	crates/sema-vm/src/runtime/tests.rs:3447:/// itself excluded from an `async/run` barrier.
-F23	crates/sema-vm/src/runtime/tests.rs:3492:/// Barrier caller: `async/run`, then record its release and return.
-F23	crates/sema-vm/src/runtime/tests.rs:3517:/// CYCLE-FORMING for the `async/run` barrier. A same-origin-root sibling parked on
-F23	crates/sema-vm/src/runtime/tests.rs:3519:/// channel) must NOT keep the barrier waiting — `(async/run)` releases because the
-F23	crates/sema-vm/src/runtime/tests.rs:3559:    // Root R: main task M is the `async/run` barrier caller.
-F23	crates/sema-vm/src/runtime/tests.rs:3589:            "async/run barrier hung on a ResourceSlot cycle (regression: ResourceSlot must be cycle-forming); events: {:?}",
+F23	crates/sema-vm/src/runtime/tests.rs:1804:/// `channel/send`/`channel/recv`'s continuation for the in-place handoff fast
+F23	crates/sema-vm/src/runtime/tests.rs:3565:/// itself excluded from an `async/run` barrier.
+F23	crates/sema-vm/src/runtime/tests.rs:3610:/// Barrier caller: `async/run`, then record its release and return.
+F23	crates/sema-vm/src/runtime/tests.rs:3635:/// CYCLE-FORMING for the `async/run` barrier. A same-origin-root sibling parked on
+F23	crates/sema-vm/src/runtime/tests.rs:3637:/// channel) must NOT keep the barrier waiting — `(async/run)` releases because the
+F23	crates/sema-vm/src/runtime/tests.rs:3677:    // Root R: main task M is the `async/run` barrier caller.
+F23	crates/sema-vm/src/runtime/tests.rs:3707:            "async/run barrier hung on a ResourceSlot cycle (regression: ResourceSlot must be cycle-forming); events: {:?}",
 F08A	crates/sema-vm/src/runtime/wait.rs:464:    pub fn block_on_inbox(&mut self, deadline: Option<Instant>) -> bool {
 F08A	crates/sema-vm/src/runtime/wait.rs:474:                inbox.recv_timeout(timeout).ok()
 F08A	crates/sema-vm/src/runtime/wait.rs:476:            None => inbox.recv().ok(),

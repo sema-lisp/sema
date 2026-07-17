@@ -4,6 +4,21 @@
 
 ### Added
 
+- **`sema build --json`** — a machine-readable build manifest on stdout: source,
+  archive size, and per-target `path` / `bytes` / `sha256` / runtime source
+  (`host`·`cached`·`downloaded`·`custom`) / `ok` / `error`. Works for single
+  targets, `--target all`, and `--target web` (same envelope, `runtime: null`).
+  Failed targets appear as `ok: false` entries and the exit code stays non-zero.
+- **`sema build -v/--verbose`** — restores the per-step build detail
+  (`[1/4]`…`[4/4]`) and runtime cache/checksum/paths info that the new compact
+  output omits by default.
+- **Windows executables from `sema build` are branded**: the Sema mark is
+  embedded as a proper multi-resolution icon (256→16 px) and a `VERSIONINFO`
+  resource (ProductName / FileDescription / FileVersion) fills Explorer's
+  Details tab. Pure-Rust, works when cross-building from macOS/Linux.
+- **Runtime downloads show a progress bar** when stderr is a TTY (plain
+  deterministic lines when piped or in CI).
+
 - **Authenticated MCP servers in workflow runs — headless precursor** (per
   `docs/plans/2026-06-24-workflow-mcp-auth.md`, §9 items a–c). A `defworkflow`
   can declare the MCP servers its leaves need in a new `:mcp` meta key
@@ -91,6 +106,29 @@
 
 ### Changed
 
+- **`sema build` output redesigned.** Default output is compact: one
+  `Compiled <src> → archive` note, a live per-target status line under
+  `--target all`, and an aligned summary table (os / arch / human-readable
+  size / full path) at the end. Progress goes to stderr, the final summary to
+  stdout (pipeable). The `Note: this binary … won't run on your current
+  machine` line is gone; `Checksum verified` / `Cached at` / `Using cached
+  runtime` moved behind `--verbose`.
+- **`sema build --target all` compiles once.** The archive (compile → trace
+  imports → collect assets → serialize) is target-independent and is now built
+  a single time; only the runtime fetch + injection runs per target.
+- **OTLP-over-gRPC is now a cargo feature (`otel-grpc`).** Release artifacts
+  (installer, Homebrew, GitHub archives) still include it; a plain
+  `cargo install sema-lang` or source build omits the tonic/h2 stack
+  (~30s of compile) and `OTEL_EXPORTER_OTLP_PROTOCOL=grpc` warns once and
+  falls back to `http/protobuf`. Opt back in with `--features otel-grpc`.
+- **TLS now uses rustls with the pure-Rust `ring` provider** instead of
+  aws-lc. No behavioral change for HTTP/LLM/WebSocket features; it removes the
+  slowest C build step from source builds.
+- **`--runtime` help text clarified**: it is a path to a sema executable used
+  as the embed base; the output inherits its platform and version, so passing
+  e.g. a Windows `sema.exe` cross-builds without a download. Conflicts with
+  `--target`.
+
 - **`async/sleep` and `async/timeout` accept a float duration**, not just an
   int — a duration is naturally a number, and `(round …)` / `(math/random)` /
   ordinary arithmetic routinely yield floats. A float is rounded to the nearest
@@ -122,6 +160,17 @@
     async yields, and debug hooks still take the re-entry path.
 
 ### Fixed
+
+- **`sema build --output` is honored with `--target all`.** Previously the
+  flag was silently ignored and per-target files landed in the current
+  directory. A directory output now yields `<dir>/<stem>-<target>[.exe]`, a
+  file-ish output becomes the base name (`<base>-<target>[.exe]`), and every
+  target gets a distinct suffixed filename instead of overwriting one file.
+- **`sema build -o` creates missing parent directories** (`mkdir -p`
+  semantics) instead of erroring, treats an existing directory (or trailing
+  `/`) as "default filename inside this directory", expands a literal leading
+  `~` (shells don't tilde-expand after `--output=`), and refuses an output
+  path that resolves to the source file itself.
 
 - **Many more blocking natives are now scheduler-compatible under `async`.** A
   native that ran a blocking syscall on the cooperative VM thread would freeze

@@ -286,7 +286,7 @@ Injection is format-aware rather than host-specific — `libsui` performs Mach-O
 |----------|-----------|---------|-------|
 | Linux (ELF) | Raw append + trailer | N/A | ELF loaders ignore appended data |
 | macOS (Mach-O) | `libsui` section injection | Ad-hoc re-signed | Re-sign with Developer ID for distribution |
-| Windows (PE) | `libsui` resource injection | Authenticode stripped | Re-sign with `signtool` if needed |
+| Windows (PE) | `libsui` resource injection | Authenticode stripped | Sema icon + `VERSIONINFO` resource embedded; re-sign with `signtool` if needed |
 
 ## Implementation
 

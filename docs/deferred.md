@@ -817,3 +817,30 @@ Pre-landing hard-audit items (flagged in the design doc): the External-HTTP resu
 decoded `Value` must carry a `Trace` impl (GC invariant I2); macrotask fairness between live
 roots; cancel latency for a root suspended in an External wait; the worker-protocol rewrite
 dropping the SAB; `MessageChannel` vs `setTimeout(0)` throttling in background tabs.
+
+## PERF-RESIDUAL-1 — accepted post-flip runtime overhead on three benchmark shapes
+
+**Recorded 2026-07-17 (Slice 0b close-out; owner-accepted).** The fast-path
+recovery pass (clock batching, register-local instruction countdown, in-place
+HOF dispatch, inline matched rendezvous, empty-scope seam-swap skip — commits
+097f76e0..f165a767) brought HOF compute and spawn fan-out FASTER than the
+pre-migration engine, but three shapes remain above the 1.10× bar vs baseline
+`3f111e83` and are deliberately parked for a later optimization pass:
+
+- **channel-pingpong 2.82×** (~19k instructions/message residual): the
+  genuine-park half of a capacity-1 rendezvous still pays quantum park/unpark
+  with `Box<VM>` moves and task-map churn. Follow-up: direct task-to-task
+  handoff — write the peer's resume value without parking the matched sender.
+- **sleep-storm 1.65× / deep-await ~1.7×**: per-task spawn+timer+settle
+  lifecycle through the drive loop (~10 ms per 500 tasks absolute). spawn-storm
+  (same machinery, no timers) beats baseline, so the residual is timer-wheel +
+  park-path specific.
+- **cons-1m 1.38×**: NOT explained by any 0b target (no HOF, no channels,
+  budget check already register-local). Needs its own diagnosis; suspected
+  allocator/GC-registry interaction under the runtime.
+
+Reproduction protocol, corrected baselines, and per-task measurements:
+`docs/plans/evidence/unified-cooperative-runtime/benchmark-vs-baseline.md`.
+Benchmark binary-identity rule: rebuild and verify the baseline worktree binary
+(`git log` + mtime) before measuring — a stale bisect-era binary contaminated
+one investigation.

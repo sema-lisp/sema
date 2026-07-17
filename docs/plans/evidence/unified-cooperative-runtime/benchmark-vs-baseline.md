@@ -120,3 +120,9 @@ starved GC).
 fan-out) now beat the pre-migration engine. The ≤1.10× bar is NOT met on
 4 of 6 rows; residuals are characterized with named structural follow-ups.
 Accept-or-continue is an owner decision recorded in the orchestration plan.
+
+**Owner decision (Helge, 2026-07-17): residuals ACCEPTED.** Slice 0b closes;
+the program proceeds to P6-1. The three structural follow-ups (direct
+rendezvous handoff, timer/park lifecycle, cons-1m allocator diagnosis) are
+parked as a deliberate later optimization pass — tracked as PERF-RESIDUAL-1 in
+docs/deferred.md.

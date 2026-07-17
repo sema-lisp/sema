@@ -565,7 +565,7 @@ impl WaitRuntime {
     /// with no timer bound, where a worker completion is guaranteed to
     /// arrive. Never busy-spins.
     pub fn block_on_inbox(&mut self, deadline: Option<Instant>) -> bool {
-        if !self.deferred.is_empty() {
+        if !self.deferred.is_empty() || !self.commands.is_empty() {
             return true;
         }
         let Some(inbox) = self.inbox.as_ref() else {

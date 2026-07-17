@@ -1653,6 +1653,39 @@ fn runtime_command_wakes_a_thread_parked_in_block_on_inbox() {
 }
 
 #[test]
+fn block_on_inbox_returns_immediately_when_a_command_is_already_buffered() {
+    // Reproduces the buffer-then-park bug: a command that arrives mid-turn is
+    // pumped off the channel into `self.commands` (not `self.deferred`) and
+    // the dirty flag is cleared, so nothing is left on the channel for a
+    // *subsequent* `block_on_inbox` call to observe. The first call below
+    // blocks until the command arrives and buffers it; the second call must
+    // see that already-buffered command and return `true` immediately,
+    // instead of blocking out its full deadline waiting on a channel that
+    // will never receive anything else.
+    let runtime = runtime_with_inline_executor(Rc::new(FakeClock::new()));
+    let commands = runtime.command_handle();
+    let sender = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(commands.cancel_all());
+    });
+    let woke_first = runtime.block_on_inbox(None);
+    sender.join().expect("spawned thread does not panic");
+    assert!(woke_first, "first call wakes when the command arrives");
+
+    let start = Instant::now();
+    let woke_second = runtime.block_on_inbox(Some(start + Duration::from_millis(400)));
+    let elapsed = start.elapsed();
+    assert!(
+        woke_second,
+        "second call must see the already-buffered command and return true"
+    );
+    assert!(
+        elapsed < Duration::from_millis(100),
+        "buffered command should make block_on_inbox return immediately, took {elapsed:?}"
+    );
+}
+
+#[test]
 fn runtime_drive_charges_external_extract_decode_resume_and_apply_stages() {
     let runtime = runtime_with_inline_executor(Rc::new(FakeClock::new()));
     let events = Arc::new(Mutex::new(Vec::new()));

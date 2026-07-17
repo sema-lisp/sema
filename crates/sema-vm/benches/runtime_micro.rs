@@ -190,17 +190,22 @@ fn idle_drive_turn(bencher: divan::Bencher) {
     });
 }
 
-// ── (f) cancel_waiting sweep over N parked tasks ─────────────────────────
+// ── (f) shutdown sweep over N parked tasks ────────────────────────────────
 //
 // The only publicly reachable path to the private `cancel_waiting` scan is
 // `Runtime::shutdown`, which cancels every live task and drains them via that
-// same scan (see `Runtime::shutdown` in `runtime/state.rs`). Each iteration's
-// setup (spawning and parking N children on an unbuffered channel that is
-// never sent to, so every child blocks in `channel/recv`) runs in divan's
-// untimed `with_inputs` phase; only `Runtime::shutdown` itself is timed.
-// `shutdown` sets a permanent `shutting_down` flag, so a fresh `Interpreter`
-// (and its fresh `Runtime`) is required per iteration — reusing one across
-// iterations would time-degenerate after the first shutdown.
+// same scan (see `Runtime::shutdown` in `runtime/state.rs`). This measures
+// teardown throughput end to end — `Runtime::shutdown`'s wall time is
+// dominated by VM drops and executor teardown, not by `cancel_waiting`
+// itself, so it cannot isolate a regression in `cancel_waiting`'s O(1)
+// no-cancellations-pending fast path (see `idle_turn_with_parked_tasks`
+// below for that). Each iteration's setup (spawning and parking N children on
+// an unbuffered channel that is never sent to, so every child blocks in
+// `channel/recv`) runs in divan's untimed `with_inputs` phase; only
+// `Runtime::shutdown` itself is timed. `shutdown` sets a permanent
+// `shutting_down` flag, so a fresh `Interpreter` (and its fresh `Runtime`) is
+// required per iteration — reusing one across iterations would
+// time-degenerate after the first shutdown.
 
 fn spawn_and_park(n: usize) -> Interpreter {
     let interp = Interpreter::new();
@@ -218,11 +223,27 @@ fn spawn_and_park(n: usize) -> Interpreter {
         "expected at least N={n} children parked on channel/recv after the root drains, got {}",
         interp.runtime_live_task_count()
     );
+    // `eval_str_via_runtime` settles the root but can leave one-time
+    // bookkeeping (reaping the just-settled root) as `Progress` on the next
+    // `Runtime::drive` call. Drain that here, in untimed setup, so a
+    // benchmark that times a single subsequent `drive` call measures a
+    // genuinely idle/quiescent turn rather than this eval's own teardown.
+    let drain_budget = DriveBudget::host_default();
+    loop {
+        match interp
+            .runtime()
+            .drive(&drain_budget)
+            .expect("draining settled-root bookkeeping cannot fault")
+        {
+            DriveState::Progress { .. } => continue,
+            _ => break,
+        }
+    }
     interp
 }
 
 #[divan::bench(args = [0, 64])]
-fn cancel_waiting_sweep(bencher: divan::Bencher, n: usize) {
+fn shutdown_sweep(bencher: divan::Bencher, n: usize) {
     bencher
         .with_inputs(|| spawn_and_park(n))
         .bench_local_values(|interp| {
@@ -237,6 +258,58 @@ fn cancel_waiting_sweep(bencher: divan::Bencher, n: usize) {
             assert!(
                 divan::black_box(report.clean),
                 "expected a clean shutdown after cancelling {n} parked tasks, got {report:?}"
+            );
+        });
+}
+
+// ── (g) one idle drive turn over N parked-but-uncancelled tasks ──────────
+//
+// Isolates exactly what `shutdown_sweep` cannot: the cost of `cancel_waiting`
+// (called on every `Runtime::drive` turn to check for pending cancellations)
+// when NO cancellation is pending — the 0c-2 optimization's target. Builds a
+// runtime already holding N tasks parked on `channel/recv` for a channel
+// nobody sends to and nobody cancels (untimed `with_inputs` setup, same
+// `spawn_and_park` shape `shutdown_sweep` uses), then times exactly ONE
+// `Runtime::drive` turn — the same shape as `idle_drive_turn` above, but
+// against a runtime that actually holds live parked tasks instead of an
+// empty one. That turn finds nothing ready to run and must report
+// `Idle`/`Quiescent`; the assertions (wrapped in `divan::black_box` per this
+// file's convention, so the optimizer can't prove them dead and elide the
+// drive call, while keeping their cost off the critical measured work) check
+// both that no progress was made and that all N tasks are still live — i.e.
+// this turn observed them without disturbing them.
+//
+// `cancel_waiting` itself is O(1) here (its scan is bounded to
+// `pending_cancel_waits.len()`, which is 0 when nothing was cancelled) — a
+// regression there would show up as this turn's cost jumping specifically
+// between n=0 and n>0, not scaling further between n=64 and n=256. The
+// measured total is NOT otherwise flat in N: a separate, unconditional O(N)
+// cost every `drive` turn already pays (the `ready_remaining` scan over all
+// tracked tasks) dominates the growth from n=64 to n=256. See the numbers
+// table in `docs/plans/evidence/unified-cooperative-runtime/
+// benchmark-vs-baseline.md` for the measured split and rationale.
+
+#[divan::bench(args = [0, 64, 256])]
+fn idle_turn_with_parked_tasks(bencher: divan::Bencher, n: usize) {
+    let budget = DriveBudget::host_default();
+    bencher
+        .with_inputs(|| spawn_and_park(n))
+        .bench_local_values(|interp| {
+            let state = interp
+                .runtime()
+                .drive(&budget)
+                .expect("idle drive turn over parked tasks succeeds");
+            assert!(
+                divan::black_box(matches!(
+                    state,
+                    DriveState::Idle { .. } | DriveState::Quiescent
+                )),
+                "expected an idle/quiescent turn over {n} parked tasks, got {state:?}"
+            );
+            assert!(
+                divan::black_box(interp.runtime_live_task_count()) >= n,
+                "expected all N={n} parked tasks to remain live (uncancelled) after one drive turn, got {}",
+                interp.runtime_live_task_count()
             );
         });
 }

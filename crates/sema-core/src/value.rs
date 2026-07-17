@@ -2422,8 +2422,20 @@ unsafe fn rc_strong_cell<'a>(ptr: *const u8) -> &'a Cell<usize> {
 /// threshold while comfortably exceeding realistic nesting depth; beyond it,
 /// `free_heap_value` falls back to the worklist spill (see
 /// `drop_last_heap_ref`'s original SIGABRT-prevention rationale, preserved
-/// below) so teardown of a genuinely deep structure still costs only O(1)
-/// native frames regardless of how deep it goes.
+/// below), so teardown of one contiguous run of nested `TAG_LIST`/`TAG_VECTOR`/
+/// `TAG_MAP`/`TAG_HASHMAP` (the types this module unrolls onto the worklist)
+/// costs only O(1) native frames regardless of how deep that run goes.
+///
+/// That bound does NOT extend across a non-unrolled heap type (`Record`,
+/// `Thunk`, `MutableArray`, `Lambda`, ...) reached mid-teardown: those drop
+/// via ordinary Rust drop glue (`drop_leaf_heap_ref`), which recurses into
+/// each `Value` field through `Value::drop` — a fresh call with no memory of
+/// the depth this module was tracking, i.e. a fresh depth-0 budget. A
+/// structure that interleaves such types with runs of nested collections
+/// each ≤64 deep therefore costs O(reset-count × 64) native frames in the
+/// worst case, not O(1) — accepted as a ~64x narrowing of the overflow
+/// margin versus always spilling, since that interleaved shape is contrived
+/// and the common case (long pure collection chains) is unaffected.
 const DROP_DIRECT_RECURSION_BUDGET: u32 = 64;
 
 /// Typed free for a heap value whose last strong reference is going away:
@@ -2467,11 +2479,16 @@ unsafe fn free_heap_value(tag: u64, ptr: *const u8, depth: u32) {
         // SIGABRT) well before any Sema guard can fire. Flatten it: move
         // each collection's children onto an explicit heap worklist and free
         // them iteratively, so teardown depth from here is O(1) native
-        // frames regardless of how much deeper the structure goes. Only the
-        // cycle-free immutable collections are unrolled here; every other
-        // payload drops through `drop_leaf_heap_ref` (its own recursion is
-        // bounded by nesting of *distinct* types, not element count — e.g. a
-        // record field holding a deep list re-enters this iterative path).
+        // frames per contiguous run of the unrolled collection types
+        // (`TAG_LIST`/`TAG_VECTOR`/`TAG_MAP`/`TAG_HASHMAP`), regardless of how
+        // deep that run goes. Only those cycle-free immutable collections are
+        // unrolled here; every other payload drops through
+        // `drop_leaf_heap_ref` via ordinary Rust drop glue, which re-enters
+        // `Value::drop` (and so `free_heap_value`) at a fresh depth 0 for
+        // each `Value` field it holds — a structure that interleaves such
+        // types with ≤64-deep collection runs costs O(reset-count × 64)
+        // frames rather than O(1) (see `DROP_DIRECT_RECURSION_BUDGET` for the
+        // accepted margin trade-off this implies).
         let mut worklist: Vec<Value> = Vec::new();
         free_heap_payload(tag, ptr, &mut worklist);
         drain_drop_worklist(worklist);
@@ -3566,17 +3583,19 @@ mod tests {
 
     #[test]
     fn drop_mixed_shallow_and_deep_nesting_does_not_double_free_or_leak() {
-        // A shape that crosses `DROP_DIRECT_RECURSION_BUDGET` (64) in both
-        // directions within a single drop: a 5000-deep nested-list spine
-        // (far past the budget, forcing the worklist-spill fallback) with a
-        // map spliced into its middle that itself holds a 100-deep nested
-        // list (also past the budget, but reached from a fresh depth-0 spill
-        // frame via `free_heap_payload`'s recursive `TAG_MAP` handling,
-        // exercising the direct path for its own first 64 levels before
-        // spilling again). Two leaf strings are wrapped in `Rc` so their
-        // weak counts pin "freed exactly once" — a double-free would abort
-        // or corrupt the allocator before this assertion runs, and a leak
-        // would leave the strong count above zero.
+        // A shape that crosses `DROP_DIRECT_RECURSION_BUDGET` (64) well
+        // before reaching a splice: a 5000-deep nested-list spine (far past
+        // the budget, forcing the worklist-spill fallback) with a map
+        // spliced into its middle that itself holds a 100-deep nested list.
+        // By the depth the map is reached, the outer spine has already
+        // spilled to the worklist, so the map and its inner list are freed
+        // by `free_heap_payload` draining the worklist — pushing children
+        // directly rather than recursing — never re-entering the direct
+        // recursive path (`free_heap_value`'s depth-tracked branch). Two leaf
+        // strings are wrapped in `Rc` so their weak counts pin "freed exactly
+        // once" — a double-free would abort or corrupt the allocator before
+        // this assertion runs, and a leak would leave the strong count above
+        // zero.
         fn deep_list(depth: usize, leaf: Value) -> Value {
             let mut v = leaf;
             for _ in 0..depth {

@@ -134,10 +134,10 @@ Date: 2026-07-17. Branch: `codex/unified-async-runtime`. New divan suite,
 `crates/sema-vm/benches/runtime_micro.rs`, isolating the scheduler's hot
 primitives at native-op granularity (µs–ns, vs. the hyperfine suite's
 whole-program ms). Every Sema source form is read + compiled once, outside
-the timed closure; each iteration drives a fresh `VM` (or, for the shutdown
-sweep, a fresh `Interpreter`) through the real `Runtime` — `sema-vm`'s public
-API only, nothing under `crates/sema-vm/src/` was touched to build it.
-Reproduce with:
+the timed closure; each iteration drives a fresh `VM` (or, for the
+shutdown/idle-with-parked-tasks benches, a fresh `Interpreter`) through the
+real `Runtime` — `sema-vm`'s public API only, nothing under
+`crates/sema-vm/src/` was touched to build it. Reproduce with:
 
 ```
 cargo bench -p sema-vm --bench runtime_micro
@@ -146,13 +146,16 @@ cargo bench -p sema-vm --bench runtime_micro
 
 | benchmark | fastest | slowest | median | mean | samples | iters |
 |---|---|---|---|---|---|---|
-| idle_drive_turn | 81.73 ns | 89.54 ns | 83.68 ns | 83.91 ns | 100 | 6400 |
-| spawn_settle | 744.5 ns | 853.9 ns | 780.9 ns | 785.9 ns | 100 | 800 |
-| timer_arm_and_fire | 1.624 µs | 6.124 µs | 1.687 µs | 1.74 µs | 100 | 100 |
-| channel_rendezvous | 4.999 µs | 12.2 µs | 5.208 µs | 5.353 µs | 100 | 100 |
-| hof_map_100 (100 elements) | 9.958 µs | 68.24 µs | 10.12 µs | 10.85 µs | 100 | 100 |
-| cancel_waiting_sweep(n=0) | 209.4 µs | 978.2 µs | 213.2 µs | 234.8 µs | 100 | 100 |
-| cancel_waiting_sweep(n=64) | 332.1 µs | 62.29 ms | 340.7 µs | 1.383 ms | 100 | 100 |
+| idle_drive_turn | 71.3 ns | 77.18 ns | 73.27 ns | 73.51 ns | 100 | 6400 |
+| spawn_settle | 687.1 ns | 765.3 ns | 718.4 ns | 721 ns | 100 | 800 |
+| timer_arm_and_fire | 1.624 µs | 6.541 µs | 1.708 µs | 1.775 µs | 100 | 100 |
+| channel_rendezvous | 4.874 µs | 299.4 µs | 5.083 µs | 8.195 µs | 100 | 100 |
+| hof_map_100 (100 elements) | 9.749 µs | 65.62 µs | 9.999 µs | 10.65 µs | 100 | 100 |
+| idle_turn_with_parked_tasks(n=0) | 200.8 µs | 522.2 µs | 208 µs | 213.4 µs | 100 | 100 |
+| idle_turn_with_parked_tasks(n=64) | 311.2 µs | 520.4 µs | 326.4 µs | 332.1 µs | 100 | 100 |
+| idle_turn_with_parked_tasks(n=256) | 826.5 µs | 1.078 ms | 865.6 µs | 881.6 µs | 100 | 100 |
+| shutdown_sweep(n=0) | 201.6 µs | 471.8 µs | 206.6 µs | 215.7 µs | 100 | 100 |
+| shutdown_sweep(n=64) | 312.3 µs | 1.383 ms | 328.2 µs | 368.4 µs | 100 | 100 |
 
 Notes:
 - `hof_map_100` ≈ 100 ns/element for the cooperative `NativeOutcome::Call`
@@ -160,13 +163,34 @@ Notes:
   consistent with the ~2.7 µs/element figure quoted in the bisect section
   above being dominated by allocation/GC-adjacent costs at whole-program
   scale rather than the dispatch primitive itself.
-- `cancel_waiting_sweep`'s n=0 vs n=64 median delta (~127 µs) is the marginal
-  cost of the `cancel_waiting` scan over 64 parked tasks reached through
-  `Runtime::shutdown` (the only publicly reachable path to that private scan);
-  n=0's ~213 µs floor is `Interpreter::new()` + `Runtime::shutdown` overhead
-  common to both. Both rows show a long tail (max 978 µs / 62.29 ms) — shared
-  with a machine under load during this run; the median/mean-of-100 figures
-  are the load-bearing numbers, not the single worst sample.
+- `shutdown_sweep`'s n=0 vs n=64 median delta (~122 µs) is the cost of
+  `Runtime::shutdown` fanning cancellation out to, and draining, 64 parked
+  tasks via the private `cancel_waiting` scan — genuinely O(N) here because
+  shutdown queues every live task onto `pending_cancel_waits`, so each must
+  be visited at least once. n=0's ~207 µs floor is `Interpreter::new()` +
+  `Runtime::shutdown` overhead common to both rows.
+- `idle_turn_with_parked_tasks` times ONE `Runtime::drive` turn against a
+  runtime already holding N *uncancelled* parked tasks (no shutdown, no
+  cancellation requested) — the case `shutdown_sweep` cannot isolate, since
+  its cost is dominated by VM drops/executor teardown and (per the note
+  above) a real O(N) cancellation fan-out. `cancel_waiting` itself is O(1) in
+  this uncancelled case (`pending_cancel_waits` is empty, so the scan's
+  `attempts` bound is 0 and it returns immediately) — inspected directly in
+  `crates/sema-vm/src/runtime/state.rs`. The measured turn is NOT flat,
+  though: median cost grows from 208 µs (n=0) to 326 µs (n=64) to 866 µs
+  (n=256), roughly linear in N. That growth is not evidence against the 0c-2
+  fast path — it traces to a separate, unconditional O(N) cost every
+  `Runtime::drive` turn already pays regardless of cancellation state: the
+  `ready_remaining` computation (`state.tasks.values().any(...)` in
+  `runtime/state.rs`), which scans every tracked task once per turn to
+  answer "is anything else ready?". This is a real per-turn cost worth
+  tracking as its own regression reference, but it is orthogonal to what
+  this bench was added to isolate; it is flagged here rather than
+  mischaracterized as a `cancel_waiting` regression.
+- Both `shutdown_sweep(n=64)` and `idle_turn_with_parked_tasks` rows show a
+  long tail (max up to 1.4 ms) — shared with a machine under load during
+  this run; the median/mean-of-100 figures are the load-bearing numbers, not
+  the single worst sample.
 - This suite is a µs/ns-granularity *regression reference* for the scheduler
   primitives in isolation; it complements, and does not replace, the
   whole-program hyperfine matrix above.

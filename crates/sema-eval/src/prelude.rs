@@ -984,4 +984,59 @@ pub const PRELUDE: &str = r#"
           (let ((__out (__stream-finish __tok)))
             (if (null? __cbs) (begin (newline) __out) __out))))
       (apply __llm-stream-blocking __args)))
+
+;; SRV-1: `http/serve`'s concurrent accept loop (`sema-stdlib/src/server.rs`,
+;; the native registered as `__http-serve-run` below) needs one task per
+;; connection, spawned via `async/spawn`'s runtime ABI, which requires a
+;; compiled VM closure — a hand-built native fn is rejected (see
+;; docs/deferred.md "SRV-1"). It also needs `async/spawn` itself called from
+;; ORDINARY compiled bytecode, not re-issued as a bare `RuntimeRequest::Spawn`
+;; from a Rust continuation: `spawn_via_registry`
+;; (`sema-vm/src/runtime/state.rs`) has a `ReturnOwner::VmResume` fast path
+;; that — correctly, for `async/spawn`'s own trivial default continuation —
+;; injects the settled promise straight onto the parked VM's stack, but that
+;; same fast path SILENTLY DISCARDS any other caller-supplied
+;; `NativeContinuation` without ever invoking it. Every native-outcome hop
+;; chained off a plain top-level call (Suspend/Call/Runtime resumed from a
+;; continuation, never handed back to real bytecode in between) keeps
+;; `owner == VmResume` the whole way, so a Rust continuation built to run
+;; AFTER a raw `RuntimeRequest::Spawn` — e.g. one that re-arms the next accept
+;; wait — is silently dropped, and the spawn's promise value pops out as if it
+;; had settled the ENTIRE top-level call.
+;;
+;; `http/serve` is therefore defined HERE, as a thin Sema wrapper around the
+;; native `__http-serve-run`, so the per-connection dispatch factory — the
+;; closure that does the mint-and-spawn — is built fresh on EVERY call and
+;; passed as a PLAIN ARGUMENT, exactly like `handler` itself. The first
+;; version of this tried to compile the factory once and cache it (an
+;; `EvalContext` seam, later a thread-local): both leak, because either store
+;; outlives the specific `Interpreter`/global-env that compiled it — a
+;; thread-local in particular is process-lifetime, so it pins that env's
+;; `Rc` forever. `gc_stress_test`'s `zero_upvalue_env_cycle_collected_via_env_
+;; candidate` and its cross-env sibling caught this the first time it was
+;; tried: after the offending `Interpreter` dropped, its global env's
+;; `bindings` `Rc` was still reachable through the stale cached closure.
+;; Building the factory fresh per call has no such lifetime mismatch — its
+;; only reference is the call's own argument, dropped normally with everything
+;; else once the connection's task settles.
+;; NOTE: calls `__http-serve-run` DIRECTLY (a fixed-arity call per branch),
+;; deliberately NOT via `apply`. `apply`'s cooperative routing (`list.rs`)
+;; only sends a callee through the `NativeOutcome::Call` path when it is
+;; closure or a known runtime-only native; every OTHER native — including a
+;; plain dual-ABI one like `__http-serve-run` — takes `apply`'s synchronous
+;; `call_function` fallback unconditionally, on the assumption that a
+;; dual-ABI native's legacy `func` is a complete, equivalent implementation.
+;; That assumption doesn't hold here: `__http-serve-run`'s legacy `func` is
+;; the OLD serial `blocking_recv` loop, kept only as the (never-reached-in-
+;; production) non-quantum fallback — routing through `apply` silently ran
+;; THAT instead of the concurrent accept loop, and any `async/spawn` inside a
+;; handler failed with "requires runtime invocation" (its `call_function`
+;; path is fully synchronous, same as any other legacy call). A direct call
+;; goes through the VM's normal native-dispatch (`dispatch_native`), which
+;; correctly honors the runtime ABI.
+(defn http/serve (handler . opts)
+  (let ((factory (fn (h req responder) (async/spawn (fn () (responder (h req)))))))
+    (if (null? opts)
+        (__http-serve-run handler factory)
+        (__http-serve-run handler factory (car opts)))))
 "#;

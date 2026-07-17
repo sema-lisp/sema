@@ -1461,46 +1461,96 @@ fn handle_ws_response(
     }
 }
 
+/// Registers `__http-serve-run`, NOT `http/serve` — the user-facing
+/// `http/serve` is a Sema wrapper defined in prelude.rs that mints the
+/// per-connection dispatch factory fresh on every call and forwards to this
+/// native. See that wrapper's doc comment for why (a cached factory, stored
+/// anywhere longer-lived than one call, pins its compiling `Interpreter`'s
+/// global env forever).
 fn register_serve(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
     use sema_core::{intern, Caps, EvalContext, NativeFn};
 
     if sandbox.is_unrestricted() {
         env.set(
-            intern("http/serve"),
-            Value::native_fn(NativeFn::with_ctx(
-                "http/serve",
+            intern("__http-serve-run"),
+            Value::native_fn(NativeFn::with_ctx_runtime(
+                "__http-serve-run",
                 |ctx: &EvalContext, args: &[Value]| http_serve_impl(ctx, args),
+                |_ctx, args| http_serve_runtime_impl(args),
             )),
         );
     } else {
         let sandbox = sandbox.clone();
+        let sandbox_runtime = sandbox.clone();
         env.set(
-            intern("http/serve"),
-            Value::native_fn(NativeFn::with_ctx(
-                "http/serve",
+            intern("__http-serve-run"),
+            Value::native_fn(NativeFn::with_ctx_runtime(
+                "__http-serve-run",
                 move |ctx: &EvalContext, args: &[Value]| {
                     sandbox.check(Caps::NETWORK, "http/serve")?;
                     http_serve_impl(ctx, args)
+                },
+                move |_ctx, args| {
+                    sandbox_runtime.check(Caps::NETWORK, "http/serve")?;
+                    http_serve_runtime_impl(args)
                 },
             )),
         );
     }
 }
 
-fn http_serve_impl(ctx: &sema_core::EvalContext, args: &[Value]) -> Result<Value, SemaError> {
-    use sema_core::call_callback;
+/// `http/serve`'s handler/dispatch-factory + bound request channel, once
+/// bind+listen succeeds. Shared between the sync (serial `blocking_recv`) and
+/// runtime (concurrent accept-loop) dispatch paths — everything up to "the
+/// server is listening and the caller has been notified" is identical
+/// between them.
+struct ServeSetup {
+    handler: Value,
+    /// The per-connection dispatch factory — see prelude.rs's `http/serve`
+    /// wrapper. Unused by the legacy sync path (`http_serve_impl`, which
+    /// dispatches inline exactly as before); threaded through only so
+    /// `__http-serve-run`'s arg parsing is shared between both paths.
+    factory: Value,
+    rx: tokio::sync::mpsc::Receiver<ServerRequest>,
+}
 
-    // `http/serve` below runs its own blocking accept loop on THIS thread
-    // (`rx.blocking_recv()` in the dispatch loop) for the life of the server —
+/// Calls a Sema function value with args, used only for `http_serve_setup`'s
+/// `:on-listen` invocation — see its doc comment for the sync/runtime split.
+type ServeInvoke<'a> = &'a dyn Fn(&Value, &[Value]) -> Result<Value, SemaError>;
+
+/// Parse options, bind + spawn the axum server, and wait for it to come up.
+///
+/// Registered as `__http-serve-run`, NOT `http/serve` directly — see
+/// prelude.rs's `http/serve` wrapper for why: `args[0]` is the user's
+/// `handler`, `args[1]` is the per-connection dispatch factory the wrapper
+/// mints fresh on every call (a plain argument, not a value stored anywhere
+/// persistent — see that doc comment for the leak a cached version of this
+/// had), and `args[2]` is the optional options map.
+///
+/// `invoke` calls a Sema function value with args — used only for the
+/// `:on-listen` callback. The sync caller passes its own `EvalContext`
+/// directly; the runtime caller (no `EvalContext` of its own — the runtime
+/// ABI only threads `NativeCallContext`) routes through the shared
+/// `STDLIB_CTX` via `with_stdlib_ctx`, the same seam `http/router/dispatch`'s
+/// runtime path uses for its handler calls.
+fn http_serve_setup(args: &[Value], invoke: ServeInvoke<'_>) -> Result<ServeSetup, SemaError> {
+    // `http/serve`'s sync dispatch path below runs its own blocking accept
+    // loop on THIS thread (`rx.blocking_recv()`) for the life of the server —
     // by design at top level, where it's the only thing this thread will ever
-    // do again. Inside `async/spawn` that thread IS the VM thread the
-    // cooperative scheduler drives every task on, so the loop would never
-    // return control to the scheduler: every sibling task, and every future
-    // poll of anything else, freezes forever with no error, no log, nothing
-    // to debug. A full non-blocking rearchitecture (yield-aware dispatch +
-    // per-connection handler tasks) is real design work, deliberately
-    // deferred (see docs/deferred.md); until then, fail fast and loud instead
-    // of hanging silently.
+    // do again. The concurrent runtime dispatch path (`http_serve_runtime_impl`)
+    // fixes that for PLAIN HTTP: its accept loop parks cooperatively on a
+    // re-arming `WaitKind::External` instead of blocking, and each connection
+    // runs its own spawned task, so a slow/parked handler no longer stalls its
+    // siblings (see docs/deferred.md "SRV-1"). This guard still rejects
+    // `http/serve` from inside `async/spawn`, though: a WebSocket handler's
+    // `ws/recv`/`ws/send` (below) still use `blocking_recv`/`blocking_send`,
+    // which — unlike the accept loop and a plain-HTTP handler's `async/sleep`/
+    // `async/await` — pin the single cooperative VM thread for as long as the
+    // client stays quiet, freezing every sibling task with no error. Lifting
+    // the guard requires converting those to cooperative External waits too
+    // (deliberately not attempted here); until then, fail fast and loud
+    // instead of hanging silently for the one case (WS-composed-inside-spawn)
+    // this pass doesn't make safe.
     if sema_core::in_runtime_quantum() && sema_core::current_task_id().is_some() {
         // The core message alone must carry enough to explain the failure: a
         // task's rejection is flattened to a plain string when it crosses the
@@ -1518,13 +1568,18 @@ fn http_serve_impl(ctx: &sema_core::EvalContext, args: &[Value]) -> Result<Value
         ));
     }
 
-    if args.is_empty() || args.len() > 2 {
-        return Err(SemaError::arity("http/serve", "1-2", args.len()));
+    if args.len() < 2 || args.len() > 3 {
+        return Err(SemaError::arity(
+            "http/serve",
+            "1-2",
+            args.len().saturating_sub(1),
+        ));
     }
 
     let handler = args[0].clone();
+    let factory = args[1].clone();
 
-    // Parse options map (arg 1): {:port 3000 :host "0.0.0.0"
+    // Parse options map (arg 2): {:port 3000 :host "0.0.0.0"
     //                             :port-fallback true :on-listen (fn (info) ...)}
     let mut port: u16 = 3000;
     let mut host = "0.0.0.0".to_string();
@@ -1534,8 +1589,8 @@ fn http_serve_impl(ctx: &sema_core::EvalContext, args: &[Value]) -> Result<Value
     let mut port_fallback = false;
     let mut on_listen: Option<Value> = None;
 
-    if args.len() == 2 {
-        if let Some(opts) = args[1].as_map_rc() {
+    if args.len() == 3 {
+        if let Some(opts) = args[2].as_map_rc() {
             if let Some(p) = opts.get(&Value::keyword("port")).and_then(|v| v.as_int()) {
                 port = parse_port(p)?;
             }
@@ -1554,7 +1609,7 @@ fn http_serve_impl(ctx: &sema_core::EvalContext, args: &[Value]) -> Result<Value
     }
 
     // Create the mpsc channel for server requests (tokio async channel)
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<ServerRequest>(256);
+    let (tx, rx) = tokio::sync::mpsc::channel::<ServerRequest>(256);
 
     // Create a std sync channel for the ready signal, carrying the port the
     // server actually bound to (may differ from `port` when fallback kicks in).
@@ -1644,10 +1699,33 @@ fn http_serve_impl(ctx: &sema_core::EvalContext, args: &[Value]) -> Result<Value
             Value::keyword("url"),
             Value::string(&format!("http://{host}:{actual_port}")),
         );
-        if let Err(e) = call_callback(ctx, cb, &[Value::map(info)]) {
+        if let Err(e) = invoke(cb, &[Value::map(info)]) {
             eprintln!("http/serve on-listen handler error: {e}");
         }
     }
+
+    Ok(ServeSetup {
+        handler,
+        factory,
+        rx,
+    })
+}
+
+/// Legacy/non-quantum dispatch path: serially drains `rx` on this thread. Used
+/// as `http/serve`'s value-ABI fallback (`NativeFn::with_ctx_runtime`'s `func`)
+/// — reachable only when `http/serve` runs OUTSIDE any unified-runtime quantum,
+/// which the shipped product never does (every eval entry point drives the
+/// runtime; see `docs/deferred.md` "Unified runtime migration"). Kept
+/// byte-for-byte equivalent to pre-SRV-1 behavior as the safety net for that
+/// path, since it cannot suspend (no runtime to park it).
+fn http_serve_impl(ctx: &sema_core::EvalContext, args: &[Value]) -> Result<Value, SemaError> {
+    use sema_core::call_callback;
+
+    let ServeSetup {
+        handler,
+        factory: _,
+        mut rx,
+    } = http_serve_setup(args, &|f, a| call_callback(ctx, f, a))?;
 
     // Main evaluator loop: read requests from channel, call handler, send response.
     //
@@ -1658,13 +1736,10 @@ fn http_serve_impl(ctx: &sema_core::EvalContext, args: &[Value]) -> Result<Value
     // `blocking_recv` on its own per-connection channel) only ever gets called
     // from inside `call_callback` below — so a WS handler idling in `ws/recv`
     // waiting on its client keeps this loop from picking up the NEXT request
-    // (HTTP or WS) until that client sends something or disconnects. axum
-    // itself is fully concurrent (each connection gets its own task and can
-    // queue on the bounded `tx`), but the single evaluator thread draining
-    // that queue serially is the actual concurrency ceiling. Fixing this needs
-    // a yield-aware dispatch loop with a handler task per connection —
-    // deliberately not attempted here (see docs/deferred.md); this comment
-    // documents the limitation, not a bug to chase.
+    // (HTTP or WS) until that client sends something or disconnects. This
+    // serial loop is retained ONLY as the non-runtime-quantum fallback (see
+    // this function's doc comment) — the runtime dispatch path below is what
+    // production actually runs, and fixes exactly this for plain HTTP.
     while let Some(req) = rx.blocking_recv() {
         match req {
             ServerRequest::Http { raw, respond } => {
@@ -1705,6 +1780,267 @@ fn http_serve_impl(ctx: &sema_core::EvalContext, args: &[Value]) -> Result<Value
     Ok(Value::nil())
 }
 
+/// Completion-kind tag for `http/serve`'s accept-loop External wait ("svac" —
+/// serve-accept). Distinct from `http.rs`'s `HTTP_COMPLETION_KIND` (the
+/// OUTBOUND `http/*` client) so the two subsystems' offload accounting never
+/// share a bucket.
+const SERVE_ACCEPT_COMPLETION_KIND: u64 = 0x7376_6163;
+
+type ServeRequestReceiver = tokio::sync::mpsc::Receiver<ServerRequest>;
+/// Ping-pongs the tokio receiver across accept-loop iterations: each External
+/// wait's job MOVES it into the future (so `rx.recv().await` runs off the VM
+/// thread), and its decoder hands it back on the VM thread before the next
+/// wait is built. A plain `Rc<RefCell<..>>`, not a `Value` — the runtime's GC
+/// only traces `Value`/`Env` edges, and this holds neither.
+type ServeRequestReceiverCell = std::rc::Rc<std::cell::RefCell<Option<ServeRequestReceiver>>>;
+
+/// Build the per-request `responder` native: consumes the handler's return
+/// value exactly once and routes it to the connection's `respond` channel —
+/// the same raw/SSE/WebSocket/file dispatch the legacy serial loop did inline
+/// (`http_serve_impl` above), now run from inside the per-connection task the
+/// runtime accept loop spawns. `respond` is a `oneshot::Sender`, usable only
+/// once, but a `NativeFn` closure is `Fn` not `FnOnce` — the `RefCell<Option<_>>`
+/// takes it on first (and only legal) call; a second call is a clear
+/// internal-invariant error rather than a silent no-op or panic.
+///
+/// A handler that RAISES instead of returning never calls this native at all
+/// (see the `http/serve` wrapper in prelude.rs), so `respond` is dropped
+/// unsent; `handle_axum_request`'s `resp_rx.await` `Err(_)` arm already covers
+/// that case with a bounded 500 ("Handler did not respond") — safe, but not
+/// byte-identical to the legacy loop's `{"error": "..."}` JSON body. No
+/// acceptance test pins that body's exact shape.
+fn make_responder_native(respond: tokio::sync::oneshot::Sender<ServerResponse>) -> Value {
+    use sema_core::NativeFn;
+    let respond = std::rc::Rc::new(std::cell::RefCell::new(Some(respond)));
+    Value::native_fn(NativeFn::with_ctx(
+        "http/serve/responder",
+        move |ctx: &sema_core::EvalContext, args: &[Value]| {
+            check_arity!(args, "http/serve/responder", 1);
+            let response_val = &args[0];
+            let respond = respond.borrow_mut().take().ok_or_else(|| {
+                SemaError::eval("http/serve: internal: handler response already sent")
+            })?;
+            if is_stream_response(response_val) {
+                handle_sse_response(ctx, response_val, respond);
+            } else if is_websocket_response(response_val) {
+                handle_ws_response(ctx, response_val, respond);
+            } else if is_file_response(response_val) {
+                handle_file_response(response_val, respond);
+            } else {
+                let raw_resp = value_to_raw_response(response_val);
+                let _ = respond.send(ServerResponse::Raw(raw_resp));
+            }
+            Ok(Value::nil())
+        },
+    ))
+}
+
+/// Build the next accept-loop External wait: take `rx` out of `rx_cell`, park
+/// on `rx.recv()` off the VM thread, and decode the result back into either
+/// `nil` (channel closed — every sender dropped, server shutting down) or a
+/// 2-vector `[request-map responder-native]` for [`AcceptLoopContinuation`] to
+/// dispatch. This is the re-arming shape the SRV-1 liveness spike
+/// (`crates/sema-vm/src/runtime/tests.rs`, `srv1_spike_*`) proves deadlock-free:
+/// a task parked here alone still drives the runtime to `Idle`, never a false
+/// `Quiescent`/deadlock, and re-arming across many iterations leaks nothing.
+fn next_accept_wait(
+    handler: Value,
+    factory: Value,
+    rx_cell: ServeRequestReceiverCell,
+) -> sema_core::runtime::NativeResult {
+    use sema_core::runtime::CompletionKind;
+
+    let rx = rx_cell.borrow_mut().take().ok_or_else(|| {
+        SemaError::eval("http/serve: internal: accept-loop receiver missing (already parked?)")
+    })?;
+    let decode_cell = rx_cell.clone();
+    let continuation: Box<dyn sema_core::runtime::NativeContinuation> =
+        Box::new(AcceptLoopContinuation {
+            handler: handler.clone(),
+            factory: factory.clone(),
+            rx_cell,
+        });
+    let kind = CompletionKind::try_from_raw(SERVE_ACCEPT_COMPLETION_KIND)
+        .expect("http/serve accept completion kind is nonzero");
+    crate::runtime_offload::external_io_async_try_with_continuation(
+        "http/serve",
+        kind,
+        "http/serve/accept",
+        move |(rx, item): (ServeRequestReceiver, Option<ServerRequest>)| -> Result<Value, SemaError> {
+            *decode_cell.borrow_mut() = Some(rx);
+            match item {
+                None => Ok(Value::nil()),
+                Some(ServerRequest::Http { raw, respond }) => {
+                    let request_val = raw_request_to_value(&raw);
+                    let responder_val = make_responder_native(respond);
+                    Ok(Value::vector(vec![request_val, responder_val]))
+                }
+            }
+        },
+        continuation,
+        move || {
+            let mut rx = rx;
+            async move {
+                let item = rx.recv().await;
+                Ok::<_, String>((rx, item))
+            }
+        },
+    )
+}
+
+/// Resumes the accept-loop's External wait: decodes either `nil` (shutdown, end
+/// the loop) or `[request responder]`, then mints AND spawns the per-connection
+/// handler task in one `Call` to the per-connection dispatch factory (`args[1]`,
+/// minted fresh per call by the `http/serve` wrapper in prelude.rs).
+/// Traces `handler`/`factory`: both are live `Value`s held across the External
+/// park, exactly like `RouterDecoder`'s route handlers.
+///
+/// The factory does the `async/spawn` itself, in compiled Sema bytecode,
+/// rather than this continuation issuing a bare `RuntimeRequest::Spawn` —
+/// deliberately: `spawn_via_registry` (`sema-vm/src/runtime/state.rs`) has a
+/// `ReturnOwner::VmResume` fast path that silently discards any
+/// caller-supplied continuation OTHER than `async/spawn`'s own trivial
+/// default, injecting the settled promise straight onto the parked VM's stack
+/// instead. Every hop chained off a plain top-level call keeps
+/// `owner == VmResume` the whole way (confirmed empirically: a version of this
+/// code that issued `RuntimeRequest::Spawn` with a custom re-arm continuation
+/// had that continuation silently skipped — the spawned task still ran
+/// correctly, but the accept loop's OWN promise, not the connection's
+/// response, became `http/serve`'s call result, and the loop stopped
+/// re-arming after one request). Routing the spawn through compiled bytecode
+/// (see prelude.rs's factory) sidesteps the gap entirely — no bare
+/// `RuntimeRequest::Spawn` ever crosses this Rust continuation boundary — at
+/// the cost of one Sema-level indirection, and needs no sema-vm change.
+struct AcceptLoopContinuation {
+    handler: Value,
+    factory: Value,
+    rx_cell: ServeRequestReceiverCell,
+}
+
+impl sema_core::runtime::Trace for AcceptLoopContinuation {
+    fn trace(&self, sink: &mut dyn FnMut(sema_core::cycle::GcEdge<'_>)) -> bool {
+        sink(sema_core::cycle::GcEdge::Value(&self.handler));
+        sink(sema_core::cycle::GcEdge::Value(&self.factory));
+        true
+    }
+}
+
+impl sema_core::runtime::NativeContinuation for AcceptLoopContinuation {
+    fn resume(
+        self: Box<Self>,
+        _context: &mut sema_core::runtime::NativeCallContext<'_>,
+        input: sema_core::runtime::ResumeInput,
+    ) -> sema_core::runtime::NativeResult {
+        use sema_core::runtime::{NativeCall, NativeOutcome, ResumeInput};
+        match input {
+            ResumeInput::Returned(value) => {
+                if value.is_nil() {
+                    // The request channel closed — every sender dropped, so the
+                    // axum server task is gone too. End the accept loop cleanly;
+                    // `http/serve`'s call resolves to nil, matching the legacy
+                    // serial loop's `while let Some(req) = rx.blocking_recv()`
+                    // falling out of its loop.
+                    return Ok(NativeOutcome::Return(Value::nil()));
+                }
+                let pair = value
+                    .as_vector_rc()
+                    .filter(|v| v.len() == 2)
+                    .ok_or_else(|| {
+                        SemaError::eval(
+                            "http/serve: internal: malformed accept-loop payload (expected a \
+                         2-vector [request responder])",
+                        )
+                    })?;
+                let request_val = pair[0].clone();
+                let responder_val = pair[1].clone();
+                Ok(NativeOutcome::Call(NativeCall {
+                    callable: self.factory.clone(),
+                    args: vec![self.handler.clone(), request_val, responder_val],
+                    continuation: Box::new(AfterDispatchContinuation {
+                        handler: self.handler,
+                        factory: self.factory,
+                        rx_cell: self.rx_cell,
+                    }),
+                }))
+            }
+            ResumeInput::Failed(error) => Err(error),
+            ResumeInput::Cancelled(reason) => Err(SemaError::eval(format!(
+                "http/serve: accept loop was cancelled ({reason:?})"
+            ))),
+            ResumeInput::Runtime(_) => Err(SemaError::eval(
+                "http/serve: accept loop continuation received an unexpected runtime response",
+            )),
+        }
+    }
+}
+
+/// Resumes once the dispatch factory returns — the per-connection
+/// handler task is already minted AND spawned (detached — fire-and-forget,
+/// its promise discarded here; the connection's response reaches the client
+/// through `responder`, not through this promise): re-arms the next accept
+/// wait, closing the loop. The re-arm itself is what the SRV-1 spike's
+/// `srv1_spike_rearm_indefinite` proves terminates cleanly and leaks nothing
+/// across many iterations. Traces `handler`/`factory` for the same reason as
+/// [`AcceptLoopContinuation`] (still held across this stage's `Call`).
+struct AfterDispatchContinuation {
+    handler: Value,
+    factory: Value,
+    rx_cell: ServeRequestReceiverCell,
+}
+
+impl sema_core::runtime::Trace for AfterDispatchContinuation {
+    fn trace(&self, sink: &mut dyn FnMut(sema_core::cycle::GcEdge<'_>)) -> bool {
+        sink(sema_core::cycle::GcEdge::Value(&self.handler));
+        sink(sema_core::cycle::GcEdge::Value(&self.factory));
+        true
+    }
+}
+
+impl sema_core::runtime::NativeContinuation for AfterDispatchContinuation {
+    fn resume(
+        self: Box<Self>,
+        _context: &mut sema_core::runtime::NativeCallContext<'_>,
+        input: sema_core::runtime::ResumeInput,
+    ) -> sema_core::runtime::NativeResult {
+        use sema_core::runtime::ResumeInput;
+        match input {
+            // The dispatch factory's return value is the spawned
+            // task's promise (from `async/spawn` inside the factory) — not
+            // needed here; deliberately discarded (detached/fire-and-forget).
+            ResumeInput::Returned(_promise) => {
+                next_accept_wait(self.handler, self.factory, self.rx_cell)
+            }
+            ResumeInput::Failed(error) => Err(error),
+            ResumeInput::Cancelled(reason) => Err(SemaError::eval(format!(
+                "http/serve: accept loop was cancelled while dispatching a handler task ({reason:?})"
+            ))),
+            ResumeInput::Runtime(_) => Err(SemaError::eval(
+                "http/serve: dispatch-task factory call returned an unexpected runtime response",
+            )),
+        }
+    }
+}
+
+/// Concurrent runtime-ABI dispatch path: `http/serve`'s accept loop, re-arming
+/// on a `WaitKind::External` per request (see [`next_accept_wait`]) instead of
+/// blocking the VM thread. Each connection's handler runs as its own spawned
+/// task (scope isolation is free here — `spawn_via_registry` already
+/// fresh-defaults every spawned task's dynamic scopes, the same seam
+/// `async/spawn` uses), so a slow/parked handler no longer stalls its
+/// siblings. This is what `http/serve` actually runs in the shipped product
+/// (every eval entry point drives the unified runtime).
+fn http_serve_runtime_impl(args: &[Value]) -> sema_core::runtime::NativeResult {
+    let ServeSetup {
+        handler,
+        factory,
+        rx,
+    } = http_serve_setup(args, &|f, a| {
+        sema_core::with_stdlib_ctx(|c| sema_core::call_callback(c, f, a))
+    })?;
+    let rx_cell: ServeRequestReceiverCell = std::rc::Rc::new(std::cell::RefCell::new(Some(rx)));
+    next_accept_wait(handler, factory, rx_cell)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1735,6 +2071,56 @@ mod tests {
         assert_eq!(
             edges, 2,
             "RouterDecoder must trace exactly one edge per route handler"
+        );
+    }
+
+    // SRV-1 / invariant I2 (CORE-2 GC): `AcceptLoopContinuation` holds the
+    // `handler` and `factory` `Value`s live across the accept loop's External
+    // park — its `Trace` MUST expose exactly those two as GC edges, or the
+    // collector could reclaim a still-in-flight handler/factory closure.
+    #[test]
+    fn accept_loop_continuation_traces_exactly_handler_and_factory() {
+        use sema_core::runtime::Trace;
+        let handler = Value::string("handler");
+        let factory = Value::string("factory");
+        let cont = AcceptLoopContinuation {
+            handler: handler.clone(),
+            factory: factory.clone(),
+            rx_cell: std::rc::Rc::new(std::cell::RefCell::new(None)),
+        };
+        let mut edges = 0usize;
+        cont.trace(&mut |edge| {
+            if let sema_core::cycle::GcEdge::Value(_) = edge {
+                edges += 1;
+            }
+        });
+        assert_eq!(
+            edges, 2,
+            "AcceptLoopContinuation must trace exactly handler + factory"
+        );
+    }
+
+    // Same invariant for `AfterDispatchContinuation`, which carries the same
+    // two `Value`s across the `Call` to the dispatch factory.
+    #[test]
+    fn after_dispatch_continuation_traces_exactly_handler_and_factory() {
+        use sema_core::runtime::Trace;
+        let handler = Value::string("handler");
+        let factory = Value::string("factory");
+        let cont = AfterDispatchContinuation {
+            handler: handler.clone(),
+            factory: factory.clone(),
+            rx_cell: std::rc::Rc::new(std::cell::RefCell::new(None)),
+        };
+        let mut edges = 0usize;
+        cont.trace(&mut |edge| {
+            if let sema_core::cycle::GcEdge::Value(_) = edge {
+                edges += 1;
+            }
+        });
+        assert_eq!(
+            edges, 2,
+            "AfterDispatchContinuation must trace exactly handler + factory"
         );
     }
 

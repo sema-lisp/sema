@@ -134,7 +134,6 @@ fn bounded<T: Send + 'static>(budget: Duration, body: impl FnOnce() -> T + Send 
 /// `/fast` returns in well under the slow handler's remaining sleep; under the
 /// shipped serial loop it can only be handled after `/slow` completes.
 #[test]
-#[ignore = "SRV-1: async http/serve concurrent handlers not yet implemented (also needs a loopback port + subprocess)"]
 fn slow_handler_does_not_block_fast_handler() {
     let port = free_port();
     let program = format!(
@@ -228,7 +227,6 @@ fn idle_websocket_does_not_block_plain_request() {
 /// The handler awaits a spawned task (which itself sleeps) and echoes its result;
 /// the response must come back intact within a bounded time.
 #[test]
-#[ignore = "SRV-1: handler task parking under http/serve not yet implemented (also needs a loopback port + subprocess)"]
 fn handler_parking_on_async_returns_response() {
     let port = free_port();
     let program = format!(

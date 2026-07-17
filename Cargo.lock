@@ -4181,6 +4181,7 @@ dependencies = [
  "sema-core",
  "sema-eval",
  "sema-otel",
+ "sema-vm",
  "serde",
  "serde_json",
  "tokio",

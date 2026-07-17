@@ -463,7 +463,10 @@ C13	crates/sema-mcp/src/oauth/flow.rs:276:            let request = server.recv(
 H07	crates/sema-mcp/src/oauth/loopback.rs:84:                .recv_timeout(remaining)
 H07	crates/sema-mcp/src/tools.rs:548:    // runtime, the sole async engine, so async/await, channels, and timers work
 H06	crates/sema-notebook/src/bridge.rs:126:            while let Some(req) = rt.block_on(rx.recv()) {
-H06	crates/sema-notebook/src/engine.rs:528:                   (channel/send ch (list ch))
+H06	crates/sema-notebook/src/engine.rs:144:    /// whichever cell this engine is currently driving (`async/sleep 60000`
+H06	crates/sema-notebook/src/engine.rs:620:                   (channel/send ch (list ch))
+H06	crates/sema-notebook/src/engine.rs:888:                std::thread::sleep(Duration::from_millis(1));
+H06	crates/sema-notebook/src/engine.rs:894:        let (_, result) = engine.create_and_eval("(async/sleep 60000)").unwrap();
 C06	crates/sema-otel/src/imp.rs:142:/// propagation across `async/spawn` (a `(with-span … (async/map …))` becomes one
 C06	crates/sema-otel/src/imp.rs:336:    // `thread_local!` block, but std destroys them in an unspecified order, so a window
 C06	crates/sema-otel/src/imp.rs:458:        std::thread::sleep(Duration::from_millis(25));
@@ -847,17 +850,17 @@ C12	crates/sema-workflow/src/context.rs:39:thread_local! {
 H01	crates/sema/src/lib.rs:133:        sema_core::set_eval_callback(&ctx, sema_eval::eval_value_vm);
 H01	crates/sema/src/lib.rs:134:        sema_core::set_call_callback(&ctx, sema_eval::call_value);
 H01	crates/sema/src/lib.rs:135:        sema_core::set_call_owned_callback(&ctx, sema_eval::call_value_owned);
-H02	crates/sema/src/main.rs:1011:                    .block_on(async {
-H02	crates/sema/src/main.rs:1250:                .block_on(workflow_view::serve(PathBuf::from(run_dir), &host, port));
-H02	crates/sema/src/main.rs:1360:                .block_on(async {
-H02	crates/sema/src/main.rs:1377:        std::thread::sleep(std::time::Duration::from_millis(250));
-H02	crates/sema/src/main.rs:1447:            std::thread::sleep(std::time::Duration::from_secs(3600));
-H02	crates/sema/src/main.rs:1552:                .block_on(sema_notebook::serve(path, &host, port));
-H02	crates/sema/src/main.rs:2090:            .block_on(async {
-H02	crates/sema/src/main.rs:3046:    // runtime, the sole async engine, so async/await, channels, and timers work
+H02	crates/sema/src/main.rs:1016:                    .block_on(async {
+H02	crates/sema/src/main.rs:1255:                .block_on(workflow_view::serve(PathBuf::from(run_dir), &host, port));
+H02	crates/sema/src/main.rs:1365:                .block_on(async {
+H02	crates/sema/src/main.rs:1382:        std::thread::sleep(std::time::Duration::from_millis(250));
+H02	crates/sema/src/main.rs:1452:            std::thread::sleep(std::time::Duration::from_secs(3600));
+H02	crates/sema/src/main.rs:1557:                .block_on(sema_notebook::serve(path, &host, port));
+H02	crates/sema/src/main.rs:2095:            .block_on(async {
+H02	crates/sema/src/main.rs:3051:    // runtime, the sole async engine, so async/await, channels, and timers work
 H02	crates/sema/src/main.rs:92:thread_local! {
-H02	crates/sema/src/main.rs:938:                    .block_on(sema_lsp::run_server());
-H02	crates/sema/src/main.rs:945:                    .block_on(sema_dap::run_server());
+H02	crates/sema/src/main.rs:943:                    .block_on(sema_lsp::run_server());
+H02	crates/sema/src/main.rs:950:                    .block_on(sema_dap::run_server());
 H02	crates/sema/src/pkg.rs:1528:                std::thread::sleep(jittered(wait));
 H02	crates/sema/src/pkg.rs:1541:                std::thread::sleep(jittered(backoff));
 H03	crates/sema/src/repl/completer.rs:16:thread_local! {

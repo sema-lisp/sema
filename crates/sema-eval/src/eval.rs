@@ -215,8 +215,8 @@ impl Interpreter {
             sema_llm::builtins::register_llm_builtins(&env, &sema_core::Sandbox::allow_all());
         }
         let global_env = Rc::new(env);
-        register_vm_delegates(&global_env);
         let ctx = Rc::new(ctx);
+        register_vm_delegates(&global_env, &ctx);
         load_prelude(&ctx, &global_env);
         (global_env, ctx)
     }
@@ -234,8 +234,8 @@ impl Interpreter {
             sema_llm::builtins::register_llm_builtins(&env, sandbox);
         }
         let global_env = Rc::new(env);
-        register_vm_delegates(&global_env);
         let ctx = Rc::new(ctx);
+        register_vm_delegates(&global_env, &ctx);
         load_prelude(&ctx, &global_env);
         Self::from_parts(global_env, ctx)
     }
@@ -1509,28 +1509,13 @@ pub fn call_value_owned(ctx: &EvalContext, func: &Value, args: &mut [Value]) -> 
     call_value(ctx, func, args)
 }
 
-/// Call a multimethod: dispatch on args, look up handler, call it.
+/// Call a multimethod: dispatch on args, look up handler, call it. Handler
+/// resolution is shared with the VM's runtime-quantum-aware direct-call sites
+/// (`sema_core::resolve_multimethod_handler`) so both paths pick the exact
+/// same handler for the exact same dispatch value.
 fn call_multimethod(ctx: &EvalContext, mm: &Rc<MultiMethod>, args: &[Value]) -> EvalResult {
-    let dispatch_val = call_value(ctx, &mm.dispatch_fn, args)?;
-    let methods = mm.methods.borrow();
-    if let Some(handler) = methods.get(&dispatch_val) {
-        let handler = handler.clone();
-        drop(methods);
-        call_value(ctx, &handler, args)
-    } else {
-        drop(methods);
-        let default = mm.default.borrow().clone();
-        if let Some(handler) = default {
-            call_value(ctx, &handler, args)
-        } else {
-            Err(SemaError::eval(format!(
-                "no method in multimethod '{}' for dispatch value: {}",
-                resolve(mm.name),
-                dispatch_val
-            ))
-            .with_hint("add a (defmethod name :default handler) to handle unmatched values"))
-        }
-    }
+    let handler = sema_core::resolve_multimethod_handler(ctx, mm, args)?;
+    call_value(ctx, &handler, args)
 }
 
 /// Run a trampoline to completion iteratively.
@@ -1773,33 +1758,116 @@ fn upgrade_delegate_env(weak: &Weak<Env>) -> Result<Rc<Env>, SemaError> {
         .ok_or_else(|| SemaError::eval("evaluator environment has been torn down"))
 }
 
+/// Cooperative continuation for nested `eval`'s runtime ABI: the eval'd
+/// program is driven as one `NativeOutcome::Call` to a callable wrapping the
+/// compiled chunk (`sema_vm::program_as_callable`), and this continuation
+/// just forwards whatever it settles with straight through — `eval`'s result
+/// IS the program's result. Mirrors `IdentityContinuation` in
+/// `sema-stdlib::list` (`apply`'s cooperative path). Holds no state, so
+/// nothing to trace.
+struct EvalProgramContinuation;
+
+impl sema_core::runtime::Trace for EvalProgramContinuation {
+    fn trace(&self, _sink: &mut dyn FnMut(sema_core::cycle::GcEdge<'_>)) -> bool {
+        true
+    }
+}
+
+impl sema_core::runtime::NativeContinuation for EvalProgramContinuation {
+    fn resume(
+        self: Box<Self>,
+        _context: &mut sema_core::runtime::NativeCallContext<'_>,
+        input: sema_core::runtime::ResumeInput,
+    ) -> sema_core::runtime::NativeResult {
+        use sema_core::runtime::{NativeOutcome, ResumeInput};
+        match input {
+            ResumeInput::Returned(value) => Ok(NativeOutcome::Return(value)),
+            ResumeInput::Failed(error) => Err(error),
+            ResumeInput::Cancelled(reason) => {
+                Err(SemaError::eval(format!("eval was cancelled ({reason:?})")))
+            }
+            ResumeInput::Runtime(_) => Err(SemaError::eval(
+                "eval continuation received an unexpected runtime response",
+            )),
+        }
+    }
+}
+
 /// Register the `__vm-*` delegate natives into `env`.
 ///
 /// Invariant I2 (CORE-2): each delegate's boxed closure captures the env it is
 /// registered into WEAKLY (`Weak<Env>`), never strongly — a strong capture
 /// would form an uncollectable `Env → NativeFn → Box<dyn Fn> → Env` cycle that
-/// pins the entire environment past Interpreter teardown.
-pub fn register_vm_delegates(env: &Rc<Env>) {
+/// pins the entire environment past Interpreter teardown. `__vm-eval`'s
+/// runtime-ABI closure additionally captures `ctx` WEAKLY for the same
+/// reason: `EvalContext` transitively owns `Value`s (module cache, user
+/// context), so a strong capture would form the same kind of uncollectable
+/// cycle.
+pub fn register_vm_delegates(env: &Rc<Env>, ctx: &Rc<EvalContext>) {
     // __vm-eval: macro-expand, compile, and run the expression on the bytecode
     // VM (rooted at the global env so top-level `define`s persist). The runtime
     // `(eval ...)` meta path is thus VM-native.
+    //
+    // Dual ABI (Step G): the legacy value ABI (`func`, below) is UNCHANGED —
+    // a bare top-level `eval` or one reached from a nested synchronous
+    // re-entry keeps running the eval'd form on a fresh, throwaway
+    // `VM::execute`, exactly as before. The runtime ABI (`runtime`) only
+    // takes over when `__vm-eval` is dispatched inside a live runtime
+    // quantum (`dispatch_native`'s `runtime_quantum_active()` gate): macro
+    // expansion and compilation stay synchronous (they need `EvalContext`,
+    // which the runtime ABI is never handed — `NativeFn::invoke_runtime`
+    // only forwards it to the legacy fallback), but EXECUTION of the
+    // compiled program is handed to the runtime as an ordinary
+    // `NativeOutcome::Call` callee (`sema_vm::program_as_callable`), exactly
+    // like a HOF's callback (`MapContinuation` et al. in
+    // `sema-stdlib::list`). This lets the runtime host a suspension
+    // (`async/await`, `channel/*`, …) inside the eval'd form instead of the
+    // fresh VM hitting a dead end with no scheduler attached.
     let eval_env = Rc::downgrade(env);
+    let eval_env_runtime = Rc::downgrade(env);
+    let eval_ctx_runtime = Rc::downgrade(ctx);
     env.set(
         intern("__vm-eval"),
-        Value::native_fn(NativeFn::with_ctx("__vm-eval", move |ctx, args| {
-            if args.len() != 1 {
-                return Err(SemaError::arity("eval", "1", args.len()));
-            }
-            let eval_env = upgrade_delegate_env(&eval_env)?;
-            let expanded = expand_for_vm_in(ctx, &eval_env, &args[0])?;
-            // A form that expands to nothing (e.g. a `defmacro`) yields nil.
-            if expanded.is_nil() {
-                return Ok(Value::nil());
-            }
-            let prog = sema_vm::compile_program(std::slice::from_ref(&expanded), None)?;
-            let mut vm = sema_vm::VM::new(eval_env, prog.functions, &[], prog.main_cache_slots)?;
-            vm.execute(prog.closure, ctx)
-        })),
+        Value::native_fn(NativeFn::with_ctx_runtime(
+            "__vm-eval",
+            move |ctx, args| {
+                if args.len() != 1 {
+                    return Err(SemaError::arity("eval", "1", args.len()));
+                }
+                let eval_env = upgrade_delegate_env(&eval_env)?;
+                let expanded = expand_for_vm_in(ctx, &eval_env, &args[0])?;
+                // A form that expands to nothing (e.g. a `defmacro`) yields nil.
+                if expanded.is_nil() {
+                    return Ok(Value::nil());
+                }
+                let prog = sema_vm::compile_program(std::slice::from_ref(&expanded), None)?;
+                let mut vm =
+                    sema_vm::VM::new(eval_env, prog.functions, &[], prog.main_cache_slots)?;
+                vm.execute(prog.closure, ctx)
+            },
+            move |_native_ctx, args| {
+                if args.len() != 1 {
+                    return Err(SemaError::arity("eval", "1", args.len()));
+                }
+                let eval_env = upgrade_delegate_env(&eval_env_runtime)?;
+                let eval_ctx = eval_ctx_runtime
+                    .upgrade()
+                    .ok_or_else(|| SemaError::eval("evaluator context has been torn down"))?;
+                let expanded = expand_for_vm_in(&eval_ctx, &eval_env, &args[0])?;
+                if expanded.is_nil() {
+                    return Ok(sema_core::runtime::NativeOutcome::Return(Value::nil()));
+                }
+                let prog = sema_vm::compile_program(std::slice::from_ref(&expanded), None)?;
+                let callable = sema_vm::program_as_callable(prog, eval_env)?;
+                Ok(sema_core::runtime::NativeOutcome::Call(
+                    sema_core::runtime::NativeCall {
+                        callable,
+                        args: Vec::new(),
+                        continuation: Box::new(EvalProgramContinuation),
+                    },
+                ))
+            },
+        )),
     );
 
     // __vm-module-exports: register a `(module name (export ...) ...)` form's

@@ -147,12 +147,12 @@ impl InterpreterBuilder {
         }
 
         let global_env = Rc::new(env);
+        let ctx = Rc::new(ctx);
         // The VM is the sole evaluator: register the __vm-* delegates (eval/load/
         // import/macroexpand/...) and load the prelude macros, exactly as
         // sema_eval::Interpreter::new does. Without this, an embedder built via
         // this builder would lose import/load and all prelude macros on the VM.
-        sema_eval::register_vm_delegates(&global_env);
-        let ctx = Rc::new(ctx);
+        sema_eval::register_vm_delegates(&global_env, &ctx);
         sema_eval::load_prelude(&ctx, &global_env);
 
         Interpreter {

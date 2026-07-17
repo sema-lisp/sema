@@ -73,11 +73,11 @@ pub use sandbox::{Caps, Sandbox};
 pub use text_util::truncate_chars;
 pub use value::{
     bits_to_spur, compare_spurs, intern, interner_stats, next_gensym, pretty_print, resolve,
-    spur_to_bits, with_resolved, Agent, AsyncPromise, Channel, Conversation, Env, ImageAttachment,
-    Lambda, Macro, Message, MultiMethod, MutableArray, MutableCell, NativeFn, PromiseState, Prompt,
-    Record, Role, SemaStream, StreamBox, SyntaxRules, Thunk, ToolDefinition, Value, ValueView,
-    ValueViewRef, NAN_INT_SIGN_BIT, NAN_INT_SMALL_PATTERN, NAN_PAYLOAD_BITS, NAN_PAYLOAD_MASK,
-    NAN_TAG_MASK, TAG_NATIVE_FN,
+    resolve_multimethod_handler, spur_to_bits, with_resolved, Agent, AsyncPromise, Channel,
+    Conversation, Env, ImageAttachment, Lambda, Macro, Message, MultiMethod, MutableArray,
+    MutableCell, NativeFn, PromiseState, Prompt, Record, Role, SemaStream, StreamBox, SyntaxRules,
+    Thunk, ToolDefinition, Value, ValueView, ValueViewRef, NAN_INT_SIGN_BIT, NAN_INT_SMALL_PATTERN,
+    NAN_PAYLOAD_BITS, NAN_PAYLOAD_MASK, NAN_TAG_MASK, TAG_NATIVE_FN,
 };
 
 pub mod runtime;

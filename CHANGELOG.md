@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+- **Unified runtime — Step G callback re-entry (nested `eval` and multimethod
+  dispatch):** the last two gaps where a synchronous evaluator re-entry could
+  not host a suspension are fixed. `(eval '(async/await (async ...)))` now
+  runs the eval'd form under the SAME runtime quantum instead of a fresh,
+  scheduler-less VM — `__vm-eval` gained a runtime-ABI path that wraps the
+  compiled chunk as a callable (`sema_vm::program_as_callable`) and hands it to
+  the runtime as a cooperative `NativeOutcome::Call`, exactly like a
+  higher-order-function callback. A direct multimethod call `(mm x)` whose
+  SELECTED method suspends (`async/await`, `channel/*`, …) now suspends
+  cleanly too, instead of leaking "internal error: runtime native function 'X'
+  requires runtime invocation" — the VM's direct-call sites route a
+  runtime-quantum multimethod dispatch through the same cooperative Call path.
+  Both synchronous paths (top-level `eval`, a multimethod call outside a
+  runtime quantum, `apply` of a multimethod) are unchanged. See
+  `docs/deferred.md`'s Step G entry.
 - **WASM Promise-driven roots — the deletion (P6-3 step 5):** the shipped
   HTTP-replay loops (`evalAsync`/`evalVMAsync`/`runEntryAsync` re-running the
   whole program on every host I/O, up to `MAX_REPLAYS=50`) and the playground

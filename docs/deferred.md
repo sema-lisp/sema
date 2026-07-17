@@ -564,10 +564,83 @@ tracked as bugs to fix later — the audit checked them and closed them):
 the unified cooperative `Runtime` — the sole async engine for CLI, MCP,
 notebook, REPL, DAP, wasm, and tests. The legacy thread-local scheduler is
 DELETED (P5, commit a1862f67); `scripts/check-unified-runtime-legacy.sh
---check` enforces zero reintroduction. One async test remains `#[ignore]`d
-pending Step G (below).
+--check` enforces zero reintroduction.
 
-- **`vm_eval_is_vm_native_runs_async`** (`crates/sema/tests/vm_integration_test.rs`).
+- **RESOLVED (2026-07-17, Step G — callback re-entry).** Both remaining
+  Step-G gaps (nested `eval` of an async form, and multimethod dispatch of a
+  suspending method) are fixed by giving each a runtime-ABI path that returns
+  `NativeOutcome::Call`, so the runtime hosts the callee's suspension exactly
+  like a HOF callback (`MapContinuation` et al.). The synchronous value-ABI
+  paths are byte-for-byte unchanged: a bare top-level `eval`, a nested
+  synchronous re-entry, and a multimethod call outside a runtime quantum all
+  keep their exact prior behavior.
+
+  **Nested `eval`.** `__vm-eval` (`crates/sema-eval/src/eval.rs`,
+  `register_vm_delegates`) became a dual-ABI native
+  (`NativeFn::with_ctx_runtime`): the legacy `func` is untouched (macro-expand,
+  compile, run on a fresh throwaway `VM::execute`); the new `runtime` closure
+  does the SAME macro-expansion + compile synchronously (both need
+  `EvalContext`, which `NativeFn::invoke_runtime` only ever forwards to the
+  legacy fallback — never to a `runtime_func`, so expansion/compile cannot move
+  into the runtime closure itself), then wraps the compiled chunk as a callable
+  `Value` via a new `sema_vm::program_as_callable(prog, home)` and returns it as
+  one `NativeOutcome::Call` with a trivial forwarding continuation
+  (`EvalProgramContinuation`). `program_as_callable` concretizes
+  `compile_program`'s main closure — normally `globals: None`/`functions: None`
+  ("run me on whichever VM owns me", since it's always driven directly by
+  `VM::execute`) — into a real `MakeClosure`-shaped closure with a concrete home
+  env, mirroring the wrapper `VM::make_closure` builds for an ordinary user
+  closure, INCLUDING re-running the cache-offset assignment loop `VM::new`
+  normally does for a freshly loaded program (skipping it would alias the
+  eval'd program's inline-cache slots with a nested closure's inside it). Once
+  wrapped, `invoke_vm_callback_loop`'s existing VM-closure extraction
+  (`extract_vm_closure`) picks it up for free — no new runtime-loop code was
+  needed. `register_vm_delegates` now also takes `ctx: &Rc<EvalContext>` (all
+  three call sites — `sema-eval`'s two `Interpreter` constructors and
+  `sema/src/lib.rs`'s builder — now `Rc::new(ctx)` BEFORE calling it) so the
+  runtime closure can capture `Weak<EvalContext>` (invariant I2: `EvalContext`
+  transitively owns `Value`s via its module/user-context caches, so the capture
+  must be weak, upgraded per call, exactly like the existing `Weak<Env>`
+  pattern in the same function).
+
+  **Multimethod dispatch.** The direct-call sites in the VM
+  (`crates/sema-vm/src/vm.rs`, `call_value`/`call_value_with`'s non-native,
+  non-keyword fallback, `tail_call_value` delegates to `call_value`) used to
+  always call `sema_core::call_callback` synchronously — the only channel
+  `call_value`'s callback signature offers, which cannot express a suspension.
+  Both sites now share a new `call_non_native` helper: when a runtime quantum
+  is active AND the callee is a multimethod, it resolves the SELECTED method
+  (still synchronously — the dispatch function itself is a plain selector, not
+  expected to suspend, mirroring `apply`'s cooperative gate, which never routes
+  a multimethod's dispatch function through the Call ABI either) via a new
+  shared `sema_core::resolve_multimethod_handler(ctx, mm, args)` (factored out
+  of `sema-eval`'s `call_multimethod`, which now calls it too — one dispatch
+  algorithm, not two), then stashes a `NativeOutcome::Call` to the handler
+  (`MultimethodCallContinuation`, a trivial forwarder) via the SAME
+  `stash_native_dispatch` a native's runtime dispatch uses, so the opcode loop
+  (`Op::CALL`/`Op::TAIL_CALL`) picks it up as a structural pending outcome with
+  no new opcode-level plumbing. Outside a runtime quantum, or for any other
+  non-native callable, `call_non_native` falls back to the exact prior
+  synchronous `call_callback` path.
+
+  Verified working: `(eval '(async/await (async (+ 40 2))))` → 42 (was: "no
+  async scheduler registered"); `(eval '(+ 1 2))` unaffected at top level and
+  inside a runtime quantum; `(map (fn (x) (eval x)) '((+ 1 1) (+ 2 2)))` →
+  `(2 4)`; a direct multimethod call whose selected method does
+  `(async/await (async/spawn ...))` suspends and resumes cleanly, while a
+  sibling synchronous method on the same multimethod, and `(apply mm ...)`
+  (which deliberately keeps multimethod callees on the synchronous path — the
+  cooperative Call path still does not dispatch multimethods, so `apply`'s
+  existing graceful "cannot invoke runtime-only native" error surface for a
+  runtime-only callee is unaffected), are both unchanged. Gate tests:
+  `vm_eval_is_vm_native_runs_async` (`crates/sema/tests/vm_integration_test.rs`,
+  un-`#[ignore]`d) and
+  `multimethod_selected_method_suspends_cooperatively`
+  (`crates/sema/tests/vm_async_test.rs`).
+
+  Historical description follows (superseded by the resolution above).
+
+  **`vm_eval_is_vm_native_runs_async`** (`crates/sema/tests/vm_integration_test.rs`).
   `(eval '(await (async (+ 40 2))))` fails with "no async scheduler registered".
   Root cause: the nested-`eval` callback (`eval_value_vm` in
   `crates/sema-eval/src/eval.rs`) runs the eval'd form on a FRESH `VM::execute`

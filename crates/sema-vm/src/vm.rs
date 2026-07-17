@@ -4,7 +4,10 @@ use std::rc::{Rc, Weak};
 
 use smallvec::SmallVec;
 
-use sema_core::runtime::{CancellationView, NativeCallContext, NativeOutcome};
+use sema_core::runtime::{
+    CancellationView, NativeCall, NativeCallContext, NativeContinuation, NativeOutcome,
+    NativeResult, ResumeInput, Trace,
+};
 use sema_core::{
     bits_to_spur,
     error::{suggest_similar, veteran_hint, CallFrame as CoreCallFrame, StackTrace},
@@ -635,6 +638,40 @@ fn env_root(env: &Rc<Env>) -> *const () {
         cur = parent;
     }
     Rc::as_ptr(&cur.bindings) as *const ()
+}
+
+/// Cooperative continuation for a runtime-quantum multimethod call
+/// (`call_value`/`call_value_with`'s `call_non_native`, Step G): the selected
+/// method is driven as one `NativeOutcome::Call`, and this continuation just
+/// forwards whatever it settles with straight through — the multimethod
+/// call's result IS the selected method's result. Mirrors
+/// `IdentityContinuation` in `sema-stdlib::list` (`apply`'s cooperative
+/// path). Holds no state, so nothing to trace.
+struct MultimethodCallContinuation;
+
+impl Trace for MultimethodCallContinuation {
+    fn trace(&self, _sink: &mut dyn FnMut(sema_core::cycle::GcEdge<'_>)) -> bool {
+        true
+    }
+}
+
+impl NativeContinuation for MultimethodCallContinuation {
+    fn resume(
+        self: Box<Self>,
+        _context: &mut NativeCallContext<'_>,
+        input: ResumeInput,
+    ) -> NativeResult {
+        match input {
+            ResumeInput::Returned(value) => Ok(NativeOutcome::Return(value)),
+            ResumeInput::Failed(error) => Err(error),
+            ResumeInput::Cancelled(reason) => Err(SemaError::eval(format!(
+                "multimethod call was cancelled ({reason:?})"
+            ))),
+            ResumeInput::Runtime(_) => Err(SemaError::eval(
+                "multimethod continuation received an unexpected runtime response",
+            )),
+        }
+    }
 }
 
 /// Try to run `closure` on the live VM currently executing a native call on
@@ -3798,14 +3835,52 @@ impl VM {
             let func_val = self.stack[func_idx].clone();
             let call_args: SmallVec<[Value; 8]> = self.stack.drain(func_idx + 1..).collect();
             self.stack.pop(); // pop the callable value
-            let result = {
-                let _vm_guard = CurrentVmGuard::enter(self);
-                sema_core::call_callback(ctx, &func_val, &call_args)
-            };
-            let result = result?;
-            self.stack.push(result);
-            Ok(())
+            self.call_non_native(func_val, call_args, ctx)
         }
+    }
+
+    /// Dispatch a callable that is neither a native fn nor a keyword: a
+    /// multimethod resolved COOPERATIVELY when a runtime quantum is active,
+    /// so a suspending selected method routes through the `NativeOutcome::Call`
+    /// ABI exactly like a HOF callback instead of leaking the "requires
+    /// runtime invocation" stub — the multimethod half of Step G (see
+    /// `docs/deferred.md`). Outside a runtime quantum (or for any other
+    /// non-native callable), falls back to the exact prior synchronous
+    /// `call_callback` path. Only the SELECTED METHOD is routed cooperatively;
+    /// the dispatch function itself is always invoked synchronously (mirrors
+    /// `apply`'s cooperative gate, which never routes a multimethod's dispatch
+    /// function through the Call ABI either) — see
+    /// `sema_core::resolve_multimethod_handler`.
+    fn call_non_native(
+        &mut self,
+        func_val: Value,
+        call_args: SmallVec<[Value; 8]>,
+        ctx: &EvalContext,
+    ) -> Result<(), SemaError> {
+        if ctx.runtime_quantum_active() {
+            if let Some(mm) = func_val.as_multimethod_rc() {
+                let handler = {
+                    let _vm_guard = CurrentVmGuard::enter(self);
+                    sema_core::resolve_multimethod_handler(ctx, &mm, &call_args)
+                }?;
+                let outcome = NativeOutcome::Call(NativeCall {
+                    callable: handler,
+                    args: call_args.into_vec(),
+                    continuation: Box::new(MultimethodCallContinuation),
+                });
+                self.stash_native_dispatch(NativeDispatchResult::Pending(
+                    VmPendingOutcome::from_outcome(outcome),
+                ));
+                return Ok(());
+            }
+        }
+        let result = {
+            let _vm_guard = CurrentVmGuard::enter(self);
+            sema_core::call_callback(ctx, &func_val, &call_args)
+        };
+        let result = result?;
+        self.stack.push(result);
+        Ok(())
     }
 
     fn tail_call_value(&mut self, argc: usize, ctx: &EvalContext) -> Result<(), SemaError> {
@@ -3880,13 +3955,7 @@ impl VM {
             // crossing point.
             let args_start = self.stack.len() - argc;
             let call_args: SmallVec<[Value; 8]> = self.stack.drain(args_start..).collect();
-            let result = {
-                let _vm_guard = CurrentVmGuard::enter(self);
-                sema_core::call_callback(ctx, &func_val, &call_args)
-            };
-            let result = result?;
-            self.stack.push(result);
-            Ok(())
+            self.call_non_native(func_val, call_args, ctx)
         }
     }
 
@@ -5705,6 +5774,84 @@ pub fn compile_program(
         native_table: result.native_table,
         main_cache_slots,
     })
+}
+
+/// Wrap a [`compile_program`] result as a zero-arg callable `Value`,
+/// concretizing its home globals as `home` and pre-resolving its native
+/// table against it.
+///
+/// `compile_program`'s main closure carries `globals: None` / `functions:
+/// None` ("run me on whichever VM owns me") because it is normally driven
+/// directly by `VM::execute` on a fresh, throwaway VM. Nested `eval` of an
+/// async form (Step G) instead needs the eval'd program to run as an
+/// ordinary callee under the runtime's cooperative `NativeOutcome::Call`
+/// ABI — `invoke_vm_callback_loop` retargets a scratch VM at a callee
+/// closure's `globals`/`functions`/native table, so those fields must be
+/// concrete `Some(..)`, exactly like a closure produced by `MakeClosure`
+/// (mirrors that construction in `VM::make_closure`).
+///
+/// Nested function cache offsets are assigned here the same way `VM::new`
+/// assigns them for a freshly loaded program (starting after the main
+/// chunk's own `main_cache_slots`): `compile_program`'s `functions` come
+/// straight from the compiler with default (colliding) offsets, since
+/// offset assignment normally only happens once, in `VM::new`. Skipping this
+/// would alias the eval'd program's inline-cache slots with a nested
+/// closure's, corrupting global lookups inside it.
+pub fn program_as_callable(prog: CompiledProgram, home: Rc<Env>) -> Result<Value, SemaError> {
+    let native_fns = Rc::new(VM::resolve_native_table(&home, &prog.native_table)?);
+    let mut functions = prog.functions;
+    let mut total_cache_slots = prog.main_cache_slots as usize;
+    for func_rc in &mut functions {
+        let func = Rc::make_mut(func_rc);
+        func.cache_offset = total_cache_slots;
+        total_cache_slots += func.chunk.n_global_cache_slots as usize;
+    }
+    let functions: Rc<Vec<Rc<Function>>> = Rc::new(functions);
+    let closure = Rc::new(Closure {
+        func: prog.closure.func.clone(),
+        upvalues: Vec::new(),
+        globals: Some(home),
+        functions: Some(functions.clone()),
+    });
+    let payload = Rc::new(VmClosurePayload {
+        closure: closure.clone(),
+        functions: functions.clone(),
+        native_fns,
+    });
+    let payload_for_box = Rc::clone(&payload);
+    ensure_cycle_gc_wired();
+    let mut native_fn = sema_core::NativeFn::with_payload(
+        "<eval-program>",
+        payload as Rc<dyn std::any::Any>,
+        move |ctx, args| {
+            let closure = &payload_for_box.closure;
+            let functions = &payload_for_box.functions;
+            let globals = closure
+                .globals
+                .as_ref()
+                .expect("program_as_callable closures always carry Some(home)");
+            if let Some(result) = try_run_on_current_vm(closure, globals, args, ctx) {
+                return result;
+            }
+            close_closure_upvalues_for_foreign_run(closure);
+            let mut vm = VM::new_with_rc_functions(
+                globals.clone(),
+                functions.clone(),
+                payload_for_box.native_fns.clone(),
+            );
+            vm.setup_for_call(closure.clone(), args)?;
+            let _q = ctx.suspend_runtime_quantum();
+            vm.run(ctx)
+        },
+    );
+    // Zero-arg, no upvalues: not a cycle candidate for the same reason a
+    // zero-upvalue `MakeClosure` result is skipped (see `VM::make_closure`'s
+    // "Zero-upvalue exemption" comment) — it owns no upvalue cells, so it
+    // cannot sit on a severable cycle edge; its home env is independently a
+    // registered candidate (or reachable from one) already.
+    native_fn.is_closure = true;
+    native_fn.param_names = Some(Rc::from(Vec::new()));
+    Ok(Value::native_fn_from_rc(Rc::new(native_fn)))
 }
 
 #[cfg(test)]

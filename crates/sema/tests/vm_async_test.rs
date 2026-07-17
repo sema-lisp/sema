@@ -1772,6 +1772,29 @@ fn apply_of_suspending_lambda_runs_cooperatively() {
 }
 
 #[test]
+fn multimethod_selected_method_suspends_cooperatively() {
+    // A direct multimethod call `(mm x)` whose SELECTED method suspends
+    // (`async/await`/`async/spawn`) must run cooperatively under the runtime
+    // instead of leaking the value-ABI "requires runtime invocation" stub —
+    // the multimethod half of Step G (see docs/deferred.md). Dispatch itself
+    // (the synchronous `(:kind s)` selector) is unaffected; a sibling
+    // synchronous method (`:square`) on the SAME multimethod is unaffected too.
+    assert_eq!(
+        eval(
+            r#"(begin
+                 (defmulti shape-area (fn (s) (:kind s)))
+                 (defmethod shape-area :circle
+                   (fn (s) (async/await (async/spawn (fn () (* 3 (:r s) (:r s)))))))
+                 (defmethod shape-area :square
+                   (fn (s) (* (:side s) (:side s))))
+                 (list (shape-area {:kind :circle :r 2})
+                       (shape-area {:kind :square :side 4})))"#
+        ),
+        Value::list(vec![Value::int(12), Value::int(16)])
+    );
+}
+
+#[test]
 fn nested_apply_of_runtime_native_is_graceful_error() {
     // `apply`/`call-with-values` reached through another synchronous `apply`
     // run on the value ABI, where a runtime-only native cannot suspend. That

@@ -649,6 +649,39 @@ impl fmt::Debug for MultiMethod {
     }
 }
 
+/// Resolve the handler a `MultiMethod` selects for `args`, WITHOUT calling it.
+/// Shared by the synchronous dispatch in `sema-eval`'s `call_value` (via
+/// `call_multimethod`) and the runtime-quantum-aware direct-call sites in
+/// `sema-vm`'s `call_value`/`call_value_with`, which route the resolved
+/// handler through the cooperative `NativeOutcome::Call` ABI instead of
+/// calling it synchronously — the multimethod half of Step G (see
+/// `docs/deferred.md`). Dispatch-function invocation itself stays fully
+/// synchronous: it is a plain value-selector call, never expected to suspend,
+/// mirroring `apply`'s cooperative gate (which never routes a multimethod's
+/// dispatch function through the Call ABI either).
+pub fn resolve_multimethod_handler(
+    ctx: &EvalContext,
+    mm: &MultiMethod,
+    args: &[Value],
+) -> Result<Value, SemaError> {
+    let dispatch_val = crate::call_callback(ctx, &mm.dispatch_fn, args)?;
+    let methods = mm.methods.borrow();
+    if let Some(handler) = methods.get(&dispatch_val) {
+        Ok(handler.clone())
+    } else {
+        drop(methods);
+        let default = mm.default.borrow().clone();
+        default.ok_or_else(|| {
+            SemaError::eval(format!(
+                "no method in multimethod '{}' for dispatch value: {}",
+                resolve(mm.name),
+                dispatch_val
+            ))
+            .with_hint("add a (defmethod name :default handler) to handle unmatched values")
+        })
+    }
+}
+
 /// Trait for stream implementations (files, buffers, serial ports, etc.).
 /// All methods take `&self` — interior mutability is handled by the implementation.
 pub trait SemaStream: fmt::Debug {

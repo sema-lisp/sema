@@ -2,7 +2,30 @@
 
 ## Unreleased
 
+### Fixed
+
+- **`sema mcp` no longer dies on `llm/*` calls.** The stdio server ran inside a
+  tokio `block_on`, so LLM builtins' `io_block_on` hit tokio's
+  runtime-in-runtime panic — with release `panic = "abort"` the whole server
+  aborted on the first `llm/complete`/`llm/extract` a client invoked. The loop
+  is now plain synchronous std::io (`run_mcp_server_sync`); LLM tool calls
+  return normal tool results/errors.
+- **MCP error results keep hints.** Unbound-variable "Did you mean 'X'?"
+  suggestions (and error notes) now survive the MCP boundary instead of being
+  dropped by `Display`; a `docs` miss also points at `docs_search`.
+- **`llm/extract` bare keyword field specs are real shorthand.**
+  `{:total :number}` now renders the type in the extraction prompt (was
+  `<any>`) and is type-checked in validation (was key-presence only, so
+  `"$10.00"` passed as `:number`).
+
 ### Added
+
+- **`sema mcp --sandbox <mode>`** — sandbox the MCP server with the standard
+  grammar (`strict` or `no-shell,no-fs-write`); falls back to the top-level
+  `--sandbox`, default remains allow-everything.
+- **`docs_search` hits include a `signature` field** with argument order
+  (e.g. `(regex/replace-all pattern replacement text) -> string`) — summaries
+  alone led agents to swap argument order.
 
 - **`sema build --json`** — a machine-readable build manifest on stdout: source,
   archive size, and per-target `path` / `bytes` / `sha256` / runtime source

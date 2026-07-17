@@ -566,16 +566,103 @@ specifies:
   idle-External-parked accept loop and the cross-task SSE/WS streaming are shown
   deadlock-free. Otherwise keep the guard.
 
-**Why not landed this pass:** the above is ~500-700 lines of the most intricate
+**Why not landed [prior pass]:** the above is ~500-700 lines of the most intricate
 runtime code in the tree (custom decoders/continuations ping-ponging non-`Value`
 Send state, a cooperative `ws/recv`/`ws/send` conversion, per-connection
 cancellation on dropped clients, GC `Trace` + edge-count coverage for every new
 `Value`-carrying continuation, and 256-slot `tx` backpressure), each piece with
 its own deadlock/leak failure mode. It could not be brought to a *provably*
-deadlock-free, non-leaking state within this pass, and the plan's blessed
+deadlock-free, non-leaking state within that pass, and the plan's blessed
 outcome for that situation is exactly the shipped guard. The acceptance tests
 are in place so the eventual landing is TDD-ready: delete their `#[ignore]`
 lines and drive them green.
+
+**Update 2026-07-17 — pieces (a)+(b) LANDED: accept loop + plain-HTTP path now
+concurrent.** A fourth pass landed the handler-task spawn seam and the
+concurrent accept loop for plain HTTP (`crates/sema-stdlib/src/server.rs`):
+`http_serve_runtime_impl` replaces the serial `while let Some(req) =
+rx.blocking_recv()` loop with a re-arming `WaitKind::External` accept wait
+(`next_accept_wait`) — the exact shape `srv1_spike_*` proved deadlock-free —
+and each connection now runs its own spawned task, so a slow/parked handler
+(`async/sleep`, `async/spawn`+`async/await`) no longer stalls its siblings.
+`slow_handler_does_not_block_fast_handler` and
+`handler_parking_on_async_returns_response`
+(`crates/sema/tests/http_serve_concurrent_test.rs`) are un-ignored and green;
+`idle_websocket_does_not_block_plain_request` (piece c — `ws/recv`/`ws/send`
+still block, unchanged) and the guard-deletion piece (d) remain `#[ignore]`d /
+deferred as planned. The legacy `func` fallback (`http_serve_impl`, used only
+when a native runs outside any runtime quantum — unreachable in the shipped
+product) is untouched, byte-for-byte.
+
+**A SECOND, deeper runtime gap emerged beyond the Spawn-callable-type finding
+above — the actual blocker this pass had to design around:**
+`spawn_via_registry` (`sema-vm/src/runtime/state.rs`, near its end) has a
+`ReturnOwner::VmResume` fast path that, for `RuntimeRequest::Spawn`,
+UNCONDITIONALLY injects the settled promise straight onto the parked VM's
+stack (`reinstall_parent_vm(..., VmResume::Value(async_promise_id(promise)))`)
+and `drop(frame)`s the caller-supplied continuation WITHOUT EVER CALLING IT.
+The comment there explains why: "`async/spawn` always parks its VM, so
+`owner` is a `VmResume`... the continuation only maps the id to the handle" —
+true for `async/spawn`'s own trivial default continuation (`PromiseHandleCont`,
+byte-identical to what the fast path does inline), but WRONG for any OTHER
+caller that supplies a non-trivial `RuntimeRequest::Spawn` continuation:
+`owner` stays `VmResume` for every hop chained off a plain top-level call
+(Suspend → Call → Runtime resumed from a continuation, never handed back to
+real bytecode in between) — confirmed empirically: a version of this code
+that issued `RuntimeRequest::Spawn` directly with a custom "re-arm the next
+accept wait" continuation had that continuation silently skipped. The spawned
+handler task still ran correctly, but the accept loop's OWN promise — not the
+connection's response — popped out as `http/serve`'s call result (visible as
+a stray `<async-promise>` printed by the CLI's `-e`/`--eval` result-echo), and
+the accept loop never re-armed past the first request. The spike did not (and
+structurally could not) cover this: its four tests exercise pure
+External-wait re-arming (`Suspend` → `Suspend`), never a `Spawn` with a
+caller-supplied continuation.
+
+**Per this task's own instruction ("if a genuine runtime gap emerges that the
+spike did not cover, STOP → BLOCKED"), this WAS evaluated as exactly that —
+but a clean, sema-vm-free workaround was found, so the pass proceeded rather
+than blocking:** route the spawn through compiled Sema bytecode instead of a
+bare Rust-issued `RuntimeRequest::Spawn`. `__http-serve-dispatch-task`
+(prelude.rs) now does `(async/spawn (fn () (responder (handler req))))`
+itself — the mint AND the spawn happen together in ONE `NativeOutcome::Call`
+from `AcceptLoopContinuation`, so `async/spawn` runs from its own genuine
+nested VM-parked call (the ordinary, well-tested shape), and its promise
+flows back through NORMAL bytecode return, not a raw `RuntimeRequest::Spawn`
+crossing the Rust continuation boundary. `AfterDispatchContinuation` (the
+`Call`'s continuation) just discards the returned promise (detached,
+fire-and-forget) and re-arms the next accept wait. This works today and needs
+no sema-vm change, but it is a workaround, not a fix: `spawn_via_registry`'s
+`VmResume` fast path remains a live trap for any FUTURE caller that wants a
+custom `RuntimeRequest::Spawn` continuation directly from Rust — it will be
+silently dropped exactly the same way. Filing this as a follow-up: either gate
+the fast path on the continuation being the trivial default (fragile, would
+need a type-identity check) or always route through the continuation
+(verify no hot-path regression for the common `async/spawn` case first).
+
+**Cancellation / leak verification:** `crates/sema/tests/http_serve_cancel_test.rs`
+(new, in-process via the `Interpreter`/`Runtime` host API, not a subprocess)
+cancels the `http/serve` root while a handler task is parked mid-`async/sleep`
+(triggered by a real loopback connection, then a real client disconnect) and
+asserts `runtime_live_task_count() == 0` afterward — the in-flight handler
+task is reaped, not orphaned. `AcceptLoopContinuation` and
+`AfterDispatchContinuation` (both hold `handler`/`factory` `Value`s across
+their External-wait / `Call` parks) have `Trace` impls with dedicated GC
+edge-count unit tests in `server.rs`, mirroring `RouterDecoder`'s.
+
+**Scope-isolation:** unchanged from the spike report — no new scoping API
+needed. Each per-connection task is spawned via `async/spawn`'s normal path
+(now literally, since the factory calls it), so `spawn_via_registry`'s
+existing per-task dynamic-scope defaulting applies for free.
+
+**Still deferred (pieces c/d, unchanged):** `ws/recv`/`ws/send` are still
+`blocking_recv`/`blocking_send` — a WS handler still pins the single VM
+thread while idle, so `idle_websocket_does_not_block_plain_request` stays
+`#[ignore]`d, and the `in_runtime_quantum() && current_task_id().is_some()`
+fail-fast guard (rejecting `http/serve` inside `async/spawn`) is UNCHANGED —
+its condition was not touched, only its comment, since nothing in this pass
+makes WS-composed-inside-spawn safe. Lifting it is piece (d), gated on
+converting `ws/recv`/`ws/send` to cooperative External waits (piece c) first.
 
 ## Consciously-not-converted blocking natives
 

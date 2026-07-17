@@ -40,7 +40,24 @@ pub fn sema_value_to_json_schema(val: &Value) -> serde_json::Value {
                         .as_keyword()
                         .or_else(|| t.as_str().map(|s| s.to_string()))
                         .unwrap_or_else(|| "string".to_string());
-                    prop_obj.insert("type".to_string(), serde_json::Value::String(type_str));
+                    // Sema type keywords → JSON Schema draft 2020-12 type names.
+                    // LLM providers validate tool schemas strictly and reject the
+                    // ENTIRE request over one bad name — `:list` leaking through as
+                    // "list" broke every turn of an MCP client session.
+                    let json_type = match type_str.as_str() {
+                        "str" => "string",
+                        "int" => "integer",
+                        "float" | "double" => "number",
+                        "bool" => "boolean",
+                        "list" | "vector" | "array" => "array",
+                        "map" | "dict" => "object",
+                        "nil" => "null",
+                        other => other,
+                    };
+                    prop_obj.insert(
+                        "type".to_string(),
+                        serde_json::Value::String(json_type.to_string()),
+                    );
                 } else {
                     prop_obj.insert(
                         "type".to_string(),
@@ -1466,5 +1483,45 @@ fn error_result(text: impl Into<String>) -> CallToolResult {
     CallToolResult {
         content: vec![ToolContent::Text { text: text.into() }],
         is_error: true,
+    }
+}
+
+#[cfg(test)]
+mod schema_tests {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    fn schema_for(param_type: &str) -> serde_json::Value {
+        let mut spec = BTreeMap::new();
+        spec.insert(Value::keyword("type"), Value::keyword(param_type));
+        let mut params = BTreeMap::new();
+        params.insert(Value::keyword("x"), Value::map(spec));
+        sema_value_to_json_schema(&Value::map(params))
+    }
+
+    /// Providers validate tool schemas against JSON Schema draft 2020-12 and
+    /// reject the whole request over one bad type name — Sema keywords must map.
+    #[test]
+    fn sema_type_keywords_map_to_json_schema_types() {
+        for (sema_ty, json_ty) in [
+            ("string", "string"),
+            ("str", "string"),
+            ("int", "integer"),
+            ("integer", "integer"),
+            ("float", "number"),
+            ("number", "number"),
+            ("bool", "boolean"),
+            ("boolean", "boolean"),
+            ("list", "array"),
+            ("vector", "array"),
+            ("map", "object"),
+            ("nil", "null"),
+        ] {
+            let schema = schema_for(sema_ty);
+            assert_eq!(
+                schema["properties"]["x"]["type"], json_ty,
+                "sema :{sema_ty} should emit JSON Schema type {json_ty}"
+            );
+        }
     }
 }

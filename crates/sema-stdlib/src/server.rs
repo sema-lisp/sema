@@ -1350,8 +1350,231 @@ fn handle_sse_response(
     }
 }
 
+/// VM-thread readiness probe for the server-side `ws/recv`'s cooperative
+/// runtime path: scans the per-connection incoming channel with `try_recv`
+/// (never moving the receiver off the VM thread, so a cancel can't strand
+/// it). Mirrors `ws.rs`'s `WsRecvProbe` (the client-side twin) — same shape,
+/// different message/channel types, so an IDLE server-side WebSocket
+/// handler parked here still lets [`await_runtime_until`](crate::io::await_runtime_until)
+/// drive sibling tasks (the plain-HTTP accept loop, other connections)
+/// instead of pinning the VM thread the way `blocking_recv` did.
+struct ServerWsRecvProbe {
+    in_rx: std::rc::Rc<std::cell::RefCell<Option<tokio::sync::mpsc::Receiver<WsMsg>>>>,
+}
+
+impl sema_core::runtime::Trace for ServerWsRecvProbe {
+    fn trace(&self, _sink: &mut dyn FnMut(sema_core::cycle::GcEdge<'_>)) -> bool {
+        // Holds no `Value` — the receiver handle isn't one.
+        true
+    }
+}
+
+impl crate::io::RuntimePoll for ServerWsRecvProbe {
+    fn poll(&mut self) -> Option<Result<Value, String>> {
+        use tokio::sync::mpsc::error::TryRecvError;
+        let mut rx_opt = self.in_rx.borrow_mut();
+        let Some(rx) = rx_opt.as_mut() else {
+            // Already closed by an earlier recv/close — resolve to nil
+            // immediately rather than parking forever.
+            return Some(Ok(Value::nil()));
+        };
+        match rx.try_recv() {
+            Ok(WsMsg::Text(s)) => Some(Ok(Value::string(&s))),
+            Ok(WsMsg::Binary(b)) => Some(Ok(Value::bytevector(b))),
+            Err(TryRecvError::Empty) => None,
+            Err(TryRecvError::Disconnected) => {
+                *rx_opt = None;
+                Some(Ok(Value::nil()))
+            }
+        }
+    }
+}
+
+/// Resumes once a runtime-dispatched WebSocket handler call (see
+/// `handle_ws_response_runtime`) returns, fails, or is cancelled. Holds no
+/// `Value` — the handler's return value is discarded (matching the legacy
+/// `handle_ws_response`'s `Ok(_) => {}`), and a handler error is logged
+/// rather than failing the whole connection task, exactly as before.
+struct WsHandlerContinuation;
+
+impl sema_core::runtime::Trace for WsHandlerContinuation {
+    fn trace(&self, _sink: &mut dyn FnMut(sema_core::cycle::GcEdge<'_>)) -> bool {
+        true
+    }
+}
+
+impl sema_core::runtime::NativeContinuation for WsHandlerContinuation {
+    fn resume(
+        self: Box<Self>,
+        _context: &mut sema_core::runtime::NativeCallContext<'_>,
+        input: sema_core::runtime::ResumeInput,
+    ) -> sema_core::runtime::NativeResult {
+        use sema_core::runtime::ResumeInput;
+        match input {
+            ResumeInput::Returned(_) => Ok(NativeOutcome::Return(Value::nil())),
+            ResumeInput::Failed(error) => {
+                eprintln!("ws handler error: {error}");
+                Ok(NativeOutcome::Return(Value::nil()))
+            }
+            ResumeInput::Cancelled(reason) => Err(SemaError::eval(format!(
+                "http/serve: websocket connection handler was cancelled ({reason:?})"
+            ))),
+            ResumeInput::Runtime(_) => Err(SemaError::eval(
+                "http/serve: websocket handler call received an unexpected runtime response",
+            )),
+        }
+    }
+}
+
+/// Runtime-ABI counterpart of [`handle_ws_response`]: build the bidirectional
+/// channels and connection map exactly as the legacy path does, but instead
+/// of calling the WS handler synchronously through `call_callback` (which
+/// runs it on a fresh, non-cooperative "foreign VM" — see
+/// `sema-vm/src/vm.rs`'s `make_closure` "TEMPORARY BRIDGE" comment — where
+/// `in_runtime_quantum()` is suspended for the duration, so `(:recv conn)`
+/// could never suspend cooperatively and would fall back to blocking), this
+/// dispatches the handler through `NativeOutcome::Call`. That is a genuine
+/// VM-dispatched call within the connection's OWN spawned task quantum
+/// (the same mechanism `AcceptLoopContinuation` uses to invoke the
+/// per-connection dispatch factory), so `in_runtime_quantum()` stays true for
+/// the handler's whole body — including any nested `(:recv conn)` — and the
+/// connection's `recv_fn` (below) can suspend structurally on an External
+/// wait instead of blocking the VM thread. This is what makes an idle
+/// WebSocket non-blocking for its siblings (SRV-1 piece c).
+fn handle_ws_response_runtime(
+    response_val: &Value,
+    respond: tokio::sync::oneshot::Sender<ServerResponse>,
+) -> sema_core::runtime::NativeResult {
+    use sema_core::runtime::{NativeCall, NativeOutcome};
+    use sema_core::NativeFn;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    let map = response_val.as_map_rc().unwrap();
+    let ws_handler = map.get(&Value::keyword("__ws_handler")).cloned().unwrap();
+
+    let (in_tx, in_rx) = tokio::sync::mpsc::channel::<WsMsg>(256);
+    let (out_tx, out_rx) = tokio::sync::mpsc::channel::<WsMsg>(256);
+
+    let _ = respond.send(ServerResponse::WebSocket {
+        incoming_tx: in_tx,
+        outgoing_rx: out_rx,
+    });
+
+    // Same send/close shape as the legacy `handle_ws_response` — `ws/send`
+    // only blocks the VM thread if the 256-slot outgoing queue is full (a
+    // slow/stalled client), a narrower and pre-existing limitation, not the
+    // idle-recv head-of-line case this pass fixes.
+    let out_tx = Rc::new(RefCell::new(Some(out_tx)));
+    let out_tx_for_send = out_tx.clone();
+    let send_fn = Value::native_fn(NativeFn::simple("ws/send", move |args| {
+        check_arity!(args, "ws/send", 1);
+        let msg = if let Some(s) = args[0].as_str() {
+            WsMsg::Text(s.to_string())
+        } else if let Some(b) = args[0].as_bytevector() {
+            WsMsg::Binary(b.to_vec())
+        } else {
+            return Err(SemaError::type_error(
+                "string or bytevector",
+                args[0].type_name(),
+            ));
+        };
+        let guard = out_tx_for_send.borrow();
+        let tx = guard
+            .as_ref()
+            .ok_or_else(|| SemaError::eval("WebSocket closed"))?;
+        tx.blocking_send(msg)
+            .map_err(|_| SemaError::eval("WebSocket closed"))?;
+        Ok(Value::nil())
+    }));
+
+    let in_rx = Rc::new(RefCell::new(Some(in_rx)));
+    let in_rx_for_recv_legacy = in_rx.clone();
+    let in_rx_for_recv_runtime = in_rx.clone();
+    let recv_fn = Value::native_fn(NativeFn::simple_with_runtime(
+        "ws/recv",
+        move |args| {
+            check_arity!(args, "ws/recv", 0);
+            let mut rx_opt = in_rx_for_recv_legacy.borrow_mut();
+            if let Some(rx) = rx_opt.as_mut() {
+                match rx.blocking_recv() {
+                    Some(WsMsg::Text(s)) => Ok(Value::string(&s)),
+                    Some(WsMsg::Binary(b)) => Ok(Value::bytevector(b)),
+                    None => {
+                        *rx_opt = None;
+                        Ok(Value::nil())
+                    }
+                }
+            } else {
+                Ok(Value::nil())
+            }
+        },
+        move |_ctx, args| -> sema_core::runtime::NativeResult {
+            check_arity!(args, "ws/recv", 0);
+            // Always true here — this native is only ever reached via the
+            // Call dispatch above, itself only issued from inside a runtime
+            // quantum — but check anyway rather than assume, mirroring every
+            // other cooperative op in this codebase (see `ws.rs`'s
+            // `ws_recv`).
+            if sema_core::in_runtime_quantum() {
+                let probe = ServerWsRecvProbe {
+                    in_rx: in_rx_for_recv_runtime.clone(),
+                };
+                return crate::io::await_runtime_until(
+                    Box::new(probe),
+                    std::time::Instant::now(),
+                    u64::MAX,
+                );
+            }
+            let mut rx_opt = in_rx_for_recv_runtime.borrow_mut();
+            if let Some(rx) = rx_opt.as_mut() {
+                match rx.blocking_recv() {
+                    Some(WsMsg::Text(s)) => Ok(NativeOutcome::Return(Value::string(&s))),
+                    Some(WsMsg::Binary(b)) => Ok(NativeOutcome::Return(Value::bytevector(b))),
+                    None => {
+                        *rx_opt = None;
+                        Ok(NativeOutcome::Return(Value::nil()))
+                    }
+                }
+            } else {
+                Ok(NativeOutcome::Return(Value::nil()))
+            }
+        },
+    ));
+
+    let out_tx_for_close = out_tx;
+    let in_rx_for_close = in_rx;
+    let close_fn = Value::native_fn(NativeFn::simple("ws/close", move |args| {
+        check_arity!(args, "ws/close", 0);
+        out_tx_for_close.borrow_mut().take();
+        let mut rx_opt = in_rx_for_close.borrow_mut();
+        *rx_opt = None;
+        Ok(Value::nil())
+    }));
+
+    let mut conn_map = BTreeMap::new();
+    conn_map.insert(Value::keyword("send"), send_fn);
+    conn_map.insert(Value::keyword("recv"), recv_fn);
+    conn_map.insert(Value::keyword("close"), close_fn);
+    let conn = Value::map(conn_map);
+
+    Ok(NativeOutcome::Call(NativeCall {
+        callable: ws_handler,
+        args: vec![conn],
+        continuation: Box::new(WsHandlerContinuation),
+    }))
+}
+
 /// Handle a WebSocket response: extract the WS handler, create bidirectional channels,
 /// send them to axum for bridging, then call the handler with a connection map.
+///
+/// Legacy/non-quantum path only (reached solely from `http_serve_impl`'s
+/// serial loop and the responder's legacy value-ABI branch — both dead in
+/// the shipped product). Its `ws/recv` blocks the VM thread with
+/// `blocking_recv`; that's fine here because this whole path already has no
+/// sibling connections to stall (`http_serve_impl` handles one request at a
+/// time by construction). See [`handle_ws_response_runtime`] for the
+/// cooperative path production actually runs.
 fn handle_ws_response(
     ctx: &sema_core::EvalContext,
     response_val: &Value,
@@ -1538,36 +1761,17 @@ fn http_serve_setup(args: &[Value], invoke: ServeInvoke<'_>) -> Result<ServeSetu
     // loop on THIS thread (`rx.blocking_recv()`) for the life of the server —
     // by design at top level, where it's the only thing this thread will ever
     // do again. The concurrent runtime dispatch path (`http_serve_runtime_impl`)
-    // fixes that for PLAIN HTTP: its accept loop parks cooperatively on a
-    // re-arming `WaitKind::External` instead of blocking, and each connection
-    // runs its own spawned task, so a slow/parked handler no longer stalls its
-    // siblings (see docs/deferred.md "SRV-1"). This guard still rejects
-    // `http/serve` from inside `async/spawn`, though: a WebSocket handler's
-    // `ws/recv`/`ws/send` (below) still use `blocking_recv`/`blocking_send`,
-    // which — unlike the accept loop and a plain-HTTP handler's `async/sleep`/
-    // `async/await` — pin the single cooperative VM thread for as long as the
-    // client stays quiet, freezing every sibling task with no error. Lifting
-    // the guard requires converting those to cooperative External waits too
-    // (deliberately not attempted here); until then, fail fast and loud
-    // instead of hanging silently for the one case (WS-composed-inside-spawn)
-    // this pass doesn't make safe.
-    if sema_core::in_runtime_quantum() && sema_core::current_task_id().is_some() {
-        // The core message alone must carry enough to explain the failure: a
-        // task's rejection is flattened to a plain string when it crosses the
-        // promise boundary (`format!("{e}")` in the scheduler), so the hint
-        // below is only guaranteed to survive for an UNCAUGHT top-level call
-        // (no async/spawn) — the CLI's error reporter prints `.hint()`
-        // separately. `async/await`ing a rejected task only sees this message.
-        return Err(SemaError::eval(
-            "http/serve runs a blocking accept loop; it cannot be started inside async/spawn or \
-             another async context — start it from the top level instead",
-        )
-        .with_hint(
-            "async http/serve (concurrent, non-blocking connection handling) is tracked as \
-             deferred work — see docs/deferred.md",
-        ));
-    }
-
+    // fixes that for both PLAIN HTTP and WebSocket connections (see
+    // docs/deferred.md "SRV-1"): the accept loop parks cooperatively on a
+    // re-arming `WaitKind::External` instead of blocking, each connection runs
+    // its own spawned task, and a WebSocket handler's `ws/recv` suspends
+    // cooperatively too (`handle_ws_response_runtime`) — so a slow/parked
+    // handler, plain or WebSocket, no longer stalls its siblings. `http/serve`
+    // composing inside `async/spawn` was fail-fast-rejected in earlier passes
+    // (both gaps were live traps then); with all concurrency paths now live,
+    // that guard is gone — the acceptance suite in
+    // `crates/sema/tests/http_serve_concurrent_test.rs` is the regression
+    // gate for this claim.
     if args.len() < 2 || args.len() > 3 {
         return Err(SemaError::arity(
             "http/serve",
@@ -1807,12 +2011,28 @@ type ServeRequestReceiverCell = std::rc::Rc<std::cell::RefCell<Option<ServeReque
 /// (see the `http/serve` wrapper in prelude.rs), so `respond` is dropped
 /// unsent; `handle_axum_request`'s `resp_rx.await` `Err(_)` arm already covers
 /// that case with a bounded 500 ("Handler did not respond") — safe, but not
-/// byte-identical to the legacy loop's `{"error": "..."}` JSON body. No
-/// acceptance test pins that body's exact shape.
+/// byte-identical to the legacy loop's `{"error": "..."}` JSON body. This is
+/// the CHOSEN, pinned contract (see `uncaught_handler_error_produces_the_
+/// bounded_500_fallback` below): the legacy JSON shape is not documented
+/// anywhere (`website/docs/stdlib/web-server.md` only documents the explicit
+/// `http/error`/`http/not-found`/etc. constructors, never an implicit
+/// uncaught-exception body), so there is no compatibility obligation to
+/// restore it, and `server_test.rs`'s `test_http_serve_handler_error` only
+/// ever asserted the status code (500), never the body.
+///
+/// Dual-ABI: the runtime branch routes a WebSocket response through
+/// `handle_ws_response_runtime`'s `NativeOutcome::Call` (see its doc comment
+/// for why a plain synchronous `call_callback` can't let the handler's
+/// `(:recv conn)` suspend cooperatively); every other response shape needs no
+/// suspension, so both branches build it identically. The legacy branch
+/// (reachable only outside a runtime quantum — dead in the shipped product)
+/// keeps calling the WS handler synchronously via `handle_ws_response`.
 fn make_responder_native(respond: tokio::sync::oneshot::Sender<ServerResponse>) -> Value {
+    use sema_core::runtime::NativeResult;
     use sema_core::NativeFn;
     let respond = std::rc::Rc::new(std::cell::RefCell::new(Some(respond)));
-    Value::native_fn(NativeFn::with_ctx(
+    let respond_runtime = respond.clone();
+    Value::native_fn(NativeFn::with_ctx_runtime(
         "http/serve/responder",
         move |ctx: &sema_core::EvalContext, args: &[Value]| {
             check_arity!(args, "http/serve/responder", 1);
@@ -1831,6 +2051,27 @@ fn make_responder_native(respond: tokio::sync::oneshot::Sender<ServerResponse>) 
                 let _ = respond.send(ServerResponse::Raw(raw_resp));
             }
             Ok(Value::nil())
+        },
+        move |_ctx, args| -> NativeResult {
+            check_arity!(args, "http/serve/responder", 1);
+            let response_val = args[0].clone();
+            let respond = respond_runtime.borrow_mut().take().ok_or_else(|| {
+                SemaError::eval("http/serve: internal: handler response already sent")
+            })?;
+            if is_websocket_response(&response_val) {
+                return handle_ws_response_runtime(&response_val, respond);
+            }
+            if is_stream_response(&response_val) {
+                sema_core::with_stdlib_ctx(|c| handle_sse_response(c, &response_val, respond));
+                return Ok(NativeOutcome::Return(Value::nil()));
+            }
+            if is_file_response(&response_val) {
+                handle_file_response(&response_val, respond);
+                return Ok(NativeOutcome::Return(Value::nil()));
+            }
+            let raw_resp = value_to_raw_response(&response_val);
+            let _ = respond.send(ServerResponse::Raw(raw_resp));
+            Ok(NativeOutcome::Return(Value::nil()))
         },
     ))
 }
@@ -2122,6 +2363,83 @@ mod tests {
             edges, 2,
             "AfterDispatchContinuation must trace exactly handler + factory"
         );
+    }
+
+    // SRV-1 piece c / invariant I2: `WsHandlerContinuation` holds no `Value`
+    // (the ws handler is consumed by the `NativeCall` it rides in, not kept by
+    // the continuation) — its `Trace` MUST report zero edges, or the collector
+    // would be asked to trace nonexistent state.
+    #[test]
+    fn ws_handler_continuation_traces_no_edges() {
+        use sema_core::runtime::Trace;
+        let cont = WsHandlerContinuation;
+        let mut edges = 0usize;
+        cont.trace(&mut |edge| {
+            if let sema_core::cycle::GcEdge::Value(_) = edge {
+                edges += 1;
+            }
+        });
+        assert_eq!(edges, 0, "WsHandlerContinuation must trace no Value edges");
+    }
+
+    // `ServerWsRecvProbe` holds a channel receiver handle, not a `Value` — its
+    // `Trace` MUST also report zero edges (it rides across the External park
+    // the same way `WsRecvProbe`, its client-side twin in `ws.rs`, does).
+    #[test]
+    fn server_ws_recv_probe_traces_no_edges() {
+        use sema_core::runtime::Trace;
+        let (_tx, rx) = tokio::sync::mpsc::channel::<WsMsg>(4);
+        let probe = ServerWsRecvProbe {
+            in_rx: std::rc::Rc::new(std::cell::RefCell::new(Some(rx))),
+        };
+        let mut edges = 0usize;
+        probe.trace(&mut |edge| {
+            if let sema_core::cycle::GcEdge::Value(_) = edge {
+                edges += 1;
+            }
+        });
+        assert_eq!(edges, 0, "ServerWsRecvProbe must trace no Value edges");
+    }
+
+    // `ServerWsRecvProbe::poll` is the cooperative core of server-side
+    // `ws/recv`: empty channel -> None (keep waiting, lets the runtime drive
+    // siblings), a queued message -> Some(Ok(..)) with the right shape, a
+    // disconnected channel -> Some(Ok(nil)) and clears the cell so a second
+    // poll doesn't re-touch a dropped receiver.
+    #[test]
+    fn server_ws_recv_probe_poll_resolves_message_then_disconnect() {
+        use crate::io::RuntimePoll;
+        let (tx, rx) = tokio::sync::mpsc::channel::<WsMsg>(4);
+        let cell = std::rc::Rc::new(std::cell::RefCell::new(Some(rx)));
+        let mut probe = ServerWsRecvProbe {
+            in_rx: cell.clone(),
+        };
+
+        // Empty: keep waiting.
+        assert!(probe.poll().is_none());
+
+        // A queued text message resolves immediately.
+        tx.try_send(WsMsg::Text("hi".to_string())).unwrap();
+        match probe.poll() {
+            Some(Ok(v)) => assert_eq!(v.as_str(), Some("hi")),
+            other => panic!("expected Some(Ok(\"hi\")), got {other:?}"),
+        }
+
+        // Dropping every sender disconnects the channel; poll resolves to nil
+        // and clears the cell.
+        drop(tx);
+        match probe.poll() {
+            Some(Ok(v)) => assert!(v.is_nil()),
+            other => panic!("expected Some(Ok(nil)) on disconnect, got {other:?}"),
+        }
+        assert!(
+            cell.borrow().is_none(),
+            "poll must clear the cell on disconnect"
+        );
+
+        // A second poll after the cell is cleared must not panic — it
+        // resolves to nil immediately instead of touching a dropped receiver.
+        assert!(matches!(probe.poll(), Some(Ok(v)) if v.is_nil()));
     }
 
     // Regression guard for the real production send path: the actual

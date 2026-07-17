@@ -2,21 +2,33 @@
 
 ## Unreleased
 
-- **SRV-1 (concurrent `http/serve`) — liveness primitive proven (spike only,
-  feature still deferred):** added four focused runtime tests
-  (`crates/sema-vm/src/runtime/tests.rs`, `srv1_spike_*`) that prove, with
-  synthetic fake-externals at the real `Runtime` API level, that the re-arming
-  `WaitKind::External` shape the concurrent accept loop needs is deadlock-free:
-  an idle External keeps the runtime in `DriveState::Idle` (never a false
-  `Quiescent`/deadlock, no busy-spin), two parked tasks coexist and complete
-  independently, a continuation re-arms onto a fresh External indefinitely (the
-  accept-loop ping-pong), and shutdown while parked tears down cleanly with no
-  orphaned wait. This confirms the runtime has no missing primitive for SRV-1.
-  The full `http/serve` rearchitecture (cooperative accept loop + handler task
-  per connection + cooperative `ws/recv`/`ws/send`) is NOT landed — the
-  fail-fast guard and the four `#[ignore]`d acceptance scenarios in
-  `crates/sema/tests/http_serve_concurrent_test.rs` stay as-is (a subtly-broken
-  server is worse than the guard). See `docs/deferred.md` §SRV-1.
+- **SRV-1 (concurrent `http/serve`) — RESOLVED, fail-fast guard deleted.**
+  `http/serve`'s accept loop no longer blocks the VM thread: it parks
+  cooperatively on a re-arming `WaitKind::External` fed by the request
+  channel (proven deadlock-free by four focused runtime tests,
+  `crates/sema-vm/src/runtime/tests.rs`'s `srv1_spike_*`, at the real
+  `Runtime` API level — an idle External keeps the runtime `Idle`, never a
+  false `Quiescent`/deadlock; independent parked tasks settle independently;
+  a re-arming continuation loops indefinitely with no leak; shutdown while
+  parked tears down cleanly), each connection runs as its own spawned task,
+  and a server-side WebSocket handler's `(:recv conn)` suspends cooperatively
+  too instead of pinning the VM thread with `blocking_recv` — so a slow,
+  async-parked, or WebSocket-idling handler no longer blocks its siblings.
+  The `in_runtime_quantum() && current_task_id().is_some()` fail-fast guard
+  that used to reject `http/serve` inside `async/spawn` is deleted:
+  `http/serve` now genuinely composes there. All four acceptance scenarios in
+  `crates/sema/tests/http_serve_concurrent_test.rs` are un-ignored and green,
+  plus a new synthetic-level cancellation gate
+  (`crates/sema/tests/http_serve_cancel_test.rs`) proves an idle WebSocket
+  handler's task is reaped (no leak) on cancellation. An uncaught handler
+  error now produces a bounded 500 ("Handler did not respond") rather than
+  the old serial loop's `{"error": "..."}` JSON body — undocumented either
+  way, and now pinned by a dedicated test. See `docs/deferred.md` §SRV-1 for
+  the two runtime-adjacent traps this work routed around without a
+  `sema-vm` change (`spawn_via_registry`'s `VmResume` fast path silently
+  dropping a non-default `Spawn` continuation; a synchronous `call_callback`
+  re-entry suspending `in_runtime_quantum()` for its duration), both flagged
+  as open follow-ups for the next caller in this area.
 - **Unified runtime — Step G callback re-entry (nested `eval` and multimethod
   dispatch):** the last two gaps where a synchronous evaluator re-entry could
   not host a suspension are fixed. `(eval '(async/await (async ...)))` now

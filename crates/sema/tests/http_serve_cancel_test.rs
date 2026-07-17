@@ -109,3 +109,89 @@ fn cancel_during_slow_handler_reaps_the_handler_task_no_leak() {
         "cancelling the server root must reap the in-flight handler task too — no leak"
     );
 }
+
+/// SRV-1 piece c: cancelling `http/serve` while a WebSocket handler is parked
+/// IDLE in `(:recv conn)` (`ws/recv`'s cooperative `ServerWsRecvProbe` path,
+/// `crates/sema-stdlib/src/server.rs`) must reap the connection's handler
+/// task cleanly too — no orphan, no hang. This is the cancellation half of
+/// the piece-c contract; `idle_websocket_does_not_block_plain_request`
+/// (`http_serve_concurrent_test.rs`) covers the liveness half (a sibling
+/// request isn't blocked). Using a real `tungstenite` WS client so the
+/// connection genuinely upgrades and the handler genuinely parks in
+/// `ws/recv` — a bare TCP connect/disconnect (like `fire_and_disconnect`
+/// above) never reaches that code path.
+#[test]
+fn cancel_during_idle_websocket_recv_reaps_the_handler_task_no_leak() {
+    let interp = Interpreter::new();
+    let port = free_port();
+    let program = format!(
+        r#"(http/serve
+             (fn (req)
+               (if (= (:path req) "/ws")
+                   (http/websocket (fn (conn) ((:recv conn))))
+                   (http/text "unused")))
+             {{:port {port}}})"#
+    );
+    let handle = interp
+        .submit_str(&program, RootOptions::default())
+        .expect("http/serve submits as a root");
+    let root_id = handle.id();
+    let cmd = interp.command_handle();
+
+    // Canceller thread: waits for the accept loop to bind, opens a real WS
+    // connection (parking the per-connection handler task in `ws/recv`),
+    // gives it a moment to actually park, then cancels the root — modeling a
+    // process shutdown / client disconnect while the WS handler is idling.
+    let canceller = thread::spawn(move || {
+        assert!(
+            wait_until_listening(port, Duration::from_secs(5)),
+            "server never bound"
+        );
+        let ws_url = format!("ws://127.0.0.1:{port}/ws");
+        let ws = tungstenite::connect(&ws_url);
+        assert!(ws.is_ok(), "WS upgrade failed: {:?}", ws.err());
+        let (socket, _resp) = ws.unwrap();
+        thread::sleep(Duration::from_millis(250));
+        let cancelled = cmd.cancel_root(root_id);
+        // Keep the socket alive until after cancellation is issued so the
+        // handler is genuinely still parked in `ws/recv`, not merely
+        // disconnected client-side first.
+        drop(socket);
+        cancelled
+    });
+
+    let result = interp.drive_until_settled(&handle);
+
+    let cancelled = canceller.join().expect("canceller thread completes");
+    assert!(
+        cancelled,
+        "cancel_root must accept the live http/serve root"
+    );
+    assert!(
+        result.is_err(),
+        "a cancelled http/serve root must settle as an error, not a value"
+    );
+    // The WS handler's `ws/recv` parks on a cooperative poll
+    // (`ServerWsRecvProbe` / `await_runtime_until`) whose inter-scan wait is a
+    // `quarantined_blocking` op: a real (if brief, 5ms) OS-thread sleep that
+    // cancellation cannot abort mid-flight — the child task fully reaps only
+    // once that in-flight blocking job returns its completion through the
+    // inbox. `drive_until_settled` above stops as soon as the ROOT (the
+    // accept-loop task) settles, which can race ahead of that last hop for
+    // this wait kind specifically (unlike `async/sleep`'s purely-internal
+    // timer, which the sibling test above cancels synchronously). Keep
+    // driving bounded turns until the count actually reaches 0 — the
+    // liveness oracle itself, not a fixed sleep — so this stays a leak gate,
+    // not a timing-dependent flake.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut live = interp.runtime_live_task_count();
+    while live != 0 && Instant::now() < deadline {
+        let _ = interp.drive_turn();
+        thread::sleep(Duration::from_millis(2));
+        live = interp.runtime_live_task_count();
+    }
+    assert_eq!(
+        live, 0,
+        "cancelling the server root must reap the idle WebSocket handler task too — no leak"
+    );
+}

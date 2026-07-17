@@ -1,33 +1,29 @@
 //! Acceptance gate for **SRV-1** — async `http/serve` + concurrent, non-blocking
 //! connection handling.
 //!
-//! These tests are the failing-test-first artifact for the SRV-1 rearchitecture
-//! (see `docs/deferred.md` §"SRV-1"). Today `http/serve`
-//! (`crates/sema-stdlib/src/server.rs`) drains a single tokio `rx` SERIALLY on
-//! the evaluator (VM) thread via `rx.blocking_recv()` and runs each handler
-//! synchronously via `call_callback`, so:
+//! SRV-1 is landed (see `docs/deferred.md` §"SRV-1", RESOLVED): the accept
+//! loop (`crates/sema-stdlib/src/server.rs`'s `http_serve_runtime_impl`) parks
+//! on a re-arming `WaitKind::External` fed by the tokio request channel
+//! instead of blocking the VM thread, each connection's handler runs as its
+//! own spawned task, and a server-side WebSocket handler's `(:recv conn)`
+//! (`handle_ws_response_runtime`) suspends cooperatively too — so a slow,
+//! async-parked, or WebSocket-idling handler no longer blocks its siblings,
+//! and the old fail-fast guard against `http/serve` inside `async/spawn` is
+//! gone. Every test below is a standing regression gate against that
+//! contract, not a failing-test-first artifact anymore.
 //!
-//!   * one slow/parked handler (e.g. `ws/recv` idling on a quiet WebSocket, or a
-//!     handler awaiting real async work) blocks EVERY other connection, and
-//!   * `http/serve` cannot compose inside `async/spawn` at all (a fail-fast guard
-//!     rejects it — it would freeze the single VM thread the scheduler drives).
+//! ## Why `#[ignore]` is now unused here
 //!
-//! The fix (deferred) runs each request's handler as its OWN cooperative task on
-//! the unified runtime and makes the accept loop park on an External wait fed by
-//! the tokio `rx` instead of blocking the VM thread. Once that lands, delete the
-//! `#[ignore]` lines below and these become the standing concurrency gate.
-//!
-//! ## Why `#[ignore]`
-//!
-//! Every test here is `#[ignore]`d for TWO reasons: (1) SRV-1 is not yet
-//! implemented, so the concurrency assertions cannot pass against the shipped
-//! fail-fast/serial design (the WS head-of-line test in particular is a
-//! guaranteed hang→timeout today); and (2) they bind a loopback port and spawn
-//! the `sema` binary as a subprocess, i.e. they are network/process tests like
-//! `server_async_test::http_serve_top_level_still_serves`. The regression test
-//! (`regression_top_level_serve_still_answers`) is ignored for reason (2) ONLY —
-//! it already passes against the shipped code and exists so the SRV-1 landing
-//! keeps the existing top-level contract green.
+//! None of these tests are `#[ignore]`d: they bind a loopback port and spawn
+//! the `sema` binary as a subprocess (like
+//! `server_async_test::http_serve_top_level_still_serves`), but that alone
+//! isn't disqualifying — sibling subprocess/network tests in this same crate
+//! (e.g. `http_serve_cancel_test.rs`'s in-process variant, `server_test.rs`)
+//! already run un-ignored in the default `cargo test` gate. `regression_top_
+//! level_serve_still_answers` was previously ignored for "needs a loopback
+//! port + subprocess" alone, which is inconsistent with its un-ignored
+//! siblings in this very file that use the identical pattern — un-ignored
+//! here to match.
 //!
 //! ## Bounded guards
 //!
@@ -111,6 +107,47 @@ fn http_get_body(port: u16, path: &str, timeout: Duration) -> Result<String, Str
     Ok(body)
 }
 
+/// Like `http_get_body`, but also returns the HTTP status code — needed for
+/// `uncaught_handler_error_produces_the_bounded_500_fallback`, which pins
+/// both.
+fn http_get_status_and_body(
+    port: u16,
+    path: &str,
+    timeout: Duration,
+) -> Result<(u16, String), String> {
+    let addr = format!("127.0.0.1:{port}")
+        .to_socket_addrs()
+        .map_err(|e| e.to_string())?
+        .next()
+        .ok_or("no address")?;
+    let mut stream = TcpStream::connect_timeout(&addr, timeout).map_err(|e| e.to_string())?;
+    stream
+        .set_read_timeout(Some(timeout))
+        .map_err(|e| e.to_string())?;
+    stream
+        .set_write_timeout(Some(timeout))
+        .map_err(|e| e.to_string())?;
+    use std::io::Write;
+    let req = format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n");
+    stream
+        .write_all(req.as_bytes())
+        .map_err(|e| e.to_string())?;
+    let mut raw = String::new();
+    stream.read_to_string(&mut raw).map_err(|e| e.to_string())?;
+    let (status_line, rest) = raw.split_once("\r\n").ok_or("no status line")?;
+    let status: u16 = status_line
+        .split_whitespace()
+        .nth(1)
+        .ok_or("no status code")?
+        .parse()
+        .map_err(|_| "status code not numeric".to_string())?;
+    let body = rest
+        .split_once("\r\n\r\n")
+        .map(|(_, b)| b.to_string())
+        .unwrap_or_default();
+    Ok((status, body))
+}
+
 /// Run `body` on a worker thread and require it to finish within `budget`,
 /// returning its result. A hung server therefore fails the test with a clear
 /// message instead of blocking the harness forever.
@@ -182,7 +219,6 @@ fn slow_handler_does_not_block_fast_handler() {
 /// thread, so `/ping` never returns — the bounded guard turns that permanent
 /// stall into a test failure.
 #[test]
-#[ignore = "SRV-1: WS idle head-of-line blocking not yet fixed (also needs a loopback port + subprocess)"]
 fn idle_websocket_does_not_block_plain_request() {
     let port = free_port();
     let program = format!(
@@ -260,7 +296,6 @@ fn handler_parking_on_async_returns_response() {
 /// against the shipped serial design; it is ignored only because it needs a
 /// loopback port + subprocess. The SRV-1 landing must keep it green.
 #[test]
-#[ignore = "needs a loopback port + subprocess (passes against the shipped serial design)"]
 fn regression_top_level_serve_still_answers() {
     let port = free_port();
     let program = format!(r#"(http/serve (fn (req) (http/text (:path req))) {{:port {port}}})"#);
@@ -278,4 +313,41 @@ fn regression_top_level_serve_still_answers() {
     child.wait().ok();
 
     assert_eq!(body.as_deref(), Ok("/echo-me"), "top-level serve regressed");
+}
+
+/// **Error-contract pin.** A handler that raises (never returns, so
+/// `http/serve`'s responder native is never called — see
+/// `crates/sema-stdlib/src/server.rs`'s `make_responder_native` doc comment)
+/// must produce a bounded 500 with a fixed, pinned body. This is the CHOSEN
+/// contract from the SRV-1 piece-b/c concerns list: the pre-SRV-1 serial
+/// loop's `{"error": "..."}` JSON body is undocumented
+/// (`website/docs/stdlib/web-server.md` only documents explicit
+/// `http/error`/`http/not-found`/etc. constructors, never an implicit
+/// uncaught-exception shape) and `server_test.rs`'s `test_http_serve_handler_
+/// error` only ever asserted the status code — so there is no compatibility
+/// obligation to restore the old JSON shape, and this test pins whatever the
+/// concurrent accept loop actually produces instead of leaving it untested.
+#[test]
+fn uncaught_handler_error_produces_the_bounded_500_fallback() {
+    let port = free_port();
+    let program = format!(r#"(http/serve (fn (req) (error "boom")) {{:port {port}}})"#);
+    let mut child = spawn_serve(&program);
+    assert!(
+        wait_until_listening(port, Duration::from_secs(5)),
+        "server never bound"
+    );
+
+    let result = bounded(Duration::from_secs(3), move || {
+        http_get_status_and_body(port, "/anything", Duration::from_secs(3))
+    });
+
+    child.kill().ok();
+    child.wait().ok();
+
+    let (status, body) = result.expect("request must complete (bounded 500, not a hang)");
+    assert_eq!(status, 500, "uncaught handler error must produce a 500");
+    assert_eq!(
+        body, "Handler did not respond",
+        "uncaught handler error's body is the pinned bounded-fallback text, not the legacy JSON shape"
+    );
 }

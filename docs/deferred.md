@@ -664,6 +664,120 @@ its condition was not touched, only its comment, since nothing in this pass
 makes WS-composed-inside-spawn safe. Lifting it is piece (d), gated on
 converting `ws/recv`/`ws/send` to cooperative External waits (piece c) first.
 
+**RESOLVED 2026-07-17 — pieces (c)+(d) LANDED: server-side WebSocket recv is
+now cooperative, and the fail-fast guard is deleted.** A sixth pass closed the
+two remaining pieces:
+
+- **Piece (c) — server-side `ws/recv` is now a cooperative External wait.**
+  `handle_ws_response`'s WS-handler dispatch, when reached through
+  `http/serve`'s runtime ABI, no longer calls the handler synchronously via
+  `call_callback` — that path runs the closure on a fresh "foreign VM"
+  bridge (`sema-vm/src/vm.rs`'s `make_closure` "TEMPORARY BRIDGE" arm) which
+  explicitly SUSPENDS `in_runtime_quantum()` for the call's duration (a
+  Task-04-era bridge for legacy callback re-entry, still load-bearing for
+  every OTHER `call_callback` caller), so a suspending native called from
+  inside it can never observe `in_runtime_quantum() == true` — `(:recv
+  conn)` would silently fall back to blocking `blocking_recv` no matter what
+  the native itself did. `handle_ws_response_runtime` (new) instead returns
+  `NativeOutcome::Call { callable: ws_handler, .. }` from
+  `http/serve`'s responder native (now dual-ABI via
+  `NativeFn::with_ctx_runtime`) — a genuine VM-dispatched call within the
+  connection's OWN spawned task quantum, the same mechanism
+  `AcceptLoopContinuation` already uses to invoke the per-connection dispatch
+  factory. `in_runtime_quantum()` therefore stays true for the whole handler
+  body, including any nested `(:recv conn)`. The connection's `ws/recv`
+  (`simple_with_runtime`, dual-ABI) then cooperatively polls the incoming
+  channel via `ServerWsRecvProbe` + `crate::io::await_runtime_until` — the
+  exact `RuntimePoll`/`await_runtime_until` pattern the client-side `ws.rs`
+  already used for `ws/connect`/`ws/recv` — instead of `blocking_recv`. This
+  was the genuinely novel wrinkle this piece surfaced: converting `ws/recv`
+  alone is not enough, the WS handler's OWN invocation had to move off the
+  synchronous callback bridge first, or the conversion would have compiled
+  and looked correct while still silently blocking (`in_runtime_quantum()`
+  would always read false). `idle_websocket_does_not_block_plain_request`
+  (`http_serve_concurrent_test.rs`) is un-ignored and green: a real
+  `tungstenite` client opens a WS connection and stays silent; a sibling
+  plain `/ping` GET still completes well within its bounded budget.
+  `cancel_during_idle_websocket_recv_reaps_the_handler_task_no_leak`
+  (`http_serve_cancel_test.rs`, new) proves a real WS connection parked in
+  `ws/recv`, then cancelled (client disconnect / server shutdown), reaps its
+  handler task — `runtime_live_task_count() == 0` — with a bounded poll-until-
+  reaped loop rather than a synchronous assert, because this wait's
+  inter-scan sleep is a `quarantined_blocking` op (a real, if brief, 5 ms
+  OS-thread sleep) that cancellation cannot abort mid-flight; the task fully
+  reaps once that in-flight job's completion round-trips through the inbox,
+  which can trail the ROOT's own settlement by a turn or two for this wait
+  kind specifically (unlike `async/sleep`'s purely-internal timer, which the
+  sibling slow-handler cancellation test reaps synchronously). `ws/send`
+  and `ws/close` are UNCHANGED (still `blocking_send`/synchronous) — send
+  only blocks the VM thread if the 256-slot outgoing queue is full (a
+  slow/stalled client), a narrower, pre-existing limitation orthogonal to the
+  idle-recv head-of-line case this piece fixes; not attempted here.
+
+- **Piece (d) — the fail-fast guard is deleted.** With plain-HTTP concurrency
+  (pieces a/b) and server-side WS concurrency (piece c) both live,
+  `http_serve_setup`'s `in_runtime_quantum() && current_task_id().is_some()`
+  guard is gone in the same commit. `http/serve` now genuinely composes
+  inside `async/spawn`: confirmed both by a real subprocess run
+  (`(async/await (async/spawn (fn () (http/serve ...))))` binds and answers a
+  real loopback request) and by
+  `http_serve_inside_async_spawn_now_serves`
+  (`server_async_test.rs`, rewritten — it replaces the two tests that
+  asserted the now-deleted guard's rejection behavior, which would fail,
+  correctly, against the current code). `regression_top_level_serve_still_
+  answers` and `http_serve_top_level_arity_error_unchanged`/`http_serve_top_
+  level_still_serves` confirm the top-level contract is unchanged.
+
+- **Error-contract decision (from the pieces a/b concerns list):** a handler
+  that raises (never returns, so the responder native is never called) still
+  produces the bounded 500 "Handler did not respond" fallback, NOT the
+  legacy serial loop's `{"error": "..."}` JSON body. Kept, not restored: the
+  JSON shape is undocumented (`website/docs/stdlib/web-server.md` documents
+  only the explicit `http/error`/`http/not-found`/etc. constructors, never an
+  implicit uncaught-exception body) and the pre-existing
+  `server_test.rs::test_http_serve_handler_error` only ever asserted the
+  status code, never the body — so there was no compatibility obligation
+  either way. Pinned by a new test,
+  `uncaught_handler_error_produces_the_bounded_500_fallback`
+  (`http_serve_concurrent_test.rs`), which asserts both the 500 status and
+  the exact body text, so this is no longer untested behavior.
+
+- **Two open traps carried forward from the pieces a/b pass, unresolved by
+  c/d (repeated here since this entry is now the canonical SRV-1 status, and
+  both remain live for the NEXT caller who touches this area):**
+  1. `spawn_via_registry`'s `ReturnOwner::VmResume` fast path
+     (`sema-vm/src/runtime/state.rs`) still silently drops any
+     `RuntimeRequest::Spawn` continuation other than `async/spawn`'s own
+     trivial default. Every future caller wanting a custom Spawn
+     continuation from Rust must route through compiled bytecode instead
+     (as `AcceptLoopContinuation`'s factory does) or get silently dropped
+     the same way pieces a/b's first attempt did.
+  2. `apply`'s cooperative routing (`list.rs`) sends a callee through
+     `NativeOutcome::Call` only for a closure or a KNOWN runtime-only
+     native; every other native — including a dual-ABI one whose two ABIs
+     genuinely diverge in capability, like `__http-serve-run` — takes
+     `apply`'s synchronous fallback unconditionally. `http/serve`'s prelude
+     wrapper deliberately avoids `apply` for exactly this reason; the next
+     native with genuinely-divergent dual ABIs should too, or add a
+     capability marker to `apply`'s routing.
+  A THIRD trap surfaced by piece (c) itself, worth adding to this list: any
+  future stdlib native that calls a Sema callback via `call_callback` from
+  inside another native's body (as `handle_ws_response`/`handle_sse_response`
+  still do for the legacy/non-quantum path, and as `handle_ws_response_
+  runtime`'s predecessor did until this pass) must not assume
+  `in_runtime_quantum()` reflects the enclosing task's real state —
+  `sema-vm/src/vm.rs`'s `make_closure` "TEMPORARY BRIDGE" arm suspends it for
+  the call's duration by design (`ctx.suspend_runtime_quantum()`), a
+  Task-04-era necessity for ordinary synchronous callback re-entry (HOFs,
+  tool handlers) that this piece had to route AROUND (via
+  `NativeOutcome::Call`) rather than through, for exactly this WS case.
+  `handle_sse_response`'s `call_callback` invocation of the SSE stream
+  handler was NOT converted the same way in this pass — an SSE handler that
+  tries to suspend cooperatively inside its `send`-driven body would hit the
+  identical silent-fallback-to-blocking behavior `ws/recv` had before piece
+  (c); flagged here, not fixed (out of scope — no acceptance test currently
+  exercises a suspending op inside an SSE handler body).
+
 ## Consciously-not-converted blocking natives
 
 **Found 2026-07-10, during the scheduler-blocking-natives sweep.** Two more

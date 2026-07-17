@@ -2207,3 +2207,141 @@ fn channel_pingpong_handoff_respects_instruction_budget_and_lets_sibling_progres
         settlement.outcome
     );
 }
+
+/// `channel_pingpong_handoff_respects_instruction_budget_and_lets_sibling_progress`
+/// above pins the SAME budget continuation, but a cap-1 ping-pong parks
+/// naturally after at most two handoff iterations per round trip (the
+/// channel's own capacity forces a genuine suspend), so the in-place loop
+/// there never spins more than a couple of iterations regardless of whether
+/// `remaining_budget` is honored — it would stay green even if the
+/// continuation were defeated entirely. Pin the bound with a scenario that
+/// genuinely spins MANY handoff iterations in a single `run_parked_quantum`
+/// call: a tight send loop into a channel with capacity far larger than the
+/// number of sends, so every `channel/send` resolves immediately via
+/// `try_channel_handoff` and the Rust-level loop in `run_parked_quantum`
+/// never breaks out to a genuine park — only `remaining_budget` running out
+/// stops it.
+///
+/// The discriminator is turn count, not "who settles first": submitting a
+/// trivial sibling root turns out NOT to distinguish the two behaviors on its
+/// own, because `channel/new` itself is a genuine multi-step suspend (a
+/// `RuntimeRequest`, not a channel wait), so the very first `drive()` turn
+/// naturally round-robins the sibling in before the send loop even starts —
+/// regardless of whether the later loop is budget-bounded. What the budget
+/// continuation actually controls is how many sends land PER TURN once the
+/// loop is running: with it intact, `drive()` reports `instructions` pinned
+/// at the per-task cap on every turn and needs on the order of
+/// `50_000 / (sends per budget)` turns to drain the loop; with it defeated,
+/// the whole 50k-send loop completes inline within a single work item (the
+/// loop never returns control to `drive()`'s own per-turn accounting, which
+/// only checks between work items) and the sender settles within a small
+/// handful of turns regardless of the (tiny) per-task instruction budget.
+#[test]
+fn channel_send_loop_handoff_respects_instruction_budget_and_lets_sibling_progress() {
+    use sema_vm::runtime::{DriveBudget, RootPoll};
+
+    let interp = sema_eval::Interpreter::new();
+    let runtime = interp.runtime();
+
+    let sender_form = sema_reader::read_many(
+        r#"
+        (let ((c (channel/new 100000)))
+          (let loop ((n 0))
+            (if (< n 50000)
+                (begin (channel/send c n) (loop (+ n 1)))
+                n)))
+        "#,
+    )
+    .expect("sender source parses");
+    let sender_prog = sema_vm::compile_program(&sender_form, None).expect("sender compiles");
+    let mut sender_vm = sema_vm::VM::new(
+        interp.global_env.clone(),
+        sender_prog.functions,
+        &sender_prog.native_table,
+        sender_prog.main_cache_slots,
+    )
+    .expect("sender VM builds against stdlib globals");
+    sender_vm.seed_main_frame(sender_prog.closure);
+    let sender = runtime
+        .submit_root(sender_vm)
+        .expect("sender root admitted");
+
+    let sibling_form = sema_reader::read_many("(+ 1 2)").expect("sibling source parses");
+    let sibling_prog = sema_vm::compile_program(&sibling_form, None).expect("sibling compiles");
+    let mut sibling_vm = sema_vm::VM::new(
+        interp.global_env.clone(),
+        sibling_prog.functions,
+        &sibling_prog.native_table,
+        sibling_prog.main_cache_slots,
+    )
+    .expect("sibling VM builds");
+    sibling_vm.seed_main_frame(sibling_prog.closure);
+    let sibling = runtime
+        .submit_root(sibling_vm)
+        .expect("sibling root admitted");
+
+    let budget = DriveBudget {
+        work_item_limit: std::num::NonZeroUsize::new(4096).unwrap(),
+        completion_limit: std::num::NonZeroUsize::new(64).unwrap(),
+        timer_limit: std::num::NonZeroUsize::new(64).unwrap(),
+        root_visit_limit: std::num::NonZeroUsize::new(64).unwrap(),
+        cleanup_limit: std::num::NonZeroUsize::new(64).unwrap(),
+        // Tiny relative to the 50k-send loop: with the continuation intact this
+        // caps each turn to roughly instruction_limit_per_task / cost-per-send
+        // sends, so draining the whole loop legitimately takes hundreds of
+        // turns. A handoff loop that ignored the budget drains the entire
+        // 50k-send loop inline within a couple of turns regardless of this
+        // value (see the doc comment above).
+        instruction_limit_per_task: std::num::NonZeroUsize::new(500).unwrap(),
+        wall_clock_limit: std::time::Duration::from_secs(30),
+    };
+
+    let mut turns = 0;
+    let mut sibling_settled_at_turn = None;
+    while matches!(sender.poll_result(), RootPoll::Pending) {
+        runtime.drive(&budget).expect("drive turn succeeds");
+        turns += 1;
+        if sibling_settled_at_turn.is_none() && matches!(sibling.poll_result(), RootPoll::Ready(_))
+        {
+            sibling_settled_at_turn = Some(turns);
+        }
+        assert!(
+            turns < 5000,
+            "sender never finished draining its 50k-send loop after {turns} drive() turns"
+        );
+    }
+
+    let sibling_settled_at_turn = sibling_settled_at_turn
+        .expect("sibling must have settled by the time the sender's send loop finished");
+    assert!(
+        sibling_settled_at_turn < turns,
+        "sibling only settled at turn {sibling_settled_at_turn}, the SAME turn the sender's \
+         send loop finished (turn {turns}) — not a meaningful proof the sibling was \
+         interleaved into the loop rather than merely following it"
+    );
+    assert!(
+        turns > 100,
+        "the 50k-send loop drained in only {turns} drive() turns — the in-place channel \
+         handoff loop is not being chunked by the per-task instruction budget the way it \
+         should be. A handoff loop that ignored `remaining_budget` would run the whole \
+         loop to completion inline within a single work item and settle in only a \
+         couple of turns, regardless of how tiny instruction_limit_per_task is set here"
+    );
+
+    let RootPoll::Ready(settlement) = sibling.poll_result() else {
+        panic!("sibling settles")
+    };
+    assert!(
+        matches!(&settlement.outcome, sema_core::runtime::TaskOutcome::Returned(v) if v.as_int() == Some(3)),
+        "sibling settlement: {:?}",
+        settlement.outcome
+    );
+    let RootPoll::Ready(sender_settlement) = sender.poll_result() else {
+        panic!("sender settles")
+    };
+    assert!(
+        matches!(&sender_settlement.outcome, sema_core::runtime::TaskOutcome::Returned(v) if v.as_int() == Some(50000)),
+        "sender settlement: {:?}",
+        sender_settlement.outcome
+    );
+}

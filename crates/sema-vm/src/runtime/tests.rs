@@ -1801,6 +1801,124 @@ fn native_call_into_sema_closure_and_back_to_native_uses_task_vm() {
     );
 }
 
+/// `channel/send`/`channel/recv`'s continuation for the in-place handoff fast
+/// path (`try_channel_handoff`, state.rs) — `SendCont`/`RecvCont` in
+/// `sema-stdlib`'s `async_ops.rs` — only ever `resume()` to
+/// `Ok(NativeOutcome::Return(_))` or `Err(_)`, so no Sema-source channel op
+/// can drive the `ChannelHandoffOutcome::Deferred(other)` arm (state.rs:2999):
+/// a resumed continuation that itself composes into a further
+/// `Call`/`Suspend`/`Runtime` instead of settling outright. Pin that cold
+/// path directly with a synthetic `NativeContinuation` that does compose
+/// further (into a second, external suspend) — the only way to reach it.
+struct ChannelDeferContinuation(Arc<Mutex<Vec<&'static str>>>);
+
+impl Trace for ChannelDeferContinuation {
+    fn trace(&self, _sink: &mut dyn FnMut(sema_core::cycle::GcEdge<'_>)) -> bool {
+        true
+    }
+}
+
+impl NativeContinuation for ChannelDeferContinuation {
+    fn resume(
+        self: Box<Self>,
+        _context: &mut NativeCallContext<'_>,
+        input: ResumeInput,
+    ) -> NativeResult {
+        assert!(
+            matches!(
+                input,
+                ResumeInput::Runtime(sema_core::runtime::RuntimeResponse::Send(
+                    sema_core::runtime::ChannelSend::Sent
+                ))
+            ),
+            "channel handoff must resume the continuation with a Sent runtime response"
+        );
+        self.0.lock().unwrap().push("channel-composed");
+        // Compose into a further suspend instead of returning/erroring — this
+        // is exactly what makes `resume_this_inline`'s match fall into the
+        // `other => ChannelHandoffOutcome::Deferred(other)` arm.
+        Ok(NativeOutcome::Suspend(external_suspend(Arc::clone(
+            &self.0,
+        ))))
+    }
+}
+
+fn channel_defer_native(
+    channel: sema_core::runtime::ChannelId,
+    events: Arc<Mutex<Vec<&'static str>>>,
+) -> sema_core::NativeFn {
+    sema_core::NativeFn::with_context_result("chan-send-defer", move |_context, _args| {
+        Ok(NativeOutcome::Suspend(NativeSuspend {
+            wait: WaitKind::Channel(sema_core::runtime::ChannelWait::Send {
+                channel,
+                value: Value::int(1),
+            }),
+            continuation: Box::new(ChannelDeferContinuation(Arc::clone(&events))),
+        }))
+    })
+}
+
+#[test]
+fn channel_handoff_continuation_composing_further_takes_the_deferred_cold_path() {
+    let runtime = runtime_with_inline_executor(Rc::new(FakeClock::new()));
+    // Capacity 1, freshly allocated: `would_resolve_immediately` says yes for
+    // a send with no receiver required, so the quantum-loop's fast path in
+    // `run_parked_quantum` reaches `try_channel_handoff` instead of genuinely
+    // parking.
+    let channel = runtime.create_channel_for_test(1);
+    let events: Arc<Mutex<Vec<&'static str>>> = Arc::new(Mutex::new(Vec::new()));
+
+    let globals = Rc::new(sema_core::Env::new());
+    globals.set(
+        sema_core::intern("chan-send-defer"),
+        Value::native_fn(channel_defer_native(channel, Arc::clone(&events))),
+    );
+    let known = [sema_core::intern("chan-send-defer")].into_iter().collect();
+    let forms = sema_reader::read_many("(lambda () (chan-send-defer))").unwrap();
+    let program = crate::compile_program(&forms, Some(known)).unwrap();
+    let context = sema_core::EvalContext::new();
+    let mut vm = crate::VM::new(
+        globals,
+        program.functions,
+        &program.native_table,
+        program.main_cache_slots,
+    )
+    .unwrap();
+    let callable = vm.execute(program.closure, &context).unwrap();
+
+    let handle = runtime
+        .submit_test_root(TestPreparedTask::native(Ok(NativeOutcome::Call(
+            NativeCall {
+                callable,
+                args: Vec::new(),
+                continuation: Box::new(RecordingContinuation(Arc::clone(&events))),
+            },
+        ))))
+        .unwrap();
+
+    let mut guard = 0;
+    while matches!(handle.poll_result(), RootPoll::Pending) {
+        runtime.drive(&drive_budget(8)).unwrap();
+        guard += 1;
+        assert!(
+            guard < 100,
+            "deferred channel handoff composition did not settle"
+        );
+    }
+    assert!(matches!(
+        handle.poll_result(),
+        RootPoll::Ready(settlement)
+            if matches!(settlement.outcome, TaskOutcome::Returned(ref value) if value.as_int() == Some(9))
+    ));
+    assert_eq!(
+        *events.lock().unwrap(),
+        vec!["channel-composed", "decode", "returned", "resume-returned"],
+        "the Deferred outcome must drive its composed external suspend to \
+         completion and resume the outer VM call — proving the cold path is \
+         handled, not just matched"
+    );
+}
+
 #[test]
 fn extracted_runtime_closure_preserves_call_native_table() {
     let forms = sema_reader::read_many("(lambda () (identity 42))").unwrap();

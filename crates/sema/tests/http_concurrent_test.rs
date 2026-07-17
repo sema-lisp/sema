@@ -38,6 +38,15 @@ const DELAY_MS: u64 = 300;
 /// per-request correctness and ordering. Returns the bound port. The runtime is
 /// intentionally leaked (`Box::leak`) so it lives for the whole test process.
 fn start_delay_server() -> u16 {
+    start_delay_server_with_gauge().0
+}
+
+/// Like [`start_delay_server`], additionally returning a gauge of the maximum
+/// number of requests the server ever had in flight simultaneously. Server-side
+/// overlap is a load-independent oracle: a wall-clock bound can trip on a busy
+/// test machine, but "the server held >= 2 requests inside their delay windows
+/// at once" is exactly the overlap property and nothing else.
+fn start_delay_server_with_gauge() -> (u16, std::sync::Arc<MaxInFlight>) {
     // Bind synchronously first so we can hand the caller a ready port with no
     // race against the background accept loop.
     let std_listener = StdTcpListener::bind("127.0.0.1:0").expect("bind delay server");
@@ -49,6 +58,8 @@ fn start_delay_server() -> u16 {
         .build()
         .expect("delay server runtime");
 
+    let gauge = std::sync::Arc::new(MaxInFlight::default());
+    let gauge_for_server = gauge.clone();
     rt.spawn(async move {
         let listener = tokio::net::TcpListener::from_std(std_listener).expect("from_std listener");
         loop {
@@ -56,7 +67,9 @@ fn start_delay_server() -> u16 {
                 Ok(pair) => pair,
                 Err(_) => continue,
             };
+            let gauge = gauge_for_server.clone();
             tokio::spawn(async move {
+                let _in_flight = gauge.enter();
                 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
                 // Read the request (enough to get the request line). We only
@@ -96,11 +109,42 @@ fn start_delay_server() -> u16 {
 
     // Leak the runtime so the accept loop keeps running for the test's lifetime.
     Box::leak(Box::new(rt));
+    let ret_gauge = gauge;
 
     // Best-effort readiness wait: the runtime starts accepting promptly, but a
     // tiny sleep avoids a connection-refused race on the very first request.
     std::thread::sleep(Duration::from_millis(50));
-    port
+    (port, ret_gauge)
+}
+
+/// Tracks the high-water mark of concurrently in-flight requests.
+#[derive(Default)]
+struct MaxInFlight {
+    current: std::sync::atomic::AtomicUsize,
+    max: std::sync::atomic::AtomicUsize,
+}
+
+impl MaxInFlight {
+    fn enter(self: &std::sync::Arc<Self>) -> InFlightGuard {
+        use std::sync::atomic::Ordering;
+        let now = self.current.fetch_add(1, Ordering::SeqCst) + 1;
+        self.max.fetch_max(now, Ordering::SeqCst);
+        InFlightGuard(self.clone())
+    }
+
+    fn max_seen(&self) -> usize {
+        self.max.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+struct InFlightGuard(std::sync::Arc<MaxInFlight>);
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        self.0
+            .current
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 /// Find a port that is currently closed (bound then released) so a request to it
@@ -118,7 +162,7 @@ fn closed_port() -> u16 {
 #[test]
 #[serial]
 fn http_concurrent_overlap() {
-    let port = start_delay_server();
+    let (port, gauge) = start_delay_server_with_gauge();
     let interp = Interpreter::new();
     let program = format!(
         r#"
@@ -147,11 +191,20 @@ fn http_concurrent_overlap() {
         "expected five echoed bodies in input order"
     );
 
-    // Overlap (timing): serial floor is ~1500 ms; overlapping ~300-900 ms.
-    eprintln!("http_concurrent_overlap: wall-clock {elapsed_ms} ms (serial floor ~1500 ms)");
+    // Overlap: the server-side in-flight high-water mark is the oracle — it is
+    // immune to test-machine load, unlike a wall-clock bound (which flaked
+    // repeatedly under full-parallel nextest runs). Serial execution can never
+    // exceed 1 in flight; genuine overlap shows >= 2 (typically 5). Wall-clock
+    // is reported for eyeballing only.
+    let max_in_flight = gauge.max_seen();
+    eprintln!(
+        "http_concurrent_overlap: wall-clock {elapsed_ms} ms (serial floor ~1500 ms), \
+         max in-flight {max_in_flight}"
+    );
     assert!(
-        elapsed_ms < 1200,
-        "expected overlapped wall-clock < 1200 ms (serial floor ~1500 ms), got {elapsed_ms} ms"
+        max_in_flight >= 2,
+        "expected overlapped requests (server-side max in-flight >= 2), got {max_in_flight} \
+         (wall-clock {elapsed_ms} ms)"
     );
 }
 

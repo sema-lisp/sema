@@ -265,7 +265,7 @@ test('cancelRoot cancels the exact RootId via RuntimeCommandHandle::cancel_root,
   // A was cancelled, not left to run to completion (would take ~5s).
   expect(result.aOutcome.ok).toBe(false);
   expect((result.aOutcome as { message: string }).message.toLowerCase()).toContain('cancel');
-  expect(result.events).not.toContain(expect.stringContaining('A-should-not-print'));
+  expect(result.events.some((e: string) => e.includes('A-should-not-print'))).toBe(false);
   // B settled normally, unaffected by A's cancellation.
   expect(result.bOutcome.ok).toBe(true);
   expect(result.events.some((e) => e.endsWith(':B-done'))).toBe(true);

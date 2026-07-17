@@ -18,7 +18,27 @@ legacy_pattern='IoHandle|IoPoll|YieldReason|SchedulerTarget|SchedulerRunResult|s
 # `set_yield_signal`/`take_yield_signal`/`take_resume_value` (the ctx-less
 # `async/sleep` bridge), `VmExecResult::AsyncYield` (carries `Sleep`),
 # `execute_debug` (the VM-level debug test driver), `in_runtime_quantum`.
-purged_pattern='LegacyPromise|LegacyChannel|\bIoHandle\b|\bIoPoll\b|SchedulerTarget|SchedulerRunResult|DebugCoopResume|set_debug_coop_resume|take_debug_coop_resume|debug_coop_resume_pending|set_resume_value|\bin_async_context\b|set_async_context|init_scheduler|shutdown_scheduler|reset_scheduler_tasks|scheduler_task_count|run_cooperative|start_cooperative|run_closure_as_inline_task|call_run_scheduler|call_run_scheduler_all_of|call_run_scheduler_any_of|call_run_scheduler_target|call_run_scheduler_timeout|set_run_scheduler_callback|call_spawn_callback|set_spawn_callback|call_cancel_callback|set_cancel_callback|notify_io_complete|\bio_park\b|PromiseSetKind|LegacyRuntimeBridge|with_coop_paused_task_vm|COOP_TASK_STOP|coop_paused_task_id|clear_coop_paused_task_id|surface_coop_task_stop|reconstruct_coop_resume_value|\bexecute_async\b|\brun_async\b'
+#
+# Also deliberately NOT here (P6-3 step 5 — see
+# `docs/plans/2026-07-16-wasm-promise-driven-roots.md` §3 and the P6-3 entry
+# in `docs/deferred.md`): `HTTP_AWAIT_MARKER`/`is_http_await_marker`/
+# `parse_http_marker`/`HTTP_CACHE`/`clear_http_cache`/`perform_fetch_from_marker`
+# stay live — narrowed to the wasm DEBUGGER's own `http_needed`/
+# `debugPerformFetch` flow (`debugStart` is not promise-driven and has no
+# other way to surface a pending fetch to JS); `SLEEP_I32`/
+# `worker_atomics_sleep`/`worker_check_interrupt`/`installAtomicsSleep`/
+# `set_blocking_sleep_callback`/`set_interrupt_callback`/`check_interrupt`
+# stay live too — `crates/sema-eval/src/eval.rs`'s `drive_handle_to_settlement`
+# (wasm32 branch) still needs interruptible blocking sleep for every
+# still-synchronous wasm entry point (`eval`/`evalGlobal`/`evalVM`, and a
+# precompiled bytecode archive entry), which structurally suspend on a bare
+# `(async/sleep ...)` exactly like the promise-driven path does (`async/sleep`
+# is not dual-ABI-gated). Only `MAX_REPLAYS` (no remaining caller — the three
+# replay loops it bounded are gone) and the worker's `legacySab`/control-SAB
+# allocation (JS; the browser gate's own step-4 scoping note already flagged
+# it as dormant) are unconditionally deleted; those two ARE in the
+# zero-tolerance list below.
+purged_pattern='LegacyPromise|LegacyChannel|\bIoHandle\b|\bIoPoll\b|SchedulerTarget|SchedulerRunResult|DebugCoopResume|set_debug_coop_resume|take_debug_coop_resume|debug_coop_resume_pending|set_resume_value|\bin_async_context\b|set_async_context|init_scheduler|shutdown_scheduler|reset_scheduler_tasks|scheduler_task_count|run_cooperative|start_cooperative|run_closure_as_inline_task|call_run_scheduler|call_run_scheduler_all_of|call_run_scheduler_any_of|call_run_scheduler_target|call_run_scheduler_timeout|set_run_scheduler_callback|call_spawn_callback|set_spawn_callback|call_cancel_callback|set_cancel_callback|notify_io_complete|\bio_park\b|PromiseSetKind|LegacyRuntimeBridge|with_coop_paused_task_vm|COOP_TASK_STOP|coop_paused_task_id|clear_coop_paused_task_id|surface_coop_task_stop|reconstruct_coop_resume_value|\bexecute_async\b|\brun_async\b|\bMAX_REPLAYS\b|legacySab|new SharedArrayBuffer\('
 
 # Exact-file allowlist (no globs). A purged identifier surviving here is a KNOWN,
 # reviewed exception with a written reason. Currently empty — the purge is total.

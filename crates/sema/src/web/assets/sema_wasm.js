@@ -19,6 +19,21 @@ export class SemaInterpreter {
         wasm.__wbg_semainterpreter_free(ptr, 0);
     }
     /**
+     * Request cancellation of the root whose id was reported by
+     * [`Self::eval_promise`]'s `on_root_id` callback. Returns `false` if no
+     * pending `evalPromise` root matches `root_id` (already settled, or
+     * never existed) — a harmless no-op, same liveness contract as the
+     * underlying `RuntimeCommandHandle::cancel_root`. Has no effect on the
+     * OLD `eval`/`evalAsync`/`evalVM`/… entry points (they don't submit a
+     * cancellable root at all).
+     * @param {number} root_id
+     * @returns {boolean}
+     */
+    cancelRoot(root_id) {
+        const ret = wasm.semainterpreter_cancelRoot(this.__wbg_ptr, root_id);
+        return ret !== 0;
+    }
+    /**
      * Create interpreter with options: {stdlib: false, deny: ["network", "fs-write"]}
      * @param {any} opts
      * @returns {SemaInterpreter}
@@ -154,8 +169,14 @@ export class SemaInterpreter {
         return ret;
     }
     /**
-     * Evaluate code with async HTTP support in the persistent global env
-     * (top-level defines persist across calls). Runs on the bytecode VM.
+     * Evaluate code with real (single-execution) async HTTP/sleep support in
+     * the persistent global env (top-level defines persist across calls).
+     *
+     * A thin Promise-returning wrapper over [`Self::eval_promise`] (P6-3
+     * step 5) — kept as its own entry point so existing JS callers
+     * (`sema-web.js`, the playground's `?no-worker` fallback) don't have to
+     * change; the program body is submitted as ONE root and never replayed.
+     * See [`Self::eval_once_via_promise_seam`].
      * @param {string} code
      * @returns {Promise<any>}
      */
@@ -177,6 +198,33 @@ export class SemaInterpreter {
         return ret;
     }
     /**
+     * Evaluate `code` as ONE root on the unified runtime and return a
+     * `Promise` that resolves with its printed value (or `null`) and rejects
+     * with an `Error` on failure — never replays the program body, and
+     * (unlike every other `eval*` method) correctly supports a real
+     * `async/sleep` / `http/get` instead of hanging or panicking on the
+     * blocking legacy drive path. See `driver.rs` (P6-3 step 2). Output is
+     * NOT included in the resolved value: install `setPromiseOutputSink` to
+     * receive this root's `println`/`print-err` output, tagged with its
+     * root id, as it happens.
+     *
+     * `on_root_id`, if a function, is called SYNCHRONOUSLY (before this
+     * method returns) with the new root's id as a JS `number` — the only way
+     * a caller can learn it in time to route a later [`Self::cancel_root`]
+     * call at the exact root this call submitted (P6-3 step 3; the
+     * playground worker protocol uses this to implement "Stop"). Pass
+     * `null`/`undefined` to skip.
+     * @param {string} code
+     * @param {any} on_root_id
+     * @returns {Promise<any>}
+     */
+    evalPromise(code, on_root_id) {
+        const ptr0 = passStringToWasm0(code, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ret = wasm.semainterpreter_evalPromise(this.__wbg_ptr, ptr0, len0, on_root_id);
+        return ret;
+    }
+    /**
      * Evaluate code via the bytecode VM, returns same JSON format as eval_global
      * @param {string} code
      * @returns {any}
@@ -188,7 +236,9 @@ export class SemaInterpreter {
         return ret;
     }
     /**
-     * Evaluate code with async HTTP support (bytecode VM)
+     * Evaluate code with real (single-execution) async HTTP/sleep support
+     * (bytecode VM). See [`Self::eval_async`] — identical wrapper; kept as a
+     * separate name for the same JS-compat reason.
      * @param {string} code
      * @returns {Promise<any>}
      */
@@ -381,7 +431,18 @@ export class SemaInterpreter {
         return ret;
     }
     /**
-     * Execute an embedded archive entry path with async HTTP replay support.
+     * Execute an embedded archive entry path with real (single-execution)
+     * async HTTP/sleep support (P6-3 step 5).
+     *
+     * A source-text entry is submitted as ONE root via
+     * [`Self::eval_once_via_promise_seam_at_path`] — the program body never
+     * replays, and `http/get`/`async/sleep` inside it get the real
+     * runtime-ABI suspend. A precompiled bytecode entry has no
+     * submit-a-root equivalent (`Interpreter::submit_str` only accepts
+     * source text), so it stays on the direct single-execution path
+     * `runEntry` already used; an `http/get` inside one now surfaces a
+     * clear, honest error instead of the deleted replay loop silently
+     * leaking the internal HTTP marker string.
      * @param {string} path
      * @returns {Promise<any>}
      */
@@ -400,6 +461,17 @@ export class SemaInterpreter {
      */
     setOutputSink(sink) {
         wasm.semainterpreter_setOutputSink(this.__wbg_ptr, sink);
+    }
+    /**
+     * Install (or clear, passing `null`/`undefined`) the JS callback that
+     * receives `evalPromise` roots' output as `(rootId, stream, text)`,
+     * where `stream` is `"stdout"` or `"stderr"`. Independent of
+     * `setOutputSink` (the worker's line-batched sink for the OLD entry
+     * points) — the two never observe each other's output.
+     * @param {any} sink
+     */
+    setPromiseOutputSink(sink) {
+        wasm.semainterpreter_setPromiseOutputSink(this.__wbg_ptr, sink);
     }
     /**
      * Get the Sema version
@@ -521,10 +593,21 @@ function __wbg_get_imports() {
             const ret = arg0.call(arg1, arg2);
             return ret;
         }, arguments); },
+        __wbg_call_dcc2662fa17a72cf: function() { return handleError(function (arg0, arg1, arg2, arg3) {
+            const ret = arg0.call(arg1, arg2, arg3);
+            return ret;
+        }, arguments); },
         __wbg_call_e133b57c9155d22c: function() { return handleError(function (arg0, arg1) {
             const ret = arg0.call(arg1);
             return ret;
         }, arguments); },
+        __wbg_call_f858478a02f9600f: function() { return handleError(function (arg0, arg1, arg2, arg3, arg4) {
+            const ret = arg0.call(arg1, arg2, arg3, arg4);
+            return ret;
+        }, arguments); },
+        __wbg_close_ab55423854e61546: function(arg0) {
+            arg0.close();
+        },
         __wbg_done_08ce71ee07e3bd17: function(arg0) {
             const ret = arg0.done;
             return ret;
@@ -533,6 +616,10 @@ function __wbg_get_imports() {
             const ret = eval(getStringFromWasm0(arg0, arg1));
             return ret;
         }, arguments); },
+        __wbg_fetch_5550a88cf343aaa9: function(arg0, arg1) {
+            const ret = arg0.fetch(arg1);
+            return ret;
+        },
         __wbg_fetch_f8a611684c3b5fe5: function(arg0, arg1) {
             const ret = arg0.fetch(arg1);
             return ret;
@@ -618,6 +705,16 @@ function __wbg_get_imports() {
             const ret = result;
             return ret;
         },
+        __wbg_instanceof_WorkerGlobalScope_de6976d00cb213c6: function(arg0) {
+            let result;
+            try {
+                result = arg0 instanceof WorkerGlobalScope;
+            } catch (_) {
+                result = false;
+            }
+            const ret = result;
+            return ret;
+        },
         __wbg_isArray_33b91feb269ff46e: function(arg0) {
             const ret = Array.isArray(arg0);
             return ret;
@@ -666,6 +763,32 @@ function __wbg_get_imports() {
             const ret = new XMLHttpRequest();
             return ret;
         }, arguments); },
+        __wbg_new_d098e265629cd10f: function(arg0, arg1) {
+            try {
+                var state0 = {a: arg0, b: arg1};
+                var cb0 = (arg0, arg1) => {
+                    const a = state0.a;
+                    state0.a = 0;
+                    try {
+                        return wasm_bindgen_99a98757d426b094___convert__closures_____invoke___js_sys_82c2e4c9bb939c97___Function_fn_wasm_bindgen_99a98757d426b094___JsValue_____wasm_bindgen_99a98757d426b094___sys__Undefined___js_sys_82c2e4c9bb939c97___Function_fn_wasm_bindgen_99a98757d426b094___JsValue_____wasm_bindgen_99a98757d426b094___sys__Undefined_______true_(a, state0.b, arg0, arg1);
+                    } finally {
+                        state0.a = a;
+                    }
+                };
+                const ret = new Promise(cb0);
+                return ret;
+            } finally {
+                state0.a = state0.b = 0;
+            }
+        },
+        __wbg_new_d15cb560a6a0e5f0: function(arg0, arg1) {
+            const ret = new Error(getStringFromWasm0(arg0, arg1));
+            return ret;
+        },
+        __wbg_new_f7708ba82c4c12f6: function() { return handleError(function () {
+            const ret = new MessageChannel();
+            return ret;
+        }, arguments); },
         __wbg_new_typed_aaaeaf29cf802876: function(arg0, arg1) {
             try {
                 var state0 = {a: arg0, b: arg1};
@@ -704,12 +827,31 @@ function __wbg_get_imports() {
             const ret = Date.now();
             return ret;
         },
+        __wbg_now_e7c6795a7f81e10f: function(arg0) {
+            const ret = arg0.now();
+            return ret;
+        },
         __wbg_open_ab5f9641f561c051: function() { return handleError(function (arg0, arg1, arg2, arg3, arg4, arg5) {
             arg0.open(getStringFromWasm0(arg1, arg2), getStringFromWasm0(arg3, arg4), arg5 !== 0);
         }, arguments); },
         __wbg_parse_e9eddd2a82c706eb: function() { return handleError(function (arg0, arg1) {
             const ret = JSON.parse(getStringFromWasm0(arg0, arg1));
             return ret;
+        }, arguments); },
+        __wbg_performance_3fcf6e32a7e1ed0a: function(arg0) {
+            const ret = arg0.performance;
+            return ret;
+        },
+        __wbg_port1_869a7ef90538dbdf: function(arg0) {
+            const ret = arg0.port1;
+            return ret;
+        },
+        __wbg_port2_947a51b8ba00adc9: function(arg0) {
+            const ret = arg0.port2;
+            return ret;
+        },
+        __wbg_postMessage_c89a8b5edbf59ad0: function() { return handleError(function (arg0, arg1) {
+            arg0.postMessage(arg1);
         }, arguments); },
         __wbg_prototypesetcall_d62e5099504357e6: function(arg0, arg1, arg2) {
             Uint8Array.prototype.set.call(getArrayU8FromWasm0(arg0, arg1), arg2);
@@ -749,6 +891,10 @@ function __wbg_get_imports() {
             const ret = arg0.setTimeout(arg1, arg2);
             return ret;
         }, arguments); },
+        __wbg_setTimeout_c8336cac3e6a81ea: function() { return handleError(function (arg0, arg1, arg2) {
+            const ret = arg0.setTimeout(arg1, arg2);
+            return ret;
+        }, arguments); },
         __wbg_set_7eaa4f96924fd6b3: function() { return handleError(function (arg0, arg1, arg2) {
             const ret = Reflect.set(arg0, arg1, arg2);
             return ret;
@@ -767,6 +913,9 @@ function __wbg_get_imports() {
         },
         __wbg_set_mode_5a87f2c809cf37c2: function(arg0, arg1) {
             arg0.mode = __wbindgen_enum_RequestMode[arg1];
+        },
+        __wbg_set_onmessage_f939f8b6d08ca76b: function(arg0, arg1) {
+            arg0.onmessage = arg1;
         },
         __wbg_set_signal_0cebecb698f25d21: function(arg0, arg1) {
             arg0.signal = arg1;
@@ -824,21 +973,31 @@ function __wbg_get_imports() {
             return ret;
         }, arguments); },
         __wbindgen_cast_0000000000000001: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { dtor_idx: 1, function: Function { arguments: [Externref], shim_idx: 45, ret: Result(Unit), inner_ret: Some(Result(Unit)) }, mutable: true }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { dtor_idx: 1, function: Function { arguments: [Externref], shim_idx: 69, ret: Result(Unit), inner_ret: Some(Result(Unit)) }, mutable: true }) -> Externref`.
             const ret = makeMutClosure(arg0, arg1, wasm.wasm_bindgen_99a98757d426b094___closure__destroy___dyn_core_7d5f0a2ba6a62c33___ops__function__FnMut__wasm_bindgen_99a98757d426b094___JsValue____Output___core_7d5f0a2ba6a62c33___result__Result_____wasm_bindgen_99a98757d426b094___JsError___, wasm_bindgen_99a98757d426b094___convert__closures_____invoke___wasm_bindgen_99a98757d426b094___JsValue__core_7d5f0a2ba6a62c33___result__Result_____wasm_bindgen_99a98757d426b094___JsError___true_);
             return ret;
         },
         __wbindgen_cast_0000000000000002: function(arg0, arg1) {
+            // Cast intrinsic for `Closure(Closure { dtor_idx: 1, function: Function { arguments: [F64, Externref, Externref], shim_idx: 14, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+            const ret = makeMutClosure(arg0, arg1, wasm.wasm_bindgen_99a98757d426b094___closure__destroy___dyn_core_7d5f0a2ba6a62c33___ops__function__FnMut__wasm_bindgen_99a98757d426b094___JsValue____Output___core_7d5f0a2ba6a62c33___result__Result_____wasm_bindgen_99a98757d426b094___JsError___, wasm_bindgen_99a98757d426b094___convert__closures_____invoke___f64__wasm_bindgen_99a98757d426b094___JsValue__wasm_bindgen_99a98757d426b094___JsValue______true_);
+            return ret;
+        },
+        __wbindgen_cast_0000000000000003: function(arg0, arg1) {
+            // Cast intrinsic for `Closure(Closure { dtor_idx: 1, function: Function { arguments: [F64], shim_idx: 12, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+            const ret = makeMutClosure(arg0, arg1, wasm.wasm_bindgen_99a98757d426b094___closure__destroy___dyn_core_7d5f0a2ba6a62c33___ops__function__FnMut__wasm_bindgen_99a98757d426b094___JsValue____Output___core_7d5f0a2ba6a62c33___result__Result_____wasm_bindgen_99a98757d426b094___JsError___, wasm_bindgen_99a98757d426b094___convert__closures_____invoke___f64______true_);
+            return ret;
+        },
+        __wbindgen_cast_0000000000000004: function(arg0, arg1) {
             // Cast intrinsic for `Closure(Closure { dtor_idx: 1, function: Function { arguments: [], shim_idx: 2, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
             const ret = makeMutClosure(arg0, arg1, wasm.wasm_bindgen_99a98757d426b094___closure__destroy___dyn_core_7d5f0a2ba6a62c33___ops__function__FnMut__wasm_bindgen_99a98757d426b094___JsValue____Output___core_7d5f0a2ba6a62c33___result__Result_____wasm_bindgen_99a98757d426b094___JsError___, wasm_bindgen_99a98757d426b094___convert__closures_____invoke_______true_);
             return ret;
         },
-        __wbindgen_cast_0000000000000003: function(arg0) {
+        __wbindgen_cast_0000000000000005: function(arg0) {
             // Cast intrinsic for `F64 -> Externref`.
             const ret = arg0;
             return ret;
         },
-        __wbindgen_cast_0000000000000004: function(arg0, arg1) {
+        __wbindgen_cast_0000000000000006: function(arg0, arg1) {
             // Cast intrinsic for `Ref(String) -> Externref`.
             const ret = getStringFromWasm0(arg0, arg1);
             return ret;
@@ -872,6 +1031,14 @@ function wasm_bindgen_99a98757d426b094___convert__closures_____invoke___wasm_bin
 
 function wasm_bindgen_99a98757d426b094___convert__closures_____invoke___js_sys_82c2e4c9bb939c97___Function_fn_wasm_bindgen_99a98757d426b094___JsValue_____wasm_bindgen_99a98757d426b094___sys__Undefined___js_sys_82c2e4c9bb939c97___Function_fn_wasm_bindgen_99a98757d426b094___JsValue_____wasm_bindgen_99a98757d426b094___sys__Undefined_______true_(arg0, arg1, arg2, arg3) {
     wasm.wasm_bindgen_99a98757d426b094___convert__closures_____invoke___js_sys_82c2e4c9bb939c97___Function_fn_wasm_bindgen_99a98757d426b094___JsValue_____wasm_bindgen_99a98757d426b094___sys__Undefined___js_sys_82c2e4c9bb939c97___Function_fn_wasm_bindgen_99a98757d426b094___JsValue_____wasm_bindgen_99a98757d426b094___sys__Undefined_______true_(arg0, arg1, arg2, arg3);
+}
+
+function wasm_bindgen_99a98757d426b094___convert__closures_____invoke___f64______true_(arg0, arg1, arg2) {
+    wasm.wasm_bindgen_99a98757d426b094___convert__closures_____invoke___f64______true_(arg0, arg1, arg2);
+}
+
+function wasm_bindgen_99a98757d426b094___convert__closures_____invoke___f64__wasm_bindgen_99a98757d426b094___JsValue__wasm_bindgen_99a98757d426b094___JsValue______true_(arg0, arg1, arg2, arg3, arg4) {
+    wasm.wasm_bindgen_99a98757d426b094___convert__closures_____invoke___f64__wasm_bindgen_99a98757d426b094___JsValue__wasm_bindgen_99a98757d426b094___JsValue______true_(arg0, arg1, arg2, arg3, arg4);
 }
 
 

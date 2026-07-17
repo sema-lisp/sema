@@ -787,7 +787,59 @@ are the only new legacy cells) and `no_adhoc_tokio_runtimes_outside_allowlist` (
 interpreter's cooperative `Runtime::new` is allowlisted; in-src `tests.rs` modules are exempt
 like `tests/**`).
 
-### P6-3 WASM Promise-driven roots (deferred — needs a browser); P6-1 RESOLVED
+### P6-3 WASM Promise-driven roots — RESOLVED 2026-07-17 (step 5, the deletion); P6-1 RESOLVED
+
+**P6-3 step 5 (the deletion) — RESOLVED 2026-07-17.** Landed on top of steps 2-4
+(the `evalPromise` seam, the root-aware worker protocol, and the real-browser
+acceptance gate — transcript at
+`docs/plans/evidence/unified-cooperative-runtime/p63-browser-gate-transcript.txt`).
+Deleted: the three HTTP-replay loops in `evalAsync`/`evalVMAsync`/`runEntryAsync`
+(now thin Promise-returning wrappers over `evalPromise`, preserving their JSON
+shape and JS-visible signatures — see
+`docs/plans/2026-07-16-wasm-promise-driven-roots.md` §2.1); `MAX_REPLAYS`; and
+the JS worker's dormant `legacySab`/control-`SharedArrayBuffer` fallback branch
+(`playground/src/sema-worker.js`) entirely.
+
+**Deliberately NOT deleted — two verified-live consumers found during the step-5
+audit, kept rather than forced per the landing rule ("if something still reads
+it, STOP and report"):**
+1. `HTTP_AWAIT_MARKER`/`is_http_await_marker`/`parse_http_marker`/`HTTP_CACHE`/
+   `clear_http_cache`/`perform_fetch_from_marker` — narrowed to the wasm
+   debugger's own `http_needed`/`debugPerformFetch` flow
+   (`crates/sema-wasm/src/lib.rs`'s `debugStart`/`debug_maybe_http_error`),
+   which is not promise-driven and has no other way to surface a pending
+   fetch to JS. Every other caller (the three rewritten entry points) now
+   routes through `evalPromise`, where `http/get` never throws this marker at
+   all (dual-ABI gate in `register_wasm_io`).
+2. `SLEEP_I32`/`worker_atomics_sleep`/`worker_check_interrupt`/
+   `installAtomicsSleep`/`set_blocking_sleep_callback`/`set_interrupt_callback`/
+   `sema_core::check_interrupt` — `crates/sema-eval/src/eval.rs`'s
+   `drive_handle_to_settlement` (wasm32 branch) still needs interruptible
+   blocking sleep for every still-synchronous wasm entry point (`eval`/
+   `evalGlobal`/`evalVM`, and a precompiled bytecode archive entry, which has
+   no submit-a-root equivalent to route through the promise seam). A bare
+   `(async/sleep ...)` reaches this branch on ANY path — `async/sleep` is not
+   dual-ABI-gated the way `http/get` is — so this is not merely the old SAB-
+   cancel path; forcing its deletion would break synchronous eval on wasm32
+   with no replacement mechanism in scope for this step. With the worker's SAB
+   allocation gone, this machinery degrades to the same no-op "busy-poll to
+   deadline" the main thread has always used when no callback is installed —
+   graceful, not broken, just less promptly cancellable mid-sleep for a
+   synchronous call specifically.
+
+A precompiled bytecode archive entry's `http/get` (no submit-a-root path
+exists for a compiled chunk) now surfaces a clear, honest error instead of the
+deleted replay loop leaking the internal HTTP marker string — the sanctioned
+"sync fast path errors on suspension with a clear message" fallback.
+
+Also fixed as a byproduct: `crates/sema/src/web/assets/sema_wasm.js`/
+`sema_wasm_bg.wasm` (the `sema web` packaged runtime, embedded via `build.rs`)
+were stale relative to even P6-3 step 2 (missing `evalPromise`/`cancelRoot`/
+`setPromiseOutputSink` bindings entirely) — regenerated via
+`jake wasm.web-runtime` and committed; `scripts/test-packaged-sema-web.sh`
+passes against the rebuilt `.crate`.
+
+Full record: `.superpowers/sdd/p63-step5-report.md`.
 
 **P6-1 common host API — RESOLVED 2026-07-17** (commits 0b54e961..519fdc50):
 public `Interpreter::{submit_str, submit_value, drive_until_settled, drive_turn,

@@ -444,10 +444,23 @@ fn resolve_with_value(resolve: &Function, value: &Value) {
     let _ = resolve.call1(&JsValue::NULL, &text);
 }
 
+/// Builds the full formatted error text — inner message, stack trace, hint,
+/// note, in that order — matching every OLD entry point's `{"error": "..."}`
+/// formatting (`lib.rs`'s `eval_error_result`/`eval_async`/…). Baking all of
+/// it into the rejected `Error`'s message (previously only the inner message
+/// and hint, before P6-3 step 5) means an OLD entry point's promise-driven
+/// wrapper can recover full fidelity from a plain `JsFuture` rejection
+/// without a second, parallel error-detail channel.
 fn reject_with_error(reject: &Function, error: &SemaError) {
     let mut message = format!("{}", error.inner());
+    if let Some(trace) = error.stack_trace() {
+        message.push_str(&format!("\n{trace}"));
+    }
     if let Some(hint) = error.hint() {
         message.push_str(&format!("\n  hint: {hint}"));
+    }
+    if let Some(note) = error.note() {
+        message.push_str(&format!("\n  note: {note}"));
     }
     reject_with_message(reject, &message);
 }

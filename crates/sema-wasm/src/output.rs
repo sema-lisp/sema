@@ -35,6 +35,15 @@ pub(crate) fn set_sink(sink: Option<Function>) {
     ROOT_OUTPUT_SINK.with(|s| *s.borrow_mut() = sink);
 }
 
+/// Remove and return whatever sink is currently installed. Used by an OLD
+/// entry point's promise-driven wrapper (`lib.rs`'s `eval_once_via_promise_seam`,
+/// P6-3 step 5) to install its own private root-tagged sink for the duration
+/// of one call without permanently stomping a real `setPromiseOutputSink`
+/// caller's sink — the previous value is restored via [`set_sink`] afterward.
+pub(crate) fn take_sink() -> Option<Function> {
+    ROOT_OUTPUT_SINK.with(|s| s.borrow_mut().take())
+}
+
 /// Drain every `OutputEvent` captured since the last call (across every
 /// `capture_output` root on `interp`'s runtime) and forward each to the
 /// installed sink in order. A no-op (but still drains, so nothing piles up

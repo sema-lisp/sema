@@ -1,10 +1,20 @@
 # P6-3: WASM Promise-driven roots — design + acceptance gate
 
-Status: **DESIGN / NOT LANDED** (hard-fallback). The shipped replay+Atomics
-mechanism in `crates/sema-wasm/src/lib.rs` is unchanged. This document is the
-concrete design seam and the acceptance gate for the eventual landing, plus a
-record of exactly what blocked real-browser verification in the fallback
-session so the next attempt starts from a known state.
+Status: **LANDED 2026-07-17** (step 5, the deletion). `evalPromise` is the
+live default seam; the shipped `eval`/`evalAsync`/`evalVM`/`evalVMAsync`/
+`runEntryAsync` entry points route through it (the three async ones as thin
+Promise-returning wrappers, `eval`/`evalGlobal`/`evalVM` unchanged, still
+synchronous). The HTTP-replay loops, `MAX_REPLAYS`, and the JS worker's
+`legacySab`/control-SAB fallback are deleted. Two narrowly-scoped exceptions
+were kept rather than force-deleted after a step-5 audit found live
+consumers beyond the browser gate's scope — the wasm debugger's own HTTP
+marker flow, and `check_interrupt`/blocking-sleep support for the
+still-synchronous entry points — see `docs/deferred.md`'s P6-3 entry and
+`.superpowers/sdd/p63-step5-report.md` for the full record. This document
+remains the design record and the acceptance gate
+(`playground/tests/unified-runtime.spec.ts`); the browser-gate transcript is
+committed at
+`docs/plans/evidence/unified-cooperative-runtime/p63-browser-gate-transcript.txt`.
 
 This is the WASM slice of Task 07
 (`docs/plans/2026-07-13-unified-cooperative-runtime-task-07.md`, Task 5) and the

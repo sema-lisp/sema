@@ -1,13 +1,14 @@
 ;; Real sleep — watch the clock actually tick.
 ;;
-;; In the playground (when the page is cross-origin isolated) eval runs on a Web
-;; Worker that blocks on Atomics.wait, so `async/sleep` pauses for REAL
-;; wall-clock time while the page stays responsive. Each line below prints the
-;; moment its nap finishes — live, one at a time — proving the sleeps really
-;; happen instead of completing instantly. Hit Stop to cancel mid-nap.
+;; In the playground eval runs on a Web Worker that drives the Promise-based
+;; evalPromise seam, so `async/sleep` completes via a real `setTimeout` and
+;; pauses for REAL wall-clock time while the page stays responsive. Each line
+;; below prints the moment its nap finishes — live, one at a time — proving
+;; the sleeps really happen instead of completing instantly. Hit Stop to
+;; cancel mid-nap.
 ;;
-;; (On native this is real time too. In a browser without cross-origin
-;; isolation it falls back to an instant virtual clock — ordering is preserved,
+;; (On native this is real time too. On the main thread — e.g. with ?no-worker
+;; — it falls back to an instant virtual clock — ordering is preserved,
 ;; durations just don't really wait.)
 
 (println "Taking 10 naps, each a random 1–3 seconds. Watch them land live...")
@@ -25,7 +26,7 @@
           "s).")))
     (let ((ms (math/random-int 1000 3000)))
       ;; Wrap in (async ...) so async/sleep goes through the scheduler — that's
-      ;; what blocks on Atomics.wait for the real duration on the worker.
+      ;; what completes via a real setTimeout for the real duration on the worker.
       (await (async (async/sleep ms)))
       (println (str "  nap " i " — slept " ms " ms"))
       (loop (+ i 1) (+ total ms)))))

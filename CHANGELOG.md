@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- **WASM Promise-driven roots — the deletion (P6-3 step 5):** the shipped
+  HTTP-replay loops (`evalAsync`/`evalVMAsync`/`runEntryAsync` re-running the
+  whole program on every host I/O, up to `MAX_REPLAYS=50`) and the playground
+  worker's `SharedArrayBuffer`/`Atomics.wait` sleep fallback are deleted. The
+  three async entry points are now thin Promise-returning wrappers over the
+  `evalPromise` seam — submitted as ONE root, never replayed, with real
+  single-execution `http/get`/`async/sleep` support — while keeping their
+  existing JS method names and JSON result shape. The debugger's own HTTP
+  marker flow and the synchronous entry points' (`eval`/`evalGlobal`/`evalVM`)
+  interruptible-sleep support are intentionally kept (verified live
+  consumers beyond this step's scope); see `docs/deferred.md`'s P6-3 entry.
 - **Public host API (P6-1):** `Interpreter` gains `submit_str`/`submit_value`/
   `drive_until_settled`/`drive_turn`/`take_output`/`command_handle`/`shutdown`,
   with `RootOptions{capture_output}`, root-tagged `OutputEvent`, and

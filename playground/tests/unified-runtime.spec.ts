@@ -26,26 +26,31 @@
 // requires; it is not a stand-in for wiring concurrent runs into the UI
 // (which nothing in P6-3's scope calls for).
 //
-// (e) is scoped down from the design doc's literal wording ("source scan
-// finds no HTTP_AWAIT_MARKER/MAX_REPLAYS/installAtomicsSleep/Atomics.wait").
-// The old replay/Atomics machinery still EXISTS in the tree until step 5
-// (`crates/sema-wasm/src/lib.rs`'s three replay loops, `sema-worker.js`'s
-// dead `legacySab` fallback branch) — a whole-repo scan would fail today by
-// design, not by defect. What step 4 CAN honestly assert: the NEW promise-
-// driven path's own code is clean of those markers, and the legacy JS that
-// still exists is provably unreachable through the shipped default protocol.
-// Concretely: `crates/sema-wasm/src/driver.rs` (the new macrotask driver,
-// entirely step-2/3 code) contains zero occurrences of any of the four
-// markers; and in the built `dist/sema-worker.js`, `HTTP_AWAIT_MARKER`/
-// `MAX_REPLAYS` never appear at all (they are `lib.rs`-only, `.rs`, not
-// `.js`), no literal `Atomics.wait(` call exists, and the one legacy call
-// that does still exist there (`installAtomicsSleep(`) is gated behind
-// `if (msg.legacySab)` — a flag nothing in the shipped `app.js`/
-// `worker-client.js` ever sets, confirmed by grepping the bundled output.
-// The full-repo "these strings are gone entirely" scan is step 5's job, once
-// the replay/Atomics machinery is actually deleted.
+// (e), P6-3 step 5 update: the three replay loops and the JS-side
+// SAB/`legacySab` fallback are DELETED (see
+// `docs/plans/2026-07-16-wasm-promise-driven-roots.md` §3), so this now
+// scans the full sources (`crates/**`, `playground/src/**`) for `MAX_REPLAYS`
+// and the SAB/`legacySab` machinery, not just `driver.rs`/the shipped
+// bundle's default branch as step 4 scoped it.
+//
+// This is NOT a claim that `HTTP_AWAIT_MARKER`/`installAtomicsSleep` are gone
+// from the Rust crate entirely — a step-5 audit found each has a real, still-
+// live consumer beyond the deleted replay/legacySab machinery: (1) the wasm
+// debugger's own `http_needed`/`debugPerformFetch` flow (`debugStart` is not
+// promise-driven and has no other way to surface a pending fetch to JS), and
+// (2) `check_interrupt`/blocking-sleep support for every still-synchronous
+// entry point (`eval`/`evalGlobal`/`evalVM`, a precompiled bytecode archive
+// entry) via `crates/sema-eval/src/eval.rs`'s `drive_handle_to_settlement`,
+// which a bare `(async/sleep ...)` reaches on ANY path (`async/sleep` is not
+// dual-ABI-gated the way `http/get` is). Forcing their deletion would break
+// those live callers with no replacement mechanism in scope here — see
+// `docs/deferred.md`'s P6-3 entry and
+// `scripts/check-unified-runtime-legacy.sh`'s zero-tolerance list comment for
+// the full record. `driver.rs` (the promise-driven path's own code) and the
+// shipped JS bundle stay clean of all four markers, checked below.
 import { test, expect, type Page } from '@playwright/test';
 import { readFileSync } from 'node:fs';
+import { execSync } from 'node:child_process';
 import path from 'node:path';
 
 const REPO_ROOT = path.resolve(__dirname, '../..');
@@ -267,11 +272,38 @@ test('cancelRoot cancels the exact RootId via RuntimeCommandHandle::cancel_root,
   expect(elapsed).toBeLessThan(3000);
 });
 
-// ── Gate (e), scoped: the promise-driven path's OWN code carries none of the
-// legacy replay/Atomics markers (full-repo deletion scan is step 5's job —
-// see the file-level comment above for why a whole-tree scan would fail
-// today by design).
-test('promise-driven driver.rs is free of the legacy replay/Atomics markers', async () => {
+// ── Gate (e), un-scoped (P6-3 step 5 —
+// `docs/plans/2026-07-16-wasm-promise-driven-roots.md`): the replay loops and
+// the JS-side SAB/`legacySab` fallback are now actually deleted, so this
+// scans the FULL sources, not just `driver.rs`/the shipped bundle's default
+// branch as step 4 scoped it. It is NOT a claim that `HTTP_AWAIT_MARKER`/
+// `installAtomicsSleep` are gone from the Rust crate entirely — they aren't:
+// `crates/sema-wasm/src/lib.rs` keeps both, narrowed to two still-live,
+// verified consumers documented in `docs/deferred.md`'s P6-3 entry and
+// `scripts/check-unified-runtime-legacy.sh`'s zero-tolerance list comment —
+// (1) the wasm debugger's own `http_needed`/`debugPerformFetch` flow (not
+// promise-driven; has no other way to surface a pending fetch to JS), and (2)
+// `check_interrupt`/blocking-sleep support for every still-synchronous entry
+// point (`eval`/`evalGlobal`/`evalVM`, a precompiled bytecode archive entry)
+// via `crates/sema-eval/src/eval.rs`'s `drive_handle_to_settlement`, which a
+// bare `(async/sleep ...)` reaches on ANY path (not dual-ABI-gated). What
+// full-repo deletion actually removed: the three replay loops themselves,
+// `MAX_REPLAYS` (no remaining caller anywhere), and the worker's SAB
+// allocation/`legacySab` branch (JS) entirely.
+test('the replay loops and MAX_REPLAYS are gone repo-wide', async () => {
+  const roots = ['crates', 'playground/src'];
+  for (const marker of ['MAX_REPLAYS', 'legacySab', 'new SharedArrayBuffer(']) {
+    for (const root of roots) {
+      execSync(
+        `! grep -RIn --include='*.rs' --include='*.js' --include='*.ts' ` +
+          `-- '${marker}' ${path.join(REPO_ROOT, root)}`,
+        { shell: '/bin/bash' },
+      );
+    }
+  }
+});
+
+test('driver.rs (the promise-driven path itself) is free of the legacy replay/Atomics markers', async () => {
   const driverSrc = readFileSync(
     path.join(REPO_ROOT, 'crates/sema-wasm/src/driver.rs'),
     'utf8',
@@ -281,37 +313,25 @@ test('promise-driven driver.rs is free of the legacy replay/Atomics markers', as
   }
 });
 
-test('the shipped default worker protocol never reaches the legacy Atomics/replay code', async () => {
+test('the shipped default worker protocol never reaches legacy Atomics/replay code (SAB deleted entirely)', async () => {
   const workerSrc = readFileSync(path.join(__dirname, '..', 'dist', 'sema-worker.js'), 'utf8');
   const appSrc = readFileSync(path.join(__dirname, '..', 'dist', 'app.js'), 'utf8');
 
-  // The replay markers are `lib.rs`-only (Rust); they must not leak into the
-  // shipped JS bundle at all.
-  for (const marker of ['HTTP_AWAIT_MARKER', 'MAX_REPLAYS']) {
+  // The replay markers are `lib.rs`-only (Rust, and narrowed to the
+  // debugger); they must not appear in the shipped JS bundle at all.
+  for (const marker of ['HTTP_AWAIT_MARKER', 'MAX_REPLAYS', 'legacySab', 'SharedArrayBuffer(']) {
     expect(workerSrc).not.toContain(marker);
     expect(appSrc).not.toContain(marker);
   }
-  // No real blocking Atomics.wait CALL exists anywhere in the shipped worker
-  // (the sleep wait happens inside the wasm binary via `js_sys::Atomics`, not
-  // as a literal `Atomics.wait(` invocation in the JS source).
-  expect(workerSrc).not.toMatch(/Atomics\.wait\(/);
-  expect(appSrc).not.toMatch(/Atomics\.wait\(/);
+  // No real blocking Atomics.wait/notify CALL exists anywhere in the shipped
+  // worker (the sleep wait, where it still exists at all, happens inside the
+  // wasm binary via `js_sys::Atomics`, not as a literal invocation in JS).
+  expect(workerSrc).not.toMatch(/Atomics\.(wait|store|notify)\(/);
+  expect(appSrc).not.toMatch(/Atomics\.(wait|store|notify)\(/);
+  expect(workerSrc).not.toContain('installAtomicsSleep');
+  expect(appSrc).not.toContain('installAtomicsSleep');
 
   // The default protocol's own reachable entry points call the new seam.
   expect(workerSrc).toContain('evalPromise');
   expect(workerSrc).toContain('cancelRoot');
-
-  // The one legacy call that DOES still exist (`installAtomicsSleep`) is
-  // gated behind `msg.legacySab` — confirm the call site is inside that
-  // conditional, and that nothing in the shipped app/worker-client ever sets
-  // `legacySab` truthy (i.e. the gate is provably closed under the default
-  // protocol; step 5 deletes this branch entirely).
-  const legacyIdx = workerSrc.indexOf('installAtomicsSleep(control)');
-  expect(legacyIdx).toBeGreaterThan(-1);
-  const guardIdx = workerSrc.lastIndexOf('if (msg.legacySab)', legacyIdx);
-  expect(guardIdx).toBeGreaterThan(-1);
-  expect(legacyIdx - guardIdx).toBeLessThan(200); // same small guarded block
-
-  expect(appSrc).not.toMatch(/legacySab\s*:\s*true/);
-  expect(appSrc).not.toContain('legacySab: true');
 });

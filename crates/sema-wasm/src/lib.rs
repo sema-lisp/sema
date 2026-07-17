@@ -227,8 +227,18 @@ fn take_output() -> Vec<String> {
     OUTPUT.with(|o| o.borrow_mut().drain(..).collect())
 }
 
+// `HTTP_AWAIT_MARKER`/the replay-with-cache mechanism it drove is deleted
+// everywhere EXCEPT the debugger's own HTTP flow (P6-3 step 5 — see the
+// deletion inventory note at `docs/deferred.md`'s P6-3 entry): `debugStart`'s
+// synchronous drive and `debugPerformFetch`/`debug_maybe_http_error` below
+// still catch this marker to implement the debugger's "http_needed" pause —
+// that flow is not promise-driven and has no other way to surface a pending
+// fetch to JS. Every OTHER caller (`evalAsync`/`evalVMAsync`/`runEntryAsync`'s
+// source branch) now submits through `evalPromise` instead, where `http/get`
+// never throws this marker at all (see the dual-ABI gate in
+// `register_wasm_io`) — so it's a live, narrower-scoped primitive, not dead
+// code.
 const HTTP_AWAIT_MARKER: &str = "__SEMA_WASM_HTTP__";
-const MAX_REPLAYS: usize = 50;
 
 /// Instruction budget per cooperative VM yield. The VM will execute up to this
 /// many instructions before yielding back to the browser event loop.
@@ -1748,6 +1758,112 @@ fn register_wasm_io(env: &Env) {
     );
 }
 
+/// Bridges one [`WasmInterpreter::eval_promise`] call back into the OLD
+/// `{"value":...,"output":[...],"error":...}` JSON shape (P6-3 step 5,
+/// `docs/plans/2026-07-16-wasm-promise-driven-roots.md` §2.1) — shared by
+/// `evalAsync`/`evalVMAsync`/`runEntryAsync`'s wrapper methods.
+///
+/// Installs a private `Closure`-backed `setPromiseOutputSink` for the
+/// duration of one call, collecting only the lines tagged with the root id
+/// this call's `on_root_id` callback reports (root ids are per-runtime
+/// unique, so no cross-talk with a concurrent unrelated root), and restores
+/// whatever sink predates the call on drop.
+struct PromiseCapture {
+    collected: Rc<RefCell<Vec<String>>>,
+    target_root: Rc<Cell<Option<f64>>>,
+    previous_sink: Option<js_sys::Function>,
+    // Retained only to keep the underlying JS functions alive until this
+    // capture is dropped (after the awaited promise settles) — never called
+    // directly from Rust.
+    _sink_closure: Closure<dyn FnMut(f64, JsValue, JsValue)>,
+    _on_root_closure: Closure<dyn FnMut(f64)>,
+    on_root_js: JsValue,
+}
+
+impl PromiseCapture {
+    fn install() -> Self {
+        let collected: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
+        let target_root: Rc<Cell<Option<f64>>> = Rc::new(Cell::new(None));
+        let previous_sink = output::take_sink();
+
+        let sink_collected = Rc::clone(&collected);
+        let sink_root = Rc::clone(&target_root);
+        let sink_closure = Closure::wrap(Box::new(
+            move |root_id: f64, _stream: JsValue, text: JsValue| {
+                if sink_root.get() == Some(root_id) {
+                    if let Some(text) = text.as_string() {
+                        sink_collected.borrow_mut().push(text);
+                    }
+                }
+            },
+        ) as Box<dyn FnMut(f64, JsValue, JsValue)>);
+        output::set_sink(Some(
+            sink_closure
+                .as_ref()
+                .unchecked_ref::<js_sys::Function>()
+                .clone(),
+        ));
+
+        let on_root_root = Rc::clone(&target_root);
+        let on_root_closure = Closure::wrap(Box::new(move |root_id: f64| {
+            on_root_root.set(Some(root_id));
+        }) as Box<dyn FnMut(f64)>);
+        let on_root_js: JsValue = on_root_closure
+            .as_ref()
+            .unchecked_ref::<js_sys::Function>()
+            .clone()
+            .into();
+
+        Self {
+            collected,
+            target_root,
+            previous_sink,
+            _sink_closure: sink_closure,
+            _on_root_closure: on_root_closure,
+            on_root_js,
+        }
+    }
+
+    /// The `on_root_id` callback argument to pass to `eval_promise`.
+    fn on_root_id(&self) -> JsValue {
+        self.on_root_js.clone()
+    }
+
+    /// Await `promise` to settlement, restore the previous output sink, and
+    /// build the OLD JSON result shape from the resolved/rejected value plus
+    /// whatever output was captured for this call's root.
+    async fn await_as_old_json(self, promise: js_sys::Promise) -> JsValue {
+        let _ = &self.target_root; // kept alive for the sink closure's Weak-free capture
+        let settled = JsFuture::from(promise).await;
+        output::set_sink(self.previous_sink.clone());
+
+        let output_lines = self.collected.borrow();
+        let output_json = output_lines
+            .iter()
+            .map(|s| format!("\"{}\"", escape_json(s)))
+            .collect::<Vec<_>>()
+            .join(",");
+
+        let json_str = match settled {
+            Ok(value) => {
+                let val_str = match value.as_string() {
+                    Some(s) => format!("\"{}\"", escape_json(&s)),
+                    None => "null".to_string(),
+                };
+                format!("{{\"value\":{val_str},\"output\":[{output_json}],\"error\":null}}")
+            }
+            Err(err) => {
+                let message = js_err(&err);
+                format!(
+                    "{{\"value\":null,\"output\":[{output_json}],\"error\":\"{}\"}}",
+                    escape_json(&message)
+                )
+            }
+        };
+        js_sys::JSON::parse(&json_str).unwrap_or(JsValue::NULL)
+    }
+}
+
 #[wasm_bindgen(js_name = SemaInterpreter)]
 pub struct WasmInterpreter {
     // `Rc` (not a bare `Interpreter`) so `evalPromise` (`driver.rs`) can share
@@ -1904,6 +2020,59 @@ impl WasmInterpreter {
         output::set_sink(sink.dyn_into::<js_sys::Function>().ok());
     }
 
+    /// Shared body for the OLD `evalAsync`/`evalVMAsync`/`runEntryAsync`
+    /// entry points (P6-3 step 5,
+    /// `docs/plans/2026-07-16-wasm-promise-driven-roots.md` §2.1): submits
+    /// `src` as ONE root via [`Self::eval_promise`] and awaits it, so
+    /// `http/get`/`async/sleep` inside it get the real, single-execution
+    /// runtime-ABI suspend (no HTTP replay, no `Atomics.wait`) — but rebuilds
+    /// the OLD `{"value":...,"output":[...],"error":...}` JSON shape these
+    /// callers (the playground's `?no-worker` fallback, `sema-web.js`) still
+    /// expect, so this is a behavior-preserving wrapper, not a signature
+    /// change.
+    ///
+    /// Output capture: `eval_promise` only delivers a root's output through
+    /// the shared `setPromiseOutputSink` channel, tagged by root id — there is
+    /// no way to "read it back" after the fact (a real `setPromiseOutputSink`
+    /// caller, if any, would already have drained it by the next drive turn).
+    /// This installs a private `Closure`-backed sink for the duration of the
+    /// call that only collects lines tagged with THIS call's root id, then
+    /// restores whatever sink was previously installed — so a concurrent real
+    /// `evalPromise`/`setPromiseOutputSink` caller on the same interpreter
+    /// (not a supported combination for the OLD entry points, but not
+    /// corrupted either) gets its sink back exactly as it left it.
+    ///
+    /// Error fidelity: `eval_promise` rejects with a plain JS `Error`, but
+    /// `driver::reject_with_error` bakes the full inner message + stack trace
+    /// + hint + note into its `.message` (P6-3 step 5), so extracting that
+    /// text reproduces the OLD entry points' `"error"` field exactly.
+    async fn eval_once_via_promise_seam(&self, code: &str) -> JsValue {
+        let capture = PromiseCapture::install();
+        let promise = self.eval_promise(code, capture.on_root_id());
+        capture.await_as_old_json(promise).await
+    }
+
+    /// Like [`Self::eval_once_via_promise_seam`], but the submission itself
+    /// (the ONLY synchronous part of an `eval_promise` call — see that
+    /// method's doc) runs with `path` pushed as the current file, so a
+    /// source-text archive entry gets correct relative-import resolution and
+    /// stack-trace file attribution — matching what
+    /// `run_embedded_entry_result`'s direct-eval path did with
+    /// `push_file_path`/`pop_file_path`. Used only by `runEntryAsync`'s
+    /// source-file branch (P6-3 step 5); a precompiled bytecode entry has no
+    /// submit-a-root equivalent and stays on the direct single-execution path.
+    async fn eval_once_via_promise_seam_at_path(
+        &self,
+        code: &str,
+        path: &std::path::Path,
+    ) -> JsValue {
+        let capture = PromiseCapture::install();
+        self.inner.ctx.push_file_path(path.to_path_buf());
+        let promise = self.eval_promise(code, capture.on_root_id());
+        self.inner.ctx.pop_file_path();
+        capture.await_as_old_json(promise).await
+    }
+
     /// Evaluate in the global env so defines persist
     #[wasm_bindgen(js_name = evalGlobal)]
     pub fn eval_global(&self, code: &str) -> JsValue {
@@ -2004,179 +2173,25 @@ impl WasmInterpreter {
         js_sys::JSON::parse(&json_str).unwrap_or(JsValue::NULL)
     }
 
-    /// Evaluate code with async HTTP support in the persistent global env
-    /// (top-level defines persist across calls). Runs on the bytecode VM.
+    /// Evaluate code with real (single-execution) async HTTP/sleep support in
+    /// the persistent global env (top-level defines persist across calls).
+    ///
+    /// A thin Promise-returning wrapper over [`Self::eval_promise`] (P6-3
+    /// step 5) — kept as its own entry point so existing JS callers
+    /// (`sema-web.js`, the playground's `?no-worker` fallback) don't have to
+    /// change; the program body is submitted as ONE root and never replayed.
+    /// See [`Self::eval_once_via_promise_seam`].
     #[wasm_bindgen(js_name = evalAsync)]
     pub async fn eval_async(&self, code: &str) -> JsValue {
-        clear_http_cache();
-
-        for _ in 0..MAX_REPLAYS {
-            OUTPUT.with(|o| o.borrow_mut().clear());
-            LINE_BUF.with(|b| b.borrow_mut().clear());
-
-            match self.inner.eval_str_in_global(code) {
-                Ok(val) => {
-                    let output = take_output();
-                    let val_str = if val.is_nil() {
-                        "null".to_string()
-                    } else {
-                        format!("\"{}\"", escape_json(&pretty_print(&val, 80)))
-                    };
-                    let json_str = format!(
-                        "{{\"value\":{},\"output\":[{}],\"error\":null}}",
-                        val_str,
-                        output
-                            .iter()
-                            .map(|s| format!("\"{}\"", escape_json(s)))
-                            .collect::<Vec<_>>()
-                            .join(",")
-                    );
-                    return js_sys::JSON::parse(&json_str).unwrap_or(JsValue::NULL);
-                }
-                Err(e) => {
-                    if is_http_await_marker(&e) {
-                        if let Some(json_str) = parse_http_marker(&e) {
-                            match perform_fetch_from_marker(&json_str).await {
-                                Ok((key, response)) => {
-                                    HTTP_CACHE.with(|c| {
-                                        c.borrow_mut().insert(key, response);
-                                    });
-                                    continue;
-                                }
-                                Err(fetch_err) => {
-                                    let output = take_output();
-                                    let err_str = format!("{}", fetch_err.inner());
-                                    let json_str = format!(
-                                        "{{\"value\":null,\"output\":[{}],\"error\":\"{}\"}}",
-                                        output
-                                            .iter()
-                                            .map(|s| format!("\"{}\"", escape_json(s)))
-                                            .collect::<Vec<_>>()
-                                            .join(","),
-                                        escape_json(&err_str)
-                                    );
-                                    return js_sys::JSON::parse(&json_str).unwrap_or(JsValue::NULL);
-                                }
-                            }
-                        }
-                    }
-                    let output = take_output();
-                    let mut err_str = format!("{}", e.inner());
-                    if let Some(trace) = e.stack_trace() {
-                        err_str.push_str(&format!("\n{trace}"));
-                    }
-                    if let Some(hint) = e.hint() {
-                        err_str.push_str(&format!("\n  hint: {hint}"));
-                    }
-                    if let Some(note) = e.note() {
-                        err_str.push_str(&format!("\n  note: {note}"));
-                    }
-                    let json_str = format!(
-                        "{{\"value\":null,\"output\":[{}],\"error\":\"{}\"}}",
-                        output
-                            .iter()
-                            .map(|s| format!("\"{}\"", escape_json(s)))
-                            .collect::<Vec<_>>()
-                            .join(","),
-                        escape_json(&err_str)
-                    );
-                    return js_sys::JSON::parse(&json_str).unwrap_or(JsValue::NULL);
-                }
-            }
-        }
-
-        let json_str = format!(
-            "{{\"value\":null,\"output\":[],\"error\":\"{}\"}}",
-            escape_json("exceeded maximum number of HTTP requests (50)")
-        );
-        js_sys::JSON::parse(&json_str).unwrap_or(JsValue::NULL)
+        self.eval_once_via_promise_seam(code).await
     }
 
-    /// Evaluate code with async HTTP support (bytecode VM)
+    /// Evaluate code with real (single-execution) async HTTP/sleep support
+    /// (bytecode VM). See [`Self::eval_async`] — identical wrapper; kept as a
+    /// separate name for the same JS-compat reason.
     #[wasm_bindgen(js_name = evalVMAsync)]
     pub async fn eval_vm_async(&self, code: &str) -> JsValue {
-        clear_http_cache();
-
-        for _ in 0..MAX_REPLAYS {
-            OUTPUT.with(|o| o.borrow_mut().clear());
-            LINE_BUF.with(|b| b.borrow_mut().clear());
-
-            match self.inner.eval_str_compiled(code) {
-                Ok(val) => {
-                    let output = take_output();
-                    let val_str = if val.is_nil() {
-                        "null".to_string()
-                    } else {
-                        format!("\"{}\"", escape_json(&pretty_print(&val, 80)))
-                    };
-                    let json_str = format!(
-                        "{{\"value\":{},\"output\":[{}],\"error\":null}}",
-                        val_str,
-                        output
-                            .iter()
-                            .map(|s| format!("\"{}\"", escape_json(s)))
-                            .collect::<Vec<_>>()
-                            .join(",")
-                    );
-                    return js_sys::JSON::parse(&json_str).unwrap_or(JsValue::NULL);
-                }
-                Err(e) => {
-                    if is_http_await_marker(&e) {
-                        if let Some(json_str) = parse_http_marker(&e) {
-                            match perform_fetch_from_marker(&json_str).await {
-                                Ok((key, response)) => {
-                                    HTTP_CACHE.with(|c| {
-                                        c.borrow_mut().insert(key, response);
-                                    });
-                                    continue;
-                                }
-                                Err(fetch_err) => {
-                                    let output = take_output();
-                                    let err_str = format!("{}", fetch_err.inner());
-                                    let json_str = format!(
-                                        "{{\"value\":null,\"output\":[{}],\"error\":\"{}\"}}",
-                                        output
-                                            .iter()
-                                            .map(|s| format!("\"{}\"", escape_json(s)))
-                                            .collect::<Vec<_>>()
-                                            .join(","),
-                                        escape_json(&err_str)
-                                    );
-                                    return js_sys::JSON::parse(&json_str).unwrap_or(JsValue::NULL);
-                                }
-                            }
-                        }
-                    }
-                    let output = take_output();
-                    let mut err_str = format!("{}", e.inner());
-                    if let Some(trace) = e.stack_trace() {
-                        err_str.push_str(&format!("\n{trace}"));
-                    }
-                    if let Some(hint) = e.hint() {
-                        err_str.push_str(&format!("\n  hint: {hint}"));
-                    }
-                    if let Some(note) = e.note() {
-                        err_str.push_str(&format!("\n  note: {note}"));
-                    }
-                    let json_str = format!(
-                        "{{\"value\":null,\"output\":[{}],\"error\":\"{}\"}}",
-                        output
-                            .iter()
-                            .map(|s| format!("\"{}\"", escape_json(s)))
-                            .collect::<Vec<_>>()
-                            .join(","),
-                        escape_json(&err_str)
-                    );
-                    return js_sys::JSON::parse(&json_str).unwrap_or(JsValue::NULL);
-                }
-            }
-        }
-
-        let json_str = format!(
-            "{{\"value\":null,\"output\":[],\"error\":\"{}\"}}",
-            escape_json("exceeded maximum number of HTTP requests (50)")
-        );
-        js_sys::JSON::parse(&json_str).unwrap_or(JsValue::NULL)
+        self.eval_once_via_promise_seam(code).await
     }
 
     /// Start a debug session. Compiles the code, sets breakpoints on given lines,
@@ -2190,6 +2205,11 @@ impl WasmInterpreter {
         DEBUG_SESSION.with(|s| {
             *s.borrow_mut() = None;
         });
+        // The debugger's `http_needed`/`debugPerformFetch` flow is the sole
+        // remaining consumer of the HTTP replay cache (P6-3 step 5); reset it
+        // per session so a fresh debug run never observes a stale response
+        // cached by an earlier one.
+        clear_http_cache();
 
         OUTPUT.with(|o| o.borrow_mut().clear());
         LINE_BUF.with(|b| b.borrow_mut().clear());
@@ -2964,41 +2984,64 @@ impl WasmInterpreter {
         }
     }
 
-    /// Execute an embedded archive entry path with async HTTP replay support.
+    /// Execute an embedded archive entry path with real (single-execution)
+    /// async HTTP/sleep support (P6-3 step 5).
+    ///
+    /// A source-text entry is submitted as ONE root via
+    /// [`Self::eval_once_via_promise_seam_at_path`] — the program body never
+    /// replays, and `http/get`/`async/sleep` inside it get the real
+    /// runtime-ABI suspend. A precompiled bytecode entry has no
+    /// submit-a-root equivalent (`Interpreter::submit_str` only accepts
+    /// source text), so it stays on the direct single-execution path
+    /// `runEntry` already used; an `http/get` inside one now surfaces a
+    /// clear, honest error instead of the deleted replay loop silently
+    /// leaking the internal HTTP marker string.
     #[wasm_bindgen(js_name = runEntryAsync)]
     pub async fn run_entry_async(&self, path: &str) -> JsValue {
-        clear_http_cache();
+        let entry_path = std::path::PathBuf::from(path);
+        let bytes = match self.inner.ctx.get_embedded_file(&entry_path) {
+            Some(bytes) => bytes,
+            None => {
+                return self.eval_error_result(&SemaError::eval(format!(
+                    "embedded entry not found: {path}"
+                )));
+            }
+        };
 
-        for _ in 0..MAX_REPLAYS {
+        if sema_vm::is_bytecode_file(&bytes) {
             OUTPUT.with(|o| o.borrow_mut().clear());
             LINE_BUF.with(|b| b.borrow_mut().clear());
-
-            match self.run_embedded_entry_result(path) {
-                Ok(val) => return self.eval_success_result(&val),
-                Err(e) => {
-                    if is_http_await_marker(&e) {
-                        if let Some(json_str) = parse_http_marker(&e) {
-                            match perform_fetch_from_marker(&json_str).await {
-                                Ok((key, response)) => {
-                                    HTTP_CACHE.with(|c| {
-                                        c.borrow_mut().insert(key, response);
-                                    });
-                                    continue;
-                                }
-                                Err(fetch_err) => return self.eval_error_result(&fetch_err),
-                            }
-                        }
-                    }
-                    return self.eval_error_result(&e);
-                }
-            }
+            self.inner.ctx.push_file_path(entry_path.clone());
+            let result = sema_vm::deserialize_from_bytes(&bytes).and_then(|compiled| {
+                sema_eval::execute_compile_result(
+                    &self.inner.ctx,
+                    self.inner.global_env.clone(),
+                    compiled,
+                )
+            });
+            self.inner.ctx.pop_file_path();
+            return match result {
+                Ok(val) => self.eval_success_result(&val),
+                Err(e) if is_http_await_marker(&e) => self.eval_error_result(&SemaError::eval(
+                    "http/get: a precompiled bytecode archive entry cannot perform HTTP \
+                     requests synchronously; rebuild the archive from source, or run it \
+                     through evalPromise",
+                )),
+                Err(e) => self.eval_error_result(&e),
+            };
         }
 
-        let json_str = format!(
-            "{{\"value\":null,\"output\":[],\"error\":\"{}\"}}",
-            escape_json("exceeded maximum number of HTTP requests (50)")
-        );
-        js_sys::JSON::parse(&json_str).unwrap_or(JsValue::NULL)
+        let source = match String::from_utf8(bytes) {
+            Ok(source) => source,
+            Err(e) => {
+                return self.eval_error_result(&SemaError::eval(format!(
+                    "embedded entry is not valid UTF-8: {e}"
+                )));
+            }
+        };
+
+        self.eval_once_via_promise_seam_at_path(&source, &entry_path)
+            .await
     }
 
     /// Read a file from the virtual filesystem.

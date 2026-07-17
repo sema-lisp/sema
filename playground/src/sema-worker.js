@@ -14,15 +14,13 @@
 //   worker -> { type:'result', id, result:{value,output,error}, vfs }
 //   main -> { type:'cancel', id }   Stop: cancels root `id`'s in-flight eval
 //
-// `installAtomicsSleep`/the control `SharedArrayBuffer` are NOT used by this
-// protocol (deletion of that Rust machinery is a later step) — the worker no
-// longer allocates one. A `legacySab` opt-in flag is kept only so the old
-// Atomics-based path stays reachable for direct comparison/debugging; it is
-// off by default and not exercised by the playground UI.
+// The control `SharedArrayBuffer`/`installAtomicsSleep`/`Atomics.wait` replay
+// path is gone (P6-3 step 5 — `docs/plans/2026-07-16-wasm-promise-driven-roots.md`):
+// this worker never allocates a SAB and cancellation routes exclusively
+// through `cancelRoot`.
 import init, { SemaInterpreter } from '../pkg/sema_wasm.js';
 
 let interp = null;
-let control = null; // legacy-only: Int32Array over the shared control SAB (slot 0)
 // eval message id -> the root id `evalPromise` reported for it, so a later
 // `cancel` message (keyed by the same eval id) can route to the exact root.
 const activeRoots = new Map();
@@ -33,14 +31,6 @@ self.onmessage = async (e) => {
     if (msg.type === 'init') {
       await init();
       interp = new SemaInterpreter();
-      if (msg.legacySab) {
-        // Legacy fallback path, not used by the current playground UI: a
-        // shared control buffer the worker blocks on via Atomics.wait for
-        // sleep, doubling as a cancel flag. Superseded by evalPromise's
-        // setTimeout-driven sleep + explicit cancelRoot below.
-        control = new Int32Array(new SharedArrayBuffer(4));
-        interp.installAtomicsSleep(control);
-      }
       // Root-tagged output: forward every evalPromise root's println/print
       // output to the main thread as it happens, tagged with the eval
       // message id it belongs to (looked up from its root id) so the main
@@ -88,11 +78,6 @@ self.onmessage = async (e) => {
     if (msg.type === 'cancel') {
       const rootId = activeRoots.get(msg.id);
       if (rootId !== undefined) interp.cancelRoot(rootId);
-      // Legacy fallback: still poke the SAB cancel flag if it was installed.
-      if (control) {
-        Atomics.store(control, 0, 1);
-        Atomics.notify(control, 0);
-      }
       return;
     }
   } catch (err) {

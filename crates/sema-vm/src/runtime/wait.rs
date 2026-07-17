@@ -10,8 +10,8 @@ use sema_core::runtime::{
     CancellationView, CompletionDecoder, CompletionDelivery, CompletionKind, CompletionRegistrar,
     CompletionSender, ExecutorAttachError, ExecutorCancelHandle, ExecutorLease, ExternalCompletion,
     ExternalFailure, IoExecutor, NativeCallContext, NativeContinuation, NativeResult,
-    NativeSuspend, OperationId, ResourceClass, ResumeInput, RuntimeId, TaskContextHandle, TaskId,
-    Trace, WaitGeneration, WaitId, WaitKind,
+    NativeSuspend, OperationId, ResourceClass, ResumeInput, RootId, RuntimeId, TaskContextHandle,
+    TaskId, Trace, WaitGeneration, WaitId, WaitKind,
 };
 
 use super::{TaskRecord, WaitKey};
@@ -43,13 +43,13 @@ impl std::fmt::Debug for RegisterExternalError {
     }
 }
 
-struct InboxSender(Sender<ExternalCompletion>, Arc<AtomicBool>);
+struct InboxSender(Sender<InboxItem>, Arc<AtomicBool>);
 
 impl CompletionSender for InboxSender {
     fn send(&self, completion: ExternalCompletion) -> CompletionDelivery {
         let delivery = self
             .0
-            .send(completion)
+            .send(InboxItem::Completion(completion))
             .map(|()| CompletionDelivery::Delivered)
             .unwrap_or(CompletionDelivery::InboxClosed);
         // Set the dirty flag AFTER the send lands (not before), so the
@@ -60,6 +60,54 @@ impl CompletionSender for InboxSender {
             self.1.store(true, Ordering::Release);
         }
         delivery
+    }
+}
+
+/// A command enqueued by a `RuntimeCommandHandle` from another OS thread —
+/// cross-thread cancellation is the only host-initiated action that reaches
+/// the runtime outside of the driving thread itself. Delivered through the
+/// same inbox channel an executor uses for completions (see [`InboxItem`]),
+/// so it wakes a parked `block_on_inbox` with no separate channel or select
+/// loop, and is applied by the drive loop calling the existing
+/// `Runtime::cancel_root` (never by poking `RuntimeState` fields directly).
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum RuntimeCommand {
+    CancelRoot(RootId),
+    CancelAll,
+}
+
+/// The item type carried on the inbox channel: either a worker's
+/// `ExternalCompletion` or a cross-thread `RuntimeCommand`. Both share one
+/// channel and one dirty flag deliberately — a `RuntimeCommandHandle` needs
+/// no wakeup machinery of its own; it rides the same send-then-set-flag
+/// protocol `InboxSender` already uses (see `pump_inbox`), so a command
+/// wakes a thread parked in `block_on_inbox` exactly like a completion does.
+enum InboxItem {
+    Completion(ExternalCompletion),
+    Command(RuntimeCommand),
+}
+
+/// `Send + Sync` sending half of the inbox channel, handed out by
+/// `WaitRuntime::command_channel` and wrapped by `RuntimeCommandHandle`
+/// (`host_api.rs`) — the runtime's only cross-thread control surface. Plain
+/// `mpsc::Sender<T>` is `Send + Sync` for `T: Send` (no `Mutex` needed); this
+/// type holds no `Rc`/`Value`/`Env`, satisfying Invariant I2.
+#[derive(Clone)]
+pub(crate) struct CommandChannel {
+    sender: Sender<InboxItem>,
+    dirty: Arc<AtomicBool>,
+}
+
+impl CommandChannel {
+    /// Enqueue `command`. Returns `false` if the inbox has closed (the
+    /// owning `WaitRuntime`/`Runtime` was dropped or has shut down) — the
+    /// command was never delivered, not merely a no-op.
+    pub(crate) fn send(&self, command: RuntimeCommand) -> bool {
+        let delivered = self.sender.send(InboxItem::Command(command)).is_ok();
+        if delivered {
+            self.dirty.store(true, Ordering::Release);
+        }
+        delivered
     }
 }
 
@@ -178,12 +226,20 @@ pub struct WaitRuntime {
     runtime_id: RuntimeId,
     registrar: Option<CompletionRegistrar>,
     lease: Option<Arc<dyn ExecutorLease>>,
-    inbox: Option<Receiver<ExternalCompletion>>,
+    inbox: Option<Receiver<InboxItem>>,
+    /// A clone of `inbox`'s sending half, retained so `command_channel` can
+    /// hand out further clones to `RuntimeCommandHandle`s without needing a
+    /// live `InboxSender` (which is type-erased behind the registrar's
+    /// `Arc<dyn CompletionSender>` and not otherwise reachable).
+    command_sender: Sender<InboxItem>,
     /// Set by `InboxSender::send` after a completion lands; cleared by
     /// `poll_inbox` before it drains. Lets the drive loop skip `try_recv`
     /// (a syscall-ish mpsc lock) on rotations with nothing new to see.
     inbox_dirty: Arc<AtomicBool>,
     deferred: VecDeque<ExternalCompletion>,
+    /// `RuntimeCommand`s pulled off the inbox by `pump_inbox`, awaiting
+    /// `drain_commands` at the top of the next `Runtime::drive` turn.
+    commands: VecDeque<RuntimeCommand>,
     active: HashMap<WaitKey, RegisteredExternalWait>,
     cleanup: HashMap<WaitKey, CleanupEntry>,
     cleanup_order: VecDeque<WaitKey>,
@@ -216,9 +272,10 @@ impl WaitRuntime {
     ) -> Result<(Self, sema_core::runtime::RuntimeScopedIdIssuers), RuntimeCreateError> {
         let (sender, inbox) = mpsc::channel();
         let inbox_dirty = Arc::new(AtomicBool::new(false));
-        let (runtime_id, registrar, issuers) =
-            CompletionRegistrar::register(Arc::new(InboxSender(sender, Arc::clone(&inbox_dirty))))
-                .map_err(|_| RuntimeCreateError::IdExhausted)?;
+        let (runtime_id, registrar, issuers) = CompletionRegistrar::register(Arc::new(
+            InboxSender(sender.clone(), Arc::clone(&inbox_dirty)),
+        ))
+        .map_err(|_| RuntimeCreateError::IdExhausted)?;
         let lease = executor
             .attach_runtime(runtime_id)
             .map_err(RuntimeCreateError::ExecutorAttach)?;
@@ -228,8 +285,10 @@ impl WaitRuntime {
                 registrar: Some(registrar),
                 lease: Some(lease),
                 inbox: Some(inbox),
+                command_sender: sender,
                 inbox_dirty,
                 deferred: VecDeque::new(),
+                commands: VecDeque::new(),
                 active: HashMap::new(),
                 cleanup: HashMap::new(),
                 cleanup_order: VecDeque::new(),
@@ -391,15 +450,53 @@ impl WaitRuntime {
         if !self.deferred.is_empty() {
             return;
         }
+        self.pump_inbox();
+    }
+
+    /// If the dirty flag is set, drain everything currently visible on the
+    /// channel — routing `ExternalCompletion`s into `deferred` and
+    /// `RuntimeCommand`s into `commands` — and clear the flag. No-op
+    /// otherwise. Shared by `refill_from_inbox` (gated by `deferred` being
+    /// empty, the completion-draining hot path) and `drain_commands`
+    /// (unconditional, so a command isn't hidden behind a still-buffered
+    /// completion — see its doc comment).
+    fn pump_inbox(&mut self) {
         if !self.inbox_dirty.swap(false, Ordering::AcqRel) {
             return;
         }
         let Some(inbox) = self.inbox.as_ref() else {
             return;
         };
-        while let Ok(completion) = inbox.try_recv() {
-            self.deferred.push_back(completion);
+        while let Ok(item) = inbox.try_recv() {
+            match item {
+                InboxItem::Completion(completion) => self.deferred.push_back(completion),
+                InboxItem::Command(command) => self.commands.push_back(command),
+            }
         }
+    }
+
+    /// A `Send + Sync` clone of the inbox's sending half for a
+    /// `RuntimeCommandHandle`. Every clone shares the same channel and dirty
+    /// flag as completions, so enqueuing a command wakes a parked
+    /// `block_on_inbox` exactly like a worker completion would.
+    pub(crate) fn command_channel(&self) -> CommandChannel {
+        CommandChannel {
+            sender: self.command_sender.clone(),
+            dirty: Arc::clone(&self.inbox_dirty),
+        }
+    }
+
+    /// Drain every `RuntimeCommand` currently visible on the inbox, in
+    /// arrival order. Called once at the top of every `Runtime::drive` turn,
+    /// before source rotation and barrier re-evaluation, so a cross-thread
+    /// cancel lands within the turn that observes it. Unlike
+    /// `refill_from_inbox` this always polls the channel when the dirty flag
+    /// is set — even if `deferred` already has buffered completions — so a
+    /// command queued behind a completion is never left undiscovered until
+    /// `deferred` happens to drain empty.
+    pub(crate) fn drain_commands(&mut self) -> Vec<RuntimeCommand> {
+        self.pump_inbox();
+        self.commands.drain(..).collect()
     }
 
     pub fn drain_one(
@@ -455,12 +552,18 @@ impl WaitRuntime {
         Some((CompletionRoute::Late, None))
     }
 
-    /// Block the calling (VM) thread until a completion is available on the
-    /// inbox or `deadline` elapses, buffering any received completion so the next
-    /// drive turn delivers it. Returns `true` if a completion is now buffered.
-    /// A `None` deadline blocks until a completion arrives or the inbox is
-    /// closed — used when a task is parked on an external op with no timer bound,
-    /// where a worker completion is guaranteed to arrive. Never busy-spins.
+    /// Block the calling (VM) thread until a completion or command is
+    /// available on the inbox or `deadline` elapses, buffering whatever
+    /// arrived so the next drive turn delivers it. Returns `true` if a
+    /// completion is now buffered OR a command is now queued (either way,
+    /// the caller has real work to do on its next `drive` call — a
+    /// `RuntimeCommandHandle::cancel_root`/`cancel_all` sent from another
+    /// thread while this thread is parked here wakes it exactly like a
+    /// worker completion would, since both ride the same channel; see
+    /// `RuntimeCommand`). A `None` deadline blocks until something arrives or
+    /// the inbox is closed — used when a task is parked on an external op
+    /// with no timer bound, where a worker completion is guaranteed to
+    /// arrive. Never busy-spins.
     pub fn block_on_inbox(&mut self, deadline: Option<Instant>) -> bool {
         if !self.deferred.is_empty() {
             return true;
@@ -476,8 +579,12 @@ impl WaitRuntime {
             None => inbox.recv().ok(),
         };
         match received {
-            Some(completion) => {
+            Some(InboxItem::Completion(completion)) => {
                 self.deferred.push_back(completion);
+                true
+            }
+            Some(InboxItem::Command(command)) => {
+                self.commands.push_back(command);
                 true
             }
             None => false,

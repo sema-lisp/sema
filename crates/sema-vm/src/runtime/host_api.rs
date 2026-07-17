@@ -20,6 +20,7 @@ use super::state::{
     deliver_cancel_teardown, ReturnOwner, Runtime, RuntimeFault, RuntimeState, RuntimeTask,
     SubmitRootError, TaskPayload, TaskScopes,
 };
+use super::wait::{CommandChannel, RuntimeCommand};
 use super::{DriveBudget, DriveState, RootRecord, RootState, TaskRecord, WaitRuntime};
 
 pub enum RootPoll {
@@ -57,6 +58,58 @@ pub struct ShutdownInvariantFailure {
 pub struct RootHandle {
     pub(super) runtime: Weak<RefCell<RuntimeState>>,
     pub(super) id: RootId,
+}
+
+/// The runtime's only `Send + Sync` control surface: lets a host cancel a
+/// root, or every root, from a thread other than the one driving
+/// `Runtime::drive` (a signal handler, a watchdog thread, a notebook
+/// server's request handler). Holds no `Rc`/`Value`/`Env` — only a channel
+/// sender and a shared dirty flag (`CommandChannel`, `wait.rs`), so it
+/// carries nothing the cycle collector needs to trace and cannot form a
+/// cross-thread aliasing hazard on GC state (Invariant I2).
+///
+/// A command rides the same inbox channel an `IoExecutor` uses to deliver
+/// completions (see `RuntimeCommand`/`InboxItem` in `wait.rs`): enqueuing one
+/// sets the same dirty flag a completion would, so a driving thread parked in
+/// `block_on_inbox` wakes for a command exactly as it would for a completion
+/// — no second channel, no select loop. Commands are drained and applied on
+/// the runtime's own drive thread, at the top of every `drive` turn, before
+/// source rotation (`Runtime::apply_pending_commands`, `state.rs`) — this
+/// handle never touches `RuntimeState` itself, only the existing
+/// `Runtime::cancel_root`.
+#[derive(Clone)]
+pub struct RuntimeCommandHandle {
+    channel: CommandChannel,
+}
+
+const _: () = {
+    fn assert_send_sync<T: Send + Sync>() {}
+    #[expect(dead_code, reason = "compile-time-only Send+Sync witness")]
+    fn check() {
+        assert_send_sync::<RuntimeCommandHandle>();
+    }
+};
+
+impl RuntimeCommandHandle {
+    pub(super) fn new(channel: CommandChannel) -> Self {
+        Self { channel }
+    }
+
+    /// Request cancellation of `root`. Returns `false` if the runtime has
+    /// been dropped or shut down (the inbox channel is closed) — the command
+    /// was never delivered. `true` means the command was enqueued; it does
+    /// not guarantee `root` was still live when the drive loop processed it
+    /// (a root that settles first makes the cancellation an inert no-op,
+    /// exactly like calling `RootHandle::cancel` on an already-settled root).
+    pub fn cancel_root(&self, root: RootId) -> bool {
+        self.channel.send(RuntimeCommand::CancelRoot(root))
+    }
+
+    /// Request cancellation of every live root (the Ctrl-C shape). Same
+    /// delivery/liveness semantics as [`cancel_root`](Self::cancel_root).
+    pub fn cancel_all(&self) -> bool {
+        self.channel.send(RuntimeCommand::CancelAll)
+    }
 }
 
 impl Runtime {
@@ -104,6 +157,19 @@ impl Runtime {
             runtime: Rc::downgrade(&self.state),
             id: root,
         })
+    }
+
+    /// A `Send + Sync` handle for cancelling roots from another thread. See
+    /// [`RuntimeCommandHandle`].
+    pub fn command_handle(&self) -> RuntimeCommandHandle {
+        let channel = self
+            .state
+            .borrow()
+            .waits
+            .as_ref()
+            .expect("open runtime has waits installed")
+            .command_channel();
+        RuntimeCommandHandle::new(channel)
     }
 
     pub fn shutdown(&self, options: &ShutdownOptions) -> Result<ShutdownReport, RuntimeFault> {

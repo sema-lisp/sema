@@ -305,6 +305,14 @@ impl Interpreter {
             .expect("runtime is present outside of Drop")
     }
 
+    /// A `Send + Sync` handle for cancelling roots on this interpreter's
+    /// runtime from another thread (a signal handler, a watchdog, a
+    /// notebook server's request handler) — see
+    /// [`RuntimeCommandHandle`](sema_vm::runtime::RuntimeCommandHandle).
+    pub fn command_handle(&self) -> sema_vm::runtime::RuntimeCommandHandle {
+        self.runtime().command_handle()
+    }
+
     pub fn drive_vm_on_runtime(&self, vm: sema_vm::VM) -> EvalResult {
         use sema_vm::runtime::{DriveBudget, DriveState, RootPoll};
 

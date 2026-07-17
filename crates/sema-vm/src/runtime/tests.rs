@@ -1542,6 +1542,116 @@ fn runtime_drop_turns_weak_root_handle_into_runtime_dropped() {
     assert!(!handle.cancel(CancelReason::Explicit));
 }
 
+// P6-1 Task 2: `RuntimeCommandHandle`, the runtime's only `Send + Sync`
+// control surface. These tests exercise the real cross-thread path (a
+// spawned OS thread holding only the handle, never the `Runtime` itself,
+// which is `!Send`) rather than calling `WaitRuntime` internals directly, so
+// they cover the same wiring a host (CLI Ctrl-C, notebook cancel) will use.
+
+#[test]
+fn runtime_command_handle_cancel_root_lands_within_one_drive_turn() {
+    let runtime = runtime_with_inline_executor(Rc::new(FakeClock::new()));
+    let handle = runtime
+        .submit_test_root(TestPreparedTask::yield_forever())
+        .expect("root admitted");
+    let root = handle.id();
+    let commands = runtime.command_handle();
+    // Only the `Send + Sync` handle crosses the thread boundary — `Runtime`
+    // itself holds an `Rc` and could not be moved here.
+    let delivered = std::thread::spawn(move || commands.cancel_root(root))
+        .join()
+        .expect("spawned thread does not panic");
+    assert!(
+        delivered,
+        "command channel is open while the runtime is alive"
+    );
+    // One drive turn: `apply_pending_commands` drains the queued command at
+    // the top of `drive`, before source rotation, and routes it through the
+    // existing `cancel_root` — same settlement path as a same-thread cancel.
+    runtime
+        .drive(&drive_budget(8))
+        .expect("drive applies the queued command");
+    let RootPoll::Ready(settlement) = handle.poll_result() else {
+        panic!("cancelled root should settle after one drive turn");
+    };
+    assert!(matches!(
+        settlement.outcome,
+        TaskOutcome::Cancelled(CancelReason::HostStop)
+    ));
+}
+
+#[test]
+fn runtime_command_handle_cancel_all_lands_within_one_drive_turn() {
+    let runtime = runtime_with_inline_executor(Rc::new(FakeClock::new()));
+    let a = runtime
+        .submit_test_root(TestPreparedTask::yield_forever())
+        .expect("root admitted");
+    let b = runtime
+        .submit_test_root(TestPreparedTask::yield_forever())
+        .expect("root admitted");
+    let commands = runtime.command_handle();
+    let delivered = std::thread::spawn(move || commands.cancel_all())
+        .join()
+        .expect("spawned thread does not panic");
+    assert!(delivered);
+    runtime
+        .drive(&drive_budget(8))
+        .expect("drive applies the queued command");
+    for handle in [&a, &b] {
+        let RootPoll::Ready(settlement) = handle.poll_result() else {
+            panic!("cancel_all settles every live root after one drive turn");
+        };
+        assert!(matches!(
+            settlement.outcome,
+            TaskOutcome::Cancelled(CancelReason::HostStop)
+        ));
+    }
+}
+
+#[test]
+fn runtime_command_handle_outliving_runtime_returns_false_without_panic() {
+    let runtime = runtime_with_inline_executor(Rc::new(FakeClock::new()));
+    let handle = runtime
+        .submit_test_root(TestPreparedTask::yield_forever())
+        .expect("root admitted");
+    let root = handle.id();
+    let commands = runtime.command_handle();
+    drop(handle);
+    drop(runtime);
+    assert!(
+        !commands.cancel_root(root),
+        "cancel_root reports false once the runtime is gone"
+    );
+    assert!(
+        !commands.cancel_all(),
+        "cancel_all reports false once the runtime is gone"
+    );
+}
+
+#[test]
+fn runtime_command_wakes_a_thread_parked_in_block_on_inbox() {
+    // The driving thread parks in `block_on_inbox` (as `drive_vm_on_runtime`
+    // does when `DriveState::Idle { inbox_wakeup_required: true, .. }`) with
+    // no deadline — it can only return via a channel arrival. A command sent
+    // from another thread must wake it, since `CommandChannel` rides the same
+    // channel and dirty flag as an executor completion.
+    let runtime = runtime_with_inline_executor(Rc::new(FakeClock::new()));
+    let commands = runtime.command_handle();
+    let sender = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(commands.cancel_all());
+    });
+    let start = Instant::now();
+    let woke = runtime.block_on_inbox(None);
+    let elapsed = start.elapsed();
+    sender.join().expect("spawned thread does not panic");
+    assert!(woke, "block_on_inbox returns true when a command arrives");
+    assert!(
+        elapsed < Duration::from_secs(1),
+        "command should wake block_on_inbox promptly, took {elapsed:?}"
+    );
+}
+
 #[test]
 fn runtime_drive_charges_external_extract_decode_resume_and_apply_stages() {
     let runtime = runtime_with_inline_executor(Rc::new(FakeClock::new()));

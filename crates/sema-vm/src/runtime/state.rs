@@ -30,6 +30,7 @@ use sema_core::YieldReason;
 use sema_core::{Env, EvalContext, NativeFn};
 
 use super::channel::{ChannelClose, ChannelWake};
+use super::wait::RuntimeCommand;
 #[cfg(test)]
 use super::RootHandle;
 use super::{
@@ -950,6 +951,11 @@ impl Runtime {
             state.turn_instructions = 0;
         }
         let _drive = ActiveDriveGuard(Rc::clone(&self.state));
+        // Apply cross-thread commands (`RuntimeCommandHandle::cancel_root` /
+        // `cancel_all`) before anything else this turn, including barrier
+        // re-evaluation — a command observed here settles within this turn
+        // rather than waiting for a later one.
+        self.apply_pending_commands();
         let start = self.state.borrow().clock.now();
         // The quarantine-expiry and wall-clock-budget checks below read this
         // cached value rather than the clock directly; it is refreshed every
@@ -4236,6 +4242,38 @@ impl Runtime {
         };
         self.settle(root, main_task, TaskOutcome::Failed(error))?;
         Ok(true)
+    }
+
+    /// Drain and apply commands enqueued via `RuntimeCommandHandle`
+    /// (`host_api.rs`) — the runtime's only cross-thread control surface.
+    /// Called once at the top of every [`drive`](Self::drive) turn, before
+    /// source rotation. Each `RuntimeCommand` is applied by calling the
+    /// existing `cancel_root` (same as a host-owned `RootHandle::cancel` or
+    /// `debug_cancel_paused`) — this never reaches into `RuntimeState`
+    /// fields directly, so cancellation observed here has exactly the same
+    /// semantics (C2 eager teardown included) as a same-thread cancel.
+    fn apply_pending_commands(&self) {
+        let commands = {
+            let mut state = self.state.borrow_mut();
+            state
+                .waits
+                .as_mut()
+                .map(WaitRuntime::drain_commands)
+                .unwrap_or_default()
+        };
+        for command in commands {
+            match command {
+                RuntimeCommand::CancelRoot(root) => {
+                    self.cancel_root(root, CancelReason::HostStop);
+                }
+                RuntimeCommand::CancelAll => {
+                    let roots: Vec<RootId> = self.state.borrow().roots.keys().copied().collect();
+                    for root in roots {
+                        self.cancel_root(root, CancelReason::HostStop);
+                    }
+                }
+            }
+        }
     }
 
     pub fn cancel_root(&self, root: RootId, reason: CancelReason) -> bool {

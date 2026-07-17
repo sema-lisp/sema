@@ -1,7 +1,8 @@
 use std::collections::VecDeque;
 
 use hashbrown::HashMap;
-use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -42,14 +43,23 @@ impl std::fmt::Debug for RegisterExternalError {
     }
 }
 
-struct InboxSender(Sender<ExternalCompletion>);
+struct InboxSender(Sender<ExternalCompletion>, Arc<AtomicBool>);
 
 impl CompletionSender for InboxSender {
     fn send(&self, completion: ExternalCompletion) -> CompletionDelivery {
-        self.0
+        let delivery = self
+            .0
             .send(completion)
             .map(|()| CompletionDelivery::Delivered)
-            .unwrap_or(CompletionDelivery::InboxClosed)
+            .unwrap_or(CompletionDelivery::InboxClosed);
+        // Set the dirty flag AFTER the send lands (not before), so the
+        // consumer never observes "dirty" without a corresponding item
+        // already visible in the channel. See `WaitRuntime::poll_inbox`
+        // for the paired clear-before-drain half of this protocol.
+        if delivery == CompletionDelivery::Delivered {
+            self.1.store(true, Ordering::Release);
+        }
+        delivery
     }
 }
 
@@ -169,6 +179,10 @@ pub struct WaitRuntime {
     registrar: Option<CompletionRegistrar>,
     lease: Option<Arc<dyn ExecutorLease>>,
     inbox: Option<Receiver<ExternalCompletion>>,
+    /// Set by `InboxSender::send` after a completion lands; cleared by
+    /// `poll_inbox` before it drains. Lets the drive loop skip `try_recv`
+    /// (a syscall-ish mpsc lock) on rotations with nothing new to see.
+    inbox_dirty: Arc<AtomicBool>,
     deferred: VecDeque<ExternalCompletion>,
     active: HashMap<WaitKey, RegisteredExternalWait>,
     cleanup: HashMap<WaitKey, CleanupEntry>,
@@ -201,8 +215,9 @@ impl WaitRuntime {
         executor: Arc<dyn IoExecutor>,
     ) -> Result<(Self, sema_core::runtime::RuntimeScopedIdIssuers), RuntimeCreateError> {
         let (sender, inbox) = mpsc::channel();
+        let inbox_dirty = Arc::new(AtomicBool::new(false));
         let (runtime_id, registrar, issuers) =
-            CompletionRegistrar::register(Arc::new(InboxSender(sender)))
+            CompletionRegistrar::register(Arc::new(InboxSender(sender, Arc::clone(&inbox_dirty))))
                 .map_err(|_| RuntimeCreateError::IdExhausted)?;
         let lease = executor
             .attach_runtime(runtime_id)
@@ -213,6 +228,7 @@ impl WaitRuntime {
                 registrar: Some(registrar),
                 lease: Some(lease),
                 inbox: Some(inbox),
+                inbox_dirty,
                 deferred: VecDeque::new(),
                 active: HashMap::new(),
                 cleanup: HashMap::new(),
@@ -344,21 +360,56 @@ impl WaitRuntime {
         }
     }
 
+    /// Refill `deferred` from the mpsc inbox, gated by `inbox_dirty` so a
+    /// rotation with nothing new to see skips `try_recv` (an mpsc lock)
+    /// entirely. No-op if `deferred` already has buffered completions.
+    ///
+    /// Wakeup-safety argument: `InboxSender::send` sets `inbox_dirty` strictly
+    /// AFTER the item is visible in the channel (send-then-set). Here we clear
+    /// the flag BEFORE draining (swap, not read-then-clear), then drain the
+    /// channel to `Empty`. Two race outcomes are possible once we've observed
+    /// `dirty == true` and cleared it:
+    ///
+    /// 1. No further sends land during our drain: we drain everything that
+    ///    was visible; the flag is legitimately clean afterward.
+    /// 2. A concurrent send lands mid-drain (before or after we've already
+    ///    popped its item): its `store(true)` happens after our
+    ///    `swap(false)`, so the flag ends up `true` again regardless of drain
+    ///    timing — the next call to `refill_from_inbox` will see
+    ///    `dirty == true` and poll again, even if that poll turns out empty
+    ///    because we already drained the item in this call.
+    ///
+    /// The failure mode this avoids is clearing AFTER draining: drain to
+    /// `Empty`, THEN a send lands and sets the flag — that's fine too (flag
+    /// stays true, next call retries) — but clearing BEFORE is the form that
+    /// can never observe `dirty == true`, decide "nothing to do", and clear a
+    /// flag out from under a send that raced in, because the clear happens
+    /// first and any racing send's `store(true)` unconditionally lands after
+    /// it (`Ordering::Release` on the store, `Ordering::Acquire` on our
+    /// swap's read half).
+    fn refill_from_inbox(&mut self) {
+        if !self.deferred.is_empty() {
+            return;
+        }
+        if !self.inbox_dirty.swap(false, Ordering::AcqRel) {
+            return;
+        }
+        let Some(inbox) = self.inbox.as_ref() else {
+            return;
+        };
+        while let Ok(completion) = inbox.try_recv() {
+            self.deferred.push_back(completion);
+        }
+    }
+
     pub fn drain_one(
         &mut self,
         task: &mut TaskRecord,
     ) -> Option<(CompletionRoute, Option<PendingResume>)> {
-        let completion = match self.deferred.pop_front().map_or_else(
-            || {
-                self.inbox
-                    .as_ref()
-                    .map_or(Err(TryRecvError::Disconnected), Receiver::try_recv)
-            },
-            Ok,
-        ) {
-            Ok(completion) => completion,
-            Err(TryRecvError::Empty | TryRecvError::Disconnected) => return None,
-        };
+        if self.deferred.is_empty() {
+            self.refill_from_inbox();
+        }
+        let completion = self.deferred.pop_front()?;
         let key = WaitKey {
             runtime: self.runtime_id,
             id: completion.wait_id,
@@ -434,15 +485,7 @@ impl WaitRuntime {
     }
 
     pub fn next_completion_task_id(&mut self) -> Option<TaskId> {
-        if self.deferred.is_empty() {
-            if let Ok(completion) = self
-                .inbox
-                .as_ref()
-                .map_or(Err(TryRecvError::Disconnected), Receiver::try_recv)
-            {
-                self.deferred.push_back(completion);
-            }
-        }
+        self.refill_from_inbox();
         let completion = self.deferred.front();
         completion.and_then(|completion| {
             let key = WaitKey {

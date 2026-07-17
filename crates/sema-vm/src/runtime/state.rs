@@ -1116,7 +1116,7 @@ impl Runtime {
                 }
                 2 => self.cancel_waiting()?,
                 3 => self.advance_pending()?,
-                4 if timers < budget.timer_limit.get() && self.fire_timer()? => {
+                4 if timers < budget.timer_limit.get() && self.fire_timer(clock_now)? => {
                     timers += 1;
                     true
                 }
@@ -1363,7 +1363,14 @@ impl Runtime {
         Ok(true)
     }
 
-    fn fire_timer(&self) -> Result<bool, RuntimeFault> {
+    /// `now` is the drive loop's cached `clock_now` (refreshed every 64
+    /// iterations), not a fresh `Instant::now()` read — a timer wheel peek
+    /// does not need finer freshness than the quarantine/wall-clock checks
+    /// that share the same cache. Firing latency is therefore bounded by
+    /// one 64-iteration window; timers are self-resolving (a due-but-not-
+    /// yet-observed timer is simply re-checked, and fires, on the next
+    /// window) so this never delays a timer past that bound.
+    fn fire_timer(&self, now: Instant) -> Result<bool, RuntimeFault> {
         let mut state = self.state.borrow_mut();
         // Virtual-clock cooperative semantics: never fire a timer while any task
         // is still runnable. A cooperative scheduler drains all ready work to a
@@ -1377,7 +1384,6 @@ impl Runtime {
         if state.ready.root_count() > 0 || !state.pending.is_empty() {
             return Ok(false);
         }
-        let now = state.clock.now();
         let Some(key) = state.timers.pop_due(now) else {
             return Ok(false);
         };

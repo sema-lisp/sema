@@ -2410,6 +2410,22 @@ unsafe fn rc_strong_cell<'a>(ptr: *const u8) -> &'a Cell<usize> {
     &*(ptr.sub(RC_HEADER) as *const Cell<usize>)
 }
 
+/// Recursion budget for `free_heap_value`'s direct (non-worklist) path: at
+/// depths at or below this bound, freeing a nested collection recurses
+/// straight through Rust's native call stack instead of allocating and
+/// draining a worklist `Vec`. The overwhelming majority of real Sema
+/// structures (a handful of list/map levels) never approach this depth, so
+/// the direct path is what almost every last-ref drop actually takes —
+/// no `Vec::new`/push/pop indirection, just ordinary recursive calls the
+/// compiler can inline and branch-predict well. 64 native frames (a few
+/// hundred bytes each at most) is far below any realistic stack-overflow
+/// threshold while comfortably exceeding realistic nesting depth; beyond it,
+/// `free_heap_value` falls back to the worklist spill (see
+/// `drop_last_heap_ref`'s original SIGABRT-prevention rationale, preserved
+/// below) so teardown of a genuinely deep structure still costs only O(1)
+/// native frames regardless of how deep it goes.
+const DROP_DIRECT_RECURSION_BUDGET: u32 = 64;
+
 /// Typed free for a heap value whose last strong reference is going away:
 /// reconstruct the `Rc` (strong count 1) and drop it, running the payload's
 /// destructor and releasing the box exactly as a plain `Rc` drop would
@@ -2427,25 +2443,101 @@ unsafe fn rc_strong_cell<'a>(ptr: *const u8) -> &'a Cell<usize> {
 /// better judgment about its layout.
 #[inline(never)]
 unsafe fn drop_last_heap_ref(tag: u64, ptr: *const u8) {
-    // Deeply nested immutable collections (a 5000-deep nested list, a tree of
-    // maps) would otherwise free recursively: dropping the outer `Vec<Value>`
-    // drops each child `Value`, whose last-ref free drops *its* `Vec<Value>`,
-    // one native frame per level. On the unified-runtime drive path that
-    // recursion starts from a deep native baseline and overflows the OS stack
-    // (an uncatchable SIGABRT) well before any Sema guard can fire. Flatten it:
-    // move each collection's children onto an explicit heap worklist and free
-    // them iteratively, so teardown depth is O(1) native frames regardless of
-    // structure depth. Only the cycle-free immutable collections are unrolled
-    // here; every other payload drops through `drop_leaf_heap_ref` (its own
-    // recursion is bounded by nesting of *distinct* types, not element count —
-    // e.g. a record field holding a deep list re-enters this iterative path).
-    let mut worklist: Vec<Value> = Vec::new();
-    free_heap_payload(tag, ptr, &mut worklist);
+    free_heap_value(tag, ptr, 0);
+}
+
+/// Free one heap value's last strong reference at nesting `depth` (0 at the
+/// drop root, +1 per nested immutable-collection level a recursive free
+/// descends into). Depths within [`DROP_DIRECT_RECURSION_BUDGET`] free their
+/// children via direct recursive calls; past the budget, this falls back to
+/// the iterative worklist spill that the original (always-iterative)
+/// implementation used unconditionally.
+///
+/// # Safety
+/// Same contract as [`drop_last_heap_ref`]: `ptr` came from `Rc::into_raw`
+/// for the payload type `tag` denotes, with strong count exactly 1.
+unsafe fn free_heap_value(tag: u64, ptr: *const u8, depth: u32) {
+    if depth > DROP_DIRECT_RECURSION_BUDGET {
+        // Deeply nested immutable collections (a 5000-deep nested list, a
+        // tree of maps) would otherwise free recursively: dropping the outer
+        // `Vec<Value>` drops each child `Value`, whose last-ref free drops
+        // *its* `Vec<Value>`, one native frame per level. On the
+        // unified-runtime drive path that recursion starts from a deep
+        // native baseline and overflows the OS stack (an uncatchable
+        // SIGABRT) well before any Sema guard can fire. Flatten it: move
+        // each collection's children onto an explicit heap worklist and free
+        // them iteratively, so teardown depth from here is O(1) native
+        // frames regardless of how much deeper the structure goes. Only the
+        // cycle-free immutable collections are unrolled here; every other
+        // payload drops through `drop_leaf_heap_ref` (its own recursion is
+        // bounded by nesting of *distinct* types, not element count — e.g. a
+        // record field holding a deep list re-enters this iterative path).
+        let mut worklist: Vec<Value> = Vec::new();
+        free_heap_payload(tag, ptr, &mut worklist);
+        drain_drop_worklist(worklist);
+        return;
+    }
+    match tag {
+        TAG_LIST | TAG_VECTOR => {
+            let items = Rc::into_inner(Rc::from_raw(ptr as *const Vec<Value>))
+                .expect("caller guarantees the last strong reference");
+            for value in items {
+                drop_child_value(value, depth + 1);
+            }
+        }
+        TAG_MAP => {
+            let map = Rc::into_inner(Rc::from_raw(ptr as *const BTreeMap<Value, Value>))
+                .expect("caller guarantees the last strong reference");
+            for (k, v) in map {
+                drop_child_value(k, depth + 1);
+                drop_child_value(v, depth + 1);
+            }
+        }
+        TAG_HASHMAP => {
+            let map = Rc::into_inner(Rc::from_raw(ptr as *const hashbrown::HashMap<Value, Value>))
+                .expect("caller guarantees the last strong reference");
+            for (k, v) in map {
+                drop_child_value(k, depth + 1);
+                drop_child_value(v, depth + 1);
+            }
+        }
+        _ => drop_leaf_heap_ref(tag, ptr),
+    }
+}
+
+/// Drop one child `Value` reached while freeing a collection's contents at
+/// `depth`: decrement its refcount, recursing into `free_heap_value` (direct
+/// or worklist-spilled, per `depth`) only when this was the last reference.
+/// `mem::forget` keeps `Value`'s own `Drop` from re-entering the recursive
+/// path this replaces.
+#[inline]
+unsafe fn drop_child_value(value: Value, depth: u32) {
+    if is_boxed(value.0) {
+        let tag = get_tag(value.0);
+        match tag {
+            TAG_NIL | TAG_FALSE | TAG_TRUE | TAG_INT_SMALL | TAG_CHAR | TAG_SYMBOL
+            | TAG_KEYWORD => {}
+            _ => {
+                let ptr = payload_to_ptr(get_payload(value.0));
+                let strong = rc_strong_cell(ptr);
+                match strong.get() {
+                    1 => free_heap_value(tag, ptr, depth),
+                    n => strong.set(n - 1),
+                }
+            }
+        }
+    }
+    std::mem::forget(value);
+}
+
+/// Drain a worklist of children spilled by the depth-budget fallback,
+/// freeing each iteratively. Deliberately does NOT call back into
+/// `free_heap_value`'s direct path — once a structure's teardown has
+/// spilled, it stays on the O(1)-native-frames worklist path for the rest of
+/// its depth, which is what makes the budget cutoff safe against arbitrarily
+/// deep structures.
+unsafe fn drain_drop_worklist(mut worklist: Vec<Value>) {
     while let Some(value) = worklist.pop() {
-        // Replicate `Value::drop`'s refcount step, but redirect the last-ref
-        // free back through the worklist instead of recursing. `mem::forget`
-        // keeps `Value`'s own `Drop` from running the recursive path we are
-        // deliberately replacing.
         if is_boxed(value.0) {
             let tag = get_tag(value.0);
             match tag {
@@ -3470,6 +3562,57 @@ mod tests {
             drop(Rc::from_raw(raw));
         }
         drop(extra);
+    }
+
+    #[test]
+    fn drop_mixed_shallow_and_deep_nesting_does_not_double_free_or_leak() {
+        // A shape that crosses `DROP_DIRECT_RECURSION_BUDGET` (64) in both
+        // directions within a single drop: a 5000-deep nested-list spine
+        // (far past the budget, forcing the worklist-spill fallback) with a
+        // map spliced into its middle that itself holds a 100-deep nested
+        // list (also past the budget, but reached from a fresh depth-0 spill
+        // frame via `free_heap_payload`'s recursive `TAG_MAP` handling,
+        // exercising the direct path for its own first 64 levels before
+        // spilling again). Two leaf strings are wrapped in `Rc` so their
+        // weak counts pin "freed exactly once" — a double-free would abort
+        // or corrupt the allocator before this assertion runs, and a leak
+        // would leave the strong count above zero.
+        fn deep_list(depth: usize, leaf: Value) -> Value {
+            let mut v = leaf;
+            for _ in 0..depth {
+                v = Value::list(vec![v]);
+            }
+            v
+        }
+
+        let shallow_leaf = Rc::new(String::from("shallow leaf"));
+        let deep_leaf = Rc::new(String::from("deep leaf"));
+        let shallow_weak = Rc::downgrade(&shallow_leaf);
+        let deep_weak = Rc::downgrade(&deep_leaf);
+
+        let shallow_value = Value::string_from_rc(shallow_leaf);
+        let deep_value = Value::string_from_rc(deep_leaf);
+
+        // 100-deep list (past the budget on its own) nested inside a map.
+        let inner_deep_list = deep_list(100, deep_value);
+        let mut inner_map = BTreeMap::new();
+        inner_map.insert(Value::keyword("payload"), inner_deep_list);
+        let map_value = Value::map(inner_map);
+
+        // Splice the map into the middle of a 5000-deep spine (2500 levels
+        // on either side, each well past the budget).
+        let below = deep_list(2500, map_value);
+        let spine_bottom = Value::list(vec![shallow_value, below]);
+        let full = deep_list(2500, spine_bottom);
+
+        drop(full);
+
+        assert_eq!(
+            shallow_weak.strong_count(),
+            0,
+            "shallow leaf freed exactly once"
+        );
+        assert_eq!(deep_weak.strong_count(), 0, "deep leaf freed exactly once");
     }
 
     #[test]

@@ -160,7 +160,8 @@ test('two concurrent eval roots stay pending and settle fairly with distinct roo
 
   const result = await page.evaluate(async () => {
     // The exact wasm-pack-built artifact the playground worker loads.
-    const mod = await import('/pkg/sema_wasm.js');
+    // @ts-expect-error -- resolved by the dev server at runtime, not by tsc
+      const mod = await import('/pkg/sema_wasm.js');
     await mod.default();
     const interp = new mod.SemaInterpreter();
 
@@ -216,7 +217,8 @@ test('cancelRoot cancels the exact RootId via RuntimeCommandHandle::cancel_root,
 
   const t0 = Date.now();
   const result = await page.evaluate(async () => {
-    const mod = await import('/pkg/sema_wasm.js');
+    // @ts-expect-error -- resolved by the dev server at runtime, not by tsc
+      const mod = await import('/pkg/sema_wasm.js');
     await mod.default();
     const interp = new mod.SemaInterpreter();
 

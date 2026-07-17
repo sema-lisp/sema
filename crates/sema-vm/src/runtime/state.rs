@@ -345,6 +345,59 @@ impl Drop for TaskScopeSwap {
     }
 }
 
+/// RAII guard for the two single-slot "current quantum" thread-locals —
+/// `sema_core::CURRENT_TASK_ID` and `sema_core::CURRENT_ROOT` (published via
+/// `set_current_task_id`/`set_current_root`) — published around every
+/// quantum so natives (`llm/stream`, `agent/run`, output capture) can tell
+/// which task/root is currently executing. Mirrors `TaskScopeSwap`'s
+/// panic/early-return safety story, but for these two ids: both quantum
+/// call sites run a `loop { .. }` containing `break`s AND at least one `?`
+/// on a fallible call (`try_channel_handoff`, the debug-session lookup) that
+/// can leave the function before reaching a plain post-loop restore
+/// statement. A plain pair of `let prev = set_current_*(..); .. ; let _ =
+/// set_current_*(prev);` restores correctly on the fallthrough path but
+/// leaves the displaced (parent/sibling) id published on any early exit —
+/// the next quantum on this thread would then run with a stale task/root
+/// id, corrupting output-capture routing and the task-scoped slab lookups
+/// natives use it for. `restore` is idempotent and `Drop` calls it, so an
+/// early `?`-return or panic still restores the displaced ids exactly once.
+struct QuantumIdGuard {
+    prev_task_id: Option<u64>,
+    prev_root_id: Option<RootId>,
+    restored: bool,
+}
+
+impl QuantumIdGuard {
+    /// Publish `published_task_id`/`root` as the current quantum's identity,
+    /// capturing the displaced (spawner/sibling) values to restore later.
+    fn install(published_task_id: Option<u64>, root: RootId) -> Self {
+        let prev_task_id = sema_core::set_current_task_id(published_task_id);
+        let prev_root_id = sema_core::set_current_root(Some(root));
+        Self {
+            prev_task_id,
+            prev_root_id,
+            restored: false,
+        }
+    }
+
+    /// Normal-path restore. Idempotent — a subsequent `Drop` is a no-op.
+    fn restore(&mut self) {
+        if self.restored {
+            return;
+        }
+        self.restored = true;
+        let _ = sema_core::set_current_task_id(self.prev_task_id);
+        let _ = sema_core::set_current_root(self.prev_root_id);
+    }
+}
+
+impl Drop for QuantumIdGuard {
+    fn drop(&mut self) {
+        // Unwind or early-`?`-return path: `restore` never ran explicitly.
+        self.restore();
+    }
+}
+
 // Task 4 replaces this placeholder with the VM-backed PreparedRoot payload.
 #[cfg_attr(not(test), allow(dead_code))]
 pub(super) enum TaskPayload {
@@ -1921,12 +1974,13 @@ impl Runtime {
         } else {
             Some(task_id.get())
         };
-        let prev_task_id = sema_core::set_current_task_id(published_task_id);
         // Publish the running quantum's root (unlike task id, this is set for
         // the root main task too — its `println`s must tag correctly for a
         // capturing root) so `write_stdout`/`write_stderr` can route output
         // captured for this root instead of process stdout/stderr.
-        let prev_root_id = sema_core::set_current_root(Some(root));
+        // `QuantumIdGuard` restores both ids even if the loop below returns
+        // early via `?` or panics — see its doc comment.
+        let mut id_guard = QuantumIdGuard::install(published_task_id, root);
         // Regression insurance for the crux invariant (verified on the audited
         // path): no `RuntimeState` borrow is held across the quantum. The debug
         // variant may BLOCK inside the quantum (`handle_debug_stop` parks the
@@ -2080,8 +2134,7 @@ impl Runtime {
             }
         };
 
-        let _ = sema_core::set_current_task_id(prev_task_id);
-        let _ = sema_core::set_current_root(prev_root_id);
+        id_guard.restore();
         scopes.restore(task);
         drop(quantum_guard);
         Ok(action)
@@ -3570,8 +3623,9 @@ impl Runtime {
         } else {
             Some(task_id.get())
         };
-        let prev_task_id = sema_core::set_current_task_id(published_task_id);
-        let prev_root_id = sema_core::set_current_root(Some(root));
+        // `QuantumIdGuard` restores both ids even on an early `?`-return or
+        // panic inside the loop below — see its doc comment.
+        let mut id_guard = QuantumIdGuard::install(published_task_id, root);
         let mut scopes = TaskScopeSwap::install(&mut task);
         debug_assert!(
             self.state.try_borrow_mut().is_ok(),
@@ -3717,8 +3771,7 @@ impl Runtime {
             }
         };
 
-        let _ = sema_core::set_current_task_id(prev_task_id);
-        let _ = sema_core::set_current_root(prev_root_id);
+        id_guard.restore();
         scopes.restore(&mut task);
         drop(quantum_guard);
 

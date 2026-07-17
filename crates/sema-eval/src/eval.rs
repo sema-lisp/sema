@@ -365,6 +365,16 @@ impl Interpreter {
     /// didn't opt in still writes straight to process stdout/stderr, exactly
     /// as before this API existed — this only ever returns output from
     /// capturing roots.
+    ///
+    /// Ordering: events come back in global execution order (the order the
+    /// underlying prints actually happened across every capturing root on
+    /// this runtime, interleaved as the scheduler ran them), which preserves
+    /// each root's own events in FIFO order too. Each call drains only what
+    /// accumulated since the previous drain — reading is destructive, never
+    /// a peek. The captured output itself is retained regardless of the
+    /// owning root's lifecycle: it survives the root settling, being
+    /// reaped, and interpreter `shutdown`, so a caller can still drain a
+    /// root's final output after polling it to completion.
     pub fn take_output(&self) -> Vec<sema_vm::runtime::OutputEvent> {
         let runtime = self
             .runtime

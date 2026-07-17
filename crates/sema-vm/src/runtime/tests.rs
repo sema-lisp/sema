@@ -1458,6 +1458,52 @@ fn runtime_with_inline_executor(clock: Rc<dyn RuntimeClock>) -> Runtime {
     .expect("runtime")
 }
 
+/// A `Runtime` dropped directly (bypassing `Interpreter::drop`'s bounded
+/// `shutdown`, which drives every task to cancellation/reap before tearing
+/// down) runs only `close_for_interpreter_drop` — documented as closing the
+/// inbox WITHOUT driving any VM quantum. A root still marked
+/// `capture_output`-capturing at that point is therefore never reaped and
+/// never reaches `unmark_root_capturing` (that only runs from
+/// `cleanup_one`, on the reap path). Before the fix, `Runtime::new`'s
+/// `install_output_capture_sink` call only replaced the sink pointer, so
+/// `sema_core::capturing_root_count()` — and the `CAPTURING_ROOTS` set
+/// backing it — stayed dirty forever afterward on this OS thread: every
+/// later `Runtime` on the same thread paid the non-empty capture-set path
+/// (`CURRENT_ROOT` read + `HashSet::contains`) on every `print`, never the
+/// intended `CAPTURING_COUNT == 0` fast return.
+#[test]
+fn dropped_runtime_with_live_capturing_root_does_not_leak_into_next_runtime_on_thread() {
+    {
+        let clock = Rc::new(FakeClock::new());
+        let runtime_a = runtime_with_inline_executor(clock);
+        let handle_a = runtime_a
+            .submit_test_root(TestPreparedTask::yield_forever())
+            .expect("root A admitted");
+        // Opt this root into output capture exactly as `submit_root_with_options`
+        // would for `RootOptions { capture_output: true, .. }` — this is the
+        // one-liner that flips `write_stdout`/`write_stderr` into the capture
+        // path for this root.
+        sema_core::mark_root_capturing(handle_a.id);
+        assert_eq!(sema_core::capturing_root_count(), 1);
+
+        // Never drive `runtime_a` — root A's task stays parked forever
+        // (`YieldForever`), so it can never become reap-eligible. Dropping
+        // `handle_a` then `runtime_a` here exercises exactly the raw
+        // `Runtime::drop` -> `close_for_interpreter_drop` path, which does
+        // not drive a single quantum.
+    }
+
+    // A second `Runtime` on this same thread: a fresh `install_output_capture_sink`
+    // call must not inherit runtime A's abandoned capturing-root entry.
+    let clock_b = Rc::new(FakeClock::new());
+    let _runtime_b = runtime_with_inline_executor(clock_b);
+    assert_eq!(
+        sema_core::capturing_root_count(),
+        0,
+        "a fresh runtime must not inherit a dead runtime's stale capturing-root count"
+    );
+}
+
 thread_local! {
     static REENTRANT_HANDLE: RefCell<Option<super::RootHandle>> = const { RefCell::new(None) };
 }

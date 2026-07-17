@@ -89,181 +89,181 @@ F32	crates/sema-eval/src/eval.rs:166:        sema_core::set_call_owned_callback(
 F32	crates/sema-eval/src/eval.rs:185:        sema_core::set_eval_callback(&ctx, eval_value_vm);
 F32	crates/sema-eval/src/eval.rs:186:        sema_core::set_call_callback(&ctx, call_value);
 F32	crates/sema-eval/src/eval.rs:187:        sema_core::set_call_owned_callback(&ctx, call_value_owned);
-F32	crates/sema-eval/src/eval.rs:1903:                    sema_core::call_callback(ctx, &thunk.body, &[])?
-F31	crates/sema-eval/src/eval.rs:2458:    // ACCEPTANCE GATE (Task 04 native-suspend ABI, first async op): `async/sleep`
-F31	crates/sema-eval/src/eval.rs:2470:            .eval_str_via_runtime("(async/sleep 2)")
-F31	crates/sema-eval/src/eval.rs:2471:            .expect("async/sleep settles through the runtime");
-F31	crates/sema-eval/src/eval.rs:2481:            .eval_str_via_runtime("(begin (async/sleep 2) (+ 40 2))")
-F31	crates/sema-eval/src/eval.rs:2482:            .expect("program continues past async/sleep");
-F31	crates/sema-eval/src/eval.rs:2486:    // `async/spawn` + `async/await` round-trip through the runtime: spawn a
-F31	crates/sema-eval/src/eval.rs:2494:            .eval_str_via_runtime("(await (async/spawn (fn () (+ 40 2))))")
-F31	crates/sema-eval/src/eval.rs:2508:                   (define a (async/spawn (fn () (+ 1 2)))) \
-F31	crates/sema-eval/src/eval.rs:2509:                   (define b (async/spawn (fn () (* 4 5)))) \
-F31	crates/sema-eval/src/eval.rs:2516:    // A spawned task that itself parks on a timer (`async/sleep`) and resumes:
-F31	crates/sema-eval/src/eval.rs:2523:            .eval_str_via_runtime("(await (async/spawn (fn () (async/sleep 2) 7)))")
-F31	crates/sema-eval/src/eval.rs:2536:    // detached task (parked on its `async/sleep` timer at the end of call one)
-F31	crates/sema-eval/src/eval.rs:2545:            .eval_str_via_runtime("(define p (async/spawn (fn () (async/sleep 2) 42)))")
-F31	crates/sema-eval/src/eval.rs:2569:                .eval_str_via_runtime("(async/spawn (fn () (async/sleep 100000) 1)) 7")
-F31	crates/sema-eval/src/eval.rs:2588:        let result = interp.eval_str_via_runtime("(await (async/spawn (fn () (error \"boom\"))))");
-F31	crates/sema-eval/src/eval.rs:2600:            .eval_str_via_runtime("(let ((p (async/spawn (fn () 5)))) (async/sleep 5) (await p))")
-F31	crates/sema-eval/src/eval.rs:2613:                   (define p (async/spawn (fn () 99))) \
-F31	crates/sema-eval/src/eval.rs:2614:                   (define a (async/spawn (fn () (await p)))) \
-F31	crates/sema-eval/src/eval.rs:2615:                   (define b (async/spawn (fn () (await p)))) \
-F31	crates/sema-eval/src/eval.rs:2627:            .eval_str_via_runtime("(await (async/spawn (fn () (await (async/spawn (fn () 42))))))")
-F31	crates/sema-eval/src/eval.rs:2638:            .eval_str_via_runtime("(begin (async/spawn (fn () 1)) 99)")
-F31	crates/sema-eval/src/eval.rs:2652:                    (set! p (async/spawn (fn () (async/sleep 1) (await p)))) \
-F31	crates/sema-eval/src/eval.rs:2686:        match rx.recv_timeout(std::time::Duration::from_secs(30)) {
-F31	crates/sema-eval/src/eval.rs:2712:    // GATE — top-level `channel/recv` on an empty channel with no sender parks
-F31	crates/sema-eval/src/eval.rs:2714:    // it with the legacy "channel/recv: channel is empty".
-F31	crates/sema-eval/src/eval.rs:2717:        assert_runtime_deadlock_matches_oracle("(channel/recv (channel/new 1))");
-F31	crates/sema-eval/src/eval.rs:2720:    // GATE — top-level `channel/send` on a full channel with no receiver parks
-F31	crates/sema-eval/src/eval.rs:2721:    // the root; the drive loop settles it with the legacy "channel/send: channel
-F31	crates/sema-eval/src/eval.rs:2727:            "(begin (define ch (channel/new 1)) (channel/send ch 1) (channel/send ch 2))",
-F31	crates/sema-eval/src/eval.rs:2740:               (set! pa (async/spawn (fn () (async/sleep 1) (await pb)))) \
-F31	crates/sema-eval/src/eval.rs:2741:               (set! pb (async/spawn (fn () (async/sleep 1) (await pa)))) \
-F31	crates/sema-eval/src/eval.rs:2759:            .eval_str_via_runtime("(async/spawn (fn () (async/sleep 5000) 1))")
-F31	crates/sema-eval/src/eval.rs:2770:    // awaited promise is still Pending at the moment `async/await` runs, the
-F31	crates/sema-eval/src/eval.rs:2785:                "(try (await (async/spawn (fn () (async/sleep 2) (error \"x\")))) \
-F31	crates/sema-eval/src/eval.rs:2798:            .eval_str_via_runtime("(await (async/spawn (fn () (async/sleep 2) (error \"boom\"))))");
-F31	crates/sema-eval/src/eval.rs:2820:                "(async/all (list (async/spawn (fn () 1)) \
-F31	crates/sema-eval/src/eval.rs:2821:                                  (async/spawn (fn () 2)) \
-F31	crates/sema-eval/src/eval.rs:2822:                                  (async/spawn (fn () 3))))",
-F31	crates/sema-eval/src/eval.rs:2824:            .expect("async/all resolves through the runtime");
-F31	crates/sema-eval/src/eval.rs:2832:            .eval_str_via_runtime("(async/all (list))")
-F31	crates/sema-eval/src/eval.rs:2833:            .expect("async/all of empty input");
-F31	crates/sema-eval/src/eval.rs:2846:                   (define sib (async/spawn (fn () (async/sleep 4) (channel/send ch 77) 1))) \
-F31	crates/sema-eval/src/eval.rs:2847:                   (define bad (async/spawn (fn () (error \"boom\")))) \
-F31	crates/sema-eval/src/eval.rs:2848:                   (define outcome (try (async/all (list bad sib)) (catch e :caught))) \
-F31	crates/sema-eval/src/eval.rs:2849:                   (list outcome (await sib) (channel/recv ch)))",
-F31	crates/sema-eval/src/eval.rs:2862:                   (define fast (async/spawn (fn () 10))) \
-F31	crates/sema-eval/src/eval.rs:2863:                   (define slow (async/spawn (fn () (async/sleep 5) (channel/send ch 88) 20))) \
-F31	crates/sema-eval/src/eval.rs:2864:                   (define winner (async/race (list fast slow))) \
-F31	crates/sema-eval/src/eval.rs:2865:                   (list winner (await slow) (channel/recv ch)))",
-F31	crates/sema-eval/src/eval.rs:2875:            .eval_str_via_runtime("(async/timeout 10000 (async/spawn (fn () (async/sleep 1) 5)))")
-F31	crates/sema-eval/src/eval.rs:2887:                   (define slow (async/spawn (fn () (async/sleep 20) (channel/send ch 55) 9))) \
-F31	crates/sema-eval/src/eval.rs:2888:                   (define outcome (try (async/timeout 1 slow) (catch e :timeout))) \
-F31	crates/sema-eval/src/eval.rs:2889:                   (list outcome (await slow) (channel/recv ch)))",
-F31	crates/sema-eval/src/eval.rs:2897:    // yield seam. Unlike the earlier async/all|race|timeout channel uses (which
-F31	crates/sema-eval/src/eval.rs:2910:                   (async/spawn (fn () (channel/send ch 42))) \
-F31	crates/sema-eval/src/eval.rs:2911:                   (channel/recv ch))",
-F31	crates/sema-eval/src/eval.rs:2926:                   (channel/send ch 1) (channel/send ch 2) (channel/send ch 3) \
-F31	crates/sema-eval/src/eval.rs:2927:                   (list (channel/recv ch) (channel/recv ch) (channel/recv ch)))",
-F31	crates/sema-eval/src/eval.rs:2944:                   (define p (async/spawn (fn () \
-F31	crates/sema-eval/src/eval.rs:2945:                       (channel/send ch 1) (channel/send ch 2) (channel/send ch 3) :done))) \
-F31	crates/sema-eval/src/eval.rs:2946:                   (define out (list (channel/recv ch) (channel/recv ch) (channel/recv ch))) \
-F31	crates/sema-eval/src/eval.rs:2956:    fn runtime_channel_blocking_recv_parks_until_sent() {
-F31	crates/sema-eval/src/eval.rs:2962:                   (async/spawn (fn () (async/sleep 2) (channel/send ch 77))) \
-F31	crates/sema-eval/src/eval.rs:2963:                   (channel/recv ch))",
-F31	crates/sema-eval/src/eval.rs:2976:               (channel/send ch 1) \
-F31	crates/sema-eval/src/eval.rs:2978:               (list (channel/recv ch) (channel/recv ch)))",
-F31	crates/sema-eval/src/eval.rs:2991:                   (try (channel/send ch 9) (catch e :send-failed)))",
-F31	crates/sema-eval/src/eval.rs:3026:               (channel/send ch 10) \
-F31	crates/sema-eval/src/eval.rs:3027:               (channel/send ch 20) \
-F31	crates/sema-eval/src/eval.rs:3039:               (channel/send ch 10) \
-F31	crates/sema-eval/src/eval.rs:3040:               (channel/send ch 20) \
-F31	crates/sema-eval/src/eval.rs:3051:               (channel/send ch 1) \
-F31	crates/sema-eval/src/eval.rs:3052:               (channel/send ch 2) \
-F31	crates/sema-eval/src/eval.rs:3062:               (channel/send ch 7) \
-F31	crates/sema-eval/src/eval.rs:3070:    // GATE 1: `async/cancel` returns `#t` ONLY for the FIRST cancellation request
-F31	crates/sema-eval/src/eval.rs:3078:                "(let ((p (async/spawn (fn () (async/sleep 100000) 42)))) \
-F31	crates/sema-eval/src/eval.rs:3079:                   (list (async/cancel p) (async/cancel p)))",
-F31	crates/sema-eval/src/eval.rs:3081:            .expect("async/cancel of a sleeping spawned task drives through the runtime");
-F31	crates/sema-eval/src/eval.rs:3089:    // GATE 1b: `async/cancel` returns `#f` for a synthetic promise (no backing
-F31	crates/sema-eval/src/eval.rs:3095:            .eval_str_via_runtime("(async/cancel (async/resolved 5))")
-F31	crates/sema-eval/src/eval.rs:3108:                "(let ((p (async/spawn (fn () (async/sleep 100000) 42)))) \
-F31	crates/sema-eval/src/eval.rs:3109:                   (async/cancel p) \
-F31	crates/sema-eval/src/eval.rs:3126:            "(let ((p (async/spawn (fn () (async/sleep 100000) 42)))) \
-F31	crates/sema-eval/src/eval.rs:3127:               (async/cancel p) \
-F31	crates/sema-eval/src/eval.rs:3138:    // GATE 3: a task blocked on a LONG `async/sleep`, when cancelled, actually
-F31	crates/sema-eval/src/eval.rs:3140:    // NOT after the full (100s) sleep. The promise reports `async/cancelled?`
-F31	crates/sema-eval/src/eval.rs:3148:                "(let ((p (async/spawn (fn () (async/sleep 100000) 42)))) \
-F31	crates/sema-eval/src/eval.rs:3149:                   (async/cancel p) \
-F31	crates/sema-eval/src/eval.rs:3151:                   (async/cancelled? p))",
-F31	crates/sema-eval/src/eval.rs:3168:    // `channel/recv` is tracked ONLY in `channel_waits`, with a wait key that is
-F31	crates/sema-eval/src/eval.rs:3177:    // PROMPTLY; `async/cancelled?` is #t and `await` raises a catchable
-F31	crates/sema-eval/src/eval.rs:3185:                "(let ((p (async/spawn (fn () (channel/recv (channel/new 1)))))) \
-F31	crates/sema-eval/src/eval.rs:3186:                   (async/cancel p) \
-F31	crates/sema-eval/src/eval.rs:3187:                   (list (try (await p) (catch e (:type e))) (async/cancelled? p)))",
-F31	crates/sema-eval/src/eval.rs:3202:    // GATE B: THE HANG PROOF. A detached task left parked on `channel/recv` when
-F31	crates/sema-eval/src/eval.rs:3215:            .eval_str_via_runtime("(async/spawn (fn () (channel/recv (channel/new 1)))) 42")
-F31	crates/sema-eval/src/eval.rs:3235:                "(async/spawn (fn () (let ((c (channel/new 1))) (channel/send c 1) (channel/send c 99)))) 7",
-F31	crates/sema-eval/src/eval.rs:3246:    // GATE D: owned fail-fast that cancels a worker parked on `channel/recv`
-F31	crates/sema-eval/src/eval.rs:3257:                     (try (async/spawn-all \
-F31	crates/sema-eval/src/eval.rs:3259:                                  (fn () (channel/recv ch)))) \
-F31	crates/sema-eval/src/eval.rs:3277:    // observational `async/all`/`race`/`timeout` gates above, where the supplied
-F31	crates/sema-eval/src/eval.rs:3280:    // async/spawn-all GATE 1 — happy path: values in INPUT order.
-F31	crates/sema-eval/src/eval.rs:3285:            .eval_str_via_runtime("(async/spawn-all (list (fn () 1) (fn () 2) (fn () 3)))")
-F31	crates/sema-eval/src/eval.rs:3290:    // async/spawn-all GATE 1b — empty input → empty list.
-F31	crates/sema-eval/src/eval.rs:3295:            .eval_str_via_runtime("(async/spawn-all (list))")
-F31	crates/sema-eval/src/eval.rs:3300:    // async/spawn-all GATE 2 — fail-fast OWNERSHIP: one child errors immediately;
-F31	crates/sema-eval/src/eval.rs:3312:                     (try (async/spawn-all \
-F31	crates/sema-eval/src/eval.rs:3313:                            (list (fn () (async/sleep 60) (set! flag 77) 1) \
-F31	crates/sema-eval/src/eval.rs:3316:                   (async/sleep 200) \
-F31	crates/sema-eval/src/eval.rs:3348:                                        (begin (async/sleep 60) (set! flag x) x))) \
-F31	crates/sema-eval/src/eval.rs:3351:                   (async/sleep 200) \
-F31	crates/sema-eval/src/eval.rs:3372:                     (async/sleep 15) \
-F31	crates/sema-eval/src/eval.rs:3418:                     (if (= x 1) (begin (async/sleep 5) (error \"boom\")) \
-F31	crates/sema-eval/src/eval.rs:3419:                         (begin (async/sleep 60) (set! flag x) x))) \
-F31	crates/sema-eval/src/eval.rs:3422:                   (async/sleep 200) \
-F31	crates/sema-eval/src/eval.rs:3429:    // async/race-owned GATE 1 — first settlement wins AND the loser is CANCELLED
-F31	crates/sema-eval/src/eval.rs:3440:                     (async/race-owned \
-F31	crates/sema-eval/src/eval.rs:3442:                             (fn () (async/sleep 60) (set! flag 99) 20)))) \
-F31	crates/sema-eval/src/eval.rs:3443:                   (async/sleep 200) \
-F31	crates/sema-eval/src/eval.rs:3454:    // async/race-owned GATE 2 — empty input is an argument error.
-F31	crates/sema-eval/src/eval.rs:3460:                .eval_str_via_runtime("(try (async/race-owned (list)) (catch e :empty))",)
-F31	crates/sema-eval/src/eval.rs:3466:    // async/race-owned GATE 3 — the first settlement being an error re-raises it.
-F31	crates/sema-eval/src/eval.rs:3472:                "(try (async/race-owned (list (fn () (error \"boom\")) \
-F31	crates/sema-eval/src/eval.rs:3473:                                              (fn () (async/sleep 100) 2))) \
-F31	crates/sema-eval/src/eval.rs:3491:                            (fn () (async/sleep 200) (set! flag 5) :done)) \
-F31	crates/sema-eval/src/eval.rs:3493:                   (async/sleep 300) \
-F31	crates/sema-eval/src/eval.rs:3509:            .eval_str_via_runtime("(async/with-timeout 10000 (fn () (async/sleep 1) 42))")
-F31	crates/sema-eval/src/eval.rs:3530:    // at bytecode level via `__spawn-apply` rather than `(map async/spawn …)`.
-F31	crates/sema-eval/src/eval.rs:3532:    // `(map async/spawn …)` shape would raise "async yield outside of scheduler
-F31	crates/sema-eval/src/eval.rs:3587:                "(map (fn (x) (async/await (async/spawn (fn () (* x x))))) (list 1 2 3))",
-F31	crates/sema-eval/src/eval.rs:3596:    // The embedding-style shape: each `async` desugars to `(async/spawn (fn ()
-F31	crates/sema-eval/src/eval.rs:3597:    // …))`, so `map` produces a list of promises which `async/all` then awaits.
-F31	crates/sema-eval/src/eval.rs:3598:    // The callback's `async/spawn` yield must be serviced cooperatively.
-F31	crates/sema-eval/src/eval.rs:3603:            .eval_str_via_runtime("(async/all (map (fn (x) (async (* x x))) (list 1 2 3)))")
-F31	crates/sema-eval/src/eval.rs:3604:            .expect("async/all over a mapped list of spawns resolves");
-F31	crates/sema-eval/src/eval.rs:3623:                "(filter (fn (x) (async/await (async/spawn (fn () (> x 1))))) (list 1 2 3))",
-F31	crates/sema-eval/src/eval.rs:3639:                "(foldl (fn (acc x) (async/await (async/spawn (fn () (+ acc x))))) 0 \
-F31	crates/sema-eval/src/eval.rs:3656:                "(foldl (fn (acc x) (async/await (async/spawn (fn () (+ acc x))))) 99 (list))",
-F31	crates/sema-eval/src/eval.rs:3667:                "(reduce (fn (acc x) (async/await (async/spawn (fn () (+ acc x))))) \
-F31	crates/sema-eval/src/eval.rs:3684:                "(reduce (fn (acc x) (async/await (async/spawn (fn () (+ acc x))))) (list 42))",
-F31	crates/sema-eval/src/eval.rs:3696:                "(sort-by (fn (x) (async/await (async/spawn (fn () (- x))))) (list 3 1 2))",
-F31	crates/sema-eval/src/eval.rs:3718:                 (for-each (fn (x) (async/await (async/spawn (fn () (channel/send ch (* x 10)))))) \
-F31	crates/sema-eval/src/eval.rs:3721:                 (list (channel/recv ch) (channel/recv ch) (channel/recv ch))",
-F31	crates/sema-eval/src/eval.rs:3749:    // still-live `Tracked` cell, mirroring `async/spawn`) every escaping open
-F31	crates/sema-eval/src/eval.rs:3924:            .eval_str_via_runtime("(async/spawn (fn () (sleep 100000) 1)) 7")
-F31	crates/sema-eval/src/eval.rs:3961:    // observable synchronously via `async/cancelled?`.
-F31	crates/sema-eval/src/eval.rs:3968:                   (let ((p (async (channel/recv ch)))) \
-F31	crates/sema-eval/src/eval.rs:3969:                     (async/cancel p) \
-F31	crates/sema-eval/src/eval.rs:3970:                     (async/cancelled? p)))",
-F31	crates/sema-eval/src/eval.rs:3982:                "(let ((p (async (async/sleep 100)))) \
-F31	crates/sema-eval/src/eval.rs:3983:                   (async/cancel p) \
-F31	crates/sema-eval/src/eval.rs:3984:                   (list (async/cancelled? p) (async/rejected? p) \
-F31	crates/sema-eval/src/eval.rs:3999:    // A yielding native (`channel/recv`) passed DIRECTLY as a HOF callback now
-F31	crates/sema-eval/src/eval.rs:4001:    // continuation ABI (the tool-loop/HOF migration): `(map channel/recv …)`
-F31	crates/sema-eval/src/eval.rs:4009:                   (let ((producer (async (channel/send ch 1) (channel/close ch))) \
-F31	crates/sema-eval/src/eval.rs:4010:                         (consumer (async (map channel/recv (list ch))))) \
-F31	crates/sema-eval/src/eval.rs:4017:    // `async/run` inside an async task is a cooperative yield under the runtime
-F31	crates/sema-eval/src/eval.rs:4025:                   (await (async (async/run) (channel/send ch 42) (channel/recv ch))))",
-F31	crates/sema-eval/src/eval.rs:4033:    // A 0 ms `async/timeout` must still let synchronously-ready work finish: the
-F31	crates/sema-eval/src/eval.rs:4040:            .eval_str_via_runtime("(async/timeout 0 (async 42))")
-F31	crates/sema-eval/src/eval.rs:4045:    // `retry` backoff in a runtime quantum yields cooperatively (via `async/sleep`)
-F31	crates/sema-eval/src/eval.rs:4054:                   (async/all \
-F31	crates/sema-eval/src/eval.rs:4055:                     (list (async/spawn (fn () \
-F31	crates/sema-eval/src/eval.rs:4059:                             (channel/send out :slow))) \
-F31	crates/sema-eval/src/eval.rs:4060:                           (async/spawn (fn () (async/sleep 10) (channel/send out :fast))))) \
-F31	crates/sema-eval/src/eval.rs:4061:                   (list (channel/recv out) (channel/recv out)))",
-F31	crates/sema-eval/src/eval.rs:4079:                 (begin (async (channel/send ch :ran)) :end)",
-F31	crates/sema-eval/src/eval.rs:4085:            .eval_str_via_runtime("(channel/recv ch)")
+F32	crates/sema-eval/src/eval.rs:1913:                    sema_core::call_callback(ctx, &thunk.body, &[])?
+F31	crates/sema-eval/src/eval.rs:2468:    // ACCEPTANCE GATE (Task 04 native-suspend ABI, first async op): `async/sleep`
+F31	crates/sema-eval/src/eval.rs:2480:            .eval_str_via_runtime("(async/sleep 2)")
+F31	crates/sema-eval/src/eval.rs:2481:            .expect("async/sleep settles through the runtime");
+F31	crates/sema-eval/src/eval.rs:2491:            .eval_str_via_runtime("(begin (async/sleep 2) (+ 40 2))")
+F31	crates/sema-eval/src/eval.rs:2492:            .expect("program continues past async/sleep");
+F31	crates/sema-eval/src/eval.rs:2496:    // `async/spawn` + `async/await` round-trip through the runtime: spawn a
+F31	crates/sema-eval/src/eval.rs:2504:            .eval_str_via_runtime("(await (async/spawn (fn () (+ 40 2))))")
+F31	crates/sema-eval/src/eval.rs:2518:                   (define a (async/spawn (fn () (+ 1 2)))) \
+F31	crates/sema-eval/src/eval.rs:2519:                   (define b (async/spawn (fn () (* 4 5)))) \
+F31	crates/sema-eval/src/eval.rs:2526:    // A spawned task that itself parks on a timer (`async/sleep`) and resumes:
+F31	crates/sema-eval/src/eval.rs:2533:            .eval_str_via_runtime("(await (async/spawn (fn () (async/sleep 2) 7)))")
+F31	crates/sema-eval/src/eval.rs:2546:    // detached task (parked on its `async/sleep` timer at the end of call one)
+F31	crates/sema-eval/src/eval.rs:2555:            .eval_str_via_runtime("(define p (async/spawn (fn () (async/sleep 2) 42)))")
+F31	crates/sema-eval/src/eval.rs:2579:                .eval_str_via_runtime("(async/spawn (fn () (async/sleep 100000) 1)) 7")
+F31	crates/sema-eval/src/eval.rs:2598:        let result = interp.eval_str_via_runtime("(await (async/spawn (fn () (error \"boom\"))))");
+F31	crates/sema-eval/src/eval.rs:2610:            .eval_str_via_runtime("(let ((p (async/spawn (fn () 5)))) (async/sleep 5) (await p))")
+F31	crates/sema-eval/src/eval.rs:2623:                   (define p (async/spawn (fn () 99))) \
+F31	crates/sema-eval/src/eval.rs:2624:                   (define a (async/spawn (fn () (await p)))) \
+F31	crates/sema-eval/src/eval.rs:2625:                   (define b (async/spawn (fn () (await p)))) \
+F31	crates/sema-eval/src/eval.rs:2637:            .eval_str_via_runtime("(await (async/spawn (fn () (await (async/spawn (fn () 42))))))")
+F31	crates/sema-eval/src/eval.rs:2648:            .eval_str_via_runtime("(begin (async/spawn (fn () 1)) 99)")
+F31	crates/sema-eval/src/eval.rs:2662:                    (set! p (async/spawn (fn () (async/sleep 1) (await p)))) \
+F31	crates/sema-eval/src/eval.rs:2696:        match rx.recv_timeout(std::time::Duration::from_secs(30)) {
+F31	crates/sema-eval/src/eval.rs:2722:    // GATE — top-level `channel/recv` on an empty channel with no sender parks
+F31	crates/sema-eval/src/eval.rs:2724:    // it with the legacy "channel/recv: channel is empty".
+F31	crates/sema-eval/src/eval.rs:2727:        assert_runtime_deadlock_matches_oracle("(channel/recv (channel/new 1))");
+F31	crates/sema-eval/src/eval.rs:2730:    // GATE — top-level `channel/send` on a full channel with no receiver parks
+F31	crates/sema-eval/src/eval.rs:2731:    // the root; the drive loop settles it with the legacy "channel/send: channel
+F31	crates/sema-eval/src/eval.rs:2737:            "(begin (define ch (channel/new 1)) (channel/send ch 1) (channel/send ch 2))",
+F31	crates/sema-eval/src/eval.rs:2750:               (set! pa (async/spawn (fn () (async/sleep 1) (await pb)))) \
+F31	crates/sema-eval/src/eval.rs:2751:               (set! pb (async/spawn (fn () (async/sleep 1) (await pa)))) \
+F31	crates/sema-eval/src/eval.rs:2769:            .eval_str_via_runtime("(async/spawn (fn () (async/sleep 5000) 1))")
+F31	crates/sema-eval/src/eval.rs:2780:    // awaited promise is still Pending at the moment `async/await` runs, the
+F31	crates/sema-eval/src/eval.rs:2795:                "(try (await (async/spawn (fn () (async/sleep 2) (error \"x\")))) \
+F31	crates/sema-eval/src/eval.rs:2808:            .eval_str_via_runtime("(await (async/spawn (fn () (async/sleep 2) (error \"boom\"))))");
+F31	crates/sema-eval/src/eval.rs:2830:                "(async/all (list (async/spawn (fn () 1)) \
+F31	crates/sema-eval/src/eval.rs:2831:                                  (async/spawn (fn () 2)) \
+F31	crates/sema-eval/src/eval.rs:2832:                                  (async/spawn (fn () 3))))",
+F31	crates/sema-eval/src/eval.rs:2834:            .expect("async/all resolves through the runtime");
+F31	crates/sema-eval/src/eval.rs:2842:            .eval_str_via_runtime("(async/all (list))")
+F31	crates/sema-eval/src/eval.rs:2843:            .expect("async/all of empty input");
+F31	crates/sema-eval/src/eval.rs:2856:                   (define sib (async/spawn (fn () (async/sleep 4) (channel/send ch 77) 1))) \
+F31	crates/sema-eval/src/eval.rs:2857:                   (define bad (async/spawn (fn () (error \"boom\")))) \
+F31	crates/sema-eval/src/eval.rs:2858:                   (define outcome (try (async/all (list bad sib)) (catch e :caught))) \
+F31	crates/sema-eval/src/eval.rs:2859:                   (list outcome (await sib) (channel/recv ch)))",
+F31	crates/sema-eval/src/eval.rs:2872:                   (define fast (async/spawn (fn () 10))) \
+F31	crates/sema-eval/src/eval.rs:2873:                   (define slow (async/spawn (fn () (async/sleep 5) (channel/send ch 88) 20))) \
+F31	crates/sema-eval/src/eval.rs:2874:                   (define winner (async/race (list fast slow))) \
+F31	crates/sema-eval/src/eval.rs:2875:                   (list winner (await slow) (channel/recv ch)))",
+F31	crates/sema-eval/src/eval.rs:2885:            .eval_str_via_runtime("(async/timeout 10000 (async/spawn (fn () (async/sleep 1) 5)))")
+F31	crates/sema-eval/src/eval.rs:2897:                   (define slow (async/spawn (fn () (async/sleep 20) (channel/send ch 55) 9))) \
+F31	crates/sema-eval/src/eval.rs:2898:                   (define outcome (try (async/timeout 1 slow) (catch e :timeout))) \
+F31	crates/sema-eval/src/eval.rs:2899:                   (list outcome (await slow) (channel/recv ch)))",
+F31	crates/sema-eval/src/eval.rs:2907:    // yield seam. Unlike the earlier async/all|race|timeout channel uses (which
+F31	crates/sema-eval/src/eval.rs:2920:                   (async/spawn (fn () (channel/send ch 42))) \
+F31	crates/sema-eval/src/eval.rs:2921:                   (channel/recv ch))",
+F31	crates/sema-eval/src/eval.rs:2936:                   (channel/send ch 1) (channel/send ch 2) (channel/send ch 3) \
+F31	crates/sema-eval/src/eval.rs:2937:                   (list (channel/recv ch) (channel/recv ch) (channel/recv ch)))",
+F31	crates/sema-eval/src/eval.rs:2954:                   (define p (async/spawn (fn () \
+F31	crates/sema-eval/src/eval.rs:2955:                       (channel/send ch 1) (channel/send ch 2) (channel/send ch 3) :done))) \
+F31	crates/sema-eval/src/eval.rs:2956:                   (define out (list (channel/recv ch) (channel/recv ch) (channel/recv ch))) \
+F31	crates/sema-eval/src/eval.rs:2966:    fn runtime_channel_blocking_recv_parks_until_sent() {
+F31	crates/sema-eval/src/eval.rs:2972:                   (async/spawn (fn () (async/sleep 2) (channel/send ch 77))) \
+F31	crates/sema-eval/src/eval.rs:2973:                   (channel/recv ch))",
+F31	crates/sema-eval/src/eval.rs:2986:               (channel/send ch 1) \
+F31	crates/sema-eval/src/eval.rs:2988:               (list (channel/recv ch) (channel/recv ch)))",
+F31	crates/sema-eval/src/eval.rs:3001:                   (try (channel/send ch 9) (catch e :send-failed)))",
+F31	crates/sema-eval/src/eval.rs:3036:               (channel/send ch 10) \
+F31	crates/sema-eval/src/eval.rs:3037:               (channel/send ch 20) \
+F31	crates/sema-eval/src/eval.rs:3049:               (channel/send ch 10) \
+F31	crates/sema-eval/src/eval.rs:3050:               (channel/send ch 20) \
+F31	crates/sema-eval/src/eval.rs:3061:               (channel/send ch 1) \
+F31	crates/sema-eval/src/eval.rs:3062:               (channel/send ch 2) \
+F31	crates/sema-eval/src/eval.rs:3072:               (channel/send ch 7) \
+F31	crates/sema-eval/src/eval.rs:3080:    // GATE 1: `async/cancel` returns `#t` ONLY for the FIRST cancellation request
+F31	crates/sema-eval/src/eval.rs:3088:                "(let ((p (async/spawn (fn () (async/sleep 100000) 42)))) \
+F31	crates/sema-eval/src/eval.rs:3089:                   (list (async/cancel p) (async/cancel p)))",
+F31	crates/sema-eval/src/eval.rs:3091:            .expect("async/cancel of a sleeping spawned task drives through the runtime");
+F31	crates/sema-eval/src/eval.rs:3099:    // GATE 1b: `async/cancel` returns `#f` for a synthetic promise (no backing
+F31	crates/sema-eval/src/eval.rs:3105:            .eval_str_via_runtime("(async/cancel (async/resolved 5))")
+F31	crates/sema-eval/src/eval.rs:3118:                "(let ((p (async/spawn (fn () (async/sleep 100000) 42)))) \
+F31	crates/sema-eval/src/eval.rs:3119:                   (async/cancel p) \
+F31	crates/sema-eval/src/eval.rs:3136:            "(let ((p (async/spawn (fn () (async/sleep 100000) 42)))) \
+F31	crates/sema-eval/src/eval.rs:3137:               (async/cancel p) \
+F31	crates/sema-eval/src/eval.rs:3148:    // GATE 3: a task blocked on a LONG `async/sleep`, when cancelled, actually
+F31	crates/sema-eval/src/eval.rs:3150:    // NOT after the full (100s) sleep. The promise reports `async/cancelled?`
+F31	crates/sema-eval/src/eval.rs:3158:                "(let ((p (async/spawn (fn () (async/sleep 100000) 42)))) \
+F31	crates/sema-eval/src/eval.rs:3159:                   (async/cancel p) \
+F31	crates/sema-eval/src/eval.rs:3161:                   (async/cancelled? p))",
+F31	crates/sema-eval/src/eval.rs:3178:    // `channel/recv` is tracked ONLY in `channel_waits`, with a wait key that is
+F31	crates/sema-eval/src/eval.rs:3187:    // PROMPTLY; `async/cancelled?` is #t and `await` raises a catchable
+F31	crates/sema-eval/src/eval.rs:3195:                "(let ((p (async/spawn (fn () (channel/recv (channel/new 1)))))) \
+F31	crates/sema-eval/src/eval.rs:3196:                   (async/cancel p) \
+F31	crates/sema-eval/src/eval.rs:3197:                   (list (try (await p) (catch e (:type e))) (async/cancelled? p)))",
+F31	crates/sema-eval/src/eval.rs:3212:    // GATE B: THE HANG PROOF. A detached task left parked on `channel/recv` when
+F31	crates/sema-eval/src/eval.rs:3225:            .eval_str_via_runtime("(async/spawn (fn () (channel/recv (channel/new 1)))) 42")
+F31	crates/sema-eval/src/eval.rs:3245:                "(async/spawn (fn () (let ((c (channel/new 1))) (channel/send c 1) (channel/send c 99)))) 7",
+F31	crates/sema-eval/src/eval.rs:3256:    // GATE D: owned fail-fast that cancels a worker parked on `channel/recv`
+F31	crates/sema-eval/src/eval.rs:3267:                     (try (async/spawn-all \
+F31	crates/sema-eval/src/eval.rs:3269:                                  (fn () (channel/recv ch)))) \
+F31	crates/sema-eval/src/eval.rs:3287:    // observational `async/all`/`race`/`timeout` gates above, where the supplied
+F31	crates/sema-eval/src/eval.rs:3290:    // async/spawn-all GATE 1 — happy path: values in INPUT order.
+F31	crates/sema-eval/src/eval.rs:3295:            .eval_str_via_runtime("(async/spawn-all (list (fn () 1) (fn () 2) (fn () 3)))")
+F31	crates/sema-eval/src/eval.rs:3300:    // async/spawn-all GATE 1b — empty input → empty list.
+F31	crates/sema-eval/src/eval.rs:3305:            .eval_str_via_runtime("(async/spawn-all (list))")
+F31	crates/sema-eval/src/eval.rs:3310:    // async/spawn-all GATE 2 — fail-fast OWNERSHIP: one child errors immediately;
+F31	crates/sema-eval/src/eval.rs:3322:                     (try (async/spawn-all \
+F31	crates/sema-eval/src/eval.rs:3323:                            (list (fn () (async/sleep 60) (set! flag 77) 1) \
+F31	crates/sema-eval/src/eval.rs:3326:                   (async/sleep 200) \
+F31	crates/sema-eval/src/eval.rs:3358:                                        (begin (async/sleep 60) (set! flag x) x))) \
+F31	crates/sema-eval/src/eval.rs:3361:                   (async/sleep 200) \
+F31	crates/sema-eval/src/eval.rs:3382:                     (async/sleep 15) \
+F31	crates/sema-eval/src/eval.rs:3428:                     (if (= x 1) (begin (async/sleep 5) (error \"boom\")) \
+F31	crates/sema-eval/src/eval.rs:3429:                         (begin (async/sleep 60) (set! flag x) x))) \
+F31	crates/sema-eval/src/eval.rs:3432:                   (async/sleep 200) \
+F31	crates/sema-eval/src/eval.rs:3439:    // async/race-owned GATE 1 — first settlement wins AND the loser is CANCELLED
+F31	crates/sema-eval/src/eval.rs:3450:                     (async/race-owned \
+F31	crates/sema-eval/src/eval.rs:3452:                             (fn () (async/sleep 60) (set! flag 99) 20)))) \
+F31	crates/sema-eval/src/eval.rs:3453:                   (async/sleep 200) \
+F31	crates/sema-eval/src/eval.rs:3464:    // async/race-owned GATE 2 — empty input is an argument error.
+F31	crates/sema-eval/src/eval.rs:3470:                .eval_str_via_runtime("(try (async/race-owned (list)) (catch e :empty))",)
+F31	crates/sema-eval/src/eval.rs:3476:    // async/race-owned GATE 3 — the first settlement being an error re-raises it.
+F31	crates/sema-eval/src/eval.rs:3482:                "(try (async/race-owned (list (fn () (error \"boom\")) \
+F31	crates/sema-eval/src/eval.rs:3483:                                              (fn () (async/sleep 100) 2))) \
+F31	crates/sema-eval/src/eval.rs:3501:                            (fn () (async/sleep 200) (set! flag 5) :done)) \
+F31	crates/sema-eval/src/eval.rs:3503:                   (async/sleep 300) \
+F31	crates/sema-eval/src/eval.rs:3519:            .eval_str_via_runtime("(async/with-timeout 10000 (fn () (async/sleep 1) 42))")
+F31	crates/sema-eval/src/eval.rs:3540:    // at bytecode level via `__spawn-apply` rather than `(map async/spawn …)`.
+F31	crates/sema-eval/src/eval.rs:3542:    // `(map async/spawn …)` shape would raise "async yield outside of scheduler
+F31	crates/sema-eval/src/eval.rs:3597:                "(map (fn (x) (async/await (async/spawn (fn () (* x x))))) (list 1 2 3))",
+F31	crates/sema-eval/src/eval.rs:3606:    // The embedding-style shape: each `async` desugars to `(async/spawn (fn ()
+F31	crates/sema-eval/src/eval.rs:3607:    // …))`, so `map` produces a list of promises which `async/all` then awaits.
+F31	crates/sema-eval/src/eval.rs:3608:    // The callback's `async/spawn` yield must be serviced cooperatively.
+F31	crates/sema-eval/src/eval.rs:3613:            .eval_str_via_runtime("(async/all (map (fn (x) (async (* x x))) (list 1 2 3)))")
+F31	crates/sema-eval/src/eval.rs:3614:            .expect("async/all over a mapped list of spawns resolves");
+F31	crates/sema-eval/src/eval.rs:3633:                "(filter (fn (x) (async/await (async/spawn (fn () (> x 1))))) (list 1 2 3))",
+F31	crates/sema-eval/src/eval.rs:3649:                "(foldl (fn (acc x) (async/await (async/spawn (fn () (+ acc x))))) 0 \
+F31	crates/sema-eval/src/eval.rs:3666:                "(foldl (fn (acc x) (async/await (async/spawn (fn () (+ acc x))))) 99 (list))",
+F31	crates/sema-eval/src/eval.rs:3677:                "(reduce (fn (acc x) (async/await (async/spawn (fn () (+ acc x))))) \
+F31	crates/sema-eval/src/eval.rs:3694:                "(reduce (fn (acc x) (async/await (async/spawn (fn () (+ acc x))))) (list 42))",
+F31	crates/sema-eval/src/eval.rs:3706:                "(sort-by (fn (x) (async/await (async/spawn (fn () (- x))))) (list 3 1 2))",
+F31	crates/sema-eval/src/eval.rs:3728:                 (for-each (fn (x) (async/await (async/spawn (fn () (channel/send ch (* x 10)))))) \
+F31	crates/sema-eval/src/eval.rs:3731:                 (list (channel/recv ch) (channel/recv ch) (channel/recv ch))",
+F31	crates/sema-eval/src/eval.rs:3759:    // still-live `Tracked` cell, mirroring `async/spawn`) every escaping open
+F31	crates/sema-eval/src/eval.rs:3934:            .eval_str_via_runtime("(async/spawn (fn () (sleep 100000) 1)) 7")
+F31	crates/sema-eval/src/eval.rs:3971:    // observable synchronously via `async/cancelled?`.
+F31	crates/sema-eval/src/eval.rs:3978:                   (let ((p (async (channel/recv ch)))) \
+F31	crates/sema-eval/src/eval.rs:3979:                     (async/cancel p) \
+F31	crates/sema-eval/src/eval.rs:3980:                     (async/cancelled? p)))",
+F31	crates/sema-eval/src/eval.rs:3992:                "(let ((p (async (async/sleep 100)))) \
+F31	crates/sema-eval/src/eval.rs:3993:                   (async/cancel p) \
+F31	crates/sema-eval/src/eval.rs:3994:                   (list (async/cancelled? p) (async/rejected? p) \
+F31	crates/sema-eval/src/eval.rs:4009:    // A yielding native (`channel/recv`) passed DIRECTLY as a HOF callback now
+F31	crates/sema-eval/src/eval.rs:4011:    // continuation ABI (the tool-loop/HOF migration): `(map channel/recv …)`
+F31	crates/sema-eval/src/eval.rs:4019:                   (let ((producer (async (channel/send ch 1) (channel/close ch))) \
+F31	crates/sema-eval/src/eval.rs:4020:                         (consumer (async (map channel/recv (list ch))))) \
+F31	crates/sema-eval/src/eval.rs:4027:    // `async/run` inside an async task is a cooperative yield under the runtime
+F31	crates/sema-eval/src/eval.rs:4035:                   (await (async (async/run) (channel/send ch 42) (channel/recv ch))))",
+F31	crates/sema-eval/src/eval.rs:4043:    // A 0 ms `async/timeout` must still let synchronously-ready work finish: the
+F31	crates/sema-eval/src/eval.rs:4050:            .eval_str_via_runtime("(async/timeout 0 (async 42))")
+F31	crates/sema-eval/src/eval.rs:4055:    // `retry` backoff in a runtime quantum yields cooperatively (via `async/sleep`)
+F31	crates/sema-eval/src/eval.rs:4064:                   (async/all \
+F31	crates/sema-eval/src/eval.rs:4065:                     (list (async/spawn (fn () \
+F31	crates/sema-eval/src/eval.rs:4069:                             (channel/send out :slow))) \
+F31	crates/sema-eval/src/eval.rs:4070:                           (async/spawn (fn () (async/sleep 10) (channel/send out :fast))))) \
+F31	crates/sema-eval/src/eval.rs:4071:                   (list (channel/recv out) (channel/recv out)))",
+F31	crates/sema-eval/src/eval.rs:4089:                 (begin (async (channel/send ch :ran)) :end)",
+F31	crates/sema-eval/src/eval.rs:4095:            .eval_str_via_runtime("(channel/recv ch)")
 F31	crates/sema-eval/src/eval.rs:42:    // quantum and turns any `async/spawn`/`await`/channel yield inside the
-F31	crates/sema-eval/src/eval.rs:532:                    if !runtime.block_on_inbox(next_deadline) && next_deadline.is_none() {
-F31	crates/sema-eval/src/eval.rs:540:                // The root is parked purely on a timer (`async/sleep`): the only
-F31	crates/sema-eval/src/eval.rs:550:                        std::thread::sleep(deadline - now);
-F31	crates/sema-eval/src/eval.rs:558:                // legacy-parity error (`channel/recv: channel is empty` /
-F31	crates/sema-eval/src/eval.rs:559:                // `channel/send: channel is full` for a top-level channel op, or
+F31	crates/sema-eval/src/eval.rs:542:                    if !runtime.block_on_inbox(next_deadline) && next_deadline.is_none() {
+F31	crates/sema-eval/src/eval.rs:550:                // The root is parked purely on a timer (`async/sleep`): the only
+F31	crates/sema-eval/src/eval.rs:560:                        std::thread::sleep(deadline - now);
+F31	crates/sema-eval/src/eval.rs:568:                // legacy-parity error (`channel/recv: channel is empty` /
+F31	crates/sema-eval/src/eval.rs:569:                // `channel/send: channel is full` for a top-level channel op, or
 F31	crates/sema-eval/src/eval.rs:62:    /// context would route the VM's `call_callback` through unregistered
 F31	crates/sema-eval/src/eval.rs:69:    /// `async/spawn` tasks, timers, promises and channels survive *between*
 F34D	crates/sema-eval/src/prelude.rs:137:;; (async/await (ws/listen sock {:on-message (fn (c m) (println m))}))
@@ -694,82 +694,82 @@ F09B	crates/sema-vm/src/runtime/host.rs:534:        std::thread::sleep(Duration:
 F09B	crates/sema-vm/src/runtime/host.rs:569:        rx.recv_timeout(Duration::from_secs(2))
 F09B	crates/sema-vm/src/runtime/host.rs:78:/// overlap, so `async/spawn`ed blocking operations no longer serialize.
 F08A	crates/sema-vm/src/runtime/host_api.rs:121:/// `block_on_inbox` wakes for a command exactly as it would for a completion
-F03	crates/sema-vm/src/runtime/state.rs:1015:            // Re-evaluate parked `async/run` barriers against the current
-F08A	crates/sema-vm/src/runtime/state.rs:1169:    pub fn block_on_inbox(&self, deadline: Option<Instant>) -> bool {
-F08A	crates/sema-vm/src/runtime/state.rs:1174:            .is_some_and(|waits| waits.block_on_inbox(deadline))
-F03	crates/sema-vm/src/runtime/state.rs:1251:    /// Re-evaluate every parked `async/run` barrier and resume the first whose
-F23	crates/sema-vm/src/runtime/state.rs:1337:        // This is what makes `(async/timeout 0 (async 42))` return 42 (the ready
-F08B	crates/sema-vm/src/runtime/state.rs:1404:        // A VM task parked directly on a timer (legacy `async/sleep` via
-F08B	crates/sema-vm/src/runtime/state.rs:1405:        // `VmSleep`): wake it and re-run its frame. Observational `async/timeout`
-F03	crates/sema-vm/src/runtime/state.rs:1563:                        // A cancelled `async/run` barrier: nothing external to tear
-F23	crates/sema-vm/src/runtime/state.rs:1601:            let mut task = state.tasks.remove(&task_id).expect("selected task exists");
-F23	crates/sema-vm/src/runtime/state.rs:1653:                let (Some(task), Some(waits)) = (state.tasks.remove(&task_id), state.waits.take())
-F27	crates/sema-vm/src/runtime/state.rs:1909:        // cancellable task (top level can't be `async/cancel`led), and a native that
+F03	crates/sema-vm/src/runtime/state.rs:1068:            // Re-evaluate parked `async/run` barriers against the current
+F08A	crates/sema-vm/src/runtime/state.rs:1222:    pub fn block_on_inbox(&self, deadline: Option<Instant>) -> bool {
+F08A	crates/sema-vm/src/runtime/state.rs:1227:            .is_some_and(|waits| waits.block_on_inbox(deadline))
+F03	crates/sema-vm/src/runtime/state.rs:1304:    /// Re-evaluate every parked `async/run` barrier and resume the first whose
+F23	crates/sema-vm/src/runtime/state.rs:1390:        // This is what makes `(async/timeout 0 (async 42))` return 42 (the ready
+F08B	crates/sema-vm/src/runtime/state.rs:1457:        // A VM task parked directly on a timer (legacy `async/sleep` via
+F08B	crates/sema-vm/src/runtime/state.rs:1458:        // `VmSleep`): wake it and re-run its frame. Observational `async/timeout`
+F03	crates/sema-vm/src/runtime/state.rs:1616:                        // A cancelled `async/run` barrier: nothing external to tear
+F23	crates/sema-vm/src/runtime/state.rs:1654:            let mut task = state.tasks.remove(&task_id).expect("selected task exists");
+F23	crates/sema-vm/src/runtime/state.rs:1706:                let (Some(task), Some(waits)) = (state.tasks.remove(&task_id), state.waits.take())
+F27	crates/sema-vm/src/runtime/state.rs:1962:        // cancellable task (top level can't be `async/cancel`led), and a native that
 F24	crates/sema-vm/src/runtime/state.rs:199:    /// child (the `async/spawn` capture that used to read each seam's
-F08B	crates/sema-vm/src/runtime/state.rs:2131:            // The only TLS yield signal left is `async/sleep`'s ctx-less value ABI:
-F08B	crates/sema-vm/src/runtime/state.rs:2136:                YieldReason::Sleep(ms) => {
-F23	crates/sema-vm/src/runtime/state.rs:2564:                        let task = state.tasks.remove(&task_id).ok_or_else(|| {
-F23	crates/sema-vm/src/runtime/state.rs:2756:                // first regardless (e.g. `channel/send` settles the sender's
-F03	crates/sema-vm/src/runtime/state.rs:2978:        // `async/run` (OriginBarrier): park the caller on a self-resolving-waits
+F08B	crates/sema-vm/src/runtime/state.rs:2184:            // The only TLS yield signal left is `async/sleep`'s ctx-less value ABI:
+F08B	crates/sema-vm/src/runtime/state.rs:2189:                YieldReason::Sleep(ms) => {
+F23	crates/sema-vm/src/runtime/state.rs:2617:                        let task = state.tasks.remove(&task_id).ok_or_else(|| {
+F23	crates/sema-vm/src/runtime/state.rs:2809:                // first regardless (e.g. `channel/send` settles the sender's
 F23	crates/sema-vm/src/runtime/state.rs:29:use sema_core::YieldReason;
-F24	crates/sema-vm/src/runtime/state.rs:3247:                            // one `async/spawn` layer deeper is not orphaned running
-F23	crates/sema-vm/src/runtime/state.rs:3390:                // callback (`(map channel/recv …)`) leaves a channel/promise/sleep
-F23	crates/sema-vm/src/runtime/state.rs:3399:                let native_result = match sema_core::take_yield_signal() {
-F23	crates/sema-vm/src/runtime/state.rs:3403:                             For example, `(map (fn (x) (channel/recv x)) ...)` instead of \
-F23	crates/sema-vm/src/runtime/state.rs:3404:                             `(map channel/recv ...)`.",
-F24	crates/sema-vm/src/runtime/state.rs:3855:    /// `RuntimeResponse::Promise(id)`. This is the sole `async/spawn` path.
-F24	crates/sema-vm/src/runtime/state.rs:3884:                    "async/spawn: argument must be a function (compiled VM closure)",
-F24	crates/sema-vm/src/runtime/state.rs:3900:                sema_core::SemaError::eval("async/spawn: thunk closure has no home environment"),
-F24	crates/sema-vm/src/runtime/state.rs:3914:                    sema_core::SemaError::eval("async/spawn: task identity exhausted"),
-F24	crates/sema-vm/src/runtime/state.rs:3937:                        sema_core::SemaError::eval("async/spawn: promise identity exhausted"),
-F27	crates/sema-vm/src/runtime/state.rs:3944:            // cancel edge the plan's "async/cancel through the cancellation-parent
-F23	crates/sema-vm/src/runtime/state.rs:3946:            // the tasks it spawned (e.g. a task parked on `async/await` of a child
-F27	crates/sema-vm/src/runtime/state.rs:3948:            // It does NOT make `async/await`/`all`/`race`/`timeout` cancel SUPPLIED
-F27	crates/sema-vm/src/runtime/state.rs:3990:        // (`async/pending?`, `async/cancel`) sees it Pending, and a post-spawn op
-F24	crates/sema-vm/src/runtime/state.rs:3992:        // quantum. `async/spawn` always parks its VM, so `owner` is a `VmResume`:
-F23	crates/sema-vm/src/runtime/state.rs:4165:        let mut task = state.tasks.remove(&task_id).expect("task prevalidated");
-F23	crates/sema-vm/src/runtime/state.rs:4205:    /// - root main task parked directly on `channel/recv` (top-level, no sender)
-F23	crates/sema-vm/src/runtime/state.rs:4206:    ///   → "channel/recv: channel is empty";
-F23	crates/sema-vm/src/runtime/state.rs:4207:    /// - root main task parked directly on `channel/send` (full, no receiver)
-F23	crates/sema-vm/src/runtime/state.rs:4208:    ///   → "channel/send: channel is full";
-F23	crates/sema-vm/src/runtime/state.rs:4236:            // The root main task parked directly on a `channel/recv`/`channel/send`
-F23	crates/sema-vm/src/runtime/state.rs:4257:                    sema_core::SemaError::eval("channel/recv: channel is empty")
-F23	crates/sema-vm/src/runtime/state.rs:4259:                    sema_core::SemaError::eval("channel/send: channel is full").with_hint(
-F03	crates/sema-vm/src/runtime/state.rs:430:    // Count of live `OriginBarrier` (`async/run`) protocol waits. A cheap
-F23	crates/sema-vm/src/runtime/state.rs:4842:        &format!("async/timeout: operation timed out after {duration_ms} ms"),
-F23	crates/sema-vm/src/runtime/state.rs:4843:        "async/timeout",
-F03	crates/sema-vm/src/runtime/state.rs:484:    /// An `async/run` (`OriginBarrier`) suspension: the caller parks until every
-F03	crates/sema-vm/src/runtime/state.rs:5285:/// Whether an `async/run` barrier for `caller` (whose origin root is `root` and
-F03	crates/sema-vm/src/runtime/state.rs:5330:                    // suspends before its own `async/run` lets a descendant park
-F03	crates/sema-vm/src/runtime/state.rs:5342:/// Register an `async/run` (`OriginBarrier`) suspension: park the caller with an
-F08B	crates/sema-vm/src/runtime/state.rs:5600:    /// A VM root/child parked on `async/sleep`: arm a runtime timer for `ms`
-F23	crates/sema-vm/src/runtime/state.rs:569:thread_local! {
-F23	crates/sema-vm/src/runtime/state.rs:5846:    thread_local! {
+F03	crates/sema-vm/src/runtime/state.rs:3031:        // `async/run` (OriginBarrier): park the caller on a self-resolving-waits
+F24	crates/sema-vm/src/runtime/state.rs:3300:                            // one `async/spawn` layer deeper is not orphaned running
+F23	crates/sema-vm/src/runtime/state.rs:3443:                // callback (`(map channel/recv …)`) leaves a channel/promise/sleep
+F23	crates/sema-vm/src/runtime/state.rs:3452:                let native_result = match sema_core::take_yield_signal() {
+F23	crates/sema-vm/src/runtime/state.rs:3456:                             For example, `(map (fn (x) (channel/recv x)) ...)` instead of \
+F23	crates/sema-vm/src/runtime/state.rs:3457:                             `(map channel/recv ...)`.",
+F24	crates/sema-vm/src/runtime/state.rs:3908:    /// `RuntimeResponse::Promise(id)`. This is the sole `async/spawn` path.
+F24	crates/sema-vm/src/runtime/state.rs:3937:                    "async/spawn: argument must be a function (compiled VM closure)",
+F24	crates/sema-vm/src/runtime/state.rs:3953:                sema_core::SemaError::eval("async/spawn: thunk closure has no home environment"),
+F24	crates/sema-vm/src/runtime/state.rs:3967:                    sema_core::SemaError::eval("async/spawn: task identity exhausted"),
+F24	crates/sema-vm/src/runtime/state.rs:3990:                        sema_core::SemaError::eval("async/spawn: promise identity exhausted"),
+F27	crates/sema-vm/src/runtime/state.rs:3997:            // cancel edge the plan's "async/cancel through the cancellation-parent
+F23	crates/sema-vm/src/runtime/state.rs:3999:            // the tasks it spawned (e.g. a task parked on `async/await` of a child
+F27	crates/sema-vm/src/runtime/state.rs:4001:            // It does NOT make `async/await`/`all`/`race`/`timeout` cancel SUPPLIED
+F27	crates/sema-vm/src/runtime/state.rs:4043:        // (`async/pending?`, `async/cancel`) sees it Pending, and a post-spawn op
+F24	crates/sema-vm/src/runtime/state.rs:4045:        // quantum. `async/spawn` always parks its VM, so `owner` is a `VmResume`:
+F23	crates/sema-vm/src/runtime/state.rs:4218:        let mut task = state.tasks.remove(&task_id).expect("task prevalidated");
+F23	crates/sema-vm/src/runtime/state.rs:4258:    /// - root main task parked directly on `channel/recv` (top-level, no sender)
+F23	crates/sema-vm/src/runtime/state.rs:4259:    ///   → "channel/recv: channel is empty";
+F23	crates/sema-vm/src/runtime/state.rs:4260:    /// - root main task parked directly on `channel/send` (full, no receiver)
+F23	crates/sema-vm/src/runtime/state.rs:4261:    ///   → "channel/send: channel is full";
+F23	crates/sema-vm/src/runtime/state.rs:4289:            // The root main task parked directly on a `channel/recv`/`channel/send`
+F23	crates/sema-vm/src/runtime/state.rs:4310:                    sema_core::SemaError::eval("channel/recv: channel is empty")
+F23	crates/sema-vm/src/runtime/state.rs:4312:                    sema_core::SemaError::eval("channel/send: channel is full").with_hint(
+F03	crates/sema-vm/src/runtime/state.rs:483:    // Count of live `OriginBarrier` (`async/run`) protocol waits. A cheap
+F23	crates/sema-vm/src/runtime/state.rs:4895:        &format!("async/timeout: operation timed out after {duration_ms} ms"),
+F23	crates/sema-vm/src/runtime/state.rs:4896:        "async/timeout",
+F03	crates/sema-vm/src/runtime/state.rs:5338:/// Whether an `async/run` barrier for `caller` (whose origin root is `root` and
+F03	crates/sema-vm/src/runtime/state.rs:537:    /// An `async/run` (`OriginBarrier`) suspension: the caller parks until every
+F03	crates/sema-vm/src/runtime/state.rs:5383:                    // suspends before its own `async/run` lets a descendant park
+F03	crates/sema-vm/src/runtime/state.rs:5395:/// Register an `async/run` (`OriginBarrier`) suspension: park the caller with an
+F08B	crates/sema-vm/src/runtime/state.rs:5653:    /// A VM root/child parked on `async/sleep`: arm a runtime timer for `ms`
+F23	crates/sema-vm/src/runtime/state.rs:5899:    thread_local! {
+F23	crates/sema-vm/src/runtime/state.rs:622:thread_local! {
 F23	crates/sema-vm/src/runtime/state.rs:73:    /// Pending resume for a VM-quantum task woken from an `async/await` (or
 F24	crates/sema-vm/src/runtime/state.rs:74:    /// `async/spawn`) park: the value to inject onto the parked frame's stack
 F24	crates/sema-vm/src/runtime/state.rs:79:    /// spawner's thread-locals at `async/spawn` and swapped into/out of the process
-F24	crates/sema-vm/src/runtime/state.rs:824:    /// shape `async/spawn` produces. Used to build multi-task origin-root graphs
-F03	crates/sema-vm/src/runtime/state.rs:825:    /// (e.g. an `async/run` barrier caller with a `ResourceSlot`-parked sibling)
-F23	crates/sema-vm/src/runtime/tests.rs:1461:thread_local! {
-F08A	crates/sema-vm/src/runtime/tests.rs:1632:fn runtime_command_wakes_a_thread_parked_in_block_on_inbox() {
-F08A	crates/sema-vm/src/runtime/tests.rs:1633:    // The driving thread parks in `block_on_inbox` (as `drive_vm_on_runtime`
-F08A	crates/sema-vm/src/runtime/tests.rs:1641:        std::thread::sleep(Duration::from_millis(50));
-F08A	crates/sema-vm/src/runtime/tests.rs:1645:    let woke = runtime.block_on_inbox(None);
-F08A	crates/sema-vm/src/runtime/tests.rs:1648:    assert!(woke, "block_on_inbox returns true when a command arrives");
-F08A	crates/sema-vm/src/runtime/tests.rs:1651:        "command should wake block_on_inbox promptly, took {elapsed:?}"
-F08A	crates/sema-vm/src/runtime/tests.rs:1656:fn block_on_inbox_returns_immediately_when_a_command_is_already_buffered() {
-F08A	crates/sema-vm/src/runtime/tests.rs:1660:    // *subsequent* `block_on_inbox` call to observe. The first call below
-F08A	crates/sema-vm/src/runtime/tests.rs:1668:        std::thread::sleep(Duration::from_millis(50));
-F08A	crates/sema-vm/src/runtime/tests.rs:1671:    let woke_first = runtime.block_on_inbox(None);
-F08A	crates/sema-vm/src/runtime/tests.rs:1676:    let woke_second = runtime.block_on_inbox(Some(start + Duration::from_millis(400)));
-F08A	crates/sema-vm/src/runtime/tests.rs:1684:        "buffered command should make block_on_inbox return immediately, took {elapsed:?}"
-F23	crates/sema-vm/src/runtime/tests.rs:1947:/// `channel/send`/`channel/recv`'s continuation for the in-place handoff fast
-F23	crates/sema-vm/src/runtime/tests.rs:3708:/// itself excluded from an `async/run` barrier.
-F23	crates/sema-vm/src/runtime/tests.rs:3753:/// Barrier caller: `async/run`, then record its release and return.
-F23	crates/sema-vm/src/runtime/tests.rs:3778:/// CYCLE-FORMING for the `async/run` barrier. A same-origin-root sibling parked on
-F23	crates/sema-vm/src/runtime/tests.rs:3780:/// channel) must NOT keep the barrier waiting — `(async/run)` releases because the
-F23	crates/sema-vm/src/runtime/tests.rs:3820:    // Root R: main task M is the `async/run` barrier caller.
-F23	crates/sema-vm/src/runtime/tests.rs:3850:            "async/run barrier hung on a ResourceSlot cycle (regression: ResourceSlot must be cycle-forming); events: {:?}",
+F24	crates/sema-vm/src/runtime/state.rs:877:    /// shape `async/spawn` produces. Used to build multi-task origin-root graphs
+F03	crates/sema-vm/src/runtime/state.rs:878:    /// (e.g. an `async/run` barrier caller with a `ResourceSlot`-parked sibling)
+F23	crates/sema-vm/src/runtime/tests.rs:1507:thread_local! {
+F08A	crates/sema-vm/src/runtime/tests.rs:1678:fn runtime_command_wakes_a_thread_parked_in_block_on_inbox() {
+F08A	crates/sema-vm/src/runtime/tests.rs:1679:    // The driving thread parks in `block_on_inbox` (as `drive_vm_on_runtime`
+F08A	crates/sema-vm/src/runtime/tests.rs:1687:        std::thread::sleep(Duration::from_millis(50));
+F08A	crates/sema-vm/src/runtime/tests.rs:1691:    let woke = runtime.block_on_inbox(None);
+F08A	crates/sema-vm/src/runtime/tests.rs:1694:    assert!(woke, "block_on_inbox returns true when a command arrives");
+F08A	crates/sema-vm/src/runtime/tests.rs:1697:        "command should wake block_on_inbox promptly, took {elapsed:?}"
+F08A	crates/sema-vm/src/runtime/tests.rs:1702:fn block_on_inbox_returns_immediately_when_a_command_is_already_buffered() {
+F08A	crates/sema-vm/src/runtime/tests.rs:1706:    // *subsequent* `block_on_inbox` call to observe. The first call below
+F08A	crates/sema-vm/src/runtime/tests.rs:1714:        std::thread::sleep(Duration::from_millis(50));
+F08A	crates/sema-vm/src/runtime/tests.rs:1717:    let woke_first = runtime.block_on_inbox(None);
+F08A	crates/sema-vm/src/runtime/tests.rs:1722:    let woke_second = runtime.block_on_inbox(Some(start + Duration::from_millis(400)));
+F08A	crates/sema-vm/src/runtime/tests.rs:1730:        "buffered command should make block_on_inbox return immediately, took {elapsed:?}"
+F23	crates/sema-vm/src/runtime/tests.rs:1993:/// `channel/send`/`channel/recv`'s continuation for the in-place handoff fast
+F23	crates/sema-vm/src/runtime/tests.rs:3754:/// itself excluded from an `async/run` barrier.
+F23	crates/sema-vm/src/runtime/tests.rs:3799:/// Barrier caller: `async/run`, then record its release and return.
+F23	crates/sema-vm/src/runtime/tests.rs:3824:/// CYCLE-FORMING for the `async/run` barrier. A same-origin-root sibling parked on
+F23	crates/sema-vm/src/runtime/tests.rs:3826:/// channel) must NOT keep the barrier waiting — `(async/run)` releases because the
+F23	crates/sema-vm/src/runtime/tests.rs:3866:    // Root R: main task M is the `async/run` barrier caller.
+F23	crates/sema-vm/src/runtime/tests.rs:3896:            "async/run barrier hung on a ResourceSlot cycle (regression: ResourceSlot must be cycle-forming); events: {:?}",
 F08A	crates/sema-vm/src/runtime/wait.rs:481:    /// `block_on_inbox` exactly like a worker completion would.
 F08A	crates/sema-vm/src/runtime/wait.rs:567:    pub fn block_on_inbox(&mut self, deadline: Option<Instant>) -> bool {
 F08A	crates/sema-vm/src/runtime/wait.rs:577:                inbox.recv_timeout(timeout).ok()

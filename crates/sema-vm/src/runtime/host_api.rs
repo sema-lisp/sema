@@ -186,6 +186,20 @@ impl Runtime {
     /// `capture_output: true`. Empty when no such root exists (or none has
     /// printed since the last drain) — cheap to call speculatively every
     /// turn.
+    ///
+    /// Ordering: the returned `Vec` is in global execution order — the order
+    /// `write_stdout`/`write_stderr` calls actually landed across ALL
+    /// capturing roots on this thread, interleaved exactly as the scheduler
+    /// ran them — which also means each individual root's own events stay in
+    /// per-root FIFO order (a total order restricted to one root's events is
+    /// still that root's order). Draining is destructive: each call returns
+    /// only what accumulated since the previous drain (or since the root
+    /// started, for the first call), never a stale or repeated event.
+    /// Draining does NOT depend on the source root's lifecycle — output is
+    /// retained in the sink (and so still drainable) across the root
+    /// settling, being reaped, and even runtime `shutdown`; nothing about
+    /// reap/shutdown clears `output_sink` itself, only the per-root
+    /// `CAPTURING_ROOTS` marker that stops future writes from that root.
     pub fn take_captured_output(&self) -> Vec<OutputEvent> {
         let sink = self.state.borrow().output_sink.clone();
         let raw = std::mem::take(&mut *sink.borrow_mut());

@@ -60,8 +60,40 @@ thread_local! {
 
 /// Install (or replace) the shared buffer that captured output is appended
 /// to. Called once per `Runtime::new`.
+///
+/// Also resets `CAPTURING_ROOTS`/`CAPTURING_COUNT` to empty. Sema's core is
+/// single-threaded: at most one `Runtime` is ever live on a given OS thread
+/// at a time (a second `Runtime::new` on the same thread only happens after
+/// the first one has been dropped — `Runtime` is `!Send`/`!Sync` via its
+/// `Rc`-based state, so it can't migrate threads, and nothing else installs
+/// a sink). A `Runtime` that dies with capturing roots still marked (e.g. a
+/// host drops the `Interpreter` without driving its roots to settlement,
+/// which is the only way `unmark_root_capturing` is skipped — see
+/// `cleanup_one`) therefore never has a legitimate reason to keep those
+/// entries alive past its own death: no root id it minted can ever recur
+/// (`RootId` embeds the dead runtime's `RuntimeId`, so even a theoretical
+/// stale entry could never match a live root), and no future runtime on
+/// this thread has any relationship to those roots. Resetting here — the
+/// one place a fresh runtime's lifetime begins on this thread — is there-
+/// fore always correct, and is what keeps a long-lived host that creates
+/// many short-lived runtimes on one thread (tests, a REPL that restarts its
+/// interpreter, embedders) from permanently paying the `HashSet::contains`
+/// path on every `print` after the first abandoned capturing root.
 pub fn install_output_capture_sink(sink: Rc<RefCell<Vec<CapturedOutput>>>) {
     OUTPUT_CAPTURE_SINK.with(|cell| *cell.borrow_mut() = Some(sink));
+    CAPTURING_ROOTS.with(|set| set.borrow_mut().clear());
+    CAPTURING_COUNT.with(|c| c.set(0));
+}
+
+/// Test/introspection accessor for `CAPTURING_COUNT` — lets a white-box
+/// test (in another crate, so it can't reach the thread-local directly)
+/// assert the fast-path counter is clean after `install_output_capture_sink`
+/// resets it. Not `cfg(test)`: integration tests in downstream crates build
+/// this crate without the library's own `test` cfg, so a `cfg(test)`-gated
+/// item here would be invisible to them.
+#[doc(hidden)]
+pub fn capturing_root_count() -> usize {
+    CAPTURING_COUNT.with(Cell::get)
 }
 
 /// Mark `root` as capturing its output instead of inheriting process

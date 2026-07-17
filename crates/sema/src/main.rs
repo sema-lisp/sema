@@ -278,6 +278,15 @@ enum Commands {
         /// Force re-download of cached runtime binaries
         #[arg(long)]
         no_cache: bool,
+
+        /// Show per-step build detail and runtime cache/checksum info
+        #[arg(short, long)]
+        verbose: bool,
+
+        /// Print a machine-readable build manifest to stdout (paths, sizes,
+        /// sha256, per-target status)
+        #[arg(long)]
+        json: bool,
     },
     /// Format Sema source files
     Fmt {
@@ -826,6 +835,8 @@ fn main() {
                 target,
                 list_targets,
                 no_cache,
+                verbose,
+                json,
             } => {
                 if list_targets {
                     cross_compile::list_targets();
@@ -839,6 +850,7 @@ fn main() {
                     runtime.as_deref(),
                     target.as_deref(),
                     no_cache,
+                    BuildOutputOpts { verbose, json },
                 ) {
                     eprintln!("Error: {e}");
                     std::process::exit(1);
@@ -2153,107 +2165,141 @@ fn plan_all_target_outputs(
         .collect()
 }
 
-fn run_build(
-    file: &str,
-    output: Option<&str>,
-    includes: &[String],
-    runtime: Option<&str>,
-    target: Option<&str>,
-    no_cache: bool,
+/// Output-mode flags for `sema build`, threaded through the pipeline.
+#[derive(Clone, Copy, Default)]
+struct BuildOutputOpts {
+    verbose: bool,
+    json: bool,
+}
+
+/// The target-independent build product — one archive, embedded into every
+/// per-target executable.
+struct BuildArchive {
+    files_count: usize,
+    archive_bytes: Vec<u8>,
+}
+
+/// One successfully written artifact (native executable or web .vfs archive).
+struct BuiltArtifact {
+    /// Resolved target triple, or "web".
+    target: String,
+    /// Absolute output path.
+    path: std::path::PathBuf,
+    bytes: u64,
+    /// How the runtime was obtained: "host" | "cached" | "downloaded" | "custom",
+    /// or None for web (no runtime is embedded).
+    runtime: Option<&'static str>,
+    duration: std::time::Duration,
+}
+
+/// `29289346` → `27.9 MB` (base-1024, one decimal above bytes).
+fn human_size(bytes: u64) -> String {
+    const UNITS: [&str; 4] = ["B", "KB", "MB", "GB"];
+    let mut v = bytes as f64;
+    let mut u = 0;
+    while v >= 1024.0 && u < UNITS.len() - 1 {
+        v /= 1024.0;
+        u += 1;
+    }
+    if u == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{v:.1} {}", UNITS[u])
+    }
+}
+
+fn human_duration(d: std::time::Duration) -> String {
+    let secs = d.as_secs_f64();
+    if secs < 60.0 {
+        format!("{secs:.1}s")
+    } else {
+        format!("{}m {:02}s", d.as_secs() / 60, d.as_secs() % 60)
+    }
+}
+
+/// Split a target triple into user-facing (os, arch) — `aarch64-apple-darwin`
+/// → ("macos", "arm64"). Unknown triples fall back to the raw string.
+fn triple_os_arch(target: &str) -> (&'static str, String) {
+    if target == "web" {
+        return ("web", "-".to_string());
+    }
+    let arch = match target.split('-').next().unwrap_or(target) {
+        "aarch64" => "arm64".to_string(),
+        other => other.to_string(),
+    };
+    let os = if target.contains("apple-darwin") {
+        "macos"
+    } else if target.contains("linux") {
+        "linux"
+    } else if target.contains("windows") {
+        "windows"
+    } else {
+        "?"
+    };
+    (os, arch)
+}
+
+fn sha256_hex_of_file(path: &std::path::Path) -> Option<String> {
+    use sha2::Digest;
+    let data = std::fs::read(path).ok()?;
+    let hash = sha2::Sha256::digest(&data);
+    Some(hash.iter().map(|b| format!("{b:02x}")).collect())
+}
+
+/// Refuse to clobber the source file itself (`-o hello.sema` would otherwise
+/// silently replace the program with its own binary).
+fn check_output_not_source(
+    source: &std::path::Path,
+    output_path: &std::path::Path,
 ) -> Result<(), String> {
-    // Handle --target all (build for every supported target)
-    if target == Some("all") {
-        let mut failures = Vec::new();
-        for (t, target_output) in plan_all_target_outputs(output, std::path::Path::new(file)) {
-            eprintln!("\n━━━ Building for {t} ━━━");
-            if let Err(e) = run_build(
-                file,
-                Some(&target_output.to_string_lossy()),
-                includes,
-                None,
-                Some(t),
-                no_cache,
-            ) {
-                eprintln!("Error: {e}");
-                failures.push(t);
-            }
-        }
-        if !failures.is_empty() {
-            return Err(format!(
-                "failed to build for {} target(s): {}\n  Hint: re-run a single target for details: `sema build --target <target> {}`\n  Hint: use `--runtime /path/to/sema` if downloads fail, or install a released version of sema.",
-                failures.len(),
-                failures.join(", "),
-                file
-            ));
-        }
-        return Ok(());
+    let a = std::fs::canonicalize(source).unwrap_or_else(|_| source.to_path_buf());
+    let b = std::fs::canonicalize(output_path).unwrap_or_else(|_| output_path.to_path_buf());
+    if a == b {
+        return Err(format!(
+            "Output path would overwrite the source file '{}'.\n  Hint: use `-o <output>` to specify a different output path, or rename your source file to use a .sema extension.",
+            source.display()
+        ));
     }
+    Ok(())
+}
 
-    if target == Some("web") {
-        return run_build_web(file, output, includes);
-    }
-
+/// Steps 1–4: compile → trace imports → collect assets → serialize archive.
+/// Fully target-independent; `--target all` runs this ONCE. Prints the per-step
+/// detail only in verbose mode, plus a one-line completion note always (stderr).
+fn build_archive(
+    file: &str,
+    includes: &[String],
+    opts: BuildOutputOpts,
+) -> Result<BuildArchive, String> {
     let path = std::path::Path::new(file);
-
     let source = read_source_file(path)?;
 
-    // Pre-flight: resolve output path now so we can probe the parent directory
-    // for writability before running any compilation steps. This avoids the
-    // frustrating "failed at step 5 of 5" experience when the user gave an
-    // unwritable -o path.
-    let output_path = resolve_output_path(output, path, target);
-    // Refuse to clobber the source file itself (`-o hello.sema` would otherwise
-    // silently replace the program with its own binary).
-    if let (Ok(a), Ok(b)) = (path.canonicalize(), output_path.canonicalize()) {
-        if a == b {
-            return Err(format!(
-                "output path {} is the source file itself; pick a different -o",
-                output_path.display()
-            ));
-        }
+    if opts.verbose {
+        eprintln!("[1/4] Compiling {file}...");
     }
-    probe_output_writable(&output_path)?;
 
-    eprintln!("[1/5] Compiling {file}...");
-
-    // Compute source hash and compile to bytecode
     let source_hash = crc32fast::hash(source.as_bytes());
     let sandbox = sema_core::Sandbox::allow_all();
     let interpreter = build_interpreter(&sandbox);
 
-    let result = match interpreter.compile_to_bytecode(&source) {
-        Ok(r) => r,
-        Err(e) => {
-            return Err(format!("compile error: {}", e.inner()));
-        }
-    };
+    let result = interpreter
+        .compile_to_bytecode(&source)
+        .map_err(|e| format!("compile error: {}", e.inner()))?;
+    let bytecode = sema_vm::serialize_to_bytes(&result, source_hash)
+        .map_err(|e| format!("serialization error: {}", e.inner()))?;
 
-    let bytecode = match sema_vm::serialize_to_bytes(&result, source_hash) {
-        Ok(b) => b,
-        Err(e) => {
-            return Err(format!("serialization error: {}", e.inner()));
-        }
-    };
+    if opts.verbose {
+        eprintln!("[2/4] Tracing imports...");
+    }
+    let imports =
+        import_tracer::trace_imports(path).map_err(|e| format!("tracing imports: {e}"))?;
 
-    eprintln!("[2/5] Tracing imports...");
-
-    // Trace transitive imports
-    let imports = match import_tracer::trace_imports(path) {
-        Ok(m) => m,
-        Err(e) => {
-            return Err(format!("tracing imports: {e}"));
-        }
-    };
-
-    eprintln!("[3/5] Collecting assets...");
-
-    // Build VFS files map
+    if opts.verbose {
+        eprintln!("[3/4] Collecting assets...");
+    }
     let mut files = std::collections::HashMap::new();
-
-    // Entry point bytecode
     files.insert("__main__.semac".to_string(), bytecode);
 
-    // Traced imports
     for (rel_path, contents) in &imports {
         if let Err(e) = sema_core::vfs::validate_vfs_path(rel_path) {
             eprintln!("Warning: skipping import with invalid VFS path: {e}");
@@ -2262,7 +2308,6 @@ fn run_build(
         files.insert(rel_path.clone(), contents.clone());
     }
 
-    // Additional --include assets
     for include in includes {
         let inc_path = std::path::Path::new(include);
         if inc_path.is_dir() {
@@ -2295,9 +2340,9 @@ fn run_build(
         }
     }
 
-    eprintln!("[4/5] Building archive ({} files)...", files.len());
-
-    // Build metadata
+    if opts.verbose {
+        eprintln!("[4/4] Building archive ({} files)...", files.len());
+    }
     let mut metadata = std::collections::HashMap::new();
     metadata.insert(
         "sema-version".to_string(),
@@ -2319,25 +2364,38 @@ fn run_build(
     );
 
     let archive_bytes = archive::serialize_archive(&metadata, &files);
+    eprintln!(
+        "Compiled {file} → archive ({} file{}, {})",
+        files.len(),
+        if files.len() == 1 { "" } else { "s" },
+        human_size(archive_bytes.len() as u64)
+    );
 
-    eprintln!("[5/5] Writing executable...");
+    Ok(BuildArchive {
+        files_count: files.len(),
+        archive_bytes,
+    })
+}
 
-    // Check that output doesn't overwrite the source file
-    let input_canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-    let output_canonical =
-        std::fs::canonicalize(&output_path).unwrap_or_else(|_| output_path.clone());
-    if input_canonical == output_canonical {
-        return Err(format!(
-            "Output path would overwrite the source file '{}'.\n  Hint: use `-o <output>` to specify a different output path, or rename your source file to use a .sema extension.",
-            path.display()
-        ));
-    }
+/// Step 5: resolve the runtime for one target and write the executable.
+fn write_target_executable(
+    source: &std::path::Path,
+    archive: &BuildArchive,
+    output_path: &std::path::Path,
+    runtime: Option<&str>,
+    target: Option<&str>,
+    no_cache: bool,
+    opts: BuildOutputOpts,
+) -> Result<BuiltArtifact, String> {
+    let started = std::time::Instant::now();
+    check_output_not_source(source, output_path)?;
+    probe_output_writable(output_path)?;
 
-    // Resolve target triple for later use
     let resolved_target = target.and_then(|t| cross_compile::resolve_target(t).ok());
 
-    // Determine runtime binary
-    let runtime_path = if let Some(r) = runtime {
+    let (runtime_path, runtime_source): (std::path::PathBuf, &'static str) = if let Some(r) =
+        runtime
+    {
         // Validate runtime binary format against target if both are specified
         if let Some(resolved) = resolved_target {
             let runtime_bytes =
@@ -2352,60 +2410,277 @@ fn run_build(
                 }
             }
         }
-        std::path::PathBuf::from(r)
+        (std::path::PathBuf::from(r), "custom")
     } else if let Some(t) = target {
-        let resolved = match cross_compile::resolve_target(t) {
-            Ok(t) => t,
-            Err(e) => {
-                return Err(e.to_string());
-            }
-        };
+        let resolved = cross_compile::resolve_target(t).map_err(|e| e.to_string())?;
         if cross_compile::is_host_target(resolved) {
-            eprintln!("  Target {resolved} matches host — using local runtime (no download)");
-            match std::env::current_exe() {
-                Ok(p) => p,
-                Err(e) => {
-                    return Err(format!("cannot determine current executable path: {e}"));
-                }
+            if opts.verbose {
+                eprintln!("  Target {resolved} matches host — using local runtime (no download)");
             }
+            let exe = std::env::current_exe()
+                .map_err(|e| format!("cannot determine current executable path: {e}"))?;
+            (exe, "host")
         } else {
-            match cross_compile::ensure_runtime(resolved, no_cache) {
-                Ok(p) => p,
-                Err(e) => {
-                    return Err(e.to_string());
-                }
-            }
+            let (path, fetch) = cross_compile::ensure_runtime(resolved, no_cache, opts.verbose)
+                .map_err(|e| e.to_string())?;
+            let label = match fetch {
+                cross_compile::RuntimeFetch::Cached => "cached",
+                cross_compile::RuntimeFetch::Downloaded => "downloaded",
+            };
+            (path, label)
         }
     } else {
-        match std::env::current_exe() {
-            Ok(p) => p,
-            Err(e) => {
-                return Err(format!("cannot determine current executable path: {e}"));
-            }
-        }
+        let exe = std::env::current_exe()
+            .map_err(|e| format!("cannot determine current executable path: {e}"))?;
+        (exe, "host")
     };
 
-    if let Err(e) = write_executable_platform(&runtime_path, &output_path, &archive_bytes) {
-        return Err(format!("writing executable: {e}"));
+    write_executable_platform(&runtime_path, output_path, &archive.archive_bytes)
+        .map_err(|e| format!("writing executable: {e}"))?;
+
+    let bytes = std::fs::metadata(output_path).map(|m| m.len()).unwrap_or(0);
+    let abs = std::path::absolute(output_path).unwrap_or_else(|_| output_path.to_path_buf());
+    Ok(BuiltArtifact {
+        target: resolved_target
+            .unwrap_or_else(cross_compile::host_target)
+            .to_string(),
+        path: abs,
+        bytes,
+        runtime: Some(runtime_source),
+        duration: started.elapsed(),
+    })
+}
+
+/// Print the machine-readable manifest for any build (single, all, or web).
+fn print_build_json(
+    source: &str,
+    bundled_files: usize,
+    archive_bytes: usize,
+    artifacts: &[BuiltArtifact],
+    failures: &[(String, String)],
+    elapsed: std::time::Duration,
+) {
+    let mut targets: Vec<serde_json::Value> = Vec::new();
+    for a in artifacts {
+        let (os, arch) = triple_os_arch(&a.target);
+        targets.push(serde_json::json!({
+            "target": a.target,
+            "os": os,
+            "arch": arch,
+            "path": a.path,
+            "bytes": a.bytes,
+            "sha256": sha256_hex_of_file(&a.path),
+            "runtime": a.runtime,
+            "ok": true,
+            "error": null,
+        }));
     }
-
-    eprintln!(
-        "Built: {} ({} bytes, {} bundled files)",
-        output_path.display(),
-        std::fs::metadata(&output_path)
-            .map(|m| m.len())
-            .unwrap_or(0),
-        files.len()
+    for (t, e) in failures {
+        let (os, arch) = triple_os_arch(t);
+        targets.push(serde_json::json!({
+            "target": t,
+            "os": os,
+            "arch": arch,
+            "path": null,
+            "bytes": null,
+            "sha256": null,
+            "runtime": null,
+            "ok": false,
+            "error": e,
+        }));
+    }
+    let manifest = serde_json::json!({
+        "source": std::path::absolute(source).unwrap_or_else(|_| source.into()),
+        "bundled_files": bundled_files,
+        "archive_bytes": archive_bytes,
+        "duration_ms": elapsed.as_millis() as u64,
+        "targets": targets,
+    });
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&manifest).unwrap_or_else(|_| "{}".to_string())
     );
+}
 
-    if let Some(resolved) = resolved_target {
-        if !cross_compile::is_host_target(resolved) {
-            eprintln!(
-                "  Note: this binary targets {resolved} and won't run on your current machine."
-            );
+/// Render the aligned human summary table for `--target all`.
+fn render_build_summary(
+    artifacts: &[BuiltArtifact],
+    failures: &[(String, String)],
+    elapsed: std::time::Duration,
+) -> String {
+    use std::fmt::Write;
+    let mut out = String::new();
+    let total = artifacts.len() + failures.len();
+    let _ = writeln!(
+        out,
+        "Built {}/{} target{} in {}:",
+        artifacts.len(),
+        total,
+        if total == 1 { "" } else { "s" },
+        human_duration(elapsed)
+    );
+    let _ = writeln!(out);
+    // rows: (os, arch, size-or-FAILED, path-or-error)
+    let mut rows: Vec<(String, String, String, String)> = Vec::new();
+    for a in artifacts {
+        let (os, arch) = triple_os_arch(&a.target);
+        rows.push((
+            os.to_string(),
+            arch,
+            human_size(a.bytes),
+            a.path.display().to_string(),
+        ));
+    }
+    for (t, e) in failures {
+        let (os, arch) = triple_os_arch(t);
+        let first = e.lines().next().unwrap_or("build failed").to_string();
+        rows.push((os.to_string(), arch, "FAILED".to_string(), first));
+    }
+    let w_os = rows.iter().map(|r| r.0.len()).max().unwrap_or(0);
+    let w_arch = rows.iter().map(|r| r.1.len()).max().unwrap_or(0);
+    let w_size = rows.iter().map(|r| r.2.len()).max().unwrap_or(0);
+    for (os, arch, size, path) in rows {
+        let _ = writeln!(
+            out,
+            "  {os:<w_os$}  {arch:<w_arch$}  {size:>w_size$}   {path}"
+        );
+    }
+    out
+}
+
+/// Build every supported native target from one shared archive.
+fn run_build_all(
+    file: &str,
+    output: Option<&str>,
+    includes: &[String],
+    runtime: Option<&str>,
+    no_cache: bool,
+    opts: BuildOutputOpts,
+) -> Result<(), String> {
+    let started = std::time::Instant::now();
+    if runtime.is_some() {
+        // clap's conflicts_with should prevent this; belt and braces.
+        return Err("--runtime cannot be combined with --target all".to_string());
+    }
+    let source = std::path::Path::new(file);
+    let archive = build_archive(file, includes, opts)?;
+    let plans = plan_all_target_outputs(output, source);
+    let name_w = plans.iter().map(|(t, _)| t.len()).max().unwrap_or(0);
+
+    let mut artifacts: Vec<BuiltArtifact> = Vec::new();
+    let mut failures: Vec<(String, String)> = Vec::new();
+    for (t, target_output) in &plans {
+        match write_target_executable(
+            source,
+            &archive,
+            target_output,
+            None,
+            Some(t),
+            no_cache,
+            opts,
+        ) {
+            Ok(a) => {
+                eprintln!(
+                    "  {t:<name_w$}  ✓ {:>6}  ({} runtime)",
+                    human_duration(a.duration),
+                    a.runtime.unwrap_or("host"),
+                );
+                artifacts.push(a);
+            }
+            Err(e) => {
+                let first = e.lines().next().unwrap_or("build failed");
+                eprintln!("  {t:<name_w$}  ✗ {first}");
+                failures.push((t.to_string(), e));
+            }
         }
     }
 
+    eprintln!();
+    if opts.json {
+        print_build_json(
+            file,
+            archive.files_count,
+            archive.archive_bytes.len(),
+            &artifacts,
+            &failures,
+            started.elapsed(),
+        );
+    } else {
+        print!(
+            "{}",
+            render_build_summary(&artifacts, &failures, started.elapsed())
+        );
+    }
+
+    if !failures.is_empty() {
+        let failed: Vec<&str> = failures.iter().map(|(t, _)| t.as_str()).collect();
+        return Err(format!(
+            "failed to build for {} target(s): {}\n  Hint: re-run a single target for details: `sema build --target <target> {}`\n  Hint: use `--runtime /path/to/sema` if downloads fail, or install a released version of sema.",
+            failed.len(),
+            failed.join(", "),
+            file
+        ));
+    }
+    Ok(())
+}
+
+fn run_build(
+    file: &str,
+    output: Option<&str>,
+    includes: &[String],
+    runtime: Option<&str>,
+    target: Option<&str>,
+    no_cache: bool,
+    opts: BuildOutputOpts,
+) -> Result<(), String> {
+    if target == Some("all") {
+        return run_build_all(file, output, includes, runtime, no_cache, opts);
+    }
+    if target == Some("web") {
+        return run_build_web(file, output, includes, opts);
+    }
+
+    let started = std::time::Instant::now();
+    let path = std::path::Path::new(file);
+
+    // Pre-flight before any compilation: resolve the output path, refuse to
+    // clobber the source, and probe the parent for writability (creating missing
+    // directories). Avoids "failed at the last step" after a full compile.
+    let output_path = resolve_output_path(output, path, target);
+    check_output_not_source(path, &output_path)?;
+    probe_output_writable(&output_path)?;
+
+    let archive = build_archive(file, includes, opts)?;
+    let artifact = write_target_executable(
+        path,
+        &archive,
+        &output_path,
+        runtime,
+        target,
+        no_cache,
+        opts,
+    )?;
+
+    if opts.json {
+        print_build_json(
+            file,
+            archive.files_count,
+            archive.archive_bytes.len(),
+            std::slice::from_ref(&artifact),
+            &[],
+            started.elapsed(),
+        );
+    } else {
+        println!(
+            "Built {} ({}, {} bundled file{}) for {} in {}",
+            artifact.path.display(),
+            human_size(artifact.bytes),
+            archive.files_count,
+            if archive.files_count == 1 { "" } else { "s" },
+            artifact.target,
+            human_duration(started.elapsed())
+        );
+    }
     Ok(())
 }
 
@@ -2544,14 +2819,25 @@ pub(crate) fn build_web_archive(
     Ok((archive::serialize_archive(&metadata, &files), import_count))
 }
 
-fn run_build_web(file: &str, output: Option<&str>, includes: &[String]) -> Result<(), String> {
+fn run_build_web(
+    file: &str,
+    output: Option<&str>,
+    includes: &[String],
+    opts: BuildOutputOpts,
+) -> Result<(), String> {
+    let started = std::time::Instant::now();
     let path = std::path::Path::new(file);
     if !path.exists() {
         return Err(format!("source file not found: {file}"));
     }
 
-    eprintln!("Compiling {file} for web...");
     let (archive_bytes, import_count) = build_web_archive(path, includes)?;
+    eprintln!(
+        "Compiled {file} → web archive ({} import{} bundled, {})",
+        import_count,
+        if import_count == 1 { "" } else { "s" },
+        human_size(archive_bytes.len() as u64)
+    );
 
     let output_path = web_output_path(path, output);
     if let Some(parent) = output_path.parent() {
@@ -2563,16 +2849,37 @@ fn run_build_web(file: &str, output: Option<&str>, includes: &[String]) -> Resul
     std::fs::write(&output_path, &archive_bytes)
         .map_err(|e| format!("writing {}: {e}", output_path.display()))?;
 
-    eprintln!(
-        "Built web archive: {} ({} bytes, {} imports bundled)",
-        output_path.display(),
-        archive_bytes.len(),
-        import_count
-    );
-    eprintln!(
-        "  Load with <script type=\"text/sema\" src=\"{}\"></script>",
-        output_path.display()
-    );
+    let abs = std::path::absolute(&output_path).unwrap_or_else(|_| output_path.clone());
+    if opts.json {
+        let artifact = BuiltArtifact {
+            target: "web".to_string(),
+            path: abs,
+            bytes: archive_bytes.len() as u64,
+            runtime: None,
+            duration: started.elapsed(),
+        };
+        print_build_json(
+            file,
+            import_count,
+            archive_bytes.len(),
+            std::slice::from_ref(&artifact),
+            &[],
+            started.elapsed(),
+        );
+    } else {
+        println!(
+            "Built {} ({}, {} import{} bundled) for web in {}",
+            abs.display(),
+            human_size(archive_bytes.len() as u64),
+            import_count,
+            if import_count == 1 { "" } else { "s" },
+            human_duration(started.elapsed())
+        );
+        eprintln!(
+            "  Load with <script type=\"text/sema\" src=\"{}\"></script>",
+            output_path.display()
+        );
+    }
 
     Ok(())
 }
@@ -3957,6 +4264,68 @@ fn install_completions(shell: Shell) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn build_summary_helpers() {
+        assert_eq!(
+            triple_os_arch("aarch64-apple-darwin"),
+            ("macos", "arm64".into())
+        );
+        assert_eq!(
+            triple_os_arch("x86_64-unknown-linux-gnu"),
+            ("linux", "x86_64".into())
+        );
+        assert_eq!(
+            triple_os_arch("x86_64-pc-windows-msvc"),
+            ("windows", "x86_64".into())
+        );
+        assert_eq!(triple_os_arch("web"), ("web", "-".into()));
+
+        assert_eq!(human_size(512), "512 B");
+        assert_eq!(human_size(12_700), "12.4 KB");
+        assert_eq!(human_size(29_289_346), "27.9 MB");
+        assert_eq!(human_size(2_147_483_648), "2.0 GB");
+
+        assert_eq!(
+            human_duration(std::time::Duration::from_millis(640)),
+            "0.6s"
+        );
+        assert_eq!(human_duration(std::time::Duration::from_secs(92)), "1m 32s");
+    }
+
+    #[test]
+    fn build_summary_table_aligns_and_reports_failures() {
+        let artifacts = vec![
+            BuiltArtifact {
+                target: "aarch64-apple-darwin".into(),
+                path: "/x/game-aarch64-apple-darwin".into(),
+                bytes: 29_289_346,
+                runtime: Some("host"),
+                duration: std::time::Duration::from_secs(1),
+            },
+            BuiltArtifact {
+                target: "x86_64-unknown-linux-gnu".into(),
+                path: "/x/game-x86_64-unknown-linux-gnu".into(),
+                bytes: 32_462_497,
+                runtime: Some("downloaded"),
+                duration: std::time::Duration::from_secs(3),
+            },
+        ];
+        let failures = vec![(
+            "x86_64-pc-windows-msvc".to_string(),
+            "download failed: 404".to_string(),
+        )];
+        let table = render_build_summary(&artifacts, &failures, std::time::Duration::from_secs(14));
+        assert!(table.starts_with("Built 2/3 targets in 14.0s:"), "{table}");
+        // every data row aligns: the path column starts at the same byte offset
+        let rows: Vec<&str> = table.lines().skip(2).collect();
+        assert_eq!(rows.len(), 3);
+        let col = rows[0].find("/x/").unwrap();
+        assert_eq!(rows[1].find("/x/"), Some(col), "{table}");
+        assert!(rows[2].contains("FAILED"));
+        assert!(rows[2].contains("download failed: 404"));
+        assert!(!table.contains("won't run"));
+    }
 
     #[test]
     fn build_output_default_name_adds_exe_for_windows_targets() {

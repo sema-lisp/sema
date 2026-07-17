@@ -12890,6 +12890,137 @@ fn build_test_dir(name: &str) -> std::path::PathBuf {
 }
 
 #[test]
+fn test_sema_build_default_output_is_compact() {
+    // Default mode: one "Built …" line on STDOUT (human size + target triple);
+    // stderr carries the compile note but no step spam and no "won't run" note.
+    let dir = build_test_dir("compact");
+    std::fs::write(dir.join("hello.sema"), r#"(println "hi")"#).unwrap();
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_sema"))
+        .args([
+            "build",
+            dir.join("hello.sema").to_str().unwrap(),
+            "-o",
+            dir.join("hello").to_str().unwrap(),
+        ])
+        .output()
+        .expect("failed to run sema build");
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stdout.starts_with("Built "), "stdout: {stdout}");
+    assert!(stdout.contains(" bundled file) for "), "stdout: {stdout}");
+    assert!(
+        stdout.contains("MB") || stdout.contains("KB") || stdout.contains("GB"),
+        "human size expected: {stdout}"
+    );
+    assert!(!stderr.contains("[1/"), "no step spam by default: {stderr}");
+    assert!(!stderr.contains("won't run"), "note removed: {stderr}");
+    assert!(
+        stderr.contains("Compiled "),
+        "compile note on stderr: {stderr}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_sema_build_verbose_shows_steps() {
+    let dir = build_test_dir("verbose");
+    std::fs::write(dir.join("hello.sema"), r#"(println "hi")"#).unwrap();
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_sema"))
+        .args([
+            "build",
+            dir.join("hello.sema").to_str().unwrap(),
+            "-o",
+            dir.join("hello").to_str().unwrap(),
+            "--verbose",
+        ])
+        .output()
+        .expect("failed to run sema build");
+    assert!(output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    for step in ["[1/4]", "[2/4]", "[3/4]", "[4/4]"] {
+        assert!(stderr.contains(step), "missing {step}: {stderr}");
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_sema_build_json_manifest() {
+    let dir = build_test_dir("json");
+    std::fs::write(dir.join("hello.sema"), r#"(println "hi")"#).unwrap();
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_sema"))
+        .args([
+            "build",
+            dir.join("hello.sema").to_str().unwrap(),
+            "-o",
+            dir.join("hello").to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .expect("failed to run sema build");
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let manifest: serde_json::Value = serde_json::from_str(&stdout).expect("stdout is pure JSON");
+    assert_eq!(manifest["bundled_files"], 1);
+    let t = &manifest["targets"][0];
+    assert_eq!(t["ok"], true);
+    assert_eq!(t["runtime"], "host");
+    let built = std::path::PathBuf::from(t["path"].as_str().unwrap());
+    assert!(built.exists());
+    // sha256 in the manifest matches the file on disk
+    let data = std::fs::read(&built).unwrap();
+    let expected: String = {
+        use sha2::Digest;
+        sha2::Sha256::digest(&data)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect()
+    };
+    assert_eq!(t["sha256"].as_str().unwrap(), expected);
+    assert_eq!(t["bytes"].as_u64().unwrap(), data.len() as u64);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_sema_build_web_json_manifest() {
+    let dir = build_test_dir("webjson");
+    std::fs::write(dir.join("hello.sema"), r#"(println "hi")"#).unwrap();
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_sema"))
+        .args([
+            "build",
+            dir.join("hello.sema").to_str().unwrap(),
+            "--target",
+            "web",
+            "-o",
+            dir.join("out").join("hello").to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .expect("failed to run sema build");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let manifest: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&output.stdout)).expect("pure JSON");
+    let t = &manifest["targets"][0];
+    assert_eq!(t["target"], "web");
+    assert_eq!(t["ok"], true);
+    assert!(t["runtime"].is_null());
+    assert!(std::path::Path::new(t["path"].as_str().unwrap()).exists());
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn test_sema_build_output_into_existing_directory() {
     // `-o <dir>` must mean "default filename inside <dir>", not File::create(dir).
     let dir = build_test_dir("outdir");
@@ -15288,14 +15419,18 @@ fn test_u3_build_preflight_permission_denied() {
         "expected non-zero exit when output dir is unwritable"
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
+    // Missing parents are now created (mkdir -p); the pre-flight error is either
+    // the create failure (read-only root) or a probe permission failure.
     assert!(
-        stderr.contains("output directory does not exist") || stderr.contains("permission denied"),
+        stderr.contains("cannot create output directory")
+            || stderr.contains("permission denied")
+            || stderr.contains("not writable"),
         "expected pre-flight write error, got: {stderr}"
     );
-    // Pre-flight must happen before any compile step, so we shouldn't see "[5/5]".
+    // Pre-flight must fire before any compilation happens.
     assert!(
-        !stderr.contains("[5/5]"),
-        "expected pre-flight to fire before step 5, got: {stderr}"
+        !stderr.contains("Compiled ") && !stderr.contains("[1/"),
+        "expected pre-flight to fire before compiling, got: {stderr}"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }

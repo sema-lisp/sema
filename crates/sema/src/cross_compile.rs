@@ -151,7 +151,18 @@ fn validate_cached_runtime(cache_path: &Path, target: &str) -> bool {
 ///
 /// Returns the path to the cached binary. Downloads from GitHub Releases
 /// if not already cached.
-pub fn ensure_runtime(target: &str, no_cache: bool) -> Result<PathBuf, Box<dyn std::error::Error>> {
+/// How `ensure_runtime` satisfied the request — feeds the build summary.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RuntimeFetch {
+    Cached,
+    Downloaded,
+}
+
+pub fn ensure_runtime(
+    target: &str,
+    no_cache: bool,
+    verbose: bool,
+) -> Result<(PathBuf, RuntimeFetch), Box<dyn std::error::Error>> {
     // Defense-in-depth: reject targets not in our allow-list
     if !SUPPORTED_TARGETS.contains(&target) {
         return Err(format!("unsupported target: {target}").into());
@@ -161,8 +172,10 @@ pub fn ensure_runtime(target: &str, no_cache: bool) -> Result<PathBuf, Box<dyn s
     let cache_path = runtime_cache_path(version, target);
 
     if !no_cache && validate_cached_runtime(&cache_path, target) {
-        eprintln!("  Using cached runtime for {target}");
-        return Ok(cache_path);
+        if verbose {
+            eprintln!("  Using cached runtime for {target}");
+        }
+        return Ok((cache_path, RuntimeFetch::Cached));
     }
 
     // Invalid or missing cache — remove stale file if present
@@ -171,8 +184,8 @@ pub fn ensure_runtime(target: &str, no_cache: bool) -> Result<PathBuf, Box<dyn s
     }
 
     eprintln!("  Downloading runtime for {target}...");
-    download_runtime(version, target, &cache_path)?;
-    Ok(cache_path)
+    download_runtime(version, target, &cache_path, verbose)?;
+    Ok((cache_path, RuntimeFetch::Downloaded))
 }
 
 /// Build a reqwest client with timeouts and a user-agent.
@@ -194,6 +207,7 @@ fn download_runtime(
     version: &str,
     target: &str,
     cache_path: &Path,
+    verbose: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let is_windows = is_windows_target(target);
     let ext = if is_windows { "zip" } else { "tar.xz" };
@@ -305,6 +319,25 @@ fn download_runtime(
                 );
             }
         }
+        // Live progress bar only when a human is watching and the size is known;
+        // piped/CI output keeps the single "Downloading..." line, no bar frames.
+        let progress = {
+            use std::io::IsTerminal;
+            match response.content_length() {
+                Some(total) if total > 0 && std::io::stderr().is_terminal() => {
+                    let bar = indicatif::ProgressBar::new(total);
+                    bar.set_style(
+                        indicatif::ProgressStyle::with_template(
+                            "  [{bar:30}] {bytes}/{total_bytes} ({eta})",
+                        )
+                        .unwrap_or_else(|_| indicatif::ProgressStyle::default_bar())
+                        .progress_chars("=>-"),
+                    );
+                    Some(bar)
+                }
+                _ => None,
+            }
+        };
         let mut response = response;
         let mut archive_file = std::fs::File::create(&archive_tmp)?;
         let mut buf = [0u8; 65536];
@@ -315,6 +348,12 @@ fn download_runtime(
             }
             hasher.update(&buf[..n]);
             archive_file.write_all(&buf[..n])?;
+            if let Some(bar) = &progress {
+                bar.inc(n as u64);
+            }
+        }
+        if let Some(bar) = &progress {
+            bar.finish_and_clear();
         }
         archive_file.flush()?;
         Ok(())
@@ -335,7 +374,9 @@ fn download_runtime(
         .into());
     }
 
-    eprintln!("  Checksum verified ✓");
+    if verbose {
+        eprintln!("  Checksum verified ✓");
+    }
 
     // Read verified archive and extract the binary
     let archive_bytes = std::fs::read(&archive_tmp)?;
@@ -359,7 +400,9 @@ fn download_runtime(
         return Err(format!("failed to finalize cached runtime: {e}").into());
     }
 
-    eprintln!("  Cached at {}", cache_path.display());
+    if verbose {
+        eprintln!("  Cached at {}", cache_path.display());
+    }
     Ok(())
 }
 
@@ -675,7 +718,7 @@ mod tests {
 
     #[test]
     fn test_ensure_runtime_rejects_unsupported_target() {
-        let result = ensure_runtime("totally-fake-target", false);
+        let result = ensure_runtime("totally-fake-target", false, false);
         assert!(result.is_err());
         assert!(
             result.unwrap_err().to_string().contains("unsupported"),
@@ -685,7 +728,7 @@ mod tests {
 
     #[test]
     fn test_ensure_runtime_rejects_path_traversal() {
-        let result = ensure_runtime("../../../etc/passwd", false);
+        let result = ensure_runtime("../../../etc/passwd", false, false);
         assert!(result.is_err());
     }
 

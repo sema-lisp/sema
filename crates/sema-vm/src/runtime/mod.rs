@@ -1,6 +1,7 @@
 mod channel;
 mod drive;
 mod host;
+mod host_api;
 mod promise;
 mod ready;
 mod resource_gate;
@@ -12,14 +13,14 @@ mod wait;
 
 pub use drive::{BoundedDriver, DriveBudget, DriveReport, DriveState, RuntimeClock};
 pub use host::{MonotonicClock, NullExecutor, ThreadPoolExecutor};
+pub use host_api::{
+    RootHandle, RootPoll, ShutdownInvariantFailure, ShutdownOptions, ShutdownReport,
+};
 pub use ready::ReadyScheduler;
 pub use root::{RootRecord, RootState, RootTransitionError};
 #[cfg(test)]
 use state::TestPreparedTask;
-pub use state::{
-    RootHandle, RootPoll, Runtime, RuntimeFault, ShutdownInvariantFailure, ShutdownOptions,
-    ShutdownReport, SubmitRootError,
-};
+pub use state::{Runtime, RuntimeFault, SubmitRootError};
 pub use task::{
     CancellationRequest, ContinuationFrame, StateName, TaskRecord, TaskState, TaskTransitionError,
     WaitKey,

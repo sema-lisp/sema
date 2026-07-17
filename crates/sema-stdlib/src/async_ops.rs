@@ -595,6 +595,13 @@ fn register_promise_ops(env: &Env) {
     // parked frame with nil when it fires. Outside the runtime — a bare top-level
     // eval or the legacy scheduler — the legacy value ABI runs: it sleeps
     // synchronously, or yields the `Sleep` signal to the legacy scheduler.
+    //
+    // This suspend is unconditional (no promise-driven check): unlike the wasm
+    // http natives, the SAME structural timer wait is correct on every
+    // caller/target — the difference between "old" and "new" wasm entry
+    // points is entirely in how the DRIVE LOOP waits out an `Idle` turn with
+    // only a timer pending, which is fixed at the loop (`drive_handle_to_settlement`
+    // in `sema-eval`), not here. See that function's wasm32 branch.
     env.set(
         sema_core::intern("async/sleep"),
         Value::native_fn(NativeFn::simple_with_runtime(

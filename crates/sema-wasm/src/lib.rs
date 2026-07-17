@@ -1,5 +1,6 @@
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
+use std::rc::Rc;
 
 use js_sys::Date;
 use sema_core::{pretty_print, Env, NativeFn, SemaError, Value, ValueView};
@@ -171,13 +172,32 @@ fn normalize_path(path: &str) -> Result<String, SemaError> {
 /// root has no other way to reach the JS side, since it never runs
 /// `take_output`/`OUTPUT`/`LINE_BUF` below (those are drained by the OLD
 /// entry points' own `eval`/`evalAsync`/… methods, not by `evalPromise`).
+///
+/// A promise-driven root's own output therefore has no business in
+/// `LINE_BUF`/`OUTPUT` at all: nothing ever drains those for it (only the OLD
+/// entry points' `take_output()` does, and `evalPromise` never calls that),
+/// so appending there would grow unboundedly for a long-running/looping
+/// promise-driven program. Skip the legacy accumulation while a promise-
+/// driven turn is active; `write_stdout` below is this root's only real sink.
 fn append_output(s: &str) {
-    LINE_BUF.with(|b| b.borrow_mut().push_str(s));
+    if !sema_core::promise_driven_quantum_active() {
+        LINE_BUF.with(|b| b.borrow_mut().push_str(s));
+    }
     sema_core::write_stdout(s);
 }
 
 /// Flush the current line buffer as a completed line.
+///
+/// A no-op while a promise-driven turn is active — `LINE_BUF` is never
+/// populated for such a root either (see `append_output`), and `OUTPUT`/
+/// `OUTPUT_SINK` are exclusively the OLD entry points' output channel; a
+/// promise-driven root's output goes out through `output.rs`'s own sink.
+/// Without this, every `println` from a long-running/looping promise-driven
+/// program would still push an (empty) line into `OUTPUT` forever.
 fn flush_line() {
+    if sema_core::promise_driven_quantum_active() {
+        return;
+    }
     let line = LINE_BUF.with(|b| {
         let line = b.borrow().clone();
         b.borrow_mut().clear();
@@ -611,20 +631,26 @@ fn register_wasm_io(env: &Env) {
     };
 
     // Dual-ABI registration for the http natives below: `f` is the existing
-    // marker-throw legacy closure (unchanged, still what every pre-existing
-    // eval entry point gets — none of them run a native from inside a
-    // `Runtime::drive` quantum), and `method` selects the NEW runtime-ABI
-    // closure (`driver::runtime_http_fn`) that activates ONLY when this
-    // native is invoked from under the runtime quantum (i.e. only reachable
-    // via `evalPromise`), where it suspends on a real `WaitKind::External`
-    // fetch instead of throwing a marker. See P6-3 step 2.
+    // marker-throw legacy closure (unchanged — still exactly what every
+    // pre-existing eval entry point gets), and `method` selects the NEW
+    // runtime-ABI closure (`driver::runtime_http_fn`). That closure activates
+    // its `WaitKind::External` suspend ONLY when
+    // `sema_core::promise_driven_quantum_active()` is true (set only by
+    // `driver.rs`'s own drive turn, i.e. only reachable via `evalPromise`) —
+    // NOT merely "under a runtime quantum", which is true for every
+    // pre-existing entry point too and would (did, before this discriminator
+    // existed) hijack them into a suspend they can never resolve. Outside a
+    // promise-driven turn `runtime_http_fn` calls this same `f`, so old
+    // entry points are unaffected. See P6-3 step 2 + the driver.rs fix.
     let register_http = |name: &str, method: &'static str, f: WasmNativeFn| {
+        let f: driver::LegacyHttpFn = Rc::from(f);
+        let legacy = Rc::clone(&f);
         env.set(
             sema_core::intern(name),
             Value::native_fn(NativeFn::simple_with_runtime(
                 name,
-                move |args| f(args),
-                driver::runtime_http_fn(method),
+                move |args| (f)(args),
+                driver::runtime_http_fn(method, legacy),
             )),
         );
     };

@@ -22,11 +22,19 @@
 //!   the FIRST wasm entry point that can correctly run `async/sleep` or a
 //!   real `http/get` at all — not just a Promise-flavored return type.
 //!
-//! Old paths are untouched: they never call anything in this module, and
-//! nothing here is reachable except through `evalPromise` (plus the
-//! `WaitKind::External` runtime-ABI http natives below, which only activate
-//! when a native is invoked FROM UNDER the runtime quantum — see
-//! `NativeFn::simple_with_runtime` in `register_wasm_io`'s http registration).
+//! Old paths are untouched: they never call anything in this module directly.
+//! But they DO share the same `Runtime::drive`, so `runtime_quantum_active()`/
+//! `in_runtime_quantum()` is true for old and new paths alike — that flag
+//! CANNOT be used to gate the dual-ABI http natives below, because it would
+//! (and, before this module added [`PromiseDrivenGuard`], did)
+//! hijack an old entry point's http call into a structural `External` suspend
+//! it can never resolve (the old path's only recovery, `block_on_inbox`,
+//! cannot work on wasm32 — see above). The dual-ABI http natives (and, on
+//! wasm32, `async/sleep`) instead gate on
+//! [`sema_core::promise_driven_quantum_active`], which THIS module sets true
+//! only for the duration of its own `drive_turn` call — the only caller that
+//! actually pumps the runtime non-blockingly across turns and can resolve a
+//! structural suspend.
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -78,6 +86,31 @@ thread_local! {
     /// callback, which runs detached from any JS call stack (so it cannot
     /// simply borrow `self` from a `WasmInterpreter` method).
     static DRIVE_INTERPRETER: RefCell<Option<Rc<Interpreter>>> = const { RefCell::new(None) };
+}
+
+/// RAII guard marking the calling stack as inside THIS module's own
+/// `drive_turn` call — the ONLY caller that pumps the runtime
+/// non-blockingly across macrotasks and can therefore resolve a structural
+/// `WaitKind::External`/`WaitKind::Timer` suspend from a dual-ABI wasm
+/// native. Sets [`sema_core::promise_driven_quantum_active`] true for the
+/// guard's lifetime and restores the PREVIOUS value on drop (including on
+/// unwind, via `Drop`) rather than unconditionally clearing it, so a nested
+/// re-entry — should one ever occur — can't stomp an outer guard's flag.
+struct PromiseDrivenGuard {
+    previous: bool,
+}
+
+impl PromiseDrivenGuard {
+    fn enter() -> Self {
+        let previous = sema_core::set_promise_driven_quantum(true);
+        Self { previous }
+    }
+}
+
+impl Drop for PromiseDrivenGuard {
+    fn drop(&mut self) {
+        sema_core::set_promise_driven_quantum(self.previous);
+    }
 }
 
 /// Submit `src` as a fresh root on `interp`'s persistent runtime with
@@ -190,16 +223,24 @@ fn drive_and_settle() {
         return;
     };
 
-    let next_deadline = match interp.drive_turn() {
-        Ok(DriveState::Idle {
-            next_deadline,
-            inbox_wakeup_required: _,
-        }) => next_deadline,
-        Ok(_) => None, // Progress / Quiescent / ShutdownComplete / DebugStopped
-        Err(fault) => {
-            pump_output(&interp);
-            fail_all_pending(&format!("runtime fault: {fault:?}"));
-            return;
+    let drive_state = {
+        // Only this call is "promise-driven": the dual-ABI natives (wasm
+        // http, and `async/sleep` on wasm32) consult
+        // `sema_core::promise_driven_quantum_active()` to suspend
+        // structurally instead of running their legacy synchronous/marker-
+        // throw fallback. The guard is scoped tightly to this one
+        // `drive_turn` call and restores the previous value on drop
+        // (including on unwind), so it can never leak into an unrelated old
+        // `eval`/`evalAsync` call made from a JS callback re-entering the
+        // interpreter.
+        let _guard = PromiseDrivenGuard::enter();
+        match interp.drive_turn() {
+            Ok(state) => state,
+            Err(fault) => {
+                pump_output(&interp);
+                fail_all_pending(&format!("runtime fault: {fault:?}"));
+                return;
+            }
         }
     };
 
@@ -210,8 +251,14 @@ fn drive_and_settle() {
     if !pending {
         return; // idle with nothing left to settle — stop scheduling, no busy loop
     }
-    match next_deadline {
-        Some(deadline) => {
+    match drive_state {
+        // More ready work (or a debug stop the host will resume out-of-band):
+        // schedule the next turn immediately.
+        DriveState::Progress { .. } | DriveState::DebugStopped { .. } => schedule_drive(),
+        DriveState::Idle {
+            next_deadline: Some(deadline),
+            ..
+        } => {
             let now = Instant::now();
             let delay_ms = deadline
                 .checked_duration_since(now)
@@ -219,17 +266,32 @@ fn drive_and_settle() {
                 .unwrap_or(0);
             schedule_drive_after(delay_ms);
         }
-        // Either more work is ready right now, or we are only waiting on an
-        // external completion (http) — in that case `WasmExecutor` calls
-        // `schedule_drive` itself when the completion lands, so no
-        // unconditional reschedule here would just busy-loop for nothing.
-        // `Progress`/ready-remaining is the one case that DOES need an
-        // immediate reschedule; distinguishing them isn't observable from
-        // `DriveState` alone once idle, so re-check via another drive_turn
-        // next macrotask is the conservative, still-non-busy choice: a
-        // genuinely idle-on-external-completion turn returns `Idle` again
-        // immediately and stops (see below) rather than spin.
-        None => schedule_drive(),
+        // Idle with no timer deadline but an external wait (http fetch, …)
+        // still outstanding: do NOT reschedule here. `WasmExecutor::submit`
+        // calls `schedule_drive()` itself the instant the completion lands
+        // (see its `spawn_local` body below) — that IS the wake. Rescheduling
+        // unconditionally here (the P6-3 step 2 bug) would instead spin an
+        // unbounded stream of no-op macrotask turns until the fetch resolves,
+        // for no benefit (nothing here can make earlier progress than the
+        // completion callback already guarantees).
+        DriveState::Idle {
+            next_deadline: None,
+            inbox_wakeup_required: true,
+        } => {}
+        // Fully idle: no timer, no external wait, yet a promise is still
+        // unsettled — an intra-runtime deadlock (e.g. a channel op with no
+        // possible sender) the runtime cannot resolve on its own and nothing
+        // will ever wake another turn. Reject rather than hang the returned
+        // `Promise` forever.
+        DriveState::Idle {
+            next_deadline: None,
+            inbox_wakeup_required: false,
+        } => {
+            fail_all_pending(
+                "runtime deadlocked: no pending timer or external wait, but a root has not settled",
+            );
+        }
+        DriveState::Quiescent | DriveState::ShutdownComplete => {}
     }
 }
 
@@ -396,19 +458,40 @@ struct RawHttpResponse {
     body: String,
 }
 
+/// The legacy (marker-throw) value-ABI closure a dual-ABI wasm http native
+/// falls back to outside a promise-driven turn. Named to keep
+/// `runtime_http_fn`'s signature (and `lib.rs`'s call site) under clippy's
+/// `type_complexity` threshold.
+pub(crate) type LegacyHttpFn = Rc<dyn Fn(&[Value]) -> Result<Value, SemaError>>;
+
 /// Register the runtime ABI onto an existing wasm http `NativeFn` built with
 /// [`sema_core::NativeFn::simple`] (the legacy marker-throw closure), turning
 /// it into a dual-ABI native via
-/// [`sema_core::NativeFn::simple_with_runtime`]. The legacy closure keeps
-/// running unmodified for every pre-existing entry point (none of which
-/// drives a runtime quantum); the new runtime closure activates ONLY when
-/// this native is invoked from inside `Runtime::drive` (i.e. only reachable
-/// through `evalPromise`), where it suspends structurally on a real
-/// `WaitKind::External` fetch instead of throwing a marker.
+/// [`sema_core::NativeFn::simple_with_runtime`].
+///
+/// `runtime_quantum_active()` is true for EVERY live runtime quantum — old
+/// wasm entry points included, since they all drive the same
+/// `Runtime::drive` — so it cannot gate this closure (see the module doc
+/// comment). Instead this checks
+/// [`sema_core::promise_driven_quantum_active`], set true only inside this
+/// module's own `drive_and_settle` turn: when true, suspend structurally on
+/// a real `WaitKind::External` fetch; otherwise run `legacy` (the exact
+/// marker-throw closure every pre-existing entry point always got) and wrap
+/// its result as a plain `Return`, matching what `NativeFn::invoke_runtime`
+/// does automatically for a native with no `runtime_func` at all — i.e. old
+/// entry points see byte-for-byte the same behavior as before this native
+/// became dual-ABI.
 pub(crate) fn runtime_http_fn(
     method: &'static str,
+    legacy: LegacyHttpFn,
 ) -> impl for<'a> Fn(&mut NativeCallContext<'a>, &[Value]) -> NativeResult + 'static {
-    move |_ctx, args| runtime_http_call(method, args)
+    move |_ctx, args| {
+        if sema_core::promise_driven_quantum_active() {
+            runtime_http_call(method, args)
+        } else {
+            (legacy)(args).map(NativeOutcome::Return)
+        }
+    }
 }
 
 fn runtime_http_call(default_method: &'static str, args: &[Value]) -> NativeResult {

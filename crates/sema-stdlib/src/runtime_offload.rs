@@ -230,6 +230,7 @@ fn suspend_with_resource_async<T, F, Fut>(
     resource: InterruptibleResource,
     cancel_rx: CancelWaiter,
     decode: DecodeFn<T>,
+    continuation: Box<dyn NativeContinuation>,
     make_future: F,
 ) -> NativeResult
 where
@@ -238,7 +239,6 @@ where
     Fut: Future<Output = Result<T, String>> + Send + 'static,
 {
     let decoder = Box::new(IoDecoder { op, decode });
-    let continuation = Box::new(IoOffloadContinuation { op });
     let prepared = PreparedExternalOperation::interruptible_async(
         kind,
         decoder,
@@ -307,7 +307,54 @@ where
             signal: Some(cancel_tx),
         }),
     );
-    suspend_with_resource_async(op, kind, resource, cancel_rx, Box::new(decode), make_future)
+    suspend_with_resource_async(
+        op,
+        kind,
+        resource,
+        cancel_rx,
+        Box::new(decode),
+        Box::new(IoOffloadContinuation { op }),
+        make_future,
+    )
+}
+
+/// Like [`external_io_async_try`], but the caller supplies its OWN
+/// [`NativeContinuation`] instead of the generic single-shot
+/// [`IoOffloadContinuation`]. For an op that must RE-ARM another External wait
+/// from within its own resume (rather than settling with a plain `Value`) —
+/// e.g. `http/serve`'s accept loop, which spawns a handler task per request and
+/// then parks again on the next `rx.recv()`. Uses the same
+/// cancel-drops-the-future teardown as every other op in this module.
+pub(crate) fn external_io_async_try_with_continuation<T, F, Fut, D>(
+    op: &'static str,
+    kind: CompletionKind,
+    resource_label: &'static str,
+    decode: D,
+    continuation: Box<dyn NativeContinuation>,
+    make_future: F,
+) -> NativeResult
+where
+    T: Send + 'static,
+    D: FnOnce(T) -> Result<Value, SemaError> + 'static,
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: Future<Output = Result<T, String>> + Send + 'static,
+{
+    let (cancel_tx, cancel_rx) = cancel_channel();
+    let resource = InterruptibleResource::new(
+        resource_label,
+        Box::new(SelectCancelHook {
+            signal: Some(cancel_tx),
+        }),
+    );
+    suspend_with_resource_async(
+        op,
+        kind,
+        resource,
+        cancel_rx,
+        Box::new(decode),
+        continuation,
+        make_future,
+    )
 }
 
 /// Offload an interruptible async I/O op onto the executor's blocking tier,

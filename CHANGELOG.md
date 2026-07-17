@@ -9,10 +9,22 @@
   three async entry points are now thin Promise-returning wrappers over the
   `evalPromise` seam — submitted as ONE root, never replayed, with real
   single-execution `http/get`/`async/sleep` support — while keeping their
-  existing JS method names and JSON result shape. The debugger's own HTTP
-  marker flow and the synchronous entry points' (`eval`/`evalGlobal`/`evalVM`)
-  interruptible-sleep support are intentionally kept (verified live
-  consumers beyond this step's scope); see `docs/deferred.md`'s P6-3 entry.
+  existing JS method names and JSON result shape. Playground programs execute
+  exactly once — an `http/get` no longer re-runs the program up to 50× — and
+  `async/sleep` now drives through `setTimeout` with the page responsive
+  instead of a blocking `Atomics.wait`. Evaluations submitted concurrently are
+  individually cancellable: Stop routes through
+  `RuntimeCommandHandle::cancel_root` and cancels the exact in-flight root, not
+  every root in the worker. The playground worker's SharedArrayBuffer/Atomics
+  control protocol is removed entirely, and the real-browser acceptance gate
+  (`playground/tests/unified-runtime.spec.ts`) is committed as evidence, with
+  its transcript at
+  `docs/plans/evidence/unified-cooperative-runtime/p63-browser-gate-transcript.txt`.
+  The debugger's own HTTP marker flow and the synchronous entry points'
+  (`eval`/`evalGlobal`/`evalVM`) interruptible-sleep support are intentionally
+  kept (verified live consumers beyond this step's scope) — the two documented
+  survivors are the sync-entry-point sleep busy-poll and the
+  debugger-narrowed HTTP marker; see `docs/deferred.md`'s P6-3 entry.
 - **Public host API (P6-1):** `Interpreter` gains `submit_str`/`submit_value`/
   `drive_until_settled`/`drive_turn`/`take_output`/`command_handle`/`shutdown`,
   with `RootOptions{capture_output}`, root-tagged `OutputEvent`, and
@@ -25,6 +37,10 @@
   7.4×→~1.4× via inline completion + direct task-to-task handoff; O(1)
   cancel-waiting and ready-remaining; depth-bounded value drop; divan scheduler
   micro-benchmarks (`jake bench.micro`).
+- **Advisory Windows CI leg:** `ci.yml` gains a `test-windows` job
+  (`windows-latest`, `cargo nextest run --workspace`) with
+  `continue-on-error: true` — advisory until first green, then promoted to
+  required.
 
 ### Added
 

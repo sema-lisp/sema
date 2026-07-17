@@ -1,15 +1,19 @@
-// Main-thread client for the Sema eval Web Worker (M3).
-//
-// Enables real wall-clock async/sleep by running eval on a worker that blocks
-// on Atomics.wait. Gated: requires cross-origin isolation (for SharedArrayBuffer)
-// AND an explicit ?worker opt-in, because VFS/HTTP/debugger are not yet routed
-// to the worker (M4/M5/M7). Without the opt-in, the playground uses the
-// main-thread interpreter exactly as before.
+// Main-thread client for the Sema eval Web Worker — root-aware protocol v2
+// (P6-3 step 3). Enables real wall-clock async/sleep and real (non-replayed)
+// http/get by running eval on a worker that drives the Promise-based
+// `evalPromise` seam (`crates/sema-wasm/src/driver.rs`, P6-3 step 2) instead
+// of blocking on `Atomics.wait`. Gated: requires cross-origin isolation (kept
+// as the availability signal, even though this protocol no longer allocates
+// a SharedArrayBuffer itself — cross-origin isolation is what makes the
+// worker eval path meaningfully different from the main thread, e.g. it
+// stays responsive during a long computation) AND an explicit ?worker opt-in
+// is not required (default-on); ?no-worker opts out to the main-thread
+// fallback.
 
 let worker = null;
 let ready = null;
 let nextId = 1;
-let controlView = null; // Int32Array over the shared control SAB (slot 0)
+let currentEvalId = null; // the eval message id currently in flight, for cancel
 let outputHandler = null; // called with each streamed output line
 const pending = new Map();
 
@@ -30,19 +34,14 @@ export function workerEvalEnabled() {
   );
 }
 
-/** Spawn the worker and wait for it to load wasm + install the sleep hook. */
+/** Spawn the worker and wait for it to load wasm. */
 export function initWorker() {
   if (ready) return ready;
   worker = new Worker(new URL('dist/sema-worker.js', document.baseURI), { type: 'module' });
-  // 4-byte control buffer: the worker blocks on it (Atomics.wait for sleep) and
-  // the main thread stores a cancel flag + Atomics.notify into slot 0 to stop a
-  // running program (see cancelWorker).
-  const sab = new SharedArrayBuffer(4);
-  controlView = new Int32Array(sab);
   worker.addEventListener('message', (e) => {
     const m = e.data;
     if (m && m.type === 'output') {
-      if (outputHandler) outputHandler(m.line);
+      if (outputHandler) outputHandler(m.text);
     } else if (m && m.type === 'result') {
       const resolve = pending.get(m.id);
       if (resolve) {
@@ -59,18 +58,18 @@ export function initWorker() {
       }
     };
     worker.addEventListener('message', onReady);
-    worker.postMessage({ type: 'init', sab });
+    worker.postMessage({ type: 'init' });
   });
   return ready;
 }
 
-/** Request cancellation of the running eval: set the cancel flag (slot 0) and
- *  wake any in-progress Atomics.wait sleep. The VM loop guard / scheduler abort
- *  shortly after; the worker survives (defines + VFS preserved). */
+/** Request cancellation of the currently running eval: sends a `cancel`
+ *  message tagged with its eval id, which the worker maps to the exact root
+ *  `evalPromise` reported for it and cancels via `cancelRoot` (design doc
+ *  §2.4). The worker survives (defines + VFS preserved). */
 export function cancelWorker() {
-  if (!controlView) return;
-  Atomics.store(controlView, 0, 1);
-  Atomics.notify(controlView, 0);
+  if (!worker || currentEvalId === null) return;
+  worker.postMessage({ type: 'cancel', id: currentEvalId });
 }
 
 /** Evaluate `code` on the worker, seeding it with `vfs` (a dumpVfs snapshot).
@@ -78,8 +77,13 @@ export function cancelWorker() {
 export async function evalViaWorker(code, vfs) {
   await ready;
   const id = nextId++;
-  return new Promise((resolve) => {
-    pending.set(id, resolve);
-    worker.postMessage({ type: 'eval', id, code, vfs });
-  });
+  currentEvalId = id;
+  try {
+    return await new Promise((resolve) => {
+      pending.set(id, resolve);
+      worker.postMessage({ type: 'eval', id, code, vfs });
+    });
+  } finally {
+    if (currentEvalId === id) currentEvalId = null;
+  }
 }

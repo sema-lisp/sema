@@ -25,6 +25,8 @@ uuid = { workspace = true, features = ["v4", "js"] }
 wasm-bindgen-futures.workspace = true
 web-sys = { workspace = true, features = [
     "Window",
+    "WorkerGlobalScope",
+    "DedicatedWorkerGlobalScope",
     "Request",
     "RequestInit",
     "RequestMode",

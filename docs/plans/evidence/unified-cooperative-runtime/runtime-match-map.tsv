@@ -826,31 +826,32 @@ F29	crates/sema-vm/src/vm.rs:781:        return sema_core::call_callback(ctx, fu
 C17	crates/sema-vm/src/vm.rs:814:thread_local! {
 F29	crates/sema-vm/src/vm.rs:908:/// the owning VM is still current, exactly like `async/spawn` at spawn time)
 F29	crates/sema-vm/src/vm.rs:954:/// `async/spawn` preserves it.
-H10A	crates/sema-wasm/src/driver.rs:160:/// honor a pending `WaitKind::Timer` deadline (`async/sleep`) instead of
 H09	crates/sema-wasm/src/driver.rs:17://!   calling thread on `WaitRuntime::block_on_inbox`, which internally calls
 H09	crates/sema-wasm/src/driver.rs:18://!   `Receiver::recv_timeout` — unconditionally unsupported on
-H10A	crates/sema-wasm/src/driver.rs:228:        // http, and `async/sleep` on wasm32) consult
+H10A	crates/sema-wasm/src/driver.rs:196:    // immediate turn here, a cancelled `(async/sleep 5000)` would sit
+H10A	crates/sema-wasm/src/driver.rs:225:/// honor a pending `WaitKind::Timer` deadline (`async/sleep`) instead of
 H10A	crates/sema-wasm/src/driver.rs:22://!   the FIRST wasm entry point that can correctly run `async/sleep` or a
+H10A	crates/sema-wasm/src/driver.rs:318:        // http, and `async/sleep` on wasm32) consult
 H09	crates/sema-wasm/src/driver.rs:31://! it can never resolve (the old path's only recovery, `block_on_inbox`,
 H10A	crates/sema-wasm/src/driver.rs:33://! wasm32, `async/sleep`) instead gate on
 H09	crates/sema-wasm/src/driver.rs:77:thread_local! {
 H09	crates/sema-wasm/src/lib.rs:1863:    /// `async/sleep` / `http/get` instead of hanging or panicking on the
-H10B	crates/sema-wasm/src/lib.rs:1993:        for _ in 0..MAX_REPLAYS {
-H10B	crates/sema-wasm/src/lib.rs:2080:        for _ in 0..MAX_REPLAYS {
+H10B	crates/sema-wasm/src/lib.rs:2013:        for _ in 0..MAX_REPLAYS {
 H09	crates/sema-wasm/src/lib.rs:20:thread_local! {
+H10B	crates/sema-wasm/src/lib.rs:2100:        for _ in 0..MAX_REPLAYS {
 H10B	crates/sema-wasm/src/lib.rs:230:const HTTP_AWAIT_MARKER: &str = "__SEMA_WASM_HTTP__";
 H10B	crates/sema-wasm/src/lib.rs:231:const MAX_REPLAYS: usize = 50;
-H09	crates/sema-wasm/src/lib.rs:2569:            sema_core::set_eval_callback(&ctx, sema_eval::eval_value_vm);
-H09	crates/sema-wasm/src/lib.rs:2570:            sema_core::set_call_callback(&ctx, sema_eval::call_value);
-H09	crates/sema-wasm/src/lib.rs:2571:            sema_core::set_call_owned_callback(&ctx, sema_eval::call_value_owned);
+H09	crates/sema-wasm/src/lib.rs:2589:            sema_core::set_eval_callback(&ctx, sema_eval::eval_value_vm);
+H09	crates/sema-wasm/src/lib.rs:2590:            sema_core::set_call_callback(&ctx, sema_eval::call_value);
+H09	crates/sema-wasm/src/lib.rs:2591:            sema_core::set_call_owned_callback(&ctx, sema_eval::call_value_owned);
 H10B	crates/sema-wasm/src/lib.rs:285:        HTTP_AWAIT_MARKER,
-H10B	crates/sema-wasm/src/lib.rs:2952:        for _ in 0..MAX_REPLAYS {
+H10B	crates/sema-wasm/src/lib.rs:2972:        for _ in 0..MAX_REPLAYS {
 H10B	crates/sema-wasm/src/lib.rs:299:        SemaError::Eval(msg) => msg.starts_with(HTTP_AWAIT_MARKER),
 H10B	crates/sema-wasm/src/lib.rs:307:        SemaError::Eval(msg) if msg.starts_with(HTTP_AWAIT_MARKER) => {
 H10B	crates/sema-wasm/src/lib.rs:308:            Some(msg[HTTP_AWAIT_MARKER.len()..].to_string())
-H10C	crates/sema-wasm/src/lib.rs:3217:    /// Enable real wall-clock `async/sleep` via `Atomics.wait` on the given
-H10C	crates/sema-wasm/src/lib.rs:3222:    /// `Atomics.wait` is illegal there; leaving it uninstalled keeps the
-H10C	crates/sema-wasm/src/lib.rs:3224:    #[wasm_bindgen(js_name = installAtomicsSleep)]
+H10C	crates/sema-wasm/src/lib.rs:3237:    /// Enable real wall-clock `async/sleep` via `Atomics.wait` on the given
+H10C	crates/sema-wasm/src/lib.rs:3242:    /// `Atomics.wait` is illegal there; leaving it uninstalled keeps the
+H10C	crates/sema-wasm/src/lib.rs:3244:    #[wasm_bindgen(js_name = installAtomicsSleep)]
 H10C	crates/sema-wasm/src/lib.rs:388:    // correctly with real `Atomics.wait` sleeps (no re-runs). Cross-origin
 H10C	crates/sema-wasm/src/lib.rs:408:/// Synchronous HTTP via `XMLHttpRequest` (worker-only — sync XHR is illegal on
 H10C	crates/sema-wasm/src/lib.rs:40:    /// `Atomics.wait` sleep when running inside a Web Worker (installed via
@@ -886,11 +887,10 @@ H08	crates/sema/src/workflow_mcp.rs:41:thread_local! {
 H12	playground/src/app.js:417:  // Opt-in worker path: run eval off the main thread for real async/sleep.
 H12	playground/src/app.js:476:  // (async/sleep paces in real wall-clock time). On the main-thread path the
 H12	playground/src/app.js:9:// When true, eval runs on a Web Worker (real wall-clock async/sleep, responsive
-H11	playground/src/sema-worker.js:25:        // Shared control buffer: slot 0 doubles as the Atomics.wait sleep cell
-H11	playground/src/sema-worker.js:28:        interp.installAtomicsSleep(control);
-H11	playground/src/sema-worker.js:3:// Runs the WASM VM off the main UI thread so it can block on Atomics.wait for
-H11	playground/src/sema-worker.js:4:// REAL wall-clock `async/sleep` (installed via installAtomicsSleep) without
-H11	playground/src/worker-client.js:37:  // 4-byte control buffer: the worker blocks on it (Atomics.wait for sleep) and
-H11	playground/src/worker-client.js:3:// Enables real wall-clock async/sleep by running eval on a worker that blocks
-H11	playground/src/worker-client.js:4:// on Atomics.wait. Gated: requires cross-origin isolation (for SharedArrayBuffer)
-H11	playground/src/worker-client.js:68: *  wake any in-progress Atomics.wait sleep. The VM loop guard / scheduler abort
+H11	playground/src/sema-worker.js:17:// `installAtomicsSleep`/the control `SharedArrayBuffer` are NOT used by this
+H11	playground/src/sema-worker.js:38:        // shared control buffer the worker blocks on via Atomics.wait for
+H11	playground/src/sema-worker.js:42:        interp.installAtomicsSleep(control);
+H11	playground/src/sema-worker.js:6:// driver; `async/sleep` and `http/get` complete through real `setTimeout`/
+H11	playground/src/sema-worker.js:8:// thread on `Atomics.wait` — the worker stays free to pump its own macrotask
+H11	playground/src/worker-client.js:2:// (P6-3 step 3). Enables real wall-clock async/sleep and real (non-replayed)
+H11	playground/src/worker-client.js:5:// of blocking on `Atomics.wait`. Gated: requires cross-origin isolation (kept

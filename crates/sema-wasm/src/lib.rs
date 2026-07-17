@@ -1865,13 +1865,33 @@ impl WasmInterpreter {
     /// NOT included in the resolved value: install `setPromiseOutputSink` to
     /// receive this root's `println`/`print-err` output, tagged with its
     /// root id, as it happens.
+    ///
+    /// `on_root_id`, if a function, is called SYNCHRONOUSLY (before this
+    /// method returns) with the new root's id as a JS `number` — the only way
+    /// a caller can learn it in time to route a later [`Self::cancel_root`]
+    /// call at the exact root this call submitted (P6-3 step 3; the
+    /// playground worker protocol uses this to implement "Stop"). Pass
+    /// `null`/`undefined` to skip.
     #[wasm_bindgen(js_name = evalPromise)]
-    pub fn eval_promise(&self, code: &str) -> js_sys::Promise {
+    pub fn eval_promise(&self, code: &str, on_root_id: JsValue) -> js_sys::Promise {
         let interp = self.inner.clone();
         let code = code.to_string();
+        let on_root_id = on_root_id.dyn_into::<js_sys::Function>().ok();
         js_sys::Promise::new(&mut |resolve, reject| {
-            driver::submit(&interp, &code, resolve, reject);
+            driver::submit(&interp, &code, resolve, reject, on_root_id.clone());
         })
+    }
+
+    /// Request cancellation of the root whose id was reported by
+    /// [`Self::eval_promise`]'s `on_root_id` callback. Returns `false` if no
+    /// pending `evalPromise` root matches `root_id` (already settled, or
+    /// never existed) — a harmless no-op, same liveness contract as the
+    /// underlying `RuntimeCommandHandle::cancel_root`. Has no effect on the
+    /// OLD `eval`/`evalAsync`/`evalVM`/… entry points (they don't submit a
+    /// cancellable root at all).
+    #[wasm_bindgen(js_name = cancelRoot)]
+    pub fn cancel_root(&self, root_id: f64) -> bool {
+        driver::cancel_root(&self.inner, root_id)
     }
 
     /// Install (or clear, passing `null`/`undefined`) the JS callback that

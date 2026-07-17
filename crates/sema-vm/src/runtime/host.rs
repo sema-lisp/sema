@@ -12,7 +12,16 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Condvar, Mutex};
 use std::task::{Context, Poll, Wake, Waker};
 use std::thread::JoinHandle;
-use std::time::Instant;
+
+// See the comment on this same import in `host_api.rs`: a wasm32-safe
+// `Instant` substitute used throughout `crate::runtime` — `MonotonicClock`
+// below is the interpreter's DEFAULT clock on every target including wasm32,
+// so it must not use the panicking `std::time::Instant::now()` there. The
+// rest of this file (`ThreadPoolExecutor`) is native-only in practice (wasm32
+// has no OS threads to run its workers on) but still compiles for that target
+// — `web_time::Instant` is a transparent alias of `std::time::Instant` off
+// wasm32, so its unchanged native-only uses here are unaffected.
+use web_time::Instant;
 
 use sema_core::runtime::{
     BlockingDispatchClass, CompletionDelivery, ExecutorAttachError, ExecutorDispatch,

@@ -4001,6 +4001,7 @@ dependencies = [
  "stacker",
  "thiserror 2.0.18",
  "toml",
+ "web-time",
 ]
 
 [[package]]
@@ -4036,6 +4037,7 @@ dependencies = [
  "sema-reader",
  "sema-stdlib",
  "sema-vm",
+ "web-time",
 ]
 
 [[package]]
@@ -4282,12 +4284,14 @@ dependencies = [
  "sema-reader",
  "sema-stdlib",
  "smallvec",
+ "web-time",
 ]
 
 [[package]]
 name = "sema-wasm"
 version = "1.30.0"
 dependencies = [
+ "futures-channel",
  "getrandom 0.4.2",
  "js-sys",
  "sema-core",
@@ -4300,6 +4304,7 @@ dependencies = [
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "web-sys",
+ "web-time",
 ]
 
 [[package]]

@@ -1,5 +1,7 @@
 use std::collections::BTreeMap;
-use std::time::Instant;
+// See the comment on this same import in `host_api.rs`: a wasm32-safe
+// `Instant` substitute used throughout `crate::runtime`.
+use web_time::Instant;
 
 use hashbrown::HashMap;
 

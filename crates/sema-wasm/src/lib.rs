@@ -7,6 +7,15 @@ use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::JsFuture;
 
+// P6-3 step 2 (`docs/plans/2026-07-16-wasm-promise-driven-roots.md`): the
+// macrotask-driven Promise seam (`evalPromise`) and its root-tagged output
+// pump. Additive — nothing below this point in the file changes except the
+// http registration (dual-ABI'd so its runtime-suspend variant is reachable
+// only under `evalPromise`) and `WasmInterpreter.inner`'s type (now `Rc`, so
+// the driver's detached macrotask callback can share it).
+mod driver;
+mod output;
+
 thread_local! {
     /// Completed lines of output (flushed by println/newline)
     static OUTPUT: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
@@ -154,8 +163,17 @@ fn normalize_path(path: &str) -> Result<String, SemaError> {
 }
 
 /// Append text to the current line buffer (no newline).
+///
+/// Also forwards `s` through `sema_core::write_stdout`, which is a no-op here
+/// for every pre-existing entry point (see `install_noop_core_output_hooks`)
+/// — its ONLY live effect is for a root submitted with
+/// `RootOptions::capture_output` (i.e. `evalPromise`, P6-3 step 2): such a
+/// root has no other way to reach the JS side, since it never runs
+/// `take_output`/`OUTPUT`/`LINE_BUF` below (those are drained by the OLD
+/// entry points' own `eval`/`evalAsync`/… methods, not by `evalPromise`).
 fn append_output(s: &str) {
     LINE_BUF.with(|b| b.borrow_mut().push_str(s));
+    sema_core::write_stdout(s);
 }
 
 /// Flush the current line buffer as a completed line.
@@ -570,11 +588,44 @@ async fn perform_fetch_from_marker(json_str: &str) -> Result<(String, Value), Se
 /// Register print/println/display/newline that write to the output buffer instead of stdout
 type WasmNativeFn = Box<dyn Fn(&[Value]) -> Result<Value, SemaError>>;
 
+/// Make `sema_core::write_stdout`/`write_stderr`'s NON-capturing fallback
+/// (`STDOUT_HOOK`/`STDERR_HOOK`) an inert no-op, so `append_output`'s new
+/// `write_stdout` forward (above) has zero effect on every pre-existing entry
+/// point. Without this, the fallback is `print!`/`eprint!` — real syscalls
+/// that are `unsupported` on wasm32-unknown-unknown and `.expect()`-panic
+/// there (the same class of bug this session already found and fixed for
+/// `Instant::now()`/`std::thread::spawn`). Idempotent; called once per
+/// `WasmInterpreter` construction via `register_wasm_io`.
+fn install_noop_core_output_hooks() {
+    sema_core::set_stdout_hook(Some(Box::new(|_s: &str| {})));
+    sema_core::set_stderr_hook(Some(Box::new(|_s: &str| {})));
+}
+
 fn register_wasm_io(env: &Env) {
+    install_noop_core_output_hooks();
     let register = |name: &str, f: WasmNativeFn| {
         env.set(
             sema_core::intern(name),
             Value::native_fn(NativeFn::simple(name, move |args| f(args))),
+        );
+    };
+
+    // Dual-ABI registration for the http natives below: `f` is the existing
+    // marker-throw legacy closure (unchanged, still what every pre-existing
+    // eval entry point gets — none of them run a native from inside a
+    // `Runtime::drive` quantum), and `method` selects the NEW runtime-ABI
+    // closure (`driver::runtime_http_fn`) that activates ONLY when this
+    // native is invoked from under the runtime quantum (i.e. only reachable
+    // via `evalPromise`), where it suspends on a real `WaitKind::External`
+    // fetch instead of throwing a marker. See P6-3 step 2.
+    let register_http = |name: &str, method: &'static str, f: WasmNativeFn| {
+        env.set(
+            sema_core::intern(name),
+            Value::native_fn(NativeFn::simple_with_runtime(
+                name,
+                move |args| f(args),
+                driver::runtime_http_fn(method),
+            )),
         );
     };
 
@@ -1034,8 +1085,9 @@ fn register_wasm_io(env: &Env) {
 
     // --- HTTP via replay-with-cache (async eval catches markers and performs fetch) ---
 
-    register(
+    register_http(
         "http/get",
+        "GET",
         Box::new(|args: &[Value]| {
             if args.is_empty() || args.len() > 2 {
                 return Err(SemaError::arity("http/get", "1 or 2", args.len()));
@@ -1047,8 +1099,9 @@ fn register_wasm_io(env: &Env) {
         }),
     );
 
-    register(
+    register_http(
         "http/post",
+        "POST",
         Box::new(|args: &[Value]| {
             if args.len() < 2 || args.len() > 3 {
                 return Err(SemaError::arity("http/post", "2 or 3", args.len()));
@@ -1060,8 +1113,9 @@ fn register_wasm_io(env: &Env) {
         }),
     );
 
-    register(
+    register_http(
         "http/put",
+        "PUT",
         Box::new(|args: &[Value]| {
             if args.len() < 2 || args.len() > 3 {
                 return Err(SemaError::arity("http/put", "2 or 3", args.len()));
@@ -1073,8 +1127,9 @@ fn register_wasm_io(env: &Env) {
         }),
     );
 
-    register(
+    register_http(
         "http/delete",
+        "DELETE",
         Box::new(|args: &[Value]| {
             if args.is_empty() || args.len() > 2 {
                 return Err(SemaError::arity("http/delete", "1 or 2", args.len()));
@@ -1086,8 +1141,9 @@ fn register_wasm_io(env: &Env) {
         }),
     );
 
-    register(
+    register_http(
         "http/request",
+        "REQUEST",
         Box::new(|args: &[Value]| {
             if args.len() < 2 || args.len() > 4 {
                 return Err(SemaError::arity("http/request", "2-4", args.len()));
@@ -1668,7 +1724,11 @@ fn register_wasm_io(env: &Env) {
 
 #[wasm_bindgen(js_name = SemaInterpreter)]
 pub struct WasmInterpreter {
-    inner: sema_eval::Interpreter,
+    // `Rc` (not a bare `Interpreter`) so `evalPromise` (`driver.rs`) can share
+    // it with the macrotask driver's callback, which runs detached from any
+    // JS call stack / `&self` borrow. Every existing method's `self.inner.foo()`
+    // call keeps compiling unchanged (`Rc<T>` derefs transparently to `T`).
+    inner: std::rc::Rc<sema_eval::Interpreter>,
     callback_handles: std::rc::Rc<RefCell<BTreeMap<u32, Value>>>,
     callback_ids_by_value: std::rc::Rc<RefCell<BTreeMap<u64, u32>>>,
     next_callback_id: std::rc::Rc<Cell<u32>>,
@@ -1694,7 +1754,16 @@ type LoadedArchiveInfo = (
 impl WasmInterpreter {
     #[wasm_bindgen(constructor)]
     pub fn new() -> WasmInterpreter {
-        let interp = sema_eval::Interpreter::new();
+        // `new_with_executor` (not `new()`): wasm32's platform-default
+        // executor is `NullExecutor` (see `sema_eval::build_runtime`) — correct
+        // for every pre-existing entry point (none of them suspend on
+        // `WaitKind::External`), but `evalPromise`'s http natives need a real
+        // one. Sharing ONE interpreter/runtime across old and new entry points
+        // is safe either way: only natives invoked from inside a
+        // `Runtime::drive` quantum (i.e. only reachable via `evalPromise`)
+        // ever touch the executor at all.
+        let interp =
+            sema_eval::Interpreter::new_with_executor(std::sync::Arc::new(driver::WasmExecutor));
 
         // Override print/println/display with our buffer-based versions
         register_wasm_io(&interp.global_env);
@@ -1704,7 +1773,7 @@ impl WasmInterpreter {
         interp.ctx.set_eval_step_limit(10_000_000);
 
         WasmInterpreter {
-            inner: interp,
+            inner: std::rc::Rc::new(interp),
             callback_handles: std::rc::Rc::new(RefCell::new(BTreeMap::new())),
             callback_ids_by_value: std::rc::Rc::new(RefCell::new(BTreeMap::new())),
             next_callback_id: std::rc::Rc::new(Cell::new(1)),
@@ -1759,6 +1828,34 @@ impl WasmInterpreter {
             }
         };
         js_sys::JSON::parse(&json_str).unwrap_or(JsValue::NULL)
+    }
+
+    /// Evaluate `code` as ONE root on the unified runtime and return a
+    /// `Promise` that resolves with its printed value (or `null`) and rejects
+    /// with an `Error` on failure — never replays the program body, and
+    /// (unlike every other `eval*` method) correctly supports a real
+    /// `async/sleep` / `http/get` instead of hanging or panicking on the
+    /// blocking legacy drive path. See `driver.rs` (P6-3 step 2). Output is
+    /// NOT included in the resolved value: install `setPromiseOutputSink` to
+    /// receive this root's `println`/`print-err` output, tagged with its
+    /// root id, as it happens.
+    #[wasm_bindgen(js_name = evalPromise)]
+    pub fn eval_promise(&self, code: &str) -> js_sys::Promise {
+        let interp = self.inner.clone();
+        let code = code.to_string();
+        js_sys::Promise::new(&mut |resolve, reject| {
+            driver::submit(&interp, &code, resolve, reject);
+        })
+    }
+
+    /// Install (or clear, passing `null`/`undefined`) the JS callback that
+    /// receives `evalPromise` roots' output as `(rootId, stream, text)`,
+    /// where `stream` is `"stdout"` or `"stderr"`. Independent of
+    /// `setOutputSink` (the worker's line-batched sink for the OLD entry
+    /// points) — the two never observe each other's output.
+    #[wasm_bindgen(js_name = setPromiseOutputSink)]
+    pub fn set_promise_output_sink(&self, sink: JsValue) {
+        output::set_sink(sink.dyn_into::<js_sys::Function>().ok());
     }
 
     /// Evaluate in the global env so defines persist
@@ -2435,7 +2532,10 @@ impl WasmInterpreter {
             .unwrap_or(true);
 
         let interp = if with_stdlib {
-            sema_eval::Interpreter::new()
+            // See the comment in `WasmInterpreter::new` on why every wasm
+            // interpreter is built with `WasmExecutor`, not the platform
+            // default.
+            sema_eval::Interpreter::new_with_executor(std::sync::Arc::new(driver::WasmExecutor))
         } else {
             use std::rc::Rc;
             let env = sema_core::Env::new();
@@ -2445,7 +2545,11 @@ impl WasmInterpreter {
             sema_core::set_call_owned_callback(&ctx, sema_eval::call_value_owned);
             let global_env = Rc::new(env);
             let ctx = Rc::new(ctx);
-            sema_eval::Interpreter::from_parts(global_env, ctx)
+            sema_eval::Interpreter::from_parts_with_executor(
+                global_env,
+                ctx,
+                std::sync::Arc::new(driver::WasmExecutor),
+            )
         };
 
         register_wasm_io(&interp.global_env);
@@ -2520,7 +2624,7 @@ impl WasmInterpreter {
         }
 
         WasmInterpreter {
-            inner: interp,
+            inner: std::rc::Rc::new(interp),
             callback_handles: std::rc::Rc::new(RefCell::new(BTreeMap::new())),
             callback_ids_by_value: std::rc::Rc::new(RefCell::new(BTreeMap::new())),
             next_callback_id: std::rc::Rc::new(Cell::new(1)),

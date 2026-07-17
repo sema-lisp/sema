@@ -6,7 +6,11 @@ use std::collections::VecDeque;
 use hashbrown::HashMap;
 use std::rc::{Rc, Weak};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+// See the comment on this same import in `host_api.rs`: a wasm32-safe
+// `Instant` substitute used throughout `crate::runtime`.
+use web_time::Instant;
 
 use crate::vm::{
     close_closure_upvalues_for_foreign_run, close_closure_upvalues_with_owner,

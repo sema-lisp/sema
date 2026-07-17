@@ -1,7 +1,11 @@
 use std::collections::VecDeque;
 use std::num::NonZeroUsize;
 use std::rc::Rc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+// See the comment on this same import in `host_api.rs`: a wasm32-safe
+// `Instant` substitute used throughout `crate::runtime`.
+use web_time::Instant;
 
 pub trait RuntimeClock {
     fn now(&self) -> Instant;

@@ -5,7 +5,12 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
-use std::time::Instant;
+
+// `web_time::Instant` is `std::time::Instant` on every target except
+// wasm32-unknown-unknown (where the latter's `now()` panics); used here so
+// `ExecutorLease::shutdown`'s deadline type-checks against sema-vm's runtime
+// module, which uses the same substitute throughout.
+use web_time::Instant;
 
 use crate::cycle::GcEdge;
 

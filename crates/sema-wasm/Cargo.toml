@@ -33,7 +33,21 @@ web-sys = { workspace = true, features = [
     "AbortController",
     "AbortSignal",
     "XmlHttpRequest",
+    "MessageChannel",
+    "MessagePort",
+    "MessageEvent",
 ] }
+# Send-safe one-shot completion channel used by the Promise-driven runtime-ABI
+# natives (`driver.rs`): a JS callback (fetch `.then`, `setTimeout`) resolves a
+# oneshot `Sender` from OUTSIDE the `Send`-bounded external-wait job future;
+# the future itself only awaits the `Receiver` (no `JsValue` inside it — those
+# aren't `Send`). Already a transitive workspace dependency (`futures`); named
+# directly here since only its `channel::oneshot` is used.
+futures-channel = "0.3"
+# Wasm32-safe `Instant` (see the comment in sema-vm's Cargo.toml) — the
+# macrotask driver (`driver.rs`) compares `Instant`s against sema-vm's
+# `DriveState::Idle::next_deadline`, so it must use the same substitute.
+web-time = "1.1.0"
 
 [package.metadata.cargo-machete]
 # No direct code references — present only to turn on the wasm RNG feature flags

@@ -4,7 +4,9 @@ use hashbrown::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Arc;
-use std::time::Instant;
+// See the comment on this same import in `host_api.rs`: a wasm32-safe
+// `Instant` substitute used throughout `crate::runtime`.
+use web_time::Instant;
 
 use sema_core::runtime::{
     CancellationView, CompletionDecoder, CompletionDelivery, CompletionKind, CompletionRegistrar,

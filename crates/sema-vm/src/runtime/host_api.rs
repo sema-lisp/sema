@@ -7,7 +7,11 @@
 
 use std::cell::RefCell;
 use std::rc::{Rc, Weak};
-use std::time::Instant;
+// `web_time::Instant` is a transparent re-export of `std::time::Instant` on
+// every target except wasm32-unknown-unknown, where `std::time::Instant::now()`
+// panics (unimplemented) — used here (and throughout `crate::runtime`) so a
+// `ShutdownOptions` deadline works on both.
+use web_time::Instant;
 
 use sema_core::runtime::{
     CancelReason, CancellationParent, ExecutorShutdown, LifetimeOwner, RootId, TaskContextHandle,

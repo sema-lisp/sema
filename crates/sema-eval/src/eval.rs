@@ -84,17 +84,35 @@ use sema_vm::runtime::Runtime;
 /// this is infallible — a failure would mean the wait-runtime could not allocate
 /// identity, which only happens under a corrupt/exhausted global counter.
 fn build_runtime(ctx: &Rc<EvalContext>) -> Runtime {
-    use sema_vm::runtime::MonotonicClock;
     // Native builds attach to THE process-wide tokio pool (via sema-io, which
     // hides the tokio edge): its async tier runs `reqwest`/`tokio::process`
     // futures on a real reactor and its blocking tier is admission-controlled, so
-    // concurrent external ops overlap without a per-op worker ceiling. wasm/no-io
-    // builds have no tokio pool and keep the thread-parking `ThreadPoolExecutor`.
+    // concurrent external ops overlap without a per-op worker ceiling.
     #[cfg(not(target_arch = "wasm32"))]
     let executor = sema_io::process_executor();
+    // wasm32-unknown-unknown has no OS threads: `ThreadPoolExecutor::new()`
+    // calls `std::thread::spawn`, which panics at construction time on that
+    // target ("failed to spawn thread") — confirmed live (any
+    // `Interpreter::new()`/`from_parts` on a real wasm build aborted before
+    // this fix). `NullExecutor` just rejects `WaitKind::External` submissions
+    // instead of crashing, which is behavior-neutral for every wasm eval path
+    // that existed before this module: none of them ever suspend on the
+    // runtime's I/O tier (`http`/`sleep` there use a JS-marker replay and a
+    // ctx-less virtual clock, entirely outside `WaitKind::External`). A host
+    // that needs a real external tier on wasm (the Promise-driven driver in
+    // `sema-wasm`) must construct via [`from_parts_with_executor`] with its
+    // own `IoExecutor` instead of relying on this default.
     #[cfg(target_arch = "wasm32")]
     let executor: std::sync::Arc<dyn sema_core::runtime::IoExecutor> =
-        std::sync::Arc::new(sema_vm::runtime::ThreadPoolExecutor::new());
+        std::sync::Arc::new(sema_vm::runtime::NullExecutor);
+    build_runtime_with(ctx, executor)
+}
+
+fn build_runtime_with(
+    ctx: &Rc<EvalContext>,
+    executor: std::sync::Arc<dyn sema_core::runtime::IoExecutor>,
+) -> Runtime {
+    use sema_vm::runtime::MonotonicClock;
     Runtime::new(Rc::clone(ctx), Rc::new(MonotonicClock), executor)
         .expect("fresh unified runtime construction cannot fail")
 }
@@ -128,7 +146,11 @@ impl Drop for Interpreter {
         // releases its state so the collection reclaims the env.
         if let Some(runtime) = self.runtime.take() {
             let options = sema_vm::runtime::ShutdownOptions {
-                deadline: std::time::Instant::now() + std::time::Duration::from_secs(2),
+                // `web_time::Instant`, not `std::time::Instant`: on wasm32 the
+                // latter's `now()` panics (see sema-vm's runtime module,
+                // which `ShutdownOptions` belongs to); `web_time` is a
+                // transparent re-export of `std::time` everywhere else.
+                deadline: web_time::Instant::now() + std::time::Duration::from_secs(2),
                 drive_budget: sema_vm::runtime::DriveBudget::host_default(),
             };
             let _ = runtime.shutdown(&options);
@@ -158,6 +180,26 @@ impl Drop for Interpreter {
 
 impl Interpreter {
     pub fn new() -> Self {
+        let (global_env, ctx) = Self::new_parts();
+        Self::from_parts(global_env, ctx)
+    }
+
+    /// Like [`new`](Self::new), but the caller supplies the runtime's
+    /// `IoExecutor` (see [`from_parts_with_executor`](Self::from_parts_with_executor))
+    /// instead of the platform default. The one-shot constructor sema-wasm
+    /// needs: everything `new()` sets up (stdlib, callbacks, prelude), but
+    /// wired to a real external-wait tier instead of wasm32's default
+    /// `NullExecutor`.
+    pub fn new_with_executor(executor: std::sync::Arc<dyn sema_core::runtime::IoExecutor>) -> Self {
+        let (global_env, ctx) = Self::new_parts();
+        Self::from_parts_with_executor(global_env, ctx, executor)
+    }
+
+    /// Build the (global env, ctx) pair `new`/`new_with_executor` share —
+    /// stdlib registration, eval/call callbacks, LLM builtins (native only),
+    /// VM delegates, and the prelude — everything short of picking the
+    /// runtime's executor.
+    fn new_parts() -> (Rc<Env>, Rc<EvalContext>) {
         let env = Env::new();
         let ctx = EvalContext::new();
         // Register eval/call callbacks so stdlib can invoke the real evaluator
@@ -176,7 +218,7 @@ impl Interpreter {
         register_vm_delegates(&global_env);
         let ctx = Rc::new(ctx);
         load_prelude(&ctx, &global_env);
-        Self::from_parts(global_env, ctx)
+        (global_env, ctx)
     }
 
     pub fn new_with_sandbox(sandbox: &sema_core::Sandbox) -> Self {
@@ -204,6 +246,27 @@ impl Interpreter {
     /// go through here rather than the struct literal so they get the runtime.
     pub fn from_parts(global_env: Rc<Env>, ctx: Rc<EvalContext>) -> Self {
         let runtime = build_runtime(&ctx);
+        Interpreter {
+            global_env,
+            ctx,
+            runtime: Some(runtime),
+        }
+    }
+
+    /// Like [`from_parts`](Self::from_parts), but the caller supplies the
+    /// runtime's [`IoExecutor`](sema_vm::runtime::IoExecutor) instead of the
+    /// platform default `build_runtime` picks. The escape hatch a host needs
+    /// when the default executor is wrong for its target — e.g. wasm32's
+    /// default is a `NullExecutor` (no real threads to run one on), but a
+    /// browser host that wants a working `WaitKind::External` tier (real
+    /// `fetch`/timer completions delivered from JS callbacks, not an OS
+    /// thread pool) supplies its own `IoExecutor` here instead.
+    pub fn from_parts_with_executor(
+        global_env: Rc<Env>,
+        ctx: Rc<EvalContext>,
+        executor: std::sync::Arc<dyn sema_core::runtime::IoExecutor>,
+    ) -> Self {
+        let runtime = build_runtime_with(&ctx, executor);
         Interpreter {
             global_env,
             ctx,

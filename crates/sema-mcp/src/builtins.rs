@@ -15,15 +15,13 @@
 //! already vetted. MCP tools then run with the *server's* authority, not Sema's
 //! sandbox: connecting to an untrusted server is like running untrusted code.
 //!
-//! ## Async offload (MCP-4 / issue #96)
+//! ## Runtime waits
 //!
-//! Inside an `async/spawn`'d task (`sema_core::in_async_context()`), all four
-//! builtins — and therefore every `mcp/tools->sema` handler, which routes
-//! through the same [`call_tool`] core — offload their JSON-RPC round trip onto
-//! the shared `sema-io` pool and yield `AwaitIo`, so a slow `mcp/call` no
-//! longer stalls sibling scheduler tasks. At top level (no scheduler) every
-//! builtin keeps today's fully synchronous, blocking behavior byte-for-byte —
-//! see [`block_on`].
+//! During a unified-runtime quantum, connect and every connection operation
+//! suspend on cancellable External waits. Operations on an established handle
+//! first acquire its ResourceGate, so one JSON-RPC pipe remains serial while
+//! different connections overlap. Top-level calls remain synchronous and drive
+//! the same transport futures through [`block_on`].
 //!
 //! **Registry / checkout.** `CONNECTIONS` maps a handle to an [`Rc<ConnEntry>`],
 //! where [`ConnEntry`] separates the connection's stable, always-readable
@@ -39,21 +37,13 @@
 //!
 //! **Cancellation semantics.** If a task is cancelled (`async/cancel`,
 //! `async/timeout` expiry) while it holds a connection's checkout, the slot is
-//! tombstoned (see [`checkout_offload`]'s abort hook): the in-flight worker's
-//! eventual reply is discarded (its channel send fails harmlessly), and the
+//! tombstoned by the External wait's cancellation hook: the in-flight worker's
+//! eventual completion is discarded by the runtime, and the
 //! connection itself — the `McpClient`, hence any child process/socket — drops
 //! on the worker thread. Any *later* use of that handle fails fast with a
 //! `SemaError` naming the reason and a reconnect hint; a task that was merely
 //! *queued* (never actually held the checkout) when cancelled leaves the slot
 //! untouched (a no-op abort) so the connection remains usable by others.
-//!
-//! **Lost-wakeup guard.** When a checked-out connection is returned
-//! (`mcp/call`/`mcp/tools` succeed) or removed (`mcp/close`), the finishing
-//! poller calls `sema_core::notify_io_complete()` — mandatory, because a
-//! sibling task queued on the same slot may already have been polled `Pending`
-//! earlier in the same `wake_blocked_tasks` sweep; without this poke its
-//! next acquisition attempt could miss the wakeup and park until the next
-//! scheduler timeout instead of promptly.
 
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -309,7 +299,7 @@ fn busy_sync_error(handle: &str, label: &str) -> SemaError {
 }
 
 /// Drive a future to completion on the CALLING thread — the SYNC (top-level,
-/// non-async-context) path. Routes through `sema_io::io_block_on`, the ADR
+/// non-runtime) path. Routes through `sema_io::io_block_on`, the ADR
 /// #69 sanctioned mechanism, rather than a private per-thread runtime.
 ///
 /// This is a DELIBERATE, brief-sanctioned deviation from keeping the
@@ -322,7 +312,7 @@ fn busy_sync_error(handle: &str, label: &str) -> SemaError {
 /// completion under a DIFFERENT one (the `sema-io` pool the async-offload path
 /// uses) without hanging forever (verified empirically while implementing
 /// MCP-4: a connection made via a synchronous `mcp/connect` and then called
-/// from inside `async/spawn` parked on `AwaitIo` indefinitely). Routing every
+/// from inside `async/spawn` could not be driven on a private runtime). Routing every
 /// MCP connection's entire lifecycle — connect AND every later call, sync or
 /// offloaded — through the ONE shared pool is what makes "connect once
 /// (sync), call from async tasks later" (the common/expected pattern, and
@@ -337,17 +327,11 @@ fn next_handle() -> String {
     format!("mcp-{}", HANDLE_COUNTER.fetch_add(1, Ordering::SeqCst))
 }
 
-fn register_fn(env: &Env, name: &str, f: impl Fn(&[Value]) -> Result<Value, SemaError> + 'static) {
-    env.set_str(name, Value::native_fn(NativeFn::simple(name, f)));
-}
-
 /// Build a dual-ABI native from an op body that speaks the runtime native ABI
 /// (`NativeResult`). Under the unified runtime the runtime callback returns the
-/// body's `NativeOutcome` (so an `mcp/call` external-wait suspend surfaces
+/// body's `NativeOutcome` (so an External-wait suspend surfaces
 /// structurally); outside it (bare eval / legacy scheduler) the legacy value
-/// callback unwraps the plain `Return` the body produces there. Shared by
-/// `mcp/call` and each dynamically-built `mcp/tools->sema` handler so both
-/// inherit the offload-aware suspension with one body.
+/// callback unwraps the plain `Return` the body produces there.
 fn dual_native(name: String, body: impl Fn(&[Value]) -> NativeResult + 'static) -> NativeFn {
     let body = Rc::new(body);
     let for_func = body.clone();
@@ -374,9 +358,9 @@ fn gate(sandbox: &Sandbox, cap: Caps) -> Result<(), SemaError> {
 }
 
 /// The capability a connect needs, from the config's transport: `:url` is
-/// network I/O, `:command` spawns a process. Shared by the sync and
-/// async-offload entry points so both gate identically, on the VM thread,
-/// BEFORE any offload is spawned.
+/// network I/O, `:command` spawns a process. Shared by the runtime and
+/// synchronous entry points so both gate identically, on the VM thread, BEFORE
+/// any offload is spawned.
 fn connect_capability(config_json: &serde_json::Value) -> Caps {
     if config_json.get("url").and_then(|v| v.as_str()).is_some() {
         Caps::NETWORK
@@ -387,8 +371,8 @@ fn connect_capability(config_json: &serde_json::Value) -> Caps {
 
 /// Register a live connection under a fresh opaque handle and return the
 /// handle. Always called on the VM thread (touches the `CONNECTIONS`
-/// thread-local) — for the async-offload connect path that means from the
-/// poller's finish step, never from inside the offloaded closure.
+/// thread-local) — for the runtime path that means from the completion decoder,
+/// never from inside the offloaded closure.
 fn register_connection(client: McpClient, identity: String, opts: &ConnectOpts) -> Value {
     let handle = next_handle();
     let entry = Rc::new(ConnEntry {
@@ -738,8 +722,7 @@ enum ConnectOutcome {
 /// call on this thread (unrestricted if that was never called), dispatch on
 /// transport, and connect. SYNC PATH ONLY (drives [`connect_dispatch_async`]
 /// via the blocking [`block_on`]) — shared by `mcp/connect`'s synchronous
-/// branch and [`connect_from_config`] so the two can never drift. The
-/// async-offload branch is [`connect_offload`], below.
+/// branch and [`connect_from_config`] so the two can never drift.
 fn connect_with_opts(
     config_json: &serde_json::Value,
     opts: &ConnectOpts,
@@ -810,6 +793,199 @@ fn connect_outcome_to_sema_error(outcome: ConnectOutcome) -> SemaError {
              connect should have attempted login)"
         )),
     }
+}
+
+/// Plain, thread-safe form of a connect error. Every error produced after the
+/// VM-thread capability gate is an eval error, optionally carrying user
+/// guidance. Flatten it before returning from the blocking executor job so no
+/// `SemaError` (and therefore no possible `Value`/`Rc`) crosses threads.
+struct ConnectErrorPayload {
+    message: String,
+    hint: Option<String>,
+    note: Option<String>,
+}
+
+impl ConnectErrorPayload {
+    fn from_sema(error: SemaError) -> Self {
+        let hint = error.hint().map(str::to_string);
+        let note = error.note().map(str::to_string);
+        let message = connect_error_message(error);
+        Self {
+            message,
+            hint,
+            note,
+        }
+    }
+
+    fn into_sema(self) -> SemaError {
+        let mut error = SemaError::eval(self.message);
+        if let Some(hint) = self.hint {
+            error = error.with_hint(hint);
+        }
+        if let Some(note) = self.note {
+            error = error.with_note(note);
+        }
+        error
+    }
+}
+
+fn connect_error_message(error: SemaError) -> String {
+    match error {
+        SemaError::Eval(message) => message,
+        SemaError::WithContext { inner, .. } | SemaError::WithTrace { inner, .. } => {
+            connect_error_message(*inner)
+        }
+        other => other.to_string(),
+    }
+}
+
+enum ConnectPayloadResult {
+    Connected {
+        client: Box<McpClient>,
+        identity: String,
+    },
+    NeedsAuth(String),
+    Failed(ConnectErrorPayload),
+}
+
+struct McpConnectPayload(ConnectPayloadResult);
+
+struct McpNoopCancelHook;
+
+impl Trace for McpNoopCancelHook {
+    fn trace(&self, _sink: &mut dyn FnMut(GcEdge<'_>)) -> bool {
+        true
+    }
+}
+
+impl CancelHook for McpNoopCancelHook {
+    fn cancel(&mut self) -> Result<CancelDisposition, CancelHookError> {
+        Ok(CancelDisposition::Reaped)
+    }
+
+    fn reap(&mut self) -> Result<CancelDisposition, CancelHookError> {
+        Ok(CancelDisposition::Reaped)
+    }
+}
+
+/// Pass a direct External completion back to its native caller. The runtime
+/// decodes successful completion to `Returned`; cancellation and failures keep
+/// their public error behavior without retaining any Sema values while parked.
+struct McpReturnContinuation {
+    label: &'static str,
+}
+
+impl Trace for McpReturnContinuation {
+    fn trace(&self, _sink: &mut dyn FnMut(GcEdge<'_>)) -> bool {
+        true
+    }
+}
+
+impl NativeContinuation for McpReturnContinuation {
+    fn resume(
+        self: Box<Self>,
+        _context: &mut NativeCallContext<'_>,
+        input: ResumeInput,
+    ) -> NativeResult {
+        match input {
+            ResumeInput::Returned(value) => Ok(NativeOutcome::Return(value)),
+            ResumeInput::Failed(error) => Err(error),
+            ResumeInput::Cancelled(reason) => Err(SemaError::eval(format!(
+                "{} was cancelled ({reason:?})",
+                self.label
+            ))),
+            ResumeInput::Runtime(_) => Err(SemaError::eval(format!(
+                "{}: unexpected runtime response after offload",
+                self.label
+            ))),
+        }
+    }
+}
+
+const MCP_CONNECT_COMPLETION_KIND: u64 = 0x6d63_7032; // "mcp2"
+
+struct McpConnectDecoder {
+    opts: ConnectOpts,
+}
+
+impl Trace for McpConnectDecoder {
+    fn trace(&self, _sink: &mut dyn FnMut(GcEdge<'_>)) -> bool {
+        true
+    }
+}
+
+impl CompletionDecoder for McpConnectDecoder {
+    fn decode(
+        self: Box<Self>,
+        _context: &mut NativeCallContext<'_>,
+        result: Result<SendPayload, ExternalFailure>,
+    ) -> DecodedCompletion {
+        let payload = result
+            .map_err(|failure| SemaError::eval(format!("mcp/connect: {}", failure.message())))?;
+        let McpConnectPayload(result) =
+            downcast_send_payload::<McpConnectPayload>(payload, "mcp/connect")
+                .map_err(|failure| SemaError::eval(failure.message()))?;
+        match result {
+            ConnectPayloadResult::Connected { client, identity } => {
+                Ok(register_connection(*client, identity, &self.opts))
+            }
+            ConnectPayloadResult::NeedsAuth(url) => Err(connect_outcome_to_sema_error(
+                ConnectOutcome::NeedsAuth(url),
+            )),
+            ConnectPayloadResult::Failed(error) => Err(error.into_sema()),
+        }
+    }
+}
+
+fn connect_runtime_outcome(
+    config_json: serde_json::Value,
+    opts: ConnectOpts,
+    browser_allowed: bool,
+) -> NativeResult {
+    let kind = CompletionKind::try_from_raw(MCP_CONNECT_COMPLETION_KIND)
+        .expect("mcp/connect completion kind is nonzero");
+    let decoder = Box::new(McpConnectDecoder { opts: opts.clone() });
+    let resource = InterruptibleResource::new("mcp/connect", Box::new(McpNoopCancelHook));
+    let prepared =
+        PreparedExternalOperation::interruptible_blocking(kind, decoder, resource, move || {
+            let result = match sema_io::io_block_on(connect_dispatch_async(
+                config_json,
+                opts,
+                OpenerSource::Resolved(browser_allowed),
+            )) {
+                Ok((client, identity)) => ConnectPayloadResult::Connected {
+                    client: Box::new(client),
+                    identity,
+                },
+                Err(ConnectOutcome::NeedsAuth(url)) => ConnectPayloadResult::NeedsAuth(url),
+                Err(ConnectOutcome::Sema(error)) => {
+                    ConnectPayloadResult::Failed(ConnectErrorPayload::from_sema(error))
+                }
+            };
+            Ok(Box::new(McpConnectPayload(result)) as SendPayload)
+        });
+    Ok(NativeOutcome::Suspend(NativeSuspend {
+        wait: WaitKind::External(Box::new(prepared)),
+        continuation: Box::new(McpReturnContinuation {
+            label: "mcp/connect",
+        }),
+    }))
+}
+
+fn connect_builtin(args: &[Value]) -> NativeResult {
+    let config_json = config_to_json(args)?;
+    let opts = ConnectOpts {
+        interactive_auth: true,
+        allowed_tools: None,
+    };
+    if in_runtime_quantum() {
+        let sandbox = SANDBOX.with(|sandbox| sandbox.borrow().clone());
+        gate(&sandbox, connect_capability(&config_json))?;
+        return connect_runtime_outcome(config_json, opts, browser_open_allowed());
+    }
+    connect_with_opts(&config_json, &opts)
+        .map(NativeOutcome::Return)
+        .map_err(connect_outcome_to_sema_error)
 }
 
 fn require_handle<'a>(args: &'a [Value], fn_name: &str) -> Result<&'a str, SemaError> {
@@ -1064,7 +1240,7 @@ fn call_tool(
     // through the runtime's thread-pool executor as an external wait (the same
     // `NativeOutcome::Suspend` mechanism `sleep` uses) so two `mcp/call`s to
     // DIFFERENT connections overlap on separate workers instead of serializing
-    // on the VM thread. Checked before the legacy `in_async_context` path.
+    // on the VM thread.
     if in_runtime_quantum() {
         let interactive_auth = entry.meta.interactive_auth;
         let browser_allowed = browser_open_allowed();
@@ -1220,12 +1396,24 @@ impl CompletionDecoder for McpCallDecoder {
     }
 }
 
-/// The `mcp/call` state carried between gate lifecycle stages (create → acquire
-/// → external → release). Threaded through the continuations so the connection
-/// stays serialized on its [`ResourceGate`] without any executor polling. Holds
-/// no live `Value` (see [`Materialize`]); `arguments_json` is plain JSON.
-struct McpCallState {
+trait McpGatedAction: Trace {
+    fn label(&self) -> &'static str;
+    fn prepare(
+        self: Box<Self>,
+        entry: Rc<ConnEntry>,
+        conn: McpConnection,
+    ) -> PreparedExternalOperation;
+}
+
+/// Shared state for the existing connection gate lifecycle (create → acquire →
+/// external → release). The boxed action contains only operation-specific plain
+/// data and builds the External wait after the gate grants exclusive ownership.
+struct McpGatedState {
     entry: Rc<ConnEntry>,
+    action: Box<dyn McpGatedAction>,
+}
+
+struct McpCallAction {
     cassette_key: String,
     tool_name: String,
     arguments_json: serde_json::Value,
@@ -1234,15 +1422,62 @@ struct McpCallState {
     browser_allowed: bool,
 }
 
+impl Trace for McpCallAction {
+    fn trace(&self, _sink: &mut dyn FnMut(GcEdge<'_>)) -> bool {
+        true
+    }
+}
+
+impl McpGatedAction for McpCallAction {
+    fn label(&self) -> &'static str {
+        "mcp/call"
+    }
+
+    fn prepare(
+        self: Box<Self>,
+        entry: Rc<ConnEntry>,
+        conn: McpConnection,
+    ) -> PreparedExternalOperation {
+        let McpCallAction {
+            cassette_key,
+            tool_name,
+            arguments_json,
+            materialize,
+            interactive_auth,
+            browser_allowed,
+        } = *self;
+        let kind = CompletionKind::try_from_raw(MCP_CALL_COMPLETION_KIND)
+            .expect("mcp/call completion kind is nonzero");
+        let decoder = Box::new(McpCallDecoder {
+            entry: entry.clone(),
+            cassette_key,
+            materialize,
+        });
+        let resource =
+            InterruptibleResource::new("mcp/call", Box::new(McpCallCancelHook { entry }));
+        PreparedExternalOperation::interruptible_blocking(kind, decoder, resource, move || {
+            let mut conn = conn;
+            let result = sema_io::io_block_on(call_tool_async(
+                &mut conn,
+                &tool_name,
+                arguments_json,
+                interactive_auth,
+                OpenerSource::Resolved(browser_allowed),
+            ));
+            Ok(Box::new(McpCallPayload { conn, result }) as SendPayload)
+        })
+    }
+}
+
 /// Stage 0: a freshly-created gate arrives; store it on the connection entry,
 /// then suspend on its slot. Holds no `Value`.
 struct McpCreateGateCont {
-    state: McpCallState,
+    state: McpGatedState,
 }
 
 impl Trace for McpCreateGateCont {
-    fn trace(&self, _sink: &mut dyn FnMut(GcEdge<'_>)) -> bool {
-        true
+    fn trace(&self, sink: &mut dyn FnMut(GcEdge<'_>)) -> bool {
+        self.state.action.trace(sink)
     }
 }
 
@@ -1253,6 +1488,7 @@ impl NativeContinuation for McpCreateGateCont {
         input: ResumeInput,
     ) -> NativeResult {
         let state = self.state;
+        let label = state.action.label();
         match input {
             ResumeInput::Runtime(RuntimeResponse::ResourceGate(gate)) => {
                 state.entry.gate.set(Some(gate));
@@ -1263,11 +1499,11 @@ impl NativeContinuation for McpCreateGateCont {
             }
             ResumeInput::Failed(error) => Err(error),
             ResumeInput::Cancelled(reason) => Err(SemaError::eval(format!(
-                "mcp/call was cancelled before its connection gate was created ({reason:?})"
+                "{label} was cancelled before its connection gate was created ({reason:?})"
             ))),
-            ResumeInput::Returned(_) | ResumeInput::Runtime(_) => Err(SemaError::eval(
-                "mcp/call: unexpected runtime response creating connection gate",
-            )),
+            ResumeInput::Returned(_) | ResumeInput::Runtime(_) => Err(SemaError::eval(format!(
+                "{label}: unexpected runtime response creating connection gate"
+            ))),
         }
     }
 }
@@ -1277,13 +1513,13 @@ impl NativeContinuation for McpCreateGateCont {
 /// releases the gate (waking the next acquirer, who also fails fast) then raises.
 /// Holds no `Value`.
 struct McpAcquireCont {
-    state: McpCallState,
+    state: McpGatedState,
     gate: ResourceGateId,
 }
 
 impl Trace for McpAcquireCont {
-    fn trace(&self, _sink: &mut dyn FnMut(GcEdge<'_>)) -> bool {
-        true
+    fn trace(&self, sink: &mut dyn FnMut(GcEdge<'_>)) -> bool {
+        self.state.action.trace(sink)
     }
 }
 
@@ -1294,50 +1530,17 @@ impl NativeContinuation for McpAcquireCont {
         input: ResumeInput,
     ) -> NativeResult {
         let McpAcquireCont { state, gate } = *self;
+        let label = state.action.label();
         match input {
             // Slot granted: we now own `gate`.
             ResumeInput::Runtime(RuntimeResponse::Value(_)) => {
-                let McpCallState {
-                    entry,
-                    cassette_key,
-                    tool_name,
-                    arguments_json,
-                    materialize,
-                    interactive_auth,
-                    browser_allowed,
-                } = state;
+                let McpGatedState { entry, action } = state;
                 match try_checkout(&entry) {
                     Ok(Some(conn)) => {
-                        let kind = CompletionKind::try_from_raw(MCP_CALL_COMPLETION_KIND)
-                            .expect("mcp/call completion kind is nonzero");
-                        let decoder = Box::new(McpCallDecoder {
-                            entry: entry.clone(),
-                            cassette_key,
-                            materialize,
-                        });
-                        let resource = InterruptibleResource::new(
-                            "mcp/call",
-                            Box::new(McpCallCancelHook { entry }),
-                        );
-                        let prepared = PreparedExternalOperation::interruptible_blocking(
-                            kind,
-                            decoder,
-                            resource,
-                            move || {
-                                let mut conn = conn;
-                                let result = sema_io::io_block_on(call_tool_async(
-                                    &mut conn,
-                                    &tool_name,
-                                    arguments_json,
-                                    interactive_auth,
-                                    OpenerSource::Resolved(browser_allowed),
-                                ));
-                                Ok(Box::new(McpCallPayload { conn, result }) as SendPayload)
-                            },
-                        );
+                        let prepared = action.prepare(entry, conn);
                         Ok(NativeOutcome::Suspend(NativeSuspend {
                             wait: WaitKind::External(Box::new(prepared)),
-                            continuation: Box::new(McpReleaseReturnCont { gate }),
+                            continuation: Box::new(McpReleaseReturnCont { gate, label }),
                         }))
                     }
                     // Slot tombstoned/missing (a prior cancel orphaned it): we own
@@ -1347,9 +1550,9 @@ impl NativeContinuation for McpAcquireCont {
                     Ok(None) => Ok(NativeOutcome::Runtime(
                         RuntimeRequest::ReleaseResourceGate {
                             gate,
-                            continuation: Box::new(McpFinalCont::Fail(SemaError::eval(
-                                "mcp/call: connection unexpectedly busy while holding its gate",
-                            ))),
+                            continuation: Box::new(McpFinalCont::Fail(SemaError::eval(format!(
+                                "{label}: connection unexpectedly busy while holding its gate"
+                            )))),
                         },
                     )),
                     Err(error) => Ok(NativeOutcome::Runtime(
@@ -1366,11 +1569,11 @@ impl NativeContinuation for McpAcquireCont {
             // removed us from the FIFO; we never owned the gate, so the connection
             // is untouched.
             ResumeInput::Cancelled(reason) => Err(SemaError::eval(format!(
-                "mcp/call was cancelled while waiting for its connection ({reason:?})"
+                "{label} was cancelled while waiting for its connection ({reason:?})"
             ))),
-            ResumeInput::Returned(_) | ResumeInput::Runtime(_) => Err(SemaError::eval(
-                "mcp/call: unexpected runtime response acquiring connection",
-            )),
+            ResumeInput::Returned(_) | ResumeInput::Runtime(_) => Err(SemaError::eval(format!(
+                "{label}: unexpected runtime response acquiring connection"
+            ))),
         }
     }
 }
@@ -1380,6 +1583,7 @@ impl NativeContinuation for McpAcquireCont {
 /// only the gate id (`Copy`), so it is trivially edge-free.
 struct McpReleaseReturnCont {
     gate: ResourceGateId,
+    label: &'static str,
 }
 
 impl Trace for McpReleaseReturnCont {
@@ -1398,11 +1602,12 @@ impl NativeContinuation for McpReleaseReturnCont {
             ResumeInput::Returned(value) => Box::new(McpFinalCont::Value(value)),
             ResumeInput::Failed(error) => Box::new(McpFinalCont::Fail(error)),
             ResumeInput::Cancelled(reason) => Box::new(McpFinalCont::Fail(SemaError::eval(
-                format!("mcp/call was cancelled ({reason:?})"),
+                format!("{} was cancelled ({reason:?})", self.label),
             ))),
-            ResumeInput::Runtime(_) => Box::new(McpFinalCont::Fail(SemaError::eval(
-                "mcp/call: unexpected runtime response after offload",
-            ))),
+            ResumeInput::Runtime(_) => Box::new(McpFinalCont::Fail(SemaError::eval(format!(
+                "{}: unexpected runtime response after offload",
+                self.label
+            )))),
         };
         Ok(NativeOutcome::Runtime(
             RuntimeRequest::ReleaseResourceGate {
@@ -1450,7 +1655,8 @@ impl NativeContinuation for McpFinalCont {
 /// Acquires the connection's [`ResourceGate`] (creating it on first use) so
 /// calls on the SAME connection serialize FIFO while calls to DIFFERENT
 /// connections overlap; the actual JSON-RPC round trip runs off the VM thread as
-/// an External wait once the gate is owned. The old poll+retry queue is gone.
+/// an External wait once the gate is owned. Acquisition is event-driven; no
+/// executor polling is involved.
 fn mcp_call_runtime_outcome(
     entry: Rc<ConnEntry>,
     cassette_key: String,
@@ -1460,8 +1666,7 @@ fn mcp_call_runtime_outcome(
     interactive_auth: bool,
     browser_allowed: bool,
 ) -> NativeResult {
-    let state = McpCallState {
-        entry,
+    let action = McpCallAction {
         cassette_key,
         tool_name,
         arguments_json,
@@ -1469,6 +1674,14 @@ fn mcp_call_runtime_outcome(
         interactive_auth,
         browser_allowed,
     };
+    mcp_gated_runtime_outcome(entry, Box::new(action))
+}
+
+fn mcp_gated_runtime_outcome(
+    entry: Rc<ConnEntry>,
+    action: Box<dyn McpGatedAction>,
+) -> NativeResult {
+    let state = McpGatedState { entry, action };
     match state.entry.gate.get() {
         Some(gate) => Ok(NativeOutcome::Suspend(NativeSuspend {
             wait: WaitKind::ResourceSlot(gate),
@@ -1478,6 +1691,184 @@ fn mcp_call_runtime_outcome(
             continuation: Box::new(McpCreateGateCont { state }),
         })),
     }
+}
+
+// ── Shared unified-runtime path for `mcp/tools` and `mcp/close` ─────────────
+
+const MCP_CONNECTION_OP_COMPLETION_KIND: u64 = 0x6d63_7033; // "mcp3"
+
+/// VM-thread result shaping for `tools/list`. Implementations capture only
+/// plain strings; no `Value` is retained across the External wait.
+type ToolsMaterialize = Box<dyn FnOnce(Vec<Tool>, &ConnMeta) -> Value>;
+
+enum McpConnectionOperation {
+    ListTools,
+    Close,
+}
+
+enum McpConnectionOperationResult {
+    Tools(Result<Vec<Tool>, String>),
+    Close(Result<(), String>),
+}
+
+struct McpConnectionOperationPayload {
+    conn: McpConnection,
+    result: McpConnectionOperationResult,
+}
+
+enum McpConnectionFinish {
+    Tools {
+        label: &'static str,
+        materialize: ToolsMaterialize,
+    },
+    Close,
+}
+
+impl McpConnectionFinish {
+    fn label(&self) -> &'static str {
+        match self {
+            Self::Tools { label, .. } => label,
+            Self::Close => "mcp/close",
+        }
+    }
+}
+
+struct McpConnectionCancelHook {
+    entry: Rc<ConnEntry>,
+    label: &'static str,
+}
+
+impl Trace for McpConnectionCancelHook {
+    fn trace(&self, _sink: &mut dyn FnMut(GcEdge<'_>)) -> bool {
+        true
+    }
+}
+
+impl CancelHook for McpConnectionCancelHook {
+    fn cancel(&mut self) -> Result<CancelDisposition, CancelHookError> {
+        tombstone_slot(&self.entry, format!("cancelled during {}", self.label));
+        Ok(CancelDisposition::Reaped)
+    }
+
+    fn reap(&mut self) -> Result<CancelDisposition, CancelHookError> {
+        Ok(CancelDisposition::Reaped)
+    }
+}
+
+struct McpConnectionDecoder {
+    entry: Rc<ConnEntry>,
+    finish: McpConnectionFinish,
+}
+
+impl Trace for McpConnectionDecoder {
+    fn trace(&self, _sink: &mut dyn FnMut(GcEdge<'_>)) -> bool {
+        // `entry` never owns a Value, and ToolsMaterialize captures only plain
+        // strings (the connection handle for tools->sema).
+        true
+    }
+}
+
+impl CompletionDecoder for McpConnectionDecoder {
+    fn decode(
+        self: Box<Self>,
+        _context: &mut NativeCallContext<'_>,
+        result: Result<SendPayload, ExternalFailure>,
+    ) -> DecodedCompletion {
+        let McpConnectionDecoder { entry, finish } = *self;
+        let label = finish.label();
+        let payload = match result {
+            Ok(payload) => payload,
+            Err(failure) => {
+                tombstone_slot(&entry, format!("{label} worker failed"));
+                return Err(SemaError::eval(format!("{label}: {}", failure.message())));
+            }
+        };
+        let McpConnectionOperationPayload { conn, result } =
+            match downcast_send_payload::<McpConnectionOperationPayload>(payload, label) {
+                Ok(payload) => payload,
+                Err(failure) => {
+                    tombstone_slot(&entry, format!("{label} payload decode failed"));
+                    return Err(SemaError::eval(format!("{label}: {}", failure.message())));
+                }
+            };
+
+        match (finish, result) {
+            (
+                McpConnectionFinish::Tools { label, materialize },
+                McpConnectionOperationResult::Tools(result),
+            ) => {
+                checkin(&entry, conn);
+                let tools = result.map_err(|error| SemaError::eval(format!("{label}: {error}")))?;
+                Ok(materialize(tools, &entry.meta))
+            }
+            (McpConnectionFinish::Close, McpConnectionOperationResult::Close(result)) => {
+                tombstone_slot(&entry, "connection closed");
+                drop(conn);
+                result.map_err(|error| SemaError::eval(format!("mcp/close: {error}")))?;
+                Ok(Value::nil())
+            }
+            _ => {
+                tombstone_slot(&entry, format!("{label} result kind mismatch"));
+                Err(SemaError::eval(format!(
+                    "{label}: worker returned an unexpected operation result"
+                )))
+            }
+        }
+    }
+}
+
+struct McpConnectionAction {
+    operation: McpConnectionOperation,
+    finish: McpConnectionFinish,
+}
+
+impl Trace for McpConnectionAction {
+    fn trace(&self, _sink: &mut dyn FnMut(GcEdge<'_>)) -> bool {
+        true
+    }
+}
+
+impl McpGatedAction for McpConnectionAction {
+    fn label(&self) -> &'static str {
+        self.finish.label()
+    }
+
+    fn prepare(
+        self: Box<Self>,
+        entry: Rc<ConnEntry>,
+        conn: McpConnection,
+    ) -> PreparedExternalOperation {
+        let McpConnectionAction { operation, finish } = *self;
+        let label = finish.label();
+        let kind = CompletionKind::try_from_raw(MCP_CONNECTION_OP_COMPLETION_KIND)
+            .expect("MCP connection operation completion kind is nonzero");
+        let decoder = Box::new(McpConnectionDecoder {
+            entry: entry.clone(),
+            finish,
+        });
+        let resource =
+            InterruptibleResource::new(label, Box::new(McpConnectionCancelHook { entry, label }));
+        PreparedExternalOperation::interruptible_blocking(kind, decoder, resource, move || {
+            let mut conn = conn;
+            let result = match operation {
+                McpConnectionOperation::ListTools => McpConnectionOperationResult::Tools(
+                    sema_io::io_block_on(list_tools_async(&mut conn)),
+                ),
+                McpConnectionOperation::Close => McpConnectionOperationResult::Close(
+                    sema_io::io_block_on(close_async(&mut conn)),
+                ),
+            };
+            Ok(Box::new(McpConnectionOperationPayload { conn, result }) as SendPayload)
+        })
+    }
+}
+
+fn mcp_connection_runtime_outcome(
+    entry: Rc<ConnEntry>,
+    operation: McpConnectionOperation,
+    finish: McpConnectionFinish,
+) -> NativeResult {
+    mcp_gated_runtime_outcome(entry, Box::new(McpConnectionAction { operation, finish }))
 }
 
 // ── `mcp/tools` / `mcp/tools->sema`: shared listing entry point ────────────
@@ -1649,13 +2040,23 @@ fn fetch_tools(
     handle: &str,
     label: &'static str,
     on_ready: impl FnOnce(Vec<Tool>, &ConnMeta) -> Value + 'static,
-) -> Result<Value, SemaError> {
+) -> NativeResult {
     let entry = lookup_entry(handle)?;
+    if in_runtime_quantum() {
+        return mcp_connection_runtime_outcome(
+            entry,
+            McpConnectionOperation::ListTools,
+            McpConnectionFinish::Tools {
+                label,
+                materialize: Box::new(on_ready),
+            },
+        );
+    }
     let mut conn = try_checkout(&entry)?.ok_or_else(|| busy_sync_error(handle, label))?;
     let result = block_on(list_tools_async(&mut conn));
     checkin(&entry, conn);
     let tools = result.map_err(|err| SemaError::eval(format!("{label}: {err}")))?;
-    Ok(on_ready(tools, &entry.meta))
+    Ok(NativeOutcome::Return(on_ready(tools, &entry.meta)))
 }
 
 // ── `mcp/close` ─────────────────────────────────────────────────────────────
@@ -1682,6 +2083,28 @@ pub fn close_handle(handle: &Value) {
     }
 }
 
+fn close_connection(args: &[Value]) -> NativeResult {
+    check_arity!(args, "mcp/close", 1);
+    let handle = require_handle(args, "mcp/close")?;
+    let entry = CONNECTIONS.with(|connections| connections.borrow_mut().remove(handle));
+    let Some(entry) = entry else {
+        return Err(SemaError::eval(format!(
+            "mcp connection {handle} is not registered; it may have already been closed"
+        )));
+    };
+    if in_runtime_quantum() {
+        return mcp_connection_runtime_outcome(
+            entry,
+            McpConnectionOperation::Close,
+            McpConnectionFinish::Close,
+        );
+    }
+    let mut conn = try_checkout(&entry)?.ok_or_else(|| busy_sync_error(handle, "mcp/close"))?;
+    let result = block_on(close_async(&mut conn));
+    result.map_err(|err| SemaError::eval(format!("mcp/close: {err}")))?;
+    Ok(NativeOutcome::Return(Value::nil()))
+}
+
 pub fn register_mcp_builtins(env: &Env, sandbox: &Sandbox) {
     // Capture the sandbox so the OAuth browser launch can honor the PROCESS cap.
     SANDBOX.with(|s| *s.borrow_mut() = sandbox.clone());
@@ -1689,34 +2112,36 @@ pub fn register_mcp_builtins(env: &Env, sandbox: &Sandbox) {
     // `mcp/connect` picks its transport from the config map at runtime, so the
     // capability it needs is not fixed: a `:url` server is network I/O
     // (`NETWORK`), a `:command` server spawns a process (`PROCESS`). Gating and
-    // dispatch live in `connect_with_opts`/`connect_offload`, shared with
+    // dispatch live in the shared connect helpers used by
     // `connect_from_config`; this just supplies the interactive, unrestricted
     // options `mcp/connect` has always used.
-    register_fn(env, "mcp/connect", |args| {
-        let config_json = config_to_json(args)?;
-        let opts = ConnectOpts {
-            interactive_auth: true,
-            allowed_tools: None,
-        };
-        connect_with_opts(&config_json, &opts).map_err(connect_outcome_to_sema_error)
-    });
+    env.set_str(
+        "mcp/connect",
+        Value::native_fn(dual_native("mcp/connect".to_string(), connect_builtin)),
+    );
 
-    register_fn(env, "mcp/tools", |args| {
-        check_arity!(args, "mcp/tools", 1);
-        let handle = require_handle(args, "mcp/tools")?;
-        fetch_tools(handle, "mcp/tools", |tools, meta| {
-            tools_to_value(tools, &meta.allowed_tools)
-        })
-    });
+    env.set_str(
+        "mcp/tools",
+        Value::native_fn(dual_native("mcp/tools".to_string(), |args| {
+            check_arity!(args, "mcp/tools", 1);
+            let handle = require_handle(args, "mcp/tools")?;
+            fetch_tools(handle, "mcp/tools", |tools, meta| {
+                tools_to_value(tools, &meta.allowed_tools)
+            })
+        })),
+    );
 
-    register_fn(env, "mcp/tools->sema", |args| {
-        check_arity!(args, "mcp/tools->sema", 1);
-        let handle = require_handle(args, "mcp/tools->sema")?;
-        let connection_handle = handle.to_string();
-        fetch_tools(handle, "mcp/tools->sema", move |tools, meta| {
-            tool_defs_to_value(tools, &meta.allowed_tools, &connection_handle)
-        })
-    });
+    env.set_str(
+        "mcp/tools->sema",
+        Value::native_fn(dual_native("mcp/tools->sema".to_string(), |args| {
+            check_arity!(args, "mcp/tools->sema", 1);
+            let handle = require_handle(args, "mcp/tools->sema")?;
+            let connection_handle = handle.to_string();
+            fetch_tools(handle, "mcp/tools->sema", move |tools, meta| {
+                tool_defs_to_value(tools, &meta.allowed_tools, &connection_handle)
+            })
+        })),
+    );
 
     env.set_str(
         "mcp/call",
@@ -1734,20 +2159,10 @@ pub fn register_mcp_builtins(env: &Env, sandbox: &Sandbox) {
         })),
     );
 
-    register_fn(env, "mcp/close", |args| {
-        check_arity!(args, "mcp/close", 1);
-        let handle = require_handle(args, "mcp/close")?;
-        let entry = CONNECTIONS.with(|connections| connections.borrow_mut().remove(handle));
-        let Some(entry) = entry else {
-            return Err(SemaError::eval(format!(
-                "mcp connection {handle} is not registered; it may have already been closed"
-            )));
-        };
-        let mut conn = try_checkout(&entry)?.ok_or_else(|| busy_sync_error(handle, "mcp/close"))?;
-        let result = block_on(close_async(&mut conn));
-        result.map_err(|err| SemaError::eval(format!("mcp/close: {err}")))?;
-        Ok(Value::nil())
-    });
+    env.set_str(
+        "mcp/close",
+        Value::native_fn(dual_native("mcp/close".to_string(), close_connection)),
+    );
 }
 
 #[cfg(test)]
@@ -1790,6 +2205,8 @@ mod tests {
     #[test]
     fn mcp_connection_is_send() {
         _assert_mcp_connection_is_send();
+        _assert_send::<McpConnectPayload>();
+        _assert_send::<McpConnectionOperationPayload>();
     }
 
     #[test]
@@ -1813,5 +2230,65 @@ mod tests {
         };
         assert!(err.to_string().contains("connection lost"));
         assert!(err.to_string().contains("cancelled mid-call"));
+    }
+
+    fn checked_out_entry() -> Rc<ConnEntry> {
+        Rc::new(ConnEntry {
+            meta: ConnMeta {
+                identity: "trace-test".to_string(),
+                interactive_auth: false,
+                allowed_tools: None,
+            },
+            slot: RefCell::new(Slot::CheckedOut),
+            gate: Cell::new(None),
+        })
+    }
+
+    fn tools_finish() -> McpConnectionFinish {
+        McpConnectionFinish::Tools {
+            label: "mcp/tools",
+            materialize: Box::new(|tools, meta| tools_to_value(tools, &meta.allowed_tools)),
+        }
+    }
+
+    #[test]
+    fn mcp_runtime_connection_continuations_trace_exact_value_edges() {
+        let connect = McpReturnContinuation {
+            label: "mcp/connect",
+        };
+        let mut edges = 0;
+        assert!(connect.trace(&mut |_| edges += 1));
+        assert_eq!(edges, 0);
+
+        let create = McpCreateGateCont {
+            state: McpGatedState {
+                entry: checked_out_entry(),
+                action: Box::new(McpConnectionAction {
+                    operation: McpConnectionOperation::ListTools,
+                    finish: tools_finish(),
+                }),
+            },
+        };
+        let mut edges = 0;
+        assert!(create.trace(&mut |_| edges += 1));
+        assert_eq!(edges, 0);
+
+        let decoder = McpConnectionDecoder {
+            entry: checked_out_entry(),
+            finish: tools_finish(),
+        };
+        let mut edges = 0;
+        assert!(decoder.trace(&mut |_| edges += 1));
+        assert_eq!(edges, 0);
+
+        let final_value = McpFinalCont::Value(Value::string("kept"));
+        let mut edges = 0;
+        assert!(final_value.trace(&mut |_| edges += 1));
+        assert_eq!(edges, 1);
+
+        let final_error = McpFinalCont::Fail(SemaError::UserException(Value::string("kept")));
+        let mut edges = 0;
+        assert!(final_error.trace(&mut |_| edges += 1));
+        assert_eq!(edges, 1);
     }
 }

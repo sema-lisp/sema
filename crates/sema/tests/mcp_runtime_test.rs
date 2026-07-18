@@ -9,7 +9,15 @@
 //! scheduler. The legacy path is covered by `mcp_async_test.rs`; this file is
 //! the runtime-path oracle.
 
+use std::io::{BufRead, BufReader};
+use std::process::{Child, Command, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
+
 use sema::Interpreter;
+use sema_core::Sandbox;
+use sema_eval::Interpreter as EvalInterpreter;
+use sema_vm::runtime::RootOptions;
 
 /// Sema string-literal-encode a Rust string (JSON string syntax is a valid Sema
 /// string literal), for interpolating a marker path / server script.
@@ -25,6 +33,271 @@ fn unique_temp_path(tag: &str) -> std::path::PathBuf {
         "sema-mcp-runtime-{tag}-{}-{n}.marker",
         std::process::id()
     ))
+}
+
+struct Markers {
+    release: std::path::PathBuf,
+    entered: std::path::PathBuf,
+    timed_out: std::path::PathBuf,
+    finished: std::path::PathBuf,
+}
+
+impl Markers {
+    fn new(tag: &str) -> Self {
+        Self {
+            release: unique_temp_path(&format!("{tag}-release")),
+            entered: unique_temp_path(&format!("{tag}-entered")),
+            timed_out: unique_temp_path(&format!("{tag}-timed-out")),
+            finished: unique_temp_path(&format!("{tag}-finished")),
+        }
+    }
+
+    fn script_args(&self) -> String {
+        format!(
+            "{} {} {} {}",
+            sema_str(&self.release.to_string_lossy()),
+            sema_str(&self.entered.to_string_lossy()),
+            sema_str(&self.timed_out.to_string_lossy()),
+            sema_str(&self.finished.to_string_lossy()),
+        )
+    }
+}
+
+impl Drop for Markers {
+    fn drop(&mut self) {
+        for path in [
+            &self.release,
+            &self.entered,
+            &self.timed_out,
+            &self.finished,
+        ] {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+fn wait_for_path(path: &std::path::Path, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if path.exists() {
+            return true;
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+    path.exists()
+}
+
+fn mcp_eval_interpreter() -> EvalInterpreter {
+    let interp = EvalInterpreter::new();
+    sema_mcp::register_mcp_builtins(&interp.global_env, &Sandbox::allow_all());
+    interp
+}
+
+const DELAYED_STDIO_SERVER: &str = r#"
+import json, os, sys, time
+
+mode, release, entered, timed_out, finished = sys.argv[1:6]
+
+def touch(path):
+    open(path, "w").close()
+
+def wait_for_release():
+    touch(entered)
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        if os.path.exists(release):
+            touch(finished)
+            return
+        time.sleep(0.005)
+    touch(timed_out)
+    touch(finished)
+
+def send(message):
+    sys.stdout.write(json.dumps(message) + "\n")
+    sys.stdout.flush()
+
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    request = json.loads(line)
+    method = request.get("method")
+    request_id = request.get("id")
+    if request_id is None:
+        continue
+    if method == "initialize":
+        if mode == "connect":
+            wait_for_release()
+        send({"jsonrpc": "2.0", "id": request_id, "result": {
+            "protocolVersion": "2025-11-25", "capabilities": {},
+            "serverInfo": {"name": "delayed", "version": "1"}}})
+    elif method == "tools/list":
+        if mode == "tools":
+            wait_for_release()
+        send({"jsonrpc": "2.0", "id": request_id, "result": {"tools": [
+            {"name": "echo", "description": "Echo a string",
+             "inputSchema": {"type": "object",
+                             "properties": {"text": {"type": "string"}},
+                             "required": ["text"]}}
+        ]}})
+    elif method == "tools/call":
+        arguments = request.get("params", {}).get("arguments", {})
+        send({"jsonrpc": "2.0", "id": request_id, "result": {
+            "content": [{"type": "text", "text": arguments.get("text", "")}],
+            "isError": False}})
+    else:
+        send({"jsonrpc": "2.0", "id": request_id,
+              "error": {"code": -32601, "message": "Method not found"}})
+"#;
+
+fn delayed_stdio_config(mode: &str, markers: &Markers) -> String {
+    let script = sema_str(DELAYED_STDIO_SERVER);
+    format!(
+        r#"{{:command "python3" :args ["-c" {script} {} {}]}}"#,
+        sema_str(mode),
+        markers.script_args(),
+    )
+}
+
+const DELAYED_HTTP_SERVER: &str = r#"
+import json, os, sys, time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+release, entered, timed_out, finished = sys.argv[1:5]
+
+def touch(path):
+    open(path, "w").close()
+
+class Handler(BaseHTTPRequestHandler):
+    def log_message(self, *args):
+        pass
+
+    def reply(self, status, body=b"", headers=None):
+        self.send_response(status)
+        for key, value in (headers or {}).items():
+            self.send_header(key, value)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        if body:
+            self.wfile.write(body)
+
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length", "0"))
+        raw = self.rfile.read(length) if length else b""
+        request = json.loads(raw) if raw else {}
+        request_id = request.get("id")
+        if request_id is None:
+            self.reply(202)
+            return
+        method = request.get("method")
+        if method == "initialize":
+            result = {"protocolVersion": "2025-11-25", "capabilities": {},
+                      "serverInfo": {"name": "delayed-http", "version": "1"}}
+        elif method == "tools/list":
+            result = {"tools": []}
+        else:
+            result = {}
+        body = json.dumps({"jsonrpc": "2.0", "id": request_id,
+                           "result": result}).encode()
+        self.reply(200, body, {"Content-Type": "application/json",
+                               "Mcp-Session-Id": "delayed-session"})
+
+    def do_DELETE(self):
+        touch(entered)
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            if os.path.exists(release):
+                touch(finished)
+                self.reply(200)
+                return
+            time.sleep(0.005)
+        touch(timed_out)
+        touch(finished)
+        self.reply(200)
+
+server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+print(server.server_address[1], flush=True)
+server.serve_forever()
+"#;
+
+struct HttpServerGuard {
+    child: Child,
+}
+
+impl Drop for HttpServerGuard {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+fn start_delayed_http_server(markers: &Markers) -> (HttpServerGuard, u16) {
+    let mut child = Command::new("python3")
+        .args([
+            "-c",
+            DELAYED_HTTP_SERVER,
+            &markers.release.to_string_lossy(),
+            &markers.entered.to_string_lossy(),
+            &markers.timed_out.to_string_lossy(),
+            &markers.finished.to_string_lossy(),
+        ])
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn delayed HTTP MCP server");
+    let stdout = child.stdout.take().expect("HTTP server stdout");
+    let mut reader = BufReader::new(stdout);
+    let mut line = String::new();
+    reader.read_line(&mut line).expect("read HTTP server port");
+    let port = line.trim().parse().expect("HTTP server port is a u16");
+    (HttpServerGuard { child }, port)
+}
+
+fn assert_cancelled_before_server_fallback(
+    interp: &EvalInterpreter,
+    program: &str,
+    markers: &Markers,
+) {
+    let root = interp
+        .submit_str(program, RootOptions::default())
+        .expect("MCP operation root submits");
+    let root_id = root.id();
+    let command = interp.command_handle();
+    let entered = markers.entered.clone();
+    let emergency_release = markers.release.clone();
+    let canceller = thread::spawn(move || {
+        let saw_entry = wait_for_path(&entered, Duration::from_secs(6));
+        if !saw_entry {
+            let _ = std::fs::write(emergency_release, b"release");
+            return (false, false);
+        }
+        (true, command.cancel_root(root_id))
+    });
+
+    let result = interp.drive_until_settled(&root);
+    let server_fallback_ran = markers.timed_out.exists();
+    let _ = std::fs::write(&markers.release, b"release");
+    let (saw_entry, cancel_accepted) = canceller.join().expect("canceller thread completes");
+    let worker_finished = wait_for_path(&markers.finished, Duration::from_secs(6));
+
+    assert!(
+        saw_entry,
+        "the MCP operation never reached the delayed server"
+    );
+    assert!(cancel_accepted, "the live MCP root rejected cancellation");
+    assert!(result.is_err(), "the cancelled MCP root returned a value");
+    assert!(
+        !server_fallback_ran,
+        "runtime cancellation was not serviced until the server's bounded fallback released the operation"
+    );
+    assert!(
+        worker_finished,
+        "the released MCP worker did not finish cleanup"
+    );
+    assert_eq!(
+        interp.runtime_live_task_count(),
+        0,
+        "cancelled MCP operation left a runtime task behind"
+    );
 }
 
 // Server A withholds its `tools/call` reply until it observes a marker file
@@ -213,4 +486,181 @@ fn same_connection_mcp_calls_serialize_through_runtime() {
     assert_eq!(vals, vec!["call-1", "call-2"]);
 
     interp.eval_str_via_runtime(r#"(mcp/close server)"#).ok();
+}
+
+#[test]
+fn runtime_mcp_connect_wait_allows_sibling_progress() {
+    let markers = Markers::new("connect-progress");
+    let config = delayed_stdio_config("connect", &markers);
+    let release = sema_str(&markers.release.to_string_lossy());
+    let interp = Interpreter::new();
+    let result = interp
+        .eval_str_via_runtime(&format!(
+            r#"
+            (let ((operation (async/spawn (fn () (mcp/connect {config}))))
+                  (sibling (async/spawn (fn ()
+                    (file/write {release} "release")
+                    :sibling))))
+              (list (async/await operation) (async/await sibling)))
+            "#
+        ))
+        .expect("mcp/connect and its sibling complete");
+    let values = result.as_seq().expect("connect result and sibling marker");
+    assert_eq!(values.len(), 2);
+    assert!(values[0].as_str().is_some(), "connect returns a handle");
+    assert_eq!(values[1].as_keyword().as_deref(), Some("sibling"));
+    assert!(markers.entered.exists(), "server delayed initialize");
+    assert!(
+        !markers.timed_out.exists(),
+        "connect blocked the VM until the server's fallback fired"
+    );
+    sema_mcp::close_handle(&values[0]);
+}
+
+#[test]
+fn runtime_mcp_tools_wait_allows_sibling_progress() {
+    let markers = Markers::new("tools-progress");
+    let config = delayed_stdio_config("tools", &markers);
+    let release = sema_str(&markers.release.to_string_lossy());
+    let interp = Interpreter::new();
+    interp
+        .eval_str_via_runtime(&format!("(define server (mcp/connect {config}))"))
+        .expect("connect delayed tools server");
+    let result = interp
+        .eval_str_via_runtime(&format!(
+            r#"
+            (let ((operation (async/spawn (fn () (mcp/tools server))))
+                  (sibling (async/spawn (fn ()
+                    (file/write {release} "release")
+                    :sibling))))
+              (list (async/await operation) (async/await sibling)))
+            "#
+        ))
+        .expect("mcp/tools and its sibling complete");
+    let values = result.as_seq().expect("tools result and sibling marker");
+    let tools = values[0].as_seq().expect("mcp/tools returns a list");
+    assert_eq!(tools.len(), 1);
+    assert_eq!(values[1].as_keyword().as_deref(), Some("sibling"));
+    assert!(markers.entered.exists(), "server delayed tools/list");
+    assert!(
+        !markers.timed_out.exists(),
+        "tools/list blocked the VM until the server's fallback fired"
+    );
+    interp.eval_str_via_runtime("(mcp/close server)").ok();
+}
+
+#[test]
+fn runtime_mcp_close_wait_allows_sibling_progress() {
+    let markers = Markers::new("close-progress");
+    let (_server, port) = start_delayed_http_server(&markers);
+    let release = sema_str(&markers.release.to_string_lossy());
+    let interp = Interpreter::new();
+    interp
+        .eval_str_via_runtime(&format!(
+            "(define server (mcp/connect {{:url \"http://127.0.0.1:{port}/mcp\"}}))"
+        ))
+        .expect("connect delayed close server");
+    let result = interp
+        .eval_str_via_runtime(&format!(
+            r#"
+            (let ((operation (async/spawn (fn () (mcp/close server))))
+                  (sibling (async/spawn (fn ()
+                    (file/write {release} "release")
+                    :sibling))))
+              (list (async/await operation) (async/await sibling)))
+            "#
+        ))
+        .expect("mcp/close and its sibling complete");
+    let values = result.as_seq().expect("close result and sibling marker");
+    assert!(values[0].is_nil(), "mcp/close returns nil");
+    assert_eq!(values[1].as_keyword().as_deref(), Some("sibling"));
+    assert!(markers.entered.exists(), "server delayed DELETE");
+    assert!(
+        !markers.timed_out.exists(),
+        "mcp/close blocked the VM until the server's fallback fired"
+    );
+}
+
+#[test]
+fn runtime_mcp_connect_wait_is_promptly_cancellable() {
+    let markers = Markers::new("connect-cancel");
+    let config = delayed_stdio_config("connect", &markers);
+    let interp = mcp_eval_interpreter();
+    assert_cancelled_before_server_fallback(&interp, &format!("(mcp/connect {config})"), &markers);
+}
+
+#[test]
+fn runtime_mcp_tools_wait_is_promptly_cancellable() {
+    let markers = Markers::new("tools-cancel");
+    let config = delayed_stdio_config("tools", &markers);
+    let interp = mcp_eval_interpreter();
+    interp
+        .eval_str_via_runtime(&format!("(define server (mcp/connect {config}))"))
+        .expect("connect delayed tools server");
+    assert_cancelled_before_server_fallback(&interp, "(mcp/tools server)", &markers);
+    interp.eval_str_via_runtime("(mcp/close server)").ok();
+}
+
+#[test]
+fn runtime_mcp_close_wait_is_promptly_cancellable() {
+    let markers = Markers::new("close-cancel");
+    let (_server, port) = start_delayed_http_server(&markers);
+    let interp = mcp_eval_interpreter();
+    interp
+        .eval_str_via_runtime(&format!(
+            "(define server (mcp/connect {{:url \"http://127.0.0.1:{port}/mcp\"}}))"
+        ))
+        .expect("connect delayed close server");
+    assert_cancelled_before_server_fallback(&interp, "(mcp/close server)", &markers);
+}
+
+#[test]
+fn runtime_mcp_tools_to_sema_matches_synchronous_shape() {
+    let markers = Markers::new("tools-to-sema-parity");
+    let config = delayed_stdio_config("immediate", &markers);
+    let interp = Interpreter::new();
+    interp
+        .eval_str(&format!("(define server (mcp/connect {config}))"))
+        .expect("connect parity server");
+
+    let synchronous = interp
+        .eval_str("(mcp/tools->sema server)")
+        .expect("synchronous tools->sema");
+    let runtime = interp
+        .eval_str_via_runtime("(mcp/tools->sema server)")
+        .expect("runtime tools->sema");
+    let synchronous = synchronous.as_seq().expect("synchronous tool defs");
+    let runtime = runtime.as_seq().expect("runtime tool defs");
+    assert_eq!(synchronous.len(), runtime.len());
+    for (sync_value, runtime_value) in synchronous.iter().zip(runtime) {
+        let sync_tool = sync_value.as_tool_def_rc().expect("synchronous tool def");
+        let runtime_tool = runtime_value.as_tool_def_rc().expect("runtime tool def");
+        assert_eq!(sync_tool.name, runtime_tool.name);
+        assert_eq!(sync_tool.description, runtime_tool.description);
+        assert_eq!(sync_tool.parameters, runtime_tool.parameters);
+    }
+
+    interp.eval_str("(mcp/close server)").ok();
+}
+
+fn assert_sync_runtime_error_parity(source: &str) {
+    let synchronous = Interpreter::new()
+        .eval_str(source)
+        .expect_err("synchronous MCP operation must fail");
+    let runtime = Interpreter::new()
+        .eval_str_via_runtime(source)
+        .expect_err("runtime MCP operation must fail");
+    assert_eq!(synchronous.to_string(), runtime.to_string());
+    assert_eq!(synchronous.hint(), runtime.hint());
+    assert_eq!(synchronous.note(), runtime.note());
+}
+
+#[test]
+fn runtime_mcp_operation_errors_match_synchronous_errors() {
+    assert_sync_runtime_error_parity(
+        r#"(mcp/connect {:command "definitely-not-a-real-mcp-command"})"#,
+    );
+    assert_sync_runtime_error_parity(r#"(mcp/tools "mcp-not-registered")"#);
+    assert_sync_runtime_error_parity(r#"(mcp/tools->sema "mcp-not-registered")"#);
+    assert_sync_runtime_error_parity(r#"(mcp/close "mcp-not-registered")"#);
 }

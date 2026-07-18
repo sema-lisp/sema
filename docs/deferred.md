@@ -789,36 +789,73 @@ two remaining pieces:
   (c); flagged here, not fixed (out of scope — no acceptance test currently
   exercises a suspending op inside an SSE handler body).
 
-## CANCEL-ROOT-CASCADE-1 — `cancel_root` does not sweep detached descendants
+## CANCEL-ROOT-CASCADE-1 — `cancel_root` does not sweep detached descendants (RESOLVED)
 
 **Found 2026-07-18 (adversarial review of SRV-1); general runtime gap, not
-SRV-1-specific.** `Runtime::cancel_root` (`crates/sema-vm/src/runtime/state.rs`,
-the `cancel_root` fn) cancels the root's main task and relies on the live
-cancellation-parent chain to reach descendants — so a descendant that is still
-**parked** (awaiting/sleeping/blocked) under the root is reaped, but a
-**fire-and-forget descendant of a task that has already completed** is orphaned
-(its chain to the root is broken when its parent settles). The `async/cancel` /
-`CancelPromise` path does NOT have this gap — it calls `cancel_descendants`
+SRV-1-specific. RESOLVED 2026-07-18.** `Runtime::cancel_root`
+(`crates/sema-vm/src/runtime/state.rs`, the `cancel_root` fn) cancelled only the
+root's main task and relied on the live cancellation-parent chain to reach
+descendants — so a descendant that was still **parked** (awaiting/sleeping/
+blocked) under the root got reaped, but a **fire-and-forget descendant of a task
+that had already completed** was orphaned (its chain to the root was broken when
+its parent settled and was removed from `state.tasks`). The `async/cancel` /
+`CancelPromise` path did NOT have this gap — it calls `cancel_descendants`
 explicitly. Empirically (persistent `Interpreter`, `runtime_live_task_count`
-after `cancel_root`):
+after `cancel_root`), pre-fix:
 
 | shape | reaped? |
 | --- | --- |
-| root awaits `(async/spawn (sleep))` | **leaks (count 1)** |
-| root detaches `(async/spawn (sleep))`, root sleeps | **leaks (count 1)** |
+| root awaits `(async/spawn (sleep))` | **leaked (count 1)** |
+| root detaches `(async/spawn (sleep))`, root sleeps | **leaked (count 1)** |
 | `http/serve` handler awaits a grandchild | reaped (0) |
-| `http/serve` handler detaches a child then returns | **leaks (count 1)** |
+| `http/serve` handler detaches a child then returns | **leaked (count 1)** |
 
 **Blast radius:** persistent multi-root hosts only (notebook cell cancel;
 embedded `Interpreter`; a server that cancels one root while others run).
 Process-exit CLI is unaffected (the process teardown reaps everything). SIGINT
-of a single-root CLI program is unaffected (root settles, process exits). **Fix
-(not yet landed):** make `cancel_root` call `cancel_descendants` for the
-cancelled root's task subtree, mirroring the `CancelPromise` path — needs a
-focused test (submit root, spawn detached child, `cancel_root`, drive, assert
-`runtime_live_task_count() == 0`) and an audit that the descendant sweep does
-not double-tear-down a task the parent-chain also reaches. Tracked as a
-runtime-correctness follow-up.
+of a single-root CLI program is unaffected (root settles, process exits).
+
+**Resolution — `origin_root` sweep, not `cancel_descendants`.** The obvious fix
+(have `cancel_root` call `cancel_descendants` on the root's main task, mirroring
+`CancelPromise`) does NOT work: `cancel_descendants` is a BFS over the LIVE
+`cancellation_parent` chain, the exact same chain that breaks when an
+intermediate spawner settles and is removed from `state.tasks` — calling it from
+`cancel_root` would still miss the orphaned grandchild for the identical reason.
+Instead, `cancel_root` now sweeps `state.tasks` for every task whose
+`relations().origin_root` equals the cancelled root — a field copied onto every
+descendant at spawn time (`spawn_via_registry`) that survives an intermediate
+spawner's removal, unlike `cancellation_parent`, which points at a specific,
+possibly now-gone, task. The main task keeps the caller's `CancelReason`; every
+other swept task gets `CancelReason::Owner` (matching `cancel_descendants`'
+convention for a transitively-cancelled task). Each newly-cancelled task —
+main and descendants alike — is pushed onto `pending_cancel_waits` and gets the
+same C2 eager wait teardown `deliver_cancel_teardown` already provides for the
+`CancelPromise` path; this composes exactly-once with the per-drive-turn
+`cancel_waiting` scan because `deliver_cancel_teardown` removes the wait
+registration itself, so the scan finds nothing left to double-abort.
+
+**Tests** (`crates/sema-vm/src/runtime/tests.rs`, low-level `Runtime` host API,
+no subprocesses): `cancel_root_reaps_a_fire_and_forget_grandchild_of_an_already_
+settled_task` (the headline repro — a grandchild cancellation-parented to a task
+id that was never inserted into `state.tasks`, modeling "already settled and
+reaped"), `cancel_root_reaps_a_plain_single_task_root` /
+`cancel_root_reaps_a_directly_parked_sibling_child` /
+`cancel_root_on_a_settled_root_returns_false` /
+`cancel_root_is_idempotent_second_call_returns_false_no_panic` (regressions on
+the already-working shapes and the unchanged false/idempotent contract),
+`cancel_root_sweep_does_not_reach_a_sibling_roots_tasks` (CRITICAL multi-root
+isolation — cancelling root A must not touch root B's still-live detached task,
+proven with a far-future `Timer` wait that cannot resolve on its own regardless
+of how long the test keeps driving root A to settlement), and
+`cancel_root_sweep_aborts_an_external_grandchild_exactly_once` (double-teardown
+safety — a `RecordingHook`-backed External wait's abort hook fires exactly once,
+not re-aborted by the drive-turn scan). A gotcha the test suite surfaced: the
+`Inline` fake test executor resolves an External wait on its own after a few
+drive turns regardless of cancellation, so a "descendant survives many drive
+turns" assertion needs a Timer-based wait (never fires without an explicit clock
+advance) to stay a valid RED/GREEN oracle — an External-based version of the
+same test silently passed even with the sweep disabled, because the wait
+resolved naturally before ever being cancelled.
 
 ## Consciously-not-converted blocking natives
 

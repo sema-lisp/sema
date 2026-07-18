@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+- **Runtime correctness: `cancel_root` now reaps fire-and-forget descendants
+  of an already-settled task (CANCEL-ROOT-CASCADE-1).** `Runtime::cancel_root`
+  used to cancel only the root's main task and rely on the live
+  `cancellation_parent` chain to reach descendants — a detached child spawned
+  by a task that had already returned (its spawner removed from
+  `state.tasks`) fell off that chain and leaked, running to completion or
+  staying parked forever in a persistent host (notebook, embedded
+  `Interpreter`, a server cancelling one root while others run). `cancel_root`
+  now sweeps every live task by `origin_root` (a field that survives an
+  intermediate spawner's removal, unlike `cancellation_parent`), reaping the
+  whole subtree regardless of how deep or how settled its spawners are, with
+  the same C2 eager wait teardown and exactly-once composition the
+  `async/cancel` path already relied on. See `docs/deferred.md`
+  §CANCEL-ROOT-CASCADE-1.
 - **SRV-1 (concurrent `http/serve`) — RESOLVED, fail-fast guard deleted.**
   `http/serve`'s accept loop no longer blocks the VM thread: it parks
   cooperatively on a re-arming `WaitKind::External` fed by the request

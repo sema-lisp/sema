@@ -1674,6 +1674,363 @@ fn runtime_command_handle_outliving_runtime_returns_false_without_panic() {
     );
 }
 
+// ── CANCEL-ROOT-CASCADE-1 ───────────────────────────────────────────────
+//
+// `cancel_root` used to cancel only the root's main task and rely on the
+// LIVE `cancellation_parent` chain (walked by `cancel_descendants`, the
+// `async/cancel`/`CancelPromise` path — never called by `cancel_root`
+// itself — plus the per-drive-turn `cancel_waiting` scan) to reach
+// descendants. That chain is broken the moment an intermediate task
+// settles and is removed from `state.tasks`: a fire-and-forget grandchild
+// it spawned before returning is then unreachable from the root and leaks
+// (runs to completion / stays parked forever in a persistent runtime).
+// The fix sweeps every live task by `origin_root` instead — a field that
+// survives an intermediate spawner's removal, unlike `cancellation_parent`.
+//
+// Helpers used below: `submit_test_child_under_root` (cancellation-parented
+// directly on the root, the `async/spawn`-from-main shape) and the new
+// `submit_test_child_under_task` (cancellation-parented on another TASK,
+// the shape a detached descendant of an intermediate spawner has).
+
+/// THE reproduction (CANCEL-ROOT-CASCADE-1): a fire-and-forget grandchild
+/// whose spawning intermediate task has ALREADY SETTLED (and been removed
+/// from `state.tasks`, breaking its `cancellation_parent` chain to the
+/// root) must still be reaped by `cancel_root`. Pre-fix this asserts
+/// `live_task_count() == 1` (the orphaned grandchild); post-fix, 0.
+#[test]
+fn cancel_root_reaps_a_fire_and_forget_grandchild_of_an_already_settled_task() {
+    let clock = Rc::new(FakeClock::new());
+    let runtime = runtime_with_inline_executor(clock);
+    let handle = runtime
+        .submit_test_root(TestPreparedTask::yield_forever())
+        .expect("root admitted");
+    let root = handle.id();
+
+    // Intermediate task: allocated but never inserted into `state.tasks` —
+    // models a same-origin-root task that has ALREADY settled and been
+    // reaped (a handler/task that spawned a detached child and returned).
+    // `TestPreparedTask`'s synthetic settlement path only supports a root's
+    // MAIN task (`self.settle`, which asserts `WrongMainTask` for anything
+    // else — a real detached child settles via `settle_task`, which needs a
+    // genuine VM closure to reach), so this test models "already settled
+    // and gone" directly rather than driving a synthetic task through it.
+    let intermediate = runtime.allocate_task_id_for_test();
+
+    // Grandchild: cancellation-parented to the INTERMEDIATE (not the root),
+    // parked on a far-future Timer that never fires on its own — models a
+    // subprocess/request the intermediate detached before returning. Its
+    // live `cancellation_parent` chain to the root is broken from the
+    // moment it is created: `intermediate` was never a real task. A Timer
+    // (not External) is deliberate: the `Inline` fake executor resolves an
+    // External wait on its own within a handful of drive turns, which would
+    // reap this task via its own NORMAL completion regardless of whether
+    // `cancel_root`'s sweep works — silently defeating this test's RED/GREEN
+    // power. A far-future Timer under a never-advanced `FakeClock`
+    // genuinely never resolves except via cancellation.
+    let _grandchild = runtime.submit_test_child_under_task(
+        root,
+        intermediate,
+        TestPreparedTask::native(Ok(NativeOutcome::Suspend(far_future_timer_suspend()))),
+    );
+
+    // Drive with a work-item budget of 1 until the Timer wait is
+    // registered, stopping EXACTLY there.
+    while runtime.timer_count_for_test() == 0 {
+        runtime.drive(&drive_budget(1)).unwrap();
+    }
+    assert_eq!(
+        runtime.live_task_count(),
+        2,
+        "main (yield-forever) + parked grandchild only"
+    );
+
+    assert!(
+        runtime.cancel_root(root, CancelReason::Explicit),
+        "cancel_root accepts the live root"
+    );
+
+    let mut guard = 0;
+    while matches!(handle.poll_result(), RootPoll::Pending) {
+        runtime.drive(&drive_budget(8)).unwrap();
+        guard += 1;
+        assert!(guard < 100, "cancelled root settles");
+    }
+    let RootPoll::Ready(settlement) = handle.poll_result() else {
+        panic!("cancelled root settles");
+    };
+    assert!(matches!(
+        settlement.outcome,
+        TaskOutcome::Cancelled(CancelReason::Explicit)
+    ));
+    assert_eq!(
+        runtime.live_task_count(),
+        0,
+        "cancel_root must reap the fire-and-forget grandchild too — no leak \
+         (CANCEL-ROOT-CASCADE-1)"
+    );
+}
+
+/// Regression: a plain single-task root is still fully reaped.
+#[test]
+fn cancel_root_reaps_a_plain_single_task_root() {
+    let runtime = runtime_with_inline_executor(Rc::new(FakeClock::new()));
+    let handle = runtime
+        .submit_test_root(TestPreparedTask::yield_forever())
+        .expect("root admitted");
+    let root = handle.id();
+    assert!(runtime.cancel_root(root, CancelReason::Explicit));
+    let mut guard = 0;
+    while matches!(handle.poll_result(), RootPoll::Pending) {
+        runtime.drive(&drive_budget(8)).unwrap();
+        guard += 1;
+        assert!(guard < 50, "single-task root settles");
+    }
+    assert_eq!(runtime.live_task_count(), 0);
+}
+
+/// Regression: a root with a directly root-parented parked sibling (the
+/// already-working shape, reachable from main WITHOUT needing the
+/// `origin_root` sweep) stays fully reaped.
+#[test]
+fn cancel_root_reaps_a_directly_parked_sibling_child() {
+    let runtime = runtime_with_inline_executor(Rc::new(FakeClock::new()));
+    let handle = runtime
+        .submit_test_root(TestPreparedTask::yield_forever())
+        .expect("root admitted");
+    let root = handle.id();
+    // A far-future Timer (never fires under a never-advanced `FakeClock`),
+    // not External — the `Inline` fake executor resolves an External wait
+    // on its own within a few drive turns regardless of cancellation.
+    let _child = runtime.submit_test_child_under_root(
+        root,
+        TestPreparedTask::native(Ok(NativeOutcome::Suspend(far_future_timer_suspend()))),
+    );
+    while runtime.timer_count_for_test() == 0 {
+        runtime.drive(&drive_budget(1)).unwrap();
+    }
+    assert_eq!(runtime.live_task_count(), 2, "main + parked sibling");
+
+    assert!(runtime.cancel_root(root, CancelReason::Explicit));
+    let mut guard = 0;
+    while matches!(handle.poll_result(), RootPoll::Pending) || runtime.live_task_count() > 0 {
+        runtime.drive(&drive_budget(8)).unwrap();
+        guard += 1;
+        assert!(guard < 100, "root with parked sibling settles and drains");
+    }
+    assert_eq!(
+        runtime.live_task_count(),
+        0,
+        "parked sibling reaped alongside main"
+    );
+}
+
+/// Regression: cancelling an unknown/already-settled root still returns
+/// `false` (unchanged contract).
+#[test]
+fn cancel_root_on_a_settled_root_returns_false() {
+    let runtime = runtime_with_inline_executor(Rc::new(FakeClock::new()));
+    let handle = runtime
+        .submit_test_root(TestPreparedTask::returned(Value::int(1)))
+        .expect("root admitted");
+    let root = handle.id();
+    runtime.drive(&drive_budget(8)).unwrap();
+    assert!(
+        matches!(handle.poll_result(), RootPoll::Ready(_)),
+        "root settles on its own"
+    );
+    assert!(
+        !runtime.cancel_root(root, CancelReason::Explicit),
+        "cancel_root on an already-settled root is a no-op"
+    );
+}
+
+/// Regression: `cancel_root` is idempotent — a second call on an
+/// already-cancelled root returns `false` and does not double-tear-down the
+/// swept descendant (would otherwise panic/misbehave in
+/// `deliver_cancel_teardown`).
+#[test]
+fn cancel_root_is_idempotent_second_call_returns_false_no_panic() {
+    let runtime = runtime_with_inline_executor(Rc::new(FakeClock::new()));
+    let handle = runtime
+        .submit_test_root(TestPreparedTask::yield_forever())
+        .expect("root admitted");
+    let root = handle.id();
+    let intermediate = runtime.allocate_task_id_for_test();
+    // A far-future Timer (never fires under a never-advanced `FakeClock`),
+    // not External — see `cancel_root_reaps_a_directly_parked_sibling_child`.
+    let _grandchild = runtime.submit_test_child_under_task(
+        root,
+        intermediate,
+        TestPreparedTask::native(Ok(NativeOutcome::Suspend(far_future_timer_suspend()))),
+    );
+    while runtime.timer_count_for_test() == 0 {
+        runtime.drive(&drive_budget(1)).unwrap();
+    }
+    assert_eq!(runtime.live_task_count(), 2, "main + parked grandchild");
+
+    assert!(
+        runtime.cancel_root(root, CancelReason::Explicit),
+        "first cancel newly cancels"
+    );
+    assert!(
+        !runtime.cancel_root(root, CancelReason::Timeout),
+        "second cancel is a no-op"
+    );
+    let mut guard = 0;
+    while matches!(handle.poll_result(), RootPoll::Pending) || runtime.live_task_count() > 0 {
+        runtime.drive(&drive_budget(8)).unwrap();
+        guard += 1;
+        assert!(guard < 100, "root settles once and every task drains");
+    }
+    assert_eq!(runtime.live_task_count(), 0);
+}
+
+/// CRITICAL — multi-root isolation: the `origin_root` sweep must not
+/// over-reach into a sibling root's tasks. Cancelling root A (which has the
+/// same orphaned-grandchild shape as the headline repro) must leave root
+/// B's independent, still-live detached task fully untouched (never
+/// cancelled, never reaped) while B keeps running/settling normally. Both
+/// descendants park on a far-future `Timer` (not External — the `Inline`
+/// fake executor resolves an External wait on its own after a few drive
+/// turns, which would make root B's "stays alive" half of this test flaky
+/// against the number of turns root A's settlement happens to take; a
+/// `Timer` under a never-advanced `FakeClock` genuinely never fires).
+#[test]
+fn cancel_root_sweep_does_not_reach_a_sibling_roots_tasks() {
+    let clock = Rc::new(FakeClock::new());
+    let runtime = runtime_with_inline_executor(clock);
+
+    // Root A: main (yield-forever) + intermediate (already gone) +
+    // grandchild (parked, cancellation-parented to the now-settled
+    // intermediate) — the same orphaned shape as the headline repro.
+    let handle_a = runtime
+        .submit_test_root(TestPreparedTask::yield_forever())
+        .expect("root A admitted");
+    let root_a = handle_a.id();
+    let intermediate_a = runtime.allocate_task_id_for_test();
+    let _grandchild_a = runtime.submit_test_child_under_task(
+        root_a,
+        intermediate_a,
+        TestPreparedTask::native(Ok(NativeOutcome::Suspend(far_future_timer_suspend()))),
+    );
+
+    // Root B: fully independent. Main settles immediately; a directly
+    // root-parented sibling stays parked on its own Timer wait.
+    let handle_b = runtime
+        .submit_test_root(TestPreparedTask::returned(Value::int(99)))
+        .expect("root B admitted");
+    let root_b = handle_b.id();
+    let _sibling_b = runtime.submit_test_child_under_root(
+        root_b,
+        TestPreparedTask::native(Ok(NativeOutcome::Suspend(far_future_timer_suspend()))),
+    );
+
+    // Drive until root A's grandchild has parked and root B's main has
+    // settled (root B's detached sibling does NOT block root B's
+    // settlement — a detached child never transitions its root).
+    let mut guard = 0;
+    while runtime.live_task_count() > 3 || matches!(handle_b.poll_result(), RootPoll::Pending) {
+        runtime.drive(&drive_budget(8)).unwrap();
+        guard += 1;
+        assert!(guard < 100, "two-root setup converges");
+    }
+    assert_eq!(
+        runtime.live_task_count(),
+        3,
+        "main_a (yield-forever) + grandchild_a (parked) + sibling_b (parked)"
+    );
+    assert!(
+        matches!(handle_b.poll_result(), RootPoll::Ready(_)),
+        "root B settles independently of root A's setup"
+    );
+
+    assert!(runtime.cancel_root(root_a, CancelReason::Explicit));
+    let mut guard = 0;
+    while matches!(handle_a.poll_result(), RootPoll::Pending) {
+        runtime.drive(&drive_budget(8)).unwrap();
+        guard += 1;
+        assert!(guard < 100, "root A settles");
+    }
+
+    assert_eq!(
+        runtime.live_task_count(),
+        1,
+        "root A's main + grandchild reaped; root B's detached sibling left \
+         completely alone"
+    );
+    let RootPoll::Ready(settlement_b) = handle_b.poll_result() else {
+        panic!("root B stays settled")
+    };
+    assert!(
+        matches!(&settlement_b.outcome, TaskOutcome::Returned(v) if v.as_int() == Some(99)),
+        "root B's own settlement is unperturbed by an unrelated root's cancel"
+    );
+}
+
+/// Double-teardown safety: a grandchild parked on a real External wait,
+/// reached BOTH by the new `origin_root` sweep (which pushes it onto
+/// `pending_cancel_waits` and delivers C2 eager teardown) and by the
+/// existing per-drive-turn `cancel_waiting` scan, must have its abort hook
+/// fire EXACTLY ONCE — `deliver_cancel_teardown` removes the wait
+/// registration itself, so the scan finds nothing left to double-abort.
+#[test]
+fn cancel_root_sweep_aborts_an_external_grandchild_exactly_once() {
+    let runtime = runtime_with_inline_executor(Rc::new(FakeClock::new()));
+    let handle = runtime
+        .submit_test_root(TestPreparedTask::yield_forever())
+        .expect("root admitted");
+    let root = handle.id();
+    let intermediate = runtime.allocate_task_id_for_test();
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let _grandchild = runtime.submit_test_child_under_task(
+        root,
+        intermediate,
+        TestPreparedTask::native(Ok(NativeOutcome::Suspend(interruptible_suspend_with_hook(
+            events,
+            RecordingHook {
+                result: CancelResult::Reaped,
+                calls: Arc::clone(&calls),
+                edge: None,
+                trace_ok: true,
+            },
+        )))),
+    );
+    // Drive with a work-item budget of 1 until the External wait is
+    // registered, stopping EXACTLY there — a bigger budget can also drain
+    // the (Inline-executor-resolved) completion in the same turn, which
+    // would resume the grandchild normally before cancellation ever
+    // observes it as `Waiting` (mirrors
+    // `cancelling_external_parked_task_runs_abort_hook_at_request_time`'s
+    // proven pattern above).
+    while runtime.active_wait_count_for_test() == 0 {
+        runtime.drive(&drive_budget(1)).unwrap();
+    }
+    assert_eq!(runtime.live_task_count(), 2, "main + parked grandchild");
+    assert!(
+        calls.lock().unwrap().is_empty(),
+        "the abort hook must not fire before cancellation"
+    );
+
+    assert!(runtime.cancel_root(root, CancelReason::Explicit));
+    // Keep driving (letting the per-drive-turn `cancel_waiting` scan run
+    // repeatedly) to prove it never re-aborts what the sweep's eager
+    // teardown already tore down.
+    let mut guard = 0;
+    while matches!(handle.poll_result(), RootPoll::Pending) || runtime.live_task_count() > 0 {
+        runtime.drive(&drive_budget(8)).unwrap();
+        guard += 1;
+        assert!(guard < 100, "root settles and every task drains");
+    }
+    assert_eq!(runtime.live_task_count(), 0);
+    assert_eq!(
+        *calls.lock().unwrap(),
+        vec!["cancel"],
+        "the abort hook must fire exactly once, not double-aborted by the \
+         drive-turn scan"
+    );
+}
+
 #[test]
 fn runtime_command_wakes_a_thread_parked_in_block_on_inbox() {
     // The driving thread parks in `block_on_inbox` (as `drive_vm_on_runtime`
@@ -3364,6 +3721,24 @@ fn external_suspend(events: Arc<Mutex<Vec<&'static str>>>) -> NativeSuspend {
             || Ok(Box::new(7_i32)),
         ))),
         continuation: Box::new(CountingContinuation(events)),
+    }
+}
+
+/// A `WaitKind::Timer` parked FAR in the future under a `FakeClock` that is
+/// never advanced — unlike an External wait (which the `Inline` fake
+/// executor resolves on its own after a few drive turns, making it
+/// unsuitable for a test that needs a descendant to stay parked across MANY
+/// turns), this genuinely never fires on its own, however long the test
+/// keeps driving. Used where a test needs a same-origin-root task to stay
+/// alive-and-parked for the duration, not to prove the External-wait abort
+/// hook specifically (that is `interruptible_suspend_with_hook`'s job).
+fn far_future_timer_suspend() -> NativeSuspend {
+    NativeSuspend {
+        wait: WaitKind::Timer(Duration::from_secs(3600)),
+        continuation: Box::new(TimerResumeContinuation {
+            observed: Rc::new(RefCell::new(Vec::new())),
+            value: Value::NIL,
+        }),
     }
 }
 

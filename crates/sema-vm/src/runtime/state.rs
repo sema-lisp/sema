@@ -880,7 +880,13 @@ impl Runtime {
     /// enqueued Ready — a same-origin-root sibling of the root's main task, the
     /// shape `async/spawn` produces. Used to build multi-task origin-root graphs
     /// (e.g. an `async/run` barrier caller with a `ResourceSlot`-parked sibling)
-    /// without a real VM closure.
+    /// without a real VM closure. `vm_owner: Some(ReturnOwner::Root)` mirrors
+    /// `spawn_via_registry`'s real detached-child shape: it is what routes a
+    /// cancellation observed while this task is still `Ready` (never run)
+    /// through `settle_task`'s main-vs-registry-child distinction rather than
+    /// `TaskAction::Settle`'s direct `self.settle()`, which asserts the
+    /// settling task IS the root's main task — true for a synthetic root's
+    /// own main task (which keeps `vm_owner: None`), never for a sibling.
     #[cfg(test)]
     pub(super) fn submit_test_child_under_root(
         &self,
@@ -902,7 +908,68 @@ impl Runtime {
                 pending_resume: None,
                 suspended_owner: None,
                 vm_call: None,
-                vm_owner: None,
+                vm_owner: Some(ReturnOwner::Root),
+                context: TaskContextHandle::default(),
+                vm_resume: None,
+                scopes: TaskScopes::default(),
+            },
+        );
+        state.ready.enqueue(root, task);
+        task
+    }
+
+    /// Allocate a fresh `TaskId` WITHOUT inserting any record into
+    /// `state.tasks` or `state.ready` — models a task that has already run
+    /// to completion and been reaped (settled + removed), for tests that
+    /// need a (now-gone) `cancellation_parent` task id to attach a
+    /// grandchild to. `TestPreparedTask`'s synthetic settlement path only
+    /// supports a root's MAIN task (see `submit_test_child_under_task`'s
+    /// doc comment), so this sidesteps ever needing the returned id to
+    /// actually run — the test only cares that it is ABSENT from
+    /// `state.tasks` by the time `cancel_root` sweeps.
+    #[cfg(test)]
+    pub(super) fn allocate_task_id_for_test(&self) -> TaskId {
+        self.state
+            .borrow_mut()
+            .task_ids
+            .allocate()
+            .expect("test task identity")
+    }
+
+    /// Insert a task whose CANCELLATION parent is another TASK (not the
+    /// root directly), sharing `root`'s `origin_root` — the shape
+    /// `spawn_via_registry` produces for a detached `async/spawn` child
+    /// (`origin_root` = spawner's origin root, `cancellation_parent` =
+    /// `Task(spawner)`). Used to build a grandchild whose live
+    /// `cancellation_parent` chain to the root can be broken by removing
+    /// `parent` from `state.tasks` (e.g. once `parent` settles), the exact
+    /// shape CANCEL-ROOT-CASCADE-1's repro needs and `submit_test_child_
+    /// under_root` (parented directly on the root) cannot express.
+    /// `vm_owner: Some(ReturnOwner::Root)` for the same reason as
+    /// `submit_test_child_under_root` — see its doc comment.
+    #[cfg(test)]
+    pub(super) fn submit_test_child_under_task(
+        &self,
+        root: RootId,
+        parent: TaskId,
+        prepared: TestPreparedTask,
+    ) -> TaskId {
+        let mut state = self.state.borrow_mut();
+        let task = state.task_ids.allocate().expect("grandchild task identity");
+        let relations = TaskRelations {
+            origin_root: root,
+            cancellation_parent: CancellationParent::Task(parent),
+            lifetime_owner: LifetimeOwner::Root(root),
+        };
+        state.tasks.insert(
+            task,
+            RuntimeTask {
+                record: TaskRecord::new(task, relations),
+                payload: TaskPayload::Test(prepared),
+                pending_resume: None,
+                suspended_owner: None,
+                vm_call: None,
+                vm_owner: Some(ReturnOwner::Root),
                 context: TaskContextHandle::default(),
                 vm_resume: None,
                 scopes: TaskScopes::default(),
@@ -4362,8 +4429,27 @@ impl Runtime {
         }
     }
 
+    /// Cancel a root's main task AND sweep every other live task whose
+    /// `origin_root` is this root (CANCEL-ROOT-CASCADE-1).
+    ///
+    /// The main task alone is not enough: `cancel_descendants` (the
+    /// `async/cancel`/`CancelPromise` path) walks the LIVE
+    /// `cancellation_parent` chain, which a fire-and-forget descendant falls
+    /// out of the moment its spawning task settles and is removed from
+    /// `state.tasks` — a grandchild spawned by a task that has already
+    /// returned would never be reached and would leak (run to completion /
+    /// stay parked forever in a persistent runtime). `origin_root` survives
+    /// that removal (it is copied onto every descendant at spawn time,
+    /// unlike `cancellation_parent`, which points at a specific, possibly
+    /// now-gone, task), so sweeping by it reaches every task under this
+    /// root regardless of how deep, or how settled its intermediate
+    /// spawners are.
+    ///
+    /// Returns whether the MAIN task was newly cancelled by this call
+    /// (unchanged contract: `false` for an unknown/already-settled root, or
+    /// a second call on an already-cancelled root — idempotent).
     pub fn cancel_root(&self, root: RootId, reason: CancelReason) -> bool {
-        let (task_id, newly) = {
+        let (main_newly, targets) = {
             let mut state = self.state.borrow_mut();
             if root.runtime()
                 != state
@@ -4375,25 +4461,54 @@ impl Runtime {
             {
                 return false;
             }
-            let task_id = match state.roots.get(&root).map(RootRecord::state) {
+            let main_task = match state.roots.get(&root).map(RootRecord::state) {
                 Some(RootState::Running { main_task }) => *main_task,
                 _ => return false,
             };
-            let Some(task) = state.tasks.get_mut(&task_id) else {
+            if state.tasks.get(&main_task).is_none() {
                 return false;
-            };
-            let newly = task.record.request_cancellation(reason);
-            if newly {
-                state.pending_cancel_waits.push_back(task_id);
             }
-            (task_id, newly)
+            let mut targets = Vec::new();
+            let main_newly = {
+                let task = state.tasks.get_mut(&main_task).expect("main task present");
+                task.record.request_cancellation(reason)
+            };
+            if main_newly {
+                state.pending_cancel_waits.push_back(main_task);
+                targets.push(main_task);
+            }
+            // Every other live task under this origin root (descendants at
+            // any depth, however their spawning ancestors have settled)
+            // carries `CancelReason::Owner` — cancelled because the root
+            // was, mirroring `cancel_descendants`' reason for a
+            // transitively-cancelled task.
+            let descendants: Vec<TaskId> = state
+                .tasks
+                .iter()
+                .filter_map(|(id, task)| {
+                    (*id != main_task && task.record.relations().origin_root == root).then_some(*id)
+                })
+                .collect();
+            for id in descendants {
+                if let Some(task) = state.tasks.get_mut(&id) {
+                    if task.record.request_cancellation(CancelReason::Owner) {
+                        state.pending_cancel_waits.push_back(id);
+                        targets.push(id);
+                    }
+                }
+            }
+            (main_newly, targets)
         };
-        // Eagerly tear down an in-flight External/IO/ResourceSlot wait so a
-        // root cancelled between drive turns aborts promptly (C2).
-        if newly {
-            let _ = deliver_cancel_teardown(&self.state, task_id);
+        // Eagerly tear down every newly-cancelled task's in-flight
+        // External/IO/ResourceSlot wait (C2), the same delivery
+        // `cancel_descendants`' caller uses — exactly-once because
+        // `deliver_cancel_teardown` removes the wait registration itself, so
+        // a later per-drive-turn `cancel_waiting` scan finds nothing left to
+        // double-abort.
+        for target in targets {
+            let _ = deliver_cancel_teardown(&self.state, target);
         }
-        newly
+        main_newly
     }
 
     pub(super) fn abort_terminal_state(&self, fault: &RuntimeFault) {

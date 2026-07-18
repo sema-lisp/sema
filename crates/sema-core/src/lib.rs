@@ -30,12 +30,12 @@ pub use async_signal::{
     set_interrupt_callback, set_llm_scope_empty_callbacks, set_llm_scope_task_callbacks,
     set_otel_empty_callbacks, set_otel_task_callbacks, set_promise_driven_quantum,
     set_runtime_quantum, set_task_reaped_callback, set_usage_scope_empty_callbacks,
-    set_usage_scope_task_callbacks, set_yield_signal, take_resume_value, take_task_llm_scope,
-    take_task_otel, take_task_usage_scope, take_yield_signal, usage_scope_ambient_is_empty,
-    usage_scope_captured_is_empty, BlockingSleepFn, InterruptCallbackFn, LlmScopeAmbientEmptyFn,
-    LlmScopeCaptureFn, LlmScopeInstallFn, LlmScopeIsEmptyFn, LlmScopeTakeFn, OtelAmbientEmptyFn,
-    OtelInstallFn, OtelIsEmptyFn, OtelScopeFn, OtelTakeFn, TaskReapedFn, UsageScopeAmbientEmptyFn,
-    UsageScopeCaptureFn, UsageScopeInstallFn, UsageScopeIsEmptyFn, UsageScopeTakeFn, YieldReason,
+    set_usage_scope_task_callbacks, take_resume_value, take_task_llm_scope, take_task_otel,
+    take_task_usage_scope, usage_scope_ambient_is_empty, usage_scope_captured_is_empty,
+    BlockingSleepFn, InterruptCallbackFn, LlmScopeAmbientEmptyFn, LlmScopeCaptureFn,
+    LlmScopeInstallFn, LlmScopeIsEmptyFn, LlmScopeTakeFn, OtelAmbientEmptyFn, OtelInstallFn,
+    OtelIsEmptyFn, OtelScopeFn, OtelTakeFn, TaskReapedFn, UsageScopeAmbientEmptyFn,
+    UsageScopeCaptureFn, UsageScopeInstallFn, UsageScopeIsEmptyFn, UsageScopeTakeFn,
 };
 pub use context::{
     call_callback, call_callback_owned, eval_callback, set_call_callback, set_call_owned_callback,

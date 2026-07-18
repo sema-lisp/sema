@@ -1827,6 +1827,53 @@ fn apply_channel_send_callback_runs() {
     );
 }
 
+// `async/sleep` is DUAL-ABI (unlike `async/spawn`/`channel/*`/`async/resolved`,
+// which are runtime-only): its structural Timer suspend is always preferred by
+// `invoke_runtime`, so these only exercise the LEGACY value-ABI closure, which
+// is reached when a raw native bypasses `invoke_runtime` entirely — a
+// single-ABI (`register_fn`-only) HOF like `any`/`every`, or `apply` of one.
+// That closure cannot suspend from a bare Rust callback, so (post
+// YieldReason::Sleep retirement) it raises a clear error instead of silently
+// skipping the sleep. See `docs/deferred.md`'s LEGACY-SCHEDULER residue note.
+
+#[test]
+fn sleep_passed_directly_to_single_abi_hof_is_graceful_error() {
+    let err = eval_vm_err(r#"(any async/sleep (list 500))"#);
+    assert!(
+        err.contains("async/sleep") && err.contains("wrap it in a lambda"),
+        "expected a graceful 'wrap it in a lambda' error, got: {err}"
+    );
+}
+
+#[test]
+fn sleep_passed_directly_to_apply_is_graceful_error() {
+    let err = eval_vm_err(r#"(apply async/sleep (list 500))"#);
+    assert!(
+        err.contains("async/sleep") && err.contains("wrap it in a lambda"),
+        "expected a graceful 'wrap it in a lambda' error, got: {err}"
+    );
+}
+
+#[test]
+fn sleep_wrapped_in_lambda_for_single_abi_hof_works() {
+    // The error message's own suggested workaround must actually work.
+    assert_eq!(
+        eval(r#"(any (fn (x) (async/sleep x) #t) (list 10))"#),
+        Value::bool(true)
+    );
+}
+
+#[test]
+fn sleep_passed_directly_to_cooperative_hof_still_suspends() {
+    // `map`/`filter`/`sort-by` (`register_hof`, dual-ABI) drive their callback
+    // cooperatively under an active runtime quantum, so a raw `async/sleep`
+    // suspends structurally instead of reaching the legacy value ABI at all.
+    assert_eq!(
+        eval(r#"(map async/sleep (list 5 5))"#),
+        Value::list(vec![Value::nil(), Value::nil()])
+    );
+}
+
 #[test]
 fn call_with_values_consumer_runtime_native_suspends() {
     // The consumer is a runtime-only op; it suspends cleanly.

@@ -6,54 +6,36 @@
 //! sema-vm. Follows the same pattern as `set_eval_callback`.
 //!
 //! The unified cooperative runtime drives async ops structurally through the
-//! `NativeOutcome` ABI (`Suspend`/`Runtime`); the one remaining TLS yield signal
-//! is [`YieldReason::Sleep`], which a ctx-less `async/sleep` uses to surface a
-//! timer wait when it cannot suspend structurally.
+//! `NativeOutcome` ABI (`Suspend`/`Runtime`). The legacy TLS yield-signal
+//! bridge (`YieldReason`) that used to carry a ctx-less `async/sleep`'s
+//! sleep request to the VM has been retired: `async/sleep`'s runtime ABI
+//! (`WaitKind::Timer`) suspends structurally instead, and its legacy value
+//! ABI (reached when a raw native is invoked synchronously — a bare HOF
+//! callback or a nested/foreign VM re-entry) either actually sleeps
+//! (outside any runtime quantum) or raises a clear error (inside one, where
+//! it cannot suspend). See `docs/deferred.md`'s LEGACY-SCHEDULER residue note.
 
 use std::any::Any;
 use std::cell::{Cell, RefCell};
 
 use crate::value::Value;
 
-/// Reason a task is yielding control back to the runtime via the TLS yield
-/// signal. Promise/channel/IO ops suspend structurally through the
-/// `NativeOutcome` ABI; only `async/sleep`'s ctx-less value ABI still yields.
-#[derive(Debug, Clone)]
-pub enum YieldReason {
-    /// Sleeping for a duration in milliseconds.
-    Sleep(u64),
-}
-
 thread_local! {
-    /// Set by native functions that need to yield. Checked by the VM after
-    /// each native call. If set, the VM suspends the current task.
-    static YIELD_SIGNAL: RefCell<Option<YieldReason>> = const { RefCell::new(None) };
-
     /// Set by the runtime before resuming a yielded task. The native function
     /// that previously yielded checks this first and returns it instead of
-    /// re-executing the operation. Vestigial under the structural resume path
-    /// (the runtime injects the resume value onto the parked frame's stack top),
-    /// kept for the ctx-less `async/sleep` symmetry.
+    /// re-executing the operation. No producer remains registered (the sole
+    /// legacy-scheduler resume path this served was retired); consumers
+    /// (`git`, `http`, `ws`, `system`) always observe `None` today but keep
+    /// checking it as the wired seam for the pattern.
     static RESUME_VALUE: RefCell<Option<Value>> = const { RefCell::new(None) };
 
     /// Whether a unified-runtime VM quantum is currently executing on this
     /// thread. Set for the lifetime of one `run_quantum` by the runtime's
-    /// `RuntimeQuantumGuard`. Native functions that yield via the TLS yield
-    /// signal (e.g. `async/sleep`) check this to decide between yielding to the
-    /// runtime and running synchronously.
+    /// `RuntimeQuantumGuard`. Native functions that cannot suspend structurally
+    /// from a ctx-less callback (e.g. `async/sleep`'s legacy value ABI) check
+    /// this to decide between raising a "cannot suspend here" error and
+    /// running synchronously.
     static IN_RUNTIME_QUANTUM: Cell<bool> = const { Cell::new(false) };
-}
-
-// ── Yield signal ────────────────────────────────────────────────
-
-/// Set the yield signal. Called by native functions that need to suspend.
-pub fn set_yield_signal(reason: YieldReason) {
-    YIELD_SIGNAL.with(|s| *s.borrow_mut() = Some(reason));
-}
-
-/// Take the yield signal (clearing it). Called by the VM after native calls.
-pub fn take_yield_signal() -> Option<YieldReason> {
-    YIELD_SIGNAL.with(|s| s.borrow_mut().take())
 }
 
 // ── Resume value ────────────────────────────────────────────────

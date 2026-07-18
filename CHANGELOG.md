@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+- **Unified runtime — `YieldReason::Sleep` (the last TLS yield-signal bridge)
+  retired.** `async/sleep`'s structural Timer ABI (`invoke_runtime`) is
+  always preferred when a `TaskContext` is installed, so the legacy
+  ctx-less value-ABI closure was reached only when a caller bypassed
+  `invoke_runtime` entirely: a raw native passed directly to a single-ABI
+  (`register_fn`-only) higher-order function like `any`/`every` (not the
+  cooperative `register_hof` natives — `map`/`filter`/`sort-by`/… already
+  suspend it structurally), or to `apply`, where there is no way to suspend
+  anyway. That closure now raises a clear "wrap it in a lambda" error itself
+  instead of setting a TLS signal for the VM to relay into
+  `VmExecResult::AsyncYield`; outside any runtime quantum (a nested/foreign
+  synchronous VM re-entry) it still actually sleeps, unchanged. `YieldReason`,
+  `set_yield_signal`/`take_yield_signal`, `VmExecResult::AsyncYield` (and its
+  `NativeDispatchResult`/`VmNativeSignal` carriers), and `TaskAction::VmSleep`
+  are deleted; `list.rs`'s `check_hof_yield` guard — now redundant, since the
+  error surfaces directly from `async/sleep` itself — is deleted too.
+  `scripts/check-unified-runtime-legacy.sh`'s zero-tolerance gate is extended
+  to guard against reintroducing any of these symbols. See
+  `docs/deferred.md`'s LEGACY-SCHEDULER note.
 - **Runtime correctness: `cancel_root` now reaps fire-and-forget descendants
   of an already-settled task (CANCEL-ROOT-CASCADE-1).** `Runtime::cancel_root`
   used to cancel only the root's main task and rely on the live

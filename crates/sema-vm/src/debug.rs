@@ -407,9 +407,6 @@ pub enum VmExecResult {
     Yielded,
     /// Execution stopped at an opcode boundary after consuming its instruction quantum.
     QuantumExpired { instructions: usize },
-    /// Execution suspended for async yield (channel op, await, sleep) via the
-    /// legacy TLS yield-signal bridge.
-    AsyncYield(sema_core::YieldReason),
     /// Execution suspended because a native returned a structural, non-`Return`
     /// [`NativeOutcome`] through the runtime ABI. The runtime consumes the
     /// carried outcome to drive the suspension (a wait, a call, or a runtime

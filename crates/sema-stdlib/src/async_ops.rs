@@ -6,8 +6,7 @@ use sema_core::runtime::{
     TaskSettlement, Trace, WaitKind,
 };
 use sema_core::{
-    check_arity, in_runtime_quantum, set_yield_signal, take_resume_value, Env, NativeFn, SemaError,
-    Value, ValueView, YieldReason,
+    check_arity, in_runtime_quantum, take_resume_value, Env, NativeFn, SemaError, Value, ValueView,
 };
 
 use crate::register_fn;
@@ -592,9 +591,17 @@ fn register_promise_ops(env: &Env) {
     //
     // Under the unified cooperative runtime (a `TaskContext` is installed) the
     // native suspends structurally on a timer wait; `SleepCont` resumes the
-    // parked frame with nil when it fires. Outside the runtime — a bare top-level
-    // eval or the legacy scheduler — the legacy value ABI runs: it sleeps
-    // synchronously, or yields the `Sleep` signal to the legacy scheduler.
+    // parked frame with nil when it fires. That runtime ABI is ALWAYS preferred
+    // by `NativeFn::invoke_runtime` when present, so the legacy value ABI below
+    // is reached only when a caller bypasses `invoke_runtime` and calls the
+    // native's plain value closure directly — `call_function`/`call_value`
+    // (a raw native passed straight to a single-ABI HOF like `any`/`every`, or
+    // to `apply`), or a nested/foreign synchronous VM re-entry (a callback
+    // crossing a context boundary, which suspends the runtime-quantum flag —
+    // see `EvalContext::suspend_runtime_quantum`). In the former case there is
+    // no way to suspend from here, so it raises a clear error; in the latter,
+    // the calling context is contractually synchronous-only, so it actually
+    // blocks the thread.
     //
     // This suspend is unconditional (no promise-driven check): unlike the wasm
     // http natives, the SAME structural timer wait is correct on every
@@ -612,12 +619,20 @@ fn register_promise_ops(env: &Env) {
                     if let Some(cached) = take_resume_value() {
                         return Ok(cached);
                     }
-                    set_yield_signal(YieldReason::Sleep(ms));
-                    return Ok(Value::nil());
+                    return Err(SemaError::eval(
+                        "async/sleep: passed directly to a synchronous higher-order function \
+                         or `apply` — wrap it in a lambda so it can suspend cleanly. For \
+                         example, `(any (fn (x) (async/sleep x)) ...)` instead of \
+                         `(any async/sleep ...)`.",
+                    ));
                 }
-                // Outside async, actually sleep.
+                // Outside any runtime quantum (a nested/foreign synchronous VM
+                // re-entry), actually sleep. `ms` is unused on wasm32 (the main
+                // thread must never block there).
                 #[cfg(not(target_arch = "wasm32"))]
                 std::thread::sleep(std::time::Duration::from_millis(ms));
+                #[cfg(target_arch = "wasm32")]
+                let _ = ms;
                 Ok(Value::nil())
             },
             |_ctx, args| {

@@ -2151,18 +2151,17 @@ fn is_callable(v: &Value) -> bool {
 ///
 /// VM closures called from inside an async task route through the scheduler
 /// (see `run_closure_as_inline_task` in sema-vm), so yields suspend cleanly.
-/// Plain native callbacks (e.g. `(map channel/recv ...)`) don't have that
-/// affordance — their yield signal would be silently dropped or coalesced
-/// with subsequent calls, producing wrong results. Surface that case as an
-/// explicit error pointing to the lambda-wrap workaround.
+/// Plain native callbacks (e.g. `(any async/sleep ...)`) don't have that
+/// affordance: a runtime-only native's value ABI is the "requires runtime
+/// invocation" stub, and a dual-ABI native (`async/sleep`) that cannot
+/// suspend from here raises its own clear error — see `async/sleep`'s legacy
+/// closure in `sema-stdlib::async_ops`.
 pub fn call_function(func: &Value, args: &[Value]) -> Result<Value, SemaError> {
-    let result = if let Some(native) = func.as_native_fn_rc() {
+    if let Some(native) = func.as_native_fn_rc() {
         sema_core::with_stdlib_ctx(|ctx| (native.func)(ctx, args))
     } else {
         sema_core::with_stdlib_ctx(|ctx| sema_core::call_callback(ctx, func, args))
-    };
-
-    check_hof_yield(result)
+    }
 }
 
 /// [`call_function`] with an args buffer the caller owns and will not reuse:
@@ -2170,23 +2169,7 @@ pub fn call_function(func: &Value, args: &[Value]) -> Result<Value, SemaError> {
 /// holding nils), keeping a fold accumulator uniquely owned across the
 /// callback boundary so the `strong_count == 1` in-place fast paths can fire.
 pub fn call_function_owned(func: &Value, args: &mut [Value]) -> Result<Value, SemaError> {
-    let result = sema_core::with_stdlib_ctx(|ctx| sema_core::call_callback_owned(ctx, func, args));
-    check_hof_yield(result)
-}
-
-/// Shared post-call guard for HOF callback invocations: a yielding native
-/// passed directly (not wrapped in a lambda) cannot suspend cleanly here.
-fn check_hof_yield(result: Result<Value, SemaError>) -> Result<Value, SemaError> {
-    if sema_core::in_runtime_quantum() && sema_core::take_yield_signal().is_some() {
-        return Err(SemaError::eval(
-            "yielding native passed directly to a higher-order function — \
-             wrap it in a lambda so the yield can suspend cleanly. \
-             For example, `(map (fn (x) (channel/recv x)) ...)` instead of \
-             `(map channel/recv ...)`.",
-        ));
-    }
-
-    result
+    sema_core::with_stdlib_ctx(|ctx| sema_core::call_callback_owned(ctx, func, args))
 }
 
 #[cfg(test)]

@@ -13,8 +13,7 @@ use sema_core::{
     error::{suggest_similar, veteran_hint, CallFrame as CoreCallFrame, StackTrace},
     number::SemaNumber,
     resolve as resolve_spur, Env, EvalContext, NativeFn, SemaError, Spur, Value, ValueViewRef,
-    YieldReason, NAN_INT_SMALL_PATTERN, NAN_PAYLOAD_BITS, NAN_PAYLOAD_MASK, NAN_TAG_MASK,
-    TAG_NATIVE_FN,
+    NAN_INT_SMALL_PATTERN, NAN_PAYLOAD_BITS, NAN_PAYLOAD_MASK, NAN_TAG_MASK, TAG_NATIVE_FN,
 };
 
 use crate::chunk::Function;
@@ -26,9 +25,6 @@ use crate::opcodes::Op;
 enum NativeDispatchResult {
     /// The native produced an immediate value; push it and continue.
     Value(Value),
-    /// A legacy async op raised the TLS yield signal alongside a sentinel
-    /// return; park the frame and surface it as [`VmExecResult::AsyncYield`].
-    LegacyYield(YieldReason),
     /// A runtime-ABI native returned a structural, non-`Return` outcome; park the
     /// frame and surface it as [`VmExecResult::Pending`].
     Pending(VmPendingOutcome),
@@ -40,14 +36,12 @@ enum NativeDispatchResult {
 /// VM-scoped state, not a thread-local: it never outlives the single opcode that
 /// set it.
 enum VmNativeSignal {
-    Legacy(YieldReason),
     Pending(VmPendingOutcome),
 }
 
 impl VmNativeSignal {
     fn into_exec_result(self) -> crate::debug::VmExecResult {
         match self {
-            Self::Legacy(reason) => crate::debug::VmExecResult::AsyncYield(reason),
             Self::Pending(outcome) => crate::debug::VmExecResult::Pending(outcome),
         }
     }
@@ -528,9 +522,9 @@ pub struct VM {
     instructions_executed: usize,
     /// Pending error to raise into a parked frame on the next `run_inner`.
     ///
-    /// The value-resume path (`replace_stack_top`) resumes a frame parked on an
-    /// `AsyncYield` by injecting the awaited value onto its stack top. This is
-    /// the rejection counterpart: when the awaited promise settled Failed, the
+    /// The value-resume path (`replace_stack_top`) resumes a frame parked on a
+    /// structural suspend by injecting the awaited value onto its stack top.
+    /// This is the rejection counterpart: when the awaited promise settled Failed, the
     /// runtime arms this so the next dispatch entry raises the error at the
     /// parked call site — exactly as if the yielding native had returned
     /// `Err(error)` — routing it through the normal exception machinery so an
@@ -1420,8 +1414,7 @@ impl VM {
                 crate::debug::VmExecResult::QuantumExpired { .. } => {
                     unreachable!("debug execution does not install a runtime quantum")
                 }
-                crate::debug::VmExecResult::AsyncYield(_)
-                | crate::debug::VmExecResult::Pending(_) => {
+                crate::debug::VmExecResult::Pending(_) => {
                     return Err(SemaError::eval(
                         "async yield outside of scheduler context".to_string(),
                     ));
@@ -1636,11 +1629,9 @@ impl VM {
             crate::debug::VmExecResult::QuantumExpired { .. } => {
                 unreachable!("unbounded VM execution cannot exhaust a quantum")
             }
-            crate::debug::VmExecResult::AsyncYield(_) | crate::debug::VmExecResult::Pending(_) => {
-                Err(SemaError::eval(
-                    "async yield outside of scheduler context".to_string(),
-                ))
-            }
+            crate::debug::VmExecResult::Pending(_) => Err(SemaError::eval(
+                "async yield outside of scheduler context".to_string(),
+            )),
         }
     }
 
@@ -1667,8 +1658,8 @@ impl VM {
         // NON-async wrapper branches (both `make_closure`'s native wrapper and
         // `call_closure_owned` route the async case to
         // `run_closure_as_inline_task` *before* trying the current VM). The
-        // callback runs synchronously to completion here (an AsyncYield below
-        // is treated as an unrecoverable error), so it never touches the
+        // callback runs synchronously to completion here (a structural suspend
+        // below is treated as an unrecoverable error), so it never touches the
         // runtime scheduler. Suspend the quantum flag for the nested run so the
         // re-entry guard doesn't reject legacy user closures called across
         // context boundaries during an active runtime quantum. Deleted with the
@@ -1718,8 +1709,7 @@ impl VM {
             Ok(crate::debug::VmExecResult::QuantumExpired { .. }) => {
                 unreachable!("nested synchronous execution does not install a runtime quantum")
             }
-            Ok(crate::debug::VmExecResult::AsyncYield(_))
-            | Ok(crate::debug::VmExecResult::Pending(_)) => {
+            Ok(crate::debug::VmExecResult::Pending(_)) => {
                 // Re-entrant HOF callbacks are synchronous; a suspension here
                 // cannot be resumed. Roll back the partial nested frames/stack so
                 // the parent VM stays consistent, then surface the same error the
@@ -1832,11 +1822,10 @@ impl VM {
     /// runtime quantum), the native is invoked via
     /// [`NativeFn::invoke_runtime`] under a fresh [`NativeCallContext`] built from
     /// the quantum's cancellation snapshot, mirroring the runtime's own
-    /// `invoke_callable`. A `Return` with a stale TLS yield signal is a legacy
-    /// async op (surfaced as [`NativeDispatchResult::LegacyYield`]); a `Return`
-    /// with no signal is a plain value; any other outcome is structural
-    /// ([`NativeDispatchResult::Pending`]). Outside a runtime quantum (nested,
-    /// synchronous, or wasm entry) the native runs through the legacy value ABI.
+    /// `invoke_callable`. A `Return` is a plain value; any other outcome is
+    /// structural ([`NativeDispatchResult::Pending`]). Outside a runtime quantum
+    /// (nested, synchronous, or wasm entry) the native runs through the legacy
+    /// value ABI.
     ///
     /// The `TaskContext` borrow is confined to the native call itself and dropped
     /// before returning, so a converted native that suspends — or a legacy
@@ -1869,10 +1858,7 @@ impl VM {
                 drop(task_context);
                 drop(_installed);
                 return Ok(match outcome {
-                    NativeOutcome::Return(value) => match sema_core::take_yield_signal() {
-                        Some(reason) => NativeDispatchResult::LegacyYield(reason),
-                        None => NativeDispatchResult::Value(value),
-                    },
+                    NativeOutcome::Return(value) => NativeDispatchResult::Value(value),
                     other => NativeDispatchResult::Pending(VmPendingOutcome::from_outcome(other)),
                 });
             }
@@ -1881,10 +1867,7 @@ impl VM {
             let _vm_guard = CurrentVmGuard::enter(self);
             (func.func)(ctx, call_args)
         }?;
-        Ok(match sema_core::take_yield_signal() {
-            Some(reason) => NativeDispatchResult::LegacyYield(reason),
-            None => NativeDispatchResult::Value(value),
-        })
+        Ok(NativeDispatchResult::Value(value))
     }
 
     /// Land a helper-mediated native dispatch result onto the stack: a value is
@@ -1894,10 +1877,6 @@ impl VM {
     fn stash_native_dispatch(&mut self, result: NativeDispatchResult) {
         match result {
             NativeDispatchResult::Value(value) => self.stack.push(value),
-            NativeDispatchResult::LegacyYield(reason) => {
-                self.stack.push(Value::nil());
-                self.native_signal = Some(VmNativeSignal::Legacy(reason));
-            }
             NativeDispatchResult::Pending(outcome) => {
                 self.stack.push(Value::nil());
                 self.native_signal = Some(VmNativeSignal::Pending(outcome));
@@ -1948,7 +1927,7 @@ impl VM {
         }
     }
 
-    /// Arm a rejection resume for a frame parked on an `AsyncYield`.
+    /// Arm a rejection resume for a frame parked on a structural suspend.
     ///
     /// Rejection counterpart to [`replace_stack_top`]: instead of injecting a
     /// value onto the parked frame's stack top, the next `run_inner` raises
@@ -2167,8 +2146,8 @@ impl VM {
         // immutable snapshot is the fallback for `None` closures (M1).
         let base_globals = self.globals.clone();
 
-        // Rejection resume: a frame parked on an `AsyncYield` is being re-run
-        // because its awaited promise settled Failed. The park left a nil
+        // Rejection resume: a frame parked on a structural suspend is being
+        // re-run because its awaited promise settled Failed. The park left a nil
         // placeholder on the stack top (the awaited value's slot) and advanced
         // pc past the yielding call. Discard that placeholder and raise the
         // error at the parked call site, mirroring the native-`Err` path
@@ -2209,8 +2188,8 @@ impl VM {
         // (`self.instructions_executed` around the synchronous re-entry path)
         // immediately after `run_inner` returns — including on `Err`. Rather
         // than hand-editing every `return` in this function (Return/Finished,
-        // every `handle_err!`/`?`-propagated `Err`, every AsyncYield/Pending/
-        // Stopped/Yielded suspend, QuantumExpired itself, and the DEBUG
+        // every `handle_err!`/`?`-propagated `Err`, every Pending/Stopped/
+        // Yielded suspend, QuantumExpired itself, and the DEBUG
         // instantiation's Disconnect/breakpoint-stop exits), the guard's
         // `Drop` reconciles `self.instructions_executed` from the countdown
         // on every exit from `run_inner`, however it returns.
@@ -2745,30 +2724,18 @@ impl VM {
                         self.frames[fi].pc = pc;
                         let saved_pc = pc - op::SIZE_OP_U16;
                         if let Err(err) = self.call_value(argc, ctx) {
-                            // Drain any stale yield signal set before the error
-                            let _ = sema_core::take_yield_signal();
                             match self.handle_exception(err, saved_pc)? {
                                 ExceptionAction::Handled => {}
                                 ExceptionAction::Propagate(e) => return Err(e),
                             }
                         }
-                        // A native dispatched via call_value suspended structurally
-                        // or through the legacy yield signal.
+                        // A native dispatched via call_value suspended structurally.
                         if let Some(signal) = self.native_signal.take() {
                             if let Some(top) = self.stack.last_mut() {
                                 *top = Value::nil();
                             }
                             self.frames[fi].pc = pc;
                             return Ok(signal.into_exec_result());
-                        }
-                        // A non-native callable (the call_callback branch) may still
-                        // raise the legacy yield signal directly.
-                        if let Some(reason) = sema_core::take_yield_signal() {
-                            if let Some(top) = self.stack.last_mut() {
-                                *top = Value::nil();
-                            }
-                            self.frames[fi].pc = pc;
-                            return Ok(crate::debug::VmExecResult::AsyncYield(reason));
                         }
                         continue 'dispatch;
                     }
@@ -2777,30 +2744,19 @@ impl VM {
                         self.frames[fi].pc = pc;
                         let saved_pc = pc - op::SIZE_OP_U16;
                         if let Err(err) = self.tail_call_value(argc, ctx) {
-                            // Drain any stale yield signal set before the error
-                            let _ = sema_core::take_yield_signal();
                             match self.handle_exception(err, saved_pc)? {
                                 ExceptionAction::Handled => {}
                                 ExceptionAction::Propagate(e) => return Err(e),
                             }
                         }
                         // A native dispatched via tail_call_value → call_value
-                        // suspended structurally or through the legacy yield signal.
+                        // suspended structurally.
                         if let Some(signal) = self.native_signal.take() {
                             if let Some(top) = self.stack.last_mut() {
                                 *top = Value::nil();
                             }
                             self.frames[fi].pc = pc;
                             return Ok(signal.into_exec_result());
-                        }
-                        // A non-native callable (the call_callback branch) may still
-                        // raise the legacy yield signal directly.
-                        if let Some(reason) = sema_core::take_yield_signal() {
-                            if let Some(top) = self.stack.last_mut() {
-                                *top = Value::nil();
-                            }
-                            self.frames[fi].pc = pc;
-                            return Ok(crate::debug::VmExecResult::AsyncYield(reason));
                         }
                         continue 'dispatch;
                     }
@@ -2911,19 +2867,12 @@ impl VM {
                             // Args are already truncated. Push nil as a placeholder
                             // for the call result slot; on resume the runtime replaces
                             // it with the actual resume value before continuing.
-                            Ok(NativeDispatchResult::LegacyYield(reason)) => {
-                                self.stack.push(Value::nil());
-                                self.frames[fi].pc = pc; // PC already past CALL_NATIVE
-                                return Ok(crate::debug::VmExecResult::AsyncYield(reason));
-                            }
                             Ok(NativeDispatchResult::Pending(outcome)) => {
                                 self.stack.push(Value::nil());
                                 self.frames[fi].pc = pc; // PC already past CALL_NATIVE
                                 return Ok(crate::debug::VmExecResult::Pending(outcome));
                             }
                             Err(err) => {
-                                // Drain any stale yield signal set before the error
-                                let _ = sema_core::take_yield_signal();
                                 handle_err!(self, fi, pc, err, saved_pc, 'dispatch);
                             }
                         }
@@ -3334,10 +3283,9 @@ impl VM {
                                 let func = func.clone();
                                 match self.call_native_with(&func, argc, ctx) {
                                     Ok(()) => {
-                                        // The native suspended (structurally or via
-                                        // the legacy yield signal). The call pushed a
-                                        // nil placeholder; on resume the runtime
-                                        // substitutes the actual resume value.
+                                        // The native suspended structurally. The call
+                                        // pushed a nil placeholder; on resume the
+                                        // runtime substitutes the actual resume value.
                                         if let Some(signal) = self.native_signal.take() {
                                             self.frames[fi].pc = pc; // PC already past CALL_GLOBAL
                                             return Ok(signal.into_exec_result());
@@ -3366,7 +3314,6 @@ impl VM {
                                         code_len = frame.closure.func.chunk.code.len();
                                     }
                                     Err(err) => {
-                                        let _ = sema_core::take_yield_signal();
                                         handle_err!(self, fi, pc, err, saved_pc, 'dispatch);
                                     }
                                 }
@@ -3375,26 +3322,16 @@ impl VM {
                             CachedGlobal::Plain(value) => {
                                 let func_val = value.clone();
                                 if let Err(err) = self.call_value_with(func_val, argc, ctx) {
-                                    let _ = sema_core::take_yield_signal();
                                     match self.handle_exception(err, saved_pc)? {
                                         ExceptionAction::Handled => {}
                                         ExceptionAction::Propagate(e) => return Err(e),
                                     }
                                 }
-                                // A native callable suspended (structurally or via the
-                                // legacy yield signal); the placeholder is on top.
+                                // A native callable suspended structurally; the
+                                // placeholder is on top.
                                 if let Some(signal) = self.native_signal.take() {
                                     self.frames[fi].pc = pc; // PC already past CALL_GLOBAL
                                     return Ok(signal.into_exec_result());
-                                }
-                                // A non-native callable (the call_callback branch) may
-                                // still raise the legacy yield signal directly.
-                                if let Some(reason) = sema_core::take_yield_signal() {
-                                    if let Some(top) = self.stack.last_mut() {
-                                        *top = Value::nil();
-                                    }
-                                    self.frames[fi].pc = pc; // PC already past CALL_GLOBAL
-                                    return Ok(crate::debug::VmExecResult::AsyncYield(reason));
                                 }
                                 continue 'dispatch;
                             }
@@ -4410,7 +4347,7 @@ impl VM {
                 // Inside an async task, route through the scheduler so any
                 // yield in the inner closure (channel/send, channel/recv,
                 // await, sleep) suspends cleanly. Otherwise the inner VM's
-                // AsyncYield would surface as "async yield outside of
+                // structural suspend would surface as "async yield outside of
                 // scheduler context" and crash the calling HOF.
 
                 // C1: if this closure belongs to a VM currently running a native

@@ -30,7 +30,6 @@ use sema_core::runtime::{
 use sema_core::runtime::{CancellationParent, LifetimeOwner, TaskRelations};
 #[cfg(test)]
 use sema_core::Value;
-use sema_core::YieldReason;
 use sema_core::{Env, EvalContext, NativeFn};
 
 use super::channel::{ChannelClose, ChannelWake};
@@ -1525,8 +1524,8 @@ impl Runtime {
                 message: "timer referenced missing waiting task".into(),
             })?;
         let root = state.tasks[&task_id].record.relations().origin_root;
-        // A VM task parked directly on a timer (legacy `async/sleep` via
-        // `VmSleep`): wake it and re-run its frame. Observational `async/timeout`
+        // A task parked directly on a bare timer key with no protocol-wait
+        // entry: wake it and re-run its frame. Observational `async/timeout`
         // deadlines are delivered through the protocol-wait path above.
         state
             .tasks
@@ -2246,22 +2245,6 @@ impl Runtime {
                 task.vm_call = Some(vm);
                 TaskAction::DebugStop(root, task_id, info)
             }
-            // A native yielded the VM through the TLS yield signal (surfaced as
-            // `AsyncYield`). The VM has already parked its frame (pc past the
-            // call, a nil placeholder on the stack top) and stays in `vm_call`;
-            // the runtime registers a native wait and, when it fires, re-runs
-            // `run_quantum` — the frame resumes in place with the placeholder as
-            // the resume value.
-            // The only TLS yield signal left is `async/sleep`'s ctx-less value ABI:
-            // every promise/channel/offloaded-I/O op suspends structurally through
-            // the `NativeOutcome` ABI (`Suspend`/`Runtime`), handled by the `Pending`
-            // arm below.
-            Ok(VmExecResult::AsyncYield(reason)) => match reason {
-                YieldReason::Sleep(ms) => {
-                    task.vm_call = Some(vm);
-                    TaskAction::VmSleep(task_id, ms)
-                }
-            },
             // A native suspended structurally through the runtime ABI (the VM
             // parked its frame — pc past the call, a nil placeholder on its stack
             // top). Move the parent VM OUT
@@ -2468,33 +2451,6 @@ impl Runtime {
                     .borrow_mut()
                     .pending
                     .push_back(PendingStage::Apply(task_id, owner, result));
-            }
-            TaskAction::VmSleep(task_id, ms) => {
-                let mut state = self.state.borrow_mut();
-                let deadline = state.clock.now() + Duration::from_millis(ms);
-                let key = state
-                    .waits
-                    .as_ref()
-                    .expect("wait runtime installed")
-                    .issue_internal_wait()
-                    .map_err(|_| RuntimeFault::IdExhausted { kind: "wait" })?;
-                if !state.timers.insert(deadline, key) {
-                    return Err(RuntimeFault::IdExhausted { kind: "timer" });
-                }
-                if let Err(error) = state
-                    .tasks
-                    .get_mut(&task_id)
-                    .ok_or_else(|| RuntimeFault::Invariant {
-                        message: "sleeping VM task disappeared".into(),
-                    })?
-                    .record
-                    .wait(key)
-                {
-                    state.timers.cancel(key);
-                    return Err(RuntimeFault::Invariant {
-                        message: format!("sleeping VM task failed to wait: {error:?}"),
-                    });
-                }
             }
             TaskAction::DebugStop(root, task_id, info) => {
                 let mut state = self.state.borrow_mut();
@@ -3506,29 +3462,17 @@ impl Runtime {
                         cancellation.map(|request| request.reason),
                     ),
                 };
-                // Dispatch the native with the runtime-quantum flag active so a
-                // callback native takes its cooperative path: a genuinely
-                // driveable native (e.g. an agent tool that offloads I/O) RETURNS
-                // its `NativeOutcome` (Suspend/Call) from `invoke_runtime`, which
-                // we drive here; a *parking* native passed DIRECTLY as a HOF
-                // callback (`(map channel/recv …)`) leaves a channel/promise/sleep
-                // park yield that CANNOT suspend inside this Rust continuation, so
-                // it is converted into the lambda-wrap guidance — parity with the
-                // legacy `check_hof_yield`.
+                // Dispatch the native with the runtime-quantum flag active (a
+                // ctx-less native like `mcp/call` reads `in_runtime_quantum()`
+                // internally to route cooperatively) so it takes its structural
+                // ABI: `invoke_runtime` returns the native's `NativeOutcome`
+                // (Suspend/Call/Return) directly, driven by the caller's
+                // `PendingStage::Apply`.
                 let prev_q = sema_core::in_runtime_quantum();
                 sema_core::set_runtime_quantum(true);
                 let native_result =
                     native.invoke_runtime(&eval_context, &mut native_context, &call.args);
                 sema_core::set_runtime_quantum(prev_q);
-                let native_result = match sema_core::take_yield_signal() {
-                    Some(_park) => Err(sema_core::SemaError::eval(
-                        "yielding native passed directly to a higher-order function — \
-                             wrap it in a lambda so the yield can suspend cleanly. \
-                             For example, `(map (fn (x) (channel/recv x)) ...)` instead of \
-                             `(map channel/recv ...)`.",
-                    )),
-                    None => native_result,
-                };
                 (ContinuationFrame::native(call.continuation), native_result)
             } else {
                 (
@@ -3616,10 +3560,11 @@ impl Runtime {
     /// `Err` from the quantum; that element falls back to EXACTLY today's
     /// parked path via `quantum_to_action` — the shared mapping
     /// `run_parked_quantum` uses — so the fallback can never drift from the
-    /// slow path's semantics. `check_hof_yield`'s bare-runtime-native error
-    /// surface is untouched: it fires inside `NativeContinuation::resume`
-    /// implementations / the native-fn arm of `invoke_callable`, neither of
-    /// which this function changes.
+    /// slow path's semantics. A bare runtime-only native's "requires runtime
+    /// invocation" value-ABI stub, and a dual-ABI native's own "cannot suspend
+    /// from a synchronous callback" error, surface unchanged: they fire inside
+    /// `NativeContinuation::resume` implementations / the native-fn arm of
+    /// `invoke_callable`, neither of which this function changes.
     ///
     /// Cancellation is re-read fresh from `task.record` before EVERY element
     /// (not just the first): a cancellation recorded against this task before
@@ -3833,8 +3778,8 @@ impl Runtime {
                     }
                 }
                 _ => {
-                    // Genuine suspend (structural `Pending`, `AsyncYield`,
-                    // `Stopped`) or a budget expiry: fall back to exactly
+                    // Genuine suspend (structural `Pending`, `Stopped`) or a
+                    // budget expiry: fall back to exactly
                     // today's parked path via the shared mapping (applied
                     // after the loop, once `vm`/`owner` can be moved safely).
                     break ElementOutcome::Suspended(quantum, current_call.continuation);
@@ -4858,8 +4803,8 @@ pub(super) fn deliver_cancel_teardown(
                     {
                         EagerTeardown::External
                     }
-                    // A bare `Timer`/`VmSleep` key (in `timers` only): self-resolving,
-                    // left to the scan.
+                    // A bare `Timer` key (in `timers` only, no protocol-wait
+                    // entry): self-resolving, left to the scan.
                     None => EagerTeardown::None,
                 }
             }
@@ -5409,9 +5354,7 @@ fn install_promise_wait(
 
 /// Register a `Timer(duration)` suspension: arm the task's wait key in the timer
 /// queue and stash its continuation so `fire_timer` resumes it with
-/// `Returned(nil)` once the deadline elapses. Mirrors the `VmSleep` timer
-/// registration, but delivers through a `NativeContinuation` rather than a
-/// parked VM.
+/// `Returned(nil)` once the deadline elapses.
 fn install_timer_wait(
     state: &mut RuntimeState,
     task_id: TaskId,
@@ -5769,9 +5712,6 @@ enum TaskAction {
     Cancel(TaskId, ReturnOwner, CancelReason),
     Native(TaskId, NativeResult),
     VmResult(TaskId, ReturnOwner, NativeResult),
-    /// A VM root/child parked on `async/sleep`: arm a runtime timer for `ms`
-    /// milliseconds and leave the VM in `vm_call` so `fire_timer` re-runs it.
-    VmSleep(TaskId, u64),
     /// A cooperative (headless) debug session hit a breakpoint/step inside this
     /// task. The task's frames are parked in `vm_call`; arm the runtime-wide
     /// debug barrier (`debug_paused`) and hold the task out of the ready queue
@@ -5896,7 +5836,6 @@ impl Trace for TaskAction {
                         Err(error) => error.trace(sink),
                     }
             }
-            Self::VmSleep(_, _) => true,
             // A `StopInfo` is a reason + source location; it holds no Sema
             // `Value`, so there is no GC edge to trace.
             Self::DebugStop(_, _, _) => true,

@@ -1150,21 +1150,34 @@ abort hook promptly when the task is cancelled by a sibling, not only at drain.
 
 ### LEGACY-SCHEDULER — purged (RESOLVED 2026-07-16, P5)
 
-**RESOLVED 2026-07-16 (P5 purge, commit a1862f67).** `scheduler.rs`,
-`LegacyPromise`/`LegacyChannel`, `IN_ASYNC_CONTEXT`, `SchedulerTarget`/
-`SchedulerRunResult`/`DebugCoopResume`, `COOP_TASK_STOP`, and the scheduler
-callback seams are deleted; `scripts/check-unified-runtime-legacy.sh --check`
-(zero-tolerance, no globs) guards against reintroduction. The sole surviving
-piece of the old TLS yield transport is `YieldReason` — now a single variant
-`Sleep(u64)` (`crates/sema-core/src/async_signal.rs:22`) carried via
-`VmExecResult::AsyncYield` — which is **live, not dead**: it is the ctx-less
-value ABI for `async/sleep`. Retiring it needs a ctx-full sleep native; a
-follow-up, not a correctness gap.
+**RESOLVED 2026-07-16 (P5 purge, commit a1862f67; `YieldReason` fully retired
+in a follow-up slice).** `scheduler.rs`, `LegacyPromise`/`LegacyChannel`,
+`IN_ASYNC_CONTEXT`, `SchedulerTarget`/`SchedulerRunResult`/`DebugCoopResume`,
+`COOP_TASK_STOP`, and the scheduler callback seams are deleted;
+`scripts/check-unified-runtime-legacy.sh --check` (zero-tolerance, no globs)
+guards against reintroduction. The last surviving piece of the old TLS yield
+transport, `YieldReason` (a single variant `Sleep(u64)`), has since been
+deleted too — along with `set_yield_signal`/`take_yield_signal` and
+`VmExecResult::AsyncYield` — once investigation showed it could be retired
+cleanly: `async/sleep`'s structural Timer ABI (`invoke_runtime`) is always
+preferred when a `TaskContext` is installed, so the legacy value-ABI closure
+is reached only when a caller bypasses `invoke_runtime` entirely — a raw
+native passed directly to a single-ABI (`register_fn`-only) HOF like
+`any`/`every`, or to `apply` — where there is no way to suspend anyway. That
+closure now raises a clear "wrap it in a lambda" error itself instead of
+setting a TLS signal for the VM to relay; outside any runtime quantum (a
+nested/foreign synchronous VM re-entry) it still actually sleeps. The
+`list.rs` guard (`check_hof_yield`) that used to detect the stale signal is
+gone too — `call_function`/`call_function_owned` return the native's result
+directly. `scripts/check-unified-runtime-legacy.sh` was extended with fixtures
+for `YieldReason`, `set_yield_signal`, `take_yield_signal`, and
+`VmExecResult::AsyncYield` to catch reintroduction.
 
 What IS fully deleted and guarded against reintroduction (see the static-scan
 test): the thread-local suspension transport for LANGUAGE async —
 `YieldReason::NativeYield`, `PENDING_NATIVE_OUTCOME`, `set/take_pending_native_outcome`, the
-ad-hoc `spawned_promises`/`promise_waits`/`channel_bridge` stores, and the runtime's
+ad-hoc `spawned_promises`/`promise_waits`/`channel_bridge` stores, `YieldReason` itself
+(`Sleep` included) and its `VmExecResult::AsyncYield` carrier, and the runtime's
 consumption of the promise/channel `YieldReason` variants (now structural `NativeOutcome`).
 Promises, channels, and cooperative HOFs go 100% through the canonical registries + the
 structural ABI with no thread-local suspension hop.

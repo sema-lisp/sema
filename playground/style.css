@@ -368,9 +368,35 @@
 
   /* ── Responsive ── */
   @media (max-width: 768px) {
-    main { grid-template-columns: 1fr; grid-template-rows: auto 1fr 1fr; }
-    .sidebar { max-height: 200px; border-right: none; border-bottom: 1px solid var(--border); }
+    main {
+      grid-template-columns: minmax(0, 1fr);
+      grid-template-rows:
+        var(--mobile-sidebar-h, 160px)
+        4px
+        var(--mobile-editor-h, 260px)
+        4px
+        minmax(0, 1fr);
+    }
+    .sidebar {
+      min-width: 0;
+      max-height: none;
+      border-right: none;
+      border-bottom: 1px solid var(--border);
+    }
     .editor-pane { border-right: none; border-bottom: 1px solid var(--border); }
-    .files-body { grid-template-columns: 1fr; height: auto; }
-    .file-tree-pane { border-right: none; border-bottom: 1px solid var(--border); max-height: 150px; }
+    .right-column { min-width: 0; }
+    .files-body {
+      grid-template-columns: minmax(0, 1fr);
+      grid-template-rows:
+        var(--mobile-filetree-h, 78px)
+        4px
+        minmax(0, 1fr);
+      height: var(--mobile-files-h, 160px);
+      min-width: 0;
+    }
+    .file-tree-pane {
+      max-height: none;
+      border-right: none;
+      border-bottom: 1px solid var(--border);
+    }
   }

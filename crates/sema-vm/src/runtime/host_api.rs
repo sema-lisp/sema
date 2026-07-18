@@ -2,7 +2,7 @@
 //! result, and shutting the runtime down. This is the API a host (CLI,
 //! notebook, MCP, DAP, wasm) drives a program through; the drive-loop
 //! internals it calls into (`Runtime::drive`, `cancel_waiting`,
-//! `abort_terminal_state`, `deliver_cancel_teardown`, `RuntimeState`) stay in
+//! `abort_terminal_state`, `cancel_origin_root`, `RuntimeState`) stay in
 //! `state.rs`.
 
 use std::cell::RefCell;
@@ -21,7 +21,7 @@ use sema_core::runtime::{
 use crate::VM;
 
 use super::state::{
-    deliver_cancel_teardown, ReturnOwner, Runtime, RuntimeFault, RuntimeState, RuntimeTask,
+    cancel_origin_root, ReturnOwner, Runtime, RuntimeFault, RuntimeState, RuntimeTask,
     SubmitRootError, TaskPayload, TaskScopes,
 };
 use super::wait::{CommandChannel, RuntimeCommand};
@@ -394,27 +394,7 @@ impl RootHandle {
         let Some(runtime) = self.runtime.upgrade() else {
             return false;
         };
-        let (task_id, newly) = {
-            let mut state = runtime.borrow_mut();
-            let task_id = match state.roots.get(&self.id).map(RootRecord::state) {
-                Some(RootState::Running { main_task }) => *main_task,
-                _ => return false,
-            };
-            let newly = state
-                .tasks
-                .get_mut(&task_id)
-                .is_some_and(|task| task.record.request_cancellation(reason));
-            if newly {
-                state.pending_cancel_waits.push_back(task_id);
-            }
-            (task_id, newly)
-        };
-        // Eagerly deliver in-flight wait teardown so a root cancelled between
-        // drive turns (e.g. host Ctrl-C) aborts its offloaded op promptly (C2).
-        if newly {
-            let _ = deliver_cancel_teardown(&runtime, task_id);
-        }
-        newly
+        cancel_origin_root(&runtime, self.id, reason)
     }
 }
 

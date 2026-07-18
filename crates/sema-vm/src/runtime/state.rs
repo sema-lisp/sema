@@ -4297,7 +4297,7 @@ impl Runtime {
             }
         };
         let error = {
-            let mut state = self.state.borrow_mut();
+            let state = self.state.borrow();
             match state.tasks.get(&main_task) {
                 Some(task) if task.record.state_name() == super::StateName::Waiting => {}
                 // The root main task is not parked (already resumed/settling): not
@@ -4308,22 +4308,18 @@ impl Runtime {
             // is a `protocol_waits` Channel entry keyed by its wait key. Name the
             // deadlock with the legacy synchronous message (empty/full) so
             // `eval_str_via_runtime` matches the `eval_str` oracle.
-            let channel_wait = state
+            let channel_receive = state
                 .tasks
                 .get(&main_task)
                 .and_then(|task| task.record.wait_key())
                 .and_then(|key| match state.protocol_waits.get(&key) {
                     Some(ProtocolWait {
-                        kind: ProtocolWaitKind::Channel { channel, receive },
+                        kind: ProtocolWaitKind::Channel { receive, .. },
                         ..
-                    }) => Some((key, *channel, *receive)),
+                    }) => Some(*receive),
                     _ => None,
                 });
-            if let Some((key, channel, receive)) = channel_wait {
-                // Deregister from the channel queue and drop the protocol wait so no
-                // stale wait remains once the task is removed by `settle` below.
-                let _ = state.channels.cancel_wait(channel, key);
-                state.protocol_waits.remove(&key);
+            if let Some(receive) = channel_receive {
                 if receive {
                     sema_core::SemaError::eval("channel/recv: channel is empty")
                 } else {
@@ -4332,16 +4328,114 @@ impl Runtime {
                     )
                 }
             } else {
-                // Awaiting a promise (single or set) that can never settle — a
-                // genuine cross-task deadlock. The main task's protocol wait is
-                // dropped by `settle` below; any never-settling descendant tasks
-                // stay parked but inert (they are Waiting, never Ready, so they
-                // never re-enter the drive loop).
+                // Awaiting a promise (single or set) that can never settle is a
+                // genuine cross-task deadlock. Descendant tasks remain parked so
+                // a later root may still satisfy their dependency.
                 sema_core::SemaError::eval("async scheduler: all tasks blocked (deadlock detected)")
             }
         };
+        self.deregister_deadlocked_task_wait(main_task)?;
         self.settle(root, main_task, TaskOutcome::Failed(error))?;
         Ok(true)
+    }
+
+    /// Remove every registry edge owned by a deadlocked task before its record is
+    /// force-settled and dropped. A later root may wake the dependency, but that
+    /// wake must no longer target the removed task.
+    fn deregister_deadlocked_task_wait(&self, task_id: TaskId) -> Result<(), RuntimeFault> {
+        let key = {
+            let state = self.state.borrow();
+            state
+                .tasks
+                .get(&task_id)
+                .and_then(|task| task.record.wait_key())
+                .ok_or_else(|| RuntimeFault::Invariant {
+                    message: "deadlocked task has no wait key".into(),
+                })?
+        };
+
+        {
+            let mut state = self.state.borrow_mut();
+            if let Some(wait) = state.protocol_waits.remove(&key) {
+                match wait.kind {
+                    ProtocolWaitKind::Promises(set) => {
+                        for promise in set.promises {
+                            let _ = state.promises.cancel_observation(promise, key);
+                        }
+                        if matches!(set.mode, sema_core::runtime::PromiseSetMode::Timeout(_)) {
+                            state.timers.cancel(key);
+                        }
+                    }
+                    ProtocolWaitKind::Timer => {
+                        state.timers.cancel(key);
+                    }
+                    ProtocolWaitKind::Channel { channel, .. } => {
+                        let _ = state.channels.cancel_wait(channel, key);
+                        let _ = state.channels.take_wake(key);
+                    }
+                    ProtocolWaitKind::ResourceSlot { gate } => {
+                        let queued =
+                            state
+                                .resource_gates
+                                .cancel_wait(gate, key)
+                                .map_err(|error| RuntimeFault::Invariant {
+                                    message: format!("resource slot teardown failed: {error:?}"),
+                                })?;
+                        if !queued {
+                            let _ = state.resource_gates.take_wake(key);
+                            release_owned_gate(&mut state, gate)?;
+                        }
+                    }
+                    ProtocolWaitKind::OriginBarrier { .. } => {
+                        state.origin_barrier_waits = state.origin_barrier_waits.saturating_sub(1);
+                    }
+                }
+                return Ok(());
+            }
+            if state.timers.cancel(key) {
+                return Ok(());
+            }
+            if !state
+                .waits
+                .as_ref()
+                .is_some_and(|waits| waits.is_active(key))
+            {
+                return Err(RuntimeFault::Invariant {
+                    message: "deadlocked task wait registration disappeared".into(),
+                });
+            }
+        }
+
+        let (mut task, mut waits, now) = {
+            let mut state = self.state.borrow_mut();
+            let waits = state.waits.take().ok_or_else(|| RuntimeFault::Invariant {
+                message: "wait runtime already extracted".into(),
+            })?;
+            let Some(task) = state.tasks.remove(&task_id) else {
+                state.waits = Some(waits);
+                return Err(RuntimeFault::Invariant {
+                    message: "deadlocked external task disappeared".into(),
+                });
+            };
+            let now = state.clock.now();
+            (task, waits, now)
+        };
+        task.record.request_cancellation(CancelReason::Owner);
+        let pending = waits.cancel(&mut task.record, key, now);
+        let removed = pending.is_some();
+        {
+            let mut state = self.state.borrow_mut();
+            state.waits = Some(waits);
+            state.tasks.insert(task_id, task);
+        }
+        drop(pending);
+        if removed {
+            Ok(())
+        } else {
+            Err(RuntimeFault::Invariant {
+                message: "deadlocked external wait could not be deregistered".into(),
+            })
+        }
     }
 
     /// Drain and apply commands enqueued via `RuntimeCommandHandle`
@@ -4396,66 +4490,7 @@ impl Runtime {
     /// (unchanged contract: `false` for an unknown/already-settled root, or
     /// a second call on an already-cancelled root — idempotent).
     pub fn cancel_root(&self, root: RootId, reason: CancelReason) -> bool {
-        let (main_newly, targets) = {
-            let mut state = self.state.borrow_mut();
-            if root.runtime()
-                != state
-                    .waits
-                    .as_ref()
-                    .expect("runtime wait owner is installed")
-                    .runtime_id()
-                || !state.roots.contains_key(&root)
-            {
-                return false;
-            }
-            let main_task = match state.roots.get(&root).map(RootRecord::state) {
-                Some(RootState::Running { main_task }) => *main_task,
-                _ => return false,
-            };
-            if state.tasks.get(&main_task).is_none() {
-                return false;
-            }
-            let mut targets = Vec::new();
-            let main_newly = {
-                let task = state.tasks.get_mut(&main_task).expect("main task present");
-                task.record.request_cancellation(reason)
-            };
-            if main_newly {
-                state.pending_cancel_waits.push_back(main_task);
-                targets.push(main_task);
-            }
-            // Every other live task under this origin root (descendants at
-            // any depth, however their spawning ancestors have settled)
-            // carries `CancelReason::Owner` — cancelled because the root
-            // was, mirroring `cancel_descendants`' reason for a
-            // transitively-cancelled task.
-            let descendants: Vec<TaskId> = state
-                .tasks
-                .iter()
-                .filter_map(|(id, task)| {
-                    (*id != main_task && task.record.relations().origin_root == root).then_some(*id)
-                })
-                .collect();
-            for id in descendants {
-                if let Some(task) = state.tasks.get_mut(&id) {
-                    if task.record.request_cancellation(CancelReason::Owner) {
-                        state.pending_cancel_waits.push_back(id);
-                        targets.push(id);
-                    }
-                }
-            }
-            (main_newly, targets)
-        };
-        // Eagerly tear down every newly-cancelled task's in-flight
-        // External/IO/ResourceSlot wait (C2), the same delivery
-        // `cancel_descendants`' caller uses — exactly-once because
-        // `deliver_cancel_teardown` removes the wait registration itself, so
-        // a later per-drive-turn `cancel_waiting` scan finds nothing left to
-        // double-abort.
-        for target in targets {
-            let _ = deliver_cancel_teardown(&self.state, target);
-        }
-        main_newly
+        cancel_origin_root(&self.state, root, reason)
     }
 
     pub(super) fn abort_terminal_state(&self, fault: &RuntimeFault) {
@@ -4713,6 +4748,77 @@ impl Runtime {
             state: Rc::clone(&self.state),
         }
     }
+}
+
+/// Canonical host cancellation path for a root and every live task carrying its
+/// origin identity. Both [`Runtime::cancel_root`] and `RootHandle::cancel` route
+/// here so descendant reachability, eager wait teardown, and debug barriers have
+/// one implementation.
+pub(super) fn cancel_origin_root(
+    cell: &Rc<RefCell<RuntimeState>>,
+    root: RootId,
+    reason: CancelReason,
+) -> bool {
+    let (main_newly, targets) = {
+        let mut state = cell.borrow_mut();
+        if root.runtime()
+            != state
+                .waits
+                .as_ref()
+                .expect("runtime wait owner is installed")
+                .runtime_id()
+            || !state.roots.contains_key(&root)
+        {
+            return false;
+        }
+        let main_task = match state.roots.get(&root).map(RootRecord::state) {
+            Some(RootState::Running { main_task }) => *main_task,
+            _ => return false,
+        };
+        if state.tasks.get(&main_task).is_none() {
+            return false;
+        }
+        let mut targets = Vec::new();
+        let main_newly = {
+            let task = state.tasks.get_mut(&main_task).expect("main task present");
+            task.record.request_cancellation(reason)
+        };
+        if main_newly {
+            state.pending_cancel_waits.push_back(main_task);
+            targets.push(main_task);
+        }
+        let descendants: Vec<TaskId> = state
+            .tasks
+            .iter()
+            .filter_map(|(id, task)| {
+                (*id != main_task && task.record.relations().origin_root == root).then_some(*id)
+            })
+            .collect();
+        for id in descendants {
+            if let Some(task) = state.tasks.get_mut(&id) {
+                if task.record.request_cancellation(CancelReason::Owner) {
+                    state.pending_cancel_waits.push_back(id);
+                    targets.push(id);
+                }
+            }
+        }
+        if state
+            .debug_paused
+            .as_ref()
+            .is_some_and(|(paused_root, _, _)| *paused_root == root)
+        {
+            let (_, paused_task, _) = state
+                .debug_paused
+                .take()
+                .expect("matching debug barrier exists");
+            state.ready.enqueue(root, paused_task);
+        }
+        (main_newly, targets)
+    };
+    for target in targets {
+        let _ = deliver_cancel_teardown(cell, target);
+    }
+    main_newly
 }
 
 /// Transitively request cancellation of every live task whose cancellation-parent
@@ -5857,6 +5963,7 @@ pub(super) enum TestPreparedTask {
     YieldForever,
     Native(Option<NativeResult>),
     NativeCall(Option<Box<dyn FnOnce() -> NativeResult>>),
+    DebugStop(Option<crate::debug::StopInfo>),
     TimerReturn {
         deadline: Option<Instant>,
         value: Option<Value>,
@@ -5879,6 +5986,14 @@ impl TestPreparedTask {
 
     pub(super) fn native_call(call: impl FnOnce() -> NativeResult + 'static) -> Self {
         Self::NativeCall(Some(Box::new(call)))
+    }
+
+    pub(super) fn debug_stop() -> Self {
+        Self::DebugStop(Some(crate::debug::StopInfo {
+            reason: crate::debug::StopReason::Breakpoint,
+            file: None,
+            line: 1,
+        }))
     }
 
     pub(super) fn timer_returned(deadline: Instant, value: Value) -> Self {
@@ -5905,6 +6020,11 @@ impl TestPreparedTask {
             Self::NativeCall(call) => TaskAction::NativeCall(
                 task,
                 call.take().expect("test native callable executes once"),
+            ),
+            Self::DebugStop(info) => TaskAction::DebugStop(
+                root,
+                task,
+                info.take().expect("test debug stop executes once"),
             ),
             Self::TimerReturn { deadline, value } => deadline.take().map_or_else(
                 || {

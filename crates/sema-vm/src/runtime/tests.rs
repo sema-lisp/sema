@@ -1446,6 +1446,102 @@ fn runtime_promise_timeout_raises_structured_condition_when_deadline_wins() {
     runtime.settle_promise_for_test(promise, TaskOutcome::Returned(Value::int(9)));
 }
 
+#[test]
+fn deadlocked_root_deregisters_promise_wait_before_later_dependency_wake() {
+    let runtime = runtime_with_inline_executor(Rc::new(FakeClock::new()));
+    let promise = runtime.create_pending_promise_for_test();
+    let responses = Rc::new(RefCell::new(Vec::new()));
+    let deadlocked = runtime
+        .submit_test_root(TestPreparedTask::native(Ok(NativeOutcome::Suspend(
+            NativeSuspend {
+                wait: WaitKind::Promise(promise),
+                continuation: Box::new(CaptureRuntimeContinuation(Rc::clone(&responses))),
+            },
+        ))))
+        .expect("deadlocked root admitted");
+    while runtime.protocol_wait_count_for_test() == 0 {
+        runtime.drive(&drive_budget(1)).unwrap();
+    }
+
+    assert!(runtime
+        .settle_deadlocked_root(deadlocked.id())
+        .expect("deadlocked root settlement succeeds"));
+    let RootPoll::Ready(settlement) = deadlocked.poll_result() else {
+        panic!("deadlocked root settles failed")
+    };
+    assert!(matches!(settlement.outcome, TaskOutcome::Failed(_)));
+
+    runtime.settle_promise_for_test(promise, TaskOutcome::Returned(Value::int(42)));
+    let fresh = runtime
+        .submit_test_root(TestPreparedTask::returned(Value::int(9)))
+        .expect("persistent runtime accepts a later root");
+    let mut turns = 0;
+    while matches!(fresh.poll_result(), RootPoll::Pending) {
+        runtime
+            .drive(&drive_budget(8))
+            .expect("the later wake must not target the removed deadlocked task");
+        turns += 1;
+        assert!(turns < 20, "later root settles");
+    }
+
+    let RootPoll::Ready(settlement) = fresh.poll_result() else {
+        panic!("later root settles")
+    };
+    assert!(
+        matches!(&settlement.outcome, TaskOutcome::Returned(value) if value.as_int() == Some(9))
+    );
+    assert!(responses.borrow().is_empty());
+    assert_eq!(runtime.protocol_wait_count_for_test(), 0);
+}
+
+#[test]
+fn forced_deadlock_settlement_aborts_external_wait_without_arming_a_resume() {
+    let runtime = runtime_with_inline_executor(Rc::new(FakeClock::new()));
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let blocked = runtime
+        .submit_test_root(TestPreparedTask::native(Ok(NativeOutcome::Suspend(
+            interruptible_suspend_with_hook(
+                Arc::clone(&events),
+                RecordingHook {
+                    result: CancelResult::Reaped,
+                    calls: Arc::clone(&calls),
+                    edge: None,
+                    trace_ok: true,
+                },
+            ),
+        ))))
+        .expect("external root admitted");
+    while runtime.active_wait_count_for_test() == 0 {
+        runtime.drive(&drive_budget(1)).unwrap();
+    }
+
+    assert!(runtime
+        .settle_deadlocked_root(blocked.id())
+        .expect("forced settlement tears down the external wait"));
+    assert_eq!(runtime.active_wait_count_for_test(), 0);
+    assert_eq!(*calls.lock().unwrap(), vec!["cancel"]);
+    assert!(events.lock().unwrap().is_empty());
+    let RootPoll::Ready(settlement) = blocked.poll_result() else {
+        panic!("externally parked root settles")
+    };
+    assert!(matches!(settlement.outcome, TaskOutcome::Failed(_)));
+
+    let fresh = runtime
+        .submit_test_root(TestPreparedTask::returned(Value::int(11)))
+        .expect("persistent runtime accepts a later root");
+    let mut turns = 0;
+    while matches!(fresh.poll_result(), RootPoll::Pending) {
+        runtime
+            .drive(&drive_budget(8))
+            .expect("cancelled external completion cannot resume the removed task");
+        turns += 1;
+        assert!(turns < 20, "later root settles");
+    }
+    assert_eq!(*calls.lock().unwrap(), vec!["cancel"]);
+    assert!(events.lock().unwrap().is_empty());
+}
+
 fn runtime_with_inline_executor(clock: Rc<dyn RuntimeClock>) -> Runtime {
     Runtime::new(
         Rc::new(sema_core::EvalContext::new()),
@@ -1655,6 +1751,83 @@ fn runtime_command_handle_cancel_all_lands_within_one_drive_turn() {
 }
 
 #[test]
+fn runtime_command_handle_cancel_root_settles_debug_paused_root_without_resume() {
+    let runtime = runtime_with_inline_executor(Rc::new(FakeClock::new()));
+    let handle = runtime
+        .submit_test_root(TestPreparedTask::debug_stop())
+        .expect("root admitted");
+    let root = handle.id();
+    assert!(matches!(
+        runtime
+            .drive(&drive_budget(8))
+            .expect("drive to debug stop"),
+        super::DriveState::DebugStopped { .. }
+    ));
+    assert!(runtime.is_debug_paused());
+
+    let commands = runtime.command_handle();
+    assert!(std::thread::spawn(move || commands.cancel_root(root))
+        .join()
+        .expect("command thread does not panic"));
+    runtime
+        .drive(&drive_budget(8))
+        .expect("ordinary root cancellation clears the debug barrier");
+
+    assert!(!runtime.is_debug_paused());
+    let RootPoll::Ready(settlement) = handle.poll_result() else {
+        panic!("debug-paused root settles without debug_resume")
+    };
+    assert!(matches!(
+        settlement.outcome,
+        TaskOutcome::Cancelled(CancelReason::HostStop)
+    ));
+}
+
+#[test]
+fn runtime_command_handle_cancel_all_settles_debug_paused_and_sibling_roots() {
+    let runtime = runtime_with_inline_executor(Rc::new(FakeClock::new()));
+    let paused = runtime
+        .submit_test_root(TestPreparedTask::debug_stop())
+        .expect("paused root admitted");
+    let sibling = runtime
+        .submit_test_root(TestPreparedTask::yield_forever())
+        .expect("sibling root admitted");
+    assert!(matches!(
+        runtime
+            .drive(&drive_budget(1))
+            .expect("drive to debug stop"),
+        super::DriveState::DebugStopped { .. }
+    ));
+
+    let commands = runtime.command_handle();
+    assert!(std::thread::spawn(move || commands.cancel_all())
+        .join()
+        .expect("command thread does not panic"));
+    let mut turns = 0;
+    while [&paused, &sibling]
+        .iter()
+        .any(|handle| matches!(handle.poll_result(), RootPoll::Pending))
+    {
+        runtime
+            .drive(&drive_budget(8))
+            .expect("cancel_all clears the debug barrier and drains roots");
+        turns += 1;
+        assert!(turns < 20, "cancel_all settles every root");
+    }
+
+    assert!(!runtime.is_debug_paused());
+    for handle in [&paused, &sibling] {
+        let RootPoll::Ready(settlement) = handle.poll_result() else {
+            panic!("cancel_all settles every root")
+        };
+        assert!(matches!(
+            settlement.outcome,
+            TaskOutcome::Cancelled(CancelReason::HostStop)
+        ));
+    }
+}
+
+#[test]
 fn runtime_command_handle_outliving_runtime_returns_false_without_panic() {
     let runtime = runtime_with_inline_executor(Rc::new(FakeClock::new()));
     let handle = runtime
@@ -1768,6 +1941,42 @@ fn cancel_root_reaps_a_fire_and_forget_grandchild_of_an_already_settled_task() {
         "cancel_root must reap the fire-and-forget grandchild too — no leak \
          (CANCEL-ROOT-CASCADE-1)"
     );
+}
+
+#[test]
+fn root_handle_cancel_reaps_a_fire_and_forget_grandchild() {
+    let runtime = runtime_with_inline_executor(Rc::new(FakeClock::new()));
+    let handle = runtime
+        .submit_test_root(TestPreparedTask::yield_forever())
+        .expect("root admitted");
+    let root = handle.id();
+    let intermediate = runtime.allocate_task_id_for_test();
+    let _grandchild = runtime.submit_test_child_under_task(
+        root,
+        intermediate,
+        TestPreparedTask::native(Ok(NativeOutcome::Suspend(far_future_timer_suspend()))),
+    );
+    while runtime.timer_count_for_test() == 0 {
+        runtime.drive(&drive_budget(1)).unwrap();
+    }
+    assert_eq!(runtime.live_task_count(), 2, "main + parked grandchild");
+
+    assert!(handle.cancel(CancelReason::Explicit));
+    let mut turns = 0;
+    while matches!(handle.poll_result(), RootPoll::Pending) || runtime.live_task_count() > 0 {
+        runtime.drive(&drive_budget(8)).unwrap();
+        turns += 1;
+        assert!(turns < 100, "handle cancellation settles the whole root");
+    }
+
+    let RootPoll::Ready(settlement) = handle.poll_result() else {
+        panic!("cancelled root settles")
+    };
+    assert!(matches!(
+        settlement.outcome,
+        TaskOutcome::Cancelled(CancelReason::Explicit)
+    ));
+    assert_eq!(runtime.live_task_count(), 0);
 }
 
 /// Regression: a plain single-task root is still fully reaped.

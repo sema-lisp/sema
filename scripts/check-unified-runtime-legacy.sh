@@ -14,10 +14,23 @@ legacy_pattern='IoHandle|IoPoll|YieldReason|SchedulerTarget|SchedulerRunResult|s
 # symbols retired with `scheduler.rs`, the cooperative-debug driver, and the
 # legacy `async_signal.rs` seams — every async op is now structural.
 #
-# Deliberately NOT here (KEPT, still live): `YieldReason` (reduced to `Sleep`),
-# `set_yield_signal`/`take_yield_signal`/`take_resume_value` (the ctx-less
-# `async/sleep` bridge), `VmExecResult::AsyncYield` (carries `Sleep`),
-# `execute_debug` (the VM-level debug test driver), `in_runtime_quantum`.
+# Deliberately NOT here (KEPT, still live): `take_resume_value` (a still-wired
+# seam for `git`/`http`/`ws`/`system`'s own legacy resume checks — unrelated to
+# `YieldReason`, which never had a setter counterpart reachable from those
+# modules), `execute_debug` (the VM-level debug test driver),
+# `in_runtime_quantum`.
+#
+# `YieldReason`, `set_yield_signal`, `take_yield_signal`, and
+# `VmExecResult::AsyncYield` (the last surviving TLS yield-signal transport —
+# the ctx-less `async/sleep` value-ABI bridge) WERE here in the "KEPT, still
+# live" list; they are now retired and moved into `purged_pattern` below.
+# `async/sleep`'s structural Timer ABI (`invoke_runtime`) is always preferred
+# when a `TaskContext` is installed, so the legacy value-ABI closure is
+# reached only when a caller bypasses `invoke_runtime` — a raw native passed
+# directly to a single-ABI HOF (`any`/`every`/…) or to `apply` — where there
+# is no way to suspend anyway; it now raises a clear error itself instead of
+# setting a TLS signal for the VM to relay. `TaskAction::VmSleep`, the
+# runtime's sole consumer of the carried `Sleep(ms)`, is retired alongside it.
 #
 # Also deliberately NOT here (P6-3 step 5 — see
 # `docs/plans/archive/2026-07-16-wasm-promise-driven-roots.md` §3 and the P6-3 entry
@@ -38,7 +51,7 @@ legacy_pattern='IoHandle|IoPoll|YieldReason|SchedulerTarget|SchedulerRunResult|s
 # allocation (JS; the browser gate's own step-4 scoping note already flagged
 # it as dormant) are unconditionally deleted; those two ARE in the
 # zero-tolerance list below.
-purged_pattern='LegacyPromise|LegacyChannel|\bIoHandle\b|\bIoPoll\b|SchedulerTarget|SchedulerRunResult|DebugCoopResume|set_debug_coop_resume|take_debug_coop_resume|debug_coop_resume_pending|set_resume_value|\bin_async_context\b|set_async_context|init_scheduler|shutdown_scheduler|reset_scheduler_tasks|scheduler_task_count|run_cooperative|start_cooperative|run_closure_as_inline_task|call_run_scheduler|call_run_scheduler_all_of|call_run_scheduler_any_of|call_run_scheduler_target|call_run_scheduler_timeout|set_run_scheduler_callback|call_spawn_callback|set_spawn_callback|call_cancel_callback|set_cancel_callback|notify_io_complete|\bio_park\b|PromiseSetKind|LegacyRuntimeBridge|with_coop_paused_task_vm|COOP_TASK_STOP|coop_paused_task_id|clear_coop_paused_task_id|surface_coop_task_stop|reconstruct_coop_resume_value|\bexecute_async\b|\brun_async\b|\bMAX_REPLAYS\b|legacySab|new SharedArrayBuffer\('
+purged_pattern='LegacyPromise|LegacyChannel|\bIoHandle\b|\bIoPoll\b|SchedulerTarget|SchedulerRunResult|DebugCoopResume|set_debug_coop_resume|take_debug_coop_resume|debug_coop_resume_pending|set_resume_value|\bin_async_context\b|set_async_context|init_scheduler|shutdown_scheduler|reset_scheduler_tasks|scheduler_task_count|run_cooperative|start_cooperative|run_closure_as_inline_task|call_run_scheduler|call_run_scheduler_all_of|call_run_scheduler_any_of|call_run_scheduler_target|call_run_scheduler_timeout|set_run_scheduler_callback|call_spawn_callback|set_spawn_callback|call_cancel_callback|set_cancel_callback|notify_io_complete|\bio_park\b|PromiseSetKind|LegacyRuntimeBridge|with_coop_paused_task_vm|COOP_TASK_STOP|coop_paused_task_id|clear_coop_paused_task_id|surface_coop_task_stop|reconstruct_coop_resume_value|\bexecute_async\b|\brun_async\b|\bMAX_REPLAYS\b|legacySab|new SharedArrayBuffer\(|\bYieldReason\b|set_yield_signal|take_yield_signal|\bAsyncYield\b|\bVmSleep\b'
 
 # Exact-file allowlist (no globs). A purged identifier surviving here is a KNOWN,
 # reviewed exception with a written reason. Currently empty — the purge is total.

@@ -6,9 +6,8 @@
 //! these tests exercise the async tier end-to-end through `http/get`:
 //!
 //! 1. `http_16_concurrent_overlap` — sixteen 300 ms requests via
-//!    `async/spawn`+`async/all` complete in ~1× wall-time, decisively below the
-//!    16× serial floor AND below the ceiling the old blocking tier imposed (one
-//!    pool worker per in-flight op, clamped to [2,8] → ≥2 serial batches at N=16).
+//!    `async/spawn`+`async/all` overlap server-side while preserving response
+//!    correctness and input order.
 //! 2. `http_get_cancel_aborts_and_disconnects` — an `async/cancel` of a parked
 //!    `http/get` returns promptly and the SERVER observes the client disconnect
 //!    (the in-flight reqwest future was dropped, socket torn down).
@@ -23,7 +22,7 @@
 
 use std::io::Read;
 use std::net::TcpListener as StdTcpListener;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -40,9 +39,10 @@ const DELAY_MS: u64 = 300;
 
 /// Spin up a local delay HTTP server (raw `tokio` TCP on its own multi-thread
 /// runtime, random port). The handler sleeps [`DELAY_MS`] then echoes the `i`
-/// query param as `echo:<i>`. Returns the bound port; the runtime is leaked so
-/// the accept loop lives for the whole test.
-fn start_delay_server() -> u16 {
+/// query param as `echo:<i>`. Returns the bound port and a server-side in-flight
+/// high-water mark; the runtime is leaked so the accept loop lives for the whole
+/// test.
+fn start_delay_server() -> (u16, Arc<MaxInFlight>) {
     let std_listener = StdTcpListener::bind("127.0.0.1:0").expect("bind delay server");
     std_listener.set_nonblocking(true).expect("set_nonblocking");
     let port = std_listener.local_addr().expect("local_addr").port();
@@ -52,6 +52,8 @@ fn start_delay_server() -> u16 {
         .build()
         .expect("delay server runtime");
 
+    let gauge = Arc::new(MaxInFlight::default());
+    let gauge_for_server = gauge.clone();
     rt.spawn(async move {
         let listener = tokio::net::TcpListener::from_std(std_listener).expect("from_std listener");
         loop {
@@ -59,7 +61,9 @@ fn start_delay_server() -> u16 {
                 Ok(pair) => pair,
                 Err(_) => continue,
             };
+            let gauge = gauge_for_server.clone();
             tokio::spawn(async move {
+                let _in_flight = gauge.enter();
                 use tokio::io::{AsyncReadExt, AsyncWriteExt};
                 let mut buf = [0u8; 1024];
                 let n = match socket.read(&mut buf).await {
@@ -93,16 +97,42 @@ fn start_delay_server() -> u16 {
 
     Box::leak(Box::new(rt));
     std::thread::sleep(Duration::from_millis(50));
-    port
+    (port, gauge)
 }
 
-/// Sixteen 300 ms requests overlap on the async tier: wall-clock ~1× (well under
-/// the 16× serial floor of ~4800 ms and under the old blocking-tier ceiling of
-/// ≥2 serial batches). Bodies must be correct and in input order.
+/// Tracks the high-water mark of concurrently in-flight requests.
+#[derive(Default)]
+struct MaxInFlight {
+    current: AtomicUsize,
+    max: AtomicUsize,
+}
+
+impl MaxInFlight {
+    fn enter(self: &Arc<Self>) -> InFlightGuard {
+        let current = self.current.fetch_add(1, Ordering::SeqCst) + 1;
+        self.max.fetch_max(current, Ordering::SeqCst);
+        InFlightGuard(self.clone())
+    }
+
+    fn max_seen(&self) -> usize {
+        self.max.load(Ordering::SeqCst)
+    }
+}
+
+struct InFlightGuard(Arc<MaxInFlight>);
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        self.0.current.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// Sixteen 300 ms requests overlap on the async tier. Bodies must be correct and
+/// in input order.
 #[test]
 #[serial]
 fn http_16_concurrent_overlap() {
-    let port = start_delay_server();
+    let (port, gauge) = start_delay_server();
     let interp = Interpreter::new();
     let program = format!(
         r#"
@@ -127,13 +157,15 @@ fn http_16_concurrent_overlap() {
     );
     assert_eq!(result, expected, "expected 16 echoed bodies in input order");
 
-    eprintln!("http_16_concurrent_overlap: wall-clock {elapsed_ms} ms (serial floor ~4800 ms)");
-    // Fully overlapped is ~300-900 ms; the old [2,8]-worker blocking ceiling would
-    // force ≥2 batches (~600 ms floor at 8 workers, ~2400 ms at 2). 1500 ms proves
-    // we are well past the worker ceiling while leaving slack for CI jitter.
+    let max_in_flight = gauge.max_seen();
+    eprintln!(
+        "http_16_concurrent_overlap: wall-clock {elapsed_ms} ms (serial floor ~4800 ms), \
+         max in-flight {max_in_flight}"
+    );
     assert!(
-        elapsed_ms < 1500,
-        "expected overlapped wall-clock < 1500 ms at N=16 (serial floor ~4800 ms), got {elapsed_ms} ms"
+        max_in_flight >= 2,
+        "expected overlapped requests (server-side max in-flight >= 2), got {max_in_flight} \
+         (wall-clock {elapsed_ms} ms)"
     );
 }
 

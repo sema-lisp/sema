@@ -1241,6 +1241,37 @@ passes against the rebuilt `.crate`.
 
 Full record: `.superpowers/sdd/p63-step5-report.md`.
 
+### DEBUG-PROMISE-DRIVE — debugger HTTP replay is still the pre-P6-3 marker/cache flow (follow-up, not attempted here)
+
+**Recorded 2026-07-18**, while fixing a same-session cache-clobber bug in that
+flow (`fix(wasm): debug HTTP cache survives same-session replay restart`,
+`.superpowers/sdd/debug-fetch-loop-report.md`). The debugger's `debugStart` is
+the one caller `HTTP_AWAIT_MARKER`/`HTTP_CACHE`/`debugPerformFetch` still
+survive P6-3 step 5 for (§ above, "deliberately NOT deleted" item 1): a
+synchronous drive that hits `http/get` throws the marker, JS awaits a real
+fetch via `debugPerformFetch` (caching the response), then re-calls
+`debugStart` to replay the whole program from scratch up through the
+now-cached response(s). The P6-3 step-5 authors punted on unifying this with
+the promise-driven `evalPromise` seam because "there is no way to surface a
+pending fetch to JS from a synchronous drive" — the debug drive is
+inherently synchronous (single-stepping/breakpoints need a paused VM state
+JS can inspect between steps), and `evalPromise` roots run to completion (or
+a yielded turn) without exposing that kind of mid-drive pause.
+
+The real end state is to promise-drive the debug drive through the same
+`evalPromise` seam the three rewritten entry points use, so `http/get`
+suspends and resumes the *same* task in place instead of re-running the
+program from the top — at which point the marker/`HTTP_CACHE`/
+`debugPerformFetch`/restart machinery (and the replay-restart-vs-fresh-start
+distinction the 2026-07-18 fix had to introduce, `DEBUG_HTTP_REPLAY_ARMED`)
+can be deleted entirely, along with the non-idempotent-side-effects and
+`MAX_DEBUG_HTTP_RETRIES` caveats that come with re-running a whole program on
+every HTTP call during a debug session. This needs its own design pass (how a
+promise-driven root exposes step/breakpoint/locals-inspection to JS between
+turns) and is **not attempted here** — out of scope for the 2026-07-18 fix,
+which only stopped the replay restart from wiping its own just-cached
+response.
+
 **P6-1 common host API — RESOLVED 2026-07-17** (commits 0b54e961..519fdc50):
 public `Interpreter::{submit_str, submit_value, drive_until_settled, drive_turn,
 take_output, command_handle, shutdown}`, `RootOptions` (`capture_output`;

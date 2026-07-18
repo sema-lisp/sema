@@ -863,30 +863,30 @@ H10A	crates/sema-wasm/src/driver.rs:318:        // http, and `async/sleep` on wa
 H09	crates/sema-wasm/src/driver.rs:31://! it can never resolve (the old path's only recovery, `block_on_inbox`,
 H10A	crates/sema-wasm/src/driver.rs:33://! wasm32, `async/sleep`) instead gate on
 H09	crates/sema-wasm/src/driver.rs:77:thread_local! {
-H09	crates/sema-wasm/src/lib.rs:1979:    /// `async/sleep` / `http/get` instead of hanging or panicking on the
-H09	crates/sema-wasm/src/lib.rs:2027:    /// `http/get`/`async/sleep` inside it get the real, single-execution
-H09	crates/sema-wasm/src/lib.rs:2028:    /// runtime-ABI suspend (no HTTP replay, no `Atomics.wait`) — but rebuilds
+H09	crates/sema-wasm/src/lib.rs:1989:    /// `async/sleep` / `http/get` instead of hanging or panicking on the
+H09	crates/sema-wasm/src/lib.rs:2037:    /// `http/get`/`async/sleep` inside it get the real, single-execution
+H09	crates/sema-wasm/src/lib.rs:2038:    /// runtime-ABI suspend (no HTTP replay, no `Atomics.wait`) — but rebuilds
 H09	crates/sema-wasm/src/lib.rs:20:thread_local! {
-H10B	crates/sema-wasm/src/lib.rs:230:// `HTTP_AWAIT_MARKER`/the replay-with-cache mechanism it drove is deleted
-H10B	crates/sema-wasm/src/lib.rs:241:const HTTP_AWAIT_MARKER: &str = "__SEMA_WASM_HTTP__";
-H09	crates/sema-wasm/src/lib.rs:2609:            sema_core::set_eval_callback(&ctx, sema_eval::eval_value_vm);
-H09	crates/sema-wasm/src/lib.rs:2610:            sema_core::set_call_callback(&ctx, sema_eval::call_value);
-H09	crates/sema-wasm/src/lib.rs:2611:            sema_core::set_call_owned_callback(&ctx, sema_eval::call_value_owned);
-H10B	crates/sema-wasm/src/lib.rs:295:        HTTP_AWAIT_MARKER,
-H09	crates/sema-wasm/src/lib.rs:2992:    /// replays, and `http/get`/`async/sleep` inside it get the real
-H10B	crates/sema-wasm/src/lib.rs:309:        SemaError::Eval(msg) => msg.starts_with(HTTP_AWAIT_MARKER),
-H10B	crates/sema-wasm/src/lib.rs:317:        SemaError::Eval(msg) if msg.starts_with(HTTP_AWAIT_MARKER) => {
-H10B	crates/sema-wasm/src/lib.rs:318:            Some(msg[HTTP_AWAIT_MARKER.len()..].to_string())
-H10C	crates/sema-wasm/src/lib.rs:3280:    /// Enable real wall-clock `async/sleep` via `Atomics.wait` on the given
-H10C	crates/sema-wasm/src/lib.rs:3285:    /// `Atomics.wait` is illegal there; leaving it uninstalled keeps the
-H10C	crates/sema-wasm/src/lib.rs:3287:    #[wasm_bindgen(js_name = installAtomicsSleep)]
-H10C	crates/sema-wasm/src/lib.rs:398:    // correctly with real `Atomics.wait` sleeps (no re-runs). Cross-origin
+H10B	crates/sema-wasm/src/lib.rs:240:// `HTTP_AWAIT_MARKER`/the replay-with-cache mechanism it drove is deleted
+H10B	crates/sema-wasm/src/lib.rs:251:const HTTP_AWAIT_MARKER: &str = "__SEMA_WASM_HTTP__";
+H09	crates/sema-wasm/src/lib.rs:2637:            sema_core::set_eval_callback(&ctx, sema_eval::eval_value_vm);
+H09	crates/sema-wasm/src/lib.rs:2638:            sema_core::set_call_callback(&ctx, sema_eval::call_value);
+H09	crates/sema-wasm/src/lib.rs:2639:            sema_core::set_call_owned_callback(&ctx, sema_eval::call_value_owned);
+H09	crates/sema-wasm/src/lib.rs:3020:    /// replays, and `http/get`/`async/sleep` inside it get the real
+H10B	crates/sema-wasm/src/lib.rs:305:        HTTP_AWAIT_MARKER,
+H10B	crates/sema-wasm/src/lib.rs:319:        SemaError::Eval(msg) => msg.starts_with(HTTP_AWAIT_MARKER),
+H10B	crates/sema-wasm/src/lib.rs:327:        SemaError::Eval(msg) if msg.starts_with(HTTP_AWAIT_MARKER) => {
+H10B	crates/sema-wasm/src/lib.rs:328:            Some(msg[HTTP_AWAIT_MARKER.len()..].to_string())
+H10C	crates/sema-wasm/src/lib.rs:3308:    /// Enable real wall-clock `async/sleep` via `Atomics.wait` on the given
+H10C	crates/sema-wasm/src/lib.rs:3313:    /// `Atomics.wait` is illegal there; leaving it uninstalled keeps the
+H10C	crates/sema-wasm/src/lib.rs:3315:    #[wasm_bindgen(js_name = installAtomicsSleep)]
+H10C	crates/sema-wasm/src/lib.rs:408:    // correctly with real `Atomics.wait` sleeps (no re-runs). Cross-origin
 H10C	crates/sema-wasm/src/lib.rs:40:    /// `Atomics.wait` sleep when running inside a Web Worker (installed via
-H10C	crates/sema-wasm/src/lib.rs:418:/// Synchronous HTTP via `XMLHttpRequest` (worker-only — sync XHR is illegal on
 H10C	crates/sema-wasm/src/lib.rs:41:    /// `installAtomicsSleep`). `None` on the main thread (sleep stays an
-H10C	crates/sema-wasm/src/lib.rs:429:    let xhr = web_sys::XmlHttpRequest::new()
+H10C	crates/sema-wasm/src/lib.rs:428:/// Synchronous HTTP via `XMLHttpRequest` (worker-only — sync XHR is illegal on
 H10C	crates/sema-wasm/src/lib.rs:42:    /// instant virtual-clock advance — `Atomics.wait` is illegal there anyway).
-H10C	crates/sema-wasm/src/lib.rs:430:        .map_err(|_| SemaError::Io("failed to create XMLHttpRequest".to_string()))?;
+H10C	crates/sema-wasm/src/lib.rs:439:    let xhr = web_sys::XmlHttpRequest::new()
+H10C	crates/sema-wasm/src/lib.rs:440:        .map_err(|_| SemaError::Io("failed to create XMLHttpRequest".to_string()))?;
 H10C	crates/sema-wasm/src/lib.rs:53:/// thread for `ms` real milliseconds via `Atomics.wait` on the control SAB. The
 H10C	crates/sema-wasm/src/lib.rs:63:            let _ = js_sys::Atomics::wait_with_timeout(arr, 0, 0, ms as f64);
 H09	crates/sema-wasm/src/lib.rs:89:thread_local! {

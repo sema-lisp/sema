@@ -88,6 +88,16 @@ struct DebugSession {
 
 thread_local! {
     static DEBUG_SESSION: RefCell<Option<DebugSession>> = const { RefCell::new(None) };
+    /// Distinguishes a same-session `debugStart` replay restart (triggered by
+    /// `debugPerformFetch` right after it caches a response) from a genuine
+    /// fresh session start. `debugPerformFetch` arms this after a successful
+    /// cache insert; the very next `debugStart` consumes it (`replace(false)`)
+    /// and, if it was armed, skips `clear_http_cache()` so the response it just
+    /// fetched survives the replay instead of being wiped and re-fetched in a
+    /// loop. `debugStop` also resets it so an abandoned http_needed exchange
+    /// (Stop clicked instead of letting the replay happen) can't leak an
+    /// arming into an unrelated later fresh session.
+    static DEBUG_HTTP_REPLAY_ARMED: Cell<bool> = const { Cell::new(false) };
 }
 
 const VFS_MAX_TOTAL_BYTES: usize = 16 * 1024 * 1024; // 16 MB total
@@ -2206,10 +2216,19 @@ impl WasmInterpreter {
             *s.borrow_mut() = None;
         });
         // The debugger's `http_needed`/`debugPerformFetch` flow is the sole
-        // remaining consumer of the HTTP replay cache (P6-3 step 5); reset it
-        // per session so a fresh debug run never observes a stale response
-        // cached by an earlier one.
-        clear_http_cache();
+        // remaining consumer of the HTTP replay cache (P6-3 step 5). A genuine
+        // fresh session must never observe a stale response cached by an
+        // earlier one, so it clears the cache here — but a same-session
+        // replay restart (JS re-calling debugStart right after
+        // debugPerformFetch cached a response, to replay the program up to
+        // the newly-cached response) must NOT clear it, or the response just
+        // fetched is wiped before the replay can use it, producing another
+        // cache miss and an unbounded fetch loop. `DEBUG_HTTP_REPLAY_ARMED`
+        // distinguishes the two: `debugPerformFetch` arms it right after
+        // inserting into the cache, and this consumes it.
+        if !DEBUG_HTTP_REPLAY_ARMED.with(|f| f.replace(false)) {
+            clear_http_cache();
+        }
 
         OUTPUT.with(|o| o.borrow_mut().clear());
         LINE_BUF.with(|b| b.borrow_mut().clear());
@@ -2421,6 +2440,11 @@ impl WasmInterpreter {
                 HTTP_CACHE.with(|c| {
                     c.borrow_mut().insert(key, response);
                 });
+                // Arm the replay flag: JS is about to re-call `debugStart` to
+                // replay this same session up through the response just
+                // cached, and that restart must not clear the cache out from
+                // under it.
+                DEBUG_HTTP_REPLAY_ARMED.with(|f| f.set(true));
                 true
             }
             Err(_) => false,
@@ -2467,6 +2491,10 @@ impl WasmInterpreter {
         DEBUG_SESSION.with(|s| {
             *s.borrow_mut() = None;
         });
+        // If Stop is clicked instead of letting an in-flight http_needed
+        // exchange replay (see `DEBUG_HTTP_REPLAY_ARMED`), don't let that
+        // arming survive into an unrelated later fresh session.
+        DEBUG_HTTP_REPLAY_ARMED.with(|f| f.set(false));
     }
 
     #[wasm_bindgen(js_name = debugGetLocals)]

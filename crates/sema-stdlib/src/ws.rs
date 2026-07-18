@@ -16,82 +16,88 @@
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::rc::Rc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use futures::{SinkExt, StreamExt};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio_tungstenite::tungstenite::Message;
 
 use sema_core::cycle::GcEdge;
-use sema_core::runtime::{NativeOutcome, NativeResult, Trace};
+use sema_core::runtime::{
+    CompletionKind, NativeCallContext, NativeContinuation, NativeOutcome, NativeResult,
+    ResumeInput, Trace,
+};
 use sema_core::{check_arity, Caps, SemaError, SemaStream, StreamBox, Value};
 
-use crate::io::{await_runtime_until, RuntimePoll, RuntimePollResult};
 use crate::register_fn;
 
-/// VM-thread readiness probe for a runtime-path `ws/recv`/`ws/recv-timeout`: scans
-/// the incoming-event channel with `try_recv` (never moving the receiver off the
-/// VM thread, so a cancel can't strand it). A message resolves to its value, a
-/// disconnect to `nil`, and — with a `deadline` — a lapse to the `:timeout`
-/// keyword. Holds no `Value` (the receiver handle isn't one), so it emits no GC
-/// edges. Driven by [`await_runtime_until`], which parks on a structural timer
-/// between scans so siblings overlap.
-struct WsRecvProbe {
-    evt_rx: Rc<RefCell<mpsc::Receiver<WsEvent>>>,
-    deadline: Option<std::time::Instant>,
-}
+const WS_COMPLETION_KIND: u64 = 0x7773_0000; // "ws\0\0"
 
-impl Trace for WsRecvProbe {
-    fn trace(&self, _sink: &mut dyn FnMut(GcEdge<'_>)) -> bool {
-        true
-    }
-}
-
-impl RuntimePoll for WsRecvProbe {
-    fn poll(&mut self) -> RuntimePollResult {
-        use tokio::sync::mpsc::error::TryRecvError;
-        match self.evt_rx.borrow_mut().try_recv() {
-            Ok(event) => match event_to_value(Some(event)) {
-                Ok(value) => RuntimePollResult::Ready(value),
-                Err(error) => RuntimePollResult::Failed(error.to_string()),
-            },
-            Err(TryRecvError::Disconnected) => RuntimePollResult::Ready(Value::nil()),
-            Err(TryRecvError::Empty) => match self.deadline {
-                Some(deadline) if std::time::Instant::now() >= deadline => {
-                    RuntimePollResult::Ready(Value::keyword("timeout"))
-                }
-                _ => RuntimePollResult::PendingAfter(Duration::from_millis(5)),
-            },
-        }
-    }
-}
-
-/// VM-thread readiness probe for a runtime-path `ws/connect`: scans the pump's
-/// one-shot handshake signal; on success resolves to the pre-built connection
-/// value (carried here and GC-traced across the park). On cancel the probe (and
-/// thus the connection value) is dropped, which closes `cmd_tx` and stops the pump.
-struct WsConnectProbe {
-    ready_rx: tokio::sync::oneshot::Receiver<Result<(), String>>,
+/// Retains the connection on the VM thread while its handshake runs on the I/O
+/// executor. Dropping this continuation closes the command channel and stops the
+/// incomplete pump.
+struct WsConnectContinuation {
     conn: Value,
 }
 
-impl Trace for WsConnectProbe {
+impl Trace for WsConnectContinuation {
     fn trace(&self, sink: &mut dyn FnMut(GcEdge<'_>)) -> bool {
         sink(GcEdge::Value(&self.conn));
         true
     }
 }
 
-impl RuntimePoll for WsConnectProbe {
-    fn poll(&mut self) -> RuntimePollResult {
-        use tokio::sync::oneshot::error::TryRecvError;
-        match self.ready_rx.try_recv() {
-            Ok(Ok(())) => RuntimePollResult::Ready(self.conn.clone()),
-            Ok(Err(message)) => RuntimePollResult::Failed(message),
-            Err(TryRecvError::Empty) => RuntimePollResult::PendingAfter(Duration::from_millis(5)),
-            Err(TryRecvError::Closed) => RuntimePollResult::Failed(
-                "ws/connect: connection worker dropped before handshake".to_string(),
-            ),
+impl NativeContinuation for WsConnectContinuation {
+    fn resume(
+        self: Box<Self>,
+        _context: &mut NativeCallContext<'_>,
+        input: ResumeInput,
+    ) -> NativeResult {
+        match input {
+            ResumeInput::Returned(_) => Ok(NativeOutcome::Return(self.conn)),
+            ResumeInput::Failed(error) => Err(error),
+            ResumeInput::Cancelled(reason) => Err(SemaError::eval(format!(
+                "ws/connect was cancelled ({reason:?})"
+            ))),
+            ResumeInput::Runtime(_) => Err(SemaError::eval(
+                "ws/connect continuation received an unexpected runtime response",
+            )),
+        }
+    }
+}
+
+/// Rechecks the VM-owned event receiver after every generation or timer wake.
+/// The watch handle has no `Value` edges and dropping an in-flight wait leaves
+/// the installed message receiver intact.
+struct WsRecvContinuation {
+    evt_rx: Rc<RefCell<mpsc::Receiver<WsEvent>>>,
+    evt_generation: watch::Receiver<u64>,
+    deadline: Option<Instant>,
+}
+
+impl Trace for WsRecvContinuation {
+    fn trace(&self, _sink: &mut dyn FnMut(GcEdge<'_>)) -> bool {
+        true
+    }
+}
+
+impl NativeContinuation for WsRecvContinuation {
+    fn resume(
+        self: Box<Self>,
+        _context: &mut NativeCallContext<'_>,
+        input: ResumeInput,
+    ) -> NativeResult {
+        match input {
+            ResumeInput::Returned(_) => {
+                suspend_ws_receive(self.evt_rx, self.evt_generation, self.deadline)
+            }
+            ResumeInput::Failed(error) => Err(error),
+            ResumeInput::Cancelled(reason) => Err(SemaError::eval(format!(
+                "ws/recv was cancelled ({reason:?})"
+            ))),
+            ResumeInput::Runtime(_) => Err(SemaError::eval(
+                "ws/recv continuation received an unexpected runtime response",
+            )),
         }
     }
 }
@@ -139,6 +145,7 @@ enum WsEvent {
 struct WsConnection {
     cmd_tx: mpsc::UnboundedSender<WsFrame>,
     evt_rx: Rc<RefCell<mpsc::Receiver<WsEvent>>>,
+    evt_generation: watch::Receiver<u64>,
 }
 
 impl std::fmt::Debug for WsConnection {
@@ -223,10 +230,15 @@ fn handles_of(
 ) -> (
     mpsc::UnboundedSender<WsFrame>,
     Rc<RefCell<mpsc::Receiver<WsEvent>>>,
+    watch::Receiver<u64>,
 ) {
     let inner = sb.borrow_inner();
     let conn = inner.as_any().downcast_ref::<WsConnection>().unwrap();
-    (conn.cmd_tx.clone(), conn.evt_rx.clone())
+    (
+        conn.cmd_tx.clone(),
+        conn.evt_rx.clone(),
+        conn.evt_generation.clone(),
+    )
 }
 
 /// Encode a value as JSON text for a frame.
@@ -291,6 +303,79 @@ fn event_to_value(ev: Option<WsEvent>) -> Result<Value, SemaError> {
         }
         Some(WsEvent::Error(e)) => Err(SemaError::Io(e)),
     }
+}
+
+/// Check the VM-owned incoming queue without moving its receiver to an executor
+/// future. Queue readiness is tested before the deadline so an event already in
+/// the channel wins a timeout race.
+fn poll_ws_event(
+    evt_rx: &Rc<RefCell<mpsc::Receiver<WsEvent>>>,
+    deadline: Option<Instant>,
+) -> Result<Option<Value>, SemaError> {
+    use tokio::sync::mpsc::error::TryRecvError;
+
+    match evt_rx.borrow_mut().try_recv() {
+        Ok(event) => event_to_value(Some(event)).map(Some),
+        Err(TryRecvError::Disconnected) => Ok(Some(Value::nil())),
+        Err(TryRecvError::Empty) if deadline.is_some_and(|at| Instant::now() >= at) => {
+            Ok(Some(Value::keyword("timeout")))
+        }
+        Err(TryRecvError::Empty) => Ok(None),
+    }
+}
+
+/// Wait until the pump advances or closes its generation channel, or until the
+/// optional receive deadline. Every outcome is a wake: the VM continuation owns
+/// the policy and rechecks the message queue before deciding what to return.
+async fn wait_for_ws_generation(
+    mut generation: watch::Receiver<u64>,
+    remaining: Option<Duration>,
+) -> Result<(), String> {
+    match remaining {
+        Some(remaining) => {
+            tokio::select! {
+                _ = generation.changed() => {}
+                _ = tokio::time::sleep(remaining) => {}
+            }
+        }
+        None => {
+            let _ = generation.changed().await;
+        }
+    }
+    Ok(())
+}
+
+/// Arm a lossless generation wait, then perform the final VM-thread queue check.
+/// An event published before the generation snapshot is visible in the queue;
+/// an event published after it makes `changed()` ready.
+fn suspend_ws_receive(
+    evt_rx: Rc<RefCell<mpsc::Receiver<WsEvent>>>,
+    evt_generation: watch::Receiver<u64>,
+    deadline: Option<Instant>,
+) -> NativeResult {
+    let mut wait_generation = evt_generation.clone();
+    wait_generation.borrow_and_update();
+
+    if let Some(value) = poll_ws_event(&evt_rx, deadline)? {
+        return Ok(NativeOutcome::Return(value));
+    }
+
+    let remaining = deadline.map(|at| at.saturating_duration_since(Instant::now()));
+    let continuation: Box<dyn NativeContinuation> = Box::new(WsRecvContinuation {
+        evt_rx,
+        evt_generation,
+        deadline,
+    });
+    let kind = CompletionKind::try_from_raw(WS_COMPLETION_KIND)
+        .expect("websocket completion kind is nonzero");
+    crate::runtime_offload::external_io_async_try_with_continuation(
+        "ws/recv",
+        kind,
+        "ws/recv/generation",
+        |()| Ok(Value::nil()),
+        continuation,
+        move || wait_for_ws_generation(wait_generation, remaining),
+    )
 }
 
 /// Build a single-key tagged map `{:<key> value}` (`{:text "hi"}`, `{:binary …}`).
@@ -373,6 +458,20 @@ async fn connect_with_retry(
     }
 }
 
+/// Enqueue an event before publishing its generation so a woken continuation
+/// always observes the event in the VM-owned queue.
+async fn publish_event(
+    evt_tx: &mpsc::Sender<WsEvent>,
+    generation: &watch::Sender<u64>,
+    event: WsEvent,
+) -> bool {
+    if evt_tx.send(event).await.is_err() {
+        return false;
+    }
+    generation.send_modify(|value| *value = value.wrapping_add(1));
+    true
+}
+
 /// The pump task: connect, signal handshake result, then bridge the socket to
 /// the command/event channels until either side closes.
 async fn pump(
@@ -380,6 +479,7 @@ async fn pump(
     opts: ConnectOpts,
     mut cmd_rx: mpsc::UnboundedReceiver<WsFrame>,
     evt_tx: mpsc::Sender<WsEvent>,
+    evt_generation: watch::Sender<u64>,
     ready_tx: tokio::sync::oneshot::Sender<Result<(), String>>,
 ) {
     let ws = match connect_with_retry(&url, &opts).await {
@@ -389,6 +489,7 @@ async fn pump(
         }
         Err(e) => {
             let _ = ready_tx.send(Err(e));
+            evt_generation.send_modify(|value| *value = value.wrapping_add(1));
             return;
         }
     };
@@ -414,35 +515,62 @@ async fn pump(
             },
             msg = stream.next() => match msg {
                 Some(Ok(Message::Text(t))) => {
-                    if evt_tx.send(WsEvent::Text(t.to_string())).await.is_err() { break; }
+                    if !publish_event(
+                        &evt_tx,
+                        &evt_generation,
+                        WsEvent::Text(t.to_string()),
+                    )
+                    .await
+                    {
+                        break;
+                    }
                 }
                 Some(Ok(Message::Binary(b))) => {
-                    if evt_tx.send(WsEvent::Binary(b.to_vec())).await.is_err() { break; }
+                    if !publish_event(&evt_tx, &evt_generation, WsEvent::Binary(b.to_vec())).await {
+                        break;
+                    }
                 }
                 Some(Ok(Message::Close(frame))) => {
                     let (code, reason) = match frame {
                         Some(f) => (u16::from(f.code), f.reason.to_string()),
                         None => (1005, String::new()), // 1005: no status present
                     };
-                    let _ = evt_tx.send(WsEvent::Close { code, reason }).await;
+                    let _ = publish_event(
+                        &evt_tx,
+                        &evt_generation,
+                        WsEvent::Close { code, reason },
+                    )
+                    .await;
                     break;
                 }
                 // Ping/Pong/raw frames: tungstenite auto-replies to pings.
                 Some(Ok(_)) => {}
                 Some(Err(e)) => {
-                    let _ = evt_tx.send(WsEvent::Error(format!("websocket: {e}"))).await;
+                    let _ = publish_event(
+                        &evt_tx,
+                        &evt_generation,
+                        WsEvent::Error(format!("websocket: {e}")),
+                    )
+                    .await;
                     break;
                 }
                 // Stream ended with no close frame (abnormal).
                 None => {
-                    let _ = evt_tx
-                        .send(WsEvent::Close { code: 1006, reason: "connection closed".to_string() })
-                        .await;
+                    let _ = publish_event(
+                        &evt_tx,
+                        &evt_generation,
+                        WsEvent::Close {
+                            code: 1006,
+                            reason: "connection closed".to_string(),
+                        },
+                    )
+                    .await;
                     break;
                 }
             },
         }
     }
+    evt_generation.send_modify(|value| *value = value.wrapping_add(1));
 }
 
 /// `ws/connect`: spawn the pump, then await the handshake (block at top level,
@@ -456,6 +584,7 @@ fn ws_connect(url: &str, opts: ConnectOpts) -> NativeResult {
 
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<WsFrame>();
     let (evt_tx, evt_rx) = mpsc::channel::<WsEvent>(EVENT_CAP);
+    let (evt_generation_tx, evt_generation) = watch::channel(0_u64);
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
 
     let _abort_pump = sema_io::io_spawn(Box::pin(pump(
@@ -463,24 +592,38 @@ fn ws_connect(url: &str, opts: ConnectOpts) -> NativeResult {
         opts,
         cmd_rx,
         evt_tx,
+        evt_generation_tx,
         ready_tx,
     )));
 
     let conn_val = Value::stream(WsConnection {
         cmd_tx,
         evt_rx: Rc::new(RefCell::new(evt_rx)),
+        evt_generation,
     });
 
-    // Unified-runtime quantum: cooperatively poll the handshake signal off the VM
-    // thread (a short inter-scan sleep between scans) so sibling tasks overlap; the
-    // pump keeps running on io_spawn, and a cancel drops the connection value
-    // (closing `cmd_tx` and stopping the pump).
+    // Unified-runtime quantum: await the handshake signal directly. The Send
+    // future owns only the oneshot receiver; the traced continuation retains the
+    // connection value on the VM thread.
     if sema_core::in_runtime_quantum() {
-        let probe = WsConnectProbe {
-            ready_rx,
-            conn: conn_val,
-        };
-        return await_runtime_until(Box::new(probe), std::time::Instant::now(), u64::MAX);
+        let kind = CompletionKind::try_from_raw(WS_COMPLETION_KIND)
+            .expect("websocket completion kind is nonzero");
+        return crate::runtime_offload::external_io_async_try_with_continuation(
+            "ws/connect",
+            kind,
+            "ws/connect/handshake",
+            |()| Ok(Value::nil()),
+            Box::new(WsConnectContinuation { conn: conn_val }),
+            move || async move {
+                match ready_rx.await {
+                    Ok(Ok(())) => Ok(()),
+                    Ok(Err(message)) => Err(message),
+                    Err(_) => {
+                        Err("ws/connect: connection worker dropped before handshake".to_string())
+                    }
+                }
+            },
+        );
     }
 
     // Top level: block the VM thread on the handshake (it is not inside a runtime).
@@ -500,7 +643,7 @@ fn ws_send(args: &[Value]) -> Result<Value, SemaError> {
         return Err(SemaError::eval("ws/send: connection is closed"));
     }
     let frame = value_to_frame(&args[1])?;
-    let (cmd_tx, _) = handles_of(&sb);
+    let (cmd_tx, _, _) = handles_of(&sb);
     cmd_tx.send(frame).map_err(|_| {
         SemaError::eval("ws/send: connection is closed")
             .with_hint("the websocket has stopped (server closed the connection or it errored)")
@@ -511,19 +654,15 @@ fn ws_send(args: &[Value]) -> Result<Value, SemaError> {
 fn ws_recv(args: &[Value]) -> NativeResult {
     check_arity!(args, "ws/recv", 1);
     let sb = ws_conn(args, "ws/recv", 0)?;
-    let (_, evt_rx) = handles_of(&sb);
+    let (_, evt_rx, evt_generation) = handles_of(&sb);
 
-    // Unified-runtime quantum: cooperatively scan the channel and park between
-    // scans so siblings overlap while no message is ready.
+    // Unified-runtime quantum: recheck the VM-owned queue after each lossless
+    // generation wake. Cancellation drops only the watch-receiver clone.
     if sema_core::in_runtime_quantum() {
         if let Some(v) = sema_core::take_resume_value() {
             return Ok(NativeOutcome::Return(v));
         }
-        let probe = WsRecvProbe {
-            evt_rx,
-            deadline: None,
-        };
-        return await_runtime_until(Box::new(probe), std::time::Instant::now(), u64::MAX);
+        return suspend_ws_receive(evt_rx, evt_generation, None);
     }
 
     // Legacy scheduler task: park on an `AwaitIo` poll.
@@ -541,20 +680,16 @@ fn ws_recv_timeout(args: &[Value]) -> NativeResult {
         .ok_or_else(|| SemaError::type_error("int", args[1].type_name()))
         .map_err(|e| e.with_hint("ws/recv-timeout: argument 2 is the timeout in milliseconds"))?
         .max(0) as u64;
-    let (_, evt_rx) = handles_of(&sb);
+    let (_, evt_rx, evt_generation) = handles_of(&sb);
 
-    // Unified-runtime quantum: cooperatively scan with a deadline; a lapse resolves
-    // to `:timeout`, and structural timers between scans let siblings overlap.
+    // Unified-runtime quantum: race the next generation wake against the exact
+    // deadline, rechecking the queue before resolving a timeout.
     if sema_core::in_runtime_quantum() {
         if let Some(v) = sema_core::take_resume_value() {
             return Ok(NativeOutcome::Return(v));
         }
         let deadline = std::time::Instant::now() + std::time::Duration::from_millis(ms);
-        let probe = WsRecvProbe {
-            evt_rx,
-            deadline: Some(deadline),
-        };
-        return await_runtime_until(Box::new(probe), std::time::Instant::now(), u64::MAX);
+        return suspend_ws_receive(evt_rx, evt_generation, Some(deadline));
     }
 
     // Legacy scheduler task: park on an `AwaitIo` poll with the deadline.
@@ -613,7 +748,7 @@ fn ws_ping(args: &[Value]) -> Result<Value, SemaError> {
             }
         }
     };
-    let (cmd_tx, _) = handles_of(&sb);
+    let (cmd_tx, _, _) = handles_of(&sb);
     cmd_tx
         .send(WsFrame::Ping(payload))
         .map_err(|_| SemaError::eval("ws/ping: connection is closed"))?;
@@ -630,7 +765,7 @@ fn ws_close(args: &[Value]) -> Result<Value, SemaError> {
 fn ws_connected(args: &[Value]) -> Result<Value, SemaError> {
     check_arity!(args, "ws/connected?", 1);
     let sb = ws_conn(args, "ws/connected?", 0)?;
-    let (cmd_tx, _) = handles_of(&sb);
+    let (cmd_tx, _, _) = handles_of(&sb);
     Ok(Value::bool(!sb.is_closed() && !cmd_tx.is_closed()))
 }
 
@@ -731,4 +866,178 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
     register_fn(env, "ws/ping", ws_ping);
     register_fn(env, "ws/close", ws_close);
     register_fn(env, "ws/connected?", ws_connected);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sema_core::runtime::{
+        CancellationView, NativeCallContext, NativeContinuation, ResumeInput, TaskContext, WaitKind,
+    };
+    use std::time::Instant;
+    use tokio::sync::watch;
+
+    #[test]
+    fn ws_generation_wakes_after_published_event() {
+        let (evt_tx, mut evt_rx) = mpsc::channel(1);
+        let (generation_tx, generation_rx) = watch::channel(0_u64);
+        let mut wait_generation = generation_rx.clone();
+        wait_generation.borrow_and_update();
+
+        sema_io::io_block_on(async {
+            assert!(
+                publish_event(&evt_tx, &generation_tx, WsEvent::Text("ready".to_string()),).await
+            );
+            tokio::time::timeout(
+                Duration::from_millis(100),
+                wait_for_ws_generation(wait_generation, None),
+            )
+            .await
+            .expect("published event must advance the generation")
+            .expect("generation wait must succeed");
+        });
+
+        assert!(matches!(
+            evt_rx.try_recv(),
+            Ok(WsEvent::Text(text)) if text == "ready"
+        ));
+    }
+
+    #[test]
+    fn ws_generation_retains_change_before_future_is_polled() {
+        let (generation_tx, generation_rx) = watch::channel(0_u64);
+        let wait_future = wait_for_ws_generation(generation_rx, None);
+        generation_tx.send_modify(|generation| *generation += 1);
+
+        sema_io::io_block_on(async {
+            tokio::time::timeout(Duration::from_millis(100), wait_future)
+                .await
+                .expect("an unpolled wait must retain the generation change")
+                .expect("generation wait must succeed");
+        });
+    }
+
+    #[test]
+    fn dropping_ws_wait_preserves_receiver() {
+        let (evt_tx, mut evt_rx) = mpsc::channel(1);
+        let (_generation_tx, generation_rx) = watch::channel(0_u64);
+        let wait_future = wait_for_ws_generation(generation_rx, None);
+
+        drop(wait_future);
+        evt_tx
+            .try_send(WsEvent::Text("still-open".to_string()))
+            .unwrap();
+        assert!(matches!(
+            evt_rx.try_recv(),
+            Ok(WsEvent::Text(text)) if text == "still-open"
+        ));
+    }
+
+    #[test]
+    fn ws_generation_closed_sender_wakes_pending_wait() {
+        let (generation_tx, generation_rx) = watch::channel(0_u64);
+
+        sema_io::io_block_on(async {
+            let waiter = tokio::spawn(wait_for_ws_generation(generation_rx, None));
+            tokio::task::yield_now().await;
+            drop(generation_tx);
+            tokio::time::timeout(Duration::from_millis(100), waiter)
+                .await
+                .expect("closing the generation sender must wake a pending wait")
+                .expect("generation waiter task must not panic")
+                .expect("a closed sender is a readiness wake, not a wait error");
+        });
+    }
+
+    #[test]
+    fn ws_connect_continuation_traces_and_returns_connection() {
+        let connection = Value::int(41);
+        let continuation = WsConnectContinuation {
+            conn: connection.clone(),
+        };
+        let mut edges = 0;
+        assert!(continuation.trace(&mut |_| edges += 1));
+        assert_eq!(edges, 1);
+
+        let mut task_context = TaskContext::empty();
+        let mut native_context = NativeCallContext {
+            task_context: &mut task_context,
+            cancellation: CancellationView::default(),
+        };
+        let outcome = Box::new(continuation)
+            .resume(&mut native_context, ResumeInput::Returned(Value::nil()))
+            .expect("successful handshake continuation must resume");
+        assert!(matches!(outcome, NativeOutcome::Return(value) if value == connection));
+    }
+
+    #[test]
+    fn ws_recv_continuation_traces_no_values() {
+        let (_evt_tx, evt_rx) = mpsc::channel(1);
+        let (_generation_tx, evt_generation) = watch::channel(0_u64);
+        let continuation = WsRecvContinuation {
+            evt_rx: Rc::new(RefCell::new(evt_rx)),
+            evt_generation,
+            deadline: None,
+        };
+        let mut edges = 0;
+        assert!(continuation.trace(&mut |_| edges += 1));
+        assert_eq!(edges, 0);
+    }
+
+    #[test]
+    fn ws_timeout_queued_event_wins_expired_deadline() {
+        let (evt_tx, evt_rx) = mpsc::channel(1);
+        evt_tx
+            .try_send(WsEvent::Text("on-the-line".to_string()))
+            .unwrap();
+        let evt_rx = Rc::new(RefCell::new(evt_rx));
+        let deadline = Instant::now()
+            .checked_sub(Duration::from_millis(1))
+            .unwrap();
+
+        let value = poll_ws_event(&evt_rx, Some(deadline))
+            .expect("queued event must decode")
+            .expect("queued event must be ready");
+        let expected = event_to_value(Some(WsEvent::Text("on-the-line".to_string()))).unwrap();
+        assert_eq!(value, expected);
+    }
+
+    #[test]
+    fn ws_timeout_empty_queue_returns_timeout() {
+        let (_evt_tx, evt_rx) = mpsc::channel(1);
+        let evt_rx = Rc::new(RefCell::new(evt_rx));
+        let deadline = Instant::now()
+            .checked_sub(Duration::from_millis(1))
+            .unwrap();
+
+        assert_eq!(
+            poll_ws_event(&evt_rx, Some(deadline)).expect("empty timeout poll must succeed"),
+            Some(Value::keyword("timeout"))
+        );
+    }
+
+    #[test]
+    fn ws_recv_continuation_rearms_after_coalesced_empty_wake() {
+        let (_evt_tx, evt_rx) = mpsc::channel(1);
+        let (generation_tx, evt_generation) = watch::channel(0_u64);
+        generation_tx.send_modify(|generation| *generation += 1);
+        let continuation = WsRecvContinuation {
+            evt_rx: Rc::new(RefCell::new(evt_rx)),
+            evt_generation,
+            deadline: None,
+        };
+        let mut task_context = TaskContext::empty();
+        let mut native_context = NativeCallContext {
+            task_context: &mut task_context,
+            cancellation: CancellationView::default(),
+        };
+
+        let outcome = Box::new(continuation)
+            .resume(&mut native_context, ResumeInput::Returned(Value::nil()))
+            .expect("coalesced wake must recheck and rearm");
+        let NativeOutcome::Suspend(suspend) = outcome else {
+            panic!("an empty queue after a coalesced wake must suspend again");
+        };
+        assert!(matches!(suspend.wait, WaitKind::External(_)));
+    }
 }

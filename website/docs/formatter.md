@@ -23,6 +23,7 @@ With no arguments, `sema fmt` formats all `.sema` files in the current directory
 | `--width <N>` | Max line width (default: `80`) |
 | `--indent <N>` | Indentation width for body forms (default: `2`) |
 | `--align` | Align consecutive similar forms (defines, cond clauses, let bindings) |
+| `--json` | Emit read-only NDJSON results for editor integrations |
 
 ### Examples
 
@@ -48,6 +49,24 @@ sema fmt --width 100 --indent 4
 # Enable decorative alignment
 sema fmt --align
 ```
+
+## JSON output
+
+`--json` formats without rewriting files and emits one JSON object per file:
+
+```bash
+sema fmt --json src/main.sema
+```
+
+```json
+{"file":"src/main.sema","formatted":true,"changed":true,"source":"(define x 1)\n"}
+```
+
+`formatted` reports whether formatting succeeded. `changed` reports whether `source` differs from the input file. Multiple files produce newline-delimited JSON (NDJSON), with no human-readable summary. If no files match, stdout is empty.
+
+Read and formatting failures emit `{"file":"...","formatted":false,"error":"..."}` and cause a non-zero exit status after all resolved files are processed. `--check --json` also exits with status 1 when any file would change. `--diff` cannot be combined with `--json`.
+
+For stdin, `sema fmt --json -` emits one object with `formatted` and either `source` or `error`; stdin results do not include `file` or `changed`.
 
 ## Project Configuration
 

@@ -301,7 +301,7 @@ sema fmt [OPTIONS] [FILES...]
 | `--width <N>` | Max line width (default: `80`) |
 | `--indent <N>` | Indentation width (default: `2`) |
 | `--align` | Align consecutive similar forms |
-| `--json` | Output result as JSON (useful for editor integrations) |
+| `--json` | Emit read-only NDJSON results for editor integrations |
 
 ```bash
 # Format all .sema files recursively
@@ -312,6 +312,9 @@ sema fmt --check
 
 # Preview changes
 sema fmt --diff
+
+# Machine-readable check (exit 1 when changes are needed)
+sema fmt --check --json
 ```
 
 ### `sema notebook`

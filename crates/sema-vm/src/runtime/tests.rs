@@ -2253,6 +2253,41 @@ fn continuation_call_apply_invoke_resume_and_final_apply_are_distinct_turns() {
 }
 
 #[test]
+fn panicking_runtime_native_restores_quantum_thread_local() {
+    let runtime = runtime_with_inline_executor(Rc::new(FakeClock::new()));
+    let invoked = Rc::new(Cell::new(false));
+    let observed = Rc::clone(&invoked);
+    let handle = runtime
+        .submit_test_root(TestPreparedTask::native(Ok(NativeOutcome::Call(
+            NativeCall {
+                callable: Value::native_fn(sema_core::NativeFn::simple_result(
+                    "panicking-native",
+                    move |_| {
+                        observed.set(true);
+                        assert!(sema_core::in_runtime_quantum());
+                        panic!("test native panic");
+                    },
+                )),
+                args: Vec::new(),
+                continuation: Box::new(RecordingContinuation(Arc::new(Mutex::new(Vec::new())))),
+            },
+        ))))
+        .unwrap();
+    assert!(!sema_core::in_runtime_quantum());
+
+    let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        while !invoked.get() {
+            runtime.drive(&drive_budget(1)).unwrap();
+        }
+    }));
+
+    assert!(panic.is_err());
+    assert!(invoked.get());
+    assert!(matches!(handle.poll_result(), RootPoll::Pending));
+    assert!(!sema_core::in_runtime_quantum());
+}
+
+#[test]
 fn invalid_callable_failure_is_delivered_to_its_continuation() {
     let runtime = runtime_with_inline_executor(Rc::new(FakeClock::new()));
     let events = Arc::new(Mutex::new(Vec::new()));

@@ -3468,11 +3468,13 @@ impl Runtime {
                 // ABI: `invoke_runtime` returns the native's `NativeOutcome`
                 // (Suspend/Call/Return) directly, driven by the caller's
                 // `PendingStage::Apply`.
-                let prev_q = sema_core::in_runtime_quantum();
-                sema_core::set_runtime_quantum(true);
+                let _quantum_guard = eval_context.enter_runtime_quantum().map_err(|error| {
+                    RuntimeFault::Invariant {
+                        message: error.to_string(),
+                    }
+                })?;
                 let native_result =
                     native.invoke_runtime(&eval_context, &mut native_context, &call.args);
-                sema_core::set_runtime_quantum(prev_q);
                 (ContinuationFrame::native(call.continuation), native_result)
             } else {
                 (

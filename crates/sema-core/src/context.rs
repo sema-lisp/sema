@@ -153,8 +153,12 @@ impl EvalContext {
         // natives (e.g. `async/sleep`, registered via the value-only ABI) can
         // detect that they run under the unified runtime and should surface a
         // yield the runtime will turn into a native wait.
+        let previous_thread_local = crate::in_runtime_quantum();
         crate::set_runtime_quantum(true);
-        Ok(RuntimeQuantumGuard { ctx: self })
+        Ok(RuntimeQuantumGuard {
+            ctx: self,
+            previous_thread_local,
+        })
     }
 
     pub fn runtime_quantum_active(&self) -> bool {
@@ -522,12 +526,13 @@ impl EvalContext {
 
 pub struct RuntimeQuantumGuard<'a> {
     ctx: &'a EvalContext,
+    previous_thread_local: bool,
 }
 
 impl Drop for RuntimeQuantumGuard<'_> {
     fn drop(&mut self) {
         self.ctx.runtime_quantum_active.set(false);
-        crate::set_runtime_quantum(false);
+        crate::set_runtime_quantum(self.previous_thread_local);
     }
 }
 
@@ -631,6 +636,29 @@ mod tests {
                 .0,
             1
         );
+    }
+
+    #[test]
+    fn runtime_quantum_guard_restores_outer_context_thread_local() {
+        let outer = EvalContext::new();
+        let inner = EvalContext::new();
+        assert!(!crate::in_runtime_quantum());
+
+        let outer_guard = outer.enter_runtime_quantum().unwrap();
+        assert!(outer.runtime_quantum_active());
+        assert!(crate::in_runtime_quantum());
+
+        {
+            let _inner_guard = inner.enter_runtime_quantum().unwrap();
+            assert!(inner.runtime_quantum_active());
+            assert!(crate::in_runtime_quantum());
+        }
+
+        assert!(outer.runtime_quantum_active());
+        assert!(crate::in_runtime_quantum());
+        drop(outer_guard);
+        assert!(!outer.runtime_quantum_active());
+        assert!(!crate::in_runtime_quantum());
     }
 
     struct TestTaskLocal(u32);

@@ -642,10 +642,21 @@ need a type-identity check) or always route through the continuation
 
 **Cancellation / leak verification:** `crates/sema/tests/http_serve_cancel_test.rs`
 (new, in-process via the `Interpreter`/`Runtime` host API, not a subprocess)
-cancels the `http/serve` root while a handler task is parked mid-`async/sleep`
-(triggered by a real loopback connection, then a real client disconnect) and
-asserts `runtime_live_task_count() == 0` afterward — the in-flight handler
-task is reaped, not orphaned. `AcceptLoopContinuation` and
+cancels the `http/serve` root while a handler task is **parked**
+mid-`async/sleep` (triggered by a real loopback connection, then a real client
+disconnect) and asserts `runtime_live_task_count() == 0` afterward — the parked
+in-flight handler task is reaped, not orphaned. **Scope of this guarantee
+(corrected 2026-07-18 after adversarial review):** `cancel_root` reaps every
+descendant that is still *parked* under the cancelled root (the live
+cancellation-parent chain reaches it), which covers the accept loop, parked
+handler tasks, and a handler awaiting a grandchild — all verified reaped. It
+does NOT reap a *fire-and-forget descendant of an already-completed handler*:
+once the handler task settles, the chain to its detached child is broken and
+that child leaks until process exit. This is the general `cancel_root` gap
+recorded as **CANCEL-ROOT-CASCADE-1** below, not specific to `http/serve`; a
+persistent multi-root host (notebook, embedded `Interpreter`) that cancels a
+server root while a handler's detached child is still running will leak that
+child's task. `AcceptLoopContinuation` and
 `AfterDispatchContinuation` (both hold `handler`/`factory` `Value`s across
 their External-wait / `Call` parks) have `Trace` impls with dedicated GC
 edge-count unit tests in `server.rs`, mirroring `RouterDecoder`'s.
@@ -777,6 +788,37 @@ two remaining pieces:
   identical silent-fallback-to-blocking behavior `ws/recv` had before piece
   (c); flagged here, not fixed (out of scope — no acceptance test currently
   exercises a suspending op inside an SSE handler body).
+
+## CANCEL-ROOT-CASCADE-1 — `cancel_root` does not sweep detached descendants
+
+**Found 2026-07-18 (adversarial review of SRV-1); general runtime gap, not
+SRV-1-specific.** `Runtime::cancel_root` (`crates/sema-vm/src/runtime/state.rs`,
+the `cancel_root` fn) cancels the root's main task and relies on the live
+cancellation-parent chain to reach descendants — so a descendant that is still
+**parked** (awaiting/sleeping/blocked) under the root is reaped, but a
+**fire-and-forget descendant of a task that has already completed** is orphaned
+(its chain to the root is broken when its parent settles). The `async/cancel` /
+`CancelPromise` path does NOT have this gap — it calls `cancel_descendants`
+explicitly. Empirically (persistent `Interpreter`, `runtime_live_task_count`
+after `cancel_root`):
+
+| shape | reaped? |
+| --- | --- |
+| root awaits `(async/spawn (sleep))` | **leaks (count 1)** |
+| root detaches `(async/spawn (sleep))`, root sleeps | **leaks (count 1)** |
+| `http/serve` handler awaits a grandchild | reaped (0) |
+| `http/serve` handler detaches a child then returns | **leaks (count 1)** |
+
+**Blast radius:** persistent multi-root hosts only (notebook cell cancel;
+embedded `Interpreter`; a server that cancels one root while others run).
+Process-exit CLI is unaffected (the process teardown reaps everything). SIGINT
+of a single-root CLI program is unaffected (root settles, process exits). **Fix
+(not yet landed):** make `cancel_root` call `cancel_descendants` for the
+cancelled root's task subtree, mirroring the `CancelPromise` path — needs a
+focused test (submit root, spawn detached child, `cancel_root`, drive, assert
+`runtime_live_task_count() == 0`) and an audit that the descendant sweep does
+not double-tear-down a task the parent-chain also reaches. Tracked as a
+runtime-correctness follow-up.
 
 ## Consciously-not-converted blocking natives
 

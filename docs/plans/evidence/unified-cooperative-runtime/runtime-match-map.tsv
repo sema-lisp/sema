@@ -648,27 +648,27 @@ R15B	crates/sema-stdlib/src/server.rs:1644:            match rx.blocking_recv() 
 R15B	crates/sema-stdlib/src/server.rs:1679:    match call_callback(ctx, &ws_handler, &[conn]) {
 R15B	crates/sema-stdlib/src/server.rs:1726:/// bind+listen succeeds. Shared between the sync (serial `blocking_recv`) and
 R15B	crates/sema-stdlib/src/server.rs:1761:    // loop on THIS thread (`rx.blocking_recv()`) for the life of the server —
-R15B	crates/sema-stdlib/src/server.rs:1770:    // composing inside `async/spawn` was fail-fast-rejected in earlier passes
-R15B	crates/sema-stdlib/src/server.rs:1881:    let actual_port = match ready_rx.recv() {
-R15B	crates/sema-stdlib/src/server.rs:1926:    use sema_core::call_callback;
-R15B	crates/sema-stdlib/src/server.rs:1932:    } = http_serve_setup(args, &|f, a| call_callback(ctx, f, a))?;
-R15B	crates/sema-stdlib/src/server.rs:1938:    // at a time on the evaluator thread before looping back to `blocking_recv`
-R15B	crates/sema-stdlib/src/server.rs:1940:    // `blocking_recv` on its own per-connection channel) only ever gets called
-R15B	crates/sema-stdlib/src/server.rs:1941:    // from inside `call_callback` below — so a WS handler idling in `ws/recv`
-R15B	crates/sema-stdlib/src/server.rs:1947:    while let Some(req) = rx.blocking_recv() {
-R15B	crates/sema-stdlib/src/server.rs:1951:                match call_callback(ctx, &handler, &[request_val]) {
-R15A	crates/sema-stdlib/src/server.rs:1995:/// wait's job MOVES it into the future (so `rx.recv().await` runs off the VM
-R15B	crates/sema-stdlib/src/server.rs:2025:/// for why a plain synchronous `call_callback` can't let the handler's
-R15A	crates/sema-stdlib/src/server.rs:2080:/// on `rx.recv()` off the VM thread, and decode the result back into either
-R15A	crates/sema-stdlib/src/server.rs:2125:                let item = rx.recv().await;
-R15A	crates/sema-stdlib/src/server.rs:2139:/// The factory does the `async/spawn` itself, in compiled Sema bytecode,
-R15A	crates/sema-stdlib/src/server.rs:2143:/// caller-supplied continuation OTHER than `async/spawn`'s own trivial
-R15B	crates/sema-stdlib/src/server.rs:2182:                    // serial loop's `while let Some(req) = rx.blocking_recv()`
-R15B	crates/sema-stdlib/src/server.rs:2249:            // task's promise (from `async/spawn` inside the factory) — not
-R15B	crates/sema-stdlib/src/server.rs:2270:/// `async/spawn` uses), so a slow/parked handler no longer stalls its
-R15B	crates/sema-stdlib/src/server.rs:2279:        sema_core::with_stdlib_ctx(|c| sema_core::call_callback(c, f, a))
-R15B	crates/sema-stdlib/src/server.rs:2457:        let result = rt.block_on(async {
-R15B	crates/sema-stdlib/src/server.rs:2480:        rt.block_on(async {
+R15B	crates/sema-stdlib/src/server.rs:1770:    // `http/serve` composes inside `async/spawn`. The acceptance suite in
+R15B	crates/sema-stdlib/src/server.rs:1879:    let actual_port = match ready_rx.recv() {
+R15B	crates/sema-stdlib/src/server.rs:1924:    use sema_core::call_callback;
+R15B	crates/sema-stdlib/src/server.rs:1930:    } = http_serve_setup(args, &|f, a| call_callback(ctx, f, a))?;
+R15B	crates/sema-stdlib/src/server.rs:1936:    // at a time on the evaluator thread before looping back to `blocking_recv`
+R15B	crates/sema-stdlib/src/server.rs:1938:    // `blocking_recv` on its own per-connection channel) only ever gets called
+R15B	crates/sema-stdlib/src/server.rs:1939:    // from inside `call_callback` below — so a WS handler idling in `ws/recv`
+R15B	crates/sema-stdlib/src/server.rs:1945:    while let Some(req) = rx.blocking_recv() {
+R15B	crates/sema-stdlib/src/server.rs:1949:                match call_callback(ctx, &handler, &[request_val]) {
+R15A	crates/sema-stdlib/src/server.rs:1993:/// wait's job MOVES it into the future (so `rx.recv().await` runs off the VM
+R15B	crates/sema-stdlib/src/server.rs:2023:/// for why a plain synchronous `call_callback` can't let the handler's
+R15A	crates/sema-stdlib/src/server.rs:2078:/// on `rx.recv()` off the VM thread, and decode the result back into either
+R15A	crates/sema-stdlib/src/server.rs:2123:                let item = rx.recv().await;
+R15A	crates/sema-stdlib/src/server.rs:2137:/// The factory does the `async/spawn` itself, in compiled Sema bytecode,
+R15A	crates/sema-stdlib/src/server.rs:2141:/// caller-supplied continuation OTHER than `async/spawn`'s own trivial
+R15B	crates/sema-stdlib/src/server.rs:2180:                    // serial loop's `while let Some(req) = rx.blocking_recv()`
+R15B	crates/sema-stdlib/src/server.rs:2247:            // task's promise (from `async/spawn` inside the factory) — not
+R15B	crates/sema-stdlib/src/server.rs:2268:/// `async/spawn` uses), so a slow/parked handler does not stall its
+R15B	crates/sema-stdlib/src/server.rs:2277:        sema_core::with_stdlib_ctx(|c| sema_core::call_callback(c, f, a))
+R15B	crates/sema-stdlib/src/server.rs:2455:        let result = rt.block_on(async {
+R15B	crates/sema-stdlib/src/server.rs:2478:        rt.block_on(async {
 R15B	crates/sema-stdlib/src/server.rs:381:                    let result = sema_core::call_callback(ctx, &handler, &tool_args)?;
 R15A	crates/sema-stdlib/src/server.rs:78:    /// and may be inside a provider's `block_on` (e.g. llm/stream), where a
 R15B	crates/sema-stdlib/src/server.rs:893:/// non-static handler through `call_callback` — the value ABI with its passed

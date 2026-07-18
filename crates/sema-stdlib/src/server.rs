@@ -1463,8 +1463,8 @@ fn handle_ws_response_runtime(
 
     // Same send/close shape as the legacy `handle_ws_response` — `ws/send`
     // only blocks the VM thread if the 256-slot outgoing queue is full (a
-    // slow/stalled client), a narrower and pre-existing limitation, not the
-    // idle-recv head-of-line case this pass fixes.
+    // slow/stalled client), a narrower limitation than the idle-recv
+    // head-of-line case the cooperative `ws/recv` path handles.
     let out_tx = Rc::new(RefCell::new(Some(out_tx)));
     let out_tx_for_send = out_tx.clone();
     let send_fn = Value::native_fn(NativeFn::simple("ws/send", move |args| {
@@ -1766,10 +1766,8 @@ fn http_serve_setup(args: &[Value], invoke: ServeInvoke<'_>) -> Result<ServeSetu
     // re-arming `WaitKind::External` instead of blocking, each connection runs
     // its own spawned task, and a WebSocket handler's `ws/recv` suspends
     // cooperatively too (`handle_ws_response_runtime`) — so a slow/parked
-    // handler, plain or WebSocket, no longer stalls its siblings. `http/serve`
-    // composing inside `async/spawn` was fail-fast-rejected in earlier passes
-    // (both gaps were live traps then); with all concurrency paths now live,
-    // that guard is gone — the acceptance suite in
+    // handler, plain or WebSocket, does not stall its siblings, and
+    // `http/serve` composes inside `async/spawn`. The acceptance suite in
     // `crates/sema/tests/http_serve_concurrent_test.rs` is the regression
     // gate for this claim.
     if args.len() < 2 || args.len() > 3 {
@@ -2267,8 +2265,8 @@ impl sema_core::runtime::NativeContinuation for AfterDispatchContinuation {
 /// blocking the VM thread. Each connection's handler runs as its own spawned
 /// task (scope isolation is free here — `spawn_via_registry` already
 /// fresh-defaults every spawned task's dynamic scopes, the same seam
-/// `async/spawn` uses), so a slow/parked handler no longer stalls its
-/// siblings. This is what `http/serve` actually runs in the shipped product
+/// `async/spawn` uses), so a slow/parked handler does not stall its
+/// siblings. This is what `http/serve` runs in the shipped product
 /// (every eval entry point drives the unified runtime).
 fn http_serve_runtime_impl(args: &[Value]) -> sema_core::runtime::NativeResult {
     let ServeSetup {

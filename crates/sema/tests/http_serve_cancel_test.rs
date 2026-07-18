@@ -14,6 +14,7 @@
 
 use std::io::Write;
 use std::net::{TcpStream, ToSocketAddrs};
+use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -135,6 +136,8 @@ fn cancel_during_idle_websocket_recv_reaps_the_handler_task_no_leak() {
         .expect("http/serve submits as a root");
     let root_id = handle.id();
     let cmd = interp.command_handle();
+    let (release_socket_tx, release_socket_rx) = mpsc::channel::<()>();
+    let (socket_dropped_tx, socket_dropped_rx) = mpsc::channel::<()>();
 
     // Canceller thread: waits for the accept loop to bind, opens a real WS
     // connection (parking the per-connection handler task in `ws/recv`),
@@ -151,16 +154,27 @@ fn cancel_during_idle_websocket_recv_reaps_the_handler_task_no_leak() {
         let (socket, _resp) = ws.unwrap();
         thread::sleep(Duration::from_millis(250));
         let cancelled = cmd.cancel_root(root_id);
-        // Keep the socket alive until after cancellation is issued so the
-        // handler is genuinely still parked in `ws/recv`, not merely
-        // disconnected client-side first.
+        // Keep the socket alive until the VM thread has sampled its live-task
+        // count. Sender drop also releases this receive if the main test exits.
+        let _ = release_socket_rx.recv();
         drop(socket);
+        let _ = socket_dropped_tx.send(());
         cancelled
     });
 
     let result = interp.drive_until_settled(&handle);
+    let live_while_socket_held = interp.runtime_live_task_count();
+    let socket_was_held = matches!(socket_dropped_rx.try_recv(), Err(mpsc::TryRecvError::Empty));
 
+    // Complete thread/socket cleanup before any assertion can panic.
+    let _ = release_socket_tx.send(());
+    drop(release_socket_tx);
     let cancelled = canceller.join().expect("canceller thread completes");
+
+    assert!(
+        socket_was_held,
+        "the client socket must remain held while live-task count is sampled"
+    );
     assert!(
         cancelled,
         "cancel_root must accept the live http/serve root"
@@ -170,8 +184,8 @@ fn cancel_during_idle_websocket_recv_reaps_the_handler_task_no_leak() {
         "a cancelled http/serve root must settle as an error, not a value"
     );
     assert_eq!(
-        interp.runtime_live_task_count(),
+        live_while_socket_held,
         0,
-        "cancelling the server root must synchronously reap the idle WebSocket handler and its External wait"
+        "cancelling the server root must reap the idle WebSocket handler while the client socket remains open"
     );
 }

@@ -1188,6 +1188,29 @@ async fn handle_axum_request(
     }
 }
 
+/// Tear down both halves of a WebSocket bridge before publishing its final
+/// incoming-queue generation.
+async fn finish_server_ws_bridge_tasks(
+    mut recv_task: tokio::task::JoinHandle<()>,
+    mut send_task: tokio::task::JoinHandle<()>,
+    incoming_generation: tokio::sync::watch::Sender<u64>,
+) {
+    tokio::select! {
+        _ = &mut recv_task => {
+            send_task.abort();
+            let _ = send_task.await;
+        }
+        _ = &mut send_task => {
+            recv_task.abort();
+            let _ = recv_task.await;
+        }
+    }
+
+    // Awaiting the losing task guarantees its future and every mpsc sender it
+    // owns have dropped before shutdown readiness is published.
+    incoming_generation.send_modify(|generation| *generation = generation.wrapping_add(1));
+}
+
 /// Bridge an axum WebSocket to the evaluator's channels.
 async fn bridge_websocket(
     socket: axum::extract::ws::WebSocket,
@@ -1203,29 +1226,21 @@ async fn bridge_websocket(
     // Task 1: forward messages from client (WebSocket) to evaluator. Text frames
     // become `WsMsg::Text`, binary frames `WsMsg::Binary`; ping/pong are handled
     // by axum and ignored here.
-    let incoming_tx_clone = incoming_tx.clone();
-    let incoming_generation_clone = incoming_generation.clone();
+    let incoming_generation_for_messages = incoming_generation.clone();
     let recv_task = tokio::spawn(async move {
         while let Some(Ok(msg)) = ws_stream.next().await {
             let forwarded = match msg {
-                Message::Text(text) => incoming_tx_clone.send(WsMsg::Text(text.to_string())).await,
-                Message::Binary(bytes) => {
-                    incoming_tx_clone.send(WsMsg::Binary(bytes.to_vec())).await
-                }
+                Message::Text(text) => incoming_tx.send(WsMsg::Text(text.to_string())).await,
+                Message::Binary(bytes) => incoming_tx.send(WsMsg::Binary(bytes.to_vec())).await,
                 Message::Close(_) => break,
                 _ => continue, // ping/pong
             };
             if forwarded.is_err() {
                 break;
             }
-            incoming_generation_clone
+            incoming_generation_for_messages
                 .send_modify(|generation| *generation = generation.wrapping_add(1));
         }
-        // Publish shutdown before the last receive-loop sender drops so every
-        // parked evaluator receive gets a final queue/disconnect recheck.
-        incoming_generation_clone
-            .send_modify(|generation| *generation = generation.wrapping_add(1));
-        drop(incoming_tx_clone);
     });
 
     // Task 2: forward messages from evaluator to client (WebSocket)
@@ -1243,11 +1258,7 @@ async fn bridge_websocket(
         let _ = ws_sink.send(Message::Close(None)).await;
     });
 
-    // Wait for either task to complete, then abort the other
-    tokio::select! {
-        _ = recv_task => {}
-        _ = send_task => {}
-    }
+    finish_server_ws_bridge_tasks(recv_task, send_task, incoming_generation).await;
 }
 
 /// Check if a response Value is an SSE stream marker.
@@ -2468,6 +2479,33 @@ mod tests {
         assert_eq!(edges, 0, "WsHandlerContinuation must trace no Value edges");
     }
 
+    fn take_server_ws_external_continuation(
+        outcome: NativeOutcome,
+    ) -> Box<dyn sema_core::runtime::NativeContinuation> {
+        use sema_core::runtime::{NativeSuspend, WaitKind};
+
+        let NativeOutcome::Suspend(NativeSuspend { wait, continuation }) = outcome else {
+            panic!("server ws/recv must suspend on an empty connected queue");
+        };
+        assert!(matches!(wait, WaitKind::External(_)));
+        continuation
+    }
+
+    fn resume_server_ws_continuation(
+        continuation: Box<dyn sema_core::runtime::NativeContinuation>,
+    ) -> NativeOutcome {
+        use sema_core::runtime::{CancellationView, NativeCallContext, ResumeInput, TaskContext};
+
+        let mut task_context = TaskContext::empty();
+        let mut native_context = NativeCallContext {
+            task_context: &mut task_context,
+            cancellation: CancellationView::default(),
+        };
+        continuation
+            .resume(&mut native_context, ResumeInput::Returned(Value::nil()))
+            .expect("server ws/recv continuation must resume")
+    }
+
     #[test]
     fn server_ws_generation_response_wakes_every_receiver_clone() {
         let (incoming_tx, _incoming_rx) = tokio::sync::mpsc::channel::<WsMsg>(1);
@@ -2535,6 +2573,27 @@ mod tests {
     }
 
     #[test]
+    fn server_ws_generation_exact_suspended_continuation_returns_published_message() {
+        let (incoming_tx, incoming_rx) = tokio::sync::mpsc::channel::<WsMsg>(1);
+        let (generation_tx, incoming_generation) = tokio::sync::watch::channel(0_u64);
+        let in_rx = std::rc::Rc::new(std::cell::RefCell::new(Some(incoming_rx)));
+        let continuation = take_server_ws_external_continuation(
+            suspend_server_ws_receive(in_rx, incoming_generation)
+                .expect("empty connected receive must suspend"),
+        );
+
+        incoming_tx
+            .try_send(WsMsg::Text("exact-wake".to_string()))
+            .unwrap();
+        generation_tx.send_modify(|generation| *generation = generation.wrapping_add(1));
+
+        let outcome = resume_server_ws_continuation(continuation);
+        assert!(
+            matches!(outcome, NativeOutcome::Return(value) if value.as_str() == Some("exact-wake"))
+        );
+    }
+
+    #[test]
     fn server_ws_generation_disconnect_wakes_and_resolves_nil() {
         let (incoming_tx, incoming_rx) = tokio::sync::mpsc::channel::<WsMsg>(1);
         let (generation_tx, generation_rx) = tokio::sync::watch::channel(0_u64);
@@ -2552,6 +2611,57 @@ mod tests {
         let value = try_server_ws_message(&in_rx).expect("disconnect must be ready");
         assert!(value.is_nil());
         assert!(in_rx.borrow().is_none());
+    }
+
+    #[test]
+    fn server_ws_generation_shutdown_recheck_runs_after_all_mpsc_senders_drop() {
+        let (incoming_tx, incoming_rx) = tokio::sync::mpsc::channel::<WsMsg>(1);
+        let (generation_tx, incoming_generation) = tokio::sync::watch::channel(0_u64);
+        let in_rx = std::rc::Rc::new(std::cell::RefCell::new(Some(incoming_rx)));
+
+        let first_continuation = take_server_ws_external_continuation(
+            suspend_server_ws_receive(in_rx.clone(), incoming_generation.clone())
+                .expect("empty connected receive must suspend"),
+        );
+
+        // A generation published while the mpsc sender remains installed is a
+        // legitimate empty wake. The exact continuation must rearm.
+        generation_tx.send_modify(|generation| *generation = generation.wrapping_add(1));
+        let rearmed_continuation =
+            take_server_ws_external_continuation(resume_server_ws_continuation(first_continuation));
+        let shutdown_generation = arm_server_ws_generation(&incoming_generation);
+
+        sema_io::io_block_on(async {
+            let recv_task = tokio::spawn(async move {
+                let _incoming_tx = incoming_tx;
+                futures::future::pending::<()>().await;
+            });
+            let send_task = tokio::spawn(async {});
+            let shutdown =
+                finish_server_ws_bridge_tasks(recv_task, send_task, generation_tx.clone());
+            let exact_recheck = async move {
+                wait_for_server_ws_generation(shutdown_generation)
+                    .await
+                    .expect("final shutdown generation must wake the recheck");
+                let outcome = resume_server_ws_continuation(rearmed_continuation);
+                assert!(matches!(outcome, NativeOutcome::Return(value) if value.is_nil()));
+            };
+            tokio::time::timeout(std::time::Duration::from_millis(100), async {
+                tokio::join!(shutdown, exact_recheck);
+            })
+            .await
+            .expect("bridge shutdown and its exact recheck must finish without a lost wake");
+        });
+
+        assert!(
+            in_rx.borrow().is_none(),
+            "the exact post-shutdown recheck must observe mpsc disconnection"
+        );
+        assert_eq!(
+            generation_tx.receiver_count(),
+            1,
+            "the original watch receiver remains, so the final wake cannot come from channel closure"
+        );
     }
 
     #[test]

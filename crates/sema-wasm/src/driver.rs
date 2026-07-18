@@ -38,7 +38,7 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 
 use js_sys::Function;
 use sema_core::runtime::{
@@ -56,7 +56,7 @@ use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::JsFuture;
 use web_time::Instant;
 
-use crate::output::pump_output;
+use crate::output::PromiseOutput;
 
 // ─────────────────────────────────────────────────────────────────────────
 // Promise table + macrotask driver
@@ -75,26 +75,49 @@ struct PromiseSettlers {
 }
 
 thread_local! {
-    static PROMISE_TABLE: RefCell<HashMap<RootId, PromiseSettlers>> = RefCell::new(HashMap::new());
-    /// Coalescing flag: a macrotask is already queued to call `drive_and_settle`.
-    /// Every wake source (`submit`, a settled `WaitKind::External` completion,
-    /// a fired timer) calls `schedule_drive`, which is a no-op while this is
-    /// set — so N wakes in the same turn still schedule exactly one macrotask.
-    static DRIVE_SCHEDULED: Cell<bool> = const { Cell::new(false) };
-    /// The `setTimeout` id of a pending turn scheduled via
-    /// `schedule_drive_after` to honor a future `WaitKind::Timer` deadline —
-    /// `None` whenever no delayed turn is outstanding (including while an
-    /// IMMEDIATE turn is scheduled via `schedule_drive`, which never sets
-    /// this). `schedule_drive` cancels and clears it before posting its own
-    /// immediate macrotask: an external completion (fetch resolving) or an
-    /// explicit `cancel_root` command must not sit behind an unrelated
-    /// timer's remaining delay — see `schedule_drive`'s doc comment.
-    static DRIVE_TIMEOUT_ID: Cell<Option<i32>> = const { Cell::new(None) };
-    /// The interpreter the macrotask driver pumps. Bound by the first
-    /// `evalPromise` submission and shared by the driver's macrotask
-    /// callback, which runs detached from any JS call stack (so it cannot
-    /// simply borrow `self` from a `WasmInterpreter` method).
-    static DRIVE_INTERPRETER: RefCell<Option<Rc<Interpreter>>> = const { RefCell::new(None) };
+    /// Completion callbacks receive only the runtime identity through the
+    /// `Send + Sync` executor ABI. This registry routes that identity back to
+    /// the matching single-threaded driver without owning it.
+    static DRIVER_REGISTRY: RefCell<HashMap<RuntimeId, Weak<PromiseDriver>>> =
+        RefCell::new(HashMap::new());
+}
+
+/// Promise-root state owned by one [`crate::WasmInterpreter`]. Local root ids
+/// are only meaningful inside this table; scheduling and cancellation never
+/// inspect another interpreter's roots.
+pub(crate) struct PromiseDriver {
+    interp: Rc<Interpreter>,
+    promises: RefCell<HashMap<RootId, PromiseSettlers>>,
+    drive_scheduled: Cell<bool>,
+    drive_timeout_id: Cell<Option<i32>>,
+    runtime_id: Cell<Option<RuntimeId>>,
+    /// A pending JS Promise must keep its interpreter alive even if the JS
+    /// wrapper is collected while an external completion is outstanding. The
+    /// temporary self-retain is released when the last Promise settles.
+    active_retain: RefCell<Option<Rc<PromiseDriver>>>,
+    output: PromiseOutput,
+}
+
+impl PromiseDriver {
+    pub(crate) fn new(interp: Rc<Interpreter>) -> Rc<Self> {
+        Rc::new(Self {
+            interp,
+            promises: RefCell::new(HashMap::new()),
+            drive_scheduled: Cell::new(false),
+            drive_timeout_id: Cell::new(None),
+            runtime_id: Cell::new(None),
+            active_retain: RefCell::new(None),
+            output: PromiseOutput::default(),
+        })
+    }
+
+    pub(crate) fn set_output_sink(&self, sink: Option<Function>) {
+        self.output.set_sink(sink);
+    }
+
+    pub(crate) fn take_output_sink(&self) -> Option<Function> {
+        self.output.take_sink()
+    }
 }
 
 /// RAII guard marking the calling stack as inside THIS module's own
@@ -135,36 +158,35 @@ impl Drop for PromiseDrivenGuard {
 /// P6-3 step 3 / design doc §2.4). Not called on submission failure (there is
 /// no root to report).
 pub(crate) fn submit(
-    interp: &Rc<Interpreter>,
+    driver: &Rc<PromiseDriver>,
     src: &str,
     resolve: Function,
     reject: Function,
     on_root: Option<Function>,
 ) {
-    DRIVE_INTERPRETER.with(|slot| {
-        *slot.borrow_mut() = Some(Rc::clone(interp));
-    });
     let opts = RootOptions {
         name: None,
         capture_output: true,
     };
-    match interp.submit_str(src, opts) {
+    match driver.interp.submit_str(src, opts) {
         Ok(handle) => {
             let root = handle.id();
-            PROMISE_TABLE.with(|t| {
-                t.borrow_mut().insert(
-                    root,
-                    PromiseSettlers {
-                        handle,
-                        resolve,
-                        reject,
-                    },
-                );
-            });
+            register_driver(driver, root.runtime());
+            driver.promises.borrow_mut().insert(
+                root,
+                PromiseSettlers {
+                    handle,
+                    resolve,
+                    reject,
+                },
+            );
+            if driver.active_retain.borrow().is_none() {
+                *driver.active_retain.borrow_mut() = Some(Rc::clone(driver));
+            }
             if let Some(f) = on_root {
                 let _ = f.call1(&JsValue::NULL, &JsValue::from_f64(root.get() as f64));
             }
-            schedule_drive();
+            schedule_drive(driver);
         }
         Err(err) => {
             reject_with_error(&reject, &err);
@@ -174,7 +196,7 @@ pub(crate) fn submit(
 
 /// Request cancellation of the root whose id (as reported to `submit`'s
 /// `on_root` callback) is `raw_root_id`. Looks the live `RootId` up by its
-/// local numeric component in [`PROMISE_TABLE`] (there is no public
+/// local numeric component in this driver's Promise table (there is no public
 /// constructor from a raw `u64` back to a `RootId` — see
 /// `sema_core::runtime::ids` — so a linear scan of the still-pending roots is
 /// the supported way back) and routes through
@@ -182,11 +204,16 @@ pub(crate) fn submit(
 /// Returns `false` if no pending root matches `raw_root_id` (already settled,
 /// or never existed) — a stale/late cancel is a harmless no-op, matching
 /// `cancel_root`'s own liveness semantics.
-pub(crate) fn cancel_root(interp: &Interpreter, raw_root_id: f64) -> bool {
+pub(crate) fn cancel_root(driver: &Rc<PromiseDriver>, raw_root_id: f64) -> bool {
     let raw = raw_root_id as u64;
-    let found = PROMISE_TABLE.with(|t| t.borrow().keys().find(|root| root.get() == raw).copied());
+    let found = driver
+        .promises
+        .borrow()
+        .keys()
+        .find(|root| root.get() == raw)
+        .copied();
     let cancelled = match found {
-        Some(root) => interp.command_handle().cancel_root(root),
+        Some(root) => driver.interp.command_handle().cancel_root(root),
         None => return false,
     };
     // The cancel command rides the runtime's own inbox, applied at the top of
@@ -196,12 +223,54 @@ pub(crate) fn cancel_root(interp: &Interpreter, raw_root_id: f64) -> bool {
     // immediate turn here, a cancelled `(async/sleep 5000)` would sit
     // uncancelled for up to 5 real seconds — `schedule_drive` cancels that
     // pending delayed timer and posts an immediate macrotask instead.
-    schedule_drive();
+    schedule_drive(driver);
     cancelled
 }
 
-/// Queue exactly one macrotask (if none is already queued) that drives the
-/// bound interpreter — ASAP, not honoring any pending `WaitKind::Timer`
+fn register_driver(driver: &Rc<PromiseDriver>, runtime_id: RuntimeId) {
+    match driver.runtime_id.get() {
+        Some(registered) => {
+            debug_assert_eq!(registered, runtime_id);
+        }
+        None => driver.runtime_id.set(Some(runtime_id)),
+    }
+    DRIVER_REGISTRY.with(|registry| {
+        registry
+            .borrow_mut()
+            .insert(runtime_id, Rc::downgrade(driver));
+    });
+}
+
+fn unregister_driver(driver: &Rc<PromiseDriver>) {
+    let Some(runtime_id) = driver.runtime_id.get() else {
+        return;
+    };
+    let expected = Rc::downgrade(driver);
+    DRIVER_REGISTRY.with(|registry| {
+        let mut registry = registry.borrow_mut();
+        if registry
+            .get(&runtime_id)
+            .is_some_and(|registered| Weak::ptr_eq(registered, &expected))
+        {
+            registry.remove(&runtime_id);
+        }
+    });
+}
+
+fn schedule_runtime(runtime_id: RuntimeId) {
+    let driver =
+        DRIVER_REGISTRY.with(|registry| registry.borrow().get(&runtime_id).and_then(Weak::upgrade));
+    if let Some(driver) = driver {
+        schedule_drive(&driver);
+    } else {
+        DRIVER_REGISTRY.with(|registry| {
+            registry.borrow_mut().remove(&runtime_id);
+        });
+    }
+}
+
+/// Queue exactly one macrotask (if none is already queued) that drives this
+/// interpreter — ASAP, not honoring any pending `WaitKind::Timer`
 /// deadline. Idempotent — safe to call from `submit`, a `WasmExecutor`
 /// completion, or `cancel_root` without ever double-scheduling.
 ///
@@ -210,35 +279,35 @@ pub(crate) fn cancel_root(interp: &Interpreter, raw_root_id: f64) -> bool {
 /// immediate macrotask instead: an external completion or an explicit cancel
 /// command must be observed on the next possible turn, not delayed behind an
 /// unrelated (or now-irrelevant) timer wait.
-pub(crate) fn schedule_drive() {
-    if let Some(id) = DRIVE_TIMEOUT_ID.with(|c| c.take()) {
+fn schedule_drive(driver: &Rc<PromiseDriver>) {
+    if let Some(id) = driver.drive_timeout_id.take() {
         clear_timeout(id);
-        DRIVE_SCHEDULED.with(|f| f.set(false));
+        driver.drive_scheduled.set(false);
     }
-    if DRIVE_SCHEDULED.with(|f| f.replace(true)) {
+    if driver.drive_scheduled.replace(true) {
         return; // already scheduled (an immediate turn is already pending)
     }
-    schedule_macrotask(drive_and_settle);
+    schedule_macrotask(Rc::clone(driver));
 }
 
 /// Like `schedule_drive`, but the macrotask fires after `delay_ms` — used to
 /// honor a pending `WaitKind::Timer` deadline (`async/sleep`) instead of
-/// busy-polling `drive_turn` until it fires. The scheduled `setTimeout`'s id
-/// is retained in `DRIVE_TIMEOUT_ID` so a later `schedule_drive` call (an
-/// external completion or a cancel command) can preempt it.
-fn schedule_drive_after(delay_ms: i32) {
-    if DRIVE_SCHEDULED.with(|f| f.replace(true)) {
+/// busy-polling `drive_turn` until it fires. The scheduled `setTimeout` id is
+/// retained on the driver so a later `schedule_drive` call (an external
+/// completion or a cancel command) can preempt it.
+fn schedule_drive_after(driver: &Rc<PromiseDriver>, delay_ms: i32) {
+    if driver.drive_scheduled.replace(true) {
         return;
     }
-    let id = schedule_timeout_tracked(drive_and_settle, delay_ms.max(0));
-    DRIVE_TIMEOUT_ID.with(|c| c.set(id));
+    let id = schedule_timeout_tracked(Rc::clone(driver), delay_ms.max(0));
+    driver.drive_timeout_id.set(id);
 }
 
-/// Post `f` as a genuine macrotask: a `MessageChannel` round-trip when
-/// available (a true macrotask that yields to rendering/input, per the
-/// design doc), falling back to `setTimeout(f, 0)` — both are supported in a
-/// Window, a Worker, and Node.
-fn schedule_macrotask(f: fn()) {
+/// Post this driver's next turn as a genuine macrotask: a `MessageChannel`
+/// round-trip when available (a true macrotask that yields to rendering/input,
+/// per the design doc), falling back to `setTimeout(..., 0)` — both are
+/// supported in a Window, a Worker, and Node.
+fn schedule_macrotask(driver: Rc<PromiseDriver>) {
     if let Ok(channel) = web_sys::MessageChannel::new() {
         let port1 = channel.port1();
         let port2 = channel.port2();
@@ -249,8 +318,9 @@ fn schedule_macrotask(f: fn()) {
         // doesn't have that "keep process alive" concept, but closing the
         // port promptly is correct there too (no reason to leak it).
         let port1_for_close = port1.clone();
+        let scheduled_driver = Rc::clone(&driver);
         let closure = Closure::once_into_js(move || {
-            f();
+            drive_and_settle(&scheduled_driver);
             port1_for_close.close();
         });
         port1.set_onmessage(Some(closure.unchecked_ref()));
@@ -259,14 +329,15 @@ fn schedule_macrotask(f: fn()) {
         }
         port1.close();
     }
-    schedule_timeout_tracked(f, 0);
+    schedule_timeout_tracked(driver, 0);
 }
 
 /// `setTimeout(f, delay_ms)`, returning the timer id (for `clearTimeout`) if
 /// the host actually has a global `setTimeout` to call — `None` when it ran
 /// `f` inline instead (no id to track; nothing to cancel).
-fn schedule_timeout_tracked(f: fn(), delay_ms: i32) -> Option<i32> {
-    let closure = Closure::once_into_js(f);
+fn schedule_timeout_tracked(driver: Rc<PromiseDriver>, delay_ms: i32) -> Option<i32> {
+    let scheduled_driver = Rc::clone(&driver);
+    let closure = Closure::once_into_js(move || drive_and_settle(&scheduled_driver));
     let target = js_sys::global();
     if let Ok(set_timeout) = js_sys::Reflect::get(&target, &JsValue::from_str("setTimeout")) {
         if let Some(set_timeout) = set_timeout.dyn_ref::<Function>() {
@@ -281,8 +352,8 @@ fn schedule_timeout_tracked(f: fn(), delay_ms: i32) -> Option<i32> {
     }
     // No global `setTimeout` at all (an unexpected host): run inline rather
     // than dropping the drive request — same-turn re-entrancy is safe since
-    // `drive_and_settle` only touches thread-local state.
-    f();
+    // `drive_and_settle` only touches this driver's single-threaded state.
+    drive_and_settle(&driver);
     None
 }
 
@@ -302,16 +373,14 @@ fn clear_timeout(id: i32) {
 /// output + settle any roots that finished, then either stop (idle, nothing
 /// pending) or schedule the next turn — immediately if there is more ready
 /// work, or after the next timer deadline if everything is waiting on one.
-fn drive_and_settle() {
-    DRIVE_SCHEDULED.with(|f| f.set(false));
+fn drive_and_settle(driver: &Rc<PromiseDriver>) {
+    driver.drive_scheduled.set(false);
     // The timer that fired to reach this turn (if any) has already run; its
     // id is stale. Clearing it also lets a `schedule_drive_after` called
     // later in THIS turn (a fresh, shorter timer deadline) register its own
     // id cleanly rather than appearing to still have one pending.
-    DRIVE_TIMEOUT_ID.with(|c| c.set(None));
-    let Some(interp) = DRIVE_INTERPRETER.with(|slot| slot.borrow().clone()) else {
-        return;
-    };
+    driver.drive_timeout_id.set(None);
+    let interp = &driver.interp;
 
     let drive_state = {
         // Only this call is "promise-driven": the dual-ABI natives (wasm
@@ -327,24 +396,26 @@ fn drive_and_settle() {
         match interp.drive_turn() {
             Ok(state) => state,
             Err(fault) => {
-                pump_output(&interp);
-                fail_all_pending(&format!("runtime fault: {fault:?}"));
+                driver.output.pump(interp);
+                fail_all_pending(driver, &format!("runtime fault: {fault:?}"));
                 return;
             }
         }
     };
 
-    pump_output(&interp);
-    settle_ready_roots();
+    driver.output.pump(interp);
+    settle_ready_roots(driver);
 
-    let pending = PROMISE_TABLE.with(|t| !t.borrow().is_empty());
+    let pending = !driver.promises.borrow().is_empty();
     if !pending {
+        unregister_driver(driver);
+        driver.active_retain.borrow_mut().take();
         return; // idle with nothing left to settle — stop scheduling, no busy loop
     }
     match drive_state {
         // More ready work (or a debug stop the host will resume out-of-band):
         // schedule the next turn immediately.
-        DriveState::Progress { .. } | DriveState::DebugStopped { .. } => schedule_drive(),
+        DriveState::Progress { .. } | DriveState::DebugStopped { .. } => schedule_drive(driver),
         DriveState::Idle {
             next_deadline: Some(deadline),
             ..
@@ -354,7 +425,7 @@ fn drive_and_settle() {
                 .checked_duration_since(now)
                 .map(|d| d.as_millis().min(i32::MAX as u128) as i32)
                 .unwrap_or(0);
-            schedule_drive_after(delay_ms);
+            schedule_drive_after(driver, delay_ms);
         }
         // Idle with no timer deadline but an external wait (http fetch, …)
         // still outstanding: do NOT reschedule here. `WasmExecutor::submit`
@@ -378,6 +449,7 @@ fn drive_and_settle() {
             inbox_wakeup_required: false,
         } => {
             fail_all_pending(
+                driver,
                 "runtime deadlocked: no pending timer or external wait, but a root has not settled",
             );
         }
@@ -387,16 +459,16 @@ fn drive_and_settle() {
 
 /// Poll every pending root; settle (resolve/reject, remove from the table)
 /// each one whose `poll_result()` is no longer `Pending`.
-fn settle_ready_roots() {
-    let ready: Vec<RootId> = PROMISE_TABLE.with(|t| {
-        t.borrow()
-            .iter()
-            .filter(|(_, entry)| !matches!(entry.handle.poll_result(), RootPoll::Pending))
-            .map(|(&root, _)| root)
-            .collect()
-    });
+fn settle_ready_roots(driver: &PromiseDriver) {
+    let ready: Vec<RootId> = driver
+        .promises
+        .borrow()
+        .iter()
+        .filter(|(_, entry)| !matches!(entry.handle.poll_result(), RootPoll::Pending))
+        .map(|(&root, _)| root)
+        .collect();
     for root in ready {
-        let Some(entry) = PROMISE_TABLE.with(|t| t.borrow_mut().remove(&root)) else {
+        let Some(entry) = driver.promises.borrow_mut().remove(&root) else {
             continue;
         };
         match entry.handle.poll_result() {
@@ -427,12 +499,18 @@ fn settle_ready_roots() {
 
 /// Reject every still-pending root the same way (a `Runtime::drive` fault is
 /// not root-specific) and clear the table, so no promise is left hanging.
-fn fail_all_pending(message: &str) {
-    let pending: Vec<PromiseSettlers> =
-        PROMISE_TABLE.with(|t| t.borrow_mut().drain().map(|(_, v)| v).collect());
+fn fail_all_pending(driver: &Rc<PromiseDriver>, message: &str) {
+    let pending: Vec<PromiseSettlers> = driver
+        .promises
+        .borrow_mut()
+        .drain()
+        .map(|(_, value)| value)
+        .collect();
     for entry in pending {
         reject_with_message(&entry.reject, message);
     }
+    unregister_driver(driver);
+    driver.active_retain.borrow_mut().take();
 }
 
 fn resolve_with_value(resolve: &Function, value: &Value) {
@@ -485,14 +563,16 @@ fn reject_with_message(reject: &Function, message: &str) {
 /// which is free to touch `JsValue` because it isn't part of the job closure.
 pub(crate) struct WasmExecutor;
 
-struct WasmLease;
+struct WasmLease {
+    runtime_id: RuntimeId,
+}
 
 impl IoExecutor for WasmExecutor {
     fn attach_runtime(
         &self,
-        _runtime_id: RuntimeId,
+        runtime_id: RuntimeId,
     ) -> Result<ExecutorLeaseArc, ExecutorAttachError> {
-        Ok(std::sync::Arc::new(WasmLease))
+        Ok(std::sync::Arc::new(WasmLease { runtime_id }))
     }
 
     fn snapshot(&self) -> ExecutorSnapshot {
@@ -513,9 +593,10 @@ impl ExecutorLease for WasmLease {
         match submission.into_dispatch() {
             ExecutorDispatch::Async(dispatch) => {
                 let fut = dispatch.into_future();
+                let runtime_id = self.runtime_id;
                 wasm_bindgen_futures::spawn_local(async move {
                     let _report = fut.await; // self-delivers its completion via the sink
-                    schedule_drive();
+                    schedule_runtime(runtime_id);
                 });
             }
             ExecutorDispatch::Blocking(dispatch) => {
@@ -524,7 +605,7 @@ impl ExecutorLease for WasmLease {
                 // inline so an unforeseen future caller still completes
                 // rather than hanging silently.
                 let _report = dispatch.run();
-                schedule_drive();
+                schedule_runtime(self.runtime_id);
             }
         }
         Ok(RunningSubmission::new(operation_id))
@@ -693,7 +774,6 @@ fn runtime_http_call(default_method: &'static str, args: &[Value]) -> NativeResu
         )
         .await;
         let _ = tx.send(result);
-        schedule_drive();
     });
 
     let kind = CompletionKind::try_from_raw(WASM_HTTP_COMPLETION_KIND)

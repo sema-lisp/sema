@@ -274,7 +274,94 @@ test('cancelRoot cancels the exact RootId via RuntimeCommandHandle::cancel_root,
   expect(elapsed).toBeLessThan(3000);
 });
 
-// ── Gate (e), un-scoped (P6-3 step 5 —
+// ── Gate (e): each interpreter owns its Promise driver ─────────────────────
+test('separate interpreters settle concurrent suspending evalPromise and evalAsync roots', async ({ page }) => {
+  await page.goto('/');
+  await expect(page.getByTestId('status')).toHaveClass(/status-ready/, { timeout: 20000 });
+
+  const result = await page.evaluate(async () => {
+    // @ts-expect-error -- resolved by the dev server at runtime, not by tsc
+      const mod = await import('/pkg/sema_wasm.js');
+    await mod.default();
+    const interpA = new mod.SemaInterpreter();
+    const interpB = new mod.SemaInterpreter();
+
+    let rootA: number | undefined;
+    const a = interpA
+      .evalPromise('(async/sleep 80) "A-ok"', (rid: number) => { rootA = rid; })
+      .then(() => 'fulfilled', () => 'rejected');
+    const b = interpB
+      .evalAsync('(async/sleep 30) "B-ok"')
+      .then(() => 'fulfilled', () => 'rejected');
+
+    const settled = await Promise.race([
+      Promise.all([a, b]).then((outcomes) => ({ timedOut: false, outcomes })),
+      new Promise<{ timedOut: true; outcomes: string[] }>((resolve) => {
+        setTimeout(() => resolve({ timedOut: true, outcomes: [] }), 1_500);
+      }),
+    ]);
+
+    // Settling the last root unregisters the driver's weak wake route. A
+    // later external operation must re-register it and still receive the
+    // executor completion for this exact interpreter.
+    const followUp = settled.timedOut
+      ? 'skipped'
+      : await Promise.race([
+          interpA
+            .evalPromise(`(:status (http/get "${location.origin}/index.html"))`, undefined)
+            .then(() => 'fulfilled', () => 'rejected'),
+          new Promise<string>((resolve) => setTimeout(() => resolve('timed-out'), 1_500)),
+        ]);
+
+    return { rootA, followUp, ...settled };
+  });
+
+  expect(result.timedOut).toBe(false);
+  expect(result.rootA).toBeDefined();
+  expect(result.outcomes).toEqual(['fulfilled', 'fulfilled']);
+  expect(result.followUp).toBe('fulfilled');
+});
+
+test('cancelling one interpreter root cannot cancel a colliding root owned by another interpreter', async ({ page }) => {
+  await page.goto('/');
+  await expect(page.getByTestId('status')).toHaveClass(/status-ready/, { timeout: 20000 });
+
+  const result = await page.evaluate(async () => {
+    // @ts-expect-error -- resolved by the dev server at runtime, not by tsc
+      const mod = await import('/pkg/sema_wasm.js');
+    await mod.default();
+    const interpA = new mod.SemaInterpreter();
+    const interpB = new mod.SemaInterpreter();
+
+    let rootA: number | undefined;
+    let rootB: number | undefined;
+    const a = interpA
+      .evalPromise('(async/sleep 5000) "A-should-not-complete"', (rid: number) => { rootA = rid; })
+      .then(() => 'fulfilled', () => 'cancelled');
+    const b = interpB
+      .evalPromise('(async/sleep 100) "B-ok"', (rid: number) => { rootB = rid; })
+      .then(() => 'fulfilled', () => 'rejected');
+
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    const cancelled = interpA.cancelRoot(rootA);
+    const settled = await Promise.race([
+      Promise.all([a, b]).then((outcomes) => ({ timedOut: false, outcomes })),
+      new Promise<{ timedOut: true; outcomes: string[] }>((resolve) => {
+        setTimeout(() => resolve({ timedOut: true, outcomes: [] }), 1_500);
+      }),
+    ]);
+
+    return { cancelled, rootA, rootB, ...settled };
+  });
+
+  expect(result.rootA).toBeDefined();
+  expect(result.rootA).toBe(result.rootB);
+  expect(result.cancelled).toBe(true);
+  expect(result.timedOut).toBe(false);
+  expect(result.outcomes).toEqual(['cancelled', 'fulfilled']);
+});
+
+// ── Gate (f), un-scoped (P6-3 step 5 —
 // `docs/plans/archive/2026-07-16-wasm-promise-driven-roots.md`): the replay loops and
 // the JS-side SAB/`legacySab` fallback are now actually deleted, so this
 // scans the FULL sources, not just `driver.rs`/the shipped bundle's default

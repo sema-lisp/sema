@@ -1775,10 +1775,11 @@ fn register_wasm_io(env: &Env) {
 ///
 /// Installs a private `Closure`-backed `setPromiseOutputSink` for the
 /// duration of one call, collecting only the lines tagged with the root id
-/// this call's `on_root_id` callback reports (root ids are per-runtime
-/// unique, so no cross-talk with a concurrent unrelated root), and restores
-/// whatever sink predates the call on drop.
+/// this call's `on_root_id` callback reports. The sink belongs to this
+/// interpreter's driver, so a different interpreter may use the same local
+/// root id without cross-talk. Restores whatever sink predates the call.
 struct PromiseCapture {
+    driver: Rc<driver::PromiseDriver>,
     collected: Rc<RefCell<Vec<String>>>,
     target_root: Rc<Cell<Option<f64>>>,
     previous_sink: Option<js_sys::Function>,
@@ -1791,10 +1792,10 @@ struct PromiseCapture {
 }
 
 impl PromiseCapture {
-    fn install() -> Self {
+    fn install(driver: &Rc<driver::PromiseDriver>) -> Self {
         let collected: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
         let target_root: Rc<Cell<Option<f64>>> = Rc::new(Cell::new(None));
-        let previous_sink = output::take_sink();
+        let previous_sink = driver.take_output_sink();
 
         let sink_collected = Rc::clone(&collected);
         let sink_root = Rc::clone(&target_root);
@@ -1807,7 +1808,7 @@ impl PromiseCapture {
                 }
             },
         ) as Box<dyn FnMut(f64, JsValue, JsValue)>);
-        output::set_sink(Some(
+        driver.set_output_sink(Some(
             sink_closure
                 .as_ref()
                 .unchecked_ref::<js_sys::Function>()
@@ -1825,6 +1826,7 @@ impl PromiseCapture {
             .into();
 
         Self {
+            driver: Rc::clone(driver),
             collected,
             target_root,
             previous_sink,
@@ -1845,7 +1847,7 @@ impl PromiseCapture {
     async fn await_as_old_json(self, promise: js_sys::Promise) -> JsValue {
         let _ = &self.target_root; // kept alive for the sink closure's Weak-free capture
         let settled = JsFuture::from(promise).await;
-        output::set_sink(self.previous_sink.clone());
+        self.driver.set_output_sink(self.previous_sink.clone());
 
         let output_lines = self.collected.borrow();
         let output_json = output_lines
@@ -1881,6 +1883,7 @@ pub struct WasmInterpreter {
     // JS call stack / `&self` borrow. Every existing method's `self.inner.foo()`
     // call keeps compiling unchanged (`Rc<T>` derefs transparently to `T`).
     inner: std::rc::Rc<sema_eval::Interpreter>,
+    promise_driver: std::rc::Rc<driver::PromiseDriver>,
     callback_handles: std::rc::Rc<RefCell<BTreeMap<u32, Value>>>,
     callback_ids_by_value: std::rc::Rc<RefCell<BTreeMap<u64, u32>>>,
     next_callback_id: std::rc::Rc<Cell<u32>>,
@@ -1924,8 +1927,10 @@ impl WasmInterpreter {
         // 10M steps is enough for complex examples but prevents runaway computation.
         interp.ctx.set_eval_step_limit(10_000_000);
 
+        let inner = std::rc::Rc::new(interp);
         WasmInterpreter {
-            inner: std::rc::Rc::new(interp),
+            promise_driver: driver::PromiseDriver::new(std::rc::Rc::clone(&inner)),
+            inner,
             callback_handles: std::rc::Rc::new(RefCell::new(BTreeMap::new())),
             callback_ids_by_value: std::rc::Rc::new(RefCell::new(BTreeMap::new())),
             next_callback_id: std::rc::Rc::new(Cell::new(1)),
@@ -2000,11 +2005,11 @@ impl WasmInterpreter {
     /// `null`/`undefined` to skip.
     #[wasm_bindgen(js_name = evalPromise)]
     pub fn eval_promise(&self, code: &str, on_root_id: JsValue) -> js_sys::Promise {
-        let interp = self.inner.clone();
+        let driver = Rc::clone(&self.promise_driver);
         let code = code.to_string();
         let on_root_id = on_root_id.dyn_into::<js_sys::Function>().ok();
         js_sys::Promise::new(&mut |resolve, reject| {
-            driver::submit(&interp, &code, resolve, reject, on_root_id.clone());
+            driver::submit(&driver, &code, resolve, reject, on_root_id.clone());
         })
     }
 
@@ -2017,7 +2022,7 @@ impl WasmInterpreter {
     /// cancellable root at all).
     #[wasm_bindgen(js_name = cancelRoot)]
     pub fn cancel_root(&self, root_id: f64) -> bool {
-        driver::cancel_root(&self.inner, root_id)
+        driver::cancel_root(&self.promise_driver, root_id)
     }
 
     /// Install (or clear, passing `null`/`undefined`) the JS callback that
@@ -2027,7 +2032,8 @@ impl WasmInterpreter {
     /// points) — the two never observe each other's output.
     #[wasm_bindgen(js_name = setPromiseOutputSink)]
     pub fn set_promise_output_sink(&self, sink: JsValue) {
-        output::set_sink(sink.dyn_into::<js_sys::Function>().ok());
+        self.promise_driver
+            .set_output_sink(sink.dyn_into::<js_sys::Function>().ok());
     }
 
     /// Shared body for the OLD `evalAsync`/`evalVMAsync`/`runEntryAsync`
@@ -2042,7 +2048,7 @@ impl WasmInterpreter {
     /// change.
     ///
     /// Output capture: `eval_promise` only delivers a root's output through
-    /// the shared `setPromiseOutputSink` channel, tagged by root id — there is
+    /// the interpreter's `setPromiseOutputSink` channel, tagged by root id — there is
     /// no way to "read it back" after the fact (a real `setPromiseOutputSink`
     /// caller, if any, would already have drained it by the next drive turn).
     /// This installs a private `Closure`-backed sink for the duration of the
@@ -2057,7 +2063,7 @@ impl WasmInterpreter {
     /// + hint + note into its `.message` (P6-3 step 5), so extracting that
     /// text reproduces the OLD entry points' `"error"` field exactly.
     async fn eval_once_via_promise_seam(&self, code: &str) -> JsValue {
-        let capture = PromiseCapture::install();
+        let capture = PromiseCapture::install(&self.promise_driver);
         let promise = self.eval_promise(code, capture.on_root_id());
         capture.await_as_old_json(promise).await
     }
@@ -2076,7 +2082,7 @@ impl WasmInterpreter {
         code: &str,
         path: &std::path::Path,
     ) -> JsValue {
-        let capture = PromiseCapture::install();
+        let capture = PromiseCapture::install(&self.promise_driver);
         self.inner.ctx.push_file_path(path.to_path_buf());
         let promise = self.eval_promise(code, capture.on_root_id());
         self.inner.ctx.pop_file_path();
@@ -2717,8 +2723,10 @@ impl WasmInterpreter {
             }
         }
 
+        let inner = std::rc::Rc::new(interp);
         WasmInterpreter {
-            inner: std::rc::Rc::new(interp),
+            promise_driver: driver::PromiseDriver::new(std::rc::Rc::clone(&inner)),
+            inner,
             callback_handles: std::rc::Rc::new(RefCell::new(BTreeMap::new())),
             callback_ids_by_value: std::rc::Rc::new(RefCell::new(BTreeMap::new())),
             next_callback_id: std::rc::Rc::new(Cell::new(1)),

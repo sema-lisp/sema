@@ -479,10 +479,11 @@ git commit -m "refactor(server): wake websocket handlers from channel generation
 
 **Files:**
 - Modify: `scripts/check-unified-runtime-legacy.sh`
-- Modify: `docs/internals/async-runtime-inventory/runtime-match-map.tsv`
+- Modify: `docs/plans/evidence/unified-cooperative-runtime/runtime-match-map.tsv`
 - Modify: `docs/deferred.md`
 - Modify: `CHANGELOG.md`
 - Modify: `docs/plans/2026-07-18-poll-probes-event-driven-wakes.md`
+- Modify: `docs/plans/2026-07-18-poll-probes-event-driven-wakes-implementation.md`
 
 **Interfaces:**
 - Consumes: Tasks 1-3 complete and reviewed.
@@ -552,9 +553,10 @@ Expected: every command exits zero. Any known flake must be isolation-reproduced
 
 ```bash
 git add scripts/check-unified-runtime-legacy.sh \
-  docs/internals/async-runtime-inventory/runtime-match-map.tsv \
+  docs/plans/evidence/unified-cooperative-runtime/runtime-match-map.tsv \
   docs/deferred.md CHANGELOG.md \
-  docs/plans/2026-07-18-poll-probes-event-driven-wakes.md
+  docs/plans/2026-07-18-poll-probes-event-driven-wakes.md \
+  docs/plans/2026-07-18-poll-probes-event-driven-wakes-implementation.md
 git commit -m "docs(runtime): close event-driven wake slice"
 ```
 
@@ -563,7 +565,7 @@ git commit -m "docs(runtime): close event-driven wake slice"
 Resolve the implementation-plan commit as the Slice 7 code base, not `HEAD~1`:
 
 ```bash
-slice7_base=$(git log -1 --format=%H -- \
+slice7_base=$(git log --diff-filter=A -1 --format=%H -- \
   docs/plans/2026-07-18-poll-probes-event-driven-wakes-implementation.md)
 /Users/helge/.codex/plugins/cache/claude-plugins-official/superpowers/6.1.1/skills/subagent-driven-development/scripts/review-package "$slice7_base" HEAD
 ```

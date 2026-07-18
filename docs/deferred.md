@@ -697,33 +697,21 @@ two remaining pieces:
   `AcceptLoopContinuation` already uses to invoke the per-connection dispatch
   factory. `in_runtime_quantum()` therefore stays true for the whole handler
   body, including any nested `(:recv conn)`. The connection's `ws/recv`
-  (`simple_with_runtime`, dual-ABI) then cooperatively polls the incoming
-  channel via `ServerWsRecvProbe` + `crate::io::await_runtime_until` — the
-  exact `RuntimePoll`/`await_runtime_until` pattern the client-side `ws.rs`
-  already used for `ws/connect`/`ws/recv` — instead of `blocking_recv`. This
-  was the genuinely novel wrinkle this piece surfaced: converting `ws/recv`
-  alone is not enough, the WS handler's OWN invocation had to move off the
-  synchronous callback bridge first, or the conversion would have compiled
-  and looked correct while still silently blocking (`in_runtime_quantum()`
-  would always read false). `idle_websocket_does_not_block_plain_request`
-  (`http_serve_concurrent_test.rs`) is un-ignored and green: a real
-  `tungstenite` client opens a WS connection and stays silent; a sibling
-  plain `/ping` GET still completes well within its bounded budget.
-  `cancel_during_idle_websocket_recv_reaps_the_handler_task_no_leak`
-  (`http_serve_cancel_test.rs`, new) proves a real WS connection parked in
-  `ws/recv`, then cancelled (client disconnect / server shutdown), reaps its
-  handler task — `runtime_live_task_count() == 0` — with a bounded poll-until-
-  reaped loop rather than a synchronous assert, because this wait's
-  inter-scan sleep is a `quarantined_blocking` op (a real, if brief, 5 ms
-  OS-thread sleep) that cancellation cannot abort mid-flight; the task fully
-  reaps once that in-flight job's completion round-trips through the inbox,
-  which can trail the ROOT's own settlement by a turn or two for this wait
-  kind specifically (unlike `async/sleep`'s purely-internal timer, which the
-  sibling slow-handler cancellation test reaps synchronously). `ws/send`
-  and `ws/close` are UNCHANGED (still `blocking_send`/synchronous) — send
-  only blocks the VM thread if the 256-slot outgoing queue is full (a
-  slow/stalled client), a narrower, pre-existing limitation orthogonal to the
-  idle-recv head-of-line case this piece fixes; not attempted here.
+  (`simple_with_runtime`, dual-ABI) parks on its watch generation through a
+  `WaitKind::External` operation, then rechecks the VM-owned receiver. The
+  bridge enqueues each message before advancing the generation and publishes a
+  final generation after both bridge tasks release their channel state, so
+  message and close wakes are lossless. Cancelling a pending receive drops only
+  its watch-receiver clone; the installed receiver remains usable. The idle
+  WebSocket liveness and cancellation tests verify sibling progress and
+  immediate handler-task teardown. `ws/send` and `ws/close` remain synchronous;
+  send can block the VM thread only if its 256-slot outgoing queue is full.
+
+  **Remaining bounded probes:** `io/read-key-timeout` and `event/select` with
+  `:key` or `:proc` sources recheck readiness on the VM thread every 5 ms using
+  structural `WaitKind::Timer` wakes. Terminal and process registries have no
+  runtime notification source. Timer-only `event/select` waits once until the
+  exact earliest deadline.
 
 - **Piece (d) — the fail-fast guard is deleted.** With plain-HTTP concurrency
   (pieces a/b) and server-side WS concurrency (piece c) both live,
@@ -1013,17 +1001,10 @@ DELETED (P5, commit a1862f67); `scripts/check-unified-runtime-legacy.sh
   callee).
 
 - **RESOLVED (2026-07-16, Step F / F2 conversion — commits e6b7004b, 1cabd457).**
-  `event_select_yields_to_sibling_in_async_context` is un-ignored and green:
-  `event/select` now suspends via `WaitKind::External` and yields to siblings
-  before parking. Historical description follows.
-- **`event_select_yields_to_sibling_in_async_context`**
-  (`crates/sema/tests/vm_async_test.rs`). Under the runtime, `event/select`
-  resolved its own marker before a co-scheduled sibling ran (observed order
-  `[select-done, sibling-ran]`, expected `[sibling-ran, select-done]`). Root
-  cause: `event/select` was an I/O op on the legacy `AwaitIo(IoHandle)`
-  bridge, which did not yield cooperatively BEFORE parking under the runtime.
-  The fix was the **Step F (external I/O sites → `WaitKind::External`)**
-  conversion, which makes the op yield to siblings before it parks.
+  `event_select_yields_to_sibling_in_async_context` is un-ignored and green.
+  `event/select` yields before parking and uses structural `WaitKind::Timer`
+  waits: one exact earliest-deadline wait for timer-only sources, or bounded
+  5 ms VM-thread checks when key/process readiness is present.
 
 ### ASYNC-RUN-BARRIER-1 — `async/run` self-resolving-waits barrier (RESOLVED)
 

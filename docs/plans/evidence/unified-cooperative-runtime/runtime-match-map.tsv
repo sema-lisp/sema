@@ -578,14 +578,12 @@ R08A	crates/sema-stdlib/src/io.rs:1044:// (`fs_offload`, gated on `in_async_cont
 R08C	crates/sema-stdlib/src/io.rs:11:thread_local! {
 R08A	crates/sema-stdlib/src/io.rs:1212:                std::thread::sleep(Duration::from_millis(delay));
 R08B	crates/sema-stdlib/src/io.rs:1365:// chunk is offloaded — repeating via a hand-rolled `IoHandle` poll closure
-R08A	crates/sema-stdlib/src/io.rs:1398:// untraced `IoHandle`, the runtime path re-checks the source on the VM thread and
-R08A	crates/sema-stdlib/src/io.rs:1417:/// `IoHandle`.
-R08A	crates/sema-stdlib/src/io.rs:1464:            std::thread::sleep(Duration::from_millis(RUNTIME_POLL_INTERVAL_MS));
-R08A	crates/sema-stdlib/src/io.rs:1577:/// plus the legacy cooperative-scheduler `in_async_context()` `AwaitIo` poll. The
+R08A	crates/sema-stdlib/src/io.rs:1415:/// `IoHandle`.
+R08A	crates/sema-stdlib/src/io.rs:1541:/// plus the legacy cooperative-scheduler `in_async_context()` `AwaitIo` poll. The
 R08C	crates/sema-stdlib/src/io.rs:17:thread_local! {
-R22A	crates/sema-stdlib/src/io.rs:2287:                    sema_core::call_callback(ctx, &func, &[Value::string(&line_buf)])?;
-R22A	crates/sema-stdlib/src/io.rs:2335:                    acc = sema_core::call_callback_owned(ctx, &func, &mut cb_args)?;
-R22A	crates/sema-stdlib/src/io.rs:2390:                    acc = sema_core::call_callback_owned(ctx, &func, &mut cb_args)?;
+R22A	crates/sema-stdlib/src/io.rs:2251:                    sema_core::call_callback(ctx, &func, &[Value::string(&line_buf)])?;
+R22A	crates/sema-stdlib/src/io.rs:2299:                    acc = sema_core::call_callback_owned(ctx, &func, &mut cb_args)?;
+R22A	crates/sema-stdlib/src/io.rs:2354:                    acc = sema_core::call_callback_owned(ctx, &func, &mut cb_args)?;
 R09A	crates/sema-stdlib/src/kv.rs:77:thread_local! {
 R22A	crates/sema-stdlib/src/list.rs:2121:/// A runtime-only native (`async/spawn`, `channel/*`, `async/resolved`, …) can
 R22A	crates/sema-stdlib/src/list.rs:2154:/// Plain native callbacks (e.g. `(any async/sleep ...)`) don't have that
@@ -624,50 +622,53 @@ R13	crates/sema-stdlib/src/secret.rs:14://! (`in_async_context()`) — offload t
 R13	crates/sema-stdlib/src/secret.rs:233:        // CPU-bound and can run long over large inputs; inside async/spawn
 R14	crates/sema-stdlib/src/serial.rs:86:thread_local! {
 R14	crates/sema-stdlib/src/serial.rs:8://! VM thread for the operation's whole duration. Inside an `async/spawn`'d
-R15A	crates/sema-stdlib/src/server.rs:1221:        while let Some(msg) = outgoing_rx.recv().await {
-R15A	crates/sema-stdlib/src/server.rs:1298:/// `block_on`) that panicked when the channel was bounded + `blocking_send`.
-R15B	crates/sema-stdlib/src/server.rs:1322:    use sema_core::call_callback;
-R15B	crates/sema-stdlib/src/server.rs:1331:    // evaluator thread and may `send` from inside a provider's block_on (e.g.
-R15B	crates/sema-stdlib/src/server.rs:1345:    match call_callback(ctx, &stream_handler, &[send_fn]) {
-R15A	crates/sema-stdlib/src/server.rs:1360:/// instead of pinning the VM thread the way `blocking_recv` did.
-R15B	crates/sema-stdlib/src/server.rs:1431:/// of calling the WS handler synchronously through `call_callback` (which
-R15B	crates/sema-stdlib/src/server.rs:1500:                match rx.blocking_recv() {
-R15B	crates/sema-stdlib/src/server.rs:1531:                match rx.blocking_recv() {
-R15B	crates/sema-stdlib/src/server.rs:1574:/// `blocking_recv`; that's fine here because this whole path already has no
-R15B	crates/sema-stdlib/src/server.rs:1583:    use sema_core::{call_callback, NativeFn};
-R15B	crates/sema-stdlib/src/server.rs:1607:    // NOTE: `ws/send`/`ws/recv` below use bounded blocking_send/blocking_recv,
-R15B	crates/sema-stdlib/src/server.rs:1610:    // callback fires inside the provider's block_on) would hit the same "block
-R15B	crates/sema-stdlib/src/server.rs:1644:            match rx.blocking_recv() {
-R15B	crates/sema-stdlib/src/server.rs:1679:    match call_callback(ctx, &ws_handler, &[conn]) {
-R15B	crates/sema-stdlib/src/server.rs:1726:/// bind+listen succeeds. Shared between the sync (serial `blocking_recv`) and
-R15B	crates/sema-stdlib/src/server.rs:1761:    // loop on THIS thread (`rx.blocking_recv()`) for the life of the server —
-R15B	crates/sema-stdlib/src/server.rs:1770:    // `http/serve` composes inside `async/spawn`. The acceptance suite in
-R15B	crates/sema-stdlib/src/server.rs:1879:    let actual_port = match ready_rx.recv() {
-R15B	crates/sema-stdlib/src/server.rs:1924:    use sema_core::call_callback;
-R15B	crates/sema-stdlib/src/server.rs:1930:    } = http_serve_setup(args, &|f, a| call_callback(ctx, f, a))?;
-R15B	crates/sema-stdlib/src/server.rs:1936:    // at a time on the evaluator thread before looping back to `blocking_recv`
-R15B	crates/sema-stdlib/src/server.rs:1938:    // `blocking_recv` on its own per-connection channel) only ever gets called
-R15B	crates/sema-stdlib/src/server.rs:1939:    // from inside `call_callback` below — so a WS handler idling in `ws/recv`
-R15B	crates/sema-stdlib/src/server.rs:1945:    while let Some(req) = rx.blocking_recv() {
-R15B	crates/sema-stdlib/src/server.rs:1949:                match call_callback(ctx, &handler, &[request_val]) {
-R15A	crates/sema-stdlib/src/server.rs:1993:/// wait's job MOVES it into the future (so `rx.recv().await` runs off the VM
-R15B	crates/sema-stdlib/src/server.rs:2023:/// for why a plain synchronous `call_callback` can't let the handler's
-R15A	crates/sema-stdlib/src/server.rs:2078:/// on `rx.recv()` off the VM thread, and decode the result back into either
-R15A	crates/sema-stdlib/src/server.rs:2123:                let item = rx.recv().await;
-R15A	crates/sema-stdlib/src/server.rs:2137:/// The factory does the `async/spawn` itself, in compiled Sema bytecode,
-R15A	crates/sema-stdlib/src/server.rs:2141:/// caller-supplied continuation OTHER than `async/spawn`'s own trivial
-R15B	crates/sema-stdlib/src/server.rs:2180:                    // serial loop's `while let Some(req) = rx.blocking_recv()`
-R15B	crates/sema-stdlib/src/server.rs:2247:            // task's promise (from `async/spawn` inside the factory) — not
-R15B	crates/sema-stdlib/src/server.rs:2268:/// `async/spawn` uses), so a slow/parked handler does not stall its
-R15B	crates/sema-stdlib/src/server.rs:2277:        sema_core::with_stdlib_ctx(|c| sema_core::call_callback(c, f, a))
-R15B	crates/sema-stdlib/src/server.rs:2455:        let result = rt.block_on(async {
-R15B	crates/sema-stdlib/src/server.rs:2478:        rt.block_on(async {
-R15B	crates/sema-stdlib/src/server.rs:381:                    let result = sema_core::call_callback(ctx, &handler, &tool_args)?;
+R15A	crates/sema-stdlib/src/server.rs:1248:        while let Some(msg) = outgoing_rx.recv().await {
+R15A	crates/sema-stdlib/src/server.rs:1321:/// `block_on`) that panicked when the channel was bounded + `blocking_send`.
+R15B	crates/sema-stdlib/src/server.rs:1345:    use sema_core::call_callback;
+R15B	crates/sema-stdlib/src/server.rs:1354:    // evaluator thread and may `send` from inside a provider's block_on (e.g.
+R15B	crates/sema-stdlib/src/server.rs:1368:    match call_callback(ctx, &stream_handler, &[send_fn]) {
+R15B	crates/sema-stdlib/src/server.rs:1529:/// of calling the WS handler synchronously through `call_callback` (which
+R15B	crates/sema-stdlib/src/server.rs:1601:                match rx.blocking_recv() {
+R15B	crates/sema-stdlib/src/server.rs:1628:                match rx.blocking_recv() {
+R15B	crates/sema-stdlib/src/server.rs:1671:/// `blocking_recv`; that's fine here because this whole path already has no
+R15B	crates/sema-stdlib/src/server.rs:1680:    use sema_core::{call_callback, NativeFn};
+R15B	crates/sema-stdlib/src/server.rs:1706:    // NOTE: `ws/send`/`ws/recv` below use bounded blocking_send/blocking_recv,
+R15B	crates/sema-stdlib/src/server.rs:1709:    // callback fires inside the provider's block_on) would hit the same "block
+R15B	crates/sema-stdlib/src/server.rs:1743:            match rx.blocking_recv() {
+R15B	crates/sema-stdlib/src/server.rs:1778:    match call_callback(ctx, &ws_handler, &[conn]) {
+R15B	crates/sema-stdlib/src/server.rs:1825:/// bind+listen succeeds. Shared between the sync (serial `blocking_recv`) and
+R15B	crates/sema-stdlib/src/server.rs:1860:    // loop on THIS thread (`rx.blocking_recv()`) for the life of the server —
+R15B	crates/sema-stdlib/src/server.rs:1869:    // `http/serve` composes inside `async/spawn`. The acceptance suite in
+R15B	crates/sema-stdlib/src/server.rs:1978:    let actual_port = match ready_rx.recv() {
+R15B	crates/sema-stdlib/src/server.rs:2023:    use sema_core::call_callback;
+R15B	crates/sema-stdlib/src/server.rs:2029:    } = http_serve_setup(args, &|f, a| call_callback(ctx, f, a))?;
+R15B	crates/sema-stdlib/src/server.rs:2035:    // at a time on the evaluator thread before looping back to `blocking_recv`
+R15B	crates/sema-stdlib/src/server.rs:2037:    // `blocking_recv` on its own per-connection channel) only ever gets called
+R15B	crates/sema-stdlib/src/server.rs:2038:    // from inside `call_callback` below — so a WS handler idling in `ws/recv`
+R15B	crates/sema-stdlib/src/server.rs:2044:    while let Some(req) = rx.blocking_recv() {
+R15B	crates/sema-stdlib/src/server.rs:2048:                match call_callback(ctx, &handler, &[request_val]) {
+R15A	crates/sema-stdlib/src/server.rs:2092:/// wait's job MOVES it into the future (so `rx.recv().await` runs off the VM
+R15B	crates/sema-stdlib/src/server.rs:2122:/// for why a plain synchronous `call_callback` can't let the handler's
+R15A	crates/sema-stdlib/src/server.rs:2177:/// on `rx.recv()` off the VM thread, and decode the result back into either
+R15A	crates/sema-stdlib/src/server.rs:2222:                let item = rx.recv().await;
+R15A	crates/sema-stdlib/src/server.rs:2236:/// The factory does the `async/spawn` itself, in compiled Sema bytecode,
+R15A	crates/sema-stdlib/src/server.rs:2240:/// caller-supplied continuation OTHER than `async/spawn`'s own trivial
+R15B	crates/sema-stdlib/src/server.rs:2279:                    // serial loop's `while let Some(req) = rx.blocking_recv()`
+R15B	crates/sema-stdlib/src/server.rs:2346:            // task's promise (from `async/spawn` inside the factory) — not
+R15B	crates/sema-stdlib/src/server.rs:2367:/// `async/spawn` uses), so a slow/parked handler does not stall its
+R15B	crates/sema-stdlib/src/server.rs:2376:        sema_core::with_stdlib_ctx(|c| sema_core::call_callback(c, f, a))
+R15A	crates/sema-stdlib/src/server.rs:2529:        sema_io::io_block_on(async {
+R15A	crates/sema-stdlib/src/server.rs:2605:        sema_io::io_block_on(async {
+R15A	crates/sema-stdlib/src/server.rs:2634:        sema_io::io_block_on(async {
+R15A	crates/sema-stdlib/src/server.rs:2675:        sema_io::io_block_on(async {
+R15B	crates/sema-stdlib/src/server.rs:2741:        let result = rt.block_on(async {
+R15B	crates/sema-stdlib/src/server.rs:2764:        rt.block_on(async {
+R15B	crates/sema-stdlib/src/server.rs:383:                    let result = sema_core::call_callback(ctx, &handler, &tool_args)?;
 R15A	crates/sema-stdlib/src/server.rs:78:    /// and may be inside a provider's `block_on` (e.g. llm/stream), where a
-R15B	crates/sema-stdlib/src/server.rs:893:/// non-static handler through `call_callback` — the value ABI with its passed
-R15B	crates/sema-stdlib/src/server.rs:896:    use sema_core::{call_callback, with_stdlib_ctx, EvalContext, NativeFn};
-R15B	crates/sema-stdlib/src/server.rs:902:            let invoke = |handler: &Value, req: Value| call_callback(ctx, handler, &[req]);
-R15B	crates/sema-stdlib/src/server.rs:912:                with_stdlib_ctx(|c| call_callback(c, handler, &[req]))
+R15B	crates/sema-stdlib/src/server.rs:895:/// non-static handler through `call_callback` — the value ABI with its passed
+R15B	crates/sema-stdlib/src/server.rs:898:    use sema_core::{call_callback, with_stdlib_ctx, EvalContext, NativeFn};
+R15B	crates/sema-stdlib/src/server.rs:904:            let invoke = |handler: &Value, req: Value| call_callback(ctx, handler, &[req]);
+R15B	crates/sema-stdlib/src/server.rs:914:                with_stdlib_ctx(|c| call_callback(c, handler, &[req]))
 R16A	crates/sema-stdlib/src/sqlite.rs:23://! queues (an async caller's `IoHandle` re-attempts the checkout every poll —
 R16A	crates/sema-stdlib/src/sqlite.rs:76:thread_local! {
 R16A	crates/sema-stdlib/src/sqlite.rs:8://! thread for the operation's whole duration. Inside an `async/spawn`'d task
@@ -690,16 +691,22 @@ R19	crates/sema-stdlib/src/terminal.rs:186:                std::thread::sleep(st
 R19	crates/sema-stdlib/src/terminal.rs:37:thread_local! {
 R23B	crates/sema-stdlib/src/workflow.rs:223:/// `async/spawn`, an offloaded `llm/chat` tool loop, `channel/*`) parks on the active
 R23B	crates/sema-stdlib/src/workflow_mcp.rs:473:thread_local! {
+R20A	crates/sema-stdlib/src/ws.rs:1042:            .recv_timeout(Duration::from_secs(1))
+R20A	crates/sema-stdlib/src/ws.rs:1051:            .recv_timeout(Duration::from_secs(1))
 R20A	crates/sema-stdlib/src/ws.rs:11://! channel. Top-level ops block the VM thread; ops inside an `async/spawn` task
-R20A	crates/sema-stdlib/src/ws.rs:393:            cmd = cmd_rx.recv() => match cmd {
-R20A	crates/sema-stdlib/src/ws.rs:447:    if let Some(v) = sema_core::take_resume_value() {
-R20B	crates/sema-stdlib/src/ws.rs:481:    match ready_rx.blocking_recv() {
-R20A	crates/sema-stdlib/src/ws.rs:513:        if let Some(v) = sema_core::take_resume_value() {
-R20B	crates/sema-stdlib/src/ws.rs:526:    let ev = evt_rx.borrow_mut().blocking_recv();
-R20A	crates/sema-stdlib/src/ws.rs:530:fn ws_recv_timeout(args: &[Value]) -> NativeResult {
-R20A	crates/sema-stdlib/src/ws.rs:543:        if let Some(v) = sema_core::take_resume_value() {
-R20B	crates/sema-stdlib/src/ws.rs:567:    let outcome = sema_io::io_block_on(async {
-R20A	crates/sema-stdlib/src/ws.rs:724:    register_runtime_fn(env, "ws/recv-timeout", ws_recv_timeout);
+R20A	crates/sema-stdlib/src/ws.rs:517:            cmd = cmd_rx.recv() => match cmd {
+R20A	crates/sema-stdlib/src/ws.rs:598:    if let Some(v) = sema_core::take_resume_value() {
+R20B	crates/sema-stdlib/src/ws.rs:652:    match ready_rx.blocking_recv() {
+R20A	crates/sema-stdlib/src/ws.rs:684:        if let Some(v) = sema_core::take_resume_value() {
+R20B	crates/sema-stdlib/src/ws.rs:693:    let ev = evt_rx.borrow_mut().blocking_recv();
+R20A	crates/sema-stdlib/src/ws.rs:697:fn ws_recv_timeout(args: &[Value]) -> NativeResult {
+R20A	crates/sema-stdlib/src/ws.rs:710:        if let Some(v) = sema_core::take_resume_value() {
+R20B	crates/sema-stdlib/src/ws.rs:730:    let outcome = sema_io::io_block_on(async {
+R20A	crates/sema-stdlib/src/ws.rs:887:    register_runtime_fn(env, "ws/recv-timeout", ws_recv_timeout);
+R20A	crates/sema-stdlib/src/ws.rs:909:        sema_io::io_block_on(async {
+R20A	crates/sema-stdlib/src/ws.rs:934:        sema_io::io_block_on(async {
+R20A	crates/sema-stdlib/src/ws.rs:948:        sema_io::io_block_on(async {
+R20A	crates/sema-stdlib/src/ws.rs:984:        sema_io::io_block_on(async {
 C16	crates/sema-vm/src/lower.rs:1013:/// (async body ...) → wrap body in zero-arg lambda, call async/spawn
 C16	crates/sema-vm/src/lower.rs:1032:        func: Box::new(CoreExpr::Var(intern("async/spawn"))),
 C16	crates/sema-vm/src/lower.rs:1038:/// (await expr) → call async/await with the expression

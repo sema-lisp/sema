@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- **WebSocket waits and event selection use source-driven runtime wakes.**
+  Client handshakes and client/server message and close waits are event-driven;
+  cancelling a pending receive preserves the installed receiver and connection.
+  Timer-only `event/select` parks once until the exact earliest deadline. Stdin
+  and process readiness cannot notify the runtime, so their VM-thread checks
+  retain structural 5 ms timer probes.
 - **Unified runtime — `YieldReason::Sleep` (the last TLS yield-signal bridge)
   retired.** `async/sleep`'s structural Timer ABI (`invoke_runtime`) is
   always preferred when a `TaskContext` is installed, so the legacy

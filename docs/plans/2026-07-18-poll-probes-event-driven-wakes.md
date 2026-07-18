@@ -1,6 +1,6 @@
 # Poll Probes to Event-Driven Wakes
 
-**Status:** Approved 2026-07-18
+**Status:** Implemented 2026-07-18
 
 ## Goal
 
@@ -10,23 +10,16 @@ that cannot notify the runtime. Public Sema behavior stays unchanged.
 
 ## Current behavior
 
-`crates/sema-stdlib/src/io.rs` implements `await_runtime_until` by checking a
-`RuntimePoll`, scheduling a quarantined blocking job that sleeps for 5 ms, then
-checking the probe again. The helper serves unrelated operations:
+Runtime WebSocket operations use external channel notifications. `ws/connect`
+awaits its handshake oneshot, while client and server receives park on versioned
+Tokio watch generations for message and close events. Receivers remain installed
+on the VM thread, so cancelling a pending receive preserves the connection.
 
-- client `ws/connect`, `ws/recv`, and `ws/recv-timeout`;
-- server-side `ws/recv`;
-- `event/select` over key, process, and timer sources;
-- `io/read-key-timeout`.
-
-The helper is cooperative—the VM thread does not block—but every idle wait can
-submit about 200 executor jobs per second. A WebSocket message can also wait for
-the next scan even though Tokio channels already provide wake notifications.
-
-The sources do not have one common readiness model. WebSocket handshakes and
-message queues can notify immediately. Timer sources have exact deadlines.
-Terminal input and `proc/*` readiness live behind synchronous VM-thread checks
-and have no runtime notification interface.
+`event/select` with only timer sources parks once until the earliest deadline.
+Mixed key/process/timer selection and `io/read-key-timeout` use structural
+`WaitKind::Timer` wakes between VM-thread readiness checks. The 5 ms probe
+interval remains only for terminal and process registries, which have no runtime
+notification interface. No probe wait occupies an executor worker.
 
 ## Decision
 
@@ -200,7 +193,7 @@ the runtime inbox.
 
 ## Verification
 
-Implementation follows red-green TDD. Focused tests must prove:
+Focused red-green tests prove:
 
 1. Client and server WebSocket receives wake from watch changes without a
    periodic runtime timer.
@@ -237,6 +230,21 @@ jake docs-check
 scripts/check-unified-runtime-legacy.sh --check
 scripts/check-unified-runtime-inventory.sh --check
 ```
+
+### Verification transcript
+
+Verified 2026-07-18:
+
+- The purge-guard plant failed with the planted file and passed after removal;
+  the WebSocket structural search returned no matches.
+- The runtime inventory covers 896 exact production matches with zero
+  `UNREVIEWED` assignments; both runtime guards pass.
+- `cargo nextest run --workspace` passed 6,430 tests with 52 skipped and one
+  leaky-test annotation.
+- `jake examples` and `jake smoke-bytecode` each passed 81 runnable examples
+  with 12 skipped and zero failures.
+- `jake lint`, `jake docs-check`, the wasm32 `sema-wasm` check, and
+  `git diff --check` exited successfully.
 
 ## Out of scope
 

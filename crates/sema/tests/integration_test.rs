@@ -12875,6 +12875,158 @@ fn test_http_serve_websocket() {
 }
 
 // ===========================================================================
+// sema fmt --json
+// ===========================================================================
+
+const FMT_JSON_UGLY: &str = "(define   x   1)\n";
+const FMT_JSON_PRETTY: &str = "(define x 1)\n";
+
+fn run_fmt_command(dir: &std::path::Path, args: &[&str]) -> std::process::Output {
+    std::process::Command::new(env!("CARGO_BIN_EXE_sema"))
+        .arg("fmt")
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .expect("failed to run sema fmt")
+}
+
+fn parse_ndjson(output: &[u8]) -> Vec<serde_json::Value> {
+    String::from_utf8_lossy(output)
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("stdout line must be JSON"))
+        .collect()
+}
+
+#[test]
+fn test_fmt_json_changed_input_is_valid_and_read_only() {
+    let dir = unique_temp_dir("fmt-json-changed");
+    std::fs::write(dir.join("changed.sema"), FMT_JSON_UGLY).unwrap();
+
+    let output = run_fmt_command(&dir, &["--json", "changed.sema"]);
+
+    assert!(
+        output.status.success(),
+        "sema fmt failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let results = parse_ndjson(&output.stdout);
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0]["file"], "changed.sema");
+    assert_eq!(results[0]["formatted"], true);
+    assert_eq!(results[0]["changed"], true);
+    assert_eq!(results[0]["source"], FMT_JSON_PRETTY);
+    assert_eq!(
+        std::fs::read_to_string(dir.join("changed.sema")).unwrap(),
+        FMT_JSON_UGLY,
+        "JSON mode must not rewrite the source file"
+    );
+
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn test_fmt_json_unchanged_input_reports_unchanged() {
+    let dir = unique_temp_dir("fmt-json-unchanged");
+    std::fs::write(dir.join("clean.sema"), FMT_JSON_PRETTY).unwrap();
+
+    let output = run_fmt_command(&dir, &["--json", "clean.sema"]);
+
+    assert!(output.status.success());
+    let results = parse_ndjson(&output.stdout);
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0]["formatted"], true);
+    assert_eq!(results[0]["changed"], false);
+    assert_eq!(results[0]["source"], FMT_JSON_PRETTY);
+
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn test_fmt_json_multiple_files_emit_only_ndjson_records() {
+    let dir = unique_temp_dir("fmt-json-multiple");
+    std::fs::write(dir.join("changed.sema"), FMT_JSON_UGLY).unwrap();
+    std::fs::write(dir.join("clean.sema"), FMT_JSON_PRETTY).unwrap();
+
+    let output = run_fmt_command(&dir, &["--json", "changed.sema", "clean.sema"]);
+
+    assert!(output.status.success());
+    let results = parse_ndjson(&output.stdout);
+    assert_eq!(results.len(), 2);
+    assert_eq!(results[0]["file"], "changed.sema");
+    assert_eq!(results[0]["changed"], true);
+    assert_eq!(results[1]["file"], "clean.sema");
+    assert_eq!(results[1]["changed"], false);
+
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn test_fmt_json_check_exits_one_when_input_would_change() {
+    let dir = unique_temp_dir("fmt-json-check");
+    std::fs::write(dir.join("changed.sema"), FMT_JSON_UGLY).unwrap();
+
+    let output = run_fmt_command(&dir, &["--check", "--json", "changed.sema"]);
+
+    assert_eq!(output.status.code(), Some(1));
+    let results = parse_ndjson(&output.stdout);
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0]["changed"], true);
+    assert_eq!(
+        std::fs::read_to_string(dir.join("changed.sema")).unwrap(),
+        FMT_JSON_UGLY
+    );
+
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn test_fmt_json_rejects_diff() {
+    let dir = unique_temp_dir("fmt-json-diff");
+    std::fs::write(dir.join("changed.sema"), FMT_JSON_UGLY).unwrap();
+
+    let output = run_fmt_command(&dir, &["--diff", "--json", "changed.sema"]);
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("--diff"), "unexpected stderr: {stderr}");
+    assert!(stderr.contains("--json"), "unexpected stderr: {stderr}");
+    assert!(
+        stderr.contains("cannot be used with"),
+        "unexpected stderr: {stderr}"
+    );
+
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn test_fmt_json_no_matches_is_silent() {
+    let dir = unique_temp_dir("fmt-json-empty");
+
+    let output = run_fmt_command(&dir, &["--json", "*.sema"]);
+
+    assert!(output.status.success());
+    assert!(output.stdout.is_empty());
+
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn test_fmt_json_missing_file_emits_one_error_record() {
+    let dir = unique_temp_dir("fmt-json-missing");
+
+    let output = run_fmt_command(&dir, &["--json", "missing.sema"]);
+
+    assert_eq!(output.status.code(), Some(1));
+    let results = parse_ndjson(&output.stdout);
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0]["file"], "missing.sema");
+    assert_eq!(results[0]["formatted"], false);
+    assert!(results[0]["error"].is_string());
+
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+// ===========================================================================
 // sema build — standalone executable tests
 // ===========================================================================
 

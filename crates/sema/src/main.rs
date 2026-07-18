@@ -287,7 +287,7 @@ enum Commands {
         align: bool,
 
         /// Output result as JSON (useful for editor integrations)
-        #[arg(long)]
+        #[arg(long, conflicts_with = "diff")]
         json: bool,
     },
     /// Start the Language Server Protocol (LSP) server
@@ -3153,7 +3153,9 @@ fn run_fmt(
     };
 
     if files.is_empty() {
-        println!("No .sema files found");
+        if !json {
+            println!("No .sema files found");
+        }
         return;
     }
 
@@ -3202,23 +3204,26 @@ fn run_fmt(
             }
         };
 
+        checked += 1;
+        let file_changed = source != formatted;
+        if file_changed {
+            changed += 1;
+        }
+
         if json {
             println!(
                 "{}",
                 serde_json::json!({
                     "file": file,
                     "formatted": true,
+                    "changed": file_changed,
                     "source": formatted
                 })
             );
             continue;
         }
 
-        checked += 1;
-
-        if source != formatted {
-            changed += 1;
-
+        if file_changed {
             if check {
                 println!("Would reformat: {file}");
             } else if show_diff {
@@ -3237,26 +3242,32 @@ fn run_fmt(
     }
 
     // Print summary
-    if check {
-        if changed > 0 {
-            println!("\n{changed} file(s) would be reformatted, {checked} file(s) checked");
-            std::process::exit(1);
+    if !json {
+        if check {
+            if changed > 0 {
+                println!("\n{changed} file(s) would be reformatted, {checked} file(s) checked");
+                std::process::exit(1);
+            } else {
+                println!("{checked} file(s) already formatted");
+            }
+        } else if show_diff {
+            println!("\n{changed} file(s) would change, {checked} file(s) checked");
+        } else if changed > 0 {
+            println!(
+                "\n{changed} file(s) formatted, {} file(s) unchanged",
+                checked - changed
+            );
         } else {
             println!("{checked} file(s) already formatted");
         }
-    } else if show_diff {
-        println!("\n{changed} file(s) would change, {checked} file(s) checked");
-    } else if changed > 0 {
-        println!(
-            "\n{changed} file(s) formatted, {} file(s) unchanged",
-            checked - changed
-        );
-    } else {
-        println!("{checked} file(s) already formatted");
     }
 
     if errors > 0 {
         eprintln!("{errors} error(s)");
+        std::process::exit(1);
+    }
+
+    if check && changed > 0 {
         std::process::exit(1);
     }
 }

@@ -2901,10 +2901,6 @@ fn run_build_web(
             if files_count == 1 { "" } else { "s" },
             human_duration(started.elapsed())
         );
-        eprintln!(
-            "  Load with <script type=\"text/sema\" src=\"{}\"></script>",
-            output_path.display()
-        );
     }
 
     Ok(())

@@ -3,6 +3,7 @@ use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::rc::Rc;
 
+use sema_core::runtime::RuntimeTaskId;
 use sema_core::{
     resolve, Agent, Conversation, Env, EvalContext, ImageAttachment, Message, NativeFn, Prompt,
     Role, SemaError, Value, ValueView,
@@ -8964,7 +8965,7 @@ struct AgentLoopState {
     /// the task-reaped sweep (`reap_cancelled_agent_runs`) matches on this id to
     /// reclaim the entry (and end its span) instead of leaking it until
     /// `reset_runtime_state`.
-    owning_task_id: Option<u64>,
+    owning_task_id: Option<RuntimeTaskId>,
 }
 
 impl Drop for AgentLoopState {
@@ -9028,7 +9029,7 @@ pub fn stream_runs_len() -> usize {
 /// Idempotent by absence in both directions: after `__agent-finish` removed the
 /// entry this sweep finds nothing, and a late finish after this sweep is the
 /// existing idempotent no-op. Entries with `owning_task_id: None` are untouched.
-fn reap_cancelled_agent_runs(task_id: u64) {
+fn reap_cancelled_agent_runs(task_id: RuntimeTaskId) {
     let reaped: Vec<AgentLoopState> = AGENT_RUNS.with(|r| {
         let mut slab = r.borrow_mut();
         let tokens: Vec<u64> = slab
@@ -10110,7 +10111,7 @@ struct StreamRunState {
     /// The scheduler task that opened this run (None outside a task). The
     /// task-reaped sweep reclaims entries by this id when their task is
     /// cancelled — `__stream-finish` cannot run for a cancelled task.
-    owning_task_id: Option<u64>,
+    owning_task_id: Option<RuntimeTaskId>,
     /// A failure that arrived in a batch that still carried deltas: stored so the
     /// driver delivers those deltas to the callback first, then raised (and the
     /// entry dropped) on the next `__stream-next`/`__stream-finish`.

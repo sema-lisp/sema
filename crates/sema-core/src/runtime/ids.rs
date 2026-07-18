@@ -64,6 +64,31 @@ impl RuntimeId {
     }
 }
 
+/// A task's complete identity across every runtime in the process.
+///
+/// [`TaskId`] values are local to one runtime and may collide. Native registries
+/// that outlive a task quantum use this composite identity for ownership and
+/// cancellation cleanup.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct RuntimeTaskId {
+    runtime: RuntimeId,
+    task: TaskId,
+}
+
+impl RuntimeTaskId {
+    pub fn new(runtime: RuntimeId, task: TaskId) -> Self {
+        Self { runtime, task }
+    }
+
+    pub fn runtime(self) -> RuntimeId {
+        self.runtime
+    }
+
+    pub fn task(self) -> TaskId {
+        self.task
+    }
+}
+
 fn allocate_atomic(counter: &AtomicU64) -> Result<NonZeroU64, IdExhausted> {
     let raw = counter
         .fetch_update(
@@ -353,10 +378,25 @@ mod tests {
     }
 
     #[test]
+    fn runtime_task_ids_with_equal_local_tasks_are_distinct() {
+        let first_runtime = RuntimeId::allocate().expect("runtime ID available");
+        let second_runtime = RuntimeId::allocate().expect("runtime ID available");
+        let local_task = TaskId::try_from_raw(7).expect("task ID is nonzero");
+
+        let first = RuntimeTaskId::new(first_runtime, local_task);
+        let second = RuntimeTaskId::new(second_runtime, local_task);
+
+        assert_eq!(first.runtime(), first_runtime);
+        assert_eq!(first.task(), local_task);
+        assert_ne!(first, second);
+    }
+
+    #[test]
     fn every_identity_has_the_required_value_traits() {
         fn assert_traits<T: Copy + Clone + std::fmt::Debug + Eq + Ord + std::hash::Hash>() {}
 
         assert_traits::<RuntimeId>();
+        assert_traits::<RuntimeTaskId>();
         assert_traits::<RootId>();
         assert_traits::<TaskId>();
         assert_traits::<ScopeId>();

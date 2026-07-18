@@ -18,6 +18,7 @@
 use std::any::Any;
 use std::cell::{Cell, RefCell};
 
+use crate::runtime::RuntimeTaskId;
 use crate::value::Value;
 
 thread_local! {
@@ -116,7 +117,7 @@ pub fn set_promise_driven_quantum(val: bool) -> bool {
 /// Sema error) — those paths run their own cleanup in bytecode; only a
 /// cancellation leaves per-task native state (e.g. an agent-run slab entry in
 /// `sema-llm`) with no other reclamation point.
-pub type TaskReapedFn = fn(u64);
+pub type TaskReapedFn = fn(RuntimeTaskId);
 
 thread_local! {
     static TASK_REAPED_CALLBACK: Cell<Option<TaskReapedFn>> = const { Cell::new(None) };
@@ -131,7 +132,7 @@ pub fn set_task_reaped_callback(f: TaskReapedFn) {
 /// Notify the registered callback that `task_id` was reaped (cancelled and will
 /// never resume). Cheap no-op when no callback is installed. See
 /// [`TaskReapedFn`] for the firing contract.
-pub fn notify_task_reaped(task_id: u64) {
+pub fn notify_task_reaped(task_id: RuntimeTaskId) {
     if let Some(f) = TASK_REAPED_CALLBACK.with(|cb| cb.get()) {
         f(task_id);
     }
@@ -145,18 +146,18 @@ thread_local! {
     /// (e.g. `__agent-begin`'s slab entry) can stamp it with its owning task for
     /// later reclamation via the task-reaped callback. `None` outside any task
     /// step (top-level code).
-    static CURRENT_TASK_ID: Cell<Option<u64>> = const { Cell::new(None) };
+    static CURRENT_TASK_ID: Cell<Option<RuntimeTaskId>> = const { Cell::new(None) };
 }
 
 /// The id of the task currently being stepped by the runtime, or `None` when
 /// running top-level (non-task) code.
-pub fn current_task_id() -> Option<u64> {
+pub fn current_task_id() -> Option<RuntimeTaskId> {
     CURRENT_TASK_ID.with(|c| c.get())
 }
 
 /// Install `id` as the current task id, returning the displaced value so the
 /// caller can restore it on step leave (nested inline-task runs stack correctly).
-pub fn set_current_task_id(id: Option<u64>) -> Option<u64> {
+pub fn set_current_task_id(id: Option<RuntimeTaskId>) -> Option<RuntimeTaskId> {
     CURRENT_TASK_ID.with(|c| c.replace(id))
 }
 
@@ -532,4 +533,29 @@ pub fn clear_interrupt_callback() {
 #[inline]
 pub fn check_interrupt() -> bool {
     INTERRUPT_CALLBACK.with(|cb| cb.get()).is_some_and(|f| f())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::runtime::{RuntimeId, RuntimeTaskId, TaskId};
+
+    #[test]
+    fn current_task_id_restores_displaced_runtime_scoped_identity() {
+        let outer = RuntimeTaskId::new(
+            RuntimeId::allocate().expect("runtime ID available"),
+            TaskId::try_from_raw(1).expect("task ID is nonzero"),
+        );
+        let inner = RuntimeTaskId::new(
+            RuntimeId::allocate().expect("runtime ID available"),
+            TaskId::try_from_raw(1).expect("task ID is nonzero"),
+        );
+
+        assert_eq!(set_current_task_id(Some(outer)), None);
+        assert_eq!(set_current_task_id(Some(inner)), Some(outer));
+        assert_eq!(current_task_id(), Some(inner));
+        assert_eq!(set_current_task_id(Some(outer)), Some(inner));
+        assert_eq!(set_current_task_id(None), Some(outer));
+        assert_eq!(current_task_id(), None);
+    }
 }

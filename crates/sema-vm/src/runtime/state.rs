@@ -24,8 +24,8 @@ use sema_core::runtime::ExternalFailure;
 use sema_core::runtime::{
     CancelReason, CancellationView, IdCounter, IoExecutor, NativeCall, NativeCallContext,
     NativeOutcome, NativeResult, ResourceGateId, ResumeInput, RootId, RuntimeRequest,
-    RuntimeResponse, RuntimeScopedIdCounter, SettlementSeq, TaskContextHandle, TaskId, TaskOutcome,
-    TaskSettlement, Trace, WaitKind,
+    RuntimeResponse, RuntimeScopedIdCounter, RuntimeTaskId, SettlementSeq, TaskContextHandle,
+    TaskId, TaskOutcome, TaskSettlement, Trace, WaitKind,
 };
 use sema_core::runtime::{CancellationParent, LifetimeOwner, TaskRelations};
 #[cfg(test)]
@@ -365,7 +365,7 @@ impl Drop for TaskScopeSwap {
 /// natives use it for. `restore` is idempotent and `Drop` calls it, so an
 /// early `?`-return or panic still restores the displaced ids exactly once.
 struct QuantumIdGuard {
-    prev_task_id: Option<u64>,
+    prev_task_id: Option<RuntimeTaskId>,
     prev_root_id: Option<RootId>,
     restored: bool,
 }
@@ -373,7 +373,7 @@ struct QuantumIdGuard {
 impl QuantumIdGuard {
     /// Publish `published_task_id`/`root` as the current quantum's identity,
     /// capturing the displaced (spawner/sibling) values to restore later.
-    fn install(published_task_id: Option<u64>, root: RootId) -> Self {
+    fn install(published_task_id: Option<RuntimeTaskId>, root: RootId) -> Self {
         let prev_task_id = sema_core::set_current_task_id(published_task_id);
         let prev_root_id = sema_core::set_current_root(Some(root));
         Self {
@@ -2042,7 +2042,7 @@ impl Runtime {
         let published_task_id = if is_root_main {
             None
         } else {
-            Some(task_id.get())
+            Some(RuntimeTaskId::new(root.runtime(), task_id))
         };
         // Publish the running quantum's root (unlike task id, this is set for
         // the root main task too — its `println`s must tag correctly for a
@@ -3639,7 +3639,7 @@ impl Runtime {
         let published_task_id = if is_root_main {
             None
         } else {
-            Some(task_id.get())
+            Some(RuntimeTaskId::new(root.runtime(), task_id))
         };
         // `QuantumIdGuard` restores both ids even on an early `?`-return or
         // panic inside the loop below — see its doc comment.
@@ -4105,7 +4105,7 @@ impl Runtime {
         // reclaims any per-task slab entry (and ends its detached span) this task
         // owned. Idempotent by absence for a normally-finished task.
         if matches!(outcome, TaskOutcome::Cancelled(_)) {
-            sema_core::notify_task_reaped(task_id.get());
+            sema_core::notify_task_reaped(RuntimeTaskId::new(root.runtime(), task_id));
         }
         let is_root_main = {
             let state = self.state.borrow();

@@ -6,8 +6,9 @@
 //! these tests exercise the async tier end-to-end through `http/get`:
 //!
 //! 1. `http_16_concurrent_overlap` — sixteen 300 ms requests via
-//!    `async/spawn`+`async/all` overlap server-side while preserving response
-//!    correctness and input order.
+//!    `async/spawn`+`async/all` reach at least nine concurrent server handlers,
+//!    exceeding the retired blocking tier's eight-worker ceiling while
+//!    preserving response correctness and input order.
 //! 2. `http_get_cancel_aborts_and_disconnects` — an `async/cancel` of a parked
 //!    `http/get` returns promptly and the SERVER observes the client disconnect
 //!    (the in-flight reqwest future was dropped, socket torn down).
@@ -36,6 +37,10 @@ use serial_test::serial;
 
 /// Per-request delay of the local overlap server, in milliseconds.
 const DELAY_MS: u64 = 300;
+/// The retired blocking tier could have at most eight HTTP operations in flight.
+const RENDEZVOUS_TARGET: usize = 9;
+/// Bounds the failure path when fewer than [`RENDEZVOUS_TARGET`] handlers arrive.
+const RENDEZVOUS_TIMEOUT_MS: u64 = 5_000;
 
 /// Spin up a local delay HTTP server (raw `tokio` TCP on its own multi-thread
 /// runtime, random port). The handler sleeps [`DELAY_MS`] then echoes the `i`
@@ -52,7 +57,7 @@ fn start_delay_server() -> (u16, Arc<MaxInFlight>) {
         .build()
         .expect("delay server runtime");
 
-    let gauge = Arc::new(MaxInFlight::default());
+    let gauge = Arc::new(MaxInFlight::new(RENDEZVOUS_TARGET));
     let gauge_for_server = gauge.clone();
     rt.spawn(async move {
         let listener = tokio::net::TcpListener::from_std(std_listener).expect("from_std listener");
@@ -63,25 +68,31 @@ fn start_delay_server() -> (u16, Arc<MaxInFlight>) {
             };
             let gauge = gauge_for_server.clone();
             tokio::spawn(async move {
-                let _in_flight = gauge.enter();
                 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-                let mut buf = [0u8; 1024];
-                let n = match socket.read(&mut buf).await {
-                    Ok(n) => n,
-                    Err(_) => return,
+                // Scope the guard to the rendezvous so a completed batch cannot
+                // inflate the gauge while the next batch starts receiving replies.
+                let i = {
+                    let _in_flight = gauge.enter();
+                    let mut buf = [0u8; 1024];
+                    let n = match socket.read(&mut buf).await {
+                        Ok(n) => n,
+                        Err(_) => return,
+                    };
+                    let req = String::from_utf8_lossy(&buf[..n]);
+                    let path = req
+                        .lines()
+                        .next()
+                        .and_then(|line| line.split_whitespace().nth(1))
+                        .unwrap_or("/")
+                        .to_string();
+                    let i = path
+                        .split("i=")
+                        .nth(1)
+                        .map(|s| s.trim().to_string())
+                        .unwrap_or_default();
+                    gauge.wait_for_target().await;
+                    i
                 };
-                let req = String::from_utf8_lossy(&buf[..n]);
-                let path = req
-                    .lines()
-                    .next()
-                    .and_then(|line| line.split_whitespace().nth(1))
-                    .unwrap_or("/")
-                    .to_string();
-                let i = path
-                    .split("i=")
-                    .nth(1)
-                    .map(|s| s.trim().to_string())
-                    .unwrap_or_default();
                 tokio::time::sleep(Duration::from_millis(DELAY_MS)).await;
                 let body = format!("echo:{i}");
                 let resp = format!(
@@ -101,17 +112,47 @@ fn start_delay_server() -> (u16, Arc<MaxInFlight>) {
 }
 
 /// Tracks the high-water mark of concurrently in-flight requests.
-#[derive(Default)]
 struct MaxInFlight {
     current: AtomicUsize,
     max: AtomicUsize,
+    target: usize,
+    target_reached: tokio::sync::watch::Sender<bool>,
+    rendezvous_deadline: Instant,
 }
 
 impl MaxInFlight {
+    fn new(target: usize) -> Self {
+        let (target_reached, _) = tokio::sync::watch::channel(false);
+        Self {
+            current: AtomicUsize::new(0),
+            max: AtomicUsize::new(0),
+            target,
+            target_reached,
+            rendezvous_deadline: Instant::now() + Duration::from_millis(RENDEZVOUS_TIMEOUT_MS),
+        }
+    }
+
     fn enter(self: &Arc<Self>) -> InFlightGuard {
         let current = self.current.fetch_add(1, Ordering::SeqCst) + 1;
         self.max.fetch_max(current, Ordering::SeqCst);
+        if current >= self.target {
+            self.target_reached.send_replace(true);
+        }
         InFlightGuard(self.clone())
+    }
+
+    async fn wait_for_target(&self) {
+        let remaining = self
+            .rendezvous_deadline
+            .saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return;
+        }
+        // Watch retains the latest value, including a release sent before this
+        // receiver subscribes, so the rendezvous has no lost-notification window.
+        let mut target_reached = self.target_reached.subscribe();
+        let wait = target_reached.wait_for(|reached| *reached);
+        let _ = tokio::time::timeout(remaining, wait).await;
     }
 
     fn max_seen(&self) -> usize {
@@ -163,8 +204,8 @@ fn http_16_concurrent_overlap() {
          max in-flight {max_in_flight}"
     );
     assert!(
-        max_in_flight >= 2,
-        "expected overlapped requests (server-side max in-flight >= 2), got {max_in_flight} \
+        max_in_flight >= RENDEZVOUS_TARGET,
+        "expected overlapped requests (server-side max in-flight >= {RENDEZVOUS_TARGET}), got {max_in_flight} \
          (wall-clock {elapsed_ms} ms)"
     );
 }

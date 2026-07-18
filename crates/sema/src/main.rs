@@ -286,7 +286,7 @@ enum Commands {
         #[arg(long)]
         align: bool,
 
-        /// Output result as JSON (useful for editor integrations)
+        /// Emit read-only NDJSON results for editor integrations
         #[arg(long, conflicts_with = "diff")]
         json: bool,
     },

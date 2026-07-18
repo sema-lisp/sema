@@ -111,15 +111,13 @@ fn cancel_during_slow_handler_reaps_the_handler_task_no_leak() {
 }
 
 /// SRV-1 piece c: cancelling `http/serve` while a WebSocket handler is parked
-/// IDLE in `(:recv conn)` (`ws/recv`'s cooperative `ServerWsRecvProbe` path,
-/// `crates/sema-stdlib/src/server.rs`) must reap the connection's handler
-/// task cleanly too — no orphan, no hang. This is the cancellation half of
-/// the piece-c contract; `idle_websocket_does_not_block_plain_request`
-/// (`http_serve_concurrent_test.rs`) covers the liveness half (a sibling
-/// request isn't blocked). Using a real `tungstenite` WS client so the
-/// connection genuinely upgrades and the handler genuinely parks in
-/// `ws/recv` — a bare TCP connect/disconnect (like `fire_and_disconnect`
-/// above) never reaches that code path.
+/// IDLE in `(:recv conn)` on its External watch-generation wait must reap the
+/// connection's handler task cleanly too — no orphan, no hang. This is the
+/// cancellation half of the piece-c contract; `idle_websocket_does_not_block_`
+/// `plain_request` (`http_serve_concurrent_test.rs`) covers liveness and the
+/// corresponding message wake. Using a real `tungstenite` client ensures the
+/// connection upgrades and the handler genuinely parks in `ws/recv`; a bare
+/// TCP connect/disconnect never reaches that code path.
 #[test]
 fn cancel_during_idle_websocket_recv_reaps_the_handler_task_no_leak() {
     let interp = Interpreter::new();
@@ -171,27 +169,9 @@ fn cancel_during_idle_websocket_recv_reaps_the_handler_task_no_leak() {
         result.is_err(),
         "a cancelled http/serve root must settle as an error, not a value"
     );
-    // The WS handler's `ws/recv` parks on a cooperative poll
-    // (`ServerWsRecvProbe` / `await_runtime_until`) whose inter-scan wait is a
-    // `quarantined_blocking` op: a real (if brief, 5ms) OS-thread sleep that
-    // cancellation cannot abort mid-flight — the child task fully reaps only
-    // once that in-flight blocking job returns its completion through the
-    // inbox. `drive_until_settled` above stops as soon as the ROOT (the
-    // accept-loop task) settles, which can race ahead of that last hop for
-    // this wait kind specifically (unlike `async/sleep`'s purely-internal
-    // timer, which the sibling test above cancels synchronously). Keep
-    // driving bounded turns until the count actually reaches 0 — the
-    // liveness oracle itself, not a fixed sleep — so this stays a leak gate,
-    // not a timing-dependent flake.
-    let deadline = Instant::now() + Duration::from_secs(5);
-    let mut live = interp.runtime_live_task_count();
-    while live != 0 && Instant::now() < deadline {
-        let _ = interp.drive_turn();
-        thread::sleep(Duration::from_millis(2));
-        live = interp.runtime_live_task_count();
-    }
     assert_eq!(
-        live, 0,
-        "cancelling the server root must reap the idle WebSocket handler task too — no leak"
+        interp.runtime_live_task_count(),
+        0,
+        "cancelling the server root must synchronously reap the idle WebSocket handler and its External wait"
     );
 }

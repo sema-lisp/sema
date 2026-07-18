@@ -82,6 +82,8 @@ enum ServerResponse {
     WebSocket {
         /// Sends messages from axum (client) to the evaluator (server handler).
         incoming_tx: tokio::sync::mpsc::Sender<WsMsg>,
+        /// Publishes lossless readiness generations after incoming messages.
+        incoming_generation: tokio::sync::watch::Sender<u64>,
         /// Receives messages from the evaluator (server handler) to axum (client).
         outgoing_rx: tokio::sync::mpsc::Receiver<WsMsg>,
     },
@@ -1137,11 +1139,14 @@ async fn handle_axum_request(
         }
         Ok(ServerResponse::WebSocket {
             incoming_tx,
+            incoming_generation,
             outgoing_rx,
         }) => {
             if let Some(ws) = ws_upgrade {
-                ws.on_upgrade(move |socket| bridge_websocket(socket, incoming_tx, outgoing_rx))
-                    .into_response()
+                ws.on_upgrade(move |socket| {
+                    bridge_websocket(socket, incoming_tx, incoming_generation, outgoing_rx)
+                })
+                .into_response()
             } else {
                 raw_response_to_axum(&RawResponse {
                     status: 400,
@@ -1187,6 +1192,7 @@ async fn handle_axum_request(
 async fn bridge_websocket(
     socket: axum::extract::ws::WebSocket,
     incoming_tx: tokio::sync::mpsc::Sender<WsMsg>,
+    incoming_generation: tokio::sync::watch::Sender<u64>,
     mut outgoing_rx: tokio::sync::mpsc::Receiver<WsMsg>,
 ) {
     use axum::extract::ws::Message;
@@ -1198,6 +1204,7 @@ async fn bridge_websocket(
     // become `WsMsg::Text`, binary frames `WsMsg::Binary`; ping/pong are handled
     // by axum and ignored here.
     let incoming_tx_clone = incoming_tx.clone();
+    let incoming_generation_clone = incoming_generation.clone();
     let recv_task = tokio::spawn(async move {
         while let Some(Ok(msg)) = ws_stream.next().await {
             let forwarded = match msg {
@@ -1211,8 +1218,13 @@ async fn bridge_websocket(
             if forwarded.is_err() {
                 break;
             }
+            incoming_generation_clone
+                .send_modify(|generation| *generation = generation.wrapping_add(1));
         }
-        // Signal to the evaluator that the client disconnected by dropping the sender
+        // Publish shutdown before the last receive-loop sender drops so every
+        // parked evaluator receive gets a final queue/disconnect recheck.
+        incoming_generation_clone
+            .send_modify(|generation| *generation = generation.wrapping_add(1));
         drop(incoming_tx_clone);
     });
 
@@ -1350,48 +1362,119 @@ fn handle_sse_response(
     }
 }
 
-/// VM-thread readiness probe for the server-side `ws/recv`'s cooperative
-/// runtime path: scans the per-connection incoming channel with `try_recv`
-/// (never moving the receiver off the VM thread, so a cancel can't strand
-/// it). Mirrors `ws.rs`'s `WsRecvProbe` (the client-side twin) — same shape,
-/// different message/channel types, so an IDLE server-side WebSocket
-/// handler parked here still lets [`await_runtime_until`](crate::io::await_runtime_until)
-/// drive sibling tasks (the plain-HTTP accept loop, other connections)
-/// instead of pinning the VM thread the way `blocking_recv` did.
-struct ServerWsRecvProbe {
-    in_rx: std::rc::Rc<std::cell::RefCell<Option<tokio::sync::mpsc::Receiver<WsMsg>>>>,
+const SERVER_WS_RECV_COMPLETION_KIND: u64 = 0x7377_7372; // "swsr"
+
+type ServerWsReceiverCell =
+    std::rc::Rc<std::cell::RefCell<Option<tokio::sync::mpsc::Receiver<WsMsg>>>>;
+
+/// Rechecks the VM-owned incoming receiver after every generation wake. The
+/// watch handle contains no `Value`, and cancellation drops only its cloned
+/// receiver while leaving the installed message receiver usable.
+struct ServerWsRecvContinuation {
+    in_rx: ServerWsReceiverCell,
+    incoming_generation: tokio::sync::watch::Receiver<u64>,
 }
 
-impl sema_core::runtime::Trace for ServerWsRecvProbe {
+impl sema_core::runtime::Trace for ServerWsRecvContinuation {
     fn trace(&self, _sink: &mut dyn FnMut(sema_core::cycle::GcEdge<'_>)) -> bool {
-        // Holds no `Value` — the receiver handle isn't one.
         true
     }
 }
 
-impl crate::io::RuntimePoll for ServerWsRecvProbe {
-    fn poll(&mut self) -> crate::io::RuntimePollResult {
-        use tokio::sync::mpsc::error::TryRecvError;
-        let mut rx_opt = self.in_rx.borrow_mut();
-        let Some(rx) = rx_opt.as_mut() else {
-            // Already closed by an earlier recv/close — resolve to nil
-            // immediately rather than parking forever.
-            return crate::io::RuntimePollResult::Ready(Value::nil());
-        };
-        match rx.try_recv() {
-            Ok(WsMsg::Text(text)) => crate::io::RuntimePollResult::Ready(Value::string(&text)),
-            Ok(WsMsg::Binary(bytes)) => {
-                crate::io::RuntimePollResult::Ready(Value::bytevector(bytes))
+impl sema_core::runtime::NativeContinuation for ServerWsRecvContinuation {
+    fn resume(
+        self: Box<Self>,
+        _context: &mut sema_core::runtime::NativeCallContext<'_>,
+        input: sema_core::runtime::ResumeInput,
+    ) -> sema_core::runtime::NativeResult {
+        use sema_core::runtime::ResumeInput;
+
+        match input {
+            ResumeInput::Returned(_) => {
+                suspend_server_ws_receive(self.in_rx, self.incoming_generation)
             }
-            Err(TryRecvError::Empty) => {
-                crate::io::RuntimePollResult::PendingAfter(std::time::Duration::from_millis(5))
-            }
-            Err(TryRecvError::Disconnected) => {
-                *rx_opt = None;
-                crate::io::RuntimePollResult::Ready(Value::nil())
-            }
+            ResumeInput::Failed(error) => Err(error),
+            ResumeInput::Cancelled(reason) => Err(SemaError::eval(format!(
+                "ws/recv was cancelled ({reason:?})"
+            ))),
+            ResumeInput::Runtime(_) => Err(SemaError::eval(
+                "ws/recv continuation received an unexpected runtime response",
+            )),
         }
     }
+}
+
+/// Check the incoming queue without moving its receiver off the VM thread.
+/// `None` means the queue is empty; a cleared or disconnected receiver is a
+/// ready `nil` result.
+fn try_server_ws_message(in_rx: &ServerWsReceiverCell) -> Option<Value> {
+    use tokio::sync::mpsc::error::TryRecvError;
+
+    let mut rx_opt = in_rx.borrow_mut();
+    let Some(rx) = rx_opt.as_mut() else {
+        return Some(Value::nil());
+    };
+    match rx.try_recv() {
+        Ok(WsMsg::Text(text)) => Some(Value::string(&text)),
+        Ok(WsMsg::Binary(bytes)) => Some(Value::bytevector(bytes)),
+        Err(TryRecvError::Empty) => None,
+        Err(TryRecvError::Disconnected) => {
+            *rx_opt = None;
+            Some(Value::nil())
+        }
+    }
+}
+
+async fn wait_for_server_ws_generation(
+    mut incoming_generation: tokio::sync::watch::Receiver<u64>,
+) -> Result<(), String> {
+    let _ = incoming_generation.changed().await;
+    Ok(())
+}
+
+fn arm_server_ws_generation(
+    incoming_generation: &tokio::sync::watch::Receiver<u64>,
+) -> tokio::sync::watch::Receiver<u64> {
+    let mut armed = incoming_generation.clone();
+    armed.borrow_and_update();
+    armed
+}
+
+/// Arm a lossless generation wait before the final VM-thread queue check. A
+/// message queued before the snapshot is visible to `try_recv`; a later queue
+/// publication advances the generation and wakes the continuation.
+fn suspend_server_ws_receive(
+    in_rx: ServerWsReceiverCell,
+    incoming_generation: tokio::sync::watch::Receiver<u64>,
+) -> sema_core::runtime::NativeResult {
+    let wait_generation = arm_server_ws_generation(&incoming_generation);
+    if let Some(value) = try_server_ws_message(&in_rx) {
+        return Ok(NativeOutcome::Return(value));
+    }
+
+    let continuation: Box<dyn sema_core::runtime::NativeContinuation> =
+        Box::new(ServerWsRecvContinuation {
+            in_rx,
+            incoming_generation,
+        });
+    let kind = sema_core::runtime::CompletionKind::try_from_raw(SERVER_WS_RECV_COMPLETION_KIND)
+        .expect("server websocket receive completion kind is nonzero");
+    crate::runtime_offload::external_io_async_try_with_continuation(
+        "ws/recv",
+        kind,
+        "server ws/recv/generation",
+        |()| Ok(Value::nil()),
+        continuation,
+        move || wait_for_server_ws_generation(wait_generation),
+    )
+}
+
+fn close_server_ws_receiver(
+    in_rx: &ServerWsReceiverCell,
+    incoming_generation: &tokio::sync::watch::Sender<u64>,
+) {
+    in_rx.borrow_mut().take();
+    incoming_generation.send_modify(|generation| *generation = generation.wrapping_add(1));
 }
 
 /// Resumes once a runtime-dispatched WebSocket handler call (see
@@ -1442,7 +1525,7 @@ impl sema_core::runtime::NativeContinuation for WsHandlerContinuation {
 /// (the same mechanism `AcceptLoopContinuation` uses to invoke the
 /// per-connection dispatch factory), so `in_runtime_quantum()` stays true for
 /// the handler's whole body — including any nested `(:recv conn)` — and the
-/// connection's `recv_fn` (below) can suspend structurally on a timer
+/// connection's `recv_fn` (below) can suspend on an External generation
 /// wait instead of blocking the VM thread. This is what makes an idle
 /// WebSocket non-blocking for its siblings (SRV-1 piece c).
 fn handle_ws_response_runtime(
@@ -1458,10 +1541,12 @@ fn handle_ws_response_runtime(
     let ws_handler = map.get(&Value::keyword("__ws_handler")).cloned().unwrap();
 
     let (in_tx, in_rx) = tokio::sync::mpsc::channel::<WsMsg>(256);
+    let (incoming_generation_tx, incoming_generation) = tokio::sync::watch::channel(0_u64);
     let (out_tx, out_rx) = tokio::sync::mpsc::channel::<WsMsg>(256);
 
     let _ = respond.send(ServerResponse::WebSocket {
         incoming_tx: in_tx,
+        incoming_generation: incoming_generation_tx.clone(),
         outgoing_rx: out_rx,
     });
 
@@ -1495,6 +1580,7 @@ fn handle_ws_response_runtime(
     let in_rx = Rc::new(RefCell::new(Some(in_rx)));
     let in_rx_for_recv_legacy = in_rx.clone();
     let in_rx_for_recv_runtime = in_rx.clone();
+    let incoming_generation_for_recv_runtime = incoming_generation.clone();
     let recv_fn = Value::native_fn(NativeFn::simple_with_runtime(
         "ws/recv",
         move |args| {
@@ -1521,13 +1607,9 @@ fn handle_ws_response_runtime(
             // other cooperative op in this codebase (see `ws.rs`'s
             // `ws_recv`).
             if sema_core::in_runtime_quantum() {
-                let probe = ServerWsRecvProbe {
-                    in_rx: in_rx_for_recv_runtime.clone(),
-                };
-                return crate::io::await_runtime_until(
-                    Box::new(probe),
-                    std::time::Instant::now(),
-                    u64::MAX,
+                return suspend_server_ws_receive(
+                    in_rx_for_recv_runtime.clone(),
+                    incoming_generation_for_recv_runtime.clone(),
                 );
             }
             let mut rx_opt = in_rx_for_recv_runtime.borrow_mut();
@@ -1548,11 +1630,11 @@ fn handle_ws_response_runtime(
 
     let out_tx_for_close = out_tx;
     let in_rx_for_close = in_rx;
+    let incoming_generation_for_close = incoming_generation_tx;
     let close_fn = Value::native_fn(NativeFn::simple("ws/close", move |args| {
         check_arity!(args, "ws/close", 0);
         out_tx_for_close.borrow_mut().take();
-        let mut rx_opt = in_rx_for_close.borrow_mut();
-        *rx_opt = None;
+        close_server_ws_receiver(&in_rx_for_close, &incoming_generation_for_close);
         Ok(Value::nil())
     }));
 
@@ -1593,11 +1675,13 @@ fn handle_ws_response(
 
     // Create bidirectional channels
     let (in_tx, in_rx) = tokio::sync::mpsc::channel::<WsMsg>(256); // client -> evaluator
+    let (incoming_generation_tx, _incoming_generation) = tokio::sync::watch::channel(0_u64);
     let (out_tx, out_rx) = tokio::sync::mpsc::channel::<WsMsg>(256); // evaluator -> client
 
     // Send channels to axum for WebSocket bridging
     let _ = respond.send(ServerResponse::WebSocket {
         incoming_tx: in_tx,
+        incoming_generation: incoming_generation_tx.clone(),
         outgoing_rx: out_rx,
     });
 
@@ -1662,14 +1746,14 @@ fn handle_ws_response(
 
     let out_tx_for_close = out_tx;
     let in_rx_for_close = in_rx;
+    let incoming_generation_for_close = incoming_generation_tx;
     let close_fn = Value::native_fn(NativeFn::simple("ws/close", move |args| {
         check_arity!(args, "ws/close", 0);
         // Take + drop the sole outgoing sender: this closes `out_rx`, so axum's
         // send task exits and the socket actually closes.
         out_tx_for_close.borrow_mut().take();
         // Drop the incoming receiver too.
-        let mut rx_opt = in_rx_for_close.borrow_mut();
-        *rx_opt = None;
+        close_server_ws_receiver(&in_rx_for_close, &incoming_generation_for_close);
         Ok(Value::nil())
     }));
 
@@ -2384,71 +2468,152 @@ mod tests {
         assert_eq!(edges, 0, "WsHandlerContinuation must trace no Value edges");
     }
 
-    // `ServerWsRecvProbe` holds a channel receiver handle, not a `Value` — its
-    // `Trace` MUST also report zero edges (it rides across the timer park
-    // the same way `WsRecvProbe`, its client-side twin in `ws.rs`, does).
     #[test]
-    fn server_ws_recv_probe_traces_no_edges() {
-        use sema_core::runtime::Trace;
-        let (_tx, rx) = tokio::sync::mpsc::channel::<WsMsg>(4);
-        let probe = ServerWsRecvProbe {
-            in_rx: std::rc::Rc::new(std::cell::RefCell::new(Some(rx))),
+    fn server_ws_generation_response_wakes_every_receiver_clone() {
+        let (incoming_tx, _incoming_rx) = tokio::sync::mpsc::channel::<WsMsg>(1);
+        let (incoming_generation, generation_rx) = tokio::sync::watch::channel(0_u64);
+        let (_outgoing_tx, outgoing_rx) = tokio::sync::mpsc::channel::<WsMsg>(1);
+        let response = ServerResponse::WebSocket {
+            incoming_tx,
+            incoming_generation,
+            outgoing_rx,
         };
-        let mut edges = 0usize;
-        probe.trace(&mut |edge| {
-            if let sema_core::cycle::GcEdge::Value(_) = edge {
-                edges += 1;
-            }
+        let ServerResponse::WebSocket {
+            incoming_generation,
+            ..
+        } = response
+        else {
+            unreachable!("constructed a websocket response")
+        };
+        let first = arm_server_ws_generation(&generation_rx);
+        let second = arm_server_ws_generation(&generation_rx);
+
+        sema_io::io_block_on(async {
+            let first_wait = wait_for_server_ws_generation(first);
+            let second_wait = wait_for_server_ws_generation(second);
+            incoming_generation.send_modify(|generation| *generation += 1);
+            tokio::time::timeout(std::time::Duration::from_millis(100), async {
+                let (first_result, second_result) = tokio::join!(first_wait, second_wait);
+                first_result.expect("first generation wait must succeed");
+                second_result.expect("second generation wait must succeed");
+            })
+            .await
+            .expect("one generation must wake every receiver clone");
         });
-        assert_eq!(edges, 0, "ServerWsRecvProbe must trace no Value edges");
     }
 
-    // `ServerWsRecvProbe::poll` is the cooperative core of server-side
-    // `ws/recv`: empty channel -> PendingAfter (keep waiting, lets the runtime
-    // drive siblings), a queued message -> Ready(..) with the right shape, a
-    // disconnected channel -> Ready(nil) and clears the cell so a second poll
-    // doesn't re-touch a dropped receiver.
     #[test]
-    fn server_ws_recv_probe_poll_resolves_message_then_disconnect() {
-        use crate::io::{RuntimePoll, RuntimePollResult};
-        let (tx, rx) = tokio::sync::mpsc::channel::<WsMsg>(4);
-        let cell = std::rc::Rc::new(std::cell::RefCell::new(Some(rx)));
-        let mut probe = ServerWsRecvProbe {
-            in_rx: cell.clone(),
+    fn server_ws_generation_dropping_wait_preserves_installed_receiver() {
+        let (incoming_tx, incoming_rx) = tokio::sync::mpsc::channel::<WsMsg>(1);
+        let (_generation_tx, generation_rx) = tokio::sync::watch::channel(0_u64);
+        let in_rx = std::rc::Rc::new(std::cell::RefCell::new(Some(incoming_rx)));
+        let wait = wait_for_server_ws_generation(arm_server_ws_generation(&generation_rx));
+
+        drop(wait);
+        assert!(
+            in_rx.borrow().is_some(),
+            "cancelling a wait must leave the VM-owned receiver installed"
+        );
+        incoming_tx
+            .try_send(WsMsg::Text("still-open".to_string()))
+            .unwrap();
+        let value = try_server_ws_message(&in_rx).expect("queued message must be ready");
+        assert_eq!(value.as_str(), Some("still-open"));
+    }
+
+    #[test]
+    fn server_ws_generation_queued_text_and_binary_win_immediately() {
+        let (incoming_tx, incoming_rx) = tokio::sync::mpsc::channel::<WsMsg>(2);
+        let in_rx = std::rc::Rc::new(std::cell::RefCell::new(Some(incoming_rx)));
+        incoming_tx.try_send(WsMsg::Text("hi".to_string())).unwrap();
+        incoming_tx.try_send(WsMsg::Binary(vec![1, 2, 3])).unwrap();
+
+        let text = try_server_ws_message(&in_rx).expect("text must be ready");
+        assert_eq!(text.as_str(), Some("hi"));
+        let binary = try_server_ws_message(&in_rx).expect("binary must be ready");
+        assert_eq!(binary.as_bytevector(), Some([1, 2, 3].as_slice()));
+    }
+
+    #[test]
+    fn server_ws_generation_disconnect_wakes_and_resolves_nil() {
+        let (incoming_tx, incoming_rx) = tokio::sync::mpsc::channel::<WsMsg>(1);
+        let (generation_tx, generation_rx) = tokio::sync::watch::channel(0_u64);
+        let in_rx = std::rc::Rc::new(std::cell::RefCell::new(Some(incoming_rx)));
+        let wait = wait_for_server_ws_generation(arm_server_ws_generation(&generation_rx));
+
+        drop(incoming_tx);
+        drop(generation_tx);
+        sema_io::io_block_on(async {
+            tokio::time::timeout(std::time::Duration::from_millis(100), wait)
+                .await
+                .expect("closing the generation sender must wake the wait")
+                .expect("generation closure is a readiness wake");
+        });
+        let value = try_server_ws_message(&in_rx).expect("disconnect must be ready");
+        assert!(value.is_nil());
+        assert!(in_rx.borrow().is_none());
+    }
+
+    #[test]
+    fn server_ws_generation_explicit_close_wakes_pending_receive() {
+        let (_incoming_tx, incoming_rx) = tokio::sync::mpsc::channel::<WsMsg>(1);
+        let (generation_tx, generation_rx) = tokio::sync::watch::channel(0_u64);
+        let in_rx = std::rc::Rc::new(std::cell::RefCell::new(Some(incoming_rx)));
+        let wait = wait_for_server_ws_generation(arm_server_ws_generation(&generation_rx));
+
+        close_server_ws_receiver(&in_rx, &generation_tx);
+        sema_io::io_block_on(async {
+            tokio::time::timeout(std::time::Duration::from_millis(100), wait)
+                .await
+                .expect("explicit close must wake the pending receive")
+                .expect("explicit close generation wait must succeed");
+        });
+        let value = try_server_ws_message(&in_rx).expect("cleared receiver must be ready");
+        assert!(value.is_nil());
+    }
+
+    #[test]
+    fn server_ws_generation_continuation_rearms_after_coalesced_empty_wake() {
+        use sema_core::runtime::{
+            CancellationView, NativeCallContext, NativeContinuation, ResumeInput, TaskContext,
+            WaitKind,
         };
 
-        // Empty: keep waiting.
-        assert!(matches!(
-            probe.poll(),
-            RuntimePollResult::PendingAfter(delay)
-                if delay == std::time::Duration::from_millis(5)
-        ));
+        let (_incoming_tx, incoming_rx) = tokio::sync::mpsc::channel::<WsMsg>(1);
+        let (generation_tx, incoming_generation) = tokio::sync::watch::channel(0_u64);
+        generation_tx.send_modify(|generation| *generation += 1);
+        let continuation = ServerWsRecvContinuation {
+            in_rx: std::rc::Rc::new(std::cell::RefCell::new(Some(incoming_rx))),
+            incoming_generation,
+        };
+        let mut task_context = TaskContext::empty();
+        let mut native_context = NativeCallContext {
+            task_context: &mut task_context,
+            cancellation: CancellationView::default(),
+        };
 
-        // A queued text message resolves immediately.
-        tx.try_send(WsMsg::Text("hi".to_string())).unwrap();
-        match probe.poll() {
-            RuntimePollResult::Ready(value) => assert_eq!(value.as_str(), Some("hi")),
-            other => panic!("expected Ready(\"hi\"), got {other:?}"),
-        }
+        let outcome = Box::new(continuation)
+            .resume(&mut native_context, ResumeInput::Returned(Value::nil()))
+            .expect("coalesced wake must recheck and rearm");
+        let NativeOutcome::Suspend(suspend) = outcome else {
+            panic!("an empty queue after a coalesced wake must suspend again");
+        };
+        assert!(matches!(suspend.wait, WaitKind::External(_)));
+    }
 
-        // Dropping every sender disconnects the channel; poll resolves to nil
-        // and clears the cell.
-        drop(tx);
-        match probe.poll() {
-            RuntimePollResult::Ready(value) => assert!(value.is_nil()),
-            other => panic!("expected Ready(nil) on disconnect, got {other:?}"),
-        }
-        assert!(
-            cell.borrow().is_none(),
-            "poll must clear the cell on disconnect"
-        );
+    #[test]
+    fn server_ws_generation_continuation_traces_no_value_edges() {
+        use sema_core::runtime::Trace;
 
-        // A second poll after the cell is cleared must not panic — it
-        // resolves to nil immediately instead of touching a dropped receiver.
-        assert!(matches!(
-            probe.poll(),
-            RuntimePollResult::Ready(value) if value.is_nil()
-        ));
+        let (_incoming_tx, incoming_rx) = tokio::sync::mpsc::channel::<WsMsg>(1);
+        let (_generation_tx, incoming_generation) = tokio::sync::watch::channel(0_u64);
+        let continuation = ServerWsRecvContinuation {
+            in_rx: std::rc::Rc::new(std::cell::RefCell::new(Some(incoming_rx))),
+            incoming_generation,
+        };
+        let mut edges = 0;
+        assert!(continuation.trace(&mut |_| edges += 1));
+        assert_eq!(edges, 0);
     }
 
     // Regression guard for the real production send path: the actual

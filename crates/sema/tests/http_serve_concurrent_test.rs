@@ -212,7 +212,8 @@ fn slow_handler_does_not_block_fast_handler() {
 /// **Scenario 2 — the documented head-of-line pathology.** A WebSocket handler
 /// idling in `ws/recv` on one connection must not prevent a second connection's
 /// plain HTTP request from being served. The WS client connects and stays
-/// silent; a plain `/ping` GET must still complete within a bounded time.
+/// silent; a plain `/ping` GET must still complete within a bounded time, then
+/// a text frame must wake the parked handler and round-trip through its echo.
 ///
 /// This is the strongest failing-first demonstrator: against the shipped serial
 /// loop the WS handler's `ws/recv` (`blocking_recv`) pins the single evaluator
@@ -242,12 +243,22 @@ fn idle_websocket_does_not_block_plain_request() {
     let ws_url = format!("ws://127.0.0.1:{port}/ws");
     let ws = tungstenite::connect(&ws_url);
     assert!(ws.is_ok(), "WS upgrade failed: {:?}", ws.err());
-    let (_socket, _resp) = ws.unwrap();
+    let (mut socket, _resp) = ws.unwrap();
+    match socket.get_mut() {
+        tungstenite::stream::MaybeTlsStream::Plain(stream) => stream
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .expect("set bounded WebSocket read timeout"),
+        _ => panic!("loopback ws:// connection must use a plain TCP stream"),
+    }
 
     // A plain request must still be served promptly despite the idle WS handler.
     let ping = bounded(Duration::from_secs(3), move || {
         http_get_body(port, "/ping", Duration::from_secs(3))
     });
+
+    let echo = socket
+        .send(tungstenite::Message::Text("generation-wake".into()))
+        .and_then(|()| socket.read());
 
     child.kill().ok();
     child.wait().ok();
@@ -256,6 +267,13 @@ fn idle_websocket_does_not_block_plain_request() {
         ping.as_deref(),
         Ok("pong"),
         "plain request blocked behind an idle WebSocket handler (head-of-line)"
+    );
+    assert_eq!(
+        echo.expect("published incoming generation must wake the handler")
+            .into_text()
+            .expect("echo must be a text frame"),
+        "generation-wake",
+        "WebSocket message generation did not wake the parked handler"
     );
 }
 

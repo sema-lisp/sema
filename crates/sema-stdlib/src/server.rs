@@ -1370,21 +1370,25 @@ impl sema_core::runtime::Trace for ServerWsRecvProbe {
 }
 
 impl crate::io::RuntimePoll for ServerWsRecvProbe {
-    fn poll(&mut self) -> Option<Result<Value, String>> {
+    fn poll(&mut self) -> crate::io::RuntimePollResult {
         use tokio::sync::mpsc::error::TryRecvError;
         let mut rx_opt = self.in_rx.borrow_mut();
         let Some(rx) = rx_opt.as_mut() else {
             // Already closed by an earlier recv/close — resolve to nil
             // immediately rather than parking forever.
-            return Some(Ok(Value::nil()));
+            return crate::io::RuntimePollResult::Ready(Value::nil());
         };
         match rx.try_recv() {
-            Ok(WsMsg::Text(s)) => Some(Ok(Value::string(&s))),
-            Ok(WsMsg::Binary(b)) => Some(Ok(Value::bytevector(b))),
-            Err(TryRecvError::Empty) => None,
+            Ok(WsMsg::Text(text)) => crate::io::RuntimePollResult::Ready(Value::string(&text)),
+            Ok(WsMsg::Binary(bytes)) => {
+                crate::io::RuntimePollResult::Ready(Value::bytevector(bytes))
+            }
+            Err(TryRecvError::Empty) => {
+                crate::io::RuntimePollResult::PendingAfter(std::time::Duration::from_millis(5))
+            }
             Err(TryRecvError::Disconnected) => {
                 *rx_opt = None;
-                Some(Ok(Value::nil()))
+                crate::io::RuntimePollResult::Ready(Value::nil())
             }
         }
     }
@@ -1438,7 +1442,7 @@ impl sema_core::runtime::NativeContinuation for WsHandlerContinuation {
 /// (the same mechanism `AcceptLoopContinuation` uses to invoke the
 /// per-connection dispatch factory), so `in_runtime_quantum()` stays true for
 /// the handler's whole body — including any nested `(:recv conn)` — and the
-/// connection's `recv_fn` (below) can suspend structurally on an External
+/// connection's `recv_fn` (below) can suspend structurally on a timer
 /// wait instead of blocking the VM thread. This is what makes an idle
 /// WebSocket non-blocking for its siblings (SRV-1 piece c).
 fn handle_ws_response_runtime(
@@ -2381,7 +2385,7 @@ mod tests {
     }
 
     // `ServerWsRecvProbe` holds a channel receiver handle, not a `Value` — its
-    // `Trace` MUST also report zero edges (it rides across the External park
+    // `Trace` MUST also report zero edges (it rides across the timer park
     // the same way `WsRecvProbe`, its client-side twin in `ws.rs`, does).
     #[test]
     fn server_ws_recv_probe_traces_no_edges() {
@@ -2400,13 +2404,13 @@ mod tests {
     }
 
     // `ServerWsRecvProbe::poll` is the cooperative core of server-side
-    // `ws/recv`: empty channel -> None (keep waiting, lets the runtime drive
-    // siblings), a queued message -> Some(Ok(..)) with the right shape, a
-    // disconnected channel -> Some(Ok(nil)) and clears the cell so a second
-    // poll doesn't re-touch a dropped receiver.
+    // `ws/recv`: empty channel -> PendingAfter (keep waiting, lets the runtime
+    // drive siblings), a queued message -> Ready(..) with the right shape, a
+    // disconnected channel -> Ready(nil) and clears the cell so a second poll
+    // doesn't re-touch a dropped receiver.
     #[test]
     fn server_ws_recv_probe_poll_resolves_message_then_disconnect() {
-        use crate::io::RuntimePoll;
+        use crate::io::{RuntimePoll, RuntimePollResult};
         let (tx, rx) = tokio::sync::mpsc::channel::<WsMsg>(4);
         let cell = std::rc::Rc::new(std::cell::RefCell::new(Some(rx)));
         let mut probe = ServerWsRecvProbe {
@@ -2414,21 +2418,25 @@ mod tests {
         };
 
         // Empty: keep waiting.
-        assert!(probe.poll().is_none());
+        assert!(matches!(
+            probe.poll(),
+            RuntimePollResult::PendingAfter(delay)
+                if delay == std::time::Duration::from_millis(5)
+        ));
 
         // A queued text message resolves immediately.
         tx.try_send(WsMsg::Text("hi".to_string())).unwrap();
         match probe.poll() {
-            Some(Ok(v)) => assert_eq!(v.as_str(), Some("hi")),
-            other => panic!("expected Some(Ok(\"hi\")), got {other:?}"),
+            RuntimePollResult::Ready(value) => assert_eq!(value.as_str(), Some("hi")),
+            other => panic!("expected Ready(\"hi\"), got {other:?}"),
         }
 
         // Dropping every sender disconnects the channel; poll resolves to nil
         // and clears the cell.
         drop(tx);
         match probe.poll() {
-            Some(Ok(v)) => assert!(v.is_nil()),
-            other => panic!("expected Some(Ok(nil)) on disconnect, got {other:?}"),
+            RuntimePollResult::Ready(value) => assert!(value.is_nil()),
+            other => panic!("expected Ready(nil) on disconnect, got {other:?}"),
         }
         assert!(
             cell.borrow().is_none(),
@@ -2437,7 +2445,10 @@ mod tests {
 
         // A second poll after the cell is cleared must not panic — it
         // resolves to nil immediately instead of touching a dropped receiver.
-        assert!(matches!(probe.poll(), Some(Ok(v)) if v.is_nil()));
+        assert!(matches!(
+            probe.poll(),
+            RuntimePollResult::Ready(value) if value.is_nil()
+        ));
     }
 
     // Regression guard for the real production send path: the actual

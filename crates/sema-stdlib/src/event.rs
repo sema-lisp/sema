@@ -71,6 +71,42 @@ struct SourcesProbe {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
+impl SourcesProbe {
+    fn next_check_after(&self) -> Duration {
+        let next_timer = self
+            .sources
+            .iter()
+            .filter_map(|source| {
+                let map = source.as_map_ref()?;
+                (map.get(&kw("type")) == Some(&kw("timer"))).then(|| {
+                    let ms = map
+                        .get(&kw("ms"))
+                        .and_then(|value| value.as_int())
+                        .unwrap_or(0)
+                        .max(0) as u128;
+                    Duration::from_millis(
+                        ms.saturating_sub(self.started.elapsed().as_millis()) as u64
+                    )
+                })
+            })
+            .min();
+
+        let has_vm_probe = self.sources.iter().any(|source| {
+            match source.as_map_ref().and_then(|map| map.get(&kw("type"))) {
+                Some(kind) => kind != &kw("timer"),
+                None => true,
+            }
+        });
+
+        match (has_vm_probe, next_timer) {
+            (false, Some(timer)) => timer,
+            (true, Some(timer)) => timer.min(Duration::from_millis(5)),
+            (true, None) | (false, None) => Duration::from_millis(5),
+        }
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 impl sema_core::runtime::Trace for SourcesProbe {
     fn trace(&self, sink: &mut dyn FnMut(sema_core::cycle::GcEdge<'_>)) -> bool {
         for s in &self.sources {
@@ -82,10 +118,15 @@ impl sema_core::runtime::Trace for SourcesProbe {
 
 #[cfg(not(target_arch = "wasm32"))]
 impl crate::io::RuntimePoll for SourcesProbe {
-    fn poll(&mut self) -> Option<Result<Value, String>> {
-        self.sources
+    fn poll(&mut self) -> crate::io::RuntimePollResult {
+        if let Some(value) = self
+            .sources
             .iter()
-            .find_map(|s| ready(s, self.started).map(Ok))
+            .find_map(|source| ready(source, self.started))
+        {
+            return crate::io::RuntimePollResult::Ready(value);
+        }
+        crate::io::RuntimePollResult::PendingAfter(self.next_check_after())
     }
 }
 
@@ -162,7 +203,7 @@ pub fn register(env: &sema_core::Env) {
 
     // event/select — first ready source, or nil on timeout. Registered dual-ABI:
     // the value body serves the sync + legacy-scheduler paths; under the unified
-    // runtime the runtime body yields a cooperative External-sleep poll so a TUI
+    // runtime the runtime body yields a cooperative structural-timer poll so a TUI
     // "input OR agent progress" loop overlaps siblings without the legacy
     // `AwaitIo` bridge (crates/sema/tests/vm_async_test.rs asserts the yield).
     register_event_select(env);
@@ -201,6 +242,15 @@ fn register_event_select(env: &sema_core::Env) {
 mod tests {
     use super::*;
     use sema_core::EvalContext;
+
+    fn source(kind: &str, fields: &[(&str, Value)]) -> Value {
+        let mut map = BTreeMap::new();
+        map.insert(kw("type"), kw(kind));
+        for (key, value) in fields {
+            map.insert(kw(key), value.clone());
+        }
+        Value::map(map)
+    }
 
     fn env() -> sema_core::Env {
         let e = sema_core::Env::new();
@@ -245,5 +295,36 @@ mod tests {
             &[Value::list(vec![Value::map(src)]), Value::int(20)],
         );
         assert!(ev.is_nil());
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn sources_probe_uses_earliest_timer_deadline() {
+        let probe = SourcesProbe {
+            sources: vec![
+                source("timer", &[("ms", Value::int(100))]),
+                source("timer", &[("ms", Value::int(25))]),
+            ],
+            started: Instant::now(),
+        };
+
+        let delay = probe.next_check_after();
+        assert!((Duration::ZERO..=Duration::from_millis(25)).contains(&delay));
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn sources_probe_caps_vm_probe_delay() {
+        let probe = SourcesProbe {
+            sources: vec![
+                source("timer", &[("ms", Value::int(100))]),
+                source("timer", &[("ms", Value::int(25))]),
+                source("proc", &[("handle", Value::int(999999))]),
+            ],
+            started: Instant::now(),
+        };
+
+        let delay = probe.next_check_after();
+        assert!((Duration::ZERO..=Duration::from_millis(5)).contains(&delay));
     }
 }

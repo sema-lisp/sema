@@ -1394,21 +1394,19 @@ pub(crate) fn poll_key_event(_ms: u64) -> Option<Value> {
 // The unified-runtime analog of [`await_io_until`]: `io/read-key-timeout` and
 // `event/select` must poll a readiness source that lives ENTIRELY on the VM
 // thread (stdin, a `proc/*` handle registry, elapsed timers) — none of it is
-// `Send`, so it can't move onto a worker like a file read. Instead of the legacy
-// untraced `IoHandle`, the runtime path re-checks the source on the VM thread and
-// yields a SHORT executor sleep between scans (a `WaitKind::External` bounded
-// job, like `sleep`), so sibling tasks run while it waits. The readiness probe
-// (which may hold Sema `Value`s — e.g. `event/select`'s source maps) rides in the
-// resume continuation and is GC-traced, unlike `await_io_until`'s boxed closure.
+// `Send`, so it can't move onto a worker like a file read. The runtime path
+// re-checks the source on the VM thread and parks on a structural timer between
+// scans, so sibling tasks run while it waits. The readiness probe (which may hold
+// Sema `Value`s — e.g. `event/select`'s source maps) rides in the resume
+// continuation and is GC-traced, unlike `await_io_until`'s boxed closure.
 
-/// Completion tag for a cooperative runtime poll's inter-scan sleep. Only needs
-/// consistency between issue and prepared op; not a uniqueness key.
 #[cfg(not(target_arch = "wasm32"))]
-const RUNTIME_POLL_COMPLETION_KIND: u64 = 0x696f_706c; // "iopl"
-/// Milliseconds slept off the VM thread between readiness scans — short enough to
-/// keep a TUI/event loop responsive, off-thread so it never stalls siblings.
-#[cfg(not(target_arch = "wasm32"))]
-const RUNTIME_POLL_INTERVAL_MS: u64 = 5;
+#[derive(Debug)]
+pub(crate) enum RuntimePollResult {
+    Ready(Value),
+    Failed(String),
+    PendingAfter(Duration),
+}
 
 /// A VM-thread readiness probe for [`await_runtime_until`]. Runs entirely on the
 /// VM thread each scan, so it MAY hold Sema `Value`s (`event/select`'s source
@@ -1417,16 +1415,14 @@ const RUNTIME_POLL_INTERVAL_MS: u64 = 5;
 /// `IoHandle`.
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) trait RuntimePoll: Trace {
-    /// Poll once: `Some(Ok(v))` ready (resolve to `v`), `Some(Err(e))` reject the
-    /// task with `e`, `None` keep waiting.
-    fn poll(&mut self) -> Option<Result<Value, String>>;
+    fn poll(&mut self) -> RuntimePollResult;
 }
 
 /// Cooperatively poll `probe` under the unified runtime until it yields a value
 /// or `timeout_ms` milliseconds have elapsed since `started` (then nil), yielding
-/// a short off-VM-thread sleep between scans so siblings overlap. Returns on the
-/// runtime native ABI (`NativeOutcome::Suspend`/`Return`). The runtime-native twin
-/// of [`await_io_until`].
+/// a structural timer between scans so siblings overlap. Returns on the runtime
+/// native ABI (`NativeOutcome::Suspend`/`Return`). The runtime-native twin of
+/// [`await_io_until`].
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn await_runtime_until(
     probe: Box<dyn RuntimePoll>,
@@ -1437,36 +1433,30 @@ pub(crate) fn await_runtime_until(
 }
 
 /// One scan of the cooperative poll: check the probe on the VM thread; resolve if
-/// ready, resolve to nil if the deadline passed, else re-arm the inter-scan sleep.
+/// ready, resolve to nil if the deadline passed, else park until the probe's next
+/// useful check or the overall timeout.
 #[cfg(not(target_arch = "wasm32"))]
 fn runtime_poll_step(
     mut probe: Box<dyn RuntimePoll>,
     started: std::time::Instant,
     timeout_ms: u64,
 ) -> NativeResult {
-    match probe.poll() {
-        Some(Ok(v)) => return Ok(NativeOutcome::Return(v)),
-        Some(Err(e)) => return Err(SemaError::eval(e)),
-        None => {}
-    }
-    if started.elapsed() >= Duration::from_millis(timeout_ms) {
+    let requested_delay = match probe.poll() {
+        RuntimePollResult::Ready(value) => return Ok(NativeOutcome::Return(value)),
+        RuntimePollResult::Failed(message) => return Err(SemaError::eval(message)),
+        RuntimePollResult::PendingAfter(delay) => delay,
+    };
+
+    let timeout = Duration::from_millis(timeout_ms);
+    let Some(remaining) = timeout.checked_sub(started.elapsed()) else {
+        return Ok(NativeOutcome::Return(Value::nil()));
+    };
+    if remaining.is_zero() {
         return Ok(NativeOutcome::Return(Value::nil()));
     }
-    let kind = CompletionKind::try_from_raw(RUNTIME_POLL_COMPLETION_KIND)
-        .expect("runtime poll completion kind is nonzero");
-    let bound = QuarantineBound::hard_deadline(FS_CLEANUP_DEADLINE)
-        .expect("runtime poll cleanup deadline is nonzero");
-    let prepared = PreparedExternalOperation::quarantined_blocking(
-        kind,
-        Box::new(RuntimePollDecoder),
-        bound,
-        move || {
-            std::thread::sleep(Duration::from_millis(RUNTIME_POLL_INTERVAL_MS));
-            Ok(Box::new(()) as SendPayload)
-        },
-    );
+
     Ok(NativeOutcome::Suspend(NativeSuspend {
-        wait: WaitKind::External(Box::new(prepared)),
+        wait: WaitKind::Timer(requested_delay.min(remaining)),
         continuation: Box::new(RuntimePollContinuation {
             probe: Some(probe),
             started,
@@ -1475,33 +1465,7 @@ fn runtime_poll_step(
     }))
 }
 
-/// Nil decoder for the inter-scan sleep — the readiness re-check lives in
-/// [`RuntimePollContinuation`]; the sleep itself carries no result.
-#[cfg(not(target_arch = "wasm32"))]
-struct RuntimePollDecoder;
-
-#[cfg(not(target_arch = "wasm32"))]
-impl Trace for RuntimePollDecoder {
-    fn trace(&self, _sink: &mut dyn FnMut(GcEdge<'_>)) -> bool {
-        true
-    }
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-impl CompletionDecoder for RuntimePollDecoder {
-    fn decode(
-        self: Box<Self>,
-        _context: &mut NativeCallContext<'_>,
-        result: Result<SendPayload, ExternalFailure>,
-    ) -> DecodedCompletion {
-        match result {
-            Ok(_) => Ok(Value::nil()),
-            Err(failure) => Err(SemaError::eval(failure.message().to_string())),
-        }
-    }
-}
-
-/// Resumes a parked cooperative poll after its inter-scan sleep elapses: re-check
+/// Resumes a parked cooperative poll after its structural timer elapses: re-check
 /// the probe (start the next scan, or resolve). Carries the `RuntimePoll` probe
 /// across the park and traces any `Value` it holds.
 #[cfg(not(target_arch = "wasm32"))]
@@ -1558,17 +1522,17 @@ impl Trace for KeyProbe {
 
 #[cfg(not(target_arch = "wasm32"))]
 impl RuntimePoll for KeyProbe {
-    fn poll(&mut self) -> Option<Result<Value, String>> {
+    fn poll(&mut self) -> RuntimePollResult {
         if !unix_stdin_ready(0) {
-            return None;
+            return RuntimePollResult::PendingAfter(Duration::from_millis(5));
         }
         match parse_key_input() {
-            Ok(Some(v)) => Some(Ok(v)),
+            Ok(Some(value)) => RuntimePollResult::Ready(value),
             Ok(None) => {
                 STDIN_EOF.with(|f| f.set(true));
-                Some(Ok(Value::nil()))
+                RuntimePollResult::Ready(Value::nil())
             }
-            Err(e) => Some(Err(e.to_string())),
+            Err(error) => RuntimePollResult::Failed(error.to_string()),
         }
     }
 }
@@ -1601,7 +1565,7 @@ fn read_key_timeout_value(args: &[Value]) -> Result<Value, SemaError> {
 
 /// Register `io/read-key-timeout` dual-ABI: the value body serves the sync +
 /// legacy-scheduler paths; under the unified runtime the runtime body yields a
-/// cooperative External-sleep poll ([`await_runtime_until`]) so a "key OR agent
+/// cooperative structural-timer poll ([`await_runtime_until`]) so a "key OR agent
 /// progress" loop overlaps siblings without the legacy `AwaitIo` bridge.
 #[cfg(not(target_arch = "wasm32"))]
 fn register_read_key_timeout(env: &sema_core::Env) {
@@ -2663,6 +2627,53 @@ fn register_log_fn(env: &sema_core::Env, name: &str, level: &'static str) {
             Ok(Value::nil())
         })),
     );
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod runtime_poll_tests {
+    use std::time::Instant;
+
+    use super::*;
+
+    struct PendingProbe;
+
+    impl Trace for PendingProbe {
+        fn trace(&self, _sink: &mut dyn FnMut(GcEdge<'_>)) -> bool {
+            true
+        }
+    }
+
+    impl RuntimePoll for PendingProbe {
+        fn poll(&mut self) -> RuntimePollResult {
+            RuntimePollResult::PendingAfter(Duration::from_millis(37))
+        }
+    }
+
+    #[test]
+    fn runtime_poll_pending_uses_structural_timer() {
+        let outcome = await_runtime_until(Box::new(PendingProbe), Instant::now(), 1_000)
+            .expect("pending probe suspends");
+
+        let NativeOutcome::Suspend(suspend) = outcome else {
+            panic!("pending probe must suspend");
+        };
+        match suspend.wait {
+            WaitKind::Timer(delay) => assert_eq!(delay, Duration::from_millis(37)),
+            WaitKind::External(_) => panic!("poll probe must not occupy an executor worker"),
+            _ => panic!("poll probe must use a structural timer"),
+        }
+    }
+
+    #[test]
+    fn runtime_poll_zero_timeout_returns_nil_immediately() {
+        let outcome = await_runtime_until(Box::new(PendingProbe), Instant::now(), 0)
+            .expect("zero-timeout probe returns");
+
+        let NativeOutcome::Return(value) = outcome else {
+            panic!("zero-timeout probe must not suspend");
+        };
+        assert!(value.is_nil());
+    }
 }
 
 #[cfg(all(test, unix))]

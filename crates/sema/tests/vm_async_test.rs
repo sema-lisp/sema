@@ -1562,6 +1562,17 @@ fn event_select_times_out_to_nil_in_async_context() {
     );
 }
 
+#[test]
+fn timer_only_event_select_preserves_earliest_source() {
+    let out = eval(
+        r#"
+        (let ((event (event/select (list (time/tick 30) (time/tick 5)) 100)))
+          (= (:ms (:source event)) 5))
+        "#,
+    );
+    assert_eq!(out, Value::bool(true));
+}
+
 // io/read-key-timeout: without a TTY we cannot deterministically feed a keystroke
 // nor force a clean idle timeout (a non-TTY stdin is often at EOF, which the first
 // poll resolves to nil immediately). So this does NOT prove the yield-during-wait

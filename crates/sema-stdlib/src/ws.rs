@@ -16,6 +16,7 @@
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::rc::Rc;
+use std::time::Duration;
 
 use futures::{SinkExt, StreamExt};
 use tokio::sync::mpsc;
@@ -25,7 +26,7 @@ use sema_core::cycle::GcEdge;
 use sema_core::runtime::{NativeOutcome, NativeResult, Trace};
 use sema_core::{check_arity, Caps, SemaError, SemaStream, StreamBox, Value};
 
-use crate::io::{await_runtime_until, RuntimePoll};
+use crate::io::{await_runtime_until, RuntimePoll, RuntimePollResult};
 use crate::register_fn;
 
 /// VM-thread readiness probe for a runtime-path `ws/recv`/`ws/recv-timeout`: scans
@@ -33,8 +34,8 @@ use crate::register_fn;
 /// VM thread, so a cancel can't strand it). A message resolves to its value, a
 /// disconnect to `nil`, and — with a `deadline` — a lapse to the `:timeout`
 /// keyword. Holds no `Value` (the receiver handle isn't one), so it emits no GC
-/// edges. Driven by [`await_runtime_until`], which sleeps briefly off the VM
-/// thread between scans so siblings overlap.
+/// edges. Driven by [`await_runtime_until`], which parks on a structural timer
+/// between scans so siblings overlap.
 struct WsRecvProbe {
     evt_rx: Rc<RefCell<mpsc::Receiver<WsEvent>>>,
     deadline: Option<std::time::Instant>,
@@ -47,14 +48,19 @@ impl Trace for WsRecvProbe {
 }
 
 impl RuntimePoll for WsRecvProbe {
-    fn poll(&mut self) -> Option<Result<Value, String>> {
+    fn poll(&mut self) -> RuntimePollResult {
         use tokio::sync::mpsc::error::TryRecvError;
         match self.evt_rx.borrow_mut().try_recv() {
-            Ok(ev) => Some(event_to_value(Some(ev)).map_err(|e| e.to_string())),
-            Err(TryRecvError::Disconnected) => Some(Ok(Value::nil())),
+            Ok(event) => match event_to_value(Some(event)) {
+                Ok(value) => RuntimePollResult::Ready(value),
+                Err(error) => RuntimePollResult::Failed(error.to_string()),
+            },
+            Err(TryRecvError::Disconnected) => RuntimePollResult::Ready(Value::nil()),
             Err(TryRecvError::Empty) => match self.deadline {
-                Some(d) if std::time::Instant::now() >= d => Some(Ok(Value::keyword("timeout"))),
-                _ => None,
+                Some(deadline) if std::time::Instant::now() >= deadline => {
+                    RuntimePollResult::Ready(Value::keyword("timeout"))
+                }
+                _ => RuntimePollResult::PendingAfter(Duration::from_millis(5)),
             },
         }
     }
@@ -77,15 +83,15 @@ impl Trace for WsConnectProbe {
 }
 
 impl RuntimePoll for WsConnectProbe {
-    fn poll(&mut self) -> Option<Result<Value, String>> {
+    fn poll(&mut self) -> RuntimePollResult {
         use tokio::sync::oneshot::error::TryRecvError;
         match self.ready_rx.try_recv() {
-            Ok(Ok(())) => Some(Ok(self.conn.clone())),
-            Ok(Err(msg)) => Some(Err(msg)),
-            Err(TryRecvError::Empty) => None,
-            Err(TryRecvError::Closed) => Some(Err(
+            Ok(Ok(())) => RuntimePollResult::Ready(self.conn.clone()),
+            Ok(Err(message)) => RuntimePollResult::Failed(message),
+            Err(TryRecvError::Empty) => RuntimePollResult::PendingAfter(Duration::from_millis(5)),
+            Err(TryRecvError::Closed) => RuntimePollResult::Failed(
                 "ws/connect: connection worker dropped before handshake".to_string(),
-            )),
+            ),
         }
     }
 }
@@ -507,8 +513,8 @@ fn ws_recv(args: &[Value]) -> NativeResult {
     let sb = ws_conn(args, "ws/recv", 0)?;
     let (_, evt_rx) = handles_of(&sb);
 
-    // Unified-runtime quantum: cooperatively scan the channel off the VM thread so
-    // siblings overlap while no message is ready.
+    // Unified-runtime quantum: cooperatively scan the channel and park between
+    // scans so siblings overlap while no message is ready.
     if sema_core::in_runtime_quantum() {
         if let Some(v) = sema_core::take_resume_value() {
             return Ok(NativeOutcome::Return(v));
@@ -538,7 +544,7 @@ fn ws_recv_timeout(args: &[Value]) -> NativeResult {
     let (_, evt_rx) = handles_of(&sb);
 
     // Unified-runtime quantum: cooperatively scan with a deadline; a lapse resolves
-    // to `:timeout`, off-VM-thread sleeps between scans let siblings overlap.
+    // to `:timeout`, and structural timers between scans let siblings overlap.
     if sema_core::in_runtime_quantum() {
         if let Some(v) = sema_core::take_resume_value() {
             return Ok(NativeOutcome::Return(v));

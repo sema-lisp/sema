@@ -769,14 +769,14 @@ F23	crates/sema-vm/src/runtime/state.rs:4381:                    sema_core::Sema
 F23	crates/sema-vm/src/runtime/state.rs:4383:                    sema_core::SemaError::eval("channel/send: channel is full").with_hint(
 F27	crates/sema-vm/src/runtime/state.rs:4436:    /// `async/cancel`/`CancelPromise` path) walks the LIVE
 F03	crates/sema-vm/src/runtime/state.rs:487:    // Count of live `OriginBarrier` (`async/run`) protocol waits. A cheap
-F23	crates/sema-vm/src/runtime/state.rs:5015:        &format!("async/timeout: operation timed out after {duration_ms} ms"),
-F23	crates/sema-vm/src/runtime/state.rs:5016:        "async/timeout",
+F23	crates/sema-vm/src/runtime/state.rs:5014:        &format!("async/timeout: operation timed out after {duration_ms} ms"),
+F23	crates/sema-vm/src/runtime/state.rs:5015:        "async/timeout",
 F03	crates/sema-vm/src/runtime/state.rs:541:    /// An `async/run` (`OriginBarrier`) suspension: the caller parks until every
-F03	crates/sema-vm/src/runtime/state.rs:5458:/// Whether an `async/run` barrier for `caller` (whose origin root is `root` and
-F03	crates/sema-vm/src/runtime/state.rs:5503:                    // suspends before its own `async/run` lets a descendant park
-F03	crates/sema-vm/src/runtime/state.rs:5515:/// Register an `async/run` (`OriginBarrier`) suspension: park the caller with an
-F08B	crates/sema-vm/src/runtime/state.rs:5773:    /// A VM root/child parked on `async/sleep`: arm a runtime timer for `ms`
-F23	crates/sema-vm/src/runtime/state.rs:6019:    thread_local! {
+F03	crates/sema-vm/src/runtime/state.rs:5457:/// Whether an `async/run` barrier for `caller` (whose origin root is `root` and
+F03	crates/sema-vm/src/runtime/state.rs:5502:                    // suspends before its own `async/run` lets a descendant park
+F03	crates/sema-vm/src/runtime/state.rs:5514:/// Register an `async/run` (`OriginBarrier`) suspension: park the caller with an
+F08B	crates/sema-vm/src/runtime/state.rs:5772:    /// A VM root/child parked on `async/sleep`: arm a runtime timer for `ms`
+F23	crates/sema-vm/src/runtime/state.rs:6018:    thread_local! {
 F23	crates/sema-vm/src/runtime/state.rs:626:thread_local! {
 F23	crates/sema-vm/src/runtime/state.rs:77:    /// Pending resume for a VM-quantum task woken from an `async/await` (or
 F24	crates/sema-vm/src/runtime/state.rs:78:    /// `async/spawn`) park: the value to inject onto the parked frame's stack

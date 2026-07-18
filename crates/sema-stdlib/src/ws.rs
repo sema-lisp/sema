@@ -38,6 +38,7 @@ const WS_COMPLETION_KIND: u64 = 0x7773_0000; // "ws\0\0"
 /// incomplete pump.
 struct WsConnectContinuation {
     conn: Value,
+    abort_pump: Option<sema_core::AbortHook>,
 }
 
 impl Trace for WsConnectContinuation {
@@ -49,12 +50,15 @@ impl Trace for WsConnectContinuation {
 
 impl NativeContinuation for WsConnectContinuation {
     fn resume(
-        self: Box<Self>,
+        mut self: Box<Self>,
         _context: &mut NativeCallContext<'_>,
         input: ResumeInput,
     ) -> NativeResult {
         match input {
-            ResumeInput::Returned(_) => Ok(NativeOutcome::Return(self.conn)),
+            ResumeInput::Returned(_) => {
+                self.abort_pump.take();
+                Ok(NativeOutcome::Return(self.conn.clone()))
+            }
             ResumeInput::Failed(error) => Err(error),
             ResumeInput::Cancelled(reason) => Err(SemaError::eval(format!(
                 "ws/connect was cancelled ({reason:?})"
@@ -62,6 +66,14 @@ impl NativeContinuation for WsConnectContinuation {
             ResumeInput::Runtime(_) => Err(SemaError::eval(
                 "ws/connect continuation received an unexpected runtime response",
             )),
+        }
+    }
+}
+
+impl Drop for WsConnectContinuation {
+    fn drop(&mut self) {
+        if let Some(abort_pump) = self.abort_pump.take() {
+            abort_pump();
         }
     }
 }
@@ -345,6 +357,12 @@ async fn wait_for_ws_generation(
     Ok(())
 }
 
+fn arm_ws_generation(generation: &watch::Receiver<u64>) -> watch::Receiver<u64> {
+    let mut armed = generation.clone();
+    armed.borrow_and_update();
+    armed
+}
+
 /// Arm a lossless generation wait, then perform the final VM-thread queue check.
 /// An event published before the generation snapshot is visible in the queue;
 /// an event published after it makes `changed()` ready.
@@ -353,8 +371,7 @@ fn suspend_ws_receive(
     evt_generation: watch::Receiver<u64>,
     deadline: Option<Instant>,
 ) -> NativeResult {
-    let mut wait_generation = evt_generation.clone();
-    wait_generation.borrow_and_update();
+    let wait_generation = arm_ws_generation(&evt_generation);
 
     if let Some(value) = poll_ws_event(&evt_rx, deadline)? {
         return Ok(NativeOutcome::Return(value));
@@ -587,7 +604,7 @@ fn ws_connect(url: &str, opts: ConnectOpts) -> NativeResult {
     let (evt_generation_tx, evt_generation) = watch::channel(0_u64);
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
 
-    let _abort_pump = sema_io::io_spawn(Box::pin(pump(
+    let abort_pump = sema_io::io_spawn(Box::pin(pump(
         url.to_string(),
         opts,
         cmd_rx,
@@ -612,16 +629,21 @@ fn ws_connect(url: &str, opts: ConnectOpts) -> NativeResult {
             "ws/connect",
             kind,
             "ws/connect/handshake",
-            |()| Ok(Value::nil()),
-            Box::new(WsConnectContinuation { conn: conn_val }),
+            |handshake: Result<(), String>| match handshake {
+                Ok(()) => Ok(Value::nil()),
+                Err(message) => Err(SemaError::eval(message)),
+            },
+            Box::new(WsConnectContinuation {
+                conn: conn_val,
+                abort_pump: Some(abort_pump),
+            }),
             move || async move {
-                match ready_rx.await {
-                    Ok(Ok(())) => Ok(()),
-                    Ok(Err(message)) => Err(message),
+                Ok(match ready_rx.await {
+                    Ok(handshake) => handshake,
                     Err(_) => {
                         Err("ws/connect: connection worker dropped before handshake".to_string())
                     }
-                }
+                })
             },
         );
     }
@@ -918,6 +940,28 @@ mod tests {
     }
 
     #[test]
+    fn ws_generation_rearm_waits_for_subsequent_change() {
+        let (generation_tx, generation_rx) = watch::channel(0_u64);
+        generation_tx.send_modify(|generation| *generation += 1);
+        let armed_generation = arm_ws_generation(&generation_rx);
+
+        sema_io::io_block_on(async {
+            let mut wait = Box::pin(wait_for_ws_generation(armed_generation, None));
+            assert!(
+                tokio::time::timeout(Duration::from_millis(20), &mut wait)
+                    .await
+                    .is_err(),
+                "a coalesced generation must be marked seen before rearming"
+            );
+            generation_tx.send_modify(|generation| *generation += 1);
+            tokio::time::timeout(Duration::from_millis(100), wait)
+                .await
+                .expect("a subsequent generation must wake the rearmed wait")
+                .expect("generation wait must succeed");
+        });
+    }
+
+    #[test]
     fn dropping_ws_wait_preserves_receiver() {
         let (evt_tx, mut evt_rx) = mpsc::channel(1);
         let (_generation_tx, generation_rx) = watch::channel(0_u64);
@@ -954,6 +998,9 @@ mod tests {
         let connection = Value::int(41);
         let continuation = WsConnectContinuation {
             conn: connection.clone(),
+            abort_pump: Some(Box::new(|| {
+                panic!("successful handshake must disarm its pump abort hook")
+            })),
         };
         let mut edges = 0;
         assert!(continuation.trace(&mut |_| edges += 1));
@@ -968,6 +1015,41 @@ mod tests {
             .resume(&mut native_context, ResumeInput::Returned(Value::nil()))
             .expect("successful handshake continuation must resume");
         assert!(matches!(outcome, NativeOutcome::Return(value) if value == connection));
+    }
+
+    #[test]
+    fn ws_connect_continuation_drop_aborts_spawned_task() {
+        use std::sync::mpsc;
+
+        struct SignalOnDrop(Option<mpsc::SyncSender<()>>);
+
+        impl Drop for SignalOnDrop {
+            fn drop(&mut self) {
+                if let Some(signal) = self.0.take() {
+                    let _ = signal.send(());
+                }
+            }
+        }
+
+        let (started_tx, started_rx) = mpsc::sync_channel(1);
+        let (dropped_tx, dropped_rx) = mpsc::sync_channel(1);
+        let abort_pump = sema_io::io_spawn(async move {
+            let _drop_signal = SignalOnDrop(Some(dropped_tx));
+            started_tx.send(()).expect("report spawned task start");
+            futures::future::pending::<()>().await;
+        });
+        started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("spawned task must start");
+
+        drop(WsConnectContinuation {
+            conn: Value::nil(),
+            abort_pump: Some(abort_pump),
+        });
+
+        dropped_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("dropping the continuation must abort its spawned task");
     }
 
     #[test]

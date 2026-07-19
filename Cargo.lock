@@ -4065,6 +4065,7 @@ dependencies = [
  "crc32fast",
  "crossterm",
  "ctrlc",
+ "directories",
  "flate2",
  "glob",
  "indicatif",

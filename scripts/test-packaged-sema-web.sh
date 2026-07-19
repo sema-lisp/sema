@@ -103,6 +103,66 @@ done
 cp "$PACKAGE_GLUE" "$TMP/expected-sema_wasm.js"
 cp "$PACKAGE_WASM" "$TMP/expected-sema_wasm_bg.wasm"
 
+# Prime the exact content-addressed generation name with stale bytes of the
+# same size. This is the package-boundary regression for the historical cache
+# bug: the installed binary must reject the candidate and publish the bytes
+# embedded from this .crate, without consulting the checkout.
+PACKAGE_VERSION="${PACKAGE_DIR##*/sema-lang-}"
+ASSET_DIGEST="$(python3 - "$PACKAGE_DIR/src/web/assets" <<'PY'
+import hashlib
+import pathlib
+import struct
+import sys
+
+root = pathlib.Path(sys.argv[1])
+digest = hashlib.sha256()
+for path in sorted(candidate for candidate in root.rglob("*") if candidate.is_file()):
+    relative = path.relative_to(root).as_posix().encode()
+    contents = path.read_bytes()
+    digest.update(struct.pack("<Q", len(relative)))
+    digest.update(relative)
+    digest.update(struct.pack("<Q", len(contents)))
+    digest.update(contents)
+print(digest.hexdigest())
+PY
+)"
+ISOLATED_HOME="$TMP/cache-home"
+ISOLATED_XDG_CACHE="$TMP/xdg-cache"
+case "$(uname -s)" in
+  Darwin)
+    RUNTIME_CACHE_ROOT="$ISOLATED_HOME/Library/Caches/com.sema-lang.sema/web-runtime"
+    ;;
+  Linux)
+    RUNTIME_CACHE_ROOT="$ISOLATED_XDG_CACHE/sema/web-runtime"
+    ;;
+  *)
+    echo "packaged web smoke: unsupported cache-path platform: $(uname -s)" >&2
+    exit 1
+    ;;
+esac
+STALE_GENERATION="$RUNTIME_CACHE_ROOT/sema-web-runtime-$PACKAGE_VERSION-$ASSET_DIGEST"
+mkdir -p "$STALE_GENERATION"
+cp -R "$PACKAGE_DIR/src/web/assets/." "$STALE_GENERATION/"
+python3 - "$STALE_GENERATION/sema_wasm.js" <<'PY'
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+contents = bytearray(path.read_bytes())
+if not contents:
+    raise SystemExit("packaged web smoke: cannot corrupt an empty WASM glue asset")
+contents[0] ^= 1
+path.write_bytes(contents)
+PY
+if [[ "$(wc -c <"$STALE_GENERATION/sema_wasm.js" | tr -d ' ')" != "$(wc -c <"$TMP/expected-sema_wasm.js" | tr -d ' ')" ]]; then
+  echo "packaged web smoke: stale cache fixture changed the asset size" >&2
+  exit 1
+fi
+if cmp -s "$STALE_GENERATION/sema_wasm.js" "$TMP/expected-sema_wasm.js"; then
+  echo "packaged web smoke: stale cache fixture did not change the asset bytes" >&2
+  exit 1
+fi
+
 # Package manifests correctly replace workspace paths with registry versions.
 # Patch those packages back to this checkout so the smoke remains runnable on
 # unreleased commits while the sema-lang source itself stays the actual .crate.
@@ -137,7 +197,8 @@ with socket.socket() as sock:
 PY
 )"
 
-"$BUILD_TARGET/debug/sema" web "$TMP/app.sema" \
+HOME="$ISOLATED_HOME" XDG_CACHE_HOME="$ISOLATED_XDG_CACHE" \
+  "$BUILD_TARGET/debug/sema" web "$TMP/app.sema" \
   --host 127.0.0.1 \
   --port "$PORT" \
   --no-open \

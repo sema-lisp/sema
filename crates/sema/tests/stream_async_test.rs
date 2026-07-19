@@ -704,3 +704,37 @@ fn cancelled_stream_slab_entries_are_reaped() {
     );
     assert_eq!(agent_runs_len(), 0, "agent slab also swept");
 }
+
+/// `__stream-begin` reached as a direct native callback (through `apply`) runs
+/// between VM quanta. It must still publish the spawned task id so cancellation
+/// can reclaim the stream slab entry that the task will never finish normally.
+#[test]
+#[serial_test::serial]
+fn cancelled_direct_native_stream_begin_is_reaped() {
+    let fake = FakeProvider::builder("fake")
+        .model("fake-model")
+        .reply("unused")
+        .build();
+    let (result, recorder) = eval_with_fake(
+        r#"
+        (let ((ready (channel/new 1)))
+          (let ((pending
+                  (async/spawn
+                    (fn ()
+                      (let ((token (apply __stream-begin (list "slow"))))
+                        (channel/send ready token)
+                        (async/sleep 1000))))))
+            (channel/recv ready)
+            (async/cancel pending)
+            (try (async/await pending) (catch error nil))))
+        "#,
+        fake,
+    );
+    result.expect("direct native stream owner cancels cleanly");
+    assert_eq!(recorder.call_count(), 0, "stream dispatch never started");
+    assert_eq!(
+        sema_llm::builtins::stream_runs_len(),
+        0,
+        "the cancelled direct-native owner must be reaped"
+    );
+}

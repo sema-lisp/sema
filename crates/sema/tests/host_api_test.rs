@@ -109,6 +109,36 @@ fn captured_output_tags_the_correct_root_when_interleaved() {
     assert!(interp.take_output().is_empty());
 }
 
+/// A native reached through a structural callback runs between VM quanta. It still
+/// belongs to the invoking root, so output capture must see the same published root
+/// identity as an ordinary native call inside the VM quantum.
+#[test]
+fn captured_output_includes_direct_native_callbacks() {
+    let interp = Interpreter::new();
+    let handle = interp
+        .submit_str(
+            r#"(apply println (list "native-callback-output"))"#,
+            RootOptions {
+                name: Some("native-callback-root".into()),
+                capture_output: true,
+            },
+        )
+        .expect("root submits");
+
+    interp.drive_until_settled(&handle).expect("root settles");
+    let events = interp.take_output();
+    assert!(
+        events.iter().any(|event| {
+            matches!(
+                event,
+                OutputEvent::Stdout { root, text }
+                    if *root == handle.id() && text.contains("native-callback-output")
+            )
+        }),
+        "direct native callback output was not attributed to its root: {events:?}"
+    );
+}
+
 /// submit -> drive_turn loop -> poll_result -> shutdown report counts.
 #[test]
 fn lifecycle_submit_drive_turn_poll_shutdown() {

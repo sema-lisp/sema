@@ -3673,7 +3673,7 @@ impl Runtime {
         mut owner: ReturnOwner,
         call: NativeCall,
     ) -> Result<(), RuntimeFault> {
-        let (eval_context, context, cancellation) = {
+        let (eval_context, context, cancellation, root, published_task_id) = {
             let state = self.state.borrow();
             let task = state
                 .tasks
@@ -3681,10 +3681,22 @@ impl Runtime {
                 .ok_or_else(|| RuntimeFault::Invariant {
                     message: "calling task disappeared".into(),
                 })?;
+            let root = task.record.relations().origin_root;
+            let is_root_main = matches!(
+                state.roots.get(&root).map(RootRecord::state),
+                Some(RootState::Running { main_task }) if *main_task == task_id
+            );
+            let published_task_id = if is_root_main {
+                None
+            } else {
+                Some(RuntimeTaskId::new(root.runtime(), task_id))
+            };
             (
                 Rc::clone(&state._context),
                 task.context.clone(),
                 task.record.cancellation(),
+                root,
+                published_task_id,
             )
         };
         if let Some(cancellation) = cancellation {
@@ -3751,7 +3763,34 @@ impl Runtime {
                         message: error.to_string(),
                     }
                 })?;
+                // A direct native callback runs between VM quanta, but it still belongs
+                // to this task/root. Install the same LLM/OTel/usage scopes and identity
+                // a VM quantum receives so scope-sensitive natives mutate the task's
+                // parked state and output/resource ownership stays correctly attributed.
+                let mut scopes =
+                    {
+                        let mut state = self.state.borrow_mut();
+                        let task = state.tasks.get_mut(&task_id).ok_or_else(|| {
+                            RuntimeFault::Invariant {
+                                message: "calling task disappeared".into(),
+                            }
+                        })?;
+                        TaskScopeSwap::install(task)
+                    };
+                let mut id_guard = QuantumIdGuard::install(published_task_id, root);
                 let native_result = native.invoke_runtime(&mut native_context, &call.args);
+                id_guard.restore();
+                {
+                    let mut state = self.state.borrow_mut();
+                    let task =
+                        state
+                            .tasks
+                            .get_mut(&task_id)
+                            .ok_or_else(|| RuntimeFault::Invariant {
+                                message: "calling task disappeared".into(),
+                            })?;
+                    scopes.restore(task);
+                }
                 (ContinuationFrame::native(call.continuation), native_result)
             } else if let Some(keyword) = call.callable.as_keyword_spur() {
                 let result = if call.args.len() != 1 {
@@ -4195,20 +4234,48 @@ impl Runtime {
         frame: ContinuationFrame,
         input: ResumeInput,
     ) -> Result<NativeResult, RuntimeFault> {
-        let (eval_context, context, cancellation) = {
+        let (eval_context, context, cancellation, root, published_task_id) = {
             let state = self.state.borrow();
             let Some(task) = state.tasks.get(&task_id) else {
                 return Err(RuntimeFault::Invariant {
                     message: "continuation task disappeared".into(),
                 });
             };
+            let root = task.record.relations().origin_root;
+            let is_root_main = matches!(
+                state.roots.get(&root).map(RootRecord::state),
+                Some(RootState::Running { main_task }) if *main_task == task_id
+            );
+            let published_task_id = if is_root_main {
+                None
+            } else {
+                Some(RuntimeTaskId::new(root.runtime(), task_id))
+            };
             (
                 Rc::clone(&state._context),
                 task.context.clone(),
                 task.record.cancellation(),
+                root,
+                published_task_id,
             )
         };
         let _installed = eval_context.scope_task_context(context.clone());
+        // Continuation teardown is task execution too. In particular, dropping an
+        // OTel span/session guard must pop the scope captured on this task; doing it
+        // against ambient TLS leaves an ended scope parked on the task and corrupts
+        // its next quantum. Publish task/root identity for teardown side effects too.
+        // No RuntimeState borrow crosses `frame.resume`.
+        let mut scopes = {
+            let mut state = self.state.borrow_mut();
+            let task = state
+                .tasks
+                .get_mut(&task_id)
+                .ok_or_else(|| RuntimeFault::Invariant {
+                    message: "continuation task disappeared".into(),
+                })?;
+            TaskScopeSwap::install(task)
+        };
+        let mut id_guard = QuantumIdGuard::install(published_task_id, root);
         let mut task_context = context.borrow_mut();
         let mut native_context = NativeCallContext {
             eval_context: &eval_context,
@@ -4223,10 +4290,16 @@ impl Runtime {
             .unwrap_or(input);
         let resumed = frame.resume(&mut native_context, input);
         drop(task_context);
-        if !self.state.borrow().tasks.contains_key(&task_id) {
-            return Err(RuntimeFault::Invariant {
-                message: "continuation task disappeared".into(),
-            });
+        id_guard.restore();
+        {
+            let mut state = self.state.borrow_mut();
+            let task = state
+                .tasks
+                .get_mut(&task_id)
+                .ok_or_else(|| RuntimeFault::Invariant {
+                    message: "continuation task disappeared".into(),
+                })?;
+            scopes.restore(task);
         }
         Ok(resumed)
     }

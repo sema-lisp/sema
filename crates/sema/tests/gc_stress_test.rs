@@ -434,6 +434,30 @@ fn multimethod_structural_stages_survive_collections_while_parked() {
     assert_eq!(v, Value::list(vec![Value::int(11), Value::int(11)]));
 }
 
+#[test]
+fn async_multimethod_capture_survives_collections_while_parked() {
+    let v = eval_ok(
+        "(let ((seen 0))
+           (defmulti collected-async-multimethod
+             (fn (key)
+               (set! seen (+ seen 1))
+               (async/sleep 50)
+               key))
+           (defmethod collected-async-multimethod :go
+             (fn (key)
+               (set! seen (+ seen 10))
+               (async/sleep 50)
+               seen))
+           (let ((pending (async (collected-async-multimethod :go))))
+             (async/sleep 10)
+             (gc/collect)
+             (async/sleep 50)
+             (gc/collect)
+             (list (await pending) seen)))",
+    );
+    assert_eq!(v, Value::list(vec![Value::int(11), Value::int(11)]));
+}
+
 // ── Collections from inside foreign frames ─────────────────────────
 
 #[test]

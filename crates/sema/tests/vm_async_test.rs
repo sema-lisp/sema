@@ -1793,6 +1793,43 @@ fn apply_of_suspending_lambda_runs_cooperatively() {
 }
 
 #[test]
+fn applied_callback_survives_channel_then_timer_suspension_and_preserves_mutation() {
+    assert_eq!(
+        eval(
+            r#"(let ((seen 0)
+                     (stage (channel/new 1)))
+                 (channel/send stage :primed)
+                 (let ((pending
+                         (async
+                           (apply
+                             (fn ()
+                               (set! seen (+ seen 1))
+                               (channel/send stage :callback-started)
+                               (set! seen (+ seen 10))
+                               (async/sleep 5)
+                               (set! seen (+ seen 100))
+                               seen)
+                             (list)))))
+                   (let ((markers
+                           (await
+                             (async
+                               (async/sleep 5)
+                               (list (channel/recv stage)
+                                     (channel/recv stage))))))
+                     (list markers (await pending) seen))))"#
+        ),
+        Value::list(vec![
+            Value::list(vec![
+                Value::keyword("primed"),
+                Value::keyword("callback-started"),
+            ]),
+            Value::int(111),
+            Value::int(111),
+        ])
+    );
+}
+
+#[test]
 fn multimethod_selected_method_suspends_cooperatively() {
     // A direct multimethod call `(mm x)` whose SELECTED method suspends
     // (`async/await`/`async/spawn`) must run cooperatively under the runtime
@@ -1850,6 +1887,49 @@ fn multimethod_dispatch_and_method_preserve_captured_mutation() {
 }
 
 #[test]
+fn async_multimethod_preserves_defining_frame_capture() {
+    assert_eq!(
+        eval(
+            r#"(let ((seen 0))
+                 (defmulti async-captured-multimethod
+                   (fn (key)
+                     (set! seen (+ seen 1))
+                     (async/sleep 5)
+                     key))
+                 (defmethod async-captured-multimethod :go
+                   (fn (key)
+                     (set! seen (+ seen 10))
+                     (async/sleep 5)
+                     seen))
+                 (let ((pending (async (async-captured-multimethod :go))))
+                   (list (await pending) seen)))"#
+        ),
+        Value::list(vec![Value::int(11), Value::int(11)])
+    );
+}
+
+#[test]
+fn snapshotting_multimethod_self_cycle_terminates() {
+    assert_eq!(
+        eval(
+            r#"(let ((seen 0))
+                 (defmulti cyclic-captured-multimethod
+                   (fn (key) key))
+                 (defmethod cyclic-captured-multimethod :self
+                   cyclic-captured-multimethod)
+                 (defmethod cyclic-captured-multimethod :go
+                   (fn (key)
+                     (set! seen (+ seen 1))
+                     (async/sleep 5)
+                     seen))
+                 (let ((pending (async (cyclic-captured-multimethod :go))))
+                   (list (await pending) seen)))"#
+        ),
+        Value::list(vec![Value::int(1), Value::int(1)])
+    );
+}
+
+#[test]
 fn multimethod_structural_stages_propagate_failures() {
     let dispatch_error = eval_vm_err(
         r#"(begin
@@ -1894,6 +1974,31 @@ fn cancelling_multimethod_dispatch_cancels_the_parked_call() {
                      (list requested (async/cancelled? p)))))"#
         ),
         Value::list(vec![Value::bool(true), Value::bool(true)])
+    );
+}
+
+#[test]
+fn cancelling_async_multimethod_preserves_captured_mutation() {
+    assert_eq!(
+        eval(
+            r#"(let ((seen 0)
+                     (started (channel/new 1)))
+                 (defmulti cancellable-captured-multimethod
+                   (fn (key)
+                     (set! seen 1)
+                     (channel/send started :started)
+                     (async/sleep 1000)
+                     key))
+                 (defmethod cancellable-captured-multimethod :go
+                   (fn (key) :unreachable))
+                 (let ((pending
+                         (async (cancellable-captured-multimethod :go))))
+                   (await (async (channel/recv started)))
+                   (async/cancel pending)
+                   (try (await pending) (catch error nil))
+                   (list seen (async/cancelled? pending))))"#
+        ),
+        Value::list(vec![Value::int(1), Value::bool(true)])
     );
 }
 

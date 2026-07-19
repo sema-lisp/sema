@@ -10312,11 +10312,11 @@
       "name": "stream/copy",
       "module": "streams",
       "section": "Control",
-      "summary": "Copy all bytes from a readable stream to a writable one, streaming through an internal buffer (no need to hold the whole payload in memory). Returns the total bytes copied.",
+      "summary": "Copy bytes from a readable stream to a writable one and return the total copied. The optional `max-bytes` limit defaults to 256 MiB. Every path rejects the first over-limit chunk before writing it.",
       "examples": [
-        ";; Stream a file to another file without loading it fully\n(with-stream (in (stream/open-input \"src.bin\"))\n  (with-stream (out (stream/open-output \"dst.bin\"))\n    (stream/copy in out)))   ;; => bytes copied\n\n;; Drain a string source into an in-memory buffer\n(let ((in (stream/from-string \"hello\"))\n      (out (stream/byte-buffer)))\n  (stream/copy in out))      ;; => 5"
+        ";; Drain a string source into an in-memory buffer\n(let ((in (stream/from-string \"hello\"))\n      (out (stream/byte-buffer)))\n  (stream/copy in out 1024)) ;; => 5"
       ],
-      "body": "Copy all bytes from a readable stream to a writable one, streaming through an internal buffer (no need to hold the whole payload in memory). Returns the total bytes copied.\n\nWhen BOTH streams are file-backed, `stream/copy` runs its ordinary synchronous loop even inside `async/spawn` — a narrow, documented exception (avoids a two-resource checkout that could deadlock against a concurrent reverse copy). A copy with only one file-backed side (the other in-memory or stdio) offloads normally and doesn't stall siblings.\n\n```sema\n;; Stream a file to another file without loading it fully\n(with-stream (in (stream/open-input \"src.bin\"))\n  (with-stream (out (stream/open-output \"dst.bin\"))\n    (stream/copy in out)))   ;; => bytes copied\n\n;; Drain a string source into an in-memory buffer\n(let ((in (stream/from-string \"hello\"))\n      (out (stream/byte-buffer)))\n  (stream/copy in out))      ;; => 5\n```"
+      "body": "Copy bytes from a readable stream to a writable one and return the total copied.\nThe optional `max-bytes` limit defaults to 256 MiB. Every path rejects the\nfirst over-limit chunk before writing it.\n\nInside the cooperative runtime, a copy with one file-backed side offloads that\nresource. Stdin is polled cooperatively, so an open pipe remains cancellable.\nFile-to-file copy fails promptly because a safe one-call implementation requires\nordered acquisition of both resource gates. Copy files with bounded\n`stream/read`/`stream/write` chunks instead.\n\n```sema\n;; Drain a string source into an in-memory buffer\n(let ((in (stream/from-string \"hello\"))\n      (out (stream/byte-buffer)))\n  (stream/copy in out 1024)) ;; => 5\n```"
     },
     {
       "name": "stream/flush",
@@ -10382,11 +10382,11 @@
       "name": "stream/read-all",
       "module": "streams",
       "section": "Reading",
-      "summary": "Read the entire stream into a bytevector.",
+      "summary": "Read the stream into a bytevector, up to `max-bytes`. The optional limit defaults to 256 MiB. The call fails before growing its result beyond that cap.",
       "examples": [
-        "(define data (stream/read-all s))\n(utf8->string data)    ; convert to string if text"
+        "(define data (stream/read-all s (* 8 1024 1024))) ; 8 MiB maximum\n(utf8->string data)    ; convert to string if text"
       ],
-      "body": "Read the entire stream into a bytevector.\n\n```sema\n(define data (stream/read-all s))\n(utf8->string data)    ; convert to string if text\n```"
+      "body": "Read the stream into a bytevector, up to `max-bytes`. The optional limit\ndefaults to 256 MiB. The call fails before growing its result beyond that cap.\n\nUse repeated `stream/read` calls when the input may be larger or does not have a\nknown end.\n\n```sema\n(define data (stream/read-all s (* 8 1024 1024))) ; 8 MiB maximum\n(utf8->string data)    ; convert to string if text\n```"
     },
     {
       "name": "stream/read-byte",

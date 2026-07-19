@@ -14649,10 +14649,12 @@ fn test_stream_copy() {
 
     eval(&format!(
         r#"(let ((in (stream/open-input "{src_str}"))
-                 (out (stream/open-output "{dst_str}")))
-             (stream/copy in out)
+                 (buffer (stream/byte-buffer)))
+             (stream/copy in buffer 1024)
              (stream/close in)
-             (stream/close out))"#
+             (let ((out (stream/open-output "{dst_str}")))
+               (stream/write out (stream/to-bytes buffer))
+               (stream/close out)))"#
     ));
 
     assert_eq!(std::fs::read_to_string(&dst).unwrap(), "copy me");

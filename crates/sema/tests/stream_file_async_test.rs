@@ -1,25 +1,24 @@
 //! Async-offload coverage for file-backed `stream/*` (WP-STREAM).
 //!
-//! `crates/sema-stdlib/src/stream.rs` now branches on `in_async_context()`
-//! AND whether the stream handed to it is file-backed (`stream_type()` is
+//! `crates/sema-stdlib/src/stream.rs` branches on `in_runtime_quantum()` and
+//! whether the stream handed to it is file-backed (`stream_type()` is
 //! `"file-input"`/`"file-output"`): `stream/open-input`/`stream/open-output`
-//! offload the blocking `File::open`/`File::create` via `fs_offload` (mirrors
-//! `db/open`); `stream/read`, `stream/write`, `stream/read-line`,
+//! offload the blocking `File::open`/`File::create`; `stream/read`,
+//! `stream/write`, `stream/read-line`,
 //! `stream/flush`, and `stream/close` offload the blocking op through a
 //! CHECKOUT slot that lives directly on the stream object (no separate keyed
 //! registry needed — the `Rc<StreamBox>` already IS the unique handle);
 //! `stream/copy` checks out whichever side is file-backed when exactly one
-//! side is (the other, a memory/stdio stream, is read/written on the VM
-//! thread — fast, no I/O) and falls back to the unchanged synchronous loop
-//! when BOTH sides are file-backed (a documented, narrow exception — see the
-//! module doc comment in `stream.rs`). In-memory streams
-//! (`stream/byte-buffer`, `stream/from-string`) never offload, even inside
-//! async context — nothing to offload, they're pure CPU/memory. At top level
-//! (no scheduler) every builtin keeps the original synchronous shape.
+//! side is (the other, a memory stream, is read/written on the VM thread —
+//! fast, no I/O); a runtime-quantum file-to-file copy fails promptly with
+//! bounded-chunk guidance instead of entering a VM-thread EOF loop. In-memory
+//! streams (`stream/byte-buffer`, `stream/from-string`) never offload because
+//! they are pure CPU/memory. The direct value ABI keeps its bounded synchronous
+//! compatibility path.
 //!
 //! Every file here is a small fresh temp file — no real disk latency needed
-//! for these tests to be meaningful: the offload yields `AwaitIo` the instant
-//! it's called (before the checkout's `spawn_blocking` closure has any
+//! for these tests to be meaningful: the offload parks on an External wait the
+//! instant it is called (before the checkout's blocking closure has any
 //! chance to run), so a zero-delay sibling task reliably completes first —
 //! the same mechanism `db_async_test.rs`/`proc_pty_async_test.rs` rely on.
 //! Ordering is asserted via channel receive order — never a wall-clock
@@ -379,12 +378,171 @@ fn stream_file_async_copy_bytebuffer_to_file_matches_sync() {
     let _ = std::fs::remove_file(&dst_path);
 }
 
-/// `stream/copy` between two FILE-backed streams inside async context: per
-/// the documented policy this deliberately falls back to the synchronous
-/// loop rather than implementing dual-checkout — still correct, just not
-/// yielding for this one call. Proves it still produces the right result.
 #[test]
-fn stream_file_async_copy_file_to_file_still_works() {
+fn stream_aggregation_caps_accept_the_boundary_and_reject_one_byte_over() {
+    let interp = Interpreter::new();
+
+    let exact = interp
+        .eval_str_compiled(r#"(utf8->string (stream/read-all (stream/from-string "12345678") 8))"#)
+        .expect("read-all accepts exactly max-bytes");
+    assert_eq!(exact, Value::string("12345678"));
+
+    let read_err = interp
+        .eval_str_compiled(r#"(stream/read-all (stream/from-string "123456789") 8)"#)
+        .expect_err("read-all rejects one byte beyond max-bytes");
+    assert!(
+        read_err.to_string().contains("8-byte cap"),
+        "expected the configured byte cap in the error, got: {read_err}"
+    );
+
+    interp
+        .eval_str_compiled(
+            r#"(define capped-copy-src (stream/from-string "123456789"))
+                (define capped-copy-dst (stream/byte-buffer))"#,
+        )
+        .expect("define copy streams");
+    let copy_err = interp
+        .eval_str_compiled("(stream/copy capped-copy-src capped-copy-dst 8)")
+        .expect_err("copy rejects one byte beyond max-bytes");
+    assert!(
+        copy_err.to_string().contains("8-byte cap"),
+        "expected the configured byte cap in the error, got: {copy_err}"
+    );
+    let copied = interp
+        .eval_str_compiled("(stream/to-bytes capped-copy-dst)")
+        .expect("inspect rejected copy destination");
+    assert_eq!(
+        copied.as_bytevector(),
+        Some(&[][..]),
+        "the over-cap chunk must be rejected before any destination write"
+    );
+
+    let exact_copy = interp
+        .eval_str_compiled(
+            r#"(let ((src (stream/from-string "12345678"))
+                      (dst (stream/byte-buffer)))
+                  (list (stream/copy src dst 8) (utf8->string (stream/to-bytes dst))))"#,
+        )
+        .expect("copy accepts exactly max-bytes");
+    assert_eq!(
+        exact_copy,
+        Value::list(vec![Value::int(8), Value::string("12345678")])
+    );
+}
+
+#[test]
+fn file_read_all_cap_releases_its_gate_after_success_and_rejection() {
+    let exact_file = TempFile::with_contents("read-all-cap-exact", "12345678");
+    let over_file = TempFile::with_contents("read-all-cap-over", "123456789");
+    let interp = Interpreter::new();
+
+    let exact = interp
+        .eval_str_compiled(&format!(
+            r#"(with-stream (s (stream/open-input "{}"))
+                  (utf8->string (stream/read-all s 8)))"#,
+            exact_file.path()
+        ))
+        .expect("file read-all accepts exactly max-bytes");
+    assert_eq!(exact, Value::string("12345678"));
+    assert_eq!(interp.runtime_resource_gate_count(), 0);
+
+    let err = interp
+        .eval_str_compiled(&format!(
+            r#"(with-stream (s (stream/open-input "{}"))
+                  (stream/read-all s 8))"#,
+            over_file.path()
+        ))
+        .expect_err("file read-all rejects one byte beyond max-bytes");
+    assert!(err.to_string().contains("8-byte cap"));
+    assert_eq!(
+        interp.runtime_resource_gate_count(),
+        0,
+        "over-cap read-all cleanup returns the file gate to baseline"
+    );
+}
+
+#[test]
+fn stream_aggregation_value_abi_keeps_synchronous_compatibility() {
+    let interp = Interpreter::new();
+    let source = interp
+        .eval_str_compiled(r#"(stream/from-string "sync-path")"#)
+        .expect("construct source stream");
+    let read_all = interp
+        .global_env
+        .get(sema_core::intern("stream/read-all"))
+        .expect("stream/read-all builtin")
+        .as_native_fn_rc()
+        .expect("stream/read-all is native");
+
+    let value = (read_all.func)(&interp.ctx, &[source, Value::int(9)])
+        .expect("value ABI reads synchronously outside a runtime quantum");
+    assert_eq!(value.as_bytevector(), Some(&b"sync-path"[..]));
+
+    let source = interp
+        .eval_str_compiled(r#"(stream/from-string "copy-sync")"#)
+        .expect("construct copy source");
+    let destination = interp
+        .eval_str_compiled("(stream/byte-buffer)")
+        .expect("construct copy destination");
+    let copy = interp
+        .global_env
+        .get(sema_core::intern("stream/copy"))
+        .expect("stream/copy builtin")
+        .as_native_fn_rc()
+        .expect("stream/copy is native");
+    let copied = (copy.func)(&interp.ctx, &[source, destination.clone(), Value::int(9)])
+        .expect("copy value ABI runs synchronously outside a runtime quantum");
+    assert_eq!(copied, Value::int(9));
+    let to_bytes = interp
+        .global_env
+        .get(sema_core::intern("stream/to-bytes"))
+        .expect("stream/to-bytes builtin")
+        .as_native_fn_rc()
+        .expect("stream/to-bytes is native");
+    let copied_bytes = (to_bytes.func)(&interp.ctx, std::slice::from_ref(&destination))
+        .expect("inspect value-ABI copy destination");
+    assert_eq!(
+        copied_bytes.as_bytevector(),
+        Some(&b"copy-sync"[..]),
+        "the synchronous copy compatibility path writes the complete payload"
+    );
+
+    let file_source = TempFile::with_contents("value-abi-copy-src", "file-sync");
+    let file_destination = TempFile::new("value-abi-copy-dst");
+    let source = interp
+        .eval_str_compiled(&format!(r#"(stream/open-input "{}")"#, file_source.path()))
+        .expect("open value-ABI file source");
+    let destination = interp
+        .eval_str_compiled(&format!(
+            r#"(stream/open-output "{}")"#,
+            file_destination.path()
+        ))
+        .expect("open value-ABI file destination");
+    let copied = (copy.func)(
+        &interp.ctx,
+        &[source.clone(), destination.clone(), Value::int(9)],
+    )
+    .expect("value ABI retains bounded synchronous file-to-file copy");
+    assert_eq!(copied, Value::int(9));
+    let close = interp
+        .global_env
+        .get(sema_core::intern("stream/close"))
+        .expect("stream/close builtin")
+        .as_native_fn_rc()
+        .expect("stream/close is native");
+    (close.func)(&interp.ctx, &[source]).expect("close value-ABI file source");
+    (close.func)(&interp.ctx, &[destination]).expect("flush value-ABI file destination");
+    assert_eq!(
+        std::fs::read_to_string(&file_destination.0).expect("read copied file"),
+        "file-sync"
+    );
+}
+
+/// A runtime-quantum file-to-file copy must never enter the VM-thread EOF
+/// loop. Until ordered dual-resource acquisition exists, it fails promptly
+/// with bounded-chunk guidance and leaves both resource gates reclaimable.
+#[test]
+fn stream_file_async_copy_file_to_file_fails_fast_with_chunk_guidance() {
     let src = TempFile::with_contents("copy-ff-src", "file to file");
     let dst_path = {
         let dir = std::env::temp_dir();
@@ -395,22 +553,133 @@ fn stream_file_async_copy_file_to_file_still_works() {
         dir.join(format!("sema-stream-async-copy-ff-dst-{nanos}.txt"))
     };
     let interp = Interpreter::new();
-    let result = interp
+    let error = interp
         .eval_str_compiled(&format!(
-            r#"(await (async/spawn (fn ()
-                 (let ((s (stream/open-input "{src}"))
-                       (d (stream/open-output "{dst}")))
-                   (let ((n (stream/copy s d)))
-                     (stream/close s)
-                     (stream/close d)
-                     n)))))"#,
+            r#"(with-stream (s (stream/open-input "{src}"))
+                  (with-stream (d (stream/open-output "{dst}"))
+                    (stream/copy s d 1024)))"#,
             src = src.path(),
             dst = dst_path.display()
         ))
-        .expect("async file->file copy");
-    assert_eq!(result, Value::int(12));
-    assert_eq!(std::fs::read_to_string(&dst_path).unwrap(), "file to file");
+        .expect_err("runtime file->file copy must fail instead of blocking the VM thread");
+    let message = error.to_string();
+    assert!(
+        message.contains("file-to-file") && message.contains("bounded chunks"),
+        "expected actionable bounded-chunk guidance, got: {message}"
+    );
+    assert_eq!(interp.runtime_resource_gate_count(), 0);
     let _ = std::fs::remove_file(&dst_path);
+}
+
+#[cfg(unix)]
+fn assert_open_stdin_operations_are_cancellable(program: &str, expected_cancellations: usize) {
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_sema"))
+        .args(["--no-llm", "-e", program])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn sema with an open stdin pipe");
+
+    // Deliberately keep the writer open and empty. A worker blocked in
+    // `stdin.read()` cannot observe EOF; the cooperative readiness path can be
+    // cancelled and lets the sibling/root settle anyway.
+    let open_stdin = child.stdin.take().expect("piped stdin");
+    // Process startup can contend with other nextest cases; the old pinned
+    // worker survives indefinitely while this cooperative path exits promptly.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("poll sema child") {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            drop(open_stdin);
+            let output = child.wait_with_output().expect("reap timed-out sema child");
+            panic!(
+                "cancelled stdin aggregation left work pinned; stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    drop(open_stdin);
+    let output = child.wait_with_output().expect("collect sema output");
+    assert!(
+        status.success(),
+        "sema exited non-zero: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains(":sibling")
+            && stdout.matches(":cancelled").count() == expected_cancellations,
+        "sibling must progress and stdin task must settle cancelled, got: {stdout}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn cancelled_open_stdin_aggregations_exit_without_pinned_workers_or_gates() {
+    let destination = TempFile::new("stdin-copy-cancel");
+    assert_open_stdin_operations_are_cancellable(
+        &format!(
+            r#"
+        (let ((events (channel/new 2))
+              (read-pending (async/spawn (fn () (stream/read-all *stdin* 64))))
+              (copy-pending (async/spawn (fn ()
+                (with-stream (dst (stream/open-output "{path}"))
+                  (stream/copy *stdin* dst 64))))))
+          (async/spawn (fn () (channel/send events :sibling)))
+          (async/sleep 20)
+          (async/cancel read-pending)
+          (async/cancel copy-pending)
+          (list (channel/recv events)
+                (try (await read-pending) (catch e (:type e)))
+                (try (await copy-pending) (catch e (:type e)))))
+        "#,
+            path = destination.path()
+        ),
+        2,
+    );
+    assert_eq!(
+        std::fs::metadata(&destination.0)
+            .expect("cancelled copy created its destination")
+            .len(),
+        0,
+        "no stdin byte was written before the open-source cancellation"
+    );
+}
+
+#[test]
+fn file_read_all_suspends_so_a_sibling_progresses_and_cleanup_reaches_baseline() {
+    let input = TempFile::with_contents("read-all-sibling", &"x".repeat(32 * 1024));
+    let interp = Interpreter::new();
+    let result = interp
+        .eval_str_compiled(&format!(
+            r#"
+            (let ((events (channel/new 2)))
+              (async/all (list
+                (async/spawn (fn ()
+                  (with-stream (s (stream/open-input "{path}"))
+                    (stream/read-all s 32768))
+                  (channel/send events :aggregate)))
+                (async/spawn (fn () (channel/send events :sibling)))))
+              (list (channel/recv events) (channel/recv events)))
+            "#,
+            path = input.path()
+        ))
+        .expect("read-all and sibling settle");
+    assert_eq!(
+        result,
+        Value::list(vec![Value::keyword("sibling"), Value::keyword("aggregate")])
+    );
+    assert_eq!(interp.runtime_live_task_count(), 0);
+    assert_eq!(interp.runtime_resource_gate_count(), 0);
 }
 
 /// Three sibling tasks all call `stream/read-line` on the SAME shared input

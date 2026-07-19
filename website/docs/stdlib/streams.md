@@ -100,10 +100,11 @@ Read until newline (`\n`), returning a string without the newline. Strips traili
 
 ### `stream/read-all`
 
-Read the entire stream into a bytevector.
+Read the stream into a bytevector. An optional byte cap defaults to 256 MiB;
+the call fails before growing its result beyond the cap.
 
 ```sema
-(define data (stream/read-all s))
+(define data (stream/read-all s (* 8 1024 1024))) ; 8 MiB maximum
 (utf8->string data)    ; convert to string if text
 ```
 
@@ -154,12 +155,19 @@ Flush any buffered output to the underlying sink.
 
 ### `stream/copy`
 
-Copy all bytes from one stream to another. Returns total bytes copied.
+Copy bytes from one stream to another. Returns total bytes copied. An optional
+byte cap defaults to 256 MiB, and the first over-limit chunk is rejected before
+it is written.
+
+Inside the cooperative runtime, stdin remains cancellable and a copy with one
+file-backed side is offloaded. File-to-file copy requires two resource gates and
+therefore fails promptly; use bounded `stream/read`/`stream/write` chunks for
+that case.
 
 ```sema
-(with-stream (in (stream/open-input "src.bin"))
-  (with-stream (out (stream/open-output "dst.bin"))
-    (stream/copy in out)))   ;; => bytes copied
+(let ((in (stream/from-string "hello"))
+      (out (stream/byte-buffer)))
+  (stream/copy in out 1024)) ;; => 5
 ```
 
 ## Introspection
@@ -287,7 +295,13 @@ Macro that binds a stream, executes the body, and automatically closes the strea
 ```sema
 (with-stream (in (stream/open-input "photo.jpg"))
   (with-stream (out (stream/open-output "backup.jpg"))
-    (stream/copy in out)))
+    (let loop ((total 0))
+      (let ((chunk (stream/read in 8192)))
+        (if (= (bytes/length chunk) 0)
+          total
+          (begin
+            (stream/write out chunk)
+            (loop (+ total (bytes/length chunk)))))))))
 ```
 
 ## Error Handling

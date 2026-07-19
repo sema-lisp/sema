@@ -23,23 +23,21 @@
 //! cancel tombstones the slot (best-effort). `stream/open-input`/
 //! `stream/open-output` offload the initial `File::open`/`File::create` on a
 //! quarantined-bounded External wait (`crate::io::quarantined_compute`, `io.rs`)
-//! — there is no existing stream to contend over, mirroring `db/open`. *stdin*
-//! reads take the same quarantined-bounded External path (stateless, so no
-//! checkout); the bound is a post-cancel cleanup watchdog, never a running-read
-//! timeout, so an input-blocked read is not faulted.
+//! — there is no existing stream to contend over, mirroring `db/open`. Finite
+//! stdin reads use that path; whole-stdin aggregation uses nonblocking readiness
+//! checks plus structural timer wakes, so cancellation never leaves a worker
+//! pinned on an open pipe.
 //!
-//! `stream/copy` between two FILE-backed streams deliberately does not
-//! implement dual-checkout (it would need a canonical acquire order across
-//! two independently-checked-out resources to avoid a would-be reverse copy
-//! deadlocking against it) — that combination falls through to the existing
-//! synchronous loop even inside async context: still correct, just a narrow,
-//! documented blocking window for that one call. A copy with exactly one
-//! file-backed side checks out only that side; an in-memory counterpart is
-//! read/written on the VM thread (fast, no real I/O), while a *stdin* source is
-//! offloaded to a worker (it can block waiting on real input).
+//! `stream/read-all` and `stream/copy` accept an optional final `max-bytes`
+//! argument and default to 256 MiB. The captured cap is checked before every
+//! aggregate-buffer growth or destination write. A copy with exactly one
+//! file-backed side checks out only that side. File-to-file copy inside a
+//! runtime quantum fails promptly with bounded-chunk guidance: safely supporting
+//! it requires canonical dual-gate acquisition, and it must never fall through
+//! to a VM-thread EOF loop. The host value ABI retains the bounded synchronous
+//! loop for compatibility.
 //!
-//! At top level (no scheduler) every builtin keeps today's synchronous shape
-//! byte-for-byte.
+//! Direct host calls through the value ABI keep a bounded synchronous path.
 
 use std::any::Any;
 use std::cell::{Cell, RefCell};
@@ -48,6 +46,82 @@ use sema_core::runtime::NativeOutcome;
 use sema_core::{check_arity, SemaError, SemaStream, Value};
 
 use crate::register_fn;
+
+/// Default maximum for one `stream/read-all` or `stream/copy` call. Callers can
+/// pass a smaller or larger explicit maximum as the final argument, but no
+/// aggregation path is ever unbounded.
+const STREAM_AGGREGATION_BYTE_CAP_DEFAULT: usize = 256 * 1024 * 1024;
+const STREAM_CHUNK_BYTES: usize = 8192;
+
+fn aggregation_cap(args: &[Value], index: usize, op: &str) -> Result<usize, SemaError> {
+    let Some(value) = args.get(index) else {
+        return Ok(STREAM_AGGREGATION_BYTE_CAP_DEFAULT);
+    };
+    let cap = value
+        .as_int()
+        .ok_or_else(|| SemaError::type_error("non-negative integer", value.type_name()))?;
+    usize::try_from(cap).map_err(|_| {
+        SemaError::eval(format!(
+            "{op}: max-bytes must be a non-negative integer representable on this platform, got {cap}"
+        ))
+    })
+}
+
+fn aggregation_cap_message(op: &str, cap: usize) -> String {
+    format!("{op}: input exceeds the configured {cap}-byte cap")
+}
+
+fn aggregation_cap_error(op: &str, cap: usize) -> SemaError {
+    SemaError::eval(aggregation_cap_message(op, cap)).with_hint(
+        "process the stream with stream/read and stream/write in bounded chunks, or raise max-bytes",
+    )
+}
+
+/// Extend an aggregation buffer only after proving the incoming chunk fits.
+/// The check precedes `try_reserve_exact`, so an over-cap chunk cannot trigger a
+/// capacity growth even when it is only one byte beyond the boundary.
+fn extend_aggregation(
+    output: &mut Vec<u8>,
+    chunk: &[u8],
+    cap: usize,
+    op: &str,
+) -> Result<(), SemaError> {
+    if chunk.len() > cap.saturating_sub(output.len()) {
+        return Err(aggregation_cap_error(op, cap));
+    }
+    let required = output.len() + chunk.len();
+    if required > output.capacity() {
+        let geometric = output
+            .capacity()
+            .max(STREAM_CHUNK_BYTES)
+            .saturating_mul(2)
+            .min(cap);
+        let target = required.max(geometric);
+        let additional = target - output.len();
+        output.try_reserve_exact(additional).map_err(|error| {
+            SemaError::eval(format!(
+                "{op}: could not reserve {additional} bytes within the {cap}-byte cap: {error}"
+            ))
+        })?;
+    }
+    output.extend_from_slice(chunk);
+    Ok(())
+}
+
+fn checked_copy_total(total: usize, next: usize, cap: usize) -> Result<usize, SemaError> {
+    if next > cap.saturating_sub(total) {
+        Err(aggregation_cap_error("stream/copy", cap))
+    } else {
+        Ok(total + next)
+    }
+}
+
+/// Request only the still-allowed bytes plus one overflow witness. Reading the
+/// witness is enough to reject an over-cap source without consuming a whole
+/// excess chunk.
+fn capped_read_len(current: usize, cap: usize) -> usize {
+    STREAM_CHUNK_BYTES.min(cap.saturating_sub(current).saturating_add(1).max(1))
+}
 
 /// Register a builtin whose body speaks the runtime native ABI
 /// (`NativeResult`), so its async branch can return a `NativeOutcome::Suspend`
@@ -398,22 +472,24 @@ pub fn register(env: &sema_core::Env) {
     // --- convenience (no I/O, always available) ---
 
     register_runtime_fn(env, "stream/read-all", |args| {
-        check_arity!(args, "stream/read-all", 1);
+        check_arity!(args, "stream/read-all", 1..=2);
         let s = expect_stream(args, "stream/read-all", 0)?;
+        let cap = aggregation_cap(args, 1, "stream/read-all")?;
 
         #[cfg(not(target_arch = "wasm32"))]
-        if let Some(outcome) = io_streams::maybe_async_read_all(&s)? {
+        if let Some(outcome) = io_streams::maybe_async_read_all(&s, cap)? {
             return Ok(outcome);
         }
 
         let mut result = Vec::new();
-        let mut buf = [0u8; 8192];
+        let mut buf = [0u8; STREAM_CHUNK_BYTES];
         loop {
-            let n = s.read(&mut buf)?;
+            let read_len = capped_read_len(result.len(), cap);
+            let n = s.read(&mut buf[..read_len])?;
             if n == 0 {
                 break;
             }
-            result.extend_from_slice(&buf[..n]);
+            extend_aggregation(&mut result, &buf[..n], cap, "stream/read-all")?;
         }
         Ok(NativeOutcome::Return(Value::bytevector(result)))
     });
@@ -469,24 +545,27 @@ pub fn register(env: &sema_core::Env) {
     });
 
     register_runtime_fn(env, "stream/copy", |args| {
-        check_arity!(args, "stream/copy", 2);
+        check_arity!(args, "stream/copy", 2..=3);
         let src = expect_stream(args, "stream/copy", 0)?;
         let dst = expect_stream(args, "stream/copy", 1)?;
+        let cap = aggregation_cap(args, 2, "stream/copy")?;
 
         #[cfg(not(target_arch = "wasm32"))]
-        if let Some(outcome) = io_streams::maybe_async_copy(&src, &dst)? {
+        if let Some(outcome) = io_streams::maybe_async_copy(&src, &dst, cap)? {
             return Ok(outcome);
         }
 
         let mut total: usize = 0;
-        let mut buf = [0u8; 8192];
+        let mut buf = [0u8; STREAM_CHUNK_BYTES];
         loop {
-            let n = src.read(&mut buf)?;
+            let read_len = capped_read_len(total, cap);
+            let n = src.read(&mut buf[..read_len])?;
             if n == 0 {
                 break;
             }
+            let next_total = checked_copy_total(total, n, cap)?;
             dst.write(&buf[..n])?;
-            total += n;
+            total = next_total;
         }
         Ok(NativeOutcome::Return(Value::int(total as i64)))
     });
@@ -499,9 +578,12 @@ mod io_streams {
     use super::*;
     use std::io::{BufRead, BufReader, BufWriter, Read, Write};
     use std::rc::Rc;
+    use std::time::Duration;
 
+    use sema_core::cycle::GcEdge;
     use sema_core::runtime::{
-        CompletionKind, NativeOutcome, NativeResult, ResourceGateHandle, ResourceGateId,
+        CompletionKind, NativeCallContext, NativeContinuation, NativeOutcome, NativeResult,
+        NativeSuspend, ResourceGateHandle, ResourceGateId, ResumeInput, Trace, WaitKind,
     };
     use sema_core::{in_runtime_quantum, StreamBox};
 
@@ -1119,30 +1201,207 @@ mod io_streams {
         )?))
     }
 
-    /// `stream/read-all`'s async dispatch: loops the same offloaded read
-    /// (stdin via `fs_offload`, file-input via CHECKOUT) inside the worker
-    /// closure until EOF, accumulating everything into one buffer, so a
-    /// multi-chunk read-to-EOF never re-enters the scheduler per chunk.
+    /// One interruptible stdin aggregation. Stdin readiness is polled without
+    /// blocking the VM thread; each ready chunk is read directly from the Unix
+    /// fd and followed by a structural timer wake. The optional destination is
+    /// a traced `Value`, keeping a `stream/copy` target alive across parks.
+    struct StdinAggregation {
+        bytes: Vec<u8>,
+        cap: usize,
+        destination: Option<Value>,
+    }
+
+    impl Trace for StdinAggregation {
+        fn trace(&self, sink: &mut dyn FnMut(GcEdge<'_>)) -> bool {
+            if let Some(destination) = &self.destination {
+                sink(GcEdge::Value(destination));
+            }
+            true
+        }
+    }
+
+    impl StdinAggregation {
+        fn op_name(&self) -> &'static str {
+            if self.destination.is_some() {
+                "stream/copy"
+            } else {
+                "stream/read-all"
+            }
+        }
+
+        fn finish(mut self) -> NativeResult {
+            let Some(destination) = self.destination.take() else {
+                return Ok(NativeOutcome::Return(Value::bytevector(self.bytes)));
+            };
+            let destination = destination
+                .as_stream_rc()
+                .ok_or_else(|| SemaError::eval("stream/copy: destination stream was reclaimed"))?;
+            if self.bytes.is_empty() {
+                return Ok(NativeOutcome::Return(Value::int(0)));
+            }
+            let total = self.bytes.len();
+            if destination.stream_type() == "file-output" {
+                if destination.is_closed() {
+                    return Err(SemaError::eval("stream/write: stream is closed"));
+                }
+                return checkout_output(
+                    "stream/copy",
+                    "stream/write",
+                    &destination,
+                    move |writer: &mut BufWriter<std::fs::File>| -> Result<(), String> {
+                        writer
+                            .write_all(&self.bytes)
+                            .map_err(|e| render(format!("stream/copy: I/O error: {e}")))
+                    },
+                    move |()| Ok(Value::int(total as i64)),
+                );
+            }
+
+            debug_assert_eq!(destination.stream_type(), "byte-buffer");
+            destination.write(&self.bytes)?;
+            Ok(NativeOutcome::Return(Value::int(total as i64)))
+        }
+    }
+
+    struct StdinAggregationContinuation {
+        state: Option<StdinAggregation>,
+    }
+
+    impl Trace for StdinAggregationContinuation {
+        fn trace(&self, sink: &mut dyn FnMut(GcEdge<'_>)) -> bool {
+            self.state.as_ref().is_none_or(|state| state.trace(sink))
+        }
+    }
+
+    impl NativeContinuation for StdinAggregationContinuation {
+        fn resume(
+            mut self: Box<Self>,
+            _context: &mut NativeCallContext<'_>,
+            input: ResumeInput,
+        ) -> NativeResult {
+            let state = self
+                .state
+                .take()
+                .expect("stdin aggregation continuation resumes once");
+            match input {
+                ResumeInput::Returned(_) => stdin_aggregation_step(state),
+                ResumeInput::Failed(error) => Err(error),
+                ResumeInput::Cancelled(reason) => Err(SemaError::eval(format!(
+                    "{} was cancelled ({reason:?})",
+                    state.op_name()
+                ))),
+                ResumeInput::Runtime(_) => Err(SemaError::eval(format!(
+                    "{}: unexpected runtime response while polling stdin",
+                    state.op_name()
+                ))),
+            }
+        }
+    }
+
+    fn park_stdin_aggregation(state: StdinAggregation, delay: Duration) -> NativeResult {
+        Ok(NativeOutcome::Suspend(NativeSuspend {
+            wait: WaitKind::Timer(delay),
+            continuation: Box::new(StdinAggregationContinuation { state: Some(state) }),
+        }))
+    }
+
+    #[cfg(unix)]
+    fn read_ready_stdin(buf: &mut [u8], op: &str) -> Result<Option<usize>, SemaError> {
+        // SAFETY: the fd set and timeval are initialized for a zero-timeout
+        // readiness check, and `buf` provides a valid writable region to
+        // `read(2)`. EINTR is reported as pending so the next structural wake
+        // retries without blocking the VM thread.
+        unsafe {
+            let mut readfds: libc::fd_set = std::mem::zeroed();
+            libc::FD_ZERO(&mut readfds);
+            libc::FD_SET(libc::STDIN_FILENO, &mut readfds);
+            let mut timeout = libc::timeval {
+                tv_sec: 0,
+                tv_usec: 0,
+            };
+            let ready = libc::select(
+                libc::STDIN_FILENO + 1,
+                &mut readfds,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut timeout,
+            );
+            if ready == 0 {
+                return Ok(None);
+            }
+            if ready < 0 {
+                let error = std::io::Error::last_os_error();
+                if error.kind() == std::io::ErrorKind::Interrupted {
+                    return Ok(None);
+                }
+                return Err(SemaError::eval(format!(
+                    "{op}: stdin readiness check failed: {error}"
+                )));
+            }
+
+            let read = libc::read(
+                libc::STDIN_FILENO,
+                buf.as_mut_ptr().cast::<libc::c_void>(),
+                buf.len(),
+            );
+            if read >= 0 {
+                return Ok(Some(read as usize));
+            }
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::Interrupted
+                || error.kind() == std::io::ErrorKind::WouldBlock
+            {
+                Ok(None)
+            } else {
+                Err(SemaError::eval(format!("{op}: stdin read failed: {error}")))
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn stdin_aggregation_step(mut state: StdinAggregation) -> NativeResult {
+        // Read at most one byte beyond the remaining allowance. That byte is
+        // enough to prove overflow while the aggregate buffer itself remains at
+        // or below the cap.
+        let read_len = capped_read_len(state.bytes.len(), state.cap);
+        let mut chunk = [0u8; STREAM_CHUNK_BYTES];
+        let Some(read) = read_ready_stdin(&mut chunk[..read_len], state.op_name())? else {
+            return park_stdin_aggregation(state, Duration::from_millis(5));
+        };
+        if read == 0 {
+            return state.finish();
+        }
+        let op = state.op_name();
+        extend_aggregation(&mut state.bytes, &chunk[..read], state.cap, op)?;
+        // A wake between every chunk makes a continuously-readable stdin
+        // cooperatively interruptible and gives runnable siblings a turn.
+        park_stdin_aggregation(state, Duration::from_millis(1))
+    }
+
+    #[cfg(not(unix))]
+    fn stdin_aggregation_step(state: StdinAggregation) -> NativeResult {
+        Err(SemaError::eval(format!(
+            "{}: whole-stdin aggregation is unavailable in a runtime quantum on this platform",
+            state.op_name()
+        ))
+        .with_hint("use stream/read in bounded chunks so each read remains cancellable"))
+    }
+
+    /// `stream/read-all`'s async dispatch. File input is checked out and read on
+    /// a worker under the captured cap; stdin uses the interruptible readiness
+    /// state machine above and never pins a worker while the pipe remains open.
     pub(super) fn maybe_async_read_all(
         stream: &Rc<StreamBox>,
+        cap: usize,
     ) -> Result<Option<NativeOutcome>, SemaError> {
         if !in_runtime_quantum() {
             return Ok(None);
         }
         if stream.stream_type() == "stdin" {
-            return crate::io::quarantined_compute("stream/read", Value::bytevector, move || {
-                let mut result = Vec::new();
-                let mut chunk = [0u8; 8192];
-                loop {
-                    let n = std::io::stdin()
-                        .read(&mut chunk)
-                        .map_err(|e| render(format!("stream/read: stdin: {e}")))?;
-                    if n == 0 {
-                        break;
-                    }
-                    result.extend_from_slice(&chunk[..n]);
-                }
-                Ok(result)
+            return stdin_aggregation_step(StdinAggregation {
+                bytes: Vec::new(),
+                cap,
+                destination: None,
             })
             .map(Some);
         }
@@ -1157,15 +1416,17 @@ mod io_streams {
             stream,
             move |reader: &mut BufReader<std::fs::File>| -> Result<Vec<u8>, String> {
                 let mut result = Vec::new();
-                let mut chunk = [0u8; 8192];
+                let mut chunk = [0u8; STREAM_CHUNK_BYTES];
                 loop {
+                    let read_len = capped_read_len(result.len(), cap);
                     let n = reader
-                        .read(&mut chunk)
+                        .read(&mut chunk[..read_len])
                         .map_err(|e| render(format!("stream/read: I/O error: {e}")))?;
                     if n == 0 {
                         break;
                     }
-                    result.extend_from_slice(&chunk[..n]);
+                    extend_aggregation(&mut result, &chunk[..n], cap, "stream/read-all")
+                        .map_err(|error| render(error.to_string()))?;
                 }
                 Ok(result)
             },
@@ -1421,23 +1682,49 @@ mod io_streams {
         )?))
     }
 
-    /// `stream/copy`'s async dispatch. See the module doc comment for the
-    /// three-way policy (both memory: sync; one file: checkout that side
-    /// only; both file: sync fallback, documented and deliberate).
+    /// `stream/copy`'s async dispatch. A single file side is checked out and
+    /// offloaded under the captured cap. Stdin uses cooperative readiness
+    /// polling. Two file resources are rejected rather than entering a
+    /// VM-thread EOF loop without ordered dual-gate acquisition.
     pub(super) fn maybe_async_copy(
         src: &Rc<StreamBox>,
         dst: &Rc<StreamBox>,
+        cap: usize,
     ) -> Result<Option<NativeOutcome>, SemaError> {
         if !in_runtime_quantum() {
             return Ok(None);
         }
+
+        if src.stream_type() == "stdin" {
+            if dst.stream_type() != "file-output" && dst.stream_type() != "byte-buffer" {
+                return Err(SemaError::eval(format!(
+                    "stream/copy: stdin copy to a {} stream is unavailable in a runtime quantum",
+                    dst.stream_type()
+                ))
+                .with_hint(
+                    "copy stdin into a byte-buffer or file-output, or use stream/read and stream/write in bounded chunks",
+                ));
+            }
+            return stdin_aggregation_step(StdinAggregation {
+                bytes: Vec::new(),
+                cap,
+                destination: Some(Value::stream_from_rc(dst.clone())),
+            })
+            .map(Some);
+        }
+
         let src_file = src.stream_type() == "file-input";
         let dst_file = dst.stream_type() == "file-output";
         if !src_file && !dst_file {
             return Ok(None);
         }
         if src_file && dst_file {
-            return Ok(None);
+            return Err(SemaError::eval(
+                "stream/copy: file-to-file copy is unavailable inside a runtime quantum; copy with stream/read and stream/write in bounded chunks",
+            )
+            .with_hint(
+                "ordered dual-resource acquisition is required for a one-call file-to-file copy",
+            ));
         }
 
         if src_file {
@@ -1450,15 +1737,17 @@ mod io_streams {
                 src,
                 move |reader: &mut BufReader<std::fs::File>| -> Result<Vec<u8>, String> {
                     let mut out = Vec::new();
-                    let mut chunk = [0u8; 8192];
+                    let mut chunk = [0u8; STREAM_CHUNK_BYTES];
                     loop {
+                        let read_len = capped_read_len(out.len(), cap);
                         let n = reader
-                            .read(&mut chunk)
+                            .read(&mut chunk[..read_len])
                             .map_err(|e| render(format!("stream/copy: I/O error: {e}")))?;
                         if n == 0 {
                             break;
                         }
-                        out.extend_from_slice(&chunk[..n]);
+                        extend_aggregation(&mut out, &chunk[..n], cap, "stream/copy")
+                            .map_err(|error| render(error.to_string()))?;
                     }
                     Ok(out)
                 },
@@ -1475,49 +1764,17 @@ mod io_streams {
             )?));
         }
 
-        // dst_file: src is an in-memory or *stdin* source.
-        //
-        // *stdin* does real, potentially-blocking I/O, so read AND write run on
-        // the worker: check out the file writer and stream stdin straight into it
-        // there. Keeps `(stream/copy *stdin* file-out)` from stalling the
-        // cooperative scheduler while it waits on input.
-        if src.stream_type() == "stdin" {
-            return Ok(Some(checkout_output(
-                "stream/copy",
-                "stream/write",
-                dst,
-                move |writer: &mut BufWriter<std::fs::File>| -> Result<usize, String> {
-                    let mut stdin = std::io::stdin();
-                    let mut chunk = [0u8; 8192];
-                    let mut total = 0usize;
-                    loop {
-                        let n = stdin
-                            .read(&mut chunk)
-                            .map_err(|e| render(format!("stream/copy: stdin: {e}")))?;
-                        if n == 0 {
-                            break;
-                        }
-                        writer
-                            .write_all(&chunk[..n])
-                            .map_err(|e| render(format!("stream/copy: I/O error: {e}")))?;
-                        total += n;
-                    }
-                    Ok(total)
-                },
-                move |total: usize| -> Result<Value, SemaError> { Ok(Value::int(total as i64)) },
-            )?));
-        }
-
         // In-memory source: reading is a fast in-process copy (no real I/O), so
-        // do it on the VM thread now, then offload the file write.
+        // build a bounded snapshot on the VM thread, then offload the file write.
         let mut buf = Vec::new();
-        let mut chunk = [0u8; 8192];
+        let mut chunk = [0u8; STREAM_CHUNK_BYTES];
         loop {
-            let n = src.read(&mut chunk)?;
+            let read_len = capped_read_len(buf.len(), cap);
+            let n = src.read(&mut chunk[..read_len])?;
             if n == 0 {
                 break;
             }
-            buf.extend_from_slice(&chunk[..n]);
+            extend_aggregation(&mut buf, &chunk[..n], cap, "stream/copy")?;
         }
         if buf.is_empty() {
             // Nothing read — the sync loop would never have touched dst

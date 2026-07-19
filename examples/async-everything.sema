@@ -148,10 +148,12 @@
         (stream/write-byte o 33) ; write-byte
         (stream/flush o)
         (stream/close o)) ; flush + close
-      (let ((i (stream/open-input src)) (o (stream/open-output dst)))
-        (stream/copy i o) ; copy
+      (let ((i (stream/open-input src)) (buf (stream/byte-buffer)))
+        (stream/copy i buf (* 16 1024 1024)) ; bounded file -> memory copy
         (stream/close i)
-        (stream/close o))
+        (let ((o (stream/open-output dst)))
+          (stream/write o (stream/to-bytes buf))
+          (stream/close o)))
       (let ((i (stream/open-input dst)))
         (let ((b0 (stream/read-byte i)) ; read-byte
               (line (stream/read-line i)) ; read-line

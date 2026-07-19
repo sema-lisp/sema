@@ -594,6 +594,9 @@ impl RuntimeState {
             .borrow_mut()
             .insert(Rc::new(self._context.snapshot_dynamic_task_state()));
         context
+            .borrow_mut()
+            .insert(Rc::new(self._context.snapshot_module_task_state()));
+        context
     }
 }
 

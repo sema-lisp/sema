@@ -2890,6 +2890,64 @@ mod runtime_eval_tests {
     }
 
     #[test]
+    fn pending_roots_resolve_relative_embedded_loads_from_their_submission_paths() {
+        let interp = Interpreter::new();
+        interp
+            .ctx
+            .set_embedded_file(std::path::PathBuf::from("left/dep.sema"), b":left".to_vec());
+        interp.ctx.set_embedded_file(
+            std::path::PathBuf::from("right/dep.sema"),
+            b":right".to_vec(),
+        );
+
+        interp
+            .ctx
+            .push_file_path(std::path::PathBuf::from("left/entry.sema"));
+        let left = interp
+            .submit_str(r#"(load "./dep.sema")"#, RootOptions::default())
+            .expect("submit left root");
+        interp.ctx.pop_file_path();
+
+        interp
+            .ctx
+            .push_file_path(std::path::PathBuf::from("right/entry.sema"));
+        let right = interp
+            .submit_str(r#"(load "./dep.sema")"#, RootOptions::default())
+            .expect("submit right root");
+        interp.ctx.pop_file_path();
+
+        let left = drive_selected_until_ready(&interp, &left);
+        let right = drive_selected_until_ready(&interp, &right);
+        assert_eq!(returned_value(&left), Value::keyword("left"));
+        assert_eq!(returned_value(&right), Value::keyword("right"));
+        assert_eq!(interp.ctx.current_file_path(), None);
+    }
+
+    #[test]
+    fn spawned_children_inherit_the_root_module_resolution_context() {
+        let interp = Interpreter::new();
+        interp.ctx.set_embedded_file(
+            std::path::PathBuf::from("nested/dep.sema"),
+            b":child".to_vec(),
+        );
+
+        interp
+            .ctx
+            .push_file_path(std::path::PathBuf::from("nested/entry.sema"));
+        let root = interp
+            .submit_str(
+                r#"(await (async/spawn (fn () (load "./dep.sema"))))"#,
+                RootOptions::default(),
+            )
+            .expect("submit spawning root");
+        interp.ctx.pop_file_path();
+
+        let settlement = drive_selected_until_ready(&interp, &root);
+        assert_eq!(returned_value(&settlement), Value::keyword("child"));
+        assert_eq!(interp.ctx.current_file_path(), None);
+    }
+
+    #[test]
     fn runtime_concurrent_roots_isolate_dynamic_context_until_settlement() {
         let interp = Interpreter::new();
         interp

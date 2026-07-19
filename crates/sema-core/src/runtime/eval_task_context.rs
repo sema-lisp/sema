@@ -226,6 +226,14 @@ impl ModuleTaskState {
         remove_scope(&mut self.inner.borrow_mut().current_files, id).is_some()
     }
 
+    pub fn pop_current_file(&self) -> Option<PathBuf> {
+        self.inner
+            .borrow_mut()
+            .current_files
+            .pop()
+            .map(|entry| entry.value)
+    }
+
     pub fn loading(&self) -> Vec<PathBuf> {
         self.inner
             .borrow()
@@ -277,6 +285,14 @@ impl ModuleTaskState {
 
     pub fn remove_exports(&self, id: ScopeId) -> bool {
         self.take_exports(id).is_some()
+    }
+
+    pub fn pop_exports(&self) -> Option<Option<Vec<String>>> {
+        self.inner
+            .borrow_mut()
+            .exports
+            .pop()
+            .map(|entry| entry.value)
     }
 }
 

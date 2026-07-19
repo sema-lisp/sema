@@ -10,12 +10,12 @@ use sema_core::{
         CancelReason, CancellationParent, CompletionDecoder, CompletionDelivery, CompletionKind,
         CompletionRegistrar, CompletionSender, DynamicTaskState, ExecutorAttachError,
         ExecutorDispatch, ExecutorLease, ExecutorShutdown, ExecutorSnapshot, ExternalCompletion,
-        IdCounter, InterruptibleResource, IoExecutor, LifetimeOwner, NativeCall, NativeCallContext,
-        NativeContinuation, NativeOutcome, NativeResult, NativeSuspend, PreparedExternalOperation,
-        ResumeInput, RootId, RunningSubmission, RuntimeId, RuntimeScopedIdCounter,
-        RuntimeScopedIdIssuers, ScopeId, SettlementSeq, SubmissionRejected, SubmitErrorKind,
-        TaskContextHandle, TaskId, TaskOutcome, TaskRelations, Trace, WaitGeneration, WaitId,
-        WaitKind,
+        IdCounter, InterruptibleResource, IoExecutor, LifetimeOwner, ModuleTaskState, NativeCall,
+        NativeCallContext, NativeContinuation, NativeOutcome, NativeResult, NativeSuspend,
+        PreparedExternalOperation, ResumeInput, RootId, RunningSubmission, RuntimeId,
+        RuntimeScopedIdCounter, RuntimeScopedIdIssuers, ScopeId, SettlementSeq, SubmissionRejected,
+        SubmitErrorKind, TaskContextHandle, TaskId, TaskOutcome, TaskRelations, Trace,
+        WaitGeneration, WaitId, WaitKind,
     },
     SemaError, Value,
 };
@@ -3495,6 +3495,10 @@ impl NativeContinuation for ChannelDeferContinuation {
             "inline channel continuation requires a seeded dynamic task state"
         );
         assert!(
+            context.task_context.get::<ModuleTaskState>().is_some(),
+            "inline channel continuation requires a seeded module task state"
+        );
+        assert!(
             matches!(
                 input,
                 ResumeInput::Runtime(sema_core::runtime::RuntimeResponse::Send(
@@ -3530,6 +3534,10 @@ fn channel_defer_native(
         assert!(
             context.task_context.get::<DynamicTaskState>().is_some(),
             "inline channel native requires a seeded dynamic task state"
+        );
+        assert!(
+            context.task_context.get::<ModuleTaskState>().is_some(),
+            "inline channel native requires a seeded module task state"
         );
         context.eval_context.context_set(
             Value::keyword("inline-channel-context-seam"),
@@ -4783,6 +4791,10 @@ impl CompletionDecoder for ContextIdentityDecoder {
             context.task_context.get::<DynamicTaskState>().is_some(),
             "external decoder requires a seeded dynamic task state"
         );
+        assert!(
+            context.task_context.get::<ModuleTaskState>().is_some(),
+            "external decoder requires a seeded module task state"
+        );
         let key = Value::keyword("runtime-context-seam");
         assert_eq!(
             context.eval_context.context_get(&key),
@@ -4820,6 +4832,10 @@ impl NativeContinuation for ContextIdentityContinuation {
         assert!(
             context.task_context.get::<DynamicTaskState>().is_some(),
             "external continuation requires a seeded dynamic task state"
+        );
+        assert!(
+            context.task_context.get::<ModuleTaskState>().is_some(),
+            "external continuation requires a seeded module task state"
         );
         assert!(matches!(input, ResumeInput::Returned(_)));
         let key = Value::keyword("runtime-context-seam");
@@ -4892,6 +4908,10 @@ fn runtime_native_external_decoder_and_continuations_keep_owning_eval_context() 
                 assert!(
                     context.task_context.get::<DynamicTaskState>().is_some(),
                     "runtime native requires a seeded dynamic task state"
+                );
+                assert!(
+                    context.task_context.get::<ModuleTaskState>().is_some(),
+                    "runtime native requires a seeded module task state"
                 );
                 let key = Value::keyword("runtime-context-seam");
                 assert_eq!(context.eval_context.context_get(&key), None);

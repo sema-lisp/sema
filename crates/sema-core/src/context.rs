@@ -6,7 +6,8 @@ use std::rc::Rc;
 use std::time::Instant;
 
 use crate::runtime::{
-    apply_dynamic_mutations, DynamicStackIdentities, DynamicTaskState, TaskContextHandle,
+    apply_dynamic_mutations, DynamicStackIdentities, DynamicTaskState, ModuleTaskState, ScopeId,
+    TaskContextHandle,
 };
 use crate::{CallFrame, Env, Sandbox, SemaError, Span, SpanMap, StackTrace, Value};
 
@@ -135,12 +136,18 @@ struct InstalledTaskContext {
     // The canonical state is still the extension owned by `handle`; every
     // installation refreshes this cached clone of the same Rc.
     dynamic: Option<Rc<DynamicTaskState>>,
+    module: Option<Rc<ModuleTaskState>>,
 }
 
 impl InstalledTaskContext {
     fn new(handle: TaskContextHandle) -> Self {
         let dynamic = handle.get_rc::<DynamicTaskState>();
-        Self { handle, dynamic }
+        let module = handle.get_rc::<ModuleTaskState>();
+        Self {
+            handle,
+            dynamic,
+            module,
+        }
     }
 }
 
@@ -149,7 +156,16 @@ impl InstalledTaskContext {
 /// by [`EvalContext::enter_module_load`].
 pub struct ModuleLoadGuard<'a> {
     ctx: &'a EvalContext,
-    path: PathBuf,
+    scope: ModuleLoadScope,
+}
+
+#[derive(Debug)]
+enum ModuleLoadScope {
+    Ambient(PathBuf),
+    Task {
+        state: Rc<ModuleTaskState>,
+        scope: ScopeId,
+    },
 }
 
 pub struct TaskContextGuard<'a> {
@@ -165,8 +181,28 @@ impl Drop for TaskContextGuard<'_> {
 
 impl Drop for ModuleLoadGuard<'_> {
     fn drop(&mut self) {
-        self.ctx.end_module_load(&self.path);
+        match &self.scope {
+            ModuleLoadScope::Ambient(path) => self.ctx.end_module_load(path),
+            ModuleLoadScope::Task { state, scope } => {
+                state.remove_loading(*scope);
+            }
+        }
     }
+}
+
+fn check_module_cycle(stack: &[PathBuf], path: &PathBuf) -> Result<(), SemaError> {
+    let Some(pos) = stack.iter().position(|candidate| candidate == path) else {
+        return Ok(());
+    };
+    let mut cycle: Vec<String> = stack[pos..]
+        .iter()
+        .map(|entry| entry.display().to_string())
+        .collect();
+    cycle.push(path.display().to_string());
+    Err(SemaError::eval(format!(
+        "cyclic import detected: {}",
+        cycle.join(" -> ")
+    )))
 }
 
 impl EvalContext {
@@ -255,6 +291,13 @@ impl EvalContext {
             .borrow()
             .as_ref()
             .and_then(|installed| installed.dynamic.clone())
+    }
+
+    fn module_task_state(&self) -> Option<Rc<ModuleTaskState>> {
+        self.task_context
+            .borrow()
+            .as_ref()
+            .and_then(|installed| installed.module.clone())
     }
 
     pub fn enter_runtime_quantum(&self) -> Result<RuntimeQuantumGuard<'_>, SemaError> {
@@ -354,21 +397,32 @@ impl EvalContext {
     }
 
     pub fn push_file_path(&self, path: PathBuf) {
+        if let Some(state) = self.module_task_state() {
+            state
+                .push_current_file(path)
+                .expect("module current-file scope identity exhausted");
+            return;
+        }
         self.current_file.borrow_mut().push(path);
     }
 
     pub fn pop_file_path(&self) {
+        if let Some(state) = self.module_task_state() {
+            state.pop_current_file();
+            return;
+        }
         self.current_file.borrow_mut().pop();
     }
 
     pub fn current_file_dir(&self) -> Option<PathBuf> {
-        self.current_file
-            .borrow()
-            .last()
-            .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+        self.current_file_path()
+            .and_then(|path| path.parent().map(|dir| dir.to_path_buf()))
     }
 
     pub fn current_file_path(&self) -> Option<PathBuf> {
+        if let Some(state) = self.module_task_state() {
+            return state.current_file();
+        }
         self.current_file.borrow().last().cloned()
     }
 
@@ -401,6 +455,10 @@ impl EvalContext {
     }
 
     pub fn set_module_exports(&self, names: Vec<String>) {
+        if let Some(state) = self.module_task_state() {
+            state.set_current_exports(names);
+            return;
+        }
         let mut stack = self.module_exports.borrow_mut();
         if let Some(top) = stack.last_mut() {
             *top = Some(names);
@@ -408,10 +466,19 @@ impl EvalContext {
     }
 
     pub fn clear_module_exports(&self) {
+        if let Some(state) = self.module_task_state() {
+            state
+                .push_exports(None)
+                .expect("module export scope identity exhausted");
+            return;
+        }
         self.module_exports.borrow_mut().push(None);
     }
 
     pub fn take_module_exports(&self) -> Option<Vec<String>> {
+        if let Some(state) = self.module_task_state() {
+            return state.pop_exports().flatten();
+        }
         self.module_exports.borrow_mut().pop().flatten()
     }
 
@@ -419,25 +486,21 @@ impl EvalContext {
     /// returned [`ModuleLoadGuard`] pops the load stack when dropped, keeping it
     /// balanced on any exit path. Errors if `path` is already being loaded.
     pub fn enter_module_load(&self, path: PathBuf) -> Result<ModuleLoadGuard<'_>, SemaError> {
-        self.begin_module_load(&path)?;
-        Ok(ModuleLoadGuard { ctx: self, path })
+        let scope = self.begin_module_load(&path)?;
+        Ok(ModuleLoadGuard { ctx: self, scope })
     }
 
-    fn begin_module_load(&self, path: &PathBuf) -> Result<(), SemaError> {
-        let mut stack = self.module_load_stack.borrow_mut();
-        if let Some(pos) = stack.iter().position(|p| p == path) {
-            let mut cycle: Vec<String> = stack[pos..]
-                .iter()
-                .map(|p| p.display().to_string())
-                .collect();
-            cycle.push(path.display().to_string());
-            return Err(SemaError::eval(format!(
-                "cyclic import detected: {}",
-                cycle.join(" -> ")
-            )));
+    fn begin_module_load(&self, path: &PathBuf) -> Result<ModuleLoadScope, SemaError> {
+        if let Some(state) = self.module_task_state() {
+            check_module_cycle(&state.loading(), path)?;
+            let scope = state
+                .push_loading(path.clone())
+                .map_err(|error| SemaError::eval(format!("module load scope: {error}")))?;
+            return Ok(ModuleLoadScope::Task { state, scope });
         }
-        stack.push(path.clone());
-        Ok(())
+        check_module_cycle(&self.module_load_stack.borrow(), path)?;
+        self.module_load_stack.borrow_mut().push(path.clone());
+        Ok(ModuleLoadScope::Ambient(path.clone()))
     }
 
     fn end_module_load(&self, path: &PathBuf) {
@@ -720,6 +783,17 @@ impl EvalContext {
         )
     }
 
+    /// Capture the transient module-resolution scopes inherited by a new root.
+    /// These scopes are task-private and never publish back at settlement.
+    #[doc(hidden)]
+    pub fn snapshot_module_task_state(&self) -> ModuleTaskState {
+        ModuleTaskState::from_snapshot(
+            self.current_file.borrow().clone(),
+            self.module_load_stack.borrow().clone(),
+            self.module_exports.borrow().clone(),
+        )
+    }
+
     /// Publish and drain one root snapshot's mutation journal. Child snapshots
     /// carry no journal and return `false` without changing interpreter state.
     #[doc(hidden)]
@@ -885,6 +959,81 @@ mod tests {
             dynamic.user_get(&Value::keyword("key")),
             Some(Value::int(42))
         );
+    }
+
+    #[test]
+    fn installed_module_state_is_accessible_while_task_context_is_borrowed() {
+        let context = EvalContext::new();
+        context.push_file_path(PathBuf::from("ambient/entry.sema"));
+        let handle = crate::runtime::TaskContextHandle::default();
+        let module = Rc::new(context.snapshot_module_task_state());
+        handle.borrow_mut().insert(Rc::clone(&module));
+        let _scope = context.scope_task_context(handle.clone());
+
+        let held_by_native_call = handle.borrow_mut();
+        assert_eq!(
+            context.current_file_path(),
+            Some(PathBuf::from("ambient/entry.sema"))
+        );
+        context.push_file_path(PathBuf::from("task/module.sema"));
+        context.clear_module_exports();
+        context.set_module_exports(vec!["answer".to_string()]);
+        let load = context
+            .enter_module_load(PathBuf::from("task/module.sema"))
+            .expect("task-local module-load scope");
+
+        assert_eq!(
+            context.current_file_path(),
+            Some(PathBuf::from("task/module.sema"))
+        );
+        assert_eq!(
+            context.take_module_exports(),
+            Some(vec!["answer".to_string()])
+        );
+        assert_eq!(module.loading(), vec![PathBuf::from("task/module.sema")]);
+        drop(load);
+        assert!(module.loading().is_empty());
+        context.pop_file_path();
+        assert_eq!(
+            context.current_file_path(),
+            Some(PathBuf::from("ambient/entry.sema"))
+        );
+        drop(held_by_native_call);
+
+        assert_eq!(
+            context.current_file.borrow().as_slice(),
+            &[PathBuf::from("ambient/entry.sema")]
+        );
+        assert!(context.module_exports.borrow().is_empty());
+        assert!(context.module_load_stack.borrow().is_empty());
+    }
+
+    #[test]
+    fn module_load_guards_do_not_cross_task_states_with_colliding_scope_ids() {
+        let context_a = EvalContext::new();
+        let context_b = EvalContext::new();
+        let state_a = Rc::new(ModuleTaskState::default());
+        let state_b = Rc::new(ModuleTaskState::default());
+        let handle_a = crate::runtime::TaskContextHandle::default();
+        let handle_b = crate::runtime::TaskContextHandle::default();
+        handle_a.borrow_mut().insert(Rc::clone(&state_a));
+        handle_b.borrow_mut().insert(Rc::clone(&state_b));
+        let _scope_a = context_a.scope_task_context(handle_a);
+        let _scope_b = context_b.scope_task_context(handle_b);
+
+        let guard_a = context_a
+            .enter_module_load(PathBuf::from("same.sema"))
+            .expect("task A load scope");
+        let guard_b = context_b
+            .enter_module_load(PathBuf::from("same.sema"))
+            .expect("task B load scope");
+        assert_eq!(state_a.loading(), state_b.loading());
+
+        drop(guard_a);
+        assert!(state_a.loading().is_empty());
+        assert_eq!(state_b.loading(), vec![PathBuf::from("same.sema")]);
+        drop(guard_b);
+        assert!(state_b.loading().is_empty());
     }
 
     #[test]

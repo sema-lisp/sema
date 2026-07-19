@@ -57,6 +57,35 @@ impl Drop for TempFile {
     }
 }
 
+fn eval_with_stdin(program: &str, input: &[u8]) -> String {
+    use std::io::Write;
+    use std::process::Stdio;
+
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_sema"))
+        .args(["--no-llm", "-e", program])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn sema with piped stdin");
+    child
+        .stdin
+        .take()
+        .expect("piped stdin")
+        .write_all(input)
+        .expect("write complete stdin fixture");
+    let output = child.wait_with_output().expect("collect sema output");
+    assert!(
+        output.status.success(),
+        "sema exited non-zero: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout)
+        .expect("sema output is UTF-8")
+        .trim()
+        .to_string()
+}
+
 // === Scheduler-not-stalled: a sibling task completes while a stream/* op is in flight ===
 //
 // Pre-conversion, `stream/read-line` never yields, so the sibling (which
@@ -428,6 +457,70 @@ fn stream_aggregation_caps_accept_the_boundary_and_reject_one_byte_over() {
         exact_copy,
         Value::list(vec![Value::int(8), Value::string("12345678")])
     );
+
+    interp
+        .eval_str_compiled(
+            r#"(define multi-copy-src
+                   (stream/from-string (string/repeat "x" 16385)))
+                (define multi-copy-dst (stream/byte-buffer))"#,
+        )
+        .expect("define multi-chunk copy streams");
+    let multi_copy_err = interp
+        .eval_str_compiled("(stream/copy multi-copy-src multi-copy-dst 16384)")
+        .expect_err("copy rejects the overflow witness after multiple chunks");
+    assert!(multi_copy_err.to_string().contains("16384-byte cap"));
+    let copied_prefix = interp
+        .eval_str_compiled("(stream/to-bytes multi-copy-dst)")
+        .expect("inspect multi-chunk rejected destination");
+    assert_eq!(
+        copied_prefix.as_bytevector().map(<[u8]>::len),
+        Some(16384),
+        "the one-byte overflow witness must be rejected before its destination write"
+    );
+}
+
+#[test]
+fn stdin_operations_share_buffered_bytes_sequentially_and_concurrently() {
+    let sequential_read = eval_with_stdin(
+        r#"(list
+              (utf8->string (stream/read *stdin* 1))
+              (utf8->string (stream/read-all *stdin* 16)))"#,
+        b"abc",
+    );
+    assert_eq!(sequential_read, r#"("a" "bc")"#);
+
+    let sequential_line = eval_with_stdin(
+        r#"(list
+              (stream/read-line *stdin*)
+              (utf8->string (stream/read-all *stdin* 16)))"#,
+        b"a\nbc",
+    );
+    assert_eq!(sequential_line, r#"("a" "bc")"#);
+
+    let sequential_copy = eval_with_stdin(
+        r#"(let ((dst (stream/byte-buffer)))
+              (list
+                (utf8->string (stream/read *stdin* 1))
+                (stream/copy *stdin* dst 16)
+                (utf8->string (stream/to-bytes dst))))"#,
+        b"abc",
+    );
+    assert_eq!(sequential_copy, r#"("a" 2 "bc")"#);
+
+    let concurrent = eval_with_stdin(
+        r#"(let ((first
+                   (async/spawn
+                     (fn () (utf8->string (stream/read *stdin* 3)))))
+                  (rest
+                   (async/spawn
+                     (fn () (utf8->string (stream/read-all *stdin* 16))))))
+              (async/all (list first rest)))"#,
+        b"abcdef",
+    );
+    assert_eq!(
+        concurrent, r#"("abc" "def")"#,
+        "stdin operations must acquire FIFO ownership and consume disjoint bytes"
+    );
 }
 
 #[test]
@@ -571,7 +664,6 @@ fn stream_file_async_copy_file_to_file_fails_fast_with_chunk_guidance() {
     let _ = std::fs::remove_file(&dst_path);
 }
 
-#[cfg(unix)]
 fn assert_open_stdin_operations_are_cancellable(program: &str, expected_cancellations: usize) {
     use std::process::Stdio;
     use std::time::{Duration, Instant};
@@ -584,9 +676,9 @@ fn assert_open_stdin_operations_are_cancellable(program: &str, expected_cancella
         .spawn()
         .expect("spawn sema with an open stdin pipe");
 
-    // Deliberately keep the writer open and empty. A worker blocked in
-    // `stdin.read()` cannot observe EOF; the cooperative readiness path can be
-    // cancelled and lets the sibling/root settle anyway.
+    // Deliberately keep the writer open and empty. The coordinated owner may
+    // wait in its dedicated reader, but the logical operations remain
+    // cancellable and let the sibling/root settle without a runtime worker.
     let open_stdin = child.stdin.take().expect("piped stdin");
     // Process startup can contend with other nextest cases; the old pinned
     // worker survives indefinitely while this cooperative path exits promptly.
@@ -622,7 +714,6 @@ fn assert_open_stdin_operations_are_cancellable(program: &str, expected_cancella
     );
 }
 
-#[cfg(unix)]
 #[test]
 fn cancelled_open_stdin_aggregations_exit_without_pinned_workers_or_gates() {
     let destination = TempFile::new("stdin-copy-cancel");
@@ -656,20 +747,85 @@ fn cancelled_open_stdin_aggregations_exit_without_pinned_workers_or_gates() {
 }
 
 #[test]
+fn cancelled_stdin_owner_releases_its_lease_and_preserves_inflight_bytes() {
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::process::Stdio;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let program = r#"
+        (let ((pending (async/spawn (fn () (stream/read-all *stdin* 64)))))
+          (async/sleep 20)
+          (async/cancel pending)
+          (try (await pending) (catch e nil))
+          (stream/write-string *stdout* "lease-released\n")
+          (stream/flush *stdout*)
+          (utf8->string (stream/read *stdin* 1)))
+    "#;
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_sema"))
+        .args(["--no-llm", "-e", program])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn sema with piped stdin");
+    let mut stdin = child.stdin.take().expect("piped stdin");
+    let stdout = child.stdout.take().expect("piped stdout");
+    let (send_marker, receive_marker) = mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        let mut stdout = BufReader::new(stdout);
+        let mut marker = String::new();
+        let result = stdout.read_line(&mut marker).map(|_| (marker, stdout));
+        let _ = send_marker.send(result);
+    });
+
+    let (marker, mut stdout) = match receive_marker.recv_timeout(Duration::from_secs(10)) {
+        Ok(Ok(marker)) => marker,
+        Ok(Err(error)) => panic!("read lease-release marker: {error}"),
+        Err(error) => {
+            let _ = child.kill();
+            panic!("cancelled stdin owner did not release its lease: {error}");
+        }
+    };
+    assert_eq!(marker, "lease-released\n");
+
+    // The owner's OS read was already in flight for the cancelled aggregate.
+    // Its byte must stay in the owner buffer and satisfy the next FIFO reader.
+    stdin.write_all(b"z").expect("write post-cancel byte");
+    drop(stdin);
+    let status = child.wait().expect("wait for sema child");
+    let mut remaining_stdout = String::new();
+    stdout
+        .read_to_string(&mut remaining_stdout)
+        .expect("read post-marker stdout");
+    let mut stderr = String::new();
+    child
+        .stderr
+        .take()
+        .expect("piped stderr")
+        .read_to_string(&mut stderr)
+        .expect("read child stderr");
+    assert!(status.success(), "sema exited non-zero: {stderr}");
+    assert_eq!(remaining_stdout.trim(), r#""z""#);
+}
+
+#[test]
 fn file_read_all_suspends_so_a_sibling_progresses_and_cleanup_reaches_baseline() {
     let input = TempFile::with_contents("read-all-sibling", &"x".repeat(32 * 1024));
     let interp = Interpreter::new();
     let result = interp
         .eval_str_compiled(&format!(
             r#"
-            (let ((events (channel/new 2)))
+            (let ((stream (stream/open-input "{path}"))
+                  (events (channel/new 2)))
               (async/all (list
                 (async/spawn (fn ()
-                  (with-stream (s (stream/open-input "{path}"))
-                    (stream/read-all s 32768))
+                  (stream/read-all stream 32768)
                   (channel/send events :aggregate)))
                 (async/spawn (fn () (channel/send events :sibling)))))
-              (list (channel/recv events) (channel/recv events)))
+              (let ((result (list (channel/recv events) (channel/recv events))))
+                (stream/close stream)
+                result))
             "#,
             path = input.path()
         ))

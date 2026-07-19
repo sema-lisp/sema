@@ -299,11 +299,12 @@
   values are: …" list out of the 400, and the temperature / effort-tools /
   effort-value backstops now **chain** through one bounded retry loop so a
   request tripping several at once recovers in a single turn.
-- **`stream/copy`, `stream/read`, and `stream/read-line` on `*stdin*` no longer
-  block the async scheduler.** Inside `async`, a blocking stdin read is now
-  offloaded to a worker (matching the file-backed path) instead of running
-  synchronously on the VM thread, so a `(stream/copy *stdin* out)` can't stall
-  cooperative scheduling while it waits on input.
+- **All `*stdin*` stream operations share one interruptible owner.** Finite
+  reads, line reads, `stream/read-all`, and `stream/copy` acquire FIFO ownership
+  and consume one bounded buffer on every native platform, so mixing them
+  cannot lose bytes already buffered by an earlier read. Runtime calls poll the
+  owner structurally, so waiting on an open stdin never blocks the VM or pins a
+  runtime worker; cancellation releases queued ownership promptly.
 - **Installed `sema web` builds now contain their browser runtime.** The
   crates.io package, GitHub release archives, shell installer, and Homebrew
   formula embed the WASM VM and JavaScript runtime and work offline. Version
@@ -385,11 +386,11 @@
     a concurrent op on the same handle.
   - File-backed `stream/*` offloads via a per-stream checkout; in-memory
     streams (`stream/from-string`, `stream/byte-buffer`, …) stay synchronous
-    everywhere — nothing to offload. A `stream/copy` between two file-backed
-    streams keeps its synchronous loop even in async context (avoiding a
-    two-resource checkout that could deadlock against a reverse copy) — a
-    narrow, documented exception; a copy with only one file-backed side
-    offloads normally.
+    everywhere — nothing to offload. A runtime `stream/copy` between two
+    file-backed streams fails promptly with guidance to copy in bounded chunks,
+    because safely offloading both ends requires ordered dual-resource
+    acquisition; a copy with only one file-backed side offloads normally. The
+    direct host ABI retains its bounded synchronous file-to-file loop.
   - `kv/*`'s disk flush (the whole-store rewrite behind `kv/set`/`kv/delete`)
     offloads too, but the call still doesn't resolve until the flush
     completes — the write-through durability contract (a crash right after

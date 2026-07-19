@@ -23,10 +23,11 @@
 //! cancel tombstones the slot (best-effort). `stream/open-input`/
 //! `stream/open-output` offload the initial `File::open`/`File::create` on a
 //! quarantined-bounded External wait (`crate::io::quarantined_compute`, `io.rs`)
-//! — there is no existing stream to contend over, mirroring `db/open`. Finite
-//! stdin reads use that path; whole-stdin aggregation uses nonblocking readiness
-//! checks plus structural timer wakes, so cancellation never leaves a worker
-//! pinned on an open pipe.
+//! — there is no existing stream to contend over, mirroring `db/open`. Stdin
+//! has one process-wide owner on every native platform: it serializes complete
+//! operations FIFO, reads into a bounded on-demand buffer, and exposes
+//! nonblocking polls to runtime continuations. Cancellation releases the
+//! logical operation without pinning a runtime worker on an open pipe.
 //!
 //! `stream/read-all` and `stream/copy` accept an optional final `max-bytes`
 //! argument and default to 256 MiB. The captured cap is checked before every
@@ -576,8 +577,10 @@ pub fn register(env: &sema_core::Env) {
 #[cfg(not(target_arch = "wasm32"))]
 mod io_streams {
     use super::*;
+    use std::collections::VecDeque;
     use std::io::{BufRead, BufReader, BufWriter, Read, Write};
     use std::rc::Rc;
+    use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
     use std::time::Duration;
 
     use sema_core::cycle::GcEdge;
@@ -1120,6 +1123,309 @@ mod io_streams {
         }
     }
 
+    // ── Coordinated stdin owner ────────────────────────────────────
+
+    /// Maximum data the stdin owner reads for one request. The owner reads only
+    /// on demand and never starts a second read while buffered data remains, so
+    /// its explicit buffer stays within one chunk (apart from bytes Rust's
+    /// process-global `Stdin` may retain internally).
+    const STDIN_OWNER_CHUNK_BYTES: usize = STREAM_CHUNK_BYTES;
+
+    struct StdinOwnerState {
+        buffer: VecDeque<u8>,
+        eof: bool,
+        error: Option<String>,
+        queue: VecDeque<u64>,
+        next_id: u64,
+        demand: usize,
+        read_in_flight: bool,
+        version: u64,
+    }
+
+    impl StdinOwnerState {
+        fn new() -> Self {
+            Self {
+                buffer: VecDeque::with_capacity(STDIN_OWNER_CHUNK_BYTES),
+                eof: false,
+                error: None,
+                queue: VecDeque::new(),
+                next_id: 1,
+                demand: 0,
+                read_in_flight: false,
+                version: 0,
+            }
+        }
+
+        fn changed(&mut self) {
+            self.version = self.version.wrapping_add(1);
+        }
+    }
+
+    struct StdinOwner {
+        state: Mutex<StdinOwnerState>,
+        changed: Condvar,
+    }
+
+    enum StdinPoll {
+        Data(Vec<u8>),
+        Eof,
+        Pending(u64),
+    }
+
+    impl StdinOwner {
+        fn start() -> Arc<Self> {
+            let owner = Arc::new(Self {
+                state: Mutex::new(StdinOwnerState::new()),
+                changed: Condvar::new(),
+            });
+            let reader = owner.clone();
+            if let Err(error) = std::thread::Builder::new()
+                .name("sema-stdin-owner".to_string())
+                .spawn(move || reader.reader_loop())
+            {
+                let mut state = owner.lock();
+                state.error = Some(format!("could not start stdin owner: {error}"));
+                state.changed();
+                owner.changed.notify_all();
+            }
+            owner
+        }
+
+        fn lock(&self) -> MutexGuard<'_, StdinOwnerState> {
+            self.state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+        }
+
+        fn reader_loop(&self) {
+            let mut stdin = std::io::stdin();
+            loop {
+                let demand = {
+                    let mut state = self.lock();
+                    while state.demand == 0 && state.error.is_none() && !state.eof {
+                        state = self
+                            .changed
+                            .wait(state)
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    }
+                    if state.error.is_some() || state.eof {
+                        return;
+                    }
+                    let demand = state.demand.min(STDIN_OWNER_CHUNK_BYTES);
+                    state.demand = 0;
+                    state.read_in_flight = true;
+                    demand
+                };
+
+                let mut chunk = vec![0u8; demand];
+                let result = stdin.read(&mut chunk);
+                let mut state = self.lock();
+                state.read_in_flight = false;
+                // A request may have been cancelled or superseded while the
+                // OS read was in flight. The returned bytes satisfy the next
+                // owner too, so discard any newer demand until the buffer is
+                // consumed and that owner polls again.
+                state.demand = 0;
+                match result {
+                    Ok(0) => state.eof = true,
+                    Ok(read) => state.buffer.extend(&chunk[..read]),
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(error) => state.error = Some(error.to_string()),
+                }
+                state.changed();
+                self.changed.notify_all();
+            }
+        }
+
+        fn acquire(self: &Arc<Self>) -> StdinLease {
+            let mut state = self.lock();
+            let id = state.next_id;
+            state.next_id = state.next_id.wrapping_add(1).max(1);
+            state.queue.push_back(id);
+            state.changed();
+            self.changed.notify_all();
+            StdinLease {
+                owner: self.clone(),
+                id,
+                released: false,
+            }
+        }
+
+        fn poll(
+            &self,
+            id: u64,
+            max: usize,
+            delimiter: Option<u8>,
+            op: &str,
+        ) -> Result<StdinPoll, SemaError> {
+            let mut state = self.lock();
+            if state.queue.front().copied() != Some(id) {
+                return Ok(StdinPoll::Pending(state.version));
+            }
+            if max == 0 {
+                return Ok(StdinPoll::Data(Vec::new()));
+            }
+            if !state.buffer.is_empty() {
+                let available = max.min(state.buffer.len());
+                let take = delimiter
+                    .and_then(|delimiter| {
+                        state
+                            .buffer
+                            .iter()
+                            .take(available)
+                            .position(|byte| *byte == delimiter)
+                            .map(|position| position + 1)
+                    })
+                    .unwrap_or(available);
+                let data = state.buffer.drain(..take).collect();
+                state.changed();
+                self.changed.notify_all();
+                return Ok(StdinPoll::Data(data));
+            }
+            if let Some(error) = &state.error {
+                return Err(SemaError::eval(format!("{op}: stdin: {error}")));
+            }
+            if state.eof {
+                return Ok(StdinPoll::Eof);
+            }
+            if !state.read_in_flight {
+                state.demand = max.min(STDIN_OWNER_CHUNK_BYTES);
+                self.changed.notify_all();
+            }
+            Ok(StdinPoll::Pending(state.version))
+        }
+
+        fn release(&self, id: u64) {
+            let mut state = self.lock();
+            let was_active = state.queue.front().copied() == Some(id);
+            if let Some(position) = state.queue.iter().position(|queued| *queued == id) {
+                state.queue.remove(position);
+            }
+            if was_active && !state.read_in_flight {
+                state.demand = 0;
+            }
+            state.changed();
+            self.changed.notify_all();
+        }
+
+        fn wait_for_change(&self, version: u64) {
+            let mut state = self.lock();
+            while state.version == version {
+                state = self
+                    .changed
+                    .wait(state)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+            }
+        }
+    }
+
+    struct StdinLease {
+        owner: Arc<StdinOwner>,
+        id: u64,
+        released: bool,
+    }
+
+    impl StdinLease {
+        fn poll(
+            &self,
+            max: usize,
+            delimiter: Option<u8>,
+            op: &str,
+        ) -> Result<StdinPoll, SemaError> {
+            self.owner.poll(self.id, max, delimiter, op)
+        }
+
+        fn blocking_read(
+            &self,
+            max: usize,
+            delimiter: Option<u8>,
+            op: &str,
+        ) -> Result<Option<Vec<u8>>, SemaError> {
+            loop {
+                match self.poll(max, delimiter, op)? {
+                    StdinPoll::Data(data) => return Ok(Some(data)),
+                    StdinPoll::Eof => return Ok(None),
+                    StdinPoll::Pending(version) => self.owner.wait_for_change(version),
+                }
+            }
+        }
+    }
+
+    impl Drop for StdinLease {
+        fn drop(&mut self) {
+            if !self.released {
+                self.owner.release(self.id);
+                self.released = true;
+            }
+        }
+    }
+
+    fn stdin_owner() -> &'static Arc<StdinOwner> {
+        static OWNER: OnceLock<Arc<StdinOwner>> = OnceLock::new();
+        OWNER.get_or_init(StdinOwner::start)
+    }
+
+    fn blocking_stdin_read(max: usize, op: &str) -> Result<Vec<u8>, SemaError> {
+        if max == 0 {
+            return Ok(Vec::new());
+        }
+        let lease = stdin_owner().acquire();
+        Ok(lease.blocking_read(max, None, op)?.unwrap_or_default())
+    }
+
+    fn blocking_stdin_read_line() -> Result<Option<String>, SemaError> {
+        let lease = stdin_owner().acquire();
+        let mut line = Vec::new();
+        loop {
+            let Some(chunk) =
+                lease.blocking_read(STDIN_OWNER_CHUNK_BYTES, Some(b'\n'), "stream/read-line")?
+            else {
+                if line.is_empty() {
+                    return Ok(None);
+                }
+                break;
+            };
+            let complete = chunk.last() == Some(&b'\n');
+            line.extend_from_slice(&chunk);
+            if complete {
+                line.pop();
+                break;
+            }
+        }
+        if line.last() == Some(&b'\r') {
+            line.pop();
+        }
+        String::from_utf8(line)
+            .map(Some)
+            .map_err(|error| SemaError::eval(format!("stream/read-line: invalid UTF-8: {error}")))
+    }
+
+    fn blocking_stdin_read_all(cap: usize, op: &str) -> Result<Vec<u8>, SemaError> {
+        let lease = stdin_owner().acquire();
+        let mut bytes = Vec::new();
+        loop {
+            let read_len = capped_read_len(bytes.len(), cap);
+            let Some(chunk) = lease.blocking_read(read_len, None, op)? else {
+                return Ok(bytes);
+            };
+            extend_aggregation(&mut bytes, &chunk, cap, op)?;
+        }
+    }
+
+    fn blocking_stdin_copy(dst: &Rc<StreamBox>, cap: usize) -> Result<usize, SemaError> {
+        let lease = stdin_owner().acquire();
+        let mut total = 0;
+        loop {
+            let read_len = capped_read_len(total, cap);
+            let Some(chunk) = lease.blocking_read(read_len, None, "stream/copy")? else {
+                return Ok(total);
+            };
+            let next_total = checked_copy_total(total, chunk.len(), cap)?;
+            dst.write(&chunk)?;
+            total = next_total;
+        }
+    }
+
     // ── Dispatch: called from `register()`'s builtin closures ──────
     //
     // Each returns `Ok(None)` when the caller should fall through to the
@@ -1134,12 +1440,9 @@ mod io_streams {
         maybe_async_read_decoded(stream, n, Value::bytevector)
     }
 
-    /// `stream/read-byte`'s async dispatch: same stdin/file-input offload
-    /// shape as `maybe_async_read` (even the error text — `SemaStream::read`
-    /// itself doesn't distinguish caller, so the sync path's error message
-    /// for a failing `stream/read-byte` already reads "stream/read: ...")
-    /// but with a 1-byte read and a byte-or-nil decode instead of a
-    /// bytevector one.
+    /// `stream/read-byte` uses the same stdin-owner/file-input dispatch as
+    /// `maybe_async_read` (including its `stream/read` error prefix), but with
+    /// a 1-byte read and a byte-or-nil decode instead of a bytevector one.
     pub(super) fn maybe_async_read_byte(
         stream: &Rc<StreamBox>,
     ) -> Result<Option<NativeOutcome>, SemaError> {
@@ -1149,36 +1452,28 @@ mod io_streams {
         })
     }
 
-    /// Shared offload body for `stream/read` and `stream/read-byte`: reads up
-    /// to `n` bytes (stdin via `fs_offload`, file-input via the CHECKOUT
-    /// pattern) and hands the raw bytes to `decode` to build the final
-    /// `Value` on the VM thread once the offload completes.
+    /// Shared dispatch for `stream/read` and `stream/read-byte`. Stdin reads use
+    /// the coordinated owner on every ABI; file input keeps the checked-out
+    /// worker path inside a runtime quantum.
     fn maybe_async_read_decoded(
         stream: &Rc<StreamBox>,
         n: usize,
         decode: fn(Vec<u8>) -> Value,
     ) -> Result<Option<NativeOutcome>, SemaError> {
+        if stream.stream_type() == "stdin" {
+            if n == 0 {
+                return Ok(Some(NativeOutcome::Return(decode(Vec::new()))));
+            }
+            if in_runtime_quantum() {
+                return stdin_operation_step(StdinOperation::bytes(n, decode)).map(Some);
+            }
+            return blocking_stdin_read(n, "stream/read")
+                .map(decode)
+                .map(NativeOutcome::Return)
+                .map(Some);
+        }
         if !in_runtime_quantum() {
             return Ok(None);
-        }
-        // *stdin* does real, potentially-blocking I/O (unlike in-memory byte
-        // streams): offload the read so a waiting-for-input read can't stall the
-        // cooperative scheduler. stdin is process-global and stateless, so we
-        // read it directly on the worker instead of checking out the (VM-thread-
-        // bound) stream box. Under the unified runtime this suspends structurally
-        // on a quarantined-bounded External wait (the bound is a post-cancel
-        // cleanup watchdog, never a running-read timeout, so a read blocked on
-        // input is not faulted).
-        if stream.stream_type() == "stdin" {
-            return crate::io::quarantined_compute("stream/read", decode, move || {
-                let mut buf = vec![0u8; n];
-                let read = std::io::stdin()
-                    .read(&mut buf)
-                    .map_err(|e| render(format!("stream/read: stdin: {e}")))?;
-                buf.truncate(read);
-                Ok(buf)
-            })
-            .map(Some);
         }
         if stream.stream_type() != "file-input" {
             return Ok(None);
@@ -1201,79 +1496,157 @@ mod io_streams {
         )?))
     }
 
-    /// One interruptible stdin aggregation. Stdin readiness is polled without
-    /// blocking the VM thread; each ready chunk is read directly from the Unix
-    /// fd and followed by a structural timer wake. The optional destination is
-    /// a traced `Value`, keeping a `stream/copy` target alive across parks.
-    struct StdinAggregation {
-        bytes: Vec<u8>,
-        cap: usize,
-        destination: Option<Value>,
+    enum StdinOperationKind {
+        Bytes {
+            max: usize,
+            decode: fn(Vec<u8>) -> Value,
+        },
+        Line {
+            bytes: Vec<u8>,
+        },
+        Aggregate {
+            bytes: Vec<u8>,
+            cap: usize,
+            destination: Option<Value>,
+        },
     }
 
-    impl Trace for StdinAggregation {
+    /// A FIFO stdin operation. Its lease spans the complete logical operation,
+    /// not one OS read, so concurrent finite reads, lines, and aggregations
+    /// cannot split or steal one another's buffered bytes.
+    struct StdinOperation {
+        lease: StdinLease,
+        kind: StdinOperationKind,
+    }
+
+    impl StdinOperation {
+        fn bytes(max: usize, decode: fn(Vec<u8>) -> Value) -> Self {
+            Self {
+                lease: stdin_owner().acquire(),
+                kind: StdinOperationKind::Bytes { max, decode },
+            }
+        }
+
+        fn line() -> Self {
+            Self {
+                lease: stdin_owner().acquire(),
+                kind: StdinOperationKind::Line { bytes: Vec::new() },
+            }
+        }
+
+        fn aggregate(cap: usize, destination: Option<Value>) -> Self {
+            Self {
+                lease: stdin_owner().acquire(),
+                kind: StdinOperationKind::Aggregate {
+                    bytes: Vec::new(),
+                    cap,
+                    destination,
+                },
+            }
+        }
+
+        fn op_name(&self) -> &'static str {
+            match &self.kind {
+                StdinOperationKind::Bytes { .. } => "stream/read",
+                StdinOperationKind::Line { .. } => "stream/read-line",
+                StdinOperationKind::Aggregate { destination, .. } => {
+                    if destination.is_some() {
+                        "stream/copy"
+                    } else {
+                        "stream/read-all"
+                    }
+                }
+            }
+        }
+
+        fn finish_eof(self) -> NativeResult {
+            let Self { lease, kind } = self;
+            drop(lease);
+            match kind {
+                StdinOperationKind::Bytes { decode, .. } => {
+                    Ok(NativeOutcome::Return(decode(Vec::new())))
+                }
+                StdinOperationKind::Line { bytes } if bytes.is_empty() => {
+                    Ok(NativeOutcome::Return(Value::nil()))
+                }
+                StdinOperationKind::Line { bytes } => finish_stdin_line(bytes),
+                StdinOperationKind::Aggregate {
+                    bytes, destination, ..
+                } => finish_stdin_aggregation(bytes, destination),
+            }
+        }
+    }
+
+    impl Trace for StdinOperation {
         fn trace(&self, sink: &mut dyn FnMut(GcEdge<'_>)) -> bool {
-            if let Some(destination) = &self.destination {
+            if let StdinOperationKind::Aggregate {
+                destination: Some(destination),
+                ..
+            } = &self.kind
+            {
                 sink(GcEdge::Value(destination));
             }
             true
         }
     }
 
-    impl StdinAggregation {
-        fn op_name(&self) -> &'static str {
-            if self.destination.is_some() {
-                "stream/copy"
-            } else {
-                "stream/read-all"
-            }
+    fn finish_stdin_line(mut bytes: Vec<u8>) -> NativeResult {
+        if bytes.last() == Some(&b'\n') {
+            bytes.pop();
         }
-
-        fn finish(mut self) -> NativeResult {
-            let Some(destination) = self.destination.take() else {
-                return Ok(NativeOutcome::Return(Value::bytevector(self.bytes)));
-            };
-            let destination = destination
-                .as_stream_rc()
-                .ok_or_else(|| SemaError::eval("stream/copy: destination stream was reclaimed"))?;
-            if self.bytes.is_empty() {
-                return Ok(NativeOutcome::Return(Value::int(0)));
-            }
-            let total = self.bytes.len();
-            if destination.stream_type() == "file-output" {
-                if destination.is_closed() {
-                    return Err(SemaError::eval("stream/write: stream is closed"));
-                }
-                return checkout_output(
-                    "stream/copy",
-                    "stream/write",
-                    &destination,
-                    move |writer: &mut BufWriter<std::fs::File>| -> Result<(), String> {
-                        writer
-                            .write_all(&self.bytes)
-                            .map_err(|e| render(format!("stream/copy: I/O error: {e}")))
-                    },
-                    move |()| Ok(Value::int(total as i64)),
-                );
-            }
-
-            debug_assert_eq!(destination.stream_type(), "byte-buffer");
-            destination.write(&self.bytes)?;
-            Ok(NativeOutcome::Return(Value::int(total as i64)))
+        if bytes.last() == Some(&b'\r') {
+            bytes.pop();
         }
+        let text = String::from_utf8(bytes).map_err(|error| {
+            SemaError::eval(format!("stream/read-line: invalid UTF-8: {error}"))
+        })?;
+        Ok(NativeOutcome::Return(Value::string_owned(text)))
     }
 
-    struct StdinAggregationContinuation {
-        state: Option<StdinAggregation>,
+    fn finish_stdin_aggregation(bytes: Vec<u8>, destination: Option<Value>) -> NativeResult {
+        let Some(destination) = destination else {
+            return Ok(NativeOutcome::Return(Value::bytevector(bytes)));
+        };
+        let destination = destination
+            .as_stream_rc()
+            .ok_or_else(|| SemaError::eval("stream/copy: destination stream was reclaimed"))?;
+        if bytes.is_empty() {
+            return Ok(NativeOutcome::Return(Value::int(0)));
+        }
+        let total = bytes.len();
+        if destination.stream_type() == "file-output" {
+            if destination.is_closed() {
+                return Err(SemaError::eval("stream/write: stream is closed"));
+            }
+            return checkout_output(
+                "stream/copy",
+                "stream/write",
+                &destination,
+                move |writer: &mut BufWriter<std::fs::File>| -> Result<(), String> {
+                    writer
+                        .write_all(&bytes)
+                        .map_err(|error| render(format!("stream/copy: I/O error: {error}")))
+                },
+                move |()| Ok(Value::int(total as i64)),
+            );
+        }
+
+        debug_assert_eq!(destination.stream_type(), "byte-buffer");
+        destination.write(&bytes)?;
+        Ok(NativeOutcome::Return(Value::int(total as i64)))
     }
 
-    impl Trace for StdinAggregationContinuation {
+    struct StdinOperationContinuation {
+        state: Option<StdinOperation>,
+    }
+
+    impl Trace for StdinOperationContinuation {
         fn trace(&self, sink: &mut dyn FnMut(GcEdge<'_>)) -> bool {
             self.state.as_ref().is_none_or(|state| state.trace(sink))
         }
     }
 
-    impl NativeContinuation for StdinAggregationContinuation {
+    impl NativeContinuation for StdinOperationContinuation {
         fn resume(
             mut self: Box<Self>,
             _context: &mut NativeCallContext<'_>,
@@ -1282,128 +1655,92 @@ mod io_streams {
             let state = self
                 .state
                 .take()
-                .expect("stdin aggregation continuation resumes once");
+                .expect("stdin operation continuation resumes once");
+            let op = state.op_name();
             match input {
-                ResumeInput::Returned(_) => stdin_aggregation_step(state),
+                ResumeInput::Returned(_) => stdin_operation_step(state),
                 ResumeInput::Failed(error) => Err(error),
-                ResumeInput::Cancelled(reason) => Err(SemaError::eval(format!(
-                    "{} was cancelled ({reason:?})",
-                    state.op_name()
-                ))),
+                ResumeInput::Cancelled(reason) => {
+                    Err(SemaError::eval(format!("{op} was cancelled ({reason:?})")))
+                }
                 ResumeInput::Runtime(_) => Err(SemaError::eval(format!(
-                    "{}: unexpected runtime response while polling stdin",
-                    state.op_name()
+                    "{op}: unexpected runtime response while polling stdin"
                 ))),
             }
         }
     }
 
-    fn park_stdin_aggregation(state: StdinAggregation, delay: Duration) -> NativeResult {
+    fn park_stdin_operation(state: StdinOperation, delay: Duration) -> NativeResult {
         Ok(NativeOutcome::Suspend(NativeSuspend {
             wait: WaitKind::Timer(delay),
-            continuation: Box::new(StdinAggregationContinuation { state: Some(state) }),
+            continuation: Box::new(StdinOperationContinuation { state: Some(state) }),
         }))
     }
 
-    #[cfg(unix)]
-    fn read_ready_stdin(buf: &mut [u8], op: &str) -> Result<Option<usize>, SemaError> {
-        // SAFETY: the fd set and timeval are initialized for a zero-timeout
-        // readiness check, and `buf` provides a valid writable region to
-        // `read(2)`. EINTR is reported as pending so the next structural wake
-        // retries without blocking the VM thread.
-        unsafe {
-            let mut readfds: libc::fd_set = std::mem::zeroed();
-            libc::FD_ZERO(&mut readfds);
-            libc::FD_SET(libc::STDIN_FILENO, &mut readfds);
-            let mut timeout = libc::timeval {
-                tv_sec: 0,
-                tv_usec: 0,
-            };
-            let ready = libc::select(
-                libc::STDIN_FILENO + 1,
-                &mut readfds,
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                &mut timeout,
-            );
-            if ready == 0 {
-                return Ok(None);
+    fn stdin_operation_step(mut state: StdinOperation) -> NativeResult {
+        let (read_len, delimiter) = match &state.kind {
+            StdinOperationKind::Bytes { max, .. } => (*max, None),
+            StdinOperationKind::Line { .. } => (STDIN_OWNER_CHUNK_BYTES, Some(b'\n')),
+            StdinOperationKind::Aggregate { bytes, cap, .. } => {
+                (capped_read_len(bytes.len(), *cap), None)
             }
-            if ready < 0 {
-                let error = std::io::Error::last_os_error();
-                if error.kind() == std::io::ErrorKind::Interrupted {
-                    return Ok(None);
-                }
-                return Err(SemaError::eval(format!(
-                    "{op}: stdin readiness check failed: {error}"
-                )));
-            }
-
-            let read = libc::read(
-                libc::STDIN_FILENO,
-                buf.as_mut_ptr().cast::<libc::c_void>(),
-                buf.len(),
-            );
-            if read >= 0 {
-                return Ok(Some(read as usize));
-            }
-            let error = std::io::Error::last_os_error();
-            if error.kind() == std::io::ErrorKind::Interrupted
-                || error.kind() == std::io::ErrorKind::WouldBlock
-            {
-                Ok(None)
-            } else {
-                Err(SemaError::eval(format!("{op}: stdin read failed: {error}")))
-            }
-        }
-    }
-
-    #[cfg(unix)]
-    fn stdin_aggregation_step(mut state: StdinAggregation) -> NativeResult {
-        // Read at most one byte beyond the remaining allowance. That byte is
-        // enough to prove overflow while the aggregate buffer itself remains at
-        // or below the cap.
-        let read_len = capped_read_len(state.bytes.len(), state.cap);
-        let mut chunk = [0u8; STREAM_CHUNK_BYTES];
-        let Some(read) = read_ready_stdin(&mut chunk[..read_len], state.op_name())? else {
-            return park_stdin_aggregation(state, Duration::from_millis(5));
         };
-        if read == 0 {
-            return state.finish();
+        match state.lease.poll(read_len, delimiter, state.op_name())? {
+            StdinPoll::Pending(_) => park_stdin_operation(state, Duration::from_millis(2)),
+            StdinPoll::Eof => state.finish_eof(),
+            StdinPoll::Data(chunk) => match &mut state.kind {
+                StdinOperationKind::Bytes { decode, .. } => {
+                    Ok(NativeOutcome::Return(decode(chunk)))
+                }
+                StdinOperationKind::Line { bytes } => {
+                    let complete = chunk.last() == Some(&b'\n');
+                    bytes.extend_from_slice(&chunk);
+                    if complete {
+                        let StdinOperation { lease, kind } = state;
+                        drop(lease);
+                        let StdinOperationKind::Line { bytes } = kind else {
+                            unreachable!("line state remains a line")
+                        };
+                        finish_stdin_line(bytes)
+                    } else {
+                        park_stdin_operation(state, Duration::from_millis(1))
+                    }
+                }
+                StdinOperationKind::Aggregate {
+                    bytes,
+                    cap,
+                    destination,
+                } => {
+                    let op = if destination.is_some() {
+                        "stream/copy"
+                    } else {
+                        "stream/read-all"
+                    };
+                    extend_aggregation(bytes, &chunk, *cap, op)?;
+                    park_stdin_operation(state, Duration::from_millis(1))
+                }
+            },
         }
-        let op = state.op_name();
-        extend_aggregation(&mut state.bytes, &chunk[..read], state.cap, op)?;
-        // A wake between every chunk makes a continuously-readable stdin
-        // cooperatively interruptible and gives runnable siblings a turn.
-        park_stdin_aggregation(state, Duration::from_millis(1))
     }
 
-    #[cfg(not(unix))]
-    fn stdin_aggregation_step(state: StdinAggregation) -> NativeResult {
-        Err(SemaError::eval(format!(
-            "{}: whole-stdin aggregation is unavailable in a runtime quantum on this platform",
-            state.op_name()
-        ))
-        .with_hint("use stream/read in bounded chunks so each read remains cancellable"))
-    }
-
-    /// `stream/read-all`'s async dispatch. File input is checked out and read on
-    /// a worker under the captured cap; stdin uses the interruptible readiness
-    /// state machine above and never pins a worker while the pipe remains open.
+    /// `stream/read-all` dispatch. File input is checked out and read on a
+    /// worker under the captured cap; stdin uses the coordinated owner on both
+    /// ABIs and never pins a runtime worker while the pipe remains open.
     pub(super) fn maybe_async_read_all(
         stream: &Rc<StreamBox>,
         cap: usize,
     ) -> Result<Option<NativeOutcome>, SemaError> {
+        if stream.stream_type() == "stdin" {
+            if in_runtime_quantum() {
+                return stdin_operation_step(StdinOperation::aggregate(cap, None)).map(Some);
+            }
+            return blocking_stdin_read_all(cap, "stream/read-all")
+                .map(Value::bytevector)
+                .map(NativeOutcome::Return)
+                .map(Some);
+        }
         if !in_runtime_quantum() {
             return Ok(None);
-        }
-        if stream.stream_type() == "stdin" {
-            return stdin_aggregation_step(StdinAggregation {
-                bytes: Vec::new(),
-                cap,
-                destination: None,
-            })
-            .map(Some);
         }
         if stream.stream_type() != "file-input" {
             return Ok(None);
@@ -1437,34 +1774,15 @@ mod io_streams {
     pub(super) fn maybe_async_read_line(
         stream: &Rc<StreamBox>,
     ) -> Result<Option<NativeOutcome>, SemaError> {
+        if stream.stream_type() == "stdin" {
+            if in_runtime_quantum() {
+                return stdin_operation_step(StdinOperation::line()).map(Some);
+            }
+            let value = blocking_stdin_read_line()?.map_or_else(Value::nil, Value::string_owned);
+            return Ok(Some(NativeOutcome::Return(value)));
+        }
         if !in_runtime_quantum() {
             return Ok(None);
-        }
-        // *stdin* — see maybe_async_read: offload the blocking line read.
-        if stream.stream_type() == "stdin" {
-            fn decode_line(line: Option<String>) -> Value {
-                match line {
-                    None => Value::nil(),
-                    Some(s) => Value::string(&s),
-                }
-            }
-            return crate::io::quarantined_compute("stream/read-line", decode_line, move || {
-                let mut line = String::new();
-                let n = std::io::stdin()
-                    .read_line(&mut line)
-                    .map_err(|e| render(format!("stream/read-line: stdin: {e}")))?;
-                if n == 0 {
-                    return Ok(None); // EOF, nothing read at all
-                }
-                if line.ends_with('\n') {
-                    line.pop();
-                    if line.ends_with('\r') {
-                        line.pop();
-                    }
-                }
-                Ok(Some(line))
-            })
-            .map(Some);
         }
         if stream.stream_type() != "file-input" {
             return Ok(None);
@@ -1682,21 +2000,20 @@ mod io_streams {
         )?))
     }
 
-    /// `stream/copy`'s async dispatch. A single file side is checked out and
-    /// offloaded under the captured cap. Stdin uses cooperative readiness
-    /// polling. Two file resources are rejected rather than entering a
-    /// VM-thread EOF loop without ordered dual-gate acquisition.
+    /// `stream/copy` dispatch. A single file side is checked out and offloaded
+    /// under the captured cap. Stdin uses the coordinated owner on both ABIs.
+    /// Two file resources are rejected rather than entering a VM-thread EOF
+    /// loop without ordered dual-gate acquisition.
     pub(super) fn maybe_async_copy(
         src: &Rc<StreamBox>,
         dst: &Rc<StreamBox>,
         cap: usize,
     ) -> Result<Option<NativeOutcome>, SemaError> {
-        if !in_runtime_quantum() {
-            return Ok(None);
-        }
-
         if src.stream_type() == "stdin" {
-            if dst.stream_type() != "file-output" && dst.stream_type() != "byte-buffer" {
+            if in_runtime_quantum()
+                && dst.stream_type() != "file-output"
+                && dst.stream_type() != "byte-buffer"
+            {
                 return Err(SemaError::eval(format!(
                     "stream/copy: stdin copy to a {} stream is unavailable in a runtime quantum",
                     dst.stream_type()
@@ -1705,12 +2022,19 @@ mod io_streams {
                     "copy stdin into a byte-buffer or file-output, or use stream/read and stream/write in bounded chunks",
                 ));
             }
-            return stdin_aggregation_step(StdinAggregation {
-                bytes: Vec::new(),
-                cap,
-                destination: Some(Value::stream_from_rc(dst.clone())),
-            })
-            .map(Some);
+            if in_runtime_quantum() {
+                return stdin_operation_step(StdinOperation::aggregate(
+                    cap,
+                    Some(Value::stream_from_rc(dst.clone())),
+                ))
+                .map(Some);
+            }
+            return blocking_stdin_copy(dst, cap)
+                .map(|total| NativeOutcome::Return(Value::int(total as i64)))
+                .map(Some);
+        }
+        if !in_runtime_quantum() {
+            return Ok(None);
         }
 
         let src_file = src.stream_type() == "file-input";
@@ -1853,9 +2177,9 @@ mod io_streams {
 
     impl SemaStream for StdinStream {
         fn read(&self, buf: &mut [u8]) -> Result<usize, SemaError> {
-            std::io::stdin()
-                .read(buf)
-                .map_err(|e| SemaError::eval(format!("stream/read: stdin: {e}")))
+            let bytes = blocking_stdin_read(buf.len(), "stream/read")?;
+            buf[..bytes.len()].copy_from_slice(&bytes);
+            Ok(bytes.len())
         }
 
         fn write(&self, _data: &[u8]) -> Result<usize, SemaError> {
@@ -1983,4 +2307,38 @@ pub fn register_io(env: &Env, sandbox: &Sandbox) {
     env.set(sema_core::intern("*stdin*"), Value::stream(StdinStream));
     env.set(sema_core::intern("*stdout*"), Value::stream(StdoutStream));
     env.set(sema_core::intern("*stderr*"), Value::stream(StderrStream));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn aggregate_growth_stays_within_cap_and_rejects_without_reserving() {
+        let cap = STREAM_CHUNK_BYTES * 2;
+        let mut aggregate = Vec::new();
+        extend_aggregation(
+            &mut aggregate,
+            &[b'x'; STREAM_CHUNK_BYTES],
+            cap,
+            "stream/read-all",
+        )
+        .expect("first chunk fits");
+        extend_aggregation(
+            &mut aggregate,
+            &[b'y'; STREAM_CHUNK_BYTES],
+            cap,
+            "stream/read-all",
+        )
+        .expect("second chunk reaches the boundary");
+        assert_eq!(aggregate.len(), cap);
+        assert!(aggregate.capacity() <= cap);
+
+        let capacity_at_boundary = aggregate.capacity();
+        let error = extend_aggregation(&mut aggregate, b"z", cap, "stream/read-all")
+            .expect_err("one-byte overflow witness is rejected");
+        assert!(error.to_string().contains("16384-byte cap"));
+        assert_eq!(aggregate.len(), cap);
+        assert_eq!(aggregate.capacity(), capacity_at_boundary);
+    }
 }

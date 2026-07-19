@@ -202,8 +202,8 @@ fn apply_vm_resume(vm: &mut VM, resume: VmResume) {
 /// (see `docs/plans/evidence/unified-cooperative-runtime/task-06-context-matrix.md`
 /// for why workflow/MCP context is NOT in this table).
 struct ScopeSeam {
-    /// Capture the spawner's live scope (cloning the relevant `Rc`/values) to seed
-    /// a freshly-spawned child task.
+    /// Capture the submitter/spawner's live scope (cloning the relevant
+    /// `Rc`/values) to seed a root or freshly-spawned child task.
     capture: fn() -> Box<dyn std::any::Any>,
     /// Take the current thread-local scope out (leaving it empty/default), returning
     /// the task's step-modified scope to carry across a suspension.
@@ -254,20 +254,21 @@ const TASK_SCOPE_SEAMS: [ScopeSeam; 3] = [
 ];
 
 /// A task's captured per-quantum dynamic scopes, one slot per [`TASK_SCOPE_SEAMS`]
-/// entry (same order). Empty (all `None`) for a root task, which runs directly
-/// against the process thread-locals. Holds no GC-traceable `Value` — the scopes
-/// carry only scalar snapshots and shared `Rc`s (budget/usage accounts), so this
-/// needs no [`Trace`] edge.
+/// entry (same order). Real VM tasks snapshot the submitting/spawning context;
+/// synthetic runtime-test tasks may leave every slot `None`. Holds no
+/// GC-traceable `Value` — the scopes carry only scalar snapshots and shared `Rc`s
+/// (budget/usage accounts), so this needs no [`Trace`] edge.
 #[derive(Default)]
 pub(super) struct TaskScopes {
     captured: [Option<Box<dyn std::any::Any>>; TASK_SCOPE_SEAMS.len()],
 }
 
 impl TaskScopes {
-    /// Snapshot the spawner's live thread-local scopes to seed a freshly-spawned
-    /// child (the `async/spawn` capture that used to read each seam's
-    /// `current_*_boxed` inline).
-    fn capture_for_spawn() -> Self {
+    /// Snapshot the live thread-local scopes when a host submits a root or a task
+    /// spawns a child. Root capture gives every seam an owned empty slot even when
+    /// the submitter is unscoped, allowing the exit fast path to reclaim a scope
+    /// that the root opens and suspends inside its first quantum.
+    pub(super) fn capture_current() -> Self {
         Self {
             captured: std::array::from_fn(|i| Some((TASK_SCOPE_SEAMS[i].capture)())),
         }
@@ -287,7 +288,7 @@ impl TaskScopes {
 /// order across them is immaterial; each is self-contained.
 ///
 /// EMPTY-SCOPE FAST PATH: for a program that never touches a given seam's feature
-/// (no LLM cache/budget/cassette, no OTel span, no leaf-usage attribution), every spawned
+/// (no LLM cache/budget/cassette, no OTel span, no leaf-usage attribution), every real
 /// task's captured scope for that seam is a "default" value — and the swap would
 /// box/unbox that default on every single quantum for nothing (malloc/free churn
 /// visible in profiles even when the feature is unused). `install` skips the
@@ -320,8 +321,9 @@ struct TaskScopeSwap {
     /// `true` for a seam whose install was skipped (both captured and ambient were
     /// empty at entry) — no thread-local touched, no allocation made. Distinct from
     /// `displaced[i] == None`, which also covers the ordinary "nothing captured"
-    /// case (a root task, or a nested swap inside an already-installed quantum) —
-    /// those never ran the emptiness check and never need the exit re-check below.
+    /// case (a synthetic runtime-test task, or a nested swap inside an
+    /// already-installed quantum) — those never ran the emptiness check and never
+    /// need the exit re-check below.
     skipped: [bool; TASK_SCOPE_SEAMS.len()],
     restored: bool,
 }
@@ -332,9 +334,9 @@ impl TaskScopeSwap {
             std::array::from_fn(|_| None);
         let mut skipped = [false; TASK_SCOPE_SEAMS.len()];
         for (i, seam) in TASK_SCOPE_SEAMS.iter().enumerate() {
-            // No captured scope at all (root task; or a nested swap re-entering an
-            // already-installed quantum, where the outer swap already took it) —
-            // nothing to do, exactly as before the fast path existed.
+            // No captured scope at all (a synthetic runtime-test task, or a nested
+            // swap re-entering an already-installed quantum where the outer swap
+            // already took it) — nothing to do.
             let Some(captured) = task.scopes.captured[i].as_ref() else {
                 continue;
             };
@@ -2271,11 +2273,12 @@ impl Runtime {
         // spawned inside a `with-cache`/`with-budget`/`workflow/step` extent must see
         // it even after the wrapper's thunk has ended. The quantum's own mutations
         // (spans opened this step, cache flips) persist back onto the task; the prior
-        // (spawner/global) contexts are restored afterwards. The root task carries no
-        // captured contexts and runs directly against the process thread-locals. The
-        // swap is panic-safe: `TaskScopeSwap`'s `Drop` restores the displaced contexts
-        // to the thread-locals even if the quantum unwinds, so a parent/sibling's span
-        // stack and usage tally are never left corrupted.
+        // (submitter/spawner) contexts are restored afterwards. Root tasks own a
+        // submission-time snapshot too, so two independently submitted roots cannot
+        // observe scopes the other opened before suspending. The swap is panic-safe:
+        // `TaskScopeSwap`'s `Drop` restores the displaced contexts to the thread-locals
+        // even if the quantum unwinds, so a parent/sibling's span stack and usage tally
+        // are never left corrupted.
         let mut scopes = TaskScopeSwap::install(task);
         // Publish the running task's identity so natives that open a per-task slab
         // entry (`llm/stream`, `agent/run`) record the owning task, letting the
@@ -3317,7 +3320,34 @@ impl Runtime {
             continuation,
         } = request
         {
-            return self.spawn_via_registry(task_id, owner, callable, continuation);
+            // Runtime requests are dispatched after the producing VM quantum has
+            // parked and its task-local scopes have been captured. Reinstall the
+            // spawner here so child admission snapshots the spawner's active span,
+            // LLM scope, and leaf-usage frame rather than unrelated ambient state.
+            let mut scopes = {
+                let mut state = self.state.borrow_mut();
+                let task =
+                    state
+                        .tasks
+                        .get_mut(&task_id)
+                        .ok_or_else(|| RuntimeFault::Invariant {
+                            message: "spawning task disappeared".into(),
+                        })?;
+                TaskScopeSwap::install(task)
+            };
+            let result = self.spawn_via_registry(task_id, owner, callable, continuation);
+            {
+                let mut state = self.state.borrow_mut();
+                let task =
+                    state
+                        .tasks
+                        .get_mut(&task_id)
+                        .ok_or_else(|| RuntimeFault::Invariant {
+                            message: "spawning task disappeared".into(),
+                        })?;
+                scopes.restore(task);
+            }
+            return result;
         }
         // `async/run` (OriginBarrier): park the caller on a self-resolving-waits
         // barrier (ASYNC-RUN-BARRIER-1). The caller suspends while ANY other task
@@ -4431,13 +4461,12 @@ impl Runtime {
                     // concurrent fan-out inside one `llm/with-budget` captures the
                     // shared budget `Rc` (charged as one aggregate) and a deferred
                     // `with-cache` completion still sees the cache enabled; the OTel
-                    // identity (conversation/session/user ids) with an EMPTY span stack
-                    // so the child parents to its own trace root, not a sibling's open
-                    // span; and the leaf-usage scope its `workflow/step` opened so the
-                    // fan-out's LLM usage attributes to the spawning step. Each scope
-                    // rides the task and is swapped per quantum, not the (already
-                    // restored) global.
-                    scopes: TaskScopes::capture_for_spawn(),
+                    // identity (conversation/session/user ids) plus the current active
+                    // span as the child's trace parent; and the leaf-usage scope its
+                    // `workflow/step` opened so the fan-out's LLM usage attributes to
+                    // the spawning step. Each scope rides the task and is swapped per
+                    // quantum, not the (already restored) global.
+                    scopes: TaskScopes::capture_current(),
                 },
             );
             state.task_promises.insert(child, promise);

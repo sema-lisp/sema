@@ -135,6 +135,61 @@ impl NativeContinuation for SpanGuardContinuation {
     }
 }
 
+/// Keep a conversation/session/user scope installed until a cooperative thunk
+/// settles. The guard owns only strings and thread-local restoration state, so
+/// the continuation has no GC edges.
+struct ConversationGuardContinuation {
+    guard: Option<sema_otel::ConversationGuard>,
+}
+
+impl Trace for ConversationGuardContinuation {
+    fn trace(&self, _sink: &mut dyn FnMut(GcEdge<'_>)) -> bool {
+        true
+    }
+}
+
+impl NativeContinuation for ConversationGuardContinuation {
+    fn resume(
+        mut self: Box<Self>,
+        _context: &mut NativeCallContext<'_>,
+        input: ResumeInput,
+    ) -> NativeResult {
+        let guard = self.guard.take();
+        let result = match input {
+            ResumeInput::Returned(value) => Ok(NativeOutcome::Return(value)),
+            ResumeInput::Failed(error) => Err(error),
+            ResumeInput::Cancelled(reason) => Err(SemaError::eval(format!(
+                "otel/with-session thunk was cancelled ({reason:?})"
+            ))),
+            ResumeInput::Runtime(_) => Err(SemaError::eval(
+                "otel/with-session teardown received an unexpected runtime response",
+            )),
+        };
+        drop(guard);
+        result
+    }
+}
+
+fn session_call(args: &[Value]) -> Result<(sema_otel::ConversationGuard, Value), SemaError> {
+    if args.len() < 2 || args.len() > 3 {
+        return Err(SemaError::arity("otel/with-session", "2-3", args.len()));
+    }
+    let session = args[0]
+        .as_str()
+        .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
+    let (user, thunk) = if args.len() == 3 {
+        let user = map_entries(&args[1])
+            .into_iter()
+            .find(|(key, _)| key == "user")
+            .and_then(|(_, value)| value.as_str().map(str::to_string));
+        (user, args[2].clone())
+    } else {
+        (None, args[1].clone())
+    };
+    let guard = sema_otel::set_conversation_scope(session, Some(session), user.as_deref());
+    Ok((guard, thunk))
+}
+
 /// Register a typed-span builtin as a DUAL-ABI native. `setup` validates the args and
 /// OPENS the span (returning it plus the body thunk). Under a runtime quantum the VM
 /// invokes the runtime callback, which drives the thunk as a cooperative
@@ -295,27 +350,26 @@ pub fn register(env: &Env) {
 
     // (otel/with-session id thunk) / (otel/with-session id {:user "..."} thunk) — group
     // the spans started in `thunk` into a session (Langfuse Sessions/Users).
-    crate::register_fn(env, "otel/with-session", |args| {
-        if args.len() < 2 || args.len() > 3 {
-            return Err(SemaError::arity("otel/with-session", "2-3", args.len()));
-        }
-        let session = args[0]
-            .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
-        let (user, thunk) = if args.len() == 3 {
-            let user = map_entries(&args[1])
-                .into_iter()
-                .find(|(k, _)| k == "user")
-                .and_then(|(_, v)| v.as_str().map(|s| s.to_string()));
-            (user, &args[2])
-        } else {
-            (None, &args[1])
-        };
-        let guard = sema_otel::set_conversation_scope(session, Some(session), user.as_deref());
-        let result = crate::list::call_function(thunk, &[]);
-        drop(guard);
-        result
-    });
+    env.set(
+        sema_core::intern("otel/with-session"),
+        Value::native_fn(sema_core::NativeFn::simple_with_runtime(
+            "otel/with-session",
+            |args| {
+                let (guard, thunk) = session_call(args)?;
+                let result = crate::list::call_function(&thunk, &[]);
+                drop(guard);
+                result
+            },
+            |_context, args| {
+                let (guard, thunk) = session_call(args)?;
+                Ok(NativeOutcome::Call(NativeCall {
+                    callable: thunk,
+                    args: Vec::new(),
+                    continuation: Box::new(ConversationGuardContinuation { guard: Some(guard) }),
+                }))
+            },
+        )),
+    );
 
     // (otel/event "name") / (otel/event "name" {:k "v" ...}) — add an event to the
     // current span. Attribute values are stringified. Returns nil.
@@ -430,6 +484,17 @@ mod tests {
         assert_eq!(
             edges, 0,
             "span teardown continuation must expose no Value edges"
+        );
+    }
+
+    #[test]
+    fn conversation_guard_continuation_holds_no_gc_edges() {
+        let cont = ConversationGuardContinuation { guard: None };
+        let mut edges = 0usize;
+        assert!(cont.trace(&mut |_| edges += 1));
+        assert_eq!(
+            edges, 0,
+            "session teardown continuation must expose no Value edges"
         );
     }
 }

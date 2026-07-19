@@ -139,6 +139,41 @@ fn captured_output_includes_direct_native_callbacks() {
     );
 }
 
+/// Root mains own dynamic scopes just like spawned tasks. A budget opened by root A
+/// before it parks must not become ambient input to independently-submitted root B.
+#[test]
+fn independently_submitted_roots_isolate_llm_scopes() {
+    let interp = Interpreter::new();
+    let root_a = interp
+        .submit_str(
+            r#"
+            (llm/with-budget
+              {:max-tokens 7}
+              (fn ()
+                (async/sleep 25)
+                (:token-limit (llm/budget-remaining))))
+            "#,
+            RootOptions::default(),
+        )
+        .expect("budgeted root submits");
+    let root_b = interp
+        .submit_str("(llm/budget-remaining)", RootOptions::default())
+        .expect("unscoped root submits");
+
+    let a = interp
+        .drive_until_settled(&root_a)
+        .expect("budgeted root settles");
+    let b = interp
+        .drive_until_settled(&root_b)
+        .expect("unscoped root settles");
+
+    assert_eq!(a, sema_core::Value::int(7));
+    assert!(
+        b.is_nil(),
+        "root B inherited root A's active LLM budget scope: {b}"
+    );
+}
+
 /// submit -> drive_turn loop -> poll_result -> shutdown report counts.
 #[test]
 fn lifecycle_submit_drive_turn_poll_shutdown() {

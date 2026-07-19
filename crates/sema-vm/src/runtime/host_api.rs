@@ -244,7 +244,7 @@ impl Runtime {
                 vm_owner: Some(ReturnOwner::Root),
                 context,
                 vm_resume: None,
-                scopes: TaskScopes::default(),
+                scopes: TaskScopes::capture_current(),
             },
         );
         state.ready.enqueue(root, task);

@@ -451,6 +451,15 @@ impl DynamicTaskState {
         remove_scope(&mut self.inner.borrow_mut().user_frames, id).is_some()
     }
 
+    pub fn pop_user_frame(&self) -> bool {
+        let mut inner = self.inner.borrow_mut();
+        if inner.user_frames.len() <= 1 {
+            return false;
+        }
+        inner.user_frames.pop();
+        true
+    }
+
     pub fn hidden_get(&self, key: &Value) -> Option<Value> {
         self.inner
             .borrow()
@@ -483,6 +492,15 @@ impl DynamicTaskState {
 
     pub fn remove_hidden_frame(&self, id: ScopeId) -> bool {
         remove_scope(&mut self.inner.borrow_mut().hidden_frames, id).is_some()
+    }
+
+    pub fn pop_hidden_frame(&self) -> bool {
+        let mut inner = self.inner.borrow_mut();
+        if inner.hidden_frames.len() <= 1 {
+            return false;
+        }
+        inner.hidden_frames.pop();
+        true
     }
 
     pub fn stack_get(&self, key: &Value) -> Vec<Value> {
@@ -935,6 +953,17 @@ mod tests {
             state.remove_stack_value(&stack_key, inner_stack),
             Some(Value::string("inner"))
         );
+
+        state
+            .push_user_frame(BTreeMap::new())
+            .expect("scope ID available");
+        state
+            .push_hidden_frame(BTreeMap::new())
+            .expect("scope ID available");
+        assert!(state.pop_user_frame());
+        assert!(state.pop_hidden_frame());
+        assert!(!state.pop_user_frame());
+        assert!(!state.pop_hidden_frame());
     }
 
     #[test]

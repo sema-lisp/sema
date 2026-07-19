@@ -14,8 +14,8 @@ use std::rc::{Rc, Weak};
 use web_time::Instant;
 
 use sema_core::runtime::{
-    CancelReason, CancellationParent, ExecutorShutdown, LifetimeOwner, RootId, TaskContextHandle,
-    TaskId, TaskRelations, TaskSettlement,
+    CancelReason, CancellationParent, ExecutorShutdown, LifetimeOwner, RootId, TaskId,
+    TaskRelations, TaskSettlement,
 };
 
 use crate::VM;
@@ -231,6 +231,7 @@ impl Runtime {
             cancellation_parent: CancellationParent::Root(root),
             lifetime_owner: LifetimeOwner::Root(root),
         };
+        let context = state.snapshot_dynamic_root_context();
         state.roots.insert(root, RootRecord::new(root, task));
         state.tasks.insert(
             task,
@@ -241,7 +242,7 @@ impl Runtime {
                 suspended_owner: None,
                 vm_call: Some(vm),
                 vm_owner: Some(ReturnOwner::Root),
-                context: TaskContextHandle::default(),
+                context,
                 vm_resume: None,
                 scopes: TaskScopes::default(),
             },

@@ -2533,6 +2533,38 @@ fn gc_stats_map(stats: &sema_core::GcStats) -> Value {
 mod runtime_eval_tests {
     use super::*;
 
+    use sema_core::runtime::{CancelReason, TaskOutcome, TaskSettlement};
+    use sema_vm::runtime::{RootHandle, RootOptions, RootPoll};
+
+    fn drive_selected_until_ready(interp: &Interpreter, root: &RootHandle) -> Rc<TaskSettlement> {
+        for _ in 0..128 {
+            match root.poll_result() {
+                RootPoll::Ready(settlement) => return settlement,
+                RootPoll::Pending => {
+                    interp
+                        .drive_roots(&[root.id()])
+                        .expect("selected root drive succeeds");
+                }
+                RootPoll::Aborted(fault) => panic!("selected root aborted: {fault:?}"),
+                RootPoll::RuntimeDropped => panic!("runtime dropped while driving selected root"),
+                RootPoll::InvariantViolation => {
+                    panic!("runtime invariant violation while driving selected root")
+                }
+            }
+        }
+        panic!("selected root did not settle within the bounded drive loop")
+    }
+
+    fn returned_value(settlement: &TaskSettlement) -> Value {
+        match &settlement.outcome {
+            TaskOutcome::Returned(value) => value.clone(),
+            TaskOutcome::Failed(error) => panic!("root failed instead of returning: {error:?}"),
+            TaskOutcome::Cancelled(reason) => {
+                panic!("root was cancelled instead of returning: {reason:?}")
+            }
+        }
+    }
+
     // Full-flip blocker (native-stack): routing eval through the runtime
     // (`drive` → `visit_ready` → `run_quantum`) adds native frames below every
     // VM native call, so freeing a pathologically deep, cycle-free collection
@@ -2825,6 +2857,320 @@ mod runtime_eval_tests {
             .eval_str_via_runtime("(await p)")
             .expect("the detached task from call 1 is still drivable in call 2");
         assert_eq!(result, Value::int(42));
+    }
+
+    #[test]
+    fn runtime_concurrent_roots_isolate_dynamic_context_until_settlement() {
+        let interp = Interpreter::new();
+        interp
+            .eval_str("(define root-context-gate (channel/new 1))")
+            .expect("define root synchronization channel");
+
+        let owner = Value::keyword("root-owner");
+        let hidden = Value::keyword("root-hidden");
+        let stack = Value::keyword("root-stack");
+        let base = Value::keyword("base");
+        let base_hidden = Value::keyword("base-hidden");
+        let base_stack = Value::keyword("base-stack");
+        interp.ctx.context_set(owner.clone(), base.clone());
+        interp.ctx.hidden_set(hidden.clone(), base_hidden.clone());
+        interp
+            .ctx
+            .context_stack_push(stack.clone(), base_stack.clone());
+
+        let root_a = interp
+            .submit_str(
+                r#"(begin
+                     (context/set :root-owner :a)
+                     (context/set-hidden :root-hidden :a-hidden)
+                     (context/push :root-stack :a-stack)
+                     (channel/recv root-context-gate)
+                     (list (context/get :root-owner)
+                           (context/get-hidden :root-hidden)
+                           (context/stack :root-stack)))"#,
+                RootOptions::default(),
+            )
+            .expect("submit root A");
+        let root_b = interp
+            .submit_str(
+                r#"(begin
+                     (context/set :root-owner :b)
+                     (context/set-hidden :root-hidden :b-hidden)
+                     (context/push :root-stack :b-stack)
+                     (list (context/get :root-owner)
+                           (context/get-hidden :root-hidden)
+                           (context/stack :root-stack)))"#,
+                RootOptions::default(),
+            )
+            .expect("submit root B");
+
+        interp
+            .drive_roots(&[root_a.id()])
+            .expect("drive root A to its channel wait");
+        assert!(matches!(root_a.poll_result(), RootPoll::Pending));
+        assert!(interp.ctx.task_context().is_none());
+        assert_eq!(interp.ctx.context_get(&owner), Some(base.clone()));
+        assert_eq!(interp.ctx.hidden_get(&hidden), Some(base_hidden.clone()));
+        assert_eq!(
+            interp.ctx.context_stack_get(&stack),
+            vec![base_stack.clone()]
+        );
+
+        let settled_b = drive_selected_until_ready(&interp, &root_b);
+        let expected_b = interp
+            .eval_str("'(:b :b-hidden (:base-stack :b-stack))")
+            .expect("evaluate root B oracle");
+        assert_eq!(returned_value(&settled_b), expected_b);
+        assert!(matches!(root_a.poll_result(), RootPoll::Pending));
+        assert!(interp.ctx.task_context().is_none());
+        assert_eq!(interp.ctx.context_get(&owner), Some(Value::keyword("b")));
+        assert_eq!(
+            interp.ctx.hidden_get(&hidden),
+            Some(Value::keyword("b-hidden"))
+        );
+        assert_eq!(
+            interp.ctx.context_stack_get(&stack),
+            vec![base_stack.clone(), Value::keyword("b-stack")]
+        );
+
+        let signal = interp
+            .submit_str(
+                "(channel/send root-context-gate :go)",
+                RootOptions::default(),
+            )
+            .expect("submit root A wake signal");
+        drive_selected_until_ready(&interp, &signal);
+        let settled_a = drive_selected_until_ready(&interp, &root_a);
+        let expected_a = interp
+            .eval_str("'(:a :a-hidden (:base-stack :a-stack))")
+            .expect("evaluate root A oracle");
+        assert_eq!(returned_value(&settled_a), expected_a);
+        assert_eq!(interp.ctx.context_get(&owner), Some(Value::keyword("a")));
+        assert_eq!(
+            interp.ctx.hidden_get(&hidden),
+            Some(Value::keyword("a-hidden"))
+        );
+        assert_eq!(
+            interp.ctx.context_stack_get(&stack),
+            vec![
+                base_stack,
+                Value::keyword("b-stack"),
+                Value::keyword("a-stack")
+            ]
+        );
+    }
+
+    #[test]
+    fn runtime_spawned_siblings_inherit_then_isolate_dynamic_context() {
+        let interp = Interpreter::new();
+        let result = interp
+            .eval_str_via_runtime(
+                r#"(let ((gate (channel/new 1))
+                          (ready (channel/new 1)))
+                     (context/set :who :parent)
+                     (context/set-hidden :secret :parent-hidden)
+                     (context/push :layers :parent-stack)
+                     (let ((a (async
+                                (context/set :who :a)
+                                (context/set-hidden :secret :a-hidden)
+                                (context/push :layers :a-stack)
+                                (channel/send ready :ready)
+                                (channel/recv gate)
+                                (list (context/get :who)
+                                      (context/get-hidden :secret)
+                                      (context/stack :layers))))
+                           (b (async
+                                (channel/recv ready)
+                                (let ((before
+                                        (list (context/get :who)
+                                              (context/get-hidden :secret)
+                                              (context/stack :layers))))
+                                  (context/set :who :b)
+                                  (context/set-hidden :secret :b-hidden)
+                                  (context/push :layers :b-stack)
+                                  (channel/send gate :go)
+                                  (list before
+                                        (list (context/get :who)
+                                              (context/get-hidden :secret)
+                                              (context/stack :layers)))))))
+                       (list (await a)
+                             (await b)
+                             (list (context/get :who)
+                                   (context/get-hidden :secret)
+                                   (context/stack :layers)))))"#,
+            )
+            .expect("spawned siblings settle");
+
+        let expected = interp
+            .eval_str(
+                "'((:a :a-hidden (:parent-stack :a-stack)) \
+                   ((:parent :parent-hidden (:parent-stack)) \
+                    (:b :b-hidden (:parent-stack :b-stack))) \
+                   (:parent :parent-hidden (:parent-stack)))",
+            )
+            .expect("evaluate sibling-isolation oracle");
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn runtime_spawned_child_settlement_does_not_publish_child_context() {
+        let interp = Interpreter::new();
+        let result = interp
+            .eval_str_via_runtime(
+                r#"(begin
+                     (context/set :child-owner :parent)
+                     (context/set-hidden :child-hidden :parent-hidden)
+                     (context/push :child-stack :parent-stack)
+                     (let ((child
+                             (async
+                               (context/set :child-owner :child)
+                               (context/set-hidden :child-hidden :child-hidden)
+                               (context/push :child-stack :child-stack)
+                               (list (context/get :child-owner)
+                                     (context/get-hidden :child-hidden)
+                                     (context/stack :child-stack)))))
+                       (list (await child)
+                             (list (context/get :child-owner)
+                                   (context/get-hidden :child-hidden)
+                                   (context/stack :child-stack)))))"#,
+            )
+            .expect("child and root settle without child publication");
+        let expected = interp
+            .eval_str(
+                "'((:child :child-hidden (:parent-stack :child-stack)) \
+                   (:parent :parent-hidden (:parent-stack)))",
+            )
+            .expect("evaluate child-publication oracle");
+        assert_eq!(result, expected);
+        assert_eq!(
+            interp.ctx.context_get(&Value::keyword("child-owner")),
+            Some(Value::keyword("parent"))
+        );
+        assert_eq!(
+            interp.ctx.hidden_get(&Value::keyword("child-hidden")),
+            Some(Value::keyword("parent-hidden"))
+        );
+        assert_eq!(
+            interp.ctx.context_stack_get(&Value::keyword("child-stack")),
+            vec![Value::keyword("parent-stack")]
+        );
+    }
+
+    #[test]
+    fn runtime_context_with_frame_is_task_local_and_cleanup_is_exact() {
+        let interp = Interpreter::new();
+        let result = interp
+            .eval_str_via_runtime(
+                r#"(begin
+                     (context/set :scoped :outer)
+                     (list
+                       (context/with {:scoped :inner :inner-only :value}
+                         (fn ()
+                           (list (context/get :scoped)
+                                 (context/get :inner-only)
+                                 (context/all))))
+                       (context/get :scoped)
+                       (context/get :inner-only)))"#,
+            )
+            .expect("context/with runs against the root task snapshot");
+        let expected = interp
+            .eval_str("'((:inner :value {:inner-only :value :scoped :inner}) :outer nil)")
+            .expect("evaluate context/with oracle");
+        assert_eq!(result, expected);
+        assert_eq!(
+            interp.ctx.context_get(&Value::keyword("scoped")),
+            Some(Value::keyword("outer"))
+        );
+        assert_eq!(interp.ctx.context_get(&Value::keyword("inner-only")), None);
+    }
+
+    #[test]
+    fn runtime_cancelled_root_publishes_only_at_settlement() {
+        let interp = Interpreter::new();
+        let user = Value::keyword("cancelled-user");
+        let hidden = Value::keyword("cancelled-hidden");
+        let stack = Value::keyword("cancelled-stack");
+        let root = interp
+            .submit_str(
+                r#"(begin
+                     (context/set :cancelled-user :kept)
+                     (context/set-hidden :cancelled-hidden :kept-hidden)
+                     (context/push :cancelled-stack :kept-stack)
+                     (channel/recv (channel/new 1)))"#,
+                RootOptions::default(),
+            )
+            .expect("submit cancellable root");
+
+        interp
+            .drive_roots(&[root.id()])
+            .expect("drive cancellable root to its channel wait");
+        assert!(matches!(root.poll_result(), RootPoll::Pending));
+        assert_eq!(interp.ctx.context_get(&user), None);
+        assert_eq!(interp.ctx.hidden_get(&hidden), None);
+        assert!(interp.ctx.context_stack_get(&stack).is_empty());
+
+        assert!(root.cancel(CancelReason::Explicit));
+        let settlement = drive_selected_until_ready(&interp, &root);
+        assert!(matches!(
+            settlement.outcome,
+            TaskOutcome::Cancelled(CancelReason::Explicit)
+        ));
+        assert_eq!(interp.ctx.context_get(&user), Some(Value::keyword("kept")));
+        assert_eq!(
+            interp.ctx.hidden_get(&hidden),
+            Some(Value::keyword("kept-hidden"))
+        );
+        assert_eq!(
+            interp.ctx.context_stack_get(&stack),
+            vec![Value::keyword("kept-stack")]
+        );
+        assert!(matches!(root.poll_result(), RootPoll::Ready(_)));
+        interp
+            .drive_roots(&[root.id()])
+            .expect("driving an already-settled root remains harmless");
+        assert_eq!(
+            interp.ctx.context_stack_get(&stack),
+            vec![Value::keyword("kept-stack")]
+        );
+    }
+
+    #[test]
+    fn runtime_failed_root_publishes_dynamic_context_exactly_once() {
+        let interp = Interpreter::new();
+        let user = Value::keyword("failed-user");
+        let hidden = Value::keyword("failed-hidden");
+        let stack = Value::keyword("failed-stack");
+        let root = interp
+            .submit_str(
+                r#"(begin
+                     (context/set :failed-user :kept)
+                     (context/set-hidden :failed-hidden :kept-hidden)
+                     (context/push :failed-stack :kept-stack)
+                     (error "expected failure"))"#,
+                RootOptions::default(),
+            )
+            .expect("submit failing root");
+
+        let settlement = drive_selected_until_ready(&interp, &root);
+        assert!(matches!(settlement.outcome, TaskOutcome::Failed(_)));
+        assert_eq!(interp.ctx.context_get(&user), Some(Value::keyword("kept")));
+        assert_eq!(
+            interp.ctx.hidden_get(&hidden),
+            Some(Value::keyword("kept-hidden"))
+        );
+        assert_eq!(
+            interp.ctx.context_stack_get(&stack),
+            vec![Value::keyword("kept-stack")]
+        );
+
+        assert!(matches!(root.poll_result(), RootPoll::Ready(_)));
+        interp
+            .drive_roots(&[root.id()])
+            .expect("driving an already-failed root remains harmless");
+        assert_eq!(
+            interp.ctx.context_stack_get(&stack),
+            vec![Value::keyword("kept-stack")]
+        );
     }
 
     // GATE (clean drop with a detached timer-parked task): an interpreter whose

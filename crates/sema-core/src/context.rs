@@ -2,6 +2,7 @@ use std::cell::{Cell, Ref, RefCell, RefMut};
 use std::collections::{BTreeMap, HashMap};
 use std::ops::{Deref, DerefMut};
 use std::path::PathBuf;
+use std::rc::Rc;
 use std::time::Instant;
 
 use crate::runtime::{
@@ -121,8 +122,26 @@ pub struct EvalContext {
     pub call_fn: Cell<Option<CallCallbackFn>>,
     pub call_owned_fn: Cell<Option<CallOwnedCallbackFn>>,
     pub interactive: Cell<bool>,
-    task_context: RefCell<Option<TaskContextHandle>>,
+    task_context: RefCell<Option<InstalledTaskContext>>,
     runtime_quantum_active: Cell<bool>,
+}
+
+#[derive(Clone)]
+struct InstalledTaskContext {
+    handle: TaskContextHandle,
+    // Native dispatch lends the whole TaskContext mutably to NativeCallContext.
+    // Cache the typed Rc at installation so EvalContext compatibility methods
+    // remain usable during that loan without re-borrowing the context map.
+    // The canonical state is still the extension owned by `handle`; every
+    // installation refreshes this cached clone of the same Rc.
+    dynamic: Option<Rc<DynamicTaskState>>,
+}
+
+impl InstalledTaskContext {
+    fn new(handle: TaskContextHandle) -> Self {
+        let dynamic = handle.get_rc::<DynamicTaskState>();
+        Self { handle, dynamic }
+    }
 }
 
 /// RAII guard for a module-load scope: pops the load stack when dropped, so the
@@ -135,7 +154,7 @@ pub struct ModuleLoadGuard<'a> {
 
 pub struct TaskContextGuard<'a> {
     ctx: &'a EvalContext,
-    previous: Option<TaskContextHandle>,
+    previous: Option<InstalledTaskContext>,
 }
 
 impl Drop for TaskContextGuard<'_> {
@@ -210,18 +229,32 @@ impl EvalContext {
     }
 
     pub fn task_context(&self) -> Option<TaskContextHandle> {
-        self.task_context.borrow().clone()
+        self.task_context
+            .borrow()
+            .as_ref()
+            .map(|installed| installed.handle.clone())
     }
 
     pub fn install_task_context(&self, handle: TaskContextHandle) -> Option<TaskContextHandle> {
-        self.task_context.replace(Some(handle))
+        self.task_context
+            .replace(Some(InstalledTaskContext::new(handle)))
+            .map(|installed| installed.handle)
     }
 
     pub fn scope_task_context(&self, handle: TaskContextHandle) -> TaskContextGuard<'_> {
         TaskContextGuard {
             ctx: self,
-            previous: self.task_context.replace(Some(handle)),
+            previous: self
+                .task_context
+                .replace(Some(InstalledTaskContext::new(handle))),
         }
+    }
+
+    fn dynamic_task_state(&self) -> Option<Rc<DynamicTaskState>> {
+        self.task_context
+            .borrow()
+            .as_ref()
+            .and_then(|installed| installed.dynamic.clone())
     }
 
     pub fn enter_runtime_quantum(&self) -> Result<RuntimeQuantumGuard<'_>, SemaError> {
@@ -280,7 +313,10 @@ impl EvalContext {
     }
 
     pub fn take_task_context(&self) -> Option<TaskContextHandle> {
-        self.task_context.borrow_mut().take()
+        self.task_context
+            .borrow_mut()
+            .take()
+            .map(|installed| installed.handle)
     }
 
     #[doc(hidden)]
@@ -509,6 +545,9 @@ impl EvalContext {
     // --- User context methods ---
 
     pub fn context_get(&self, key: &Value) -> Option<Value> {
+        if let Some(state) = self.dynamic_task_state() {
+            return state.user_get(key);
+        }
         let frames = self.user_context.borrow();
         for frame in frames.iter().rev() {
             if let Some(v) = frame.get(key) {
@@ -519,6 +558,10 @@ impl EvalContext {
     }
 
     pub fn context_set(&self, key: Value, value: Value) {
+        if let Some(state) = self.dynamic_task_state() {
+            state.user_set(key, value);
+            return;
+        }
         let mut frames = self.user_context.borrow_mut();
         if let Some(top) = frames.last_mut() {
             top.insert(key, value);
@@ -526,11 +569,17 @@ impl EvalContext {
     }
 
     pub fn context_has(&self, key: &Value) -> bool {
+        if let Some(state) = self.dynamic_task_state() {
+            return state.user_get(key).is_some();
+        }
         let frames = self.user_context.borrow();
         frames.iter().any(|frame| frame.contains_key(key))
     }
 
     pub fn context_remove(&self, key: &Value) -> Option<Value> {
+        if let Some(state) = self.dynamic_task_state() {
+            return state.user_remove(key);
+        }
         let mut frames = self.user_context.borrow_mut();
         let mut first_found = None;
         for frame in frames.iter_mut().rev() {
@@ -544,6 +593,9 @@ impl EvalContext {
     }
 
     pub fn context_all(&self) -> BTreeMap<Value, Value> {
+        if let Some(state) = self.dynamic_task_state() {
+            return state.user_all();
+        }
         let frames = self.user_context.borrow();
         let mut merged = BTreeMap::new();
         for frame in frames.iter() {
@@ -555,14 +607,30 @@ impl EvalContext {
     }
 
     pub fn context_push_frame(&self) {
+        if let Some(state) = self.dynamic_task_state() {
+            state
+                .push_user_frame(BTreeMap::new())
+                .expect("dynamic user-context scope identity exhausted");
+            return;
+        }
         self.user_context.borrow_mut().push(BTreeMap::new());
     }
 
     pub fn context_push_frame_with(&self, bindings: BTreeMap<Value, Value>) {
+        if let Some(state) = self.dynamic_task_state() {
+            state
+                .push_user_frame(bindings)
+                .expect("dynamic user-context scope identity exhausted");
+            return;
+        }
         self.user_context.borrow_mut().push(bindings);
     }
 
     pub fn context_pop_frame(&self) {
+        if let Some(state) = self.dynamic_task_state() {
+            state.pop_user_frame();
+            return;
+        }
         let mut frames = self.user_context.borrow_mut();
         if frames.len() > 1 {
             frames.pop();
@@ -570,6 +638,10 @@ impl EvalContext {
     }
 
     pub fn context_clear(&self) {
+        if let Some(state) = self.dynamic_task_state() {
+            state.user_clear();
+            return;
+        }
         let mut frames = self.user_context.borrow_mut();
         frames.clear();
         frames.push(BTreeMap::new());
@@ -578,6 +650,9 @@ impl EvalContext {
     // --- Hidden context methods ---
 
     pub fn hidden_get(&self, key: &Value) -> Option<Value> {
+        if let Some(state) = self.dynamic_task_state() {
+            return state.hidden_get(key);
+        }
         let frames = self.hidden_context.borrow();
         for frame in frames.iter().rev() {
             if let Some(v) = frame.get(key) {
@@ -588,6 +663,10 @@ impl EvalContext {
     }
 
     pub fn hidden_set(&self, key: Value, value: Value) {
+        if let Some(state) = self.dynamic_task_state() {
+            state.hidden_set(key, value);
+            return;
+        }
         let mut frames = self.hidden_context.borrow_mut();
         if let Some(top) = frames.last_mut() {
             top.insert(key, value);
@@ -595,15 +674,28 @@ impl EvalContext {
     }
 
     pub fn hidden_has(&self, key: &Value) -> bool {
+        if let Some(state) = self.dynamic_task_state() {
+            return state.hidden_get(key).is_some();
+        }
         let frames = self.hidden_context.borrow();
         frames.iter().any(|frame| frame.contains_key(key))
     }
 
     pub fn hidden_push_frame(&self) {
+        if let Some(state) = self.dynamic_task_state() {
+            state
+                .push_hidden_frame(BTreeMap::new())
+                .expect("dynamic hidden-context scope identity exhausted");
+            return;
+        }
         self.hidden_context.borrow_mut().push(BTreeMap::new());
     }
 
     pub fn hidden_pop_frame(&self) {
+        if let Some(state) = self.dynamic_task_state() {
+            state.pop_hidden_frame();
+            return;
+        }
         let mut frames = self.hidden_context.borrow_mut();
         if frames.len() > 1 {
             frames.pop();
@@ -653,12 +745,21 @@ impl EvalContext {
     }
 
     pub fn context_stack_push(&self, key: Value, value: Value) {
+        if let Some(state) = self.dynamic_task_state() {
+            state
+                .stack_push(key, value)
+                .expect("dynamic context-stack scope identity exhausted");
+            return;
+        }
         let (mut stacks, mut identities) = self.context_stacks.borrow_parts_mut();
         stacks.entry(key.clone()).or_default().push(value);
         identities.push(key);
     }
 
     pub fn context_stack_get(&self, key: &Value) -> Vec<Value> {
+        if let Some(state) = self.dynamic_task_state() {
+            return state.stack_get(key);
+        }
         self.context_stacks
             .borrow()
             .get(key)
@@ -667,6 +768,9 @@ impl EvalContext {
     }
 
     pub fn context_stack_pop(&self, key: &Value) -> Option<Value> {
+        if let Some(state) = self.dynamic_task_state() {
+            return state.stack_pop(key);
+        }
         let (mut stacks, mut identities) = self.context_stacks.borrow_parts_mut();
         let stack = stacks.get_mut(key)?;
         let val = stack.pop();
@@ -755,6 +859,32 @@ mod tests {
         assert_eq!(handle.borrow().get::<TestTaskLocal>().unwrap().0, 4);
         assert!(context.take_task_context().is_some());
         assert!(context.task_context().is_none());
+    }
+
+    #[test]
+    fn installed_dynamic_state_is_accessible_while_task_context_is_borrowed() {
+        let context = EvalContext::new();
+        let handle = crate::runtime::TaskContextHandle::default();
+        let dynamic = Rc::new(DynamicTaskState::root(
+            vec![BTreeMap::new()],
+            vec![BTreeMap::new()],
+            BTreeMap::new(),
+        ));
+        handle.borrow_mut().insert(Rc::clone(&dynamic));
+        let _scope = context.scope_task_context(handle.clone());
+
+        let held_by_native_call = handle.borrow_mut();
+        context.context_set(Value::keyword("key"), Value::int(42));
+        assert_eq!(
+            context.context_get(&Value::keyword("key")),
+            Some(Value::int(42))
+        );
+        drop(held_by_native_call);
+
+        assert_eq!(
+            dynamic.user_get(&Value::keyword("key")),
+            Some(Value::int(42))
+        );
     }
 
     #[test]

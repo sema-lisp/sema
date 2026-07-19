@@ -587,6 +587,16 @@ pub(super) struct RuntimeState {
     ready_visit_count: usize,
 }
 
+impl RuntimeState {
+    pub(super) fn snapshot_dynamic_root_context(&self) -> TaskContextHandle {
+        let context = TaskContextHandle::default();
+        context
+            .borrow_mut()
+            .insert(Rc::new(self._context.snapshot_dynamic_task_state()));
+        context
+    }
+}
+
 enum ProtocolWaitKind {
     Promises(sema_core::runtime::PromiseSetWait),
     Channel {
@@ -3264,6 +3274,7 @@ impl Runtime {
             None => response.map_or_else(ResumeInput::Failed, ResumeInput::Runtime),
         };
         let eval_context = Rc::clone(&self.state.borrow()._context);
+        let _installed = eval_context.scope_task_context(task.context.clone());
         let mut task_context = task.context.borrow_mut();
         let mut native_context = NativeCallContext {
             eval_context: &eval_context,
@@ -4193,6 +4204,7 @@ impl Runtime {
                 task.record.cancellation(),
             )
         };
+        let _installed = eval_context.scope_task_context(context.clone());
         let mut task_context = context.borrow_mut();
         let mut native_context = NativeCallContext {
             eval_context: &eval_context,
@@ -4286,15 +4298,18 @@ impl Runtime {
                 .task_ids
                 .allocate()
                 .map_err(|_| RuntimeFault::IdExhausted { kind: "task" })?;
-            let root = state
-                .tasks
-                .get(&spawner)
-                .ok_or_else(|| RuntimeFault::Invariant {
-                    message: "spawning task disappeared".into(),
-                })?
-                .record
-                .relations()
-                .origin_root;
+            let (root, context) = {
+                let spawner = state
+                    .tasks
+                    .get(&spawner)
+                    .ok_or_else(|| RuntimeFault::Invariant {
+                        message: "spawning task disappeared".into(),
+                    })?;
+                (
+                    spawner.record.relations().origin_root,
+                    spawner.context.inherit_for_child(),
+                )
+            };
             let promise = match state.promises.allocate_pending(Some(child)) {
                 Ok(promise) => promise,
                 Err(_) => {
@@ -4331,7 +4346,7 @@ impl Runtime {
                     suspended_owner: None,
                     vm_call: Some(vm),
                     vm_owner: Some(ReturnOwner::Root),
-                    context: TaskContextHandle::default(),
+                    context,
                     vm_resume: None,
                     // Seed the child with a snapshot of the spawner's live dynamic
                     // scopes, read from the thread-locals the spawner is still running
@@ -4531,6 +4546,10 @@ impl Runtime {
             }
         };
         let mut task = state.tasks.remove(&task_id).expect("task prevalidated");
+        let eval_context = Rc::clone(&state._context);
+        let dynamic_state = task
+            .context
+            .get_rc::<sema_core::runtime::DynamicTaskState>();
         let settlement = task
             .record
             .settle(sequence, outcome)
@@ -4555,6 +4574,13 @@ impl Runtime {
             state.handle_cleanup.push_back(root);
         }
         drop(state);
+        if let Some(dynamic_state) = dynamic_state {
+            let published = eval_context.publish_dynamic_task_state(&dynamic_state);
+            debug_assert!(
+                published,
+                "root task dynamic context must carry publication authority"
+            );
+        }
         drop(task);
         Ok(())
     }

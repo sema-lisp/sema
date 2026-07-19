@@ -775,6 +775,306 @@ fn register_runtime_fn_gated(
     );
 }
 
+#[derive(Clone, Copy)]
+enum ConversationCallbackKind {
+    Filter,
+    Map,
+    MapRole,
+    Find,
+}
+
+impl ConversationCallbackKind {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Filter => "conversation/filter",
+            Self::Map => "conversation/map",
+            Self::MapRole => "conversation/map-role",
+            Self::Find => "conversation/find",
+        }
+    }
+
+    fn arity(self) -> usize {
+        match self {
+            Self::MapRole => 3,
+            Self::Filter | Self::Map | Self::Find => 2,
+        }
+    }
+}
+
+enum ConversationCallbackOperation {
+    Filter,
+    Map,
+    MapRole(Role),
+    Find,
+}
+
+struct ConversationCallbackPlan {
+    conversation: Rc<Conversation>,
+    callback: Value,
+    operation: ConversationCallbackOperation,
+}
+
+fn prepare_conversation_callback(
+    kind: ConversationCallbackKind,
+    args: &[Value],
+) -> Result<ConversationCallbackPlan, SemaError> {
+    let expected = kind.arity();
+    if args.len() != expected {
+        return Err(SemaError::arity(
+            kind.name(),
+            expected.to_string(),
+            args.len(),
+        ));
+    }
+    let conversation = args[0]
+        .as_conversation_rc()
+        .ok_or_else(|| SemaError::type_error("conversation", args[0].type_name()))?;
+    let (callback, operation) = match kind {
+        ConversationCallbackKind::Filter => {
+            (args[1].clone(), ConversationCallbackOperation::Filter)
+        }
+        ConversationCallbackKind::Map => (args[1].clone(), ConversationCallbackOperation::Map),
+        ConversationCallbackKind::MapRole => (
+            args[2].clone(),
+            ConversationCallbackOperation::MapRole(parse_role(&args[1], kind.name())?),
+        ),
+        ConversationCallbackKind::Find => (args[1].clone(), ConversationCallbackOperation::Find),
+    };
+    Ok(ConversationCallbackPlan {
+        conversation,
+        callback,
+        operation,
+    })
+}
+
+fn run_conversation_callback_sync(
+    ctx: &EvalContext,
+    plan: ConversationCallbackPlan,
+) -> Result<Value, SemaError> {
+    match plan.operation {
+        ConversationCallbackOperation::Filter => {
+            let mut messages = Vec::new();
+            for message in &plan.conversation.messages {
+                let result = sema_core::call_callback(
+                    ctx,
+                    &plan.callback,
+                    &[Value::message(message.clone())],
+                )?;
+                if result.is_truthy() {
+                    messages.push(message.clone());
+                }
+            }
+            Ok(conversation_with_messages(&plan.conversation, messages))
+        }
+        ConversationCallbackOperation::Map => {
+            let mut results = Vec::with_capacity(plan.conversation.messages.len());
+            for message in &plan.conversation.messages {
+                results.push(sema_core::call_callback(
+                    ctx,
+                    &plan.callback,
+                    &[Value::message(message.clone())],
+                )?);
+            }
+            Ok(Value::list(results))
+        }
+        ConversationCallbackOperation::MapRole(role) => {
+            let mut messages = Vec::with_capacity(plan.conversation.messages.len());
+            for message in &plan.conversation.messages {
+                if message.role == role {
+                    let result = sema_core::call_callback(
+                        ctx,
+                        &plan.callback,
+                        &[Value::message(message.clone())],
+                    )?;
+                    let transformed = result
+                        .as_message_rc()
+                        .ok_or_else(|| SemaError::type_error("message", result.type_name()))?;
+                    messages.push((*transformed).clone());
+                } else {
+                    messages.push(message.clone());
+                }
+            }
+            Ok(conversation_with_messages(&plan.conversation, messages))
+        }
+        ConversationCallbackOperation::Find => {
+            for message in &plan.conversation.messages {
+                let argument = Value::message(message.clone());
+                if sema_core::call_callback(ctx, &plan.callback, std::slice::from_ref(&argument))?
+                    .is_truthy()
+                {
+                    return Ok(argument);
+                }
+            }
+            Ok(Value::nil())
+        }
+    }
+}
+
+fn conversation_with_messages(conversation: &Conversation, messages: Vec<Message>) -> Value {
+    Value::conversation(Conversation {
+        messages,
+        model: conversation.model.clone(),
+        metadata: conversation.metadata.clone(),
+    })
+}
+
+fn register_conversation_callback_fn(env: &Env, kind: ConversationCallbackKind) {
+    let name = kind.name();
+    env.set(
+        sema_core::intern(name),
+        Value::native_fn(NativeFn::with_ctx_runtime(
+            name,
+            move |ctx, args| {
+                run_conversation_callback_sync(ctx, prepare_conversation_callback(kind, args)?)
+            },
+            move |_native_ctx, args| {
+                ConversationCallbackDriver::start(prepare_conversation_callback(kind, args)?)
+            },
+        )),
+    );
+}
+
+struct ConversationCallbackDriver {
+    plan: ConversationCallbackPlan,
+    next_message: usize,
+    active_message: Option<usize>,
+    active_argument: Option<Value>,
+    values: Vec<Value>,
+    messages: Vec<Message>,
+}
+
+impl sema_core::runtime::Trace for ConversationCallbackDriver {
+    fn trace(&self, sink: &mut dyn FnMut(sema_core::cycle::GcEdge<'_>)) -> bool {
+        sink(sema_core::cycle::GcEdge::Value(&self.plan.callback));
+        if let Some(argument) = &self.active_argument {
+            sink(sema_core::cycle::GcEdge::Value(argument));
+        }
+        for value in &self.values {
+            sink(sema_core::cycle::GcEdge::Value(value));
+        }
+        true
+    }
+}
+
+impl ConversationCallbackDriver {
+    fn start(plan: ConversationCallbackPlan) -> sema_core::runtime::NativeResult {
+        Box::new(Self {
+            plan,
+            next_message: 0,
+            active_message: None,
+            active_argument: None,
+            values: Vec::new(),
+            messages: Vec::new(),
+        })
+        .advance()
+    }
+
+    fn advance(mut self: Box<Self>) -> sema_core::runtime::NativeResult {
+        use sema_core::runtime::{NativeCall, NativeOutcome};
+
+        while let Some(message) = self.plan.conversation.messages.get(self.next_message) {
+            let index = self.next_message;
+            self.next_message += 1;
+            if let ConversationCallbackOperation::MapRole(role) = &self.plan.operation {
+                if message.role != *role {
+                    self.messages.push(message.clone());
+                    continue;
+                }
+            }
+            self.active_message = Some(index);
+            let argument = Value::message(message.clone());
+            self.active_argument = Some(argument.clone());
+            return Ok(NativeOutcome::Call(NativeCall {
+                callable: self.plan.callback.clone(),
+                args: vec![argument],
+                continuation: self,
+            }));
+        }
+
+        let Self {
+            plan,
+            values,
+            messages,
+            ..
+        } = *self;
+        let value = match plan.operation {
+            ConversationCallbackOperation::Filter | ConversationCallbackOperation::MapRole(_) => {
+                conversation_with_messages(&plan.conversation, messages)
+            }
+            ConversationCallbackOperation::Map => Value::list(values),
+            ConversationCallbackOperation::Find => Value::nil(),
+        };
+        Ok(NativeOutcome::Return(value))
+    }
+}
+
+impl sema_core::runtime::NativeContinuation for ConversationCallbackDriver {
+    fn resume(
+        mut self: Box<Self>,
+        _context: &mut sema_core::runtime::NativeCallContext<'_>,
+        input: sema_core::runtime::ResumeInput,
+    ) -> sema_core::runtime::NativeResult {
+        use sema_core::runtime::{NativeOutcome, ResumeInput};
+
+        let Some((index, argument)) = self.active_message.take().zip(self.active_argument.take())
+        else {
+            return Err(SemaError::eval(format!(
+                "{} callback resumed without an active message",
+                self.plan.operation.name()
+            )));
+        };
+        match input {
+            ResumeInput::Returned(value) => match &self.plan.operation {
+                ConversationCallbackOperation::Filter => {
+                    if value.is_truthy() {
+                        self.messages
+                            .push(self.plan.conversation.messages[index].clone());
+                    }
+                    self.advance()
+                }
+                ConversationCallbackOperation::Map => {
+                    self.values.push(value);
+                    self.advance()
+                }
+                ConversationCallbackOperation::MapRole(_) => {
+                    let transformed = value
+                        .as_message_rc()
+                        .ok_or_else(|| SemaError::type_error("message", value.type_name()))?;
+                    self.messages.push((*transformed).clone());
+                    self.advance()
+                }
+                ConversationCallbackOperation::Find => {
+                    if value.is_truthy() {
+                        Ok(NativeOutcome::Return(argument))
+                    } else {
+                        self.advance()
+                    }
+                }
+            },
+            ResumeInput::Failed(error) => Err(error),
+            ResumeInput::Cancelled(reason) => Err(SemaError::eval(format!(
+                "{} callback was cancelled ({reason:?})",
+                self.plan.operation.name()
+            ))),
+            ResumeInput::Runtime(_) => Err(SemaError::eval(format!(
+                "{} callback received an unexpected runtime response",
+                self.plan.operation.name()
+            ))),
+        }
+    }
+}
+
+impl ConversationCallbackOperation {
+    fn name(&self) -> &'static str {
+        match self {
+            Self::Filter => ConversationCallbackKind::Filter.name(),
+            Self::Map => ConversationCallbackKind::Map.name(),
+            Self::MapRole(_) => ConversationCallbackKind::MapRole.name(),
+            Self::Find => ConversationCallbackKind::Find.name(),
+        }
+    }
+}
+
 /// Cooperative teardown for an `llm/with-*` dynamic-scope wrapper. The wrapper's
 /// setup installs the scope's thread-local state and hands this continuation a
 /// `teardown` closure that restores the prior state; the runtime drives the
@@ -4740,46 +5040,10 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
     });
 
     // (conversation/filter conv pred) — keep only messages where (pred msg) is truthy
-    register_fn_ctx(env, "conversation/filter", |ctx, args| {
-        if args.len() != 2 {
-            return Err(SemaError::arity("conversation/filter", "2", args.len()));
-        }
-        let conv = args[0]
-            .as_conversation_rc()
-            .ok_or_else(|| SemaError::type_error("conversation", args[0].type_name()))?;
-        let pred = &args[1];
-        let mut filtered = Vec::new();
-        for msg in &conv.messages {
-            let msg_val = Value::message(msg.clone());
-            let result = sema_core::call_callback(ctx, pred, &[msg_val])?;
-            if result.is_truthy() {
-                filtered.push(msg.clone());
-            }
-        }
-        Ok(Value::conversation(Conversation {
-            messages: filtered,
-            model: conv.model.clone(),
-            metadata: conv.metadata.clone(),
-        }))
-    });
+    register_conversation_callback_fn(env, ConversationCallbackKind::Filter);
 
     // (conversation/map conv f) — transform each message with (f msg), returns list of results
-    register_fn_ctx(env, "conversation/map", |ctx, args| {
-        if args.len() != 2 {
-            return Err(SemaError::arity("conversation/map", "2", args.len()));
-        }
-        let conv = args[0]
-            .as_conversation_rc()
-            .ok_or_else(|| SemaError::type_error("conversation", args[0].type_name()))?;
-        let func = &args[1];
-        let mut results = Vec::new();
-        for msg in &conv.messages {
-            let msg_val = Value::message(msg.clone());
-            let result = sema_core::call_callback(ctx, func, &[msg_val])?;
-            results.push(result);
-        }
-        Ok(Value::list(results))
-    });
+    register_conversation_callback_fn(env, ConversationCallbackKind::Map);
 
     // (conversation/say-as conv system-prompt "message" opts?) — say with a different system prompt for one turn
     register_runtime_fn_ctx(env, "conversation/say-as", |_ctx, args| {
@@ -5168,33 +5432,7 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
 
     // (conversation/map-role conv :role f) — transform only messages of `role` with (f msg),
     // which must return a message; other messages pass through unchanged.
-    register_fn_ctx(env, "conversation/map-role", |ctx, args| {
-        if args.len() != 3 {
-            return Err(SemaError::arity("conversation/map-role", "3", args.len()));
-        }
-        let conv = args[0]
-            .as_conversation_rc()
-            .ok_or_else(|| SemaError::type_error("conversation", args[0].type_name()))?;
-        let role = parse_role(&args[1], "conversation/map-role")?;
-        let func = &args[2];
-        let mut messages = Vec::with_capacity(conv.messages.len());
-        for msg in &conv.messages {
-            if msg.role == role {
-                let result = sema_core::call_callback(ctx, func, &[Value::message(msg.clone())])?;
-                let new_msg = result
-                    .as_message_rc()
-                    .ok_or_else(|| SemaError::type_error("message", result.type_name()))?;
-                messages.push((*new_msg).clone());
-            } else {
-                messages.push(msg.clone());
-            }
-        }
-        Ok(Value::conversation(Conversation {
-            messages,
-            model: conv.model.clone(),
-            metadata: conv.metadata.clone(),
-        }))
-    });
+    register_conversation_callback_fn(env, ConversationCallbackKind::MapRole);
 
     // ---- Conversation search (issue #12, Part 3) ----
 
@@ -5225,22 +5463,7 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
     });
 
     // (conversation/find conv pred) — first message where (pred msg) is truthy, else nil
-    register_fn_ctx(env, "conversation/find", |ctx, args| {
-        if args.len() != 2 {
-            return Err(SemaError::arity("conversation/find", "2", args.len()));
-        }
-        let conv = args[0]
-            .as_conversation_rc()
-            .ok_or_else(|| SemaError::type_error("conversation", args[0].type_name()))?;
-        let pred = &args[1];
-        for m in &conv.messages {
-            let msg_val = Value::message(m.clone());
-            if sema_core::call_callback(ctx, pred, std::slice::from_ref(&msg_val))?.is_truthy() {
-                return Ok(msg_val);
-            }
-        }
-        Ok(Value::nil())
-    });
+    register_conversation_callback_fn(env, ConversationCallbackKind::Find);
 
     // ---- Prompt algebra (issue #12, Part 7) — exact (role, content) matching ----
 
@@ -11946,6 +12169,38 @@ mod tests {
     use super::*;
     use sema_core::{intern, Lambda};
     use serde_json::json;
+
+    #[test]
+    fn conversation_callback_driver_traces_retained_values() {
+        use sema_core::runtime::Trace;
+
+        let active_argument = Value::int(40);
+        let callback = Value::int(41);
+        let accumulated = Value::int(42);
+        let driver = ConversationCallbackDriver {
+            plan: ConversationCallbackPlan {
+                conversation: Rc::new(Conversation {
+                    messages: Vec::new(),
+                    model: String::new(),
+                    metadata: BTreeMap::new(),
+                }),
+                callback: callback.clone(),
+                operation: ConversationCallbackOperation::Map,
+            },
+            next_message: 0,
+            active_message: Some(0),
+            active_argument: Some(active_argument.clone()),
+            values: vec![accumulated.clone()],
+            messages: Vec::new(),
+        };
+        let mut traced = Vec::new();
+        assert!(driver.trace(&mut |edge| {
+            if let sema_core::cycle::GcEdge::Value(value) = edge {
+                traced.push(value.clone());
+            }
+        }));
+        assert_eq!(traced, vec![callback, active_argument, accumulated]);
+    }
 
     /// The `llm/with-*` teardown continuation captures only non-`Value` scope
     /// state (a `FnOnce` over bools/ints/`Rc<BudgetFrame>`/provider names), so it

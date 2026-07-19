@@ -202,6 +202,25 @@ test('compiled runEntryAsync adopts the deserialized program into the Promise dr
   const start = source.indexOf('pub async fn run_entry_async');
   const end = source.indexOf('/// Read a file from the virtual filesystem.', start);
   const method = source.slice(start, end);
+  const admission = method.indexOf('ensure_promise_admission');
+  const deserialize = method.indexOf('deserialize_from_bytes');
+  const submit = method.indexOf('submit_compile_result');
+  expect(admission).toBeGreaterThan(-1);
+  expect(admission).toBeLessThan(deserialize);
+  expect(admission).toBeLessThan(submit);
   expect(method).toContain('submit_compile_result');
   expect(method).not.toContain('execute_compile_result');
+});
+
+test('compiled root adoption cancels before rejecting an admission conflict', () => {
+  const source = readFileSync(path.join(REPO_ROOT, 'crates/sema-wasm/src/driver.rs'), 'utf8');
+  const start = source.indexOf('pub(crate) fn adopt');
+  const end = source.indexOf('fn retain_while_active', start);
+  const method = source.slice(start, end);
+  const admission = method.indexOf('ensure_promise_admission');
+  const cancel = method.indexOf('handle.cancel');
+  const insert = method.indexOf('driver.promises.borrow_mut().insert');
+  expect(admission).toBeGreaterThan(-1);
+  expect(cancel).toBeGreaterThan(admission);
+  expect(cancel).toBeLessThan(insert);
 });

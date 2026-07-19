@@ -1,6 +1,6 @@
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 
 use js_sys::Date;
 use sema_core::{pretty_print, Env, NativeFn, SemaError, Value, ValueView};
@@ -44,8 +44,30 @@ thread_local! {
 /// `ActiveDebugGuard` around each drive so `run_parked_quantum` runs the
 /// debug-aware quantum) and the root handle it polls for settlement.
 struct DebugSession {
+    owner: Weak<sema_eval::Interpreter>,
     debug: sema_vm::DebugState,
     handle: sema_vm::runtime::RootHandle,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OwnerRelation {
+    Same,
+    Foreign,
+    Dead,
+}
+
+fn weak_owner_relation<T>(owner: &Weak<T>, current: &Rc<T>) -> OwnerRelation {
+    match owner.upgrade() {
+        Some(owner) if Rc::ptr_eq(&owner, current) => OwnerRelation::Same,
+        Some(_) => OwnerRelation::Foreign,
+        None => OwnerRelation::Dead,
+    }
+}
+
+impl DebugSession {
+    fn is_owned_by(&self, interp: &Rc<sema_eval::Interpreter>) -> bool {
+        weak_owner_relation(&self.owner, interp) == OwnerRelation::Same
+    }
 }
 
 fn cancel_debug_root(runtime: &sema_vm::runtime::Runtime, handle: &sema_vm::runtime::RootHandle) {
@@ -66,6 +88,44 @@ fn cancel_debug_root(runtime: &sema_vm::runtime::Runtime, handle: &sema_vm::runt
 
 thread_local! {
     static DEBUG_SESSION: RefCell<Option<DebugSession>> = const { RefCell::new(None) };
+}
+
+fn legacy_debug_owner_for(interp: &Rc<sema_eval::Interpreter>) -> Option<OwnerRelation> {
+    DEBUG_SESSION.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        let relation = weak_owner_relation(&slot.as_ref()?.owner, interp);
+        if relation == OwnerRelation::Dead {
+            let stale = slot.take().expect("legacy debug session disappeared");
+            let _ = stale
+                .handle
+                .cancel(sema_core::runtime::CancelReason::HostStop);
+            None
+        } else {
+            Some(relation)
+        }
+    })
+}
+
+fn legacy_debug_active_for(interp: &Rc<sema_eval::Interpreter>) -> bool {
+    legacy_debug_owner_for(interp) == Some(OwnerRelation::Same)
+}
+
+fn foreign_legacy_debug_active_for(interp: &Rc<sema_eval::Interpreter>) -> bool {
+    legacy_debug_owner_for(interp) == Some(OwnerRelation::Foreign)
+}
+
+fn take_legacy_debug_session_for(interp: &Rc<sema_eval::Interpreter>) -> Option<DebugSession> {
+    DEBUG_SESSION.with(|slot| {
+        let mut session = slot.try_borrow_mut().ok()?;
+        if session
+            .as_ref()
+            .is_some_and(|session| session.is_owned_by(interp))
+        {
+            session.take()
+        } else {
+            None
+        }
+    })
 }
 
 const VFS_MAX_TOTAL_BYTES: usize = 16 * 1024 * 1024; // 16 MB total
@@ -1488,6 +1548,16 @@ pub struct WasmInterpreter {
     next_callback_id: std::rc::Rc<Cell<u32>>,
 }
 
+impl Drop for WasmInterpreter {
+    fn drop(&mut self) {
+        if let Some(session) = take_legacy_debug_session_for(&self.inner) {
+            let _ = session
+                .handle
+                .cancel(sema_core::runtime::CancelReason::HostStop);
+        }
+    }
+}
+
 impl Default for WasmInterpreter {
     fn default() -> Self {
         Self::new()
@@ -1832,6 +1902,9 @@ impl WasmInterpreter {
         code: &str,
         breakpoint_lines: &js_sys::Array,
     ) -> js_sys::Promise {
+        if let Err(message) = driver::ensure_promise_admission(&self.promise_driver) {
+            return js_sys::Promise::resolve(&self.debug_error_str(message));
+        }
         self.inner.ctx.eval_steps.set(0);
         let bp_lines: Vec<u32> = breakpoint_lines
             .iter()
@@ -1950,6 +2023,15 @@ impl WasmInterpreter {
     /// Returns JSON: { status: "stopped"|"finished"|"error", ... }
     #[wasm_bindgen(js_name = debugStart)]
     pub fn debug_start(&self, code: &str, breakpoint_lines: &js_sys::Array) -> JsValue {
+        if foreign_legacy_debug_active_for(&self.inner) {
+            return self
+                .debug_error_str("another interpreter has an active synchronous debug session");
+        }
+        if self.promise_driver.has_active_roots() {
+            return self.debug_error_str(
+                "the synchronous debugger cannot start while Promise-driven execution is active on this interpreter",
+            );
+        }
         // The debugger always executes on the VM, so a `(load ...)` runs the
         // loaded body on the VM regardless of which eval the playground ran last.
         self.debug_stop();
@@ -2058,7 +2140,11 @@ impl WasmInterpreter {
             Err(e) => return self.debug_error_str(&format!("debug root submission failed: {e:?}")),
         };
         DEBUG_SESSION.with(|s| {
-            *s.borrow_mut() = Some(DebugSession { debug, handle });
+            *s.borrow_mut() = Some(DebugSession {
+                owner: Rc::downgrade(&self.inner),
+                debug,
+                handle,
+            });
         });
         attach_bp_info(self.debug_drive())
     }
@@ -2076,6 +2162,9 @@ impl WasmInterpreter {
             let Some(ref mut sess) = *session else {
                 return self.debug_error_str("No active debug session");
             };
+            if !sess.is_owned_by(&self.inner) {
+                return self.debug_error_str("No active debug session for this interpreter");
+            }
             let runtime = self.inner.runtime();
             let budget = sema_vm::runtime::DriveBudget::host_default();
             for _ in 0..4_096 {
@@ -2175,7 +2264,7 @@ impl WasmInterpreter {
         // Keep driving the runtime under the active session (the program yielded
         // back to JS on a prior turn); returns the same stopped/finished/yielded
         // mapping as the initial drive.
-        if DEBUG_SESSION.with(|s| s.borrow().is_none()) {
+        if !legacy_debug_active_for(&self.inner) {
             return self.debug_error_str("No active debug session");
         }
         self.debug_drive()
@@ -2183,7 +2272,7 @@ impl WasmInterpreter {
 
     #[wasm_bindgen(js_name = debugStop)]
     pub fn debug_stop(&self) {
-        let session = DEBUG_SESSION.with(|slot| slot.borrow_mut().take());
+        let session = take_legacy_debug_session_for(&self.inner);
         if let Some(session) = session {
             cancel_debug_root(self.inner.runtime(), &session.handle);
         }
@@ -2196,6 +2285,9 @@ impl WasmInterpreter {
             let Some(ref session) = *session else {
                 return JsValue::NULL;
             };
+            if !session.is_owned_by(&self.inner) {
+                return JsValue::NULL;
+            }
             // Inspect the paused task's own VM (its frames hold the task-locals);
             // it never leaves the runtime, so `with_paused_task_vm` borrows it in
             // place. Empty when nothing is paused.
@@ -2227,6 +2319,9 @@ impl WasmInterpreter {
             let Some(ref session) = *session else {
                 return js_sys::Array::new().into();
             };
+            if !session.is_owned_by(&self.inner) {
+                return js_sys::Array::new().into();
+            }
             // Mirror debug_get_locals: at an async stop, show the PAUSED TASK's
             // call stack (its VM is borrowed in place from the runtime).
             let frames = self
@@ -2299,6 +2394,9 @@ impl WasmInterpreter {
             .collect();
         DEBUG_SESSION.with(|s| {
             if let Some(ref mut sess) = *s.borrow_mut() {
+                if !sess.is_owned_by(&self.inner) {
+                    return;
+                }
                 let file = std::path::PathBuf::from("<playground>");
                 sess.debug.set_breakpoints(&file, &bp_lines);
             }
@@ -2307,7 +2405,7 @@ impl WasmInterpreter {
 
     #[wasm_bindgen(js_name = debugIsActive)]
     pub fn debug_is_active(&self) -> bool {
-        DEBUG_SESSION.with(|s| s.borrow().is_some())
+        legacy_debug_active_for(&self.inner)
     }
 
     /// Create interpreter with options: {stdlib: false, deny: ["network", "fs-write"]}
@@ -2726,6 +2824,9 @@ impl WasmInterpreter {
         };
 
         if sema_vm::is_bytecode_file(&bytes) {
+            if let Err(message) = driver::ensure_promise_admission(&self.promise_driver) {
+                return self.eval_error_result(&SemaError::eval(message));
+            }
             self.inner.ctx.push_file_path(entry_path.clone());
             let result = sema_vm::deserialize_from_bytes(&bytes).and_then(|compiled| {
                 self.inner.submit_compile_result(
@@ -3084,6 +3185,9 @@ impl WasmInterpreter {
         let root = DEBUG_SESSION.with(|slot| {
             let mut session = slot.borrow_mut();
             let sess = session.as_mut()?;
+            if !sess.is_owned_by(&self.inner) {
+                return None;
+            }
             let root = sess.handle.id();
             if !runtime.is_debug_paused_for(root) {
                 return None;
@@ -3404,6 +3508,26 @@ mod tests {
         );
         // The dedicated escapes are still preferred over the generic form.
         assert_eq!(escape_json("\t"), "\\t");
+    }
+
+    #[test]
+    fn dead_weak_owner_is_distinct_from_a_live_foreign_owner() {
+        let current = Rc::new(());
+        let foreign = Rc::new(());
+        let foreign_owner = Rc::downgrade(&foreign);
+        assert_eq!(
+            weak_owner_relation(&foreign_owner, &current),
+            OwnerRelation::Foreign
+        );
+
+        let dead_owner = {
+            let owner = Rc::new(());
+            Rc::downgrade(&owner)
+        };
+        assert_eq!(
+            weak_owner_relation(&dead_owner, &current),
+            OwnerRelation::Dead
+        );
     }
 
     #[test]

@@ -39,6 +39,8 @@ use web_time::Instant;
 use crate::output::{PromiseOutput, PromiseOutputEvent};
 
 const DEBUG_INSTRUCTION_BUDGET: u32 = 500_000;
+const LEGACY_DEBUG_CONFLICT: &str =
+    "Promise-driven execution cannot start while the synchronous debugger is active on this interpreter";
 
 // ─────────────────────────────────────────────────────────────────────────
 // Promise table + macrotask driver
@@ -166,7 +168,21 @@ pub(crate) fn promise_driven_root_active() -> bool {
     })
 }
 
+pub(crate) fn ensure_promise_admission(driver: &PromiseDriver) -> Result<(), &'static str> {
+    if crate::legacy_debug_active_for(&driver.interp) {
+        Err(LEGACY_DEBUG_CONFLICT)
+    } else {
+        Ok(())
+    }
+}
+
 impl PromiseDriver {
+    pub(crate) fn has_active_roots(&self) -> bool {
+        !self.promises.borrow().is_empty()
+            || self.debug_root.get().is_some()
+            || !self.retiring_debug_roots.borrow().is_empty()
+    }
+
     fn owns_root(&self, root: RootId) -> bool {
         self.promises.borrow().contains_key(&root)
             || self.debug_root.get() == Some(root)
@@ -202,6 +218,10 @@ pub(crate) fn submit(
     reject: Function,
     on_root: Option<Function>,
 ) {
+    if let Err(message) = ensure_promise_admission(driver) {
+        reject_with_message(&reject, message);
+        return;
+    }
     let opts = RootOptions {
         name: None,
         capture_output: true,
@@ -225,6 +245,12 @@ pub(crate) fn adopt(
     reject: Function,
     on_root: Option<Function>,
 ) {
+    if let Err(message) = ensure_promise_admission(driver) {
+        handle.cancel(sema_core::runtime::CancelReason::HostStop);
+        reject_with_message(&reject, message);
+        schedule_drive(driver);
+        return;
+    }
     let root = handle.id();
     register_driver(driver, root.runtime());
     driver.promises.borrow_mut().insert(
@@ -295,6 +321,10 @@ pub(crate) fn start_debug(
     let mut vm = Some(vm);
     let mut debug = Some(debug);
     js_sys::Promise::new(&mut move |resolve, _reject| {
+        if let Err(message) = ensure_promise_admission(&driver) {
+            resolve_debug_immediately(&resolve, debug_error_result(message));
+            return;
+        }
         let replaced_own_session = stop_debug(&driver);
         if !replaced_own_session && driver.interp.runtime().is_debug_paused() {
             resolve_debug_immediately(

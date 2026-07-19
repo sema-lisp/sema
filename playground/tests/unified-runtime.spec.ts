@@ -543,6 +543,8 @@ test('synchronous eval rejected behind a promise debug barrier leaves no runnabl
     const paused = await interp.debugStartPromise('(define held 1)\n(+ held 1)', [2]);
     const rejected = interp.evalVM('(context/set :foreign-sync-root 99)');
     const stopAccepted = interp.debugStopPromise();
+    const retiringBlocked = interp.debugStart('(context/set :retiring-debug-root-ran 1)', []);
+    await new Promise((resolve) => setTimeout(resolve, 20));
 
     // A synchronous debugger drives the whole runtime. If evalVM admitted a
     // root before noticing the foreign debug barrier, that stranded root runs
@@ -551,11 +553,13 @@ test('synchronous eval rejected behind a promise debug barrier leaves no runnabl
     const finished = interp.debugContinue();
     interp.debugStop();
 
-    return { paused, rejected, stopAccepted, entry, finished };
+    return { paused, rejected, stopAccepted, retiringBlocked, entry, finished };
   });
 
   expect(result.paused).toMatchObject({ status: 'stopped', line: 2 });
   expect(result.stopAccepted).toBe(true);
+  expect(result.retiringBlocked).toMatchObject({ status: 'error' });
+  expect(result.retiringBlocked.error).toContain('Promise-driven execution');
   expect(result.entry).toMatchObject({ status: 'stopped' });
   expect(result.finished).toMatchObject({ status: 'finished', value: null });
   expect(result.rejected.error).toContain('debugger is paused');
@@ -582,6 +586,212 @@ test('synchronous eval rejected behind a promise debug barrier cannot register a
   expect(result.stopAccepted).toBe(true);
   expect(result.probe.value).toBeNull();
   expect(result.probe.error.toLowerCase()).toContain('unbound variable');
+});
+
+test('legacy debugger excludes same-interpreter Promise roots before admission', async ({ page }) => {
+  await page.goto('/');
+
+  const result = await page.evaluate(async () => {
+    // @ts-expect-error -- resolved by the dev server at runtime, not by tsc
+    const mod = await import('/pkg/sema_wasm.js');
+    await mod.default();
+    const interp = new mod.SemaInterpreter();
+
+    const entry = interp.debugStart('(+ 1 2)', []);
+    let promiseRoot: number | null = null;
+    const rejected = await interp
+      .evalPromise(
+        '(context/set :legacy-promise-orphan 99)',
+        (root: number) => { promiseRoot = root; },
+      )
+      .then(
+        (value: string) => ({ value, error: null }),
+        (error: Error) => ({ value: null, error: error.message }),
+      );
+    const promiseDebug = await interp.debugStartPromise(
+      '(defmacro promise-debug-admission-leak () 7)\n(+ 1 2)',
+      [],
+    );
+
+    const resumed = interp.debugContinue();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    // A fresh legacy drive would run a stranded root if the rejected Promise
+    // had been submitted before the admission failure was discovered.
+    const inspectionEntry = interp.debugStart('(context/get :legacy-promise-orphan)', []);
+    const inspected = interp.debugContinue();
+    interp.debugStop();
+    const macroProbe = interp.evalVM('(promise-debug-admission-leak)');
+    return {
+      entry,
+      promiseRoot,
+      rejected,
+      promiseDebug,
+      resumed,
+      inspectionEntry,
+      inspected,
+      macroProbe,
+    };
+  });
+
+  expect(result.entry).toMatchObject({ status: 'stopped' });
+  expect(result.promiseRoot).toBeNull();
+  expect(result.rejected.value).toBeNull();
+  expect(result.rejected.error).toContain('synchronous debugger');
+  expect(result.promiseDebug).toMatchObject({ status: 'error' });
+  expect(result.promiseDebug.error).toContain('synchronous debugger');
+  expect(result.resumed).toMatchObject({ status: 'finished', value: '3' });
+  expect(result.inspectionEntry).toMatchObject({ status: 'stopped' });
+  expect(result.inspected).toMatchObject({ status: 'finished', value: null });
+  expect(result.macroProbe.value).toBeNull();
+  expect(result.macroProbe.error.toLowerCase()).toContain('unbound variable');
+});
+
+test('Promise root excludes same-interpreter legacy debugger before expansion', async ({ page }) => {
+  await page.goto('/');
+
+  const result = await page.evaluate(async () => {
+    // @ts-expect-error -- resolved by the dev server at runtime, not by tsc
+    const mod = await import('/pkg/sema_wasm.js');
+    await mod.default();
+    const interp = new mod.SemaInterpreter();
+
+    let promiseRoot: number | null = null;
+    const pending = interp.evalPromise(
+      '(async/sleep 30)\n' +
+        '(context/set :promise-admission-runs (+ (or (context/get :promise-admission-runs) 0) 1))\n' +
+        '"done"',
+      (root: number) => { promiseRoot = root; },
+    );
+    const legacy = interp.debugStart(
+      '(defmacro legacy-admission-leak () 7)\n' +
+        '(context/set :rejected-legacy-debugger-ran 99)',
+      [],
+    );
+    // Keep the pre-fix RED run finite. The corrected path returns an error
+    // without creating a session, so this branch is then unreachable.
+    if (legacy.status !== 'error') interp.debugStop();
+
+    const promised = await pending.then(
+      (value: string) => ({ value, error: null }),
+      (error: Error) => ({ value: null, error: error.message }),
+    );
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    const runs = interp.evalVM('(context/get :promise-admission-runs)');
+    const legacyMarker = interp.evalVM('(context/get :rejected-legacy-debugger-ran)');
+    const macroProbe = interp.evalVM('(legacy-admission-leak)');
+    return { promiseRoot, legacy, promised, runs, legacyMarker, macroProbe };
+  });
+
+  expect(result.promiseRoot).not.toBeNull();
+  expect(result.legacy).toMatchObject({ status: 'error' });
+  expect(result.legacy.error).toContain('Promise-driven execution');
+  expect(result.promised).toEqual({ value: '"done"', error: null });
+  expect(result.runs).toMatchObject({ value: '1', error: null });
+  expect(result.legacyMarker).toMatchObject({ value: null, error: null });
+  expect(result.macroProbe.value).toBeNull();
+  expect(result.macroProbe.error.toLowerCase()).toContain('unbound variable');
+});
+
+test('legacy debugger on interpreter A does not block Promise root on interpreter B', async ({ page }) => {
+  await page.goto('/');
+
+  const result = await page.evaluate(async () => {
+    // @ts-expect-error -- resolved by the dev server at runtime, not by tsc
+    const mod = await import('/pkg/sema_wasm.js');
+    await mod.default();
+    const interpA = new mod.SemaInterpreter();
+    const interpB = new mod.SemaInterpreter();
+
+    const entryA = interpA.debugStart('(+ 1 2)', []);
+    let rootB: number | null = null;
+    const promisedB = await interpB
+      .evalPromise(
+        '(async/sleep 20)\n(context/set :interpreter-b-runs 1)\n"B-ok"',
+        (root: number) => { rootB = root; },
+      )
+      .then(
+        (value: string) => ({ value, error: null }),
+        (error: Error) => ({ value: null, error: error.message }),
+      );
+    const activeABeforeContinue = interpA.debugIsActive();
+    const finishedA = interpA.debugContinue();
+    const probeB = interpB.evalVM('(context/get :interpreter-b-runs)');
+    interpA.debugStop();
+    return { entryA, rootB, promisedB, activeABeforeContinue, finishedA, probeB };
+  });
+
+  expect(result.entryA).toMatchObject({ status: 'stopped' });
+  expect(result.rootB).not.toBeNull();
+  expect(result.promisedB).toEqual({ value: '"B-ok"', error: null });
+  expect(result.activeABeforeContinue).toBe(true);
+  expect(result.finishedA).toMatchObject({ status: 'finished', value: '3' });
+  expect(result.probeB).toMatchObject({ value: '1', error: null });
+});
+
+test('legacy debugger operations on interpreter B cannot mutate interpreter A session', async ({ page }) => {
+  await page.goto('/');
+
+  const result = await page.evaluate(async () => {
+    // @ts-expect-error -- resolved by the dev server at runtime, not by tsc
+    const mod = await import('/pkg/sema_wasm.js');
+    await mod.default();
+    const interpA = new mod.SemaInterpreter();
+    const interpB = new mod.SemaInterpreter();
+
+    const entryA = interpA.debugStart('(define owned 41)\n(+ owned 1)', []);
+    const activeB = interpB.debugIsActive();
+    const localsB = interpB.debugGetLocals();
+    const stackB = interpB.debugGetStackTrace();
+    const continueB = interpB.debugContinue();
+    interpB.debugSetBreakpoints([2]);
+    const startB = interpB.debugStart(
+      '(defmacro foreign-legacy-admission-leak () 9)\n(+ 1 2)',
+      [],
+    );
+    const activeAAfterBOps = interpA.debugIsActive();
+    const finishedA = interpA.debugContinue();
+    interpA.debugStop();
+    interpB.debugStop();
+    const macroProbeB = interpB.evalVM('(foreign-legacy-admission-leak)');
+
+    const interpA2 = new mod.SemaInterpreter();
+    const entryA2 = interpA2.debugStart('(+ 1 2)', []);
+    interpB.debugStop();
+    const activeA2AfterBStop = interpA2.debugIsActive();
+    const finishedA2 = interpA2.debugContinue();
+    interpA2.debugStop();
+
+    return {
+      entryA,
+      activeB,
+      localsB,
+      stackB,
+      continueB,
+      startB,
+      activeAAfterBOps,
+      finishedA,
+      macroProbeB,
+      entryA2,
+      activeA2AfterBStop,
+      finishedA2,
+    };
+  });
+
+  expect(result.entryA).toMatchObject({ status: 'stopped' });
+  expect(result.activeB).toBe(false);
+  expect(result.localsB).toBeNull();
+  expect(result.stackB).toEqual([]);
+  expect(result.continueB).toMatchObject({ status: 'error' });
+  expect(result.startB).toMatchObject({ status: 'error' });
+  expect(result.startB.error).toContain('another interpreter');
+  expect(result.activeAAfterBOps).toBe(true);
+  expect(result.finishedA).toMatchObject({ status: 'finished', value: '42' });
+  expect(result.macroProbeB.value).toBeNull();
+  expect(result.macroProbeB.error.toLowerCase()).toContain('unbound variable');
+  expect(result.entryA2).toMatchObject({ status: 'stopped' });
+  expect(result.activeA2AfterBStop).toBe(true);
+  expect(result.finishedA2).toMatchObject({ status: 'finished', value: '3' });
 });
 
 test('a detached foreign timer does not delay promise-root deadlock settlement', async ({ page }) => {

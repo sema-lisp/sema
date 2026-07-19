@@ -6,6 +6,10 @@ The synchronous legacy debugger and the Promise-driven runtime must never own ro
 
 Each legacy `DebugSession` records a weak reference to its `Interpreter`. Admission checks compare interpreter identity, not the thread-global session slot alone. A paused legacy debugger on interpreter A must not block Promise work on interpreter B.
 
+The legacy session slot remains single-session for compatibility, but every legacy operation verifies ownership. Start on interpreter B rejects while A owns the slot; continue, poll, stop, locals, stack trace, active-state, and breakpoint calls on B act as though B has no session. They cannot resume, cancel, inspect, replace, or mutate A's session.
+
+Dropping a `WasmInterpreter` cancels and removes its legacy session. Admission also distinguishes a live foreign owner from a dead `Weak`: a stale session is cancelled and evicted before a new legacy root may be submitted, so garbage collection cannot permanently reserve the thread-local slot or leave a live root to be overwritten.
+
 The Promise driver exposes whether it owns any ordinary, active-debug, or retiring-debug roots. This includes all roots that its selected drive may need to settle or retire.
 
 ## Admission rules
@@ -31,4 +35,5 @@ Browser tests cover:
 1. A legacy debugger paused before `evalPromise`: the Promise rejects before reporting a root, and its body never mutates state after the legacy debugger resumes.
 2. A pending `evalPromise` before legacy `debugStart`: the legacy start rejects before expansion or submission, the Promise settles once, and no rejected debugger body runs later.
 3. A legacy debugger on interpreter A while interpreter B runs `evalPromise`: B proceeds normally and A remains independently resumable.
-4. Existing Promise-debugger concurrency tests remain green.
+4. Legacy debugger operations on interpreter B cannot observe, replace, stop, or mutate interpreter A's session.
+5. Existing Promise-debugger concurrency tests remain green.

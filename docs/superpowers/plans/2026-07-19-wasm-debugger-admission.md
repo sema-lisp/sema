@@ -12,6 +12,8 @@
 
 - Ordinary `evalPromise` roots and the Promise debugger must continue to coexist.
 - A legacy debugger on interpreter A must not block Promise work on interpreter B.
+- Legacy debugger methods on interpreter B must not inspect, replace, resume, stop, or mutate interpreter A's session.
+- A dead legacy-session owner must be cancelled and evicted rather than treated as a permanently live foreign owner.
 - Legacy `debugStart` must reject before stopping a session, clearing output, parsing, macro expansion, compilation, or root submission.
 - Source evaluation, compiled entry submission/adoption, and Promise debugger start must all enforce admission.
 - Preserve unrelated worktree changes and stage only owned files.
@@ -77,6 +79,8 @@ Assert B reports a root, resolves to `"B-ok"`, and records the marker while A re
 
 - [ ] **Step 4: Run the new tests and verify RED**
 
+Before the RED run, add one cross-interpreter legacy-API test. Pause A, call B's active-state, locals, stack, continue, breakpoint, start, and stop APIs, and assert they neither observe nor mutate A. B's `debugStart` must reject before expanding a macro, A must still finish with its original breakpoint state, and B's `debugStop` must leave a second A session active.
+
 Run:
 
 ```bash
@@ -120,6 +124,10 @@ fn legacy_debug_active_for(interp: &Rc<sema_eval::Interpreter>) -> bool {
 ```
 
 When legacy `debugStart` submits its root, store `owner: Rc::downgrade(&self.inner)`.
+
+Add `DebugSession::is_owned_by` and use it in every legacy session operation. A foreign `debugStart` returns `status: "error"` before calling `self.debug_stop`; foreign continue/poll return the existing no-session error, stop and breakpoint updates are no-ops, locals returns null, stack returns an empty array, and `debugIsActive` returns false.
+
+Classify weak owners as `Same`, `Foreign`, or `Dead`. Evict and cancel `Dead` sessions before admission, and add `Drop for WasmInterpreter` to cancel/remove the wrapper's owned legacy session. Unit-test that a dead weak owner is not classified as foreign.
 
 - [ ] **Step 2: Add exact Promise-driver admission predicates**
 

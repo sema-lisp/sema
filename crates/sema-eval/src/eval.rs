@@ -1445,16 +1445,12 @@ fn expand_match_form(
     Ok(rebuilt_list(expr, items, expanded))
 }
 
-/// Build a fresh VM and main closure from a deserialized `.semac` payload.
+/// Convert a deserialized `.semac` payload into the form shared by fresh-VM
+/// execution and cooperative callable execution.
 ///
 /// The bytecode format intentionally omits the in-process direct-native table,
 /// so loaded programs resolve native calls through their global environment.
-/// Returning the closure separately lets the nested synchronous entry execute
-/// it directly while the host-root entry seeds it without running a quantum.
-fn build_vm_for_compile_result(
-    globals: Rc<Env>,
-    result: sema_vm::CompileResult,
-) -> Result<(sema_vm::VM, Rc<sema_vm::Closure>), SemaError> {
+fn compiled_program_from_result(result: sema_vm::CompileResult) -> sema_vm::CompiledProgram {
     let functions: Vec<Rc<sema_vm::Function>> = result.functions.into_iter().map(Rc::new).collect();
     let main_cache_slots = result.chunk.n_global_cache_slots;
     let closure = Rc::new(sema_vm::Closure {
@@ -1475,7 +1471,27 @@ fn build_vm_for_compile_result(
         globals: None,
         functions: None,
     });
-    let vm = sema_vm::VM::new(globals, functions, &[], main_cache_slots)?;
+    sema_vm::CompiledProgram {
+        closure,
+        functions,
+        native_table: Vec::new(),
+        main_cache_slots,
+    }
+}
+
+/// Build a fresh VM and main closure for synchronous `.semac` execution.
+fn build_vm_for_compile_result(
+    globals: Rc<Env>,
+    result: sema_vm::CompileResult,
+) -> Result<(sema_vm::VM, Rc<sema_vm::Closure>), SemaError> {
+    let program = compiled_program_from_result(result);
+    let closure = Rc::clone(&program.closure);
+    let vm = sema_vm::VM::new(
+        globals,
+        program.functions,
+        &program.native_table,
+        program.main_cache_slots,
+    )?;
     Ok((vm, closure))
 }
 
@@ -1896,6 +1912,787 @@ impl sema_core::runtime::NativeContinuation for EvalProgramContinuation {
                 "eval continuation received an unexpected runtime response",
             )),
         }
+    }
+}
+
+fn runtime_module_state(
+    context: &sema_core::runtime::NativeCallContext<'_>,
+) -> Result<Rc<sema_core::runtime::ModuleTaskState>, SemaError> {
+    context
+        .task_context
+        .get_rc::<sema_core::runtime::ModuleTaskState>()
+        .ok_or_else(|| SemaError::eval("runtime module state is unavailable"))
+}
+
+fn check_runtime_module_cycle(
+    context: &sema_core::runtime::NativeCallContext<'_>,
+    identity: &std::path::Path,
+) -> Result<(), SemaError> {
+    let loading = runtime_module_state(context)?.loading();
+    let Some(cycle_start) = loading.iter().position(|candidate| candidate == identity) else {
+        return Ok(());
+    };
+    let mut cycle: Vec<String> = loading[cycle_start..]
+        .iter()
+        .map(|path| path.display().to_string())
+        .collect();
+    cycle.push(identity.display().to_string());
+    Err(SemaError::eval(format!(
+        "cyclic import detected: {}",
+        cycle.join(" -> ")
+    )))
+}
+
+struct ImportGateEntry {
+    gate: sema_core::runtime::ResourceGateHandle,
+    active_calls: usize,
+}
+
+impl Drop for ImportGateEntry {
+    fn drop(&mut self) {
+        let _ = self.gate.close();
+    }
+}
+
+/// Per-interpreter single-flight gates serialize cache misses for one exact
+/// module identity. The map owns no Sema values or environments; the fallback
+/// env is weak, so the payload adds no cycle-collector edges.
+struct ImportRuntimeState {
+    import_env: Weak<Env>,
+    self_ref: Weak<Self>,
+    gates: RefCell<HashMap<std::path::PathBuf, ImportGateEntry>>,
+}
+
+struct ImportGateLease {
+    state: Weak<ImportRuntimeState>,
+    identity: std::path::PathBuf,
+    gate: sema_core::runtime::ResourceGateId,
+}
+
+impl Drop for ImportGateLease {
+    fn drop(&mut self) {
+        let Some(state) = self.state.upgrade() else {
+            return;
+        };
+        let mut gates = state.gates.borrow_mut();
+        let remove = gates.get_mut(&self.identity).is_some_and(|entry| {
+            if entry.gate.id() != self.gate {
+                return false;
+            }
+            entry.active_calls = entry.active_calls.saturating_sub(1);
+            entry.active_calls == 0
+        });
+        if remove {
+            gates.remove(&self.identity);
+        }
+    }
+}
+
+impl ImportRuntimeState {
+    fn new(import_env: Weak<Env>) -> Rc<Self> {
+        Rc::new_cyclic(|self_ref| Self {
+            import_env,
+            self_ref: self_ref.clone(),
+            gates: RefCell::new(HashMap::new()),
+        })
+    }
+
+    fn active_gate(
+        &self,
+        identity: &std::path::Path,
+    ) -> Result<Option<(sema_core::runtime::ResourceGateHandle, ImportGateLease)>, SemaError> {
+        let Some(runtime) = sema_core::current_root().map(|root| root.runtime()) else {
+            return Ok(None);
+        };
+        let mut gates = self.gates.borrow_mut();
+        let Some(entry) = gates.get_mut(identity) else {
+            return Ok(None);
+        };
+        if entry.gate.id().runtime() != runtime {
+            return Err(SemaError::eval(
+                "import: module is already loading in another runtime",
+            ));
+        }
+        entry.active_calls += 1;
+        Ok(Some((
+            entry.gate.clone(),
+            ImportGateLease {
+                state: self.self_ref.clone(),
+                identity: identity.to_path_buf(),
+                gate: entry.gate.id(),
+            },
+        )))
+    }
+
+    fn reject_legacy_overlap(&self, identity: &std::path::Path) -> Result<(), SemaError> {
+        if self
+            .gates
+            .borrow()
+            .get(identity)
+            .is_some_and(|entry| entry.active_calls > 0)
+        {
+            return Err(SemaError::eval(
+                "import: module is already active in the cooperative runtime",
+            ));
+        }
+        Ok(())
+    }
+
+    fn install_gate(
+        &self,
+        identity: &std::path::Path,
+        gate: sema_core::runtime::ResourceGateHandle,
+    ) -> Result<(sema_core::runtime::ResourceGateHandle, ImportGateLease), SemaError> {
+        match self.active_gate(identity) {
+            Ok(Some(existing)) => {
+                let _ = gate.close();
+                return Ok(existing);
+            }
+            Err(error) => {
+                let _ = gate.close();
+                return Err(error);
+            }
+            Ok(None) => {}
+        }
+        let gate_id = gate.id();
+        self.gates.borrow_mut().insert(
+            identity.to_path_buf(),
+            ImportGateEntry {
+                gate: gate.clone(),
+                active_calls: 1,
+            },
+        );
+        Ok((
+            gate,
+            ImportGateLease {
+                state: self.self_ref.clone(),
+                identity: identity.to_path_buf(),
+                gate: gate_id,
+            },
+        ))
+    }
+}
+
+struct PendingRuntimeImport {
+    module: special_forms::ResolvedModuleBytes,
+    selective: Vec<String>,
+    target: Rc<Env>,
+}
+
+impl sema_core::runtime::Trace for PendingRuntimeImport {
+    fn trace(&self, sink: &mut dyn FnMut(sema_core::cycle::GcEdge<'_>)) -> bool {
+        sink(sema_core::cycle::GcEdge::Env(&self.target));
+        true
+    }
+}
+
+struct ImportGateCreated {
+    state: Weak<ImportRuntimeState>,
+    pending: PendingRuntimeImport,
+}
+
+impl sema_core::runtime::Trace for ImportGateCreated {
+    fn trace(&self, sink: &mut dyn FnMut(sema_core::cycle::GcEdge<'_>)) -> bool {
+        self.pending.trace(sink)
+    }
+}
+
+impl sema_core::runtime::NativeContinuation for ImportGateCreated {
+    fn resume(
+        self: Box<Self>,
+        _context: &mut sema_core::runtime::NativeCallContext<'_>,
+        input: sema_core::runtime::ResumeInput,
+    ) -> sema_core::runtime::NativeResult {
+        use sema_core::runtime::{ResumeInput, RuntimeResponse};
+
+        let ResumeInput::Runtime(RuntimeResponse::ResourceGate(gate)) = input else {
+            return match input {
+                ResumeInput::Failed(error) => Err(error),
+                ResumeInput::Cancelled(reason) => Err(SemaError::eval(format!(
+                    "import gate allocation was cancelled ({reason:?})"
+                ))),
+                _ => Err(SemaError::eval(
+                    "import gate allocation returned an unexpected runtime response",
+                )),
+            };
+        };
+        let Some(state) = self.state.upgrade() else {
+            let _ = gate.close();
+            return Err(SemaError::eval("import runtime state is unavailable"));
+        };
+        let (gate, lease) = state.install_gate(&self.pending.module.identity, gate)?;
+        acquire_import_gate(self.pending, gate.id(), lease)
+    }
+}
+
+fn acquire_import_gate(
+    pending: PendingRuntimeImport,
+    gate: sema_core::runtime::ResourceGateId,
+    lease: ImportGateLease,
+) -> sema_core::runtime::NativeResult {
+    use sema_core::runtime::{NativeOutcome, NativeSuspend, WaitKind};
+
+    Ok(NativeOutcome::Suspend(NativeSuspend {
+        wait: WaitKind::ResourceSlot(gate),
+        continuation: Box::new(ImportGateAcquired {
+            pending,
+            gate,
+            lease,
+        }),
+    }))
+}
+
+struct ImportGateAcquired {
+    pending: PendingRuntimeImport,
+    gate: sema_core::runtime::ResourceGateId,
+    lease: ImportGateLease,
+}
+
+impl sema_core::runtime::Trace for ImportGateAcquired {
+    fn trace(&self, sink: &mut dyn FnMut(sema_core::cycle::GcEdge<'_>)) -> bool {
+        self.pending.trace(sink)
+    }
+}
+
+impl sema_core::runtime::NativeContinuation for ImportGateAcquired {
+    fn resume(
+        self: Box<Self>,
+        context: &mut sema_core::runtime::NativeCallContext<'_>,
+        input: sema_core::runtime::ResumeInput,
+    ) -> sema_core::runtime::NativeResult {
+        use sema_core::runtime::{ResumeInput, RuntimeResponse};
+
+        match input {
+            ResumeInput::Runtime(RuntimeResponse::Value(_)) => {
+                start_import_owner(context, self.pending, self.gate, self.lease)
+            }
+            ResumeInput::Failed(error) => Err(error),
+            ResumeInput::Cancelled(reason) => Err(SemaError::eval(format!(
+                "import gate acquisition was cancelled ({reason:?})"
+            ))),
+            _ => Err(SemaError::eval(
+                "import gate acquisition returned an unexpected runtime response",
+            )),
+        }
+    }
+}
+
+struct ImportReleaseContinuation {
+    outcome: sema_core::runtime::TaskOutcome,
+    _lease: ImportGateLease,
+}
+
+impl sema_core::runtime::Trace for ImportReleaseContinuation {
+    fn trace(&self, sink: &mut dyn FnMut(sema_core::cycle::GcEdge<'_>)) -> bool {
+        self.outcome.trace(sink)
+    }
+}
+
+impl sema_core::runtime::NativeContinuation for ImportReleaseContinuation {
+    fn resume(
+        self: Box<Self>,
+        _context: &mut sema_core::runtime::NativeCallContext<'_>,
+        input: sema_core::runtime::ResumeInput,
+    ) -> sema_core::runtime::NativeResult {
+        use sema_core::runtime::{NativeOutcome, ResumeInput, RuntimeResponse, TaskOutcome};
+
+        match input {
+            ResumeInput::Runtime(RuntimeResponse::Value(_)) => match self.outcome {
+                TaskOutcome::Returned(value) => Ok(NativeOutcome::Return(value)),
+                TaskOutcome::Failed(error) => Err(error),
+                TaskOutcome::Cancelled(reason) => Err(SemaError::eval(format!(
+                    "import was cancelled ({reason:?})"
+                ))),
+            },
+            ResumeInput::Failed(error) => Err(error),
+            ResumeInput::Cancelled(reason) => Err(SemaError::eval(format!(
+                "import gate release was cancelled ({reason:?})"
+            ))),
+            _ => Err(SemaError::eval(
+                "import gate release returned an unexpected runtime response",
+            )),
+        }
+    }
+}
+
+fn release_import_gate(
+    gate: sema_core::runtime::ResourceGateId,
+    outcome: sema_core::runtime::TaskOutcome,
+    lease: ImportGateLease,
+) -> sema_core::runtime::NativeResult {
+    use sema_core::runtime::{NativeOutcome, RuntimeRequest};
+
+    Ok(NativeOutcome::Runtime(
+        RuntimeRequest::ReleaseResourceGate {
+            gate,
+            continuation: Box::new(ImportReleaseContinuation {
+                outcome,
+                _lease: lease,
+            }),
+        },
+    ))
+}
+
+/// Exact task-local module scopes retained across structural calls. Scope IDs
+/// let `Drop` remove this invocation's entries even when cancellation unwinds
+/// the continuation instead of returning through its normal completion path.
+struct RuntimeModuleScope {
+    state: Rc<sema_core::runtime::ModuleTaskState>,
+    loading: sema_core::runtime::ScopeId,
+    current_file: sema_core::runtime::ScopeId,
+    exports: Option<sema_core::runtime::ScopeId>,
+}
+
+impl RuntimeModuleScope {
+    fn enter(
+        context: &mut sema_core::runtime::NativeCallContext<'_>,
+        identity: &std::path::Path,
+        file_path: std::path::PathBuf,
+        tracks_exports: bool,
+    ) -> Result<Self, SemaError> {
+        check_runtime_module_cycle(context, identity)?;
+        let state = runtime_module_state(context)?;
+
+        let loading_scope = state
+            .push_loading(identity.to_path_buf())
+            .map_err(|error| SemaError::eval(format!("module load scope: {error}")))?;
+        let current_file = match state.push_current_file(file_path) {
+            Ok(scope) => scope,
+            Err(error) => {
+                state.remove_loading(loading_scope);
+                return Err(SemaError::eval(format!(
+                    "module current-file scope: {error}"
+                )));
+            }
+        };
+        let exports = if tracks_exports {
+            match state.push_exports(None) {
+                Ok(scope) => Some(scope),
+                Err(error) => {
+                    state.remove_current_file(current_file);
+                    state.remove_loading(loading_scope);
+                    return Err(SemaError::eval(format!("module export scope: {error}")));
+                }
+            }
+        } else {
+            None
+        };
+
+        Ok(Self {
+            state,
+            loading: loading_scope,
+            current_file,
+            exports,
+        })
+    }
+
+    fn take_exports(&mut self) -> Option<Vec<String>> {
+        self.exports
+            .take()
+            .and_then(|scope| self.state.take_exports(scope))
+            .flatten()
+    }
+}
+
+impl Drop for RuntimeModuleScope {
+    fn drop(&mut self) {
+        if let Some(scope) = self.exports.take() {
+            self.state.remove_exports(scope);
+        }
+        self.state.remove_current_file(self.current_file);
+        self.state.remove_loading(self.loading);
+    }
+}
+
+enum RuntimeModuleCompletion {
+    Load,
+    Import {
+        identity: std::path::PathBuf,
+        selective: Vec<String>,
+        target: Rc<Env>,
+        gate: sema_core::runtime::ResourceGateId,
+        lease: ImportGateLease,
+    },
+}
+
+impl RuntimeModuleCompletion {
+    fn trace(&self, sink: &mut dyn FnMut(sema_core::cycle::GcEdge<'_>)) {
+        if let Self::Import { target, .. } = self {
+            sink(sema_core::cycle::GcEdge::Env(target));
+        }
+    }
+
+    fn fail(self, error: SemaError) -> sema_core::runtime::NativeResult {
+        match self {
+            Self::Load => Err(error),
+            Self::Import { gate, lease, .. } => {
+                release_import_gate(gate, sema_core::runtime::TaskOutcome::Failed(error), lease)
+            }
+        }
+    }
+
+    fn cancelled(
+        self,
+        reason: sema_core::runtime::CancelReason,
+    ) -> sema_core::runtime::NativeResult {
+        drop(self);
+        Err(SemaError::eval(format!(
+            "module evaluation was cancelled ({reason:?})"
+        )))
+    }
+}
+
+/// State common to source and bytecode module execution. Import cache/export
+/// publication happens only in `finish`, after the complete body has returned.
+struct RuntimeModuleRun {
+    scope: RuntimeModuleScope,
+    globals: Rc<Env>,
+    completion: RuntimeModuleCompletion,
+}
+
+impl RuntimeModuleRun {
+    fn finish(mut self, context: &EvalContext, value: Value) -> sema_core::runtime::NativeResult {
+        use sema_core::runtime::NativeOutcome;
+
+        match self.completion {
+            RuntimeModuleCompletion::Load => Ok(NativeOutcome::Return(value)),
+            RuntimeModuleCompletion::Import {
+                identity,
+                selective,
+                target,
+                gate,
+                lease,
+            } => {
+                let declared = self.scope.take_exports();
+                let exports =
+                    special_forms::collect_module_exports(&self.globals, declared.as_deref());
+                context.cache_module(identity, exports.clone());
+                let outcome =
+                    match special_forms::copy_exports_to_env(&exports, &selective, &target) {
+                        Ok(()) => sema_core::runtime::TaskOutcome::Returned(Value::nil()),
+                        Err(error) => sema_core::runtime::TaskOutcome::Failed(error),
+                    };
+                release_import_gate(gate, outcome, lease)
+            }
+        }
+    }
+
+    fn fail(self, error: SemaError) -> sema_core::runtime::NativeResult {
+        self.completion.fail(error)
+    }
+
+    fn cancelled(
+        self,
+        reason: sema_core::runtime::CancelReason,
+    ) -> sema_core::runtime::NativeResult {
+        self.completion.cancelled(reason)
+    }
+
+    fn trace(&self, sink: &mut dyn FnMut(sema_core::cycle::GcEdge<'_>)) {
+        sink(sema_core::cycle::GcEdge::Env(&self.globals));
+        self.completion.trace(sink);
+    }
+}
+
+struct RuntimeSourceModule {
+    run: RuntimeModuleRun,
+    expressions: Vec<Value>,
+    spans: sema_core::SpanMap,
+    source_file: std::path::PathBuf,
+    next: usize,
+    last: Value,
+}
+
+impl RuntimeSourceModule {
+    fn drive(
+        mut self: Box<Self>,
+        context: &mut sema_core::runtime::NativeCallContext<'_>,
+    ) -> sema_core::runtime::NativeResult {
+        use sema_core::runtime::{NativeCall, NativeOutcome};
+
+        while let Some(expression) = self.expressions.get(self.next) {
+            self.next += 1;
+            let expanded =
+                match expand_for_vm_in(context.eval_context, &self.run.globals, expression) {
+                    Ok(expanded) => expanded,
+                    Err(error) => return self.run.fail(error),
+                };
+            if expanded.is_nil() {
+                continue;
+            }
+            let program = match sema_vm::compile_program_with_spans(
+                std::slice::from_ref(&expanded),
+                &self.spans,
+                Some(self.source_file.clone()),
+            ) {
+                Ok(program) => program,
+                Err(error) => return self.run.fail(error),
+            };
+            let callable = match sema_vm::program_as_callable(program, Rc::clone(&self.run.globals))
+            {
+                Ok(callable) => callable,
+                Err(error) => return self.run.fail(error),
+            };
+            return Ok(NativeOutcome::Call(NativeCall {
+                callable,
+                args: Vec::new(),
+                continuation: self,
+            }));
+        }
+
+        let Self { run, last, .. } = *self;
+        run.finish(context.eval_context, last)
+    }
+}
+
+impl sema_core::runtime::Trace for RuntimeSourceModule {
+    fn trace(&self, sink: &mut dyn FnMut(sema_core::cycle::GcEdge<'_>)) -> bool {
+        self.run.trace(sink);
+        for expression in &self.expressions {
+            sink(sema_core::cycle::GcEdge::Value(expression));
+        }
+        sink(sema_core::cycle::GcEdge::Value(&self.last));
+        true
+    }
+}
+
+impl sema_core::runtime::NativeContinuation for RuntimeSourceModule {
+    fn resume(
+        mut self: Box<Self>,
+        context: &mut sema_core::runtime::NativeCallContext<'_>,
+        input: sema_core::runtime::ResumeInput,
+    ) -> sema_core::runtime::NativeResult {
+        use sema_core::runtime::ResumeInput;
+
+        match input {
+            ResumeInput::Returned(value) => self.last = value,
+            ResumeInput::Failed(error) => return self.run.fail(error),
+            ResumeInput::Cancelled(reason) => return self.run.cancelled(reason),
+            ResumeInput::Runtime(_) => {
+                return Err(SemaError::eval(
+                    "module continuation received an unexpected runtime response",
+                ))
+            }
+        }
+        self.drive(context)
+    }
+}
+
+struct RuntimeBytecodeModule {
+    run: RuntimeModuleRun,
+}
+
+impl sema_core::runtime::Trace for RuntimeBytecodeModule {
+    fn trace(&self, sink: &mut dyn FnMut(sema_core::cycle::GcEdge<'_>)) -> bool {
+        self.run.trace(sink);
+        true
+    }
+}
+
+impl sema_core::runtime::NativeContinuation for RuntimeBytecodeModule {
+    fn resume(
+        self: Box<Self>,
+        context: &mut sema_core::runtime::NativeCallContext<'_>,
+        input: sema_core::runtime::ResumeInput,
+    ) -> sema_core::runtime::NativeResult {
+        use sema_core::runtime::ResumeInput;
+
+        match input {
+            ResumeInput::Returned(value) => self.run.finish(context.eval_context, value),
+            ResumeInput::Failed(error) => self.run.fail(error),
+            ResumeInput::Cancelled(reason) => self.run.cancelled(reason),
+            ResumeInput::Runtime(_) => Err(SemaError::eval(
+                "module continuation received an unexpected runtime response",
+            )),
+        }
+    }
+}
+
+fn start_runtime_module(
+    context: &mut sema_core::runtime::NativeCallContext<'_>,
+    module: special_forms::ResolvedModuleBytes,
+    globals: Rc<Env>,
+    completion: RuntimeModuleCompletion,
+) -> sema_core::runtime::NativeResult {
+    use sema_core::runtime::{NativeCall, NativeOutcome};
+
+    let tracks_exports = matches!(completion, RuntimeModuleCompletion::Import { .. });
+    let special_forms::ResolvedModuleBytes {
+        requested,
+        identity,
+        file_path,
+        bytes,
+    } = module;
+    let scope =
+        match RuntimeModuleScope::enter(context, &identity, file_path.clone(), tracks_exports) {
+            Ok(scope) => scope,
+            Err(error) => return completion.fail(error),
+        };
+    let run = RuntimeModuleRun {
+        scope,
+        globals,
+        completion,
+    };
+
+    if sema_vm::is_bytecode_file(&bytes) {
+        let compiled = match sema_vm::deserialize_from_bytes(&bytes) {
+            Ok(compiled) => compiled,
+            Err(error) => return run.fail(error),
+        };
+        let program = compiled_program_from_result(compiled);
+        let callable = match sema_vm::program_as_callable(program, Rc::clone(&run.globals)) {
+            Ok(callable) => callable,
+            Err(error) => return run.fail(error),
+        };
+        return Ok(NativeOutcome::Call(NativeCall {
+            callable,
+            args: Vec::new(),
+            continuation: Box::new(RuntimeBytecodeModule { run }),
+        }));
+    }
+
+    let source = match String::from_utf8(bytes) {
+        Ok(source) => source,
+        Err(error) => {
+            let message = if tracks_exports {
+                format!("import {requested}: invalid UTF-8 in module: {error}")
+            } else {
+                format!("load {requested}: invalid UTF-8: {error}")
+            };
+            return run.fail(SemaError::Io(message));
+        }
+    };
+    let (expressions, spans) = match sema_reader::read_many_with_spans(&source) {
+        Ok(parsed) => parsed,
+        Err(error) => return run.fail(error),
+    };
+    context.eval_context.merge_span_table(spans.clone());
+    Box::new(RuntimeSourceModule {
+        run,
+        expressions,
+        spans,
+        source_file: file_path,
+        next: 0,
+        last: Value::nil(),
+    })
+    .drive(context)
+}
+
+fn runtime_delegate_target(fallback: &Weak<Env>) -> Result<Rc<Env>, SemaError> {
+    match sema_vm::current_vm_globals() {
+        Some(target) => Ok(target),
+        None => upgrade_delegate_env(fallback),
+    }
+}
+
+fn runtime_load(
+    fallback: &Weak<Env>,
+    context: &mut sema_core::runtime::NativeCallContext<'_>,
+    args: &[Value],
+) -> sema_core::runtime::NativeResult {
+    let target = runtime_delegate_target(fallback)?;
+    let module = special_forms::prepare_load(args, context.eval_context)?;
+    start_runtime_module(context, module, target, RuntimeModuleCompletion::Load)
+}
+
+fn import_args(args: &[Value]) -> Result<Vec<Value>, SemaError> {
+    if args.len() != 2 {
+        return Err(SemaError::arity("import", "2", args.len()));
+    }
+    let mut prepared = vec![args[0].clone()];
+    if let Some(items) = args[1].as_list() {
+        prepared.extend(items.iter().cloned());
+    }
+    Ok(prepared)
+}
+
+fn runtime_import(
+    state: &ImportRuntimeState,
+    context: &mut sema_core::runtime::NativeCallContext<'_>,
+    args: &[Value],
+) -> sema_core::runtime::NativeResult {
+    use sema_core::runtime::{NativeOutcome, RuntimeRequest};
+
+    let target = runtime_delegate_target(&state.import_env)?;
+    let args = import_args(args)?;
+    match special_forms::prepare_import(&args, context.eval_context)? {
+        special_forms::ImportPreparation::Cached { exports, selective } => {
+            special_forms::copy_exports_to_env(&exports, &selective, &target)?;
+            Ok(NativeOutcome::Return(Value::nil()))
+        }
+        special_forms::ImportPreparation::Uncached { module, selective } => {
+            check_runtime_module_cycle(context, &module.identity)?;
+            let pending = PendingRuntimeImport {
+                module,
+                selective,
+                target,
+            };
+            if let Some((gate, lease)) = state.active_gate(&pending.module.identity)? {
+                return acquire_import_gate(pending, gate.id(), lease);
+            }
+            Ok(NativeOutcome::Runtime(RuntimeRequest::CreateResourceGate {
+                continuation: Box::new(ImportGateCreated {
+                    state: state.self_ref.clone(),
+                    pending,
+                }),
+            }))
+        }
+    }
+}
+
+fn start_import_owner(
+    context: &mut sema_core::runtime::NativeCallContext<'_>,
+    pending: PendingRuntimeImport,
+    gate: sema_core::runtime::ResourceGateId,
+    lease: ImportGateLease,
+) -> sema_core::runtime::NativeResult {
+    if let Some(exports) = context
+        .eval_context
+        .get_cached_module(&pending.module.identity)
+    {
+        let outcome =
+            match special_forms::copy_exports_to_env(&exports, &pending.selective, &pending.target)
+            {
+                Ok(()) => sema_core::runtime::TaskOutcome::Returned(Value::nil()),
+                Err(error) => sema_core::runtime::TaskOutcome::Failed(error),
+            };
+        return release_import_gate(gate, outcome, lease);
+    }
+
+    let module_env = Rc::new(create_module_env(&pending.target));
+    let completion = RuntimeModuleCompletion::Import {
+        identity: pending.module.identity.clone(),
+        selective: pending.selective,
+        target: pending.target,
+        gate,
+        lease,
+    };
+    start_runtime_module(context, pending.module, module_env, completion)
+}
+
+fn legacy_import(
+    state: &ImportRuntimeState,
+    context: &EvalContext,
+    args: &[Value],
+) -> Result<Value, SemaError> {
+    let args = import_args(args)?;
+    let target = match sema_vm::current_vm_globals() {
+        Some(target) => target,
+        None => upgrade_delegate_env(&state.import_env)?,
+    };
+    let result = match special_forms::prepare_import(&args, context)? {
+        special_forms::ImportPreparation::Cached { exports, selective } => {
+            special_forms::copy_exports_to_env(&exports, &selective, &target)?;
+            Trampoline::Value(Value::nil())
+        }
+        special_forms::ImportPreparation::Uncached { module, selective } => {
+            state.reject_legacy_overlap(&module.identity)?;
+            special_forms::eval_prepared_import(module, &selective, &target, context)?
+        }
+    };
+    match result {
+        Trampoline::Value(value) => Ok(value),
+        Trampoline::Eval(..) => Ok(Value::nil()),
     }
 }
 
@@ -2523,60 +3320,45 @@ pub fn register_vm_delegates(env: &Rc<Env>, ctx: &Rc<EvalContext>) {
         )),
     );
 
-    // __vm-load: call the load driver (special_forms::eval_load) directly.
-    // The driver handles VFS
-    // resolution, file path push/pop, caching, and runs the loaded body on the
-    // VM (M4). The path arrives already evaluated from the VM.
+    // __vm-load resolves and reads synchronously. Its runtime ABI keeps the
+    // module path/cycle scopes in task-local state, then invokes each loaded
+    // form structurally so timers, channels, and runtime-only natives can park.
+    // The value ABI preserves synchronous nested-evaluator compatibility.
     let load_env = Rc::downgrade(env);
+    let load_env_runtime = Rc::downgrade(env);
     env.set(
         intern("__vm-load"),
-        Value::native_fn(NativeFn::with_ctx("__vm-load", move |ctx, args| {
-            if args.len() != 1 {
-                return Err(SemaError::arity("load", "1", args.len()));
-            }
-            // Target the *currently executing* VM's env (the module being run),
-            // falling back to the global env at top level, so a nested `load`
-            // adds definitions to the right module env — not always the globals.
-            let target = match sema_vm::current_vm_globals() {
-                Some(t) => t,
-                None => upgrade_delegate_env(&load_env)?,
-            };
-            match special_forms::eval_load(std::slice::from_ref(&args[0]), &target, ctx)? {
-                Trampoline::Value(v) => Ok(v),
-                Trampoline::Eval(..) => Ok(Value::nil()),
-            }
-        })),
+        Value::native_fn(NativeFn::with_ctx_runtime(
+            "__vm-load",
+            move |ctx, args| {
+                if args.len() != 1 {
+                    return Err(SemaError::arity("load", "1", args.len()));
+                }
+                let target = match sema_vm::current_vm_globals() {
+                    Some(target) => target,
+                    None => upgrade_delegate_env(&load_env)?,
+                };
+                match special_forms::eval_load(std::slice::from_ref(&args[0]), &target, ctx)? {
+                    Trampoline::Value(value) => Ok(value),
+                    Trampoline::Eval(..) => Ok(Value::nil()),
+                }
+            },
+            move |context, args| runtime_load(&load_env_runtime, context, args),
+        )),
     );
 
-    // __vm-import: call the import driver (special_forms::eval_import) directly.
-    // Under the VM backend the
-    // driver compiles and runs the module body on the VM (M4). The path and
-    // selective-import symbols arrive already evaluated from the VM.
-    let import_env = Rc::downgrade(env);
+    // __vm-import uses the same dual ABI. The runtime continuation owns the
+    // isolated module env until evaluation settles, then atomically caches and
+    // copies its selected exports into the caller env.
+    let import_state = ImportRuntimeState::new(Rc::downgrade(env));
     env.set(
         intern("__vm-import"),
-        Value::native_fn(NativeFn::with_ctx("__vm-import", move |ctx, args| {
-            if args.len() != 2 {
-                return Err(SemaError::arity("import", "2", args.len()));
-            }
-            ctx.sandbox.check(sema_core::Caps::FS_READ, "import")?;
-            let mut imp_args = vec![args[0].clone()];
-            if let Some(items) = args[1].as_list() {
-                imp_args.extend(items.iter().cloned());
-            }
-            // Copy exports into the *currently executing* VM's env (the module
-            // being run), falling back to the global env at top level. This keeps
-            // a nested module's imports private to that module instead of leaking
-            // into the global env (M4 nested-module isolation).
-            let target = match sema_vm::current_vm_globals() {
-                Some(t) => t,
-                None => upgrade_delegate_env(&import_env)?,
-            };
-            match special_forms::eval_import(&imp_args, &target, ctx)? {
-                Trampoline::Value(v) => Ok(v),
-                Trampoline::Eval(..) => Ok(Value::nil()),
-            }
-        })),
+        Value::native_fn(NativeFn::with_payload_ctx_runtime(
+            "__vm-import",
+            import_state,
+            legacy_import,
+            runtime_import,
+        )),
     );
 
     // __vm-defmacro: register a macro in the environment
@@ -3095,6 +3877,24 @@ mod runtime_eval_tests {
                 panic!("root was cancelled instead of returning: {reason:?}")
             }
         }
+    }
+
+    fn assert_runtime_import_not_published(interp: &Interpreter, identity: &str, export: &str) {
+        assert!(
+            interp
+                .ctx
+                .get_cached_module(&std::path::PathBuf::from(identity))
+                .is_none(),
+            "failed import must not populate the module cache",
+        );
+        assert!(
+            interp.global_env.get(intern(export)).is_none(),
+            "failed import must not copy exports",
+        );
+        assert_eq!(interp.ctx.current_file_path(), None);
+        assert!(interp.ctx.current_file.borrow().is_empty());
+        assert!(interp.ctx.module_exports.borrow().is_empty());
+        assert!(interp.ctx.module_load_stack.borrow().is_empty());
     }
 
     // Full-flip blocker (native-stack): routing eval through the runtime
@@ -3831,6 +4631,888 @@ mod runtime_eval_tests {
         let settlement = drive_selected_until_ready(&interp, &root);
         assert_eq!(returned_value(&settlement), Value::keyword("child"));
         assert_eq!(interp.ctx.current_file_path(), None);
+    }
+
+    #[test]
+    fn runtime_load_parks_cooperatively_and_a_sibling_can_release_it() {
+        let interp = Interpreter::new();
+        interp.ctx.set_embedded_file(
+            std::path::PathBuf::from("blocking-load.sema"),
+            b"(channel/recv runtime-load-gate) (define runtime-loaded 42) runtime-loaded".to_vec(),
+        );
+        interp
+            .eval_str_via_runtime("(define runtime-load-gate (channel/new 1))")
+            .expect("create the load gate");
+
+        let load = interp
+            .submit_str(r#"(load "blocking-load.sema")"#, RootOptions::default())
+            .expect("submit a load that parks in its body");
+        interp
+            .drive_roots(&[load.id()])
+            .expect("drive the loaded body to its channel wait");
+        assert!(matches!(load.poll_result(), RootPoll::Pending));
+
+        assert_eq!(
+            interp
+                .eval_str_via_runtime("(channel/send runtime-load-gate :continue)")
+                .expect("a sibling root can run while load is parked"),
+            Value::nil(),
+        );
+        let settlement = drive_selected_until_ready(&interp, &load);
+        assert_eq!(returned_value(&settlement), Value::int(42));
+        assert_eq!(
+            interp
+                .eval_str_via_runtime("runtime-loaded")
+                .expect("load definitions land in the caller environment"),
+            Value::int(42),
+        );
+    }
+
+    #[test]
+    fn runtime_import_parks_then_caches_and_copies_exports_after_completion() {
+        let interp = Interpreter::new();
+        interp.ctx.set_embedded_file(
+            std::path::PathBuf::from("blocking-import.sema"),
+            b"(module blocking (export answer) (set! runtime-import-count (+ runtime-import-count 1)) (channel/recv runtime-import-gate) (define answer 42))".to_vec(),
+        );
+        interp
+            .eval_str_via_runtime(
+                "(define runtime-import-gate (channel/new 1)) (define runtime-import-count 0)",
+            )
+            .expect("prepare import synchronization");
+
+        let import = interp
+            .submit_str(
+                r#"(begin (import "blocking-import.sema" answer) answer)"#,
+                RootOptions::default(),
+            )
+            .expect("submit a suspending import");
+        interp
+            .drive_roots(&[import.id()])
+            .expect("drive the imported module to its channel wait");
+        assert!(matches!(import.poll_result(), RootPoll::Pending));
+        assert!(
+            interp
+                .ctx
+                .get_cached_module(&std::path::PathBuf::from("blocking-import.sema"))
+                .is_none(),
+            "a parked import must not expose a partial cache entry",
+        );
+        assert!(
+            interp.global_env.get(intern("answer")).is_none(),
+            "a parked import must not copy partial exports",
+        );
+        assert_eq!(
+            interp
+                .eval_str_via_runtime("(+ 1 2)")
+                .expect("an unrelated sibling runs while import is parked"),
+            Value::int(3),
+        );
+        interp
+            .eval_str_via_runtime("(channel/send runtime-import-gate :continue)")
+            .expect("release the imported module");
+
+        let settlement = drive_selected_until_ready(&interp, &import);
+        assert_eq!(returned_value(&settlement), Value::int(42));
+        assert!(
+            interp
+                .ctx
+                .get_cached_module(&std::path::PathBuf::from("blocking-import.sema"))
+                .is_some(),
+            "a successful import publishes its cache entry at completion",
+        );
+        assert_eq!(
+            interp
+                .eval_str_via_runtime(
+                    r#"(begin (import "blocking-import.sema" answer) (list answer runtime-import-count))"#,
+                )
+                .expect("the second import uses the completed cache"),
+            Value::list(vec![Value::int(42), Value::int(1)]),
+        );
+    }
+
+    #[test]
+    fn synchronous_import_rejects_an_active_runtime_import_without_reevaluating() {
+        let interp = Interpreter::new();
+        let identity = std::path::PathBuf::from("sync-runtime-overlap.sema");
+        interp.ctx.set_embedded_file(
+            identity.clone(),
+            b"(module sync-runtime-overlap (export overlap-answer) (set! overlap-count (+ overlap-count 1)) (channel/recv overlap-gate) (define overlap-answer 42))".to_vec(),
+        );
+        interp
+            .eval_str_via_runtime("(define overlap-count 0) (define overlap-gate (channel/new 1))")
+            .expect("prepare overlap state");
+
+        let owner = interp
+            .submit_str(
+                r#"(begin (import "sync-runtime-overlap.sema" overlap-answer) overlap-answer)"#,
+                RootOptions::default(),
+            )
+            .expect("submit structural import owner");
+        interp
+            .drive_roots(&[owner.id()])
+            .expect("park the structural import owner");
+        assert!(matches!(owner.poll_result(), RootPoll::Pending));
+
+        let (expressions, _) = sema_reader::read_many_with_spans(
+            r#"(import "sync-runtime-overlap.sema" overlap-answer)"#,
+        )
+        .expect("parse synchronous import");
+        let error = eval_value_vm(&interp.ctx, &expressions[0], &interp.global_env)
+            .expect_err("the value ABI must reject overlap with a runtime owner");
+        assert!(
+            error
+                .to_string()
+                .contains("already active in the cooperative runtime"),
+            "unexpected overlap error: {error}",
+        );
+        assert_eq!(
+            interp
+                .eval_str_via_runtime("overlap-count")
+                .expect("inspect overlap side effects"),
+            Value::int(1),
+        );
+        assert!(interp.ctx.get_cached_module(&identity).is_none());
+        assert!(interp.global_env.get(intern("overlap-answer")).is_none());
+
+        interp
+            .eval_str_via_runtime("(channel/send overlap-gate :continue)")
+            .expect("release structural import owner");
+        assert_eq!(
+            returned_value(&drive_selected_until_ready(&interp, &owner)),
+            Value::int(42),
+        );
+        assert_eq!(
+            interp
+                .eval_str_via_runtime("overlap-count")
+                .expect("the owner evaluated exactly once"),
+            Value::int(1),
+        );
+    }
+
+    #[test]
+    fn runtime_import_from_a_shared_foreign_runtime_is_rejected() {
+        let (env, context) = Interpreter::new_parts();
+        let first = Interpreter::from_parts(Rc::clone(&env), Rc::clone(&context));
+        let second = Interpreter::from_parts(env, context);
+        first.ctx.set_embedded_file(
+            std::path::PathBuf::from("foreign-runtime-import.sema"),
+            b"(module foreign-runtime-import (export foreign-answer) (set! foreign-import-count (+ foreign-import-count 1)) (channel/recv foreign-import-gate) (define foreign-answer 42))".to_vec(),
+        );
+        first
+            .eval_str_via_runtime(
+                "(define foreign-import-count 0) (define foreign-import-gate (channel/new 1))",
+            )
+            .expect("prepare shared import state");
+
+        let owner = first
+            .submit_str(
+                r#"(begin (import "foreign-runtime-import.sema" foreign-answer) foreign-answer)"#,
+                RootOptions::default(),
+            )
+            .expect("submit import on the first runtime");
+        first
+            .drive_roots(&[owner.id()])
+            .expect("park the first runtime import");
+
+        let error = second
+            .eval_str_via_runtime(r#"(import "foreign-runtime-import.sema" foreign-answer)"#)
+            .expect_err("the foreign runtime must not bypass the live import gate");
+        assert!(
+            error
+                .to_string()
+                .contains("already loading in another runtime"),
+            "unexpected foreign-runtime error: {error}",
+        );
+        assert_eq!(
+            first
+                .eval_str_via_runtime("foreign-import-count")
+                .expect("foreign runtime caused no duplicate side effect"),
+            Value::int(1),
+        );
+
+        first
+            .eval_str_via_runtime("(channel/send foreign-import-gate :continue)")
+            .expect("release first runtime import");
+        assert_eq!(
+            returned_value(&drive_selected_until_ready(&first, &owner)),
+            Value::int(42),
+        );
+    }
+
+    #[test]
+    fn concurrent_import_gate_allocations_converge_on_one_identity() {
+        let interp = Interpreter::new();
+        let root = interp
+            .submit_str("nil", RootOptions::default())
+            .expect("mint a runtime identity");
+        let previous_root = sema_core::set_current_root(Some(root.id()));
+        let mut gate_ids = sema_core::runtime::RuntimeScopedIdCounter::<
+            sema_core::runtime::ResourceGateId,
+        >::new(root.id().runtime());
+        let first_id = gate_ids.allocate().expect("allocate first candidate gate");
+        let second_id = gate_ids.allocate().expect("allocate second candidate gate");
+        let closed = Rc::new(RefCell::new(Vec::new()));
+        let closer: Rc<
+            dyn Fn(
+                sema_core::runtime::ResourceGateId,
+            ) -> Result<bool, sema_core::runtime::ResourceGateCloseError>,
+        > = {
+            let closed = Rc::clone(&closed);
+            Rc::new(move |gate| {
+                closed.borrow_mut().push(gate);
+                Ok(true)
+            })
+        };
+        let state = ImportRuntimeState::new(Rc::downgrade(&interp.global_env));
+        let identity = std::path::PathBuf::from("allocation-race.sema");
+
+        let (first, first_lease) = state
+            .install_gate(
+                &identity,
+                sema_core::runtime::ResourceGateHandle::new(first_id, Rc::clone(&closer)),
+            )
+            .expect("install the first pending allocation");
+        let (second, second_lease) = state
+            .install_gate(
+                &identity,
+                sema_core::runtime::ResourceGateHandle::new(second_id, closer),
+            )
+            .expect("the second pending allocation converges");
+
+        assert_eq!(first.id(), first_id);
+        assert_eq!(second.id(), first_id);
+        assert_eq!(
+            state
+                .gates
+                .borrow()
+                .get(&identity)
+                .map(|entry| entry.active_calls),
+            Some(2),
+        );
+        assert_eq!(closed.borrow().as_slice(), &[second_id]);
+
+        drop(first_lease);
+        assert!(state.gates.borrow().contains_key(&identity));
+        drop(second_lease);
+        assert!(!state.gates.borrow().contains_key(&identity));
+        assert!(closed.borrow().contains(&first_id));
+        sema_core::set_current_root(previous_root);
+    }
+
+    #[test]
+    fn runtime_import_gate_count_returns_to_baseline_after_terminal_outcomes() {
+        let success = Interpreter::new();
+        success.ctx.set_embedded_file(
+            std::path::PathBuf::from("gate-success.sema"),
+            b"(module gate-success (export gate-success-answer) (define gate-success-answer 42))"
+                .to_vec(),
+        );
+        let success_baseline = success.runtime_resource_gate_count();
+        success
+            .eval_str_via_runtime(r#"(import "gate-success.sema" gate-success-answer)"#)
+            .expect("successful import settles");
+        assert_eq!(success.runtime_resource_gate_count(), success_baseline);
+
+        let cancelled = Interpreter::new();
+        cancelled.ctx.set_embedded_file(
+            std::path::PathBuf::from("gate-cancel.sema"),
+            b"(channel/recv gate-cancel-channel)".to_vec(),
+        );
+        cancelled
+            .eval_str_via_runtime("(define gate-cancel-channel (channel/new 1))")
+            .expect("create cancellation channel");
+        let cancel_baseline = cancelled.runtime_resource_gate_count();
+        let root = cancelled
+            .submit_str(r#"(import "gate-cancel.sema")"#, RootOptions::default())
+            .expect("submit cancellable import");
+        cancelled
+            .drive_roots(&[root.id()])
+            .expect("park cancellable import");
+        assert!(root.cancel(CancelReason::Explicit));
+        assert!(matches!(
+            drive_selected_until_ready(&cancelled, &root).outcome,
+            TaskOutcome::Cancelled(CancelReason::Explicit),
+        ));
+        assert_eq!(cancelled.runtime_resource_gate_count(), cancel_baseline);
+
+        let failed = Interpreter::new();
+        failed.ctx.set_embedded_file(
+            std::path::PathBuf::from("gate-failure.sema"),
+            b"(error \"expected import failure\")".to_vec(),
+        );
+        let failure_baseline = failed.runtime_resource_gate_count();
+        failed
+            .eval_str_via_runtime(r#"(import "gate-failure.sema")"#)
+            .expect_err("failing import settles");
+        assert_eq!(failed.runtime_resource_gate_count(), failure_baseline);
+    }
+
+    #[test]
+    fn concurrent_runtime_source_imports_evaluate_once() {
+        let interp = Interpreter::new();
+        interp.ctx.set_embedded_file(
+            std::path::PathBuf::from("single-flight-source.sema"),
+            b"(module single-flight-source (export source-answer) (set! source-import-count (+ source-import-count 1)) (channel/recv source-import-gate) (define source-answer 42))".to_vec(),
+        );
+        interp
+            .eval_str_via_runtime(
+                "(define source-import-count 0) (define source-import-gate (channel/new 1))",
+            )
+            .expect("prepare source single-flight state");
+
+        let first = interp
+            .submit_str(
+                r#"(begin (import "single-flight-source.sema" source-answer) source-answer)"#,
+                RootOptions::default(),
+            )
+            .expect("submit first source import");
+        let second = interp
+            .submit_str(
+                r#"(begin (import "single-flight-source.sema" source-answer) source-answer)"#,
+                RootOptions::default(),
+            )
+            .expect("submit second source import");
+        interp
+            .drive_roots(&[first.id()])
+            .expect("park the first source import");
+        interp
+            .drive_roots(&[second.id()])
+            .expect("park the second source import behind single-flight");
+        assert!(matches!(first.poll_result(), RootPoll::Pending));
+        assert!(matches!(second.poll_result(), RootPoll::Pending));
+        assert_eq!(
+            interp
+                .eval_str_via_runtime("source-import-count")
+                .expect("inspect source import side effects"),
+            Value::int(1),
+        );
+
+        interp
+            .eval_str_via_runtime("(channel/send source-import-gate :continue)")
+            .expect("release the single source evaluator");
+        assert_eq!(
+            returned_value(&drive_selected_until_ready(&interp, &first)),
+            Value::int(42),
+        );
+        assert_eq!(
+            returned_value(&drive_selected_until_ready(&interp, &second)),
+            Value::int(42),
+        );
+        assert_eq!(
+            interp
+                .eval_str_via_runtime("source-import-count")
+                .expect("source import remains exact-once"),
+            Value::int(1),
+        );
+    }
+
+    #[test]
+    fn concurrent_runtime_bytecode_imports_evaluate_once() {
+        let interp = Interpreter::new();
+        interp
+            .eval_str_via_runtime(
+                "(define bytecode-import-count 0) (define bytecode-import-gate (channel/new 1))",
+            )
+            .expect("prepare bytecode single-flight state");
+        let compiled = interp
+            .compile_to_bytecode(
+                "(module single-flight-bytecode (export bytecode-answer) (set! bytecode-import-count (+ bytecode-import-count 1)) (channel/recv bytecode-import-gate) (define bytecode-answer 42))",
+            )
+            .expect("compile bytecode single-flight module");
+        let bytes = sema_vm::serialize_to_bytes(&compiled, 0).expect("serialize bytecode module");
+        interp.ctx.set_embedded_file(
+            std::path::PathBuf::from("single-flight-bytecode.semac"),
+            bytes,
+        );
+
+        let first = interp
+            .submit_str(
+                r#"(begin (import "single-flight-bytecode.semac" bytecode-answer) bytecode-answer)"#,
+                RootOptions::default(),
+            )
+            .expect("submit first bytecode import");
+        let second = interp
+            .submit_str(
+                r#"(begin (import "single-flight-bytecode.semac" bytecode-answer) bytecode-answer)"#,
+                RootOptions::default(),
+            )
+            .expect("submit second bytecode import");
+        interp
+            .drive_roots(&[first.id()])
+            .expect("park the first bytecode import");
+        interp
+            .drive_roots(&[second.id()])
+            .expect("park the second bytecode import behind single-flight");
+        assert!(matches!(first.poll_result(), RootPoll::Pending));
+        assert!(matches!(second.poll_result(), RootPoll::Pending));
+        assert_eq!(
+            interp
+                .eval_str_via_runtime("bytecode-import-count")
+                .expect("inspect bytecode import side effects"),
+            Value::int(1),
+        );
+
+        interp
+            .eval_str_via_runtime("(channel/send bytecode-import-gate :continue)")
+            .expect("release the single bytecode evaluator");
+        assert_eq!(
+            returned_value(&drive_selected_until_ready(&interp, &first)),
+            Value::int(42),
+        );
+        assert_eq!(
+            returned_value(&drive_selected_until_ready(&interp, &second)),
+            Value::int(42),
+        );
+        assert_eq!(
+            interp
+                .eval_str_via_runtime("bytecode-import-count")
+                .expect("bytecode import remains exact-once"),
+            Value::int(1),
+        );
+    }
+
+    #[test]
+    fn cancelled_runtime_import_owner_hands_off_to_one_waiter() {
+        let interp = Interpreter::new();
+        interp.ctx.set_embedded_file(
+            std::path::PathBuf::from("cancelled-owner-import.sema"),
+            b"(module cancelled-owner-import (export cancelled-owner-answer) (set! cancelled-owner-count (+ cancelled-owner-count 1)) (if (= cancelled-owner-count 1) (channel/recv cancelled-owner-gate) nil) (define cancelled-owner-answer 42))".to_vec(),
+        );
+        interp
+            .eval_str_via_runtime(
+                "(define cancelled-owner-count 0) (define cancelled-owner-gate (channel/new 1))",
+            )
+            .expect("prepare cancellation handoff state");
+
+        let owner = interp
+            .submit_str(
+                r#"(import "cancelled-owner-import.sema" cancelled-owner-answer)"#,
+                RootOptions::default(),
+            )
+            .expect("submit import owner");
+        let waiter = interp
+            .submit_str(
+                r#"(begin (import "cancelled-owner-import.sema" cancelled-owner-answer) cancelled-owner-answer)"#,
+                RootOptions::default(),
+            )
+            .expect("submit queued import waiter");
+        interp
+            .drive_roots(&[owner.id()])
+            .expect("park the owner in its module body");
+        interp
+            .drive_roots(&[waiter.id()])
+            .expect("park the waiter on the import gate");
+        assert!(matches!(owner.poll_result(), RootPoll::Pending));
+        assert!(matches!(waiter.poll_result(), RootPoll::Pending));
+
+        assert!(owner.cancel(CancelReason::Explicit));
+        assert!(matches!(
+            drive_selected_until_ready(&interp, &owner).outcome,
+            TaskOutcome::Cancelled(CancelReason::Explicit)
+        ));
+        assert_eq!(
+            returned_value(&drive_selected_until_ready(&interp, &waiter)),
+            Value::int(42),
+        );
+        assert_eq!(
+            interp
+                .eval_str_via_runtime("cancelled-owner-count")
+                .expect("the waiter alone retries the module"),
+            Value::int(2),
+        );
+    }
+
+    #[test]
+    fn failed_runtime_import_owner_hands_off_to_one_waiter() {
+        let interp = Interpreter::new();
+        interp.ctx.set_embedded_file(
+            std::path::PathBuf::from("failed-owner-import.sema"),
+            b"(module failed-owner-import (export failed-owner-answer) (set! failed-owner-count (+ failed-owner-count 1)) (if (= failed-owner-count 1) (begin (channel/recv failed-owner-gate) (error \"expected first-owner failure\")) nil) (define failed-owner-answer 42))".to_vec(),
+        );
+        interp
+            .eval_str_via_runtime(
+                "(define failed-owner-count 0) (define failed-owner-gate (channel/new 1))",
+            )
+            .expect("prepare failure handoff state");
+
+        let owner = interp
+            .submit_str(
+                r#"(import "failed-owner-import.sema" failed-owner-answer)"#,
+                RootOptions::default(),
+            )
+            .expect("submit import owner");
+        let waiter = interp
+            .submit_str(
+                r#"(begin (import "failed-owner-import.sema" failed-owner-answer) failed-owner-answer)"#,
+                RootOptions::default(),
+            )
+            .expect("submit queued import waiter");
+        interp
+            .drive_roots(&[owner.id()])
+            .expect("park the owner before its failure");
+        interp
+            .drive_roots(&[waiter.id()])
+            .expect("park the waiter on the import gate");
+        assert!(matches!(owner.poll_result(), RootPoll::Pending));
+        assert!(matches!(waiter.poll_result(), RootPoll::Pending));
+
+        interp
+            .eval_str_via_runtime("(channel/send failed-owner-gate :continue)")
+            .expect("resume the owner into its failure");
+        assert!(matches!(
+            drive_selected_until_ready(&interp, &owner).outcome,
+            TaskOutcome::Failed(_)
+        ));
+        assert_eq!(
+            returned_value(&drive_selected_until_ready(&interp, &waiter)),
+            Value::int(42),
+        );
+        assert_eq!(
+            interp
+                .eval_str_via_runtime("failed-owner-count")
+                .expect("the waiter alone retries after failure"),
+            Value::int(2),
+        );
+    }
+
+    #[test]
+    fn cancelling_a_suspended_runtime_load_cleans_its_module_scopes() {
+        let interp = Interpreter::new();
+        interp.ctx.set_embedded_file(
+            std::path::PathBuf::from("cancelled-load.sema"),
+            b"(channel/recv cancelled-load-gate) :loaded".to_vec(),
+        );
+        interp
+            .eval_str_via_runtime("(define cancelled-load-gate (channel/new 1))")
+            .expect("create the cancellation gate");
+
+        let first = interp
+            .submit_str(r#"(load "cancelled-load.sema")"#, RootOptions::default())
+            .expect("submit the first load");
+        interp
+            .drive_roots(&[first.id()])
+            .expect("park the first load");
+        assert!(matches!(first.poll_result(), RootPoll::Pending));
+        assert!(first.cancel(CancelReason::Explicit));
+        let cancelled = drive_selected_until_ready(&interp, &first);
+        assert!(matches!(
+            cancelled.outcome,
+            TaskOutcome::Cancelled(CancelReason::Explicit)
+        ));
+
+        interp
+            .eval_str_via_runtime("(channel/send cancelled-load-gate :retry)")
+            .expect("seed the retry receive");
+        assert_eq!(
+            interp
+                .eval_str_via_runtime(r#"(load "cancelled-load.sema")"#)
+                .expect("the cancelled load left no false cycle or file scope"),
+            Value::keyword("loaded"),
+        );
+        assert_eq!(interp.ctx.current_file_path(), None);
+    }
+
+    #[test]
+    fn cancelling_a_suspended_runtime_import_allows_clean_retry() {
+        let interp = Interpreter::new();
+        let identity = "cancelled-import.sema";
+        let export = "cancelled-import-answer";
+        interp.ctx.set_embedded_file(
+            std::path::PathBuf::from(identity),
+            b"(module cancelled-import (export cancelled-import-answer) (channel/recv cancelled-import-gate) (define cancelled-import-answer 42))".to_vec(),
+        );
+        interp
+            .eval_str_via_runtime("(define cancelled-import-gate (channel/new 1))")
+            .expect("create cancelled import gate");
+
+        let root = interp
+            .submit_str(
+                r#"(import "cancelled-import.sema" cancelled-import-answer)"#,
+                RootOptions::default(),
+            )
+            .expect("submit cancellable import");
+        interp
+            .drive_roots(&[root.id()])
+            .expect("park the import body");
+        assert!(matches!(root.poll_result(), RootPoll::Pending));
+        assert!(root.cancel(CancelReason::Explicit));
+        let settlement = drive_selected_until_ready(&interp, &root);
+        assert!(matches!(
+            settlement.outcome,
+            TaskOutcome::Cancelled(CancelReason::Explicit)
+        ));
+        assert_runtime_import_not_published(&interp, identity, export);
+
+        interp
+            .eval_str_via_runtime("(channel/send cancelled-import-gate :retry)")
+            .expect("seed retry receive");
+        assert_eq!(
+            interp
+                .eval_str_via_runtime(
+                    r#"(begin (import "cancelled-import.sema" cancelled-import-answer) cancelled-import-answer)"#,
+                )
+                .expect("cancelled import releases single-flight and module scopes"),
+            Value::int(42),
+        );
+    }
+
+    #[test]
+    fn runtime_import_parse_failure_cleans_state_for_retry() {
+        let interp = Interpreter::new();
+        let identity = "parse-failure-import.sema";
+        let export = "parse-retry-answer";
+        interp.ctx.set_embedded_file(
+            std::path::PathBuf::from(identity),
+            b"(module incomplete".to_vec(),
+        );
+
+        interp
+            .eval_str_via_runtime(r#"(import "parse-failure-import.sema")"#)
+            .expect_err("invalid source must fail import");
+        assert_runtime_import_not_published(&interp, identity, export);
+
+        interp.ctx.set_embedded_file(
+            std::path::PathBuf::from(identity),
+            b"(module parse-retry (export parse-retry-answer) (define parse-retry-answer 42))"
+                .to_vec(),
+        );
+        assert_eq!(
+            interp
+                .eval_str_via_runtime(
+                    r#"(begin (import "parse-failure-import.sema" parse-retry-answer) parse-retry-answer)"#,
+                )
+                .expect("parse failure leaves no false cycle or cache entry"),
+            Value::int(42),
+        );
+    }
+
+    #[test]
+    fn runtime_import_compile_failure_after_suspension_cleans_state_for_retry() {
+        let interp = Interpreter::new();
+        let identity = "compile-failure-import.sema";
+        let export = "compile-retry-answer";
+        interp.ctx.set_embedded_file(
+            std::path::PathBuf::from(identity),
+            b"(channel/recv compile-failure-import-gate) (if #t)".to_vec(),
+        );
+        interp
+            .eval_str_via_runtime("(define compile-failure-import-gate (channel/new 1))")
+            .expect("create compile-failure suspension gate");
+
+        let root = interp
+            .submit_str(
+                r#"(import "compile-failure-import.sema")"#,
+                RootOptions::default(),
+            )
+            .expect("submit compile-failing import");
+        interp
+            .drive_roots(&[root.id()])
+            .expect("park before compiling the invalid second form");
+        assert!(matches!(root.poll_result(), RootPoll::Pending));
+        interp
+            .eval_str_via_runtime("(channel/send compile-failure-import-gate :continue)")
+            .expect("resume the compile-failing import");
+        let settlement = drive_selected_until_ready(&interp, &root);
+        assert!(matches!(settlement.outcome, TaskOutcome::Failed(_)));
+        assert_runtime_import_not_published(&interp, identity, export);
+
+        interp.ctx.set_embedded_file(
+            std::path::PathBuf::from(identity),
+            b"(module compile-retry (export compile-retry-answer) (define compile-retry-answer 42))".to_vec(),
+        );
+        assert_eq!(
+            interp
+                .eval_str_via_runtime(
+                    r#"(begin (import "compile-failure-import.sema" compile-retry-answer) compile-retry-answer)"#,
+                )
+                .expect("compile failure releases single-flight and module scopes"),
+            Value::int(42),
+        );
+    }
+
+    #[test]
+    fn runtime_import_callback_failure_after_suspension_cleans_state_for_retry() {
+        let interp = Interpreter::new();
+        let identity = "callback-failure-import.sema";
+        let export = "callback-retry-answer";
+        interp.ctx.set_embedded_file(
+            std::path::PathBuf::from(identity),
+            b"(channel/recv callback-failure-import-gate) (error \"expected module callback failure\")".to_vec(),
+        );
+        interp
+            .eval_str_via_runtime("(define callback-failure-import-gate (channel/new 1))")
+            .expect("create callback-failure suspension gate");
+
+        let root = interp
+            .submit_str(
+                r#"(import "callback-failure-import.sema")"#,
+                RootOptions::default(),
+            )
+            .expect("submit callback-failing import");
+        interp
+            .drive_roots(&[root.id()])
+            .expect("park before the failing callback");
+        assert!(matches!(root.poll_result(), RootPoll::Pending));
+        interp
+            .eval_str_via_runtime("(channel/send callback-failure-import-gate :continue)")
+            .expect("resume the callback-failing import");
+        let settlement = drive_selected_until_ready(&interp, &root);
+        assert!(matches!(settlement.outcome, TaskOutcome::Failed(_)));
+        assert_runtime_import_not_published(&interp, identity, export);
+
+        interp.ctx.set_embedded_file(
+            std::path::PathBuf::from(identity),
+            b"(module callback-retry (export callback-retry-answer) (define callback-retry-answer 42))".to_vec(),
+        );
+        assert_eq!(
+            interp
+                .eval_str_via_runtime(
+                    r#"(begin (import "callback-failure-import.sema" callback-retry-answer) callback-retry-answer)"#,
+                )
+                .expect("callback failure releases single-flight and module scopes"),
+            Value::int(42),
+        );
+    }
+
+    #[test]
+    fn malformed_runtime_bytecode_import_cleans_state_for_retry() {
+        let interp = Interpreter::new();
+        let identity = "malformed-import.semac";
+        let export = "bytecode-retry-answer";
+        interp.ctx.set_embedded_file(
+            std::path::PathBuf::from(identity),
+            b"\0SEMmalformed".to_vec(),
+        );
+
+        interp
+            .eval_str_via_runtime(r#"(import "malformed-import.semac")"#)
+            .expect_err("malformed bytecode must fail import");
+        assert_runtime_import_not_published(&interp, identity, export);
+
+        interp.ctx.set_embedded_file(
+            std::path::PathBuf::from(identity),
+            b"(module bytecode-retry (export bytecode-retry-answer) (define bytecode-retry-answer 42))".to_vec(),
+        );
+        assert_eq!(
+            interp
+                .eval_str_via_runtime(
+                    r#"(begin (import "malformed-import.semac" bytecode-retry-answer) bytecode-retry-answer)"#,
+                )
+                .expect("malformed bytecode releases single-flight and module scopes"),
+            Value::int(42),
+        );
+    }
+
+    #[test]
+    fn suspended_import_keeps_relative_resolution_and_export_scope() {
+        let interp = Interpreter::new();
+        interp.ctx.set_embedded_file(
+            std::path::PathBuf::from("relative/inner.sema"),
+            b"(module inner (export inner-value) (define inner-value 40))".to_vec(),
+        );
+        interp.ctx.set_embedded_file(
+            std::path::PathBuf::from("relative/outer.sema"),
+            b"(module outer (export answer) (async/sleep 2) (import \"./inner.sema\" inner-value) (define answer (+ inner-value 2)))".to_vec(),
+        );
+
+        assert_eq!(
+            interp
+                .eval_str_via_runtime(r#"(begin (import "relative/outer.sema" answer) answer)"#,)
+                .expect("relative nested import resumes in the outer module scope"),
+            Value::int(42),
+        );
+        assert_eq!(interp.ctx.current_file_path(), None);
+    }
+
+    #[test]
+    fn runtime_import_executes_embedded_bytecode_cooperatively() {
+        let interp = Interpreter::new();
+        let compiled = interp
+            .compile_to_bytecode(
+                "(module bytecode (export answer) (async/sleep 2) (define answer 42))",
+            )
+            .expect("compile the embedded module");
+        let bytes = sema_vm::serialize_to_bytes(&compiled, 0).expect("serialize the module");
+        interp
+            .ctx
+            .set_embedded_file(std::path::PathBuf::from("runtime-bytecode.semac"), bytes);
+
+        assert_eq!(
+            interp
+                .eval_str_via_runtime(r#"(begin (import "runtime-bytecode.semac" answer) answer)"#,)
+                .expect("embedded bytecode can suspend under import"),
+            Value::int(42),
+        );
+        assert_eq!(interp.ctx.current_file_path(), None);
+    }
+
+    #[test]
+    fn runtime_module_continuation_traces_envs_and_source_values() {
+        let interp = Interpreter::new();
+        let root = interp
+            .submit_str("nil", RootOptions::default())
+            .expect("mint a runtime-scoped gate identity");
+        let mut gate_ids = sema_core::runtime::RuntimeScopedIdCounter::<
+            sema_core::runtime::ResourceGateId,
+        >::new(root.id().runtime());
+        let gate = gate_ids.allocate().expect("allocate import gate id");
+        let state = Rc::new(sema_core::runtime::ModuleTaskState::default());
+        let loading = state
+            .push_loading(std::path::PathBuf::from("trace-module.sema"))
+            .expect("allocate loading scope");
+        let current_file = state
+            .push_current_file(std::path::PathBuf::from("trace-module.sema"))
+            .expect("allocate current-file scope");
+        let exports = state.push_exports(None).expect("allocate export scope");
+        let globals = Rc::new(Env::new());
+        let target = Rc::new(Env::new());
+        let source = RuntimeSourceModule {
+            run: RuntimeModuleRun {
+                scope: RuntimeModuleScope {
+                    state,
+                    loading,
+                    current_file,
+                    exports: Some(exports),
+                },
+                globals: Rc::clone(&globals),
+                completion: RuntimeModuleCompletion::Import {
+                    identity: std::path::PathBuf::from("trace-module.sema"),
+                    selective: vec!["answer".to_string()],
+                    target: Rc::clone(&target),
+                    gate,
+                    lease: ImportGateLease {
+                        state: Weak::new(),
+                        identity: std::path::PathBuf::from("trace-module.sema"),
+                        gate,
+                    },
+                },
+            },
+            expressions: vec![Value::string("expression")],
+            spans: sema_core::SpanMap::new(),
+            source_file: std::path::PathBuf::from("trace-module.sema"),
+            next: 0,
+            last: Value::string("last"),
+        };
+        let mut globals_edges = 0;
+        let mut target_edges = 0;
+        let mut value_edges = 0;
+
+        assert!(sema_core::runtime::Trace::trace(&source, &mut |edge| {
+            match edge {
+                sema_core::cycle::GcEdge::Env(env) if Rc::ptr_eq(env, &globals) => {
+                    globals_edges += 1;
+                }
+                sema_core::cycle::GcEdge::Env(env) if Rc::ptr_eq(env, &target) => {
+                    target_edges += 1;
+                }
+                sema_core::cycle::GcEdge::Value(_) => value_edges += 1,
+                _ => {}
+            }
+        }));
+        assert_eq!(globals_edges, 1);
+        assert_eq!(target_edges, 1);
+        assert_eq!(value_edges, 2);
     }
 
     #[test]

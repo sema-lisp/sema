@@ -13540,6 +13540,10 @@ fn test_vfs_in_process() {
         "github.com/x/lib/src/common.sema".to_string(),
         b"(define common-val 5)".to_vec(),
     );
+    files.insert(
+        "runtime-vfs.sema".to_string(),
+        b"(module runtime-vfs (export answer) (async/sleep 2) (define answer 42))".to_vec(),
+    );
 
     sema_core::vfs::init_vfs(files);
 
@@ -13608,6 +13612,16 @@ fn test_vfs_in_process() {
             .eval_str(r#"(begin (import "counter.sema") (import "counter.sema") n)"#)
             .unwrap();
         assert_eq!(result, Value::int(42));
+    }
+
+    // --- cooperative runtime import from VFS ---
+    {
+        let interp = Interpreter::new();
+        let result = interp
+            .eval_str_via_runtime(r#"(begin (import "runtime-vfs.sema" answer) answer)"#)
+            .unwrap();
+        assert_eq!(result, Value::int(42));
+        assert_eq!(interp.ctx.current_file_path(), None);
     }
 
     // --- load ---

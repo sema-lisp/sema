@@ -738,3 +738,72 @@ fn cancelled_direct_native_stream_begin_is_reaped() {
         "the cancelled direct-native owner must be reaped"
     );
 }
+
+#[test]
+#[serial_test::serial]
+fn blocking_stream_compatibility_native_rejects_runtime_entry() {
+    let fake = FakeProvider::builder("fake")
+        .model("fake-model")
+        .stream(&["must-not-dispatch"])
+        .build();
+    let (result, recorder) = eval_with_fake(
+        r#"
+        (let ((callback-calls 0))
+          (try
+            (__llm-stream-blocking
+              "root"
+              (fn (_chunk) (set! callback-calls (+ callback-calls 1))))
+            (catch error (list (:message error) callback-calls))))
+        "#,
+        fake,
+    );
+
+    let result = result
+        .expect("runtime guard error should be catchable")
+        .as_list()
+        .expect("guard result list")
+        .to_vec();
+    let error = result[0].as_str().expect("guard error message");
+    assert!(
+        error.contains("__llm-stream-blocking cannot run inside the cooperative runtime"),
+        "unexpected blocking-native error: {error}"
+    );
+    assert_eq!(
+        result[1],
+        Value::int(0),
+        "guard must run before the chunk callback"
+    );
+    assert_eq!(
+        recorder.call_count(),
+        0,
+        "guard must run before provider I/O"
+    );
+}
+
+#[test]
+#[serial_test::serial]
+fn blocking_stream_compatibility_native_preserves_public_arity_error() {
+    let fake = FakeProvider::builder("fake")
+        .model("fake-model")
+        .reply("must-not-dispatch")
+        .build();
+    let (result, recorder) = eval_with_fake(
+        r#"(try (llm/stream) (catch error (:message error)))"#,
+        fake,
+    );
+
+    let message = result
+        .expect("arity error should be catchable")
+        .as_str()
+        .expect("arity error message")
+        .to_string();
+    assert!(
+        message.contains("llm/stream expects 1-3 args, got 0"),
+        "unexpected zero-arity error: {message}"
+    );
+    assert_eq!(
+        recorder.call_count(),
+        0,
+        "arity validation must run before provider I/O"
+    );
+}

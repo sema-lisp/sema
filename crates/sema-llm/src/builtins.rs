@@ -2815,6 +2815,12 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
                     Ok(NativeOutcome::Return(Value::string(&response.content)))
                 }
             } else {
+                if sema_core::in_runtime_quantum() {
+                    return Err(SemaError::eval(
+                        "__llm-chat-blocking cannot run a tool loop inside the cooperative runtime",
+                    )
+                    .with_hint("call llm/chat so provider, observer, and tool callbacks can suspend cooperatively"));
+                }
                 // Chat with tool execution loop, synchronously — `run_tool_loop` is a
                 // Rust `for` over rounds that blocks the VM thread per round. Reached
                 // from top level (this IS "the" tool loop there) and, in principle,
@@ -2865,6 +2871,12 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
     // between delta batches there).
     register_fn_ctx(env, "__llm-stream-blocking", |ctx, args| {
         let (request, callback, opts_map) = parse_stream_args(args)?;
+        if sema_core::in_runtime_quantum() {
+            return Err(SemaError::eval(
+                "__llm-stream-blocking cannot run inside the cooperative runtime",
+            )
+            .with_hint("call llm/stream so its provider and callback can suspend cooperatively"));
+        }
         let conv_scope = ConvScope::from_opts(opts_map.as_ref());
 
         // Streaming bypasses do_complete/track_usage, so it gets its own CLIENT span +
@@ -3481,6 +3493,14 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
     register_fn_ctx(env, "__agent-run-blocking", |ctx, args| {
         if args.len() < 2 || args.len() > 3 {
             return Err(SemaError::arity("agent/run", "2-3", args.len()));
+        }
+        if sema_core::in_runtime_quantum() {
+            return Err(SemaError::eval(
+                "__agent-run-blocking cannot run inside the cooperative runtime",
+            )
+            .with_hint(
+                "call agent/run so provider, observer, and tool callbacks can suspend cooperatively",
+            ));
         }
         let agent = args[0]
             .as_agent_rc()

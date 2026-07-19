@@ -37,8 +37,8 @@ pub trait LlmProvider: Send + Sync {
     /// `llm/define-provider`, whose `:complete` closure is dispatched through the
     /// VM-thread callback context. Such a provider CANNOT be offloaded to a pool
     /// worker (the worker has no VM/callback context), so runtime dispatch must
-    /// run it synchronously on the VM thread. Native HTTP/SDK providers return
-    /// `false` and can be offloaded.
+    /// drive its callback structurally on the VM thread. Native HTTP/SDK
+    /// providers return `false` and can be offloaded.
     fn runs_on_vm_thread(&self) -> bool {
         false
     }

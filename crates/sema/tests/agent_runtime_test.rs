@@ -61,6 +61,49 @@ fn suspending_echo_fake() -> FakeProvider {
         .build()
 }
 
+#[test]
+#[serial]
+fn blocking_agent_compatibility_native_rejects_runtime_entry() {
+    let fake = FakeProvider::builder("fake")
+        .model("fake-model")
+        .tool_call("call_1", "counted", serde_json::json!({"text": "hi"}))
+        .reply("must not finish")
+        .build();
+    let (result, recorder) = via_runtime(
+        r#"
+        (define handler-calls 0)
+        (deftool counted "Count calls" {:text {:type :string}}
+          (fn (_text) (set! handler-calls (+ handler-calls 1))))
+        (defagent bot {:model "fake-model" :tools [counted] :max-turns 3})
+        (try
+          (__agent-run-blocking bot "go")
+          (catch error (list (:message error) handler-calls)))
+        "#,
+        fake,
+    );
+
+    let result = result
+        .expect("runtime guard error should be catchable")
+        .as_list()
+        .expect("guard result list")
+        .to_vec();
+    let error = result[0].as_str().expect("guard error message");
+    assert!(
+        error.contains("__agent-run-blocking cannot run inside the cooperative runtime"),
+        "unexpected blocking-native error: {error}"
+    );
+    assert_eq!(
+        result[1],
+        Value::int(0),
+        "guard must run before tool handlers"
+    );
+    assert_eq!(
+        recorder.call_count(),
+        0,
+        "guard must run before provider I/O"
+    );
+}
+
 // GATE: a suspending tool handler inside `agent/run` completes the full
 // multi-turn loop through the runtime and returns the final answer, matching the
 // legacy `eval_str` oracle for the same program.

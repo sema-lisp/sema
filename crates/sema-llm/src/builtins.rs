@@ -1,6 +1,6 @@
 use std::cell::Cell;
 use std::cell::RefCell;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::rc::Rc;
 
 use sema_core::runtime::RuntimeTaskId;
@@ -306,6 +306,7 @@ impl sema_core::McpCassetteRecordTarget for CassetteState {
 type CassetteScope = Rc<CassetteState>;
 
 /// The dynamically-scoped LLM state captured onto a task and swapped in/out per step.
+#[derive(Clone)]
 struct LlmDynScope {
     cache_enabled: bool,
     cache_ttl_secs: i64,
@@ -2662,14 +2663,6 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
         request.json_mode = true;
         request.system = Some(system.clone());
 
-        // Only attempt 0 is offloaded so siblings overlap; the decoder
-        // accounts attempt 0, then `finalize` validates and — only if a re-ask is
-        // needed — runs the remaining attempts on the SYNCHRONOUS `do_complete`
-        // path. Runtime roots and spawned tasks both suspend for attempt 0; the
-        // synchronous validation/re-ask residue is owned by the cooperative
-        // callback/re-entry migration.
-        #[cfg(not(target_arch = "wasm32"))]
-        let finalize_values = vec![schema.clone()];
         let cfg = ExtractConfig {
             schema,
             schema_desc,
@@ -2682,13 +2675,15 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
         };
         #[cfg(not(target_arch = "wasm32"))]
         {
-            dispatch_complete_offload(
-                request,
-                CompleteFinalize::with_values(
-                    move |first| extract_validate_and_reask(first, &cfg),
-                    finalize_values,
-                ),
-            )
+            if in_runtime_offload_task() {
+                return do_complete_runtime_suspend(
+                    request,
+                    CompleteFinalize::runtime(Box::new(RuntimeExtractDriver::new(cfg))),
+                );
+            }
+            let first = do_complete(request)?;
+            track_usage(&first.usage)?;
+            extract_validate_and_reask(first, &cfg).map(NativeOutcome::Return)
         }
         #[cfg(target_arch = "wasm32")]
         {
@@ -6388,16 +6383,65 @@ fn format_schema(val: &Value) -> String {
 /// The schema is a map of keyword keys to field descriptors (maps with `:type`).
 /// Returns Ok(()) if valid, or Err with a description of mismatches.
 fn validate_extraction(result: &Value, schema: &Value) -> Result<(), String> {
+    let mut errors = Vec::new();
+    for step in prepare_extraction_validation(result, schema) {
+        match step {
+            ExtractionValidationStep::Error(error) => errors.push(error),
+            ExtractionValidationStep::Predicate {
+                callable,
+                argument,
+                key_name,
+                failure_message,
+            } => match sema_core::with_stdlib_ctx(|ctx| {
+                sema_core::call_callback(ctx, &callable, std::slice::from_ref(&argument))
+            }) {
+                Ok(value) if value.is_truthy() => {}
+                Ok(_) => errors.push(format!("key {key_name}: {failure_message}")),
+                Err(error) => {
+                    errors.push(format!("key {key_name}: validation error: {error}"));
+                }
+            },
+        }
+    }
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("; "))
+    }
+}
+
+enum ExtractionValidationStep {
+    Error(String),
+    Predicate {
+        callable: Value,
+        argument: Value,
+        key_name: String,
+        failure_message: String,
+    },
+}
+
+/// Produce validation work in schema order. Runtime callers drive predicates as
+/// structural calls; synchronous callers consume the same sequence inline.
+fn prepare_extraction_validation(
+    result: &Value,
+    schema: &Value,
+) -> VecDeque<ExtractionValidationStep> {
     let schema_map = match schema.as_map_rc() {
         Some(m) => m,
-        None => return Ok(()),
+        None => return VecDeque::new(),
     };
     let result_map = match result.as_map_rc() {
         Some(m) => m,
-        None => return Err(format!("expected map result, got {}", result.type_name())),
+        None => {
+            return VecDeque::from([ExtractionValidationStep::Error(format!(
+                "expected map result, got {}",
+                result.type_name()
+            ))]);
+        }
     };
 
-    let mut errors = Vec::new();
+    let mut steps = VecDeque::new();
 
     for (key, field_spec) in schema_map.iter() {
         let key_name = key
@@ -6418,7 +6462,9 @@ fn validate_extraction(result: &Value, schema: &Value) -> Result<(), String> {
         match result_val {
             None => {
                 if !is_optional {
-                    errors.push(format!("missing key: {key_name}"));
+                    steps.push_back(ExtractionValidationStep::Error(format!(
+                        "missing key: {key_name}"
+                    )));
                 }
             }
             Some(val) => {
@@ -6437,45 +6483,33 @@ fn validate_extraction(result: &Value, schema: &Value) -> Result<(), String> {
                             _ => true,
                         };
                         if !ok {
-                            errors.push(format!(
+                            steps.push_back(ExtractionValidationStep::Error(format!(
                                 "key {key_name}: expected {type_name}, got {}",
                                 val.type_name()
-                            ));
+                            )));
                             continue; // skip :validate if type check failed
                         }
                     }
 
                     // Custom predicate validation via :validate
                     if let Some(validate_fn) = spec.get(&Value::keyword("validate")) {
-                        let custom_msg = spec
+                        let failure_message = spec
                             .get(&Value::keyword("message"))
-                            .and_then(|v| v.as_str().map(|s| s.to_string()));
-
-                        match sema_core::with_stdlib_ctx(|ctx| {
-                            sema_core::call_callback(ctx, validate_fn, std::slice::from_ref(val))
-                        }) {
-                            Ok(v) if v.is_truthy() => {} // validation passed
-                            Ok(_) => {
-                                let msg = custom_msg.unwrap_or_else(|| {
-                                    format!("custom validation failed for value {}", val)
-                                });
-                                errors.push(format!("key {key_name}: {msg}"));
-                            }
-                            Err(e) => {
-                                errors.push(format!("key {key_name}: validation error: {e}"));
-                            }
-                        }
+                            .and_then(|v| v.as_str().map(|s| s.to_string()))
+                            .unwrap_or_else(|| format!("custom validation failed for value {val}"));
+                        steps.push_back(ExtractionValidationStep::Predicate {
+                            callable: validate_fn.clone(),
+                            argument: val.clone(),
+                            key_name,
+                            failure_message,
+                        });
                     }
                 }
             }
         }
     }
 
-    if errors.is_empty() {
-        Ok(())
-    } else {
-        Err(errors.join("; "))
-    }
+    steps
 }
 
 fn compute_cache_key(request: &ChatRequest) -> String {
@@ -6864,16 +6898,27 @@ fn do_complete_streaming(
     stream_with_dispatch(request, &mut chunk_cb, &span)
 }
 
-/// Shapes a completed `ChatResponse` into a per-native return value on the VM
-/// thread, after `track_usage`, and exposes every `Value` retained by the
-/// closure to the runtime's CORE-2 tracer.
+/// Shapes a completed `ChatResponse` into the next native-runtime outcome on the
+/// VM thread, after `track_usage`.
 #[cfg(not(target_arch = "wasm32"))]
 type CompleteFinalizeCallback = Box<dyn FnOnce(ChatResponse) -> Result<Value, SemaError>>;
 
 #[cfg(not(target_arch = "wasm32"))]
-struct CompleteFinalize {
-    callback: Option<CompleteFinalizeCallback>,
-    retained_values: Vec<Value>,
+trait CompleteResponseContinuation: sema_core::runtime::Trace {
+    fn finish(self: Box<Self>, response: ChatResponse) -> sema_core::runtime::NativeResult;
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+enum CompleteFinalize {
+    /// A value-producing finalizer. Closures are opaque to the cycle collector,
+    /// so every captured `Value` must also appear in `retained_values`.
+    Value {
+        callback: CompleteFinalizeCallback,
+        retained_values: Vec<Value>,
+    },
+    /// A structural continuation that can return another call or suspension.
+    /// Its implementation owns and traces all retained runtime state.
+    Runtime(Box<dyn CompleteResponseContinuation>),
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -6886,26 +6931,40 @@ impl CompleteFinalize {
         callback: impl FnOnce(ChatResponse) -> Result<Value, SemaError> + 'static,
         retained_values: Vec<Value>,
     ) -> Self {
-        Self {
-            callback: Some(Box::new(callback)),
+        Self::Value {
+            callback: Box::new(callback),
             retained_values,
         }
     }
 
-    fn finish(mut self, response: ChatResponse) -> Result<Value, SemaError> {
-        self.callback
-            .take()
-            .expect("completion finalizer is consumed exactly once")(response)
+    fn runtime(continuation: Box<dyn CompleteResponseContinuation>) -> Self {
+        Self::Runtime(continuation)
+    }
+
+    fn finish(self, response: ChatResponse) -> sema_core::runtime::NativeResult {
+        match self {
+            Self::Value { callback, .. } => {
+                callback(response).map(sema_core::runtime::NativeOutcome::Return)
+            }
+            Self::Runtime(continuation) => continuation.finish(response),
+        }
     }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
 impl sema_core::runtime::Trace for CompleteFinalize {
     fn trace(&self, sink: &mut dyn FnMut(sema_core::cycle::GcEdge<'_>)) -> bool {
-        for value in &self.retained_values {
-            sink(sema_core::cycle::GcEdge::Value(value));
+        match self {
+            Self::Value {
+                retained_values, ..
+            } => {
+                for value in retained_values {
+                    sink(sema_core::cycle::GcEdge::Value(value));
+                }
+                true
+            }
+            Self::Runtime(continuation) => continuation.trace(sink),
         }
-        true
     }
 }
 
@@ -7128,7 +7187,7 @@ fn finalize_complete_success(
     budget_slot: Option<Rc<RefCell<BudgetFrame>>>,
     request_for_messages: &ChatRequest,
     finalize: CompleteFinalize,
-) -> Result<Value, SemaError> {
+) -> sema_core::runtime::NativeResult {
     let CompleteOutcome {
         resp,
         serving_provider,
@@ -7220,13 +7279,12 @@ fn dispatch_complete_offload(
     request: ChatRequest,
     finalize: CompleteFinalize,
 ) -> sema_core::runtime::NativeResult {
-    use sema_core::runtime::NativeOutcome;
     if in_runtime_offload_task() {
         return do_complete_runtime_suspend(request, finalize);
     }
     let response = do_complete(request)?;
     track_usage(&response.usage)?;
-    finalize.finish(response).map(NativeOutcome::Return)
+    finalize.finish(response)
 }
 
 /// Cooperative provider-complete round under the unified runtime. It uses the
@@ -7240,12 +7298,10 @@ fn do_complete_runtime_suspend(
     request: ChatRequest,
     finalize: CompleteFinalize,
 ) -> sema_core::runtime::NativeResult {
-    use sema_core::runtime::NativeOutcome;
-
     let plan = match complete_offload_prep(request)? {
         CompletePrep::Inline(resp) => {
             track_usage(&resp.usage)?;
-            return finalize.finish(resp).map(NativeOutcome::Return);
+            return finalize.finish(resp);
         }
         CompletePrep::Offload(plan) => *plan,
     };
@@ -7453,8 +7509,6 @@ impl RuntimeCompleteDriver {
     }
 
     fn finish(self: Box<Self>, outcome: CompleteOutcome) -> sema_core::runtime::NativeResult {
-        use sema_core::runtime::NativeOutcome;
-
         let Self {
             plan,
             finalize,
@@ -7462,7 +7516,7 @@ impl RuntimeCompleteDriver {
             budget_slot,
             ..
         } = *self;
-        let value = finalize_complete_success(
+        finalize_complete_success(
             outcome,
             plan.span,
             plan.cache_key,
@@ -7472,8 +7526,7 @@ impl RuntimeCompleteDriver {
             budget_slot,
             &plan.request_for_messages,
             finalize,
-        )?;
-        Ok(NativeOutcome::Return(value))
+        )
     }
 }
 
@@ -8257,8 +8310,7 @@ fn primary_model_for_cache() -> Result<String, SemaError> {
     with_provider(|p| Ok(p.default_model().to_string()))
 }
 
-/// Parameters for `llm/extract`'s validate-and-re-ask stage, captured so the
-/// (possibly offloaded) finalize closure can run the synchronous re-ask attempts.
+/// Parameters shared by every `llm/extract` validation and re-ask attempt.
 struct ExtractConfig {
     schema: Value,
     schema_desc: String,
@@ -8268,6 +8320,28 @@ struct ExtractConfig {
     validate: bool,
     max_retries: u32,
     reask: bool,
+}
+
+fn extract_reask_request(
+    cfg: &ExtractConfig,
+    last_response_content: &str,
+    last_validation_error: &str,
+) -> ChatRequest {
+    let mut request = ChatRequest::new(cfg.model.clone(), cfg.messages.clone());
+    request.json_mode = true;
+    request.system = Some(if cfg.reask {
+        format_reask_prompt(
+            last_response_content,
+            last_validation_error,
+            &cfg.schema_desc,
+        )
+    } else {
+        format!(
+            "{}\n\nYour previous response had validation errors: {}. Please fix.",
+            cfg.system, last_validation_error
+        )
+    });
+    request
 }
 
 /// Parse an LLM extraction response body into a Sema `Value` (strips a ```json
@@ -8291,11 +8365,245 @@ fn extract_parse_response(response: &ChatResponse) -> Result<Value, SemaError> {
     Ok(sema_core::json_to_value(&json))
 }
 
-/// Validate `llm/extract`'s attempt-0 response and, on validation failure with
-/// retries remaining, run the re-ask attempts via the SYNCHRONOUS `do_complete`
-/// path (+ `track_usage` per attempt) — preserving the exact loop semantics and
-/// error messages of the original native. `first` is the attempt-0 response, which
-/// the caller has already accounted (synchronous path inline; runtime path in the decoder).
+#[cfg(not(target_arch = "wasm32"))]
+enum RuntimeExtractPhase {
+    Ready,
+    Predicate {
+        key_name: String,
+        failure_message: String,
+    },
+}
+
+/// Reinstall the extraction task's dispatch-time dynamic scopes while preparing
+/// a later completion round. Native continuations resume outside the runtime's
+/// per-quantum scope swap, so recursive provider preparation must supply the
+/// captured LLM, telemetry, and leaf-accounting contexts explicitly.
+#[cfg(not(target_arch = "wasm32"))]
+struct RuntimeCompletionPrepScope {
+    previous_llm: Option<LlmDynScope>,
+    previous_otel: Option<sema_otel::OtelTaskCtx>,
+    previous_usage: Option<Option<Rc<RefCell<LeafUsage>>>>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl RuntimeCompletionPrepScope {
+    fn install(
+        llm: LlmDynScope,
+        otel: sema_otel::OtelTaskCtx,
+        usage: Option<Rc<RefCell<LeafUsage>>>,
+    ) -> Self {
+        let previous_llm = write_llm_scope(llm);
+        let previous_otel = sema_otel::install_task_otel(otel);
+        let previous_usage =
+            ACTIVE_LEAF_SCOPE.with(|active| std::mem::replace(&mut *active.borrow_mut(), usage));
+        Self {
+            previous_llm: Some(previous_llm),
+            previous_otel: Some(previous_otel),
+            previous_usage: Some(previous_usage),
+        }
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl Drop for RuntimeCompletionPrepScope {
+    fn drop(&mut self) {
+        if let Some(previous_usage) = self.previous_usage.take() {
+            ACTIVE_LEAF_SCOPE.with(|active| *active.borrow_mut() = previous_usage);
+        }
+        if let Some(previous_otel) = self.previous_otel.take() {
+            let _ = sema_otel::install_task_otel(previous_otel);
+        }
+        if let Some(previous_llm) = self.previous_llm.take() {
+            let _ = write_llm_scope(previous_llm);
+        }
+    }
+}
+
+/// Cooperative validation and re-ask state for `llm/extract`. Provider rounds
+/// reuse the canonical completion driver, and custom validators are structural
+/// VM calls so either side may suspend without occupying the VM thread.
+#[cfg(not(target_arch = "wasm32"))]
+struct RuntimeExtractDriver {
+    cfg: ExtractConfig,
+    attempt: u32,
+    last_validation_error: String,
+    last_response_content: String,
+    result: Option<Value>,
+    steps: VecDeque<ExtractionValidationStep>,
+    errors: Vec<String>,
+    phase: RuntimeExtractPhase,
+    llm_scope: LlmDynScope,
+    otel_scope: sema_otel::OtelTaskCtx,
+    usage_accum_slot: Option<Rc<RefCell<LeafUsage>>>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl RuntimeExtractDriver {
+    fn new(cfg: ExtractConfig) -> Self {
+        Self {
+            cfg,
+            attempt: 0,
+            last_validation_error: String::new(),
+            last_response_content: String::new(),
+            result: None,
+            steps: VecDeque::new(),
+            errors: Vec::new(),
+            phase: RuntimeExtractPhase::Ready,
+            llm_scope: read_llm_scope(),
+            otel_scope: sema_otel::current_conversation_scope(),
+            usage_accum_slot: current_usage_accum(),
+        }
+    }
+
+    fn accept_response(
+        mut self: Box<Self>,
+        response: ChatResponse,
+    ) -> sema_core::runtime::NativeResult {
+        use sema_core::runtime::NativeOutcome;
+
+        self.last_response_content = response.content.trim().to_string();
+        let result = extract_parse_response(&response)?;
+        if !self.cfg.validate {
+            return Ok(NativeOutcome::Return(result));
+        }
+
+        self.steps = prepare_extraction_validation(&result, &self.cfg.schema);
+        self.result = Some(result);
+        self.errors.clear();
+        self.phase = RuntimeExtractPhase::Ready;
+        self.advance_validation()
+    }
+
+    fn advance_validation(mut self: Box<Self>) -> sema_core::runtime::NativeResult {
+        use sema_core::runtime::{NativeCall, NativeOutcome};
+
+        while let Some(step) = self.steps.pop_front() {
+            match step {
+                ExtractionValidationStep::Error(error) => self.errors.push(error),
+                ExtractionValidationStep::Predicate {
+                    callable,
+                    argument,
+                    key_name,
+                    failure_message,
+                } => {
+                    self.phase = RuntimeExtractPhase::Predicate {
+                        key_name,
+                        failure_message,
+                    };
+                    return Ok(NativeOutcome::Call(NativeCall {
+                        callable,
+                        args: vec![argument],
+                        continuation: self,
+                    }));
+                }
+            }
+        }
+
+        if self.errors.is_empty() {
+            let result = self
+                .result
+                .take()
+                .ok_or_else(|| SemaError::eval("llm/extract validation lost its parsed result"))?;
+            return Ok(NativeOutcome::Return(result));
+        }
+
+        self.last_validation_error = std::mem::take(&mut self.errors).join("; ");
+        if self.attempt == self.cfg.max_retries {
+            return Err(SemaError::Llm(format!(
+                "extraction validation failed after {} attempt(s): {}",
+                self.cfg.max_retries + 1,
+                self.last_validation_error
+            )));
+        }
+
+        self.attempt += 1;
+        self.result = None;
+        self.phase = RuntimeExtractPhase::Ready;
+        let request = extract_reask_request(
+            &self.cfg,
+            &self.last_response_content,
+            &self.last_validation_error,
+        );
+        let _scope = RuntimeCompletionPrepScope::install(
+            self.llm_scope.clone(),
+            self.otel_scope.clone(),
+            self.usage_accum_slot.clone(),
+        );
+        do_complete_runtime_suspend(request, CompleteFinalize::runtime(self))
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl sema_core::runtime::Trace for RuntimeExtractDriver {
+    fn trace(&self, sink: &mut dyn FnMut(sema_core::cycle::GcEdge<'_>)) -> bool {
+        sink(sema_core::cycle::GcEdge::Value(&self.cfg.schema));
+        if let Some(result) = &self.result {
+            sink(sema_core::cycle::GcEdge::Value(result));
+        }
+        for step in &self.steps {
+            if let ExtractionValidationStep::Predicate {
+                callable, argument, ..
+            } = step
+            {
+                sink(sema_core::cycle::GcEdge::Value(callable));
+                sink(sema_core::cycle::GcEdge::Value(argument));
+            }
+        }
+        true
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl CompleteResponseContinuation for RuntimeExtractDriver {
+    fn finish(self: Box<Self>, response: ChatResponse) -> sema_core::runtime::NativeResult {
+        self.accept_response(response)
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl sema_core::runtime::NativeContinuation for RuntimeExtractDriver {
+    fn resume(
+        mut self: Box<Self>,
+        _context: &mut sema_core::runtime::NativeCallContext<'_>,
+        input: sema_core::runtime::ResumeInput,
+    ) -> sema_core::runtime::NativeResult {
+        use sema_core::runtime::ResumeInput;
+
+        let phase = std::mem::replace(&mut self.phase, RuntimeExtractPhase::Ready);
+        match (phase, input) {
+            (
+                RuntimeExtractPhase::Predicate {
+                    key_name,
+                    failure_message,
+                },
+                ResumeInput::Returned(value),
+            ) => {
+                if !value.is_truthy() {
+                    self.errors
+                        .push(format!("key {key_name}: {failure_message}"));
+                }
+                self.advance_validation()
+            }
+            (RuntimeExtractPhase::Predicate { key_name, .. }, ResumeInput::Failed(error)) => {
+                self.errors
+                    .push(format!("key {key_name}: validation error: {error}"));
+                self.advance_validation()
+            }
+            (_, ResumeInput::Cancelled(reason)) => Err(SemaError::eval(format!(
+                "llm/extract validator was cancelled ({reason:?})"
+            ))),
+            (_, ResumeInput::Runtime(_)) => Err(SemaError::eval(
+                "llm/extract validator received an unexpected runtime response",
+            )),
+            (RuntimeExtractPhase::Ready, _) => Err(SemaError::eval(
+                "llm/extract validator resumed without an active predicate",
+            )),
+        }
+    }
+}
+
+/// Validate `llm/extract` synchronously for host calls and wasm builds. `first` is
+/// the attempt-0 response and has already been accounted by the caller.
 fn extract_validate_and_reask(
     first: ChatResponse,
     cfg: &ExtractConfig,
@@ -8309,20 +8617,8 @@ fn extract_validate_and_reask(
         let response = if attempt == 0 {
             first.clone()
         } else {
-            let mut request = ChatRequest::new(cfg.model.clone(), cfg.messages.clone());
-            request.json_mode = true;
-            request.system = Some(if cfg.reask {
-                format_reask_prompt(
-                    &last_response_content,
-                    &last_validation_error,
-                    &cfg.schema_desc,
-                )
-            } else {
-                format!(
-                    "{}\n\nYour previous response had validation errors: {}. Please fix.",
-                    cfg.system, last_validation_error
-                )
-            });
+            let request =
+                extract_reask_request(cfg, &last_response_content, &last_validation_error);
             let resp = do_complete(request)?;
             track_usage(&resp.usage)?;
             resp
@@ -11668,6 +11964,44 @@ mod tests {
         // Sanity: the captured teardown is a real closure that runs once.
         (cont.teardown.unwrap())();
         assert!(fired.get());
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn runtime_extract_finalizer_traces_pending_validation_values() {
+        use sema_core::runtime::Trace;
+
+        let driver = RuntimeExtractDriver {
+            cfg: ExtractConfig {
+                schema: Value::int(1),
+                schema_desc: String::new(),
+                system: String::new(),
+                model: String::new(),
+                messages: Vec::new(),
+                validate: true,
+                max_retries: 1,
+                reask: true,
+            },
+            attempt: 0,
+            last_validation_error: String::new(),
+            last_response_content: String::new(),
+            result: Some(Value::int(2)),
+            steps: VecDeque::from([ExtractionValidationStep::Predicate {
+                callable: Value::int(3),
+                argument: Value::int(4),
+                key_name: "field".to_string(),
+                failure_message: "invalid".to_string(),
+            }]),
+            errors: Vec::new(),
+            phase: RuntimeExtractPhase::Ready,
+            llm_scope: LlmDynScope::default(),
+            otel_scope: sema_otel::OtelTaskCtx::default(),
+            usage_accum_slot: None,
+        };
+        let finalize = CompleteFinalize::runtime(Box::new(driver));
+        let mut edges = 0;
+        assert!(finalize.trace(&mut |_| edges += 1));
+        assert_eq!(edges, 4, "schema, result, predicate, and argument are live");
     }
 
     /// The cooperative tool-round continuation exposes exactly its live `Value`

@@ -17,6 +17,8 @@
 
 #![cfg(not(target_arch = "wasm32"))]
 
+use std::time::{Duration, Instant};
+
 use sema_eval::Interpreter;
 use sema_llm::builtins::{
     install_cassette, io_peak_inflight, register_test_provider, reset_io_inflight,
@@ -833,6 +835,536 @@ fn extract_single_attempt_overlaps() {
         "expected peak in-flight >= 2, got {}",
         io_peak_inflight()
     );
+}
+
+/// Every re-ask is a canonical cooperative completion. A timer that becomes
+/// ready between attempt 0 and attempt 1 must run before the second provider
+/// result, and both successful provider responses are accounted exactly once.
+#[test]
+#[serial]
+fn extract_native_reask_parks_while_a_sibling_runs() {
+    let fake = FakeProvider::builder("fake")
+        .model("fake-chat")
+        .chat_delay(100)
+        .reply(r#"{"n":"invalid"}"#)
+        .reply(r#"{"n":2}"#)
+        .build();
+    let recorder = fake.recorder();
+    let interp = Interpreter::new();
+    reset_runtime_state();
+    register_test_provider(Box::new(fake));
+
+    let value = interp
+        .eval_str_compiled(
+            r#"
+            (define before (:total-tokens (llm/session-usage)))
+            (define out (channel/new 2))
+            (async/spawn (fn () (sleep 150) (channel/send out "sibling")))
+            (channel/send out
+              (format "~a"
+                (:n (llm/extract {:n {:type :number}} "root" {:retries 1}))))
+            (list (channel/recv out) (channel/recv out)
+                  (- (:total-tokens (llm/session-usage)) before))
+            "#,
+        )
+        .expect("native extraction re-ask and sibling settle");
+
+    let items = value.as_list().expect("ordered results and usage");
+    assert_eq!(items[0].as_str(), Some("sibling"));
+    assert_eq!(items[1].as_str(), Some("2"));
+    assert_eq!(items[2].as_int(), Some(30));
+    assert_eq!(recorder.call_count(), 2);
+}
+
+/// Re-asks rebuild the same fallback chain on every attempt; a failing Sema
+/// provider is invoked before the native fallback for both rounds.
+#[test]
+#[serial]
+fn extract_reask_reuses_mixed_provider_fallback() {
+    let fake = FakeProvider::builder("fake")
+        .model("fake-chat")
+        .reply(r#"{"n":"invalid"}"#)
+        .reply(r#"{"n":2}"#)
+        .build();
+    let recorder = fake.recorder();
+    let interp = Interpreter::new();
+    reset_runtime_state();
+    register_test_provider(Box::new(fake));
+
+    let value = interp
+        .eval_str_compiled(
+            r#"
+            (define sema-calls 0)
+            (llm/define-provider :sema-provider
+              {:complete
+                (fn (_request)
+                  (set! sema-calls (+ sema-calls 1))
+                  (error "use fallback"))
+               :default-model "sema-model"})
+            (define result
+              (llm/with-fallback [:sema-provider :fake]
+                (fn ()
+                  (llm/extract
+                    {:n {:type :number}}
+                    "root"
+                    {:retries 1}))))
+            (list (:n result) sema-calls)
+            "#,
+        )
+        .expect("each extraction attempt traverses the mixed fallback chain");
+
+    let items = value.as_list().expect("result and Sema call count");
+    assert_eq!(items[0].as_int(), Some(2));
+    assert_eq!(items[1].as_int(), Some(2));
+    assert_eq!(recorder.call_count(), 2);
+}
+
+/// Disabling the verbose re-ask keeps the established terse system prompt and
+/// otherwise preserves the original messages and JSON mode.
+#[test]
+#[serial]
+fn extract_reask_false_preserves_exact_prompt_shape() {
+    let fake = FakeProvider::builder("fake")
+        .model("fake-chat")
+        .reply(r#"{"n":"invalid"}"#)
+        .reply(r#"{"n":2}"#)
+        .build();
+    let recorder = fake.recorder();
+    let interp = Interpreter::new();
+    reset_runtime_state();
+    register_test_provider(Box::new(fake));
+
+    let value = interp
+        .eval_str_compiled(
+            r#"
+            (:n
+              (llm/extract
+                {:n {:type :number}}
+                "root"
+                {:retries 1 :reask? #f}))
+            "#,
+        )
+        .expect("terse extraction re-ask succeeds");
+    assert_eq!(value.as_int(), Some(2));
+
+    let requests = recorder.requests();
+    assert_eq!(requests.len(), 2);
+    let initial_system = requests[0]
+        .system
+        .as_deref()
+        .expect("initial system prompt");
+    assert_eq!(
+        requests[1].system.as_deref(),
+        Some(
+            format!(
+                "{initial_system}\n\nYour previous response had validation errors: \
+                 key n: expected number, got string. Please fix."
+            )
+            .as_str()
+        )
+    );
+    assert_eq!(requests[1].messages.len(), requests[0].messages.len());
+    assert_eq!(requests[1].messages[0].role, requests[0].messages[0].role);
+    assert_eq!(
+        requests[1].messages[0].content.as_text(),
+        requests[0].messages[0].content.as_text()
+    );
+    assert!(requests[1].json_mode);
+}
+
+/// Re-ask accounting stays attached to the budget captured by a task spawned
+/// inside the scope, even when the task is awaited after that scope has ended.
+#[test]
+#[serial]
+fn extract_reask_charges_spawn_captured_budget() {
+    let fake = FakeProvider::builder("fake")
+        .model("fake-chat")
+        .reply_with_usage(r#"{"n":"invalid"}"#, 10, 5)
+        .reply_with_usage(r#"{"n":2}"#, 10, 5)
+        .build();
+    let recorder = fake.recorder();
+    let interp = Interpreter::new();
+    reset_runtime_state();
+    register_test_provider(Box::new(fake));
+
+    let value = interp
+        .eval_str_compiled(
+            r#"
+            (define pending
+              (llm/with-budget {:max-tokens 20}
+                (fn ()
+                  (async/spawn
+                    (fn ()
+                      (llm/extract
+                        {:n {:type :number}}
+                        "root"
+                        {:retries 1}))))))
+            (try (async/await pending) (catch error (:message error)))
+            "#,
+        )
+        .expect("retry budget failure is catchable");
+
+    assert!(value
+        .as_str()
+        .expect("budget error message")
+        .contains("token budget exceeded: used 30 of 20 tokens"));
+    assert_eq!(recorder.call_count(), 2);
+}
+
+/// Both request shapes produced by extraction are cached under the spawned
+/// task's captured cache scope, so a later extraction can replay both attempts.
+#[test]
+#[serial]
+fn extract_reask_uses_spawn_captured_cache_scope() {
+    let fake = FakeProvider::builder("fake")
+        .model("fake-chat")
+        .reply(r#"{"n":"invalid"}"#)
+        .reply(r#"{"n":2}"#)
+        .build();
+    let recorder = fake.recorder();
+    let interp = Interpreter::new();
+    reset_runtime_state();
+    register_test_provider(Box::new(fake));
+
+    let primed = interp
+        .eval_str_compiled(
+            r#"
+            (llm/cache-clear)
+            (define pending
+              (llm/with-cache {:ttl 3600}
+                (fn ()
+                  (async/spawn
+                    (fn ()
+                      (llm/extract
+                        {:n {:type :number}}
+                        "root"
+                        {:retries 1}))))))
+            (:n (async/await pending))
+            "#,
+        )
+        .expect("spawned extraction primes both cache entries");
+    assert_eq!(primed.as_int(), Some(2));
+    assert_eq!(recorder.call_count(), 2);
+
+    let fail = FakeProvider::builder("fake")
+        .model("fake-chat")
+        .error(sema_llm::types::LlmError::Api {
+            status: 500,
+            message: "provider must not be called on extraction cache replay".into(),
+        })
+        .build();
+    let fail_recorder = fail.recorder();
+    register_test_provider(Box::new(fail));
+    let replayed = interp
+        .eval_str_compiled(
+            r#"
+            (define pending
+              (llm/with-cache {:ttl 3600}
+                (fn ()
+                  (async/spawn
+                    (fn ()
+                      (llm/extract
+                        {:n {:type :number}}
+                        "root"
+                        {:retries 1}))))))
+            (define result (async/await pending))
+            (list (:n result)
+                  (:hits (llm/cache-stats))
+                  (:misses (llm/cache-stats)))
+            "#,
+        )
+        .expect("spawned extraction replays both cache entries");
+    let items = replayed.as_list().expect("result and cache stats");
+    assert_eq!(items[0].as_int(), Some(2));
+    assert_eq!(items[1].as_int(), Some(2));
+    assert_eq!(items[2].as_int(), Some(2));
+    assert_eq!(fail_recorder.call_count(), 0);
+    interp
+        .eval_str_compiled("(llm/cache-clear)")
+        .expect("clean extraction cache fixture");
+}
+
+/// A spawned recording scope owns both extraction attempts, and replay can
+/// consume both without reaching a provider after the dynamic extent unwinds.
+#[test]
+#[serial]
+fn extract_reask_uses_spawn_captured_cassette_scope() {
+    let path = std::env::temp_dir().join(format!(
+        "sema-cassette-extract-reask-{}-{}.jsonl",
+        std::process::id(),
+        line!()
+    ));
+    let _ = std::fs::remove_file(&path);
+
+    let interp = Interpreter::new();
+    reset_runtime_state();
+    let fake = FakeProvider::builder("fake")
+        .model("fake-chat")
+        .reply(r#"{"n":"invalid"}"#)
+        .reply(r#"{"n":2}"#)
+        .build();
+    let recorder = fake.recorder();
+    register_test_provider(Box::new(fake));
+    let recorded = interp
+        .eval_str_compiled(&format!(
+            r#"
+            (define pending
+              (llm/with-cassette "{}" {{:mode :record}}
+                (fn ()
+                  (async/spawn
+                    (fn ()
+                      (llm/extract
+                        {{:n {{:type :number}}}}
+                        "root"
+                        {{:retries 1}}))))))
+            (:n (async/await pending))
+            "#,
+            path.display()
+        ))
+        .expect("spawned extraction records both attempts");
+    assert_eq!(recorded.as_int(), Some(2));
+    assert_eq!(recorder.call_count(), 2);
+
+    reset_runtime_state();
+    let fail = FakeProvider::builder("fake")
+        .model("fake-chat")
+        .error(sema_llm::types::LlmError::Api {
+            status: 500,
+            message: "provider must not be called on extraction cassette replay".into(),
+        })
+        .build();
+    let fail_recorder = fail.recorder();
+    register_test_provider(Box::new(fail));
+    let replayed = interp
+        .eval_str_compiled(&format!(
+            r#"
+            (define pending
+              (llm/with-cassette "{}" {{:mode :replay}}
+                (fn ()
+                  (async/spawn
+                    (fn ()
+                      (llm/extract
+                        {{:n {{:type :number}}}}
+                        "root"
+                        {{:retries 1}}))))))
+            (:n (async/await pending))
+            "#,
+            path.display()
+        ))
+        .expect("spawned extraction replays both attempts");
+    assert_eq!(replayed.as_int(), Some(2));
+    assert_eq!(fail_recorder.call_count(), 0);
+
+    let _ = std::fs::remove_file(path);
+}
+
+/// A Sema-defined provider can suspend and observe the caller's task context on
+/// a later extraction attempt, not only on attempt 0.
+#[test]
+#[serial]
+fn extract_sema_provider_reask_is_structural() {
+    let interp = Interpreter::new();
+    reset_runtime_state();
+
+    let value = interp
+        .eval_str_compiled(
+            r#"
+            (define calls 0)
+            (llm/define-provider :sema-provider
+              {:complete
+                (fn (_request)
+                  (set! calls (+ calls 1))
+                  (if (= calls 1)
+                      {:content "{\"n\":\"invalid\"}"
+                       :usage {:prompt-tokens 3 :completion-tokens 2}}
+                      (begin
+                        (async/await
+                          (async/spawn (fn () (sleep 10) nil)))
+                        {:content
+                          (string-append "{\"n\":" (context/get :answer) "}")
+                         :usage {:prompt-tokens 3 :completion-tokens 2}})))
+               :default-model "sema-model"})
+            (define before (:total-tokens (llm/session-usage)))
+            (define result
+              (context/with {:answer "7"}
+                (fn ()
+                  (llm/extract {:n {:type :number}} "root" {:retries 1}))))
+            (list (:n result) calls
+                  (- (:total-tokens (llm/session-usage)) before))
+            "#,
+        )
+        .expect("Sema extraction re-ask preserves runtime context");
+
+    let items = value.as_list().expect("result, call count, and usage");
+    assert_eq!(items[0].as_int(), Some(7));
+    assert_eq!(items[1].as_int(), Some(2));
+    assert_eq!(items[2].as_int(), Some(10));
+}
+
+/// Schema predicates are structural Sema calls: they may spawn/await and read
+/// task-local context while preserving the one-provider-call success path.
+#[test]
+#[serial]
+fn extract_custom_validator_can_suspend_and_observe_context() {
+    let fake = FakeProvider::builder("fake")
+        .model("fake-chat")
+        .reply(r#"{"name":"Ada"}"#)
+        .build();
+    let recorder = fake.recorder();
+    let interp = Interpreter::new();
+    reset_runtime_state();
+    register_test_provider(Box::new(fake));
+
+    let value = interp
+        .eval_str_compiled(
+            r#"
+            (context/with {:prefix "ctx"}
+              (fn ()
+                (:name
+                  (llm/extract
+                    {:name
+                      {:type :string
+                       :validate
+                         (fn (value)
+                           (define pending
+                             (async/spawn (fn () (sleep 10) (= value "Ada"))))
+                           (and (= (context/get :prefix) "ctx")
+                                (async/await pending)))}}
+                    "root"
+                    {:retries 0}))))
+            "#,
+        )
+        .expect("suspending extraction validator succeeds");
+
+    assert_eq!(value.as_str(), Some("Ada"));
+    assert_eq!(recorder.call_count(), 1);
+}
+
+/// Cancellation during a schema predicate propagates out of extraction. It is
+/// not converted into a validation failure and must not issue a re-ask.
+#[test]
+#[serial]
+fn cancelling_extract_validator_does_not_reask_or_charge_again() {
+    let fake = FakeProvider::builder("fake")
+        .model("fake-chat")
+        .reply(r#"{"name":"Ada"}"#)
+        .reply(r#"{"name":"must-not-dispatch"}"#)
+        .build();
+    let recorder = fake.recorder();
+    let interp = Interpreter::new();
+    reset_runtime_state();
+    register_test_provider(Box::new(fake));
+
+    let started = Instant::now();
+    let value = interp
+        .eval_str_compiled(
+            r#"
+            (define pending
+              (async/spawn
+                (fn ()
+                  (llm/extract
+                    {:name
+                      {:type :string
+                       :validate (fn (_value) (sleep 1000) #t)}}
+                    "root"
+                    {:retries 1}))))
+            (async/spawn (fn () (sleep 20) (async/cancel pending)))
+            (list (try (async/await pending) (catch error :cancelled))
+                  (:total-tokens (llm/session-usage)))
+            "#,
+        )
+        .expect("cancelled extraction validator settles");
+
+    assert!(
+        started.elapsed() < Duration::from_millis(500),
+        "cancellation must not wait out the validator sleep"
+    );
+    let items = value.as_list().expect("cancel result and usage");
+    assert_eq!(items[0], sema_core::Value::keyword("cancelled"));
+    assert_eq!(items[1].as_int(), Some(15));
+    assert_eq!(recorder.call_count(), 1, "cancellation must not re-ask");
+}
+
+/// JSON decoding failures precede schema validation and remain terminal even
+/// when validation retries are enabled.
+#[test]
+#[serial]
+fn extract_invalid_json_does_not_reask() {
+    let fake = FakeProvider::builder("fake")
+        .model("fake-chat")
+        .reply("not json")
+        .reply(r#"{"n":2}"#)
+        .build();
+    let recorder = fake.recorder();
+    let interp = Interpreter::new();
+    reset_runtime_state();
+    register_test_provider(Box::new(fake));
+
+    let value = interp
+        .eval_str_compiled(
+            r#"
+            (try
+              (llm/extract {:n {:type :number}} "root" {:retries 2})
+              (catch error (:message error)))
+            "#,
+        )
+        .expect("invalid JSON is catchable");
+
+    assert!(value
+        .as_str()
+        .expect("error message")
+        .contains("failed to parse LLM JSON response"));
+    assert_eq!(recorder.call_count(), 1, "parse errors must not re-ask");
+}
+
+/// Validator failures accumulate in schema order, and a failing predicate does
+/// not prevent later predicates from running.
+#[test]
+#[serial]
+fn extract_validator_errors_are_ordered_and_non_short_circuiting() {
+    let fake = FakeProvider::builder("fake")
+        .model("fake-chat")
+        .reply(r#"{"a":"x","b":"y"}"#)
+        .build();
+    let recorder = fake.recorder();
+    let interp = Interpreter::new();
+    reset_runtime_state();
+    register_test_provider(Box::new(fake));
+
+    let value = interp
+        .eval_str_compiled(
+            r#"
+            (define second-ran #f)
+            (define message
+              (try
+                (llm/extract
+                  {:a {:type :string
+                       :validate (fn (_value) (error "first boom"))}
+                   :b {:type :string
+                       :validate (fn (_value) (set! second-ran #t) #f)
+                       :message "second false"}}
+                  "root"
+                  {:retries 0})
+                (catch error (:message error))))
+            (list message second-ran)
+            "#,
+        )
+        .expect("validator failures are catchable");
+
+    let items = value.as_list().expect("message and continuation marker");
+    let message = items[0].as_str().expect("validation error message");
+    let first = message
+        .find("key a: validation error:")
+        .expect("first validator error is present");
+    let second = message
+        .find("key b: second false")
+        .expect("second validator error is present");
+    assert!(
+        first < second,
+        "validator errors must preserve schema order"
+    );
+    assert_eq!(items[1].as_bool(), Some(true));
+    assert_eq!(recorder.call_count(), 1);
 }
 
 /// Sync path unchanged: a plain top-level `(llm/complete ...)` still works and

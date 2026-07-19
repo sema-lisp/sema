@@ -104,7 +104,7 @@ thread_local! {
 /// swaps one of these into the thread-locals on task entry and takes it back out
 /// on task leave, so a task that parks mid-span (its `SpanCore` guard still on
 /// the stack) cannot corrupt a sibling task's stack or ids.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct OtelTaskCtx {
     stack: Vec<Context>,
     conversation_id: Option<String>,

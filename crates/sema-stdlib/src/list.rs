@@ -1,5 +1,5 @@
 use std::borrow::Cow;
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 
 use sema_core::cycle::GcEdge;
 use sema_core::number::SemaNumber;
@@ -817,6 +817,130 @@ fn sort_by_call(key_fn: &Value, items: &[Value]) -> NativeOutcome {
         args: vec![first.clone()],
         continuation,
     })
+}
+
+enum KeyProjectionMode {
+    GroupBy { groups: Vec<(Value, Vec<Value>)> },
+    KeyBy { keyed: BTreeMap<Value, Value> },
+}
+
+impl KeyProjectionMode {
+    fn accept(&mut self, key: Value, item: Value) {
+        match self {
+            Self::GroupBy { groups } => {
+                if let Some((_, items)) = groups.iter_mut().find(|(existing, _)| existing == &key) {
+                    items.push(item);
+                } else {
+                    groups.push((key, vec![item]));
+                }
+            }
+            Self::KeyBy { keyed } => {
+                keyed.insert(key, item);
+            }
+        }
+    }
+
+    fn finish(&mut self) -> Value {
+        match self {
+            Self::GroupBy { groups } => {
+                let mut grouped = BTreeMap::new();
+                for (key, items) in std::mem::take(groups) {
+                    grouped.insert(key, Value::list(items));
+                }
+                Value::map(grouped)
+            }
+            Self::KeyBy { keyed } => Value::map(std::mem::take(keyed)),
+        }
+    }
+
+    fn trace(&self, sink: &mut dyn FnMut(GcEdge<'_>)) {
+        match self {
+            Self::GroupBy { groups } => {
+                for (key, items) in groups {
+                    sink(GcEdge::Value(key));
+                    for item in items {
+                        sink(GcEdge::Value(item));
+                    }
+                }
+            }
+            Self::KeyBy { keyed } => {
+                for (key, item) in keyed {
+                    sink(GcEdge::Value(key));
+                    sink(GcEdge::Value(item));
+                }
+            }
+        }
+    }
+}
+
+struct KeyProjectionContinuation {
+    hof: &'static str,
+    key_fn: Value,
+    current: Value,
+    remaining: PredicateItems,
+    mode: KeyProjectionMode,
+}
+
+impl KeyProjectionContinuation {
+    fn continue_or_finish(mut self: Box<Self>) -> NativeResult {
+        match self.remaining.pop_front() {
+            Some(next) => {
+                self.current = next.clone();
+                Ok(NativeOutcome::Call(NativeCall {
+                    callable: self.key_fn.clone(),
+                    args: vec![next],
+                    continuation: self,
+                }))
+            }
+            None => Ok(NativeOutcome::Return(self.mode.finish())),
+        }
+    }
+}
+
+impl Trace for KeyProjectionContinuation {
+    fn trace(&self, sink: &mut dyn FnMut(GcEdge<'_>)) -> bool {
+        sink(GcEdge::Value(&self.key_fn));
+        sink(GcEdge::Value(&self.current));
+        self.remaining.trace(sink);
+        self.mode.trace(sink);
+        true
+    }
+}
+
+impl NativeContinuation for KeyProjectionContinuation {
+    fn resume(
+        mut self: Box<Self>,
+        _context: &mut NativeCallContext<'_>,
+        input: ResumeInput,
+    ) -> NativeResult {
+        let key = resume_value(input, self.hof)?;
+        let item = std::mem::replace(&mut self.current, Value::nil());
+        self.mode.accept(key, item);
+        self.continue_or_finish()
+    }
+}
+
+fn key_projection_call(
+    key_fn: &Value,
+    source: &Value,
+    mut mode: KeyProjectionMode,
+    hof: &'static str,
+) -> NativeResult {
+    let mut remaining = PredicateItems::from_value(source, hof)?;
+    let Some(first) = remaining.pop_front() else {
+        return Ok(NativeOutcome::Return(mode.finish()));
+    };
+    Ok(NativeOutcome::Call(NativeCall {
+        callable: key_fn.clone(),
+        args: vec![first.clone()],
+        continuation: Box::new(KeyProjectionContinuation {
+            hof,
+            key_fn: key_fn.clone(),
+            current: first,
+            remaining,
+            mode,
+        }),
+    }))
 }
 
 #[derive(Clone, Copy)]
@@ -2089,24 +2213,37 @@ pub fn register(env: &sema_core::Env) {
         Ok(Value::list(result))
     });
 
-    register_fn(env, "list/group-by", |args| {
-        check_arity!(args, "list/group-by", 2);
-        let items = get_sequence(&args[1], "list/group-by")?;
-        let mut groups: Vec<(Value, Vec<Value>)> = Vec::new();
-        for item in items.iter() {
-            let key = call_function(&args[0], &[item.clone()])?;
-            if let Some(group) = groups.iter_mut().find(|(k, _)| k == &key) {
-                group.1.push(item.clone());
-            } else {
-                groups.push((key, vec![item.clone()]));
+    register_hof(
+        env,
+        "list/group-by",
+        |args| {
+            check_arity!(args, "list/group-by", 2);
+            let items = get_sequence(&args[1], "list/group-by")?;
+            let mut groups: Vec<(Value, Vec<Value>)> = Vec::new();
+            for item in items.iter() {
+                let key = call_function(&args[0], &[item.clone()])?;
+                if let Some(group) = groups.iter_mut().find(|(k, _)| k == &key) {
+                    group.1.push(item.clone());
+                } else {
+                    groups.push((key, vec![item.clone()]));
+                }
             }
-        }
-        let mut map = std::collections::BTreeMap::new();
-        for (key, vals) in groups {
-            map.insert(key, Value::list(vals));
-        }
-        Ok(Value::map(map))
-    });
+            let mut map = BTreeMap::new();
+            for (key, vals) in groups {
+                map.insert(key, Value::list(vals));
+            }
+            Ok(Value::map(map))
+        },
+        |args| {
+            check_arity!(args, "list/group-by", 2);
+            key_projection_call(
+                &args[0],
+                &args[1],
+                KeyProjectionMode::GroupBy { groups: Vec::new() },
+                "list/group-by",
+            )
+        },
+    );
 
     register_fn(env, "list/interleave", |args| {
         check_arity!(args, "list/interleave", 2..);
@@ -2673,16 +2810,31 @@ pub fn register(env: &sema_core::Env) {
     });
 
     // list/key-by — turn list of maps into map keyed by fn
-    register_fn(env, "list/key-by", |args| {
-        check_arity!(args, "list/key-by", 2);
-        let items = get_sequence(&args[1], "list/key-by")?;
-        let mut map = std::collections::BTreeMap::new();
-        for item in items.iter() {
-            let key = call_function(&args[0], &[item.clone()])?;
-            map.insert(key, item.clone());
-        }
-        Ok(Value::map(map))
-    });
+    register_hof(
+        env,
+        "list/key-by",
+        |args| {
+            check_arity!(args, "list/key-by", 2);
+            let items = get_sequence(&args[1], "list/key-by")?;
+            let mut map = BTreeMap::new();
+            for item in items.iter() {
+                let key = call_function(&args[0], &[item.clone()])?;
+                map.insert(key, item.clone());
+            }
+            Ok(Value::map(map))
+        },
+        |args| {
+            check_arity!(args, "list/key-by", 2);
+            key_projection_call(
+                &args[0],
+                &args[1],
+                KeyProjectionMode::KeyBy {
+                    keyed: BTreeMap::new(),
+                },
+                "list/key-by",
+            )
+        },
+    );
 
     // list/times — generate list by calling fn N times
     register_hof(
@@ -3173,6 +3325,39 @@ mod continuation_trace_tests {
         };
         // Predicate + current + one compact source handle + retained sole match.
         assert_eq!(edge_count(&sole), 4);
+    }
+
+    #[test]
+    fn key_projection_continuation_traces_inputs_and_outputs() {
+        let grouped = KeyProjectionContinuation {
+            hof: "list/group-by",
+            key_fn: Value::string("key-fn"),
+            current: Value::int(1),
+            remaining: PredicateItems::Retained {
+                source: Value::list(vec![Value::int(1), Value::int(2)]),
+                next: 1,
+            },
+            mode: KeyProjectionMode::GroupBy {
+                groups: vec![(Value::keyword("group"), vec![Value::int(3), Value::int(4)])],
+            },
+        };
+        // Key fn + current + compact source + group key + two grouped items.
+        assert_eq!(edge_count(&grouped), 6);
+
+        let keyed = KeyProjectionContinuation {
+            hof: "list/key-by",
+            key_fn: Value::string("key-fn"),
+            current: Value::int(1),
+            remaining: PredicateItems::Snapshot {
+                items: vec![Value::nil(), Value::int(2)],
+                next: 1,
+            },
+            mode: KeyProjectionMode::KeyBy {
+                keyed: BTreeMap::from([(Value::keyword("key"), Value::int(3))]),
+            },
+        };
+        // Key fn + current + one pending snapshot item + output key/item.
+        assert_eq!(edge_count(&keyed), 5);
     }
 
     #[test]

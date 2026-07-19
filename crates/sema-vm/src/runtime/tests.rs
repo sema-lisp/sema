@@ -1542,6 +1542,239 @@ fn forced_deadlock_settlement_aborts_external_wait_without_arming_a_resume() {
     assert!(events.lock().unwrap().is_empty());
 }
 
+fn force_deadlocked_root(runtime: &Runtime, handle: &RootHandle) {
+    assert!(runtime
+        .settle_deadlocked_root(handle.id())
+        .expect("forced deadlock cleanup succeeds"));
+    let RootPoll::Ready(settlement) = handle.poll_result() else {
+        panic!("forced deadlock root settles")
+    };
+    assert!(matches!(settlement.outcome, TaskOutcome::Failed(_)));
+}
+
+fn assert_persistent_runtime_accepts_fresh_root(runtime: &Runtime, expected: i64) {
+    let fresh = runtime
+        .submit_test_root(TestPreparedTask::returned(Value::int(expected)))
+        .expect("persistent runtime accepts a fresh root");
+    assert_eq!(drive_root_to_int(runtime, &fresh), expected);
+    for _ in 0..8 {
+        runtime
+            .drive(&drive_budget(8))
+            .expect("late cleanup wake is harmless");
+    }
+}
+
+#[test]
+fn forced_deadlock_cleanup_matrix_deregisters_every_protocol_wait_kind() {
+    // PromiseSet::Timeout owns both promise observations and a timer entry.
+    {
+        let clock = Rc::new(FakeClock::new());
+        let runtime = runtime_with_inline_executor(clock.clone());
+        let first = runtime.create_pending_promise_for_test();
+        let second = runtime.create_pending_promise_for_test();
+        let responses = Rc::new(RefCell::new(Vec::new()));
+        let blocked = runtime
+            .submit_test_root(TestPreparedTask::native(Ok(NativeOutcome::Runtime(
+                sema_core::runtime::RuntimeRequest::PromiseSetWait {
+                    wait: sema_core::runtime::PromiseSetWait {
+                        promises: vec![first, second],
+                        mode: sema_core::runtime::PromiseSetMode::Timeout(Duration::from_secs(60)),
+                    },
+                    continuation: Box::new(CaptureRuntimeContinuation(Rc::clone(&responses))),
+                },
+            ))))
+            .expect("promise-set root admitted");
+        while runtime.protocol_wait_count_for_test() == 0 || runtime.timer_count_for_test() == 0 {
+            runtime.drive(&drive_budget(1)).unwrap();
+        }
+
+        force_deadlocked_root(&runtime, &blocked);
+        assert_eq!(runtime.protocol_wait_count_for_test(), 0);
+        assert_eq!(runtime.timer_count_for_test(), 0);
+        runtime.settle_promise_for_test(first, TaskOutcome::Returned(Value::int(1)));
+        runtime.settle_promise_for_test(second, TaskOutcome::Returned(Value::int(2)));
+        clock.advance(Duration::from_secs(120));
+        assert_persistent_runtime_accepts_fresh_root(&runtime, 31);
+        assert!(responses.borrow().is_empty());
+    }
+
+    // A bare protocol timer must be physically removed from the timer queue.
+    {
+        let clock = Rc::new(FakeClock::new());
+        let runtime = runtime_with_inline_executor(clock.clone());
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let blocked = runtime
+            .submit_test_root(TestPreparedTask::native(Ok(NativeOutcome::Suspend(
+                NativeSuspend {
+                    wait: WaitKind::Timer(Duration::from_secs(60)),
+                    continuation: Box::new(CountingContinuation(Arc::clone(&events))),
+                },
+            ))))
+            .expect("timer root admitted");
+        while runtime.timer_count_for_test() == 0 {
+            runtime.drive(&drive_budget(1)).unwrap();
+        }
+
+        force_deadlocked_root(&runtime, &blocked);
+        assert_eq!(runtime.protocol_wait_count_for_test(), 0);
+        assert_eq!(runtime.timer_count_for_test(), 0);
+        clock.advance(Duration::from_secs(120));
+        assert_persistent_runtime_accepts_fresh_root(&runtime, 32);
+        assert!(events.lock().unwrap().is_empty());
+    }
+
+    // A channel waiter must leave the receiver FIFO before a later close.
+    {
+        let runtime = runtime_with_inline_executor(Rc::new(FakeClock::new()));
+        let channel = runtime.create_channel_for_test(0);
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let blocked = runtime
+            .submit_test_root(TestPreparedTask::native(Ok(NativeOutcome::Suspend(
+                NativeSuspend {
+                    wait: WaitKind::Channel(sema_core::runtime::ChannelWait::Receive { channel }),
+                    continuation: Box::new(CountingContinuation(Arc::clone(&events))),
+                },
+            ))))
+            .expect("channel root admitted");
+        while runtime.channel_receiver_queue_len_for_test(channel) == 0 {
+            runtime.drive(&drive_budget(1)).unwrap();
+        }
+
+        force_deadlocked_root(&runtime, &blocked);
+        assert_eq!(runtime.protocol_wait_count_for_test(), 0);
+        assert_eq!(runtime.channel_receiver_queue_len_for_test(channel), 0);
+        let close_events = Arc::new(Mutex::new(Vec::new()));
+        let closer = runtime
+            .submit_test_root(TestPreparedTask::native(Ok(NativeOutcome::Runtime(
+                sema_core::runtime::RuntimeRequest::ChannelOp {
+                    channel,
+                    operation: sema_core::runtime::ChannelOperation::Close,
+                    continuation: Box::new(CountingContinuation(Arc::clone(&close_events))),
+                },
+            ))))
+            .expect("channel closer admitted");
+        while matches!(closer.poll_result(), RootPoll::Pending) {
+            runtime.drive(&drive_budget(8)).unwrap();
+        }
+        assert_persistent_runtime_accepts_fresh_root(&runtime, 33);
+        assert!(events.lock().unwrap().is_empty());
+        assert_eq!(*close_events.lock().unwrap(), vec!["runtime"]);
+    }
+
+    // A queued resource-slot waiter must leave the gate FIFO before release.
+    {
+        let clock = Rc::new(FakeClock::new());
+        let runtime = runtime_with_inline_executor(clock.clone());
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let gate_slot = Rc::new(Cell::new(None));
+        let owner = runtime
+            .submit_test_root(TestPreparedTask::native(Ok(NativeOutcome::Runtime(
+                sema_core::runtime::RuntimeRequest::CreateResourceGate {
+                    continuation: Box::new(GateHoldOwner {
+                        gate_slot: Rc::clone(&gate_slot),
+                        events: Arc::clone(&events),
+                        stage: 0,
+                        gate: None,
+                    }),
+                },
+            ))))
+            .expect("gate owner admitted");
+        while gate_slot.get().is_none()
+            || runtime
+                .resource_gate_owner_for_test(gate_slot.get().expect("gate created"))
+                .is_none()
+            || runtime.timer_count_for_test() == 0
+        {
+            runtime.drive(&drive_budget(1)).unwrap();
+        }
+        let gate = gate_slot.get().expect("gate created");
+        let blocked = runtime
+            .submit_test_root(TestPreparedTask::native(Ok(NativeOutcome::Suspend(
+                NativeSuspend {
+                    wait: WaitKind::ResourceSlot(gate),
+                    continuation: Box::new(RecordGateGrant {
+                        label: "deadlocked",
+                        events: Arc::clone(&events),
+                    }),
+                },
+            ))))
+            .expect("resource waiter admitted");
+        while runtime.protocol_wait_count_for_test() < 2 {
+            runtime.drive(&drive_budget(1)).unwrap();
+        }
+
+        force_deadlocked_root(&runtime, &blocked);
+        assert_eq!(
+            runtime.protocol_wait_count_for_test(),
+            1,
+            "only the owner's hold timer remains"
+        );
+        clock.advance(Duration::from_secs(7200));
+        let mut turns = 0;
+        while matches!(owner.poll_result(), RootPoll::Pending) {
+            runtime.drive(&drive_budget(8)).unwrap();
+            turns += 1;
+            assert!(turns < 32, "gate owner releases and settles");
+        }
+        assert_eq!(runtime.resource_gate_owner_for_test(gate), None);
+        assert_eq!(runtime.protocol_wait_count_for_test(), 0);
+        assert!(events
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|event| event != "deadlocked-granted"));
+        assert_persistent_runtime_accepts_fresh_root(&runtime, 34);
+    }
+
+    // An origin barrier owns only its protocol entry and the aggregate count.
+    {
+        let clock = Rc::new(FakeClock::new());
+        let runtime = runtime_with_inline_executor(clock.clone());
+        let barrier_events = Arc::new(Mutex::new(Vec::new()));
+        let child_events = Arc::new(Mutex::new(Vec::new()));
+        let blocked = runtime
+            .submit_test_root(TestPreparedTask::native(Ok(NativeOutcome::Runtime(
+                sema_core::runtime::RuntimeRequest::OriginBarrier {
+                    continuation: Box::new(BarrierReleaseCont {
+                        events: Arc::clone(&barrier_events),
+                    }),
+                },
+            ))))
+            .expect("barrier root admitted");
+        runtime.submit_test_child_under_root(
+            blocked.id(),
+            TestPreparedTask::native(Ok(NativeOutcome::Suspend(NativeSuspend {
+                wait: WaitKind::Timer(Duration::from_secs(60)),
+                continuation: Box::new(CountingContinuation(Arc::clone(&child_events))),
+            }))),
+        );
+        while runtime.origin_barrier_wait_count_for_test() == 0
+            || runtime.timer_count_for_test() == 0
+        {
+            runtime.drive(&drive_budget(1)).unwrap();
+        }
+
+        force_deadlocked_root(&runtime, &blocked);
+        assert_eq!(runtime.origin_barrier_wait_count_for_test(), 0);
+        assert_eq!(
+            runtime.protocol_wait_count_for_test(),
+            1,
+            "only the child timer remains"
+        );
+        clock.advance(Duration::from_secs(120));
+        let mut turns = 0;
+        while runtime.live_task_count() > 0 {
+            runtime.drive(&drive_budget(8)).unwrap();
+            turns += 1;
+            assert!(turns < 32, "the surviving child timer settles");
+        }
+        assert_eq!(runtime.protocol_wait_count_for_test(), 0);
+        assert!(barrier_events.lock().unwrap().is_empty());
+        assert_eq!(*child_events.lock().unwrap(), vec!["returned"]);
+        assert_persistent_runtime_accepts_fresh_root(&runtime, 35);
+    }
+}
+
 fn runtime_with_inline_executor(clock: Rc<dyn RuntimeClock>) -> Runtime {
     Runtime::new(
         Rc::new(sema_core::EvalContext::new()),
@@ -1776,6 +2009,56 @@ fn runtime_command_handle_cancel_root_settles_debug_paused_root_without_resume()
     assert!(!runtime.is_debug_paused());
     let RootPoll::Ready(settlement) = handle.poll_result() else {
         panic!("debug-paused root settles without debug_resume")
+    };
+    assert!(matches!(
+        settlement.outcome,
+        TaskOutcome::Cancelled(CancelReason::HostStop)
+    ));
+}
+
+#[test]
+fn runtime_command_handle_cancel_root_settles_a_debug_paused_child() {
+    let runtime = runtime_with_inline_executor(Rc::new(FakeClock::new()));
+    let handle = runtime
+        .submit_test_root(TestPreparedTask::yield_forever())
+        .expect("root admitted");
+    let root = handle.id();
+    let child = runtime.submit_test_child_under_root(root, TestPreparedTask::debug_stop());
+
+    let mut turns = 0;
+    loop {
+        match runtime
+            .drive(&drive_budget(1))
+            .expect("drive reaches the child debug stop")
+        {
+            super::DriveState::DebugStopped { task, .. } => {
+                assert_eq!(task, child, "the child, not the root main, is paused");
+                break;
+            }
+            _ => {
+                turns += 1;
+                assert!(turns < 32, "child reaches its debug stop");
+            }
+        }
+    }
+
+    let commands = runtime.command_handle();
+    assert!(std::thread::spawn(move || commands.cancel_root(root))
+        .join()
+        .expect("command thread does not panic"));
+    let mut turns = 0;
+    while matches!(handle.poll_result(), RootPoll::Pending) || runtime.live_task_count() > 0 {
+        runtime
+            .drive(&drive_budget(8))
+            .expect("command cancellation clears the child-owned debug barrier");
+        turns += 1;
+        assert!(turns < 32, "root main and paused child both settle");
+    }
+
+    assert!(!runtime.is_debug_paused());
+    assert_eq!(runtime.live_task_count(), 0);
+    let RootPoll::Ready(settlement) = handle.poll_result() else {
+        panic!("root settles after its paused child is cancelled")
     };
     assert!(matches!(
         settlement.outcome,
@@ -4251,6 +4534,175 @@ impl NativeContinuation for RecordGateGrant {
             .push(format!("{}-{}", self.label, outcome));
         Ok(NativeOutcome::Return(Value::NIL))
     }
+}
+
+#[test]
+fn command_cancellation_settles_resource_waiter_after_close_wake_is_committed() {
+    let clock = Rc::new(FakeClock::new());
+    let runtime = runtime_with_inline_executor(clock);
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let gate_slot = Rc::new(Cell::new(None));
+
+    let owner = runtime
+        .submit_test_root(TestPreparedTask::native(Ok(NativeOutcome::Runtime(
+            sema_core::runtime::RuntimeRequest::CreateResourceGate {
+                continuation: Box::new(GateHoldOwner {
+                    gate_slot: Rc::clone(&gate_slot),
+                    events: Arc::clone(&events),
+                    stage: 0,
+                    gate: None,
+                }),
+            },
+        ))))
+        .expect("gate owner admitted");
+    while gate_slot.get().is_none()
+        || runtime
+            .resource_gate_owner_for_test(gate_slot.get().expect("gate created"))
+            .is_none()
+        || runtime.timer_count_for_test() == 0
+    {
+        runtime.drive(&drive_budget(1)).unwrap();
+    }
+    let gate = gate_slot.get().expect("gate created");
+
+    let waiter = runtime
+        .submit_test_root(TestPreparedTask::native(Ok(NativeOutcome::Suspend(
+            NativeSuspend {
+                wait: WaitKind::ResourceSlot(gate),
+                continuation: Box::new(RecordGateGrant {
+                    label: "waiter",
+                    events: Arc::clone(&events),
+                }),
+            },
+        ))))
+        .expect("gate waiter admitted");
+    while runtime.protocol_wait_count_for_test() < 2 {
+        runtime.drive(&drive_budget(1)).unwrap();
+    }
+
+    let closer = runtime
+        .submit_test_root(TestPreparedTask::native(Ok(NativeOutcome::Runtime(
+            sema_core::runtime::RuntimeRequest::CloseResourceGate {
+                gate,
+                continuation: Box::new(GateDone),
+            },
+        ))))
+        .expect("gate closer admitted");
+    let mut guard = 0;
+    while runtime.resource_gate_owner_for_test(gate).is_some() {
+        runtime.drive(&drive_budget(1)).unwrap();
+        guard += 1;
+        assert!(guard < 64, "close request must remove the gate");
+    }
+    assert!(
+        matches!(waiter.poll_result(), RootPoll::Pending),
+        "the one-item close turn leaves its Closed wake pending"
+    );
+
+    let commands = runtime.command_handle();
+    let waiter_root = waiter.id();
+    assert!(
+        std::thread::spawn(move || commands.cancel_root(waiter_root))
+            .join()
+            .expect("command thread does not panic")
+    );
+
+    let mut turns = 0;
+    while matches!(waiter.poll_result(), RootPoll::Pending) {
+        runtime
+            .drive(&drive_budget(1))
+            .expect("the committed Closed wake is a harmless late no-op");
+        turns += 1;
+        assert!(
+            turns < 64,
+            "command cancellation must not strand the closed-gate waiter"
+        );
+    }
+    let RootPoll::Ready(settlement) = waiter.poll_result() else {
+        panic!("cancelled gate waiter settles")
+    };
+    assert!(matches!(
+        settlement.outcome,
+        TaskOutcome::Cancelled(CancelReason::HostStop)
+    ));
+
+    let fresh = runtime
+        .submit_test_root(TestPreparedTask::returned(Value::int(23)))
+        .expect("persistent runtime accepts another root");
+    let mut turns = 0;
+    while matches!(fresh.poll_result(), RootPoll::Pending) {
+        runtime
+            .drive(&drive_budget(8))
+            .expect("late Closed wake cannot fault the persistent runtime");
+        turns += 1;
+        assert!(turns < 20, "fresh root settles");
+    }
+    assert!(matches!(closer.poll_result(), RootPoll::Ready(_)));
+    assert!(owner.cancel(CancelReason::Explicit));
+}
+
+#[test]
+fn wrong_runtime_resource_slot_teardown_aborts_instead_of_stranding() {
+    let runtime = runtime_with_inline_executor(Rc::new(FakeClock::new()));
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let gate_slot = Rc::new(Cell::new(None));
+    let owner = runtime
+        .submit_test_root(TestPreparedTask::native(Ok(NativeOutcome::Runtime(
+            sema_core::runtime::RuntimeRequest::CreateResourceGate {
+                continuation: Box::new(GateHoldOwner {
+                    gate_slot: Rc::clone(&gate_slot),
+                    events: Arc::clone(&events),
+                    stage: 0,
+                    gate: None,
+                }),
+            },
+        ))))
+        .expect("gate owner admitted");
+    while gate_slot.get().is_none()
+        || runtime
+            .resource_gate_owner_for_test(gate_slot.get().expect("gate created"))
+            .is_none()
+        || runtime.timer_count_for_test() == 0
+    {
+        runtime.drive(&drive_budget(1)).unwrap();
+    }
+    let gate = gate_slot.get().expect("gate created");
+
+    let waiter = runtime
+        .submit_test_root(TestPreparedTask::native(Ok(NativeOutcome::Suspend(
+            NativeSuspend {
+                wait: WaitKind::ResourceSlot(gate),
+                continuation: Box::new(RecordGateGrant {
+                    label: "waiter",
+                    events,
+                }),
+            },
+        ))))
+        .expect("gate waiter admitted");
+    while runtime.protocol_wait_count_for_test() < 2 {
+        runtime.drive(&drive_budget(1)).unwrap();
+    }
+
+    let foreign = runtime_with_inline_executor(Rc::new(FakeClock::new()));
+    let foreign_gate = foreign.create_resource_gate_for_test();
+    runtime.forge_resource_slot_gate_for_test(
+        waiter.main_task_for_test().expect("waiter task is live"),
+        foreign_gate,
+    );
+
+    assert!(waiter.cancel(CancelReason::Explicit));
+    let RootPoll::Aborted(super::RuntimeFault::Invariant { message }) = waiter.poll_result() else {
+        panic!("wrong-runtime teardown aborts the root with its invariant")
+    };
+    assert!(message.contains("WrongRuntime"), "{message}");
+    assert!(matches!(
+        owner.poll_result(),
+        RootPoll::Aborted(super::RuntimeFault::Invariant { .. })
+    ));
+    assert!(matches!(
+        runtime.drive(&drive_budget(1)),
+        Err(super::RuntimeFault::Invariant { message }) if message.contains("WrongRuntime")
+    ));
 }
 
 /// (c) A resource-gate acquirer that is cancelled AFTER being granted the slot but

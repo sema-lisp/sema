@@ -39,7 +39,7 @@ use super::RootHandle;
 use super::{
     AcquireResult, ChannelRegistry, ContinuationFrame, DriveBudget, DriveState, GateResult,
     PendingResume, PromiseRegistry, PromiseState, ReadyScheduler, RegisterExternalError,
-    ResourceGateRegistry, ResourceGateWake, RootRecord, RootState, RuntimeClock,
+    RegistryError, ResourceGateRegistry, ResourceGateWake, RootRecord, RootState, RuntimeClock,
     RuntimeCreateError, TaskRecord, TimerQueue, WaitRuntime,
 };
 
@@ -1642,53 +1642,47 @@ impl Runtime {
                         continue;
                     }
                 }
-                let wait = state
-                    .protocol_waits
-                    .remove(&key)
-                    .expect("selected protocol wait exists");
-                match &wait.kind {
-                    ProtocolWaitKind::Promises(set) => {
-                        for promise in &set.promises {
-                            let _ = state.promises.cancel_observation(*promise, key);
+                let resource_gate = match &wait.kind {
+                    ProtocolWaitKind::ResourceSlot { gate } => Some(*gate),
+                    _ => None,
+                };
+                let wait = if let Some(gate) = resource_gate {
+                    remove_resource_slot_wait(&mut state, task_id, key, gate)?.expect(
+                        "selected resource-slot protocol wait remains registered until teardown",
+                    )
+                } else {
+                    let wait = state
+                        .protocol_waits
+                        .remove(&key)
+                        .expect("selected protocol wait exists");
+                    match &wait.kind {
+                        ProtocolWaitKind::Promises(set) => {
+                            for promise in &set.promises {
+                                let _ = state.promises.cancel_observation(*promise, key);
+                            }
+                            if matches!(set.mode, sema_core::runtime::PromiseSetMode::Timeout(_)) {
+                                state.timers.cancel(key);
+                            }
                         }
-                        if matches!(set.mode, sema_core::runtime::PromiseSetMode::Timeout(_)) {
+                        ProtocolWaitKind::Timer => {
                             state.timers.cancel(key);
                         }
-                    }
-                    ProtocolWaitKind::Timer => {
-                        state.timers.cancel(key);
-                    }
-                    ProtocolWaitKind::Channel { channel, .. } => {
-                        let _ = state.channels.cancel_wait(*channel, key);
-                    }
-                    ProtocolWaitKind::ResourceSlot { gate } => {
-                        // A task cancelled while queued behind a busy gate: drop
-                        // it from the FIFO queue so a later `release` skips it.
-                        // (An owner cancelled mid-op releases the gate via its
-                        // module cancel hook, not here.) If it was already GRANTED
-                        // the slot (not in the queue — the gate owner) but never
-                        // ran its acquire continuation, release the gate here so
-                        // the next acquirer proceeds (no leak).
-                        let gate = *gate;
-                        let queued =
-                            state
-                                .resource_gates
-                                .cancel_wait(gate, key)
-                                .map_err(|error| RuntimeFault::Invariant {
-                                    message: format!("resource slot cancel failed: {error:?}"),
-                                })?;
-                        if !queued {
-                            let _ = state.resource_gates.take_wake(key);
-                            release_owned_gate(&mut state, gate)?;
+                        ProtocolWaitKind::Channel { channel, .. } => {
+                            let _ = state.channels.cancel_wait(*channel, key);
+                        }
+                        ProtocolWaitKind::ResourceSlot { .. } => {
+                            unreachable!("resource-slot teardown uses its transactional path")
+                        }
+                        ProtocolWaitKind::OriginBarrier { .. } => {
+                            // A cancelled `async/run` barrier: nothing external to tear
+                            // down (no timer/registry). Just drop the wait and let the
+                            // continuation raise on the cancellation below.
+                            state.origin_barrier_waits =
+                                state.origin_barrier_waits.saturating_sub(1);
                         }
                     }
-                    ProtocolWaitKind::OriginBarrier { .. } => {
-                        // A cancelled `async/run` barrier: nothing external to tear
-                        // down (no timer/registry). Just drop the wait and let the
-                        // continuation raise on the cancellation below.
-                        state.origin_barrier_waits = state.origin_barrier_waits.saturating_sub(1);
-                    }
-                }
+                    wait
+                };
                 let task = state.tasks.get_mut(&task_id).expect("selected task exists");
                 task.record
                     .reject_wait(key)
@@ -4356,6 +4350,19 @@ impl Runtime {
 
         {
             let mut state = self.state.borrow_mut();
+            let resource_gate = state.protocol_waits.get(&key).and_then(|wait| {
+                if let ProtocolWaitKind::ResourceSlot { gate } = &wait.kind {
+                    Some(*gate)
+                } else {
+                    None
+                }
+            });
+            if let Some(gate) = resource_gate {
+                remove_resource_slot_wait(&mut state, task_id, key, gate)?.expect(
+                    "selected resource-slot protocol wait remains registered until teardown",
+                );
+                return Ok(());
+            }
             if let Some(wait) = state.protocol_waits.remove(&key) {
                 match wait.kind {
                     ProtocolWaitKind::Promises(set) => {
@@ -4373,18 +4380,8 @@ impl Runtime {
                         let _ = state.channels.cancel_wait(channel, key);
                         let _ = state.channels.take_wake(key);
                     }
-                    ProtocolWaitKind::ResourceSlot { gate } => {
-                        let queued =
-                            state
-                                .resource_gates
-                                .cancel_wait(gate, key)
-                                .map_err(|error| RuntimeFault::Invariant {
-                                    message: format!("resource slot teardown failed: {error:?}"),
-                                })?;
-                        if !queued {
-                            let _ = state.resource_gates.take_wake(key);
-                            release_owned_gate(&mut state, gate)?;
-                        }
+                    ProtocolWaitKind::ResourceSlot { .. } => {
+                        unreachable!("resource-slot teardown uses its transactional path")
                     }
                     ProtocolWaitKind::OriginBarrier { .. } => {
                         state.origin_barrier_waits = state.origin_barrier_waits.saturating_sub(1);
@@ -4494,28 +4491,7 @@ impl Runtime {
     }
 
     pub(super) fn abort_terminal_state(&self, fault: &RuntimeFault) {
-        let (pending, protocol_waits, tasks) = {
-            let mut state = self.state.borrow_mut();
-            state.terminal_fault = Some(fault.clone());
-            let pending = std::mem::take(&mut state.pending);
-            state.ready = ReadyScheduler::new();
-            let mut newly_eligible = Vec::new();
-            for (id, root) in &mut state.roots {
-                if root.abort_running() && root.is_reap_eligible() {
-                    newly_eligible.push(*id);
-                }
-            }
-            state.handle_cleanup.extend(newly_eligible);
-            state.origin_barrier_waits = 0;
-            (
-                pending,
-                std::mem::take(&mut state.protocol_waits),
-                std::mem::take(&mut state.tasks),
-            )
-        };
-        drop(pending);
-        drop(protocol_waits);
-        drop(tasks);
+        abort_runtime_state(&self.state, fault);
     }
 
     pub fn close_for_interpreter_drop(&self) {
@@ -4586,6 +4562,37 @@ impl Runtime {
     #[cfg(test)]
     pub(super) fn resource_gate_owner_for_test(&self, gate: ResourceGateId) -> Option<TaskId> {
         self.state.borrow().resource_gates.owner_of(gate)
+    }
+
+    #[cfg(test)]
+    pub(super) fn create_resource_gate_for_test(&self) -> ResourceGateId {
+        self.state
+            .borrow_mut()
+            .resource_gates
+            .allocate()
+            .expect("test resource-gate identity")
+    }
+
+    #[cfg(test)]
+    pub(super) fn forge_resource_slot_gate_for_test(
+        &self,
+        task_id: TaskId,
+        replacement: ResourceGateId,
+    ) {
+        let mut state = self.state.borrow_mut();
+        let key = state
+            .tasks
+            .get(&task_id)
+            .and_then(|task| task.record.wait_key())
+            .expect("resource-slot task is waiting");
+        let wait = state
+            .protocol_waits
+            .get_mut(&key)
+            .expect("resource-slot protocol wait exists");
+        let ProtocolWaitKind::ResourceSlot { gate } = &mut wait.kind else {
+            panic!("task is waiting on a resource slot")
+        };
+        *gate = replacement;
     }
 
     #[cfg(test)]
@@ -4678,6 +4685,11 @@ impl Runtime {
     #[cfg(test)]
     pub(super) fn protocol_wait_count_for_test(&self) -> usize {
         self.state.borrow().protocol_waits.len()
+    }
+
+    #[cfg(test)]
+    pub(super) fn origin_barrier_wait_count_for_test(&self) -> usize {
+        self.state.borrow().origin_barrier_waits
     }
 
     #[cfg(test)]
@@ -4816,9 +4828,37 @@ pub(super) fn cancel_origin_root(
         (main_newly, targets)
     };
     for target in targets {
-        let _ = deliver_cancel_teardown(cell, target);
+        if let Err(fault) = deliver_cancel_teardown(cell, target) {
+            abort_runtime_state(cell, &fault);
+            break;
+        }
     }
     main_newly
+}
+
+fn abort_runtime_state(cell: &RefCell<RuntimeState>, fault: &RuntimeFault) {
+    let (pending, protocol_waits, tasks) = {
+        let mut state = cell.borrow_mut();
+        state.terminal_fault = Some(fault.clone());
+        let pending = std::mem::take(&mut state.pending);
+        state.ready = ReadyScheduler::new();
+        let mut newly_eligible = Vec::new();
+        for (id, root) in &mut state.roots {
+            if root.abort_running() && root.is_reap_eligible() {
+                newly_eligible.push(*id);
+            }
+        }
+        state.handle_cleanup.extend(newly_eligible);
+        state.origin_barrier_waits = 0;
+        (
+            pending,
+            std::mem::take(&mut state.protocol_waits),
+            std::mem::take(&mut state.tasks),
+        )
+    };
+    drop(pending);
+    drop(protocol_waits);
+    drop(tasks);
 }
 
 /// Transitively request cancellation of every live task whose cancellation-parent
@@ -4947,22 +4987,9 @@ fn eager_resource_slot_teardown(
     gate: ResourceGateId,
 ) -> Result<bool, RuntimeFault> {
     let mut state = cell.borrow_mut();
-    let Some(wait) = state.protocol_waits.remove(&key) else {
+    let Some(wait) = remove_resource_slot_wait(&mut state, task_id, key, gate)? else {
         return Ok(false);
     };
-    let queued = state
-        .resource_gates
-        .cancel_wait(gate, key)
-        .map_err(|error| RuntimeFault::Invariant {
-            message: format!("resource slot cancel failed: {error:?}"),
-        })?;
-    if !queued {
-        // Not in the queue: this task was granted the slot (it owns the gate) but
-        // has not run its acquire continuation. Release the gate for it and drop
-        // any buffered grant wake keyed to it.
-        let _ = state.resource_gates.take_wake(key);
-        release_owned_gate(&mut state, gate)?;
-    }
     state
         .tasks
         .get_mut(&task_id)
@@ -4979,6 +5006,88 @@ fn eager_resource_slot_teardown(
         Err(sema_core::SemaError::eval("protocol wait cancelled")),
     ));
     Ok(true)
+}
+
+/// Detach a resource-slot protocol wait only after its gate-side state has a
+/// complete teardown disposition. A queued waiter is removed from the FIFO; a
+/// waiter with committed ownership has that slot released; a gate removed by
+/// `close` is accepted only while its exact `Closed` wake is still pending.
+/// Registry identity errors and unwitnessed absence leave the protocol entry
+/// intact so the caller can surface the invariant without stranding the task.
+fn remove_resource_slot_wait(
+    state: &mut RuntimeState,
+    task_id: TaskId,
+    key: super::WaitKey,
+    gate: ResourceGateId,
+) -> Result<Option<ProtocolWait>, RuntimeFault> {
+    let Some(wait) = state.protocol_waits.get(&key) else {
+        return Ok(None);
+    };
+    if wait.task != task_id
+        || !matches!(wait.kind, ProtocolWaitKind::ResourceSlot { gate: wait_gate } if wait_gate == gate)
+        || state
+            .tasks
+            .get(&task_id)
+            .and_then(|task| task.record.wait_key())
+            != Some(key)
+    {
+        return Err(RuntimeFault::Invariant {
+            message: format!(
+                "resource slot teardown ownership mismatch for task {task_id:?}, wait {key:?}, gate {gate:?}"
+            ),
+        });
+    }
+
+    let closed_wake_pending = state.pending.iter().any(|stage| {
+        matches!(
+            stage,
+            PendingStage::ResourceGateWake(wake)
+                if wake.key == key
+                    && wake.task == task_id
+                    && wake.result == GateResult::Closed
+        )
+    });
+    if !closed_wake_pending {
+        match state.resource_gates.owner_gate(task_id) {
+            Some(owner_gate) if owner_gate == gate => {
+                // A grant was committed but its wake has not run. Releasing the
+                // live owner is infallible after the ownership check; any staged
+                // grant wake remains queued and becomes a harmless late no-op.
+                release_owned_gate(state, gate)?;
+            }
+            Some(owner_gate) => {
+                return Err(RuntimeFault::Invariant {
+                    message: format!(
+                        "resource slot task {task_id:?} owns {owner_gate:?}, not registered gate {gate:?}"
+                    ),
+                });
+            }
+            None => match state.resource_gates.cancel_wait(gate, key) {
+                Ok(true) => {}
+                Ok(false) => {
+                    return Err(RuntimeFault::Invariant {
+                        message: format!(
+                            "resource slot wait {key:?} is neither queued nor owned for gate {gate:?}"
+                        ),
+                    });
+                }
+                Err(RegistryError::Unknown) => {
+                    return Err(RuntimeFault::Invariant {
+                        message: format!(
+                            "resource slot gate {gate:?} disappeared without a pending Closed wake for task {task_id:?}, wait {key:?}"
+                        ),
+                    });
+                }
+                Err(error) => {
+                    return Err(RuntimeFault::Invariant {
+                        message: format!("resource slot teardown failed: {error:?}"),
+                    });
+                }
+            },
+        }
+    }
+
+    Ok(state.protocol_waits.remove(&key))
 }
 
 /// Eager teardown of a task parked on an External wait: run the executor cancel

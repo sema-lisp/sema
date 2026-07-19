@@ -442,6 +442,90 @@ fn captured_frame_subscription_releases_process_handler_at_teardown() {
 }
 
 #[test]
+fn retained_environment_does_not_retain_process_signal_ownership() {
+    let _guard = signal_test_guard();
+    let _restore = install_prior_sigwinch_handler();
+
+    let retained_env = {
+        let interp = Interpreter::new();
+        eval(
+            &interp,
+            "(begin
+               (define retained-signal-count 0)
+               (sys/on-signal :winch
+                 (fn ()
+                   (set! retained-signal-count
+                     (+ retained-signal-count 1)))))",
+        );
+        std::rc::Rc::clone(&interp.global_env)
+    };
+
+    let restored = current_sigwinch_action();
+    assert_eq!(
+        restored.sa_sigaction, prior_sigwinch_handler as *const () as libc::sighandler_t,
+        "interpreter teardown restores the prior handler while its env survives"
+    );
+    assert_ne!(
+        restored.sa_flags & libc::SA_RESTART,
+        0,
+        "interpreter teardown restores the prior flags"
+    );
+    // SAFETY: the successful sigaction query initialized `restored.sa_mask`.
+    assert_eq!(
+        unsafe { libc::sigismember(&restored.sa_mask, libc::SIGTERM) },
+        1,
+        "interpreter teardown restores the prior signal mask"
+    );
+
+    raise_sigwinch();
+    assert_eq!(PRIOR_SIGWINCH_CALLS.load(Ordering::Relaxed), 1);
+
+    let retained_env_guard = std::rc::Rc::clone(&retained_env);
+    let resumed_ctx = {
+        let fresh = Interpreter::new();
+        std::rc::Rc::clone(&fresh.ctx)
+    };
+    let resumed = Interpreter::from_parts(retained_env, resumed_ctx);
+    assert_eq!(eval(&resumed, "(sys/check-signals)"), Value::nil());
+    assert_eq!(eval(&resumed, "retained-signal-count"), Value::int(0));
+
+    eval(
+        &resumed,
+        "(sys/on-signal :winch
+           (fn ()
+             (set! retained-signal-count
+               (+ retained-signal-count 10))))",
+    );
+    assert_ne!(
+        current_sigwinch_action().sa_sigaction,
+        prior_sigwinch_handler as *const () as libc::sighandler_t,
+        "the retained builtin reacquires process ownership in its new interpreter"
+    );
+    raise_sigwinch();
+    assert_eq!(
+        PRIOR_SIGWINCH_CALLS.load(Ordering::Relaxed),
+        1,
+        "the resumed interpreter owns the process handler"
+    );
+    assert_eq!(eval(&resumed, "(sys/check-signals)"), Value::nil());
+    assert_eq!(
+        eval(&resumed, "retained-signal-count"),
+        Value::int(10),
+        "teardown cleared the old callback before the retained builtin registered a new one"
+    );
+
+    drop(resumed);
+    assert_eq!(
+        current_sigwinch_action().sa_sigaction,
+        prior_sigwinch_handler as *const () as libc::sighandler_t,
+        "the resumed interpreter releases ownership while the env still survives"
+    );
+    raise_sigwinch();
+    assert_eq!(PRIOR_SIGWINCH_CALLS.load(Ordering::Relaxed), 2);
+    drop(retained_env_guard);
+}
+
+#[test]
 fn callback_failure_is_fail_fast_and_consumes_the_signal_batch() {
     let _guard = signal_test_guard();
     let interp = Interpreter::new();

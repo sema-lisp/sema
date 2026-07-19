@@ -19,6 +19,8 @@ pub type CallCallbackFn = fn(&EvalContext, &Value, &[Value]) -> Result<Value, Se
 /// values out of it (leaving nil behind). See [`call_callback_owned`].
 pub type CallOwnedCallbackFn = fn(&EvalContext, &Value, &mut [Value]) -> Result<Value, SemaError>;
 
+type SignalTeardownHook = Box<dyn Fn()>;
+
 pub struct EvalContext {
     pub module_cache: RefCell<BTreeMap<PathBuf, BTreeMap<String, Value>>>,
     pub embedded_files: RefCell<BTreeMap<PathBuf, Vec<u8>>>,
@@ -44,6 +46,9 @@ pub struct EvalContext {
     /// This store is intentionally separate from task-local dynamic context:
     /// any root may dispatch a subscription installed by another root.
     signal_callbacks: RefCell<[Vec<Value>; 3]>,
+    /// Weak, non-Value hooks that release process signal leases at interpreter
+    /// teardown even when an embedder retains the global environment.
+    signal_teardown_hooks: RefCell<Vec<SignalTeardownHook>>,
     pub eval_fn: Cell<Option<EvalCallbackFn>>,
     pub call_fn: Cell<Option<CallCallbackFn>>,
     pub call_owned_fn: Cell<Option<CallOwnedCallbackFn>>,
@@ -97,6 +102,7 @@ impl EvalContext {
             hidden_context: RefCell::new(vec![BTreeMap::new()]),
             context_stacks: RefCell::new(BTreeMap::new()),
             signal_callbacks: RefCell::default(),
+            signal_teardown_hooks: RefCell::default(),
             eval_fn: Cell::new(None),
             call_fn: Cell::new(None),
             call_owned_fn: Cell::new(None),
@@ -125,6 +131,7 @@ impl EvalContext {
             hidden_context: RefCell::new(vec![BTreeMap::new()]),
             context_stacks: RefCell::new(BTreeMap::new()),
             signal_callbacks: RefCell::default(),
+            signal_teardown_hooks: RefCell::default(),
             eval_fn: Cell::new(None),
             call_fn: Cell::new(None),
             call_owned_fn: Cell::new(None),
@@ -216,6 +223,19 @@ impl EvalContext {
     #[doc(hidden)]
     pub fn signal_callbacks(&self, signal_index: usize) -> Vec<Value> {
         self.signal_callbacks.borrow()[signal_index].clone()
+    }
+
+    #[doc(hidden)]
+    pub fn register_signal_teardown_hook(&self, hook: impl Fn() + 'static) {
+        self.signal_teardown_hooks.borrow_mut().push(Box::new(hook));
+    }
+
+    #[doc(hidden)]
+    pub fn run_signal_teardown_hooks(&self) {
+        let hooks = self.signal_teardown_hooks.take();
+        for hook in hooks {
+            hook();
+        }
     }
 
     #[doc(hidden)]

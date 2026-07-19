@@ -148,6 +148,10 @@ impl Drop for Interpreter {
             let _ = runtime.shutdown(&options);
             drop(runtime);
         }
+        // Process signal leases belong to the interpreter lifetime, not the
+        // reachability of its global env. Embedders may retain `global_env`, so
+        // run the registry's weak teardown hooks before clearing Value roots.
+        self.ctx.run_signal_teardown_hooks();
         // `self.ctx` outlives this Drop body (fields drop after it), and its
         // caches hold Values: module-cache export closures keep their module
         // envs — and via the parent chain the ENTIRE global env — externally
@@ -164,8 +168,8 @@ impl Drop for Interpreter {
         // Once released, the only refs left are the Env⇄Closure cycle edges
         // from top-level `define`s, which the collector severs. No pins — the
         // dying env is exactly what must be traced. Anything still externally
-        // held (e.g. a user-kept `global_env` clone) survives, and the
-        // registry reclaims it at a later safe point once released.
+        // held (e.g. a user-kept `global_env` clone) survives without retaining
+        // process signal ownership.
         drop(std::mem::replace(&mut self.global_env, Rc::new(Env::new())));
         sema_core::gc_collect(&[], sema_core::GcTrigger::InterpreterDrop);
     }

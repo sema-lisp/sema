@@ -337,12 +337,16 @@ struct SignalRegistry {
     /// Installed kinds outlive callback roots so teardown can release every
     /// process-handler lease even after the callback store is cleared.
     installed: Cell<[bool; 3]>,
+    /// Exactly one weak teardown hook covers each live lease epoch. Releasing
+    /// the epoch resets this so a retained builtin can reacquire under a new
+    /// interpreter context.
+    teardown_hook_registered: Cell<bool>,
 }
 
 #[cfg(unix)]
 impl SignalRegistry {
     fn register(
-        &self,
+        self: &Rc<Self>,
         ctx: &sema_core::EvalContext,
         kind: SignalKind,
         callback: Value,
@@ -357,6 +361,14 @@ impl SignalRegistry {
             // are historical; a signal racing after it advances the generation
             // and is delivered on the next check.
             self.slots.borrow_mut()[index].seen_epoch = kind.epoch().load(Ordering::Relaxed);
+        }
+        if !self.teardown_hook_registered.replace(true) {
+            let registry = Rc::downgrade(self);
+            ctx.register_signal_teardown_hook(move || {
+                if let Some(registry) = registry.upgrade() {
+                    registry.release_installed_handlers();
+                }
+            });
         }
         ctx.register_signal_callback(index, callback);
         Ok(())
@@ -386,6 +398,7 @@ impl SignalRegistry {
     }
 
     fn release_installed_handlers(&self) {
+        self.teardown_hook_registered.set(false);
         let installed = self.installed.replace([false; 3]);
         for kind in SignalKind::ALL {
             if installed[kind.index()] {

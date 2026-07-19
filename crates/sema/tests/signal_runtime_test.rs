@@ -228,6 +228,48 @@ fn checking_one_interpreter_does_not_dispatch_another_interpreters_callbacks() {
 }
 
 #[test]
+fn subscription_registered_by_one_root_is_checked_by_another_root() {
+    let _guard = signal_test_guard();
+    let interp = Interpreter::new();
+    eval(&interp, "(define cross-root-events '())");
+
+    let registration = interp
+        .submit_str(
+            "(begin
+               (sys/on-signal :winch
+                 (fn ()
+                   (set! cross-root-events
+                     (append cross-root-events '(:delivered)))))
+               :registered)",
+            RootOptions::default(),
+        )
+        .expect("registration root admitted");
+    drive_until_settled(&interp, &registration);
+    assert!(matches!(
+        registration.poll_result(),
+        RootPoll::Ready(settlement)
+            if matches!(settlement.outcome, TaskOutcome::Returned(ref value)
+                if *value == Value::keyword("registered"))
+    ));
+
+    mark_sigwinch_pending();
+    let check = interp
+        .submit_str("(sys/check-signals)", RootOptions::default())
+        .expect("signal-check root admitted");
+    drive_until_settled(&interp, &check);
+    assert!(matches!(
+        check.poll_result(),
+        RootPoll::Ready(settlement)
+            if matches!(settlement.outcome, TaskOutcome::Returned(ref value)
+                if *value == Value::nil())
+    ));
+    assert_eq!(
+        eval(&interp, "cross-root-events"),
+        eval(&interp, "'(:delivered)")
+    );
+}
+
+#[test]
 fn callbacks_keep_registration_order_and_signal_events_coalesce() {
     let _guard = signal_test_guard();
     let interp = Interpreter::new();
@@ -321,6 +363,82 @@ fn callback_mutation_reaches_its_still_parked_defining_frame() {
     assert!(
         matches!(settlement.outcome, TaskOutcome::Returned(ref value) if *value == Value::int(42))
     );
+}
+
+#[test]
+fn captured_frame_subscription_releases_process_handler_at_teardown() {
+    let _guard = signal_test_guard();
+    let _restore = install_prior_sigwinch_handler();
+    {
+        let interp = Interpreter::new();
+        eval(&interp, "(define installer-gate (channel/new 1))");
+        let installer = interp
+            .submit_str(
+                "(let ((captured 40))
+                   (sys/on-signal :winch
+                     (fn () (set! captured (+ captured 2))))
+                   (channel/recv installer-gate)
+                   captured)",
+                RootOptions::default(),
+            )
+            .expect("installer root admitted");
+        drive_until_idle(&interp);
+
+        mark_sigwinch_pending();
+        assert_eq!(eval(&interp, "(sys/check-signals)"), Value::nil());
+        assert_eq!(
+            eval(&interp, "(channel/send installer-gate :go)"),
+            Value::nil()
+        );
+        let RootPoll::Ready(settlement) = installer.poll_result() else {
+            panic!("installer root settled after its gate was released")
+        };
+        assert!(
+            matches!(settlement.outcome, TaskOutcome::Returned(ref value) if *value == Value::int(42))
+        );
+    }
+
+    let restored = current_sigwinch_action();
+    assert_eq!(
+        restored.sa_sigaction, prior_sigwinch_handler as *const () as libc::sighandler_t,
+        "captured-frame interpreter teardown restores the prior handler"
+    );
+    raise_sigwinch();
+    assert_eq!(PRIOR_SIGWINCH_CALLS.load(Ordering::Relaxed), 1);
+
+    {
+        let interp = Interpreter::new();
+        eval(
+            &interp,
+            "(begin
+               (define replacement-signal-count 0)
+               (sys/on-signal :winch
+                 (fn ()
+                   (set! replacement-signal-count
+                     (+ replacement-signal-count 1)))))",
+        );
+        assert_ne!(
+            current_sigwinch_action().sa_sigaction,
+            prior_sigwinch_handler as *const () as libc::sighandler_t,
+            "a fresh first subscriber installs the Sema handler"
+        );
+        raise_sigwinch();
+        assert_eq!(
+            PRIOR_SIGWINCH_CALLS.load(Ordering::Relaxed),
+            1,
+            "the fresh subscription owns the process handler"
+        );
+        assert_eq!(eval(&interp, "(sys/check-signals)"), Value::nil());
+        assert_eq!(eval(&interp, "replacement-signal-count"), Value::int(1));
+    }
+
+    assert_eq!(
+        current_sigwinch_action().sa_sigaction,
+        prior_sigwinch_handler as *const () as libc::sighandler_t,
+        "the replacement registry also releases the final process lease"
+    );
+    raise_sigwinch();
+    assert_eq!(PRIOR_SIGWINCH_CALLS.load(Ordering::Relaxed), 2);
 }
 
 #[test]

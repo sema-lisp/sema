@@ -322,26 +322,31 @@ fn process_signal_ownership() -> &'static Mutex<[ProcessSignalOwnership; 3]> {
 #[cfg(unix)]
 #[derive(Default)]
 struct SignalSlot {
-    callbacks: Vec<Value>,
     seen_epoch: usize,
 }
 
 /// One interpreter's signal subscriptions. The two signal builtins in that
-/// interpreter's environment share this as a traced native payload; no process
-/// or thread-local cell owns callback `Value`s.
+/// interpreter's environment share this as a traced native payload. Callback
+/// `Value`s live in the interpreter-wide `EvalContext` signal store, which
+/// teardown clears before collecting its global environment; this host-only
+/// registry owns only process-handler leases and event cursors.
 #[cfg(unix)]
 #[derive(Default)]
 struct SignalRegistry {
     slots: RefCell<[SignalSlot; 3]>,
-    /// Process handler ownership is independent of callback edges: cycle
-    /// collection may sever `SignalSlot::callbacks` before this registry drops,
-    /// but teardown must still release every signal it installed.
+    /// Installed kinds outlive callback roots so teardown can release every
+    /// process-handler lease even after the callback store is cleared.
     installed: Cell<[bool; 3]>,
 }
 
 #[cfg(unix)]
 impl SignalRegistry {
-    fn register(&self, kind: SignalKind, callback: Value) -> Result<(), SemaError> {
+    fn register(
+        &self,
+        ctx: &sema_core::EvalContext,
+        kind: SignalKind,
+        callback: Value,
+    ) -> Result<(), SemaError> {
         let index = kind.index();
         let mut installed = self.installed.get();
         if !installed[index] {
@@ -353,14 +358,17 @@ impl SignalRegistry {
             // and is delivered on the next check.
             self.slots.borrow_mut()[index].seen_epoch = kind.epoch().load(Ordering::Relaxed);
         }
-        self.slots.borrow_mut()[index].callbacks.push(callback);
+        ctx.register_signal_callback(index, callback);
         Ok(())
     }
 
     /// Consume this interpreter's current generation snapshot and clone its
     /// callback batch in stable signal/registration order. The borrow ends
     /// before any callback runs, so callbacks may register more callbacks.
-    fn take_pending_callbacks(&self) -> Result<VecDeque<Value>, SemaError> {
+    fn take_pending_callbacks(
+        &self,
+        ctx: &sema_core::EvalContext,
+    ) -> Result<VecDeque<Value>, SemaError> {
         let observed = SignalKind::ALL.map(|kind| kind.epoch().load(Ordering::Relaxed));
         let mut slots = self.slots.try_borrow_mut().map_err(|_| {
             SemaError::eval("sys/check-signals: signal registry is already borrowed")
@@ -369,24 +377,28 @@ impl SignalRegistry {
         for kind in SignalKind::ALL {
             let index = kind.index();
             let slot = &mut slots[index];
-            if !slot.callbacks.is_empty() && slot.seen_epoch != observed[index] {
+            if self.installed.get()[index] && slot.seen_epoch != observed[index] {
                 slot.seen_epoch = observed[index];
-                callbacks.extend(slot.callbacks.iter().cloned());
+                callbacks.extend(ctx.signal_callbacks(index));
             }
         }
         Ok(callbacks)
+    }
+
+    fn release_installed_handlers(&self) {
+        let installed = self.installed.replace([false; 3]);
+        for kind in SignalKind::ALL {
+            if installed[kind.index()] {
+                kind.release();
+            }
+        }
     }
 }
 
 #[cfg(unix)]
 impl Drop for SignalRegistry {
     fn drop(&mut self) {
-        let installed = self.installed.get();
-        for kind in SignalKind::ALL {
-            if installed[kind.index()] {
-                kind.release();
-            }
-        }
+        self.release_installed_handlers();
     }
 }
 
@@ -442,11 +454,11 @@ fn dispatch_signal_callbacks(mut callbacks: VecDeque<Value>) -> NativeResult {
 #[cfg(unix)]
 fn check_signals(
     registry: &SignalRegistry,
-    _context: &mut NativeCallContext<'_>,
+    context: &mut NativeCallContext<'_>,
     args: &[Value],
 ) -> NativeResult {
     check_arity!(args, "sys/check-signals", 0);
-    dispatch_signal_callbacks(registry.take_pending_callbacks()?)
+    dispatch_signal_callbacks(registry.take_pending_callbacks(context.eval_context)?)
 }
 
 /// Reports the one strong payload edge owned by the NativeFn currently being
@@ -467,7 +479,7 @@ fn signal_registry_payload_tracer(
 }
 
 #[cfg(unix)]
-fn trace_signal_registry(ptr: sema_core::NodePtr, sink: &mut dyn FnMut(GcEdge<'_>)) -> bool {
+fn trace_signal_registry(ptr: sema_core::NodePtr, _sink: &mut dyn FnMut(GcEdge<'_>)) -> bool {
     // SAFETY: payload tracing supplied the data pointer of a live
     // `Rc<SignalRegistry>`; the collector retains traced allocations through
     // the complete pass.
@@ -475,9 +487,7 @@ fn trace_signal_registry(ptr: sema_core::NodePtr, sink: &mut dyn FnMut(GcEdge<'_
     let Ok(slots) = registry.slots.try_borrow() else {
         return false;
     };
-    for callback in slots.iter().flat_map(|slot| &slot.callbacks) {
-        sink(GcEdge::Value(callback));
-    }
+    drop(slots);
     true
 }
 
@@ -486,12 +496,9 @@ fn sever_signal_registry(ptr: sema_core::NodePtr) -> Option<Value> {
     // SAFETY: see `trace_signal_registry`; severing runs while the same opaque
     // allocation remains retained by the collector.
     let registry = unsafe { &*(ptr.raw() as *const SignalRegistry) };
-    let mut slots = registry.slots.try_borrow_mut().ok()?;
-    let callbacks = slots
-        .iter_mut()
-        .flat_map(|slot| std::mem::take(&mut slot.callbacks))
-        .collect();
-    Some(Value::list(callbacks))
+    let _slots = registry.slots.try_borrow_mut().ok()?;
+    registry.release_installed_handlers();
+    Some(Value::nil())
 }
 
 // ─── Signal handlers: only allowed to use async-signal-safe operations ───────
@@ -1148,13 +1155,13 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
         env.set(
             sema_core::intern("sys/on-signal"),
             Value::native_fn(
-                NativeFn::with_payload("sys/on-signal", on_signal_payload, move |_ctx, args| {
+                NativeFn::with_payload("sys/on-signal", on_signal_payload, move |ctx, args| {
                     check_arity!(args, "sys/on-signal", 2);
                     let kind = SignalKind::from_value(&args[0])?;
                     let registry = on_signal_registry.upgrade().ok_or_else(|| {
                         SemaError::eval("internal error: sys/on-signal registry is unavailable")
                     })?;
-                    registry.register(kind, args[1].clone())?;
+                    registry.register(ctx, kind, args[1].clone())?;
                     Ok(Value::nil())
                 })
                 .with_escaping_args(&[1]),

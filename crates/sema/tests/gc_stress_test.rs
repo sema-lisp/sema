@@ -1184,9 +1184,9 @@ fn zero_upvalue_env_cycle_collected_via_env_candidate() {
 #[cfg(unix)]
 #[test]
 fn signal_registry_callback_cycle_collected_at_interpreter_teardown() {
-    // The interpreter env owns the signal builtins, their shared registry
-    // payload owns this callback, and the callback points back to its home env.
-    // Dropping the interpreter must trace and sever that complete cycle.
+    // EvalContext roots the callback interpreter-wide, and the callback points
+    // back to its home env. Teardown must clear that root before collecting the
+    // env and its signal-registry payload.
     let weak_bindings = {
         let interp = Interpreter::new();
         interp

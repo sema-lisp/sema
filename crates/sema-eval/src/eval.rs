@@ -157,6 +157,7 @@ impl Drop for Interpreter {
         self.ctx.user_context.borrow_mut().clear();
         self.ctx.hidden_context.borrow_mut().clear();
         self.ctx.context_stacks.borrow_mut().clear();
+        self.ctx.clear_signal_callbacks();
         // Release this interpreter's own strong ref to the env BEFORE the
         // teardown collection: with it held, the env wrapper carries an
         // external count and trial deletion (correctly) keeps the whole env.

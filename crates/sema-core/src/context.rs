@@ -40,6 +40,10 @@ pub struct EvalContext {
     pub user_context: RefCell<Vec<BTreeMap<Value, Value>>>,
     pub hidden_context: RefCell<Vec<BTreeMap<Value, Value>>>,
     pub context_stacks: RefCell<BTreeMap<Value, Vec<Value>>>,
+    /// Interpreter-wide roots for callbacks registered by `sys/on-signal`.
+    /// This store is intentionally separate from task-local dynamic context:
+    /// any root may dispatch a subscription installed by another root.
+    signal_callbacks: RefCell<[Vec<Value>; 3]>,
     pub eval_fn: Cell<Option<EvalCallbackFn>>,
     pub call_fn: Cell<Option<CallCallbackFn>>,
     pub call_owned_fn: Cell<Option<CallOwnedCallbackFn>>,
@@ -92,6 +96,7 @@ impl EvalContext {
             user_context: RefCell::new(vec![BTreeMap::new()]),
             hidden_context: RefCell::new(vec![BTreeMap::new()]),
             context_stacks: RefCell::new(BTreeMap::new()),
+            signal_callbacks: RefCell::default(),
             eval_fn: Cell::new(None),
             call_fn: Cell::new(None),
             call_owned_fn: Cell::new(None),
@@ -119,6 +124,7 @@ impl EvalContext {
             user_context: RefCell::new(vec![BTreeMap::new()]),
             hidden_context: RefCell::new(vec![BTreeMap::new()]),
             context_stacks: RefCell::new(BTreeMap::new()),
+            signal_callbacks: RefCell::default(),
             eval_fn: Cell::new(None),
             call_fn: Cell::new(None),
             call_owned_fn: Cell::new(None),
@@ -200,6 +206,23 @@ impl EvalContext {
 
     pub fn take_task_context(&self) -> Option<TaskContextHandle> {
         self.task_context.borrow_mut().take()
+    }
+
+    #[doc(hidden)]
+    pub fn register_signal_callback(&self, signal_index: usize, callback: Value) {
+        self.signal_callbacks.borrow_mut()[signal_index].push(callback);
+    }
+
+    #[doc(hidden)]
+    pub fn signal_callbacks(&self, signal_index: usize) -> Vec<Value> {
+        self.signal_callbacks.borrow()[signal_index].clone()
+    }
+
+    #[doc(hidden)]
+    pub fn clear_signal_callbacks(&self) {
+        for callbacks in self.signal_callbacks.borrow_mut().iter_mut() {
+            callbacks.clear();
+        }
     }
 
     pub fn push_file_path(&self, path: PathBuf) {

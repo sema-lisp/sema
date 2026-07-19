@@ -460,6 +460,68 @@ fn step_plan(args: &[Value]) -> Result<ThunkPlan<Option<StepTeardown>>, SemaErro
     })
 }
 
+/// Scalar state needed after a checkpoint write thunk settles. The live workflow
+/// context is re-fetched in `finish_checkpoint`; retaining it here would also retain
+/// its state bag of GC-visible `Value`s outside the collector's trace graph.
+struct CheckpointTeardown {
+    key: String,
+    resume_key: String,
+}
+
+fn checkpoint_plan(args: &[Value]) -> Result<ThunkPlan<CheckpointTeardown>, SemaError> {
+    if args.is_empty() || args.len() > 2 {
+        return Err(SemaError::arity("workflow/checkpoint", "1-2", args.len()));
+    }
+    let key = as_name(&args[0])
+        .ok_or_else(|| SemaError::type_error("keyword or string", args[0].type_name()))?;
+    let ctx =
+        context::current().ok_or_else(|| SemaError::eval("checkpoint outside a workflow/run"))?;
+
+    if args.len() == 1 {
+        return Ok(ThunkPlan::Immediate(
+            ctx.read_checkpoint(&key).unwrap_or_else(Value::nil),
+        ));
+    }
+
+    // Advancing the occurrence ordinal precedes the resume lookup, so memo hits
+    // and misses consume the same body-order key.
+    let resume_key = ctx.checkpoint_content_key(&key, &ctx.cur_phase_label());
+    if ctx.resuming() {
+        if let Some(value) = ctx.memo_lookup(&resume_key) {
+            ctx.store_checkpoint(&key, value.clone());
+            return Ok(ThunkPlan::Immediate(value));
+        }
+    }
+
+    Ok(ThunkPlan::Run {
+        thunk: args[1].clone(),
+        teardown: CheckpointTeardown { key, resume_key },
+    })
+}
+
+fn finish_checkpoint(
+    teardown: CheckpointTeardown,
+    result: Result<Value, SemaError>,
+) -> Result<Value, SemaError> {
+    let value = result?;
+    let Some(ctx) = context::current() else {
+        return Ok(value);
+    };
+    ctx.store_checkpoint(&teardown.key, value.clone());
+    let digest = ctx.value_digest(&value);
+    ctx.emit(WorkflowEvent::Checkpoint {
+        seq: ctx.next_seq(),
+        ts: ctx.ts(),
+        phase_seq: ctx.phase_seq(),
+        key: teardown.key,
+        content_key: teardown.resume_key.clone(),
+        value_digest: digest,
+        value: capped_render(&value),
+    });
+    ctx.memo_store(&teardown.resume_key, &value);
+    Ok(value)
+}
+
 /// Post-thunk teardown state for `workflow/run`. Holds the scope guard (dropped last,
 /// after `run.ended` + `result.json`) and any open MCP handles to close (the handles are
 /// `Value`s — traced).
@@ -802,50 +864,15 @@ pub fn register(env: &sema_core::Env) {
     // event; (workflow/checkpoint :k) reads the stored value (nil if unset). The
     // public (checkpoint :k v) macro delays v into the thunk, so a resume memo hit can
     // skip evaluating the write expression entirely.
-    crate::register_fn(env, "workflow/checkpoint", |args| {
-        if args.is_empty() || args.len() > 2 {
-            return Err(SemaError::arity("workflow/checkpoint", "1-2", args.len()));
-        }
-        let key = as_name(&args[0])
-            .ok_or_else(|| SemaError::type_error("keyword or string", args[0].type_name()))?;
-        let ctx = context::current()
-            .ok_or_else(|| SemaError::eval("checkpoint outside a workflow/run"))?;
-
-        if args.len() == 2 {
-            // Resume short-circuit: a memoized checkpoint returns the recorded value,
-            // seeds the state bag (so later `(checkpoint :k)` reads see it), and skips
-            // evaluating the write thunk / re-emitting the checkpoint event. The key
-            // advances its occurrence ordinal on every run (computed before the resume
-            // check) to stay in body order.
-            let resume_key = ctx.checkpoint_content_key(&key, &ctx.cur_phase_label());
-            if ctx.resuming() {
-                if let Some(v) = ctx.memo_lookup(&resume_key) {
-                    ctx.store_checkpoint(&key, v.clone());
-                    return Ok(v);
-                }
-            }
-            // Write miss: evaluate, store, journal, return the value (so it threads
-            // through `let`).
-            let value = crate::list::call_function(&args[1], &[])?;
-            ctx.store_checkpoint(&key, value.clone());
-            let digest = ctx.value_digest(&value);
-            ctx.emit(WorkflowEvent::Checkpoint {
-                seq: ctx.next_seq(),
-                ts: ctx.ts(),
-                phase_seq: ctx.phase_seq(),
-                key: key.clone(),
-                content_key: resume_key.clone(),
-                value_digest: digest,
-                value: capped_render(&value), // the real checkpointed value, for the dashboard
-            });
-            // Memoize for a future --resume (round-trip-guarded; outside journal borrow).
-            ctx.memo_store(&resume_key, &value);
-            Ok(value)
-        } else {
-            // Read: return the stored value or nil.
-            Ok(ctx.read_checkpoint(&key).unwrap_or_else(Value::nil))
-        }
-    });
+    register_thunk_fn(
+        env,
+        "workflow/checkpoint",
+        checkpoint_plan,
+        finish_checkpoint,
+        |_teardown, _sink| {
+            // Checkpoint teardown retains only the key and content-key strings.
+        },
+    );
 
     // (workflow/mcp-handle alias) — the resolved MCP connection handle for a
     // declared `:mcp` alias (a symbol or keyword). Only meaningful once
@@ -979,5 +1006,18 @@ mod continuation_tests {
         let mut edges = 0usize;
         assert!(empty.trace(&mut |_| edges += 1));
         assert_eq!(edges, 0, "a teardown with no Value must expose no edges");
+
+        let checkpoint = ThunkContinuation::<CheckpointTeardown> {
+            teardown: Some(CheckpointTeardown {
+                key: "key".into(),
+                resume_key: "content-key".into(),
+            }),
+            finish: finish_checkpoint,
+            trace_teardown: |_teardown, _sink| {},
+            name: "workflow/checkpoint",
+        };
+        let mut edges = 0usize;
+        assert!(checkpoint.trace(&mut |_| edges += 1));
+        assert_eq!(edges, 0, "checkpoint teardown must expose no Value edges");
     }
 }

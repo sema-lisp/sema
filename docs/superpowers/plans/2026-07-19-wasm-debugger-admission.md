@@ -14,6 +14,7 @@
 - A legacy debugger on interpreter A must not block Promise work on interpreter B.
 - Legacy debugger methods on interpreter B must not inspect, replace, resume, stop, or mutate interpreter A's session.
 - A dead legacy-session owner must be cancelled and evicted rather than treated as a permanently live foreign owner.
+- Registered JavaScript callbacks may re-enter debugger and Promise APIs during macro expansion or runtime driving without a `RefCell` borrow panic or ownership gap.
 - Legacy `debugStart` must reject before stopping a session, clearing output, parsing, macro expansion, compilation, or root submission.
 - Source evaluation, compiled entry submission/adoption, and Promise debugger start must all enforce admission.
 - Preserve unrelated worktree changes and stage only owned files.
@@ -128,6 +129,8 @@ When legacy `debugStart` submits its root, store `owner: Rc::downgrade(&self.inn
 Add `DebugSession::is_owned_by` and use it in every legacy session operation. A foreign `debugStart` returns `status: "error"` before calling `self.debug_stop`; foreign continue/poll return the existing no-session error, stop and breakpoint updates are no-ops, locals returns null, stack returns an empty array, and `debugIsActive` returns false.
 
 Classify weak owners as `Same`, `Foreign`, or `Dead`. Evict and cancel `Dead` sessions before admission, and add `Drop for WasmInterpreter` to cancel/remove the wrapper's owned legacy session. Unit-test that a dead weak owner is not classified as foreign.
+
+Represent the global slot as `Starting`, `Active`, or `Driving`. Reserve `Starting` before parse/expansion and recheck after replacement cleanup and expansion. Move the `DebugSession` out of the slot for `runtime.drive`, leaving a `Driving` owner/root reservation with a reentrant stop flag, then restore or cancel after the drive returns. Browser-test registered JavaScript callbacks from both expansion and a debugged native call.
 
 - [ ] **Step 2: Add exact Promise-driver admission predicates**
 

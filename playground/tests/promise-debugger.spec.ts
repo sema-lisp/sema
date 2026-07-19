@@ -224,3 +224,30 @@ test('compiled root adoption cancels before rejecting an admission conflict', ()
   expect(cancel).toBeGreaterThan(admission);
   expect(cancel).toBeLessThan(insert);
 });
+
+test('legacy debugStart reserves before replacement cleanup and expansion', () => {
+  const source = readFileSync(path.join(REPO_ROOT, 'crates/sema-wasm/src/lib.rs'), 'utf8');
+  const start = source.indexOf('pub fn debug_start(');
+  const end = source.indexOf('fn debug_drive(', start);
+  const method = source.slice(start, end);
+  const reserve = method.indexOf('reserve_legacy_debug_start');
+  const replacementCancel = method.indexOf('cancel_debug_root');
+  const recheck = method.indexOf('start_reservation.ensure_pending()', replacementCancel);
+  const parse = method.indexOf('read_many_with_spans');
+  const expand = method.indexOf('expand_for_vm_batch');
+  expect(reserve).toBeGreaterThan(-1);
+  expect(reserve).toBeLessThan(replacementCancel);
+  expect(replacementCancel).toBeLessThan(recheck);
+  expect(recheck).toBeLessThan(parse);
+  expect(parse).toBeLessThan(expand);
+});
+
+test('legacy debug_drive never holds the global slot across runtime.drive', () => {
+  const source = readFileSync(path.join(REPO_ROOT, 'crates/sema-wasm/src/lib.rs'), 'utf8');
+  const start = source.indexOf('fn debug_drive(');
+  const end = source.indexOf('#[wasm_bindgen(js_name = debugContinue)]', start);
+  const method = source.slice(start, end);
+  expect(method).toContain('take_legacy_debug_session_for_drive');
+  expect(method).toContain('runtime.drive(&budget)');
+  expect(method).not.toContain('DEBUG_SESSION');
+});

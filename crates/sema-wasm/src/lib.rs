@@ -70,6 +70,49 @@ impl DebugSession {
     }
 }
 
+/// Thread-local legacy debugger ownership without a borrow spanning user code.
+/// `Starting` closes admission before macro expansion; `Driving` retains root
+/// identity/cancellation while `DebugSession` lives on `debug_drive`'s stack.
+enum LegacyDebugSlot {
+    Starting {
+        owner: Weak<sema_eval::Interpreter>,
+        stop_requested: bool,
+    },
+    Active(Box<DebugSession>),
+    Driving {
+        owner: Weak<sema_eval::Interpreter>,
+        handle: sema_vm::runtime::RootHandle,
+        stop_requested: bool,
+    },
+}
+
+impl LegacyDebugSlot {
+    fn owner(&self) -> &Weak<sema_eval::Interpreter> {
+        match self {
+            Self::Starting { owner, .. } | Self::Driving { owner, .. } => owner,
+            Self::Active(session) => &session.owner,
+        }
+    }
+
+    fn is_owned_by(&self, interp: &Rc<sema_eval::Interpreter>) -> bool {
+        weak_owner_relation(self.owner(), interp) == OwnerRelation::Same
+    }
+
+    fn cancel_without_drive(self) {
+        match self {
+            Self::Active(session) => {
+                let _ = session
+                    .handle
+                    .cancel(sema_core::runtime::CancelReason::HostStop);
+            }
+            Self::Driving { handle, .. } => {
+                let _ = handle.cancel(sema_core::runtime::CancelReason::HostStop);
+            }
+            Self::Starting { .. } => {}
+        }
+    }
+}
+
 fn cancel_debug_root(runtime: &sema_vm::runtime::Runtime, handle: &sema_vm::runtime::RootHandle) {
     handle.cancel(sema_core::runtime::CancelReason::HostStop);
     let budget = sema_vm::runtime::DriveBudget::host_default();
@@ -87,18 +130,16 @@ fn cancel_debug_root(runtime: &sema_vm::runtime::Runtime, handle: &sema_vm::runt
 }
 
 thread_local! {
-    static DEBUG_SESSION: RefCell<Option<DebugSession>> = const { RefCell::new(None) };
+    static DEBUG_SESSION: RefCell<Option<LegacyDebugSlot>> = const { RefCell::new(None) };
 }
 
 fn legacy_debug_owner_for(interp: &Rc<sema_eval::Interpreter>) -> Option<OwnerRelation> {
     DEBUG_SESSION.with(|slot| {
         let mut slot = slot.borrow_mut();
-        let relation = weak_owner_relation(&slot.as_ref()?.owner, interp);
+        let relation = weak_owner_relation(slot.as_ref()?.owner(), interp);
         if relation == OwnerRelation::Dead {
             let stale = slot.take().expect("legacy debug session disappeared");
-            let _ = stale
-                .handle
-                .cancel(sema_core::runtime::CancelReason::HostStop);
+            stale.cancel_without_drive();
             None
         } else {
             Some(relation)
@@ -110,22 +151,253 @@ fn legacy_debug_active_for(interp: &Rc<sema_eval::Interpreter>) -> bool {
     legacy_debug_owner_for(interp) == Some(OwnerRelation::Same)
 }
 
-fn foreign_legacy_debug_active_for(interp: &Rc<sema_eval::Interpreter>) -> bool {
-    legacy_debug_owner_for(interp) == Some(OwnerRelation::Foreign)
+struct LegacyStartReservation {
+    owner: Weak<sema_eval::Interpreter>,
+    armed: bool,
 }
 
-fn take_legacy_debug_session_for(interp: &Rc<sema_eval::Interpreter>) -> Option<DebugSession> {
+impl LegacyStartReservation {
+    fn ensure_pending(&self) -> Result<(), &'static str> {
+        DEBUG_SESSION.with(|slot| {
+            let slot = slot.borrow();
+            match slot.as_ref() {
+                Some(LegacyDebugSlot::Starting {
+                    owner,
+                    stop_requested: false,
+                }) if Weak::ptr_eq(owner, &self.owner) => Ok(()),
+                Some(LegacyDebugSlot::Starting {
+                    owner,
+                    stop_requested: true,
+                }) if Weak::ptr_eq(owner, &self.owner) => {
+                    Err("synchronous debug start was stopped by a reentrant callback")
+                }
+                _ => Err("synchronous debug start lost its ownership reservation"),
+            }
+        })
+    }
+
+    fn activate(&mut self, session: Box<DebugSession>) -> Result<(), Box<DebugSession>> {
+        let activated = DEBUG_SESSION.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            let ready = matches!(
+                slot.as_ref(),
+                Some(LegacyDebugSlot::Starting {
+                    owner,
+                    stop_requested: false,
+                }) if Weak::ptr_eq(owner, &self.owner)
+            );
+            if ready {
+                *slot = Some(LegacyDebugSlot::Active(session));
+                Ok(())
+            } else {
+                Err(session)
+            }
+        });
+        if activated.is_ok() {
+            self.armed = false;
+        }
+        activated
+    }
+}
+
+impl Drop for LegacyStartReservation {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        DEBUG_SESSION.with(|slot| {
+            let Ok(mut slot) = slot.try_borrow_mut() else {
+                return;
+            };
+            let owned_start = matches!(
+                slot.as_ref(),
+                Some(LegacyDebugSlot::Starting { owner, .. })
+                    if Weak::ptr_eq(owner, &self.owner)
+            );
+            if owned_start {
+                slot.take();
+            }
+        });
+    }
+}
+
+fn reserve_legacy_debug_start(
+    interp: &Rc<sema_eval::Interpreter>,
+) -> Result<(LegacyStartReservation, Option<Box<DebugSession>>), &'static str> {
     DEBUG_SESSION.with(|slot| {
-        let mut session = slot.try_borrow_mut().ok()?;
-        if session
-            .as_ref()
-            .is_some_and(|session| session.is_owned_by(interp))
-        {
-            session.take()
-        } else {
-            None
+        let mut slot = slot.borrow_mut();
+        if let Some(existing) = slot.as_ref() {
+            match weak_owner_relation(existing.owner(), interp) {
+                OwnerRelation::Foreign => {
+                    return Err("another interpreter has an active synchronous debug session");
+                }
+                OwnerRelation::Same => match existing {
+                    LegacyDebugSlot::Active(_) => {}
+                    LegacyDebugSlot::Starting { .. } | LegacyDebugSlot::Driving { .. } => {
+                        return Err(
+                            "a synchronous debug start or drive is already active on this interpreter",
+                        );
+                    }
+                },
+                OwnerRelation::Dead => {
+                    slot.take()
+                        .expect("legacy debug session disappeared")
+                        .cancel_without_drive();
+                }
+            }
+        }
+
+        let replaced = match slot.take() {
+            Some(LegacyDebugSlot::Active(session)) => Some(session),
+            None => None,
+            Some(other) => {
+                *slot = Some(other);
+                return Err("synchronous debug start could not reserve its session");
+            }
+        };
+        let owner = Rc::downgrade(interp);
+        *slot = Some(LegacyDebugSlot::Starting {
+            owner: owner.clone(),
+            stop_requested: false,
+        });
+        Ok((
+            LegacyStartReservation { owner, armed: true },
+            replaced,
+        ))
+    })
+}
+
+enum LegacyStopAction {
+    Cancel(Box<DebugSession>),
+    Requested,
+    None,
+}
+
+fn request_legacy_debug_stop(interp: &Rc<sema_eval::Interpreter>) -> LegacyStopAction {
+    DEBUG_SESSION.with(|slot| {
+        let Ok(mut slot) = slot.try_borrow_mut() else {
+            return LegacyStopAction::None;
+        };
+        let Some(session) = slot.as_mut() else {
+            return LegacyStopAction::None;
+        };
+        if !session.is_owned_by(interp) {
+            return LegacyStopAction::None;
+        }
+        match session {
+            LegacyDebugSlot::Starting { stop_requested, .. }
+            | LegacyDebugSlot::Driving { stop_requested, .. } => {
+                *stop_requested = true;
+                LegacyStopAction::Requested
+            }
+            LegacyDebugSlot::Active(_) => match slot.take() {
+                Some(LegacyDebugSlot::Active(session)) => LegacyStopAction::Cancel(session),
+                _ => unreachable!("active legacy debug session changed under one borrow"),
+            },
         }
     })
+}
+
+fn take_legacy_debug_session_for_drive(
+    interp: &Rc<sema_eval::Interpreter>,
+) -> Option<Box<DebugSession>> {
+    DEBUG_SESSION.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        let active = matches!(
+            slot.as_ref(),
+            Some(LegacyDebugSlot::Active(session)) if session.is_owned_by(interp)
+        );
+        if !active {
+            return None;
+        }
+        let Some(LegacyDebugSlot::Active(session)) = slot.take() else {
+            unreachable!("checked active legacy debug session");
+        };
+        *slot = Some(LegacyDebugSlot::Driving {
+            owner: session.owner.clone(),
+            handle: session.handle.clone(),
+            stop_requested: false,
+        });
+        Some(session)
+    })
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LegacyDriveReservation {
+    Continue,
+    Stop,
+    Lost,
+}
+
+fn legacy_drive_reservation(
+    interp: &Rc<sema_eval::Interpreter>,
+    root: sema_core::runtime::RootId,
+) -> LegacyDriveReservation {
+    DEBUG_SESSION.with(|slot| {
+        let slot = slot.borrow();
+        match slot.as_ref() {
+            Some(LegacyDebugSlot::Driving {
+                owner,
+                handle,
+                stop_requested,
+            }) if handle.id() == root
+                && weak_owner_relation(owner, interp) == OwnerRelation::Same =>
+            {
+                if *stop_requested {
+                    LegacyDriveReservation::Stop
+                } else {
+                    LegacyDriveReservation::Continue
+                }
+            }
+            _ => LegacyDriveReservation::Lost,
+        }
+    })
+}
+
+fn restore_legacy_debug_session_after_drive(
+    interp: &Rc<sema_eval::Interpreter>,
+    session: Box<DebugSession>,
+) -> Result<(), Box<DebugSession>> {
+    let root = session.handle.id();
+    DEBUG_SESSION.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        let restorable = matches!(
+            slot.as_ref(),
+            Some(LegacyDebugSlot::Driving {
+                owner,
+                handle,
+                stop_requested: false,
+            }) if handle.id() == root
+                && weak_owner_relation(owner, interp) == OwnerRelation::Same
+        );
+        if restorable {
+            *slot = Some(LegacyDebugSlot::Active(session));
+            Ok(())
+        } else {
+            Err(session)
+        }
+    })
+}
+
+fn clear_legacy_drive_reservation(
+    interp: &Rc<sema_eval::Interpreter>,
+    root: sema_core::runtime::RootId,
+) {
+    DEBUG_SESSION.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        let owned = matches!(
+            slot.as_ref(),
+            Some(LegacyDebugSlot::Driving {
+                owner,
+                handle,
+                ..
+            }) if handle.id() == root
+                && weak_owner_relation(owner, interp) == OwnerRelation::Same
+        );
+        if owned {
+            slot.take();
+        }
+    });
 }
 
 const VFS_MAX_TOTAL_BYTES: usize = 16 * 1024 * 1024; // 16 MB total
@@ -1550,7 +1822,7 @@ pub struct WasmInterpreter {
 
 impl Drop for WasmInterpreter {
     fn drop(&mut self) {
-        if let Some(session) = take_legacy_debug_session_for(&self.inner) {
+        if let LegacyStopAction::Cancel(session) = request_legacy_debug_stop(&self.inner) {
             let _ = session
                 .handle
                 .cancel(sema_core::runtime::CancelReason::HostStop);
@@ -2023,18 +2295,24 @@ impl WasmInterpreter {
     /// Returns JSON: { status: "stopped"|"finished"|"error", ... }
     #[wasm_bindgen(js_name = debugStart)]
     pub fn debug_start(&self, code: &str, breakpoint_lines: &js_sys::Array) -> JsValue {
-        if foreign_legacy_debug_active_for(&self.inner) {
-            return self
-                .debug_error_str("another interpreter has an active synchronous debug session");
-        }
         if self.promise_driver.has_active_roots() {
             return self.debug_error_str(
                 "the synchronous debugger cannot start while Promise-driven execution is active on this interpreter",
             );
         }
+        let (mut start_reservation, replaced_session) =
+            match reserve_legacy_debug_start(&self.inner) {
+                Ok(reservation) => reservation,
+                Err(message) => return self.debug_error_str(message),
+            };
+        if let Some(session) = replaced_session {
+            cancel_debug_root(self.inner.runtime(), &session.handle);
+        }
+        if let Err(message) = start_reservation.ensure_pending() {
+            return self.debug_error_str(message);
+        }
         // The debugger always executes on the VM, so a `(load ...)` runs the
         // loaded body on the VM regardless of which eval the playground ran last.
-        self.debug_stop();
         OUTPUT.with(|o| o.borrow_mut().clear());
         LINE_BUF.with(|b| b.borrow_mut().clear());
         // Reset the loop-guard step counter so the limit is per debug session.
@@ -2060,6 +2338,9 @@ impl WasmInterpreter {
             Ok(v) => v.into_iter().filter(|e| !e.is_nil()).collect(),
             Err(e) => return self.debug_error_result(&e),
         };
+        if let Err(message) = start_reservation.ensure_pending() {
+            return self.debug_error_str(message);
+        }
         if expanded.is_empty() {
             return self.debug_finished_result(&sema_core::Value::nil());
         }
@@ -2097,6 +2378,9 @@ impl WasmInterpreter {
         vm.seed_main_frame(prog.closure);
 
         let runtime = self.inner.runtime();
+        if let Err(message) = start_reservation.ensure_pending() {
+            return self.debug_error_str(message);
+        }
         if runtime.is_debug_paused() {
             return self.debug_error_str("Another debug session is already paused");
         }
@@ -2139,13 +2423,16 @@ impl WasmInterpreter {
             Ok(handle) => handle,
             Err(e) => return self.debug_error_str(&format!("debug root submission failed: {e:?}")),
         };
-        DEBUG_SESSION.with(|s| {
-            *s.borrow_mut() = Some(DebugSession {
-                owner: Rc::downgrade(&self.inner),
-                debug,
-                handle,
-            });
+        let session = Box::new(DebugSession {
+            owner: Rc::downgrade(&self.inner),
+            debug,
+            handle,
         });
+        if let Err(session) = start_reservation.activate(session) {
+            cancel_debug_root(runtime, &session.handle);
+            return self
+                .debug_error_str("synchronous debug start was stopped before root activation");
+        }
         attach_bp_info(self.debug_drive())
     }
 
@@ -2157,86 +2444,125 @@ impl WasmInterpreter {
     /// cleared. Bounded so a pathological program returns "yielded" rather than
     /// spinning the browser thread.
     fn debug_drive(&self) -> JsValue {
-        DEBUG_SESSION.with(|s| {
-            let mut session = s.borrow_mut();
-            let Some(ref mut sess) = *session else {
-                return self.debug_error_str("No active debug session");
-            };
-            if !sess.is_owned_by(&self.inner) {
-                return self.debug_error_str("No active debug session for this interpreter");
-            }
-            let runtime = self.inner.runtime();
-            let budget = sema_vm::runtime::DriveBudget::host_default();
-            for _ in 0..4_096 {
-                match sess.handle.poll_result() {
-                    sema_vm::runtime::RootPoll::Ready(settlement) => {
-                        let result = match &settlement.outcome {
-                            sema_core::runtime::TaskOutcome::Returned(v) => {
-                                self.debug_finished_result(v)
-                            }
-                            sema_core::runtime::TaskOutcome::Failed(e) => {
-                                self.debug_error_result(e)
-                            }
-                            sema_core::runtime::TaskOutcome::Cancelled(r) => {
-                                self.debug_error_str(&format!("debug run cancelled: {r:?}"))
-                            }
-                        };
-                        *session = None;
-                        return result;
-                    }
-                    sema_vm::runtime::RootPoll::Pending => {}
-                    sema_vm::runtime::RootPoll::Aborted(fault) => {
-                        *session = None;
-                        return self.debug_error_str(&format!("debug root aborted: {fault:?}"));
-                    }
-                    sema_vm::runtime::RootPoll::RuntimeDropped
-                    | sema_vm::runtime::RootPoll::InvariantViolation => {
-                        *session = None;
-                        return self.debug_error_str("debug runtime invariant violation");
-                    }
-                }
-                sess.debug.instructions_remaining = WASM_DEBUG_INSTRUCTION_BUDGET;
-                let root = sess.handle.id();
-                let state = {
-                    let _guard = sema_vm::ActiveDebugGuard::enter_for_root(&mut sess.debug, root);
-                    match runtime.drive(&budget) {
-                        Ok(state) => state,
-                        Err(fault) => {
-                            drop(_guard);
-                            *session = None;
-                            return self.debug_error_str(&format!("runtime fault: {fault:?}"));
+        let Some(mut session) = take_legacy_debug_session_for_drive(&self.inner) else {
+            return self.debug_error_str("No active debug session for this interpreter");
+        };
+        let runtime = self.inner.runtime();
+        let root = session.handle.id();
+        let budget = sema_vm::runtime::DriveBudget::host_default();
+        for _ in 0..4_096 {
+            match session.handle.poll_result() {
+                sema_vm::runtime::RootPoll::Ready(settlement) => {
+                    clear_legacy_drive_reservation(&self.inner, root);
+                    return match &settlement.outcome {
+                        sema_core::runtime::TaskOutcome::Returned(value) => {
+                            self.debug_finished_result(value)
                         }
-                    }
-                };
-                match state {
-                    sema_vm::runtime::DriveState::DebugStopped {
-                        root: stopped_root,
-                        info,
-                        ..
-                    } if stopped_root == root => {
-                        return self.debug_stopped_result(&info);
-                    }
-                    sema_vm::runtime::DriveState::DebugStopped { .. } => {
-                        cancel_debug_root(runtime, &sess.handle);
-                        *session = None;
-                        return self.debug_error_str(
-                            "another debug root paused this runtime; use the Promise debugger methods",
-                        );
-                    }
-                    sema_vm::runtime::DriveState::Progress { .. }
-                    | sema_vm::runtime::DriveState::Quiescent
-                    | sema_vm::runtime::DriveState::ShutdownComplete => {}
-                    sema_vm::runtime::DriveState::Idle { .. } => {
-                        cancel_debug_root(runtime, &sess.handle);
-                        *session = None;
-                        return self.debug_error_str(
-                            "synchronous debug APIs cannot suspend; use debugStartPromise and the Promise debugger methods",
-                        );
+                        sema_core::runtime::TaskOutcome::Failed(error) => {
+                            self.debug_error_result(error)
+                        }
+                        sema_core::runtime::TaskOutcome::Cancelled(reason) => {
+                            self.debug_error_str(&format!("debug run cancelled: {reason:?}"))
+                        }
+                    };
+                }
+                sema_vm::runtime::RootPoll::Pending => {}
+                sema_vm::runtime::RootPoll::Aborted(fault) => {
+                    clear_legacy_drive_reservation(&self.inner, root);
+                    return self.debug_error_str(&format!("debug root aborted: {fault:?}"));
+                }
+                sema_vm::runtime::RootPoll::RuntimeDropped
+                | sema_vm::runtime::RootPoll::InvariantViolation => {
+                    clear_legacy_drive_reservation(&self.inner, root);
+                    return self.debug_error_str("debug runtime invariant violation");
+                }
+            }
+
+            session.debug.instructions_remaining = WASM_DEBUG_INSTRUCTION_BUDGET;
+            let state = {
+                let _guard = sema_vm::ActiveDebugGuard::enter_for_root(&mut session.debug, root);
+                runtime.drive(&budget)
+            };
+            let state = match state {
+                Ok(state) => state,
+                Err(fault) => {
+                    clear_legacy_drive_reservation(&self.inner, root);
+                    return self.debug_error_str(&format!("runtime fault: {fault:?}"));
+                }
+            };
+
+            match legacy_drive_reservation(&self.inner, root) {
+                LegacyDriveReservation::Continue => {}
+                LegacyDriveReservation::Stop => {
+                    cancel_debug_root(runtime, &session.handle);
+                    clear_legacy_drive_reservation(&self.inner, root);
+                    return self.debug_error_str(
+                        "synchronous debug run was stopped by a reentrant callback",
+                    );
+                }
+                LegacyDriveReservation::Lost => {
+                    cancel_debug_root(runtime, &session.handle);
+                    clear_legacy_drive_reservation(&self.inner, root);
+                    return self
+                        .debug_error_str("synchronous debug run lost its ownership reservation");
+                }
+            }
+
+            match state {
+                sema_vm::runtime::DriveState::DebugStopped {
+                    root: stopped_root,
+                    info,
+                    ..
+                } if stopped_root == root => {
+                    let result = self.debug_stopped_result(&info);
+                    return match restore_legacy_debug_session_after_drive(&self.inner, session) {
+                        Ok(()) => result,
+                        Err(session) => {
+                            cancel_debug_root(runtime, &session.handle);
+                            clear_legacy_drive_reservation(&self.inner, root);
+                            self.debug_error_str(
+                                "synchronous debug run could not restore its session",
+                            )
+                        }
+                    };
+                }
+                sema_vm::runtime::DriveState::DebugStopped { .. } => {
+                    cancel_debug_root(runtime, &session.handle);
+                    clear_legacy_drive_reservation(&self.inner, root);
+                    return self.debug_error_str(
+                        "another debug root paused this runtime; use the Promise debugger methods",
+                    );
+                }
+                sema_vm::runtime::DriveState::Progress { .. }
+                | sema_vm::runtime::DriveState::Quiescent
+                | sema_vm::runtime::DriveState::ShutdownComplete => {}
+                sema_vm::runtime::DriveState::Idle { .. } => {
+                    cancel_debug_root(runtime, &session.handle);
+                    clear_legacy_drive_reservation(&self.inner, root);
+                    return self.debug_error_str(
+                        "synchronous debug APIs cannot suspend; use debugStartPromise and the Promise debugger methods",
+                    );
+                }
+            }
+        }
+
+        match legacy_drive_reservation(&self.inner, root) {
+            LegacyDriveReservation::Continue => {
+                match restore_legacy_debug_session_after_drive(&self.inner, session) {
+                    Ok(()) => self.debug_yielded_result(),
+                    Err(session) => {
+                        cancel_debug_root(runtime, &session.handle);
+                        clear_legacy_drive_reservation(&self.inner, root);
+                        self.debug_error_str("synchronous debug run could not restore its session")
                     }
                 }
             }
-            self.debug_yielded_result()
-        })
+            LegacyDriveReservation::Stop | LegacyDriveReservation::Lost => {
+                cancel_debug_root(runtime, &session.handle);
+                clear_legacy_drive_reservation(&self.inner, root);
+                self.debug_error_str("synchronous debug run was stopped during execution")
+            }
+        }
     }
 
     #[wasm_bindgen(js_name = debugContinue)]
@@ -2272,9 +2598,11 @@ impl WasmInterpreter {
 
     #[wasm_bindgen(js_name = debugStop)]
     pub fn debug_stop(&self) {
-        let session = take_legacy_debug_session_for(&self.inner);
-        if let Some(session) = session {
-            cancel_debug_root(self.inner.runtime(), &session.handle);
+        match request_legacy_debug_stop(&self.inner) {
+            LegacyStopAction::Cancel(session) => {
+                cancel_debug_root(self.inner.runtime(), &session.handle);
+            }
+            LegacyStopAction::Requested | LegacyStopAction::None => {}
         }
     }
 
@@ -2282,7 +2610,7 @@ impl WasmInterpreter {
     pub fn debug_get_locals(&self) -> JsValue {
         DEBUG_SESSION.with(|s| {
             let session = s.borrow();
-            let Some(ref session) = *session else {
+            let Some(LegacyDebugSlot::Active(session)) = session.as_ref() else {
                 return JsValue::NULL;
             };
             if !session.is_owned_by(&self.inner) {
@@ -2316,7 +2644,7 @@ impl WasmInterpreter {
     pub fn debug_get_stack_trace(&self) -> JsValue {
         DEBUG_SESSION.with(|s| {
             let session = s.borrow();
-            let Some(ref session) = *session else {
+            let Some(LegacyDebugSlot::Active(session)) = session.as_ref() else {
                 return js_sys::Array::new().into();
             };
             if !session.is_owned_by(&self.inner) {
@@ -2393,7 +2721,7 @@ impl WasmInterpreter {
             .filter_map(|v| v.as_f64().map(|n| n as u32))
             .collect();
         DEBUG_SESSION.with(|s| {
-            if let Some(ref mut sess) = *s.borrow_mut() {
+            if let Some(LegacyDebugSlot::Active(sess)) = s.borrow_mut().as_mut() {
                 if !sess.is_owned_by(&self.inner) {
                     return;
                 }
@@ -3184,7 +3512,9 @@ impl WasmInterpreter {
         let runtime = self.inner.runtime();
         let root = DEBUG_SESSION.with(|slot| {
             let mut session = slot.borrow_mut();
-            let sess = session.as_mut()?;
+            let LegacyDebugSlot::Active(sess) = session.as_mut()? else {
+                return None;
+            };
             if !sess.is_owned_by(&self.inner) {
                 return None;
             }

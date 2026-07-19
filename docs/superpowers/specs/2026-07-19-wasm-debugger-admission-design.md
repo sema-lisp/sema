@@ -8,6 +8,10 @@ Each legacy `DebugSession` records a weak reference to its `Interpreter`. Admiss
 
 The legacy session slot remains single-session for compatibility, but every legacy operation verifies ownership. Start on interpreter B rejects while A owns the slot; continue, poll, stop, locals, stack trace, active-state, and breakpoint calls on B act as though B has no session. They cannot resume, cancel, inspect, replace, or mutate A's session.
 
+The slot is an explicit `Starting` / `Active` / `Driving` state machine. `debugStart` installs `Starting` before parsing or macro expansion, so a registered JavaScript function invoked by expansion sees the reservation and cannot admit Promise work or another interpreter's debugger. `debug_drive` moves the full session to its stack and leaves only a lightweight `Driving` reservation in the slot before executing VM code. No `DEBUG_SESSION` borrow crosses macro expansion, runtime driving, or cancellation cleanup.
+
+Reentrant legacy operations are phase-safe. Starting/driving sessions report active ownership, reject continue/poll/start, return empty inspection data, and ignore breakpoint updates. Reentrant stop records intent in the reservation; the outer start checks it before compilation/submission, and the outer drive reconciles it immediately after the runtime returns, cancelling before a stopped root can be restored.
+
 Dropping a `WasmInterpreter` cancels and removes its legacy session. Admission also distinguishes a live foreign owner from a dead `Weak`: a stale session is cancelled and evicted before a new legacy root may be submitted, so garbage collection cannot permanently reserve the thread-local slot or leave a live root to be overwritten.
 
 The Promise driver exposes whether it owns any ordinary, active-debug, or retiring-debug roots. This includes all roots that its selected drive may need to settle or retire.
@@ -36,4 +40,6 @@ Browser tests cover:
 2. A pending `evalPromise` before legacy `debugStart`: the legacy start rejects before expansion or submission, the Promise settles once, and no rejected debugger body runs later.
 3. A legacy debugger on interpreter A while interpreter B runs `evalPromise`: B proceeds normally and A remains independently resumable.
 4. Legacy debugger operations on interpreter B cannot observe, replace, stop, or mutate interpreter A's session.
-5. Existing Promise-debugger concurrency tests remain green.
+5. JavaScript callbacks invoked during macro expansion cannot admit a Promise root or overwrite the starting debugger.
+6. JavaScript callbacks invoked from a driven debug root can re-enter every legacy API without a borrow panic; reentrant stop cancels deterministically without a late body mutation.
+7. Existing Promise-debugger concurrency tests remain green.

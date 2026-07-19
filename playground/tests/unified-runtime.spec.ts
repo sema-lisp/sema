@@ -794,6 +794,181 @@ test('legacy debugger operations on interpreter B cannot mutate interpreter A se
   expect(result.finishedA2).toMatchObject({ status: 'finished', value: '3' });
 });
 
+test('legacy debugStart reserves its owner across macro-expansion JS re-entry', async ({ page }) => {
+  await page.goto('/');
+
+  const result = await page.evaluate(async () => {
+    // @ts-expect-error -- resolved by the dev server at runtime, not by tsc
+    const mod = await import('/pkg/sema_wasm.js');
+    await mod.default();
+    const interpA = new mod.SemaInterpreter();
+    const interpB = new mod.SemaInterpreter();
+    let nestedRoot: number | null = null;
+    let nestedPromise: Promise<{ value: string | null; error: string | null }> | undefined;
+    let foreignStart: Record<string, unknown> | null = null;
+    let activeDuringStart: boolean | null = null;
+    let continueDuringStart: Record<string, unknown> | null = null;
+    let localsDuringStart: unknown = 'not-called';
+    let stackDuringStart: unknown = 'not-called';
+
+    interpA.registerFunction('reenter-debug-start', () => {
+      nestedPromise = interpA
+        .evalPromise(
+          '(context/set :macro-reentrant-promise-ran 1)',
+          (root: number) => { nestedRoot = root; },
+        )
+        .then(
+          (value: string) => ({ value, error: null }),
+          (error: Error) => ({ value: null, error: error.message }),
+        );
+      foreignStart = interpB.debugStart(
+        '(defmacro foreign-start-admission-leak () 9)\n(+ 1 2)',
+        [],
+      );
+      activeDuringStart = interpA.debugIsActive();
+      continueDuringStart = interpA.debugContinue();
+      localsDuringStart = interpA.debugGetLocals();
+      stackDuringStart = interpA.debugGetStackTrace();
+      interpA.debugSetBreakpoints([99]);
+      return null;
+    });
+
+    const outer = interpA.debugStart(
+      "(defmacro trigger-reentrant-start () (reenter-debug-start) '(+ 1 2))\n" +
+        '(trigger-reentrant-start)',
+      [],
+    );
+    const nested = nestedPromise
+      ? await nestedPromise
+      : { value: null, error: 'macro callback did not return' };
+    const finished = outer.status === 'stopped' ? interpA.debugContinue() : outer;
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    const nestedProbe = interpA.evalVM('(context/get :macro-reentrant-promise-ran)');
+    const foreignMacroProbe = interpB.evalVM('(foreign-start-admission-leak)');
+    interpA.debugStop();
+    interpB.debugStop();
+    return {
+      nestedRoot,
+      nested,
+      foreignStart,
+      activeDuringStart,
+      continueDuringStart,
+      localsDuringStart,
+      stackDuringStart,
+      outer,
+      finished,
+      nestedProbe,
+      foreignMacroProbe,
+    };
+  });
+
+  expect(result.nestedRoot).toBeNull();
+  expect(result.nested.value).toBeNull();
+  expect(result.nested.error).toContain('synchronous debugger');
+  expect(result.foreignStart).toMatchObject({ status: 'error' });
+  expect(result.activeDuringStart).toBe(true);
+  expect(result.continueDuringStart).toMatchObject({ status: 'error' });
+  expect(result.localsDuringStart).toBeNull();
+  expect(result.stackDuringStart).toEqual([]);
+  expect(result.outer).toMatchObject({ status: 'stopped' });
+  expect(result.finished).toMatchObject({ status: 'finished', value: '3' });
+  expect(result.nestedProbe).toMatchObject({ value: null, error: null });
+  expect(result.foreignMacroProbe.value).toBeNull();
+  expect(result.foreignMacroProbe.error.toLowerCase()).toContain('unbound variable');
+});
+
+test('legacy debug drive permits callback re-entry without borrowing or orphaning roots', async ({ page }) => {
+  await page.goto('/');
+
+  const result = await page.evaluate(async () => {
+    // @ts-expect-error -- resolved by the dev server at runtime, not by tsc
+    const mod = await import('/pkg/sema_wasm.js');
+    await mod.default();
+    const interpA = new mod.SemaInterpreter();
+    const interpB = new mod.SemaInterpreter();
+    let nestedRoot: number | null = null;
+    let nestedPromise: Promise<{ value: string | null; error: string | null }> | undefined;
+    let foreignStart: Record<string, unknown> | null = null;
+    let activeDuringDrive: boolean | null = null;
+    let continueDuringDrive: Record<string, unknown> | null = null;
+    let pollDuringDrive: Record<string, unknown> | null = null;
+    let localsDuringDrive: unknown = 'not-called';
+    let stackDuringDrive: unknown = 'not-called';
+
+    interpA.registerFunction('reenter-debug-drive', () => {
+      nestedPromise = interpA
+        .evalPromise(
+          '(context/set :drive-reentrant-promise-ran 1)',
+          (root: number) => { nestedRoot = root; },
+        )
+        .then(
+          (value: string) => ({ value, error: null }),
+          (error: Error) => ({ value: null, error: error.message }),
+        );
+      foreignStart = interpB.debugStart('(context/set :foreign-drive-debugger-ran 1)', []);
+      activeDuringDrive = interpA.debugIsActive();
+      continueDuringDrive = interpA.debugContinue();
+      pollDuringDrive = interpA.debugPoll();
+      localsDuringDrive = interpA.debugGetLocals();
+      stackDuringDrive = interpA.debugGetStackTrace();
+      interpA.debugSetBreakpoints([99]);
+      interpA.debugStop();
+      return 41;
+    });
+
+    const outer = interpA.debugStart(
+      '(reenter-debug-drive)\n(context/set :outer-drive-body-ran 1)\n42',
+      [2],
+    );
+    const nested = nestedPromise
+      ? await nestedPromise
+      : { value: null, error: 'drive callback did not return' };
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    const promiseProbe = interpA.evalVM('(context/get :drive-reentrant-promise-ran)');
+    const outerProbe = interpA.evalVM('(context/get :outer-drive-body-ran)');
+    const foreignProbe = interpB.evalVM('(context/get :foreign-drive-debugger-ran)');
+    const activeAfter = interpA.debugIsActive();
+    const reusableEntry = interpA.debugStart('(+ 1 2)', []);
+    const reusableFinished = interpA.debugContinue();
+    interpA.debugStop();
+    interpB.debugStop();
+    return {
+      nestedRoot,
+      nested,
+      foreignStart,
+      activeDuringDrive,
+      continueDuringDrive,
+      pollDuringDrive,
+      localsDuringDrive,
+      stackDuringDrive,
+      outer,
+      promiseProbe,
+      outerProbe,
+      foreignProbe,
+      activeAfter,
+      reusableEntry,
+      reusableFinished,
+    };
+  });
+
+  expect(result.nestedRoot).toBeNull();
+  expect(result.nested.value).toBeNull();
+  expect(result.nested.error).toContain('synchronous debugger');
+  expect(result.foreignStart).toMatchObject({ status: 'error' });
+  expect(result.activeDuringDrive).toBe(true);
+  expect(result.continueDuringDrive).toMatchObject({ status: 'error' });
+  expect(result.pollDuringDrive).toMatchObject({ status: 'error' });
+  expect(result.localsDuringDrive).toBeNull();
+  expect(result.stackDuringDrive).toEqual([]);
+  expect(result.outer).toMatchObject({ status: 'error' });
+  expect(result.promiseProbe).toMatchObject({ value: null, error: null });
+  expect(result.outerProbe).toMatchObject({ value: null, error: null });
+  expect(result.foreignProbe).toMatchObject({ value: null, error: null });
+  expect(result.activeAfter).toBe(false);
+  expect(result.reusableEntry).toMatchObject({ status: 'stopped' });
+  expect(result.reusableFinished).toMatchObject({ status: 'finished', value: '3' });
+});
+
 test('a detached foreign timer does not delay promise-root deadlock settlement', async ({ page }) => {
   await page.goto('/');
 

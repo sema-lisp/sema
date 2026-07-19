@@ -10398,8 +10398,14 @@ fn record_tool_result(token: u64, tc: &ToolCall, result: String, is_error: bool)
 
 /// Which cooperative `Call` the next [`ExecToolsContinuation::resume`] is settling.
 enum ToolPhase {
+    /// Resuming from a custom tool-schema predicate. Validation failures are
+    /// accumulated after the start observer and before handler dispatch.
+    Validation {
+        key_name: String,
+        failure_message: String,
+    },
     /// Resuming from the `:on-tool-call` "start" event callback: its return value is
-    /// ignored; next, dispatch the handler.
+    /// ignored; next, open the tool span and validate the call.
     StartEvent,
     /// Resuming from the tool handler itself: its `Returned`/`Failed` becomes the
     /// tool result fed back to the model.
@@ -10409,15 +10415,17 @@ enum ToolPhase {
     EndEvent { result: String, is_error: bool },
 }
 
-/// Per-call working state carried across the start-event / handler / end-event
-/// `Call`s while one tool call is in flight. The OTel `span` (opened just before the
-/// handler, dropped when it settles) and `started` instant travel with the task's
-/// swapped span stack across any suspension inside the handler.
+/// Per-call working state carried across the start-event, validation, handler, and
+/// end-event calls while one tool call is in flight. The OTel span covers validation
+/// and handler execution, matching the synchronous tool-call boundary.
 struct ActiveCall {
     tc: ToolCall,
-    /// `(handler, args)` resolved by `prepare_tool_call`, taken when the handler
-    /// `Call` is dispatched.
+    /// `(handler, args)` resolved before validation, taken when the handler call
+    /// is dispatched.
     pending_handler: Option<(Value, Vec<Value>)>,
+    pending_error: Option<String>,
+    validation_steps: VecDeque<ExtractionValidationStep>,
+    validation_errors: Vec<String>,
     /// The call arguments as a Sema value (passed to both `:on-tool-call` events).
     args_value: Value,
     /// The call arguments as JSON (for the tool span's content-gated I/O).
@@ -10462,6 +10470,15 @@ impl sema_core::runtime::Trace for ExecToolsContinuation {
                     sink(GcEdge::Value(arg));
                 }
             }
+            for step in &active.validation_steps {
+                if let ExtractionValidationStep::Predicate {
+                    callable, argument, ..
+                } = step
+                {
+                    sink(GcEdge::Value(callable));
+                    sink(GcEdge::Value(argument));
+                }
+            }
         }
         true
     }
@@ -10493,6 +10510,93 @@ fn tool_event_map(
 }
 
 impl ExecToolsContinuation {
+    fn start_tool_call(self: Box<Self>) -> sema_core::runtime::NativeResult {
+        let start_event = self.on_tool_call.as_ref().map(|_| {
+            let active = self.active.as_ref().expect("active tool call");
+            tool_event_map("start", &active.tc, &active.args_value, None)
+        });
+        match self.on_tool_call.clone() {
+            Some(callback) => {
+                self.call_event(callback, start_event.unwrap(), ToolPhase::StartEvent)
+            }
+            None => self.begin_tool_work(),
+        }
+    }
+
+    fn begin_tool_work(mut self: Box<Self>) -> sema_core::runtime::NativeResult {
+        let active = self.active.as_mut().expect("active tool call");
+        let tool_desc = self.tools.iter().find_map(|tool| {
+            let definition = tool.as_tool_def_rc()?;
+            (definition.name == active.tc.name).then(|| definition.description.clone())
+        });
+        active.span = Some(sema_otel::tool_span_detached(
+            &active.tc.name,
+            &active.tc.id,
+            tool_desc.as_deref(),
+        ));
+        active.started = Some(std::time::Instant::now());
+
+        if let Some(error) = active.pending_error.take() {
+            return self.complete_tool_call(error, true);
+        }
+        self.advance_validation()
+    }
+
+    fn advance_validation(mut self: Box<Self>) -> sema_core::runtime::NativeResult {
+        use sema_core::runtime::{NativeCall, NativeOutcome};
+
+        loop {
+            let step = self
+                .active
+                .as_mut()
+                .expect("active call while validating")
+                .validation_steps
+                .pop_front();
+            match step {
+                Some(ExtractionValidationStep::Error(error)) => self
+                    .active
+                    .as_mut()
+                    .expect("active call while validating")
+                    .validation_errors
+                    .push(error),
+                Some(ExtractionValidationStep::Predicate {
+                    callable,
+                    argument,
+                    key_name,
+                    failure_message,
+                }) => {
+                    self.phase = ToolPhase::Validation {
+                        key_name,
+                        failure_message,
+                    };
+                    return Ok(NativeOutcome::Call(NativeCall {
+                        callable,
+                        args: vec![argument],
+                        continuation: self,
+                    }));
+                }
+                None => break,
+            }
+        }
+
+        let errors = &self
+            .active
+            .as_ref()
+            .expect("active call after validation")
+            .validation_errors;
+        if errors.is_empty() {
+            return self.dispatch_handler();
+        }
+
+        let active = self.active.as_ref().expect("invalid active call");
+        let error = SemaError::Llm(format!(
+            "invalid arguments for tool '{}': {}",
+            active.tc.name,
+            active.validation_errors.join("; ")
+        ));
+        self.complete_tool_call(format!("Error: {error}"), true)
+    }
+
     /// A cooperative `Call` on `callback` with one event map, resuming into `phase`.
     fn call_event(
         mut self: Box<Self>,
@@ -10509,8 +10613,8 @@ impl ExecToolsContinuation {
         }))
     }
 
-    /// Open the tool span (nesting under the active agent span) and dispatch the
-    /// resolved handler as a `NativeOutcome::Call`, resuming into `Handler`.
+    /// Dispatch the validated handler as a `NativeOutcome::Call`, resuming into
+    /// `Handler`. The tool span was opened before validation.
     fn dispatch_handler(mut self: Box<Self>) -> sema_core::runtime::NativeResult {
         use sema_core::runtime::{NativeCall, NativeOutcome};
         let active = self.active.as_mut().expect("active call while dispatching");
@@ -10518,26 +10622,6 @@ impl ExecToolsContinuation {
             .pending_handler
             .take()
             .expect("handler resolved before dispatch");
-        // INTERNAL tool span (self-times over the handler, matching run_tool_loop's
-        // execute_tool_call span); v1.41 requires the tool name in the span name. It
-        // parents under the agent span active on this task's otel stack.
-        let tool_desc = self.tools.iter().find_map(|t| {
-            let td = t.as_tool_def_rc()?;
-            (td.name == active.tc.name).then(|| td.description.clone())
-        });
-        let active = self.active.as_mut().expect("active call while dispatching");
-        // DETACHED: the span (and its Drop) survives across the handler `Call` and is
-        // ended in `resume`, which runs OUTSIDE the task's span-stack scope — a
-        // stack-based span would pop the wrong (root) stack there and strand itself on
-        // the task's stack, mis-parenting the next round's chat span. Detached captures
-        // the agent span as parent here (in the native, task scope installed) and drops
-        // cleanly without touching the stack.
-        active.span = Some(sema_otel::tool_span_detached(
-            &active.tc.name,
-            &active.tc.id,
-            tool_desc.as_deref(),
-        ));
-        active.started = Some(std::time::Instant::now());
         self.phase = ToolPhase::Handler;
         Ok(NativeOutcome::Call(NativeCall {
             callable: handler,
@@ -10546,49 +10630,37 @@ impl ExecToolsContinuation {
         }))
     }
 
-    /// Pop the next pending call, resolve it, and fire its "start" event (or, with no
-    /// callback, dispatch the handler directly). Records resolution/validation
-    /// failures inline (fed back as tool errors) and skips to the next call. Returns
-    /// `Return(nil)` once every pending call is recorded.
+    /// Pop the next pending call and fire its start event. The no-observer path opens
+    /// the span and begins validation directly. Returns `Return(nil)` once every
+    /// pending call is recorded.
     fn advance(mut self: Box<Self>) -> sema_core::runtime::NativeResult {
         use sema_core::runtime::NativeOutcome;
-        while let Some(tc) = self.remaining.pop_front() {
-            let args_value = sema_core::json_to_value(&tc.arguments);
-            match prepare_tool_call(&self.tools, &tc.name, &tc.arguments) {
-                Ok((handler, args)) => {
-                    let args_json = serde_json::to_string(&tc.arguments).unwrap_or_default();
-                    let start_event = self
-                        .on_tool_call
-                        .as_ref()
-                        .map(|_| tool_event_map("start", &tc, &args_value, None));
-                    self.active = Some(ActiveCall {
-                        tc,
-                        pending_handler: Some((handler, args)),
-                        args_value,
-                        args_json,
-                        span: None,
-                        started: None,
-                    });
-                    // Fire the "start" event cooperatively (it may run a runtime op,
-                    // e.g. channel/send), then dispatch the handler; or dispatch the
-                    // handler straight away when there is no callback.
-                    return match self.on_tool_call.clone() {
-                        Some(cb) => {
-                            self.call_event(cb, start_event.unwrap(), ToolPhase::StartEvent)
-                        }
-                        None => self.dispatch_handler(),
-                    };
-                }
-                Err(e) => {
-                    // Resolution / validation failure: no handler runs, so no span or
-                    // start/end events (matching the fact that no handler executed);
-                    // feed the error back as a tool result (identical text to the
-                    // synchronous path) and keep going.
-                    record_tool_result(self.token, &tc, format!("Error: {e}"), true);
-                }
-            }
-        }
-        Ok(NativeOutcome::Return(Value::nil()))
+        let Some(tc) = self.remaining.pop_front() else {
+            return Ok(NativeOutcome::Return(Value::nil()));
+        };
+        let args_value = sema_core::json_to_value(&tc.arguments);
+        let prepared = prepare_tool_call_cooperative(&self.tools, &tc.name, &tc.arguments);
+        let (pending_handler, pending_error, validation_steps) = match prepared {
+            Ok(prepared) => (
+                Some((prepared.handler, prepared.args)),
+                None,
+                prepared.validation_steps,
+            ),
+            Err(error) => (None, Some(format!("Error: {error}")), VecDeque::new()),
+        };
+        let args_json = serde_json::to_string(&tc.arguments).unwrap_or_default();
+        self.active = Some(ActiveCall {
+            tc,
+            pending_handler,
+            pending_error,
+            validation_steps,
+            validation_errors: Vec::new(),
+            args_value,
+            args_json,
+            span: None,
+            started: None,
+        });
+        self.start_tool_call()
     }
 
     /// Finalize the tool span for the settled handler (record error / content I/O,
@@ -10609,6 +10681,31 @@ impl ExecToolsContinuation {
             .map(|t| t.elapsed().as_millis() as i64)
             .unwrap_or(0)
     }
+
+    fn complete_tool_call(
+        mut self: Box<Self>,
+        result: String,
+        is_error: bool,
+    ) -> sema_core::runtime::NativeResult {
+        let duration_ms = self.finish_span(&result, is_error);
+        match self.on_tool_call.clone() {
+            Some(callback) => {
+                let active = self.active.as_ref().expect("active call at completion");
+                let event = tool_event_map(
+                    "end",
+                    &active.tc,
+                    &active.args_value,
+                    Some((&result, is_error, duration_ms)),
+                );
+                self.call_event(callback, event, ToolPhase::EndEvent { result, is_error })
+            }
+            None => {
+                let tc = self.active.take().expect("active call at completion").tc;
+                record_tool_result(self.token, &tc, result, is_error);
+                self.advance()
+            }
+        }
+    }
 }
 
 impl sema_core::runtime::NativeContinuation for ExecToolsContinuation {
@@ -10621,14 +10718,38 @@ impl sema_core::runtime::NativeContinuation for ExecToolsContinuation {
         // A task cancellation lands on whichever `Call` was in flight; abort the whole
         // run so the runtime settles the parked parent task Cancelled.
         if let ResumeInput::Cancelled(reason) = &input {
-            return Err(SemaError::eval(format!(
-                "agent tool round was cancelled ({reason:?})"
-            )));
+            let message = format!("agent tool round was cancelled ({reason:?})");
+            if let Some(span) = self.active.as_ref().and_then(|active| active.span.as_ref()) {
+                span.record_error("cancelled", &message);
+            }
+            return Err(SemaError::eval(message));
         }
         match std::mem::replace(&mut self.phase, ToolPhase::Handler) {
+            ToolPhase::Validation {
+                key_name,
+                failure_message,
+            } => {
+                let active = self.active.as_mut().expect("active call after validation");
+                match input {
+                    ResumeInput::Returned(value) if value.is_truthy() => {}
+                    ResumeInput::Returned(_) => active
+                        .validation_errors
+                        .push(format!("key {key_name}: {failure_message}")),
+                    ResumeInput::Failed(error) => active
+                        .validation_errors
+                        .push(format!("key {key_name}: validation error: {error}")),
+                    ResumeInput::Cancelled(_) => unreachable!("handled above"),
+                    ResumeInput::Runtime(_) => {
+                        return Err(SemaError::eval(
+                            "agent tool validation received an unexpected runtime response",
+                        ))
+                    }
+                }
+                self.advance_validation()
+            }
             // The "start" event settled (return value ignored, and a callback failure
-            // must not abort the tool round) — now run the handler.
-            ToolPhase::StartEvent => self.dispatch_handler(),
+            // must not abort the tool round) — now open the span and validate.
+            ToolPhase::StartEvent => self.begin_tool_work(),
             // The handler settled: its value/error is the tool result.
             ToolPhase::Handler => {
                 let (result, is_error) = match input {
@@ -10643,32 +10764,7 @@ impl sema_core::runtime::NativeContinuation for ExecToolsContinuation {
                         ))
                     }
                 };
-                let duration_ms = self.finish_span(&result, is_error);
-                // Fire the "end" event cooperatively, then record; or record directly
-                // when there is no callback.
-                match self.on_tool_call.clone() {
-                    Some(cb) => {
-                        let tc = self.active.as_ref().expect("active call").tc.clone();
-                        let args_value = self
-                            .active
-                            .as_ref()
-                            .expect("active call")
-                            .args_value
-                            .clone();
-                        let end_event = tool_event_map(
-                            "end",
-                            &tc,
-                            &args_value,
-                            Some((&result, is_error, duration_ms)),
-                        );
-                        self.call_event(cb, end_event, ToolPhase::EndEvent { result, is_error })
-                    }
-                    None => {
-                        let tc = self.active.take().expect("active call").tc;
-                        record_tool_result(self.token, &tc, result, is_error);
-                        self.advance()
-                    }
-                }
+                self.complete_tool_call(result, is_error)
             }
             // The "end" event settled — record the tool result and move on.
             ToolPhase::EndEvent { result, is_error } => {
@@ -12074,31 +12170,36 @@ fn stringify_tool_result(result: Value) -> String {
     }
 }
 
-/// The synchronous prefix of `execute_tool_call`: resolve the tool, validate the
-/// model-supplied arguments, and produce the `(handler, args)` to invoke — WITHOUT
-/// running the handler. The cooperative runtime tool loop uses this so it can hand
-/// the handler call to the scheduler (as a `NativeOutcome::Call`) instead of
-/// re-entering the VM synchronously; a resolution/validation failure returns the
-/// same `Err` the synchronous path raises (fed back to the model as a tool error).
-fn prepare_tool_call(
+struct CooperativeToolCall {
+    handler: Value,
+    args: Vec<Value>,
+    validation_steps: VecDeque<ExtractionValidationStep>,
+}
+
+/// Resolve a runtime tool call without invoking custom schema predicates. The
+/// caller drives each predicate through `NativeOutcome::Call` before dispatching
+/// the handler.
+fn prepare_tool_call_cooperative(
     tools: &[Value],
     name: &str,
     arguments: &serde_json::Value,
-) -> Result<(Value, Vec<Value>), SemaError> {
+) -> Result<CooperativeToolCall, SemaError> {
     let tool_def = tools
         .iter()
-        .find_map(|t| t.as_tool_def_rc().filter(|td| td.name == name))
+        .find_map(|tool| {
+            tool.as_tool_def_rc()
+                .filter(|definition| definition.name == name)
+        })
         .ok_or_else(|| SemaError::Llm(format!("tool not found: {name}")))?;
 
     let args_map = sema_core::json_to_value(arguments);
-    if let Err(msg) = validate_extraction(&args_map, &tool_def.parameters) {
-        return Err(SemaError::Llm(format!(
-            "invalid arguments for tool '{name}': {msg}"
-        )));
-    }
-
-    let sema_args = json_args_to_sema(&tool_def.parameters, arguments, &tool_def.handler);
-    Ok((tool_def.handler.clone(), sema_args))
+    let validation_steps = prepare_extraction_validation(&args_map, &tool_def.parameters);
+    let args = json_args_to_sema(&tool_def.parameters, arguments, &tool_def.handler);
+    Ok(CooperativeToolCall {
+        handler: tool_def.handler.clone(),
+        args,
+        validation_steps,
+    })
 }
 
 /// Convert JSON arguments into a list of Sema values based on handler declaration order.
@@ -12291,15 +12392,29 @@ mod tests {
         cont.active = Some(ActiveCall {
             tc,
             pending_handler: Some((Value::int(4), vec![Value::int(5), Value::int(6)])),
+            pending_error: None,
+            validation_steps: VecDeque::new(),
+            validation_errors: Vec::new(),
             args_value: Value::int(7),
             args_json: "{}".into(),
             span: None,
             started: None,
         });
         assert_eq!(edges(&cont), 7);
+        cont.active
+            .as_mut()
+            .expect("active call")
+            .validation_steps
+            .push_back(ExtractionValidationStep::Predicate {
+                callable: Value::int(8),
+                argument: Value::int(9),
+                key_name: "field".into(),
+                failure_message: "invalid".into(),
+            });
+        assert_eq!(edges(&cont), 9);
         // No callback → one fewer edge.
         cont.on_tool_call = None;
-        assert_eq!(edges(&cont), 6);
+        assert_eq!(edges(&cont), 8);
     }
 
     fn usage(prompt: u32, completion: u32) -> Usage {

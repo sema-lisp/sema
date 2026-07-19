@@ -153,6 +153,188 @@ fn agent_run_tool_error_recovers_via_runtime() {
     );
 }
 
+#[test]
+#[serial]
+fn agent_run_tool_schema_predicate_suspends_via_runtime() {
+    let fake = FakeProvider::builder("fake")
+        .model("fake-model")
+        .tool_call(
+            "call_1",
+            "validated-echo",
+            serde_json::json!({ "text": "hi" }),
+        )
+        .reply("validated")
+        .build();
+    let program = r#"
+        (deftool validated-echo "validated echo"
+          {:text {:type :string
+                  :validate (fn (text)
+                    (await (async/spawn (fn () (= text "hi")))))} }
+          (fn (text) text))
+        (defagent bot {:system "Use the tool." :model "fake-model"
+                       :tools [validated-echo] :max-turns 5})
+        (agent/run bot "echo hi")
+    "#;
+
+    let (result, recorder) = via_runtime(program, fake);
+    assert_eq!(
+        result
+            .expect("runtime drives the suspending schema predicate")
+            .as_str(),
+        Some("validated")
+    );
+    let round2 = &recorder.requests()[1];
+    let tool_msg = round2
+        .messages
+        .iter()
+        .find(|message| message.role == "tool")
+        .expect("round 2 contains the correlated tool result");
+    assert_eq!(tool_msg.content.as_text(), Some("hi"));
+}
+
+#[test]
+#[serial]
+fn cancelling_suspended_tool_schema_predicate_skips_handler() {
+    let fake = FakeProvider::builder("fake")
+        .model("fake-model")
+        .tool_call(
+            "call_1",
+            "validated-echo",
+            serde_json::json!({ "text": "hi" }),
+        )
+        .build();
+    let program = r#"
+        (define predicate-entered (channel/new 1))
+        (define handler-ran #f)
+        (deftool validated-echo "validated echo"
+          {:text {:type :string
+                  :validate (fn (_text)
+                    (channel/send predicate-entered #t)
+                    (async/sleep 60000)
+                    #t)} }
+          (fn (text) (set! handler-ran #t) text))
+        (defagent bot {:system "Use the tool." :model "fake-model"
+                       :tools [validated-echo] :max-turns 5})
+        (let ((run (async/spawn (fn () (agent/run bot "echo hi")))))
+          (channel/recv predicate-entered)
+          (async/cancel run)
+          (try (async/await run) (catch error nil))
+          handler-ran)
+    "#;
+
+    let (result, recorder) = via_runtime(program, fake);
+    assert_eq!(
+        result
+            .expect("cancelling a schema predicate settles the agent task")
+            .as_bool(),
+        Some(false)
+    );
+    assert_eq!(recorder.call_count(), 1, "no later provider round runs");
+}
+
+#[test]
+#[serial]
+fn tool_schema_validation_preserves_observer_order_via_runtime() {
+    let fake = FakeProvider::builder("fake")
+        .model("fake-model")
+        .tool_call(
+            "call_1",
+            "validated-echo",
+            serde_json::json!({ "text": "hi" }),
+        )
+        .reply("validated")
+        .build();
+    let program = r#"
+        (define start-seen #f)
+        (define handler-ran #f)
+        (define events '())
+        (deftool validated-echo "validated echo"
+          {:text {:type :string :validate (fn (_text) start-seen)} }
+          (fn (text) (set! handler-ran #t) text))
+        (defagent bot {:system "Use the tool." :model "fake-model"
+                       :tools [validated-echo] :max-turns 5})
+        (define answer
+          (:response
+            (agent/run bot "echo hi"
+              {:on-tool-call
+               (fn (event)
+                 (if (= (:event event) "start")
+                     (begin
+                       (set! start-seen #t)
+                       (set! events (append events (list "start"))))
+                     (set! events
+                       (append events
+                         (list (if (:error event) "end-error" "end-ok"))))))})))
+        (list answer start-seen events handler-ran)
+    "#;
+
+    let (result, recorder) = via_runtime(program, fake);
+    let result = result.expect("runtime agent completes");
+    let fields = result.as_seq().expect("result tuple");
+    assert_eq!(fields[0].as_str(), Some("validated"));
+    assert_eq!(fields[1].as_bool(), Some(true));
+    assert_eq!(fields[2].to_string(), r#"("start" "end-ok")"#);
+    assert_eq!(fields[3].as_bool(), Some(true));
+    let round2 = &recorder.requests()[1];
+    let tool_msg = round2
+        .messages
+        .iter()
+        .find(|message| message.role == "tool")
+        .expect("round 2 contains the tool result");
+    assert_eq!(tool_msg.content.as_text(), Some("hi"));
+}
+
+#[test]
+#[serial]
+fn failed_tool_schema_validation_emits_end_error_via_runtime() {
+    let fake = FakeProvider::builder("fake")
+        .model("fake-model")
+        .tool_call(
+            "call_1",
+            "validated-echo",
+            serde_json::json!({ "text": "bad" }),
+        )
+        .reply("recovered")
+        .build();
+    let program = r#"
+        (define handler-ran #f)
+        (define events '())
+        (deftool validated-echo "validated echo"
+          {:text {:type :string :validate (fn (_text) #f) :message "rejected"} }
+          (fn (text) (set! handler-ran #t) text))
+        (defagent bot {:system "Use the tool." :model "fake-model"
+                       :tools [validated-echo] :max-turns 5})
+        (define answer
+          (:response
+            (agent/run bot "echo"
+              {:on-tool-call
+               (fn (event)
+                 (set! events
+                   (append events
+                     (list
+                       (if (= (:event event) "start")
+                           "start"
+                           (if (:error event) "end-error" "end-ok"))))))})))
+        (list answer events handler-ran)
+    "#;
+
+    let (result, recorder) = via_runtime(program, fake);
+    let result = result.expect("runtime agent recovers from schema rejection");
+    let fields = result.as_seq().expect("result tuple");
+    assert_eq!(fields[0].as_str(), Some("recovered"));
+    assert_eq!(fields[1].to_string(), r#"("start" "end-error")"#);
+    assert_eq!(fields[2].as_bool(), Some(false));
+    let round2 = &recorder.requests()[1];
+    let tool_msg = round2
+        .messages
+        .iter()
+        .find(|message| message.role == "tool")
+        .expect("round 2 contains the validation error");
+    let content = tool_msg.content.as_text().unwrap_or_default();
+    assert!(content.contains("invalid arguments"), "{content}");
+    assert!(content.contains("rejected"), "{content}");
+}
+
 // GATE (full-flip blocker 1): two `agent/run`s spawned concurrently through the
 // UNIFIED RUNTIME must OVERLAP across their provider rounds — not serialize. Each
 // round now offloads the provider call to the executor IO pool and suspends the

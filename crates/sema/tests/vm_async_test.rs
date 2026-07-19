@@ -2095,18 +2095,34 @@ fn synchronous_apply_hof_snapshots_target_native_escaping_args() {
 }
 
 #[test]
-fn context_set_after_spawn_snapshots_inserted_closure() {
+fn context_set_before_spawn_inherits_snapshotted_closure() {
+    assert_eq!(
+        eval(
+            r#"(let ((x 41))
+                 (context/set :cb (fn () (+ x 1)))
+                 (let ((pending
+                         (async
+                           (async/sleep 10)
+                           ((context/get :cb)))))
+                   (await pending)))"#
+        ),
+        Value::int(42)
+    );
+}
+
+#[test]
+fn context_set_after_spawn_remains_parent_local() {
     assert_eq!(
         eval(
             r#"(let ((x 41))
                  (let ((pending
                          (async
                            (async/sleep 10)
-                           ((context/get :cb)))))
+                           (context/get :cb))))
                    (context/set :cb (fn () (+ x 1)))
-                   (await pending)))"#
+                   (list (await pending) ((context/get :cb)))))"#
         ),
-        Value::int(42)
+        Value::list(vec![Value::nil(), Value::int(42)])
     );
 }
 
@@ -2437,8 +2453,7 @@ fn structural_apply_propagates_native_failure() {
 }
 
 #[test]
-fn sleep_wrapped_in_lambda_for_single_abi_hof_works() {
-    // The error message's own suggested workaround must actually work.
+fn sleep_wrapped_in_predicate_callback_suspends() {
     assert_eq!(
         eval(r#"(any (fn (x) (async/sleep x) #t) (list 10))"#),
         Value::bool(true)

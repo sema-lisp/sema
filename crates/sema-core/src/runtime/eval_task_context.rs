@@ -145,8 +145,12 @@ impl Trace for ModuleTaskState {
 
 impl TaskLocalValue for ModuleTaskState {
     fn inherit(&self) -> Rc<dyn TaskLocalValue> {
+        let mut inner = self.inner.borrow().clone();
+        strip_scope_ids(&mut inner.current_files);
+        strip_scope_ids(&mut inner.loading);
+        strip_scope_ids(&mut inner.exports);
         Rc::new(Self {
-            inner: RefCell::new(self.inner.borrow().clone()),
+            inner: RefCell::new(inner),
         })
     }
 
@@ -161,8 +165,18 @@ pub enum DynamicMutation {
     UserRemove(Value),
     UserClear,
     HiddenSet(Value, Value),
-    StackPush(Value, Value),
-    StackPop(Value),
+    StackPush {
+        key: Value,
+        value: Value,
+        scope: ScopeId,
+    },
+    /// Removes an inherited top only if publication still sees the snapshot
+    /// state. The depth check distinguishes equal values pushed by another root.
+    StackPop {
+        key: Value,
+        expected_value: Value,
+        expected_depth: usize,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -327,39 +341,65 @@ impl DynamicTaskState {
             .entry(key.clone())
             .or_default()
             .push(Scoped::owned(id, value.clone()));
-        record(&mut inner, DynamicMutation::StackPush(key, value));
+        record(
+            &mut inner,
+            DynamicMutation::StackPush {
+                key,
+                value,
+                scope: id,
+            },
+        );
         Ok(id)
     }
 
     pub fn stack_pop(&self, key: &Value) -> Option<Value> {
         let mut inner = self.inner.borrow_mut();
-        let value = inner.stacks.get_mut(key)?.pop()?.value;
+        let (entry, expected_depth) = {
+            let stack = inner.stacks.get_mut(key)?;
+            let expected_depth = stack.len();
+            (stack.pop()?, expected_depth)
+        };
         if inner.stacks.get(key).is_some_and(Vec::is_empty) {
             inner.stacks.remove(key);
         }
-        record(&mut inner, DynamicMutation::StackPop(key.clone()));
-        Some(value)
+        if entry
+            .id
+            .is_some_and(|scope| cancel_pending_stack_push(&mut inner, scope))
+        {
+            return Some(entry.value);
+        }
+        record(
+            &mut inner,
+            DynamicMutation::StackPop {
+                key: key.clone(),
+                expected_value: entry.value.clone(),
+                expected_depth,
+            },
+        );
+        Some(entry.value)
     }
 
     pub fn remove_stack_value(&self, key: &Value, id: ScopeId) -> Option<Value> {
         let mut inner = self.inner.borrow_mut();
         let stack = inner.stacks.get_mut(key)?;
         let index = stack.iter().position(|entry| entry.id == Some(id))?;
-        let removed = stack.remove(index).value;
-        let above: Vec<Value> = stack[index..]
-            .iter()
-            .map(|entry| entry.value.clone())
-            .collect();
+        let expected_depth = stack.len();
+        let was_top = index + 1 == expected_depth;
+        let removed = stack.remove(index);
         if stack.is_empty() {
             inner.stacks.remove(key);
         }
-        for _ in 0..=above.len() {
-            record(&mut inner, DynamicMutation::StackPop(key.clone()));
+        if !cancel_pending_stack_push(&mut inner, id) && was_top {
+            record(
+                &mut inner,
+                DynamicMutation::StackPop {
+                    key: key.clone(),
+                    expected_value: removed.value.clone(),
+                    expected_depth,
+                },
+            );
         }
-        for value in above {
-            record(&mut inner, DynamicMutation::StackPush(key.clone(), value));
-        }
-        Some(removed)
+        Some(removed.value)
     }
 
     pub fn drain_mutations(&self) -> Option<Vec<DynamicMutation>> {
@@ -400,6 +440,11 @@ impl Trace for DynamicTaskState {
 impl TaskLocalValue for DynamicTaskState {
     fn inherit(&self) -> Rc<dyn TaskLocalValue> {
         let mut inner = self.inner.borrow().clone();
+        strip_scope_ids(&mut inner.user_frames);
+        strip_scope_ids(&mut inner.hidden_frames);
+        for stack in inner.stacks.values_mut() {
+            strip_scope_ids(stack);
+        }
         inner.mutations = None;
         Rc::new(Self {
             inner: RefCell::new(inner),
@@ -418,9 +463,90 @@ fn remove_scope<T>(entries: &mut Vec<Scoped<T>>, id: ScopeId) -> Option<T> {
         .map(|index| entries.remove(index).value)
 }
 
+fn strip_scope_ids<T>(entries: &mut [Scoped<T>]) {
+    for entry in entries {
+        entry.id = None;
+    }
+}
+
 fn record(inner: &mut DynamicState, mutation: DynamicMutation) {
     if let Some(mutations) = &mut inner.mutations {
         mutations.push(mutation);
+    }
+}
+
+fn cancel_pending_stack_push(inner: &mut DynamicState, scope: ScopeId) -> bool {
+    let Some(mutations) = inner.mutations.as_mut() else {
+        return false;
+    };
+    let Some(index) = mutations.iter().rposition(
+        |mutation| matches!(mutation, DynamicMutation::StackPush { scope: candidate, .. } if *candidate == scope),
+    ) else {
+        return false;
+    };
+    mutations.remove(index);
+    true
+}
+
+/// Applies a root's settlement journal to the interpreter-wide dynamic state.
+pub fn apply_dynamic_mutations(
+    user_frames: &mut Vec<BTreeMap<Value, Value>>,
+    hidden_frames: &mut Vec<BTreeMap<Value, Value>>,
+    stacks: &mut BTreeMap<Value, Vec<Value>>,
+    mutations: &[DynamicMutation],
+) {
+    if user_frames.is_empty() {
+        user_frames.push(BTreeMap::new());
+    }
+    if hidden_frames.is_empty() {
+        hidden_frames.push(BTreeMap::new());
+    }
+    for mutation in mutations {
+        match mutation {
+            DynamicMutation::UserSet(key, value) => {
+                user_frames
+                    .last_mut()
+                    .expect("user context is normalized above")
+                    .insert(key.clone(), value.clone());
+            }
+            DynamicMutation::UserRemove(key) => {
+                for frame in user_frames.iter_mut().rev() {
+                    frame.remove(key);
+                }
+            }
+            DynamicMutation::UserClear => {
+                user_frames.clear();
+                user_frames.push(BTreeMap::new());
+            }
+            DynamicMutation::HiddenSet(key, value) => {
+                hidden_frames
+                    .last_mut()
+                    .expect("hidden context is normalized above")
+                    .insert(key.clone(), value.clone());
+            }
+            DynamicMutation::StackPush { key, value, .. } => {
+                stacks.entry(key.clone()).or_default().push(value.clone());
+            }
+            DynamicMutation::StackPop {
+                key,
+                expected_value,
+                expected_depth,
+            } => {
+                let remove_key = match stacks.get_mut(key) {
+                    Some(stack)
+                        if stack.len() == *expected_depth
+                            && stack.last() == Some(expected_value) =>
+                    {
+                        stack.pop();
+                        stack.is_empty()
+                    }
+                    _ => false,
+                };
+                if remove_key {
+                    stacks.remove(key);
+                }
+            }
+        }
     }
 }
 
@@ -428,12 +554,20 @@ fn trace_mutation(mutation: &DynamicMutation, sink: &mut dyn FnMut(GcEdge<'_>)) 
     match mutation {
         DynamicMutation::UserSet(key, value)
         | DynamicMutation::HiddenSet(key, value)
-        | DynamicMutation::StackPush(key, value) => {
+        | DynamicMutation::StackPush { key, value, .. } => {
             sink(GcEdge::Value(key));
             sink(GcEdge::Value(value));
         }
-        DynamicMutation::UserRemove(key) | DynamicMutation::StackPop(key) => {
+        DynamicMutation::UserRemove(key) => {
             sink(GcEdge::Value(key));
+        }
+        DynamicMutation::StackPop {
+            key,
+            expected_value,
+            ..
+        } => {
+            sink(GcEdge::Value(key));
+            sink(GcEdge::Value(expected_value));
         }
         DynamicMutation::UserClear => {}
     }
@@ -449,7 +583,7 @@ mod tests {
     use crate::runtime::{TaskContext, Trace};
     use crate::Value;
 
-    use super::{DynamicMutation, DynamicTaskState, ModuleTaskState};
+    use super::{apply_dynamic_mutations, DynamicMutation, DynamicTaskState, ModuleTaskState};
 
     #[test]
     fn module_scopes_remove_the_exact_current_file_token_once() {
@@ -555,6 +689,41 @@ mod tests {
     }
 
     #[test]
+    fn module_child_strips_parent_scope_tokens() {
+        let parent = Rc::new(ModuleTaskState::default());
+        let file = parent
+            .push_current_file(PathBuf::from("parent.sema"))
+            .expect("scope ID available");
+        let loading = parent
+            .push_loading(PathBuf::from("loading.sema"))
+            .expect("scope ID available");
+        let exports = parent
+            .push_exports(Some(vec!["parent-export".to_owned()]))
+            .expect("scope ID available");
+        let mut context = TaskContext::default();
+        context.insert(Rc::clone(&parent));
+
+        let child = context
+            .inherit_for_child()
+            .get_rc::<ModuleTaskState>()
+            .expect("module state inherited");
+
+        assert!(!child.remove_current_file(file));
+        assert!(!child.remove_loading(loading));
+        assert!(!child.remove_exports(exports));
+        assert_eq!(child.current_file(), Some(PathBuf::from("parent.sema")));
+        assert_eq!(child.loading(), vec![PathBuf::from("loading.sema")]);
+        assert_eq!(
+            child.exports(),
+            vec![Some(vec!["parent-export".to_owned()])]
+        );
+        let child_scope = child
+            .push_current_file(PathBuf::from("child.sema"))
+            .expect("scope ID available");
+        assert!(child_scope > exports);
+    }
+
+    #[test]
     fn dynamic_scope_cleanup_is_exact_and_idempotent() {
         let state = DynamicTaskState::root(
             vec![BTreeMap::new()],
@@ -637,11 +806,87 @@ mod tests {
                 DynamicMutation::UserRemove(user_key),
                 DynamicMutation::UserClear,
                 DynamicMutation::HiddenSet(hidden_key, Value::int(2)),
-                DynamicMutation::StackPush(stack_key.clone(), Value::int(3)),
-                DynamicMutation::StackPop(stack_key),
             ])
         );
         assert_eq!(state.drain_mutations(), Some(Vec::new()));
+    }
+
+    #[test]
+    fn inherited_stack_pop_cannot_remove_another_roots_equal_later_push() {
+        let key = Value::keyword("stack");
+        let initial = BTreeMap::from([(key.clone(), vec![Value::keyword("a")])]);
+        let first = DynamicTaskState::root(
+            vec![BTreeMap::new()],
+            vec![BTreeMap::new()],
+            initial.clone(),
+        );
+        let second = DynamicTaskState::root(
+            vec![BTreeMap::new()],
+            vec![BTreeMap::new()],
+            initial.clone(),
+        );
+
+        first
+            .stack_push(key.clone(), Value::keyword("a"))
+            .expect("scope ID available");
+        assert_eq!(second.stack_pop(&key), Some(Value::keyword("a")));
+
+        let mut user = vec![BTreeMap::new()];
+        let mut hidden = vec![BTreeMap::new()];
+        let mut published = initial;
+        apply_dynamic_mutations(
+            &mut user,
+            &mut hidden,
+            &mut published,
+            &first.drain_mutations().expect("root journal"),
+        );
+        apply_dynamic_mutations(
+            &mut user,
+            &mut hidden,
+            &mut published,
+            &second.drain_mutations().expect("root journal"),
+        );
+
+        assert_eq!(
+            published.get(&key),
+            Some(&vec![Value::keyword("a"), Value::keyword("a")])
+        );
+    }
+
+    #[test]
+    fn owned_stack_cleanup_cancels_only_its_exact_push_with_duplicate_values() {
+        let key = Value::keyword("stack");
+        let state = DynamicTaskState::root(
+            vec![BTreeMap::new()],
+            vec![BTreeMap::new()],
+            BTreeMap::new(),
+        );
+        let first = state
+            .stack_push(key.clone(), Value::keyword("same"))
+            .expect("scope ID available");
+        let second = state
+            .stack_push(key.clone(), Value::keyword("same"))
+            .expect("scope ID available");
+
+        assert_eq!(
+            state.remove_stack_value(&key, first),
+            Some(Value::keyword("same"))
+        );
+        let mutations = state.drain_mutations().expect("root journal");
+        assert_eq!(
+            mutations,
+            vec![DynamicMutation::StackPush {
+                key: key.clone(),
+                value: Value::keyword("same"),
+                scope: second,
+            }]
+        );
+
+        let mut user = vec![BTreeMap::new()];
+        let mut hidden = vec![BTreeMap::new()];
+        let mut published = BTreeMap::new();
+        apply_dynamic_mutations(&mut user, &mut hidden, &mut published, &mutations);
+        assert_eq!(published.get(&key), Some(&vec![Value::keyword("same")]));
     }
 
     #[test]
@@ -708,6 +953,64 @@ mod tests {
         );
         assert_eq!(child.drain_mutations(), None);
         assert_eq!(parent.drain_mutations(), Some(Vec::new()));
+    }
+
+    #[test]
+    fn dynamic_child_strips_parent_scope_tokens() {
+        let parent = Rc::new(DynamicTaskState::root(
+            vec![BTreeMap::new()],
+            vec![BTreeMap::new()],
+            BTreeMap::new(),
+        ));
+        let user = parent
+            .push_user_frame(BTreeMap::from([(Value::keyword("user"), Value::int(1))]))
+            .expect("scope ID available");
+        let hidden = parent
+            .push_hidden_frame(BTreeMap::from([(Value::keyword("hidden"), Value::int(2))]))
+            .expect("scope ID available");
+        let stack_key = Value::keyword("stack");
+        let stack = parent
+            .stack_push(stack_key.clone(), Value::int(3))
+            .expect("scope ID available");
+        let mut context = TaskContext::default();
+        context.insert(Rc::clone(&parent));
+
+        let child = context
+            .inherit_for_child()
+            .get_rc::<DynamicTaskState>()
+            .expect("dynamic state inherited");
+
+        assert!(!child.remove_user_frame(user));
+        assert!(!child.remove_hidden_frame(hidden));
+        assert_eq!(child.remove_stack_value(&stack_key, stack), None);
+        assert_eq!(child.user_get(&Value::keyword("user")), Some(Value::int(1)));
+        assert_eq!(
+            child.hidden_get(&Value::keyword("hidden")),
+            Some(Value::int(2))
+        );
+        assert_eq!(child.stack_get(&stack_key), vec![Value::int(3)]);
+        let child_scope = child
+            .push_user_frame(BTreeMap::new())
+            .expect("scope ID available");
+        assert!(child_scope > stack);
+    }
+
+    #[test]
+    fn conditional_stack_pop_traces_key_and_expected_value() {
+        let key = Value::keyword("stack");
+        let state = DynamicTaskState::root(
+            vec![BTreeMap::new()],
+            vec![BTreeMap::new()],
+            BTreeMap::from([(key.clone(), vec![Value::int(1)])]),
+        );
+        assert_eq!(state.stack_pop(&key), Some(Value::int(1)));
+
+        let mut edges = 0;
+        assert!(state.trace(&mut |edge| {
+            assert!(matches!(edge, GcEdge::Value(_)));
+            edges += 1;
+        }));
+        assert_eq!(edges, 2);
     }
 
     #[test]

@@ -42,10 +42,10 @@
 //!
 //! Pinned by `tests/tokio_pin_test.rs` (re-established on every CI run so a
 //! tokio upgrade that changes the rules fails loudly): `io_block_on` is legal
-//! from plain OS threads (the VM thread) and from this pool's own
-//! `spawn_blocking` closures — `block_on` drives the future on the CALLING
-//! thread, workers supply only the reactor/timers — and panics from async
-//! worker threads.
+//! from plain OS threads only while no Sema runtime quantum is active, and from
+//! this pool's own `spawn_blocking` closures. `block_on` drives the future on the
+//! CALLING thread, workers supply only the reactor/timers. It panics from an
+//! active runtime quantum and from async worker threads.
 
 use std::future::Future;
 use std::pin::Pin;

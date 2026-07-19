@@ -151,6 +151,154 @@ fn root_batch_keeps_a_sema_defined_provider_on_the_vm_thread() {
 
 #[test]
 #[serial]
+fn root_image_extract_parks_while_a_sibling_runs() {
+    let fake = FakeProvider::builder("fake")
+        .model("fake-chat")
+        .chat_delay(100)
+        .reply(r#"{"description":"image"}"#)
+        .build();
+    let interp = Interpreter::new();
+    reset_runtime_state();
+    register_test_provider(Box::new(fake));
+
+    let value = interp
+        .eval_str_compiled(
+            r#"
+            (let ((out (channel/new 2)))
+              (async/spawn (fn () (sleep 10) (channel/send out "sibling")))
+              (channel/send out
+                (:description
+                  (llm/extract-from-image
+                    {:description :string}
+                    (bytevector 137 80 78 71))))
+              (list (channel/recv out) (channel/recv out)))
+            "#,
+        )
+        .expect("root image extraction and sibling settle");
+
+    assert_eq!(strings(&value), ["sibling", "image"]);
+}
+
+#[test]
+#[serial]
+fn root_embed_parks_while_a_sibling_runs() {
+    let fake = FakeProvider::builder("fake")
+        .model("fake-embed")
+        .embed_delay(100)
+        .embed(vec![vec![0.1, 0.2, 0.3]])
+        .build();
+    let interp = Interpreter::new();
+    reset_runtime_state();
+    register_test_provider(Box::new(fake));
+
+    let value = interp
+        .eval_str_compiled(
+            r#"
+            (let ((out (channel/new 2)))
+              (async/spawn (fn () (sleep 10) (channel/send out "sibling")))
+              (let ((embedding (llm/embed "root")))
+                (channel/send out
+                  (if (= (embedding/length embedding) 3) "embed" "wrong")))
+              (list (channel/recv out) (channel/recv out)))
+            "#,
+        )
+        .expect("root embedding and sibling settle");
+
+    assert_eq!(strings(&value), ["sibling", "embed"]);
+}
+
+#[test]
+#[serial]
+fn root_rerank_parks_while_a_sibling_runs() {
+    let fake = FakeProvider::builder("fake")
+        .model("fake-rerank")
+        .rerank_delay(100)
+        .rerank(&[(0, 0.9), (1, 0.1)])
+        .build();
+    let interp = Interpreter::new();
+    reset_runtime_state();
+    register_test_provider(Box::new(fake));
+
+    let value = interp
+        .eval_str_compiled(
+            r#"
+            (let ((out (channel/new 2)))
+              (async/spawn (fn () (sleep 10) (channel/send out "sibling")))
+              (channel/send out
+                (:document (first (llm/rerank "root" (list "rerank" "other")))))
+              (list (channel/recv out) (channel/recv out)))
+            "#,
+        )
+        .expect("root rerank and sibling settle");
+
+    assert_eq!(strings(&value), ["sibling", "rerank"]);
+}
+
+#[test]
+#[serial]
+fn root_batch_parks_while_a_sibling_runs() {
+    let fake = FakeProvider::builder("fake")
+        .model("fake-chat")
+        .chat_delay(100)
+        .reply("batch")
+        .build();
+    let interp = Interpreter::new();
+    reset_runtime_state();
+    register_test_provider(Box::new(fake));
+
+    let value = interp
+        .eval_str_compiled(
+            r#"
+            (let ((out (channel/new 2)))
+              (async/spawn (fn () (sleep 10) (channel/send out "sibling")))
+              (channel/send out (first (llm/batch (list "root"))))
+              (list (channel/recv out) (channel/recv out)))
+            "#,
+        )
+        .expect("root batch and sibling settle");
+
+    assert_eq!(strings(&value), ["sibling", "batch"]);
+}
+
+#[test]
+#[serial]
+fn native_before_sema_fallback_is_rejected_before_native_dispatch() {
+    let fake = FakeProvider::builder("fake")
+        .model("fake-chat")
+        .reply("must-not-dispatch")
+        .build();
+    let recorder = fake.recorder();
+    let interp = Interpreter::new();
+    reset_runtime_state();
+    register_test_provider(Box::new(fake));
+
+    let error = interp
+        .eval_str_compiled(
+            r#"
+            (llm/define-provider :sema-provider
+              {:complete (fn (_request) "sema")
+               :default-model "sema-model"})
+            (llm/with-fallback [:fake :sema-provider]
+              (fn () (llm/complete "root")))
+            "#,
+        )
+        .expect_err("native-before-Sema fallback must be rejected before dispatch");
+
+    assert!(
+        error
+            .to_string()
+            .contains("place Sema-defined providers first"),
+        "error must provide an immediately usable remedy: {error}"
+    );
+    assert_eq!(
+        recorder.call_count(),
+        0,
+        "unsupported fallback ordering must not call the leading native provider"
+    );
+}
+
+#[test]
+#[serial]
 fn sema_provider_rate_pacing_uses_a_structural_timer() {
     let interp = Interpreter::new();
     reset_runtime_state();

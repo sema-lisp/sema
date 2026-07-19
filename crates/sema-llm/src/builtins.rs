@@ -1550,26 +1550,7 @@ fn parse_lisp_provider_response(val: &Value, model: &str) -> Result<ChatResponse
     }
 }
 
-fn register_fn_ctx_gated(
-    env: &Env,
-    sandbox: &sema_core::Sandbox,
-    cap: sema_core::Caps,
-    name: &str,
-    f: impl Fn(&sema_core::EvalContext, &[Value]) -> Result<Value, SemaError> + 'static,
-) {
-    if sandbox.is_unrestricted() {
-        register_fn_ctx(env, name, f);
-    } else {
-        let sandbox = sandbox.clone();
-        let fn_name = name.to_string();
-        register_fn_ctx(env, name, move |ctx, args| {
-            sandbox.check(cap, &fn_name)?;
-            f(ctx, args)
-        });
-    }
-}
-
-/// Like [`register_fn_ctx_gated`], but binds the native under a different ENV SYMBOL
+/// Bind a capability-gated context native under a different ENV SYMBOL
 /// (`reg_name`) than the name used for the capability-check error / `NativeFn`
 /// display (`display_name`). Used to split a Sema-visible entry point (e.g.
 /// `llm/chat`) into several internal native entry points (a blocking twin, an
@@ -2717,12 +2698,15 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
 
     // (llm/extract-from-image schema source {:model "..."})
     // source: string path or bytevector
-    register_fn_ctx_gated(
+    register_runtime_fn_ctx_gated_as(
         env,
         sandbox,
         sema_core::Caps::LLM,
         "llm/extract-from-image",
+        "llm/extract-from-image",
         |_ctx, args| {
+            #[allow(unused_imports)]
+            use sema_core::runtime::NativeOutcome;
             if args.len() < 2 || args.len() > 3 {
                 return Err(SemaError::arity(
                     "llm/extract-from-image",
@@ -2780,26 +2764,19 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
             request.system = Some(system);
             request.json_mode = true;
 
-            let response = do_complete(request)?;
-            track_usage(&response.usage)?;
-
-            // Parse JSON response back to Sema value
-            let content = response.content.trim();
-            let json_str = if content.starts_with("```") {
-                content
-                    .trim_start_matches("```json")
-                    .trim_start_matches("```")
-                    .trim_end_matches("```")
-                    .trim()
-            } else {
-                content
-            };
-            let json: serde_json::Value = serde_json::from_str(json_str).map_err(|e| {
-                SemaError::Llm(format!(
-                    "failed to parse LLM JSON response: {e}\nResponse was: {content}"
-                ))
-            })?;
-            Ok(sema_core::json_to_value(&json))
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                dispatch_complete_offload(
+                    request,
+                    CompleteFinalize::new(|response| extract_parse_response(&response)),
+                )
+            }
+            #[cfg(target_arch = "wasm32")]
+            {
+                let response = do_complete(request)?;
+                track_usage(&response.usage)?;
+                extract_parse_response(&response).map(NativeOutcome::Return)
+            }
         },
     );
 
@@ -7359,7 +7336,8 @@ fn dispatch_complete_runtime_plan(
         .any(|entry| entry.provider.runs_on_vm_thread())
     {
         let message = "a runtime fallback chain cannot place a Sema-defined provider after a \
-                       native provider until provider callbacks use the cooperative call driver";
+                       native provider until provider callbacks use the cooperative call driver; \
+                       place Sema-defined providers first in the fallback chain";
         plan.span.record_error("config", message);
         return Err(SemaError::Llm(message.to_string()));
     }

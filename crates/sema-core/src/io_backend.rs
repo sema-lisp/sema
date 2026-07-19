@@ -18,13 +18,13 @@
 //!
 //! # Threading contract (pinned by tokio-assumption tests in `sema-io`)
 //!
-//! `io_block_on` is legal from the VM thread, plain OS threads, and
-//! `io_spawn_blocking` closures; it PANICS from `io_spawn` futures or any other
-//! async-driver thread ("cannot block_on from within a runtime worker"). A
-//! `block_on`'d future may transiently need at most ONE blocking slot of its own
-//! (reqwest's GaiResolver DNS); never nest a second spawn_blocking-and-wait
-//! level inside one — the pool's admission control reserves exactly depth-1
-//! headroom.
+//! `io_block_on` is legal from plain OS threads only while no Sema runtime
+//! quantum is active, and from `io_spawn_blocking` closures. It PANICS from an
+//! active runtime quantum, `io_spawn` futures, or any other async-driver thread
+//! ("cannot block_on from within a runtime worker"). A `block_on`'d future may
+//! transiently need at most ONE blocking slot of its own (reqwest's GaiResolver
+//! DNS); never nest a second spawn_blocking-and-wait level inside one — the
+//! pool's admission control reserves exactly depth-1 headroom.
 
 use std::future::Future;
 use std::pin::Pin;

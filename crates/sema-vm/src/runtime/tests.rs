@@ -8,9 +8,9 @@ use std::time::{Duration, Instant};
 use sema_core::{
     runtime::{
         CancelReason, CancellationParent, CompletionDecoder, CompletionDelivery, CompletionKind,
-        CompletionRegistrar, CompletionSender, ExecutorAttachError, ExecutorDispatch,
-        ExecutorLease, ExecutorShutdown, ExecutorSnapshot, ExternalCompletion, IdCounter,
-        InterruptibleResource, IoExecutor, LifetimeOwner, NativeCall, NativeCallContext,
+        CompletionRegistrar, CompletionSender, DynamicTaskState, ExecutorAttachError,
+        ExecutorDispatch, ExecutorLease, ExecutorShutdown, ExecutorSnapshot, ExternalCompletion,
+        IdCounter, InterruptibleResource, IoExecutor, LifetimeOwner, NativeCall, NativeCallContext,
         NativeContinuation, NativeOutcome, NativeResult, NativeSuspend, PreparedExternalOperation,
         ResumeInput, RootId, RunningSubmission, RuntimeId, RuntimeScopedIdCounter,
         RuntimeScopedIdIssuers, ScopeId, SettlementSeq, SubmissionRejected, SubmitErrorKind,
@@ -3491,6 +3491,10 @@ impl NativeContinuation for ChannelDeferContinuation {
         input: ResumeInput,
     ) -> NativeResult {
         assert!(
+            context.task_context.get::<DynamicTaskState>().is_some(),
+            "inline channel continuation requires a seeded dynamic task state"
+        );
+        assert!(
             matches!(
                 input,
                 ResumeInput::Runtime(sema_core::runtime::RuntimeResponse::Send(
@@ -3523,6 +3527,10 @@ fn channel_defer_native(
     events: Arc<Mutex<Vec<&'static str>>>,
 ) -> sema_core::NativeFn {
     sema_core::NativeFn::with_context_result("chan-send-defer", move |context, _args| {
+        assert!(
+            context.task_context.get::<DynamicTaskState>().is_some(),
+            "inline channel native requires a seeded dynamic task state"
+        );
         context.eval_context.context_set(
             Value::keyword("inline-channel-context-seam"),
             Value::keyword("native"),
@@ -4771,6 +4779,10 @@ impl CompletionDecoder for ContextIdentityDecoder {
         context: &mut NativeCallContext<'_>,
         _result: Result<sema_core::runtime::SendPayload, sema_core::runtime::ExternalFailure>,
     ) -> Result<Value, SemaError> {
+        assert!(
+            context.task_context.get::<DynamicTaskState>().is_some(),
+            "external decoder requires a seeded dynamic task state"
+        );
         let key = Value::keyword("runtime-context-seam");
         assert_eq!(
             context.eval_context.context_get(&key),
@@ -4805,6 +4817,10 @@ impl NativeContinuation for ContextIdentityContinuation {
         context: &mut NativeCallContext<'_>,
         input: ResumeInput,
     ) -> NativeResult {
+        assert!(
+            context.task_context.get::<DynamicTaskState>().is_some(),
+            "external continuation requires a seeded dynamic task state"
+        );
         assert!(matches!(input, ResumeInput::Returned(_)));
         let key = Value::keyword("runtime-context-seam");
         let (expected, next) = match self.stage {
@@ -4873,6 +4889,10 @@ fn runtime_native_external_decoder_and_continuations_keep_owning_eval_context() 
         let native = Value::native_fn(sema_core::NativeFn::with_context_result(
             "context-identity",
             move |context, _| {
+                assert!(
+                    context.task_context.get::<DynamicTaskState>().is_some(),
+                    "runtime native requires a seeded dynamic task state"
+                );
                 let key = Value::keyword("runtime-context-seam");
                 assert_eq!(context.eval_context.context_get(&key), None);
                 context

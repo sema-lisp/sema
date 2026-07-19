@@ -60,9 +60,13 @@ impl TimerQueue {
     }
 
     pub fn next_deadline(&self) -> Option<Instant> {
+        self.next_deadline_for(|_| true)
+    }
+
+    pub fn next_deadline_for(&self, matches: impl Fn(WaitKey) -> bool) -> Option<Instant> {
         self.deadlines
-            .first_key_value()
-            .map(|(&(deadline, _), _)| deadline)
+            .iter()
+            .find_map(|(&(deadline, _), &key)| matches(key).then_some(deadline))
     }
 
     pub fn is_empty(&self) -> bool {

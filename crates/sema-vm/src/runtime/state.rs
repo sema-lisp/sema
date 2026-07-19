@@ -1346,7 +1346,11 @@ impl Runtime {
         // so the host raises a stopped event and inspects the paused task. Takes
         // precedence over `Progress` (the stopping `visit_ready` counted a work
         // item) — the runtime is frozen, not merely making progress.
-        if let Some((root, task, info)) = &state.debug_paused {
+        let selected_debug_stop = state
+            .debug_paused
+            .as_ref()
+            .filter(|(root, _, _)| selected_roots.is_none_or(|roots| roots.contains(root)));
+        if let Some((root, task, info)) = selected_debug_stop {
             return Ok(DriveState::DebugStopped {
                 root: *root,
                 task: *task,
@@ -1390,12 +1394,26 @@ impl Runtime {
         {
             Ok(DriveState::Quiescent)
         } else {
+            let next_deadline = selected_roots.map_or_else(
+                || state.timers.next_deadline(),
+                |roots| {
+                    state.timers.next_deadline_for(|key| {
+                        state
+                            .protocol_waits
+                            .get(&key)
+                            .is_some_and(|wait| task_belongs_to_roots(&state, wait.task, roots))
+                    })
+                },
+            );
+            let inbox_wakeup_required = state.waits.as_ref().is_some_and(|waits| {
+                selected_roots.map_or_else(
+                    || waits.active_len() > 0,
+                    |roots| waits.has_active_for(|task| task_belongs_to_roots(&state, task, roots)),
+                )
+            });
             Ok(DriveState::Idle {
-                next_deadline: state.timers.next_deadline(),
-                inbox_wakeup_required: state
-                    .waits
-                    .as_ref()
-                    .is_some_and(|waits| waits.active_len() > 0),
+                next_deadline,
+                inbox_wakeup_required,
             })
         }
     }

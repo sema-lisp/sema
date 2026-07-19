@@ -756,6 +756,118 @@ fn root_filtered_drive_leaves_a_later_foreign_root_queued() {
 }
 
 #[test]
+fn root_filtered_drive_does_not_report_a_foreign_debug_stop() {
+    let runtime = runtime_with_inline_executor(Rc::new(FakeClock::new()));
+    let foreign = runtime
+        .submit_test_root(TestPreparedTask::debug_stop())
+        .expect("foreign debug root admitted");
+    let selected = runtime
+        .submit_test_root(TestPreparedTask::yield_forever())
+        .expect("selected root admitted");
+
+    assert!(matches!(
+        runtime
+            .drive_roots(&drive_budget(8), &[foreign.id()])
+            .expect("foreign root reaches its debug stop"),
+        super::DriveState::DebugStopped { root, .. } if root == foreign.id()
+    ));
+
+    assert!(matches!(
+        runtime
+            .drive_roots(&drive_budget(8), &[selected.id()])
+            .expect("selected drive remains blocked by the runtime barrier"),
+        super::DriveState::Idle {
+            next_deadline: None,
+            inbox_wakeup_required: false,
+        }
+    ));
+    assert!(matches!(selected.poll_result(), RootPoll::Pending));
+}
+
+#[test]
+fn root_filtered_idle_ignores_a_foreign_timer_deadline() {
+    let clock = Rc::new(FakeClock::new());
+    let runtime = runtime_with_inline_executor(clock.clone());
+    let foreign = runtime
+        .submit_test_root(TestPreparedTask::native(Ok(NativeOutcome::Suspend(
+            NativeSuspend {
+                wait: WaitKind::Timer(Duration::from_secs(800)),
+                continuation: Box::new(CountingContinuation(Arc::new(Mutex::new(Vec::new())))),
+            },
+        ))))
+        .expect("foreign timer root admitted");
+    let channel = runtime.create_channel_for_test(0);
+    let selected = runtime
+        .submit_test_root(TestPreparedTask::native(Ok(NativeOutcome::Suspend(
+            NativeSuspend {
+                wait: WaitKind::Channel(sema_core::runtime::ChannelWait::Receive { channel }),
+                continuation: Box::new(CountingContinuation(Arc::new(Mutex::new(Vec::new())))),
+            },
+        ))))
+        .expect("selected channel root admitted");
+    let one = drive_budget(1);
+
+    while runtime.timer_count_for_test() == 0 {
+        runtime.drive_roots(&one, &[foreign.id()]).unwrap();
+    }
+    while runtime.channel_receiver_queue_len_for_test(channel) == 0 {
+        runtime.drive_roots(&one, &[selected.id()]).unwrap();
+    }
+
+    assert!(matches!(
+        runtime.drive_roots(&one, &[selected.id()]).unwrap(),
+        super::DriveState::Idle {
+            next_deadline: None,
+            inbox_wakeup_required: false,
+        }
+    ));
+    assert!(matches!(selected.poll_result(), RootPoll::Pending));
+    assert_eq!(runtime.timer_count_for_test(), 1);
+}
+
+#[test]
+fn root_filtered_idle_ignores_a_foreign_external_wait() {
+    let runtime = Runtime::new(
+        Rc::new(sema_core::EvalContext::new()),
+        Rc::new(FakeClock::new()),
+        Arc::new(PendingExecutor),
+    )
+    .expect("runtime");
+    let foreign = runtime
+        .submit_test_root(TestPreparedTask::native(Ok(NativeOutcome::Suspend(
+            external_suspend(Arc::new(Mutex::new(Vec::new()))),
+        ))))
+        .expect("foreign external root admitted");
+    let channel = runtime.create_channel_for_test(0);
+    let selected = runtime
+        .submit_test_root(TestPreparedTask::native(Ok(NativeOutcome::Suspend(
+            NativeSuspend {
+                wait: WaitKind::Channel(sema_core::runtime::ChannelWait::Receive { channel }),
+                continuation: Box::new(CountingContinuation(Arc::new(Mutex::new(Vec::new())))),
+            },
+        ))))
+        .expect("selected channel root admitted");
+    let one = drive_budget(1);
+
+    while runtime.active_wait_count_for_test() == 0 {
+        runtime.drive_roots(&one, &[foreign.id()]).unwrap();
+    }
+    while runtime.channel_receiver_queue_len_for_test(channel) == 0 {
+        runtime.drive_roots(&one, &[selected.id()]).unwrap();
+    }
+
+    assert!(matches!(
+        runtime.drive_roots(&one, &[selected.id()]).unwrap(),
+        super::DriveState::Idle {
+            next_deadline: None,
+            inbox_wakeup_required: false,
+        }
+    ));
+    assert!(matches!(selected.poll_result(), RootPoll::Pending));
+    assert_eq!(runtime.active_wait_count_for_test(), 1);
+}
+
+#[test]
 fn runtime_delayed_promise_wait_resumes_with_canonical_settlement() {
     let runtime = runtime_with_inline_executor(Rc::new(FakeClock::new()));
     let promise = runtime.create_pending_promise_for_test();
@@ -4445,6 +4557,48 @@ impl IoExecutor for FakeExecutor {
     }
     fn snapshot(&self) -> ExecutorSnapshot {
         ExecutorSnapshot::default()
+    }
+}
+
+struct PendingExecutor;
+
+impl IoExecutor for PendingExecutor {
+    fn attach_runtime(
+        &self,
+        _runtime_id: RuntimeId,
+    ) -> Result<Arc<dyn ExecutorLease>, ExecutorAttachError> {
+        Ok(Arc::new(PendingLease::default()))
+    }
+
+    fn snapshot(&self) -> ExecutorSnapshot {
+        ExecutorSnapshot::default()
+    }
+}
+
+#[derive(Default)]
+struct PendingLease {
+    submissions: Mutex<Vec<ExecutorDispatch>>,
+}
+
+impl ExecutorLease for PendingLease {
+    fn submit(
+        &self,
+        submission: sema_core::runtime::ExecutorSubmission,
+    ) -> Result<RunningSubmission, SubmissionRejected> {
+        let operation = submission.operation_id();
+        self.submissions
+            .lock()
+            .unwrap()
+            .push(submission.into_dispatch());
+        Ok(RunningSubmission::new(operation))
+    }
+
+    fn snapshot(&self) -> ExecutorSnapshot {
+        ExecutorSnapshot::default()
+    }
+
+    fn shutdown(&self, _deadline: Instant) -> ExecutorShutdown {
+        ExecutorShutdown::Drained(self.snapshot())
     }
 }
 

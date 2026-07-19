@@ -749,6 +749,10 @@ impl WaitRuntime {
         self.active.len()
     }
 
+    pub fn has_active_for(&self, matches: impl Fn(TaskId) -> bool) -> bool {
+        self.active.values().any(|wait| matches(wait.task_id))
+    }
+
     /// Whether `key` names a live external wait (an in-flight offloaded op). Used
     /// to classify a cancelled Waiting task's kind at cancellation-request time so
     /// its executor abort runs immediately, not at the next drive scan.

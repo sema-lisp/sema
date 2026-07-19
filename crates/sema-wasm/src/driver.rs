@@ -51,12 +51,15 @@ use sema_core::runtime::{
 use sema_core::{SemaError, Value, ValueView};
 use sema_eval::Interpreter;
 use sema_vm::runtime::{DriveState, RootHandle, RootOptions, RootPoll};
+use sema_vm::{DebugState, StepMode, StopInfo, StopReason, VM};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::JsFuture;
 use web_time::Instant;
 
-use crate::output::PromiseOutput;
+use crate::output::{PromiseOutput, PromiseOutputEvent};
+
+const DEBUG_INSTRUCTION_BUDGET: u32 = 500_000;
 
 // ─────────────────────────────────────────────────────────────────────────
 // Promise table + macrotask driver
@@ -72,6 +75,25 @@ struct PromiseSettlers {
     handle: RootHandle,
     resolve: Function,
     reject: Function,
+}
+
+/// One JS debugger action (`start`, `continue`, or a step) waiting for the
+/// session to reach its next stable stop or terminal result.
+struct DebugActionSettler {
+    resolve: Function,
+    include_breakpoint_info: bool,
+}
+
+/// Promise-driven debugger state owned by one interpreter. The runtime owns
+/// the paused VM; this record owns the exact root handle, its `DebugState`, and
+/// the currently outstanding JS action Promise (if execution is in flight).
+struct PromiseDebugSession {
+    debug: DebugState,
+    handle: RootHandle,
+    action: Option<DebugActionSettler>,
+    output: Vec<PromiseOutputEvent>,
+    valid_lines: Vec<u32>,
+    breakpoints: Vec<u32>,
 }
 
 thread_local! {
@@ -96,6 +118,7 @@ pub(crate) struct PromiseDriver {
     /// temporary self-retain is released when the last Promise settles.
     active_retain: RefCell<Option<Rc<PromiseDriver>>>,
     output: PromiseOutput,
+    debug_session: RefCell<Option<PromiseDebugSession>>,
 }
 
 impl PromiseDriver {
@@ -108,6 +131,7 @@ impl PromiseDriver {
             runtime_id: Cell::new(None),
             active_retain: RefCell::new(None),
             output: PromiseOutput::default(),
+            debug_session: RefCell::new(None),
         })
     }
 
@@ -117,6 +141,28 @@ impl PromiseDriver {
 
     pub(crate) fn take_output_sink(&self) -> Option<Function> {
         self.output.take_sink()
+    }
+}
+
+impl Drop for PromiseDriver {
+    fn drop(&mut self) {
+        if let Some(timeout) = self.drive_timeout_id.take() {
+            clear_timeout(timeout);
+        }
+        if let Some(session) = self.debug_session.get_mut().take() {
+            let _ = self
+                .interp
+                .command_handle()
+                .cancel_root(session.handle.id());
+            if self.interp.runtime().is_debug_paused() {
+                self.interp.runtime().debug_cancel_paused();
+            }
+        }
+        if let Some(runtime_id) = self.runtime_id.get() {
+            DRIVER_REGISTRY.with(|registry| {
+                registry.borrow_mut().remove(&runtime_id);
+            });
+        }
     }
 }
 
@@ -169,28 +215,44 @@ pub(crate) fn submit(
         capture_output: true,
     };
     match driver.interp.submit_str(src, opts) {
-        Ok(handle) => {
-            let root = handle.id();
-            register_driver(driver, root.runtime());
-            driver.promises.borrow_mut().insert(
-                root,
-                PromiseSettlers {
-                    handle,
-                    resolve,
-                    reject,
-                },
-            );
-            if driver.active_retain.borrow().is_none() {
-                *driver.active_retain.borrow_mut() = Some(Rc::clone(driver));
-            }
-            if let Some(f) = on_root {
-                let _ = f.call1(&JsValue::NULL, &JsValue::from_f64(root.get() as f64));
-            }
-            schedule_drive(driver);
-        }
+        Ok(handle) => adopt(driver, handle, resolve, reject, on_root),
         Err(err) => {
             reject_with_error(&reject, &err);
         }
+    }
+}
+
+/// Adopt an already-submitted root into the same Promise table used by
+/// `evalPromise`. Compiled archive entry points use this after
+/// `Interpreter::submit_compile_result`, so deserialization happens once and
+/// the resulting VM is resumed in place across timer/external waits.
+pub(crate) fn adopt(
+    driver: &Rc<PromiseDriver>,
+    handle: RootHandle,
+    resolve: Function,
+    reject: Function,
+    on_root: Option<Function>,
+) {
+    let root = handle.id();
+    register_driver(driver, root.runtime());
+    driver.promises.borrow_mut().insert(
+        root,
+        PromiseSettlers {
+            handle,
+            resolve,
+            reject,
+        },
+    );
+    retain_while_active(driver);
+    if let Some(f) = on_root {
+        let _ = f.call1(&JsValue::NULL, &JsValue::from_f64(root.get() as f64));
+    }
+    schedule_drive(driver);
+}
+
+fn retain_while_active(driver: &Rc<PromiseDriver>) {
+    if driver.active_retain.borrow().is_none() {
+        *driver.active_retain.borrow_mut() = Some(Rc::clone(driver));
     }
 }
 
@@ -225,6 +287,195 @@ pub(crate) fn cancel_root(driver: &Rc<PromiseDriver>, raw_root_id: f64) -> bool 
     // pending delayed timer and posts an immediate macrotask instead.
     schedule_drive(driver);
     cancelled
+}
+
+/// Start a cooperative debug root and return one Promise for the first stable
+/// stop or terminal result. The seeded VM is submitted exactly once; later
+/// actions resume this same root through [`resume_debug`].
+pub(crate) fn start_debug(
+    driver: &Rc<PromiseDriver>,
+    vm: VM,
+    debug: DebugState,
+    valid_lines: Vec<u32>,
+    breakpoints: Vec<u32>,
+) -> js_sys::Promise {
+    let driver = Rc::clone(driver);
+    let mut vm = Some(vm);
+    let mut debug = Some(debug);
+    js_sys::Promise::new(&mut move |resolve, _reject| {
+        let replaced_own_session = stop_debug(&driver);
+        if !replaced_own_session && driver.interp.runtime().is_debug_paused() {
+            resolve_debug_immediately(
+                &resolve,
+                debug_error_result("another debugger is already paused on this interpreter"),
+            );
+            return;
+        }
+        let opts = RootOptions {
+            name: Some("wasm-debugger".to_string()),
+            capture_output: true,
+        };
+        let Some(vm) = vm.take() else {
+            resolve_debug_immediately(
+                &resolve,
+                debug_error_result("debug VM was already submitted"),
+            );
+            return;
+        };
+        let Some(debug) = debug.take() else {
+            resolve_debug_immediately(
+                &resolve,
+                debug_error_result("debug state was already submitted"),
+            );
+            return;
+        };
+        match driver.interp.runtime().submit_root_with_options(vm, &opts) {
+            Ok(handle) => {
+                let root = handle.id();
+                register_driver(&driver, root.runtime());
+                *driver.debug_session.borrow_mut() = Some(PromiseDebugSession {
+                    debug,
+                    handle,
+                    action: Some(DebugActionSettler {
+                        resolve,
+                        include_breakpoint_info: true,
+                    }),
+                    output: Vec::new(),
+                    valid_lines: valid_lines.clone(),
+                    breakpoints: breakpoints.clone(),
+                });
+                retain_while_active(&driver);
+                schedule_drive(&driver);
+            }
+            Err(error) => resolve_debug_immediately(
+                &resolve,
+                debug_error_result(&format!("debug root submission failed: {error:?}")),
+            ),
+        }
+    })
+}
+
+/// Resume the active Promise-driven debug session in place and settle when it
+/// next stops or terminates. A second action cannot replace one already in
+/// flight; it resolves to an explicit error instead.
+pub(crate) fn resume_debug(driver: &Rc<PromiseDriver>, mode: StepMode) -> js_sys::Promise {
+    let driver = Rc::clone(driver);
+    js_sys::Promise::new(&mut move |resolve, _reject| {
+        let runtime = driver.interp.runtime();
+        let install_error = {
+            let mut slot = driver.debug_session.borrow_mut();
+            match slot.as_mut() {
+                None => Some("No active Promise debug session"),
+                Some(session) if session.action.is_some() => {
+                    Some("A Promise debug action is already running")
+                }
+                Some(_session) if !runtime.is_debug_paused() => {
+                    Some("The Promise debug session is not paused")
+                }
+                Some(session) => {
+                    session.debug.step_mode = mode;
+                    if mode != StepMode::Continue {
+                        if let Some(depth) = runtime.with_paused_task_vm(|vm| vm.frame_count()) {
+                            session.debug.step_frame_depth = depth;
+                        }
+                    }
+                    session.action = Some(DebugActionSettler {
+                        resolve: resolve.clone(),
+                        include_breakpoint_info: false,
+                    });
+                    None
+                }
+            }
+        };
+        if let Some(message) = install_error {
+            resolve_debug_immediately(&resolve, debug_error_result(message));
+            return;
+        }
+        runtime.debug_resume();
+        retain_while_active(&driver);
+        schedule_drive(&driver);
+    })
+}
+
+/// Cancel this driver's exact debug root. If an action Promise is waiting on a
+/// timer/fetch, settle it immediately as cancelled; the runtime cancellation
+/// command is still scheduled for the next turn so resources are reaped.
+pub(crate) fn stop_debug(driver: &Rc<PromiseDriver>) -> bool {
+    let Some(mut session) = driver.debug_session.borrow_mut().take() else {
+        return false;
+    };
+    let root = session.handle.id();
+    let runtime = driver.interp.runtime();
+    let _ = driver.interp.command_handle().cancel_root(root);
+    if runtime.is_debug_paused() {
+        runtime.debug_cancel_paused();
+    }
+    let action = session.action.take();
+    let result = debug_cancelled_result(root, std::mem::take(&mut session.output));
+    drop(session);
+    if let Some(action) = action {
+        resolve_debug_immediately(&action.resolve, result);
+    }
+    schedule_drive(driver);
+    true
+}
+
+pub(crate) fn debug_is_active(driver: &PromiseDriver) -> bool {
+    driver.debug_session.borrow().is_some()
+}
+
+pub(crate) fn debug_locals(driver: &PromiseDriver) -> JsValue {
+    if driver.debug_session.borrow().is_none() {
+        return JsValue::NULL;
+    }
+    let locals = driver
+        .interp
+        .runtime()
+        .with_paused_task_vm(|vm| {
+            let frame = vm.frame_count().saturating_sub(1);
+            vm.debug_locals(frame)
+        })
+        .unwrap_or_default();
+    let array = js_sys::Array::new();
+    for variable in locals {
+        let object = js_sys::Object::new();
+        set_property(&object, "name", JsValue::from_str(&variable.name));
+        set_property(&object, "value", JsValue::from_str(&variable.value));
+        set_property(&object, "type", JsValue::from_str(&variable.type_name));
+        array.push(&object);
+    }
+    array.into()
+}
+
+pub(crate) fn debug_stack_trace(driver: &PromiseDriver) -> JsValue {
+    if driver.debug_session.borrow().is_none() {
+        return js_sys::Array::new().into();
+    }
+    let frames = driver
+        .interp
+        .runtime()
+        .with_paused_task_vm(|vm| vm.debug_stack_trace())
+        .unwrap_or_default();
+    let array = js_sys::Array::new();
+    for frame in frames {
+        let object = js_sys::Object::new();
+        set_property(&object, "name", JsValue::from_str(&frame.name));
+        set_property(&object, "line", JsValue::from_f64(frame.line as f64));
+        set_property(&object, "column", JsValue::from_f64(frame.column as f64));
+        array.push(&object);
+    }
+    array.into()
+}
+
+pub(crate) fn set_debug_breakpoints(driver: &PromiseDriver, lines: &[u32]) -> bool {
+    let mut slot = driver.debug_session.borrow_mut();
+    let Some(session) = slot.as_mut() else {
+        return false;
+    };
+    let source = std::path::PathBuf::from("<playground>");
+    session.debug.set_breakpoints(&source, lines);
+    session.breakpoints = lines.to_vec();
+    true
 }
 
 fn register_driver(driver: &Rc<PromiseDriver>, runtime_id: RuntimeId) {
@@ -392,30 +643,61 @@ fn drive_and_settle(driver: &Rc<PromiseDriver>) {
         // (including on unwind), so it can never leak into an unrelated old
         // `eval`/`evalAsync` call made from a JS callback re-entering the
         // interpreter.
-        let _guard = PromiseDrivenGuard::enter();
+        let _promise_guard = PromiseDrivenGuard::enter();
+        let mut debug_slot = driver.debug_session.borrow_mut();
+        if let Some(session) = debug_slot.as_mut() {
+            session.debug.instructions_remaining = DEBUG_INSTRUCTION_BUDGET;
+        }
+        let _debug_guard = debug_slot
+            .as_mut()
+            .map(|session| sema_vm::ActiveDebugGuard::enter(&mut session.debug));
         match interp.drive_turn() {
             Ok(state) => state,
             Err(fault) => {
-                driver.output.pump(interp);
+                drop(_debug_guard);
+                drop(debug_slot);
+                pump_output(driver);
                 fail_all_pending(driver, &format!("runtime fault: {fault:?}"));
                 return;
             }
         }
     };
 
-    driver.output.pump(interp);
+    pump_output(driver);
     settle_ready_roots(driver);
+    settle_debug_action(driver, &drive_state);
 
-    let pending = !driver.promises.borrow().is_empty();
-    if !pending {
+    let ordinary_pending = !driver.promises.borrow().is_empty();
+    let (debug_active, debug_action_pending) = driver
+        .debug_session
+        .borrow()
+        .as_ref()
+        .map(|session| (true, session.action.is_some()))
+        .unwrap_or((false, false));
+    if !ordinary_pending && !debug_active {
         unregister_driver(driver);
         driver.active_retain.borrow_mut().take();
         return; // idle with nothing left to settle — stop scheduling, no busy loop
     }
+    // A stable cooperative stop intentionally leaves the session alive but has
+    // no action Promise in flight. The debug barrier freezes this runtime until
+    // an explicit continue/step call; scheduling here would busy-spin on the
+    // same `DebugStopped` forever.
+    if matches!(drive_state, DriveState::DebugStopped { .. })
+        || (driver.interp.runtime().is_debug_paused() && !debug_action_pending)
+    {
+        if !ordinary_pending {
+            // No Promise is awaiting progress while paused. Let the JS
+            // interpreter wrapper own this stable session; retaining `self`
+            // here would form a permanent cycle if that wrapper were dropped
+            // without an explicit Stop.
+            driver.active_retain.borrow_mut().take();
+        }
+        return;
+    }
     match drive_state {
-        // More ready work (or a debug stop the host will resume out-of-band):
-        // schedule the next turn immediately.
-        DriveState::Progress { .. } | DriveState::DebugStopped { .. } => schedule_drive(driver),
+        DriveState::Progress { .. } => schedule_drive(driver),
+        DriveState::DebugStopped { .. } => {}
         DriveState::Idle {
             next_deadline: Some(deadline),
             ..
@@ -454,6 +736,129 @@ fn drive_and_settle(driver: &Rc<PromiseDriver>) {
             );
         }
         DriveState::Quiescent | DriveState::ShutdownComplete => {}
+    }
+}
+
+fn pump_output(driver: &PromiseDriver) {
+    let debug_root = driver
+        .debug_session
+        .borrow()
+        .as_ref()
+        .map(|session| session.handle.id());
+    driver.output.pump(&driver.interp, debug_root, |captured| {
+        if let Some(session) = driver.debug_session.borrow_mut().as_mut() {
+            session.output.extend(captured);
+        }
+    });
+}
+
+/// Settle the Promise debugger's current action at a stable stop or terminal
+/// root state. JS callbacks run only after the session `RefCell` borrow is
+/// released, so a `.then(...)` callback may re-enter the interpreter safely.
+fn settle_debug_action(driver: &PromiseDriver, drive_state: &DriveState) {
+    let delivery = {
+        let mut slot = driver.debug_session.borrow_mut();
+        let Some(session) = slot.as_mut() else {
+            return;
+        };
+        let poll = session.handle.poll_result();
+        match poll {
+            RootPoll::Ready(settlement) => {
+                let root = session.handle.id();
+                let output = std::mem::take(&mut session.output);
+                let result = match &settlement.outcome {
+                    sema_core::runtime::TaskOutcome::Returned(value) => {
+                        debug_finished_result(root, value, output)
+                    }
+                    sema_core::runtime::TaskOutcome::Failed(error) => {
+                        debug_failed_result(root, &format_debug_error(error), output)
+                    }
+                    sema_core::runtime::TaskOutcome::Cancelled(_) => {
+                        debug_cancelled_result(root, output)
+                    }
+                };
+                let action = session.action.take();
+                let delivery = action.map(|action| {
+                    let mut result = result;
+                    if action.include_breakpoint_info {
+                        attach_breakpoint_info(
+                            &mut result,
+                            &session.valid_lines,
+                            &session.breakpoints,
+                        );
+                    }
+                    (action.resolve, result)
+                });
+                *slot = None;
+                delivery
+            }
+            RootPoll::Aborted(fault) => {
+                let root = session.handle.id();
+                let result = debug_failed_result(
+                    root,
+                    &format!("debug root aborted: {fault:?}"),
+                    std::mem::take(&mut session.output),
+                );
+                let action = session.action.take();
+                let delivery = action.map(|action| {
+                    let mut result = result;
+                    if action.include_breakpoint_info {
+                        attach_breakpoint_info(
+                            &mut result,
+                            &session.valid_lines,
+                            &session.breakpoints,
+                        );
+                    }
+                    (action.resolve, result)
+                });
+                *slot = None;
+                delivery
+            }
+            RootPoll::RuntimeDropped | RootPoll::InvariantViolation => {
+                let root = session.handle.id();
+                let result = debug_failed_result(
+                    root,
+                    "debug runtime invariant violation",
+                    std::mem::take(&mut session.output),
+                );
+                let action = session.action.take();
+                let delivery = action.map(|action| {
+                    let mut result = result;
+                    if action.include_breakpoint_info {
+                        attach_breakpoint_info(
+                            &mut result,
+                            &session.valid_lines,
+                            &session.breakpoints,
+                        );
+                    }
+                    (action.resolve, result)
+                });
+                *slot = None;
+                delivery
+            }
+            RootPoll::Pending => match drive_state {
+                DriveState::DebugStopped { info, .. } => {
+                    let root = session.handle.id();
+                    let action = session.action.take();
+                    action.map(|action| {
+                        let mut result =
+                            debug_stopped_result(root, info, std::mem::take(&mut session.output));
+                        if action.include_breakpoint_info {
+                            attach_breakpoint_info(
+                                &mut result,
+                                &session.valid_lines,
+                                &session.breakpoints,
+                            );
+                        }
+                        (action.resolve, result)
+                    })
+                }
+                _ => None,
+            },
+        }
+    };
+    if let Some((resolve, result)) = delivery {
+        resolve_debug_immediately(&resolve, result);
     }
 }
 
@@ -509,8 +914,131 @@ fn fail_all_pending(driver: &Rc<PromiseDriver>, message: &str) {
     for entry in pending {
         reject_with_message(&entry.reject, message);
     }
+    let debug_delivery = driver
+        .debug_session
+        .borrow_mut()
+        .take()
+        .and_then(|mut session| {
+            let action = session.action.take()?;
+            let result = debug_failed_result(
+                session.handle.id(),
+                message,
+                std::mem::take(&mut session.output),
+            );
+            Some((action.resolve, result))
+        });
+    if let Some((resolve, result)) = debug_delivery {
+        resolve_debug_immediately(&resolve, result);
+    }
     unregister_driver(driver);
     driver.active_retain.borrow_mut().take();
+}
+
+fn debug_stopped_result(root: RootId, info: &StopInfo, output: Vec<PromiseOutputEvent>) -> JsValue {
+    let object = js_sys::Object::new();
+    set_property(&object, "status", JsValue::from_str("stopped"));
+    set_property(&object, "rootId", JsValue::from_f64(root.get() as f64));
+    set_property(&object, "line", JsValue::from_f64(info.line as f64));
+    let reason = match info.reason {
+        StopReason::Breakpoint => "breakpoint",
+        StopReason::Step => "step",
+        StopReason::Pause => "pause",
+        StopReason::Entry => "entry",
+        StopReason::Exception => "exception",
+    };
+    set_property(&object, "reason", JsValue::from_str(reason));
+    attach_debug_output(&object, output);
+    object.into()
+}
+
+fn debug_finished_result(root: RootId, value: &Value, output: Vec<PromiseOutputEvent>) -> JsValue {
+    let object = js_sys::Object::new();
+    set_property(&object, "status", JsValue::from_str("finished"));
+    set_property(&object, "rootId", JsValue::from_f64(root.get() as f64));
+    let value = if value.is_nil() {
+        JsValue::NULL
+    } else {
+        JsValue::from_str(&sema_core::pretty_print(value, 80))
+    };
+    set_property(&object, "value", value);
+    attach_debug_output(&object, output);
+    object.into()
+}
+
+fn debug_failed_result(root: RootId, message: &str, output: Vec<PromiseOutputEvent>) -> JsValue {
+    let object = js_sys::Object::new();
+    set_property(&object, "status", JsValue::from_str("error"));
+    set_property(&object, "rootId", JsValue::from_f64(root.get() as f64));
+    set_property(&object, "error", JsValue::from_str(message));
+    attach_debug_output(&object, output);
+    object.into()
+}
+
+fn debug_cancelled_result(root: RootId, output: Vec<PromiseOutputEvent>) -> JsValue {
+    let object = js_sys::Object::new();
+    set_property(&object, "status", JsValue::from_str("cancelled"));
+    set_property(&object, "rootId", JsValue::from_f64(root.get() as f64));
+    attach_debug_output(&object, output);
+    object.into()
+}
+
+fn debug_error_result(message: &str) -> JsValue {
+    let object = js_sys::Object::new();
+    set_property(&object, "status", JsValue::from_str("error"));
+    set_property(&object, "error", JsValue::from_str(message));
+    set_property(&object, "output", js_sys::Array::new().into());
+    object.into()
+}
+
+fn attach_breakpoint_info(result: &mut JsValue, valid_lines: &[u32], breakpoints: &[u32]) {
+    let valid = numbers_to_array(valid_lines);
+    let snapped = numbers_to_array(breakpoints);
+    let _ = js_sys::Reflect::set(result, &JsValue::from_str("validLines"), &valid);
+    let _ = js_sys::Reflect::set(result, &JsValue::from_str("breakpoints"), &snapped);
+}
+
+fn attach_debug_output(object: &js_sys::Object, output: Vec<PromiseOutputEvent>) {
+    let texts = js_sys::Array::new();
+    let events = js_sys::Array::new();
+    for event in output {
+        texts.push(&JsValue::from_str(&event.text));
+        let item = js_sys::Object::new();
+        set_property(&item, "stream", JsValue::from_str(event.stream));
+        set_property(&item, "text", JsValue::from_str(&event.text));
+        events.push(&item);
+    }
+    set_property(object, "output", texts.into());
+    set_property(object, "outputEvents", events.into());
+}
+
+fn numbers_to_array(values: &[u32]) -> js_sys::Array {
+    let array = js_sys::Array::new();
+    for value in values {
+        array.push(&JsValue::from_f64(*value as f64));
+    }
+    array
+}
+
+fn set_property(object: &js_sys::Object, key: &str, value: JsValue) {
+    let _ = js_sys::Reflect::set(object, &JsValue::from_str(key), &value);
+}
+
+fn resolve_debug_immediately(resolve: &Function, result: JsValue) {
+    let _ = resolve.call1(&JsValue::NULL, &result);
+}
+
+fn format_debug_error(error: &SemaError) -> String {
+    let mut message = format!("{}", error.inner());
+    if let Some(trace) = error.stack_trace() {
+        message.push_str(&format!("\n{trace}"));
+    }
+    if let Some(hint) = error.hint() {
+        message.push_str(&format!("\n  hint: {hint}"));
+    }
+    if let Some(note) = error.note() {
+        message.push_str(&format!("\n  note: {note}"));
+    }
+    message
 }
 
 fn resolve_with_value(resolve: &Function, value: &Value) {

@@ -196,6 +196,16 @@ fn append_output(s: &str) {
     sema_core::write_stdout(s);
 }
 
+/// Error-channel counterpart to [`append_output`]. Legacy entry points retain
+/// their single buffered `output` array, while a capturing runtime root emits
+/// a real stderr-tagged `OutputEvent` for Promise/debugger consumers.
+fn append_error_output(s: &str) {
+    if !sema_core::promise_driven_quantum_active() {
+        LINE_BUF.with(|b| b.borrow_mut().push_str(s));
+    }
+    sema_core::write_stderr(s);
+}
+
 /// Flush the current line buffer as a completed line.
 ///
 /// A no-op while a promise-driven turn is active — `LINE_BUF` is never
@@ -764,7 +774,7 @@ fn register_wasm_io(env: &Env) {
                 }
                 out.push_str(&format!("{arg}"));
             }
-            append_output(&format!("[error] {out}"));
+            append_error_output(&format!("[error] {out}"));
             flush_line();
             Ok(Value::nil())
         }),
@@ -780,7 +790,7 @@ fn register_wasm_io(env: &Env) {
                 }
                 out.push_str(&format!("{arg}"));
             }
-            append_output(&format!("[error] {out}"));
+            append_error_output(&format!("[error] {out}"));
             flush_line();
             Ok(Value::nil())
         }),
@@ -2089,6 +2099,29 @@ impl WasmInterpreter {
         capture.await_as_old_json(promise).await
     }
 
+    /// Await an already-submitted root through this interpreter's macrotask
+    /// driver while preserving the compatibility JSON/output shape. Used by
+    /// precompiled archive entries, whose deserialized VM must not be rebuilt
+    /// or executed through the synchronous host boundary.
+    async fn await_submitted_root_via_promise_seam(
+        &self,
+        handle: sema_vm::runtime::RootHandle,
+    ) -> JsValue {
+        let capture = PromiseCapture::install(&self.promise_driver);
+        let driver = Rc::clone(&self.promise_driver);
+        let on_root = capture.on_root_id().dyn_into::<js_sys::Function>().ok();
+        let mut handle = Some(handle);
+        let promise = js_sys::Promise::new(&mut move |resolve, reject| {
+            if let Some(handle) = handle.take() {
+                driver::adopt(&driver, handle, resolve, reject, on_root.clone());
+            } else {
+                let error = js_sys::Error::new("archive root was already adopted");
+                let _ = reject.call1(&JsValue::NULL, &error);
+            }
+        });
+        capture.await_as_old_json(promise).await
+    }
+
     /// Evaluate in the global env so defines persist
     #[wasm_bindgen(js_name = evalGlobal)]
     pub fn eval_global(&self, code: &str) -> JsValue {
@@ -2214,6 +2247,128 @@ impl WasmInterpreter {
     #[wasm_bindgen(js_name = evalVMAsync)]
     pub async fn eval_vm_async(&self, code: &str) -> JsValue {
         self.eval_once_via_promise_seam(code).await
+    }
+
+    /// Start a per-interpreter, Promise-driven debug session. The returned
+    /// Promise settles only at a stable stop or terminal outcome; timer/HTTP
+    /// waits yield to the browser and resume the same runtime root.
+    #[wasm_bindgen(js_name = debugStartPromise)]
+    pub fn debug_start_promise(
+        &self,
+        code: &str,
+        breakpoint_lines: &js_sys::Array,
+    ) -> js_sys::Promise {
+        self.inner.ctx.eval_steps.set(0);
+        let bp_lines: Vec<u32> = breakpoint_lines
+            .iter()
+            .filter_map(|value| value.as_f64().map(|line| line as u32))
+            .collect();
+        let (exprs, spans) = match sema_reader::read_many_with_spans(code) {
+            Ok(parsed) => parsed,
+            Err(error) => return js_sys::Promise::resolve(&self.debug_error_result(&error)),
+        };
+        self.inner.ctx.merge_span_table(spans);
+        if exprs.is_empty() {
+            return js_sys::Promise::resolve(&self.debug_finished_result(&sema_core::Value::nil()));
+        }
+        let expanded: Vec<_> = match self.inner.expand_for_vm_batch(&exprs) {
+            Ok(values) => values.into_iter().filter(|value| !value.is_nil()).collect(),
+            Err(error) => return js_sys::Promise::resolve(&self.debug_error_result(&error)),
+        };
+        if expanded.is_empty() {
+            return js_sys::Promise::resolve(&self.debug_finished_result(&sema_core::Value::nil()));
+        }
+
+        let source_file = std::path::PathBuf::from("<playground>");
+        let span_map = self.inner.ctx.span_table.borrow().clone();
+        let program = match sema_vm::compile_program_with_spans(
+            &expanded,
+            &span_map,
+            Some(source_file.clone()),
+        ) {
+            Ok(program) => program,
+            Err(error) => return js_sys::Promise::resolve(&self.debug_error_result(&error)),
+        };
+        let valid_lines = sema_vm::valid_breakpoint_lines(&program.closure, &program.functions);
+        let snapped: Vec<u32> = bp_lines
+            .iter()
+            .filter_map(|line| sema_vm::snap_breakpoint_line(*line, &valid_lines))
+            .collect();
+        let mut vm = match sema_vm::VM::new(
+            self.inner.global_env.clone(),
+            program.functions,
+            &[],
+            program.main_cache_slots,
+        ) {
+            Ok(vm) => vm,
+            Err(error) => {
+                return js_sys::Promise::resolve(
+                    &self.debug_error_str(&format!("VM init error: {error}")),
+                );
+            }
+        };
+        vm.seed_main_frame(program.closure);
+
+        let mut debug = sema_vm::DebugState::new_headless();
+        if !snapped.is_empty() {
+            debug.set_breakpoints(&source_file, &snapped);
+        }
+        debug.step_mode = if snapped.is_empty() {
+            sema_vm::StepMode::StepInto
+        } else {
+            sema_vm::StepMode::Continue
+        };
+        debug.instructions_remaining = WASM_DEBUG_INSTRUCTION_BUDGET;
+        driver::start_debug(&self.promise_driver, vm, debug, valid_lines, snapped)
+    }
+
+    #[wasm_bindgen(js_name = debugContinuePromise)]
+    pub fn debug_continue_promise(&self) -> js_sys::Promise {
+        driver::resume_debug(&self.promise_driver, sema_vm::StepMode::Continue)
+    }
+
+    #[wasm_bindgen(js_name = debugStepIntoPromise)]
+    pub fn debug_step_into_promise(&self) -> js_sys::Promise {
+        driver::resume_debug(&self.promise_driver, sema_vm::StepMode::StepInto)
+    }
+
+    #[wasm_bindgen(js_name = debugStepOverPromise)]
+    pub fn debug_step_over_promise(&self) -> js_sys::Promise {
+        driver::resume_debug(&self.promise_driver, sema_vm::StepMode::StepOver)
+    }
+
+    #[wasm_bindgen(js_name = debugStepOutPromise)]
+    pub fn debug_step_out_promise(&self) -> js_sys::Promise {
+        driver::resume_debug(&self.promise_driver, sema_vm::StepMode::StepOut)
+    }
+
+    #[wasm_bindgen(js_name = debugStopPromise)]
+    pub fn debug_stop_promise(&self) -> bool {
+        driver::stop_debug(&self.promise_driver)
+    }
+
+    #[wasm_bindgen(js_name = debugGetLocalsPromise)]
+    pub fn debug_get_locals_promise(&self) -> JsValue {
+        driver::debug_locals(&self.promise_driver)
+    }
+
+    #[wasm_bindgen(js_name = debugGetStackTracePromise)]
+    pub fn debug_get_stack_trace_promise(&self) -> JsValue {
+        driver::debug_stack_trace(&self.promise_driver)
+    }
+
+    #[wasm_bindgen(js_name = debugSetBreakpointsPromise)]
+    pub fn debug_set_breakpoints_promise(&self, lines: &js_sys::Array) -> bool {
+        let lines: Vec<u32> = lines
+            .iter()
+            .filter_map(|value| value.as_f64().map(|line| line as u32))
+            .collect();
+        driver::set_debug_breakpoints(&self.promise_driver, &lines)
+    }
+
+    #[wasm_bindgen(js_name = debugIsActivePromise)]
+    pub fn debug_is_active_promise(&self) -> bool {
+        driver::debug_is_active(&self.promise_driver)
     }
 
     /// Start a debug session. Compiles the code, sets breakpoints on given lines,
@@ -3029,15 +3184,9 @@ impl WasmInterpreter {
     /// Execute an embedded archive entry path with real (single-execution)
     /// async HTTP/sleep support (P6-3 step 5).
     ///
-    /// A source-text entry is submitted as ONE root via
-    /// [`Self::eval_once_via_promise_seam_at_path`] — the program body never
-    /// replays, and `http/get`/`async/sleep` inside it get the real
-    /// runtime-ABI suspend. A precompiled bytecode entry has no
-    /// submit-a-root equivalent (`Interpreter::submit_str` only accepts
-    /// source text), so it stays on the direct single-execution path
-    /// `runEntry` already used; an `http/get` inside one now surfaces a
-    /// clear, honest error instead of the deleted replay loop silently
-    /// leaking the internal HTTP marker string.
+    /// Source-text and precompiled entries are each submitted as one root and
+    /// adopted by the same macrotask Promise driver. The program body never
+    /// replays, and `http/get`/`async/sleep` resume the original root in place.
     #[wasm_bindgen(js_name = runEntryAsync)]
     pub async fn run_entry_async(&self, path: &str) -> JsValue {
         let entry_path = std::path::PathBuf::from(path);
@@ -3051,25 +3200,20 @@ impl WasmInterpreter {
         };
 
         if sema_vm::is_bytecode_file(&bytes) {
-            OUTPUT.with(|o| o.borrow_mut().clear());
-            LINE_BUF.with(|b| b.borrow_mut().clear());
             self.inner.ctx.push_file_path(entry_path.clone());
             let result = sema_vm::deserialize_from_bytes(&bytes).and_then(|compiled| {
-                sema_eval::execute_compile_result(
-                    &self.inner.ctx,
-                    self.inner.global_env.clone(),
+                self.inner.submit_compile_result(
                     compiled,
+                    sema_vm::runtime::RootOptions {
+                        name: Some(entry_path.display().to_string()),
+                        capture_output: true,
+                    },
                 )
             });
             self.inner.ctx.pop_file_path();
             return match result {
-                Ok(val) => self.eval_success_result(&val),
-                Err(e) if is_http_await_marker(&e) => self.eval_error_result(&SemaError::eval(
-                    "http/get: a precompiled bytecode archive entry cannot perform HTTP \
-                     requests synchronously; rebuild the archive from source, or run it \
-                     through evalPromise",
-                )),
-                Err(e) => self.eval_error_result(&e),
+                Ok(handle) => self.await_submitted_root_via_promise_seam(handle).await,
+                Err(error) => self.eval_error_result(&error),
             };
         }
 

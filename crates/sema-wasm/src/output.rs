@@ -22,6 +22,14 @@ use sema_eval::Interpreter;
 use sema_vm::runtime::OutputEvent;
 use wasm_bindgen::prelude::*;
 
+/// One output event privately buffered for a Promise-driven debugger root.
+/// The compatibility `output` array uses `text`; debugger clients that need
+/// stream fidelity can consume both fields through `outputEvents`.
+pub(crate) struct PromiseOutputEvent {
+    pub(crate) stream: &'static str,
+    pub(crate) text: String,
+}
+
 /// One interpreter's root-tagged output sink. The callback is instance state:
 /// two `SemaInterpreter` objects may use the same local root numbers without
 /// replacing or receiving each other's output callbacks.
@@ -44,22 +52,44 @@ impl PromiseOutput {
         self.sink.borrow_mut().take()
     }
 
-    /// Drain every `OutputEvent` captured since the last call (across every
-    /// `capture_output` root on `interp`'s runtime) and forward each to the
-    /// installed sink in order. A no-op (but still drains, so nothing piles up
-    /// unboundedly in the sink) when no JS sink is installed.
-    pub(crate) fn pump(&self, interp: &Interpreter) {
+    /// Drain every `OutputEvent` captured since the last call. Events belonging
+    /// to `captured_root` are returned to that root's private debugger buffer;
+    /// every other event is forwarded to the ordinary Promise sink in order.
+    /// This keeps debugger action output out of an unrelated `evalPromise`
+    /// callback without changing that callback's behavior for ordinary roots.
+    pub(crate) fn pump(
+        &self,
+        interp: &Interpreter,
+        captured_root: Option<RootId>,
+        retain_captured: impl FnOnce(Vec<PromiseOutputEvent>),
+    ) {
         let events = interp.take_output();
         if events.is_empty() {
+            retain_captured(Vec::new());
             return;
         }
-        let Some(sink) = self.sink.borrow().clone() else {
-            return;
-        };
+        let mut captured = Vec::new();
+        let mut forwarded = Vec::new();
         for event in events {
             let (root, stream, text) = match event {
                 OutputEvent::Stdout { root, text } => (root, "stdout", text),
                 OutputEvent::Stderr { root, text } => (root, "stderr", text),
+            };
+            if captured_root == Some(root) {
+                captured.push(PromiseOutputEvent { stream, text });
+                continue;
+            }
+            forwarded.push((root, stream, text));
+        }
+
+        // Retain private debugger output before invoking an ordinary sink: a
+        // sink is arbitrary JS and may re-enter `debugStopPromise`, which must
+        // still settle with every event produced before that stop.
+        retain_captured(captured);
+        let sink = self.sink.borrow().clone();
+        for (root, stream, text) in forwarded {
+            let Some(sink) = &sink else {
+                continue;
             };
             let root_val = JsValue::from_f64(root_id_as_f64(root));
             let stream_val = JsValue::from_str(stream);

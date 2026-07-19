@@ -24,8 +24,8 @@
   ],
   "scripts": {
     "build": "node build.mjs",
-    "dev": "node build.mjs && npx serve -l 8787",
-    "serve": "npx serve -l 8787",
+    "dev": "node build.mjs && node tests/serve.mjs 8787",
+    "serve": "node tests/serve.mjs",
     "test": "npx playwright test",
     "test:ui": "npx playwright test --ui"
   },

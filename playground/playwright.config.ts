@@ -11,7 +11,7 @@ export default defineConfig({
     baseURL: `http://localhost:${port}`,
   },
   webServer: {
-    command: `npx serve -l ${port}`,
+    command: `npm run serve -- ${port}`,
     port,
     reuseExistingServer: true,
   },

@@ -159,6 +159,8 @@ Write a list of strings to a file, one per line.
 
 Iterate over lines of a file, calling a function on each line. Memory-efficient for large files.
 
+The streaming line operations use a 64 KiB read buffer and bounded batches. Each line may contain at most 256 KiB of content. A trailing `\n` or `\r\n` does not count toward the limit; a longer line raises an error.
+
 ```sema
 (file/for-each-line "data.txt"
   (fn (line) (println line)))
@@ -166,7 +168,7 @@ Iterate over lines of a file, calling a function on each line. Memory-efficient 
 
 ### `file/fold-lines`
 
-Fold over lines of a file with an accumulator. Uses a 256KB buffer for high throughput on large files.
+Fold over lines of a file with an accumulator.
 
 ```sema
 (file/fold-lines "data.csv"

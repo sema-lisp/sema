@@ -26,8 +26,8 @@ mod io;
 /// knobs used by the resource-contract tests.
 #[cfg(not(target_arch = "wasm32"))]
 pub use io::{
-    fs_peak_inflight, reset_fs_inflight, set_fs_byte_cap, set_fs_list_cap, set_fs_test_delay_ms,
-    FS_BYTE_CAP_DEFAULT, FS_LIST_CAP_DEFAULT,
+    fs_current_inflight, fs_peak_inflight, reset_fs_inflight, set_fs_byte_cap, set_fs_list_cap,
+    set_fs_test_delay_ms, FS_BYTE_CAP_DEFAULT, FS_LIST_CAP_DEFAULT,
 };
 pub(crate) mod json;
 #[cfg(not(target_arch = "wasm32"))]

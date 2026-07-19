@@ -1093,6 +1093,11 @@ pub fn fs_peak_inflight() -> usize {
     FS_PEAK_INFLIGHT.load(AtomicOrdering::SeqCst)
 }
 
+/// Quarantined file jobs currently executing on a worker.
+pub fn fs_current_inflight() -> usize {
+    FS_INFLIGHT.load(AtomicOrdering::SeqCst)
+}
+
 /// Reset the in-flight peak gauge (call before observing overlap in a test).
 pub fn reset_fs_inflight() {
     FS_PEAK_INFLIGHT.store(0, AtomicOrdering::SeqCst);
@@ -1349,22 +1354,425 @@ fn fs_write_cap_check(op: &str, len: usize) -> Result<(), SemaError> {
     Ok(())
 }
 
-// ── Async line-streaming (file/for-each-line, file/fold-lines[-bytes]) ────
+// ── Cooperative line streaming (file/for-each-line, file/fold-lines[-bytes]) ─
 //
-// These natives run a Sema callback (`!Send`, touches `Value`s — cannot cross
-// the thread boundary) once per line, so the whole read loop can't just be
-// handed to `fs_offload` like a stateless read/write. Nor can the file be
-// read to completion up front — an unbounded `fs_offload` slurp would defeat
-// the "huge file" case these iterators exist for. Instead each offloaded
-// round-trip reads a BOUNDED chunk of lines on the worker; the chunk is
-// handed back and the callback runs per-line on the VM thread; then the next
-// chunk is offloaded — repeating via a hand-rolled `IoHandle` poll closure
-// (the same "poll immediately re-arms the next stage" shape as
-// `stream.rs`'s `checkout_offload`, minus the checkout: the `BufReader` here
-// is owned solely by this call, never shared, so there's nothing to
-// reinstall/tombstone — an abandoned in-flight chunk read just finishes on
-// the worker and is dropped, exactly like `fs_offload`'s own no-abort-hook
-// rationale).
+// The file reader is moved to a blocking worker for one bounded batch of lines,
+// then returned to the VM thread while each Sema callback is driven as a
+// structural `NativeOutcome::Call`. A callback may therefore park on a timer,
+// channel, or nested async operation without blocking sibling tasks. Only raw
+// strings/bytes and the `BufReader` cross the worker boundary; every live Sema
+// `Value` stays in a traced continuation on the VM thread. Cancellation drops
+// that continuation (and its reader) or discards a still-running bounded read.
+
+const FILE_LINE_CHUNK_MAX_LINES: usize = 256;
+const FILE_LINE_CHUNK_MAX_BYTES: usize = 256 * 1024;
+const FILE_LINE_READER_BUFFER_BYTES: usize = 64 * 1024;
+
+#[derive(Clone, Copy)]
+enum FileLineKind {
+    ForEachText,
+    FoldText,
+    FoldBytes,
+}
+
+impl FileLineKind {
+    fn op(self) -> &'static str {
+        match self {
+            Self::ForEachText => "file/for-each-line",
+            Self::FoldText => "file/fold-lines",
+            Self::FoldBytes => "file/fold-lines-bytes",
+        }
+    }
+
+    fn is_bytes(self) -> bool {
+        matches!(self, Self::FoldBytes)
+    }
+}
+
+enum FileLineItem {
+    Text(String),
+    Bytes(Vec<u8>),
+}
+
+impl FileLineItem {
+    fn into_value(self) -> Value {
+        match self {
+            Self::Text(line) => Value::string_owned(line),
+            Self::Bytes(line) => Value::bytevector(line),
+        }
+    }
+}
+
+struct FileLineReader {
+    reader: std::io::BufReader<std::fs::File>,
+    pending_line: Vec<u8>,
+    batch_lines: bool,
+}
+
+struct FileLineChunk {
+    reader: FileLineReader,
+    lines: std::collections::VecDeque<FileLineItem>,
+    eof: bool,
+    terminal_error: Option<String>,
+}
+
+fn finish_file_line(
+    pending_line: &mut Vec<u8>,
+    terminated: bool,
+    bytes: bool,
+    op: &str,
+    path: &str,
+) -> Result<FileLineItem, String> {
+    if terminated && pending_line.last() == Some(&b'\r') {
+        pending_line.pop();
+    }
+    let line = std::mem::take(pending_line);
+    if bytes {
+        Ok(FileLineItem::Bytes(line))
+    } else {
+        String::from_utf8(line)
+            .map(FileLineItem::Text)
+            .map_err(|_| format!("{op} {path}: stream did not contain valid UTF-8"))
+    }
+}
+
+fn oversized_file_line_error(op: &str, path: &str) -> String {
+    format!(
+        "{op} {path}: line exceeds the {FILE_LINE_CHUNK_MAX_BYTES}-byte cooperative streaming limit"
+    )
+}
+
+fn read_file_line_chunk(
+    op: &'static str,
+    path: &str,
+    reader: Option<FileLineReader>,
+    bytes: bool,
+) -> Result<FileLineChunk, String> {
+    let mut state = match reader {
+        Some(reader) => reader,
+        None => {
+            let file =
+                std::fs::File::open(path).map_err(|error| format!("{op} {path}: {error}"))?;
+            let batch_lines = file.metadata().is_ok_and(|metadata| metadata.is_file());
+            FileLineReader {
+                reader: std::io::BufReader::with_capacity(FILE_LINE_READER_BUFFER_BYTES, file),
+                pending_line: Vec::with_capacity(128),
+                batch_lines,
+            }
+        }
+    };
+    let mut lines = std::collections::VecDeque::with_capacity(FILE_LINE_CHUNK_MAX_LINES);
+    let mut bytes_read = 0usize;
+    let mut eof = false;
+    let mut terminal_error = None;
+
+    while lines.len() < FILE_LINE_CHUNK_MAX_LINES && bytes_read < FILE_LINE_CHUNK_MAX_BYTES {
+        let chunk_remaining = FILE_LINE_CHUNK_MAX_BYTES - bytes_read;
+        let pending_len = state.pending_line.len();
+        let (consume, complete) = {
+            let available = match state.reader.fill_buf() {
+                Ok(available) => available,
+                Err(error) => {
+                    terminal_error = Some(format!("{op} {path}: {error}"));
+                    break;
+                }
+            };
+            if available.is_empty() {
+                eof = true;
+                if state.pending_line.len() > FILE_LINE_CHUNK_MAX_BYTES {
+                    terminal_error = Some(oversized_file_line_error(op, path));
+                } else if !state.pending_line.is_empty() {
+                    match finish_file_line(&mut state.pending_line, false, bytes, op, path) {
+                        Ok(line) => lines.push_back(line),
+                        Err(error) => terminal_error = Some(error),
+                    }
+                }
+                break;
+            }
+
+            let scan_len = available.len().min(chunk_remaining);
+            match available[..scan_len].iter().position(|byte| *byte == b'\n') {
+                Some(newline) => {
+                    let trailing_cr = if newline > 0 {
+                        available[newline - 1] == b'\r'
+                    } else {
+                        state.pending_line.last() == Some(&b'\r')
+                    };
+                    let content_len = pending_len + newline - usize::from(trailing_cr);
+                    if content_len > FILE_LINE_CHUNK_MAX_BYTES {
+                        terminal_error = Some(oversized_file_line_error(op, path));
+                        break;
+                    }
+                    state.pending_line.extend_from_slice(&available[..newline]);
+                    (newline + 1, true)
+                }
+                None => {
+                    // Keep one provisional CR beyond the content limit until
+                    // the next byte proves it is a CRLF terminator. EOF or any
+                    // non-LF successor leaves it as oversized line content.
+                    let storage_remaining =
+                        (FILE_LINE_CHUNK_MAX_BYTES + 1).saturating_sub(state.pending_line.len());
+                    if scan_len > storage_remaining
+                        || (pending_len + scan_len > FILE_LINE_CHUNK_MAX_BYTES
+                            && available[scan_len - 1] != b'\r')
+                    {
+                        terminal_error = Some(oversized_file_line_error(op, path));
+                        break;
+                    }
+                    state.pending_line.extend_from_slice(&available[..scan_len]);
+                    (scan_len, false)
+                }
+            }
+        };
+        state.reader.consume(consume);
+        bytes_read += consume;
+
+        if complete {
+            match finish_file_line(&mut state.pending_line, true, bytes, op, path) {
+                Ok(line) => lines.push_back(line),
+                Err(error) => {
+                    terminal_error = Some(error);
+                    break;
+                }
+            }
+            if !state.batch_lines {
+                break;
+            }
+        }
+    }
+
+    Ok(FileLineChunk {
+        reader: state,
+        lines,
+        eof,
+        terminal_error,
+    })
+}
+
+struct FileLineChunkDecoder {
+    op: &'static str,
+    slot: std::rc::Rc<std::cell::RefCell<Option<FileLineChunk>>>,
+}
+
+impl Trace for FileLineChunkDecoder {
+    fn trace(&self, _sink: &mut dyn FnMut(GcEdge<'_>)) -> bool {
+        true
+    }
+}
+
+impl CompletionDecoder for FileLineChunkDecoder {
+    fn decode(
+        self: Box<Self>,
+        _context: &mut NativeCallContext<'_>,
+        result: Result<SendPayload, ExternalFailure>,
+    ) -> DecodedCompletion {
+        match result {
+            Ok(payload) => {
+                match downcast_send_payload::<Result<FileLineChunk, String>>(payload, self.op) {
+                    Ok(Ok(chunk)) => {
+                        *self.slot.borrow_mut() = Some(chunk);
+                        Ok(Value::nil())
+                    }
+                    Ok(Err(message)) => Err(SemaError::Io(message)),
+                    Err(failure) => Err(SemaError::eval(failure.message().to_string())),
+                }
+            }
+            Err(failure) => Err(SemaError::eval(format!(
+                "{}: {}",
+                self.op,
+                failure.message()
+            ))),
+        }
+    }
+}
+
+enum FileLineResult {
+    ForEach,
+    Fold(Value),
+}
+
+impl FileLineResult {
+    fn callback_args(&mut self, line: Value) -> Vec<Value> {
+        match self {
+            Self::ForEach => vec![line],
+            Self::Fold(accumulator) => {
+                vec![std::mem::replace(accumulator, Value::nil()), line]
+            }
+        }
+    }
+
+    fn accept_callback_result(&mut self, value: Value) {
+        if let Self::Fold(accumulator) = self {
+            *accumulator = value;
+        }
+    }
+
+    fn finish(self) -> Value {
+        match self {
+            Self::ForEach => Value::nil(),
+            Self::Fold(accumulator) => accumulator,
+        }
+    }
+
+    fn trace(&self, sink: &mut dyn FnMut(GcEdge<'_>)) {
+        if let Self::Fold(accumulator) = self {
+            sink(GcEdge::Value(accumulator));
+        }
+    }
+}
+
+struct FileLineContinuation {
+    kind: FileLineKind,
+    path: String,
+    callback: Value,
+    result: FileLineResult,
+    reader: Option<FileLineReader>,
+    lines: std::collections::VecDeque<FileLineItem>,
+    eof: bool,
+    terminal_error: Option<String>,
+    read_slot: Option<std::rc::Rc<std::cell::RefCell<Option<FileLineChunk>>>>,
+}
+
+impl Trace for FileLineContinuation {
+    fn trace(&self, sink: &mut dyn FnMut(GcEdge<'_>)) -> bool {
+        sink(GcEdge::Value(&self.callback));
+        self.result.trace(sink);
+        true
+    }
+}
+
+impl FileLineContinuation {
+    fn start(
+        kind: FileLineKind,
+        path: String,
+        callback: Value,
+        result: FileLineResult,
+    ) -> NativeResult {
+        Box::new(Self {
+            kind,
+            path,
+            callback,
+            result,
+            reader: None,
+            lines: std::collections::VecDeque::new(),
+            eof: false,
+            terminal_error: None,
+            read_slot: None,
+        })
+        .suspend_read()
+    }
+
+    fn suspend_read(mut self: Box<Self>) -> NativeResult {
+        let op = self.kind.op();
+        let path = self.path.clone();
+        let reader = self.reader.take();
+        let bytes = self.kind.is_bytes();
+        let slot = std::rc::Rc::new(std::cell::RefCell::new(None));
+        self.read_slot = Some(slot.clone());
+
+        let kind = CompletionKind::try_from_raw(FS_COMPLETION_KIND)
+            .expect("file completion kind is nonzero");
+        let bound = QuarantineBound::hard_deadline(FS_CLEANUP_DEADLINE)
+            .expect("file cleanup deadline is nonzero");
+        let prepared = PreparedExternalOperation::quarantined_blocking(
+            kind,
+            Box::new(FileLineChunkDecoder { op, slot }),
+            bound,
+            move || {
+                let inflight = FS_INFLIGHT.fetch_add(1, AtomicOrdering::SeqCst) + 1;
+                FS_PEAK_INFLIGHT.fetch_max(inflight, AtomicOrdering::SeqCst);
+                let delay = FS_TEST_DELAY_MS.load(AtomicOrdering::Relaxed);
+                if delay > 0 {
+                    std::thread::sleep(Duration::from_millis(delay));
+                }
+                let result = read_file_line_chunk(op, &path, reader, bytes);
+                FS_INFLIGHT.fetch_sub(1, AtomicOrdering::SeqCst);
+                Ok(Box::new(result) as SendPayload)
+            },
+        );
+        Ok(NativeOutcome::Suspend(NativeSuspend {
+            wait: WaitKind::External(Box::new(prepared)),
+            continuation: self,
+        }))
+    }
+
+    fn continue_iteration(mut self: Box<Self>) -> NativeResult {
+        if let Some(line) = self.lines.pop_front() {
+            let args = self.result.callback_args(line.into_value());
+            return Ok(NativeOutcome::Call(sema_core::runtime::NativeCall {
+                callable: self.callback.clone(),
+                args,
+                continuation: self,
+            }));
+        }
+        if let Some(error) = self.terminal_error.take() {
+            return Err(SemaError::Io(error));
+        }
+        if self.eof {
+            return Ok(NativeOutcome::Return(self.result.finish()));
+        }
+        self.suspend_read()
+    }
+}
+
+impl NativeContinuation for FileLineContinuation {
+    fn resume(
+        mut self: Box<Self>,
+        _context: &mut NativeCallContext<'_>,
+        input: ResumeInput,
+    ) -> NativeResult {
+        if let Some(slot) = self.read_slot.take() {
+            match input {
+                ResumeInput::Returned(_) => {}
+                ResumeInput::Failed(error) => return Err(error),
+                ResumeInput::Cancelled(reason) => {
+                    return Err(SemaError::eval(format!(
+                        "{} was cancelled ({reason:?})",
+                        self.kind.op()
+                    )))
+                }
+                ResumeInput::Runtime(_) => {
+                    return Err(SemaError::eval(format!(
+                        "{} continuation received an unexpected runtime response",
+                        self.kind.op()
+                    )))
+                }
+            }
+            let chunk = slot.borrow_mut().take().ok_or_else(|| {
+                SemaError::eval(format!(
+                    "{} completion did not return its line reader",
+                    self.kind.op()
+                ))
+            })?;
+            self.reader = Some(chunk.reader);
+            self.lines = chunk.lines;
+            self.eof = chunk.eof;
+            self.terminal_error = chunk.terminal_error;
+        } else {
+            let value = crate::list::resume_value(input, self.kind.op())?;
+            self.result.accept_callback_result(value);
+        }
+        self.continue_iteration()
+    }
+}
+
+fn file_line_runtime(args: &[Value], kind: FileLineKind) -> NativeResult {
+    let op = kind.op();
+    match kind {
+        FileLineKind::ForEachText => check_arity!(args, op, 2),
+        FileLineKind::FoldText | FileLineKind::FoldBytes => check_arity!(args, op, 3),
+    }
+    let path = args[0]
+        .as_str()
+        .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?
+        .to_string();
+    let callback = args[1].clone();
+    let result = match kind {
+        FileLineKind::ForEachText => FileLineResult::ForEach,
+        FileLineKind::FoldText | FileLineKind::FoldBytes => FileLineResult::Fold(args[2].clone()),
+    };
+    FileLineContinuation::start(kind, path, callback, result)
+}
 
 /// Crate-internal: poll stdin for a key within `ms` and decode it, for
 /// `event/select`'s `:key` source. Returns the key event, or `None` if no key
@@ -2207,7 +2615,7 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
         },
     );
 
-    crate::register_fn_path_gated(
+    crate::register_runtime_fn_path_gated(
         env,
         sandbox,
         Caps::FS_READ,
@@ -2215,6 +2623,9 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
         &[0],
         |args| {
             check_arity!(args, "file/for-each-line", 2);
+            if sema_core::in_runtime_quantum() {
+                return file_line_runtime(args, FileLineKind::ForEachText);
+            }
             let path = args[0]
                 .as_str()
                 .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
@@ -2241,12 +2652,12 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
                     }
                     sema_core::call_callback(ctx, &func, &[Value::string(&line_buf)])?;
                 }
-                Ok(Value::nil())
+                Ok(NativeOutcome::Return(Value::nil()))
             })
         },
     );
 
-    crate::register_fn_path_gated(
+    crate::register_runtime_fn_path_gated(
         env,
         sandbox,
         Caps::FS_READ,
@@ -2254,6 +2665,9 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
         &[0],
         |args| {
             check_arity!(args, "file/fold-lines", 3);
+            if sema_core::in_runtime_quantum() {
+                return file_line_runtime(args, FileLineKind::FoldText);
+            }
             let path = args[0]
                 .as_str()
                 .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
@@ -2289,12 +2703,12 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
                     let mut cb_args = [std::mem::replace(&mut acc, Value::nil()), line_val];
                     acc = sema_core::call_callback_owned(ctx, &func, &mut cb_args)?;
                 }
-                Ok(acc)
+                Ok(NativeOutcome::Return(acc))
             })
         },
     );
 
-    crate::register_fn_path_gated(
+    crate::register_runtime_fn_path_gated(
         env,
         sandbox,
         Caps::FS_READ,
@@ -2302,6 +2716,9 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
         &[0],
         |args| {
             check_arity!(args, "file/fold-lines-bytes", 3);
+            if sema_core::in_runtime_quantum() {
+                return file_line_runtime(args, FileLineKind::FoldBytes);
+            }
             let path = args[0]
                 .as_str()
                 .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
@@ -2344,7 +2761,7 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
                     let mut cb_args = [std::mem::replace(&mut acc, Value::nil()), line_val];
                     acc = sema_core::call_callback_owned(ctx, &func, &mut cb_args)?;
                 }
-                Ok(acc)
+                Ok(NativeOutcome::Return(acc))
             })
         },
     );
@@ -2664,6 +3081,103 @@ mod runtime_poll_tests {
             panic!("zero-timeout probe must not suspend");
         };
         assert!(value.is_nil());
+    }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod file_line_trace_tests {
+    use super::*;
+
+    fn edge_count(trace: &dyn Trace) -> usize {
+        let mut count = 0;
+        assert!(trace.trace(&mut |_| count += 1));
+        count
+    }
+
+    #[test]
+    fn line_continuation_traces_callback_and_fold_accumulator() {
+        let continuation = FileLineContinuation {
+            kind: FileLineKind::FoldText,
+            path: "fixture".to_string(),
+            callback: Value::string("callback"),
+            result: FileLineResult::Fold(Value::string("accumulator")),
+            reader: None,
+            lines: std::collections::VecDeque::from([
+                FileLineItem::Text("raw-line".to_string()),
+                FileLineItem::Bytes(vec![1, 2, 3]),
+            ]),
+            eof: false,
+            terminal_error: None,
+            read_slot: Some(std::rc::Rc::new(std::cell::RefCell::new(None))),
+        };
+
+        assert_eq!(edge_count(&continuation), 2);
+    }
+
+    #[test]
+    fn line_decoder_holds_no_value_edges() {
+        let decoder = FileLineChunkDecoder {
+            op: "file/fold-lines",
+            slot: std::rc::Rc::new(std::cell::RefCell::new(None)),
+        };
+
+        assert_eq!(edge_count(&decoder), 0);
+    }
+
+    fn temp_path(tag: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock is after epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!("sema-file-lines-{tag}-{nanos}"))
+    }
+
+    #[test]
+    fn line_chunk_is_bounded_by_line_count() {
+        let path = temp_path("count");
+        let contents: String = (0..261).map(|index| format!("line-{index}\n")).collect();
+        std::fs::write(&path, contents).expect("write line fixture");
+        let path_text = path.to_string_lossy();
+
+        let first = read_file_line_chunk("file/fold-lines", &path_text, None, false)
+            .expect("read first bounded chunk");
+        assert_eq!(first.lines.len(), 256);
+        assert!(!first.eof);
+        let second = read_file_line_chunk("file/fold-lines", &path_text, Some(first.reader), false)
+            .expect("read remaining lines");
+        assert_eq!(second.lines.len(), 5);
+        assert!(second.eof);
+
+        std::fs::remove_file(path).expect("remove line fixture");
+    }
+
+    #[test]
+    fn line_chunk_is_bounded_by_bytes() {
+        let path = temp_path("bytes");
+        let line = vec![b'x'; 130 * 1024];
+        let mut contents = Vec::with_capacity((line.len() + 1) * 3);
+        for _ in 0..3 {
+            contents.extend_from_slice(&line);
+            contents.push(b'\n');
+        }
+        std::fs::write(&path, contents).expect("write byte fixture");
+        let path_text = path.to_string_lossy();
+
+        let first = read_file_line_chunk("file/fold-lines-bytes", &path_text, None, true)
+            .expect("read first byte-bounded chunk");
+        assert_eq!(first.lines.len(), 1);
+        assert!(!first.eof);
+        let second = read_file_line_chunk(
+            "file/fold-lines-bytes",
+            &path_text,
+            Some(first.reader),
+            true,
+        )
+        .expect("read remaining byte line");
+        assert_eq!(second.lines.len(), 2);
+        assert!(second.eof);
+
+        std::fs::remove_file(path).expect("remove byte fixture");
     }
 }
 

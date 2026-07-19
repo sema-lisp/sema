@@ -4092,7 +4092,7 @@ impl Runtime {
                     &current_call.args,
                 );
             }
-            if let Err(error) = vm.setup_for_call(next_closure, &current_call.args) {
+            if let Err(error) = vm.setup_for_call_owned(next_closure, &mut current_call.args) {
                 let mut task_context = task.context.borrow_mut();
                 let mut native_context = NativeCallContext {
                     eval_context: &eval_context,

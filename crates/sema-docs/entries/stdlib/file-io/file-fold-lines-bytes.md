@@ -8,7 +8,9 @@ returns: "any"
 
 Fold over the lines of a file with an accumulator, passing each line to the reducer as a **bytevector** (trailing `\n`/`\r\n` stripped, no UTF-8 validation). The byte-oriented sibling of `file/fold-lines`, for `bytes/*` pipelines that avoid per-line string decoding: `bytes/find` the separator, `bytes/parse-int10` the number, `bytes/->string` only what must become text.
 
-Streams with a 256KB read buffer and never holds the whole file in memory. Reach for `file/fold-lines` when you want lines as strings.
+Streams through a 64 KiB read buffer in bounded batches and never holds the whole file in memory. Each line may contain at most 256 KiB of content. A trailing `\n` or `\r\n` does not count toward the limit; a longer line raises an error.
+
+Reach for `file/fold-lines` when you want lines as strings.
 
 ```sema
 ;; Sum one-decimal temperatures from "Name;-12.3" lines as ints ×10.

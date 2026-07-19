@@ -2097,6 +2097,18 @@ impl VM {
         self.setup_for_call_args(closure, CallArgs::Borrowed(args))
     }
 
+    /// Prepare a callback call by moving each argument into its VM local slot.
+    /// The unified runtime owns `NativeCall::args`, so its cooperative callback
+    /// handoff can preserve uniqueness-sensitive accumulator fast paths instead
+    /// of retaining a second reference for the duration of the call.
+    pub(crate) fn setup_for_call_owned(
+        &mut self,
+        closure: Rc<Closure>,
+        args: &mut [Value],
+    ) -> Result<(), SemaError> {
+        self.setup_for_call_args(closure, CallArgs::Owned(args))
+    }
+
     /// [`Self::setup_for_call`] parametrized over the args handoff: `Borrowed`
     /// clones each value into its slot, `Owned` moves it out of the caller's
     /// buffer (leaving nil) so the slot holds the value's only new reference.

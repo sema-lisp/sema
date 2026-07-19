@@ -26,7 +26,7 @@
 
 #![cfg(not(target_arch = "wasm32"))]
 
-use sema_core::Value;
+use sema_core::{NativeFn, NodePtr, Value};
 use sema_eval::Interpreter;
 
 /// A unique temp file path for one test, removed on drop (also on panic).
@@ -929,18 +929,9 @@ fn stream_file_async_read_closed_file_errors() {
     );
 }
 
-/// Regression (VM closure/scheduler): a `file/for-each-line` / `file/fold-lines`
-/// callback that CAPTURES a lexical upvalue must read the correct value when the
-/// reader runs in async context — even alongside a NESTED `async/all` on a
-/// sibling task. Two bugs made this fail before:
-///   1. the per-line callback runs from a deferred I/O poll AFTER the owning task
-///      suspends, so its still-`Open` upvalue read `nil` — fixed by snapshotting
-///      the callback's upvalues (`snapshot_escaping_closure`) up front, while the
-///      owning task VM is still current (exactly as `async/spawn` does);
-///   2. routing that call through the inline-task path `take_scheduler()`'d while
-///      the scheduler was already borrowed to drive the poll (reproducible under a
-///      nested `async/all`) — fixed by running the callback synchronously on a
-///      foreign VM (`run_closure_foreign_sync`), which never touches the scheduler.
+/// A line callback may capture lexical upvalues across the initial external
+/// chunk-read suspension. The traced callback then runs structurally on its
+/// owning task VM, including while a sibling drives a nested `async/all`.
 #[test]
 fn streaming_line_callback_captures_upvalue_under_nested_async() {
     let f = TempFile::with_contents("upvalue-stream", "a\nb\nc\nd\ne\n");
@@ -978,6 +969,482 @@ fn streaming_line_callback_captures_upvalue_under_nested_async() {
         Some("startL:aL:bL:cL:dL:e"),
         "fold-lines callback read its captured `tag` upvalue"
     );
+}
+
+#[test]
+fn streaming_line_callbacks_suspend_without_blocking_siblings_and_preserve_order() {
+    let f = TempFile::with_contents("line-callback-suspend", "a\nbb\r\nc\r");
+    let interp = Interpreter::new();
+    let result = interp
+        .eval_str_compiled(&format!(
+            r#"
+            (let ((events (mutable-array/new)))
+              (async/all
+                (list
+                  (async
+                    (file/for-each-line "{path}"
+                      (fn (line)
+                        (async/sleep 20)
+                        (mutable-array/push! events line))))
+                  (async (mutable-array/push! events "sibling"))))
+              (list
+                (mutable-array/->vector events)
+                (file/fold-lines "{path}"
+                  (fn (acc line)
+                    (async/sleep 1)
+                    (str acc "[" line "]"))
+                  "")
+                (file/fold-lines-bytes "{path}"
+                  (fn (acc line)
+                    (async/sleep 1)
+                    (+ acc (bytes/length line)))
+                  0)))
+            "#,
+            path = f.path()
+        ))
+        .expect("all line callbacks should suspend and resume cooperatively");
+
+    assert_eq!(
+        result,
+        Value::list(vec![
+            Value::vector(vec![
+                Value::string("sibling"),
+                Value::string("a"),
+                Value::string("bb"),
+                Value::string("c\r"),
+            ]),
+            Value::string("[a][bb][c\r]"),
+            Value::int(5),
+        ])
+    );
+}
+
+#[test]
+fn streaming_line_callbacks_accept_runtime_only_natives() {
+    let f = TempFile::with_contents("line-runtime-native", "only\n");
+    let interp = Interpreter::new();
+    let result = interp
+        .eval_str_compiled(&format!(
+            r#"
+            (let ((lines (channel/new 1)))
+              (let ((fold-result (file/fold-lines "{path}" channel/send lines)))
+                (list
+                  fold-result
+                  (channel/recv lines)
+                  (file/for-each-line "{path}" async/resolved))))
+            "#,
+            path = f.path()
+        ))
+        .expect("runtime-only line callbacks should use structural calls");
+
+    assert_eq!(
+        result,
+        Value::list(vec![Value::nil(), Value::string("only"), Value::nil()])
+    );
+}
+
+#[test]
+fn streaming_file_fold_preserves_unique_accumulator_handoff() {
+    let f = TempFile::with_contents("line-owned-fold", "a\nb\nc\n");
+    let observed_nodes = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let callback_nodes = std::rc::Rc::clone(&observed_nodes);
+    let interp = Interpreter::new();
+    interp.global_env.set_str(
+        "__test/record-map-node",
+        Value::native_fn(NativeFn::simple("__test/record-map-node", move |args| {
+            if args.len() != 1 {
+                return Err(sema_core::SemaError::arity(
+                    "__test/record-map-node",
+                    "1",
+                    args.len(),
+                ));
+            }
+            let node = NodePtr::of_value(&args[0])
+                .ok_or_else(|| sema_core::SemaError::type_error("map", args[0].type_name()))?;
+            callback_nodes.borrow_mut().push(node);
+            Ok(Value::nil())
+        })),
+    );
+
+    let result = interp
+        .eval_str_compiled(&format!(
+            r#"
+            (file/fold-lines "{path}"
+              (fn (acc line)
+                (__test/record-map-node acc)
+                (assoc acc line #t))
+              {{}})
+            "#,
+            path = f.path()
+        ))
+        .expect("the structural fold should move its accumulator into each callback");
+
+    let map = result.as_map_ref().expect("fold returns a map");
+    assert_eq!(map.len(), 3);
+    for key in ["a", "b", "c"] {
+        assert_eq!(map.get(&Value::string(key)), Some(&Value::bool(true)));
+    }
+    let observed_nodes = observed_nodes.borrow();
+    assert_eq!(observed_nodes.len(), 3);
+    assert!(
+        observed_nodes.windows(2).all(|pair| pair[0] == pair[1]),
+        "assoc must mutate the uniquely owned accumulator allocation in place across callbacks"
+    );
+}
+
+#[test]
+fn cancelling_suspended_line_callback_settles_the_parent_task() {
+    let f = TempFile::with_contents("line-callback-cancel", "first\nsecond\n");
+    let interp = Interpreter::new();
+    let result = interp
+        .eval_str_compiled(&format!(
+            r#"
+            (let ((started (channel/new 1)))
+              (let ((pending
+                      (async
+                        (file/for-each-line "{path}"
+                          (fn (line)
+                            (channel/send started line)
+                            (async/sleep 60000))))))
+                (channel/recv started)
+                (let ((requested (async/cancel pending))
+                      (settled (try (await pending) (catch error :cancelled))))
+                  (list requested settled (async/cancelled? pending)))))
+            "#,
+            path = f.path()
+        ))
+        .expect("cancelling a parked line callback should settle cleanly");
+
+    assert_eq!(
+        result,
+        Value::list(vec![
+            Value::bool(true),
+            Value::keyword("cancelled"),
+            Value::bool(true),
+        ])
+    );
+}
+
+#[test]
+fn streaming_line_callback_failure_is_fail_fast() {
+    let f = TempFile::with_contents("line-callback-error", "a\nb\nc\n");
+    let interp = Interpreter::new();
+    let result = interp
+        .eval_str_compiled(&format!(
+            r#"
+            (let ((seen (mutable-array/new)))
+              (let ((message
+                      (try
+                        (file/fold-lines "{path}"
+                          (fn (acc line)
+                            (mutable-array/push! seen line)
+                            (if (= line "b") (error "line boom") acc))
+                          nil)
+                        (catch error (str error)))))
+                (list message (mutable-array/->vector seen))))
+            "#,
+            path = f.path()
+        ))
+        .expect("the callback failure should remain catchable at the call site");
+    let parts = result.as_list().expect("error parity result list");
+    assert!(
+        parts[0]
+            .as_str()
+            .is_some_and(|message| message.contains("line boom")),
+        "expected the original callback error, got {}",
+        parts[0]
+    );
+    assert_eq!(
+        parts[1],
+        Value::vector(vec![Value::string("a"), Value::string("b")]),
+        "iteration must stop at the first callback failure"
+    );
+}
+
+#[test]
+fn streaming_line_drains_valid_callbacks_before_later_utf8_failure() {
+    let f = TempFile::new("line-invalid-utf8");
+    std::fs::write(&f.0, b"first\nsecond\ninvalid-\xff\nnever\n")
+        .expect("write invalid UTF-8 fixture");
+    let interp = Interpreter::new();
+    let result = interp
+        .eval_str_compiled(&format!(
+            r#"
+            (let ((seen (mutable-array/new)))
+              (let ((message
+                      (try
+                        (file/for-each-line "{path}"
+                          (fn (line) (mutable-array/push! seen line)))
+                        (catch error (str error)))))
+                (list message (mutable-array/->vector seen))))
+            "#,
+            path = f.path()
+        ))
+        .expect("the terminal read error should remain catchable");
+    let parts = result.as_list().expect("terminal-error result list");
+    assert!(
+        parts[0]
+            .as_str()
+            .is_some_and(|message| message.contains("UTF-8")),
+        "expected an invalid UTF-8 error, got {}",
+        parts[0]
+    );
+    assert_eq!(
+        parts[1],
+        Value::vector(vec![Value::string("first"), Value::string("second")]),
+        "valid buffered lines must reach the callback before the later read error"
+    );
+}
+
+#[test]
+fn streaming_line_rejects_one_byte_over_limit_without_callbacks() {
+    let f = TempFile::new("line-oversized");
+    std::fs::write(&f.0, vec![b'x'; 256 * 1024 + 1]).expect("write oversized line fixture");
+    let interp = Interpreter::new();
+    let result = interp
+        .eval_str_compiled(&format!(
+            r#"
+            (let ((text-seen (mutable-cell/new 0))
+                  (bytes-seen (mutable-cell/new 0)))
+              (let ((text-error
+                      (try
+                        (file/for-each-line "{path}"
+                          (fn (line)
+                            (mutable-cell/set! text-seen (+ 1 (mutable-cell/get text-seen)))))
+                        (catch error (str error))))
+                    (bytes-error
+                      (try
+                        (file/fold-lines-bytes "{path}"
+                          (fn (acc line)
+                            (mutable-cell/set! bytes-seen (+ 1 (mutable-cell/get bytes-seen)))
+                            acc)
+                          nil)
+                        (catch error (str error)))))
+                (list text-error bytes-error
+                      (mutable-cell/get text-seen)
+                      (mutable-cell/get bytes-seen))))
+            "#,
+            path = f.path()
+        ))
+        .expect("oversized line errors should remain catchable");
+    let parts = result.as_list().expect("oversized-line result list");
+    for message in &parts[..2] {
+        assert!(
+            message
+                .as_str()
+                .is_some_and(|text| text.contains("line exceeds") && text.contains("262144")),
+            "expected a clear bounded-line error, got {message}"
+        );
+    }
+    assert_eq!(parts[2], Value::int(0));
+    assert_eq!(parts[3], Value::int(0));
+}
+
+#[test]
+fn streaming_line_limit_counts_content_bytes_not_crlf_terminators() {
+    const LIMIT: usize = 256 * 1024;
+
+    let lf = TempFile::new("line-exact-limit-lf");
+    let mut lf_contents = vec![b'x'; LIMIT];
+    lf_contents.push(b'\n');
+    std::fs::write(&lf.0, lf_contents).expect("write exact-limit LF fixture");
+
+    let crlf = TempFile::new("line-exact-limit-crlf");
+    let mut crlf_contents = vec![b'x'; LIMIT];
+    crlf_contents.extend_from_slice(b"\r\n");
+    std::fs::write(&crlf.0, crlf_contents).expect("write exact-limit CRLF fixture");
+
+    let unterminated = TempFile::new("line-exact-limit-unterminated");
+    std::fs::write(&unterminated.0, vec![b'x'; LIMIT])
+        .expect("write exact-limit unterminated fixture");
+
+    let oversized_bare_cr = TempFile::new("line-oversized-bare-cr");
+    let mut bare_cr_contents = vec![b'x'; LIMIT];
+    bare_cr_contents.push(b'\r');
+    std::fs::write(&oversized_bare_cr.0, bare_cr_contents)
+        .expect("write oversized bare-CR fixture");
+
+    let interp = Interpreter::new();
+    let result = interp
+        .eval_str_compiled(&format!(
+            r#"
+            (list
+              (file/fold-lines "{lf}"
+                (fn (length line) (+ length (string/length line))) 0)
+              (file/fold-lines-bytes "{lf}"
+                (fn (length line) (+ length (bytes/length line))) 0)
+              (file/fold-lines "{crlf}"
+                (fn (length line) (+ length (string/length line))) 0)
+              (file/fold-lines-bytes "{crlf}"
+                (fn (length line) (+ length (bytes/length line))) 0)
+              (file/fold-lines "{unterminated}"
+                (fn (length line) (+ length (string/length line))) 0)
+              (file/fold-lines-bytes "{unterminated}"
+                (fn (length line) (+ length (bytes/length line))) 0)
+              (try
+                (file/for-each-line "{bare_cr}" (fn (line) nil))
+                (catch error (str error)))
+              (try
+                (file/fold-lines-bytes "{bare_cr}" (fn (acc line) acc) nil)
+                (catch error (str error))))
+            "#,
+            lf = lf.path(),
+            crlf = crlf.path(),
+            unterminated = unterminated.path(),
+            bare_cr = oversized_bare_cr.path(),
+        ))
+        .expect("line-boundary errors should remain catchable");
+    let parts = result.as_list().expect("line-boundary result list");
+    for length in &parts[..6] {
+        assert_eq!(*length, Value::int(LIMIT as i64));
+    }
+    for message in &parts[6..] {
+        assert!(
+            message
+                .as_str()
+                .is_some_and(|text| text.contains("line exceeds") && text.contains("262144")),
+            "a bare CR beyond the content limit must remain an oversized line, got {message}"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn special_file_delivers_each_completed_line_before_waiting_for_the_next() {
+    use std::io::Write as _;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    let fifo = TempFile::new("line-fifo");
+    let fifo_c = std::ffi::CString::new(fifo.path()).expect("FIFO path has no NUL");
+    let created = unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) };
+    assert_eq!(
+        created,
+        0,
+        "create FIFO: {}",
+        std::io::Error::last_os_error()
+    );
+    let marker = TempFile::new("line-fifo-marker");
+    let marker_path = marker.path();
+    let callback_seen = Arc::new(AtomicBool::new(false));
+    let writer_seen = Arc::clone(&callback_seen);
+    let fifo_path = fifo.path();
+    let writer = std::thread::spawn(move || {
+        let mut pipe = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&fifo_path)
+            .expect("open FIFO writer");
+        pipe.write_all(b"first\n").expect("write first FIFO line");
+        pipe.flush().expect("flush first FIFO line");
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !std::path::Path::new(&marker_path).exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        writer_seen.store(
+            std::path::Path::new(&marker_path).exists(),
+            Ordering::SeqCst,
+        );
+        pipe.write_all(b"second\n").expect("write second FIFO line");
+    });
+
+    let interp = Interpreter::new();
+    let result = interp
+        .eval_str_compiled(&format!(
+            r#"
+            (let ((seen (mutable-array/new)))
+              (file/for-each-line "{fifo}"
+                (fn (line)
+                  (mutable-array/push! seen line)
+                  (when (= line "first") (file/write "{marker}" "ready"))))
+              (mutable-array/->vector seen))
+            "#,
+            fifo = fifo.path(),
+            marker = marker.path(),
+        ))
+        .expect("FIFO line callbacks should run incrementally");
+    writer.join().expect("FIFO writer exits");
+
+    assert!(
+        callback_seen.load(Ordering::SeqCst),
+        "the first callback must run before the writer supplies the second line"
+    );
+    assert_eq!(
+        result,
+        Value::vector(vec![Value::string("first"), Value::string("second")])
+    );
+}
+
+#[test]
+fn cancelling_line_read_settles_before_worker_completion_and_reaps_later() {
+    let f = TempFile::with_contents("line-read-cancel", "first\nsecond\n");
+    sema_stdlib::reset_fs_inflight();
+    sema_stdlib::set_fs_test_delay_ms(800);
+    let interp = Interpreter::new();
+    interp.global_env.set_str(
+        "__test/fs-current-inflight",
+        Value::native_fn(NativeFn::simple("__test/fs-current-inflight", |args| {
+            if !args.is_empty() {
+                return Err(sema_core::SemaError::arity(
+                    "__test/fs-current-inflight",
+                    "0",
+                    args.len(),
+                ));
+            }
+            Ok(Value::int(sema_stdlib::fs_current_inflight() as i64))
+        })),
+    );
+    let result = interp
+        .eval_str_compiled(&format!(
+            r#"
+            (letrec ((wait-for-worker
+                       (fn (remaining)
+                         (if (= (__test/fs-current-inflight) 1)
+                           #t
+                           (if (= remaining 0)
+                             (error "file worker did not start")
+                             (begin
+                               (async/sleep 1)
+                               (wait-for-worker (- remaining 1))))))))
+              (let ((pending
+                      (async
+                        (file/for-each-line "{path}" (fn (line) nil)))))
+                (wait-for-worker 1000)
+                (let ((requested (async/cancel pending))
+                      (settled (try (await pending) (catch error :cancelled))))
+                  (list requested settled (async/cancelled? pending)))))
+            "#,
+            path = f.path()
+        ))
+        .expect("cancelling an externally parked line read should settle promptly");
+    assert_eq!(
+        result,
+        Value::list(vec![
+            Value::bool(true),
+            Value::keyword("cancelled"),
+            Value::bool(true),
+        ])
+    );
+    assert_eq!(
+        sema_stdlib::fs_current_inflight(),
+        1,
+        "the task must settle while the quarantined worker still owns the reader"
+    );
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    while sema_stdlib::fs_current_inflight() != 0 && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    sema_stdlib::set_fs_test_delay_ms(0);
+    assert_eq!(
+        sema_stdlib::fs_current_inflight(),
+        0,
+        "the detached bounded read must eventually finish and release its reader"
+    );
+    interp
+        .eval_str_compiled("(+ 1 1)")
+        .expect("a later drive processes the detached completion");
+    assert_eq!(interp.runtime_live_task_count(), 0);
 }
 
 /// Regression (VM transitive upvalue snapshot): a closure capturing a lexical

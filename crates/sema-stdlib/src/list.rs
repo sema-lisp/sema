@@ -114,42 +114,168 @@ fn map_multi(args: &[Value]) -> Result<Value, SemaError> {
     Ok(Value::list(result))
 }
 
-/// Cooperative continuation for `filter` (Task 04). Runs the predicate on each
-/// element as a fresh runtime Call so an async op inside it parks/resumes; keeps
-/// only the elements whose predicate result is truthy, preserving input order —
-/// identical semantics to the legacy synchronous path.
-struct FilterContinuation {
-    predicate: Value,
-    /// The element whose predicate result the next `resume` carries.
-    current: Value,
-    remaining: VecDeque<Value>,
-    results: Vec<Value>,
+/// Pending inputs for a predicate scan. Immutable lists and vectors are kept as
+/// one traced source handle; mutable arrays use the snapshot produced by
+/// `get_sequence` so callbacks may mutate the original array safely.
+enum PredicateItems {
+    Retained { source: Value, next: usize },
+    Snapshot { items: Vec<Value>, next: usize },
 }
 
-impl Trace for FilterContinuation {
-    fn trace(&self, sink: &mut dyn FnMut(GcEdge<'_>)) -> bool {
-        sink(GcEdge::Value(&self.predicate));
-        sink(GcEdge::Value(&self.current));
-        for item in &self.remaining {
-            sink(GcEdge::Value(item));
+impl PredicateItems {
+    fn from_value(source: &Value, hof: &'static str) -> Result<Self, SemaError> {
+        match get_sequence(source, hof)? {
+            Cow::Borrowed(_) => Ok(Self::Retained {
+                source: source.clone(),
+                next: 0,
+            }),
+            Cow::Owned(items) => Ok(Self::Snapshot { items, next: 0 }),
         }
-        for result in &self.results {
-            sink(GcEdge::Value(result));
+    }
+
+    fn pop_front(&mut self) -> Option<Value> {
+        match self {
+            Self::Retained { source, next } => {
+                let item = source
+                    .as_list()
+                    .or_else(|| source.as_vector())
+                    .and_then(|items| items.get(*next))
+                    .cloned();
+                *next += usize::from(item.is_some());
+                item
+            }
+            Self::Snapshot { items, next } if *next < items.len() => {
+                let item = std::mem::replace(&mut items[*next], Value::nil());
+                *next += 1;
+                Some(item)
+            }
+            Self::Snapshot { .. } => None,
         }
-        true
+    }
+
+    fn remaining_len(&self) -> usize {
+        match self {
+            Self::Retained { source, next } => source
+                .as_list()
+                .or_else(|| source.as_vector())
+                .map_or(0, |items| items.len().saturating_sub(*next)),
+            Self::Snapshot { items, next } => items.len().saturating_sub(*next),
+        }
+    }
+
+    fn take_remaining(&mut self) -> Vec<Value> {
+        match self {
+            Self::Retained { source, next } => {
+                let remaining = source
+                    .as_list()
+                    .or_else(|| source.as_vector())
+                    .map_or_else(Vec::new, |items| items[*next..].to_vec());
+                *next += remaining.len();
+                remaining
+            }
+            Self::Snapshot { items, next } => {
+                let remaining = items.drain(*next..).collect();
+                *next = items.len();
+                remaining
+            }
+        }
+    }
+
+    fn trace(&self, sink: &mut dyn FnMut(GcEdge<'_>)) {
+        match self {
+            Self::Retained { source, .. } => sink(GcEdge::Value(source)),
+            Self::Snapshot { items, next } => {
+                for item in &items[*next..] {
+                    sink(GcEdge::Value(item));
+                }
+            }
+        }
     }
 }
 
-impl NativeContinuation for FilterContinuation {
-    fn resume(
-        mut self: Box<Self>,
-        _context: &mut NativeCallContext<'_>,
-        input: ResumeInput,
-    ) -> NativeResult {
-        let keep = resume_value(input, "filter")?;
-        if keep.is_truthy() {
-            self.results.push(self.current.clone());
+/// Result policy and accumulated state for a predicate-driven sequence scan.
+enum PredicateMode {
+    Select {
+        keep_when_truthy: bool,
+        results: Vec<Value>,
+    },
+    Partition {
+        matching: Vec<Value>,
+        non_matching: Vec<Value>,
+    },
+    Any,
+    Every,
+    TakeWhile {
+        results: Vec<Value>,
+    },
+    DropWhile,
+    Find,
+    Sole {
+        found: Option<Value>,
+    },
+}
+
+impl PredicateMode {
+    fn trace(&self, sink: &mut dyn FnMut(GcEdge<'_>)) {
+        match self {
+            Self::Select { results, .. } | Self::TakeWhile { results } => {
+                for result in results {
+                    sink(GcEdge::Value(result));
+                }
+            }
+            Self::Partition {
+                matching,
+                non_matching,
+            } => {
+                for result in matching {
+                    sink(GcEdge::Value(result));
+                }
+                for result in non_matching {
+                    sink(GcEdge::Value(result));
+                }
+            }
+            Self::Sole { found: Some(found) } => sink(GcEdge::Value(found)),
+            Self::Any | Self::Every | Self::DropWhile | Self::Find | Self::Sole { found: None } => {
+            }
         }
+    }
+
+    fn finish(&mut self, hof: &'static str) -> Result<Value, SemaError> {
+        match self {
+            Self::Select { results, .. } | Self::TakeWhile { results } => {
+                Ok(Value::list(std::mem::take(results)))
+            }
+            Self::Partition {
+                matching,
+                non_matching,
+            } => Ok(Value::list(vec![
+                Value::list(std::mem::take(matching)),
+                Value::list(std::mem::take(non_matching)),
+            ])),
+            Self::Any => Ok(Value::bool(false)),
+            Self::Every => Ok(Value::bool(true)),
+            Self::DropWhile => Ok(Value::list(Vec::new())),
+            Self::Find => Ok(Value::nil()),
+            Self::Sole { found } => found
+                .take()
+                .ok_or_else(|| SemaError::eval(format!("{hof}: no matching item"))),
+        }
+    }
+}
+
+/// Cooperative state machine for predicate higher-order functions. The current
+/// input is retained separately because `find`, `sole`, and the selecting modes
+/// must return the exact `Value` passed to the predicate.
+struct PredicateContinuation {
+    hof: &'static str,
+    predicate: Value,
+    current: Value,
+    remaining: PredicateItems,
+    mode: PredicateMode,
+}
+
+impl PredicateContinuation {
+    fn continue_or_finish(mut self: Box<Self>) -> NativeResult {
         match self.remaining.pop_front() {
             Some(next) => {
                 self.current = next.clone();
@@ -159,30 +285,114 @@ impl NativeContinuation for FilterContinuation {
                     continuation: self,
                 }))
             }
-            None => Ok(NativeOutcome::Return(Value::list(std::mem::take(
-                &mut self.results,
-            )))),
+            None => self.mode.finish(self.hof).map(NativeOutcome::Return),
         }
     }
 }
 
-/// Initial cooperative `NativeOutcome::Call` for `filter`. Empty input has
-/// nothing to test, so it returns the empty list directly.
-fn filter_call(predicate: &Value, items: &[Value]) -> NativeOutcome {
-    let Some((first, rest)) = items.split_first() else {
-        return NativeOutcome::Return(Value::list(Vec::new()));
+impl Trace for PredicateContinuation {
+    fn trace(&self, sink: &mut dyn FnMut(GcEdge<'_>)) -> bool {
+        sink(GcEdge::Value(&self.predicate));
+        sink(GcEdge::Value(&self.current));
+        self.remaining.trace(sink);
+        self.mode.trace(sink);
+        true
+    }
+}
+
+impl NativeContinuation for PredicateContinuation {
+    fn resume(
+        mut self: Box<Self>,
+        _context: &mut NativeCallContext<'_>,
+        input: ResumeInput,
+    ) -> NativeResult {
+        let matches = resume_value(input, self.hof)?.is_truthy();
+
+        match &mut self.mode {
+            PredicateMode::Select {
+                keep_when_truthy,
+                results,
+            } => {
+                if matches == *keep_when_truthy {
+                    results.push(self.current.clone());
+                }
+            }
+            PredicateMode::Partition {
+                matching,
+                non_matching,
+            } => {
+                if matches {
+                    matching.push(self.current.clone());
+                } else {
+                    non_matching.push(self.current.clone());
+                }
+            }
+            PredicateMode::Any if matches => return Ok(NativeOutcome::Return(Value::bool(true))),
+            PredicateMode::Every if !matches => {
+                return Ok(NativeOutcome::Return(Value::bool(false)))
+            }
+            PredicateMode::TakeWhile { results } if matches => {
+                results.push(self.current.clone());
+            }
+            PredicateMode::TakeWhile { results } => {
+                return Ok(NativeOutcome::Return(Value::list(std::mem::take(results))))
+            }
+            PredicateMode::DropWhile if !matches => {
+                let mut results = Vec::with_capacity(self.remaining.remaining_len() + 1);
+                results.push(std::mem::replace(&mut self.current, Value::nil()));
+                results.extend(self.remaining.take_remaining());
+                return Ok(NativeOutcome::Return(Value::list(results)));
+            }
+            PredicateMode::Find if matches => {
+                return Ok(NativeOutcome::Return(std::mem::replace(
+                    &mut self.current,
+                    Value::nil(),
+                )))
+            }
+            PredicateMode::Sole { found } if matches => {
+                if found.is_some() {
+                    return Err(SemaError::eval(format!(
+                        "{}: more than one matching item",
+                        self.hof
+                    )));
+                }
+                *found = Some(self.current.clone());
+            }
+            PredicateMode::Any
+            | PredicateMode::Every
+            | PredicateMode::DropWhile
+            | PredicateMode::Find
+            | PredicateMode::Sole { .. } => {}
+        }
+
+        self.continue_or_finish()
+    }
+}
+
+/// Start a cooperative predicate scan, or produce the mode's empty-input value
+/// without invoking the predicate.
+fn predicate_call(
+    predicate: &Value,
+    source: &Value,
+    mut mode: PredicateMode,
+    hof: &'static str,
+) -> NativeResult {
+    let mut remaining = PredicateItems::from_value(source, hof)?;
+    let Some(first) = remaining.pop_front() else {
+        return mode.finish(hof).map(NativeOutcome::Return);
     };
-    let continuation = Box::new(FilterContinuation {
+    let continuation = Box::new(PredicateContinuation {
+        hof,
         predicate: predicate.clone(),
         current: first.clone(),
-        remaining: rest.iter().cloned().collect(),
-        results: Vec::new(),
+        remaining,
+        mode,
     });
-    NativeOutcome::Call(NativeCall {
+    Ok(NativeOutcome::Call(NativeCall {
         callable: predicate.clone(),
         args: vec![first.clone()],
         continuation,
-    })
+    }))
 }
 
 /// Cooperative continuation for `foldl`/`reduce` (Task 04). Threads the
@@ -1116,8 +1326,15 @@ pub fn register(env: &sema_core::Env) {
         },
         |args| {
             check_arity!(args, "filter", 2);
-            let items = get_sequence(&args[1], "filter")?;
-            Ok(filter_call(&args[0], &items))
+            predicate_call(
+                &args[0],
+                &args[1],
+                PredicateMode::Select {
+                    keep_when_truthy: true,
+                    results: Vec::new(),
+                },
+                "filter",
+            )
         },
     );
 
@@ -1366,27 +1583,43 @@ pub fn register(env: &sema_core::Env) {
         Ok(Value::bool(false))
     });
 
-    register_fn(env, "any", |args| {
-        check_arity!(args, "any", 2);
-        let items = get_sequence(&args[1], "any")?;
-        for item in items.iter() {
-            if call_function(&args[0], &[item.clone()])?.is_truthy() {
-                return Ok(Value::bool(true));
+    register_hof(
+        env,
+        "any",
+        |args| {
+            check_arity!(args, "any", 2);
+            let items = get_sequence(&args[1], "any")?;
+            for item in items.iter() {
+                if call_function(&args[0], &[item.clone()])?.is_truthy() {
+                    return Ok(Value::bool(true));
+                }
             }
-        }
-        Ok(Value::bool(false))
-    });
+            Ok(Value::bool(false))
+        },
+        |args| {
+            check_arity!(args, "any", 2);
+            predicate_call(&args[0], &args[1], PredicateMode::Any, "any")
+        },
+    );
 
-    register_fn(env, "every", |args| {
-        check_arity!(args, "every", 2);
-        let items = get_sequence(&args[1], "every")?;
-        for item in items.iter() {
-            if !call_function(&args[0], &[item.clone()])?.is_truthy() {
-                return Ok(Value::bool(false));
+    register_hof(
+        env,
+        "every",
+        |args| {
+            check_arity!(args, "every", 2);
+            let items = get_sequence(&args[1], "every")?;
+            for item in items.iter() {
+                if !call_function(&args[0], &[item.clone()])?.is_truthy() {
+                    return Ok(Value::bool(false));
+                }
             }
-        }
-        Ok(Value::bool(true))
-    });
+            Ok(Value::bool(true))
+        },
+        |args| {
+            check_arity!(args, "every", 2);
+            predicate_call(&args[0], &args[1], PredicateMode::Every, "every")
+        },
+    );
     // Note: canonical predicate-? aliases (`any?`, `every?`) are registered
     // at the end of this fn (see below).
 
@@ -1419,23 +1652,39 @@ pub fn register(env: &sema_core::Env) {
         },
     );
 
-    register_fn(env, "partition", |args| {
-        check_arity!(args, "partition", 2);
-        let items = get_sequence(&args[1], "partition")?;
-        let mut matching = Vec::new();
-        let mut non_matching = Vec::new();
-        for item in items.iter() {
-            if call_function(&args[0], &[item.clone()])?.is_truthy() {
-                matching.push(item.clone());
-            } else {
-                non_matching.push(item.clone());
+    register_hof(
+        env,
+        "partition",
+        |args| {
+            check_arity!(args, "partition", 2);
+            let items = get_sequence(&args[1], "partition")?;
+            let mut matching = Vec::new();
+            let mut non_matching = Vec::new();
+            for item in items.iter() {
+                if call_function(&args[0], &[item.clone()])?.is_truthy() {
+                    matching.push(item.clone());
+                } else {
+                    non_matching.push(item.clone());
+                }
             }
-        }
-        Ok(Value::list(vec![
-            Value::list(matching),
-            Value::list(non_matching),
-        ]))
-    });
+            Ok(Value::list(vec![
+                Value::list(matching),
+                Value::list(non_matching),
+            ]))
+        },
+        |args| {
+            check_arity!(args, "partition", 2);
+            predicate_call(
+                &args[0],
+                &args[1],
+                PredicateMode::Partition {
+                    matching: Vec::new(),
+                    non_matching: Vec::new(),
+                },
+                "partition",
+            )
+        },
+    );
 
     register_fn(env, "foldr", |args| {
         check_arity!(args, "foldr", 3);
@@ -1715,34 +1964,57 @@ pub fn register(env: &sema_core::Env) {
         Ok(Value::list(result))
     });
 
-    register_fn(env, "take-while", |args| {
-        check_arity!(args, "take-while", 2);
-        let items = get_sequence(&args[1], "take-while")?;
-        let mut result = Vec::new();
-        for item in items.iter() {
-            if call_function(&args[0], &[item.clone()])?.is_truthy() {
-                result.push(item.clone());
-            } else {
-                break;
+    register_hof(
+        env,
+        "take-while",
+        |args| {
+            check_arity!(args, "take-while", 2);
+            let items = get_sequence(&args[1], "take-while")?;
+            let mut result = Vec::new();
+            for item in items.iter() {
+                if call_function(&args[0], &[item.clone()])?.is_truthy() {
+                    result.push(item.clone());
+                } else {
+                    break;
+                }
             }
-        }
-        Ok(Value::list(result))
-    });
+            Ok(Value::list(result))
+        },
+        |args| {
+            check_arity!(args, "take-while", 2);
+            predicate_call(
+                &args[0],
+                &args[1],
+                PredicateMode::TakeWhile {
+                    results: Vec::new(),
+                },
+                "take-while",
+            )
+        },
+    );
 
-    register_fn(env, "drop-while", |args| {
-        check_arity!(args, "drop-while", 2);
-        let items = get_sequence(&args[1], "drop-while")?;
-        let mut dropping = true;
-        let mut result = Vec::new();
-        for item in items.iter() {
-            if dropping && call_function(&args[0], &[item.clone()])?.is_truthy() {
-                continue;
+    register_hof(
+        env,
+        "drop-while",
+        |args| {
+            check_arity!(args, "drop-while", 2);
+            let items = get_sequence(&args[1], "drop-while")?;
+            let mut dropping = true;
+            let mut result = Vec::new();
+            for item in items.iter() {
+                if dropping && call_function(&args[0], &[item.clone()])?.is_truthy() {
+                    continue;
+                }
+                dropping = false;
+                result.push(item.clone());
             }
-            dropping = false;
-            result.push(item.clone());
-        }
-        Ok(Value::list(result))
-    });
+            Ok(Value::list(result))
+        },
+        |args| {
+            check_arity!(args, "drop-while", 2);
+            predicate_call(&args[0], &args[1], PredicateMode::DropWhile, "drop-while")
+        },
+    );
 
     register_fn(env, "list/dedupe", |args| {
         check_arity!(args, "list/dedupe", 1);
@@ -1805,38 +2077,66 @@ pub fn register(env: &sema_core::Env) {
         Ok(Value::list(vec![Value::list(left), Value::list(right)]))
     });
 
-    register_fn(env, "list/take-while", |args| {
-        check_arity!(args, "list/take-while", 2);
-        let items = get_sequence(&args[1], "list/take-while")?;
-        let mut result = Vec::new();
-        for item in items.iter() {
-            let keep = call_function(&args[0], &[item.clone()])?;
-            if keep.is_truthy() {
-                result.push(item.clone());
-            } else {
-                break;
-            }
-        }
-        Ok(Value::list(result))
-    });
-
-    register_fn(env, "list/drop-while", |args| {
-        check_arity!(args, "list/drop-while", 2);
-        let items = get_sequence(&args[1], "list/drop-while")?;
-        let mut dropping = true;
-        let mut result = Vec::new();
-        for item in items.iter() {
-            if dropping {
-                let drop = call_function(&args[0], &[item.clone()])?;
-                if drop.is_truthy() {
-                    continue;
+    register_hof(
+        env,
+        "list/take-while",
+        |args| {
+            check_arity!(args, "list/take-while", 2);
+            let items = get_sequence(&args[1], "list/take-while")?;
+            let mut result = Vec::new();
+            for item in items.iter() {
+                let keep = call_function(&args[0], &[item.clone()])?;
+                if keep.is_truthy() {
+                    result.push(item.clone());
+                } else {
+                    break;
                 }
-                dropping = false;
             }
-            result.push(item.clone());
-        }
-        Ok(Value::list(result))
-    });
+            Ok(Value::list(result))
+        },
+        |args| {
+            check_arity!(args, "list/take-while", 2);
+            predicate_call(
+                &args[0],
+                &args[1],
+                PredicateMode::TakeWhile {
+                    results: Vec::new(),
+                },
+                "list/take-while",
+            )
+        },
+    );
+
+    register_hof(
+        env,
+        "list/drop-while",
+        |args| {
+            check_arity!(args, "list/drop-while", 2);
+            let items = get_sequence(&args[1], "list/drop-while")?;
+            let mut dropping = true;
+            let mut result = Vec::new();
+            for item in items.iter() {
+                if dropping {
+                    let drop = call_function(&args[0], &[item.clone()])?;
+                    if drop.is_truthy() {
+                        continue;
+                    }
+                    dropping = false;
+                }
+                result.push(item.clone());
+            }
+            Ok(Value::list(result))
+        },
+        |args| {
+            check_arity!(args, "list/drop-while", 2);
+            predicate_call(
+                &args[0],
+                &args[1],
+                PredicateMode::DropWhile,
+                "list/drop-while",
+            )
+        },
+    );
 
     register_fn(env, "list/sum", |args| {
         check_arity!(args, "list/sum", 1);
@@ -1947,18 +2247,34 @@ pub fn register(env: &sema_core::Env) {
     });
 
     // list/reject — inverse of filter
-    register_fn(env, "list/reject", |args| {
-        check_arity!(args, "list/reject", 2);
-        let items = get_sequence(&args[1], "list/reject")?;
-        let mut result = Vec::new();
-        for item in items.iter() {
-            let reject = call_function(&args[0], &[item.clone()])?;
-            if !reject.is_truthy() {
-                result.push(item.clone());
+    register_hof(
+        env,
+        "list/reject",
+        |args| {
+            check_arity!(args, "list/reject", 2);
+            let items = get_sequence(&args[1], "list/reject")?;
+            let mut result = Vec::new();
+            for item in items.iter() {
+                let reject = call_function(&args[0], &[item.clone()])?;
+                if !reject.is_truthy() {
+                    result.push(item.clone());
+                }
             }
-        }
-        Ok(Value::list(result))
-    });
+            Ok(Value::list(result))
+        },
+        |args| {
+            check_arity!(args, "list/reject", 2);
+            predicate_call(
+                &args[0],
+                &args[1],
+                PredicateMode::Select {
+                    keep_when_truthy: false,
+                    results: Vec::new(),
+                },
+                "list/reject",
+            )
+        },
+    );
 
     // list/pluck — extract a field from list of maps
     register_fn(env, "list/pluck", |args| {
@@ -2186,17 +2502,25 @@ pub fn register(env: &sema_core::Env) {
     });
 
     // list/find — first matching item
-    register_fn(env, "list/find", |args| {
-        check_arity!(args, "list/find", 2);
-        let items = get_sequence(&args[1], "list/find")?;
-        for item in items.iter() {
-            let result = call_function(&args[0], &[item.clone()])?;
-            if result.is_truthy() {
-                return Ok(item.clone());
+    register_hof(
+        env,
+        "list/find",
+        |args| {
+            check_arity!(args, "list/find", 2);
+            let items = get_sequence(&args[1], "list/find")?;
+            for item in items.iter() {
+                let result = call_function(&args[0], &[item.clone()])?;
+                if result.is_truthy() {
+                    return Ok(item.clone());
+                }
             }
-        }
-        Ok(Value::nil())
-    });
+            Ok(Value::nil())
+        },
+        |args| {
+            check_arity!(args, "list/find", 2);
+            predicate_call(&args[0], &args[1], PredicateMode::Find, "list/find")
+        },
+    );
 
     // list/pad — pad list to length
     register_fn(env, "list/pad", |args| {
@@ -2211,21 +2535,34 @@ pub fn register(env: &sema_core::Env) {
     });
 
     // list/sole — single matching item or error
-    register_fn(env, "list/sole", |args| {
-        check_arity!(args, "list/sole", 2);
-        let items = get_sequence(&args[1], "list/sole")?;
-        let mut found: Option<Value> = None;
-        for item in items.iter() {
-            let result = call_function(&args[0], &[item.clone()])?;
-            if result.is_truthy() {
-                if found.is_some() {
-                    return Err(SemaError::eval("list/sole: more than one matching item"));
+    register_hof(
+        env,
+        "list/sole",
+        |args| {
+            check_arity!(args, "list/sole", 2);
+            let items = get_sequence(&args[1], "list/sole")?;
+            let mut found: Option<Value> = None;
+            for item in items.iter() {
+                let result = call_function(&args[0], &[item.clone()])?;
+                if result.is_truthy() {
+                    if found.is_some() {
+                        return Err(SemaError::eval("list/sole: more than one matching item"));
+                    }
+                    found = Some(item.clone());
                 }
-                found = Some(item.clone());
             }
-        }
-        found.ok_or_else(|| SemaError::eval("list/sole: no matching item"))
-    });
+            found.ok_or_else(|| SemaError::eval("list/sole: no matching item"))
+        },
+        |args| {
+            check_arity!(args, "list/sole", 2);
+            predicate_call(
+                &args[0],
+                &args[1],
+                PredicateMode::Sole { found: None },
+                "list/sole",
+            )
+        },
+    );
 
     // list/join — join with optional final separator
     register_fn(env, "list/join", |args| {
@@ -2547,6 +2884,40 @@ mod continuation_trace_tests {
             results: CollectResults::Values(Vec::new()),
         };
         assert_eq!(edge_count(&range), 1);
+    }
+
+    #[test]
+    fn predicate_continuation_traces_inputs_and_accumulated_values() {
+        let partition = PredicateContinuation {
+            hof: "partition",
+            predicate: Value::string("predicate"),
+            current: Value::int(1),
+            remaining: PredicateItems::Snapshot {
+                items: vec![Value::int(2), Value::int(3)],
+                next: 0,
+            },
+            mode: PredicateMode::Partition {
+                matching: vec![Value::int(4)],
+                non_matching: vec![Value::int(5)],
+            },
+        };
+        // Predicate + current + two remaining + two accumulated values.
+        assert_eq!(edge_count(&partition), 6);
+
+        let sole = PredicateContinuation {
+            hof: "list/sole",
+            predicate: Value::string("predicate"),
+            current: Value::int(1),
+            remaining: PredicateItems::Retained {
+                source: Value::list(vec![Value::int(1), Value::int(2)]),
+                next: 1,
+            },
+            mode: PredicateMode::Sole {
+                found: Some(Value::int(2)),
+            },
+        };
+        // Predicate + current + one compact source handle + retained sole match.
+        assert_eq!(edge_count(&sole), 4);
     }
 
     #[test]
